@@ -39,11 +39,44 @@ const CLEANUP_INTERVAL_MS = 6 * 60 * 60 * 1000;
 const STARTUP_DELAY_MS = 60_000;
 const MINIMUM_IDLE_DAYS = 7;
 const STALE_WARNING_DAYS = 30;
+const DEFAULT_TOPIC_IDLE_RECLAIM_DAYS = 14;
+
+let warnedBadIdleReclaimDays = false;
+
+/**
+ * Owner-approved widening (2026-08-29): a topic whose open participants have
+ * been idle this long is treated as side-(a) evidence too, on top of "every
+ * participant closed". 0 disables it (pre-existing behavior).
+ *
+ * UNSET (the var isn't in the environment at all) -> the deliberate default
+ * (14). Set to anything that isn't a plain non-negative integer — "" included
+ * (negative, decimal, exponent notation, "abc", "NaN", empty, …) -> DISABLED
+ * (0), not the default — a typo meant to turn this off (or a nonsense value)
+ * must never silently turn it on at 14. Warns once per process on the bad path.
+ */
+function topicIdleReclaimDays(): number {
+  const raw = process.env.NANOCLAW_TOPIC_IDLE_RECLAIM_DAYS;
+  if (raw === undefined) return DEFAULT_TOPIC_IDLE_RECLAIM_DAYS;
+  if (/^\d+$/.test(raw)) return Number(raw);
+  if (!warnedBadIdleReclaimDays) {
+    warnedBadIdleReclaimDays = true;
+    log.warn('Worktree cleanup: invalid NANOCLAW_TOPIC_IDLE_RECLAIM_DAYS, disabling idle reclaim', { value: raw });
+  }
+  return 0;
+}
+
+/** Days since an ISO timestamp. An unparseable timestamp fails closed (treated as just-now). */
+function daysSince(iso: string): number {
+  const ms = Date.parse(iso);
+  return Number.isFinite(ms) ? (Date.now() - ms) / 86_400_000 : 0;
+}
 
 interface TopicParticipant {
   sessionId: string;
   agentGroupId: string;
   status: string;
+  /** COALESCE(last_active, created_at) — ISO-8601 UTC. */
+  idleSince: string;
 }
 
 export interface TopicWorktreeTarget {
@@ -63,6 +96,7 @@ interface SessionRow {
   platform_id: string | null;
   folder: string;
   workgroup_id: string;
+  idle_since: string;
 }
 
 function git(cwd: string, args: string[]): string | null {
@@ -108,7 +142,8 @@ function sessionInventory(): SessionRow[] | null {
       .prepare(
         `SELECT s.id AS session_id, s.agent_group_id, s.status, s.thread_id,
                 s.messaging_group_id, mg.platform_id, ag.folder,
-                COALESCE(ag.workgroup_id, ag.folder) AS workgroup_id
+                COALESCE(ag.workgroup_id, ag.folder) AS workgroup_id,
+                COALESCE(s.last_active, s.created_at) AS idle_since
            FROM sessions s
            JOIN agent_groups ag ON ag.id = s.agent_group_id
            LEFT JOIN messaging_groups mg ON mg.id = s.messaging_group_id`,
@@ -143,6 +178,7 @@ function participantsByTopic(
         sessionId: row.session_id,
         agentGroupId: row.agent_group_id,
         status: row.status,
+        idleSince: row.idle_since,
       });
       result.set(key, current);
     } catch (err) {
@@ -260,6 +296,36 @@ function topicIsBusy(participants: TopicParticipant[], dataDir: string): boolean
       isContainerSpawning(participant.sessionId) ||
       participantHasPersistedWork(participant, dataDir),
   );
+}
+
+/**
+ * Side (a): is topic ownership clear enough to consider collecting?
+ *
+ * Every owning row CLOSED, or no row at all, is the original predicate —
+ * byte-identical behavior. Otherwise (owner-approved 2026-08-29 widening):
+ * EVERY row, closed ones included, must be idle at least idleReclaimDays by
+ * coalesce(last_active, created_at). Closure alone no longer exempts a row
+ * once any sibling is open — a session closed only yesterday is evidence of
+ * recent topic activity, not proof the topic is quiet.
+ */
+function sideAClear(
+  participants: TopicParticipant[] | undefined,
+  idleReclaimDays: number,
+): { pass: boolean; viaIdle: boolean } {
+  if (!participants || participants.length === 0) return { pass: true, viaIdle: false };
+  if (participants.every((p) => p.status === 'closed')) return { pass: true, viaIdle: false };
+  // The idle path only ever reasons about steady states. `archiving` (mid
+  // reclaim CAS) or any other/NULL status is a transitional or unrecognized
+  // state the idle floor was never evaluated against — refuse outright
+  // rather than let it ride through on a sibling's idle time.
+  if (
+    idleReclaimDays > 0 &&
+    participants.every((p) => p.status === 'closed' || p.status === 'active') &&
+    participants.every((p) => daysSince(p.idleSince) >= idleReclaimDays)
+  ) {
+    return { pass: true, viaIdle: true };
+  }
+  return { pass: false, viaIdle: false };
 }
 
 function transferReferencesPath(
@@ -620,6 +686,7 @@ function record(report: GcReport, candidate: GcCandidate): void {
 
 function collectOrphanTopics(report: GcReport, dataDir: string, owners: Map<string, TopicParticipant[]>): void {
   const topicsRoot = path.join(dataDir, 'v2-topics');
+  const idleReclaimDays = topicIdleReclaimDays();
   for (const workgroupId of safeDirectories(topicsRoot) ?? []) {
     const workgroupDir = path.join(topicsRoot, workgroupId);
     for (const topic of safeDirectories(workgroupDir) ?? []) {
@@ -628,11 +695,11 @@ function collectOrphanTopics(report: GcReport, dataDir: string, owners: Map<stri
         record(report, { category: 'orphan-topic', path: topicDir, collect: false, reason, bytes: 0 });
 
       const participants = owners.get(topicDir);
-      // Side (a): every owning session row is CLOSED, or there is no row at
-      // all. Status alone is not enough — a closed session can still hold a
-      // processing claim or a continuation, and `topicIsBusy` fails closed on
-      // anything it cannot read.
-      if (participants?.some((participant) => participant.status !== 'closed')) {
+      // Side (a) — see sideAClear. Status alone is not enough even once it
+      // passes: a closed session can still hold a processing claim or a
+      // continuation, and `topicIsBusy` fails closed on anything unreadable.
+      const { pass, viaIdle: collectedViaIdle } = sideAClear(participants, idleReclaimDays);
+      if (!pass) {
         skip('topic-open');
         continue;
       }
@@ -674,7 +741,7 @@ function collectOrphanTopics(report: GcReport, dataDir: string, owners: Map<stri
         category: 'orphan-topic',
         path: topicDir,
         collect: true,
-        reason: participants ? 'closed-and-clean' : 'orphaned-and-clean',
+        reason: collectedViaIdle ? 'idle-and-clean' : participants ? 'closed-and-clean' : 'orphaned-and-clean',
         bytes: dirSizeBytes(topicDir),
       });
     }
@@ -825,7 +892,7 @@ function stillDisposable(candidate: GcCandidate, dataDir: string, mounts: string
     return { ok: true, reason: 'recheck-clear' };
   }
   const owner = participantsByTopic(dataDir).get(candidate.path);
-  if (owner?.participants.some((participant) => participant.status !== 'closed')) {
+  if (!sideAClear(owner?.participants, topicIdleReclaimDays()).pass) {
     return { ok: false, reason: 'recheck-topic-open' };
   }
   if (owner && topicIsBusy(owner.participants, dataDir)) return { ok: false, reason: 'recheck-topic-busy' };

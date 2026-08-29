@@ -107,7 +107,8 @@ function workUnit(threadId: string) {
   });
 }
 
-function sessionRow(threadId: string, folder = 'folder-a', status = 'closed') {
+/** idleDays: how long ago (last_active, created_at) was — omit for "just now". */
+function sessionRow(threadId: string, folder = 'folder-a', status = 'closed', idleDays = 0) {
   return {
     session_id: `s-${threadId}`,
     agent_group_id: `ag-${threadId}`,
@@ -117,6 +118,7 @@ function sessionRow(threadId: string, folder = 'folder-a', status = 'closed') {
     platform_id: 'slack:C1',
     folder,
     workgroup_id: WG,
+    idle_since: new Date(Date.now() - idleDays * 86_400_000).toISOString(),
   };
 }
 
@@ -179,11 +181,13 @@ beforeEach(() => {
   state.rowsPerCall = null;
   state.call = 0;
   delete process.env.NANOCLAW_STORAGE_GC;
+  delete process.env.NANOCLAW_TOPIC_IDLE_RECLAIM_DAYS;
 });
 
 afterEach(() => {
   fs.rmSync(path.dirname(state.dataDir), { recursive: true, force: true });
   delete process.env.NANOCLAW_STORAGE_GC;
+  delete process.env.NANOCLAW_TOPIC_IDLE_RECLAIM_DAYS;
 });
 
 describe('storage GC — evidence', () => {
@@ -293,6 +297,82 @@ describe('storage GC — the predicate refuses', () => {
   });
 });
 
+describe('storage GC — idle-threshold reclaim (owner-approved side-a widening)', () => {
+  it('collects an OPEN topic whose sole owning session has been idle past the threshold', () => {
+    const { topicDir } = topicFixture('thread-idle-20');
+    state.rows = [sessionRow('thread-idle-20', 'folder-a', 'active', 20)];
+    const report = runStorageGcOnce(state.dataDir, state.groupsDir);
+    expect(find(report, topicDir)).toMatchObject({ collect: true, reason: 'idle-and-clean' });
+  });
+
+  it('refuses an OPEN topic whose session has not been idle long enough', () => {
+    const { topicDir } = topicFixture('thread-idle-10');
+    state.rows = [sessionRow('thread-idle-10', 'folder-a', 'active', 10)];
+    const report = runStorageGcOnce(state.dataDir, state.groupsDir);
+    expect(find(report, topicDir)).toMatchObject({ collect: false, reason: 'topic-open' });
+  });
+
+  it('still refuses a DIRTY checkout even once the idle threshold is met', () => {
+    const { topicDir, worktree } = topicFixture('thread-idle-dirty');
+    fs.writeFileSync(path.join(worktree, 'uncommitted.txt'), 'wip');
+    state.rows = [sessionRow('thread-idle-dirty', 'folder-a', 'active', 20)];
+    const report = runStorageGcOnce(state.dataDir, state.groupsDir);
+    expect(find(report, topicDir)).toMatchObject({ collect: false, reason: 'dirty' });
+  });
+
+  it('refuses when ANY owning OPEN session is under the idle threshold', () => {
+    const { topicDir } = topicFixture('thread-idle-mixed');
+    const stale = sessionRow('thread-idle-mixed', 'folder-a', 'active', 20);
+    // A second sibling session on the SAME topic (own row), too fresh.
+    const fresh = sessionRow('thread-idle-mixed-2', 'folder-a', 'active', 2);
+    fresh.thread_id = 'thread-idle-mixed';
+    state.rows = [stale, fresh];
+    const report = runStorageGcOnce(state.dataDir, state.groupsDir);
+    expect(find(report, topicDir)).toMatchObject({ collect: false, reason: 'topic-open' });
+  });
+
+  it('refuses when a CLOSED sibling was itself only recently closed', () => {
+    // Quantifier: once ANY participant is open, EVERY participant — closed
+    // ones included — must clear the idle floor. A sibling closed yesterday
+    // is evidence of recent topic activity, not proof the topic is quiet.
+    const { topicDir } = topicFixture('thread-idle-closed-recent');
+    const open = sessionRow('thread-idle-closed-recent', 'folder-a', 'active', 20);
+    const closedRecent = sessionRow('thread-idle-closed-recent-2', 'folder-a', 'closed', 1);
+    closedRecent.thread_id = 'thread-idle-closed-recent';
+    state.rows = [open, closedRecent];
+    const report = runStorageGcOnce(state.dataDir, state.groupsDir);
+    expect(find(report, topicDir)).toMatchObject({ collect: false, reason: 'topic-open' });
+  });
+
+  it('refuses an idle ARCHIVING (transitional-status) participant via the idle path', () => {
+    // archiving is a real mid-reclaim-CAS status, not a steady closed/active
+    // state the idle floor was ever meant to reason about.
+    const { topicDir } = topicFixture('thread-idle-archiving');
+    state.rows = [sessionRow('thread-idle-archiving', 'folder-a', 'archiving', 20)];
+    const report = runStorageGcOnce(state.dataDir, state.groupsDir);
+    expect(find(report, topicDir)).toMatchObject({ collect: false, reason: 'topic-open' });
+  });
+
+  it('NANOCLAW_TOPIC_IDLE_RECLAIM_DAYS=0 disables the idle path (old behavior)', () => {
+    process.env.NANOCLAW_TOPIC_IDLE_RECLAIM_DAYS = '0';
+    const { topicDir } = topicFixture('thread-idle-disabled');
+    state.rows = [sessionRow('thread-idle-disabled', 'folder-a', 'active', 100)];
+    const report = runStorageGcOnce(state.dataDir, state.groupsDir);
+    expect(find(report, topicDir)).toMatchObject({ collect: false, reason: 'topic-open' });
+  });
+
+  it.each(['abc', '1e2', '-1', '0.5', 'NaN', ''])(
+    'treats an invalid knob value (%s) as DISABLED, never as the default',
+    (bad) => {
+      process.env.NANOCLAW_TOPIC_IDLE_RECLAIM_DAYS = bad;
+      const { topicDir } = topicFixture(`thread-idle-badknob-${bad}`);
+      state.rows = [sessionRow(`thread-idle-badknob-${bad}`, 'folder-a', 'active', 100)];
+      const report = runStorageGcOnce(state.dataDir, state.groupsDir);
+      expect(find(report, topicDir)).toMatchObject({ collect: false, reason: 'topic-open' });
+    },
+  );
+});
+
 describe('storage GC — clones', () => {
   it('collects a clean, pushed, idle scratch clone at depth', () => {
     const dir = cloneFixture('folder-a/prwork/668');
@@ -391,6 +471,32 @@ describe('storage GC — apply mode', () => {
     // Call 1 is the scan's inventory, call 2 its participant map; the pre-trash
     // recheck sees an active row that did not exist when the scan ran.
     state.rowsPerCall = [[], [], [sessionRow('thread-reopen', 'folder-a', 'active')]];
+    process.env.NANOCLAW_STORAGE_GC = 'apply';
+    const report = runStorageGcOnce(state.dataDir, state.groupsDir);
+    expect(find(report, topicDir)).toMatchObject({ collect: false, reason: 'recheck-topic-open' });
+    expect(fs.existsSync(topicDir)).toBe(true);
+  });
+
+  it.skipIf(!hasTrash)('actually trashes an idle-qualified OPEN topic', () => {
+    const { topicDir } = topicFixture('thread-idle-apply');
+    state.rows = [sessionRow('thread-idle-apply', 'folder-a', 'active', 20)];
+    process.env.NANOCLAW_STORAGE_GC = 'apply';
+    const report = runStorageGcOnce(state.dataDir, state.groupsDir);
+    expect(find(report, topicDir)).toMatchObject({ collect: true, reason: 'idle-and-clean' });
+    expect(fs.existsSync(topicDir)).toBe(false);
+  });
+
+  it.skipIf(!hasTrash)('demotes an idle-qualified topic whose session went active again by recheck time', () => {
+    const { topicDir } = topicFixture('thread-idle-recheck');
+    // Same 3-call shape as the reopen test above: scan sees idle 20d (qualifies
+    // and gets scheduled), pre-trash recheck sees idle only 10d (fails the
+    // floor again) — proves stillDisposable re-evaluates the idle path fresh
+    // rather than trusting the scan-time verdict.
+    state.rowsPerCall = [
+      [sessionRow('thread-idle-recheck', 'folder-a', 'active', 20)],
+      [sessionRow('thread-idle-recheck', 'folder-a', 'active', 20)],
+      [sessionRow('thread-idle-recheck', 'folder-a', 'active', 10)],
+    ];
     process.env.NANOCLAW_STORAGE_GC = 'apply';
     const report = runStorageGcOnce(state.dataDir, state.groupsDir);
     expect(find(report, topicDir)).toMatchObject({ collect: false, reason: 'recheck-topic-open' });
