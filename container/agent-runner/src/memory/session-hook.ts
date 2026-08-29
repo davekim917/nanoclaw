@@ -1,4 +1,4 @@
-import { renderMemoryLifecycleGuidance } from './context.js';
+import { renderMemorySection } from './context.js';
 
 const MEMORY_CONTEXT_SOURCES = ['startup', 'clear', 'compact'] as const;
 
@@ -17,7 +17,7 @@ export const MEMORY_SESSION_HOOK: MemorySessionHookRegistration = {
   sources: MEMORY_CONTEXT_SOURCES,
 };
 
-/** Return trusted static guidance only while a provider establishes a new context window. */
+/** Return memory only when a provider is establishing a new context window. */
 export function memoryContextForSessionStart(source: MemorySessionStartSource, baseDir?: string): string | undefined {
-  return source === 'resume' ? undefined : renderMemoryLifecycleGuidance(baseDir);
+  return source === 'resume' ? undefined : renderMemorySection(baseDir);
 }

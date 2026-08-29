@@ -32,7 +32,7 @@ const DEFINITION_TEMPLATE = path.join(
  * `definition.md` reaches agents through that same lane. This lifecycle seam
  * must never read or promote workgroup bytes into system instructions.
  */
-export function renderMemoryLifecycleGuidance(_baseDir?: string): string {
+export function renderMemorySection(_baseDir?: string): string {
   return [
     '## Workgroup Memory',
     '',
