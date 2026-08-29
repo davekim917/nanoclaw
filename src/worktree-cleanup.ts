@@ -1106,9 +1106,18 @@ function readPendingPrunes(dataDir: string): PendingPrune[] {
  *  trash something the journal is meant to protect must abort on `false`
  *  rather than proceed without a durable record (Codex P2). */
 function writePendingPrunes(dataDir: string, entries: PendingPrune[]): boolean {
+  const target = pendingPrunePath(dataDir);
   try {
-    if (entries.length === 0) fs.rmSync(pendingPrunePath(dataDir), { force: true });
-    else fs.writeFileSync(pendingPrunePath(dataDir), JSON.stringify(entries));
+    if (entries.length === 0) {
+      fs.rmSync(target, { force: true });
+    } else {
+      // Codex P2: write-then-rename, not in-place — a failure partway
+      // through (ENOSPC/EIO/kill) never touches `target`, so the existing
+      // journal survives untouched instead of being left empty/truncated.
+      const tmp = `${target}.tmp-${process.pid}`;
+      fs.writeFileSync(tmp, JSON.stringify(entries));
+      fs.renameSync(tmp, target);
+    }
     return true;
   } catch (err) {
     log.warn('Storage GC: could not update the pending-prune journal', { err });

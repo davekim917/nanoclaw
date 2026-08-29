@@ -952,4 +952,38 @@ describe('storage GC — apply mode', () => {
       else process.env.XDG_DATA_HOME = savedXdg;
     }
   });
+
+  it.skipIf(!hasTrash)(
+    'Codex P2: a failed journal write never corrupts the existing journal (atomic tmp+rename)',
+    () => {
+      const { topicDir } = topicFixture('thread-idle-journalpartial');
+      state.rows = [sessionRow('thread-idle-journalpartial', 'folder-a', 'active', 20)];
+      const journalPath = path.join(state.dataDir, '.gc-pending-prunes.json');
+      const existing = [{ workgroupId: WG, repo: 'unrelated-repo' }];
+      fs.writeFileSync(journalPath, JSON.stringify(existing));
+
+      // Force the TEMP-file write to fail (simulating ENOSPC/EIO/a kill
+      // mid-write). Because writes go to a tmp path first, this must never
+      // touch the real journal file at all.
+      const realWriteFileSync = fs.writeFileSync;
+      vi.spyOn(fs, 'writeFileSync').mockImplementation(((...args: Parameters<typeof fs.writeFileSync>) => {
+        const [file] = args;
+        if (typeof file === 'string' && file.includes('.gc-pending-prunes.json.tmp-')) {
+          throw new Error('simulated: partial write / crash mid-write');
+        }
+        return (realWriteFileSync as (...a: unknown[]) => unknown)(...args);
+      }) as typeof fs.writeFileSync);
+
+      process.env.NANOCLAW_STORAGE_GC = 'apply';
+      let report: GcReport;
+      try {
+        report = runStorageGcOnce(state.dataDir, state.groupsDir);
+      } finally {
+        vi.restoreAllMocks();
+      }
+      expect(find(report, topicDir)).toMatchObject({ collect: false, reason: 'aborted-prune-journal-unwritable' });
+      // The pre-existing journal content survives untouched — no corruption.
+      expect(JSON.parse(fs.readFileSync(journalPath, 'utf8'))).toEqual(existing);
+    },
+  );
 });
