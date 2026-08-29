@@ -126,6 +126,11 @@ if [ "$POST_PULL" != "1" ]; then
 
   # Bash keeps reading the already-open script after git replaces it. Re-exec
   # the freshly pulled copy so the deployment always uses the code it installs.
+  # Validate it before exec replaces this shell and discards its rollback trap.
+  if [ ! -r scripts/deploy.sh ] || ! bash -n scripts/deploy.sh >> "$LOG" 2>&1; then
+    write_status "failed" "deploy handoff" "pulled deploy script is missing or invalid — restored the previous build"
+    exit 1
+  fi
   exec env \
     NANOCLAW_DEPLOY_POST_PULL=1 \
     NANOCLAW_DEPLOY_PRE_COMMIT="$PRE_COMMIT" \

@@ -9,6 +9,7 @@ const script = fs.readFileSync(path.join(root, 'scripts', 'deploy.sh'), 'utf-8')
 describe('deploy rollback shell contract', () => {
   it('snapshots before a fast-forward pull and re-execs the pulled script', () => {
     expect(script.indexOf('snapshot_dir node_modules')).toBeLessThan(script.indexOf('git pull --ff-only origin main'));
+    expect(script.indexOf('bash -n scripts/deploy.sh')).toBeLessThan(script.indexOf('exec env'));
     expect(script).toContain('NANOCLAW_DEPLOY_POST_PULL=1');
     expect(script).toContain('bash scripts/deploy.sh');
   });
