@@ -1294,6 +1294,22 @@ describe('Claude Bash timeout policy (structural)', () => {
   });
 });
 
+describe('pnpm store-dir pinning (structural)', () => {
+  it('pins the store to the group mount unconditionally, ahead of the opencode-only block', () => {
+    const src = fs.readFileSync(path.join(process.cwd(), 'src', 'container-runner.ts'), 'utf-8');
+    const storeDirLine = "args.push('-e', 'npm_config_store_dir=/workspace/agent/.pnpm-store')";
+    const storeDirLinePnpm = "args.push('-e', 'pnpm_config_store_dir=/workspace/agent/.pnpm-store')";
+    expect(src).toContain(storeDirLine);
+    expect(src).toContain(storeDirLinePnpm);
+
+    // Not nested inside `if (provider === 'opencode') {' — it must apply to
+    // every provider, so it has to appear before that gate in source order.
+    const opencodeGateIdx = src.indexOf("if (provider === 'opencode')");
+    expect(src.indexOf(storeDirLine)).toBeGreaterThan(-1);
+    expect(src.indexOf(storeDirLine)).toBeLessThan(opencodeGateIdx);
+  });
+});
+
 // The one guard that covers every by-id wake caller at once. It sits above any
 // DB or Docker work in wakeContainer, so it is reachable without a host.
 describe('wakeContainer session-status admission', () => {
