@@ -48,6 +48,7 @@ import {
   buildPreTurnContext,
   enforceFinalBound,
   evaluateRecallCorpus,
+  GENERATED_MEMORY_MAX_BYTES,
   PRE_TURN_BOUNDS,
   tokenizeForRecall,
   type ContextNotice,

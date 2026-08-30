@@ -38,7 +38,7 @@ import { runGuarded, type DeliveryGuardSpec, type GuardedDeliveryHandler } from 
 import { isUnguarded, unguarded, type Unguarded } from './guard/index.js';
 import { log } from './log.js';
 import { scrubSecrets } from './secret-scrubber.js';
-import { archiveMessageAndScheduleMemoryCuration } from './message-archive.js';
+import { archiveMessage } from './message-archive.js';
 import { normalizeOptions } from './channels/ask-question.js';
 import { clearOutbox, openInboundDb, openOutboundDb, outboundDbPath, readOutboxFiles } from './session-manager.js';
 import { pauseTypingRefreshAfterDelivery, setTypingAdapter } from './modules/typing/index.js';
@@ -1327,26 +1327,20 @@ async function deliverMessage(
         typeof parsed.text === 'string' ? parsed.text : typeof parsed.content === 'string' ? parsed.content : '';
       if (text && msg.channel_type && msg.platform_id) {
         const mg = getMessagingGroupByPlatform(msg.channel_type, msg.platform_id);
-        const group = getAgentGroup(session.agent_group_id);
-        if (group) {
-          archiveMessageAndScheduleMemoryCuration(
-            {
-              id: msg.id,
-              agentGroupId: session.agent_group_id,
-              messagingGroupId: session.messaging_group_id,
-              channelType: msg.channel_type,
-              channelName: mg?.name ?? null,
-              platformId: msg.platform_id,
-              threadId: msg.thread_id,
-              role: 'assistant',
-              senderId: session.agent_group_id,
-              senderName: 'assistant',
-              text,
-              sentAt: new Date().toISOString(),
-            },
-            group.workgroup_id ?? group.folder,
-          );
-        }
+        archiveMessage({
+          id: msg.id,
+          agentGroupId: session.agent_group_id,
+          messagingGroupId: session.messaging_group_id,
+          channelType: msg.channel_type,
+          channelName: mg?.name ?? null,
+          platformId: msg.platform_id,
+          threadId: msg.thread_id,
+          role: 'assistant',
+          senderId: session.agent_group_id,
+          senderName: 'assistant',
+          text,
+          sentAt: new Date().toISOString(),
+        });
       }
     } catch {
       // best-effort

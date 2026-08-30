@@ -32,7 +32,7 @@ vi.mock('./config.js', async () => {
 const TEST_DIR = '/tmp/nanoclaw-test-router-session-skip';
 
 vi.mock('./message-archive.js', () => ({
-  archiveMessageAndScheduleMemoryCuration: vi.fn(),
+  archiveMessage: vi.fn(),
 }));
 
 vi.mock('./topic-title.js', () => ({
@@ -50,7 +50,7 @@ import {
 } from './db/index.js';
 import { findSessionForAgent, createSession } from './db/sessions.js';
 import { inboundDbPath } from './session-manager.js';
-import { archiveMessageAndScheduleMemoryCuration } from './message-archive.js';
+import { archiveMessage } from './message-archive.js';
 import { buildThreadContextBlock, THREAD_CONTEXT_LIMIT } from './thread-context.js';
 import type { ChannelAdapter, InboundEvent } from './channels/adapter.js';
 import type { IgnoredMessagePolicy, SessionMode } from './types.js';
@@ -210,7 +210,7 @@ beforeEach(() => {
   historyCalls = [];
   historyThrows = false;
   supportsFetchThreadHistory = true;
-  vi.mocked(archiveMessageAndScheduleMemoryCuration).mockReset();
+  vi.mocked(archiveMessage).mockReset();
 });
 
 afterEach(() => {
@@ -230,7 +230,7 @@ describe('non-engaged session skip', () => {
       threadHistory.push({ sender: 'Sender One', text: 'deploy finished, all green', timestamp: now() });
 
       expect(findSessionForAgent(AG, MG, THREAD)).toBeUndefined();
-      expect(archiveMessageAndScheduleMemoryCuration).toHaveBeenCalledTimes(1);
+      expect(archiveMessage).toHaveBeenCalledTimes(1);
 
       // 2. A human replies — also non-waking. Still no session.
       await routeInbound(event({ id: 'm-2', text: 'nice, did staging pick it up?', sender: 'Sender Two' }));
@@ -297,7 +297,7 @@ describe('non-engaged session skip', () => {
     // row is the message's only remaining copy. If it did not land, the skip
     // must not happen.
     wire();
-    vi.mocked(archiveMessageAndScheduleMemoryCuration).mockImplementation(() => {
+    vi.mocked(archiveMessage).mockImplementation(() => {
       throw new Error('archive.db is locked');
     });
     await withAdapter(async () => {
@@ -369,7 +369,7 @@ describe('non-engaged session skip', () => {
       expect(findSessionForAgent(AG, MG, THREAD)).toBeUndefined();
       await routeInbound(event({ id: 'm-2', text: 'chat-sdk kind', kind: 'chat-sdk' }));
       expect(findSessionForAgent(AG, MG, THREAD)).toBeUndefined();
-      expect(archiveMessageAndScheduleMemoryCuration).toHaveBeenCalledTimes(2);
+      expect(archiveMessage).toHaveBeenCalledTimes(2);
     });
   });
 

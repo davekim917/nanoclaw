@@ -38,7 +38,9 @@ export interface MemoryWriteOptions {
   retryDelayMs?: number;
   beforeRename?: () => void | Promise<void>;
   beforeAtomicRename?: () => void;
-  /** Host curator only. Container paths fail the canonical-host-root check. */
+  /** Host-side writers only, and no host writer sets it today — the memory
+   *  curator that did has been removed. Container paths fail the
+   *  canonical-host-root check regardless. */
   allowGeneratedMemory?: boolean;
 }
 

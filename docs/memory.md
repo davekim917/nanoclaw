@@ -27,7 +27,7 @@ memory/
 ├── index.md
 ├── generated/
 │   └── memory.md
-├── people/            # curator-maintained topic files
+├── people/            # topic files, left by the retired curator
 │   ├── index.md
 │   └── <entity>.md
 ├── domain/
@@ -65,11 +65,29 @@ tool rejects a missing or symlinked parent.
 `CLAUDE.local.md` and `instructions.prepend.md` are standing instruction
 surfaces, not memory write targets.
 
-## Curator-maintained topic files
+## Topic files and the generated ledger
 
-`people/`, `domain/` and `systems/` hold the background curator's consolidated
-views, distilled from `generated/memory.md`. They are ordinary OKF concept
-files — nothing about reading or hand-editing them is special:
+`generated/memory.md` and the `people/`, `domain/` and `systems/` topic files
+were written by a background memory curator that has been REMOVED. Nothing
+writes them any more. They are kept, not deleted: on a live install they hold
+megabytes of accumulated facts and hundreds of topic files.
+
+The two are read very differently now.
+
+`generated/memory.md` is a flat list of self-contained one-line facts, each
+carrying an HTML provenance marker. It is the one memory file recall still
+ranks, one fact at a time rather than as a single document, and it is gated on
+`NANOCLAW_MEMORY_CURATOR_ENABLED`. Off — the default, and what live installs
+set — means no fact injection at all. The variable keeps the curator's name
+because it is set in existing `.env` files; with the curator gone it is a
+recall switch, and the only thing that decides whether that accumulated ledger
+reaches a prompt.
+
+The topic files are not read automatically by anything. Recall touches only
+`index.md`, the sender-matched `preferences/<slug>.md` files, and the ledger
+above — an agent reaches a topic file by navigating from `index.md` or by
+grepping `/workspace/workgroup/memory` itself. They are ordinary OKF concept
+files; nothing about reading or hand-editing them is special:
 
 ```yaml
 ---
@@ -78,203 +96,25 @@ consolidated_facts: 150
 ---
 ```
 
-Frontmatter is metadata the agent reads, not host-ranked text. `title` and
-`description` ("used when scanning indexes and search hits") and `tags`
-("cross-cutting labels for search and grouping") are what make a file findable
-when the agent greps the tree; `resource` is a path or a URL. The host does not
-walk, read or rank these files per turn — it hands the agent `index.md` and the
-OKF contract, and the agent follows the links or greps
-`/workspace/workgroup/memory` itself.
+`type` came from the directory (`person`, `domain`, `system`) and can be
+hand-corrected freely. `consolidated_facts` — and the older
+`<!-- consolidated: facts=N -->` HTML comment some files carry instead — was
+the curator's ownership marker; with no curator it is inert provenance. Edit or
+delete either without consequence.
 
-Setting `title:` or `description:` by hand is also how you fix an ugly map
-entry — the curator carries both forward untouched and prefers them over the
-slug-derived title and the lead-line hook. It never writes either field itself.
+Index maintenance was the curator's too, and went with it: `index.md` at the
+memory root and in each topic folder is now purely hand-maintained. Write map
+links as ordinary `- [Title](target.md)` bullets under an unindented ATX
+`## Map` heading, and keep `index.md` inside the 2,500-byte bound it is
+injected under — it is the map the agent navigates by, so a truncated one costs
+reachability, and detail belongs in the linked files.
 
-`type` comes from the directory (`person`, `domain`, `system`) and can be
-hand-corrected to better vocabulary; the curator carries a changed `type`, and
-every other frontmatter key it does not recognize, forward untouched.
-`consolidated_facts` is the provenance and ownership marker: how many ledger
-facts the last pass folded in, and the thing that makes the file a legitimate
-curator write target. Removing it makes the file human-owned, and the curator
-will refuse to overwrite it from then on. Files predating this format carry a
-`<!-- consolidated: facts=N -->` HTML comment instead; that is still honored as
-proof of ownership and is replaced with frontmatter the next time the curator
-rewrites the file. `scripts/repair-memory-topic-frontmatter.ts` converts a whole
-install ahead of that (dry run by default, `--apply` to write).
+## Memory writes
 
-The curator also maintains the map. After every consolidation pass it rewrites
-each topic folder's `index.md` from what is on disk and points the root
-`index.md`'s `## Map` section at those three folder indexes.
-
-Two-level, and placed high, because `index.md` is read HEAD-first under a hard
-2,500-byte bound (`PRE_TURN_BOUNDS.markdownCoreChars` on the host,
-`MAX_INDEX_BYTES` in the container bootstrap). That bound is
-`system/definition.md`'s own rule in code — "headlines and pointers here, detail
-in linked files" — not a budget memory outgrew: detail belongs in the linked
-files recall pulls at 12-16k. So the root Map carries three pointers, each
-folder index carries one bullet per concept, and the curator's pointers lead the
-Map's bullet list rather than trailing it. On the busiest live workgroup the
-`## Map` heading already sat at byte 1,881 but thirteen hand-written bullets
-pushed appended links to 4,308, where nothing reads them; leading the list puts
-them at 2,107. Where a `## Map` the curator CREATES goes is its choice (after
-`## Core Memory`); where an existing one sits is never changed.
-`scripts/repair-memory-topic-frontmatter.ts` prints a NOTICE for any index whose
-pointers still land past the bound — shortening what sits above them is an
-editorial call for a human, not something a background pass does by deletion.
-
-This is a merge, not a regeneration. Headings, frontmatter, other sections,
-section ordering, fenced code blocks, HTML comments, non-indented prose, and
-hand-written Map links to files the curator does not own survive it. Trailing
-whitespace inside and after the managed section is normalized, and CRLF input
-becomes LF. Lines immediately indented under a link the curator re-renders move
-WITH it, so a hand-written note keeps the entry it was written under.
-
-**Index maintenance has known destructive bugs and is under review.** What
-follows says what is actually true today, which is less than earlier versions
-of this document claimed. Earlier text here promised that nothing
-hand-written is ever lost and that every misread construct merely duplicates a
-link; both were wrong, and an overclaim here is worse than a gap, because it
-turns a known limitation into an unknown one. Until this notice is removed,
-treat any construct not named below as unverified rather than safe.
-
-A link _should_ only be removed on positive evidence its target is gone —
-`managedTargets` in `src/modules/memory/memory-index.ts` is that rule, and a
-folder whose listing failed, a file that could not be read, and a reserved name
-filtered out of a listing all keep their links. Two inputs to the rule are
-still wrong. The directory listing is taken _before_ the index file is read, so
-a topic file created in between is deleted from the map with a clean
-compare-and-swap and no retry; and a symlinked topic file is not counted as
-present, so a hand-written link to one is deleted while the file is still on
-disk.
-
-The merge is a line-walker, not a Markdown parser. Constructs it reads
-imprecisely _without_ losing content: a `> - [X](y.md)` in a blockquote, a
-`* [X](y.md)` star-marker bullet, a tab-indented bullet, and a `[X]: y.md` link
-reference definition are not recognized as the curator's, so a second link to
-the same target appears beside them; a setext `Map` / `---` heading is not
-recognized as the managed `## Map`, so a fresh one is appended at end of file (a
-setext heading _inside_ the section is a recognized boundary). Constructs where
-it **does** lose or move hand-written lines: an HTML block is protected only as
-far as the next blank line, so a bullet after a blank line inside a `<script>`
-or `<div>` block is deleted; an ATX heading indented one to three spaces is not
-treated as a section boundary, so bullets filed under it are hoisted above it;
-and a re-rendered bullet carries only its contiguous indented lines, so in a
-loose list the child after a blank line is left behind and reparented.
-
-Write map links as ordinary `- [Title](target.md)` bullets under an unindented
-ATX `## Map` heading and none of this reaches you.
-
-## Selective background capture
-
-Foreground agents still use `write_memory_file` for explicit "remember this"
-requests, corrections, decisions, and other facts that should be durable
-immediately. That tool cannot write `generated/memory.md`; this keeps
-user-authored, imported, and foreground-agent memory separate from automatic
-capture.
-
-`NANOCLAW_MEMORY_CURATOR_ENABLED` gates the whole fact system, both halves:
-writing new facts AND recalling previously written ones. Turning it off stops
-`generated/memory.md` from being injected as well as from growing — without
-that, an install with an accumulated ledger keeps serving those facts forever
-and "curator off" is untestable as an A/B. Off means the ledger is excluded
-from BOTH recall lanes; it is deliberately not demoted into the ordinary
-markdown lane, where a multi-megabyte file would surface roughly one fact per
-turn while consuming the shared markdown scan budget. The predicate lives in
-`src/modules/memory/curator-contract.ts`.
-
-When `NANOCLAW_MEMORY_CURATOR_ENABLED=true`, the host also reviews completed
-conversation episodes after five minutes of inactivity. This work is
-fire-and-forget from the 60-second host sweep: routing and delivery perform only
-the archive/queue transaction and never wait for a model call.
-
-The curator uses only `claude-sonnet-5` at medium effort through Claude Code's
-subscription-aware, non-interactive runtime, without tools, provider
-continuation, prompt suggestions, or fallback. The selected OAuth slot is the
-child process's only Anthropic credential; the untrusted episode payload is
-sent over stdin, safe mode excludes project and user customizations, and the
-Anthropic model endpoint bypasses the OneCLI credential proxy so the gateway
-cannot replace the selected identity. The host also recovers the real primary
-from `.env` when the OneCLI service wrapper has shadowed it with its
-`placeholder` sentinel. Each job is bounded to 80 de-duplicated messages and
-24,000 transcript characters, a relevance-ranked generated-memory view capped
-at 32,000 characters, and up to three relevant manual-memory excerpts. The
-canonical generated store is independently bounded at 1 MiB; automatic
-agent recall remains governed by the 12,000-character final context budget.
-
-A fact is never evicted. Nothing ages out, and a decision captured months ago
-stays recallable for as long as it is the most relevant answer to a turn. The
-1 MiB bound is a runaway rail, not a retention policy, and its real cost is
-that the store is re-tokenized on each turn to rank it — roughly 525 ms per
-MiB. Crossing 75 percent logs a warning long before the ceiling bites, and a
-queue that has retried a write past three attempts is reported by the runtime
-verifier as a non-blocking `curator-episodes-stuck` warning instead of being
-indistinguishable from a healthy idle queue.
-Its default decision is `noop`.
-It captures durable decisions, corrections, stable cross-task preferences,
-verified outcomes, durable workflows, and durable facts about people,
-organizations, and external systems — who they are, what they own, and how to
-route work to them. A stated role or ownership counts even when it arrives in
-passing rather than as a decision; before this category existed, 134 archived
-messages mentioning two named feed liaisons distilled to zero facts about who
-they were. It rejects secrets, capability state, transient work, speculation,
-third-party uncertainty, and facts recoverable from code.
-A worked method that succeeded — a query pattern, an API sequence, a debugging
-technique — is a durable workflow, distinct from the raw output around it.
-Agents also record methods directly at solve time under `memory/methods/`
-(standing instruction in `container/CLAUDE.md`), where recall surfaces them
-when a similar problem arrives; the curator complements that from what agents
-narrate in chat, since it never sees container tool calls.
-
-The model returns semantic facts plus archive evidence IDs, never Markdown.
-The host owns the complete representation: it normalizes fact text, derives
-stable IDs and capture timestamps from trusted evidence, preserves every active
-fact unless current evidence explicitly supersedes it, and renders the
-canonical heading, bullets, and provenance markers. It then validates its own
-rendered document, scrubs secrets, and promotes through the same workgroup lock
-and SHA compare-and-swap writer used by sibling agents. A model's heading,
-bullet, marker, ID, or timestamp spelling therefore cannot block a valid
-capture because those fields are not part of the model contract.
-If a semantic candidate exceeds the 2,000-character limit, the curator gets
-one bounded repair attempt before the durable episode is retained for retry;
-content is never silently truncated or discarded. The limit was 1,000, which
-rejected more captures than every other failure cause combined against a live
-median fact length of 658 characters.
-Provider-namespaced archive IDs may be cited by their raw platform ID only when
-that shorthand resolves to exactly one allowed row; ambiguous or invented IDs
-still fail closed.
-Failures leave both the pending episode and existing memory intact.
-The host resolves the shared Bun compare-and-swap helper from an explicit
-`BUN_BIN`, the service account's standard `~/.bun/bin/bun` install, or `PATH`;
-a minimal systemd `PATH` therefore cannot strand an accepted capture.
-
-The host discovers every distinct configured Claude OAuth slot and selects
-among them with a persisted round-robin cursor. A 401, 403, or 429 marks only
-that slot unavailable and immediately retries the same job once on an
-available sibling slot. Cooldowns and call history survive host restarts. If
-every slot is unavailable, the episode cursor remains untouched; the sweep
-resumes it automatically when the earliest cooldown expires.
-
-Automatic model attempts are guarded at 120 per rolling hour and 3,000 per UTC
-day. Those ceilings are above the two-attempt maximum of the one-job-per-minute
-worker, so one exhausted OAuth key cannot throttle successful work on the
-other; they exist to stop an accidental runaway caller. Saturation, pending and
-due episodes, oldest due time, retry count, and per-slot cooldown state are
-reported by the runtime verifier, and admission delay or total credential
-unavailability emits a throttled warning without deleting work.
-
-After 50 accepted updates or when generated memory exceeds 768 KiB, the host
-retires the maintenance threshold without asking a model to rewrite the
-document. The deterministic renderer already maintains the one canonical flat
-representation, so a second model-authored presentation pass would add failure
-surface without adding facts. Before every actual replacement, the previous
-generated file is snapshotted under the host-only
-`data/memory-curator-history/<workgroup-id>/` tree, outside container mounts and
-recall, with the latest 20 versions retained. Operator rollback restores one of
-those bounded snapshots through the same compare-and-swap writer, so it cannot
-silently overwrite a newer generated version.
-
-The curator defaults off. Setting the environment flag, restarting the
-service, and verifying the live queue are an explicit activation boundary.
+Agents use `write_memory_file` for explicit "remember this" requests,
+corrections, decisions, and other facts that should be durable immediately.
+That tool cannot write `generated/memory.md`. There is no automatic background
+capture: every durable fact is written by an agent in the foreground.
 
 ## Automatic pre-turn context
 

@@ -14,15 +14,15 @@ interface ProcessWriteRequest {
   allowGeneratedMemory?: boolean;
 }
 
-// Must stay at or above the host's GENERATED_MEMORY_MAX_BYTES (16 MiB) plus
-// its HELPER_REQUEST_OVERHEAD_BYTES (16 KiB) — this bounds the whole JSON
-// request, not just the content. It cannot import those: this is the Bun
-// container tree and they live in the host tree, so the two are kept in step
-// by hand.
+// Must stay at or above the host's GENERATED_MEMORY_MAX_BYTES (16 MiB, now in
+// src/modules/memory/pre-turn-context.ts) plus its
+// HELPER_REQUEST_OVERHEAD_BYTES (16 KiB) — this bounds the whole JSON request,
+// not just the content. It cannot import those: this is the Bun container tree
+// and they live in the host tree, so the two are kept in step by hand.
 //
-// Raising the host cap without this one is exactly how a curator write starts
-// failing again a few hundred KiB later: the host accepts the document, then
-// the helper rejects the request and the episode retries forever.
+// Raising the host cap without this one is exactly how a large write starts
+// failing a few hundred KiB later: the host accepts the document, then the
+// helper rejects the request.
 const MAX_CURATOR_WRITE_REQUEST_BYTES = 16400 * 1024;
 
 if (import.meta.main) {

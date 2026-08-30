@@ -34,14 +34,10 @@ after it last read the file. Treat raw provider-native projections as
 read-only. Ordinary same-file raw shell writes retain normal filesystem
 last-writer semantics and are an explicit operator escape hatch.
 
-When automatic curation is enabled, all siblings also feed one durable
-workgroup episode queue in `data/archive.db`. After an idle debounce, one host
-worker selectively writes only
-`data/workgroups/<workgroup-id>/memory/generated/memory.md`. Claude, Codex, and
-OpenCode therefore generate and recall from the same automatic-memory canon;
-there is no provider-specific generated store. Imported/manual files remain
-protected, failed jobs retain their cursor, and fixed admission limits leave
-excess work queued rather than dropping it.
+`data/workgroups/<workgroup-id>/memory/generated/memory.md` is a shared
+read-only artifact of the removed background curator. Claude, Codex, and
+OpenCode all recall from it; there is no provider-specific generated store, and
+nothing writes it any more.
 
 Before every admissible turn, the host supplies actual session capabilities,
 canonical memory, same-thread evidence, workgroup-wide archive recall, and

@@ -15,7 +15,26 @@ vi.mock('../../config.js', async (importOriginal) => ({
 
 import { runMigrations, migrations } from './index.js';
 import { migration051 } from './051-memory-consolidated-facts.js';
-import { claimMemoryMaintenance } from '../../message-archive.js';
+
+/** Workgroups the migration enqueued for maintenance, read straight from
+ *  archive.db — the application-side reader went with the memory curator, but
+ *  the migration is frozen logic and still writes these rows. */
+function pendingMaintenanceWorkgroups(): string[] {
+  const archivePath = path.join(TEST_ROOT, 'archive.db');
+  // No enqueue means no archive.db at all — the migration only opens it when
+  // it has a row to write. "File absent" is the same answer as "no rows".
+  if (!fs.existsSync(archivePath)) return [];
+  const archiveDb = new Database(archivePath);
+  try {
+    return (
+      archiveDb.prepare('SELECT workgroup_id FROM memory_curation_state WHERE maintenance_pending = 1').all() as Array<{
+        workgroup_id: string;
+      }>
+    ).map((row) => row.workgroup_id);
+  } finally {
+    archiveDb.close();
+  }
+}
 
 function ledgerContent(): string {
   return [
@@ -87,10 +106,7 @@ describe('migration051', () => {
 
     migration051.up(db);
 
-    const now = Date.now() + 60_000;
-    const first = claimMemoryMaintenance('probe-1', { nowMs: now });
-    expect(first?.workgroupId).toBe('wg-nonempty');
-    expect(claimMemoryMaintenance('probe-2', { nowMs: now })).toBeNull();
+    expect(pendingMaintenanceWorkgroups()).toEqual(['wg-nonempty']);
     db.close();
   });
 
@@ -104,8 +120,7 @@ describe('migration051', () => {
 
     migration051.up(db);
 
-    const now = Date.now() + 60_000;
-    expect(claimMemoryMaintenance('probe', { nowMs: now })).toBeNull();
+    expect(pendingMaintenanceWorkgroups()).toEqual([]);
     db.close();
   });
 

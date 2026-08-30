@@ -11,12 +11,42 @@ import {
   searchArchiveEvidence,
   type ArchiveEvidenceRow,
 } from '../../message-archive.js';
-import {
-  GENERATED_MEMORY_MAX_BYTES,
-  GENERATED_MEMORY_RELATIVE_PATH,
-  isMemoryCuratorEnabled,
-} from './curator-contract.js';
 import { workgroupMemoryDir } from '../workgroup/shared-dirs.js';
+
+// ---------------------------------------------------------------------------
+// The fact-ledger read contract
+//
+// `generated/memory.md` was written by the host memory curator, which has been
+// removed. `readGeneratedFacts` below is its only reader, and these three
+// pieces are all a reader needs — they moved here verbatim from the deleted
+// curator-contract.ts rather than being deleted with the writer, because live
+// installs carry megabytes of accumulated facts the flag can still turn back
+// on.
+// ---------------------------------------------------------------------------
+
+/** The fact ledger, relative to a workgroup's memory root. */
+const GENERATED_MEMORY_RELATIVE_PATH = 'generated/memory.md';
+
+/**
+ * Per-file read cap for the ledger, deliberately far above `markdownFileBytes`:
+ * the ledger is one file holding what the rest of the tree spreads over
+ * hundreds, and truncating it drops facts silently. Nothing appends to it any
+ * more, so this is now purely a rail on what recall will read.
+ */
+export const GENERATED_MEMORY_MAX_BYTES = 16 * 1024 * 1024;
+
+/**
+ * Gates recall of the ledger.
+ *
+ * It used to gate the curator AND recall of what the curator wrote — one flag,
+ * one system. The curator is gone, so this is now a recall switch alone: off
+ * means the accumulated ledger is excluded from the fact lane entirely, on
+ * means those facts are still injected. The environment variable keeps its
+ * name because it is set in live `.env` files.
+ */
+function isMemoryCuratorEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return /^(?:1|true|yes|on)$/i.test(env.NANOCLAW_MEMORY_CURATOR_ENABLED ?? '');
+}
 
 export const PRE_TURN_BOUNDS = Object.freeze({
   // Per-file read cap. Only three things are read from the memory tree per
@@ -1196,8 +1226,7 @@ function readGeneratedFacts(root: string, canonicalRoot: string): SearchableCand
       // Score the fact, not its provenance marker. The marker is ~20% of a
       // line's characters, and its tokens dilute the density term ranking
       // uses, so scoring it penalised generated facts against clean manual
-      // Markdown. selectGeneratedMemoryForPrompt already strips it exactly
-      // this way on the curator side; this makes both paths agree.
+      // Markdown.
       searchable: markerAt < 0 ? line : line.slice(0, markerAt),
       capturedAt: capturedAtOf(line),
     });
