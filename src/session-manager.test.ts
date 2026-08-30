@@ -244,10 +244,10 @@ describe('writeSessionMessage re-provisions a deleted session folder', () => {
   // Two tests below use the generated-fact lane as their memory-evidence
   // vehicle, and that lane is gated on the curator flag (default off). Same
   // save/restore pattern as pre-turn-context.test.ts.
-  const curatorFlag = process.env.NANOCLAW_MEMORY_CURATOR_ENABLED;
+  const curatorFlag = process.env.NANOCLAW_MEMORY_FACT_RECALL_ENABLED;
 
   beforeEach(() => {
-    process.env.NANOCLAW_MEMORY_CURATOR_ENABLED = 'true';
+    process.env.NANOCLAW_MEMORY_FACT_RECALL_ENABLED = 'true';
     fs.rmSync(sessionDir(AG, SESS), { recursive: true, force: true });
     const db = initTestDb();
     runMigrations(db);
@@ -277,8 +277,8 @@ describe('writeSessionMessage re-provisions a deleted session folder', () => {
   });
 
   afterEach(() => {
-    if (curatorFlag === undefined) delete process.env.NANOCLAW_MEMORY_CURATOR_ENABLED;
-    else process.env.NANOCLAW_MEMORY_CURATOR_ENABLED = curatorFlag;
+    if (curatorFlag === undefined) delete process.env.NANOCLAW_MEMORY_FACT_RECALL_ENABLED;
+    else process.env.NANOCLAW_MEMORY_FACT_RECALL_ENABLED = curatorFlag;
     closeDb();
   });
 

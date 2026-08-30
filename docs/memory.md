@@ -77,7 +77,7 @@ The two are read very differently now.
 `generated/memory.md` is a flat list of self-contained one-line facts, each
 carrying an HTML provenance marker. It is the one memory file recall still
 ranks, one fact at a time rather than as a single document, and it is gated on
-`NANOCLAW_MEMORY_CURATOR_ENABLED`. Off — the default, and what live installs
+`NANOCLAW_MEMORY_FACT_RECALL_ENABLED`. Off — the default, and what live installs
 set — means no fact injection at all. The variable keeps the curator's name
 because it is set in existing `.env` files; with the curator gone it is a
 recall switch, and the only thing that decides whether that accumulated ledger

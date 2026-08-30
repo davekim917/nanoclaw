@@ -39,13 +39,24 @@ export const GENERATED_MEMORY_MAX_BYTES = 16 * 1024 * 1024;
  * Gates recall of the ledger.
  *
  * It used to gate the curator AND recall of what the curator wrote — one flag,
- * one system. The curator is gone, so this is now a recall switch alone: off
- * means the accumulated ledger is excluded from the fact lane entirely, on
- * means those facts are still injected. The environment variable keeps its
- * name because it is set in live `.env` files.
+ * one system. The curator writer is gone, so this is a recall switch alone:
+ * off means the accumulated ledger is excluded from the fact lane entirely,
+ * on means those facts are still injected.
+ *
+ * Understand what `on` costs before setting it. The ledger is read and parsed
+ * in full on EVERY turn — 8 MB and ~6,700 facts on the largest workgroup — to
+ * select the top `generatedFactExcerpts` (3) by lexical rank. With no writer
+ * left, those 3 facts come from a corpus frozen at the moment curation
+ * stopped, and they go on aging. The read cost is paid per turn regardless of
+ * whether any fact scores well enough to be injected.
+ *
+ * Renamed from NANOCLAW_MEMORY_CURATOR_ENABLED: it never gated only the
+ * curator, and once the writer was deleted that name described nothing that
+ * still existed. An install still setting the old name gets the default —
+ * disabled — which is the intended state.
  */
-function isMemoryCuratorEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
-  return /^(?:1|true|yes|on)$/i.test(env.NANOCLAW_MEMORY_CURATOR_ENABLED ?? '');
+function isFactRecallEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return /^(?:1|true|yes|on)$/i.test(env.NANOCLAW_MEMORY_FACT_RECALL_ENABLED ?? '');
 }
 
 export const PRE_TURN_BOUNDS = Object.freeze({
@@ -1204,7 +1215,7 @@ function readGeneratedFacts(root: string, canonicalRoot: string): SearchableCand
   // Curator off means no fact injection at all. This is the ONLY reader of the
   // ledger now, so the gate lives here — the scan loop it used to sit in is
   // gone. Before the lstat, so a disabled ledger costs no filesystem call.
-  if (!isMemoryCuratorEnabled()) return [];
+  if (!isFactRecallEnabled()) return [];
   const absolute = path.join(root, GENERATED_MEMORY_RELATIVE_PATH);
   // lstat, not stat: a symlinked ledger is skipped the way every other memory
   // read skips one, rather than followed out of the canonical tree.
