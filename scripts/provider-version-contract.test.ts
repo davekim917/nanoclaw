@@ -62,7 +62,7 @@ describe('provider version contracts', () => {
 
   it.each([
     ['CLAUDE_CODE_VERSION', '2.1.250', '"@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}"'],
-    ['CODEX_VERSION', '0.150.1', '"@openai/codex@${CODEX_VERSION}"'],
+    ['CODEX_VERSION', '0.151.0', '"@openai/codex@${CODEX_VERSION}"'],
     ['OPENCODE_VERSION', '1.18.23', '"opencode-ai@${OPENCODE_VERSION}"'],
   ])('uses the effective %s declaration before its final install', (name, version, consumingInstall) => {
     const overridden = `FROM node:22\nARG ${name}=${version}\nARG ${name}=latest\nRUN pnpm install -g ${consumingInstall}\n`;
