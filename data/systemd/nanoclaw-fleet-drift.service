@@ -1,0 +1,16 @@
+[Unit]
+Description=NanoClaw fleet-drift daily control-band health check
+# Collects disk/error-log/scheduled-task metrics, appends to
+# data/fleet-drift/metrics.ndjson, and files a GitHub issue per breached
+# metric (median + 3xMAD band, or a fixed rule for paused/failed-streak
+# series). No LLM calls — pure deterministic arithmetic over collected data.
+After=network.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+WorkingDirectory=/home/ubuntu/nanoclaw-v2
+ExecStart=/home/ubuntu/nanoclaw-v2/node_modules/.bin/tsx scripts/fleet-drift.ts
+IOSchedulingClass=idle
+Nice=10
+OnFailure=nanoclaw-unit-alert@%n.service
