@@ -40,6 +40,17 @@ const STARTUP_DELAY_MS = 60_000;
 const MINIMUM_IDLE_DAYS = 7;
 const STALE_WARNING_DAYS = 30;
 const DEFAULT_TOPIC_IDLE_RECLAIM_DAYS = 14;
+/**
+ * #190, owner-approved: a scratch clone is only a candidate after two weeks
+ * untouched — twice the topic floor, because nothing upstream ever closes a
+ * clone the way a session close retires a topic, so idleness is the only
+ * signal that the agent which made it has moved on.
+ *
+ * Directory mtime, not a deep walk: the git proof below is what establishes
+ * that the contents are recoverable, and it sees deep edits (dirty, unpushed,
+ * stashed) that a mtime sweep would only be able to date, not classify.
+ */
+const CLONE_IDLE_RECLAIM_DAYS = 14;
 
 let warnedBadIdleReclaimDays = false;
 
@@ -607,6 +618,34 @@ function provenDisposable(dir: string, scope: 'head' | 'all'): { ok: boolean; re
   if (stash === null) return { ok: false, reason: 'stash-unprovable' };
   if (stash !== '') return { ok: false, reason: 'stashed' };
 
+  // A repository that backs linked worktrees owns an object store those
+  // checkouts share; trashing it destroys their history, and nothing above
+  // would notice because every check so far looks only at THIS tree.
+  //
+  // Codex review of #190: collectClones already asks cloneHasBoundWorktrees,
+  // but only once, during the scan. That was survivable while any live
+  // container in the group refused every clone under it; with that gate gone
+  // a clone in a busy group is an ordinary candidate, and an agent running
+  // `git worktree add` against it between the scan and the trash would not be
+  // caught. Ask git's own registry instead of the filesystem sweep: every
+  // linked worktree of a repo has an entry under <gitdir>/worktrees, so this
+  // is one readdir, it is authoritative, and putting it HERE means it is
+  // re-answered by the post-move re-proof rather than only at scan time.
+  //
+  // Only for scope 'all' (a clone). A linked worktree is itself an entry in
+  // some other repo's registry and legitimately has none of its own.
+  if (scope === 'all') {
+    const gitDir = git(dir, ['rev-parse', '--path-format=absolute', '--git-dir']);
+    if (gitDir === null) return { ok: false, reason: 'gitdir-unprovable' };
+    const registered = safeDirectories(path.join(gitDir, 'worktrees'));
+    // null is "the directory exists but could not be read" — unprovable, not
+    // empty. A repo with no linked worktrees simply has no such directory.
+    if (registered === null && fs.existsSync(path.join(gitDir, 'worktrees'))) {
+      return { ok: false, reason: 'worktree-registry-unprovable' };
+    }
+    if (registered !== null && registered.length > 0) return { ok: false, reason: 'backs-worktrees' };
+  }
+
   return { ok: true, reason: 'clean-and-pushed' };
 }
 
@@ -622,14 +661,52 @@ function isPrivateClone(dir: string): boolean {
   }
 }
 
-function findClonesUnder(root: string, depth: number, found: string[] = []): string[] {
+/**
+ * A checkout whose `.git` is a FILE pointing somewhere this host cannot follow
+ * — in practice `gitdir: /workspace/...`, a path that only resolves inside the
+ * container that made it.
+ *
+ * #190 constraint 3: roughly 42 of these exist and they are permanently
+ * unprovable from the host, so they must never be removed. They already are
+ * never removed, because isPrivateClone demands a real `.git` DIRECTORY — but
+ * they were also silently invisible, which in the middle of a storage squeeze
+ * reads as "nothing here" rather than "mass no host-side pass can ever
+ * reclaim". Report them so the gap is legible, and stop walking their working
+ * trees looking for nested repositories.
+ */
+function isUnprovableCheckout(dir: string): boolean {
+  let pointer: string;
+  try {
+    const marker = fs.lstatSync(path.join(dir, '.git'));
+    if (!marker.isFile() || marker.isSymbolicLink()) return false;
+    pointer = fs.readFileSync(path.join(dir, '.git'), 'utf8').trim();
+  } catch {
+    return false;
+  }
+  if (!pointer.startsWith('gitdir:')) return false;
+  const target = pointer.slice('gitdir:'.length).trim();
+  const resolved = path.isAbsolute(target) ? target : path.resolve(dir, target);
+  return !fs.existsSync(resolved);
+}
+
+interface CloneScan {
+  clones: string[];
+  /** Checkouts bound to a git-dir this host cannot resolve. Never removable. */
+  unprovable: string[];
+}
+
+function findClonesUnder(root: string, depth: number, found: CloneScan = { clones: [], unprovable: [] }): CloneScan {
   if (depth < 0) return found;
   for (const name of safeDirectories(root) ?? []) {
     if (name.startsWith('.') || name === 'node_modules') continue;
     const dir = path.join(root, name);
     if (isPrivateClone(dir)) {
-      found.push(dir);
+      found.clones.push(dir);
       continue; // Never descend into a repository looking for more repositories.
+    }
+    if (isUnprovableCheckout(dir)) {
+      found.unprovable.push(dir);
+      continue;
     }
     findClonesUnder(dir, depth - 1, found);
   }
@@ -696,22 +773,6 @@ function cloneHasBoundWorktrees(cloneDir: string, index: { pointers: string[]; u
     }
     return resolved === canonical || resolved.startsWith(`${canonical}${path.sep}`);
   });
-}
-
-interface LiveScopes {
-  folders: Set<string>;
-  workgroups: Set<string>;
-}
-
-function liveScopes(rows: SessionRow[]): LiveScopes {
-  const folders = new Set<string>();
-  const workgroups = new Set<string>();
-  for (const row of rows) {
-    if (!isContainerRunning(row.session_id) && !isContainerSpawning(row.session_id)) continue;
-    folders.add(row.folder);
-    workgroups.add(row.workgroup_id);
-  }
-  return { folders, workgroups };
 }
 
 function record(report: GcReport, candidate: GcCandidate): void {
@@ -801,15 +862,16 @@ function collectClones(
   report: GcReport,
   dataDir: string,
   groupsDir: string,
-  live: LiveScopes,
   bound: { pointers: string[]; unreadable: boolean },
 ): void {
   const candidates: Array<{ dir: string; folder: string | null; workgroupId: string | null }> = [];
 
   for (const folder of safeDirectories(groupsDir) ?? []) {
     const folderDir = path.join(groupsDir, folder);
-    for (const dir of findClonesUnder(folderDir, CLONE_SCAN_DEPTH)) {
-      candidates.push({ dir, folder, workgroupId: null });
+    const scan = findClonesUnder(folderDir, CLONE_SCAN_DEPTH);
+    for (const dir of scan.clones) candidates.push({ dir, folder, workgroupId: null });
+    for (const dir of scan.unprovable) {
+      record(report, { category: 'clone', path: dir, collect: false, reason: 'keep-unprovable', bytes: 0 });
     }
   }
 
@@ -827,15 +889,14 @@ function collectClones(
     const skip = (reason: string): void =>
       record(report, { category: 'clone', path: candidate.dir, collect: false, reason, bytes: 0 });
 
-    if (candidate.folder && live.folders.has(candidate.folder)) {
-      skip('agent-group-live');
-      continue;
-    }
-    if (candidate.workgroupId && live.workgroups.has(candidate.workgroupId)) {
-      skip('workgroup-live');
-      continue;
-    }
-    if (idleDays(candidate.dir) < MINIMUM_IDLE_DAYS) {
+    // #190: agent-group and workgroup liveness were the gates that made clone
+    // reclaim unreachable. `groups/<folder>` is bind-mounted into every
+    // container of that group, so a group with any running container refused
+    // EVERY clone under it — and a QA group with a continuous cadence never
+    // has a quiet moment. Neither gate says anything about THIS directory.
+    // Apply mode decides that per path instead: mount relation plus a process
+    // scan, re-verified after the quarantine rename. See stillDisposable.
+    if (idleDays(candidate.dir) < CLONE_IDLE_RECLAIM_DAYS) {
       skip('recent');
       continue;
     }
@@ -898,8 +959,159 @@ function runningContainerMounts(): string[] | null {
   }
 }
 
-function pathOverlapsResolvedMounts(resolvedTarget: string, mounts: string[]): boolean {
-  return mounts.some((mount) => {
+/**
+ * Translate a path as a process sees it into the host path it maps to.
+ *
+ * A containerized process's cwd resolves inside that container's mount
+ * namespace: measured on this host, an agent container's runner reads
+ * `/workspace/agent`, never the host directory it is bound from. A raw
+ * readlink scan compared against host paths is therefore blind to exactly the
+ * processes it exists to catch — 51 live container processes read as zero.
+ * /proc/<pid>/mountinfo carries the mapping, one line per mount, whose fourth
+ * field is the path WITHIN the source filesystem and whose fifth is the
+ * mountpoint as that namespace sees it. Resolve through the longest matching
+ * mountpoint.
+ *
+ * A mount whose root is unrelated to the host tree (a container's own
+ * overlayfs, rooted at `/`) can translate into a host-looking path that is not
+ * really one. That direction is safe: a spurious match refuses a candidate, it
+ * never authorizes removing one. `null` means the mapping could not be read at
+ * all, which is a visible process we failed to place — the caller refuses the
+ * whole pass on it.
+ */
+/** Pure half of hostPathForProcessCwd, factored out so tests can drive it with
+ *  a synthetic mountinfo body instead of real /proc access. */
+/**
+ * PRECONDITION, stated because it is an assumption and not a guarantee: the
+ * fourth mountinfo field is a path within the SOURCE filesystem, so treating
+ * it as host-absolute is only correct while the bind-mount sources live on the
+ * filesystem mounted at `/`. That holds on this install (every mount resolves
+ * to the same device), and is what makes `groups/<folder> -> /workspace/agent`
+ * translate exactly.
+ *
+ * Where it does not hold — DATA_DIR or GROUPS_DIR on their own volume, a
+ * common enough cloud layout — a translated path comes out relative to that
+ * volume's root and simply fails to match any candidate. Codex review of #190
+ * flagged this: the consequence is a MISS, not a spurious match, so the /proc
+ * check quietly degrades to nothing rather than misfiring. It is defence in
+ * depth either way — the git re-proof on the moved copy is what actually
+ * stands between this and deleting live work — but a reader should not
+ * mistake this function for a guarantee on an arbitrary host.
+ */
+function resolveHostPathFromMountinfo(raw: string, cwd: string): string | null {
+  let best: { mountpoint: string; root: string } | null = null;
+  for (const line of raw.split('\n')) {
+    const fields = line.split(' ');
+    if (fields.length < 5) continue;
+    const root = fields[3];
+    const mountpoint = fields[4];
+    if (cwd !== mountpoint && !cwd.startsWith(`${mountpoint === '/' ? '' : mountpoint}${path.sep}`)) continue;
+    if (!best || mountpoint.length > best.mountpoint.length) best = { mountpoint, root };
+  }
+  if (!best) return null;
+  const suffix = cwd.slice(best.mountpoint === '/' ? 0 : best.mountpoint.length);
+  return path.posix.join(best.root, suffix);
+}
+
+/**
+ * `undefined` means the process is simply gone — it exited between the cwd
+ * readlink and this read, so it holds nothing and the scan continues. `null`
+ * is a real read failure on a process that still exists: a live process we
+ * cannot place, which makes the caller refuse the whole pass.
+ *
+ * The distinction is load-bearing, not pedantry. Processes come and go
+ * constantly on this host, so collapsing an exit into "unreadable" would let
+ * any short-lived command abort an entire GC pass — intermittently, and
+ * looking exactly like "the GC mysteriously reclaims nothing".
+ */
+function hostPathForProcessCwd(pid: string, cwd: string, procRoot: string): string | null | undefined {
+  let raw: string;
+  try {
+    raw = fs.readFileSync(path.join(procRoot, pid, 'mountinfo'), 'utf8');
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === 'ENOENT' || code === 'ESRCH') return undefined;
+    return null;
+  }
+  return resolveHostPathFromMountinfo(raw, cwd);
+}
+
+/**
+ * Host paths that some currently running process is rooted in.
+ *
+ * #190 constraint 2: a git lock is not a liveness signal for these directories
+ * (measured: 3 live sessions, 0 locks), so ask the process table directly.
+ *
+ * Boundary, stated because absence of a signal must never be read as absence
+ * of a process: 282 of 390 pids on this host have an unreadable cwd — they are
+ * root- and system-owned processes, which never hold an agent scratch clone as
+ * their working directory. Every process that CAN hold one (container agents,
+ * host shells running as the install user) is readable, and was observed to be
+ * during the #190 audit. An unreadable pid contributes nothing rather than
+ * failing the pass; a pid we can see but cannot place fails it.
+ */
+function liveProcessCwds(procRoot = '/proc'): string[] | null {
+  let pids: string[];
+  try {
+    pids = fs.readdirSync(procRoot).filter((name) => /^\d+$/.test(name));
+  } catch {
+    return null; // Cannot enumerate the process table at all.
+  }
+  const roots: string[] = [];
+  for (const pid of pids) {
+    let cwd: string;
+    try {
+      cwd = fs.readlinkSync(path.join(procRoot, pid, 'cwd'));
+    } catch {
+      continue; // Unreadable or exited between readdir and readlink.
+    }
+    if (!path.isAbsolute(cwd)) continue;
+    const host = hostPathForProcessCwd(pid, cwd, procRoot);
+    if (host === undefined) continue; // Exited mid-scan; it holds nothing.
+    if (host === null) return null;
+    // Both, not just the translation. A host process's cwd IS already a host
+    // path, and for a mount on a separate device the fourth mountinfo field is
+    // that filesystem's own root rather than a host-absolute path, which would
+    // translate `/tmp/x` to `/x`. Keeping the raw value too means such a mount
+    // can only ever add a spurious entry, never drop a real one — and a
+    // spurious entry refuses a candidate rather than authorizing one.
+    roots.push(cwd);
+    if (host !== cwd) roots.push(host);
+  }
+  return roots;
+}
+
+/** True when a live process sits inside `target` (or on it). */
+function processRootedIn(target: string, cwds: string[]): boolean {
+  let resolved: string;
+  try {
+    resolved = fs.realpathSync(target);
+  } catch {
+    return true; // A path we cannot resolve is a path we cannot clear.
+  }
+  return cwds.some((cwd) => cwd === resolved || cwd.startsWith(`${resolved}${path.sep}`));
+}
+
+/**
+ * How a target relates to the bind mounts of running containers.
+ *
+ * - 'is-mount-source' — the target IS a mount source, or CONTAINS one.
+ *   Removing it pulls the floor out from under a live container's mount.
+ *   Never removable, on any evidence.
+ * - 'inside-mount-source' — the target merely lives underneath a mount
+ *   source. `groups/<folder>` is itself mounted into every container of that
+ *   group, so EVERY scratch clone in an active group is permanently in this
+ *   state; treating it as equivalent to the case above is what made clone
+ *   reclaim unreachable in practice (#190). A container could touch such a
+ *   path, but the idle + git proof is the evidence that it has not, and the
+ *   quarantine rename plus post-move recheck is what closes the race.
+ * - 'clear' — no overlap at all.
+ */
+type MountRelation = 'is-mount-source' | 'inside-mount-source' | 'clear';
+
+function mountRelation(resolvedTarget: string, mounts: string[]): MountRelation {
+  let relation: MountRelation = 'clear';
+  for (const mount of mounts) {
     let source = mount;
     try {
       source = fs.realpathSync(mount);
@@ -907,22 +1119,26 @@ function pathOverlapsResolvedMounts(resolvedTarget: string, mounts: string[]): b
       // Keep the raw value: a mount source that is gone from the host still
       // names the tree the container was given.
     }
-    return (
-      source === resolvedTarget ||
-      source.startsWith(`${resolvedTarget}${path.sep}`) ||
-      resolvedTarget.startsWith(`${source}${path.sep}`)
-    );
-  });
+    if (source === resolvedTarget || source.startsWith(`${resolvedTarget}${path.sep}`)) {
+      return 'is-mount-source';
+    }
+    if (resolvedTarget.startsWith(`${source}${path.sep}`)) relation = 'inside-mount-source';
+  }
+  return relation;
 }
 
-function overlapsAny(target: string, mounts: string[]): boolean {
-  let resolved = target;
+function relationToMounts(target: string, mounts: string[]): MountRelation {
+  let resolved: string;
   try {
     resolved = fs.realpathSync(target);
   } catch {
-    return true; // A path we cannot resolve is a path we cannot clear.
+    return 'is-mount-source'; // A path we cannot resolve is a path we cannot clear.
   }
-  return pathOverlapsResolvedMounts(resolved, mounts);
+  return mountRelation(resolved, mounts);
+}
+
+function overlapsAny(target: string, mounts: string[]): boolean {
+  return relationToMounts(target, mounts) !== 'clear';
 }
 
 /**
@@ -1076,62 +1292,244 @@ function laterThan(a: number | null, b: number | null): boolean {
   return b > a;
 }
 
+/** Durable record of canonical-repo prunes a trash is (or was) about to require.
+ *  See #185: a crash between a successful trash and the prune loop that
+ *  follows it would otherwise leave a dangling `.git/worktrees/<name>`
+ *  registration with nothing to find it. */
+const PENDING_PRUNE_FILE = '.gc-pending-prunes.json';
+
+interface PendingPrune {
+  workgroupId: string;
+  repo: string;
+}
+
+function pendingPrunePath(dataDir: string): string {
+  return path.join(dataDir, PENDING_PRUNE_FILE);
+}
+
+/** Best-effort — a journal read failure only costs the crash-recovery safety
+ *  net for this pass; the prune loop that follows still runs regardless. */
+function readPendingPrunes(dataDir: string): PendingPrune[] {
+  try {
+    const raw: unknown = JSON.parse(fs.readFileSync(pendingPrunePath(dataDir), 'utf8'));
+    return Array.isArray(raw) ? (raw as PendingPrune[]) : [];
+  } catch {
+    return [];
+  }
+}
+
+/** Returns whether the write actually landed — callers that are about to
+ *  trash something the journal is meant to protect must abort on `false`
+ *  rather than proceed without a durable record (Codex P2). */
+function writePendingPrunes(dataDir: string, entries: PendingPrune[]): boolean {
+  const target = pendingPrunePath(dataDir);
+  try {
+    if (entries.length === 0) {
+      fs.rmSync(target, { force: true });
+    } else {
+      // Codex P2: write-then-rename, not in-place — a failure partway
+      // through (ENOSPC/EIO/kill) never touches `target`, so the existing
+      // journal survives untouched instead of being left empty/truncated.
+      const tmp = `${target}.tmp-${process.pid}`;
+      fs.writeFileSync(tmp, JSON.stringify(entries));
+      fs.renameSync(tmp, target);
+    }
+    return true;
+  } catch (err) {
+    log.warn('Storage GC: could not update the pending-prune journal', { err });
+    return false;
+  }
+}
+
+/**
+ * Finish any per-repo prune left pending by a crash between a successful
+ * trash and the deregistration loop that follows it (#185). Run once at the
+ * start of every apply pass, same shape as recoverOrphanedQuarantine: retry,
+ * and only clear an entry once `git worktree prune` actually succeeds — a
+ * repeat failure just stays journaled for the next pass, exactly the
+ * "may need a manual prune" state a non-crash prune failure already leaves.
+ */
+function runPendingPrunes(dataDir: string): void {
+  const pending = readPendingPrunes(dataDir);
+  if (pending.length === 0) return;
+  const remaining = pending.filter(({ workgroupId, repo }) => {
+    if (git(canonicalRepoDir(workgroupId, repo, dataDir), ['worktree', 'prune']) === null) {
+      log.warn('Storage GC: pending prune still failing; retrying next pass', { workgroupId, repo });
+      return true;
+    }
+    log.warn('Storage GC: completed a prune left pending by an interrupted pass', { workgroupId, repo });
+    return false;
+  });
+  writePendingPrunes(dataDir, remaining);
+}
+
+/**
+ * Put a quarantined clone back where it came from.
+ *
+ * Deliberately not reconcileQuarantine: that one reasons about a topic's
+ * `worktrees/<repo>` split and prunes canonical registrations, none of which a
+ * clone has. A clone is one directory, so its rollback is one rename. If the
+ * destination reappeared while we held the copy, keep BOTH — leave the copy in
+ * quarantine for a human. Trashing it would destroy the one thing we could not
+ * prove disposable.
+ */
+/**
+ * A clone's recovery marker lives BESIDE its quarantine entry, not inside it.
+ *
+ * Topics put the marker in the directory so it travels in the same atomic
+ * rename (#184). A clone cannot: the post-move check is a git re-proof, and an
+ * untracked marker file inside the tree would read as a dirty worktree and
+ * abort every single collection. Deleting the marker after the rename instead
+ * would strand any entry whose process died in the gap — a markerless entry is
+ * exactly what recoverOrphanedQuarantine cannot identify.
+ *
+ * A sidecar keeps the ordering invariant by writing FIRST: a crash can leave a
+ * marker with no entry, which is a stray file the next pass overwrites, but
+ * never an entry with no marker. `safeDirectories` lists only directories, so
+ * the sidecar is skipped by the recovery scan that walks the quarantine root.
+ */
+function cloneSidecarPath(quarantinePath: string): string {
+  return `${quarantinePath}.meta.json`;
+}
+
+function restoreQuarantinedClone(originalPath: string, quarantinePath: string): void {
+  // The sidecar is dropped LAST, and only once the entry it describes is gone
+  // from quarantine. Deleting it up front looks harmless — the restore is
+  // about to happen anyway — but both exits below can leave the entry on
+  // disk, and an entry whose marker was already removed is precisely the
+  // (entry, no marker) state cloneSidecarPath promises cannot occur:
+  // recoverOrphanedQuarantine finds neither marker, logs "no readable
+  // recovery metadata", and skips it on every future pass, forever.
+  if (fs.existsSync(originalPath)) {
+    log.warn('Storage GC: clone rollback found the destination recreated; leaving the copy in quarantine', {
+      originalPath,
+      quarantinePath,
+    });
+    return;
+  }
+  try {
+    fs.renameSync(quarantinePath, originalPath);
+  } catch (err) {
+    log.error('Storage GC: clone rollback rename failed; the copy stays in quarantine', {
+      originalPath,
+      quarantinePath,
+      err,
+    });
+    return; // Marker stays, so the next pass can still find its way home.
+  }
+  fs.rmSync(cloneSidecarPath(quarantinePath), { force: true });
+}
+
+/**
+ * Quarantine-then-verify removal for a scratch clone.
+ *
+ * Clones previously went straight to `trashPath` while topics got the
+ * quarantine treatment (#190 constraint 7). That gap matters more now, not
+ * less: dropping the coarse agent-group-live gate means a clone can be
+ * collected while its group has a live container, so the window between
+ * deciding and deleting has to be closed by evidence rather than by refusing
+ * the whole class.
+ *
+ * The rename is atomic and instant. Anything an agent writes afterwards lands
+ * in the quarantined copy, where re-running the SAME git proof sees it: a new
+ * file makes the tree dirty, a commit makes it unpushed. That is a stronger
+ * post-move check than a timestamp, because it re-answers the actual question
+ * ("is everything in here recoverable?") rather than a proxy for it.
+ */
+function finalizeCloneCollection(candidate: GcCandidate, dataDir: string): { ok: boolean; reason?: string } {
+  const resolvedOriginal = fs.realpathSync(candidate.path);
+  const quarantineRoot = path.join(dataDir, '.gc-quarantine');
+  const quarantinePath = path.join(quarantineRoot, `${path.basename(candidate.path)}-${Date.now()}`);
+  fs.mkdirSync(quarantineRoot, { recursive: true });
+
+  // Sidecar BEFORE the rename — see cloneSidecarPath. Ordering is the whole
+  // point: a crash here leaves a marker with no entry (harmless), never an
+  // entry with no marker (unrecoverable).
+  try {
+    fs.writeFileSync(
+      cloneSidecarPath(quarantinePath),
+      JSON.stringify({ originalPath: candidate.path, category: 'clone' }),
+    );
+  } catch (err) {
+    log.error('Storage GC: could not write clone quarantine metadata; leaving the clone in place', {
+      path: candidate.path,
+      err,
+    });
+    return { ok: false, reason: 'quarantine-meta-write-failed' };
+  }
+  try {
+    fs.renameSync(candidate.path, quarantinePath);
+  } catch (err) {
+    // No entry was created, so drop the now-meaningless sidecar rather than
+    // leaving the next recovery pass a marker pointing at a live directory.
+    fs.rmSync(cloneSidecarPath(quarantinePath), { force: true });
+    throw err;
+  }
+
+  const restore = (reason: string): { ok: boolean; reason: string } => {
+    restoreQuarantinedClone(candidate.path, quarantinePath);
+    return { ok: false, reason };
+  };
+
+  const freshMounts = runningContainerMounts();
+  if (freshMounts === null || mountRelation(resolvedOriginal, freshMounts) === 'is-mount-source') {
+    return restore('aborted-late-mount');
+  }
+  const freshCwds = liveProcessCwds();
+  if (freshCwds === null || processRootedIn(quarantinePath, freshCwds)) {
+    return restore('aborted-late-activity');
+  }
+  // Re-prove the moved copy, not the original path: this is the check that
+  // catches a write landing in the gap between the scan and now.
+  const decision = provenDisposable(quarantinePath, 'all');
+  if (!decision.ok) return restore(`aborted-${decision.reason}`);
+
+  try {
+    trashPath(quarantinePath);
+  } catch (err) {
+    restoreQuarantinedClone(candidate.path, quarantinePath);
+    throw err;
+  }
+  // Only once the entry is genuinely gone. A sidecar outliving its entry is
+  // tidied by the next recovery pass, so dropping it here is housekeeping, not
+  // a correctness step — and doing it BEFORE the trash would be the stranding
+  // bug this sidecar exists to avoid.
+  fs.rmSync(cloneSidecarPath(quarantinePath), { force: true });
+  return { ok: true };
+}
+
 function finalizeIdleCollection(candidate: GcCandidate, dataDir: string): { ok: boolean; reason?: string } {
   const snapshot = candidate.idleSnapshot!;
   const resolvedOriginal = fs.realpathSync(candidate.path);
   const quarantineRoot = path.join(dataDir, '.gc-quarantine');
   const quarantinePath = path.join(quarantineRoot, `${path.basename(candidate.path)}-${Date.now()}`);
   fs.mkdirSync(quarantineRoot, { recursive: true });
-  fs.renameSync(candidate.path, quarantinePath);
-  // Crash recovery (Codex P2, round 5): if the process dies before this
-  // function reaches restore or trash, this is the only record of where the
-  // topic came from. recoverOrphanedQuarantine reads it at the next pass.
+
+  // #184: write the recovery marker INTO the topic dir BEFORE the rename that
+  // creates the quarantine entry, so the marker travels with the directory in
+  // the SAME renameSync — one atomic move, not two separate writes with a
+  // crash window between them. A markerless quarantine entry is now
+  // impossible: either the marker-bearing directory got renamed, or nothing
+  // moved at all.
   try {
-    fs.writeFileSync(path.join(quarantinePath, QUARANTINE_META_FILE), JSON.stringify({ originalPath: candidate.path }));
+    fs.writeFileSync(path.join(candidate.path, QUARANTINE_META_FILE), JSON.stringify({ originalPath: candidate.path }));
   } catch (err) {
-    log.warn('Storage GC: could not write quarantine recovery metadata', { quarantinePath, err });
+    log.error('Storage GC: could not write quarantine recovery metadata; leaving the topic in place', {
+      path: candidate.path,
+      err,
+    });
+    return { ok: false, reason: 'quarantine-meta-write-failed' };
   }
-
-  // Codex P1 (round 5): sessionInventory failing here is not evidence the
-  // topic is quiet — participantsByTopic collapses a DB failure into an empty
-  // map, indistinguishable from "genuinely no participants" unless checked
-  // directly first. Same principle participantsByTopic's own doc comment
-  // already states: a failed inventory preserves, never deletes.
-  if (sessionInventory() === null) {
-    reconcileQuarantine(candidate, quarantinePath, dataDir);
-    return { ok: false, reason: 'aborted-recheck-unavailable' };
-  }
-
-  const before = new Map(snapshot.map((p) => [p.sessionId, p]));
-  const owner = participantsByTopic(dataDir).get(candidate.path);
-  const activityAdvanced = (owner?.participants ?? []).some((p) => {
-    const prior = before.get(p.sessionId);
-    // Codex P1 (round 4): status/idleSince lag the real admission event —
-    // writeSessionMessageLocked inserts into inbound.db and closes it BEFORE
-    // it updates last_active (session-manager.ts:892-911), two separate
-    // writes. Fence on the durable write itself instead of its lagging
-    // index: inbound.db's mtime moves at the insert, not after. A file that
-    // appeared, or whose mtime moved forward, or that stopped being statable
-    // where it previously was — all count as new activity. Nothing durable
-    // happens after this file changes, so there is no remaining window.
-    const inboundMoved = laterThan(prior?.inboundMtimeMs ?? null, p.inboundMtimeMs);
-    return !prior || prior.status !== p.status || Date.parse(p.idleSince) > Date.parse(prior.idleSince) || inboundMoved;
-  });
-  if (activityAdvanced) {
-    reconcileQuarantine(candidate, quarantinePath, dataDir);
-    return { ok: false, reason: 'aborted-late-activity' };
-  }
+  fs.renameSync(candidate.path, quarantinePath);
 
   const freshMounts = runningContainerMounts();
-  if (freshMounts === null || pathOverlapsResolvedMounts(resolvedOriginal, freshMounts)) {
+  if (freshMounts === null || mountRelation(resolvedOriginal, freshMounts) !== 'clear') {
     reconcileQuarantine(candidate, quarantinePath, dataDir);
     return { ok: false, reason: 'aborted-late-activity' };
   }
 
-  // Genuinely clear — capture the repo list before trashing (quarantinePath
-  // won't exist to list afterward), then commit the delete FIRST. Prune runs
-  // only once that succeeds (Codex P2): a trash failure below leaves every
-  // canonical registration untouched, so the restored checkout stays usable.
+  // Capture the repo list before trashing (quarantinePath won't exist to list
+  // afterward).
   const repoListing = safeDirectories(path.join(quarantinePath, 'worktrees'));
   if (repoListing === null) {
     // A real read failure (EACCES/EIO), not "no worktrees" — treating it as
@@ -1144,9 +1542,66 @@ function finalizeIdleCollection(candidate: GcCandidate, dataDir: string): { ok: 
     return { ok: false, reason: 'quarantine-unreadable' };
   }
   const repos = repoListing.filter(isRepositoryName);
+  const workgroupId = path.basename(path.dirname(candidate.path));
+
+  // #183: the durable-write fence runs LAST, immediately before the
+  // irreversible trash — not before freshMounts/repoListing above, which
+  // themselves cost real wall-clock time (a docker inspect, a readdir). A
+  // fence checked earlier leaves that whole span unguarded; checked here it
+  // shrinks the residual admission-race window down to roughly the width of
+  // the trashPath call itself. Codex P1 (round 5): sessionInventory failing
+  // here is not evidence the topic is quiet — participantsByTopic collapses a
+  // DB failure into an empty map, indistinguishable from "genuinely no
+  // participants" unless checked directly first.
+  if (sessionInventory() === null) {
+    reconcileQuarantine(candidate, quarantinePath, dataDir);
+    return { ok: false, reason: 'aborted-recheck-unavailable' };
+  }
+  const before = new Map(snapshot.map((p) => [p.sessionId, p]));
+  const owner = participantsByTopic(dataDir).get(candidate.path);
+  const activityAdvanced = (owner?.participants ?? []).some((p) => {
+    const prior = before.get(p.sessionId);
+    // Codex P1 (round 4): status/idleSince lag the real admission event —
+    // writeSessionMessageLocked inserts into inbound.db and closes it BEFORE
+    // it updates last_active (session-manager.ts:892-911), two separate
+    // writes. Fence on the durable write itself instead of its lagging
+    // index: inbound.db's mtime moves at the insert, not after. A file that
+    // appeared, or whose mtime moved forward, or that stopped being statable
+    // where it previously was — all count as new activity.
+    const inboundMoved = laterThan(prior?.inboundMtimeMs ?? null, p.inboundMtimeMs);
+    return !prior || prior.status !== p.status || Date.parse(p.idleSince) > Date.parse(prior.idleSince) || inboundMoved;
+  });
+  if (activityAdvanced) {
+    reconcileQuarantine(candidate, quarantinePath, dataDir);
+    return { ok: false, reason: 'aborted-late-activity' };
+  }
+
+  // #185: journal the prunes this trash is about to require BEFORE trashing,
+  // so a crash between the trash succeeding and the loop below finishing
+  // leaves a durable record instead of a silently dangling registration.
+  // runPendingPrunes sweeps this at the start of the next apply pass.
+  const priorPending = readPendingPrunes(dataDir);
+  const journaled = writePendingPrunes(dataDir, [...priorPending, ...repos.map((repo) => ({ workgroupId, repo }))]);
+  if (!journaled) {
+    // Codex P2: a read-only dataDir or ENOSPC here must not fall through to
+    // trashing anyway — that's exactly the crash-without-a-record window
+    // this journal exists to close. Abort and leave the topic recoverable.
+    reconcileQuarantine(candidate, quarantinePath, dataDir);
+    return { ok: false, reason: 'aborted-prune-journal-unwritable' };
+  }
+
+  // Genuinely clear — commit the delete FIRST. Prune runs only once that
+  // succeeds (Codex P2): a trash failure below leaves every canonical
+  // registration untouched, so the restored checkout stays usable.
   try {
     trashPath(quarantinePath);
   } catch (err) {
+    // Restore the EXACT pre-attempt contents rather than filtering by
+    // workgroupId/repo (Codex P2): a filter would also strip an unrelated
+    // OLDER entry for the same workgroupId/repo left by a previous
+    // interrupted pass, losing its retry record permanently. Nothing else
+    // touches this file mid-pass, so priorPending is still accurate.
+    writePendingPrunes(dataDir, priorPending);
     reconcileQuarantine(candidate, quarantinePath, dataDir);
     throw err;
   }
@@ -1159,13 +1614,17 @@ function finalizeIdleCollection(candidate: GcCandidate, dataDir: string): { ok: 
   // (no container-relative back-pointer can land in them), so `worktree
   // prune` only ever removes entries whose path is genuinely gone — which,
   // for this repo, is now true.
-  const workgroupId = path.basename(path.dirname(candidate.path));
   for (const repo of repos) {
     if (git(canonicalRepoDir(workgroupId, repo, dataDir), ['worktree', 'prune']) === null) {
       log.warn('Storage GC: git worktree prune failed after idle collection; may need a manual prune', {
         workgroupId,
         repo,
       });
+    } else {
+      writePendingPrunes(
+        dataDir,
+        readPendingPrunes(dataDir).filter((e) => !(e.workgroupId === workgroupId && e.repo === repo)),
+      );
     }
   }
   return { ok: true };
@@ -1178,20 +1637,27 @@ function finalizeIdleCollection(candidate: GcCandidate, dataDir: string): { ok: 
  * started, while the pass is still walking. Anything unreadable at this point
  * refuses, exactly as it does during the scan.
  */
-function stillDisposable(candidate: GcCandidate, dataDir: string, mounts: string[]): { ok: boolean; reason: string } {
+function stillDisposable(
+  candidate: GcCandidate,
+  dataDir: string,
+  mounts: string[],
+  cwds: string[],
+): { ok: boolean; reason: string } {
+  if (candidate.category === 'clone') {
+    // A clone under an active group is ALWAYS inside a mount source, so only
+    // the strong relation can refuse here (#190). What stands in for the
+    // coarse gate: no process is actually rooted in this directory, and the
+    // git proof from the scan is re-run below after the quarantine rename.
+    if (relationToMounts(candidate.path, mounts) === 'is-mount-source') {
+      return { ok: false, reason: 'container-mounted' };
+    }
+    if (processRootedIn(candidate.path, cwds)) return { ok: false, reason: 'process-rooted' };
+    if (sessionInventory() === null) return { ok: false, reason: 'recheck-failed' };
+    return { ok: true, reason: 'recheck-clear' };
+  }
   if (overlapsAny(candidate.path, mounts)) return { ok: false, reason: 'container-mounted' };
   const rows = sessionInventory();
   if (rows === null) return { ok: false, reason: 'recheck-failed' };
-  if (candidate.category === 'clone') {
-    const live = liveScopes(rows);
-    const relative = path.relative(GROUPS_DIR, candidate.path);
-    const folder = relative.startsWith('..') ? null : relative.split(path.sep)[0];
-    if (folder && live.folders.has(folder)) return { ok: false, reason: 'recheck-agent-group-live' };
-    const workgroupRelative = path.relative(path.join(dataDir, 'workgroups'), candidate.path);
-    const workgroupId = workgroupRelative.startsWith('..') ? null : workgroupRelative.split(path.sep)[0];
-    if (workgroupId && live.workgroups.has(workgroupId)) return { ok: false, reason: 'recheck-workgroup-live' };
-    return { ok: true, reason: 'recheck-clear' };
-  }
   const owner = participantsByTopic(dataDir).get(candidate.path);
   if (!sideAClear(owner?.participants, topicIdleReclaimDays()).pass) {
     return { ok: false, reason: 'recheck-topic-open' };
@@ -1214,15 +1680,44 @@ function recoverOrphanedQuarantine(dataDir: string, report: GcReport): void {
   for (const entry of safeDirectories(quarantineRoot) ?? []) {
     const quarantinePath = path.join(quarantineRoot, entry);
     let originalPath: string;
+    let category: GcCategory;
     try {
-      const meta = JSON.parse(fs.readFileSync(path.join(quarantinePath, QUARANTINE_META_FILE), 'utf8')) as {
+      // A clone's marker sits beside the entry (see cloneSidecarPath); a
+      // topic's travels inside it. Prefer the sidecar so a clone is never
+      // misread as a topic and put through the per-repo prune path.
+      const sidecar = cloneSidecarPath(quarantinePath);
+      const metaFile = fs.existsSync(sidecar) ? sidecar : path.join(quarantinePath, QUARANTINE_META_FILE);
+      const meta = JSON.parse(fs.readFileSync(metaFile, 'utf8')) as {
         originalPath: string;
+        category?: GcCategory;
       };
       originalPath = meta.originalPath;
+      // Entries written before clones used quarantine carry no category, and
+      // every one of those is a topic.
+      category = meta.category ?? 'orphan-topic';
     } catch (err) {
       log.error('Storage GC: orphaned quarantine entry has no readable recovery metadata; leaving it as-is', {
         quarantinePath,
         err,
+      });
+      continue;
+    }
+    if (category === 'clone') {
+      // A clone's rollback is a plain rename; reconcileQuarantine's per-repo
+      // split and canonical prune would be meaningless here and its
+      // `isRepositoryName` filter could misread a coincidental `worktrees`
+      // directory inside the clone's own tree.
+      restoreQuarantinedClone(originalPath, quarantinePath);
+      log.warn('Storage GC: restored an orphaned clone quarantine entry after an interrupted pass', {
+        originalPath,
+        quarantinePath,
+      });
+      record(report, {
+        category: 'clone',
+        path: originalPath,
+        collect: false,
+        reason: 'quarantine-restored',
+        bytes: 0,
       });
       continue;
     }
@@ -1292,10 +1787,13 @@ export function runStorageGcOnce(dataDir: string = DATA_DIR, groupsDir: string =
   }
 
   const report = emptyReport(mode, true);
-  if (mode === 'apply') recoverOrphanedQuarantine(dataDir, report);
+  if (mode === 'apply') {
+    recoverOrphanedQuarantine(dataDir, report);
+    runPendingPrunes(dataDir);
+  }
   const owners = new Map([...participantsByTopic(dataDir)].map(([key, value]) => [key, value.participants] as const));
   collectOrphanTopics(report, dataDir, owners);
-  collectClones(report, dataDir, groupsDir, liveScopes(rows), boundGitDirs(dataDir));
+  collectClones(report, dataDir, groupsDir, boundGitDirs(dataDir));
 
   if (mode === 'apply') {
     const demote = (candidate: GcCandidate, reason: string): void => {
@@ -1306,21 +1804,32 @@ export function runStorageGcOnce(dataDir: string = DATA_DIR, groupsDir: string =
       report.skips[reason] = (report.skips[reason] ?? 0) + 1;
     };
     const mounts = runningContainerMounts();
-    if (mounts === null) {
-      log.error('Storage GC: container runtime unreadable — removing nothing this pass', { mode });
+    const cwds = liveProcessCwds();
+    if (mounts === null || cwds === null) {
+      log.error('Storage GC: liveness unreadable — removing nothing this pass', {
+        mode,
+        runtimeUnreadable: mounts === null,
+        processTableUnreadable: cwds === null,
+      });
       for (const candidate of report.candidates.filter((c) => c.collect)) {
-        demote(candidate, 'runtime-unreadable');
+        demote(candidate, mounts === null ? 'runtime-unreadable' : 'process-table-unreadable');
       }
     } else {
       for (const candidate of report.candidates) {
         if (!candidate.collect) continue;
-        const recheck = stillDisposable(candidate, dataDir, mounts);
+        const recheck = stillDisposable(candidate, dataDir, mounts, cwds);
         if (!recheck.ok) {
           demote(candidate, recheck.reason);
           continue;
         }
         try {
-          if (candidate.idleSnapshot) {
+          if (candidate.category === 'clone') {
+            const finalized = finalizeCloneCollection(candidate, dataDir);
+            if (!finalized.ok) {
+              demote(candidate, finalized.reason!);
+              continue;
+            }
+          } else if (candidate.idleSnapshot) {
             const finalized = finalizeIdleCollection(candidate, dataDir);
             if (!finalized.ok) {
               demote(candidate, finalized.reason!);
@@ -1358,6 +1867,15 @@ export function _discoveryStatsForTesting(dataDir: string = DATA_DIR): Discovery
 
 export async function _cleanupOneForTesting(target: TopicWorktreeTarget, dataDir: string = DATA_DIR): Promise<void> {
   await cleanupOne(target, dataDir);
+}
+
+export function _hostPathForProcessCwdForTesting(mountinfoText: string, cwd: string): string | null {
+  return resolveHostPathFromMountinfo(mountinfoText, cwd);
+}
+
+/** Scan a fake /proc tree, so the exit-vs-unreadable split can be exercised. */
+export function _liveProcessCwdsForTesting(procRoot: string): string[] | null {
+  return liveProcessCwds(procRoot);
 }
 
 let intervalHandle: NodeJS.Timeout | null = null;
