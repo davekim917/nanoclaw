@@ -14,6 +14,8 @@
 #   7. crashloop   — a session whose container repeatedly exits non-zero
 #   8. qaseats     — QA seat-health artifact missing or stale (the smoke
 #                    gates fail OPEN on it, so nothing else would say so)
+#   9. timers      — a watched sibling timer stopped firing (opt-in via
+#                    WATCHED_TIMERS; systemd cannot see this for a oneshot)
 #
 # Log windows are measured by BYTE OFFSET deltas stored in the state file —
 # never by log timestamps (the log has multiple writers stamping different
@@ -160,13 +162,79 @@ if [ -n "$QA_SEAT_HEALTH_FILE" ]; then
   fi
 fi
 
+# Watched sibling timers. A detector that STOPPED FIRING is invisible to
+# `systemctl list-units --failed`: every detector in this fleet is Type=oneshot,
+# and a oneshot's failed state is cleared by its next successful fire — one unit
+# failed 259 consecutive times and --failed was empty 36h later. Timer liveness,
+# not service exit status, is the only honest signal, and nothing else reads it.
+#
+# Opt-in; unit names are install-specific, so trunk carries none. Set it in the
+# sentinel unit's Environment=, format `<unit>:<max-seconds-since-last-trigger>`:
+#   WATCHED_TIMERS="nanoclaw-outbox-ship.timer:300 qa-seat-health.timer:2700"
+#
+# Fail-closed on every branch: a systemctl that errors, a listed unit that is
+# not installed, an empty or unparseable LastTriggerUSec all BREACH. Reading any
+# of those as healthy would rebuild the exact blind spot this vital closes.
+WATCHED_TIMERS="${WATCHED_TIMERS:-}"
+for spec in $WATCHED_TIMERS; do
+  unit="${spec%%:*}"
+  max_age="${spec##*:}"
+  case "$max_age" in
+    ''|*[!0-9]*)
+      BREACHES+=("unit-$unit|WATCHED_TIMERS entry '$spec' has no numeric max age — $unit is listed but unjudgeable")
+      continue ;;
+  esac
+  LOAD_STATE=$(systemctl show "$unit" -p LoadState --value 2>/dev/null || echo error)
+  if [ "$LOAD_STATE" != "loaded" ]; then
+    BREACHES+=("unit-$unit|$unit is listed in WATCHED_TIMERS but not installed here (LoadState=$LOAD_STATE) — whatever it was meant to detect is unwatched")
+    continue
+  fi
+  UNIT_STATE=$(systemctl is-active "$unit" 2>/dev/null || echo unknown)
+  if [ "$UNIT_STATE" != "active" ]; then
+    BREACHES+=("unit-$unit|$unit is $UNIT_STATE — it is not going to fire again")
+    continue
+  fi
+  LAST_TRIGGER=$(systemctl show "$unit" -p LastTriggerUSec --value 2>/dev/null || echo '')
+  # `date -d ""` returns MIDNIGHT TODAY at exit 0, so an empty trigger time
+  # would silently read as "fired a few hours ago". Reject it before date sees
+  # it — this is the fail-open this vital exists to prevent.
+  if [ -z "$LAST_TRIGGER" ]; then
+    LAST_EPOCH=''
+  else
+    LAST_EPOCH=$(date -d "$LAST_TRIGGER" +%s 2>/dev/null || echo '')
+  fi
+  case "$LAST_EPOCH" in ''|*[!0-9]*) LAST_EPOCH='' ;; esac
+  if [ -z "$LAST_EPOCH" ]; then
+    BREACHES+=("unit-$unit|$unit has no readable LastTriggerUSec (got '${LAST_TRIGGER:-<empty>}') — an unreadable trigger time is treated as not firing, never as healthy")
+    continue
+  fi
+  UNIT_AGE=$((NOW - LAST_EPOCH))
+  if [ "$UNIT_AGE" -ge "$max_age" ]; then
+    BREACHES+=("unit-$unit|$unit last fired $((UNIT_AGE / 60))m ago (bound $((max_age / 60))m) — the timer stopped firing; a oneshot's failure is invisible to \`systemctl --failed\`")
+  fi
+done
+
 if [ "${TEST_ALERT:-0}" = "1" ]; then
   BREACHES+=("test|test alert requested via TEST_ALERT=1 — delivery path verified, no action needed")
 fi
 
-# ── dedup + persist state ───────────────────────────────────────────────────
+# ── dedup + persist window cursors ──────────────────────────────────────────
+# TWO separate writes, and the split is the whole point.
+#
+# `log_off`/`err_off`/`restarts` are a window CURSOR: persist them on every run
+# or the next run re-scans the same bytes and re-alerts forever.
+#
+# `last_alert` is a RECEIPT of a DM that actually went out, so it is stamped
+# only after the socket send returns (bottom of this file). Stamping it here
+# burned the 6h cooldown on undelivered alerts — worst precisely when it
+# matters, because cli.sock is served BY nanoclaw-v2 itself: the
+# `service|nanoclaw-v2 is <state>` breach is undeliverable exactly when it
+# fires, and the old code then sat silent for 6h having "already alerted".
 export STATE_FILE LOG_SIZE ERR_SIZE RESTARTS
-ALERT_LINES=$(python3 - "$NOW" "$ALERT_COOLDOWN_S" "${BREACHES[@]+"${BREACHES[@]}"}" <<'EOF'
+ALERT_FILE=$(mktemp)
+trap 'rm -f "$ALERT_FILE"' EXIT
+export ALERT_FILE
+ALERT_KEYS=$(python3 - "$NOW" "$ALERT_COOLDOWN_S" "${BREACHES[@]+"${BREACHES[@]}"}" <<'EOF'
 import json, os, sys
 state_file = os.environ["STATE_FILE"]
 now, cooldown = int(sys.argv[1]), int(sys.argv[2])
@@ -175,23 +243,43 @@ try:
     with open(state_file) as f: state = json.load(f)
 except Exception: state = {}
 last = state.get("last_alert", {})
-out = []
+lines, keys = [], []
 for key, msg in breaches:
-    if now - int(last.get(key, 0)) >= cooldown:
-        out.append(f"- {msg}")
-        last[key] = now
-state["last_alert"] = last
+    if now - int(last.get(key, 0)) >= cooldown and key not in keys:
+        lines.append(f"- {msg}")
+        keys.append(key)
 state["log_off"] = int(os.environ["LOG_SIZE"])
 state["err_off"] = int(os.environ["ERR_SIZE"])
 state["restarts"] = int(os.environ["RESTARTS"])
 os.makedirs(os.path.dirname(state_file), exist_ok=True)
 with open(state_file, "w") as f: json.dump(state, f)
-print("\n".join(out))
+with open(os.environ["ALERT_FILE"], "w") as f: f.write("\n".join(lines))
+print(" ".join(keys))
 EOF
 )
+ALERT_LINES=$(cat "$ALERT_FILE")
+
+# Stamp the cooldown for the keys we just delivered. Called ONLY on the success
+# path; every early exit above and the send failing under `set -e` leave
+# `last_alert` untouched, so the next run re-alerts instead of going quiet.
+stamp_alert_cooldown() {
+  [ -n "$ALERT_KEYS" ] || return 0
+  python3 - "$NOW" $ALERT_KEYS <<'EOF'
+import json, os, sys
+state_file = os.environ["STATE_FILE"]
+now, keys = int(sys.argv[1]), sys.argv[2:]
+try:
+    with open(state_file) as f: state = json.load(f)
+except Exception: state = {}
+last = state.get("last_alert", {})
+for key in keys: last[key] = now
+state["last_alert"] = last
+with open(state_file, "w") as f: json.dump(state, f)
+EOF
+}
 
 if [ ${#BREACHES[@]} -eq 0 ]; then
-  echo "health-sentinel: all vitals OK (load15=$LOAD15 disk=${DISK_PCT:-?}% service=$SERVICE_STATE)"
+  echo "health-sentinel: all vitals OK (load15=$LOAD15 disk=${DISK_PCT:-?}% service=$SERVICE_STATE timers=${WATCHED_TIMERS:-off})"
   exit 0
 fi
 if [ -z "$ALERT_LINES" ]; then
@@ -241,3 +329,4 @@ time.sleep(0.5)
 sock.close()
 print("health-sentinel: alert delivered to owner DM")
 EOF
+stamp_alert_cooldown

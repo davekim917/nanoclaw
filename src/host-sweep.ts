@@ -122,7 +122,7 @@ export function parseSqliteUtc(s: string): number {
   return Date.parse(/[zZ]|[+-]\d{2}:?\d{2}$/.test(s) ? s : s + 'Z');
 }
 
-const SWEEP_INTERVAL_MS = 60_000;
+export const SWEEP_INTERVAL_MS = 60_000;
 
 // Quiet-session cache — see the sweep loop. A fully-quiet session is skipped
 // for at most this long (or until its next scheduled row is due, if sooner).
@@ -1043,7 +1043,26 @@ export function stopHostSweep(): void {
   stopMemoryCurationInBackground();
 }
 
+/**
+ * The timer chain, and the only thing that must never be skipped. An unguarded
+ * throw anywhere in the tick used to reject sweep()'s promise, so the
+ * reschedule never ran while `running` stayed true — making startHostSweep() a
+ * permanent no-op. log.ts swallows the unhandledRejection, so the process did
+ * not crash, systemd never restarted it, the sentinel's `service` vital stayed
+ * green, and a dead sweep emits no tick-timing lines so the `sweep` vital saw
+ * zero slow ticks. Live: 2026-08-06 ~22:20 ET. Rescheduling is unconditional
+ * for the same reason it always was: nothing else re-arms this.
+ */
 async function sweep(): Promise<void> {
+  try {
+    await sweepOnce();
+  } catch (err) {
+    log.error('Host sweep tick threw — rescheduling anyway', { err });
+  }
+  setTimeout(sweep, SWEEP_INTERVAL_MS);
+}
+
+async function sweepOnce(): Promise<void> {
   // Stall attribution: the sweep is the main 60s-periodic bulk worker, so a
   // slow tick is the first suspect whenever the event-loop stall detector
   // fires. One line per slow tick, with the per-session share, convicts or
@@ -1081,6 +1100,7 @@ async function sweep(): Promise<void> {
   // so fresh activity is swept on the very next tick, and future wakes can
   // never be skipped past their due time.
   const sessionsStartedAtMs = Date.now();
+  unreadableSessions = [];
   let skippedQuiet = 0;
   for (const session of sessions) {
     const mark = quietSessions.get(session.id);
@@ -1116,6 +1136,15 @@ async function sweep(): Promise<void> {
   }
   const sessionsMs = Date.now() - sessionsStartedAtMs;
   lastSkippedQuiet = skippedQuiet;
+  // One line per tick, never one per session: this loop runs every 60s over
+  // ~1600 sessions. Live: 24 session dirs have no inbound.db and were skipped
+  // in total silence, indistinguishable from healthy quiet.
+  if (unreadableSessions.length > 0) {
+    log.warn('Host sweep: sessions skipped as UNREADABLE (not quiet)', {
+      count: unreadableSessions.length,
+      samples: unreadableSessions.slice(0, 5),
+    });
+  }
 
   // Finalize any "Reject with reason…" holds whose reply window elapsed (admin
   // ghosted, or the host restarted mid-capture). Central-DB scan, once per tick
@@ -1241,8 +1270,6 @@ async function sweep(): Promise<void> {
   if (sweepMs >= 1_000) {
     log.info('Host sweep tick timing', { sweepMs, sessionsMs, sweptSessions, skippedQuiet: lastSkippedQuiet });
   }
-
-  setTimeout(sweep, SWEEP_INTERVAL_MS);
 }
 
 /** A per-task session with no live tasks and no running container is spent → close it. */
@@ -1633,22 +1660,33 @@ export function pruneAuditBodies(centralDb: Database.Database, options: { nowMs?
 }
 
 /**
+ * "I cannot read this session" is not "this session is quiet", but both took
+ * the same silent quiet-until return. Same backoff — a session the host cannot
+ * open has nothing to sweep — but it is now counted so the tick can say so.
+ */
+let unreadableSessions: { sessionId: string; reason: string }[] = [];
+function skipUnreadable(sessionId: string, reason: string): number {
+  unreadableSessions.push({ sessionId, reason });
+  return Date.now() + QUIET_SESSION_BACKOFF_MS;
+}
+
+/**
  * Sweep one session. Returns a quiet-until timestamp (ms) when the session is
  * fully quiet and safe to skip until then, or null when it must stay hot.
  */
 async function sweepSession(session: Session): Promise<number | null> {
   const agentGroup = getAgentGroup(session.agent_group_id);
-  if (!agentGroup) return Date.now() + QUIET_SESSION_BACKOFF_MS;
+  if (!agentGroup) return skipUnreadable(session.id, 'agent group missing');
 
   const inPath = inboundDbPath(agentGroup.id, session.id);
-  if (!fs.existsSync(inPath)) return Date.now() + QUIET_SESSION_BACKOFF_MS;
+  if (!fs.existsSync(inPath)) return skipUnreadable(session.id, 'no inbound.db');
 
   let inDb: Database.Database;
   let outDb: Database.Database | null = null;
   try {
     inDb = openInboundDb(agentGroup.id, session.id);
-  } catch {
-    return Date.now() + QUIET_SESSION_BACKOFF_MS;
+  } catch (err) {
+    return skipUnreadable(session.id, `inbound.db unreadable: ${String(err)}`);
   }
 
   try {
