@@ -44,24 +44,13 @@ the change, not a budget.
 
 ### Correct is not the test — blocking is
 
-**Most findings should not stop a merge, including real ones.** A reviewer's
-job on a PR is to catch what is glaringly destructive, not to perfect a diff.
-Quality comes from the whole gauntlet — automated review, QA, humans using the
-thing — and a PR held at round 4 over granular findings is a PR nobody can
-exercise. That trade is backwards, and it is the single most expensive habit
-this skill can teach you.
-
-- **Blocks — destructive.** Data loss or corruption; money computed, moved or
-  reported wrong; tenant or scope isolation breached; auth or permission
-  bypassed; credentials exposed; a migration with no undo. These block at any
-  round and no deadline lowers the bar.
-- **Does not block — record it and merge.** Everything else, including real
-  defects that are narrow, cosmetic, adjacent, pre-existing, or hardening
-  niceties. Record the finding wherever this deployment collects them, link it
-  from the thread, resolve the thread, merge.
-
-State the classification in one line in the thread. An unnamed call cannot be
-overruled, and a human overruling you is the point.
+**Most findings should not stop a merge, including real ones.** The full
+severity contract — what blocks, what gets recorded-and-merged, the PR-body
+contradiction exception, and the do-not-report list — is
+`docs/review-policy.md` (inside a container: `/workspace/project/docs/review-policy.md`).
+That file governs; read it before classifying, and state the classification
+in one line in the thread — an unnamed call cannot be overruled, and a human
+overruling you is the point.
 
 There is no round number that forbids a push. There used to be, and it froze
 four PRs with CI green — one with every thread already resolved — because the

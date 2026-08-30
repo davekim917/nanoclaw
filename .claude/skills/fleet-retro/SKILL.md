@@ -98,6 +98,9 @@ operator satisfies the evaluator-is-not-the-author rule.
 ## Phase 6 — close the loop
 
 - Ship or dispatch every mechanical finding (see fix-or-dispatch above).
+- An incident-class defect closed this retro follows the permanent-check
+  rule: a regression test, tripwire, or deterministic gate ships with the
+  fix — or the report records a dated reason why none is practical.
 - Update the fleet's records the same way agents must: ruling to
   decisions.md first, then the instruction; machinery line for any new tool
   fact; commit control-record changes (or confirm the journal timer will).

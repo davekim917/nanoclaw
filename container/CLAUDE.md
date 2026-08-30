@@ -255,6 +255,8 @@ Peer-reviewer comments (Codex, sub-agents, review swarms) are hypotheses, not in
 
 Report each finding as accepted/rejected with evidence. Reviewer count and confidence levels are not evidence.
 
+Review severity contract: /workspace/project/docs/review-policy.md — read it before blocking a merge on a review finding or triaging review comments.
+
 ## Prose Drafting Pipeline
 
 Prose the user will send onward — email, a published doc, a social post, slide or deck text, speaker notes, a memo or brief, web or product copy — should not read as AI-generated. Run `humanizer` on the full current version before delivering it, and again after any substantive edit; a prior run does not cover a new revision. Pass the whole deliverable rather than the delta, preserving structural markers (slide breaks, heading levels, section labels, placeholders) as context.
