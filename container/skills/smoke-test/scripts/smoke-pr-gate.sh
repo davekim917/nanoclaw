@@ -1820,13 +1820,30 @@ PR_LIST_JSON="$(timeout 10 gh pr list -R "$REPO" --base "$BRANCH" --label "$LABE
   --json number,headRefOid,headRefName --limit 100 2>/dev/null)"
 PR_LIST_RC=$?
 PR_LIST_LEN="$(jq -r 'length' <<<"$PR_LIST_JSON" 2>/dev/null || printf -- '-1')"
-# Exit code, shape, AND truncation (>=100, the --limit ceiling — same guard
-# evaluate_pr already applies to its own files/check-runs fetches) all gate
-# here. A command that fails but still prints something that happens to
+# An EMPTY list is the one answer this command cannot be trusted on. `gh pr
+# list` routes through GitHub's search API, and an unresolvable or no-longer-
+# readable repo answers with HTTP 200, body `[]`, exit 0, empty stderr — byte
+# for byte a healthy "nothing is labeled". That defeats all three legs of the
+# guard below, which made the gate_fetch_failed escalation unreachable for
+# exactly the failures that stop every campaign silently: a renamed repo, a
+# revoked or rescoped token, a typo'd SMOKE_GATE_REPO.
+#
+# So on empty (and ONLY on empty — the healthy path pays nothing) ask a
+# question that actually 404s. `gh repo view` hits the repo endpoint directly
+# and exits non-zero when the repo does not resolve or is no longer readable,
+# which turns "absence of PRs" back into evidence instead of an assumption.
+REPO_PROBE_OK=true
+if [ "$PR_LIST_RC" -eq 0 ] && [ "$PR_LIST_LEN" = "0" ]; then
+  timeout 10 gh repo view "$REPO" --json name >/dev/null 2>&1 || REPO_PROBE_OK=false
+fi
+# Exit code, reachability, shape, AND truncation (>=100, the --limit ceiling —
+# same guard evaluate_pr already applies to its own files/check-runs fetches)
+# all gate here. A command that fails but still prints something that happens to
 # parse as an empty/valid array must not be read as a legitimate "no labeled
 # PRs" result, and a truncated page must not be read as "only these PRs are
 # labeled" — either way some labeled PRs would silently never get polled.
-if [ "$PR_LIST_RC" -ne 0 ] || ! jq -e 'type == "array"' <<<"$PR_LIST_JSON" >/dev/null 2>&1 || \
+if [ "$PR_LIST_RC" -ne 0 ] || [ "$REPO_PROBE_OK" != true ] || \
+   ! jq -e 'type == "array"' <<<"$PR_LIST_JSON" >/dev/null 2>&1 || \
    [ "$PR_LIST_LEN" -ge 100 ] 2>/dev/null; then
   exec 8>"$CONTROL_LOCK"
   flock -w 5 8 || true

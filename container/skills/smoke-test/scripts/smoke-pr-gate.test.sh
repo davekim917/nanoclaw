@@ -21,6 +21,7 @@ set -u
 # so every JSON default here is set with an explicit is-it-set-at-all guard
 # instead.
 [ -n "${STUB_PR_LIST+x}" ] || STUB_PR_LIST='[]'
+[ -n "${STUB_REPO_VIEW_EXIT+x}" ] || STUB_REPO_VIEW_EXIT=0
 [ -n "${STUB_PR_VIEW+x}" ] || STUB_PR_VIEW='{}'
 [ -n "${STUB_PR_FILES+x}" ] || STUB_PR_FILES='[]'
 [ -n "${STUB_RUN_LIST+x}" ] || STUB_RUN_LIST='[]'
@@ -38,6 +39,11 @@ set -u
 [ -n "${STUB_COMPARE_EXIT+x}" ] || STUB_COMPARE_EXIT=0
 
 case "$1" in
+  repo)
+    # Reachability probe. A repo that does not resolve 404s here even though
+    # `pr list` answered it with a cheerful empty array.
+    if [ "$STUB_REPO_VIEW_EXIT" = 0 ]; then echo '{"name":"repo"}'; fi
+    exit "$STUB_REPO_VIEW_EXIT" ;;
   run)
     # CI facts now come from `gh run list --branch` (the check-runs REST
     # endpoint is invisible to the container's scoped token — see the gate).
@@ -150,7 +156,7 @@ reset_stubs() {
         STUB_PR_FILES_EXIT STUB_PR_CREATE_EXIT STUB_NEW_PR_NUMBER STUB_SUSPEND_CODE \
         STUB_HEALTHZ_CODE STUB_SERVICES STUB_BACKEND_DEPLOYS STUB_FRONTEND_DEPLOYS \
         STUB_COMPARE_FILES STUB_COMPARE_EXIT STUB_LOCK_PROBE STUB_LOCK_PROBE_FILE \
-        STUB_STATE_PROBE STUB_STATE_PROBE_FILE STUB_SUSPEND_SLEEP \
+        STUB_STATE_PROBE STUB_STATE_PROBE_FILE STUB_SUSPEND_SLEEP STUB_REPO_VIEW_EXIT \
         SMOKE_GATE_PUBLISH_FILE SMOKE_GATE_HOLD_FILE SMOKE_GATE_HANDOFF_LEDGER 2>/dev/null || true
 }
 
@@ -574,6 +580,27 @@ bash "$GATE" poll | jq -e '.wakeAgent == false and .data.trigger == "gate_fetch_
 bash "$GATE" poll | jq -e '
   .wakeAgent == true and .data.trigger == "gate_fetch_failed" and .data.consecutiveFailures == 3
 ' >/dev/null
+
+# --- 10a. An empty PR list from an UNREACHABLE repo must not read as "nothing
+# labeled". `gh pr list` goes through the search API, which answers a renamed
+# repo or a rescoped token with HTTP 200 / `[]` / exit 0 — byte-identical to
+# the healthy idle in scenario 2, which is why the reachability probe exists.
+fresh_state
+export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
+  SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
+export STUB_PR_LIST='[]' STUB_PR_LIST_EXIT=0 STUB_REPO_VIEW_EXIT=1
+bash "$GATE" poll | jq -e '.wakeAgent == false and .data.trigger == "gate_fetch_failed"' >/dev/null
+bash "$GATE" poll | jq -e '.wakeAgent == false and .data.trigger == "gate_fetch_failed"' >/dev/null
+bash "$GATE" poll | jq -e '
+  .wakeAgent == true and .data.trigger == "gate_fetch_failed" and .data.consecutiveFailures == 3
+' >/dev/null
+# And the probe must cost the healthy path nothing: a reachable repo with an
+# empty list is still a quiet idle, not a strike.
+fresh_state
+export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
+  SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
+export STUB_PR_LIST='[]' STUB_REPO_VIEW_EXIT=0
+bash "$GATE" poll | jq -e '.wakeAgent == false and .data.trigger == "waiting_for_candidates"' >/dev/null
 
 # --- 11. P1 regression: run ids must be unique ACROSS PRs, not just within
 # one PR's own state file. Before the fix, `claim` only checked collision
