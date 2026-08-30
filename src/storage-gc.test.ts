@@ -1,4 +1,4 @@
-import { execFileSync } from 'child_process';
+import { execFileSync, spawn } from 'child_process';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
@@ -90,11 +90,35 @@ vi.mock('./log.js', () => ({
   log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
 }));
 
-import { runStorageGcOnce, type GcCandidate, type GcReport } from './worktree-cleanup.js';
+import {
+  runStorageGcOnce,
+  _hostPathForProcessCwdForTesting,
+  _liveProcessCwdsForTesting,
+  type GcCandidate,
+  type GcReport,
+} from './worktree-cleanup.js';
 import { resolveRepositoryWorkUnit, topicStateDir } from './repository-workspaces.js';
 
 const WG = 'wg-a';
 const OLD = new Date(Date.now() - 30 * 86_400_000);
+/** Shared across describe blocks — apply-mode removal (topic or clone) always
+ *  goes through the real /usr/bin/trash binary. */
+const hasTrash = fs.existsSync('/usr/bin/trash');
+
+/** Poll (no sleep) until /proc/<pid>/cwd is readable — closes the (tiny,
+ *  unobserved-in-practice) window between spawn() returning and the child's
+ *  /proc entry appearing, without an arbitrary fixed wait. */
+function waitForProcCwd(pid: number, deadlineMs = 2000): void {
+  const deadline = Date.now() + deadlineMs;
+  for (;;) {
+    try {
+      fs.readlinkSync(`/proc/${pid}/cwd`);
+      return;
+    } catch {
+      if (Date.now() >= deadline) return;
+    }
+  }
+}
 
 function git(cwd: string, args: string[]): string {
   return execFileSync('git', ['-c', 'user.name=Test', '-c', 'user.email=test@example.com', ...args], {
@@ -452,13 +476,125 @@ describe('storage GC — clones', () => {
     expect(find(report, dir)).toMatchObject({ collect: false, reason: 'bound-worktrees' });
   });
 
-  it('refuses a clone whose agent group has a live container', () => {
+  it('#190: still collects a clean, pushed, idle clone even when its agent group has a live container', () => {
+    // The old behavior refused every clone under a group with any running
+    // container — but groups/<folder> is itself a container bind-mount
+    // source, so that gate fired unconditionally and made clone reclaim
+    // unreachable. Scan-time collection no longer looks at container/session
+    // liveness at all; only mount relation and process rooting (checked at
+    // apply time — see the apply-mode and process-rooted tests below) can
+    // refuse a specific clone.
     const dir = cloneFixture('folder-a/live');
     state.rows = [sessionRow('thread-live', 'folder-a', 'closed')];
     state.running.add('s-thread-live');
     const report = runStorageGcOnce(state.dataDir, state.groupsDir);
-    expect(find(report, dir)).toMatchObject({ collect: false, reason: 'agent-group-live' });
+    expect(find(report, dir)).toMatchObject({ category: 'clone', collect: true, reason: 'clean-and-pushed' });
   });
+
+  it('refuses a clone idle only 10 days, but collects one idle 30 (the 14-day floor)', () => {
+    const tooFresh = cloneFixture('folder-a/idle10');
+    const tenDaysAgo = new Date(Date.now() - 10 * 86_400_000);
+    fs.utimesSync(tooFresh, tenDaysAgo, tenDaysAgo);
+
+    const oldEnough = cloneFixture('folder-a/idle30');
+    const thirtyDaysAgo = new Date(Date.now() - 30 * 86_400_000);
+    fs.utimesSync(oldEnough, thirtyDaysAgo, thirtyDaysAgo);
+
+    const report = runStorageGcOnce(state.dataDir, state.groupsDir);
+    expect(find(report, tooFresh)).toMatchObject({ collect: false, reason: 'recent' });
+    expect(find(report, oldEnough)).toMatchObject({ collect: true, reason: 'clean-and-pushed' });
+  });
+
+  describe('hostPathForProcessCwd translation', () => {
+    it('picks the longest matching mountpoint when both /workspace and /workspace/agent are mounted', () => {
+      // Field index 3 (root) carries the host source for each mount; field 4
+      // is the mountpoint as the process's namespace sees it.
+      const mountinfo = [
+        '20 1 0:20 / / rw - ext4 /dev/root rw',
+        '21 20 0:21 /data/workgroups/wg-a /workspace rw - overlay overlay-wg rw',
+        '22 21 0:22 /data/groups/folder-a /workspace/agent rw - overlay overlay-group rw',
+      ].join('\n');
+      const host = _hostPathForProcessCwdForTesting(mountinfo, '/workspace/agent/scratch/x');
+      expect(host).toBe('/data/groups/folder-a/scratch/x');
+    });
+
+    it('maps a container path exactly at /workspace/agent to the host group dir', () => {
+      const mountinfo = [
+        '20 1 0:20 / / rw - ext4 /dev/root rw',
+        '21 20 0:21 /data/workgroups/wg-a /workspace rw - overlay overlay-wg rw',
+        '22 21 0:22 /data/groups/folder-a /workspace/agent rw - overlay overlay-group rw',
+      ].join('\n');
+      const host = _hostPathForProcessCwdForTesting(mountinfo, '/workspace/agent');
+      expect(host).toBe('/data/groups/folder-a');
+    });
+
+    it('maps root mountpoint "/" as identity when nothing more specific matches', () => {
+      const mountinfo = ['20 1 0:20 / / rw - ext4 /dev/root rw'].join('\n');
+      const host = _hostPathForProcessCwdForTesting(mountinfo, '/home/ubuntu/some/where');
+      expect(host).toBe('/home/ubuntu/some/where');
+    });
+  });
+
+  describe('liveProcessCwds — a vanished process is not an unreadable one', () => {
+    /** A fake /proc: each pid gets a `cwd` symlink, and mountinfo only if given. */
+    function fakeProc(pids: Array<{ pid: string; cwd: string; mountinfo?: string }>): string {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), 'fake-proc-'));
+      for (const entry of pids) {
+        const dir = path.join(root, entry.pid);
+        fs.mkdirSync(dir, { recursive: true });
+        fs.symlinkSync(entry.cwd, path.join(dir, 'cwd'));
+        if (entry.mountinfo !== undefined) fs.writeFileSync(path.join(dir, 'mountinfo'), entry.mountinfo);
+      }
+      return root;
+    }
+
+    const IDENTITY = '20 1 0:20 / / rw - ext4 /dev/root rw';
+
+    it('skips a pid whose mountinfo is GONE and still reports the others', () => {
+      // No mountinfo file at all == the process exited mid-scan. Treating that
+      // as unreadable would abort the pass, and on a host with constant
+      // process churn that disables the GC intermittently and invisibly.
+      const root = fakeProc([
+        { pid: '100', cwd: '/home/ubuntu/live', mountinfo: IDENTITY },
+        { pid: '200', cwd: '/home/ubuntu/vanished' },
+      ]);
+      try {
+        expect(_liveProcessCwdsForTesting(root)).toEqual(['/home/ubuntu/live']);
+      } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+      }
+    });
+
+    it('refuses the whole pass when a live pid mountinfo is unreadable for a REAL reason', () => {
+      const root = fakeProc([{ pid: '100', cwd: '/home/ubuntu/live', mountinfo: IDENTITY }]);
+      try {
+        // A directory where a file belongs reads as EISDIR, not ENOENT — a
+        // process that exists but cannot be placed.
+        fs.rmSync(path.join(root, '100', 'mountinfo'));
+        fs.mkdirSync(path.join(root, '100', 'mountinfo'));
+        expect(_liveProcessCwdsForTesting(root)).toBeNull();
+      } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+      }
+    });
+  });
+
+  it.skipIf(!hasTrash)(
+    '#190: a live process rooted in a clone refuses it as process-rooted, without trashing it',
+    () => {
+      const dir = cloneFixture('folder-a/rooted');
+      const child = spawn('sleep', ['30'], { cwd: dir });
+      try {
+        if (child.pid) waitForProcCwd(child.pid);
+        process.env.NANOCLAW_STORAGE_GC = 'apply';
+        const report = runStorageGcOnce(state.dataDir, state.groupsDir);
+        expect(find(report, dir)).toMatchObject({ collect: false, reason: 'process-rooted' });
+        expect(fs.existsSync(dir)).toBe(true);
+      } finally {
+        child.kill();
+      }
+    },
+  );
 
   it('never treats a symlink to a shared workgroup clone as a private clone', () => {
     const shared = path.join(state.dataDir, 'workgroups', WG, 'shared-repo');
@@ -482,11 +618,31 @@ describe('storage GC — clones', () => {
     const report = runStorageGcOnce(state.dataDir, state.groupsDir);
     expect(report.candidates.some((c) => c.path.includes('.repos'))).toBe(false);
   });
+
+  it('#190: reports a checkout whose .git points to an unresolvable container gitdir as keep-unprovable', () => {
+    const dir = path.join(state.groupsDir, 'folder-a', 'unprovable-checkout');
+    fs.mkdirSync(dir, { recursive: true });
+    // `.git` is a FILE (not a real worktree here) pointing at a path that only
+    // ever resolves inside the container that made it.
+    fs.writeFileSync(path.join(dir, '.git'), 'gitdir: /workspace/workgroup/repo-a/.git/worktrees/foo\n');
+    fs.utimesSync(dir, OLD, OLD);
+    const report = runStorageGcOnce(state.dataDir, state.groupsDir);
+    expect(find(report, dir)).toMatchObject({ category: 'clone', collect: false, reason: 'keep-unprovable' });
+  });
+
+  it('does not report a checkout as keep-unprovable when its .git pointer resolves on the host', () => {
+    const dir = path.join(state.groupsDir, 'folder-a', 'resolvable-checkout');
+    fs.mkdirSync(dir, { recursive: true });
+    // Points at a real host path (need not be a genuine gitdir — the
+    // predicate only asks whether the target exists on this host).
+    fs.writeFileSync(path.join(dir, '.git'), `gitdir: ${state.dataDir}\n`);
+    fs.utimesSync(dir, OLD, OLD);
+    const report = runStorageGcOnce(state.dataDir, state.groupsDir);
+    expect(find(report, dir)).toBeUndefined();
+  });
 });
 
 describe('storage GC — apply mode', () => {
-  const hasTrash = fs.existsSync('/usr/bin/trash');
-
   it.skipIf(!hasTrash)('removes NOTHING when the container runtime cannot be listed', () => {
     const { topicDir } = topicFixture('thread-clean');
     state.dockerBin = '/bin/false';
@@ -984,6 +1140,132 @@ describe('storage GC — apply mode', () => {
       expect(find(report, topicDir)).toMatchObject({ collect: false, reason: 'aborted-prune-journal-unwritable' });
       // The pre-existing journal content survives untouched — no corruption.
       expect(JSON.parse(fs.readFileSync(journalPath, 'utf8'))).toEqual(existing);
+    },
+  );
+
+  it.skipIf(!hasTrash)('#190: collects a clone via quarantine — the directory is gone afterward', () => {
+    const dir = cloneFixture('folder-a/collectme');
+    process.env.NANOCLAW_STORAGE_GC = 'apply';
+    const report = runStorageGcOnce(state.dataDir, state.groupsDir);
+    expect(find(report, dir)).toMatchObject({ category: 'clone', collect: true, reason: 'clean-and-pushed' });
+    expect(fs.existsSync(dir)).toBe(false);
+    // Nothing left behind under quarantine — trashPath took the moved copy,
+    // and the (now-empty) quarantine root itself is reaped by a later pass's
+    // recoverOrphanedQuarantine, not asserted here.
+    expect(fs.readdirSync(path.join(state.dataDir, '.gc-quarantine'))).toEqual([]);
+  });
+
+  it.skipIf(!hasTrash)('#190: a clone made DIRTY during the quarantine window is restored, not trashed', () => {
+    // finalizeCloneCollection re-runs the full git proof against the MOVED
+    // copy after the rename into quarantine. Hook the rename itself (same
+    // technique the topic-side "late activity" tests above use) to write an
+    // untracked file into the quarantined copy right after the move — this
+    // is the exact race the post-move re-proof exists to catch.
+    const dir = cloneFixture('folder-a/dirtiedlate');
+    const realRename = fs.renameSync.bind(fs);
+    vi.spyOn(fs, 'renameSync').mockImplementationOnce((from, to) => {
+      realRename(from as fs.PathLike, to as fs.PathLike);
+      fs.writeFileSync(path.join(to as string, 'dirtied-during-quarantine.txt'), 'late write');
+    });
+    process.env.NANOCLAW_STORAGE_GC = 'apply';
+    let report: GcReport;
+    try {
+      report = runStorageGcOnce(state.dataDir, state.groupsDir);
+    } finally {
+      vi.restoreAllMocks();
+    }
+    expect(find(report, dir)).toMatchObject({ collect: false, reason: 'aborted-dirty' });
+    // Restored to its original path with the late write intact — nothing lost.
+    expect(fs.existsSync(dir)).toBe(true);
+    expect(fs.existsSync(path.join(dir, 'dirtied-during-quarantine.txt'))).toBe(true);
+    expect(fs.readdirSync(path.join(state.dataDir, '.gc-quarantine'))).toEqual([]);
+  });
+
+  it.skipIf(!hasTrash)('#190: recovers a CLONE orphaned in quarantine by a prior interrupted pass', () => {
+    // The clone marker is a SIDECAR next to the entry (`<entry>.meta.json`),
+    // not a file inside it — see cloneSidecarPath. The ordering invariant
+    // (marker written before the rename, deleted only after trash succeeds)
+    // means a crash can leave (marker, no entry) but never (entry, no
+    // marker), so recoverOrphanedQuarantine only ever needs to handle the
+    // entry-present case for a clone.
+    const originalPath = path.join(state.groupsDir, 'folder-a', 'orphan-clone');
+    fs.mkdirSync(path.dirname(originalPath), { recursive: true });
+    const quarantinePath = path.join(state.dataDir, '.gc-quarantine', 'orphan-clone-123');
+    fs.mkdirSync(quarantinePath, { recursive: true });
+    fs.writeFileSync(path.join(quarantinePath, 'marker.txt'), 'kept');
+    fs.writeFileSync(`${quarantinePath}.meta.json`, JSON.stringify({ originalPath, category: 'clone' }));
+    state.rows = [];
+    process.env.NANOCLAW_STORAGE_GC = 'apply';
+    const report = runStorageGcOnce(state.dataDir, state.groupsDir);
+    expect(find(report, originalPath)).toMatchObject({
+      category: 'clone',
+      collect: false,
+      reason: 'quarantine-restored',
+    });
+    expect(fs.existsSync(originalPath)).toBe(true);
+    expect(fs.existsSync(path.join(originalPath, 'marker.txt'))).toBe(true);
+    expect(fs.existsSync(`${quarantinePath}.meta.json`)).toBe(false);
+    expect(fs.existsSync(path.join(state.dataDir, '.gc-quarantine'))).toBe(false);
+  });
+
+  it.skipIf(!hasTrash)('#190: an orphaned quarantine entry with no category field is still treated as a topic', () => {
+    const { topicDir } = topicFixture('thread-idle-nocategory');
+    const quarantinePath = path.join(state.dataDir, '.gc-quarantine', 'orphan-nocat');
+    fs.mkdirSync(quarantinePath, { recursive: true });
+    fs.cpSync(topicDir, quarantinePath, { recursive: true });
+    fs.rmSync(topicDir, { recursive: true, force: true });
+    // No `category` field at all — the pre-#190 shape.
+    fs.writeFileSync(path.join(quarantinePath, '.gc-quarantine-meta.json'), JSON.stringify({ originalPath: topicDir }));
+    state.rows = [];
+    process.env.NANOCLAW_STORAGE_GC = 'apply';
+    const report = runStorageGcOnce(state.dataDir, state.groupsDir);
+    expect(find(report, topicDir)).toMatchObject({
+      category: 'orphan-topic',
+      collect: false,
+      reason: 'quarantine-recovered',
+    });
+    expect(fs.existsSync(topicDir)).toBe(true);
+  });
+
+  it.skipIf(!hasTrash)(
+    '#190: a process that exits between the cwd readlink and the mountinfo read does not abort the whole pass',
+    () => {
+      // Simulate the exact race hostPathForProcessCwd's ENOENT/ESRCH branch
+      // exists for: readdirSync('/proc') sees a pid, readlinkSync(cwd) still
+      // succeeds, but the process is gone by the time mountinfo is read. A
+      // phantom pid lets us force exactly that sequence deterministically,
+      // without racing a real process exit.
+      const dir = cloneFixture('folder-a/racy');
+      const phantomPid = '999999999';
+      const realReaddirSync = fs.readdirSync.bind(fs);
+      const realReadlinkSync = fs.readlinkSync.bind(fs);
+      const realReadFileSync = fs.readFileSync.bind(fs);
+      vi.spyOn(fs, 'readdirSync').mockImplementation(((p: unknown, opts?: unknown) => {
+        if (p === '/proc' && !opts) return [...(realReaddirSync(p as string) as string[]), phantomPid];
+        return (realReaddirSync as (...args: unknown[]) => unknown)(p, opts);
+      }) as typeof fs.readdirSync);
+      vi.spyOn(fs, 'readlinkSync').mockImplementation(((p: unknown, opts?: unknown) => {
+        if (p === `/proc/${phantomPid}/cwd`) return '/workspace/agent/gone';
+        return (realReadlinkSync as (...args: unknown[]) => unknown)(p, opts);
+      }) as typeof fs.readlinkSync);
+      vi.spyOn(fs, 'readFileSync').mockImplementation(((p: unknown, ...rest: unknown[]) => {
+        if (p === `/proc/${phantomPid}/mountinfo`) {
+          const err = new Error('simulated: process exited mid-scan') as NodeJS.ErrnoException;
+          err.code = 'ENOENT';
+          throw err;
+        }
+        return (realReadFileSync as (...args: unknown[]) => unknown)(p, ...rest);
+      }) as typeof fs.readFileSync);
+
+      process.env.NANOCLAW_STORAGE_GC = 'apply';
+      let report: GcReport;
+      try {
+        report = runStorageGcOnce(state.dataDir, state.groupsDir);
+      } finally {
+        vi.restoreAllMocks();
+      }
+      expect(find(report, dir)).toMatchObject({ category: 'clone', collect: true, reason: 'clean-and-pushed' });
+      expect(fs.existsSync(dir)).toBe(false);
     },
   );
 });
