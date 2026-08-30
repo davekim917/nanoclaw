@@ -3914,7 +3914,7 @@ async function buildContainerArgs(
     // (vault entry "Exa-MCP" → mcp.exa.ai).
     mcpServers.exa = {
       type: 'http',
-      url: 'https://mcp.exa.ai/mcp?tools=web_search_exa,web_search_advanced_exa,get_code_context_exa,crawling_exa,company_research_exa,people_search_exa,deep_researcher_start,deep_researcher_check,deep_search_exa',
+      url: 'https://mcp.exa.ai/mcp?tools=web_search_exa,web_fetch_exa,web_search_advanced_exa,agent_run',
     };
   }
   if (canInject('pocket')) {

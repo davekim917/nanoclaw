@@ -494,7 +494,7 @@ export function buildSessionServicesSnapshot(
       scopes: [],
       credentialPaths: [],
       useFor:
-        'Web search, research, and code context. Prefer exa over ad-hoc WebSearch/WebFetch for: web search (`mcp__exa__web_search_exa`), company research (`mcp__exa__company_research_exa`), people search (`mcp__exa__people_search_exa`), deep research (`mcp__exa__deep_researcher_start` then `_check`), code context from public repos (`mcp__exa__get_code_context_exa`), crawling specific URLs (`mcp__exa__crawling_exa`).',
+        'Web search, research, and code context. Prefer exa over ad-hoc WebSearch/WebFetch for: web search including code/docs lookups (`mcp__exa__web_search_exa`), reading specific URLs (`mcp__exa__web_fetch_exa`), filtered search — categories (company, people), domains, dates (`mcp__exa__web_search_advanced_exa`), multi-step research agent (`mcp__exa__agent_run`).',
     });
   }
 

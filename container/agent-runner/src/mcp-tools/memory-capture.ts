@@ -189,15 +189,6 @@ export const MCP_CAPTURE_TOOLS: ReadonlyArray<{
   // Search-only tools (web_search_exa) are also captured because their result
   // sets carry context that compounds (top-N URLs/snippets for a query).
   {
-    name: 'mcp__exa__crawling_exa',
-    prefix: 'exa-crawl',
-    hashOf: (input: unknown) => {
-      const i = input as { url?: string; urls?: string[] };
-      return i.url ?? (i.urls ?? []).join('|') ?? JSON.stringify(input);
-    },
-    serialize: (output: unknown) => JSON.stringify(output, null, 2),
-  },
-  {
     name: 'mcp__exa__web_search_exa',
     prefix: 'exa-search',
     hashOf: (input: unknown) => (input as { query?: string })?.query ?? JSON.stringify(input),
@@ -210,30 +201,21 @@ export const MCP_CAPTURE_TOOLS: ReadonlyArray<{
     serialize: (output: unknown) => JSON.stringify(output, null, 2),
   },
   {
-    name: 'mcp__exa__company_research_exa',
-    prefix: 'exa-company',
+    name: 'mcp__exa__web_fetch_exa',
+    prefix: 'exa-fetch',
     hashOf: (input: unknown) =>
-      (input as { company_name?: string; domain?: string })?.company_name ??
-      (input as { domain?: string })?.domain ??
+      (input as { url?: string; urls?: string[] })?.url ??
+      (input as { urls?: string[] })?.urls?.join(',') ??
       JSON.stringify(input),
     serialize: (output: unknown) => JSON.stringify(output, null, 2),
   },
   {
-    name: 'mcp__exa__people_search_exa',
-    prefix: 'exa-people',
-    hashOf: (input: unknown) => (input as { query?: string })?.query ?? JSON.stringify(input),
-    serialize: (output: unknown) => JSON.stringify(output, null, 2),
-  },
-  {
-    name: 'mcp__exa__deep_researcher_check',
+    name: 'mcp__exa__agent_run',
     prefix: 'exa-research',
-    hashOf: (input: unknown) => (input as { task_id?: string })?.task_id ?? JSON.stringify(input),
-    serialize: (output: unknown) => JSON.stringify(output, null, 2),
-  },
-  {
-    name: 'mcp__exa__get_code_context_exa',
-    prefix: 'exa-code',
-    hashOf: (input: unknown) => (input as { query?: string })?.query ?? JSON.stringify(input),
+    hashOf: (input: unknown) =>
+      (input as { instructions?: string; query?: string })?.instructions ??
+      (input as { query?: string })?.query ??
+      JSON.stringify(input),
     serialize: (output: unknown) => JSON.stringify(output, null, 2),
   },
 ];

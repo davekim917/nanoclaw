@@ -84,15 +84,12 @@ describe('MCP_CAPTURE_TOOLS', () => {
     expect(names).toContain('mcp__github__get_pr');
     // Exa MCP tools — content-producing research/crawl results route through
     // the same source pipeline ("fetch is the curation signal").
-    expect(names).toContain('mcp__exa__crawling_exa');
     expect(names).toContain('mcp__exa__web_search_exa');
     expect(names).toContain('mcp__exa__web_search_advanced_exa');
-    expect(names).toContain('mcp__exa__company_research_exa');
-    expect(names).toContain('mcp__exa__people_search_exa');
-    expect(names).toContain('mcp__exa__deep_researcher_check');
-    expect(names).toContain('mcp__exa__get_code_context_exa');
-    // 1 granola + 1 pocket + 1 linear + 1 github + 7 exa = 11
-    expect(MCP_CAPTURE_TOOLS.length).toBe(11);
+    expect(names).toContain('mcp__exa__web_fetch_exa');
+    expect(names).toContain('mcp__exa__agent_run');
+    // 1 granola + 1 pocket + 1 linear + 1 github + 4 exa = 8
+    expect(MCP_CAPTURE_TOOLS.length).toBe(8);
   });
 });
 
