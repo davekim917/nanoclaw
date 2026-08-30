@@ -2242,6 +2242,33 @@ describe('storage-manager rescue archive round-trip', () => {
       process.env.PATH = originalPath;
     }
   });
+
+  it('survives tar exiting 1 for "file changed as we read it" on the create call', () => {
+    // GNU tar's documented exit status (`man tar` RETURN VALUE, verified on
+    // this box: tar 1.35): exit 1 for --create means "some files were
+    // changed while being archived" — expected on a live tree, not fatal.
+    // `--warning=no-file-changed` mutes the message but NOT this exit code
+    // (also verified directly), so the create call must tolerate status 1
+    // itself. Force it deterministically rather than racing a real file
+    // write against tar's read.
+    const realTarPath = realExecFileSync('sh', ['-c', 'command -v tar'], { encoding: 'utf8' }).trim();
+    const fakeBinDir = fs.mkdtempSync(path.join(tmpRoot, 'fake-bin-'));
+    const fakeTarPath = path.join(fakeBinDir, 'tar');
+    fs.writeFileSync(
+      fakeTarPath,
+      `#!/bin/sh\n"${realTarPath}" "$@"\nrc=$?\ncase " $* " in\n  *" -cf "*) exit 1 ;;\nesac\nexit $rc\n`,
+    );
+    fs.chmodSync(fakeTarPath, 0o755);
+    const originalPath = process.env.PATH;
+    process.env.PATH = `${fakeBinDir}:${originalPath}`;
+    try {
+      const dir = seedIdle('sess-tar-exit1');
+      expect(runApply().actions.find((a) => a.kind === 'archive-session')?.status).toBe('applied');
+      expect(fs.existsSync(dir)).toBe(false);
+    } finally {
+      process.env.PATH = originalPath;
+    }
+  });
 });
 
 /**

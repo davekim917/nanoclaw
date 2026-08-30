@@ -935,6 +935,28 @@ const SESSION_ARCHIVE_EXTRA_EXCLUDES = ['creds'];
 // to every tar invocation below (create and `-tf` verify/listing alike).
 const TAR_MAX_BUFFER_BYTES = 64 * 1024 * 1024;
 
+/**
+ * Create a tar archive, tolerating GNU tar's documented exit 1 ("some files
+ * were changed while being archived" — `man tar` RETURN VALUE, verified on
+ * this box against tar 1.35 by forcing the race: exit 1, and unaffected by
+ * `--warning=no-file-changed`, which mutes only the message, not the status).
+ * That is the expected outcome of archiving a dir its agent may still be
+ * writing to, not a failure — treating it as fatal is what made every
+ * archive-session on a live tree fail before this fix. Exit 2 (or anything
+ * else, including a fatal subprocess failure passed through from zstd) still
+ * throws. Safety is not weakened: content correctness is decided by the
+ * `-tf` read-back and size/fsync checks the caller runs afterward, not by
+ * this exit code, so a genuinely truncated or corrupt archive still fails
+ * fast there.
+ */
+function tarCreate(args: string[], options: Parameters<typeof execFileSync>[2]): void {
+  try {
+    execFileSync('tar', args, options);
+  } catch (err) {
+    if ((err as { status?: number }).status !== 1) throw err;
+  }
+}
+
 interface CentralSessionRow {
   status: string;
   last_activity: string | null;
@@ -1221,19 +1243,20 @@ function createArchiveSessionAction(args: {
         const tempPath = `${archivePath}.tmp`;
         try {
           fs.rmSync(tempPath, { force: true });
-          execFileSync(
-            'tar',
+          tarCreate(
             [
               '-I',
               'zstd -T0',
               // The tree is live while we read it (the agent may still be
               // writing), so tar's own "file changed as we read it" notice
-              // is the expected case here, not a sign of trouble — silencing
-              // it stops the flood at the source instead of just raising the
-              // ceiling below. Correctness is decided by the exit code and
-              // the `-tf` verify pass, not by parsing warning text, so this
-              // does not hide a genuinely corrupt archive. Every OTHER
-              // warning class stays on.
+              // (and the exit 1 that comes with it, tolerated by tarCreate
+              // above) is the expected case here, not a sign of trouble —
+              // silencing the message just cuts noise, since suppressing it
+              // does NOT change the exit status. Correctness is decided by
+              // the `-tf` verify pass and the size/fsync checks below, not by
+              // the exit code or by parsing warning text, so none of this
+              // hides a genuinely corrupt archive. Every OTHER warning class
+              // stays on.
               '--warning=no-file-changed',
               ...ARCHIVE_EXCLUDED_DIR_NAMES.map((name) => `--exclude=${name}`),
               ...SESSION_ARCHIVE_EXTRA_EXCLUDES.map((name) => `--exclude=${name}`),
@@ -1717,14 +1740,14 @@ function createArchiveThreadWorktreeAction(args: {
         const stamp = new Date().toISOString().replace(/[:.]/g, '-');
         const archiveName = `${args.threadDir.slice(args.threadsRoot.length + 1).replace(/[/\\]/g, '__')}-${stamp}.tar.zst`;
         const archivePath = path.join(args.rescuesDir, archiveName);
-        execFileSync(
-          'tar',
+        tarCreate(
           [
             '-I',
             'zstd -T0',
-            // Same rationale as the session-archive create call: this path is
-            // idle-gated, not guaranteed quiet, and the maxBuffer bump below
-            // is a bounded ceiling rather than a bug fix on its own.
+            // Same rationale as the session-archive create call (tarCreate
+            // tolerates tar's exit 1 there too): this path is idle-gated,
+            // not guaranteed quiet, and the maxBuffer bump below is a
+            // bounded ceiling rather than a bug fix on its own.
             '--warning=no-file-changed',
             ...ARCHIVE_EXCLUDED_DIR_NAMES.map((name) => `--exclude=${name}`),
             '-cf',
