@@ -809,12 +809,25 @@ function collectOrphanTopics(report: GcReport, dataDir: string, owners: Map<stri
         skip('topic-busy');
         continue;
       }
-      if (idleDays(topicDir) < MINIMUM_IDLE_DAYS) {
+      const worktreeRoot = path.join(topicDir, 'worktrees');
+      // #203: topicDir's own mtime is not a signal of activity — any bulk
+      // metadata touch on the parent (data/v2-topics/<workgroup>) bumps every
+      // topic dir at once regardless of what's inside. Production evidence:
+      // 360 topic dirs shared one 2-second mtime window from an unidentified
+      // bulk op, which silently disabled this gate fleet-wide for 7 days.
+      // `worktrees/` is the deeper, real-activity signal — branchMayBeRemoved
+      // above already keys off this same depth rather than the topic dir.
+      // Read idleDays from worktrees/ exclusively rather than
+      // max(topicDir, worktrees): taking the max would still let a poisoned
+      // (freshest) topicDir value win on the next bulk touch, reproducing
+      // this exact bug. A missing/unstat-able worktrees/ hits idleDays'
+      // stat-failure fallback (returns 0 = "brand new"), which still fails
+      // closed here — it refuses collection, it does not grant a free pass.
+      if (idleDays(worktreeRoot) < MINIMUM_IDLE_DAYS) {
         skip('recent');
         continue;
       }
 
-      const worktreeRoot = path.join(topicDir, 'worktrees');
       // The ONE safeDirectories call here that must not fall back to []. The
       // loop below is what proves every checkout under this topic disposable;
       // reading an unreadable root as empty leaves `refused` null and records

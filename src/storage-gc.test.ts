@@ -190,6 +190,9 @@ function topicFixture(
   const branch = `topic-${threadId}`;
   git(canonical, ['worktree', 'add', '-q', '-b', branch, worktree, 'origin/HEAD']);
   fs.utimesSync(topicDir, OLD, OLD);
+  // #203: the recency gate reads worktrees/, not topicDir — age it too so
+  // every "collectible" fixture reflects genuinely-idle real-activity state.
+  fs.utimesSync(path.join(topicDir, 'worktrees'), OLD, OLD);
   return { topicDir, worktree, canonical, branch };
 }
 
@@ -345,10 +348,31 @@ describe('storage GC — the predicate refuses', () => {
     expect(find(report, topicDir)).toMatchObject({ collect: false, reason: 'status-unprovable' });
   });
 
-  it('refuses a topic that has not been idle long enough', () => {
+  it('refuses a topic whose worktrees/ directory has not been idle long enough', () => {
     const { topicDir } = topicFixture('thread-fresh');
     const now = new Date();
-    fs.utimesSync(topicDir, now, now);
+    fs.utimesSync(path.join(topicDir, 'worktrees'), now, now);
+    const report = runStorageGcOnce(state.dataDir, state.groupsDir);
+    expect(find(report, topicDir)).toMatchObject({ collect: false, reason: 'recent' });
+  });
+
+  // #203: production evidence — 360 topic dirs shared one 2-second mtime
+  // window from an unidentified bulk metadata touch on the parent
+  // (data/v2-topics/<workgroup>), which silently disabled this gate
+  // fleet-wide for 7 days. worktrees/ underneath was untouched and genuinely
+  // stale. This is the case the fix targets: a poisoned topicDir mtime must
+  // not block collection when worktrees/ proves real inactivity.
+  it('collects a topic whose directory mtime was bulk-touched but whose worktrees/ is genuinely stale', () => {
+    const { topicDir } = topicFixture('thread-bulk-touched');
+    const now = new Date();
+    fs.utimesSync(topicDir, now, now); // simulates the poisoning bulk op
+    const report = runStorageGcOnce(state.dataDir, state.groupsDir);
+    expect(find(report, topicDir)).toMatchObject({ collect: true, reason: 'orphaned-and-clean' });
+  });
+
+  it('refuses a topic whose worktrees/ directory is missing (fails closed, not open)', () => {
+    const { topicDir } = topicFixture('thread-no-worktrees');
+    fs.rmSync(path.join(topicDir, 'worktrees'), { recursive: true, force: true });
     const report = runStorageGcOnce(state.dataDir, state.groupsDir);
     expect(find(report, topicDir)).toMatchObject({ collect: false, reason: 'recent' });
   });
