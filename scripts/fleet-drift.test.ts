@@ -7,9 +7,19 @@ import {
   failedStreakBreach,
   isDuplicateBreach,
   isWarmingUp,
+  isLiveForStreak,
+  advancePauseState,
   computeSeriesStats,
   countRecentErrorLines,
 } from './fleet-drift.js';
+
+/** Mirrors src/log.ts's `ts()` — local wall-clock, not UTC. Kept TZ-agnostic by building both the log
+ * stamp and the `now` argument from the SAME local-time basis, so these tests pass under any runner TZ. */
+function localStamp(d: Date): string {
+  const p2 = (n: number) => String(n).padStart(2, '0');
+  const p3 = (n: number) => String(n).padStart(3, '0');
+  return `${d.getFullYear()}-${p2(d.getMonth() + 1)}-${p2(d.getDate())} ${p2(d.getHours())}:${p2(d.getMinutes())}:${p2(d.getSeconds())}.${p3(d.getMilliseconds())}`;
+}
 
 describe('median', () => {
   it('averages the two middle values for an even-length array', () => {
@@ -167,27 +177,111 @@ describe('computeSeriesStats', () => {
 });
 
 describe('countRecentErrorLines', () => {
-  const now = Date.parse('2026-08-30T14:00:00.000Z');
+  // Built from real local Date objects (not hardcoded UTC 'Z' strings), so
+  // these assertions hold under any runner TZ — matching the fix: the logger
+  // writes local wall-clock time, and this parses it as local too.
+  const nowDate = new Date();
+  const now = nowDate.getTime();
 
-  it('counts ERROR-prefixed lines within the last 24h', () => {
+  it('counts ANSI-wrapped ERROR lines (the real src/log.ts format)', () => {
+    const stamp = localStamp(new Date(now - 60_000));
+    // src/log.ts emit(): `[${ts()}] ${COLORS.error}ERROR${RESET} ${MSG_COLOR}msg${RESET} key=value`
+    const content = `[${stamp}] \x1b[31mERROR\x1b[39m \x1b[36msomething broke\x1b[39m key=value`;
+    expect(countRecentErrorLines(content, now)).toBe(1);
+  });
+
+  it('still counts a plain (non-ANSI) ERROR line', () => {
+    const stamp = localStamp(new Date(now - 60_000));
+    const content = `[${stamp}] ERROR something broke`;
+    expect(countRecentErrorLines(content, now)).toBe(1);
+  });
+
+  it('counts multiple ERROR lines within the last 24h', () => {
     const content = [
-      '[2026-08-30 13:00:00.000] ERROR something broke',
-      '[2026-08-29 20:00:00.000] ERROR something else broke',
+      `[${localStamp(new Date(now - 60 * 60_000))}] \x1b[31mERROR\x1b[39m \x1b[36mone\x1b[39m`,
+      `[${localStamp(new Date(now - 18 * 60 * 60_000))}] \x1b[31mERROR\x1b[39m \x1b[36mtwo\x1b[39m`,
     ].join('\n');
     expect(countRecentErrorLines(content, now)).toBe(2);
   });
 
-  it('excludes ERROR lines older than the window', () => {
-    const content = '[2026-08-29 13:59:59.000] ERROR too old by 1 second';
+  it('excludes ERROR lines older than the 24h window', () => {
+    const stamp = localStamp(new Date(now - 25 * 60 * 60 * 1000));
+    const content = `[${stamp}] \x1b[31mERROR\x1b[39m \x1b[36mtoo old\x1b[39m`;
     expect(countRecentErrorLines(content, now)).toBe(0);
   });
 
+  it('parses the stamp as LOCAL time, not UTC (no trailing Z appended)', () => {
+    // A stamp built from UTC getters instead of local getters would misread
+    // by the host's UTC offset. Skip this assertion when local time IS UTC
+    // (can't distinguish the bug there) — it still runs under any other TZ.
+    if (nowDate.getTimezoneOffset() === 0) return;
+    const utcMisreadStamp = new Date(now - 60_000).toISOString().replace('T', ' ').replace('Z', '').slice(0, 23);
+    const localCorrectStamp = localStamp(new Date(now - 60_000));
+    expect(utcMisreadStamp).not.toBe(localCorrectStamp); // sanity: the two bases actually differ here
+    expect(countRecentErrorLines(`[${localCorrectStamp}] ERROR local`, now)).toBe(1);
+  });
+
   it('ignores non-ERROR levels and multi-line stderr continuation tails', () => {
+    const stamp = localStamp(new Date(now - 60_000));
     const content = [
-      '[2026-08-30 13:00:00.000] WARN not an error',
+      `[${stamp}] \x1b[33mWARN\x1b[39m \x1b[36mnot an error\x1b[39m`,
       '    at someFunction (file.ts:10:5)', // stack-trace continuation, no timestamp prefix
       'unhandled rejection dump with no bracket prefix at all',
     ].join('\n');
     expect(countRecentErrorLines(content, now)).toBe(0);
+  });
+});
+
+describe('isLiveForStreak', () => {
+  it('excludes cancelled and paused series — a dead/already-paused series is not "about to" auto-pause', () => {
+    expect(isLiveForStreak('cancelled')).toBe(false);
+    expect(isLiveForStreak('paused')).toBe(false);
+  });
+  it('includes every other status (pending/completed/failed/expired)', () => {
+    expect(isLiveForStreak('pending')).toBe(true);
+    expect(isLiveForStreak('completed')).toBe(true);
+    expect(isLiveForStreak('failed')).toBe(true);
+    expect(isLiveForStreak('expired')).toBe(true);
+  });
+});
+
+describe('advancePauseState', () => {
+  it('stamps first observation as "now"', () => {
+    const { state, oldestPausedDays } = advancePauseState({}, ['s1'], '2026-08-30T00:00:00.000Z');
+    expect(state).toEqual({ s1: '2026-08-30T00:00:00.000Z' });
+    expect(oldestPausedDays).toBe(0);
+  });
+
+  it('keeps the original first-seen timestamp on repeat observation (does not reset the clock)', () => {
+    const prev = { s1: '2026-08-27T00:00:00.000Z' };
+    const { state, oldestPausedDays } = advancePauseState(prev, ['s1'], '2026-08-30T00:00:00.000Z');
+    expect(state).toEqual({ s1: '2026-08-27T00:00:00.000Z' });
+    expect(oldestPausedDays).toBe(3);
+  });
+
+  it('drops a series no longer paused (resumed or gone)', () => {
+    const prev = { s1: '2026-08-20T00:00:00.000Z', s2: '2026-08-29T00:00:00.000Z' };
+    const { state } = advancePauseState(prev, ['s2'], '2026-08-30T00:00:00.000Z');
+    expect(state).toEqual({ s2: '2026-08-29T00:00:00.000Z' });
+  });
+
+  it('a re-paused series (absent from prevState) is stamped fresh, not resuming its old age', () => {
+    const { state, oldestPausedDays } = advancePauseState({}, ['s1'], '2026-08-30T00:00:00.000Z');
+    expect(state.s1).toBe('2026-08-30T00:00:00.000Z');
+    expect(oldestPausedDays).toBe(0);
+  });
+
+  it('no currently-paused series → empty state, zero age', () => {
+    const { state, oldestPausedDays } = advancePauseState({ s1: '2026-08-01T00:00:00.000Z' }, [], '2026-08-30T00:00:00.000Z');
+    expect(state).toEqual({});
+    expect(oldestPausedDays).toBe(0);
+  });
+
+  it('oldest_paused_days breaches pausedSeriesBreach only after 3+ observed days', () => {
+    const prev = { s1: '2026-08-27T12:00:00.000Z' };
+    const under = advancePauseState(prev, ['s1'], '2026-08-30T11:59:00.000Z').oldestPausedDays;
+    const over = advancePauseState(prev, ['s1'], '2026-08-30T12:01:00.000Z').oldestPausedDays;
+    expect(pausedSeriesBreach(1, under)).toBe(false);
+    expect(pausedSeriesBreach(1, over)).toBe(true);
   });
 });

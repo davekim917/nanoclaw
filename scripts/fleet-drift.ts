@@ -8,11 +8,15 @@
  *
  * Flow:
  *   1. Collect today's metrics — disk usage/pct for data/, ERROR-line count in
- *      the last 24h from logs/nanoclaw.error.log(.1), and fleet-wide scheduled-
- *      task health (paused series / oldest pause / worst failure streak) via a
+ *      the last 24h from logs/nanoclaw.error.log(.1) (ANSI-stripped, local-time
+ *      parsed — src/log.ts wraps the level tag in color codes and timestamps in
+ *      local wall-clock, not UTC), and fleet-wide scheduled-task health (paused
+ *      series / oldest observed pause / worst live failure streak) via a
  *      per-session inbound.db fan-out. Fail-closed: any unreadable source
  *      throws, main() prints it and returns 1 — never silently treated as zero.
- *   2. Append one JSON line to data/fleet-drift/metrics.ndjson.
+ *   2. Append one JSON line to data/fleet-drift/metrics.ndjson, and persist
+ *      data/fleet-drift/state.json (first-observed-paused per series — see
+ *      advancePauseState; the DB has no authoritative "when paused" signal).
  *   3. Compare today's value against a control band built from prior days:
  *      disk_growth_bytes and error_events_24h breach at median + 3×MAD (scaled
  *      ×1.4826) of the prior series, with a flat-zero guard when MAD is 0.
@@ -24,8 +28,8 @@
  *      starts with `fleet-drift: <metric>` suppresses re-filing — the open
  *      issue IS the cooldown; closing it re-arms.
  *
- * FLEET_DRIFT_DRY_RUN=1: collect + print, write the ndjson line to a temp path
- * instead of data/fleet-drift/metrics.ndjson, never call `gh issue create`.
+ * FLEET_DRIFT_DRY_RUN=1: collect + print, write the ndjson line and pause-state
+ * to a temp path instead of data/fleet-drift/, never call `gh issue create`.
  * Band computation still reads the REAL prior history (read-only) so the dry
  * run exercises genuine band logic against live data.
  *
@@ -99,6 +103,51 @@ export function isWarmingUp(priorLineCount: number): boolean {
   return priorLineCount < 7;
 }
 
+/**
+ * failed_streak_max is a leading indicator for a series about to auto-pause
+ * (recurrence.ts SCRIPT_FAIL_PAUSE_CAP) — exclude a series whose newest row
+ * is already 'cancelled' (dead, cancelTask clears its recurrence — src/modules/scheduling/db.ts)
+ * or already 'paused' (that state is separately captured by paused_series;
+ * the streak that got it there isn't "about to" happen, it already did).
+ * Without this a long-dead cancelled series' historical streak would breach
+ * forever, since nothing ever appends a fresh non-failed row to reset it.
+ */
+export function isLiveForStreak(latestStatus: string): boolean {
+  return latestStatus !== 'cancelled' && latestStatus !== 'paused';
+}
+
+export interface PauseState {
+  [seriesKey: string]: string; // ISO timestamp this script first observed the series paused
+}
+
+/**
+ * `pauseTask` (src/modules/scheduling/db.ts) only flips `status`; it never
+ * stamps a fresh timestamp, so there's no authoritative "when did this
+ * pause" signal in the DB — a paused row's `timestamp` is whenever that row
+ * was originally inserted, not when it was paused. Track it ourselves:
+ * first-observed-paused per series, persisted across runs in state.json.
+ *
+ * oldest_paused_days = age of the earliest first-seen among currently-paused
+ * series. This measures OBSERVED pause duration (since fleet-drift started
+ * watching), which LOWER-BOUNDS true pause duration — a series paused before
+ * this script ever ran reads as "just paused" on first observation. A series
+ * that resumes and later re-pauses is treated as newly first-seen (dropped
+ * from state while resumed, so it doesn't inherit its old age).
+ */
+export function advancePauseState(
+  prevState: PauseState,
+  currentlyPausedKeys: string[],
+  nowIso: string,
+): { state: PauseState; oldestPausedDays: number } {
+  const state: PauseState = {};
+  for (const key of currentlyPausedKeys) state[key] = prevState[key] ?? nowIso;
+
+  const firstSeenMs = Object.values(state).map((iso) => Date.parse(iso));
+  if (firstSeenMs.length === 0) return { state, oldestPausedDays: 0 };
+  const oldestPausedDays = (Date.parse(nowIso) - Math.min(...firstSeenMs)) / (24 * 60 * 60 * 1000);
+  return { state, oldestPausedDays };
+}
+
 interface TaskRow {
   id: string;
   series_id: string | null;
@@ -144,14 +193,24 @@ export function computeSeriesStats(rowsDescBySeq: TaskRow[]): Map<string, Series
   return result;
 }
 
-/** Count `[<stamp>] ERROR ...` lines in `content` whose timestamp is within `windowMs` of `nowMs`. Host TZ is UTC. */
+/**
+ * Count `[<stamp>] ERROR ...` lines in `content` whose timestamp is within
+ * `windowMs` of `nowMs`. src/log.ts wraps the level tag in ANSI color codes
+ * (`\x1b[31mERROR\x1b[39m`) and the message in another color, so a plain
+ * `] ERROR` prefix match misses every real line — strip ANSI escapes first.
+ * The stamp itself is LOCAL wall-clock time (src/log.ts `ts()` uses local
+ * Date getters, not UTC), so it's parsed as local — correct as long as this
+ * script runs on the same host/TZ as the logger, which it does (both are
+ * plain host processes, no TZ override).
+ */
+const ANSI_RE = /\x1b\[[0-9;]*m/g;
 const ERROR_LINE_RE = /^\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3})\] ERROR\b/;
 export function countRecentErrorLines(content: string, nowMs: number, windowMs = 24 * 60 * 60 * 1000): number {
   let count = 0;
-  for (const line of content.split('\n')) {
-    const m = ERROR_LINE_RE.exec(line);
+  for (const rawLine of content.split('\n')) {
+    const m = ERROR_LINE_RE.exec(rawLine.replace(ANSI_RE, ''));
     if (!m) continue;
-    const ts = Date.parse(`${m[1].replace(' ', 'T')}Z`);
+    const ts = Date.parse(m[1]);
     if (Number.isFinite(ts) && nowMs - ts <= windowMs) count++;
   }
   return count;
@@ -187,16 +246,23 @@ function collectErrorEvents24h(logsDir: string, nowMs: number): number {
   return countRecentErrorLines(primary, nowMs) + countRecentErrorLines(rotated, nowMs);
 }
 
-function collectScheduledTaskHealth(
-  dataDir: string,
-  nowMs: number,
-): { pausedSeries: number; oldestPausedDays: number; failedStreakMax: number } {
+/** Missing state.json (first run ever) is a normal empty state; a present-but-corrupt one is fail-closed like every other source. */
+function readPauseState(p: string): PauseState {
+  try {
+    return JSON.parse(fs.readFileSync(p, 'utf-8')) as PauseState;
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === 'ENOENT') return {};
+    throw new Error(`cannot read pause-tracking state ${p}: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
+function collectScheduledTaskHealth(dataDir: string): { pausedSeriesKeys: string[]; failedStreakMax: number } {
   const sessionsRoot = path.join(dataDir, 'v2-sessions');
-  let pausedSeries = 0;
-  let oldestPausedTs: number | null = null; // earliest latest-row timestamp among paused series = longest-paused
+  const pausedSeriesKeys: string[] = [];
   let failedStreakMax = 0;
 
-  if (!fs.existsSync(sessionsRoot)) return { pausedSeries: 0, oldestPausedDays: 0, failedStreakMax: 0 };
+  if (!fs.existsSync(sessionsRoot)) return { pausedSeriesKeys, failedStreakMax };
 
   for (const groupDir of fs.readdirSync(sessionsRoot)) {
     const groupPath = path.join(sessionsRoot, groupDir);
@@ -210,13 +276,11 @@ function collectScheduledTaskHealth(
         const rows = db
           .prepare(`SELECT id, series_id, status, seq, timestamp FROM messages_in WHERE kind = 'task' ORDER BY seq DESC`)
           .all() as TaskRow[];
-        for (const stat of computeSeriesStats(rows).values()) {
-          if (stat.failedStreak > failedStreakMax) failedStreakMax = stat.failedStreak;
-          if (stat.latestStatus === 'paused') {
-            pausedSeries++;
-            const ts = Date.parse(stat.latestTimestamp);
-            if (Number.isFinite(ts) && (oldestPausedTs === null || ts < oldestPausedTs)) oldestPausedTs = ts;
+        for (const [seriesKey, stat] of computeSeriesStats(rows)) {
+          if (isLiveForStreak(stat.latestStatus) && stat.failedStreak > failedStreakMax) {
+            failedStreakMax = stat.failedStreak;
           }
+          if (stat.latestStatus === 'paused') pausedSeriesKeys.push(seriesKey);
         }
       } finally {
         db.close();
@@ -224,8 +288,7 @@ function collectScheduledTaskHealth(
     }
   }
 
-  const oldestPausedDays = oldestPausedTs === null ? 0 : (nowMs - oldestPausedTs) / (24 * 60 * 60 * 1000);
-  return { pausedSeries, oldestPausedDays, failedStreakMax };
+  return { pausedSeriesKeys, failedStreakMax };
 }
 
 interface StoredMetrics {
@@ -238,19 +301,16 @@ interface StoredMetrics {
   failed_streak_max: number;
 }
 
-function collectMetrics(now: Date): StoredMetrics {
-  const nowMs = now.getTime();
-  const disk = collectDisk(DATA_DIR);
-  const errorEvents24h = collectErrorEvents24h(path.join(REPO_ROOT, 'logs'), nowMs);
-  const taskHealth = collectScheduledTaskHealth(DATA_DIR, nowMs);
+/** Raw fleet facts for `now` — everything except oldest_paused_days, which needs cross-run state (see advancePauseState). */
+function collectRaw(now: Date): {
+  disk: { usedBytes: number; pct: number };
+  errorEvents24h: number;
+  taskHealth: { pausedSeriesKeys: string[]; failedStreakMax: number };
+} {
   return {
-    ts: now.toISOString(),
-    disk_used_bytes: disk.usedBytes,
-    disk_pct: disk.pct,
-    error_events_24h: errorEvents24h,
-    paused_series: taskHealth.pausedSeries,
-    oldest_paused_days: Math.round(taskHealth.oldestPausedDays * 100) / 100,
-    failed_streak_max: taskHealth.failedStreakMax,
+    disk: collectDisk(DATA_DIR),
+    errorEvents24h: collectErrorEvents24h(path.join(REPO_ROOT, 'logs'), now.getTime()),
+    taskHealth: collectScheduledTaskHealth(DATA_DIR),
   };
 }
 
@@ -382,21 +442,42 @@ export function main(): number {
   try {
     const dryRun = process.env.FLEET_DRIFT_DRY_RUN === '1';
     const now = new Date();
-    const metrics = collectMetrics(now);
+    const nowIso = now.toISOString();
+    const raw = collectRaw(now);
 
     const fleetDriftDir = path.join(DATA_DIR, 'fleet-drift');
     const realNdjsonPath = path.join(fleetDriftDir, 'metrics.ndjson');
+    const realStatePath = path.join(fleetDriftDir, 'state.json');
     const priorMetrics = loadPriorMetrics(realNdjsonPath);
+    const prevPauseState = readPauseState(realStatePath);
+    const { state: newPauseState, oldestPausedDays } = advancePauseState(prevPauseState, raw.taskHealth.pausedSeriesKeys, nowIso);
 
-    let writePath = realNdjsonPath;
+    const metrics: StoredMetrics = {
+      ts: nowIso,
+      disk_used_bytes: raw.disk.usedBytes,
+      disk_pct: raw.disk.pct,
+      error_events_24h: raw.errorEvents24h,
+      paused_series: raw.taskHealth.pausedSeriesKeys.length,
+      oldest_paused_days: Math.round(oldestPausedDays * 100) / 100,
+      failed_streak_max: raw.taskHealth.failedStreakMax,
+    };
+
+    let ndjsonWritePath = realNdjsonPath;
+    let stateWritePath = realStatePath;
     if (dryRun) {
       const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'fleet-drift-dry-'));
-      writePath = path.join(tmpDir, 'metrics.ndjson');
+      ndjsonWritePath = path.join(tmpDir, 'metrics.ndjson');
+      stateWritePath = path.join(tmpDir, 'state.json');
     } else {
       fs.mkdirSync(fleetDriftDir, { recursive: true });
     }
-    fs.appendFileSync(writePath, `${JSON.stringify(metrics)}\n`);
-    if (dryRun) console.log(`fleet-drift: dry run — wrote today's line to ${writePath} (real ndjson untouched)`);
+    fs.appendFileSync(ndjsonWritePath, `${JSON.stringify(metrics)}\n`);
+    fs.writeFileSync(stateWritePath, JSON.stringify(newPauseState));
+    if (dryRun) {
+      console.log(
+        `fleet-drift: dry run — wrote today's line to ${ndjsonWritePath} and pause-state to ${stateWritePath} (real files untouched)`,
+      );
+    }
 
     if (isWarmingUp(priorMetrics.length)) {
       console.log(`fleet-drift: warming up (${priorMetrics.length}/7 runs of history)`);
