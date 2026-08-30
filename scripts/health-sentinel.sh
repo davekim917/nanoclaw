@@ -14,6 +14,8 @@
 #   7. crashloop   — a session whose container repeatedly exits non-zero
 #   8. qaseats     — QA seat-health artifact missing or stale (the smoke
 #                    gates fail OPEN on it, so nothing else would say so)
+#   9. timers      — a watched sibling timer stopped firing (opt-in via
+#                    WATCHED_TIMERS; systemd cannot see this for a oneshot)
 #
 # Log windows are measured by BYTE OFFSET deltas stored in the state file —
 # never by log timestamps (the log has multiple writers stamping different
@@ -160,6 +162,58 @@ if [ -n "$QA_SEAT_HEALTH_FILE" ]; then
   fi
 fi
 
+# Watched sibling timers. A detector that STOPPED FIRING is invisible to
+# `systemctl list-units --failed`: every detector in this fleet is Type=oneshot,
+# and a oneshot's failed state is cleared by its next successful fire — one unit
+# failed 259 consecutive times and --failed was empty 36h later. Timer liveness,
+# not service exit status, is the only honest signal, and nothing else reads it.
+#
+# Opt-in; unit names are install-specific, so trunk carries none. Set it in the
+# sentinel unit's Environment=, format `<unit>:<max-seconds-since-last-trigger>`:
+#   WATCHED_TIMERS="nanoclaw-outbox-ship.timer:300 qa-seat-health.timer:2700"
+#
+# Fail-closed on every branch: a systemctl that errors, a listed unit that is
+# not installed, an empty or unparseable LastTriggerUSec all BREACH. Reading any
+# of those as healthy would rebuild the exact blind spot this vital closes.
+WATCHED_TIMERS="${WATCHED_TIMERS:-}"
+for spec in $WATCHED_TIMERS; do
+  unit="${spec%%:*}"
+  max_age="${spec##*:}"
+  case "$max_age" in
+    ''|*[!0-9]*)
+      BREACHES+=("unit-$unit|WATCHED_TIMERS entry '$spec' has no numeric max age — $unit is listed but unjudgeable")
+      continue ;;
+  esac
+  LOAD_STATE=$(systemctl show "$unit" -p LoadState --value 2>/dev/null || echo error)
+  if [ "$LOAD_STATE" != "loaded" ]; then
+    BREACHES+=("unit-$unit|$unit is listed in WATCHED_TIMERS but not installed here (LoadState=$LOAD_STATE) — whatever it was meant to detect is unwatched")
+    continue
+  fi
+  UNIT_STATE=$(systemctl is-active "$unit" 2>/dev/null || echo unknown)
+  if [ "$UNIT_STATE" != "active" ]; then
+    BREACHES+=("unit-$unit|$unit is $UNIT_STATE — it is not going to fire again")
+    continue
+  fi
+  LAST_TRIGGER=$(systemctl show "$unit" -p LastTriggerUSec --value 2>/dev/null || echo '')
+  # `date -d ""` returns MIDNIGHT TODAY at exit 0, so an empty trigger time
+  # would silently read as "fired a few hours ago". Reject it before date sees
+  # it — this is the fail-open this vital exists to prevent.
+  if [ -z "$LAST_TRIGGER" ]; then
+    LAST_EPOCH=''
+  else
+    LAST_EPOCH=$(date -d "$LAST_TRIGGER" +%s 2>/dev/null || echo '')
+  fi
+  case "$LAST_EPOCH" in ''|*[!0-9]*) LAST_EPOCH='' ;; esac
+  if [ -z "$LAST_EPOCH" ]; then
+    BREACHES+=("unit-$unit|$unit has no readable LastTriggerUSec (got '${LAST_TRIGGER:-<empty>}') — an unreadable trigger time is treated as not firing, never as healthy")
+    continue
+  fi
+  UNIT_AGE=$((NOW - LAST_EPOCH))
+  if [ "$UNIT_AGE" -ge "$max_age" ]; then
+    BREACHES+=("unit-$unit|$unit last fired $((UNIT_AGE / 60))m ago (bound $((max_age / 60))m) — the timer stopped firing; a oneshot's failure is invisible to \`systemctl --failed\`")
+  fi
+done
+
 if [ "${TEST_ALERT:-0}" = "1" ]; then
   BREACHES+=("test|test alert requested via TEST_ALERT=1 — delivery path verified, no action needed")
 fi
@@ -225,7 +279,7 @@ EOF
 }
 
 if [ ${#BREACHES[@]} -eq 0 ]; then
-  echo "health-sentinel: all vitals OK (load15=$LOAD15 disk=${DISK_PCT:-?}% service=$SERVICE_STATE)"
+  echo "health-sentinel: all vitals OK (load15=$LOAD15 disk=${DISK_PCT:-?}% service=$SERVICE_STATE timers=${WATCHED_TIMERS:-off})"
   exit 0
 fi
 if [ -z "$ALERT_LINES" ]; then

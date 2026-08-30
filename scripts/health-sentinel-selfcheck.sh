@@ -7,6 +7,9 @@
 #   1. A failed DM leaves `last_alert` UNTOUCHED (the 6h cooldown is a receipt
 #      of delivery, not of intent) — while log offsets still advance.
 #   2. A delivered DM stamps `last_alert`.
+#   3. WATCHED_TIMERS fails CLOSED: a timer that is inactive, uninstalled, or
+#      whose LastTriggerUSec is empty/garbage BREACHES rather than reading OK.
+#
 #   bash scripts/health-sentinel-selfcheck.sh
 
 set -uo pipefail
@@ -99,6 +102,55 @@ wait $SRV 2>/dev/null
   || bad "successful delivery did not stamp the cooldown" "$OUT"
 [ "$(state log_off)" -gt 0 ] && ok "offsets advanced on the success path" \
   || bad "offsets did not advance" "log_off=$(state log_off)"
+
+# ── 3. WATCHED_TIMERS fails closed ──────────────────────────────────────────
+# Live socket sink for this section: the breach text only exists in the DM
+# payload, so asserting on stdout alone would pass on a connect failure.
+SENT="$ROOT/data/sent.log"
+: > "$SENT"
+python3 - "$ROOT/data/cli.sock" "$SENT" <<'EOS' &
+import os, socket, sys
+p, out = sys.argv[1], sys.argv[2]
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); s.bind(p); s.listen(8)
+s.settimeout(60)
+try:
+    while True:
+        c, _ = s.accept()
+        with open(out, "ab") as f: f.write(c.recv(65536))
+        c.close()
+except Exception: pass
+s.close()
+EOS
+SINK=$!
+trap 'kill $SINK 2>/dev/null; rm -rf "$ROOT"' EXIT
+for _ in $(seq 50); do [ -S "$ROOT/data/cli.sock" ] && break; sleep 0.1; done
+
+breaches_on() { # label, env...
+  local label="$1"; shift
+  rm -f "$ROOT/data/health-sentinel-state.json"
+  : > "$SENT"
+  run_sentinel "$@" WATCHED_TIMERS="probe.timer:300"
+  case "$OUT" in *"all vitals OK"*) bad "$label read as healthy" "$OUT"; return ;; esac
+  if grep -q 'probe.timer' "$SENT"; then ok "$label breached"
+  else bad "$label sent no probe.timer breach" "out=$OUT sent=$(cat "$SENT")"; fi
+}
+breaches_on "empty LastTriggerUSec"       STUB_LASTTRIGGER=""
+breaches_on "unparseable LastTriggerUSec" STUB_LASTTRIGGER="n/a"
+breaches_on "inactive timer"              STUB_ACTIVE="inactive" STUB_LASTTRIGGER="$(date)"
+# Fresh trigger supplied deliberately: LoadState must be the ONLY thing that
+# can breach here, or this case passes for the wrong reason.
+breaches_on "uninstalled unit"            STUB_LOADSTATE="not-found" STUB_LASTTRIGGER="$(date)"
+breaches_on "stale last trigger"          STUB_LASTTRIGGER="$(date -d '2 hours ago')"
+
+# A fresh trigger inside the bound must NOT breach — otherwise "fails closed"
+# is indistinguishable from "always fires", which is its own dead alarm.
+rm -f "$ROOT/data/health-sentinel-state.json"
+run_sentinel STUB_LASTTRIGGER="$(date)" WATCHED_TIMERS="probe.timer:300"
+case "$OUT" in
+  *"all vitals OK"*) ok "fresh trigger inside the bound stays quiet" ;;
+  *) bad "fresh trigger breached" "$OUT" ;;
+esac
+kill $SINK 2>/dev/null
 
 [ "$FAILED" -eq 0 ] && echo "health-sentinel-selfcheck: all checks passed" || echo "health-sentinel-selfcheck: FAILURES"
 exit "$FAILED"
