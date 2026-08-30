@@ -74,7 +74,10 @@ describe('host sweep reschedule', () => {
     await vi.waitFor(() =>
       expect(warn).toHaveBeenCalledWith(
         'Host sweep: sessions skipped as UNREADABLE (not quiet)',
-        expect.objectContaining({ count: 1, samples: [{ sessionId: 'sess-unreadable', reason: 'agent group missing' }] }),
+        expect.objectContaining({
+          count: 1,
+          samples: [{ sessionId: 'sess-unreadable', reason: 'agent group missing' }],
+        }),
       ),
     );
     warn.mockRestore();
