@@ -541,7 +541,7 @@ evaluate_pr() {
   local pr="$1" head_sha="$2" head_ref="${3:-}"
   local files_json files_len files_fetch_failed migrations_touched frontend_touched is_freeze ci_sha
   local migration_files migrations_determinable target_files_json target_files_len target_compare_failed
-  local runs_json runs_len ci_ref ci_total ci_pending ci_failed ci_succeeded ci_ready ci_truncated
+  local runs_json runs_len ci_total ci_pending ci_failed ci_succeeded ci_ready ci_truncated
   local services_json backend backend_id backend_url backend_deploy_sha backend_ready
   local frontend frontend_id frontend_url frontend_deploy_sha frontend_ready
   local healthz_ready settled fetch_ok=true
@@ -656,19 +656,24 @@ evaluate_pr() {
   ci_ready=false
   ci_total=0; ci_pending=0; ci_failed=0; ci_succeeded=0; ci_truncated=false
   if [ -n "$ci_sha" ]; then
-    # A freeze PR's ci_sha is its marker commit's PARENT, which lives on the
-    # base branch; a normal PR's ci_sha is its own head, on its head branch.
-    if [ "$is_freeze" = true ]; then ci_ref="$BRANCH"; else ci_ref="$head_ref"; fi
-    if [ -n "$ci_ref" ] &&
-       runs_json="$(timeout 10 gh run list -R "$REPO" --branch "$ci_ref" --limit 100 \
-         --json headSha,status,conclusion,workflowName 2>/dev/null)" &&
+    # Runs are found BY COMMIT (`actions/runs?head_sha=`), not by branch.
+    # Branch-based listing structurally missed release-lineage freezes: a
+    # merge commit that lands ON develop keeps its runs under
+    # head_branch=release/<...>, so `gh run list --branch develop` returned
+    # zero rows for a fully green SHA and the gate could never settle
+    # (pr1330, 2026-08-30 — the coordinator's manual SHA-bound substitution,
+    # independently re-proved by the challenger, is exactly this query).
+    # Same listing API family as `gh run list`, so the scoped-container-token
+    # property that motivated the original `gh run list` choice carries over
+    # — and it was executed in-container under that token during pr1330.
+    if runs_json="$(timeout 10 gh api "repos/$REPO/actions/runs?head_sha=$ci_sha&per_page=100" \
+         --jq '[.workflow_runs[] | {headSha: .head_sha, status, conclusion, workflowName: .name}]' 2>/dev/null)" &&
        jq -e 'type == "array"' <<<"$runs_json" >/dev/null 2>&1; then
       runs_len="$(jq -r 'length' <<<"$runs_json")"
       ci_total="$(jq -r --arg s "$ci_sha" '[.[] | select(.headSha == $s)] | length' <<<"$runs_json")"
       if [ "$runs_len" -ge 100 ] && [ "$ci_total" -eq 0 ]; then
-        # Full page and none of it is our SHA — the runs may simply be older
-        # than one page. Cannot prove CI state, so fail closed rather than
-        # read a paging artifact as "no CI ran".
+        # Cannot happen with head_sha-filtered listing (every row matches),
+        # but kept as the fail-closed guard against an API surprise.
         ci_truncated=true
         fetch_ok=false
       else
