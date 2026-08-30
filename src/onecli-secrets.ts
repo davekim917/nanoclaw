@@ -4,10 +4,8 @@
  * Declarative model: each group's `container.json` may carry an
  * `onecliSecrets: string[]` field listing the secrets it should have
  * access to (by NAME or UUID). On every container spawn, the host
- * resolves names → UUIDs and calls `onecli agents set-secrets` so the
- * agent gets exactly that set — no more, no less — and forces mode
- * `selective` so an operator who flipped to `all` via the UI doesn't
- * silently override the declarative config.
+ * resolves names → UUIDs and reconciles the agent's OneCLI secret grants
+ * so it gets exactly that set — no more, no less.
  *
  * Closes the parity gap surfaced by the earlier audit: previously
  * `ensureAgent` left every new agent in `selective` mode with NOTHING
@@ -24,9 +22,10 @@
  * SDK-bypass rationale: the `@onecli-sh/sdk@0.5.0` only exposes
  * `getGatewaySkill`, `getContainerConfig`, `applyContainerConfig`,
  * `createAgent`, `ensureAgent`, `provisionUser`, and
- * `configureManualApproval`. Set operations are CLI-only (shell-out, per
- * `setup/auth.ts:80-113`); LIST operations go straight to the gateway API
- * (`listViaApi`) because the CLI's list caps at 20 rows with no pagination.
+ * `configureManualApproval`. OneCLI v1.44 replaced the legacy agent secret
+ * mode/assignment commands with grants, so reads and mutations go straight
+ * to the gateway API. List operations also bypass the CLI because its list
+ * output caps at 20 rows with no pagination.
  */
 import { execFileSync } from 'child_process';
 
@@ -45,6 +44,26 @@ interface OnecliSecret {
   name: string;
 }
 
+interface OnecliAgentSecretGrant {
+  secretId: string;
+}
+
+interface OnecliAgentGrants {
+  agentId: string;
+  mode: 'grants';
+  connections: unknown[];
+  secrets: OnecliAgentSecretGrant[];
+}
+
+export interface EnsureOnecliAgentInput {
+  name: string;
+  identifier: string;
+}
+
+export interface EnsureOnecliAgentResult extends EnsureOnecliAgentInput {
+  created: boolean;
+}
+
 /**
  * In-memory cache mapping agent identifier → UUID. Cuts the per-spawn
  * `onecli agents list` round-trip down to one for the lifetime of the
@@ -60,20 +79,10 @@ const identifierToUuid = new Map<string, string>();
  * secret NAME requiring lookup.
  */
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const CURL_TIMEOUT_ARGS = ['--connect-timeout', '2', '--max-time', '10'] as const;
 
 function isUuid(s: string): boolean {
   return UUID_RE.test(s);
-}
-
-function runOnecli(args: string[]): string {
-  // No shell interpolation — `execFileSync` passes args directly to the
-  // binary. Important: secret VALUES are never on this path (we only
-  // pass NAMES and UUIDs), but treat the argv as untrusted-content-free
-  // anyway to keep the invariant simple.
-  return execFileSync('onecli', args, {
-    encoding: 'utf-8',
-    stdio: ['ignore', 'pipe', 'pipe'],
-  });
 }
 
 /**
@@ -89,12 +98,11 @@ function runOnecli(args: string[]): string {
  * uses; the API returns the full set (a bare array, or `{data:[...]}`).
  *
  * Kept synchronous (curl via execFileSync) so the resolve/apply call chain
- * stays sync — set operations still go through `runOnecli` (they target one
- * agent + explicit ids, so they have no pagination concern).
+ * stays sync.
  */
 function listViaApi(resource: 'agents' | 'secrets'): unknown[] {
   const base = (ONECLI_URL || 'http://127.0.0.1:10254').replace(/\/$/, '');
-  const args = ['-fsS', `${base}/api/${resource}?limit=10000`];
+  const args = ['-fsS', ...CURL_TIMEOUT_ARGS, `${base}/api/${resource}?limit=10000`];
   if (ONECLI_API_KEY) args.unshift('-H', `Authorization: Bearer ${ONECLI_API_KEY}`);
   const out = execFileSync('curl', args, { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'pipe'] });
   const parsed = JSON.parse(out) as unknown;
@@ -103,12 +111,105 @@ function listViaApi(resource: 'agents' | 'secrets'): unknown[] {
   return Array.isArray(data) ? data : [];
 }
 
+/**
+ * Call the OneCLI gateway synchronously. `curl -f` turns every non-2xx response
+ * into an exception, preserving the fail-closed spawn behavior. No secret
+ * values travel on this path; only agent and secret UUIDs are used in URLs.
+ */
+function requestViaApi(method: 'GET' | 'PUT' | 'DELETE', path: string): unknown {
+  const base = (ONECLI_URL || 'http://127.0.0.1:10254').replace(/\/$/, '');
+  const args = ['-fsS', ...CURL_TIMEOUT_ARGS, '-X', method];
+  if (ONECLI_API_KEY) args.push('-H', `Authorization: Bearer ${ONECLI_API_KEY}`);
+  args.push(`${base}/api/${path.replace(/^\//, '')}`);
+  const out = execFileSync('curl', args, { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'pipe'] });
+  return out.trim() ? (JSON.parse(out) as unknown) : undefined;
+}
+
+/**
+ * Create an agent through the current versioned API while retaining the HTTP
+ * status. A concurrent creator can legitimately win after our list read, so
+ * callers must be able to distinguish that 409 from every other failure.
+ */
+function createAgentViaApi(input: EnsureOnecliAgentInput): { status: number; body: unknown } {
+  const base = (ONECLI_URL || 'http://127.0.0.1:10254').replace(/\/$/, '');
+  const args = ['-sS', ...CURL_TIMEOUT_ARGS, '-X', 'POST', '-H', 'Content-Type: application/json'];
+  if (ONECLI_API_KEY) args.push('-H', `Authorization: Bearer ${ONECLI_API_KEY}`);
+  args.push('--data-binary', JSON.stringify(input), '-w', '\n%{http_code}', `${base}/v1/agents`);
+
+  const out = execFileSync('curl', args, { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'pipe'] });
+  const statusSeparator = out.lastIndexOf('\n');
+  if (statusSeparator < 0) {
+    throw new Error('Malformed OneCLI agent create response: missing HTTP status');
+  }
+  const status = Number(out.slice(statusSeparator + 1).trim());
+  if (!Number.isInteger(status) || status < 100 || status > 599) {
+    throw new Error('Malformed OneCLI agent create response: invalid HTTP status');
+  }
+
+  const bodyText = out.slice(0, statusSeparator).trim();
+  let body: unknown;
+  if (bodyText) {
+    try {
+      body = JSON.parse(bodyText) as unknown;
+    } catch (error) {
+      throw new Error(`Malformed OneCLI agent create response body (HTTP ${status})`, { cause: error });
+    }
+  }
+  return { status, body };
+}
+
+function getAgentGrants(agentUuid: string): OnecliAgentGrants {
+  const parsed = requestViaApi('GET', `agents/${encodeURIComponent(agentUuid)}/grants`);
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new Error(`Malformed OneCLI grants response for agent ${agentUuid}`);
+  }
+
+  const grants = parsed as Partial<OnecliAgentGrants>;
+  if (
+    grants.agentId !== agentUuid ||
+    grants.mode !== 'grants' ||
+    !Array.isArray(grants.connections) ||
+    !Array.isArray(grants.secrets) ||
+    !grants.secrets.every(
+      (secret) =>
+        secret !== null &&
+        typeof secret === 'object' &&
+        typeof (secret as Partial<OnecliAgentSecretGrant>).secretId === 'string' &&
+        isUuid((secret as OnecliAgentSecretGrant).secretId),
+    )
+  ) {
+    throw new Error(`Malformed OneCLI grants response for agent ${agentUuid}`);
+  }
+
+  return grants as OnecliAgentGrants;
+}
+
 function listAgents(): OnecliAgent[] {
   return listViaApi('agents') as OnecliAgent[];
 }
 
 function listSecrets(): OnecliSecret[] {
   return listViaApi('secrets') as OnecliSecret[];
+}
+
+function refreshAgentCache(): void {
+  const agents = listAgents();
+  const refreshed = new Map<string, string>();
+  for (const agent of agents) {
+    if (
+      !agent ||
+      typeof agent !== 'object' ||
+      typeof agent.identifier !== 'string' ||
+      !agent.identifier ||
+      typeof agent.id !== 'string' ||
+      !isUuid(agent.id)
+    ) {
+      throw new Error('Malformed OneCLI agents list response');
+    }
+    refreshed.set(agent.identifier, agent.id);
+  }
+  identifierToUuid.clear();
+  for (const [identifier, uuid] of refreshed) identifierToUuid.set(identifier, uuid);
 }
 
 /**
@@ -126,11 +227,7 @@ function resolveAgentUuid(identifier: string): string {
 
   // Cache miss — refresh and try again. We replace the whole map so
   // stale entries (agents renamed/deleted) get evicted.
-  const agents = listAgents();
-  identifierToUuid.clear();
-  for (const a of agents) {
-    if (a.identifier) identifierToUuid.set(a.identifier, a.id);
-  }
+  refreshAgentCache();
   const refreshed = identifierToUuid.get(identifier);
   if (!refreshed) {
     throw new Error(
@@ -138,6 +235,43 @@ function resolveAgentUuid(identifier: string): string {
     );
   }
   return refreshed;
+}
+
+/**
+ * Synchronously ensure a OneCLI agent exists without issuing a redundant
+ * create request on every container spawn. The first cache miss refreshes the
+ * full agents list; only a genuinely absent identifier is created.
+ *
+ * A 409 is the expected create race and counts as success only after a fresh
+ * list confirms the agent. Every other response fails closed so the caller
+ * cannot continue into an unscoped container configuration.
+ */
+export function ensureOnecliAgent(input: EnsureOnecliAgentInput): EnsureOnecliAgentResult {
+  if (identifierToUuid.has(input.identifier)) return { ...input, created: false };
+
+  refreshAgentCache();
+  if (identifierToUuid.has(input.identifier)) return { ...input, created: false };
+
+  const response = createAgentViaApi(input);
+  if (response.status === 409) {
+    refreshAgentCache();
+    if (!identifierToUuid.has(input.identifier)) {
+      throw new Error(
+        `OneCLI agent create returned HTTP 409 but identifier "${input.identifier}" was not found after refresh`,
+      );
+    }
+    return { ...input, created: false };
+  }
+  if (response.status !== 201) {
+    throw new Error(`OneCLI agent create failed with HTTP ${response.status}`);
+  }
+
+  const created = response.body as Partial<OnecliAgent> | undefined;
+  if (!created || created.identifier !== input.identifier || typeof created.id !== 'string' || !isUuid(created.id)) {
+    throw new Error(`Malformed OneCLI agent create response for identifier "${input.identifier}"`);
+  }
+  identifierToUuid.set(input.identifier, created.id);
+  return { ...input, created: true };
 }
 
 /**
@@ -195,32 +329,38 @@ export function resolveSecretUuids(declarations: string[]): string[] {
  *   1. Resolve agent identifier → UUID (cached, with miss refresh).
  *   2. Resolve declared names/UUIDs → vault UUIDs (hard-fail on
  *      any unresolved).
- *   3. Force agent mode to `selective` — defensive against an
- *      operator who flipped to `all` via the UI, ensuring the
- *      declarative model is authoritative.
- *   4. `onecli agents set-secrets --id <uuid> --secret-ids <ids>` —
- *      this is a SET, not an APPEND. Any prior assignment is
- *      replaced by exactly the declared list.
+ *   3. Read its current secret grants.
+ *   4. Detach undeclared grants, then attach missing grants. Connection grants
+ *      are deliberately untouched. OneCLI's grants-only model has no mutable
+ *      all/selective mode.
  */
 export function applyOnecliSecrets(agentIdentifier: string, declarations: string[] | undefined): void {
   if (!declarations || declarations.length === 0) return;
 
   const agentUuid = resolveAgentUuid(agentIdentifier);
   const secretUuids = resolveSecretUuids(declarations);
+  const grants = getAgentGrants(agentUuid);
+  const declaredSet = new Set(secretUuids);
+  const grantedSet = new Set(grants.secrets.map((secret) => secret.secretId));
+  const toRemove = [...grantedSet].filter((secretUuid) => !declaredSet.has(secretUuid));
+  const toAdd = [...declaredSet].filter((secretUuid) => !grantedSet.has(secretUuid));
 
-  // Defensive mode lock — the CLI is idempotent if the mode is already
-  // `selective`. We run it unconditionally so the post-condition is
-  // always "this agent is in selective mode with exactly the declared
-  // secrets" regardless of what state it was in.
-  runOnecli(['agents', 'set-secret-mode', '--id', agentUuid, '--mode', 'selective']);
-
-  runOnecli(['agents', 'set-secrets', '--id', agentUuid, '--secret-ids', secretUuids.join(',')]);
+  // Remove excess access before adding missing access. If a request fails,
+  // spawn aborts instead of leaving a newly broadened partial configuration.
+  for (const secretUuid of toRemove) {
+    requestViaApi('DELETE', `agents/${encodeURIComponent(agentUuid)}/grants/secrets/${encodeURIComponent(secretUuid)}`);
+  }
+  for (const secretUuid of toAdd) {
+    requestViaApi('PUT', `agents/${encodeURIComponent(agentUuid)}/grants/secrets/${encodeURIComponent(secretUuid)}`);
+  }
 
   log.info('OneCLI secrets applied', {
     agentIdentifier,
     agentUuid,
     declared: declarations.length,
     resolved: secretUuids.length,
+    added: toAdd.length,
+    removed: toRemove.length,
   });
 }
 

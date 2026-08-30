@@ -74,7 +74,12 @@ import { buildArchiveProjection, buildCentralProjection } from './db/per-agent-p
 import { initGroupFilesystem } from './group-init.js';
 import { stopTypingRefresh } from './modules/typing/index.js';
 import { log } from './log.js';
-import { applyOnecliSecrets, mergeWorkgroupAndGroupSecrets, slackUserTokenSecrets } from './onecli-secrets.js';
+import {
+  applyOnecliSecrets,
+  ensureOnecliAgent,
+  mergeWorkgroupAndGroupSecrets,
+  slackUserTokenSecrets,
+} from './onecli-secrets.js';
 import {
   reconcileWorkgroupMemory,
   workgroupMemoryDir,
@@ -3633,7 +3638,7 @@ async function buildContainerArgs(
         }
       }
 
-      await onecli.ensureAgent({
+      ensureOnecliAgent({
         name:
           identity === agentIdentifier ? agentGroup.name : `${agentGroup.name} (no Slack — non-owner-safe sessions)`,
         identifier: identity,

@@ -2,14 +2,15 @@ import { describe, expect, test, vi, beforeEach, afterEach } from 'vitest';
 
 import {
   applyOnecliSecrets,
+  ensureOnecliAgent,
   mergeWorkgroupAndGroupSecrets,
   slackUserTokenSecrets,
   __resetCachesForTest,
   __test,
 } from './onecli-secrets.js';
 
-// Mock child_process.execFileSync so we don't actually shell out to `onecli`
-// during tests. Hoisted via vi.mock so it applies before the module imports.
+// Mock child_process.execFileSync so tests never call the local gateway.
+// Hoisted via vi.mock so it applies before the module imports.
 vi.mock('child_process', async () => {
   const actual = await vi.importActual<typeof import('child_process')>('child_process');
   return {
@@ -23,13 +24,26 @@ import { execFileSync } from 'child_process';
 // Type-safe handle to the mocked function.
 const mockedExec = vi.mocked(execFileSync);
 
-// LIST ops now go through the gateway API via curl (the CLI caps at 20 rows), so
-// a list call looks like execFileSync('curl', [..., '<base>/api/<resource>...']).
-// Set ops still shell out to `onecli`. These match a mock.calls entry [bin, args].
+// OneCLI gateway calls go through curl. These predicates match an
+// execFileSync call shaped as [bin, args].
 const isAgentsListCall = (c: unknown[]): boolean =>
-  c[0] === 'curl' && (c[1] as string[]).some((a) => String(a).includes('/api/agents'));
+  c[0] === 'curl' &&
+  (c[1] as string[]).some((a) => String(a).includes('/api/agents?')) &&
+  !(c[1] as string[]).some((a) => String(a).includes('/grants'));
 const isSecretsListCall = (c: unknown[]): boolean =>
   c[0] === 'curl' && (c[1] as string[]).some((a) => String(a).includes('/api/secrets'));
+const isAgentGrantsCall = (c: unknown[]): boolean =>
+  c[0] === 'curl' && (c[1] as string[]).some((a) => String(a).includes('/grants'));
+const isAgentCreateCall = (c: unknown[]): boolean =>
+  c[0] === 'curl' && (c[1] as string[]).some((a) => String(a).includes('/v1/agents'));
+const grantMutation = (c: unknown[]): { method: string; url: string } | undefined => {
+  if (c[0] !== 'curl') return undefined;
+  const argv = c[1] as string[];
+  const methodIndex = argv.indexOf('-X');
+  const method = methodIndex >= 0 ? argv[methodIndex + 1] : undefined;
+  const url = argv.find((arg) => arg.includes('/grants/secrets/'));
+  return method && url ? { method, url } : undefined;
+};
 
 beforeEach(() => {
   __resetCachesForTest();
@@ -72,11 +86,15 @@ function setupCliResponses(): void {
     // LIST ops go through the gateway API via curl; route by the URL in argv.
     if (bin === 'curl') {
       const url = argv.join(' ');
+      if (url.includes('/grants')) {
+        const agentId = url.match(/\/api\/agents\/([^/]+)\/grants/)?.[1];
+        return JSON.stringify({ agentId, mode: 'grants', connections: [], secrets: [] });
+      }
       if (url.includes('/api/agents')) return JSON.stringify(AGENT_FIXTURE);
       if (url.includes('/api/secrets')) return JSON.stringify(SECRET_FIXTURE);
       return '';
     }
-    return ''; // onecli set-secrets / set-secret-mode return empty success
+    return '';
   });
 }
 
@@ -113,39 +131,134 @@ describe('applyOnecliSecrets — no-op paths', () => {
   });
 });
 
+describe('ensureOnecliAgent', () => {
+  test('lists once and skips create for an existing agent, then reuses the cache', () => {
+    setupCliResponses();
+
+    expect(ensureOnecliAgent({ name: 'Example Retail', identifier: 'example-retail' })).toEqual({
+      name: 'Example Retail',
+      identifier: 'example-retail',
+      created: false,
+    });
+    expect(ensureOnecliAgent({ name: 'Example Retail', identifier: 'example-retail' })).toEqual({
+      name: 'Example Retail',
+      identifier: 'example-retail',
+      created: false,
+    });
+
+    expect(mockedExec.mock.calls.filter(isAgentsListCall)).toHaveLength(1);
+    expect(mockedExec.mock.calls.filter(isAgentCreateCall)).toHaveLength(0);
+  });
+
+  test('creates a missing agent once and caches the returned UUID', () => {
+    mockedExec.mockImplementation((bin: unknown, rawArgs: unknown) => {
+      const argv = (rawArgs ?? []) as string[];
+      if (bin !== 'curl') return '';
+      const url = argv.join(' ');
+      if (url.includes('/api/agents?')) return JSON.stringify({ data: [] });
+      if (url.includes('/v1/agents')) {
+        return `${JSON.stringify({
+          id: '33333333-3333-3333-3333-333333333333',
+          name: 'New Agent',
+          identifier: 'new-agent',
+        })}\n201`;
+      }
+      return '';
+    });
+
+    expect(ensureOnecliAgent({ name: 'New Agent', identifier: 'new-agent' })).toEqual({
+      name: 'New Agent',
+      identifier: 'new-agent',
+      created: true,
+    });
+    expect(ensureOnecliAgent({ name: 'New Agent', identifier: 'new-agent' }).created).toBe(false);
+    expect(mockedExec.mock.calls.filter(isAgentsListCall)).toHaveLength(1);
+    expect(mockedExec.mock.calls.filter(isAgentCreateCall)).toHaveLength(1);
+  });
+
+  test('treats a create race returning 409 as success only after the agent is visible', () => {
+    let listCalls = 0;
+    mockedExec.mockImplementation((bin: unknown, rawArgs: unknown) => {
+      const argv = (rawArgs ?? []) as string[];
+      if (bin !== 'curl') return '';
+      const url = argv.join(' ');
+      if (url.includes('/api/agents?')) {
+        listCalls++;
+        return listCalls === 1
+          ? JSON.stringify({ data: [] })
+          : JSON.stringify({
+              data: [
+                {
+                  id: '33333333-3333-3333-3333-333333333333',
+                  name: 'Raced Agent',
+                  identifier: 'raced-agent',
+                },
+              ],
+            });
+      }
+      if (url.includes('/v1/agents')) return `${JSON.stringify({ error: 'already exists' })}\n409`;
+      return '';
+    });
+
+    expect(ensureOnecliAgent({ name: 'Raced Agent', identifier: 'raced-agent' }).created).toBe(false);
+    expect(listCalls).toBe(2);
+  });
+
+  test('fails closed on an unexpected create response', () => {
+    mockedExec.mockImplementation((bin: unknown, rawArgs: unknown) => {
+      const argv = (rawArgs ?? []) as string[];
+      if (bin !== 'curl') return '';
+      const url = argv.join(' ');
+      if (url.includes('/api/agents?')) return JSON.stringify({ data: [] });
+      if (url.includes('/v1/agents')) return `${JSON.stringify({ error: 'unavailable' })}\n503`;
+      return '';
+    });
+
+    expect(() => ensureOnecliAgent({ name: 'New Agent', identifier: 'new-agent' })).toThrow(
+      /OneCLI agent create failed with HTTP 503/,
+    );
+  });
+});
+
 describe('applyOnecliSecrets — happy path', () => {
-  test('resolves names to UUIDs and calls set-secret-mode + set-secrets', () => {
+  test('uses the grants API instead of removed legacy OneCLI agent commands', () => {
+    setupCliResponses();
+
+    applyOnecliSecrets('example-retail', ['Anthropic']);
+
+    expect(mockedExec.mock.calls.some(isAgentGrantsCall)).toBe(true);
+    expect(mockedExec.mock.calls.some((c) => c[0] === 'onecli')).toBe(false);
+  });
+
+  test('resolves names to UUIDs and attaches each missing secret grant', () => {
     setupCliResponses();
 
     applyOnecliSecrets('example-retail', ['Datafold-ExampleRetail', 'Hex', 'Anthropic']);
 
     const rawCalls = mockedExec.mock.calls;
 
-    // Order: agents list (UUID resolution) → secrets list (name resolution) via
-    // the gateway API (curl), then set-secret-mode (defensive lock) + set-secrets
-    // (declarative apply) via the onecli CLI.
+    // Order: agents list (UUID resolution) → secrets list (name resolution)
+    // → grants read → missing grant mutations, all via the gateway API.
     const agentsListIdx = rawCalls.findIndex(isAgentsListCall);
     const secretsListIdx = rawCalls.findIndex(isSecretsListCall);
+    const grantsIdx = rawCalls.findIndex(isAgentGrantsCall);
     expect(agentsListIdx).toBeGreaterThanOrEqual(0);
     expect(secretsListIdx).toBeGreaterThan(agentsListIdx);
+    expect(grantsIdx).toBeGreaterThan(secretsListIdx);
 
-    const modeCall = rawCalls.find((c) => (c[1] as string[])[1] === 'set-secret-mode');
-    const setCall = rawCalls.find((c) => (c[1] as string[])[1] === 'set-secrets');
-    expect(modeCall?.[1] as string[]).toEqual([
-      'agents',
-      'set-secret-mode',
-      '--id',
-      '11111111-1111-1111-1111-111111111111',
-      '--mode',
-      'selective',
-    ]);
-    expect(setCall?.[1] as string[]).toEqual([
-      'agents',
-      'set-secrets',
-      '--id',
-      '11111111-1111-1111-1111-111111111111',
-      '--secret-ids',
-      'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa,cccccccc-cccc-cccc-cccc-cccccccccccc,dddddddd-dddd-dddd-dddd-dddddddddddd',
+    expect(rawCalls.map(grantMutation).filter(Boolean)).toEqual([
+      {
+        method: 'PUT',
+        url: 'http://127.0.0.1:10254/api/agents/11111111-1111-1111-1111-111111111111/grants/secrets/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',
+      },
+      {
+        method: 'PUT',
+        url: 'http://127.0.0.1:10254/api/agents/11111111-1111-1111-1111-111111111111/grants/secrets/cccccccc-cccc-cccc-cccc-cccccccccccc',
+      },
+      {
+        method: 'PUT',
+        url: 'http://127.0.0.1:10254/api/agents/11111111-1111-1111-1111-111111111111/grants/secrets/dddddddd-dddd-dddd-dddd-dddddddddddd',
+      },
     ]);
   });
 
@@ -154,12 +267,9 @@ describe('applyOnecliSecrets — happy path', () => {
 
     applyOnecliSecrets('example-retail', ['aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa']);
 
-    const setSecretsCall = mockedExec.mock.calls.find(
-      (c) => (c[1] as string[])[0] === 'agents' && (c[1] as string[])[1] === 'set-secrets',
-    );
-    expect(setSecretsCall).toBeDefined();
-    const argv = setSecretsCall![1] as string[];
-    expect(argv).toContain('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa');
+    const mutations = mockedExec.mock.calls.map(grantMutation).filter(Boolean);
+    expect(mutations).toHaveLength(1);
+    expect(mutations[0]?.url).toContain('/grants/secrets/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa');
   });
 
   test('mixes names and UUIDs in a single call', () => {
@@ -167,25 +277,52 @@ describe('applyOnecliSecrets — happy path', () => {
 
     applyOnecliSecrets('example-retail', ['Datafold-ExampleRetail', 'cccccccc-cccc-cccc-cccc-cccccccccccc']);
 
-    const setSecretsCall = mockedExec.mock.calls.find(
-      (c) => (c[1] as string[])[0] === 'agents' && (c[1] as string[])[1] === 'set-secrets',
-    );
-    const argv = setSecretsCall![1] as string[];
-    const idsArg = argv[argv.length - 1];
-    expect(idsArg).toBe('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa,cccccccc-cccc-cccc-cccc-cccccccccccc');
+    const urls = mockedExec.mock.calls
+      .map(grantMutation)
+      .filter((mutation): mutation is { method: string; url: string } => Boolean(mutation))
+      .map((mutation) => mutation.url);
+    expect(urls).toEqual([
+      expect.stringContaining('/grants/secrets/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa'),
+      expect.stringContaining('/grants/secrets/cccccccc-cccc-cccc-cccc-cccccccccccc'),
+    ]);
   });
 
-  test('always forces mode to selective regardless of current mode', () => {
-    setupCliResponses();
+  test('removes undeclared secret grants before adding missing grants without touching connections', () => {
+    mockedExec.mockImplementation((bin: unknown, rawArgs: unknown) => {
+      const argv = (rawArgs ?? []) as string[];
+      if (bin !== 'curl') return '';
+      const url = argv.join(' ');
+      if (url.includes('/grants')) {
+        return JSON.stringify({
+          agentId: '11111111-1111-1111-1111-111111111111',
+          mode: 'grants',
+          connections: [{ connectionId: 'connection-that-must-not-change' }],
+          secrets: [
+            { secretId: 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb' },
+            { secretId: 'dddddddd-dddd-dddd-dddd-dddddddddddd' },
+          ],
+        });
+      }
+      if (url.includes('/api/agents')) return JSON.stringify(AGENT_FIXTURE);
+      if (url.includes('/api/secrets')) return JSON.stringify(SECRET_FIXTURE);
+      return '';
+    });
 
-    // helper-codex is currently in mode `all` per fixture. After apply,
-    // we still set-secret-mode selective. The mode-flip is unconditional
-    // when onecliSecrets is set — that's the declarative posture.
-    applyOnecliSecrets('example-labs-codex', ['Hex']);
+    applyOnecliSecrets('example-retail', ['Datafold-ExampleRetail', 'Anthropic']);
 
-    const modeCall = mockedExec.mock.calls.find((c) => (c[1] as string[])[1] === 'set-secret-mode');
-    expect(modeCall).toBeDefined();
-    expect((modeCall![1] as string[]).at(-1)).toBe('selective');
+    expect(mockedExec.mock.calls.map(grantMutation).filter(Boolean)).toEqual([
+      {
+        method: 'DELETE',
+        url: 'http://127.0.0.1:10254/api/agents/11111111-1111-1111-1111-111111111111/grants/secrets/bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb',
+      },
+      {
+        method: 'PUT',
+        url: 'http://127.0.0.1:10254/api/agents/11111111-1111-1111-1111-111111111111/grants/secrets/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',
+      },
+    ]);
+    expect(mockedExec.mock.calls.flatMap((call) => call[1] as string[]).join(' ')).not.toContain(
+      'connection-that-must-not-change',
+    );
   });
 });
 
@@ -196,11 +333,7 @@ describe('applyOnecliSecrets — fail-closed paths', () => {
     expect(() => applyOnecliSecrets('does-not-exist', ['Anthropic'])).toThrow(
       /agent with identifier "does-not-exist" not found/,
     );
-    // No set-secrets should have been issued
-    const setSecretsCall = mockedExec.mock.calls.find(
-      (c) => (c[1] as string[])[0] === 'agents' && (c[1] as string[])[1] === 'set-secrets',
-    );
-    expect(setSecretsCall).toBeUndefined();
+    expect(mockedExec.mock.calls.map(grantMutation).filter(Boolean)).toHaveLength(0);
   });
 
   test("throws when a declared secret NAME doesn't resolve", () => {
@@ -209,11 +342,8 @@ describe('applyOnecliSecrets — fail-closed paths', () => {
     expect(() => applyOnecliSecrets('example-retail', ['Datafold-ExampleRetail', 'Mistyped-Name'])).toThrow(
       /secret\(s\) not found in vault: Mistyped-Name/,
     );
-    // No set-secrets should have been issued — fail-closed before apply
-    const setSecretsCall = mockedExec.mock.calls.find(
-      (c) => (c[1] as string[])[0] === 'agents' && (c[1] as string[])[1] === 'set-secrets',
-    );
-    expect(setSecretsCall).toBeUndefined();
+    // No grant mutation should have been issued — fail-closed before apply.
+    expect(mockedExec.mock.calls.map(grantMutation).filter(Boolean)).toHaveLength(0);
   });
 
   test("throws when a declared UUID doesn't exist in vault", () => {
@@ -229,6 +359,16 @@ describe('applyOnecliSecrets — fail-closed paths', () => {
     setupCliResponses();
 
     expect(() => applyOnecliSecrets('example-retail', ['Bad-One', 'Anthropic', 'Bad-Two'])).toThrow(/Bad-One, Bad-Two/);
+  });
+
+  test('throws without mutating when the grants response is malformed', () => {
+    setupCliResponses();
+    mockedExec.mockImplementationOnce(() => JSON.stringify(AGENT_FIXTURE));
+    mockedExec.mockImplementationOnce(() => JSON.stringify(SECRET_FIXTURE));
+    mockedExec.mockImplementationOnce(() => JSON.stringify({ mode: 'grants', connections: [], secrets: [] }));
+
+    expect(() => applyOnecliSecrets('example-retail', ['Anthropic'])).toThrow(/Malformed OneCLI grants response/);
+    expect(mockedExec.mock.calls.map(grantMutation).filter(Boolean)).toHaveLength(0);
   });
 });
 
@@ -255,6 +395,10 @@ describe('applyOnecliSecrets — caching', () => {
       const argv = (rawArgs ?? []) as string[];
       if (bin === 'curl') {
         const url = argv.join(' ');
+        if (url.includes('/grants')) {
+          const agentId = url.match(/\/api\/agents\/([^/]+)\/grants/)?.[1];
+          return JSON.stringify({ agentId, mode: 'grants', connections: [], secrets: [] });
+        }
         if (url.includes('/api/agents')) {
           callsToAgentsList++;
           if (callsToAgentsList === 1) return JSON.stringify(AGENT_FIXTURE);
