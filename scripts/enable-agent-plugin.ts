@@ -327,9 +327,34 @@ function readDeclaredCodexName(pluginDir: string): string | null {
   }
 }
 
+/** Sub-plugin dirs a repo's own codex marketplace declares (absolute paths), or null if it ships none. */
+function declaredCodexSourceDirs(repoDir: string): Set<string> | null {
+  try {
+    const parsed = JSON.parse(
+      fs.readFileSync(path.join(repoDir, '.agents', 'plugins', 'marketplace.json'), 'utf-8'),
+    ) as { plugins?: Array<{ source?: { source?: unknown; path?: unknown } }> };
+    if (!Array.isArray(parsed.plugins)) return null;
+    const dirs = new Set<string>();
+    for (const entry of parsed.plugins) {
+      if (entry?.source?.source === 'local' && typeof entry.source.path === 'string') {
+        dirs.add(path.resolve(repoDir, entry.source.path));
+      }
+    }
+    return dirs.size > 0 ? dirs : null;
+  } catch {
+    return null;
+  }
+}
+
 function ensureCodexSubPluginManifests(repoDir: string, dryRun: boolean): { dir: string; generated: boolean }[] {
   const out: { dir: string; generated: boolean }[] = [];
   const seen = new Set<string>();
+  // A repo that ships its own codex marketplace has already decided which
+  // sub-plugins are Codex-registerable. Generating manifests into the rest
+  // (e.g. a Claude-only twin like bootstrap's plugins/workflow) plants stray
+  // files that the repo's own drift gates then reject — and Codex never reads
+  // them anyway, since registration follows the marketplace entries.
+  const declared = declaredCodexSourceDirs(repoDir);
   for (const container of [path.join(repoDir, 'plugins'), repoDir]) {
     if (!isDirectory(container)) continue;
     let subs: string[] = [];
@@ -342,8 +367,9 @@ function ensureCodexSubPluginManifests(repoDir: string, dryRun: boolean): { dir:
       if (sub.startsWith('.')) continue;
       const subDir = path.join(container, sub);
       if (seen.has(subDir) || !isDirectory(subDir)) continue;
+      if (declared !== null && !declared.has(path.resolve(subDir))) continue;
       // Only dirs that declare themselves a plugin — the same signal the native loaders use.
-      if (!fs.existsSync(path.join(subDir, '.claude-plugin', 'plugin.json'))) continue;
+      if (declared === null && !fs.existsSync(path.join(subDir, '.claude-plugin', 'plugin.json'))) continue;
       const root = findCodexSkillsRoot(subDir);
       if (root === null) continue;
       seen.add(subDir);
