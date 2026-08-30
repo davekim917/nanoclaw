@@ -618,6 +618,34 @@ function provenDisposable(dir: string, scope: 'head' | 'all'): { ok: boolean; re
   if (stash === null) return { ok: false, reason: 'stash-unprovable' };
   if (stash !== '') return { ok: false, reason: 'stashed' };
 
+  // A repository that backs linked worktrees owns an object store those
+  // checkouts share; trashing it destroys their history, and nothing above
+  // would notice because every check so far looks only at THIS tree.
+  //
+  // Codex review of #190: collectClones already asks cloneHasBoundWorktrees,
+  // but only once, during the scan. That was survivable while any live
+  // container in the group refused every clone under it; with that gate gone
+  // a clone in a busy group is an ordinary candidate, and an agent running
+  // `git worktree add` against it between the scan and the trash would not be
+  // caught. Ask git's own registry instead of the filesystem sweep: every
+  // linked worktree of a repo has an entry under <gitdir>/worktrees, so this
+  // is one readdir, it is authoritative, and putting it HERE means it is
+  // re-answered by the post-move re-proof rather than only at scan time.
+  //
+  // Only for scope 'all' (a clone). A linked worktree is itself an entry in
+  // some other repo's registry and legitimately has none of its own.
+  if (scope === 'all') {
+    const gitDir = git(dir, ['rev-parse', '--path-format=absolute', '--git-dir']);
+    if (gitDir === null) return { ok: false, reason: 'gitdir-unprovable' };
+    const registered = safeDirectories(path.join(gitDir, 'worktrees'));
+    // null is "the directory exists but could not be read" — unprovable, not
+    // empty. A repo with no linked worktrees simply has no such directory.
+    if (registered === null && fs.existsSync(path.join(gitDir, 'worktrees'))) {
+      return { ok: false, reason: 'worktree-registry-unprovable' };
+    }
+    if (registered !== null && registered.length > 0) return { ok: false, reason: 'backs-worktrees' };
+  }
+
   return { ok: true, reason: 'clean-and-pushed' };
 }
 
@@ -953,6 +981,23 @@ function runningContainerMounts(): string[] | null {
  */
 /** Pure half of hostPathForProcessCwd, factored out so tests can drive it with
  *  a synthetic mountinfo body instead of real /proc access. */
+/**
+ * PRECONDITION, stated because it is an assumption and not a guarantee: the
+ * fourth mountinfo field is a path within the SOURCE filesystem, so treating
+ * it as host-absolute is only correct while the bind-mount sources live on the
+ * filesystem mounted at `/`. That holds on this install (every mount resolves
+ * to the same device), and is what makes `groups/<folder> -> /workspace/agent`
+ * translate exactly.
+ *
+ * Where it does not hold — DATA_DIR or GROUPS_DIR on their own volume, a
+ * common enough cloud layout — a translated path comes out relative to that
+ * volume's root and simply fails to match any candidate. Codex review of #190
+ * flagged this: the consequence is a MISS, not a spurious match, so the /proc
+ * check quietly degrades to nothing rather than misfiring. It is defence in
+ * depth either way — the git re-proof on the moved copy is what actually
+ * stands between this and deleting live work — but a reader should not
+ * mistake this function for a guarantee on an arbitrary host.
+ */
 function resolveHostPathFromMountinfo(raw: string, cwd: string): string | null {
   let best: { mountpoint: string; root: string } | null = null;
   for (const line of raw.split('\n')) {
@@ -1348,11 +1393,13 @@ function cloneSidecarPath(quarantinePath: string): string {
 }
 
 function restoreQuarantinedClone(originalPath: string, quarantinePath: string): void {
-  try {
-    fs.rmSync(cloneSidecarPath(quarantinePath), { force: true });
-  } catch {
-    // A leftover marker is a leak, not a correctness issue.
-  }
+  // The sidecar is dropped LAST, and only once the entry it describes is gone
+  // from quarantine. Deleting it up front looks harmless — the restore is
+  // about to happen anyway — but both exits below can leave the entry on
+  // disk, and an entry whose marker was already removed is precisely the
+  // (entry, no marker) state cloneSidecarPath promises cannot occur:
+  // recoverOrphanedQuarantine finds neither marker, logs "no readable
+  // recovery metadata", and skips it on every future pass, forever.
   if (fs.existsSync(originalPath)) {
     log.warn('Storage GC: clone rollback found the destination recreated; leaving the copy in quarantine', {
       originalPath,
@@ -1368,7 +1415,9 @@ function restoreQuarantinedClone(originalPath: string, quarantinePath: string): 
       quarantinePath,
       err,
     });
+    return; // Marker stays, so the next pass can still find its way home.
   }
+  fs.rmSync(cloneSidecarPath(quarantinePath), { force: true });
 }
 
 /**

@@ -476,6 +476,22 @@ describe('storage GC — clones', () => {
     expect(find(report, dir)).toMatchObject({ collect: false, reason: 'bound-worktrees' });
   });
 
+  it('#190: refuses a clone backing a worktree the filesystem sweep cannot see', () => {
+    // Codex review: cloneHasBoundWorktrees only indexes gitdir pointers under
+    // dataDir's known roots. A `git worktree add` to anywhere else is
+    // invisible to it, and with the agent-group-live gate gone nothing else
+    // would refuse the clone — trashing it would take the object store the
+    // linked checkout depends on. provenDisposable now asks git's own
+    // registry, which knows about every linked worktree regardless of path.
+    const dir = cloneFixture('folder-a/backing-offscan');
+    const bound = path.join(path.dirname(state.dataDir), 'elsewhere', 'bound');
+    fs.mkdirSync(path.dirname(bound), { recursive: true });
+    git(dir, ['worktree', 'add', '-q', '-b', 'offscan', bound, 'HEAD']);
+    fs.utimesSync(dir, OLD, OLD);
+    const report = runStorageGcOnce(state.dataDir, state.groupsDir);
+    expect(find(report, dir)).toMatchObject({ collect: false, reason: 'backs-worktrees' });
+  });
+
   it('#190: still collects a clean, pushed, idle clone even when its agent group has a live container', () => {
     // The old behavior refused every clone under a group with any running
     // container — but groups/<folder> is itself a container bind-mount
@@ -1179,6 +1195,39 @@ describe('storage GC — apply mode', () => {
     expect(fs.existsSync(dir)).toBe(true);
     expect(fs.existsSync(path.join(dir, 'dirtied-during-quarantine.txt'))).toBe(true);
     expect(fs.readdirSync(path.join(state.dataDir, '.gc-quarantine'))).toEqual([]);
+  });
+
+  it.skipIf(!hasTrash)('#190: a rollback that cannot restore KEEPS the sidecar, so recovery can still find it', () => {
+    // Codex review: restoreQuarantinedClone used to delete the marker before
+    // it knew the restore would succeed. When the destination has been
+    // recreated the function returns early, which left an entry on disk whose
+    // marker was already gone — the one state cloneSidecarPath promises is
+    // impossible, and one recoverOrphanedQuarantine can never identify again.
+    // Recreate the original path during the rename to force that branch.
+    const dir = cloneFixture('folder-a/rollbackblocked');
+    const realRename = fs.renameSync.bind(fs);
+    vi.spyOn(fs, 'renameSync').mockImplementationOnce((from, to) => {
+      realRename(from as fs.PathLike, to as fs.PathLike);
+      // Dirty the moved copy so the re-proof aborts AND put something back at
+      // the original path, so the rollback hits the "recreated" branch.
+      fs.writeFileSync(path.join(to as string, 'late.txt'), 'late');
+      fs.mkdirSync(from as string, { recursive: true });
+      fs.writeFileSync(path.join(from as string, 'recreated.txt'), 'new work');
+    });
+    process.env.NANOCLAW_STORAGE_GC = 'apply';
+    try {
+      runStorageGcOnce(state.dataDir, state.groupsDir);
+    } finally {
+      vi.restoreAllMocks();
+    }
+    const entries = fs.readdirSync(path.join(state.dataDir, '.gc-quarantine'));
+    const dirs = entries.filter((e) => !e.endsWith('.meta.json'));
+    // The quarantined copy is still there — and so is a marker naming it.
+    expect(dirs).toHaveLength(1);
+    expect(entries).toContain(`${dirs[0]}.meta.json`);
+    // Nothing was destroyed on either side.
+    expect(fs.existsSync(path.join(dir, 'recreated.txt'))).toBe(true);
+    expect(fs.existsSync(path.join(state.dataDir, '.gc-quarantine', dirs[0], 'late.txt'))).toBe(true);
   });
 
   it.skipIf(!hasTrash)('#190: recovers a CLONE orphaned in quarantine by a prior interrupted pass', () => {
