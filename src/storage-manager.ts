@@ -927,6 +927,13 @@ export const SESSION_RESCUES_DIRNAME = 'session-rescues';
 // Secret material never enters a rescue archive: creds/ is re-materialized on
 // every spawn.
 const SESSION_ARCHIVE_EXTRA_EXCLUDES = ['creds'];
+// Node's execFileSync defaults maxBuffer to 1MB per stream. A session dir is
+// archived while its agent may still be writing to it, so tar's "file changed
+// as we read it" warning is expected, not exceptional, and reliably blows past
+// that default — every archive-session then fails with `spawnSync tar
+// ENOBUFS` right when disk pressure needs the reclaim to actually work. Applied
+// to every tar invocation below (create and `-tf` verify/listing alike).
+const TAR_MAX_BUFFER_BYTES = 64 * 1024 * 1024;
 
 interface CentralSessionRow {
   status: string;
@@ -1083,6 +1090,7 @@ function isPublishedArchive(archivePath: string): boolean {
     execFileSync('tar', ['-I', 'zstd -T0', '-tf', archivePath], {
       stdio: ['pipe', 'pipe', 'pipe'],
       timeout: 10 * 60 * 1000,
+      maxBuffer: TAR_MAX_BUFFER_BYTES,
     });
     return true;
   } catch {
@@ -1218,6 +1226,15 @@ function createArchiveSessionAction(args: {
             [
               '-I',
               'zstd -T0',
+              // The tree is live while we read it (the agent may still be
+              // writing), so tar's own "file changed as we read it" notice
+              // is the expected case here, not a sign of trouble — silencing
+              // it stops the flood at the source instead of just raising the
+              // ceiling below. Correctness is decided by the exit code and
+              // the `-tf` verify pass, not by parsing warning text, so this
+              // does not hide a genuinely corrupt archive. Every OTHER
+              // warning class stays on.
+              '--warning=no-file-changed',
               ...ARCHIVE_EXCLUDED_DIR_NAMES.map((name) => `--exclude=${name}`),
               ...SESSION_ARCHIVE_EXTRA_EXCLUDES.map((name) => `--exclude=${name}`),
               '-cf',
@@ -1226,7 +1243,7 @@ function createArchiveSessionAction(args: {
               path.dirname(args.sessPath),
               path.basename(args.sessPath),
             ],
-            { stdio: ['pipe', 'pipe', 'pipe'], timeout: 60 * 60 * 1000 },
+            { stdio: ['pipe', 'pipe', 'pipe'], timeout: 60 * 60 * 1000, maxBuffer: TAR_MAX_BUFFER_BYTES },
           );
           const archiveSt = fs.statSync(tempPath);
           if (!archiveSt.isFile() || archiveSt.size === 0) {
@@ -1237,6 +1254,7 @@ function createArchiveSessionAction(args: {
           execFileSync('tar', ['-I', 'zstd -T0', '-tf', tempPath], {
             stdio: ['pipe', 'pipe', 'pipe'],
             timeout: 60 * 60 * 1000,
+            maxBuffer: TAR_MAX_BUFFER_BYTES,
           });
           // tar exited, but its bytes may still be page cache. The rename is
           // durable; the CONTENT has to be too, or a crash publishes an empty
@@ -1704,6 +1722,10 @@ function createArchiveThreadWorktreeAction(args: {
           [
             '-I',
             'zstd -T0',
+            // Same rationale as the session-archive create call: this path is
+            // idle-gated, not guaranteed quiet, and the maxBuffer bump below
+            // is a bounded ceiling rather than a bug fix on its own.
+            '--warning=no-file-changed',
             ...ARCHIVE_EXCLUDED_DIR_NAMES.map((name) => `--exclude=${name}`),
             '-cf',
             archivePath,
@@ -1711,7 +1733,7 @@ function createArchiveThreadWorktreeAction(args: {
             path.dirname(args.threadDir),
             path.basename(args.threadDir),
           ],
-          { stdio: ['pipe', 'pipe', 'pipe'], timeout: 60 * 60 * 1000 },
+          { stdio: ['pipe', 'pipe', 'pipe'], timeout: 60 * 60 * 1000, maxBuffer: TAR_MAX_BUFFER_BYTES },
         );
         const archiveSt = fs.statSync(archivePath);
         if (!archiveSt.isFile() || archiveSt.size === 0) {

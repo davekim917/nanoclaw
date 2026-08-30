@@ -2215,6 +2215,33 @@ describe('storage-manager rescue archive round-trip', () => {
     expect(sessionStatus(db, 'sess-truncated')).toBe('active');
     expect(fs.existsSync(rescuesDir) ? fs.readdirSync(rescuesDir) : []).toEqual([]);
   });
+
+  it('survives tar emitting more than Node execFileSync default 1MB maxBuffer', () => {
+    // Production symptom: archiving a live session dir makes tar warn
+    // continuously ("file changed as we read it") because the agent may
+    // still be writing to it, and that reliably exceeds Node's default 1MB
+    // maxBuffer -> `spawnSync tar ENOBUFS` on every archive-session. Reproduce
+    // it with a `tar` on PATH that does the real work (so the archive is
+    // genuinely valid) but also floods stderr past that default, and prove
+    // the create AND verify calls both survive it.
+    const realTarPath = realExecFileSync('sh', ['-c', 'command -v tar'], { encoding: 'utf8' }).trim();
+    const fakeBinDir = fs.mkdtempSync(path.join(tmpRoot, 'fake-bin-'));
+    const fakeTarPath = path.join(fakeBinDir, 'tar');
+    fs.writeFileSync(
+      fakeTarPath,
+      `#!/bin/sh\n"${realTarPath}" "$@"\nrc=$?\nyes "tar: file changed as we read it" | head -c 2000000 >&2\nexit $rc\n`,
+    );
+    fs.chmodSync(fakeTarPath, 0o755);
+    const originalPath = process.env.PATH;
+    process.env.PATH = `${fakeBinDir}:${originalPath}`;
+    try {
+      const dir = seedIdle('sess-noisy-tar');
+      expect(runApply().actions.find((a) => a.kind === 'archive-session')?.status).toBe('applied');
+      expect(fs.existsSync(dir)).toBe(false);
+    } finally {
+      process.env.PATH = originalPath;
+    }
+  });
 });
 
 /**
