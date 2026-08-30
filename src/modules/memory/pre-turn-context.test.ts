@@ -160,10 +160,10 @@ function archive(
   });
 }
 
-const CURATOR_FLAG = process.env.NANOCLAW_MEMORY_CURATOR_ENABLED;
+const CURATOR_FLAG = process.env.NANOCLAW_MEMORY_FACT_RECALL_ENABLED;
 
 beforeEach(() => {
-  process.env.NANOCLAW_MEMORY_CURATOR_ENABLED = 'true';
+  process.env.NANOCLAW_MEMORY_FACT_RECALL_ENABLED = 'true';
   FAILURES.archive = false;
   FAILURES.exactLink = false;
   FAILURES.capabilities = false;
@@ -177,8 +177,8 @@ beforeEach(() => {
 });
 
 afterEach(() => {
-  if (CURATOR_FLAG === undefined) delete process.env.NANOCLAW_MEMORY_CURATOR_ENABLED;
-  else process.env.NANOCLAW_MEMORY_CURATOR_ENABLED = CURATOR_FLAG;
+  if (CURATOR_FLAG === undefined) delete process.env.NANOCLAW_MEMORY_FACT_RECALL_ENABLED;
+  else process.env.NANOCLAW_MEMORY_FACT_RECALL_ENABLED = CURATOR_FLAG;
   closeDb();
   fs.rmSync(TEST_ROOT, { recursive: true, force: true });
 });
@@ -1741,7 +1741,7 @@ it('test_sanitizer_passes_expiresAt_through_to_trustedCapabilities', () => {
   }
 });
 
-describe('NANOCLAW_MEMORY_CURATOR_ENABLED gates fact injection, not just fact writing', () => {
+describe('NANOCLAW_MEMORY_FACT_RECALL_ENABLED gates fact injection, not just fact writing', () => {
   const FACT_TEXT = 'Quarterly forecast pipeline volume reconciles against the ledger snapshot';
   const ledger = () =>
     memoryFile(
@@ -1770,7 +1770,7 @@ describe('NANOCLAW_MEMORY_CURATOR_ENABLED gates fact injection, not just fact wr
 
   it('injects no ledger facts when the curator is disabled', () => {
     ledger();
-    process.env.NANOCLAW_MEMORY_CURATOR_ENABLED = 'false';
+    process.env.NANOCLAW_MEMORY_FACT_RECALL_ENABLED = 'false';
 
     expect(recall().memoryEvidence.excerpts.filter((row) => row.path === 'generated/memory.md')).toEqual([]);
   });
@@ -1786,7 +1786,7 @@ describe('NANOCLAW_MEMORY_CURATOR_ENABLED gates fact injection, not just fact wr
     // disabled ledger is not merely unranked but never touched. Move the guard
     // below the stat and this fails; delete it and both halves fail.
     ledger();
-    process.env.NANOCLAW_MEMORY_CURATOR_ENABLED = 'off';
+    process.env.NANOCLAW_MEMORY_FACT_RECALL_ENABLED = 'off';
     const lstatSpy = vi.spyOn(fs, 'lstatSync');
 
     try {
@@ -1802,10 +1802,10 @@ describe('NANOCLAW_MEMORY_CURATOR_ENABLED gates fact injection, not just fact wr
 
   it('leaves an absent or malformed flag behaving as a disabled curator', () => {
     ledger();
-    process.env.NANOCLAW_MEMORY_CURATOR_ENABLED = 'banana';
+    process.env.NANOCLAW_MEMORY_FACT_RECALL_ENABLED = 'banana';
     expect(recall().memoryEvidence.excerpts.filter((row) => row.path === 'generated/memory.md')).toEqual([]);
 
-    delete process.env.NANOCLAW_MEMORY_CURATOR_ENABLED;
+    delete process.env.NANOCLAW_MEMORY_FACT_RECALL_ENABLED;
     expect(recall().memoryEvidence.excerpts.filter((row) => row.path === 'generated/memory.md')).toEqual([]);
   });
 });
