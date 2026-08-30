@@ -164,9 +164,23 @@ if [ "${TEST_ALERT:-0}" = "1" ]; then
   BREACHES+=("test|test alert requested via TEST_ALERT=1 — delivery path verified, no action needed")
 fi
 
-# ── dedup + persist state ───────────────────────────────────────────────────
+# ── dedup + persist window cursors ──────────────────────────────────────────
+# TWO separate writes, and the split is the whole point.
+#
+# `log_off`/`err_off`/`restarts` are a window CURSOR: persist them on every run
+# or the next run re-scans the same bytes and re-alerts forever.
+#
+# `last_alert` is a RECEIPT of a DM that actually went out, so it is stamped
+# only after the socket send returns (bottom of this file). Stamping it here
+# burned the 6h cooldown on undelivered alerts — worst precisely when it
+# matters, because cli.sock is served BY nanoclaw-v2 itself: the
+# `service|nanoclaw-v2 is <state>` breach is undeliverable exactly when it
+# fires, and the old code then sat silent for 6h having "already alerted".
 export STATE_FILE LOG_SIZE ERR_SIZE RESTARTS
-ALERT_LINES=$(python3 - "$NOW" "$ALERT_COOLDOWN_S" "${BREACHES[@]+"${BREACHES[@]}"}" <<'EOF'
+ALERT_FILE=$(mktemp)
+trap 'rm -f "$ALERT_FILE"' EXIT
+export ALERT_FILE
+ALERT_KEYS=$(python3 - "$NOW" "$ALERT_COOLDOWN_S" "${BREACHES[@]+"${BREACHES[@]}"}" <<'EOF'
 import json, os, sys
 state_file = os.environ["STATE_FILE"]
 now, cooldown = int(sys.argv[1]), int(sys.argv[2])
@@ -175,20 +189,40 @@ try:
     with open(state_file) as f: state = json.load(f)
 except Exception: state = {}
 last = state.get("last_alert", {})
-out = []
+lines, keys = [], []
 for key, msg in breaches:
-    if now - int(last.get(key, 0)) >= cooldown:
-        out.append(f"- {msg}")
-        last[key] = now
-state["last_alert"] = last
+    if now - int(last.get(key, 0)) >= cooldown and key not in keys:
+        lines.append(f"- {msg}")
+        keys.append(key)
 state["log_off"] = int(os.environ["LOG_SIZE"])
 state["err_off"] = int(os.environ["ERR_SIZE"])
 state["restarts"] = int(os.environ["RESTARTS"])
 os.makedirs(os.path.dirname(state_file), exist_ok=True)
 with open(state_file, "w") as f: json.dump(state, f)
-print("\n".join(out))
+with open(os.environ["ALERT_FILE"], "w") as f: f.write("\n".join(lines))
+print(" ".join(keys))
 EOF
 )
+ALERT_LINES=$(cat "$ALERT_FILE")
+
+# Stamp the cooldown for the keys we just delivered. Called ONLY on the success
+# path; every early exit above and the send failing under `set -e` leave
+# `last_alert` untouched, so the next run re-alerts instead of going quiet.
+stamp_alert_cooldown() {
+  [ -n "$ALERT_KEYS" ] || return 0
+  python3 - "$NOW" $ALERT_KEYS <<'EOF'
+import json, os, sys
+state_file = os.environ["STATE_FILE"]
+now, keys = int(sys.argv[1]), sys.argv[2:]
+try:
+    with open(state_file) as f: state = json.load(f)
+except Exception: state = {}
+last = state.get("last_alert", {})
+for key in keys: last[key] = now
+state["last_alert"] = last
+with open(state_file, "w") as f: json.dump(state, f)
+EOF
+}
 
 if [ ${#BREACHES[@]} -eq 0 ]; then
   echo "health-sentinel: all vitals OK (load15=$LOAD15 disk=${DISK_PCT:-?}% service=$SERVICE_STATE)"
@@ -241,3 +275,4 @@ time.sleep(0.5)
 sock.close()
 print("health-sentinel: alert delivered to owner DM")
 EOF
+stamp_alert_cooldown
