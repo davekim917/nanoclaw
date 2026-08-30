@@ -13,57 +13,10 @@ import {
 } from '../../message-archive.js';
 import { workgroupMemoryDir } from '../workgroup/shared-dirs.js';
 
-// ---------------------------------------------------------------------------
-// The fact-ledger read contract
-//
-// `generated/memory.md` was written by the host memory curator, which has been
-// removed. `readGeneratedFacts` below is its only reader, and these three
-// pieces are all a reader needs — they moved here verbatim from the deleted
-// curator-contract.ts rather than being deleted with the writer, because live
-// installs carry megabytes of accumulated facts the flag can still turn back
-// on.
-// ---------------------------------------------------------------------------
-
-/** The fact ledger, relative to a workgroup's memory root. */
-const GENERATED_MEMORY_RELATIVE_PATH = 'generated/memory.md';
-
-/**
- * Per-file read cap for the ledger, deliberately far above `markdownFileBytes`:
- * the ledger is one file holding what the rest of the tree spreads over
- * hundreds, and truncating it drops facts silently. Nothing appends to it any
- * more, so this is now purely a rail on what recall will read.
- */
-export const GENERATED_MEMORY_MAX_BYTES = 16 * 1024 * 1024;
-
-/**
- * Gates recall of the ledger.
- *
- * It used to gate the curator AND recall of what the curator wrote — one flag,
- * one system. The curator writer is gone, so this is a recall switch alone:
- * off means the accumulated ledger is excluded from the fact lane entirely,
- * on means those facts are still injected.
- *
- * Understand what `on` costs before setting it. The ledger is read and parsed
- * in full on EVERY turn — 8 MB and ~6,700 facts on the largest workgroup — to
- * select the top `generatedFactExcerpts` (3) by lexical rank. With no writer
- * left, those 3 facts come from a corpus frozen at the moment curation
- * stopped, and they go on aging. The read cost is paid per turn regardless of
- * whether any fact scores well enough to be injected.
- *
- * Renamed from NANOCLAW_MEMORY_CURATOR_ENABLED: it never gated only the
- * curator, and once the writer was deleted that name described nothing that
- * still existed. An install still setting the old name gets the default —
- * disabled — which is the intended state.
- */
-function isFactRecallEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
-  return /^(?:1|true|yes|on)$/i.test(env.NANOCLAW_MEMORY_FACT_RECALL_ENABLED ?? '');
-}
-
 export const PRE_TURN_BOUNDS = Object.freeze({
-  // Per-file read cap. Only three things are read from the memory tree per
-  // turn — index.md, the matched preferences/<slug>.md files, and the curator's
-  // fact ledger (which uses GENERATED_MEMORY_MAX_BYTES instead) — so this plus
-  // the per-lane counts is the whole IO bound. Nothing walks the tree.
+  // Per-file read cap. Only two things are read from the memory tree per turn —
+  // index.md and the matched preferences/<slug>.md files — so this plus the
+  // per-lane counts is the whole IO bound. Nothing walks the tree.
   markdownFileBytes: 65_536,
   // index.md, injected whole on a bootstrap turn. This is the retrieval
   // mechanism for manual memory: the agent gets the map and reads or greps
@@ -72,20 +25,6 @@ export const PRE_TURN_BOUNDS = Object.freeze({
   markdownCoreChars: 2_500,
   markdownHeadings: 24,
   markdownHeadingChars: 240,
-  // generated/memory.md is a flat list of self-contained one-line facts, so it
-  // is ranked per FACT rather than as one document. Scored as a single file it
-  // contributed at most one 900-char passage per turn no matter how much it
-  // held — measured against a live 328-fact store (median line 817 chars) that
-  // is ~1.1 facts surfaced out of 328, and growing the store could not improve
-  // it. Facts also get their own excerpt lane so they cannot crowd out manual
-  // memory in the shared excerpt budget, and vice versa.
-  generatedFactCandidates: 48,
-  generatedFactExcerpts: 3,
-  // A fact is one atomic unit, so it is delivered whole rather than windowed
-  // mid-sentence. Matched to CURATOR_MAX_MEMORY_TEXT_CHARS plus its provenance
-  // marker. Worst case 3 x 2200 is still inside finalChars alongside archive
-  // recall, and enforceFinalBound trims the tail if a bootstrap turn is tight.
-  generatedFactExcerptChars: 2_200,
   // Deterministic per-person preference lane: preferences/<name-slug>.md files
   // matching the conversation's involved senders are injected whole (bounded).
   // Cap covers a busy multi-human thread; the per-file cap bounds one person's
@@ -93,15 +32,13 @@ export const PRE_TURN_BOUNDS = Object.freeze({
   // memory files are navigated by the agent from index.md, not scanned here.
   preferenceExcerpts: 6,
   preferenceExcerptChars: 900,
-  // Total for BOTH memory lanes (preferences and facts), enforced after
-  // selection.
+  // Total for the memory excerpt lane, enforced after selection.
   //
-  // Load-bearing for the same reason capabilityTotalChars is. Per-lane caps
-  // alone took the worst-case memory footprint from 2,700 to 9,300 inside an
-  // unchanged 12,000 finalChars, and enforceFinalBound sacrifices conversation
-  // excerpts FIRST, so a few long facts could silently evict every archive
-  // excerpt. 5,500 leaves the archive lane intact on a normal turn while still
-  // fitting three typical facts (median 817 chars) beside a preference file.
+  // Load-bearing for the same reason capabilityTotalChars is: enforceFinalBound
+  // sacrifices conversation excerpts FIRST, so unbounded memory could silently
+  // evict every archive excerpt. It is a safety net rather than a live limiter
+  // now the generated-fact lane is gone — six preference files at 900 chars
+  // reach 5,400 — so it fires only if the preference caps above are raised.
   memoryExcerptTotalChars: 5_500,
   archiveCandidates: 96,
   archiveExcerpts: 3,
@@ -437,13 +374,11 @@ export function tokenizeForRecall(value: string): string[] {
 
 export type RecallToken = { value: string; start: number; end: number };
 
-// Tokenizing the generated store is the single largest per-turn cost, and it
-// repeats identically every turn: the curator rewrites the file a few times an
-// hour while turns are constant, so the same fact lines are re-normalized,
-// re-matched and re-filtered over and over. Measured on a live 1 MiB / 1,058
-// fact store that was 875 ms added to EVERY turn, and it scales linearly with
-// the store — which made the size cap a latency decision rather than a storage
-// one.
+// Tokenizing ranked candidates is the single largest per-turn cost, and it
+// repeats near-identically across turns: the archive rows a conversation keeps
+// re-selecting are the same strings, re-normalized, re-matched and re-filtered
+// over and over. Measured against the retired 1 MiB / 1,058-fact ledger that
+// was 875 ms added to EVERY turn, scaling linearly with the candidate set.
 //
 // Keyed on the text itself, so it needs no invalidation: a rewritten fact is a
 // different string and simply misses. Evicted least-recently-used: a Map keeps
@@ -451,25 +386,24 @@ export type RecallToken = { value: string; start: number; end: number };
 // and the first key is always the oldest. Wholesale-clear was the bug — one
 // overflow threw away the entire warm set instead of one entry.
 const TOKEN_STREAM_CACHE = new Map<string, readonly RecallToken[]>();
-// SIZING. An entry used to be one WINDOW, not one fact line: bestPassage
-// tokenized every boundedPassages window and a fact yields 9-12 of them, so the
-// per-turn working set of the two large workgroups was 46,108 and 131,245
-// entries — far past any cap worth paying for, and on a single sequential sweep
-// a partial cache yields ~zero hits rather than partial ones.
+// SIZING. An entry used to be one WINDOW, not one candidate: bestPassage
+// tokenized every boundedPassages window and a candidate yields 9-12 of them,
+// so the per-turn working set of the two large workgroups was 46,108 and
+// 131,245 entries — far past any cap worth paying for, and on a single
+// sequential sweep a partial cache yields ~zero hits rather than partial ones.
 //
 // passageWindows now tokenizes each CANDIDATE once and slices that stream per
-// window, so an entry is one fact line again and those working sets collapse to
+// window, so an entry is one candidate again and those working sets collapse to
 // 6,633 and 1,438 — both inside this cap, which is why the large workgroups get
 // a warm cache for the first time. Measured heap is ~4.4 KB per entry, so
-// 24,576 entries is ~108 MB worst case, and the largest live store now needs
-// ~29 MB of it.
+// 24,576 entries is ~108 MB worst case.
 //
-// The cache still earns its place after that fix: it is what makes the SECOND
-// and later turns nearly free, since the ledger changes only a few times an
-// hour while turns are constant. The fix removes intra-turn duplication; the
-// cache removes inter-turn repetition. They are not substitutes.
-// ponytail: entry-count cap, not a byte cap — a fact line is bounded by the
-// curator's own line budget, so entries stay within ~2x of the measured mean.
+// The cache still earns its place after that fix: it is what makes repeated
+// selection of the same candidate nearly free. The fix removes intra-turn
+// duplication; the cache removes inter-turn repetition. They are not
+// substitutes.
+// ponytail: entry-count cap, not a byte cap — a candidate is bounded by the
+// per-lane read caps, so entries stay within ~2x of the measured mean.
 const TOKEN_STREAM_CACHE_MAX = 24_576;
 
 const TOKEN_STREAM_CACHE_STATS = { hits: 0, misses: 0 };
@@ -1167,99 +1101,14 @@ function listDirectMarkdownStems(root: string, dir: string, notices: ContextNoti
   return stems;
 }
 
-export interface SearchableCandidate {
-  path: string;
-  headings: string[];
-  /** Text handed to the agent: for a generated fact this keeps the provenance marker. */
-  content: string;
-  /** Text used for ranking only: for a generated fact this drops the marker. */
-  searchable: string;
-  /** ISO-8601 capture stamp for a generated fact; empty for ordinary files. */
-  capturedAt: string;
-}
-
-const CAPTURED_AT_PATTERN = /captured=([0-9T:.Z+-]+)/;
-
-export function capturedAtOf(line: string): string {
-  return CAPTURED_AT_PATTERN.exec(line)?.[1] ?? '';
-}
-
-/**
- * Bound one generated fact, keeping its provenance marker attached.
- *
- * A fact can legitimately exceed the excerpt width: the text alone may reach
- * CURATOR_MAX_MEMORY_TEXT_CHARS and the marker carries up to
- * CURATOR_MAX_EVIDENCE_IDS archive ids after it. Windowing the line generically
- * cuts from the end, which drops exactly the `id=` and `captured=` the agent
- * needs to judge how old a fact is and to cite it. Trim the prose instead and
- * re-attach the marker, so provenance survives at any width.
- */
-function boundedFactLine(line: string, maxChars: number): string {
-  if (line.length <= maxChars) return line;
-  const markerAt = line.indexOf('<!--');
-  if (markerAt < 0) return boundedText(line, maxChars, TRUNCATED_MARKDOWN_EXCERPT);
-  const marker = line.slice(markerAt);
-  const budget = maxChars - marker.length - TRUNCATED_MARKDOWN_EXCERPT.length - 1;
-  // Marker alone over budget: keep it whole, since a citation without prose is
-  // still usable and prose without a citation is not.
-  if (budget <= 0) return marker;
-  return `${line.slice(0, budget).trimEnd()}${TRUNCATED_MARKDOWN_EXCERPT} ${marker}`;
-}
-
-/**
- * The curator's fact ledger, one candidate per fact line sharing ONE headings
- * array (decision 15). Read by direct path — no listing, no tree walk — and
- * absent on every install where the curator has never run.
- */
-function readGeneratedFacts(root: string, canonicalRoot: string): SearchableCandidate[] {
-  // Curator off means no fact injection at all. This is the ONLY reader of the
-  // ledger now, so the gate lives here — the scan loop it used to sit in is
-  // gone. Before the lstat, so a disabled ledger costs no filesystem call.
-  if (!isFactRecallEnabled()) return [];
-  const absolute = path.join(root, GENERATED_MEMORY_RELATIVE_PATH);
-  // lstat, not stat: a symlinked ledger is skipped the way every other memory
-  // read skips one, rather than followed out of the canonical tree.
-  try {
-    if (!fs.lstatSync(absolute).isFile()) return [];
-  } catch {
-    return [];
-  }
-  const read = readBoundedFile(absolute, canonicalRoot, GENERATED_MEMORY_MAX_BYTES);
-  const headings = headingsOf(read.content);
-  const candidates: SearchableCandidate[] = [];
-  for (const line of read.content.split('\n')) {
-    if (!line.startsWith('- ')) continue;
-    const markerAt = line.indexOf('<!--');
-    candidates.push({
-      path: GENERATED_MEMORY_RELATIVE_PATH,
-      headings,
-      content: line,
-      // Score the fact, not its provenance marker. The marker is ~20% of a
-      // line's characters, and its tokens dilute the density term ranking
-      // uses, so scoring it penalised generated facts against clean manual
-      // Markdown.
-      searchable: markerAt < 0 ? line : line.slice(0, markerAt),
-      capturedAt: capturedAtOf(line),
-    });
-  }
-  return candidates;
-}
-
-/** Out-param populated by `readMemoryEvidence`, mirroring the `notices` mutable-array pattern. */
-export interface RecallCandidateStats {
-  factCandidates: number;
-}
-
 export function readMemoryEvidence(
   root: string,
   workgroupId: string,
-  query: string,
   notices: ContextNotice[],
   includeBootstrap: boolean,
   seenEvidenceFingerprints: ReadonlySet<string>,
   bypassDedupe: boolean,
   involvedSenderNames: readonly string[] = [],
-  candidateStats?: RecallCandidateStats,
 ): PreTurnContext['memoryEvidence'] {
   if (!fs.existsSync(root)) throw new Error(`canonical memory tree missing: ${root}`);
   const canonicalRoot = fs.realpathSync(root);
@@ -1288,9 +1137,6 @@ export function readMemoryEvidence(
       });
     }
   }
-
-  const queryTokens = tokenizeForRecall(query);
-  const expandedTokens = tokenizeForRecall(`${query} ${ephemeralExpansion(query).join(' ')}`);
 
   // Deterministic per-person preference lane. Files under preferences/ are
   // keyed by name slug and injected whole for the conversation's involved
@@ -1353,48 +1199,10 @@ export function readMemoryEvidence(
     }
   }
 
-  // Generated-fact lane. The curator's ledger is one known file, read directly:
-  // nothing walks the memory tree per turn any more.
-  const factCandidates = readGeneratedFacts(root, canonicalRoot);
-  if (candidateStats) candidateStats.factCandidates = factCandidates.length;
-  // Age ranks, it never filters. Between facts of equal relevance the newer
-  // capture wins; an older exact match still outranks a fresher weak one, so a
-  // fact stays recallable however old it is. ISO-8601 sorts chronologically.
-  const byRecency = (a: SearchableCandidate, b: SearchableCandidate) => compareCodepoint(b.capturedAt, a.capturedAt);
-  const rankFacts = (tokens: string[]) =>
-    rankByBestPassage(tokens, factCandidates, (candidate) => candidate.searchable, {
-      maxChars: PRE_TURN_BOUNDS.generatedFactExcerptChars,
-      tieBreak: byRecency,
-    });
-  let ranked = rankFacts(queryTokens);
-  if (ranked.length === 0) {
-    const expanded = rankFacts(expandedTokens);
-    if (expanded.length > 0) {
-      ranked = expanded;
-      markExpansionUsed(notices);
-    }
-  }
-  const rankedFacts = ranked.map(({ candidate, passage }): MemoryEvidenceExcerpt => {
-    const text = boundedFactLine(candidate.content, PRE_TURN_BOUNDS.generatedFactExcerptChars);
-    return {
-      path: candidate.path,
-      headings: candidate.headings,
-      text,
-      score: passage.score,
-      fingerprint: evidenceFingerprint(
-        'workgroup-memory-canon',
-        workgroupId,
-        `${candidate.path}\0${sha256(text)}`,
-        candidate.content,
-      ),
-      provenance: { authority: 'workgroup-memory-canon' as const, workgroupId },
-    };
-  });
-  const keepUnseen = (rows: MemoryEvidenceExcerpt[]): MemoryEvidenceExcerpt[] =>
-    bypassDedupe ? rows : rows.filter((row) => !seenEvidenceFingerprints.has(row.fingerprint));
-  const dedupedFacts = keepUnseen(rankedFacts);
-  const dedupedPreferences = keepUnseen(preferenceExcerpts);
-  const suppressed = rankedFacts.length - dedupedFacts.length + (preferenceExcerpts.length - dedupedPreferences.length);
+  const dedupedPreferences = bypassDedupe
+    ? preferenceExcerpts
+    : preferenceExcerpts.filter((row) => !seenEvidenceFingerprints.has(row.fingerprint));
+  const suppressed = preferenceExcerpts.length - dedupedPreferences.length;
   if (suppressed > 0) {
     notices.push({
       source: 'context',
@@ -1403,31 +1211,13 @@ export function readMemoryEvidence(
       detail: `suppressed ${suppressed} unchanged Markdown passage${suppressed === 1 ? '' : 's'} in this context epoch`,
     });
   }
-  const boundedFacts = dedupedFacts.slice(0, PRE_TURN_BOUNDS.generatedFactCandidates);
-  if (rankedFacts.length > boundedFacts.length) {
-    notices.push({
-      source: 'markdown',
-      status: 'truncated',
-      code: 'generated-fact-candidate-limit',
-      detail: `selected ${boundedFacts.length} of ${rankedFacts.length} relevant generated facts`,
-    });
-  }
-  const factExcerpts = boundedFacts.slice(0, PRE_TURN_BOUNDS.generatedFactExcerpts);
-  if (boundedFacts.length > factExcerpts.length) {
-    notices.push({
-      source: 'markdown',
-      status: 'truncated',
-      code: 'generated-fact-excerpt-limit',
-      detail: `selected ${factExcerpts.length} of ${boundedFacts.length} bounded generated facts`,
-    });
-  }
   // Most relevant first: enforceFinalBound pops from the end when over budget.
   // Preferences carry MAX_SAFE_INTEGER scores, so they sort first and the
   // budget loop below (which pops the tail) can never drop them.
-  const excerpts = [...dedupedPreferences, ...factExcerpts].sort((a, b) => b.score - a.score);
-  // Keep both memory lanes inside one shared total, dropping the least relevant
-  // first, so memory cannot reach enforceFinalBound large enough to evict the
-  // archive lane that function sacrifices ahead of it.
+  const excerpts = [...dedupedPreferences].sort((a, b) => b.score - a.score);
+  // Keep the memory lane inside its total, dropping the least relevant first,
+  // so memory cannot reach enforceFinalBound large enough to evict the archive
+  // lane that function sacrifices ahead of it.
   let excerptChars = excerpts.reduce((sum, row) => sum + row.text.length, 0);
   let droppedForBudget = 0;
   while (excerpts.length > 1 && excerptChars > PRE_TURN_BOUNDS.memoryExcerptTotalChars) {
@@ -1655,7 +1445,6 @@ export function buildPreTurnContext(input: PreTurnContextInput): PreTurnContext 
   // otherwise make meaningless per line.
   const tokenStatsBefore = { ...TOKEN_STREAM_CACHE_STATS };
   const offsetStatsBefore = { ...OFFSET_SLICE_STATS };
-  const candidateStats: RecallCandidateStats = { factCandidates: 0 };
   const db = getDb();
   const scope = db
     .prepare(
@@ -1761,13 +1550,11 @@ export function buildPreTurnContext(input: PreTurnContextInput): PreTurnContext 
     memoryEvidence = readMemoryEvidence(
       workgroupMemoryDir(workgroupId),
       workgroupId,
-      query,
       notices,
       includeBootstrap,
       seenEvidenceFingerprints,
       bypassDedupe,
       involvedSenderNames,
-      candidateStats,
     );
   } catch (error) {
     if (!(error instanceof Error)) throw error;
@@ -1910,7 +1697,6 @@ export function buildPreTurnContext(input: PreTurnContextInput): PreTurnContext 
   log.debug('pre-turn-context: build', {
     workgroupId,
     elapsedMs: Date.now() - startedAt,
-    factCandidates: candidateStats.factCandidates,
     tokenCacheSize: TOKEN_STREAM_CACHE.size,
     tokenCacheMax: TOKEN_STREAM_CACHE_MAX,
     tokenCacheHits: TOKEN_STREAM_CACHE_STATS.hits - tokenStatsBefore.hits,

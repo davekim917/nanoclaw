@@ -11,24 +11,19 @@ interface ProcessWriteRequest {
   retryDelayMs?: number;
   pauseSignalPath?: string;
   resumeSignalPath?: string;
-  allowGeneratedMemory?: boolean;
 }
 
-// Must stay at or above the host's GENERATED_MEMORY_MAX_BYTES (16 MiB, now in
-// src/modules/memory/pre-turn-context.ts) plus its
-// HELPER_REQUEST_OVERHEAD_BYTES (16 KiB) — this bounds the whole JSON request,
-// not just the content. It cannot import those: this is the Bun container tree
-// and they live in the host tree, so the two are kept in step by hand.
-//
-// Raising the host cap without this one is exactly how a large write starts
-// failing a few hundred KiB later: the host accepts the document, then the
-// helper rejects the request.
-const MAX_CURATOR_WRITE_REQUEST_BYTES = 16400 * 1024;
+// Bounds the whole JSON request, not just the content: 16 MiB of document plus
+// HELPER_REQUEST_OVERHEAD_BYTES (16 KiB) of envelope. The host no longer has a
+// matching read cap to stay in step with — the generated-fact reader that owned
+// it is gone — so this is now the single authority on how large one memory
+// write may be.
+const MAX_MEMORY_WRITE_REQUEST_BYTES = 16400 * 1024;
 
 if (import.meta.main) {
   const encoded = process.argv[2];
   const raw = encoded ? Buffer.from(encoded, 'base64url').toString('utf8') : await Bun.stdin.text();
-  if (!raw || Buffer.byteLength(raw) > MAX_CURATOR_WRITE_REQUEST_BYTES) {
+  if (!raw || Buffer.byteLength(raw) > MAX_MEMORY_WRITE_REQUEST_BYTES) {
     throw new Error('bounded write request is required');
   }
   const request = JSON.parse(raw) as ProcessWriteRequest;
@@ -43,7 +38,6 @@ if (import.meta.main) {
       rootDir: request.rootDir,
       lockWaitMs: request.lockWaitMs,
       retryDelayMs: request.retryDelayMs,
-      allowGeneratedMemory: request.allowGeneratedMemory === true,
       beforeAtomicRename:
         request.pauseSignalPath && request.resumeSignalPath
           ? () => {

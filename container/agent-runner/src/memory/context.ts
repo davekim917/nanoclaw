@@ -21,19 +21,18 @@ const DEFINITION_TEMPLATE = path.join(
  * WRITING, not behind a link — 512 of 1,062 live memory files carried no
  * `type:` while it was only linked. It is rendered from the TEMPLATE in trunk
  * source, never from workgroup disk: `system/definition.md` is writable by any
- * sibling (`write_memory_file` reserves only `generated/memory.md`, and the
- * memory mount is rw), and our memory is workgroup-shared rather than
- * per-agent like upstream's, so inlining the live file would let one sibling
- * write into every other sibling's system instructions.
+ * sibling (`write_memory_file` reserves no path, and the memory mount is rw),
+ * and our memory is workgroup-shared rather than per-agent like upstream's, so
+ * inlining the live file would let one sibling write into every other
+ * sibling's system instructions.
  *
- * Canonical memory bytes — `index.md` at a fresh context boundary, the
- * sender-matched `preferences/` files, and the curator's fact ledger — are
- * selected by the host and enter the turn through the formatter's
- * collision-safe untrusted recall field. Topic files are not among them and
- * neither is the rest of the live `definition.md`: since the ranked Markdown
- * lane was deleted, agents reach both by reading the tree themselves. This
- * lifecycle seam must never read or promote workgroup bytes into system
- * instructions.
+ * Canonical memory bytes — `index.md` at a fresh context boundary and the
+ * sender-matched `preferences/` files — are selected by the host and enter the
+ * turn through the formatter's collision-safe untrusted recall field. Topic
+ * files are not among them and neither is the rest of the live
+ * `definition.md`: since the ranked Markdown lane was deleted, agents reach
+ * both by reading the tree themselves. This lifecycle seam must never read or
+ * promote workgroup bytes into system instructions.
  */
 export function renderMemorySection(_baseDir?: string): string {
   return [

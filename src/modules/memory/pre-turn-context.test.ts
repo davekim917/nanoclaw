@@ -44,11 +44,11 @@ vi.mock('../../message-archive.js', async (importOriginal) => {
 import {
   _resetTokenStreamCacheForTest,
   _tokenStreamCacheStatsForTest,
+  _bestPassageForTest,
   boundedCapabilities,
   buildPreTurnContext,
   enforceFinalBound,
   evaluateRecallCorpus,
-  GENERATED_MEMORY_MAX_BYTES,
   PRE_TURN_BOUNDS,
   tokenizeForRecall,
   type ContextNotice,
@@ -160,10 +160,7 @@ function archive(
   });
 }
 
-const CURATOR_FLAG = process.env.NANOCLAW_MEMORY_FACT_RECALL_ENABLED;
-
 beforeEach(() => {
-  process.env.NANOCLAW_MEMORY_FACT_RECALL_ENABLED = 'true';
   FAILURES.archive = false;
   FAILURES.exactLink = false;
   FAILURES.capabilities = false;
@@ -177,8 +174,6 @@ beforeEach(() => {
 });
 
 afterEach(() => {
-  if (CURATOR_FLAG === undefined) delete process.env.NANOCLAW_MEMORY_FACT_RECALL_ENABLED;
-  else process.env.NANOCLAW_MEMORY_FACT_RECALL_ENABLED = CURATOR_FLAG;
   closeDb();
   fs.rmSync(TEST_ROOT, { recursive: true, force: true });
 });
@@ -269,9 +264,8 @@ describe('bounded authoritative pre-turn retrieval', () => {
 
   it('test_core_conflicts_and_truncation_are_explicit', () => {
     memoryFile(
-      'generated/memory.md',
-      `# Generated workgroup memory\n\n- SipTrue DNS is managed in Wix. ${'Supabase detail '.repeat(400)}` +
-        ` <!-- nanoclaw-memory:id=mem_0000000000000001;evidence=conflict;captured=2026-07-20T00:00:00.000Z -->\n`,
+      'preferences/operator.md',
+      `# Operator\nSipTrue DNS is managed in Wix. ${'Supabase detail '.repeat(400)}`,
     );
     archive(
       'conflict',
@@ -285,13 +279,13 @@ describe('bounded authoritative pre-turn retrieval', () => {
       sessionId: 'sess-a',
       kind: 'chat',
       trigger: 1 as const,
-      normalizedContent: JSON.stringify({ text: 'Who manages SipTrue DNS?' }),
+      normalizedContent: JSON.stringify({ text: 'Who manages SipTrue DNS?', sender: 'Operator' }),
     };
     const first = buildPreTurnContext(input);
     const second = buildPreTurnContext(input);
 
     expect(first.memoryEvidence.core.map((e) => e.path)).toEqual(['index.md']);
-    expect(first.memoryEvidence.excerpts.some((e) => e.path === 'generated/memory.md')).toBe(true);
+    expect(first.memoryEvidence.excerpts.some((e) => e.path === 'preferences/operator.md')).toBe(true);
     expect(first.notices.some((n) => n.code === 'potential-source-conflict')).toBe(true);
     expect(JSON.stringify(first)).toContain('[truncated:markdown-excerpt]');
     expect(JSON.stringify(first)).toBe(JSON.stringify(second));
@@ -331,23 +325,6 @@ describe('bounded authoritative pre-turn retrieval', () => {
     const missing = buildPreTurnContext({ ...input, includeBootstrap: true });
     expect(missing.memoryEvidence.core).toEqual([]);
     expect(missing.notices.some((n) => n.code === 'missing-core-memory')).toBe(true);
-  });
-
-  it('recalls relevant generated memory beyond the ordinary 64 KiB Markdown-file bound', () => {
-    memoryFile(
-      'generated/memory.md',
-      `# Generated workgroup memory\n\n${'unrelated filler '.repeat(4_500)}\n- GSC data is stored in Snowflake.`,
-    );
-    const result = buildPreTurnContext({
-      agentGroupId: 'ag-a',
-      sessionId: 'sess-a',
-      kind: 'chat-sdk',
-      trigger: 1,
-      normalizedContent: JSON.stringify({ text: 'Where is GSC data stored?' }),
-    });
-    expect(
-      result.memoryEvidence.excerpts.some((excerpt) => excerpt.text.includes('GSC data is stored in Snowflake')),
-    ).toBe(true);
   });
 
   it('detects a correction that conflicts with always-loaded core canon', () => {
@@ -438,132 +415,19 @@ describe('bounded authoritative pre-turn retrieval', () => {
     expect(lexical).toHaveLength(PRE_TURN_BOUNDS.archiveExcerpts);
   });
 
-  it('ranks generated memory per fact in its own lane, so store size does not throttle recall', () => {
-    // One fact per line, each self-contained, exactly as the curator renders it.
-    const fact = (id: string, capturedAt: string, text: string): string =>
-      `- ${text} <!-- nanoclaw-memory:id=mem_${id};evidence=arc-${id};captured=${capturedAt} -->`;
-    const filler = Array.from({ length: 200 }, (_, index) =>
-      fact(
-        String(index).padStart(16, '0'),
-        '2026-07-01T00:00:00.000Z',
-        `Unrelated fact ${index} about invoice reconciliation grain and warehouse origins.`,
-      ),
-    );
-    memoryFile(
-      'generated/memory.md',
-      [
-        '# Generated workgroup memory',
-        '',
-        // Old but exactly on point. Nothing prunes it; nothing should bury it.
-        fact('aaaaaaaaaaaaaaa1', '2026-05-01T00:00:00.000Z', 'Jordan owns deployment for the release pipeline.'),
-        ...filler,
-        fact('aaaaaaaaaaaaaaa2', '2026-07-25T00:00:00.000Z', 'Deployment rollbacks are approved by Jordan only.'),
-        fact('aaaaaaaaaaaaaaa3', '2026-07-26T00:00:00.000Z', 'Deployment freezes run over the weekend.'),
-      ].join('\n'),
-    );
-
-    const result = buildPreTurnContext({
-      agentGroupId: 'ag-a',
-      sessionId: 'sess-a',
-      kind: 'chat',
-      trigger: 1,
-      normalizedContent: '{"text":"Who owns deployment?"}',
-    });
-
-    const facts = result.memoryEvidence.excerpts.filter((row) => row.path === 'generated/memory.md');
-    // Was capped at one 900-char window for the whole store, whatever it held.
-    expect(facts.length).toBeGreaterThan(1);
-    expect(facts.length).toBeLessThanOrEqual(PRE_TURN_BOUNDS.generatedFactExcerpts);
-    // Each excerpt is one fact, not a window straddling its neighbours.
-    for (const row of facts) expect(row.text.split('nanoclaw-memory:id=')).toHaveLength(2);
-    // Age ranks but never filters: the May fact outranks 200 fresher irrelevant ones.
-    expect(facts.some((row) => row.text.includes('Jordan owns deployment'))).toBe(true);
-    // Provenance still reaches the agent, so it can tell how old a fact is.
-    expect(facts.some((row) => row.text.includes('captured=2026-05-01T00:00:00.000Z'))).toBe(true);
-  });
-
-  it('keeps archive recall alive when long facts would otherwise consume the whole budget', () => {
-    // Worst case: three max-width facts. Per-lane caps alone let memory reach
-    // 9,300 chars of a 12,000 budget, and enforceFinalBound evicts conversation
-    // excerpts before memory ones, so archive recall vanished silently.
-    const marker = (n: number, id: string): string =>
-      `- ${`Deployment ownership detail ${n}. `.repeat(80)} <!-- nanoclaw-memory:id=mem_${id};evidence=arc-${id};captured=2026-07-2${n}T00:00:00.000Z -->`;
-    memoryFile(
-      'generated/memory.md',
-      [
-        '# Generated workgroup memory',
-        '',
-        marker(1, 'aaaaaaaaaaaaaaa1'),
-        marker(2, 'aaaaaaaaaaaaaaa2'),
-        marker(3, 'aaaaaaaaaaaaaaa3'),
-        '',
-      ].join('\n'),
-    );
-    // Every lane at full width, so the combined footprint exceeds finalChars and
-    // enforceFinalBound is forced to sacrifice something.
-    for (const id of ['arc-1', 'arc-2', 'arc-3']) {
+  it('memoizes tokenization so a repeated turn does not re-tokenize the candidate set', () => {
+    // Guards the change that made ranking latency a function of the candidate
+    // count rather than a cost re-paid every turn: a live 1 MiB store cost
+    // 875 ms of tokenization per turn before this. A regression here is
+    // invisible except as slow turns.
+    for (let index = 0; index < 90; index++) {
       archive(
-        id,
+        `memo-${String(index).padStart(2, '0')}`,
         'ag-a',
-        `${'Jordan owns deployment, discussed at length. '.repeat(40)} ${id}`,
-        '2026-07-26T00:00:00.000Z',
+        `Deployment ownership detail ${index} covering the release pipeline and its rollback path.`,
+        `2026-07-${String((index % 28) + 1).padStart(2, '0')}T00:00:00.000Z`,
       );
     }
-
-    const result = buildPreTurnContext({
-      agentGroupId: 'ag-a',
-      sessionId: 'sess-a',
-      kind: 'chat',
-      trigger: 1,
-      normalizedContent: '{"text":"Who owns deployment?"}',
-    });
-
-    const memoryChars = result.memoryEvidence.excerpts.reduce((sum, row) => sum + row.text.length, 0);
-    expect(memoryChars).toBeLessThanOrEqual(PRE_TURN_BOUNDS.memoryExcerptTotalChars);
-    // The point of the bound: conversation evidence still survives.
-    expect(result.conversationEvidence.excerpts.length).toBeGreaterThan(0);
-    expect(JSON.stringify(result).length).toBeLessThanOrEqual(PRE_TURN_BOUNDS.finalChars);
-  });
-
-  it('keeps the provenance marker on a fact too long to deliver whole', () => {
-    const longText = `${'Deployment ownership rationale. '.repeat(120)}`;
-    memoryFile(
-      'generated/memory.md',
-      [
-        '# Generated workgroup memory',
-        '',
-        // A full complement of evidence ids, so the marker is at its widest.
-        `- ${longText} <!-- nanoclaw-memory:id=mem_aaaaaaaaaaaaaaa1;evidence=${Array.from({ length: 20 }, (_, i) => `msg-${String(i).padStart(4, '0')}-evidence-row:ag-example-group`).join(',')};captured=2026-05-01T00:00:00.000Z -->`,
-        '',
-      ].join('\n'),
-    );
-
-    const result = buildPreTurnContext({
-      agentGroupId: 'ag-a',
-      sessionId: 'sess-a',
-      kind: 'chat',
-      trigger: 1,
-      normalizedContent: '{"text":"Who owns deployment?"}',
-    });
-
-    const fact = result.memoryEvidence.excerpts.find((row) => row.path === 'generated/memory.md');
-    expect(fact).toBeDefined();
-    // Trimmed, but the agent can still tell how old it is and cite it.
-    expect(fact!.text).toContain('nanoclaw-memory:id=mem_aaaaaaaaaaaaaaa1');
-    expect(fact!.text).toContain('captured=2026-05-01T00:00:00.000Z');
-  });
-
-  it('memoizes tokenization so a repeated turn does not re-tokenize the fact store', () => {
-    // Guards the change that made the size cap a storage decision instead of a
-    // latency one: a live 1 MiB store cost 875 ms of tokenization per turn
-    // before this. A regression here is invisible except as slow turns.
-    const facts = Array.from(
-      { length: 400 },
-      (_, index) =>
-        `- Deployment ownership detail ${index} covering the release pipeline and its rollback path. ` +
-        `<!-- nanoclaw-memory:id=mem_${String(index).padStart(16, '0')};evidence=arc-${index};captured=2026-07-2${index % 9}T00:00:00.000Z -->`,
-    );
-    memoryFile('generated/memory.md', ['# Generated workgroup memory', '', ...facts, ''].join('\n'));
     const input = {
       agentGroupId: 'ag-a',
       sessionId: 'sess-a',
@@ -572,16 +436,17 @@ describe('bounded authoritative pre-turn retrieval', () => {
       normalizedContent: '{"text":"Who owns deployment rollback?"}',
     };
 
-    const cold = process.hrtime.bigint();
+    _resetTokenStreamCacheForTest();
     buildPreTurnContext(input);
-    const coldNs = Number(process.hrtime.bigint() - cold);
-    const warm = process.hrtime.bigint();
+    const cold = _tokenStreamCacheStatsForTest();
     buildPreTurnContext(input);
-    const warmNs = Number(process.hrtime.bigint() - warm);
+    const warm = _tokenStreamCacheStatsForTest();
 
-    // Deliberately loose: this asserts the cache exists at all, not a latency
-    // budget, so it cannot flake on a loaded CI box. Measured speedup is ~50x.
-    expect(warmNs).toBeLessThan(coldNs);
+    // The repeat pass reads the same candidates back out of the cache instead
+    // of re-tokenizing them.
+    expect(cold.misses).toBeGreaterThan(0);
+    expect(warm.hits - cold.hits).toBeGreaterThan(0);
+    expect(warm.misses - cold.misses).toBeLessThan(cold.misses);
     // And the cache must not change what is returned.
     expect(JSON.stringify(buildPreTurnContext(input).memoryEvidence)).toBe(
       JSON.stringify(buildPreTurnContext(input).memoryEvidence),
@@ -640,10 +505,6 @@ describe('bounded authoritative pre-turn retrieval', () => {
   });
 
   it('uses bounded ephemeral expansion only after direct lexical no-match', () => {
-    memoryFile(
-      'generated/memory.md',
-      '# Generated workgroup memory\n\n- When a dedicated MCP is absent, try the real HTTPS API through the OneCLI gateway before claiming no access. <!-- nanoclaw-memory:id=mem_0000000000000001;evidence=ev-1;captured=2026-07-20T00:00:00.000Z -->\n',
-    );
     archive(
       'archive-external-access',
       'ag-a-codex',
@@ -659,7 +520,6 @@ describe('bounded authoritative pre-turn retrieval', () => {
       normalizedContent: '{"text":"What should happen before saying an external service is unavailable?"}',
     });
 
-    expect(result.memoryEvidence.excerpts[0]?.path).toBe('generated/memory.md');
     expect(result.conversationEvidence.excerpts[0]?.id).toBe('archive-external-access');
     expect(result.notices.some((notice) => notice.code === 'ephemeral-query-expansion-used')).toBe(true);
     expect(JSON.stringify(result.notices)).not.toContain('gateway');
@@ -755,90 +615,75 @@ describe('bounded authoritative pre-turn retrieval', () => {
     expect(result.notices.some((notice) => notice.code === 'capability-detail-read-failed')).toBe(false);
   });
 
-  it.each([
-    {
-      label: 'the generated fact ledger',
-      ancestor: 'generated',
-      leaf: 'generated/memory.md',
-      outsideLeaf: 'memory.md',
-      restoreBeforeValidation: true,
-    },
-  ])(
-    'rejects an ancestor-directory symlink swap for $label',
-    ({ ancestor, leaf, outsideLeaf, restoreBeforeValidation }) => {
-      const memoryRoot = path.join(TEST_ROOT, 'workgroups', 'wg-a', 'memory');
-      if (ancestor === 'generated') {
-        memoryFile(
-          'generated/memory.md',
-          '# Generated workgroup memory\n\n- Jordan owns deployment. <!-- nanoclaw-memory:id=mem_0000000000000001;evidence=ev-1;captured=2026-07-20T00:00:00.000Z -->\n',
-        );
+  // The leaf-only O_NOFOLLOW above does not stop an enumerated ANCESTOR being
+  // swapped to a symlink between the directory listing and the open, so
+  // readBoundedFile pins the opened fd and re-validates dev+ino against the
+  // path resolved under the canonical root. preferences/ is the one directory
+  // recall enumerates per turn, so it is where that check has to hold.
+  it('rejects an ancestor-directory symlink swap for the preferences directory', () => {
+    const memoryRoot = path.join(TEST_ROOT, 'workgroups', 'wg-a', 'memory');
+    memoryFile('preferences/operator.md', '# Operator\nJordan owns deployment.');
+    const checkedLeaf = path.join(memoryRoot, 'preferences', 'operator.md');
+    const checkedAncestor = path.join(memoryRoot, 'preferences');
+    const outsideDir = path.join(TEST_ROOT, 'outside-preferences');
+    const secret = 'OUTSIDE_ANCESTOR_PREFERENCES_MUST_NOT_BE_READ';
+    fs.mkdirSync(outsideDir, { recursive: true });
+    fs.writeFileSync(path.join(outsideDir, 'operator.md'), `# Deployment owner\nJordan owns deployment. ${secret}`);
+    archive('healthy-during-preferences-race', 'ag-a', 'The deployment owner is Jordan.', '2026-07-20T00:00:00.000Z');
+
+    const realOpenSync = fs.openSync;
+    let swapped = false;
+    const openSpy = vi.spyOn(fs, 'openSync').mockImplementation(((file, flags, mode) => {
+      if (!swapped && path.resolve(String(file)) === checkedLeaf) {
+        swapped = true;
+        const parkedAncestor = `${checkedAncestor}-parked`;
+        fs.renameSync(checkedAncestor, parkedAncestor);
+        fs.symlinkSync(outsideDir, checkedAncestor, 'dir');
+        const opened = realOpenSync(file, flags, mode);
+        // Restored before validation, so containment alone cannot catch this —
+        // only the dev+ino identity check on the already-opened fd does.
+        fs.rmSync(checkedAncestor);
+        fs.renameSync(parkedAncestor, checkedAncestor);
+        return opened;
       }
-      const checkedLeaf = path.join(memoryRoot, leaf);
-      const checkedAncestor = path.join(memoryRoot, ancestor);
-      const outsideDir = path.join(TEST_ROOT, `outside-${ancestor}`);
-      const secret = `OUTSIDE_ANCESTOR_${ancestor.toLocaleUpperCase('en-US')}_MUST_NOT_BE_READ`;
-      fs.mkdirSync(outsideDir, { recursive: true });
-      fs.writeFileSync(path.join(outsideDir, outsideLeaf), `# Deployment owner\nJordan owns deployment. ${secret}`);
-      archive(`healthy-during-${ancestor}-race`, 'ag-a', 'The deployment owner is Jordan.', '2026-07-20T00:00:00.000Z');
+      return realOpenSync(file, flags, mode);
+    }) as typeof fs.openSync);
 
-      const realOpenSync = fs.openSync;
-      let swapped = false;
-      const openSpy = vi.spyOn(fs, 'openSync').mockImplementation(((file, flags, mode) => {
-        if (!swapped && path.resolve(String(file)) === checkedLeaf) {
-          swapped = true;
-          const parkedAncestor = `${checkedAncestor}-parked`;
-          if (restoreBeforeValidation) fs.renameSync(checkedAncestor, parkedAncestor);
-          else fs.rmSync(checkedAncestor, { recursive: true });
-          fs.symlinkSync(outsideDir, checkedAncestor, 'dir');
-          const opened = realOpenSync(file, flags, mode);
-          if (restoreBeforeValidation) {
-            fs.rmSync(checkedAncestor);
-            fs.renameSync(parkedAncestor, checkedAncestor);
-          }
-          return opened;
-        }
-        return realOpenSync(file, flags, mode);
-      }) as typeof fs.openSync);
+    let result: ReturnType<typeof buildPreTurnContext>;
+    try {
+      result = buildPreTurnContext({
+        agentGroupId: 'ag-a',
+        sessionId: 'sess-a',
+        kind: 'chat',
+        trigger: 1,
+        normalizedContent: '{"text":"Who is the deployment owner?"}',
+      });
+    } finally {
+      openSpy.mockRestore();
+    }
 
-      let result: ReturnType<typeof buildPreTurnContext>;
-      try {
-        result = buildPreTurnContext({
-          agentGroupId: 'ag-a',
-          sessionId: 'sess-a',
-          kind: 'chat',
-          trigger: 1,
-          normalizedContent: '{"text":"Who is the deployment owner?"}',
-        });
-      } finally {
-        openSpy.mockRestore();
-      }
-
-      expect(swapped).toBe(true);
-      expect(JSON.stringify(result.memoryEvidence)).not.toContain(secret);
-      expect(result.notices.some((notice) => notice.code === 'markdown-read-failed')).toBe(true);
-      expect(result.trustedCapabilities?.services[0]?.name).toBe('safe-for:mg-a');
-      expect(result.conversationEvidence.excerpts[0]?.id).toBe(`healthy-during-${ancestor}-race`);
-      expect(result.notices.some((notice) => notice.code === 'archive-read-failed')).toBe(false);
-      expect(result.notices.some((notice) => notice.code === 'capability-detail-read-failed')).toBe(false);
-    },
-  );
+    expect(swapped).toBe(true);
+    expect(JSON.stringify(result.memoryEvidence)).not.toContain(secret);
+    expect(result.notices.some((notice) => notice.code === 'preference-read-failed')).toBe(true);
+    expect(result.trustedCapabilities?.services[0]?.name).toBe('safe-for:mg-a');
+    expect(result.conversationEvidence.excerpts[0]?.id).toBe('healthy-during-preferences-race');
+    expect(result.notices.some((notice) => notice.code === 'archive-read-failed')).toBe(false);
+    expect(result.notices.some((notice) => notice.code === 'capability-detail-read-failed')).toBe(false);
+  });
 
   it('degrades archive, exact-link, and capabilities independently', () => {
-    memoryFile(
-      'generated/memory.md',
-      '# Generated workgroup memory\n\n- Jordan owns deployment. <!-- nanoclaw-memory:id=mem_0000000000000001;evidence=ev-1;captured=2026-07-20T00:00:00.000Z -->\n',
-    );
+    memoryFile('preferences/operator.md', '# Operator\nJordan owns deployment.');
     const input = {
       agentGroupId: 'ag-a',
       sessionId: 'sess-a',
       kind: 'chat',
       trigger: 1 as const,
-      normalizedContent: '{"text":"Who owns deployment?"}',
+      normalizedContent: '{"text":"Who owns deployment?","sender":"Operator"}',
     };
 
     FAILURES.archive = true;
     const archiveFailure = buildPreTurnContext(input);
-    expect(archiveFailure.memoryEvidence.excerpts[0]?.path).toBe('generated/memory.md');
+    expect(archiveFailure.memoryEvidence.excerpts[0]?.path).toBe('preferences/operator.md');
     expect(archiveFailure.trustedCapabilities?.services[0]?.name).toBe('safe-for:mg-a');
     expect(archiveFailure.notices.some((notice) => notice.code === 'archive-read-failed')).toBe(true);
     expect(archiveFailure.notices.some((notice) => notice.code === 'exact-link-read-failed')).toBe(false);
@@ -846,14 +691,14 @@ describe('bounded authoritative pre-turn retrieval', () => {
     FAILURES.archive = false;
     FAILURES.exactLink = true;
     const exactLinkFailure = buildPreTurnContext(input);
-    expect(exactLinkFailure.memoryEvidence.excerpts[0]?.path).toBe('generated/memory.md');
+    expect(exactLinkFailure.memoryEvidence.excerpts[0]?.path).toBe('preferences/operator.md');
     expect(exactLinkFailure.notices.some((notice) => notice.code === 'exact-link-read-failed')).toBe(true);
     expect(exactLinkFailure.notices.some((notice) => notice.code === 'archive-read-failed')).toBe(false);
 
     FAILURES.exactLink = false;
     FAILURES.capabilities = true;
     const capabilityFailure = buildPreTurnContext(input);
-    expect(capabilityFailure.memoryEvidence.excerpts[0]?.path).toBe('generated/memory.md');
+    expect(capabilityFailure.memoryEvidence.excerpts[0]?.path).toBe('preferences/operator.md');
     expect(capabilityFailure.trustedCapabilities).toEqual({ agentGroupId: 'ag-a', services: [] });
     expect(capabilityFailure.notices.some((notice) => notice.code === 'capability-detail-read-failed')).toBe(true);
   });
@@ -883,10 +728,7 @@ describe('bounded authoritative pre-turn retrieval', () => {
   });
 
   it('bootstraps capabilities and index once, then emits only unseen per-turn evidence', () => {
-    memoryFile(
-      'generated/memory.md',
-      '# Generated workgroup memory\n\n- Jordan owns deployment. <!-- nanoclaw-memory:id=mem_0000000000000001;evidence=owner-archive;captured=2026-07-20T00:00:00.000Z -->\n',
-    );
+    memoryFile('preferences/operator.md', '# Operator\nJordan owns deployment.');
     archive('owner-archive', 'ag-a', 'Jordan owns deployment.', '2026-07-20T00:00:00.000Z');
     const common = {
       agentGroupId: 'ag-a',
@@ -895,7 +737,7 @@ describe('bounded authoritative pre-turn retrieval', () => {
       trigger: 1 as const,
       provider: 'claude',
       contextEpoch: 4,
-      normalizedContent: '{"text":"Who owns deployment?"}',
+      normalizedContent: '{"text":"Who owns deployment?","sender":"Operator"}',
     };
 
     const bootstrap = buildPreTurnContext({ ...common, includeBootstrap: true });
@@ -914,6 +756,7 @@ describe('bounded authoritative pre-turn retrieval', () => {
     expect(bootstrap.contextEpoch).toBe(4);
     expect(bootstrap.trustedCapabilities?.services[0]?.name).toBe('safe-for:mg-a');
     expect(bootstrap.memoryEvidence.core.map((row) => row.path)).toEqual(['index.md']);
+    expect(bootstrap.memoryEvidence.excerpts.map((row) => row.path)).toEqual(['preferences/operator.md']);
     expect(delta.trustedCapabilities).toBeUndefined();
     expect(delta.memoryEvidence.core).toEqual([]);
     expect(delta.memoryEvidence.excerpts).toEqual([]);
@@ -1014,12 +857,9 @@ describe('bounded authoritative pre-turn retrieval', () => {
   });
 
   it('keeps normal deltas within the approved evidence counts and size ceiling', () => {
-    const factLine = (index: number): string =>
-      `- Bounded relevant detail ${index}. ${'bounded relevant detail '.repeat(200)}` +
-      ` <!-- nanoclaw-memory:id=mem_${String(index).padStart(16, '0')};evidence=bounded-${index};captured=2026-07-01T00:00:00.000Z -->`;
     memoryFile(
-      'generated/memory.md',
-      `# Generated workgroup memory\n\n${Array.from({ length: 12 }, (_, index) => factLine(index)).join('\n')}\n`,
+      'preferences/operator.md',
+      `# Operator\nBounded relevant detail. ${'bounded relevant detail '.repeat(200)}`,
     );
     for (let index = 0; index < 12; index++) {
       archive(
@@ -1038,9 +878,10 @@ describe('bounded authoritative pre-turn retrieval', () => {
       includeBootstrap: false,
       provider: 'claude',
       contextEpoch: 1,
-      normalizedContent: '{"text":"bounded relevant detail"}',
+      normalizedContent: '{"text":"bounded relevant detail","sender":"Operator"}',
     });
 
+    expect(result.memoryEvidence.excerpts.map((row) => row.path)).toEqual(['preferences/operator.md']);
     expect(result.memoryEvidence.excerpts.length).toBeLessThanOrEqual(3);
     expect(result.conversationEvidence.excerpts.length).toBeLessThanOrEqual(3);
     expect(JSON.stringify(result).length).toBeLessThanOrEqual(PRE_TURN_BOUNDS.finalChars);
@@ -1144,51 +985,6 @@ describe('per-person preference recall', () => {
   });
 });
 
-describe('fact marker reason field (P0-AC6)', () => {
-  it('the reason field does not affect ranking or selection', () => {
-    const fact = (n: number, reason: string) =>
-      `- Forecast pipeline volume fact number ${n} with distinct detail ${'x'.repeat(30 * n)}. <!-- nanoclaw-memory:id=mem_${String(n).repeat(16)};${reason}evidence=ev-${n};captured=2026-08-0${n}T00:00:00.000Z -->`;
-    const stripMarker = (text: string) => text.slice(0, text.indexOf('<!--')).trimEnd();
-    const input = {
-      agentGroupId: 'ag-a',
-      sessionId: 'sess-a',
-      kind: 'chat-sdk',
-      trigger: 1 as const,
-      normalizedContent: JSON.stringify({ text: 'What is the forecast pipeline volume detail?' }),
-      includeBootstrap: false,
-    };
-
-    memoryFile(
-      'generated/memory.md',
-      `# Generated workgroup memory\n\n${[1, 2, 3].map((n) => fact(n, '')).join('\n')}\n`,
-    );
-    const legacy = buildPreTurnContext(input);
-
-    memoryFile(
-      'generated/memory.md',
-      `# Generated workgroup memory\n\n${[1, 2, 3].map((n) => fact(n, 'reason=domain_knowledge;')).join('\n')}\n`,
-    );
-    const reasoned = buildPreTurnContext(input);
-
-    const shape = (context: typeof legacy) =>
-      context.memoryEvidence.excerpts.map((row) => `${row.path}|${stripMarker(row.text)}`);
-    // Same facts selected, same order, identical marker-stripped text. Do NOT
-    // compare raw bytes: delivered text keeps the marker by design, so the
-    // reason field itself differs.
-    expect(shape(reasoned)).toEqual(shape(legacy));
-
-    // Review-hardened half: a query whose terms appear ONLY inside the marker
-    // (the reason token and marker vocabulary) must select nothing. If a
-    // regression ever ranks the full line instead of the marker-stripped
-    // searchable text, this query starts matching and fails here.
-    const markerOnly = buildPreTurnContext({
-      ...input,
-      normalizedContent: JSON.stringify({ text: 'nanoclaw-memory domain_knowledge captured evidence' }),
-    });
-    expect(markerOnly.memoryEvidence.excerpts.filter((row) => row.path === 'generated/memory.md')).toEqual([]);
-  });
-});
-
 describe('bootstrap recall budget (B-AC1..B-AC4, incident 2026-08-13)', () => {
   const ASK = 'Can you help me build a practice app about losophe?';
 
@@ -1197,12 +993,6 @@ describe('bootstrap recall budget (B-AC1..B-AC4, incident 2026-08-13)', () => {
     const sentence = 'Losophe is the streets-only dev tenant for the practice build losophe app project detail. ';
     memoryFile('index.md', `# Canon\n${sentence.repeat(30)}`);
     memoryFile('preferences/operator.md', `# Operator — preferences\n${'Use plain language. '.repeat(40)}`);
-    const fact = sentence.repeat(24).slice(0, 2_000);
-    const factLines = [0, 1, 2].map(
-      (index) =>
-        `- ${fact} (fact ${index}) <!-- nanoclaw-memory:id=mem_${String(index).repeat(16)};evidence=ev-${index};captured=2026-08-0${index + 1}T00:00:00.000Z -->`,
-    );
-    memoryFile('generated/memory.md', `# Generated workgroup memory\n\n${factLines.join('\n')}\n`);
     for (let index = 0; index < 4; index++) {
       archive(`losophe-${index}`, 'ag-a', `${sentence.repeat(10)} (row ${index})`, `2026-07-2${index}T00:00:00.000Z`);
     }
@@ -1233,9 +1023,7 @@ describe('bootstrap recall budget (B-AC1..B-AC4, incident 2026-08-13)', () => {
     expect(result.trustedCapabilities).toBeDefined();
     // The incident: these two were zero while capabilities survived.
     expect(result.conversationEvidence.excerpts.length).toBeGreaterThan(0);
-    expect(result.memoryEvidence.excerpts.filter((row) => !row.path.startsWith('preferences/')).length).toBeGreaterThan(
-      0,
-    );
+    expect(result.memoryEvidence.excerpts.map((row) => row.path)).toContain('preferences/operator.md');
     expect(JSON.stringify(result).length).toBeLessThanOrEqual(PRE_TURN_BOUNDS.bootstrapFinalChars);
   });
 
@@ -1394,50 +1182,32 @@ describe('final-bound eviction order at the seam', () => {
 });
 
 // Root cause: the recall token cache keyed on WINDOW text (boundedPassages via
-// bestPassage), not on fact text, and one fact yields ~9-12 windows. A
-// 1,000-fact ledger was ~12,000 entries, so the old 8,192 cap flushed the whole
-// Map mid-pass and the warm path never materialized — measured 12.5 s cold AND
-// 12.9 s warm on the live 6,626-fact store.
+// bestPassage), not on candidate text, and one candidate yields ~9-12 windows.
+// A 1,000-candidate corpus was ~12,000 entries, so the old 8,192 cap flushed
+// the whole Map mid-pass and the warm path never materialized — measured 12.5 s
+// cold AND 12.9 s warm on a live 6,626-candidate store.
 //
-// passageWindows since collapsed an entry back to one CANDIDATE, so the ledger
-// here is sized by candidate count rather than window count: the point of the
-// test is that a working set past the old cap still warms, and only the number
-// of facts needed to build one changed.
+// passageWindows since collapsed an entry back to one CANDIDATE. The point of
+// the test is that a working set past the old cap still warms.
 describe('recall token cache survives a working set larger than the old 8,192-entry cap', () => {
-  const input = {
-    agentGroupId: 'ag-a',
-    sessionId: 'sess-a',
-    kind: 'chat-sdk',
-    trigger: 1 as const,
-    normalizedContent: JSON.stringify({ text: 'What is the forecast pipeline volume reading?' }),
-    includeBootstrap: false,
-  };
-
-  it('a second identical ranking pass is served from cache instead of re-tokenizing', () => {
-    const fact = (n: number) =>
-      `- Forecast pipeline volume reading ${n} landed. Region delta ${n} held steady. ` +
-      `Operator sign-off ${n} recorded. Ledger checkpoint ${n} confirmed. ` +
-      `<!-- nanoclaw-memory:id=mem_${String(n).padStart(16, '0')};evidence=ev-${n};captured=2026-08-01T00:00:00.000Z -->`;
-    memoryFile(
-      'generated/memory.md',
-      `# Generated workgroup memory\n\n${Array.from({ length: 10_000 }, (_, i) => fact(i + 1)).join('\n')}\n`,
-    );
+  it('a second identical pass over a working set past the old cap is served from cache', () => {
+    const candidate = (n: number) =>
+      `Forecast pipeline volume reading ${n} landed. Region delta ${n} held steady. ` +
+      `Operator sign-off ${n} recorded. Ledger checkpoint ${n} confirmed.`;
+    const corpus = Array.from({ length: 10_000 }, (_, index) => candidate(index + 1));
     _resetTokenStreamCacheForTest();
 
-    buildPreTurnContext(input);
+    for (const text of corpus) tokenizeForRecall(text);
     const cold = _tokenStreamCacheStatsForTest();
     // The working set must actually exceed the old cap, or this proves nothing.
     expect(cold.misses).toBeGreaterThan(8_192);
 
-    buildPreTurnContext(input);
+    for (const text of corpus) tokenizeForRecall(text);
     const warm = _tokenStreamCacheStatsForTest();
-    const warmHits = warm.hits - cold.hits;
-    const warmMisses = warm.misses - cold.misses;
 
-    // Materially less tokenization work on the repeat pass: essentially every
-    // candidate is served from cache rather than re-tokenized.
-    expect(warmHits).toBeGreaterThan(8_192);
-    expect(warmMisses).toBeLessThan(warmHits / 100);
+    // Every candidate is served from cache rather than re-tokenized.
+    expect(warm.hits - cold.hits).toBe(corpus.length);
+    expect(warm.misses - cold.misses).toBe(0);
   });
 
   it('overflow evicts the oldest entry, it does not clear the whole cache', () => {
@@ -1468,89 +1238,70 @@ describe('recall token cache survives a working set larger than the old 8,192-en
 
 // Root cause of the remaining large-workgroup cost: bestPassage scored
 // OVERLAPPING windows over the same candidate and tokenized each window as its
-// own distinct string — measured 2.9x the candidate's characters on the live
-// 6,633-fact store, and distinct strings so no cache can collapse them. The fix
-// tokenizes each candidate ONCE and slices that stream by token offset.
+// own distinct string — measured 2.9x the candidate's characters on a live
+// 6,633-candidate store, and distinct strings so no cache can collapse them.
+// The fix tokenizes each candidate ONCE and slices that stream by token offset.
 //
 // The hazard the fix must not trade correctness for: token offsets index the
 // NFKC-normalized, lowercased string while windows are slices of the ORIGINAL,
-// so the two coordinate spaces only coincide for ASCII candidates with
-// token-clean window edges. Everything else must fall back to per-window
-// tokenization and produce byte-identical passages.
+// so the two coordinate spaces only coincide for normalization-invariant
+// candidates with token-clean window edges. Everything else must fall back to
+// per-window tokenization and produce byte-identical passages.
+//
+// Asserted at the ranker seam rather than through a whole turn: this is the
+// cost and the correctness of `bestPassage` itself, which every remaining
+// lane — archive recall included — routes through.
 describe('passage windows reuse one tokenization per candidate', () => {
-  const ask = (text: string) => ({
-    agentGroupId: 'ag-a',
-    sessionId: 'sess-a',
-    kind: 'chat-sdk',
-    trigger: 1 as const,
-    normalizedContent: JSON.stringify({ text }),
-    includeBootstrap: false,
+  const CHARS = PRE_TURN_BOUNDS.archiveExcerptChars;
+
+  /** Tokenizations charged for ranking one candidate, with the query pre-warmed. */
+  function tokenizationsFor(query: string, candidate: string, maxChars: number = CHARS): number {
+    const tokens = tokenizeForRecall(query);
+    _resetTokenStreamCacheForTest();
+    _bestPassageForTest(tokens, candidate, maxChars);
+    return _tokenStreamCacheStatsForTest().misses;
+  }
+
+  function passageFor(query: string, candidate: string, maxChars: number = CHARS): string {
+    const passage = _bestPassageForTest(tokenizeForRecall(query), candidate, maxChars);
+    expect(passage).not.toBeNull();
+    return passage!.text;
+  }
+
+  it('a four-sentence candidate costs exactly one tokenization, not nine', () => {
+    // Four sentences => 4 spans => 9 windows under the 1..3-sentence sweep, so
+    // per-window tokenization charges 9 and per-candidate tokenization charges 1.
+    const candidate =
+      'Forecast pipeline volume doubled last quarter. Region delta held steady through the review. ' +
+      'Operator sign-off was recorded by the duty lead. Ledger checkpoint confirmed the final figure.';
+
+    expect(tokenizationsFor('forecast pipeline volume', candidate)).toBe(1);
   });
 
-  it('each added multi-sentence fact costs exactly one tokenization', () => {
-    // Each fact is four sentences => 4 spans => 9 windows under the 1..3-sentence
-    // sweep, so per-window tokenization charges 9 misses per fact and
-    // per-candidate tokenization charges 1. Measuring the DELTA between two
-    // ledger sizes isolates the per-fact cost from the fixed overhead of the
-    // query, the expansion probe and the seeded manual files, so the assertion
-    // is the invariant itself rather than a tuned magic number.
-    const fact = (n: number) =>
-      `- Forecast pipeline volume ${n} doubled last quarter. Region delta ${n} held steady through the review. ` +
-      `Operator sign-off ${n} was recorded by the duty lead. Ledger checkpoint ${n} confirmed the final figure. ` +
-      `<!-- nanoclaw-memory:id=mem_${String(n).padStart(16, '0')};evidence=ev-${n};captured=2026-08-01T00:00:00.000Z -->`;
-    const ledger = (count: number) =>
-      `# Generated workgroup memory\n\n${Array.from({ length: count }, (_, i) => fact(i + 1)).join('\n')}\n`;
+  it('selected passage is the original bytes, not the normalized ones', () => {
+    const candidate = 'Alpha Bravo Charlie shipped. Delta Echo Foxtrot stalled. Golf Hotel India resumed.';
 
-    memoryFile('generated/memory.md', ledger(20));
-    _resetTokenStreamCacheForTest();
-    const result = buildPreTurnContext(ask('forecast pipeline volume'));
-    expect(result.memoryEvidence.excerpts.some((row) => row.path === 'generated/memory.md')).toBe(true);
-    const small = _tokenStreamCacheStatsForTest().misses;
+    const text = passageFor('Delta Echo Foxtrot', candidate);
 
-    memoryFile('generated/memory.md', ledger(120));
-    _resetTokenStreamCacheForTest();
-    buildPreTurnContext(ask('forecast pipeline volume'));
-    const large = _tokenStreamCacheStatsForTest().misses;
-
-    // 100 extra facts must cost 100 extra tokenizations, not ~900.
-    expect(large - small).toBe(100);
-  });
-
-  it('selected passage and score are identical to per-window tokenization', () => {
-    // Same fact ranked through the real path; the winning excerpt must be the
-    // exact original-string slice, not a normalized or re-cased one.
-    const fact =
-      '- Alpha Bravo Charlie shipped. Delta Echo Foxtrot stalled. Golf Hotel India resumed. ' +
-      '<!-- nanoclaw-memory:id=mem_0000000000000002;evidence=ev-2;captured=2026-08-01T00:00:00.000Z -->';
-    memoryFile('generated/memory.md', `# Generated workgroup memory\n\n${fact}\n`);
-
-    const result = buildPreTurnContext(ask('Delta Echo Foxtrot'));
-    const excerpt = result.memoryEvidence.excerpts.find((row) => row.path === 'generated/memory.md');
-    expect(excerpt).toBeDefined();
-    // Original casing survives — the delivered text is a slice of the source
-    // line, never of the lowercased normalization the tokenizer works on.
-    expect(excerpt!.text).toContain('Delta Echo Foxtrot stalled.');
-    expect(excerpt!.text).not.toContain('delta echo foxtrot');
+    // Original casing survives — the passage is a slice of the source string,
+    // never of the lowercased normalization the tokenizer works on.
+    expect(text).toContain('Delta Echo Foxtrot stalled.');
+    expect(text).not.toContain('delta echo foxtrot');
   });
 
   it('NFKC-length-changing text still ranks and delivers the original bytes', () => {
-    // 'ﬁ' -> 'fi' GROWS under NFKC and 'e'+U+0301 -> 'é' SHRINKS, so token
-    // offsets taken from the normalized string cannot index this line. The
-    // candidate must fall back to per-window tokenization rather than
-    // mis-slice.
-    const fact =
-      '- The ﬁle café pipeline runs nightly. ＡＢＣ batch ①② rotates weekly. ' +
-      'Retention window stays at ninety days. ' +
-      '<!-- nanoclaw-memory:id=mem_0000000000000003;evidence=ev-3;captured=2026-08-01T00:00:00.000Z -->';
-    memoryFile('generated/memory.md', `# Generated workgroup memory\n\n${fact}\n`);
+    // The ligature grows under NFKC and a combining accent shrinks, so token
+    // offsets taken from the normalized string cannot index this candidate. It
+    // must fall back to per-window tokenization rather than mis-slice.
+    const candidate =
+      'The \ufb01le cafe\u0301 pipeline runs nightly. ＡＢＣ batch ①② rotates weekly. Retention window stays at ninety days.';
 
     // 'file' is only reachable through NFKC folding of the ligature.
-    const result = buildPreTurnContext(ask('file cache pipeline'));
-    const excerpt = result.memoryEvidence.excerpts.find((row) => row.path === 'generated/memory.md');
-    expect(excerpt).toBeDefined();
+    const text = passageFor('file cache pipeline', candidate);
+
     // Byte-identical to the source: the ligature and the combining accent are
     // still there, unfolded.
-    expect(excerpt!.text).toContain('ﬁle café pipeline runs nightly.');
+    expect(text).toContain('\ufb01le cafe\u0301 pipeline runs nightly.');
   });
 
   it('a window edge that cuts a word falls back instead of dropping the fragment', () => {
@@ -1559,115 +1310,75 @@ describe('passage windows reuse one tokenization per candidate', () => {
     // the straddling run entirely; per-window tokenization yields its two
     // fragments. The fallback keeps the fragments reachable.
     const filler = 'supercalifragilistic'.repeat(60); // one unbroken run, no spaces
-    const fact =
-      `- ${filler} tail sentinel token here ` +
-      '<!-- nanoclaw-memory:id=mem_0000000000000004;evidence=ev-4;captured=2026-08-01T00:00:00.000Z -->';
-    memoryFile('generated/memory.md', `# Generated workgroup memory\n\n${fact}\n`);
+    const candidate = `${filler} tail sentinel token here`;
 
-    const result = buildPreTurnContext(ask('tail sentinel token'));
-    const excerpt = result.memoryEvidence.excerpts.find((row) => row.path === 'generated/memory.md');
-    expect(excerpt).toBeDefined();
-    expect(excerpt!.text).toContain('tail sentinel token here');
+    expect(tokenizationsFor('tail sentinel token', candidate)).toBeGreaterThan(1);
+    expect(passageFor('tail sentinel token', candidate)).toContain('tail sentinel token here');
   });
 });
 
 // Root cause of the remaining cost: the coordinate-space gate above was PURE
-// ASCII, and 372 of the 574 files in the live store carry a non-ASCII character
-// — 2,466 em-dashes and 666 arrows against 94 occurrences of everything that
-// actually perturbs offsets. Each of those files fell back to per-window
-// tokenization, ~118 cache entries instead of 1, which put the per-turn working
-// set at ~76,000 entries against a 24,576-entry cap: ~0% hit rate and ~6.7 s
-// warm. The gate is now normalization invariance, which an em-dash satisfies
-// and a ligature does not.
+// ASCII, and 372 of the 574 files in the live store carried a non-ASCII
+// character — 2,466 em-dashes and 666 arrows against 94 occurrences of
+// everything that actually perturbs offsets. Each of those fell back to
+// per-window tokenization, ~118 cache entries instead of 1, which put the
+// per-turn working set at ~76,000 entries against a 24,576-entry cap: ~0% hit
+// rate and ~6.7 s warm. The gate is now normalization invariance, which an
+// em-dash satisfies and a ligature does not.
 describe('offset slicing is gated on normalization invariance, not on ASCII', () => {
-  const ask = (text: string) => ({
-    agentGroupId: 'ag-a',
-    sessionId: 'sess-a',
-    kind: 'chat-sdk',
-    trigger: 1 as const,
-    normalizedContent: JSON.stringify({ text }),
-    includeBootstrap: false,
-  });
-  const marker = (n: number) =>
-    `<!-- nanoclaw-memory:id=mem_${String(n).padStart(16, '0')};evidence=ev-${n};captured=2026-08-01T00:00:00.000Z -->`;
+  const CHARS = PRE_TURN_BOUNDS.archiveExcerptChars;
 
-  it('an em-dash-bearing fact takes the fast path and still costs one tokenization', () => {
+  function tokenizationsFor(query: string, candidate: string): number {
+    const tokens = tokenizeForRecall(query);
+    _resetTokenStreamCacheForTest();
+    _bestPassageForTest(tokens, candidate, CHARS);
+    return _tokenStreamCacheStatsForTest().misses;
+  }
+
+  it('an em-dash-bearing candidate takes the fast path and still costs one tokenization', () => {
     // Same four-sentence shape as the per-candidate invariant above, with an
-    // em-dash, an arrow and an en-dash in every sentence. Per-window
-    // tokenization charges 9 misses per fact; the fast path charges 1.
-    const fact = (n: number) =>
-      `- Forecast pipeline volume ${n} doubled — last quarter. Region delta ${n} → held steady through the review. ` +
-      `Operator sign-off ${n} – recorded by the duty lead. Ledger checkpoint ${n} — confirmed the final figure. ` +
-      marker(n);
-    const ledger = (count: number) =>
-      `# Generated workgroup memory\n\n${Array.from({ length: count }, (_, i) => fact(i + 1)).join('\n')}\n`;
+    // em-dash, an arrow and an en-dash in every sentence.
+    const candidate =
+      'Forecast pipeline volume doubled — last quarter. Region delta → held steady through the review. ' +
+      'Operator sign-off – recorded by the duty lead. Ledger checkpoint — confirmed the final figure.';
 
-    memoryFile('generated/memory.md', ledger(20));
-    _resetTokenStreamCacheForTest();
-    const result = buildPreTurnContext(ask('forecast pipeline volume'));
-    expect(result.memoryEvidence.excerpts.some((row) => row.path === 'generated/memory.md')).toBe(true);
-    const small = _tokenStreamCacheStatsForTest().misses;
-
-    memoryFile('generated/memory.md', ledger(120));
-    _resetTokenStreamCacheForTest();
-    buildPreTurnContext(ask('forecast pipeline volume'));
-    const large = _tokenStreamCacheStatsForTest().misses;
-
-    expect(large - small).toBe(100);
+    expect(tokenizationsFor('forecast pipeline volume', candidate)).toBe(1);
   });
 
-  it('an em-dash-bearing fact delivers the same passage the fallback would', () => {
-    const fact =
-      '- Alpha Bravo Charlie shipped — on time. Delta Echo Foxtrot stalled → twice. Golf Hotel India resumed. ' +
-      marker(11);
-    memoryFile('generated/memory.md', `# Generated workgroup memory\n\n${fact}\n`);
+  it('an em-dash-bearing candidate delivers the same passage the fallback would', () => {
+    const candidate =
+      'Alpha Bravo Charlie shipped on time. Delta Echo Foxtrot stalled — twice → and resumed. Golf Hotel India resumed.';
 
-    const result = buildPreTurnContext(ask('Delta Echo Foxtrot'));
-    const excerpt = result.memoryEvidence.excerpts.find((row) => row.path === 'generated/memory.md');
-    expect(excerpt).toBeDefined();
-    // Byte-identical original: the em-dash and arrow survive, casing survives,
-    // and the window is the same sentence the ASCII-only gate selected.
-    expect(excerpt!.text).toContain('Delta Echo Foxtrot stalled → twice.');
-    expect(excerpt!.text).toContain('Alpha Bravo Charlie shipped — on time.');
-    expect(excerpt!.text).not.toContain('delta echo foxtrot');
+    const passage = _bestPassageForTest(tokenizeForRecall('Delta Echo Foxtrot'), candidate, CHARS);
+
+    // Byte-identical original: the em-dash and arrow survive inside the selected
+    // window, casing survives, and the window is the same sentence the
+    // ASCII-only gate selected before offsets could be sliced at all.
+    expect(passage!.text).toContain('Delta Echo Foxtrot stalled — twice → and resumed.');
+    expect(passage!.text).not.toContain('delta echo foxtrot');
   });
 
   it('a length-changing candidate still falls back and pays per window', () => {
-    // 'ﬁ' -> 'fi' grows, 'e' + U+0301 -> 'é' shrinks, so this line's offsets are
-    // not its own. It must keep charging 9 tokenizations per fact, not 1.
-    const fact = (n: number) =>
-      `- The ﬁle café pipeline ${n} runs nightly. Region delta ${n} held steady through the review. ` +
-      `Operator sign-off ${n} was recorded by the duty lead. Ledger checkpoint ${n} confirmed the final figure. ` +
-      marker(n);
-    const ledger = (count: number) =>
-      `# Generated workgroup memory\n\n${Array.from({ length: count }, (_, i) => fact(i + 1)).join('\n')}\n`;
+    // The ligature grows and the combining accent shrinks, so this candidate's
+    // offsets are not its own. It must keep charging 9 tokenizations, not 1.
+    const candidate =
+      'The \ufb01le cafe\u0301 pipeline runs nightly. Region delta held steady through the review. ' +
+      'Operator sign-off was recorded by the duty lead. Ledger checkpoint confirmed the final figure.';
 
-    memoryFile('generated/memory.md', ledger(20));
-    _resetTokenStreamCacheForTest();
-    buildPreTurnContext(ask('file cafe pipeline'));
-    const small = _tokenStreamCacheStatsForTest().misses;
-
-    memoryFile('generated/memory.md', ledger(120));
-    _resetTokenStreamCacheForTest();
-    buildPreTurnContext(ask('file cafe pipeline'));
-    const large = _tokenStreamCacheStatsForTest().misses;
-
-    // 4 spans => 9 windows per fact under the 1..3-sentence sweep.
-    expect(large - small).toBe(900);
+    // 4 spans => 9 windows per candidate under the 1..3-sentence sweep.
+    expect(tokenizationsFor('file cafe pipeline', candidate)).toBe(9);
   });
 
   it('a combining-accent candidate falls back and delivers the original bytes', () => {
-    // 'e' + U+0301 is a decomposed e-acute: NFKC composes it and the string
-    // shrinks. The precomposed U+00E9 in the same line is offset-stable, so
-    // this proves the gate rejects on the mark rather than on non-ASCII.
-    const fact = '- The café rota is precomposed café elsewhere. Retention window stays at ninety days. ' + marker(12);
-    memoryFile('generated/memory.md', `# Generated workgroup memory\n\n${fact}\n`);
+    // A decomposed e-acute: NFKC composes it and the string shrinks. The
+    // precomposed form in the same candidate is offset-stable, so this proves
+    // the gate rejects on the mark rather than on non-ASCII.
+    const candidate = 'The cafe\u0301 rota is precomposed caf\u00e9 elsewhere. Retention window stays at ninety days.';
 
-    const result = buildPreTurnContext(ask('cafe rota retention window'));
-    const excerpt = result.memoryEvidence.excerpts.find((row) => row.path === 'generated/memory.md');
-    expect(excerpt).toBeDefined();
+    const passage = _bestPassageForTest(tokenizeForRecall('cafe rota retention window'), candidate, CHARS);
+
     // Byte-identical: the decomposed sequence is still decomposed.
-    expect(excerpt!.text).toContain('café rota is precomposed café elsewhere.');
+    expect(passage!.text).toContain('cafe\u0301 rota is precomposed caf\u00e9 elsewhere.');
   });
 });
 
@@ -1675,11 +1386,9 @@ describe('offset slicing is gated on normalization invariance, not on ASCII', ()
 // claim came from an ad-hoc harness run against a copied tree. This is the
 // permanent replacement: one structured debug line per build.
 describe('per-build structured log line (recall latency instrumentation)', () => {
-  it('fires once per build with workgroup id, timing, candidate counts, cache stats and fast-path count', () => {
-    memoryFile(
-      'generated/memory.md',
-      '# Generated workgroup memory\n\n- Deploy pipeline runs nightly.\n- Deploy pipeline retries on failure.\n',
-    );
+  it('fires once per build with workgroup id, timing, cache stats and fast-path count', () => {
+    archive('deploy-nightly', 'ag-a', 'Deploy pipeline runs nightly.', '2026-07-20T00:00:00.000Z');
+    archive('deploy-retry', 'ag-a', 'Deploy pipeline retries on failure.', '2026-07-21T00:00:00.000Z');
 
     const debugSpy = vi.spyOn(log, 'debug').mockImplementation(() => {});
     buildPreTurnContext({
@@ -1697,9 +1406,6 @@ describe('per-build structured log line (recall latency instrumentation)', () =>
     expect(fields.workgroupId).toBe('wg-a');
     expect(typeof fields.elapsedMs).toBe('number');
     expect(fields.elapsedMs as number).toBeGreaterThanOrEqual(0);
-    // The two generated fact lines. index.md and the preferences lane are
-    // not ranked candidates, and no other Markdown is read at all.
-    expect(fields.factCandidates).toBe(2);
     expect(typeof fields.tokenCacheSize).toBe('number');
     expect(typeof fields.tokenCacheMax).toBe('number');
     expect(typeof fields.tokenCacheHits).toBe('number');
@@ -1739,73 +1445,4 @@ it('test_sanitizer_passes_expiresAt_through_to_trustedCapabilities', () => {
   } finally {
     CAPABILITY_FIXTURE.services = null;
   }
-});
-
-describe('NANOCLAW_MEMORY_FACT_RECALL_ENABLED gates fact injection, not just fact writing', () => {
-  const FACT_TEXT = 'Quarterly forecast pipeline volume reconciles against the ledger snapshot';
-  const ledger = () =>
-    memoryFile(
-      'generated/memory.md',
-      `# Generated workgroup memory\n\n- ${FACT_TEXT}. <!-- nanoclaw-memory:id=mem_${'1'.repeat(16)};evidence=ev-1;captured=2026-08-01T00:00:00.000Z -->\n`,
-    );
-
-  const recall = () =>
-    buildPreTurnContext({
-      agentGroupId: 'ag-a',
-      sessionId: 'sess-a',
-      kind: 'chat-sdk',
-      trigger: 1,
-      normalizedContent: JSON.stringify({ text: 'What is the quarterly forecast pipeline volume?' }),
-      includeBootstrap: false,
-    });
-
-  it('injects ledger facts when the curator is enabled', () => {
-    ledger();
-
-    const excerpts = recall().memoryEvidence.excerpts.filter((row) => row.path === 'generated/memory.md');
-
-    expect(excerpts.length).toBeGreaterThan(0);
-    expect(excerpts[0]?.text).toContain(FACT_TEXT);
-  });
-
-  it('injects no ledger facts when the curator is disabled', () => {
-    ledger();
-    process.env.NANOCLAW_MEMORY_FACT_RECALL_ENABLED = 'false';
-
-    expect(recall().memoryEvidence.excerpts.filter((row) => row.path === 'generated/memory.md')).toEqual([]);
-  });
-
-  it('never reads the disabled ledger at all, through any lane', () => {
-    // Replaces 'does not demote the disabled ledger into the ordinary markdown
-    // lane'. That test guarded against generated/memory.md leaking into the
-    // ranked file lane when the fact lane was gated off. There is no file lane
-    // any more — `readGeneratedFacts` is the ledger's only reader — so the
-    // demotion hazard is structurally gone and that assertion could not fail.
-    //
-    // What replaces it is stronger: the gate must sit BEFORE the lstat, so a
-    // disabled ledger is not merely unranked but never touched. Move the guard
-    // below the stat and this fails; delete it and both halves fail.
-    ledger();
-    process.env.NANOCLAW_MEMORY_FACT_RECALL_ENABLED = 'off';
-    const lstatSpy = vi.spyOn(fs, 'lstatSync');
-
-    try {
-      const excerpts = recall().memoryEvidence.excerpts;
-
-      expect(excerpts.every((row) => row.path !== 'generated/memory.md')).toBe(true);
-      expect(excerpts.every((row) => !row.text.includes(FACT_TEXT))).toBe(true);
-      expect(lstatSpy.mock.calls.some(([target]) => String(target).endsWith('generated/memory.md'))).toBe(false);
-    } finally {
-      lstatSpy.mockRestore();
-    }
-  });
-
-  it('leaves an absent or malformed flag behaving as a disabled curator', () => {
-    ledger();
-    process.env.NANOCLAW_MEMORY_FACT_RECALL_ENABLED = 'banana';
-    expect(recall().memoryEvidence.excerpts.filter((row) => row.path === 'generated/memory.md')).toEqual([]);
-
-    delete process.env.NANOCLAW_MEMORY_FACT_RECALL_ENABLED;
-    expect(recall().memoryEvidence.excerpts.filter((row) => row.path === 'generated/memory.md')).toEqual([]);
-  });
 });

@@ -65,29 +65,27 @@ tool rejects a missing or symlinked parent.
 `CLAUDE.local.md` and `instructions.prepend.md` are standing instruction
 surfaces, not memory write targets.
 
-## Topic files and the generated ledger
+## Topic files and the retired ledger
 
 `generated/memory.md` and the `people/`, `domain/` and `systems/` topic files
 were written by a background memory curator that has been REMOVED. Nothing
 writes them any more. They are kept, not deleted: on a live install they hold
 megabytes of accumulated facts and hundreds of topic files.
 
-The two are read very differently now.
+`generated/memory.md` is no longer read either. It had a recall lane of its
+own, gated on `NANOCLAW_MEMORY_FACT_RECALL_ENABLED` and disabled by default;
+with no writer left, that lane could only ever inject facts from a corpus
+frozen at the moment curation stopped, so the reader and the flag were removed
+with it. The file is inert history: nothing reads it, and with the reader gone
+the write-side reservation that held it for the curator went too, so it is now
+an ordinary memory file that `write_memory_file` will overwrite like any
+other.
 
-`generated/memory.md` is a flat list of self-contained one-line facts, each
-carrying an HTML provenance marker. It is the one memory file recall still
-ranks, one fact at a time rather than as a single document, and it is gated on
-`NANOCLAW_MEMORY_FACT_RECALL_ENABLED`. Off — the default, and what live installs
-set — means no fact injection at all. The variable keeps the curator's name
-because it is set in existing `.env` files; with the curator gone it is a
-recall switch, and the only thing that decides whether that accumulated ledger
-reaches a prompt.
-
-The topic files are not read automatically by anything. Recall touches only
-`index.md`, the sender-matched `preferences/<slug>.md` files, and the ledger
-above — an agent reaches a topic file by navigating from `index.md` or by
-grepping `/workspace/workgroup/memory` itself. They are ordinary OKF concept
-files; nothing about reading or hand-editing them is special:
+The topic files are not read automatically by anything either. Recall touches
+only `index.md` and the sender-matched `preferences/<slug>.md` files — an agent
+reaches a topic file by navigating from `index.md` or by grepping
+`/workspace/workgroup/memory` itself. They are ordinary OKF concept files;
+nothing about reading or hand-editing them is special:
 
 ```yaml
 ---
@@ -113,8 +111,8 @@ reachability, and detail belongs in the linked files.
 
 Agents use `write_memory_file` for explicit "remember this" requests,
 corrections, decisions, and other facts that should be durable immediately.
-That tool cannot write `generated/memory.md`. There is no automatic background
-capture: every durable fact is written by an agent in the foreground.
+There is no automatic background capture: every durable fact is written by an
+agent in the foreground, and no path is reserved from the tool.
 
 ## Automatic pre-turn context
 
@@ -139,29 +137,15 @@ Every pair then contains only the newly relevant evidence delta:
 
 1. the preference files of the conversation's involved senders, matched by name
    slug and injected whole — deterministic, never ranked;
-2. up to three generated-memory facts, in their own lane;
-3. up to three lexical archive excerpts, preferring the current thread;
-4. a separately bounded exact Slack/Discord permalink lane when the input
+2. up to three lexical archive excerpts, preferring the current thread;
+3. a separately bounded exact Slack/Discord permalink lane when the input
    contains a supported message link; and
-5. explicit degraded, conflict, truncation, already-delivered, or no-match
+4. explicit degraded, conflict, truncation, already-delivered, or no-match
    notices.
 
 The rest of the manual canon is not pushed. `index.md` is the map, and the
 agent reads or greps the tree from it — the host runs no per-turn walk of the
 memory directory and ranks no Markdown files.
-
-`generated/memory.md` is a flat list of self-contained one-line facts, so it is
-ranked one fact at a time rather than as a single document, and each selected
-fact is delivered whole. Scored as one document it could contribute at most one
-900-character passage per turn however much it held — against a live 328-fact
-store that was one fact, and a larger store could not have improved it. Its own
-excerpt lane keeps facts and preference files from crowding each other out.
-
-Ranking uses the fact text only; the provenance marker is excluded, because its
-tokens are about a fifth of a line and diluted the density term. The marker
-still reaches the agent, so `captured=` remains visible and an agent can tell
-how old a fact is. Capture time is a tiebreak between comparably relevant facts,
-never a filter: an older exact match still outranks a fresher weak one.
 
 `system/definition.md` is protocol guidance, not recalled evidence. Its
 behavioral contract belongs in standing lifecycle instructions and is not
