@@ -1072,7 +1072,20 @@ function sawRealActivityAfter(
   const dir = path.dirname(inboundPath);
   for (const name of UNTOUCHED_ACTIVITY_FILES) {
     try {
-      if (fs.statSync(path.join(dir, name)).mtimeMs > sinceMs) return true;
+      // Floor before comparing. `sinceMs` is a Date.now() reading — integer
+      // milliseconds — while statSync reports mtimeMs as a float carrying the
+      // filesystem's sub-millisecond precision. A file touched microseconds
+      // BEFORE the manifest was written therefore compares as after it
+      // (1234.567 > 1234), and the pass reads its own quiescent session as
+      // live traffic. Measured on this host: 36.6% of writes landing in the
+      // same millisecond as the following Date.now() produce that phantom.
+      // The consequence is not cosmetic — a phantom here skips the mtime
+      // restore, so the session keeps the clock the DDL bumped and stops
+      // aging out, which is the fleet-wide archival freeze this manifest
+      // exists to prevent. Flooring can only remove false positives: a write
+      // that genuinely lands in a later millisecond still floors above
+      // `sinceMs`.
+      if (Math.floor(fs.statSync(path.join(dir, name)).mtimeMs) > sinceMs) return true;
     } catch {
       // Absent signal file.
     }

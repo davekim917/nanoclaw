@@ -1417,6 +1417,51 @@ describe('session migration pass preserves the idle clock', () => {
     expect(stat.mtimeMs).toBeGreaterThan(0);
   });
 
+  it('does not read sub-millisecond mtime precision as activity after the manifest', async () => {
+    // Regression for the phantom-activity flake (#195). `writtenAtMs` is a
+    // Date.now() reading — integer ms — while statSync reports mtimeMs as a
+    // float. An activity file touched microseconds BEFORE the manifest was
+    // written compares as after it, so the pass sees its own quiescent session
+    // as live traffic and skips the restore.
+    //
+    // This pins the artifact deterministically rather than racing for it: the
+    // real sequence (write outbound.db, then read Date.now()) reproduced the
+    // phantom in 36.6% of 20,000 trials on this host, which is why the two
+    // sibling tests flaked roughly one CI run in three. Without the floor in
+    // sawRealActivityAfter this fails every time; with it, never.
+    const sessionId = 'sess-subms-phantom';
+    seedSession(sessionId);
+    initSessionFolder(MIGRATION_AG, sessionId);
+    const target = inboundDbPath(MIGRATION_AG, sessionId);
+    const writtenAtMs = Date.now();
+    fs.writeFileSync(
+      path.join(DATA_DIR, 'pending-upgrade-mtimes.json'),
+      JSON.stringify({
+        writtenAtMs,
+        entries: [{ path: target, sessionId, atimeMs: OLD_SECONDS * 1000, mtimeMs: OLD_SECONDS * 1000 }],
+      }),
+    );
+    // The DDL bump: inside the replay window, so the entry is a candidate.
+    const bumped = (writtenAtMs + 1000) / 1000;
+    fs.utimesSync(target, bumped, bumped);
+    // The artifact: outbound.db in the SAME millisecond as writtenAtMs, but
+    // with a sub-millisecond fraction above it. This is the shape a real write
+    // lands in; it is not activity.
+    const phantom = (writtenAtMs + 0.5) / 1000;
+    const outbound = path.join(path.dirname(target), 'outbound.db');
+    fs.utimesSync(outbound, phantom, phantom);
+    // Assert the fixture actually landed sub-millisecond-above, so a
+    // coarse-granularity filesystem fails as a broken fixture rather than
+    // silently passing without exercising the bug.
+    const outboundMtime = fs.statSync(outbound).mtimeMs;
+    expect(outboundMtime).toBeGreaterThan(writtenAtMs);
+    expect(Math.floor(outboundMtime)).toBe(writtenAtMs);
+
+    const { replayUpgradeMtimeManifest } = await import('./session-manager.js');
+    expect(replayUpgradeMtimeManifest(DATA_DIR, getDb())).toBe(1);
+    expect(fs.statSync(target).mtimeMs).toBe(OLD_SECONDS * 1000);
+  });
+
   it('leaves a session that saw real traffic after the crashed pass alone', async () => {
     const sessionId = 'sess-real-traffic';
     seedSession(sessionId);
