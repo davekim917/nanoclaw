@@ -1,0 +1,9 @@
+[Unit]
+Description=Daily NanoClaw fleet-drift check at 09:45 UTC
+
+[Timer]
+OnCalendar=*-*-* 09:45:00 UTC
+Persistent=true
+
+[Install]
+WantedBy=timers.target
