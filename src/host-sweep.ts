@@ -105,7 +105,6 @@ import { runReconcilerSweep } from './modules/orchestrator-dispatch/reconciler.j
 import { decideTaskAction, pendingTerminalSpawnOutboundSeenAt } from './modules/orchestrator-dispatch/watchdog.js';
 import { OomKillObserver } from './resource-oom-observer.js';
 import { pruneChannelIngressReceipts } from './db/channel-ingress-receipts.js';
-import { runMemoryCurationInBackground, stopMemoryCurationInBackground } from './modules/memory/curator-worker.js';
 import { reconcileMergedClaims } from './modules/claims/reconcile.js';
 import { sweepClaimsSelfHeal } from './modules/claims/self-heal.js';
 
@@ -1040,7 +1039,6 @@ export function startHostSweep(): void {
 
 export function stopHostSweep(): void {
   running = false;
-  stopMemoryCurationInBackground();
 }
 
 /**
@@ -1218,10 +1216,6 @@ async function sweepOnce(): Promise<void> {
   void import('./dashboard/session-title-sweep.js')
     .then((mod) => mod.runSessionTitleSweep())
     .catch((err) => log.warn('session-title sweep failed', { err }));
-
-  // Workgroup memory curation is durable, debounced, and never awaited by the
-  // sweep. The module enforces one active pump globally and fails closed.
-  void runMemoryCurationInBackground().catch((err) => log.warn('memory-curator: background pump failed', { err }));
 
   // Prune dashboard_tokens rows past expiry + 1d grace (post-build QA fix SF-6).
   void import('./dashboard/db/dashboard-tokens.js')

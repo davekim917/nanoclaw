@@ -39,31 +39,6 @@ interface CliResult {
       members: Array<{ id: string; compatibility: { status: string }; nativeViews: Array<{ status: string }> }>;
       sessions: Array<{ id: string; status: string; pairs: { applicableTriggers: number; complete: number } }>;
       migration: { status: string };
-      curator: {
-        generated: { status: string; activeMemoryIds: number };
-        queue: {
-          status: string;
-          pendingEpisodes: number;
-          dueEpisodes: number;
-          leasedEpisodes: number;
-          oldestDueAt: string | null;
-          maxAttemptCount: number;
-          lastErrorClass: string | null;
-          admission: {
-            hourlyCalls: number;
-            dailyCalls: number;
-            hourlyLimit: number;
-            dailyLimit: number;
-            saturated: boolean;
-          };
-          credentials: Array<{
-            slot: string;
-            unavailableUntil: string | null;
-            consecutiveFailures: number;
-            lastErrorClass: string | null;
-          }>;
-        };
-      };
       issues: Array<{ code: string; severity: string; detail?: string }>;
     }>;
     issues: Array<{ code: string; severity: string; detail?: string }>;
@@ -102,70 +77,6 @@ function centralDb(root: string): Database.Database {
     );
   `);
   return db;
-}
-
-function seedCuratorArchive(root: string, workgroupId = 'house'): void {
-  const db = new Database(path.join(root, 'data', 'archive.db'));
-  db.exec(`
-    CREATE TABLE memory_curation_episodes (
-      episode_key TEXT PRIMARY KEY,
-      workgroup_id TEXT NOT NULL,
-      messaging_group_id TEXT NOT NULL,
-      thread_id TEXT NOT NULL,
-      pending_rowid INTEGER NOT NULL,
-      handled_rowid INTEGER NOT NULL DEFAULT 0,
-      not_before TEXT NOT NULL,
-      lease_owner TEXT,
-      lease_expires_at TEXT,
-      attempt_count INTEGER NOT NULL DEFAULT 0,
-      last_error_class TEXT,
-      created_at TEXT NOT NULL,
-      updated_at TEXT NOT NULL
-    );
-    CREATE TABLE memory_curation_calls (
-      id TEXT PRIMARY KEY,
-      workgroup_id TEXT NOT NULL,
-      started_at TEXT NOT NULL,
-      credential_slot TEXT,
-      outcome TEXT
-    );
-    CREATE TABLE memory_curation_credentials (
-      credential_slot TEXT PRIMARY KEY,
-      unavailable_until TEXT,
-      consecutive_failures INTEGER NOT NULL DEFAULT 0,
-      last_error_class TEXT,
-      updated_at TEXT NOT NULL
-    );
-    CREATE TABLE memory_curation_state (
-      workgroup_id TEXT PRIMARY KEY,
-      accepted_updates_since_maintenance INTEGER NOT NULL DEFAULT 0,
-      maintenance_pending INTEGER NOT NULL DEFAULT 0,
-      not_before TEXT NOT NULL,
-      lease_owner TEXT,
-      lease_expires_at TEXT,
-      updated_at TEXT NOT NULL
-    );
-  `);
-  db.prepare(
-    `INSERT INTO memory_curation_episodes
-       (episode_key,workgroup_id,messaging_group_id,thread_id,pending_rowid,handled_rowid,
-        not_before,lease_owner,lease_expires_at,attempt_count,created_at,updated_at)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
-  ).run(
-    'episode-1',
-    workgroupId,
-    'mg-discord',
-    'discord:1:2:3',
-    4,
-    2,
-    '2026-07-26T00:00:00.000Z',
-    null,
-    null,
-    0,
-    '2026-07-26T00:00:00.000Z',
-    '2026-07-26T00:00:00.000Z',
-  );
-  db.close();
 }
 
 function writeInbound(
@@ -474,15 +385,6 @@ describe('verify-workgroup-memory-runtime', () => {
       id: 'house',
       status: 'clean',
       migration: { status: 'verified-applied' },
-      curator: {
-        generated: { status: 'missing', activeMemoryIds: 0 },
-        queue: {
-          status: 'not-initialized',
-          pendingEpisodes: 0,
-          dueEpisodes: 0,
-          leasedEpisodes: 0,
-        },
-      },
       sessions: [{ id: 'session-1', status: 'clean', pairs: { applicableTriggers: 1, complete: 1 } }],
     });
     expect(result.json.workgroups[0]!.members.every((member) => member.compatibility.status === 'verified')).toBe(true);
@@ -520,78 +422,11 @@ describe('verify-workgroup-memory-runtime', () => {
     );
   }, 15_000);
 
-  it('makes curator queue readiness an explicit activation gate without requiring a generated file', () => {
-    const root = mkRoot();
-    const db = centralDb(root);
-    seedAppliedWorkgroup(root, db);
-    db.close();
-
-    const blocked = run(root, ['--workgroup', 'house', '--json', '--require-curator-ready']);
-    expect(blocked.status).toBe(1);
-    expect(blocked.json.workgroups[0]!.issues).toContainEqual(
-      expect.objectContaining({ code: 'curator-queue-not-initialized', severity: 'failure' }),
-    );
-
-    seedCuratorArchive(root);
-    const ready = run(root, ['--workgroup', 'house', '--json', '--require-curator-ready']);
-    expect(ready.status).toBe(0);
-    expect(ready.json.workgroups[0]!.curator).toMatchObject({
-      generated: { status: 'missing', activeMemoryIds: 0 },
-      queue: {
-        status: 'verified',
-        pendingEpisodes: 1,
-        dueEpisodes: 1,
-        leasedEpisodes: 0,
-        oldestDueAt: '2026-07-26T00:00:00.000Z',
-        maxAttemptCount: 0,
-        lastErrorClass: null,
-        admission: {
-          hourlyCalls: 0,
-          dailyCalls: 0,
-          hourlyLimit: 120,
-          dailyLimit: 3000,
-          saturated: false,
-        },
-        credentials: [],
-      },
-    });
-
-    const archive = new Database(path.join(root, 'data', 'archive.db'));
-    const now = Date.now();
-    archive
-      .prepare(
-        `INSERT INTO memory_curation_calls
-         (id, workgroup_id, started_at, credential_slot, outcome)
-       VALUES (?, ?, ?, ?, ?)`,
-      )
-      .run('call-1', 'house', new Date(now - 1000).toISOString(), 'oauth:primary', 'quota');
-    archive
-      .prepare(
-        `INSERT INTO memory_curation_credentials
-         (credential_slot, unavailable_until, consecutive_failures, last_error_class, updated_at)
-       VALUES (?, ?, ?, ?, ?)`,
-      )
-      .run('oauth:primary', new Date(now + 60_000).toISOString(), 1, 'quota', new Date(now).toISOString());
-    archive.close();
-    const observable = run(root, ['--workgroup', 'house', '--json', '--require-curator-ready']);
-    expect(observable.json.workgroups[0]!.curator.queue).toMatchObject({
-      admission: { hourlyCalls: 1, dailyCalls: 1, saturated: false },
-      credentials: [
-        {
-          slot: 'oauth:primary',
-          consecutiveFailures: 1,
-          lastErrorClass: 'quota',
-        },
-      ],
-    });
-  }, 15_000);
-
   it('allows authorized post-cutover memory writes without weakening the explicit cutover gate', () => {
     const root = mkRoot();
     const db = centralDb(root);
     seedAppliedWorkgroup(root, db);
     db.close();
-    seedCuratorArchive(root);
 
     const canon = path.join(root, 'data', 'workgroups', 'house', 'memory');
     fs.appendFileSync(path.join(canon, 'index.md'), '\nAuthorized foreground memory.\n');
@@ -607,12 +442,11 @@ describe('verify-workgroup-memory-runtime', () => {
       ].join('\n'),
     );
 
-    const runtime = run(root, ['--workgroup', 'house', '--json', '--require-curator-ready']);
+    const runtime = run(root, ['--workgroup', 'house', '--json']);
     expect(runtime.status, runtime.stdout).toBe(0);
     expect(runtime.json.workgroups[0]).toMatchObject({
       status: 'clean',
       migration: { status: 'verified-applied' },
-      curator: { generated: { status: 'verified', activeMemoryIds: 1 } },
     });
     expect(runtime.json.workgroups[0]!.issues).not.toContainEqual(
       expect.objectContaining({ code: 'canonical-checksum-mismatch' }),
@@ -628,30 +462,6 @@ describe('verify-workgroup-memory-runtime', () => {
         expect.objectContaining({ code: 'canonical-checksum-mismatch', severity: 'failure' }),
         expect.objectContaining({ code: 'canonical-outcome-mismatch', severity: 'failure' }),
       ]),
-    );
-  }, 15_000);
-
-  it('fails closed on malformed or secret-bearing generated memory', () => {
-    const root = mkRoot();
-    const db = centralDb(root);
-    seedAppliedWorkgroup(root, db);
-    db.close();
-    const generatedDir = path.join(root, 'data', 'workgroups', 'house', 'memory', 'generated');
-    fs.mkdirSync(generatedDir, { recursive: true });
-    fs.writeFileSync(
-      path.join(generatedDir, 'memory.md'),
-      '# Generated workgroup memory\n\n- Temporary key sk_test_1234567890abcdefghijkl\n',
-    );
-
-    const result = run(root, ['--workgroup', 'house', '--json']);
-    expect(result.status).toBe(1);
-    expect(result.json.workgroups[0]!.curator.generated.status).toBe('invalid');
-    expect(result.json.workgroups[0]!.issues).toContainEqual(
-      expect.objectContaining({
-        code: 'curator-generated-memory-invalid',
-        severity: 'failure',
-        detail: expect.stringMatching(/secret material/),
-      }),
     );
   }, 15_000);
 

@@ -333,7 +333,7 @@ async function runClaudeCli(
  * entitlement and usage state associated with each OAuth token. The selected
  * slot is isolated as the child's only Anthropic credential, the untrusted
  * user payload travels over stdin, and safe mode removes project/user
- * customizations from the stateless curator call.
+ * customizations from the stateless call.
  */
 export async function callClaudeCliStructured<T>(
   request: ClaudeStructuredRequest,

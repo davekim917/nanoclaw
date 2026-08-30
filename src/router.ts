@@ -53,7 +53,7 @@ import {
   writeSessionMessageIfNew,
   writeOutboundDirect,
 } from './session-manager.js';
-import { archiveMessageAndScheduleMemoryCuration } from './message-archive.js';
+import { archiveMessage } from './message-archive.js';
 import { parseMessageFlags, formatFlagConfirmation, type FlagIntent } from './flag-parser.js';
 import { maybeRenameNewThread } from './topic-title.js';
 import { wakeContainer } from './container-runner.js';
@@ -1056,7 +1056,6 @@ function evaluateEngage(
  */
 function archiveInboundUserMessage(
   agent: MessagingGroupAgent,
-  agentGroup: AgentGroup,
   mg: MessagingGroup,
   event: InboundEvent,
   userId: string | null,
@@ -1066,23 +1065,20 @@ function archiveInboundUserMessage(
   if (event.message.kind !== 'chat' && event.message.kind !== 'chat-sdk') return false;
   if (!parsedContent.text) return false;
   try {
-    archiveMessageAndScheduleMemoryCuration(
-      {
-        id: messageIdForAgent(event.message.id, agent.agent_group_id),
-        agentGroupId: agent.agent_group_id,
-        messagingGroupId: mg.id,
-        channelType: event.channelType,
-        channelName: mg.name ?? null,
-        platformId: event.platformId,
-        threadId: effectiveThreadId,
-        role: 'user',
-        senderId: userId,
-        senderName: parsedContent.sender ?? null,
-        text: parsedContent.text,
-        sentAt: event.message.timestamp,
-      },
-      agentGroup.workgroup_id ?? agentGroup.folder,
-    );
+    archiveMessage({
+      id: messageIdForAgent(event.message.id, agent.agent_group_id),
+      agentGroupId: agent.agent_group_id,
+      messagingGroupId: mg.id,
+      channelType: event.channelType,
+      channelName: mg.name ?? null,
+      platformId: event.platformId,
+      threadId: effectiveThreadId,
+      role: 'user',
+      senderId: userId,
+      senderName: parsedContent.sender ?? null,
+      text: parsedContent.text,
+      sentAt: event.message.timestamp,
+    });
     return true;
   } catch (err) {
     log.warn('Failed to archive inbound user message', {
@@ -1176,8 +1172,8 @@ async function deliverToAgent(
   // *** The `archiveInboundUserMessage(...)` call below is the thing the skip
   // DEPENDS ON, not a side effect on the way out. *** Skipping writes no
   // session row, so the archive row is the message's only remaining copy: it
-  // is what `messages_archive` retrieval and memory curation read, and what
-  // the workgroup archive retains as conversation history.
+  // is what `messages_archive` retrieval reads, and what the workgroup
+  // archive retains as conversation history.
   // If the archive throws and we skip
   // anyway, the message ceases to exist — no row, no retry, no error anyone
   // sees. So it is evaluated LAST, and a `false` return falls through to
@@ -1209,7 +1205,7 @@ async function deliverToAgent(
     effectiveThreadId !== null &&
     typeof adapter?.fetchThreadHistory === 'function' &&
     findSessionForAgent(agent.agent_group_id, mg.id, effectiveThreadId) === undefined &&
-    archiveInboundUserMessage(agent, agentGroup, mg, event, userId, parsedContent, effectiveThreadId)
+    archiveInboundUserMessage(agent, mg, event, userId, parsedContent, effectiveThreadId)
   ) {
     log.debug('Skipped session creation for non-engaged thread message', {
       agentGroupId: agent.agent_group_id,
@@ -1426,7 +1422,7 @@ async function deliverToAgent(
     return;
   }
 
-  archiveInboundUserMessage(agent, agentGroup, mg, event, userId, parsedContent, effectiveThreadId);
+  archiveInboundUserMessage(agent, mg, event, userId, parsedContent, effectiveThreadId);
 
   // The message is durable and this wiring engaged — record the fact. Stamped
   // AFTER the backfill read above, which needs the pre-wake state, and after

@@ -6,14 +6,7 @@ import { pathToFileURL } from 'url';
 import Database from 'better-sqlite3';
 
 import { DATA_DIR, GROUPS_DIR } from '../src/config.js';
-import { MEMORY_CURATION_DAILY_LIMIT, MEMORY_CURATION_HOURLY_LIMIT } from '../src/message-archive.js';
-import {
-  GENERATED_MEMORY_MAX_BYTES,
-  GENERATED_MEMORY_RELATIVE_PATH,
-  validateGeneratedMemoryDocument,
-} from '../src/modules/memory/curator-contract.js';
 import { isAdmissiblePreTurnTrigger } from '../src/session-manager.js';
-import { scrubSecrets } from '../src/secret-scrubber.js';
 import {
   memoryTreeSha256,
   workgroupMemoryDir,
@@ -90,36 +83,6 @@ export interface RuntimeWorkgroupVerification {
     reportPath: string | null;
     snapshotDir: string | null;
   };
-  curator: {
-    generated: {
-      path: string;
-      status: 'verified' | 'missing' | 'invalid';
-      sha256: string | null;
-      activeMemoryIds: number;
-    };
-    queue: {
-      status: 'verified' | 'not-initialized' | 'invalid';
-      pendingEpisodes: number;
-      dueEpisodes: number;
-      leasedEpisodes: number;
-      oldestDueAt: string | null;
-      maxAttemptCount: number;
-      lastErrorClass: string | null;
-      admission: {
-        hourlyCalls: number;
-        dailyCalls: number;
-        hourlyLimit: number;
-        dailyLimit: number;
-        saturated: boolean;
-      };
-      credentials: Array<{
-        slot: string;
-        unavailableUntil: string | null;
-        consecutiveFailures: number;
-        lastErrorClass: string | null;
-      }>;
-    };
-  };
   members: RuntimeMemberVerification[];
   sessions: RuntimeSessionVerification[];
   issues: VerificationIssue[];
@@ -145,7 +108,6 @@ export interface RuntimeVerificationReport {
 export interface RuntimeVerifierOptions {
   workgroupId?: string;
   requireAppliedMigration?: boolean;
-  requireCuratorReady?: boolean;
 }
 
 interface CentralMember {
@@ -295,9 +257,6 @@ function statusFor(issues: VerificationIssue[]): VerificationStatus {
   if (issues.some((issue) => issue.severity === 'warning')) return 'degraded';
   return 'clean';
 }
-
-/** Retry count past which a pending episode is treated as stuck rather than in-flight. */
-const STUCK_EPISODE_ATTEMPTS = 3;
 
 function failure(issues: VerificationIssue[], code: string, subject?: string, detail?: string): void {
   issues.push({ code, severity: 'failure', ...(subject ? { subject } : {}), ...(detail ? { detail } : {}) });
@@ -1092,231 +1051,11 @@ function verifySession(
   }
 }
 
-function verifyCurator(
-  workgroupId: string,
-  canonicalPath: string,
-  dataDir: string,
-  requireReady: boolean,
-  issues: VerificationIssue[],
-): RuntimeWorkgroupVerification['curator'] {
-  const generatedPath = canonicalPath ? path.join(canonicalPath, GENERATED_MEMORY_RELATIVE_PATH) : '';
-  let generated: RuntimeWorkgroupVerification['curator']['generated'] = {
-    path: generatedPath,
-    status: 'missing',
-    sha256: null,
-    activeMemoryIds: 0,
-  };
-  const generatedStat = generatedPath ? lstatOrNull(generatedPath) : null;
-  if (generatedStat) {
-    try {
-      if (
-        generatedStat.isSymbolicLink() ||
-        !generatedStat.isFile() ||
-        generatedStat.size > GENERATED_MEMORY_MAX_BYTES ||
-        !trustedExistingPath(canonicalPath, generatedPath)
-      ) {
-        throw new Error('generated memory is not a trusted bounded regular file');
-      }
-      const fd = fs.openSync(generatedPath, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
-      let content: string;
-      try {
-        const opened = fs.fstatSync(fd);
-        const resolved = fs.realpathSync(generatedPath);
-        const resolvedStat = fs.statSync(resolved);
-        if (!opened.isFile() || opened.dev !== resolvedStat.dev || opened.ino !== resolvedStat.ino) {
-          throw new Error('generated memory changed while it was opened');
-        }
-        content = fs.readFileSync(fd, 'utf8');
-      } finally {
-        fs.closeSync(fd);
-      }
-      if (!content.startsWith('# Generated workgroup memory\n')) {
-        throw new Error('generated memory has no canonical heading');
-      }
-      if (scrubSecrets(content) !== content) throw new Error('generated memory contains secret material');
-      const facts = validateGeneratedMemoryDocument(content);
-      if (facts.length === 0 || new Set(facts.map((fact) => fact.id)).size !== facts.length) {
-        throw new Error('generated memory has missing or duplicate fact markers');
-      }
-      generated = {
-        path: generatedPath,
-        status: 'verified',
-        sha256: hash(content),
-        activeMemoryIds: facts.length,
-      };
-    } catch (error) {
-      if (!(error instanceof Error)) throw error;
-      generated = { ...generated, status: 'invalid' };
-      failure(issues, 'curator-generated-memory-invalid', workgroupId, error.message);
-    }
-  }
-
-  const queue: RuntimeWorkgroupVerification['curator']['queue'] = {
-    status: 'not-initialized',
-    pendingEpisodes: 0,
-    dueEpisodes: 0,
-    leasedEpisodes: 0,
-    oldestDueAt: null,
-    maxAttemptCount: 0,
-    lastErrorClass: null,
-    admission: {
-      hourlyCalls: 0,
-      dailyCalls: 0,
-      hourlyLimit: MEMORY_CURATION_HOURLY_LIMIT,
-      dailyLimit: MEMORY_CURATION_DAILY_LIMIT,
-      saturated: false,
-    },
-    credentials: [],
-  };
-  const archivePath = path.join(dataDir, 'archive.db');
-  if (lstatOrNull(archivePath)) {
-    let db: Database.Database | null = null;
-    try {
-      db = new Database(archivePath, { readonly: true, fileMustExist: true });
-      const required = new Set([
-        'memory_curation_episodes',
-        'memory_curation_calls',
-        'memory_curation_credentials',
-        'memory_curation_state',
-      ]);
-      const present = new Set(
-        (
-          db
-            .prepare(
-              `SELECT name FROM sqlite_master
-                WHERE type = 'table'
-                  AND name IN (
-                    'memory_curation_episodes',
-                    'memory_curation_calls',
-                    'memory_curation_credentials',
-                    'memory_curation_state'
-                  )`,
-            )
-            .all() as Array<{ name: string }>
-        ).map((row) => row.name),
-      );
-      if (present.size === 0) {
-        // An archive created by an older host is valid but not activation-ready.
-      } else if ([...required].some((name) => !present.has(name))) {
-        throw new Error('memory curator archive schema is only partially initialized');
-      } else {
-        const invalid = db
-          .prepare(
-            `SELECT COUNT(*) AS count
-               FROM memory_curation_episodes
-              WHERE pending_rowid < handled_rowid
-                 OR attempt_count < 0
-                 OR workgroup_id = ''`,
-          )
-          .get() as { count: number };
-        if (invalid.count > 0) throw new Error('memory curator queue contains invalid cursor state');
-        const now = new Date().toISOString();
-        const counts = db
-          .prepare(
-            `SELECT
-               SUM(CASE WHEN pending_rowid > handled_rowid THEN 1 ELSE 0 END) AS pending,
-               SUM(CASE WHEN pending_rowid > handled_rowid AND not_before <= ? THEN 1 ELSE 0 END) AS due,
-               SUM(CASE WHEN lease_owner IS NOT NULL THEN 1 ELSE 0 END) AS leased,
-               MIN(CASE WHEN pending_rowid > handled_rowid AND not_before <= ? THEN not_before END) AS oldest_due,
-               MAX(CASE WHEN pending_rowid > handled_rowid THEN attempt_count ELSE 0 END) AS max_attempts
-             FROM memory_curation_episodes
-             WHERE workgroup_id = ?`,
-          )
-          .get(now, now, workgroupId) as {
-          pending: number | null;
-          due: number | null;
-          leased: number | null;
-          oldest_due: string | null;
-          max_attempts: number | null;
-        };
-        const latestError = db
-          .prepare(
-            `SELECT last_error_class
-               FROM memory_curation_episodes
-              WHERE workgroup_id = ?
-                AND pending_rowid > handled_rowid
-                AND last_error_class IS NOT NULL
-              ORDER BY updated_at DESC
-              LIMIT 1`,
-          )
-          .get(workgroupId) as { last_error_class: string } | undefined;
-        const nowMs = Date.now();
-        const hourStart = new Date(nowMs - 60 * 60_000).toISOString();
-        const current = new Date(nowMs);
-        const dayStart = new Date(
-          Date.UTC(current.getUTCFullYear(), current.getUTCMonth(), current.getUTCDate()),
-        ).toISOString();
-        const admission = db
-          .prepare(
-            `SELECT
-               SUM(CASE WHEN started_at >= ? THEN 1 ELSE 0 END) AS hourly,
-               SUM(CASE WHEN started_at >= ? THEN 1 ELSE 0 END) AS daily
-             FROM memory_curation_calls`,
-          )
-          .get(hourStart, dayStart) as { hourly: number | null; daily: number | null };
-        const credentials = db
-          .prepare(
-            `SELECT credential_slot, unavailable_until, consecutive_failures, last_error_class
-               FROM memory_curation_credentials
-              ORDER BY credential_slot`,
-          )
-          .all() as Array<{
-          credential_slot: string;
-          unavailable_until: string | null;
-          consecutive_failures: number;
-          last_error_class: string | null;
-        }>;
-        queue.status = 'verified';
-        queue.pendingEpisodes = counts.pending ?? 0;
-        queue.dueEpisodes = counts.due ?? 0;
-        queue.leasedEpisodes = counts.leased ?? 0;
-        queue.oldestDueAt = counts.oldest_due;
-        queue.maxAttemptCount = counts.max_attempts ?? 0;
-        queue.lastErrorClass = latestError?.last_error_class ?? null;
-        queue.admission.hourlyCalls = admission.hourly ?? 0;
-        queue.admission.dailyCalls = admission.daily ?? 0;
-        queue.admission.saturated =
-          queue.admission.hourlyCalls >= queue.admission.hourlyLimit ||
-          queue.admission.dailyCalls >= queue.admission.dailyLimit;
-        queue.credentials = credentials.map((credential) => ({
-          slot: credential.credential_slot,
-          unavailableUntil: credential.unavailable_until,
-          consecutiveFailures: credential.consecutive_failures,
-          lastErrorClass: credential.last_error_class,
-        }));
-        // A queue that retries forever looks identical to a healthy idle one in
-        // the raw counts, and reporting only those counts is how a workgroup sat
-        // at 24 stuck episodes and 202 wasted attempts while this said "clean".
-        // Non-blocking: the work is retained, not lost, but it needs an operator.
-        if (queue.pendingEpisodes > 0 && queue.maxAttemptCount >= STUCK_EPISODE_ATTEMPTS) {
-          warning(
-            issues,
-            'curator-episodes-stuck',
-            workgroupId,
-            `${queue.pendingEpisodes} pending episode(s), up to ${queue.maxAttemptCount} attempts, last error class ${queue.lastErrorClass ?? 'unknown'}`,
-          );
-        }
-      }
-    } catch (error) {
-      if (!(error instanceof Error)) throw error;
-      queue.status = 'invalid';
-      failure(issues, 'curator-queue-invalid', workgroupId, error.message);
-    } finally {
-      db?.close();
-    }
-  }
-  if (requireReady && queue.status === 'not-initialized') {
-    failure(issues, 'curator-queue-not-initialized', workgroupId);
-  }
-  return { generated, queue };
-}
-
 function verifyWorkgroup(
   db: Database.Database,
   workgroupId: string,
   roots: { dbPath: string; dataDir: string; groupsDir: string },
   requireAppliedMigration: boolean,
-  requireCuratorReady: boolean,
 ): RuntimeWorkgroupVerification {
   const issues: VerificationIssue[] = [];
   let canonicalPath = '';
@@ -1354,7 +1093,6 @@ function verifyWorkgroup(
   if (requireAppliedMigration && migrationWithActivation.status !== 'verified-applied') {
     failure(issues, 'applied-migration-required', workgroupId);
   }
-  const curator = verifyCurator(workgroupId, canonicalPath, roots.dataDir, requireCuratorReady, issues);
   const members = db
     .prepare(
       `SELECT id,folder,agent_provider
@@ -1397,7 +1135,6 @@ function verifyWorkgroup(
       reportPath: migrationWithActivation.reportPath,
       snapshotDir: migrationWithActivation.snapshotDir,
     },
-    curator,
     members: memberReports,
     sessions: sessionReports,
     issues,
@@ -1452,13 +1189,7 @@ export function verifyWorkgroupMemoryRuntime(options: RuntimeVerifierOptions = {
     }
     const selectedIds = options.workgroupId ? [options.workgroupId] : allIds;
     const workgroups = selectedIds.map((id) =>
-      verifyWorkgroup(
-        db,
-        id,
-        { dbPath, dataDir, groupsDir },
-        options.requireAppliedMigration === true,
-        options.requireCuratorReady === true,
-      ),
+      verifyWorkgroup(db, id, { dbPath, dataDir, groupsDir }, options.requireAppliedMigration === true),
     );
     const allIssues = [...issues, ...workgroups.flatMap((workgroup) => workgroup.issues)];
     const failures = allIssues.filter((issue) => issue.severity === 'failure').length;
@@ -1493,7 +1224,6 @@ function parseCli(argv: string[]): RuntimeVerifierOptions {
   let workgroupId: string | undefined;
   let json = false;
   let requireAppliedMigration = false;
-  let requireCuratorReady = false;
   for (let index = 0; index < argv.length; index++) {
     const arg = argv[index];
     if (arg === '--all') {
@@ -1505,8 +1235,6 @@ function parseCli(argv: string[]): RuntimeVerifierOptions {
       json = true;
     } else if (arg === '--require-applied-migration') {
       requireAppliedMigration = true;
-    } else if (arg === '--require-curator-ready') {
-      requireCuratorReady = true;
     } else {
       throw new Error('unknown argument');
     }
@@ -1517,7 +1245,6 @@ function parseCli(argv: string[]): RuntimeVerifierOptions {
   return {
     ...(workgroupId ? { workgroupId } : {}),
     ...(requireAppliedMigration ? { requireAppliedMigration: true } : {}),
-    ...(requireCuratorReady ? { requireCuratorReady: true } : {}),
   };
 }
 

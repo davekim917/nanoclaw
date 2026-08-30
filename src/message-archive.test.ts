@@ -13,24 +13,10 @@ vi.mock('./config.js', async (importOriginal) => ({
 }));
 
 import {
-  archiveMessageAndScheduleMemoryCuration,
-  claimMemoryCurationEpisode,
-  claimMemoryMaintenance,
-  MEMORY_MAINTENANCE_SIZE_THRESHOLD,
-  completeMemoryMaintenance,
-  completeMemoryCurationEpisode,
-  failMemoryMaintenance,
-  failMemoryCurationEpisode,
-  markMemoryCurationCredentialAvailable,
-  markMemoryCurationCredentialUnavailable,
-  memoryCurationAdmission,
+  archiveMessage,
   parseArchivePermalinks,
   queryArchiveExactLinks,
-  readMemoryCurationEpisodeMessages,
   recentConversationSenderNames,
-  recordAcceptedGeneratedMemory,
-  recordMemoryCurationCall,
-  selectMemoryCurationCredential,
   sanitizeArchiveFtsQuery,
   searchArchiveEvidence,
   upsertArchiveMessage,
@@ -286,331 +272,45 @@ describe('archive evidence candidate ordering', () => {
   });
 });
 
-describe('memory curation episode queue', () => {
-  function scheduledMessage(id: string, role: 'user' | 'assistant', sentAt: string) {
-    return {
-      id,
-      agentGroupId: 'ag-a',
-      messagingGroupId: 'mg-a',
-      channelType: 'discord',
-      channelName: 'ops',
-      platformId: 'discord:g:c',
-      threadId: 'discord:g:c:t',
-      role,
-      senderId: role === 'user' ? 'discord:u' : 'ag-a',
-      senderName: role === 'user' ? 'Operator' : 'assistant',
-      text: `${role} durable text ${id}`,
-      sentAt,
-    } as const;
-  }
-
-  it('archives and schedules atomically, then exposes only trusted workgroup members', () => {
-    const start = Date.parse('2026-07-26T00:00:00.000Z');
-    expect(
-      archiveMessageAndScheduleMemoryCuration(scheduledMessage('u-1', 'user', '2026-07-26T00:00:00.000Z'), 'wg-a', {
-        nowMs: start,
-        debounceMs: 1000,
-      }),
-    ).toBe(true);
-    expect(claimMemoryCurationEpisode('worker', { nowMs: start + 999 })).toBeNull();
-    const episode = claimMemoryCurationEpisode('worker', { nowMs: start + 1000 });
-    expect(episode).not.toBeNull();
-    expect(readMemoryCurationEpisodeMessages(episode!, ['ag-foreign'])).toEqual([]);
-    expect(readMemoryCurationEpisodeMessages(episode!, ['ag-a']).map((row) => row.id)).toEqual(['u-1']);
+describe('archiveMessage', () => {
+  const message = (id: string, text: string) => ({
+    id,
+    agentGroupId: 'ag-a',
+    messagingGroupId: 'mg-a',
+    channelType: 'discord',
+    channelName: 'ops',
+    platformId: 'discord:g:c',
+    threadId: 'discord:g:c:t',
+    role: 'user' as const,
+    senderId: 'discord:u',
+    senderName: 'Operator',
+    text,
+    sentAt: '2026-07-26T00:00:00.000Z',
   });
 
-  it('keeps arrivals during a lease pending after the claimed cursor completes', () => {
-    const start = Date.parse('2026-07-26T00:00:00.000Z');
-    archiveMessageAndScheduleMemoryCuration(scheduledMessage('u-1', 'user', new Date(start).toISOString()), 'wg-a', {
-      nowMs: start,
-      debounceMs: 0,
-    });
-    const first = claimMemoryCurationEpisode('worker-1', { nowMs: start })!;
-    archiveMessageAndScheduleMemoryCuration(
-      scheduledMessage('a-2', 'assistant', new Date(start + 1000).toISOString()),
-      'wg-a',
-      { nowMs: start + 1000, debounceMs: 1000 },
-    );
-    expect(completeMemoryCurationEpisode(first, { nowMs: start + 1100 })).toBe(true);
-    expect(claimMemoryCurationEpisode('worker-2', { nowMs: start + 1999 })).toBeNull();
-    const second = claimMemoryCurationEpisode('worker-2', { nowMs: start + 2000 })!;
-    expect(readMemoryCurationEpisodeMessages(second, ['ag-a']).map((row) => row.id)).toEqual(['a-2']);
+  const found = (query: string) =>
+    searchArchiveEvidence({
+      memberAgentGroupIds: ['ag-a'],
+      query,
+      currentMessagingGroupId: 'mg-a',
+      currentThreadId: 'discord:g:c:t',
+      currentNormalizedContent: '',
+      candidateLimit: 20,
+    }).map((row) => row.id);
+
+  it('writes the row and reports it', () => {
+    expect(archiveMessage(message('a-1', 'durable archive text'))).toBe(true);
+    expect(found('durable archive')).toEqual(['a-1']);
   });
 
-  it('reclaims expired leases and retries failures without advancing handled state', () => {
-    const start = Date.parse('2026-07-26T00:00:00.000Z');
-    archiveMessageAndScheduleMemoryCuration(scheduledMessage('u-1', 'user', new Date(start).toISOString()), 'wg-a', {
-      nowMs: start,
-      debounceMs: 0,
-    });
-    const abandoned = claimMemoryCurationEpisode('dead-worker', { nowMs: start, leaseMs: 1000 })!;
-    expect(claimMemoryCurationEpisode('early-worker', { nowMs: start + 999 })).toBeNull();
-    const reclaimed = claimMemoryCurationEpisode('new-worker', { nowMs: start + 1000 })!;
-    expect(reclaimed.claimedThroughRowid).toBe(abandoned.claimedThroughRowid);
-    expect(failMemoryCurationEpisode(reclaimed, 'quota', { nowMs: start + 1000 })).toBe(true);
-    expect(claimMemoryCurationEpisode('retry-too-early', { nowMs: start + 5 * 60_000 })).toBeNull();
-    const retry = claimMemoryCurationEpisode('retry', { nowMs: start + 5 * 60_000 + 1000 })!;
-    expect(readMemoryCurationEpisodeMessages(retry, ['ag-a']).map((row) => row.id)).toEqual(['u-1']);
+  it('reports false for empty text instead of writing', () => {
+    expect(archiveMessage(message('a-2', ''))).toBe(false);
+    expect(found('durable archive')).toEqual([]);
   });
 
-  it('reclaims the exact unprocessed archive slice in a fresh host process', () => {
-    const restartRoot = `/tmp/nanoclaw-memory-curator-restart-${process.pid}`;
-    fs.rmSync(restartRoot, { recursive: true, force: true });
-    fs.mkdirSync(restartRoot, { recursive: true });
-    const moduleUrl = pathToFileURL(path.resolve('src/message-archive.ts')).href;
-    // A literal join, not Node's ancestor-walk resolution — silently missing
-    // in a worktree without its own install. Same fallback as run-migrations.ts's resolveTsx().
-    const localTsx = path.resolve('node_modules/.bin/tsx');
-    const tsx = fs.existsSync(localTsx)
-      ? localTsx
-      : (() => {
-          try {
-            return execSync('which tsx', { encoding: 'utf8' }).trim();
-          } catch {
-            return 'npx';
-          }
-        })();
-    // npx (last-resort fallback) needs the package name as its first arg; a
-    // direct tsx binary does not.
-    const tsxArgs = (args: string[]) => (tsx.endsWith('npx') ? ['tsx', ...args] : args);
-    const start = Date.parse('2026-07-26T00:00:00.000Z');
-    const first = spawnSync(
-      tsx,
-      tsxArgs([
-        '-e',
-        `import {
-          archiveMessageAndScheduleMemoryCuration,
-          claimMemoryCurationEpisode,
-          failMemoryCurationEpisode
-        } from ${JSON.stringify(moduleUrl)};
-        const start = ${start};
-        archiveMessageAndScheduleMemoryCuration({
-          id: 'restart-message',
-          agentGroupId: 'ag-a',
-          messagingGroupId: 'mg-a',
-          channelType: 'discord',
-          channelName: 'ops',
-          platformId: 'discord:g:c',
-          threadId: 'thread-a',
-          role: 'user',
-          senderId: 'discord:u',
-          senderName: 'Operator',
-          text: 'This input must survive both OAuth keys being unavailable.',
-          sentAt: new Date(start).toISOString()
-        }, 'wg-a', { nowMs: start, debounceMs: 0 });
-        const episode = claimMemoryCurationEpisode('first-host', { nowMs: start });
-        if (!episode || !failMemoryCurationEpisode(episode, 'quota', { nowMs: start })) process.exit(2);
-        console.log(JSON.stringify({ claimedThroughRowid: episode.claimedThroughRowid }));`,
-      ]),
-      { cwd: restartRoot, encoding: 'utf8' },
-    );
-    expect(first.status, first.stderr).toBe(0);
-    const firstClaim = JSON.parse(first.stdout) as { claimedThroughRowid: number };
-
-    const second = spawnSync(
-      tsx,
-      tsxArgs([
-        '-e',
-        `import {
-          claimMemoryCurationEpisode,
-          readMemoryCurationEpisodeMessages
-        } from ${JSON.stringify(moduleUrl)};
-        const episode = claimMemoryCurationEpisode('restarted-host', { nowMs: ${start + 5 * 60_000 + 1} });
-        if (!episode) process.exit(3);
-        const messages = readMemoryCurationEpisodeMessages(episode, ['ag-a']);
-        console.log(JSON.stringify({
-          claimedThroughRowid: episode.claimedThroughRowid,
-          handledRowid: episode.handledRowid,
-          ids: messages.map((message) => message.id)
-        }));`,
-      ]),
-      { cwd: restartRoot, encoding: 'utf8' },
-    );
-    expect(second.status, second.stderr).toBe(0);
-    expect(JSON.parse(second.stdout)).toEqual({
-      claimedThroughRowid: firstClaim.claimedThroughRowid,
-      handledRowid: 0,
-      ids: ['restart-message'],
-    });
-    fs.rmSync(restartRoot, { recursive: true, force: true });
-  });
-
-  it('enforces rolling-hour and UTC-day call admission without deleting work', () => {
-    const now = Date.parse('2026-07-26T12:00:00.000Z');
-    expect(memoryCurationAdmission({ nowMs: now, hourlyLimit: 2, dailyLimit: 3 }).allowed).toBe(true);
-    expect(recordMemoryCurationCall('call-1', 'wg-a', { nowMs: now - 1000 })).toBe(true);
-    expect(recordMemoryCurationCall('call-2', 'wg-a', { nowMs: now })).toBe(true);
-    expect(memoryCurationAdmission({ nowMs: now, hourlyLimit: 2, dailyLimit: 3 })).toMatchObject({
-      allowed: false,
-      hourly: 2,
-      daily: 2,
-    });
-    expect(recordMemoryCurationCall('call-2', 'wg-a', { nowMs: now })).toBe(false);
-  });
-
-  it('prunes call-accounting rows only after they are older than the admission windows', () => {
-    const now = Date.parse('2026-07-26T12:00:00.000Z');
-    expect(recordMemoryCurationCall('expired-call', 'wg-a', { nowMs: now - 3 * 24 * 60 * 60_000 })).toBe(true);
-    expect(memoryCurationAdmission({ nowMs: now, hourlyLimit: 2, dailyLimit: 3 })).toMatchObject({
-      allowed: true,
-      hourly: 0,
-      daily: 0,
-    });
-    expect(recordMemoryCurationCall('expired-call', 'wg-a', { nowMs: now })).toBe(true);
-  });
-
-  it('round-robins credential slots durably and skips a cooling-down slot', () => {
-    const now = Date.parse('2026-07-26T12:00:00.000Z');
-    const slots = ['oauth:primary', 'oauth:2'];
-    expect(selectMemoryCurationCredential(slots, { nowMs: now }).slot).toBe('oauth:primary');
-    expect(
-      recordMemoryCurationCall('call-primary', 'wg-a', {
-        nowMs: now,
-        credentialSlot: 'oauth:primary',
-      }),
-    ).toBe(true);
-    expect(selectMemoryCurationCredential(slots, { nowMs: now }).slot).toBe('oauth:2');
-    expect(
-      recordMemoryCurationCall('call-secondary', 'wg-a', {
-        nowMs: now + 1,
-        credentialSlot: 'oauth:2',
-      }),
-    ).toBe(true);
-    expect(selectMemoryCurationCredential(slots, { nowMs: now + 1 }).slot).toBe('oauth:primary');
-
-    const unavailableUntil = markMemoryCurationCredentialUnavailable('oauth:primary', 'quota', {
-      nowMs: now + 2,
-      retryAfterMs: 60_000,
-    });
-    expect(selectMemoryCurationCredential(slots, { nowMs: now + 30_000 })).toMatchObject({
-      slot: 'oauth:2',
-      unavailableSlots: ['oauth:primary'],
-    });
-    expect(selectMemoryCurationCredential(slots, { nowMs: Date.parse(unavailableUntil) }).slot).toBe('oauth:primary');
-    markMemoryCurationCredentialAvailable('oauth:primary', { nowMs: now + 60_001 });
-    expect(selectMemoryCurationCredential(slots, { nowMs: now + 60_001 }).unavailableSlots).toEqual([]);
-  });
-
-  it('reports the earliest durable retry without claiming work when every credential is unavailable', () => {
-    const now = Date.parse('2026-07-26T12:00:00.000Z');
-    const primaryUntil = markMemoryCurationCredentialUnavailable('oauth:primary', 'quota', {
-      nowMs: now,
-      retryAfterMs: 120_000,
-    });
-    markMemoryCurationCredentialUnavailable('oauth:2', 'quota', {
-      nowMs: now,
-      retryAfterMs: 300_000,
-    });
-    expect(selectMemoryCurationCredential(['oauth:primary', 'oauth:2'], { nowMs: now })).toEqual({
-      slot: null,
-      retryAt: primaryUntil,
-      unavailableSlots: ['oauth:primary', 'oauth:2'],
-    });
-  });
-
-  it('durably leases threshold-triggered maintenance and retries without clearing it', () => {
-    const now = Date.parse('2026-07-26T12:00:00.000Z');
-    recordAcceptedGeneratedMemory('wg-a', MEMORY_MAINTENANCE_SIZE_THRESHOLD + 1024, { nowMs: now });
-    const first = claimMemoryMaintenance('maintenance-1', { nowMs: now });
-    expect(first).toMatchObject({ workgroupId: 'wg-a', acceptedUpdates: 1 });
-    expect(failMemoryMaintenance(first!, { nowMs: now, retryMs: 1000 })).toBe(true);
-    expect(claimMemoryMaintenance('too-early', { nowMs: now + 999 })).toBeNull();
-    const retry = claimMemoryMaintenance('maintenance-2', { nowMs: now + 1000 });
-    expect(retry).not.toBeNull();
-    expect(completeMemoryMaintenance(retry!, { nowMs: now + 1000 })).toBe(true);
-    expect(claimMemoryMaintenance('done', { nowMs: now + 2000 })).toBeNull();
-  });
-
-  // Bug: recordAcceptedGeneratedMemory's ON CONFLICT branch unconditionally set
-  // not_before = excluded.not_before (= now of the accepted write), wiping out
-  // any future not_before a prior failMemoryMaintenance had set. That let a
-  // permanently-failing maintenance pass get retried on every subsequent
-  // accepted episode write instead of waiting out the 6h backoff.
-  it('an accepted generated-memory write does not pull a future not_before backoff backwards', () => {
-    const now = Date.parse('2026-07-26T12:00:00.000Z');
-    recordAcceptedGeneratedMemory('wg-a', MEMORY_MAINTENANCE_SIZE_THRESHOLD + 1, { nowMs: now });
-    const job = claimMemoryMaintenance('worker-1', { nowMs: now });
-    expect(job).toMatchObject({ workgroupId: 'wg-a', acceptedUpdates: 1 });
-    const retryMs = 6 * 60 * 60_000;
-    expect(failMemoryMaintenance(job!, { nowMs: now, retryMs })).toBe(true);
-    const notBefore = now + retryMs;
-
-    // An accepted episode write lands well inside the 6h backoff window.
-    recordAcceptedGeneratedMemory('wg-a', 10, { nowMs: now + 1000 });
-
-    // The backoff must still hold: one ms before the ORIGINAL not_before still
-    // yields nothing...
-    expect(claimMemoryMaintenance('too-early', { nowMs: notBefore - 1 })).toBeNull();
-    // ...and claiming exactly at it succeeds, with acceptedUpdates reflecting
-    // the accepted write in between — the counter increment must keep working
-    // even though the backoff timestamp itself is protected.
-    const retried = claimMemoryMaintenance('worker-2', { nowMs: notBefore });
-    expect(retried).toMatchObject({ workgroupId: 'wg-a', acceptedUpdates: 2 });
-  });
-
-  it('a fresh workgroup INSERT still seeds not_before to now, so maintenance is immediately claimable', () => {
-    const now = Date.parse('2026-07-26T12:00:00.000Z');
-    recordAcceptedGeneratedMemory('wg-fresh', MEMORY_MAINTENANCE_SIZE_THRESHOLD + 1, { nowMs: now });
-    expect(claimMemoryMaintenance('worker', { nowMs: now })).toMatchObject({ workgroupId: 'wg-fresh' });
-  });
-
-  // P2-AC15. completeMemoryMaintenance used to zero the counter unconditionally,
-  // erasing updates accepted while the lease was held. It now subtracts the
-  // job's claim-time snapshot (floored at 0), and a caller can reassert
-  // maintenance_pending immediately when a pass leaves the consolidation tail
-  // non-empty, instead of waiting for MEMORY_MAINTENANCE_UPDATE_THRESHOLD more
-  // updates to accrue.
-  it("completeMemoryMaintenance subtracts the job's snapshot count and reasserts pending on a remaining tail", () => {
-    const now = Date.parse('2026-07-26T12:00:00.000Z');
-    for (let i = 0; i < 29; i++) recordAcceptedGeneratedMemory('wg-a', 10, { nowMs: now });
-    // 30th call forces maintenance_pending via the size branch (well under the
-    // 50-update threshold) so the counter lands on exactly 30, matching the AC.
-    recordAcceptedGeneratedMemory('wg-a', MEMORY_MAINTENANCE_SIZE_THRESHOLD + 1, { nowMs: now });
-    const job = claimMemoryMaintenance('worker-1', { nowMs: now });
-    expect(job).toMatchObject({ workgroupId: 'wg-a', acceptedUpdates: 30 });
-    for (let i = 0; i < 10; i++) recordAcceptedGeneratedMemory('wg-a', 10, { nowMs: now + 1 });
-    expect(completeMemoryMaintenance(job!, { nowMs: now + 2 })).toBe(true);
-
-    // Floor-not-zero: 30 subtracted from (30 + 10) leaves 10, not 0. Read it
-    // back by forcing the workgroup pending again (size-threshold branch, which
-    // also increments the counter by one) and re-claiming.
-    recordAcceptedGeneratedMemory('wg-a', MEMORY_MAINTENANCE_SIZE_THRESHOLD + 1, { nowMs: now + 3 });
-    const after = claimMemoryMaintenance('worker-2', { nowMs: now + 3 });
-    expect(after).toMatchObject({ workgroupId: 'wg-a', acceptedUpdates: 11 });
-    expect(completeMemoryMaintenance(after!, { nowMs: now + 4 })).toBe(true);
-
-    // Reassert: a pass that leaves the tail non-empty re-arms immediately,
-    // without waiting for the threshold.
-    recordAcceptedGeneratedMemory('wg-b', MEMORY_MAINTENANCE_SIZE_THRESHOLD + 1, { nowMs: now });
-    const jobB = claimMemoryMaintenance('worker-3', { nowMs: now });
-    expect(completeMemoryMaintenance(jobB!, { nowMs: now + 1, reassertPending: true })).toBe(true);
-    expect(claimMemoryMaintenance('worker-4', { nowMs: now + 1 })).toMatchObject({ workgroupId: 'wg-b' });
-
-    // F1 finding: a stale `reassertPending: false` (this pass's own tail WAS
-    // fully drained) must not clobber a re-arm mid-pass accrual independently
-    // earned. Claim with a 30-update snapshot, accrue 60 more while the lease
-    // is held (90 total), complete with reassertPending: false — the floored
-    // counter is 90 - 30 = 60, which is >= MEMORY_MAINTENANCE_UPDATE_THRESHOLD
-    // (50), so pending must still be 1, and the persisted counter must read
-    // 60 (not 0, not 90).
-    recordAcceptedGeneratedMemory('wg-c', MEMORY_MAINTENANCE_SIZE_THRESHOLD + 1, { nowMs: now });
-    for (let i = 0; i < 29; i++) recordAcceptedGeneratedMemory('wg-c', 10, { nowMs: now });
-    const jobC = claimMemoryMaintenance('worker-5', { nowMs: now });
-    expect(jobC).toMatchObject({ workgroupId: 'wg-c', acceptedUpdates: 30 });
-    for (let i = 0; i < 60; i++) recordAcceptedGeneratedMemory('wg-c', 10, { nowMs: now + 1 });
-    expect(completeMemoryMaintenance(jobC!, { nowMs: now + 2, reassertPending: false })).toBe(true);
-    expect(claimMemoryMaintenance('worker-6', { nowMs: now + 2 })).toMatchObject({
-      workgroupId: 'wg-c',
-      acceptedUpdates: 60,
-    });
-  });
-
-  it('keeps the maintenance size threshold mirrored on the generated-memory warn line', async () => {
-    // The constant is hand-mirrored because importing curator-contract here
-    // would close a runtime cycle. Left stale it fires every sweep for any
-    // workgroup past the old cap, claiming and completing a job that does
-    // nothing. The test file has no cycle, so it can assert the mirror.
-    const { GENERATED_MEMORY_WARN_BYTES } = await import('./modules/memory/curator-contract.js');
-    expect(MEMORY_MAINTENANCE_SIZE_THRESHOLD).toBe(GENERATED_MEMORY_WARN_BYTES);
+  // router.ts's non-engaged session skip uses the boolean as a durability
+  // precondition, so a write failure must surface rather than be swallowed.
+  it('throws on a write failure rather than reporting success', () => {
+    expect(() => archiveMessage({ ...message('a-3', 'text'), sentAt: null as unknown as string })).toThrow();
   });
 });

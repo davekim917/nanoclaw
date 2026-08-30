@@ -96,7 +96,7 @@ vi.mock('./log.js', () => ({
 }));
 
 vi.mock('./message-archive.js', () => ({
-  archiveMessageAndScheduleMemoryCuration: vi.fn(),
+  archiveMessage: vi.fn(),
 }));
 
 vi.mock('./flag-parser.js', () => ({
