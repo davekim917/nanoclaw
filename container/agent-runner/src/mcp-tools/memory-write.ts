@@ -7,7 +7,6 @@ import { registerTools } from './server.js';
 import type { McpToolDefinition } from './types.js';
 
 const DEFAULT_MEMORY_ROOT = '/workspace/workgroup/memory';
-const GENERATED_MEMORY_RELATIVE_PATH = 'generated/memory.md';
 const DEFAULT_LOCK_WAIT_MS = 2_000;
 const DEFAULT_RETRY_DELAY_MS = 15;
 const WORKGROUP_LOCK_LEAF = '.memory-write.lock';
@@ -38,10 +37,6 @@ export interface MemoryWriteOptions {
   retryDelayMs?: number;
   beforeRename?: () => void | Promise<void>;
   beforeAtomicRename?: () => void;
-  /** Host-side writers only, and no host writer sets it today — the memory
-   *  curator that did has been removed. Container paths fail the
-   *  canonical-host-root check regardless. */
-  allowGeneratedMemory?: boolean;
 }
 
 interface LockRecord {
@@ -336,15 +331,6 @@ export async function writeMemoryFile(
   let resolved: ResolvedMemoryPath;
   try {
     if (typeof input.content !== 'string') throw new Error('content must be a string');
-    if (relativePath === GENERATED_MEMORY_RELATIVE_PATH) {
-      if (!options.allowGeneratedMemory) throw new Error('generated/memory.md is reserved for the host curator');
-      const moduleRepoRoot = path.resolve(import.meta.dir, '../../../..');
-      const canonicalHostRoot = path.join(moduleRepoRoot, 'data', 'workgroups');
-      const requestedRoot = path.resolve(options.rootDir ?? DEFAULT_MEMORY_ROOT);
-      if (!requestedRoot.startsWith(`${canonicalHostRoot}${path.sep}`)) {
-        throw new Error('generated/memory.md requires a canonical host workgroup root');
-      }
-    }
     if (
       input.expected_sha256 !== null &&
       (typeof input.expected_sha256 !== 'string' || !/^[a-f0-9]{64}$/.test(input.expected_sha256))

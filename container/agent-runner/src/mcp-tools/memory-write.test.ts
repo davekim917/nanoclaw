@@ -85,22 +85,6 @@ async function processResult(
 }
 
 describe('write_memory_file', () => {
-  it('reserves generated memory from foreground and non-canonical callers', async () => {
-    fs.mkdirSync(path.join(root, 'generated'));
-    expect(
-      await writeMemoryFile(
-        { relative_path: 'generated/memory.md', content: 'foreground', expected_sha256: null },
-        { rootDir: root },
-      ),
-    ).toMatchObject({ status: 'error', error: expect.stringContaining('reserved for the host curator') });
-    expect(
-      await writeMemoryFile(
-        { relative_path: 'generated/memory.md', content: 'spoofed host', expected_sha256: null },
-        { rootDir: root, allowGeneratedMemory: true },
-      ),
-    ).toMatchObject({ status: 'error', error: expect.stringContaining('canonical host workgroup root') });
-  });
-
   it('test_expected_hash_update_is_atomic_and_visible', async () => {
     const target = path.join(root, 'index.md');
     fs.writeFileSync(target, 'old');

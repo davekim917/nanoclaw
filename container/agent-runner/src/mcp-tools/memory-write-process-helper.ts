@@ -11,7 +11,6 @@ interface ProcessWriteRequest {
   retryDelayMs?: number;
   pauseSignalPath?: string;
   resumeSignalPath?: string;
-  allowGeneratedMemory?: boolean;
 }
 
 // Bounds the whole JSON request, not just the content: 16 MiB of document plus
@@ -39,7 +38,6 @@ if (import.meta.main) {
       rootDir: request.rootDir,
       lockWaitMs: request.lockWaitMs,
       retryDelayMs: request.retryDelayMs,
-      allowGeneratedMemory: request.allowGeneratedMemory === true,
       beforeAtomicRename:
         request.pauseSignalPath && request.resumeSignalPath
           ? () => {

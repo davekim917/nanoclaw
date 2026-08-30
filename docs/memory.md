@@ -76,8 +76,10 @@ megabytes of accumulated facts and hundreds of topic files.
 own, gated on `NANOCLAW_MEMORY_FACT_RECALL_ENABLED` and disabled by default;
 with no writer left, that lane could only ever inject facts from a corpus
 frozen at the moment curation stopped, so the reader and the flag were removed
-with it. The file is inert history. Nothing in the host reads it and
-`write_memory_file` still refuses to write it.
+with it. The file is inert history: nothing reads it, and with the reader gone
+the write-side reservation that held it for the curator went too, so it is now
+an ordinary memory file that `write_memory_file` will overwrite like any
+other.
 
 The topic files are not read automatically by anything either. Recall touches
 only `index.md` and the sender-matched `preferences/<slug>.md` files — an agent
@@ -109,8 +111,8 @@ reachability, and detail belongs in the linked files.
 
 Agents use `write_memory_file` for explicit "remember this" requests,
 corrections, decisions, and other facts that should be durable immediately.
-That tool cannot write `generated/memory.md`. There is no automatic background
-capture: every durable fact is written by an agent in the foreground.
+There is no automatic background capture: every durable fact is written by an
+agent in the foreground, and no path is reserved from the tool.
 
 ## Automatic pre-turn context
 
