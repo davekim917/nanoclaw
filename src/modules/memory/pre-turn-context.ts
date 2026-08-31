@@ -296,6 +296,51 @@ function extractSenderId(normalizedContent: string): string | null {
     return null;
   }
 }
+
+/**
+ * The portion of an id after its LAST colon — same rule readMemoryEvidence's
+ * id tier uses to match a bare `ids:` entry against a namespaced sender_id
+ * (one entry covers every sibling-bot namespace on a shared raw suffix). An
+ * id with no colon is its own raw suffix.
+ */
+function rawIdSuffix(id: string): string {
+  const lastColon = id.lastIndexOf(':');
+  return lastColon === -1 ? id : id.slice(lastColon + 1);
+}
+
+/**
+ * Namespaces the trigger-fallback sender id the same way `extractAndUpsertUser`
+ * (src/modules/permissions/index.ts:99) namespaces an archived one: an id
+ * that already contains a colon is left as-is, otherwise it is prefixed with
+ * the CURRENT messaging group's channel_type (`${channelType}:${rawId}`).
+ *
+ * extractSenderId returns the RAW platform id off the wire (e.g. `U123`),
+ * unlike an archived row's sender_id which is already namespaced at write
+ * time. Without this, the fallback group's senderId could only ever hit
+ * readMemoryEvidence's raw-suffix map (rawIdToRelative) — never a file's
+ * namespace-exact `ids: [slack-x:U123]` declaration. Namespacing it here
+ * makes it hit the exact map first, and its raw suffix still hits the raw
+ * map as before — no change needed on the lookup side.
+ *
+ * A channel_type lookup failure (missing row, closed DB) degrades to the
+ * raw id rather than throwing: worst case is falling back to raw-suffix
+ * matching, not losing the fallback group's id entirely.
+ */
+function namespaceTriggerSenderId(
+  rawId: string | null,
+  db: ReturnType<typeof getDb>,
+  messagingGroupId: string | null,
+): string | null {
+  if (rawId === null || rawId.includes(':') || !messagingGroupId) return rawId;
+  try {
+    const row = db.prepare('SELECT channel_type FROM messaging_groups WHERE id = ?').get(messagingGroupId) as
+      | { channel_type: string }
+      | undefined;
+    return row ? `${row.channel_type}:${rawId}` : rawId;
+  } catch {
+    return rawId;
+  }
+}
 const TRUNCATED_MARKDOWN_FILE = '\n[truncated:markdown-file]';
 const TRUNCATED_MARKDOWN_EXCERPT = '\n[truncated:markdown-excerpt]';
 const TRUNCATED_ARCHIVE_EXCERPT = '\n[truncated:archive-excerpt]';
@@ -1741,11 +1786,23 @@ export function buildPreTurnContext(input: PreTurnContextInput): PreTurnContext 
   // per-message name. Since the round-1 fix the triggering message is
   // archived before this runs, so the trigger sender normally already
   // appears as the newest recentConversationSenders row; a fallback group is
-  // prepended only when no existing group contains that name — for kinds
-  // that don't archive before this call. Its senderId comes straight from
-  // the normalized content via extractSenderId (not an archive lookup), and
-  // is typically the RAW platform id — see extractSenderId's doc comment for
-  // why that deliberately routes through the id tier's raw-suffix map.
+  // prepended only for kinds that don't archive before this call.
+  //
+  // Round 2: suppression of that fallback is by sender id, not display name.
+  // A DIFFERENT participant who merely shares the trigger's display name
+  // must not swallow the trigger's own id-declared preference file. When the
+  // trigger resolves a senderId (see namespaceTriggerSenderId below), the
+  // fallback is suppressed only if some existing group's senderId matches it
+  // exactly, or shares its raw (post-last-colon) suffix — archive groups
+  // carry per-instance namespaces, so a sibling-bot row for the same human
+  // still counts as represented. The old name-based check (aliases.includes)
+  // now applies ONLY when the trigger has no senderId at all.
+  //
+  // The fallback's senderId comes from extractSenderId (not an archive
+  // lookup) via normalizedContent — the RAW platform id — then gets
+  // namespaced with the current messaging group's channel_type before use,
+  // so it can hit a file's namespace-exact `ids:` declaration and not only
+  // the raw-suffix map; see namespaceTriggerSenderId's doc comment.
   const involvedSenders: InvolvedSenderGroup[] = [];
   try {
     for (const sender of recentConversationSenders({
@@ -1768,8 +1825,23 @@ export function buildPreTurnContext(input: PreTurnContextInput): PreTurnContext 
     });
   }
   const triggerSender = extractSenderName(input.normalizedContent);
-  if (triggerSender && !involvedSenders.some((group) => group.aliases.includes(triggerSender))) {
-    involvedSenders.unshift({ senderId: extractSenderId(input.normalizedContent), aliases: [triggerSender] });
+  if (triggerSender) {
+    const triggerSenderId = namespaceTriggerSenderId(
+      extractSenderId(input.normalizedContent),
+      db,
+      currentMessagingGroupId,
+    );
+    const alreadyRepresented =
+      triggerSenderId !== null
+        ? involvedSenders.some(
+            (group) =>
+              group.senderId !== null &&
+              (group.senderId === triggerSenderId || rawIdSuffix(group.senderId) === rawIdSuffix(triggerSenderId)),
+          )
+        : involvedSenders.some((group) => group.aliases.includes(triggerSender));
+    if (!alreadyRepresented) {
+      involvedSenders.unshift({ senderId: triggerSenderId, aliases: [triggerSender] });
+    }
   }
 
   let memoryEvidence: PreTurnContext['memoryEvidence'];

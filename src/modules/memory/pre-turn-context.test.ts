@@ -1333,6 +1333,102 @@ describe('per-person preference recall', () => {
     expect(paths).toContain('preferences/fallback-two.md');
   });
 
+  it('namespaces the fallback trigger id so it hits a namespace-exact ids: declaration', () => {
+    // Empty archive: the only involved-sender group is the [triggerSender]
+    // fallback. This file declares ONLY the namespace-exact form for the
+    // CURRENT messaging group's channel type — mg-a is 'discord' (seedScope)
+    // — which a raw, unnamespaced payload senderId could never match
+    // pre-fix: it only ever hit the raw-suffix map (rawIdToRelative).
+    memoryFile(
+      'preferences/ns-fallback.md',
+      '---\nids: [discord:U0TESTNS1]\n---\n# NS Fallback\nPrefers concise updates.',
+    );
+
+    const result = buildPreTurnContext({
+      agentGroupId: 'ag-a',
+      sessionId: 'sess-a',
+      kind: 'chat-sdk',
+      trigger: 1,
+      normalizedContent: JSON.stringify({ text: 'status?', sender: 'NS Person', senderId: 'U0TESTNS1' }),
+    });
+
+    const paths = result.memoryEvidence.excerpts.map((row) => row.path);
+    expect(paths).toContain('preferences/ns-fallback.md');
+  });
+
+  it('does not let a same-name different-sender archived participant swallow the trigger fallback', () => {
+    // A DIFFERENT person, also named "Pat Doe", already archived under a
+    // different sender_id — and that person's own preference file, matched
+    // by name.
+    memoryFile('preferences/pat-doe.md', '# Pat Doe (other)\nWants terse updates.');
+    // The trigger's OWN id-declared file, reachable only via the fallback
+    // group's (namespaced) senderId hitting the raw-suffix map.
+    memoryFile(
+      'preferences/pat-doe-trigger.md',
+      '---\nids: [U0TESTTRIGGERPERSON]\n---\n# Pat Doe (trigger)\nWants detailed updates.',
+    );
+    archiveFrom(
+      'm1',
+      'Pat Doe',
+      '2026-08-01T00:00:00.000Z',
+      'discord:guild:channel:thread',
+      'discord:U0TESTOTHERPERSON',
+    );
+
+    const result = buildPreTurnContext({
+      agentGroupId: 'ag-a',
+      sessionId: 'sess-a',
+      kind: 'chat-sdk',
+      trigger: 1,
+      normalizedContent: JSON.stringify({ text: 'status?', sender: 'Pat Doe', senderId: 'U0TESTTRIGGERPERSON' }),
+    });
+
+    // Pre-fix, the name-only suppression check saw "Pat Doe" already present
+    // in involvedSenders (the OTHER person's archived group) and dropped the
+    // fallback entirely — the trigger's own id-declared file was never
+    // reached. Post-fix, suppression is by sender id: the two different ids
+    // mean BOTH groups (and both files) survive.
+    const paths = result.memoryEvidence.excerpts.map((row) => row.path);
+    expect(paths).toContain('preferences/pat-doe-trigger.md');
+    expect(paths).toContain('preferences/pat-doe.md');
+  });
+
+  it('still suppresses the fallback when the trigger is already archived under a sibling namespace of the same raw id', () => {
+    // Same human, archived earlier under a sibling-bot namespace
+    // (slack-x:U0TESTSHARED) sharing the trigger's raw id (U0TESTSHARED,
+    // namespaced by this call to discord:U0TESTSHARED) — a DIFFERENT
+    // display name simulates a rename, proving suppression here is keyed on
+    // the id, not the name.
+    memoryFile('preferences/sam-shared.md', '---\nids: [slack-x:U0TESTSHARED]\n---\n# Sam\nCurrent preferences.');
+    // A stale file that a NOT-suppressed fallback would additionally pick up
+    // by name (its id lookup misses: the declared id above is exact-namespaced
+    // to slack-x, not the discord-namespaced form, and no bare form exists).
+    memoryFile(
+      'preferences/sam-new-name.md',
+      '# Sam New Name (stale)\nMust not be injected — same person as sam-shared.',
+    );
+    archiveFrom(
+      'm1',
+      'Sam Archived',
+      '2026-08-01T00:00:00.000Z',
+      'discord:guild:channel:thread',
+      'slack-x:U0TESTSHARED',
+    );
+
+    const result = buildPreTurnContext({
+      agentGroupId: 'ag-a',
+      sessionId: 'sess-a',
+      kind: 'chat-sdk',
+      trigger: 1,
+      normalizedContent: JSON.stringify({ text: 'status?', sender: 'Sam New Name', senderId: 'U0TESTSHARED' }),
+    });
+
+    const paths = result.memoryEvidence.excerpts.map((row) => row.path);
+    expect(paths).toContain('preferences/sam-shared.md');
+    expect(paths).not.toContain('preferences/sam-new-name.md');
+    expect(paths.filter((p) => p === 'preferences/sam-shared.md')).toHaveLength(1);
+  });
+
   it('reports an id-index read failure exactly once for a file that matches nothing by name', () => {
     // Ancestor-directory symlink swap, same technique as the "rejects an
     // ancestor-directory symlink swap" test above, but on a file no involved
