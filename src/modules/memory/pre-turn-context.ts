@@ -1235,6 +1235,45 @@ export interface InvolvedSenderGroup {
   aliases: readonly string[];
 }
 
+/**
+ * Module-level mtime+size cache of one `preferences/<stem>.md` file's
+ * declared `ids:` frontmatter, keyed by absolute path. Before this cache,
+ * readMemoryEvidence's id-index tier read every preferences/ file (up to
+ * markdownFileBytes each) on EVERY admissible turn just to build
+ * exactIdToRelative/rawIdToRelative — steady-state cost scaled with the
+ * number of files in the directory regardless of whether anything changed.
+ * A cache hit now costs one `fs.lstatSync`; a miss (new file, or an
+ * mtime/size change) falls through to the existing `readPreferenceFile`
+ * read, same as before.
+ *
+ * Only the frontmatter IDS ride this cache. The excerpt-build loop further
+ * down, for whichever files end up MATCHED to a sender, still reads fresh
+ * content every turn through `readPreferenceFile` (that function's own
+ * per-turn Map, unaffected by this one) — correctness of the injected TEXT
+ * is unchanged; only the id lookup used to DECIDE which files match by id is
+ * now cached across turns.
+ *
+ * (mtimeMs, size) is the change-detection key, not a content hash — hashing
+ * would defeat the point, since it requires reading the very bytes this
+ * cache exists to avoid reading. A same-mtime-same-size in-place edit is
+ * therefore an accepted staleness window: file writes are sub-second and
+ * `write_memory_file` (the only writer of these files) always rewrites the
+ * whole file rather than patching it in place, which moves mtime every time.
+ *
+ * Not swept for deleted files: a stale entry for a since-deleted path is
+ * never looked up again (its stem no longer appears in a directory listing
+ * unless the filename is recreated, and a recreated file's fresh write moves
+ * mtime, which invalidates the entry naturally) — one leaked Map slot per
+ * since-deleted file is cheaper than eagerly diffing the whole cache against
+ * every turn's listing.
+ */
+const PREFERENCE_ID_CACHE = new Map<string, { mtimeMs: number; size: number; ids: string[] }>();
+
+/** Test seam: clears the cache between test cases that reuse fixture paths. */
+export function _resetPreferenceIdCacheForTest(): void {
+  PREFERENCE_ID_CACHE.clear();
+}
+
 export function readMemoryEvidence(
   root: string,
   workgroupId: string,
@@ -1359,20 +1398,83 @@ export function readMemoryEvidence(
     // here regardless of whether any sender later matches it by name, so a
     // read failure is reported even for a file "matches nothing by name"
     // would otherwise never reach.
-    const exactIdToRelative = new Map<string, string>();
-    const rawIdToRelative = new Map<string, string>();
-    for (const stem of preferenceStems) {
-      const relative = `${PREFERENCES_DIR}${stem}.md`;
+    //
+    // Ids ride PREFERENCE_ID_CACHE (mtime+size keyed) instead of a full read
+    // every turn — see that Map's doc comment above. `fs.lstatSync`, not
+    // `fs.statSync`, mirrors readBoundedFile's O_NOFOLLOW leaf semantics: a
+    // leaf swapped to a symlink since the last successful read reports
+    // `isFile() === false` here exactly as O_NOFOLLOW would refuse to open
+    // it there, so a swapped leaf never satisfies a cache hit and always
+    // falls through to the fully safety-checked readPreferenceFile read
+    // below — same as an ordinary (uncached) miss.
+    const frontmatterIds = (relative: string): string[] | undefined => {
+      const absolute = path.join(root, relative);
+      let stat: fs.Stats | undefined;
+      try {
+        stat = fs.lstatSync(absolute);
+      } catch {
+        stat = undefined;
+      }
+      if (stat?.isFile()) {
+        const cached = PREFERENCE_ID_CACHE.get(absolute);
+        if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) return cached.ids;
+      } else {
+        // Gone, or no longer a plain file (e.g. symlink-swapped) — never
+        // trust a stale entry for this path; let the read below produce
+        // (and report) the real failure.
+        PREFERENCE_ID_CACHE.delete(absolute);
+      }
       const read = readPreferenceFile(relative);
       if (!('content' in read)) {
+        // Never cached on failure — retried fresh next turn, same as every
+        // other read failure in this lane.
         reportReadFailure(relative, read.error);
-        continue;
+        return undefined;
       }
-      for (const id of parsePreferenceFrontmatter(read.content).ids) {
-        if (id.includes(':')) exactIdToRelative.set(id, relative);
-        else rawIdToRelative.set(id, relative);
+      const ids = parsePreferenceFrontmatter(read.content).ids;
+      if (stat?.isFile()) PREFERENCE_ID_CACHE.set(absolute, { mtimeMs: stat.mtimeMs, size: stat.size, ids });
+      return ids;
+    };
+    // Duplicate declarations of the same id across DIFFERENT files are
+    // ambiguous. Map.set used to let the lexically-last stem silently win —
+    // collect every (id -> declaring files) pair first instead. An id
+    // declared by more than one distinct file is blacklisted from id
+    // matching entirely (both files lose it, one degraded notice per
+    // conflicting id per turn); affected senders fall back to name matching,
+    // same as a file with no ids: frontmatter at all. A Set per id absorbs
+    // the same file declaring an id twice (not a conflict) without
+    // over-counting.
+    const exactDeclarations = new Map<string, Set<string>>();
+    const rawDeclarations = new Map<string, Set<string>>();
+    for (const stem of preferenceStems) {
+      const relative = `${PREFERENCES_DIR}${stem}.md`;
+      const ids = frontmatterIds(relative);
+      if (ids === undefined) continue;
+      for (const id of ids) {
+        const declarations = id.includes(':') ? exactDeclarations : rawDeclarations;
+        const files = declarations.get(id);
+        if (files) files.add(relative);
+        else declarations.set(id, new Set([relative]));
       }
     }
+    const exactIdToRelative = new Map<string, string>();
+    const rawIdToRelative = new Map<string, string>();
+    const claimUnconflicted = (declarations: Map<string, Set<string>>, target: Map<string, string>): void => {
+      for (const [id, files] of declarations) {
+        if (files.size > 1) {
+          notices.push({
+            source: 'markdown',
+            status: 'degraded',
+            code: 'preference-id-conflict',
+            detail: `id "${id}" declared by multiple preference files (${[...files].join(', ')}); ignored for id matching`,
+          });
+          continue;
+        }
+        target.set(id, [...files][0]!);
+      }
+    };
+    claimUnconflicted(exactDeclarations, exactIdToRelative);
+    claimUnconflicted(rawDeclarations, rawIdToRelative);
     const selectedRelatives = new Set<string>();
     const matched: string[] = [];
     for (const group of involvedSenders) {

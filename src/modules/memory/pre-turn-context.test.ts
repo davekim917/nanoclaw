@@ -42,6 +42,7 @@ vi.mock('../../message-archive.js', async (importOriginal) => {
 });
 
 import {
+  _resetPreferenceIdCacheForTest,
   _resetTokenStreamCacheForTest,
   _tokenStreamCacheStatsForTest,
   _bestPassageForTest,
@@ -168,6 +169,12 @@ beforeEach(() => {
   CAPABILITY_FIXTURE.services = null;
   fs.rmSync(TEST_ROOT, { recursive: true, force: true });
   fs.mkdirSync(TEST_ROOT, { recursive: true });
+  // TEST_ROOT is a fixed path reused by every test in this file, so the
+  // module-level frontmatter-id cache (keyed by absolute path) would
+  // otherwise carry a prior test's (mtime, size, ids) entry into a fresh
+  // test that happens to recreate the same relative path at a coincidentally
+  // matching size — reset it here so every test starts cold.
+  _resetPreferenceIdCacheForTest();
   runMigrations(initTestDb());
   seedScope();
   memoryFile('index.md', '# Canon\nThe current input is authoritative.');
@@ -1486,6 +1493,81 @@ describe('per-person preference recall', () => {
     expect(failures).toHaveLength(1);
     expect(failures[0]?.detail).toContain('preferences/unmatched-file.md');
     expect(result.memoryEvidence.excerpts.some((row) => row.path === 'preferences/unmatched-file.md')).toBe(false);
+  });
+
+  it('produces identical selection on a second call when preference files are unchanged (frontmatter-id cache)', () => {
+    memoryFile('preferences/cache-one.md', '---\nids: [U0TESTCACHE1]\n---\n# Cache One\nConcise updates, always.');
+    const input = {
+      agentGroupId: 'ag-a',
+      sessionId: 'sess-a',
+      kind: 'chat-sdk',
+      trigger: 1,
+      normalizedContent: JSON.stringify({ text: 'status?', sender: 'Cache Person', senderId: 'U0TESTCACHE1' }),
+    } as const;
+
+    const pathsOf = (ctx: ReturnType<typeof buildPreTurnContext>): string[] =>
+      ctx.memoryEvidence.excerpts.map((row) => row.path);
+    expect(pathsOf(buildPreTurnContext(input))).toEqual(['preferences/cache-one.md']);
+    expect(pathsOf(buildPreTurnContext(input))).toEqual(['preferences/cache-one.md']);
+  });
+
+  it('picks up a changed ids: frontmatter after an edit, invalidating the mtime cache', () => {
+    const relative = 'preferences/cache-two.md';
+    const absolute = path.join(TEST_ROOT, 'workgroups', 'wg-a', 'memory', relative);
+    memoryFile(relative, '---\nids: [U0TESTCACHEOLD]\n---\n# Cache Two\nOld preferences.');
+
+    const askAs = (senderId: string) =>
+      buildPreTurnContext({
+        agentGroupId: 'ag-a',
+        sessionId: 'sess-a',
+        kind: 'chat-sdk',
+        trigger: 1,
+        normalizedContent: JSON.stringify({ text: 'status?', sender: 'Cache Person', senderId }),
+      });
+
+    expect(askAs('U0TESTCACHEOLD').memoryEvidence.excerpts.map((row) => row.path)).toContain(relative);
+
+    // Same byte length before and after ("OLD"/"NEW" and "Old"/"New" are both
+    // 3 chars) so this exercises the mtime half of the (mtimeMs, size) cache
+    // key, not the size half. utimesSync forces mtime forward explicitly —
+    // a same-millisecond rewrite is the accepted staleness window this fix
+    // documents, not what this test is proving.
+    memoryFile(relative, '---\nids: [U0TESTCACHENEW]\n---\n# Cache Two\nNew preferences.');
+    const bumped = new Date(fs.statSync(absolute).mtime.getTime() + 5000);
+    fs.utimesSync(absolute, bumped, bumped);
+
+    expect(askAs('U0TESTCACHEOLD').memoryEvidence.excerpts.map((row) => row.path)).not.toContain(relative);
+    const nowNew = askAs('U0TESTCACHENEW');
+    const preference = nowNew.memoryEvidence.excerpts.find((row) => row.path === relative);
+    expect(preference).toBeDefined();
+    expect(preference?.text).toContain('New preferences');
+  });
+
+  it('blacklists a duplicate bare id from id matching, reports one conflict notice, and still name-matches', () => {
+    memoryFile('preferences/dup-a.md', '---\nids: [U0TESTDUP]\n---\n# Dup A\nFile A preferences.');
+    memoryFile('preferences/dup-b.md', '---\nids: [U0TESTDUP]\n---\n# Dup B\nFile B preferences.');
+    // Name-slug file for the same sender, so the "name matching remains the
+    // fallback" half of the fix is exercised in the same test.
+    memoryFile('preferences/dup-person.md', '# Dup Person\nName-matched preferences.');
+
+    const result = buildPreTurnContext({
+      agentGroupId: 'ag-a',
+      sessionId: 'sess-a',
+      kind: 'chat-sdk',
+      trigger: 1,
+      normalizedContent: JSON.stringify({ text: 'status?', sender: 'Dup Person', senderId: 'U0TESTDUP' }),
+    });
+
+    const paths = result.memoryEvidence.excerpts.map((row) => row.path);
+    expect(paths).not.toContain('preferences/dup-a.md');
+    expect(paths).not.toContain('preferences/dup-b.md');
+    expect(paths).toContain('preferences/dup-person.md');
+
+    const conflicts = result.notices.filter((notice) => notice.code === 'preference-id-conflict');
+    expect(conflicts).toHaveLength(1);
+    expect(conflicts[0]?.detail).toContain('U0TESTDUP');
+    expect(conflicts[0]?.detail).toContain('preferences/dup-a.md');
+    expect(conflicts[0]?.detail).toContain('preferences/dup-b.md');
   });
 });
 
