@@ -1248,6 +1248,149 @@ describe('per-person preference recall', () => {
     expect(preference).toBeDefined();
     expect(preference!.text).toContain('---');
   });
+
+  it('an id match is terminal for its group: never falls through to a stale name match on a shared raw suffix', () => {
+    // One human archived under two sibling-bot namespaces sharing a raw
+    // suffix (slack-x vs slack-x-codex), declared once in river-park.md.
+    // Newest first: the slack-x-codex row is processed first and claims
+    // river-park.md via the id tier; the slack-x row's id resolves to the
+    // same, now-claimed file. Pre-fix, that already-claimed id match fell
+    // through to name matching, and its own display name slugs to the
+    // unrelated river-park-alt.md — injecting a second, stale file for the
+    // same person. Post-fix, an id match never falls through.
+    memoryFile('preferences/river-park.md', '---\nids: [U0TEST900XYZ]\n---\n# River Park\nCurrent preferences.');
+    memoryFile('preferences/river-park-alt.md', '# River Park Alt\nStale preferences — must not be injected.');
+    archiveFrom(
+      'm1',
+      'River Park Alt',
+      '2026-08-01T00:00:00.000Z',
+      'discord:guild:channel:thread',
+      'slack-x:U0TEST900XYZ',
+    );
+    archiveFrom(
+      'm2',
+      'River Park',
+      '2026-08-01T00:01:00.000Z',
+      'discord:guild:channel:thread',
+      'slack-x-codex:U0TEST900XYZ',
+    );
+
+    const result = buildPreTurnContext({
+      agentGroupId: 'ag-a',
+      sessionId: 'sess-a',
+      kind: 'chat-sdk',
+      trigger: 1,
+      normalizedContent: JSON.stringify({ text: 'status?', sender: 'Pat Doe' }),
+    });
+
+    const paths = result.memoryEvidence.excerpts.map((row) => row.path);
+    expect(paths).toContain('preferences/river-park.md');
+    expect(paths).not.toContain('preferences/river-park-alt.md');
+    expect(paths.filter((p) => p === 'preferences/river-park.md')).toHaveLength(1);
+  });
+
+  it('carries the trigger sender id into the fallback group via top-level senderId', () => {
+    // Empty archive: the only involved-sender group is the [triggerSender]
+    // fallback built straight from normalizedContent, which must now carry
+    // the id too (previously always null), routing through the raw-suffix
+    // map since this is an unnamespaced platform id.
+    memoryFile(
+      'preferences/fallback-one.md',
+      '---\nids: [U0TESTFALLBACK1]\n---\n# Fallback One\nPrefers concise updates.',
+    );
+
+    const result = buildPreTurnContext({
+      agentGroupId: 'ag-a',
+      sessionId: 'sess-a',
+      kind: 'chat-sdk',
+      trigger: 1,
+      normalizedContent: JSON.stringify({ text: 'status?', sender: 'New Person', senderId: 'U0TESTFALLBACK1' }),
+    });
+
+    const paths = result.memoryEvidence.excerpts.map((row) => row.path);
+    expect(paths).toContain('preferences/fallback-one.md');
+  });
+
+  it('carries the trigger sender id into the fallback group via nested author.userId', () => {
+    memoryFile(
+      'preferences/fallback-two.md',
+      '---\nids: [U0TESTFALLBACK2]\n---\n# Fallback Two\nPrefers detailed updates.',
+    );
+
+    const result = buildPreTurnContext({
+      agentGroupId: 'ag-a',
+      sessionId: 'sess-a',
+      kind: 'chat-sdk',
+      trigger: 1,
+      normalizedContent: JSON.stringify({
+        text: 'status?',
+        sender: 'New Person',
+        author: { userId: 'U0TESTFALLBACK2' },
+      }),
+    });
+
+    const paths = result.memoryEvidence.excerpts.map((row) => row.path);
+    expect(paths).toContain('preferences/fallback-two.md');
+  });
+
+  it('reports an id-index read failure exactly once for a file that matches nothing by name', () => {
+    // Ancestor-directory symlink swap, same technique as the "rejects an
+    // ancestor-directory symlink swap" test above, but on a file no involved
+    // sender's alias slug ever matches — so pre-fix, the excerpt-build loop
+    // never reaches it and the id-index loop's read failure is silently
+    // swallowed: no notice at all.
+    const memoryRoot = path.join(TEST_ROOT, 'workgroups', 'wg-a', 'memory');
+    memoryFile('preferences/unmatched-file.md', '# Placeholder\nSwapped to a symlink before the id-index read.');
+    const checkedLeaf = path.join(memoryRoot, 'preferences', 'unmatched-file.md');
+    const checkedAncestor = path.join(memoryRoot, 'preferences');
+    const outsideDir = path.join(TEST_ROOT, 'outside-unmatched');
+    const secret = 'OUTSIDE_UNMATCHED_MUST_NOT_BE_READ';
+    fs.mkdirSync(outsideDir, { recursive: true });
+    fs.writeFileSync(path.join(outsideDir, 'unmatched-file.md'), `# Outside\n${secret}`);
+    archiveFrom(
+      'm1',
+      'Totally Different Name',
+      '2026-08-01T00:00:00.000Z',
+      'discord:guild:channel:thread',
+      'slack:U0TESTNOMATCH',
+    );
+
+    const realOpenSync = fs.openSync;
+    let swapped = false;
+    const openSpy = vi.spyOn(fs, 'openSync').mockImplementation(((file, flags, mode) => {
+      if (!swapped && path.resolve(String(file)) === checkedLeaf) {
+        swapped = true;
+        const parkedAncestor = `${checkedAncestor}-parked`;
+        fs.renameSync(checkedAncestor, parkedAncestor);
+        fs.symlinkSync(outsideDir, checkedAncestor, 'dir');
+        const opened = realOpenSync(file, flags, mode);
+        fs.rmSync(checkedAncestor);
+        fs.renameSync(parkedAncestor, checkedAncestor);
+        return opened;
+      }
+      return realOpenSync(file, flags, mode);
+    }) as typeof fs.openSync);
+
+    let result: ReturnType<typeof buildPreTurnContext>;
+    try {
+      result = buildPreTurnContext({
+        agentGroupId: 'ag-a',
+        sessionId: 'sess-a',
+        kind: 'chat-sdk',
+        trigger: 1,
+        normalizedContent: JSON.stringify({ text: 'status?', sender: 'Pat Doe' }),
+      });
+    } finally {
+      openSpy.mockRestore();
+    }
+
+    expect(swapped).toBe(true);
+    expect(JSON.stringify(result.memoryEvidence)).not.toContain(secret);
+    const failures = result.notices.filter((notice) => notice.code === 'preference-read-failed');
+    expect(failures).toHaveLength(1);
+    expect(failures[0]?.detail).toContain('preferences/unmatched-file.md');
+    expect(result.memoryEvidence.excerpts.some((row) => row.path === 'preferences/unmatched-file.md')).toBe(false);
+  });
 });
 
 describe('parsePreferenceFrontmatter', () => {

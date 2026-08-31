@@ -272,6 +272,30 @@ function extractSenderName(normalizedContent: string): string | null {
     return null;
   }
 }
+
+/**
+ * Extracts the triggering message's sender id from normalized content — same
+ * shapes `container/agent-runner/src/formatter.ts:161` (extractSenderId) and
+ * `src/modules/permissions/index.ts:84-96` (extractAndUpsertUser) already
+ * parse: top-level `senderId` string, else nested `author.userId` string.
+ * Absence or a parse failure returns null, same permissiveness as
+ * extractSenderName above. Unlike those two call sites this id is used
+ * as-is, NOT namespaced with a channel-type prefix — it is typically the RAW
+ * platform id (unnamespaced), and readMemoryEvidence's id tier deliberately
+ * routes an unnamespaced id through the raw-suffix map (rawIdToRelative),
+ * not the exact-namespaced one.
+ */
+function extractSenderId(normalizedContent: string): string | null {
+  try {
+    const parsed = JSON.parse(normalizedContent) as { senderId?: unknown; author?: unknown };
+    if (typeof parsed.senderId === 'string' && parsed.senderId.trim().length > 0) return parsed.senderId.trim();
+    const author = parsed.author;
+    const userId = author && typeof author === 'object' ? (author as { userId?: unknown }).userId : undefined;
+    return typeof userId === 'string' && userId.trim().length > 0 ? userId.trim() : null;
+  } catch {
+    return null;
+  }
+}
 const TRUNCATED_MARKDOWN_FILE = '\n[truncated:markdown-file]';
 const TRUNCATED_MARKDOWN_EXCERPT = '\n[truncated:markdown-excerpt]';
 const TRUNCATED_ARCHIVE_EXCERPT = '\n[truncated:archive-excerpt]';
@@ -1218,12 +1242,19 @@ export function readMemoryEvidence(
   // tried IN ORDER — per-message name first, canonical name as fallback,
   // preserving pre-PR behavior when both files happen to exist — using the
   // exact-slug-wins-else-longest-stem rule below; the first alias that claims
-  // an unclaimed file wins and the group stops looking. An alias (or id)
-  // matching a file an earlier group already claimed falls through — to the
-  // next alias for a name match, to name matching entirely for an id match —
-  // that file belongs to the other person. Never lexically ranked, so a
-  // preference cannot lose a relevance contest to unrelated memory. Reads run
-  // before the ranked scan so the shared byte budget cannot starve them.
+  // an unclaimed file wins and the group stops looking. An alias matching a
+  // file an earlier group already claimed falls through to the next alias
+  // for a name match — that file belongs to the other person. An id match is
+  // terminal for its group instead: a resolved id stops the group right
+  // there, claiming the file if unclaimed and contributing nothing if
+  // another group already claimed it — it NEVER falls through to name/alias
+  // matching. This is what stops a human archived under two sibling-bot
+  // namespaces (e.g. `slack-x:U1` and `slack-x-codex:U1`, sharing one raw
+  // suffix declared in one file) from having their second, already-resolved
+  // group also pick up a second, stale name-matched file for the same
+  // person. Never lexically ranked, so a preference cannot lose a relevance
+  // contest to unrelated memory. Reads run before the ranked scan so the
+  // shared byte budget cannot starve them.
   const preferenceExcerpts: MemoryEvidenceExcerpt[] = [];
   if (involvedSenders.length > 0) {
     const preferenceStems = listDirectMarkdownStems(root, PREFERENCES_DIR, notices);
@@ -1259,16 +1290,39 @@ export function readMemoryEvidence(
       preferenceFileReads.set(relative, result);
       return result;
     };
+    // Reported at most once per file per turn — the id-index loop below
+    // attempts every preferences/ file regardless of whether it ends up
+    // matched, and the excerpt-build loop further down re-reads the same
+    // (cached) result for whichever subset got matched by name, so without
+    // this guard a file reached by both would surface two notices for one
+    // failure.
+    const reportedReadFailures = new Set<string>();
+    const reportReadFailure = (relative: string, error: unknown): void => {
+      if (reportedReadFailures.has(relative)) return;
+      reportedReadFailures.add(relative);
+      notices.push({
+        source: 'markdown',
+        status: 'degraded',
+        code: 'preference-read-failed',
+        detail: `${relative}: ${error instanceof Error ? error.message : String(error)}`,
+      });
+    };
     // Explicit-id tier: index every preferences/ file's declared ids. An
     // entry WITHOUT a colon matches the raw suffix after a sender_id's LAST
     // colon (one entry covers every sibling-bot namespace); an entry WITH a
-    // colon must equal the full sender_id exactly.
+    // colon must equal the full sender_id exactly. Every file is attempted
+    // here regardless of whether any sender later matches it by name, so a
+    // read failure is reported even for a file "matches nothing by name"
+    // would otherwise never reach.
     const exactIdToRelative = new Map<string, string>();
     const rawIdToRelative = new Map<string, string>();
     for (const stem of preferenceStems) {
       const relative = `${PREFERENCES_DIR}${stem}.md`;
       const read = readPreferenceFile(relative);
-      if (!('content' in read)) continue;
+      if (!('content' in read)) {
+        reportReadFailure(relative, read.error);
+        continue;
+      }
       for (const id of parsePreferenceFrontmatter(read.content).ids) {
         if (id.includes(':')) exactIdToRelative.set(id, relative);
         else rawIdToRelative.set(id, relative);
@@ -1290,10 +1344,17 @@ export function readMemoryEvidence(
           idRelative = rawIdToRelative.get(rawSuffix);
         }
       }
-      if (idRelative !== undefined && !selectedRelatives.has(idRelative)) {
-        selectedRelatives.add(idRelative);
-        matched.push(idRelative);
-        continue; // id match claims the file; skip name/alias matching for this group
+      if (idRelative !== undefined) {
+        // Terminal for this group either way: claim the file if unclaimed,
+        // or contribute nothing if an earlier group already claimed it — an
+        // id resolution is never a reason to fall through to name matching
+        // (see the lane comment above for the sibling-namespace case this
+        // prevents).
+        if (!selectedRelatives.has(idRelative)) {
+          selectedRelatives.add(idRelative);
+          matched.push(idRelative);
+        }
+        continue;
       }
 
       for (const alias of group.aliases) {
@@ -1315,12 +1376,10 @@ export function readMemoryEvidence(
     for (const relative of matched.slice(0, PRE_TURN_BOUNDS.preferenceExcerpts)) {
       const read = readPreferenceFile(relative);
       if ('error' in read) {
-        notices.push({
-          source: 'markdown',
-          status: 'degraded',
-          code: 'preference-read-failed',
-          detail: `${relative}: ${read.error instanceof Error ? read.error.message : String(read.error)}`,
-        });
+        // Already reported by the id-index loop above for every stem
+        // (matched or not) — reportReadFailure's dedupe means this only
+        // actually pushes a (second) notice if that invariant ever breaks.
+        reportReadFailure(relative, read.error);
         continue;
       }
       const { body } = parsePreferenceFrontmatter(read.content);
@@ -1681,9 +1740,12 @@ export function buildPreTurnContext(input: PreTurnContextInput): PreTurnContext 
   // canonical included only when resolved, set, and different from the
   // per-message name. Since the round-1 fix the triggering message is
   // archived before this runs, so the trigger sender normally already
-  // appears as the newest recentConversationSenders row; a fallback group
-  // (senderId: null) is prepended only when no existing group contains that
-  // name — for kinds that don't archive before this call.
+  // appears as the newest recentConversationSenders row; a fallback group is
+  // prepended only when no existing group contains that name — for kinds
+  // that don't archive before this call. Its senderId comes straight from
+  // the normalized content via extractSenderId (not an archive lookup), and
+  // is typically the RAW platform id — see extractSenderId's doc comment for
+  // why that deliberately routes through the id tier's raw-suffix map.
   const involvedSenders: InvolvedSenderGroup[] = [];
   try {
     for (const sender of recentConversationSenders({
@@ -1707,7 +1769,7 @@ export function buildPreTurnContext(input: PreTurnContextInput): PreTurnContext 
   }
   const triggerSender = extractSenderName(input.normalizedContent);
   if (triggerSender && !involvedSenders.some((group) => group.aliases.includes(triggerSender))) {
-    involvedSenders.unshift({ senderId: null, aliases: [triggerSender] });
+    involvedSenders.unshift({ senderId: extractSenderId(input.normalizedContent), aliases: [triggerSender] });
   }
 
   let memoryEvidence: PreTurnContext['memoryEvidence'];
