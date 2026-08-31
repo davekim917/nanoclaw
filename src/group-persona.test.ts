@@ -6,7 +6,12 @@ vi.mock('./log.js', () => ({
   log: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn(), fatal: vi.fn() },
 }));
 
-import { PERSONA_PREPEND_FILE, STANDING_INSTRUCTIONS_FILE, readGroupPersona, stageGroupPersona } from './group-persona.js';
+import {
+  PERSONA_PREPEND_FILE,
+  STANDING_INSTRUCTIONS_FILE,
+  readGroupPersona,
+  stageGroupPersona,
+} from './group-persona.js';
 import { log } from './log.js';
 
 const TMP = '/tmp/nanoclaw-group-persona-test';

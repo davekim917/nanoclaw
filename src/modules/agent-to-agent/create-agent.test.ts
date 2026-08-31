@@ -195,7 +195,9 @@ describe('legacy call — no provider, no provider_config', () => {
     const parsed = JSON.parse(fs.readFileSync(containerJsonPath, 'utf8'));
     expect(parsed).not.toHaveProperty('provider');
     expect(parsed).not.toHaveProperty('providerConfig');
-    expect(fs.readFileSync(path.join(TEST_GROUPS_DIR, 'legacy', STANDING_INSTRUCTIONS_FILE), 'utf8')).toBe('be helpful\n');
+    expect(fs.readFileSync(path.join(TEST_GROUPS_DIR, 'legacy', STANDING_INSTRUCTIONS_FILE), 'utf8')).toBe(
+      'be helpful\n',
+    );
     expect(fs.readFileSync(path.join(TEST_GROUPS_DIR, 'legacy', 'CLAUDE.local.md'), 'utf8')).toBe('');
     expect(
       fs.existsSync(path.join(TEST_DATA_DIR, 'workgroups', 'legacy', 'memory', 'memories', 'imported-agent-memory.md')),

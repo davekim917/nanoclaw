@@ -266,8 +266,12 @@ describe('initGroupFilesystem agent surfaces', () => {
     withWorkgroup(ag);
     ensureContainerConfig(ag.id);
     buildMounts(ag, session('s-default-instructions', ag.id), containerConfig(), 'claude', {});
-    expect(fs.readFileSync(path.join(groupDir, '.claude-fragments', 'standing-instructions.md'), 'utf-8')).toBe('hello');
-    expect(fs.readFileSync(path.join(groupDir, 'CLAUDE.md'), 'utf-8')).toContain('@./.claude-fragments/standing-instructions.md');
+    expect(fs.readFileSync(path.join(groupDir, '.claude-fragments', 'standing-instructions.md'), 'utf-8')).toBe(
+      'hello',
+    );
+    expect(fs.readFileSync(path.join(groupDir, 'CLAUDE.md'), 'utf-8')).toContain(
+      '@./.claude-fragments/standing-instructions.md',
+    );
   });
 
   it('reconciles the managed Bash maximum while preserving an operator-owned default', () => {
@@ -779,7 +783,14 @@ describe('worker agent def sync (orchestrator roster)', () => {
     expect(codexWorker).toContain('keeps its own `codex exec` Bash call in the foreground');
     expect(
       fs.existsSync(
-        path.join(process.cwd(), 'container', 'agent-runner', 'src', 'mcp-tools', 'orchestrator-workers.instructions.md'),
+        path.join(
+          process.cwd(),
+          'container',
+          'agent-runner',
+          'src',
+          'mcp-tools',
+          'orchestrator-workers.instructions.md',
+        ),
       ),
     ).toBe(false);
     // The retired fragment is never composed for any provider.

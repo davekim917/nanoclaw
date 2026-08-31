@@ -62,9 +62,9 @@ describe('composeGroupClaudeMd persona prepend', () => {
     const imports = importsOf(ag.folder);
     expect(imports[0]).toBe('@./.claude-fragments/standing-instructions.md');
     expect(imports[1]).toBe('@./.claude-shared.md');
-    expect(fs.readFileSync(path.join(GROUPS_DIR, ag.folder, '.claude-fragments', 'standing-instructions.md'), 'utf-8')).toBe(
-      'You are an SDR agent.',
-    );
+    expect(
+      fs.readFileSync(path.join(GROUPS_DIR, ag.folder, '.claude-fragments', 'standing-instructions.md'), 'utf-8'),
+    ).toBe('You are an SDR agent.');
   });
 
   it('keeps the persona across a second compose (not pruned)', () => {
@@ -88,7 +88,9 @@ describe('composeGroupClaudeMd persona prepend', () => {
     const imports = importsOf(ag.folder);
     expect(imports[0]).toBe('@./.claude-shared.md');
     expect(imports).not.toContain('@./.claude-fragments/standing-instructions.md');
-    expect(fs.existsSync(path.join(GROUPS_DIR, ag.folder, '.claude-fragments', 'standing-instructions.md'))).toBe(false);
+    expect(fs.existsSync(path.join(GROUPS_DIR, ag.folder, '.claude-fragments', 'standing-instructions.md'))).toBe(
+      false,
+    );
   });
 });
 
