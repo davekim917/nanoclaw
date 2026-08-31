@@ -358,10 +358,15 @@ export function recentConversationSenders(input: {
       input.rowLimit ?? 100,
     ) as Array<{ sender_name: string; sender_id: string | null }>;
   const senders: Array<{ senderName: string; senderId: string | null }> = [];
-  const seenNames = new Set<string>();
+  const seenKeys = new Set<string>();
   for (const row of rows) {
-    if (seenNames.has(row.sender_name)) continue;
-    seenNames.add(row.sender_name);
+    // Dedupe on stable sender_id where we have one — falling back to name
+    // for legacy/anonymous rows — so two different people who happen to
+    // share a display name aren't collapsed into one (rows are newest
+    // first, so a renamed sender_id still keeps only its newest name).
+    const key = row.sender_id ?? `name:${row.sender_name}`;
+    if (seenKeys.has(key)) continue;
+    seenKeys.add(key);
     senders.push({ senderName: row.sender_name, senderId: row.sender_id });
     if (senders.length >= (input.nameLimit ?? 8)) break;
   }
