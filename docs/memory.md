@@ -136,7 +136,9 @@ require the agent to call it before declaring a service unavailable.
 Every pair then contains only the newly relevant evidence delta:
 
 1. the preference files of the conversation's involved senders, matched by name
-   slug and injected whole — deterministic, never ranked;
+   slug — both the per-message display name and, resolved via the archive's
+   stable sender id, the sender's canonical `users.display_name` — and
+   injected whole — deterministic, never ranked;
 2. up to three lexical archive excerpts, preferring the current thread;
 3. a separately bounded exact Slack/Discord permalink lane when the input
    contains a supported message link; and

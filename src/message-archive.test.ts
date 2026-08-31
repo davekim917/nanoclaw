@@ -16,7 +16,7 @@ import {
   archiveMessage,
   parseArchivePermalinks,
   queryArchiveExactLinks,
-  recentConversationSenderNames,
+  recentConversationSenders,
   sanitizeArchiveFtsQuery,
   searchArchiveEvidence,
   upsertArchiveMessage,
@@ -221,12 +221,16 @@ describe('archive retrieval helpers', () => {
     }
 
     expect(
-      recentConversationSenderNames({
+      recentConversationSenders({
         memberAgentGroupIds: ['ag-a'],
         messagingGroupId: 'mg-tie',
         threadId: 'discord:g:c:t',
       }),
-    ).toEqual(['Sender m-c', 'Sender m-b', 'Sender m-a']);
+    ).toEqual([
+      { senderName: 'Sender m-c', senderId: 'discord:m-c' },
+      { senderName: 'Sender m-b', senderId: 'discord:m-b' },
+      { senderName: 'Sender m-a', senderId: 'discord:m-a' },
+    ]);
   });
 });
 

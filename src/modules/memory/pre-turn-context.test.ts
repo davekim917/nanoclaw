@@ -906,6 +906,7 @@ describe('per-person preference recall', () => {
     senderName: string,
     sentAt: string,
     threadId = 'discord:guild:channel:thread',
+    senderId = `discord:${senderName}`,
   ): void {
     upsertArchiveMessage({
       id,
@@ -916,11 +917,17 @@ describe('per-person preference recall', () => {
       platformId: 'discord:guild:channel',
       threadId,
       role: 'user',
-      senderId: `discord:${senderName}`,
+      senderId,
       senderName,
       text: `message from ${senderName}`,
       sentAt,
     });
+  }
+
+  function upsertUserRow(id: string, displayName: string | null): void {
+    getDb()
+      .prepare(`INSERT INTO users (id, kind, display_name, created_at) VALUES (?, ?, ?, ?)`)
+      .run(id, 'slack', displayName, '2026-01-01T00:00:00.000Z');
   }
 
   it('injects the trigger sender preference file deterministically, outside the ranked lane', () => {
@@ -982,6 +989,61 @@ describe('per-person preference recall', () => {
     const third = buildPreTurnContext({ ...input, seenEvidenceFingerprints: [fingerprint!] });
     const changed = third.memoryEvidence.excerpts.find((row) => row.path === 'preferences/alex.md');
     expect(changed?.text).toContain('Code-level detail');
+  });
+
+  it('matches a preference file on the canonical users.display_name after a platform rename', () => {
+    // The archive row carries the post-rename per-message name; only the
+    // canonical display_name on the (stable) sender_id still matches the slug
+    // of the pre-existing preference file.
+    memoryFile('preferences/sam-rivera.md', '# Sam Rivera\nPrefers terse status updates.');
+    archiveFrom('m1', 'SR Renamed', '2026-08-01T00:00:00.000Z', 'discord:guild:channel:thread', 'slack:U1');
+    upsertUserRow('slack:U1', 'Sam Rivera');
+
+    const result = buildPreTurnContext({
+      agentGroupId: 'ag-a',
+      sessionId: 'sess-a',
+      kind: 'chat-sdk',
+      trigger: 1,
+      normalizedContent: JSON.stringify({ text: 'status?', sender: 'Pat Doe' }),
+    });
+
+    const paths = result.memoryEvidence.excerpts.map((row) => row.path);
+    expect(paths).toContain('preferences/sam-rivera.md');
+  });
+
+  it('falls back to the message sender name with no crash when sender_id has no users row', () => {
+    memoryFile('preferences/casey-doe.md', '# Casey Doe\nShort summaries.');
+    archiveFrom('m1', 'Casey Doe', '2026-08-01T00:00:00.000Z', 'discord:guild:channel:thread', 'slack:U-unknown');
+
+    const result = buildPreTurnContext({
+      agentGroupId: 'ag-a',
+      sessionId: 'sess-a',
+      kind: 'chat-sdk',
+      trigger: 1,
+      normalizedContent: JSON.stringify({ text: 'status?', sender: 'Pat Doe' }),
+    });
+
+    const paths = result.memoryEvidence.excerpts.map((row) => row.path);
+    expect(paths).toContain('preferences/casey-doe.md');
+    expect(result.notices.some((notice) => notice.code === 'sender-recall-failed')).toBe(false);
+  });
+
+  it('falls back to the message sender name with no crash when the users row has a NULL display_name', () => {
+    memoryFile('preferences/jordan-lee.md', '# Jordan Lee\nNo tables.');
+    archiveFrom('m1', 'Jordan Lee', '2026-08-01T00:00:00.000Z', 'discord:guild:channel:thread', 'slack:U2');
+    upsertUserRow('slack:U2', null);
+
+    const result = buildPreTurnContext({
+      agentGroupId: 'ag-a',
+      sessionId: 'sess-a',
+      kind: 'chat-sdk',
+      trigger: 1,
+      normalizedContent: JSON.stringify({ text: 'status?', sender: 'Pat Doe' }),
+    });
+
+    const paths = result.memoryEvidence.excerpts.map((row) => row.path);
+    expect(paths).toContain('preferences/jordan-lee.md');
+    expect(result.notices.some((notice) => notice.code === 'sender-recall-failed')).toBe(false);
   });
 });
 

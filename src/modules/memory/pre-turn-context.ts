@@ -7,10 +7,11 @@ import { getDb } from '../../db/connection.js';
 import { log } from '../../log.js';
 import {
   queryArchiveExactLinks,
-  recentConversationSenderNames,
+  recentConversationSenders,
   searchArchiveEvidence,
   type ArchiveEvidenceRow,
 } from '../../message-archive.js';
+import { getUser } from '../permissions/db/users.js';
 import { workgroupMemoryDir } from '../workgroup/shared-dirs.js';
 
 export const PRE_TURN_BOUNDS = Object.freeze({
@@ -30,16 +31,20 @@ export const PRE_TURN_BOUNDS = Object.freeze({
   // Cap covers a busy multi-human thread; the per-file cap bounds one person's
   // file. This is the ONLY lane that reads manual Markdown per turn — ordinary
   // memory files are navigated by the agent from index.md, not scanned here.
+  // 2,200 matches the write-side guidance for a preference file's current-state
+  // section (~2,000 chars) with headroom — real files measure ~1.5-2.1KB.
   preferenceExcerpts: 6,
-  preferenceExcerptChars: 900,
+  preferenceExcerptChars: 2_200,
   // Total for the memory excerpt lane, enforced after selection.
   //
   // Load-bearing for the same reason capabilityTotalChars is: enforceFinalBound
   // sacrifices conversation excerpts FIRST, so unbounded memory could silently
-  // evict every archive excerpt. It is a safety net rather than a live limiter
-  // now the generated-fact lane is gone — six preference files at 900 chars
-  // reach 5,400 — so it fires only if the preference caps above are raised.
-  memoryExcerptTotalChars: 5_500,
+  // evict every archive excerpt. No longer just a safety net now the per-file
+  // cap is 2,200: it fires with 3+ matched preference files, deliberately
+  // letting preferences crowd out ranked memory in many-human threads —
+  // preferences carry MAX_SAFE_INTEGER scores so they sort first, and the
+  // budget loop below pops the (lower-ranked) tail first.
+  memoryExcerptTotalChars: 6_600,
   archiveCandidates: 96,
   archiveExcerpts: 3,
   archiveExcerptChars: 900,
@@ -1140,9 +1145,12 @@ export function readMemoryEvidence(
 
   // Deterministic per-person preference lane. Files under preferences/ are
   // keyed by name slug and injected whole for the conversation's involved
-  // senders — never lexically ranked, so a preference cannot lose a relevance
-  // contest to unrelated memory. Reads run before the ranked scan so the
-  // shared byte budget cannot starve them.
+  // senders — both their per-message display name and their canonical
+  // `users.display_name` (see involvedSenderNames above) are slugged and
+  // matched, so a platform rename can't silently break an existing file.
+  // Never lexically ranked, so a preference cannot lose a relevance contest
+  // to unrelated memory. Reads run before the ranked scan so the shared byte
+  // budget cannot starve them.
   const preferenceExcerpts: MemoryEvidenceExcerpt[] = [];
   if (involvedSenderNames.length > 0) {
     const senderSlugs = [...new Set(involvedSenderNames.map(preferenceSlug))].filter((slug) => slug.length > 0);
@@ -1523,17 +1531,23 @@ export function buildPreTurnContext(input: PreTurnContextInput): PreTurnContext 
   }
 
   // Involved senders for the deterministic preference lane: the triggering
-  // message's sender plus recent inbound senders in this conversation.
+  // message's sender plus recent inbound senders in this conversation, plus
+  // each sender's canonical `users.display_name` (resolved via the archive's
+  // stable sender_id) when it differs from the per-message name — a platform
+  // rename must not silently stop matching an existing preference file.
   const involvedSenderNames: string[] = [];
   const triggerSender = extractSenderName(input.normalizedContent);
   if (triggerSender) involvedSenderNames.push(triggerSender);
   try {
-    for (const name of recentConversationSenderNames({
+    for (const sender of recentConversationSenders({
       memberAgentGroupIds,
       messagingGroupId: currentMessagingGroupId,
       threadId: currentThreadId,
     })) {
-      if (!involvedSenderNames.includes(name)) involvedSenderNames.push(name);
+      if (!involvedSenderNames.includes(sender.senderName)) involvedSenderNames.push(sender.senderName);
+      if (!sender.senderId) continue;
+      const canonicalName = getUser(sender.senderId)?.display_name;
+      if (canonicalName && !involvedSenderNames.includes(canonicalName)) involvedSenderNames.push(canonicalName);
     }
   } catch (error) {
     if (!(error instanceof Error)) throw error;
