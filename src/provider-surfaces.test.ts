@@ -158,12 +158,17 @@ describe('container instruction contracts', () => {
     expect(instructions).toContain("your group's instructions win");
     // Truth-grounding core.
     expect(instructions).toContain('grounded in verifiable truth');
+    // Test-is-the-contract guard: an existing test asserting the opposite
+    // behavior IS the current contract, and a review comment alone never
+    // overrides it without an explicit contract change from the user.
+    expect(instructions).toContain('IS the current contract');
   });
 
-  it('bans dates, incident recaps, issue/PR numbers, and agent names in the base file', () => {
+  it('bans ISO dates and issue/PR references in the base file', () => {
     const instructions = fs.readFileSync(path.join(process.cwd(), 'container/CLAUDE.md'), 'utf-8');
     expect(instructions).not.toMatch(/\b20\d{2}-\d{2}-\d{2}\b/);
-    expect(instructions).not.toMatch(/(?:^|\s)#\d{2,}\b/);
+    // Matches a bare `#123` and a parenthesized `(#123)`.
+    expect(instructions).not.toMatch(/(?:^|[\s(])#\d{2,}\b/);
   });
 
   // ── Hand-synced host/container constants ──
