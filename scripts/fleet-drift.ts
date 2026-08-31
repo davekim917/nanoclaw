@@ -24,10 +24,13 @@
  *      band — see pausedSeriesBreach/failedStreakBreach). Fewer than 7 prior
  *      days of history → print a warm-up notice and exit 0 (the instruction-
  *      stack tripwire below has no history dependency and still runs).
- *   3b. instructionStack (no history, no band): container/CLAUDE.md ceiling
- *      and per-group standing-file ceiling (persona + CLAUDE.local.md,
- *      symlinks resolved, shared files counted/flagged once fleet-wide) plus
- *      a banned-pattern scan for dates/issue-refs/"Current Focus" headers —
+ *   3b. instructionStack (no history, no band): container/CLAUDE.md ceiling,
+ *      per-group standing-file ceiling (persona + CLAUDE.local.md, symlinks
+ *      resolved, shared files counted/flagged once fleet-wide) with a
+ *      banned-pattern scan for dates/issue-refs/"Current Focus" headers, and
+ *      per-group effectiveStackBytes ceiling on the FLATTENED composed doc a
+ *      container agent actually receives (AGENTS.md when present, else
+ *      flatten(CLAUDE.md) + CLAUDE.local.md) — size only, no pattern scan —
  *      see checkInstructionStack. docs/specs/instruction-stack-prune/plan.md.
  *   4. On breach, file one GitHub issue per breached metric on the origin repo
  *      via `gh`, labeled `fleet-drift`. An already-open issue whose title
@@ -51,6 +54,7 @@ import { pathToFileURL } from 'node:url';
 import Database from 'better-sqlite3';
 
 import { DATA_DIR, REPO_ROOT } from '../src/config.js';
+import { flattenClaudeMd } from '../src/agents-md-flatten.js';
 
 // ─────────────────────────── pure logic (exported for tests) ──────────────
 
@@ -280,7 +284,9 @@ function collectScheduledTaskHealth(dataDir: string): { pausedSeriesKeys: string
       const db = new Database(inboundPath, { readonly: true });
       try {
         const rows = db
-          .prepare(`SELECT id, series_id, status, seq, timestamp FROM messages_in WHERE kind = 'task' ORDER BY seq DESC`)
+          .prepare(
+            `SELECT id, series_id, status, seq, timestamp FROM messages_in WHERE kind = 'task' ORDER BY seq DESC`,
+          )
           .all() as TaskRow[];
         for (const [seriesKey, stat] of computeSeriesStats(rows)) {
           if (isLiveForStreak(stat.latestStatus) && stat.failedStreak > failedStreakMax) {
@@ -425,7 +431,7 @@ export function scanBannedPatterns(content: string): string[] {
 }
 
 export interface InstructionStackBreach {
-  metric: 'containerBytes' | 'groupStandingBytes';
+  metric: 'containerBytes' | 'groupStandingBytes' | 'effectiveStackBytes';
   scope: string; // 'container/CLAUDE.md', or the sorted group name(s) sharing the flagged file(s)
   bytes: number;
   ceiling: number;
@@ -435,7 +441,10 @@ export interface InstructionStackBreach {
 }
 
 /** container/CLAUDE.md ceiling + banned-pattern check. Returns null when clean. */
-export function checkContainerBytes(containerClaudeMdPath: string, ceiling = CONTAINER_BYTES_CEILING): InstructionStackBreach | null {
+export function checkContainerBytes(
+  containerClaudeMdPath: string,
+  ceiling = CONTAINER_BYTES_CEILING,
+): InstructionStackBreach | null {
   const content = fs.readFileSync(containerClaudeMdPath, 'utf-8');
   const bytes = Buffer.byteLength(content, 'utf-8');
   const patterns = scanBannedPatterns(content);
@@ -512,7 +521,8 @@ function resolveStandingFile(p: string, groupsRootResolved: string): { realPath:
   }
 
   if (!stat.isFile()) return { skip: 'not a regular file' };
-  if (stat.size > MAX_STANDING_FILE_BYTES) return { skip: `exceeds ${MAX_STANDING_FILE_BYTES} B safety cap (${stat.size} B)` };
+  if (stat.size > MAX_STANDING_FILE_BYTES)
+    return { skip: `exceeds ${MAX_STANDING_FILE_BYTES} B safety cap (${stat.size} B)` };
   return { realPath };
 }
 
@@ -520,7 +530,10 @@ function resolveStandingFile(p: string, groupsRootResolved: string): { realPath:
 const MAX_STANDING_FILE_BYTES = 1_000_000;
 
 /** Reads one group's standing files, resolving symlinks to their real target so a shared file is read (and counted) once. Unsafe candidates are skipped, never read. */
-function readGroupStandingFiles(groupDir: string, groupsRootResolved: string): { files: StandingFileInfo[]; unscannable: UnscannableFile[] } {
+function readGroupStandingFiles(
+  groupDir: string,
+  groupsRootResolved: string,
+): { files: StandingFileInfo[]; unscannable: UnscannableFile[] } {
   const files: StandingFileInfo[] = [];
   const unscannable: UnscannableFile[] = [];
   const group = path.basename(groupDir);
@@ -533,7 +546,11 @@ function readGroupStandingFiles(groupDir: string, groupsRootResolved: string): {
       continue;
     }
     const content = fs.readFileSync(resolved.realPath, 'utf-8');
-    files.push({ realPath: resolved.realPath, bytes: Buffer.byteLength(content, 'utf-8'), bannedHits: scanBannedPatterns(content) });
+    files.push({
+      realPath: resolved.realPath,
+      bytes: Buffer.byteLength(content, 'utf-8'),
+      bannedHits: scanBannedPatterns(content),
+    });
   }
   return { files, unscannable };
 }
@@ -555,10 +572,15 @@ function readGroupStandingFiles(groupDir: string, groupsRootResolved: string): {
  * shape, so a shared file's hit is reported once no matter how many groups
  * reference it.
  */
-export function checkGroupStandingBytes(groupsRoot: string, ceiling = GROUP_STANDING_BYTES_CEILING): InstructionStackBreach[] {
+export function checkGroupStandingBytes(
+  groupsRoot: string,
+  ceiling = GROUP_STANDING_BYTES_CEILING,
+): InstructionStackBreach[] {
   if (!fs.existsSync(groupsRoot)) return [];
   const groupsRootResolved = fs.realpathSync(groupsRoot);
-  const groupNames = fs.readdirSync(groupsRoot).filter((name) => fs.statSync(path.join(groupsRoot, name)).isDirectory());
+  const groupNames = fs
+    .readdirSync(groupsRoot)
+    .filter((name) => fs.statSync(path.join(groupsRoot, name)).isDirectory());
 
   const clusters = new Map<string, { groups: string[]; files: Map<string, StandingFileInfo> }>();
   const byRealPath = new Map<string, { bannedHits: string[]; groups: Set<string> }>();
@@ -617,31 +639,154 @@ export function checkGroupStandingBytes(groupsRoot: string, ceiling = GROUP_STAN
     });
   }
 
-  const unscannableByGroup = new Map<string, UnscannableFile[]>();
-  for (const u of allUnscannable) {
-    const arr = unscannableByGroup.get(u.group);
-    if (arr) arr.push(u);
-    else unscannableByGroup.set(u.group, [u]);
-  }
-  for (const [group, items] of unscannableByGroup) {
-    breaches.push({
-      metric: 'groupStandingBytes',
-      scope: group,
-      bytes: 0,
-      ceiling,
-      overCeiling: false,
-      bannedHits: [],
-      unscannable: items.map(({ path: p, reason }) => ({ file: p, reason })),
-    });
-  }
-
+  breaches.push(...unscannableBreaches('groupStandingBytes', ceiling, allUnscannable));
   return breaches;
 }
 
-/** Both metrics together — the core L4 check. Kept as two ceilings (not summed): a shared base file must not guarantee a false breach of every group's ceiling. */
+/** One breach per group with any unscannable candidate file — shared by every metric that gates reads through resolveStandingFile. */
+function unscannableBreaches(
+  metric: InstructionStackBreach['metric'],
+  ceiling: number,
+  items: UnscannableFile[],
+): InstructionStackBreach[] {
+  const byGroup = new Map<string, UnscannableFile[]>();
+  for (const u of items) {
+    const arr = byGroup.get(u.group);
+    if (arr) arr.push(u);
+    else byGroup.set(u.group, [u]);
+  }
+  return [...byGroup.entries()].map(([group, files]) => ({
+    metric,
+    scope: group,
+    bytes: 0,
+    ceiling,
+    overCeiling: false,
+    bannedHits: [],
+    unscannable: files.map(({ path: p, reason }) => ({ file: p, reason })),
+  }));
+}
+
+/** ponytail: sanity cap on the flattened doc, same reasoning as MAX_STANDING_FILE_BYTES — no legitimate composed stack gets remotely close. */
+export const EFFECTIVE_STACK_BYTES_CEILING = 24_576;
+
+// Mirrors src/claude-md-compose.ts:219-273's containerToHost map exactly (not
+// imported — those are module-private consts there, and this is a read-only
+// metrics job in a different file, not a shared library). If compose's
+// container-path scheme changes, update both.
+const COMPOSE_CONTAINER_TO_HOST = (repoRoot: string): Record<string, string> => ({
+  '/app/CLAUDE.md': path.join(repoRoot, 'container', 'CLAUDE.md'),
+  '/app/skills': path.join(repoRoot, 'container', 'skills'),
+  '/app/src/mcp-tools': path.join(repoRoot, 'container', 'agent-runner', 'src', 'mcp-tools'),
+});
+
+/**
+ * The bytes one group's container agent actually receives as its always-on
+ * project doc — not just the authored top-level file. For a group with an
+ * on-disk AGENTS.md, that file already IS the flattened artifact (every
+ * provider gets one; `composeGroupClaudeMd` writes it regardless of which
+ * provider the group runs, and its content is provider-agnostic since Claude
+ * groups compose the same way minus provider-gated fragments). Only when
+ * AGENTS.md is absent (group never spawned, or cleaned) do we fall back to
+ * flattening CLAUDE.md ourselves and adding CLAUDE.local.md's bytes on top —
+ * Claude Code auto-discovers CLAUDE.local.md independently of the @-import
+ * chain, so it is never embedded in CLAUDE.md itself.
+ *
+ * Returns bytes: null when the group has no composed doc on disk at all
+ * (not a breach — just nothing to measure yet, same convention as an absent
+ * standing file).
+ */
+function measureEffectiveStack(
+  groupDir: string,
+  groupsRootResolved: string,
+): { bytes: number | null; unscannable: UnscannableFile[] } {
+  const group = path.basename(groupDir);
+  const unscannable: UnscannableFile[] = [];
+
+  const agentsPath = path.join(groupDir, 'AGENTS.md');
+  const agents = resolveStandingFile(agentsPath, groupsRootResolved);
+  if (agents !== null) {
+    if ('skip' in agents) {
+      unscannable.push({ group, path: agentsPath, reason: agents.skip });
+      return { bytes: null, unscannable };
+    }
+    const content = fs.readFileSync(agents.realPath, 'utf-8');
+    return { bytes: Buffer.byteLength(content, 'utf-8'), unscannable };
+  }
+
+  // No AGENTS.md — fall back to flattening CLAUDE.md + CLAUDE.local.md.
+  const claudeMdPath = path.join(groupDir, 'CLAUDE.md');
+  const claudeMd = resolveStandingFile(claudeMdPath, groupsRootResolved);
+  if (claudeMd === null) return { bytes: null, unscannable }; // never spawned — nothing composed yet
+  if ('skip' in claudeMd) {
+    unscannable.push({ group, path: claudeMdPath, reason: claudeMd.skip });
+    return { bytes: null, unscannable };
+  }
+
+  const flattened = flattenClaudeMd(claudeMd.realPath, {
+    containerToHost: COMPOSE_CONTAINER_TO_HOST(path.resolve(groupsRootResolved, '..')),
+  });
+  let bytes = Buffer.byteLength(flattened, 'utf-8');
+
+  const localPath = path.join(groupDir, 'CLAUDE.local.md');
+  const local = resolveStandingFile(localPath, groupsRootResolved);
+  if (local !== null) {
+    if ('skip' in local) unscannable.push({ group, path: localPath, reason: local.skip });
+    else bytes += Buffer.byteLength(fs.readFileSync(local.realPath, 'utf-8'), 'utf-8');
+  }
+
+  return { bytes, unscannable };
+}
+
+/**
+ * Per-group effective-stack ceiling — the flattened doc a container agent
+ * actually receives, not just the authored standing files (which is what
+ * groupStandingBytes measures). Size only: banned-pattern content was
+ * already scanned at its source file by groupStandingBytes/containerBytes;
+ * re-scanning the flattened doc would just re-flag the same hit under a
+ * different metric and false-positive on shared-base example text that
+ * happens to get inlined here.
+ */
+export function checkEffectiveStackBytes(
+  groupsRoot: string,
+  ceiling = EFFECTIVE_STACK_BYTES_CEILING,
+): InstructionStackBreach[] {
+  if (!fs.existsSync(groupsRoot)) return [];
+  const groupsRootResolved = fs.realpathSync(groupsRoot);
+  const groupNames = fs
+    .readdirSync(groupsRoot)
+    .filter((name) => fs.statSync(path.join(groupsRoot, name)).isDirectory());
+
+  const breaches: InstructionStackBreach[] = [];
+  const allUnscannable: UnscannableFile[] = [];
+
+  for (const group of groupNames) {
+    const { bytes, unscannable } = measureEffectiveStack(path.join(groupsRoot, group), groupsRootResolved);
+    allUnscannable.push(...unscannable);
+    if (bytes !== null && bytes > ceiling) {
+      breaches.push({
+        metric: 'effectiveStackBytes',
+        scope: group,
+        bytes,
+        ceiling,
+        overCeiling: true,
+        bannedHits: [],
+        unscannable: [],
+      });
+    }
+  }
+
+  breaches.push(...unscannableBreaches('effectiveStackBytes', ceiling, allUnscannable));
+  return breaches;
+}
+
+/** All three metrics together — the core L4 check. Kept as separate ceilings (never summed): a shared base file must not guarantee a false breach of every group's ceiling. */
 export function checkInstructionStack(containerClaudeMdPath: string, groupsRoot: string): InstructionStackBreach[] {
   const containerBreach = checkContainerBytes(containerClaudeMdPath);
-  return containerBreach ? [containerBreach, ...checkGroupStandingBytes(groupsRoot)] : checkGroupStandingBytes(groupsRoot);
+  return [
+    ...(containerBreach ? [containerBreach] : []),
+    ...checkGroupStandingBytes(groupsRoot),
+    ...checkEffectiveStackBytes(groupsRoot),
+  ];
 }
 
 function describeInstructionStackBreach(b: InstructionStackBreach): string {
@@ -740,7 +885,11 @@ export function main(): number {
     const realStatePath = path.join(fleetDriftDir, 'state.json');
     const priorMetrics = loadPriorMetrics(realNdjsonPath);
     const prevPauseState = readPauseState(realStatePath);
-    const { state: newPauseState, oldestPausedDays } = advancePauseState(prevPauseState, raw.taskHealth.pausedSeriesKeys, nowIso);
+    const { state: newPauseState, oldestPausedDays } = advancePauseState(
+      prevPauseState,
+      raw.taskHealth.pausedSeriesKeys,
+      nowIso,
+    );
 
     const metrics: StoredMetrics = {
       ts: nowIso,

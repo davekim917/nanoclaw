@@ -18,10 +18,12 @@ import {
   scanBannedPatterns,
   checkContainerBytes,
   checkGroupStandingBytes,
+  checkEffectiveStackBytes,
   checkInstructionStack,
   instructionStackBreachKind,
   CONTAINER_BYTES_CEILING,
   GROUP_STANDING_BYTES_CEILING,
+  EFFECTIVE_STACK_BYTES_CEILING,
 } from './fleet-drift.js';
 
 /** Mirrors src/log.ts's `ts()` — local wall-clock, not UTC. Kept TZ-agnostic by building both the log
@@ -110,10 +112,7 @@ describe('failedStreakBreach', () => {
 });
 
 describe('isDuplicateBreach (dedup — stands in for a stubbed `gh issue list --json title` result)', () => {
-  const openTitles = [
-    'fleet-drift: error_events_24h out of band (2026-08-29)',
-    'some unrelated issue',
-  ];
+  const openTitles = ['fleet-drift: error_events_24h out of band (2026-08-29)', 'some unrelated issue'];
   it('suppresses a metric with an already-open issue', () => {
     expect(isDuplicateBreach(openTitles, 'error_events_24h')).toBe(true);
   });
@@ -158,7 +157,11 @@ describe('computeSeriesStats', () => {
     // latestStatus/latestTimestamp come from the highest-seq row regardless of status (paused).
     // failedStreak is computed separately over the completed/failed subsequence only (t2 'failed'
     // then t1 'completed' breaks it) — the paused row isn't part of that subsequence at all.
-    expect(stats.get('s1')).toEqual({ latestStatus: 'paused', latestTimestamp: '2026-08-30T00:00:00.000Z', failedStreak: 1 });
+    expect(stats.get('s1')).toEqual({
+      latestStatus: 'paused',
+      latestTimestamp: '2026-08-30T00:00:00.000Z',
+      failedStreak: 1,
+    });
   });
 
   it('counts a trailing failed streak, stopping at the first completed row', () => {
@@ -283,7 +286,11 @@ describe('advancePauseState', () => {
   });
 
   it('no currently-paused series → empty state, zero age', () => {
-    const { state, oldestPausedDays } = advancePauseState({ s1: '2026-08-01T00:00:00.000Z' }, [], '2026-08-30T00:00:00.000Z');
+    const { state, oldestPausedDays } = advancePauseState(
+      { s1: '2026-08-01T00:00:00.000Z' },
+      [],
+      '2026-08-30T00:00:00.000Z',
+    );
     expect(state).toEqual({});
     expect(oldestPausedDays).toBe(0);
   });
@@ -611,5 +618,102 @@ describe('checkInstructionStack', () => {
     }
 
     expect(checkInstructionStack(containerPath, groupsRoot)).toEqual([]);
+  });
+});
+
+describe('checkEffectiveStackBytes', () => {
+  const TMP = '/tmp/nanoclaw-fleet-drift-effective-stack-test';
+  const groupsRoot = () => path.join(TMP, 'groups');
+
+  beforeEach(() => {
+    fs.rmSync(TMP, { recursive: true, force: true });
+    fs.mkdirSync(TMP, { recursive: true });
+  });
+  afterEach(() => fs.rmSync(TMP, { recursive: true, force: true }));
+
+  it('flattens an @-import chain, producing a larger effective size than the top-level file alone', () => {
+    const g = path.join(groupsRoot(), 'chain-group');
+    fs.mkdirSync(g, { recursive: true });
+    // Top file is tiny — only breaches once the inlined fragment is counted, proving flattening happened.
+    fs.writeFileSync(path.join(g, 'fragment.md'), cleanContent(EFFECTIVE_STACK_BYTES_CEILING + 1000));
+    fs.writeFileSync(path.join(g, 'CLAUDE.md'), '@./fragment.md\n');
+
+    const breaches = checkEffectiveStackBytes(groupsRoot());
+    expect(breaches).toHaveLength(1);
+    expect(breaches[0].scope).toBe('chain-group');
+    expect(breaches[0].overCeiling).toBe(true);
+  });
+
+  it('measures a group with an on-disk AGENTS.md directly, not by re-flattening CLAUDE.md', () => {
+    const g = path.join(groupsRoot(), 'agents-group');
+    fs.mkdirSync(g, { recursive: true });
+    // CLAUDE.md alone is small — would NOT breach if it (wrongly) got measured instead of AGENTS.md.
+    fs.writeFileSync(path.join(g, 'CLAUDE.md'), cleanContent(2000));
+    fs.writeFileSync(path.join(g, 'AGENTS.md'), cleanContent(EFFECTIVE_STACK_BYTES_CEILING + 1000));
+
+    const breaches = checkEffectiveStackBytes(groupsRoot());
+    expect(breaches).toHaveLength(1);
+    expect(breaches[0].scope).toBe('agents-group');
+    expect(breaches[0].bytes).toBe(EFFECTIVE_STACK_BYTES_CEILING + 1000);
+  });
+
+  it('a ceiling breach carries the effectiveStackBytes metric and "ceiling" kind', () => {
+    const g = path.join(groupsRoot(), 'over-group');
+    fs.mkdirSync(g, { recursive: true });
+    fs.writeFileSync(path.join(g, 'AGENTS.md'), cleanContent(EFFECTIVE_STACK_BYTES_CEILING + 1));
+
+    const breaches = checkEffectiveStackBytes(groupsRoot());
+    expect(breaches).toHaveLength(1);
+    expect(breaches[0].metric).toBe('effectiveStackBytes');
+    expect(instructionStackBreachKind(breaches[0])).toBe('ceiling');
+  });
+
+  it('does not banned-pattern-scan the flattened doc — size only', () => {
+    const g = path.join(groupsRoot(), 'dated-agents-group');
+    fs.mkdirSync(g, { recursive: true });
+    // Banned content, but small — under ceiling, and must not itself trigger a breach.
+    fs.writeFileSync(path.join(g, 'AGENTS.md'), `Fixed on 2026-08-31 (#123).\n${cleanContent(200)}`);
+    expect(checkEffectiveStackBytes(groupsRoot())).toEqual([]);
+  });
+
+  it('a stale/dangling @-import does not crash the check (flattenClaudeMd degrades to a comment marker, per its own documented behavior)', () => {
+    const g = path.join(groupsRoot(), 'dangling-group');
+    fs.mkdirSync(g, { recursive: true });
+    // No AGENTS.md — forces the flatten fallback path; the referenced target is never created.
+    fs.writeFileSync(path.join(g, 'CLAUDE.md'), '@./does-not-exist.md\n');
+
+    expect(() => checkEffectiveStackBytes(groupsRoot())).not.toThrow();
+    expect(checkEffectiveStackBytes(groupsRoot())).toEqual([]); // placeholder comment is tiny, well under ceiling
+  });
+
+  it('adds CLAUDE.local.md bytes on top of the flattened CLAUDE.md when no AGENTS.md is present', () => {
+    const g = path.join(groupsRoot(), 'local-add-group');
+    fs.mkdirSync(g, { recursive: true });
+    fs.writeFileSync(path.join(g, 'CLAUDE.md'), cleanContent(2000));
+    fs.writeFileSync(path.join(g, 'CLAUDE.local.md'), cleanContent(5000));
+    // Neither file alone breaches; only their sum does — proves CLAUDE.local.md is added, not embedded/ignored.
+    expect(checkEffectiveStackBytes(groupsRoot())).toEqual([]);
+
+    fs.writeFileSync(path.join(g, 'CLAUDE.local.md'), cleanContent(EFFECTIVE_STACK_BYTES_CEILING));
+    const breaches = checkEffectiveStackBytes(groupsRoot());
+    expect(breaches).toHaveLength(1);
+    expect(breaches[0].bytes).toBe(2000 + EFFECTIVE_STACK_BYTES_CEILING);
+  });
+
+  it('a group with no composed doc at all (never spawned) is silently skipped, not a breach', () => {
+    const g = path.join(groupsRoot(), 'never-spawned-group');
+    fs.mkdirSync(g, { recursive: true });
+    expect(checkEffectiveStackBytes(groupsRoot())).toEqual([]);
+  });
+
+  it('checkInstructionStack includes effectiveStackBytes breaches alongside the other two metrics', () => {
+    const containerPath = path.join(TMP, 'container-CLAUDE.md');
+    fs.writeFileSync(containerPath, cleanContent(2000));
+    const g = path.join(groupsRoot(), 'combined-group');
+    fs.mkdirSync(g, { recursive: true });
+    fs.writeFileSync(path.join(g, 'AGENTS.md'), cleanContent(EFFECTIVE_STACK_BYTES_CEILING + 1));
+
+    const breaches = checkInstructionStack(containerPath, groupsRoot());
+    expect(breaches.some((b) => b.metric === 'effectiveStackBytes')).toBe(true);
   });
 });
