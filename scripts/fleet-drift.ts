@@ -22,7 +22,13 @@
  *      ×1.4826) of the prior series, with a flat-zero guard when MAD is 0.
  *      paused_series and failed_streak_max use fixed thresholds instead (no
  *      band — see pausedSeriesBreach/failedStreakBreach). Fewer than 7 prior
- *      days of history → print a warm-up notice and exit 0.
+ *      days of history → print a warm-up notice and exit 0 (the instruction-
+ *      stack tripwire below has no history dependency and still runs).
+ *   3b. instructionStack (no history, no band): container/CLAUDE.md ceiling
+ *      and per-group standing-file ceiling (persona + CLAUDE.local.md,
+ *      symlinks resolved, shared files counted/flagged once fleet-wide) plus
+ *      a banned-pattern scan for dates/issue-refs/"Current Focus" headers —
+ *      see checkInstructionStack. docs/specs/instruction-stack-prune/plan.md.
  *   4. On breach, file one GitHub issue per breached metric on the origin repo
  *      via `gh`, labeled `fleet-drift`. An already-open issue whose title
  *      starts with `fleet-drift: <metric>` suppresses re-filing — the open
@@ -388,6 +394,149 @@ function detectBreaches(metrics: StoredMetrics, priorMetrics: StoredMetrics[]): 
   return breaches;
 }
 
+// ────────────────────── L4: instruction-stack tripwire ─────────────────────
+//
+// Re-inflation / staleness guard for the always-on instruction surface
+// (docs/specs/instruction-stack-prune/plan.md). Two independent byte
+// ceilings — container/CLAUDE.md alone, and each group's standing files —
+// plus a banned-pattern scan (dates, issue/PR refs, "Current Focus" headers)
+// that would mean an agent wrote point-in-time facts into a file that's
+// supposed to hold only timeless rules. No LLM, no history, no new timer —
+// this reads the current tree and reports, same as any other check here.
+
+/** container/CLAUDE.md alone (shared base, not persona/fragments). */
+export const CONTAINER_BYTES_CEILING = 10_240;
+/** Per group: its standing-instructions/persona file(s) + CLAUDE.local.md. */
+export const GROUP_STANDING_BYTES_CEILING = 8_192;
+
+/**
+ * Both persona filenames are read during the L2/L3 rename transition
+ * (`instructions.prepend.md` → `standing-instructions.md`): a group carries
+ * one or the other. If a migration bug leaves both as real (non-symlink)
+ * files, both get counted — that's a real doubling of always-on content and
+ * should push the group over ceiling, not be silently averaged away.
+ */
+const GROUP_STANDING_FILENAMES = ['standing-instructions.md', 'instructions.prepend.md', 'CLAUDE.local.md'];
+
+const BANNED_PATTERNS: Array<{ name: string; re: RegExp }> = [
+  { name: 'iso_date', re: /\b20\d{2}-\d{2}-\d{2}\b/ },
+  { name: 'issue_or_pr_ref', re: /(?:^|\s)#\d{2,}\b/ },
+  { name: 'xzo_ref', re: /\bXZO-\d+\b/ },
+  { name: 'current_focus_header', re: /^#+\s*Current Focus/im },
+];
+
+/** Names every banned pattern found in `content` — point-in-time facts that don't belong in a standing instruction file. */
+export function scanBannedPatterns(content: string): string[] {
+  return BANNED_PATTERNS.filter(({ re }) => re.test(content)).map(({ name }) => name);
+}
+
+export interface InstructionStackBreach {
+  metric: 'containerBytes' | 'groupStandingBytes';
+  scope: string; // 'container/CLAUDE.md', or the sorted group name(s) sharing the flagged file(s)
+  bytes: number;
+  ceiling: number;
+  overCeiling: boolean;
+  bannedHits: Array<{ file: string; patterns: string[] }>;
+}
+
+/** container/CLAUDE.md ceiling + banned-pattern check. Returns null when clean. */
+export function checkContainerBytes(containerClaudeMdPath: string, ceiling = CONTAINER_BYTES_CEILING): InstructionStackBreach | null {
+  const content = fs.readFileSync(containerClaudeMdPath, 'utf-8');
+  const bytes = Buffer.byteLength(content, 'utf-8');
+  const patterns = scanBannedPatterns(content);
+  const overCeiling = bytes > ceiling;
+  if (!overCeiling && patterns.length === 0) return null;
+  return {
+    metric: 'containerBytes',
+    scope: 'container/CLAUDE.md',
+    bytes,
+    ceiling,
+    overCeiling,
+    bannedHits: patterns.length ? [{ file: containerClaudeMdPath, patterns }] : [],
+  };
+}
+
+interface StandingFileInfo {
+  realPath: string;
+  bytes: number;
+  bannedHits: string[];
+}
+
+/** Reads one group's standing files, resolving symlinks to their real target so a shared file is read (and counted) once. */
+function readGroupStandingFiles(groupDir: string): StandingFileInfo[] {
+  const infos: StandingFileInfo[] = [];
+  for (const name of GROUP_STANDING_FILENAMES) {
+    const p = path.join(groupDir, name);
+    if (!fs.existsSync(p)) continue;
+    const realPath = fs.realpathSync(p);
+    const content = fs.readFileSync(realPath, 'utf-8');
+    infos.push({ realPath, bytes: Buffer.byteLength(content, 'utf-8'), bannedHits: scanBannedPatterns(content) });
+  }
+  return infos;
+}
+
+/**
+ * Per-group standing-file ceiling + banned-pattern check across every group
+ * under `groupsRoot`. Sibling groups commonly symlink their ENTIRE standing
+ * file set to one source group (e.g. a codex/opencode sibling → its Claude
+ * counterpart) — those groups are clustered by the exact set of real files
+ * they resolve to, so the shared content's bytes and any banned-pattern hit
+ * are counted and flagged once fleet-wide, not once per sibling.
+ */
+export function checkGroupStandingBytes(groupsRoot: string, ceiling = GROUP_STANDING_BYTES_CEILING): InstructionStackBreach[] {
+  if (!fs.existsSync(groupsRoot)) return [];
+  const groupNames = fs.readdirSync(groupsRoot).filter((name) => fs.statSync(path.join(groupsRoot, name)).isDirectory());
+
+  const clusters = new Map<string, { groups: string[]; files: Map<string, StandingFileInfo> }>();
+  for (const group of groupNames) {
+    const files = readGroupStandingFiles(path.join(groupsRoot, group));
+    if (files.length === 0) continue;
+    const signature = files
+      .map((f) => f.realPath)
+      .sort()
+      .join('|');
+    let cluster = clusters.get(signature);
+    if (!cluster) {
+      cluster = { groups: [], files: new Map(files.map((f) => [f.realPath, f])) };
+      clusters.set(signature, cluster);
+    }
+    cluster.groups.push(group);
+  }
+
+  const breaches: InstructionStackBreach[] = [];
+  for (const { groups, files } of clusters.values()) {
+    const fileList = [...files.values()];
+    const bytes = fileList.reduce((sum, f) => sum + f.bytes, 0);
+    const bannedHits = fileList.filter((f) => f.bannedHits.length > 0).map((f) => ({ file: f.realPath, patterns: f.bannedHits }));
+    const overCeiling = bytes > ceiling;
+    if (!overCeiling && bannedHits.length === 0) continue;
+    breaches.push({ metric: 'groupStandingBytes', scope: [...groups].sort().join(', '), bytes, ceiling, overCeiling, bannedHits });
+  }
+  return breaches;
+}
+
+/** Both metrics together — the core L4 check. Kept as two ceilings (not summed): a shared base file must not guarantee a false breach of every group's ceiling. */
+export function checkInstructionStack(containerClaudeMdPath: string, groupsRoot: string): InstructionStackBreach[] {
+  const containerBreach = checkContainerBytes(containerClaudeMdPath);
+  return containerBreach ? [containerBreach, ...checkGroupStandingBytes(groupsRoot)] : checkGroupStandingBytes(groupsRoot);
+}
+
+function describeInstructionStackBreach(b: InstructionStackBreach): string {
+  const parts: string[] = [];
+  if (b.overCeiling) parts.push(`${b.bytes} B > ceiling ${b.ceiling} B`);
+  for (const hit of b.bannedHits) parts.push(`banned pattern(s) [${hit.patterns.join(', ')}] in ${hit.file}`);
+  return parts.join('; ');
+}
+
+function detectInstructionStackBreaches(containerClaudeMdPath: string, groupsRoot: string): Breach[] {
+  return checkInstructionStack(containerClaudeMdPath, groupsRoot).map((b) => ({
+    metric: `instructionStack:${b.metric}:${b.scope}`,
+    todayValue: b.bytes,
+    ruleDescription: describeInstructionStackBreach(b),
+    last7RawValues: [b.bytes],
+  }));
+}
+
 // ───────────────────────────── GitHub issue filing ─────────────────────────
 
 function fetchOpenFleetDriftTitles(): string[] {
@@ -436,6 +585,16 @@ function fileBreachIssues(breaches: Breach[]): void {
   }
 }
 
+function logAndFileBreaches(breaches: Breach[], dryRun: boolean): void {
+  for (const b of breaches) console.log(`fleet-drift: BREACH ${b.metric} — ${b.ruleDescription}`);
+  if (breaches.length === 0) return;
+  if (dryRun) {
+    console.log(`fleet-drift: dry run — skipping gh issue create for: ${breaches.map((b) => b.metric).join(', ')}`);
+  } else {
+    fileBreachIssues(breaches);
+  }
+}
+
 // ──────────────────────────────────── main ─────────────────────────────────
 
 export function main(): number {
@@ -479,23 +638,23 @@ export function main(): number {
       );
     }
 
+    // Instruction-stack tripwire (L4): a static tree check, independent of the
+    // banded metrics' daily history — runs (and can file) even during warm-up.
+    const instructionStackBreaches = detectInstructionStackBreaches(
+      path.join(REPO_ROOT, 'container', 'CLAUDE.md'),
+      path.join(REPO_ROOT, 'groups'),
+    );
+
     if (isWarmingUp(priorMetrics.length)) {
       console.log(`fleet-drift: warming up (${priorMetrics.length}/7 runs of history)`);
+      logAndFileBreaches(instructionStackBreaches, dryRun);
       return 0;
     }
 
-    const breaches = detectBreaches(metrics, priorMetrics);
+    const breaches = [...detectBreaches(metrics, priorMetrics), ...instructionStackBreaches];
     const status = breaches.length > 0 ? 'breach' : 'ok';
     console.log(`fleet-drift: ${status} metrics=${JSON.stringify(metrics)}`);
-    for (const b of breaches) console.log(`fleet-drift: BREACH ${b.metric} — ${b.ruleDescription}`);
-
-    if (breaches.length > 0) {
-      if (dryRun) {
-        console.log(`fleet-drift: dry run — skipping gh issue create for: ${breaches.map((b) => b.metric).join(', ')}`);
-      } else {
-        fileBreachIssues(breaches);
-      }
-    }
+    logAndFileBreaches(breaches, dryRun);
 
     return 0;
   } catch (err) {
