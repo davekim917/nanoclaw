@@ -223,6 +223,47 @@ function preferenceStemMatches(stem: string, senderSlug: string): boolean {
   return stem === senderSlug || senderSlug.startsWith(`${stem}-`) || stem.startsWith(`${senderSlug}-`);
 }
 
+export interface PreferenceFrontmatter {
+  ids: string[];
+  body: string;
+}
+
+/**
+ * Parses the optional leading frontmatter of a `preferences/<slug>.md` file
+ * declaring the person's platform sender ids:
+ *
+ *   ---
+ *   ids: [U0TEST111AAA, U0TEST222BBB]
+ *   ---
+ *   # body...
+ *
+ * Deliberately NOT a YAML parser — this grammar is one line long: a literal
+ * `---\n` fence, one `ids: [...]` bracket-list line (entries trimmed, empties
+ * ignored), a closing `---\n` fence. Anything that doesn't match that exact
+ * shape (no opening fence, no `ids:` line, no closing fence) is treated as
+ * absent frontmatter: `ids` empty, `body` the full original content,
+ * unchanged. Never throws.
+ */
+export function parsePreferenceFrontmatter(content: string): PreferenceFrontmatter {
+  const OPEN = '---\n';
+  if (!content.startsWith(OPEN)) return { ids: [], body: content };
+  const idsLineEnd = content.indexOf('\n', OPEN.length);
+  if (idsLineEnd === -1) return { ids: [], body: content };
+  const idsLine = content.slice(OPEN.length, idsLineEnd);
+  const idsMatch = idsLine.match(/^ids:\s*\[([^\]]*)\]\s*$/);
+  if (!idsMatch) return { ids: [], body: content };
+  const afterIdsLine = idsLineEnd + 1;
+  const CLOSE = '---\n';
+  if (content.slice(afterIdsLine, afterIdsLine + CLOSE.length) !== CLOSE) {
+    return { ids: [], body: content };
+  }
+  const ids = idsMatch[1]!
+    .split(',')
+    .map((entry) => entry.trim())
+    .filter((entry) => entry.length > 0);
+  return { ids, body: content.slice(afterIdsLine + CLOSE.length) };
+}
+
 function extractSenderName(normalizedContent: string): string | null {
   try {
     const parsed = JSON.parse(normalizedContent) as { sender?: unknown };
@@ -1118,6 +1159,13 @@ function listDirectMarkdownStems(root: string, dir: string, notices: ContextNoti
   return stems;
 }
 
+export interface InvolvedSenderGroup {
+  /** Archive's stable sender_id for this person, or null for the trigger-sender fallback group. */
+  senderId: string | null;
+  /** Per-message display name and, when resolved and different, the canonical users.display_name. */
+  aliases: readonly string[];
+}
+
 export function readMemoryEvidence(
   root: string,
   workgroupId: string,
@@ -1125,7 +1173,7 @@ export function readMemoryEvidence(
   includeBootstrap: boolean,
   seenEvidenceFingerprints: ReadonlySet<string>,
   bypassDedupe: boolean,
-  involvedSenders: ReadonlyArray<readonly string[]> = [],
+  involvedSenders: ReadonlyArray<InvolvedSenderGroup> = [],
 ): PreTurnContext['memoryEvidence'] {
   if (!fs.existsSync(root)) throw new Error(`canonical memory tree missing: ${root}`);
   const canonicalRoot = fs.realpathSync(root);
@@ -1156,21 +1204,26 @@ export function readMemoryEvidence(
   }
 
   // Deterministic per-person preference lane. Files under preferences/ are
-  // keyed by name slug and injected whole for the conversation's involved
-  // senders. ONE FILE PER PERSON, never per alias: `involvedSenders` groups
-  // each participant's aliases (their per-message display name and, when
-  // resolved, set and different, their canonical `users.display_name`) so a
-  // platform rename can't leave BOTH the pre-rename and post-rename
-  // preference file injected as conflicting guidance for the same human. For
-  // each group, aliases are tried IN ORDER — per-message name first,
-  // canonical name as fallback, preserving pre-PR behavior when both files
-  // happen to exist — using the exact-slug-wins-else-longest-stem rule below;
-  // the first alias that claims an unclaimed file wins and the group stops
-  // looking. An alias matching a file an earlier group already claimed falls
-  // through to the next alias — that file belongs to the other person.
-  // Never lexically ranked, so a preference cannot lose a relevance contest
-  // to unrelated memory. Reads run before the ranked scan so the shared byte
-  // budget cannot starve them.
+  // keyed by name slug (or, when the file declares an `ids:` frontmatter
+  // block, by explicit platform sender id) and injected whole for the
+  // conversation's involved senders. Selection tier, in order: (1) explicit
+  // `ids:` frontmatter — a file whose declared ids include the group's
+  // sender_id wins outright and skips name matching entirely; (2) per-message
+  // display name; (3) canonical `users.display_name`. ONE FILE PER PERSON,
+  // never per alias: `involvedSenders` groups each participant's aliases
+  // (their per-message display name and, when resolved, set and different,
+  // their canonical `users.display_name`) so a platform rename can't leave
+  // BOTH the pre-rename and post-rename preference file injected as
+  // conflicting guidance for the same human. For each group, name aliases are
+  // tried IN ORDER — per-message name first, canonical name as fallback,
+  // preserving pre-PR behavior when both files happen to exist — using the
+  // exact-slug-wins-else-longest-stem rule below; the first alias that claims
+  // an unclaimed file wins and the group stops looking. An alias (or id)
+  // matching a file an earlier group already claimed falls through — to the
+  // next alias for a name match, to name matching entirely for an id match —
+  // that file belongs to the other person. Never lexically ranked, so a
+  // preference cannot lose a relevance contest to unrelated memory. Reads run
+  // before the ranked scan so the shared byte budget cannot starve them.
   const preferenceExcerpts: MemoryEvidenceExcerpt[] = [];
   if (involvedSenders.length > 0) {
     const preferenceStems = listDirectMarkdownStems(root, PREFERENCES_DIR, notices);
@@ -1184,11 +1237,66 @@ export function readMemoryEvidence(
         .sort((a, b) => b.length - a.length || compareCodepoint(a, b));
       return compatible[0];
     };
+    // Every preferences/ file is read AT MOST ONCE per turn, cached here —
+    // the id tier below needs each file's frontmatter to build the id map,
+    // and the selection loop further down needs the same file's content
+    // (for a matched file) to build the injected excerpt. Caching (rather
+    // than reading twice) also keeps a read FAILURE a one-time event: without
+    // it, a file whose read throws once (e.g. the security check in
+    // `readBoundedFile` rejecting a symlink-swapped ancestor) would silently
+    // succeed on a second, unrelated read attempt and the resulting
+    // `preference-read-failed` notice would never fire.
+    const preferenceFileReads = new Map<string, { content: string } | { error: unknown }>();
+    const readPreferenceFile = (relative: string): { content: string } | { error: unknown } => {
+      const cached = preferenceFileReads.get(relative);
+      if (cached) return cached;
+      let result: { content: string } | { error: unknown };
+      try {
+        result = { content: readBoundedFile(path.join(root, relative), canonicalRoot).content };
+      } catch (error) {
+        result = { error };
+      }
+      preferenceFileReads.set(relative, result);
+      return result;
+    };
+    // Explicit-id tier: index every preferences/ file's declared ids. An
+    // entry WITHOUT a colon matches the raw suffix after a sender_id's LAST
+    // colon (one entry covers every sibling-bot namespace); an entry WITH a
+    // colon must equal the full sender_id exactly.
+    const exactIdToRelative = new Map<string, string>();
+    const rawIdToRelative = new Map<string, string>();
+    for (const stem of preferenceStems) {
+      const relative = `${PREFERENCES_DIR}${stem}.md`;
+      const read = readPreferenceFile(relative);
+      if (!('content' in read)) continue;
+      for (const id of parsePreferenceFrontmatter(read.content).ids) {
+        if (id.includes(':')) exactIdToRelative.set(id, relative);
+        else rawIdToRelative.set(id, relative);
+      }
+    }
     const selectedRelatives = new Set<string>();
     const matched: string[] = [];
     for (const group of involvedSenders) {
       if (matched.length >= PRE_TURN_BOUNDS.preferenceExcerpts) break;
-      for (const alias of group) {
+
+      // Explicit id match wins over name/alias matching. Exact namespaced id
+      // first, then the raw (post-last-colon) suffix.
+      let idRelative: string | undefined;
+      if (group.senderId !== null) {
+        idRelative = exactIdToRelative.get(group.senderId);
+        if (idRelative === undefined) {
+          const lastColon = group.senderId.lastIndexOf(':');
+          const rawSuffix = lastColon === -1 ? group.senderId : group.senderId.slice(lastColon + 1);
+          idRelative = rawIdToRelative.get(rawSuffix);
+        }
+      }
+      if (idRelative !== undefined && !selectedRelatives.has(idRelative)) {
+        selectedRelatives.add(idRelative);
+        matched.push(idRelative);
+        continue; // id match claims the file; skip name/alias matching for this group
+      }
+
+      for (const alias of group.aliases) {
         const slug = preferenceSlug(alias);
         if (slug.length === 0) continue;
         const stem = matchStem(slug);
@@ -1205,30 +1313,31 @@ export function readMemoryEvidence(
       }
     }
     for (const relative of matched.slice(0, PRE_TURN_BOUNDS.preferenceExcerpts)) {
-      try {
-        const read = readBoundedFile(path.join(root, relative), canonicalRoot);
-        const text = boundedText(read.content, PRE_TURN_BOUNDS.preferenceExcerptChars, TRUNCATED_MARKDOWN_EXCERPT);
-        preferenceExcerpts.push({
-          path: relative,
-          headings: headingsOf(read.content),
-          text,
-          score: Number.MAX_SAFE_INTEGER,
-          fingerprint: evidenceFingerprint(
-            'workgroup-memory-canon',
-            workgroupId,
-            `${relative}\0${sha256(text)}`,
-            read.content,
-          ),
-          provenance: { authority: 'workgroup-memory-canon', workgroupId },
-        });
-      } catch (error) {
+      const read = readPreferenceFile(relative);
+      if ('error' in read) {
         notices.push({
           source: 'markdown',
           status: 'degraded',
           code: 'preference-read-failed',
-          detail: `${relative}: ${error instanceof Error ? error.message : String(error)}`,
+          detail: `${relative}: ${read.error instanceof Error ? read.error.message : String(read.error)}`,
         });
+        continue;
       }
+      const { body } = parsePreferenceFrontmatter(read.content);
+      const text = boundedText(body, PRE_TURN_BOUNDS.preferenceExcerptChars, TRUNCATED_MARKDOWN_EXCERPT);
+      preferenceExcerpts.push({
+        path: relative,
+        headings: headingsOf(body),
+        text,
+        score: Number.MAX_SAFE_INTEGER,
+        fingerprint: evidenceFingerprint(
+          'workgroup-memory-canon',
+          workgroupId,
+          `${relative}\0${sha256(text)}`,
+          read.content,
+        ),
+        provenance: { authority: 'workgroup-memory-canon', workgroupId },
+      });
     }
     if (preferenceExcerpts.length > 0) {
       notices.push({
@@ -1566,15 +1675,16 @@ export function buildPreTurnContext(input: PreTurnContextInput): PreTurnContext 
   // Involved senders for the deterministic preference lane, grouped by
   // person so a platform rename can't inject BOTH the pre-rename and
   // post-rename preference file for the same human (see readMemoryEvidence).
-  // One group per recent conversation sender: [per-message senderName,
-  // canonical users.display_name] — canonical included only when resolved,
-  // set, and different from the per-message name, resolved via the archive's
-  // stable sender_id. Since the round-1 fix the triggering message is
+  // One group per recent conversation sender, carrying the archive's stable
+  // sender_id (for the explicit-`ids:`-frontmatter tier) alongside its name
+  // aliases: [per-message senderName, canonical users.display_name] —
+  // canonical included only when resolved, set, and different from the
+  // per-message name. Since the round-1 fix the triggering message is
   // archived before this runs, so the trigger sender normally already
-  // appears as the newest recentConversationSenders row; a [triggerSender]
-  // group is prepended only when no existing group contains that name — the
-  // fallback for kinds that don't archive before this call.
-  const involvedSenders: string[][] = [];
+  // appears as the newest recentConversationSenders row; a fallback group
+  // (senderId: null) is prepended only when no existing group contains that
+  // name — for kinds that don't archive before this call.
+  const involvedSenders: InvolvedSenderGroup[] = [];
   try {
     for (const sender of recentConversationSenders({
       memberAgentGroupIds,
@@ -1582,9 +1692,9 @@ export function buildPreTurnContext(input: PreTurnContextInput): PreTurnContext 
       threadId: currentThreadId,
     })) {
       const canonicalName = sender.senderId ? getUser(sender.senderId)?.display_name : undefined;
-      involvedSenders.push(
-        canonicalName && canonicalName !== sender.senderName ? [sender.senderName, canonicalName] : [sender.senderName],
-      );
+      const aliases =
+        canonicalName && canonicalName !== sender.senderName ? [sender.senderName, canonicalName] : [sender.senderName];
+      involvedSenders.push({ senderId: sender.senderId, aliases });
     }
   } catch (error) {
     if (!(error instanceof Error)) throw error;
@@ -1596,8 +1706,8 @@ export function buildPreTurnContext(input: PreTurnContextInput): PreTurnContext 
     });
   }
   const triggerSender = extractSenderName(input.normalizedContent);
-  if (triggerSender && !involvedSenders.some((group) => group.includes(triggerSender))) {
-    involvedSenders.unshift([triggerSender]);
+  if (triggerSender && !involvedSenders.some((group) => group.aliases.includes(triggerSender))) {
+    involvedSenders.unshift({ senderId: null, aliases: [triggerSender] });
   }
 
   let memoryEvidence: PreTurnContext['memoryEvidence'];

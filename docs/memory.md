@@ -138,7 +138,11 @@ Every pair then contains only the newly relevant evidence delta:
 1. the preference files of the conversation's involved senders, matched by name
    slug — both the per-message display name and, resolved via the archive's
    stable sender id, the sender's canonical `users.display_name` — and
-   injected whole — deterministic, never ranked;
+   injected whole — deterministic, never ranked. A file may instead open with
+   an `ids: [...]` frontmatter block declaring the person's platform sender
+   ids (colon-namespaced for an exact match, or bare for a raw suffix shared
+   across sibling-bot namespaces); an id match wins over name matching and the
+   frontmatter itself is stripped before injection;
 2. up to three lexical archive excerpts, preferring the current thread;
 3. a separately bounded exact Slack/Discord permalink lane when the input
    contains a supported message link; and

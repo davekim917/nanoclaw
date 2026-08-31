@@ -49,6 +49,7 @@ import {
   buildPreTurnContext,
   enforceFinalBound,
   evaluateRecallCorpus,
+  parsePreferenceFrontmatter,
   PRE_TURN_BOUNDS,
   tokenizeForRecall,
   type ContextNotice,
@@ -1132,6 +1133,163 @@ describe('per-person preference recall', () => {
     const paths = result.memoryEvidence.excerpts.map((row) => row.path);
     expect(paths).toContain('preferences/sam.md');
     expect(paths).toContain('preferences/sam-rivera.md');
+  });
+
+  it('matches an ids: frontmatter file by raw suffix even when both name slugs miss', () => {
+    memoryFile('preferences/quinn-park.md', '---\nids: [U123]\n---\n# Quinn\nPrefers concise updates.');
+    // Renamed display name (misses the "quinn-park" slug) + a users row with
+    // a NULL canonical display_name (also misses) — the id tier is the only
+    // way this file can be claimed.
+    archiveFrom('m1', 'QP Renamed', '2026-08-01T00:00:00.000Z', 'discord:guild:channel:thread', 'slack-x:U123');
+    upsertUserRow('slack-x:U123', null);
+
+    const result = buildPreTurnContext({
+      agentGroupId: 'ag-a',
+      sessionId: 'sess-a',
+      kind: 'chat-sdk',
+      trigger: 1,
+      normalizedContent: JSON.stringify({ text: 'status?', sender: 'Pat Doe' }),
+    });
+
+    const paths = result.memoryEvidence.excerpts.map((row) => row.path);
+    expect(paths).toContain('preferences/quinn-park.md');
+  });
+
+  it('an exact namespaced id entry matches only that full sender_id', () => {
+    memoryFile('preferences/river-cole.md', '---\nids: [slack-x:U123]\n---\n# River\nWants terse replies.');
+    archiveFrom('m1', 'RC Alt', '2026-08-01T00:00:00.000Z', 'discord:guild:channel:thread', 'slack-x:U123');
+
+    const result = buildPreTurnContext({
+      agentGroupId: 'ag-a',
+      sessionId: 'sess-a',
+      kind: 'chat-sdk',
+      trigger: 1,
+      normalizedContent: JSON.stringify({ text: 'status?', sender: 'Pat Doe' }),
+    });
+
+    const paths = result.memoryEvidence.excerpts.map((row) => row.path);
+    expect(paths).toContain('preferences/river-cole.md');
+  });
+
+  it('a bare id entry does not match a different sender_id under the same namespace prefix', () => {
+    memoryFile('preferences/river-cole.md', '---\nids: [U123]\n---\n# River\nWants terse replies.');
+    // Different raw suffix (U9999, not U123) — must not match even though the
+    // namespace prefix "slack-x:" is shared.
+    archiveFrom('m1', 'RC Alt', '2026-08-01T00:00:00.000Z', 'discord:guild:channel:thread', 'slack-x:U9999');
+
+    const result = buildPreTurnContext({
+      agentGroupId: 'ag-a',
+      sessionId: 'sess-a',
+      kind: 'chat-sdk',
+      trigger: 1,
+      normalizedContent: JSON.stringify({ text: 'status?', sender: 'Pat Doe' }),
+    });
+
+    const paths = result.memoryEvidence.excerpts.map((row) => row.path);
+    expect(paths).not.toContain('preferences/river-cole.md');
+  });
+
+  it('an id match beats a name match for the same person', () => {
+    memoryFile('preferences/morgan-park.md', '# Morgan Park (stale)\nOld preferences — should not be used.');
+    memoryFile('preferences/current.md', '---\nids: [U500]\n---\n# Morgan\nCurrent preferences.');
+    // Display name slugs to morgan-park.md, but the declared id routes to
+    // current.md — the id tier must win and the name file must not appear.
+    archiveFrom('m1', 'Morgan Park', '2026-08-01T00:00:00.000Z', 'discord:guild:channel:thread', 'slack-x:U500');
+
+    const result = buildPreTurnContext({
+      agentGroupId: 'ag-a',
+      sessionId: 'sess-a',
+      kind: 'chat-sdk',
+      trigger: 1,
+      normalizedContent: JSON.stringify({ text: 'status?', sender: 'Pat Doe' }),
+    });
+
+    const paths = result.memoryEvidence.excerpts.map((row) => row.path);
+    expect(paths).toContain('preferences/current.md');
+    expect(paths).not.toContain('preferences/morgan-park.md');
+  });
+
+  it('strips ids: frontmatter from the injected excerpt text', () => {
+    memoryFile('preferences/sky-vance.md', '---\nids: [U777]\n---\n# Sky Vance\nPrefers bullet points.');
+    archiveFrom('m1', 'Sky Vance', '2026-08-01T00:00:00.000Z', 'discord:guild:channel:thread', 'slack-x:U777');
+
+    const result = buildPreTurnContext({
+      agentGroupId: 'ag-a',
+      sessionId: 'sess-a',
+      kind: 'chat-sdk',
+      trigger: 1,
+      normalizedContent: JSON.stringify({ text: 'status?', sender: 'Pat Doe' }),
+    });
+
+    const preference = result.memoryEvidence.excerpts.find((row) => row.path === 'preferences/sky-vance.md');
+    expect(preference).toBeDefined();
+    expect(preference!.text).not.toContain('---');
+    expect(preference!.text).not.toContain('ids:');
+    expect(preference!.text).toContain('Prefers bullet points');
+  });
+
+  it('treats malformed frontmatter (no closing fence) as body text and falls back to name matching', () => {
+    memoryFile('preferences/drew-lane.md', '---\nids: [U999]\nnot a closing fence\n# Drew Lane\nPrefers plain text.');
+    archiveFrom('m1', 'Drew Lane', '2026-08-01T00:00:00.000Z', 'discord:guild:channel:thread', 'slack-x:U999');
+
+    const result = buildPreTurnContext({
+      agentGroupId: 'ag-a',
+      sessionId: 'sess-a',
+      kind: 'chat-sdk',
+      trigger: 1,
+      normalizedContent: JSON.stringify({ text: 'status?', sender: 'Pat Doe' }),
+    });
+
+    // Malformed frontmatter means the id "U999" was never indexed, so the
+    // file is reached (if at all) only via the name-matching fallback — and
+    // its "malformed frontmatter" content is treated as ordinary body text,
+    // not stripped.
+    const preference = result.memoryEvidence.excerpts.find((row) => row.path === 'preferences/drew-lane.md');
+    expect(preference).toBeDefined();
+    expect(preference!.text).toContain('---');
+  });
+});
+
+describe('parsePreferenceFrontmatter', () => {
+  it('parses a bracket-form ids: line, trimming entries and dropping empties', () => {
+    const result = parsePreferenceFrontmatter(
+      '---\nids: [U0TEST111AAA,  U0TEST222BBB ,  ]\n---\n# Riley Shaw\nBody text.',
+    );
+    expect(result.ids).toEqual(['U0TEST111AAA', 'U0TEST222BBB']);
+    expect(result.body).toBe('# Riley Shaw\nBody text.');
+  });
+
+  it('returns ids empty and body unchanged when there is no frontmatter at all', () => {
+    const content = '# Riley Shaw\nNo frontmatter here.';
+    expect(parsePreferenceFrontmatter(content)).toEqual({ ids: [], body: content });
+  });
+
+  it('returns ids empty and body unchanged for an unclosed frontmatter fence', () => {
+    const content = '---\nids: [U1]\nno closing fence here\nrest of file';
+    expect(parsePreferenceFrontmatter(content)).toEqual({ ids: [], body: content });
+  });
+
+  it('returns ids empty and body unchanged when the fenced block has no ids: line', () => {
+    const content = '---\ntitle: not-ids\n---\n# Body';
+    expect(parsePreferenceFrontmatter(content)).toEqual({ ids: [], body: content });
+  });
+
+  it('returns ids empty and body unchanged for a lone opening fence with no following line', () => {
+    const content = '---\n';
+    expect(parsePreferenceFrontmatter(content)).toEqual({ ids: [], body: content });
+  });
+
+  it('never throws on arbitrary content', () => {
+    expect(() => parsePreferenceFrontmatter('')).not.toThrow();
+    expect(() => parsePreferenceFrontmatter('---')).not.toThrow();
+    expect(() => parsePreferenceFrontmatter('---\n---\n')).not.toThrow();
+    expect(() => parsePreferenceFrontmatter('ids: [U1]\n---\n')).not.toThrow();
+  });
+
+  it('supports a single id with no trailing comma', () => {
+    const result = parsePreferenceFrontmatter('---\nids: [U123]\n---\nbody');
+    expect(result.ids).toEqual(['U123']);
+    expect(result.body).toBe('body');
   });
 });
 
