@@ -703,4 +703,37 @@ describe('symlink overlay workgroup allowlist', () => {
     expect(containerPaths).not.toContain('/workspace/agent/STOLEN');
     expect(containerPaths).not.toContain('/workspace/agent/HOST');
   });
+
+  it('declares the redirected destination for an upward-escaping relative symlink', () => {
+    const ag = group('ag-rel', 'rel-main');
+    const sib = group('ag-rel-sib', 'rel-sib');
+    createAgentGroup(ag);
+    createAgentGroup(sib);
+    assignWorkgroup(ag, 'wg-rel');
+    assignWorkgroup(sib, 'wg-rel');
+    ensureContainerConfig(ag.id);
+
+    const groupDir = path.join(GROUPS_DIR, ag.folder);
+    fs.mkdirSync(groupDir, { recursive: true });
+    fs.mkdirSync(path.join(GROUPS_DIR, sib.folder, 'SHARED-REL'), { recursive: true });
+    // clone-as-codex's relative-symlink pattern. Docker resolves the mount
+    // destination through the container FS, where /workspace/agent IS this
+    // group dir — so `../rel-sib/SHARED-REL` really attaches at
+    // /workspace/rel-sib/SHARED-REL, inside the session-dir bind. Declaring
+    // that path lets spawnContainer pre-create the parent as the host user
+    // instead of leaving runc to create it root-owned.
+    fs.symlinkSync('../rel-sib/SHARED-REL', path.join(groupDir, 'SHARED-REL'));
+    // An absolute target resolves to itself — no redirect.
+    fs.mkdirSync(path.join(GROUPS_DIR, sib.folder, 'SHARED-ABS'), { recursive: true });
+    fs.symlinkSync(path.join(GROUPS_DIR, sib.folder, 'SHARED-ABS'), path.join(groupDir, 'SHARED-ABS'));
+
+    const mounts = buildMounts(ag, session('s-rel', ag.id), containerConfig(), 'claude', {}, 'wg-rel');
+    const containerPaths = mounts.map((m) => m.containerPath);
+    expect(containerPaths).toContain('/workspace/rel-sib/SHARED-REL');
+    expect(containerPaths).not.toContain('/workspace/agent/SHARED-REL');
+    expect(containerPaths).toContain('/workspace/agent/SHARED-ABS');
+    expect(mounts.find((m) => m.containerPath === '/workspace/rel-sib/SHARED-REL')?.hostPath).toBe(
+      fs.realpathSync(path.join(GROUPS_DIR, sib.folder, 'SHARED-REL')),
+    );
+  });
 });

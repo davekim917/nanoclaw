@@ -1826,8 +1826,10 @@ export function buildMounts(
     if (!entry.isSymbolicLink()) continue;
     const linkPath = path.join(groupDir, entry.name);
     let realTarget: string;
+    let rawTarget: string;
     try {
       realTarget = fs.realpathSync(linkPath);
+      rawTarget = fs.readlinkSync(linkPath);
     } catch {
       continue;
     }
@@ -1839,9 +1841,21 @@ export function buildMounts(
       });
       continue;
     }
+    // Docker resolves a mount DESTINATION through the container's own
+    // filesystem, and /workspace/agent is this group dir — so a relative
+    // symlink that escapes upward redirects the destination out of the group
+    // mount and back into the session-dir bind at /workspace (clone-as-codex's
+    // `CLAUDE.local.md -> ../<seed>/CLAUDE.local.md` really attaches at
+    // /workspace/<seed>/CLAUDE.local.md). runc then creates that parent as
+    // ROOT, and host-side session reclaim can never delete it. Declare the
+    // path Docker is going to use anyway, so the /workspace stub pre-creation
+    // in spawnContainer creates it as the host user first. Absolute and
+    // non-escaping targets keep the literal path — same destination either way.
+    const escapes = rawTarget.startsWith('../');
+    const redirected = escapes ? path.posix.join('/workspace/agent', rawTarget) : null;
     mounts.push({
       hostPath: realTarget,
-      containerPath: `/workspace/agent/${entry.name}`,
+      containerPath: redirected && redirected.startsWith('/workspace/') ? redirected : `/workspace/agent/${entry.name}`,
       readonly: false,
       overlayAllowedRoots: allowedOverlayRoots,
     });
