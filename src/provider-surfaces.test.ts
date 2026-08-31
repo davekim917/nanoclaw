@@ -145,6 +145,9 @@ describe('initGroupFilesystem agent surfaces', () => {
     const claudeDir = path.join(DATA_DIR, 'v2-sessions', ag.id, '.claude-shared');
     expect(fs.readFileSync(path.join(groupDir, PERSONA_PREPEND_FILE), 'utf-8')).toBe('hello\n');
     expect(fs.readFileSync(path.join(groupDir, 'CLAUDE.local.md'), 'utf-8')).toBe('');
+    // Host-owned placeholder for the nested spawn-template.md mount — without
+    // it Docker creates the destination in this folder root-owned.
+    expect(fs.readFileSync(path.join(groupDir, 'spawn-template.md'), 'utf-8')).toBe('');
     const settings = JSON.parse(fs.readFileSync(path.join(claudeDir, 'settings.json'), 'utf-8')) as {
       autoMemoryEnabled?: boolean;
       env: Record<string, string>;
@@ -196,12 +199,36 @@ describe('initGroupFilesystem agent surfaces', () => {
     const compatibilityLink = path.join(groupDir, 'memory');
     expect(fs.existsSync(groupDir)).toBe(true);
     expect(fs.existsSync(path.join(groupDir, 'CLAUDE.local.md'))).toBe(false);
+    // The spawn-template mount isn't gated on defaultSurfaces, so its
+    // placeholder isn't either.
+    expect(fs.existsSync(path.join(groupDir, 'spawn-template.md'))).toBe(true);
     expect(fs.readFileSync(path.join(groupDir, PERSONA_PREPEND_FILE), 'utf-8')).toBe('hello\n');
     expect(readGroupPersona(groupDir)).toBe('hello');
     expect(fs.existsSync(path.join(canonicalMemory, 'memories', 'imported-agent-memory.md'))).toBe(false);
     expect(fs.lstatSync(compatibilityLink).isSymbolicLink()).toBe(true);
     expect(fs.readlinkSync(compatibilityLink)).toBe('/workspace/workgroup/memory');
     expect(fs.existsSync(path.join(sessionRoot, '.claude-shared'))).toBe(false);
+  });
+
+  it('leaves container-resolvable placeholder symlinks alone instead of writing through them', () => {
+    const ag = group('ag-danglink', 'danglink-group');
+    createAgentGroup(ag);
+    const groupDir = path.join(GROUPS_DIR, ag.folder);
+    fs.mkdirSync(groupDir, { recursive: true });
+    // Targets that only resolve inside the container. existsSync FOLLOWS these
+    // and reports false, so the placeholder write would traverse the same link
+    // and throw ENOENT — and initGroupFilesystem runs before every spawn, so
+    // that throw makes the group unstartable.
+    fs.symlinkSync('/workspace/workgroup/private-spawn-template.md', path.join(groupDir, 'spawn-template.md'));
+    fs.symlinkSync('/workspace/workgroup/shared-CLAUDE.local.md', path.join(groupDir, 'CLAUDE.local.md'));
+
+    expect(() => initGroupFilesystem(ag, { instructions: 'hello' })).not.toThrow();
+
+    for (const name of ['spawn-template.md', 'CLAUDE.local.md']) {
+      const entry = path.join(groupDir, name);
+      expect(fs.lstatSync(entry).isSymbolicLink()).toBe(true);
+      expect(fs.readlinkSync(entry)).toContain('/workspace/workgroup/');
+    }
   });
 
   it('writes nothing at all for a surfaces-owning provider without instructions', () => {
@@ -702,5 +729,94 @@ describe('symlink overlay workgroup allowlist', () => {
     expect(containerPaths).toContain('/workspace/agent/SHARED-REPO');
     expect(containerPaths).not.toContain('/workspace/agent/STOLEN');
     expect(containerPaths).not.toContain('/workspace/agent/HOST');
+  });
+
+  it('declares the redirected destination for an upward-escaping relative symlink', () => {
+    const ag = group('ag-rel', 'rel-main');
+    const sib = group('ag-rel-sib', 'rel-sib');
+    createAgentGroup(ag);
+    createAgentGroup(sib);
+    assignWorkgroup(ag, 'wg-rel');
+    assignWorkgroup(sib, 'wg-rel');
+    ensureContainerConfig(ag.id);
+
+    const groupDir = path.join(GROUPS_DIR, ag.folder);
+    fs.mkdirSync(groupDir, { recursive: true });
+    fs.mkdirSync(path.join(GROUPS_DIR, sib.folder, 'SHARED-REL'), { recursive: true });
+    // clone-as-codex's relative-symlink pattern. Docker resolves the mount
+    // destination through the container FS, where /workspace/agent IS this
+    // group dir — so `../rel-sib/SHARED-REL` really attaches at
+    // /workspace/rel-sib/SHARED-REL, inside the session-dir bind. Declaring
+    // that path lets spawnContainer pre-create the parent as the host user
+    // instead of leaving runc to create it root-owned.
+    fs.symlinkSync('../rel-sib/SHARED-REL', path.join(groupDir, 'SHARED-REL'));
+    // An absolute target resolves to itself — no redirect.
+    fs.mkdirSync(path.join(GROUPS_DIR, sib.folder, 'SHARED-ABS'), { recursive: true });
+    fs.symlinkSync(path.join(GROUPS_DIR, sib.folder, 'SHARED-ABS'), path.join(groupDir, 'SHARED-ABS'));
+
+    const mounts = buildMounts(ag, session('s-rel', ag.id), containerConfig(), 'claude', {}, 'wg-rel');
+    const containerPaths = mounts.map((m) => m.containerPath);
+    expect(containerPaths).toContain('/workspace/rel-sib/SHARED-REL');
+    expect(containerPaths).not.toContain('/workspace/agent/SHARED-REL');
+    expect(containerPaths).toContain('/workspace/agent/SHARED-ABS');
+    expect(mounts.find((m) => m.containerPath === '/workspace/rel-sib/SHARED-REL')?.hostPath).toBe(
+      fs.realpathSync(path.join(GROUPS_DIR, sib.folder, 'SHARED-REL')),
+    );
+  });
+
+  it('redirects relative targets that escape only after normalization', () => {
+    const ag = group('ag-norm', 'norm-main');
+    const sib = group('ag-norm-sib', 'norm-sib');
+    createAgentGroup(ag);
+    createAgentGroup(sib);
+    assignWorkgroup(ag, 'wg-norm');
+    assignWorkgroup(sib, 'wg-norm');
+    ensureContainerConfig(ag.id);
+
+    const groupDir = path.join(GROUPS_DIR, ag.folder);
+    fs.mkdirSync(groupDir, { recursive: true });
+    // Neither target starts with `../`, but both normalize outside
+    // /workspace/agent — a textual prefix test sends them down the literal
+    // branch, whose stub Docker never uses, and runc creates the parent root.
+    fs.mkdirSync(path.join(GROUPS_DIR, sib.folder, 'DOT-REL'), { recursive: true });
+    fs.symlinkSync('./../norm-sib/DOT-REL', path.join(groupDir, 'DOT-REL'));
+    fs.mkdirSync(path.join(GROUPS_DIR, sib.folder, 'DEEP-REL'), { recursive: true });
+    // `sub` must exist for the target to resolve host-side at all — the loop
+    // skips unresolvable links before classification ever runs.
+    fs.mkdirSync(path.join(groupDir, 'sub'), { recursive: true });
+    fs.symlinkSync('sub/../../norm-sib/DEEP-REL', path.join(groupDir, 'DEEP-REL'));
+
+    const mounts = buildMounts(ag, session('s-norm', ag.id), containerConfig(), 'claude', {}, 'wg-norm');
+    const containerPaths = mounts.map((m) => m.containerPath);
+    expect(containerPaths).toContain('/workspace/norm-sib/DOT-REL');
+    expect(containerPaths).not.toContain('/workspace/agent/DOT-REL');
+    expect(containerPaths).toContain('/workspace/norm-sib/DEEP-REL');
+    expect(containerPaths).not.toContain('/workspace/agent/DEEP-REL');
+  });
+
+  it('redirects through an intermediate symlink that only the filesystem can resolve', () => {
+    const ag = group('ag-chain', 'chain-main');
+    const sib = group('ag-chain-sib', 'chain-sib');
+    createAgentGroup(ag);
+    createAgentGroup(sib);
+    assignWorkgroup(ag, 'wg-chain');
+    assignWorkgroup(sib, 'wg-chain');
+    ensureContainerConfig(ag.id);
+
+    const groupDir = path.join(GROUPS_DIR, ag.folder);
+    fs.mkdirSync(path.join(groupDir, 'sub'), { recursive: true });
+    fs.mkdirSync(path.join(GROUPS_DIR, sib.folder, 'T'), { recursive: true });
+    // `jump` is itself a symlink out to the sibling, so the top-level link's
+    // text (`sub/jump/T`) normalizes to /workspace/agent/sub/jump/T while the
+    // container really attaches at /workspace/chain-sib/T. No lexical rule can
+    // see this; only resolution can.
+    fs.symlinkSync('../../chain-sib', path.join(groupDir, 'sub', 'jump'));
+    fs.symlinkSync('sub/jump/T', path.join(groupDir, 'CHAINED'));
+
+    const mounts = buildMounts(ag, session('s-chain', ag.id), containerConfig(), 'claude', {}, 'wg-chain');
+    const containerPaths = mounts.map((m) => m.containerPath);
+    expect(containerPaths).toContain('/workspace/chain-sib/T');
+    expect(containerPaths).not.toContain('/workspace/agent/CHAINED');
+    expect(containerPaths).not.toContain('/workspace/agent/sub/jump/T');
   });
 });

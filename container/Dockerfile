@@ -412,7 +412,7 @@ ARG HOST_GID=1001
 # its config dir). Pre-creating it node-owned means Docker only root-creates the
 # nested read-only cred paths, which nothing needs to write.
 RUN groupmod -g ${HOST_GID} node && usermod -u ${HOST_UID} -g ${HOST_GID} node && \
-    mkdir -p /workspace/group /workspace/global /workspace/extra /home/node/.config && \
+    mkdir -p /workspace/agent /workspace/global /workspace/extra /home/node/.config && \
     chown -R ${HOST_UID}:${HOST_GID} /workspace /home/node && \
     chmod 755 /home/node
 
@@ -426,7 +426,13 @@ RUN unreadable="$(find /opt/remotion \( -type f ! -readable -o -type d ! -execut
     && test -x /usr/local/bin/slack-mcp-server \
     && test -x /usr/local/bin/hex-wrapper.sh \
     && test -x /opt/remotion/new-video.sh
-WORKDIR /workspace/group
+# The runtime cwd is /workspace/agent (agent-runner's CWD constant, passed to
+# every provider). This WORKDIR only sets the entrypoint process's cwd, but it
+# must still name a path that exists inside the session-dir bind at /workspace:
+# a WORKDIR that doesn't exist is auto-created by runc at container init as
+# ROOT (it ignores USER), materializing an undeletable dir in the session dir
+# that blocks host-side session reclaim. /workspace/agent is always mounted.
+WORKDIR /workspace/agent
 
 # tini is PID 1, reaps zombies, forwards signals cleanly. entrypoint.sh does
 # `exec bun ...` so bun runs as tini's direct child.

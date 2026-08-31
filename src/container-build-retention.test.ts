@@ -83,6 +83,17 @@ describe('container image retention metadata', () => {
     expect(dockerfile).toContain('test -x /usr/local/bin/slack-mcp-server');
   });
 
+  it('points WORKDIR at a path the session-dir bind actually provides', () => {
+    const dockerfile = fs.readFileSync(dockerfilePath, 'utf8');
+
+    // /workspace is a bind of the session dir. runc auto-creates a missing
+    // WORKDIR at container init as ROOT (it ignores USER), so a WORKDIR that
+    // isn't itself a mount leaves an undeletable dir in the session dir and
+    // host-side reclaim fails with EACCES. /workspace/agent is always mounted.
+    expect(dockerfile).toContain('WORKDIR /workspace/agent');
+    expect(dockerfile).not.toContain('WORKDIR /workspace/group');
+  });
+
   it('marks derived group images with the group owner and role', () => {
     const source = fs.readFileSync(path.join(projectRoot, 'src', 'container-runner.ts'), 'utf8');
 

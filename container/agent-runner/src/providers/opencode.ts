@@ -273,10 +273,10 @@ function spawnOpencodeServer(
     const port = 0;
     // Spawn `opencode serve` with cwd=input.cwd so OpenCode's file/shell tools
     // (read, edit, bash) default to the mounted agent workspace at
-    // /workspace/agent. Without this, the child inherits the Dockerfile WORKDIR
-    // (/workspace/group), which is empty in our layout — Claude provider already
-    // passes input.cwd; this brings OpenCode to parity. Caller falls back to
-    // process.cwd() if input.cwd was undefined.
+    // /workspace/agent. Without this the child would just inherit the
+    // Dockerfile WORKDIR rather than the session's mounted workspace — Claude
+    // provider already passes input.cwd; this brings OpenCode to parity.
+    // Caller falls back to process.cwd() if input.cwd was undefined.
     const proc = spawn('opencode', ['serve', `--hostname=${hostname}`, `--port=${port}`], {
       // Auth secrets (ANTHROPIC_API_KEY*, CLAUDE_CODE_OAUTH_TOKEN*, GMAIL_*) are
       // stripped from the child env here — OpenCode auths via auth.json/XDG, not
