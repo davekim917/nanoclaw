@@ -42,7 +42,7 @@ import { buildContainerCodexConfig } from './providers/codex.js';
 import { closeDb, createAgentGroup, getDb, initTestDb, runMigrations } from './db/index.js';
 import { ensureContainerConfig, updateContainerConfigScalars } from './db/container-configs.js';
 import { initGroupFilesystem } from './group-init.js';
-import { PERSONA_PREPEND_FILE, readGroupPersona } from './group-persona.js';
+import { PERSONA_PREPEND_FILE, STANDING_INSTRUCTIONS_FILE, readGroupPersona } from './group-persona.js';
 import {
   getProviderContainerConfig,
   registerProviderContainerConfig,
@@ -245,7 +245,7 @@ describe('initGroupFilesystem agent surfaces', () => {
 
     const groupDir = path.join(GROUPS_DIR, ag.folder);
     const claudeDir = path.join(DATA_DIR, 'v2-sessions', ag.id, '.claude-shared');
-    expect(fs.readFileSync(path.join(groupDir, PERSONA_PREPEND_FILE), 'utf-8')).toBe('hello\n');
+    expect(fs.readFileSync(path.join(groupDir, STANDING_INSTRUCTIONS_FILE), 'utf-8')).toBe('hello\n');
     expect(fs.readFileSync(path.join(groupDir, 'CLAUDE.local.md'), 'utf-8')).toBe('');
     // Host-owned placeholder for the nested spawn-template.md mount — without
     // it Docker creates the destination in this folder root-owned.
@@ -266,8 +266,8 @@ describe('initGroupFilesystem agent surfaces', () => {
     withWorkgroup(ag);
     ensureContainerConfig(ag.id);
     buildMounts(ag, session('s-default-instructions', ag.id), containerConfig(), 'claude', {});
-    expect(fs.readFileSync(path.join(groupDir, '.claude-fragments', 'persona.md'), 'utf-8')).toBe('hello');
-    expect(fs.readFileSync(path.join(groupDir, 'CLAUDE.md'), 'utf-8')).toContain('@./.claude-fragments/persona.md');
+    expect(fs.readFileSync(path.join(groupDir, '.claude-fragments', 'standing-instructions.md'), 'utf-8')).toBe('hello');
+    expect(fs.readFileSync(path.join(groupDir, 'CLAUDE.md'), 'utf-8')).toContain('@./.claude-fragments/standing-instructions.md');
   });
 
   it('reconciles the managed Bash maximum while preserving an operator-owned default', () => {
@@ -304,7 +304,7 @@ describe('initGroupFilesystem agent surfaces', () => {
     // The spawn-template mount isn't gated on defaultSurfaces, so its
     // placeholder isn't either.
     expect(fs.existsSync(path.join(groupDir, 'spawn-template.md'))).toBe(true);
-    expect(fs.readFileSync(path.join(groupDir, PERSONA_PREPEND_FILE), 'utf-8')).toBe('hello\n');
+    expect(fs.readFileSync(path.join(groupDir, STANDING_INSTRUCTIONS_FILE), 'utf-8')).toBe('hello\n');
     expect(readGroupPersona(groupDir)).toBe('hello');
     expect(fs.existsSync(path.join(canonicalMemory, 'memories', 'imported-agent-memory.md'))).toBe(false);
     expect(fs.lstatSync(compatibilityLink).isSymbolicLink()).toBe(true);
@@ -342,7 +342,7 @@ describe('initGroupFilesystem agent surfaces', () => {
     const groupDir = path.join(GROUPS_DIR, ag.folder);
     expect(fs.existsSync(path.join(groupDir, 'CLAUDE.local.md'))).toBe(false);
     expect(fs.existsSync(path.join(groupDir, 'memory'))).toBe(false);
-    expect(fs.existsSync(path.join(groupDir, PERSONA_PREPEND_FILE))).toBe(false);
+    expect(fs.existsSync(path.join(groupDir, STANDING_INSTRUCTIONS_FILE))).toBe(false);
   });
 
   it('treats an unregistered provider name as default support files without creating memory', () => {
@@ -378,11 +378,14 @@ describe('initGroupFilesystem legacy seed isolation', () => {
 
     expect(fs.readFileSync(seedFile)).toEqual(seedBytes);
     expect(fs.readFileSync(path.join(groupDir, 'CLAUDE.local.md'), 'utf-8')).toBe('');
-    expect(fs.existsSync(path.join(groupDir, PERSONA_PREPEND_FILE))).toBe(false);
+    expect(fs.existsSync(path.join(groupDir, STANDING_INSTRUCTIONS_FILE))).toBe(false);
     expect(fs.existsSync(path.join(groupDir, 'memory'))).toBe(false);
   });
 
-  it('does not overwrite existing nonempty instruction surfaces', () => {
+  // Simulates a pre-migration group whose operator content lives under the
+  // LEGACY filename only. A fresh stamp must never shadow it with a new
+  // canonical file — see group-persona.ts's stageGroupPersona.
+  it('does not overwrite existing nonempty instruction surfaces (legacy filename)', () => {
     const ag = group('ag-existing-instructions', 'existing-instructions-group');
     createAgentGroup(ag);
     const groupDir = path.join(GROUPS_DIR, ag.folder);
@@ -394,6 +397,7 @@ describe('initGroupFilesystem legacy seed isolation', () => {
     initGroupFilesystem(ag, { instructions: 'another replacement' });
 
     expect(fs.readFileSync(path.join(groupDir, PERSONA_PREPEND_FILE), 'utf-8')).toBe('operator persona\n');
+    expect(fs.existsSync(path.join(groupDir, STANDING_INSTRUCTIONS_FILE))).toBe(false);
     expect(fs.readFileSync(path.join(groupDir, 'CLAUDE.local.md'), 'utf-8')).toBe('operator local\n');
   });
 });
@@ -766,16 +770,20 @@ describe('worker agent def sync (orchestrator roster)', () => {
     expect(codexWorker).toContain('never set `run_in_background` for the Codex call');
     expect(codexWorker).toContain('the orchestrator owns continued monitoring');
     expect(codexWorker).not.toContain('timeout to 600000');
-    const orchestratorInstructions = fs.readFileSync(
-      path.join(process.cwd(), 'container', 'agent-runner', 'src', 'mcp-tools', 'orchestrator-workers.instructions.md'),
-      'utf-8',
-    );
-    expect(orchestratorInstructions).toContain('Invoke `worker-codex` with `run_in_background: true`');
-    expect(orchestratorInstructions).toContain('keeps its `codex exec` Bash call in the foreground');
-    // Delegation-rules fragment composed for claude. The fragment itself is a
-    // symlink to a container path (dangling on the host), so assert on the
-    // composed doc's include line rather than existsSync (which follows links).
-    expect(fs.readFileSync(path.join(GROUPS_DIR, ag.folder, 'CLAUDE.md'), 'utf-8')).toContain(
+    // Acceptance criterion 4 (instruction-stack-prune L2): the
+    // orchestrator-workers.instructions.md fragment is retired — its
+    // tier-selection markers now live in the worker-def descriptions
+    // themselves (the field the Task tool surfaces at selection time), not
+    // in an always-on fragment.
+    expect(codexWorker).toContain('Invoke with `run_in_background: true`');
+    expect(codexWorker).toContain('keeps its own `codex exec` Bash call in the foreground');
+    expect(
+      fs.existsSync(
+        path.join(process.cwd(), 'container', 'agent-runner', 'src', 'mcp-tools', 'orchestrator-workers.instructions.md'),
+      ),
+    ).toBe(false);
+    // The retired fragment is never composed for any provider.
+    expect(fs.readFileSync(path.join(GROUPS_DIR, ag.folder, 'CLAUDE.md'), 'utf-8')).not.toContain(
       'module-orchestrator-workers.md',
     );
   });
@@ -804,7 +812,7 @@ describe('worker agent def sync (orchestrator roster)', () => {
     expect(fs.existsSync(canary)).toBe(true);
   });
 
-  it('skips defs and the orchestrator fragment when the spawn-resolved provider is codex', () => {
+  it('skips the worker-def sync when the spawn-resolved provider is codex', () => {
     const ag = group('ag-worker-defs-cx', 'worker-defs-cx');
     createAgentGroup(ag);
     withWorkgroup(ag);
@@ -814,9 +822,6 @@ describe('worker agent def sync (orchestrator roster)', () => {
     buildMounts(ag, session('s-wd-cx', ag.id), containerConfig(), 'codex', {});
 
     expect(fs.existsSync(path.join(DATA_DIR, 'v2-sessions', ag.id, '.claude-shared', 'agents'))).toBe(false);
-    expect(fs.readFileSync(path.join(GROUPS_DIR, ag.folder, 'CLAUDE.md'), 'utf-8')).not.toContain(
-      'module-orchestrator-workers.md',
-    );
   });
 });
 

@@ -83,7 +83,7 @@ conversations, and let it evolve with your understanding of the user.
 Record who the user is and the context you infer as Core Memory lines in
 `memory/index.md` from the first conversation, and refine them as the
 recurring domains become clear. Behavioral role and persona instructions
-belong in `instructions.prepend.md`.
+belong in `standing-instructions.md`.
 
 ---
 

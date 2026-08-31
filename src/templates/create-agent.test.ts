@@ -23,7 +23,7 @@ vi.mock('../log.js', () => ({
 import { closeDb, getAllAgentGroups, initTestDb, runMigrations } from '../db/index.js';
 import { getContainerConfig } from '../db/container-configs.js';
 import { findTaskSessions } from '../db/sessions.js';
-import { PERSONA_PREPEND_FILE } from '../group-persona.js';
+import { STANDING_INSTRUCTIONS_FILE } from '../group-persona.js';
 import { inboundDbPath } from '../session-manager.js';
 import { createAgentFromTemplate } from './create-agent.js';
 
@@ -71,7 +71,7 @@ describe('createAgentFromTemplate', () => {
     const g = createAgentFromTemplate('sales/sdr', { name: 'SDR Test' });
 
     const groupDir = path.join(GROUPS_DIR, g.folder);
-    const prepend = fs.readFileSync(path.join(groupDir, PERSONA_PREPEND_FILE), 'utf-8');
+    const prepend = fs.readFileSync(path.join(groupDir, STANDING_INSTRUCTIONS_FILE), 'utf-8');
     expect(prepend).toBe('You are an SDR agent.\n');
     expect(fs.existsSync(path.join(groupDir, '.seed.md'))).toBe(false);
   });

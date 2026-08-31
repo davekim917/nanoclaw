@@ -62,7 +62,7 @@ If a new folder is necessary, create an ordinary directory under the canon
 first, then use `write_memory_file` for its Markdown files and `index.md`. The
 tool rejects a missing or symlinked parent.
 
-`CLAUDE.local.md` and `instructions.prepend.md` are standing instruction
+`CLAUDE.local.md` and `standing-instructions.md` are standing instruction
 surfaces, not memory write targets.
 
 ## Topic files and the retired ledger

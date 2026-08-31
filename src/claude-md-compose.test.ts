@@ -17,7 +17,7 @@ vi.mock('./log.js', () => ({
 import { composeGroupClaudeMd } from './claude-md-compose.js';
 import { ensureContainerConfig, updateContainerConfigScalars } from './db/container-configs.js';
 import { closeDb, createAgentGroup, initTestDb, runMigrations } from './db/index.js';
-import { PERSONA_PREPEND_FILE } from './group-persona.js';
+import { STANDING_INSTRUCTIONS_FILE } from './group-persona.js';
 import type { AgentGroup } from './types.js';
 
 function group(id: string, folder: string): AgentGroup {
@@ -32,7 +32,7 @@ function seed(ag: AgentGroup): void {
 function writePersona(folder: string, text: string): void {
   const dir = path.join(GROUPS_DIR, folder);
   fs.mkdirSync(dir, { recursive: true });
-  fs.writeFileSync(path.join(dir, PERSONA_PREPEND_FILE), text);
+  fs.writeFileSync(path.join(dir, STANDING_INSTRUCTIONS_FILE), text);
 }
 
 function importsOf(folder: string): string[] {
@@ -60,9 +60,9 @@ describe('composeGroupClaudeMd persona prepend', () => {
     composeGroupClaudeMd(ag, 'claude');
 
     const imports = importsOf(ag.folder);
-    expect(imports[0]).toBe('@./.claude-fragments/persona.md');
+    expect(imports[0]).toBe('@./.claude-fragments/standing-instructions.md');
     expect(imports[1]).toBe('@./.claude-shared.md');
-    expect(fs.readFileSync(path.join(GROUPS_DIR, ag.folder, '.claude-fragments', 'persona.md'), 'utf-8')).toBe(
+    expect(fs.readFileSync(path.join(GROUPS_DIR, ag.folder, '.claude-fragments', 'standing-instructions.md'), 'utf-8')).toBe(
       'You are an SDR agent.',
     );
   });
@@ -75,8 +75,8 @@ describe('composeGroupClaudeMd persona prepend', () => {
     composeGroupClaudeMd(ag, 'claude');
     composeGroupClaudeMd(ag, 'claude');
 
-    expect(fs.existsSync(path.join(GROUPS_DIR, ag.folder, '.claude-fragments', 'persona.md'))).toBe(true);
-    expect(importsOf(ag.folder)[0]).toBe('@./.claude-fragments/persona.md');
+    expect(fs.existsSync(path.join(GROUPS_DIR, ag.folder, '.claude-fragments', 'standing-instructions.md'))).toBe(true);
+    expect(importsOf(ag.folder)[0]).toBe('@./.claude-fragments/standing-instructions.md');
   });
 
   it('is inert when no persona file is present (non-template groups)', () => {
@@ -87,8 +87,8 @@ describe('composeGroupClaudeMd persona prepend', () => {
 
     const imports = importsOf(ag.folder);
     expect(imports[0]).toBe('@./.claude-shared.md');
-    expect(imports).not.toContain('@./.claude-fragments/persona.md');
-    expect(fs.existsSync(path.join(GROUPS_DIR, ag.folder, '.claude-fragments', 'persona.md'))).toBe(false);
+    expect(imports).not.toContain('@./.claude-fragments/standing-instructions.md');
+    expect(fs.existsSync(path.join(GROUPS_DIR, ag.folder, '.claude-fragments', 'standing-instructions.md'))).toBe(false);
   });
 });
 
@@ -120,6 +120,28 @@ describe('composeGroupClaudeMd scheduling instructions through ncl tasks', () =>
     const imports = importsOf(ag.folder);
     expect(imports).not.toContain('@./.claude-fragments/module-cli.md');
     expect(imports).not.toContain('@./.claude-fragments/module-scheduling.md');
+  });
+});
+
+describe('instruction-stack-prune L2 fragment retirement (acceptance criterion 2)', () => {
+  it('composes module-cli.md but never the five retired always-on fragments', () => {
+    const ag = group('ag-fragment-retire', 'fragment-retire-group');
+    seed(ag);
+
+    composeGroupClaudeMd(ag, 'claude');
+
+    const imports = importsOf(ag.folder);
+    expect(imports).toContain('@./.claude-fragments/module-cli.md');
+    for (const retired of [
+      'module-agents.md',
+      'module-core.md',
+      'module-self-mod.md',
+      'module-orchestrator-workers.md',
+      'skill-onecli-gateway.md',
+    ]) {
+      expect(imports).not.toContain(`@./.claude-fragments/${retired}`);
+      expect(fs.existsSync(path.join(GROUPS_DIR, ag.folder, '.claude-fragments', retired))).toBe(false);
+    }
   });
 });
 

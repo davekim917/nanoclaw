@@ -42,12 +42,16 @@ export const createAgent: McpToolDefinition = {
   tool: {
     name: 'create_agent',
     description:
-      'Create a long-lived companion sub-agent (research assistant, task manager, specialist) — the name becomes your destination for it. May require admin approval before the agent is created. Fire-and-forget.',
+      'Create a long-lived companion or collaborator sub-agent — a Researcher tracking an ongoing inquiry, a Calendar agent, a Builder handling code while you stay in conversation, a Reviewer running checks in the background. Each gets its own container, workspace, and persistent memory that survives across sessions — a full standalone agent, not a stateless sub-query. Its `name` becomes a destination on both sides: you `send_message({ to: name })` it, and its replies arrive with `from=name`. Use it when the agent needs its own memory/context that builds over time, or needs to work independently without blocking your turn. Do NOT use it for a one-off lookup or anything that finishes before the user\'s next message — use the Agent/Task tool instead, which is stateless and leaves no persistent footprint. Fire-and-forget: returns immediately without waiting for the agent to come up; messages queue until it is ready. May require admin approval before the agent is created.',
     inputSchema: {
       type: 'object' as const,
       properties: {
         name: { type: 'string', description: 'Human-readable name (also becomes your destination name for this agent)' },
-        instructions: { type: 'string', description: 'CLAUDE.md content for the new agent (personality, role, instructions)' },
+        instructions: {
+          type: 'string',
+          description:
+            "Becomes the new agent's standing-instructions.md (its standing role and personality) — read on every spawn alongside the shared base, so don't restate NanoClaw base behavior here. Cover: the agent's role, who it takes tasks from (you, by name), how/when it reports back (completion only, or milestones for long work), and any domain-specific rules.",
+        },
         provider: {
           type: 'string',
           description:

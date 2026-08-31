@@ -9,7 +9,7 @@ cutting over.
 > `/migrate-memory` when prompted. Current memory has one canonical Markdown
 > tree per workgroup at `data/workgroups/<workgroup-id>/memory`, shared by all
 > sibling agent groups. `CLAUDE.md`, `CLAUDE.local.md`, and
-> `instructions.prepend.md` are instruction/customization surfaces and are
+> `standing-instructions.md` are instruction/customization surfaces and are
 > never memory migration inputs. The dated phases and measurements below are
 > retained as historical migration context.
 
@@ -345,7 +345,7 @@ For per-group additions, edit `groups/{folder}/container.json`:
       rollback.
 - [ ] Run `/migrate-memory` for recognized durable-memory sources. Never paste
       exported memory into CLAUDE.md, CLAUDE.local.md, or
-      instructions.prepend.md.
+      standing-instructions.md.
 - [ ] Copy tone profiles: `cp -r ~/nanoclaw/tone-profiles ~/nanoclaw-v2/tone-profiles` (used later in Tier 2)
 
 ### 1.7 Verify basic flow and native v2 features

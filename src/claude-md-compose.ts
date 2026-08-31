@@ -27,9 +27,9 @@ import { readGroupPersona } from './group-persona.js';
 import { log } from './log.js';
 import type { AgentGroup } from './types.js';
 
-// Fragment holding a template's persona prepend. Imported FIRST (before the
-// shared base) so the persona is the top of the composed system prompt.
-const PERSONA_FRAGMENT = 'persona.md';
+// Fragment holding a group's standing instructions. Imported FIRST (before
+// the shared base) so it is the top of the composed system prompt.
+const STANDING_INSTRUCTIONS_FRAGMENT = 'standing-instructions.md';
 
 // Symlink targets are container paths — dangling on host (hence the readlink
 // dance instead of existsSync), valid inside the container via RO mounts.
@@ -42,7 +42,7 @@ const SHARED_MCP_TOOLS_CONTAINER_BASE = '/app/src/mcp-tools';
 const MCP_TOOLS_HOST_SUBPATH = path.join('container', 'agent-runner', 'src', 'mcp-tools');
 
 const COMPOSED_HEADER =
-  '<!-- Composed at spawn - do not edit. Standing instructions: instructions.prepend.md. Memory: memory/. -->';
+  '<!-- Composed at spawn - do not edit. Standing instructions: standing-instructions.md. Memory: memory/. -->';
 
 /**
  * Regenerate `groups/<folder>/CLAUDE.md` from the shared base, enabled skill
@@ -56,7 +56,7 @@ const COMPOSED_HEADER =
  * with the worker-def sync gate in buildMounts.
  */
 /**
- * Directories a group's `instructions.prepend.md` symlink may resolve into:
+ * Directories a group's standing-instructions symlink may resolve into:
  * its own, plus every agent group sharing its workgroup. Siblings that build
  * together share one instruction file, and the workgroup is the data-pool
  * boundary — a group in another workgroup is a different tenant, so a link
@@ -129,9 +129,6 @@ export function composeGroupClaudeMd(group: AgentGroup, provider: string): void 
       if (!match) continue;
       const moduleName = match[1];
       if (moduleName === 'cli' && cliDisabled) continue;
-      // Worker-def orchestration is Claude-only (Task-tool subagents from
-      // ~/.claude/agents); codex/opencode groups must not get these instructions.
-      if (moduleName === 'orchestrator-workers' && provider !== 'claude') continue;
       desired.set(`module-${moduleName}.md`, {
         type: 'symlink',
         content: `${SHARED_MCP_TOOLS_CONTAINER_BASE}/${entry}`,
@@ -185,7 +182,7 @@ export function composeGroupClaudeMd(group: AgentGroup, provider: string): void 
   // first (see the imports assembly) so it prepends the composed system prompt.
   const persona = readGroupPersona(groupDir, personaSymlinkRoots(group, groupDir));
   if (persona) {
-    desired.set(PERSONA_FRAGMENT, { type: 'inline', content: persona });
+    desired.set(STANDING_INSTRUCTIONS_FRAGMENT, { type: 'inline', content: persona });
   }
 
   // Reconcile: drop stale, write desired.
@@ -206,11 +203,11 @@ export function composeGroupClaudeMd(group: AgentGroup, provider: string): void 
   // Composed entry — imports only. Persona first (top of the system prompt),
   // then the shared base, then the remaining fragments sorted.
   const imports: string[] = [];
-  if (desired.has(PERSONA_FRAGMENT)) {
-    imports.push(`@./.claude-fragments/${PERSONA_FRAGMENT}`);
+  if (desired.has(STANDING_INSTRUCTIONS_FRAGMENT)) {
+    imports.push(`@./.claude-fragments/${STANDING_INSTRUCTIONS_FRAGMENT}`);
   }
   imports.push('@./.claude-shared.md');
-  for (const name of [...desired.keys()].filter((n) => n !== PERSONA_FRAGMENT).sort()) {
+  for (const name of [...desired.keys()].filter((n) => n !== STANDING_INSTRUCTIONS_FRAGMENT).sort()) {
     imports.push(`@./.claude-fragments/${name}`);
   }
   const body = [COMPOSED_HEADER, ...imports, ''].join('\n');

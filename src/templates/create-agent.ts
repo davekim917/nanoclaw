@@ -23,8 +23,8 @@ export interface CreateAgentOptions {
  * context extras, skills, and paused recurring tasks, but nothing else (no policy,
  * packages, or provider).
  *
- * The template persona is written to the provider-neutral `instructions.prepend.md`
- * (see src/group-persona.ts). Each provider's project-doc composer inlines it at
+ * The template persona is written to the provider-neutral standing-instructions
+ * file (see src/group-persona.ts). Each provider's project-doc composer inlines it at
  * the TOP of the doc it generates every spawn, so the persona is system-prompt
  * tier regardless of which provider the group ends up running. Because the file
  * is provider-agnostic, placement needs no provider knowledge at stamp time (the
@@ -60,7 +60,7 @@ export function createAgentFromTemplate(ref: string, opts?: CreateAgentOptions):
   ensureContainerConfig(id);
 
   // group-init.ts owns the mkdir at first spawn, but it isn't called here — so we
-  // create the dir ourselves to land instructions.prepend.md + context/.
+  // create the dir ourselves to land the standing-instructions file + context/.
   const groupDir = path.resolve(GROUPS_DIR, folder);
   fs.mkdirSync(groupDir, { recursive: true });
 
