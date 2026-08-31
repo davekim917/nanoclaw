@@ -605,6 +605,133 @@ export function isCodexOAuthRotationEligible(classification: string | undefined)
   );
 }
 
+// ── Child-agent (multi_agent) quota exhaustion ──
+
+/**
+ * Upstream's inter-agent completion framing, as emitted by codex-rs
+ * `session_prefix.rs::format_inter_agent_completion_message` when a spawned
+ * child agent's turn ends in `AgentStatus::Errored`. Both literals below are
+ * verbatim from the installed codex 0.151.0 binary.
+ *
+ * WHY THE FRAMING IS MANDATORY, AND WHY CODEX_USAGE_LIMIT_RE ALONE IS NOT
+ * ENOUGH: CODEX_USAGE_LIMIT_RE is safe today only because every caller
+ * applies it to a STRUCTURED error object (a thrown app-server Error, or a
+ * `codexErrorInfo` payload). The child-agent failure has no structured
+ * carrier at all — upstream forwards it to the PARENT as ordinary injected
+ * conversation prose and deliberately does NOT fail the parent's turn. So the
+ * only place to see it is free text, and free text is exactly where that
+ * regex stops being a signal: "purchase more credits" / "hit your usage
+ * limit" are phrases an agent can legitimately WRITE. An agent working on
+ * this very file would trip a prose-only matcher and kill its own live turn
+ * plus rotate a perfectly healthy credential slot.
+ *
+ * The guard is therefore a conjunction of three independent conditions
+ * (see `detectCodexChildAgentQuotaFailure`):
+ *   1. the item text opens a line with upstream's "Agent errored:" prefix,
+ *   2. it carries upstream's verbatim turn-failed sentence, and
+ *   3. the error body matches CODEX_USAGE_LIMIT_RE.
+ * i.e. "a child agent reported a terminal error AND that error is a quota
+ * error" — never "this text mentions a usage limit".
+ *
+ * Residual, knowingly accepted: prose that reproduces the WHOLE framed
+ * message verbatim, starting at a line boundary, still matches. The cost of
+ * that is one turn aborted and replayed on the next credential slot; the cost
+ * of relaxing the conjunction is silent rotation storms on ordinary agent
+ * chatter. Line-start anchoring (rather than whole-string) is deliberate:
+ * app-server versions may prefix the item with an agent path/nickname, and a
+ * missed detection costs the pre-fix behavior.
+ */
+export const CODEX_CHILD_AGENT_ERROR_FRAMING_RE = /^[\s>*_`[\]()-]*Agent errored:/m;
+
+/**
+ * The fixed sentence upstream appends after the child's error text. Verbatim
+ * from codex 0.151.0; it is the half of the framing that free prose is most
+ * unlikely to reproduce, so it does the heavy lifting of the false-positive
+ * guard. Matched case-insensitively with flexible inner whitespace so a
+ * re-wrap in transport cannot break detection, and tolerating either
+ * apostrophe for the same reason QUOTA regexes elsewhere do.
+ */
+export const CODEX_CHILD_AGENT_TURN_FAILED_RE =
+  /This\s+agent['’]s\s+turn\s+failed\.\s+If\s+you\s+still\s+need\s+this\s+agent,\s+use\s+the\s+available\s+collaboration\s+tools\s+to\s+give\s+it\s+another\s+task\./i;
+
+/**
+ * Flatten an app-server ThreadItem (typed `unknown` — the protocol is pinned
+ * but the payload shape varies by item type and app-server version) to text
+ * the framing/quota matchers can run over.
+ *
+ * Covers both subagent surfaces the child-agent failure can arrive on:
+ *   - `multi_agent_v2`: the injected inter-agent completion message, which
+ *     lands as an ordinary conversation item (`text`).
+ *   - `multi_agent` v1: the child's error text inside the collaboration
+ *     tool's own result (`functionCallOutput.output`, `result`, `content`).
+ * Both flags are `stable=true` on codex 0.151.0 and which one is exercised is
+ * install-dependent, so both are scanned — the framing conjunction is what
+ * makes that safe rather than reckless.
+ *
+ * Never throws; depth-capped so a cyclic or pathological payload cannot spin.
+ */
+export function extractCodexThreadItemText(value: unknown, depth = 0): string {
+  if (value == null || depth > 4) return '';
+  if (typeof value === 'string') return value;
+  if (typeof value === 'number' || typeof value === 'boolean') return String(value);
+  if (Array.isArray(value)) {
+    const parts: string[] = [];
+    for (const entry of value) {
+      const part = extractCodexThreadItemText(entry, depth + 1);
+      if (part) parts.push(part);
+    }
+    return parts.join('\n');
+  }
+  if (typeof value !== 'object') return '';
+
+  const o = value as Record<string, unknown>;
+  const parts: string[] = [];
+  for (const key of ['text', 'output', 'result', 'content', 'message', 'error'] as const) {
+    if (o[key] === undefined) continue;
+    const part = extractCodexThreadItemText(o[key], depth + 1);
+    if (part) parts.push(part);
+  }
+  return parts.join('\n');
+}
+
+/**
+ * Detect a spawned child agent reporting a QUOTA failure, on either subagent
+ * surface. Returns the terminal error message to attribute to the parent
+ * turn, or null.
+ *
+ * This exists because the parent turn never learns about it any other way:
+ * `turnState.error` / `turnState.errorKind` are populated only from the
+ * coordinator's OWN `turn/completed`+`turn/failed` payloads, and upstream
+ * explicitly leaves the parent turn running and unmarked when a child errors.
+ * Without this, `classifyCodexError` never sees a quota error,
+ * `isCodexOAuthRotationEligible` is never consulted, no rotation happens, and
+ * the coordinator is left holding literal "purchase more credits" prose it
+ * can misread as an instruction to the user.
+ *
+ * The caller routes a hit into the EXISTING rotation path by setting
+ * `turnState.error` + `errorKind = 'UsageLimitExceeded'`, exactly as if the
+ * parent's own turn had failed that way. No new rotation logic.
+ *
+ * Never throws — a malformed item is not a reason to lose a turn.
+ */
+export function detectCodexChildAgentQuotaFailure(item: unknown): string | null {
+  try {
+    if (!item || typeof item !== 'object') return null;
+    const text = extractCodexThreadItemText(item);
+    if (!text) return null;
+    // Conjunction, in cheapest-first order. All three must hold; see the
+    // comment on CODEX_CHILD_AGENT_ERROR_FRAMING_RE for why any two of them
+    // would be an unsafe matcher.
+    if (!CODEX_CHILD_AGENT_ERROR_FRAMING_RE.test(text)) return null;
+    if (!CODEX_CHILD_AGENT_TURN_FAILED_RE.test(text)) return null;
+    if (!CODEX_USAGE_LIMIT_RE.test(text)) return null;
+    const snippet = text.replace(/\s+/g, ' ').trim().slice(0, 300);
+    return `codex_child_agent_quota_exhausted: ${snippet}`;
+  } catch {
+    return null;
+  }
+}
+
 export function buildCodexRecoveryPrompt(): string {
   return [
     "The prior turn's Codex control plane stopped responding and was restarted.",
@@ -1483,6 +1610,14 @@ export async function* runOneTurn(
   const turnState: { error: Error | null; errorKind: string | null } = { error: null, errorKind: null };
   let resultText = '';
   let turnDone = false;
+  // Set when a SPAWNED CHILD agent's turn died on a quota error. Kept out of
+  // `turnState` until the turn actually ends because `completeTurn` /
+  // `finishForLivenessFailure` both overwrite `turnState.error` on their own
+  // terminal paths — this failure has to survive those, since it is the one
+  // that says "this credential slot is spent" and therefore the one the
+  // rotation path needs to see. Applied to `turnState` at the single point
+  // where the classification is read. See detectCodexChildAgentQuotaFailure.
+  let childAgentQuotaError: string | null = null;
   // Per-turn cost attribution (Fleet Hardening Phase 0.1 follow-up): Codex's
   // app-server protocol has no single "API round-trip count" field the way
   // the Claude SDK's num_turns does. `item/completed` — one per tool call,
@@ -1522,7 +1657,7 @@ export async function* runOneTurn(
   // here, because ONE logical turn can span several runOneTurn invocations —
   // the outer retry loop re-invokes this generator on a same-thread recovery,
   // and the model requests made before that crash belong to the same turn.
-  // Codex can deliver reasoning two ways: streaming item/reasoning/* deltas
+  // Codex can deliver reasoning two ways: streaming `item/reasoning/…` deltas
   // when enabled by the app-server, or finalized reasoning ThreadItems via
   // item/completed. Streamed item IDs are tracked so lifecycle fallback
   // payloads do not duplicate already-forwarded summaries.
@@ -1581,6 +1716,35 @@ export async function* runOneTurn(
     | ({ id?: unknown; type?: string; text?: string } & ReasoningThreadItem & ImageGenerationThreadItem)
     | undefined;
 
+  /**
+   * Upstream does NOT fail the parent turn when a spawned child agent errors
+   * — it injects the child's error into the parent as prose and lets the
+   * parent keep going. On a quota error that means the parent runs on against
+   * a spent credential slot, and nothing in `turnState` ever tells the
+   * rotation path why. End the turn here instead, attributed as the parent's
+   * own quota failure, so `classifyCodexError` →
+   * `isCodexOAuthRotationEligible` → `rotateCodexHome` + app-server respawn
+   * runs unchanged. First detection wins; later items cannot downgrade it.
+   */
+  const noteChildAgentQuotaFailure = (item: unknown): void => {
+    if (childAgentQuotaError) return;
+    const detected = detectCodexChildAgentQuotaFailure(item);
+    if (!detected) return;
+    childAgentQuotaError = detected;
+    console.error(`[codex-provider] ${detected}`);
+    buffer.push({
+      type: 'progress',
+      message: formatBlockquoteLabel('↻', 'A Codex subagent exhausted this account; rotating credentials and retrying'),
+    });
+    // Ending the turn is what actually stops the burn: the app-server is torn
+    // down by the rotation path in gen(), which is this provider's equivalent
+    // of interrupting the in-flight query.
+    if (!turnDone) {
+      turnDone = true;
+      kick();
+    }
+  };
+
   // Codex may deliver completed ThreadItems live, only in turn/completed, or
   // both. Keep all user-visible restoration and liveness bookkeeping here so
   // those delivery paths remain observationally equivalent.
@@ -1595,6 +1759,7 @@ export async function* runOneTurn(
       if (stepItemId) turnAccum.countedItemIds.add(stepItemId);
     }
     emitCollaborationProgress(item);
+    noteChildAgentQuotaFailure(item);
     if (item?.type === 'agentMessage' && item.text) resultText = item.text;
     if (item?.type === 'reasoning') emitCompletedReasoningItem(item);
     const generatedImagePath = extractImageGenerationPath(item);
@@ -1775,6 +1940,11 @@ export async function* runOneTurn(
     const snapshotItemsAreAuthoritative = completedTurn?.itemsView === undefined || completedTurn.itemsView === 'full';
     if (snapshotItemsAreAuthoritative && Array.isArray(completedTurn?.items)) {
       for (const item of completedTurn.items) {
+        // Scanned unconditionally, ahead of the terminality gate: the injected
+        // inter-agent completion message is not necessarily an
+        // agentMessage/reasoning item, so `isTerminalThreadItemPayload` can
+        // legitimately reject the one item that carries the child's failure.
+        noteChildAgentQuotaFailure(item);
         if (isTerminalThreadItemPayload(item)) reduceCompletedThreadItem(item as CompletedThreadItem);
       }
     }
@@ -1910,6 +2080,10 @@ export async function* runOneTurn(
         // native sub-agent lifecycle events. Some app-server versions also
         // repeat ThreadItems at completion; the required item ID dedupes them.
         emitCollaborationProgress(params.item);
+        // Cheap second look at the start of an item's life: some app-server
+        // versions carry an injected item's full text on item/started, and
+        // catching it there saves a round trip on the spent slot.
+        noteChildAgentQuotaFailure(params.item);
         break;
       }
       case 'item/completed': {
@@ -1968,7 +2142,7 @@ export async function* runOneTurn(
         // Drop the trivial "active" / "idle" labels — they fire on every
         // turn-state flip, so the chat-side status message (which the host
         // delivers as edit-in-place) ends up overwriting the 💭 thinking
-        // labels emitted from item/reasoning/* with "status: active". The
+        // labels emitted from `item/reasoning/…` with "status: active". The
         // Claude provider hit the analogous problem with tool_use labels
         // overwriting thinking and resolved it the same way (claude.ts:54).
         // Anything more semantic that codex might emit (compacting,
@@ -2002,7 +2176,7 @@ export async function* runOneTurn(
         break;
       }
       default:
-        // Silently handle the many item/* notifications — they already
+        // Silently handle the many `item/…` notifications — they already
         // contributed an activity event above.
         break;
     }
@@ -2049,6 +2223,18 @@ export async function* runOneTurn(
     }
 
     while (buffer.length > 0) yield buffer.shift()!;
+
+    // A child agent's quota failure is the parent turn's failure too — the
+    // slot it is running on is spent. Attribute it exactly as a structured
+    // `UsageLimitExceeded` on this turn so the existing classification and
+    // rotation path below needs no special case. Deliberately overrides an
+    // already-set `turnState.error`: whatever else the turn reported, the
+    // spent credential is the actionable cause and the only one whose
+    // recovery (rotate + replay) is correct.
+    if (childAgentQuotaError) {
+      turnState.error = new Error(childAgentQuotaError);
+      turnState.errorKind = 'UsageLimitExceeded';
+    }
 
     if (turnState.error) {
       // Map the structured CodexErrorInfo type to a ProviderEvent

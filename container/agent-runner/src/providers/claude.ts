@@ -7,6 +7,7 @@ import {
   query as sdkQuery,
   type EffortLevel,
   type HookCallback,
+  type PostToolUseHookInput,
   type PreCompactHookInput,
   type PreToolUseHookInput,
   type SdkPluginConfig,
@@ -670,8 +671,26 @@ const RETRYABLE_ERROR_RE =
 // The apostrophe class tolerates both straight (U+0027, what the SDK emits
 // today) and curly (U+2019) so a typographic change upstream can't silently
 // re-break rotation.
-export const QUOTA_RESULT_RE =
-  /^\s*You['’]?(re|ve) (out of (extra |daily |weekly )?usage|(hit|reached) your ((org['’]?s |team['’]?s |account['’]?s |session |usage |weekly |daily |monthly |annual |spend(ing)? |token |credit )*)limit)\b/i;
+//
+// The pattern BODY is defined once, as a string, and both the anchored form
+// (QUOTA_RESULT_RE, for top-level result text) and the unanchored form
+// (QUOTA_EMBEDDED_RE, for a quota message buried inside a subagent's
+// tool_response) are derived from it. Two hand-maintained copies would
+// reproduce the exact failure this comment block documents: a wording is
+// updated in one place, rotation silently keeps working on one surface and
+// silently stops on the other.
+const QUOTA_PATTERN_BODY =
+  "You['’]?(re|ve) (out of (extra |daily |weekly )?usage|(hit|reached) your ((org['’]?s |team['’]?s |account['’]?s |session |usage |weekly |daily |monthly |annual |spend(ing)? |token |credit )*)limit)\\b";
+
+export const QUOTA_RESULT_RE = new RegExp(`^\\s*${QUOTA_PATTERN_BODY}`, 'i');
+
+// Unanchored twin of QUOTA_RESULT_RE. A subagent (Task tool) that exhausts the
+// quota never produces a top-level `result` — the quota prose comes back as a
+// `tool_result` inside the parent's still-running turn, so the anchored form
+// can't see it. Used only by the PostToolUse Task hook; the anchoring is what
+// keeps false positives off the top-level result path, so do NOT swap this in
+// there.
+export const QUOTA_EMBEDDED_RE = new RegExp(QUOTA_PATTERN_BODY, 'i');
 
 // Org-level Claude Code access block, e.g. "Your organization has disabled
 // Claude subscription access for Claude Code · Use an Anthropic API key
@@ -683,9 +702,16 @@ export const QUOTA_RESULT_RE =
 // (`subscription_access_disabled`) so logs distinguish a blocked account
 // from an exhausted one. Anchored on the "Your <org-word> has disabled
 // Claude … access" sentence opener; requires "Claude" + "access" so agent
-// prose about other things an org disabled can't match.
-export const SUBSCRIPTION_BLOCKED_RE =
-  /^\s*Your (organization|org|team|admin|account) has disabled Claude( Code)?( subscription)? access\b/i;
+// prose about other things an org disabled can't match. Same single-source
+// body/anchored/unanchored split as QUOTA_PATTERN_BODY above, for the same
+// reason.
+const SUBSCRIPTION_BLOCKED_PATTERN_BODY =
+  'Your (organization|org|team|admin|account) has disabled Claude( Code)?( subscription)? access\\b';
+
+export const SUBSCRIPTION_BLOCKED_RE = new RegExp(`^\\s*${SUBSCRIPTION_BLOCKED_PATTERN_BODY}`, 'i');
+
+/** Unanchored twin of SUBSCRIPTION_BLOCKED_RE — see QUOTA_EMBEDDED_RE. */
+export const SUBSCRIPTION_BLOCKED_EMBEDDED_RE = new RegExp(SUBSCRIPTION_BLOCKED_PATTERN_BODY, 'i');
 
 // Poisoned continuation: the SDK surfaces the thinking-signature 400 as plain
 // result text ("API Error: 400 ... Invalid `signature` in `thinking` block"),
@@ -715,6 +741,124 @@ export const POISONED_CONTINUATION_RE = /invalid `?signature`? in `?thinking`? b
 // result is the agent's own text, never prefixed "API Error:").
 export const TRANSIENT_OVERLOAD_RESULT_RE =
   /^API Error:\s*(?:Server is temporarily limiting requests|Request rejected \(429\))/i;
+
+// ── Subagent quota exhaustion (PostToolUse: Task) ──
+
+/**
+ * What the parent agent sees in place of a quota-exhausted subagent's output.
+ *
+ * Two hard requirements:
+ *  - It must NOT match QUOTA_EMBEDDED_RE / SUBSCRIPTION_BLOCKED_EMBEDDED_RE.
+ *    The hook rewrites the tool output it just matched on; text that
+ *    re-matched would make every replayed turn look quota-exhausted again.
+ *    The self-match guard lives in claude.subagentQuota.test.ts.
+ *  - It must not repeat the SDK's "ask your admin to raise it at
+ *    claude.ai/settings/usage" remediation. The bug this whole path fixes is
+ *    the parent reading that sentence as an instruction and telling the user
+ *    to go raise their org limits — which is neither true nor actionable when
+ *    the real fix is rotating to the next credential slot.
+ */
+export const SUBAGENT_QUOTA_REPLACEMENT_TEXT =
+  '[nanoclaw] The subagent was aborted before it produced any result: the credential slot ' +
+  'it was running on stopped serving requests. The parent turn is being aborted and replayed ' +
+  'automatically on the next credential slot. This is infrastructure, not a task outcome — do ' +
+  'not report it as a finding, do not act on anything the subagent returned, and do not ask ' +
+  'anyone to change an account, billing, or plan setting.';
+
+/**
+ * Flatten a PostToolUse `tool_response` (typed `unknown`) to text we can run
+ * the quota regexes over. The Task tool's result is normally an array of
+ * content blocks, but the field is untyped by contract — a string, a bare
+ * object, or something unexpected are all legal. Never throws; depth-capped so
+ * a cyclic structure can't spin.
+ */
+function stringifyToolResponse(response: unknown, depth = 0): string {
+  if (response == null || depth > 4) return '';
+  if (typeof response === 'string') return response;
+  if (typeof response === 'number' || typeof response === 'boolean') return String(response);
+  if (Array.isArray(response)) return response.map((entry) => stringifyToolResponse(entry, depth + 1)).join('\n');
+  if (typeof response === 'object') {
+    const o = response as Record<string, unknown>;
+    const parts: string[] = [];
+    if (typeof o.text === 'string') parts.push(o.text);
+    if (o.content !== undefined) parts.push(stringifyToolResponse(o.content, depth + 1));
+    if (parts.length > 0) return parts.join('\n');
+    try {
+      return JSON.stringify(response) ?? '';
+    } catch {
+      return '';
+    }
+  }
+  return '';
+}
+
+/**
+ * PostToolUse hook matched on `Task`: catch Claude Max quota exhaustion (or an
+ * org access block) that a SUBAGENT hit.
+ *
+ * A subagent's quota failure never becomes a top-level `type:'result'` — it
+ * comes back as a tool_result inside the parent's still-running turn, so the
+ * result-branch throws below never fire, no rotation happens, and the parent
+ * reads "…ask your admin to raise it…" as an instruction.
+ *
+ * Rotation cannot happen mid-flight (the CLI subprocess is started with this
+ * query's env, so the credential is fixed for the query's life — see the
+ * comment on `oauthSlot` in query()). Recovery therefore requires aborting the
+ * query and letting poll-loop's existing rotation/retry machinery replay the
+ * turn. So this hook does two things: it records the detection for
+ * translateEvents to throw on, and it interrupts the query so the turn
+ * actually stops instead of running on with a dead subagent.
+ *
+ * The rewrite is belt-and-braces: if the abort races the next model request,
+ * the misleading prose still never enters the parent's context.
+ */
+export function createSubagentQuotaHook(options: {
+  /** Called once per detection with the full `<marker>: <text>` throw message. */
+  onDetect: (markedMessage: string) => void;
+  /** Aborts the in-flight query (i.e. `sdkResult.interrupt`). */
+  interrupt: () => Promise<unknown>;
+}): HookCallback {
+  return async (input) => {
+    try {
+      const i = input as PostToolUseHookInput;
+      const text = stringifyToolResponse(i.tool_response);
+      if (!text) return { continue: true };
+
+      const marker = QUOTA_EMBEDDED_RE.test(text)
+        ? 'subscription_quota_exhausted'
+        : SUBSCRIPTION_BLOCKED_EMBEDDED_RE.test(text)
+          ? 'subscription_access_disabled'
+          : null;
+      // No match: return NO rewrite at all. An identity rewrite here would
+      // race sibling PostToolUse hooks last-write-wins and could clobber a
+      // real redaction (sdk.d.ts, PostToolUseHookSpecificOutput).
+      if (!marker) return { continue: true };
+
+      const snippet = text.replace(/\s+/g, ' ').trim().slice(0, 300);
+      log(`Subagent hit ${marker} — interrupting turn so poll-loop can rotate: ${snippet}`);
+      options.onDetect(`${marker}: ${snippet}`);
+
+      try {
+        void options.interrupt()?.catch?.((err: unknown) => {
+          log(`Subagent quota interrupt failed: ${err instanceof Error ? err.message : String(err)}`);
+        });
+      } catch (err) {
+        log(`Subagent quota interrupt threw: ${err instanceof Error ? err.message : String(err)}`);
+      }
+
+      return {
+        continue: true,
+        hookSpecificOutput: {
+          hookEventName: 'PostToolUse',
+          updatedToolOutput: SUBAGENT_QUOTA_REPLACEMENT_TEXT,
+        },
+      };
+    } catch (err) {
+      log(`Subagent quota hook failed: ${err instanceof Error ? err.message : String(err)}`);
+      return { continue: true };
+    }
+  };
+}
 
 // buildSecretEnvVarList (the Bash-sanitize unset list) lives in secret-env.ts —
 // an SDK-free module so sibling adapters can import the same single-source list.
@@ -2087,6 +2231,14 @@ export class ClaudeProvider implements AgentProvider {
       lane: laneForSlot(process.env.CLAUDE_CODE_OAUTH_LANES, oauthSlot),
     };
 
+    // Set by the PostToolUse:Task hook when a SUBAGENT hits the Claude Max
+    // quota (or an org access block). Rotation can't happen mid-query — the
+    // credential is fixed for this query's life (see `oauthSlot` above) — so
+    // the hook interrupts the query and translateEvents throws this on the
+    // next loop iteration, landing in poll-loop's existing rotation/retry
+    // catch exactly like the result-branch throws below.
+    let subagentQuotaError: string | null = null;
+
     const sdkResult = sdkQuery({
       prompt: stream,
       options: {
@@ -2137,6 +2289,21 @@ export class ClaudeProvider implements AgentProvider {
             // mcp__.* matches every MCP tool call; the hook itself dispatches
             // through its allowlist and ignores non-durable results.
             { matcher: 'mcp__.*', hooks: [createMemoryCaptureMcpHook()] },
+            // A subagent's quota exhaustion arrives as a tool_result inside
+            // this still-running turn, never as a top-level result — this is
+            // the only place it can be seen. Task is not matched by any other
+            // rewriting hook, so there's no rewrite collision.
+            {
+              matcher: 'Task',
+              hooks: [
+                createSubagentQuotaHook({
+                  onDetect: (marked) => {
+                    if (!subagentQuotaError) subagentQuotaError = marked;
+                  },
+                  interrupt: () => sdkResult.interrupt(),
+                }),
+              ],
+            },
           ],
           PostToolUseFailure: [{ hooks: [postToolUseHook] }],
           PreCompact: [{ hooks: [createPreCompactHook(this.assistantName)] }],
@@ -2232,6 +2399,11 @@ export class ClaudeProvider implements AgentProvider {
 
       for await (const message of sdkResult) {
         if (aborted) return;
+        // A subagent hit the credential slot's quota (PostToolUse:Task hook).
+        // Throw here so poll-loop's catch rotates the OAuth ring and replays
+        // the turn — identical to the result-branch throws below, which a
+        // subagent failure never reaches.
+        if (subagentQuotaError) throw new Error(subagentQuotaError);
         messageCount++;
 
         // Yield activity for every SDK event so the poll loop knows the agent is working
@@ -2391,6 +2563,13 @@ export class ClaudeProvider implements AgentProvider {
           }
         }
       }
+      // Second gate, and the load-bearing one: `interrupt()` may end the
+      // stream without emitting a further message, in which case the
+      // top-of-loop check above never runs again and the turn would complete
+      // normally — dead subagent, no rotation, silently. Re-check after the
+      // loop so the throw is guaranteed regardless of how the SDK winds the
+      // interrupted stream down.
+      if (subagentQuotaError) throw new Error(subagentQuotaError);
       log(`Query completed after ${messageCount} SDK messages`);
     }
 
