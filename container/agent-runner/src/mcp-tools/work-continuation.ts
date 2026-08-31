@@ -22,9 +22,11 @@ export const continueWork: McpToolDefinition = {
   tool: {
     name: 'continue_work',
     description:
-      'Durably hand yourself one unfinished next step. Call this BEFORE ending a turn that promises more work. ' +
-      'The runner immediately starts the task after the current response and resumes it after container or host restarts. ' +
-      'Calling it again replaces the queued task. Do not use it for a time delay; use wait for that.',
+      'Durably hand yourself one unfinished next step. Call this BEFORE ending a turn that promises more work — ' +
+      'plain future-tense prose or a "NEXT: …" note does nothing on its own. ' +
+      'The runner starts the task after the current response, resuming after any input that already arrived, ' +
+      'and the queued task survives container and host restarts. Calling it again replaces the queued task; ' +
+      'cancel_continuation cancels it. Do not use it for a time delay; use wait for that.',
     inputSchema: {
       type: 'object' as const,
       additionalProperties: false,
@@ -91,9 +93,10 @@ export const proposeDone: McpToolDefinition = {
     name: 'propose_done',
     description:
       'Tell the operator you believe this thread is finished, with a one-line reason. ' +
-      'This is a PROPOSAL, not a close: nothing stops, and you keep working if more arrives. ' +
-      'Call it when you have delivered the result and hold no continuation. ' +
-      'If the operator asks you to wrap up, finish, cancel_continuation, then call this to confirm.',
+      'This is a PROPOSAL, not a close: nothing stops, and you keep working if more arrives — only the operator decides. ' +
+      'Callable only once you have delivered the result and hold no continuation. ' +
+      'A `[system] … asked to close this thread` message IS that decision: finish or checkpoint, ' +
+      'report state (done / lost / next), then call this to confirm.',
     inputSchema: {
       type: 'object' as const,
       additionalProperties: false,

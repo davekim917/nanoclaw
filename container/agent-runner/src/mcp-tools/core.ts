@@ -12,7 +12,13 @@ import path from 'path';
 
 import { awaitDeliveryAck } from '../db/delivery-acks.js';
 import { findByName, getAllDestinations } from '../destinations.js';
-import { chatBudgetExhausted, isChatMuted, getMessageIdBySeq, getRoutingBySeq, writeMessageOut } from '../db/messages-out.js';
+import {
+  chatBudgetExhausted,
+  isChatMuted,
+  getMessageIdBySeq,
+  getRoutingBySeq,
+  writeMessageOut,
+} from '../db/messages-out.js';
 
 // Shared refusal copy for send paths under the physical chat budget. Edits and
 // reactions stay allowed — amending the already-sent message is the sanctioned
@@ -151,7 +157,7 @@ export const sendMessage: McpToolDefinition = {
   tool: {
     name: 'send_message',
     description:
-      'Send a message. Omit `to` to post in the CURRENT conversation (the thread/channel you are working in) — this is the default and works regardless of how many destinations you have, so it is the right choice for progress updates and results of the work you were asked to do. Pass `to` ONLY to reach a different destination than the current conversation (a sibling agent, another channel, or a DM someone explicitly asked you to use). Do not redirect routine status/completion to a DM.',
+      'Send a message. Omit `to` to post in the CURRENT conversation (the thread/channel you are working in) — this is the default and works regardless of how many destinations you have, so it is the right choice for progress updates and results of the work you were asked to do. Pass `to` ONLY to reach a different destination than the current conversation (a sibling agent, another channel, or a DM someone explicitly asked you to use). Do not redirect routine status/completion to a DM. A container file path means nothing to the user — attach it with send_file or excerpt its content here instead of naming the path.',
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -193,7 +199,7 @@ export const sendFile: McpToolDefinition = {
   tool: {
     name: 'send_file',
     description:
-      'Send a file from your workspace. Omit `to` to post in the current conversation (the thread/channel you are working in) — the default, regardless of destination count. Pass `to` only to reach a different destination than the current conversation. Use this to deliver artifacts you produced — charts, PDFs, generated images, reports, self-contained HTML — rather than dumping their contents into chat.',
+      'Send a file from your workspace. Omit `to` to post in the current conversation (the thread/channel you are working in) — the default, regardless of destination count. Pass `to` only to reach a different destination than the current conversation. Use this to deliver artifacts you produced — charts, PDFs, generated images, reports, self-contained HTML — rather than dumping their contents into chat. A container path is never openable by the user directly; this is how they actually receive the file.',
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -227,15 +233,15 @@ export const sendFile: McpToolDefinition = {
       return err('Path not allowed for send_file.');
     }
     if (!isAllowedFilePath(realPath)) {
-      return err(
-        `Path not allowed for send_file. Files must be under ${SEND_FILE_ALLOWED_PREFIXES.join(', ')}.`,
-      );
+      return err(`Path not allowed for send_file. Files must be under ${SEND_FILE_ALLOWED_PREFIXES.join(', ')}.`);
     }
 
     const stat = fs.statSync(realPath);
     if (stat.size === 0) return err('File is empty.');
     if (stat.size > SEND_FILE_MAX_BYTES) {
-      return err(`File too large (${(stat.size / 1024 / 1024).toFixed(1)}MB). Max ${SEND_FILE_MAX_BYTES / 1024 / 1024}MB.`);
+      return err(
+        `File too large (${(stat.size / 1024 / 1024).toFixed(1)}MB). Max ${SEND_FILE_MAX_BYTES / 1024 / 1024}MB.`,
+      );
     }
 
     // path.basename strips any traversal in the optional display name.

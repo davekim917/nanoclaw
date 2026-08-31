@@ -22,10 +22,7 @@ Before proposing work that mutates shared, production, or customer-visible state
 
 The idle ceiling is a heartbeat, not a turn timer: it fires once your turn ends and the runner goes quiet, and anything "running in the background" dies with it.
 
-- Never announce a next step and stop — start it now, or call `continue_work({ task })` first; it resumes after already-arrived input, survives restarts, and `cancel_continuation` cancels it. Prose/"NEXT:" does nothing.
-- `propose_done({ reason })` is a proposal, callable only once delivered with no continuation held — an operator decides. A `[system] … asked to close this thread` message IS that decision: finish or checkpoint, report state (done / lost / next), confirm with `propose_done`.
 - Checkpoint to durable paths, never `/tmp` — resume from checkpoints, not memory of the dead turn.
-- `wait({ minutes, prompt })` is an in-thread wake with full context restored; `ncl tasks` is only for jobs whose stop condition is "never" — a writable end condition belongs in a `wait` loop.
 - "No completion record" or an idle-ceiling wake means the prior container died mid-work: report state (done / lost / next), then resume — never re-dispatch what just got killed. A cancelled tool call mid-restart means mounts are reconciling, not revoked.
 
 If `/workspace/workgroup/claims/` exists, claim work before starting and check for an existing claim first (`work-claims` skill). Skip for read-only or private-workspace work.
@@ -44,7 +41,7 @@ Asked how your own tools work, read the source at `/workspace/project` — never
 
 ## Workspace and memory
 
-Files you create live in `/workspace/agent/` (private); `/workspace/workgroup/`, shared read-write with siblings when present (repos are the exception — see Repos). A container path is never openable by a user — attach the file or excerpt it. `conversations/` holds searchable past transcripts.
+Files you create live in `/workspace/agent/` (private); `/workspace/workgroup/`, shared read-write with siblings when present (repos are the exception — see Working with Repos). `conversations/` holds searchable past transcripts.
 
 Durable memory lives under `/workspace/workgroup/memory/` (compat: `/workspace/agent/memory/`) — edit via `write_memory_file` with the current SHA-256; record a non-trivial technique in `memory/methods/`. `CLAUDE.local.md` is operator-curated: read it, don't edit it unless asked. **Lessons you learn go to memory, never a standing instruction file — those change only via the operator.** Route outbound prose through `humanizer` first; code, commits, and your own replies are excluded.
 
@@ -60,9 +57,7 @@ Delegate to Codex with `codex exec --yolo "<prompt>"`, not `/codex:*` plugin ski
 
 ## Working with Repos
 
-One canonical clone per workgroup; browse and edit it at `/workspace/worktrees/<repo>` via `create_worktree` (existing) or `clone_repo` (new), never an ad-hoc clone. Then `git_commit` → `git_push` → `open_pr`. Dirty/staged/untracked state persists exactly, and coordinate commits with same-topic siblings — `git_commit` stages every dirty file in the checkout, theirs included; if migrated work looks missing, ask the operator rather than recreating a branch — the source topology stays outside agent mounts for rollback.
-
-After every PR: `add_ship_log`; resolve a backlog item via `update_backlog_item`; file new bugs with `add_backlog_item`. Never add "Co-Authored-By" trailers or "Generated with Claude Code" footers.
+One canonical clone per workgroup, mounted at `/workspace/worktrees/<repo>` — never an ad-hoc clone. See the `clone_repo`, `create_worktree`, `git_commit`, `git_push`, and `open_pr` tool descriptions for how to use it.
 
 ## Feature Work Routing
 
