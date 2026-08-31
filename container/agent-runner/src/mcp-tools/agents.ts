@@ -50,7 +50,7 @@ export const createAgent: McpToolDefinition = {
         instructions: {
           type: 'string',
           description:
-            "Becomes the new agent's instructions.prepend.md (its standing role and personality) — read on every spawn alongside the shared base, so don't restate NanoClaw base behavior here. Cover: the agent's role, who it takes tasks from (you, by name), how/when it reports back (completion only, or milestones for long work), and any domain-specific rules.",
+            "Becomes the new agent's standing-instructions.md (its standing role and personality) — read on every spawn alongside the shared base, so don't restate NanoClaw base behavior here. Cover: the agent's role, who it takes tasks from (you, by name), how/when it reports back (completion only, or milestones for long work), and any domain-specific rules.",
         },
         provider: {
           type: 'string',

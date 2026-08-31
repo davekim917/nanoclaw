@@ -36,7 +36,7 @@ describe('agents.instructions.md content migrated into create_agent', () => {
 
   it('instructions param description carries what to write into it', () => {
     const instructionsParam = createAgent.tool.inputSchema.properties.instructions as { description: string };
-    expect(instructionsParam.description).toContain('instructions.prepend.md');
+    expect(instructionsParam.description).toContain('standing-instructions.md');
     expect(instructionsParam.description).toMatch(/role/i);
   });
 });

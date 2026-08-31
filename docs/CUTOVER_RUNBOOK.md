@@ -25,7 +25,7 @@ The memory workflow is deliberately separate and lossless:
 - verify every sibling link, migration outcome, snapshot, and live recall pair;
 - use the exact applied report for rollback if post-cutover verification fails.
 
-`CLAUDE.md`, `CLAUDE.local.md`, `instructions.prepend.md`, provider
+`CLAUDE.md`, `CLAUDE.local.md`, `standing-instructions.md`, provider
 configuration, credentials, session transcripts, repositories, and worktrees
 are customization or provider-state surfaces—not memory inputs. They remain
 separate throughout migration.

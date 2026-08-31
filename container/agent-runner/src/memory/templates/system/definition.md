@@ -37,7 +37,7 @@ shape would remember or retrieve better.
 Keep `memory/index.md` and this definition lean: headlines and pointers here,
 detail in linked files. Core Memory in the index should only hold durable facts
 relevant in nearly every conversation; behavior, role, and persona belong in
-`/workspace/agent/instructions.prepend.md`.
+`/workspace/agent/standing-instructions.md`.
 
 ## Open Knowledge Format
 

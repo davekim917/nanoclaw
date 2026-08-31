@@ -124,7 +124,7 @@ Owner gets seeded during the `/migrate-from-v1` skill's interview phase ("Which 
 
 **v2:** each group still lives at `groups/<folder>/`, but the shape is richer:
 - `CLAUDE.md` or `AGENTS.md` — **composed at container spawn** from the provider's shared base, standing instructions, and capability fragments. **Don't edit it directly.**
-- `instructions.prepend.md` — provider-neutral standing role, personality, and behavior.
+- `standing-instructions.md` — provider-neutral standing role, personality, and behavior.
 - `memory/` — a compatibility view of the workgroup's provider-neutral durable
   memory canon at `data/workgroups/<workgroup-id>/memory`.
 - `CLAUDE.local.md` — a byte-preserved standing-instruction/customization
@@ -136,11 +136,11 @@ Owner gets seeded during the `/migrate-from-v1` skill's interview phase ("Which 
 `/migrate-memory` losslessly consolidates only discovered group-local memory
 roots and recognized provider-native memory roots into the one workgroup canon.
 It never moves or distills `.seed.md`, `CLAUDE.md`, `CLAUDE.local.md`,
-`instructions.prepend.md`, or another non-memory customization.
+`standing-instructions.md`, or another non-memory customization.
 
 When old standing instructions need porting, legacy instruction reconciliation
 is an explicit separate operator workflow: preserve `CLAUDE.local.md`
-byte-for-byte, show and approve any proposed `instructions.prepend.md` change,
+byte-for-byte, show and approve any proposed `standing-instructions.md` change,
 verify the original checksum, and record the result separately. Never move or
 distill an instruction surface into the memory canon.
 
