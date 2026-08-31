@@ -1,3 +1,4 @@
+import { execFileSync } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 
@@ -18,6 +19,7 @@ import {
   checkContainerBytes,
   checkGroupStandingBytes,
   checkInstructionStack,
+  instructionStackBreachKind,
   CONTAINER_BYTES_CEILING,
   GROUP_STANDING_BYTES_CEILING,
 } from './fleet-drift.js';
@@ -458,6 +460,131 @@ describe('checkGroupStandingBytes', () => {
 
   it('returns empty when the groups root does not exist (e.g. a worktree without the groups checkout)', () => {
     expect(checkGroupStandingBytes(path.join(TMP, 'does-not-exist'))).toEqual([]);
+  });
+
+  // P2 regression: a normal clone shares only SOME standing files (a common
+  // CLAUDE.local.md, each group keeping its own persona) — that puts the two
+  // groups in DIFFERENT clusters (their full file sets differ), so the
+  // shared file must still be pattern-scanned/reported once, not once per
+  // cluster that happens to reference it.
+  it('P2: scans a file shared by only some groups exactly once, even when their personas differ (partial cluster overlap)', () => {
+    const groupA = path.join(groupsRoot(), 'group-a');
+    const groupB = path.join(groupsRoot(), 'group-b');
+    fs.mkdirSync(groupA, { recursive: true });
+    fs.mkdirSync(groupB, { recursive: true });
+    fs.writeFileSync(path.join(groupA, 'standing-instructions.md'), cleanContent(500)); // own, distinct
+    fs.writeFileSync(path.join(groupB, 'standing-instructions.md'), cleanContent(600)); // own, distinct — different size so the cluster signature truly differs
+    fs.writeFileSync(path.join(groupA, 'CLAUDE.local.md'), 'Root-caused in #123.\n'); // shared, real
+    fs.symlinkSync(path.join(groupA, 'CLAUDE.local.md'), path.join(groupB, 'CLAUDE.local.md')); // shared, symlink
+
+    const breaches = checkGroupStandingBytes(groupsRoot());
+    const patternBreaches = breaches.filter((b) => b.bannedHits.length > 0);
+    expect(patternBreaches).toHaveLength(1); // not one per cluster
+    expect(patternBreaches[0].scope).toBe('group-a, group-b');
+    expect(patternBreaches[0].bannedHits).toHaveLength(1);
+    expect(patternBreaches[0].bannedHits[0].patterns).toContain('issue_or_pr_ref');
+  });
+
+  it('a full-cluster ceiling breach and a banned-pattern hit on the same shared file are two distinct breach entries, not merged or colliding', () => {
+    const source = path.join(groupsRoot(), 'dup-source');
+    const sibling = path.join(groupsRoot(), 'dup-sibling');
+    fs.mkdirSync(source, { recursive: true });
+    fs.mkdirSync(sibling, { recursive: true });
+    fs.writeFileSync(
+      path.join(source, 'standing-instructions.md'),
+      `${cleanContent(GROUP_STANDING_BYTES_CEILING + 500)}Fixed on 2026-08-31.\n`,
+    );
+    fs.symlinkSync(path.join(source, 'standing-instructions.md'), path.join(sibling, 'standing-instructions.md'));
+
+    const breaches = checkGroupStandingBytes(groupsRoot());
+    expect(breaches).toHaveLength(2);
+    const ceilingBreach = breaches.find((b) => b.overCeiling);
+    const patternBreach = breaches.find((b) => b.bannedHits.length > 0);
+    expect(ceilingBreach?.scope).toBe('dup-sibling, dup-source');
+    expect(patternBreach?.scope).toBe('dup-sibling, dup-source');
+    // Same scope string on both — they must still carry a distinct kind so the issue-title dedup doesn't collapse them.
+    expect(instructionStackBreachKind(ceilingBreach!)).not.toBe(instructionStackBreachKind(patternBreach!));
+  });
+});
+
+// P1: groups/ is container-writable, so a candidate standing-file path is a
+// trust boundary, not just a file to read. These lock in that a planted
+// symlink/FIFO/oversized file is skipped and reported as its own signal,
+// never read.
+describe('checkGroupStandingBytes safety (P1: symlink containment, non-regular files, size cap)', () => {
+  const TMP = '/tmp/nanoclaw-fleet-drift-safety-test';
+  const groupsRoot = () => path.join(TMP, 'groups');
+
+  beforeEach(() => {
+    fs.rmSync(TMP, { recursive: true, force: true });
+    fs.mkdirSync(TMP, { recursive: true });
+  });
+  afterEach(() => fs.rmSync(TMP, { recursive: true, force: true }));
+
+  it('skips and flags a symlink that escapes the groups/ tree, never reading the target', () => {
+    const outside = path.join(TMP, 'outside-secret.md');
+    fs.writeFileSync(outside, 'host-side content with a date 2026-08-31 that must never surface.\n');
+    const g = path.join(groupsRoot(), 'escape-group');
+    fs.mkdirSync(g, { recursive: true });
+    fs.symlinkSync(outside, path.join(g, 'CLAUDE.local.md'));
+
+    const breaches = checkGroupStandingBytes(groupsRoot());
+    expect(breaches).toHaveLength(1);
+    expect(breaches[0].scope).toBe('escape-group');
+    expect(breaches[0].unscannable).toHaveLength(1);
+    expect(breaches[0].unscannable[0].reason).toMatch(/escapes groups\//);
+    // The banned date in the outside file's content must never surface — it was never read.
+    expect(breaches[0].bannedHits).toEqual([]);
+  });
+
+  it('skips a FIFO placed directly (no symlink) without hanging', () => {
+    const g = path.join(groupsRoot(), 'fifo-group');
+    fs.mkdirSync(g, { recursive: true });
+    const fifoPath = path.join(g, 'CLAUDE.local.md');
+    execFileSync('mkfifo', [fifoPath]);
+
+    const breaches = checkGroupStandingBytes(groupsRoot()); // must return promptly — a naive read would block forever
+    expect(breaches).toHaveLength(1);
+    expect(breaches[0].unscannable[0].reason).toBe('not a regular file');
+  });
+
+  it('skips a symlink to a FIFO without hanging', () => {
+    const source = path.join(groupsRoot(), 'fifo-source');
+    fs.mkdirSync(source, { recursive: true });
+    const fifoPath = path.join(source, 'the-fifo');
+    execFileSync('mkfifo', [fifoPath]);
+    const g = path.join(groupsRoot(), 'fifo-symlink-group');
+    fs.mkdirSync(g, { recursive: true });
+    fs.symlinkSync(fifoPath, path.join(g, 'CLAUDE.local.md'));
+
+    const breaches = checkGroupStandingBytes(groupsRoot());
+    expect(breaches).toHaveLength(1);
+    expect(breaches[0].scope).toBe('fifo-symlink-group');
+    expect(breaches[0].unscannable[0].reason).toBe('not a regular file');
+  });
+
+  it('skips a file over the safety cap without reading its content', () => {
+    const g = path.join(groupsRoot(), 'huge-group');
+    fs.mkdirSync(g, { recursive: true });
+    // Sparse file: stat reports a huge size without allocating/reading real data.
+    const hugePath = path.join(g, 'CLAUDE.local.md');
+    fs.writeFileSync(hugePath, '');
+    fs.truncateSync(hugePath, 5_000_000);
+
+    const breaches = checkGroupStandingBytes(groupsRoot());
+    expect(breaches).toHaveLength(1);
+    expect(breaches[0].unscannable[0].reason).toMatch(/safety cap/);
+  });
+
+  it('still follows a symlink that stays inside groups/ (a legitimate sibling share) and reads it', () => {
+    const source = path.join(groupsRoot(), 'legit-source');
+    const sibling = path.join(groupsRoot(), 'legit-sibling');
+    fs.mkdirSync(source, { recursive: true });
+    fs.mkdirSync(sibling, { recursive: true });
+    fs.writeFileSync(path.join(source, 'CLAUDE.local.md'), cleanContent(300));
+    fs.symlinkSync(path.join(source, 'CLAUDE.local.md'), path.join(sibling, 'CLAUDE.local.md'));
+
+    expect(checkGroupStandingBytes(groupsRoot())).toEqual([]); // clean, under ceiling, nothing unscannable
   });
 });
 

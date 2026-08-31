@@ -437,6 +437,7 @@ export interface InstructionStackBreach {
   ceiling: number;
   overCeiling: boolean;
   bannedHits: Array<{ file: string; patterns: string[] }>;
+  unscannable: Array<{ file: string; reason: string }>;
 }
 
 /** container/CLAUDE.md ceiling + banned-pattern check. Returns null when clean. */
@@ -453,6 +454,7 @@ export function checkContainerBytes(containerClaudeMdPath: string, ceiling = CON
     ceiling,
     overCeiling,
     bannedHits: patterns.length ? [{ file: containerClaudeMdPath, patterns }] : [],
+    unscannable: [],
   };
 }
 
@@ -462,35 +464,123 @@ interface StandingFileInfo {
   bannedHits: string[];
 }
 
-/** Reads one group's standing files, resolving symlinks to their real target so a shared file is read (and counted) once. */
-function readGroupStandingFiles(groupDir: string): StandingFileInfo[] {
-  const infos: StandingFileInfo[] = [];
+interface UnscannableFile {
+  group: string;
+  path: string;
+  reason: string;
+}
+
+/**
+ * `groups/<name>/` is container-writable, so a candidate standing-file path
+ * cannot be trusted blind: a symlink to a FIFO would hang this (daily-timer)
+ * process forever on read, a symlink/file to something huge or a device
+ * would exhaust memory, and a symlink resolving outside groups/ would cross
+ * the trust boundary into host-side content. lstat first; a symlink is only
+ * followed if its resolved target stays inside `groupsRootResolved`
+ * (mirrors the containment check in src/group-persona.ts readGroupPersona,
+ * minus the O_NOFOLLOW fd gymnastics — not needed for a read-only metrics
+ * job); the resolved target (or the path itself, if not a symlink) must be a
+ * regular file under the size cap. Nothing unsafe is ever read — a null
+ * return means "doesn't exist" (normal; most groups don't have every
+ * candidate filename), a `skip` return means "exists but unsafe to read."
+ */
+function resolveStandingFile(p: string, groupsRootResolved: string): { realPath: string } | { skip: string } | null {
+  let stat: fs.Stats;
+  try {
+    stat = fs.lstatSync(p);
+  } catch (err) {
+    // ENOENT is the normal case — most groups don't have every candidate
+    // filename. Anything else (EACCES, a race mid-scan, ...) is unexpected —
+    // fail closed like every other collector in this file, don't swallow it.
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return null;
+    throw err;
+  }
+
+  let realPath = p;
+  if (stat.isSymbolicLink()) {
+    let target: string;
+    try {
+      target = fs.realpathSync(p);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') return { skip: 'broken symlink' };
+      throw err;
+    }
+    if (target !== groupsRootResolved && !target.startsWith(groupsRootResolved + path.sep)) {
+      return { skip: `symlink escapes groups/ (-> ${target})` };
+    }
+    try {
+      stat = fs.statSync(target);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') return { skip: 'broken symlink target' };
+      throw err;
+    }
+    realPath = target;
+  }
+
+  if (!stat.isFile()) return { skip: 'not a regular file' };
+  if (stat.size > MAX_STANDING_FILE_BYTES) return { skip: `exceeds ${MAX_STANDING_FILE_BYTES} B safety cap (${stat.size} B)` };
+  return { realPath };
+}
+
+/** ponytail: sanity cap, not a precision limit — 100x+ the real ceiling is plenty of headroom for any legitimate standing file, small enough that a planted huge file/device is never read into memory. */
+const MAX_STANDING_FILE_BYTES = 1_000_000;
+
+/** Reads one group's standing files, resolving symlinks to their real target so a shared file is read (and counted) once. Unsafe candidates are skipped, never read. */
+function readGroupStandingFiles(groupDir: string, groupsRootResolved: string): { files: StandingFileInfo[]; unscannable: UnscannableFile[] } {
+  const files: StandingFileInfo[] = [];
+  const unscannable: UnscannableFile[] = [];
+  const group = path.basename(groupDir);
   for (const name of GROUP_STANDING_FILENAMES) {
     const p = path.join(groupDir, name);
-    if (!fs.existsSync(p)) continue;
-    const realPath = fs.realpathSync(p);
-    const content = fs.readFileSync(realPath, 'utf-8');
-    infos.push({ realPath, bytes: Buffer.byteLength(content, 'utf-8'), bannedHits: scanBannedPatterns(content) });
+    const resolved = resolveStandingFile(p, groupsRootResolved);
+    if (resolved === null) continue;
+    if ('skip' in resolved) {
+      unscannable.push({ group, path: p, reason: resolved.skip });
+      continue;
+    }
+    const content = fs.readFileSync(resolved.realPath, 'utf-8');
+    files.push({ realPath: resolved.realPath, bytes: Buffer.byteLength(content, 'utf-8'), bannedHits: scanBannedPatterns(content) });
   }
-  return infos;
+  return { files, unscannable };
 }
 
 /**
  * Per-group standing-file ceiling + banned-pattern check across every group
- * under `groupsRoot`. Sibling groups commonly symlink their ENTIRE standing
- * file set to one source group (e.g. a codex/opencode sibling → its Claude
- * counterpart) — those groups are clustered by the exact set of real files
- * they resolve to, so the shared content's bytes and any banned-pattern hit
- * are counted and flagged once fleet-wide, not once per sibling.
+ * under `groupsRoot`.
+ *
+ * Ceiling: sibling groups commonly symlink their ENTIRE standing file set to
+ * one source group (e.g. a codex/opencode sibling → its Claude counterpart)
+ * — those groups are clustered by the exact set of real files they resolve
+ * to, and the cluster's total is checked once against the per-group ceiling
+ * (it's the same total for every member, so one breach covers the cluster).
+ *
+ * Banned patterns: deliberately NOT scoped to those clusters — a normal
+ * clone shares only SOME standing files (e.g. one common CLAUDE.local.md,
+ * each group keeping its own persona), which puts those groups in different
+ * clusters. Scanned per real file fleet-wide instead, independent of cluster
+ * shape, so a shared file's hit is reported once no matter how many groups
+ * reference it.
  */
 export function checkGroupStandingBytes(groupsRoot: string, ceiling = GROUP_STANDING_BYTES_CEILING): InstructionStackBreach[] {
   if (!fs.existsSync(groupsRoot)) return [];
+  const groupsRootResolved = fs.realpathSync(groupsRoot);
   const groupNames = fs.readdirSync(groupsRoot).filter((name) => fs.statSync(path.join(groupsRoot, name)).isDirectory());
 
   const clusters = new Map<string, { groups: string[]; files: Map<string, StandingFileInfo> }>();
+  const byRealPath = new Map<string, { bannedHits: string[]; groups: Set<string> }>();
+  const allUnscannable: UnscannableFile[] = [];
+
   for (const group of groupNames) {
-    const files = readGroupStandingFiles(path.join(groupsRoot, group));
+    const { files, unscannable } = readGroupStandingFiles(path.join(groupsRoot, group), groupsRootResolved);
+    allUnscannable.push(...unscannable);
     if (files.length === 0) continue;
+
+    for (const f of files) {
+      const existing = byRealPath.get(f.realPath);
+      if (existing) existing.groups.add(group);
+      else byRealPath.set(f.realPath, { bannedHits: f.bannedHits, groups: new Set([group]) });
+    }
+
     const signature = files
       .map((f) => f.realPath)
       .sort()
@@ -504,14 +594,53 @@ export function checkGroupStandingBytes(groupsRoot: string, ceiling = GROUP_STAN
   }
 
   const breaches: InstructionStackBreach[] = [];
+
   for (const { groups, files } of clusters.values()) {
-    const fileList = [...files.values()];
-    const bytes = fileList.reduce((sum, f) => sum + f.bytes, 0);
-    const bannedHits = fileList.filter((f) => f.bannedHits.length > 0).map((f) => ({ file: f.realPath, patterns: f.bannedHits }));
-    const overCeiling = bytes > ceiling;
-    if (!overCeiling && bannedHits.length === 0) continue;
-    breaches.push({ metric: 'groupStandingBytes', scope: [...groups].sort().join(', '), bytes, ceiling, overCeiling, bannedHits });
+    const bytes = [...files.values()].reduce((sum, f) => sum + f.bytes, 0);
+    if (bytes > ceiling) {
+      breaches.push({
+        metric: 'groupStandingBytes',
+        scope: [...groups].sort().join(', '),
+        bytes,
+        ceiling,
+        overCeiling: true,
+        bannedHits: [],
+        unscannable: [],
+      });
+    }
   }
+
+  for (const [realPath, { bannedHits, groups }] of byRealPath) {
+    if (bannedHits.length === 0) continue;
+    breaches.push({
+      metric: 'groupStandingBytes',
+      scope: [...groups].sort().join(', '),
+      bytes: 0, // pattern-only finding; the cluster's ceiling breach (if any) carries the byte total
+      ceiling,
+      overCeiling: false,
+      bannedHits: [{ file: realPath, patterns: bannedHits }],
+      unscannable: [],
+    });
+  }
+
+  const unscannableByGroup = new Map<string, UnscannableFile[]>();
+  for (const u of allUnscannable) {
+    const arr = unscannableByGroup.get(u.group);
+    if (arr) arr.push(u);
+    else unscannableByGroup.set(u.group, [u]);
+  }
+  for (const [group, items] of unscannableByGroup) {
+    breaches.push({
+      metric: 'groupStandingBytes',
+      scope: group,
+      bytes: 0,
+      ceiling,
+      overCeiling: false,
+      bannedHits: [],
+      unscannable: items.map(({ path: p, reason }) => ({ file: p, reason })),
+    });
+  }
+
   return breaches;
 }
 
@@ -525,12 +654,20 @@ function describeInstructionStackBreach(b: InstructionStackBreach): string {
   const parts: string[] = [];
   if (b.overCeiling) parts.push(`${b.bytes} B > ceiling ${b.ceiling} B`);
   for (const hit of b.bannedHits) parts.push(`banned pattern(s) [${hit.patterns.join(', ')}] in ${hit.file}`);
+  for (const u of b.unscannable) parts.push(`unscannable standing file ${u.file} (${u.reason}) — skipped, never read`);
   return parts.join('; ');
+}
+
+/** ceiling / pattern / unscannable breaches for the same scope must not share a metric identity, or the same-day issue-title dedup collapses two distinct findings into one filed issue. */
+export function instructionStackBreachKind(b: InstructionStackBreach): string {
+  if (b.overCeiling) return 'ceiling';
+  if (b.unscannable.length > 0) return 'unscannable';
+  return 'pattern';
 }
 
 function detectInstructionStackBreaches(containerClaudeMdPath: string, groupsRoot: string): Breach[] {
   return checkInstructionStack(containerClaudeMdPath, groupsRoot).map((b) => ({
-    metric: `instructionStack:${b.metric}:${b.scope}`,
+    metric: `instructionStack:${b.metric}:${instructionStackBreachKind(b)}:${b.scope}`,
     todayValue: b.bytes,
     ruleDescription: describeInstructionStackBreach(b),
     last7RawValues: [b.bytes],
