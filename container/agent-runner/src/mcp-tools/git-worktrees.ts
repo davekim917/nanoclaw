@@ -446,7 +446,9 @@ export const createWorktreeTool: McpToolDefinition = {
   tool: {
     name: 'create_worktree',
     description:
-      "Create or reuse this topic's standard linked worktree at /workspace/worktrees/<repo>. Existing worktrees are never rebased or branch-switched. Optionally transfer exact work from an inactive source thread.",
+      "Create or reuse this topic's standard linked worktree at /workspace/worktrees/<repo>. Existing worktrees are " +
+      'never rebased or branch-switched, and dirty/staged/untracked state persists exactly as left. Optionally transfer ' +
+      'exact work from an inactive source thread. Typical flow from here: git_commit → git_push → open_pr.',
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -454,7 +456,10 @@ export const createWorktreeTool: McpToolDefinition = {
         branch: { type: 'string', description: 'Optional explicit branch. Defaults to the stable topic branch.' },
         continueFromThreadId: {
           type: 'string',
-          description: 'Optional source external thread id whose exact inactive worktree should move to this topic.',
+          description:
+            'Optional source external thread id whose exact inactive worktree should move to this topic. ' +
+            'If migrated work looks missing afterward, ask the operator rather than recreating a branch — the source ' +
+            'topology stays outside agent mounts for rollback.',
         },
       },
       required: ['repo'],
@@ -516,7 +521,10 @@ function worktreeForTool(repo: string): { context: RepositoryContext } | { error
 export const gitCommitTool: McpToolDefinition = {
   tool: {
     name: 'git_commit',
-    description: 'Stage and commit all changes in this topic worktree. Returns the short commit SHA.',
+    description:
+      'Stage and commit all changes in this topic worktree. Returns the short commit SHA. Stages every dirty file in ' +
+      'the checkout, including any left by same-topic siblings sharing it — coordinate before committing. Never add ' +
+      '"Co-Authored-By" trailers or "Generated with Claude Code" footers to the message.',
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -591,7 +599,9 @@ export const gitPushTool: McpToolDefinition = {
 export const openPrTool: McpToolDefinition = {
   tool: {
     name: 'open_pr',
-    description: 'Open a GitHub pull request from the current topic worktree branch.',
+    description:
+      'Open a GitHub pull request from the current topic worktree branch. After it opens: add_ship_log to record it, ' +
+      'update_backlog_item to resolve any backlog item it addresses, and add_backlog_item for any new bugs found along the way.',
     inputSchema: {
       type: 'object' as const,
       properties: {

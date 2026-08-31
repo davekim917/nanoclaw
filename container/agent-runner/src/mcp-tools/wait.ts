@@ -32,9 +32,10 @@ export const wait: McpToolDefinition = {
     name: 'wait',
     description:
       'Schedule a wake in THIS thread after a delay — for time-based waits like "check CI in 15 minutes". ' +
-      'The prompt comes back to you as a message in this session when it fires, with full conversation context. ' +
-      'Not for immediate next-step continuations (use continue_work instead) and not for standalone ' +
-      'scheduled jobs that post to a destination (use ncl tasks create for those).',
+      'The prompt comes back to you as a message in this session when it fires, with full conversation context restored. ' +
+      'Not for immediate next-step continuations (use continue_work instead). ' +
+      '`ncl tasks create` is only for jobs whose stop condition is "never" — anything with a writable end ' +
+      'condition belongs in a wait loop instead of a standalone task.',
     inputSchema: {
       type: 'object' as const,
       additionalProperties: false,

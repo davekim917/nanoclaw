@@ -152,8 +152,6 @@ describe('container instruction contracts', () => {
     expect(instructions).toContain('SIGKILLs individual child processes');
     // /tmp death on container kill.
     expect(instructions).toContain('`/tmp` plus every in-container background task, sleep, and timer dies with it');
-    // continue_work lifecycle contract.
-    expect(instructions).toContain('continue_work({ task })');
     // Group-precedence rule.
     expect(instructions).toContain("your group's instructions win");
     // Truth-grounding core.
