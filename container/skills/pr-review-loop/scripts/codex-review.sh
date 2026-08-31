@@ -48,7 +48,7 @@ threads() {
 # banner mandates the stop-and-diagnose path in SKILL.md instead of a push.
 rounds_count() {
   gh api --paginate --slurp "repos/$REPO/pulls/$PR/comments" \
-    | jq '[.[][] | select(.user.login | test("codex";"i")) | .pull_request_review_id] | unique | length'
+    | jq '[.[][] | select(.user.login | ascii_downcase | startswith("chatgpt-codex-connector")) | .pull_request_review_id] | unique | length'
 }
 
 rounds_banner() {
@@ -83,7 +83,7 @@ case "${1:?usage: open|churn|body|reply|resolve|status}" in
     # reviews, which means the fixes are landing in the wrong place — see
     # "When the fixes are causing the findings" in SKILL.md.
     gh api --paginate --slurp "repos/$REPO/pulls/$PR/comments" \
-      | jq -r '[.[][] | select(.user.login | test("codex";"i"))]
+      | jq -r '[.[][] | select(.user.login | ascii_downcase | startswith("chatgpt-codex-connector"))]
           | group_by(.path)
           | map({ path: .[0].path,
                   rounds: ([.[].pull_request_review_id] | unique | length),
@@ -121,11 +121,11 @@ case "${1:?usage: open|churn|body|reply|resolve|status}" in
     review=$(gh api --paginate --slurp "repos/$REPO/pulls/$PR/reviews" \
       | jq --arg sha "$sha" --arg since "$since" \
            '[.[][] | select(.commit_id | startswith($sha))
-                   | select(.user.login | test("codex";"i"))
+                   | select(.user.login | ascii_downcase | startswith("chatgpt-codex-connector"))
                    | select(.submitted_at > $since)] | length')
     reaction=$(gh api --paginate --slurp "repos/$REPO/issues/$PR/reactions" \
       | jq --arg since "$since" \
-           '[.[][] | select(.user.login | test("codex";"i"))
+           '[.[][] | select(.user.login | ascii_downcase | startswith("chatgpt-codex-connector"))
                    | select(.content == "+1")
                    | select(.created_at > $since)] | length')
     open_count=$(threads | grep -c . || true)
