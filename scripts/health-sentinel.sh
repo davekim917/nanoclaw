@@ -214,6 +214,67 @@ for spec in $WATCHED_TIMERS; do
   fi
 done
 
+# Recurring series that stopped firing. A PAUSE is an absorbing state with no
+# witness: `getCompletedRecurring` selects completed|failed|expired and never
+# `paused`, and nothing anywhere scans for "paused for N days". Only the
+# 8-strike auto-pause notifies; every other pause -- `ncl tasks pause`, an
+# agent-initiated one, a migration artifact -- is silent. Observed live: a daily
+# briefing sat paused 12 days and nobody was told.
+#
+# `ncl tasks list` is the only view of series state: scheduled tasks live in the
+# per-session inbound DBs, not v2.db, so there is nothing to query directly.
+# ~3s, so this stays out of the tighter vitals above.
+#
+# Opt-out, not opt-in: the whole point is catching a pause nobody declared, so a
+# series must be named explicitly to be ignored. PAUSED_SERIES_IGNORE is a
+# space-separated list of deliberately-retired series ids.
+PAUSED_SERIES_MAX_AGE_S="${PAUSED_SERIES_MAX_AGE_S:-172800}"
+PAUSED_SERIES_IGNORE="${PAUSED_SERIES_IGNORE:-}"
+if [ -x "$NANOCLAW_DIR/bin/ncl" ]; then
+  PAUSED_JSON=$("$NANOCLAW_DIR/bin/ncl" tasks list --json 2>/dev/null || echo '')
+  # Fail closed. An unreachable or unparseable listing is "cannot look", which
+  # this vital must never report as "nothing wrong" -- that is the exact shape
+  # it exists to close.
+  PAUSED_OUT=$(NCL_JSON="$PAUSED_JSON" IGNORE="$PAUSED_SERIES_IGNORE" \
+    MAXAGE="$PAUSED_SERIES_MAX_AGE_S" NOW_EPOCH="$NOW" python3 - <<'PYEOF' 2>/dev/null || echo 'ERROR|task listing could not be parsed'
+import json, os, sys
+raw = os.environ.get("NCL_JSON", "")
+if not raw.strip():
+    print("ERROR|`ncl tasks list` returned nothing — series state is unreadable, so a paused series would be invisible")
+    sys.exit(0)
+try:
+    rows = json.loads(raw).get("data", [])
+except Exception as e:
+    print(f"ERROR|`ncl tasks list` returned unparseable JSON ({type(e).__name__}) — series state is unreadable")
+    sys.exit(0)
+ignore = set(os.environ.get("IGNORE", "").split())
+now, maxage = int(os.environ["NOW_EPOCH"]), int(os.environ["MAXAGE"])
+import datetime
+for r in rows:
+    if r.get("status") != "paused" or r.get("series_id") in ignore:
+        continue
+    last = r.get("last_run")
+    if not last:
+        print(f"PAUSED|{r.get('series_id')}|and has never run")
+        continue
+    try:
+        age = now - int(datetime.datetime.fromisoformat(last.replace("Z", "+00:00")).timestamp())
+    except Exception:
+        print(f"PAUSED|{r.get('series_id')}|with an unparseable last_run '{last}'")
+        continue
+    if age >= maxage:
+        print(f"PAUSED|{r.get('series_id')}|for {age // 86400}d")
+PYEOF
+)
+  while IFS='|' read -r kind a b; do
+    [ -n "$kind" ] || continue
+    case "$kind" in
+      ERROR)  BREACHES+=("paused-series|$a") ;;
+      PAUSED) BREACHES+=("paused-$a|scheduled series '$a' has been paused $b and nothing else reports that — it is not going to run again until somebody resumes it (\`ncl tasks resume $a\`) or retires it") ;;
+    esac
+  done <<< "$PAUSED_OUT"
+fi
+
 if [ "${TEST_ALERT:-0}" = "1" ]; then
   BREACHES+=("test|test alert requested via TEST_ALERT=1 — delivery path verified, no action needed")
 fi
@@ -288,6 +349,9 @@ if [ -z "$ALERT_LINES" ]; then
 fi
 
 # ── resolve owner DM and send (same protocol as check-onecli-drift.sh) ──────
+# `|| true`: under `set -e` a failing lookup killed the script HERE, before the
+# "cannot resolve owner DM" branch below could print the breach lines to stderr.
+# An undeliverable alert must still be loud somewhere. (Observed 2026-08-25.)
 ADMIN_DM_ROW="$(node_modules/.bin/tsx scripts/q.ts "$NANOCLAW_DIR/data/v2.db" "
   SELECT mg.platform_id, ud.channel_type
     FROM user_roles ur
@@ -296,7 +360,7 @@ ADMIN_DM_ROW="$(node_modules/.bin/tsx scripts/q.ts "$NANOCLAW_DIR/data/v2.db" "
    WHERE ur.role = 'owner'
    ORDER BY ud.resolved_at DESC
    LIMIT 1
-")"
+")" || true
 IFS='|' read -r ADMIN_DM_PLATFORM_ID ADMIN_DM_CHANNEL_TYPE <<< "$ADMIN_DM_ROW"
 if [ -z "${ADMIN_DM_PLATFORM_ID:-}" ] || [ -z "${ADMIN_DM_CHANNEL_TYPE:-}" ]; then
   echo "health-sentinel: BREACH but cannot resolve owner DM:" >&2

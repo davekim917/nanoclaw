@@ -150,6 +150,60 @@ case "$OUT" in
   *"all vitals OK"*) ok "fresh trigger inside the bound stays quiet" ;;
   *) bad "fresh trigger breached" "$OUT" ;;
 esac
+# ── paused-series vital ─────────────────────────────────────────────────────
+# A pause is an absorbing state that only the 8-strike auto-pause reports. Every
+# other pause was silent until this vital: a daily briefing sat paused 12 days.
+mkdir -p "$ROOT/bin"
+stub_ncl() { printf '#!/bin/bash\n%s\n' "$1" > "$ROOT/bin/ncl"; chmod +x "$ROOT/bin/ncl"; }
+OLD_RUN="$(date -u -d '10 days ago' +%Y-%m-%dT%H:%M:%SZ)"
+NEW_RUN="$(date -u -d '1 hour ago' +%Y-%m-%dT%H:%M:%SZ)"
+
+rm -f "$ROOT/data/health-sentinel-state.json"
+stub_ncl "echo '{\"data\":[{\"series_id\":\"ghost-x\",\"status\":\"paused\",\"last_run\":\"$OLD_RUN\"}]}'"
+run_sentinel
+# Assert on the vital's dedup KEY in state, not on stdout: when delivery
+# succeeds the breach text goes into the DM payload, not the terminal.
+case "$(cat "$ROOT/data/health-sentinel-state.json")" in
+  *'"paused-ghost-x"'*) ok "a series paused past the bound breached" ;;
+  *) bad "a series paused 10 days did not breach" "$OUT" ;;
+esac
+
+# Opt-OUT, not opt-in: a deliberately retired series is named explicitly.
+rm -f "$ROOT/data/health-sentinel-state.json"
+run_sentinel PAUSED_SERIES_IGNORE=ghost-x
+case "$OUT" in
+  *"all vitals OK"*) ok "an explicitly ignored paused series stays quiet" ;;
+  *) bad "PAUSED_SERIES_IGNORE did not suppress" "$OUT" ;;
+esac
+
+# Must not always-fire: a recent pause is inside the bound.
+rm -f "$ROOT/data/health-sentinel-state.json"
+stub_ncl "echo '{\"data\":[{\"series_id\":\"ghost-x\",\"status\":\"paused\",\"last_run\":\"$NEW_RUN\"}]}'"
+run_sentinel
+case "$OUT" in
+  *"all vitals OK"*) ok "a pause inside the bound stays quiet" ;;
+  *) bad "a 1h-old pause breached" "$OUT" ;;
+esac
+
+# FAIL CLOSED. "Cannot look" must never read as "nothing wrong" — that is the
+# exact shape this vital exists to close.
+rm -f "$ROOT/data/health-sentinel-state.json"
+stub_ncl "exit 1"
+run_sentinel
+case "$(cat "$ROOT/data/health-sentinel-state.json")" in
+  *'"paused-series"'*) ok "an unreadable task listing breached (fail-closed)" ;;
+  *) bad "a failing ncl tasks list read as healthy" "$OUT" ;;
+esac
+
+rm -f "$ROOT/data/health-sentinel-state.json"
+stub_ncl "echo 'not json {'"
+run_sentinel
+case "$(cat "$ROOT/data/health-sentinel-state.json")" in
+  *'"paused-series"'*) ok "an unparseable task listing breached (fail-closed)" ;;
+  *) bad "unparseable JSON read as healthy" "$OUT" ;;
+esac
+rm -f "$ROOT/bin/ncl"
+
 kill $SINK 2>/dev/null
 
 [ "$FAILED" -eq 0 ] && echo "health-sentinel-selfcheck: all checks passed" || echo "health-sentinel-selfcheck: FAILURES"
