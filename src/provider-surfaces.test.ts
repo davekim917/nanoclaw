@@ -742,4 +742,34 @@ describe('symlink overlay workgroup allowlist', () => {
       fs.realpathSync(path.join(GROUPS_DIR, sib.folder, 'SHARED-REL')),
     );
   });
+
+  it('redirects relative targets that escape only after normalization', () => {
+    const ag = group('ag-norm', 'norm-main');
+    const sib = group('ag-norm-sib', 'norm-sib');
+    createAgentGroup(ag);
+    createAgentGroup(sib);
+    assignWorkgroup(ag, 'wg-norm');
+    assignWorkgroup(sib, 'wg-norm');
+    ensureContainerConfig(ag.id);
+
+    const groupDir = path.join(GROUPS_DIR, ag.folder);
+    fs.mkdirSync(groupDir, { recursive: true });
+    // Neither target starts with `../`, but both normalize outside
+    // /workspace/agent — a textual prefix test sends them down the literal
+    // branch, whose stub Docker never uses, and runc creates the parent root.
+    fs.mkdirSync(path.join(GROUPS_DIR, sib.folder, 'DOT-REL'), { recursive: true });
+    fs.symlinkSync('./../norm-sib/DOT-REL', path.join(groupDir, 'DOT-REL'));
+    fs.mkdirSync(path.join(GROUPS_DIR, sib.folder, 'DEEP-REL'), { recursive: true });
+    // `sub` must exist for the target to resolve host-side at all — the loop
+    // skips unresolvable links before classification ever runs.
+    fs.mkdirSync(path.join(groupDir, 'sub'), { recursive: true });
+    fs.symlinkSync('sub/../../norm-sib/DEEP-REL', path.join(groupDir, 'DEEP-REL'));
+
+    const mounts = buildMounts(ag, session('s-norm', ag.id), containerConfig(), 'claude', {}, 'wg-norm');
+    const containerPaths = mounts.map((m) => m.containerPath);
+    expect(containerPaths).toContain('/workspace/norm-sib/DOT-REL');
+    expect(containerPaths).not.toContain('/workspace/agent/DOT-REL');
+    expect(containerPaths).toContain('/workspace/norm-sib/DEEP-REL');
+    expect(containerPaths).not.toContain('/workspace/agent/DEEP-REL');
+  });
 });

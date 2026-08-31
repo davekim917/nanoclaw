@@ -1851,11 +1851,17 @@ export function buildMounts(
     // path Docker is going to use anyway, so the /workspace stub pre-creation
     // in spawnContainer creates it as the host user first. Absolute and
     // non-escaping targets keep the literal path — same destination either way.
-    const escapes = rawTarget.startsWith('../');
-    const redirected = escapes ? path.posix.join('/workspace/agent', rawTarget) : null;
+    //
+    // Classify on the NORMALIZED destination, never the raw text: `./../sib/X`
+    // and `sub/../../sib/X` escape just as surely as `../sib/X` without
+    // matching a `../` prefix, and a textual test would send them down the
+    // literal-path branch whose stub Docker never uses. path.posix.join
+    // normalizes, so the joined result is the destination itself.
+    const redirected = path.posix.join('/workspace/agent', rawTarget);
+    const escapes = redirected !== `/workspace/agent/${entry.name}` && !redirected.startsWith('/workspace/agent/');
     mounts.push({
       hostPath: realTarget,
-      containerPath: redirected && redirected.startsWith('/workspace/') ? redirected : `/workspace/agent/${entry.name}`,
+      containerPath: escapes && redirected.startsWith('/workspace/') ? redirected : `/workspace/agent/${entry.name}`,
       readonly: false,
       overlayAllowedRoots: allowedOverlayRoots,
     });
