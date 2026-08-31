@@ -772,4 +772,30 @@ describe('symlink overlay workgroup allowlist', () => {
     expect(containerPaths).toContain('/workspace/norm-sib/DEEP-REL');
     expect(containerPaths).not.toContain('/workspace/agent/DEEP-REL');
   });
+
+  it('redirects through an intermediate symlink that only the filesystem can resolve', () => {
+    const ag = group('ag-chain', 'chain-main');
+    const sib = group('ag-chain-sib', 'chain-sib');
+    createAgentGroup(ag);
+    createAgentGroup(sib);
+    assignWorkgroup(ag, 'wg-chain');
+    assignWorkgroup(sib, 'wg-chain');
+    ensureContainerConfig(ag.id);
+
+    const groupDir = path.join(GROUPS_DIR, ag.folder);
+    fs.mkdirSync(path.join(groupDir, 'sub'), { recursive: true });
+    fs.mkdirSync(path.join(GROUPS_DIR, sib.folder, 'T'), { recursive: true });
+    // `jump` is itself a symlink out to the sibling, so the top-level link's
+    // text (`sub/jump/T`) normalizes to /workspace/agent/sub/jump/T while the
+    // container really attaches at /workspace/chain-sib/T. No lexical rule can
+    // see this; only resolution can.
+    fs.symlinkSync('../../chain-sib', path.join(groupDir, 'sub', 'jump'));
+    fs.symlinkSync('sub/jump/T', path.join(groupDir, 'CHAINED'));
+
+    const mounts = buildMounts(ag, session('s-chain', ag.id), containerConfig(), 'claude', {}, 'wg-chain');
+    const containerPaths = mounts.map((m) => m.containerPath);
+    expect(containerPaths).toContain('/workspace/chain-sib/T');
+    expect(containerPaths).not.toContain('/workspace/agent/CHAINED');
+    expect(containerPaths).not.toContain('/workspace/agent/sub/jump/T');
+  });
 });

@@ -1849,19 +1849,42 @@ export function buildMounts(
     // /workspace/<seed>/CLAUDE.local.md). runc then creates that parent as
     // ROOT, and host-side session reclaim can never delete it. Declare the
     // path Docker is going to use anyway, so the /workspace stub pre-creation
-    // in spawnContainer creates it as the host user first. Absolute and
-    // non-escaping targets keep the literal path — same destination either way.
+    // in spawnContainer creates it as the host user first.
     //
-    // Classify on the NORMALIZED destination, never the raw text: `./../sib/X`
-    // and `sub/../../sib/X` escape just as surely as `../sib/X` without
-    // matching a `../` prefix, and a textual test would send them down the
-    // literal-path branch whose stub Docker never uses. path.posix.join
-    // normalizes, so the joined result is the destination itself.
-    const redirected = path.posix.join('/workspace/agent', rawTarget);
-    const escapes = redirected !== `/workspace/agent/${entry.name}` && !redirected.startsWith('/workspace/agent/');
+    // Derive that path by RESOLUTION, not by inspecting the link text. Two
+    // review rounds died on lexical prediction: a `../` prefix test misses
+    // `./../sib/X`, and normalizing the raw text still misses an intermediate
+    // symlink (`foo -> sub/jump/T` where `sub/jump -> ../../sibling`), which
+    // the container resolves but no amount of string work can. `realTarget` is
+    // already fully resolved by realpathSync above, so map it back through the
+    // container's view: /workspace/agent IS groupDir, therefore GROUPS_DIR is
+    // /workspace, and a resolved sibling path is /workspace/<folder>/<rest>.
+    // Anything resolving outside those roots was already refused as an
+    // out-of-workgroup target, so it never reaches here.
+    //
+    // An ABSOLUTE raw target is the one case resolution must NOT drive: it
+    // names a host path that does not exist inside the container, so nothing
+    // there resolves it and Docker attaches at the literal name. Relative
+    // targets are the opposite — the container resolves them against
+    // /workspace/agent, chains and all — so those derive from realTarget.
+    const containerPathFor = (resolved: string): string => {
+      if (path.isAbsolute(rawTarget)) return `/workspace/agent/${entry.name}`;
+      const inOwnGroup = path.relative(groupDir, resolved);
+      if (inOwnGroup && !inOwnGroup.startsWith('..') && !path.isAbsolute(inOwnGroup)) {
+        return path.posix.join('/workspace/agent', ...inOwnGroup.split(path.sep));
+      }
+      const inGroups = path.relative(GROUPS_DIR, resolved);
+      if (inGroups && !inGroups.startsWith('..') && !path.isAbsolute(inGroups)) {
+        return path.posix.join('/workspace', ...inGroups.split(path.sep));
+      }
+      // Workgroup shared tree or anything else representable only at its
+      // literal name — the stub loop then pre-creates that, which is correct
+      // because Docker has no symlink to follow.
+      return `/workspace/agent/${entry.name}`;
+    };
     mounts.push({
       hostPath: realTarget,
-      containerPath: escapes && redirected.startsWith('/workspace/') ? redirected : `/workspace/agent/${entry.name}`,
+      containerPath: containerPathFor(realTarget),
       readonly: false,
       overlayAllowedRoots: allowedOverlayRoots,
     });
