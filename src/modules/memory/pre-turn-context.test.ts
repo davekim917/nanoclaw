@@ -1045,6 +1045,94 @@ describe('per-person preference recall', () => {
     expect(paths).toContain('preferences/jordan-lee.md');
     expect(result.notices.some((notice) => notice.code === 'sender-recall-failed')).toBe(false);
   });
+
+  it('injects only the per-message-name file when files exist under both alias slugs', () => {
+    // Both the pre-rename and post-rename preference file exist. Per-message
+    // precedence must win so only one — not both, conflicting — is injected.
+    memoryFile('preferences/jamie-frost.md', '# Jamie Frost\nBe terse.');
+    memoryFile('preferences/jamie-old.md', '# Jamie Old\nBe verbose.');
+    archiveFrom('m1', 'Jamie Frost', '2026-08-01T00:00:00.000Z', 'discord:guild:channel:thread', 'slack:U10');
+    upsertUserRow('slack:U10', 'Jamie Old');
+
+    const result = buildPreTurnContext({
+      agentGroupId: 'ag-a',
+      sessionId: 'sess-a',
+      kind: 'chat-sdk',
+      trigger: 1,
+      normalizedContent: JSON.stringify({ text: 'status?', sender: 'Pat Doe' }),
+    });
+
+    const paths = result.memoryEvidence.excerpts.map((row) => row.path);
+    expect(paths).toContain('preferences/jamie-frost.md');
+    expect(paths).not.toContain('preferences/jamie-old.md');
+  });
+
+  it('injects the canonical-slug file when only it exists (rename durability)', () => {
+    memoryFile('preferences/robin-vale.md', '# Robin Vale\nPrefers async updates.');
+    archiveFrom('m1', 'RV New', '2026-08-01T00:00:00.000Z', 'discord:guild:channel:thread', 'slack:U11');
+    upsertUserRow('slack:U11', 'Robin Vale');
+
+    const result = buildPreTurnContext({
+      agentGroupId: 'ag-a',
+      sessionId: 'sess-a',
+      kind: 'chat-sdk',
+      trigger: 1,
+      normalizedContent: JSON.stringify({ text: 'status?', sender: 'Pat Doe' }),
+    });
+
+    const paths = result.memoryEvidence.excerpts.map((row) => row.path);
+    expect(paths).toContain('preferences/robin-vale.md');
+  });
+
+  it('two groups inject two files; a group whose alias matches an already-selected file does not double-inject', () => {
+    memoryFile('preferences/morgan-lee.md', '# Morgan Lee\nWants bullet points.');
+    memoryFile('preferences/taylor-fox.md', '# Taylor Fox\nWants prose.');
+    // Newest first: the direct Morgan Lee sender claims morgan-lee.md, then
+    // Taylor Fox claims taylor-fox.md, then a third sender whose canonical
+    // name also resolves to morgan-lee.md — already selected — contributes
+    // nothing.
+    archiveFrom('m1', 'Morgan Lee', '2026-08-01T00:02:00.000Z', 'discord:guild:channel:thread', 'slack:U12');
+    archiveFrom('m2', 'Taylor Fox', '2026-08-01T00:01:00.000Z', 'discord:guild:channel:thread', 'slack:U13');
+    archiveFrom('m3', 'MF Renamed', '2026-08-01T00:00:00.000Z', 'discord:guild:channel:thread', 'slack:U14');
+    upsertUserRow('slack:U14', 'Morgan Lee');
+
+    const result = buildPreTurnContext({
+      agentGroupId: 'ag-a',
+      sessionId: 'sess-a',
+      kind: 'chat-sdk',
+      trigger: 1,
+      normalizedContent: JSON.stringify({ text: 'status?', sender: 'Pat Doe' }),
+    });
+
+    const paths = result.memoryEvidence.excerpts.map((row) => row.path);
+    expect(paths).toContain('preferences/morgan-lee.md');
+    expect(paths).toContain('preferences/taylor-fox.md');
+    expect(paths.filter((p) => p === 'preferences/morgan-lee.md')).toHaveLength(1);
+    expect(result.memoryEvidence.excerpts).toHaveLength(2);
+  });
+
+  it('resolves two same-display-name senders to their own files via differing canonical names', () => {
+    // The first Sam claims sam.md; the second Sam's per-message alias hits
+    // that already-claimed file, which must fall through to their canonical
+    // alias instead of the group contributing nothing.
+    memoryFile('preferences/sam.md', '# Sam\nWants prose.');
+    memoryFile('preferences/sam-rivera.md', '# Sam Rivera\nWants bullet points.');
+    archiveFrom('m1', 'Sam', '2026-08-01T00:01:00.000Z', 'discord:guild:channel:thread', 'slack:U20');
+    archiveFrom('m2', 'Sam', '2026-08-01T00:00:00.000Z', 'discord:guild:channel:thread', 'slack:U21');
+    upsertUserRow('slack:U21', 'Sam Rivera');
+
+    const result = buildPreTurnContext({
+      agentGroupId: 'ag-a',
+      sessionId: 'sess-a',
+      kind: 'chat-sdk',
+      trigger: 1,
+      normalizedContent: JSON.stringify({ text: 'status?', sender: 'Pat Doe' }),
+    });
+
+    const paths = result.memoryEvidence.excerpts.map((row) => row.path);
+    expect(paths).toContain('preferences/sam.md');
+    expect(paths).toContain('preferences/sam-rivera.md');
+  });
 });
 
 describe('bootstrap recall budget (B-AC1..B-AC4, incident 2026-08-13)', () => {
