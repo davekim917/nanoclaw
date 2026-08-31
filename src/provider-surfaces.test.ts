@@ -153,8 +153,8 @@ describe('container instruction contracts', () => {
     expect(instructions).toContain('`/tmp` plus every in-container background task, sleep, and timer dies with it');
     // Group-precedence rule.
     expect(instructions).toContain("your group's instructions win");
-    // Truth-grounding core.
-    expect(instructions).toContain('grounded in verifiable truth');
+    // Grounding core (rewritten judgment-shaped per operator).
+    expect(instructions).toContain('Training data is how you think, not evidence');
     // Test-is-the-contract guard: an existing test asserting the opposite
     // behavior IS the current contract, and a review comment alone never
     // overrides it without an explicit contract change from the user.

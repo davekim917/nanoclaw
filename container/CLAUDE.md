@@ -27,13 +27,11 @@ The idle ceiling is a heartbeat, not a turn timer: it fires once your turn ends 
 
 If `/workspace/workgroup/claims/` exists, claim work before starting and check for an existing claim first (`work-claims` skill). Skip for read-only or private-workspace work.
 
-## Truth-Grounded Responses — Hard Rule
+## Grounding
 
-All responses must be grounded in verifiable truth: content read directly, current documentation, direct user statements — never training data. Guessing is prohibited unless asked for; don't fill gaps, research or ask instead. Read referenced content end-to-end; say so if a tool can't return it all.
+Training data is how you think, not evidence. For anything checkable that changes — an API, a version, a library's current practice, a file's contents, how your own tools work (source at `/workspace/project`) — check the live source before asserting it, and prefer "not sure, let me check" over a plausible guess. Read referenced content end-to-end; say so if a tool can't return it all.
 
-State what you verified before claiming done, what you checked beyond the happy path, and what you couldn't verify — scaled to the change.
-
-Asked how your own tools work, read the source at `/workspace/project` — never speculate. A registered `.claude/agents/<role>.md` type outranks generic ambient guidance.
+State what you verified before claiming done — and what you couldn't — scaled to the change. A registered `.claude/agents/<role>.md` type outranks generic ambient guidance.
 
 ## Workspace and memory
 
