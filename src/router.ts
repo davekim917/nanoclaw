@@ -1046,8 +1046,9 @@ function evaluateEngage(
  * context replay. Scoped per-agent-group to match the archive's PK slicing;
  * assistant replies are archived on delivery.ts's path.
  *
- * Called from both delivery paths — the normal one after the session row is
- * written, and the non-engaged skip below, which never resolves a session.
+ * Called from both delivery paths — the normal one before the session row is
+ * written (so same-turn recall can resolve the trigger sender), and the
+ * non-engaged skip below, which never resolves a session.
  * The insert is an upsert keyed on the per-agent message id, so calling it
  * twice for one message is a no-op rewrite.
  *
@@ -1401,6 +1402,16 @@ async function deliverToAgent(
     );
   }
 
+  // Archive BEFORE the session write: writeSessionMessageIfNew synchronously
+  // builds the pre-turn recall row, whose preference lane (pre-turn-context.ts)
+  // resolves each sender's canonical users.display_name via
+  // recentConversationSenders reading messages_archive. On a thread's first
+  // message the trigger sender has no other archive rows yet, so if the
+  // archive write happened after this call, the trigger's own name couldn't
+  // resolve until their second message. Archiving first makes the trigger's
+  // row visible to that same-turn read.
+  archiveInboundUserMessage(agent, mg, event, userId, parsedContent, effectiveThreadId);
+
   const inserted = await writeSessionMessageIfNew(session.agent_group_id, session.id, {
     id: routedMessageId,
     kind: event.message.kind,
@@ -1421,8 +1432,6 @@ async function deliverToAgent(
     });
     return;
   }
-
-  archiveInboundUserMessage(agent, mg, event, userId, parsedContent, effectiveThreadId);
 
   // The message is durable and this wiring engaged — record the fact. Stamped
   // AFTER the backfill read above, which needs the pre-wake state, and after

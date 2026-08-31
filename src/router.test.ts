@@ -145,6 +145,7 @@ import { isAnyAdmin } from './modules/permissions/db/user-roles.js';
 import { claimChannelIngress, completeChannelIngress } from './db/channel-ingress-receipts.js';
 import { registerInterceptHandler, clearInterceptHandlers } from './command-gate.js';
 import { getDeliveryAdapter } from './delivery.js';
+import { archiveMessage } from './message-archive.js';
 import type { ChannelAdapter, InboundEvent } from './channels/adapter.js';
 import type { MessagingGroup, MessagingGroupAgent } from './types.js';
 
@@ -842,5 +843,50 @@ describe('34: pre-fanout intercept fan-out dedup + denial reply', () => {
     await routeInbound(event);
 
     expect(writeSessionMessageIfNew).toHaveBeenCalledOnce();
+  });
+});
+
+// The preference lane (pre-turn-context.ts, recentConversationSenders) reads
+// messages_archive to resolve a sender's canonical display name. That read
+// happens synchronously inside writeSessionMessageIfNew's recall build, so on
+// a thread's first message the trigger sender only resolves if their archive
+// row already exists by the time writeSessionMessageIfNew runs.
+describe('archive-before-session-write ordering', () => {
+  it('archives the inbound message before writing the session row', async () => {
+    const { getAgentGroup } = await import('./db/agent-groups.js');
+    const mg = makeMg();
+    const agent = makeAgent();
+    vi.mocked(getMessagingGroupWithAgentCount).mockReturnValue({ mg, agentCount: 1 });
+    vi.mocked(getMessagingGroupAgents).mockReturnValue([agent]);
+    vi.mocked(getAgentGroup).mockReturnValue({
+      id: 'ag-1',
+      name: 'Test Agent',
+      folder: 'test',
+      agent_provider: null,
+      created_at: new Date().toISOString(),
+    });
+    const session = {
+      id: 's-1',
+      agent_group_id: 'ag-1',
+      messaging_group_id: 'mg-1',
+      thread_id: null,
+      agent_provider: null,
+      status: 'active' as const,
+      container_status: 'idle' as const,
+      last_active: null,
+      created_at: new Date().toISOString(),
+    };
+    vi.mocked(resolveSession).mockReturnValue({ session, created: true });
+    vi.mocked(getSession).mockReturnValue(session);
+    vi.mocked(wakeContainer).mockResolvedValue(false);
+
+    const event = makeChatEvent('hello world');
+    await routeInbound(event);
+
+    expect(archiveMessage).toHaveBeenCalledOnce();
+    expect(writeSessionMessageIfNew).toHaveBeenCalledOnce();
+    const archiveCallOrder = vi.mocked(archiveMessage).mock.invocationCallOrder[0]!;
+    const writeCallOrder = vi.mocked(writeSessionMessageIfNew).mock.invocationCallOrder[0]!;
+    expect(archiveCallOrder).toBeLessThan(writeCallOrder);
   });
 });

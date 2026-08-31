@@ -100,7 +100,7 @@ function initSchema(db: Database.Database): void {
     CREATE INDEX IF NOT EXISTS idx_archive_fingerprint
       ON messages_archive(agent_group_id, role, channel_type, sent_at);
 
-    -- Pre-turn sender recall (recentConversationSenderNames, once per turn).
+    -- Pre-turn sender recall (recentConversationSenders, once per turn).
     -- Without it the planner falls back to idx_archive_fingerprint, whose
     -- leading agent_group_id constraint matches ~half the table for a
     -- multi-member workgroup, then temp-B-tree sorts all of it for a LIMIT
@@ -113,21 +113,33 @@ function initSchema(db: Database.Database): void {
     --     the index backwards instead of sorting. id is the UNIQUE primary
     --     key, which is what makes that ordering total and the plan swap
     --     result-preserving; sent_at alone ties on 47k live values.
-    --   agent_group_id, thread_id, sender_name — after the sort columns, to
-    --     make the index covering. The residual filters (member scope, thread)
-    --     are not index constraints, so without these every walked entry costs
-    --     a table lookup: dropping the three trailing columns costs 19ms vs
-    --     2.1ms on the busiest messaging group in the install, and the planner
-    --     reports plain INDEX instead of COVERING INDEX.
+    --   agent_group_id, thread_id, sender_name, sender_id — after the sort
+    --     columns, to make the index covering. The residual filters (member
+    --     scope, thread) are not index constraints, so without these every
+    --     walked entry costs a table lookup: dropping the trailing columns
+    --     costs 19ms vs 2.1ms on the busiest messaging group in the install,
+    --     and the planner reports plain INDEX instead of COVERING INDEX.
+    --     sender_id joined the trailing set when the canonical-name preference
+    --     match started reading it too — an existing install's index predates
+    --     that column, so it is dropped and recreated below rather than left
+    --     silently non-covering under CREATE INDEX IF NOT EXISTS.
     -- Measured against a copy of the 309MiB / 145,752-row live archive, six
     -- member agent groups of one workgroup: 134ms -> 2.1ms, identical for a hot
     -- thread and for a fresh thread whose rows do not exist. Index costs
     -- +24.3MiB and ~1.4-2.0s to build; archive INSERT p50 is unchanged
     -- (7.5ms -> 6.5ms, within noise — the TRUNCATE-journal fsync dominates the
     -- write).
+  `);
+  const convRecentColumns = db.prepare(`PRAGMA index_info(idx_archive_conv_recent)`).all() as Array<{
+    name: string;
+  }>;
+  if (convRecentColumns.length > 0 && !convRecentColumns.some((col) => col.name === 'sender_id')) {
+    db.exec('DROP INDEX idx_archive_conv_recent');
+  }
+  db.exec(`
     CREATE INDEX IF NOT EXISTS idx_archive_conv_recent
       ON messages_archive(messaging_group_id, role, sent_at, id,
-                          agent_group_id, thread_id, sender_name);
+                          agent_group_id, thread_id, sender_name, sender_id);
 
     CREATE VIRTUAL TABLE IF NOT EXISTS messages_archive_fts USING fts5(
       text,
@@ -309,22 +321,25 @@ export function sanitizeArchiveFtsQuery(query: string): string {
 }
 
 /**
- * Distinct sender names of recent inbound messages in the current
- * conversation, newest first. Deterministic key set for per-person
- * preference recall — no ranking, no FTS.
+ * Distinct senders of recent inbound messages in the current conversation,
+ * newest first. Deterministic key set for per-person preference recall — no
+ * ranking, no FTS. `senderId` is the archive's stable per-message sender key
+ * (e.g. `slack:U123`) — the preference lane resolves it against the central
+ * `users` table to match on canonical `display_name`, not just the per-message
+ * `sender_name`, so a platform rename doesn't silently break a preference file.
  */
-export function recentConversationSenderNames(input: {
+export function recentConversationSenders(input: {
   memberAgentGroupIds: string[];
   messagingGroupId: string | null;
   threadId: string | null;
   rowLimit?: number;
   nameLimit?: number;
-}): string[] {
+}): Array<{ senderName: string; senderId: string | null }> {
   if (input.memberAgentGroupIds.length === 0 || !input.messagingGroupId) return [];
   const scope = trustedMemberClause(input.memberAgentGroupIds);
   const rows = openDb()
     .prepare(
-      `SELECT sender_name
+      `SELECT sender_name, sender_id
          FROM messages_archive
         WHERE ${scope.sql}
           AND role = 'user'
@@ -341,13 +356,21 @@ export function recentConversationSenderNames(input: {
       input.threadId,
       input.threadId,
       input.rowLimit ?? 100,
-    ) as Array<{ sender_name: string }>;
-  const names: string[] = [];
+    ) as Array<{ sender_name: string; sender_id: string | null }>;
+  const senders: Array<{ senderName: string; senderId: string | null }> = [];
+  const seenKeys = new Set<string>();
   for (const row of rows) {
-    if (!names.includes(row.sender_name)) names.push(row.sender_name);
-    if (names.length >= (input.nameLimit ?? 8)) break;
+    // Dedupe on stable sender_id where we have one — falling back to name
+    // for legacy/anonymous rows — so two different people who happen to
+    // share a display name aren't collapsed into one (rows are newest
+    // first, so a renamed sender_id still keeps only its newest name).
+    const key = row.sender_id ?? `name:${row.sender_name}`;
+    if (seenKeys.has(key)) continue;
+    seenKeys.add(key);
+    senders.push({ senderName: row.sender_name, senderId: row.sender_id });
+    if (senders.length >= (input.nameLimit ?? 8)) break;
   }
-  return names;
+  return senders;
 }
 
 /**

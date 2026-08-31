@@ -16,7 +16,7 @@ import {
   archiveMessage,
   parseArchivePermalinks,
   queryArchiveExactLinks,
-  recentConversationSenderNames,
+  recentConversationSenders,
   sanitizeArchiveFtsQuery,
   searchArchiveEvidence,
   upsertArchiveMessage,
@@ -221,12 +221,100 @@ describe('archive retrieval helpers', () => {
     }
 
     expect(
-      recentConversationSenderNames({
+      recentConversationSenders({
         memberAgentGroupIds: ['ag-a'],
         messagingGroupId: 'mg-tie',
         threadId: 'discord:g:c:t',
       }),
-    ).toEqual(['Sender m-c', 'Sender m-b', 'Sender m-a']);
+    ).toEqual([
+      { senderName: 'Sender m-c', senderId: 'discord:m-c' },
+      { senderName: 'Sender m-b', senderId: 'discord:m-b' },
+      { senderName: 'Sender m-a', senderId: 'discord:m-a' },
+    ]);
+  });
+
+  // Guards the sender_id-keyed dedupe: a shared per-message display name must
+  // not collapse two distinct people into one, and a mid-thread rename must
+  // not leave two rows for the same person.
+  it('keeps both senders when two different sender_ids share a display name', () => {
+    upsertArchiveMessage({
+      id: 'sam-1',
+      agentGroupId: 'ag-a',
+      messagingGroupId: 'mg-samename',
+      channelType: 'discord',
+      channelName: 'room',
+      platformId: 'discord:g:c',
+      threadId: 'discord:g:c:t',
+      role: 'user',
+      senderId: 'discord:sam-1',
+      senderName: 'Sam',
+      text: 'first Sam',
+      sentAt: '2026-07-25T00:00:01.000Z',
+    });
+    upsertArchiveMessage({
+      id: 'sam-2',
+      agentGroupId: 'ag-a',
+      messagingGroupId: 'mg-samename',
+      channelType: 'discord',
+      channelName: 'room',
+      platformId: 'discord:g:c',
+      threadId: 'discord:g:c:t',
+      role: 'user',
+      senderId: 'discord:sam-2',
+      senderName: 'Sam',
+      text: 'second Sam',
+      sentAt: '2026-07-25T00:00:02.000Z',
+    });
+
+    expect(
+      recentConversationSenders({
+        memberAgentGroupIds: ['ag-a'],
+        messagingGroupId: 'mg-samename',
+        threadId: 'discord:g:c:t',
+      }),
+    ).toEqual([
+      { senderName: 'Sam', senderId: 'discord:sam-2' },
+      { senderName: 'Sam', senderId: 'discord:sam-1' },
+    ]);
+  });
+
+  it('keeps only the newest name for a sender_id that renamed mid-thread', () => {
+    upsertArchiveMessage({
+      id: 'rename-1',
+      agentGroupId: 'ag-a',
+      messagingGroupId: 'mg-rename',
+      channelType: 'discord',
+      channelName: 'room',
+      platformId: 'discord:g:c',
+      threadId: 'discord:g:c:t',
+      role: 'user',
+      senderId: 'discord:renamed',
+      senderName: 'Morgan',
+      text: 'before rename',
+      sentAt: '2026-07-25T00:00:01.000Z',
+    });
+    upsertArchiveMessage({
+      id: 'rename-2',
+      agentGroupId: 'ag-a',
+      messagingGroupId: 'mg-rename',
+      channelType: 'discord',
+      channelName: 'room',
+      platformId: 'discord:g:c',
+      threadId: 'discord:g:c:t',
+      role: 'user',
+      senderId: 'discord:renamed',
+      senderName: 'Morgan Lee',
+      text: 'after rename',
+      sentAt: '2026-07-25T00:00:02.000Z',
+    });
+
+    expect(
+      recentConversationSenders({
+        memberAgentGroupIds: ['ag-a'],
+        messagingGroupId: 'mg-rename',
+        threadId: 'discord:g:c:t',
+      }),
+    ).toEqual([{ senderName: 'Morgan Lee', senderId: 'discord:renamed' }]);
   });
 });
 

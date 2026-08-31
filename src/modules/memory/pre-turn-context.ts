@@ -7,10 +7,11 @@ import { getDb } from '../../db/connection.js';
 import { log } from '../../log.js';
 import {
   queryArchiveExactLinks,
-  recentConversationSenderNames,
+  recentConversationSenders,
   searchArchiveEvidence,
   type ArchiveEvidenceRow,
 } from '../../message-archive.js';
+import { getUser } from '../permissions/db/users.js';
 import { workgroupMemoryDir } from '../workgroup/shared-dirs.js';
 
 export const PRE_TURN_BOUNDS = Object.freeze({
@@ -30,16 +31,20 @@ export const PRE_TURN_BOUNDS = Object.freeze({
   // Cap covers a busy multi-human thread; the per-file cap bounds one person's
   // file. This is the ONLY lane that reads manual Markdown per turn — ordinary
   // memory files are navigated by the agent from index.md, not scanned here.
+  // 2,200 matches the write-side guidance for a preference file's current-state
+  // section (~2,000 chars) with headroom — real files measure ~1.5-2.1KB.
   preferenceExcerpts: 6,
-  preferenceExcerptChars: 900,
+  preferenceExcerptChars: 2_200,
   // Total for the memory excerpt lane, enforced after selection.
   //
   // Load-bearing for the same reason capabilityTotalChars is: enforceFinalBound
   // sacrifices conversation excerpts FIRST, so unbounded memory could silently
-  // evict every archive excerpt. It is a safety net rather than a live limiter
-  // now the generated-fact lane is gone — six preference files at 900 chars
-  // reach 5,400 — so it fires only if the preference caps above are raised.
-  memoryExcerptTotalChars: 5_500,
+  // evict every archive excerpt. No longer just a safety net now the per-file
+  // cap is 2,200: it fires with 3+ matched preference files, deliberately
+  // letting preferences crowd out ranked memory in many-human threads —
+  // preferences carry MAX_SAFE_INTEGER scores so they sort first, and the
+  // budget loop below pops the (lower-ranked) tail first.
+  memoryExcerptTotalChars: 6_600,
   archiveCandidates: 96,
   archiveExcerpts: 3,
   archiveExcerptChars: 900,
@@ -79,13 +84,25 @@ export const PRE_TURN_BOUNDS = Object.freeze({
   // every fact and archive excerpt on exactly the fleet's first impression of
   // each thread. The 2026-08-13 incident: an agent denied knowing a project
   // with 165 facts in its own store because the delivered bootstrap row held
-  // only a preference file. Derived: finalChars + capabilityTotalChars — the
-  // capability block is the one bootstrap-only payload large enough to
-  // displace recall (the core index rides within the ordinary envelope's
-  // measured slack). Deliberately NOT the sum of every lane cap: that number
-  // (~24.5k) is unreachable, which would turn the final bound into dead code
-  // instead of a live safety net.
-  bootstrapFinalChars: 22_000,
+  // only a preference file. Derived: finalChars + capabilityTotalChars +
+  // 1,100. The +1,100 tracks the 2026-08-31 preference-lane fix, which raised
+  // memoryExcerptTotalChars 5,500 -> 6,600 to fit two per-person files
+  // instead of one after the alias-group rework — otherwise that raise would
+  // silently widen the bootstrap payload past the bound derived before it.
+  // Worst realistic bootstrap payload with today's constants: capability
+  // 10,000 + core index 2,500 + memory/preference excerpts 6,600 + lexical
+  // archive 3*900=2,700 = 21,800 before JSON/provenance overhead — comfortably
+  // under 23,100. Deliberately NOT the sum of every lane cap (recomputed
+  // honestly here, not copied from the old ~24.5k figure that predates the
+  // graph-scent lane's retirement): capability 10,000 + core index 2,500 +
+  // memory 6,600 + lexical archive 2,700 + exact-link 8*900=7,200 = 29,000.
+  // That combination is unreachable as a hard cap — exact-link rows are the
+  // one conversation lane enforceFinalBound protects from early eviction, so
+  // a turn that is simultaneously a bootstrap turn and a full exact-link
+  // match is exactly the case the safety net exists to shed memory/lexical
+  // excerpts for — and sizing the bound there would turn it into dead code
+  // instead of a live one.
+  bootstrapFinalChars: 23_100,
 });
 
 export interface PreTurnContextInput {
@@ -1108,7 +1125,7 @@ export function readMemoryEvidence(
   includeBootstrap: boolean,
   seenEvidenceFingerprints: ReadonlySet<string>,
   bypassDedupe: boolean,
-  involvedSenderNames: readonly string[] = [],
+  involvedSenders: ReadonlyArray<readonly string[]> = [],
 ): PreTurnContext['memoryEvidence'] {
   if (!fs.existsSync(root)) throw new Error(`canonical memory tree missing: ${root}`);
   const canonicalRoot = fs.realpathSync(root);
@@ -1140,29 +1157,53 @@ export function readMemoryEvidence(
 
   // Deterministic per-person preference lane. Files under preferences/ are
   // keyed by name slug and injected whole for the conversation's involved
-  // senders — never lexically ranked, so a preference cannot lose a relevance
-  // contest to unrelated memory. Reads run before the ranked scan so the
-  // shared byte budget cannot starve them.
+  // senders. ONE FILE PER PERSON, never per alias: `involvedSenders` groups
+  // each participant's aliases (their per-message display name and, when
+  // resolved, set and different, their canonical `users.display_name`) so a
+  // platform rename can't leave BOTH the pre-rename and post-rename
+  // preference file injected as conflicting guidance for the same human. For
+  // each group, aliases are tried IN ORDER — per-message name first,
+  // canonical name as fallback, preserving pre-PR behavior when both files
+  // happen to exist — using the exact-slug-wins-else-longest-stem rule below;
+  // the first alias that claims an unclaimed file wins and the group stops
+  // looking. An alias matching a file an earlier group already claimed falls
+  // through to the next alias — that file belongs to the other person.
+  // Never lexically ranked, so a preference cannot lose a relevance contest
+  // to unrelated memory. Reads run before the ranked scan so the shared byte
+  // budget cannot starve them.
   const preferenceExcerpts: MemoryEvidenceExcerpt[] = [];
-  if (involvedSenderNames.length > 0) {
-    const senderSlugs = [...new Set(involvedSenderNames.map(preferenceSlug))].filter((slug) => slug.length > 0);
+  if (involvedSenders.length > 0) {
     const preferenceStems = listDirectMarkdownStems(root, PREFERENCES_DIR, notices);
-    // ONE file per sender: exact slug match wins outright; otherwise the
-    // longest prefix-compatible stem. Injecting every prefix match would let
+    // ONE file per sender alias: exact slug match wins outright; otherwise
+    // the longest prefix-compatible stem. Matching every prefix would let
     // `alex.md` ride along with `alex-stone.md` for the same person.
-    const matched = [
-      ...new Set(
-        senderSlugs
-          .map((slug) => {
-            if (preferenceStems.includes(slug)) return slug;
-            const compatible = preferenceStems
-              .filter((stem) => preferenceStemMatches(stem, slug))
-              .sort((a, b) => b.length - a.length || compareCodepoint(a, b));
-            return compatible[0];
-          })
-          .filter((stem): stem is string => stem !== undefined),
-      ),
-    ].map((stem) => `${PREFERENCES_DIR}${stem}.md`);
+    const matchStem = (slug: string): string | undefined => {
+      if (preferenceStems.includes(slug)) return slug;
+      const compatible = preferenceStems
+        .filter((stem) => preferenceStemMatches(stem, slug))
+        .sort((a, b) => b.length - a.length || compareCodepoint(a, b));
+      return compatible[0];
+    };
+    const selectedRelatives = new Set<string>();
+    const matched: string[] = [];
+    for (const group of involvedSenders) {
+      if (matched.length >= PRE_TURN_BOUNDS.preferenceExcerpts) break;
+      for (const alias of group) {
+        const slug = preferenceSlug(alias);
+        if (slug.length === 0) continue;
+        const stem = matchStem(slug);
+        if (stem === undefined) continue;
+        const relative = `${PREFERENCES_DIR}${stem}.md`;
+        // A file an earlier group already claimed is that PERSON's file, not
+        // this one's — fall through to the next alias (two humans sharing a
+        // display name resolve through their differing canonical names)
+        // instead of silently contributing nothing.
+        if (selectedRelatives.has(relative)) continue;
+        selectedRelatives.add(relative);
+        matched.push(relative);
+        break; // one file per group: stop at the first alias that claimed a file
+      }
+    }
     for (const relative of matched.slice(0, PRE_TURN_BOUNDS.preferenceExcerpts)) {
       try {
         const read = readBoundedFile(path.join(root, relative), canonicalRoot);
@@ -1522,18 +1563,28 @@ export function buildPreTurnContext(input: PreTurnContextInput): PreTurnContext 
     }
   }
 
-  // Involved senders for the deterministic preference lane: the triggering
-  // message's sender plus recent inbound senders in this conversation.
-  const involvedSenderNames: string[] = [];
-  const triggerSender = extractSenderName(input.normalizedContent);
-  if (triggerSender) involvedSenderNames.push(triggerSender);
+  // Involved senders for the deterministic preference lane, grouped by
+  // person so a platform rename can't inject BOTH the pre-rename and
+  // post-rename preference file for the same human (see readMemoryEvidence).
+  // One group per recent conversation sender: [per-message senderName,
+  // canonical users.display_name] — canonical included only when resolved,
+  // set, and different from the per-message name, resolved via the archive's
+  // stable sender_id. Since the round-1 fix the triggering message is
+  // archived before this runs, so the trigger sender normally already
+  // appears as the newest recentConversationSenders row; a [triggerSender]
+  // group is prepended only when no existing group contains that name — the
+  // fallback for kinds that don't archive before this call.
+  const involvedSenders: string[][] = [];
   try {
-    for (const name of recentConversationSenderNames({
+    for (const sender of recentConversationSenders({
       memberAgentGroupIds,
       messagingGroupId: currentMessagingGroupId,
       threadId: currentThreadId,
     })) {
-      if (!involvedSenderNames.includes(name)) involvedSenderNames.push(name);
+      const canonicalName = sender.senderId ? getUser(sender.senderId)?.display_name : undefined;
+      involvedSenders.push(
+        canonicalName && canonicalName !== sender.senderName ? [sender.senderName, canonicalName] : [sender.senderName],
+      );
     }
   } catch (error) {
     if (!(error instanceof Error)) throw error;
@@ -1543,6 +1594,10 @@ export function buildPreTurnContext(input: PreTurnContextInput): PreTurnContext 
       code: 'sender-recall-failed',
       detail: error.message,
     });
+  }
+  const triggerSender = extractSenderName(input.normalizedContent);
+  if (triggerSender && !involvedSenders.some((group) => group.includes(triggerSender))) {
+    involvedSenders.unshift([triggerSender]);
   }
 
   let memoryEvidence: PreTurnContext['memoryEvidence'];
@@ -1554,7 +1609,7 @@ export function buildPreTurnContext(input: PreTurnContextInput): PreTurnContext 
       includeBootstrap,
       seenEvidenceFingerprints,
       bypassDedupe,
-      involvedSenderNames,
+      involvedSenders,
     );
   } catch (error) {
     if (!(error instanceof Error)) throw error;
