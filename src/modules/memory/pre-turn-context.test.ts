@@ -1142,13 +1142,16 @@ describe('per-person preference recall', () => {
     expect(paths).toContain('preferences/sam-rivera.md');
   });
 
-  it('matches an ids: frontmatter file by raw suffix even when both name slugs miss', () => {
+  it("matches an ids: frontmatter file via the bare form under the conversation's verified namespace, even when both name slugs miss", () => {
     memoryFile('preferences/quinn-park.md', '---\nids: [U123]\n---\n# Quinn\nPrefers concise updates.');
     // Renamed display name (misses the "quinn-park" slug) + a users row with
     // a NULL canonical display_name (also misses) — the id tier is the only
-    // way this file can be claimed.
-    archiveFrom('m1', 'QP Renamed', '2026-08-01T00:00:00.000Z', 'discord:guild:channel:thread', 'slack-x:U123');
-    upsertUserRow('slack-x:U123', null);
+    // way this file can be claimed. sess-a's messaging group (mg-a) is
+    // channel_type 'discord' (seedScope), so stripVerifiedPrefix strips
+    // exactly this "discord:" prefix, leaving "U123" to match the bare
+    // declared id.
+    archiveFrom('m1', 'QP Renamed', '2026-08-01T00:00:00.000Z', 'discord:guild:channel:thread', 'discord:U123');
+    upsertUserRow('discord:U123', null);
 
     const result = buildPreTurnContext({
       agentGroupId: 'ag-a',
@@ -1178,11 +1181,12 @@ describe('per-person preference recall', () => {
     expect(paths).toContain('preferences/river-cole.md');
   });
 
-  it('a bare id entry does not match a different sender_id under the same namespace prefix', () => {
+  it('a bare id entry does not match a different sender_id under the same VERIFIED namespace prefix', () => {
     memoryFile('preferences/river-cole.md', '---\nids: [U123]\n---\n# River\nWants terse replies.');
-    // Different raw suffix (U9999, not U123) — must not match even though the
-    // namespace prefix "slack-x:" is shared.
-    archiveFrom('m1', 'RC Alt', '2026-08-01T00:00:00.000Z', 'discord:guild:channel:thread', 'slack-x:U9999');
+    // Different raw suffix (U9999, not U123) under the conversation's own
+    // verified "discord:" namespace — must not match even though the
+    // verified prefix is shared.
+    archiveFrom('m1', 'RC Alt', '2026-08-01T00:00:00.000Z', 'discord:guild:channel:thread', 'discord:U9999');
 
     const result = buildPreTurnContext({
       agentGroupId: 'ag-a',
@@ -1201,7 +1205,9 @@ describe('per-person preference recall', () => {
     memoryFile('preferences/current.md', '---\nids: [U500]\n---\n# Morgan\nCurrent preferences.');
     // Display name slugs to morgan-park.md, but the declared id routes to
     // current.md — the id tier must win and the name file must not appear.
-    archiveFrom('m1', 'Morgan Park', '2026-08-01T00:00:00.000Z', 'discord:guild:channel:thread', 'slack-x:U500');
+    // 'discord:' matches mg-a's channel_type (seedScope) so the bare
+    // declared id strips and matches via the verified namespace.
+    archiveFrom('m1', 'Morgan Park', '2026-08-01T00:00:00.000Z', 'discord:guild:channel:thread', 'discord:U500');
 
     const result = buildPreTurnContext({
       agentGroupId: 'ag-a',
@@ -1218,7 +1224,7 @@ describe('per-person preference recall', () => {
 
   it('strips ids: frontmatter from the injected excerpt text', () => {
     memoryFile('preferences/sky-vance.md', '---\nids: [U777]\n---\n# Sky Vance\nPrefers bullet points.');
-    archiveFrom('m1', 'Sky Vance', '2026-08-01T00:00:00.000Z', 'discord:guild:channel:thread', 'slack-x:U777');
+    archiveFrom('m1', 'Sky Vance', '2026-08-01T00:00:00.000Z', 'discord:guild:channel:thread', 'discord:U777');
 
     const result = buildPreTurnContext({
       agentGroupId: 'ag-a',
@@ -1256,31 +1262,30 @@ describe('per-person preference recall', () => {
     expect(preference!.text).toContain('---');
   });
 
-  it('an id match is terminal for its group: never falls through to a stale name match on a shared raw suffix', () => {
-    // One human archived under two sibling-bot namespaces sharing a raw
-    // suffix (slack-x vs slack-x-codex), declared once in river-park.md.
-    // Newest first: the slack-x-codex row is processed first and claims
-    // river-park.md via the id tier; the slack-x row's id resolves to the
-    // same, now-claimed file. Pre-fix, that already-claimed id match fell
-    // through to name matching, and its own display name slugs to the
+  it('an id match is terminal for its group: never falls through to a stale name match on a shared raw id declaration', () => {
+    // One human declared under two raw ids in one file (e.g. an old and a
+    // new platform id), both under the CURRENT conversation's verified
+    // "discord:" namespace (mg-a's channel_type, per seedScope) — so both
+    // strip to their bare form and both resolve via the id tier.
+    // Newest first: the 'River Park' row is processed first and claims
+    // river-park.md via the id tier; the 'River Park Alt' row's id resolves
+    // to the same, now-claimed file. Pre-fix, that already-claimed id match
+    // fell through to name matching, and its own display name slugs to the
     // unrelated river-park-alt.md — injecting a second, stale file for the
     // same person. Post-fix, an id match never falls through.
-    memoryFile('preferences/river-park.md', '---\nids: [U0TEST900XYZ]\n---\n# River Park\nCurrent preferences.');
+    memoryFile(
+      'preferences/river-park.md',
+      '---\nids: [U0TEST900XYZ, U0TEST900ALT]\n---\n# River Park\nCurrent preferences.',
+    );
     memoryFile('preferences/river-park-alt.md', '# River Park Alt\nStale preferences — must not be injected.');
     archiveFrom(
       'm1',
       'River Park Alt',
       '2026-08-01T00:00:00.000Z',
       'discord:guild:channel:thread',
-      'slack-x:U0TEST900XYZ',
+      'discord:U0TEST900ALT',
     );
-    archiveFrom(
-      'm2',
-      'River Park',
-      '2026-08-01T00:01:00.000Z',
-      'discord:guild:channel:thread',
-      'slack-x-codex:U0TEST900XYZ',
-    );
+    archiveFrom('m2', 'River Park', '2026-08-01T00:01:00.000Z', 'discord:guild:channel:thread', 'discord:U0TEST900XYZ');
 
     const result = buildPreTurnContext({
       agentGroupId: 'ag-a',
@@ -1400,16 +1405,20 @@ describe('per-person preference recall', () => {
     expect(paths).toContain('preferences/pat-doe.md');
   });
 
-  it('still suppresses the fallback when the trigger is already archived under a sibling namespace of the same raw id', () => {
-    // Same human, archived earlier under a sibling-bot namespace
-    // (slack-x:U0TESTSHARED) sharing the trigger's raw id (U0TESTSHARED,
-    // namespaced by this call to discord:U0TESTSHARED) — a DIFFERENT
-    // display name simulates a rename, proving suppression here is keyed on
-    // the id, not the name.
-    memoryFile('preferences/sam-shared.md', '---\nids: [slack-x:U0TESTSHARED]\n---\n# Sam\nCurrent preferences.');
+  it('still suppresses the fallback when the trigger is already archived under the same verified namespace', () => {
+    // Same human, archived earlier under the CURRENT conversation's verified
+    // namespace (mg-a's channel_type is 'discord', per seedScope) — a
+    // DIFFERENT display name simulates a rename, proving suppression here is
+    // keyed on the id (once each side's verified "discord:" prefix is
+    // stripped), not the name. A sender_id namespaced under some OTHER,
+    // unverified channel_type would NOT suppress — see the Matrix-shape
+    // "does not suppress the fallback for a different homeserver user"
+    // test further below in this describe block, which is the round-4 fix
+    // this test's prior sibling-namespace variant used to (incorrectly)
+    // assert the opposite of.
+    memoryFile('preferences/sam-shared.md', '---\nids: [U0TESTSHARED]\n---\n# Sam\nCurrent preferences.');
     // A stale file that a NOT-suppressed fallback would additionally pick up
-    // by name (its id lookup misses: the declared id above is exact-namespaced
-    // to slack-x, not the discord-namespaced form, and no bare form exists).
+    // by name.
     memoryFile(
       'preferences/sam-new-name.md',
       '# Sam New Name (stale)\nMust not be injected — same person as sam-shared.',
@@ -1419,7 +1428,7 @@ describe('per-person preference recall', () => {
       'Sam Archived',
       '2026-08-01T00:00:00.000Z',
       'discord:guild:channel:thread',
-      'slack-x:U0TESTSHARED',
+      'discord:U0TESTSHARED',
     );
 
     const result = buildPreTurnContext({
@@ -1568,6 +1577,76 @@ describe('per-person preference recall', () => {
     expect(conflicts[0]?.detail).toContain('U0TESTDUP');
     expect(conflicts[0]?.detail).toContain('preferences/dup-a.md');
     expect(conflicts[0]?.detail).toContain('preferences/dup-b.md');
+  });
+
+  it('does not suppress the fallback for a different homeserver user with the same last-colon suffix (Matrix-shape)', () => {
+    // Matrix-style raw handles contain their OWN colon (`@user:homeserver`),
+    // and extractAndUpsertUser (src/modules/permissions/index.ts:96-99)
+    // stores them UN-PREFIXED — this is the platform's own opaque id, not a
+    // "channelType:rawId" pair. Pre-fix (PR #221 round 4), rawIdSuffix took
+    // everything after the LAST colon, so '@bob:matrix.example' and
+    // '@alice:matrix.example' both suffixed to 'matrix.example' and the
+    // archived Bob wrongly suppressed Alice's own trigger-fallback group —
+    // dropping her exact-declared preference file entirely. Post-fix, a
+    // colon-bearing id that isn't namespaced under the CURRENT verified
+    // channel_type ('discord', mg-a's channel_type per seedScope) is
+    // compared whole, so the two different homeserver users never collide.
+    memoryFile(
+      'preferences/alice-matrix.md',
+      '---\nids: [@alice:matrix.example]\n---\n# Alice\nPrefers concise updates.',
+    );
+    archiveFrom('m1', 'Bob', '2026-08-01T00:00:00.000Z', 'discord:guild:channel:thread', '@bob:matrix.example');
+
+    const result = buildPreTurnContext({
+      agentGroupId: 'ag-a',
+      sessionId: 'sess-a',
+      kind: 'chat-sdk',
+      trigger: 1,
+      normalizedContent: JSON.stringify({ text: 'status?', sender: 'Alice', senderId: '@alice:matrix.example' }),
+    });
+
+    const paths = result.memoryEvidence.excerpts.map((row) => row.path);
+    expect(paths).toContain('preferences/alice-matrix.md');
+  });
+
+  it('a bare id entry does not match a colon-bearing raw id it merely trails (Matrix-shape)', () => {
+    // A file declares the trailing part of a Matrix id as a bare entry —
+    // exactly what the old last-colon-stripping rule would have let match
+    // any '@*:matrix.example' sender. Under the fix, a colon-bearing
+    // sender_id that is not namespaced under the CURRENT verified
+    // channel_type never reaches the raw (bare-entry) map at all, so this
+    // must not match.
+    memoryFile('preferences/homeserver-catchall.md', '---\nids: [matrix.example]\n---\n# Catchall\nMust not match.');
+    archiveFrom('m1', 'Alice', '2026-08-01T00:00:00.000Z', 'discord:guild:channel:thread', '@alice:matrix.example');
+
+    const result = buildPreTurnContext({
+      agentGroupId: 'ag-a',
+      sessionId: 'sess-a',
+      kind: 'chat-sdk',
+      trigger: 1,
+      normalizedContent: JSON.stringify({ text: 'status?', sender: 'Pat Doe' }),
+    });
+
+    const paths = result.memoryEvidence.excerpts.map((row) => row.path);
+    expect(paths).not.toContain('preferences/homeserver-catchall.md');
+  });
+
+  it("a bare id entry still matches when stripped of the CURRENT conversation's verified channel_type prefix", () => {
+    // <ct> is mg-a's channel_type ('discord', per seedScope) — the ONLY
+    // prefix stripVerifiedPrefix is allowed to remove for this conversation.
+    memoryFile('preferences/verified-bare.md', '---\nids: [U0TESTV1]\n---\n# Verified Bare\nCurrent preferences.');
+    archiveFrom('m1', 'VB Renamed', '2026-08-01T00:00:00.000Z', 'discord:guild:channel:thread', 'discord:U0TESTV1');
+
+    const result = buildPreTurnContext({
+      agentGroupId: 'ag-a',
+      sessionId: 'sess-a',
+      kind: 'chat-sdk',
+      trigger: 1,
+      normalizedContent: JSON.stringify({ text: 'status?', sender: 'Pat Doe' }),
+    });
+
+    const paths = result.memoryEvidence.excerpts.map((row) => row.path);
+    expect(paths).toContain('preferences/verified-bare.md');
   });
 });
 

@@ -282,8 +282,9 @@ function extractSenderName(normalizedContent: string): string | null {
  * extractSenderName above. Unlike those two call sites this id is used
  * as-is, NOT namespaced with a channel-type prefix — it is typically the RAW
  * platform id (unnamespaced), and readMemoryEvidence's id tier deliberately
- * routes an unnamespaced id through the raw-suffix map (rawIdToRelative),
- * not the exact-namespaced one.
+ * routes an unnamespaced id through the raw (bare-entry) map, keyed by the
+ * id with the CURRENT conversation's verified channel_type prefix stripped —
+ * see stripVerifiedPrefix.
  */
 function extractSenderId(normalizedContent: string): string | null {
   try {
@@ -298,14 +299,50 @@ function extractSenderId(normalizedContent: string): string | null {
 }
 
 /**
- * The portion of an id after its LAST colon — same rule readMemoryEvidence's
- * id tier uses to match a bare `ids:` entry against a namespaced sender_id
- * (one entry covers every sibling-bot namespace on a shared raw suffix). An
- * id with no colon is its own raw suffix.
+ * Looks up the CURRENT messaging group's channel_type ONCE per build, for
+ * reuse by both trigger-sender namespacing (namespaceTriggerSenderId) and
+ * verified-prefix stripping (stripVerifiedPrefix) in buildPreTurnContext and
+ * readMemoryEvidence's id tier. A lookup failure (missing row, closed DB) or
+ * a null messagingGroupId degrades to null: every caller treats a null
+ * channelType as "no verified namespace for this conversation" and skips
+ * stripping/prefixing rather than throwing.
  */
-function rawIdSuffix(id: string): string {
-  const lastColon = id.lastIndexOf(':');
-  return lastColon === -1 ? id : id.slice(lastColon + 1);
+function lookupChannelType(db: ReturnType<typeof getDb>, messagingGroupId: string | null): string | null {
+  if (!messagingGroupId) return null;
+  try {
+    const row = db.prepare('SELECT channel_type FROM messaging_groups WHERE id = ?').get(messagingGroupId) as
+      | { channel_type: string }
+      | undefined;
+    return row ? row.channel_type : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Strips ONLY a VERIFIED namespace prefix — `${channelType}:` for the
+ * CURRENT conversation's channel_type — and only when `id` actually starts
+ * with it; otherwise `id` is returned completely unchanged.
+ *
+ * This replaces the old "strip everything before the LAST colon" rule
+ * (rawIdSuffix, removed — PR #221 round 4). That rule was unsound: a raw
+ * platform handle can itself contain a colon (Matrix: `@alice:matrix.org`),
+ * and `extractAndUpsertUser` (src/modules/permissions/index.ts:96-99) stores
+ * such a handle UN-prefixed (no leading `channelType:`) because it already
+ * "looks namespaced". Suffixing at the last colon then collapsed two
+ * DIFFERENT people on different homeservers — `@alice:matrix.org` and
+ * `@bob:matrix.org` — to the same "matrix.org" suffix, letting a bare
+ * `ids: [matrix.org]` entry match a whole homeserver and letting an
+ * unrelated archived participant suppress the trigger-fallback group.
+ *
+ * Only the id's OWN verified prefix may be removed. A colon-bearing id that
+ * does not start with `${channelType}:` is left whole, colon and all, and
+ * must NOT be treated as if it had a strippable namespace.
+ */
+function stripVerifiedPrefix(id: string, channelType: string | null): string {
+  if (channelType === null) return id;
+  const prefix = `${channelType}:`;
+  return id.startsWith(prefix) ? id.slice(prefix.length) : id;
 }
 
 /**
@@ -313,33 +350,24 @@ function rawIdSuffix(id: string): string {
  * (src/modules/permissions/index.ts:99) namespaces an archived one: an id
  * that already contains a colon is left as-is, otherwise it is prefixed with
  * the CURRENT messaging group's channel_type (`${channelType}:${rawId}`).
+ * `channelType` is the value `lookupChannelType` already resolved once in
+ * buildPreTurnContext — this function does no DB access of its own.
  *
  * extractSenderId returns the RAW platform id off the wire (e.g. `U123`),
  * unlike an archived row's sender_id which is already namespaced at write
  * time. Without this, the fallback group's senderId could only ever hit
- * readMemoryEvidence's raw-suffix map (rawIdToRelative) — never a file's
- * namespace-exact `ids: [slack-x:U123]` declaration. Namespacing it here
- * makes it hit the exact map first, and its raw suffix still hits the raw
- * map as before — no change needed on the lookup side.
+ * readMemoryEvidence's raw (bare-entry) map — never a file's namespace-exact
+ * `ids: [discord:U123]` declaration. Namespacing it here makes it hit the
+ * exact map first, and stripping its own (now-present) verified prefix still
+ * hits the raw map as before — no change needed on the lookup side.
  *
- * A channel_type lookup failure (missing row, closed DB) degrades to the
- * raw id rather than throwing: worst case is falling back to raw-suffix
- * matching, not losing the fallback group's id entirely.
+ * A null channelType (lookup failure, or no current messaging group)
+ * degrades to the raw id rather than throwing: worst case is falling back to
+ * raw (bare-entry) matching, not losing the fallback group's id entirely.
  */
-function namespaceTriggerSenderId(
-  rawId: string | null,
-  db: ReturnType<typeof getDb>,
-  messagingGroupId: string | null,
-): string | null {
-  if (rawId === null || rawId.includes(':') || !messagingGroupId) return rawId;
-  try {
-    const row = db.prepare('SELECT channel_type FROM messaging_groups WHERE id = ?').get(messagingGroupId) as
-      | { channel_type: string }
-      | undefined;
-    return row ? `${row.channel_type}:${rawId}` : rawId;
-  } catch {
-    return rawId;
-  }
+function namespaceTriggerSenderId(rawId: string | null, channelType: string | null): string | null {
+  if (rawId === null || rawId.includes(':') || !channelType) return rawId;
+  return `${channelType}:${rawId}`;
 }
 const TRUNCATED_MARKDOWN_FILE = '\n[truncated:markdown-file]';
 const TRUNCATED_MARKDOWN_EXCERPT = '\n[truncated:markdown-excerpt]';
@@ -1282,6 +1310,11 @@ export function readMemoryEvidence(
   seenEvidenceFingerprints: ReadonlySet<string>,
   bypassDedupe: boolean,
   involvedSenders: ReadonlyArray<InvolvedSenderGroup> = [],
+  /** CURRENT conversation's verified channel_type, threaded from
+   * buildPreTurnContext's single lookupChannelType call. Default null means
+   * "no verified namespace" — stripVerifiedPrefix then never strips, so a
+   * bare `ids:` entry only ever matches a genuinely colon-free sender_id. */
+  channelType: string | null = null,
 ): PreTurnContext['memoryEvidence'] {
   if (!fs.existsSync(root)) throw new Error(`canonical memory tree missing: ${root}`);
   const canonicalRoot = fs.realpathSync(root);
@@ -1332,13 +1365,14 @@ export function readMemoryEvidence(
   // terminal for its group instead: a resolved id stops the group right
   // there, claiming the file if unclaimed and contributing nothing if
   // another group already claimed it — it NEVER falls through to name/alias
-  // matching. This is what stops a human archived under two sibling-bot
-  // namespaces (e.g. `slack-x:U1` and `slack-x-codex:U1`, sharing one raw
-  // suffix declared in one file) from having their second, already-resolved
-  // group also pick up a second, stale name-matched file for the same
-  // person. Never lexically ranked, so a preference cannot lose a relevance
-  // contest to unrelated memory. Reads run before the ranked scan so the
-  // shared byte budget cannot starve them.
+  // matching. This is what stops a human declared under two raw ids in one
+  // file (e.g. an old and a new platform id for the same person,
+  // `ids: [U1, U2]`, each matched by stripping the CURRENT conversation's
+  // verified channel_type prefix — see stripVerifiedPrefix) from having
+  // their second, already-resolved group also pick up a second, stale
+  // name-matched file for the same person. Never lexically ranked, so a
+  // preference cannot lose a relevance contest to unrelated memory. Reads
+  // run before the ranked scan so the shared byte budget cannot starve them.
   const preferenceExcerpts: MemoryEvidenceExcerpt[] = [];
   if (involvedSenders.length > 0) {
     const preferenceStems = listDirectMarkdownStems(root, PREFERENCES_DIR, notices);
@@ -1392,12 +1426,14 @@ export function readMemoryEvidence(
       });
     };
     // Explicit-id tier: index every preferences/ file's declared ids. An
-    // entry WITHOUT a colon matches the raw suffix after a sender_id's LAST
-    // colon (one entry covers every sibling-bot namespace); an entry WITH a
-    // colon must equal the full sender_id exactly. Every file is attempted
-    // here regardless of whether any sender later matches it by name, so a
-    // read failure is reported even for a file "matches nothing by name"
-    // would otherwise never reach.
+    // entry WITHOUT a colon (a "bare" entry) matches a sender_id with the
+    // CURRENT conversation's VERIFIED channel_type prefix stripped
+    // (stripVerifiedPrefix) — one entry covers every conversation in this
+    // channel, but NOT an arbitrary other namespace; an entry WITH a colon
+    // must equal the full sender_id exactly. Every file is attempted here
+    // regardless of whether any sender later matches it by name, so a read
+    // failure is reported even for a file "matches nothing by name" would
+    // otherwise never reach.
     //
     // Ids ride PREFERENCE_ID_CACHE (mtime+size keyed) instead of a full read
     // every turn — see that Map's doc comment above. `fs.lstatSync`, not
@@ -1481,21 +1517,31 @@ export function readMemoryEvidence(
       if (matched.length >= PRE_TURN_BOUNDS.preferenceExcerpts) break;
 
       // Explicit id match wins over name/alias matching. Exact namespaced id
-      // first, then the raw (post-last-colon) suffix.
+      // first (full sender_id string, unaffected by channelType), then the
+      // raw (bare-entry) tier — but ONLY when stripVerifiedPrefix actually
+      // removed the CURRENT conversation's verified channel_type prefix, or
+      // the id was already colon-free to begin with. A colon-bearing id that
+      // does NOT start with the verified prefix (a Matrix-style raw handle
+      // whose own colon isn't a namespace separator, or a sibling bot's
+      // differently-namespaced sender_id) is left whole and must NOT reach
+      // the raw map — that would resurrect the last-colon-suffix bug this id
+      // tier exists to avoid (PR #221 round 4).
       let idRelative: string | undefined;
       if (group.senderId !== null) {
         idRelative = exactIdToRelative.get(group.senderId);
         if (idRelative === undefined) {
-          const lastColon = group.senderId.lastIndexOf(':');
-          const rawSuffix = lastColon === -1 ? group.senderId : group.senderId.slice(lastColon + 1);
-          idRelative = rawIdToRelative.get(rawSuffix);
+          const stripped = stripVerifiedPrefix(group.senderId, channelType);
+          const verifiedOrColonFree = stripped !== group.senderId || !group.senderId.includes(':');
+          if (verifiedOrColonFree) {
+            idRelative = rawIdToRelative.get(stripped);
+          }
         }
       }
       if (idRelative !== undefined) {
         // Terminal for this group either way: claim the file if unclaimed,
         // or contribute nothing if an earlier group already claimed it — an
         // id resolution is never a reason to fall through to name matching
-        // (see the lane comment above for the sibling-namespace case this
+        // (see the lane comment above for the shared-raw-id case this
         // prevents).
         if (!selectedRelatives.has(idRelative)) {
           selectedRelatives.add(idRelative);
@@ -1823,6 +1869,10 @@ export function buildPreTurnContext(input: PreTurnContextInput): PreTurnContext 
   const currentMessagingGroupId =
     input.messagingGroupId === undefined ? scope.messaging_group_id : input.messagingGroupId;
   const currentThreadId = input.threadId === undefined ? scope.thread_id : input.threadId;
+  // Looked up ONCE and reused below by both namespaceTriggerSenderId (trigger
+  // fallback) and stripVerifiedPrefix (alreadyRepresented comparison, and
+  // threaded into readMemoryEvidence's id tier) — see lookupChannelType.
+  const channelType = lookupChannelType(db, currentMessagingGroupId);
   const fallbackGroup = db.prepare(`SELECT folder FROM agent_groups WHERE id = ?`).get(input.agentGroupId) as
     | { folder: string }
     | undefined;
@@ -1895,16 +1945,23 @@ export function buildPreTurnContext(input: PreTurnContextInput): PreTurnContext 
   // must not swallow the trigger's own id-declared preference file. When the
   // trigger resolves a senderId (see namespaceTriggerSenderId below), the
   // fallback is suppressed only if some existing group's senderId matches it
-  // exactly, or shares its raw (post-last-colon) suffix — archive groups
-  // carry per-instance namespaces, so a sibling-bot row for the same human
-  // still counts as represented. The old name-based check (aliases.includes)
-  // now applies ONLY when the trigger has no senderId at all.
+  // exactly, or the two ids agree once each has the CURRENT conversation's
+  // VERIFIED channel_type prefix stripped (stripVerifiedPrefix) — same
+  // conversation, same channel_type, so this still unifies a renamed sender
+  // across turns. A colon-bearing id that is NOT namespaced under the
+  // current channel_type (a Matrix-style raw handle, or a sibling bot's own
+  // namespace) is left whole and compared as-is, so it can only coincide by
+  // accident, never by an unverified shared suffix (round 4: rawIdSuffix's
+  // last-colon rule let `@alice:matrix.org` and `@bob:matrix.org` collapse
+  // to the same "matrix.org" suffix — fixed by removing it). The old
+  // name-based check (aliases.includes) now applies ONLY when the trigger
+  // has no senderId at all.
   //
   // The fallback's senderId comes from extractSenderId (not an archive
   // lookup) via normalizedContent — the RAW platform id — then gets
   // namespaced with the current messaging group's channel_type before use,
   // so it can hit a file's namespace-exact `ids:` declaration and not only
-  // the raw-suffix map; see namespaceTriggerSenderId's doc comment.
+  // the raw (bare-entry) map; see namespaceTriggerSenderId's doc comment.
   const involvedSenders: InvolvedSenderGroup[] = [];
   try {
     for (const sender of recentConversationSenders({
@@ -1928,17 +1985,13 @@ export function buildPreTurnContext(input: PreTurnContextInput): PreTurnContext 
   }
   const triggerSender = extractSenderName(input.normalizedContent);
   if (triggerSender) {
-    const triggerSenderId = namespaceTriggerSenderId(
-      extractSenderId(input.normalizedContent),
-      db,
-      currentMessagingGroupId,
-    );
+    const triggerSenderId = namespaceTriggerSenderId(extractSenderId(input.normalizedContent), channelType);
     const alreadyRepresented =
       triggerSenderId !== null
         ? involvedSenders.some(
             (group) =>
               group.senderId !== null &&
-              (group.senderId === triggerSenderId || rawIdSuffix(group.senderId) === rawIdSuffix(triggerSenderId)),
+              stripVerifiedPrefix(group.senderId, channelType) === stripVerifiedPrefix(triggerSenderId, channelType),
           )
         : involvedSenders.some((group) => group.aliases.includes(triggerSender));
     if (!alreadyRepresented) {
@@ -1956,6 +2009,7 @@ export function buildPreTurnContext(input: PreTurnContextInput): PreTurnContext 
       seenEvidenceFingerprints,
       bypassDedupe,
       involvedSenders,
+      channelType,
     );
   } catch (error) {
     if (!(error instanceof Error)) throw error;
