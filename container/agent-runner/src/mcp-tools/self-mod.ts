@@ -48,7 +48,7 @@ export const installPackages: McpToolDefinition = {
   tool: {
     name: 'install_packages',
     description:
-      'Install apt and/or npm packages into YOUR per-agent container image. Requires admin approval; fire-and-forget. On approval, the image is rebuilt and the container is restarted automatically.',
+      'Install apt and/or npm packages into YOUR per-agent container image so they persist for all future turns — use this over a workspace `pnpm install` (which only lasts the current turn) whenever the user asks you to add a capability for good. Requires admin approval; fire-and-forget. On approval, the image is rebuilt and the container is restarted automatically.',
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -90,7 +90,7 @@ export const addMcpServer: McpToolDefinition = {
   tool: {
     name: 'add_mcp_server',
     description:
-      'Wire an EXISTING third-party MCP server into YOUR per-agent runtime config — you must already know the exact `command` + `args` to invoke it (e.g. `npx @modelcontextprotocol/server-github`). Requires admin approval; fire-and-forget.',
+      'Wire an EXISTING third-party MCP server into YOUR per-agent runtime config — you must already know the exact `command` + `args` to invoke it (e.g. `npx @modelcontextprotocol/server-github`; browse options at https://mcp.so). Requires admin approval; fire-and-forget. Never ask the user for credentials or fabricate credential-setup instructions — OneCLI handles them: use `"onecli-managed"` as the placeholder value for any credential env var or config field the server needs. After the server is installed and the container restarts, load the `onecli-gateway` skill for the full credential-handling flow (connect URLs, stubs, error recovery).',
     inputSchema: {
       type: 'object' as const,
       properties: {

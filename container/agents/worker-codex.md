@@ -1,6 +1,6 @@
 ---
 name: worker-codex
-description: Codex-backed execution worker — routes the task to the Codex CLI (GPT-5.x) and reports its result. Use when the user asks for codex workers. Pass any requested codex model/effort in the delegation text (e.g. "codex model gpt-5.6-sol, xhigh reasoning"); omit them for the plain default.
+description: Codex-backed execution worker — routes the task to the Codex CLI (GPT-5.x) and reports its result. Not a model tier; reach for it for a genuinely independent implementation or second opinion, or to keep a long noisy codex run out of the main loop's context. Slow (minutes, not seconds) — not the routine choice. Invoke with `run_in_background: true`: that backgrounds only this worker at the parent layer while it keeps its own `codex exec` Bash call in the foreground, preserving lifecycle, cancellation, and complete results. Pass any requested codex model/effort in the delegation text (e.g. "codex model gpt-5.6-sol, xhigh reasoning"); omit them for the plain default.
 model: claude-sonnet-5
 effort: low
 ---

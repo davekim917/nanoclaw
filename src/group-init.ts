@@ -2,7 +2,7 @@ import fs from 'fs';
 import path from 'path';
 
 import { DATA_DIR, DEFAULT_AGENT_PROVIDER, GROUPS_DIR } from './config.js';
-import { stageGroupPersona } from './group-persona.js';
+import { stageGroupPersona, STANDING_INSTRUCTIONS_FILE } from './group-persona.js';
 import { log } from './log.js';
 import { providerProvidesAgentSurfaces } from './providers/provider-container-registry.js';
 import { prepareWorkgroupMemoryMember } from './modules/workgroup/shared-dirs.js';
@@ -239,7 +239,7 @@ export function initGroupFilesystem(
   // project-document composer consumes this shared surface at spawn. Exclusive
   // creation preserves any existing operator-owned instructions.
   if (opts?.instructions && stageGroupPersona(groupDir, opts.instructions)) {
-    initialized.push('instructions.prepend.md');
+    initialized.push(STANDING_INSTRUCTIONS_FILE);
   }
 
   if (defaultSurfaces) {

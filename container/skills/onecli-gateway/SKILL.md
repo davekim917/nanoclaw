@@ -6,7 +6,9 @@ description: >-
   read emails, check calendar, access GitHub repos, create issues, check
   Stripe payments, or interact with ANY external service or API. Do NOT
   use browser extensions or OAuth CLI tools. Make HTTP requests directly;
-  the gateway injects credentials automatically.
+  the gateway injects credentials automatically. On a 401, 403, or
+  app_not_connected error, show the response's connect_url to the user as a
+  bare URL on its own line so they can click to connect.
 compatibility: Requires HTTPS_PROXY set in environment (automatic when launched via `onecli run`)
 metadata:
   author: onecli
@@ -25,7 +27,16 @@ You have direct HTTP access to external APIs. OAuth apps (Gmail, GitHub,
 Google Calendar, Google Drive, etc.) and API key services are all available
 through the gateway. Just make the request directly; the gateway injects
 credentials if the app is connected. If not, it returns an error with a
-connect URL you can present to the user.
+connect URL you can present to the user. Use any method that makes an HTTP
+request — curl, Python, a CLI tool, whatever fits; if a tool insists on a
+locally-configured credential, pass any placeholder value, since the proxy
+replaces it with the real credential at request time.
+
+**Exception — services with a mounted credential file use their own CLI,
+not the proxy.** Check `get_capabilities` first. Google Workspace
+(Gmail/Calendar/Drive) is the main one: use `gws` with the account file and
+env var shown there. A OneCLI `app_not_connected` for such a service does
+not mean you lack access — it means you're calling the wrong surface.
 
 ## Making Requests
 
@@ -58,10 +69,11 @@ https://www.onecli.sh/docs/guides/credential-stubs/general-app
 If you get a 401, 403, or a gateway error (e.g., `app_not_connected`):
 
 **Step 1 — Show the user a connect link.** Use the `connect_url` from the
-error response:
+error response. You MUST show it as a bare URL on its own line — no angle
+brackets, no markdown link syntax — so it's clickable as-is:
 
 > To connect [service], open this link:
-> [connect_url from the error response]
+> https://example.com/connect/...
 
 If there is no `connect_url` in the error, tell the user to open the
 OneCLI dashboard and connect the service there.
