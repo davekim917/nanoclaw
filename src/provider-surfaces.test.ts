@@ -435,6 +435,52 @@ describe('buildMounts agent surfaces', () => {
     expect(fs.lstatSync(path.join(state, 'repository.lock')).isFile()).toBe(true);
   });
 
+  // Pins the deletion of the global-~/.codex `config.toml` / `plugins` fallback
+  // mounts (822f1deb). Nothing in the container reads /home/node/.codex/* in
+  // codex-as-peer mode — the runner redirects CODEX_HOME to
+  // /home/node/.codex-runtime — and as nested mounts runc created both entries
+  // as root inside the operator's host ~/.codex-<folder>/.
+  it('never nests global-codex config.toml or plugins inside a scoped ~/.codex home', () => {
+    const ag = group('ag-codex-peer', 'codex-peer');
+    createAgentGroup(ag);
+    withWorkgroup(ag);
+    ensureContainerConfig(ag.id);
+    initGroupFilesystem({ ...ag, workgroup_id: ag.folder }, { provider: 'claude' });
+
+    const fakeHome = path.join(TEST_ROOT, 'codex-home');
+    const scoped = path.join(fakeHome, `.codex-${ag.folder}`);
+    const globalCodex = path.join(fakeHome, '.codex');
+    fs.mkdirSync(path.join(fakeHome, 'plugins', 'codex'), { recursive: true });
+    fs.mkdirSync(scoped, { recursive: true });
+    fs.mkdirSync(path.join(globalCodex, 'plugins'), { recursive: true });
+    // Scoped home has auth (so resolveCodexAuthDir picks it) but no config.toml
+    // and no plugins/ — the exact shape the removed fallback fired on.
+    fs.writeFileSync(path.join(scoped, 'auth.json'), '{}');
+    fs.writeFileSync(path.join(globalCodex, 'config.toml'), 'model = "gpt-5.6-terra"\n');
+
+    const prevHome = process.env.HOME;
+    process.env.HOME = fakeHome;
+    let mounts;
+    try {
+      mounts = buildMounts(
+        ag,
+        session('s-codex-peer', ag.id),
+        { ...containerConfig(), codexHostAuth: true },
+        'claude',
+        {},
+        ag.folder,
+      );
+    } finally {
+      if (prevHome === undefined) delete process.env.HOME;
+      else process.env.HOME = prevHome;
+    }
+
+    // The scoped home itself still mounts — that is the credential surface.
+    expect(mounts).toContainEqual({ hostPath: scoped, containerPath: '/home/node/.codex', readonly: false });
+    expect(mounts.some((m) => m.containerPath.startsWith('/home/node/.codex/'))).toBe(false);
+    expect(mounts.some((m) => m.hostPath === globalCodex || m.hostPath.startsWith(`${globalCodex}/`))).toBe(false);
+  });
+
   it('uses the OpenCode Go default at high effort when no DB override exists', () => {
     const ag = group('ag-opencode-defaults', 'opencode-defaults');
     createAgentGroup(ag);

@@ -2177,28 +2177,18 @@ export function buildMounts(
         // sibling's purpose-built ~/.codex-<sibling>/ dir with the source's.
         const hostCodex = primaryHostPath;
         if (fs.existsSync(hostCodex)) {
+          // DELIBERATELY no global-`~/.codex` fallback for `config.toml` /
+          // `plugins` when hostCodex is a scoped `~/.codex-<folder>`. 822f1deb
+          // added both so a scoped group inherited the host's
+          // `[plugins.*]`/`[marketplaces.*]` config and plugin cache; that
+          // inheritance is gone (4da9d288 registers plugins fresh from
+          // /workspace/plugins, 87b12122 generates the peer config.toml), and
+          // this branch is codex-as-peer only, where the runner always
+          // redirects CODEX_HOME to /home/node/.codex-runtime. So nothing read
+          // them — while as NESTED mounts into an RW bind whose source lacks
+          // the entry, runc created both as ROOT in the operator's host
+          // `~/.codex-<folder>/`. Pinned by src/provider-surfaces.test.ts.
           mounts.push({ hostPath: hostCodex, containerPath: '/home/node/.codex', readonly: false });
-          const globalCodex = path.join(os.homedir(), '.codex');
-          if (hostCodex !== globalCodex) {
-            const scopedConfig = path.join(hostCodex, 'config.toml');
-            const globalConfig = path.join(globalCodex, 'config.toml');
-            if (!fs.existsSync(scopedConfig) && fs.existsSync(globalConfig)) {
-              mounts.push({
-                hostPath: globalConfig,
-                containerPath: '/home/node/.codex/config.toml',
-                readonly: true,
-              });
-            }
-            const scopedPlugins = path.join(hostCodex, 'plugins');
-            const globalPlugins = path.join(globalCodex, 'plugins');
-            if (!fs.existsSync(scopedPlugins) && fs.existsSync(globalPlugins)) {
-              mounts.push({
-                hostPath: globalPlugins,
-                containerPath: '/home/node/.codex/plugins',
-                readonly: true,
-              });
-            }
-          }
         }
       }
 
