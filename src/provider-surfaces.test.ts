@@ -210,6 +210,27 @@ describe('initGroupFilesystem agent surfaces', () => {
     expect(fs.existsSync(path.join(sessionRoot, '.claude-shared'))).toBe(false);
   });
 
+  it('leaves container-resolvable placeholder symlinks alone instead of writing through them', () => {
+    const ag = group('ag-danglink', 'danglink-group');
+    createAgentGroup(ag);
+    const groupDir = path.join(GROUPS_DIR, ag.folder);
+    fs.mkdirSync(groupDir, { recursive: true });
+    // Targets that only resolve inside the container. existsSync FOLLOWS these
+    // and reports false, so the placeholder write would traverse the same link
+    // and throw ENOENT — and initGroupFilesystem runs before every spawn, so
+    // that throw makes the group unstartable.
+    fs.symlinkSync('/workspace/workgroup/private-spawn-template.md', path.join(groupDir, 'spawn-template.md'));
+    fs.symlinkSync('/workspace/workgroup/shared-CLAUDE.local.md', path.join(groupDir, 'CLAUDE.local.md'));
+
+    expect(() => initGroupFilesystem(ag, { instructions: 'hello' })).not.toThrow();
+
+    for (const name of ['spawn-template.md', 'CLAUDE.local.md']) {
+      const entry = path.join(groupDir, name);
+      expect(fs.lstatSync(entry).isSymbolicLink()).toBe(true);
+      expect(fs.readlinkSync(entry)).toContain('/workspace/workgroup/');
+    }
+  });
+
   it('writes nothing at all for a surfaces-owning provider without instructions', () => {
     const ag = group('ag-surfy-bare', 'surfy-bare-group');
     createAgentGroup(ag);

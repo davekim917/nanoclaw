@@ -133,6 +133,21 @@ export function prepareGroupCanonicalMemory(
  * outside these lists is user-owned and untouched. Returns true if the
  * file was modified.
  */
+/**
+ * Does a directory ENTRY exist at this path — link included, target ignored?
+ *
+ * `existsSync` follows symlinks, so a link whose target only resolves inside
+ * the container (`spawn-template.md -> /workspace/workgroup/...`) reads as
+ * absent here, and the `writeFileSync` that follows would traverse the same
+ * link and throw ENOENT. initGroupFilesystem runs before every spawn, so that
+ * throw would make the group unstartable. An existing link is occupied — it
+ * was placed deliberately, and the placeholder exists only to stop Docker
+ * creating a root-owned file where nothing exists at all.
+ */
+function entryExists(target: string): boolean {
+  return fs.lstatSync(target, { throwIfNoEntry: false }) !== undefined;
+}
+
 function ensureRequiredSettings(settingsFile: string): boolean {
   let settings: Record<string, unknown>;
   try {
@@ -229,7 +244,7 @@ export function initGroupFilesystem(
 
   if (defaultSurfaces) {
     const claudeLocalFile = path.join(groupDir, 'CLAUDE.local.md');
-    if (!fs.existsSync(claudeLocalFile)) {
+    if (!entryExists(claudeLocalFile)) {
       fs.writeFileSync(claudeLocalFile, '');
       initialized.push('CLAUDE.local.md');
     }
@@ -242,7 +257,7 @@ export function initGroupFilesystem(
   // remove. Docker leaves an existing file's ownership alone. Not gated on
   // defaultSurfaces: the mount isn't either.
   const spawnTemplateFile = path.join(groupDir, 'spawn-template.md');
-  if (!fs.existsSync(spawnTemplateFile)) {
+  if (!entryExists(spawnTemplateFile)) {
     fs.writeFileSync(spawnTemplateFile, '');
     initialized.push('spawn-template.md');
   }
