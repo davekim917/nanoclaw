@@ -25,6 +25,8 @@
  *      days of history → print a warm-up notice and exit 0 (the instruction-
  *      stack tripwire below has no history dependency and still runs).
  *   3b. instructionStack (no history, no band): container/CLAUDE.md ceiling,
+ *      repo-root CLAUDE.md ceiling (trunkDocBytes, 16,384 B — the dev-facing
+ *      doc, not the in-container agent surface),
  *      per-group standing-file ceiling (persona + CLAUDE.local.md, symlinks
  *      resolved, shared files counted/flagged once fleet-wide) with a
  *      banned-pattern scan for dates/issue-refs/"Current Focus" headers, and
@@ -417,6 +419,8 @@ function detectBreaches(metrics: StoredMetrics, priorMetrics: StoredMetrics[]): 
 
 /** container/CLAUDE.md alone (shared base, not persona/fragments). */
 export const CONTAINER_BYTES_CEILING = 10_240;
+/** Repo-root CLAUDE.md alone — loads into every host session and any container agent working on the nanoclaw repo itself. */
+export const TRUNK_DOC_BYTES_CEILING = 16_384;
 /** Per group: its standing-instructions/persona file(s) + CLAUDE.local.md. */
 export const GROUP_STANDING_BYTES_CEILING = 8_192;
 
@@ -436,7 +440,7 @@ export function scanBannedPatterns(content: string): string[] {
 }
 
 export interface InstructionStackBreach {
-  metric: 'containerBytes' | 'groupStandingBytes' | 'effectiveStackBytes';
+  metric: 'containerBytes' | 'trunkDocBytes' | 'groupStandingBytes' | 'effectiveStackBytes';
   scope: string; // 'container/CLAUDE.md', or the sorted group name(s) sharing the flagged file(s)
   bytes: number;
   ceiling: number;
@@ -462,6 +466,27 @@ export function checkContainerBytes(
     ceiling,
     overCeiling,
     bannedHits: patterns.length ? [{ file: containerClaudeMdPath, patterns }] : [],
+    unscannable: [],
+  };
+}
+
+/** Repo-root CLAUDE.md ceiling + banned-pattern check. Returns null when clean. */
+export function checkTrunkDocBytes(
+  trunkClaudeMdPath: string,
+  ceiling = TRUNK_DOC_BYTES_CEILING,
+): InstructionStackBreach | null {
+  const content = fs.readFileSync(trunkClaudeMdPath, 'utf-8');
+  const bytes = Buffer.byteLength(content, 'utf-8');
+  const patterns = scanBannedPatterns(content);
+  const overCeiling = bytes > ceiling;
+  if (!overCeiling && patterns.length === 0) return null;
+  return {
+    metric: 'trunkDocBytes',
+    scope: 'CLAUDE.md',
+    bytes,
+    ceiling,
+    overCeiling,
+    bannedHits: patterns.length ? [{ file: trunkClaudeMdPath, patterns }] : [],
     unscannable: [],
   };
 }
@@ -908,11 +933,17 @@ export function checkEffectiveStackBytes(
   return breaches;
 }
 
-/** All three metrics together — the core L4 check. Kept as separate ceilings (never summed): a shared base file must not guarantee a false breach of every group's ceiling. */
-export function checkInstructionStack(containerClaudeMdPath: string, groupsRoot: string): InstructionStackBreach[] {
+/** All four metrics together — the core L4 check. Kept as separate ceilings (never summed): a shared base file must not guarantee a false breach of every group's ceiling. */
+export function checkInstructionStack(
+  containerClaudeMdPath: string,
+  groupsRoot: string,
+  trunkClaudeMdPath: string,
+): InstructionStackBreach[] {
   const containerBreach = checkContainerBytes(containerClaudeMdPath);
+  const trunkBreach = checkTrunkDocBytes(trunkClaudeMdPath);
   return [
     ...(containerBreach ? [containerBreach] : []),
+    ...(trunkBreach ? [trunkBreach] : []),
     ...checkGroupStandingBytes(groupsRoot),
     ...checkEffectiveStackBytes(groupsRoot),
   ];
@@ -933,8 +964,12 @@ export function instructionStackBreachKind(b: InstructionStackBreach): string {
   return 'pattern';
 }
 
-function detectInstructionStackBreaches(containerClaudeMdPath: string, groupsRoot: string): Breach[] {
-  return checkInstructionStack(containerClaudeMdPath, groupsRoot).map((b) => ({
+function detectInstructionStackBreaches(
+  containerClaudeMdPath: string,
+  groupsRoot: string,
+  trunkClaudeMdPath: string,
+): Breach[] {
+  return checkInstructionStack(containerClaudeMdPath, groupsRoot, trunkClaudeMdPath).map((b) => ({
     metric: `instructionStack:${b.metric}:${instructionStackBreachKind(b)}:${b.scope}`,
     todayValue: b.bytes,
     ruleDescription: describeInstructionStackBreach(b),
@@ -1052,6 +1087,7 @@ export function main(): number {
     const instructionStackBreaches = detectInstructionStackBreaches(
       path.join(REPO_ROOT, 'container', 'CLAUDE.md'),
       path.join(REPO_ROOT, 'groups'),
+      path.join(REPO_ROOT, 'CLAUDE.md'),
     );
 
     if (isWarmingUp(priorMetrics.length)) {
