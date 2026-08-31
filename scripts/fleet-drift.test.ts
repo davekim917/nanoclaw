@@ -17,11 +17,13 @@ import {
   countRecentErrorLines,
   scanBannedPatterns,
   checkContainerBytes,
+  checkTrunkDocBytes,
   checkGroupStandingBytes,
   checkEffectiveStackBytes,
   checkInstructionStack,
   instructionStackBreachKind,
   CONTAINER_BYTES_CEILING,
+  TRUNK_DOC_BYTES_CEILING,
   GROUP_STANDING_BYTES_CEILING,
   EFFECTIVE_STACK_BYTES_CEILING,
 } from './fleet-drift.js';
@@ -367,6 +369,37 @@ describe('checkContainerBytes', () => {
   });
 });
 
+describe('checkTrunkDocBytes', () => {
+  const TMP = '/tmp/nanoclaw-fleet-drift-trunk-doc-test';
+  const trunkPath = () => path.join(TMP, 'CLAUDE.md');
+
+  beforeEach(() => {
+    fs.rmSync(TMP, { recursive: true, force: true });
+    fs.mkdirSync(TMP, { recursive: true });
+  });
+  afterEach(() => fs.rmSync(TMP, { recursive: true, force: true }));
+
+  it('passes a clean file under the ceiling', () => {
+    fs.writeFileSync(trunkPath(), cleanContent(5000));
+    expect(checkTrunkDocBytes(trunkPath())).toBeNull();
+  });
+
+  it('flags a ceiling breach independently of any banned pattern', () => {
+    fs.writeFileSync(trunkPath(), cleanContent(TRUNK_DOC_BYTES_CEILING + 500));
+    const breach = checkTrunkDocBytes(trunkPath());
+    expect(breach?.metric).toBe('trunkDocBytes');
+    expect(breach?.overCeiling).toBe(true);
+    expect(breach?.bannedHits).toEqual([]);
+  });
+
+  it('flags a banned pattern even under the ceiling', () => {
+    fs.writeFileSync(trunkPath(), 'Fixed on 2026-08-31.\n');
+    const breach = checkTrunkDocBytes(trunkPath());
+    expect(breach?.overCeiling).toBe(false);
+    expect(breach?.bannedHits[0].patterns).toContain('iso_date');
+  });
+});
+
 describe('checkGroupStandingBytes', () => {
   const TMP = '/tmp/nanoclaw-fleet-drift-group-standing-test';
   const groupsRoot = () => path.join(TMP, 'groups');
@@ -590,20 +623,38 @@ describe('checkInstructionStack', () => {
   it('flags containerBytes and groupStandingBytes independently — a breaching shared base does not force every group over its own ceiling', () => {
     const containerPath = path.join(TMP, 'CLAUDE.md');
     fs.writeFileSync(containerPath, cleanContent(CONTAINER_BYTES_CEILING + 500));
+    const trunkPath = path.join(TMP, 'trunk-CLAUDE.md');
+    fs.writeFileSync(trunkPath, cleanContent(5000));
 
     const groupsRoot = path.join(TMP, 'groups');
     const g = path.join(groupsRoot, 'fine-group');
     fs.mkdirSync(g, { recursive: true });
     fs.writeFileSync(path.join(g, 'standing-instructions.md'), cleanContent(2000));
 
-    const breaches = checkInstructionStack(containerPath, groupsRoot);
+    const breaches = checkInstructionStack(containerPath, groupsRoot, trunkPath);
     expect(breaches).toHaveLength(1);
     expect(breaches[0].metric).toBe('containerBytes');
+  });
+
+  it('flags trunkDocBytes independently of containerBytes', () => {
+    const containerPath = path.join(TMP, 'CLAUDE.md');
+    fs.writeFileSync(containerPath, cleanContent(5000));
+    const trunkPath = path.join(TMP, 'trunk-CLAUDE.md');
+    fs.writeFileSync(trunkPath, cleanContent(TRUNK_DOC_BYTES_CEILING + 500));
+
+    const groupsRoot = path.join(TMP, 'groups');
+    fs.mkdirSync(groupsRoot, { recursive: true });
+
+    const breaches = checkInstructionStack(containerPath, groupsRoot, trunkPath);
+    expect(breaches).toHaveLength(1);
+    expect(breaches[0].metric).toBe('trunkDocBytes');
   });
 
   it('passes a post-prune-shaped tree: ~8KB base + 2-3KB personas does not self-breach', () => {
     const containerPath = path.join(TMP, 'CLAUDE.md');
     fs.writeFileSync(containerPath, cleanContent(8000));
+    const trunkPath = path.join(TMP, 'trunk-CLAUDE.md');
+    fs.writeFileSync(trunkPath, cleanContent(12000));
 
     const groupsRoot = path.join(TMP, 'groups');
     for (const [name, size] of [
@@ -617,7 +668,7 @@ describe('checkInstructionStack', () => {
       fs.writeFileSync(path.join(g, 'CLAUDE.local.md'), cleanContent(100));
     }
 
-    expect(checkInstructionStack(containerPath, groupsRoot)).toEqual([]);
+    expect(checkInstructionStack(containerPath, groupsRoot, trunkPath)).toEqual([]);
   });
 });
 
@@ -794,15 +845,17 @@ describe('checkEffectiveStackBytes', () => {
     expect(checkEffectiveStackBytes(groupsRoot())).toEqual([]);
   });
 
-  it('checkInstructionStack includes effectiveStackBytes breaches alongside the other two metrics', () => {
+  it('checkInstructionStack includes effectiveStackBytes breaches alongside the other metrics', () => {
     const containerPath = path.join(TMP, 'container-CLAUDE.md');
     fs.writeFileSync(containerPath, cleanContent(2000));
+    const trunkPath = path.join(TMP, 'trunk-CLAUDE.md');
+    fs.writeFileSync(trunkPath, cleanContent(5000));
     const g = path.join(groupsRoot(), 'combined-group');
     fs.mkdirSync(g, { recursive: true });
     writeContainerJson(g, 'codex');
     fs.writeFileSync(path.join(g, 'AGENTS.md'), cleanContent(EFFECTIVE_STACK_BYTES_CEILING + 1));
 
-    const breaches = checkInstructionStack(containerPath, groupsRoot());
+    const breaches = checkInstructionStack(containerPath, groupsRoot(), trunkPath);
     expect(breaches.some((b) => b.metric === 'effectiveStackBytes')).toBe(true);
   });
 });
