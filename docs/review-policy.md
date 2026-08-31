@@ -53,6 +53,23 @@ There is no round number that forbids a push. A high round count with
 severity falling is convergence; severity flat or rising across rounds means
 stop and diagnose out loud before touching code.
 
+## Fix discipline
+
+Accepting a finding authorizes the finding, not any fix. Two rules bind
+whoever writes the fix — a review loop, an auto-fix pass, a worker:
+
+- **Scope expansion escalates to a human.** If the honest fix adds machinery
+  (a new helper layer, flag, wrapper, config), a new dependency, or edits
+  outside the diff's existing footprint, it leaves the batch: post the
+  finding with the fix you would make and let a human route it onto this PR
+  or its own. Measured on this fleet (2026-08-31, last 20 merged PRs): 94%
+  of later-round findings landed on code fix commits had touched — the
+  fixes, not the original diffs, were generating the rounds.
+- **Simplification over machinery.** Prefer the fix that subtracts: tighten
+  an existing guard, hoist the check to the seam every caller shares, delete
+  the path the finding lives on. If no simplifying fix exists, that is a
+  design signal — escalate it, don't build around it.
+
 ## Do not report
 
 For reviewers (where we control the prompt) and triagers alike:

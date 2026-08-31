@@ -6,7 +6,8 @@
 #   codex-review.sh churn                     # files drawing findings across 3+ rounds — the churn detector
 #   codex-review.sh reply <comment_id> <text> # reply on that thread
 #   codex-review.sh resolve <thread_id>       # mark the thread resolved
-#   codex-review.sh status <sha> <since_iso>  # codex=<pending|clean|findings> open=<n> review=<n> reaction=<n>
+#   codex-review.sh status <sha> <since_iso>  # codex=<pending|clean|findings> open=<n> review=<n> reaction=<n> rounds=<n>
+#                                             # open/status print a STOP banner at rounds>=4 — diagnose, do not push
 #
 # The reviewer is `chatgpt-codex-connector` in GraphQL and
 # `chatgpt-codex-connector[bot]` in REST, so every login match here is a
@@ -42,9 +43,31 @@ threads() {
           | select(.comments.nodes[0].author.login | ascii_downcase | startswith("chatgpt-codex-connector"))'
 }
 
+# Distinct Codex reviews that produced findings — the PR's round count.
+# Printed on open/status so the number is impossible to not see; at 4+ the
+# banner mandates the stop-and-diagnose path in SKILL.md instead of a push.
+rounds_count() {
+  gh api --paginate --slurp "repos/$REPO/pulls/$PR/comments" \
+    | jq '[.[][] | select(.user.login | ascii_downcase | startswith("chatgpt-codex-connector")) | .pull_request_review_id] | unique | length'
+}
+
+rounds_banner() {
+  local n="$1"
+  if [ "$n" -ge 4 ]; then
+    {
+      echo "=================================================================="
+      echo "STOP: $n distinct review rounds on this PR. Do not push another"
+      echo "patch. Run 'codex-review.sh churn', name the one invariant the"
+      echo "findings are circling, and escalate per SKILL.md (round 4+ path)."
+      echo "=================================================================="
+    } >&2
+  fi
+}
+
 case "${1:?usage: open|churn|body|reply|resolve|status}" in
   open)
     # thread_id  comment_id  file:line  outdated?  severity  title
+    rounds_banner "$(rounds_count)"
     threads | jq -r '.comments.nodes[0] as $c
       | [ .id,
           ($c.databaseId | tostring),
@@ -60,7 +83,7 @@ case "${1:?usage: open|churn|body|reply|resolve|status}" in
     # reviews, which means the fixes are landing in the wrong place — see
     # "When the fixes are causing the findings" in SKILL.md.
     gh api --paginate --slurp "repos/$REPO/pulls/$PR/comments" \
-      | jq -r '[.[][] | select(.user.login | test("codex";"i"))]
+      | jq -r '[.[][] | select(.user.login | ascii_downcase | startswith("chatgpt-codex-connector"))]
           | group_by(.path)
           | map({ path: .[0].path,
                   rounds: ([.[].pull_request_review_id] | unique | length),
@@ -83,7 +106,7 @@ case "${1:?usage: open|churn|body|reply|resolve|status}" in
       -F id="${2:?thread id}" --jq '"resolved: \(.data.resolveReviewThread.thread.isResolved)"'
     ;;
   status)
-    # Prints: codex=<pending|clean|findings> open=<n> review=<n> reaction=<n>
+    # Prints: codex=<pending|clean|findings> open=<n> review=<n> reaction=<n> rounds=<n>
     #
     # `codex=` is only about whether the reviewer answered THIS commit; `open=`
     # is the separate merge gate. They are printed apart on purpose: a 👍 on a
@@ -98,11 +121,11 @@ case "${1:?usage: open|churn|body|reply|resolve|status}" in
     review=$(gh api --paginate --slurp "repos/$REPO/pulls/$PR/reviews" \
       | jq --arg sha "$sha" --arg since "$since" \
            '[.[][] | select(.commit_id | startswith($sha))
-                   | select(.user.login | test("codex";"i"))
+                   | select(.user.login | ascii_downcase | startswith("chatgpt-codex-connector"))
                    | select(.submitted_at > $since)] | length')
     reaction=$(gh api --paginate --slurp "repos/$REPO/issues/$PR/reactions" \
       | jq --arg since "$since" \
-           '[.[][] | select(.user.login | test("codex";"i"))
+           '[.[][] | select(.user.login | ascii_downcase | startswith("chatgpt-codex-connector"))
                    | select(.content == "+1")
                    | select(.created_at > $since)] | length')
     open_count=$(threads | grep -c . || true)
@@ -113,7 +136,9 @@ case "${1:?usage: open|churn|body|reply|resolve|status}" in
     else
       codex=pending
     fi
-    echo "codex=$codex open=$open_count review=$review reaction=$reaction"
+    rounds=$(rounds_count)
+    rounds_banner "$rounds"
+    echo "codex=$codex open=$open_count review=$review reaction=$reaction rounds=$rounds"
     ;;
   *) echo "unknown command: $1" >&2; exit 2 ;;
 esac
