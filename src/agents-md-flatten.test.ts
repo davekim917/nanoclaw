@@ -121,4 +121,28 @@ describe('flattenClaudeMd', () => {
     const file = write('CLAUDE.md', '  - bullet\n    - nested\n');
     expect(flattenClaudeMd(file)).toBe('  - bullet\n    - nested\n');
   });
+
+  // A caller reading from a container-writable directory (e.g. a fleet
+  // metrics job) can't trust an @-import target blind — see FlattenOptions.
+  // validateRead is the opt-in gate; compose's own calls never set it, so
+  // every test above (unaffected) is the "default unchanged" half of this
+  // contract, and this is the "gate actually skips the read" half.
+  it('validateRead can skip a read, replacing it with a comment marker instead of the content', () => {
+    const included = write('included.md', 'SHOULD_NOT_APPEAR\n');
+    const file = write('CLAUDE.md', 'TOP\n@./included.md\nEND\n');
+    const out = flattenClaudeMd(file, {
+      validateRead: (realPath) => (realPath === included ? 'blocked by test gate' : undefined),
+    });
+    expect(out).not.toContain('SHOULD_NOT_APPEAR');
+    expect(out).toMatch(/skipped.*blocked by test gate/);
+    expect(out).toContain('TOP');
+    expect(out).toContain('END');
+  });
+
+  it('validateRead also gates the top-level file, not just nested includes', () => {
+    const file = write('CLAUDE.md', 'SHOULD_NOT_APPEAR\n');
+    const out = flattenClaudeMd(file, { validateRead: () => 'blocked' });
+    expect(out).not.toContain('SHOULD_NOT_APPEAR');
+    expect(out).toMatch(/skipped/);
+  });
 });

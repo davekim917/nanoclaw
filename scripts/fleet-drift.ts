@@ -29,9 +29,14 @@
  *      resolved, shared files counted/flagged once fleet-wide) with a
  *      banned-pattern scan for dates/issue-refs/"Current Focus" headers, and
  *      per-group effectiveStackBytes ceiling on the FLATTENED composed doc a
- *      container agent actually receives (AGENTS.md when present, else
- *      flatten(CLAUDE.md) + CLAUDE.local.md) — size only, no pattern scan —
- *      see checkInstructionStack. docs/specs/instruction-stack-prune/plan.md.
+ *      container agent actually receives — provider-aware (container.json):
+ *      codex/opencode read their on-disk AGENTS.md directly (their harnesses
+ *      embed CLAUDE.local.md there at compose time); claude/default flatten
+ *      CLAUDE.md themselves and add CLAUDE.local.md's bytes on top, since
+ *      Claude Code auto-discovers it independently and AGENTS.md is only a
+ *      spawn-time snapshot that can miss a newer local edit. Size only, no
+ *      pattern scan — see checkInstructionStack.
+ *      docs/specs/instruction-stack-prune/plan.md.
  *   4. On breach, file one GitHub issue per breached metric on the origin repo
  *      via `gh`, labeled `fleet-drift`. An already-open issue whose title
  *      starts with `fleet-drift: <metric>` suppresses re-filing — the open
@@ -520,14 +525,20 @@ function resolveStandingFile(p: string, groupsRootResolved: string): { realPath:
     realPath = target;
   }
 
-  if (!stat.isFile()) return { skip: 'not a regular file' };
-  if (stat.size > MAX_STANDING_FILE_BYTES)
-    return { skip: `exceeds ${MAX_STANDING_FILE_BYTES} B safety cap (${stat.size} B)` };
-  return { realPath };
+  const check = checkRegularSize(stat);
+  return check.ok ? { realPath } : { skip: check.reason };
 }
 
 /** ponytail: sanity cap, not a precision limit — 100x+ the real ceiling is plenty of headroom for any legitimate standing file, small enough that a planted huge file/device is never read into memory. */
 const MAX_STANDING_FILE_BYTES = 1_000_000;
+
+/** Shared tail check for every safety gate in this file: given an already-obtained `Stats`, is it a regular file under the size cap? */
+function checkRegularSize(stat: fs.Stats): { ok: true } | { ok: false; reason: string } {
+  if (!stat.isFile()) return { ok: false, reason: 'not a regular file' };
+  if (stat.size > MAX_STANDING_FILE_BYTES)
+    return { ok: false, reason: `exceeds ${MAX_STANDING_FILE_BYTES} B safety cap (${stat.size} B)` };
+  return { ok: true };
+}
 
 /** Reads one group's standing files, resolving symlinks to their real target so a shared file is read (and counted) once. Unsafe candidates are skipped, never read. */
 function readGroupStandingFiles(
@@ -680,20 +691,127 @@ const COMPOSE_CONTAINER_TO_HOST = (repoRoot: string): Record<string, string> => 
 });
 
 /**
+ * Which provider actually reads this group's composed doc, read from
+ * `groups/<g>/container.json` (container-writable, so gated the same way as
+ * any standing file). Absent field, absent file, or `'default'` all mean
+ * claude — mirrors `resolveProviderName`'s container-config half
+ * (`src/db/container-configs.ts`) without needing the session-level override
+ * that only exists at spawn time. A present-but-unsafe or malformed file
+ * returns `skip` rather than guessing: source selection depends on this, so
+ * an unreadable provider must block measurement, not silently default.
+ */
+function readGroupProvider(groupDir: string, groupsRootResolved: string): { provider: string } | { skip: string } {
+  const p = path.join(groupDir, 'container.json');
+  const resolved = resolveStandingFile(p, groupsRootResolved);
+  if (resolved === null) return { provider: 'claude' }; // no container.json — default
+  if ('skip' in resolved) return { skip: resolved.skip };
+
+  let content: string;
+  try {
+    content = fs.readFileSync(resolved.realPath, 'utf-8');
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return { skip: 'container.json vanished mid-scan' };
+    throw err;
+  }
+
+  let raw: unknown;
+  try {
+    raw = JSON.parse(content);
+  } catch (err) {
+    // Content error (bad JSON), not an infra error — always a skip, never rethrown.
+    return { skip: `malformed container.json: ${err instanceof Error ? err.message : String(err)}` };
+  }
+  const rawProvider =
+    raw && typeof raw === 'object' && typeof (raw as { provider?: unknown }).provider === 'string'
+      ? (raw as { provider: string }).provider
+      : '';
+  return { provider: (rawProvider || 'claude').toLowerCase() };
+}
+
+/**
+ * `flattenClaudeMd`'s `validateRead` gate for one group's @-import chain.
+ * `groups/<g>/` is container-writable, so a nested import is exactly as
+ * untrusted as a top-level standing file — the same FIFO-hang /
+ * huge-file-memory / trust-boundary-escape vectors apply to every hop of
+ * the chain, not just the file `flattenClaudeMd` was first pointed at.
+ * Allowed roots: the group's own tree (legitimate cross-group persona
+ * symlinks) plus the known host-side prefixes compose's own containerToHost
+ * map translates to (the shared base, skills, mcp-tools instructions —
+ * host-controlled, not container-writable, but still real-file/size-capped
+ * for consistency). Violations are recorded into `unscannable` via closure
+ * so the caller can report them; the flattener gets back only a reason
+ * string to inline as its own skip marker.
+ */
+function makeFlattenGuard(
+  group: string,
+  allowedRoots: string[],
+  unscannable: UnscannableFile[],
+): (realPath: string) => string | undefined {
+  return (realPath: string) => {
+    let lst: fs.Stats;
+    try {
+      lst = fs.lstatSync(realPath);
+    } catch (err) {
+      // Missing target = a stale/dangling @-import — not a security issue,
+      // let flattenClaudeMd's own "failed to read" marker handle it.
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+      throw err;
+    }
+    if (lst.isSymbolicLink()) {
+      // resolveSymlinkChain (agents-md-flatten.ts) already tried to resolve
+      // this and gave up — either the target is genuinely dangling (benign:
+      // e.g. a stale fragment symlink pointing at a source file a later
+      // trunk change deleted) or it resolves to something non-regular like
+      // a FIFO (unsafe: reading it would hang). Both land here identically
+      // because resolveSymlinkChain's translation step (container-path
+      // prefixes aren't real host paths) means a plain follow-up stat can't
+      // tell them apart without redoing that translation.
+      //
+      // ponytail: treat both as unscannable rather than reimplementing
+      // resolveSymlinkChain's translation-aware resolution a second time
+      // just to split "dangling" from "unsafe" — safe either way (never
+      // read), and a dangling fragment symlink is itself a real staleness
+      // signal this tripwire wants surfaced. Upgrade path if the dangling
+      // case turns out to be common/noisy enough to want quieted: export
+      // resolveSymlinkChain (or a variant that reports why it gave up) from
+      // agents-md-flatten.ts and call it here instead of this lstat check.
+      const reason = 'symlink does not resolve to a readable regular file (dangling target or non-regular type)';
+      unscannable.push({ group, path: realPath, reason });
+      return reason;
+    }
+    const check = checkRegularSize(lst);
+    if (!check.ok) {
+      unscannable.push({ group, path: realPath, reason: check.reason });
+      return check.reason;
+    }
+    const contained = allowedRoots.some((root) => realPath === root || realPath.startsWith(root + path.sep));
+    if (!contained) {
+      const reason = `import escapes the trusted set (-> ${realPath})`;
+      unscannable.push({ group, path: realPath, reason });
+      return reason;
+    }
+    return undefined;
+  };
+}
+
+/**
  * The bytes one group's container agent actually receives as its always-on
- * project doc — not just the authored top-level file. For a group with an
- * on-disk AGENTS.md, that file already IS the flattened artifact (every
- * provider gets one; `composeGroupClaudeMd` writes it regardless of which
- * provider the group runs, and its content is provider-agnostic since Claude
- * groups compose the same way minus provider-gated fragments). Only when
- * AGENTS.md is absent (group never spawned, or cleaned) do we fall back to
- * flattening CLAUDE.md ourselves and adding CLAUDE.local.md's bytes on top —
- * Claude Code auto-discovers CLAUDE.local.md independently of the @-import
- * chain, so it is never embedded in CLAUDE.md itself.
+ * project doc — not just the authored top-level file. Source depends on
+ * which harness actually reads it (container.json's `provider`):
  *
- * Returns bytes: null when the group has no composed doc on disk at all
- * (not a breach — just nothing to measure yet, same convention as an absent
- * standing file).
+ * - codex/opencode: their harnesses don't auto-discover CLAUDE.local.md —
+ *   compose embeds it raw into AGENTS.md at spawn time, so AGENTS.md alone
+ *   IS the complete artifact.
+ * - claude/default: Claude Code resolves CLAUDE.md's @-imports itself and
+ *   auto-discovers CLAUDE.local.md independently — neither is embedded in
+ *   AGENTS.md's generation inputs in a way that stays current for Claude,
+ *   and AGENTS.md is only regenerated at spawn time, so it can miss a
+ *   CLAUDE.local.md edited since. Flatten CLAUDE.md ourselves and add
+ *   CLAUDE.local.md's bytes on top instead of trusting the snapshot.
+ *
+ * Returns bytes: null when nothing can be measured (never spawned, or the
+ * provider itself couldn't be safely read) — not a breach on its own; an
+ * unsafe file along the way is reported via `unscannable` separately.
  */
 function measureEffectiveStack(
   groupDir: string,
@@ -702,9 +820,16 @@ function measureEffectiveStack(
   const group = path.basename(groupDir);
   const unscannable: UnscannableFile[] = [];
 
-  const agentsPath = path.join(groupDir, 'AGENTS.md');
-  const agents = resolveStandingFile(agentsPath, groupsRootResolved);
-  if (agents !== null) {
+  const providerResult = readGroupProvider(groupDir, groupsRootResolved);
+  if ('skip' in providerResult) {
+    unscannable.push({ group, path: path.join(groupDir, 'container.json'), reason: providerResult.skip });
+    return { bytes: null, unscannable };
+  }
+
+  if (providerResult.provider === 'codex' || providerResult.provider === 'opencode') {
+    const agentsPath = path.join(groupDir, 'AGENTS.md');
+    const agents = resolveStandingFile(agentsPath, groupsRootResolved);
+    if (agents === null) return { bytes: null, unscannable }; // never spawned — nothing composed yet
     if ('skip' in agents) {
       unscannable.push({ group, path: agentsPath, reason: agents.skip });
       return { bytes: null, unscannable };
@@ -713,7 +838,7 @@ function measureEffectiveStack(
     return { bytes: Buffer.byteLength(content, 'utf-8'), unscannable };
   }
 
-  // No AGENTS.md — fall back to flattening CLAUDE.md + CLAUDE.local.md.
+  // claude / default — flatten CLAUDE.md ourselves; never trust AGENTS.md's snapshot for this provider.
   const claudeMdPath = path.join(groupDir, 'CLAUDE.md');
   const claudeMd = resolveStandingFile(claudeMdPath, groupsRootResolved);
   if (claudeMd === null) return { bytes: null, unscannable }; // never spawned — nothing composed yet
@@ -722,8 +847,12 @@ function measureEffectiveStack(
     return { bytes: null, unscannable };
   }
 
+  const repoRoot = path.resolve(groupsRootResolved, '..');
+  const containerToHost = COMPOSE_CONTAINER_TO_HOST(repoRoot);
+  const allowedRoots = [groupsRootResolved, ...Object.values(containerToHost)];
   const flattened = flattenClaudeMd(claudeMd.realPath, {
-    containerToHost: COMPOSE_CONTAINER_TO_HOST(path.resolve(groupsRootResolved, '..')),
+    containerToHost,
+    validateRead: makeFlattenGuard(group, allowedRoots, unscannable),
   });
   let bytes = Buffer.byteLength(flattened, 'utf-8');
 
