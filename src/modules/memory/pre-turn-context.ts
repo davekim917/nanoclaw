@@ -223,6 +223,47 @@ function preferenceStemMatches(stem: string, senderSlug: string): boolean {
   return stem === senderSlug || senderSlug.startsWith(`${stem}-`) || stem.startsWith(`${senderSlug}-`);
 }
 
+export interface PreferenceFrontmatter {
+  ids: string[];
+  body: string;
+}
+
+/**
+ * Parses the optional leading frontmatter of a `preferences/<slug>.md` file
+ * declaring the person's platform sender ids:
+ *
+ *   ---
+ *   ids: [U0TEST111AAA, U0TEST222BBB]
+ *   ---
+ *   # body...
+ *
+ * Deliberately NOT a YAML parser — this grammar is one line long: a literal
+ * `---\n` fence, one `ids: [...]` bracket-list line (entries trimmed, empties
+ * ignored), a closing `---\n` fence. Anything that doesn't match that exact
+ * shape (no opening fence, no `ids:` line, no closing fence) is treated as
+ * absent frontmatter: `ids` empty, `body` the full original content,
+ * unchanged. Never throws.
+ */
+export function parsePreferenceFrontmatter(content: string): PreferenceFrontmatter {
+  const OPEN = '---\n';
+  if (!content.startsWith(OPEN)) return { ids: [], body: content };
+  const idsLineEnd = content.indexOf('\n', OPEN.length);
+  if (idsLineEnd === -1) return { ids: [], body: content };
+  const idsLine = content.slice(OPEN.length, idsLineEnd);
+  const idsMatch = idsLine.match(/^ids:\s*\[([^\]]*)\]\s*$/);
+  if (!idsMatch) return { ids: [], body: content };
+  const afterIdsLine = idsLineEnd + 1;
+  const CLOSE = '---\n';
+  if (content.slice(afterIdsLine, afterIdsLine + CLOSE.length) !== CLOSE) {
+    return { ids: [], body: content };
+  }
+  const ids = idsMatch[1]!
+    .split(',')
+    .map((entry) => entry.trim())
+    .filter((entry) => entry.length > 0);
+  return { ids, body: content.slice(afterIdsLine + CLOSE.length) };
+}
+
 function extractSenderName(normalizedContent: string): string | null {
   try {
     const parsed = JSON.parse(normalizedContent) as { sender?: unknown };
@@ -230,6 +271,103 @@ function extractSenderName(normalizedContent: string): string | null {
   } catch {
     return null;
   }
+}
+
+/**
+ * Extracts the triggering message's sender id from normalized content — same
+ * shapes `container/agent-runner/src/formatter.ts:161` (extractSenderId) and
+ * `src/modules/permissions/index.ts:84-96` (extractAndUpsertUser) already
+ * parse: top-level `senderId` string, else nested `author.userId` string.
+ * Absence or a parse failure returns null, same permissiveness as
+ * extractSenderName above. Unlike those two call sites this id is used
+ * as-is, NOT namespaced with a channel-type prefix — it is typically the RAW
+ * platform id (unnamespaced), and readMemoryEvidence's id tier deliberately
+ * routes an unnamespaced id through the raw (bare-entry) map, keyed by the
+ * id with the CURRENT conversation's verified channel_type prefix stripped —
+ * see stripVerifiedPrefix.
+ */
+function extractSenderId(normalizedContent: string): string | null {
+  try {
+    const parsed = JSON.parse(normalizedContent) as { senderId?: unknown; author?: unknown };
+    if (typeof parsed.senderId === 'string' && parsed.senderId.trim().length > 0) return parsed.senderId.trim();
+    const author = parsed.author;
+    const userId = author && typeof author === 'object' ? (author as { userId?: unknown }).userId : undefined;
+    return typeof userId === 'string' && userId.trim().length > 0 ? userId.trim() : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Looks up the CURRENT messaging group's channel_type ONCE per build, for
+ * reuse by both trigger-sender namespacing (namespaceTriggerSenderId) and
+ * verified-prefix stripping (stripVerifiedPrefix) in buildPreTurnContext and
+ * readMemoryEvidence's id tier. A lookup failure (missing row, closed DB) or
+ * a null messagingGroupId degrades to null: every caller treats a null
+ * channelType as "no verified namespace for this conversation" and skips
+ * stripping/prefixing rather than throwing.
+ */
+function lookupChannelType(db: ReturnType<typeof getDb>, messagingGroupId: string | null): string | null {
+  if (!messagingGroupId) return null;
+  try {
+    const row = db.prepare('SELECT channel_type FROM messaging_groups WHERE id = ?').get(messagingGroupId) as
+      | { channel_type: string }
+      | undefined;
+    return row ? row.channel_type : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Strips ONLY a VERIFIED namespace prefix — `${channelType}:` for the
+ * CURRENT conversation's channel_type — and only when `id` actually starts
+ * with it; otherwise `id` is returned completely unchanged.
+ *
+ * This replaces the old "strip everything before the LAST colon" rule
+ * (rawIdSuffix, removed — PR #221 round 4). That rule was unsound: a raw
+ * platform handle can itself contain a colon (Matrix: `@alice:matrix.org`),
+ * and `extractAndUpsertUser` (src/modules/permissions/index.ts:96-99) stores
+ * such a handle UN-prefixed (no leading `channelType:`) because it already
+ * "looks namespaced". Suffixing at the last colon then collapsed two
+ * DIFFERENT people on different homeservers — `@alice:matrix.org` and
+ * `@bob:matrix.org` — to the same "matrix.org" suffix, letting a bare
+ * `ids: [matrix.org]` entry match a whole homeserver and letting an
+ * unrelated archived participant suppress the trigger-fallback group.
+ *
+ * Only the id's OWN verified prefix may be removed. A colon-bearing id that
+ * does not start with `${channelType}:` is left whole, colon and all, and
+ * must NOT be treated as if it had a strippable namespace.
+ */
+function stripVerifiedPrefix(id: string, channelType: string | null): string {
+  if (channelType === null) return id;
+  const prefix = `${channelType}:`;
+  return id.startsWith(prefix) ? id.slice(prefix.length) : id;
+}
+
+/**
+ * Namespaces the trigger-fallback sender id the same way `extractAndUpsertUser`
+ * (src/modules/permissions/index.ts:99) namespaces an archived one: an id
+ * that already contains a colon is left as-is, otherwise it is prefixed with
+ * the CURRENT messaging group's channel_type (`${channelType}:${rawId}`).
+ * `channelType` is the value `lookupChannelType` already resolved once in
+ * buildPreTurnContext — this function does no DB access of its own.
+ *
+ * extractSenderId returns the RAW platform id off the wire (e.g. `U123`),
+ * unlike an archived row's sender_id which is already namespaced at write
+ * time. Without this, the fallback group's senderId could only ever hit
+ * readMemoryEvidence's raw (bare-entry) map — never a file's namespace-exact
+ * `ids: [discord:U123]` declaration. Namespacing it here makes it hit the
+ * exact map first, and stripping its own (now-present) verified prefix still
+ * hits the raw map as before — no change needed on the lookup side.
+ *
+ * A null channelType (lookup failure, or no current messaging group)
+ * degrades to the raw id rather than throwing: worst case is falling back to
+ * raw (bare-entry) matching, not losing the fallback group's id entirely.
+ */
+function namespaceTriggerSenderId(rawId: string | null, channelType: string | null): string | null {
+  if (rawId === null || rawId.includes(':') || !channelType) return rawId;
+  return `${channelType}:${rawId}`;
 }
 const TRUNCATED_MARKDOWN_FILE = '\n[truncated:markdown-file]';
 const TRUNCATED_MARKDOWN_EXCERPT = '\n[truncated:markdown-excerpt]';
@@ -1118,6 +1256,52 @@ function listDirectMarkdownStems(root: string, dir: string, notices: ContextNoti
   return stems;
 }
 
+export interface InvolvedSenderGroup {
+  /** Archive's stable sender_id for this person, or null for the trigger-sender fallback group. */
+  senderId: string | null;
+  /** Per-message display name and, when resolved and different, the canonical users.display_name. */
+  aliases: readonly string[];
+}
+
+/**
+ * Module-level mtime+size cache of one `preferences/<stem>.md` file's
+ * declared `ids:` frontmatter, keyed by absolute path. Before this cache,
+ * readMemoryEvidence's id-index tier read every preferences/ file (up to
+ * markdownFileBytes each) on EVERY admissible turn just to build
+ * exactIdToRelative/rawIdToRelative — steady-state cost scaled with the
+ * number of files in the directory regardless of whether anything changed.
+ * A cache hit now costs one `fs.lstatSync`; a miss (new file, or an
+ * mtime/size change) falls through to the existing `readPreferenceFile`
+ * read, same as before.
+ *
+ * Only the frontmatter IDS ride this cache. The excerpt-build loop further
+ * down, for whichever files end up MATCHED to a sender, still reads fresh
+ * content every turn through `readPreferenceFile` (that function's own
+ * per-turn Map, unaffected by this one) — correctness of the injected TEXT
+ * is unchanged; only the id lookup used to DECIDE which files match by id is
+ * now cached across turns.
+ *
+ * (mtimeMs, size) is the change-detection key, not a content hash — hashing
+ * would defeat the point, since it requires reading the very bytes this
+ * cache exists to avoid reading. A same-mtime-same-size in-place edit is
+ * therefore an accepted staleness window: file writes are sub-second and
+ * `write_memory_file` (the only writer of these files) always rewrites the
+ * whole file rather than patching it in place, which moves mtime every time.
+ *
+ * Not swept for deleted files: a stale entry for a since-deleted path is
+ * never looked up again (its stem no longer appears in a directory listing
+ * unless the filename is recreated, and a recreated file's fresh write moves
+ * mtime, which invalidates the entry naturally) — one leaked Map slot per
+ * since-deleted file is cheaper than eagerly diffing the whole cache against
+ * every turn's listing.
+ */
+const PREFERENCE_ID_CACHE = new Map<string, { mtimeMs: number; size: number; ids: string[] }>();
+
+/** Test seam: clears the cache between test cases that reuse fixture paths. */
+export function _resetPreferenceIdCacheForTest(): void {
+  PREFERENCE_ID_CACHE.clear();
+}
+
 export function readMemoryEvidence(
   root: string,
   workgroupId: string,
@@ -1125,7 +1309,12 @@ export function readMemoryEvidence(
   includeBootstrap: boolean,
   seenEvidenceFingerprints: ReadonlySet<string>,
   bypassDedupe: boolean,
-  involvedSenders: ReadonlyArray<readonly string[]> = [],
+  involvedSenders: ReadonlyArray<InvolvedSenderGroup> = [],
+  /** CURRENT conversation's verified channel_type, threaded from
+   * buildPreTurnContext's single lookupChannelType call. Default null means
+   * "no verified namespace" — stripVerifiedPrefix then never strips, so a
+   * bare `ids:` entry only ever matches a genuinely colon-free sender_id. */
+  channelType: string | null = null,
 ): PreTurnContext['memoryEvidence'] {
   if (!fs.existsSync(root)) throw new Error(`canonical memory tree missing: ${root}`);
   const canonicalRoot = fs.realpathSync(root);
@@ -1156,21 +1345,34 @@ export function readMemoryEvidence(
   }
 
   // Deterministic per-person preference lane. Files under preferences/ are
-  // keyed by name slug and injected whole for the conversation's involved
-  // senders. ONE FILE PER PERSON, never per alias: `involvedSenders` groups
-  // each participant's aliases (their per-message display name and, when
-  // resolved, set and different, their canonical `users.display_name`) so a
-  // platform rename can't leave BOTH the pre-rename and post-rename
-  // preference file injected as conflicting guidance for the same human. For
-  // each group, aliases are tried IN ORDER — per-message name first,
-  // canonical name as fallback, preserving pre-PR behavior when both files
-  // happen to exist — using the exact-slug-wins-else-longest-stem rule below;
-  // the first alias that claims an unclaimed file wins and the group stops
-  // looking. An alias matching a file an earlier group already claimed falls
-  // through to the next alias — that file belongs to the other person.
-  // Never lexically ranked, so a preference cannot lose a relevance contest
-  // to unrelated memory. Reads run before the ranked scan so the shared byte
-  // budget cannot starve them.
+  // keyed by name slug (or, when the file declares an `ids:` frontmatter
+  // block, by explicit platform sender id) and injected whole for the
+  // conversation's involved senders. Selection tier, in order: (1) explicit
+  // `ids:` frontmatter — a file whose declared ids include the group's
+  // sender_id wins outright and skips name matching entirely; (2) per-message
+  // display name; (3) canonical `users.display_name`. ONE FILE PER PERSON,
+  // never per alias: `involvedSenders` groups each participant's aliases
+  // (their per-message display name and, when resolved, set and different,
+  // their canonical `users.display_name`) so a platform rename can't leave
+  // BOTH the pre-rename and post-rename preference file injected as
+  // conflicting guidance for the same human. For each group, name aliases are
+  // tried IN ORDER — per-message name first, canonical name as fallback,
+  // preserving pre-PR behavior when both files happen to exist — using the
+  // exact-slug-wins-else-longest-stem rule below; the first alias that claims
+  // an unclaimed file wins and the group stops looking. An alias matching a
+  // file an earlier group already claimed falls through to the next alias
+  // for a name match — that file belongs to the other person. An id match is
+  // terminal for its group instead: a resolved id stops the group right
+  // there, claiming the file if unclaimed and contributing nothing if
+  // another group already claimed it — it NEVER falls through to name/alias
+  // matching. This is what stops a human declared under two raw ids in one
+  // file (e.g. an old and a new platform id for the same person,
+  // `ids: [U1, U2]`, each matched by stripping the CURRENT conversation's
+  // verified channel_type prefix — see stripVerifiedPrefix) from having
+  // their second, already-resolved group also pick up a second, stale
+  // name-matched file for the same person. Never lexically ranked, so a
+  // preference cannot lose a relevance contest to unrelated memory. Reads
+  // run before the ranked scan so the shared byte budget cannot starve them.
   const preferenceExcerpts: MemoryEvidenceExcerpt[] = [];
   if (involvedSenders.length > 0) {
     const preferenceStems = listDirectMarkdownStems(root, PREFERENCES_DIR, notices);
@@ -1184,11 +1386,171 @@ export function readMemoryEvidence(
         .sort((a, b) => b.length - a.length || compareCodepoint(a, b));
       return compatible[0];
     };
+    // Every preferences/ file is read AT MOST ONCE per turn, cached here —
+    // the id tier below needs each file's frontmatter to build the id map,
+    // and the selection loop further down needs the same file's content
+    // (for a matched file) to build the injected excerpt. Caching (rather
+    // than reading twice) also keeps a read FAILURE a one-time event: without
+    // it, a file whose read throws once (e.g. the security check in
+    // `readBoundedFile` rejecting a symlink-swapped ancestor) would silently
+    // succeed on a second, unrelated read attempt and the resulting
+    // `preference-read-failed` notice would never fire.
+    const preferenceFileReads = new Map<string, { content: string } | { error: unknown }>();
+    const readPreferenceFile = (relative: string): { content: string } | { error: unknown } => {
+      const cached = preferenceFileReads.get(relative);
+      if (cached) return cached;
+      let result: { content: string } | { error: unknown };
+      try {
+        result = { content: readBoundedFile(path.join(root, relative), canonicalRoot).content };
+      } catch (error) {
+        result = { error };
+      }
+      preferenceFileReads.set(relative, result);
+      return result;
+    };
+    // Reported at most once per file per turn — the id-index loop below
+    // attempts every preferences/ file regardless of whether it ends up
+    // matched, and the excerpt-build loop further down re-reads the same
+    // (cached) result for whichever subset got matched by name, so without
+    // this guard a file reached by both would surface two notices for one
+    // failure.
+    const reportedReadFailures = new Set<string>();
+    const reportReadFailure = (relative: string, error: unknown): void => {
+      if (reportedReadFailures.has(relative)) return;
+      reportedReadFailures.add(relative);
+      notices.push({
+        source: 'markdown',
+        status: 'degraded',
+        code: 'preference-read-failed',
+        detail: `${relative}: ${error instanceof Error ? error.message : String(error)}`,
+      });
+    };
+    // Explicit-id tier: index every preferences/ file's declared ids. An
+    // entry WITHOUT a colon (a "bare" entry) matches a sender_id with the
+    // CURRENT conversation's VERIFIED channel_type prefix stripped
+    // (stripVerifiedPrefix) — one entry covers every conversation in this
+    // channel, but NOT an arbitrary other namespace; an entry WITH a colon
+    // must equal the full sender_id exactly. Every file is attempted here
+    // regardless of whether any sender later matches it by name, so a read
+    // failure is reported even for a file "matches nothing by name" would
+    // otherwise never reach.
+    //
+    // Ids ride PREFERENCE_ID_CACHE (mtime+size keyed) instead of a full read
+    // every turn — see that Map's doc comment above. `fs.lstatSync`, not
+    // `fs.statSync`, mirrors readBoundedFile's O_NOFOLLOW leaf semantics: a
+    // leaf swapped to a symlink since the last successful read reports
+    // `isFile() === false` here exactly as O_NOFOLLOW would refuse to open
+    // it there, so a swapped leaf never satisfies a cache hit and always
+    // falls through to the fully safety-checked readPreferenceFile read
+    // below — same as an ordinary (uncached) miss.
+    const frontmatterIds = (relative: string): string[] | undefined => {
+      const absolute = path.join(root, relative);
+      let stat: fs.Stats | undefined;
+      try {
+        stat = fs.lstatSync(absolute);
+      } catch {
+        stat = undefined;
+      }
+      if (stat?.isFile()) {
+        const cached = PREFERENCE_ID_CACHE.get(absolute);
+        if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) return cached.ids;
+      } else {
+        // Gone, or no longer a plain file (e.g. symlink-swapped) — never
+        // trust a stale entry for this path; let the read below produce
+        // (and report) the real failure.
+        PREFERENCE_ID_CACHE.delete(absolute);
+      }
+      const read = readPreferenceFile(relative);
+      if (!('content' in read)) {
+        // Never cached on failure — retried fresh next turn, same as every
+        // other read failure in this lane.
+        reportReadFailure(relative, read.error);
+        return undefined;
+      }
+      const ids = parsePreferenceFrontmatter(read.content).ids;
+      if (stat?.isFile()) PREFERENCE_ID_CACHE.set(absolute, { mtimeMs: stat.mtimeMs, size: stat.size, ids });
+      return ids;
+    };
+    // Duplicate declarations of the same id across DIFFERENT files are
+    // ambiguous. Map.set used to let the lexically-last stem silently win —
+    // collect every (id -> declaring files) pair first instead. An id
+    // declared by more than one distinct file is blacklisted from id
+    // matching entirely (both files lose it, one degraded notice per
+    // conflicting id per turn); affected senders fall back to name matching,
+    // same as a file with no ids: frontmatter at all. A Set per id absorbs
+    // the same file declaring an id twice (not a conflict) without
+    // over-counting.
+    const exactDeclarations = new Map<string, Set<string>>();
+    const rawDeclarations = new Map<string, Set<string>>();
+    for (const stem of preferenceStems) {
+      const relative = `${PREFERENCES_DIR}${stem}.md`;
+      const ids = frontmatterIds(relative);
+      if (ids === undefined) continue;
+      for (const id of ids) {
+        const declarations = id.includes(':') ? exactDeclarations : rawDeclarations;
+        const files = declarations.get(id);
+        if (files) files.add(relative);
+        else declarations.set(id, new Set([relative]));
+      }
+    }
+    const exactIdToRelative = new Map<string, string>();
+    const rawIdToRelative = new Map<string, string>();
+    const claimUnconflicted = (declarations: Map<string, Set<string>>, target: Map<string, string>): void => {
+      for (const [id, files] of declarations) {
+        if (files.size > 1) {
+          notices.push({
+            source: 'markdown',
+            status: 'degraded',
+            code: 'preference-id-conflict',
+            detail: `id "${id}" declared by multiple preference files (${[...files].join(', ')}); ignored for id matching`,
+          });
+          continue;
+        }
+        target.set(id, [...files][0]!);
+      }
+    };
+    claimUnconflicted(exactDeclarations, exactIdToRelative);
+    claimUnconflicted(rawDeclarations, rawIdToRelative);
     const selectedRelatives = new Set<string>();
     const matched: string[] = [];
     for (const group of involvedSenders) {
       if (matched.length >= PRE_TURN_BOUNDS.preferenceExcerpts) break;
-      for (const alias of group) {
+
+      // Explicit id match wins over name/alias matching. Exact namespaced id
+      // first (full sender_id string, unaffected by channelType), then the
+      // raw (bare-entry) tier — but ONLY when stripVerifiedPrefix actually
+      // removed the CURRENT conversation's verified channel_type prefix, or
+      // the id was already colon-free to begin with. A colon-bearing id that
+      // does NOT start with the verified prefix (a Matrix-style raw handle
+      // whose own colon isn't a namespace separator, or a sibling bot's
+      // differently-namespaced sender_id) is left whole and must NOT reach
+      // the raw map — that would resurrect the last-colon-suffix bug this id
+      // tier exists to avoid (PR #221 round 4).
+      let idRelative: string | undefined;
+      if (group.senderId !== null) {
+        idRelative = exactIdToRelative.get(group.senderId);
+        if (idRelative === undefined) {
+          const stripped = stripVerifiedPrefix(group.senderId, channelType);
+          const verifiedOrColonFree = stripped !== group.senderId || !group.senderId.includes(':');
+          if (verifiedOrColonFree) {
+            idRelative = rawIdToRelative.get(stripped);
+          }
+        }
+      }
+      if (idRelative !== undefined) {
+        // Terminal for this group either way: claim the file if unclaimed,
+        // or contribute nothing if an earlier group already claimed it — an
+        // id resolution is never a reason to fall through to name matching
+        // (see the lane comment above for the shared-raw-id case this
+        // prevents).
+        if (!selectedRelatives.has(idRelative)) {
+          selectedRelatives.add(idRelative);
+          matched.push(idRelative);
+        }
+        continue;
+      }
+
+      for (const alias of group.aliases) {
         const slug = preferenceSlug(alias);
         if (slug.length === 0) continue;
         const stem = matchStem(slug);
@@ -1205,30 +1567,29 @@ export function readMemoryEvidence(
       }
     }
     for (const relative of matched.slice(0, PRE_TURN_BOUNDS.preferenceExcerpts)) {
-      try {
-        const read = readBoundedFile(path.join(root, relative), canonicalRoot);
-        const text = boundedText(read.content, PRE_TURN_BOUNDS.preferenceExcerptChars, TRUNCATED_MARKDOWN_EXCERPT);
-        preferenceExcerpts.push({
-          path: relative,
-          headings: headingsOf(read.content),
-          text,
-          score: Number.MAX_SAFE_INTEGER,
-          fingerprint: evidenceFingerprint(
-            'workgroup-memory-canon',
-            workgroupId,
-            `${relative}\0${sha256(text)}`,
-            read.content,
-          ),
-          provenance: { authority: 'workgroup-memory-canon', workgroupId },
-        });
-      } catch (error) {
-        notices.push({
-          source: 'markdown',
-          status: 'degraded',
-          code: 'preference-read-failed',
-          detail: `${relative}: ${error instanceof Error ? error.message : String(error)}`,
-        });
+      const read = readPreferenceFile(relative);
+      if ('error' in read) {
+        // Already reported by the id-index loop above for every stem
+        // (matched or not) — reportReadFailure's dedupe means this only
+        // actually pushes a (second) notice if that invariant ever breaks.
+        reportReadFailure(relative, read.error);
+        continue;
       }
+      const { body } = parsePreferenceFrontmatter(read.content);
+      const text = boundedText(body, PRE_TURN_BOUNDS.preferenceExcerptChars, TRUNCATED_MARKDOWN_EXCERPT);
+      preferenceExcerpts.push({
+        path: relative,
+        headings: headingsOf(body),
+        text,
+        score: Number.MAX_SAFE_INTEGER,
+        fingerprint: evidenceFingerprint(
+          'workgroup-memory-canon',
+          workgroupId,
+          `${relative}\0${sha256(text)}`,
+          read.content,
+        ),
+        provenance: { authority: 'workgroup-memory-canon', workgroupId },
+      });
     }
     if (preferenceExcerpts.length > 0) {
       notices.push({
@@ -1508,6 +1869,10 @@ export function buildPreTurnContext(input: PreTurnContextInput): PreTurnContext 
   const currentMessagingGroupId =
     input.messagingGroupId === undefined ? scope.messaging_group_id : input.messagingGroupId;
   const currentThreadId = input.threadId === undefined ? scope.thread_id : input.threadId;
+  // Looked up ONCE and reused below by both namespaceTriggerSenderId (trigger
+  // fallback) and stripVerifiedPrefix (alreadyRepresented comparison, and
+  // threaded into readMemoryEvidence's id tier) — see lookupChannelType.
+  const channelType = lookupChannelType(db, currentMessagingGroupId);
   const fallbackGroup = db.prepare(`SELECT folder FROM agent_groups WHERE id = ?`).get(input.agentGroupId) as
     | { folder: string }
     | undefined;
@@ -1566,15 +1931,38 @@ export function buildPreTurnContext(input: PreTurnContextInput): PreTurnContext 
   // Involved senders for the deterministic preference lane, grouped by
   // person so a platform rename can't inject BOTH the pre-rename and
   // post-rename preference file for the same human (see readMemoryEvidence).
-  // One group per recent conversation sender: [per-message senderName,
-  // canonical users.display_name] — canonical included only when resolved,
-  // set, and different from the per-message name, resolved via the archive's
-  // stable sender_id. Since the round-1 fix the triggering message is
+  // One group per recent conversation sender, carrying the archive's stable
+  // sender_id (for the explicit-`ids:`-frontmatter tier) alongside its name
+  // aliases: [per-message senderName, canonical users.display_name] —
+  // canonical included only when resolved, set, and different from the
+  // per-message name. Since the round-1 fix the triggering message is
   // archived before this runs, so the trigger sender normally already
-  // appears as the newest recentConversationSenders row; a [triggerSender]
-  // group is prepended only when no existing group contains that name — the
-  // fallback for kinds that don't archive before this call.
-  const involvedSenders: string[][] = [];
+  // appears as the newest recentConversationSenders row; a fallback group is
+  // prepended only for kinds that don't archive before this call.
+  //
+  // Round 2: suppression of that fallback is by sender id, not display name.
+  // A DIFFERENT participant who merely shares the trigger's display name
+  // must not swallow the trigger's own id-declared preference file. When the
+  // trigger resolves a senderId (see namespaceTriggerSenderId below), the
+  // fallback is suppressed only if some existing group's senderId matches it
+  // exactly, or the two ids agree once each has the CURRENT conversation's
+  // VERIFIED channel_type prefix stripped (stripVerifiedPrefix) — same
+  // conversation, same channel_type, so this still unifies a renamed sender
+  // across turns. A colon-bearing id that is NOT namespaced under the
+  // current channel_type (a Matrix-style raw handle, or a sibling bot's own
+  // namespace) is left whole and compared as-is, so it can only coincide by
+  // accident, never by an unverified shared suffix (round 4: rawIdSuffix's
+  // last-colon rule let `@alice:matrix.org` and `@bob:matrix.org` collapse
+  // to the same "matrix.org" suffix — fixed by removing it). The old
+  // name-based check (aliases.includes) now applies ONLY when the trigger
+  // has no senderId at all.
+  //
+  // The fallback's senderId comes from extractSenderId (not an archive
+  // lookup) via normalizedContent — the RAW platform id — then gets
+  // namespaced with the current messaging group's channel_type before use,
+  // so it can hit a file's namespace-exact `ids:` declaration and not only
+  // the raw (bare-entry) map; see namespaceTriggerSenderId's doc comment.
+  const involvedSenders: InvolvedSenderGroup[] = [];
   try {
     for (const sender of recentConversationSenders({
       memberAgentGroupIds,
@@ -1582,9 +1970,9 @@ export function buildPreTurnContext(input: PreTurnContextInput): PreTurnContext 
       threadId: currentThreadId,
     })) {
       const canonicalName = sender.senderId ? getUser(sender.senderId)?.display_name : undefined;
-      involvedSenders.push(
-        canonicalName && canonicalName !== sender.senderName ? [sender.senderName, canonicalName] : [sender.senderName],
-      );
+      const aliases =
+        canonicalName && canonicalName !== sender.senderName ? [sender.senderName, canonicalName] : [sender.senderName];
+      involvedSenders.push({ senderId: sender.senderId, aliases });
     }
   } catch (error) {
     if (!(error instanceof Error)) throw error;
@@ -1596,8 +1984,19 @@ export function buildPreTurnContext(input: PreTurnContextInput): PreTurnContext 
     });
   }
   const triggerSender = extractSenderName(input.normalizedContent);
-  if (triggerSender && !involvedSenders.some((group) => group.includes(triggerSender))) {
-    involvedSenders.unshift([triggerSender]);
+  if (triggerSender) {
+    const triggerSenderId = namespaceTriggerSenderId(extractSenderId(input.normalizedContent), channelType);
+    const alreadyRepresented =
+      triggerSenderId !== null
+        ? involvedSenders.some(
+            (group) =>
+              group.senderId !== null &&
+              stripVerifiedPrefix(group.senderId, channelType) === stripVerifiedPrefix(triggerSenderId, channelType),
+          )
+        : involvedSenders.some((group) => group.aliases.includes(triggerSender));
+    if (!alreadyRepresented) {
+      involvedSenders.unshift({ senderId: triggerSenderId, aliases: [triggerSender] });
+    }
   }
 
   let memoryEvidence: PreTurnContext['memoryEvidence'];
@@ -1610,6 +2009,7 @@ export function buildPreTurnContext(input: PreTurnContextInput): PreTurnContext 
       seenEvidenceFingerprints,
       bypassDedupe,
       involvedSenders,
+      channelType,
     );
   } catch (error) {
     if (!(error instanceof Error)) throw error;

@@ -42,6 +42,7 @@ vi.mock('../../message-archive.js', async (importOriginal) => {
 });
 
 import {
+  _resetPreferenceIdCacheForTest,
   _resetTokenStreamCacheForTest,
   _tokenStreamCacheStatsForTest,
   _bestPassageForTest,
@@ -49,6 +50,7 @@ import {
   buildPreTurnContext,
   enforceFinalBound,
   evaluateRecallCorpus,
+  parsePreferenceFrontmatter,
   PRE_TURN_BOUNDS,
   tokenizeForRecall,
   type ContextNotice,
@@ -167,6 +169,12 @@ beforeEach(() => {
   CAPABILITY_FIXTURE.services = null;
   fs.rmSync(TEST_ROOT, { recursive: true, force: true });
   fs.mkdirSync(TEST_ROOT, { recursive: true });
+  // TEST_ROOT is a fixed path reused by every test in this file, so the
+  // module-level frontmatter-id cache (keyed by absolute path) would
+  // otherwise carry a prior test's (mtime, size, ids) entry into a fresh
+  // test that happens to recreate the same relative path at a coincidentally
+  // matching size — reset it here so every test starts cold.
+  _resetPreferenceIdCacheForTest();
   runMigrations(initTestDb());
   seedScope();
   memoryFile('index.md', '# Canon\nThe current input is authoritative.');
@@ -1132,6 +1140,556 @@ describe('per-person preference recall', () => {
     const paths = result.memoryEvidence.excerpts.map((row) => row.path);
     expect(paths).toContain('preferences/sam.md');
     expect(paths).toContain('preferences/sam-rivera.md');
+  });
+
+  it("matches an ids: frontmatter file via the bare form under the conversation's verified namespace, even when both name slugs miss", () => {
+    memoryFile('preferences/quinn-park.md', '---\nids: [U123]\n---\n# Quinn\nPrefers concise updates.');
+    // Renamed display name (misses the "quinn-park" slug) + a users row with
+    // a NULL canonical display_name (also misses) — the id tier is the only
+    // way this file can be claimed. sess-a's messaging group (mg-a) is
+    // channel_type 'discord' (seedScope), so stripVerifiedPrefix strips
+    // exactly this "discord:" prefix, leaving "U123" to match the bare
+    // declared id.
+    archiveFrom('m1', 'QP Renamed', '2026-08-01T00:00:00.000Z', 'discord:guild:channel:thread', 'discord:U123');
+    upsertUserRow('discord:U123', null);
+
+    const result = buildPreTurnContext({
+      agentGroupId: 'ag-a',
+      sessionId: 'sess-a',
+      kind: 'chat-sdk',
+      trigger: 1,
+      normalizedContent: JSON.stringify({ text: 'status?', sender: 'Pat Doe' }),
+    });
+
+    const paths = result.memoryEvidence.excerpts.map((row) => row.path);
+    expect(paths).toContain('preferences/quinn-park.md');
+  });
+
+  it('an exact namespaced id entry matches only that full sender_id', () => {
+    memoryFile('preferences/river-cole.md', '---\nids: [slack-x:U123]\n---\n# River\nWants terse replies.');
+    archiveFrom('m1', 'RC Alt', '2026-08-01T00:00:00.000Z', 'discord:guild:channel:thread', 'slack-x:U123');
+
+    const result = buildPreTurnContext({
+      agentGroupId: 'ag-a',
+      sessionId: 'sess-a',
+      kind: 'chat-sdk',
+      trigger: 1,
+      normalizedContent: JSON.stringify({ text: 'status?', sender: 'Pat Doe' }),
+    });
+
+    const paths = result.memoryEvidence.excerpts.map((row) => row.path);
+    expect(paths).toContain('preferences/river-cole.md');
+  });
+
+  it('a bare id entry does not match a different sender_id under the same VERIFIED namespace prefix', () => {
+    memoryFile('preferences/river-cole.md', '---\nids: [U123]\n---\n# River\nWants terse replies.');
+    // Different raw suffix (U9999, not U123) under the conversation's own
+    // verified "discord:" namespace — must not match even though the
+    // verified prefix is shared.
+    archiveFrom('m1', 'RC Alt', '2026-08-01T00:00:00.000Z', 'discord:guild:channel:thread', 'discord:U9999');
+
+    const result = buildPreTurnContext({
+      agentGroupId: 'ag-a',
+      sessionId: 'sess-a',
+      kind: 'chat-sdk',
+      trigger: 1,
+      normalizedContent: JSON.stringify({ text: 'status?', sender: 'Pat Doe' }),
+    });
+
+    const paths = result.memoryEvidence.excerpts.map((row) => row.path);
+    expect(paths).not.toContain('preferences/river-cole.md');
+  });
+
+  it('an id match beats a name match for the same person', () => {
+    memoryFile('preferences/morgan-park.md', '# Morgan Park (stale)\nOld preferences — should not be used.');
+    memoryFile('preferences/current.md', '---\nids: [U500]\n---\n# Morgan\nCurrent preferences.');
+    // Display name slugs to morgan-park.md, but the declared id routes to
+    // current.md — the id tier must win and the name file must not appear.
+    // 'discord:' matches mg-a's channel_type (seedScope) so the bare
+    // declared id strips and matches via the verified namespace.
+    archiveFrom('m1', 'Morgan Park', '2026-08-01T00:00:00.000Z', 'discord:guild:channel:thread', 'discord:U500');
+
+    const result = buildPreTurnContext({
+      agentGroupId: 'ag-a',
+      sessionId: 'sess-a',
+      kind: 'chat-sdk',
+      trigger: 1,
+      normalizedContent: JSON.stringify({ text: 'status?', sender: 'Pat Doe' }),
+    });
+
+    const paths = result.memoryEvidence.excerpts.map((row) => row.path);
+    expect(paths).toContain('preferences/current.md');
+    expect(paths).not.toContain('preferences/morgan-park.md');
+  });
+
+  it('strips ids: frontmatter from the injected excerpt text', () => {
+    memoryFile('preferences/sky-vance.md', '---\nids: [U777]\n---\n# Sky Vance\nPrefers bullet points.');
+    archiveFrom('m1', 'Sky Vance', '2026-08-01T00:00:00.000Z', 'discord:guild:channel:thread', 'discord:U777');
+
+    const result = buildPreTurnContext({
+      agentGroupId: 'ag-a',
+      sessionId: 'sess-a',
+      kind: 'chat-sdk',
+      trigger: 1,
+      normalizedContent: JSON.stringify({ text: 'status?', sender: 'Pat Doe' }),
+    });
+
+    const preference = result.memoryEvidence.excerpts.find((row) => row.path === 'preferences/sky-vance.md');
+    expect(preference).toBeDefined();
+    expect(preference!.text).not.toContain('---');
+    expect(preference!.text).not.toContain('ids:');
+    expect(preference!.text).toContain('Prefers bullet points');
+  });
+
+  it('treats malformed frontmatter (no closing fence) as body text and falls back to name matching', () => {
+    memoryFile('preferences/drew-lane.md', '---\nids: [U999]\nnot a closing fence\n# Drew Lane\nPrefers plain text.');
+    archiveFrom('m1', 'Drew Lane', '2026-08-01T00:00:00.000Z', 'discord:guild:channel:thread', 'slack-x:U999');
+
+    const result = buildPreTurnContext({
+      agentGroupId: 'ag-a',
+      sessionId: 'sess-a',
+      kind: 'chat-sdk',
+      trigger: 1,
+      normalizedContent: JSON.stringify({ text: 'status?', sender: 'Pat Doe' }),
+    });
+
+    // Malformed frontmatter means the id "U999" was never indexed, so the
+    // file is reached (if at all) only via the name-matching fallback — and
+    // its "malformed frontmatter" content is treated as ordinary body text,
+    // not stripped.
+    const preference = result.memoryEvidence.excerpts.find((row) => row.path === 'preferences/drew-lane.md');
+    expect(preference).toBeDefined();
+    expect(preference!.text).toContain('---');
+  });
+
+  it('an id match is terminal for its group: never falls through to a stale name match on a shared raw id declaration', () => {
+    // One human declared under two raw ids in one file (e.g. an old and a
+    // new platform id), both under the CURRENT conversation's verified
+    // "discord:" namespace (mg-a's channel_type, per seedScope) — so both
+    // strip to their bare form and both resolve via the id tier.
+    // Newest first: the 'River Park' row is processed first and claims
+    // river-park.md via the id tier; the 'River Park Alt' row's id resolves
+    // to the same, now-claimed file. Pre-fix, that already-claimed id match
+    // fell through to name matching, and its own display name slugs to the
+    // unrelated river-park-alt.md — injecting a second, stale file for the
+    // same person. Post-fix, an id match never falls through.
+    memoryFile(
+      'preferences/river-park.md',
+      '---\nids: [U0TEST900XYZ, U0TEST900ALT]\n---\n# River Park\nCurrent preferences.',
+    );
+    memoryFile('preferences/river-park-alt.md', '# River Park Alt\nStale preferences — must not be injected.');
+    archiveFrom(
+      'm1',
+      'River Park Alt',
+      '2026-08-01T00:00:00.000Z',
+      'discord:guild:channel:thread',
+      'discord:U0TEST900ALT',
+    );
+    archiveFrom('m2', 'River Park', '2026-08-01T00:01:00.000Z', 'discord:guild:channel:thread', 'discord:U0TEST900XYZ');
+
+    const result = buildPreTurnContext({
+      agentGroupId: 'ag-a',
+      sessionId: 'sess-a',
+      kind: 'chat-sdk',
+      trigger: 1,
+      normalizedContent: JSON.stringify({ text: 'status?', sender: 'Pat Doe' }),
+    });
+
+    const paths = result.memoryEvidence.excerpts.map((row) => row.path);
+    expect(paths).toContain('preferences/river-park.md');
+    expect(paths).not.toContain('preferences/river-park-alt.md');
+    expect(paths.filter((p) => p === 'preferences/river-park.md')).toHaveLength(1);
+  });
+
+  it('carries the trigger sender id into the fallback group via top-level senderId', () => {
+    // Empty archive: the only involved-sender group is the [triggerSender]
+    // fallback built straight from normalizedContent, which must now carry
+    // the id too (previously always null), routing through the raw-suffix
+    // map since this is an unnamespaced platform id.
+    memoryFile(
+      'preferences/fallback-one.md',
+      '---\nids: [U0TESTFALLBACK1]\n---\n# Fallback One\nPrefers concise updates.',
+    );
+
+    const result = buildPreTurnContext({
+      agentGroupId: 'ag-a',
+      sessionId: 'sess-a',
+      kind: 'chat-sdk',
+      trigger: 1,
+      normalizedContent: JSON.stringify({ text: 'status?', sender: 'New Person', senderId: 'U0TESTFALLBACK1' }),
+    });
+
+    const paths = result.memoryEvidence.excerpts.map((row) => row.path);
+    expect(paths).toContain('preferences/fallback-one.md');
+  });
+
+  it('carries the trigger sender id into the fallback group via nested author.userId', () => {
+    memoryFile(
+      'preferences/fallback-two.md',
+      '---\nids: [U0TESTFALLBACK2]\n---\n# Fallback Two\nPrefers detailed updates.',
+    );
+
+    const result = buildPreTurnContext({
+      agentGroupId: 'ag-a',
+      sessionId: 'sess-a',
+      kind: 'chat-sdk',
+      trigger: 1,
+      normalizedContent: JSON.stringify({
+        text: 'status?',
+        sender: 'New Person',
+        author: { userId: 'U0TESTFALLBACK2' },
+      }),
+    });
+
+    const paths = result.memoryEvidence.excerpts.map((row) => row.path);
+    expect(paths).toContain('preferences/fallback-two.md');
+  });
+
+  it('namespaces the fallback trigger id so it hits a namespace-exact ids: declaration', () => {
+    // Empty archive: the only involved-sender group is the [triggerSender]
+    // fallback. This file declares ONLY the namespace-exact form for the
+    // CURRENT messaging group's channel type — mg-a is 'discord' (seedScope)
+    // — which a raw, unnamespaced payload senderId could never match
+    // pre-fix: it only ever hit the raw-suffix map (rawIdToRelative).
+    memoryFile(
+      'preferences/ns-fallback.md',
+      '---\nids: [discord:U0TESTNS1]\n---\n# NS Fallback\nPrefers concise updates.',
+    );
+
+    const result = buildPreTurnContext({
+      agentGroupId: 'ag-a',
+      sessionId: 'sess-a',
+      kind: 'chat-sdk',
+      trigger: 1,
+      normalizedContent: JSON.stringify({ text: 'status?', sender: 'NS Person', senderId: 'U0TESTNS1' }),
+    });
+
+    const paths = result.memoryEvidence.excerpts.map((row) => row.path);
+    expect(paths).toContain('preferences/ns-fallback.md');
+  });
+
+  it('does not let a same-name different-sender archived participant swallow the trigger fallback', () => {
+    // A DIFFERENT person, also named "Pat Doe", already archived under a
+    // different sender_id — and that person's own preference file, matched
+    // by name.
+    memoryFile('preferences/pat-doe.md', '# Pat Doe (other)\nWants terse updates.');
+    // The trigger's OWN id-declared file, reachable only via the fallback
+    // group's (namespaced) senderId hitting the raw-suffix map.
+    memoryFile(
+      'preferences/pat-doe-trigger.md',
+      '---\nids: [U0TESTTRIGGERPERSON]\n---\n# Pat Doe (trigger)\nWants detailed updates.',
+    );
+    archiveFrom(
+      'm1',
+      'Pat Doe',
+      '2026-08-01T00:00:00.000Z',
+      'discord:guild:channel:thread',
+      'discord:U0TESTOTHERPERSON',
+    );
+
+    const result = buildPreTurnContext({
+      agentGroupId: 'ag-a',
+      sessionId: 'sess-a',
+      kind: 'chat-sdk',
+      trigger: 1,
+      normalizedContent: JSON.stringify({ text: 'status?', sender: 'Pat Doe', senderId: 'U0TESTTRIGGERPERSON' }),
+    });
+
+    // Pre-fix, the name-only suppression check saw "Pat Doe" already present
+    // in involvedSenders (the OTHER person's archived group) and dropped the
+    // fallback entirely — the trigger's own id-declared file was never
+    // reached. Post-fix, suppression is by sender id: the two different ids
+    // mean BOTH groups (and both files) survive.
+    const paths = result.memoryEvidence.excerpts.map((row) => row.path);
+    expect(paths).toContain('preferences/pat-doe-trigger.md');
+    expect(paths).toContain('preferences/pat-doe.md');
+  });
+
+  it('still suppresses the fallback when the trigger is already archived under the same verified namespace', () => {
+    // Same human, archived earlier under the CURRENT conversation's verified
+    // namespace (mg-a's channel_type is 'discord', per seedScope) — a
+    // DIFFERENT display name simulates a rename, proving suppression here is
+    // keyed on the id (once each side's verified "discord:" prefix is
+    // stripped), not the name. A sender_id namespaced under some OTHER,
+    // unverified channel_type would NOT suppress — see the Matrix-shape
+    // "does not suppress the fallback for a different homeserver user"
+    // test further below in this describe block, which is the round-4 fix
+    // this test's prior sibling-namespace variant used to (incorrectly)
+    // assert the opposite of.
+    memoryFile('preferences/sam-shared.md', '---\nids: [U0TESTSHARED]\n---\n# Sam\nCurrent preferences.');
+    // A stale file that a NOT-suppressed fallback would additionally pick up
+    // by name.
+    memoryFile(
+      'preferences/sam-new-name.md',
+      '# Sam New Name (stale)\nMust not be injected — same person as sam-shared.',
+    );
+    archiveFrom(
+      'm1',
+      'Sam Archived',
+      '2026-08-01T00:00:00.000Z',
+      'discord:guild:channel:thread',
+      'discord:U0TESTSHARED',
+    );
+
+    const result = buildPreTurnContext({
+      agentGroupId: 'ag-a',
+      sessionId: 'sess-a',
+      kind: 'chat-sdk',
+      trigger: 1,
+      normalizedContent: JSON.stringify({ text: 'status?', sender: 'Sam New Name', senderId: 'U0TESTSHARED' }),
+    });
+
+    const paths = result.memoryEvidence.excerpts.map((row) => row.path);
+    expect(paths).toContain('preferences/sam-shared.md');
+    expect(paths).not.toContain('preferences/sam-new-name.md');
+    expect(paths.filter((p) => p === 'preferences/sam-shared.md')).toHaveLength(1);
+  });
+
+  it('reports an id-index read failure exactly once for a file that matches nothing by name', () => {
+    // Ancestor-directory symlink swap, same technique as the "rejects an
+    // ancestor-directory symlink swap" test above, but on a file no involved
+    // sender's alias slug ever matches — so pre-fix, the excerpt-build loop
+    // never reaches it and the id-index loop's read failure is silently
+    // swallowed: no notice at all.
+    const memoryRoot = path.join(TEST_ROOT, 'workgroups', 'wg-a', 'memory');
+    memoryFile('preferences/unmatched-file.md', '# Placeholder\nSwapped to a symlink before the id-index read.');
+    const checkedLeaf = path.join(memoryRoot, 'preferences', 'unmatched-file.md');
+    const checkedAncestor = path.join(memoryRoot, 'preferences');
+    const outsideDir = path.join(TEST_ROOT, 'outside-unmatched');
+    const secret = 'OUTSIDE_UNMATCHED_MUST_NOT_BE_READ';
+    fs.mkdirSync(outsideDir, { recursive: true });
+    fs.writeFileSync(path.join(outsideDir, 'unmatched-file.md'), `# Outside\n${secret}`);
+    archiveFrom(
+      'm1',
+      'Totally Different Name',
+      '2026-08-01T00:00:00.000Z',
+      'discord:guild:channel:thread',
+      'slack:U0TESTNOMATCH',
+    );
+
+    const realOpenSync = fs.openSync;
+    let swapped = false;
+    const openSpy = vi.spyOn(fs, 'openSync').mockImplementation(((file, flags, mode) => {
+      if (!swapped && path.resolve(String(file)) === checkedLeaf) {
+        swapped = true;
+        const parkedAncestor = `${checkedAncestor}-parked`;
+        fs.renameSync(checkedAncestor, parkedAncestor);
+        fs.symlinkSync(outsideDir, checkedAncestor, 'dir');
+        const opened = realOpenSync(file, flags, mode);
+        fs.rmSync(checkedAncestor);
+        fs.renameSync(parkedAncestor, checkedAncestor);
+        return opened;
+      }
+      return realOpenSync(file, flags, mode);
+    }) as typeof fs.openSync);
+
+    let result: ReturnType<typeof buildPreTurnContext>;
+    try {
+      result = buildPreTurnContext({
+        agentGroupId: 'ag-a',
+        sessionId: 'sess-a',
+        kind: 'chat-sdk',
+        trigger: 1,
+        normalizedContent: JSON.stringify({ text: 'status?', sender: 'Pat Doe' }),
+      });
+    } finally {
+      openSpy.mockRestore();
+    }
+
+    expect(swapped).toBe(true);
+    expect(JSON.stringify(result.memoryEvidence)).not.toContain(secret);
+    const failures = result.notices.filter((notice) => notice.code === 'preference-read-failed');
+    expect(failures).toHaveLength(1);
+    expect(failures[0]?.detail).toContain('preferences/unmatched-file.md');
+    expect(result.memoryEvidence.excerpts.some((row) => row.path === 'preferences/unmatched-file.md')).toBe(false);
+  });
+
+  it('produces identical selection on a second call when preference files are unchanged (frontmatter-id cache)', () => {
+    memoryFile('preferences/cache-one.md', '---\nids: [U0TESTCACHE1]\n---\n# Cache One\nConcise updates, always.');
+    const input = {
+      agentGroupId: 'ag-a',
+      sessionId: 'sess-a',
+      kind: 'chat-sdk',
+      trigger: 1,
+      normalizedContent: JSON.stringify({ text: 'status?', sender: 'Cache Person', senderId: 'U0TESTCACHE1' }),
+    } as const;
+
+    const pathsOf = (ctx: ReturnType<typeof buildPreTurnContext>): string[] =>
+      ctx.memoryEvidence.excerpts.map((row) => row.path);
+    expect(pathsOf(buildPreTurnContext(input))).toEqual(['preferences/cache-one.md']);
+    expect(pathsOf(buildPreTurnContext(input))).toEqual(['preferences/cache-one.md']);
+  });
+
+  it('picks up a changed ids: frontmatter after an edit, invalidating the mtime cache', () => {
+    const relative = 'preferences/cache-two.md';
+    const absolute = path.join(TEST_ROOT, 'workgroups', 'wg-a', 'memory', relative);
+    memoryFile(relative, '---\nids: [U0TESTCACHEOLD]\n---\n# Cache Two\nOld preferences.');
+
+    const askAs = (senderId: string) =>
+      buildPreTurnContext({
+        agentGroupId: 'ag-a',
+        sessionId: 'sess-a',
+        kind: 'chat-sdk',
+        trigger: 1,
+        normalizedContent: JSON.stringify({ text: 'status?', sender: 'Cache Person', senderId }),
+      });
+
+    expect(askAs('U0TESTCACHEOLD').memoryEvidence.excerpts.map((row) => row.path)).toContain(relative);
+
+    // Same byte length before and after ("OLD"/"NEW" and "Old"/"New" are both
+    // 3 chars) so this exercises the mtime half of the (mtimeMs, size) cache
+    // key, not the size half. utimesSync forces mtime forward explicitly —
+    // a same-millisecond rewrite is the accepted staleness window this fix
+    // documents, not what this test is proving.
+    memoryFile(relative, '---\nids: [U0TESTCACHENEW]\n---\n# Cache Two\nNew preferences.');
+    const bumped = new Date(fs.statSync(absolute).mtime.getTime() + 5000);
+    fs.utimesSync(absolute, bumped, bumped);
+
+    expect(askAs('U0TESTCACHEOLD').memoryEvidence.excerpts.map((row) => row.path)).not.toContain(relative);
+    const nowNew = askAs('U0TESTCACHENEW');
+    const preference = nowNew.memoryEvidence.excerpts.find((row) => row.path === relative);
+    expect(preference).toBeDefined();
+    expect(preference?.text).toContain('New preferences');
+  });
+
+  it('blacklists a duplicate bare id from id matching, reports one conflict notice, and still name-matches', () => {
+    memoryFile('preferences/dup-a.md', '---\nids: [U0TESTDUP]\n---\n# Dup A\nFile A preferences.');
+    memoryFile('preferences/dup-b.md', '---\nids: [U0TESTDUP]\n---\n# Dup B\nFile B preferences.');
+    // Name-slug file for the same sender, so the "name matching remains the
+    // fallback" half of the fix is exercised in the same test.
+    memoryFile('preferences/dup-person.md', '# Dup Person\nName-matched preferences.');
+
+    const result = buildPreTurnContext({
+      agentGroupId: 'ag-a',
+      sessionId: 'sess-a',
+      kind: 'chat-sdk',
+      trigger: 1,
+      normalizedContent: JSON.stringify({ text: 'status?', sender: 'Dup Person', senderId: 'U0TESTDUP' }),
+    });
+
+    const paths = result.memoryEvidence.excerpts.map((row) => row.path);
+    expect(paths).not.toContain('preferences/dup-a.md');
+    expect(paths).not.toContain('preferences/dup-b.md');
+    expect(paths).toContain('preferences/dup-person.md');
+
+    const conflicts = result.notices.filter((notice) => notice.code === 'preference-id-conflict');
+    expect(conflicts).toHaveLength(1);
+    expect(conflicts[0]?.detail).toContain('U0TESTDUP');
+    expect(conflicts[0]?.detail).toContain('preferences/dup-a.md');
+    expect(conflicts[0]?.detail).toContain('preferences/dup-b.md');
+  });
+
+  it('does not suppress the fallback for a different homeserver user with the same last-colon suffix (Matrix-shape)', () => {
+    // Matrix-style raw handles contain their OWN colon (`@user:homeserver`),
+    // and extractAndUpsertUser (src/modules/permissions/index.ts:96-99)
+    // stores them UN-PREFIXED — this is the platform's own opaque id, not a
+    // "channelType:rawId" pair. Pre-fix (PR #221 round 4), rawIdSuffix took
+    // everything after the LAST colon, so '@bob:matrix.example' and
+    // '@alice:matrix.example' both suffixed to 'matrix.example' and the
+    // archived Bob wrongly suppressed Alice's own trigger-fallback group —
+    // dropping her exact-declared preference file entirely. Post-fix, a
+    // colon-bearing id that isn't namespaced under the CURRENT verified
+    // channel_type ('discord', mg-a's channel_type per seedScope) is
+    // compared whole, so the two different homeserver users never collide.
+    memoryFile(
+      'preferences/alice-matrix.md',
+      '---\nids: [@alice:matrix.example]\n---\n# Alice\nPrefers concise updates.',
+    );
+    archiveFrom('m1', 'Bob', '2026-08-01T00:00:00.000Z', 'discord:guild:channel:thread', '@bob:matrix.example');
+
+    const result = buildPreTurnContext({
+      agentGroupId: 'ag-a',
+      sessionId: 'sess-a',
+      kind: 'chat-sdk',
+      trigger: 1,
+      normalizedContent: JSON.stringify({ text: 'status?', sender: 'Alice', senderId: '@alice:matrix.example' }),
+    });
+
+    const paths = result.memoryEvidence.excerpts.map((row) => row.path);
+    expect(paths).toContain('preferences/alice-matrix.md');
+  });
+
+  it('a bare id entry does not match a colon-bearing raw id it merely trails (Matrix-shape)', () => {
+    // A file declares the trailing part of a Matrix id as a bare entry —
+    // exactly what the old last-colon-stripping rule would have let match
+    // any '@*:matrix.example' sender. Under the fix, a colon-bearing
+    // sender_id that is not namespaced under the CURRENT verified
+    // channel_type never reaches the raw (bare-entry) map at all, so this
+    // must not match.
+    memoryFile('preferences/homeserver-catchall.md', '---\nids: [matrix.example]\n---\n# Catchall\nMust not match.');
+    archiveFrom('m1', 'Alice', '2026-08-01T00:00:00.000Z', 'discord:guild:channel:thread', '@alice:matrix.example');
+
+    const result = buildPreTurnContext({
+      agentGroupId: 'ag-a',
+      sessionId: 'sess-a',
+      kind: 'chat-sdk',
+      trigger: 1,
+      normalizedContent: JSON.stringify({ text: 'status?', sender: 'Pat Doe' }),
+    });
+
+    const paths = result.memoryEvidence.excerpts.map((row) => row.path);
+    expect(paths).not.toContain('preferences/homeserver-catchall.md');
+  });
+
+  it("a bare id entry still matches when stripped of the CURRENT conversation's verified channel_type prefix", () => {
+    // <ct> is mg-a's channel_type ('discord', per seedScope) — the ONLY
+    // prefix stripVerifiedPrefix is allowed to remove for this conversation.
+    memoryFile('preferences/verified-bare.md', '---\nids: [U0TESTV1]\n---\n# Verified Bare\nCurrent preferences.');
+    archiveFrom('m1', 'VB Renamed', '2026-08-01T00:00:00.000Z', 'discord:guild:channel:thread', 'discord:U0TESTV1');
+
+    const result = buildPreTurnContext({
+      agentGroupId: 'ag-a',
+      sessionId: 'sess-a',
+      kind: 'chat-sdk',
+      trigger: 1,
+      normalizedContent: JSON.stringify({ text: 'status?', sender: 'Pat Doe' }),
+    });
+
+    const paths = result.memoryEvidence.excerpts.map((row) => row.path);
+    expect(paths).toContain('preferences/verified-bare.md');
+  });
+});
+
+describe('parsePreferenceFrontmatter', () => {
+  it('parses a bracket-form ids: line, trimming entries and dropping empties', () => {
+    const result = parsePreferenceFrontmatter(
+      '---\nids: [U0TEST111AAA,  U0TEST222BBB ,  ]\n---\n# Riley Shaw\nBody text.',
+    );
+    expect(result.ids).toEqual(['U0TEST111AAA', 'U0TEST222BBB']);
+    expect(result.body).toBe('# Riley Shaw\nBody text.');
+  });
+
+  it('returns ids empty and body unchanged when there is no frontmatter at all', () => {
+    const content = '# Riley Shaw\nNo frontmatter here.';
+    expect(parsePreferenceFrontmatter(content)).toEqual({ ids: [], body: content });
+  });
+
+  it('returns ids empty and body unchanged for an unclosed frontmatter fence', () => {
+    const content = '---\nids: [U1]\nno closing fence here\nrest of file';
+    expect(parsePreferenceFrontmatter(content)).toEqual({ ids: [], body: content });
+  });
+
+  it('returns ids empty and body unchanged when the fenced block has no ids: line', () => {
+    const content = '---\ntitle: not-ids\n---\n# Body';
+    expect(parsePreferenceFrontmatter(content)).toEqual({ ids: [], body: content });
+  });
+
+  it('returns ids empty and body unchanged for a lone opening fence with no following line', () => {
+    const content = '---\n';
+    expect(parsePreferenceFrontmatter(content)).toEqual({ ids: [], body: content });
+  });
+
+  it('never throws on arbitrary content', () => {
+    expect(() => parsePreferenceFrontmatter('')).not.toThrow();
+    expect(() => parsePreferenceFrontmatter('---')).not.toThrow();
+    expect(() => parsePreferenceFrontmatter('---\n---\n')).not.toThrow();
+    expect(() => parsePreferenceFrontmatter('ids: [U1]\n---\n')).not.toThrow();
+  });
+
+  it('supports a single id with no trailing comma', () => {
+    const result = parsePreferenceFrontmatter('---\nids: [U123]\n---\nbody');
+    expect(result.ids).toEqual(['U123']);
+    expect(result.body).toBe('body');
   });
 });
 
