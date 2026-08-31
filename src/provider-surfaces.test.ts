@@ -134,6 +134,43 @@ describe('container instruction contracts', () => {
     expect(instructions).not.toContain('team-qa/team-review');
   });
 
+  // Acceptance criterion 5 (instruction-stack-prune plan): each safety floor
+  // must survive the L1 rewrite with an assertable marker phrase. A floor
+  // dropped or reworded to the point the marker disappears fails this test
+  // BEFORE it can reach a live container — see docs/specs/instruction-stack-prune/plan.md.
+  it('keeps a marker phrase for every safety floor after the L1 rewrite', () => {
+    const instructions = fs.readFileSync(path.join(process.cwd(), 'container/CLAUDE.md'), 'utf-8');
+
+    // Credential Security must survive VERBATIM, not just as a marker.
+    expect(instructions).toContain(
+      '**NEVER ask users to share API keys, passwords, tokens, or credentials in chat.** Check your environment first. If credentials are missing, tell the user to provision them on the host (`.env` or OneCLI vault). If a user posts a credential in chat, warn them immediately.',
+    );
+    // 30-minute idle ceiling.
+    expect(instructions).toContain('killed after ~30 minutes without an active turn');
+    // Shared memory limit + its OOM-symptom warning (SIGKILL, not a clean failure).
+    expect(instructions).toContain('one memory limit');
+    expect(instructions).toContain('SIGKILLs individual child processes');
+    // /tmp death on container kill.
+    expect(instructions).toContain('`/tmp` plus every in-container background task, sleep, and timer dies with it');
+    // continue_work lifecycle contract.
+    expect(instructions).toContain('continue_work({ task })');
+    // Group-precedence rule.
+    expect(instructions).toContain("your group's instructions win");
+    // Truth-grounding core.
+    expect(instructions).toContain('grounded in verifiable truth');
+    // Test-is-the-contract guard: an existing test asserting the opposite
+    // behavior IS the current contract, and a review comment alone never
+    // overrides it without an explicit contract change from the user.
+    expect(instructions).toContain('IS the current contract');
+  });
+
+  it('bans ISO dates and issue/PR references in the base file', () => {
+    const instructions = fs.readFileSync(path.join(process.cwd(), 'container/CLAUDE.md'), 'utf-8');
+    expect(instructions).not.toMatch(/\b20\d{2}-\d{2}-\d{2}\b/);
+    // Matches a bare `#123` and a parenthesized `(#123)`.
+    expect(instructions).not.toMatch(/(?:^|[\s(])#\d{2,}\b/);
+  });
+
   // ── Hand-synced host/container constants ──
   // The container tree is a separate Bun package (vitest excludes it, and an
   // import risks pulling in bun:sqlite), so the container side is read as TEXT.
