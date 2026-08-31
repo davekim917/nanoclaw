@@ -41,9 +41,27 @@ export interface FlattenOptions {
    * Default 8.
    */
   maxDepth?: number;
+  /**
+   * Optional gate called with the resolved read target — the top-level
+   * file and every recursively inlined `@`-import — immediately before it
+   * is ever passed to `readFileSync`. Return a reason string to skip the
+   * read (replaced with the same kind of inline comment marker used for a
+   * missing/unreadable include); return undefined to proceed normally.
+   *
+   * `compose`'s own usage never sets this — every top-level and nested
+   * target it flattens is a host-controlled path it fully trusts. A caller
+   * reading FROM a container-writable directory (e.g. a metrics job
+   * walking `groups/`, where an agent could plant a symlink to a FIFO, a
+   * huge file, or a path outside its trust boundary) should pass one; the
+   * blind `readFileSync` two lines below is exactly the DoS/exfiltration
+   * surface such a caller needs to gate. Undefined by default so this is a
+   * pure opt-in with zero behavior change for existing callers.
+   */
+  validateRead?: (realPath: string) => string | undefined;
 }
 
 const DEFAULT_MAX_DEPTH = 8;
+const noopValidateRead = (): string | undefined => undefined;
 
 function expandHome(p: string): string {
   if (p === '~' || p.startsWith('~/')) return path.join(os.homedir(), p.slice(2));
@@ -106,6 +124,11 @@ function flattenInner(filePath: string, visited: Set<string>, depth: number, opt
   }
   visited.add(realPath);
 
+  const skipReason = opts.validateRead(realPath);
+  if (skipReason !== undefined) {
+    return `<!-- agents-md-flatten: skipped ${filePath} (${skipReason}) -->`;
+  }
+
   let content: string;
   try {
     content = fs.readFileSync(realPath, 'utf-8');
@@ -158,6 +181,7 @@ export function flattenClaudeMd(filePath: string, options: FlattenOptions = {}):
   const opts: Required<FlattenOptions> = {
     containerToHost: options.containerToHost ?? {},
     maxDepth: options.maxDepth ?? DEFAULT_MAX_DEPTH,
+    validateRead: options.validateRead ?? noopValidateRead,
   };
   return flattenInner(filePath, new Set(), 0, opts);
 }
