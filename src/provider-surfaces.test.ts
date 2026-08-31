@@ -145,6 +145,9 @@ describe('initGroupFilesystem agent surfaces', () => {
     const claudeDir = path.join(DATA_DIR, 'v2-sessions', ag.id, '.claude-shared');
     expect(fs.readFileSync(path.join(groupDir, PERSONA_PREPEND_FILE), 'utf-8')).toBe('hello\n');
     expect(fs.readFileSync(path.join(groupDir, 'CLAUDE.local.md'), 'utf-8')).toBe('');
+    // Host-owned placeholder for the nested spawn-template.md mount — without
+    // it Docker creates the destination in this folder root-owned.
+    expect(fs.readFileSync(path.join(groupDir, 'spawn-template.md'), 'utf-8')).toBe('');
     const settings = JSON.parse(fs.readFileSync(path.join(claudeDir, 'settings.json'), 'utf-8')) as {
       autoMemoryEnabled?: boolean;
       env: Record<string, string>;
@@ -196,6 +199,9 @@ describe('initGroupFilesystem agent surfaces', () => {
     const compatibilityLink = path.join(groupDir, 'memory');
     expect(fs.existsSync(groupDir)).toBe(true);
     expect(fs.existsSync(path.join(groupDir, 'CLAUDE.local.md'))).toBe(false);
+    // The spawn-template mount isn't gated on defaultSurfaces, so its
+    // placeholder isn't either.
+    expect(fs.existsSync(path.join(groupDir, 'spawn-template.md'))).toBe(true);
     expect(fs.readFileSync(path.join(groupDir, PERSONA_PREPEND_FILE), 'utf-8')).toBe('hello\n');
     expect(readGroupPersona(groupDir)).toBe('hello');
     expect(fs.existsSync(path.join(canonicalMemory, 'memories', 'imported-agent-memory.md'))).toBe(false);

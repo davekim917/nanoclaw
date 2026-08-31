@@ -235,6 +235,18 @@ export function initGroupFilesystem(
     }
   }
 
+  // The host-shared spawn template is nested-mounted at
+  // /workspace/agent/spawn-template.md (container-runner.ts), and
+  // /workspace/agent IS this folder — so without a placeholder Docker creates
+  // the destination here ROOT-owned, leaving a file the host user can never
+  // remove. Docker leaves an existing file's ownership alone. Not gated on
+  // defaultSurfaces: the mount isn't either.
+  const spawnTemplateFile = path.join(groupDir, 'spawn-template.md');
+  if (!fs.existsSync(spawnTemplateFile)) {
+    fs.writeFileSync(spawnTemplateFile, '');
+    initialized.push('spawn-template.md');
+  }
+
   // Note: the container_configs DB row is NOT created here. Local's
   // applyCreateAgent ordering puts initGroupFilesystem BEFORE the
   // agent_groups insert (so a DB failure can roll back the FS via
