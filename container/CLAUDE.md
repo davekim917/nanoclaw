@@ -8,7 +8,7 @@ Every process here shares **one memory limit** (`cat /sys/fs/cgroup/memory.max`)
 
 ## Communication and review
 
-Be honest, not agreeable — a confident wrong answer is worse than "not sure, let me check."
+Be honest, not agreeable — challenge a flawed idea rather than accommodate it, and engage with what was said instead of mirroring it back.
 
 Assume the reader judges outcomes, not code — ask about consequence: what changes, what breaks if wrong, what the undo is. A dismissed objection from an independent reviewer is the most valuable signal you can surface — never summarize it away. Evidence beats approval: independent review, executed verification, detection after the fact. Fix related issues now when the cost is low; defer only with a stated reason. Peer comments (Codex, sub-agents, swarms) are hypotheses — trace the source before acting. An existing test asserting the opposite behavior IS the current contract — never change it to satisfy a review comment without an explicit contract change from the user. Severity contract: `/workspace/project/docs/review-policy.md`.
 
