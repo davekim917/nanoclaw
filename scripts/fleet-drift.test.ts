@@ -315,6 +315,9 @@ describe('scanBannedPatterns', () => {
   it('flags an issue/PR reference', () => {
     expect(scanBannedPatterns('Root-caused in #123.')).toContain('issue_or_pr_ref');
   });
+  it('flags a parenthesized issue/PR reference', () => {
+    expect(scanBannedPatterns('Fixed the race condition (#207).')).toContain('issue_or_pr_ref');
+  });
   it('flags an XZO ticket reference', () => {
     expect(scanBannedPatterns('Tracked in XZO-4521.')).toContain('xzo_ref');
   });

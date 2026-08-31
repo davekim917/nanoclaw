@@ -420,7 +420,7 @@ const GROUP_STANDING_FILENAMES = ['standing-instructions.md', 'instructions.prep
 
 const BANNED_PATTERNS: Array<{ name: string; re: RegExp }> = [
   { name: 'iso_date', re: /\b20\d{2}-\d{2}-\d{2}\b/ },
-  { name: 'issue_or_pr_ref', re: /(?:^|\s)#\d{2,}\b/ },
+  { name: 'issue_or_pr_ref', re: /(?:^|[\s(])#\d{2,}\b/ },
   { name: 'xzo_ref', re: /\bXZO-\d+\b/ },
   { name: 'current_focus_header', re: /^#+\s*Current Focus/im },
 ];
