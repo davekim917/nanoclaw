@@ -4,7 +4,6 @@
  * Replaces the per-group "written once at init, owned by the group" pattern
  * with a host-regenerated entry point that imports:
  *   - a shared base (`container/CLAUDE.md` mounted RO at `/app/CLAUDE.md`)
- *   - optional per-skill fragments (skills that ship `instructions.md`)
  *   - optional per-MCP-server fragments (inline `instructions` field in
  *     `container.json`)
  *   - optional provider-neutral standing instructions
@@ -34,7 +33,6 @@ const STANDING_INSTRUCTIONS_FRAGMENT = 'standing-instructions.md';
 // Symlink targets are container paths — dangling on host (hence the readlink
 // dance instead of existsSync), valid inside the container via RO mounts.
 const SHARED_CLAUDE_MD_CONTAINER_PATH = '/app/CLAUDE.md';
-const SHARED_SKILLS_CONTAINER_BASE = '/app/skills';
 const SHARED_MCP_TOOLS_CONTAINER_BASE = '/app/src/mcp-tools';
 
 // Host-side source paths used to discover fragment sources at compose time.
@@ -45,9 +43,9 @@ const COMPOSED_HEADER =
   '<!-- Composed at spawn - do not edit. Standing instructions: standing-instructions.md. Memory: memory/. -->';
 
 /**
- * Regenerate `groups/<folder>/CLAUDE.md` from the shared base, enabled skill
- * fragments, and MCP server fragments declared in `container.json`. Creates
- * an empty `CLAUDE.local.md` if missing.
+ * Regenerate `groups/<folder>/CLAUDE.md` from the shared base, built-in
+ * module fragments, and MCP server fragments declared in `container.json`.
+ * Creates an empty `CLAUDE.local.md` if missing.
  *
  * `provider` is the spawn-resolved effective provider (session override →
  * container config → 'claude', already lowercased by resolveProviderName).
@@ -100,21 +98,6 @@ export function composeGroupClaudeMd(group: AgentGroup, provider: string): void 
     ? validateMcpServers(JSON.parse(configRow.mcp_servers) as Record<string, McpServerConfig>)
     : {};
   const desired = new Map<string, { type: 'symlink' | 'inline'; content: string }>();
-
-  // Skill fragments — every skill that ships an `instructions.md`.
-  // TODO (shared-source refactor): respect `container.json` skill selection.
-  const skillsHostDir = path.join(process.cwd(), 'container', 'skills');
-  if (fs.existsSync(skillsHostDir)) {
-    for (const skillName of fs.readdirSync(skillsHostDir)) {
-      const hostFragment = path.join(skillsHostDir, skillName, 'instructions.md');
-      if (fs.existsSync(hostFragment)) {
-        desired.set(`skill-${skillName}.md`, {
-          type: 'symlink',
-          content: `${SHARED_SKILLS_CONTAINER_BASE}/${skillName}/instructions.md`,
-        });
-      }
-    }
-  }
 
   // Built-in module fragments — every MCP/CLI module that ships a
   // sibling `<name>.instructions.md`. These describe how the agent should
@@ -217,13 +200,12 @@ export function composeGroupClaudeMd(group: AgentGroup, provider: string): void 
   // @-includes resolved inline. Codex doesn't expand @-references in
   // AGENTS.md, so the references would otherwise reach the model as
   // literal text. The composer's symlinks point at container paths
-  // (`/app/CLAUDE.md`, `/app/skills/<n>/instructions.md`,
-  // `/app/src/mcp-tools/<n>.instructions.md`) — pass a translation map
-  // to the flattener so it can read those targets from their host paths.
+  // (`/app/CLAUDE.md`, `/app/src/mcp-tools/<n>.instructions.md`) — pass a
+  // translation map to the flattener so it can read those targets from
+  // their host paths.
   const projectRoot = path.resolve(GROUPS_DIR, '..');
   const containerToHost: Record<string, string> = {
     [SHARED_CLAUDE_MD_CONTAINER_PATH]: path.join(projectRoot, 'container', 'CLAUDE.md'),
-    [SHARED_SKILLS_CONTAINER_BASE]: path.join(projectRoot, 'container', 'skills'),
     [SHARED_MCP_TOOLS_CONTAINER_BASE]: path.join(projectRoot, MCP_TOOLS_HOST_SUBPATH),
   };
   // Ensure the local file exists BEFORE flattening — it is part of the AGENTS.md
