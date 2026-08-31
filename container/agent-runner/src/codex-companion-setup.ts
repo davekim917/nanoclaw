@@ -49,6 +49,14 @@ import type { McpServerConfig } from './providers/types.js';
 
 const HOST_CODEX_DIR = '/home/node/.codex';
 const RUNTIME_CODEX_DIR = '/home/node/.codex-runtime';
+/**
+ * Deliberately nonexistent path. Handed out as CODEX_HOME when the real runtime
+ * dir could not be built — codex refuses to start rather than falling back to
+ * the default home ("Error finding codex home: CODEX_HOME points to ..., but
+ * that path does not exist"), which is exactly the fail-closed property we want.
+ * Named so it self-documents in `printenv` and in a log line.
+ */
+const FAILED_CODEX_HOME = '/nonexistent/codex-runtime-setup-failed';
 const CONTAINER_CLAUDE_SKILLS_DIR = '/home/node/.claude/skills';
 const CONTAINER_PLUGINS_DIR = '/workspace/plugins';
 /**
@@ -285,9 +293,44 @@ export function projectCodexPluginConfigForTest(primaryToml: string, targetToml:
 }
 
 /**
+ * Fail closed on CODEX, not on the CONTAINER.
+ *
+ * Returning `null` here would be a guard BYPASS, not a graceful degrade: the
+ * caller only sets `CODEX_HOME` on a non-null return, so a peer-mode
+ * `codex exec` would fall back to `/home/node/.codex` — the host's RW-mounted
+ * home, which HAS auth and never receives the in-tree PreToolUse destructive-
+ * action guard chain. Net: an authenticated, working, UNGUARDED codex. Writing
+ * the guard into that directory instead is not an option: it is the operator's
+ * real `~/.codex` on the host.
+ *
+ * So we hand back a nonexistent sentinel. Codex refuses to start on it and
+ * cannot reach the host-mounted auth or config, while the primary provider
+ * (Claude/OpenCode) boots and works normally — these are all filesystem
+ * failures in the container's writable home, and under disk pressure throwing
+ * would convert "peer codex degraded" into "every container crash-loops".
+ * It also needs no filesystem operation, so it still holds in the case where
+ * `mkdirSync` itself is what failed.
+ */
+function failClosed(what: string, err: unknown): string {
+  const detail = err instanceof Error ? err.message : String(err);
+  log(
+    `FAIL-CLOSED: peer-mode Codex DISABLED for this container — ${what}: ${detail}. ` +
+      `CODEX_HOME is set to the nonexistent sentinel ${FAILED_CODEX_HOME}, so \`codex exec\` will refuse ` +
+      `to start rather than run unguarded against the host-mounted ${HOST_CODEX_DIR}. ` +
+      `The primary agent provider is unaffected. Most likely cause: no space / bad permissions on /home/node.`,
+  );
+  return FAILED_CODEX_HOME;
+}
+
+/**
  * Set up `/home/node/.codex-runtime/` and return the path so callers can
- * point `CODEX_HOME` at it. Returns `null` when the codex auth mount is
- * absent (no host `~/.codex/auth.json`).
+ * point `CODEX_HOME` at it. Returns `null` ONLY when the codex auth mount is
+ * absent (no host `~/.codex/auth.json`) — benign, since codex cannot run at
+ * all without auth. Every other failure returns the nonexistent
+ * `FAILED_CODEX_HOME` sentinel, which disables peer-mode codex without taking
+ * the container down (see `failClosed`). No filesystem failure throws.
+ * (`buildRuntimeConfig` can still throw on a malformed MCP server entry — a
+ * wiring bug, not a runtime condition, and pre-existing behavior.)
  *
  * `runtime` identifies the host agent runtime driving this peer-mode Codex
  * invocation (never `'codex'` itself — a codex-primary session writes its
@@ -307,8 +350,7 @@ export function setupCodexRuntime(
   try {
     fs.mkdirSync(RUNTIME_CODEX_DIR, { recursive: true });
   } catch (err) {
-    log(`Failed to create runtime dir: ${err instanceof Error ? err.message : String(err)}`);
-    return null;
+    return failClosed('could not create the runtime dir', err);
   }
 
   // Symlink auth.json so OAuth token refresh writes back to the host's
@@ -324,8 +366,7 @@ export function setupCodexRuntime(
   try {
     fs.symlinkSync(hostAuth, runtimeAuth);
   } catch (err) {
-    log(`Failed to symlink auth.json: ${err instanceof Error ? err.message : String(err)}`);
-    return null;
+    return failClosed('could not symlink auth.json', err);
   }
 
   // agents/: symlink the GROUP-OWNED subagent roster
@@ -362,8 +403,7 @@ export function setupCodexRuntime(
   try {
     fs.writeFileSync(runtimeConfigPath, mergedConfig);
   } catch (err) {
-    log(`Failed to write merged config.toml: ${err instanceof Error ? err.message : String(err)}`);
-    return null;
+    return failClosed('could not write the merged config.toml', err);
   }
 
   // Peer-mode `codex exec` reads this synthesized CODEX_HOME directly. Its
@@ -373,8 +413,7 @@ export function setupCodexRuntime(
   try {
     writeCodexHooksJson({ codexHome: RUNTIME_CODEX_DIR });
   } catch (err) {
-    log(`Failed to write peer Codex hooks.json: ${err instanceof Error ? err.message : String(err)}`);
-    return null;
+    return failClosed('could not write the peer Codex hooks.json', err);
   }
 
   // Container-owned plugin registration: build the runtime's own plugin

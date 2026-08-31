@@ -225,6 +225,13 @@ async function main(): Promise<void> {
     // Pass the host runtime so the registration log names it accurately. Only the
     // label varies — which plugins get registered is always codex's own set,
     // since this CODEX_HOME is what the peer `codex` process reads.
+    // `null` means only one thing: no codex auth is mounted, so peer-mode codex
+    // cannot run at all and CODEX_HOME is left unset. Any OTHER failure returns
+    // the nonexistent FAILED_CODEX_HOME sentinel rather than null — a truthy
+    // value we deliberately still assign, because an unset CODEX_HOME would run
+    // codex unguarded against the host-mounted ~/.codex. So a non-null result
+    // means "CODEX_HOME is authoritative", NOT "peer codex is usable": on the
+    // sentinel, codex refuses to start (see failClosed in codex-companion-setup).
     const codexHome = setupCodexRuntime(mcpServers, providerName === 'opencode' ? 'opencode' : 'claude');
     if (codexHome) {
       process.env.CODEX_HOME = codexHome;

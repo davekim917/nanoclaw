@@ -135,6 +135,38 @@ describe('buildRuntimeConfig', () => {
     const source = fs.readFileSync(new URL('./codex-companion-setup.ts', import.meta.url), 'utf8');
     expect(source).toMatch(/writeCodexHooksJson\(\{\s*codexHome:\s*RUNTIME_CODEX_DIR\s*\}\)/);
   });
+
+  it('setupCodexRuntime fails closed on codex, not on the container', () => {
+    // A `return null` on a hard failure is a guard BYPASS, not a degrade: the
+    // caller only sets CODEX_HOME on a non-null return, so peer `codex exec`
+    // would fall back to the host-mounted /home/node/.codex — authenticated and
+    // with no PreToolUse guard chain. Hard paths must hand back the nonexistent
+    // sentinel instead, which codex refuses to start on. Throwing would also
+    // close the guard but takes the whole container down over an optional peer
+    // feature — under disk pressure that turns a degrade into a crash-loop.
+    const source = fs.readFileSync(new URL('./codex-companion-setup.ts', import.meta.url), 'utf8');
+    const start = source.indexOf('export function setupCodexRuntime');
+    expect(start).toBeGreaterThan(-1);
+    const body = source.slice(start, source.indexOf('\nfunction replaceWithDirectorySymlink', start));
+
+    // The ONLY null return is the benign missing-auth case.
+    expect(body.match(/return null/g) ?? []).toHaveLength(1);
+    expect(body).toMatch(/Host codex auth not mounted[\s\S]*?return null/);
+    // mkdir, auth symlink, config.toml write, hooks.json write — all four
+    // hand the sentinel back to the caller.
+    expect(body.match(/return failClosed\(/g) ?? []).toHaveLength(4);
+    expect(body).not.toMatch(/\bthrow new\b/);
+
+    // The sentinel must be a nonexistent path (codex hard-errors on it), and
+    // failClosed must RETURN it rather than throw. Slice the helper's own body
+    // only — trailing docs are prose and may legitimately say "throw".
+    expect(source).toMatch(/const FAILED_CODEX_HOME = '\/nonexistent\/[^']+';/);
+    const helperStart = source.indexOf('function failClosed(');
+    const helper = source.slice(helperStart, source.indexOf('\n}\n', helperStart));
+    expect(helper).toMatch(/^function failClosed\(what: string, err: unknown\): string \{/);
+    expect(helper).toContain('return FAILED_CODEX_HOME;');
+    expect(helper).not.toMatch(/\bthrow new\b/);
+  });
 });
 
 describe('stripPluginsAndMarketplaces', () => {

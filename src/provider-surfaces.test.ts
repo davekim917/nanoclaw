@@ -38,6 +38,7 @@ vi.mock('./db/messaging-groups.js', async (importOriginal) => {
 });
 
 import { buildMounts } from './container-runner.js';
+import { buildContainerCodexConfig } from './providers/codex.js';
 import { closeDb, createAgentGroup, getDb, initTestDb, runMigrations } from './db/index.js';
 import { ensureContainerConfig, updateContainerConfigScalars } from './db/container-configs.js';
 import { initGroupFilesystem } from './group-init.js';
@@ -131,6 +132,70 @@ describe('container instruction contracts', () => {
     expect(instructions).toContain('`timeout` to `3600000`');
     expect(instructions).not.toContain('`timeout` to `600000`');
     expect(instructions).not.toContain('team-qa/team-review');
+  });
+
+  // ── Hand-synced host/container constants ──
+  // The container tree is a separate Bun package (vitest excludes it, and an
+  // import risks pulling in bun:sqlite), so the container side is read as TEXT.
+  const CODEX_COMPANION_SETUP = 'container/agent-runner/src/codex-companion-setup.ts';
+  const CONTAINER_RUNNER = 'src/container-runner.ts';
+
+  const readRepoFile = (rel: string) => fs.readFileSync(path.join(process.cwd(), rel), 'utf-8');
+
+  const PARALLEL_IMPL_NOTE =
+    'These are a DELIBERATE parallel implementation: the host is Node/ESM and the container is Bun, ' +
+    'and they share no modules by design. Extraction is not an option — update BOTH files together.';
+
+  it('keeps the container Codex base config identical on both sides of the host/container boundary', () => {
+    // Evaluate the container's array literal instead of substring-matching the
+    // source: the `[projects."…"]` lines are built by a flatMap over template
+    // literals, so they never appear verbatim in the file text.
+    const src = readRepoFile(CODEX_COMPANION_SETUP);
+    const literal = src.match(/const CONTAINER_CODEX_CONFIG_BASE = (\[[\s\S]*?\n\]\.join\('\\n'\));/);
+    expect(
+      literal,
+      `Could not find the CONTAINER_CODEX_CONFIG_BASE array literal in ${CODEX_COMPANION_SETUP}. ` +
+        `If it was reshaped, update this test to match — it is the only thing keeping it in sync with ` +
+        `buildContainerCodexConfig() in src/providers/codex.ts. ${PARALLEL_IMPL_NOTE}`,
+    ).not.toBeNull();
+    const containerBase = new Function(`return ${literal![1]}`)() as string;
+
+    // Comments differ by design (each names its own generating file); every
+    // other line must match exactly, in order, in both directions.
+    const settings = (toml: string) =>
+      toml
+        .split('\n')
+        .map((line) => line.trim())
+        .filter((line) => line && !line.startsWith('#'));
+
+    expect(
+      settings(containerBase),
+      `Codex container config DRIFT between src/providers/codex.ts (buildContainerCodexConfig) and ` +
+        `${CODEX_COMPANION_SETUP} (CONTAINER_CODEX_CONFIG_BASE). ${PARALLEL_IMPL_NOTE} ` +
+        `Every non-comment line — sandbox_mode, approval_policy, approvals_reviewer, [features], ` +
+        `[features.multi_agent_v2], and the [projects."…"] trusted roots — must be byte-identical.`,
+    ).toEqual(settings(buildContainerCodexConfig()));
+  });
+
+  it('keeps IN_TREE_SHADOWED_PLUGINS identical on both sides of the host/container boundary', () => {
+    // The host copy is a function-local const in buildMounts, so both sides are
+    // read as text.
+    const shadowed = (rel: string) => {
+      const m = readRepoFile(rel).match(/IN_TREE_SHADOWED_PLUGINS = (?:new Set\()?\[([^\]]*)\]/);
+      expect(
+        m,
+        `Could not find IN_TREE_SHADOWED_PLUGINS in ${rel}. If it was reshaped, update this test — ` +
+          `it is the only thing keeping the host and container copies in sync. ${PARALLEL_IMPL_NOTE}`,
+      ).not.toBeNull();
+      return [...m![1].matchAll(/'([^']*)'/g)].map((q) => q[1]);
+    };
+
+    expect(
+      shadowed(CODEX_COMPANION_SETUP),
+      `IN_TREE_SHADOWED_PLUGINS DRIFT between ${CONTAINER_RUNNER} (host mount exclusion) and ` +
+        `${CODEX_COMPANION_SETUP} (container plugin registration). ${PARALLEL_IMPL_NOTE} ` +
+        `A plugin dropped from one side either gets double-delivered or silently un-shadowed.`,
+    ).toEqual(shadowed(CONTAINER_RUNNER));
   });
 });
 
