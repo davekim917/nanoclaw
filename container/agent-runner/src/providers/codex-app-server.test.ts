@@ -346,6 +346,45 @@ describe('writeCodexMcpConfigToml', () => {
     }
   });
 
+  it('does not accumulate the runtime-MCP marker comment across repeated writes', () => {
+    // stripExistingMcpServers only dropped [mcp_servers.*] blocks, not the
+    // marker comment above them — every spawn appended a fresh marker,
+    // so a long-lived $HOME/.codex/config.toml grew one duplicate per run.
+    const prevHome = process.env.HOME;
+    const prevCodexHome = process.env.CODEX_HOME;
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-home-'));
+    try {
+      process.env.HOME = home;
+      delete process.env.CODEX_HOME;
+      // Marker only appears once there's non-MCP base content to append after
+      // (an empty/mcp-only file strips down to an empty base and no marker).
+      const codexDir = path.join(home, '.codex');
+      fs.mkdirSync(codexDir, { recursive: true });
+      fs.writeFileSync(path.join(codexDir, 'config.toml'), '[features]\nhooks = true\n');
+
+      writeCodexMcpConfigToml({ nanoclaw: { command: 'bun', args: ['run', 'x'] } });
+      writeCodexMcpConfigToml({ nanoclaw: { command: 'bun', args: ['run', 'x'] } });
+
+      const config = fs.readFileSync(path.join(home, '.codex', 'config.toml'), 'utf-8');
+      const markerCount = config.split('# --- nanoclaw runtime MCP servers ---').length - 1;
+      expect(markerCount).toBe(1);
+      expect(config).toContain('[features]');
+      expect(config).toContain('[mcp_servers.nanoclaw]');
+    } finally {
+      if (prevHome === undefined) {
+        delete process.env.HOME;
+      } else {
+        process.env.HOME = prevHome;
+      }
+      if (prevCodexHome === undefined) {
+        delete process.env.CODEX_HOME;
+      } else {
+        process.env.CODEX_HOME = prevCodexHome;
+      }
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
   it('writes config.toml + hooks.json to CODEX_HOME, not $HOME/.codex (codex #126 rotation)', () => {
     // On OAuth rotation the provider sets CODEX_HOME to a fallback dir; the writers
     // must target it (else the rotated app-server runs with stale config and — for

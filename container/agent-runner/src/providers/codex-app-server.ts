@@ -489,10 +489,13 @@ export interface CodexHttpMcpServer {
   headers?: Record<string, string>;
 }
 
+const MCP_MARKER = '# --- nanoclaw runtime MCP servers ---';
+
 function stripExistingMcpServers(toml: string): string {
   const out: string[] = [];
   let inMcpBlock = false;
   for (const line of toml.split('\n')) {
+    if (line.trim() === MCP_MARKER) continue;
     const header = line.match(/^\s*\[([^\]]+)\]\s*$/);
     if (header) {
       inMcpBlock = header[1].trim().startsWith('mcp_servers.');
@@ -500,7 +503,9 @@ function stripExistingMcpServers(toml: string): string {
     }
     if (!inMcpBlock) out.push(line);
   }
-  return out.join('\n').trimEnd();
+  // Collapse blank-line runs left behind by the removed marker/blocks.
+  const collapsed = out.filter((line, i) => line !== '' || out[i - 1] !== '');
+  return collapsed.join('\n').trimEnd();
 }
 
 export function writeCodexMcpConfigToml(servers: Record<string, CodexMcpServer>): void {
@@ -518,7 +523,7 @@ export function writeCodexMcpConfigToml(servers: Record<string, CodexMcpServer>)
     base = '';
   }
 
-  const lines: string[] = base ? [base, '', '# --- nanoclaw runtime MCP servers ---', ''] : [];
+  const lines: string[] = base ? [base, '', MCP_MARKER, ''] : [];
   for (const [name, config] of Object.entries(servers)) {
     lines.push(`[mcp_servers.${name}]`);
     if (config.type === 'http') {
