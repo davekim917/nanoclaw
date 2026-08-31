@@ -42,7 +42,7 @@ import { buildContainerCodexConfig } from './providers/codex.js';
 import { closeDb, createAgentGroup, getDb, initTestDb, runMigrations } from './db/index.js';
 import { ensureContainerConfig, updateContainerConfigScalars } from './db/container-configs.js';
 import { initGroupFilesystem } from './group-init.js';
-import { PERSONA_PREPEND_FILE, STANDING_INSTRUCTIONS_FILE, readGroupPersona } from './group-persona.js';
+import { STANDING_INSTRUCTIONS_FILE, readGroupPersona } from './group-persona.js';
 import {
   getProviderContainerConfig,
   registerProviderContainerConfig,
@@ -386,22 +386,18 @@ describe('initGroupFilesystem legacy seed isolation', () => {
     expect(fs.existsSync(path.join(groupDir, 'memory'))).toBe(false);
   });
 
-  // Simulates a pre-migration group whose operator content lives under the
-  // LEGACY filename only. A fresh stamp must never shadow it with a new
-  // canonical file — see group-persona.ts's stageGroupPersona.
-  it('does not overwrite existing nonempty instruction surfaces (legacy filename)', () => {
+  it('does not overwrite existing nonempty instruction surfaces', () => {
     const ag = group('ag-existing-instructions', 'existing-instructions-group');
     createAgentGroup(ag);
     const groupDir = path.join(GROUPS_DIR, ag.folder);
     fs.mkdirSync(groupDir, { recursive: true });
-    fs.writeFileSync(path.join(groupDir, PERSONA_PREPEND_FILE), 'operator persona\n');
+    fs.writeFileSync(path.join(groupDir, STANDING_INSTRUCTIONS_FILE), 'operator persona\n');
     fs.writeFileSync(path.join(groupDir, 'CLAUDE.local.md'), 'operator local\n');
 
     initGroupFilesystem(ag, { instructions: 'replacement' });
     initGroupFilesystem(ag, { instructions: 'another replacement' });
 
-    expect(fs.readFileSync(path.join(groupDir, PERSONA_PREPEND_FILE), 'utf-8')).toBe('operator persona\n');
-    expect(fs.existsSync(path.join(groupDir, STANDING_INSTRUCTIONS_FILE))).toBe(false);
+    expect(fs.readFileSync(path.join(groupDir, STANDING_INSTRUCTIONS_FILE), 'utf-8')).toBe('operator persona\n');
     expect(fs.readFileSync(path.join(groupDir, 'CLAUDE.local.md'), 'utf-8')).toBe('operator local\n');
   });
 });

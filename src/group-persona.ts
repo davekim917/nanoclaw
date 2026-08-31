@@ -16,33 +16,14 @@ function isErrno(err: unknown, code: string): boolean {
 export const STANDING_INSTRUCTIONS_FILE = 'standing-instructions.md';
 
 /**
- * Legacy filename from before the rename above. Read as a one-release
- * fallback when the canonical file is absent — never written to by new code.
- */
-export const PERSONA_PREPEND_FILE = 'instructions.prepend.md';
-
-function pathHasEntry(p: string): boolean {
-  try {
-    fs.lstatSync(p);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-/**
  * Create a group's standing instructions without following or replacing an
- * existing path. Returns false when the content is empty, or when the group
- * already has standing instructions under EITHER the canonical or the legacy
- * filename — an operator's existing content (whichever name it lives under)
- * always stays authoritative over a fresh stamp.
+ * existing path. Returns false when the content is empty or the path exists.
  */
 export function stageGroupPersona(groupDir: string, instructions: string): boolean {
   const content = instructions.trimEnd();
   if (!content.trim()) return false;
 
   fs.mkdirSync(groupDir, { recursive: true });
-  if (pathHasEntry(path.join(groupDir, PERSONA_PREPEND_FILE))) return false;
   try {
     fs.writeFileSync(path.join(groupDir, STANDING_INSTRUCTIONS_FILE), `${content}\n`, { flag: 'wx' });
     return true;
@@ -76,22 +57,10 @@ export function stageGroupPersona(groupDir: string, instructions: string): boole
  * inject another tenant's `CLAUDE.local.md` or memory into this prompt. The
  * default is own-directory-only so a caller that forgets the set fails closed.
  * Anything resolving outside is refused and the persona omitted.
- *
- * Checks the canonical `standing-instructions.md` first; if that path has no
- * entry at all (not even a symlink), falls back to the legacy
- * `instructions.prepend.md` with identical containment logic. A group with a
- * canonical file never falls back, even if that file fails to read for some
- * other reason — presence of the canonical name means migration is done.
  */
 export function readGroupPersona(groupDir: string, allowedRoots?: string[]): string | null {
+  const file = path.join(groupDir, STANDING_INSTRUCTIONS_FILE);
   const roots = (allowedRoots?.length ? allowedRoots : [groupDir]).map((dir) => path.resolve(dir));
-  const canonical = path.join(groupDir, STANDING_INSTRUCTIONS_FILE);
-  const filename = pathHasEntry(canonical) ? STANDING_INSTRUCTIONS_FILE : PERSONA_PREPEND_FILE;
-  return readPersonaFile(groupDir, filename, roots);
-}
-
-function readPersonaFile(groupDir: string, filename: string, roots: string[]): string | null {
-  const file = path.join(groupDir, filename);
   let fd: number | undefined;
   try {
     try {

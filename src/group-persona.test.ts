@@ -6,12 +6,7 @@ vi.mock('./log.js', () => ({
   log: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn(), fatal: vi.fn() },
 }));
 
-import {
-  PERSONA_PREPEND_FILE,
-  STANDING_INSTRUCTIONS_FILE,
-  readGroupPersona,
-  stageGroupPersona,
-} from './group-persona.js';
+import { STANDING_INSTRUCTIONS_FILE, readGroupPersona, stageGroupPersona } from './group-persona.js';
 import { log } from './log.js';
 
 const TMP = '/tmp/nanoclaw-group-persona-test';
@@ -33,12 +28,12 @@ describe('readGroupPersona', () => {
   });
 
   it('returns null for an empty / whitespace-only file', () => {
-    fs.writeFileSync(path.join(TMP, PERSONA_PREPEND_FILE), '  \n\n');
+    fs.writeFileSync(path.join(TMP, STANDING_INSTRUCTIONS_FILE), '  \n\n');
     expect(readGroupPersona(TMP)).toBeNull();
   });
 
   it('returns the trimmed content when present', () => {
-    fs.writeFileSync(path.join(TMP, PERSONA_PREPEND_FILE), '\nYou are an SDR agent.\n\n');
+    fs.writeFileSync(path.join(TMP, STANDING_INSTRUCTIONS_FILE), '\nYou are an SDR agent.\n\n');
     expect(readGroupPersona(TMP)).toBe('You are an SDR agent.');
   });
 
@@ -53,8 +48,8 @@ describe('readGroupPersona', () => {
     const sibling = path.join(root, 'sibling-group');
     fs.mkdirSync(source, { recursive: true });
     fs.mkdirSync(sibling, { recursive: true });
-    fs.writeFileSync(path.join(source, PERSONA_PREPEND_FILE), 'Shared standing instructions.\n');
-    fs.symlinkSync(path.join(source, PERSONA_PREPEND_FILE), path.join(sibling, PERSONA_PREPEND_FILE));
+    fs.writeFileSync(path.join(source, STANDING_INSTRUCTIONS_FILE), 'Shared standing instructions.\n');
+    fs.symlinkSync(path.join(source, STANDING_INSTRUCTIONS_FILE), path.join(sibling, STANDING_INSTRUCTIONS_FILE));
 
     const roots = [sibling, source];
     expect(readGroupPersona(sibling, roots)).toBe('Shared standing instructions.');
@@ -74,7 +69,7 @@ describe('readGroupPersona', () => {
     fs.mkdirSync(otherTenant, { recursive: true });
     const theirs = path.join(otherTenant, 'CLAUDE.local.md');
     fs.writeFileSync(theirs, 'other tenant scope rules\n');
-    fs.symlinkSync(theirs, path.join(group, PERSONA_PREPEND_FILE));
+    fs.symlinkSync(theirs, path.join(group, STANDING_INSTRUCTIONS_FILE));
 
     expect(readGroupPersona(group, [group])).toBeNull();
     expect(log.warn).toHaveBeenCalledWith(
@@ -91,24 +86,10 @@ describe('readGroupPersona', () => {
     const sibling = path.join(root, 'sibling-group');
     fs.mkdirSync(group, { recursive: true });
     fs.mkdirSync(sibling, { recursive: true });
-    fs.writeFileSync(path.join(sibling, PERSONA_PREPEND_FILE), 'sibling content\n');
-    fs.symlinkSync(path.join(sibling, PERSONA_PREPEND_FILE), path.join(group, PERSONA_PREPEND_FILE));
+    fs.writeFileSync(path.join(sibling, STANDING_INSTRUCTIONS_FILE), 'sibling content\n');
+    fs.symlinkSync(path.join(sibling, STANDING_INSTRUCTIONS_FILE), path.join(group, STANDING_INSTRUCTIONS_FILE));
 
     expect(readGroupPersona(group)).toBeNull();
-  });
-
-  // Amendment: persona.md/instructions.prepend.md was renamed — reads now
-  // check the canonical standing-instructions.md first, falling back to the
-  // legacy filename only when the canonical path has no entry at all.
-  it('reads the canonical standing-instructions.md over a legacy file when both exist', () => {
-    fs.writeFileSync(path.join(TMP, PERSONA_PREPEND_FILE), 'legacy content\n');
-    fs.writeFileSync(path.join(TMP, STANDING_INSTRUCTIONS_FILE), 'canonical content\n');
-    expect(readGroupPersona(TMP)).toBe('canonical content');
-  });
-
-  it('falls back to the legacy file when the canonical one is absent', () => {
-    fs.writeFileSync(path.join(TMP, PERSONA_PREPEND_FILE), 'legacy content\n');
-    expect(readGroupPersona(TMP)).toBe('legacy content');
   });
 
   it('refuses a symlink that escapes the groups tree entirely', () => {
@@ -117,7 +98,7 @@ describe('readGroupPersona', () => {
     fs.mkdirSync(group, { recursive: true });
     const outside = path.join(TMP, 'outside.md');
     fs.writeFileSync(outside, 'host-only content\n');
-    fs.symlinkSync(outside, path.join(group, PERSONA_PREPEND_FILE));
+    fs.symlinkSync(outside, path.join(group, STANDING_INSTRUCTIONS_FILE));
 
     expect(readGroupPersona(group, [group])).toBeNull();
     expect(log.warn).toHaveBeenCalledWith(
@@ -137,19 +118,9 @@ describe('stageGroupPersona', () => {
   it('does not replace an existing symlink', () => {
     const target = path.join(TMP, 'target.md');
     fs.writeFileSync(target, 'keep me\n');
-    fs.symlinkSync(target, path.join(TMP, PERSONA_PREPEND_FILE));
+    fs.symlinkSync(target, path.join(TMP, STANDING_INSTRUCTIONS_FILE));
 
     expect(stageGroupPersona(TMP, 'replacement')).toBe(false);
     expect(fs.readFileSync(target, 'utf-8')).toBe('keep me\n');
-  });
-
-  // A group already carrying operator content under the LEGACY filename must
-  // not get a second, silently-authoritative canonical file stamped over it.
-  it('does not stage a canonical file when legacy standing instructions already exist', () => {
-    fs.writeFileSync(path.join(TMP, PERSONA_PREPEND_FILE), 'operator content\n');
-
-    expect(stageGroupPersona(TMP, 'replacement')).toBe(false);
-    expect(fs.existsSync(path.join(TMP, STANDING_INSTRUCTIONS_FILE))).toBe(false);
-    expect(fs.readFileSync(path.join(TMP, PERSONA_PREPEND_FILE), 'utf-8')).toBe('operator content\n');
   });
 });

@@ -409,14 +409,8 @@ export const CONTAINER_BYTES_CEILING = 10_240;
 /** Per group: its standing-instructions/persona file(s) + CLAUDE.local.md. */
 export const GROUP_STANDING_BYTES_CEILING = 8_192;
 
-/**
- * Both persona filenames are read during the L2/L3 rename transition
- * (`instructions.prepend.md` → `standing-instructions.md`): a group carries
- * one or the other. If a migration bug leaves both as real (non-symlink)
- * files, both get counted — that's a real doubling of always-on content and
- * should push the group over ceiling, not be silently averaged away.
- */
-const GROUP_STANDING_FILENAMES = ['standing-instructions.md', 'instructions.prepend.md', 'CLAUDE.local.md'];
+/** A group's standing-instructions file plus its CLAUDE.local.md. */
+const GROUP_STANDING_FILENAMES = ['standing-instructions.md', 'CLAUDE.local.md'];
 
 const BANNED_PATTERNS: Array<{ name: string; re: RegExp }> = [
   { name: 'iso_date', re: /\b20\d{2}-\d{2}-\d{2}\b/ },

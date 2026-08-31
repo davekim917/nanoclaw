@@ -424,26 +424,6 @@ describe('checkGroupStandingBytes', () => {
     expect(breaches.map((b) => b.scope)).toEqual(['dated-group']);
   });
 
-  it('reads the legacy instructions.prepend.md filename during the rename transition', () => {
-    const g = path.join(groupsRoot(), 'legacy-group');
-    fs.mkdirSync(g, { recursive: true });
-    fs.writeFileSync(path.join(g, 'instructions.prepend.md'), 'Fixed on 2026-08-31.\n');
-    const breaches = checkGroupStandingBytes(groupsRoot());
-    expect(breaches).toHaveLength(1);
-    expect(breaches[0].bannedHits[0].patterns).toContain('iso_date');
-  });
-
-  it('counts both persona filenames if a migration bug leaves both as real files (naturally pushes it over ceiling)', () => {
-    const g = path.join(groupsRoot(), 'both-names-group');
-    fs.mkdirSync(g, { recursive: true });
-    fs.writeFileSync(path.join(g, 'standing-instructions.md'), cleanContent(GROUP_STANDING_BYTES_CEILING - 100));
-    fs.writeFileSync(path.join(g, 'instructions.prepend.md'), cleanContent(GROUP_STANDING_BYTES_CEILING - 100));
-    const breaches = checkGroupStandingBytes(groupsRoot());
-    expect(breaches).toHaveLength(1);
-    expect(breaches[0].overCeiling).toBe(true);
-    expect(breaches[0].bytes).toBe(2 * (GROUP_STANDING_BYTES_CEILING - 100));
-  });
-
   it('counts a symlinked CLAUDE.local.md once, not once per sibling group (no double-count, no double-flag)', () => {
     const source = path.join(groupsRoot(), 'acme');
     const sibling = path.join(groupsRoot(), 'acme-codex');
