@@ -101,11 +101,12 @@ codex-review.sh body <comment_id>         # the full finding
 codex-review.sh churn                     # files drawing findings across 3+ rounds — the churn detector
 codex-review.sh reply <comment_id> <text> # reply on that thread
 codex-review.sh resolve <thread_id>       # mark it resolved
-codex-review.sh status <sha> <since_iso>  # codex=<pending|clean|findings> open=<n> review=<n> reaction=<n>
+codex-review.sh status <sha> <since_iso>  # codex=<pending|clean|findings> open=<n> review=<n> reaction=<n> rounds=<n>
 ```
 
 Three details it encodes, each of which has cost real debugging time — keep them if you ever hand-roll the API calls:
 
+- `open` and `status` print the PR's total round count (distinct findings-bearing Codex reviews) and a STOP banner at 4+. The banner is the round-4+ diagnosis path above made deterministic: per-file churn detection missed a 16-round PR whose findings hopped between files, so the tripwire fires on total rounds regardless of where the findings land. Acknowledge it by diagnosing, never by pushing.
 - The reviewer is `chatgpt-codex-connector` in GraphQL and `chatgpt-codex-connector[bot]` in REST. Match case-insensitively on a prefix, never `==` against one spelling.
 - `commit_id` comes back as the full 40-char SHA. `startswith` your short SHA; `==` never matches.
 - Codex signals a clean review two ways: a review with no findings, **or** just a 👍 reaction on the PR. Poll only `/reviews` and you wait forever on a clean PR. An `eyes` reaction means the review is still running — not a result.
@@ -127,6 +128,8 @@ Build one table covering the whole open set, then work it. Two verdicts:
 - **Accept** — the finding is real. Name the concrete failure: which input, which path, what goes wrong.
 - **Reject** — you traced the code and it doesn't hold. A rejection needs evidence: the exact `file.ts:line` you read, the test or invariant that already covers it, or the contract the comment misreads. "Looks fine to me" is not a rejection, it's a shrug. If you can't produce the evidence, it's an accept.
 
+**An accept authorizes the finding, not any fix.** Before a finding enters the batch, look at what its honest fix touches. If it expands the PR — new machinery (a helper layer, a flag, a wrapper, config), a new dependency, or edits outside the diff's existing footprint — that is scope expansion, and scope is the user's call, not the reviewer's: pull it from the batch, post the finding with the fix you would make, and let the user route it onto this PR or its own. Scope quietly grown one accepted fix at a time is how a 200-line PR is an 800-line diff by round 5.
+
 Review comments are hypotheses, not instructions. If an existing test asserts the opposite of what a comment demands, that test is the current contract — reject, cite the test, and don't edit the test to satisfy the reviewer.
 
 Post the triage table to the user before editing. It is the round's plan, and it's where a 4+ round pattern becomes visible early.
@@ -134,6 +137,8 @@ Post the triage table to the user before editing. It is the round's plan, and it
 ## Step 3 — Fix the whole batch in one commit
 
 Apply every accepted fix, run the tests that cover them, then commit **once**:
+
+**Prefer the fix that subtracts.** For each accepted finding, reach for simplification first: tighten a guard that already exists, hoist the check to the seam every caller shares, delete the path the finding lives on. Adding machinery to satisfy a comment is the churn generator from the diagnosis section — this round's new wrapper is next round's findings. If no simplifying fix exists, that is a design signal, not a license to build: move the finding to the scope-expansion path in step 2 instead of coding around it.
 
 Run whatever suite and typecheck the touched tree owns — the repo's own commands, not a remembered one.
 Commit and push once — `git_commit` / `git_push` if you have those MCP tools, plain `git commit` / `git push` otherwise.
@@ -220,6 +225,7 @@ Then run whatever post-PR bookkeeping your environment expects — e.g. `add_shi
 - **One comment, one commit, one push.** The loop that never ends. Batch or don't push.
 - **Commenting `@codex review` at all.** It overrides the reviewer's own judgment about whether the commit needed a look, and every one you send is a round you then have to work.
 - **Treating a review you asked for as evidence the change is troubled.** It is evidence you asked.
+- **Fixing by addition.** Each round's fix adds a guard, a flag, a wrapper, and the new machinery draws the next round's findings. Simplify first; escalate what can't be simplified.
 - **Replying without resolving.** Next round you re-triage threads you already answered.
 - **Rejecting to save a round.** A rejection without a traced `file:line` is an accept you skipped.
 - **Editing a test so a review comment passes.** The test is the contract; change it only when the user changes the contract.
