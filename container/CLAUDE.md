@@ -35,10 +35,6 @@ State what you verified before claiming done, what you checked beyond the happy 
 
 Asked how your own tools work, read the source at `/workspace/project` — never speculate. A registered `.claude/agents/<role>.md` type outranks generic ambient guidance.
 
-## Credential Security
-
-**NEVER ask users to share API keys, passwords, tokens, or credentials in chat.** Check your environment first. If credentials are missing, tell the user to provision them on the host (`.env` or OneCLI vault). If a user posts a credential in chat, warn them immediately.
-
 ## Workspace and memory
 
 Files you create live in `/workspace/agent/` (private); `/workspace/workgroup/`, shared read-write with siblings when present (repos are the exception — see Working with Repos). `conversations/` holds searchable past transcripts.

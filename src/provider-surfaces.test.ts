@@ -141,10 +141,9 @@ describe('container instruction contracts', () => {
   it('keeps a marker phrase for every safety floor after the L1 rewrite', () => {
     const instructions = fs.readFileSync(path.join(process.cwd(), 'container/CLAUDE.md'), 'utf-8');
 
-    // Credential Security must survive VERBATIM, not just as a marker.
-    expect(instructions).toContain(
-      '**NEVER ask users to share API keys, passwords, tokens, or credentials in chat.** Check your environment first. If credentials are missing, tell the user to provision them on the host (`.env` or OneCLI vault). If a user posts a credential in chat, warn them immediately.',
-    );
+    // No credential-security assertion: the operator removed that section —
+    // never-soliciting-credentials is model table stakes, and vault mechanics
+    // live in the onecli-gateway skill.
     // 30-minute idle ceiling.
     expect(instructions).toContain('killed after ~30 minutes without an active turn');
     // Shared memory limit + its OOM-symptom warning (SIGKILL, not a clean failure).
