@@ -55,10 +55,15 @@ const MODEL_ALIAS_MAP: Record<string, string> = {
   // bare `opus` alias resolves to (DEFAULT_OPUS_MODEL in container-runner.ts).
   opus5: 'claude-opus-5[1m]',
   'opus-5': 'claude-opus-5[1m]',
-  // Fable 5 (GA 2026-06-09): single-digit version scheme (claude-fable-5,
-  // not -5-0). 1M-context-only in this fork, same policy as opus. NOTE:
-  // $10/$50 per MTok — 2x Opus 4.8; opt-in via flag, never a default.
-  fable: 'claude-fable-5[1m]',
+  // Fable 5.1 (GA 2026-09-01): two-segment version scheme (claude-fable-5-1),
+  // like opus-4-8. 1M-context-only in this fork, same policy as opus. NOTE:
+  // $10/$50 per MTok — 2x Opus 4.8; opt-in via flag, never a default. Bare
+  // `fable` tracks the newest fable — currently 5.1. Fable 5 (claude-fable-5,
+  // single-digit version scheme) is still served and stays pinned below.
+  fable: 'claude-fable-5-1[1m]',
+  fable51: 'claude-fable-5-1[1m]',
+  'fable5-1': 'claude-fable-5-1[1m]',
+  'fable-5-1': 'claude-fable-5-1[1m]',
   fable5: 'claude-fable-5[1m]',
   'fable-5': 'claude-fable-5[1m]',
   // Sonnet 5 (GA): single-digit version scheme (claude-sonnet-5, not -5-0),
@@ -111,7 +116,7 @@ export function resolveEffectiveModel(raw: string): string {
 }
 
 const VALID_MODEL_RE =
-  /^(?:opus|sonnet|haiku|default|claude-opus-\d+(?:-\d+)?(?:\[\dm\])?|claude-haiku-\d+-\d+(?:\[\dm\])?|claude-sonnet-\d+(?:\[\dm\])?|claude-fable-\d+(?:\[\dm\])?)$/;
+  /^(?:opus|sonnet|haiku|default|claude-opus-\d+(?:-\d+)?(?:\[\dm\])?|claude-haiku-\d+-\d+(?:\[\dm\])?|claude-sonnet-\d+(?:\[\dm\])?|claude-fable-\d+(?:-\d+)?(?:\[\dm\])?)$/;
 
 /**
  * Opus is only supported in its 1M-context form in this fork. Auto-append
@@ -128,9 +133,10 @@ const VALID_MODEL_RE =
  * `[Nm]` suffix.
  */
 export function ensureOpus1mSuffix(model: string): string {
-  // Fable shares the opus 1M-only policy (single-digit version: claude-fable-5).
-  // Opus itself now spans both version schemes: claude-opus-4-8 and claude-opus-5.
-  return /^claude-(?:opus-\d+(?:-\d+)?|fable-\d+)$/i.test(model) ? `${model}[1m]` : model;
+  // Fable shares the opus 1M-only policy and now spans both version schemes
+  // too: claude-fable-5 (single-digit) and claude-fable-5-1 (two-segment).
+  // Opus itself spans both version schemes: claude-opus-4-8 and claude-opus-5.
+  return /^claude-(?:opus-\d+(?:-\d+)?|fable-\d+(?:-\d+)?)$/i.test(model) ? `${model}[1m]` : model;
 }
 
 export function resolveModelAlias(raw: string): string {
@@ -172,6 +178,9 @@ const MODEL_EFFORT_SUPPORT: Record<string, ReadonlySet<EffortLevel>> = {
   // 2026-06-09). Adaptive thinking is ALWAYS ON for fable — `disabled` is
   // rejected by the API — so effort is the only depth control.
   'claude-fable-5[1m]': new Set(['low', 'medium', 'high', 'xhigh', 'max']),
+  // Fable 5.1 (GA 2026-09-01): same effort surface as Fable 5 — adaptive
+  // thinking is always on, effort is the only depth control.
+  'claude-fable-5-1[1m]': new Set(['low', 'medium', 'high', 'xhigh', 'max']),
 };
 
 // ── Per-provider flag vocabulary ────────────────────────────────────────────

@@ -267,6 +267,18 @@ describe('ClaudeProvider sticky config', () => {
     expect(mockSdkQuery).toHaveBeenCalledTimes(1);
     expect(capturedSdkOptions?.model).toBe('claude-fable-5[1m]');
   });
+
+  it('test_claude_fable51_1m_suffix: bare claude-fable-5-1 is normalized to its [1m] form', () => {
+    capturedSdkOptions = null;
+    mockSdkQuery.mockClear();
+
+    const provider = makeClaudeProvider({});
+
+    provider.query({ prompt: 'hi', cwd: '/tmp', model: 'claude-fable-5-1' });
+
+    expect(mockSdkQuery).toHaveBeenCalledTimes(1);
+    expect(capturedSdkOptions?.model).toBe('claude-fable-5-1[1m]');
+  });
 });
 
 describe('per-model-family effort defaults', () => {
@@ -436,6 +448,12 @@ describe('live applySettings (-m/-e on an active query — same conversation, no
     const q = start();
     await q.applySettings!({ model: 'claude-fable-5' });
     expect(capturedSetModel).toEqual(['claude-fable-5[1m]']);
+  });
+
+  it('test_applySettings_bare_fable51_gets_1m: bare two-segment id normalized before setModel', async () => {
+    const q = start();
+    await q.applySettings!({ model: 'claude-fable-5-1' });
+    expect(capturedSetModel).toEqual(['claude-fable-5-1[1m]']);
   });
 });
 

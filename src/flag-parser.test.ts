@@ -172,8 +172,14 @@ describe('parseMessageFlags', () => {
       expect(r.warnings).toEqual([]);
     });
 
-    it('resolves fable / fable5 / fable-5 aliases to claude-fable-5[1m]', () => {
-      expect(parseMessageFlags('-m fable hi').intent).toEqual({ stickyModel: 'claude-fable-5[1m]' });
+    it('resolves bare fable / fable51 / fable5-1 / fable-5-1 aliases to claude-fable-5-1[1m]', () => {
+      expect(parseMessageFlags('-m fable hi').intent).toEqual({ stickyModel: 'claude-fable-5-1[1m]' });
+      expect(parseMessageFlags('-m fable51 hi').intent).toEqual({ stickyModel: 'claude-fable-5-1[1m]' });
+      expect(parseMessageFlags('-m fable5-1 hi').intent).toEqual({ stickyModel: 'claude-fable-5-1[1m]' });
+      expect(parseMessageFlags('-m fable-5-1 hi').intent).toEqual({ stickyModel: 'claude-fable-5-1[1m]' });
+    });
+
+    it('resolves fable5 / fable-5 aliases to the still-served claude-fable-5[1m]', () => {
       expect(parseMessageFlags('-m fable5 hi').intent).toEqual({ stickyModel: 'claude-fable-5[1m]' });
       expect(parseMessageFlags('-m fable-5 hi').intent).toEqual({ stickyModel: 'claude-fable-5[1m]' });
     });
@@ -183,12 +189,17 @@ describe('parseMessageFlags', () => {
       expect(r.intent).toEqual({ stickyModel: 'claude-fable-5[1m]' });
     });
 
-    it('accepts the full effort surface on fable 5 (incl. xhigh and max)', () => {
+    it('auto-appends [1m] to bare claude-fable-5-1 id (two-segment version scheme)', () => {
+      const r = parseMessageFlags('-m claude-fable-5-1 hi');
+      expect(r.intent).toEqual({ stickyModel: 'claude-fable-5-1[1m]' });
+    });
+
+    it('accepts the full effort surface on fable 5.1 (incl. xhigh and max)', () => {
       const xhigh = parseMessageFlags('-m fable -e xhigh hi');
-      expect(xhigh.intent).toEqual({ stickyModel: 'claude-fable-5[1m]', stickyEffort: 'xhigh' });
+      expect(xhigh.intent).toEqual({ stickyModel: 'claude-fable-5-1[1m]', stickyEffort: 'xhigh' });
       expect(xhigh.warnings).toEqual([]);
       const max = parseMessageFlags('-m fable -e max hi');
-      expect(max.intent).toEqual({ stickyModel: 'claude-fable-5[1m]', stickyEffort: 'max' });
+      expect(max.intent).toEqual({ stickyModel: 'claude-fable-5-1[1m]', stickyEffort: 'max' });
       expect(max.warnings).toEqual([]);
     });
   });
@@ -475,7 +486,7 @@ describe('provider-aware vocabulary (codex)', () => {
 
   it('defaults to the claude vocabulary when no provider is passed (back-compat)', () => {
     const r = parseMessageFlags('-m fable hi');
-    expect(r.intent).toEqual({ stickyModel: 'claude-fable-5[1m]' });
+    expect(r.intent).toEqual({ stickyModel: 'claude-fable-5-1[1m]' });
     expect(parseMessageFlags('-m gpt-5.5 hi').errors[0]).toMatch(/unknown model/);
   });
 });

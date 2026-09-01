@@ -1820,10 +1820,11 @@ const CLAUDE_CODE_AUTO_COMPACT_WINDOW = process.env.CLAUDE_CODE_AUTO_COMPACT_WIN
  * aliases (`opus`), non-opus ids, or ids that already carry a `[Nm]` suffix.
  */
 function ensureOpus1mSuffix(model: string): string {
-  // Fable shares the opus 1M-only policy (single-digit version: claude-fable-5).
-  // Opus itself now spans both version schemes: claude-opus-4-8 and claude-opus-5.
+  // Fable shares the opus 1M-only policy and now spans both version schemes
+  // too: claude-fable-5 (single-digit) and claude-fable-5-1 (two-segment).
+  // Opus itself spans both version schemes: claude-opus-4-8 and claude-opus-5.
   // Keep in sync with src/flag-parser.ts ensureOpus1mSuffix.
-  return /^claude-(?:opus-\d+(?:-\d+)?|fable-\d+)$/i.test(model) ? `${model}[1m]` : model;
+  return /^claude-(?:opus-\d+(?:-\d+)?|fable-\d+(?:-\d+)?)$/i.test(model) ? `${model}[1m]` : model;
 }
 
 /**

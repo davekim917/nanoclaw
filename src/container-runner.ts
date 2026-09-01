@@ -3128,7 +3128,7 @@ async function buildContainerArgs(
   // `thinking: {type: 'adaptive', display: 'summarized'}` on every query
   // (claude.ts), which yields visible summarized thinking on every 4.6+
   // model, and they could conflict with always-adaptive models like
-  // claude-fable-5 that reject non-adaptive thinking.)
+  // fable models that reject non-adaptive thinking.)
 
   // Default `opus` alias resolution and default effort. The constants
   // at the top of this file (DEFAULT_OPUS_MODEL etc.) are the single
