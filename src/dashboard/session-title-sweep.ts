@@ -75,6 +75,65 @@ export function _resetTitleBackendForTest(): void {
 }
 
 /**
+ * Sweep-level cooldown, engaged by the circuit breaker (see
+ * `logFailuresWithBreaker` / `BREAKER_CONSECUTIVE_FAILURES` below).
+ *
+ * The per-tick breaker alone only de-duplicates LOG LINES — with
+ * CONCURRENCY_CAP=3 candidates per tick, a fully-failed batch has nothing
+ * left in it to "abandon". It does nothing to reduce the actual call volume:
+ * the sweep would keep issuing 3 Haiku calls every 60s (~180/hr) regardless
+ * of whether the backend is 429ing, starving the other host Haiku callers
+ * (thread titling included) with a steady drumbeat of doomed requests. This
+ * cooldown is what actually cuts spend during a sustained rate-limit window,
+ * the same way `isBackendConfigured()` below already fails closed instead of
+ * burning 3 doomed calls/tick when there's no credential at all.
+ */
+export const BREAKER_COOLDOWN_BASE_MS = 5 * 60_000;
+export const BREAKER_COOLDOWN_CAP_MS = 30 * 60_000;
+
+/** 0 = no cooldown in effect. */
+let _cooldownUntilMs = 0;
+/**
+ * Duration of the most recently engaged cooldown, in ms. 0 means either no
+ * cooldown has ever been engaged, or the escalation was reset by a
+ * subsequent success. Doubles (capped) when the very next batch to actually
+ * run after a cooldown expires trips the breaker again — a sustained
+ * rate-limit shouldn't be re-probed every 5 minutes.
+ */
+let _lastCooldownMs = 0;
+
+function isCoolingDown(nowMs: number): boolean {
+  return nowMs < _cooldownUntilMs;
+}
+
+function engageCooldown(nowMs: number): void {
+  const cooldownMs =
+    _lastCooldownMs > 0 ? Math.min(BREAKER_COOLDOWN_CAP_MS, _lastCooldownMs * 2) : BREAKER_COOLDOWN_BASE_MS;
+  _lastCooldownMs = cooldownMs;
+  _cooldownUntilMs = nowMs + cooldownMs;
+  log.warn('session-title: circuit breaker cooldown engaged — suppressing sweep', {
+    cooldownMs,
+    untilIso: new Date(_cooldownUntilMs).toISOString(),
+  });
+}
+
+/** Any successful title means the backend is not (fully) rate-limited — drop the escalation. */
+function resetCooldownEscalation(): void {
+  _lastCooldownMs = 0;
+}
+
+/** Test-only: clear cooldown state so it doesn't leak between tests (or into production on a module reload race). */
+export function _resetCooldownForTest(): void {
+  _cooldownUntilMs = 0;
+  _lastCooldownMs = 0;
+}
+
+/** Test-only: read current cooldown state for deterministic assertions. */
+export function _getCooldownStateForTest(): { cooldownUntilMs: number; lastCooldownMs: number } {
+  return { cooldownUntilMs: _cooldownUntilMs, lastCooldownMs: _lastCooldownMs };
+}
+
+/**
  * Returns true when the host process has a viable path to Anthropic. Two
  * supported modes:
  *
@@ -177,7 +236,9 @@ async function callTitleBackend(system: string, user: string, signal: AbortSigna
     signal,
   });
   if (!resp.ok) {
-    throw new Error(`session-title: Anthropic returned ${resp.status}`);
+    const err = new Error(`session-title: Anthropic returned ${resp.status}`) as Error & { status?: number };
+    err.status = resp.status;
+    throw err;
   }
   const data = (await resp.json()) as { content?: Array<{ type: string; text: string }> };
   const text = data.content?.find((c) => c.type === 'text')?.text ?? '';
@@ -439,12 +500,22 @@ async function _runSessionTitleSweepLocked(): Promise<{ generated: number; skipp
     return { generated: 0, skipped: 0 };
   }
 
+  // Fail-closed while the circuit breaker's cooldown is in effect (see
+  // engageCooldown / BREAKER_CONSECUTIVE_FAILURES). Same reasoning as the
+  // isBackendConfigured() gate above: a sustained 429 wave produces
+  // identical waste (3 doomed calls/tick) that gate doesn't cover, since a
+  // credential IS configured — it's just being rate-limited. Logged once at
+  // the moment the cooldown is engaged, not on every suppressed tick.
+  if (isCoolingDown(Date.now())) {
+    return { generated: 0, skipped: 0 };
+  }
+
   const candidates = pickCandidates(CONCURRENCY_CAP);
   if (candidates.length === 0) return { generated: 0, skipped: 0 };
 
   let generated = 0;
   let skipped = 0;
-  const tasks: Array<Promise<void>> = [];
+  const tasks: Array<Promise<TaskOutcome>> = [];
 
   for (const row of candidates) {
     if (tasks.length >= CONCURRENCY_CAP) break;
@@ -474,7 +545,7 @@ async function _runSessionTitleSweepLocked(): Promise<{ generated: number; skipp
       continue;
     }
     tasks.push(
-      (async () => {
+      (async (): Promise<TaskOutcome> => {
         const controller = new AbortController();
         const timer = setTimeout(() => controller.abort(), HAIKU_TIMEOUT_MS);
         try {
@@ -482,21 +553,24 @@ async function _runSessionTitleSweepLocked(): Promise<{ generated: number; skipp
           const title = postProcessTitle(raw);
           if (!title) {
             skipped++;
-            return;
+            return { sessionId: row.id, ok: true };
           }
           persistTitle(row.id, title, slice.maxSeq, new Date().toISOString());
           generated++;
+          return { sessionId: row.id, ok: true };
         } catch (err) {
-          log.warn('session-title: backend call failed', {
-            sessionId: row.id,
-            err: err instanceof Error ? err.message : String(err),
-          });
           try {
             stampFailureBackoff(row.id);
           } catch {
             /* stamp failure is non-fatal — next tick will retry */
           }
           skipped++;
+          return {
+            sessionId: row.id,
+            ok: false,
+            transient: isTransientBackendFailure(err),
+            errMessage: err instanceof Error ? err.message : String(err),
+          };
         } finally {
           clearTimeout(timer);
         }
@@ -504,6 +578,89 @@ async function _runSessionTitleSweepLocked(): Promise<{ generated: number; skipp
     );
   }
 
-  await Promise.all(tasks);
+  const outcomes = await Promise.all(tasks);
+  const breakerTripped = logFailuresWithBreaker(outcomes);
+
+  // Any successful title this tick proves the backend isn't (fully)
+  // rate-limited — drop the escalation so a LATER, unrelated trip starts
+  // fresh at the base cooldown instead of picking up where a stale one left
+  // off. A tripped breaker (only possible when the WHOLE batch failed
+  // transiently, so it can never coincide with generated > 0) engages/
+  // escalates the cooldown that actually cuts call volume.
+  if (generated > 0) {
+    resetCooldownEscalation();
+  } else if (breakerTripped) {
+    engageCooldown(Date.now());
+  }
+
   return { generated, skipped };
+}
+
+interface TaskOutcome {
+  sessionId: string;
+  ok: boolean;
+  transient?: boolean;
+  errMessage?: string;
+}
+
+/**
+ * A run of {@link BREAKER_CONSECUTIVE_FAILURES} consecutive transient
+ * failures (candidate order — the deterministic, testable analog of
+ * "consecutive" under a concurrently-dispatched batch, and equivalent to it
+ * whenever CONCURRENCY_CAP <= this threshold, as it is today) collapses into
+ * ONE warn naming the breaker instead of one warn per candidate. This sweep
+ * is the dominant consumer of the shared OAuth quota (120 failed 429s
+ * measured in a single day) and starves the other host Haiku callers —
+ * including thread titling (src/topic-title.ts) — so a tick where the
+ * backend is clearly rate-limited must not also flood the log on top of
+ * flooding the quota. Non-transient failures are never batched: they're
+ * real per-candidate problems (bad content, etc.), not backend-wide distress.
+ */
+const BREAKER_CONSECUTIVE_FAILURES = 3;
+
+/** Returns true iff the breaker tripped (a run of >= BREAKER_CONSECUTIVE_FAILURES occurred). */
+function logFailuresWithBreaker(outcomes: TaskOutcome[]): boolean {
+  // Buffer each run of consecutive transient failures and decide how to log
+  // it only once the run ends (a success, a non-transient failure, or the
+  // end of the batch) — a run that reaches the threshold collapses into ONE
+  // warn; a shorter run logs individually, same as before the breaker.
+  let run: TaskOutcome[] = [];
+  let tripped = false;
+
+  const flushRun = (): void => {
+    if (run.length === 0) return;
+    if (run.length >= BREAKER_CONSECUTIVE_FAILURES) {
+      tripped = true;
+      log.warn(
+        'session-title: circuit breaker tripped — consecutive transient failures this tick, abandoning rest of batch',
+        { consecutiveTransientFailures: run.length, sessionIds: run.map((o) => o.sessionId) },
+      );
+    } else {
+      for (const o of run) {
+        log.warn('session-title: backend call failed', { sessionId: o.sessionId, err: o.errMessage });
+      }
+    }
+    run = [];
+  };
+
+  for (const outcome of outcomes) {
+    if (outcome.ok) {
+      flushRun();
+      continue;
+    }
+    if (!outcome.transient) {
+      flushRun();
+      log.warn('session-title: backend call failed', { sessionId: outcome.sessionId, err: outcome.errMessage });
+      continue;
+    }
+    run.push(outcome);
+  }
+  flushRun();
+  return tripped;
+}
+
+/** 429/529/timeout/network-blip — same transient classification as callHaiku's (src/llm.ts). */
+function isTransientBackendFailure(err: unknown): boolean {
+  const status = (err as { status?: number }).status;
+  return status === 429 || status === 529 || (err as Error).name === 'AbortError' || !status;
 }

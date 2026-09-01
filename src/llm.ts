@@ -539,6 +539,19 @@ export async function callClaudeStructured<T>(
   }
 }
 
+/** HTTP failure from {@link callHaikuOnce}. Mirrors {@link ClaudeStructuredHttpError}'s shape. */
+export class CallHaikuHttpError extends Error {
+  readonly status: number;
+  readonly retryAfterMs: number | null;
+
+  constructor(status: number, retryAfterMs: number | null) {
+    super(`callHaiku: Anthropic returned ${status}`);
+    this.name = 'CallHaikuHttpError';
+    this.status = status;
+    this.retryAfterMs = retryAfterMs;
+  }
+}
+
 async function callHaikuOnce(prompt: string, timeoutMs: number): Promise<string> {
   const baseUrl = process.env['ANTHROPIC_BASE_URL'] ?? 'https://api.anthropic.com';
   const directApiKey = process.env['ANTHROPIC_API_KEY'] ?? '';
@@ -578,8 +591,7 @@ async function callHaikuOnce(prompt: string, timeoutMs: number): Promise<string>
       signal: controller.signal,
     });
     if (!resp.ok) {
-      const err = new Error(`callHaiku: Anthropic returned ${resp.status}`) as Error & { status?: number };
-      err.status = resp.status;
+      const err = new CallHaikuHttpError(resp.status, parseRetryAfterMs(resp.headers.get('retry-after')));
       throw err;
     }
     const data = (await resp.json()) as { content?: Array<{ type: string; text?: string }> };
@@ -589,21 +601,65 @@ async function callHaikuOnce(prompt: string, timeoutMs: number): Promise<string>
   }
 }
 
+/** Bounded number of attempts + backoff for {@link callHaiku}. See its docstring. */
+const CALL_HAIKU_MAX_ATTEMPTS = 4;
+const CALL_HAIKU_BACKOFF_BASE_MS = 1000;
+const CALL_HAIKU_BACKOFF_CAP_MS = 15_000;
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function isTransientCallHaikuFailure(err: unknown): boolean {
+  const status = (err as { status?: number }).status;
+  return status === 429 || status === 529 || (err as Error).name === 'AbortError' || !status;
+}
+
 /**
- * Call Haiku with a single retry on transient failures (HTTP 429 or an
- * aborted/timed-out/network blip). The sweep's data shows these two classes
- * account for essentially all direct-API failures; a single retry clears the
- * overwhelming majority. Title generation is fire-and-forget background work,
- * so the extra latency on the retry path is irrelevant.
+ * Call Haiku with up to {@link CALL_HAIKU_MAX_ATTEMPTS} attempts on transient
+ * failures (HTTP 429/529 or an aborted/timed-out/network blip).
+ *
+ * Previously this retried exactly once, immediately — both attempts landed
+ * in the same 429 window under real rate-limit pressure, silently losing the
+ * result forever (this is what caused thread titles to vanish; see
+ * src/topic-title.ts and migration 062 for the durable fix on that side).
+ *
+ * Backoff honors the provider's `retry-after` header when present (capped at
+ * {@link CALL_HAIKU_BACKOFF_CAP_MS}); otherwise capped-exponential with up to
+ * 20% jitter, base {@link CALL_HAIKU_BACKOFF_BASE_MS}. Title generation and
+ * the title sweep are background work, so added latency is fine — the
+ * backoff-only budget across all retries is bounded at roughly 30s worst
+ * case (a full-timeout hang on every attempt is a separate, orthogonal bound
+ * governed by `timeoutMs` × attempts).
+ *
+ * Non-transient errors still throw immediately — no point retrying a 4xx
+ * that isn't a rate limit.
  */
 export async function callHaiku(prompt: string, timeoutMs = 15_000): Promise<string> {
-  try {
-    return await callHaikuOnce(prompt, timeoutMs);
-  } catch (err) {
-    const status = (err as { status?: number }).status;
-    const transient = status === 429 || status === 529 || (err as Error).name === 'AbortError' || !status;
-    if (!transient) throw err;
-    log.debug('callHaiku: transient failure, retrying once', { status, name: (err as Error).name });
-    return await callHaikuOnce(prompt, timeoutMs);
+  let lastErr: unknown;
+  for (let attempt = 1; attempt <= CALL_HAIKU_MAX_ATTEMPTS; attempt++) {
+    try {
+      return await callHaikuOnce(prompt, timeoutMs);
+    } catch (err) {
+      lastErr = err;
+      if (!isTransientCallHaikuFailure(err) || attempt === CALL_HAIKU_MAX_ATTEMPTS) throw err;
+      const retryAfterMs = (err as { retryAfterMs?: number | null }).retryAfterMs;
+      const backoff =
+        retryAfterMs != null
+          ? Math.min(retryAfterMs, CALL_HAIKU_BACKOFF_CAP_MS)
+          : Math.min(CALL_HAIKU_BACKOFF_CAP_MS, CALL_HAIKU_BACKOFF_BASE_MS * 2 ** (attempt - 1));
+      const delayMs = Math.round(backoff + Math.random() * backoff * 0.2);
+      log.debug('callHaiku: transient failure, backing off', {
+        attempt,
+        status: (err as { status?: number }).status,
+        name: (err as Error).name,
+        retryAfterMs,
+        delayMs,
+      });
+      await sleep(delayMs);
+    }
   }
+  // Unreachable — the loop always returns or throws — but keeps TypeScript's
+  // control-flow analysis happy without an `as never` cast.
+  throw lastErr;
 }

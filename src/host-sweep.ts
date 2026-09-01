@@ -1217,6 +1217,16 @@ async function sweepOnce(): Promise<void> {
     .then((mod) => mod.runSessionTitleSweep())
     .catch((err) => log.warn('session-title sweep failed', { err }));
 
+  // Retry Discord thread titles whose earlier attempts all failed (e.g. a
+  // 429 window that outlasted callHaiku's own retry budget). Regenerates
+  // from the STORED, ORIGINAL first_message — never a later follow-up, which
+  // is the bug this table exists to fix. Capped at 3/tick (inside
+  // retryPendingThreadTitles) so a backlog of permanently-broken threads
+  // can't itself become a Haiku/Discord-REST quota hog. See src/topic-title.ts.
+  void import('./topic-title.js')
+    .then((mod) => mod.retryPendingThreadTitles())
+    .catch((err) => log.warn('thread-title retry sweep failed', { err }));
+
   // Prune dashboard_tokens rows past expiry + 1d grace (post-build QA fix SF-6).
   void import('./dashboard/db/dashboard-tokens.js')
     .then((mod) => mod.pruneDashboardTokens())

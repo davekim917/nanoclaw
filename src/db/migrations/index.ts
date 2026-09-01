@@ -64,6 +64,7 @@ import { migration058 } from './058-observatory-item-assignments.js';
 import { migration059 } from './059-central-turn-usage.js';
 import { migration060 } from './060-turn-usage-rate-limit.js';
 import { migration061 } from './061-turn-usage-turn-id.js';
+import { migration062 } from './062-thread-titles.js';
 // Upstream's 014/015 — file numbers clash with local but uniqueness is by `name`.
 // Aliased to avoid JS identifier collisions with the local 014/015 above.
 import { migration014 as containerConfigs } from './014-container-configs.js';
@@ -157,6 +158,7 @@ export const migrations: Migration[] = [
   migration059,
   migration060,
   migration061,
+  migration062,
   containerConfigs,
   cliScope,
   messagingGroupInstance,

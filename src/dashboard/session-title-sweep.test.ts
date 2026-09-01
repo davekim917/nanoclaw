@@ -4,6 +4,7 @@ import os from 'os';
 import path from 'path';
 
 import { closeDb, initTestDb, runMigrations, createAgentGroup, getDb } from '../db/index.js';
+import { log } from '../log.js';
 
 // The sweep reads inbound/outbound DBs from `${DATA_DIR}/v2-sessions/...`.
 // Point DATA_DIR at a temp folder so we can write minimal session DBs the
@@ -21,6 +22,9 @@ import {
   runSessionTitleSweep,
   setTitleBackendForTest,
   _resetTitleBackendForTest,
+  _resetCooldownForTest,
+  _getCooldownStateForTest,
+  BREAKER_COOLDOWN_BASE_MS,
   postProcessTitle,
   CONCURRENCY_CAP,
 } from './session-title-sweep.js';
@@ -112,7 +116,16 @@ beforeEach(() => {
 afterEach(() => {
   closeDb();
   _resetTitleBackendForTest();
+  // The cooldown tests below deliberately trip the breaker, which engages a
+  // real cooldown in this module-level singleton state. Without a reset,
+  // that cooldown would silently suppress every OTHER test in this file for
+  // (real) minutes afterward.
+  _resetCooldownForTest();
   fs.rmSync(TMP_DIR, { recursive: true, force: true });
+  // The breaker tests below spy on log.warn; without a restore, vitest keeps
+  // the same spy (and its accumulated call history) alive into later tests.
+  vi.restoreAllMocks();
+  vi.useRealTimers();
 });
 
 describe('postProcessTitle', () => {
@@ -260,6 +273,174 @@ describe('runSessionTitleSweep', () => {
     };
     expect(ok.title).toBe('all good');
     expect(fail.title).toBeNull();
+  });
+
+  it('circuit breaker: 3 consecutive transient (429) failures collapse into ONE warn, not one per candidate', async () => {
+    // This sweep was measured at 120 failed 429 calls in a single day,
+    // starving the other host Haiku callers. Three candidates all hitting a
+    // rate limit in the same tick must log ONE breaker warn, not three
+    // individual "backend call failed" warns.
+    for (let i = 1; i <= 3; i++) {
+      seedSession(`sess-429-${i}`, 'ag-1');
+      writeInboundMessages('ag-1', `sess-429-${i}`, [{ kind: 'chat', content: `{"text":"msg ${i}"}` }]);
+    }
+    const backend = vi.fn(async () => {
+      const err = new Error('rate limited') as Error & { status?: number };
+      err.status = 429;
+      throw err;
+    });
+    setTitleBackendForTest(backend);
+    const warnSpy = vi.spyOn(log, 'warn');
+
+    const result = await runSessionTitleSweep();
+    expect(result.generated).toBe(0);
+    expect(result.skipped).toBe(3);
+    expect(backend).toHaveBeenCalledTimes(3);
+
+    const breakerWarns = warnSpy.mock.calls.filter(([msg]) => String(msg).includes('circuit breaker tripped'));
+    const cooldownWarns = warnSpy.mock.calls.filter(([msg]) => String(msg).includes('cooldown engaged'));
+    const perCandidateWarns = warnSpy.mock.calls.filter(
+      ([msg]) => String(msg) === 'session-title: backend call failed',
+    );
+    expect(breakerWarns.length).toBe(1);
+    expect(perCandidateWarns.length).toBe(0);
+    // A tripped breaker also engages the sweep-level cooldown — the part
+    // that actually cuts call volume, not just log noise (see the
+    // "circuit breaker cooldown" describe block below for the full behavior).
+    expect(cooldownWarns.length).toBe(1);
+
+    // Every failed candidate is still stamped so it doesn't clog next tick —
+    // the breaker changes LOGGING, not the existing backoff/retry semantics.
+    for (let i = 1; i <= 3; i++) {
+      const row = getDb()
+        .prepare('SELECT title, title_generated_at FROM sessions WHERE id = ?')
+        .get(`sess-429-${i}`) as { title: string | null; title_generated_at: string | null };
+      expect(row.title).toBeNull();
+      expect(row.title_generated_at).toBeTruthy();
+    }
+  });
+
+  it('circuit breaker does NOT trip on fewer than 3 consecutive transient failures', async () => {
+    seedSession('sess-429-a', 'ag-1');
+    seedSession('sess-ok', 'ag-1');
+    writeInboundMessages('ag-1', 'sess-429-a', [{ kind: 'chat', content: '{"text":"will 429"}' }]);
+    writeInboundMessages('ag-1', 'sess-ok', [{ kind: 'chat', content: '{"text":"fine"}' }]);
+
+    const backend = vi.fn(async (_s, user: string) => {
+      if (user.includes('will 429')) {
+        const err = new Error('rate limited') as Error & { status?: number };
+        err.status = 429;
+        throw err;
+      }
+      return 'all good';
+    });
+    setTitleBackendForTest(backend);
+    const warnSpy = vi.spyOn(log, 'warn');
+
+    const result = await runSessionTitleSweep();
+    expect(result.generated).toBe(1);
+    expect(result.skipped).toBe(1);
+
+    const breakerWarns = warnSpy.mock.calls.filter(([msg]) => String(msg).includes('circuit breaker'));
+    const perCandidateWarns = warnSpy.mock.calls.filter(
+      ([msg]) => String(msg) === 'session-title: backend call failed',
+    );
+    expect(breakerWarns.length).toBe(0);
+    expect(perCandidateWarns.length).toBe(1);
+  });
+
+  describe('circuit breaker cooldown (sweep-level — the part that actually cuts call volume)', () => {
+    // Per-tick breaker log dedup (above) is real but only collapses log
+    // lines: with CONCURRENCY_CAP=3, a fully-failed batch has nothing left
+    // to "abandon" that tick. This cooldown is what stops the sweep from
+    // issuing 3 more doomed Haiku calls on the VERY NEXT tick.
+    function seedFailingBatch(prefix: string): void {
+      for (let i = 1; i <= 3; i++) {
+        seedSession(`${prefix}-${i}`, 'ag-1');
+        writeInboundMessages('ag-1', `${prefix}-${i}`, [{ kind: 'chat', content: `{"text":"${prefix} ${i}"}` }]);
+      }
+    }
+    function rateLimitedBackend() {
+      return vi.fn(async (): Promise<string> => {
+        const err = new Error('rate limited') as Error & { status?: number };
+        err.status = 429;
+        throw err;
+      });
+    }
+
+    beforeEach(() => {
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date('2026-08-31T00:00:00.000Z'));
+    });
+
+    it('a tripped breaker suppresses the next tick entirely — the backend is never called', async () => {
+      const backend = rateLimitedBackend();
+      setTitleBackendForTest(backend);
+      seedFailingBatch('sess-cd-a');
+
+      const first = await runSessionTitleSweep();
+      expect(first).toEqual({ generated: 0, skipped: 3 });
+      expect(backend).toHaveBeenCalledTimes(3);
+      expect(_getCooldownStateForTest().lastCooldownMs).toBe(BREAKER_COOLDOWN_BASE_MS);
+
+      backend.mockClear();
+      // Fresh untitled candidates exist — if the cooldown weren't
+      // suppressing the tick, these would be picked up and burn 3 more calls.
+      seedFailingBatch('sess-cd-b');
+      vi.setSystemTime(new Date('2026-08-31T00:01:00.000Z')); // 1 min later — well inside the 5-min cooldown
+
+      const second = await runSessionTitleSweep();
+      expect(second).toEqual({ generated: 0, skipped: 0 });
+      expect(backend).not.toHaveBeenCalled();
+    });
+
+    it('the cooldown expires and the sweep resumes', async () => {
+      const backend = rateLimitedBackend();
+      setTitleBackendForTest(backend);
+      seedFailingBatch('sess-cd-c');
+      await runSessionTitleSweep();
+      backend.mockClear();
+
+      vi.setSystemTime(new Date('2026-08-31T00:05:01.000Z')); // just past the 5-min base cooldown
+      seedFailingBatch('sess-cd-d');
+      const resumed = await runSessionTitleSweep();
+
+      expect(backend).toHaveBeenCalledTimes(3); // resumed — cooldown expired
+      expect(resumed.skipped).toBe(3);
+      // Still failing on the very first batch after the cooldown expired —
+      // this is the "sustained rate-limit" case that must escalate.
+      expect(_getCooldownStateForTest().lastCooldownMs).toBe(BREAKER_COOLDOWN_BASE_MS * 2);
+    });
+
+    it('a success resets the escalation back to the base cooldown', async () => {
+      const backend = rateLimitedBackend();
+      setTitleBackendForTest(backend);
+      seedFailingBatch('sess-cd-e');
+      await runSessionTitleSweep(); // trip #1 -> 5 min
+      expect(_getCooldownStateForTest().lastCooldownMs).toBe(BREAKER_COOLDOWN_BASE_MS);
+
+      vi.setSystemTime(new Date('2026-08-31T00:05:01.000Z'));
+      seedFailingBatch('sess-cd-f');
+      await runSessionTitleSweep(); // trip #2, first batch after cooldown expiry -> escalates to 10 min
+      expect(_getCooldownStateForTest().lastCooldownMs).toBe(BREAKER_COOLDOWN_BASE_MS * 2);
+
+      // Expire the 10-min cooldown, but succeed this time.
+      vi.setSystemTime(new Date('2026-08-31T00:15:02.000Z'));
+      setTitleBackendForTest(async () => 'a real title');
+      seedSession('sess-cd-success', 'ag-1');
+      writeInboundMessages('ag-1', 'sess-cd-success', [{ kind: 'chat', content: '{"text":"real content"}' }]);
+      const successTick = await runSessionTitleSweep();
+      expect(successTick.generated).toBeGreaterThan(0);
+      expect(_getCooldownStateForTest().lastCooldownMs).toBe(0); // escalation reset by the success
+
+      // A trip immediately after that success must start over at the BASE
+      // cooldown, not continue escalating from the prior 10-minute run.
+      const backendAgain = rateLimitedBackend();
+      setTitleBackendForTest(backendAgain);
+      seedFailingBatch('sess-cd-g');
+      await runSessionTitleSweep();
+      expect(_getCooldownStateForTest().lastCooldownMs).toBe(BREAKER_COOLDOWN_BASE_MS);
+    });
   });
 
   it('returns {0, 0} when no candidates exist', async () => {
