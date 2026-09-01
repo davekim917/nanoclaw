@@ -2891,6 +2891,7 @@ const MANAGED_WORKER_DEFS = [
   'worker-fast.md',
   'worker.md',
   'worker-high.md',
+  'worker-frontier.md',
   'worker-codex.md',
   // Retired: renamed to worker-high.md so the tier name describes the rung
   // rather than a Claude model (the same def is gpt-5.6-sol on Codex). Listed
@@ -2902,12 +2903,12 @@ const MANAGED_WORKER_DEFS = [
  * Copy trunk worker subagent defs (container/agents/*.md) into
  * .claude-shared/agents/ — the container's ~/.claude/agents — so every Claude
  * group gets the orchestrator worker roster (worker-fast, worker, worker-high,
- * worker-codex). Copies, not symlinks: agent discovery through dangling host
- * symlinks is unverified, and the files are tiny. Trunk is canonical: a
- * managed def absent from the current trunk set is pruned; operator-added defs
- * (never in MANAGED_WORKER_DEFS) are untouched. A group can shadow a trunk def
- * with a same-name file in groups/<folder>/.claude/agents/ (project scope
- * outranks user scope).
+ * worker-frontier, worker-codex). Copies, not symlinks: agent discovery
+ * through dangling host symlinks is unverified, and the files are tiny.
+ * Trunk is canonical: a managed def absent from the current trunk set is
+ * pruned; operator-added defs (never in MANAGED_WORKER_DEFS) are untouched. A
+ * group can shadow a trunk def with a same-name file in
+ * groups/<folder>/.claude/agents/ (project scope outranks user scope).
  */
 function syncWorkerAgentDefs(claudeDir: string): void {
   const srcDir = path.join(process.cwd(), 'container', 'agents');

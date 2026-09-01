@@ -46,15 +46,19 @@ export interface CodexWorkerTier {
 
 /**
  * Codex equivalents of the tiered Claude workers. Cheaper models carry a
- * higher reasoning effort to compensate; the top tier matches the parent's
- * own model and effort, so escalating buys reasoning depth rather than a
- * bigger model. Only tiers belong here — a role that is a *kind* of worker
- * rather than a rung (worker-codex, codex-rescue) is left to inherit.
+ * higher reasoning effort to compensate. worker-high matches the parent's
+ * own model at high effort — escalating from worker there buys reasoning
+ * depth rather than a bigger model. worker-frontier is the top rung: same
+ * model as worker-high, pushed to max effort, for frontier-hard work or
+ * after worker-high has failed. Only tiers belong here — a role that is a
+ * *kind* of worker rather than a rung (worker-codex, codex-rescue) is left
+ * to inherit.
  */
 export const CODEX_WORKER_TIERS: Record<string, CodexWorkerTier> = {
   'worker-fast': { model: 'gpt-5.6-luna', effort: 'max' },
   worker: { model: 'gpt-5.6-terra', effort: 'xhigh' },
   'worker-high': { model: 'gpt-5.6-sol', effort: 'high' },
+  'worker-frontier': { model: 'gpt-5.6-sol', effort: 'max' },
 };
 
 /**
@@ -201,9 +205,13 @@ export function formatCodexAgentToml(agent: ClaudeAgent): string {
  * ("Runs on Sonnet at xhigh effort.") with the Codex model it actually runs
  * on. Left alone when the sentence isn't there — the description is a routing
  * signal, so a wrong model name in it actively mis-routes the orchestrator.
+ *
+ * Matches up to the LAST period on the description's final line, not the
+ * first — a model name with a version number ("Fable 5.1") contains its own
+ * period, and `[^.]*` would stop there and leave the clause unstripped.
  */
 function retargetRunsOnSentence(description: string, tier: CodexWorkerTier): string {
-  const stripped = description.replace(/\s*Runs on [^.]*\.\s*$/, '');
+  const stripped = description.replace(/\s*Runs on [^\n]*\.\s*$/, '');
   return `${stripped} Runs on ${tier.model} at ${tier.effort} reasoning.`;
 }
 

@@ -1,6 +1,6 @@
 ---
 name: worker-high
-description: Heavyweight execution worker for work where reasoning is the bottleneck rather than typing — concurrency and race conditions, subtle algorithms, gnarly multi-file refactors, debugging that has already resisted one attempt, and adversarial verification of another agent's result. Prefer worker first and escalate here on failure. Runs on Opus at high effort.
+description: Heavyweight execution worker for work where reasoning is the bottleneck rather than typing — concurrency and race conditions, subtle algorithms, gnarly multi-file refactors, debugging that has already resisted one attempt, and adversarial verification of another agent's result. Prefer worker first and escalate here on failure; escalate further to worker-frontier only after this tier has failed or the task is frontier-hard (novel architecture, cross-cutting refactors with ambiguous specs, adversarial verification where being wrong is expensive). Runs on Opus at high effort.
 model: claude-opus-5[1m]
 effort: high
 ---

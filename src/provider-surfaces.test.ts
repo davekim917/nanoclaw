@@ -750,7 +750,7 @@ describe('worker agent def sync (orchestrator roster)', () => {
     buildMounts(ag, session('s-wd', ag.id), containerConfig(), 'claude', {});
 
     // Trunk roster copied byte-for-byte.
-    for (const def of ['worker-fast.md', 'worker.md', 'worker-high.md', 'worker-codex.md']) {
+    for (const def of ['worker-fast.md', 'worker.md', 'worker-high.md', 'worker-frontier.md', 'worker-codex.md']) {
       expect(fs.readFileSync(path.join(agentsDir, def), 'utf-8')).toBe(
         fs.readFileSync(path.join(process.cwd(), 'container', 'agents', def), 'utf-8'),
       );
@@ -761,6 +761,11 @@ describe('worker agent def sync (orchestrator roster)', () => {
     // not a bare id that collapses to 200k under proxy auth. Reverting to
     // `model: opus` or bare `claude-opus-5` fails here.
     expect(fs.readFileSync(path.join(agentsDir, 'worker-high.md'), 'utf-8')).toContain('model: claude-opus-5[1m]');
+    // Same regression guard for the frontier tier: Fable 5.1 must carry [1m]
+    // too, and stay at medium effort (not inherit a stray high/xhigh).
+    const frontierWorker = fs.readFileSync(path.join(agentsDir, 'worker-frontier.md'), 'utf-8');
+    expect(frontierWorker).toContain('model: claude-fable-5-1[1m]');
+    expect(frontierWorker).toContain('effort: medium');
     const codexWorker = fs.readFileSync(path.join(agentsDir, 'worker-codex.md'), 'utf-8');
     expect(codexWorker).toContain('Always run Codex in the foreground');
     expect(codexWorker).toContain('`timeout` to `3600000`');
