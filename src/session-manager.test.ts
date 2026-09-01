@@ -1538,13 +1538,19 @@ describe('session migration pass preserves the idle clock', () => {
     expect(fs.existsSync(path.join(DATA_DIR, 'pending-upgrade-mtimes.json'))).toBe(false);
   });
 
-  it('skips one session whose admission fails after real DDL, restoring its clock inline', async () => {
+  it('a session whose admission fails is skipped and keeps its clock, never rewound', async () => {
     // Fault injected where it actually hurts: DDL has run for this session and
     // its mtime is bumped, but admission then fails. The pass used to throw out
     // of here, which exits the host — one bad session DB crash-looped the whole
-    // fleet on 2026-09-01. It is now this session's problem alone: skipped,
-    // counted, and its bumped clock put back inline, which leaves the manifest
-    // nothing to recover.
+    // fleet on 2026-09-01. It is now this session's problem alone: skipped and
+    // counted.
+    //
+    // Its clock is deliberately NOT restored. `admitPendingUpgradeContexts`
+    // commits one transaction per message, so a throw on a later row leaves
+    // earlier admissions durable while `admittedHere` is still 0 — restoring
+    // would rewind the clock over committed work and report an active session
+    // as idle to the reclaim. A clock left bumped only delays this session's
+    // reclaim; a clock rewound over real rows can get it archived.
     const sessionId = 'sess-throws-after-ddl';
     seedSession(sessionId);
     const legacyPath = inboundDbPath(MIGRATION_AG, sessionId);
@@ -1585,17 +1591,89 @@ describe('session migration pass preserves the idle clock', () => {
     expect(reconcilePendingUpgradeContexts(getDb(), ['mtime'])).toEqual({
       sessions: 1,
       admitted: 0,
-      mtimesRestored: 1,
+      mtimesRestored: 0,
       skipped: 1,
       stubsRemoved: 0,
     });
 
-    // The DDL landed and bumped the clock; the inline restore put it back, so
-    // there is no lie left for the manifest to record and it is removed as on
-    // any other completed pass. A crash outside the per-session loop is what
-    // the manifest still exists for — `replayUpgradeMtimeManifest` covers it.
-    expect(fs.statSync(legacyPath).mtimeMs).toBe(before);
+    // The DDL landed and bumped the clock, and the pass leaves it bumped.
+    expect(fs.statSync(legacyPath).mtimeMs).toBeGreaterThan(before);
+    // The manifest is still removed: a per-session failure is handled inline,
+    // so there is nothing here for a replay to recover. A crash OUTSIDE the
+    // per-session loop is what the manifest still exists for, and
+    // `replayUpgradeMtimeManifest` covers that.
     expect(fs.existsSync(path.join(DATA_DIR, 'pending-upgrade-mtimes.json'))).toBe(false);
+  });
+
+  it('does not rewind the clock of a session that admitted one message before failing on the next', async () => {
+    // The case the rule above exists for, exercised rather than argued.
+    // `admitPendingUpgradeContexts` commits per message, so the first row's
+    // recall is DURABLE when the second row throws — and the return value that
+    // would have reported it never arrives, leaving `admittedHere` at 0. A
+    // restore keyed on that zero would rewind the clock of a session holding
+    // freshly admitted work, which is what feeds the reclaim's idle decision.
+    const sessionId = 'sess-partial-admit';
+    seedSession(sessionId);
+    const legacyPath = inboundDbPath(MIGRATION_AG, sessionId);
+    fs.mkdirSync(path.dirname(legacyPath), { recursive: true });
+    const legacy = new Database(legacyPath);
+    legacy.exec(`CREATE TABLE messages_in (
+      id TEXT PRIMARY KEY, seq INTEGER NOT NULL UNIQUE, kind TEXT NOT NULL,
+      timestamp TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending',
+      platform_id TEXT, channel_type TEXT, thread_id TEXT, content TEXT NOT NULL,
+      process_after TEXT, recurrence TEXT
+    )`);
+    const insert = legacy.prepare(
+      `INSERT INTO messages_in (id,seq,kind,timestamp,status,platform_id,channel_type,thread_id,content)
+       VALUES (?,?,?,?,?,?,?,?,?)`,
+    );
+    for (const [id, seq] of [
+      ['first-pending', 2],
+      ['second-pending', 4],
+    ] as Array<[string, number]>) {
+      insert.run(
+        id,
+        seq,
+        'chat-sdk',
+        '2026-04-01T00:00:00.000Z',
+        'pending',
+        'slack:C1',
+        'slack',
+        'slack:C1:T1',
+        JSON.stringify({ text: `admit ${id}` }),
+      );
+    }
+    // Fails the SECOND recall insert only, so the first one commits first.
+    legacy.exec(
+      `CREATE TRIGGER boom BEFORE INSERT ON messages_in
+       WHEN NEW.id = 'recall-second-pending'
+       BEGIN SELECT RAISE(ABORT, 'injected'); END`,
+    );
+    legacy.close();
+    const memoryRoot = path.join(DATA_DIR, 'workgroups', 'mtime', 'memory');
+    fs.mkdirSync(path.join(memoryRoot, 'system'), { recursive: true });
+    fs.writeFileSync(path.join(memoryRoot, 'index.md'), '# Current canon\nadmitted context');
+    fs.writeFileSync(path.join(memoryRoot, 'system', 'definition.md'), '# Definition\nfresh context');
+    const before = ageInbound(sessionId);
+
+    expect(reconcilePendingUpgradeContexts(getDb(), ['mtime'])).toEqual({
+      sessions: 1,
+      // The committed admission is invisible to the counter — which is exactly
+      // why the counter must not be what authorizes a clock rewind.
+      admitted: 0,
+      mtimesRestored: 0,
+      skipped: 1,
+      stubsRemoved: 0,
+    });
+
+    // The first message's recall really did commit…
+    const verify = new Database(legacyPath, { readonly: true });
+    const committed = verify.prepare("SELECT 1 FROM messages_in WHERE id = 'recall-first-pending'").get();
+    verify.close();
+    expect(committed).toBeDefined();
+
+    // …so the clock over that work is left where the write put it.
+    expect(fs.statSync(legacyPath).mtimeMs).toBeGreaterThan(before);
   });
 
   it('leaves a session alone when untouched evidence shows work inside the replay window', async () => {

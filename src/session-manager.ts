@@ -1260,9 +1260,16 @@ export function reconcilePendingUpgradeContexts(
         err,
       });
       skipped += 1;
-      // Falls through to the mtime restore: a failure AFTER the DDL landed
-      // still bumped this file's clock, and putting it back is what the
-      // manifest would otherwise have to do on the next start.
+      // A failed session keeps whatever clock it has. `admitPendingUpgradeContexts`
+      // commits ONE TRANSACTION PER MESSAGE, so a throw on a later row leaves
+      // earlier admissions committed — and `admittedHere` is still 0, because
+      // the assignment never ran. Restoring here would therefore rewind the
+      // clock over real, durable work and report an active session as idle to
+      // the reclaim. The two errors are not symmetric: a clock left bumped at
+      // worst delays this one session's reclaim until the next pass, while a
+      // clock rewound over committed rows can hand a session with admitted
+      // work to the archiver. Keep the bumped clock.
+      continue;
     }
     if (admittedHere > 0) continue;
     try {
@@ -1274,11 +1281,11 @@ export function reconcilePendingUpgradeContexts(
     }
   }
   // Deleted once the loop has run to the end. A per-target failure is handled
-  // inline (skipped, and its mtime restored above), so it leaves nothing for
-  // the manifest to recover. Only a failure OUTSIDE this loop — the central DB
-  // query, the manifest write — still escapes to startup, which exits; the
-  // manifest is then the only record of what this pass bumped, so a `finally`
-  // that removes it would destroy the recovery it exists for.
+  // inline (skipped, and its clock deliberately left alone), so it leaves
+  // nothing for the manifest to recover. Only a failure OUTSIDE this loop — the
+  // central DB query, the manifest write — still escapes to startup, which
+  // exits; the manifest is then the only record of what this pass bumped, so a
+  // `finally` that removes it would destroy the recovery it exists for.
   fs.rmSync(upgradeMtimeManifestPath(dataDir), { force: true });
   if (mtimesRestored > 0) {
     log.info('Session migration pass left the idle clock untouched', { sessions, mtimesRestored });
