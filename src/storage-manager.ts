@@ -3,7 +3,7 @@
  *
  * Reclaims only regenerable storage:
  *   - package/build caches inside idle session and thread worktrees
- *   - dependency/build trees inside idle topic worktrees (data/v2-topics)
+ *   - dependency-install trees inside idle topic worktrees (data/v2-topics)
  *   - per-session archive/central database projections rebuilt on container spawn
  *   - per-session Codex plugin caches rebuilt on container spawn
  *   - stopped containers carrying this NanoClaw install's ownership label
@@ -81,6 +81,9 @@ export const THREAD_RESCUES_DIRNAME = 'thread-rescues';
 /** Append-only record of every completed archival; the restore/finish authority. */
 export const SESSION_RECLAIM_JOURNAL_FILENAME = 'reclaim-journal.jsonl';
 // Regenerable trees excluded from rescue archives — pure reinstallable weight.
+// NOT a deletion allowlist: skipping a tree here only declines to copy it, and
+// the original stays on disk. `REGENERABLE_SWEEP_DIR_NAMES` below is the list
+// that authorizes removal, and it is deliberately narrower. Do not merge them.
 const ARCHIVE_EXCLUDED_DIR_NAMES = [
   'node_modules',
   '.pnpm-store',
@@ -107,11 +110,25 @@ export const SESSION_ARTIFACT_IDLE_MS =
 const DEFAULT_REGENERABLE_SWEEP_DAYS = 2;
 const TOPICS_DIRNAME = 'v2-topics';
 const TOPIC_WORKTREES_DIRNAME = 'worktrees';
-// Same names as the rescue-archive exclusion list, deliberately: a tree that is
-// safe to leave out of a rescue archive is by the same argument safe to delete
-// outright, because it holds no work — only what package.json/lockfiles
-// regenerate.
-const REGENERABLE_DIR_NAMES = new Set<string>(ARCHIVE_EXCLUDED_DIR_NAMES);
+// DELIBERATELY NARROWER THAN `ARCHIVE_EXCLUDED_DIR_NAMES` — do not merge the
+// two lists. They answer different questions:
+//
+//   - the archive list answers "is it worth the bytes to tar this?" A name on
+//     it is merely not worth archiving; the original stays on disk either way,
+//     so a wrong entry costs nothing.
+//   - THIS list answers "may we recursively delete this from a live checkout?"
+//     A wrong entry destroys the only copy.
+//
+// So this one holds ONLY names that are dependency-install output by
+// definition and cannot hold authored work. `dist`, `build`, `.next` and
+// `coverage` are on the archive list but not here: plenty of repos track them,
+// and an agent's uncommitted output can sit in them. `.cache` is dropped for
+// the same reason in weaker form — it is a generic name that can mean anything,
+// which is exactly the argument that disqualifies the other four.
+//
+// Cost of the narrowing is close to zero: the measurement that motivated this
+// sweep was node_modules at ~1.3GB of a 1.5GB topic.
+const REGENERABLE_SWEEP_DIR_NAMES = new Set<string>(['node_modules', '.pnpm-store', '.turbo', '__pycache__', '.venv']);
 
 const PRUNABLE_DIR_NAMES = new Set(['node_modules', '.pnpm-store', '.turbo', '.cache']);
 const SKIP_DESCEND_DIR_NAMES = new Set(['.git']);
@@ -155,7 +172,7 @@ export interface StoragePolicy {
   /** Target ceiling on active sessions; 0 disables the count cap. */
   sessionActiveCap: number;
   /**
-   * Idle threshold for sweeping regenerable dependency/build trees out of topic
+   * Idle threshold for sweeping regenerable dependency-install trees out of topic
    * worktrees. Its own (short) clock: unlike a whole topic dir, these trees can
    * never hold work, so they do not need the topic GC's git proofs, quarantine,
    * or CAS machinery. 0 disables the sweep.
@@ -1927,12 +1944,12 @@ function findRegenerableTargets(root: string): { target: string; targetType: 'di
       // Dirents carry lstat semantics: a symlink to a directory reports
       // isSymbolicLink() and NOT isDirectory().
       if (entry.isSymbolicLink()) {
-        if (REGENERABLE_DIR_NAMES.has(entry.name)) found.push({ target: full, targetType: 'symlink' });
+        if (REGENERABLE_SWEEP_DIR_NAMES.has(entry.name)) found.push({ target: full, targetType: 'symlink' });
         continue;
       }
       if (!entry.isDirectory()) continue;
       if (SKIP_DESCEND_DIR_NAMES.has(entry.name)) continue;
-      if (REGENERABLE_DIR_NAMES.has(entry.name)) {
+      if (REGENERABLE_SWEEP_DIR_NAMES.has(entry.name)) {
         // Do not descend: the whole tree goes, and a nested node_modules inside
         // it would only be counted twice.
         found.push({ target: full, targetType: 'directory' });
@@ -2009,15 +2026,18 @@ function pathsOverlap(a: string, b: string): boolean {
 }
 
 /**
- * Sweep regenerable dependency/build trees out of idle topic worktrees.
+ * Sweep regenerable dependency-install trees out of idle topic worktrees.
  *
  * A DIFFERENT SAFETY CLASS from the topic GC in worktree-cleanup.ts, which is
  * why this is a separate pass on a separate clock. That GC removes whole topic
  * dirs, which can hold uncommitted work, so it needs git proofs, quarantine and
- * a 7-to-30-day horizon. These trees are 100% derived from package.json and
- * lockfiles and never hold work, so the only real hazard is deleting one out
- * from under a container that is using it — and the cost of being wrong is an
- * `npm ci`, not lost work. Hence a 2-day default.
+ * a 7-to-30-day horizon. `REGENERABLE_SWEEP_DIR_NAMES` is restricted to trees
+ * that are 100% derived from package.json and lockfiles and can never hold
+ * work — which is what buys the short clock and lets this skip the git proofs.
+ * The only real hazard left is deleting one out from under a container that is
+ * using it, and the cost of being wrong is an `npm ci`, not lost work. Hence a
+ * 2-day default. Widening that list is what would break this argument; see the
+ * comment at its declaration.
  *
  * IDLE SIGNAL — `max(sessions.last_active for the topic's participants,
  * mtime of <topic>/worktrees)`. Deliberately NOT:
@@ -2103,7 +2123,7 @@ function collectTopicRegenerableActions(args: {
             safety:
               targetType === 'symlink'
                 ? 'Symlinked dependency tree under an idle topic worktree; the link is unlinked and whatever it points at is never opened.'
-                : 'Regenerable dependency/build tree under an idle topic worktree, with no running container mounting the topic. Holds no work — it is reinstalled from package.json/lockfiles.',
+                : 'Dependency-install tree under an idle topic worktree, with no running container mounting the topic. Holds no work — it is reinstalled from package.json/lockfiles.',
           }),
         );
       }

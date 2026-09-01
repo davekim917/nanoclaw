@@ -2534,6 +2534,25 @@ describe('storage-manager regenerable tree sweep', () => {
     );
   });
 
+  it('never sweeps build output directories, only dependency-install output', () => {
+    const { repoDir } = makeTopic('thread-22222222222222222222222222222222');
+    // Every one of these is on ARCHIVE_EXCLUDED_DIR_NAMES and deliberately NOT
+    // on REGENERABLE_SWEEP_DIR_NAMES: repos track them, and an agent's
+    // uncommitted output can sit in them. Not archiving a tree is a very
+    // different claim from being allowed to delete the only copy of it.
+    for (const name of ['dist', 'build', '.next', 'coverage', '.cache']) {
+      fs.mkdirSync(path.join(repoDir, name), { recursive: true });
+      fs.writeFileSync(path.join(repoDir, name, 'output.js'), `tracked ${name} output`);
+    }
+
+    const report = sweep();
+
+    expect(report.actions.map((action) => action.path)).toEqual([path.join(repoDir, 'node_modules')]);
+    for (const name of ['dist', 'build', '.next', 'coverage', '.cache']) {
+      expect(fs.readFileSync(path.join(repoDir, name, 'output.js'), 'utf8')).toBe(`tracked ${name} output`);
+    }
+  });
+
   it('leaves a topic inside the idle window alone at the default 2-day clock', () => {
     const { repoDir } = makeTopic('thread-11111111111111111111111111111111', { idleDays: 1 });
 
