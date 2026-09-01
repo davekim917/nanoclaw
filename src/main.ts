@@ -54,6 +54,7 @@ import { log } from './log.js';
 import { startDashboard } from './dashboard/index.js';
 import { enforceUpgradeTripwire } from './upgrade-state.js';
 import { reconcilePendingUpgradeContexts } from './session-manager.js';
+import { releaseOrphanedRepoIngressFencesAtStartup } from './repo-fence-recovery.js';
 
 // Response + shutdown registries live in response-registry.ts to break the
 // circular import cycle: src/index.ts imports src/modules/index.js for side
@@ -242,6 +243,23 @@ export async function main(): Promise<void> {
   } catch (pendingErr) {
     log.error('Pending pre-turn context reconciliation failed at startup', { err: pendingErr });
     process.exit(1);
+  }
+
+  // Incident 2026-09-01: a failed repository publication left 1401 session
+  // inbound DBs fenced with no publication left to release them, and the
+  // workgroup went silently deaf. The mount/lifecycle claims that mark a
+  // publication "in flight" are process-local Sets (src/repository-workspaces.ts),
+  // so a fresh process holds none: every active fence found here belongs to a
+  // publication that died with the previous process and is orphaned by
+  // definition. Per-session failures are isolated inside the pass and never
+  // exit the process — a fence is a liveness problem, not a boot invariant.
+  try {
+    const fences = await releaseOrphanedRepoIngressFencesAtStartup();
+    if (fences.released > 0 || fences.failed > 0) {
+      log.warn('Released orphaned repository ingress fences at startup', { ...fences });
+    }
+  } catch (fenceErr) {
+    log.error('Orphaned repository ingress fence recovery failed at startup', { err: fenceErr });
   }
 
   log.info('Central DB ready', { path: dbPath });

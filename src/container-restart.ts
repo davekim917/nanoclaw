@@ -60,6 +60,31 @@ export class RepositoryMountQuiescenceError extends Error {
   }
 }
 
+/**
+ * Activation failed AND the rollback could not un-fence every session it had
+ * already fenced.
+ *
+ * Incident 2026-09-01: this case threw a bare `AggregateError`, so the caller's
+ * `error instanceof RepositoryMountQuiescenceError` branch never matched, its
+ * `quiescence` stayed null, and no barrier release was ever attempted for the
+ * sessions the rollback had missed. Carrying the stranded set on a typed error
+ * lets `quiesceSessionsForRepositoryMounts` hand it back through the recovery
+ * shape that already exists for exactly this (`barriersReleased: false`).
+ */
+export class RepositoryMountBarrierRollbackError extends Error {
+  readonly epoch: string;
+  readonly strandedSessions: Session[];
+  readonly barrierGenerations: Record<string, string>;
+
+  constructor(cause: unknown, epoch: string, strandedSessions: Session[], barrierGenerations: Record<string, string>) {
+    super(`repository mount barrier ${epoch} activation failed and could not be fully rolled back`, { cause });
+    this.name = 'RepositoryMountBarrierRollbackError';
+    this.epoch = epoch;
+    this.strandedSessions = strandedSessions;
+    this.barrierGenerations = barrierGenerations;
+  }
+}
+
 function uniqueSessions(sessions: Session[]): Session[] {
   return [...new Map(sessions.map((session) => [session.id, session])).values()];
 }
@@ -116,6 +141,7 @@ async function activateRepositoryMountBarriers(
     // No topology mutation has happened yet. Restore every DB fenced by this
     // attempt so an activation failure cannot strand unrelated inbound work.
     const releaseErrors: unknown[] = [];
+    const stranded: Session[] = [];
     for (const session of activated.reverse()) {
       try {
         const inDb = openInboundDb(session.agent_group_id, session.id);
@@ -130,13 +156,19 @@ async function activateRepositoryMountBarriers(
         }
       } catch (releaseError) {
         releaseErrors.push(releaseError);
+        stranded.push(session);
       }
     }
     if (releaseErrors.length > 0) {
-      throw new AggregateError(
-        [error, ...releaseErrors],
-        `repository mount barrier ${epoch} activation failed and could not be fully rolled back`,
-        { cause: error },
+      throw new RepositoryMountBarrierRollbackError(
+        new AggregateError(
+          [error, ...releaseErrors],
+          `repository mount barrier ${epoch} activation failed and could not be fully rolled back`,
+          { cause: error },
+        ),
+        epoch,
+        stranded,
+        barrierGenerations,
       );
     }
     throw error;
@@ -234,7 +266,32 @@ export async function quiesceSessionsForRepositoryMounts(
       `running session(s) have no inbound database to fence: ${unfenceable.map((session) => session.id).join(', ')}`,
     );
   }
-  const { barrierAcks, barrierGenerations } = await activateRepositoryMountBarriers(barrierSessions, epoch);
+  let barrierAcks: Record<string, string>;
+  let barrierGenerations: Record<string, string>;
+  try {
+    ({ barrierAcks, barrierGenerations } = await activateRepositoryMountBarriers(barrierSessions, epoch));
+  } catch (error) {
+    // A partial rollback leaves real fences behind, and the caller's only
+    // recovery affordance is RepositoryMountQuiescenceError. Re-shape into it
+    // with the stranded set as the barrier sessions and `barriersReleased:
+    // false`, so `applyRepositoryPublishAction` / `applyRepositoryTransferAction`
+    // retry the release instead of dropping them (incident 2026-09-01).
+    if (error instanceof RepositoryMountBarrierRollbackError) {
+      throw new RepositoryMountQuiescenceError(
+        error,
+        {
+          epoch,
+          sessions: [],
+          barrierSessions: error.strandedSessions,
+          barrierAcks: {},
+          barrierGenerations: error.barrierGenerations,
+        },
+        [],
+        false,
+      );
+    }
+    throw error;
+  }
   const quiescence = { epoch, sessions: affected, barrierSessions, barrierAcks, barrierGenerations };
   try {
     await waitUntil(

@@ -107,6 +107,7 @@ import { OomKillObserver } from './resource-oom-observer.js';
 import { pruneChannelIngressReceipts } from './db/channel-ingress-receipts.js';
 import { reconcileMergedClaims } from './modules/claims/reconcile.js';
 import { sweepClaimsSelfHeal } from './modules/claims/self-heal.js';
+import { sweepOrphanedRepoIngressFences } from './repo-fence-recovery.js';
 
 const oomKillObserver = new OomKillObserver();
 
@@ -1268,6 +1269,19 @@ async function sweepOnce(): Promise<void> {
     await sweepClaimsSelfHeal();
   } catch (err) {
     log.warn('Claims self-heal sweep step failed', { err });
+  }
+
+  // Incident 2026-09-01: a failed repository publication left 1401 session
+  // inbound DBs fenced (`repo_ingress_fence.state = 'active'`) with no
+  // publication left to release them. Every inbound row since was held with
+  // trigger=0 and every spawn refused, so the workgroup went silently deaf for
+  // hours. Nothing else in the host releases a fence whose publication is gone.
+  // Reuses the session list the per-session loop already loaded — no extra
+  // query — and throttles its own full pass internally.
+  try {
+    await sweepOrphanedRepoIngressFences(sessions);
+  } catch (err) {
+    log.warn('Orphaned repository fence sweep step failed', { err });
   }
 
   const sweepMs = Date.now() - sweepStartedAtMs;
