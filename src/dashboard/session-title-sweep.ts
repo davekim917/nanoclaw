@@ -41,6 +41,24 @@ import {
   type StructuredCredential,
 } from '../llm.js';
 
+// `callTitleBackend` rotates credentials through src/llm.ts's
+// `callWithCredentialRotation`, which keeps its "which slot last succeeded"
+// and "which slots are currently parked" state at MODULE level in llm.ts —
+// not per-call, not per-caller. That state is shared across every
+// concurrent candidate in a single sweep tick, not just across ticks: once
+// candidate 1 discovers a slot needs parking (quota-exhausted with a long
+// retry-after) or has already rotated past a dead one, candidates 2 and 3
+// see that same state on every attempt they make AFTER that point — a
+// dead/parked slot does not get separately re-tried by all CONCURRENCY_CAP
+// candidates in the same tick. This is "for free" from llm.ts, not
+// something this file implements — verified via src/llm.test.ts's
+// credential-rotation/parking suites, which exercise the same shared state
+// this sweep's production path (below, non-test-override branch) goes
+// through. It is not airtight for the very FIRST request of a tick: JS runs
+// each candidate's synchronous setup (including firing its first HTTP
+// request) before the next candidate starts, so multiple concurrent
+// candidates CAN simultaneously dispatch to the same still-untried slot
+// once per tick before any of them has reported it dead.
 export const CONCURRENCY_CAP = 3;
 export const COOLDOWN_HOURS = 1;
 export const REFRESH_MIN_NEW_MESSAGES = 10;

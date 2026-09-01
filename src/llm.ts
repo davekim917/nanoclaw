@@ -635,10 +635,71 @@ async function callHaikuOnce(prompt: string, timeoutMs: number, credential: Stru
  * Bounded per-slot attempts + backoff shared by every
  * {@link callWithCredentialRotation} caller (`callHaiku` below and
  * `session-title-sweep.ts`'s title generation).
+ *
+ * Defaults to ONE attempt per slot. This used to be 4: a single failed call
+ * could burn `4 attempts x N slots` requests (16 for a 4-slot install) before
+ * giving up, and `session-title-sweep.ts` runs up to
+ * {@link import('./dashboard/session-title-sweep.js').CONCURRENCY_CAP}
+ * of these concurrently — ~80 req/min against a handful of accounts, enough
+ * to rate-limit credentials that were otherwise healthy. Rotation across
+ * slots is meant to be fast and cheap; the 60s host-sweep tick (not
+ * in-process backoff) is the real retry mechanism for this background work.
+ * Kept as a named, tunable constant rather than inlined `1` so a caller with
+ * a genuine need for same-slot retries (none today) has an obvious knob.
  */
-const CREDENTIAL_ROTATION_MAX_ATTEMPTS_PER_SLOT = 4;
+const CREDENTIAL_ROTATION_MAX_ATTEMPTS_PER_SLOT = 1;
 const CREDENTIAL_ROTATION_BACKOFF_BASE_MS = 1000;
-const CREDENTIAL_ROTATION_BACKOFF_CAP_MS = 15_000;
+/**
+ * Lowered from 15s to 2s alongside the attempts default above — even if a
+ * caller bumps {@link CREDENTIAL_ROTATION_MAX_ATTEMPTS_PER_SLOT} above 1 for
+ * a genuine same-slot-retry need (529 / network blip), a single call must
+ * never sleep more than a couple of seconds in total. A long `retry-after`
+ * (the "this credential is out of quota for hours" shape) is handled by
+ * parking below, never by sleeping through it.
+ */
+const CREDENTIAL_ROTATION_BACKOFF_CAP_MS = 2_000;
+
+/**
+ * A `retry-after` at or below this means "the backend is briefly busy" —
+ * cheap to retry once. Above it, the credential itself is the problem (a
+ * subscription that won't refill for hours, observed as `retry-after=149184`
+ * — 41 hours), and retrying it at all just burns quota for nothing.
+ */
+const CREDENTIAL_PARK_THRESHOLD_MS = 60_000;
+
+/**
+ * Slots parked because they returned a `retry-after` longer than
+ * {@link CREDENTIAL_PARK_THRESHOLD_MS}, keyed to when they become eligible
+ * again. Module-level (like {@link lastGoodCredentialSlot} below) because
+ * "which slots are currently dead" is one fact shared by every
+ * {@link callWithCredentialRotation} caller in this process, not something
+ * `callHaiku` and the session-title sweep should each rediscover — and burn
+ * a request finding out — independently against the same underlying quota.
+ */
+const parkedSlotUntilMs = new Map<ClaudeCredentialSlot, number>();
+
+/** True while `slot` is parked (skip it entirely) as of `nowMs`. Lazily expires the entry once its window has passed. */
+function isSlotParked(slot: ClaudeCredentialSlot, nowMs: number): boolean {
+  const until = parkedSlotUntilMs.get(slot);
+  if (until === undefined) return false;
+  if (nowMs >= until) {
+    parkedSlotUntilMs.delete(slot);
+    return false;
+  }
+  return true;
+}
+
+/** Park `slot` until `nowMs + retryAfterMs`, logging once for this occurrence (slot name only — never a token value). */
+function parkSlot(slot: ClaudeCredentialSlot, retryAfterMs: number, nowMs: number, logLabel: string): void {
+  const untilMs = nowMs + retryAfterMs;
+  parkedSlotUntilMs.set(slot, untilMs);
+  log.warn(`${logLabel}: parking exhausted credential slot`, { slot, untilIso: new Date(untilMs).toISOString() });
+}
+
+/** Test hook — clears parked-slot state so tests start with every slot eligible. */
+export function __resetCredentialParkingForTest(): void {
+  parkedSlotUntilMs.clear();
+}
 
 /**
  * How long a slot stays "sticky" (tried first) after it last succeeded.
@@ -724,6 +785,26 @@ function orderCredentialsFromLastGood(credentials: StructuredCredential[], now: 
 }
 
 /**
+ * Thrown by {@link callWithCredentialRotation} when every configured
+ * credential slot is currently parked (see {@link parkedSlotUntilMs}) — none
+ * are even attempted. This is deliberately NOT a retryable condition from
+ * this function's point of view: it fails fast, no sleep, because the caller
+ * is background work (a thread/session title) and the host's 60s sweep will
+ * naturally retry once a slot's park window lapses.
+ */
+export class AllCredentialSlotsParkedError extends Error {
+  readonly nextAvailableAt: Date | null;
+  constructor(logLabel: string, nextAvailableAt: Date | null) {
+    super(
+      `${logLabel}: every credential slot is parked` +
+        (nextAvailableAt ? ` — next available at ${nextAvailableAt.toISOString()}` : ''),
+    );
+    this.name = 'AllCredentialSlotsParkedError';
+    this.nextAvailableAt = nextAvailableAt;
+  }
+}
+
+/**
  * Run `attempt` against every configured Anthropic credential slot
  * (`CLAUDE_CODE_OAUTH_TOKEN[_2..4]` / `ANTHROPIC_API_KEY`, resolved via the
  * same {@link structuredCredentials} the structured Claude path uses) rather
@@ -737,14 +818,26 @@ function orderCredentialsFromLastGood(credentials: StructuredCredential[], now: 
  * caller forever while another had already rotated past it.
  *
  * `attempt` performs ONE request against a single resolved credential and
- * should reject on failure. Failures are classified by `classify` (default
+ * should reject on failure. A failure with a `retry-after` longer than
+ * {@link CREDENTIAL_PARK_THRESHOLD_MS} means the CREDENTIAL is the problem
+ * (observed: `retry-after=149184` — 41 hours) rather than a momentary busy
+ * backend — that slot is parked (see {@link parkSlot}) and skipped for the
+ * rest of this call AND every subsequent call until its window lapses;
+ * without this a caller would retry an hours-dead slot on every single
+ * invocation forever. If parking empties the available list before any
+ * attempt is made, this throws {@link AllCredentialSlotsParkedError}
+ * immediately — no sleep.
+ *
+ * Otherwise, failures are classified by `classify` (default
  * {@link classifyCredentialFailure}) into two classes with opposite cures:
  * transient/server-overload backs off and retries the SAME slot (up to
- * {@link CREDENTIAL_ROTATION_MAX_ATTEMPTS_PER_SLOT} attempts, honoring
+ * {@link CREDENTIAL_ROTATION_MAX_ATTEMPTS_PER_SLOT} attempts — 1 by default,
+ * so no backoff happens unless a caller opts into more; when it does, honors
  * `retry-after` when present, otherwise capped-exponential with up to 20%
- * jitter); quota-exhaustion rotates to the NEXT slot immediately with no
- * sleep. Only after every slot is exhausted does this throw — the last
- * error seen. The last slot to succeed is cached (see
+ * jitter, and never sleeps more than {@link CREDENTIAL_ROTATION_BACKOFF_CAP_MS}
+ * per attempt); quota-exhaustion rotates to the NEXT slot immediately with no
+ * sleep. Only after every slot is exhausted does this throw — the last error
+ * seen. The last slot to succeed is cached (see
  * {@link orderCredentialsFromLastGood}) so the next call — from ANY caller —
  * starts there instead of re-failing through slot 1 first.
  *
@@ -771,10 +864,23 @@ export async function callWithCredentialRotation<T>(options: {
     throw new Error(options.noCredentialsMessage);
   }
   const ordered = orderCredentialsFromLastGood(credentials, Date.now());
+  const startMs = Date.now();
+  const available = ordered.filter((credential) => !isSlotParked(credential.slot, startMs));
+  if (available.length === 0) {
+    const nextAvailableMs = ordered.reduce<number | null>((min, credential) => {
+      const until = parkedSlotUntilMs.get(credential.slot);
+      if (until === undefined) return min;
+      return min === null ? until : Math.min(min, until);
+    }, null);
+    throw new AllCredentialSlotsParkedError(
+      options.logLabel,
+      nextAvailableMs !== null ? new Date(nextAvailableMs) : null,
+    );
+  }
 
   let lastErr: unknown;
-  for (let slotPos = 0; slotPos < ordered.length; slotPos++) {
-    const credential = ordered[slotPos]!;
+  for (let slotPos = 0; slotPos < available.length; slotPos++) {
+    const credential = available[slotPos]!;
     for (let attempt = 1; attempt <= CREDENTIAL_ROTATION_MAX_ATTEMPTS_PER_SLOT; attempt++) {
       try {
         const value = await options.attempt(credential);
@@ -786,25 +892,31 @@ export async function callWithCredentialRotation<T>(options: {
         const failureClass = classify(err);
         if (failureClass === 'fatal') throw err;
 
+        const retryAfterMs = (err as { retryAfterMs?: number | null }).retryAfterMs;
+        if (retryAfterMs != null && retryAfterMs > CREDENTIAL_PARK_THRESHOLD_MS) {
+          parkSlot(credential.slot, retryAfterMs, Date.now(), options.logLabel);
+          break; // next slot immediately — this credential won't recover before the sweep's next tick anyway
+        }
+
         if (failureClass === 'quota-exhausted') {
           log.warn(`${options.logLabel}: credential slot quota exhausted, rotating`, {
             fromSlot: credential.slot,
-            toSlot: ordered[slotPos + 1]?.slot ?? null,
+            toSlot: available[slotPos + 1]?.slot ?? null,
             status: (err as { status?: number }).status,
           });
           break; // next slot immediately — no backoff, quota won't recover by waiting
         }
 
-        // transient: back off and retry the SAME slot.
+        // transient: back off and retry the SAME slot (bounded — see
+        // CREDENTIAL_ROTATION_MAX_ATTEMPTS_PER_SLOT / _BACKOFF_CAP_MS above).
         if (attempt === CREDENTIAL_ROTATION_MAX_ATTEMPTS_PER_SLOT) {
           log.warn(`${options.logLabel}: slot exhausted its transient-retry budget, trying next slot`, {
             slot: credential.slot,
-            nextSlot: ordered[slotPos + 1]?.slot ?? null,
+            nextSlot: available[slotPos + 1]?.slot ?? null,
             status: (err as { status?: number }).status,
           });
           break;
         }
-        const retryAfterMs = (err as { retryAfterMs?: number | null }).retryAfterMs;
         const backoff =
           retryAfterMs != null
             ? Math.min(retryAfterMs, CREDENTIAL_ROTATION_BACKOFF_CAP_MS)

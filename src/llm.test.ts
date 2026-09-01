@@ -10,7 +10,13 @@ vi.mock('./env.js', () => ({
   readEnvFileMatching: vi.fn(() => ({})),
 }));
 
-import { callHaiku, CallHaikuHttpError, __resetCallHaikuSlotCacheForTest } from './llm.js';
+import {
+  callHaiku,
+  CallHaikuHttpError,
+  AllCredentialSlotsParkedError,
+  __resetCallHaikuSlotCacheForTest,
+  __resetCredentialParkingForTest,
+} from './llm.js';
 
 function jsonResponse(body: unknown, init: { status?: number; headers?: Record<string, string> } = {}): Response {
   return new Response(JSON.stringify(body), {
@@ -48,12 +54,14 @@ describe('callHaiku', () => {
     vi.stubGlobal('fetch', fetchMock);
     vi.useFakeTimers();
     __resetCallHaikuSlotCacheForTest();
+    __resetCredentialParkingForTest();
   });
 
   afterEach(() => {
     vi.useRealTimers();
     vi.unstubAllGlobals();
     __resetCallHaikuSlotCacheForTest();
+    __resetCredentialParkingForTest();
     if (originalApiKey === undefined) delete process.env.ANTHROPIC_API_KEY;
     else process.env.ANTHROPIC_API_KEY = originalApiKey;
     if (originalOauthPrimary === undefined) delete process.env.CLAUDE_CODE_OAUTH_TOKEN;
@@ -66,38 +74,40 @@ describe('callHaiku', () => {
     else process.env.HTTP_PROXY = originalHttpProxy;
   });
 
-  it('honors the retry-after header and succeeds once the backend recovers', async () => {
-    fetchMock
-      .mockResolvedValueOnce(jsonResponse({}, { status: 429, headers: { 'retry-after': '2' } }))
-      .mockResolvedValueOnce(jsonResponse({}, { status: 429, headers: { 'retry-after': '1' } }))
-      .mockResolvedValueOnce(jsonResponse({ content: [{ type: 'text', text: 'Rollout fix' }] }));
+  it('issues exactly one request when the only configured slot hits a (short) retry-after 429 — no in-process retry by default', async () => {
+    // Previously this retried the SAME slot with backoff, honoring
+    // retry-after, until it eventually succeeded — up to 4 attempts. A
+    // single failed call could burn 4 requests per slot (16 across 4 slots),
+    // amplifying enough to rate-limit otherwise-healthy credentials (see
+    // src/llm.ts's CREDENTIAL_ROTATION_MAX_ATTEMPTS_PER_SLOT doc comment).
+    // The default per-slot attempt budget is now 1: with only one configured
+    // slot there's nothing to rotate to, so the call fails after ONE request
+    // — the 60s host sweep is the real retry mechanism, not in-process
+    // backoff.
+    fetchMock.mockResolvedValueOnce(jsonResponse({}, { status: 429, headers: { 'retry-after': '2' } }));
 
     const promise = callHaiku('hello');
-    await vi.runAllTimersAsync();
-    const result = await promise;
+    promise.catch(() => {});
 
-    expect(result).toBe('Rollout fix');
-    expect(fetchMock).toHaveBeenCalledTimes(3);
+    await expect(promise).rejects.toBeInstanceOf(CallHaikuHttpError);
+    await expect(promise).rejects.toMatchObject({ status: 429 });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
-  it('stops after the attempt cap and throws the last error (previously: single immediate retry, both landed in the same 429 window)', async () => {
+  it('stops after ONE attempt on the only configured slot and throws (down from 4 — rotation, not in-process backoff, is the retry mechanism)', async () => {
     // mockImplementation (not mockResolvedValue) — a fresh Response per call,
     // since callHaikuHttpError now reads the body once via .json() and a
     // shared Response instance can't be read twice.
     fetchMock.mockImplementation(async () => jsonResponse({}, { status: 429, headers: { 'retry-after': '1' } }));
 
     const promise = callHaiku('hello');
-    // Avoid an unhandled-rejection warning while the timers below are still
-    // draining and the assertion hasn't attached its own handler yet.
     promise.catch(() => {});
-    await vi.runAllTimersAsync();
 
     await expect(promise).rejects.toBeInstanceOf(CallHaikuHttpError);
     await expect(promise).rejects.toMatchObject({ status: 429 });
-    // 4 total attempts: the original call + 3 retries — up from the old
-    // single-immediate-retry behavior (2 total attempts). Only one
-    // configured slot (api-key:primary), so there's nothing to rotate to.
-    expect(fetchMock).toHaveBeenCalledTimes(4);
+    // Exactly 1 attempt: only one configured slot (api-key:primary), and the
+    // default per-slot attempt budget is 1.
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
   it('does not retry a non-transient (e.g. 400) error', async () => {
@@ -108,17 +118,15 @@ describe('callHaiku', () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
-  it('falls back to capped-exponential backoff with jitter when no retry-after is present', async () => {
-    fetchMock
-      .mockResolvedValueOnce(jsonResponse({}, { status: 529 }))
-      .mockResolvedValueOnce(jsonResponse({ content: [{ type: 'text', text: 'ok' }] }));
+  it('a 529 (server overload) also exhausts its one-attempt budget immediately, without sleeping', async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse({}, { status: 529 }));
 
     const promise = callHaiku('hello');
-    await vi.runAllTimersAsync();
-    const result = await promise;
+    promise.catch(() => {});
 
-    expect(result).toBe('ok');
-    expect(fetchMock).toHaveBeenCalledTimes(2);
+    await expect(promise).rejects.toBeInstanceOf(CallHaikuHttpError);
+    await expect(promise).rejects.toMatchObject({ status: 529 });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
   describe('credential rotation across slots', () => {
@@ -147,20 +155,21 @@ describe('callHaiku', () => {
       expect(authHeader(fetchMock.mock.calls[1])).toBe('Bearer oauth-slot-2-token');
     });
 
-    it('backs off on the same slot for a 429 WITH retry-after, and does not rotate', async () => {
+    it('rotates to the next slot on a 429 WITH a short retry-after too — the default one-attempt-per-slot budget applies regardless of classification', async () => {
+      // Previously a retry-after (any length) meant "transient — back off and
+      // retry the SAME slot", up to 4 attempts. With the default per-slot
+      // budget now 1, a SHORT retry-after (below the park threshold) still
+      // rotates immediately rather than sleeping in-process.
       fetchMock
         .mockResolvedValueOnce(jsonResponse({}, { status: 429, headers: { 'retry-after': '1' } }))
-        .mockResolvedValueOnce(jsonResponse({ content: [{ type: 'text', text: 'from slot 1 again' }] }));
+        .mockResolvedValueOnce(jsonResponse({ content: [{ type: 'text', text: 'from slot 2' }] }));
 
-      const promise = callHaiku('hello');
-      await vi.runAllTimersAsync();
-      const result = await promise;
+      const result = await callHaiku('hello');
 
-      expect(result).toBe('from slot 1 again');
+      expect(result).toBe('from slot 2');
       expect(fetchMock).toHaveBeenCalledTimes(2);
-      // Both attempts hit slot 1 — no rotation happened.
       expect(authHeader(fetchMock.mock.calls[0])).toBe('Bearer oauth-slot-1-token');
-      expect(authHeader(fetchMock.mock.calls[1])).toBe('Bearer oauth-slot-1-token');
+      expect(authHeader(fetchMock.mock.calls[1])).toBe('Bearer oauth-slot-2-token');
     });
 
     it('throws once every slot is exhausted', async () => {
@@ -199,6 +208,79 @@ describe('callHaiku', () => {
       // the now-known-exhausted slot 1.
       expect(fetchMock).toHaveBeenCalledTimes(1);
       expect(authHeader(fetchMock.mock.calls[0])).toBe('Bearer oauth-slot-2-token');
+    });
+  });
+
+  describe('credential parking (long retry-after)', () => {
+    beforeEach(() => {
+      delete process.env.ANTHROPIC_API_KEY;
+      process.env.CLAUDE_CODE_OAUTH_TOKEN = 'oauth-slot-1-token';
+      process.env.CLAUDE_CODE_OAUTH_TOKEN_2 = 'oauth-slot-2-token';
+    });
+
+    it('parks a slot whose retry-after exceeds the short-retry threshold and rotates immediately, without sleeping', async () => {
+      // retry-after=3600s (1 hour) is the "this credential is genuinely
+      // exhausted" shape (live evidence showed 149184s / 41 hours) — not a
+      // momentarily-busy backend. It must park, not back off.
+      fetchMock
+        .mockResolvedValueOnce(jsonResponse({}, { status: 429, headers: { 'retry-after': '3600' } }))
+        .mockResolvedValueOnce(jsonResponse({ content: [{ type: 'text', text: 'from slot 2' }] }));
+
+      const result = await callHaiku('hello');
+
+      expect(result).toBe('from slot 2');
+      // Exactly slots.length (2) requests — one per slot, no retry.
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect(authHeader(fetchMock.mock.calls[0])).toBe('Bearer oauth-slot-1-token');
+      expect(authHeader(fetchMock.mock.calls[1])).toBe('Bearer oauth-slot-2-token');
+    });
+
+    it('skips a parked slot on the NEXT call entirely, rather than retrying it', async () => {
+      fetchMock
+        .mockResolvedValueOnce(jsonResponse({}, { status: 429, headers: { 'retry-after': '3600' } }))
+        .mockResolvedValueOnce(jsonResponse({ content: [{ type: 'text', text: 'first call, slot 2' }] }));
+
+      const first = await callHaiku('hello');
+      expect(first).toBe('first call, slot 2');
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+
+      // Reset the STICKY-slot cache but NOT the parking state, so the next
+      // call's ordering falls back to [slot1, slot2] — this isolates
+      // "slot 1 is skipped because it's parked" from "slot 1 is skipped
+      // because slot 2 is the sticky last-known-good slot" (a different
+      // mechanism that would also explain skipping slot 1).
+      __resetCallHaikuSlotCacheForTest();
+      fetchMock.mockClear();
+      fetchMock.mockResolvedValueOnce(jsonResponse({ content: [{ type: 'text', text: 'second call, slot 2' }] }));
+
+      const second = await callHaiku('hello again');
+
+      expect(second).toBe('second call, slot 2');
+      // Only ONE fetch call: slot 1 is still parked (1-hour retry-after from
+      // the first call), so it is skipped entirely — never attempted.
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(authHeader(fetchMock.mock.calls[0])).toBe('Bearer oauth-slot-2-token');
+    });
+
+    it('fails fast with AllCredentialSlotsParkedError when every slot is parked, without sleeping', async () => {
+      // mockImplementation (not mockResolvedValue) — a fresh Response per
+      // call, since the error body is read via .json() and a shared Response
+      // instance can't be read twice.
+      fetchMock.mockImplementation(async () => jsonResponse({}, { status: 429, headers: { 'retry-after': '3600' } }));
+
+      const first = await callHaiku('hello').catch((err: unknown) => err);
+      expect(first).toBeInstanceOf(CallHaikuHttpError);
+      // Both slots tried (and parked) on this first call.
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+
+      fetchMock.mockClear();
+      const second = callHaiku('hello again');
+
+      await expect(second).rejects.toBeInstanceOf(AllCredentialSlotsParkedError);
+      // No request at all on the second call — both slots were already
+      // known-parked, so it fails fast instead of sleeping or re-trying a
+      // credential that just told us it's dead for the next hour.
+      expect(fetchMock).not.toHaveBeenCalled();
     });
   });
 });
