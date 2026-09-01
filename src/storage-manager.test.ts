@@ -41,9 +41,11 @@ import {
   pruneIdleSessionArtifacts,
   readReclaimJournal,
   type DockerImageInventory,
+  type StorageReport,
 } from './storage-manager.js';
 import { CONTAINER_IMAGE, CONTAINER_IMAGE_BASE, CONTAINER_INSTALL_LABEL } from './config.js';
 import { CONTAINER_RUNTIME_BIN } from './container-runtime.js';
+import { resolveRepositoryWorkUnit } from './repository-workspaces.js';
 import { log } from './log.js';
 
 // The rescue round-trip suite needs a REAL tar/zstd. `vi.mock('child_process')`
@@ -2342,5 +2344,408 @@ describe('storage-manager reclaim planning baseline', () => {
     // a session that had just been active.
     expect(report.actions.find((a) => a.kind === 'archive-session')?.status).toBe('skipped');
     expect(fs.existsSync(dir)).toBe(true);
+  });
+});
+
+describe('storage-manager regenerable tree sweep', () => {
+  const DAY_MS = 24 * 60 * 60 * 1000;
+  const now = Date.parse('2026-09-01T00:00:00.000Z');
+  let tmpRoot: string;
+  let dataRoot: string;
+  let topicsRoot: string;
+  let sessionsRoot: string;
+  const knob = 'NANOCLAW_REGENERABLE_SWEEP_DAYS';
+  let savedKnob: string | undefined;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    _resetStorageManagerThrottleForTesting();
+    savedKnob = process.env[knob];
+    delete process.env[knob];
+    tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'storage-sweep-'));
+    dataRoot = path.join(tmpRoot, 'data');
+    topicsRoot = path.join(dataRoot, 'v2-topics');
+    sessionsRoot = path.join(dataRoot, 'v2-sessions');
+    fs.mkdirSync(sessionsRoot, { recursive: true });
+    // The sweep needs the central inventory to resolve topic ownership; an
+    // unreadable one is a documented no-op, covered by its own test below.
+    const db = new Database(':memory:');
+    db.exec(`CREATE TABLE sessions (
+      id TEXT PRIMARY KEY, agent_group_id TEXT NOT NULL, messaging_group_id TEXT,
+      thread_id TEXT, status TEXT, last_active TEXT, created_at TEXT NOT NULL
+    )`);
+    db.exec('CREATE TABLE agent_groups (id TEXT PRIMARY KEY, folder TEXT, workgroup_id TEXT)');
+    db.exec('CREATE TABLE messaging_groups (id TEXT PRIMARY KEY, platform_id TEXT)');
+    centralDbMock.current = { db };
+    mockExecFileSync.mockImplementation((cmd: string) => {
+      if (cmd === 'df') {
+        return 'Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/sda1 1000 500 500 50% /\n';
+      }
+      throw new Error(`unexpected command ${cmd}`);
+    });
+  });
+
+  afterEach(() => {
+    closeCentralDb();
+    if (savedKnob === undefined) delete process.env[knob];
+    else process.env[knob] = savedKnob;
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  });
+
+  /**
+   * A topic worktree holding one checkout with a node_modules and real source.
+   * The lockfile is part of the fixture, not decoration: without a recorded
+   * reproducer beside it the sweep refuses the tree, so a fixture that omits it
+   * would silently stop testing anything (`lockfile: false` does that on
+   * purpose).
+   */
+  function makeTopic(
+    name: string,
+    options: { idleDays?: number; lockfile?: boolean } = {},
+  ): { topicDir: string; repoDir: string } {
+    const topicDir = path.join(topicsRoot, 'wg-acme', name);
+    const repoDir = path.join(topicDir, 'worktrees', 'XZO-BACKEND');
+    fs.mkdirSync(path.join(repoDir, 'node_modules', 'left-pad'), { recursive: true });
+    fs.writeFileSync(path.join(repoDir, 'node_modules', 'left-pad', 'index.js'), 'reinstallable');
+    fs.mkdirSync(path.join(repoDir, 'src'), { recursive: true });
+    fs.writeFileSync(path.join(repoDir, 'src', 'app.ts'), 'the actual work');
+    fs.writeFileSync(path.join(repoDir, 'package.json'), '{}');
+    if (options.lockfile !== false) {
+      fs.writeFileSync(path.join(repoDir, 'package-lock.json'), '{"lockfileVersion":3}');
+    }
+    const stamp = (now - (options.idleDays ?? 10) * DAY_MS) / 1000;
+    fs.utimesSync(path.join(topicDir, 'worktrees'), stamp, stamp);
+    return { topicDir, repoDir };
+  }
+
+  function sweep(
+    options: { mounts?: string[] | null | (() => string[] | null); mode?: 'dry-run' | 'apply' } = {},
+  ): StorageReport {
+    const configured = options.mounts;
+    const lookup = typeof configured === 'function' ? configured : () => (configured === undefined ? [] : configured);
+    return getStorageReport({
+      mode: options.mode ?? 'apply',
+      now,
+      sessionsRoot,
+      threadsRoot: path.join(dataRoot, 'no-threads'),
+      topicsRoot,
+      runningContainerMounts: lookup,
+      includeDocker: false,
+      policy: { filesystemPath: tmpRoot },
+    });
+  }
+
+  /** Clean during collection, then a container appears before the deletion runs. */
+  function mountsAppearingAfterCollection(later: string[] | null): () => string[] | null {
+    let calls = 0;
+    return () => (calls++ === 0 ? [] : later);
+  }
+
+  it('sweeps an idle topic worktree node_modules and leaves the checkout intact', () => {
+    const { repoDir } = makeTopic('thread-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa');
+
+    const report = sweep();
+
+    expect(report.actions).toEqual([
+      expect.objectContaining({
+        pool: 'topic-cache',
+        kind: 'sweep-regenerable-tree',
+        path: path.join(repoDir, 'node_modules'),
+        status: 'applied',
+      }),
+    ]);
+    expect(report.pools['topic-cache'].actions).toBe(1);
+    expect(fs.existsSync(path.join(repoDir, 'node_modules'))).toBe(false);
+    expect(fs.readFileSync(path.join(repoDir, 'src', 'app.ts'), 'utf8')).toBe('the actual work');
+    expect(fs.existsSync(path.join(repoDir, 'package.json'))).toBe(true);
+  });
+
+  it('skips a topic a running container bind-mounts', () => {
+    const { topicDir, repoDir } = makeTopic('thread-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb');
+
+    const report = sweep({ mounts: [path.join(topicDir, 'worktrees')] });
+
+    expect(report.actions).toEqual([]);
+    expect(report.skipped.liveTopics).toBe(1);
+    expect(fs.existsSync(path.join(repoDir, 'node_modules'))).toBe(true);
+  });
+
+  it('sweeps nothing at all when the container mount lookup fails', () => {
+    const { repoDir } = makeTopic('thread-cccccccccccccccccccccccccccccccc');
+
+    const report = sweep({ mounts: null });
+
+    expect(report.actions).toEqual([]);
+    expect(report.warnings).toContain('regenerable sweep skipped: container runtime mounts could not be listed');
+    expect(fs.existsSync(path.join(repoDir, 'node_modules'))).toBe(true);
+  });
+
+  it('never sweeps a symlinked tree, even a lockfile-backed node_modules', () => {
+    const { repoDir } = makeTopic('thread-dddddddddddddddddddddddddddddddd');
+    const shared = path.join(tmpRoot, 'shared-checkout', 'node_modules', 'left-pad');
+    fs.mkdirSync(shared, { recursive: true });
+    fs.writeFileSync(path.join(shared, 'index.js'), 'belongs to someone else');
+    fs.rmSync(path.join(repoDir, 'node_modules'), { recursive: true });
+    // A lockfile reproduces a tree's contents; it does not record that the tree
+    // was a link or where it pointed. The link is unique state wearing a
+    // disposable name, so the whole class is skipped rather than gated.
+    fs.symlinkSync(path.dirname(shared), path.join(repoDir, 'node_modules'));
+
+    const report = sweep();
+
+    expect(report.actions).toEqual([]);
+    expect(fs.lstatSync(path.join(repoDir, 'node_modules')).isSymbolicLink()).toBe(true);
+    expect(fs.readFileSync(path.join(shared, 'index.js'), 'utf8')).toBe('belongs to someone else');
+  });
+
+  it('preserves a topic whose owning session is still recently active', () => {
+    const { topicDir } = makeTopic('conversation-eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee');
+    const unit = resolveRepositoryWorkUnit({
+      workgroupId: 'wg-acme',
+      sessionId: 'sess-live',
+      platformId: 'slack:C1',
+      messagingGroupId: 'mg-1',
+      threadId: null,
+    });
+    // The dir name must be the work unit's own, or no activity row can be
+    // attributed to it.
+    const owned = path.join(topicsRoot, 'wg-acme', `${unit.kind}-${unit.id}`);
+    fs.renameSync(topicDir, owned);
+    const db = centralDbMock.current!.db;
+    db.prepare('INSERT INTO agent_groups VALUES (?, ?, ?)').run('ag-1', 'acme', 'wg-acme');
+    db.prepare('INSERT INTO messaging_groups VALUES (?, ?)').run('mg-1', 'slack:C1');
+    db.prepare(
+      `INSERT INTO sessions (id, agent_group_id, messaging_group_id, thread_id, status, last_active, created_at)
+       VALUES ('sess-live', 'ag-1', 'mg-1', NULL, 'active', ?, ?)`,
+    ).run(new Date(now - 60 * 60 * 1000).toISOString(), new Date(now - 40 * DAY_MS).toISOString());
+
+    const report = sweep();
+
+    expect(report.actions).toEqual([]);
+    expect(report.skipped.freshTopics).toBe(1);
+    expect(fs.existsSync(path.join(owned, 'worktrees', 'XZO-BACKEND', 'node_modules'))).toBe(true);
+  });
+
+  it('disables the sweep when the knob is 0', () => {
+    const { repoDir } = makeTopic('thread-ffffffffffffffffffffffffffffffff');
+    process.env[knob] = '0';
+
+    const report = sweep();
+
+    expect(report.policy.regenerableSweepMs).toBe(0);
+    expect(report.actions).toEqual([]);
+    expect(fs.existsSync(path.join(repoDir, 'node_modules'))).toBe(true);
+  });
+
+  it('disables the sweep on an invalid knob value rather than falling back to the default', () => {
+    const { repoDir } = makeTopic('thread-99999999999999999999999999999999');
+    process.env[knob] = '2.5';
+
+    const report = sweep();
+
+    expect(report.policy.regenerableSweepMs).toBe(0);
+    expect(report.actions).toEqual([]);
+    expect(fs.existsSync(path.join(repoDir, 'node_modules'))).toBe(true);
+    expect(log.warn).toHaveBeenCalledWith(
+      'storage-manager: invalid NANOCLAW_REGENERABLE_SWEEP_DAYS, disabling regenerable sweep',
+      { value: '2.5' },
+    );
+  });
+
+  // Every name here is on ARCHIVE_EXCLUDED_DIR_NAMES and deliberately NOT on
+  // REGENERABLE_SWEEP_DIR_NAMES. Not archiving a tree is a very different claim
+  // from being allowed to delete the only copy of it.
+  const NEVER_SWEPT = ['dist', 'build', '.next', 'coverage', '.cache'];
+
+  it('never sweeps build output directories, only dependency-install output', () => {
+    const { repoDir } = makeTopic('thread-22222222222222222222222222222222');
+    for (const name of NEVER_SWEPT) {
+      fs.mkdirSync(path.join(repoDir, name), { recursive: true });
+      fs.writeFileSync(path.join(repoDir, name, 'output.js'), `tracked ${name} output`);
+    }
+
+    const report = sweep();
+
+    expect(report.actions.map((action) => action.path)).toEqual([path.join(repoDir, 'node_modules')]);
+    for (const name of NEVER_SWEPT) {
+      expect(fs.readFileSync(path.join(repoDir, name, 'output.js'), 'utf8')).toBe(`tracked ${name} output`);
+    }
+  });
+
+  it('never sweeps a virtualenv, which is not reconstructible without a lockfile', () => {
+    const { repoDir } = makeTopic('thread-33333333333333333333333333333333');
+    // A venv grown by ad-hoc `pip install` with nothing committed is unique
+    // state, and no cheap check distinguishes it from a lockfile-pinned one.
+    // __pycache__ is swept beside it: PEP 3147 bytecode is not importable
+    // without its adjacent .py, so it can never be the only copy.
+    for (const name of ['.venv', 'venv', '.venv-3.12']) {
+      fs.mkdirSync(path.join(repoDir, name, 'lib'), { recursive: true });
+      fs.writeFileSync(path.join(repoDir, name, 'lib', 'installed.py'), `pip installed into ${name}`);
+    }
+    fs.mkdirSync(path.join(repoDir, 'src', '__pycache__'), { recursive: true });
+    fs.writeFileSync(path.join(repoDir, 'src', '__pycache__', 'app.cpython-312.pyc'), 'bytecode');
+
+    const report = sweep();
+
+    expect(report.actions.map((action) => action.path).sort()).toEqual(
+      [path.join(repoDir, 'node_modules'), path.join(repoDir, 'src', '__pycache__')].sort(),
+    );
+    for (const name of ['.venv', 'venv', '.venv-3.12']) {
+      expect(fs.readFileSync(path.join(repoDir, name, 'lib', 'installed.py'), 'utf8')).toBe(
+        `pip installed into ${name}`,
+      );
+    }
+  });
+
+  it('refuses a node_modules with no recorded manifest beside it', () => {
+    const { repoDir } = makeTopic('thread-44444444444444444444444444444444', { lockfile: false });
+    // package.json alone is not a reproducer: it does not pin what was
+    // installed, and `npm install --no-save` leaves nothing behind at all.
+    expect(fs.existsSync(path.join(repoDir, 'package.json'))).toBe(true);
+
+    const report = sweep();
+
+    expect(report.actions).toEqual([]);
+    expect(report.skipped.noManifestTrees).toBe(1);
+    expect(fs.readFileSync(path.join(repoDir, 'node_modules', 'left-pad', 'index.js'), 'utf8')).toBe('reinstallable');
+  });
+
+  it.each(['package-lock.json', 'pnpm-lock.yaml', 'yarn.lock', 'bun.lock'])(
+    'accepts %s as the recorded manifest',
+    (manifest) => {
+      const { repoDir } = makeTopic(`thread-5555555555555555555555555555555${manifest.length % 10}`, {
+        lockfile: false,
+      });
+      fs.writeFileSync(path.join(repoDir, manifest), 'pinned');
+
+      const report = sweep();
+
+      expect(report.actions.map((action) => action.path)).toEqual([path.join(repoDir, 'node_modules')]);
+      expect(report.skipped.noManifestTrees).toBe(0);
+    },
+  );
+
+  it('gates only node_modules on a manifest — the other names carry their own reproducer', () => {
+    const { repoDir } = makeTopic('thread-66666666666666666666666666666666', { lockfile: false });
+    // No lockfile anywhere, so node_modules is refused. .turbo is keyed by a
+    // hash of its inputs and __pycache__ is not importable without its .py, so
+    // neither needs an external file to prove it reconstructible.
+    fs.mkdirSync(path.join(repoDir, '.turbo'), { recursive: true });
+    fs.writeFileSync(path.join(repoDir, '.turbo', 'run.log'), 'task cache');
+    fs.mkdirSync(path.join(repoDir, 'src', '__pycache__'), { recursive: true });
+    fs.writeFileSync(path.join(repoDir, 'src', '__pycache__', 'app.cpython-312.pyc'), 'bytecode');
+
+    const report = sweep();
+
+    expect(report.actions.map((action) => action.path).sort()).toEqual(
+      [path.join(repoDir, '.turbo'), path.join(repoDir, 'src', '__pycache__')].sort(),
+    );
+    expect(report.skipped.noManifestTrees).toBe(1);
+    expect(fs.existsSync(path.join(repoDir, 'node_modules'))).toBe(true);
+  });
+
+  it('refuses at apply time when a container mounts the topic after collection', () => {
+    const { topicDir, repoDir } = makeTopic('thread-77777777777777777777777777777777');
+
+    const report = sweep({ mounts: mountsAppearingAfterCollection([path.join(topicDir, 'worktrees')]) });
+
+    // Planned against a clean snapshot, then refused by the re-check inside the
+    // cleanup claim. The container never acquired a storage activity lease, so
+    // the claim alone would not have noticed it.
+    expect(report.actions).toEqual([
+      expect.objectContaining({ path: path.join(repoDir, 'node_modules'), status: 'skipped' }),
+    ]);
+    expect(fs.readFileSync(path.join(repoDir, 'node_modules', 'left-pad', 'index.js'), 'utf8')).toBe('reinstallable');
+  });
+
+  it('refuses at apply time when the mount re-check itself fails', () => {
+    const { repoDir } = makeTopic('thread-88888888888888888888888888888888');
+
+    const report = sweep({ mounts: mountsAppearingAfterCollection(null) });
+
+    expect(report.actions).toEqual([
+      expect.objectContaining({ path: path.join(repoDir, 'node_modules'), status: 'skipped' }),
+    ]);
+    expect(fs.readFileSync(path.join(repoDir, 'node_modules', 'left-pad', 'index.js'), 'utf8')).toBe('reinstallable');
+  });
+
+  it('does not re-read session activity at apply time — only a mount blocks a collected action', () => {
+    const { topicDir, repoDir } = makeTopic('conversation-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab');
+    const unit = resolveRepositoryWorkUnit({
+      workgroupId: 'wg-acme',
+      sessionId: 'sess-wakes',
+      platformId: 'slack:C2',
+      messagingGroupId: 'mg-2',
+      threadId: null,
+    });
+    const owned = path.join(topicsRoot, 'wg-acme', `${unit.kind}-${unit.id}`);
+    fs.renameSync(topicDir, owned);
+    const db = centralDbMock.current!.db;
+    db.prepare('INSERT INTO agent_groups VALUES (?, ?, ?)').run('ag-1', 'acme', 'wg-acme');
+    db.prepare('INSERT INTO messaging_groups VALUES (?, ?)').run('mg-2', 'slack:C2');
+    db.prepare(
+      `INSERT INTO sessions (id, agent_group_id, messaging_group_id, thread_id, status, last_active, created_at)
+       VALUES ('sess-wakes', 'ag-1', 'mg-2', NULL, 'active', ?, ?)`,
+    ).run(new Date(now - 40 * DAY_MS).toISOString(), new Date(now - 40 * DAY_MS).toISOString());
+
+    // The session wakes between collection and deletion. This is a DELIBERATE
+    // gap, not an oversight: the inventory is read once per pass, and the tree
+    // is lockfile-backed, so losing this race costs a reinstall rather than any
+    // work. The container the waking session spawns is what the apply-time
+    // mount lookup catches, and that is the check worth paying for.
+    const realPrepare = db.prepare.bind(db);
+    let inventoryReads = 0;
+    db.prepare = ((sql: string) => {
+      const statement = realPrepare(sql);
+      if (!sql.includes('idle_since')) return statement;
+      return {
+        all: (...params: unknown[]) => {
+          inventoryReads += 1;
+          const rows = (statement.all as (...args: unknown[]) => unknown[])(...params);
+          // Wake it the instant the scan has finished reading.
+          realPrepare("UPDATE sessions SET last_active = ? WHERE id = 'sess-wakes'").run(new Date(now).toISOString());
+          return rows;
+        },
+      };
+    }) as typeof db.prepare;
+
+    const report = sweep();
+
+    expect(inventoryReads).toBe(1);
+    expect(report.actions).toEqual([
+      expect.objectContaining({
+        path: path.join(owned, 'worktrees', 'XZO-BACKEND', 'node_modules'),
+        status: 'applied',
+      }),
+    ]);
+    expect(repoDir).toContain('conversation-');
+  });
+
+  it('applies every candidate in a topic, not only the first', () => {
+    // Two candidates in one topic. Deleting the first bumps its parent's mtime
+    // and the cleanup claim bumps worktrees/ — any apply-time guard that read
+    // those would refuse everything after the first deletion, and the sweep
+    // would silently reclaim one tree per topic forever.
+    const { repoDir } = makeTopic('thread-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbc');
+    fs.mkdirSync(path.join(repoDir, '.turbo'), { recursive: true });
+    fs.writeFileSync(path.join(repoDir, '.turbo', 'run.log'), 'task cache');
+
+    const report = sweep();
+
+    expect(report.actions.map((action) => action.status)).toEqual(['applied', 'applied']);
+    expect(fs.existsSync(path.join(repoDir, 'node_modules'))).toBe(false);
+    expect(fs.existsSync(path.join(repoDir, '.turbo'))).toBe(false);
+    expect(fs.readFileSync(path.join(repoDir, 'src', 'app.ts'), 'utf8')).toBe('the actual work');
+  });
+
+  it('leaves a topic inside the idle window alone at the default 2-day clock', () => {
+    const { repoDir } = makeTopic('thread-11111111111111111111111111111111', { idleDays: 1 });
+
+    const report = sweep();
+
+    expect(report.policy.regenerableSweepMs).toBe(2 * DAY_MS);
+    expect(report.actions).toEqual([]);
+    expect(report.skipped.freshTopics).toBe(1);
+    expect(fs.existsSync(path.join(repoDir, 'node_modules'))).toBe(true);
   });
 });

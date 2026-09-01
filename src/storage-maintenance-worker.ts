@@ -14,7 +14,9 @@ import {
 } from './storage-manager.js';
 import { clearStorageCleanupClaims } from './storage-activity.js';
 
-type SerializableStorageOptions = Omit<StorageReportOptions, 'isContainerRunning'>;
+// Both omitted members are functions and cannot cross the worker boundary; the
+// worker thread supplies its own.
+type SerializableStorageOptions = Omit<StorageReportOptions, 'isContainerRunning' | 'runningContainerMounts'>;
 type StorageWorkerCommand = 'maintenance' | 'admission' | 'report';
 
 interface PendingRequest {
