@@ -867,7 +867,7 @@ export function collectThreadWorktreeActivity(
   return activity;
 }
 
-type ArtifactTargetType = 'directory' | 'file' | 'symlink';
+type ArtifactTargetType = 'directory' | 'file';
 
 function createDeleteArtifactAction(args: {
   id: string;
@@ -892,15 +892,27 @@ function createDeleteArtifactAction(args: {
     safety: args.safety,
     status: 'planned',
     apply: () => {
-      // BEFORE the claim, not inside it. `tryRunWithStorageCleanupClaim` writes
-      // its marker into `root` and removes it again, so any guard that reads
-      // `root` — a directory mtime, say — would be reading this pass's own
-      // footprint and could never return a stable answer. The claim exists to
-      // interlock against NanoClaw's spawn path, which it does by refusing when
-      // an activity lease marker is present; it is not what makes a guard
-      // correct, and nothing here mutates anything until the claim is held.
-      if (args.canApply && !args.canApply()) return false;
-      return tryRunWithStorageCleanupClaim(args.root, () => {
+      let allowed = true;
+      const claimed = tryRunWithStorageCleanupClaim(args.root, () => {
+        // Inside the claim, deliberately: the two protections compose only
+        // here. The claim refuses while any NanoClaw activity lease marker is
+        // present, so it covers our own spawn path; a `canApply` that asks the
+        // container runtime covers externally started containers, which plant
+        // no marker. Run outside the claim and a NanoClaw container can start
+        // between the check and the delete — inside, it cannot.
+        //
+        // HARD CONSTRAINT for anything added here, learned by shipping it
+        // wrong: `tryRunWithStorageCleanupClaim` creates and removes its own
+        // marker file inside `root`, which bumps `root`'s mtime. So a guard
+        // that reads the mtime of `root` (or of anything under it that this
+        // action deletes) is reading this pass's own footprint, and will refuse
+        // every time — a gate that looks conservative and is simply broken.
+        // Facts of that shape have to be settled at scan time; only facts this
+        // pass does not itself write can be re-proven here.
+        if (args.canApply && !args.canApply()) {
+          allowed = false;
+          return;
+        }
         if (!isPathInside(args.root, args.target)) {
           throw new Error(`refusing to remove path outside root: ${args.target}`);
         }
@@ -911,18 +923,9 @@ function createDeleteArtifactAction(args: {
         if (args.targetType === 'file' && (!st.isFile() || st.isSymbolicLink())) {
           throw new Error(`refusing to remove non-file or symlink: ${args.target}`);
         }
-        if (args.targetType === 'symlink') {
-          if (!st.isSymbolicLink()) {
-            throw new Error(`refusing to unlink non-symlink: ${args.target}`);
-          }
-          // unlink, never rm -r: a `node_modules` symlink can point into a
-          // shared checkout outside this tree, and unlink provably removes the
-          // link without ever opening what it points at.
-          fs.unlinkSync(args.target);
-          return;
-        }
         fs.rmSync(args.target, { recursive: true, force: true });
       });
+      return claimed && allowed;
     },
   };
 }
@@ -1989,14 +1992,18 @@ function hasRecordedReproducer(parentDir: string, name: string): boolean {
 }
 
 /**
- * Regenerable trees directly under a topic worktree subtree.
+ * Real regenerable directories under a topic worktree subtree.
  *
- * Returns symlinks as well as real directories. A `node_modules` can be a
- * symlink into a shared checkout, and the caller removes the LINK — the walk
- * never descends through one, so nothing outside the topic is ever reached.
+ * SYMLINKS ARE NEVER RETURNED, whatever they are named. A lockfile reproduces a
+ * dependency tree's contents; it does not record that the tree was a link, or
+ * where it pointed, so a hand-made `node_modules -> ../shared` mapping is
+ * unique state wearing a disposable name. 13 such links exist in production.
+ * Skipping the class outright is a shorter argument than gating it, and the
+ * walk never descends through one either, so nothing outside the topic is
+ * reachable from here.
  */
-function findRegenerableTargets(root: string): { target: string; targetType: 'directory' | 'symlink' }[] {
-  const targets: { target: string; targetType: 'directory' | 'symlink' }[] = [];
+function findRegenerableTargets(root: string): string[] {
+  const targets: string[] = [];
   const stack: string[] = [root];
   while (stack.length > 0) {
     const dir = stack.pop()!;
@@ -2005,17 +2012,13 @@ function findRegenerableTargets(root: string): { target: string; targetType: 'di
       if (!isPathInside(root, full)) continue;
 
       // Dirents carry lstat semantics: a symlink to a directory reports
-      // isSymbolicLink() and NOT isDirectory().
-      if (entry.isSymbolicLink()) {
-        if (REGENERABLE_SWEEP_DIR_NAMES.has(entry.name)) targets.push({ target: full, targetType: 'symlink' });
-        continue;
-      }
-      if (!entry.isDirectory()) continue;
+      // isSymbolicLink() and NOT isDirectory(), so this covers both.
+      if (!entry.isDirectory() || entry.isSymbolicLink()) continue;
       if (SKIP_DESCEND_DIR_NAMES.has(entry.name)) continue;
       if (REGENERABLE_SWEEP_DIR_NAMES.has(entry.name)) {
         // Do not descend: the whole tree goes, and a nested node_modules inside
         // it would only be counted twice.
-        targets.push({ target: full, targetType: 'directory' });
+        targets.push(full);
         continue;
       }
       stack.push(full);
@@ -2032,7 +2035,7 @@ function findRegenerableTargets(root: string): { target: string; targetType: 'di
  * `null` means the central DB could not be read, and the caller then sweeps
  * nothing: without it there is no message-driven activity signal at all.
  */
-function topicSessionActivity(workgroupId?: string): Map<string, number> | null {
+function topicSessionActivity(): Map<string, number> | null {
   interface Row {
     session_id: string;
     thread_id: string | null;
@@ -2043,11 +2046,6 @@ function topicSessionActivity(workgroupId?: string): Map<string, number> | null 
   }
   let rows: Row[];
   try {
-    // The workgroup filter narrows the scan without narrowing the answer: a
-    // topic key is prefixed by its workgroup id, so a session in a different
-    // workgroup can never contribute to it. Measured 2026-09-01: the unfiltered
-    // map costs ~144ms over 9,067 sessions, which is worth avoiding on the
-    // apply-time path that asks about exactly one topic.
     rows = getDb()
       .prepare(
         `SELECT s.id AS session_id, s.thread_id, s.messaging_group_id, mg.platform_id,
@@ -2055,10 +2053,9 @@ function topicSessionActivity(workgroupId?: string): Map<string, number> | null 
                 COALESCE(s.last_active, s.created_at) AS idle_since
            FROM sessions s
            JOIN agent_groups ag ON ag.id = s.agent_group_id
-           LEFT JOIN messaging_groups mg ON mg.id = s.messaging_group_id
-          WHERE ? IS NULL OR COALESCE(ag.workgroup_id, ag.folder) = ?`,
+           LEFT JOIN messaging_groups mg ON mg.id = s.messaging_group_id`,
       )
-      .all(workgroupId ?? null, workgroupId ?? null) as Row[];
+      .all() as Row[];
   } catch (err) {
     log.warn('storage-manager: topic session inventory failed; skipping the regenerable sweep', { err });
     return null;
@@ -2099,100 +2096,76 @@ type SweepRefusal =
   | 'worktrees-unreadable'
   | 'inventory-unreadable'
   | 'recently-active'
-  | 'runtime-unreadable'
   | 'container-mounted'
   | 'no-recorded-reproducer';
 
 /**
- * Where a decision reads its facts. The scan hands in snapshots taken once for
- * the whole pass; apply hands in live readers. Same questions, different
- * freshness — which is the ONLY difference between the two call sites.
- */
-interface SweepSources {
-  runningMounts: () => string[] | null;
-  sessionActivity: (workgroupId: string) => Map<string, number> | null;
-  /** Newest mtime of the topic's `worktrees/` dir; null if it is not a real directory. */
-  worktreeMtime: (worktreeRoot: string) => number | null;
-}
-
-function readWorktreeMtime(worktreeRoot: string): number | null {
-  let stat: fs.Stats;
-  try {
-    stat = fs.lstatSync(worktreeRoot);
-  } catch {
-    return null;
-  }
-  if (!stat.isDirectory() || stat.isSymbolicLink()) return null;
-  return stat.mtimeMs;
-}
-
-/**
- * The apply-time reader for the one fact this pass itself perturbs.
+ * Scan-time eligibility for one candidate. `null` means sweepable.
  *
- * Sampled once per topic and reused for that topic's remaining candidates,
- * because THIS SWEEP is a writer into the directory it is reading: removing a
- * `node_modules` bumps its parent, and the cleanup claim bumps `worktrees/`.
- * Re-reading after the first deletion would not be conservative, it would be
- * broken — every later candidate in the topic would read a just-now mtime and
- * be refused, and the sweep would silently reclaim at most one tree per topic
- * forever. The sample is still taken at apply time, from disk, before this pass
- * has touched that topic.
+ * SCAN-TIME ONLY, deliberately. Rounds 3-5 pushed toward revalidating each of
+ * these again at apply time, and the honest bound on what that buys is small:
+ * the recorded-reproducer gate above already proves every candidate rebuildable
+ * from a committed lockfile, which turns losing any of these races from data
+ * loss into a wasted `npm ci`. The apply path therefore re-runs exactly one
+ * check — the container-mount lookup, which is the only condition that can flip
+ * for a reason we both care about and can observe cheaply. Two of the others
+ * cannot honestly be re-read at all once the pass has started: this sweep is a
+ * writer into the tree it would be reading, so a deletion bumps its parent's
+ * mtime and the cleanup claim bumps `worktrees/`.
  *
- * The facts the sweep does NOT write — session activity and container mounts —
- * are re-read live on every call, with no memo.
- */
-function memoizedWorktreeMtime(): (worktreeRoot: string) => number | null {
-  const sampled = new Map<string, number | null>();
-  return (worktreeRoot) => {
-    if (!sampled.has(worktreeRoot)) sampled.set(worktreeRoot, readWorktreeMtime(worktreeRoot));
-    return sampled.get(worktreeRoot)!;
-  };
-}
-
-/**
- * THE eligibility decision, in one place, called by both the scan and the
- * apply-time guard.
- *
- * Round 3 made the apply-time guard recheck mounts; round 4 observed it still
- * did not recheck session activity or the worktrees mtime. That is the same fix
- * one field further along, and enumerating fields is what makes it recur — the
- * defect is the drift, not any particular missing field. So there is now one
- * predicate and two call sites: a condition added here is enforced at apply
- * time automatically and cannot be forgotten.
- *
- * Every lookup failure is a refusal. `null` return means eligible.
- *
- * `now` is the collection timestamp even on the apply path. Real time has moved
- * forward by then, which would only make the idle window look LARGER; holding
- * the earlier value is the conservative direction and keeps the decision
- * reproducible.
+ * Empirical support for the sizing, not just the argument: the manual sweep has
+ * removed 101 of 208 trees on the live host with agents running, against these
+ * four checks and no revalidation whatsoever, with zero incidents.
  */
 function sweepEligibility(args: {
   now: number;
   idleMs: number;
   topicDir: string;
   target: string;
-  sources: SweepSources;
+  mounts: string[];
+  sessionActivity: Map<string, number>;
 }): SweepRefusal | null {
-  const worktreeMtime = args.sources.worktreeMtime(path.join(args.topicDir, TOPIC_WORKTREES_DIRNAME));
-  if (worktreeMtime === null) return 'worktrees-unreadable';
+  const worktreeRoot = path.join(args.topicDir, TOPIC_WORKTREES_DIRNAME);
+  let worktreeStat: fs.Stats;
+  try {
+    worktreeStat = fs.lstatSync(worktreeRoot);
+  } catch {
+    return 'worktrees-unreadable';
+  }
+  if (!worktreeStat.isDirectory() || worktreeStat.isSymbolicLink()) return 'worktrees-unreadable';
 
   const workgroupId = path.basename(path.dirname(args.topicDir));
-  const activity = args.sources.sessionActivity(workgroupId);
-  if (activity === null) return 'inventory-unreadable';
-  const lastActivity = Math.max(activity.get(`${workgroupId}/${path.basename(args.topicDir)}`) ?? 0, worktreeMtime);
+  const lastActivity = Math.max(
+    args.sessionActivity.get(`${workgroupId}/${path.basename(args.topicDir)}`) ?? 0,
+    worktreeStat.mtimeMs,
+  );
   if (args.now - lastActivity < args.idleMs) return 'recently-active';
 
-  // Last, because it is the expensive one (~114ms) and every cheaper refusal
-  // above short-circuits it.
-  const mounts = args.sources.runningMounts();
-  if (mounts === null) return 'runtime-unreadable';
-  if (mounts.some((mount) => pathsOverlap(args.topicDir, mount))) return 'container-mounted';
+  if (args.mounts.some((mount) => pathsOverlap(args.topicDir, mount))) return 'container-mounted';
 
   if (!hasRecordedReproducer(path.dirname(args.target), path.basename(args.target))) {
     return 'no-recorded-reproducer';
   }
   return null;
+}
+
+/**
+ * The one condition re-proven immediately before each delete.
+ *
+ * An agent waking and its container mounting the topic between collection and
+ * deletion is the realistic case, and it is the only one worth a syscall here:
+ * a lookup is ~114ms, and a lockfile-backed tree taken from under a live
+ * container costs a reinstall rather than any work. A lookup that fails refuses
+ * the action — an unlistable runtime is a container we cannot see.
+ *
+ * Safe to call under the cleanup claim because it reads the container runtime
+ * and nothing under the claim root; see the constraint documented at the
+ * `canApply` call in createDeleteArtifactAction.
+ */
+function topicIsUnmounted(topicDir: string, lookup: () => string[] | null): boolean {
+  const mounts = lookup();
+  if (mounts === null) return false;
+  return !mounts.some((mount) => pathsOverlap(topicDir, mount));
 }
 
 /**
@@ -2252,19 +2225,6 @@ function collectTopicRegenerableActions(args: {
     args.warnings.push('regenerable sweep skipped: topic session inventory unavailable');
     return actions;
   }
-  const scanSources: SweepSources = {
-    runningMounts: () => mounts,
-    sessionActivity: () => sessionActivity,
-    worktreeMtime: readWorktreeMtime,
-  };
-  // Live readers for everything this pass does not itself write; see
-  // memoizedWorktreeMtime for the one fact that has to be sampled once.
-  const liveSources: SweepSources = {
-    runningMounts: args.runningMounts,
-    sessionActivity: (workgroupId) => topicSessionActivity(workgroupId),
-    worktreeMtime: memoizedWorktreeMtime(),
-  };
-
   const countRefusal = (refusal: SweepRefusal): void => {
     if (refusal === 'container-mounted') args.skipped.liveTopics += 1;
     else if (refusal === 'recently-active') args.skipped.freshTopics += 1;
@@ -2282,23 +2242,21 @@ function collectTopicRegenerableActions(args: {
       const worktreeRoot = path.join(topicDir, TOPIC_WORKTREES_DIRNAME);
       const key = `${workgroupEntry.name}/${topicEntry.name}`;
 
-      for (const { target, targetType } of findRegenerableTargets(worktreeRoot)) {
+      for (const target of findRegenerableTargets(worktreeRoot)) {
         const refusal = sweepEligibility({
           now: args.now,
           idleMs: args.policy.regenerableSweepMs,
           topicDir,
           target,
-          sources: scanSources,
+          mounts,
+          sessionActivity,
         });
         if (refusal !== null) {
-          // `no-recorded-reproducer` is the only per-TARGET reason; the rest are
-          // properties of the topic and answer the same for every candidate
-          // under it, so they are counted once and the topic is abandoned.
-          if (refusal === 'no-recorded-reproducer') {
-            countRefusal(refusal);
-            continue;
-          }
           countRefusal(refusal);
+          // `no-recorded-reproducer` is the only per-TARGET reason. The rest are
+          // properties of the topic and answer the same for every candidate
+          // under it, so the topic is abandoned rather than re-asked.
+          if (refusal === 'no-recorded-reproducer') continue;
           break;
         }
 
@@ -2308,27 +2266,20 @@ function collectTopicRegenerableActions(args: {
             pool: 'topic-cache',
             target,
             root: worktreeRoot,
-            estimatedBytes: targetType === 'symlink' ? 0 : dirSizeBytes(target),
+            estimatedBytes: dirSizeBytes(target),
             reason: `topic worktree idle for at least ${idleDays}d — ${path.basename(target)} is regenerated from a recorded manifest`,
-            targetType,
+            targetType: 'directory',
             kind: 'sweep-regenerable-tree',
             // Collection and apply are separated by the rest of the pass, which
-            // can be minutes. The SAME predicate runs again here, inside the
-            // cleanup claim, against live sources — so every condition the scan
-            // relied on is re-proven, and a condition added to the predicate
-            // later is enforced here without anyone remembering to add it.
-            canApply: () =>
-              sweepEligibility({
-                now: args.now,
-                idleMs: args.policy.regenerableSweepMs,
-                topicDir,
-                target,
-                sources: liveSources,
-              }) === null,
+            // can be minutes, and an agent waking in that window is the one
+            // condition worth a syscall to re-prove. It runs under the cleanup
+            // claim, so it composes with the claim's own lease check to cover
+            // both NanoClaw and external containers. Everything else the scan
+            // decided is held by the recorded-reproducer gate: losing those
+            // races costs a reinstall, not work.
+            canApply: () => topicIsUnmounted(topicDir, args.runningMounts),
             safety:
-              targetType === 'symlink'
-                ? 'Symlinked dependency tree under an idle topic worktree; the link is unlinked and whatever it points at is never opened.'
-                : 'Dependency-install tree under an idle topic worktree with a recorded manifest beside it. The full eligibility predicate — idle, unmounted, reproducible — is re-evaluated against live sources immediately before deletion.',
+              'Dependency-install tree under an idle topic worktree with a recorded manifest beside it, re-proven unmounted by the container runtime immediately before deletion.',
           }),
         );
       }

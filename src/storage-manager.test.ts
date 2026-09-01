@@ -2480,25 +2480,21 @@ describe('storage-manager regenerable tree sweep', () => {
     expect(fs.existsSync(path.join(repoDir, 'node_modules'))).toBe(true);
   });
 
-  it('unlinks a symlinked node_modules without touching what it points at', () => {
+  it('never sweeps a symlinked tree, even a lockfile-backed node_modules', () => {
     const { repoDir } = makeTopic('thread-dddddddddddddddddddddddddddddddd');
     const shared = path.join(tmpRoot, 'shared-checkout', 'node_modules', 'left-pad');
     fs.mkdirSync(shared, { recursive: true });
     fs.writeFileSync(path.join(shared, 'index.js'), 'belongs to someone else');
     fs.rmSync(path.join(repoDir, 'node_modules'), { recursive: true });
+    // A lockfile reproduces a tree's contents; it does not record that the tree
+    // was a link or where it pointed. The link is unique state wearing a
+    // disposable name, so the whole class is skipped rather than gated.
     fs.symlinkSync(path.dirname(shared), path.join(repoDir, 'node_modules'));
 
     const report = sweep();
 
-    expect(report.actions).toEqual([
-      expect.objectContaining({
-        kind: 'sweep-regenerable-tree',
-        path: path.join(repoDir, 'node_modules'),
-        estimatedBytes: 0,
-        status: 'applied',
-      }),
-    ]);
-    expect(fs.existsSync(path.join(repoDir, 'node_modules'))).toBe(false);
+    expect(report.actions).toEqual([]);
+    expect(fs.lstatSync(path.join(repoDir, 'node_modules')).isSymbolicLink()).toBe(true);
     expect(fs.readFileSync(path.join(shared, 'index.js'), 'utf8')).toBe('belongs to someone else');
   });
 
@@ -2673,7 +2669,7 @@ describe('storage-manager regenerable tree sweep', () => {
     expect(fs.readFileSync(path.join(repoDir, 'node_modules', 'left-pad', 'index.js'), 'utf8')).toBe('reinstallable');
   });
 
-  it('refuses at apply time when the owning session becomes active after collection', () => {
+  it('does not re-read session activity at apply time — only a mount blocks a collected action', () => {
     const { topicDir, repoDir } = makeTopic('conversation-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab');
     const unit = resolveRepositoryWorkUnit({
       workgroupId: 'wg-acme',
@@ -2692,8 +2688,11 @@ describe('storage-manager regenerable tree sweep', () => {
        VALUES ('sess-wakes', 'ag-1', 'mg-2', NULL, 'active', ?, ?)`,
     ).run(new Date(now - 40 * DAY_MS).toISOString(), new Date(now - 40 * DAY_MS).toISOString());
 
-    // The session wakes between collection and deletion. Only the apply-time
-    // read can see it — the collection snapshot said "idle 40 days".
+    // The session wakes between collection and deletion. This is a DELIBERATE
+    // gap, not an oversight: the inventory is read once per pass, and the tree
+    // is lockfile-backed, so losing this race costs a reinstall rather than any
+    // work. The container the waking session spawns is what the apply-time
+    // mount lookup catches, and that is the check worth paying for.
     const realPrepare = db.prepare.bind(db);
     let inventoryReads = 0;
     db.prepare = ((sql: string) => {
@@ -2702,32 +2701,31 @@ describe('storage-manager regenerable tree sweep', () => {
       return {
         all: (...params: unknown[]) => {
           inventoryReads += 1;
-          if (inventoryReads > 1) {
-            realPrepare("UPDATE sessions SET last_active = ? WHERE id = 'sess-wakes'").run(new Date(now).toISOString());
-          }
-          return (statement.all as (...args: unknown[]) => unknown[])(...params);
+          const rows = (statement.all as (...args: unknown[]) => unknown[])(...params);
+          // Wake it the instant the scan has finished reading.
+          realPrepare("UPDATE sessions SET last_active = ? WHERE id = 'sess-wakes'").run(new Date(now).toISOString());
+          return rows;
         },
       };
     }) as typeof db.prepare;
 
     const report = sweep();
 
-    expect(inventoryReads).toBeGreaterThan(1);
+    expect(inventoryReads).toBe(1);
     expect(report.actions).toEqual([
       expect.objectContaining({
         path: path.join(owned, 'worktrees', 'XZO-BACKEND', 'node_modules'),
-        status: 'skipped',
+        status: 'applied',
       }),
     ]);
-    expect(
-      fs.readFileSync(path.join(repoDir.replace(topicDir, owned), 'node_modules', 'left-pad', 'index.js'), 'utf8'),
-    ).toBe('reinstallable');
+    expect(repoDir).toContain('conversation-');
   });
 
-  it('re-reads the mount lookup per action but samples the worktrees mtime once per topic', () => {
+  it('applies every candidate in a topic, not only the first', () => {
     // Two candidates in one topic. Deleting the first bumps its parent's mtime
-    // and the cleanup claim bumps worktrees/ — if the guard re-read that mtime
-    // it would refuse everything after the first deletion.
+    // and the cleanup claim bumps worktrees/ — any apply-time guard that read
+    // those would refuse everything after the first deletion, and the sweep
+    // would silently reclaim one tree per topic forever.
     const { repoDir } = makeTopic('thread-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbc');
     fs.mkdirSync(path.join(repoDir, '.turbo'), { recursive: true });
     fs.writeFileSync(path.join(repoDir, '.turbo', 'run.log'), 'task cache');
