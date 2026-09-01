@@ -42,6 +42,7 @@ function report(usagePct: number): StorageReport {
       sessionReclaimPerTick: 50,
       sessionReclaimMaxMs: 120_000,
       sessionActiveCap: 0,
+      regenerableSweepMs: 172_800_000,
       rescueRetentionMs: 2_592_000_000,
       scanCadenceMs: 1,
       dockerPruneCadenceMs: 21_600_000,
@@ -86,6 +87,7 @@ function report(usagePct: number): StorageReport {
     pools: {
       'session-cache': { actions: 0, estimatedBytes: 0 },
       'thread-cache': { actions: 0, estimatedBytes: 0 },
+      'topic-cache': { actions: 0, estimatedBytes: 0 },
       docker: { actions: 0, estimatedBytes: 0 },
     },
     skipped: {
@@ -94,6 +96,8 @@ function report(usagePct: number): StorageReport {
       busySessions: 0,
       freshSessions: 0,
       freshThreads: 0,
+      liveTopics: 0,
+      freshTopics: 0,
       unreadableSessions: 0,
       noActivitySessions: 0,
       budgetDeferredSessions: 0,

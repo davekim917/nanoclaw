@@ -3,6 +3,7 @@
  *
  * Reclaims only regenerable storage:
  *   - package/build caches inside idle session and thread worktrees
+ *   - dependency/build trees inside idle topic worktrees (data/v2-topics)
  *   - per-session archive/central database projections rebuilt on container spawn
  *   - per-session Codex plugin caches rebuilt on container spawn
  *   - stopped containers carrying this NanoClaw install's ownership label
@@ -19,10 +20,12 @@ import path from 'path';
 import Database from 'better-sqlite3';
 
 import { CONTAINER_IMAGE, CONTAINER_IMAGE_BASE, CONTAINER_INSTALL_LABEL, DATA_DIR } from './config.js';
+import { runningContainerMounts as inspectRunningContainerMounts } from './container-mounts.js';
 import { CONTAINER_RUNTIME_BIN } from './container-runtime.js';
 import { getDb } from './db/connection.js';
 import { getAllContainerConfigs } from './db/container-configs.js';
 import { log } from './log.js';
+import { resolveRepositoryWorkUnit } from './repository-workspaces.js';
 import { tryRunWithStorageCleanupClaim } from './storage-activity.js';
 import {
   inboundDbPath,
@@ -95,6 +98,21 @@ const parsedIdleHours = Number(process.env.SESSION_ARTIFACT_IDLE_HOURS);
 export const SESSION_ARTIFACT_IDLE_MS =
   (Number.isFinite(parsedIdleHours) && parsedIdleHours > 0 ? parsedIdleHours : DEFAULT_IDLE_HOURS) * 60 * 60 * 1000;
 
+// Regenerable trees under an idle topic worktree are swept on a much shorter
+// clock than anything else here. Measured 2026-09-01: one sampled topic held
+// 1.5GB, 1.3GB of it node_modules, across ~547 topics — ~130GB of dependency
+// trees. npm is authoritative for the repos that dominate that (13 `npm ci`
+// invocations across their CI workflows), and npm has no content store and no
+// hardlinks, so every install is a full copy and nothing dedupes them.
+const DEFAULT_REGENERABLE_SWEEP_DAYS = 2;
+const TOPICS_DIRNAME = 'v2-topics';
+const TOPIC_WORKTREES_DIRNAME = 'worktrees';
+// Same names as the rescue-archive exclusion list, deliberately: a tree that is
+// safe to leave out of a rescue archive is by the same argument safe to delete
+// outright, because it holds no work — only what package.json/lockfiles
+// regenerate.
+const REGENERABLE_DIR_NAMES = new Set<string>(ARCHIVE_EXCLUDED_DIR_NAMES);
+
 const PRUNABLE_DIR_NAMES = new Set(['node_modules', '.pnpm-store', '.turbo', '.cache']);
 const SKIP_DESCEND_DIR_NAMES = new Set(['.git']);
 
@@ -103,12 +121,13 @@ let lastDockerPruneAttemptMs = 0;
 let lastEmergencyDockerAttemptMs = 0;
 
 export type StorageMode = 'dry-run' | 'apply';
-export type StoragePool = 'session-cache' | 'thread-cache' | 'docker';
+export type StoragePool = 'session-cache' | 'thread-cache' | 'topic-cache' | 'docker';
 export type StorageActionKind =
   | 'delete-cache-dir'
   | 'delete-derived-file'
   | 'archive-thread-worktree'
   | 'archive-session'
+  | 'sweep-regenerable-tree'
   | 'docker-prune-containers'
   | 'docker-prune-images'
   | 'docker-prune-builder-cache';
@@ -135,6 +154,13 @@ export interface StoragePolicy {
   rescueRetentionMs: number;
   /** Target ceiling on active sessions; 0 disables the count cap. */
   sessionActiveCap: number;
+  /**
+   * Idle threshold for sweeping regenerable dependency/build trees out of topic
+   * worktrees. Its own (short) clock: unlike a whole topic dir, these trees can
+   * never hold work, so they do not need the topic GC's git proofs, quarantine,
+   * or CAS machinery. 0 disables the sweep.
+   */
+  regenerableSweepMs: number;
   scanCadenceMs: number;
   dockerPruneCadenceMs: number;
   dockerBuildCacheUnusedFor: string;
@@ -311,6 +337,10 @@ export interface StorageReport {
     busySessions: number;
     freshSessions: number;
     freshThreads: number;
+    /** Topics skipped because a running container bind-mounts them. */
+    liveTopics: number;
+    /** Topics skipped because they are inside the regenerable sweep's idle window. */
+    freshTopics: number;
     unreadableSessions: number;
     noActivitySessions: number;
     /** Eligible sessions left for a later pass by the per-tick budget. */
@@ -326,6 +356,9 @@ export interface StorageReportOptions {
   isContainerRunning?: (sessionId: string) => boolean;
   sessionsRoot?: string;
   threadsRoot?: string;
+  topicsRoot?: string;
+  /** Injection seam for the real docker mount lookup the regenerable sweep gates on. */
+  runningContainerMounts?: () => string[] | null;
   includeDocker?: boolean;
   respectCadence?: boolean;
   force?: boolean;
@@ -375,6 +408,29 @@ function parseSessionKnob(name: string, fallback: number, min: number): number {
     return fallback;
   }
   return parsed;
+}
+
+let warnedBadRegenerableSweepDays = false;
+
+/**
+ * Idle days before regenerable trees are swept out of a topic worktree.
+ *
+ * UNSET (not in the environment at all) -> the deliberate default. Set to
+ * anything that is not a plain non-negative integer — "" included (negative,
+ * decimal, exponent notation, "abc", "NaN") -> DISABLED (0), not the default.
+ * A typo meant to turn this off must never silently turn it on, so this is
+ * fail-closed in the direction of doing nothing. Mirrors `topicIdleReclaimDays`
+ * in worktree-cleanup.ts, which guards the same tree on the same reasoning.
+ */
+function parseRegenerableSweepDays(): number {
+  const raw = process.env.NANOCLAW_REGENERABLE_SWEEP_DAYS;
+  if (raw === undefined) return DEFAULT_REGENERABLE_SWEEP_DAYS;
+  if (/^\d+$/.test(raw)) return Number(raw);
+  if (!warnedBadRegenerableSweepDays) {
+    warnedBadRegenerableSweepDays = true;
+    log.warn('storage-manager: invalid NANOCLAW_REGENERABLE_SWEEP_DAYS, disabling regenerable sweep', { value: raw });
+  }
+  return 0;
 }
 
 function parseNonNegativeNumber(value: string | undefined, fallback: number): number {
@@ -447,6 +503,7 @@ export function resolveStoragePolicy(overrides: Partial<StoragePolicy> = {}): St
     sessionReclaimPerTick,
     sessionReclaimMaxMs: sessionReclaimMaxSeconds * 1000,
     sessionActiveCap,
+    regenerableSweepMs: parseRegenerableSweepDays() * 24 * 60 * 60 * 1000,
     rescueRetentionMs: rescueRetentionDays * 24 * 60 * 60 * 1000,
     scanCadenceMs: scanHours * 60 * 60 * 1000,
     dockerPruneCadenceMs: dockerPruneHours * 60 * 60 * 1000,
@@ -773,23 +830,25 @@ export function collectThreadWorktreeActivity(
   return activity;
 }
 
-type ArtifactTargetType = 'directory' | 'file';
+type ArtifactTargetType = 'directory' | 'file' | 'symlink';
 
 function createDeleteArtifactAction(args: {
   id: string;
-  pool: 'session-cache' | 'thread-cache';
+  pool: 'session-cache' | 'thread-cache' | 'topic-cache';
   target: string;
   root: string;
   estimatedBytes: number;
   reason: string;
   targetType: ArtifactTargetType;
+  /** Overrides the kind derived from `targetType`. */
+  kind?: StorageActionKind;
   safety: string;
   canApply?: () => boolean;
 }): StorageAction {
   return {
     id: args.id,
     pool: args.pool,
-    kind: args.targetType === 'directory' ? 'delete-cache-dir' : 'delete-derived-file',
+    kind: args.kind ?? (args.targetType === 'directory' ? 'delete-cache-dir' : 'delete-derived-file'),
     path: args.target,
     estimatedBytes: args.estimatedBytes,
     reason: args.reason,
@@ -811,6 +870,16 @@ function createDeleteArtifactAction(args: {
         }
         if (args.targetType === 'file' && (!st.isFile() || st.isSymbolicLink())) {
           throw new Error(`refusing to remove non-file or symlink: ${args.target}`);
+        }
+        if (args.targetType === 'symlink') {
+          if (!st.isSymbolicLink()) {
+            throw new Error(`refusing to unlink non-symlink: ${args.target}`);
+          }
+          // unlink, never rm -r: a `node_modules` symlink can point into a
+          // shared checkout outside this tree, and unlink provably removes the
+          // link without ever opening what it points at.
+          fs.unlinkSync(args.target);
+          return;
         }
         fs.rmSync(args.target, { recursive: true, force: true });
       });
@@ -1840,6 +1909,210 @@ function collectThreadCacheActions(args: {
 }
 
 /**
+ * Regenerable trees directly under a topic worktree subtree.
+ *
+ * Returns symlinks as well as real directories. A `node_modules` can be a
+ * symlink into a shared checkout, and the caller removes the LINK — the walk
+ * never descends through one, so nothing outside the topic is ever reached.
+ */
+function findRegenerableTargets(root: string): { target: string; targetType: 'directory' | 'symlink' }[] {
+  const found: { target: string; targetType: 'directory' | 'symlink' }[] = [];
+  const stack: string[] = [root];
+  while (stack.length > 0) {
+    const dir = stack.pop()!;
+    for (const entry of safeReaddirDirents(dir)) {
+      const full = path.join(dir, entry.name);
+      if (!isPathInside(root, full)) continue;
+
+      // Dirents carry lstat semantics: a symlink to a directory reports
+      // isSymbolicLink() and NOT isDirectory().
+      if (entry.isSymbolicLink()) {
+        if (REGENERABLE_DIR_NAMES.has(entry.name)) found.push({ target: full, targetType: 'symlink' });
+        continue;
+      }
+      if (!entry.isDirectory()) continue;
+      if (SKIP_DESCEND_DIR_NAMES.has(entry.name)) continue;
+      if (REGENERABLE_DIR_NAMES.has(entry.name)) {
+        // Do not descend: the whole tree goes, and a nested node_modules inside
+        // it would only be counted twice.
+        found.push({ target: full, targetType: 'directory' });
+        continue;
+      }
+      stack.push(full);
+    }
+  }
+  return found;
+}
+
+/**
+ * Newest `sessions.last_active` per topic, keyed `<workgroup>/<kind>-<id>` —
+ * the last two path segments of a topic state dir, so the map is independent
+ * of which root the caller scans.
+ *
+ * `null` means the central DB could not be read, and the caller then sweeps
+ * nothing: without it there is no message-driven activity signal at all.
+ */
+function topicSessionActivity(): Map<string, number> | null {
+  interface Row {
+    session_id: string;
+    thread_id: string | null;
+    messaging_group_id: string | null;
+    platform_id: string | null;
+    workgroup_id: string;
+    idle_since: string | null;
+  }
+  let rows: Row[];
+  try {
+    rows = getDb()
+      .prepare(
+        `SELECT s.id AS session_id, s.thread_id, s.messaging_group_id, mg.platform_id,
+                COALESCE(ag.workgroup_id, ag.folder) AS workgroup_id,
+                COALESCE(s.last_active, s.created_at) AS idle_since
+           FROM sessions s
+           JOIN agent_groups ag ON ag.id = s.agent_group_id
+           LEFT JOIN messaging_groups mg ON mg.id = s.messaging_group_id`,
+      )
+      .all() as Row[];
+  } catch (err) {
+    log.warn('storage-manager: topic session inventory failed; skipping the regenerable sweep', { err });
+    return null;
+  }
+
+  const activity = new Map<string, number>();
+  for (const row of rows) {
+    let key: string;
+    try {
+      const unit = resolveRepositoryWorkUnit({
+        workgroupId: row.workgroup_id,
+        sessionId: row.session_id,
+        platformId: row.platform_id,
+        messagingGroupId: row.messaging_group_id,
+        threadId: row.thread_id,
+      });
+      key = `${unit.workgroupId}/${unit.kind}-${unit.id}`;
+    } catch {
+      // An unresolvable identity cannot be attributed to a topic dir. It is
+      // not evidence that any topic is idle, so it is simply dropped.
+      continue;
+    }
+    const ms = row.idle_since ? parseSqliteUtc(row.idle_since) : NaN;
+    if (!Number.isFinite(ms)) continue;
+    if (ms > (activity.get(key) ?? 0)) activity.set(key, ms);
+  }
+  return activity;
+}
+
+function pathsOverlap(a: string, b: string): boolean {
+  const left = path.resolve(a);
+  const right = path.resolve(b);
+  return isPathInside(left, right) || isPathInside(right, left);
+}
+
+/**
+ * Sweep regenerable dependency/build trees out of idle topic worktrees.
+ *
+ * A DIFFERENT SAFETY CLASS from the topic GC in worktree-cleanup.ts, which is
+ * why this is a separate pass on a separate clock. That GC removes whole topic
+ * dirs, which can hold uncommitted work, so it needs git proofs, quarantine and
+ * a 7-to-30-day horizon. These trees are 100% derived from package.json and
+ * lockfiles and never hold work, so the only real hazard is deleting one out
+ * from under a container that is using it — and the cost of being wrong is an
+ * `npm ci`, not lost work. Hence a 2-day default.
+ *
+ * IDLE SIGNAL — `max(sessions.last_active for the topic's participants,
+ * mtime of <topic>/worktrees)`. Deliberately NOT:
+ *   - the regenerable tree's own mtime. It moves on install, not on use, so a
+ *     tree installed in June and read every day since still dates to June. It
+ *     measures the last `npm ci`, not activity.
+ *   - the topic dir's own mtime. Any bulk metadata touch on the parent bumps
+ *     every topic at once (#203: 360 topic dirs sharing a 2-second window),
+ *     which here would make the whole fleet look fresh and silently disable
+ *     the sweep. `worktrees/` is the deeper real signal for the same reason
+ *     the topic GC reads it: it is the bind-mount source, and the
+ *     `.nanoclaw-storage-active` lease dirs are created and removed directly
+ *     under it on every container spawn.
+ * `last_active` covers the converse hole — turns that touch no file under
+ * `worktrees/` at all. The MAX is taken so that a fresh reading on ANY signal
+ * preserves the tree; every signal must be stale before anything is swept.
+ */
+function collectTopicRegenerableActions(args: {
+  now: number;
+  topicsRoot: string;
+  policy: StoragePolicy;
+  runningMounts: () => string[] | null;
+  skipped: StorageReport['skipped'];
+  warnings: string[];
+}): StorageAction[] {
+  const actions: StorageAction[] = [];
+  if (args.policy.regenerableSweepMs <= 0) return actions;
+  if (!fs.existsSync(args.topicsRoot)) return actions;
+
+  // Fail closed on both liveness inputs. A runtime we cannot list is a
+  // container we cannot see, and a central DB we cannot read leaves no
+  // activity signal worth acting on.
+  const mounts = args.runningMounts();
+  if (mounts === null) {
+    args.warnings.push('regenerable sweep skipped: container runtime mounts could not be listed');
+    return actions;
+  }
+  const sessionActivity = topicSessionActivity();
+  if (sessionActivity === null) {
+    args.warnings.push('regenerable sweep skipped: topic session inventory unavailable');
+    return actions;
+  }
+
+  const idleDays = Math.round(args.policy.regenerableSweepMs / 86400000);
+  for (const workgroupEntry of safeReaddirDirents(args.topicsRoot)) {
+    if (!workgroupEntry.isDirectory() || workgroupEntry.isSymbolicLink()) continue;
+    const workgroupDir = path.join(args.topicsRoot, workgroupEntry.name);
+    for (const topicEntry of safeReaddirDirents(workgroupDir)) {
+      if (!topicEntry.isDirectory() || topicEntry.isSymbolicLink()) continue;
+      const topicDir = path.join(workgroupDir, topicEntry.name);
+      const worktreeRoot = path.join(topicDir, TOPIC_WORKTREES_DIRNAME);
+      let worktreeStat: fs.Stats;
+      try {
+        worktreeStat = fs.lstatSync(worktreeRoot);
+      } catch {
+        continue;
+      }
+      if (!worktreeStat.isDirectory() || worktreeStat.isSymbolicLink()) continue;
+
+      if (mounts.some((mount) => pathsOverlap(topicDir, mount))) {
+        args.skipped.liveTopics += 1;
+        continue;
+      }
+
+      const key = `${workgroupEntry.name}/${topicEntry.name}`;
+      const lastActivity = Math.max(sessionActivity.get(key) ?? 0, worktreeStat.mtimeMs);
+      if (args.now - lastActivity < args.policy.regenerableSweepMs) {
+        args.skipped.freshTopics += 1;
+        continue;
+      }
+
+      for (const { target, targetType } of findRegenerableTargets(worktreeRoot)) {
+        actions.push(
+          createDeleteArtifactAction({
+            id: `topic-regenerable:${key}:${path.relative(worktreeRoot, target)}`,
+            pool: 'topic-cache',
+            target,
+            root: worktreeRoot,
+            estimatedBytes: targetType === 'symlink' ? 0 : dirSizeBytes(target),
+            reason: `topic worktree idle for at least ${idleDays}d — ${path.basename(target)} is regenerated from the lockfile`,
+            targetType,
+            kind: 'sweep-regenerable-tree',
+            safety:
+              targetType === 'symlink'
+                ? 'Symlinked dependency tree under an idle topic worktree; the link is unlinked and whatever it points at is never opened.'
+                : 'Regenerable dependency/build tree under an idle topic worktree, with no running container mounting the topic. Holds no work — it is reinstalled from package.json/lockfiles.',
+          }),
+        );
+      }
+    }
+  }
+  return actions;
+}
+
+/**
  * Age out rescue archives. Archive-then-reclaim wrote these from 2026-08-05
  * onward and nothing ever removed them, so the rescue dirs are a monotonically
  * growing copy of everything the reclaimer has ever taken. Only `.tar.zst`
@@ -2267,6 +2540,7 @@ function summarize(actions: StorageActionReport[]): StorageReport['pools'] {
   const pools: StorageReport['pools'] = {
     'session-cache': { actions: 0, estimatedBytes: 0 },
     'thread-cache': { actions: 0, estimatedBytes: 0 },
+    'topic-cache': { actions: 0, estimatedBytes: 0 },
     docker: { actions: 0, estimatedBytes: 0 },
   };
   for (const action of actions) {
@@ -2288,6 +2562,8 @@ function emptySkipped(): StorageReport['skipped'] {
     busySessions: 0,
     freshSessions: 0,
     freshThreads: 0,
+    liveTopics: 0,
+    freshTopics: 0,
     unreadableSessions: 0,
     noActivitySessions: 0,
     budgetDeferredSessions: 0,
@@ -2369,6 +2645,9 @@ function runStorageReportPass(options: StorageReportOptions, policy: StoragePoli
   const skipped = emptySkipped();
   const sessionsRoot = options.sessionsRoot ?? sessionsBaseDir();
   const threadsRoot = options.threadsRoot ?? threadsBaseDir();
+  // Same derivation as the rescue dirs below: DATA_DIR in production, and the
+  // test's own tree whenever sessionsRoot is redirected.
+  const topicsRoot = options.topicsRoot ?? path.join(path.dirname(sessionsRoot), TOPICS_DIRNAME);
   const isContainerRunning = options.isContainerRunning ?? (() => false);
   const includeDocker = options.includeDocker ?? true;
 
@@ -2431,6 +2710,14 @@ function runStorageReportPass(options: StorageReportOptions, policy: StoragePoli
       policy,
       activityByWorktreeDir: fs.existsSync(threadsRoot) ? collectThreadWorktreeActivity(isContainerRunning) : new Map(),
       skipped,
+    }),
+    ...collectTopicRegenerableActions({
+      now,
+      topicsRoot,
+      policy,
+      runningMounts: options.runningContainerMounts ?? inspectRunningContainerMounts,
+      skipped,
+      warnings,
     }),
     ...collectRescueRetentionActions({ now, dataRoot: path.dirname(sessionsRoot), policy }),
     ...dockerCollection.actions,

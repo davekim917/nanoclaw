@@ -41,9 +41,11 @@ import {
   pruneIdleSessionArtifacts,
   readReclaimJournal,
   type DockerImageInventory,
+  type StorageReport,
 } from './storage-manager.js';
 import { CONTAINER_IMAGE, CONTAINER_IMAGE_BASE, CONTAINER_INSTALL_LABEL } from './config.js';
 import { CONTAINER_RUNTIME_BIN } from './container-runtime.js';
+import { resolveRepositoryWorkUnit } from './repository-workspaces.js';
 import { log } from './log.js';
 
 // The rescue round-trip suite needs a REAL tar/zstd. `vi.mock('child_process')`
@@ -2342,5 +2344,204 @@ describe('storage-manager reclaim planning baseline', () => {
     // a session that had just been active.
     expect(report.actions.find((a) => a.kind === 'archive-session')?.status).toBe('skipped');
     expect(fs.existsSync(dir)).toBe(true);
+  });
+});
+
+describe('storage-manager regenerable tree sweep', () => {
+  const DAY_MS = 24 * 60 * 60 * 1000;
+  const now = Date.parse('2026-09-01T00:00:00.000Z');
+  let tmpRoot: string;
+  let dataRoot: string;
+  let topicsRoot: string;
+  let sessionsRoot: string;
+  const knob = 'NANOCLAW_REGENERABLE_SWEEP_DAYS';
+  let savedKnob: string | undefined;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    _resetStorageManagerThrottleForTesting();
+    savedKnob = process.env[knob];
+    delete process.env[knob];
+    tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'storage-sweep-'));
+    dataRoot = path.join(tmpRoot, 'data');
+    topicsRoot = path.join(dataRoot, 'v2-topics');
+    sessionsRoot = path.join(dataRoot, 'v2-sessions');
+    fs.mkdirSync(sessionsRoot, { recursive: true });
+    // The sweep needs the central inventory to resolve topic ownership; an
+    // unreadable one is a documented no-op, covered by its own test below.
+    const db = new Database(':memory:');
+    db.exec(`CREATE TABLE sessions (
+      id TEXT PRIMARY KEY, agent_group_id TEXT NOT NULL, messaging_group_id TEXT,
+      thread_id TEXT, status TEXT, last_active TEXT, created_at TEXT NOT NULL
+    )`);
+    db.exec('CREATE TABLE agent_groups (id TEXT PRIMARY KEY, folder TEXT, workgroup_id TEXT)');
+    db.exec('CREATE TABLE messaging_groups (id TEXT PRIMARY KEY, platform_id TEXT)');
+    centralDbMock.current = { db };
+    mockExecFileSync.mockImplementation((cmd: string) => {
+      if (cmd === 'df') {
+        return 'Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/sda1 1000 500 500 50% /\n';
+      }
+      throw new Error(`unexpected command ${cmd}`);
+    });
+  });
+
+  afterEach(() => {
+    closeCentralDb();
+    if (savedKnob === undefined) delete process.env[knob];
+    else process.env[knob] = savedKnob;
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  });
+
+  /** A topic worktree holding one checkout with a node_modules and real source. */
+  function makeTopic(name: string, options: { idleDays?: number } = {}): { topicDir: string; repoDir: string } {
+    const topicDir = path.join(topicsRoot, 'wg-acme', name);
+    const repoDir = path.join(topicDir, 'worktrees', 'XZO-BACKEND');
+    fs.mkdirSync(path.join(repoDir, 'node_modules', 'left-pad'), { recursive: true });
+    fs.writeFileSync(path.join(repoDir, 'node_modules', 'left-pad', 'index.js'), 'reinstallable');
+    fs.mkdirSync(path.join(repoDir, 'src'), { recursive: true });
+    fs.writeFileSync(path.join(repoDir, 'src', 'app.ts'), 'the actual work');
+    fs.writeFileSync(path.join(repoDir, 'package.json'), '{}');
+    const stamp = (now - (options.idleDays ?? 10) * DAY_MS) / 1000;
+    fs.utimesSync(path.join(topicDir, 'worktrees'), stamp, stamp);
+    return { topicDir, repoDir };
+  }
+
+  function sweep(options: { mounts?: string[] | null; mode?: 'dry-run' | 'apply' } = {}): StorageReport {
+    return getStorageReport({
+      mode: options.mode ?? 'apply',
+      now,
+      sessionsRoot,
+      threadsRoot: path.join(dataRoot, 'no-threads'),
+      topicsRoot,
+      runningContainerMounts: () => (options.mounts === undefined ? [] : options.mounts),
+      includeDocker: false,
+      policy: { filesystemPath: tmpRoot },
+    });
+  }
+
+  it('sweeps an idle topic worktree node_modules and leaves the checkout intact', () => {
+    const { repoDir } = makeTopic('thread-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa');
+
+    const report = sweep();
+
+    expect(report.actions).toEqual([
+      expect.objectContaining({
+        pool: 'topic-cache',
+        kind: 'sweep-regenerable-tree',
+        path: path.join(repoDir, 'node_modules'),
+        status: 'applied',
+      }),
+    ]);
+    expect(report.pools['topic-cache'].actions).toBe(1);
+    expect(fs.existsSync(path.join(repoDir, 'node_modules'))).toBe(false);
+    expect(fs.readFileSync(path.join(repoDir, 'src', 'app.ts'), 'utf8')).toBe('the actual work');
+    expect(fs.existsSync(path.join(repoDir, 'package.json'))).toBe(true);
+  });
+
+  it('skips a topic a running container bind-mounts', () => {
+    const { topicDir, repoDir } = makeTopic('thread-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb');
+
+    const report = sweep({ mounts: [path.join(topicDir, 'worktrees')] });
+
+    expect(report.actions).toEqual([]);
+    expect(report.skipped.liveTopics).toBe(1);
+    expect(fs.existsSync(path.join(repoDir, 'node_modules'))).toBe(true);
+  });
+
+  it('sweeps nothing at all when the container mount lookup fails', () => {
+    const { repoDir } = makeTopic('thread-cccccccccccccccccccccccccccccccc');
+
+    const report = sweep({ mounts: null });
+
+    expect(report.actions).toEqual([]);
+    expect(report.warnings).toContain('regenerable sweep skipped: container runtime mounts could not be listed');
+    expect(fs.existsSync(path.join(repoDir, 'node_modules'))).toBe(true);
+  });
+
+  it('unlinks a symlinked node_modules without touching what it points at', () => {
+    const { repoDir } = makeTopic('thread-dddddddddddddddddddddddddddddddd');
+    const shared = path.join(tmpRoot, 'shared-checkout', 'node_modules', 'left-pad');
+    fs.mkdirSync(shared, { recursive: true });
+    fs.writeFileSync(path.join(shared, 'index.js'), 'belongs to someone else');
+    fs.rmSync(path.join(repoDir, 'node_modules'), { recursive: true });
+    fs.symlinkSync(path.dirname(shared), path.join(repoDir, 'node_modules'));
+
+    const report = sweep();
+
+    expect(report.actions).toEqual([
+      expect.objectContaining({
+        kind: 'sweep-regenerable-tree',
+        path: path.join(repoDir, 'node_modules'),
+        estimatedBytes: 0,
+        status: 'applied',
+      }),
+    ]);
+    expect(fs.existsSync(path.join(repoDir, 'node_modules'))).toBe(false);
+    expect(fs.readFileSync(path.join(shared, 'index.js'), 'utf8')).toBe('belongs to someone else');
+  });
+
+  it('preserves a topic whose owning session is still recently active', () => {
+    const { topicDir } = makeTopic('conversation-eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee');
+    const unit = resolveRepositoryWorkUnit({
+      workgroupId: 'wg-acme',
+      sessionId: 'sess-live',
+      platformId: 'slack:C1',
+      messagingGroupId: 'mg-1',
+      threadId: null,
+    });
+    // The dir name must be the work unit's own, or no activity row can be
+    // attributed to it.
+    const owned = path.join(topicsRoot, 'wg-acme', `${unit.kind}-${unit.id}`);
+    fs.renameSync(topicDir, owned);
+    const db = centralDbMock.current!.db;
+    db.prepare('INSERT INTO agent_groups VALUES (?, ?, ?)').run('ag-1', 'acme', 'wg-acme');
+    db.prepare('INSERT INTO messaging_groups VALUES (?, ?)').run('mg-1', 'slack:C1');
+    db.prepare(
+      `INSERT INTO sessions (id, agent_group_id, messaging_group_id, thread_id, status, last_active, created_at)
+       VALUES ('sess-live', 'ag-1', 'mg-1', NULL, 'active', ?, ?)`,
+    ).run(new Date(now - 60 * 60 * 1000).toISOString(), new Date(now - 40 * DAY_MS).toISOString());
+
+    const report = sweep();
+
+    expect(report.actions).toEqual([]);
+    expect(report.skipped.freshTopics).toBe(1);
+    expect(fs.existsSync(path.join(owned, 'worktrees', 'XZO-BACKEND', 'node_modules'))).toBe(true);
+  });
+
+  it('disables the sweep when the knob is 0', () => {
+    const { repoDir } = makeTopic('thread-ffffffffffffffffffffffffffffffff');
+    process.env[knob] = '0';
+
+    const report = sweep();
+
+    expect(report.policy.regenerableSweepMs).toBe(0);
+    expect(report.actions).toEqual([]);
+    expect(fs.existsSync(path.join(repoDir, 'node_modules'))).toBe(true);
+  });
+
+  it('disables the sweep on an invalid knob value rather than falling back to the default', () => {
+    const { repoDir } = makeTopic('thread-99999999999999999999999999999999');
+    process.env[knob] = '2.5';
+
+    const report = sweep();
+
+    expect(report.policy.regenerableSweepMs).toBe(0);
+    expect(report.actions).toEqual([]);
+    expect(fs.existsSync(path.join(repoDir, 'node_modules'))).toBe(true);
+    expect(log.warn).toHaveBeenCalledWith(
+      'storage-manager: invalid NANOCLAW_REGENERABLE_SWEEP_DAYS, disabling regenerable sweep',
+      { value: '2.5' },
+    );
+  });
+
+  it('leaves a topic inside the idle window alone at the default 2-day clock', () => {
+    const { repoDir } = makeTopic('thread-11111111111111111111111111111111', { idleDays: 1 });
+
+    const report = sweep();
+
+    expect(report.policy.regenerableSweepMs).toBe(2 * DAY_MS);
+    expect(report.actions).toEqual([]);
+    expect(report.skipped.freshTopics).toBe(1);
+    expect(fs.existsSync(path.join(repoDir, 'node_modules'))).toBe(true);
   });
 });

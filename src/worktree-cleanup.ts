@@ -14,8 +14,8 @@ import fs from 'fs';
 import path from 'path';
 
 import { DATA_DIR, GROUPS_DIR } from './config.js';
+import { runningContainerMounts } from './container-mounts.js';
 import { isContainerRunning, isContainerSpawning } from './container-runner.js';
-import { CONTAINER_RUNTIME_BIN } from './container-runtime.js';
 import { getDb } from './db/connection.js';
 import { getContainerState, getProcessingClaims } from './db/session-db.js';
 import { log } from './log.js';
@@ -936,40 +936,6 @@ function collectClones(
  *  blocked by the deployed destructive guard and is never used here. */
 function trashPath(target: string): void {
   execFileSync(TRASH_BIN, [target], { stdio: 'pipe', timeout: 120_000 });
-}
-
-/**
- * Every host path bind-mounted into a currently running container.
- *
- * `isContainerRunning` reads this process's own bookkeeping, which is empty in
- * any out-of-process caller and says nothing about a container started by
- * someone else. Before removing anything, apply mode asks the runtime directly.
- * `null` means the runtime could not be listed, and a container we cannot see
- * is a container we must assume owns the path.
- */
-function runningContainerMounts(): string[] | null {
-  try {
-    const ids = execFileSync(CONTAINER_RUNTIME_BIN, ['ps', '-q'], {
-      encoding: 'utf8',
-      stdio: ['ignore', 'pipe', 'pipe'],
-      timeout: 30_000,
-    })
-      .split('\n')
-      .map((line) => line.trim())
-      .filter(Boolean);
-    if (ids.length === 0) return [];
-    const inspected = execFileSync(
-      CONTAINER_RUNTIME_BIN,
-      ['inspect', '--format', '{{range .Mounts}}{{.Source}}\n{{end}}', ...ids],
-      { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 60_000 },
-    );
-    return inspected
-      .split('\n')
-      .map((line) => line.trim())
-      .filter(Boolean);
-  } catch {
-    return null;
-  }
 }
 
 /**

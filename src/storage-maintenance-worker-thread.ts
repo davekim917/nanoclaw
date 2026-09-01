@@ -12,7 +12,9 @@ interface StorageWorkerData {
   dbPath: string;
 }
 
-type SerializableStorageOptions = Omit<StorageReportOptions, 'isContainerRunning'>;
+// Both omitted members are functions: they cannot survive the structured clone
+// into the worker, and both are supplied on this side instead.
+type SerializableStorageOptions = Omit<StorageReportOptions, 'isContainerRunning' | 'runningContainerMounts'>;
 
 type StorageWorkerRequest =
   | {
