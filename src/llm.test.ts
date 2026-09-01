@@ -10,12 +10,18 @@ vi.mock('./env.js', () => ({
   readEnvFileMatching: vi.fn(() => ({})),
 }));
 
+import { log } from './log.js';
 import {
   callHaiku,
+  callWithCredentialRotation,
   CallHaikuHttpError,
   AllCredentialSlotsParkedError,
+  CredentialRotationGateTimeoutError,
   __resetCallHaikuSlotCacheForTest,
   __resetCredentialParkingForTest,
+  __resetCredentialRotationGateForTest,
+  __setCredentialRotationGateMinIntervalForTest,
+  __getParkedUntilMsForTest,
 } from './llm.js';
 
 function jsonResponse(body: unknown, init: { status?: number; headers?: Record<string, string> } = {}): Response {
@@ -55,6 +61,14 @@ describe('callHaiku', () => {
     vi.useFakeTimers();
     __resetCallHaikuSlotCacheForTest();
     __resetCredentialParkingForTest();
+    __resetCredentialRotationGateForTest();
+    // Existing tests below assert call counts/ordering with NO fake-timer
+    // advance between multiple calls in the same test — they predate the
+    // gate's real 1s minimum spacing (see the dedicated "credential rotation
+    // gate" describe block, which restores the real interval). Disabling
+    // spacing here keeps every test that doesn't care about gate timing from
+    // having to advance fake timers just to let a second call through.
+    __setCredentialRotationGateMinIntervalForTest(0);
   });
 
   afterEach(() => {
@@ -62,6 +76,7 @@ describe('callHaiku', () => {
     vi.unstubAllGlobals();
     __resetCallHaikuSlotCacheForTest();
     __resetCredentialParkingForTest();
+    __resetCredentialRotationGateForTest();
     if (originalApiKey === undefined) delete process.env.ANTHROPIC_API_KEY;
     else process.env.ANTHROPIC_API_KEY = originalApiKey;
     if (originalOauthPrimary === undefined) delete process.env.CLAUDE_CODE_OAUTH_TOKEN;
@@ -281,6 +296,141 @@ describe('callHaiku', () => {
       // known-parked, so it fails fast instead of sleeping or re-trying a
       // credential that just told us it's dead for the next hour.
       expect(fetchMock).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('credential rotation gate (process-wide serialization — fixes the burst-parking loop)', () => {
+    // These tests exercise the gate directly via callWithCredentialRotation
+    // rather than through callHaiku/fetch, to isolate gate mechanics
+    // (queueing, spacing, timeout, park-clearing) from HTTP-mocking noise.
+    // The outer beforeEach leaves ANTHROPIC_API_KEY set (single
+    // api-key:primary slot) and disables gate spacing
+    // (__setCredentialRotationGateMinIntervalForTest(0)); restore the REAL
+    // interval here so these tests can prove real spacing behavior against
+    // fake timers.
+    beforeEach(() => {
+      __setCredentialRotationGateMinIntervalForTest(1000);
+    });
+
+    function call<T>(attempt: () => Promise<T>) {
+      return callWithCredentialRotation({
+        attempt,
+        logLabel: 'test-gate',
+        noCredentialsMessage: 'no credentials configured',
+      });
+    }
+
+    it('serializes concurrent calls and spaces them by the minimum interval — never more than one in flight', async () => {
+      let active = 0;
+      let peakActive = 0;
+      const startTimes: number[] = [];
+
+      async function attempt(n: number): Promise<number> {
+        active++;
+        peakActive = Math.max(peakActive, active);
+        startTimes.push(Date.now());
+        await Promise.resolve();
+        active--;
+        return n;
+      }
+
+      const p1 = call(() => attempt(1));
+      const p2 = call(() => attempt(2));
+      const p3 = call(() => attempt(3));
+
+      await vi.advanceTimersByTimeAsync(3000);
+
+      const results = await Promise.all([p1, p2, p3]);
+      expect(results.map((r) => r.value)).toEqual([1, 2, 3]);
+      expect(peakActive).toBe(1); // at most one in-flight request at a time
+      expect(startTimes[1]! - startTimes[0]!).toBeGreaterThanOrEqual(1000);
+      expect(startTimes[2]! - startTimes[1]!).toBeGreaterThanOrEqual(1000);
+    });
+
+    it('a throwing call releases the gate so the next queued call still proceeds (no deadlock)', async () => {
+      const boom = Object.assign(new Error('boom'), { status: 400 }); // fatal — classify() rejects immediately
+      const attempt1 = vi.fn(async () => {
+        throw boom;
+      });
+      const attempt2 = vi.fn(async () => 'ok');
+
+      const p1 = call(attempt1);
+      p1.catch(() => {});
+      const p2 = call(attempt2);
+
+      await expect(p1).rejects.toBe(boom);
+      await vi.advanceTimersByTimeAsync(1500);
+      const result2 = await p2;
+
+      expect(result2.value).toBe('ok');
+      expect(attempt2).toHaveBeenCalledTimes(1);
+    });
+
+    it('fails fast with CredentialRotationGateTimeoutError when queued past the max wait, without deadlocking the queue for later callers', async () => {
+      // A holder that never resolves on its own — released manually once
+      // we've confirmed the queued-too-long caller gave up.
+      let releaseHolder!: () => void;
+      const holderGate = new Promise<void>((resolve) => {
+        releaseHolder = resolve;
+      });
+      const holder = call(async () => {
+        await holderGate;
+        return 'holder done';
+      });
+
+      const queuedTooLong = call(async () => 'should never run');
+      queuedTooLong.catch(() => {});
+
+      // Push past the 30s max-wait cap while the holder is still running —
+      // queuedTooLong must give up rather than wait indefinitely for a
+      // predecessor that's still in flight.
+      await vi.advanceTimersByTimeAsync(31_000);
+      await expect(queuedTooLong).rejects.toBeInstanceOf(CredentialRotationGateTimeoutError);
+
+      // Let the true holder finish and unwind the chain.
+      releaseHolder();
+      await vi.advanceTimersByTimeAsync(100);
+      expect((await holder).value).toBe('holder done');
+
+      // A FRESH call issued now (well after the timeout episode) must not be
+      // stuck behind a corrupted queue — proving the timed-out caller's
+      // bail-out didn't leave the mutex permanently held.
+      const afterThat = call(async () => 'after');
+      await vi.advanceTimersByTimeAsync(1500);
+      expect((await afterThat).value).toBe('after');
+    });
+
+    it('caps a park at the 15-minute ceiling even when retry-after claims hours', async () => {
+      const startMs = Date.now();
+      const err = Object.assign(new Error('rate limited'), { status: 429, retryAfterMs: 41 * 3600_000 }); // 41h, live-observed shape
+      const promise = call(async () => {
+        throw err;
+      });
+
+      await expect(promise).rejects.toBe(err);
+
+      const untilMs = __getParkedUntilMsForTest('api-key:primary');
+      expect(untilMs).toBeDefined();
+      expect(untilMs! - startMs).toBe(15 * 60_000); // capped, not the claimed 41 hours
+    });
+
+    it('clears a slot park and logs recovery once a call through it succeeds again', async () => {
+      const infoSpy = vi.spyOn(log, 'info');
+      const err = Object.assign(new Error('rate limited'), { status: 429, retryAfterMs: 90_000 }); // parks ~90s, under the 15-min ceiling
+      const failingAttempt = vi.fn(async () => {
+        throw err;
+      });
+
+      await expect(call(failingAttempt)).rejects.toBe(err);
+      expect(__getParkedUntilMsForTest('api-key:primary')).toBeDefined();
+
+      await vi.advanceTimersByTimeAsync(91_000); // past the park window
+      const succeedingAttempt = vi.fn(async () => 'back online');
+      const result = await call(succeedingAttempt);
+
+      expect(result.value).toBe('back online');
+      expect(__getParkedUntilMsForTest('api-key:primary')).toBeUndefined();
+      expect(infoSpy.mock.calls.some(([msg]) => String(msg).includes('recovered'))).toBe(true);
     });
   });
 });

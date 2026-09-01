@@ -165,13 +165,13 @@ describe('retryPendingThreadTitles — host-sweep retry step', () => {
     expect(callHaiku).not.toHaveBeenCalled();
   });
 
-  it('caps at 3 retries per call even with more eligible rows', async () => {
+  it('caps at 1 retry per call even with more eligible rows (dropped from 3 — see src/topic-title.ts RETRY_BATCH_CAP)', async () => {
     for (let i = 1; i <= 5; i++) {
       insertThreadTitleClaim(`discord:g:c:${i}`, 'discord', `opener ${i}`, NOW);
       recordThreadTitleAttemptFailure(`discord:g:c:${i}`);
     }
 
     const result = await retryPendingThreadTitles(NOW);
-    expect(result.attempted).toBe(3);
+    expect(result.attempted).toBe(1);
   });
 });

@@ -678,6 +678,20 @@ const CREDENTIAL_PARK_THRESHOLD_MS = 60_000;
  */
 const parkedSlotUntilMs = new Map<ClaudeCredentialSlot, number>();
 
+/**
+ * A park never lasts longer than this, even when `retry-after` claims hours
+ * (observed: `retry-after=149184` — 41 hours). Before the global request
+ * gate (see {@link withCredentialRotationGate}) existed, a short park was
+ * "safe" because every caller hammered every slot on every call anyway; now
+ * that the gate serializes and spaces every request, re-probing a genuinely
+ * dead slot once every 15 minutes costs nothing, and capping the park keeps
+ * a SHORT-WINDOW rate limit (a few hundred seconds, misclassified as "hours
+ * dead" only because the account also happened to return a long
+ * `retry-after`) from blackholing an otherwise-healthy credential for the
+ * rest of the day.
+ */
+const CREDENTIAL_PARK_CEILING_MS = 15 * 60_000;
+
 /** True while `slot` is parked (skip it entirely) as of `nowMs`. Lazily expires the entry once its window has passed. */
 function isSlotParked(slot: ClaudeCredentialSlot, nowMs: number): boolean {
   const until = parkedSlotUntilMs.get(slot);
@@ -689,11 +703,19 @@ function isSlotParked(slot: ClaudeCredentialSlot, nowMs: number): boolean {
   return true;
 }
 
-/** Park `slot` until `nowMs + retryAfterMs`, logging once for this occurrence (slot name only — never a token value). */
+/**
+ * Park `slot` until `nowMs + min(retryAfterMs, CREDENTIAL_PARK_CEILING_MS)`,
+ * logging once for this occurrence (slot name only — never a token value).
+ */
 function parkSlot(slot: ClaudeCredentialSlot, retryAfterMs: number, nowMs: number, logLabel: string): void {
-  const untilMs = nowMs + retryAfterMs;
+  const untilMs = nowMs + Math.min(retryAfterMs, CREDENTIAL_PARK_CEILING_MS);
   parkedSlotUntilMs.set(slot, untilMs);
   log.warn(`${logLabel}: parking exhausted credential slot`, { slot, untilIso: new Date(untilMs).toISOString() });
+}
+
+/** Test hook — reads a slot's current park-until timestamp (epoch ms), or undefined if it isn't currently parked. */
+export function __getParkedUntilMsForTest(slot: ClaudeCredentialSlot): number | undefined {
+  return parkedSlotUntilMs.get(slot);
 }
 
 /** Test hook — clears parked-slot state so tests start with every slot eligible. */
@@ -805,6 +827,138 @@ export class AllCredentialSlotsParkedError extends Error {
 }
 
 /**
+ * Minimum spacing enforced between the START of consecutive
+ * {@link callWithCredentialRotation} calls — see
+ * {@link withCredentialRotationGate}. Named/tunable rather than inlined
+ * since it is a process-wide cadence limit, not a per-caller setting.
+ */
+const CREDENTIAL_ROTATION_GATE_MIN_INTERVAL_MS = 1000;
+
+/**
+ * A call queued behind {@link withCredentialRotationGate} for longer than
+ * this fails fast instead of piling up indefinitely — background callers
+ * (`callHaiku`, `session-title-sweep.ts`) simply retry on the next 60s
+ * host-sweep tick, so there is no reason to let a caller sit in this queue
+ * for tens of seconds.
+ */
+const CREDENTIAL_ROTATION_GATE_MAX_WAIT_MS = 30_000;
+
+/**
+ * Test-only override for {@link CREDENTIAL_ROTATION_GATE_MIN_INTERVAL_MS}.
+ * Real spacing is 1s of wall-clock time; most tests don't care about gate
+ * timing at all and would otherwise need to advance fake timers between
+ * every single call. `null` means "use the real constant".
+ */
+let _gateMinIntervalMsOverride: number | null = null;
+
+/** Test hook — override the gate's minimum inter-request spacing (or pass `null` to restore the real constant). */
+export function __setCredentialRotationGateMinIntervalForTest(ms: number | null): void {
+  _gateMinIntervalMsOverride = ms;
+}
+
+function gateMinIntervalMs(): number {
+  return _gateMinIntervalMsOverride ?? CREDENTIAL_ROTATION_GATE_MIN_INTERVAL_MS;
+}
+
+/** Thrown when a call sat in {@link withCredentialRotationGate}'s queue longer than {@link CREDENTIAL_ROTATION_GATE_MAX_WAIT_MS} without getting its turn. */
+export class CredentialRotationGateTimeoutError extends Error {
+  constructor(waitedMs: number) {
+    super(
+      `callWithCredentialRotation: queued ${waitedMs}ms without a turn (cap ${CREDENTIAL_ROTATION_GATE_MAX_WAIT_MS}ms) — too many concurrent host utility LLM calls`,
+    );
+    this.name = 'CredentialRotationGateTimeoutError';
+  }
+}
+
+/**
+ * Process-wide serialization for every {@link callWithCredentialRotation}
+ * call. This is what actually fixes the burst-parking loop: on every 60s
+ * host-sweep tick, `session-title-sweep` (up to CONCURRENCY_CAP concurrent),
+ * `retryPendingThreadTitles`, and any live `maybeRenameNewThread` used to
+ * all fire AT ONCE, each independently rotating across credential slots —
+ * enough short-window request volume to trip per-account rate limits on
+ * slots that were otherwise perfectly healthy, which then got parked for
+ * hours. These are cheap background calls with no latency requirement, so
+ * nothing is lost serializing them: at most one in-flight `fn` at a time,
+ * spaced at least {@link CREDENTIAL_ROTATION_GATE_MIN_INTERVAL_MS} apart
+ * (measured from the START of the previous `fn`).
+ *
+ * Implemented as a promise-chain mutex (`gateTail`): each call links a new
+ * "release" promise onto the tail and waits for the PREVIOUS one before
+ * proceeding. A call that has waited past
+ * {@link CREDENTIAL_ROTATION_GATE_MAX_WAIT_MS} rejects immediately with
+ * {@link CredentialRotationGateTimeoutError} instead of running `fn` at
+ * all — but it must still hand off the baton at the RIGHT time (once its
+ * true predecessor actually finishes), never early, or a later caller could
+ * start running while an earlier one is still in flight. `fn` itself is
+ * released in `finally` so a throwing call can never deadlock callers
+ * queued behind it.
+ */
+let gateTail: Promise<void> = Promise.resolve();
+let gateLastStartMs = 0;
+
+/** Test hook — resets gate queue/spacing state (and the interval override) between tests. */
+export function __resetCredentialRotationGateForTest(): void {
+  gateTail = Promise.resolve();
+  gateLastStartMs = 0;
+  _gateMinIntervalMsOverride = null;
+}
+
+/** Resolves 'ok' once `promise` settles, or 'timeout' after `ms` — whichever comes first. Always clears its timer so the loser never fires or leaks. */
+async function raceTimeout(promise: Promise<unknown>, ms: number): Promise<'ok' | 'timeout'> {
+  if (ms <= 0) return 'timeout';
+  let timer: ReturnType<typeof setTimeout>;
+  const timeout = new Promise<'timeout'>((resolve) => {
+    timer = setTimeout(() => resolve('timeout'), ms);
+  });
+  try {
+    return await Promise.race([promise.then((): 'ok' => 'ok'), timeout]);
+  } finally {
+    clearTimeout(timer!);
+  }
+}
+
+async function withCredentialRotationGate<T>(fn: () => Promise<T>): Promise<T> {
+  const enqueuedAtMs = Date.now();
+  const previousTail = gateTail;
+  let releaseMine: () => void = () => {};
+  const minePromise = new Promise<void>((resolve) => {
+    releaseMine = resolve;
+  });
+  gateTail = minePromise;
+
+  const remainingMs = CREDENTIAL_ROTATION_GATE_MAX_WAIT_MS - (Date.now() - enqueuedAtMs);
+  const outcome = await raceTimeout(previousTail, remainingMs);
+  if (outcome === 'timeout') {
+    // Give up from THIS caller's point of view, but only pass the baton once
+    // the true predecessor actually finishes — never early, or the caller
+    // behind us could start while the real predecessor is still running.
+    void previousTail.then(releaseMine, releaseMine);
+    throw new CredentialRotationGateTimeoutError(Date.now() - enqueuedAtMs);
+  }
+
+  // It's genuinely our turn. Enforce minimum spacing since the last request
+  // started, bounded by whatever's left of the queue-wait budget.
+  const sinceLastStartMs = Date.now() - gateLastStartMs;
+  const spacingWaitMs = Math.max(0, gateMinIntervalMs() - sinceLastStartMs);
+  if (spacingWaitMs > 0) {
+    const spacingBudgetMs = CREDENTIAL_ROTATION_GATE_MAX_WAIT_MS - (Date.now() - enqueuedAtMs);
+    if (spacingWaitMs > spacingBudgetMs) {
+      releaseMine();
+      throw new CredentialRotationGateTimeoutError(Date.now() - enqueuedAtMs);
+    }
+    await sleep(spacingWaitMs);
+  }
+
+  gateLastStartMs = Date.now();
+  try {
+    return await fn();
+  } finally {
+    releaseMine();
+  }
+}
+
+/**
  * Run `attempt` against every configured Anthropic credential slot
  * (`CLAUDE_CODE_OAUTH_TOKEN[_2..4]` / `ANTHROPIC_API_KEY`, resolved via the
  * same {@link structuredCredentials} the structured Claude path uses) rather
@@ -817,16 +971,21 @@ export class AllCredentialSlotsParkedError extends Error {
  * copy of this loop is exactly what let slot 1's exhausted quota wedge one
  * caller forever while another had already rotated past it.
  *
+ * Every call is additionally serialized process-wide by
+ * {@link withCredentialRotationGate} — see its doc comment for why.
+ *
  * `attempt` performs ONE request against a single resolved credential and
  * should reject on failure. A failure with a `retry-after` longer than
  * {@link CREDENTIAL_PARK_THRESHOLD_MS} means the CREDENTIAL is the problem
  * (observed: `retry-after=149184` — 41 hours) rather than a momentary busy
- * backend — that slot is parked (see {@link parkSlot}) and skipped for the
- * rest of this call AND every subsequent call until its window lapses;
- * without this a caller would retry an hours-dead slot on every single
- * invocation forever. If parking empties the available list before any
- * attempt is made, this throws {@link AllCredentialSlotsParkedError}
- * immediately — no sleep.
+ * backend — that slot is parked (see {@link parkSlot}, capped at
+ * {@link CREDENTIAL_PARK_CEILING_MS}) and skipped for the rest of this call
+ * AND every subsequent call until its window lapses; without this a caller
+ * would retry an hours-dead slot on every single invocation forever. If
+ * parking empties the available list before any attempt is made, this
+ * throws {@link AllCredentialSlotsParkedError} immediately — no sleep. A
+ * slot that succeeds after having been parked has its park cleared (and
+ * logged) immediately — see the success branch below.
  *
  * Otherwise, failures are classified by `classify` (default
  * {@link classifyCredentialFailure}) into two classes with opposite cures:
@@ -856,6 +1015,17 @@ export async function callWithCredentialRotation<T>(options: {
   env?: NodeJS.ProcessEnv;
   envFile?: Record<string, string>;
 }): Promise<{ value: T; slot: ClaudeCredentialSlot }> {
+  return withCredentialRotationGate(() => callWithCredentialRotationAttempt(options));
+}
+
+async function callWithCredentialRotationAttempt<T>(options: {
+  attempt: (credential: StructuredCredential) => Promise<T>;
+  logLabel: string;
+  noCredentialsMessage: string;
+  classify?: (err: unknown) => CredentialFailureClass;
+  env?: NodeJS.ProcessEnv;
+  envFile?: Record<string, string>;
+}): Promise<{ value: T; slot: ClaudeCredentialSlot }> {
   const env = options.env ?? process.env;
   const envFile = options.envFile ?? defaultStructuredCredentialEnvFile(env);
   const classify = options.classify ?? classifyCredentialFailure;
@@ -865,6 +1035,12 @@ export async function callWithCredentialRotation<T>(options: {
   }
   const ordered = orderCredentialsFromLastGood(credentials, Date.now());
   const startMs = Date.now();
+  // Snapshot BEFORE isSlotParked's lazy-expiry side effect deletes any entry
+  // whose window has already passed — that snapshot is what lets the success
+  // branch below tell "this slot just recovered from a park" apart from "this
+  // slot was never parked", even though by the time an attempt actually runs
+  // the map entry may already be gone.
+  const wasParkedAtStart = new Set(ordered.filter((c) => parkedSlotUntilMs.has(c.slot)).map((c) => c.slot));
   const available = ordered.filter((credential) => !isSlotParked(credential.slot, startMs));
   if (available.length === 0) {
     const nextAvailableMs = ordered.reduce<number | null>((min, credential) => {
@@ -886,6 +1062,10 @@ export async function callWithCredentialRotation<T>(options: {
         const value = await options.attempt(credential);
         lastGoodCredentialSlot = credential.slot;
         lastGoodCredentialSlotAt = Date.now();
+        if (wasParkedAtStart.has(credential.slot)) {
+          parkedSlotUntilMs.delete(credential.slot);
+          log.info(`${options.logLabel}: credential slot recovered, clearing park`, { slot: credential.slot });
+        }
         return { value, slot: credential.slot };
       } catch (err) {
         lastErr = err;

@@ -38,7 +38,14 @@ const TITLE_PROMPT_CAP = 500; // Truncate input to keep Haiku latency low
 // Retry sweep tuning (see retryPendingThreadTitles, called from host-sweep.ts).
 const RETRY_MAX_ATTEMPTS = 5;
 const RETRY_WINDOW_HOURS = 24;
-const RETRY_BATCH_CAP = 3;
+// Dropped from 3 to 1 alongside src/llm.ts's global credential-rotation gate:
+// this retry step, session-title-sweep's up-to-3-concurrent batch, and any
+// live maybeRenameNewThread all used to fire together on the same 60s tick,
+// bursting enough short-window requests to trip per-account rate limits on
+// otherwise-healthy credentials (see llm.ts's withCredentialRotationGate doc
+// comment). One title per minute still drains a backlog quickly, and the
+// gate means concurrency here wouldn't buy real throughput anyway.
+const RETRY_BATCH_CAP = 1;
 
 /**
  * Generate a short topic title from a message. Returns undefined on

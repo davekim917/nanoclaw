@@ -54,11 +54,18 @@ import {
 // something this file implements — verified via src/llm.test.ts's
 // credential-rotation/parking suites, which exercise the same shared state
 // this sweep's production path (below, non-test-override branch) goes
-// through. It is not airtight for the very FIRST request of a tick: JS runs
-// each candidate's synchronous setup (including firing its first HTTP
-// request) before the next candidate starts, so multiple concurrent
-// candidates CAN simultaneously dispatch to the same still-untried slot
-// once per tick before any of them has reported it dead.
+// through.
+//
+// CONCURRENCY_CAP no longer means real concurrency at the request level:
+// `callWithCredentialRotation` now queues behind a process-wide gate
+// (`withCredentialRotationGate` in llm.ts) that allows at most one in-flight
+// request at a time, spaced by a minimum interval — added because this cap's
+// "up to 3 at once" WAS the concurrency that produced the short-window
+// bursts tripping otherwise-healthy accounts' rate limits (see llm.ts's gate
+// doc comment). This constant now just bounds how many candidates get
+// PICKED per tick (`pickCandidates(CONCURRENCY_CAP)` below) and dispatched
+// into that queue — the queue itself, not this cap, is what limits in-flight
+// requests.
 export const CONCURRENCY_CAP = 3;
 export const COOLDOWN_HOURS = 1;
 export const REFRESH_MIN_NEW_MESSAGES = 10;

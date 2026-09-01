@@ -29,7 +29,11 @@ vi.mock('../env.js', () => ({
 }));
 
 import Database from 'better-sqlite3';
-import { __resetCallHaikuSlotCacheForTest } from '../llm.js';
+import {
+  __resetCallHaikuSlotCacheForTest,
+  __resetCredentialRotationGateForTest,
+  __setCredentialRotationGateMinIntervalForTest,
+} from '../llm.js';
 import {
   runSessionTitleSweep,
   setTitleBackendForTest,
@@ -168,6 +172,15 @@ beforeEach(() => {
   // process-wide by design (see callWithCredentialRotation) — reset it so
   // tests don't inherit a sticky slot from an earlier test in this file.
   __resetCallHaikuSlotCacheForTest();
+  __resetCredentialRotationGateForTest();
+  // The "production credential rotation" tests below exercise the real
+  // callWithCredentialRotation path (src/llm.ts), which now serializes
+  // behind a process-wide gate with a real 1s minimum spacing between
+  // calls. These tests use REAL timers (no vi.useFakeTimers() in this
+  // file's default describe blocks), so leaving the real interval in place
+  // would make the suite measurably slower without testing anything this
+  // file cares about — gate timing itself is covered in src/llm.test.ts.
+  __setCredentialRotationGateMinIntervalForTest(0);
 });
 
 afterEach(() => {
@@ -189,6 +202,7 @@ afterEach(() => {
     else process.env[key] = original;
   }
   __resetCallHaikuSlotCacheForTest();
+  __resetCredentialRotationGateForTest();
 });
 
 describe('postProcessTitle', () => {
