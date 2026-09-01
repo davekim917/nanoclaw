@@ -848,6 +848,8 @@ describe('writeSessionMessage re-provisions a deleted session folder', () => {
       sessions: 1,
       admitted: 1,
       mtimesRestored: 0,
+      skipped: 0,
+      stubsRemoved: 0,
     });
 
     const verified = new Database(legacyPath, { readonly: true });
@@ -1483,10 +1485,66 @@ describe('session migration pass preserves the idle clock', () => {
     expect(fs.statSync(target).mtimeMs).toBeGreaterThan(OLD_SECONDS * 1000);
   });
 
-  it('keeps the manifest when the pass throws after real DDL', async () => {
+  it('a schemaless inbound.db in one session does not abort the startup pass', async () => {
+    // The startup crash loop of 2026-09-01, from the other end. Three sessions:
+    // one healthy, one holding the 0-byte stub a failed open left behind, one
+    // holding a real but schemaless DB. The pass used to throw on the first bad
+    // file and main.ts exited on it, taking the whole fleet down; every healthy
+    // session must now still be processed.
+    const healthy = 'sess-isolation-healthy';
+    const stub = 'sess-isolation-stub';
+    const schemaless = 'sess-isolation-schemaless';
+    for (const sessionId of [healthy, stub, schemaless]) seedSession(sessionId);
+
+    initSessionFolder(MIGRATION_AG, healthy);
+
+    // Exactly the residue the old inbound funnel left: a resurrected session
+    // directory containing a 0-byte inbound.db and nothing else.
+    const stubPath = inboundDbPath(MIGRATION_AG, stub);
+    fs.mkdirSync(path.dirname(stubPath), { recursive: true });
+    fs.writeFileSync(stubPath, '');
+
+    const schemalessPath = inboundDbPath(MIGRATION_AG, schemaless);
+    fs.mkdirSync(path.dirname(schemalessPath), { recursive: true });
+    const broken = new Database(schemalessPath);
+    broken.exec('CREATE TABLE x (a)');
+    broken.close();
+
+    const result = reconcilePendingUpgradeContexts(getDb(), ['mtime']);
+    expect(result).toMatchObject({ sessions: 1, admitted: 0, skipped: 1, stubsRemoved: 1 });
+
+    // The healthy session was migrated, not merely counted.
+    const verified = new Database(inboundDbPath(MIGRATION_AG, healthy), { readonly: true });
+    const columns = new Set(
+      (verified.prepare("PRAGMA table_info('messages_in')").all() as Array<{ name: string }>).map((c) => c.name),
+    );
+    verified.close();
+    expect(columns.has('repo_fence_epoch')).toBe(true);
+
+    // The stub is gone — which is what restores the two-signal reclaimed state
+    // (session reclaimed AND no inbound.db) the stub was defeating.
+    expect(fs.existsSync(stubPath)).toBe(false);
+
+    // A schemaless DB is NOT a stub: it holds bytes nobody has proven are
+    // disposable, so it is skipped and left exactly where it is.
+    expect(fs.existsSync(schemalessPath)).toBe(true);
+    const stillBroken = new Database(schemalessPath, { readonly: true });
+    const tables = (
+      stillBroken.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all() as Array<{ name: string }>
+    ).map((t) => t.name);
+    stillBroken.close();
+    expect(tables).toEqual(['x']);
+
+    expect(fs.existsSync(path.join(DATA_DIR, 'pending-upgrade-mtimes.json'))).toBe(false);
+  });
+
+  it('skips one session whose admission fails after real DDL, restoring its clock inline', async () => {
     // Fault injected where it actually hurts: DDL has run for this session and
-    // its mtime is bumped, but the pass dies before the inline restore. The
-    // manifest is then the ONLY record that this file's clock is a lie.
+    // its mtime is bumped, but admission then fails. The pass used to throw out
+    // of here, which exits the host — one bad session DB crash-looped the whole
+    // fleet on 2026-09-01. It is now this session's problem alone: skipped,
+    // counted, and its bumped clock put back inline, which leaves the manifest
+    // nothing to recover.
     const sessionId = 'sess-throws-after-ddl';
     seedSession(sessionId);
     const legacyPath = inboundDbPath(MIGRATION_AG, sessionId);
@@ -1524,21 +1582,20 @@ describe('session migration pass preserves the idle clock', () => {
     fs.writeFileSync(path.join(memoryRoot, 'system', 'definition.md'), '# Definition\nfresh context');
     const before = ageInbound(sessionId);
 
-    expect(() => reconcilePendingUpgradeContexts(getDb(), ['mtime'])).toThrow();
+    expect(reconcilePendingUpgradeContexts(getDb(), ['mtime'])).toEqual({
+      sessions: 1,
+      admitted: 0,
+      mtimesRestored: 1,
+      skipped: 1,
+      stubsRemoved: 0,
+    });
 
-    const manifestPath = path.join(DATA_DIR, 'pending-upgrade-mtimes.json');
-    expect(fs.existsSync(manifestPath)).toBe(true);
-    const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf-8')) as {
-      entries: Array<{ sessionId: string; mtimeMs: number }>;
-    };
-    expect(manifest.entries.map((e) => e.sessionId)).toEqual([sessionId]);
-    expect(fs.statSync(legacyPath).mtimeMs).toBeGreaterThan(before);
-
-    // …and the next startup's replay is what puts it back.
-    const { replayUpgradeMtimeManifest } = await import('./session-manager.js');
-    expect(replayUpgradeMtimeManifest(DATA_DIR, getDb())).toBe(1);
+    // The DDL landed and bumped the clock; the inline restore put it back, so
+    // there is no lie left for the manifest to record and it is removed as on
+    // any other completed pass. A crash outside the per-session loop is what
+    // the manifest still exists for — `replayUpgradeMtimeManifest` covers it.
     expect(fs.statSync(legacyPath).mtimeMs).toBe(before);
-    expect(fs.existsSync(manifestPath)).toBe(false);
+    expect(fs.existsSync(path.join(DATA_DIR, 'pending-upgrade-mtimes.json'))).toBe(false);
   });
 
   it('leaves a session alone when untouched evidence shows work inside the replay window', async () => {
@@ -1650,6 +1707,8 @@ describe('session migration pass preserves the idle clock', () => {
       sessions: 1,
       admitted: 1,
       mtimesRestored: 0,
+      skipped: 0,
+      stubsRemoved: 0,
     });
     expect(fs.statSync(legacyPath).mtimeMs).toBeGreaterThan(before);
   });
