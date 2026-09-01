@@ -1,6 +1,11 @@
 /**
  * Orchestrator self-spawn module.
  *
+ * PARKED since 2026-08-11: no agent group holds the `orchestrator` capability, so none of
+ * these actions fire and the reconciler/watchdog sweeps in host-sweep.ts are no-ops. Kept
+ * compiled + tested pending a new fan-out strategy; restore = grantCapability(). Do not
+ * delete, do not re-grant without a decision. See docs/specs/orchestrator-dispatch/spawn-rework-plan.md.
+ *
  * Registers 5 delivery actions for the spawn pipeline:
  *   - spawn_task      (orchestrator → host: admit new task)
  *   - spawn_complete  (child → host: task done)

@@ -22,20 +22,23 @@
  * This module is the missing other side: find active fences that no live
  * publication owns, and release them.
  */
-import fs from 'fs';
-
 import { wakeRepositoryMountSessions } from './container-restart.js';
 import { getAgentGroup, getAllAgentGroups } from './db/agent-groups.js';
 import { getMessagingGroup } from './db/messaging-groups.js';
 import { getActiveSessions, getSessionsByAgentGroup } from './db/sessions.js';
-import { countDueMessages, readRepoIngressFence, releaseRepoIngressFence } from './db/session-db.js';
+import {
+  countDueMessages,
+  readRepoIngressFence,
+  releaseRepoIngressFence,
+  SessionDbMissingError,
+} from './db/session-db.js';
 import { log } from './log.js';
 import {
   isRepositoryLifecycleClaimed,
   isWorkgroupRepositoryMountClaimed,
   resolveRepositoryWorkUnit,
 } from './repository-workspaces.js';
-import { inboundDbPath, openInboundDb } from './session-manager.js';
+import { openInboundDb } from './session-manager.js';
 import type { Session } from './types.js';
 
 export interface OrphanedRepoFenceRecovery {
@@ -136,12 +139,6 @@ export async function releaseOrphanedRepoIngressFences(
   const wake: Session[] = [];
   for (const [index, session] of sessions.entries()) {
     await yieldEventLoop(index);
-    // Cheap pre-filter: no inbound DB file means no `repo_ingress_fence` table
-    // and nothing to release. One lstat beats one SQLite open by orders of
-    // magnitude, and unlike an mtime or workgroup-has-repositories filter it
-    // cannot miss a real fence — a first publication into a workgroup that
-    // fails before creating any canonical checkout still leaves fences behind.
-    if (!fs.existsSync(inboundDbPath(session.agent_group_id, session.id))) continue;
     try {
       const inDb = openInboundDb(session.agent_group_id, session.id);
       try {
@@ -176,6 +173,13 @@ export async function releaseOrphanedRepoIngressFences(
         inDb.close();
       }
     } catch (err) {
+      // The open funnel is the classifier, not `fs.existsSync`: it reports a
+      // session as missing only for a real ENOENT/ENOTDIR, never for a path the
+      // filesystem merely declined to answer about (EACCES, EMFILE). A session
+      // with no inbound DB has no fence and is the ordinary steady state, so it
+      // is skipped silently; anything else is a session we could not read and
+      // must be visible rather than quietly counted as fence-free.
+      if (err instanceof SessionDbMissingError) continue;
       report.failed += 1;
       log.warn('Orphaned repository fence pass skipped an unreadable session', {
         reason,
@@ -220,13 +224,16 @@ export async function releaseOrphanedRepoIngressFencesAtStartup(): Promise<Orpha
  *
  * Opening 1600+ inbound DBs every minute is real cost for a condition that is
  * rare and, once present, static — an orphaned fence does not heal or worsen
- * between passes. Five minutes bounds the worst case a running host can stay
- * deaf while keeping the amortised cost near zero, and startup already covers
- * the far more common "host restarted after a failed publication" case
- * immediately. The alternatives were both unsound: an inbound-mtime filter
- * misses a fence that has been quiet for hours (the incident's own shape), and
- * a "workgroups that have canonical repositories" filter misses a first
- * publication that failed before creating one.
+ * between passes. The interval IS the cost bound, deliberately, because every
+ * cheap per-session pre-filter considered was unsound: an inbound-mtime filter
+ * misses a fence that has been quiet for hours (the incident's own shape), a
+ * "workgroups that have canonical repositories" filter misses a first
+ * publication that failed before creating one, and an `fs.existsSync` filter
+ * reports an unreadable-but-present session as absent (see
+ * `sessionDbPathIsGone` in db/session-db.ts). Five minutes bounds the worst
+ * case a running host can stay deaf while keeping amortised cost near zero,
+ * and startup already covers the far more common "host restarted after a
+ * failed publication" case immediately.
  */
 export const ORPHANED_REPO_FENCE_SCAN_INTERVAL_MS = 5 * 60 * 1000;
 

@@ -1,6 +1,10 @@
 # orchestrator-dispatch → spawn rework plan
 
-> Status: APPROVED — pending execution on new branch `feat/orchestrator-spawn-rework`.
+> Status: PARKED (2026-08-11) — never executed. The whole spawn fan-out was retired by revoking the
+> only `agent_group_capabilities` grant; native provider subagents replaced it. Code stays compiled
+> in and tested, but with zero capability rows `spawn_task` never mounts and the host reconciler /
+> watchdog sweeps are no-ops. Do NOT execute this plan or delete the module — restore is a re-grant,
+> pending a new fan-out strategy. Historical status was APPROVED; the plan below is kept as the record.
 > Source: post-Phase-1-merge realignment conversation 2026-05-10 (after PR #80 merged at commit 3bcf601).
 > Why this file exists: the conversation that produced this plan is large and likely to compact. This file is the durable record so a fresh context can pick up exactly where we left off.
 

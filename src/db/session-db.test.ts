@@ -21,8 +21,11 @@ import {
   insertMessage,
   insertDeferredMessageWithContextIfNew,
   migrateMessagesInTable,
+  openInboundDb,
   openOutboundDb,
+  openOutboundDbWritable,
   releaseRepoIngressFence,
+  SessionDbMissingError,
   recoverHotJournal,
   sessionInboundHasMessage,
   syncProcessingAcks,
@@ -1001,5 +1004,193 @@ describe('hot journal recovery (readonly outbound opens)', () => {
     seed.close();
     expect(recoverHotJournal(dbPath)).toBe(false);
     fs.rmSync(dir, { recursive: true, force: true });
+  });
+});
+
+describe('host opens never create a session database', () => {
+  // 2026-09-01: a storage reclaim removed a session directory while a
+  // repository publish was mid-quiescence. The inbound open recreated the
+  // directory (its storage-activity marker does a recursive mkdir) and
+  // better-sqlite3 then created a 0-byte inbound.db. The schema migration
+  // threw, the handle closed, and what stayed on disk was a session directory
+  // holding nothing but that stub — which the next host start opened, threw
+  // on, and exited over, seven times. `ensureSchema` is the only host-side
+  // creator; no open may bring a file, or its parent directory, into existence.
+
+  const roots: string[] = [];
+  const chmodBack: Array<[string, number]> = [];
+
+  /** The post-reclaim shape exactly: the session directory itself is gone too. */
+  function reclaimedSessionDir(): string {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'session-db-missing-'));
+    roots.push(root);
+    return path.join(root, 'v2-sessions', 'ag-1', 'sess-1');
+  }
+
+  /** A real, schema-current DB the process then cannot open. */
+  function unreadableDb(name: 'inbound.db' | 'outbound.db'): string {
+    const sessionDir = reclaimedSessionDir();
+    fs.mkdirSync(sessionDir, { recursive: true });
+    const dbPath = path.join(sessionDir, name);
+    ensureSchema(dbPath, name === 'inbound.db' ? 'inbound' : 'outbound');
+    fs.chmodSync(dbPath, 0o000);
+    chmodBack.push([dbPath, 0o600]);
+    return dbPath;
+  }
+
+  /** A real, schema-current DB inside a session directory that cannot be traversed. */
+  function dbInUnsearchableDir(name: 'inbound.db' | 'outbound.db'): string {
+    const sessionDir = reclaimedSessionDir();
+    fs.mkdirSync(sessionDir, { recursive: true });
+    const dbPath = path.join(sessionDir, name);
+    ensureSchema(dbPath, name === 'inbound.db' ? 'inbound' : 'outbound');
+    fs.chmodSync(sessionDir, 0o000);
+    chmodBack.push([sessionDir, 0o700]);
+    return dbPath;
+  }
+
+  afterEach(() => {
+    // Restore first, or the recursive remove below cannot traverse or unlink.
+    for (const [target, mode] of chmodBack.splice(0)) fs.chmodSync(target, mode);
+    for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  it('openInboundDb throws SessionDbMissingError and resurrects neither the file nor its directory', () => {
+    const sessionDir = reclaimedSessionDir();
+    const dbPath = path.join(sessionDir, 'inbound.db');
+
+    expect(() => openInboundDb(dbPath)).toThrow(SessionDbMissingError);
+    expect(fs.existsSync(dbPath)).toBe(false);
+    expect(fs.existsSync(sessionDir)).toBe(false);
+  });
+
+  it('openInboundDb leaves no stub and no marker when only the file is missing', () => {
+    // The directory survives here (an operator `rm inbound.db`, or a partly
+    // completed reclaim), so the marker's mkdir is not what would create the
+    // file — better-sqlite3's own file creation is, and `fileMustExist`
+    // refuses it. The empty listing also proves the storage-activity marker
+    // was released, which is what keeps the session reclaimable.
+    const sessionDir = reclaimedSessionDir();
+    fs.mkdirSync(sessionDir, { recursive: true });
+    const dbPath = path.join(sessionDir, 'inbound.db');
+
+    expect(() => openInboundDb(dbPath)).toThrow(SessionDbMissingError);
+    expect(fs.existsSync(dbPath)).toBe(false);
+    expect(fs.readdirSync(sessionDir)).toEqual([]);
+  });
+
+  it('openOutboundDbWritable throws SessionDbMissingError and creates nothing', () => {
+    // The host never provisions outbound.db — the container does.
+    const sessionDir = reclaimedSessionDir();
+    const dbPath = path.join(sessionDir, 'outbound.db');
+
+    expect(() => openOutboundDbWritable(dbPath)).toThrow(SessionDbMissingError);
+    expect(fs.existsSync(dbPath)).toBe(false);
+    expect(fs.existsSync(sessionDir)).toBe(false);
+  });
+
+  it('openOutboundDb (readonly) reports a vanished session the same way', () => {
+    const sessionDir = reclaimedSessionDir();
+    const dbPath = path.join(sessionDir, 'outbound.db');
+
+    expect(() => openOutboundDb(dbPath)).toThrow(SessionDbMissingError);
+    expect(fs.existsSync(dbPath)).toBe(false);
+  });
+
+  // SQLite raises SQLITE_CANTOPEN with the identical "unable to open database
+  // file" message for a file that is PRESENT but unopenable — EACCES here, and
+  // descriptor exhaustion or a read-only filesystem in production. Reporting
+  // those as a missing session would let container-restart's skip-the-vanished
+  // branch leave a session whose ingress is present but unreadable UNFENCED,
+  // which is the one case that has to fail closed. Root bypasses file modes, so
+  // the precondition cannot be established there.
+  const notRoot = process.getuid?.() !== 0;
+
+  it.skipIf(!notRoot)('a present but unreadable inbound.db is NOT reported as missing', () => {
+    const dbPath = unreadableDb('inbound.db');
+    const sizeBefore = fs.statSync(dbPath).size;
+
+    let thrown: unknown;
+    try {
+      openInboundDb(dbPath);
+    } catch (err) {
+      thrown = err;
+    }
+    expect(thrown).toBeInstanceOf(Error);
+    expect(thrown).not.toBeInstanceOf(SessionDbMissingError);
+    expect((thrown as { code?: string }).code).toBe('SQLITE_CANTOPEN');
+
+    // The failing open touched nothing, and released its activity marker.
+    expect(fs.existsSync(dbPath)).toBe(true);
+    expect(fs.statSync(dbPath).size).toBe(sizeBefore);
+    expect(fs.readdirSync(path.dirname(dbPath))).toEqual(['inbound.db']);
+  });
+
+  it.skipIf(!notRoot)('a present but unreadable outbound.db is NOT reported as missing', () => {
+    const dbPath = unreadableDb('outbound.db');
+    const sizeBefore = fs.statSync(dbPath).size;
+
+    let thrown: unknown;
+    try {
+      openOutboundDbWritable(dbPath);
+    } catch (err) {
+      thrown = err;
+    }
+    expect(thrown).toBeInstanceOf(Error);
+    expect(thrown).not.toBeInstanceOf(SessionDbMissingError);
+    expect((thrown as { code?: string }).code).toBe('SQLITE_CANTOPEN');
+
+    expect(fs.existsSync(dbPath)).toBe(true);
+    expect(fs.statSync(dbPath).size).toBe(sizeBefore);
+  });
+
+  it.skipIf(!notRoot)('an unreadable session DIRECTORY is not mistaken for a vanished session', () => {
+    // One level below the CANTOPEN trap and the same mistake: `fs.existsSync`
+    // returns false for ANY stat failure, EACCES on a parent directory that
+    // lost search permission included. The session is present — its DB is right
+    // there — so this must surface the real error and fail closed, not report a
+    // missing session that container-restart would then skip fencing.
+    const inboundPath = dbInUnsearchableDir('inbound.db');
+
+    let thrown: unknown;
+    try {
+      openInboundDb(inboundPath);
+    } catch (err) {
+      thrown = err;
+    }
+    expect(thrown).toBeInstanceOf(Error);
+    expect(thrown).not.toBeInstanceOf(SessionDbMissingError);
+    expect((thrown as { code?: string }).code).toBe('EACCES');
+
+    const outboundPath = dbInUnsearchableDir('outbound.db');
+    let outboundThrown: unknown;
+    try {
+      openOutboundDbWritable(outboundPath);
+    } catch (err) {
+      outboundThrown = err;
+    }
+    expect(outboundThrown).toBeInstanceOf(Error);
+    expect(outboundThrown).not.toBeInstanceOf(SessionDbMissingError);
+    expect((outboundThrown as { code?: string }).code).toBe('SQLITE_CANTOPEN');
+  });
+
+  it('a provisioned session still opens through both funnels', () => {
+    // The regression guard: refusing to create must not refuse a real session.
+    // `ensureSchema` is the legitimate provisioning call, and it is what
+    // `initSessionFolder` runs before any open.
+    const sessionDir = reclaimedSessionDir();
+    fs.mkdirSync(sessionDir, { recursive: true });
+    const inboundPath = path.join(sessionDir, 'inbound.db');
+    const outboundPath = path.join(sessionDir, 'outbound.db');
+    ensureSchema(inboundPath, 'inbound');
+    ensureSchema(outboundPath, 'outbound');
+
+    const inbound = openInboundDb(inboundPath);
+    expect(inbound.prepare('SELECT COUNT(*) AS c FROM messages_in').get()).toEqual({ c: 0 });
+    inbound.close();
+
+    const outbound = openOutboundDbWritable(outboundPath);
+    expect(outbound.prepare('SELECT COUNT(*) AS c FROM messages_out').get()).toEqual({ c: 0 });
+    outbound.close();
   });
 });

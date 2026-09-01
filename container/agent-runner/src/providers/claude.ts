@@ -29,11 +29,6 @@ import type {
   TurnUsageInfo,
 } from './types.js';
 import { autoCommitDirtyWorktrees } from '../worktree-autosave.js';
-import {
-  createMemoryCaptureWebFetchHook,
-  createMemoryCaptureBashHook,
-  createMemoryCaptureMcpHook,
-} from '../mcp-tools/memory-capture.js';
 import { createManagedGitMaintenanceHook } from '../managed-git-guard.js';
 
 // Per D9 / D7 / A6: the runtime schema is compiler-checked against the SDK.
@@ -2282,14 +2277,6 @@ export class ClaudeProvider implements AgentProvider {
           ],
           PostToolUse: [
             { hooks: [postToolUseHook] },
-            // Capture intentionally fetched knowledge into sources/inbox.
-            // These land in the workgroup source tree so later sessions can
-            // find them as ordinary files, without an opt-in flag.
-            { matcher: 'WebFetch', hooks: [createMemoryCaptureWebFetchHook()] },
-            { matcher: 'Bash', hooks: [createMemoryCaptureBashHook()] },
-            // mcp__.* matches every MCP tool call; the hook itself dispatches
-            // through its allowlist and ignores non-durable results.
-            { matcher: 'mcp__.*', hooks: [createMemoryCaptureMcpHook()] },
             // A subagent's quota exhaustion arrives as a tool_result inside
             // this still-running turn, never as a top-level result — this is
             // the only place it can be seen. Task is not matched by any other

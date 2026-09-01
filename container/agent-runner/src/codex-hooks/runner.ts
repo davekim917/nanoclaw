@@ -23,11 +23,6 @@ import {
   createBlockGitCloneHook,
   createEmailGateHook,
 } from '../providers/claude.js';
-import {
-  createMemoryCaptureBashHook,
-  createMemoryCaptureWebFetchHook,
-  createMemoryCaptureMcpHook,
-} from '../mcp-tools/memory-capture.js';
 import { createManagedGitMaintenanceHook } from '../managed-git-guard.js';
 
 /**
@@ -470,8 +465,7 @@ export async function runPreToolUseChain(input: CodexHookInput): Promise<unknown
 }
 
 /**
- * Run the PostToolUse hook chain. Captures durable Bash/WebFetch/MCP output
- * into sources/inbox; always clears the in-flight tracker.
+ * Run the PostToolUse hook chain. Always clears the in-flight tracker.
  */
 export async function runPostToolUseChain(input: CodexHookInput): Promise<unknown> {
   const normalized = normalizeCodexHookInput(input);
@@ -481,24 +475,6 @@ export async function runPostToolUseChain(input: CodexHookInput): Promise<unknow
     {} as Parameters<HookCallback>[1],
     {} as Parameters<HookCallback>[2],
   );
-
-  const toolName = normalized.tool_name ?? '';
-  const captureHooks: HookCallback[] = [];
-  if (toolName === 'Bash') captureHooks.push(createMemoryCaptureBashHook());
-  else if (toolName === 'WebFetch') captureHooks.push(createMemoryCaptureWebFetchHook());
-  else if (toolName.startsWith('mcp__')) captureHooks.push(createMemoryCaptureMcpHook());
-
-  for (const hook of captureHooks) {
-    try {
-      await hook(
-        normalized as Parameters<HookCallback>[0],
-        {} as Parameters<HookCallback>[1],
-        {} as Parameters<HookCallback>[2],
-      );
-    } catch (err) {
-      console.error(`[codex-hook] capture failed: ${err instanceof Error ? err.message : String(err)}`);
-    }
-  }
 
   return { continue: true };
 }

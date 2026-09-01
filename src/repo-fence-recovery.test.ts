@@ -54,7 +54,8 @@ const fences = new Map<string, Fence>();
 const dueMessages = new Map<string, number>();
 const closedDbs: string[] = [];
 
-vi.mock('./db/session-db.js', () => ({
+vi.mock('./db/session-db.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./db/session-db.js')>()),
   readRepoIngressFence: (db: MockDb) => fences.get(db.sessionId) ?? null,
   countDueMessages: (db: MockDb) => dueMessages.get(db.sessionId) ?? 0,
   releaseRepoIngressFence: (db: MockDb, epoch: string, generation: string) => {
@@ -69,20 +70,28 @@ vi.mock('./db/session-db.js', () => ({
   },
 }));
 
-/** Session rows whose inbound DB was reclaimed out from under the host. */
+/** Sessions that are PRESENT but unopenable — EACCES, EMFILE, a corrupt file. */
 const unreadableSessions = new Set<string>();
+/** Sessions whose inbound DB is genuinely gone (ENOENT/ENOTDIR). */
+const missingDbSessions = new Set<string>();
 let sessionsRoot = '';
-vi.mock('./session-manager.js', () => ({
-  inboundDbPath: (agentGroupId: string, sessionId: string) =>
-    path.join(sessionsRoot, agentGroupId, sessionId, 'inbound.db'),
-  openInboundDb: (_agentGroupId: string, sessionId: string): MockDb => {
-    if (unreadableSessions.has(sessionId)) {
-      // Exactly what better-sqlite3 throws for a reclaimed session directory.
-      throw new TypeError('Cannot open database because the directory does not exist');
-    }
-    return { sessionId, close: () => closedDbs.push(sessionId) };
-  },
-}));
+vi.mock('./session-manager.js', async () => {
+  const { SessionDbMissingError } = await import('./db/session-db.js');
+  return {
+    inboundDbPath: (agentGroupId: string, sessionId: string) =>
+      path.join(sessionsRoot, agentGroupId, sessionId, 'inbound.db'),
+    openInboundDb: (agentGroupId: string, sessionId: string): MockDb => {
+      if (missingDbSessions.has(sessionId)) {
+        throw new SessionDbMissingError(path.join(sessionsRoot, agentGroupId, sessionId, 'inbound.db'));
+      }
+      if (unreadableSessions.has(sessionId)) {
+        // Present but unopenable — must stay visible, never counted fence-free.
+        throw new Error('SQLITE_CANTOPEN: unable to open database file');
+      }
+      return { sessionId, close: () => closedDbs.push(sessionId) };
+    },
+  };
+});
 
 import {
   ORPHANED_REPO_FENCE_SCAN_INTERVAL_MS,
@@ -122,6 +131,7 @@ beforeEach(() => {
   fences.clear();
   dueMessages.clear();
   unreadableSessions.clear();
+  missingDbSessions.clear();
   agentGroups.clear();
   agentGroups.set('ag-primary', { id: 'ag-primary', folder: 'wg-a', workgroup_id: 'wg-a' });
   agentGroups.set('ag-sibling', { id: 'ag-sibling', folder: 'sibling', workgroup_id: 'wg-a' });
@@ -228,6 +238,22 @@ describe('orphaned repository ingress fence recovery (incident 2026-09-01)', () 
     expect(fences.get(last.id)?.state).toBe('released');
   });
 
+  it('skips a session whose inbound DB is genuinely gone without calling it a failure', async () => {
+    // PR #223's funnel is the classifier: ENOENT/ENOTDIR means gone, and a
+    // session with no inbound DB has no fence — ordinary, not a fault. A
+    // present-but-unopenable session (EACCES, EMFILE) stays visible instead.
+    const orphaned = addSession('s1');
+    addSession('s2');
+    addSession('s3');
+    fence(orphaned.id);
+    missingDbSessions.add('s2');
+    unreadableSessions.add('s3');
+
+    const report = await releaseOrphanedRepoIngressFences('test');
+
+    expect(report).toMatchObject({ scanned: 1, active: 1, released: 1, failed: 1 });
+  });
+
   it('bounds the sweep to one full pass per scan interval', async () => {
     const orphaned = addSession('s1');
     fence(orphaned.id);
@@ -246,15 +272,23 @@ describe('orphaned repository ingress fence recovery (incident 2026-09-01)', () 
 
   it('yields to the event loop every 100 sessions so a 1600-session pass cannot freeze the host', async () => {
     for (let i = 0; i < 250; i += 1) addSession(`s${i}`);
+    // A competing setImmediate chain, not a wall-clock timer: the pass yields
+    // with setImmediate, so this counts queue turns it actually conceded and
+    // stays deterministic when the machine is saturated by a full parallel run.
     let macrotasks = 0;
-    const tick = setInterval(() => {
+    let stop = false;
+    const chain = (): void => {
+      if (stop) return;
       macrotasks += 1;
-    }, 1);
+      setImmediate(chain);
+    };
+    setImmediate(chain);
     try {
       await releaseOrphanedRepoIngressFences('test');
-      expect(macrotasks).toBeGreaterThan(0);
+      // 250 sessions → yields at index 100 and index 200.
+      expect(macrotasks).toBeGreaterThanOrEqual(2);
     } finally {
-      clearInterval(tick);
+      stop = true;
     }
   });
 });

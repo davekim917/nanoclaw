@@ -15,6 +15,7 @@ import {
   readRepoIngressFence,
   readRepositoryMountBarrierAck,
   releaseRepoIngressFence,
+  SessionDbMissingError,
 } from './db/session-db.js';
 import { getSession, getSessionsByAgentGroup } from './db/sessions.js';
 import { log } from './log.js';
@@ -102,6 +103,31 @@ function hasFenceableIngress(session: Session): boolean {
 }
 
 /**
+ * A session whose inbound DB vanished BETWEEN the eligibility filter and the
+ * open below carries exactly the invariant `hasFenceableIngress` documents:
+ * there is no ingress path left to fence, and no spawn can create one while
+ * the workgroup mount claim is held. It is skipped rather than fatal — the
+ * 2026-09-01 incident was a storage reclaim landing inside precisely this
+ * window, which failed an unrelated publication permanently.
+ *
+ * A session with a LIVE container is the one exception: it must own a DB to
+ * poll, so its absence is an inconsistent host view and still fails closed.
+ */
+function vanishedSessionIsSkippable(err: unknown, session: Session): boolean {
+  if (!(err instanceof SessionDbMissingError)) return false;
+  return !isContainerRunning(session.id) && !isContainerSpawning(session.id);
+}
+
+/** Every barrier failure names its session and DB path, so one log line diagnoses it. */
+function barrierSessionError(err: unknown, session: Session, phase: string): Error {
+  return new Error(
+    `repository mount barrier ${phase} failed for session ${session.id} ` +
+      `(${inboundDbPath(session.agent_group_id, session.id)}): ${err instanceof Error ? err.message : String(err)}`,
+    { cause: err },
+  );
+}
+
+/**
  * Fencing writes one commit per session DB under `journal_mode=DELETE`, which
  * costs ~9ms of synchronous fsync each. A workgroup with thousands of sessions
  * therefore blocks the host event loop for a minute or more, starving every
@@ -116,23 +142,43 @@ async function yieldEventLoop(index: number): Promise<void> {
 async function activateRepositoryMountBarriers(
   sessions: Session[],
   epoch: string,
-): Promise<{ barrierAcks: Record<string, string>; barrierGenerations: Record<string, string> }> {
+): Promise<{ fenced: Session[]; barrierAcks: Record<string, string>; barrierGenerations: Record<string, string> }> {
   const activated: Session[] = [];
+  // The sessions this pass actually fenced. Returned so the quiescence's
+  // barrierSessions, barrierAcks and barrierGenerations stay one consistent
+  // set — a session skipped here must never reach release, which would then
+  // fail on its missing generation.
+  const fenced: Session[] = [];
   const barrierAcks: Record<string, string> = {};
   const barrierGenerations: Record<string, string> = {};
   try {
     for (const [index, session] of sessions.entries()) {
       await yieldEventLoop(index);
-      const inDb = openInboundDb(session.agent_group_id, session.id);
+      let inDb: ReturnType<typeof openInboundDb>;
+      try {
+        inDb = openInboundDb(session.agent_group_id, session.id);
+      } catch (openError) {
+        if (vanishedSessionIsSkippable(openError, session)) {
+          log.warn('Repository mount barrier skipped: session inbound DB vanished after eligibility check', {
+            sessionId: session.id,
+            agentGroupId: session.agent_group_id,
+          });
+          continue;
+        }
+        throw barrierSessionError(openError, session, 'activation');
+      }
       try {
         const prior = readRepoIngressFence(inDb);
         const active = activateRepoIngressFence(inDb, epoch);
+        fenced.push(session);
         barrierAcks[session.id] = repoIngressFenceAckToken(active);
         barrierGenerations[session.id] = active.generation;
         // A replay may be adopting a crash-left active barrier with this exact
         // deterministic epoch. It did not create that barrier and therefore
         // must never roll it back if a later session activation fails.
         if (prior?.state !== 'active' || prior.epoch !== epoch) activated.push(session);
+      } catch (fenceError) {
+        throw barrierSessionError(fenceError, session, 'activation');
       } finally {
         inDb.close();
       }
@@ -144,7 +190,22 @@ async function activateRepositoryMountBarriers(
     const stranded: Session[] = [];
     for (const session of activated.reverse()) {
       try {
-        const inDb = openInboundDb(session.agent_group_id, session.id);
+        let inDb: ReturnType<typeof openInboundDb>;
+        try {
+          inDb = openInboundDb(session.agent_group_id, session.id);
+        } catch (openError) {
+          // A session reclaimed since we fenced it has no fence row left to
+          // restore — the whole DB is gone. Skipping reaches the same end state
+          // a successful release would.
+          if (vanishedSessionIsSkippable(openError, session)) {
+            log.warn('Repository mount barrier rollback skipped: session inbound DB vanished', {
+              sessionId: session.id,
+              agentGroupId: session.agent_group_id,
+            });
+            continue;
+          }
+          throw barrierSessionError(openError, session, 'activation rollback');
+        }
         try {
           const generation = barrierGenerations[session.id];
           if (!generation) {
@@ -173,7 +234,7 @@ async function activateRepositoryMountBarriers(
     }
     throw error;
   }
-  return { barrierAcks, barrierGenerations };
+  return { fenced, barrierAcks, barrierGenerations };
 }
 
 function sessionReachedRepositoryBarrier(session: Session, expectedAck: string): boolean {
@@ -204,7 +265,23 @@ export async function releaseRepositoryMountQuiescence(quiescence: RepositoryMou
   const wakeRequired: Session[] = [];
   for (const [index, session] of quiescence.barrierSessions.entries()) {
     await yieldEventLoop(index);
-    const inDb = openInboundDb(session.agent_group_id, session.id);
+    let inDb: ReturnType<typeof openInboundDb>;
+    try {
+      inDb = openInboundDb(session.agent_group_id, session.id);
+    } catch (openError) {
+      // Consistent for the maps too: barrierAcks/barrierGenerations are keyed
+      // by session id and only ever read for a session this loop reaches, so
+      // dropping one strands nothing — and a reclaimed session has no fence row
+      // left to release and no due rows left to wake for.
+      if (vanishedSessionIsSkippable(openError, session)) {
+        log.warn('Repository mount barrier release skipped: session inbound DB vanished', {
+          sessionId: session.id,
+          agentGroupId: session.agent_group_id,
+        });
+        continue;
+      }
+      throw barrierSessionError(openError, session, 'release');
+    }
     try {
       const generation = quiescence.barrierGenerations[session.id];
       if (!generation) throw new Error(`repository mount barrier generation missing for session ${session.id}`);
@@ -266,16 +343,22 @@ export async function quiesceSessionsForRepositoryMounts(
       `running session(s) have no inbound database to fence: ${unfenceable.map((session) => session.id).join(', ')}`,
     );
   }
+  // #223 returns `fenced` — the subset this pass actually fenced, after
+  // skipping sessions whose inbound DB vanished — so barrierSessions,
+  // barrierAcks and barrierGenerations stay one consistent set.
+  let fenced: Session[];
   let barrierAcks: Record<string, string>;
   let barrierGenerations: Record<string, string>;
   try {
-    ({ barrierAcks, barrierGenerations } = await activateRepositoryMountBarriers(barrierSessions, epoch));
+    ({ fenced, barrierAcks, barrierGenerations } = await activateRepositoryMountBarriers(barrierSessions, epoch));
   } catch (error) {
     // A partial rollback leaves real fences behind, and the caller's only
     // recovery affordance is RepositoryMountQuiescenceError. Re-shape into it
     // with the stranded set as the barrier sessions and `barriersReleased:
     // false`, so `applyRepositoryPublishAction` / `applyRepositoryTransferAction`
-    // retry the release instead of dropping them (incident 2026-09-01).
+    // retry the release instead of dropping them (incident 2026-09-01). A
+    // session skipped as vanished is never in `strandedSessions` — it holds no
+    // fence to release, so it is neither an error nor recovery work.
     if (error instanceof RepositoryMountBarrierRollbackError) {
       throw new RepositoryMountQuiescenceError(
         error,
@@ -292,7 +375,7 @@ export async function quiesceSessionsForRepositoryMounts(
     }
     throw error;
   }
-  const quiescence = { epoch, sessions: affected, barrierSessions, barrierAcks, barrierGenerations };
+  const quiescence = { epoch, sessions: affected, barrierSessions: fenced, barrierAcks, barrierGenerations };
   try {
     await waitUntil(
       () => affected.every((session) => !isContainerSpawning(session.id)),
