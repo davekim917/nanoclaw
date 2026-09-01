@@ -98,6 +98,7 @@ function report(usagePct: number): StorageReport {
       freshThreads: 0,
       liveTopics: 0,
       freshTopics: 0,
+      noManifestTrees: 0,
       unreadableSessions: 0,
       noActivitySessions: 0,
       budgetDeferredSessions: 0,

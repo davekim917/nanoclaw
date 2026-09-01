@@ -2392,8 +2392,17 @@ describe('storage-manager regenerable tree sweep', () => {
     fs.rmSync(tmpRoot, { recursive: true, force: true });
   });
 
-  /** A topic worktree holding one checkout with a node_modules and real source. */
-  function makeTopic(name: string, options: { idleDays?: number } = {}): { topicDir: string; repoDir: string } {
+  /**
+   * A topic worktree holding one checkout with a node_modules and real source.
+   * The lockfile is part of the fixture, not decoration: without a recorded
+   * reproducer beside it the sweep refuses the tree, so a fixture that omits it
+   * would silently stop testing anything (`lockfile: false` does that on
+   * purpose).
+   */
+  function makeTopic(
+    name: string,
+    options: { idleDays?: number; lockfile?: boolean } = {},
+  ): { topicDir: string; repoDir: string } {
     const topicDir = path.join(topicsRoot, 'wg-acme', name);
     const repoDir = path.join(topicDir, 'worktrees', 'XZO-BACKEND');
     fs.mkdirSync(path.join(repoDir, 'node_modules', 'left-pad'), { recursive: true });
@@ -2401,22 +2410,35 @@ describe('storage-manager regenerable tree sweep', () => {
     fs.mkdirSync(path.join(repoDir, 'src'), { recursive: true });
     fs.writeFileSync(path.join(repoDir, 'src', 'app.ts'), 'the actual work');
     fs.writeFileSync(path.join(repoDir, 'package.json'), '{}');
+    if (options.lockfile !== false) {
+      fs.writeFileSync(path.join(repoDir, 'package-lock.json'), '{"lockfileVersion":3}');
+    }
     const stamp = (now - (options.idleDays ?? 10) * DAY_MS) / 1000;
     fs.utimesSync(path.join(topicDir, 'worktrees'), stamp, stamp);
     return { topicDir, repoDir };
   }
 
-  function sweep(options: { mounts?: string[] | null; mode?: 'dry-run' | 'apply' } = {}): StorageReport {
+  function sweep(
+    options: { mounts?: string[] | null | (() => string[] | null); mode?: 'dry-run' | 'apply' } = {},
+  ): StorageReport {
+    const configured = options.mounts;
+    const lookup = typeof configured === 'function' ? configured : () => (configured === undefined ? [] : configured);
     return getStorageReport({
       mode: options.mode ?? 'apply',
       now,
       sessionsRoot,
       threadsRoot: path.join(dataRoot, 'no-threads'),
       topicsRoot,
-      runningContainerMounts: () => (options.mounts === undefined ? [] : options.mounts),
+      runningContainerMounts: lookup,
       includeDocker: false,
       policy: { filesystemPath: tmpRoot },
     });
+  }
+
+  /** Clean during collection, then a container appears before the deletion runs. */
+  function mountsAppearingAfterCollection(later: string[] | null): () => string[] | null {
+    let calls = 0;
+    return () => (calls++ === 0 ? [] : later);
   }
 
   it('sweeps an idle topic worktree node_modules and leaves the checkout intact', () => {
@@ -2577,6 +2599,78 @@ describe('storage-manager regenerable tree sweep', () => {
         `pip installed into ${name}`,
       );
     }
+  });
+
+  it('refuses a node_modules with no recorded manifest beside it', () => {
+    const { repoDir } = makeTopic('thread-44444444444444444444444444444444', { lockfile: false });
+    // package.json alone is not a reproducer: it does not pin what was
+    // installed, and `npm install --no-save` leaves nothing behind at all.
+    expect(fs.existsSync(path.join(repoDir, 'package.json'))).toBe(true);
+
+    const report = sweep();
+
+    expect(report.actions).toEqual([]);
+    expect(report.skipped.noManifestTrees).toBe(1);
+    expect(fs.readFileSync(path.join(repoDir, 'node_modules', 'left-pad', 'index.js'), 'utf8')).toBe('reinstallable');
+  });
+
+  it.each(['package-lock.json', 'pnpm-lock.yaml', 'yarn.lock', 'bun.lock'])(
+    'accepts %s as the recorded manifest',
+    (manifest) => {
+      const { repoDir } = makeTopic(`thread-5555555555555555555555555555555${manifest.length % 10}`, {
+        lockfile: false,
+      });
+      fs.writeFileSync(path.join(repoDir, manifest), 'pinned');
+
+      const report = sweep();
+
+      expect(report.actions.map((action) => action.path)).toEqual([path.join(repoDir, 'node_modules')]);
+      expect(report.skipped.noManifestTrees).toBe(0);
+    },
+  );
+
+  it('gates only node_modules on a manifest — the other names carry their own reproducer', () => {
+    const { repoDir } = makeTopic('thread-66666666666666666666666666666666', { lockfile: false });
+    // No lockfile anywhere, so node_modules is refused. .turbo is keyed by a
+    // hash of its inputs and __pycache__ is not importable without its .py, so
+    // neither needs an external file to prove it reconstructible.
+    fs.mkdirSync(path.join(repoDir, '.turbo'), { recursive: true });
+    fs.writeFileSync(path.join(repoDir, '.turbo', 'run.log'), 'task cache');
+    fs.mkdirSync(path.join(repoDir, 'src', '__pycache__'), { recursive: true });
+    fs.writeFileSync(path.join(repoDir, 'src', '__pycache__', 'app.cpython-312.pyc'), 'bytecode');
+
+    const report = sweep();
+
+    expect(report.actions.map((action) => action.path).sort()).toEqual(
+      [path.join(repoDir, '.turbo'), path.join(repoDir, 'src', '__pycache__')].sort(),
+    );
+    expect(report.skipped.noManifestTrees).toBe(1);
+    expect(fs.existsSync(path.join(repoDir, 'node_modules'))).toBe(true);
+  });
+
+  it('refuses at apply time when a container mounts the topic after collection', () => {
+    const { topicDir, repoDir } = makeTopic('thread-77777777777777777777777777777777');
+
+    const report = sweep({ mounts: mountsAppearingAfterCollection([path.join(topicDir, 'worktrees')]) });
+
+    // Planned against a clean snapshot, then refused by the re-check inside the
+    // cleanup claim. The container never acquired a storage activity lease, so
+    // the claim alone would not have noticed it.
+    expect(report.actions).toEqual([
+      expect.objectContaining({ path: path.join(repoDir, 'node_modules'), status: 'skipped' }),
+    ]);
+    expect(fs.readFileSync(path.join(repoDir, 'node_modules', 'left-pad', 'index.js'), 'utf8')).toBe('reinstallable');
+  });
+
+  it('refuses at apply time when the mount re-check itself fails', () => {
+    const { repoDir } = makeTopic('thread-88888888888888888888888888888888');
+
+    const report = sweep({ mounts: mountsAppearingAfterCollection(null) });
+
+    expect(report.actions).toEqual([
+      expect.objectContaining({ path: path.join(repoDir, 'node_modules'), status: 'skipped' }),
+    ]);
+    expect(fs.readFileSync(path.join(repoDir, 'node_modules', 'left-pad', 'index.js'), 'utf8')).toBe('reinstallable');
   });
 
   it('leaves a topic inside the idle window alone at the default 2-day clock', () => {

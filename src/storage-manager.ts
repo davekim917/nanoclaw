@@ -374,6 +374,8 @@ export interface StorageReport {
     liveTopics: number;
     /** Topics skipped because they are inside the regenerable sweep's idle window. */
     freshTopics: number;
+    /** Sweep candidates refused for want of a recorded manifest beside them. */
+    noManifestTrees: number;
     unreadableSessions: number;
     noActivitySessions: number;
     /** Eligible sessions left for a later pass by the per-tick budget. */
@@ -1942,14 +1944,60 @@ function collectThreadCacheActions(args: {
 }
 
 /**
+ * Is this candidate's content reconstructible from something on disk?
+ *
+ * THE INVARIANT THE WHOLE SWEEP RESTS ON, made checkable. Three review rounds
+ * removed one directory name each (dist/build/.next/coverage, then .venv, then
+ * node_modules was challenged) and each time the same property was being
+ * enforced one name later. A name list cannot express it: the property is
+ * per-INSTANCE, not per-name — the same `node_modules` is reproducible in a
+ * checkout that committed a lockfile and is unique state in one that did not.
+ * So it is asked per candidate instead.
+ *
+ * `node_modules` is a materialized tree whose reproducer is a SEPARATE file
+ * that may or may not exist, so it must be shown one. The other three names
+ * carry their own reproducer structurally and need no gate:
+ *
+ *   - `.pnpm-store` is content-addressed. Every entry is keyed by the integrity
+ *     hash of a published tarball, so it cannot hold anything authored here.
+ *   - `.turbo` is a task cache keyed by a hash of its inputs; a hit is by
+ *     definition equivalent to re-running the task that produced it.
+ *   - `__pycache__` is PEP 3147 bytecode, not importable without the adjacent
+ *     `.py` (verified on CPython 3.12), so it can never be the only copy.
+ *
+ * HONEST RESIDUAL: a lockfile proves a recorded state is reconstructible, not
+ * that the CURRENT tree is. Packages added by `npm install --no-save` are, by
+ * construction, unrecorded, and `npm ci` would drop them in CI too — they are a
+ * transient build input, not a work product. Closing even that would take a
+ * manifest-vs-tree diff per candidate, which is the per-target machinery this
+ * sweep exists to avoid.
+ *
+ * Deliberately NOT listed: `bun.lockb` and `npm-shrinkwrap.json`. Both are real
+ * lockfiles, but every name omitted here only ever preserves a tree, so the
+ * short list is the safe direction and widening it is a decision to take on
+ * purpose, not by drift.
+ */
+const NODE_MODULES_REPRODUCERS = ['package-lock.json', 'pnpm-lock.yaml', 'yarn.lock', 'bun.lock'];
+
+function hasRecordedReproducer(parentDir: string, name: string): boolean {
+  if (name !== 'node_modules') return true;
+  return NODE_MODULES_REPRODUCERS.some((manifest) => fs.existsSync(path.join(parentDir, manifest)));
+}
+
+/**
  * Regenerable trees directly under a topic worktree subtree.
  *
  * Returns symlinks as well as real directories. A `node_modules` can be a
  * symlink into a shared checkout, and the caller removes the LINK — the walk
  * never descends through one, so nothing outside the topic is ever reached.
  */
-function findRegenerableTargets(root: string): { target: string; targetType: 'directory' | 'symlink' }[] {
-  const found: { target: string; targetType: 'directory' | 'symlink' }[] = [];
+function findRegenerableTargets(root: string): {
+  targets: { target: string; targetType: 'directory' | 'symlink' }[];
+  /** Candidates refused for want of a recorded reproducer beside them. */
+  noManifest: number;
+} {
+  const targets: { target: string; targetType: 'directory' | 'symlink' }[] = [];
+  let noManifest = 0;
   const stack: string[] = [root];
   while (stack.length > 0) {
     const dir = stack.pop()!;
@@ -1957,10 +2005,18 @@ function findRegenerableTargets(root: string): { target: string; targetType: 'di
       const full = path.join(dir, entry.name);
       if (!isPathInside(root, full)) continue;
 
+      const admit = (targetType: 'directory' | 'symlink'): void => {
+        if (!hasRecordedReproducer(dir, entry.name)) {
+          noManifest += 1;
+          return;
+        }
+        targets.push({ target: full, targetType });
+      };
+
       // Dirents carry lstat semantics: a symlink to a directory reports
       // isSymbolicLink() and NOT isDirectory().
       if (entry.isSymbolicLink()) {
-        if (REGENERABLE_SWEEP_DIR_NAMES.has(entry.name)) found.push({ target: full, targetType: 'symlink' });
+        if (REGENERABLE_SWEEP_DIR_NAMES.has(entry.name)) admit('symlink');
         continue;
       }
       if (!entry.isDirectory()) continue;
@@ -1968,13 +2024,13 @@ function findRegenerableTargets(root: string): { target: string; targetType: 'di
       if (REGENERABLE_SWEEP_DIR_NAMES.has(entry.name)) {
         // Do not descend: the whole tree goes, and a nested node_modules inside
         // it would only be counted twice.
-        found.push({ target: full, targetType: 'directory' });
+        admit('directory');
         continue;
       }
       stack.push(full);
     }
   }
-  return found;
+  return { targets, noManifest };
 }
 
 /**
@@ -2039,6 +2095,23 @@ function pathsOverlap(a: string, b: string): boolean {
   const left = path.resolve(a);
   const right = path.resolve(b);
   return isPathInside(left, right) || isPathInside(right, left);
+}
+
+/**
+ * Ask the runtime again, right now, whether anything mounts this topic.
+ *
+ * Measured 2026-09-01: ~114ms per lookup against 6 running containers, and 243
+ * candidate trees exist across the whole of data/v2-topics — so a worst-case
+ * first sweep spends ~28s here and a steady-state pass spends almost nothing.
+ * That is affordable; a stale snapshot is not.
+ *
+ * A lookup that fails returns `false`: an unlistable runtime is a container we
+ * cannot see, and this is the last gate before a recursive delete.
+ */
+function topicIsUnmounted(topicDir: string, lookup: () => string[] | null): boolean {
+  const mounts = lookup();
+  if (mounts === null) return false;
+  return !mounts.some((mount) => pathsOverlap(topicDir, mount));
 }
 
 /**
@@ -2125,7 +2198,9 @@ function collectTopicRegenerableActions(args: {
         continue;
       }
 
-      for (const { target, targetType } of findRegenerableTargets(worktreeRoot)) {
+      const { targets, noManifest } = findRegenerableTargets(worktreeRoot);
+      args.skipped.noManifestTrees += noManifest;
+      for (const { target, targetType } of targets) {
         actions.push(
           createDeleteArtifactAction({
             id: `topic-regenerable:${key}:${path.relative(worktreeRoot, target)}`,
@@ -2133,13 +2208,19 @@ function collectTopicRegenerableActions(args: {
             target,
             root: worktreeRoot,
             estimatedBytes: targetType === 'symlink' ? 0 : dirSizeBytes(target),
-            reason: `topic worktree idle for at least ${idleDays}d — ${path.basename(target)} is regenerated from the lockfile`,
+            reason: `topic worktree idle for at least ${idleDays}d — ${path.basename(target)} is regenerated from a recorded manifest`,
             targetType,
             kind: 'sweep-regenerable-tree',
+            // Collection and apply are separated by the rest of the pass, which
+            // can be minutes. The pre-scan snapshot cannot see a container that
+            // started since, and an externally started one holds no storage
+            // activity lease for the cleanup claim to notice — so the runtime is
+            // asked again here, inside the claim, immediately before deletion.
+            canApply: () => topicIsUnmounted(topicDir, args.runningMounts),
             safety:
               targetType === 'symlink'
                 ? 'Symlinked dependency tree under an idle topic worktree; the link is unlinked and whatever it points at is never opened.'
-                : 'Dependency-install tree under an idle topic worktree, with no running container mounting the topic. Holds no work — it is reinstalled from package.json/lockfiles.',
+                : 'Dependency-install tree under an idle topic worktree with a recorded manifest beside it, re-proven unmounted by the container runtime immediately before deletion.',
           }),
         );
       }
@@ -2600,6 +2681,7 @@ function emptySkipped(): StorageReport['skipped'] {
     freshThreads: 0,
     liveTopics: 0,
     freshTopics: 0,
+    noManifestTrees: 0,
     unreadableSessions: 0,
     noActivitySessions: 0,
     budgetDeferredSessions: 0,
