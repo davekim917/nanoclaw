@@ -1018,7 +1018,7 @@ describe('host opens never create a session database', () => {
   // creator; no open may bring a file, or its parent directory, into existence.
 
   const roots: string[] = [];
-  const chmodBack: string[] = [];
+  const chmodBack: Array<[string, number]> = [];
 
   /** The post-reclaim shape exactly: the session directory itself is gone too. */
   function reclaimedSessionDir(): string {
@@ -1034,13 +1034,24 @@ describe('host opens never create a session database', () => {
     const dbPath = path.join(sessionDir, name);
     ensureSchema(dbPath, name === 'inbound.db' ? 'inbound' : 'outbound');
     fs.chmodSync(dbPath, 0o000);
-    chmodBack.push(dbPath);
+    chmodBack.push([dbPath, 0o600]);
+    return dbPath;
+  }
+
+  /** A real, schema-current DB inside a session directory that cannot be traversed. */
+  function dbInUnsearchableDir(name: 'inbound.db' | 'outbound.db'): string {
+    const sessionDir = reclaimedSessionDir();
+    fs.mkdirSync(sessionDir, { recursive: true });
+    const dbPath = path.join(sessionDir, name);
+    ensureSchema(dbPath, name === 'inbound.db' ? 'inbound' : 'outbound');
+    fs.chmodSync(sessionDir, 0o000);
+    chmodBack.push([sessionDir, 0o700]);
     return dbPath;
   }
 
   afterEach(() => {
-    // Restore first, or the recursive remove below cannot unlink a 000 file.
-    for (const dbPath of chmodBack.splice(0)) fs.chmodSync(dbPath, 0o600);
+    // Restore first, or the recursive remove below cannot traverse or unlink.
+    for (const [target, mode] of chmodBack.splice(0)) fs.chmodSync(target, mode);
     for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
   });
 
@@ -1131,6 +1142,36 @@ describe('host opens never create a session database', () => {
 
     expect(fs.existsSync(dbPath)).toBe(true);
     expect(fs.statSync(dbPath).size).toBe(sizeBefore);
+  });
+
+  it.skipIf(!notRoot)('an unreadable session DIRECTORY is not mistaken for a vanished session', () => {
+    // One level below the CANTOPEN trap and the same mistake: `fs.existsSync`
+    // returns false for ANY stat failure, EACCES on a parent directory that
+    // lost search permission included. The session is present — its DB is right
+    // there — so this must surface the real error and fail closed, not report a
+    // missing session that container-restart would then skip fencing.
+    const inboundPath = dbInUnsearchableDir('inbound.db');
+
+    let thrown: unknown;
+    try {
+      openInboundDb(inboundPath);
+    } catch (err) {
+      thrown = err;
+    }
+    expect(thrown).toBeInstanceOf(Error);
+    expect(thrown).not.toBeInstanceOf(SessionDbMissingError);
+    expect((thrown as { code?: string }).code).toBe('EACCES');
+
+    const outboundPath = dbInUnsearchableDir('outbound.db');
+    let outboundThrown: unknown;
+    try {
+      openOutboundDbWritable(outboundPath);
+    } catch (err) {
+      outboundThrown = err;
+    }
+    expect(outboundThrown).toBeInstanceOf(Error);
+    expect(outboundThrown).not.toBeInstanceOf(SessionDbMissingError);
+    expect((outboundThrown as { code?: string }).code).toBe('SQLITE_CANTOPEN');
   });
 
   it('a provisioned session still opens through both funnels', () => {
