@@ -34,6 +34,12 @@ import { EnvHttpProxyAgent, fetch as undiciFetch, type Dispatcher } from 'undici
 import { DATA_DIR } from '../config.js';
 import { getDb } from '../db/connection.js';
 import { log } from '../log.js';
+import {
+  anthropicCredentialHttpError,
+  callWithCredentialRotation,
+  listClaudeStructuredCredentialSlots,
+  type StructuredCredential,
+} from '../llm.js';
 
 export const CONCURRENCY_CAP = 3;
 export const COOLDOWN_HOURS = 1;
@@ -134,30 +140,20 @@ export function _getCooldownStateForTest(): { cooldownUntilMs: number; lastCoold
 }
 
 /**
- * Returns true when the host process has a viable path to Anthropic. Two
- * supported modes:
- *
- *   1. Direct API key — `ANTHROPIC_API_KEY` is set on the process.
- *   2. OneCLI gateway proxy — `HTTPS_PROXY` (or HTTP_PROXY) is set AND
- *      `CLAUDE_CODE_OAUTH_TOKEN` is non-empty. The gateway substitutes
- *      the literal "placeholder" Bearer with the vault token at request
- *      time. This is the production path; the systemd unit wires
- *      HTTPS_PROXY=http://127.0.0.1:10255 + CLAUDE_CODE_OAUTH_TOKEN
- *      =placeholder.
+ * Returns true when the host process has a viable path to Anthropic —
+ * ANY configured credential slot, not just the primary. Resolved through
+ * the same {@link listClaudeStructuredCredentialSlots} (src/llm.ts) that
+ * backs `callHaiku` and this sweep's own {@link callTitleBackend}, so
+ * "is a backend configured" and "which slot will actually be tried" can
+ * never drift apart — a stale slot 1 alone used to report "configured"
+ * here while the request path had 3 more slots it never tried.
  *
  * The test backend override is always considered configured so unit
  * tests don't need to set any env vars.
  */
 export function isBackendConfigured(): boolean {
   if (_backendOverride !== null) return true;
-  if (process.env['ANTHROPIC_API_KEY']) return true;
-  const hasProxy = !!(
-    process.env['HTTPS_PROXY'] ||
-    process.env['https_proxy'] ||
-    process.env['HTTP_PROXY'] ||
-    process.env['http_proxy']
-  );
-  return hasProxy && !!process.env['CLAUDE_CODE_OAUTH_TOKEN'];
+  return listClaudeStructuredCredentialSlots().length > 0;
 }
 
 // Lazy-init the proxy dispatcher on first use so tests do not inherit stale
@@ -182,24 +178,15 @@ export function _resetProxyDispatcherForTest(): void {
 
 let _missingBackendLogged = false;
 
-async function callTitleBackend(system: string, user: string, signal: AbortSignal): Promise<string> {
-  if (_backendOverride !== null) {
-    return await Promise.race([
-      _backendOverride(system, user),
-      new Promise<never>((_, reject) => {
-        if (signal.aborted) reject(new Error('aborted'));
-        signal.addEventListener('abort', () => reject(new Error('aborted')), { once: true });
-      }),
-    ]);
-  }
-
-  const directApiKey = process.env['ANTHROPIC_API_KEY'] ?? '';
-  const oauthToken = process.env['CLAUDE_CODE_OAUTH_TOKEN'] ?? '';
-  const useOauth = !directApiKey && oauthToken;
-  if (!directApiKey && !useOauth) {
-    throw new Error('session-title: no Anthropic credentials available');
-  }
-
+/**
+ * One request against a single resolved credential — the request-builder
+ * callback {@link callWithCredentialRotation} (src/llm.ts) needs, since this
+ * sweep's request shape (system + user messages, its own model/token
+ * settings, its own per-attempt timeout) differs from `callHaiku`'s fixed
+ * prompt shape. Rotation/retry policy does NOT live here — see
+ * {@link callTitleBackend}.
+ */
+async function callTitleBackendOnce(system: string, user: string, credential: StructuredCredential): Promise<string> {
   const baseUrl = process.env['ANTHROPIC_BASE_URL'] ?? 'https://api.anthropic.com';
   const model = process.env['NANOCLAW_SESSION_TITLE_MODEL'] ?? DEFAULT_MODEL;
 
@@ -215,34 +202,70 @@ async function callTitleBackend(system: string, user: string, signal: AbortSigna
         ) as unknown as Promise<Response>
     : fetch;
 
-  const authHeaders: Record<string, string> = useOauth
-    ? { authorization: `Bearer ${oauthToken}`, 'anthropic-beta': 'oauth-2025-04-20' }
-    : { 'x-api-key': directApiKey };
-
-  const resp = await fetchImpl(`${baseUrl}/v1/messages`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      ...authHeaders,
-      'anthropic-version': '2023-06-01',
-    },
-    body: JSON.stringify({
-      model,
-      max_tokens: 80,
-      temperature: 0,
-      system,
-      messages: [{ role: 'user', content: user }],
-    }),
-    signal,
-  });
-  if (!resp.ok) {
-    const err = new Error(`session-title: Anthropic returned ${resp.status}`) as Error & { status?: number };
-    err.status = resp.status;
-    throw err;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), HAIKU_TIMEOUT_MS);
+  try {
+    const resp = await fetchImpl(`${baseUrl}/v1/messages`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...credential.headers,
+        'anthropic-version': '2023-06-01',
+      },
+      body: JSON.stringify({
+        model,
+        max_tokens: 80,
+        temperature: 0,
+        system,
+        messages: [{ role: 'user', content: user }],
+      }),
+      signal: controller.signal,
+    });
+    if (!resp.ok) {
+      throw await anthropicCredentialHttpError(resp);
+    }
+    const data = (await resp.json()) as { content?: Array<{ type: string; text: string }> };
+    return data.content?.find((c) => c.type === 'text')?.text ?? '';
+  } finally {
+    clearTimeout(timer);
   }
-  const data = (await resp.json()) as { content?: Array<{ type: string; text: string }> };
-  const text = data.content?.find((c) => c.type === 'text')?.text ?? '';
-  return text;
+}
+
+/**
+ * Generate one title. The test override bypasses credential resolution and
+ * rotation entirely — a single direct call, raced against its own timeout —
+ * so unit tests stay deterministic without touching real credentials.
+ *
+ * The production path rotates across every configured Anthropic credential
+ * slot via {@link callWithCredentialRotation} (src/llm.ts) — the SAME
+ * rotation policy `callHaiku` uses, rather than a second copy pinned to the
+ * primary slot. Previously this only ever tried
+ * `process.env['CLAUDE_CODE_OAUTH_TOKEN']` (slot 1), so once that slot's
+ * quota was exhausted this sweep 429'd forever while slots 2-4 sat unused.
+ */
+async function callTitleBackend(system: string, user: string): Promise<string> {
+  if (_backendOverride !== null) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), HAIKU_TIMEOUT_MS);
+    try {
+      return await Promise.race([
+        _backendOverride(system, user),
+        new Promise<never>((_, reject) => {
+          if (controller.signal.aborted) reject(new Error('aborted'));
+          controller.signal.addEventListener('abort', () => reject(new Error('aborted')), { once: true });
+        }),
+      ]);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  const { value } = await callWithCredentialRotation({
+    attempt: (credential) => callTitleBackendOnce(system, user, credential),
+    logLabel: 'session-title',
+    noCredentialsMessage: 'session-title: no Anthropic credentials available',
+  });
+  return value;
 }
 
 /**
@@ -546,10 +569,13 @@ async function _runSessionTitleSweepLocked(): Promise<{ generated: number; skipp
     }
     tasks.push(
       (async (): Promise<TaskOutcome> => {
-        const controller = new AbortController();
-        const timer = setTimeout(() => controller.abort(), HAIKU_TIMEOUT_MS);
         try {
-          const raw = await callTitleBackend(SYSTEM_PROMPT, slice.text, controller.signal);
+          // Timeout/abort is per-attempt inside callTitleBackend now — a
+          // credential rotation may make several attempts across several
+          // slots, and each needs its own fresh timeout budget rather than
+          // sharing one controller across all of them (see
+          // callTitleBackendOnce).
+          const raw = await callTitleBackend(SYSTEM_PROMPT, slice.text);
           const title = postProcessTitle(raw);
           if (!title) {
             skipped++;
@@ -571,8 +597,6 @@ async function _runSessionTitleSweepLocked(): Promise<{ generated: number; skipp
             transient: isTransientBackendFailure(err),
             errMessage: err instanceof Error ? err.message : String(err),
           };
-        } finally {
-          clearTimeout(timer);
         }
       })(),
     );
@@ -659,7 +683,22 @@ function logFailuresWithBreaker(outcomes: TaskOutcome[]): boolean {
   return tripped;
 }
 
-/** 429/529/timeout/network-blip — same transient classification as callHaiku's (src/llm.ts). */
+/**
+ * 429/529/timeout/network-blip — used only to decide whether a FINAL,
+ * all-slots-exhausted failure counts toward the circuit breaker's
+ * consecutive-failure run (see {@link logFailuresWithBreaker}) and cooldown
+ * escalation above. This is coarser than — and serves a different purpose
+ * from — `classifyCredentialFailure` in src/llm.ts: by the time an error
+ * reaches here, {@link callWithCredentialRotation} has already rotated
+ * across every configured credential slot for quota-exhaustion 429s and
+ * backed off in place for transient ones, so a 429 surfacing here means
+ * EVERY slot was tried and still failed — "the backend is in real
+ * distress" either way. It intentionally does NOT distinguish
+ * transient-vs-quota-exhausted the way llm.ts's rotation loop does; that
+ * split is retry/rotation policy, this one is breaker/log-volume policy,
+ * and conflating the two here would just be a second copy of the same
+ * concern living in the wrong layer.
+ */
 function isTransientBackendFailure(err: unknown): boolean {
   const status = (err as { status?: number }).status;
   return status === 429 || status === 529 || (err as Error).name === 'AbortError' || !status;

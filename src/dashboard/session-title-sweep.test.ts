@@ -17,7 +17,19 @@ vi.mock('../config.js', () => ({
   },
 }));
 
+// isBackendConfigured() and callTitleBackend()'s production path now resolve
+// credentials the same way src/llm.ts's callHaiku does — including merging
+// in `.env`-file values via readEnvFileMatching() whenever passed
+// process.env directly (see src/llm.test.ts for the same stub, for the same
+// reason: this repo's real on-disk `.env` holds real OAuth tokens, and tests
+// must never read them). Credential slots for the tests below come
+// exclusively from process.env, set explicitly per test.
+vi.mock('../env.js', () => ({
+  readEnvFileMatching: vi.fn(() => ({})),
+}));
+
 import Database from 'better-sqlite3';
+import { __resetCallHaikuSlotCacheForTest } from '../llm.js';
 import {
   runSessionTitleSweep,
   setTitleBackendForTest,
@@ -32,6 +44,41 @@ import {
 function now(): string {
   return new Date().toISOString();
 }
+
+function jsonResponse(body: unknown, init: { status?: number; headers?: Record<string, string> } = {}): Response {
+  return new Response(JSON.stringify(body), {
+    status: init.status ?? 200,
+    headers: { 'Content-Type': 'application/json', ...(init.headers ?? {}) },
+  });
+}
+
+function authHeader(call: unknown[]): string | undefined {
+  const init = call[1] as { headers?: Record<string, string> } | undefined;
+  return init?.headers?.authorization;
+}
+
+/**
+ * Credential/proxy env vars that isBackendConfigured() and callTitleBackend()
+ * resolve through when no test override is set. Most tests in this file use
+ * setTitleBackendForTest() and never reach this resolution at all, but the
+ * "no backend configured" and credential-rotation tests below deliberately
+ * exercise the real production path — those must never inherit this shell's
+ * ambient CLAUDE_CODE_OAUTH_TOKEN/HTTPS_PROXY (both of which are set on a
+ * live NanoClaw host).
+ */
+const CREDENTIAL_ENV_KEYS = [
+  'ANTHROPIC_API_KEY',
+  'CLAUDE_CODE_OAUTH_TOKEN',
+  'CLAUDE_CODE_OAUTH_TOKEN_2',
+  'CLAUDE_CODE_OAUTH_TOKEN_3',
+  'CLAUDE_CODE_OAUTH_TOKEN_4',
+  'HTTPS_PROXY',
+  'https_proxy',
+  'HTTP_PROXY',
+  'http_proxy',
+] as const;
+
+let originalCredentialEnv: Partial<Record<(typeof CREDENTIAL_ENV_KEYS)[number], string>>;
 
 function setupDb(): void {
   const db = initTestDb();
@@ -111,6 +158,16 @@ beforeEach(() => {
   TMP_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'session-title-'));
   setupDb();
   seedAgentGroup('ag-1');
+
+  originalCredentialEnv = {};
+  for (const key of CREDENTIAL_ENV_KEYS) {
+    originalCredentialEnv[key] = process.env[key];
+    delete process.env[key];
+  }
+  // Shared "which credential slot is alive" cache lives in src/llm.ts and is
+  // process-wide by design (see callWithCredentialRotation) — reset it so
+  // tests don't inherit a sticky slot from an earlier test in this file.
+  __resetCallHaikuSlotCacheForTest();
 });
 
 afterEach(() => {
@@ -126,6 +183,12 @@ afterEach(() => {
   // the same spy (and its accumulated call history) alive into later tests.
   vi.restoreAllMocks();
   vi.useRealTimers();
+  for (const key of CREDENTIAL_ENV_KEYS) {
+    const original = originalCredentialEnv[key];
+    if (original === undefined) delete process.env[key];
+    else process.env[key] = original;
+  }
+  __resetCallHaikuSlotCacheForTest();
 });
 
 describe('postProcessTitle', () => {
@@ -347,6 +410,82 @@ describe('runSessionTitleSweep', () => {
     );
     expect(breakerWarns.length).toBe(0);
     expect(perCandidateWarns.length).toBe(1);
+  });
+
+  describe('production credential rotation (real callTitleBackend, no test override)', () => {
+    // These tests exercise the ACTUAL production path — isBackendConfigured()
+    // and callTitleBackend()'s real HTTP call through src/llm.ts's
+    // callWithCredentialRotation — rather than setTitleBackendForTest()'s
+    // stub. That is the path that used to pin to
+    // process.env.CLAUDE_CODE_OAUTH_TOKEN (slot 1) with no rotation, so it
+    // 429'd forever on an exhausted primary credential while slots 2-4 sat
+    // unused. beforeEach() above already strips ambient credential/proxy env
+    // and mocks readEnvFileMatching() so this never touches a real token.
+    let fetchMock: ReturnType<typeof vi.fn>;
+
+    beforeEach(() => {
+      fetchMock = vi.fn();
+      vi.stubGlobal('fetch', fetchMock);
+      process.env.CLAUDE_CODE_OAUTH_TOKEN = 'oauth-slot-1-token';
+      process.env.CLAUDE_CODE_OAUTH_TOKEN_2 = 'oauth-slot-2-token';
+    });
+
+    afterEach(() => {
+      vi.unstubAllGlobals();
+    });
+
+    it('rotates to a second credential slot on a quota-exhaustion 429 instead of tripping the breaker', async () => {
+      seedSession('sess-rotate', 'ag-1');
+      writeInboundMessages('ag-1', 'sess-rotate', [
+        { kind: 'chat', content: JSON.stringify({ text: 'fix the rollout for EXAMPLE-71' }) },
+      ]);
+
+      // Slot 1: quota-exhaustion 429 (no retry-after — the shape that needs
+      // rotation, not backoff). Slot 2: succeeds.
+      fetchMock
+        .mockResolvedValueOnce(jsonResponse({ error: { type: 'rate_limit_error' } }, { status: 429 }))
+        .mockResolvedValueOnce(jsonResponse({ content: [{ type: 'text', text: 'EXAMPLE-71 rollout fix' }] }));
+
+      const warnSpy = vi.spyOn(log, 'warn');
+
+      const result = await runSessionTitleSweep();
+
+      expect(result.generated).toBe(1);
+      expect(result.skipped).toBe(0);
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect(authHeader(fetchMock.mock.calls[0])).toBe('Bearer oauth-slot-1-token');
+      expect(authHeader(fetchMock.mock.calls[1])).toBe('Bearer oauth-slot-2-token');
+
+      // Rotation absorbed the 429 at the request layer — the breaker/cooldown
+      // (a DIFFERENT, coarser mechanism for when every slot is exhausted)
+      // never engaged.
+      const breakerWarns = warnSpy.mock.calls.filter(([msg]) => String(msg).includes('circuit breaker'));
+      const cooldownWarns = warnSpy.mock.calls.filter(([msg]) => String(msg).includes('cooldown engaged'));
+      expect(breakerWarns.length).toBe(0);
+      expect(cooldownWarns.length).toBe(0);
+
+      const row = getDb().prepare('SELECT title FROM sessions WHERE id = ?').get('sess-rotate') as {
+        title: string | null;
+      };
+      expect(row.title).toBe('EXAMPLE-71 rollout fix');
+    });
+
+    it('isBackendConfigured() reports true from a non-primary slot alone', async () => {
+      delete process.env.CLAUDE_CODE_OAUTH_TOKEN;
+      // Only slot 2 configured — the old primary-only check would have
+      // reported "not configured" here and made the sweep a no-op.
+      process.env.CLAUDE_CODE_OAUTH_TOKEN_2 = 'oauth-slot-2-token';
+
+      seedSession('sess-slot2-only', 'ag-1');
+      writeInboundMessages('ag-1', 'sess-slot2-only', [{ kind: 'chat', content: '{"text":"hello"}' }]);
+      fetchMock.mockResolvedValueOnce(jsonResponse({ content: [{ type: 'text', text: 'slot 2 title' }] }));
+
+      const result = await runSessionTitleSweep();
+
+      expect(result.generated).toBe(1);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(authHeader(fetchMock.mock.calls[0])).toBe('Bearer oauth-slot-2-token');
+    });
   });
 
   describe('circuit breaker cooldown (sweep-level — the part that actually cuts call volume)', () => {

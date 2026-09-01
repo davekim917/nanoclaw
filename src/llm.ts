@@ -64,7 +64,13 @@ export interface ClaudeStructuredResult<T> {
 
 export type ClaudeFetch = (url: string, init: RequestInit) => Promise<Response>;
 
-interface StructuredCredential {
+/**
+ * Exported so other host-side Anthropic callers (e.g.
+ * `src/dashboard/session-title-sweep.ts`) can type the credential their
+ * {@link callWithCredentialRotation} `attempt` callback receives, without
+ * re-deriving credential shape themselves.
+ */
+export interface StructuredCredential {
   slot: ClaudeCredentialSlot;
   headers: Record<string, string>;
   authEnv: {
@@ -417,19 +423,31 @@ export async function callClaudeCliStructured<T>(
   };
 }
 
-async function claudeHttpError(response: Response): Promise<ClaudeStructuredHttpError> {
-  let providerErrorType: string | null = null;
-  let providerMessage: string | null = null;
+/**
+ * Anthropic error responses are `{ error: { type, message } }`. Shared by
+ * {@link claudeHttpError} and {@link anthropicCredentialHttpError} — a
+ * non-JSON body still leaves status, retry timing, and request id to make
+ * the failure actionable.
+ */
+async function parseAnthropicErrorBody(
+  response: Response,
+): Promise<{ providerErrorType: string | null; providerMessage: string | null }> {
   try {
     const body = (await response.json()) as {
       error?: { type?: unknown; message?: unknown };
     };
-    providerErrorType = typeof body.error?.type === 'string' ? body.error.type : null;
-    providerMessage = typeof body.error?.message === 'string' ? body.error.message : null;
+    return {
+      providerErrorType: typeof body.error?.type === 'string' ? body.error.type : null,
+      providerMessage: typeof body.error?.message === 'string' ? body.error.message : null,
+    };
   } catch (error) {
     if (!(error instanceof SyntaxError)) throw error;
-    // Status, retry timing, and request id still make a non-JSON failure actionable.
+    return { providerErrorType: null, providerMessage: null };
   }
+}
+
+async function claudeHttpError(response: Response): Promise<ClaudeStructuredHttpError> {
+  const { providerErrorType, providerMessage } = await parseAnthropicErrorBody(response);
   return new ClaudeStructuredHttpError(response.status, parseRetryAfterMs(response.headers.get('retry-after')), {
     providerErrorType,
     providerMessage,
@@ -543,25 +561,42 @@ export async function callClaudeStructured<T>(
 export class CallHaikuHttpError extends Error {
   readonly status: number;
   readonly retryAfterMs: number | null;
+  readonly providerMessage: string | null;
 
-  constructor(status: number, retryAfterMs: number | null) {
+  constructor(status: number, retryAfterMs: number | null, providerMessage: string | null = null) {
     super(`callHaiku: Anthropic returned ${status}`);
     this.name = 'CallHaikuHttpError';
     this.status = status;
     this.retryAfterMs = retryAfterMs;
+    this.providerMessage = providerMessage;
   }
 }
 
-async function callHaikuOnce(prompt: string, timeoutMs: number): Promise<string> {
+/**
+ * Builds a {@link CallHaikuHttpError} from a non-ok Anthropic response.
+ * Shared by every single-credential Anthropic-messages caller that plugs
+ * into {@link callWithCredentialRotation} — `callHaikuOnce` below and
+ * `session-title-sweep.ts`'s `callTitleBackendOnce` — so a 429's
+ * retry-after/provider-message shape is parsed identically everywhere
+ * {@link classifyCredentialFailure} needs to read it.
+ */
+export async function anthropicCredentialHttpError(response: Response): Promise<CallHaikuHttpError> {
+  const { providerMessage } = await parseAnthropicErrorBody(response);
+  return new CallHaikuHttpError(
+    response.status,
+    parseRetryAfterMs(response.headers.get('retry-after')),
+    providerMessage,
+  );
+}
+
+/**
+ * Single request against one resolved credential. No retry/rotation policy
+ * lives here — that's {@link callHaiku}'s job. Uses the same slot vocabulary,
+ * placeholder filtering, and `.env`-file merging as {@link callClaudeStructured}
+ * via the `credential` the caller resolved through {@link structuredCredentials}.
+ */
+async function callHaikuOnce(prompt: string, timeoutMs: number, credential: StructuredCredential): Promise<string> {
   const baseUrl = process.env['ANTHROPIC_BASE_URL'] ?? 'https://api.anthropic.com';
-  const directApiKey = process.env['ANTHROPIC_API_KEY'] ?? '';
-  const oauthToken = process.env['CLAUDE_CODE_OAUTH_TOKEN'] ?? '';
-  const useOauth = !directApiKey && oauthToken;
-  if (!directApiKey && !useOauth) {
-    throw new Error(
-      'callHaiku: no Anthropic credentials (set ANTHROPIC_API_KEY or wire HTTPS_PROXY + CLAUDE_CODE_OAUTH_TOKEN)',
-    );
-  }
 
   const dispatcher = getProxyDispatcher();
   const fetchImpl: typeof fetch = dispatcher
@@ -572,16 +607,12 @@ async function callHaikuOnce(prompt: string, timeoutMs: number): Promise<string>
         ) as unknown as Promise<Response>
     : fetch;
 
-  const authHeaders: Record<string, string> = useOauth
-    ? { authorization: `Bearer ${oauthToken}`, 'anthropic-beta': 'oauth-2025-04-20' }
-    : { 'x-api-key': directApiKey };
-
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
     const resp = await fetchImpl(`${baseUrl}/v1/messages`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', ...authHeaders, 'anthropic-version': '2023-06-01' },
+      headers: { 'Content-Type': 'application/json', ...credential.headers, 'anthropic-version': '2023-06-01' },
       body: JSON.stringify({
         model: HAIKU_MODEL,
         max_tokens: 80,
@@ -591,8 +622,7 @@ async function callHaikuOnce(prompt: string, timeoutMs: number): Promise<string>
       signal: controller.signal,
     });
     if (!resp.ok) {
-      const err = new CallHaikuHttpError(resp.status, parseRetryAfterMs(resp.headers.get('retry-after')));
-      throw err;
+      throw await anthropicCredentialHttpError(resp);
     }
     const data = (await resp.json()) as { content?: Array<{ type: string; text?: string }> };
     return (data.content?.find((c) => c.type === 'text')?.text ?? '').trim();
@@ -601,65 +631,217 @@ async function callHaikuOnce(prompt: string, timeoutMs: number): Promise<string>
   }
 }
 
-/** Bounded number of attempts + backoff for {@link callHaiku}. See its docstring. */
-const CALL_HAIKU_MAX_ATTEMPTS = 4;
-const CALL_HAIKU_BACKOFF_BASE_MS = 1000;
-const CALL_HAIKU_BACKOFF_CAP_MS = 15_000;
+/**
+ * Bounded per-slot attempts + backoff shared by every
+ * {@link callWithCredentialRotation} caller (`callHaiku` below and
+ * `session-title-sweep.ts`'s title generation).
+ */
+const CREDENTIAL_ROTATION_MAX_ATTEMPTS_PER_SLOT = 4;
+const CREDENTIAL_ROTATION_BACKOFF_BASE_MS = 1000;
+const CREDENTIAL_ROTATION_BACKOFF_CAP_MS = 15_000;
+
+/**
+ * How long a slot stays "sticky" (tried first) after it last succeeded.
+ * After this, rotation resets to the front of the configured list so a
+ * recovered slot 1 gets used again — subscription quotas refill on a
+ * schedule, they aren't permanently dead.
+ */
+const CREDENTIAL_ROTATION_STICKY_MS = 30 * 60 * 1000;
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function isTransientCallHaikuFailure(err: unknown): boolean {
+/**
+ * Two failure classes with opposite cures — conflating them is what let
+ * slot 1's exhausted quota wedge every host utility call indefinitely while
+ * three healthy credentials sat unused:
+ *
+ *  - `transient`: the backend itself is busy (529, network blip, an aborted/
+ *    timed-out request, or a 429 that carries a `retry-after`). Every
+ *    credential hits the same busy backend, so rotating is useless — back
+ *    off and retry the SAME slot.
+ *  - `quota-exhausted`: this credential specifically is out of quota (a 429
+ *    with no `retry-after` at all — the shape Anthropic actually returns for
+ *    this — or a body that says so explicitly). Backing off here just delays
+ *    the inevitable; rotate to the next slot immediately instead.
+ *  - `fatal`: anything else (4xx that isn't a rate limit, etc.) — no amount
+ *    of retrying or rotating helps.
+ *
+ * This is {@link callWithCredentialRotation}'s default classifier — every
+ * caller gets the same cure for the same failure shape unless it has a
+ * genuinely different failure vocabulary to classify.
+ */
+type CredentialFailureClass = 'transient' | 'quota-exhausted' | 'fatal';
+
+const QUOTA_EXHAUSTED_BODY_RE = /usage limit|quota exceeded|exceeded your (?:usage|spend(?:ing)?|token|credit) limit/i;
+
+function classifyCredentialFailure(err: unknown): CredentialFailureClass {
   const status = (err as { status?: number }).status;
-  return status === 429 || status === 529 || (err as Error).name === 'AbortError' || !status;
+  const name = (err as Error).name;
+  if (name === 'AbortError' || !status || status === 529) return 'transient';
+  if (status === 429) {
+    const providerMessage = (err as { providerMessage?: string | null }).providerMessage;
+    if (providerMessage && QUOTA_EXHAUSTED_BODY_RE.test(providerMessage)) return 'quota-exhausted';
+    const retryAfterMs = (err as { retryAfterMs?: number | null }).retryAfterMs;
+    return retryAfterMs != null ? 'transient' : 'quota-exhausted';
+  }
+  return 'fatal';
 }
 
 /**
- * Call Haiku with up to {@link CALL_HAIKU_MAX_ATTEMPTS} attempts on transient
- * failures (HTTP 429/529 or an aborted/timed-out/network blip).
- *
- * Previously this retried exactly once, immediately — both attempts landed
- * in the same 429 window under real rate-limit pressure, silently losing the
- * result forever (this is what caused thread titles to vanish; see
- * src/topic-title.ts and migration 062 for the durable fix on that side).
- *
- * Backoff honors the provider's `retry-after` header when present (capped at
- * {@link CALL_HAIKU_BACKOFF_CAP_MS}); otherwise capped-exponential with up to
- * 20% jitter, base {@link CALL_HAIKU_BACKOFF_BASE_MS}. Title generation and
- * the title sweep are background work, so added latency is fine — the
- * backoff-only budget across all retries is bounded at roughly 30s worst
- * case (a full-timeout hang on every attempt is a separate, orthogonal bound
- * governed by `timeoutMs` × attempts).
- *
- * Non-transient errors still throw immediately — no point retrying a 4xx
- * that isn't a rate limit.
+ * Last credential slot that answered successfully, and when — see
+ * {@link CREDENTIAL_ROTATION_STICKY_MS}. Deliberately module-level (not
+ * per-caller): "which credential is alive" is one concern shared by every
+ * {@link callWithCredentialRotation} caller in this process, not a fact
+ * `callHaiku` and the session-title sweep should each rediscover on their
+ * own against the same underlying quota.
  */
-export async function callHaiku(prompt: string, timeoutMs = 15_000): Promise<string> {
+let lastGoodCredentialSlot: ClaudeCredentialSlot | null = null;
+let lastGoodCredentialSlotAt = 0;
+
+/** Test hook — clears the sticky-slot cache so each test starts from the front of the list. */
+export function __resetCallHaikuSlotCacheForTest(): void {
+  lastGoodCredentialSlot = null;
+  lastGoodCredentialSlotAt = 0;
+}
+
+/**
+ * Order credentials starting from the last-known-good slot (wrapping
+ * around) so a call doesn't re-fail through an already-exhausted slot 1 on
+ * every single invocation. Falls back to the configured order when there's
+ * no sticky slot, the sticky slot has aged out, or it's no longer present
+ * in the resolved credential list.
+ */
+function orderCredentialsFromLastGood(credentials: StructuredCredential[], now: number): StructuredCredential[] {
+  if (lastGoodCredentialSlot !== null && now - lastGoodCredentialSlotAt >= CREDENTIAL_ROTATION_STICKY_MS) {
+    lastGoodCredentialSlot = null;
+  }
+  if (lastGoodCredentialSlot === null) return credentials;
+  const stickyIndex = credentials.findIndex((credential) => credential.slot === lastGoodCredentialSlot);
+  if (stickyIndex <= 0) return credentials;
+  return [...credentials.slice(stickyIndex), ...credentials.slice(0, stickyIndex)];
+}
+
+/**
+ * Run `attempt` against every configured Anthropic credential slot
+ * (`CLAUDE_CODE_OAUTH_TOKEN[_2..4]` / `ANTHROPIC_API_KEY`, resolved via the
+ * same {@link structuredCredentials} the structured Claude path uses) rather
+ * than pinning to whichever slot the caller happened to read first.
+ *
+ * This is the ONE place the credential-rotation policy lives — every host
+ * caller that talks to Anthropic through a rotatable credential list
+ * (`callHaiku` below, and `session-title-sweep.ts`'s title generation) goes
+ * through this function rather than each keeping its own copy. A second
+ * copy of this loop is exactly what let slot 1's exhausted quota wedge one
+ * caller forever while another had already rotated past it.
+ *
+ * `attempt` performs ONE request against a single resolved credential and
+ * should reject on failure. Failures are classified by `classify` (default
+ * {@link classifyCredentialFailure}) into two classes with opposite cures:
+ * transient/server-overload backs off and retries the SAME slot (up to
+ * {@link CREDENTIAL_ROTATION_MAX_ATTEMPTS_PER_SLOT} attempts, honoring
+ * `retry-after` when present, otherwise capped-exponential with up to 20%
+ * jitter); quota-exhaustion rotates to the NEXT slot immediately with no
+ * sleep. Only after every slot is exhausted does this throw — the last
+ * error seen. The last slot to succeed is cached (see
+ * {@link orderCredentialsFromLastGood}) so the next call — from ANY caller —
+ * starts there instead of re-failing through slot 1 first.
+ *
+ * Fatal (non-transient, non-quota) errors throw immediately — no point
+ * retrying or rotating on a 4xx that isn't a rate limit.
+ *
+ * `logLabel` prefixes log lines so they're attributable to the calling
+ * module; only the credential's `slot` name (e.g. `oauth:2`) is ever
+ * logged, never a token value.
+ */
+export async function callWithCredentialRotation<T>(options: {
+  attempt: (credential: StructuredCredential) => Promise<T>;
+  logLabel: string;
+  noCredentialsMessage: string;
+  classify?: (err: unknown) => CredentialFailureClass;
+  env?: NodeJS.ProcessEnv;
+  envFile?: Record<string, string>;
+}): Promise<{ value: T; slot: ClaudeCredentialSlot }> {
+  const env = options.env ?? process.env;
+  const envFile = options.envFile ?? defaultStructuredCredentialEnvFile(env);
+  const classify = options.classify ?? classifyCredentialFailure;
+  const credentials = structuredCredentials(env, envFile);
+  if (credentials.length === 0) {
+    throw new Error(options.noCredentialsMessage);
+  }
+  const ordered = orderCredentialsFromLastGood(credentials, Date.now());
+
   let lastErr: unknown;
-  for (let attempt = 1; attempt <= CALL_HAIKU_MAX_ATTEMPTS; attempt++) {
-    try {
-      return await callHaikuOnce(prompt, timeoutMs);
-    } catch (err) {
-      lastErr = err;
-      if (!isTransientCallHaikuFailure(err) || attempt === CALL_HAIKU_MAX_ATTEMPTS) throw err;
-      const retryAfterMs = (err as { retryAfterMs?: number | null }).retryAfterMs;
-      const backoff =
-        retryAfterMs != null
-          ? Math.min(retryAfterMs, CALL_HAIKU_BACKOFF_CAP_MS)
-          : Math.min(CALL_HAIKU_BACKOFF_CAP_MS, CALL_HAIKU_BACKOFF_BASE_MS * 2 ** (attempt - 1));
-      const delayMs = Math.round(backoff + Math.random() * backoff * 0.2);
-      log.debug('callHaiku: transient failure, backing off', {
-        attempt,
-        status: (err as { status?: number }).status,
-        name: (err as Error).name,
-        retryAfterMs,
-        delayMs,
-      });
-      await sleep(delayMs);
+  for (let slotPos = 0; slotPos < ordered.length; slotPos++) {
+    const credential = ordered[slotPos]!;
+    for (let attempt = 1; attempt <= CREDENTIAL_ROTATION_MAX_ATTEMPTS_PER_SLOT; attempt++) {
+      try {
+        const value = await options.attempt(credential);
+        lastGoodCredentialSlot = credential.slot;
+        lastGoodCredentialSlotAt = Date.now();
+        return { value, slot: credential.slot };
+      } catch (err) {
+        lastErr = err;
+        const failureClass = classify(err);
+        if (failureClass === 'fatal') throw err;
+
+        if (failureClass === 'quota-exhausted') {
+          log.warn(`${options.logLabel}: credential slot quota exhausted, rotating`, {
+            fromSlot: credential.slot,
+            toSlot: ordered[slotPos + 1]?.slot ?? null,
+            status: (err as { status?: number }).status,
+          });
+          break; // next slot immediately — no backoff, quota won't recover by waiting
+        }
+
+        // transient: back off and retry the SAME slot.
+        if (attempt === CREDENTIAL_ROTATION_MAX_ATTEMPTS_PER_SLOT) {
+          log.warn(`${options.logLabel}: slot exhausted its transient-retry budget, trying next slot`, {
+            slot: credential.slot,
+            nextSlot: ordered[slotPos + 1]?.slot ?? null,
+            status: (err as { status?: number }).status,
+          });
+          break;
+        }
+        const retryAfterMs = (err as { retryAfterMs?: number | null }).retryAfterMs;
+        const backoff =
+          retryAfterMs != null
+            ? Math.min(retryAfterMs, CREDENTIAL_ROTATION_BACKOFF_CAP_MS)
+            : Math.min(CREDENTIAL_ROTATION_BACKOFF_CAP_MS, CREDENTIAL_ROTATION_BACKOFF_BASE_MS * 2 ** (attempt - 1));
+        const delayMs = Math.round(backoff + Math.random() * backoff * 0.2);
+        log.debug(`${options.logLabel}: transient failure, backing off`, {
+          slot: credential.slot,
+          attempt,
+          status: (err as { status?: number }).status,
+          name: (err as Error).name,
+          retryAfterMs,
+          delayMs,
+        });
+        await sleep(delayMs);
+      }
     }
   }
-  // Unreachable — the loop always returns or throws — but keeps TypeScript's
-  // control-flow analysis happy without an `as never` cast.
   throw lastErr;
+}
+
+/**
+ * Call Haiku, rotating across every configured Anthropic credential slot via
+ * {@link callWithCredentialRotation} rather than pinning to slot 1.
+ *
+ * Previously this retried up to {@link CREDENTIAL_ROTATION_MAX_ATTEMPTS_PER_SLOT}
+ * times against a single credential read straight off `process.env`. That
+ * silently lost titles under sustained rate-limit pressure (both attempts
+ * landing in the same 429 window — see src/topic-title.ts and migration 062
+ * for the durable fix on that side) — and once slot 1's quota was actually
+ * exhausted, it failed forever while other configured credentials sat idle.
+ */
+export async function callHaiku(prompt: string, timeoutMs = 15_000): Promise<string> {
+  const { value } = await callWithCredentialRotation({
+    attempt: (credential) => callHaikuOnce(prompt, timeoutMs, credential),
+    logLabel: 'callHaiku',
+    noCredentialsMessage:
+      'callHaiku: no Anthropic credentials configured (set ANTHROPIC_API_KEY or a CLAUDE_CODE_OAUTH_TOKEN slot)',
+  });
+  return value;
 }
