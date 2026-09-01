@@ -2534,13 +2534,14 @@ describe('storage-manager regenerable tree sweep', () => {
     );
   });
 
+  // Every name here is on ARCHIVE_EXCLUDED_DIR_NAMES and deliberately NOT on
+  // REGENERABLE_SWEEP_DIR_NAMES. Not archiving a tree is a very different claim
+  // from being allowed to delete the only copy of it.
+  const NEVER_SWEPT = ['dist', 'build', '.next', 'coverage', '.cache'];
+
   it('never sweeps build output directories, only dependency-install output', () => {
     const { repoDir } = makeTopic('thread-22222222222222222222222222222222');
-    // Every one of these is on ARCHIVE_EXCLUDED_DIR_NAMES and deliberately NOT
-    // on REGENERABLE_SWEEP_DIR_NAMES: repos track them, and an agent's
-    // uncommitted output can sit in them. Not archiving a tree is a very
-    // different claim from being allowed to delete the only copy of it.
-    for (const name of ['dist', 'build', '.next', 'coverage', '.cache']) {
+    for (const name of NEVER_SWEPT) {
       fs.mkdirSync(path.join(repoDir, name), { recursive: true });
       fs.writeFileSync(path.join(repoDir, name, 'output.js'), `tracked ${name} output`);
     }
@@ -2548,8 +2549,33 @@ describe('storage-manager regenerable tree sweep', () => {
     const report = sweep();
 
     expect(report.actions.map((action) => action.path)).toEqual([path.join(repoDir, 'node_modules')]);
-    for (const name of ['dist', 'build', '.next', 'coverage', '.cache']) {
+    for (const name of NEVER_SWEPT) {
       expect(fs.readFileSync(path.join(repoDir, name, 'output.js'), 'utf8')).toBe(`tracked ${name} output`);
+    }
+  });
+
+  it('never sweeps a virtualenv, which is not reconstructible without a lockfile', () => {
+    const { repoDir } = makeTopic('thread-33333333333333333333333333333333');
+    // A venv grown by ad-hoc `pip install` with nothing committed is unique
+    // state, and no cheap check distinguishes it from a lockfile-pinned one.
+    // __pycache__ is swept beside it: PEP 3147 bytecode is not importable
+    // without its adjacent .py, so it can never be the only copy.
+    for (const name of ['.venv', 'venv', '.venv-3.12']) {
+      fs.mkdirSync(path.join(repoDir, name, 'lib'), { recursive: true });
+      fs.writeFileSync(path.join(repoDir, name, 'lib', 'installed.py'), `pip installed into ${name}`);
+    }
+    fs.mkdirSync(path.join(repoDir, 'src', '__pycache__'), { recursive: true });
+    fs.writeFileSync(path.join(repoDir, 'src', '__pycache__', 'app.cpython-312.pyc'), 'bytecode');
+
+    const report = sweep();
+
+    expect(report.actions.map((action) => action.path).sort()).toEqual(
+      [path.join(repoDir, 'node_modules'), path.join(repoDir, 'src', '__pycache__')].sort(),
+    );
+    for (const name of ['.venv', 'venv', '.venv-3.12']) {
+      expect(fs.readFileSync(path.join(repoDir, name, 'lib', 'installed.py'), 'utf8')).toBe(
+        `pip installed into ${name}`,
+      );
     }
   });
 

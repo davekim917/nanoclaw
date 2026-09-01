@@ -119,16 +119,32 @@ const TOPIC_WORKTREES_DIRNAME = 'worktrees';
 //   - THIS list answers "may we recursively delete this from a live checkout?"
 //     A wrong entry destroys the only copy.
 //
-// So this one holds ONLY names that are dependency-install output by
-// definition and cannot hold authored work. `dist`, `build`, `.next` and
-// `coverage` are on the archive list but not here: plenty of repos track them,
-// and an agent's uncommitted output can sit in them. `.cache` is dropped for
-// the same reason in weaker form — it is a generic name that can mean anything,
-// which is exactly the argument that disqualifies the other four.
+// So this one holds ONLY names whose contents are reconstructible from a file
+// that is itself under version control. Every exclusion below is on the archive
+// list and deliberately not here:
+//
+//   - `dist`, `build`, `.next`, `coverage` — plenty of repos track them, and an
+//     agent's uncommitted output can sit in them.
+//   - `.cache` — a generic name that can mean anything, which is the same
+//     argument in weaker form.
+//   - `.venv` (and any `venv`/`.venv*` spelling) — the tempting one, and still
+//     wrong. A virtualenv is reconstructible only if a requirements.txt or
+//     lockfile pins it; one grown by ad-hoc `pip install` with nothing
+//     committed is unique state, and nothing here can tell the two apart
+//     without the per-target git machinery this sweep exists to avoid. Do not
+//     re-add it on "it's just a dependency cache" reasoning. Measured
+//     2026-09-01: zero `.venv*` or `venv` directories anywhere under
+//     data/v2-topics (depth 8), so it was never buying anything either.
+//
+// `__pycache__` survives that bar where `.venv` does not: PEP 3147 bytecode is
+// not importable without its adjacent `.py`, so a `__pycache__/*.pyc` can never
+// be the only copy of anything. Verified on CPython 3.12 — removing the source
+// and keeping `__pycache__` raises ModuleNotFoundError rather than importing.
+// Worst case for deleting it is a recompile on next import.
 //
 // Cost of the narrowing is close to zero: the measurement that motivated this
 // sweep was node_modules at ~1.3GB of a 1.5GB topic.
-const REGENERABLE_SWEEP_DIR_NAMES = new Set<string>(['node_modules', '.pnpm-store', '.turbo', '__pycache__', '.venv']);
+const REGENERABLE_SWEEP_DIR_NAMES = new Set<string>(['node_modules', '.pnpm-store', '.turbo', '__pycache__']);
 
 const PRUNABLE_DIR_NAMES = new Set(['node_modules', '.pnpm-store', '.turbo', '.cache']);
 const SKIP_DESCEND_DIR_NAMES = new Set(['.git']);
