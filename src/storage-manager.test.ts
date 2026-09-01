@@ -2673,6 +2673,73 @@ describe('storage-manager regenerable tree sweep', () => {
     expect(fs.readFileSync(path.join(repoDir, 'node_modules', 'left-pad', 'index.js'), 'utf8')).toBe('reinstallable');
   });
 
+  it('refuses at apply time when the owning session becomes active after collection', () => {
+    const { topicDir, repoDir } = makeTopic('conversation-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab');
+    const unit = resolveRepositoryWorkUnit({
+      workgroupId: 'wg-acme',
+      sessionId: 'sess-wakes',
+      platformId: 'slack:C2',
+      messagingGroupId: 'mg-2',
+      threadId: null,
+    });
+    const owned = path.join(topicsRoot, 'wg-acme', `${unit.kind}-${unit.id}`);
+    fs.renameSync(topicDir, owned);
+    const db = centralDbMock.current!.db;
+    db.prepare('INSERT INTO agent_groups VALUES (?, ?, ?)').run('ag-1', 'acme', 'wg-acme');
+    db.prepare('INSERT INTO messaging_groups VALUES (?, ?)').run('mg-2', 'slack:C2');
+    db.prepare(
+      `INSERT INTO sessions (id, agent_group_id, messaging_group_id, thread_id, status, last_active, created_at)
+       VALUES ('sess-wakes', 'ag-1', 'mg-2', NULL, 'active', ?, ?)`,
+    ).run(new Date(now - 40 * DAY_MS).toISOString(), new Date(now - 40 * DAY_MS).toISOString());
+
+    // The session wakes between collection and deletion. Only the apply-time
+    // read can see it — the collection snapshot said "idle 40 days".
+    const realPrepare = db.prepare.bind(db);
+    let inventoryReads = 0;
+    db.prepare = ((sql: string) => {
+      const statement = realPrepare(sql);
+      if (!sql.includes('idle_since')) return statement;
+      return {
+        all: (...params: unknown[]) => {
+          inventoryReads += 1;
+          if (inventoryReads > 1) {
+            realPrepare("UPDATE sessions SET last_active = ? WHERE id = 'sess-wakes'").run(new Date(now).toISOString());
+          }
+          return (statement.all as (...args: unknown[]) => unknown[])(...params);
+        },
+      };
+    }) as typeof db.prepare;
+
+    const report = sweep();
+
+    expect(inventoryReads).toBeGreaterThan(1);
+    expect(report.actions).toEqual([
+      expect.objectContaining({
+        path: path.join(owned, 'worktrees', 'XZO-BACKEND', 'node_modules'),
+        status: 'skipped',
+      }),
+    ]);
+    expect(
+      fs.readFileSync(path.join(repoDir.replace(topicDir, owned), 'node_modules', 'left-pad', 'index.js'), 'utf8'),
+    ).toBe('reinstallable');
+  });
+
+  it('re-reads the mount lookup per action but samples the worktrees mtime once per topic', () => {
+    // Two candidates in one topic. Deleting the first bumps its parent's mtime
+    // and the cleanup claim bumps worktrees/ — if the guard re-read that mtime
+    // it would refuse everything after the first deletion.
+    const { repoDir } = makeTopic('thread-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbc');
+    fs.mkdirSync(path.join(repoDir, '.turbo'), { recursive: true });
+    fs.writeFileSync(path.join(repoDir, '.turbo', 'run.log'), 'task cache');
+
+    const report = sweep();
+
+    expect(report.actions.map((action) => action.status)).toEqual(['applied', 'applied']);
+    expect(fs.existsSync(path.join(repoDir, 'node_modules'))).toBe(false);
+    expect(fs.existsSync(path.join(repoDir, '.turbo'))).toBe(false);
+    expect(fs.readFileSync(path.join(repoDir, 'src', 'app.ts'), 'utf8')).toBe('the actual work');
+  });
+
   it('leaves a topic inside the idle window alone at the default 2-day clock', () => {
     const { repoDir } = makeTopic('thread-11111111111111111111111111111111', { idleDays: 1 });
 
