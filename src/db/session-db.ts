@@ -30,14 +30,28 @@ export class SessionDbMissingError extends Error {
 }
 
 /**
- * better-sqlite3 reports an absent database two different ways: a `SqliteError`
- * with `SQLITE_CANTOPEN` when the file is missing under `fileMustExist`/readonly,
- * and a plain `TypeError` from its own pre-check when the PARENT DIRECTORY is
- * missing — which is the shape a reclaimed session actually has.
+ * Translate an open failure to `SessionDbMissingError` ONLY when the path has
+ * actually gone.
+ *
+ * `SQLITE_CANTOPEN` is not a synonym for "missing". SQLite raises the identical
+ * code and message ("unable to open database file") for a file that is PRESENT
+ * but unopenable — EACCES on a mode-000 file, EMFILE and other descriptor
+ * exhaustion, a full or read-only filesystem. Sniffing the code would report
+ * every one of those as a vanished session, and `container-restart`'s
+ * skip-the-vanished branch would then silently leave a session whose ingress is
+ * present but unreadable UNFENCED — the exact case that must fail closed.
+ *
+ * Asking the filesystem answers that and better-sqlite3's other shape (a plain
+ * `TypeError` from its own pre-check when the parent DIRECTORY is missing) with
+ * one question, and needs no list of error codes to stay current.
+ *
+ * It settles a post-constructor failure too, without a second try block: a
+ * pragma that throws while the file is still there rethrows untouched, and one
+ * that throws on a file that vanished underneath the handle is a vanished
+ * session by any honest reading.
  */
-function isMissingDbFileError(err: unknown): boolean {
-  if ((err as { code?: unknown } | null | undefined)?.code === 'SQLITE_CANTOPEN') return true;
-  return err instanceof TypeError && /directory does not exist/.test(err.message);
+function asMissingDbError(err: unknown, dbPath: string): unknown {
+  return fs.existsSync(dbPath) ? err : new SessionDbMissingError(dbPath);
 }
 
 /** Apply the inbound or outbound schema to a DB file. Idempotent. */
@@ -102,8 +116,9 @@ export function openInboundDb(dbPath: string): Database.Database {
     db?.close();
     release();
     // One error type for "vanished", whichever side of the check lost the race.
-    if (isMissingDbFileError(err)) throw new SessionDbMissingError(dbPath);
-    throw err;
+    // Anything still on disk keeps its original error: a present-but-unreadable
+    // DB is a real fault, and callers must not mistake it for a gone session.
+    throw asMissingDbError(err, dbPath);
   }
   // ponytail: patching close() beats a wrapper type — every existing caller
   // already closes, and a new return type would touch all ~20 of them. Known
@@ -171,8 +186,7 @@ export function openOutboundDb(dbPath: string): Database.Database {
   try {
     db = new Database(dbPath, { readonly: true });
   } catch (err) {
-    if (isMissingDbFileError(err)) throw new SessionDbMissingError(dbPath);
-    throw err;
+    throw asMissingDbError(err, dbPath);
   }
   db.pragma('busy_timeout = 5000');
   return db;
@@ -194,8 +208,7 @@ export function openOutboundDbWritable(dbPath: string): Database.Database {
   try {
     db = new Database(dbPath, { fileMustExist: true });
   } catch (err) {
-    if (isMissingDbFileError(err)) throw new SessionDbMissingError(dbPath);
-    throw err;
+    throw asMissingDbError(err, dbPath);
   }
   db.pragma('journal_mode = DELETE');
   db.pragma('busy_timeout = 5000');

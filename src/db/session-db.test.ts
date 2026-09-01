@@ -1018,6 +1018,7 @@ describe('host opens never create a session database', () => {
   // creator; no open may bring a file, or its parent directory, into existence.
 
   const roots: string[] = [];
+  const chmodBack: string[] = [];
 
   /** The post-reclaim shape exactly: the session directory itself is gone too. */
   function reclaimedSessionDir(): string {
@@ -1026,7 +1027,20 @@ describe('host opens never create a session database', () => {
     return path.join(root, 'v2-sessions', 'ag-1', 'sess-1');
   }
 
+  /** A real, schema-current DB the process then cannot open. */
+  function unreadableDb(name: 'inbound.db' | 'outbound.db'): string {
+    const sessionDir = reclaimedSessionDir();
+    fs.mkdirSync(sessionDir, { recursive: true });
+    const dbPath = path.join(sessionDir, name);
+    ensureSchema(dbPath, name === 'inbound.db' ? 'inbound' : 'outbound');
+    fs.chmodSync(dbPath, 0o000);
+    chmodBack.push(dbPath);
+    return dbPath;
+  }
+
   afterEach(() => {
+    // Restore first, or the recursive remove below cannot unlink a 000 file.
+    for (const dbPath of chmodBack.splice(0)) fs.chmodSync(dbPath, 0o600);
     for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
   });
 
@@ -1070,6 +1084,53 @@ describe('host opens never create a session database', () => {
 
     expect(() => openOutboundDb(dbPath)).toThrow(SessionDbMissingError);
     expect(fs.existsSync(dbPath)).toBe(false);
+  });
+
+  // SQLite raises SQLITE_CANTOPEN with the identical "unable to open database
+  // file" message for a file that is PRESENT but unopenable — EACCES here, and
+  // descriptor exhaustion or a read-only filesystem in production. Reporting
+  // those as a missing session would let container-restart's skip-the-vanished
+  // branch leave a session whose ingress is present but unreadable UNFENCED,
+  // which is the one case that has to fail closed. Root bypasses file modes, so
+  // the precondition cannot be established there.
+  const notRoot = process.getuid?.() !== 0;
+
+  it.skipIf(!notRoot)('a present but unreadable inbound.db is NOT reported as missing', () => {
+    const dbPath = unreadableDb('inbound.db');
+    const sizeBefore = fs.statSync(dbPath).size;
+
+    let thrown: unknown;
+    try {
+      openInboundDb(dbPath);
+    } catch (err) {
+      thrown = err;
+    }
+    expect(thrown).toBeInstanceOf(Error);
+    expect(thrown).not.toBeInstanceOf(SessionDbMissingError);
+    expect((thrown as { code?: string }).code).toBe('SQLITE_CANTOPEN');
+
+    // The failing open touched nothing, and released its activity marker.
+    expect(fs.existsSync(dbPath)).toBe(true);
+    expect(fs.statSync(dbPath).size).toBe(sizeBefore);
+    expect(fs.readdirSync(path.dirname(dbPath))).toEqual(['inbound.db']);
+  });
+
+  it.skipIf(!notRoot)('a present but unreadable outbound.db is NOT reported as missing', () => {
+    const dbPath = unreadableDb('outbound.db');
+    const sizeBefore = fs.statSync(dbPath).size;
+
+    let thrown: unknown;
+    try {
+      openOutboundDbWritable(dbPath);
+    } catch (err) {
+      thrown = err;
+    }
+    expect(thrown).toBeInstanceOf(Error);
+    expect(thrown).not.toBeInstanceOf(SessionDbMissingError);
+    expect((thrown as { code?: string }).code).toBe('SQLITE_CANTOPEN');
+
+    expect(fs.existsSync(dbPath)).toBe(true);
+    expect(fs.statSync(dbPath).size).toBe(sizeBefore);
   });
 
   it('a provisioned session still opens through both funnels', () => {
