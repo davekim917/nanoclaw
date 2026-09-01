@@ -85,6 +85,8 @@ const acknowledgedEpochs = new Map<string, string>();
 const processingSessions = new Set<string>();
 const toolSessions = new Set<string>();
 const activationFailures = new Set<string>();
+/** Sessions whose rollback release throws — the incident's reclaimed DB. */
+const releaseFailures = new Set<string>();
 let autoAcknowledgeBarrier = true;
 let barrierGeneration = 0;
 const mockActivateRepoIngressFence = vi.fn((db: MockSessionDb, epoch: string) => {
@@ -99,6 +101,7 @@ const mockActivateRepoIngressFence = vi.fn((db: MockSessionDb, epoch: string) =>
   return active;
 });
 const mockReleaseRepoIngressFence = vi.fn((db: MockSessionDb, epoch: string, generation: string) => {
+  if (releaseFailures.has(db.sessionId)) throw new Error(`release failed for ${db.sessionId}`);
   const current = activeEpochs.get(db.sessionId);
   if (!current || current.epoch !== epoch || current.generation !== generation || current.state !== 'active') {
     return { released: false, admittedRows: 0, wakeRequired: false };
@@ -139,6 +142,7 @@ beforeEach(() => {
   processingSessions.clear();
   toolSessions.clear();
   activationFailures.clear();
+  releaseFailures.clear();
   missingInboundDbs.clear();
   unreadableInboundDbs.clear();
   openedInboundDbs.length = 0;
@@ -349,6 +353,37 @@ describe('repository mount reconciliation', () => {
       state: 'active',
     });
     expect(mockReleaseRepoIngressFence).not.toHaveBeenCalled();
+  });
+
+  it('hands back the sessions a failed rollback left fenced instead of a bare AggregateError', async () => {
+    // Incident 2026-09-01: a partial rollback threw a plain AggregateError, so
+    // the caller's `instanceof RepositoryMountQuiescenceError` branch never
+    // matched, its `quiescence` stayed null, and no release was ever retried
+    // for the sessions still fenced — they stayed active for 2.5 hours.
+    const first = makeSession('s1', 'g1');
+    const stranded = makeSession('s2', 'g1');
+    const failing = makeSession('s3', 'g1');
+    activationFailures.add('s3');
+    releaseFailures.add('s2');
+    mockIsContainerRunning.mockReturnValue(false);
+
+    const error = await quiesceSessionsForRepositoryMounts(
+      [first, stranded, failing] as never,
+      'repository-publish:req-partial-rollback',
+    ).then(
+      () => null,
+      (cause: unknown) => cause,
+    );
+
+    expect(error).toBeInstanceOf(RepositoryMountQuiescenceError);
+    const recovery = error as RepositoryMountQuiescenceError;
+    expect(recovery.barriersReleased).toBe(false);
+    expect(recovery.quiescence.epoch).toBe('repository-publish:req-partial-rollback');
+    expect(recovery.quiescence.barrierSessions.map((session) => session.id)).toEqual(['s2']);
+    expect(recovery.quiescence.barrierGenerations.s2).toBeDefined();
+    // s1 rolled back cleanly; only s2 is still fenced and needs the retry.
+    expect(activeEpochs.get('s1')?.state).toBe('released');
+    expect(activeEpochs.get('s2')?.state).toBe('active');
   });
 
   it('rejects a stale ACK when replay reactivates a released action epoch with a fresh generation', async () => {

@@ -638,6 +638,25 @@ async function drainSession(session: Session): Promise<DrainOutcome> {
           const errMsg = err instanceof Error ? err.message : String(err);
           markDeliveryFailed(inDb, msg.id, errMsg);
           deliveryAttempts.delete(msg.id);
+          // Incident 2026-09-01: the row dropped here was a repository
+          // publication that had already fenced ~1400 session inbound DBs in
+          // its workgroup. Its strict release fails fast on the first bad
+          // session, so every session behind that one stayed fenced — deaf,
+          // unspawnable, and with no code path left to free it. Giving up on
+          // the message is the last moment the host knows the transition has
+          // ended, so release any fence no live publication still owns.
+          // Lazy import: session-manager already imports delivery, so a static
+          // edge here would close a module-init cycle (CLAUDE.md).
+          try {
+            const { releaseOrphanedRepoIngressFencesForDroppedMessage } = await import('./repo-fence-recovery.js');
+            await releaseOrphanedRepoIngressFencesForDroppedMessage(msg, session);
+          } catch (recoveryErr) {
+            log.error('Orphaned repository fence recovery after a dropped delivery failed', {
+              messageId: msg.id,
+              sessionId: session.id,
+              err: recoveryErr,
+            });
+          }
         } else {
           log.warn('Message delivery failed, will retry', {
             messageId: msg.id,
