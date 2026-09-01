@@ -14,6 +14,70 @@ import { DATA_DIR } from '../config.js';
 import { plantStorageActivityMarker } from '../storage-activity.js';
 import { INBOUND_SCHEMA, OUTBOUND_SCHEMA } from './schema.js';
 
+/**
+ * A host open found no database file where a provisioned session must have one.
+ *
+ * Every host-side open funnel refuses to create the file, so callers get this
+ * instead of an empty stub. `ensureSchema` is the only host-side creator; a
+ * caller that legitimately provisions a session goes through
+ * `initSessionFolder`/`initStubSessionFolder`, never through an open.
+ */
+export class SessionDbMissingError extends Error {
+  constructor(readonly dbPath: string) {
+    super(`session database does not exist: ${dbPath}`);
+    this.name = 'SessionDbMissingError';
+  }
+}
+
+/**
+ * Is this path genuinely gone, as opposed to unanswerable?
+ *
+ * `fs.existsSync` cannot tell those apart: it returns false for ANY stat
+ * failure, including EACCES when a parent directory has lost search permission.
+ * A session whose directory the host merely cannot traverse is present, and
+ * calling it vanished is the same mistake as trusting `SQLITE_CANTOPEN` — one
+ * level further down. Only ENOENT (no such entry) and ENOTDIR (a path component
+ * is not a directory) mean gone; every other errno means the filesystem
+ * declined to answer, and no session may be declared vanished on a question
+ * that was never answered.
+ */
+function sessionDbPathIsGone(dbPath: string): boolean {
+  try {
+    fs.statSync(dbPath);
+    return false;
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    return code === 'ENOENT' || code === 'ENOTDIR';
+  }
+}
+
+/**
+ * Translate an open failure to `SessionDbMissingError` ONLY when the path has
+ * actually gone.
+ *
+ * `SQLITE_CANTOPEN` is not a synonym for "missing". SQLite raises the identical
+ * code and message ("unable to open database file") for a file that is PRESENT
+ * but unopenable — EACCES on a mode-000 file, EMFILE and other descriptor
+ * exhaustion, a full or read-only filesystem. Sniffing the code would report
+ * every one of those as a vanished session, and `container-restart`'s
+ * skip-the-vanished branch would then silently leave a session whose ingress is
+ * present but unreadable UNFENCED — the exact case that must fail closed.
+ *
+ * Asking the filesystem answers that and better-sqlite3's other shape (a plain
+ * `TypeError` from its own pre-check when the parent DIRECTORY is missing) with
+ * one question, and needs no list of SQLite error codes to stay current — but
+ * it has to be a stat whose errno is read, not `existsSync`, which reports an
+ * unreadable parent directory as absence.
+ *
+ * It settles a post-constructor failure too, without a second try block: a
+ * pragma that throws while the file is still there rethrows untouched, and one
+ * that throws on a file that vanished underneath the handle is a vanished
+ * session by any honest reading.
+ */
+function asMissingDbError(err: unknown, dbPath: string): unknown {
+  return sessionDbPathIsGone(dbPath) ? new SessionDbMissingError(dbPath) : err;
+}
+
 /** Apply the inbound or outbound schema to a DB file. Idempotent. */
 export function ensureSchema(dbPath: string, schema: 'inbound' | 'outbound'): void {
   const db = new Database(dbPath);
@@ -54,10 +118,22 @@ export function ensureSchema(dbPath: string, schema: 'inbound' | 'outbound'): vo
  * such skip so that is loud rather than silent.
  */
 export function openInboundDb(dbPath: string): Database.Database {
+  // Checked BEFORE the marker, not after: plantStorageActivityMarker does a
+  // recursive mkdir of the session root, so a reclaim that has just removed
+  // the whole directory would see it resurrected by the very call meant to
+  // protect a live session. On 2026-09-01 that recreated a reclaimed session
+  // directory holding nothing but a 0-byte inbound.db, which then crash-looped
+  // the host at startup. Nothing here may create either the file or its parent.
+  // `sessionDbPathIsGone`, not existsSync: an unreadable parent directory is a
+  // present session, and must reach the open and fail there on its real error.
+  if (sessionDbPathIsGone(dbPath)) throw new SessionDbMissingError(dbPath);
   const release = plantStorageActivityMarker(path.dirname(dbPath), 'inbound-open');
   let db: Database.Database | undefined;
   try {
-    db = new Database(dbPath);
+    // `fileMustExist` closes the residual window between the check above and
+    // this open: better-sqlite3 otherwise CREATES an empty file, and an empty
+    // file is a schemaless database every later caller throws on.
+    db = new Database(dbPath, { fileMustExist: true });
     db.pragma('journal_mode = DELETE');
     db.pragma('busy_timeout = 5000');
   } catch (err) {
@@ -65,7 +141,10 @@ export function openInboundDb(dbPath: string): Database.Database {
     // before releasing — otherwise the FD outlives the marker.
     db?.close();
     release();
-    throw err;
+    // One error type for "vanished", whichever side of the check lost the race.
+    // Anything still on disk keeps its original error: a present-but-unreadable
+    // DB is a real fault, and callers must not mistake it for a gone session.
+    throw asMissingDbError(err, dbPath);
   }
   // ponytail: patching close() beats a wrapper type — every existing caller
   // already closes, and a new return type would touch all ~20 of them. Known
@@ -119,11 +198,22 @@ export function recoverHotJournal(dbPath: string): boolean {
   }
 }
 
-/** Open the outbound DB for a session (host reads only). */
+/**
+ * Open the outbound DB for a session (host reads only).
+ *
+ * A readonly open never creates a file, so this funnel is already incapable of
+ * leaving a stub behind; it is normalized to `SessionDbMissingError` only so
+ * every host-side open reports a vanished session the same way.
+ */
 export function openOutboundDb(dbPath: string): Database.Database {
   // Cheap existsSync guard — no cost on the normal path, where no journal exists.
   recoverHotJournal(dbPath);
-  const db = new Database(dbPath, { readonly: true });
+  let db: Database.Database;
+  try {
+    db = new Database(dbPath, { readonly: true });
+  } catch (err) {
+    throw asMissingDbError(err, dbPath);
+  }
   db.pragma('busy_timeout = 5000');
   return db;
 }
@@ -135,7 +225,17 @@ export function openOutboundDb(dbPath: string): Database.Database {
  * after a container is killed.
  */
 export function openOutboundDbWritable(dbPath: string): Database.Database {
-  const db = new Database(dbPath);
+  // The host never provisions outbound.db — the container does — so a missing
+  // file here is a vanished session, never something to create. Same two-part
+  // guard as the inbound funnel: the check answers fast, `fileMustExist` closes
+  // the race after it, and only a real ENOENT/ENOTDIR counts as gone.
+  if (sessionDbPathIsGone(dbPath)) throw new SessionDbMissingError(dbPath);
+  let db: Database.Database;
+  try {
+    db = new Database(dbPath, { fileMustExist: true });
+  } catch (err) {
+    throw asMissingDbError(err, dbPath);
+  }
   db.pragma('journal_mode = DELETE');
   db.pragma('busy_timeout = 5000');
   return db;

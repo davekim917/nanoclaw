@@ -29,14 +29,42 @@ const mockWriteSessionMessage = vi.fn();
 type MockSessionDb = { sessionId: string; close: ReturnType<typeof vi.fn> };
 /** Session rows that exist in the central DB but own no inbound DB file. */
 const missingInboundDbs = new Set<string>();
+/** Session DBs that exist but are unreadable (present file, no schema). */
+const unreadableInboundDbs = new Set<string>();
+/** Session ids the inbound funnel actually handed back a handle for. */
+const openedInboundDbs: string[] = [];
+/** Fires before every inbound open, so a test can reclaim a session mid-loop. */
+let beforeInboundOpen: ((sessionId: string) => void) | null = null;
+
+/**
+ * Stands in for the real error type: the host's open funnels refuse to CREATE
+ * a session DB, so a vanished session is reported as this rather than as an
+ * empty stub. Hoisted because both mock factories below close over it.
+ */
+const { MockSessionDbMissingError } = vi.hoisted(() => ({
+  MockSessionDbMissingError: class SessionDbMissingError extends Error {
+    readonly dbPath: string;
+    constructor(dbPath: string) {
+      super(`session database does not exist: ${dbPath}`);
+      this.name = 'SessionDbMissingError';
+      this.dbPath = dbPath;
+    }
+  },
+}));
+
 vi.mock('./session-manager.js', () => ({
   writeSessionMessage: (...args: unknown[]) => mockWriteSessionMessage(...args),
   openInboundDb: (...args: unknown[]) => {
     const sessionId = args[1] as string;
+    beforeInboundOpen?.(sessionId);
     if (missingInboundDbs.has(sessionId)) {
-      // Exactly what better-sqlite3 throws for a reclaimed session directory.
-      throw new TypeError('Cannot open database because the directory does not exist');
+      throw new MockSessionDbMissingError(`/mock-sessions/${args[0]}/${sessionId}/inbound.db`);
     }
+    if (unreadableInboundDbs.has(sessionId)) {
+      // A present-but-schemaless inbound.db: exactly what the migration throws.
+      throw new Error('no such table: messages_in');
+    }
+    openedInboundDbs.push(sessionId);
     return { sessionId, close: vi.fn() };
   },
   openOutboundDb: (...args: unknown[]) => ({ sessionId: args[1] as string, close: vi.fn() }),
@@ -90,6 +118,7 @@ vi.mock('./db/session-db.js', () => ({
   readRepositoryMountBarrierAck: (db: MockSessionDb) => acknowledgedEpochs.get(db.sessionId) ?? null,
   getProcessingClaims: (db: MockSessionDb) => (processingSessions.has(db.sessionId) ? [{ message_id: 'late' }] : []),
   getContainerState: (db: MockSessionDb) => (toolSessions.has(db.sessionId) ? { current_tool: 'Bash' } : null),
+  SessionDbMissingError: MockSessionDbMissingError,
 }));
 
 import {
@@ -111,6 +140,9 @@ beforeEach(() => {
   toolSessions.clear();
   activationFailures.clear();
   missingInboundDbs.clear();
+  unreadableInboundDbs.clear();
+  openedInboundDbs.length = 0;
+  beforeInboundOpen = null;
   autoAcknowledgeBarrier = true;
   barrierGeneration = 0;
   mockCountDueMessages.mockReturnValue(0);
@@ -211,6 +243,57 @@ describe('repository mount reconciliation', () => {
     expect(activeEpochs.get('s1')?.state).toBe('active');
     expect(activeEpochs.has('s2')).toBe(false);
     expect(await releaseRepositoryMountQuiescence(quiescence)).toEqual([]);
+    expect(activeEpochs.get('s1')?.state).toBe('released');
+  });
+
+  it('skips a session reclaimed between the eligibility filter and its own fence open', async () => {
+    // The 2026-09-01 incident, exactly: the reclaim finished AFTER s2 passed
+    // hasFenceableIngress and BEFORE its open, so the existsSync filter could
+    // not see it. The open used to create an empty inbound.db in a resurrected
+    // directory and fail the whole publication; it must now skip s2, fence s1,
+    // and leave nothing behind for s2.
+    const live = makeSession('s1', 'g1');
+    const reclaimedMidLoop = makeSession('s2', 'g1');
+    mockIsContainerRunning.mockReturnValue(false);
+    beforeInboundOpen = (sessionId) => {
+      if (sessionId === 's1') missingInboundDbs.add('s2');
+    };
+
+    const quiescence = await quiesceSessionsForRepositoryMounts(
+      [live, reclaimedMidLoop] as never,
+      'repository-publish:req-toctou',
+    );
+
+    expect(quiescence.barrierSessions.map((session) => session.id)).toEqual(['s1']);
+    expect(activeEpochs.get('s1')?.state).toBe('active');
+    expect(activeEpochs.has('s2')).toBe(false);
+    expect(log.warn).toHaveBeenCalledWith(
+      'Repository mount barrier skipped: session inbound DB vanished after eligibility check',
+      { sessionId: 's2', agentGroupId: 'g1' },
+    );
+    // Never opened, so nothing could have recreated its directory. The
+    // "creates no file, no directory" half is pinned on the real funnel in
+    // src/db/session-db.test.ts.
+    expect(openedInboundDbs).not.toContain('s2');
+
+    // Release walks the fenced set only — a skipped session has no generation,
+    // and reaching it there would throw on that.
+    expect(await releaseRepositoryMountQuiescence(quiescence)).toEqual([]);
+    expect(activeEpochs.get('s1')?.state).toBe('released');
+  });
+
+  it('still fails closed when a session inbound DB is present but unreadable', async () => {
+    // Only a VANISHED session is skippable. A schemaless DB is a real fault:
+    // ingress exists and would go unfenced, so the publication must not run.
+    const live = makeSession('s1', 'g1');
+    const broken = makeSession('s2', 'g1');
+    mockIsContainerRunning.mockReturnValue(false);
+    unreadableInboundDbs.add('s2');
+
+    await expect(
+      quiesceSessionsForRepositoryMounts([live, broken] as never, 'repository-publish:req-schemaless'),
+    ).rejects.toThrow(/session s2 .*inbound\.db.*no such table: messages_in/);
+    // s1's barrier is rolled back rather than stranded.
     expect(activeEpochs.get('s1')?.state).toBe('released');
   });
 

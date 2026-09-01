@@ -236,6 +236,12 @@ export async function main(): Promise<void> {
         .filter((report) => report.state.status !== 'migration-required')
         .map((report) => report.workgroupId),
     );
+    if (pendingUpgrade.skipped > 0 || pendingUpgrade.stubsRemoved > 0) {
+      // A session DB the pass could not read no longer stops startup, so it has
+      // to be loud instead. Counts, not silence: a rising `skipped` is the shape
+      // of a systemic problem that a per-session error line would bury.
+      log.warn('Startup reconciliation could not process every session DB', pendingUpgrade);
+    }
     if (pendingUpgrade.admitted > 0) {
       log.info('Admitted pending pre-turn contexts during startup', pendingUpgrade);
     }

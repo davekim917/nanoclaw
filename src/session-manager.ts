@@ -1169,9 +1169,10 @@ export function reconcilePendingUpgradeContexts(
   centralDb: Database.Database,
   workgroupIds: string[],
   dataDir = DATA_DIR,
-): { sessions: number; admitted: number; mtimesRestored: number } {
+): { sessions: number; admitted: number; mtimesRestored: number; skipped: number; stubsRemoved: number } {
   replayUpgradeMtimeManifest(dataDir, centralDb);
 
+  let stubsRemoved = 0;
   const targets: Array<{ id: string; agentGroupId: string; inboundPath: string; stat: fs.Stats }> = [];
   for (const workgroupId of [...new Set(workgroupIds)].sort()) {
     const rows = centralDb
@@ -1191,10 +1192,32 @@ export function reconcilePendingUpgradeContexts(
       } catch {
         continue;
       }
+      // A 0-byte inbound.db is provably never-provisioned: `ensureSchema` is
+      // the only host-side creator and it writes the schema in the same call
+      // that creates the file, and SQLite writes nothing to a fresh file until
+      // that first schema write. So this is the residue of a failed open, not
+      // a session — before this fix, `new Database(path)` created the file and
+      // the schema migration then threw, leaving the stub behind. Removing it
+      // restores the two-signal reclaimed state (reclaimed AND no inbound.db)
+      // the stub was defeating.
+      if (stat.size === 0) {
+        log.warn('Removed empty inbound.db stub left by a failed open of a reclaimed session', {
+          sessionId: row.id,
+          agentGroupId: row.agent_group_id,
+          path: inboundPath,
+        });
+        try {
+          fs.rmSync(inboundPath, { force: true });
+          stubsRemoved += 1;
+        } catch (err) {
+          log.error('Could not remove an empty inbound.db stub', { sessionId: row.id, path: inboundPath, err });
+        }
+        continue;
+      }
       targets.push({ id: row.id, agentGroupId: row.agent_group_id, inboundPath, stat });
     }
   }
-  if (targets.length === 0) return { sessions: 0, admitted: 0, mtimesRestored: 0 };
+  if (targets.length === 0) return { sessions: 0, admitted: 0, mtimesRestored: 0, skipped: 0, stubsRemoved };
 
   // One fsync for the whole pass, before the first ALTER TABLE. A crash any
   // time after this point is recoverable on the next start.
@@ -1211,16 +1234,42 @@ export function reconcilePendingUpgradeContexts(
   let sessions = 0;
   let admitted = 0;
   let mtimesRestored = 0;
+  let skipped = 0;
   for (const target of targets) {
-    const inbound = openInboundDbRaw(target.inboundPath);
     let admittedHere = 0;
+    // Per-target isolation. This pass runs on the startup path and its caller
+    // exits the process on a throw, so one unreadable session DB used to take
+    // the whole fleet down (2026-09-01: a stub inbound.db crash-looped the host
+    // seven times). A bad session DB is that session's problem; the pass owns
+    // every other session and the manifest bookkeeping below.
     try {
-      migrateMessagesInTable(inbound);
-      sessions++;
-      admittedHere = admitPendingUpgradeContexts(inbound, target.agentGroupId, target.id);
-      admitted += admittedHere;
-    } finally {
-      inbound.close();
+      const inbound = openInboundDbRaw(target.inboundPath);
+      try {
+        migrateMessagesInTable(inbound);
+        sessions++;
+        admittedHere = admitPendingUpgradeContexts(inbound, target.agentGroupId, target.id);
+        admitted += admittedHere;
+      } finally {
+        inbound.close();
+      }
+    } catch (err) {
+      log.error('Session inbound DB unreadable during startup reconciliation; skipping session', {
+        sessionId: target.id,
+        agentGroupId: target.agentGroupId,
+        path: target.inboundPath,
+        err,
+      });
+      skipped += 1;
+      // A failed session keeps whatever clock it has. `admitPendingUpgradeContexts`
+      // commits ONE TRANSACTION PER MESSAGE, so a throw on a later row leaves
+      // earlier admissions committed — and `admittedHere` is still 0, because
+      // the assignment never ran. Restoring here would therefore rewind the
+      // clock over real, durable work and report an active session as idle to
+      // the reclaim. The two errors are not symmetric: a clock left bumped at
+      // worst delays this one session's reclaim until the next pass, while a
+      // clock rewound over committed rows can hand a session with admitted
+      // work to the archiver. Keep the bumped clock.
+      continue;
     }
     if (admittedHere > 0) continue;
     try {
@@ -1231,14 +1280,17 @@ export function reconcilePendingUpgradeContexts(
       // Session removed underneath the pass.
     }
   }
-  // Deleted ONLY on full success. An exception here escapes to startup, which
+  // Deleted once the loop has run to the end. A per-target failure is handled
+  // inline (skipped, and its clock deliberately left alone), so it leaves
+  // nothing for the manifest to recover. Only a failure OUTSIDE this loop — the
+  // central DB query, the manifest write — still escapes to startup, which
   // exits; the manifest is then the only record of what this pass bumped, so a
   // `finally` that removes it would destroy the recovery it exists for.
   fs.rmSync(upgradeMtimeManifestPath(dataDir), { force: true });
   if (mtimesRestored > 0) {
     log.info('Session migration pass left the idle clock untouched', { sessions, mtimesRestored });
   }
-  return { sessions, admitted, mtimesRestored };
+  return { sessions, admitted, mtimesRestored, skipped, stubsRemoved };
 }
 
 /**
