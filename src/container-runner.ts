@@ -33,6 +33,7 @@ import {
   writeContainerConfig,
   type ContainerConfig,
   type McpServerConfig,
+  type SecurityConfig,
 } from './container-config.js';
 import {
   formatMemoryMb,
@@ -3196,6 +3197,10 @@ async function buildContainerArgs(
   // forwards signals to the entrypoint, so SIGTERM handling is unchanged.
   const args: string[] = ['run', '--rm', '--init', '--name', containerName, '--label', CONTAINER_INSTALL_LABEL];
   args.push(...dockerResourceLimitArgs(containerConfig.resources));
+  // Privilege hardening — capabilities and setuid escalation. Resource
+  // ceilings came from dockerResourceLimitArgs above; these two builders
+  // never emit the same Docker flag.
+  args.push(...securityArgs(containerConfig.security));
 
   // Environment — only vars read by code we don't own.
   // Everything NanoClaw-specific is in container.json (read by runner at startup).
@@ -4264,6 +4269,33 @@ async function buildContainerArgs(
   args.push(imageTag);
 
   args.push('-c', 'exec /app/entrypoint.sh');
+
+  return args;
+}
+
+/**
+ * Build the container PRIVILEGE hardening flags: drop every Linux capability
+ * and forbid setuid escalation, overridable per-group via container.json
+ * `security`. Pure so the defaults/override precedence is unit-testable
+ * without spawning.
+ *
+ * Resource ceilings (--memory, --pids-limit, --cpus) deliberately do NOT
+ * belong here — `dockerResourceLimitArgs` below owns those, driven by
+ * container.json `resources`. Emitting a flag from both builders is how a
+ * spawn ends up with two contradictory values for the same Docker option.
+ */
+export function securityArgs(security?: SecurityConfig): string[] {
+  const args: string[] = [];
+
+  if (security?.noNewPrivileges ?? true) {
+    args.push('--security-opt', 'no-new-privileges');
+  }
+
+  const capDrop = security?.capDrop ?? ['ALL'];
+  for (const cap of capDrop) args.push('--cap-drop', cap);
+
+  const capAdd = security?.capAdd ?? [];
+  for (const cap of capAdd) args.push('--cap-add', cap);
 
   return args;
 }

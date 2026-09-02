@@ -18,6 +18,7 @@ import type Database from 'better-sqlite3';
 import {
   DATAFOLD_MCP_SERVER,
   dockerResourceLimitArgs,
+  securityArgs,
   resolveMemoryAdmissionBudgetMb,
   serializeMcpServersEnv,
   resolveAnthropicAuth,
@@ -219,6 +220,37 @@ describe('dockerResourceLimitArgs', () => {
 
     expect(args).not.toContain('--cpu-shares');
     expect(args.slice(args.indexOf('--cpus'))).toEqual(['--cpus', '2', '--pids-limit', '768']);
+  });
+});
+
+describe('securityArgs', () => {
+  it('emits safe privilege defaults when no override is given', () => {
+    const args = securityArgs(undefined);
+    expect(args).toEqual(['--security-opt', 'no-new-privileges', '--cap-drop', 'ALL']);
+  });
+
+  it('honors a capAdd override', () => {
+    expect(securityArgs({ capAdd: ['SYS_ADMIN'] }).join(' ')).toContain('--cap-add SYS_ADMIN');
+  });
+
+  it('honors a narrowed capDrop override', () => {
+    const args = securityArgs({ capDrop: ['NET_RAW', 'SYS_PTRACE'] });
+    expect(args.join(' ')).toContain('--cap-drop NET_RAW --cap-drop SYS_PTRACE');
+    expect(args.join(' ')).not.toContain('--cap-drop ALL');
+  });
+
+  it('drops no-new-privileges when explicitly disabled', () => {
+    expect(securityArgs({ noNewPrivileges: false }).join(' ')).not.toContain('no-new-privileges');
+  });
+
+  // Resource ceilings are dockerResourceLimitArgs' job. If securityArgs ever
+  // starts emitting one too, a spawn gets two contradictory values for the
+  // same Docker flag — this is the guard against that regression.
+  it('never emits a resource-ceiling flag', () => {
+    const joined = securityArgs({ capAdd: ['SYS_ADMIN'] }).join(' ');
+    expect(joined).not.toContain('--pids-limit');
+    expect(joined).not.toContain('--memory');
+    expect(joined).not.toContain('--cpus');
   });
 });
 
