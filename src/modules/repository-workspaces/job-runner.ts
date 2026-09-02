@@ -137,6 +137,21 @@ export async function runRepositoryActionDetached(
   if (inFlight.has(requestId)) return { deferAck: true };
   inFlight.add(requestId);
   log.info('Repository action queued off the delivery loop', { action, requestId, sessionId: session.id });
-  chain = chain.then(() => runRepositoryActionJob(action, apply, content, session, requestId));
+  // Terminal catch. `runRepositoryActionJob` handles its own failures, but an
+  // escape (a future edit, a throwing logger) would both poison the chain for
+  // every later repository action and surface as an unhandled rejection, which
+  // kills the host — the failure class this whole change exists to remove. The
+  // escaped job keeps its in-flight entry, exactly like the ack-failure branch:
+  // its ack is unproven, so only the next host start may replay it.
+  chain = chain.then(() =>
+    runRepositoryActionJob(action, apply, content, session, requestId).catch((err) =>
+      log.error('Repository action job escaped its own error handling', {
+        action,
+        requestId,
+        sessionId: session.id,
+        err,
+      }),
+    ),
+  );
   return { deferAck: true };
 }

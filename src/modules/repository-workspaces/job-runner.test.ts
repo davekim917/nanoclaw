@@ -8,6 +8,7 @@
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
+import { log } from '../../log.js';
 import type { Session } from '../../types.js';
 
 vi.mock('../../log.js', () => ({
@@ -53,6 +54,7 @@ beforeEach(() => {
   marks.length = 0;
   closed.length = 0;
   releaseOrphans.mockClear();
+  vi.mocked(log.error).mockReset();
   openInboundDbImpl = () => ({ close: () => closed.push(1) });
 });
 
@@ -166,6 +168,38 @@ describe('runRepositoryActionDetached', () => {
     await runRepositoryActionDetached('repository_publish', apply, { requestId: id }, session);
     await _repositoryActionChainForTesting();
     expect(apply).toHaveBeenCalledTimes(1);
+  });
+
+  it("survives a job error that escapes the job's own handling, without poisoning the chain", async () => {
+    // The one seam left uncovered: `ackRow` already catches, so make its own
+    // error log throw. Without the terminal catch this rejects the chain — every
+    // later repository action is dropped and Node kills the host on the
+    // unhandled rejection, which is the failure class this change removes.
+    const escaped = requestId('0b');
+    const queued = requestId('0c');
+    openInboundDbImpl = () => {
+      throw new Error('session inbound database is gone');
+    };
+    vi.mocked(log.error).mockImplementationOnce(() => {
+      throw new Error('logger exploded');
+    });
+    const escapedApply = vi.fn(async () => {});
+    const queuedApply = vi.fn(async () => {
+      openInboundDbImpl = () => ({ close: () => closed.push(1) });
+    });
+
+    await runRepositoryActionDetached('repository_publish', escapedApply, { requestId: escaped }, session);
+    await runRepositoryActionDetached('repository_transfer', queuedApply, { requestId: queued }, session);
+    await expect(_repositoryActionChainForTesting()).resolves.toBeUndefined();
+
+    expect(queuedApply).toHaveBeenCalledTimes(1); // the chain still runs
+    expect(vi.mocked(log.error).mock.calls.at(-1)?.[0]).toBe('Repository action job escaped its own error handling');
+
+    // The escaped job's ack is unproven, so it keeps its in-flight entry and is
+    // not re-run by a later poll — only the next host start may replay it.
+    await runRepositoryActionDetached('repository_publish', escapedApply, { requestId: escaped }, session);
+    await _repositoryActionChainForTesting();
+    expect(escapedApply).toHaveBeenCalledTimes(1);
   });
 
   it('runs an unkeyable payload inline so the delivery loop keeps owning that row', async () => {
