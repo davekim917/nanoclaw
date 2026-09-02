@@ -20,7 +20,7 @@
 # lets us pull the binary via COPY --from below while keeping the version
 # pinned via build-arg.
 ARG MCP_TOOLBOX_VERSION=1.7.0
-ARG PNPM_VERSION=10.33.0
+ARG PNPM_VERSION=10.34.5
 FROM us-central1-docker.pkg.dev/database-toolbox/toolbox/toolbox:${MCP_TOOLBOX_VERSION} AS mcp-toolbox-src
 
 FROM node:22-slim
@@ -289,6 +289,12 @@ ENV PATH="$PNPM_HOME:$PATH"
 # `allowBuilds` YAML setting. Keep this in lockstep with package.json.
 ARG PNPM_VERSION
 RUN corepack enable && corepack prepare pnpm@${PNPM_VERSION} --activate
+
+# The npm bundled with node:22-slim (10.9.8) vendors tar <7.5.19, which carries
+# a fixable critical (GHSA-23hp-3jrh-7fpw). Patch-level bump only. Drop this
+# once the base image ships npm >= 10.9.9.
+ARG NPM_VERSION=10.9.9
+RUN npm install -g npm@${NPM_VERSION}
 
 # Global Node CLIs the agent invokes at runtime are installed explicitly below,
 # each pinned via an ARG (see the version block above). This fork keeps the

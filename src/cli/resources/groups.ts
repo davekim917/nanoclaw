@@ -5,6 +5,7 @@ import path from 'path';
 import { GROUPS_DIR } from '../../config.js';
 import {
   readContainerConfig,
+  resolveContainerSecurity,
   type AdditionalMountConfig,
   type McpServerConfig,
   updateContainerConfig,
@@ -48,6 +49,11 @@ function presentConfig(row: ContainerConfigRow, folder?: string): Record<string,
     cli_scope: row.cli_scope,
     resources: fileConfig?.resources ?? null,
     effective_resources: fileConfig ? resolveContainerResources(fileConfig.resources) : null,
+    // Privilege overrides are the whole point of auditing this: a config that
+    // narrows capDrop, adds a capability back, or turns off no-new-privileges
+    // must be visible here, not only in the spawn's docker args.
+    security: fileConfig?.security ?? null,
+    effective_security: fileConfig ? resolveContainerSecurity(fileConfig.security) : null,
     updated_at: row.updated_at,
   };
 }
