@@ -962,12 +962,18 @@ if [ "$COMMAND" = "claim" ]; then
   # challengerDeadline is stamped here because `claim` is the only point that
   # knows when the campaign began. A run whose challenger never files by then
   # is finishable ONLY through `challenger-timeout`, and only as BLOCKED.
+  # A reclaim that CONTINUES the same campaign (same SHA, no disposition yet)
+  # keeps its original deadline. Stamping a fresh one on every recovery
+  # reclaim reset the clock hourly and made `challenger-timeout` unreachable
+  # — pr1432 looped ~4h "stuck waiting on challenger" (2026-09-02).
   STATE="$(jq -c --arg sha "$SHA" --arg now "$NOW" --arg run "$RUN_ID" --arg took "$TOOK_OVER" \
     --arg deadline "$(challenger_deadline_from_now)" \
-    '.activeSha=$sha | .activeStartedAt=$now | .activeRunId=$run | .activeProgressAt=$now |
+    '(if (.activeSha == $sha and (.challengerDeadline // "") != "" and .challengerDisposition == null)
+      then .challengerDeadline else $deadline end) as $dl |
+     .activeSha=$sha | .activeStartedAt=$now | .activeRunId=$run | .activeProgressAt=$now |
      .displacedRunId=(if $took == "" then null else $took end) |
      .displacedAt=(if $took == "" then null else $now end) |
-     .challengerDeadline=$deadline |
+     .challengerDeadline=$dl |
      .challengerDisposition=null | .challengerTimedOutAt=null |
      .finishIntent=null' <<<"$STATE")"
   write_pr_state "$PR" "$STATE"
@@ -2207,10 +2213,13 @@ if [ -s "$SETTLE_CANDIDATES" ]; then
     RUN_ID="${RUN_PREFIX}-pr${W_PR}-${HEAD_SHA:0:12}-$(date -u -d "@$RUN_STAMP_EPOCH" +%Y%m%dT%H%M%SZ)"
   done
   NOW="$(iso_now)"
+  # Same-SHA recovery keeps the original challenger deadline (see `claim`).
   STATE="$(jq -c --arg sha "$HEAD_SHA" --arg now "$NOW" --arg run "$RUN_ID" \
     --arg deadline "$(challenger_deadline_from_now)" \
-    '.activeSha=$sha | .activeStartedAt=$now | .activeRunId=$run | .activeProgressAt=null |
-     .challengerDeadline=$deadline |
+    '(if (.activeSha == $sha and (.challengerDeadline // "") != "" and .challengerDisposition == null)
+      then .challengerDeadline else $deadline end) as $dl |
+     .activeSha=$sha | .activeStartedAt=$now | .activeRunId=$run | .activeProgressAt=null |
+     .challengerDeadline=$dl |
      .challengerDisposition=null | .challengerTimedOutAt=null | .finishIntent=null' <<<"$STATE")"
   # Deliberately NO lease here. `poll` registers a RUN, not a coordinator — it
   # runs as the token-free watcher, so a lease in its name would be owned by
