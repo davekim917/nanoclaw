@@ -151,6 +151,17 @@ metadata. One stable host lock inode serializes create/fetch, refresh, transfer,
 cleanup, and maintenance. Origin pins and transfer tombstones live in
 `data/repository-state/<workgroup>/<repo>` and are not agent-writable.
 
+`repository_publish`, `repository_transfer` and `repository_refresh` are handled
+off the serial outbound-delivery drain (`src/modules/repository-workspaces/job-runner.ts`):
+the delivery loop acks the row and one global FIFO chain runs the action, so no
+other session's messages queue behind a publication. That is what lets the mount
+quiescence wait `NANOCLAW_REPOSITORY_QUIESCE_TIMEOUT_MS` (default 600000, ten
+minutes) for sibling containers to reach a safe point before it kills them;
+every other `quiesceSessionsForRepositoryMounts` caller keeps the 120s default.
+Each action gets one attempt per host process — a retry would re-fence and
+re-kill every sibling — and a host that dies mid-action replays it on the next
+start, because the undelivered `messages_out` row is the durable record.
+
 `scripts/migrate-repo-store.ts` inventories legacy clones, mirrors, and collided
 worktrees read-only by default. `--execute --quiesced` is accepted only with a
 stopped service, zero install containers, no repository writers, and a passing

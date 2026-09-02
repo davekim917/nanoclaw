@@ -69,6 +69,7 @@ import {
   withWorkgroupRepositoryMountClaim,
   writeTransferTombstone,
 } from '../../repository-workspaces.js';
+import { REPOSITORY_MOUNT_QUIESCENCE_TIMEOUT_MS } from '../../config.js';
 import { sessionDir } from '../../session-manager.js';
 import { closeDb, initTestDb } from '../../db/connection.js';
 import { runMigrations } from '../../db/migrations/index.js';
@@ -244,7 +245,6 @@ describe('durable canonical publication core', () => {
           repositoryId: 'github.com/attacker/forged-action',
         },
         requester,
-        {} as never,
       ),
     ).rejects.toThrow(/repository identity does not match normalized origin/);
     expect(hostActionMocks.releaseRepositoryMountQuiescence).toHaveBeenCalledTimes(1);
@@ -424,10 +424,15 @@ describe('durable canonical publication core', () => {
       return [];
     });
     hostActionMocks.quiesceSessionsForRepositoryMounts.mockImplementation(
-      async (sessions: Session[], epoch: string) => {
+      async (sessions: Session[], epoch: string, timeoutMs: number) => {
         expect(isWorkgroupRepositoryMountClaimed('wg-a')).toBe(true);
         expect(sessions).toEqual(mountSessions);
         expect(epoch).toBe(`repository-publish:${requestId}`);
+        // Detached from the delivery drain, so the wait for siblings to reach a
+        // safe point is the configured one (10 min), not container-restart's
+        // 120s default that still governs every inline caller.
+        expect(timeoutMs).toBe(REPOSITORY_MOUNT_QUIESCENCE_TIMEOUT_MS);
+        expect(REPOSITORY_MOUNT_QUIESCENCE_TIMEOUT_MS).toBe(600_000);
         lifecycle.push('quiesce');
         return { epoch, sessions, barrierSessions: sessions };
       },
@@ -463,7 +468,7 @@ describe('durable canonical publication core', () => {
     cloneTo(stage);
     const action = { requestId, repo: 'proj', origin: remote, repositoryId: remote };
 
-    await applyRepositoryPublishAction(action, requester, {} as never);
+    await applyRepositoryPublishAction(action, requester);
     const canonical = canonicalRepoDir('wg-a', 'proj', hostActionDataDir);
     expect(fs.existsSync(path.join(canonical, '.git'))).toBe(true);
     expect(fs.existsSync(stage)).toBe(false);
@@ -473,7 +478,7 @@ describe('durable canonical publication core', () => {
 
     // Crash replay: the durable action is retried after the staging checkout
     // was atomically renamed and after the deterministic confirmation landed.
-    await applyRepositoryPublishAction(action, requester, {} as never);
+    await applyRepositoryPublishAction(action, requester);
     expect(lifecycle).toEqual(['quiesce', 'release', 'wake', 'quiesce', 'release', 'wake']);
     expect(hostActionMocks.writeSessionMessageIfNew).toHaveBeenCalledTimes(2);
     expect(hostActionMocks.writeSessionMessageIfNew.mock.calls.map((call) => call[2].id)).toEqual([
@@ -544,11 +549,7 @@ describe('durable canonical publication core', () => {
     );
     cloneTo(stage);
     await expect(
-      applyRepositoryPublishAction(
-        { requestId, repo: 'proj', origin: remote, repositoryId: remote },
-        requester,
-        {} as never,
-      ),
+      applyRepositoryPublishAction({ requestId, repo: 'proj', origin: remote, repositoryId: remote }, requester),
     ).rejects.toThrow(/partial repository quiescence failed/);
 
     expect(hostActionMocks.releaseRepositoryMountQuiescence).not.toHaveBeenCalled();
@@ -999,9 +1000,10 @@ describe('exact topic transfer', () => {
     const observedEpochs: string[] = [];
     const delivered = new Set<string>();
     hostActionMocks.quiesceSessionsForRepositoryMounts.mockImplementation(
-      async (sessions: Session[], requestedEpoch: string) => {
+      async (sessions: Session[], requestedEpoch: string, timeoutMs: number) => {
         expect(sessions.map((candidate) => candidate.id)).toEqual([destinationSession.id]);
         expect(requestedEpoch).toBe(epoch);
+        expect(timeoutMs).toBe(REPOSITORY_MOUNT_QUIESCENCE_TIMEOUT_MS);
         observedEpochs.push(requestedEpoch);
         if (durableBarrier === 'none') durableBarrier = 'active';
         else expect(durableBarrier).toBe('active');
@@ -1037,7 +1039,7 @@ describe('exact topic transfer', () => {
       sourceThreadId: sourceSession.thread_id,
       destinationWorkUnitKey: destination.key,
     };
-    await expect(applyRepositoryTransferAction(action, destinationSession, {} as never)).rejects.toThrow(
+    await expect(applyRepositoryTransferAction(action, destinationSession)).rejects.toThrow(
       /ingress barrier could not be released/,
     );
     expect(fs.existsSync(sourcePath)).toBe(false);
@@ -1046,7 +1048,7 @@ describe('exact topic transfer', () => {
     expect(durableBarrier).toBe('active');
     expect(hostActionMocks.wakeRepositoryMountSessions).not.toHaveBeenCalled();
 
-    await applyRepositoryTransferAction(action, destinationSession, {} as never);
+    await applyRepositoryTransferAction(action, destinationSession);
     expect(observedEpochs).toEqual([epoch, epoch]);
     expect(durableBarrier).toBe('released');
     expect(fs.readFileSync(path.join(destinationPath, 'ongoing.txt'), 'utf8')).toBe('preserve through replay\n');
