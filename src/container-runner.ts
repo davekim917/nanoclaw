@@ -887,6 +887,7 @@ async function spawnContainer(
   let channelDefaultModel: string | null = null;
   let channelDefaultEffort: string | null = null;
   let channelDefaultTone: string | null = null;
+  let channelInstructionsProfile: string | null = null;
   if (session.messaging_group_id) {
     const { getMessagingGroupAgentByPair } = await import('./db/messaging-groups.js');
     const wiring = getMessagingGroupAgentByPair(session.messaging_group_id, agentGroup.id);
@@ -894,6 +895,7 @@ async function spawnContainer(
       channelDefaultModel = wiring.default_model;
       channelDefaultEffort = wiring.default_effort;
       channelDefaultTone = wiring.default_tone;
+      channelInstructionsProfile = wiring.instructions_profile;
     }
   }
 
@@ -916,6 +918,7 @@ async function spawnContainer(
       channelDefaultModel,
       channelDefaultEffort,
       channelDefaultTone,
+      channelInstructionsProfile,
     },
     session.messaging_group_id ?? null,
     resolvedWgId,
@@ -1669,6 +1672,90 @@ function resolveProviderContribution(
   return { provider, contribution };
 }
 
+/**
+ * Read-only mounts for a group's per-channel operating instructions —
+ * `groups/<folder>/channel-instructions/*.md` at `/workspace/channel-instructions`.
+ * Selected per wiring through `messaging_group_agents.instructions_profile`;
+ * a SEPARATE layer from tone, which stays voice-only.
+ *
+ * Mounted FILE BY FILE rather than as one directory, and that is the whole
+ * trick. Workgroup siblings share one rule set by symlink (each sibling group
+ * points at the owning group's channel-instructions/<name>.md),
+ * and a per-file symlink cannot survive a directory bind here: the mount sits
+ * at /workspace/channel-instructions, two levels from container root, while
+ * its host source sits at groups/<folder>/channel-instructions, three levels
+ * from the project root — so a relative link like
+ * ../../<owner>/channel-instructions/<name>.md resolves to a different place on
+ * each side and dangles inside the container. Resolving host-side and binding
+ * the real file at a literal destination sidesteps that entirely, and matches
+ * how standing-instructions.md is already shared: the host resolves that one
+ * host-side too (readGroupPersona), never in the container. A directory-level
+ * symlink works as well, since realpathSync covers both shapes.
+ *
+ * SECURITY: same boundary as the symlink overlay in buildMounts — the group
+ * dir is mounted RW, so an agent could plant
+ * channel-instructions/x.md -> /etc/shadow and have the host bind it into its
+ * own always-on prompt. `isAllowedTarget` must be the overlay allowlist (own
+ * group dir, workgroup siblings, workgroup shared tree); anything resolving
+ * outside is skipped loudly rather than mounted.
+ */
+export function channelInstructionsMounts(
+  groupDir: string,
+  isAllowedTarget: (target: string) => boolean,
+  agentGroupId: string,
+): VolumeMount[] {
+  const dir = path.join(groupDir, 'channel-instructions');
+  let resolvedDir: string;
+  try {
+    resolvedDir = fs.realpathSync(dir);
+  } catch {
+    return [];
+  }
+  if (!isAllowedTarget(resolvedDir)) {
+    log.warn('Refusing channel-instructions mount outside workgroup boundary', {
+      agentGroupId,
+      dir,
+      target: resolvedDir,
+    });
+    return [];
+  }
+
+  const mounts: VolumeMount[] = [];
+  let entries: string[];
+  try {
+    entries = fs.readdirSync(resolvedDir);
+  } catch {
+    return [];
+  }
+  for (const entry of entries.sort()) {
+    if (!entry.endsWith('.md')) continue;
+    const linkPath = path.join(resolvedDir, entry);
+    let realFile: string;
+    try {
+      realFile = fs.realpathSync(linkPath);
+      if (!fs.statSync(realFile).isFile()) continue;
+    } catch {
+      // Dangling link or vanished file — nothing to bind, and a spawn must
+      // not fail over a stale entry in an advisory directory.
+      continue;
+    }
+    if (!isAllowedTarget(realFile)) {
+      log.warn('Refusing channel-instructions file outside workgroup boundary', {
+        agentGroupId,
+        file: linkPath,
+        target: realFile,
+      });
+      continue;
+    }
+    mounts.push({
+      hostPath: realFile,
+      containerPath: `/workspace/channel-instructions/${entry}`,
+      readonly: true,
+    });
+  }
+  return mounts;
+}
+
 export function buildMounts(
   agentGroup: AgentGroup,
   session: Session,
@@ -2323,6 +2410,9 @@ export function buildMounts(
       readonly: true,
     });
   }
+
+  // Per-channel operating instructions — see channelInstructionsMounts.
+  mounts.push(...channelInstructionsMounts(groupDir, isAllowedOverlayTarget, agentGroup.id));
 
   // Host-side credential dirs — gated by the per-agent `tools` allowlist in
   // container.json. Two modes:
@@ -3064,6 +3154,7 @@ async function buildContainerArgs(
     channelDefaultModel: string | null;
     channelDefaultEffort: string | null;
     channelDefaultTone: string | null;
+    channelInstructionsProfile?: string | null;
   },
   sessionMessagingGroupId?: string | null,
   // Resolved workgroup id from spawnContainer → reconcileWorkgroupAtSpawn.
@@ -3223,6 +3314,18 @@ async function buildContainerArgs(
   const defaultTone = channelDefaults?.channelDefaultTone ?? containerConfig.tone ?? null;
   if (defaultTone) {
     args.push('-e', `NANOCLAW_DEFAULT_TONE=${defaultTone}`);
+  }
+
+  // Per-channel operating instructions — a SEPARATE always-on layer from tone
+  // above, which stays voice-only. No container.json fallback on purpose: the
+  // group-wide equivalent is standing-instructions.md, already in every
+  // prompt, so a second group-level slot here would just be a duplicate with
+  // different precedence. Resolution is per-wiring or nothing. Profile content
+  // injection happens container-side in agent-runner/src/index.ts, ahead of
+  // the tone block, from the /workspace/channel-instructions mount.
+  const instructionsProfile = channelDefaults?.channelInstructionsProfile ?? null;
+  if (instructionsProfile) {
+    args.push('-e', `NANOCLAW_INSTRUCTIONS_PROFILE=${instructionsProfile}`);
   }
 
   // Per-session assistant name. Resolved channel-aware so the same

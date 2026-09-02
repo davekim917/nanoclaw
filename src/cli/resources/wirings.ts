@@ -32,6 +32,26 @@ const CREATE_ENUMS: Record<string, string[]> = {
   session_mode: ['shared', 'per-thread', 'agent-shared'],
 };
 
+/**
+ * A profile name indexes a filename under
+ * `groups/<folder>/channel-instructions/`, and the host forwards it verbatim
+ * into the container's environment — so an unconstrained value is a
+ * path-traversal read of the container FS by whoever can write a wiring.
+ * Rejected here rather than only in the runner, so the bad value never reaches
+ * the DB and `ncl wirings get` can't show a name that will never resolve.
+ * Same pattern the runner enforces (isSafeInstructionsProfileName).
+ */
+const INSTRUCTIONS_PROFILE_RE = /^[a-z0-9][a-z0-9-]*$/;
+
+function validateInstructionsProfile(v: unknown): void {
+  if (v === undefined || v === null || v === '') return;
+  if (!INSTRUCTIONS_PROFILE_RE.test(String(v))) {
+    throw new Error(
+      `--instructions-profile must match ${INSTRUCTIONS_PROFILE_RE.source} (lowercase letters, digits, dashes), got "${String(v)}"`,
+    );
+  }
+}
+
 function requireMessagingGroup(id: unknown): MessagingGroup {
   const mg = getMessagingGroup(String(id));
   if (!mg) throw new Error(`messaging group not found: ${id}`);
@@ -158,6 +178,14 @@ registerResource({
       updatable: true,
       nullable: true,
     },
+    {
+      name: 'instructions_profile',
+      type: 'string',
+      description:
+        'Operating rules for this channel — a profile name resolving to groups/<folder>/channel-instructions/<name>.md, injected always-on ahead of the tone block. A SEPARATE layer from --default-tone, which stays voice-only: put "only write to lab-* repos, never ask a question" here, not in a tone profile. Workgroup siblings share one rule set by symlinking the file. Lowercase name, digits and dashes. NULL = no channel instructions (the group\'s standing-instructions.md still applies); `--instructions-profile ""` clears it.',
+      updatable: true,
+      nullable: true,
+    },
     { name: 'created_at', type: 'string', description: 'Auto-set.', generated: true },
   ],
   // Generic create is replaced by the custom `create` below — it resolves
@@ -171,6 +199,9 @@ registerResource({
   preUpdate: (updates, current) => {
     const mg = requireMessagingGroup(current.messaging_group_id);
     if (updates.threads !== undefined) updates.threads = normalizeThreads(updates.threads);
+    // genericUpdate has already turned `--instructions-profile ""` into null
+    // (nullable column), so this only ever sees a real value to check.
+    validateInstructionsProfile(updates.instructions_profile);
 
     const merged: EngageValues = { ...current, ...updates };
     // Legacy rows can be engage_mode='pattern' with a NULL pattern (the
@@ -245,9 +276,10 @@ registerResource({
         if (args.priority !== undefined) values.priority = Number(args.priority);
         // Per-channel overrides. Omitted stays absent → column NULL → inherit
         // the group default, which is the right answer for almost every wiring.
-        for (const name of ['default_tone', 'default_model', 'default_effort'] as const) {
+        for (const name of ['default_tone', 'default_model', 'default_effort', 'instructions_profile'] as const) {
           if (args[name] !== undefined && args[name] !== '') values[name] = args[name];
         }
+        validateInstructionsProfile(values.instructions_profile);
 
         // Pass-2 parity: context-aware defaults + cross-column validation.
         const mg = requireMessagingGroup(values.messaging_group_id);

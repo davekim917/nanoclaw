@@ -431,6 +431,7 @@ describe('router', () => {
       default_model: null,
       default_effort: null,
       default_tone: null,
+      instructions_profile: null,
       created_at: now(),
     });
   });
@@ -568,6 +569,7 @@ describe('router', () => {
       default_model: null,
       default_effort: null,
       default_tone: null,
+      instructions_profile: null,
       created_at: now(),
     });
 
@@ -703,6 +705,7 @@ describe('router — channel instances', () => {
         default_model: null,
         default_effort: null,
         default_tone: null,
+        instructions_profile: null,
         created_at: now(),
       });
     }
@@ -877,6 +880,7 @@ describe('router — per-wiring thread policy', () => {
       default_model: null,
       default_effort: null,
       default_tone: null,
+      instructions_profile: null,
       created_at: now(),
     });
   });
@@ -1052,6 +1056,7 @@ describe('router — per-wiring thread policy', () => {
       default_model: null,
       default_effort: null,
       default_tone: null,
+      instructions_profile: null,
       created_at: now(),
     });
 
@@ -1132,6 +1137,7 @@ describe('routing metadata preservation', () => {
       default_model: null,
       default_effort: null,
       default_tone: null,
+      instructions_profile: null,
       created_at: now(),
     });
     // A live threaded adapter, matching real Discord routing — inbound
@@ -1210,6 +1216,7 @@ describe('routing metadata preservation', () => {
       default_model: null,
       default_effort: null,
       default_tone: null,
+      instructions_profile: null,
       created_at: now(),
     });
 

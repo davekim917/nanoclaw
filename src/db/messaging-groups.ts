@@ -226,13 +226,13 @@ function insertMessagingGroupAgentRow(mga: MessagingGroupAgent): void {
          id, messaging_group_id, agent_group_id,
          engage_mode, engage_pattern, sender_scope, ignored_message_policy,
          session_mode, priority, default_model, default_effort, default_tone,
-         created_at
+         instructions_profile, created_at
        )
        VALUES (
          @id, @messaging_group_id, @agent_group_id,
          @engage_mode, @engage_pattern, @sender_scope, @ignored_message_policy,
          @session_mode, @priority, @default_model, @default_effort, @default_tone,
-         @created_at
+         @instructions_profile, @created_at
        )`,
     )
     .run(mga);

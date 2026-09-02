@@ -623,6 +623,10 @@ async function routeInboundClaimed(event: InboundEvent, markReplayPending: () =>
           default_model: null,
           default_effort: null,
           default_tone: inheritedTone,
+          // Not inherited the way tone is: channel instructions are the rules
+          // of a specific room, so carrying them into a brand-new room would
+          // silently extend a scoped rule set past its scope.
+          instructions_profile: null,
           created_at: new Date().toISOString(),
         });
         log.info('Workspace-trust auto-wire', {

@@ -177,6 +177,7 @@ function makeAgent(overrides: Partial<MessagingGroupAgent> = {}): MessagingGroup
     default_model: null,
     default_effort: null,
     default_tone: null,
+    instructions_profile: null,
     created_at: new Date().toISOString(),
     ...overrides,
   };

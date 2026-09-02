@@ -143,6 +143,7 @@ function wire(
     default_model: null,
     default_effort: null,
     default_tone: null,
+    instructions_profile: null,
     created_at: now(),
   });
   if (opts.threads !== undefined && opts.threads !== null) {

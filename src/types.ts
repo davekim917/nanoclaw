@@ -220,6 +220,16 @@ export interface MessagingGroupAgent {
    */
   default_tone: string | null;
   /**
+   * Per-channel operating-instructions profile name (matches a file under
+   * `groups/<folder>/channel-instructions/<name>.md`). When set, the host
+   * forwards the name and the container injects the file ahead of the tone
+   * block, so operating rules are read before voice. A SEPARATE layer from
+   * `default_tone`, which stays voice-only. Null = no channel instructions;
+   * the group's standing-instructions.md is the group-wide equivalent and
+   * always applies.
+   */
+  instructions_profile: string | null;
+  /**
    * Per-wiring thread-policy override (migration 019). NULL = inherit the
    * channel adapter's declared default for the wiring's context (DM vs
    * group); 1/0 = explicit override, hard-ANDed with the adapter's raw

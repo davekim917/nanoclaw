@@ -196,6 +196,7 @@ function seedGroups({ withMg = false }: { withMg?: boolean } = {}): { orchSessio
       default_model: null,
       default_effort: null,
       default_tone: null,
+      instructions_profile: null,
       created_at: ts(),
     });
     getDb()

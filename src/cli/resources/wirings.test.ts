@@ -20,6 +20,7 @@ vi.mock('../../modules/agent-to-agent/write-destinations.js', () => ({
 import type { ChannelDefaults } from '../../channels/adapter.js';
 import { registerChannelAdapter } from '../../channels/channel-registry.js';
 import { initTestDb, closeDb, runMigrations, createAgentGroup, createMessagingGroup } from '../../db/index.js';
+import { getDb } from '../../db/connection.js';
 import { createMessagingGroupAgent, getMessagingGroupAgent } from '../../db/messaging-groups.js';
 import { lookup } from '../registry.js';
 // Side-effect import: registers wirings-create / wirings-update.
@@ -220,6 +221,7 @@ describe('wirings-update — same validation as create', () => {
       default_model: null,
       default_effort: null,
       default_tone: null,
+      instructions_profile: null,
       created_at: now(),
     });
 
@@ -254,6 +256,7 @@ describe('wirings — per-channel tone/model/effort overrides', () => {
       messaging_group_id: 'mg-group',
       agent_group_id: 'ag-1',
       default_tone: 'gilfoyle',
+      instructions_profile: null,
       default_model: 'sonnet',
       default_effort: 'xhigh',
     });
@@ -276,6 +279,7 @@ describe('wirings — per-channel tone/model/effort overrides', () => {
       messaging_group_id: 'mg-group',
       agent_group_id: 'ag-1',
       default_tone: 'jian-yang',
+      instructions_profile: null,
     });
     await update({ id: row.id, default_tone: '' });
     expect(stored(row.id).default_tone).toBeNull();
@@ -291,5 +295,103 @@ describe('wirings — per-channel tone/model/effort overrides', () => {
     await update({ id: row.id, default_model: '', default_effort: '' });
     expect(stored(row.id).default_model).toBeNull();
     expect(stored(row.id).default_effort).toBeNull();
+  });
+});
+
+describe('wirings — per-channel instructions profile', () => {
+  // The second per-channel always-on layer. It is NOT the tone slot: tone
+  // carries voice and only voice, and the two must stay independently
+  // settable, so every assertion here also pins that they don't clobber each
+  // other. Assertions read the persisted row, since create() returns the
+  // assembled values rather than a DB read.
+  const stored = (id: unknown) => getMessagingGroupAgent(id as string)!;
+
+  it('omitted stays NULL — no channel gains instructions by default', async () => {
+    const row = await create({ messaging_group_id: 'mg-group', agent_group_id: 'ag-1' });
+    expect(stored(row.id).instructions_profile).toBeNull();
+  });
+
+  it('create accepts a profile name', async () => {
+    const row = await create({
+      messaging_group_id: 'mg-group',
+      agent_group_id: 'ag-1',
+      instructions_profile: 'lab',
+    });
+    expect(stored(row.id).instructions_profile).toBe('lab');
+  });
+
+  it('create sets tone and instructions independently', async () => {
+    const row = await create({
+      messaging_group_id: 'mg-group',
+      agent_group_id: 'ag-1',
+      default_tone: 'gilfoyle',
+      instructions_profile: 'lab',
+    });
+    expect(stored(row.id).default_tone).toBe('gilfoyle');
+    expect(stored(row.id).instructions_profile).toBe('lab');
+  });
+
+  it('update sets it on an existing wiring', async () => {
+    const row = await create({ messaging_group_id: 'mg-group', agent_group_id: 'ag-1' });
+    await update({ id: row.id, instructions_profile: 'lab' });
+    expect(stored(row.id).instructions_profile).toBe('lab');
+  });
+
+  it('--instructions-profile "" clears back to NULL, not to empty string', async () => {
+    // '' would forward as an env value the runner then fails to resolve every
+    // spawn, logging a warning forever. A column that can be set but never
+    // unset is the trap this pins shut.
+    const row = await create({
+      messaging_group_id: 'mg-group',
+      agent_group_id: 'ag-1',
+      instructions_profile: 'lab',
+    });
+    await update({ id: row.id, instructions_profile: '' });
+    expect(stored(row.id).instructions_profile).toBeNull();
+  });
+
+  it('clearing instructions leaves tone untouched', async () => {
+    const row = await create({
+      messaging_group_id: 'mg-group',
+      agent_group_id: 'ag-1',
+      default_tone: 'gilfoyle',
+      instructions_profile: 'lab',
+    });
+    await update({ id: row.id, instructions_profile: '' });
+    expect(stored(row.id).instructions_profile).toBeNull();
+    expect(stored(row.id).default_tone).toBe('gilfoyle');
+  });
+
+  it.each([
+    ['Lab', 'uppercase'],
+    ['../etc/passwd', 'path traversal'],
+    ['lab profile', 'a space'],
+    ['-lab', 'a leading dash'],
+    ['lab.md', 'a dot'],
+    ['lab_x', 'an underscore'],
+  ])('create rejects %s (%s)', async (name) => {
+    await expect(
+      create({ messaging_group_id: 'mg-group', agent_group_id: 'ag-1', instructions_profile: name }),
+    ).rejects.toThrow(/--instructions-profile must match/);
+  });
+
+  it('update rejects an invalid name too', async () => {
+    const row = await create({ messaging_group_id: 'mg-group', agent_group_id: 'ag-1' });
+    await expect(update({ id: row.id, instructions_profile: '../../etc/shadow' })).rejects.toThrow(
+      /--instructions-profile must match/,
+    );
+    expect(stored(row.id).instructions_profile).toBeNull();
+  });
+
+  it('a rejected create writes no row at all', async () => {
+    // Validation runs before the INSERT, so a bad name must not leave a
+    // half-configured wiring behind that the operator then has to notice.
+    await expect(
+      create({ messaging_group_id: 'mg-dm', agent_group_id: 'ag-1', instructions_profile: 'BAD' }),
+    ).rejects.toThrow();
+    const rows = getDb()
+      .prepare(`SELECT id FROM messaging_group_agents WHERE messaging_group_id = 'mg-dm'`)
+      .all() as Array<{ id: string }>;
+    expect(rows).toHaveLength(0);
   });
 });

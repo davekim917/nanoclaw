@@ -205,6 +205,7 @@ describe('messaging group agents', () => {
     default_model: null,
     default_effort: null,
     default_tone: null,
+    instructions_profile: null,
     created_at: now(),
   });
 
@@ -380,6 +381,7 @@ describe('getChannelPeers — sibling-adapter awareness', () => {
       default_model: null,
       default_effort: null,
       default_tone: null,
+      instructions_profile: null,
       created_at: now(),
     };
     createMessagingGroupAgent({
@@ -481,6 +483,7 @@ describe('getChannelPeers — workgroup tenant boundary', () => {
       default_model: null,
       default_effort: null,
       default_tone: null,
+      instructions_profile: null,
       created_at: now(),
     };
     createMessagingGroupAgent({
@@ -537,6 +540,7 @@ describe('getChannelPeers — workgroup tenant boundary', () => {
       default_model: null,
       default_effort: null,
       default_tone: null,
+      instructions_profile: null,
       created_at: now(),
     });
     const { getChannelPeers } = await import('./messaging-groups.js');
@@ -736,6 +740,7 @@ describe('assertSameWorkgroupWiring (via createMessagingGroupAgent)', () => {
     default_model: null,
     default_effort: null,
     default_tone: null,
+    instructions_profile: null,
     created_at: now(),
   });
 

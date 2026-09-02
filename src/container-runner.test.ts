@@ -24,6 +24,7 @@ import {
   resolveCodexAuthFallbacks,
   materializeCodexFallbackRuntime,
   resolveProviderName,
+  channelInstructionsMounts,
   resolveAtlassianMcpServer,
   resolveWorkgroupMemoryLockMount,
   resolveWorkgroupMemoryMount,
@@ -1427,5 +1428,174 @@ describe('CLAUDE_CODE_OAUTH_SCOPES reaches the container', () => {
     const oauthBlock = source.slice(source.indexOf('if (hostOauth) {'));
     expect(oauthBlock.indexOf('CLAUDE_CODE_OAUTH_SCOPES')).toBeGreaterThan(-1);
     expect(oauthBlock.indexOf('CLAUDE_CODE_OAUTH_SCOPES')).toBeLessThan(oauthBlock.indexOf('const ghToken'));
+  });
+});
+
+// ── Per-channel instructions profile ─────────────────────────────────────────
+
+describe('channelInstructionsMounts', () => {
+  let root: string;
+  let groupDir: string;
+  let siblingDir: string;
+  let outsideDir: string;
+  let allowed: (target: string) => boolean;
+
+  beforeEach(() => {
+    root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'nc-chan-instr-')));
+    groupDir = path.join(root, 'groups', 'beta-codex');
+    siblingDir = path.join(root, 'groups', 'alpha');
+    outsideDir = path.join(root, 'elsewhere');
+    fs.mkdirSync(groupDir, { recursive: true });
+    fs.mkdirSync(siblingDir, { recursive: true });
+    fs.mkdirSync(outsideDir, { recursive: true });
+    // The overlay allowlist as buildMounts computes it: own group dir plus
+    // every workgroup sibling's. Nothing else.
+    const roots = [groupDir, siblingDir];
+    allowed = (target) => roots.some((r) => target === r || target.startsWith(r + path.sep));
+    vi.mocked(log.warn).mockClear();
+  });
+
+  it('returns nothing when the group has no channel-instructions directory', () => {
+    expect(channelInstructionsMounts(groupDir, allowed, 'ag-1')).toEqual([]);
+  });
+
+  it('binds each profile read-only at its own container path', () => {
+    const dir = path.join(groupDir, 'channel-instructions');
+    fs.mkdirSync(dir);
+    fs.writeFileSync(path.join(dir, 'lab.md'), 'lab rules');
+    fs.writeFileSync(path.join(dir, 'support.md'), 'support rules');
+
+    const mounts = channelInstructionsMounts(groupDir, allowed, 'ag-1');
+    expect(mounts).toEqual([
+      { hostPath: path.join(dir, 'lab.md'), containerPath: '/workspace/channel-instructions/lab.md', readonly: true },
+      {
+        hostPath: path.join(dir, 'support.md'),
+        containerPath: '/workspace/channel-instructions/support.md',
+        readonly: true,
+      },
+    ]);
+  });
+
+  it('ignores non-markdown entries and subdirectories', () => {
+    const dir = path.join(groupDir, 'channel-instructions');
+    fs.mkdirSync(dir);
+    fs.writeFileSync(path.join(dir, 'lab.md'), 'lab rules');
+    fs.writeFileSync(path.join(dir, 'notes.txt'), 'not a profile');
+    fs.mkdirSync(path.join(dir, 'archive.md'));
+
+    const mounts = channelInstructionsMounts(groupDir, allowed, 'ag-1');
+    expect(mounts.map((m) => m.containerPath)).toEqual(['/workspace/channel-instructions/lab.md']);
+  });
+
+  it('resolves a per-file symlink to a workgroup sibling — the sharing case', () => {
+    // the owning group holds the file; the codex and opencode siblings link to it, so a
+    // rule edit lands once. The bind must point at the REAL file: a symlink
+    // relative to the container mount point resolves somewhere else entirely
+    // and would dangle.
+    const sibDir = path.join(siblingDir, 'channel-instructions');
+    fs.mkdirSync(sibDir);
+    fs.writeFileSync(path.join(sibDir, 'lab.md'), 'lab rules');
+
+    const dir = path.join(groupDir, 'channel-instructions');
+    fs.mkdirSync(dir);
+    fs.symlinkSync('../../alpha/channel-instructions/lab.md', path.join(dir, 'lab.md'));
+
+    const mounts = channelInstructionsMounts(groupDir, allowed, 'ag-1');
+    expect(mounts).toEqual([
+      {
+        hostPath: path.join(sibDir, 'lab.md'),
+        containerPath: '/workspace/channel-instructions/lab.md',
+        readonly: true,
+      },
+    ]);
+  });
+
+  it('resolves a directory-level symlink to a workgroup sibling', () => {
+    const sibDir = path.join(siblingDir, 'channel-instructions');
+    fs.mkdirSync(sibDir);
+    fs.writeFileSync(path.join(sibDir, 'lab.md'), 'lab rules');
+    fs.symlinkSync('../alpha/channel-instructions', path.join(groupDir, 'channel-instructions'));
+
+    const mounts = channelInstructionsMounts(groupDir, allowed, 'ag-1');
+    expect(mounts).toEqual([
+      {
+        hostPath: path.join(sibDir, 'lab.md'),
+        containerPath: '/workspace/channel-instructions/lab.md',
+        readonly: true,
+      },
+    ]);
+  });
+
+  it('refuses a file symlink escaping the workgroup, and says so', () => {
+    // The group dir is mounted RW, so this is a path an agent can actually
+    // create. Binding it would put arbitrary host content into that agent's
+    // own always-on prompt.
+    fs.writeFileSync(path.join(outsideDir, 'secrets.md'), 'other tenant');
+    const dir = path.join(groupDir, 'channel-instructions');
+    fs.mkdirSync(dir);
+    fs.symlinkSync(path.join(outsideDir, 'secrets.md'), path.join(dir, 'lab.md'));
+
+    expect(channelInstructionsMounts(groupDir, allowed, 'ag-1')).toEqual([]);
+    expect(log.warn).toHaveBeenCalledWith(
+      'Refusing channel-instructions file outside workgroup boundary',
+      expect.objectContaining({ agentGroupId: 'ag-1' }),
+    );
+  });
+
+  it('refuses a directory symlink escaping the workgroup, and binds none of it', () => {
+    fs.mkdirSync(path.join(outsideDir, 'channel-instructions'));
+    fs.writeFileSync(path.join(outsideDir, 'channel-instructions', 'lab.md'), 'other tenant');
+    fs.symlinkSync(path.join(outsideDir, 'channel-instructions'), path.join(groupDir, 'channel-instructions'));
+
+    expect(channelInstructionsMounts(groupDir, allowed, 'ag-1')).toEqual([]);
+    expect(log.warn).toHaveBeenCalledWith(
+      'Refusing channel-instructions mount outside workgroup boundary',
+      expect.objectContaining({ agentGroupId: 'ag-1' }),
+    );
+  });
+
+  it('skips a dangling link without failing the spawn', () => {
+    const dir = path.join(groupDir, 'channel-instructions');
+    fs.mkdirSync(dir);
+    fs.writeFileSync(path.join(dir, 'lab.md'), 'lab rules');
+    fs.symlinkSync('../../alpha/channel-instructions/gone.md', path.join(dir, 'gone.md'));
+
+    const mounts = channelInstructionsMounts(groupDir, allowed, 'ag-1');
+    expect(mounts.map((m) => m.containerPath)).toEqual(['/workspace/channel-instructions/lab.md']);
+  });
+});
+
+// buildContainerArgs makes live onecli shell calls and cannot be executed
+// here, so the forward is guarded at the source level — the same shape used
+// for CLAUDE_CODE_OAUTH_LANES above, and for the same reason: nothing else in
+// the suite would notice the variable going missing. A wiring would just stop
+// having channel rules, silently, with the agent still answering.
+describe('NANOCLAW_INSTRUCTIONS_PROFILE reaches the container', () => {
+  const source = fs
+    .readFileSync(path.join(import.meta.dirname, 'container-runner.ts'), 'utf8')
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/(^|[^:])\/\/.*$/gm, '$1');
+
+  it('reads the profile off the wiring row next to the tone', () => {
+    expect(source).toMatch(/channelInstructionsProfile = wiring\.instructions_profile/);
+  });
+
+  it('pushes an -e forward for the profile name', () => {
+    expect(source).toMatch(/args\.push\(\s*'-e',\s*`NANOCLAW_INSTRUCTIONS_PROFILE=/);
+  });
+
+  it('forwards only when the wiring sets one', () => {
+    // An unconditional push would send the literal string "null" and the
+    // runner would warn about a missing profile on every spawn of every
+    // channel that never wanted one.
+    expect(source).toMatch(/if\s*\(\s*instructionsProfile\s*\)\s*\{?\s*args\.push/);
+  });
+
+  it('has no container.json fallback — per-wiring or nothing', () => {
+    // Tone falls through to containerConfig.tone. Instructions deliberately
+    // do not: the group-wide equivalent is standing-instructions.md, and a
+    // second group-level slot here would only be a way for the two to
+    // disagree.
+    expect(source).toMatch(/const instructionsProfile = channelDefaults\?\.channelInstructionsProfile \?\? null;/);
   });
 });

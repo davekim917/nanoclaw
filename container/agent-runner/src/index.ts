@@ -37,6 +37,7 @@ import { createProvider, type ProviderName } from './providers/factory.js';
 import type { McpServerConfig } from './providers/types.js';
 import { runPollLoop } from './poll-loop.js';
 import { readToneProfile } from './tone-profiles.js';
+import { readChannelInstructions, isSafeInstructionsProfileName } from './channel-instructions.js';
 import {
   setupCodexPrimaryRuntime,
   setupCodexRuntime,
@@ -96,7 +97,9 @@ async function main(): Promise<void> {
   // occupy the same single slot. THIS IS THE ONLY ALWAYS-ON VOICE LAYER: never
   // add a second one (a persona section in a group's instructions file, say),
   // because a per-group layer cannot vary by channel and ends up arguing with
-  // this one in rooms where a different voice was selected.
+  // this one in rooms where a different voice was selected. Operating rules
+  // are a SEPARATE layer (channel instructions, just below) — that one is not
+  // a second voice slot and does not compete with this invariant.
   let toneBlock: string | undefined;
   const toneName = process.env.NANOCLAW_DEFAULT_TONE;
   if (toneName) {
@@ -118,7 +121,38 @@ async function main(): Promise<void> {
     "Before saying a service is unavailable, verify it with `mcp__nanoclaw__get_capabilities` using `section: \"session\"`. Absence of a dedicated MCP tool is not proof of no access; follow the live snapshot's activation instructions.",
   ].join('\n');
 
-  const baseInstructions = [toneBlock, capabilityNote, addendum].filter(Boolean).join('\n\n');
+  // Always-on per-channel operating rules. Host resolves
+  // messaging_group_agents.instructions_profile for this wiring and forwards
+  // the name in NANOCLAW_INSTRUCTIONS_PROFILE; the file is mounted read-only
+  // at /workspace/channel-instructions (see ./channel-instructions.ts).
+  //
+  // Ordered FIRST in baseInstructions, ahead of the tone block: these are the
+  // rules of the room (what the agent may touch, whether it may ask), and a
+  // rule the agent reads after being told how to sound is a rule it has
+  // already had a chance to break. A missing or unreadable file is a warning,
+  // never a session failure — a wiring pointing at a profile that was renamed
+  // must still answer, in the group's default posture.
+  let channelInstructionsBlock: string | undefined;
+  const instructionsProfile = process.env.NANOCLAW_INSTRUCTIONS_PROFILE;
+  if (instructionsProfile) {
+    if (!isSafeInstructionsProfileName(instructionsProfile)) {
+      log(
+        `NANOCLAW_INSTRUCTIONS_PROFILE=${instructionsProfile} is not a valid profile name (expected ^[a-z0-9][a-z0-9-]*$) — skipping injection`,
+      );
+    } else {
+      const content = readChannelInstructions(instructionsProfile);
+      if (content !== null) {
+        channelInstructionsBlock = `# Channel instructions (${instructionsProfile})\n\nOperating rules for THIS channel, on top of your standing instructions. Where they conflict with a general habit of yours, these win; where they conflict with an explicit instruction from the user in this conversation, the user wins.\n\n${content}`;
+        log(`Loaded channel instructions profile: ${instructionsProfile}`);
+      } else {
+        log(
+          `NANOCLAW_INSTRUCTIONS_PROFILE=${instructionsProfile} but no such file in /workspace/channel-instructions — skipping injection`,
+        );
+      }
+    }
+  }
+
+  const baseInstructions = [channelInstructionsBlock, toneBlock, capabilityNote, addendum].filter(Boolean).join('\n\n');
 
   // Discover additional directories mounted at /workspace/extra/*
   const additionalDirectories: string[] = [];

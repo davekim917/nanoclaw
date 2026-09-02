@@ -185,6 +185,7 @@ export const resolver: UnwiredChannelResolverFn = (event, mg) => {
     default_model: null,
     default_effort: null,
     default_tone: null,
+    instructions_profile: null,
     created_at: new Date().toISOString(),
   };
 
