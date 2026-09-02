@@ -1,6 +1,8 @@
 import { describe, it, expect } from 'bun:test';
 
 import {
+  AGENT_API_ERROR_TERMINATION_RE,
+  AGENT_API_RATE_LIMIT_SUFFIX_RE,
   QUOTA_EMBEDDED_RE,
   QUOTA_RESULT_RE,
   SUBAGENT_QUOTA_REPLACEMENT_TEXT,
@@ -8,6 +10,8 @@ import {
   SUBAGENT_TOOL_MATCHER,
   SUBAGENT_TOOL_NAMES,
   SUBSCRIPTION_BLOCKED_RE,
+  TRANSIENT_OVERLOAD_EMBEDDED_RE,
+  TRANSIENT_OVERLOAD_RESULT_RE,
   classifySubagentQuotaText,
   createSubagentQuotaHook,
   subagentQuotaFromTaskNotification,
@@ -36,6 +40,11 @@ const QUOTA_WORDINGS = [
   'You’ve hit your org’s monthly spend limit · resets July 1',
   "You've reached your account's monthly credit limit",
   "You've hit your team's daily token limit",
+  // per-seat spend cap (2026-09-02 20:18 UTC incident wording) — "individual"
+  // was missing from the qualifier class, so this whole sentence scored null
+  // on BOTH surfaces and rotation never fired.
+  "You've hit your individual spend limit · ask your admin to raise it at claude.ai/settings/usage",
+  "You've reached your individual limit",
 ];
 
 const BLOCKED_WORDINGS = [
@@ -393,6 +402,136 @@ describe('SUBAGENT_TOOL_MATCHER', () => {
     for (const name of SUBAGENT_TOOL_NAMES) {
       expect(cliMatches(SUBAGENT_TOOL_MATCHER, name)).toBe(true);
       expect(subagentQuotaFromTaskNotification({ status: 'failed', summary: INCIDENT_SUMMARY }, name)).not.toBe(null);
+    }
+  });
+});
+
+// ── Tier 2: the CLI's structured termination template ──
+//
+// Verbatim from the 2026-09-02 20:18:54 UTC incident. A `worker-high` subagent
+// on claude-opus-5 died; the parent got this as a task_notification (status
+// 'failed', tool 'Agent'). classifySubagentQuotaText returned null, because
+// "individual" was absent from the tier-1 qualifier class. Rotation had
+// headroom (slot _2 at 24% utilization); instead the parent relayed "ask your
+// admin to raise it" and an admin raised an org spend cap that was not the
+// problem. Fourth wording to break rotation this way — hence tier 2.
+const INDIVIDUAL_SPEND_SUMMARY =
+  'Agent "Patch tracking-plan generator design + mutation tests" failed: Agent terminated early ' +
+  "due to an API error: You've hit your individual spend limit · ask your admin to raise it at " +
+  'claude.ai/settings/usage?from=cc_cli_limit_message · your session limit resets 6pm ' +
+  '(America/New_York) (error type rate_limit, HTTP 429, request id req_011CefENdXLniLiJrk8w2jD3, ' +
+  'model sent to the API: claude-opus-5)';
+
+/**
+ * How the CLI wraps EVERY subagent API death (verified against the claude
+ * 2.1.259 binary's AgentApiErrorTerminationError constructor): the prose slot
+ * varies, the wrapper and the parenthesized field list do not.
+ */
+function terminationTemplate(prose: string, fields: string): string {
+  return `Agent "x" failed: Agent terminated early due to an API error: ${prose} (${fields})`;
+}
+
+const RATE_LIMIT_FIELDS = 'error type rate_limit, HTTP 429, request id r, model sent to the API: claude-opus-5';
+
+describe('tier 2: structured termination template', () => {
+  it('classifies the 2026-09-02 individual-spend incident on both entry points', () => {
+    expect(classifySubagentQuotaText(INDIVIDUAL_SPEND_SUMMARY)).toBe('subscription_quota_exhausted');
+    const marked = subagentQuotaFromTaskNotification({ status: 'failed', summary: INDIVIDUAL_SPEND_SUMMARY }, 'Agent');
+    expect(marked).not.toBe(null);
+    expect(marked!.startsWith('subscription_quota_exhausted: ')).toBe(true);
+  });
+
+  it('repairs the top-level result path for the same wording', () => {
+    // The bare sentence, as it would arrive as a top-level `result` on the
+    // parent's own credential rather than a subagent's. Anchored form, so this
+    // is the tier-1 fix and not tier 2 doing the work.
+    const bare = "You've hit your individual spend limit · ask your admin to raise it at claude.ai/settings/usage";
+    expect(QUOTA_RESULT_RE.test(bare)).toBe(true);
+  });
+
+  it('catches a wording tier 1 has never seen', () => {
+    const summary = terminationTemplate("You've hit your galactic overdrive limit · resets 3pm", RATE_LIMIT_FIELDS);
+    // Load-bearing: if tier 1 matched this, the test would not exercise tier 2.
+    expect(QUOTA_EMBEDDED_RE.test(summary)).toBe(false);
+    expect(SUBSCRIPTION_BLOCKED_EMBEDDED_RE.test(summary)).toBe(false);
+    expect(classifySubagentQuotaText(summary)).toBe('subscription_quota_exhausted');
+    expect(subagentQuotaFromTaskNotification({ status: 'failed', summary }, 'Agent')).not.toBe(null);
+  });
+
+  it('excludes transient server overload, which carries the same rate_limit/429 fields', () => {
+    // Rotation is the WRONG cure for an overloaded server — another credential
+    // hits the same server. This exclusion is why tier 2 is safe to widen.
+    for (const prose of [
+      'API Error: Server is temporarily limiting requests (not your usage limit) · Rate limited',
+      'API Error: Request rejected (429) · this may be a temporary cap',
+    ]) {
+      const summary = terminationTemplate(prose, RATE_LIMIT_FIELDS);
+      // Both tier-2 conditions hold; only the transient exclusion saves it.
+      expect(AGENT_API_ERROR_TERMINATION_RE.test(summary)).toBe(true);
+      expect(AGENT_API_RATE_LIMIT_SUFFIX_RE.test(summary)).toBe(true);
+      expect(classifySubagentQuotaText(summary)).toBe(null);
+      expect(subagentQuotaFromTaskNotification({ status: 'failed', summary }, 'Agent')).toBe(null);
+    }
+  });
+
+  it('ignores a subagent death that is not a rate limit', () => {
+    for (const fields of [
+      'error type api_error, HTTP 500, request id r, model sent to the API: claude-opus-5',
+      'error type overloaded_error, HTTP 529, request id r, model sent to the API: claude-opus-5',
+    ]) {
+      const summary = terminationTemplate('The upstream service failed', fields);
+      expect(AGENT_API_ERROR_TERMINATION_RE.test(summary)).toBe(true);
+      expect(AGENT_API_RATE_LIMIT_SUFFIX_RE.test(summary)).toBe(false);
+      expect(classifySubagentQuotaText(summary)).toBe(null);
+      expect(subagentQuotaFromTaskNotification({ status: 'failed', summary }, 'Agent')).toBe(null);
+    }
+  });
+
+  it('ignores prose that quotes the field words outside the template', () => {
+    // Both conditions are required, so neither half alone can trip it.
+    expect(classifySubagentQuotaText('The run stopped with error type rate_limit, HTTP 429 last night.')).toBe(null);
+    expect(classifySubagentQuotaText('I saw (error type rate_limit, HTTP 429) in the logs and backed off.')).toBe(null);
+    expect(classifySubagentQuotaText('Agent terminated early due to an API error: the sandbox ran out of disk.')).toBe(
+      null,
+    );
+  });
+
+  it('leaves the replacement text unclassified, so a replay cannot loop', () => {
+    expect(AGENT_API_ERROR_TERMINATION_RE.test(SUBAGENT_QUOTA_REPLACEMENT_TEXT)).toBe(false);
+    expect(AGENT_API_RATE_LIMIT_SUFFIX_RE.test(SUBAGENT_QUOTA_REPLACEMENT_TEXT)).toBe(false);
+    expect(classifySubagentQuotaText(SUBAGENT_QUOTA_REPLACEMENT_TEXT)).toBe(null);
+  });
+});
+
+// The transient pattern is now single-sourced the same way the quota pattern
+// is. The anchored export keeps the top-level result path's exact semantics;
+// the embedded twin is what the tier-2 exclusion runs.
+describe('TRANSIENT_OVERLOAD anchored and embedded stay in lockstep', () => {
+  const ANCHORED_FORMS = [
+    'API Error: Server is temporarily limiting requests (not your usage limit) · Rate limited',
+    'API Error: Request rejected (429) · this may be a temporary cap',
+  ];
+
+  it('still matches every form the anchored pattern always matched', () => {
+    for (const form of ANCHORED_FORMS) {
+      expect(TRANSIENT_OVERLOAD_RESULT_RE.test(form)).toBe(true);
+      expect(TRANSIENT_OVERLOAD_EMBEDDED_RE.test(form)).toBe(true);
+    }
+  });
+
+  it('matches mid-string only on the embedded twin', () => {
+    for (const form of ANCHORED_FORMS) {
+      const wrapped = terminationTemplate(form, RATE_LIMIT_FIELDS);
+      expect(TRANSIENT_OVERLOAD_RESULT_RE.test(wrapped)).toBe(false);
+      expect(TRANSIENT_OVERLOAD_EMBEDDED_RE.test(wrapped)).toBe(true);
+    }
+  });
+
+  it('keeps rejecting quota prose and benign mentions on both forms', () => {
+    for (const re of [TRANSIENT_OVERLOAD_RESULT_RE, TRANSIENT_OVERLOAD_EMBEDDED_RE]) {
+      expect(re.test("You've hit your session limit · resets 10:30pm")).toBe(false);
+      expect(re.test('The endpoint returned a 429, so I backed off.')).toBe(false);
+      expect(re.test('I saw a server temporarily limiting requests earlier.')).toBe(false);
     }
   });
 });

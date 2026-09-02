@@ -675,18 +675,31 @@ const RETRYABLE_ERROR_RE =
 // nor the in-stream rate_limit_event path triggers. Detect the text and
 // re-throw to engage rotation.
 //
-// Three distinct surfacings, all handled here:
+// Four distinct surfacings, all handled here:
 //   - weekly/extra cap: "You're out of extra usage · resets …"
 //   - 5-hour session-window cap: "You've hit your session limit · resets …"
 //   - org/credit spend cap: "You've hit your org's monthly spend limit ·
 //     ask your admin to raise it at claude.ai/settings/usage" (first seen
 //     2026-06-11, ahead of the June-15 Agent SDK credit change; surfaces
 //     with "org" wording even on individual subscription accounts)
-// Each new wording has broken rotation once before being added: the
-// session-window form wasn't matched by the original usage-only regex, and
-// the org-spend form wasn't matched by the enumerated-qualifier form — in
-// both cases rotation silently failed and the dead-stop quota message was
-// dispatched to the user instead of advancing to the next OAuth fallback.
+//   - per-seat spend cap: "You've hit your individual spend limit · ask your
+//     admin to raise it at claude.ai/settings/usage · your session limit
+//     resets 6pm" (first seen 2026-09-02 20:18 UTC, on a `worker-high`
+//     subagent; "individual" was absent from the qualifier class, so the
+//     whole sentence failed to match)
+// Each new wording has broken rotation once before being added — four times
+// now. The session-window form wasn't matched by the original usage-only
+// regex; the org-spend form wasn't matched by the enumerated-qualifier form;
+// the individual-spend form wasn't matched by the qualifier word-class. Every
+// time, rotation silently failed with headroom left on the ring and the
+// dead-stop quota message was dispatched to the user (2026-09-02: relayed as
+// "ask your admin to raise it", and an admin raised a cap that did not need
+// raising) instead of advancing to the next OAuth fallback.
+//
+// That track record is why enumerating prose is now only TIER ONE of the
+// subagent classifier. Tier two (AGENT_API_ERROR_TERMINATION_RE +
+// AGENT_API_RATE_LIMIT_SUFFIX_RE, below) keys off the CLI's structured
+// parenthesized suffix instead, and catches a wording nobody has seen yet.
 //
 // Strict-anchored on the "You're/You've …" sentence opener to avoid
 // false-positives on agent prose that mentions "usage" or "limit" in passing.
@@ -707,7 +720,7 @@ const RETRYABLE_ERROR_RE =
 // updated in one place, rotation silently keeps working on one surface and
 // silently stops on the other.
 const QUOTA_PATTERN_BODY =
-  "You['’]?(re|ve) (out of (extra |daily |weekly )?usage|(hit|reached) your ((org['’]?s |team['’]?s |account['’]?s |session |usage |weekly |daily |monthly |annual |spend(ing)? |token |credit )*)limit)\\b";
+  "You['’]?(re|ve) (out of (extra |daily |weekly )?usage|(hit|reached) your ((org['’]?s |team['’]?s |account['’]?s |individual |session |usage |weekly |daily |monthly |annual |spend(ing)? |token |credit )*)limit)\\b";
 
 export const QUOTA_RESULT_RE = new RegExp(`^\\s*${QUOTA_PATTERN_BODY}`, 'i');
 
@@ -767,8 +780,23 @@ export const POISONED_CONTINUATION_RE = /invalid `?signature`? in `?thinking`? b
 // Anchored on the rendered "API Error:" prefix + the specific server-limit
 // phrase so an agent quoting these words in prose can't trip it (a normal
 // result is the agent's own text, never prefixed "API Error:").
-export const TRANSIENT_OVERLOAD_RESULT_RE =
-  /^API Error:\s*(?:Server is temporarily limiting requests|Request rejected \(429\))/i;
+//
+// Same single-source body/anchored/embedded split as QUOTA_PATTERN_BODY, for
+// the same reason: the subagent classifier needs the EMBEDDED form (a
+// subagent's transient overload arrives wrapped in the CLI's
+// "Agent terminated early due to an API error: …" template, so the prefix is
+// no longer at position 0), while the top-level result path keeps the
+// anchored form. Two hand-maintained copies would drift, and the drift is
+// silent in the worst direction: a transient overload misread as quota
+// exhaustion burns a credential slot rotating away from a server that is
+// merely busy.
+const TRANSIENT_OVERLOAD_PATTERN_BODY =
+  'API Error:\\s*(?:Server is temporarily limiting requests|Request rejected \\(429\\))';
+
+export const TRANSIENT_OVERLOAD_RESULT_RE = new RegExp(`^${TRANSIENT_OVERLOAD_PATTERN_BODY}`, 'i');
+
+/** Unanchored twin of TRANSIENT_OVERLOAD_RESULT_RE — see QUOTA_EMBEDDED_RE. */
+export const TRANSIENT_OVERLOAD_EMBEDDED_RE = new RegExp(TRANSIENT_OVERLOAD_PATTERN_BODY, 'i');
 
 // ── Subagent quota exhaustion (PostToolUse: Task) ──
 
@@ -820,6 +848,45 @@ function stringifyToolResponse(response: unknown, depth = 0): string {
   return '';
 }
 
+// ── Tier 2: the CLI's structured termination template ──
+//
+// Tier 1 (QUOTA_EMBEDDED_RE / SUBSCRIPTION_BLOCKED_EMBEDDED_RE) enumerates
+// PROSE, and prose is not a stable contract: four times now a new Anthropic
+// wording has slipped past it and silently killed rotation (see the incident
+// list on QUOTA_PATTERN_BODY). Tier 2 stops guessing at the sentence and keys
+// off the wrapper the CLI puts around EVERY subagent API death instead.
+//
+// Verified against the claude 2.1.259 binary. `AgentApiErrorTerminationError`
+// is constructed as `Agent terminated early due to an API error: ${body}`,
+// where `body` is the model's own error prose followed by a parenthesized
+// field list assembled from `error`, `apiErrorStatus`, `requestId` and the
+// model name and joined with ", ":
+//
+//   Agent "<desc>" failed: Agent terminated early due to an API error: <prose>
+//   (error type rate_limit, HTTP 429, request id req_…, model sent to the API: …)
+//
+// The prose slot changes; the wrapper and the field list do not. Both subagent
+// surfaces carry it — a synchronous Agent tool_result and an async
+// task_notification summary — so one pair of patterns covers both.
+//
+// `error type rate_limit, HTTP 429` is the credential-side signal. It is NOT
+// sufficient on its own: a TRANSIENT server overload also renders as
+// error type rate_limit / HTTP 429, and rotating away from a busy server is
+// the wrong cure (see TRANSIENT_OVERLOAD_RESULT_RE). The transient exclusion
+// in classifySubagentQuotaText is therefore load-bearing, not belt-and-braces.
+
+/** The CLI wrapper around any subagent that died on an API error. */
+export const AGENT_API_ERROR_TERMINATION_RE = /Agent terminated early due to an API error/i;
+
+/**
+ * The parenthesized field list's rate-limited opening. Whitespace is flexible
+ * because the field list is a `join(', ')` whose spacing is not a contract;
+ * the field ORDER is (`error`, `apiErrorStatus`), and `error` is only omitted
+ * when the API returned no error kind at all — in which case there is nothing
+ * to classify anyway.
+ */
+export const AGENT_API_RATE_LIMIT_SUFFIX_RE = /\(\s*error\s+type\s+rate_limit\s*,\s*HTTP\s+429\b/i;
+
 /** Marker a subagent-quota detection throws under, consumed by poll-loop's rotation catch. */
 export type SubagentQuotaMarker = 'subscription_quota_exhausted' | 'subscription_access_disabled';
 
@@ -837,8 +904,20 @@ export type SubagentQuotaMarker = 'subscription_quota_exhausted' | 'subscription
  */
 export function classifySubagentQuotaText(text: string): SubagentQuotaMarker | null {
   if (!text) return null;
+  // Tier 1 — known prose. Runs first because it is the only tier that can tell
+  // an org access block apart from a quota exhaustion.
   if (QUOTA_EMBEDDED_RE.test(text)) return 'subscription_quota_exhausted';
   if (SUBSCRIPTION_BLOCKED_EMBEDDED_RE.test(text)) return 'subscription_access_disabled';
+  // Tier 2 — the CLI's structured termination template, for a wording tier 1
+  // has never seen. Excluding the transient-overload forms is what keeps this
+  // from rotating away from a merely busy server.
+  if (
+    AGENT_API_ERROR_TERMINATION_RE.test(text) &&
+    AGENT_API_RATE_LIMIT_SUFFIX_RE.test(text) &&
+    !TRANSIENT_OVERLOAD_EMBEDDED_RE.test(text)
+  ) {
+    return 'subscription_quota_exhausted';
+  }
   return null;
 }
 
