@@ -70,6 +70,41 @@ describe('container image retention metadata', () => {
     expect(dockerfile).toContain('nanoclaw.image.role=$NANOCLAW_IMAGE_ROLE');
   });
 
+  // The retention labels are re-stamped on a cadence, and each re-stamp is a
+  // full `docker build` against the canonical tag. The spawn gate reads
+  // nanoclaw.agentRunnerDepsHash off that same tag, so a re-stamp that dropped
+  // (or failed to re-supply) the deps hash would refuse every spawn. Pin the
+  // invariant on both halves: build.sh always passes the hash, and the
+  // Dockerfile stamps it in a layer the retention ARGs cannot invalidate.
+  it('re-supplies the agent-runner deps hash on every retention re-stamp', async () => {
+    const { computeAgentRunnerDepsHash } = await import('./agent-runner-image-check.js');
+    const expected = await computeAgentRunnerDepsHash();
+
+    const first = buildArg(runBuild('latest'), 'AGENT_RUNNER_DEPS_HASH');
+    const second = buildArg(runBuild('latest'), 'AGENT_RUNNER_DEPS_HASH');
+
+    // build.sh and computeAgentRunnerDepsHash() must stay byte-identical.
+    expect(first).toBe(expected);
+    expect(first).toMatch(/^[0-9a-f]{16}$/);
+    expect(second).toBe(first);
+  });
+
+  it('stamps the deps hash ahead of the retention ARGs so a re-stamp inherits it', () => {
+    const dockerfile = fs.readFileSync(dockerfilePath, 'utf8');
+
+    const depsLabel = dockerfile.indexOf('LABEL nanoclaw.agentRunnerDepsHash=$AGENT_RUNNER_DEPS_HASH');
+    const retentionArg = dockerfile.indexOf('ARG NANOCLAW_RETENTION_CREATED_AT');
+
+    expect(depsLabel).toBeGreaterThan(0);
+    expect(retentionArg).toBeGreaterThan(depsLabel);
+
+    // The deps-hash layer must not depend on any retention ARG — otherwise the
+    // per-build created_at would invalidate it and a cache miss could leave the
+    // tag pointing at an image stamped from a different input.
+    const depsBlock = dockerfile.slice(dockerfile.indexOf('ARG AGENT_RUNNER_DEPS_HASH'), retentionArg);
+    expect(depsBlock).not.toMatch(/NANOCLAW_RETENTION|NANOCLAW_IMAGE_ROLE/);
+  });
+
   it('sets deterministic runtime-readable modes for copied agent files', () => {
     const dockerfile = fs.readFileSync(dockerfilePath, 'utf8');
 

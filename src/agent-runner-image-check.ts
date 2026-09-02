@@ -20,6 +20,18 @@
  * package.json without rebuilding", so a cache keyed on imageRef alone would
  * mask the very edits we're guarding against. ~50ms per spawn (two file reads
  * + one docker inspect) is negligible against multi-second spawn cost.
+ *
+ * The read has to be careful about one thing. `container/build.sh` re-stamps
+ * the ARG-driven retention LABEL layer on every run, which means a periodic
+ * `docker build` against the canonical tag; on a containerd image store that
+ * export writes an OCI image index, and while the index is being rewritten
+ * `docker inspect` can return a resolved-but-labelless config — exit 0, empty
+ * output. Reading a single key by name renders that identically to a genuinely
+ * unlabeled image, which is how a self-healing 30-second window produced
+ * spawn refusals telling the operator to rebuild a perfectly good image
+ * (2026-09-01/02: refusals at 00:25:02Z while a spawn 90ms later passed the
+ * same check on the same tag). So we read the whole label map and give an
+ * absent map exactly one re-read before refusing.
  */
 import { createHash } from 'crypto';
 import { readFile } from 'fs/promises';
@@ -38,7 +50,8 @@ const LOCK_PATH = path.join(REPO_ROOT, 'container/agent-runner/bun.lock');
 
 export type LabelLookup =
   | { kind: 'found'; value: string }
-  | { kind: 'missing' } // image exists but has no label (built by an old build.sh)
+  | { kind: 'missing' } // image carries labels, ours isn't among them (old build.sh)
+  | { kind: 'unresolved' } // no label map came back at all — ambiguous, see below
   | { kind: 'no-image' } // docker doesn't know this image ref
   | { kind: 'inspect-error'; reason: string }; // daemon down, timeout, permissions, etc.
 
@@ -48,8 +61,29 @@ export interface DepsDriftCheck {
   expected: string | null;
   actual: string | null;
   lookup: LabelLookup;
+  /** True when the first read came back 'unresolved' and we re-read once. */
+  retried: boolean;
   message: string;
 }
+
+/**
+ * Delay before the single re-read of an 'unresolved' label map. Long enough to
+ * clear a BuildKit image-export window, short enough that a genuinely
+ * unlabeled image still fails the spawn well inside one sweep cycle.
+ */
+export const LABEL_RETRY_DELAY_MS = 2_000;
+
+/** Raw `docker inspect` stdout producer — the one seam tests replace. */
+export type InspectRunner = (imageRef: string) => Promise<string>;
+
+export interface DriftCheckOptions {
+  /** Test seam: stands in for the real `docker inspect`. */
+  inspect?: InspectRunner;
+  /** Test seam: transient re-read delay; defaults to LABEL_RETRY_DELAY_MS. */
+  retryDelayMs?: number;
+}
+
+const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
 async function fileSha256Hex(p: string): Promise<string> {
   const buf = await readFile(p);
@@ -69,23 +103,65 @@ export async function computeAgentRunnerDepsHash(): Promise<string> {
 }
 
 /**
- * Inspect the image's deps-hash label, distinguishing operational failures
- * (daemon down, timeout) from "image exists but unlabeled" and "image not
- * found." Conflating these would send operators to the wrong remediation.
+ * Read the image's WHOLE label map, not just our key.
+ *
+ * `{{index .Config.Labels "<key>"}}` cannot tell "this image has labels and
+ * ours is not one of them" apart from "no label map resolved at all": docker
+ * prints an empty line and exits 0 for both. That conflation is what made a
+ * transient read look like a permanently broken image (see classifyLabels).
+ *
+ * --type=image: `docker inspect <name>` is ambiguous across object types
+ * (image / container / volume / network). Without --type a name collision
+ * could surface container metadata and falsely report a missing label.
  */
-async function lookupImageLabel(imageRef: string): Promise<LabelLookup> {
+const dockerInspectLabels: InspectRunner = async (imageRef) => {
+  const { stdout } = await execFileAsync(
+    CONTAINER_RUNTIME_BIN,
+    ['inspect', '--type=image', '--format', '{{json .Config.Labels}}', imageRef],
+    { timeout: 10_000 },
+  );
+  return stdout;
+};
+
+/**
+ * Classify one `{{json .Config.Labels}}` read.
+ *
+ * `null` / empty is NOT evidence of an unlabeled image. On a containerd image
+ * store the canonical tag resolves to an OCI image index (BuildKit exports one
+ * whenever attestations are on), and resolving `.Config` for an index means
+ * picking the host-platform child manifest and reading its config blob. While
+ * an export is rewriting that index the resolution can come back with no label
+ * map — exit 0, empty output. So an absent map is 'unresolved' (ambiguous,
+ * worth one re-read); only a map that resolved and genuinely lacks our key is
+ * 'missing' (settled: this image really was built by an older build.sh).
+ */
+export function classifyLabels(stdout: string): LabelLookup {
+  const raw = stdout.trim();
+  if (!raw || raw === 'null' || raw === '<no value>') return { kind: 'unresolved' };
+  let parsed: unknown;
   try {
-    const { stdout } = await execFileAsync(
-      CONTAINER_RUNTIME_BIN,
-      // --type=image: `docker inspect <name>` is ambiguous across object types
-      // (image / container / volume / network). Without --type a name collision
-      // could surface container metadata and falsely report a missing label.
-      ['inspect', '--type=image', '--format', `{{index .Config.Labels "${LABEL_KEY}"}}`, imageRef],
-      { timeout: 10_000 },
-    );
-    const v = stdout.trim();
-    if (v && v !== '<no value>') return { kind: 'found', value: v };
-    return { kind: 'missing' };
+    parsed = JSON.parse(raw);
+  } catch {
+    return { kind: 'inspect-error', reason: `unparseable label output: ${raw.slice(0, 120)}` };
+  }
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return { kind: 'unresolved' };
+  const labels = parsed as Record<string, unknown>;
+  const value = labels[LABEL_KEY];
+  if (typeof value === 'string' && value !== '') return { kind: 'found', value };
+  // An empty map is the same ambiguous "config resolved to nothing" shape as
+  // `null`; a populated map without our key is a settled answer.
+  return Object.keys(labels).length === 0 ? { kind: 'unresolved' } : { kind: 'missing' };
+}
+
+/**
+ * Inspect the image's labels, distinguishing operational failures (daemon
+ * down, timeout) from "image is labeled but not by us", "no label map
+ * resolved" and "image not found." Conflating these would send operators to
+ * the wrong remediation.
+ */
+async function lookupImageLabel(imageRef: string, inspect: InspectRunner): Promise<LabelLookup> {
+  try {
+    return classifyLabels(await inspect(imageRef));
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     // `docker inspect` writes "Error: No such object: <ref>" / "No such image"
@@ -118,8 +194,26 @@ function rebuildHint(imageRef: string): string {
  * derived-image drift too. Docker label inheritance means per-agent images
  * derived FROM a freshly-rebuilt base get the new label automatically.
  */
-export async function checkAgentRunnerDepsDrift(imageRef: string = CONTAINER_IMAGE): Promise<DepsDriftCheck> {
-  const [expected, lookup] = await Promise.all([computeAgentRunnerDepsHash(), lookupImageLabel(imageRef)]);
+export async function checkAgentRunnerDepsDrift(
+  imageRef: string = CONTAINER_IMAGE,
+  options: DriftCheckOptions = {},
+): Promise<DepsDriftCheck> {
+  const inspect = options.inspect ?? dockerInspectLabels;
+  const retryDelayMs = options.retryDelayMs ?? LABEL_RETRY_DELAY_MS;
+
+  const [expected, first] = await Promise.all([computeAgentRunnerDepsHash(), lookupImageLabel(imageRef, inspect)]);
+
+  // A label map that didn't resolve is ambiguous, and the ambiguity is
+  // self-clearing: re-read once after a short pause. Exactly one retry — a
+  // genuinely unlabeled image must still refuse the spawn loudly, and the
+  // spawn path is not allowed to sit here polling.
+  let lookup = first;
+  let retried = false;
+  if (lookup.kind === 'unresolved') {
+    retried = true;
+    await sleep(retryDelayMs);
+    lookup = await lookupImageLabel(imageRef, inspect);
+  }
 
   switch (lookup.kind) {
     case 'inspect-error':
@@ -129,7 +223,8 @@ export async function checkAgentRunnerDepsDrift(imageRef: string = CONTAINER_IMA
         expected,
         actual: null,
         lookup,
-        message: `agent-runner deps check: docker inspect ${imageRef} failed (${lookup.reason}). Not necessarily a drift — verify the container runtime is reachable.`,
+        retried,
+        message: `agent-runner deps check: docker inspect ${imageRef} failed, so no label was read (${lookup.reason}). This is an inspect failure, NOT a missing label — verify the container runtime is reachable before rebuilding anything.`,
       };
     case 'no-image':
       return {
@@ -138,16 +233,25 @@ export async function checkAgentRunnerDepsDrift(imageRef: string = CONTAINER_IMA
         expected,
         actual: null,
         lookup,
+        retried,
         message: `agent-runner image ${imageRef} not found — build it: ${rebuildHint(imageRef)}`,
       };
-    case 'missing': {
-      // Image exists but lacks our label. Two interpretations:
+    case 'missing':
+    case 'unresolved': {
+      // The image inspected cleanly and still has no deps-hash label — either
+      // it carries other labels but not ours ('missing'), or two reads a
+      // retry-delay apart both came back with no label map at all
+      // ('unresolved'). Two interpretations:
       //  - For the shared base image, this means an older build.sh was used →
       //    require a rebuild (fail closed).
       //  - For an admin-set image_tag override, this can legitimately be a
       //    custom prebuilt image that never went through container/build.sh.
       //    Permanently blocking those would lock admins out of their override.
       //    Fail open with a warning — operator opted into the override.
+      const evidence =
+        lookup.kind === 'missing'
+          ? 'the image is labeled but carries no such label'
+          : `no label map resolved on two reads ${retryDelayMs}ms apart`;
       if (imageRef !== CONTAINER_IMAGE) {
         return {
           ok: true,
@@ -155,7 +259,8 @@ export async function checkAgentRunnerDepsDrift(imageRef: string = CONTAINER_IMA
           expected,
           actual: null,
           lookup,
-          message: `agent-runner image ${imageRef} has no ${LABEL_KEY} label — treating admin-set image_tag override as opt-out from drift check. If this is a derived image from ${CONTAINER_IMAGE}, rebuild base then re-run install_packages.`,
+          retried,
+          message: `agent-runner image ${imageRef} has no ${LABEL_KEY} label (${evidence}) — treating admin-set image_tag override as opt-out from drift check. If this is a derived image from ${CONTAINER_IMAGE}, rebuild base then re-run install_packages.`,
         };
       }
       return {
@@ -164,7 +269,8 @@ export async function checkAgentRunnerDepsDrift(imageRef: string = CONTAINER_IMA
         expected,
         actual: null,
         lookup,
-        message: `agent-runner image ${imageRef} has no ${LABEL_KEY} label (built by an older build.sh) — rebuild: ${rebuildHint(imageRef)}`,
+        retried,
+        message: `agent-runner image ${imageRef} has no ${LABEL_KEY} label (${evidence}; built by an older build.sh) — rebuild: ${rebuildHint(imageRef)}`,
       };
     }
     case 'found': {
@@ -176,10 +282,11 @@ export async function checkAgentRunnerDepsDrift(imageRef: string = CONTAINER_IMA
           expected,
           actual,
           lookup,
+          retried,
           message: `agent-runner deps drift on ${imageRef}: image baked from ${actual}, current files hash to ${expected}. Run: ${rebuildHint(imageRef)}`,
         };
       }
-      return { ok: true, imageRef, expected, actual, lookup, message: 'agent-runner deps in sync' };
+      return { ok: true, imageRef, expected, actual, lookup, retried, message: 'agent-runner deps in sync' };
     }
   }
 }
