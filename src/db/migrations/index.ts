@@ -162,9 +162,12 @@ export const migrations: Migration[] = [
   migration061,
   migration062,
   migration063,
-  migration064,
   containerConfigs,
   cliScope,
+  // After cliScope: 064 ALTERs container_configs, which upstream's aliased
+  // `containerConfigs` creates. Ordering here is execution order, not file
+  // number — registering 064 next to 063 runs it before the table exists.
+  migration064,
   messagingGroupInstance,
   migration019,
   // Last on purpose: normalizes whatever naive timestamps every migration
