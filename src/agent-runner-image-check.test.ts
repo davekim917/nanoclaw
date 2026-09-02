@@ -3,8 +3,13 @@ import { createHash } from 'crypto';
 import { readFile } from 'fs/promises';
 import * as path from 'path';
 
-import { checkAgentRunnerDepsDrift, computeAgentRunnerDepsHash } from './agent-runner-image-check.js';
-import { REPO_ROOT } from './config.js';
+import {
+  checkAgentRunnerDepsDrift,
+  classifyLabels,
+  computeAgentRunnerDepsHash,
+  LABEL_RETRY_DELAY_MS,
+} from './agent-runner-image-check.js';
+import { CONTAINER_IMAGE, REPO_ROOT } from './config.js';
 
 describe('computeAgentRunnerDepsHash', () => {
   it('matches sha256(sha256(package.json) || sha256(bun.lock)) sliced to 16 chars', async () => {
@@ -61,6 +66,122 @@ describe('checkAgentRunnerDepsDrift', () => {
     } else {
       expect(r.lookup.kind).toBe('inspect-error');
     }
+  });
+});
+
+/**
+ * Regression cover for the 2026-09-01/02 spawn refusals: `container/build.sh`
+ * re-stamps the retention LABEL layer periodically, and while that export
+ * rewrites the canonical tag's OCI index `docker inspect` can return a config
+ * with no label map — exit 0, empty output. Reading a single key by name made
+ * that indistinguishable from an image genuinely built by an older build.sh.
+ */
+describe('checkAgentRunnerDepsDrift label-read classification', () => {
+  const labeled = (hash: string): string =>
+    JSON.stringify({ 'nanoclaw.commit': 'abc123', 'nanoclaw.agentRunnerDepsHash': hash });
+
+  /** Fake `docker inspect` that replays a scripted sequence of stdout reads. */
+  function scriptedInspect(reads: string[]): { run: (ref: string) => Promise<string>; calls: () => number } {
+    let i = 0;
+    return {
+      run: async () => {
+        const value = reads[Math.min(i, reads.length - 1)];
+        i += 1;
+        return value;
+      },
+      calls: () => i,
+    };
+  }
+
+  it('classifies an absent label map as unresolved, not missing', () => {
+    expect(classifyLabels('null').kind).toBe('unresolved');
+    expect(classifyLabels('').kind).toBe('unresolved');
+    expect(classifyLabels('   \n').kind).toBe('unresolved');
+    expect(classifyLabels('{}').kind).toBe('unresolved');
+    expect(classifyLabels('<no value>').kind).toBe('unresolved');
+  });
+
+  it('classifies a populated map without our key as missing', () => {
+    expect(classifyLabels(JSON.stringify({ 'nanoclaw.commit': 'abc123' })).kind).toBe('missing');
+  });
+
+  it('classifies our key as found', () => {
+    expect(classifyLabels(labeled('69f4456d09a8f88f'))).toEqual({ kind: 'found', value: '69f4456d09a8f88f' });
+  });
+
+  it('re-reads once and recovers when the first read lands mid-relabel', async () => {
+    const expected = await computeAgentRunnerDepsHash();
+    const inspect = scriptedInspect(['null', labeled(expected)]);
+
+    const r = await checkAgentRunnerDepsDrift(CONTAINER_IMAGE, { inspect: inspect.run, retryDelayMs: 0 });
+
+    expect(r.ok).toBe(true);
+    expect(r.retried).toBe(true);
+    expect(r.actual).toBe(expected);
+    expect(inspect.calls()).toBe(2);
+    expect(r.message).toBe('agent-runner deps in sync');
+  });
+
+  it('retries at most once — a persistently absent label map still refuses with the rebuild hint', async () => {
+    const inspect = scriptedInspect(['null']);
+
+    const r = await checkAgentRunnerDepsDrift(CONTAINER_IMAGE, { inspect: inspect.run, retryDelayMs: 0 });
+
+    expect(r.ok).toBe(false);
+    expect(r.retried).toBe(true);
+    expect(inspect.calls()).toBe(2);
+    expect(r.lookup.kind).toBe('unresolved');
+    expect(r.message).toMatch(/no nanoclaw\.agentRunnerDepsHash label/);
+    expect(r.message).toMatch(/no label map resolved on two reads/);
+    expect(r.message).toMatch(/rebuild: cd container\/agent-runner && bun install/);
+  });
+
+  it('refuses a genuinely unlabeled image immediately, without spending a retry', async () => {
+    const inspect = scriptedInspect([JSON.stringify({ 'nanoclaw.commit': 'abc123' })]);
+
+    const r = await checkAgentRunnerDepsDrift(CONTAINER_IMAGE, { inspect: inspect.run, retryDelayMs: 0 });
+
+    expect(r.ok).toBe(false);
+    expect(r.retried).toBe(false);
+    expect(inspect.calls()).toBe(1);
+    expect(r.lookup.kind).toBe('missing');
+    expect(r.message).toMatch(/the image is labeled but carries no such label/);
+    expect(r.message).toMatch(/rebuild: cd container\/agent-runner && bun install/);
+  });
+
+  it('still refuses on real drift, with no retry', async () => {
+    const expected = await computeAgentRunnerDepsHash();
+    const inspect = scriptedInspect([labeled('0000000000000000')]);
+
+    const r = await checkAgentRunnerDepsDrift(CONTAINER_IMAGE, { inspect: inspect.run, retryDelayMs: 0 });
+
+    expect(r.ok).toBe(false);
+    expect(r.retried).toBe(false);
+    expect(inspect.calls()).toBe(1);
+    expect(r.message).toBe(
+      `agent-runner deps drift on ${CONTAINER_IMAGE}: image baked from 0000000000000000, ` +
+        `current files hash to ${expected}. Run: cd container/agent-runner && bun install && cd ../.. && ./container/build.sh`,
+    );
+  });
+
+  it('says "inspect failed" rather than "no label" when the daemon is unreachable', async () => {
+    const r = await checkAgentRunnerDepsDrift(CONTAINER_IMAGE, {
+      inspect: async () => {
+        throw new Error('Cannot connect to the Docker daemon at unix:///var/run/docker.sock');
+      },
+      retryDelayMs: 0,
+    });
+
+    expect(r.ok).toBe(false);
+    expect(r.lookup.kind).toBe('inspect-error');
+    expect(r.message).toMatch(/docker inspect .* failed, so no label was read/);
+    expect(r.message).toMatch(/NOT a missing label/);
+    expect(r.message).not.toMatch(/has no nanoclaw\.agentRunnerDepsHash label/);
+  });
+
+  it('keeps the retry bounded to a couple of seconds', () => {
+    expect(LABEL_RETRY_DELAY_MS).toBeGreaterThan(0);
+    expect(LABEL_RETRY_DELAY_MS).toBeLessThanOrEqual(3_000);
   });
 });
 

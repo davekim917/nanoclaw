@@ -764,6 +764,10 @@ async function spawnContainer(
       imageRef: depsCheck.imageRef,
       expected: depsCheck.expected,
       actual: depsCheck.actual,
+      // 'unresolved' + retried=true is the transient-relabel shape: the label
+      // map came back empty twice. Anything else is a settled answer.
+      lookup: depsCheck.lookup.kind,
+      retried: depsCheck.retried,
       message: depsCheck.message,
     });
     // Fire-and-forget: only the shared base image is something this watcher
