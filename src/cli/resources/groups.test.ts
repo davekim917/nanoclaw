@@ -340,6 +340,80 @@ describe('groups CLI resource config', () => {
     });
   });
 
+  it('test_groups_config_get_reports_declared_and_effective_security', async () => {
+    // A privilege-weakening override in container.json must be visible to the
+    // normal config audit. Reporting only the docker args at spawn time hides
+    // a narrowed capDrop or a disabled no-new-privileges from every operator.
+    const id = 'ag-security-audit';
+    const folder = 'security-audit';
+    createAgentGroup({ id, name: folder, folder, agent_provider: null, created_at: now() });
+    getDb()
+      .prepare(
+        `INSERT INTO container_configs
+           (agent_group_id, provider, model, effort, image_tag, assistant_name, max_messages_per_prompt,
+            skills, mcp_servers, packages_apt, packages_npm, additional_mounts, cli_scope, updated_at)
+         VALUES (?, NULL, NULL, NULL, NULL, NULL, NULL, '"all"', '{}', '[]', '[]', '[]', 'group', ?)`,
+      )
+      .run(id, now());
+    const groupDir = `${TEST_DIR}/groups/${folder}`;
+    fs.mkdirSync(groupDir, { recursive: true });
+    fs.writeFileSync(
+      `${groupDir}/container.json`,
+      JSON.stringify(
+        {
+          mcpServers: {},
+          packages: { apt: [], npm: [] },
+          additionalMounts: [],
+          skills: 'all',
+          security: { capDrop: [], capAdd: ['SYS_ADMIN'], noNewPrivileges: false },
+        },
+        null,
+        2,
+      ) + '\n',
+    );
+
+    const response = await dispatch(
+      { id: 'req-security-get', command: 'groups-config-get', args: { id } },
+      { caller: 'host' },
+    );
+
+    expect(response.ok).toBe(true);
+    const data = (response as { ok: true; data: Record<string, unknown> }).data;
+    expect(data.security).toEqual({ capDrop: [], capAdd: ['SYS_ADMIN'], noNewPrivileges: false });
+    expect(data.effective_security).toEqual({ capDrop: [], capAdd: ['SYS_ADMIN'], noNewPrivileges: false });
+  });
+
+  it('test_groups_config_get_reports_safe_effective_security_when_undeclared', async () => {
+    const id = 'ag-security-default';
+    const folder = 'security-default';
+    createAgentGroup({ id, name: folder, folder, agent_provider: null, created_at: now() });
+    getDb()
+      .prepare(
+        `INSERT INTO container_configs
+           (agent_group_id, provider, model, effort, image_tag, assistant_name, max_messages_per_prompt,
+            skills, mcp_servers, packages_apt, packages_npm, additional_mounts, cli_scope, updated_at)
+         VALUES (?, NULL, NULL, NULL, NULL, NULL, NULL, '"all"', '{}', '[]', '[]', '[]', 'group', ?)`,
+      )
+      .run(id, now());
+    const groupDir = `${TEST_DIR}/groups/${folder}`;
+    fs.mkdirSync(groupDir, { recursive: true });
+    fs.writeFileSync(
+      `${groupDir}/container.json`,
+      JSON.stringify({ mcpServers: {}, packages: { apt: [], npm: [] }, additionalMounts: [], skills: 'all' }, null, 2) +
+        '\n',
+    );
+
+    const response = await dispatch(
+      { id: 'req-security-get-default', command: 'groups-config-get', args: { id } },
+      { caller: 'host' },
+    );
+
+    expect(response.ok).toBe(true);
+    const data = (response as { ok: true; data: Record<string, unknown> }).data;
+    expect(data.security).toBeNull();
+    expect(data.effective_security).toEqual({ capDrop: ['ALL'], capAdd: [], noNewPrivileges: true });
+  });
+
   it('test_groups_config_update_mirrors_runtime_scalars_into_container_json', async () => {
     // The spawn path and the in-container runner read provider/model/effort
     // from container.json; the DB row only feeds flag vocabulary and

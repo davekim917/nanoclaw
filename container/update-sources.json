@@ -3,6 +3,7 @@
   "dockerfile": [
     { "id": "mcp-toolbox", "name": "Google MCP Toolbox", "arg": "MCP_TOOLBOX_VERSION", "source": { "kind": "github", "repo": "googleapis/genai-toolbox" } },
     { "id": "pnpm", "name": "pnpm", "arg": "PNPM_VERSION", "source": { "kind": "npm", "package": "pnpm" }, "mirrors": [{ "file": "package.json", "jsonPath": ["packageManager"], "format": "pnpm@{version}" }] },
+    { "id": "npm", "name": "npm", "arg": "NPM_VERSION", "source": { "kind": "npm", "package": "npm" } },
     { "id": "claude-code", "name": "Claude Code", "arg": "CLAUDE_CODE_VERSION", "source": { "kind": "npm", "package": "@anthropic-ai/claude-code" } },
     { "id": "agent-browser", "name": "agent-browser", "arg": "AGENT_BROWSER_VERSION", "source": { "kind": "npm", "package": "agent-browser" } },
     { "id": "vercel", "name": "Vercel CLI", "arg": "VERCEL_VERSION", "source": { "kind": "npm", "package": "vercel" } },

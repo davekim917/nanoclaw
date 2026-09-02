@@ -74,7 +74,8 @@ export interface AdditionalMountConfig {
 
 /**
  * Per-group container PRIVILEGE hardening. Absent fields fall back to the
- * hardcoded safe defaults in `securityArgs` (cap-drop ALL, no-new-privileges).
+ * safe defaults resolved by `resolveContainerSecurity` (cap-drop ALL,
+ * no-new-privileges).
  *
  * Deliberately narrower than upstream's shape: resource ceilings (memory,
  * pids-limit, cpu) are NOT here. This install already owns those in
@@ -90,6 +91,20 @@ export interface SecurityConfig {
   capAdd?: string[];
   /** Emit `--security-opt no-new-privileges:true`. Default true. */
   noNewPrivileges?: boolean;
+}
+
+/**
+ * Resolve a declared `security` block against the safe defaults, mirroring
+ * `resolveContainerResources`. Single owner of the defaults: `securityArgs`
+ * turns this into Docker flags and `ncl groups config get` reports it as
+ * `effective_security`, so an audit sees exactly what the spawn will do.
+ */
+export function resolveContainerSecurity(security?: SecurityConfig): Required<SecurityConfig> {
+  return {
+    capDrop: security?.capDrop ?? ['ALL'],
+    capAdd: security?.capAdd ?? [],
+    noNewPrivileges: security?.noNewPrivileges ?? true,
+  };
 }
 
 /** Shape of the materialized `container.json` file read by the container runner. */

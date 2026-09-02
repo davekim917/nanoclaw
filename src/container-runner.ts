@@ -31,6 +31,7 @@ import {
   readContainerConfigForSpawn,
   validateMcpServers,
   writeContainerConfig,
+  resolveContainerSecurity,
   type ContainerConfig,
   type McpServerConfig,
   type SecurityConfig,
@@ -4276,8 +4277,9 @@ async function buildContainerArgs(
 /**
  * Build the container PRIVILEGE hardening flags: drop every Linux capability
  * and forbid setuid escalation, overridable per-group via container.json
- * `security`. Pure so the defaults/override precedence is unit-testable
- * without spawning.
+ * `security`. Defaults come from `resolveContainerSecurity`, the same
+ * resolver `ncl groups config get` reports, so the audit and the spawn can
+ * never disagree. Pure, so precedence is unit-testable without spawning.
  *
  * Resource ceilings (--memory, --pids-limit, --cpus) deliberately do NOT
  * belong here — `dockerResourceLimitArgs` below owns those, driven by
@@ -4285,17 +4287,14 @@ async function buildContainerArgs(
  * spawn ends up with two contradictory values for the same Docker option.
  */
 export function securityArgs(security?: SecurityConfig): string[] {
+  const effective = resolveContainerSecurity(security);
   const args: string[] = [];
 
-  if (security?.noNewPrivileges ?? true) {
+  if (effective.noNewPrivileges) {
     args.push('--security-opt', 'no-new-privileges:true');
   }
-
-  const capDrop = security?.capDrop ?? ['ALL'];
-  for (const cap of capDrop) args.push('--cap-drop', cap);
-
-  const capAdd = security?.capAdd ?? [];
-  for (const cap of capAdd) args.push('--cap-add', cap);
+  for (const cap of effective.capDrop) args.push('--cap-drop', cap);
+  for (const cap of effective.capAdd) args.push('--cap-add', cap);
 
   return args;
 }
