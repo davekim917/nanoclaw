@@ -4288,7 +4288,7 @@ export function securityArgs(security?: SecurityConfig): string[] {
   const args: string[] = [];
 
   if (security?.noNewPrivileges ?? true) {
-    args.push('--security-opt', 'no-new-privileges');
+    args.push('--security-opt', 'no-new-privileges:true');
   }
 
   const capDrop = security?.capDrop ?? ['ALL'];

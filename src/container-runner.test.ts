@@ -226,7 +226,7 @@ describe('dockerResourceLimitArgs', () => {
 describe('securityArgs', () => {
   it('emits safe privilege defaults when no override is given', () => {
     const args = securityArgs(undefined);
-    expect(args).toEqual(['--security-opt', 'no-new-privileges', '--cap-drop', 'ALL']);
+    expect(args).toEqual(['--security-opt', 'no-new-privileges:true', '--cap-drop', 'ALL']);
   });
 
   it('honors a capAdd override', () => {
@@ -251,6 +251,24 @@ describe('securityArgs', () => {
     expect(joined).not.toContain('--pids-limit');
     expect(joined).not.toContain('--memory');
     expect(joined).not.toContain('--cpus');
+  });
+});
+
+describe('pids-limit is never emitted as 0', () => {
+  // cgroups v2 rejects `--pids-limit 0` and the spawn dies. Upstream guards
+  // this by omitting the flag; this install guards it earlier, by refusing a
+  // non-positive pidsLimit at config-resolution time. Either way the flag must
+  // never reach docker with a 0.
+  it('rejects a declared pidsLimit of 0 rather than emitting the flag', () => {
+    expect(() => dockerResourceLimitArgs({ pidsLimit: 0 })).toThrow(/positive integer/);
+  });
+
+  it('rejects a negative pidsLimit', () => {
+    expect(() => dockerResourceLimitArgs({ pidsLimit: -1 })).toThrow(/positive integer/);
+  });
+
+  it('emits a positive pids-limit unchanged', () => {
+    expect(dockerResourceLimitArgs({ pidsLimit: 768 }).join(' ')).toContain('--pids-limit 768');
   });
 });
 
