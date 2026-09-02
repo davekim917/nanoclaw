@@ -945,6 +945,30 @@ if [ "$COMMAND" = "claim" ]; then
       exit 0
     fi
   fi
+  # A reclaim that CONTINUES an unfinished campaign must do it under the run
+  # id that campaign already published. Minting a fresh one here leaves every
+  # artifact, marker and posted message on the old identity while `finish` and
+  # `challenger-timeout` — both of which guard on `.activeRunId` — will only
+  # answer to the new one, so the campaign has no terminal path at all. That is
+  # exactly how pr1432 looped ~4h under ids nothing it had published named
+  # (2026-09-02). Refuse:
+  # reclaim under the published id, or say --takeover and mean it. Note this
+  # can only bite once the incumbent is no longer live — a live run is already
+  # refused by the slot check above.
+  if [ "$TAKEOVER" != true ] &&
+     [ "$(jq -r --arg sha "$SHA" \
+          'if (.activeSha == $sha and .challengerDisposition == null and (.activeRunId // "") != "")
+           then "true" else "false" end' <<<"$STATE")" = true ] &&
+     [ "$(jq -r '.activeRunId // empty' <<<"$STATE")" != "$RUN_ID" ]; then
+    jq -cn --argjson pr "$PR" --arg run "$RUN_ID" \
+      --arg active "$(jq -r '.activeRunId // empty' <<<"$STATE")" \
+      --arg sha "$(jq -r '.activeSha // empty' <<<"$STATE")" \
+      '{ok:false,
+        error:"run id drift — this PR has an unfinished campaign on the same SHA; reclaim under its existing run id to continue it, or pass --takeover to deliberately start a new identity",
+        pr:$pr,runId:$run,activeRunId:$active,
+        activeSha:(if $sha == "" then null else $sha end)}'
+    exit 0
+  fi
   # The slot check above proves no OTHER RUN owns this PR. It cannot prove no
   # other CONTAINER is running THIS run — the per-PR flock is process-local to
   # one filesystem view and both coordinators pass it. Take the durable lease
@@ -2205,13 +2229,30 @@ if [ -s "$SETTLE_CANDIDATES" ]; then
     exit 0
   fi
 
-  RUN_STAMP_EPOCH="$(date -u +%s)"
-  RUN_ID="${RUN_PREFIX}-pr${W_PR}-${HEAD_SHA:0:12}-$(date -u -d "@$RUN_STAMP_EPOCH" +%Y%m%dT%H%M%SZ)"
-  while [ "$RUN_ID" = "$(jq -r '.activeRunId // empty' <<<"$STATE")" ] ||
-        [ "$RUN_ID" = "$(jq -r '.completedRunId // empty' <<<"$STATE")" ]; do
-    RUN_STAMP_EPOCH="$(( RUN_STAMP_EPOCH + 1 ))"
+  # Same-SHA recovery keeps the RUN ID, not just the deadline. Minting a new
+  # id on reclaim published a second identity for one campaign while every
+  # artifact, marker and message still named the first — and `finish` and
+  # `challenger-timeout` both guard on `.activeRunId`, so the campaign was left
+  # with no terminal path under the id it had already announced. pr1432 burned
+  # ~4h that way: one campaign, three run ids, no terminal path (2026-09-02). A reclaim on the same
+  # frozen SHA with no disposition yet is a CONTINUATION, so it resumes the id
+  # (same predicate `claim` refuses id drift on, and the same one the deadline
+  # is preserved by below). A different SHA is a different campaign and mints.
+  RESUMED_RUN_ID=false
+  if [ "$(jq -r --arg sha "$HEAD_SHA" \
+        'if (.activeSha == $sha and .challengerDisposition == null and (.activeRunId // "") != "")
+         then "true" else "false" end' <<<"$STATE")" = true ]; then
+    RUN_ID="$(jq -r '.activeRunId' <<<"$STATE")"
+    RESUMED_RUN_ID=true
+  else
+    RUN_STAMP_EPOCH="$(date -u +%s)"
     RUN_ID="${RUN_PREFIX}-pr${W_PR}-${HEAD_SHA:0:12}-$(date -u -d "@$RUN_STAMP_EPOCH" +%Y%m%dT%H%M%SZ)"
-  done
+    while [ "$RUN_ID" = "$(jq -r '.activeRunId // empty' <<<"$STATE")" ] ||
+          [ "$RUN_ID" = "$(jq -r '.completedRunId // empty' <<<"$STATE")" ]; do
+      RUN_STAMP_EPOCH="$(( RUN_STAMP_EPOCH + 1 ))"
+      RUN_ID="${RUN_PREFIX}-pr${W_PR}-${HEAD_SHA:0:12}-$(date -u -d "@$RUN_STAMP_EPOCH" +%Y%m%dT%H%M%SZ)"
+    done
+  fi
   NOW="$(iso_now)"
   # Same-SHA recovery keeps the original challenger deadline (see `claim`).
   STATE="$(jq -c --arg sha "$HEAD_SHA" --arg now "$NOW" --arg run "$RUN_ID" \
@@ -2233,9 +2274,11 @@ if [ -s "$SETTLE_CANDIDATES" ]; then
     --arg repo "$REPO" --arg branch "$BRANCH" --argjson pr "$W_PR" --arg runId "$RUN_ID" \
     --argjson facts "$FACTS" --argjson recovery "$RECOVERY" \
     --arg abandoned "$ABANDONED" \
+    --argjson resumedRunId "$RESUMED_RUN_ID" \
     '{wakeAgent:true,data:({
       schemaVersion:1, trigger:"pr_build_settled",
       repo:$repo, branch:$branch, pr:$pr, runId:$runId,
+      resumedRunId:$resumedRunId,
       sourceSha:$facts.headSha,
       previewUrl:$facts.backendPreviewUrl,
       frontendPreviewUrl:$facts.frontendPreviewUrl,
