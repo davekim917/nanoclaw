@@ -34,9 +34,11 @@ import { getDb } from './db/connection.js';
 import {
   clearSessionStatusOnKill,
   deliverSessionMessages,
+  registerDeliveryAction,
   setDeliveryAdapter,
   assertChannelRoutingConsistency,
 } from './delivery.js';
+import { unguarded } from './guard/index.js';
 import { createChannelDeliveryAdapter } from './channels/channel-registry.js';
 import { isContainerRunning } from './container-runner.js';
 
@@ -1734,5 +1736,65 @@ describe('delivery sweep gate — delivery is never stranded (A14-A17)', () => {
 
     await sweepDeliverSession(session, Date.now());
     expect(attempts).toBe(2);
+  });
+});
+
+/**
+ * The drain loop is serial across sessions, so anything a system-action handler
+ * awaits inline stalls delivery for the whole host — `cycleMs=172606 polled=2`
+ * on 2026-09-01, while one repository publication waited for sibling containers
+ * to reach a mount barrier. Detaching that work (see
+ * modules/repository-workspaces/job-runner.ts) rests on two properties of the
+ * `deferAck` contract, neither of which was pinned by a test.
+ */
+describe('deliverSessionMessages — deferAck system actions', () => {
+  function insertAt(sessionId: string, msgId: string, timestamp: string, kind: string, content: object): void {
+    const db = new Database(outboundDbPath('ag-1', sessionId));
+    db.prepare(
+      `INSERT INTO messages_out (id, timestamp, kind, platform_id, channel_type, content)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+    ).run(
+      msgId,
+      timestamp,
+      kind,
+      kind === 'system' ? null : 'telegram:123',
+      kind === 'system' ? null : 'telegram',
+      JSON.stringify(content),
+    );
+    db.close();
+  }
+
+  it('does not hold the rest of the queue behind a deferred action, and stays pending', async () => {
+    seedAgentAndChannel();
+    const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
+    registerDeliveryAction(
+      'test_defer_ack',
+      async () => ({ deferAck: true }) as const,
+      unguarded('test-only action that defers its own ack'),
+    );
+
+    insertAt(session.id, 'out-deferred', '2026-09-01T00:00:01.000Z', 'system', { action: 'test_defer_ack' });
+    insertAt(session.id, 'out-after', '2026-09-01T00:00:02.000Z', 'chat', { text: 'chat must not wait' });
+
+    const delivered: string[] = [];
+    setDeliveryAdapter({
+      async deliver(_channelType, _platformId, _threadId, _kind, content) {
+        delivered.push(content);
+        return 'plat-1';
+      },
+    });
+
+    const outcome = await deliverSessionMessages(session);
+
+    // The chat row behind the deferred action went out on the same pass.
+    expect(delivered).toEqual([JSON.stringify({ text: 'chat must not wait' })]);
+    // The deferred row is still outstanding: its handler owns that `delivered`
+    // row, so the drain must report pending and never arm the quiet gate.
+    const inDb = openInboundDb('ag-1', session.id);
+    const ids = getDeliveredIds(inDb);
+    inDb.close();
+    expect(ids.has('out-deferred')).toBe(false);
+    expect(ids.has('out-after')).toBe(true);
+    expect(outcome).toBe('pending');
   });
 });

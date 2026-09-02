@@ -11,6 +11,7 @@ import {
   RepositoryMountQuiescenceError,
   type RepositoryMountQuiescence,
 } from '../../container-restart.js';
+import { REPOSITORY_MOUNT_QUIESCENCE_TIMEOUT_MS } from '../../config.js';
 import { getAgentGroup, getAllAgentGroups } from '../../db/agent-groups.js';
 import { getDb } from '../../db/connection.js';
 import { getMessagingGroup } from '../../db/messaging-groups.js';
@@ -19,6 +20,7 @@ import { getContainerState, getProcessingClaims, insertMessage } from '../../db/
 import { registerDeliveryAction } from '../../delivery.js';
 import { unguarded } from '../../guard/index.js';
 import { log } from '../../log.js';
+import { REPOSITORY_REQUEST_ID_PATTERN, runRepositoryActionDetached } from './job-runner.js';
 import {
   canonicalRepoDir,
   readOriginPin,
@@ -35,7 +37,7 @@ import {
   type RepositoryWorkUnit,
 } from '../../repository-workspaces.js';
 import { observedOriginsSha256 } from '../../repository-migration-recovery.js';
-import { openOutboundDb, sessionDir, writeSessionMessageIfNew } from '../../session-manager.js';
+import { openInboundDb, openOutboundDb, sessionDir, writeSessionMessageIfNew } from '../../session-manager.js';
 import { safeGitArgs, safeGitConfigGet, safeGitEnv } from '../../safe-git.js';
 import type { Session } from '../../types.js';
 
@@ -492,7 +494,7 @@ function response(inDb: Database.Database, requestId: string, ok: boolean, messa
 }
 
 function assertRepositoryRequestId(requestId: string): void {
-  if (!/^repo-[0-9]{10,17}-[a-f0-9]{16}$/.test(requestId)) {
+  if (!REPOSITORY_REQUEST_ID_PATTERN.test(requestId)) {
     throw new Error('repository action request id is invalid');
   }
 }
@@ -550,11 +552,7 @@ function workUnitForSession(session: Session, workgroupId: string): RepositoryWo
   });
 }
 
-export async function applyRepositoryPublishAction(
-  content: Record<string, unknown>,
-  session: Session,
-  _inDb: Database.Database,
-): Promise<void> {
+export async function applyRepositoryPublishAction(content: Record<string, unknown>, session: Session): Promise<void> {
   const requestId = typeof content.requestId === 'string' ? content.requestId : '';
   const repo = typeof content.repo === 'string' ? content.repo : '';
   const origin = typeof content.origin === 'string' ? content.origin : '';
@@ -581,7 +579,11 @@ export async function applyRepositoryPublishAction(
       // The mount claim closes new spawn admission. Wait for every already
       // admitted turn/tool to finish and stop all existing containers before
       // the first canonical publication mutation.
-      quiescence = await quiesceSessionsForRepositoryMounts(mountSessions, `repository-publish:${requestId}`);
+      quiescence = await quiesceSessionsForRepositoryMounts(
+        mountSessions,
+        `repository-publish:${requestId}`,
+        REPOSITORY_MOUNT_QUIESCENCE_TIMEOUT_MS,
+      );
       affectedSessions = quiescence.sessions;
       const published = await publishStagedCanonical({ workgroupId, repo, origin, repositoryId, stagingPath });
       const confirmation =
@@ -652,11 +654,7 @@ export async function applyRepositoryPublishAction(
   }
 }
 
-export async function applyRepositoryRefreshAction(
-  content: Record<string, unknown>,
-  session: Session,
-  inDb: Database.Database,
-): Promise<void> {
+export async function applyRepositoryRefreshAction(content: Record<string, unknown>, session: Session): Promise<void> {
   const requestId = typeof content.requestId === 'string' ? content.requestId : '';
   const repo = typeof content.repo === 'string' ? content.repo : '';
   if (!requestId || !repo) throw new Error('repository_refresh payload is invalid');
@@ -666,7 +664,15 @@ export async function applyRepositoryRefreshAction(
     await refreshCanonicalFromLocalRefs({ workgroupId, repo });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    response(inDb, requestId, false, `Host canonical refresh failed for ${repo}: ${message}`);
+    // Opened here rather than taken from the delivery loop: this runs on the
+    // detached chain, by which time the handle the loop passed handlers has
+    // been closed by `drainSession`'s finally.
+    const inDb = openInboundDb(session.agent_group_id, session.id);
+    try {
+      response(inDb, requestId, false, `Host canonical refresh failed for ${repo}: ${message}`);
+    } finally {
+      inDb.close();
+    }
     log.error('repository refresh failed', { workgroupId, repo, sessionId: session.id, error: message });
     await writeSessionMessageIfNew(session.agent_group_id, session.id, {
       id: `repository-refresh-failed-${requestId}`,
@@ -784,11 +790,7 @@ async function sourceSessionStates(source: RepositoryWorkUnit): Promise<Reposito
   return states;
 }
 
-export async function applyRepositoryTransferAction(
-  content: Record<string, unknown>,
-  session: Session,
-  _inDb: Database.Database,
-): Promise<void> {
+export async function applyRepositoryTransferAction(content: Record<string, unknown>, session: Session): Promise<void> {
   const requestId = typeof content.requestId === 'string' ? content.requestId : '';
   const repo = typeof content.repo === 'string' ? content.repo : '';
   const sourceThreadId = typeof content.sourceThreadId === 'string' ? content.sourceThreadId : '';
@@ -826,6 +828,7 @@ export async function applyRepositoryTransferAction(
         quiescence = await quiesceSessionsForRepositoryMounts(
           sessionsForWorkUnit(destination),
           `repository-transfer:${requestId}`,
+          REPOSITORY_MOUNT_QUIESCENCE_TIMEOUT_MS,
         );
         affectedSessions = quiescence.sessions;
       },
@@ -902,20 +905,36 @@ export async function applyRepositoryTransferAction(
   }
 }
 
+// All three run OFF the serial delivery drain (job-runner.ts): a publish's
+// quiescence now waits up to REPOSITORY_MOUNT_QUIESCENCE_TIMEOUT_MS for sibling
+// containers to reach a safe point, and no other session's outbound messages may
+// queue behind that. `repository_refresh` joins them because it contends for the
+// same per-repository flock that a detached transfer holds across its whole
+// quiescence — left inline it would simply move the delivery block.
+//
+// MAX_DELIVERY_ATTEMPTS no longer applies to these rows: the runner owns the
+// `delivered` row (deferAck) and gives each action exactly one attempt per host
+// process. A retry is not free here — every attempt re-fences and re-kills every
+// sibling container in the workgroup, so three attempts at a quiescence that has
+// already timed out cost three fleet-wide restarts to reach the same failure.
+// The give-up path keeps the orphan-fence release the delivery loop used to run.
 registerDeliveryAction(
   'repository_publish',
-  applyRepositoryPublishAction,
+  (content, session) =>
+    runRepositoryActionDetached('repository_publish', applyRepositoryPublishAction, content, session),
   unguarded(
     'workgroup-scoped publication of a locally validated container clone; no host network or ambient credentials',
   ),
 );
 registerDeliveryAction(
   'repository_refresh',
-  applyRepositoryRefreshAction,
+  (content, session) =>
+    runRepositoryActionDetached('repository_refresh', applyRepositoryRefreshAction, content, session),
   unguarded('local-only canonical checkout refresh from refs already fetched by the scoped container'),
 );
 registerDeliveryAction(
   'repository_transfer',
-  applyRepositoryTransferAction,
+  (content, session) =>
+    runRepositoryActionDetached('repository_transfer', applyRepositoryTransferAction, content, session),
   unguarded('same-workgroup exact linked-worktree move after fail-closed lifecycle checks'),
 );

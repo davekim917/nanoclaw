@@ -26,6 +26,7 @@ const envConfig = readEnvFile([
   'NANOCLAW_EGRESS_LOCKDOWN',
   'NANOCLAW_EGRESS_NETWORK',
   'NANOCLAW_TASK_SCRIPT_TIMEOUT_MS',
+  'NANOCLAW_REPOSITORY_QUIESCE_TIMEOUT_MS',
   'ONECLI_GATEWAY_CONTAINER',
 ]);
 
@@ -100,13 +101,27 @@ export const SELF_HEAL_TAKEOVER_ENABLED =
 export const TASK_SCRIPT_TIMEOUT_MS = parseTimeoutMs(
   process.env.NANOCLAW_TASK_SCRIPT_TIMEOUT_MS ?? envConfig.NANOCLAW_TASK_SCRIPT_TIMEOUT_MS,
 );
-function parseTimeoutMs(raw: string | undefined): number {
+// How long a repository publish/transfer waits for every sibling container in
+// the workgroup to reach the mount barrier before it kills them
+// (`quiesceSessionsForRepositoryMounts`). Ten minutes, not the 120s default
+// that still applies to every other caller: the repository actions run detached
+// from the serial delivery drain (modules/repository-workspaces/job-runner.ts),
+// so a long wait costs the publishing workgroup patience instead of freezing
+// outbound delivery for the whole fleet. Same env-then-.env read as the flags
+// above, for the same import-order reason.
+export const REPOSITORY_MOUNT_QUIESCENCE_TIMEOUT_MS = parseTimeoutMs(
+  process.env.NANOCLAW_REPOSITORY_QUIESCE_TIMEOUT_MS ?? envConfig.NANOCLAW_REPOSITORY_QUIESCE_TIMEOUT_MS,
+  600_000,
+  30 * 60_000,
+);
+function parseTimeoutMs(raw: string | undefined, fallbackMs = 120_000, maxMs = 600_000): number {
   const parsed = Number.parseInt(raw ?? '', 10);
-  if (!Number.isFinite(parsed) || parsed <= 0) return 120_000;
+  if (!Number.isFinite(parsed) || parsed <= 0) return fallbackMs;
   // Clamp: an operator typo of 120000000 ms would stall the sequential sweep
   // loop for a day per due script. Ten minutes is already generous headroom
-  // over the ~56s watcher that motivated this knob.
-  return Math.min(parsed, 600_000);
+  // over the ~56s watcher that motivated this knob; callers that wait on a
+  // whole workgroup rather than one script raise the ceiling explicitly.
+  return Math.min(parsed, maxMs);
 }
 // Local agent-template library. Committed but ships empty (+ README). Resolved
 // once at load. Override to another LOCAL path via NANOCLAW_TEMPLATES_DIR; never
