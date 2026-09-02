@@ -117,13 +117,21 @@ export async function acquireStorageActivityLease(
       continue;
     }
 
-    await fs.promises.mkdir(activeDir, { recursive: true });
-    try {
-      await fs.promises.writeFile(marker, `${process.pid}\n`, { flag: 'w' });
-    } catch (err) {
-      await fs.promises.rm(marker, { force: true }).catch(() => undefined);
-      await fs.promises.rmdir(activeDir).catch(() => undefined);
-      throw err;
+    // Plant, retrying ONCE on ENOENT — see plantStorageActivityMarker below,
+    // which this mirrors: a releasing holder's rmdir can land between our
+    // mkdir and our writeFile and take the directory we just made, and one
+    // retry clears it because that rmdir is done.
+    for (let attempt = 0; ; attempt++) {
+      await fs.promises.mkdir(activeDir, { recursive: true });
+      try {
+        await fs.promises.writeFile(marker, `${process.pid}\n`, { flag: 'w' });
+        break;
+      } catch (err) {
+        await fs.promises.rm(marker, { force: true }).catch(() => undefined);
+        await fs.promises.rmdir(activeDir).catch(() => undefined);
+        if (attempt === 0 && (err as NodeJS.ErrnoException).code === 'ENOENT') continue;
+        throw err;
+      }
     }
 
     if (await claimExists(resourceRoot)) {
@@ -199,7 +207,8 @@ export function plantStorageActivityMarker(resourceRoot: string, holderId: strin
   // rmdir that caused it is done; a loop would only spin. Any other failure
   // (ENOSPC leaving a partial marker) is real: discard so we neither proceed
   // unprotected nor strand a file that blocks this root's reclaim forever, and
-  // let the caller see it. Mirrors the async path's error handling.
+  // let the caller see it. acquireStorageActivityLease above mirrors this same
+  // retry-once handling, for the same race.
   for (let attempt = 0; ; attempt++) {
     fs.mkdirSync(activeDir, { recursive: true });
     try {

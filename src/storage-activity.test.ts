@@ -320,6 +320,59 @@ describe('synchronous storage activity marker', () => {
   });
 });
 
+describe('acquireStorageActivityLease retries the marker-dir ENOENT race', () => {
+  // The async counterpart of "survives a releasing holder rmdir-ing the
+  // active dir mid-plant" above: a releasing holder's rmdir can land between
+  // our mkdir(activeDir) and our writeFile(marker), same as the sync path,
+  // and this used to have no retry at all — any writeFile ENOENT was rethrown,
+  // failing an otherwise-healthy inbound write. Filter on the activeDir path
+  // rather than mockImplementationOnce because, unlike the sync planter, this
+  // function's first mkdir call is for resourceRoot, not activeDir.
+  it('retries once and still acquires the lease when the race clears it', async () => {
+    const root = tempRoot();
+    const activeDir = path.join(root, '.nanoclaw-storage-active');
+    const realMkdir = fs.promises.mkdir.bind(fs.promises);
+    let raced = false;
+    vi.spyOn(fs.promises, 'mkdir').mockImplementation(async (dir, opts) => {
+      const result = await realMkdir(dir as fs.PathLike, opts as fs.MakeDirectoryOptions);
+      if (!raced && dir === activeDir) {
+        raced = true;
+        await fs.promises.rmdir(activeDir);
+      }
+      return result;
+    });
+
+    const lease = await acquireStorageActivityLease(root, 'writer');
+
+    expect(fs.readdirSync(activeDir), 'the retry must actually leave a marker').toHaveLength(1);
+    await lease.release();
+  });
+
+  it('rethrows when a second consecutive ENOENT confirms this is not a one-off race', async () => {
+    const root = tempRoot();
+    const activeDir = path.join(root, '.nanoclaw-storage-active');
+    const realMkdir = fs.promises.mkdir.bind(fs.promises);
+    vi.spyOn(fs.promises, 'mkdir').mockImplementation(async (dir, opts) => {
+      const result = await realMkdir(dir as fs.PathLike, opts as fs.MakeDirectoryOptions);
+      if (dir === activeDir) await fs.promises.rmdir(activeDir);
+      return result;
+    });
+
+    await expect(acquireStorageActivityLease(root, 'writer')).rejects.toMatchObject({ code: 'ENOENT' });
+    expect(fs.existsSync(activeDir), 'no marker or dir must be left behind').toBe(false);
+  });
+
+  it('rethrows a non-ENOENT plant failure without retrying', async () => {
+    const root = tempRoot();
+    const activeDir = path.join(root, '.nanoclaw-storage-active');
+    const err = Object.assign(new Error('no space left on device'), { code: 'ENOSPC' });
+    vi.spyOn(fs.promises, 'writeFile').mockRejectedValueOnce(err);
+
+    await expect(acquireStorageActivityLease(root, 'writer')).rejects.toThrow('no space left on device');
+    expect(fs.existsSync(activeDir)).toBe(false);
+  });
+});
+
 describe('openInboundDb guards the whole handle lifetime', () => {
   function inboundIn(root: string): string {
     fs.mkdirSync(root, { recursive: true });
