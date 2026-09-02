@@ -36,9 +36,7 @@ describe('deriveProgressLabels', () => {
         signature: 'sig',
       },
     ]);
-    expect(deriveProgressLabels(msg)).toEqual([
-      '> 💭 First paragraph.\n> \n> Second paragraph.\n> Third line.',
-    ]);
+    expect(deriveProgressLabels(msg)).toEqual(['> 💭 First paragraph.\n> \n> Second paragraph.\n> Third line.']);
   });
 
   test('underscores in thinking text pass through (no italic markers to break)', () => {
@@ -50,18 +48,14 @@ describe('deriveProgressLabels', () => {
 
   test('truncates long thinking text on word boundary at 2000 chars (pre-format)', () => {
     const long = 'word '.repeat(1000).trim();
-    const labels = deriveProgressLabels(
-      assistantMessage([{ type: 'thinking', thinking: long, signature: 'sig' }]),
-    );
+    const labels = deriveProgressLabels(assistantMessage([{ type: 'thinking', thinking: long, signature: 'sig' }]));
     expect(labels).toHaveLength(1);
     expect(labels[0].startsWith('> 💭 ')).toBe(true);
     expect(labels[0].endsWith('…')).toBe(true);
   });
 
   test('short thinking not truncated', () => {
-    const msg = assistantMessage([
-      { type: 'thinking', thinking: 'Short reasoning here.', signature: 's' },
-    ]);
+    const msg = assistantMessage([{ type: 'thinking', thinking: 'Short reasoning here.', signature: 's' }]);
     const labels = deriveProgressLabels(msg);
     expect(labels).toEqual(['> 💭 Short reasoning here.']);
   });
@@ -113,8 +107,23 @@ describe('shouldForwardTaskNotification', () => {
     expect(shouldForwardTaskNotification('Bash')).toBe(false);
   });
 
-  test('forwards genuine subagent (Task) completions', () => {
+  // The subagent tool is named `Agent` on this SDK (sdk-tools.d.ts declares
+  // AgentInput, not TaskInput). While this accepted 'Task' alone, EVERY real
+  // subagent's task_notification was silently suppressed.
+  test('forwards genuine subagent (Agent) completions', () => {
+    expect(shouldForwardTaskNotification('Agent')).toBe(true);
+  });
+
+  test('still forwards the legacy tool name, for older CLIs', () => {
     expect(shouldForwardTaskNotification('Task')).toBe(true);
+  });
+
+  // Task-management tools, unrelated to subagents — an unanchored `Task`
+  // regex would have swept these in.
+  test('suppresses the unrelated Task* management tools', () => {
+    for (const t of ['TaskOutput', 'TaskStop', 'TaskCreate', 'TaskList']) {
+      expect(shouldForwardTaskNotification(t)).toBe(false);
+    }
   });
 
   test('forwards when tool is unknown/absent (planned task not tied to a tool)', () => {

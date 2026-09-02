@@ -5,8 +5,12 @@ import {
   QUOTA_RESULT_RE,
   SUBAGENT_QUOTA_REPLACEMENT_TEXT,
   SUBSCRIPTION_BLOCKED_EMBEDDED_RE,
+  SUBAGENT_TOOL_MATCHER,
+  SUBAGENT_TOOL_NAMES,
   SUBSCRIPTION_BLOCKED_RE,
+  classifySubagentQuotaText,
   createSubagentQuotaHook,
+  subagentQuotaFromTaskNotification,
 } from './claude.js';
 
 // Every real wording enumerated in the claude.ts comment block, plus the
@@ -122,11 +126,11 @@ function harness(interruptImpl?: () => Promise<unknown>): HookHarness {
   } as HookHarness;
 }
 
-function invoke(h: HookHarness, toolResponse: unknown) {
+function invoke(h: HookHarness, toolResponse: unknown, toolName = 'Agent') {
   return h.hook(
     {
       hook_event_name: 'PostToolUse',
-      tool_name: 'Task',
+      tool_name: toolName,
       tool_input: { prompt: 'review the diff' },
       tool_response: toolResponse,
       tool_use_id: 'toolu_test',
@@ -166,6 +170,13 @@ describe('createSubagentQuotaHook', () => {
       expect(out.hookSpecificOutput?.hookEventName).toBe('PostToolUse');
       expect(out.hookSpecificOutput?.updatedToolOutput).toBe(SUBAGENT_QUOTA_REPLACEMENT_TEXT);
     }
+  });
+
+  it('fires under the legacy tool name too', async () => {
+    const h = harness();
+    await invoke(h, embed("You've hit your session limit · resets 10:30pm"), 'Task');
+    expect(h.detections.length).toBe(1);
+    expect(h.interrupts).toBe(1);
   });
 
   it('uses the access-disabled marker for an org block', async () => {
@@ -215,5 +226,173 @@ describe('createSubagentQuotaHook', () => {
     expect(out.hookSpecificOutput?.updatedToolOutput).toBe(SUBAGENT_QUOTA_REPLACEMENT_TEXT);
     // Let the rejected promise settle so the .catch() runs before teardown.
     await new Promise((resolve) => setTimeout(resolve, 0));
+  });
+});
+
+// ── Async subagents: the task_notification surface ──
+//
+// An agent that launches a subagent ASYNCHRONOUSLY gets an `Agent` tool_result of
+// just "Async agent launched successfully…" — the PostToolUse hook above has
+// nothing to match on. The death arrives later as a system/task_notification.
+// Verbatim from the 2026-09-02 03:17 UTC incident:
+const INCIDENT_SUMMARY =
+  'Agent "Wave 2A trade spend web pages" failed: Agent terminated early due to an API error: ' +
+  "You've hit your session limit · resets 12am (America/New_York) (error type rate_limit, HTTP 429, " +
+  'request id req_011CedtTBWyKFHtu1UsNPTug, model sent to the API: claude-sonnet-5)';
+
+describe('classifySubagentQuotaText', () => {
+  it('classifies the incident summary as quota exhaustion', () => {
+    expect(classifySubagentQuotaText(INCIDENT_SUMMARY)).toBe('subscription_quota_exhausted');
+  });
+
+  it('classifies an org block as access disabled', () => {
+    expect(
+      classifySubagentQuotaText(
+        'Agent "docs sweep" failed: Your organization has disabled Claude subscription access for Claude Code',
+      ),
+    ).toBe('subscription_access_disabled');
+  });
+
+  it('returns null for benign text and for the empty string', () => {
+    expect(classifySubagentQuotaText('Reviewed the diff; two findings in src/router.ts.')).toBe(null);
+    expect(classifySubagentQuotaText('')).toBe(null);
+  });
+
+  it('is the single source both detection surfaces agree on', () => {
+    // Whatever the hook's embedded regexes match, the classifier must too —
+    // this is the lockstep guard for the two-surface split.
+    for (const wording of QUOTA_WORDINGS)
+      expect(classifySubagentQuotaText(embed(wording))).toBe('subscription_quota_exhausted');
+    for (const wording of BLOCKED_WORDINGS)
+      expect(classifySubagentQuotaText(embed(wording))).toBe('subscription_access_disabled');
+    // And the replacement text must not classify, or a replayed turn would
+    // look quota-exhausted forever.
+    expect(classifySubagentQuotaText(SUBAGENT_QUOTA_REPLACEMENT_TEXT)).toBe(null);
+  });
+});
+
+describe('subagentQuotaFromTaskNotification', () => {
+  it('detects the incident notification and marks it for rotation', () => {
+    const marked = subagentQuotaFromTaskNotification({ status: 'failed', summary: INCIDENT_SUMMARY }, 'Agent');
+    expect(marked).not.toBe(null);
+    expect(marked!.startsWith('subscription_quota_exhausted: ')).toBe(true);
+    expect(marked!.length).toBeLessThanOrEqual('subscription_quota_exhausted: '.length + 300);
+  });
+
+  it('detects an org block on the same surface', () => {
+    const marked = subagentQuotaFromTaskNotification(
+      { status: 'failed', summary: 'Agent "x" failed: Your organization has disabled Claude Code access' },
+      'Task',
+    );
+    expect(marked?.startsWith('subscription_access_disabled: ')).toBe(true);
+  });
+
+  it('treats an absent tool_use_id (unclassifiable planned task) as a subagent', () => {
+    // shouldForwardTaskNotification's documented default: an unknown tool is
+    // the planned-task case the feature was built for, so it is NOT suppressed.
+    expect(subagentQuotaFromTaskNotification({ status: 'failed', summary: INCIDENT_SUMMARY }, undefined)).not.toBe(
+      null,
+    );
+  });
+
+  // ── Negative cases: the framing the synchronous surface cannot require ──
+
+  it('ignores a COMPLETED notification whose summary quotes the exact quota string', () => {
+    // A subagent reporting ON quota handling is not an outage. This is the
+    // false positive the sync hook is knowingly exposed to and this surface
+    // is not.
+    expect(subagentQuotaFromTaskNotification({ status: 'completed', summary: INCIDENT_SUMMARY }, 'Task')).toBe(null);
+    expect(
+      subagentQuotaFromTaskNotification(
+        { status: 'completed', summary: 'Documented the retry path for "You\'ve hit your session limit".' },
+        'Task',
+      ),
+    ).toBe(null);
+  });
+
+  it('ignores a STOPPED notification, including the no-completion-record wording', () => {
+    expect(
+      subagentQuotaFromTaskNotification(
+        { status: 'stopped', summary: 'No completion record was found for this agent.' },
+        'Task',
+      ),
+    ).toBe(null);
+    expect(subagentQuotaFromTaskNotification({ status: 'stopped', summary: INCIDENT_SUMMARY }, 'Task')).toBe(null);
+  });
+
+  it('ignores a FAILED notification whose error is not a quota error', () => {
+    expect(
+      subagentQuotaFromTaskNotification(
+        {
+          status: 'failed',
+          summary: 'Agent "x" failed: Agent terminated early due to an API error: 500 internal server error',
+        },
+        'Task',
+      ),
+    ).toBe(null);
+  });
+
+  it('ignores a backgrounded Bash task, whose summary is raw command text', () => {
+    expect(subagentQuotaFromTaskNotification({ status: 'failed', summary: INCIDENT_SUMMARY }, 'Bash')).toBe(null);
+    expect(subagentQuotaFromTaskNotification({ status: 'failed', summary: INCIDENT_SUMMARY }, 'WebFetch')).toBe(null);
+  });
+
+  it('ignores a missing status or a missing summary', () => {
+    expect(subagentQuotaFromTaskNotification({ summary: INCIDENT_SUMMARY }, 'Task')).toBe(null);
+    expect(subagentQuotaFromTaskNotification({ status: 'failed' }, 'Task')).toBe(null);
+    expect(subagentQuotaFromTaskNotification({ status: 'failed', summary: undefined }, 'Task')).toBe(null);
+  });
+});
+
+// The subagent tool is named `Agent` on this SDK — sdk-tools.d.ts declares
+// AgentInput (with subagent_type / run_in_background) and has NO TaskInput.
+// `Task` is the old name. A hook registered under `matcher: 'Task'` matches
+// nothing here, which is exactly how the synchronous detection path shipped
+// dead.
+describe('SUBAGENT_TOOL_MATCHER', () => {
+  // Replicates the CLI's own matcher semantics (verified against the installed
+  // claude 2.1.258): a matcher of the plain-list shape /^[a-zA-Z0-9_|]+$/ is
+  // split on `|` and compared to the tool name by EXACT membership; only a
+  // matcher failing that shape is compiled as an unanchored RegExp.
+  const PLAIN_LIST_SHAPE = /^[a-zA-Z0-9_|]+$/;
+  function cliMatches(matcher: string, toolName: string): boolean {
+    if (PLAIN_LIST_SHAPE.test(matcher)) {
+      return matcher
+        .split('|')
+        .map((n) => n.trim())
+        .filter(Boolean)
+        .includes(toolName);
+    }
+    return new RegExp(matcher).test(toolName);
+  }
+
+  it('takes the CLI plain-list path, not the unanchored-regex fallback', () => {
+    expect(PLAIN_LIST_SHAPE.test(SUBAGENT_TOOL_MATCHER)).toBe(true);
+  });
+
+  it('matches the live subagent tool name and the legacy one', () => {
+    expect(cliMatches(SUBAGENT_TOOL_MATCHER, 'Agent')).toBe(true);
+    expect(cliMatches(SUBAGENT_TOOL_MATCHER, 'Task')).toBe(true);
+  });
+
+  it('does not match Bash, so a backgrounded command never trips the hook', () => {
+    expect(cliMatches(SUBAGENT_TOOL_MATCHER, 'Bash')).toBe(false);
+  });
+
+  it('does not leak onto the unrelated Task* management tools', () => {
+    // The reason the matcher must stay plain-list shaped: an unanchored
+    // `new RegExp('Task')` would match every one of these.
+    for (const t of ['TaskOutput', 'TaskStop', 'TaskCreate', 'TaskList', 'AgentTaskThing']) {
+      expect(cliMatches(SUBAGENT_TOOL_MATCHER, t)).toBe(false);
+    }
+  });
+
+  it('agrees with shouldForwardTaskNotification on every subagent name', () => {
+    // The hook matcher and the task_notification gate must cover the same
+    // tools, or one surface detects a quota death the other ignores.
+    for (const name of SUBAGENT_TOOL_NAMES) {
+      expect(cliMatches(SUBAGENT_TOOL_MATCHER, name)).toBe(true);
+      expect(subagentQuotaFromTaskNotification({ status: 'failed', summary: INCIDENT_SUMMARY }, name)).not.toBe(null);
+    }
   });
 });

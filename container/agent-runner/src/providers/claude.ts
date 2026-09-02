@@ -332,18 +332,50 @@ const TASK_NOTIFICATION_EMOJI: Record<string, string> = {
 };
 
 /**
+ * Tool names that launch a subagent, newest first.
+ *
+ * The tool is called **`Agent`** on this SDK — `sdk-tools.d.ts` declares
+ * `AgentInput` (with `subagent_type` / `run_in_background`) and has no
+ * `TaskInput` at all; `Task` is the OLD name, and the `Task*` types that do
+ * still exist (`TaskCreateInput`, `TaskGetInput`, `TaskStopInput`,
+ * `TaskOutputInput`) are the unrelated task-management tools. `Task` is kept
+ * here only so an older CLI still classifies; do NOT drop it, and do NOT
+ * assume either name is the live one.
+ */
+export const SUBAGENT_TOOL_NAMES = ['Agent', 'Task'] as const;
+
+/**
+ * Hook matcher covering every subagent tool name.
+ *
+ * Matcher semantics, verified against the installed CLI (2.1.258) rather than
+ * assumed: a matcher of the plain-list shape `/^[a-zA-Z0-9_|]+$/` is split on
+ * `|` and compared to the tool name by EXACT membership; only a matcher that
+ * fails that shape test is compiled as an (unanchored) `new RegExp`. So
+ * `'Agent|Task'` matches exactly those two tools and cannot leak onto
+ * `TaskOutput` / `TaskStop` / `TaskCreate` the way an unanchored `Task` regex
+ * would. The CLI's own config help states the same contract: "The matcher is
+ * a string: a tool name ("Bash"), pipe-separated list ("Edit|Write"), or empty
+ * to match all." (`HookCallbackMatcher.matcher?: string`, sdk.d.ts:867.)
+ */
+export const SUBAGENT_TOOL_MATCHER = SUBAGENT_TOOL_NAMES.join('|');
+
+/**
  * The SDK fires `task_notification` for two very different things: real
- * subagent (Task) completions AND auto-backgrounded Bash commands. For a
- * backgrounded Bash task the `summary` is the *raw command text* (env-var
- * unsets, pipelines, python heredocs) — internal noise that leaked into user
- * channels as "> ✅ <command>" and stranded there whenever the command
- * settled after the turn's real reply. Forward completion lines only for
- * genuine subagent work; a known non-Task tool (Bash) is suppressed. An
- * unknown/absent tool_use_id means a planned task not tied to a single tool —
- * forward it (the case the feature was built for).
+ * subagent (Agent, formerly Task) completions AND auto-backgrounded Bash
+ * commands. For a backgrounded Bash task the `summary` is the *raw command
+ * text* (env-var unsets, pipelines, python heredocs) — internal noise that
+ * leaked into user channels as "> ✅ <command>" and stranded there whenever
+ * the command settled after the turn's real reply. Forward completion lines
+ * only for genuine subagent work; a known non-subagent tool (Bash) is
+ * suppressed. An unknown/absent tool_use_id means a planned task not tied to a
+ * single tool — forward it (the case the feature was built for).
+ *
+ * Accepting `Agent` is load-bearing, not defensive: this SDK names the tool
+ * `Agent`, so while this checked `'Task'` alone every real subagent's
+ * notification was silently suppressed.
  */
 export function shouldForwardTaskNotification(toolName: string | undefined): boolean {
-  return toolName === undefined || toolName === 'Task';
+  return toolName === undefined || (SUBAGENT_TOOL_NAMES as readonly string[]).includes(toolName);
 }
 
 export function deriveProgressLabels(message: unknown): string[] {
@@ -679,10 +711,11 @@ const QUOTA_PATTERN_BODY =
 
 export const QUOTA_RESULT_RE = new RegExp(`^\\s*${QUOTA_PATTERN_BODY}`, 'i');
 
-// Unanchored twin of QUOTA_RESULT_RE. A subagent (Task tool) that exhausts the
-// quota never produces a top-level `result` — the quota prose comes back as a
-// `tool_result` inside the parent's still-running turn, so the anchored form
-// can't see it. Used only by the PostToolUse Task hook; the anchoring is what
+// Unanchored twin of QUOTA_RESULT_RE. A subagent (the Agent tool, formerly
+// named Task) that exhausts the quota never produces a top-level `result` —
+// the quota prose comes back as a `tool_result` inside the parent's
+// still-running turn, so the anchored form can't see it. Used by the
+// subagent-quota classifier, not the result path; the anchoring is what
 // keeps false positives off the top-level result path, so do NOT swap this in
 // there.
 export const QUOTA_EMBEDDED_RE = new RegExp(QUOTA_PATTERN_BODY, 'i');
@@ -762,8 +795,8 @@ export const SUBAGENT_QUOTA_REPLACEMENT_TEXT =
 
 /**
  * Flatten a PostToolUse `tool_response` (typed `unknown`) to text we can run
- * the quota regexes over. The Task tool's result is normally an array of
- * content blocks, but the field is untyped by contract — a string, a bare
+ * the quota regexes over. The Agent tool's (formerly Task) result is normally
+ * an array of content blocks, but the field is untyped by contract — a string, a bare
  * object, or something unexpected are all legal. Never throws; depth-capped so
  * a cyclic structure can't spin.
  */
@@ -787,9 +820,74 @@ function stringifyToolResponse(response: unknown, depth = 0): string {
   return '';
 }
 
+/** Marker a subagent-quota detection throws under, consumed by poll-loop's rotation catch. */
+export type SubagentQuotaMarker = 'subscription_quota_exhausted' | 'subscription_access_disabled';
+
 /**
- * PostToolUse hook matched on `Task`: catch Claude Max quota exhaustion (or an
- * org access block) that a SUBAGENT hit.
+ * The one classifier both subagent-quota detection sites run.
+ *
+ * A subagent's quota death reaches the parent turn on TWO different surfaces
+ * depending on how it was launched: a synchronous Agent call carries the prose
+ * in its `tool_response` (the PostToolUse hook below), while an ASYNC subagent
+ * returns "Async agent launched successfully…" immediately and reports its
+ * death later as a `system`/`task_notification` summary. Same wording, two
+ * seams — so the decision lives here once, for the same reason the pattern
+ * bodies above are single-source: two hand-maintained copies drift, and the
+ * drift is silent (one surface keeps rotating, the other stops).
+ */
+export function classifySubagentQuotaText(text: string): SubagentQuotaMarker | null {
+  if (!text) return null;
+  if (QUOTA_EMBEDDED_RE.test(text)) return 'subscription_quota_exhausted';
+  if (SUBSCRIPTION_BLOCKED_EMBEDDED_RE.test(text)) return 'subscription_access_disabled';
+  return null;
+}
+
+/** Collapse whitespace and cap at the length the throw message carries. */
+function quotaSnippet(text: string): string {
+  return text.replace(/\s+/g, ' ').trim().slice(0, 300);
+}
+
+/**
+ * Decide whether a `system`/`task_notification` message is an ASYNC subagent
+ * that died on the credential slot's quota. Returns the `<marker>: <snippet>`
+ * throw message, or null to leave the notification alone.
+ *
+ * This is the async twin of createSubagentQuotaHook. An agent that launches a
+ * subagent asynchronously gets an `Agent` `tool_result` of just "Async agent
+ * launched successfully…" — nothing for the PostToolUse hook to match on. The
+ * failure arrives later as this notification (verbatim, 2026-09-02 03:17 UTC:
+ * `status: failed`, summary `Agent "…" failed: Agent terminated early due to
+ * an API error: You've hit your session limit · resets 12am …`), which the CLI
+ * also folds back into the session as a `<task-notification>` user message
+ * that auto-continues the turn — so without this, the parent runs on with a
+ * dead subagent and no rotation ever happens.
+ *
+ * Three conditions, all required:
+ *  - `status === 'failed'` — strict. The SDK's vocabulary is exactly
+ *    'completed' | 'failed' | 'stopped' (SDKTaskNotificationMessage in
+ *    sdk.d.ts), and a completed/stopped subagent whose summary merely QUOTES
+ *    the quota string is a report, not an outage. This is the false-positive
+ *    framing the synchronous surface has no equivalent of.
+ *  - a real subagent, not a backgrounded Bash command whose summary is raw
+ *    command text — same classification the forwarding path uses.
+ *  - the shared classifier matches the summary.
+ */
+export function subagentQuotaFromTaskNotification(
+  tn: { summary?: string; status?: string },
+  toolName: string | undefined,
+): string | null {
+  if (tn.status !== 'failed') return null;
+  if (!shouldForwardTaskNotification(toolName)) return null;
+  const summary = typeof tn.summary === 'string' ? tn.summary : '';
+  const marker = classifySubagentQuotaText(summary);
+  if (!marker) return null;
+  return `${marker}: ${quotaSnippet(summary)}`;
+}
+
+/**
+ * PostToolUse hook matched on the subagent tool — `Agent` on this SDK,
+ * formerly `Task`, hence SUBAGENT_TOOL_MATCHER covering both: catch Claude Max
+ * quota exhaustion (or an org access block) that a SUBAGENT hit.
  *
  * A subagent's quota failure never becomes a top-level `type:'result'` — it
  * comes back as a tool_result inside the parent's still-running turn, so the
@@ -819,17 +917,13 @@ export function createSubagentQuotaHook(options: {
       const text = stringifyToolResponse(i.tool_response);
       if (!text) return { continue: true };
 
-      const marker = QUOTA_EMBEDDED_RE.test(text)
-        ? 'subscription_quota_exhausted'
-        : SUBSCRIPTION_BLOCKED_EMBEDDED_RE.test(text)
-          ? 'subscription_access_disabled'
-          : null;
+      const marker = classifySubagentQuotaText(text);
       // No match: return NO rewrite at all. An identity rewrite here would
       // race sibling PostToolUse hooks last-write-wins and could clobber a
       // real redaction (sdk.d.ts, PostToolUseHookSpecificOutput).
       if (!marker) return { continue: true };
 
-      const snippet = text.replace(/\s+/g, ' ').trim().slice(0, 300);
+      const snippet = quotaSnippet(text);
       log(`Subagent hit ${marker} — interrupting turn so poll-loop can rotate: ${snippet}`);
       options.onDetect(`${marker}: ${snippet}`);
 
@@ -2227,12 +2321,14 @@ export class ClaudeProvider implements AgentProvider {
       lane: laneForSlot(process.env.CLAUDE_CODE_OAUTH_LANES, oauthSlot),
     };
 
-    // Set by the PostToolUse:Task hook when a SUBAGENT hits the Claude Max
-    // quota (or an org access block). Rotation can't happen mid-query — the
-    // credential is fixed for this query's life (see `oauthSlot` above) — so
-    // the hook interrupts the query and translateEvents throws this on the
-    // next loop iteration, landing in poll-loop's existing rotation/retry
-    // catch exactly like the result-branch throws below.
+    // Set when a SUBAGENT hits the Claude Max quota — by the PostToolUse
+    // subagent-tool hook for a synchronous one, or by the task_notification
+    // branch for an async one. Both write here.
+    //
+    // Rotation can't happen mid-query — the credential is fixed for this
+    // query's life (see `oauthSlot` above) — so the detection interrupts the
+    // query and translateEvents throws this, landing in poll-loop's existing
+    // rotation/retry catch exactly like the result-branch throws below.
     let subagentQuotaError: string | null = null;
 
     const sdkResult = sdkQuery({
@@ -2277,12 +2373,15 @@ export class ClaudeProvider implements AgentProvider {
           ],
           PostToolUse: [
             { hooks: [postToolUseHook] },
-            // A subagent's quota exhaustion arrives as a tool_result inside
-            // this still-running turn, never as a top-level result — this is
-            // the only place it can be seen. Task is not matched by any other
-            // rewriting hook, so there's no rewrite collision.
+            // A synchronous subagent's quota exhaustion arrives as a
+            // tool_result inside this still-running turn, never as a top-level
+            // result — this hook is the only place it can be seen. (An ASYNC
+            // subagent's does not reach here at all; that one lands on the
+            // task_notification branch in translateEvents.) The subagent tool
+            // is not matched by any other rewriting hook, so there's no
+            // rewrite collision.
             {
-              matcher: 'Task',
+              matcher: SUBAGENT_TOOL_MATCHER,
               hooks: [
                 createSubagentQuotaHook({
                   onDetect: (marked) => {
@@ -2387,7 +2486,7 @@ export class ClaudeProvider implements AgentProvider {
 
       for await (const message of sdkResult) {
         if (aborted) return;
-        // A subagent hit the credential slot's quota (PostToolUse:Task hook).
+        // A subagent hit the credential slot's quota (PostToolUse hook).
         // Throw here so poll-loop's catch rotates the OAuth ring and replays
         // the turn — identical to the result-branch throws below, which a
         // subagent failure never reaches.
@@ -2515,6 +2614,38 @@ export class ClaudeProvider implements AgentProvider {
         } else if (message.type === 'system' && (message as { subtype?: string }).subtype === 'task_notification') {
           const tn = message as { summary?: string; status?: string; tool_use_id?: string };
           const toolName = tn.tool_use_id ? toolNameById.get(tn.tool_use_id) : undefined;
+          // An ASYNC subagent's quota death lands HERE, not on the
+          // PostToolUse subagent-tool hook — its tool_result was just "Async agent
+          // launched successfully…", with nothing to match. The CLI folds this
+          // notification back in as a `<task-notification>` user message that
+          // auto-continues the turn, so left alone the parent runs on with a
+          // dead subagent and the credential ring never rotates.
+          const asyncQuotaError = subagentQuotaFromTaskNotification(tn, toolName);
+          if (asyncQuotaError) {
+            if (!subagentQuotaError) subagentQuotaError = asyncQuotaError;
+            const split = asyncQuotaError.indexOf(': ');
+            log(
+              `Subagent hit ${asyncQuotaError.slice(0, split)} — interrupting turn so poll-loop can rotate: ` +
+                asyncQuotaError.slice(split + 2),
+            );
+            // Yield the label BEFORE throwing: the throw unwinds straight to
+            // poll-loop's rotation catch, so this is the last chance to tell
+            // the user why their turn restarted.
+            yield {
+              type: 'progress',
+              message: formatBlockquoteLabel('↻', "subagent hit the credential slot's limit — rotating and retrying"),
+            };
+            try {
+              void sdkResult.interrupt()?.catch?.((err: unknown) => {
+                log(`Subagent quota interrupt failed: ${err instanceof Error ? err.message : String(err)}`);
+              });
+            } catch (err) {
+              log(`Subagent quota interrupt threw: ${err instanceof Error ? err.message : String(err)}`);
+            }
+            // Throw directly rather than waiting for the loop-top check: an
+            // interrupted stream may never emit another message.
+            throw new Error(subagentQuotaError);
+          }
           if (shouldForwardTaskNotification(toolName)) {
             const summary = tn.summary || 'Task notification';
             const emoji = (tn.status && TASK_NOTIFICATION_EMOJI[tn.status]) || '🔧';
@@ -2522,7 +2653,7 @@ export class ClaudeProvider implements AgentProvider {
           }
         } else if (message.type === 'assistant') {
           // Record tool_use id → name so a later task_notification can be
-          // classified (Task subagent vs backgrounded Bash). See
+          // classified (Agent/Task subagent vs backgrounded Bash). See
           // shouldForwardTaskNotification.
           const blocks = (message as { message?: { content?: unknown } }).message?.content;
           if (Array.isArray(blocks)) {
