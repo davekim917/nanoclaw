@@ -18,10 +18,7 @@
  * existing row's cron + processAfter + content rather than inserting a
  * duplicate.
  */
-import fs from 'fs';
-import path from 'path';
 
-import { DATA_DIR } from '../config.js';
 import { getAgentMailbox } from '../mailbox/index.js';
 import { resolveTaskSession, withExistingMailboxSession, withMailboxSession } from '../session-manager.js';
 import type { NanoclawMailboxSession } from '../modules/mailbox/index.js';
@@ -94,19 +91,22 @@ function generateSessionId(): string {
 /**
  * Provision the mailbox for a freshly created channel-root session.
  *
- * `prepare()` is the single provisioning path — it creates whichever mailbox
- * files are absent with upstream's baseline plus the fork's schema. The
- * directory is still mkdir'd here first because `dataDir` may name a scratch
- * root in tests and the mailbox derives its own paths from DATA_DIR; the two
- * agree everywhere this is called (the only non-default caller passes a
- * dataDir equal to the configured DATA_DIR).
+ * `prepare()` is the single provisioning path, and it is the WHOLE path: it
+ * mkdirs `sessionMailboxDir(key)` itself before creating whichever mailbox
+ * files are absent, with upstream's baseline plus the fork's schema.
+ *
+ * This used to mkdir the directory first, from a `dataDir` parameter, while
+ * `prepare()` derived its own paths from the configured `DATA_DIR`. The two
+ * could disagree: a caller passing a non-default root got an empty directory
+ * under it and the actual databases under `DATA_DIR` — a session with no
+ * mailbox where it was asked for, and a write into the configured root. There
+ * is no root parameter any more, so they cannot disagree.
  *
  * Deliberately NOT `initSessionFolder`: that also creates the `outbox/`
  * directory, and a stub session that has never run a container has no outbox
  * to hold. Keeping the shapes distinct preserves the existing on-disk result.
  */
-function initStubSessionFolder(dataDir: string, agentGroupId: string, sessionId: string): void {
-  fs.mkdirSync(path.join(dataDir, 'v2-sessions', agentGroupId, sessionId), { recursive: true });
+function initStubSessionFolder(agentGroupId: string, sessionId: string): void {
   getAgentMailbox().prepare({ agentGroupId, sessionId });
 }
 
@@ -121,11 +121,7 @@ function initStubSessionFolder(dataDir: string, agentGroupId: string, sessionId:
  * makes the second INSERT throw `SQLITE_CONSTRAINT_UNIQUE`, which we catch
  * and resolve by re-lookup.
  */
-export async function resolveActiveSession(
-  agentGroupId: string,
-  messagingGroupId: string,
-  dataDir: string = DATA_DIR,
-): Promise<{ id: string }> {
+export async function resolveActiveSession(agentGroupId: string, messagingGroupId: string): Promise<{ id: string }> {
   const existing = findSessionByAgentGroupAndMessagingGroup(agentGroupId, messagingGroupId);
   if (existing) return { id: existing.id };
 
@@ -148,7 +144,7 @@ export async function resolveActiveSession(
     if (winner) return { id: winner.id };
     throw err;
   }
-  initStubSessionFolder(dataDir, agentGroupId, sessionId);
+  initStubSessionFolder(agentGroupId, sessionId);
   return { id: sessionId };
 }
 
@@ -234,7 +230,7 @@ function resolveAndValidateDestination(def: TaskDef): { messagingGroupId: string
   return validate.immediate();
 }
 
-export async function scheduleTask(def: TaskDef, _dataDir?: string): Promise<void> {
+export async function scheduleTask(def: TaskDef): Promise<void> {
   resolveAndValidateDestination(def);
   // Stamp the session with the same destination the `messages_in` row below
   // carries. `resolveAndValidateDestination` has already proved it names a
