@@ -37,8 +37,6 @@ import { getAgentGroup } from './db/agent-groups.js';
 import {
   SessionDbMissingError,
   SessionDbUnopenableError,
-  sessionMailboxPath,
-  readSessionOutbound,
   type ForkContainerStateRow as ContainerState,
   type NanoclawMailboxSession,
 } from './modules/mailbox/index.js';
@@ -52,7 +50,6 @@ import {
   admitDueTaskContexts,
   deferMessageForFreshContextRetry,
 } from './session-manager.js';
-import { rollupSessionUsage, pruneOldTurnUsage } from './db/usage.js';
 import {
   getContainerSpawnedAt,
   getActiveContainerSessionIds,
@@ -1588,83 +1585,6 @@ export function _sweepSessionForTesting(session: Session): Promise<number | null
   return sweepSession(session, tick);
 }
 
-// ── Usage rollup (fleet-hardening Phase 0.1) ──
-//
-// Per-session cache of the outbound.db mtime last successfully rolled up, so
-// a session whose outbound.db hasn't changed since the last tick costs one
-// fs.statSync and nothing else — no DB open, no query. Same shape as the
-// `quietSessions` cache above (module-level Map, bounded to sessions still
-// active). Lost on host restart, which just means the next tick re-checks
-// every session once; rollupSessionUsage's own watermark still guarantees no
-// double-counting either way.
-const usageRollupMtimeCache = new Map<string, number>(); // session.id -> outbound.db mtimeMs
-
-/** Pure so the cache decision has one thing to unit-test. */
-export function shouldSkipUsageRollup(cachedMtimeMs: number | undefined, currentMtimeMs: number): boolean {
-  return cachedMtimeMs === currentMtimeMs;
-}
-
-async function sweepUsageRollup(sessions: readonly Session[]): Promise<void> {
-  for (const session of sessions) {
-    try {
-      const outPath = sessionMailboxPath({ agentGroupId: session.agent_group_id, sessionId: session.id }, 'outbound');
-      let mtimeMs: number;
-      try {
-        mtimeMs = fs.statSync(outPath).mtimeMs;
-      } catch {
-        continue; // container never spawned yet — no outbound.db to roll up
-      }
-      if (shouldSkipUsageRollup(usageRollupMtimeCache.get(session.id), mtimeMs)) continue;
-
-      // Read through the module's own read-only outbound funnel, NOT the
-      // provisioning mailbox session. This projection touches outbound.db
-      // only, and the seam's existence check is keyed on inbound.db —
-      // routing it through a provisioning session added a gate the pre-seam
-      // code never had, so a session whose inbound.db is gone while
-      // outbound.db remains stopped being rolled up at all, and its
-      // turn_usage rows would never reach the central totals. `outPath`
-      // above is already the gate that belongs here: no outbound file, no
-      // rollup. `rollupSessionUsage` (mailbox seam PR 6) asks for only the
-      // one op it uses, `readSessionOutbound`'s read-only wrapper supplies
-      // it, and neither one provisions or writes.
-      //
-      // `recoverJournal: true` and the write path's 5s busy_timeout, not the
-      // defaults: the replaced `openOutboundDb` path recovered a hot journal
-      // and waited 5s, same as the dashboard's single-session reads
-      // (`steer.ts`, `repository-workspaces/index.ts`). Without it, a live
-      // session whose container crashed mid-write — outbound.db present with
-      // a hot journal, inbound.db gone — throws on every tick under the
-      // console's 1s fleet-fan-out default and never advances its watermark,
-      // so its turn_usage rows never reach the central ledger.
-      const rolledUp = readSessionOutbound(
-        { agentGroupId: session.agent_group_id, sessionId: session.id },
-        (mailbox) => {
-          rollupSessionUsage(mailbox, session.agent_group_id, `${session.agent_group_id}/${session.id}`);
-          return true;
-        },
-        { busyTimeoutMs: 5000, recoverJournal: true },
-      );
-      // Only a rollup that RAN may claim this mtime as processed. A session
-      // whose inbound.db is gone while outbound.db remains resolves undefined
-      // here, and marking it done would skip it on every later sweep for as
-      // long as the outbound file is untouched — its turn_usage rows would
-      // never reach the central totals.
-      if (rolledUp) usageRollupMtimeCache.set(session.id, mtimeMs);
-    } catch (err) {
-      log.warn('Usage rollup failed for session', { err, sessionId: session.id });
-    }
-  }
-  // Bound the cache to sessions that still exist, mirroring the quietSessions
-  // cleanup above — closed sessions would otherwise accumulate forever.
-  if (usageRollupMtimeCache.size > sessions.length + 500) {
-    const live = new Set(sessions.map((s) => s.id));
-    for (const id of usageRollupMtimeCache.keys()) if (!live.has(id)) usageRollupMtimeCache.delete(id);
-  }
-}
-
-/** Test-only entry point for the usage-rollup sweep step. */
-export { sweepUsageRollup as _sweepUsageRollupForTesting };
-
 // G64 (S2-PR6): the pruneIdleSessionArtifacts/pruneIdleThreadArtifacts
 // back-compat shims that used to live here are gone — callers use
 // storage-manager.ts's own exports (which already default `isContainerRunning`
@@ -2195,27 +2115,6 @@ function registerBuiltInSweepDuties(): void {
 
   // T13 (storage-maintenance, tick:post-session, order 30) moved to
   // src/modules/sweep-storage/index.ts (S2-PR6).
-
-  registerSweepDuty({
-    name: id.T19,
-    phase: 'tick:post-session',
-    order: 40,
-    // Fleet-hardening Phase 0.1 (per-turn usage accounting): roll per-session
-    // turn_usage rows into the central usage_daily table for `ncl usage`. Reuses
-    // the same `sessions` list the per-session loop above already fetched — no
-    // extra DB query. Isolated so a rollup failure never blocks the rest of the
-    // tick. `pruneOldTurnUsage` is its companion, not a separate duty: fleet
-    // volume is ~300-600 turns/day, so trimming the ledger the rollup just fed
-    // is trivial per-tick cost.
-    run: async (ctx) => {
-      try {
-        await sweepUsageRollup(ctx.sessions);
-      } catch (err) {
-        log.warn('Usage rollup sweep step failed', { err });
-      }
-      pruneOldTurnUsage();
-    },
-  });
 
   // T22 (orphaned-repo-fence-release) moved to src/modules/sweep-repo-fence/
   // (seam 2, PR 8 — G08). The wrapper moved; `repo-fence-recovery.ts` itself
