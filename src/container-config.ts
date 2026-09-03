@@ -19,8 +19,10 @@
 import fs from 'fs';
 import path from 'path';
 
-import { GROUPS_DIR } from './config.js';
+import { GROUPS_DIR, TIMEZONE } from './config.js';
 import { validateContainerResources, type ContainerResources } from './container-resources.js';
+import { getContainerConfig } from './db/container-configs.js';
+import { isValidTimezone } from './timezone.js';
 import type { AgentGroup, ContainerConfigRow } from './types.js';
 
 /**
@@ -133,6 +135,15 @@ export interface ContainerConfig {
    */
   model?: string;
   effort?: string;
+
+  /**
+   * IANA timezone for this group's container (`TZ` env at spawn) — the zone
+   * the agent's own clock and `formatLocalTime` render in. Absent = follow
+   * the install-global timezone. Mirrored from `container_configs.timezone`
+   * by the `ncl groups create`/`groups config update` write paths, the same
+   * dual-write provider/model/effort use.
+   */
+  timezone?: string;
 
   /**
    * Where to route spawns while `provider` is recorded unavailable (an
@@ -489,6 +500,22 @@ function configPath(folder: string): string {
   return path.join(GROUPS_DIR, folder, 'container.json');
 }
 
+/**
+ * Effective timezone for an agent group: per-group override → install global.
+ * The ncl write path validates, but a hand-edited DB value must not silently
+ * flip scheduling to UTC — an invalid override falls back to the global tz,
+ * same as no override.
+ *
+ * This is the HOST-side resolver: it grounds scheduling (cron interpretation,
+ * `--process-after`, run-log stamps), which reads the DB row. The container's
+ * own `TZ` comes from `container.json` at spawn, mirrored by the same write
+ * paths — the identical split provider/model/effort already live under.
+ */
+export function resolveGroupTimezone(agentGroupId: string): string {
+  const tz = getContainerConfig(agentGroupId)?.timezone;
+  return tz && isValidTimezone(tz) ? tz : TIMEZONE;
+}
+
 /** Build a `ContainerConfig` from a DB row + agent group identity. */
 export function configFromDb(row: ContainerConfigRow, group: AgentGroup): ContainerConfig {
   return {
@@ -507,6 +534,7 @@ export function configFromDb(row: ContainerConfigRow, group: AgentGroup): Contai
     maxMessagesPerPrompt: row.max_messages_per_prompt ?? undefined,
     model: row.model ?? undefined,
     effort: row.effort ?? undefined,
+    timezone: row.timezone && isValidTimezone(row.timezone) ? row.timezone : undefined,
     security: row.security_json ? (JSON.parse(row.security_json) as SecurityConfig) : undefined,
   };
 }
@@ -572,6 +600,7 @@ function materializeContainerConfig(raw: Partial<ContainerConfig>): ContainerCon
     security: raw.security,
     model: raw.model,
     effort: raw.effort,
+    timezone: raw.timezone,
     providerFallback: raw.providerFallback,
     githubTokenEnv: raw.githubTokenEnv,
     excludePlugins: raw.excludePlugins,

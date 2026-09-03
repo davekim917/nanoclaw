@@ -67,6 +67,7 @@ import { migration061 } from './061-turn-usage-turn-id.js';
 import { migration062 } from './062-thread-titles.js';
 import { migration063 } from './063-channel-instructions-profile.js';
 import { migration064 } from './064-container-config-security-json.js';
+import { migration065 } from './065-container-config-timezone.js';
 import { migration066 } from './066-approvals-instance.js';
 import { migration067 } from './067-cli-request-executions.js';
 // Upstream's 014/015 — file numbers clash with local but uniqueness is by `name`.
@@ -170,6 +171,9 @@ export const migrations: Migration[] = [
   // `containerConfigs` creates. Ordering here is execution order, not file
   // number — registering 064 next to 063 runs it before the table exists.
   migration064,
+  // Same constraint as 064: 065 ALTERs container_configs, so it must run
+  // after the aliased `containerConfigs` creates the table.
+  migration065,
   migration066,
   // Standalone CREATE TABLE with no timestamp for 053 to normalize — position
   // relative to 053 is irrelevant, same reasoning as 054/055/056 above.

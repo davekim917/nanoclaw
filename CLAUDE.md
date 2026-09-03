@@ -139,6 +139,8 @@ Two rules, no exceptions:
 - **Storage**: every timestamp written from JS is `new Date().toISOString()` (ISO-8601 UTC, `Z`). Never `datetime('now')`: its naive `YYYY-MM-DD HH:MM:SS` parses as local time in `new Date()` and breaks string comparisons against ISO values. Pure SQL uses `strftime('%Y-%m-%dT%H:%M:%fZ','now')`; SQL comparisons wrap both sides in `datetime()`.
 - **Display**: anything shown to an agent or user renders in the install timezone via `formatLocalTime`/`formatLocalStamp` (`src/timezone.ts`, runner `timezone.ts`); `--json`, DB values, operator logs stay ISO.
 
+An agent group can override the install timezone: `ncl groups config update --timezone <IANA>` (`""` clears). The override grounds that group's scheduling (cron interpretation, `--process-after`, run-log stamps — effective immediately) and the container's `TZ` env (effective on respawn, read from `container.json`). Operator-facing host display stays in the install timezone. Resolution: `resolveGroupTimezone` in `src/container-config.ts`.
+
 ## Supply Chain Security (pnpm)
 
 Tracks latest stable, including majors; prerelease/beta/RC/dev/nightly/draft/yanked/source-only/target-incompatible releases are rejected, no release-age delay. Flow: [docs/dependency-updates.md](docs/dependency-updates.md).

@@ -308,7 +308,7 @@ CREATE TABLE schema_version (
 
 ### 1.15 `container_configs`
 
-Per-agent-group container runtime config. Source of truth for provider, model, packages, MCP servers, mounts, CLI scope, etc. Materialized to `groups/<folder>/container.json` at spawn time.
+Per-agent-group container runtime config. Source of truth for provider, model, packages, MCP servers, mounts, CLI scope, timezone, etc. Materialized to `groups/<folder>/container.json` at spawn time.
 
 ```sql
 CREATE TABLE container_configs (
@@ -325,9 +325,13 @@ CREATE TABLE container_configs (
   packages_npm           TEXT NOT NULL DEFAULT '[]',
   additional_mounts      TEXT NOT NULL DEFAULT '[]',
   cli_scope              TEXT NOT NULL DEFAULT 'group',   -- disabled | group | global
+  security_json          TEXT,                            -- JSON: SecurityConfig | NULL = safe defaults
+  timezone               TEXT,                            -- IANA id; NULL = install-global TZ (migration `container-config-timezone`)
   updated_at             TEXT NOT NULL
 );
 ```
+
+`timezone` overrides the install-global timezone for one agent group. Host-side scheduling (cron interpretation, `--process-after`, run-log stamps, dashboard cron edits) resolves it live via `resolveGroupTimezone` (`src/container-config.ts`), which reads this row. The container gets it as its `TZ` env on next respawn, read from `groups/<folder>/container.json` — the `ncl` write paths dual-write the DB row and the file, exactly like `provider`/`model`/`effort`. Set via `ncl groups config update --timezone <IANA>` (`""` clears back to NULL) or `ncl groups create --timezone`. Operator-facing host display (`ncl` human output, the dashboard's rendered times) stays in the install timezone.
 
 - **Readers:** `src/container-config.ts`, `src/container-runner.ts`, `src/cli/dispatch.ts` (scope enforcement), `src/claude-md-compose.ts`
 - **Writers:** `src/db/container-configs.ts`, `src/modules/self-mod/apply.ts`, `src/backfill-container-configs.ts`

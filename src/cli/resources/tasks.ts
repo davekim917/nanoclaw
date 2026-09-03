@@ -4,6 +4,7 @@ import type Database from 'better-sqlite3';
 import { CronExpressionParser } from 'cron-parser';
 
 import { GROUPS_DIR, TIMEZONE } from '../../config.js';
+import { resolveGroupTimezone } from '../../container-config.js';
 import { getAgentGroup } from '../../db/agent-groups.js';
 import { getDb } from '../../db/connection.js';
 import { getMessagingGroup } from '../../db/messaging-groups.js';
@@ -92,13 +93,13 @@ function actorFor(ctx: CallerContext): string {
   return ctx.caller === 'agent' ? `agent:${ctx.agentGroupId}` : 'host';
 }
 
-function firstRunIso(value: unknown, recurrence: string | null): string {
+function firstRunIso(value: unknown, recurrence: string | null, tz: string = TIMEZONE): string {
   if (str(value) === undefined && recurrence) {
-    const next = CronExpressionParser.parse(recurrence, { tz: TIMEZONE }).next().toISOString();
+    const next = CronExpressionParser.parse(recurrence, { tz }).next().toISOString();
     if (!next) throw new Error('recurrence did not produce a next run');
     return next;
   }
-  return parseProcessAfter(value);
+  return parseProcessAfter(value, tz);
 }
 
 function normalizeNullableString(value: unknown): string | null | undefined {
@@ -306,9 +307,12 @@ function createTask(args: Record<string, unknown>, ctx: CallerContext) {
   if (scriptHost && ctx.caller === 'agent') {
     throw new Error('--script-host runs the script on the host and can only be set by a host operator');
   }
-  validateRecurrence(recurrence);
-  enforceRecurrenceLimit(recurrence, bool(args.dangerously_override_recurrence_limit), script != null);
-  const processAfter = firstRunIso(args.process_after, recurrence);
+  // Wall-clock fields (--process-after, the cron grid) are interpreted in the
+  // owning group's timezone, not the install's.
+  const tz = resolveGroupTimezone(group);
+  validateRecurrence(recurrence, tz);
+  enforceRecurrenceLimit(recurrence, bool(args.dangerously_override_recurrence_limit), script != null, tz);
+  const processAfter = firstRunIso(args.process_after, recurrence, tz);
   const id = makeTaskId(args.name);
   const originSessionId = ctx.caller === 'agent' ? ctx.sessionId : null;
   const { routing, note: routingNote } = resolveTaskRouting(args, ctx);
@@ -545,30 +549,40 @@ function updateTaskCommand(args: Record<string, unknown>, ctx: CallerContext) {
   }
   if (chatLimitArg(args) !== undefined) update.chatLimit = chatLimitArg(args);
   if (args.quiet_status !== undefined) update.quietStatus = bool(args.quiet_status);
-  if (args.process_after !== undefined) update.processAfter = parseProcessAfter(args.process_after);
   const recurrence = normalizeNullableString(args.recurrence);
   const script = normalizeNullableString(args.script);
-  if (recurrence !== undefined) {
-    validateRecurrence(recurrence);
-    // Effective script AFTER this update: the new value when provided
-    // (including an explicit clear), else whatever the task already has.
-    let scriptAfter: string | null = script !== undefined ? script : null;
-    if (script === undefined) {
-      for (const session of selectedSessions(args, ctx)) {
-        const row = withInbound(session, (db) => selectTask(db, id));
-        if (row) {
-          scriptAfter = parseContent(row.content).script;
-          break;
-        }
+
+  // Wall-clock fields (--process-after, the cron grid) are interpreted in the
+  // OWNING group's timezone, so that group must be resolved before parsing.
+  // The same lookup yields the task's current script for the recurrence-limit
+  // check, so it costs no extra scan.
+  let ownerGroup: string | undefined;
+  let currentScript: string | null = null;
+  if (args.process_after !== undefined || recurrence !== undefined) {
+    for (const session of selectedSessions(args, ctx)) {
+      const row = withInbound(session, (db) => selectTask(db, id));
+      if (row) {
+        ownerGroup = session.agent_group_id;
+        currentScript = parseContent(row.content).script;
+        break;
       }
     }
-    enforceRecurrenceLimit(recurrence, bool(args.dangerously_override_recurrence_limit), scriptAfter != null);
+  }
+  const tz = ownerGroup ? resolveGroupTimezone(ownerGroup) : TIMEZONE;
+
+  if (args.process_after !== undefined) update.processAfter = parseProcessAfter(args.process_after, tz);
+  if (recurrence !== undefined) {
+    validateRecurrence(recurrence, tz);
+    // Effective script AFTER this update: the new value when provided
+    // (including an explicit clear), else whatever the task already has.
+    const scriptAfter: string | null = script !== undefined ? script : currentScript;
+    enforceRecurrenceLimit(recurrence, bool(args.dangerously_override_recurrence_limit), scriptAfter != null, tz);
     update.recurrence = recurrence;
     // A new cron with the old armed timestamp fires off the new grid (or a
     // day late). Unless the caller pinned --process-after explicitly,
     // re-derive the next fire from the new expression.
     if (recurrence !== null && args.process_after === undefined) {
-      update.processAfter = CronExpressionParser.parse(recurrence, { tz: TIMEZONE }).next().toDate().toISOString();
+      update.processAfter = CronExpressionParser.parse(recurrence, { tz }).next().toDate().toISOString();
     }
   }
   if (script !== undefined) update.script = script;

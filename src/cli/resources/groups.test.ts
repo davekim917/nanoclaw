@@ -503,6 +503,53 @@ describe('groups CLI resource config', () => {
     expect(readContainerConfig(folder).assistantName).toBe('Renamed');
   });
 
+  it('test_groups_config_update_timezone_dual_writes_and_clears', async () => {
+    // Same trap as provider: scheduling reads the DB row, the container's TZ
+    // env comes from container.json. A one-sided write splits the two.
+    const id = 'ag-timezone';
+    const folder = 'timezone-group';
+    createAgentGroup({ id, name: folder, folder, agent_provider: null, created_at: now() });
+    ensureContainerConfig(id);
+    const groupDir = `${TEST_DIR}/groups/${folder}`;
+    fs.mkdirSync(groupDir, { recursive: true });
+    fs.writeFileSync(
+      `${groupDir}/container.json`,
+      JSON.stringify({ mcpServers: {}, packages: { apt: [], npm: [] }, skills: 'all' }) + '\n',
+    );
+
+    const set = await dispatch(
+      { id: 'req-tz-set', command: 'groups-config-update', args: { id, timezone: 'Europe/Lisbon' } },
+      { caller: 'host' },
+    );
+    expect(set.ok).toBe(true);
+    expect(getContainerConfig(id)?.timezone).toBe('Europe/Lisbon');
+    expect(readContainerConfig(folder).timezone).toBe('Europe/Lisbon');
+
+    // `--timezone ""` clears both sides back to the install default.
+    const clear = await dispatch(
+      { id: 'req-tz-clear', command: 'groups-config-update', args: { id, timezone: '' } },
+      { caller: 'host' },
+    );
+    expect(clear.ok).toBe(true);
+    expect(getContainerConfig(id)?.timezone).toBeNull();
+    expect(readContainerConfig(folder).timezone).toBeUndefined();
+  });
+
+  it('test_groups_config_update_rejects_a_non_iana_timezone', async () => {
+    const id = 'ag-timezone-bad';
+    const folder = 'timezone-bad';
+    createAgentGroup({ id, name: folder, folder, agent_provider: null, created_at: now() });
+    ensureContainerConfig(id);
+
+    const response = await dispatch(
+      { id: 'req-tz-bad', command: 'groups-config-update', args: { id, timezone: 'Not/AZone' } },
+      { caller: 'host' },
+    );
+    expect(response.ok).toBe(false);
+    expect(JSON.stringify(response)).toMatch(/not an IANA timezone id/);
+    expect(getContainerConfig(id)?.timezone).toBeNull();
+  });
+
   it('test_legacy_gitnexus_key_is_behaviorally_inert', () => {
     const folder = 'legacy-gitnexus';
     const groupDir = `${TEST_DIR}/groups/${folder}`;

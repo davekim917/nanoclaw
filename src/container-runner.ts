@@ -43,6 +43,7 @@ import {
   resolveContainerResources,
   type ContainerResources,
 } from './container-resources.js';
+import { isValidTimezone } from './timezone.js';
 import { resolveSpawnProvider } from './provider-fallback.js';
 import { markProviderAvailable } from './db/provider-health.js';
 import { getContainerConfig, resolveProviderName } from './db/container-configs.js';
@@ -3314,7 +3315,13 @@ async function buildContainerArgs(
   // Environment — only vars read by code we don't own.
   // Everything NanoClaw-specific is in container.json (read by runner at startup).
   for (const [key, value] of Object.entries(mailboxEnvironment ?? {})) args.push('-e', `${key}=${value}`);
-  args.push('-e', `TZ=${TIMEZONE}`);
+  // A per-group timezone override rides container.json (mirrored there by the
+  // ncl write paths); anything not a valid IANA id falls back to the install
+  // timezone rather than to UTC, so a hand-edited file can't silently move an
+  // agent's clock.
+  const containerTimezone =
+    containerConfig.timezone && isValidTimezone(containerConfig.timezone) ? containerConfig.timezone : TIMEZONE;
+  args.push('-e', `TZ=${containerTimezone}`);
 
   // Claude Code behavior locks — duplicated from settings.json env block so
   // the values are set regardless of the SDK's settings-loading order.

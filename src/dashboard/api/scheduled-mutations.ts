@@ -20,6 +20,7 @@ import path from 'path';
 import Database from 'better-sqlite3';
 
 import { DATA_DIR, TIMEZONE } from '../../config.js';
+import { resolveGroupTimezone } from '../../container-config.js';
 import { getDb } from '../../db/connection.js';
 import { getSession } from '../../db/sessions.js';
 import { openInboundDb } from '../../db/session-db.js';
@@ -200,9 +201,14 @@ function afterMutation(agentGroupId: string, sessionId: string): void {
   invalidateScheduledCache();
 }
 
-/** Next future cron occurrence (canonical parse — byte-identical to recurrence.ts:31). */
-function nextSlot(cron: string, afterMs: number): string {
-  const it = CronExpressionParser.parse(cron, { tz: TIMEZONE, currentDate: new Date(afterMs) });
+/**
+ * Next future cron occurrence (canonical parse — byte-identical to
+ * recurrence.ts:31). `tz` is the OWNING group's effective timezone: the
+ * firing path re-arms in it, so a dashboard edit that armed the first fire on
+ * the install grid would land the series one slot off until the next re-arm.
+ */
+function nextSlot(cron: string, afterMs: number, tz: string = TIMEZONE): string {
+  const it = CronExpressionParser.parse(cron, { tz, currentDate: new Date(afterMs) });
   return it.next().toDate().toISOString();
 }
 
@@ -290,7 +296,7 @@ export const editHandler: AuthHandler = async (req, params, ctx) => {
   if (body.script !== undefined) update.script = body.script;
   if (body.cron !== undefined) {
     update.recurrence = body.cron;
-    update.processAfter = nextSlot(body.cron, nowMs);
+    update.processAfter = nextSlot(body.cron, nowMs, resolveGroupTimezone(t.agentGroupId));
   }
 
   const db = openInboundDb(t.inboundPath);
@@ -376,7 +382,9 @@ export const resumeHandler: AuthHandler = async (_req, params, ctx) => {
     // pending (skip-don't-replay, D3) — a paused-past-its-slot series must not
     // fire immediately on resume.
     if (t.live.recurrence) {
-      updateTask(db, t.seriesId, { processAfter: nextSlot(t.live.recurrence, nowMs) });
+      updateTask(db, t.seriesId, {
+        processAfter: nextSlot(t.live.recurrence, nowMs, resolveGroupTimezone(t.agentGroupId)),
+      });
     }
     touched = resumeTask(db, t.seriesId);
   } finally {
