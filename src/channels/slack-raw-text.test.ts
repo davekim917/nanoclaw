@@ -83,6 +83,62 @@ describe('extractSlackRawText', () => {
     expect(extractSlackRawText({ attachments: [{ blocks: [{ type: 'table', rows: 'bad' }] }] })).toBeNull();
   });
 
+  it('renders rich_text elements that carry no `text` field', () => {
+    const raw = {
+      attachments: [
+        {
+          blocks: [
+            {
+              type: 'table',
+              rows: [
+                [
+                  {
+                    type: 'rich_text',
+                    elements: [
+                      {
+                        type: 'rich_text_section',
+                        elements: [
+                          { type: 'user', user_id: 'U9' },
+                          { type: 'emoji', name: 'tada', unicode: '1f389' },
+                          { type: 'emoji', name: 'shipit' },
+                          { type: 'channel', channel_id: 'C7' },
+                          { type: 'usergroup', usergroup_id: 'S3' },
+                          { type: 'broadcast', range: 'here' },
+                          { type: 'link', url: 'https://example.com/report' },
+                          { type: 'link', url: 'https://example.com/x', text: 'labeled' },
+                        ],
+                      },
+                    ],
+                  },
+                ],
+              ],
+            },
+          ],
+        },
+      ],
+    };
+
+    expect(extractSlackRawText(raw)).toBe(
+      '<@U9> \u{1F389} :shipit: <#C7> <!subteam^S3> @here https://example.com/report labeled',
+    );
+  });
+
+  it('returns null for a table whose cells are all empty', () => {
+    const raw = {
+      attachments: [
+        {
+          blocks: [
+            {
+              type: 'table',
+              rows: [[{ type: 'rich_text', elements: [] }], [{ type: 'rich_text', elements: [] }]],
+            },
+          ],
+        },
+      ],
+    };
+    expect(extractSlackRawText(raw)).toBeNull();
+  });
+
   it('caps unexpectedly large pasted tables', () => {
     const rows = Array.from({ length: 20_000 }, (_, index) => [
       { type: 'raw_text', text: `row-${index}-with-padding` },
@@ -199,6 +255,26 @@ describe('Slack pasted tables through the chat-sdk bridge', () => {
   it('leaves the body untouched when the adapter declares no extractor', async () => {
     const inbound = await inboundThroughBridge(pastedTableEvent, 'Analyze this attendee list:', { extract: false });
     expect((inbound.content as Record<string, unknown>).text).toBe('Analyze this attendee list:');
+  });
+
+  it('recovers a table whose only content is a native Slack mention', async () => {
+    const raw = {
+      text: 'who owns this:',
+      attachments: [
+        {
+          blocks: [
+            {
+              type: 'table',
+              rows: [[{ type: 'rich_text', elements: [{ type: 'user', user_id: 'U9' }] }]],
+            },
+          ],
+        },
+      ],
+    };
+    const inbound = await inboundThroughBridge(raw, 'who owns this:', {
+      transformInboundText: (t) => t.replaceAll('<@U9>', '@alice'),
+    });
+    expect((inbound.content as Record<string, unknown>).text).toBe('who owns this:\n\n@alice');
   });
 
   it('runs the rescued text through transformInboundText, so cell mentions resolve', async () => {

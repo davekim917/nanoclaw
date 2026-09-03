@@ -12,7 +12,59 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
-/** Collect the text leaves in a Slack cell's raw_text/rich_text subtree. */
+/**
+ * Render one rich_text element node to readable text.
+ *
+ * Only plain runs carry their content in `text`. A mention, emoji, channel
+ * reference, unlabeled link or broadcast keeps it in `user_id` / `name` /
+ * `channel_id` / `url` / `range`, so a cell built from those alone would
+ * project as empty — and a table of only such cells would look like nothing
+ * was pasted at all.
+ *
+ * Mentions and channel refs are emitted in Slack's own wire form on purpose:
+ * the bridge runs `transformInboundText` over the rescued text after
+ * appending it, so `<@U…>` resolves to `@name` exactly like a mention typed
+ * in the message body. Returns null when the node carries no readable value.
+ */
+function elementText(node: Record<string, unknown>): string | null {
+  if (typeof node.text === 'string') return node.text;
+  const str = (key: string): string | null => (typeof node[key] === 'string' ? (node[key] as string) : null);
+  switch (node.type) {
+    case 'user': {
+      const id = str('user_id');
+      return id ? `<@${id}>` : null;
+    }
+    case 'channel': {
+      const id = str('channel_id');
+      return id ? `<#${id}>` : null;
+    }
+    case 'usergroup': {
+      const id = str('usergroup_id');
+      return id ? `<!subteam^${id}>` : null;
+    }
+    case 'broadcast': {
+      const range = str('range');
+      return range ? `@${range}` : null;
+    }
+    case 'emoji': {
+      const unicode = str('unicode');
+      if (unicode) {
+        const points = unicode.split('-').map((hex) => Number.parseInt(hex, 16));
+        if (points.every((cp) => Number.isInteger(cp) && cp >= 0 && cp <= 0x10ffff)) {
+          return String.fromCodePoint(...points);
+        }
+      }
+      const name = str('name');
+      return name ? `:${name}:` : null;
+    }
+    case 'link':
+      return str('url');
+    default:
+      return null;
+  }
+}
+
+/** Collect the readable leaves in a Slack cell's raw_text/rich_text subtree. */
 function cellText(value: unknown): string {
   const parts: string[] = [];
   const visit = (node: unknown): void => {
@@ -21,7 +73,8 @@ function cellText(value: unknown): string {
       return;
     }
     if (!isRecord(node)) return;
-    if (typeof node.text === 'string') parts.push(node.text);
+    const rendered = elementText(node);
+    if (rendered) parts.push(rendered);
     Object.values(node).forEach(visit);
   };
   visit(value);
@@ -44,8 +97,10 @@ export function extractSlackRawText(raw: Record<string, unknown>): string | null
     }
   }
 
-  if (lines.length === 0) return null;
   const text = lines.join('\n');
+  // A table whose every cell is empty carries nothing to recover — say so with
+  // null rather than handing the bridge a body of separators and blank lines.
+  if (text.trim() === '') return null;
   if (text.length <= MAX_TABLE_CHARS) return text;
   return `${text.slice(0, MAX_TABLE_CHARS - 20)}\n[table truncated]`;
 }
