@@ -1,6 +1,5 @@
 [
   "container/agent-runner/src/cli/ncl.ts",
-  "container/agent-runner/src/db/index.ts",
   "container/agent-runner/src/db/rate-limit-samples.ts",
   "container/agent-runner/src/db/turn-usage.ts",
   "container/agent-runner/src/poll-loop.ts",
