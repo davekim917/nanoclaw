@@ -9,7 +9,7 @@
 import { clearTickRepositoryBarrier, getActiveRepositoryMountBarrier, setTickRepositoryBarrier } from './selection.js';
 import { acknowledgeRepositoryMountBarrier, getRepositoryMountBarrierAck } from './session-state.js';
 
-let reportedReadFailure: string | null = null;
+let reportedFailure: string | null = null;
 
 /**
  * Hold admission while the host holds a repository ingress fence, and record
@@ -21,30 +21,35 @@ let reportedReadFailure: string | null = null;
  * that follows in the same tick, so a fenced poll costs one `inbound.db` open
  * instead of two. The write is idempotent: a re-evaluation of a token the
  * session already acknowledged does not touch `session_state`.
+ *
+ * The WHOLE path fails CLOSED, in this gate rather than in the seam.
+ * `evaluateAdmission` treats a throwing gate as not holding, which is right for
+ * an optional observer and wrong for this one: the loop's late re-checks run
+ * AFTER selection has already produced a batch, so a swallowed failure there
+ * would start a turn under an active fence — and without publishing the ack the
+ * host is waiting for. That covers the `outbound.db` read and write as much as
+ * the `inbound.db` read: a lock or I/O fault on either must hold, not admit.
+ * Before this series a throw here propagated out of the poll loop, so holding
+ * restores the fail-closed direction rather than inventing one.
+ *
+ * Holding is recoverable, not silent deafness: a session DB this broken means
+ * the poll is dead anyway, and a held tick touches no heartbeat, so the host
+ * staleness sweep reaps the container.
  */
 export function repositoryFenceAdmissionGate(): boolean {
-  let token: string | null;
   try {
-    token = getActiveRepositoryMountBarrier();
+    const token = getActiveRepositoryMountBarrier();
+    setTickRepositoryBarrier(token);
+    if (token !== null && getRepositoryMountBarrierAck() !== token) acknowledgeRepositoryMountBarrier(token);
+    reportedFailure = null;
+    return token !== null;
   } catch (error) {
-    // Fail CLOSED, in this gate, not in the seam. `evaluateAdmission` treats a
-    // throwing gate as not holding, which is right for an optional observer and
-    // wrong for this one: the loop's late re-checks run AFTER selection has
-    // already returned a batch, so a swallowed read error there would start a
-    // turn under a fence with nothing left to stop it. An unreadable inbound.db
-    // means the poll is dead anyway, and a held tick touches no heartbeat — the
-    // host sweep reaps the container instead of leaving it silently deaf.
     const message = String(error);
-    if (reportedReadFailure !== message) {
-      reportedReadFailure = message;
-      console.error(`[admission] repository fence read failed — holding admission: ${message}`);
+    if (reportedFailure !== message) {
+      reportedFailure = message;
+      console.error(`[admission] repository fence check failed — holding admission: ${message}`);
     }
     clearTickRepositoryBarrier();
     return true;
   }
-  reportedReadFailure = null;
-  setTickRepositoryBarrier(token);
-  if (token === null) return false;
-  if (getRepositoryMountBarrierAck() !== token) acknowledgeRepositoryMountBarrier(token);
-  return true;
 }

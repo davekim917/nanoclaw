@@ -114,10 +114,12 @@ describe('admission gate', () => {
     expect(evaluateAdmission()).toBe(false);
   });
 
-  // Round 1 (Codex P2): the seam's fail-open catch is right for an optional
-  // observer and wrong for this gate. The loop's late re-checks run after
-  // selection has already produced a batch, so a swallowed read error there
-  // would admit a turn under an active fence with nothing left to stop it.
+  // Rounds 1-2 (Codex P2 x2): the seam's fail-open catch is right for an
+  // optional observer and wrong for this gate. The loop's late re-checks run
+  // after selection has already produced a batch, so a swallowed failure there
+  // would admit a turn under an active fence with nothing left to stop it —
+  // and without publishing the ack the host waits for. Every step of the path
+  // holds, not just the inbound read.
   test('the fence gate holds when the barrier read fails, and reports it once', () => {
     // A fence table the read cannot understand: 'no such table' is a legitimate
     // pre-fence session DB and returns null, but 'no such column' rethrows.
@@ -131,8 +133,24 @@ describe('admission gate', () => {
       expect(evaluateAdmission()).toBe(true);
       expect(errors.mock.calls.length).toBe(1);
       // The gate absorbed it — the seam never saw a throwing gate.
-      expect(String(errors.mock.calls[0][0])).toContain('[admission] repository fence read failed');
+      expect(String(errors.mock.calls[0][0])).toContain('[admission] repository fence check failed');
       expect(ackRow()).toBeNull();
+    } finally {
+      errors.mockRestore();
+    }
+  });
+
+  test('the fence gate holds when publishing the acknowledgement fails', () => {
+    activateFence('epoch-ack-fail', 'gen-ack-fail');
+    // The fence read succeeds; the outbound side of the path is what breaks.
+    getOutboundDb().exec('DROP TABLE session_state');
+
+    const errors = spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      registerAdmissionGate(repositoryFenceAdmissionGate);
+      expect(evaluateAdmission()).toBe(true);
+      expect(errors.mock.calls.length).toBe(1);
+      expect(String(errors.mock.calls[0][0])).toContain('[admission] repository fence check failed');
     } finally {
       errors.mockRestore();
     }
