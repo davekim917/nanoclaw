@@ -2254,24 +2254,33 @@ async function enforceRunningContainerSla(
       writeOutboundWhenStopped(session, mailbox, () => {
         notifyKillCeiling(mailbox, session, decision.heartbeatAgeMs, pendingClaims, containerState);
         resetStuckProcessingRows(mailbox, session, 'absolute-ceiling');
+        // Accountability wake: if the kill plausibly interrupted parked work,
+        // queue an on_wake row so the session respawns (next sweep tick's
+        // due-wake step) and answers for the interruption instead of staying
+        // dead until the next human ping. Best-effort — a failure here must
+        // not break the sweep's kill path.
+        //
+        // INSIDE the guard, which is where the pre-refactor `return` also left
+        // it. The row itself is inbound (host-owned, no single-writer hazard),
+        // but a replacement that took the session has already recovered from
+        // this kill: the row is `on_wake = 1`, so the live replacement never
+        // consumes it and it instead greets the NEXT fresh container with a
+        // stale "your previous container was killed" notice — while counting
+        // against that class's recovery-attempt cap. Skipping is correct, not
+        // merely safe.
+        try {
+          applyCeilingFollowUp(
+            mailbox,
+            session,
+            containerState,
+            workContinuation,
+            decision.heartbeatAgeMs,
+            decision.ceilingMs,
+          );
+        } catch (err) {
+          log.warn('ceiling-kill follow-up failed', { sessionId: session.id, err });
+        }
       });
-      // Accountability wake: if the kill plausibly interrupted parked work,
-      // queue an on_wake row so the session respawns (next sweep tick's
-      // due-wake step) and answers for the interruption instead of staying
-      // dead until the next human ping. Best-effort — a failure here must
-      // not break the sweep's kill path.
-      try {
-        applyCeilingFollowUp(
-          mailbox,
-          session,
-          containerState,
-          workContinuation,
-          decision.heartbeatAgeMs,
-          decision.ceilingMs,
-        );
-      } catch (err) {
-        log.warn('ceiling-kill follow-up failed', { sessionId: session.id, err });
-      }
     });
     return;
   }
