@@ -38,6 +38,18 @@ describe('mode', () => {
   it('is enforcing inside this file', () => {
     expect(hermeticityMode()).toBe('enforce');
   });
+
+  it('holds the requested mode across an await', async () => {
+    // An async callback returns at its first `await` with its body unfinished.
+    // Restoring the mode there would drop everything past the suspension back
+    // to the repo default, which in `warn` executes for real.
+    await withHermeticityMode('warn', async () => {
+      expect(hermeticityMode()).toBe('warn');
+      await Promise.resolve();
+      expect(hermeticityMode()).toBe('warn');
+    });
+    expect(hermeticityMode()).toBe('enforce');
+  });
 });
 
 describe('subprocess guard', () => {

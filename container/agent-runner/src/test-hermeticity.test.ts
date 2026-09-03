@@ -18,6 +18,7 @@ import {
   allowSubprocess,
   clearHermeticityAttempts,
   hermeticityAttempts,
+  hermeticityMode,
   resetHermeticityAllowances,
   withHermeticityMode,
 } from './test-hermeticity.js';
@@ -37,6 +38,28 @@ function enforcing<T>(fn: () => T): T {
 }
 
 describe('hermeticity tripwire', () => {
+  test('holds the requested mode across an await', async () => {
+    // An async callback returns at its first `await` with its body unfinished.
+    // Restoring the mode there would drop everything past the suspension back
+    // to the repo default, which in `warn` executes for real — and this helper
+    // is the runner's only way to enforce.
+    await withHermeticityMode('enforce', async () => {
+      expect(hermeticityMode()).toBe('enforce');
+      await Promise.resolve();
+      expect(() => execFileSync('git', ['--version'])).toThrow(/subprocess escape/);
+    });
+    clearHermeticityAttempts();
+  });
+
+  test('protects the checkout root, not the package working directory', () => {
+    // `bun test` runs with container/agent-runner as its cwd, so roots derived
+    // from the cwd would guard a directory that does not exist and leave the
+    // real central database reachable by a relative path.
+    const central = path.resolve(process.cwd(), '../../data/v2.db');
+    enforcing(() => expect(() => fs.writeFileSync(central, 'x')).toThrow(/fs-write escape/));
+    expect(fs.existsSync(central)).toBe(false);
+  });
+
   test('throws on a subprocess spawn, naming the command', () => {
     enforcing(() =>
       expect(() => execFileSync('git', ['--version'])).toThrow(/subprocess escape — execFileSync\(git\)/),

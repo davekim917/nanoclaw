@@ -22,6 +22,7 @@
 import { afterAll, mock } from 'bun:test';
 import nodeOs from 'node:os';
 import nodePath from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 export type HermeticityMode = 'enforce' | 'warn' | 'off';
 
@@ -84,15 +85,52 @@ export function hermeticityMode(): HermeticityMode {
   return state.mode;
 }
 
-/** Run `fn` with the tripwire in `mode`, restoring the previous mode after. */
+function isThenable(value: unknown): value is PromiseLike<unknown> {
+  return (
+    (typeof value === 'object' || typeof value === 'function') &&
+    value !== null &&
+    typeof (value as { then?: unknown }).then === 'function'
+  );
+}
+
+/**
+ * Run `fn` with the tripwire in `mode`, restoring the previous mode after. An
+ * async callback is awaited, so the mode survives past the first suspension.
+ */
 export function withHermeticityMode<T>(mode: HermeticityMode, fn: () => T): T {
   const previous = state.mode;
   state.mode = mode;
-  try {
-    return fn();
-  } finally {
+  let restored = false;
+  const restore = (): void => {
+    if (restored) return;
+    restored = true;
     state.mode = previous;
+  };
+  let result: T;
+  try {
+    result = fn();
+  } catch (error) {
+    restore();
+    throw error;
   }
+  // An async callback returns at its first `await` with the rest of its body
+  // still to run. Restoring in a `finally` would drop the requested mode right
+  // there, so everything past the first suspension would execute under the
+  // repo default and, in `warn`, actually reach out.
+  if (isThenable(result)) {
+    return result.then(
+      (value) => {
+        restore();
+        return value;
+      },
+      (error: unknown) => {
+        restore();
+        throw error;
+      },
+    ) as T;
+  }
+  restore();
+  return result;
 }
 
 function callSite(): string {
@@ -242,10 +280,20 @@ if (typeof globalThis.fetch === 'function') {
 
 // ── out-of-tree writes ───────────────────────────────────────────────────────
 
+/** The repository root, resolved from this file rather than the working directory. */
+const CHECKOUT_ROOT = nodePath.resolve(nodePath.dirname(fileURLToPath(import.meta.url)), '../../..');
+
 /**
  * Roots inside the checkout that a unit test has no business writing to. In a
  * live install these hold production session state, so a test that lands here
  * is writing over the running system.
+ *
+ * The roots are derived from this file's own location, not from
+ * `process.cwd()`. The runner suite runs with `container/agent-runner` as its
+ * working directory, so a cwd-derived list protects
+ * `container/agent-runner/data` — a path that does not exist — and leaves the
+ * real `<checkout>/data` open to `path.resolve(cwd, '../../data/v2.db')`. The
+ * cwd is still included, so a suite launched from somewhere else is covered too.
  *
  * Deliberately a denylist, not an allowlist: fixtures live all over the temp
  * dir and a few suites build their own scratch checkouts, so an allowlist would
@@ -256,14 +304,12 @@ if (typeof globalThis.fetch === 'function') {
  * temp-dir allowance.
  */
 function checkoutDeniedRoots(): string[] {
-  const cwd = process.cwd();
-  return [
-    nodePath.join(cwd, 'data'),
-    nodePath.join(cwd, 'groups'),
-    nodePath.join(cwd, 'dist'),
-    nodePath.join(cwd, 'logs'),
-    nodePath.join(cwd, 'node_modules'),
-  ];
+  const names = ['data', 'groups', 'dist', 'logs', 'node_modules'];
+  const roots = new Set<string>();
+  for (const base of [CHECKOUT_ROOT, process.cwd()]) {
+    for (const name of names) roots.add(nodePath.join(base, name));
+  }
+  return [...roots];
 }
 
 function isUnder(child: string, parent: string): boolean {
