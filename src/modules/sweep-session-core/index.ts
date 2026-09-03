@@ -17,16 +17,6 @@
  * log strings, thresholds, helper calls). None of these duties kills or wakes,
  * so all four run inside the window the driver already holds — `ctx.mailbox`
  * is that window's session.
- *
- * `deferMessageForFreshContextRetry` is still a raw-handle callee
- * (`session-manager.ts`): mailbox seam PR 4 converted `runHostGatedTaskScripts`,
- * `handleRecurrence` and `syncDoneProposalMirror` but NOT this one (verified on
- * PR 4's head `2d1e345d`), so `legacyInboundHandle()` moves here with the body
- * and this file joins `src/mailbox/RATCHET.json` until the mailbox series
- * converts it — the same deliberate, written-down exception S2-PR7 carries for
- * its raw opener. Removal trigger: remove this allowlist entry when the mailbox
- * seam converts that callee to take a session; nothing else in this file
- * touches a raw session-DB handle.
  */
 import { isContainerRunning } from '../../container-runner.js';
 import {
@@ -101,7 +91,7 @@ function resetStuckProcessingRows(mailbox: NanoclawMailboxSession, session: Sess
     } else {
       const backoffMs = BACKOFF_BASE_MS * Math.pow(2, msg.tries);
       const backoffSec = Math.floor(backoffMs / 1000);
-      deferMessageForFreshContextRetry(mailbox.legacyInboundHandle(), msg.id, backoffSec);
+      deferMessageForFreshContextRetry(mailbox, msg.id, backoffSec);
       log.info('Reset stale message with backoff', {
         messageId: msg.id,
         tries: msg.tries,

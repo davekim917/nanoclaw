@@ -267,8 +267,6 @@ function fakeMailbox(overrides: Record<string, unknown> = {}): NanoclawMailboxSe
     expireStalePending: () => 0,
     getProcessingClaimRows: () => [],
     hasOutbound: () => true,
-    legacyInboundHandle: () => ({}),
-    legacyOutboundHandle: () => ({}),
     // Added with the mailbox PR 4 merge: S6's mirror now reads the parsed
     // proposal through the session instead of taking the outbound handle.
     readDoneProposal: () => null,
