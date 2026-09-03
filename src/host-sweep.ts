@@ -1322,9 +1322,13 @@ export function shouldCloseTaskSession(
  *   - the pre-task script batch, which by design runs BEFORE the rows it
  *     belongs to are claimed and may take NANOCLAW_TASK_SCRIPT_TIMEOUT_MS
  *     (120s default) — several sweep ticks;
- *   - the durable-continuation turn, which claims nothing at all and drops
- *     its work_continuation record on the provider's `result` event, while
- *     delivery, archiving and the turn-end git checkpoint are still running.
+ *   - any turn after the first one in a stream: the initial batch is marked
+ *     completed at its `result`, so a pushed follow-up turn and a durable
+ *     continuation both execute holding nothing.
+ *
+ * It tracks turns, not stream lifetime — set on the prompt that starts one,
+ * cleared on the `result` that ends it — so a container parked in an open
+ * multi-turn stream still reaps on the same tick it goes quiet.
  *
  * A container that dies mid-window cannot clear the flag, so the fresh one
  * clears it at startup (clearStaleProcessingAcks) and the 30-minute heartbeat

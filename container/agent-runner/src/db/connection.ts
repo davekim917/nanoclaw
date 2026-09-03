@@ -423,18 +423,25 @@ export function clearProviderHealthState(outbound: Database = getOutboundDb()): 
  *
  * The reapers otherwise infer busy-ness from state the HOST can see: a due
  * inbound row, or a `processing` claim in processing_ack. Both are absent
- * during work the runner drives on its own behalf — the pre-task script batch
+ * during work the runner drives on its own behalf — a pre-task script batch
  * (up to NANOCLAW_TASK_SCRIPT_TIMEOUT_MS, 120s by default) runs before the
- * batch is claimed, and the durable-continuation turn runs with an empty
- * claim list and clears its work_continuation record on the provider's
- * `result` event, while the runner is still delivering, archiving and running
- * its turn-end git checkpoint. In those windows every term the task reaper
+ * batch is claimed; a pushed follow-up turn and a durable-continuation turn
+ * both run after the initial batch was completed at the previous `result`,
+ * so they hold no claim at all. In those windows every term the task reaper
  * looks at reads "idle" and the container is killed mid-work.
  *
- * Always set it in a `try`/`finally` pair: a window that is entered and never
- * left would hold the container past the reaper (the 30-minute heartbeat
- * ceiling is still a backstop, and clearStaleProcessingAcks resets the flag
- * at the next container's startup).
+ * The flag tracks TURNS, not stream lifetime. A multi-turn stream stays open
+ * after `result` to accept pushes, so poll-loop.ts publishes this at the same
+ * two boundaries it already maintains `turnIdle` at — set on the prompt that
+ * starts a turn, cleared on the `result` that ends one. Bracketing a whole
+ * `processQuery` call instead would pin the flag at 1 through the container's
+ * entire idle stretch and defeat the reaper.
+ *
+ * Windows outside a provider turn (the script batch, a turn-end checkpoint)
+ * take a `try`/`finally` pair, and they must be bounded: a window entered and
+ * never left holds the container past the reaper. The 30-minute heartbeat
+ * ceiling is still a backstop, and clearStaleProcessingAcks resets the flag at
+ * the next container's startup.
  */
 export function setProviderExecuting(executing: boolean, outbound: Database = getOutboundDb()): void {
   const now = new Date().toISOString();

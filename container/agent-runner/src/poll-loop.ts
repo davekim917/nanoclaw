@@ -426,14 +426,6 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
           setCurrentBatchAnchors(sourceBatch);
           let query: AgentQuery | undefined;
           const abortDirectQuery = () => query?.abort();
-          // This turn is invisible to every signal the host's task reaper
-          // reads: it claims no inbound rows (processingIds is []), nothing is
-          // due (the outer branch only runs when no trigger row is pending),
-          // and processQuery clears the work_continuation record the moment
-          // the provider emits `result` — while delivery, archiving and the
-          // turn-end git checkpoint below are still running. Publish the busy
-          // flag across the whole window instead.
-          setProviderExecuting(true);
           try {
             query = config.provider.query({
               prompt,
@@ -477,6 +469,11 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
             clearCurrentInReplyTo();
             clearBatchAnchors();
           }
+          // processQuery tracks the turn itself. This tail does not: the
+          // continuation record is already cleared, this path claims no
+          // inbound rows, and the turn-end git checkpoint below is real work
+          // the host would otherwise read as idle. Bounded, unlike the stream.
+          setProviderExecuting(true);
           try {
             emitTurnEnd();
             await checkpointTurnEnd(autosaveWorktrees);
@@ -1458,6 +1455,11 @@ export async function processQuery(
   let turnStartedAtMs = Date.now();
   const pushToQuery = (message: string): void => {
     turnIdle = false;
+    // Same boundary as `turnIdle`, published for the host. A pushed turn runs
+    // with no processing claim of its own (the initial batch was completed at
+    // the previous `result`), so this is the only thing standing between it
+    // and the idle reaper.
+    setProviderExecuting(true);
     turnStartedAtMs = Date.now();
     query.push(message);
   };
@@ -1740,6 +1742,8 @@ export async function processQuery(
     })();
   }, ACTIVE_POLL_INTERVAL_MS);
 
+  // The initial prompt is a turn the same way a push is; `result` clears it.
+  setProviderExecuting(true);
   try {
     for await (const event of query.events) {
       if (event.type === 'error') {
@@ -1780,6 +1784,13 @@ export async function processQuery(
         // handling below, so any push it makes (nudge, continuation launch)
         // clears the flag again and leaves it truthful on exit.
         turnIdle = true;
+        // The host's copy of that same fact. It has to be published HERE and
+        // not around the whole call: a multi-turn stream stays open after
+        // `result` to accept pushes (claude.ts's generator exits only on
+        // end()/abort), so a flag cleared on return would sit at 1 through
+        // the entire idle stretch and keep the task reaper off a container
+        // that has nothing left to do.
+        setProviderExecuting(false);
         // Fleet Hardening Phase 0.1: one turn_usage row per completed turn,
         // written here because every provider's query converges on this
         // event regardless of which one ran. Whatever the provider didn't
@@ -1956,6 +1967,8 @@ export async function processQuery(
   } finally {
     done = true;
     clearInterval(pollHandle);
+    // Floor for the abort/throw paths, which never reach a `result`.
+    setProviderExecuting(false);
   }
 
   return { continuation: queryContinuation };
