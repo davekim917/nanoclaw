@@ -9,7 +9,7 @@
  * is host locale-dependent for decorators (month abbr, "," separator) but
  * stable for the numeric parts we assert on (hour, minute, year).
  */
-import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
+import { describe, it, expect, beforeEach, afterEach, setSystemTime } from 'bun:test';
 
 import { getInboundDb } from './mailbox/sqlite/connection.js';
 import { closeSessionDb, initTestSessionDb } from './modules/mailbox/testing.js';
@@ -190,17 +190,27 @@ describe('task timestamps', () => {
       { timestamp: '2026-01-04T12:05:00.000Z', processAfter: '2026-01-05T09:00:00.000Z' },
     );
 
-    const result = formatMessages(getPendingMessages());
+    // Frozen: `current_time` is generated inside formatMessages, and the
+    // expected value below is computed after it returns. Across a minute
+    // boundary the two land on different minutes and the test fails for no
+    // reason. Restored in the finally, so nothing downstream sees a fake clock.
+    const frozen = new Date('2026-01-05T09:30:00.000Z');
+    setSystemTime(frozen);
+    try {
+      const result = formatMessages(getPendingMessages());
 
-    // Generated at format time, in the group timezone — a weekday-qualified
-    // wall clock the agent can anchor relative dates against.
-    //
-    // `[A-Za-z]+day` rather than the seven names spelled out: one of them
-    // collides with a private identifier and trips check-public-boundary. The
-    // assertion loses nothing, because the line below pins the exact rendered
-    // value; this one only pins the SHAPE, that a weekday prefix is present.
-    expect(result).toMatch(/current_time="[A-Za-z]+day, [^"]+"/);
-    expect(result).toContain(`current_time="${formatLocalDateTimeFull(new Date(), TIMEZONE)}"`);
+      // Generated at format time, in the group timezone — a weekday-qualified
+      // wall clock the agent can anchor relative dates against.
+      //
+      // `[A-Za-z]+day` rather than the seven names spelled out: one of them
+      // collides with a private identifier and trips check-public-boundary. The
+      // assertion loses nothing, because the line below pins the exact rendered
+      // value; this one only pins the SHAPE, that a weekday prefix is present.
+      expect(result).toMatch(/current_time="[A-Za-z]+day, [^"]+"/);
+      expect(result).toContain(`current_time="${formatLocalDateTimeFull(frozen, TIMEZONE)}"`);
+    } finally {
+      setSystemTime();
+    }
   });
 
   it('keeps script output rendering intact alongside the new attribute', () => {
