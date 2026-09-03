@@ -80,12 +80,34 @@ export function sessionContextPathFor(sessionPath: string): string {
   return path.join(path.dirname(sessionPath), '.context', `${path.basename(sessionPath)}.json`);
 }
 
-/** Materialize the immutable context the runner receives at startup. */
+/**
+ * Materialize the immutable context the runner receives at startup.
+ *
+ * The container READS this file and runs as a different UID than the host, so
+ * it takes the mode of `inbound.db` and its directory the mode of the session
+ * dir — the file and directory the container already reads today. Upstream's
+ * 0700/0600 would be unreadable inside the container on any install whose
+ * image UID differs from the host's, which is every install where
+ * `buildContainerArgs` omits `--user`. Safe by upstream's own contract:
+ * `runnerContext` is non-secret runner configuration, never credentials.
+ */
 export function writeSessionContext(agentGroupId: string, sessionId: string, mailbox: unknown): void {
   const contextPath = sessionContextPath(agentGroupId, sessionId);
-  fs.mkdirSync(path.dirname(contextPath), { recursive: true, mode: 0o700 });
-  fs.writeFileSync(contextPath, JSON.stringify({ agentGroupId, sessionId, mailbox }), { mode: 0o600 });
-  fs.chmodSync(contextPath, 0o600);
+  const fileMode = existingMode(inboundDbPath(agentGroupId, sessionId), 0o644);
+  const dirMode = existingMode(sessionDir(agentGroupId, sessionId), 0o755);
+  fs.mkdirSync(path.dirname(contextPath), { recursive: true });
+  fs.chmodSync(path.dirname(contextPath), dirMode);
+  fs.writeFileSync(contextPath, JSON.stringify({ agentGroupId, sessionId, mailbox }));
+  fs.chmodSync(contextPath, fileMode);
+}
+
+/** Mode bits of an existing path, or `fallback` when it is not there yet. */
+function existingMode(target: string, fallback: number): number {
+  try {
+    return fs.statSync(target).mode & 0o777;
+  } catch {
+    return fallback;
+  }
 }
 
 function mailboxKey(agentGroupId: string, sessionId: string): MailboxSessionKey {

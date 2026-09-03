@@ -8,10 +8,9 @@
  * delivery rows, the tiered container-state read, and the fused
  * processing-ack sync. See docs/specs/upstream-mailbox-seam/plan.md §4.2.
  */
-import fs from 'fs';
 import type Database from 'better-sqlite3';
 
-import { sessionMailboxDir, sessionMailboxPath } from '../../mailbox/sqlite/paths.js';
+import { sessionMailboxPath } from '../../mailbox/sqlite/paths.js';
 import { SqliteAgentMailbox, wrapSqliteInbound, wrapSqliteOutbound } from '../../mailbox/sqlite/index.js';
 import { migrateMessagesInTable as upstreamMigrateMessagesInTable } from '../../mailbox/sqlite/session-db.js';
 import { parseIsoTimestamp } from '../../mailbox/model.js';
@@ -219,24 +218,25 @@ export class NanoclawAgentMailbox extends SqliteAgentMailbox {
   /**
    * Provision the session's mailbox files.
    *
-   * `initSessionFolder`'s body, unchanged: mkdir plus the fork's `ensureSchema`
-   * on both files, unconditionally. NOT `super.prepare()` (which applies
-   * upstream's narrower baseline that the fork's schema immediately
-   * supersedes), and NOT guarded on `existsSync` — a DB that already exists
-   * may still be missing baseline tables, and the v1→v2 migration provisions
-   * over exactly such a directory. Skipping it there leaves a session whose
-   * every later spawn fails on `ALTER TABLE session_routing`.
+   * `super.prepare()` first — it creates whichever files are MISSING, with
+   * upstream's baseline — and then the fork's `ensureSchema` on both,
+   * ALWAYS, existing files included. The unconditional second half is the
+   * point: a DB that already exists may still be missing baseline tables, and
+   * the v1→v2 migration provisions over exactly such a directory. Guarding it
+   * on `existsSync` left those sessions without `session_routing`, so every
+   * later spawn failed on `ALTER TABLE session_routing`.
    *
-   * Cost is two opens per call, as it has always been. That is a session-
-   * creation path today; PRs 3-6 route every write through
-   * `withMailboxSession`, which prepares first, so that batch should measure
-   * whether this needs a per-path memo rather than assume it.
+   * Cost is the same as `initSessionFolder`'s has always been, plus upstream's
+   * two `existsSync` calls. That is a session-creation path today; PRs 3-6
+   * route every write through `withMailboxSession`, which prepares first, so
+   * that batch should measure whether this needs a per-path memo rather than
+   * assume it — assuming it is what caused the bug above.
    *
    * The migration memo is deliberately untouched here: an existing DB's legacy
    * migrations belong to its first `session()` (H-2).
    */
   override prepare(key: MailboxSessionKey): void {
-    fs.mkdirSync(sessionMailboxDir(key), { recursive: true });
+    super.prepare(key);
     ensureSchema(sessionMailboxPath(key, 'inbound'), 'inbound');
     ensureSchema(sessionMailboxPath(key, 'outbound'), 'outbound');
   }
