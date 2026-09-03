@@ -89,3 +89,9 @@ import './sweep-usage/index.js';
 // S4 pre-wake orphan-claim reset, S17 orphan-claim retry (convergence seam 2,
 // PR 9).
 import './sweep-session-core/index.js';
+
+// Continuation and ceiling accountability (S2-PR13, G09) — S6 done-proposal-mirror,
+// S7 continuation-read, S8 continuation-recovery-parking, S9a
+// continuation-wake-eligibility, S9b container-wake, S15 kill-ceiling-notice,
+// S10 ceiling-kill-accountability.
+import './sweep-continuation/index.js';

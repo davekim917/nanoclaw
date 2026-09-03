@@ -262,6 +262,10 @@ import './modules/sweep-container-health/index.js';
 // not just the in-file built-ins) still surfaces the moved duties for R-7,
 // R-10 and R-11.
 import './modules/sweep-session-core/index.js';
+// S2-PR13's family registers S6/S7/S8/S9a/S9b/S15/S10 as its own duty source
+// at import time; without this line R-7's inventory is seven registrations
+// short. Import for side effects only.
+import './modules/sweep-continuation/index.js';
 import { log } from './log.js';
 // Family module side-effect import (S2-PR7): registers T11
 // (scheduled-move-recovery) and T12 (audit-body-prune) as a duty source, so
