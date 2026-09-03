@@ -54,6 +54,7 @@ import path from 'node:path';
 import { randomBytes } from 'node:crypto';
 
 import { afterEach, describe, expect, it } from 'vitest';
+import ts from 'typescript';
 
 import {
   inboundDbPath,
@@ -314,40 +315,47 @@ describe('scripts/init-cli-agent.ts, scripts/init-first-agent.ts, scripts/refres
   const read = (relPath: string): string => fs.readFileSync(path.join(REPO_ROOT, relPath), 'utf8');
 
   /**
+   * `true` if the import/export statement enclosing source offset `pos`
+   * (a position `ts.preProcessFile` reports somewhere inside that
+   * statement's specifier) is a whole-statement `import type { … } from` or
+   * `export type { … } from` — erased at compile time, no runtime edge. A
+   * per-specifier `import { type X, Y } from` is NOT type-only (Y is a real
+   * value import) and is intentionally not matched here, same as before.
+   *
+   * This is a cheap text check, not a parse: walk back to the nearest
+   * preceding `;` (or start of file) — the statement terminator every
+   * import/export in this codebase's prettier-formatted style carries — and
+   * check what the statement starts with.
+   */
+  function isTypeOnlyStatement(src: string, pos: number): boolean {
+    const prevSemicolon = src.lastIndexOf(';', pos);
+    const statement = src.slice(prevSemicolon + 1, pos).trimStart();
+    return /^import\s+type\b/.test(statement) || /^export\s+type\b/.test(statement);
+  }
+
+  /**
    * Relative import/export specifiers that create a runtime module-graph
    * edge — VALUE imports only; `import type` / `export type { … } from` are
-   * erased at compile time and create no runtime edge. Covers three source
-   * shapes, each independently able to reach code an author wrote:
-   *   - static `import … from './x.js'` (and bare `import './x.js'`)
-   *   - dynamic `import('./x.js')`, with or without a preceding `await`
-   *   - re-exports: `export * from './x.js'` / `export * as ns from './x.js'`
-   *     / `export { a, b } from './x.js'`
+   * erased at compile time and create no runtime edge. Uses TypeScript's own
+   * scanner (`ts.preProcessFile`, an existing dependency) rather than a
+   * lexical regex walk, which previously let a lazy pattern spanning
+   * newlines swallow a bare side-effect import sitting between a
+   * non-relative `from` clause and the next relative one (see the
+   * "side-effect import" test below). `preProcessFile` reports every
+   * specifier from static imports (including bare side-effect imports),
+   * dynamic `import('./x.js')` with a string-literal specifier, and
+   * `export … from` re-exports in one pass; type-only statements are
+   * filtered out separately via `isTypeOnlyStatement` since
+   * `preProcessFile` reports those too.
    */
   function relativeValueSpecifiers(src: string): string[] {
+    const { importedFiles } = ts.preProcessFile(src, /* readImportFiles */ true, /* detectJavaScriptImports */ false);
     const specifiers = new Set<string>();
-
-    const staticImportRe =
-      /^import\s+(type\s+)?(?:[\s\S]*?)\s+from\s+['"](\.[^'"]+)['"];?|^import\s+['"](\.[^'"]+)['"];?/gm;
-    let match: RegExpExecArray | null;
-    while ((match = staticImportRe.exec(src))) {
-      if (match[1]) continue; // `import type` — no runtime edge
-      const specifier = match[2] ?? match[3];
-      if (specifier) specifiers.add(specifier);
+    for (const { fileName, pos } of importedFiles) {
+      if (!fileName.startsWith('.')) continue; // package import — no repo-relative edge
+      if (isTypeOnlyStatement(src, pos)) continue;
+      specifiers.add(fileName);
     }
-
-    const dynamicImportRe = /\bimport\s*\(\s*['"](\.[^'"]+)['"]\s*\)/g;
-    while ((match = dynamicImportRe.exec(src))) {
-      specifiers.add(match[1]);
-    }
-
-    // `export type { … } from` is intentionally NOT matched here: after
-    // `export\s*` the next literal must be `*` or `{`, and `type` fails
-    // that — same erased-at-compile-time reasoning as `import type`.
-    const reExportRe = /^export\s*(?:\*(?:\s+as\s+\w+)?|\{[^}]*\})\s*from\s*['"](\.[^'"]+)['"];?/gm;
-    while ((match = reExportRe.exec(src))) {
-      specifiers.add(match[1]);
-    }
-
     return [...specifiers];
   }
 
@@ -452,6 +460,31 @@ describe('scripts/init-cli-agent.ts, scripts/init-first-agent.ts, scripts/refres
       }
 
       expect(visited).toEqual(new Set(['entry.ts', 'middle.ts', 'leaf.ts']));
+    });
+
+    it('resolves a side-effect `import`, even when a package import with a `from` clause precedes it on an earlier line', () => {
+      // Regression: a lazy, newline-spanning regex here previously let a
+      // preceding non-relative `import path from 'path';` statement's `from`
+      // clause absorb everything up to the NEXT `from '<relative>'` it could
+      // find, silently swallowing this bare side-effect import in between —
+      // exactly the shape `scripts/init-cli-agent.ts` and
+      // `scripts/init-first-agent.ts` use for `import '../src/channels/index.js';`.
+      const dir = tmpDir('walker-side-effect');
+      fs.writeFileSync(
+        path.join(dir, 'entry.ts'),
+        [
+          "import path from 'node:path';",
+          "import './side-effect-target.js';",
+          "import { later } from './later-target.js';",
+        ].join('\n'),
+      );
+      fs.writeFileSync(path.join(dir, 'side-effect-target.ts'), 'export const ranSideEffect = true;\n');
+      fs.writeFileSync(path.join(dir, 'later-target.ts'), 'export const later = 1;\n');
+
+      const src = fs.readFileSync(path.join(dir, 'entry.ts'), 'utf8');
+      const deps = relativeValueImports('entry.ts', src, dir);
+
+      expect(deps.sort()).toEqual(['later-target.ts', 'side-effect-target.ts'].sort());
     });
   });
 });
