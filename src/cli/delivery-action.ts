@@ -8,7 +8,7 @@
 import { registerDeliveryAction } from '../delivery.js';
 import { unguarded } from '../guard/index.js';
 import { log } from '../log.js';
-import { withMailboxSession } from '../session-manager.js';
+import { withExistingMailboxSession } from '../session-manager.js';
 import { dispatch } from './dispatch.js';
 import type { RequestFrame } from './frame.js';
 
@@ -37,12 +37,18 @@ registerDeliveryAction(
     const response = await dispatch(req, ctx);
 
     // Write response to inbound.db so the container can read it. Its own
-    // short mailbox session — the delivery loop holds none while a handler
-    // runs (plan §4.5b) — and `withMailboxSession`, not the existing-only
-    // variant, because the response must land even for a session whose
-    // mailbox was never provisioned; the container is waiting on it.
+    // short mailbox session, because the delivery loop holds none while a
+    // handler runs (plan §4.5b).
+    //
+    // Existing-only, never provisioning. `prepare()` opens the CONTAINER-owned
+    // outbound.db read-write to apply its schema, and this handler runs after
+    // `dispatch()` has already executed the command — so a prepare that lost a
+    // race for that file would fail a completed mutation, the loop would retry
+    // the outbound row, and the command would run twice. The request row was
+    // just read out of this session's own mailbox, so it exists; if it has
+    // vanished, no container is left to read the response.
     // trigger=0: don't wake the agent — this is an inline response to a tool call.
-    await withMailboxSession(session.agent_group_id, session.id, (mailbox) =>
+    const written = await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) =>
       mailbox.insertMessage({
         id: `cli-resp-${requestId}`,
         kind: 'system',
@@ -60,6 +66,11 @@ registerDeliveryAction(
         trigger: 0,
       }),
     );
+
+    if (written === undefined) {
+      log.warn('CLI response dropped — session mailbox is gone', { requestId, sessionId: session.id });
+      return;
+    }
 
     log.info('CLI response written', { requestId, ok: response.ok, sessionId: session.id });
   },

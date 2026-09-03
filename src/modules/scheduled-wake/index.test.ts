@@ -231,6 +231,21 @@ describe('schedule_wake delivery action', () => {
     expect(processAfter).toBeLessThanOrEqual(Date.now());
   });
 
+  // Regression, PR #268 review: the handler must never call the provisioning
+  // helper. `prepare()` opens the CONTAINER-owned outbound.db read-write to
+  // apply its schema, which breaks the one-writer-per-file boundary, and the
+  // request being handled was read out of that very mailbox, so it exists.
+  it('never provisions a mailbox for a session that has none', async () => {
+    const fireAt = new Date(Date.now() + 60_000).toISOString();
+    await expect(
+      applyScheduleWake(
+        { action: 'schedule_wake', wake_id: wakeId, process_after: fireAt, prompt: 'ping' },
+        fakeSession(),
+      ),
+    ).rejects.toThrow('session mailbox is gone');
+    expect(fs.existsSync(`${TEST_DIR}/v2-sessions/ag-test/sess-test`)).toBe(false);
+  });
+
   it('is idempotent when the same outbound action is replayed', async () => {
     makeInDb();
     const fireAt = new Date(Date.now() + 60_000).toISOString();
