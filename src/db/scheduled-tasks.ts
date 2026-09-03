@@ -22,7 +22,12 @@
 import { getAgentMailbox } from '../mailbox/index.js';
 import { resolveTaskSession, withExistingMailboxSession, withMailboxSession } from '../session-manager.js';
 import type { NanoclawMailboxSession } from '../modules/mailbox/index.js';
-import { createSession, findSessionByAgentGroupAndMessagingGroup, getSession } from './sessions.js';
+import {
+  createSession,
+  findSessionByAgentGroupAndMessagingGroup,
+  getSession,
+  setTaskRoutingPlatformId,
+} from './sessions.js';
 import { getDb } from './connection.js';
 
 /** Did the row land, or was the session closed under us before the write? */
@@ -240,7 +245,9 @@ export async function scheduleTask(def: TaskDef): Promise<void> {
   // real, wired messaging group, so the stamp can never point at a channel the
   // agent isn't authorized for. A `scheduled-move` re-schedule lands here too
   // and re-stamps the series' new home (migration 056).
-  const { session } = resolveTaskSession(def.agentGroupId, def.seriesId, def.destination.platformId);
+  // No routing id: the stamp is deferred to `stamp`, which applies it only
+  // after re-validating the destination. See the note there.
+  const { session } = resolveTaskSession(def.agentGroupId, def.seriesId);
 
   const content = JSON.stringify({
     prompt: def.prompt,
@@ -296,6 +303,16 @@ export async function scheduleTask(def: TaskDef): Promise<void> {
       // `upsertTaskSeries`. Re-running it is a read-only IMMEDIATE transaction
       // on the central DB; it has no side effects.
       resolveAndValidateDestination(def);
+      // The ROUTING STAMP lands here, not in `resolveTaskSession` above.
+      // `sessions.task_routing_platform_id` is what the Observatory derives a
+      // task thread's channel from, and re-scheduling an existing series
+      // re-stamps it. Applied before the funnel, a revalidation that throws
+      // here would leave the series DISPLAYED at the new destination while its
+      // task row still carries the old one — a rejected request that moved the
+      // task anyway. Applying it only once the destination has been re-proved,
+      // in the same synchronous step as the write it describes, removes that
+      // partial state instead of compensating for it afterwards.
+      setTaskRoutingPlatformId(sessionId, def.destination.platformId);
       mailbox.upsertTaskSeries({
         id: def.id,
         seriesId: def.seriesId,
@@ -332,7 +349,7 @@ export async function scheduleTask(def: TaskDef): Promise<void> {
   // Lost the race. Re-resolve and try once more. This terminates: the lookups
   // behind `resolveTaskSession` filter `status = 'active'`, so the closed row
   // can never come back — a fresh active task session is minted instead.
-  const retry = resolveTaskSession(def.agentGroupId, def.seriesId, def.destination.platformId);
+  const retry = resolveTaskSession(def.agentGroupId, def.seriesId);
   if ((await write(retry.session.id)) === 'written') return;
   throw new Error(
     `scheduleTask: task session for series ${def.seriesId} was closed twice while scheduling; not retrying again`,

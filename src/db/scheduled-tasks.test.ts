@@ -808,6 +808,72 @@ describe('test_scheduleTask_revalidates_the_session_after_the_await', () => {
   });
 
   /**
+   * A rejected schedule must not move where the series is DISPLAYED.
+   *
+   * `sessions.task_routing_platform_id` is what the Observatory derives a task
+   * thread's channel from, and re-scheduling an existing series re-stamps it.
+   * Stamped before the funnel, a revalidation that throws inside leaves the
+   * series showing the new destination while its task row still carries the
+   * old one — a request that was refused, and moved the task anyway.
+   *
+   * Reverting the deferred stamp fails this test: the stamp is the rejected
+   * destination.
+   */
+  it('leaves the routing stamp alone when the redirect is rejected inside the funnel', async () => {
+    const processAfter = new Date(Date.now() + 86400000).toISOString();
+    const base = {
+      agentGroupId: AGENT_GROUP_ID,
+      cron: '0 5 * * *',
+      processAfter,
+      seriesId: 's-stamp',
+    };
+    await scheduleTask({ ...base, id: 't-stamp-1', prompt: 'first', destination: TEST_DESTINATION });
+    const sessionId = taskSessionIdFor('s-stamp');
+    const stampOf = (): string | null =>
+      (
+        getDb().prepare('SELECT task_routing_platform_id AS p FROM sessions WHERE id = ?').get(sessionId) as {
+          p: string | null;
+        }
+      ).p;
+    expect(stampOf()).toBe(TEST_PLATFORM_ID);
+
+    // A second messaging group the agent IS wired to, so the redirect is
+    // legitimate at request time and only fails mid-flight.
+    const OTHER_PLATFORM = 'discord:test:c1-other';
+    getDb()
+      .prepare(
+        `INSERT INTO messaging_groups (id, channel_type, platform_id, name, is_group, unknown_sender_policy, created_at)
+         VALUES ('mg-other-c1', ?, ?, 'Other', 1, 'public', ?)`,
+      )
+      .run(TEST_CHANNEL_TYPE, OTHER_PLATFORM, new Date().toISOString());
+    getDb()
+      .prepare(
+        `INSERT INTO messaging_group_agents (id, messaging_group_id, agent_group_id, created_at)
+         VALUES ('mga-other-c1', 'mg-other-c1', ?, ?)`,
+      )
+      .run(AGENT_GROUP_ID, new Date().toISOString());
+
+    // The wiring is revoked inside the funnel, after the pre-check passed.
+    raceRevokes.sessionId = sessionId;
+    await expect(
+      scheduleTask({
+        ...base,
+        id: 't-stamp-2',
+        prompt: 'second',
+        destination: { platformId: OTHER_PLATFORM, channelType: TEST_CHANNEL_TYPE, threadId: null },
+      }),
+    ).rejects.toThrow(/is not wired to messaging group/);
+
+    // The refusal moved nothing: not the task row, and not the stamp the
+    // dashboard renders the series from.
+    expect(stampOf()).toBe(TEST_PLATFORM_ID);
+    const db = openInboundDb(inboundPath(sessionId));
+    const rows = db.prepare("SELECT id FROM messages_in WHERE series_id = 's-stamp'").all() as Array<{ id: string }>;
+    db.close();
+    expect(rows.map((r) => r.id)).toEqual(['t-stamp-1']);
+  });
+
+  /**
    * Authorization is a precondition read before the funnel's await, and the
    * task row it guards is written after it. Revoke the wiring in that window
    * and the pre-check's proof is stale: the row would persist a route to a
