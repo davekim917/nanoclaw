@@ -19,7 +19,14 @@ import { type ContainerState } from '../mailbox/ops/sweep.js';
 import { composeNanoclawSession, type NanoclawMailboxSession } from '../mailbox/index.js';
 import { getAgentMailbox } from '../../mailbox/index.js';
 import { closeDb, initTestDb, runMigrations } from '../../db/index.js';
-import { ABSOLUTE_CEILING_MS, CLAIM_STUCK_MS, SPAWN_GRACE_MS, _sweepSessionForTesting } from '../../host-sweep.js';
+import {
+  ABSOLUTE_CEILING_MS,
+  CLAIM_STUCK_MS,
+  SPAWN_GRACE_MS,
+  SWEEP_DUTY_INVENTORY,
+  _listSweepRegistrationsForTesting,
+  _sweepSessionForTesting,
+} from '../../host-sweep.js';
 import {
   PROVIDER_HEAL_COOLDOWN_MS,
   PROVIDER_HEAL_MAX_ATTEMPTS,
@@ -1121,6 +1128,111 @@ describe('provider self-heal claims the health phase and the later branches do n
 
     closeDb();
     armSelfHeal(false);
+  });
+});
+
+// ── Registered-entry coverage (pre-review addition: drive the REGISTRATION,
+// not only the underlying body — same pattern Codex flagged on two sibling
+// families) ───────────────────────────────────────────────────────────────
+//
+// F-10.2 above already does this for S11's `claims()` and S16's SLA hook end
+// to end — it obtains them from the registry (via `_sweepSessionForTesting`'s
+// real call into `runExclusiveSessionPhase` / `runSlaObservationHooks`, not a
+// hand-built stand-in) and asserts on `sweepProviderHeal`'s and
+// `reportContainerOomTelemetry`'s real dependencies (killContainer,
+// writeSystemWake's row). The three cases below are the lighter, targeted
+// complement: each fetches the duty/hook directly from
+// `_listSweepRegistrationsForTesting()` by its inventory name and invokes
+// `claims`/`run` itself, pinning the registration's own wiring (which fields
+// of `ctx` it reads, in what order) independently of the full driver.
+describe('registered S11/S14/S16 entries reach their bodies', () => {
+  beforeEach(() => {
+    mockKillContainer.mockReset();
+    mockGetSession.mockReset();
+    mockWakeContainer.mockReset();
+    mockReadContainerConfig.mockReset().mockReturnValue({ provider: 'codex' });
+    _resetProviderHealTicksForTesting();
+  });
+
+  it('S11: the registered claims() delegates to sweepProviderHeal and reaches killContainer', async () => {
+    const { duties } = _listSweepRegistrationsForTesting();
+    const s11 = duties.find((d) => d.name === SWEEP_DUTY_INVENTORY.S11)!;
+    expect(s11.phase).toBe('session:health');
+    expect(s11.order).toBe(10);
+    expect(s11.claims).toBeDefined();
+
+    armSelfHeal(true);
+    const { mailbox } = makeSessionDbs();
+    const session = fakeSession();
+    mockGetSession.mockReturnValue(session);
+    const FAILED = { provider_status: 'failed', provider_failure_reason: 'gone' } as unknown as ContainerState;
+    const ctx = {
+      session,
+      agentGroupFolder: 'group-folder',
+      observed: { containerState: FAILED, processingClaimCount: 0, lastOutboundAtMs: null, lastInboundAtMs: null },
+      run: async (action: (m: NanoclawMailboxSession) => unknown) => action(mailbox),
+    } as unknown as Parameters<NonNullable<typeof s11.claims>>[0];
+
+    // Two consecutive ticks — the debounce s11.claims() itself advances.
+    expect(await s11.claims!(ctx)).toBe(false);
+    expect(await s11.claims!(ctx)).toBe(true);
+    expect(mockKillContainer).toHaveBeenCalledWith('sess-test', 'provider-failed-selfheal', expect.any(Function));
+
+    // run() is the no-op log branch taken when claims() already handled it.
+    expect(() => s11.run(ctx)).not.toThrow();
+    armSelfHeal(false);
+  });
+
+  it('S14: the fallthrough run() opens its own observe session, decides via decideStuckAction, and kills', async () => {
+    const { duties } = _listSweepRegistrationsForTesting();
+    const s14 = duties.find((d) => d.name === SWEEP_DUTY_INVENTORY.S14)!;
+    expect(s14.phase).toBe('session:health');
+    expect(s14.order).toBe(40);
+    expect(s14.claims).toBeUndefined(); // the fallthrough — exclusive-phase contract
+
+    const { outDb, mailbox } = makeSessionDbs();
+    outDb
+      .prepare(`INSERT INTO processing_ack (message_id, status, status_changed) VALUES ('m1', 'processing', ?)`)
+      .run(new Date(Date.now() - CLAIM_STUCK_MS - 10_000).toISOString());
+
+    const session = fakeSession();
+    const windowsSeen: string[] = [];
+    const ctx = {
+      session,
+      agentGroupId: session.agent_group_id,
+      agentGroupFolder: 'group-folder',
+      killSnapshot: null,
+      runIn: async (window: string, action: (m: NanoclawMailboxSession) => unknown) => {
+        windowsSeen.push(window);
+        return action(mailbox);
+      },
+    } as unknown as Parameters<typeof s14.run>[0];
+
+    await s14.run(ctx);
+
+    expect(windowsSeen).toContain('session:health:sla-observe');
+    expect(mockKillContainer).toHaveBeenCalledWith('sess-test', 'claim-stuck');
+  });
+
+  it('S16: the registered SLA-observation hook calls reportContainerOomTelemetry with the observed snapshot', () => {
+    const { slaObservationHooks } = _listSweepRegistrationsForTesting();
+    const s16 = slaObservationHooks.find((h) => h.name === SWEEP_DUTY_INVENTORY.S16)!;
+    expect(s16.order).toBe(10);
+
+    const { inDb, mailbox } = makeNotifyTestDbs();
+    const session = fakeSession();
+    const state = {
+      current_tool: null,
+      tool_declared_timeout_ms: null,
+      tool_started_at: null,
+      memory_oom_kill_events: 5,
+    } as ContainerState;
+    const ctx = { session, agentGroupFolder: 'ag-test' } as unknown as Parameters<typeof s16.run>[0];
+
+    s16.run(ctx, state, mailbox);
+
+    const rows = inDb.prepare("SELECT id FROM messages_in WHERE kind = 'chat'").all() as Array<{ id: string }>;
+    expect(rows.some((r) => r.id.startsWith('oom-kill-'))).toBe(true);
   });
 });
 
