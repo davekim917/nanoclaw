@@ -41,7 +41,7 @@ import {
   type NanoclawMailboxSession,
 } from './modules/mailbox/index.js';
 import { withExistingNanoclawSession } from './modules/mailbox/session.js';
-import { syncDoneProposalMirror } from './dashboard/thread-close.js';
+import type { HostWorkContinuation } from './modules/mailbox/ops/continuation.js';
 import { log } from './log.js';
 import { sessionDir, sessionsBaseDir } from './session-manager.js';
 import {
@@ -457,7 +457,7 @@ interface SweepDutyTag {
  * classified and, where it warrants one, already logged — the per-session frame
  * turns it into "no quiet mark, retried next tick" without a second line.
  */
-class SweepWindowAbort extends Error {
+export class SweepWindowAbort extends Error {
   constructor(readonly window: SweepWindow) {
     super(`sweep window ${window} aborted`);
     this.name = 'SweepWindowAbort';
@@ -636,204 +636,21 @@ export type StuckDecision =
   | { action: 'kill-ceiling'; heartbeatAgeMs: number; ceilingMs: number }
   | { action: 'kill-claim'; messageId: string; claimAgeMs: number; toleranceMs: number };
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Ceiling-kill accountability wake.
-//
-// The absolute ceiling fires whenever a container goes 30 min without a
-// heartbeat — including right after the agent parked long-running work in an
-// in-container background task and ended its turn (the heartbeat only moves
-// while a turn is active). Respawn is wake-on-inbound, so without a follow-up
-// the session stays dead until a human pings — which reads as "said it was
-// working, then went silent for hours," and the background job's state (plus
-// /tmp) is gone by the time anyone looks.
-//
-// When the kill interrupted an explicit continuation or a freshly-started
-// tool, queue an on_wake accountability row. Status/narration is deliberately
-// not evidence: "starting now" can be the final output of a completed turn.
-// The continuation record owns the two-attempt recovery cap; genuine inbound
-// resets that counter in the runner without deleting the saved task.
-// ─────────────────────────────────────────────────────────────────────────────
-
-export const CONTINUATION_WAKE_MIN_INTERVAL_MS = 10 * 60 * 1000;
-
 /**
- * The durable work-continuation record and its SQL live in the mailbox module
- * (`src/modules/mailbox/ops/continuation.ts`) — the sweep owns the throttle
- * and the cap, not the storage. Re-exported unchanged so `host-restart-warn`
- * and the existing tests keep their import path and signatures.
+ * The ceiling-kill accountability family (S2-PR13) lives in
+ * `src/modules/sweep-continuation/`. `src/host-restart-warn.ts` imports
+ * `decideCeilingFollowUp` and `WORK_CONTINUATION_RESUME_MAX_ATTEMPTS` from
+ * here and is outside that PR's ownership, so both keep resolving from this
+ * module. The re-export is from the family's side-effect-free leaf, never from
+ * its `index.ts`: that file registers its duties at eval time, and pulling it
+ * into this module's own dependency cycle would run the registrar while the
+ * registry's `const`s below are still in their temporal dead zone.
  */
+export { decideCeilingFollowUp, type CeilingFollowUp } from './modules/sweep-continuation/decide.js';
 export {
-  canAttemptContinuationRecovery,
-  incrementWorkContinuationResumeAttempt,
-  migrateLegacyWorkContinuationForRecovery,
-  readContinuationRecoveryAttemptAt,
-  readWorkContinuation,
-  restoreWorkContinuationResumeAttempt,
   WORK_CONTINUATION_RESUME_MAX_ATTEMPTS,
   type HostWorkContinuation,
 } from './modules/mailbox/ops/continuation.js';
-import {
-  canAttemptContinuationRecovery,
-  readWorkContinuation,
-  WORK_CONTINUATION_RESUME_MAX_ATTEMPTS,
-  type HostWorkContinuation,
-} from './modules/mailbox/ops/continuation.js';
-
-/** Test-only predicate over an injected outbound DB handle. */
-export function _hasWorkContinuationForTesting(db: Database.Database): boolean {
-  return readWorkContinuation(db) !== null;
-}
-
-/**
- * The deferred recovery-wake rows the sweep parks when a budget is spent.
- * SQL in the mailbox module; re-exported unchanged for the existing tests.
- */
-export { hasDueRecoveryWake, parkDueRecoveryWakes } from './modules/mailbox/ops/recovery.js';
-
-/** Throttle gate: wake only when the last spawn/recovery attempt is old. */
-export function decideContinuationWake(args: {
-  now: number;
-  spawnedAtMs: number;
-  lastRecoveryAttemptAtMs?: number;
-}): boolean {
-  const lastAttemptAtMs = Math.max(args.spawnedAtMs, args.lastRecoveryAttemptAtMs ?? 0);
-  if (lastAttemptAtMs === 0) return true;
-  return args.now - lastAttemptAtMs >= CONTINUATION_WAKE_MIN_INTERVAL_MS;
-}
-
-/**
- * Consume one recovery attempt for a STOPPED session's saved continuation.
- *
- * Its own short mailbox session: the caller must not be holding one for this
- * key (invariant I-3), and the write only ever runs with the container
- * confirmed stopped, which is what makes a host write to the container-owned
- * outbound.db safe.
- */
-async function incrementStoppedContinuationAttempt(
-  run: SessionRunner,
-  session: Session,
-  expectedId: string,
-): Promise<HostWorkContinuation | null> {
-  try {
-    const result = await run((mailbox) =>
-      expectedId !== 'legacy-pending-next'
-        ? mailbox.incrementWorkContinuationResumeAttempt(expectedId)
-        : mailbox.migrateLegacyWorkContinuationForRecovery(),
-    );
-    return result ?? null;
-  } catch (err) {
-    // An OPENER failure was already classified and logged by the window, and it
-    // is unwinding the session — swallowing it here would hand S9b a null and
-    // let it wake the container on W1's stale plan through an unreadable
-    // mailbox. Everything else keeps the pre-seam outcome exactly: warn, return
-    // null, and let a due-count wake proceed without the continuation.
-    if (err instanceof SweepWindowAbort) throw err;
-    log.warn('Failed to increment continuation recovery attempt', { sessionId: session.id, err });
-    return null;
-  }
-}
-
-async function restoreStoppedContinuationAttempt(
-  run: SessionRunner,
-  session: Session,
-  attempted: HostWorkContinuation,
-  previous: HostWorkContinuation,
-): Promise<void> {
-  try {
-    await run((mailbox) => mailbox.restoreWorkContinuationResumeAttempt(attempted, previous));
-  } catch (err) {
-    // Same split as the increment above: an opener failure is the window's to
-    // report and unwind; anything else keeps the pre-seam warn-and-continue.
-    if (err instanceof SweepWindowAbort) throw err;
-    log.warn('Failed to restore continuation recovery attempt after rejected wake', { sessionId: session.id, err });
-  }
-}
-
-export function notifyContinuationParked(
-  mailbox: NanoclawMailboxSession,
-  session: Session,
-  continuation: HostWorkContinuation,
-  writeMessage: (message: {
-    id: string;
-    kind: string;
-    platformId: string | null;
-    channelType: string | null;
-    threadId: string | null;
-    content: string;
-  }) => void = (message) => mailbox.writeOutboundDirect(message),
-): boolean {
-  const marker = `continuation_recovery_parked:${continuation.id}:${continuation.recovery_episode}`;
-  if (mailbox.outboundHasContentLike(marker)) return false;
-  const sourceRouting = continuation.source_message_id
-    ? mailbox.readMessageRouting(continuation.source_message_id)
-    : undefined;
-  const routing =
-    sourceRouting?.channel_type && sourceRouting.platform_id ? sourceRouting : mailbox.readSessionRouting();
-  if (!routing) return false;
-  writeMessage({
-    id: `continuation-parked-${continuation.id}-${continuation.recovery_episode}`,
-    kind: 'chat',
-    platformId: routing.platform_id,
-    channelType: routing.channel_type,
-    threadId: routing.thread_id,
-    content: JSON.stringify({
-      text:
-        `⚠️ I could not resume the interrupted work after ${WORK_CONTINUATION_RESUME_MAX_ATTEMPTS} automatic attempts. ` +
-        `The task is still saved: ${continuation.task}. Reply in this thread and I will try again.`,
-      _system: {
-        kind: marker,
-        continuation_id: continuation.id,
-        recovery_episode: continuation.recovery_episode,
-      },
-    }),
-  });
-  return true;
-}
-
-export type CeilingFollowUp = { action: 'none' } | { action: 'wake-accountable'; reason: 'continuation' | 'tool' };
-
-export function decideCeilingFollowUp(args: {
-  hasContinuation: boolean;
-  currentTool: string | null;
-  toolStartedAt: string | null;
-  priorToolAttempts: number;
-  now: number;
-  /**
-   * The ceiling that actually fired for this kill (decideStuckAction's
-   * `ceilingMs`, itself widened by a declared Bash/CodexItem timeout). Supply
-   * it ONLY from the kill path: it buys the tool-freshness bound one extra
-   * sweep interval of detection lag. Callers that ask "is a tool in flight
-   * right now" rather than "what did this kill interrupt" — host-restart-warn
-   * runs against live state with no sweep lag — omit it and keep the plain
-   * ABSOLUTE_CEILING_MS freshness window.
-   */
-  ceilingMs?: number;
-}): CeilingFollowUp {
-  if (args.hasContinuation) return { action: 'wake-accountable', reason: 'continuation' };
-  if (!args.currentTool || !args.toolStartedAt) return { action: 'none' };
-  const startedAt = parseSqliteUtc(args.toolStartedAt);
-  // Bound against the ceiling that actually fired, plus one sweep interval of
-  // detection lag. Bounding against ABSOLUTE_CEILING_MS made this branch
-  // unreachable: starting a tool emits a provider event, which touches the
-  // heartbeat (poll-loop.ts:1712), so at kill time the tool's age is always at
-  // least the heartbeat age that just exceeded the ceiling. Every genuinely
-  // wedged tool was killed and then went dark with no accountability wake.
-  const maxToolAgeMs =
-    args.ceilingMs === undefined
-      ? ABSOLUTE_CEILING_MS
-      : Math.max(args.ceilingMs, ABSOLUTE_CEILING_MS) + SWEEP_INTERVAL_MS;
-  if (!Number.isFinite(startedAt) || startedAt > args.now || args.now - startedAt > maxToolAgeMs) {
-    return { action: 'none' };
-  }
-  if (args.priorToolAttempts >= WORK_CONTINUATION_RESUME_MAX_ATTEMPTS) return { action: 'none' };
-  return { action: 'wake-accountable', reason: 'tool' };
-}
-
-const CEILING_RESPAWN_ID_PREFIX = 'ceiling-respawn-';
-
-export function countToolRecoveryAttemptsSinceRealInbound(mailbox: NanoclawMailboxSession): number {
-  return mailbox.countRecoveryAttemptsSinceRealInbound(`${CEILING_RESPAWN_ID_PREFIX}tool-`);
-}
 
 /**
  * Write one deferred, on-wake accountability row (plus its inert recall marker)
@@ -865,99 +682,6 @@ export function writeSystemWake(
     recurrence: null,
     onWake,
   });
-}
-
-function writeCeilingRespawn(
-  mailbox: NanoclawMailboxSession,
-  session: Session,
-  reason: 'continuation' | 'tool',
-  recoveryKey: string,
-  heartbeatAgeMs: number,
-  workContinuation: HostWorkContinuation | null,
-  ceilingMs: number = ABSOLUTE_CEILING_MS,
-): void {
-  const idleMinutes = Math.round(Math.max(ceilingMs, ABSOLUTE_CEILING_MS) / 60_000);
-  const silentMinutes = Math.round(heartbeatAgeMs / 60_000);
-  // Name the saved task. Without it the agent reads a generic "you were
-  // killed" notice, cannot tell the wake IS its own continuation, and burns a
-  // turn re-deriving whether the promised work ran (observed 2026-08-16).
-  const savedWork =
-    reason === 'continuation' && workContinuation
-      ? ` Your saved continuation (${workContinuation.id}) is still queued and resumes automatically right after ` +
-        `this message — do NOT re-queue it with continue_work, and do not redo it if you find it already done. ` +
-        `The saved task is: ${workContinuation.task}`
-      : '';
-  const text =
-    `[system] Your previous container was killed by the ${idleMinutes}-minute idle ceiling ` +
-    `(no active turn for ~${silentMinutes} min). If work was in flight: check your durable checkpoints, ` +
-    `resume what is safely resumable, and post ONE message accounting for state — done / lost / next. ` +
-    `Re-check any work claims in claims/ before resuming a seam — a sibling may have taken it over while you were down. ` +
-    `In-container background tasks, sleeps, and /tmp do not survive a restart; before going idle with ` +
-    `work in flight, checkpoint to a durable path and call continue_work, or use wait for a real time delay. ` +
-    `If nothing was in flight, say so in one line.${savedWork}`;
-  writeSystemWake(mailbox, session, `${CEILING_RESPAWN_ID_PREFIX}${recoveryKey}`, text, {
-    kind: 'agent_ceiling_respawn',
-    reason,
-    heartbeat_age_ms: heartbeatAgeMs,
-  });
-}
-
-/** The follow-up half of the kill-ceiling branch, driven only by durable work state or a fresh tool start. */
-function applyCeilingFollowUp(
-  mailbox: NanoclawMailboxSession,
-  session: Session,
-  containerState: ContainerState | null,
-  workContinuation: HostWorkContinuation | null,
-  heartbeatAgeMs: number,
-  ceilingMs: number = ABSOLUTE_CEILING_MS,
-): CeilingFollowUp {
-  const priorToolAttempts = countToolRecoveryAttemptsSinceRealInbound(mailbox);
-  const followUp = decideCeilingFollowUp({
-    hasContinuation: workContinuation !== null && canAttemptContinuationRecovery(workContinuation),
-    currentTool: containerState?.current_tool ?? null,
-    toolStartedAt: containerState?.tool_started_at ?? null,
-    priorToolAttempts,
-    now: Date.now(),
-    ceilingMs,
-  });
-  if (followUp.action !== 'wake-accountable') return followUp;
-
-  // Shadow mode gates the wedged-tool wake only. The continuation wake is
-  // long-shipped behaviour on a path this change did not touch, so flipping the
-  // flag must never take it away.
-  if (followUp.reason === 'tool' && !SELF_HEAL_ENABLED) {
-    log.info('self-heal: would queue wedged-tool accountability wake', {
-      class: 'wedged-tool',
-      sessionId: session.id,
-      currentTool: containerState?.current_tool ?? null,
-      toolStartedAt: containerState?.tool_started_at ?? null,
-      heartbeatAgeMs,
-      ceilingMs,
-      priorToolAttempts,
-      maxAttempts: WORK_CONTINUATION_RESUME_MAX_ATTEMPTS,
-    });
-    return { action: 'none' };
-  }
-
-  const recoveryKey =
-    followUp.reason === 'continuation'
-      ? `continuation-${workContinuation!.id}-${workContinuation!.recovery_episode}-${workContinuation!.resume_attempts}`
-      : `tool-${encodeURIComponent(containerState?.tool_started_at ?? 'unknown')}`;
-  writeCeilingRespawn(mailbox, session, followUp.reason, recoveryKey, heartbeatAgeMs, workContinuation, ceilingMs);
-  log.info('Queued ceiling-kill accountability wake', { sessionId: session.id, reason: followUp.reason });
-  return followUp;
-}
-
-/** Test-only re-export with injected session-DB handles. */
-export function _applyCeilingFollowUpForTesting(
-  mailbox: NanoclawMailboxSession,
-  session: Session,
-  containerState: ContainerState | null,
-  workContinuation: HostWorkContinuation | null,
-  heartbeatAgeMs: number,
-  ceilingMs: number = ABSOLUTE_CEILING_MS,
-): CeilingFollowUp {
-  return applyCeilingFollowUp(mailbox, session, containerState, workContinuation, heartbeatAgeMs, ceilingMs);
 }
 
 // Failed-provider self-heal (S11), running-container SLA (S14) and the OOM /
@@ -1407,110 +1131,6 @@ export function _sweepSessionForTesting(session: Session): Promise<number | null
 // / registerSweepDutySource / SWEEP_DUTY_INVENTORY).
 export { sweepTaskWatchdog as _sweepTaskWatchdogForTesting } from './modules/sweep-orchestrator/task-watchdog.js';
 
-/**
- * Tell the user we just reaped their container for inactivity. The
- * outbound.db write lands on the normal delivery path — no container
- * involvement needed (it's already dead).
- *
- * Three gates, all skip with a debug log:
- *   1. No session_routing yet (fresh session that never woke).
- *   2. `pendingClaims === 0` — no inbound was in-flight when we killed,
- *      meaning no user was actually waiting. The ceiling fires on every
- *      idle 30-min container; without this gate the chat spams every
- *      operator across every quiet session every half hour.
- *   3. Duplicate notice in the last 60s (racing sweep tick).
- *
- * The write goes through the mailbox session's own writable outbound handle,
- * which the module opens lazily — so a tick that never reaches this branch
- * never opens outbound.db for writing at all, and the earlier
- * `writableOutDb` test seam is gone with it.
- */
-export function notifyKillCeiling(
-  mailbox: NanoclawMailboxSession,
-  session: Session,
-  heartbeatAgeMs: number,
-  pendingClaims: number,
-  containerState?: ContainerState | null,
-): void {
-  try {
-    if (pendingClaims === 0) {
-      log.debug('kill-ceiling notify skipped — no pending claims, user was not waiting', {
-        sessionId: session.id,
-      });
-      return;
-    }
-    const routing = mailbox.readSessionRouting();
-    if (!routing) {
-      log.debug('kill-ceiling notify skipped — no session_routing', {
-        sessionId: session.id,
-      });
-      return;
-    }
-    // Idempotency: if a kill-ceiling notice was already written within the
-    // last 60s (e.g. a sweep raced and re-fired), skip the duplicate. The
-    // check is by content marker rather than a dedicated column to avoid
-    // a schema migration. Cheap query against an already-open handle.
-    const recent = mailbox.outboundHasRecentContentLike('agent_restart_inactivity', 60);
-    if (recent) {
-      log.debug('kill-ceiling notify skipped — duplicate within 60s', {
-        sessionId: session.id,
-      });
-      return;
-    }
-    const minutes = Math.round(heartbeatAgeMs / 60_000);
-    const id = `sys-kill-ceiling-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-    // Don't ask the user to resend: the kill-ceiling branch runs
-    // resetStuckProcessingRows immediately after, which defers every claimed
-    // pending message behind fresh-context retry admission. Unclaimed pending
-    // rows just sit until the next wake. Either way the system recovers
-    // the user's existing input — a resend would just create duplicates.
-    const providerFailure =
-      containerState?.provider_status === 'failed' ||
-      containerState?.provider_status === 'recovering' ||
-      containerState?.provider_status === 'suspect';
-    const failureReason = containerState?.provider_failure_reason?.slice(0, 300) ?? null;
-    const text = providerFailure
-      ? `⚠️ Codex control-plane recovery did not complete` +
-        (failureReason ? ` (${failureReason})` : '') +
-        `. The host is restarting the agent runner; your existing messages will be retried automatically — ` +
-        `no need to resend.`
-      : `⚠️ The agent runner stopped updating for ${minutes} minutes and the host is restarting it. ` +
-        `Your last messages will be picked up automatically on the next wake — no need to resend.`;
-    const content = JSON.stringify({
-      text,
-      // Machine-readable marker so the idempotency check above (and any
-      // future consumer that wants to react) doesn't need to grep prose.
-      _system: {
-        kind: 'agent_restart_inactivity',
-        heartbeat_age_ms: heartbeatAgeMs,
-        provider_status: containerState?.provider_status ?? null,
-        provider_failure_reason: failureReason,
-      },
-    });
-    mailbox.writeOutboundDirect({
-      id,
-      kind: 'chat',
-      platformId: routing.platform_id,
-      channelType: routing.channel_type,
-      threadId: routing.thread_id,
-      content,
-    });
-  } catch (err) {
-    log.warn('kill-ceiling notify failed', { sessionId: session.id, err });
-  }
-}
-
-/** Test-only alias kept so the existing suite's call sites read unchanged. */
-export function _notifyKillCeilingForTesting(
-  mailbox: NanoclawMailboxSession,
-  session: Session,
-  heartbeatAgeMs: number,
-  pendingClaims: number,
-  containerState?: ContainerState | null,
-): void {
-  notifyKillCeiling(mailbox, session, heartbeatAgeMs, pendingClaims, containerState);
-}
-
 // ─────────────────────────────────────────────────────────────────────────────
 // The 39 registrations.
 //
@@ -1527,130 +1147,6 @@ function registerBuiltInSweepDuties(): void {
 
   // T2 (egress-network-reheal, tick:pre-session) moved to
   // src/modules/sweep-egress/index.ts (S2-PR6).
-
-  // ── session:plan (W1) ──────────────────────────────────────────────────────
-
-  registerSweepDuty({
-    name: id.S6,
-    phase: 'session:plan',
-    order: 50,
-    // Mirror the container's own `propose_done` record onto the central
-    // `sessions` row so the Observatory list can show "proposes closing"
-    // without opening a per-session SQLite file per row. Free here — the
-    // session is already open and it is one SELECT — and deliberately NOT the
-    // copy the close path trusts (see thread-close.ts). Isolated: a mirror
-    // failure must never cost this session its sweep.
-    //
-    // `syncDoneProposalMirror` now takes the PARSED proposal (mailbox seam
-    // PR 4), so the read is the module's own op and no handle leaves the
-    // session. The `hasOutbound` guard is kept for what it costs: a
-    // never-woken session has no proposal to mirror and no outbound file to
-    // open looking for one.
-    run: (ctx) => {
-      const { session, mailbox } = asSessionContext(ctx);
-      if (mailbox!.hasOutbound()) {
-        try {
-          syncDoneProposalMirror(session.id, mailbox!.readDoneProposal());
-        } catch (err) {
-          log.warn('done_proposal mirror failed', { sessionId: session.id, err });
-        }
-      }
-    },
-  });
-
-  registerSweepDuty({
-    name: id.S7,
-    phase: 'session:plan',
-    order: 60,
-    // 4. Durable continuation state is a wake source, but its automatic crash
-    // recovery is both throttled and hard-capped per continuation id.
-    run: (ctx) => {
-      const { mailbox, plan } = asSessionContext(ctx);
-      plan.workContinuation = mailbox!.readWorkContinuation();
-    },
-  });
-
-  registerSweepDuty({
-    name: id.S8,
-    phase: 'session:plan',
-    order: 70,
-    run: (ctx) => {
-      const { session, mailbox, plan } = asSessionContext(ctx);
-      if (
-        !isContainerRunning(session.id) &&
-        plan.workContinuation &&
-        plan.workContinuation.resume_attempts >= WORK_CONTINUATION_RESUME_MAX_ATTEMPTS
-      ) {
-        const parked = mailbox!.parkDueRecoveryWakes(new Date().toISOString());
-        if (parked > 0) {
-          plan.dueCount = mailbox!.countDueMessages();
-          plan.wakePriority = plan.dueCount > 0 ? mailbox!.getDueWakePriority() : 'interactive';
-        }
-        if (plan.dueCount === 0) notifyContinuationParked(mailbox!, session, plan.workContinuation);
-      }
-    },
-  });
-
-  registerSweepDuty({
-    name: id.S9a,
-    phase: 'session:plan',
-    order: 80,
-    // Every stopped-session wake must pass through continuation recovery
-    // admission, even when an unrelated scheduled row is already due. The runner
-    // retains its prior owner claim until this path clears it, so a scheduled
-    // wake cannot make saved work bypass the throttle or cap.
-    run: (ctx) => {
-      const { session, mailbox, plan } = asSessionContext(ctx);
-      plan.continuationWakeEligible =
-        !isContainerRunning(session.id) &&
-        plan.workContinuation !== null &&
-        canAttemptContinuationRecovery(plan.workContinuation) &&
-        decideContinuationWake({
-          now: Date.now(),
-          spawnedAtMs: getContainerSpawnedAt(session.id),
-          lastRecoveryAttemptAtMs: mailbox!.readContinuationRecoveryAttemptAt(plan.workContinuation),
-        });
-    },
-  });
-
-  // ── session:wake (W2) — NOTHING open ───────────────────────────────────────
-
-  registerSweepDuty({
-    name: id.S9b,
-    phase: 'session:wake',
-    order: 10,
-    // 5. Wake a container if work is due and nothing is running.
-    run: async (ctx) => {
-      const c = asSessionContext(ctx);
-      const { session, plan } = c;
-      // Both of these open a mailbox of their own, so both go through the
-      // window — an unopenable mailbox here is 'Host sweep mailbox unopenable'
-      // with window 'session:wake', not the helper's legacy warning, and it
-      // takes no quiet mark (W2 never backs off).
-      const wakeRun: SessionRunner = (action) => c.runIn('session:wake', action);
-      const resumedContinuation = plan.continuationWakeEligible
-        ? await incrementStoppedContinuationAttempt(wakeRun, session, plan.workContinuation!.id)
-        : null;
-      const continuationWake = resumedContinuation !== null;
-      if ((plan.dueCount > 0 || continuationWake) && !isContainerRunning(session.id)) {
-        log.info('Waking container for due messages', {
-          sessionId: session.id,
-          count: plan.dueCount,
-          priority: plan.wakePriority,
-          continuationId: resumedContinuation?.id,
-        });
-        // wakeContainer never throws — transient spawn failures (OneCLI down,
-        // etc.) return false and leave messages pending for the next tick.
-        // Classification is passed into the atomic admission decision so a
-        // scheduled wake can never reserve memory as interactive first.
-        const woke = await wakeContainer(session, plan.wakePriority);
-        c.reportWoke(woke);
-        if (!woke && resumedContinuation) {
-          await restoreStoppedContinuationAttempt(wakeRun, session, resumedContinuation, plan.workContinuation!);
-        }
-      }
-    },
-  });
 
   // ── session:health (W4) — EXCLUSIVE, nothing open ──────────────────────────
   //
@@ -1700,50 +1196,6 @@ function registerBuiltInSweepDuties(): void {
   //
   // S16 (OOM / memory-pressure notice) registers from
   // src/modules/sweep-container-health/index.ts (convergence seam 2, PR 10).
-
-  // ── Kill follow-ups — inside the session opened AFTER killContainer returns ─
-
-  registerSweepKillFollowUp({
-    name: id.S15,
-    order: 10,
-    // Posted AFTER the kill to honor the outbound.db single-writer invariant;
-    // the module opens the writable outbound handle lazily, only for this write.
-    // notifyKillCeiling itself gates on `pendingClaims === 0` (no user was
-    // waiting) to avoid spamming restart notices on quiet sessions that just
-    // naturally reached the 30-min idle ceiling. Ceiling kills only — the
-    // claim-stuck branch has never notified.
-    run: (ctx, outcome, mailbox) => {
-      if (outcome.action !== 'kill-ceiling') return;
-      const snapshot = ctx.killSnapshot!;
-      notifyKillCeiling(mailbox, ctx.session, outcome.heartbeatAgeMs, snapshot.pendingClaims, snapshot.containerState);
-    },
-  });
-
-  registerSweepKillFollowUp({
-    name: id.S10,
-    order: 30,
-    // Accountability wake: if the kill plausibly interrupted parked work, queue
-    // an on_wake row so the session respawns (next sweep tick's due-wake step)
-    // and answers for the interruption instead of staying dead until the next
-    // human ping. Best-effort — a failure here must not break the sweep's kill
-    // path. Ceiling kills only.
-    run: (ctx, outcome, mailbox) => {
-      if (outcome.action !== 'kill-ceiling') return;
-      const snapshot = ctx.killSnapshot!;
-      try {
-        applyCeilingFollowUp(
-          mailbox,
-          ctx.session,
-          snapshot.containerState,
-          snapshot.workContinuation,
-          outcome.heartbeatAgeMs,
-          outcome.ceilingMs,
-        );
-      } catch (err) {
-        log.warn('ceiling-kill follow-up failed', { sessionId: ctx.session.id, err });
-      }
-    },
-  });
 }
 
 registerSweepDutySource('host-sweep:builtin', registerBuiltInSweepDuties);
