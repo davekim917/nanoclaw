@@ -73,6 +73,7 @@ import {
   hasContainerEverRun,
   getActiveContainerSessionIds,
   isContainerRunning,
+  isContainerSpawning,
   killContainer,
   wakeContainer,
 } from './container-runner.js';
@@ -297,12 +298,59 @@ export function decideContinuationWake(args: {
  * confirmed stopped, which is what makes a host write to the container-owned
  * outbound.db safe.
  */
+/**
+ * Could a container be writing this session's `outbound.db` right now?
+ *
+ * `outbound.db` has exactly ONE writer. The host may write it only while no
+ * container owns it, and "owns it" includes a container that is still
+ * SPAWNING — a wake issued a moment ago has not reached `isContainerRunning`
+ * yet but is about to hold the file.
+ */
+function containerOwnsOutbound(sessionId: string): boolean {
+  return isContainerRunning(sessionId) || isContainerSpawning(sessionId);
+}
+
+/**
+ * Run a host write against the container-owned `outbound.db`, but only while
+ * the container is confirmed stopped.
+ *
+ * The check is INSIDE the session and immediately before the mutation, with no
+ * await between the two — that ordering is the whole point. Opening a mailbox
+ * session is a yield, and a concurrent inbound wake can start a container in
+ * it. Pre-seam this path was a synchronous check-then-write on a handle that
+ * was already open, so no such gap existed; restoring the property, rather
+ * than re-checking at each call site, is what keeps the next writer from
+ * reintroducing it.
+ *
+ * Resolves `undefined` when the mailbox is gone OR a container took ownership
+ * during the open. Callers treat both as "did not run" — never as failure.
+ */
+async function withStoppedContainerSession<T>(
+  session: Session,
+  action: (mailbox: NanoclawMailboxSession) => T,
+): Promise<T | undefined> {
+  return withExistingNanoclawSession(session.agent_group_id, session.id, (mailbox) => {
+    if (containerOwnsOutbound(session.id)) {
+      log.debug('Skipped a host outbound write — a container took the session during the open', {
+        sessionId: session.id,
+      });
+      return undefined;
+    }
+    return action(mailbox);
+  });
+}
+
 async function incrementStoppedContinuationAttempt(
   session: Session,
   expectedId: string,
 ): Promise<HostWorkContinuation | null> {
   try {
-    const result = await withExistingNanoclawSession(session.agent_group_id, session.id, (mailbox) =>
+    // A container that came up during the open now owns both outbound.db and
+    // the continuation's runner claim. Writing here would push the record back
+    // to `queued`, drop that runner_id and consume a recovery attempt the
+    // fresh runner never got — saved work duplicated, parked early, or lost.
+    // Returning without consuming the attempt leaves the next tick to decide.
+    const result = await withStoppedContainerSession(session, (mailbox) =>
       expectedId !== 'legacy-pending-next'
         ? mailbox.incrementWorkContinuationResumeAttempt(expectedId)
         : mailbox.migrateLegacyWorkContinuationForRecovery(),
@@ -320,7 +368,7 @@ async function restoreStoppedContinuationAttempt(
   previous: HostWorkContinuation,
 ): Promise<void> {
   try {
-    await withExistingNanoclawSession(session.agent_group_id, session.id, (mailbox) =>
+    await withStoppedContainerSession(session, (mailbox) =>
       mailbox.restoreWorkContinuationResumeAttempt(attempted, previous),
     );
   } catch (err) {
@@ -799,9 +847,19 @@ async function sweepProviderHeal(
     log.warn('self-heal: provider heal budget exhausted — parking', bounds);
     killContainer(session.id, 'provider-failed-selfheal-parked');
     try {
-      await run((mailbox) =>
-        notifyProviderHealParked(mailbox, session, containerState?.provider_failure_reason ?? null, writeParkedMessage),
-      );
+      await run((mailbox) => {
+        // Same yield boundary as the kill-ceiling notice: the park kill is
+        // above, this session opened after it, and a respawn in that gap owns
+        // outbound.db. The notice is one-per-episode and idempotent, so
+        // skipping it costs nothing a later tick cannot redo.
+        if (containerOwnsOutbound(session.id)) return false;
+        return notifyProviderHealParked(
+          mailbox,
+          session,
+          containerState?.provider_failure_reason ?? null,
+          writeParkedMessage,
+        );
+      });
     } catch (err) {
       log.warn('self-heal: parked notice failed', { sessionId: session.id, err });
     }
@@ -1560,7 +1618,7 @@ async function sweepSession(session: Session): Promise<number | null> {
       // orphan claim before any due-count or wake decision can expose its stale
       // recall to a replacement/warm poller. When backoff elapses, the admission
       // seam below replaces that recall from current host state.
-      if (!isContainerRunning(session.id) && mailbox.getProcessingClaimRows().length > 0) {
+      if (!containerOwnsOutbound(session.id) && mailbox.getProcessingClaimRows().length > 0) {
         resetStuckProcessingRows(mailbox, session, 'container not running');
       }
 
@@ -1604,7 +1662,7 @@ async function sweepSession(session: Session): Promise<number | null> {
       }
 
       if (
-        !isContainerRunning(session.id) &&
+        !containerOwnsOutbound(session.id) &&
         workContinuation &&
         workContinuation.resume_attempts >= WORK_CONTINUATION_RESUME_MAX_ATTEMPTS
       ) {
@@ -1621,7 +1679,7 @@ async function sweepSession(session: Session): Promise<number | null> {
       // runner retains its prior owner claim until this path clears it, so a
       // scheduled wake cannot make saved work bypass the throttle or cap.
       const continuationWakeEligible =
-        !isContainerRunning(session.id) &&
+        !containerOwnsOutbound(session.id) &&
         workContinuation !== null &&
         canAttemptContinuationRecovery(workContinuation) &&
         decideContinuationWake({
@@ -1768,7 +1826,12 @@ async function sweepSession(session: Session): Promise<number | null> {
     // 7. Retry cleanup if the pre-wake orphan-claim clear could not finish.
     // resetStuckProcessingRows is idempotent: future retries are not bumped
     // again, and already-cleared claim sets are a no-op.
-    if (!alive && plan.hasOutbound) resetStuckProcessingRows(mailbox, session, 'container not running');
+    // `alive` was sampled BEFORE this session opened, so it cannot authorize a
+    // write to outbound.db on its own — re-checked here, immediately before,
+    // with no await in between.
+    if (plan.hasOutbound && !containerOwnsOutbound(session.id)) {
+      resetStuckProcessingRows(mailbox, session, 'container not running');
+    }
 
     // 8. Recurrence fanout for completed recurring tasks.
     // MODULE-HOOK:scheduling-recurrence:start
@@ -1805,6 +1868,18 @@ async function sweepSession(session: Session): Promise<number | null> {
     return null;
   });
   return tail ?? null;
+}
+
+/**
+ * Test-only entry point for the stopped-container recovery admission — the
+ * TOCTOU site: the container-state check must happen INSIDE the session, after
+ * the open and immediately before the mutation.
+ */
+export function _incrementStoppedContinuationAttemptForTesting(
+  session: Session,
+  expectedId: string,
+): Promise<HostWorkContinuation | null> {
+  return incrementStoppedContinuationAttempt(session, expectedId);
 }
 
 /** Test-only entry point for one session's sweep tick. */

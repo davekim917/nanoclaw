@@ -42,6 +42,7 @@ import {
   _reportContainerOomTelemetryForTesting,
   _prepareDueWakeForTesting,
   _resetStuckProcessingRowsForTesting,
+  _incrementStoppedContinuationAttemptForTesting,
   _sweepSessionForTesting,
   _sweepTaskWatchdogForTesting,
   autoArchiveOldCompleted,
@@ -2986,6 +2987,61 @@ describe('sweepSession on a session with no mailbox', () => {
     expect(fs.existsSync(sessionPath)).toBe(false);
     expect(fs.existsSync(path.join(sessionPath, 'inbound.db'))).toBe(false);
     expect(mockWakeContainer).not.toHaveBeenCalled();
+    closeDb();
+  });
+
+  // Round 7 (TOCTOU). Opening a mailbox session is a yield, and a concurrent
+  // inbound wake can start a container inside it. Pre-seam this was a
+  // synchronous check-then-write on an already-open handle, so no such gap
+  // existed. If the container-state check stays outside, the helper writes the
+  // container-owned outbound.db underneath a fresh runner: the continuation
+  // goes back to `queued`, its runner_id is dropped, and a recovery attempt the
+  // new runner never got is consumed — saved work duplicated, parked early, or
+  // lost. This is continue_work's recovery path.
+  it('a container that starts during the open leaves the continuation and its attempt count untouched', async () => {
+    const db = initTestDb();
+    runMigrations(db);
+    db.prepare(
+      `INSERT INTO agent_groups (id, name, folder, created_at)
+       VALUES ('ag-toctou', 'toctou', 'toctou', ?)`,
+    ).run(new Date().toISOString());
+
+    const session: Session = { ...fakeSession(), id: 'sess-toctou', agent_group_id: 'ag-toctou' };
+    getAgentMailbox().prepare({ agentGroupId: session.agent_group_id, sessionId: session.id });
+    const outboundPath = path.join(testDataDir.dir, 'v2-sessions', session.agent_group_id, session.id, 'outbound.db');
+    const saved = {
+      id: 'cont-toctou',
+      task: 'finish the migration',
+      phase: 'running' as const,
+      chain: 0,
+      runner_id: 'runner-fresh',
+      resume_attempts: 0,
+      recovery_episode: 0,
+    };
+    const planted = new Database(outboundPath);
+    planted
+      .prepare(
+        `INSERT INTO session_state (key, value, updated_at) VALUES ('work_continuation', ?, ?)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`,
+      )
+      .run(JSON.stringify(saved), new Date().toISOString());
+    planted.close();
+
+    // The wake landed: by the time the mailbox is open, a container owns this
+    // session and its outbound.db.
+    mockIsContainerRunning.mockReset().mockReturnValue(true);
+
+    const result = await _incrementStoppedContinuationAttemptForTesting(session, saved.id);
+
+    // No attempt consumed, and nothing handed back to wake on.
+    expect(result).toBeNull();
+    // The fresh runner's record is byte-for-byte what it was.
+    const after = new Database(outboundPath);
+    const row = after.prepare("SELECT value FROM session_state WHERE key = 'work_continuation'").get() as {
+      value: string;
+    };
+    after.close();
+    expect(JSON.parse(row.value)).toEqual(saved);
     closeDb();
   });
 
