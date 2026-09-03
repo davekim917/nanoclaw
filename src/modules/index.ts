@@ -52,3 +52,5 @@ import './provider-fallback/index.js';
 import './repository-workspaces/index.js';
 
 import './escalation/index.js';
+// Sweep family: usage-rollup (T19, host-sweep seam S2-PR12).
+import './sweep-usage/index.js';

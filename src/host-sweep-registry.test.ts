@@ -232,6 +232,10 @@ import {
 import { log } from './log.js';
 import { SessionDbMissingError, SessionDbUnopenableError } from './modules/mailbox/index.js';
 import { _mailboxSessionDepthForTesting } from './modules/mailbox/session.js';
+// Side-effect import: registers 'sweep-usage' as a duty source (S2-PR12) so
+// R-7's registration count includes T19 after the family module moved it out
+// of host-sweep.ts's own in-file builtins.
+import './modules/sweep-usage/index.js';
 
 probe.depth = _mailboxSessionDepthForTesting;
 

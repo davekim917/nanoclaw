@@ -43,7 +43,6 @@ import { getAgentGroup } from './db/agent-groups.js';
 import {
   SessionDbMissingError,
   SessionDbUnopenableError,
-  sessionMailboxPath,
   type ForkContainerStateRow as ContainerState,
   type NanoclawMailboxSession,
 } from './modules/mailbox/index.js';
@@ -52,7 +51,7 @@ import { withExistingNanoclawSession } from './modules/mailbox/session.js';
 // DATA_DIR, so its session DBs are not addressable by a mailbox key and it
 // cannot go through the seam. It stays on the module's own open funnel — the
 // one place in this file that still opens a session DB by path.
-import { openInboundDb as openInboundDbByPath, openOutboundDb } from './modules/mailbox/openers.js';
+import { openInboundDb as openInboundDbByPath } from './modules/mailbox/openers.js';
 import { restoreTaskRow, type TaskRowSnapshot } from './modules/scheduling/db.js';
 import { countLiveRowsInSessions } from './modules/scheduling/live-count.js';
 import { runHostGatedTaskScripts } from './modules/scheduling/host-script.js';
@@ -67,8 +66,6 @@ import {
   admitDueTaskContexts,
   deferMessageForFreshContextRetry,
 } from './session-manager.js';
-import { rollupSessionUsage, pruneOldTurnUsage } from './db/usage.js';
-import { listTurnUsageSince } from './modules/mailbox/ops/reads.js';
 import {
   getContainerSpawnedAt,
   hasContainerEverRun,
@@ -2164,71 +2161,6 @@ export function _sweepSessionForTesting(session: Session): Promise<number | null
   return sweepSession(session, tick);
 }
 
-// ── Usage rollup (fleet-hardening Phase 0.1) ──
-//
-// Per-session cache of the outbound.db mtime last successfully rolled up, so
-// a session whose outbound.db hasn't changed since the last tick costs one
-// fs.statSync and nothing else — no DB open, no query. Same shape as the
-// `quietSessions` cache above (module-level Map, bounded to sessions still
-// active). Lost on host restart, which just means the next tick re-checks
-// every session once; rollupSessionUsage's own watermark still guarantees no
-// double-counting either way.
-const usageRollupMtimeCache = new Map<string, number>(); // session.id -> outbound.db mtimeMs
-
-/** Pure so the cache decision has one thing to unit-test. */
-export function shouldSkipUsageRollup(cachedMtimeMs: number | undefined, currentMtimeMs: number): boolean {
-  return cachedMtimeMs === currentMtimeMs;
-}
-
-async function sweepUsageRollup(sessions: readonly Session[]): Promise<void> {
-  for (const session of sessions) {
-    try {
-      const outPath = sessionMailboxPath({ agentGroupId: session.agent_group_id, sessionId: session.id }, 'outbound');
-      let mtimeMs: number;
-      try {
-        mtimeMs = fs.statSync(outPath).mtimeMs;
-      } catch {
-        continue; // container never spawned yet — no outbound.db to roll up
-      }
-      if (shouldSkipUsageRollup(usageRollupMtimeCache.get(session.id), mtimeMs)) continue;
-
-      // Read through the module's own outbound funnel, NOT the mailbox
-      // session. This projection touches outbound.db only, and the seam's
-      // existence check is keyed on inbound.db — routing it through a session
-      // added a gate the pre-seam code never had, so a session whose
-      // inbound.db is gone while outbound.db remains stopped being rolled up
-      // at all, and its turn_usage rows would never reach the central totals.
-      // `outPath` above is already the gate that belongs here: no outbound
-      // file, no rollup. Same funnel `worktree-cleanup.ts` and the GC use, so
-      // there is still one implementation of every statement.
-      const outDb = openOutboundDb(outPath);
-      try {
-        // `rollupSessionUsage` asks for only the op it uses (mailbox seam
-        // PR 6), so the funnel's handle is bound to that one op here. This is
-        // PR 6's original two-line adapter, kept rather than collapsed: what
-        // it was waiting for was PR 5 moving this loop onto a session, and
-        // PR 5 has since deliberately moved it back off one.
-        rollupSessionUsage(
-          { listTurnUsageSince: (afterId) => listTurnUsageSince(outDb, afterId) },
-          session.agent_group_id,
-          `${session.agent_group_id}/${session.id}`,
-        );
-      } finally {
-        outDb.close();
-      }
-      usageRollupMtimeCache.set(session.id, mtimeMs);
-    } catch (err) {
-      log.warn('Usage rollup failed for session', { err, sessionId: session.id });
-    }
-  }
-  // Bound the cache to sessions that still exist, mirroring the quietSessions
-  // cleanup above — closed sessions would otherwise accumulate forever.
-  if (usageRollupMtimeCache.size > sessions.length + 500) {
-    const live = new Set(sessions.map((s) => s.id));
-    for (const id of usageRollupMtimeCache.keys()) if (!live.has(id)) usageRollupMtimeCache.delete(id);
-  }
-}
-
 const DEFAULT_NO_PROGRESS_TIMEOUT_SEC = 1800;
 const DEFAULT_SPAWN_DEADLINE_SEC = 300;
 const DEFAULT_DRAIN_GRACE_SEC = 120;
@@ -3207,27 +3139,6 @@ function registerBuiltInSweepDuties(): void {
       void runStorageMaintenanceInBackground([...ctx.activeContainerSessionIds])
         .then((storageReport) => (storageReport ? handleStoragePressureAlert(storageReport) : undefined))
         .catch((err) => log.warn('storage-manager: background maintenance failed', { err }));
-    },
-  });
-
-  registerSweepDuty({
-    name: id.T19,
-    phase: 'tick:post-session',
-    order: 40,
-    // Fleet-hardening Phase 0.1 (per-turn usage accounting): roll per-session
-    // turn_usage rows into the central usage_daily table for `ncl usage`. Reuses
-    // the same `sessions` list the per-session loop above already fetched — no
-    // extra DB query. Isolated so a rollup failure never blocks the rest of the
-    // tick. `pruneOldTurnUsage` is its companion, not a separate duty: fleet
-    // volume is ~300-600 turns/day, so trimming the ledger the rollup just fed
-    // is trivial per-tick cost.
-    run: async (ctx) => {
-      try {
-        await sweepUsageRollup(ctx.sessions);
-      } catch (err) {
-        log.warn('Usage rollup sweep step failed', { err });
-      }
-      pruneOldTurnUsage();
     },
   });
 
