@@ -103,11 +103,6 @@ describe('NanoclawAgentMailbox', () => {
     const mailbox = getAgentMailbox();
     mailbox.prepare(key);
 
-    const columnsBefore = raw(inbound, (db) =>
-      (db.prepare("PRAGMA table_info('delivered')").all() as Array<{ name: string }>).map((c) => c.name),
-    );
-    expect(columnsBefore).toEqual(['message_out_id', 'delivered_at']);
-
     const deliveredIds = await mailbox.session(key, async (m) => {
       m.markDelivered('out-1', 'p-legacy');
       return m.getDeliveredIds();
@@ -119,6 +114,54 @@ describe('NanoclawAgentMailbox', () => {
     expect(columnsAfter).toContain('platform_message_id');
     expect(columnsAfter).toContain('status');
     expect(deliveredIds.has('out-1')).toBe(true);
+  });
+
+  it('a legacy inbound DB missing baseline tables regains them', async () => {
+    const key = freshKey();
+    const inbound = dbPath(key, 'inbound');
+    fs.mkdirSync(path.dirname(inbound), { recursive: true });
+    // The v1 to v2 migration provisions over a directory whose inbound DB
+    // already exists and predates most of the baseline. Skipping provisioning
+    // because the file is present leaves a session whose every later spawn
+    // fails on `ALTER TABLE session_routing`.
+    raw(inbound, (db) => {
+      db.exec(`CREATE TABLE messages_in (
+        id TEXT PRIMARY KEY, seq INTEGER UNIQUE, kind TEXT NOT NULL, timestamp TEXT NOT NULL,
+        status TEXT DEFAULT 'pending', process_after TEXT, recurrence TEXT, tries INTEGER DEFAULT 0,
+        platform_id TEXT, channel_type TEXT, thread_id TEXT, content TEXT NOT NULL
+      );`);
+    });
+
+    getAgentMailbox().prepare(key);
+
+    const tables = raw(inbound, (db) =>
+      (db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all() as Array<{ name: string }>).map(
+        (r) => r.name,
+      ),
+    );
+    for (const table of ['messages_in', 'delivered', 'destinations', 'session_routing', 'repo_ingress_fence']) {
+      expect(tables).toContain(table);
+    }
+  });
+
+  it('prepare() does not seed the migration memo — the first session() still applies the schema', async () => {
+    const key = freshKey();
+    const mailbox = getAgentMailbox();
+    mailbox.prepare(key);
+
+    // Hostile state: a table disappears after provisioning. If prepare() had
+    // recorded this path in the migration memo, session() would skip the
+    // schema and every later op on session_routing would throw.
+    raw(dbPath(key, 'inbound'), (db) => db.exec('DROP TABLE session_routing'));
+
+    await mailbox.session(key, async (m) => {
+      fork(m).upsertSessionRouting({ channel_type: 'slack', platform_id: 'slack:C1', thread_id: null });
+    });
+
+    const routing = raw(dbPath(key, 'inbound'), (db) =>
+      db.prepare('SELECT channel_type, platform_id FROM session_routing WHERE id = 1').get(),
+    );
+    expect(routing).toEqual({ channel_type: 'slack', platform_id: 'slack:C1' });
   });
 
   it('inbound and writable outbound handles run journal_mode=DELETE then busy_timeout=5000', async () => {
