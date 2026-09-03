@@ -83,7 +83,7 @@ const calls = vi.hoisted(() => ({
   recurrences: [] as unknown[][],
   running: false,
   admittedTasks: 0,
-  admitImpl: null as null | ((db: unknown) => number),
+  admitImpl: null as null | ((session: unknown) => number),
   hostScriptFails: false,
 }));
 
@@ -211,7 +211,8 @@ vi.mock('../orchestrator-dispatch/db/tasks.js', async (importOriginal) => {
 
 import { CLOSE_CONFIRM_WINDOW_MS } from '../../dashboard/thread-close.js';
 import { closeDb, createAgentGroup, getDb, initTestDb, runMigrations } from '../../db/index.js';
-import { ensureSchema, openInboundDb } from '../../db/session-db.js';
+import { openInboundDb } from '../mailbox/openers.js';
+import { ensureSchema } from '../mailbox/schema.js';
 import { SWEEP_DUTY_INVENTORY, _listSweepRegistrationsForTesting } from '../../host-sweep.js';
 import { composeNanoclawSession } from '../mailbox/index.js';
 import { insertTaskRow } from '../scheduling/db.js';
@@ -238,8 +239,9 @@ function freshInbound(): Database.Database {
   fs.mkdirSync(dir, { recursive: true });
   const dbPath = path.join(dir, 'inbound.db');
   ensureSchema(dbPath, 'inbound');
-  openInbound = openInboundDb(dbPath);
-  return openInbound;
+  const db = openInboundDb(dbPath);
+  openInbound = db;
+  return db;
 }
 
 /**
@@ -570,9 +572,9 @@ describe('S2-PR11 scheduling + thread-close', () => {
 
     // The window's OWN session, never a second open on the same key.
     expect(calls.hostScripts).toEqual([[mailbox, 'sess-due']]);
-    // The admission seam still takes the legacy inbound handle (mailbox PR 7).
+    // The admission seam takes the window's own session (mailbox PR 7).
     expect(calls.admissions).toHaveLength(1);
-    expect(calls.admissions[0]![0]).toBe(mailbox.legacyInboundHandle());
+    expect(calls.admissions[0]![0]).toBe(mailbox);
     expect(calls.admissions[0]!.slice(1)).toEqual(['ag-test', 'sess-due']);
     expect(ctx.plan.admittedTasks).toBe(1);
     expect(ctx.plan.dueCount).toBe(1);
@@ -620,8 +622,11 @@ describe('S2-PR11 scheduling + thread-close', () => {
     it('counts and classifies the trigger inserted by the admission seam', async () => {
       const inDb = freshInbound();
       const mailbox = sessionFor(inDb);
-      calls.admitImpl = (db) => {
-        (db as Database.Database)
+      // The sweep hands `admitDueTaskContexts` the SESSION now, not a handle
+      // (invariant I-9). The stub writes the admitted trigger straight into the
+      // fixture DB behind that session, which is what the assertions below read.
+      calls.admitImpl = () => {
+        inDb
           .prepare(
             `INSERT INTO messages_in
                (id, seq, kind, timestamp, status, process_after, recurrence, series_id, trigger, content)
@@ -633,7 +638,7 @@ describe('S2-PR11 scheduling + thread-close', () => {
 
       const result = await _prepareDueWakeForTesting(mailbox, 'ag-test', 'sess-test');
 
-      expect(calls.admissions).toEqual([[inDb, 'ag-test', 'sess-test']]);
+      expect(calls.admissions).toEqual([[mailbox, 'ag-test', 'sess-test']]);
       expect(result).toEqual({ admittedTasks: 1, dueCount: 1, wakePriority: 'scheduled' });
     });
   });
