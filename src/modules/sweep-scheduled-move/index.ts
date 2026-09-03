@@ -18,6 +18,7 @@ import path from 'path';
 
 import { log } from '../../log.js';
 import { getDb } from '../../db/connection.js';
+import { touchSessionActivity } from '../../db/sessions.js';
 import { sessionsBaseDir } from '../../session-manager.js';
 import { parseSqliteUtc } from '../mailbox/sqlite-utc.js';
 // The scheduled-move recovery below walks an INJECTED sessions root, not
@@ -246,6 +247,13 @@ export function recoverMoveIntents(centralDb: Database.Database, options: MoveRe
           thread_id: snapshot.thread_id,
           kind: snapshot.kind,
         });
+        // This duty runs in tick:housekeeping — AFTER the session fan-out and
+        // after the quiet-mark flush. The fan-out saw a source with no live
+        // task (that is the crash state this recovery exists for) and may have
+        // just marked it quiet, so the row we restore here is a DUE task hiding
+        // behind a mark taken seconds ago, and S2-PR15 would carry that mark
+        // across a restart. The central-DB touch is what invalidates it.
+        touchSessionActivity(intent.session_id);
       }
     } catch (err) {
       log.error('scheduled-move-recovery: restore failed', {

@@ -56,6 +56,23 @@ function childProcessTripwire(record: string[]): Record<string, (...args: unknow
   };
 }
 
+// Codex round 2, H1: `touchSessionActivity` writes the central `sessions` row
+// through the module singleton, which this file's self-contained describe
+// deliberately never initializes. Record the call instead — the helper's real
+// behavior (nulling `sweep_quiet_until` in the same statement that writes
+// `last_active`) is asserted against real SQLite in
+// src/db/migrations/065-sessions-sweep-quiet-until.test.ts.
+const touched = vi.hoisted(() => [] as string[]);
+vi.mock('../../db/sessions.js', async (importOriginal) => {
+  const real = await importOriginal<typeof import('../../db/sessions.js')>();
+  return {
+    ...real,
+    touchSessionActivity: (id: string) => {
+      touched.push(id);
+    },
+  };
+});
+
 vi.mock('child_process', () => childProcessTripwire(h.spawns));
 vi.mock('node:child_process', () => childProcessTripwire(h.spawns));
 
@@ -391,6 +408,45 @@ describe('recoverMoveIntents (D3) + pruneAuditBodies (D4)', () => {
       .prepare("SELECT COUNT(*) AS c FROM messages_in WHERE series_id='ser-1' AND status='pending'")
       .get() as { c: number };
     expect(live.c).toBe(1);
+    db.close();
+  });
+
+  // Codex round 2, H1. This duty runs in tick:housekeeping — AFTER the session
+  // fan-out and after the quiet-mark flush. The fan-out sees the source with no
+  // live task (exactly the crash state this recovery exists for) and can mark it
+  // quiet; the row restored here is then due work hiding behind a mark taken
+  // seconds earlier, which S2-PR15 would carry across a restart.
+  it('touches the source session so a quiet mark taken during the same tick cannot hide the restored task', () => {
+    touched.length = 0;
+    const db = centralDb();
+    const inbound = seedInbound('src-ag', 'src-sess');
+    writeIntent(db, { seriesId: 'ser-touch', ag: 'src-ag', sess: 'src-sess', tsMs: NOW - 2 * SWEEP_MS });
+
+    recoverMoveIntents(db, { dataDir: DIR, nowMs: NOW });
+
+    const live = openInboundDb(inbound)
+      .prepare("SELECT COUNT(*) AS c FROM messages_in WHERE series_id='ser-touch'")
+      .get() as { c: number };
+    expect(live.c, 'the restore did not happen, so the touch proves nothing').toBe(1);
+    expect(touched, 'a restored task row left the source session quiet-marked').toEqual(['src-sess']);
+    expect(h.spawns).toEqual([]);
+    db.close();
+  });
+
+  it('does not touch the source session when there was nothing to restore', () => {
+    // A live row already exists, so recovery stamps and purges without
+    // restoring. No due-ness changed, so no invalidation is owed — a touch here
+    // would be a pointless cache flush on every recovery pass.
+    touched.length = 0;
+    const db = centralDb();
+    const inbound = seedInbound('src-ag', 'src-sess');
+    insertLive(inbound, 'ser-notouch');
+    writeIntent(db, { seriesId: 'ser-notouch', ag: 'src-ag', sess: 'src-sess', tsMs: NOW - 2 * SWEEP_MS });
+
+    recoverMoveIntents(db, { dataDir: DIR, nowMs: NOW });
+
+    expect(touched).toEqual([]);
+    expect(h.spawns).toEqual([]);
     db.close();
   });
 

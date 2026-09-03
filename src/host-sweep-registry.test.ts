@@ -1763,11 +1763,19 @@ describe('sweep duty registry (S2-PR2)', () => {
       expect(h.spawns).toEqual([]);
     });
 
-    // Codex F1, driven through the registered path. The batch is flushed after
-    // the WHOLE fan-out, so a session marked early can have its last_active moved
-    // by ingress while a LATER session is still being swept. The write must not
-    // put that stale expiry back, or a restart before the next tick warms it and
-    // skips a due session without opening its inbound.db.
+    // Codex F1, driven through the registered path.
+    //
+    // SCOPE, narrowed after Codex round 2 (L2): this case owns the DRIVER half —
+    // that each queued mark carries the `last_active` it was computed against,
+    // and that a session invalidated mid-fan-out is not skipped after a restart.
+    // It does NOT prove the storage contract: the `persistQuietSessionMarks`
+    // mock below models the null-safe comparison itself, so deleting the SQL
+    // guard leaves this case green. The statement's own guard — including the
+    // NULL-basis arm that a `=` comparison silently drops — is owned by
+    // "does not write back a mark whose last_active moved between the sweep and
+    // the flush" in src/db/migrations/065-sessions-sweep-quiet-until.test.ts,
+    // against real SQLite. Omitting the field from the driver is a compile
+    // error, so the two together close the path.
     it('a mark invalidated during the fan-out is not written back, and that session is swept after a restart', async () => {
       const early = fakeSession('sess-early');
       const late = fakeSession('sess-late');
@@ -1797,6 +1805,52 @@ describe('sweep duty registry (S2-PR2)', () => {
 
       expect(h.opens, 'a stale mark was written back and warmed').toContain('sess-early');
       expect(_lastSweepTickStatsForTesting()).toMatchObject({ skippedQuiet: 1, sweptSessions: 1 });
+      expect(h.spawns).toEqual([]);
+    });
+
+    // Codex round 2, H1/H2 — the property both restore-path fixes rely on.
+    // A tick:housekeeping duty runs AFTER the fan-out and after the mark flush,
+    // so a duty that puts due work back into a session the fan-out just marked
+    // quiet has exactly one way to be seen: move `last_active`. This proves the
+    // driver honours that, in-process and across a restart.
+    it('a housekeeping duty that touches a session invalidates the mark that tick took', async () => {
+      _resetSweepRegistryForTesting({ builtins: false });
+      _resetQuietSessionCacheForTesting();
+      h.sessions = [fakeSession('sess-restored')];
+      h.mailbox = fakeMailbox({ getNextFutureProcessAfter: () => null });
+
+      // Stands in for recoverMoveIntents' restoreTaskRow + touchSessionActivity,
+      // and for scheduled-move's compensation: due work put back after the
+      // flush, and the central-DB touch that announces it.
+      let restored = false;
+      registerSweepDuty({
+        name: 'probe-restore',
+        phase: 'tick:housekeeping',
+        order: 10,
+        run: () => {
+          if (restored) return;
+          restored = true;
+          // What touchSessionActivity does: move last_active, null the column.
+          h.sessions[0] = fakeSession('sess-restored', { last_active: '2026-04-20T14:30:00.000Z' });
+          h.persistedQuiet.delete('sess-restored');
+        },
+      });
+
+      await _sweepOnceForTesting();
+      expect(h.quietWrites[0]!.map((m) => m.sessionId)).toEqual(['sess-restored']);
+      expect([...h.persistedQuiet.keys()], 'the flush wrote a mark the restore had already cleared').toEqual([]);
+
+      // In-process: the next tick sees the moved last_active and sweeps.
+      h.opens = [];
+      await _sweepOnceForTesting();
+      expect(h.opens).toContain('sess-restored');
+
+      // And across a restart: nothing was persisted, so nothing is warmed.
+      _resetQuietSessionCacheForTesting();
+      h.opens = [];
+      await firstTickAfterRestart();
+      expect(h.opens).toContain('sess-restored');
+      expect(_lastSweepTickStatsForTesting().skippedQuiet).toBe(0);
       expect(h.spawns).toEqual([]);
     });
 

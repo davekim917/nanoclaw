@@ -6,7 +6,7 @@ Program: upstream convergence, seam 2 (`groups/_ops/upstream-rebaseline-2026-09/
 Upstream target: `nanocoai/nanoclaw` `5c3082a1` (2.3.0, 2026-09-01). `src/host-lifecycle.ts` is byte-identical at `5c3082a1` and at `upstream/main` `0d9328d2` (sha256 `fbf37333…`, verified 2026-09-03), so the port does not age before the next sync.
 Fork base: `origin/feat/mailbox-seam-pr5-sweep-family` = `756f5d02` — a stack of mailbox PRs 1, 2 and 5, 28 commits off merge-base `167c96e6`. Every fork line number below is relative to that branch.
 Predecessor: seam 1, `docs/specs/upstream-mailbox-seam/plan.md` — §6, §8 and §10 conventions are reused verbatim.
-Executable acceptance criteria: **required** — behavior-preserving restructuring of the host's only periodic control path; every PR carries the named cases in §8 (85 total).
+Executable acceptance criteria: **required** — behavior-preserving restructuring of the host's only periodic control path; every PR carries the named cases in §8 (90 total).
 
 ## 1. Outcome
 
@@ -382,7 +382,7 @@ One sequencing note: three comments on the PR 5 branch (`:1223-1224`, `:1591`, `
 | S2-PR12 usage rollup (G22) | T19 | 69 | 3 | worker | 0.4 |
 | S2-PR13 continuation + ceiling (G09) | S6, S7, S8, S9a, S9b, S10, S15 | 794 | 42 | worker-high | 2.0 |
 | S2-PR14 final + contribution draft | — | residue only | 2 new | worker | 0.4 |
-| S2-PR15 quiet cache (#320) | — (driver machinery) | ~144 | 11 new | worker-high | 0.5 |
+| S2-PR15 quiet cache (#320) | — (driver machinery) | ~150 | 20 new | worker-high | 0.6 |
 | | **38** | | | | **12.4** |
 
 ×1.3 for review rounds and deploy windows ≈ **15.5 agent-weeks**. With 3 builders the calendar bound is the deploy cadence: 15 deploys at one quiet-hour window per night ≈ **5–7 weeks**, floored by when mailbox PR 4 and PR 6 land.
@@ -444,7 +444,7 @@ Plus the moved family's own log lines at their previous rate — each family PR 
 
 ## 8. Acceptance criteria (executable; `/team-build` materializes these, names verbatim)
 
-Host, `vitest`. 85 cases.
+Host, `vitest`. 90 cases.
 
 **S2-PR0 — lifecycle port (4)**
 - **L-1** `src/host-lifecycle-seam.test.ts` › "every ported upstream file matches UPSTREAM-MANIFEST.json" — manifest key set equals `UPSTREAM_FILES`; recompute sha256 for each; assert equality.
@@ -546,9 +546,17 @@ Host, `vitest`. 85 cases.
 - **F-14.1** `src/host-sweep-registry.test.ts` › "host-sweep.ts contains no inline duty bodies" — structural, corrected at build (2026-09-03, the "under 300 lines" figure was a guess: the driver + registry + phase list + shared context + error rule + quiet cache are 1,137 lines / 631 code at the integrated head, with no duty body): importing `src/host-sweep.ts` alone yields zero registrations; the file has no `registerSweepDuty(`/`registerSweepDutySource(` call sites outside the registry API; its export set is a subset of the declared driver/registry/phase-list/context/error-rule surface; and a regrowth ratchet with the section breakdown in a comment. No driver split. **Amended by S2-PR15 (#320):** the export allowlist gains `QUIET_SESSION_BACKOFF_MS` and the two test accessors `_resetQuietSessionCacheForTesting` and `_lastSweepTickStatsForTesting`, and the ratchet moves 1,200 → 1,300 for the ~144 lines of quiet-cache driver machinery §4.4 already assigns to this file (1,136 → 1,280 by `wc -l`). The four structural assertions are unchanged — the ratchet is a regrowth guard against a duty body coming home, never a line budget.
 - **F-14.2** same file › "the registered duty set still matches the inventory after every family has moved" — R-7's assertion re-run at the end state.
 
-**S2-PR15 — quiet cache (#320) (11)**
+**S2-PR15 — quiet cache (#320) (20)**
 
-Driver machinery, not duties: the registry inventory stays at 39 registrations / 38 names. All eleven live in `src/host-sweep-registry.test.ts` and drive the registered tick driver; the warm cases go through `startHostSweep` rather than `_sweepOnceForTesting`, because only `startHostSweep` warms and a case using the latter would stay green with the warm path deleted.
+Driver machinery, not duties: the registry inventory stays at 39 registrations / 38 names.
+
+**Where the twenty live**, since this PR is the only one in the series whose cases span more than one suite: 13 in `src/host-sweep-registry.test.ts` (Q-1 … Q-12, Q-16), 2 in `src/dashboard/api/scheduled-mutations.test.ts` (Q-13, Q-14), 1 in `src/db/migrations/065-sessions-sweep-quiet-until.test.ts` (Q-15), 2 in `src/modules/sweep-scheduled-move/scheduled-move.test.ts` (Q-17, Q-20), 1 in `src/dashboard/api/scheduled-move.test.ts` (Q-18), and 1 in `src/db/scheduled-tasks.test.ts` (Q-19).
+
+**The other seven assertions in the 065 migration suite do NOT count toward the total.** They are storage-layer coverage of the column and its two helpers — added, nullable, no backfill; the batch write; an empty batch; the `updateSession` clear firing on `last_active` and not on `container_status`; the warm query's three filters — not named acceptance criteria. Counting them would make the per-PR headings stop summing.
+
+**Arithmetic:** PR 0 through PR 14 sum to 70, and this PR adds 20, so §8's total is **90**.
+
+The registry cases drive the registered tick driver. The warm cases go through `startHostSweep` rather than `_sweepOnceForTesting`, because only `startHostSweep` warms and a case using the latter would stay green with the warm path deleted.
 
 - **Q-1** › "a quiet mark survives a driver restart and is warmed without opening any session DB" — sweep two quiet sessions, assert both marks persisted; empty the cache the way a restart does and re-enter `startHostSweep`; assert the first tick reports `skippedQuiet=2, sweptSessions=0` and the mailbox opener was called zero times.
 - **Q-2** › "a warmed mark whose last_active moved is dropped, and that session is swept on the first tick after the restart".
@@ -561,11 +569,19 @@ Driver machinery, not duties: the registry inventory stays at 39 registrations /
 - **Q-9** › "the quiet cache is warm on the first tick after a restart" — persisted marks for N active sessions, fresh `startHostSweep`, first tick reports `skippedQuiet === N` and opens no session DB.
 - **Q-10** › "a persisted quiet mark is ignored when last_active moved after it" — the mark is still unexpired, so this is not an expiry test in disguise.
 - **Q-11** › "an unreadable session takes the backoff in-process but persists no mark" — `skipUnreadable`'s causes are process-local; a fresh process must re-try rather than inherit a dead one's verdict.
-- **Q-12** › "a mark invalidated during the fan-out is not written back, and that session is swept after a restart" (Codex F1) — invalidate one session's `last_active` in the yield after it was marked, flush, restart, assert it is swept and the untouched one is skipped.
+- **Q-12** › "a mark invalidated during the fan-out is not written back, and that session is swept after a restart" (Codex round 1, F1) — invalidate one session's `last_active` in the yield after it was marked, flush, restart, assert it is swept and the untouched one is skipped. **Scope, narrowed at Codex round 2 (L2):** this case owns the DRIVER half only — that each queued mark carries the basis it was computed against, and that a session invalidated mid-fan-out is not skipped after a restart. The registry harness mocks `persistQuietSessionMarks` and models the null-safe comparison itself, so deleting the SQL guard leaves Q-12 green. The statement's guard is Q-15's, against real SQLite. Omitting the field from the driver is a compile error, so the two together close the path.
+- **Q-16** › "a housekeeping duty that touches a session invalidates the mark that tick took" (Codex round 2) — the property both restore-path fixes rest on: a `tick:housekeeping` duty runs after the fan-out and after the mark flush, so due work put back there is seen only if `last_active` moves. Asserted in-process and across a restart.
 - **Q-13** `src/dashboard/api/scheduled-mutations.test.ts` › "a cron edit clears the quiet mark and moves last_active" (Codex F2) — asserted on the central `sessions` row, not the funnel, so it survives mailbox PR 7's rewrite of that module.
 - **Q-14** same file › "a resume clears the quiet mark and moves last_active".
 
-Six further cases in `src/db/migrations/065-sessions-sweep-quiet-until.test.ts` pin the storage half against real SQLite: the column is added and nullable, nothing is backfilled, the batch write is one statement, an empty batch writes nothing, `updateSession` clears the mark when it writes `last_active` and leaves it alone otherwise, and the warm query returns only active rows whose mark is still in the future. A seventh, **Q-15** › "does not write back a mark whose last_active moved between the sweep and the flush", pins Codex F1's guard against real SQLite, including the NULL-basis arm that a `=` comparison would silently drop.
+Six further cases in `src/db/migrations/065-sessions-sweep-quiet-until.test.ts` pin the storage half against real SQLite: the column is added and nullable, nothing is backfilled, the batch write is one statement, an empty batch writes nothing, `updateSession` clears the mark when it writes `last_active` and leaves it alone otherwise, and the warm query returns only active rows whose mark is still in the future. **Q-15** › "does not write back a mark whose last_active moved between the sweep and the flush" pins Codex round 1's F1 guard against real SQLite, including the NULL-basis arm that a `=` comparison would silently drop.
+
+**Codex round 2 found two more due-ness writers on the restore paths, both on the far side of the mark flush.** `recoverMoveIntents` (`tick:housekeeping`) restores a crashed move's pending snapshot into a source session the same tick's fan-out may have just marked quiet; `dashboard/api/scheduled-move.ts`'s compensation restores that row after an awaited target insert rejects, and a sweep can land inside that await. Both now call `touchSessionActivity` before resolving or purging the intent:
+
+- **Q-17** `src/modules/sweep-scheduled-move/scheduled-move.test.ts` › "touches the source session so a quiet mark taken during the same tick cannot hide the restored task".
+- **Q-20** same file › "does not touch the source session when there was nothing to restore" — a recovery pass that only stamps changes no due-ness and must not flush the cache.
+- **Q-18** `src/dashboard/api/scheduled-move.test.ts` › "the compensation restore clears the source session quiet mark" — asserted on the central `sessions` row, not the funnel.
+- **Q-19** `src/db/scheduled-tasks.test.ts` › "clears sweep_quiet_until and advances last_active on the task session" — `scheduleTask`'s own invalidation, which had no coverage because the suite's fixture lacked the column and `touchSessionActivity` swallows its own errors (Codex round 2, L1). The fixture now carries `sweep_quiet_until`, in that suite and in `scheduled-move`'s, with a comment saying why it is load-bearing rather than scenery.
 
 **Family-case rule (added at build, 2026-09-03, after Codex found it on PR 3, PR 4 and PR 8):** every family PR must, for each moved registration, drive the REGISTERED duty through the registry (obtain it by name, invoke `claims`/`run` with a mocked context) and assert the underlying dependency was reached — a case that calls the body directly proves nothing about the wrapper the PR actually wrote. Exclusive-chain assertions read the registry's actual order and each duty's `claims` presence (S14 = no predicate). **And (after Codex on PR 7):** each family ships `src/modules/sweep-<family>/wiring.test.ts` › "the production modules barrel registers the <family> duty source" — it imports the production barrel `src/modules/index.ts` and asserts the family's source is registered, because the registry test's direct module import proves mechanics but masks barrel wiring. Case titles are the plan's exact strings.
 
