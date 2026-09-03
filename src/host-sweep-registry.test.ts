@@ -266,6 +266,10 @@ import './modules/sweep-session-core/index.js';
 // at import time; without this line R-7's inventory is seven registrations
 // short. Import for side effects only.
 import './modules/sweep-continuation/index.js';
+// Registers the scheduling family's duty source (S2-PR11: T8, S5, S18, S19) —
+// without it R-7's inventory is four registrations short and R-10's W2 branch
+// has nothing to make a session due.
+import './modules/sweep-scheduling/index.js';
 import { log } from './log.js';
 // Family module side-effect import (S2-PR7): registers T11
 // (scheduled-move-recovery) and T12 (audit-body-prune) as a duty source, so

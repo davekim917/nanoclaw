@@ -22,13 +22,11 @@ import {
   ABSOLUTE_CEILING_MS,
   CLAIM_STUCK_MS,
   SPAWN_GRACE_MS,
-  _prepareDueWakeForTesting,
   _resetSweepRegistryForTesting,
   registerSweepKillFollowUp,
   _incrementStoppedContinuationAttemptForTesting,
   _sweepSessionForTesting,
   parseSqliteUtc,
-  shouldCloseTaskSession,
 } from './host-sweep.js';
 // S14 (the running-container SLA) and both post-kill write paths moved to the
 // container-health family in S2-PR10; its test-only entry point moved with the
@@ -44,6 +42,10 @@ import { _enforceRunningContainerSlaForTesting } from './modules/sweep-container
 // cases stay on this file's fixture and reach across for the moved body, the
 // same way the SLA cases above do.
 import { sweepUsageRollup as _sweepUsageRollupForTesting } from './modules/sweep-usage/index.js';
+// The error-rule case below drives a THROW through the due-admission duty
+// (S5), which now lives in the scheduling family module (S2-PR11) — importing
+// it registers that duty so the case keeps its original vehicle.
+import './modules/sweep-scheduling/index.js';
 import { getDb } from './db/connection.js';
 import type { Session } from './types.js';
 
@@ -230,29 +232,6 @@ function fakeSession(): Session {
   };
 }
 
-describe('scheduled due admission precedes wake classification', () => {
-  it('counts and classifies the trigger inserted by the admission seam', async () => {
-    const { inDb, mailbox } = makeSessionDbs();
-    // The sweep hands `admitDueTaskContexts` the SESSION now, not a handle
-    // (invariant I-9). The stub writes the admitted trigger straight into the
-    // fixture DB behind that session, which is what the assertions below read.
-    mockAdmitDueTaskContexts.mockImplementationOnce(() => {
-      inDb
-        .prepare(
-          `INSERT INTO messages_in
-           (id, seq, kind, timestamp, status, process_after, recurrence, series_id, trigger, content)
-         VALUES ('task-admitted', 2, 'task', ?, 'pending', ?, NULL, 'task-admitted', 1, '{}')`,
-        )
-        .run(new Date().toISOString(), new Date(Date.now() - 1_000).toISOString());
-      return 1;
-    });
-
-    const result = await _prepareDueWakeForTesting(mailbox, 'ag-test', 'sess-test');
-
-    expect(mockAdmitDueTaskContexts).toHaveBeenCalledWith(mailbox, 'ag-test', 'sess-test');
-    expect(result).toEqual({ admittedTasks: 1, dueCount: 1, wakePriority: 'scheduled' });
-  });
-});
 
 describe('parseSqliteUtc', () => {
   // Regression: SQLite TIMESTAMP strings have no zone marker, but Date.parse
@@ -372,25 +351,6 @@ function makeNotifyTestDbs(opts?: { withRouting?: boolean; recentNotice?: boolea
   }
   return { inDb, outDb, mailbox: composeNanoclawSession(inDb, () => outDb) };
 }
-
-describe('shouldCloseTaskSession', () => {
-  it('closes a spent per-task session (no live tasks, no container)', () => {
-    expect(shouldCloseTaskSession('system:tasks:task-1', false, 0)).toBe(true);
-  });
-
-  it('keeps it while a task is still live (recurring re-armed, or pending/paused)', () => {
-    expect(shouldCloseTaskSession('system:tasks:task-1', false, 1)).toBe(false);
-  });
-
-  it('keeps it while its container is running (mid-fire)', () => {
-    expect(shouldCloseTaskSession('system:tasks:task-1', true, 0)).toBe(false);
-  });
-
-  it('never touches non-task sessions', () => {
-    expect(shouldCloseTaskSession('telegram:12345', false, 0)).toBe(false);
-    expect(shouldCloseTaskSession(null, false, 0)).toBe(false);
-  });
-});
 
 // shouldReapIdleTaskContainer / shouldReapIdleChatContainer cases moved to
 // src/modules/sweep-idle-reap/idle-reap.test.ts (seam 2, S2-PR3 — F-3.1).
