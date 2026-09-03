@@ -311,8 +311,6 @@ export async function declineAndNotify(input: DeclineAndNotifyInput): Promise<vo
       messaging_group_id: messagingGroupId,
       agent_group_id: stampAgentGroupId,
       sender_identity: senderKey,
-      sender_name: senderName,
-      original_message: JSON.stringify(event),
     });
   } else {
     log.debug('decline_notify stamp skipped — no agent groups exist', { messagingGroupId });
@@ -386,11 +384,16 @@ export async function declineAndNotify(input: DeclineAndNotifyInput): Promise<vo
       // resolves no adapter at all.
       target.messagingGroup.instance,
     );
-    log.info('decline_notify handled — decline sent, owner notified', {
-      messagingGroupId,
-      senderIdentity,
-      notified: target.userId,
-    });
+    log.info(
+      declined
+        ? 'decline_notify handled — decline sent, owner notified'
+        : 'decline_notify — owner notified, but the decline itself failed to deliver',
+      {
+        messagingGroupId,
+        senderIdentity,
+        notified: target.userId,
+      },
+    );
   } catch (err) {
     log.error('decline_notify: owner FYI delivery failed', { messagingGroupId, err });
   }

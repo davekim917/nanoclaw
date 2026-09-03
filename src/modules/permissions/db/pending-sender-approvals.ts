@@ -83,10 +83,18 @@ export function deletePendingSenderApproval(id: string): void {
 
 const DECLINE_STAMP_ID_PREFIX = 'decline:';
 
-/** True for a decline stamp rather than a real, clickable card row. */
-export function isDeclineStamp(id: string): boolean {
-  return id.startsWith(DECLINE_STAMP_ID_PREFIX);
-}
+/**
+ * A stamp records only THAT a sender was declined, never what they wrote.
+ *
+ * `original_message` exists so an approved card can replay the held event; a
+ * declined sender has no replay path, so keeping their message would retain
+ * content from someone the operator explicitly turned away, with no reader
+ * and no expiry (the row is refreshed, not deleted). This inert sentinel goes
+ * in its place — NOT NULL is satisfied, and the one function that ever parses
+ * the column (`isSameInboundEvent`) already treats unparseable content as
+ * "not the retained event".
+ */
+const DECLINE_STAMP_BODY = '{"declined":true}';
 
 /** ISO timestamp of the last decline for this pair, if any. */
 export function getDeclineStampAt(messagingGroupId: string, senderIdentity: string): string | undefined {
@@ -103,14 +111,13 @@ export function getDeclineStampAt(messagingGroupId: string, senderIdentity: stri
  * Record (or refresh) the decline stamp. `agent_group_id` must reference a
  * real agent group (FK). title / question / options_json keep their column
  * defaults, so `getAskQuestionRender` can never build a clickable card out of
- * a stamp.
+ * a stamp; `sender_name` and `original_message` are deliberately not taken
+ * from the caller — the dedupe key and the timestamp are the whole record.
  */
 export function upsertDeclineStamp(stamp: {
   messaging_group_id: string;
   agent_group_id: string;
   sender_identity: string;
-  sender_name: string | null;
-  original_message: string;
 }): void {
   getDb()
     .prepare(
@@ -120,7 +127,7 @@ export function upsertDeclineStamp(stamp: {
        )
        VALUES (
          @id, @messaging_group_id, @agent_group_id, @sender_identity,
-         @sender_name, @original_message, '', @created_at
+         NULL, @original_message, '', @created_at
        )
        ON CONFLICT(messaging_group_id, sender_identity) DO UPDATE SET
          id = excluded.id,
@@ -135,6 +142,9 @@ export function upsertDeclineStamp(stamp: {
     .run({
       id: `${DECLINE_STAMP_ID_PREFIX}${stamp.messaging_group_id}:${stamp.sender_identity}`,
       ...stamp,
+      // Overwrites a converted card row's retained body too, so flipping a
+      // messaging group to decline_notify drops the pending card's content.
+      original_message: DECLINE_STAMP_BODY,
       created_at: new Date().toISOString(),
     });
 }

@@ -18,6 +18,7 @@
  *  - An adapter that reports no DM/group context degrades to strict too
  *  - The FYI goes to an owner, not to the first admin pickApprover would card
  *  - The FYI tells the truth when the decline itself failed to deliver
+ *  - The stamp keeps no trace of what the declined sender wrote
  *  - Caller-supplied copy + conversation-scoped dedupe overrides
  */
 import fs from 'fs';
@@ -448,6 +449,46 @@ describe('unknown-sender decline_notify flow', () => {
     const fyi = JSON.parse(deliverMock.mock.calls[1][4] as string);
     expect(fyi.text).toContain("couldn't deliver the decline");
     expect(fyi.text).not.toContain('I sent a polite decline');
+  });
+
+  it('keeps no declined-sender content in the stamp', async () => {
+    const { routeInbound } = await import('../../router.js');
+    await routeInbound(strangerDm('my bank password is hunter2'));
+    await waitForDeliveries(2);
+
+    const stamp = (await db()).prepare(`SELECT * FROM pending_sender_approvals WHERE id LIKE 'decline:%'`).get() as {
+      original_message: string;
+      sender_name: string | null;
+      title: string;
+      options_json: string;
+    };
+    expect(stamp.original_message).not.toContain('hunter2');
+    expect(stamp.original_message).toBe('{"declined":true}');
+    expect(stamp.sender_name).toBeNull();
+    // And no render metadata, so the row can never be drawn as a card.
+    expect(stamp.title).toBe('');
+    expect(stamp.options_json).toBe('[]');
+  });
+
+  it('converting a pending card row into a stamp drops the retained message body', async () => {
+    updateMessagingGroup('mg-dm-stranger', { unknown_sender_policy: 'request_approval' });
+    const { routeInbound } = await import('../../router.js');
+    await routeInbound(strangerDm('let me in, my token is abc123'));
+    await waitForDeliveries(1);
+
+    const card = (await db())
+      .prepare(`SELECT original_message FROM pending_sender_approvals WHERE id LIKE 'nsa-%'`)
+      .get() as { original_message: string };
+    expect(card.original_message).toContain('abc123'); // the card legitimately retains it for replay
+
+    updateMessagingGroup('mg-dm-stranger', { unknown_sender_policy: 'decline_notify' });
+    await routeInbound(strangerDm('hello?'));
+    await waitForDeliveries(3);
+
+    const stamp = (await db())
+      .prepare(`SELECT original_message FROM pending_sender_approvals WHERE id LIKE 'decline:%'`)
+      .get() as { original_message: string };
+    expect(stamp.original_message).toBe('{"declined":true}');
   });
 
   it('honors caller-supplied copy and conversation-scoped dedupe', async () => {
