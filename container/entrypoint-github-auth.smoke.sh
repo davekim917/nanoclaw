@@ -36,6 +36,7 @@ printf 'ghs_smoke_first\n' > "$ROOT/gh-token/token"
 chmod 0600 "$ROOT/gh-token/token"
 
 docker run -d --rm --name "$NAME" \
+  --user "$(id -u):$(id -g)" \
   --entrypoint bash \
   -e GITHUB_TOKEN_FILE=/run/nanoclaw/gh-token/token \
   -v "$ROOT/gh-token:/run/nanoclaw/gh-token:ro" \
