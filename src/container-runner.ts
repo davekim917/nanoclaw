@@ -74,7 +74,6 @@ import {
 import { getDb, hasTable } from './db/connection.js';
 import { getMessagingGroup } from './db/messaging-groups.js';
 import { getSession } from './db/sessions.js';
-import { withExistingNanoclawSession } from './modules/mailbox/session.js';
 import { buildCentralProjection } from './db/per-agent-projections.js';
 import { ensureArchiveProjection } from './db/archive-projection-worker.js';
 import { initGroupFilesystem } from './group-init.js';
@@ -118,6 +117,7 @@ import {
   markContainerStopped,
   sessionContextPath,
   sessionDir,
+  withExistingMailboxSession,
   writeSessionContext,
   writeSessionRouting,
 } from './session-manager.js';
@@ -1126,7 +1126,7 @@ async function spawnContainer(
   // when the file exists, so such a container would come up with no mailbox to
   // poll and could recreate the host-owned database under the writable parent
   // mount. The direct open this replaced threw for exactly this state.
-  const repositoryFenceRead = await withExistingNanoclawSession(session.agent_group_id, session.id, (mailbox) => ({
+  const repositoryFenceRead = await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) => ({
     fence: mailbox.readRepoIngressFence(),
   }));
   if (!repositoryFenceRead) {

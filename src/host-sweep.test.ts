@@ -21,7 +21,7 @@ import {
 } from './modules/mailbox/ops/sweep.js';
 import { composeNanoclawSession, type NanoclawMailboxSession } from './modules/mailbox/index.js';
 import { getAgentMailbox } from './mailbox/index.js';
-import { withExistingNanoclawSession } from './modules/mailbox/session.js';
+import { withExistingMailboxSession } from './session-manager.js';
 import { closeDb, initTestDb, runMigrations } from './db/index.js';
 import {
   ABSOLUTE_CEILING_MS,
@@ -1379,7 +1379,7 @@ describe('sweepSession on a session with no mailbox', () => {
       return n * 100 + outRows;
     };
     const run = (<T>(action: (m: never) => T | Promise<T>) =>
-      withExistingNanoclawSession(session.agent_group_id, session.id, action as never)) as never;
+      withExistingMailboxSession(session.agent_group_id, session.id, action as never)) as never;
     return { session, claims, run };
   }
 

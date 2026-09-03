@@ -27,6 +27,7 @@ import {
   openInboundDb,
   openOutboundDb,
   openOutboundDbRw,
+  openOutboundDbWritable,
   sessionDbPathIsGone,
 } from './openers.js';
 import { ensureNanoclawInboundSchema, ensureSchema } from './schema.js';
@@ -763,6 +764,92 @@ export function composeOutboundOps(
     readContinuationPresence: () => readOutbound(null, readContinuationPresence),
     clearWorkContinuation: () => (outboundPresent ? clearWorkContinuation(writableOutbound()) : null),
   };
+}
+
+/**
+ * Run one operation against a session's OUTBOUND database alone.
+ *
+ * Resolves `undefined` — never provisions, never throws — when `outbound.db`
+ * is genuinely absent. That is the never-woken shape: the container owns that
+ * file, and one that never ran has not written it.
+ *
+ * Deliberately NOT the mailbox session. That funnel's existence check is keyed
+ * on `inbound.db`, so it answers `undefined` for a session whose inbound.db is
+ * gone while outbound.db remains — a real cohort — and any caller reading
+ * outbound state through it reports that state as empty when it is not. Four
+ * separate review findings across this series were instances of that one
+ * mistake, the last of them the router's two notices. The rule the seam
+ * settles on: the existence question a read asks is keyed to the file the read
+ * actually touches.
+ *
+ * The action receives the module's TYPED outbound ops, not a raw `Database` —
+ * a handle leaving the module is the shape the seam exists to remove
+ * (invariant I-9), whether or not the ratchet's name patterns happen to catch
+ * the parameter. The ops are the same composition `forkOps` spreads, so an op
+ * cannot behave differently depending on which funnel reached it.
+ *
+ * Both handles open lazily and only if the action asks: a pure read never
+ * opens the writer, and once the writer is open the reads share it, so a
+ * clear-then-verify sees its own write on one connection. A file that is
+ * present but will not open raises `SessionDbUnopenableError` from the
+ * opener — unreadable is a fault, never an empty answer. A file that vanishes
+ * between the existence check and the first op raises `SessionDbMissingError`
+ * rather than resolving `undefined`; that race is a fault too.
+ *
+ * Lives HERE rather than beside the two read funnels in `read-only.ts`, which
+ * is where the rest of the "ways in" are documented. It is built from
+ * `composeOutboundOps` directly above, and `read-only.ts` cannot import that
+ * without a static import cycle through this barrel — which the host's ESM
+ * rules say to avoid rather than rely on hoisting to survive.
+ */
+export async function withExistingNanoclawOutbound<T>(
+  agentGroupId: string,
+  sessionId: string,
+  action: (outbound: NanoclawOutboundSession) => T,
+): Promise<T | undefined> {
+  return withExistingNanoclawOutboundSync(agentGroupId, sessionId, action);
+}
+
+/**
+ * The same funnel, without the promise.
+ *
+ * The body below never awaited anything: `action` returns `T`, better-sqlite3
+ * is synchronous, and the `async` keyword on the form above is conformance
+ * with the mailbox interface rather than a statement about the work. That
+ * distinction stops being cosmetic the moment a caller needs SEVERAL sessions'
+ * outbound state as of ONE instant.
+ *
+ * A `Promise.all` fan-out cannot give that. Each read resolves at its own
+ * moment, so by the time the last one lands the first is already history — and
+ * for thread-close, "history" is a container that has since taken new work and
+ * cleared its proposal. Deciding from that set kills a working agent. Called in
+ * a loop with nothing awaited between the calls and the decision, this gives
+ * the one instant the decision needs.
+ *
+ * Same existence rule, same typed ops, same fault behavior as the async form —
+ * it IS the async form's body, so the two cannot drift.
+ */
+export function withExistingNanoclawOutboundSync<T>(
+  agentGroupId: string,
+  sessionId: string,
+  action: (outbound: NanoclawOutboundSession) => T,
+): T | undefined {
+  const outboundPath = sessionMailboxPath({ agentGroupId, sessionId }, 'outbound');
+  if (sessionDbPathIsGone(outboundPath)) return undefined;
+  let readable: Database.Database | undefined;
+  let writable: Database.Database | undefined;
+  try {
+    return action(
+      composeOutboundOps(
+        () => writable ?? (readable ??= openOutboundDb(outboundPath)),
+        () => (writable ??= openOutboundDbWritable(outboundPath)),
+        true,
+      ),
+    );
+  } finally {
+    writable?.close();
+    readable?.close();
+  }
 }
 
 export function composeNanoclawSession(

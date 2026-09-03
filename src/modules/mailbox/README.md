@@ -15,17 +15,33 @@ admission and read ops.
 - No on-disk schema change: the shape here is exactly what the live fleet
   already carries.
 
-## Two ways in
+## Three ways in
 
-- `withMailboxSession` / `withExistingMailboxSession` (session-manager.ts) —
-  the read-write session. Opens inbound read-write and runs the legacy
-  migrations on the first touch of a path in a process. Everything that writes
-  goes here; a read that must not provision uses the `Existing` form and reads
-  `undefined` as "no mailbox".
-- `readSessionInbound` / `readSessionOutbound` (`read-only.ts`) — the
-  operator surfaces' read path, and the only synchronous one. A `readonly`
-  handle, no schema-ensure, no migration, no provisioning, and a 1s
-  busy_timeout by default. `read-only.ts` states the full rationale.
+There is exactly ONE spelling for the mailbox session — `withMailboxSession` /
+`withExistingMailboxSession`, from `session-manager.ts`. The
+`withNanoclawSession` / `withExistingNanoclawSession` aliases are gone: they
+were pure pass-throughs whose `as NanoclawMailboxSession` casts were no-ops,
+because `session-manager.ts` already types its action that way.
+
+- `withMailboxSession` / `withExistingMailboxSession` (`session-manager.ts`) —
+  the read-write mailbox session, keyed on **inbound.db**. Opens inbound
+  read-write and runs the legacy migrations on the first touch of a path in a
+  process. Everything that writes to inbound goes here; a read that must not
+  provision uses the `Existing` form and reads `undefined` as "no mailbox".
+- `readSessionInbound` / `readSessionOutbound` (`read-only.ts`) — the operator
+  surfaces' read path, and the only synchronous one. A `readonly` handle, no
+  schema-ensure, no migration, no provisioning, and a 1s busy_timeout by
+  default. `read-only.ts` states the full rationale.
+- `withExistingNanoclawOutbound` (`read-only.ts`) — the writable
+  **outbound-keyed** session, for an outbound-only write such as the
+  thread-close force-clear. Deliberately not the mailbox session: that one's
+  existence check is inbound-keyed, so it answers `undefined` for a session
+  whose inbound.db is gone while outbound.db remains.
+
+All three are existing-only and share one open/absent/close implementation,
+`withOpenedSessionDb` in `openers.ts`. Only the opener varies. An absent DB is
+`undefined`; a present-but-unopenable one raises `SessionDbUnopenableError`
+whichever funnel opened it.
 
 ## Adding a read op
 

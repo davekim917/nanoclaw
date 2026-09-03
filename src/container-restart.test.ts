@@ -95,11 +95,6 @@ vi.mock('./config.js', async (importOriginal) => ({
 // Only the outbound message write is stubbed; the rest of session-manager
 // (the nesting guard, the provision/exists split) is the real thing, because
 // the real-mailbox case runs through it.
-vi.mock('./session-manager.js', async (importOriginal) => ({
-  ...(await importOriginal<typeof import('./session-manager.js')>()),
-  writeSessionMessage: (...args: unknown[]) => mockWriteSessionMessage(...args),
-}));
-
 // Real fs, except that a MODEL session's inbound.db existence is answered from
 // the sets above — those sessions have no files on disk. A real-mailbox
 // session, and every other path, falls through to the real answer.
@@ -170,17 +165,21 @@ function modelMailbox(sessionId: string): NanoclawMailboxSession {
   } as unknown as NanoclawMailboxSession;
 }
 
-vi.mock('./modules/mailbox/session.js', async (importOriginal) => {
-  const real = await importOriginal<typeof import('./modules/mailbox/session.js')>();
+vi.mock('./session-manager.js', async (importOriginal) => {
+  const real = await importOriginal<typeof import('./session-manager.js')>();
   const { SessionDbMissingError } = await import('./modules/mailbox/index.js');
   return {
     ...real,
-    withExistingNanoclawSession: async (
+    // One factory per module: vitest keeps only the LAST vi.mock for a given
+    // specifier, so the writeSessionMessage override has to live here too
+    // rather than in a second call that would silently replace this one.
+    writeSessionMessage: (...args: unknown[]) => mockWriteSessionMessage(...args),
+    withExistingMailboxSession: async (
       agentGroupId: string,
       sessionId: string,
       action: (mailbox: NanoclawMailboxSession) => unknown,
     ) => {
-      if (realMailboxSessions.has(sessionId)) return real.withExistingNanoclawSession(agentGroupId, sessionId, action);
+      if (realMailboxSessions.has(sessionId)) return real.withExistingMailboxSession(agentGroupId, sessionId, action);
       beforeInboundOpen?.(sessionId);
       // The seam reports a vanished session as `undefined`, never as a throw.
       if (missingInboundDbs.has(sessionId)) return undefined;

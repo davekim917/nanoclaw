@@ -36,13 +36,10 @@ import { getActiveSessions, getSession, isTaskThread, updateSession } from './db
 import { getAgentGroup } from './db/agent-groups.js';
 import {
   SessionDbMissingError,
-  readSessionOutbound,
   SessionDbUnopenableError,
   type ForkContainerStateRow as ContainerState,
   type NanoclawMailboxSession,
 } from './modules/mailbox/index.js';
-import { withExistingNanoclawSession } from './modules/mailbox/session.js';
-
 import { runHostGatedTaskScripts } from './modules/scheduling/host-script.js';
 import { advanceThreadClosures, syncDoneProposalMirror } from './dashboard/thread-close.js';
 import { log } from './log.js';
@@ -1078,7 +1075,7 @@ export const providerFailedTicks = new Map<string, number>();
  * a `killContainer` call rather than hold one across it (invariant I-3):
  * a kill respawns through `onExit` and clears the session's status through
  * `delivery.ts`, and both of those open a mailbox session on this same key.
- * Production passes `withExistingNanoclawSession`; a test passes a runner over
+ * Production passes `withExistingMailboxSession`; a test passes a runner over
  * its own in-memory handles.
  *
  * Resolves `undefined` when the mailbox is gone — the read-path contract.
@@ -1328,7 +1325,7 @@ async function sweepSession(session: Session, tick: SweepTickContext): Promise<n
   // closed, never held across a wake or a kill (invariant I-3). Reads never
   // provision (invariant I-4): a session whose mailbox is gone resolves
   // undefined and is counted as unreadable rather than silently recreated.
-  const baseRun: SessionRunner = (action) => withExistingNanoclawSession(agentGroup.id, session.id, action);
+  const baseRun: SessionRunner = (action) => withExistingMailboxSession(agentGroup.id, session.id, action);
 
   // `session:plan` fills this in; every later phase reads it.
   const plan: WakePlan = {
@@ -1527,7 +1524,7 @@ export function _incrementStoppedContinuationAttemptForTesting(
   session: Session,
   expectedId: string,
 ): Promise<HostWorkContinuation | null> {
-  const run: SessionRunner = (action) => withExistingNanoclawSession(session.agent_group_id, session.id, action);
+  const run: SessionRunner = (action) => withExistingMailboxSession(session.agent_group_id, session.id, action);
   return incrementStoppedContinuationAttempt(run, session, expectedId);
 }
 

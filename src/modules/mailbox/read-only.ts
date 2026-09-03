@@ -1,4 +1,18 @@
 /**
+ * The module's existing-only session funnels — the three ways to reach ONE
+ * session's storage without provisioning it.
+ *
+ * Two are read-only (`readSessionInbound`, `readSessionOutbound`) and one
+ * writes (`withExistingNanoclawOutbound`, the thread-close force-clear). They
+ * live together because they share the same absence rule and the same
+ * classified openers via `withOpenedSessionDb`; only which opener, and whether
+ * the handle can write, differs. The read-only rationale below governs the
+ * first two.
+ *
+ * (Filename is narrower than the contents now. PR 4's round 4 introduces its
+ * own outbound-ops module and these converge there, so renaming this file now
+ * would only manufacture a conflict for that merge.)
+ *
  * Read-only session access for the host's operator surfaces.
  *
  * `withExistingMailboxSession` is the default for a caller that only reads
@@ -85,6 +99,7 @@ import {
   SessionDbMissingError,
   sessionDbPathIsGone,
 } from './openers.js';
+import { sessionMailboxPath } from '../../mailbox/sqlite/paths.js';
 
 /**
  * Which session to read, and where its data lives.
@@ -313,3 +328,4 @@ export function readSessionOutbound<T>(
     db.close();
   }
 }
+

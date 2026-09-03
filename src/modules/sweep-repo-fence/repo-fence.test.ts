@@ -161,9 +161,9 @@ function modelMailbox(sessionId: string) {
   };
 }
 
-vi.mock('../mailbox/session.js', async (importOriginal) => ({
-  ...(await importOriginal<typeof import('../mailbox/session.js')>()),
-  withExistingNanoclawSession: async (
+vi.mock('../../session-manager.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../session-manager.js')>()),
+  withExistingMailboxSession: async (
     _agentGroupId: string,
     sessionId: string,
     action: (mailbox: unknown) => unknown,

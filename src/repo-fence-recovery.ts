@@ -28,7 +28,7 @@ import { getMessagingGroup } from './db/messaging-groups.js';
 import { getActiveSessions, getSessionsByAgentGroup } from './db/sessions.js';
 import { log } from './log.js';
 import { SessionDbMissingError } from './modules/mailbox/index.js';
-import { withExistingNanoclawSession } from './modules/mailbox/session.js';
+import { withExistingMailboxSession } from './session-manager.js';
 import {
   isRepositoryLifecycleClaimed,
   isWorkgroupRepositoryMountClaimed,
@@ -139,7 +139,7 @@ export async function releaseOrphanedRepoIngressFences(
       // and a session with no mailbox has no fence — the ordinary steady state.
       // The wake happens after the loop, so no mailbox session is ever held
       // across `wakeRepositoryMountSessions` (invariant I-3).
-      const needsWake = await withExistingNanoclawSession(session.agent_group_id, session.id, (mailbox) => {
+      const needsWake = await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) => {
         report.scanned += 1;
         const fence = mailbox.readRepoIngressFence();
         if (fence?.state !== 'active') return false;

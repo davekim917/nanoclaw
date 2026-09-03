@@ -28,8 +28,8 @@ const duringProposalRead = vi.hoisted(() => ({
   skip: 0,
 }));
 
-vi.mock('../modules/mailbox/session.js', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('../modules/mailbox/session.js')>();
+vi.mock('../modules/mailbox/index.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../modules/mailbox/index.js')>();
   return {
     ...actual,
     // The SYNC funnel is what the decision path reads through now: the async
