@@ -22,6 +22,14 @@ describe('the production modules barrel registers the sweep-usage duty source', 
     await import('../index.js');
 
     const { duties } = _listSweepRegistrationsForTesting();
-    expect(duties.some((d) => d.name === 'usage-rollup')).toBe(true);
+    const duty = duties.find((d) => d.name === 'usage-rollup');
+    // Codex round on 89f2d24c (F1): presence alone doesn't prove the barrel
+    // carries the SAME registration the family module intends — assert the
+    // plan-mandated coordinates too (phase/order encode 21 load-bearing
+    // ordering constraints, plan.md §4.3), not just that some duty by this
+    // name exists somewhere in the registry.
+    expect(duty).toBeDefined();
+    expect(duty?.phase).toBe('tick:post-session');
+    expect(duty?.order).toBe(40);
   });
 });
