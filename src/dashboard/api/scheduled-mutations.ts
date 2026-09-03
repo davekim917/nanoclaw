@@ -15,7 +15,6 @@
  */
 import { CronExpressionParser } from 'cron-parser';
 import fs from 'fs';
-import path from 'path';
 
 import { DATA_DIR, TIMEZONE } from '../../config.js';
 import { getDb } from '../../db/connection.js';

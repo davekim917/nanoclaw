@@ -41,19 +41,14 @@
  * (usage_daily is an additive upsert over a watermark, so it never sees a
  * turn's rows together) and would silently redefine an existing column.
  */
-import type Database from 'better-sqlite3';
-
 import { getDb } from './connection.js';
 import { log } from '../log.js';
 import type { NanoclawMailboxSession } from '../modules/mailbox/index.js';
 
-/**
- * The container-written per-turn row. Owned by the mailbox module, which owns
- * the session-DB shape; the optional fields postdate the original table, so a
- * row from an older container arrives without those keys and every read below
- * goes through `??`.
- */
-type TurnUsageRow = ReturnType<NanoclawMailboxSession['listTurnUsageSince']>[number];
+// The per-turn row shape is the mailbox module's — it owns the session-DB
+// shape, and `listTurnUsageSince` is what this file reads it through. Its
+// optional fields postdate the original table, so a row from an older
+// container arrives without those keys and every read below goes through `??`.
 
 export interface UsageDailyRow {
   date: string;

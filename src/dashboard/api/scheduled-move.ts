@@ -17,8 +17,6 @@ import { createHash } from 'crypto';
 import fs from 'fs';
 import path from 'path';
 
-import Database from 'better-sqlite3';
-
 import { randomUUID } from 'crypto';
 
 import { DATA_DIR, GROUPS_DIR } from '../../config.js';

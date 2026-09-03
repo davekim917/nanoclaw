@@ -776,18 +776,34 @@ async function sourceSessionStates(source: RepositoryWorkUnit): Promise<Reposito
     let continuation = false;
     try {
       // Read-only seam: the quiescence probe must never provision or migrate a
-      // session it is only inspecting. A session with no outbound.db has no
-      // container that ever ran, so it holds no claim, runs no tool and owns
-      // no continuation — `undefined` maps to exactly that, and only a FAILED
-      // read (the catch below) falls through to fail-closed.
-      const state = readSessionOutbound({ agentGroupId: row.agent_group_id, sessionId: row.id }, (mailbox) => ({
-        processing: mailbox.getProcessingClaimRows().length > 0,
-        activeTool: Boolean(mailbox.getContainerState()?.current_tool),
-        continuation: mailbox.hasWorkContinuation(),
-      }));
-      processing = state?.processing ?? false;
-      activeTool = state?.activeTool ?? false;
-      continuation = state?.continuation ?? false;
+      // session it is only inspecting.
+      // Both options restate what `openOutboundDb` did before the seam, and
+      // both matter here. The 5s busy_timeout is the write path's, because
+      // this is a handful of named sessions rather than a console fan-out.
+      // The hot-journal rollback is load-bearing: a SIGKILLed or OOM-killed
+      // container leaves a journal a read-only handle cannot get past, so
+      // without recovery the read throws, the catch calls the session active,
+      // and the transfer is refused until some other subsystem happens to
+      // recover the file.
+      const state = readSessionOutbound(
+        { agentGroupId: row.agent_group_id, sessionId: row.id },
+        (mailbox) => ({
+          processing: mailbox.getProcessingClaimRows().length > 0,
+          activeTool: Boolean(mailbox.getContainerState()?.current_tool),
+          continuation: mailbox.hasWorkContinuation(),
+        }),
+        { busyTimeoutMs: 5000, recoverJournal: true },
+      );
+      // `undefined` (no outbound.db) counts as ACTIVE, deliberately. Before the
+      // seam the raw opener threw SessionDbMissingError on that file and the
+      // catch below made it active; keeping it active is what makes this a
+      // behavior-preserving refactor. It is arguably over-conservative — a
+      // session whose container never ran holds no claim — but relaxing it is
+      // a fail-closed policy change and does not belong in a seam move.
+      if (!state) throw new Error(`no outbound mailbox for session ${row.id}`);
+      processing = state.processing;
+      activeTool = state.activeTool;
+      continuation = state.continuation;
     } catch {
       // Unknown state is active: a transfer must fail closed.
       processing = true;
