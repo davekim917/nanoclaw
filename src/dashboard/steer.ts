@@ -15,7 +15,7 @@ import { getSession } from '../db/sessions.js';
 import { getMessagingGroup } from '../db/messaging-groups.js';
 import { log } from '../log.js';
 import { writeSessionMessage } from '../session-manager.js';
-import { sessionInboundHasMessage } from '../db/session-db.js';
+import { readSessionInbound } from '../modules/mailbox/index.js';
 import { wakeContainer } from '../container-runner.js';
 import { getChannelAdapter } from '../channels/channel-registry.js';
 import { isOwner, isGlobalAdmin, isAdminOfAgentGroup } from '../modules/permissions/db/user-roles.js';
@@ -200,7 +200,21 @@ async function _writeAndEchoSteer(
   }
 
   const resolvedMessageId = reserved.messageId;
-  const inboundExists = sessionInboundHasMessage(exec.childAgentGroupId, exec.childSessionId, resolvedMessageId);
+  // Read-only seam: this is the partial-write recovery probe (D5), so it must
+  // answer without provisioning or migrating the child's mailbox. `undefined`
+  // (no mailbox yet) is "the message is not there", which is what the write
+  // below then fixes. `recoverJournal` keeps the pre-seam behavior: rolling a
+  // hot journal back is the only reason a read-only handle can answer a
+  // session whose host write was interrupted, and this caller owns that
+  // session's write anyway. 5s busy_timeout, the write path's, not the
+  // console fan-out's 1s — one named session, and a false "not there" here
+  // costs a duplicate insert.
+  const inboundExists =
+    readSessionInbound(
+      { agentGroupId: exec.childAgentGroupId, sessionId: exec.childSessionId },
+      (mailbox) => mailbox.inboundHasMessage(resolvedMessageId),
+      { busyTimeoutMs: 5000, recoverJournal: true },
+    ) ?? false;
 
   if (!inboundExists) {
     const now = new Date().toISOString();

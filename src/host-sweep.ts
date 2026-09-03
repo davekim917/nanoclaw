@@ -1841,15 +1841,13 @@ async function sweepUsageRollup(sessions: Session[]): Promise<void> {
       }
       if (shouldSkipUsageRollup(usageRollupMtimeCache.get(session.id), mtimeMs)) continue;
 
-      // `rollupSessionUsage` still takes a raw outbound handle (`db/usage.ts`
-      // has no PR in this series yet); it only reads. Handing it this
-      // session's own handle keeps the rollup on one open.
+      // `rollupSessionUsage` takes a mailbox session, not a raw handle
+      // (mailbox seam PR 6), and it asks for only the one op it uses. PR 6
+      // carried a two-line adapter here for the pre-PR-5 sweep; with PR 5's
+      // session loop underneath, the collapsed form its comment called for is
+      // simply passing this session through.
       const rolledUp = await withExistingNanoclawSession(session.agent_group_id, session.id, (mailbox) => {
-        rollupSessionUsage(
-          mailbox.legacyOutboundHandle(),
-          session.agent_group_id,
-          `${session.agent_group_id}/${session.id}`,
-        );
+        rollupSessionUsage(mailbox, session.agent_group_id, `${session.agent_group_id}/${session.id}`);
         return true;
       });
       // Only a rollup that RAN may claim this mtime as processed. A session

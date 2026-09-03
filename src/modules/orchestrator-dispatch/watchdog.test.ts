@@ -5,7 +5,6 @@
  */
 import Database from 'better-sqlite3';
 import path from 'path';
-import os from 'os';
 import fs from 'fs';
 import { describe, expect, it, afterEach, vi } from 'vitest';
 
@@ -278,20 +277,17 @@ describe('decideTaskAction', () => {
 });
 
 // ─── C2: pendingTerminalSpawnOutboundSeenAt ────────────────────────────────
-// Tests use real on-disk SQLite DBs in a temp directory, with vi.mock to
-// redirect outboundDbPath to the temp location.
+// Real on-disk SQLite DBs under the install's own session tree. The helper
+// reads through the mailbox module's read-only seam (PR 6), which resolves
+// `<DATA_DIR>/v2-sessions/<agent group>/<session>/outbound.db` and refuses
+// anything that resolves elsewhere — so the fixture has to live where a real
+// session does, and a path mock would no longer be exercising the real
+// resolution at all. Agent-group ids carry the pid so parallel suites cannot
+// collide.
 
-const TEST_ROOT = path.join(os.tmpdir(), 'watchdog-test-' + process.pid);
+const TEST_ROOT = path.join(process.cwd(), 'data', 'v2-sessions');
+const TEST_AG_PREFIX = `wd-${process.pid}-`;
 const tmpSessions: string[] = [];
-
-vi.mock('../../session-manager.js', async (importOriginal) => {
-  const real = await importOriginal<typeof import('../../session-manager.js')>();
-  return {
-    ...real,
-    outboundDbPath: (agentGroupId: string, sessionId: string) =>
-      path.join(TEST_ROOT, agentGroupId, sessionId, 'outbound.db'),
-  };
-});
 
 function makeTmpOutboundDb(agentGroupId: string, sessionId: string): Database.Database {
   const dir = path.join(TEST_ROOT, agentGroupId, sessionId);
@@ -328,7 +324,7 @@ afterEach(() => {
 describe('pendingTerminalSpawnOutboundSeenAt', () => {
   it('test_returns_null_no_pending: returns null when only chat messages exist', async () => {
     const { pendingTerminalSpawnOutboundSeenAt } = await import('./watchdog.js');
-    const agentGroupId = 'ag-null-test';
+    const agentGroupId = TEST_AG_PREFIX + 'null-test';
     const sessionId = 'sess-null-test';
     const db = makeTmpOutboundDb(agentGroupId, sessionId);
     db.prepare("INSERT INTO messages_out VALUES ('m1', 1, null, '2026-01-01T00:00:00.000Z', 'chat', ?)").run(
@@ -342,7 +338,7 @@ describe('pendingTerminalSpawnOutboundSeenAt', () => {
 
   it('test_returns_min_timestamp: returns earliest timestamp for multiple terminal rows', async () => {
     const { pendingTerminalSpawnOutboundSeenAt } = await import('./watchdog.js');
-    const agentGroupId = 'ag-min-test';
+    const agentGroupId = TEST_AG_PREFIX + 'min-test';
     const sessionId = 'sess-min-test';
     const db = makeTmpOutboundDb(agentGroupId, sessionId);
     db.prepare("INSERT INTO messages_out VALUES ('m1', 1, null, '2026-01-01T00:01:00.000Z', 'system', ?)").run(
@@ -362,7 +358,7 @@ describe('pendingTerminalSpawnOutboundSeenAt', () => {
 
   it('test_excludes_chat_messages_with_action_word: excludes non-system rows even with action text', async () => {
     const { pendingTerminalSpawnOutboundSeenAt } = await import('./watchdog.js');
-    const agentGroupId = 'ag-chat-test';
+    const agentGroupId = TEST_AG_PREFIX + 'chat-test';
     const sessionId = 'sess-chat-test';
     const db = makeTmpOutboundDb(agentGroupId, sessionId);
     // Chat message containing action text — kind='chat' guard must reject it
@@ -377,7 +373,7 @@ describe('pendingTerminalSpawnOutboundSeenAt', () => {
 
   it('test_excludes_false_positive_match: excludes system rows with action as superstring of spawn_complete', async () => {
     const { pendingTerminalSpawnOutboundSeenAt } = await import('./watchdog.js');
-    const agentGroupId = 'ag-fp-test';
+    const agentGroupId = TEST_AG_PREFIX + 'fp-test';
     const sessionId = 'sess-fp-test';
     const db = makeTmpOutboundDb(agentGroupId, sessionId);
     // "spawn_complete_other" contains "spawn_complete" as substring — must NOT match
@@ -399,7 +395,7 @@ describe('pendingTerminalSpawnOutboundSeenAt', () => {
 
   it('matches spawn_failed correctly', async () => {
     const { pendingTerminalSpawnOutboundSeenAt } = await import('./watchdog.js');
-    const agentGroupId = 'ag-failed-test';
+    const agentGroupId = TEST_AG_PREFIX + 'failed-test';
     const sessionId = 'sess-failed-test';
     const db = makeTmpOutboundDb(agentGroupId, sessionId);
     db.prepare("INSERT INTO messages_out VALUES ('m1', 1, null, '2026-01-01T00:05:00.000Z', 'system', ?)").run(

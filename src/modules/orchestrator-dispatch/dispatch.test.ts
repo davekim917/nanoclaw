@@ -38,8 +38,10 @@ vi.mock('../../session-manager.js', async (importOriginal) => {
         created: true,
       })),
     writeSessionRouting: vi.fn(),
-    inboundDbPath: vi.fn().mockReturnValue('/tmp/nonexistent-inbound.db'),
-    openInboundDb: vi.fn(),
+    // No raw-opener overrides: the dispatcher writes the spawn_task_id stamp
+    // through `withExistingMailboxSession` (mailbox seam, PR 6), and the real
+    // one resolves `undefined` for these fixtures' non-existent mailboxes,
+    // which is the skip the stamp is supposed to take.
   };
 });
 
