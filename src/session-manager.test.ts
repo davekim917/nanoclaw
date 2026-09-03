@@ -1056,7 +1056,7 @@ describe('writeSessionMessage re-provisions a deleted session folder', () => {
     db.close();
   });
 
-  it('a retry backoff moves process_after but NEVER the occurrence\'s scheduled slot', async () => {
+  it("a retry backoff moves process_after but NEVER the occurrence's scheduled slot", async () => {
     initSessionFolder(AG, SESS);
     const db = new Database(inboundDbPath(AG, SESS));
     try {

@@ -728,7 +728,7 @@ describe('cancelSeriesWithStrandClear', () => {
 });
 
 describe('insertRecurrence', () => {
-  it('stamps the successor occurrence with its OWN slot, not the previous run\'s', () => {
+  it("stamps the successor occurrence with its OWN slot, not the previous run's", () => {
     const db = freshDb();
     const previous: RecurringMessage = {
       id: 'task-day1',

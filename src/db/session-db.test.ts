@@ -339,9 +339,11 @@ describe('migrateMessagesInTable', () => {
     const cols = (db.prepare("PRAGMA table_info('messages_in')").all() as Array<{ name: string }>).map((c) => c.name);
     expect(cols).toContain('scheduled_for');
 
-    const rows = db
-      .prepare('SELECT id, scheduled_for, process_after FROM messages_in ORDER BY seq')
-      .all() as Array<{ id: string; scheduled_for: string | null; process_after: string | null }>;
+    const rows = db.prepare('SELECT id, scheduled_for, process_after FROM messages_in ORDER BY seq').all() as Array<{
+      id: string;
+      scheduled_for: string | null;
+      process_after: string | null;
+    }>;
     expect(rows).toEqual([
       { id: 'legacy-task', scheduled_for: '2026-01-05T09:00:00.000Z', process_after: '2026-01-05T09:00:00.000Z' },
       { id: 'legacy-chat', scheduled_for: null, process_after: '2026-01-04T12:10:00.000Z' },

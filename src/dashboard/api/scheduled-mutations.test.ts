@@ -532,7 +532,7 @@ describe('runNowHandler', () => {
     expect(row.trigger).toBe(1);
   });
 
-  it('an early fire moves process_after but leaves the occurrence\'s slot alone', async () => {
+  it("an early fire moves process_after but leaves the occurrence's slot alone", async () => {
     // §4.6: run-now does not shift the schedule. The row is still FOR its
     // original slot, so that is what the agent must be told it is running.
     const originalSlot = isoIn(-60_000);

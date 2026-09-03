@@ -64,10 +64,10 @@ Content shapes: see [api-details.md §Session DB Schema Details](api-details.md#
 **Reader (container):** `container/agent-runner/src/db/messages-in.ts` — polls `status='pending' AND (process_after IS NULL OR process_after <= now)`.
 
 **`process_after` vs `scheduled_for`.** They are stamped from the same value at
-insert and then diverge. `process_after` answers *when to run next*, so the
+insert and then diverge. `process_after` answers _when to run next_, so the
 deferral paths rewrite it — a crashed provider turn put behind a retry backoff
 (`deferMessageForFreshContextRetry`), a stale message re-armed with
-`retryWithBackoff`. `scheduled_for` answers *which occurrence this is*, and only
+`retryWithBackoff`. `scheduled_for` answers _which occurrence this is_, and only
 a genuine reschedule moves it: a cron edit, a resume recomputed to the next
 future slot, an explicit `--process-after`, an operator re-`scheduleTask`. The
 board's run-now is the deliberate exception — it fires early WITHOUT shifting

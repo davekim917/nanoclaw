@@ -402,7 +402,7 @@ describe('moveExecuteHandler', () => {
     expect(tgtLive[0].recurrence).toBe('0 9 * * *');
   });
 
-  it('a successful move carries the occurrence\'s slot, not its retry deadline', async () => {
+  it("a successful move carries the occurrence's slot, not its retry deadline", async () => {
     // The source row crashed and was deferred: process_after is a backoff
     // deadline ten hours out, scheduled_for is still the 9:00 slot. Stamping
     // the destination from process_after would change the occurrence's identity
