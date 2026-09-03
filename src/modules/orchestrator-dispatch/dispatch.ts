@@ -1,5 +1,4 @@
 import { randomUUID } from 'crypto';
-import fs from 'fs';
 
 import { getChannelAdapter } from '../../channels/channel-registry.js';
 import { getDb } from '../../db/connection.js';
@@ -37,7 +36,7 @@ async function lazyEmit(kind: string, payload: _IMP | _TEP | _SEP): Promise<void
 import { getMessagingGroup } from '../../db/messaging-groups.js';
 import { getSession } from '../../db/sessions.js';
 import { log } from '../../log.js';
-import { inboundDbPath, openInboundDb, resolveSession, writeSessionMessage } from '../../session-manager.js';
+import { resolveSession, withExistingMailboxSession, writeSessionMessage } from '../../session-manager.js';
 import { wakeContainer } from '../../container-runner.js';
 import type { Session } from '../../types.js';
 import { CapabilityConfig, getCapabilityConfig, hasOrchestratorCapability } from './db/agent-group-capabilities.js';
@@ -380,7 +379,7 @@ async function _runThreadedPath(task: Task, childAgentGroupId: string): Promise<
       if (updated.changes === 0) return;
 
       // b. Write spawn_task_id to child's inbound.db session_routing
-      _writeSpawnTaskIdToRouting(childSession.agent_group_id, childSession.id, taskId);
+      await _writeSpawnTaskIdToRouting(childSession.agent_group_id, childSession.id, taskId);
 
       // c. Write first inbound to child — stamp the spawn thread's routing
       // onto the brief inbound. The agent-runner's per-destination thread
@@ -447,7 +446,7 @@ async function _runHeadlessPath(task: Task, childAgentGroupId: string): Promise<
     if (updated.changes === 0) return;
 
     // b. Write spawn_task_id to child's inbound.db session_routing
-    _writeSpawnTaskIdToRouting(childSession.agent_group_id, childSession.id, taskId);
+    await _writeSpawnTaskIdToRouting(childSession.agent_group_id, childSession.id, taskId);
 
     // c. Write first inbound
     await writeSessionMessage(childSession.agent_group_id, childSession.id, {
@@ -473,20 +472,11 @@ async function _runHeadlessPath(task: Task, childAgentGroupId: string): Promise<
   }
 }
 
-function _writeSpawnTaskIdToRouting(agentGroupId: string, sessionId: string, taskId: string): void {
-  const dbPath = inboundDbPath(agentGroupId, sessionId);
-  if (!fs.existsSync(dbPath)) return;
-
-  const db = openInboundDb(agentGroupId, sessionId);
-  try {
-    db.prepare(
-      `INSERT INTO session_routing (id, spawn_task_id)
-       VALUES (1, ?)
-       ON CONFLICT(id) DO UPDATE SET spawn_task_id = excluded.spawn_task_id`,
-    ).run(taskId);
-  } finally {
-    db.close();
-  }
+async function _writeSpawnTaskIdToRouting(agentGroupId: string, sessionId: string, taskId: string): Promise<void> {
+  // `withExistingMailboxSession`, not `withMailboxSession`: a child session
+  // whose mailbox is gone must not be re-provisioned by a routing stamp
+  // (invariant I-4). That is the same skip the pre-seam existsSync guard did.
+  await withExistingMailboxSession(agentGroupId, sessionId, (mailbox) => mailbox.setSessionRoutingSpawnTaskId(taskId));
 }
 
 function _resolveParentSession(task: Task): Session | null {
