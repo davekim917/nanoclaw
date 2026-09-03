@@ -272,6 +272,40 @@ function buildDestinationsSection(mode: SessionMode): string {
   if (mode.kind === 'task') {
     lines.push(
       'This is an isolated task run with no attached chat. Only notify someone when the task asks you to. For a user-visible message, call `send_message({ to: "name", text: "..." })`; for a file, call `send_file` with `to`. Always pass the explicit named destination.',
+    );
+
+    // A task run has no `here` — every send must name a destination, and the
+    // agent picks it from a list where a sibling agent looks as reachable as a
+    // human's channel. Left to itself it escalates INTO another agent, which
+    // reads as delivery but reaches no person: the sibling gets a message it
+    // was never asked to act on, and the operator waiting on the answer sees
+    // nothing. Name the channels explicitly as the default, and say plainly
+    // what an agent destination is for.
+    const channelDestinations = all.filter((destination) => destination.type === 'channel');
+    const agentDestinations = all.filter((destination) => destination.type === 'agent');
+    if (channelDestinations.length > 0) {
+      const channelNames = channelDestinations.map((destination) => `\`${destination.name}\``).join(', ');
+      lines.push(
+        '',
+        `For user-visible escalation — a blocker, a question you need answered, anything a person has to act on — default to your own channel destination(s): ${channelNames}. That is the operator's actual conversation with you.`,
+      );
+      // Same policy the chat branch states below: one run, one place. A task
+      // that posts interim notes to a channel and its result to a DM has split
+      // the record in half, and neither half is the whole answer.
+      lines.push(
+        '',
+        'Keep the whole run in one place. Interim notes and the final escalation go to the SAME destination — do not report progress in one channel and the outcome in someone\'s DM.',
+      );
+      if (agentDestinations.length > 0) {
+        const agentNames = agentDestinations.map((destination) => `\`${destination.name}\``).join(', ');
+        lines.push(
+          '',
+          `${agentNames} ${agentDestinations.length === 1 ? 'is an agent-type destination' : 'are agent-type destinations'} — another agent, not a person. Route through one ONLY when this task explicitly calls for it, never as your default escalation path.`,
+        );
+      }
+    }
+
+    lines.push(
       '',
       `Your final output is not sent to the user. End with a concise work-log summary. It is recorded automatically in \`tasks/${mode.taskId}.md\`. Read that file when you need context from earlier runs. Use \`ncl tasks append-log --msg "…"\` only for optional mid-run notes.`,
     );
