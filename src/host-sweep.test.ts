@@ -5,6 +5,7 @@
  *
  * Also contains C3 watchdog integration tests.
  */
+import { spawnSync } from 'child_process';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
@@ -19,6 +20,7 @@ import {
   type ContainerState,
 } from './modules/mailbox/ops/sweep.js';
 import { composeNanoclawSession, type NanoclawMailboxSession } from './modules/mailbox/index.js';
+import * as mailboxIndex from './modules/mailbox/index.js';
 import { getAgentMailbox } from './mailbox/index.js';
 import { withExistingNanoclawSession } from './modules/mailbox/session.js';
 import { closeDb, initTestDb, runMigrations } from './db/index.js';
@@ -49,6 +51,7 @@ import {
   _incrementStoppedContinuationAttemptForTesting,
   _sweepSessionForTesting,
   _sweepTaskWatchdogForTesting,
+  _sweepUsageRollupForTesting,
   autoArchiveOldCompleted,
   canAttemptContinuationRecovery,
   countToolRecoveryAttemptsSinceRealInbound,
@@ -2849,6 +2852,135 @@ describe('shouldSkipUsageRollup', () => {
 
   it('does not skip a session never seen before (no cache entry)', () => {
     expect(shouldSkipUsageRollup(undefined, 1000)).toBe(false);
+  });
+});
+
+describe('sweepUsageRollup over a hot journal', () => {
+  // Codex P2 (thread PRRT_kwDORfvfVM6fEn3q): the rollup's readSessionOutbound
+  // call used the read-only wrapper's defaults (`recoverJournal: false`, 1s
+  // busy_timeout — the console fleet-fan-out's, not a single named session's)
+  // where the replaced `openOutboundDb` path always recovered a hot journal
+  // and waited 5s. An ACTIVE session that keeps outbound.db but lost
+  // inbound.db (or simply crashed mid-write and left a hot rollback journal
+  // behind) then throws on every tick instead of reading — the watermark
+  // never advances and those turn_usage rows never reach the central ledger.
+  //
+  // A hand-written junk `-journal` file will NOT reproduce this: SQLite
+  // validates the journal header and silently ignores an invalid one. This
+  // creates a GENUINE hot journal by killing a child process mid-transaction
+  // (same technique as `db/session-db.test.ts`'s hot-journal-recovery cases).
+  it('reads turn_usage and advances the watermark over a REAL hot journal with no inbound.db', async () => {
+    const db = initTestDb();
+    runMigrations(db);
+    db.prepare(
+      `INSERT INTO agent_groups (id, name, folder, created_at)
+       VALUES ('ag-usage-hot', 'usage hot', 'usage-hot', ?)`,
+    ).run(new Date().toISOString());
+
+    const session: Session = { ...fakeSession(), id: 'sess-usage-hot', agent_group_id: 'ag-usage-hot' };
+    const dir = path.join(testDataDir.dir, 'v2-sessions', session.agent_group_id, session.id);
+    fs.mkdirSync(dir, { recursive: true });
+    const dbPath = path.join(dir, 'outbound.db');
+    // Deliberately no inbound.db: the exact cohort the fix names — a session
+    // whose inbound.db is gone (or was never woken) while outbound.db and its
+    // turn_usage rows remain.
+
+    const seed = new Database(dbPath);
+    seed.pragma('journal_mode = DELETE');
+    seed.exec(`
+      CREATE TABLE turn_usage (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts TEXT NOT NULL,
+        provider TEXT NOT NULL,
+        model TEXT,
+        input_tokens INTEGER,
+        output_tokens INTEGER,
+        cache_read_tokens INTEGER,
+        cache_write_tokens INTEGER,
+        cost_usd REAL
+      )
+    `);
+    seed
+      .prepare(
+        `INSERT INTO turn_usage (ts, provider, model, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cost_usd)
+         VALUES (?, 'claude', 'sonnet', 100, 50, 0, 0, 0.01)`,
+      )
+      .run(new Date().toISOString());
+    seed.close();
+
+    const child = `
+      const Database = require('better-sqlite3');
+      const db = new Database(${JSON.stringify(dbPath)});
+      db.pragma('journal_mode = DELETE');
+      db.prepare('BEGIN EXCLUSIVE').run();
+      db.prepare(
+        "INSERT INTO turn_usage (ts, provider, model, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cost_usd) VALUES (?, 'claude', 'sonnet', 1, 1, 0, 0, 0)",
+      ).run(new Date().toISOString());
+      process.kill(process.pid, 'SIGKILL');
+    `;
+    spawnSync(process.execPath, ['-e', child], { cwd: process.cwd() });
+
+    if (!fs.existsSync(`${dbPath}-journal`)) {
+      // Couldn't reproduce the crash residue on this platform — skip rather
+      // than assert something we didn't actually set up.
+      closeDb();
+      return;
+    }
+
+    // Confirm the precondition is REAL: a genuinely hot journal makes a bare
+    // read-only read fail. If the child's crash didn't leave one (timing or
+    // platform dependent), skip rather than assert on a condition never
+    // actually established.
+    let reproduced = false;
+    try {
+      const ro = new Database(dbPath, { readonly: true });
+      ro.prepare('SELECT id FROM turn_usage').all();
+      ro.close();
+    } catch (err) {
+      reproduced = /readonly database/.test((err as Error).message);
+    }
+    if (!reproduced) {
+      closeDb();
+      return;
+    }
+
+    await _sweepUsageRollupForTesting([session]);
+
+    // The fix: readSessionOutbound recovers the journal before reading, so
+    // the row that was already committed lands in the central ledger and the
+    // watermark advances. Without it (default recoverJournal: false, 1s
+    // timeout), the read throws, `sweepUsageRollup`'s per-session catch
+    // swallows it, and this table stays empty forever.
+    const rows = getDb().prepare('SELECT provider, model FROM turn_usage WHERE session_id = ?').all(session.id);
+    expect(rows.length).toBeGreaterThan(0);
+    expect(fs.existsSync(`${dbPath}-journal`)).toBe(false);
+    closeDb();
+  });
+
+  // The genuine-crash case above is only reproducible where the platform's
+  // SIGKILL residue leaves a real hot journal — some sandboxes never produce
+  // one and the case above self-skips there. This one is deterministic
+  // everywhere: it spies on the module's own `readSessionOutbound` and pins
+  // the exact options `sweepUsageRollup` must pass at the call site, which is
+  // the actual regression (a missing third argument, defaulting to the
+  // console fan-out's `recoverJournal: false` / 1s timeout instead of the
+  // write path's `recoverJournal: true` / 5s that `openOutboundDb` always
+  // gave).
+  it('passes the write path options (recoverJournal, 5s busy_timeout) to readSessionOutbound', async () => {
+    const spy = vi.spyOn(mailboxIndex, 'readSessionOutbound').mockReturnValue(undefined);
+    const session: Session = { ...fakeSession(), id: 'sess-usage-opts', agent_group_id: 'ag-usage-opts' };
+    const dir = path.join(testDataDir.dir, 'v2-sessions', session.agent_group_id, session.id);
+    fs.mkdirSync(dir, { recursive: true });
+    // The stat gate only needs a file to exist; readSessionOutbound is mocked
+    // so its content is irrelevant here.
+    fs.writeFileSync(path.join(dir, 'outbound.db'), '');
+
+    await _sweepUsageRollupForTesting([session]);
+
+    expect(spy).toHaveBeenCalledTimes(1);
+    expect(spy.mock.calls[0]?.[0]).toEqual({ agentGroupId: session.agent_group_id, sessionId: session.id });
+    expect(spy.mock.calls[0]?.[2]).toEqual({ busyTimeoutMs: 5000, recoverJournal: true });
+    spy.mockRestore();
   });
 });
 

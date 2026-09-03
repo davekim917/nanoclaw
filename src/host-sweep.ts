@@ -53,7 +53,7 @@ import { withExistingNanoclawSession } from './modules/mailbox/session.js';
 // DATA_DIR, so its session DBs are not addressable by a mailbox key and it
 // cannot go through the seam. It stays on the module's own open funnel — the
 // one place in this file that still opens a session DB by path.
-import { openInboundDb as openInboundDbByPath, openOutboundDb } from './modules/mailbox/openers.js';
+import { openInboundDb as openInboundDbByPath } from './modules/mailbox/openers.js';
 import { restoreTaskRow, type TaskRowSnapshot } from './modules/scheduling/db.js';
 import { countLiveRowsInSessions } from './modules/scheduling/live-count.js';
 import { runHostGatedTaskScripts } from './modules/scheduling/host-script.js';
@@ -2265,12 +2265,22 @@ async function sweepUsageRollup(sessions: readonly Session[]): Promise<void> {
       // rollup. `rollupSessionUsage` (mailbox seam PR 6) asks for only the
       // one op it uses, `readSessionOutbound`'s read-only wrapper supplies
       // it, and neither one provisions or writes.
+      //
+      // `recoverJournal: true` and the write path's 5s busy_timeout, not the
+      // defaults: the replaced `openOutboundDb` path recovered a hot journal
+      // and waited 5s, same as the dashboard's single-session reads
+      // (`steer.ts`, `repository-workspaces/index.ts`). Without it, a live
+      // session whose container crashed mid-write — outbound.db present with
+      // a hot journal, inbound.db gone — throws on every tick under the
+      // console's 1s fleet-fan-out default and never advances its watermark,
+      // so its turn_usage rows never reach the central ledger.
       const rolledUp = readSessionOutbound(
         { agentGroupId: session.agent_group_id, sessionId: session.id },
         (mailbox) => {
           rollupSessionUsage(mailbox, session.agent_group_id, `${session.agent_group_id}/${session.id}`);
           return true;
         },
+        { busyTimeoutMs: 5000, recoverJournal: true },
       );
       // Only a rollup that RAN may claim this mtime as processed. A session
       // whose inbound.db is gone while outbound.db remains resolves undefined
@@ -2289,6 +2299,9 @@ async function sweepUsageRollup(sessions: readonly Session[]): Promise<void> {
     for (const id of usageRollupMtimeCache.keys()) if (!live.has(id)) usageRollupMtimeCache.delete(id);
   }
 }
+
+/** Test-only entry point for the usage-rollup sweep step. */
+export { sweepUsageRollup as _sweepUsageRollupForTesting };
 
 const DEFAULT_NO_PROGRESS_TIMEOUT_SEC = 1800;
 const DEFAULT_SPAWN_DEADLINE_SEC = 300;
