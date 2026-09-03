@@ -132,6 +132,14 @@ vi.mock('../../container-runner.js', async (importOriginal) => {
     ...real,
     isContainerRunning: (...args: unknown[]) => mockIsContainerRunning(...args),
     isContainerSpawning: (...args: unknown[]) => mockIsContainerSpawning(...args),
+    // `containerOwnsOutbound` moved from host-sweep.ts into container-runner.ts
+    // (mailbox PR 4 round 8 — thread-close's finalizer is its second caller).
+    // Composed from the MOCKED checks: spreading `...real` alone leaves the
+    // real predicate reading live module state, so every guard in this suite's
+    // duty graph would silently bypass this mock. Same composition
+    // src/host-sweep.test.ts uses.
+    containerOwnsOutbound: (sessionId: string) =>
+      Boolean(mockIsContainerRunning(sessionId)) || Boolean(mockIsContainerSpawning(sessionId)),
     hasContainerEverRun: (...args: unknown[]) => mockHasContainerEverRun(...args),
     getContainerSpawnedAt: (...args: unknown[]) => mockGetContainerSpawnedAt(...args),
     wakeContainer: (...args: unknown[]) => mockWakeContainer(...args),
