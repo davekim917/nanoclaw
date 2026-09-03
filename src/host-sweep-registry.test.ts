@@ -229,6 +229,10 @@ import {
   type SweepSessionContext,
   type SweepTickContext,
 } from './host-sweep.js';
+// Registers the scheduling family's duty source (S2-PR11: T8, S5, S18, S19) —
+// without it R-7's inventory is four registrations short and R-10's W2 branch
+// has nothing to make a session due.
+import './modules/sweep-scheduling/index.js';
 import { log } from './log.js';
 import { SessionDbMissingError, SessionDbUnopenableError } from './modules/mailbox/index.js';
 import { _mailboxSessionDepthForTesting } from './modules/mailbox/session.js';

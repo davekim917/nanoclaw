@@ -52,3 +52,7 @@ import './provider-fallback/index.js';
 import './repository-workspaces/index.js';
 
 import './escalation/index.js';
+
+// Sweep duty family: scheduling + thread-close (S2-PR11) — thread-close-advance,
+// due-wake-admission, recurrence-fanout, spent-task-session-gc.
+import './sweep-scheduling/index.js';
