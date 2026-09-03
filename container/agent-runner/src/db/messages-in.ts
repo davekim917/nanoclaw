@@ -24,6 +24,9 @@ function hasOnWakeColumn(db: ReturnType<typeof openInboundDb>): boolean {
   return _hasOnWake;
 }
 
+// Columns exist on disk (host migrateMessagesInTable adds them); declared
+// optional here so no fixture changes are needed until R1 replaces this file
+// with upstream's.
 export interface MessageInRow {
   id: string;
   seq: number | null;
@@ -32,6 +35,7 @@ export interface MessageInRow {
   status: string;
   process_after: string | null;
   recurrence: string | null;
+  series_id?: string | null;
   tries: number;
   /** 1 = wake-eligible (default); 0 = accumulated context only */
   trigger: number;
@@ -39,6 +43,8 @@ export interface MessageInRow {
   channel_type: string | null;
   thread_id: string | null;
   content: string;
+  source_session_id?: string | null;
+  on_wake?: number;
 }
 
 // Parse the two timestamp shapes that live in the session DBs into epoch ms.

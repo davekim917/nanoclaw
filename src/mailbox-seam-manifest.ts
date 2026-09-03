@@ -40,7 +40,8 @@ export const UPSTREAM_FILES: readonly string[] = [
   'src/mailbox/index.ts',
   'src/mailbox/model.test.ts',
   'src/mailbox/model.ts',
-  'src/mailbox/registry.test.ts',
+  // 'src/mailbox/registry.test.ts' — deferred: asserts the end state (no
+  // session-db.ts, entrypoint imports the barrel); ported in PR 7 (host) / R3 (runner).
   'src/mailbox/sqlite/arm-next-task.test.ts',
   'src/mailbox/sqlite/index.ts',
   'src/mailbox/sqlite/paths.ts',
@@ -55,7 +56,8 @@ export const UPSTREAM_FILES: readonly string[] = [
   // Runner
   'container/agent-runner/src/mailbox/index.ts',
   'container/agent-runner/src/mailbox/model.generated.ts',
-  'container/agent-runner/src/mailbox/registry.test.ts',
+  // 'container/agent-runner/src/mailbox/registry.test.ts' — deferred: asserts the
+  // end state (no session-db.ts, entrypoint imports the barrel); ported in PR 7 (host) / R3 (runner).
   'container/agent-runner/src/mailbox/sqlite/connection.ts',
   'container/agent-runner/src/mailbox/sqlite/index.ts',
   'container/agent-runner/src/mailbox/sqlite/operations.ts',
@@ -64,6 +66,16 @@ export const UPSTREAM_FILES: readonly string[] = [
   'container/agent-runner/src/modules/index.ts',
   'container/agent-runner/src/heartbeat.ts',
   'container/agent-runner/src/db/container-state.ts',
+] as const;
+
+/**
+ * Deferred ported-file paths: not in UPSTREAM_FILES yet (they assert the end
+ * state of the migration), but must land no later than the raw-access ratchet
+ * (RATCHET.json) reaching empty — see the assertion in src/mailbox-seam-ratchet.test.ts.
+ */
+export const DEFERRED_UPSTREAM_FILES: readonly string[] = [
+  'src/mailbox/registry.test.ts',
+  'container/agent-runner/src/mailbox/registry.test.ts',
 ] as const;
 
 export interface MailboxSeamManifest {

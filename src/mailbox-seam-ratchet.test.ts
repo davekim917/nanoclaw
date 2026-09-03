@@ -13,6 +13,7 @@ import path from 'node:path';
 import { describe, expect, expectTypeOf, it } from 'vitest';
 
 import { computeOffenders } from './mailbox-seam-ratchet.js';
+import { DEFERRED_UPSTREAM_FILES, UPSTREAM_FILES } from './mailbox-seam-manifest.js';
 import type { DeliveryActionHandler } from './delivery.js';
 
 const REPO_ROOT = path.resolve(__dirname, '..');
@@ -49,5 +50,23 @@ describe('no raw session-DB access or passed session handle outside the mailbox 
   // this pass; it documents where the ratchet is heading, not a target for this PR.
   it('DeliveryActionHandler is still 3-argument — PR 3 narrows it to 2 (upstream contract)', () => {
     expectTypeOf<Parameters<DeliveryActionHandler>['length']>().toEqualTypeOf<3>();
+  });
+
+  // The two upstream registry.test.ts files were deliberately deferred out of
+  // UPSTREAM_FILES for this PR (they assert the migration's END state — no raw
+  // src/db/session-db.ts, entrypoints import the mailbox barrel — which only
+  // holds once RATCHET.json is empty). This assertion is the tripwire that
+  // catches the deferral being forgotten: once every caller has moved behind
+  // the mailbox seam and the allowlist is emptied, both deferred files MUST be
+  // back in UPSTREAM_FILES (PR 7 / R3).
+  it('once the raw-access allowlist is empty, both deferred registry tests must be ported', () => {
+    if (allowlist.length === 0) {
+      for (const deferred of DEFERRED_UPSTREAM_FILES) {
+        expect(
+          UPSTREAM_FILES,
+          `RATCHET.json is empty but ${deferred} is still deferred — port it and add it back to UPSTREAM_FILES`,
+        ).toContain(deferred);
+      }
+    }
   });
 });
