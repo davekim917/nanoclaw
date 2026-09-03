@@ -4,7 +4,13 @@
  * Writes an on_wake message to each session, kills the container, then
  * wakes a fresh container via the onExit callback — race-free.
  */
-import { isContainerRunning, isContainerSpawning, killContainer, wakeContainer } from './container-runner.js';
+import {
+  getContainerSpawnedAt,
+  isContainerRunning,
+  isContainerSpawning,
+  killContainer,
+  wakeContainer,
+} from './container-runner.js';
 import { randomUUID } from 'crypto';
 import { getSession, getSessionsByAgentGroup } from './db/sessions.js';
 import { log } from './log.js';
@@ -523,6 +529,14 @@ export async function restartAgentGroupContainers(
     // no-ops on a session it no longer tracks — counting that as a restart
     // reports work that did not happen.
     if (!isContainerRunning(session.id)) continue;
+    // Generation token for the process we are about to kill. The pending read
+    // below is async now, so the snapshotted container can exit and an inbound
+    // wake can install a REPLACEMENT before control returns — and killing that
+    // one is both wrong and silent: if the read saw no due rows, no onExit is
+    // installed, so the replacement's freshly claimed input goes dark until a
+    // later recovery pass. `spawnedAt` changes on every spawn, so comparing it
+    // across the await identifies the process rather than merely the session.
+    const spawnGeneration = getContainerSpawnedAt(session.id);
 
     // Always respawn after the kill when there is anything to process: an
     // explicit wake message, or in-flight messages the dying container had
@@ -551,6 +565,15 @@ export async function restartAgentGroupContainers(
         agentGroupId,
         sessionId: session.id,
         err,
+      });
+      continue;
+    }
+    // Re-check the generation, not just liveness: a replacement is "running"
+    // too. Leave it alone — it is doing the work this restart wanted done.
+    if (getContainerSpawnedAt(session.id) !== spawnGeneration) {
+      log.info('Restart: container was replaced while reading pending work; leaving the replacement alone', {
+        agentGroupId,
+        sessionId: session.id,
       });
       continue;
     }

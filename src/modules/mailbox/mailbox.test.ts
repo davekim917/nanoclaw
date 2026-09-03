@@ -416,6 +416,12 @@ describe('NanoclawAgentMailbox', () => {
         barrierAck: session.readRepositoryMountBarrierAck(),
         lastOutboundAt: session.latestOutboundTimestamp(),
         due: session.getDueOutboundMessages(),
+        // Every outbound READ degrades, not just the ones with an obvious
+        // caller: `deliverSessionMessages` calls this for every recently active
+        // session, and a throw here is caught as `pending`, so its
+        // quiet-delivery cache never arms and the sweep reopens and refails the
+        // same session on every pass.
+        outboundIds: session.listOutboundMessageIds(),
         noticed: session.outboundHasContentLike('anything'),
         answered: session.hasNonStatusReplyTo('m-inbound-only'),
       };
@@ -429,6 +435,7 @@ describe('NanoclawAgentMailbox', () => {
       barrierAck: null,
       lastOutboundAt: null,
       due: [],
+      outboundIds: [],
       noticed: false,
       answered: false,
     });

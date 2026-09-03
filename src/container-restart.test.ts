@@ -11,11 +11,15 @@ vi.mock('./log.js', async (importOriginal) => ({
 
 const mockIsContainerRunning = vi.fn<(id: string) => boolean>();
 const mockIsContainerSpawning = vi.fn<(id: string) => boolean>();
+// Process generation for a session's container. Constant unless a test models a
+// replacement spawning during the restart's async pending read.
+const mockGetContainerSpawnedAt = vi.fn<(id: string) => number>(() => 1000);
 const mockKillContainer = vi.fn<(id: string, reason: string, onExit?: () => void) => void>();
 const mockWakeContainer = vi.fn();
 vi.mock('./container-runner.js', () => ({
   isContainerRunning: (...args: unknown[]) => mockIsContainerRunning(args[0] as string),
   isContainerSpawning: (...args: unknown[]) => mockIsContainerSpawning(args[0] as string),
+  getContainerSpawnedAt: (...args: unknown[]) => mockGetContainerSpawnedAt(args[0] as string),
   killContainer: (...args: unknown[]) =>
     mockKillContainer(args[0] as string, args[1] as string, args[2] as (() => void) | undefined),
   wakeContainer: (...args: unknown[]) => mockWakeContainer(...args),
@@ -172,6 +176,7 @@ import { log } from './log.js';
 beforeEach(() => {
   vi.clearAllMocks();
   mockIsContainerSpawning.mockReturnValue(false);
+  mockGetContainerSpawnedAt.mockReset().mockReturnValue(1000);
   activeEpochs.clear();
   acknowledgedEpochs.clear();
   processingSessions.clear();
@@ -653,6 +658,22 @@ describe('restartAgentGroupContainers', () => {
 
     expect(mockKillContainer.mock.calls.map((c) => c[0])).toEqual(['s2']);
     expect(count).toBe(1);
+  });
+
+  it('does not kill a replacement container that spawned during the pending read', async () => {
+    mockGetSessionsByAgentGroup.mockReturnValue([makeSession('s1', 'g1')]);
+    mockIsContainerRunning.mockReturnValue(true);
+    // The snapshotted container exits and an inbound wake installs a fresh one
+    // while the (now async) mailbox read is in flight: same session id, new
+    // process. Killing that one is wrong, and silently so — the read saw no due
+    // rows, so no onExit would be installed and the replacement's freshly
+    // claimed input would go dark until a later recovery pass.
+    mockGetContainerSpawnedAt.mockReturnValueOnce(1000).mockReturnValue(2000);
+
+    const count = await restartAgentGroupContainers('g1', 'test');
+
+    expect(mockKillContainer).not.toHaveBeenCalled();
+    expect(count).toBe(0);
   });
 
   it('skips sessions without a running container', async () => {

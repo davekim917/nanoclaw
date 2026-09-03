@@ -541,7 +541,7 @@ function forkOps(
 
     markPending: (messageOutId) => markPending(inbound, messageOutId),
     getDueOutboundMessages: () => readOutbound([], getDueOutboundMessages),
-    listOutboundMessageIds: () => listOutboundMessageIds(readableOutbound()),
+    listOutboundMessageIds: () => readOutbound([], listOutboundMessageIds),
 
     getRecentInboundChatSenders: (limit) => getRecentInboundChatSenders(inbound, limit),
     getChannelDestination: (name) => getChannelDestination(inbound, name),

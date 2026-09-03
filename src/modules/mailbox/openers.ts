@@ -299,7 +299,7 @@ export function openOutboundDbWritable(dbPath: string): Database.Database {
   // guard as the inbound funnel: the check answers fast, `fileMustExist` closes
   // the race after it, and only a real ENOENT/ENOTDIR counts as gone.
   if (sessionDbPathIsGone(dbPath)) throw new SessionDbMissingError(dbPath);
-  let db: Database.Database;
+  let db: Database.Database | undefined;
   try {
     db = new Database(dbPath, { fileMustExist: true });
     db.pragma('journal_mode = DELETE');
@@ -308,6 +308,13 @@ export function openOutboundDbWritable(dbPath: string): Database.Database {
     // Inside the try with the constructor: a pragma that throws leaves the
     // same "present but unopenable" state, and it must carry the same class or
     // a lazy writable open would still be misread as a caller's own failure.
+    //
+    // Close what the constructor already built before rethrowing. A pragma can
+    // fail on a lock while the connection is live, and leaving it to GC keeps
+    // the descriptor and SQLite's locks held — so a transient failure that
+    // retries amplifies into descriptor exhaustion. Same discipline as the
+    // inbound funnel.
+    db?.close();
     throw asMissingDbError(err, dbPath);
   }
   assertQueryable(db, dbPath);
