@@ -64,14 +64,6 @@ import {
   killContainer,
   wakeContainer,
 } from './container-runner.js';
-import {
-  SESSION_ARTIFACT_IDLE_MS as STORAGE_SESSION_ARTIFACT_IDLE_MS,
-  collectThreadWorktreeActivity,
-  pruneIdleSessionArtifacts as pruneIdleSessionArtifactsImpl,
-  pruneIdleThreadArtifacts as pruneIdleThreadArtifactsImpl,
-  type ThreadWorktreeActivity,
-} from './storage-manager.js';
-import { startStorageMaintenanceOnce } from './modules/sweep-storage/index.js';
 import type { Session } from './types.js';
 import { getDb } from './db/connection.js';
 import { reconcileMergedClaims } from './modules/claims/reconcile.js';
@@ -121,10 +113,6 @@ export const PENDING_MESSAGE_MAX_AGE_MS =
   (Number.isFinite(parsedMaxAgeHours) && parsedMaxAgeHours > 0 ? parsedMaxAgeHours : 24) * 60 * 60 * 1000;
 const MAX_TRIES = 5;
 const BACKOFF_BASE_MS = 5000;
-
-// Back-compat export for callers that still reference the old host-sweep
-// cleanup threshold. Storage-manager owns the actual cache cleanup policy.
-export const SESSION_ARTIFACT_IDLE_MS = STORAGE_SESSION_ARTIFACT_IDLE_MS;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Sweep duty registry (convergence seam 2, PR 2)
@@ -1529,17 +1517,10 @@ async function sweepUsageRollup(sessions: readonly Session[]): Promise<void> {
   }
 }
 
-export function pruneIdleSessionArtifacts(now: number = Date.now(), root: string = sessionsBaseDir()): void {
-  pruneIdleSessionArtifactsImpl(now, root, isContainerRunning);
-}
-
-export function pruneIdleThreadArtifacts(
-  now: number = Date.now(),
-  root: string = path.join(path.dirname(sessionsBaseDir()), 'v2-threads'),
-  activityByWorktreeDir: Map<string, ThreadWorktreeActivity> = collectThreadWorktreeActivity(isContainerRunning),
-): void {
-  pruneIdleThreadArtifactsImpl(now, root, activityByWorktreeDir);
-}
+// G64 (S2-PR6): the pruneIdleSessionArtifacts/pruneIdleThreadArtifacts
+// back-compat shims that used to live here are gone — callers use
+// storage-manager.ts's own exports (which already default `isContainerRunning`
+// and the sessions/threads roots) directly.
 
 // Running-container SLA (S14) and the OOM / memory-pressure notice (S16)
 // moved to src/modules/sweep-container-health/index.ts (convergence seam 2,
@@ -2032,19 +2013,8 @@ function registerBuiltInSweepDuties(): void {
     },
   });
 
-  registerSweepDuty({
-    name: id.T13,
-    phase: 'tick:post-session',
-    order: 30,
-    // Reclaim disk from idle caches and Docker artifacts after per-session sweep
-    // work has had a chance to notice and wake due messages. Fire-and-forget
-    // into a persistent worker. The worker owns the expensive synchronous
-    // filesystem/Docker implementation and its cadence state; the host event
-    // loop stays available for channel heartbeats and inbound events.
-    run: (ctx) => {
-      startStorageMaintenanceOnce([...ctx.activeContainerSessionIds]);
-    },
-  });
+  // T13 (storage-maintenance, tick:post-session, order 30) moved to
+  // src/modules/sweep-storage/index.ts (S2-PR6).
 
   registerSweepDuty({
     name: id.T19,
