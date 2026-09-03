@@ -144,11 +144,19 @@ vi.mock('../orchestrator-dispatch/reconciler.js', async (importOriginal) => {
   const real = await importOriginal<typeof import('../orchestrator-dispatch/reconciler.js')>();
   return { ...real, runReconcilerSweep: vi.fn(real.runReconcilerSweep) };
 });
+// completeSpawnSideEffects is reconciler.ts's own action seam (queued via
+// setImmediate for each orphan) — wrapped, not replaced, purely so F-5.3's
+// "prove it bites" case can assert it fires with the seeded orphan's args.
+vi.mock('../orchestrator-dispatch/dispatch.js', async (importOriginal) => {
+  const real = await importOriginal<typeof import('../orchestrator-dispatch/dispatch.js')>();
+  return { ...real, completeSpawnSideEffects: vi.fn(real.completeSpawnSideEffects) };
+});
 
 import { autoArchiveOldCompleted } from './auto-archive.js';
 import { sweepTaskWatchdog } from './task-watchdog.js';
 import { runReconcilerSweep } from '../orchestrator-dispatch/reconciler.js';
 import { autoArchiveCompletedBefore } from '../orchestrator-dispatch/db/tasks.js';
+import { completeSpawnSideEffects } from '../orchestrator-dispatch/dispatch.js';
 // Registers T6/T14/T18 into host-sweep.ts's live registry — needed so the
 // registered-duty-wrapper cases below can obtain them by name, the same
 // accessor R-7 uses in src/host-sweep-registry.test.ts. Safe to import
@@ -603,19 +611,64 @@ describe('auto-archive covers completed tasks older than 24h and never failed ta
 });
 
 // ── F-5.3 — the dormant module takes no action when the spawn_task capability is revoked ──
-
+//
+// Codex MUST-FIX (efb8350a..e1e8955f, conf 0.94, accepted): the original
+// version of this suite mocked getActiveTasks/getOrphanedTasks to bare `[]`
+// with no seeded fixture — vacuously true (empty in, no calls out, for ANY
+// implementation, dormant or not) and blind to a re-activation regression.
+//
+// The real gate is upstream of both duties: `hasOrchestratorCapability`
+// (src/modules/orchestrator-dispatch/db/agent-group-capabilities.ts), checked
+// only inside `applySpawnTask` (dispatch.ts) — neither the reconciler nor the
+// watchdog reads it themselves; `getActiveTasks`/`getOrphanedTasks` are
+// unconditional table scans. So in production the tables are empty PURELY
+// because no row was ever admitted, not because either duty checks anything.
+// `getCapabilityConfig` (the one capability-shaped read the watchdog's own
+// body actually makes — for per-task timeout defaults, not a gate) reads the
+// same `agent_group_capabilities` table `hasOrchestratorCapability` does, so
+// it is null under the exact same "no grant" condition and is the closest
+// thing to an explicit capability signal available at this level.
+//
+// `capabilityGranted` below models that upstream admission gate directly: it
+// is the single switch every mock in this block reads, so "capability
+// revoked" is one explicit state, not scattered empty-array literals. Each
+// dormant case seeds a task that a LIVE watchdog/reconciler would act on
+// (timed-out progress; a completion-lease-expired orphan) and asserts every
+// downstream action seam saw zero calls. The "prove it bites" case flips the
+// switch and re-runs the SAME fixture, asserting those seams DO fire — proof
+// the dormant assertions are discriminating, not vacuous. Neither duty has
+// its own "skip"/dormant log line (there is nothing to skip — the loop body
+// just never executes), so there is no log assertion to add here; T18's own
+// internal-failure log line is already covered above.
 describe('the dormant module takes no action when the spawn_task capability is revoked', () => {
+  let capabilityGranted = false;
+
+  const eligibleActiveTask = makeTask({
+    task_id: 'would-be-reaped',
+    last_progress_at: new Date(NOW - 2 * 60 * 60 * 1000).toISOString(), // 2h stale — past default 30min
+  });
+  const eligibleOrphanedTask = { task_id: 'would-be-reconciled', parent_agent_group_id: 'parent-ag' };
+
   beforeEach(() => {
     vi.clearAllMocks();
-    // The capability-absent steady state: no agent group has ever admitted a
-    // task or an orphaned one, because spawn_task never fires
-    // (src/modules/orchestrator-dispatch/index.ts — PARKED 2026-08-11).
-    mockGetActiveTasks.mockReturnValue([]);
-    mockGetOrphanedTasks.mockReturnValue([]);
+    capabilityGranted = false;
+    mockGetActiveTasks.mockImplementation(() => (capabilityGranted ? [eligibleActiveTask] : []));
+    mockGetOrphanedTasks.mockImplementation(() => (capabilityGranted ? [eligibleOrphanedTask] : []));
+    mockGetCapabilityConfig.mockImplementation(() => (capabilityGranted ? { noProgressTimeoutSec: 1800 } : null));
+    mockGetSession.mockReturnValue(fakeParentSession());
+    mockTransitionToTerminal.mockReturnValue(true);
+    mockIsContainerRunning.mockReturnValue(true);
+    mockHasContainerEverRun.mockReturnValue(true);
+    mockPendingTerminalDispatchOutboundSeenAt.mockReturnValue(null);
+    mockWriteSessionMessage.mockResolvedValue(undefined);
+    mockWakeContainer.mockResolvedValue(true);
+    vi.mocked(completeSpawnSideEffects).mockClear();
   });
 
-  it('the watchdog reads the empty task table and changes nothing', async () => {
-    await sweepTaskWatchdog();
+  it('the watchdog acts on nothing: getActiveTasks is empty and every action seam sees zero calls', async () => {
+    const duty = getDuty('task-watchdog');
+
+    await duty.run(fakeTickContext());
 
     expect(mockGetActiveTasks).toHaveBeenCalled();
     expect(mockTransitionToTerminal).not.toHaveBeenCalled();
@@ -623,13 +676,38 @@ describe('the dormant module takes no action when the spawn_task capability is r
     expect(mockWakeContainer).not.toHaveBeenCalled();
   });
 
-  it('the reconciler reads the empty orphaned-task table and schedules nothing', () => {
-    // runReconcilerSweep is the real function (not mocked) — only its own
-    // getOrphanedTasks dependency is faked to the dormant-capability state.
-    // With no orphans it returns immediately, before ever touching
-    // completeSpawnSideEffects/setImmediate.
-    expect(() => runReconcilerSweep()).not.toThrow();
+  it('the reconciler acts on nothing: getOrphanedTasks is empty and no side effect is scheduled', async () => {
+    const duty = getDuty('orchestrator-reconciler');
+
+    duty.run(fakeTickContext());
+    await new Promise((resolve) => setImmediate(resolve)); // flush anything setImmediate would have queued
+
     expect(mockGetOrphanedTasks).toHaveBeenCalled();
+    expect(completeSpawnSideEffects).not.toHaveBeenCalled();
+  });
+
+  it('PROVES IT BITES: with the capability granted, the same fixture reaps the task and notifies the parent', async () => {
+    capabilityGranted = true;
+    const duty = getDuty('task-watchdog');
+
+    await duty.run(fakeTickContext());
+
+    expect(mockTransitionToTerminal).toHaveBeenCalledWith(
+      'would-be-reaped',
+      'failed',
+      expect.objectContaining({ fail_reason: 'no_progress_timeout' }),
+    );
+    expect(mockWriteSessionMessage).toHaveBeenCalled();
+  });
+
+  it('PROVES IT BITES: with the capability granted, the same fixture schedules the reconciler side effect', async () => {
+    capabilityGranted = true;
+    const duty = getDuty('orchestrator-reconciler');
+
+    duty.run(fakeTickContext());
+    await new Promise((resolve) => setImmediate(resolve));
+
+    expect(completeSpawnSideEffects).toHaveBeenCalledWith('would-be-reconciled', 'parent-ag');
   });
 });
 
