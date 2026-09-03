@@ -52,7 +52,9 @@ describe('no raw session-DB access or passed session handle outside the mailbox 
     expect(
       stale,
       stale.length > 0
-        ? `RATCHET.json entries that are no longer raw-DB offenders (deleted, or cleaned up but left in the allowlist) — remove them: ${stale.join(', ')}`
+        ? `${stale.join(', ')} no longer matches any raw-access pattern; remove ${
+            stale.length === 1 ? 'it' : 'them'
+          } from src/mailbox/RATCHET.json (the allowlist only shrinks)`
         : undefined,
     ).toEqual([]);
   });
