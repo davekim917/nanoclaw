@@ -144,7 +144,6 @@ vi.mock('../../session-manager.js', async (importOriginal) => {
     ...real,
     admitDueTaskContexts: (...args: unknown[]) => mockAdmitDueTaskContexts(...args),
     writeSessionMessage: async () => undefined,
-    outboundDbPath: real.outboundDbPath,
   };
 });
 

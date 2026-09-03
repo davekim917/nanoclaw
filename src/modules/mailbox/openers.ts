@@ -135,7 +135,7 @@ export function sessionDbPathIsGone(dbPath: string): boolean {
  * Reading one row of `sqlite_master` touches the same header, and it is closer
  * to what callers actually do with the handle anyway.
  */
-function assertQueryable(db: Database.Database, dbPath: string): void {
+export function assertQueryable(db: Database.Database, dbPath: string): void {
   try {
     db.prepare('SELECT 1 FROM sqlite_master LIMIT 1').get();
   } catch (err) {
@@ -221,6 +221,39 @@ export function openInboundDb(dbPath: string): Database.Database {
   };
   assertQueryable(db, dbPath);
   return db;
+}
+
+/**
+ * Open, run, close — with an ABSENT database answered as `undefined` rather
+ * than thrown, and every other failure left alone.
+ *
+ * The module has three existing-only funnels — the writable outbound session
+ * (`modules/mailbox/session.ts`) and the two read-only sessions
+ * (`read-only.ts`) — and each was repeating the same four moves: open, map
+ * `SessionDbMissingError` to absence, run the action, always close. One copy
+ * of that, here, next to the openers whose error contract it depends on.
+ *
+ * The `open` thunk is what varies: writable vs read-only, and which pragmas.
+ * The absence rule does not, and neither does the guarantee that a
+ * present-but-unopenable DB keeps throwing — a broken session must never read
+ * as an empty one.
+ */
+export function withOpenedSessionDb<T>(
+  open: () => Database.Database,
+  action: (db: Database.Database) => T,
+): T | undefined {
+  let db: Database.Database;
+  try {
+    db = open();
+  } catch (err) {
+    if (err instanceof SessionDbMissingError) return undefined;
+    throw err;
+  }
+  try {
+    return action(db);
+  } finally {
+    db.close();
+  }
 }
 
 /**

@@ -17,8 +17,6 @@ import { createHash } from 'crypto';
 import fs from 'fs';
 import path from 'path';
 
-import Database from 'better-sqlite3';
-
 import { randomUUID } from 'crypto';
 
 import { DATA_DIR, GROUPS_DIR } from '../../config.js';
@@ -27,16 +25,11 @@ import { getWorkgroupOnecliSecrets } from '../../db/agent-groups.js';
 import { getMessagingGroup } from '../../db/messaging-groups.js';
 import { getDb } from '../../db/connection.js';
 import { findSystemSession, taskThreadId } from '../../db/sessions.js';
-import { openInboundDb } from '../../db/session-db.js';
+import { readSessionInbound, type ScheduledTaskRow } from '../../modules/mailbox/index.js';
+import { withExistingMailboxSession } from '../../session-manager.js';
 import * as scheduledTasks from '../../db/scheduled-tasks.js';
 import { type TaskDef } from '../../db/scheduled-tasks.js';
-import {
-  cancelTask,
-  pauseTask,
-  restoreTaskRow,
-  updateTask,
-  type TaskRowSnapshot,
-} from '../../modules/scheduling/db.js';
+import { type TaskRowSnapshot } from '../../modules/scheduling/db.js';
 import { countLiveRowsInSessions } from '../../modules/scheduling/live-count.js';
 import { log } from '../../log.js';
 import { parseUtcTimestampMs } from '../../thread-context.js';
@@ -177,17 +170,10 @@ function isWired(agentGroupId: string, messagingGroupId: string): boolean {
 
 // ── Source live row (for scriptPresent + the execute snapshot) ──────────────────
 
-interface SourceLiveRow {
-  id: string;
-  status: string;
-  process_after: string | null;
-  recurrence: string | null;
-  content: string;
-  platform_id: string | null;
-  channel_type: string | null;
-  thread_id: string | null;
-  kind: string;
-}
+// Read through the mailbox module's named ops, so the row shape is the
+// module's. (The WRITE half of this flow still opens a raw inbound handle for
+// modules/scheduling/db.ts's task mutators — see the file header note.)
+type SourceLiveRow = ScheduledTaskRow;
 
 /**
  * Read the source series' live row. The result DISTINGUISHES three cases (ADV-S1,
@@ -209,33 +195,20 @@ function readSourceLiveRow(
   sessionId: string,
   seriesId: string,
 ): SourceLiveReadResult {
-  // Route through the containment-checked chokepoint (security re-QA SUGGESTION) so
-  // the preview READ path has the same traversal backstop as the execute path — a
-  // null (containment failure) is treated as "no live row" (→ no script in preview).
-  const inboundPath = sessionInboundPathFor(dataDir, agentGroupId, sessionId);
-  if (!inboundPath || !fs.existsSync(inboundPath)) return { unreadable: false, row: null };
-  let db: Database.Database | null = null;
   try {
-    db = new Database(inboundPath, { readonly: true });
-    db.pragma('busy_timeout = 1000');
-    const row =
-      (db
-        .prepare(
-          `SELECT id, status, process_after, recurrence, content, platform_id, channel_type, thread_id, kind
-             FROM messages_in
-            WHERE series_id = ? AND kind = 'task' AND status IN ('pending', 'paused')
-            ORDER BY seq DESC LIMIT 1`,
-        )
-        .get(seriesId) as SourceLiveRow | undefined) ?? null;
-    return { unreadable: false, row };
+    // Read-only seam: a move PREVIEW must never provision or migrate the
+    // session it is previewing (invariant I-4). The module applies the same
+    // canonicalize-and-contain check the pre-seam chokepoint did, so a
+    // locator that resolves outside data/v2-sessions — like a session with no
+    // mailbox — reads as "no live row", never as unreadable.
+    const row = readSessionInbound({ dataDir, agentGroupId, sessionId }, (mailbox) => mailbox.getLiveTaskRow(seriesId));
+    return { unreadable: false, row: row ?? null };
   } catch (err) {
     log.warn('scheduled-move: source live row read failed', {
       seriesId,
       err: err instanceof Error ? err.message : String(err),
     });
     return { unreadable: true, row: null };
-  } finally {
-    db?.close();
   }
 }
 
@@ -355,10 +328,6 @@ export const movePreviewHandler: AuthHandler = async (req, params, ctx) => {
 };
 
 // ── D2: execute handler ─────────────────────────────────────────────────────────
-
-function inboundPathOf(dataDir: string, agentGroupId: string, sessionId: string): string {
-  return path.join(dataDir, 'v2-sessions', agentGroupId, sessionId, 'inbound.db');
-}
 
 /** Map the source live-row status to the §4.0 health state the move guard needs. */
 function moveGuardState(status: string, processAfterMs: number | null, nowMs: number): HealthState {
@@ -549,15 +518,16 @@ export const moveExecuteHandler: AuthHandler = async (req, params, ctx) => {
   // Capture the touched count (E-2): the §2a guard already proved the source is
   // live, so a 0-touch cancel is unexpected — but if it happens, abort BEFORE
   // inserting the target so a no-op cancel can never leave a target-only series.
-  let cancelTouched = 0;
-  {
-    const srcDb = openInboundDb(sourceInbound);
-    try {
-      cancelTouched = cancelTask(srcDb, source.seriesId);
-    } finally {
-      srcDb.close();
-    }
-  }
+  //
+  // Existing-only (invariant I-10): the §2a guard just proved the source row
+  // is live, so the mailbox is there. `undefined` means it vanished under the
+  // guard, which reads as 0 touched and takes the abort branch below rather
+  // than inserting into the target — the same fail-safe direction the pre-seam
+  // open's throw had.
+  const cancelTouched =
+    (await withExistingMailboxSession(source.agentGroupId, source.sessionId, (mailbox) =>
+      mailbox.cancelTask(source.seriesId),
+    )) ?? 0;
   if (cancelTouched === 0) {
     // Nothing was cancelled (raced terminal/move between the guard and here) —
     // leave the intent unresolved for the recovery sweep and do NOT insert.
@@ -577,13 +547,20 @@ export const moveExecuteHandler: AuthHandler = async (req, params, ctx) => {
       );
       const tgtSessId = targetSessionIdFor(target.agentGroupId, source.seriesId);
       if (tgtSessId) {
-        const tgtDb = openInboundDb(inboundPathOf(dataDir, target.agentGroupId, tgtSessId));
-        try {
-          pauseTask(tgtDb, source.seriesId);
-          if (snapshot.process_after) updateTask(tgtDb, source.seriesId, { processAfter: snapshot.process_after });
-        } finally {
-          tgtDb.close();
-        }
+        // A DIFFERENT key from the source session above, and that session is
+        // closed by now — the two opens are sequential, never nested, which is
+        // what the same-key nesting guard (invariant I-3) forbids.
+        //
+        // `scheduleTask` just provisioned this mailbox, so `undefined` is a
+        // genuine fault: staging exists so the row is never simultaneously
+        // pending and due, and skipping it would land a paused move as
+        // pending. Throwing takes the restore path, as the pre-seam open did.
+        const staged = await withExistingMailboxSession(target.agentGroupId, tgtSessId, (mailbox) => {
+          mailbox.pauseTask(source.seriesId);
+          if (snapshot.process_after) mailbox.updateTask(source.seriesId, { processAfter: snapshot.process_after });
+          return true;
+        });
+        if (!staged) throw new Error(`target task session ${tgtSessId} has no inbound mailbox to stage into`);
       }
     } else {
       await scheduledTasks.scheduleTask(taskDefFromSnapshot(snapshot, source.seriesId, target.agentGroupId, targetMg));
@@ -608,13 +585,11 @@ export const moveExecuteHandler: AuthHandler = async (req, params, ctx) => {
         source.seriesId,
       );
       if (!live.unreadable && live.count === 0) {
-        const srcDb = openInboundDb(sourceInbound);
-        try {
-          restoreTaskRow(srcDb, restoreSnapshot);
-          restored = true;
-        } finally {
-          srcDb.close();
-        }
+        restored =
+          (await withExistingMailboxSession(source.agentGroupId, source.sessionId, (mailbox) => {
+            mailbox.restoreTaskRow(restoreSnapshot);
+            return true;
+          })) ?? false;
       }
     } catch (restoreErr) {
       log.error('scheduled-move: source restore ALSO failed', {

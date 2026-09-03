@@ -65,7 +65,7 @@ it('runs reconciliation only after runtime and strict absence proof succeed', ()
 it('admits pending upgrade contexts after memory cutover and before any runtime can wake', () => {
   const source = fs.readFileSync(path.resolve('src/main.ts'), 'utf8');
   const memoryCutover = source.indexOf('const memoryReports = runWorkgroupMemoryStartupGate(db);');
-  const pendingUpgrade = source.indexOf('const pendingUpgrade = reconcilePendingUpgradeContexts(');
+  const pendingUpgrade = source.indexOf('const pendingUpgrade = await reconcilePendingUpgradeContexts(');
   const dashboard = source.indexOf('startDashboard();');
   const channels = source.indexOf('await initChannelAdapters(');
 

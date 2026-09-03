@@ -49,7 +49,7 @@ import {
   createMessagingGroupAgent,
 } from './db/index.js';
 import { findSessionForAgent, createSession } from './db/sessions.js';
-import { inboundDbPath } from './session-manager.js';
+import { inboundDbPath } from './mailbox/sqlite/paths.js';
 import { archiveMessage } from './message-archive.js';
 import { buildThreadContextBlock, THREAD_CONTEXT_LIMIT } from './thread-context.js';
 import type { ChannelAdapter, InboundEvent } from './channels/adapter.js';

@@ -171,6 +171,24 @@ export function upsertSessionRouting(
   });
 }
 
+/**
+ * Record which dispatched task owns this session, leaving the chat routing
+ * columns alone.
+ *
+ * Distinct from {@link upsertSessionRouting}, which REPLACES channel_type,
+ * platform_id and thread_id with what the caller passed: the dispatcher knows
+ * the task id and nothing about the session's chat destination, so writing
+ * through the full upsert would null a routed session's destination.
+ */
+export function setSessionRoutingSpawnTaskId(db: Database.Database, taskId: string): void {
+  migrateSessionRoutingTable(db);
+  db.prepare(
+    `INSERT INTO session_routing (id, spawn_task_id)
+     VALUES (1, ?)
+     ON CONFLICT(id) DO UPDATE SET spawn_task_id = excluded.spawn_task_id`,
+  ).run(taskId);
+}
+
 export interface SessionRouting {
   channel_type: string | null;
   platform_id: string | null;

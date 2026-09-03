@@ -41,33 +41,14 @@
  * (usage_daily is an additive upsert over a watermark, so it never sees a
  * turn's rows together) and would silently redefine an existing column.
  */
-import type Database from 'better-sqlite3';
-
-import { getDb, hasTable } from './connection.js';
+import { getDb } from './connection.js';
 import { log } from '../log.js';
+import type { NanoclawMailboxSession } from '../modules/mailbox/index.js';
 
-interface TurnUsageRow {
-  id: number;
-  ts: string;
-  provider: string;
-  model: string | null;
-  input_tokens: number | null;
-  output_tokens: number | null;
-  cache_read_tokens: number | null;
-  cache_write_tokens: number | null;
-  cost_usd: number | null;
-  // Added after the columns above (Phase 0.1 follow-up) — a row rolled up
-  // from a container that predates them arrives with these keys absent
-  // entirely (not present on the object at all, since `SELECT *` only
-  // returns columns that exist), so every read below goes through `??`.
-  steps?: number | null;
-  duration_ms?: number | null;
-  trigger?: string | null;
-  rate_limit_type?: string | null;
-  rate_limit_utilization?: number | null;
-  rate_limit_resets_at?: string | null;
-  turn_id?: string | null;
-}
+// The per-turn row shape is the mailbox module's — it owns the session-DB
+// shape, and `listTurnUsageSince` is what this file reads it through. Its
+// optional fields postdate the original table, so a row from an older
+// container arrives without those keys and every read below goes through `??`.
 
 export interface UsageDailyRow {
   date: string;
@@ -120,18 +101,27 @@ function getWatermark(sessionDirKey: string): number {
 
 /**
  * Roll a session's new turn_usage rows (id > watermark) into usage_daily and
- * advance the watermark, in one central-DB transaction. `outDb` is a
- * read-only handle the caller opens/closes — never written here, respecting
- * the outbound.db single-writer split (host reads outbound.db, never writes
- * it). Missing table, empty result, or an already-caught-up watermark are all
- * the normal "nothing to do" case, not an error. Returns the row count rolled
- * up.
+ * advance the watermark, in one central-DB transaction.
+ *
+ * Takes the session's MAILBOX, not a raw outbound handle: the module owns
+ * every session-DB statement, and `listTurnUsageSince` is the named read this
+ * rollup needs (docs/specs/upstream-mailbox-seam/plan.md I-2, and the ratchet
+ * pattern that forbids a passed handle). Only the read op is required, so that
+ * is all the parameter asks for — the sweep passes its whole session and a
+ * test passes just this one op.
+ *
+ * Nothing is written to outbound.db here, which is the single-writer split
+ * (the container writes it, the host reads it). Missing table, empty result,
+ * or an already-caught-up watermark are all the normal "nothing to do" case,
+ * not an error. Returns the row count rolled up.
  */
-export function rollupSessionUsage(outDb: Database.Database, agentGroupId: string, sessionDirKey: string): number {
-  if (!hasTable(outDb, 'turn_usage')) return 0;
-
+export function rollupSessionUsage(
+  mailbox: Pick<NanoclawMailboxSession, 'listTurnUsageSince'>,
+  agentGroupId: string,
+  sessionDirKey: string,
+): number {
   const watermark = getWatermark(sessionDirKey);
-  const rows = outDb.prepare('SELECT * FROM turn_usage WHERE id > ? ORDER BY id ASC').all(watermark) as TurnUsageRow[];
+  const rows = mailbox.listTurnUsageSince(watermark);
   if (rows.length === 0) return 0;
 
   // sessionDirKey is the fixed `<agent-group>/<session>` contract (see the

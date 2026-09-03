@@ -61,11 +61,19 @@ vi.mock('./channels/channel-registry.js', () => ({
   hasDeclaredChannelDefaults: vi.fn(() => false),
 }));
 
+// The router's two direct outbound writes (command denial, flag confirmation)
+// go through the mailbox seam now. The stub session carries only the one op
+// they use, so an assertion on `writeOutboundDirect` still names exactly the
+// write the router performed.
+const writeOutboundDirect = vi.hoisted(() => vi.fn());
 vi.mock('./session-manager.js', () => ({
   resolveSession: vi.fn(),
   sessionMessageExists: vi.fn(() => false),
   writeSessionMessageIfNew: vi.fn(async () => true),
-  writeOutboundDirect: vi.fn(),
+  withExistingMailboxSession: vi.fn(
+    async (_agentGroupId: string, _sessionId: string, action: (mailbox: unknown) => unknown) =>
+      action({ writeOutboundDirect }),
+  ),
 }));
 
 vi.mock('./container-runner.js', () => ({
@@ -138,7 +146,7 @@ import {
   createMessagingGroupAgent,
 } from './db/messaging-groups.js';
 import { getDb } from './db/connection.js';
-import { writeSessionMessageIfNew, writeOutboundDirect, resolveSession } from './session-manager.js';
+import { writeSessionMessageIfNew, resolveSession } from './session-manager.js';
 import { wakeContainer } from './container-runner.js';
 import { getSession } from './db/sessions.js';
 import { isAnyAdmin } from './modules/permissions/db/user-roles.js';

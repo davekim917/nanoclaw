@@ -17,7 +17,8 @@ vi.mock('../../config.js', async () => {
 const TEST_DIR = '/tmp/nanoclaw-test-scheduled-wake';
 
 import { getDeliveryAction } from '../../delivery.js';
-import { inboundDbPath, initSessionFolder } from '../../session-manager.js';
+import { initSessionFolder } from '../../session-manager.js';
+import { inboundDbPath } from '../../mailbox/sqlite/paths.js';
 import type { Session } from '../../types.js';
 import { applyScheduleWake } from './index.js';
 

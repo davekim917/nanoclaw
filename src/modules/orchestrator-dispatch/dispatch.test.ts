@@ -15,6 +15,14 @@ import { computeRequestHash } from './derive-task-id.js';
 import { applySpawnTask, completeSpawnSideEffects } from './dispatch.js';
 import type { Session } from '../../types.js';
 
+const hostSpawnStampMock = vi.hoisted(() => vi.fn());
+// Hoisted so a test can assert WHICH seam the stamp went through. The
+// distinction is the whole point of the fix: `withExistingMailboxSession`
+// skips a half-provisioned child (`exists()` wants BOTH mailbox files) and
+// drops the stamp silently.
+const hostProvisioningSessionMock = vi.hoisted(() => vi.fn());
+const hostExistingSessionMock = vi.hoisted(() => vi.fn());
+
 // ── Mock side-effecting modules ──────────────────────────────────────────────
 vi.mock('../../session-manager.js', async (importOriginal) => {
   const real = await importOriginal<typeof import('../../session-manager.js')>();
@@ -38,8 +46,20 @@ vi.mock('../../session-manager.js', async (importOriginal) => {
         created: true,
       })),
     writeSessionRouting: vi.fn(),
-    inboundDbPath: vi.fn().mockReturnValue('/tmp/nonexistent-inbound.db'),
-    openInboundDb: vi.fn(),
+    // The dispatcher stamps `spawn_task_id` through the PROVISIONING
+    // `withMailboxSession` (mailbox seam, PR 6), so the real one would CREATE
+    // `<DATA_DIR>/v2-sessions/<ag>/<session>/` on disk for every fixture
+    // session these tests invent — in an existing install, that is a real
+    // mailbox directory this suite has no business writing to, and nothing
+    // here would clean it up. Stubbed to run the action against a recording
+    // session instead: the stamp is still exercised, on nothing.
+    withMailboxSession: hostProvisioningSessionMock.mockImplementation(
+      async (_agentGroupId: string, _sessionId: string, action: (m: unknown) => unknown) =>
+        action({ setSessionRoutingSpawnTaskId: hostSpawnStampMock }),
+    ),
+    // Recorded, never implemented: nothing on this path may take the
+    // non-provisioning seam, and a test asserts it stayed uncalled.
+    withExistingMailboxSession: hostExistingSessionMock.mockResolvedValue(undefined),
   };
 });
 
@@ -637,6 +657,53 @@ describe('completeSpawnSideEffects', () => {
     if (writeIdx !== -1 && wakeIdx !== -1) {
       expect(writeIdx).toBeLessThan(wakeIdx);
     }
+  });
+
+  // A child interrupted partway through provisioning has inbound.db and no
+  // outbound.db, and `exists()` calls that ABSENT because a mailbox is both
+  // files. Taking the non-provisioning seam here therefore drops the
+  // spawn_task_id stamp silently, and the child then runs with no way for
+  // `mountSpawnTools()` to give it progress or completion tools — while the
+  // `writeSessionMessage` one line later provisions the missing file anyway.
+  // Asserting the SEAM, not the file, is what makes this a regression guard
+  // that survives the suite no longer touching disk at all.
+  it('stamps spawn_task_id through the provisioning mailbox seam, never the existing-only one', async () => {
+    setupDb();
+    seedAgentGroup('ag-caller');
+    seedSession('sess-caller', 'ag-caller');
+    // The child row the mocked `resolveSession` claims to have created. Without
+    // it the tasks UPDATE fails its child_session_id foreign key and the whole
+    // headless path aborts into a swallowed catch — which is how the
+    // write-order test above passes while never reaching the code it names.
+    // Inserted directly rather than via `seedSession`: that helper's
+    // `INSERT OR IGNORE` is silently dropped here, because a second row with
+    // the same (agent_group_id, messaging_group_id, thread_id) collides with
+    // `sess-caller` on the sessions unique index.
+    getDb()
+      .prepare(
+        `INSERT INTO sessions (id, agent_group_id, messaging_group_id, thread_id, created_at)
+         VALUES ('child-sess-ag-caller', 'ag-caller', NULL, 'task-stamp-seam', ?)`,
+      )
+      .run(now());
+    hostSpawnStampMock.mockClear();
+    hostProvisioningSessionMock.mockClear();
+    hostExistingSessionMock.mockClear();
+
+    const taskId = 'task-stamp-seam';
+    getDb()
+      .prepare(
+        `INSERT INTO tasks (task_id, idempotency_key, parent_session_id, parent_agent_group_id,
+          status, task_content, request_hash, admitted_at, surface_mode,
+          dispatch_completion_attempts, created_at)
+         VALUES (?, 'ik', 'sess-caller', 'ag-caller', 'pending', 'do x', 'hash', ?, 'headless', 0, ?)`,
+      )
+      .run(taskId, now(), now());
+
+    await completeSpawnSideEffects(taskId, 'ag-caller');
+
+    expect(hostProvisioningSessionMock).toHaveBeenCalledWith('ag-caller', 'child-sess-ag-caller', expect.any(Function));
+    expect(hostExistingSessionMock).not.toHaveBeenCalled();
+    expect(hostSpawnStampMock).toHaveBeenCalledWith(taskId);
   });
 });
 

@@ -657,33 +657,33 @@ describe('migrate-workgroup-memory', () => {
     expect(fs.existsSync(path.join(dataDir, 'workgroups', 'beta', 'memory'))).toBe(false);
   });
 
-  it('returns CLI failure after reporting a blocked workgroup', () => {
+  it('returns CLI failure after reporting a blocked workgroup', async () => {
     const source = path.join(groupsDir, 'alpha', 'memory');
     fs.mkdirSync(source);
     fs.writeFileSync(path.join(source, 'fact.md'), 'before\n');
     inventory();
 
-    expect(() =>
+    await expect(
       runCli(['apply', '--report', reportPath], {
         ...quiescent,
         afterSnapshot: () => {
           fs.writeFileSync(path.join(source, 'fact.md'), 'after\n');
         },
       }),
-    ).toThrow(/apply blocked for workgroup\(s\): alpha/);
+    ).rejects.toThrow(/apply blocked for workgroup\(s\): alpha/);
 
     const result = readMigrationReport(reportPath).workgroups[0];
     expect(result.status).toBe('blocked');
     expect(result.error).toMatch(/changed after snapshot/i);
   });
 
-  it('returns CLI failure when rollback is blocked and retains the report', () => {
+  it('returns CLI failure when rollback is blocked and retains the report', async () => {
     inventory();
     const report = readMigrationReport(reportPath);
     report.workgroups[0].status = 'applied';
     fs.writeFileSync(reportPath, `${JSON.stringify(report, null, 2)}\n`);
 
-    expect(() => runCli(['rollback', '--report', reportPath], quiescent)).toThrow(
+    await expect(runCli(['rollback', '--report', reportPath], quiescent)).rejects.toThrow(
       /rollback blocked for workgroup\(s\): alpha/,
     );
 

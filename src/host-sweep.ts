@@ -42,6 +42,7 @@ import { getActiveSessions, getSession, isTaskThread, updateSession } from './db
 import { getAgentGroup } from './db/agent-groups.js';
 import {
   SessionDbMissingError,
+  readSessionOutbound,
   SessionDbUnopenableError,
   sessionMailboxPath,
   type ForkContainerStateRow as ContainerState,
@@ -49,11 +50,6 @@ import {
 } from './modules/mailbox/index.js';
 import { withExistingNanoclawSession } from './modules/mailbox/session.js';
 import type { HostWorkContinuation } from './modules/mailbox/ops/continuation.js';
-// The scheduled-move recovery below walks an INJECTED sessions root, not
-// DATA_DIR, so its session DBs are not addressable by a mailbox key and it
-// cannot go through the seam. It stays on the module's own open funnel — the
-// one place in this file that still opens a session DB by path.
-import { openInboundDb as openInboundDbByPath, openOutboundDb } from './modules/mailbox/openers.js';
 import { restoreTaskRow, type TaskRowSnapshot } from './modules/scheduling/db.js';
 import { countLiveRowsInSessions } from './modules/scheduling/live-count.js';
 import { runHostGatedTaskScripts } from './modules/scheduling/host-script.js';
@@ -1384,17 +1380,15 @@ async function prepareDueWake(
   // on the host BEFORE admission, so a gated/errored fire never becomes due
   // and never spawns a container. See host-script.ts's runHostGatedTaskScripts.
   //
-  // `runHostGatedTaskScripts` takes this session (mailbox seam PR 4): it is a
-  // sweep callee with no other production caller, and a SESSION parameter is
-  // the seam's sanctioned object — invariant I-9 forbids handing out raw
-  // handles, not sessions, so the callee stays off the ratchet's allowlist.
-  // It can spend the full pre-task timeout per row, so the session is held
-  // across that work exactly as it was when this line passed a raw handle.
-  // `admitDueTaskContexts` still takes one: it lives in `session-manager.ts`
-  // and moves behind the seam in PR 7. `legacyInboundHandle` survives here for
-  // that one call and nothing else.
+  // `runHostGatedTaskScripts` and `admitDueTaskContexts` both take this
+  // session: they are sweep callees with no other production caller, and a
+  // SESSION parameter is the seam's sanctioned object — invariant I-9 forbids
+  // handing out raw handles, not sessions, so neither callee lands on the
+  // ratchet's allowlist. The script runner can spend the full pre-task timeout
+  // per row, so the session is held across that work exactly as it was when
+  // these lines passed a raw handle.
   await runHostGatedTaskScripts(mailbox, sessionId);
-  const admittedTasks = admitDueTaskContexts(mailbox.legacyInboundHandle(), agentGroupId, sessionId);
+  const admittedTasks = admitDueTaskContexts(mailbox, agentGroupId, sessionId);
   const dueCount = mailbox.countDueMessages();
   return {
     admittedTasks,
@@ -1493,7 +1487,7 @@ function parseIntentDetail(detailJson: string | null): ParsedIntentDetail {
  *
  * Autonomous, not just observable. Additive — no firing-path change (C1).
  */
-export function recoverMoveIntents(centralDb: Database.Database, options: MoveRecoveryOptions): void {
+export async function recoverMoveIntents(centralDb: Database.Database, options: MoveRecoveryOptions): Promise<void> {
   const nowMs = options.nowMs ?? Date.now();
   const dataDir = options.dataDir ?? path.dirname(sessionsBaseDir());
   const sessionsRoot = options.dataDir ? path.join(options.dataDir, 'v2-sessions') : sessionsBaseDir();
@@ -1592,42 +1586,56 @@ export function recoverMoveIntents(centralDb: Database.Database, options: MoveRe
       continue;
     }
     const snapshot = detail.snapshot;
-    let db: Database.Database | null = null;
+    let outcome: 'restored' | 'deferred' | undefined;
     try {
-      db = openInboundDbByPath(inboundPath);
-      // Idempotency re-check: the restore + the resolved_at stamp span two DB
-      // files (not atomic), so re-confirm a readable zero-live IMMEDIATELY before
-      // insert. An unreadable re-check defers (never restore on unknown).
-      const recheck = countLiveRowsInSessions(dataDir, [source, target], intent.series_id);
-      if (recheck.unreadable) {
-        log.warn('scheduled-move-recovery: re-check unreadable — deferring restore', {
-          seriesId: intent.series_id,
-        });
-        continue;
-      }
-      if (recheck.count === 0) {
-        restoreTaskRow(db, {
-          // Fresh id — the cancelled source row may still hold the snapshot id.
-          id: `task-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-          series_id: snapshot.series_id,
-          status: snapshot.status,
-          process_after: snapshot.process_after,
-          recurrence: snapshot.recurrence,
-          content: snapshot.content,
-          platform_id: snapshot.platform_id,
-          channel_type: snapshot.channel_type,
-          thread_id: snapshot.thread_id,
-          kind: snapshot.kind,
-        });
-      }
+      // Existing-only: the existsSync above already answered "is there a
+      // session to restore into", and a recovery pass must never re-provision
+      // one it has just been told is gone (invariant I-10).
+      outcome = await withExistingNanoclawSession(intent.agent_group_id, intent.session_id, (mailbox) => {
+        // Idempotency re-check: the restore + the resolved_at stamp span two DB
+        // files (not atomic), so re-confirm a readable zero-live IMMEDIATELY before
+        // insert. An unreadable re-check defers (never restore on unknown).
+        const recheck = countLiveRowsInSessions(dataDir, [source, target], intent.series_id);
+        if (recheck.unreadable) return 'deferred' as const;
+        if (recheck.count === 0) {
+          mailbox.restoreTaskRow({
+            // Fresh id — the cancelled source row may still hold the snapshot id.
+            id: `task-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+            series_id: snapshot.series_id,
+            status: snapshot.status,
+            process_after: snapshot.process_after,
+            recurrence: snapshot.recurrence,
+            content: snapshot.content,
+            platform_id: snapshot.platform_id,
+            channel_type: snapshot.channel_type,
+            thread_id: snapshot.thread_id,
+            kind: snapshot.kind,
+          });
+        }
+        return 'restored' as const;
+      });
     } catch (err) {
       log.error('scheduled-move-recovery: restore failed', {
         seriesId: intent.series_id,
         err: err instanceof Error ? err.message : String(err),
       });
       continue;
-    } finally {
-      db?.close();
+    }
+    if (outcome === undefined) {
+      // The mailbox went away between the existsSync above and the open. The
+      // pre-seam open threw here and landed in the catch; same outcome, said
+      // out loud rather than as an exception.
+      log.error('scheduled-move-recovery: restore failed', {
+        seriesId: intent.series_id,
+        err: 'source inbound mailbox vanished before the restore',
+      });
+      continue;
+    }
+    if (outcome === 'deferred') {
+      log.warn('scheduled-move-recovery: re-check unreadable — deferring restore', {
+        seriesId: intent.series_id,
+      });
+      continue;
     }
     // Stamp + purge AFTER the restore (so a crash before this makes the next
     // pass re-evaluate; now a live row exists → it stamps without re-restoring).
@@ -1916,21 +1924,31 @@ async function sweepUsageRollup(sessions: readonly Session[]): Promise<void> {
       }
       if (shouldSkipUsageRollup(usageRollupMtimeCache.get(session.id), mtimeMs)) continue;
 
-      // Read through the module's own outbound funnel, NOT the mailbox
-      // session. This projection touches outbound.db only, and the seam's
-      // existence check is keyed on inbound.db — routing it through a session
-      // added a gate the pre-seam code never had, so a session whose
-      // inbound.db is gone while outbound.db remains stopped being rolled up
-      // at all, and its turn_usage rows would never reach the central totals.
-      // `outPath` above is already the gate that belongs here: no outbound
-      // file, no rollup. Same funnel `worktree-cleanup.ts` and the GC use, so
-      // there is still one implementation of every statement.
-      const outDb = openOutboundDb(outPath);
-      try {
-        rollupSessionUsage(outDb, session.agent_group_id, `${session.agent_group_id}/${session.id}`);
-      } finally {
-        outDb.close();
-      }
+      // Read through the module's OUTBOUND read session, not a mailbox
+      // session. The seam's existence check is keyed on inbound.db, and gating
+      // a pure outbound projection on that stranded the turn_usage rows of any
+      // session whose inbound.db was gone (mailbox seam PR 5). `outPath` above
+      // is already the gate that belongs here: no outbound file, no rollup.
+      //
+      // The two options restate what the read-write outbound funnel does, so
+      // this keeps PR 5's behavior exactly: the write path's 5s busy_timeout,
+      // and the hot-journal rollback without which a SIGKILLed container's
+      // outbound.db is unreadable forever. `readSessionOutbound` carries the
+      // same `assertQueryable` classification, so a present-but-unopenable DB
+      // raises SessionDbUnopenableError here just as the opener would.
+      //
+      // `rollupSessionUsage` asks for only the op it uses (mailbox seam PR 6),
+      // and the read session exposes exactly that op.
+      const rolled = readSessionOutbound(
+        { agentGroupId: session.agent_group_id, sessionId: session.id },
+        (mailbox) => {
+          rollupSessionUsage(mailbox, session.agent_group_id, `${session.agent_group_id}/${session.id}`);
+          return true;
+        },
+        { busyTimeoutMs: 5000, recoverJournal: true },
+      );
+      // Only a rollup that RAN may claim this mtime as processed.
+      if (!rolled) continue;
       usageRollupMtimeCache.set(session.id, mtimeMs);
     } catch (err) {
       log.warn('Usage rollup failed for session', { err, sessionId: session.id });
@@ -2381,7 +2399,7 @@ function resetStuckProcessingRows(mailbox: NanoclawMailboxSession, session: Sess
     } else {
       const backoffMs = BACKOFF_BASE_MS * Math.pow(2, msg.tries);
       const backoffSec = Math.floor(backoffMs / 1000);
-      deferMessageForFreshContextRetry(mailbox.legacyInboundHandle(), msg.id, backoffSec);
+      deferMessageForFreshContextRetry(mailbox, msg.id, backoffSec);
       log.info('Reset stale message with backoff', {
         messageId: msg.id,
         tries: msg.tries,
@@ -2807,9 +2825,9 @@ function registerBuiltInSweepDuties(): void {
     // move intents. Additive (same pattern as the recurrence hook); touches only
     // scheduled_audit (central) + the move's own session inbound rows — no
     // firing-path change (C1).
-    run: () => {
+    run: async () => {
       try {
-        recoverMoveIntents(getDb(), {});
+        await recoverMoveIntents(getDb(), {});
       } catch (err) {
         log.warn('scheduled-move-recovery: sweep hook failed', { err });
       }

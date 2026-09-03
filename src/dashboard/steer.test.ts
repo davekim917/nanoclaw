@@ -7,7 +7,7 @@ import type { AuthedRequestContext } from './router.js';
 
 // These imports resolve AFTER vi.mock hoisting — they are the vi.fn() instances.
 import { writeSessionMessage as _wsmRaw } from '../session-manager.js';
-import { sessionInboundHasMessage as _sihmRaw } from '../db/session-db.js';
+import { readSessionInbound as _rsiRaw } from '../modules/mailbox/read-only.js';
 import { wakeContainer as _wcRaw } from '../container-runner.js';
 import { getChannelAdapter as _gcaRaw } from '../channels/channel-registry.js';
 import { getMessagingGroup as _gmgRaw } from '../db/messaging-groups.js';
@@ -15,7 +15,7 @@ import { emitDashboardEvent as _edeRaw } from './api/events.js';
 
 // Typed as mocks for use in test assertions / setup
 const mockWriteSessionMessage = vi.mocked(_wsmRaw);
-const mockSessionInboundHasMessage = vi.mocked(_sihmRaw);
+const mockReadSessionInbound = vi.mocked(_rsiRaw);
 const mockWakeContainer = vi.mocked(_wcRaw);
 const mockGetChannelAdapter = vi.mocked(_gcaRaw);
 const mockGetMessagingGroup = vi.mocked(_gmgRaw);
@@ -34,8 +34,18 @@ vi.mock('../session-manager.js', () => ({
   writeSessionRouting: vi.fn(),
 }));
 
-vi.mock('../db/session-db.js', () => ({
-  sessionInboundHasMessage: vi.fn().mockReturnValue(false),
+// The steer write path's partial-write probe reads through the mailbox
+// module's read-only seam (PR 6); mocked at the seam, not at a raw opener.
+vi.mock('../modules/mailbox/read-only.js', () => ({
+  readSessionInbound: vi.fn().mockReturnValue(false),
+  readSessionOutbound: vi.fn().mockReturnValue(undefined),
+}));
+
+// The sweep-family ops the steer path reaches transitively. Mocked at the op
+// family rather than at the deleted `db/session-db.js` façade (mailbox seam
+// PR 7) — same statements, one module further in.
+vi.mock('../modules/mailbox/ops/sweep.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../modules/mailbox/ops/sweep.js')>()),
   syncProcessingAcks: vi.fn(),
   countDueMessages: vi.fn().mockReturnValue(0),
   getProcessingClaims: vi.fn().mockReturnValue([]),
@@ -152,8 +162,8 @@ describe('applySessionSteer — C5', () => {
     _resetRateLimitForTesting();
     mockWriteSessionMessage.mockReset();
     mockWriteSessionMessage.mockResolvedValue(undefined);
-    mockSessionInboundHasMessage.mockReset();
-    mockSessionInboundHasMessage.mockReturnValue(false);
+    mockReadSessionInbound.mockReset();
+    mockReadSessionInbound.mockReturnValue(false);
     mockWakeContainer.mockReset();
     mockWakeContainer.mockResolvedValue(true);
     mockGetChannelAdapter.mockReset();
