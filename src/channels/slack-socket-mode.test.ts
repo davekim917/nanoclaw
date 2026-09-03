@@ -99,6 +99,42 @@ describe('parseSlackWorkspaces — each mode needs only its own second credentia
   });
 });
 
+describe('one env load, so no second reader can miss a mode', () => {
+  /**
+   * backlog-canvas had its own copy of the env regex; the copy predated
+   * APP_TOKEN, so a Socket Mode workspace looked credential-less to it while
+   * working fine for the adapter. Both now go through loadSlackWorkspaces.
+   */
+  it('exposes a Socket Mode workspace to every caller of loadSlackWorkspaces', async () => {
+    vi.resetModules();
+    env.values = { SLACK_BOT_TOKEN_EXAMPLE_LABS: 'xoxb-labs', SLACK_APP_TOKEN_EXAMPLE_LABS: 'xapp-labs' };
+    const { loadSlackWorkspaces } = await import('./slack.js');
+    expect(loadSlackWorkspaces()).toEqual([
+      { channelType: 'slack-example-labs', botToken: 'xoxb-labs', appToken: 'xapp-labs' },
+    ]);
+  });
+
+  it('is the only place the Slack env pattern is written down', async () => {
+    const { readFileSync, readdirSync } = await import('node:fs');
+    const { join } = await import('node:path');
+    const root = new URL('../', import.meta.url).pathname;
+    const offenders: string[] = [];
+    const walk = (dir: string): void => {
+      for (const entry of readdirSync(dir, { withFileTypes: true })) {
+        const full = join(dir, entry.name);
+        if (entry.isDirectory()) {
+          walk(full);
+        } else if (entry.name.endsWith('.ts') && !entry.name.endsWith('.test.ts')) {
+          if (full.endsWith('channels/slack.ts')) continue;
+          if (/SLACK_\(BOT_TOKEN\|SIGNING_SECRET/.test(readFileSync(full, 'utf8'))) offenders.push(full);
+        }
+      }
+    };
+    walk(root);
+    expect(offenders).toEqual([]);
+  });
+});
+
 describe('the app token selects Socket Mode at adapter construction', () => {
   it('builds a socket adapter for a Socket Mode workspace', async () => {
     const configs = await bootWith({ SLACK_BOT_TOKEN: 'xoxb-p', SLACK_APP_TOKEN: 'xapp-p' });

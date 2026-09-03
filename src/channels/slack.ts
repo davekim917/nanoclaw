@@ -437,6 +437,20 @@ export function declarationOnlySlackTypes(env: Record<string, string>): string[]
   return types;
 }
 
+/**
+ * The env keys a Slack workspace is assembled from. ONE definition, because a
+ * second copy is how Socket Mode broke `backlog-canvas`: it had its own
+ * regex, that regex predated `APP_TOKEN`, and a socket workspace therefore
+ * looked credential-less to it while working fine for the adapter.
+ */
+const SLACK_ENV_PATTERN = /^SLACK_(BOT_TOKEN|SIGNING_SECRET|APP_TOKEN)(_[A-Za-z0-9_]+)?$/;
+
+/** Every configured Slack workspace, read from `.env`. The one entry point —
+ *  callers outside this module must not re-derive the env pattern. */
+export function loadSlackWorkspaces(): SlackWorkspace[] {
+  return parseSlackWorkspaces(readEnvFileMatching(SLACK_ENV_PATTERN));
+}
+
 /** Minimal interface for the Slack chat.postMessage client — narrow surface for testing. */
 export interface SlackPostMessageClient {
   chat: {
@@ -492,12 +506,13 @@ export async function slackCreateThread(
   return { threadId: parentMessageId, messageId: reply.ts as string };
 }
 
-// Keep the pre-filter regex in sync with the suffix regex inside
-// parseSlackWorkspaces — both must allow `_` in the suffix, otherwise
-// env vars like SLACK_BOT_TOKEN_EXAMPLE_LABS_CODEX get dropped here before
-// they ever reach the parser, and both must list APP_TOKEN or a Socket Mode
-// workspace looks credential-less.
-const slackEnv = readEnvFileMatching(/^SLACK_(BOT_TOKEN|SIGNING_SECRET|APP_TOKEN)(_[A-Za-z0-9_]+)?$/);
+// Keep SLACK_ENV_PATTERN in sync with the suffix regex inside
+// parseSlackWorkspaces — both must allow `_` in the suffix, otherwise env vars
+// like SLACK_BOT_TOKEN_EXAMPLE_LABS_CODEX get dropped before they ever reach
+// the parser, and both must list APP_TOKEN or a Socket Mode workspace looks
+// credential-less. Read once here (rather than via loadSlackWorkspaces) so the
+// raw env dict is also available to declarationOnlySlackTypes below.
+const slackEnv = readEnvFileMatching(SLACK_ENV_PATTERN);
 const workspaces = parseSlackWorkspaces(slackEnv);
 
 // Declaration-only registrations run BEFORE the live ones so a complete

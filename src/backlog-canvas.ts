@@ -52,8 +52,7 @@ import { readClaims, renderClaims } from './claims-board.js';
 import { readContainerConfig } from './container-config.js';
 import { getAllAgentGroups } from './db/agent-groups.js';
 import { getMessagingGroup } from './db/messaging-groups.js';
-import { readEnvFileMatching } from './env.js';
-import { extractSlackChannelId, parseSlackWorkspaces } from './channels/slack.js';
+import { extractSlackChannelId, loadSlackWorkspaces } from './channels/slack.js';
 import { slackPermalink } from './channels/slack-mentions.js';
 import { onHostShutdown, onHostStart } from './host-lifecycle.js';
 import { log } from './log.js';
@@ -274,10 +273,11 @@ async function refreshBoard(
   log.info('Backlog canvas refreshed', { channelId, team, issues: issues.length, claims: claims.length });
 }
 
-/** Bot token for a channel type, from the same env parse the adapter uses. */
+/** Bot token for a channel type, from the same env load the adapter uses —
+ *  never a second regex, which is how this reader missed Socket Mode
+ *  workspaces (bot token + app token, no signing secret). */
 function slackTokenFor(channelType: string): string | null {
-  const workspaces = parseSlackWorkspaces(readEnvFileMatching(/^SLACK_(BOT_TOKEN|SIGNING_SECRET)(_[A-Za-z0-9_]+)?$/));
-  return workspaces.find((w) => w.channelType === channelType)?.botToken ?? null;
+  return loadSlackWorkspaces().find((w) => w.channelType === channelType)?.botToken ?? null;
 }
 
 // ── Linear ──
