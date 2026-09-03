@@ -11,7 +11,6 @@
  * CLI spawns. `cwd` is ignored from the agent payload and pinned to the host
  * project root at apply time.
  */
-import type Database from 'better-sqlite3';
 
 import { registerDeliveryAction } from '../../delivery.js';
 import { unguarded } from '../../guard/index.js';
@@ -20,11 +19,7 @@ import { getAgentGroup } from '../../db/agent-groups.js';
 import type { Session } from '../../types.js';
 import { notifyAgent, registerApprovalHandler, requestApproval, type ApprovalHandler } from '../approvals/index.js';
 
-async function handleStartRemoteControl(
-  content: Record<string, unknown>,
-  session: Session,
-  _inDb: Database.Database,
-): Promise<void> {
+async function handleStartRemoteControl(content: Record<string, unknown>, session: Session): Promise<void> {
   const agentGroup = getAgentGroup(session.agent_group_id);
   if (!agentGroup) {
     notifyAgent(session, 'start_remote_control failed: agent group not found.');
@@ -49,11 +44,7 @@ async function handleStartRemoteControl(
   });
 }
 
-async function handleStopRemoteControl(
-  _content: Record<string, unknown>,
-  session: Session,
-  _inDb: Database.Database,
-): Promise<void> {
+async function handleStopRemoteControl(_content: Record<string, unknown>, session: Session): Promise<void> {
   const agentGroup = getAgentGroup(session.agent_group_id);
   if (!agentGroup) {
     notifyAgent(session, 'stop_remote_control failed: agent group not found.');
@@ -69,11 +60,7 @@ async function handleStopRemoteControl(
   });
 }
 
-async function handleGetRemoteControlStatus(
-  _content: Record<string, unknown>,
-  session: Session,
-  _inDb: Database.Database,
-): Promise<void> {
+async function handleGetRemoteControlStatus(_content: Record<string, unknown>, session: Session): Promise<void> {
   // Read-only — does not need approval. Returns whether a session is active
   // and its URL, but does not start or stop anything.
   const active = getActiveSession();

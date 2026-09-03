@@ -6,7 +6,6 @@
  * provider name on faith beyond the group's own configuration — a container
  * cannot mark some other group's provider dead.
  */
-import type Database from 'better-sqlite3';
 
 import { readContainerConfig } from '../../container-config.js';
 import { getAgentGroup } from '../../db/agent-groups.js';
@@ -21,11 +20,7 @@ function str(value: unknown): string | undefined {
   return typeof value === 'string' && value.trim() ? value.trim() : undefined;
 }
 
-export async function handleProviderUnavailable(
-  content: Record<string, unknown>,
-  session: Session,
-  _inDb: Database.Database,
-): Promise<void> {
+export async function handleProviderUnavailable(content: Record<string, unknown>, session: Session): Promise<void> {
   const reportedProvider = str(content.provider);
   if (!reportedProvider) {
     log.warn('provider_unavailable: rejected — missing provider', { sessionId: session.id });

@@ -37,8 +37,6 @@
  */
 import { randomUUID } from 'node:crypto';
 
-import type Database from 'better-sqlite3';
-
 import { getChannelAdapter } from '../../channels/channel-registry.js';
 import { readContainerConfig } from '../../container-config.js';
 import { wakeContainer } from '../../container-runner.js';
@@ -54,7 +52,7 @@ import {
   upsertSupportThread,
 } from '../../db/support-threads.js';
 import { log } from '../../log.js';
-import { resolveSession, writeSessionMessage } from '../../session-manager.js';
+import { resolveSession, withExistingMailboxSession, writeSessionMessage } from '../../session-manager.js';
 import type { Session } from '../../types.js';
 
 const MAX_BODY = 3000;
@@ -99,23 +97,17 @@ function ticketCreationStep(policy: string | null): string {
  * fire. Convert those one-turn flags to sticky flags for the dedicated support
  * session so later engineer replies stay on the same model/effort.
  */
-function getSupportTaskContext(session: Session, inDb: Database.Database): SupportTaskContext | null {
+async function getSupportTaskContext(session: Session): Promise<SupportTaskContext | null> {
   if (!session.thread_id?.startsWith(TASK_SESSION_PREFIX)) return null;
   const seriesId = session.thread_id.slice(TASK_SESSION_PREFIX.length);
   if (!seriesId) return null;
 
-  const row = inDb
-    .prepare(
-      `SELECT channel_type, platform_id, content
-         FROM messages_in
-        WHERE kind = 'task'
-          AND series_id = ?
-          AND channel_type IS NOT NULL
-          AND platform_id IS NOT NULL
-     ORDER BY seq DESC
-        LIMIT 1`,
-    )
-    .get(seriesId) as { channel_type: string; platform_id: string; content: string } | undefined;
+  // Its own short mailbox session — delivery holds none while a handler runs
+  // (plan §4.5b). A session with no mailbox carries no host-authored task row,
+  // and the caller already treats a missing row as "no task context".
+  const row = await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) =>
+    mailbox.getLatestRoutedTaskRow(seriesId),
+  );
   if (!row) return null;
 
   let flagIntent: SupportTaskContext['flagIntent'];
@@ -246,26 +238,21 @@ function withSupportThreadLock<T>(gmailThreadId: string, run: () => Promise<T>):
   return next;
 }
 
-export function handleDispatchSupportIssue(
-  content: Record<string, unknown>,
-  session: Session,
-  inDb: Database.Database,
-): Promise<void> {
+export function handleDispatchSupportIssue(content: Record<string, unknown>, session: Session): Promise<void> {
   const gmailThreadId = str(content.gmailThreadId);
   if (!gmailThreadId) {
     log.warn('dispatch_support_issue: rejected — missing gmailThreadId', { sessionId: session.id });
     return Promise.resolve();
   }
-  return withSupportThreadLock(gmailThreadId, () => dispatchSupportIssue(gmailThreadId, content, session, inDb));
+  return withSupportThreadLock(gmailThreadId, () => dispatchSupportIssue(gmailThreadId, content, session));
 }
 
 async function dispatchSupportIssue(
   gmailThreadId: string,
   content: Record<string, unknown>,
   session: Session,
-  inDb: Database.Database,
 ): Promise<void> {
-  const taskContext = getSupportTaskContext(session, inDb);
+  const taskContext = await getSupportTaskContext(session);
   const mg = session.messaging_group_id
     ? getMessagingGroup(session.messaging_group_id)
     : taskContext
@@ -417,11 +404,7 @@ async function dispatchSupportIssue(
  * only the ticket fields. Best-effort: re-edit the channel announcement so the
  * parent message shows the ticket id.
  */
-export async function handleUpdateSupportTicket(
-  content: Record<string, unknown>,
-  session: Session,
-  _inDb: Database.Database,
-): Promise<void> {
+export async function handleUpdateSupportTicket(content: Record<string, unknown>, session: Session): Promise<void> {
   const linearIssue = str(content.linearIssue);
   if (!linearIssue) {
     log.warn('update_support_ticket: rejected — missing linearIssue', { sessionId: session.id });

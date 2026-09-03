@@ -9,9 +9,8 @@
  * nothing but the host's own system notices), which silently denied every
  * legitimate admin. One implementation, both callers.
  */
-import type Database from 'better-sqlite3';
-
 import { getMessagingGroup } from './db/messaging-groups.js';
+import { withExistingMailboxSession } from './session-manager.js';
 import type { Session } from './types.js';
 
 /**
@@ -22,19 +21,18 @@ import type { Session } from './types.js';
  */
 const SCAN_DEPTH = 20;
 
-/** Resolve the session's most recent inbound chat senderId, namespaced. */
-export function deriveCallerId(session: Session, inDb: Database.Database): string | null {
-  // `chat` / `chat-sdk` only — `task` / `system` / `webhook` rows carry no
-  // human sender. Both chat kinds must be listed: the chat-SDK bridge writes
-  // `chat-sdk`, legacy adapters write `chat`.
-  const rows = inDb
-    .prepare(
-      `SELECT content, channel_type FROM messages_in
-       WHERE kind IN ('chat', 'chat-sdk')
-       ORDER BY timestamp DESC
-       LIMIT ?`,
-    )
-    .all(SCAN_DEPTH) as Array<{ content?: string; channel_type?: string }>;
+/**
+ * Resolve the session's most recent inbound chat senderId, namespaced.
+ *
+ * Opens its own short mailbox session: delivery action handlers now run with
+ * no session open (plan §4.5b), so the two callers no longer have a handle to
+ * lend. A session with no mailbox has no caller to derive, hence `null`.
+ */
+export async function deriveCallerId(session: Session): Promise<string | null> {
+  const rows =
+    (await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) =>
+      mailbox.getRecentInboundChatSenders(SCAN_DEPTH),
+    )) ?? [];
 
   for (const row of rows) {
     if (!row.content) continue;

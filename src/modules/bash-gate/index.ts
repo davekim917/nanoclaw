@@ -46,12 +46,10 @@
  * without a handler wired up, so effectively required wherever email
  * skills are enabled.
  */
-import type Database from 'better-sqlite3';
 
 import { registerDeliveryAction } from '../../delivery.js';
 import { unguarded } from '../../guard/index.js';
-import { markDelivered, markDeliveryFailed, markPending } from '../../db/session-db.js';
-import { openInboundDb } from '../../session-manager.js';
+import { withExistingMailboxSession } from '../../session-manager.js';
 import { log } from '../../log.js';
 import type { PendingApproval, Session } from '../../types.js';
 import {
@@ -106,22 +104,28 @@ interface BashGatePayload {
   sessionId: string;
 }
 
-function writeGateAck(
+/**
+ * Resolve the gate's own `delivered` row.
+ *
+ * A short mailbox session of its own: the gate defers its ack, so this runs
+ * long after the drain that dispatched it, with no session open anywhere
+ * (plan §4.5b). `withExistingMailboxSession` because a session whose mailbox
+ * is gone has no container left polling for the decision — provisioning one
+ * would recreate a reclaimed directory to write an ack nobody reads.
+ */
+async function writeGateAck(
   session: Session,
   requestId: string,
   outcome: 'approved' | 'rejected' | 'timeout',
   errorText?: string,
-): void {
-  const inDb = openInboundDb(session.agent_group_id, session.id);
-  try {
+): Promise<void> {
+  await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) => {
     if (outcome === 'approved') {
-      markDelivered(inDb, requestId, null);
+      mailbox.markDelivered(requestId, null);
     } else {
-      markDeliveryFailed(inDb, requestId, errorText ?? outcome);
+      mailbox.markDeliveryFailed(requestId, errorText ?? outcome);
     }
-  } finally {
-    inDb.close();
-  }
+  });
 }
 
 function clearPending(requestId: string): void {
@@ -210,7 +214,6 @@ function createGateHandler(category: GateCategory) {
   return async function handleGateRequest(
     content: Record<string, unknown>,
     session: Session,
-    _inDb: Database.Database,
   ): Promise<{ deferAck: true }> {
     const label = typeof content.label === 'string' ? content.label : category.defaultLabel;
     const summary = typeof content.summary === 'string' ? content.summary : category.defaultSummary;
@@ -235,7 +238,7 @@ function createGateHandler(category: GateCategory) {
       pendingTimeouts.delete(requestId);
       sessionsWithActiveGates.delete(session.id);
       log.warn(`${category.logPrefix} gate timed out`, { requestId, agentGroupId: session.agent_group_id });
-      writeGateAck(
+      await writeGateAck(
         session,
         requestId,
         'timeout',
@@ -279,7 +282,7 @@ function createGateHandler(category: GateCategory) {
     if (!approvalDelivered) {
       clearPending(requestId);
       sessionsWithActiveGates.delete(session.id);
-      writeGateAck(
+      await writeGateAck(
         session,
         requestId,
         'rejected',
@@ -294,12 +297,7 @@ function createGateHandler(category: GateCategory) {
     // approval card per poll interval (~500ms) until the human acts.
     // The bash-gate approval handler (or timeout path) later UPSERTs
     // this to 'delivered' or 'failed' — both outcomes supersede 'pending'.
-    const inDb = openInboundDb(session.agent_group_id, session.id);
-    try {
-      markPending(inDb, requestId);
-    } finally {
-      inDb.close();
-    }
+    await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) => mailbox.markPending(requestId));
 
     return { deferAck: true };
   };
@@ -325,7 +323,7 @@ function createApprovalHandler(logPrefix: string) {
     // response-handler.ts only invokes registered handlers on Approve —
     // Reject is handled directly there via markDeliveryFailed. So
     // reaching this function always means approved.
-    writeGateAck(session, p.requestId, 'approved');
+    await writeGateAck(session, p.requestId, 'approved');
     log.info(`${logPrefix} gate approved`, { requestId: p.requestId, userId });
     notifyAgent(session, `${logPrefix} gate approved: ${p.label}`);
   };
@@ -418,7 +416,7 @@ export async function cancelPendingGatesForSession(sessionId: string, reason: st
     } catch (err) {
       log.warn('Failed to edit cancelled approval card', { approvalId: p.approval_id, err });
     }
-    writeGateAck(session, p.request_id, 'rejected', reason);
+    await writeGateAck(session, p.request_id, 'rejected', reason);
     deletePendingApproval(p.approval_id);
   }
   sessionsWithActiveGates.delete(sessionId);

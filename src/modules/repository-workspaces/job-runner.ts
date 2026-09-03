@@ -15,7 +15,7 @@
  *
  *   - The undelivered `messages_out` row IS the durable job record. Nothing new
  *     is persisted, and deliberately NOT a `markPending` row — `getDeliveredIds`
- *     (db/session-db.ts:926) cannot tell 'pending' from 'delivered', so one
+ *     (modules/mailbox/ops/delivery.ts) cannot tell 'pending' from 'delivered', so one
  *     would silently lose the action across a host restart. A host that dies
  *     mid-publish leaves the row untouched: the startup orphan-fence pass
  *     releases the dead process's fences (repo-fence-recovery.ts:218) and the
@@ -29,11 +29,10 @@
  *     no claim namespace at all. The serial drain is what has been keeping those
  *     apart; the chain reproduces exactly that property.
  */
-import { markDelivered, markDeliveryFailed } from '../../db/session-db.js';
 import type { DeliveryActionResult } from '../../delivery.js';
 import { log } from '../../log.js';
 import { releaseOrphanedRepoIngressFencesForDroppedMessage } from '../../repo-fence-recovery.js';
-import { openInboundDb } from '../../session-manager.js';
+import { withExistingMailboxSession } from '../../session-manager.js';
 import type { Session } from '../../types.js';
 
 /** Container-generated request id, which is also the `messages_out` row id. */
@@ -55,16 +54,22 @@ export function _resetRepositoryActionsForTesting(): void {
   chain = Promise.resolve();
 }
 
-/** Write this action's own `delivered` row. Returns false if the ack never landed. */
-function ackRow(session: Session, requestId: string, failure: unknown): boolean {
+/**
+ * Write this action's own `delivered` row. Returns false if the ack never landed.
+ *
+ * Its own short mailbox session: this runs on the detached job chain, long
+ * after the drain that dispatched the action returned, and delivery holds no
+ * session while a handler runs (plan §4.5b). A vanished mailbox counts as a
+ * failed ack, same as an unwritable handle did.
+ */
+async function ackRow(session: Session, requestId: string, failure: unknown): Promise<boolean> {
   try {
-    const inDb = openInboundDb(session.agent_group_id, session.id);
-    try {
-      if (failure === null) markDelivered(inDb, requestId, null);
-      else markDeliveryFailed(inDb, requestId, failure instanceof Error ? failure.message : String(failure));
-    } finally {
-      inDb.close();
-    }
+    const acked = await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) => {
+      if (failure === null) mailbox.markDelivered(requestId, null);
+      else mailbox.markDeliveryFailed(requestId, failure instanceof Error ? failure.message : String(failure));
+      return true;
+    });
+    if (!acked) throw new Error(`session mailbox for ${session.id} is gone`);
     return true;
   } catch (ackError) {
     // The work is done but unacknowledged, so the row stays undelivered and the
@@ -95,7 +100,7 @@ async function runRepositoryActionJob(
     failure = error;
     log.error('Repository action failed', { action, requestId, sessionId: session.id, err: error });
   }
-  const acked = ackRow(session, requestId, failure);
+  const acked = await ackRow(session, requestId, failure);
   if (failure !== null) {
     // Incident 2026-09-01's last line of defence, preserved from the delivery
     // loop's give-up path: a failed publication can leave sessions fenced that
