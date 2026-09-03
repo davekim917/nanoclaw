@@ -169,6 +169,7 @@ Tracks latest stable, including majors. Prerelease, beta, RC, dev, nightly, draf
 | Setup, customizing | `setup-wiring.md`, `customizing.md` |
 | CJK fonts | `cjk-fonts.md` |
 | Directive audit | `always-on-directive-classification.md`, `always-on-directive-baseline.md` |
+| Agent mailbox seam (in progress) | `agent-mailbox-seam-migration.md` is upstream's guide and describes the seam's END state; the fork reaches it PR by PR — current step and what exists today: `docs/specs/upstream-mailbox-seam/plan.md` §5 |
 
 ## Container Runtime (Bun)
 
