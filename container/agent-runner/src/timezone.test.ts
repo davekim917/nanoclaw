@@ -1,6 +1,12 @@
 import { describe, it, expect } from 'bun:test';
 
-import { formatLocalDateTimeFull, formatLocalTime, isValidTimezone, parseZonedToUtc, resolveTimezone } from './timezone.js';
+import {
+  formatLocalDateTimeFull,
+  formatLocalTime,
+  isValidTimezone,
+  parseZonedToUtc,
+  resolveTimezone,
+} from './timezone.js';
 
 // --- formatLocalTime ---
 
