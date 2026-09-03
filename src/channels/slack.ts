@@ -32,7 +32,7 @@ import { readEnvFileMatching } from '../env.js';
 import { log } from '../log.js';
 import { markdownHeadingsToBold } from '../text-styles.js';
 import { createChatSdkBridge } from './chat-sdk-bridge.js';
-import type { ChannelRecoveryRequest, ChannelRecoveryTarget } from './adapter.js';
+import type { ChannelDefaults, ChannelRecoveryRequest, ChannelRecoveryTarget } from './adapter.js';
 import { registerChannelAdapter } from './channel-registry.js';
 import {
   fetchSlackBotIdentity,
@@ -54,6 +54,60 @@ import {
 // little headroom for adapter-side serialization while preserving complete
 // replies by letting the shared bridge split longer chat messages.
 export const SLACK_MESSAGE_MAX_TEXT_LENGTH = 2800;
+
+/**
+ * Declared wiring-time defaults for every Slack instance.
+ *
+ * Until this existed, `registerChannelAdapter` passed no `defaults` and every
+ * Slack wiring resolved through `fallbackChannelDefaults` — the lenient
+ * undeclared-adapter path. That was not neutral: the `ncl`/wizard creation
+ * surfaces gate declaration-derived defaults on `hasDeclaredChannelDefaults`,
+ * so a Slack wiring created through `ncl` got the static schema defaults
+ * (engage_mode 'mention', unknown_sender_policy 'strict') while the router's
+ * auto-create branch and the card-approval flow used the fallback. The live
+ * install shows the split: some Slack DM messaging_groups carry 'strict',
+ * their card-approved siblings 'public'.
+ *
+ * Shape mirrors upstream/channels slack.ts, VALUES are the fork's policies:
+ *  - group.engageMode 'mention', not upstream's 'mention-sticky' (owner
+ *    directive 2026-05-26 — sibling agents co-reside in channels and sticky
+ *    let one agent auto-dominate a thread);
+ *  - group.unknownSenderPolicy 'public', not upstream's 'request_approval'
+ *    (owner directive 2026-08-06 — inviting the bot to a channel IS the
+ *    access decision);
+ *  - dm.unknownSenderPolicy 'request_approval' (upstream's 'decline_notify'
+ *    is not in this fork's enum);
+ *  - no sessionMode: this fork's ChannelContextDefaults has no such field;
+ *    session_mode 'per-thread' is stamped by `wireApprovedChannel`.
+ *
+ * CREATION-TIME STAMPS vs LIVE INHERIT — the rule that keeps existing
+ * installs still: engageMode, engagePattern and unknownSenderPolicy are read
+ * only when a wiring or messaging_groups row is CREATED, so they can differ
+ * from history without touching a single existing row. `threads` is the one
+ * value re-read on every routed message (`resolveThreadPolicy`, NULL =
+ * inherit), so it MUST equal what the fallback resolved to or ~48 live Slack
+ * wirings would silently change threading on deploy. The fallback resolves
+ * `threads: supportsThreads`, and the Slack bridge declares
+ * supportsThreads:true — hence true in BOTH contexts. Upstream declares
+ * dm.threads:false; adopting that here would collapse every existing Slack DM
+ * sub-thread into one session (this fork threads DM replies by default — see
+ * the DM auto-threading block in chat-sdk-bridge.ts). Operators who want a
+ * different value set it per wiring with `--threads`.
+ */
+export const SLACK_DEFAULTS: ChannelDefaults = {
+  dm: {
+    engageMode: 'pattern',
+    engagePattern: '.',
+    threads: true,
+    unknownSenderPolicy: 'request_approval',
+  },
+  group: {
+    engageMode: 'mention',
+    threads: true,
+    unknownSenderPolicy: 'public',
+  },
+  mentions: 'platform',
+};
 
 /**
  * Fetch the workspace's human members and register them for outbound
@@ -381,6 +435,10 @@ const workspaces = parseSlackWorkspaces(readEnvFileMatching(/^SLACK_(BOT_TOKEN|S
 
 for (const ws of workspaces) {
   registerChannelAdapter(ws.channelType, {
+    // Also on the registration, so offline creation paths (setup wizard,
+    // scripts, `ncl` against a host whose factory returned null for missing
+    // creds) resolve the same declaration without instantiating the adapter.
+    defaults: SLACK_DEFAULTS,
     factory: async () => {
       const slackAdapter = createSlackAdapter({
         botToken: ws.botToken,
@@ -436,6 +494,7 @@ for (const ws of workspaces) {
         adapter: slackAdapter,
         concurrency: 'concurrent',
         supportsThreads: true,
+        defaults: SLACK_DEFAULTS,
         maxTextLength: SLACK_MESSAGE_MAX_TEXT_LENGTH,
         // Oversize channel-level posts: continuation chunks reply in the
         // first chunk's thread rather than landing as sibling parents that
