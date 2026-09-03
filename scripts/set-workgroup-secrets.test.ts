@@ -11,17 +11,22 @@ import os from 'os';
 import path from 'path';
 import fs from 'fs';
 
-// Mock child_process.execFileSync so we don't shell out to `onecli`.
+// Mock child_process so we never shell out. `resolveSecretUuids` went async in
+// #315 (the sync curl parked the host event loop on every container spawn), so
+// the gateway call is `execFile` now; `execFileSync` stays mocked purely as a
+// tripwire proving nothing fell back to it.
 vi.mock('child_process', async () => {
   const actual = await vi.importActual<typeof import('child_process')>('child_process');
   return {
     ...actual,
+    execFile: vi.fn(),
     execFileSync: vi.fn(),
   };
 });
 
-import { execFileSync } from 'child_process';
-const mockedExec = vi.mocked(execFileSync);
+import { execFile, execFileSync } from 'child_process';
+const mockedExec = vi.mocked(execFile) as unknown as ReturnType<typeof vi.fn>;
+const mockedExecSync = vi.mocked(execFileSync);
 
 import { setWorkgroupSecrets } from './set-workgroup-secrets.js';
 import { __resetCachesForTest } from '../src/onecli-secrets.js';
@@ -37,7 +42,15 @@ const SECRET_FIXTURE = {
 };
 
 function setupOnecliMock(): void {
-  mockedExec.mockImplementation((bin: unknown, rawArgs: unknown) => {
+  mockedExec.mockImplementation((bin: unknown, rawArgs: unknown, _options: unknown, callback: unknown) => {
+    const done = callback as (error: Error | null, stdout: string, stderr: string) => void;
+    queueMicrotask(() => done(null, respondTo(bin, rawArgs), ''));
+    return undefined;
+  });
+}
+
+function respondTo(bin: unknown, rawArgs: unknown): string {
+  {
     const argv = (rawArgs ?? []) as string[];
     // onecli-secrets now lists secrets via the gateway API (listViaApi: a curl
     // to /api/secrets) to dodge the CLI's 20-row cap (919d3bce). Match that.
@@ -47,7 +60,7 @@ function setupOnecliMock(): void {
     // Back-compat with the old `onecli secrets list` call shape.
     if (argv[0] === 'secrets' && argv[1] === 'list') return JSON.stringify(SECRET_FIXTURE);
     return '';
-  });
+  }
 }
 
 // ── DB helpers ────────────────────────────────────────────────────────────────
@@ -98,13 +111,14 @@ function getUpdatedAt(db: Database.Database, id: string): string | null {
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
-describe('set-workgroup-secrets CLI', () => {
+describe('set-workgroup-secrets CLI', async () => {
   let db: Database.Database;
   let dbPath: string;
 
   beforeEach(() => {
     __resetCachesForTest();
     mockedExec.mockReset();
+    mockedExecSync.mockReset();
     const result = makeTestDb();
     db = result.db;
     dbPath = result.dbPath;
@@ -117,11 +131,11 @@ describe('set-workgroup-secrets CLI', () => {
 
   // ── test_writes_valid_secrets_to_db ─────────────────────────────────────────
 
-  it('test_writes_valid_secrets_to_db', () => {
+  it('test_writes_valid_secrets_to_db', async () => {
     setupOnecliMock();
     insertWorkgroup(db, 'example-labs');
 
-    const code = setWorkgroupSecrets({
+    const code = await setWorkgroupSecrets({
       workgroupId: 'example-labs',
       secrets: ['Anthropic', 'Exa'],
       dbPath,
@@ -136,11 +150,11 @@ describe('set-workgroup-secrets CLI', () => {
 
   // ── test_rejects_unresolvable_secret ────────────────────────────────────────
 
-  it('test_rejects_unresolvable_secret', () => {
+  it('test_rejects_unresolvable_secret', async () => {
     setupOnecliMock();
     insertWorkgroup(db, 'example-labs', '[]');
 
-    const code = setWorkgroupSecrets({
+    const code = await setWorkgroupSecrets({
       workgroupId: 'example-labs',
       secrets: ['Anthropic', 'NotInVault'],
       dbPath,
@@ -154,11 +168,11 @@ describe('set-workgroup-secrets CLI', () => {
 
   // ── test_rejects_missing_workgroup ──────────────────────────────────────────
 
-  it('test_rejects_missing_workgroup', () => {
+  it('test_rejects_missing_workgroup', async () => {
     setupOnecliMock();
     // No workgroup row inserted
 
-    const code = setWorkgroupSecrets({
+    const code = await setWorkgroupSecrets({
       workgroupId: 'does-not-exist',
       secrets: ['Anthropic'],
       dbPath,
@@ -169,12 +183,12 @@ describe('set-workgroup-secrets CLI', () => {
 
   // ── test_idempotent_rerun ────────────────────────────────────────────────────
 
-  it('test_idempotent_rerun', () => {
+  it('test_idempotent_rerun', async () => {
     setupOnecliMock();
     insertWorkgroup(db, 'example-labs');
 
     // First run
-    const code1 = setWorkgroupSecrets({
+    const code1 = await setWorkgroupSecrets({
       workgroupId: 'example-labs',
       secrets: ['Anthropic', 'Exa'],
       dbPath,
@@ -182,7 +196,7 @@ describe('set-workgroup-secrets CLI', () => {
     expect(code1).toBe(0);
 
     // Second identical run — should succeed, same secrets stored
-    const code2 = setWorkgroupSecrets({
+    const code2 = await setWorkgroupSecrets({
       workgroupId: 'example-labs',
       secrets: ['Anthropic', 'Exa'],
       dbPath,
@@ -195,11 +209,11 @@ describe('set-workgroup-secrets CLI', () => {
 
   // ── test_empty_secrets_clears_existing ──────────────────────────────────────
 
-  it('allows clearing secrets with empty list', () => {
+  it('allows clearing secrets with empty list', async () => {
     setupOnecliMock();
     insertWorkgroup(db, 'example-labs', JSON.stringify(['Anthropic']));
 
-    const code = setWorkgroupSecrets({
+    const code = await setWorkgroupSecrets({
       workgroupId: 'example-labs',
       secrets: [],
       dbPath,
@@ -212,11 +226,11 @@ describe('set-workgroup-secrets CLI', () => {
 
   // ── test_validates_before_write ─────────────────────────────────────────────
 
-  it('validates ALL secrets before writing — partial failure writes nothing', () => {
+  it('validates ALL secrets before writing — partial failure writes nothing', async () => {
     setupOnecliMock();
     insertWorkgroup(db, 'example-labs', JSON.stringify(['OldSecret']));
 
-    const code = setWorkgroupSecrets({
+    const code = await setWorkgroupSecrets({
       workgroupId: 'example-labs',
       secrets: ['Anthropic', 'DefinitelyNotReal'],
       dbPath,
@@ -235,12 +249,12 @@ describe('set-workgroup-secrets CLI', () => {
   // exit code 2 path is argv-parsing — covered here by exercising the function
   // with edge-case inputs.
 
-  it('test_invalid_args — onecli call count: zero secrets skips vault check', () => {
+  it('test_invalid_args — onecli call count: zero secrets skips vault check', async () => {
     // Empty secrets list: no onecli call needed (nothing to validate)
     setupOnecliMock();
     insertWorkgroup(db, 'example-labs');
 
-    setWorkgroupSecrets({ workgroupId: 'example-labs', secrets: [], dbPath });
+    await setWorkgroupSecrets({ workgroupId: 'example-labs', secrets: [], dbPath });
 
     // secrets list is empty → no `onecli secrets list` call
     const secretsListCalls = mockedExec.mock.calls.filter(
