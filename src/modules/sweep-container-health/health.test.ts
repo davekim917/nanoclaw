@@ -48,6 +48,13 @@ import {
 // `_sweepSessionForTesting` (F-10.2) sees the real exclusive chain rather
 // than the two idle-reap duties alone.
 import './index.js';
+// The post-kill cases below assert on what the kill FOLLOW-UPS write, and those
+// are registered by sibling families: S15 (ceiling notice) and S10
+// (accountability wake) by sweep-continuation, S17 (orphan-claim reset) by
+// sweep-session-core. Without these two imports `runSweepKillFollowUps` has
+// nothing to dispatch and every post-kill assertion passes vacuously.
+import '../sweep-continuation/index.js';
+import '../sweep-session-core/index.js';
 import type { Session } from '../../types.js';
 
 // ─── Hermeticity tripwire (brief-common.md HARD RULE) ────────────────────────
@@ -987,6 +994,12 @@ describe('sweepProviderHeal — bounds, actions, and accountability', () => {
     expect(countProviderHealAttemptsSinceRealInbound(mailbox)).toBe(PROVIDER_HEAL_MAX_ATTEMPTS);
 
     mockKillContainer.mockClear();
+    // A real park kill stops the container, and the notice below is written
+    // AFTER it, in a session opened after the kill returned. The write is now
+    // ownership-guarded, so the mock has to model the stop the way production
+    // does — leaving it "running" would model a replacement wake landing in the
+    // kill's gap, which the guard correctly refuses to write through.
+    mockKillContainer.mockImplementation(() => mockIsContainerRunning.mockReturnValue(false));
     _resetProviderHealTicksForTesting();
     expect(await twoFailedTicks(mailbox, outDb)).toBe(true);
     expect(mockKillContainer).toHaveBeenCalledWith('sess-test', 'provider-failed-selfheal-parked');
