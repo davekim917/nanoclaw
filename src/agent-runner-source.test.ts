@@ -35,6 +35,7 @@ import { initGroupFilesystem } from './group-init.js';
 import {
   activateAgentRunnerSource,
   agentRunnerSourcePath,
+  pruneAgentRunnerSnapshots,
   resetAgentRunnerSourceForTesting,
 } from './agent-runner-source.js';
 import { log } from './log.js';
@@ -59,7 +60,7 @@ function withWorkgroup(ag: AgentGroup): void {
   const db = getDb();
   db.prepare(
     `INSERT OR IGNORE INTO workgroups (id, display_name, onecli_secrets, mnemon_store_id, created_at)
-     VALUES (?, ?, '[]', ?, datetime('now'))`,
+     VALUES (?, ?, '[]', ?, strftime('%Y-%m-%dT%H:%M:%fZ','now'))`,
   ).run(ag.folder, ag.folder, ag.id);
   db.prepare('UPDATE agent_groups SET workgroup_id = ? WHERE id = ?').run(ag.folder, ag.id);
 }
@@ -141,16 +142,15 @@ describe('activateAgentRunnerSource', () => {
     fs.rmSync(dataDir, { recursive: true, force: true });
   });
 
-  it('a second boot replaces the snapshot and removes the previous one', () => {
+  it('a second boot replaces the snapshot and pruning removes only unreferenced previous snapshots', () => {
     const sourceDir = makeFakeSourceDir();
     const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'nanoclaw-runner-data-'));
+    const root = path.join(dataDir, 'agent-runner-src');
 
     const first = activateAgentRunnerSource({ sourceDir, dataDir });
-    const root = path.join(dataDir, 'agent-runner-src');
     expect(fs.readdirSync(root)).toEqual([path.basename(first)]);
 
-    // Plant a stale in-progress snapshot from a hypothetically crashed boot —
-    // must be swept by the next successful activation.
+    // Plant a stale in-progress snapshot from a hypothetically crashed boot.
     const staleTmp = path.join(root, 'stale-boot.tmp');
     fs.mkdirSync(staleTmp, { recursive: true });
     fs.writeFileSync(path.join(staleTmp, 'x.ts'), 'stale\n');
@@ -159,12 +159,33 @@ describe('activateAgentRunnerSource', () => {
 
     const second = activateAgentRunnerSource({ sourceDir, dataDir });
 
+    // Activation never prunes — both snapshots (and the stale tmp dir) are
+    // still on disk right after the second boot.
     expect(second).not.toBe(first);
-    const remaining = fs.readdirSync(root);
-    expect(remaining).toEqual([path.basename(second)]);
-    expect(fs.existsSync(first)).toBe(false);
-    expect(fs.existsSync(staleTmp)).toBe(false);
+    expect(fs.existsSync(first)).toBe(true);
+    expect(fs.existsSync(second)).toBe(true);
+    expect(new Set(fs.readdirSync(root))).toEqual(
+      new Set([path.basename(first), path.basename(second), 'stale-boot.tmp']),
+    );
+
+    // A caller that still references `first` (e.g. a container from the
+    // previous host process still running) keeps it; the unreferenced stale
+    // tmp dir is swept; `second` (the active snapshot) is always kept.
+    pruneAgentRunnerSnapshots({ dataDir, referencedPaths: () => new Set([first]) });
+    expect(new Set(fs.readdirSync(root))).toEqual(new Set([path.basename(first), path.basename(second)]));
+
+    // Once nothing external references `first` any more, it is swept too.
+    pruneAgentRunnerSnapshots({ dataDir, referencedPaths: () => new Set() });
+    expect(fs.readdirSync(root)).toEqual([path.basename(second)]);
     expect(fs.readFileSync(path.join(second, 'index.ts'), 'utf-8')).toBe('export const a = 2; // changed\n');
+
+    // A referencedPaths failure (docker unreachable, etc.) must prune
+    // nothing at all — plant a fresh stale entry and confirm it survives.
+    const anotherStale = path.join(root, 'another-stale');
+    fs.mkdirSync(anotherStale, { recursive: true });
+    pruneAgentRunnerSnapshots({ dataDir, referencedPaths: () => null });
+    expect(fs.existsSync(anotherStale)).toBe(true);
+    expect(fs.existsSync(second)).toBe(true);
 
     fs.rmSync(sourceDir, { recursive: true, force: true });
     fs.rmSync(dataDir, { recursive: true, force: true });

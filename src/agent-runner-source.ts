@@ -8,12 +8,18 @@
  * `container/agent-runner/src` once at host boot (`main.ts` calls
  * `activateAgentRunnerSource()` before anything can spawn) so activation
  * happens exactly at restart: copy to a temp dir under `data/agent-runner-src/`,
- * atomically rename it in, then prune every other snapshot — running
- * containers keep their already-bind-mounted inode, only new spawns see the
- * change. Rollback of a runner-source edit is therefore a host restart.
- * `NANOCLAW_AGENT_RUNNER_SRC_LIVE=1` mounts the checkout directly for local
- * dev (`pnpm run dev`) so edits take effect without a restart.
+ * then atomically rename it in. Pruning old snapshots is a SEPARATE step
+ * (`pruneAgentRunnerSnapshots()`, called from `main.ts` after orphan
+ * containers from a previous host process have been stopped): a bind mount
+ * pins the directory, not its entries, so deleting an old snapshot's
+ * contents out from under a still-running container would empty its
+ * `/app/src` live. Pruning therefore only removes a snapshot once no
+ * running container has it mounted. Rollback of a runner-source edit is a
+ * host restart. `NANOCLAW_AGENT_RUNNER_SRC_LIVE=1` mounts the checkout
+ * directly for local dev (`pnpm run dev`) so edits take effect without a
+ * restart.
  */
+import { execFileSync } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 
@@ -66,13 +72,10 @@ export function activateAgentRunnerSource(opts?: { sourceDir?: string; dataDir?:
     fs.mkdirSync(root, { recursive: true });
     fs.cpSync(sourceDir, tmpDir, { recursive: true });
     // Atomic within the same filesystem — the snapshot appears fully formed
-    // or not at all; no spawn ever sees a partial copy.
+    // or not at all; no spawn ever sees a partial copy. Pruning old
+    // snapshots is a separate call (pruneAgentRunnerSnapshots) — see the
+    // module header for why activation must not also delete.
     fs.renameSync(tmpDir, finalDir);
-
-    for (const entry of fs.readdirSync(root)) {
-      if (entry === stamp) continue;
-      fs.rmSync(path.join(root, entry), { recursive: true, force: true });
-    }
 
     activePath = finalDir;
     log.info('agent-runner source: snapshot activated', { path: finalDir, files: countFiles(finalDir) });
@@ -90,6 +93,88 @@ export function activateAgentRunnerSource(opts?: { sourceDir?: string; dataDir?:
 
 export function agentRunnerSourcePath(): string {
   return activePath ?? DEFAULT_SOURCE_DIR;
+}
+
+/**
+ * Default `referencedPaths` for pruneAgentRunnerSnapshots: the host mount
+ * source of every mount on every running `nanoclaw-v2-*` container, read via
+ * `docker inspect`. Returns null (never an empty set) when docker itself
+ * cannot be queried, so a Docker hiccup fails toward "prune nothing" rather
+ * than toward deleting a snapshot a live container still has mounted.
+ */
+function defaultReferencedPaths(): Set<string> | null {
+  try {
+    const psOut = execFileSync('docker', ['ps', '-q', '--filter', 'name=nanoclaw-v2-'], { encoding: 'utf-8' });
+    const ids = psOut
+      .split('\n')
+      .map((s) => s.trim())
+      .filter(Boolean);
+    const referenced = new Set<string>();
+    for (const id of ids) {
+      const inspectOut = execFileSync(
+        'docker',
+        ['inspect', '--format', '{{range .Mounts}}{{.Source}}{{"\\n"}}{{end}}', id],
+        { encoding: 'utf-8' },
+      );
+      for (const line of inspectOut.split('\n')) {
+        const trimmed = line.trim();
+        if (trimmed) referenced.add(trimmed);
+      }
+    }
+    return referenced;
+  } catch (err) {
+    log.warn('agent-runner source: could not list running container mounts, pruning nothing', {
+      err: err instanceof Error ? err.message : String(err),
+    });
+    return null;
+  }
+}
+
+/**
+ * Removes every snapshot under `data/agent-runner-src/` except the active
+ * one and any still mounted by a running container. Best-effort: a failure
+ * removing one entry is logged and skipped, never thrown — pruning is
+ * housekeeping, not a boot-blocking step. Call only after orphan containers
+ * from a previous host process have been stopped (`main.ts` calls this
+ * right after `cleanupOrphansStrict()`); once container adoption across
+ * restarts (mailbox seam 2) lands, `referencedPaths` must keep covering
+ * adopted containers too, or a live one can lose its mount out from under it.
+ */
+export function pruneAgentRunnerSnapshots(opts?: {
+  dataDir?: string;
+  referencedPaths?: () => Set<string> | null;
+}): void {
+  const dataDir = opts?.dataDir ?? DATA_DIR;
+  const referencedPathsFn = opts?.referencedPaths ?? defaultReferencedPaths;
+  const root = path.join(dataDir, 'agent-runner-src');
+
+  let entries: string[];
+  try {
+    entries = fs.readdirSync(root);
+  } catch {
+    return; // nothing snapshotted yet (or dataDir doesn't exist) — nothing to prune
+  }
+
+  const referenced = referencedPathsFn();
+  if (referenced === null) {
+    log.warn('agent-runner source: skipping snapshot pruning this pass — referenced-mounts check failed');
+    return;
+  }
+
+  const activeBasename = activePath ? path.basename(activePath) : undefined;
+  for (const entry of entries) {
+    if (entry === activeBasename) continue;
+    const full = path.join(root, entry);
+    if (referenced.has(full)) continue;
+    try {
+      fs.rmSync(full, { recursive: true, force: true });
+    } catch (err) {
+      log.warn('agent-runner source: failed to remove a stale snapshot', {
+        path: full,
+        err: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
 }
 
 export function resetAgentRunnerSourceForTesting(): void {
