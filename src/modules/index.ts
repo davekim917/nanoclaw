@@ -60,3 +60,7 @@ import './escalation/index.js';
 // on the host-sweep.ts registry at import time, same pattern as above.
 // sweep-idle-reap: S12 idle-task-reap, S13 idle-chat-reap (S2-PR3).
 import './sweep-idle-reap/index.js';
+// Sweep family: central housekeeping (seam 2, S2-PR4) — github-app-token-refresh,
+// steer-idempotency-prune, channel-ingress-receipt-prune, session-title-sweep,
+// thread-title-retry, dashboard-token-prune (all tick:housekeeping).
+import './sweep-central/index.js';

@@ -1,0 +1,259 @@
+/**
+ * Acceptance cases for the central-housekeeping sweep family (convergence
+ * seam 2, S2-PR4 — F-4.1..F-4.4 in
+ * docs/specs/upstream-host-sweep-seam/plan.md §8).
+ *
+ * F-4.4 lives in src/host-sweep-registry.test.ts (it proves a registry-level
+ * property — a throw from this family's receipts-prune duty does not abort
+ * the rest of the tick — not a property of this module's own code).
+ *
+ * F-4.1's steer-idempotency slice is MOVED, unchanged, from
+ * src/host-sweep.test.ts (`describe('pruneSteerIdempotency — D7')`) — the
+ * body it exercises moved from src/host-sweep.ts to
+ * ./steer-idempotency.ts in this same commit. The receipts and
+ * dashboard-token halves of F-4.1, and all of F-4.2/F-4.3, port the retention
+ * / margin / cap / cooldown / backoff assertions that already prove these
+ * duties' underlying behavior in their own files — this module only wraps
+ * them at the tick:housekeeping registration boundary, so the ported
+ * assertions here re-prove the exact numbers the wrapper now depends on
+ * (7-day receipt retention, 1-day dashboard-token grace, the GitHub App
+ * 10-minute refresh margin), without duplicating those files' full suites.
+ *
+ * F-4.3 (session-title and thread-title caps/cooldowns/backoffs) is split
+ * across two SIBLING files in this module directory, not inlined here:
+ * `session-title-sweep.test.ts` and `thread-title-retry.test.ts` need
+ * mutually incompatible `vi.mock('../../llm.js', ...)` treatments (the
+ * session-title half needs llm.js's REAL credential-rotation reset helpers;
+ * the thread-title half fully mocks llm.js's `callHaiku`), and `vi.mock` is
+ * hoisted per FILE, not per `describe` block — combining them in one file
+ * would silently mis-mock one half. Both files carry an `F-4.3a`/`F-4.3b`
+ * label in their top describe name so the case is still traceable to F-4.3.
+ */
+import crypto from 'crypto';
+import fs from 'fs';
+import os from 'os';
+import path from 'path';
+
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+
+import { closeDb, getDb, initTestDb, runMigrations } from '../../db/index.js';
+import {
+  claimChannelIngress,
+  completeChannelIngress,
+  pruneChannelIngressReceipts,
+  type ChannelIngressReceiptKey,
+} from '../../db/channel-ingress-receipts.js';
+import { pruneSteerIdempotency } from './steer-idempotency.js';
+
+// ── F-4.1a — steer idempotency (moved unchanged from host-sweep.test.ts D7) ──
+
+describe('pruneSteerIdempotency — D7', () => {
+  beforeEach(() => {
+    const db = initTestDb();
+    db.pragma('foreign_keys = ON');
+    runMigrations(db);
+    // Seed a user required by FK
+    getDb()
+      .prepare(
+        "INSERT OR IGNORE INTO users (id, kind, display_name, created_at) VALUES ('u1', 'test', NULL, datetime('now'))",
+      )
+      .run();
+  });
+
+  afterEach(() => {
+    closeDb();
+  });
+
+  it('test_prune_removes_old_applied', () => {
+    // applied row 2 min ago — should be deleted
+    getDb()
+      .prepare(
+        `INSERT INTO steer_idempotency (user_id, idempotency_key, target_type, target_id, message_id, text, request_hash, reserved_at, status, echo_attempted, applied_at)
+       VALUES ('u1', 'key-old', 'task', 'task-1', 'msg-1', 'hi', 'h1', datetime('now', '-3 minutes'), 'applied', 1, datetime('now', '-2 minutes'))`,
+      )
+      .run();
+    // applied row 30 sec ago — should remain
+    getDb()
+      .prepare(
+        `INSERT INTO steer_idempotency (user_id, idempotency_key, target_type, target_id, message_id, text, request_hash, reserved_at, status, echo_attempted, applied_at)
+       VALUES ('u1', 'key-fresh', 'task', 'task-1', 'msg-2', 'hi', 'h2', datetime('now', '-31 seconds'), 'applied', 1, datetime('now', '-30 seconds'))`,
+      )
+      .run();
+
+    pruneSteerIdempotency();
+
+    const rows = getDb().prepare("SELECT idempotency_key FROM steer_idempotency WHERE status = 'applied'").all() as {
+      idempotency_key: string;
+    }[];
+    expect(rows.map((r) => r.idempotency_key)).not.toContain('key-old');
+    expect(rows.map((r) => r.idempotency_key)).toContain('key-fresh');
+  });
+
+  it('test_prune_removes_old_pending', () => {
+    getDb()
+      .prepare(
+        `INSERT INTO steer_idempotency (user_id, idempotency_key, target_type, target_id, message_id, text, request_hash, reserved_at, status, echo_attempted)
+       VALUES ('u1', 'pend-old', 'task', 'task-2', 'msg-3', 'hi', 'h3', datetime('now', '-10 minutes'), 'pending', 0)`,
+      )
+      .run();
+
+    pruneSteerIdempotency();
+
+    const rows = getDb().prepare("SELECT idempotency_key FROM steer_idempotency WHERE status = 'pending'").all();
+    expect(rows.length).toBe(0);
+  });
+
+  it('test_prune_preserves_recent_pending', () => {
+    getDb()
+      .prepare(
+        `INSERT INTO steer_idempotency (user_id, idempotency_key, target_type, target_id, message_id, text, request_hash, reserved_at, status, echo_attempted)
+       VALUES ('u1', 'pend-new', 'task', 'task-3', 'msg-4', 'hi', 'h4', datetime('now', '-1 minute'), 'pending', 0)`,
+      )
+      .run();
+
+    pruneSteerIdempotency();
+
+    const rows = getDb()
+      .prepare("SELECT idempotency_key FROM steer_idempotency WHERE idempotency_key = 'pend-new'")
+      .all();
+    expect(rows.length).toBe(1);
+  });
+
+  it('test_sweep_calls_prune: pruneSteerIdempotency is exported and callable', () => {
+    // Verify the function is exported and can be called without error on an empty table
+    expect(() => pruneSteerIdempotency()).not.toThrow();
+  });
+});
+
+// ── F-4.1 ──────────────────────────────────────────────────────────────────
+// "each prune duty deletes exactly the rows its retention window covers"
+// — steer idempotency is proved above (D7); receipts and dashboard tokens
+// below.
+
+describe('F-4.1 — each prune duty deletes exactly the rows its retention window covers', () => {
+  const key: ChannelIngressReceiptKey = {
+    channelType: 'discord',
+    instance: 'discord',
+    platformId: 'discord:g:c',
+    messageId: 'm1',
+  };
+
+  beforeEach(() => {
+    runMigrations(initTestDb());
+  });
+
+  afterEach(() => closeDb());
+
+  it('channel-ingress-receipt prune: deletes completed receipts past the 7-day retention, keeps fresh ones', () => {
+    expect(claimChannelIngress(key)).toBe(true);
+    completeChannelIngress(key);
+    // Ported from src/db/channel-ingress-receipts.test.ts: 7-day default
+    // retention, 8 days in the future crosses it.
+    expect(pruneChannelIngressReceipts(Date.now() + 8 * 24 * 60 * 60 * 1000)).toBe(1);
+    // A row inside the window is not touched.
+    expect(claimChannelIngress(key)).toBe(true);
+    completeChannelIngress(key);
+    expect(pruneChannelIngressReceipts(Date.now())).toBe(0);
+  });
+
+  it('dashboard-token prune: deletes rows past expiry + 1-day grace, keeps rows inside the grace and unexpired rows', async () => {
+    const { pruneDashboardTokens } = await import('../../dashboard/db/dashboard-tokens.js');
+    getDb()
+      .prepare("INSERT INTO users (id, kind, display_name, created_at) VALUES ('u1', 'test', NULL, datetime('now'))")
+      .run();
+    // Expired 2 days ago — past the 1-day grace, must be deleted.
+    getDb()
+      .prepare(
+        `INSERT INTO dashboard_tokens (user_id, token_hmac, issued_at, expires_at)
+         VALUES ('u1', 'hmac-old', datetime('now', '-3 days'), datetime('now', '-2 days'))`,
+      )
+      .run();
+    // Expired 12 hours ago — inside the 1-day grace, must survive.
+    getDb()
+      .prepare(
+        `INSERT INTO dashboard_tokens (user_id, token_hmac, issued_at, expires_at)
+         VALUES ('u1', 'hmac-grace', datetime('now', '-1 day'), datetime('now', '-12 hours'))`,
+      )
+      .run();
+    // Not yet expired — must survive.
+    getDb()
+      .prepare(
+        `INSERT INTO dashboard_tokens (user_id, token_hmac, issued_at, expires_at)
+         VALUES ('u1', 'hmac-live', datetime('now'), datetime('now', '+1 hour'))`,
+      )
+      .run();
+
+    pruneDashboardTokens();
+
+    const remaining = getDb().prepare('SELECT token_hmac FROM dashboard_tokens ORDER BY token_hmac').all() as {
+      token_hmac: string;
+    }[];
+    expect(remaining.map((r) => r.token_hmac)).toEqual(['hmac-grace', 'hmac-live']);
+  });
+});
+
+// ── F-4.2 ──────────────────────────────────────────────────────────────────
+// "the GitHub App token refresh acts only inside the refresh margin" — ported
+// from src/github-app-token.test.ts's
+// "refreshExpiringGitHubAppTokens re-mints only tokens inside the margin".
+
+describe('F-4.2 — the GitHub App token refresh acts only inside the refresh margin', () => {
+  const INSTALLATION_ID = '155749655';
+  let keyPath: string;
+
+  beforeEach(() => {
+    keyPath = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'gh-app-central-')), 'key.pem');
+    fs.writeFileSync(
+      keyPath,
+      crypto.generateKeyPairSync('rsa', {
+        modulusLength: 2048,
+        privateKeyEncoding: { type: 'pkcs8', format: 'pem' },
+        publicKeyEncoding: { type: 'spki', format: 'pem' },
+      }).privateKey,
+    );
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  function appEnv(): NodeJS.ProcessEnv {
+    return {
+      GITHUB_APP_ID: '4684388',
+      GITHUB_APP_INSTALLATION_ID: INSTALLATION_ID,
+      GITHUB_APP_PRIVATE_KEY_PATH: keyPath,
+    } as NodeJS.ProcessEnv;
+  }
+
+  function mintResponse(token: string, expiresInMs: number): Response {
+    return new Response(JSON.stringify({ token, expires_at: new Date(Date.now() + expiresInMs).toISOString() }), {
+      status: 201,
+      headers: { 'content-type': 'application/json' },
+    });
+  }
+
+  it('re-mints only when the cached token is inside the 10-minute refresh margin', async () => {
+    const { clearGitHubAppTokenCache, mintOrReuseGitHubAppToken, refreshExpiringGitHubAppTokens } =
+      await import('../../github-app-token.js');
+    clearGitHubAppTokenCache();
+
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(mintResponse('ghs_old', 30 * 60 * 1000)));
+    await mintOrReuseGitHubAppToken(appEnv());
+
+    // Fresh token, far from expiry: no-op, zero mints.
+    const idle = vi.fn();
+    vi.stubGlobal('fetch', idle);
+    await expect(refreshExpiringGitHubAppTokens(appEnv())).resolves.toBe(0);
+    expect(idle).not.toHaveBeenCalled();
+
+    // A 5-min-life token is inside the 10-min refresh margin the moment it is
+    // cached, so the sweep must re-mint it.
+    clearGitHubAppTokenCache();
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(mintResponse('ghs_soon', 5 * 60 * 1000)));
+    await mintOrReuseGitHubAppToken(appEnv());
+    const refreshMock = vi.fn().mockResolvedValue(mintResponse('ghs_new', 60 * 60 * 1000));
+    vi.stubGlobal('fetch', refreshMock);
+    await expect(refreshExpiringGitHubAppTokens(appEnv())).resolves.toBe(1);
+    await expect(mintOrReuseGitHubAppToken(appEnv())).resolves.toMatchObject({ token: 'ghs_new' });
+  });
+});
