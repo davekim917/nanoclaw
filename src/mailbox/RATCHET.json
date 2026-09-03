@@ -42,6 +42,7 @@
   "src/modules/scheduling/host-script.ts",
   "src/modules/scheduling/live-count.ts",
   "src/modules/scheduling/recurrence.ts",
+  "src/modules/sweep-scheduled-move/index.ts",
   "src/session-manager.ts",
   "src/storage-manager.ts",
   "src/worktree-cleanup.ts"
