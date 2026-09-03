@@ -44,6 +44,8 @@ import {
   _prepareDueWakeForTesting,
   _resetStuckProcessingRowsForTesting,
   _enforceRunningContainerSlaForTesting,
+  _resetSweepRegistryForTesting,
+  registerSweepKillFollowUp,
   _incrementStoppedContinuationAttemptForTesting,
   _sweepSessionForTesting,
   _sweepTaskWatchdogForTesting,
@@ -58,7 +60,6 @@ import {
   parkDueRecoveryWakes,
   pruneIdleSessionArtifacts,
   pruneIdleThreadArtifacts,
-  pruneSteerIdempotency,
   readContinuationRecoveryAttemptAt,
   readWorkContinuation,
   restoreWorkContinuationResumeAttempt,
@@ -66,10 +67,7 @@ import {
   migrateLegacyWorkContinuationForRecovery,
   notifyContinuationParked,
   shouldCloseTaskSession,
-  shouldReapIdleTaskContainer,
-  shouldReapIdleChatContainer,
   shouldSkipUsageRollup,
-  CHAT_IDLE_REAP_MS,
 } from './host-sweep.js';
 import { getDb } from './db/connection.js';
 import type { Session } from './types.js';
@@ -1910,86 +1908,6 @@ describe('sweepTaskWatchdog (C3)', () => {
   });
 });
 
-// ── D7: pruneSteerIdempotency ─────────────────────────────────────────────────
-
-describe('pruneSteerIdempotency — D7', () => {
-  beforeEach(() => {
-    const db = initTestDb();
-    db.pragma('foreign_keys = ON');
-    runMigrations(db);
-    // Seed a user required by FK
-    getDb()
-      .prepare(
-        "INSERT OR IGNORE INTO users (id, kind, display_name, created_at) VALUES ('u1', 'test', NULL, datetime('now'))",
-      )
-      .run();
-  });
-
-  afterEach(() => {
-    closeDb();
-  });
-
-  it('test_prune_removes_old_applied', () => {
-    // applied row 2 min ago — should be deleted
-    getDb()
-      .prepare(
-        `INSERT INTO steer_idempotency (user_id, idempotency_key, target_type, target_id, message_id, text, request_hash, reserved_at, status, echo_attempted, applied_at)
-       VALUES ('u1', 'key-old', 'task', 'task-1', 'msg-1', 'hi', 'h1', datetime('now', '-3 minutes'), 'applied', 1, datetime('now', '-2 minutes'))`,
-      )
-      .run();
-    // applied row 30 sec ago — should remain
-    getDb()
-      .prepare(
-        `INSERT INTO steer_idempotency (user_id, idempotency_key, target_type, target_id, message_id, text, request_hash, reserved_at, status, echo_attempted, applied_at)
-       VALUES ('u1', 'key-fresh', 'task', 'task-1', 'msg-2', 'hi', 'h2', datetime('now', '-31 seconds'), 'applied', 1, datetime('now', '-30 seconds'))`,
-      )
-      .run();
-
-    pruneSteerIdempotency();
-
-    const rows = getDb().prepare("SELECT idempotency_key FROM steer_idempotency WHERE status = 'applied'").all() as {
-      idempotency_key: string;
-    }[];
-    expect(rows.map((r) => r.idempotency_key)).not.toContain('key-old');
-    expect(rows.map((r) => r.idempotency_key)).toContain('key-fresh');
-  });
-
-  it('test_prune_removes_old_pending', () => {
-    getDb()
-      .prepare(
-        `INSERT INTO steer_idempotency (user_id, idempotency_key, target_type, target_id, message_id, text, request_hash, reserved_at, status, echo_attempted)
-       VALUES ('u1', 'pend-old', 'task', 'task-2', 'msg-3', 'hi', 'h3', datetime('now', '-10 minutes'), 'pending', 0)`,
-      )
-      .run();
-
-    pruneSteerIdempotency();
-
-    const rows = getDb().prepare("SELECT idempotency_key FROM steer_idempotency WHERE status = 'pending'").all();
-    expect(rows.length).toBe(0);
-  });
-
-  it('test_prune_preserves_recent_pending', () => {
-    getDb()
-      .prepare(
-        `INSERT INTO steer_idempotency (user_id, idempotency_key, target_type, target_id, message_id, text, request_hash, reserved_at, status, echo_attempted)
-       VALUES ('u1', 'pend-new', 'task', 'task-3', 'msg-4', 'hi', 'h4', datetime('now', '-1 minute'), 'pending', 0)`,
-      )
-      .run();
-
-    pruneSteerIdempotency();
-
-    const rows = getDb()
-      .prepare("SELECT idempotency_key FROM steer_idempotency WHERE idempotency_key = 'pend-new'")
-      .all();
-    expect(rows.length).toBe(1);
-  });
-
-  it('test_sweep_calls_prune: pruneSteerIdempotency is exported and callable', () => {
-    // Verify the function is exported and can be called without error on an empty table
-    expect(() => pruneSteerIdempotency()).not.toThrow();
-  });
-});
-
 describe('autoArchiveOldCompleted', () => {
   beforeEach(() => {
     const db = initTestDb();
@@ -2872,79 +2790,8 @@ describe('shouldCloseTaskSession', () => {
   });
 });
 
-describe('shouldReapIdleTaskContainer', () => {
-  it('reaps an idle scheduled-task container with no claimed or due work', () => {
-    expect(shouldReapIdleTaskContainer('system:tasks:task-1', 0, 0, false, false)).toBe(true);
-  });
-
-  it('keeps a scheduled-task container while work is due or claimed', () => {
-    expect(shouldReapIdleTaskContainer('system:tasks:task-1', 1, 0, false, false)).toBe(false);
-    expect(shouldReapIdleTaskContainer('system:tasks:task-1', 0, 1, false, false)).toBe(false);
-  });
-
-  it('keeps a scheduled-task container while the provider is executing a turn', () => {
-    // Runner-pushed follow-up turns (wrapping-retry nudges, post-compaction
-    // bootstrap re-injection) execute with no processing claim at all.
-    expect(shouldReapIdleTaskContainer('system:tasks:task-1', 0, 0, true, false)).toBe(false);
-  });
-
-  it('keeps a scheduled-task container holding a work continuation', () => {
-    // `continue_work` is the sanctioned follow-up promise. Between turn end
-    // and continuation admission there is no claim and no execution, and
-    // reaping there demotes the agent to the throttled recovery path.
-    expect(shouldReapIdleTaskContainer('system:tasks:task-1', 0, 0, false, true)).toBe(false);
-  });
-
-  it('never reaps an interactive session through the scheduled-task policy', () => {
-    expect(shouldReapIdleTaskContainer('discord:guild:channel:thread', 0, 0, false, false)).toBe(false);
-    expect(shouldReapIdleTaskContainer(null, 0, 0, false, false)).toBe(false);
-  });
-});
-
-describe('shouldReapIdleChatContainer', () => {
-  const THREAD = 'discord:guild:channel:thread';
-  const NOW = 1_700_000_000_000;
-  const LONG_QUIET = NOW - CHAT_IDLE_REAP_MS - 1;
-  const JUST_QUIET = NOW - CHAT_IDLE_REAP_MS + 1;
-
-  it('reaps a chat container quiet past the floor with nothing pending', () => {
-    expect(shouldReapIdleChatContainer(THREAD, 0, 0, false, LONG_QUIET, LONG_QUIET, NOW)).toBe(true);
-  });
-
-  it('keeps a chat container inside the quiet floor', () => {
-    expect(shouldReapIdleChatContainer(THREAD, 0, 0, false, JUST_QUIET, JUST_QUIET, NOW)).toBe(false);
-  });
-
-  it('keeps a chat container while work is due or claimed', () => {
-    expect(shouldReapIdleChatContainer(THREAD, 1, 0, false, LONG_QUIET, LONG_QUIET, NOW)).toBe(false);
-    expect(shouldReapIdleChatContainer(THREAD, 0, 1, false, LONG_QUIET, LONG_QUIET, NOW)).toBe(false);
-  });
-
-  it('keeps a chat container with a pending work_continuation promise', () => {
-    expect(shouldReapIdleChatContainer(THREAD, 0, 0, true, LONG_QUIET, LONG_QUIET, NOW)).toBe(false);
-  });
-
-  it('keeps a chat container that has never produced output', () => {
-    expect(shouldReapIdleChatContainer(THREAD, 0, 0, false, null, LONG_QUIET, NOW)).toBe(false);
-  });
-
-  it('never reaps a task-thread session through the chat policy', () => {
-    expect(shouldReapIdleChatContainer('system:tasks:task-1', 0, 0, false, LONG_QUIET, LONG_QUIET, NOW)).toBe(false);
-  });
-
-  // The live failure: a user message arrives 16 min after the previous reply,
-  // the container consumes it (so dueCount is already 0) and is killed 11s
-  // into the turn before emitting its first status. Outbound alone cannot see
-  // this; inbound can.
-  it('keeps a chat container that just consumed a message but has not replied yet', () => {
-    expect(shouldReapIdleChatContainer(THREAD, 0, 0, false, LONG_QUIET, JUST_QUIET, NOW)).toBe(false);
-  });
-
-  it('still reaps when the newest inbound is also past the floor', () => {
-    expect(shouldReapIdleChatContainer(THREAD, 0, 0, false, JUST_QUIET, LONG_QUIET, NOW)).toBe(false);
-    expect(shouldReapIdleChatContainer(THREAD, 0, 0, false, LONG_QUIET, null, NOW)).toBe(true);
-  });
-});
+// shouldReapIdleTaskContainer / shouldReapIdleChatContainer cases moved to
+// src/modules/sweep-idle-reap/idle-reap.test.ts (seam 2, S2-PR3 — F-3.1).
 
 describe('shouldSkipUsageRollup', () => {
   it('skips when the cached mtime matches the current outbound.db mtime (unchanged since last rollup)', () => {
@@ -3114,6 +2961,101 @@ describe('sweepSession on a session with no mailbox', () => {
 
     expect(mockKillContainer).toHaveBeenCalledWith('sess-sla-claim', 'claim-stuck');
     expect(f.claims()).toBe(before);
+    closeDb();
+  });
+
+  // Codex round 9, on the seam-2 duty registry. Upstream guards the post-kill
+  // window with ONE `writeOutboundWhenStopped` around all three follow-ups,
+  // which is sound there because they are a single synchronous block. PR 2
+  // runs them as SEPARATE awaited duties, so a single check authorizes writes
+  // that happen two yields later: S15 writes the notice, the loop awaits, a
+  // replacement wake takes outbound.db, and S17 then deletes the FRESH
+  // runner's processing claim (duplicate execution) while S10 queues a stale
+  // accountability wake against its recovery cap. Each follow-up therefore
+  // guards its own write. The first half of this case is the control that
+  // proves the second half is not vacuous.
+  it('a wake that takes ownership between post-kill follow-ups stops the later follow-ups from writing', async () => {
+    const db = initTestDb();
+    runMigrations(db);
+    db.prepare(`INSERT INTO agent_groups (id, name, folder, created_at) VALUES ('ag-sla', 'sla', 'sla', ?)`).run(
+      new Date().toISOString(),
+    );
+    mockReadContainerConfig.mockReset().mockReturnValue({ provider: 'claude' });
+
+    const sessionDir = (session: Session): string =>
+      path.join(testDataDir.dir, 'v2-sessions', session.agent_group_id, session.id);
+    // A live continuation is what makes S10 (the accountability wake) write at
+    // all — without one `decideCeilingFollowUp` returns 'none' and the S10 half
+    // of the assertion would pass for the wrong reason.
+    const plantContinuation = (session: Session): void => {
+      const out = new Database(path.join(sessionDir(session), 'outbound.db'));
+      out
+        .prepare(
+          `INSERT INTO session_state (key, value, updated_at) VALUES ('work_continuation', ?, ?)
+           ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`,
+        )
+        .run(
+          JSON.stringify({
+            id: 'cont-followups',
+            task: 'finish the migration',
+            phase: 'running',
+            chain: 0,
+            runner_id: 'runner-old',
+            resume_attempts: 0,
+            recovery_episode: 0,
+          }),
+          new Date().toISOString(),
+        );
+      out.close();
+    };
+    const respawnWakes = (session: Session): number => {
+      const inbound = new Database(path.join(sessionDir(session), 'inbound.db'));
+      const n = (
+        inbound.prepare("SELECT COUNT(*) AS c FROM messages_in WHERE id LIKE 'ceiling-respawn-%'").get() as {
+          c: number;
+        }
+      ).c;
+      inbound.close();
+      return n;
+    };
+
+    // Control: ownership never flips, so every follow-up writes.
+    mockKillContainer.mockReset();
+    mockIsContainerRunning.mockReset().mockReturnValue(false);
+    const control = slaFixture('sess-followups-control', ABSOLUTE_CEILING_MS + 60_000, 10_000);
+    plantContinuation(control.session);
+    await _enforceRunningContainerSlaForTesting(control.run, control.session, 'ag-sla', 'sla');
+
+    expect(mockKillContainer).toHaveBeenCalledWith('sess-followups-control', 'absolute-ceiling');
+    expect(control.claims()).toBe(0); // S17 cleared the orphan claim
+    expect(respawnWakes(control.session)).toBe(1); // S10 queued the accountability wake
+
+    // Guarded: a wake takes the session between S15 (order 10) and S17 (order
+    // 20) — registered as a follow-up at order 15, which is exactly the yield
+    // boundary the loop's `await` creates.
+    mockKillContainer.mockReset();
+    mockIsContainerRunning.mockReset().mockReturnValue(false);
+    registerSweepKillFollowUp({
+      name: 'test:wake-between-post-kill-follow-ups',
+      order: 15,
+      run: () => {
+        mockIsContainerRunning.mockReturnValue(true);
+      },
+    });
+    try {
+      const guarded = slaFixture('sess-followups-guarded', ABSOLUTE_CEILING_MS + 60_000, 10_000);
+      plantContinuation(guarded.session);
+      const claimsBefore = guarded.claims();
+      await _enforceRunningContainerSlaForTesting(guarded.run, guarded.session, 'ag-sla', 'sla');
+
+      expect(mockKillContainer).toHaveBeenCalledWith('sess-followups-guarded', 'absolute-ceiling');
+      // Both later follow-ups skipped: the fresh runner keeps its claim and no
+      // stale accountability wake was queued against its recovery cap.
+      expect(guarded.claims()).toBe(claimsBefore);
+      expect(respawnWakes(guarded.session)).toBe(0);
+    } finally {
+      _resetSweepRegistryForTesting();
+    }
     closeDb();
   });
 

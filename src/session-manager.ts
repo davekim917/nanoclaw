@@ -518,6 +518,20 @@ export function withMailboxSession<T>(
   return runMailboxSession(agentGroupId, sessionId, action, true) as Promise<T>;
 }
 
+/**
+ * Test-only: how many mailbox sessions the CURRENT async context holds open.
+ *
+ * The nesting guard's own store, read rather than thrown on. Seam 2's R-10
+ * asserts depth 0 at every `killContainer`/`wakeContainer` call site: a kill
+ * respawns through `onExit` and clears status through `delivery.ts`, both of
+ * which open a session on the same key, so holding one across it deadlocks
+ * (invariant I-3). Asserting `ctx.mailbox === null` is not the same assertion —
+ * a duty could open its own session and kill inside the callback.
+ */
+export function _mailboxSessionDepthForTesting(): number {
+  return activeMailboxKeys.getStore()?.size ?? 0;
+}
+
 /** Run against an already-provisioned mailbox without creating storage. */
 export function withExistingMailboxSession<T>(
   agentGroupId: string,

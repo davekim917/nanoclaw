@@ -55,3 +55,15 @@ import './repository-workspaces/index.js';
 import './sweep-storage/index.js';
 
 import './escalation/index.js';
+
+// Sweep duty families (convergence seam 2) — each self-registers its duties
+// on the host-sweep.ts registry at import time, same pattern as above.
+// sweep-idle-reap: S12 idle-task-reap, S13 idle-chat-reap (S2-PR3).
+import './sweep-idle-reap/index.js';
+// Sweep family: central housekeeping (seam 2, S2-PR4) — github-app-token-refresh,
+// steer-idempotency-prune, channel-ingress-receipt-prune, session-title-sweep,
+// thread-title-retry, dashboard-token-prune (all tick:housekeeping).
+import './sweep-central/index.js';
+// Sweep-repo-fence (seam 2, PR 8 — G08): T5 approvals-reason-sweep,
+// T22 orphaned-repo-fence-release.
+import './sweep-repo-fence/index.js';
