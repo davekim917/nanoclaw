@@ -187,7 +187,13 @@ async function syncSlackWorkspaceHumans(client: WebClient, teamId: string, chann
 export interface SlackWorkspace {
   channelType: string;
   botToken: string;
-  signingSecret: string;
+  /** Webhook-mode credential. Absent when the workspace runs Socket Mode. */
+  signingSecret?: string;
+  /**
+   * App-level token (`xapp-…`). Its presence IS the Socket Mode switch — the
+   * contract the add-slack skill already documents to operators.
+   */
+  appToken?: string;
 }
 
 interface SlackRecoveryMessage {
@@ -377,15 +383,16 @@ export async function slackChannelDisplayName(
 }
 
 export function parseSlackWorkspaces(env: Record<string, string>): SlackWorkspace[] {
-  const bySuffix = new Map<string, { botToken?: string; signingSecret?: string }>();
+  const bySuffix = new Map<string, { botToken?: string; signingSecret?: string; appToken?: string }>();
 
   for (const [key, value] of Object.entries(env)) {
-    const m = key.match(/^SLACK_(BOT_TOKEN|SIGNING_SECRET)(?:_([A-Za-z0-9_]+))?$/);
+    const m = key.match(/^SLACK_(BOT_TOKEN|SIGNING_SECRET|APP_TOKEN)(?:_([A-Za-z0-9_]+))?$/);
     if (!m) continue;
     const [, kind, rawSuffix] = m;
     const suffix = rawSuffix ? rawSuffix.toLowerCase().replace(/_/g, '-') : '';
     const entry = bySuffix.get(suffix) ?? {};
     if (kind === 'BOT_TOKEN') entry.botToken = value;
+    else if (kind === 'APP_TOKEN') entry.appToken = value;
     else entry.signingSecret = value;
     bySuffix.set(suffix, entry);
   }
@@ -393,17 +400,22 @@ export function parseSlackWorkspaces(env: Record<string, string>): SlackWorkspac
   const workspaces: SlackWorkspace[] = [];
   for (const [suffix, pair] of bySuffix) {
     if (!pair.botToken) continue;
-    if (!pair.signingSecret) {
-      log.warn('Slack workspace missing signing secret, skipping', {
+    // Each delivery mode needs only its own second credential: Socket Mode
+    // holds an outbound WebSocket (no public URL, nothing to sign), webhook
+    // delivery needs the signing secret to authenticate Slack's POSTs.
+    if (!pair.signingSecret && !pair.appToken) {
+      log.warn('Slack workspace has no signing secret and no app token, skipping', {
         suffix: suffix || '(primary)',
       });
       continue;
     }
-    workspaces.push({
+    const workspace: SlackWorkspace = {
       channelType: suffix ? `slack-${suffix}` : 'slack',
       botToken: pair.botToken,
-      signingSecret: pair.signingSecret,
-    });
+    };
+    if (pair.signingSecret) workspace.signingSecret = pair.signingSecret;
+    if (pair.appToken) workspace.appToken = pair.appToken;
+    workspaces.push(workspace);
   }
   return workspaces;
 }
@@ -458,6 +470,20 @@ export function declarationOnlySlackTypes(env: Record<string, string>): string[]
   }
   if (!anyComplete && types.length === 0) types.push('slack');
   return types;
+}
+
+/**
+ * The env keys a Slack workspace is assembled from. ONE definition, because a
+ * second copy is how Socket Mode broke `backlog-canvas`: it had its own
+ * regex, that regex predated `APP_TOKEN`, and a socket workspace therefore
+ * looked credential-less to it while working fine for the adapter.
+ */
+const SLACK_ENV_PATTERN = /^SLACK_(BOT_TOKEN|SIGNING_SECRET|APP_TOKEN)(_[A-Za-z0-9_]+)?$/;
+
+/** Every configured Slack workspace, read from `.env`. The one entry point —
+ *  callers outside this module must not re-derive the env pattern. */
+export function loadSlackWorkspaces(): SlackWorkspace[] {
+  return parseSlackWorkspaces(readEnvFileMatching(SLACK_ENV_PATTERN));
 }
 
 /** Minimal interface for the Slack chat.postMessage client — narrow surface for testing. */
@@ -515,11 +541,13 @@ export async function slackCreateThread(
   return { threadId: parentMessageId, messageId: reply.ts as string };
 }
 
-// Keep the pre-filter regex in sync with the suffix regex inside
-// parseSlackWorkspaces — both must allow `_` in the suffix, otherwise
-// env vars like SLACK_BOT_TOKEN_EXAMPLE_LABS_CODEX get dropped here before
-// they ever reach the parser.
-const slackEnv = readEnvFileMatching(/^SLACK_(BOT_TOKEN|SIGNING_SECRET)(_[A-Za-z0-9_]+)?$/);
+// Keep SLACK_ENV_PATTERN in sync with the suffix regex inside
+// parseSlackWorkspaces — both must allow `_` in the suffix, otherwise env vars
+// like SLACK_BOT_TOKEN_EXAMPLE_LABS_CODEX get dropped before they ever reach
+// the parser, and both must list APP_TOKEN or a Socket Mode workspace looks
+// credential-less. Read once here (rather than via loadSlackWorkspaces) so the
+// raw env dict is also available to declarationOnlySlackTypes below.
+const slackEnv = readEnvFileMatching(SLACK_ENV_PATTERN);
 const workspaces = parseSlackWorkspaces(slackEnv);
 
 // Declaration-only registrations run BEFORE the live ones so a complete
@@ -539,9 +567,21 @@ for (const ws of workspaces) {
     // creds) resolve the same declaration without instantiating the adapter.
     defaults: SLACK_DEFAULTS,
     factory: async () => {
+      // Socket Mode when an app-level token is configured, webhook otherwise.
+      // The app token IS the switch — the contract the add-slack skill has
+      // documented to operators all along, and the reason a Socket Mode
+      // install used to write SLACK_APP_TOKEN, no signing secret, and get a
+      // bot that could send but never receive. Existing webhook instances
+      // have no app token and are unaffected.
       const slackAdapter = createSlackAdapter({
         botToken: ws.botToken,
         signingSecret: ws.signingSecret,
+        appToken: ws.appToken,
+        mode: ws.appToken ? 'socket' : 'webhook',
+      });
+      log.info('Slack workspace connecting', {
+        channelType: ws.channelType,
+        mode: ws.appToken ? 'socket' : 'webhook',
       });
       // Multi-workspace dedup isolation. The @chat library's message dedup
       // key is `dedupe:${adapter.name}:${message.id}`. SlackAdapter defaults
