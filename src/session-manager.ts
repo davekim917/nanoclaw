@@ -10,6 +10,7 @@
  *   3. One writer per file — DELETE-mode journal-unlink isn't atomic across
  *      the mount; concurrent writers corrupt the DB.
  */
+import { AsyncLocalStorage } from 'async_hooks';
 import Database from 'better-sqlite3';
 import fs from 'fs';
 import path from 'path';
@@ -33,8 +34,9 @@ import {
   taskThreadId,
   updateSession,
 } from './db/sessions.js';
+import { getAgentMailbox } from './mailbox/index.js';
+import type { MailboxSession, MailboxSessionKey } from './mailbox/types.js';
 import {
-  ensureSchema,
   openInboundDb as openInboundDbRaw,
   openOutboundDb as openOutboundDbRaw,
   openOutboundDbRw as openOutboundDbRwRaw,
@@ -58,6 +60,58 @@ export function sessionsBaseDir(): string {
 /** Directory for a specific session: sessions/{agent_group_id}/{session_id}/ */
 export function sessionDir(agentGroupId: string, sessionId: string): string {
   return path.join(sessionsBaseDir(), agentGroupId, sessionId);
+}
+
+/** Host-owned runner context, kept outside the agent-writable session directory. */
+export function sessionContextPath(agentGroupId: string, sessionId: string): string {
+  return sessionContextPathFor(sessionDir(agentGroupId, sessionId));
+}
+
+/**
+ * The same path, derived from a session DIRECTORY rather than from DATA_DIR.
+ *
+ * The storage reclaim walks an injected sessions root, so it cannot go through
+ * `sessionContextPath`. One definition of the layout keeps the two from
+ * drifting — and they must not: the context file is a SIBLING of the session
+ * directory, so removing that directory does not take it, and a reclaim that
+ * misses it leaks one file per session forever.
+ */
+export function sessionContextPathFor(sessionPath: string): string {
+  return path.join(path.dirname(sessionPath), '.context', `${path.basename(sessionPath)}.json`);
+}
+
+/**
+ * Materialize the immutable context the runner receives at startup.
+ *
+ * The container READS this file and runs as a different UID than the host, so
+ * it takes the mode of `inbound.db` and its directory the mode of the session
+ * dir — the file and directory the container already reads today. Upstream's
+ * 0700/0600 would be unreadable inside the container on any install whose
+ * image UID differs from the host's, which is every install where
+ * `buildContainerArgs` omits `--user`. Safe by upstream's own contract:
+ * `runnerContext` is non-secret runner configuration, never credentials.
+ */
+export function writeSessionContext(agentGroupId: string, sessionId: string, mailbox: unknown): void {
+  const contextPath = sessionContextPath(agentGroupId, sessionId);
+  const fileMode = existingMode(inboundDbPath(agentGroupId, sessionId), 0o644);
+  const dirMode = existingMode(sessionDir(agentGroupId, sessionId), 0o755);
+  fs.mkdirSync(path.dirname(contextPath), { recursive: true });
+  fs.chmodSync(path.dirname(contextPath), dirMode);
+  fs.writeFileSync(contextPath, JSON.stringify({ agentGroupId, sessionId, mailbox }));
+  fs.chmodSync(contextPath, fileMode);
+}
+
+/** Mode bits of an existing path, or `fallback` when it is not there yet. */
+function existingMode(target: string, fallback: number): number {
+  try {
+    return fs.statSync(target).mode & 0o777;
+  } catch {
+    return fallback;
+  }
+}
+
+function mailboxKey(agentGroupId: string, sessionId: string): MailboxSessionKey {
+  return { agentGroupId, sessionId };
 }
 
 /** Root directory for all thread-scoped worktrees. */
@@ -424,8 +478,65 @@ export function initSessionFolder(agentGroupId: string, sessionId: string): void
   fs.mkdirSync(dir, { recursive: true });
   fs.mkdirSync(path.join(dir, 'outbox'), { recursive: true });
 
-  ensureSchema(inboundDbPath(agentGroupId, sessionId), 'inbound');
-  ensureSchema(outboundDbPath(agentGroupId, sessionId), 'outbound');
+  // prepare() is the single provisioning path: it creates whichever mailbox
+  // files are absent, with upstream's baseline schema plus the fork's tables,
+  // columns, triggers and index. Legacy-shape migrations on an EXISTING file
+  // run at that session's first session() instead, never here.
+  getAgentMailbox().prepare(mailboxKey(agentGroupId, sessionId));
+}
+
+/** Destroy one session's implementation-owned mailbox after its container stops. */
+export async function destroySessionMailbox(agentGroupId: string, sessionId: string): Promise<void> {
+  await getAgentMailbox().destroy(mailboxKey(agentGroupId, sessionId));
+  fs.rmSync(sessionContextPath(agentGroupId, sessionId), { force: true });
+}
+
+/**
+ * Detects same-key session() nesting, which is forbidden: implementations may
+ * serialize session() per key, so a nested call may deadlock. Tracked per async context so
+ * legitimately concurrent top-level sessions on the same key don't trip it.
+ */
+const activeMailboxKeys = new AsyncLocalStorage<ReadonlySet<string>>();
+
+/** Run one host operation against a session mailbox. The implementation owns persistence.
+ *
+ * Never call this (directly or via helpers like writeSessionMessage) from
+ * inside another withMailboxSession action on the same session — finish the
+ * open session first. See AgentMailbox.session in src/mailbox/types.ts.
+ */
+export function withMailboxSession<T>(
+  agentGroupId: string,
+  sessionId: string,
+  action: (mailbox: MailboxSession) => T | Promise<T>,
+): Promise<T> {
+  return runMailboxSession(agentGroupId, sessionId, action, true) as Promise<T>;
+}
+
+/** Run against an already-provisioned mailbox without creating storage. */
+export function withExistingMailboxSession<T>(
+  agentGroupId: string,
+  sessionId: string,
+  action: (mailbox: MailboxSession) => T | Promise<T>,
+): Promise<T | undefined> {
+  return runMailboxSession(agentGroupId, sessionId, action, false);
+}
+
+async function runMailboxSession<T>(
+  agentGroupId: string,
+  sessionId: string,
+  action: (mailbox: MailboxSession) => T | Promise<T>,
+  provision: boolean,
+): Promise<T | undefined> {
+  const store = getAgentMailbox();
+  const key = mailboxKey(agentGroupId, sessionId);
+  const keyId = `${agentGroupId}/${sessionId}`;
+  const held = activeMailboxKeys.getStore();
+  if (held?.has(keyId)) {
+    throw new Error(`Nested mailbox session for ${keyId} — serialized implementations would deadlock here`);
+  }
+  if (provision) store.prepare(key);
+  else if (!(await store.exists(key))) return undefined;
+  return activeMailboxKeys.run(new Set(held).add(keyId), () => store.session(key, action));
 }
 
 /**

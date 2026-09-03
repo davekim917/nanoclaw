@@ -72,6 +72,10 @@ console.log('✓ Central DB initialized');
 // --- Step 2: Route inbound message (spawns container) ---
 console.log('\n=== Step 2: Route inbound message ===');
 
+// routeInbound reaches resolveSession → initSessionFolder, which provisions
+// through the registered mailbox; this standalone harness loads the
+// composition slot itself.
+import '../src/mailbox/compose.js';
 import { routeInbound } from '../src/router.js';
 import { findSession } from '../src/db/sessions.js';
 import { inboundDbPath, outboundDbPath } from '../src/session-manager.js';

@@ -38,6 +38,8 @@ vi.mock('./db/messaging-groups.js', async (importOriginal) => {
 });
 
 import { buildMounts } from './container-runner.js';
+import { getAgentMailbox } from './mailbox/index.js';
+import { inboundDbPath, sessionContextPath, writeSessionContext } from './session-manager.js';
 import { buildContainerCodexConfig } from './providers/codex.js';
 import { closeDb, createAgentGroup, getDb, initTestDb, runMigrations } from './db/index.js';
 import { ensureContainerConfig, updateContainerConfigScalars } from './db/container-configs.js';
@@ -999,5 +1001,50 @@ describe('symlink overlay workgroup allowlist', async () => {
     expect(containerPaths).toContain('/workspace/chain-sib/T');
     expect(containerPaths).not.toContain('/workspace/agent/CHAINED');
     expect(containerPaths).not.toContain('/workspace/agent/sub/jump/T');
+  });
+});
+
+// H-9 (docs/specs/upstream-mailbox-seam/plan.md §8): the spawn path
+// materializes the runner's startup context and bind-mounts it read-only.
+// spawnContainer runs writeSessionContext just after writeSessionRouting and
+// well before buildMounts, so the two halves are asserted in that order here.
+describe('runner session context file', () => {
+  it('spawn writes the session context file and mounts it read-only at /app/.nanoclaw-session.json', async () => {
+    const ag = group('ag-ctx', 'ctx-group');
+    createAgentGroup(ag);
+    withWorkgroup(ag);
+    ensureContainerConfig(ag.id);
+    initGroupFilesystem(ag, {});
+    const sess = session('s-ctx', ag.id);
+
+    const mailbox = getAgentMailbox();
+    const key = { agentGroupId: ag.id, sessionId: sess.id };
+    // Provision first, as the spawn path does — the context file's mode is
+    // taken from inbound.db in the same session dir.
+    mailbox.prepare(key);
+    writeSessionContext(ag.id, sess.id, await mailbox.runnerContext(key));
+
+    const contextPath = sessionContextPath(ag.id, sess.id);
+    expect(JSON.parse(fs.readFileSync(contextPath, 'utf-8'))).toEqual({
+      agentGroupId: ag.id,
+      sessionId: sess.id,
+      mailbox: null,
+    });
+    // The container reads this file as a different UID than the host, so it
+    // must be no stricter than the session DB the container already reads.
+    const inboundMode = fs.statSync(inboundDbPath(ag.id, sess.id)).mode & 0o777;
+    expect(fs.statSync(contextPath).mode & 0o777).toBe(inboundMode);
+    expect(fs.statSync(path.dirname(contextPath)).mode & 0o777).toBe(
+      fs.statSync(path.join(DATA_DIR, 'v2-sessions', ag.id, sess.id)).mode & 0o777,
+    );
+    // Nothing to configure for a bind-mounted SQLite mailbox.
+    expect(await mailbox.runnerEnvironment(key)).toEqual({});
+
+    const mounts = buildMounts(ag, sess, containerConfig(), 'claude', {});
+    expect(mounts).toContainEqual({
+      hostPath: contextPath,
+      containerPath: '/app/.nanoclaw-session.json',
+      readonly: true,
+    });
   });
 });

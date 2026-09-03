@@ -15,6 +15,9 @@ import path from 'path';
 
 import Database from 'better-sqlite3';
 
+// Session provisioning goes through the registered mailbox; this standalone
+// entrypoint loads the composition slot itself.
+import '../../src/mailbox/compose.js';
 import { DATA_DIR } from '../../src/config.js';
 import { initDb, closeDb } from '../../src/db/connection.js';
 import { getAgentGroupByFolder } from '../../src/db/agent-groups.js';

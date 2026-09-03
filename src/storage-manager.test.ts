@@ -47,6 +47,7 @@ import { CONTAINER_IMAGE, CONTAINER_IMAGE_BASE, CONTAINER_INSTALL_LABEL } from '
 import { CONTAINER_RUNTIME_BIN } from './container-runtime.js';
 import { resolveRepositoryWorkUnit } from './repository-workspaces.js';
 import { log } from './log.js';
+import { sessionContextPath, sessionContextPathFor } from './session-manager.js';
 
 // The rescue round-trip suite needs a REAL tar/zstd. `vi.mock('child_process')`
 // intercepts the `node:`-prefixed specifier too, so a plain import would just
@@ -937,6 +938,23 @@ describe('storage-manager session archival lifecycle', () => {
     const report = runApply();
     expect(report.actions.find((a) => a.kind === 'archive-session')?.status).toBe('applied');
     expect(fs.existsSync(dir)).toBe(false);
+  });
+
+  it('reclaiming a session also removes its runner context file', () => {
+    const dir = seedOne();
+    // The context file is a SIBLING of the session directory, so removing the
+    // directory does not take it. Without an explicit removal every reclaimed
+    // session leaks one, and destroySessionMailbox has no caller yet.
+    const contextFile = sessionContextPathFor(dir);
+    fs.mkdirSync(path.dirname(contextFile), { recursive: true });
+    fs.writeFileSync(contextFile, JSON.stringify({ agentGroupId: 'ag-1', sessionId: 'sess-old', mailbox: null }));
+    expect(fs.existsSync(contextFile)).toBe(true);
+
+    const report = runApply();
+
+    expect(report.actions.find((a) => a.kind === 'archive-session')?.status).toBe('applied');
+    expect(fs.existsSync(dir)).toBe(false);
+    expect(fs.existsSync(contextFile)).toBe(false);
   });
 
   it('closes an archiving row whose triple a newer session already claimed', () => {
