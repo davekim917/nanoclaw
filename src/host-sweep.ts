@@ -1172,6 +1172,19 @@ async function sweepOnce(): Promise<void> {
     log.warn('GitHub App token refresh sweep step failed', { err });
   }
 
+  // Push the current token down to every group's mounted token file. This is
+  // what the re-mint above could never reach before: a running container's env
+  // is frozen at spawn, but the read-only file mount is live, so rewriting the
+  // file in place hands an already-running container the fresh credential on
+  // its next git/gh call. Ordered right after the re-mint so the value written
+  // here is the one that was just minted. See github-token-file.ts.
+  try {
+    const { refreshGroupGitHubTokenFiles } = await import('./github-token-file.js');
+    await refreshGroupGitHubTokenFiles();
+  } catch (err) {
+    log.warn('GitHub token file refresh sweep step failed', { err });
+  }
+
   // Advance operator-confirmed thread closes: wait for the agent's wrap-up
   // confirmation, then clear its saved work, stop the container and archive —
   // in that order (src/dashboard/thread-close.ts). Central-DB scan of the few
