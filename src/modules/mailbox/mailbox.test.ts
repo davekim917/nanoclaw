@@ -116,7 +116,7 @@ describe('NanoclawAgentMailbox', () => {
     expect(deliveredIds.has('out-1')).toBe(true);
   });
 
-  it('a legacy inbound DB missing baseline tables regains them', async () => {
+  it('a legacy inbound DB missing delivered and session_routing regains them after prepare() and session()', async () => {
     const key = freshKey();
     const inbound = dbPath(key, 'inbound');
     fs.mkdirSync(path.dirname(inbound), { recursive: true });
@@ -132,7 +132,8 @@ describe('NanoclawAgentMailbox', () => {
       );`);
     });
 
-    getAgentMailbox().prepare(key);
+    const mailbox = getAgentMailbox();
+    mailbox.prepare(key);
 
     const tables = raw(inbound, (db) =>
       (db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all() as Array<{ name: string }>).map(
@@ -142,6 +143,16 @@ describe('NanoclawAgentMailbox', () => {
     for (const table of ['messages_in', 'delivered', 'destinations', 'session_routing', 'repo_ingress_fence']) {
       expect(tables).toContain(table);
     }
+
+    // The routing write is the op that used to fail on every spawn.
+    await mailbox.session(key, async (m) => {
+      m.setRouting({ channelType: 'slack', platformId: 'slack:C1', threadId: null });
+    });
+    expect(
+      raw(inbound, (db) =>
+        db.prepare('SELECT channel_type, platform_id, thread_id FROM session_routing WHERE id = 1').get(),
+      ),
+    ).toEqual({ channel_type: 'slack', platform_id: 'slack:C1', thread_id: null });
   });
 
   it('prepare() does not seed the migration memo — the first session() still applies the schema', async () => {
