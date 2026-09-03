@@ -499,29 +499,6 @@ export interface NanoclawMailboxSession extends MailboxSession {
   hasNonStatusReplyTo(messageId: string): boolean;
   /** The fork's `MAX(seq) + 2` direct write; opens the writable outbound handle. */
   writeOutboundDirect(message: DirectOutboundRow): void;
-
-  // --- TRANSITIONAL: raw handles for callers not yet on the seam ----------
-  /**
-   * The open inbound / readable outbound handles behind this session.
-   *
-   * These exist for exactly one reason: a handful of helpers the host sweep
-   * calls still take a `Database.Database` and live in files owned by other
-   * PRs of this series (`modules/scheduling/*`, `dashboard/thread-close.ts`,
-   * `session-manager.ts`, `db/usage.ts`). Handing them the session's own
-   * handle keeps the sweep on ONE open per session per duty instead of
-   * reopening the file beside a live session.
-   *
-   * Every use is a debt, not an API: `src/mailbox-seam-ratchet.ts` counts
-   * these names as raw access, so a file that calls one stays on the
-   * allowlist until its callee moves behind the seam. PR 7 deletes both.
-   *
-   * The handle is valid only for the duration of the action; never store it.
-   *
-   * @deprecated Removed in mailbox seam PR 7.
-   */
-  legacyInboundHandle(): Database.Database;
-  /** @deprecated Removed in mailbox seam PR 7. See `legacyInboundHandle`. */
-  legacyOutboundHandle(): Database.Database;
 }
 
 export type NanoclawMailboxAction<T> = (mailbox: NanoclawMailboxSession) => T | Promise<T>;
@@ -844,8 +821,5 @@ function forkOps(
       readOutbound(false, (outbound) => outboundHasRecentContentLike(outbound, marker, withinSeconds)),
     hasNonStatusReplyTo: (messageId) => readOutbound(false, (outbound) => hasNonStatusReplyTo(outbound, messageId)),
     writeOutboundDirect: (message) => writeOutboundDirectRow(writableOutbound(), message),
-
-    legacyInboundHandle: () => inbound,
-    legacyOutboundHandle: () => readableOutbound(),
   };
 }

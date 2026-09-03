@@ -15,7 +15,8 @@ vi.mock('../config.js', async (importOriginal) => ({
 }));
 
 import { initTestDb, closeDb, getDb } from './connection.js';
-import { ensureSchema, openInboundDb } from './session-db.js';
+import { ensureSchema } from '../modules/mailbox/schema.js';
+import { openInboundDb } from '../modules/mailbox/openers.js';
 import { scheduleTask, resolveActiveSession } from './scheduled-tasks.js';
 import { migration024 } from './migrations/024-sessions-channel-root-unique.js';
 import { taskThreadId } from './sessions.js';

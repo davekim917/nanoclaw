@@ -41,7 +41,8 @@ vi.mock('../approvals/index.js', () => ({
 }));
 
 import { closeDb, createAgentGroup, createMessagingGroup, initTestDb, runMigrations } from '../../db/index.js';
-import { initSessionFolder, inboundDbPath } from '../../session-manager.js';
+import { initSessionFolder } from '../../session-manager.js';
+import { inboundDbPath } from '../../mailbox/sqlite/paths.js';
 import type { AgentGroup, MessagingGroup, Session } from '../../types.js';
 import { addMember, isMember } from './db/agent-group-members.js';
 import { createUser } from './db/users.js';

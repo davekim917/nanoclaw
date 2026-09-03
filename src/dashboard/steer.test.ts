@@ -41,7 +41,11 @@ vi.mock('../modules/mailbox/read-only.js', () => ({
   readSessionOutbound: vi.fn().mockReturnValue(undefined),
 }));
 
-vi.mock('../db/session-db.js', () => ({
+// The sweep-family ops the steer path reaches transitively. Mocked at the op
+// family rather than at the deleted `db/session-db.js` façade (mailbox seam
+// PR 7) — same statements, one module further in.
+vi.mock('../modules/mailbox/ops/sweep.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../modules/mailbox/ops/sweep.js')>()),
   syncProcessingAcks: vi.fn(),
   countDueMessages: vi.fn().mockReturnValue(0),
   getProcessingClaims: vi.fn().mockReturnValue([]),

@@ -24,7 +24,7 @@ import { closeDb, getAllAgentGroups, initTestDb, runMigrations } from '../db/ind
 import { getContainerConfig } from '../db/container-configs.js';
 import { findTaskSessions } from '../db/sessions.js';
 import { STANDING_INSTRUCTIONS_FILE } from '../group-persona.js';
-import { inboundDbPath } from '../session-manager.js';
+import { inboundDbPath } from '../mailbox/sqlite/paths.js';
 import { createAgentFromTemplate } from './create-agent.js';
 
 function writeTemplate(): void {
@@ -67,8 +67,8 @@ afterEach(() => {
 });
 
 describe('createAgentFromTemplate', () => {
-  it('writes the persona prepend verbatim — no injected context refs, no .seed.md', () => {
-    const g = createAgentFromTemplate('sales/sdr', { name: 'SDR Test' });
+  it('writes the persona prepend verbatim — no injected context refs, no .seed.md', async () => {
+    const g = await createAgentFromTemplate('sales/sdr', { name: 'SDR Test' });
 
     const groupDir = path.join(GROUPS_DIR, g.folder);
     const prepend = fs.readFileSync(path.join(groupDir, STANDING_INSTRUCTIONS_FILE), 'utf-8');
@@ -76,15 +76,15 @@ describe('createAgentFromTemplate', () => {
     expect(fs.existsSync(path.join(groupDir, '.seed.md'))).toBe(false);
   });
 
-  it('copies template skills into the group-private Claude-plane skills dir', () => {
-    const g = createAgentFromTemplate('sales/sdr', { name: 'SDR Skills' });
+  it('copies template skills into the group-private Claude-plane skills dir', async () => {
+    const g = await createAgentFromTemplate('sales/sdr', { name: 'SDR Skills' });
 
     const skill = path.join(DATA_DIR, 'v2-sessions', g.id, '.claude-shared', 'skills', 'widget', 'SKILL.md');
     expect(fs.existsSync(skill)).toBe(true);
   });
 
-  it('writes MCP servers to the container config and context extras at their template-relative paths', () => {
-    const g = createAgentFromTemplate('sales/sdr', { name: 'SDR Mcp' });
+  it('writes MCP servers to the container config and context extras at their template-relative paths', async () => {
+    const g = await createAgentFromTemplate('sales/sdr', { name: 'SDR Mcp' });
 
     const cfg = getContainerConfig(g.id);
     expect(cfg).toBeTruthy();
@@ -97,10 +97,10 @@ describe('createAgentFromTemplate', () => {
     expect(fs.existsSync(path.join(groupDir, 'context'))).toBe(false);
   });
 
-  it('creates template tasks paused through the normal isolated task-session path', () => {
+  it('creates template tasks paused through the normal isolated task-session path', async () => {
     writeTask('weekday-briefing', '0 9 * * 1-5', 'Send the weekday briefing.');
 
-    const g = createAgentFromTemplate('sales/sdr', { name: 'SDR Tasks' });
+    const g = await createAgentFromTemplate('sales/sdr', { name: 'SDR Tasks' });
     const sessions = findTaskSessions(g.id);
     expect(sessions).toHaveLength(1);
 
@@ -121,11 +121,11 @@ describe('createAgentFromTemplate', () => {
     expect(fs.existsSync(path.join(GROUPS_DIR, g.folder, 'tasks', 'weekday-briefing.md'))).toBe(false);
   });
 
-  it('forwards multiline scripts unchanged through the shared task creation path', () => {
+  it('forwards multiline scripts unchanged through the shared task creation path', async () => {
     const script = 'count=2\necho \'{"wakeAgent": true, "data": {"count": 2}}\'';
     writeTask('alert-watch', '*/15 * * * *', 'Investigate new alerts.', script);
 
-    const g = createAgentFromTemplate('sales/sdr', { name: 'Scripted Tasks' });
+    const g = await createAgentFromTemplate('sales/sdr', { name: 'Scripted Tasks' });
     const sessions = findTaskSessions(g.id);
     expect(sessions).toHaveLength(1);
 
@@ -148,10 +148,10 @@ describe('createAgentFromTemplate', () => {
   it.each([
     ['invalid cron', 'not a cron', /invalid --recurrence/],
     ['too-frequent cron', '* * * * *', /has not been scheduled/],
-  ])('rejects %s before creating the agent group', (_case, schedule, expected) => {
+  ])('rejects %s before creating the agent group', async (_case, schedule, expected) => {
     writeTask('broken', schedule, 'Never created.');
 
-    expect(() => createAgentFromTemplate('sales/sdr', { name: 'Broken Tasks' })).toThrow(expected);
+    await expect(createAgentFromTemplate('sales/sdr', { name: 'Broken Tasks' })).rejects.toThrow(expected);
     expect(getAllAgentGroups()).toEqual([]);
     expect(fs.existsSync(path.join(GROUPS_DIR, 'broken-tasks'))).toBe(false);
   });

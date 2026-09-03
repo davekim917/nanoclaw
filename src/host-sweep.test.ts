@@ -166,7 +166,6 @@ vi.mock('./session-manager.js', async (importOriginal) => {
     ...real,
     admitDueTaskContexts: (...args: unknown[]) => mockAdmitDueTaskContexts(...args),
     writeSessionMessage: (...args: unknown[]) => mockWriteSessionMessage(...args),
-    outboundDbPath: real.outboundDbPath,
   };
 });
 
@@ -2515,8 +2514,8 @@ describe('recoverMoveIntents (D3) + pruneAuditBodies (D4)', () => {
   let recoverMoveIntents: typeof import('./host-sweep.js').recoverMoveIntents;
   let pruneAuditBodies: typeof import('./host-sweep.js').pruneAuditBodies;
   let migration043: typeof import('./db/migrations/043-scheduled-audit.js').migration043;
-  let ensureSchema: typeof import('./db/session-db.js').ensureSchema;
-  let openInboundDb: typeof import('./db/session-db.js').openInboundDb;
+  let ensureSchema: typeof import('./modules/mailbox/schema.js').ensureSchema;
+  let openInboundDb: typeof import('./modules/mailbox/openers.js').openInboundDb;
 
   // Unique per-file temp root (mkdtempSync) so parallel vitest workers never
   // share a fixed path and clobber each other's rmSync.
@@ -2533,7 +2532,8 @@ describe('recoverMoveIntents (D3) + pruneAuditBodies (D4)', () => {
   beforeEach(async () => {
     ({ recoverMoveIntents, pruneAuditBodies } = await import('./host-sweep.js'));
     ({ migration043 } = await import('./db/migrations/043-scheduled-audit.js'));
-    ({ ensureSchema, openInboundDb } = await import('./db/session-db.js'));
+    ({ ensureSchema } = await import('./modules/mailbox/schema.js'));
+    ({ openInboundDb } = await import('./modules/mailbox/openers.js'));
     savedDataDir = testDataDir.dir;
     testDataDir.dir = DIR;
     if (fs.existsSync(DIR)) fs.rmSync(DIR, { recursive: true });

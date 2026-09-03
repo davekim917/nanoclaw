@@ -1,5 +1,11 @@
 /**
- * Tests for core per-session messages_in schema maintenance.
+ * Tests for core per-session messages_in schema maintenance and the op
+ * families that read and write it.
+ *
+ * Moved here from `src/db/session-db.test.ts` when the mailbox seam deleted
+ * that façade (PR 7): the subject never changed — these have always exercised
+ * the module's openers, schema and ops — only the import path it reached them
+ * through did.
  *
  * Task-specific DB tests (insertTask, cancel/pause/resume, updateTask,
  * insertRecurrence) live in `src/modules/scheduling/db.test.ts` with the
@@ -13,26 +19,24 @@ import path from 'path';
 import { describe, it, expect, afterEach, vi } from 'vitest';
 
 import {
-  activateRepoIngressFence,
-  ensureSchema,
-  expireStalePending,
-  getDueWakePriority,
-  getInboundSourceSessionId,
-  insertMessage,
-  insertDeferredMessageWithContextIfNew,
-  migrateMessagesInTable,
   openInboundDb,
   openOutboundDb,
   openOutboundDbWritable,
-  releaseRepoIngressFence,
-  SessionDbMissingError,
   recoverHotJournal,
+  SessionDbMissingError,
+} from './openers.js';
+import { ensureSchema, migrateMessagesInTable } from './schema.js';
+import { activateRepoIngressFence, releaseRepoIngressFence } from './ops/fence.js';
+import {
+  getInboundSourceSessionId,
+  insertDeferredMessageWithContextIfNew,
+  insertMessage,
   sessionInboundHasMessage,
-  syncProcessingAcks,
   upsertSessionRouting,
-} from './session-db.js';
-import { INBOUND_SCHEMA } from './schema.js';
-import { DATA_DIR } from '../config.js';
+} from './ops/ingress.js';
+import { expireStalePending, getDueWakePriority, syncProcessingAcks } from './ops/sweep.js';
+import { INBOUND_SCHEMA } from '../../db/schema.js';
+import { DATA_DIR } from '../../config.js';
 
 const TEST_DIR = '/tmp/nanoclaw-session-db-test';
 const DB_PATH = path.join(TEST_DIR, 'inbound.db');
