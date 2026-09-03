@@ -17,7 +17,7 @@ The deterministic pre-task gate has already run. Its JSON is in
 If `scriptOutput.trigger` is not `develop_build_settled`, do not smoke an
 unknown build. Diagnose only the watcher evidence named by the trigger and use
 the task's single allowed chat send for one concise
-`<COORDINATOR> WATCHER — BLOCKED` root in the QA channel. A
+`<coordinator name> — watcher blocked` root in the QA channel, plain words, no log-style tag. A
 `gate_misconfigured` trigger names the missing `SMOKE_GATE_*` values in the
 deployed wrapper. Do not claim product coverage.
 
@@ -52,10 +52,12 @@ For `develop_build_settled`:
    exists to challenge — so a challenger marker in the required set would
    stall the run forever.
 3. Use the task's chat budget for the channel-root message:
-   `<COORDINATOR> SMOKE <runId> — STARTED`. Include the exact SHA, dev
-   environment, scope, run-record path, and browser/auth lease owner. Mention
-   the challenger agent with its independent challenge assignment and tell it
-   not to read the coordinator's tentative conclusions.
+   `<coordinator name> — smoke campaign started` (plain words, never a
+   log-style tag), then the exact SHA, dev environment, run id, and the
+   challenger hand-off as a real @-mention of the challenger's bot username
+   with its independent challenge assignment and the instruction not to read
+   the coordinator's tentative conclusions — a bare name wakes nobody. Scope
+   and lease owner go in the run record, not the post.
    Resolve the browser credential location from the group's standing
    instructions and mounts. Do not print or copy its values, search other agent
    folders, or reset the shared account.
