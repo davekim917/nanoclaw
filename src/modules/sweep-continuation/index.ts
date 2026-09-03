@@ -44,6 +44,8 @@ import {
   SweepWindowAbort,
   asSessionContext,
   containerOwnsOutbound,
+  withStoppedContainerSession,
+  writeOutboundWhenStopped,
   registerSweepDuty,
   registerSweepDutySource,
   registerSweepKillFollowUp,
@@ -133,7 +135,12 @@ async function incrementStoppedContinuationAttempt(
   expectedId: string,
 ): Promise<HostWorkContinuation | null> {
   try {
-    const result = await run((mailbox) =>
+    // A container that came up during the open now owns both outbound.db and
+    // the continuation's runner claim. Writing here would push the record back
+    // to `queued`, drop that runner_id and consume a recovery attempt the fresh
+    // runner never got — saved work duplicated, parked early, or lost.
+    // Returning without consuming the attempt leaves the next tick to decide.
+    const result = await withStoppedContainerSession(run, session, (mailbox) =>
       expectedId !== 'legacy-pending-next'
         ? mailbox.incrementWorkContinuationResumeAttempt(expectedId)
         : mailbox.migrateLegacyWorkContinuationForRecovery(),
@@ -158,7 +165,9 @@ async function restoreStoppedContinuationAttempt(
   previous: HostWorkContinuation,
 ): Promise<void> {
   try {
-    await run((mailbox) => mailbox.restoreWorkContinuationResumeAttempt(attempted, previous));
+    await withStoppedContainerSession(run, session, (mailbox) =>
+      mailbox.restoreWorkContinuationResumeAttempt(attempted, previous),
+    );
   } catch (err) {
     // Same split as the increment above: an opener failure is the window's to
     // report and unwind; anything else keeps the pre-seam warn-and-continue.
@@ -465,19 +474,16 @@ export function registerContinuationSweepDuties(): void {
     order: 70,
     run: (ctx) => {
       const { session, mailbox, plan } = asSessionContext(ctx);
-      if (
-        // Ownership, not liveness: both writes below land in outbound.db, and a
-        // container still spawning is about to own it (mailbox seam PR 5, 7199be48).
-        !containerOwnsOutbound(session.id) &&
-        plan.workContinuation &&
-        plan.workContinuation.resume_attempts >= WORK_CONTINUATION_RESUME_MAX_ATTEMPTS
-      ) {
-        const parked = mailbox!.parkDueRecoveryWakes(new Date().toISOString());
-        if (parked > 0) {
-          plan.dueCount = mailbox!.countDueMessages();
-          plan.wakePriority = plan.dueCount > 0 ? mailbox!.getDueWakePriority() : 'interactive';
-        }
-        if (plan.dueCount === 0) notifyContinuationParked(mailbox!, session, plan.workContinuation);
+      if (plan.workContinuation && plan.workContinuation.resume_attempts >= WORK_CONTINUATION_RESUME_MAX_ATTEMPTS) {
+        const continuation = plan.workContinuation;
+        writeOutboundWhenStopped(session, mailbox!, () => {
+          const parked = mailbox!.parkDueRecoveryWakes(new Date().toISOString());
+          if (parked > 0) {
+            plan.dueCount = mailbox!.countDueMessages();
+            plan.wakePriority = plan.dueCount > 0 ? mailbox!.getDueWakePriority() : 'interactive';
+          }
+          if (plan.dueCount === 0) notifyContinuationParked(mailbox!, session, continuation);
+        });
       }
     },
   });
@@ -558,7 +564,17 @@ export function registerContinuationSweepDuties(): void {
     run: (ctx, outcome, mailbox) => {
       if (outcome.action !== 'kill-ceiling') return;
       const snapshot = ctx.killSnapshot!;
-      notifyKillCeiling(mailbox, ctx.session, outcome.heartbeatAgeMs, snapshot.pendingClaims, snapshot.containerState);
+      // Per-write: `runSweepKillFollowUps` awaits between follow-ups, so the
+      // window's early-out cannot vouch for ownership at THIS write.
+      writeOutboundWhenStopped(ctx.session, mailbox, () =>
+        notifyKillCeiling(
+          mailbox,
+          ctx.session,
+          outcome.heartbeatAgeMs,
+          snapshot.pendingClaims,
+          snapshot.containerState,
+        ),
+      );
     },
   });
 
@@ -573,18 +589,27 @@ export function registerContinuationSweepDuties(): void {
     run: (ctx, outcome, mailbox) => {
       if (outcome.action !== 'kill-ceiling') return;
       const snapshot = ctx.killSnapshot!;
-      try {
-        applyCeilingFollowUp(
-          mailbox,
-          ctx.session,
-          snapshot.containerState,
-          snapshot.workContinuation,
-          outcome.heartbeatAgeMs,
-          outcome.ceilingMs,
-        );
-      } catch (err) {
-        log.warn('ceiling-kill follow-up failed', { sessionId: ctx.session.id, err });
-      }
+      // INSIDE the guard even though the row itself is inbound (host-owned, no
+      // single-writer hazard): a replacement that took the session has already
+      // recovered from this kill, so the row is `on_wake = 1`, the live
+      // replacement never consumes it, and it instead greets the NEXT fresh
+      // container with a stale "your previous container was killed" notice —
+      // while counting against that class's recovery-attempt cap. Skipping is
+      // correct, not merely safe (#332's reasoning, kept verbatim).
+      writeOutboundWhenStopped(ctx.session, mailbox, () => {
+        try {
+          applyCeilingFollowUp(
+            mailbox,
+            ctx.session,
+            snapshot.containerState,
+            snapshot.workContinuation,
+            outcome.heartbeatAgeMs,
+            outcome.ceilingMs,
+          );
+        } catch (err) {
+          log.warn('ceiling-kill follow-up failed', { sessionId: ctx.session.id, err });
+        }
+      });
     },
   });
 }
