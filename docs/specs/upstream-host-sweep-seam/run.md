@@ -296,3 +296,5 @@ Not started.
 - **S2-PR11 dispatched** (`worker-high`) from PR 9's merge commit `b51ef1ee` in `wt-s2-pr11` → `feat/host-sweep-seam-pr11-scheduling` (load 4.9).
 
 - 16:05:08Z — update-nanoclaw: BUILD END; host restarted on dist a03a9f65 == HEAD (#303 + mailbox #260 + #264). S2-PR1 live; soak clock 16:05Z. "#303 gate green" pending the timer checks.
+
+- 16:19Z — PR12 Codex verdict on 89f2d24c: needs-attention, 2 findings — F1 high (registry test side-effect-imports the module; barrel wiring unverified — series rule, wiring.test.ts already staged by the builder), F2 medium (F-12.2 failure case throws in `openOutboundDb`, not inside `rollupSessionUsage`; a cache write after open but before rollup would pass). Both accepted; correction batch sent to the builder, folded into the pending F-12.2 commit.
