@@ -106,13 +106,16 @@ import {
 } from './providers/provider-container-registry.js';
 import { buildContainerCodexConfig } from './providers/codex.js';
 import { getSessionClaudeMounts } from './session-claude-mounts.js';
+import { getAgentMailbox } from './mailbox/index.js';
 import {
   CLAUDE_CODE_PROJECTS_DIR,
   heartbeatPath,
   markContainerRunning,
   markContainerStopped,
   openInboundDb,
+  sessionContextPath,
   sessionDir,
+  writeSessionContext,
   writeSessionRouting,
 } from './session-manager.js';
 import {
@@ -747,6 +750,16 @@ async function spawnContainer(
   }
   writeSessionRouting(agentGroup.id, session.id);
 
+  // Materialize the runner's immutable startup context before buildMounts
+  // pushes its bind mount. The SQLite mailbox has no context to hand over, so
+  // the file holds `null` — it exists so the spawn path stops diverging from
+  // upstream's, and so an implementation that DOES need one (a networked
+  // mailbox, say) is a registration away rather than a spawn-path change.
+  const mailboxKey = { agentGroupId: agentGroup.id, sessionId: session.id };
+  const mailbox = getAgentMailbox();
+  writeSessionContext(agentGroup.id, session.id, await mailbox.runnerContext(mailboxKey));
+  const mailboxEnvironment = await mailbox.runnerEnvironment(mailboxKey);
+
   // The config was read once at the reserved-spawn boundary and is threaded
   // through workgroup reconciliation, provider resolution, mounts, and args.
   const effectiveResources = resolveContainerResources(containerConfig.resources);
@@ -933,6 +946,7 @@ async function spawnContainer(
     session.thread_id ?? null,
     repositoryWorkUnit,
     slackSafetyMessagingGroupId,
+    mailboxEnvironment,
   );
 
   // Snapshot host capabilities into the session dir so the container can
@@ -1831,6 +1845,14 @@ export function buildMounts(
   // The SDK-level `readonly: true` open in container/agent-runner/src/db/
   // connection.ts is belt and suspenders. The mount is the real boundary.
   mounts.push({ hostPath: sessDir, containerPath: '/workspace', readonly: false });
+  // The runner's immutable startup context, host-owned and outside the
+  // agent-writable session directory. spawnContainer writes it just after
+  // writeSessionRouting, before this runs, so the bind source always exists.
+  mounts.push({
+    hostPath: sessionContextPath(agentGroup.id, session.id),
+    containerPath: '/app/.nanoclaw-session.json',
+    readonly: true,
+  });
   const inboundDbFile = path.join(sessDir, 'inbound.db');
   if (fs.existsSync(inboundDbFile)) {
     mounts.push({ hostPath: inboundDbFile, containerPath: '/workspace/inbound.db', readonly: true });
@@ -3195,6 +3217,14 @@ async function buildContainerArgs(
    * that channel for assistant-name, channel-peer, or routing purposes.
    */
   slackSafetyMessagingGroupId?: string | null,
+  /**
+   * Non-secret runner configuration the registered mailbox contributes
+   * (`AgentMailbox.runnerEnvironment`). Empty for the SQLite mailbox — the
+   * session DBs are bind-mounted, so there is nothing to configure. Merged
+   * first so nothing below can be shadowed by it, matching upstream's
+   * spec-composition order.
+   */
+  mailboxEnvironment?: Record<string, string>,
 ): Promise<string[]> {
   // --init: tini as PID 1 reaps orphaned children (esbuild/gh corpses were
   // accumulating as zombies under bun, which doesn't reap as PID 1) and still
@@ -3208,6 +3238,7 @@ async function buildContainerArgs(
 
   // Environment — only vars read by code we don't own.
   // Everything NanoClaw-specific is in container.json (read by runner at startup).
+  for (const [key, value] of Object.entries(mailboxEnvironment ?? {})) args.push('-e', `${key}=${value}`);
   args.push('-e', `TZ=${TIMEZONE}`);
 
   // Claude Code behavior locks — duplicated from settings.json env block so
