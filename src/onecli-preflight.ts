@@ -117,8 +117,13 @@ export function pickProbeAgent(groups: Array<{ id: string; created_at: string }>
   return oldest?.id ?? null;
 }
 
-/** HTTP status carried by `OneCLIRequestError`, when the failure had one. */
-function httpStatusOf(err: unknown): number | undefined {
+/**
+ * HTTP status carried by `OneCLIRequestError`, when the failure had one.
+ *
+ * Exported because the spawn path classifies the same errors from the same
+ * SDK client (`src/onecli-apply.ts`). One classifier, one place to correct it.
+ */
+export function httpStatusOf(err: unknown): number | undefined {
   const status = (err as { statusCode?: unknown } | null | undefined)?.statusCode;
   return typeof status === 'number' ? status : undefined;
 }
@@ -134,9 +139,12 @@ function httpStatusOf(err: unknown): number | undefined {
  * carries only `url` and `statusCode`, and reading the header would mean
  * bypassing `getContainerConfig` — the very call this probe exists to make.
  */
-const RETRYABLE_4XX = new Set([408, 425, 429]);
+export const RETRYABLE_4XX: ReadonlySet<number> = new Set([408, 425, 429]);
 
-function isRetryableStatus(status: number | undefined): boolean {
+/**
+ * Shared with the spawn path (`src/onecli-apply.ts`) — see `httpStatusOf`.
+ */
+export function isRetryableStatus(status: number | undefined): boolean {
   if (status === undefined) return true; // transport failure — no response at all
   if (status >= 500) return true;
   return RETRYABLE_4XX.has(status);

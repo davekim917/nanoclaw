@@ -1,0 +1,260 @@
+/**
+ * Instrumented wrapper around the spawn path's `onecli.applyContainerConfig`.
+ *
+ * ## Why this module exists
+ *
+ * `applyContainerConfig` returning `false` aborts the spawn
+ * ("OneCLI gateway not applied — refusing to spawn container without
+ * credentials", `src/container-runner.ts`) and costs a ~60s sweep cycle of
+ * latency. On the live host that happened on **26% of spawns** under Node 20
+ * and still happens on ~2% under Node 22 (issue #239). Until now the log said
+ * only that it happened — never why — because the SDK throws the reason away
+ * twice over:
+ *
+ *   1. `ContainerClient.applyContainerConfig` rethrows `OneCLIRequestError`
+ *      only for a 4xx. Everything else — every transport failure, every 5xx —
+ *      becomes a bare `return false` with no error object at all.
+ *   2. `getContainerConfig`'s catch runs non-SDK errors through
+ *      `toOneCLIError`, which copies `error.message` and **drops `.cause`**.
+ *      An undici `TypeError: fetch failed` therefore arrives as
+ *      `OneCLIError("fetch failed")` with the real `cause.code`
+ *      (`UND_ERR_SOCKET`, `ECONNRESET`, …) already destroyed.
+ *
+ * So naming the cause requires a request this module makes itself, with the
+ * cause chain intact. That is `diagnose` below: it runs only on the failure
+ * path, and issues the same `GET /v1/container-config?agent=…` the SDK issues.
+ *
+ * ## Why exactly one retry, and only here
+ *
+ * The 48h forensics on issue #239 pinned the failure class precisely:
+ *
+ *   - **Not a timeout.** Refusals had a p50 of 39ms and a max of 21s against a
+ *     30s ceiling; 174 of 274 finished under 50ms. Refusals were *faster* than
+ *     successes (p50 149ms). The request dies at the connection.
+ *   - **Not a 4xx, and not the agent-creation race.** Zero `OneCLIRequestError`
+ *     in 48h. `ensureOnecliAgent`/`applyOnecliSecrets` ran immediately before
+ *     every refusal and succeeded, so the vault agent existed.
+ *   - **Not a gateway outage.** 230 of 237 refusals were immediately preceded
+ *     by a *successful* apply, median 19.4s earlier. They interleave with
+ *     successes rather than clustering.
+ *   - **Not the gateway at all.** `applyOnecliSecrets` reaches the same URL
+ *     with the same key ~30ms earlier via a `curl` subprocess and failed 0 out
+ *     of 1378 times, while the pooled `fetch()` failed 281 times.
+ *
+ * That is a per-request transport fault on a control API proved to be up at
+ * the instant of failure — a transient class, and a narrow one. One retry
+ * costs ~40ms against a 60s sweep cycle. It is deliberately not a blanket
+ * retry: a non-retryable 4xx (400/401/403/404 — a bad key or an unregistered
+ * identity) still fails on the first attempt, because retrying cannot heal a
+ * misconfiguration and pretending otherwise just delays the alarm.
+ *
+ * Status classification is imported from `./onecli-preflight.js` rather than
+ * restated, so the boot probe and the spawn path can never disagree about what
+ * counts as transient.
+ */
+import { ONECLI_API_KEY, ONECLI_URL } from './config.js';
+import { log } from './log.js';
+import { httpStatusOf, isRetryableStatus } from './onecli-preflight.js';
+
+/**
+ * Delay before the single retry. Short because the failure is a connection
+ * fault that resolves as soon as the pool hands out a different socket, not a
+ * busy gateway that needs time to recover — the forensics measured a 39ms p50
+ * failure, so a long backoff would only add latency to the thing it fixes.
+ */
+export const APPLY_RETRY_DELAY_MS = 250;
+
+/** Bound on the diagnostic probe, which must never itself stall a spawn. */
+export const DIAGNOSE_TIMEOUT_MS = 5_000;
+
+/** Why the apply failed, as far as we can name it. */
+export interface ApplyDiagnosis {
+  /** `false` when the SDK returned false; `throw` when it threw. */
+  outcome: 'returned-false' | 'threw';
+  /** HTTP status, when the failure carried one. `undefined` = transport fault. */
+  statusCode?: number;
+  /** Error message as the SDK surfaced it (already flattened for transport faults). */
+  message?: string;
+  /** Node/undici error code recovered by the diagnostic probe, e.g. `ECONNRESET`. */
+  causeCode?: string;
+  /** What the diagnostic probe found, when one ran. */
+  probe?: string;
+}
+
+export interface ApplyResult {
+  applied: boolean;
+  attempts: number;
+  /** Wall time of every attempt, in order. */
+  durationsMs: number[];
+  diagnosis?: ApplyDiagnosis;
+}
+
+export interface ApplyDeps {
+  /** The SDK call under test. Mirrors `OneCLI#applyContainerConfig`. */
+  applyContainerConfig: (args: string[], options: { addHostMapping: boolean; agent?: string }) => Promise<boolean>;
+  /** Names the transport fault the SDK flattened away. Returns a description. */
+  diagnose: (agent: string | undefined) => Promise<{ probe: string; causeCode?: string; statusCode?: number }>;
+  now: () => number;
+  sleep: (ms: number) => Promise<void>;
+  retryDelayMs: number;
+}
+
+/**
+ * Recover the `cause.code` an undici `TypeError: fetch failed` carries, walking
+ * one level of nesting. Exported for tests; pure.
+ */
+export function causeCodeOf(err: unknown): string | undefined {
+  let cursor: unknown = err;
+  for (let depth = 0; depth < 3 && cursor; depth++) {
+    const code = (cursor as { code?: unknown }).code;
+    if (typeof code === 'string') return code;
+    cursor = (cursor as { cause?: unknown }).cause;
+  }
+  return undefined;
+}
+
+/**
+ * Issue the SDK's own read request with the cause chain intact.
+ *
+ * Deliberately a raw `fetch` and not `getContainerConfig`: going back through
+ * the SDK would re-flatten the error through `toOneCLIError` and lose the very
+ * `cause.code` this call exists to recover. The URL and headers mirror
+ * `ContainerClient.getContainerConfig` exactly — if that shape ever moves, the
+ * probe reports a status mismatch rather than lying about the cause.
+ */
+async function realDiagnose(agent: string | undefined): Promise<{
+  probe: string;
+  causeCode?: string;
+  statusCode?: number;
+}> {
+  const base = (ONECLI_URL || 'http://127.0.0.1:10254').replace(/\/+$/, '');
+  const url = agent ? `${base}/v1/container-config?agent=${encodeURIComponent(agent)}` : `${base}/v1/container-config`;
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+  if (ONECLI_API_KEY) headers.Authorization = `Bearer ${ONECLI_API_KEY}`;
+  try {
+    const res = await fetch(url, { headers, signal: AbortSignal.timeout(DIAGNOSE_TIMEOUT_MS) });
+    if (!res.ok) return { probe: `control API answered ${res.status} ${res.statusText}`, statusCode: res.status };
+    return { probe: 'control API answered 200 on the diagnostic probe — the failure was transient' };
+  } catch (err) {
+    const code = causeCodeOf(err);
+    const message = err instanceof Error ? err.message : String(err);
+    return { probe: `diagnostic probe failed: ${message}${code ? ` (${code})` : ''}`, causeCode: code };
+  }
+}
+
+const realDeps: Omit<ApplyDeps, 'applyContainerConfig'> = {
+  diagnose: realDiagnose,
+  now: () => Date.now(),
+  sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+  retryDelayMs: APPLY_RETRY_DELAY_MS,
+};
+
+/**
+ * Run the apply with one bounded retry for the proved-transient class.
+ *
+ * Safe to retry with the same `args` array: the SDK fetches the config before
+ * pushing a single `-e`/`-v`, so a failed attempt leaves `args` untouched and
+ * a successful retry pushes exactly one copy.
+ *
+ * Pure of logging so tests can assert the decision separately from its
+ * consequences; `applyOnecliContainerConfig` adds the log lines.
+ */
+export async function runApplyWithRetry(
+  args: string[],
+  options: { addHostMapping: boolean; agent?: string },
+  deps: ApplyDeps,
+): Promise<ApplyResult> {
+  const durationsMs: number[] = [];
+  let diagnosis: ApplyDiagnosis | undefined;
+
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    const startedAt = deps.now();
+    try {
+      const applied = await deps.applyContainerConfig(args, options);
+      durationsMs.push(deps.now() - startedAt);
+      if (applied) return { applied: true, attempts: attempt, durationsMs, diagnosis };
+      // `false` is transport-or-5xx by construction (the SDK rethrows 4xx), so
+      // it is always in the retryable class.
+      diagnosis = { outcome: 'returned-false' };
+    } catch (err) {
+      durationsMs.push(deps.now() - startedAt);
+      const statusCode = httpStatusOf(err);
+      diagnosis = {
+        outcome: 'threw',
+        statusCode,
+        message: err instanceof Error ? err.message : String(err),
+        causeCode: causeCodeOf(err),
+      };
+      // A deterministic 4xx (bad key, unregistered identity) cannot be retried
+      // into success. Rethrow so the caller sees the real error, not a generic
+      // refusal — this is the one path that must stay loud and immediate.
+      if (!isRetryableStatus(statusCode)) throw err;
+    }
+
+    if (attempt === 1) await deps.sleep(deps.retryDelayMs);
+  }
+
+  // Both attempts failed. Name the cause the SDK flattened away.
+  const probe = await deps.diagnose(options.agent);
+  diagnosis = {
+    ...(diagnosis ?? { outcome: 'returned-false' }),
+    probe: probe.probe,
+    causeCode: probe.causeCode ?? diagnosis?.causeCode,
+    statusCode: diagnosis?.statusCode ?? probe.statusCode,
+  };
+  return { applied: false, attempts: 2, durationsMs, diagnosis };
+}
+
+/**
+ * Spawn-path entry point: apply the gateway config, retry once for the proved
+ * transient class, and log what actually happened either way.
+ *
+ * Returns the result rather than throwing so the caller keeps ownership of the
+ * "refusing to spawn" decision and its existing message.
+ */
+export async function applyOnecliContainerConfig(
+  args: string[],
+  options: { addHostMapping: boolean; agent?: string },
+  overrides: Partial<ApplyDeps> & Pick<ApplyDeps, 'applyContainerConfig'>,
+): Promise<ApplyResult> {
+  const deps: ApplyDeps = { ...realDeps, ...overrides };
+  const result = await runApplyWithRetry(args, options, deps);
+
+  if (result.applied && result.attempts === 1) return result;
+
+  if (result.applied) {
+    log.warn('OneCLI gateway apply failed once, retry succeeded', {
+      agent: options.agent ?? null,
+      attempts: result.attempts,
+      durationsMs: result.durationsMs,
+      outcome: result.diagnosis?.outcome ?? null,
+      statusCode: result.diagnosis?.statusCode ?? null,
+      causeCode: result.diagnosis?.causeCode ?? null,
+    });
+    return result;
+  }
+
+  log.warn('OneCLI gateway apply failed on both attempts — spawn will be refused', {
+    agent: options.agent ?? null,
+    attempts: result.attempts,
+    durationsMs: result.durationsMs,
+    outcome: result.diagnosis?.outcome ?? null,
+    statusCode: result.diagnosis?.statusCode ?? null,
+    causeCode: result.diagnosis?.causeCode ?? null,
+    message: result.diagnosis?.message ?? null,
+    probe: result.diagnosis?.probe ?? null,
+    url: ONECLI_URL ?? null,
+  });
+  return result;
+}
+
+/** One-line summary for the refusal error message. Pure, exported for tests. */
+export function describeDiagnosis(diagnosis: ApplyDiagnosis | undefined): string {
+  if (!diagnosis) return 'no diagnosis captured';
+  const parts: string[] = [diagnosis.outcome === 'threw' ? 'SDK threw' : 'SDK returned false'];
+  if (diagnosis.statusCode !== undefined) parts.push(`status ${diagnosis.statusCode}`);
+  if (diagnosis.causeCode) parts.push(diagnosis.causeCode);
+  if (diagnosis.message) parts.push(diagnosis.message);
+  if (diagnosis.probe) parts.push(diagnosis.probe);
+  return parts.join('; ');
+}

@@ -77,6 +77,7 @@ import { buildArchiveProjection, buildCentralProjection } from './db/per-agent-p
 import { initGroupFilesystem } from './group-init.js';
 import { stopTypingRefresh } from './modules/typing/index.js';
 import { log } from './log.js';
+import { applyOnecliContainerConfig, describeDiagnosis } from './onecli-apply.js';
 import {
   applyOnecliSecrets,
   ensureOnecliAgent,
@@ -3796,14 +3797,27 @@ async function buildContainerArgs(
       applyOnecliSecrets(identity, effectiveSecrets);
       effectiveIdentifier = identity;
     }
-    const onecliApplied = await onecli.applyContainerConfig(args, {
-      addHostMapping: false,
-      agent: effectiveIdentifier,
-    });
-    if (!onecliApplied) {
-      throw new Error('OneCLI gateway not applied — refusing to spawn container without credentials');
+    // Instrumented + retried once for the proved-transient class; see
+    // `src/onecli-apply.ts` for why one retry and why only for that class.
+    // A deterministic 4xx still throws straight out of here.
+    const applyResult = await applyOnecliContainerConfig(
+      args,
+      { addHostMapping: false, agent: effectiveIdentifier },
+      { applyContainerConfig: (a, o) => onecli.applyContainerConfig(a, o) },
+    );
+    if (!applyResult.applied) {
+      throw new Error(
+        `OneCLI gateway not applied — refusing to spawn container without credentials (${describeDiagnosis(
+          applyResult.diagnosis,
+        )})`,
+      );
     }
-    log.info('OneCLI gateway applied', { containerName });
+    log.info('OneCLI gateway applied', {
+      containerName,
+      agent: effectiveIdentifier ?? null,
+      attempts: applyResult.attempts,
+      durationsMs: applyResult.durationsMs,
+    });
 
     // CA bundle env vars for bundled-CA clients. OneCLI's SDK sets
     // SSL_CERT_FILE / NODE_EXTRA_CA_CERTS / DENO_CERT, but each tool below
