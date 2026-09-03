@@ -73,7 +73,8 @@ import {
 import { getDb, hasTable } from './db/connection.js';
 import { getMessagingGroup } from './db/messaging-groups.js';
 import { readRepoIngressFence } from './db/session-db.js';
-import { buildArchiveProjection, buildCentralProjection } from './db/per-agent-projections.js';
+import { buildCentralProjection } from './db/per-agent-projections.js';
+import { ensureArchiveProjection } from './db/archive-projection-worker.js';
 import { initGroupFilesystem } from './group-init.js';
 import { stopTypingRefresh } from './modules/typing/index.js';
 import { log } from './log.js';
@@ -741,11 +742,13 @@ async function spawnContainer(
   // Refresh the destination map and current-thread routing so any admin
   // changes take effect on wake. Destinations come from the agent-to-agent
   // module — skip when the module isn't installed (table absent).
+  const routingWritesStartedAt = Date.now();
   if (hasTable(getDb(), 'agent_destinations')) {
     const { writeDestinations } = await import('./modules/agent-to-agent/write-destinations.js');
     writeDestinations(agentGroup.id, session.id);
   }
   writeSessionRouting(agentGroup.id, session.id);
+  logSpawnStage('routing-writes', routingWritesStartedAt);
 
   // The config was read once at the reserved-spawn boundary and is threaded
   // through workgroup reconciliation, provider resolution, mounts, and args.
@@ -759,7 +762,9 @@ async function spawnContainer(
   // shared base) so derived images built via install_packages are checked
   // against their own label, not the base's. See src/agent-runner-image-check.ts.
   const spawnImageRef = containerConfig.imageTag || CONTAINER_IMAGE;
+  const depsDriftStartedAt = Date.now();
   const depsCheck = await checkAgentRunnerDepsDrift(spawnImageRef);
+  logSpawnStage('deps-drift-check', depsDriftStartedAt);
   if (!depsCheck.ok) {
     log.warn('Refusing spawn — agent-runner deps drift', {
       sessionId: session.id,
@@ -797,7 +802,10 @@ async function spawnContainer(
   // The returned workgroupId is threaded through buildMounts and other
   // downstream subsystems so they don't each re-derive from agentGroups,
   // which would race against any concurrent reconcile.
+  const workgroupPersistStartedAt = Date.now();
   const { workgroupId: resolvedWgId } = persistResolvedWorkgroupAtSpawn(getDb(), agentGroup, admittedWorkgroupId);
+  logSpawnStage('workgroup-persist', workgroupPersistStartedAt);
+  const repositoryFenceStartedAt = Date.now();
   const repositoryWorkUnit = resolveSessionRepositoryWorkUnit(session, resolvedWgId);
   if (isWorkgroupRepositoryMountClaimed(resolvedWgId)) {
     throw new Error(`Repository mount reconciliation in progress for ${resolvedWgId}; spawn will retry`);
@@ -839,6 +847,9 @@ async function spawnContainer(
   // outranks container.json — and mirrored onto the config + a synthetic
   // session so every downstream consumer (mounts, credentials, instruction
   // composition, worker roster) agrees on one provider.
+  logSpawnStage('repository-fence', repositoryFenceStartedAt);
+
+  const providerDecisionStartedAt = Date.now();
   const providerDecision = resolveSpawnProvider({
     agentGroupId: agentGroup.id,
     sessionProvider: session.agent_provider,
@@ -874,15 +885,23 @@ async function spawnContainer(
     ? { ...session, agent_provider: providerDecision.provider }
     : session;
 
+  logSpawnStage('provider-decision', providerDecisionStartedAt);
+
   const providerName = resolveProviderName(spawnSession.agent_provider, containerConfig.provider);
+  const groupFilesystemStartedAt = Date.now();
   initGroupFilesystem({ ...agentGroup, workgroup_id: resolvedWgId }, { provider: providerName });
+  logSpawnStage('group-filesystem-init', groupFilesystemStartedAt);
 
   // Resolve the effective provider + any host-side contribution it declares
   // (extra mounts, env passthrough). Computed once and threaded through both
   // buildMounts and buildContainerArgs so side effects (mkdir, etc.) fire once.
   const { provider, contribution } = resolveProviderContribution(spawnSession, agentGroup, containerConfig);
 
-  const mounts = buildMounts(agentGroup, session, containerConfig, provider, contribution, resolvedWgId);
+  // Wraps every stage logged inside buildMounts, so the sum of the parts can
+  // be checked against the whole rather than assumed to account for it.
+  const buildMountsStartedAt = Date.now();
+  const mounts = await buildMounts(agentGroup, session, containerConfig, provider, contribution, resolvedWgId);
+  logSpawnStage('build-mounts', buildMountsStartedAt);
   const containerName = `nanoclaw-v2-${agentGroup.folder}-${Date.now()}`;
   // OneCLI agent identifier is always the agent group id — stable across
   // sessions and reversible via getAgentGroup() for approval routing.
@@ -1763,7 +1782,22 @@ export function channelInstructionsMounts(
   return mounts;
 }
 
-export function buildMounts(
+/**
+ * One line per synchronous stage of a spawn, so the next stall can be
+ * attributed without another sampling session.
+ *
+ * #315 cost a day of investigation because the whole window between waking a
+ * container and loading the mount allowlist emitted no logs at all — roughly
+ * 1,450 lines of prologue, ending at the first OneCLI line, which is why the
+ * OneCLI path was blamed for a block that had already finished by then.
+ * Unconditional and unsampled: a stage that only stalls occasionally is
+ * exactly the one a sampled log would miss.
+ */
+function logSpawnStage(stage: string, startedAt: number): void {
+  log.info('Spawn stage timing', { stage, ms: Date.now() - startedAt });
+}
+
+export async function buildMounts(
   agentGroup: AgentGroup,
   session: Session,
   containerConfig: import('./container-config.js').ContainerConfig,
@@ -1776,7 +1810,7 @@ export function buildMounts(
   // field for direct callers (tests, etc.) that don't go through
   // spawnContainer.
   resolvedWgId?: string,
-): VolumeMount[] {
+): Promise<VolumeMount[]> {
   const projectRoot = process.cwd();
 
   // Default agent surfaces (composed project doc, skill links, provider state
@@ -1787,13 +1821,16 @@ export function buildMounts(
   const claudeDir = path.join(DATA_DIR, 'v2-sessions', agentGroup.id, '.claude-shared');
   if (defaultSurfaces) {
     // Sync skill symlinks based on container.json selection before mounting.
+    const skillSymlinksStartedAt = Date.now();
     syncSkillSymlinks(claudeDir, containerConfig);
+    logSpawnStage('skill-symlinks', skillSymlinksStartedAt);
 
     // Worker subagent defs (orchestrator mode) — Claude-only: other providers
     // don't read ~/.claude/agents, and the defs' frontmatter is Claude-format.
     // Best-effort: the roster is optional, a copy failure must not abort the
     // spawn (pending messages would retry with no container at all).
     if (provider === 'claude') {
+      const workerAgentDefsStartedAt = Date.now();
       try {
         syncWorkerAgentDefs(claudeDir);
       } catch (err) {
@@ -1802,11 +1839,14 @@ export function buildMounts(
           err: err instanceof Error ? err.message : String(err),
         });
       }
+      logSpawnStage('worker-agent-defs', workerAgentDefsStartedAt);
     }
 
     // Compose CLAUDE.md fresh every spawn from the shared base, enabled skill
     // fragments, and MCP server instructions. See `claude-md-compose.ts`.
+    const claudeMdStartedAt = Date.now();
     composeGroupClaudeMd(agentGroup, provider);
+    logSpawnStage('claude-md-compose', claudeMdStartedAt);
   }
 
   const mounts: VolumeMount[] = [];
@@ -1839,6 +1879,12 @@ export function buildMounts(
   // Repository scope is derived by one canonical work-unit resolver.
   // Same-topic siblings therefore share a checkout; different topics receive
   // different roots even when they use one repo.
+  //
+  // Everything from here to the workgroup-mounts stage line below is
+  // filesystem work: mkdir, realpath, readdir and lstat across the workgroup,
+  // worktree and tombstone trees. Timed as one stage because it is one
+  // contiguous run of sync fs calls with no natural seam.
+  const workgroupMountsStartedAt = Date.now();
   const wgKey = resolvedWgId ?? agentGroup.workgroup_id ?? agentGroup.folder;
   const repositoryWorkUnit = resolveSessionRepositoryWorkUnit(session, wgKey);
   const worktrees = topicWorktreesDir(repositoryWorkUnit);
@@ -2093,6 +2139,9 @@ export function buildMounts(
   // value the /workspace/workgroup mount above saw, eliminating the race
   // where two subsystems inside the same spawn could observe different
   // workgroup ids under a concurrent reconcile.
+  logSpawnStage('workgroup-mounts', workgroupMountsStartedAt);
+
+  const workgroupMembershipStartedAt = Date.now();
   let workgroupMemberIds: string[] | undefined;
   try {
     if (resolvedWgId) {
@@ -2143,13 +2192,27 @@ export function buildMounts(
       agentGroupId: agentGroup.id,
     });
   }
+  logSpawnStage('workgroup-membership', workgroupMembershipStartedAt);
 
-  buildArchiveProjection(archiveSrc, archiveDst, agentGroup.id, workgroupMemberIds);
+  // Awaited: the projection is rebuilt on a worker thread when its inputs have
+  // moved, and skipped entirely when they have not. It used to run
+  // synchronously here on every spawn, which parked the host event loop for
+  // seconds at a time — the dominant cause of #315. Fail-closed is unchanged:
+  // a build that runs and throws aborts the spawn.
+  const archiveProjectionStartedAt = Date.now();
+  await ensureArchiveProjection(archiveSrc, archiveDst, agentGroup.id, workgroupMemberIds);
+  logSpawnStage('archive-projection', archiveProjectionStartedAt);
   mounts.push({ hostPath: archiveDst, containerPath: '/workspace/archive.db', readonly: true });
 
   const centralSrc = path.join(DATA_DIR, 'v2.db');
   const centralDst = path.join(sessionDir(agentGroup.id, session.id), 'central.db');
+  // Still synchronous and still on the main thread: same pattern as the
+  // archive projection but against the 20 MB central DB, so it was never the
+  // headline cost. Left alone deliberately, and now measured rather than
+  // assumed — see the PR body.
+  const centralProjectionStartedAt = Date.now();
   buildCentralProjection(centralSrc, centralDst, agentGroup.id);
+  logSpawnStage('central-projection', centralProjectionStartedAt);
   mounts.push({ hostPath: centralDst, containerPath: '/workspace/central.db', readonly: true });
 
   // Shared agent-runner source — read-only, same code for all groups. This
@@ -2180,9 +2243,13 @@ export function buildMounts(
     });
   }
 
-  // Additional mounts from container config
+  // Additional mounts from container config. This is where the silent window
+  // ends — `validateAdditionalMounts` emits 'Mount allowlist loaded
+  // successfully', the first log line after the prologue.
   if (containerConfig.additionalMounts && containerConfig.additionalMounts.length > 0) {
+    const mountAllowlistStartedAt = Date.now();
     const validated = validateAdditionalMounts(containerConfig.additionalMounts, agentGroup.name);
+    logSpawnStage('mount-allowlist', mountAllowlistStartedAt);
     mounts.push(...validated);
   }
 

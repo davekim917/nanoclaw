@@ -65,13 +65,13 @@ function withWorkgroup(ag: AgentGroup): void {
   db.prepare('UPDATE agent_groups SET workgroup_id = ? WHERE id = ?').run(ag.folder, ag.id);
 }
 
-function spawnAppSrcMount(id: string): { hostPath: string; containerPath: string; readonly?: boolean } {
+async function spawnAppSrcMount(id: string): Promise<{ hostPath: string; containerPath: string; readonly?: boolean }> {
   const ag = group(`ag-runner-src-${id}`, `runner-src-group-${id}`);
   createAgentGroup(ag);
   withWorkgroup(ag);
   ensureContainerConfig(ag.id);
   initGroupFilesystem(ag, {});
-  const mounts = buildMounts(ag, session(`s-runner-src-${id}`, ag.id), containerConfig(), 'claude', {});
+  const mounts = await buildMounts(ag, session(`s-runner-src-${id}`, ag.id), containerConfig(), 'claude', {});
   const mount = mounts.find((m) => m.containerPath === '/app/src');
   if (!mount) throw new Error('expected a /app/src mount');
   return mount;
@@ -114,8 +114,8 @@ afterEach(() => {
   resetAgentRunnerSourceForTesting();
 });
 
-describe('activateAgentRunnerSource', () => {
-  it('spawn mounts the boot snapshot of the runner source, not the checkout', () => {
+describe('activateAgentRunnerSource', async () => {
+  it('spawn mounts the boot snapshot of the runner source, not the checkout', async () => {
     const sourceDir = makeFakeSourceDir();
     const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'nanoclaw-runner-data-'));
 
@@ -127,7 +127,7 @@ describe('activateAgentRunnerSource', () => {
       expect(fs.readFileSync(path.join(snapshotPath, rel))).toEqual(fs.readFileSync(path.join(sourceDir, rel)));
     }
 
-    const mount = spawnAppSrcMount('snapshot');
+    const mount = await spawnAppSrcMount('snapshot');
     expect(mount.hostPath).toBe(snapshotPath);
     expect(mount.readonly).toBe(true);
 
@@ -135,14 +135,14 @@ describe('activateAgentRunnerSource', () => {
     const livePath = activateAgentRunnerSource({ sourceDir, dataDir, live: true });
     expect(livePath).toBe(sourceDir);
     expect(agentRunnerSourcePath()).toBe(sourceDir);
-    const liveMount = spawnAppSrcMount('live');
+    const liveMount = await spawnAppSrcMount('live');
     expect(liveMount.hostPath).toBe(sourceDir);
 
     fs.rmSync(sourceDir, { recursive: true, force: true });
     fs.rmSync(dataDir, { recursive: true, force: true });
   });
 
-  it('a second boot replaces the snapshot and pruning removes only unreferenced previous snapshots', () => {
+  it('a second boot replaces the snapshot and pruning removes only unreferenced previous snapshots', async () => {
     const sourceDir = makeFakeSourceDir();
     const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'nanoclaw-runner-data-'));
     const root = path.join(dataDir, 'agent-runner-src');
@@ -191,7 +191,7 @@ describe('activateAgentRunnerSource', () => {
     fs.rmSync(dataDir, { recursive: true, force: true });
   });
 
-  it('falls back to the checkout path and keeps booting when the snapshot cannot be written', () => {
+  it('falls back to the checkout path and keeps booting when the snapshot cannot be written', async () => {
     const sourceDir = makeFakeSourceDir();
     // A regular file used as a path prefix — mkdirSync(recursive) under it
     // must fail with ENOTDIR, never throw out of activateAgentRunnerSource.

@@ -18,9 +18,13 @@
  * The on-disk projection files live alongside the session DBs at
  * `data/v2-sessions/<ag>/<sess>/archive.db` and `central.db`.
  */
+import { createHash } from 'crypto';
 import fs from 'fs';
+import path from 'path';
+
 import Database from 'better-sqlite3';
 
+import { DATA_DIR } from '../config.js';
 import { log } from '../log.js';
 
 /**
@@ -128,6 +132,26 @@ export function buildArchiveProjection(
     }
     const src = new Database(srcPath, { readonly: true });
     try {
+      // Materialized with `.all()`, deliberately, NOT streamed with
+      // `.iterate()`.
+      //
+      // Streaming looks better: `.all()` builds one JS array holding every
+      // matching row, `text` included, measured at 2.26 s and a 237 MB heap
+      // peak for the largest workgroup. But `archive.db` runs
+      // `journal_mode = TRUNCATE`, where a reader blocks a writer, and an open
+      // iterator would hold a shared lock on the canonical archive for the
+      // whole insert phase as well as the read. The host's `archiveMessage`
+      // writer is synchronous and on the main thread, so it would stall behind
+      // that lock or fail `SQLITE_BUSY` and drop the archive row — trading the
+      // stall this file is fixing for a different one. WAL would remove the
+      // conflict but is ruled out upstream: containers read `archive.db`
+      // through a read-only mount with no `-wal`/`-shm` sidecars, so WAL
+      // writes would be invisible to them (see `src/message-archive.ts`).
+      //
+      // `.all()` therefore holds the read lock only while reading, and the
+      // insert phase runs with the source released. The 2.26 s and the heap
+      // peak now land on the projection worker thread rather than the host's,
+      // which is what made them affordable.
       let rows: Array<Record<string, unknown>>;
       if (workgroupMemberIds && workgroupMemberIds.length > 0) {
         // ── Workgroup-widened SELECT with dedup ─────────────────────────
@@ -175,6 +199,8 @@ export function buildArchiveProjection(
       const colList = ARCHIVE_COLS.join(', ');
       const placeholders = ARCHIVE_COLS.map(() => '?').join(', ');
       const insertStmt = dst.prepare(`INSERT INTO messages_archive (${colList}) VALUES (${placeholders})`);
+      // Already one transaction around one prepared statement — the shape a
+      // row-at-a-time loop needs. Unchanged by this PR.
       const insertMany = dst.transaction((batch: Array<Record<string, unknown>>) => {
         for (const row of batch) {
           // Stamp the spawning agent's id onto every deduped row (see
@@ -197,6 +223,201 @@ export function buildArchiveProjection(
   } finally {
     dst.close();
   }
+}
+
+/**
+ * Everything the archive projection's contents depend on.
+ *
+ * Recorded next to the projection so a spawn can tell, without reading the
+ * 400 MB source, whether the file it already has is still the file this build
+ * would produce. See `ensureArchiveProjection`.
+ *
+ * Bump `ARCHIVE_PROJECTION_STAMP_VERSION` whenever `buildArchiveProjection`'s
+ * output changes for identical inputs — the schema, the dedup grouping, the
+ * column list. A stamp from an older builder never satisfies a newer one.
+ */
+export const ARCHIVE_PROJECTION_STAMP_VERSION = 1;
+
+export interface ArchiveProjectionStamp {
+  version: number;
+  agentGroupId: string;
+  /** Sorted workgroup member ids, or null for the legacy single-agent filter. */
+  scope: string[] | null;
+  /** Source file identity. Absent when the source does not exist yet. */
+  src: { size: string; mtimeNs: string } | null;
+  /**
+   * A HOT `-journal` sidecar, meaning a write was in flight when we looked.
+   * Null in the normal case, including when a zero-byte journal is present.
+   */
+  journal: { size: string; mtimeNs: string } | null;
+}
+
+function statSignature(filePath: string): { size: string; mtimeNs: string } | null {
+  try {
+    const stat = fs.statSync(filePath, { bigint: true });
+    return { size: String(stat.size), mtimeNs: String(stat.mtimeNs) };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * A rollback journal that actually holds pages, meaning a write was in flight.
+ *
+ * Existence alone does NOT mean that. Under `journal_mode = TRUNCATE` — which
+ * is what `archive.db` uses — SQLite commits by truncating the journal to zero
+ * bytes rather than deleting it, so `archive.db-journal` sits there
+ * permanently at length 0 on every healthy install. Treating its presence as a
+ * hot journal would make every freshness check fail and every spawn rebuild,
+ * which is the cost this stamp exists to avoid. Verified against the live host:
+ * `data/archive.db-journal` is a persistent zero-byte file.
+ */
+function hotJournalSignature(filePath: string): { size: string; mtimeNs: string } | null {
+  const signature = statSignature(filePath);
+  if (!signature || signature.size === '0') return null;
+  return signature;
+}
+
+/**
+ * Describe the inputs of the projection that `buildArchiveProjection` would
+ * write right now.
+ *
+ * Source-change detection is a file-identity check (size plus nanosecond
+ * mtime), NOT a row watermark, and that is deliberate. `messages_archive` is
+ * not append-only: `upsertArchiveMessage` (`src/message-archive.ts`) carries an
+ * `ON CONFLICT(id) DO UPDATE SET text = excluded.text` clause, so an edited
+ * message rewrites a row in place, leaving row count and `MAX(sent_at)`
+ * untouched. Any cheap scoped watermark would therefore miss edits and serve a
+ * container stale history. `PRAGMA data_version` is no help either — SQLite
+ * only guarantees it meaningful within one connection, and every spawn opens a
+ * fresh one.
+ *
+ * The cost of that soundness is a coarser gate: because the file identity
+ * covers the whole archive, a write for ANY agent group invalidates every
+ * group's stamp. Reuse therefore catches quiet periods, spawn bursts and spawn
+ * retries rather than most spawns on a busy host. Removing the stall does not
+ * depend on the hit rate — the rebuild runs off the main thread either way.
+ * `archive.db` runs `journal_mode = TRUNCATE`, so a commit always moves the
+ * main file; there is no WAL sidecar to miss. That mode also leaves a
+ * permanent zero-byte `-journal` file behind, which is why only a NON-EMPTY
+ * journal counts as a write in flight — see `hotJournalSignature`.
+ */
+export function computeArchiveProjectionStamp(
+  srcPath: string,
+  agentGroupId: string,
+  workgroupMemberIds?: string[],
+): ArchiveProjectionStamp {
+  return {
+    version: ARCHIVE_PROJECTION_STAMP_VERSION,
+    agentGroupId,
+    // Sorted so member order from the central DB cannot force a rebuild, and
+    // copied so a later mutation of the caller's array cannot alter the stamp.
+    scope: workgroupMemberIds ? [...workgroupMemberIds].sort() : null,
+    src: statSignature(srcPath),
+    journal: hotJournalSignature(`${srcPath}-journal`),
+  };
+}
+
+/**
+ * Where the stamp lives: a host-only tree under `DATA_DIR`, never a sidecar
+ * beside the projection.
+ *
+ * The projection sits in the session directory, and `buildMounts` bind-mounts
+ * that entire directory read-write at `/workspace`. A sidecar there would be
+ * container-writable, so a compromised container could replace it with a
+ * relative symlink and the host's next stamp write would follow it and
+ * truncate the target — the central database, say — as the host user. The
+ * projection file itself is safe from that because it is re-mounted read-only
+ * over its own path; a new sidecar had no such cover. Keeping stamps out of
+ * every mounted tree removes the class rather than guarding one instance of
+ * it. `writeArchiveProjectionStamp` still refuses to follow a symlink.
+ *
+ * Named by digest because the projection's absolute path is too long and too
+ * punctuated to be a filename. The path it describes is stored inside the
+ * stamp, so an operator can still tell which session a file belongs to.
+ */
+export function archiveProjectionStampPath(dstPath: string): string {
+  const digest = createHash('sha256').update(path.resolve(dstPath)).digest('hex').slice(0, 32);
+  return path.join(DATA_DIR, 'projection-stamps', `${digest}.json`);
+}
+
+export function readArchiveProjectionStamp(dstPath: string): ArchiveProjectionStamp | null {
+  const stampPath = archiveProjectionStampPath(dstPath);
+  let handle: number | undefined;
+  try {
+    // O_NOFOLLOW: a stamp that has become a symlink is not a stamp. Reading it
+    // would be harmless on its own, but refusing keeps read and write agreeing
+    // on what counts as a valid stamp file.
+    handle = fs.openSync(stampPath, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+    return JSON.parse(fs.readFileSync(handle, 'utf-8')) as ArchiveProjectionStamp;
+  } catch {
+    return null;
+  } finally {
+    if (handle !== undefined) fs.closeSync(handle);
+  }
+}
+
+export function writeArchiveProjectionStamp(dstPath: string, stamp: ArchiveProjectionStamp): void {
+  // Written only after the projection succeeds. `ensureArchiveProjection`
+  // removes any earlier stamp BEFORE dispatching a build, so a crash between
+  // the two leaves no stamp at all and the next spawn rebuilds. The failure
+  // mode is a wasted rebuild, never a partial projection served as fresh.
+  const stampPath = archiveProjectionStampPath(dstPath);
+  fs.mkdirSync(path.dirname(stampPath), { recursive: true });
+  // Unlink first, then create exclusively: O_CREAT|O_EXCL never follows a
+  // symlink, and `rm` removes a symlink itself rather than its target. Belt
+  // and braces — this tree is not mounted anywhere.
+  fs.rmSync(stampPath, { force: true });
+  const handle = fs.openSync(
+    stampPath,
+    fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW,
+    0o600,
+  );
+  try {
+    fs.writeFileSync(handle, JSON.stringify({ ...stamp, dstPath: path.resolve(dstPath) }));
+  } finally {
+    fs.closeSync(handle);
+  }
+}
+
+/**
+ * Drop the stamp, so nothing on disk claims the projection is current.
+ *
+ * Called before every rebuild. Without it, a rebuild that leaves a non-empty
+ * partial file behind — the schema is written before any row — would sit next
+ * to a still-matching earlier stamp, and the next spawn would mount that
+ * partial projection as fresh.
+ */
+export function removeArchiveProjectionStamp(dstPath: string): void {
+  fs.rmSync(archiveProjectionStampPath(dstPath), { force: true });
+}
+
+/**
+ * True when the projection already on disk was built from exactly these
+ * inputs, so rebuilding it would reproduce the same file byte for byte.
+ *
+ * Fails closed in every ambiguous case: a missing or unreadable stamp, a stamp
+ * from an older builder, a missing or empty projection file, or a source that
+ * has moved all return false and force a rebuild. A NON-EMPTY journal at either
+ * build time or now also forces one, since a commit was in flight and the main
+ * file's identity cannot be trusted to describe the committed state. The
+ * zero-byte journal that `journal_mode = TRUNCATE` leaves behind after every
+ * successful commit is not that, and must not block reuse.
+ */
+export function archiveProjectionIsFresh(dstPath: string, stamp: ArchiveProjectionStamp): boolean {
+  if (stamp.version !== ARCHIVE_PROJECTION_STAMP_VERSION) return false;
+  if (stamp.journal !== null) return false;
+  const previous = readArchiveProjectionStamp(dstPath);
+  if (!previous) return false;
+  try {
+    if (fs.statSync(dstPath).size === 0) return false;
+  } catch {
+    return false;
+  }
+  // Compare only the fields that decide the contents. `dstPath` is recorded
+  // for operators, not for the decision.
+  const { dstPath: _recordedPath, ...comparable } = previous as ArchiveProjectionStamp & { dstPath?: string };
+  return JSON.stringify(comparable) === JSON.stringify(stamp);
 }
 
 /**

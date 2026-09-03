@@ -114,8 +114,8 @@ afterEach(() => {
   fs.rmSync(TEST_ROOT, { recursive: true, force: true });
 });
 
-describe('container instruction contracts', () => {
-  it('routes Claude and OpenCode through the current seven-skill workflow', () => {
+describe('container instruction contracts', async () => {
+  it('routes Claude and OpenCode through the current seven-skill workflow', async () => {
     const retiredRoutes = ['/team-brief', '/team-design', '/team-qa'];
     const instructions = fs.readFileSync(path.join(process.cwd(), 'container/CLAUDE.md'), 'utf-8');
     expect(instructions).toContain('start with `/team-plan`');
@@ -126,7 +126,7 @@ describe('container instruction contracts', () => {
     for (const retired of retiredRoutes) expect(instructions).not.toContain(retired);
   });
 
-  it('keeps nested-container Codex delegation on the supported foreground transport', () => {
+  it('keeps nested-container Codex delegation on the supported foreground transport', async () => {
     const instructions = fs.readFileSync(path.join(process.cwd(), 'container/CLAUDE.md'), 'utf-8');
     expect(instructions).toContain('codex exec --yolo');
     expect(instructions).toContain('`timeout` to `3600000`');
@@ -138,7 +138,7 @@ describe('container instruction contracts', () => {
   // must survive the L1 rewrite with an assertable marker phrase. A floor
   // dropped or reworded to the point the marker disappears fails this test
   // BEFORE it can reach a live container — see docs/specs/instruction-stack-prune/plan.md.
-  it('keeps a marker phrase for every safety floor after the L1 rewrite', () => {
+  it('keeps a marker phrase for every safety floor after the L1 rewrite', async () => {
     const instructions = fs.readFileSync(path.join(process.cwd(), 'container/CLAUDE.md'), 'utf-8');
 
     // No credential-security assertion: the operator removed that section —
@@ -161,7 +161,7 @@ describe('container instruction contracts', () => {
     expect(instructions).toContain('IS the current contract');
   });
 
-  it('bans ISO dates and issue/PR references in the base file', () => {
+  it('bans ISO dates and issue/PR references in the base file', async () => {
     const instructions = fs.readFileSync(path.join(process.cwd(), 'container/CLAUDE.md'), 'utf-8');
     expect(instructions).not.toMatch(/\b20\d{2}-\d{2}-\d{2}\b/);
     // Matches a bare `#123` and a parenthesized `(#123)`.
@@ -180,7 +180,7 @@ describe('container instruction contracts', () => {
     'These are a DELIBERATE parallel implementation: the host is Node/ESM and the container is Bun, ' +
     'and they share no modules by design. Extraction is not an option — update BOTH files together.';
 
-  it('keeps the container Codex base config identical on both sides of the host/container boundary', () => {
+  it('keeps the container Codex base config identical on both sides of the host/container boundary', async () => {
     // Evaluate the container's array literal instead of substring-matching the
     // source: the `[projects."…"]` lines are built by a flatMap over template
     // literals, so they never appear verbatim in the file text.
@@ -211,7 +211,7 @@ describe('container instruction contracts', () => {
     ).toEqual(settings(buildContainerCodexConfig()));
   });
 
-  it('keeps IN_TREE_SHADOWED_PLUGINS identical on both sides of the host/container boundary', () => {
+  it('keeps IN_TREE_SHADOWED_PLUGINS identical on both sides of the host/container boundary', async () => {
     // The host copy is a function-local const in buildMounts, so both sides are
     // read as text.
     const shadowed = (rel: string) => {
@@ -233,8 +233,8 @@ describe('container instruction contracts', () => {
   });
 });
 
-describe('initGroupFilesystem agent surfaces', () => {
-  it('preserves local instructions and stages default Claude support files', () => {
+describe('initGroupFilesystem agent surfaces', async () => {
+  it('preserves local instructions and stages default Claude support files', async () => {
     const ag = group('ag-default', 'default-group');
     createAgentGroup(ag);
 
@@ -262,7 +262,7 @@ describe('initGroupFilesystem agent surfaces', () => {
 
     withWorkgroup(ag);
     ensureContainerConfig(ag.id);
-    buildMounts(ag, session('s-default-instructions', ag.id), containerConfig(), 'claude', {});
+    await buildMounts(ag, session('s-default-instructions', ag.id), containerConfig(), 'claude', {});
     expect(fs.readFileSync(path.join(groupDir, '.claude-fragments', 'standing-instructions.md'), 'utf-8')).toBe(
       'hello',
     );
@@ -271,7 +271,7 @@ describe('initGroupFilesystem agent surfaces', () => {
     expect(fs.readFileSync(path.join(groupDir, 'CLAUDE.md'), 'utf-8')).toContain('hello');
   });
 
-  it('reconciles the managed Bash maximum while preserving an operator-owned default', () => {
+  it('reconciles the managed Bash maximum while preserving an operator-owned default', async () => {
     const ag = group('ag-bash-timeout', 'bash-timeout-group');
     createAgentGroup(ag);
     initGroupFilesystem(ag, {});
@@ -289,7 +289,7 @@ describe('initGroupFilesystem agent surfaces', () => {
     expect(reconciled.env.BASH_DEFAULT_TIMEOUT_MS).toBe('45000');
   });
 
-  it('stages instructions outside memory for a provider with its own surfaces and is idempotent', () => {
+  it('stages instructions outside memory for a provider with its own surfaces and is idempotent', async () => {
     const ag = group('ag-surfy', 'surfy-group');
     createAgentGroup(ag);
 
@@ -313,7 +313,7 @@ describe('initGroupFilesystem agent surfaces', () => {
     expect(fs.existsSync(path.join(sessionRoot, '.claude-shared'))).toBe(false);
   });
 
-  it('leaves container-resolvable placeholder symlinks alone instead of writing through them', () => {
+  it('leaves container-resolvable placeholder symlinks alone instead of writing through them', async () => {
     const ag = group('ag-danglink', 'danglink-group');
     createAgentGroup(ag);
     const groupDir = path.join(GROUPS_DIR, ag.folder);
@@ -334,7 +334,7 @@ describe('initGroupFilesystem agent surfaces', () => {
     }
   });
 
-  it('writes nothing at all for a surfaces-owning provider without instructions', () => {
+  it('writes nothing at all for a surfaces-owning provider without instructions', async () => {
     const ag = group('ag-surfy-bare', 'surfy-bare-group');
     createAgentGroup(ag);
 
@@ -346,7 +346,7 @@ describe('initGroupFilesystem agent surfaces', () => {
     expect(fs.existsSync(path.join(groupDir, STANDING_INSTRUCTIONS_FILE))).toBe(false);
   });
 
-  it('treats an unregistered provider name as default support files without creating memory', () => {
+  it('treats an unregistered provider name as default support files without creating memory', async () => {
     const ag = group('ag-unknown', 'unknown-group');
     createAgentGroup(ag);
 
@@ -358,8 +358,8 @@ describe('initGroupFilesystem agent surfaces', () => {
   });
 });
 
-describe('initGroupFilesystem legacy seed isolation', () => {
-  it('never reads, transforms, or deletes .seed.md', () => {
+describe('initGroupFilesystem legacy seed isolation', async () => {
+  it('never reads, transforms, or deletes .seed.md', async () => {
     const ag = group('ag-seed', 'seed-group');
     createAgentGroup(ag);
     const groupDir = path.join(GROUPS_DIR, ag.folder);
@@ -383,7 +383,7 @@ describe('initGroupFilesystem legacy seed isolation', () => {
     expect(fs.existsSync(path.join(groupDir, 'memory'))).toBe(false);
   });
 
-  it('does not overwrite existing nonempty instruction surfaces', () => {
+  it('does not overwrite existing nonempty instruction surfaces', async () => {
     const ag = group('ag-existing-instructions', 'existing-instructions-group');
     createAgentGroup(ag);
     const groupDir = path.join(GROUPS_DIR, ag.folder);
@@ -399,8 +399,8 @@ describe('initGroupFilesystem legacy seed isolation', () => {
   });
 });
 
-describe('buildMounts agent surfaces', () => {
-  it('canonical-working-tree-is-not-container-accessible', () => {
+describe('buildMounts agent surfaces', async () => {
+  it('canonical-working-tree-is-not-container-accessible', async () => {
     const workgroupId = 'wg-repositories';
     const ag = group('ag-repositories', 'repositories-agent');
     createAgentGroup(ag);
@@ -434,9 +434,9 @@ describe('buildMounts agent surfaces', () => {
       thread_id: 'slack:C1:999999.000',
     } as Session;
 
-    const a = buildMounts(ag, siblingA, containerConfig(), 'claude', {}, workgroupId);
-    const b = buildMounts(ag, siblingB, containerConfig(), 'claude', {}, workgroupId);
-    const other = buildMounts(ag, otherTopic, containerConfig(), 'claude', {}, workgroupId);
+    const a = await buildMounts(ag, siblingA, containerConfig(), 'claude', {}, workgroupId);
+    const b = await buildMounts(ag, siblingB, containerConfig(), 'claude', {}, workgroupId);
+    const other = await buildMounts(ag, otherTopic, containerConfig(), 'claude', {}, workgroupId);
     const stableA = a.find((mount) => mount.containerPath === '/workspace/worktrees');
     const stableB = b.find((mount) => mount.containerPath === '/workspace/worktrees');
     const stableOther = other.find((mount) => mount.containerPath === '/workspace/worktrees');
@@ -478,7 +478,7 @@ describe('buildMounts agent surfaces', () => {
   // codex-as-peer mode — the runner redirects CODEX_HOME to
   // /home/node/.codex-runtime — and as nested mounts runc created both entries
   // as root inside the operator's host ~/.codex-<folder>/.
-  it('never nests global-codex config.toml or plugins inside a scoped ~/.codex home', () => {
+  it('never nests global-codex config.toml or plugins inside a scoped ~/.codex home', async () => {
     const ag = group('ag-codex-peer', 'codex-peer');
     createAgentGroup(ag);
     withWorkgroup(ag);
@@ -500,7 +500,7 @@ describe('buildMounts agent surfaces', () => {
     process.env.HOME = fakeHome;
     let mounts;
     try {
-      mounts = buildMounts(
+      mounts = await buildMounts(
         ag,
         session('s-codex-peer', ag.id),
         { ...containerConfig(), codexHostAuth: true },
@@ -519,7 +519,7 @@ describe('buildMounts agent surfaces', () => {
     expect(mounts.some((m) => m.hostPath === globalCodex || m.hostPath.startsWith(`${globalCodex}/`))).toBe(false);
   });
 
-  it('uses the OpenCode Go default at high effort when no DB override exists', () => {
+  it('uses the OpenCode Go default at high effort when no DB override exists', async () => {
     const ag = group('ag-opencode-defaults', 'opencode-defaults');
     createAgentGroup(ag);
     ensureContainerConfig(ag.id);
@@ -533,7 +533,7 @@ describe('buildMounts agent surfaces', () => {
     });
   });
 
-  it('keeps explicit OpenCode DB model and effort overrides authoritative', () => {
+  it('keeps explicit OpenCode DB model and effort overrides authoritative', async () => {
     const ag = group('ag-opencode-overrides', 'opencode-overrides');
     createAgentGroup(ag);
     ensureContainerConfig(ag.id);
@@ -548,7 +548,7 @@ describe('buildMounts agent surfaces', () => {
     });
   });
 
-  it('mounts one shared kernel-lock inode for real Claude, Codex, and OpenCode build plans', () => {
+  it('mounts one shared kernel-lock inode for real Claude, Codex, and OpenCode build plans', async () => {
     const workgroupId = 'shared-house';
     const providerGroups = [
       { provider: 'claude', ag: group('ag-lock-claude', 'lock-claude') },
@@ -563,12 +563,19 @@ describe('buildMounts agent surfaces', () => {
       initGroupFilesystem({ ...ag, workgroup_id: workgroupId }, { provider });
     }
 
-    const buildProviderMounts = (provider: string, ag: AgentGroup, suffix: string) => {
+    const buildProviderMounts = async (provider: string, ag: AgentGroup, suffix: string) => {
       const sess = session(`s-lock-${provider}-${suffix}`, ag.id);
-      return buildMounts(ag, sess, containerConfig(), provider, providerContribution(provider, ag, sess), workgroupId);
+      return await buildMounts(
+        ag,
+        sess,
+        containerConfig(),
+        provider,
+        providerContribution(provider, ag, sess),
+        workgroupId,
+      );
     };
     const assertNestedMounts = (
-      mounts: ReturnType<typeof buildMounts>,
+      mounts: Awaited<ReturnType<typeof buildMounts>>,
       expectParent: boolean,
     ): { dev: number; ino: number } => {
       const parentIdx = mounts.findIndex((mount) => mount.containerPath === '/workspace/workgroup');
@@ -592,8 +599,10 @@ describe('buildMounts agent surfaces', () => {
 
     // The test config forces WORKGROUP_SHARED_FS off. All three real provider
     // build plans still receive the exact nested memory + lock mounts.
-    const memoryOnlyIdentities = providerGroups.map(({ provider, ag }) =>
-      assertNestedMounts(buildProviderMounts(provider, ag, 'memory-only'), false),
+    const memoryOnlyIdentities = await Promise.all(
+      providerGroups.map(async ({ provider, ag }) =>
+        assertNestedMounts(await buildProviderMounts(provider, ag, 'memory-only'), false),
+      ),
     );
     expect(new Set(memoryOnlyIdentities.map(({ dev, ino }) => `${dev}:${ino}`)).size).toBe(1);
 
@@ -601,8 +610,10 @@ describe('buildMounts agent surfaces', () => {
     // the flag disabled. The nested file overlay must remain later than both
     // the parent and memory mounts for every provider.
     fs.writeFileSync(path.join(DATA_DIR, 'workgroups', workgroupId, '.migrated'), '{}\n');
-    const fullIdentities = providerGroups.map(({ provider, ag }) =>
-      assertNestedMounts(buildProviderMounts(provider, ag, 'full'), true),
+    const fullIdentities = await Promise.all(
+      providerGroups.map(async ({ provider, ag }) =>
+        assertNestedMounts(await buildProviderMounts(provider, ag, 'full'), true),
+      ),
     );
     expect(new Set(fullIdentities.map(({ dev, ino }) => `${dev}:${ino}`)).size).toBe(1);
     expect(fullIdentities[0]).toEqual(memoryOnlyIdentities[0]);
@@ -613,26 +624,28 @@ describe('buildMounts agent surfaces', () => {
     ensureContainerConfig(outsider.id);
     initGroupFilesystem({ ...outsider, workgroup_id: 'other-house' }, { provider: 'claude' });
     const outsiderSession = session('s-lock-outsider', outsider.id);
-    const outsiderLock = buildMounts(
-      outsider,
-      outsiderSession,
-      containerConfig(),
-      'claude',
-      providerContribution('claude', outsider, outsiderSession),
-      'other-house',
+    const outsiderLock = (
+      await buildMounts(
+        outsider,
+        outsiderSession,
+        containerConfig(),
+        'claude',
+        providerContribution('claude', outsider, outsiderSession),
+        'other-house',
+      )
     ).find((mount) => mount.containerPath === '/workspace/workgroup/.memory-write.lock');
     expect(outsiderLock?.hostPath).toBe(path.join(DATA_DIR, 'workgroups', 'other-house', '.memory-write.lock'));
     expect(outsiderLock?.hostPath).not.toBe(path.join(DATA_DIR, 'workgroups', workgroupId, '.memory-write.lock'));
   });
 
-  it('mounts the default surfaces for an unregistered provider (today’s behavior)', () => {
+  it('mounts the default surfaces for an unregistered provider (today’s behavior)', async () => {
     const ag = group('ag-mounts-default', 'mounts-default');
     createAgentGroup(ag);
     withWorkgroup(ag);
     ensureContainerConfig(ag.id);
     initGroupFilesystem(ag, {});
 
-    const mounts = buildMounts(ag, session('s1', ag.id), containerConfig(), 'claude', {});
+    const mounts = await buildMounts(ag, session('s1', ag.id), containerConfig(), 'claude', {});
 
     const byContainerPath = new Map(mounts.map((m) => [m.containerPath, m]));
     expect(byContainerPath.has('/home/node/.claude')).toBe(true);
@@ -642,7 +655,7 @@ describe('buildMounts agent surfaces', () => {
     expect(fs.existsSync(path.join(GROUPS_DIR, ag.folder, 'CLAUDE.md'))).toBe(true);
   });
 
-  it('suppresses the default surfaces and keeps contributed mounts for a surfaces-providing provider', () => {
+  it('suppresses the default surfaces and keeps contributed mounts for a surfaces-providing provider', async () => {
     const ag = group('ag-mounts-surfy', 'mounts-surfy');
     createAgentGroup(ag);
     withWorkgroup(ag);
@@ -658,7 +671,13 @@ describe('buildMounts agent surfaces', () => {
         },
       ],
     };
-    const mounts = buildMounts(ag, session('s2', ag.id), containerConfig(), 'surfaces-test-provider', contributed);
+    const mounts = await buildMounts(
+      ag,
+      session('s2', ag.id),
+      containerConfig(),
+      'surfaces-test-provider',
+      contributed,
+    );
 
     const containerPaths = mounts.map((m) => m.containerPath);
     expect(containerPaths).not.toContain('/home/node/.claude');
@@ -673,7 +692,7 @@ describe('buildMounts agent surfaces', () => {
     expect(containerPaths).toContain('/workspace/agent/OWN-DOC.md');
   });
 
-  it('test_no_skill_is_force_added_beyond_the_group_selection', () => {
+  it('test_no_skill_is_force_added_beyond_the_group_selection', async () => {
     const cases: Array<{ provider: string; skills: ContainerConfig['skills']; suffix: string; expected?: string[] }> = [
       { provider: 'claude', skills: 'all', suffix: 'all' },
       { provider: 'codex', skills: [], suffix: 'empty', expected: [] },
@@ -687,7 +706,7 @@ describe('buildMounts agent surfaces', () => {
       ensureContainerConfig(ag.id);
       initGroupFilesystem(ag, {});
 
-      buildMounts(
+      await buildMounts(
         ag,
         session(`s-skills-${testCase.suffix}`, ag.id),
         { ...containerConfig(), skills: testCase.skills },
@@ -705,7 +724,7 @@ describe('buildMounts agent surfaces', () => {
     }
   });
 
-  it('test_gitnexus_host_plugin_and_builtin_hook_never_mount', () => {
+  it('test_gitnexus_host_plugin_and_builtin_hook_never_mount', async () => {
     const homedir = path.join(TEST_ROOT, 'home');
     const pluginsDir = path.join(homedir, 'plugins');
     const builtinDir = path.join(TEST_ROOT, 'container', 'nanoclaw-plugin');
@@ -721,7 +740,7 @@ describe('buildMounts agent surfaces', () => {
       ensureContainerConfig(ag.id);
       initGroupFilesystem(ag, {});
 
-      const mounts = buildMounts(ag, session('s-plugin-shadow', ag.id), containerConfig(), 'claude', {});
+      const mounts = await buildMounts(ag, session('s-plugin-shadow', ag.id), containerConfig(), 'claude', {});
       const paths = mounts.map((mount) => mount.containerPath);
       expect(paths).not.toContain('/workspace/plugins/gitnexus');
       expect(paths).not.toContain('/workspace/plugins/nanoclaw-hooks');
@@ -732,8 +751,8 @@ describe('buildMounts agent surfaces', () => {
   });
 });
 
-describe('worker agent def sync (orchestrator roster)', () => {
-  it('copies trunk defs for a claude spawn, prunes retired managed defs, preserves operator files', () => {
+describe('worker agent def sync (orchestrator roster)', async () => {
+  it('copies trunk defs for a claude spawn, prunes retired managed defs, preserves operator files', async () => {
     const ag = group('ag-worker-defs', 'worker-defs');
     createAgentGroup(ag);
     withWorkgroup(ag);
@@ -747,7 +766,7 @@ describe('worker agent def sync (orchestrator roster)', () => {
     fs.mkdirSync(agentsDir, { recursive: true });
     fs.writeFileSync(path.join(agentsDir, 'custom-op.md'), 'operator-owned\n');
 
-    buildMounts(ag, session('s-wd', ag.id), containerConfig(), 'claude', {});
+    await buildMounts(ag, session('s-wd', ag.id), containerConfig(), 'claude', {});
 
     // Trunk roster copied byte-for-byte.
     for (const def of ['worker-fast.md', 'worker.md', 'worker-high.md', 'worker-frontier.md', 'worker-codex.md']) {
@@ -797,7 +816,7 @@ describe('worker agent def sync (orchestrator roster)', () => {
     );
   });
 
-  it('never deletes outside the agents dir even if a poisoned file is planted (F1 traversal guard)', () => {
+  it('never deletes outside the agents dir even if a poisoned file is planted (F1 traversal guard)', async () => {
     const ag = group('ag-worker-defs-sec', 'worker-defs-sec');
     createAgentGroup(ag);
     withWorkgroup(ag);
@@ -816,26 +835,26 @@ describe('worker agent def sync (orchestrator roster)', () => {
       JSON.stringify(['../../../../canary-must-survive.txt']),
     );
 
-    buildMounts(ag, session('s-wd-sec', ag.id), containerConfig(), 'claude', {});
+    await buildMounts(ag, session('s-wd-sec', ag.id), containerConfig(), 'claude', {});
 
     expect(fs.existsSync(canary)).toBe(true);
   });
 
-  it('skips the worker-def sync when the spawn-resolved provider is codex', () => {
+  it('skips the worker-def sync when the spawn-resolved provider is codex', async () => {
     const ag = group('ag-worker-defs-cx', 'worker-defs-cx');
     createAgentGroup(ag);
     withWorkgroup(ag);
     ensureContainerConfig(ag.id);
     initGroupFilesystem(ag, {});
 
-    buildMounts(ag, session('s-wd-cx', ag.id), containerConfig(), 'codex', {});
+    await buildMounts(ag, session('s-wd-cx', ag.id), containerConfig(), 'codex', {});
 
     expect(fs.existsSync(path.join(DATA_DIR, 'v2-sessions', ag.id, '.claude-shared', 'agents'))).toBe(false);
   });
 });
 
-describe('retired mirror snapshot topology', () => {
-  it('does not expose old mirror-backed snapshots as repository canonicals', () => {
+describe('retired mirror snapshot topology', async () => {
+  it('does not expose old mirror-backed snapshots as repository canonicals', async () => {
     const ag = group('ag-snap', 'snap-group');
     createAgentGroup(ag);
     assignWorkgroup(ag, 'wg-snap');
@@ -852,15 +871,15 @@ describe('retired mirror snapshot topology', () => {
     // A mirror with no snapshot yet must NOT produce a mount.
     fs.mkdirSync(path.join(wgShared, '.repos', 'pending.git'), { recursive: true });
 
-    const mounts = buildMounts(ag, session('s-snap', ag.id), containerConfig(), 'claude', {}, 'wg-snap');
+    const mounts = await buildMounts(ag, session('s-snap', ag.id), containerConfig(), 'claude', {}, 'wg-snap');
     const snap = mounts.find((m) => m.containerPath === '/workspace/workgroup/proj');
     expect(snap).toBeUndefined();
     expect(mounts.find((m) => m.containerPath === '/workspace/workgroup/pending')).toBeUndefined();
   });
 });
 
-describe('symlink overlay workgroup allowlist', () => {
-  it('mounts same-workgroup targets and refuses outside targets', () => {
+describe('symlink overlay workgroup allowlist', async () => {
+  it('mounts same-workgroup targets and refuses outside targets', async () => {
     const ag = group('ag-sym', 'sym-main');
     const sib = group('ag-sym-sib', 'sym-sib');
     const outsider = group('ag-out', 'out-group');
@@ -886,14 +905,14 @@ describe('symlink overlay workgroup allowlist', () => {
     fs.symlinkSync(outsiderTarget, path.join(groupDir, 'STOLEN'));
     fs.symlinkSync(hostTarget, path.join(groupDir, 'HOST'));
 
-    const mounts = buildMounts(ag, session('s-sym', ag.id), containerConfig(), 'claude', {}, 'wg-sym');
+    const mounts = await buildMounts(ag, session('s-sym', ag.id), containerConfig(), 'claude', {}, 'wg-sym');
     const containerPaths = mounts.map((m) => m.containerPath);
     expect(containerPaths).toContain('/workspace/agent/SHARED-REPO');
     expect(containerPaths).not.toContain('/workspace/agent/STOLEN');
     expect(containerPaths).not.toContain('/workspace/agent/HOST');
   });
 
-  it('declares the redirected destination for an upward-escaping relative symlink', () => {
+  it('declares the redirected destination for an upward-escaping relative symlink', async () => {
     const ag = group('ag-rel', 'rel-main');
     const sib = group('ag-rel-sib', 'rel-sib');
     createAgentGroup(ag);
@@ -916,7 +935,7 @@ describe('symlink overlay workgroup allowlist', () => {
     fs.mkdirSync(path.join(GROUPS_DIR, sib.folder, 'SHARED-ABS'), { recursive: true });
     fs.symlinkSync(path.join(GROUPS_DIR, sib.folder, 'SHARED-ABS'), path.join(groupDir, 'SHARED-ABS'));
 
-    const mounts = buildMounts(ag, session('s-rel', ag.id), containerConfig(), 'claude', {}, 'wg-rel');
+    const mounts = await buildMounts(ag, session('s-rel', ag.id), containerConfig(), 'claude', {}, 'wg-rel');
     const containerPaths = mounts.map((m) => m.containerPath);
     expect(containerPaths).toContain('/workspace/rel-sib/SHARED-REL');
     expect(containerPaths).not.toContain('/workspace/agent/SHARED-REL');
@@ -926,7 +945,7 @@ describe('symlink overlay workgroup allowlist', () => {
     );
   });
 
-  it('redirects relative targets that escape only after normalization', () => {
+  it('redirects relative targets that escape only after normalization', async () => {
     const ag = group('ag-norm', 'norm-main');
     const sib = group('ag-norm-sib', 'norm-sib');
     createAgentGroup(ag);
@@ -948,7 +967,7 @@ describe('symlink overlay workgroup allowlist', () => {
     fs.mkdirSync(path.join(groupDir, 'sub'), { recursive: true });
     fs.symlinkSync('sub/../../norm-sib/DEEP-REL', path.join(groupDir, 'DEEP-REL'));
 
-    const mounts = buildMounts(ag, session('s-norm', ag.id), containerConfig(), 'claude', {}, 'wg-norm');
+    const mounts = await buildMounts(ag, session('s-norm', ag.id), containerConfig(), 'claude', {}, 'wg-norm');
     const containerPaths = mounts.map((m) => m.containerPath);
     expect(containerPaths).toContain('/workspace/norm-sib/DOT-REL');
     expect(containerPaths).not.toContain('/workspace/agent/DOT-REL');
@@ -956,7 +975,7 @@ describe('symlink overlay workgroup allowlist', () => {
     expect(containerPaths).not.toContain('/workspace/agent/DEEP-REL');
   });
 
-  it('redirects through an intermediate symlink that only the filesystem can resolve', () => {
+  it('redirects through an intermediate symlink that only the filesystem can resolve', async () => {
     const ag = group('ag-chain', 'chain-main');
     const sib = group('ag-chain-sib', 'chain-sib');
     createAgentGroup(ag);
@@ -975,7 +994,7 @@ describe('symlink overlay workgroup allowlist', () => {
     fs.symlinkSync('../../chain-sib', path.join(groupDir, 'sub', 'jump'));
     fs.symlinkSync('sub/jump/T', path.join(groupDir, 'CHAINED'));
 
-    const mounts = buildMounts(ag, session('s-chain', ag.id), containerConfig(), 'claude', {}, 'wg-chain');
+    const mounts = await buildMounts(ag, session('s-chain', ag.id), containerConfig(), 'claude', {}, 'wg-chain');
     const containerPaths = mounts.map((m) => m.containerPath);
     expect(containerPaths).toContain('/workspace/chain-sib/T');
     expect(containerPaths).not.toContain('/workspace/agent/CHAINED');
