@@ -70,17 +70,48 @@ describe('L-3: startHostModules fires after the delivery adapter and before the 
   });
 });
 
-describe('L-4: the lifecycle port registers no callbacks', () => {
-  it('importing the modules barrel leaves both host-lifecycle registries empty', async () => {
+/**
+ * L-4 ("the lifecycle port registers no callbacks") is superseded here: PR 1
+ * gives the six main.ts timers + sweep-storage real registrants, so an empty
+ * registry is no longer the invariant post-PR-1. T-5 replaces it with the
+ * new invariant — a stable registration COUNT, independent of env gates.
+ */
+describe('T-5: after PR 1 the registries hold exactly the six timer starts and seven shutdowns, regardless of env gates', () => {
+  it('importing the modules barrel plus the six timer modules registers 6 starts and 7 shutdowns', async () => {
     const lifecycle = await import('./host-lifecycle.js');
-    expect(lifecycle.getHostStartCallbacks()).toHaveLength(0);
-    expect(lifecycle.getHostShutdownCallbacks()).toHaveLength(0);
-
-    // Production barrel — side-effect imports populate module registries,
-    // same pattern as src/guard/conformance.test.ts.
+    // Production barrel — side-effect imports populate module registries
+    // (sweep-storage's onHostShutdown), same pattern as src/guard/conformance.test.ts.
     await import('./modules/index.js');
+    // The six timer modules are NOT part of the modules barrel — main.ts
+    // imports them directly for their onHostStart/onHostShutdown side effects.
+    await import('./worktree-cleanup.js');
+    await import('./repo-freshness.js');
+    await import('./plugin-updater.js');
+    await import('./commit-scan.js');
+    await import('./daily-summary.js');
+    await import('./backlog-canvas.js');
 
-    expect(lifecycle.getHostStartCallbacks()).toHaveLength(0);
-    expect(lifecycle.getHostShutdownCallbacks()).toHaveLength(0);
+    expect(lifecycle.getHostStartCallbacks()).toHaveLength(6);
+    expect(lifecycle.getHostShutdownCallbacks()).toHaveLength(7);
+  });
+
+  it('holds the same counts with DAILY_SUMMARY_ENABLED=0 and BACKLOG_CANVAS_ENABLED=0 — a disabled duty still registers and no-ops', async () => {
+    vi.stubEnv('DAILY_SUMMARY_ENABLED', '0');
+    vi.stubEnv('BACKLOG_CANVAS_ENABLED', '0');
+    try {
+      const lifecycle = await import('./host-lifecycle.js');
+      await import('./modules/index.js');
+      await import('./worktree-cleanup.js');
+      await import('./repo-freshness.js');
+      await import('./plugin-updater.js');
+      await import('./commit-scan.js');
+      await import('./daily-summary.js');
+      await import('./backlog-canvas.js');
+
+      expect(lifecycle.getHostStartCallbacks()).toHaveLength(6);
+      expect(lifecycle.getHostShutdownCallbacks()).toHaveLength(7);
+    } finally {
+      vi.unstubAllEnvs();
+    }
   });
 });
