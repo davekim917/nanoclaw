@@ -10,6 +10,7 @@ import fs from 'fs';
 import path from 'path';
 
 import { DATA_DIR } from './config.js';
+import { onHostShutdown, onHostStart } from './host-lifecycle.js';
 import { log } from './log.js';
 import { refreshCanonicalFromLocalRefs } from './modules/repository-workspaces/index.js';
 import { discoverCanonicalRepositories, repositoriesRoot, repositoryCoordinationDir } from './repository-workspaces.js';
@@ -121,9 +122,14 @@ export function startRepoFreshness(): void {
   if (intervalHandle || startupHandle) return;
   startupHandle = setTimeout(() => {
     startupHandle = null;
-    void runFreshnessOnce();
+    void runFreshnessOnce().catch((err) => log.error('Repo freshness: startup run failed', { err }));
   }, STARTUP_DELAY_MS);
-  intervalHandle = setInterval(() => void runFreshnessOnce(), FRESHNESS_INTERVAL_MS);
+  startupHandle.unref?.();
+  intervalHandle = setInterval(
+    () => void runFreshnessOnce().catch((err) => log.error('Repo freshness: periodic run failed', { err })),
+    FRESHNESS_INTERVAL_MS,
+  );
+  intervalHandle.unref?.();
 }
 
 export function stopRepoFreshness(): void {
@@ -132,3 +138,17 @@ export function stopRepoFreshness(): void {
   startupHandle = null;
   intervalHandle = null;
 }
+
+onHostStart(() => {
+  // UNGUARDED — a synchronous startup failure must abort boot (§4.2).
+  startRepoFreshness();
+  log.info('Repo freshness worker started');
+});
+
+onHostShutdown(() => {
+  try {
+    stopRepoFreshness();
+  } catch (err) {
+    log.error('Repo freshness worker failed to stop', { err });
+  }
+});

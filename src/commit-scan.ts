@@ -23,6 +23,7 @@ import path from 'path';
 import { GROUPS_DIR } from './config.js';
 import { addShipLogEntry, getCommitDigestState, upsertCommitDigestState } from './db/backlog.js';
 import { getAllAgentGroups } from './db/agent-groups.js';
+import { onHostShutdown, onHostStart } from './host-lifecycle.js';
 import { log } from './log.js';
 
 const SCAN_INTERVAL_MS = 10 * 60 * 1000;
@@ -43,7 +44,9 @@ export function startCommitScan(): void {
   timer = setTimeout(function tick() {
     runScan().catch((err) => log.error('Commit scan failed', { err }));
     timer = setTimeout(tick, SCAN_INTERVAL_MS);
+    timer.unref?.();
   }, STARTUP_DELAY_MS);
+  timer.unref?.();
 }
 
 export function stopCommitScan(): void {
@@ -52,6 +55,20 @@ export function stopCommitScan(): void {
     timer = null;
   }
 }
+
+onHostStart(() => {
+  // UNGUARDED — a synchronous startup failure must abort boot (§4.2).
+  startCommitScan();
+  log.info('Commit scan started');
+});
+
+onHostShutdown(() => {
+  try {
+    stopCommitScan();
+  } catch (err) {
+    log.error('Commit scan failed to stop', { err });
+  }
+});
 
 async function runScan(): Promise<void> {
   const groups = getAllAgentGroups();

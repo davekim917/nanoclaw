@@ -50,5 +50,8 @@ import './provider-fallback/index.js';
 // Repository workspaces — durable clone publication, local canonical refresh,
 // and exact topic-to-topic linked-worktree transfer.
 import './repository-workspaces/index.js';
+// Sweep storage — declares startStorageMaintenanceOnce (called by host-sweep.ts's
+// tick) and the onHostShutdown that stops the persistent worker, in one module.
+import './sweep-storage/index.js';
 
 import './escalation/index.js';

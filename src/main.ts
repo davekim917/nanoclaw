@@ -25,25 +25,20 @@ import { resetPhantomContainerStatus } from './db/sessions.js';
 import { resetProcessingChannelIngress } from './db/channel-ingress-receipts.js';
 import { stopAllContainers } from './container-runner.js';
 import { writeUpstreamPolicySnapshot } from './container-updates.js';
-import {
-  getDeliveryAdapter,
-  setDeliveryAdapter,
-  startActiveDeliveryPoll,
-  startSweepDeliveryPoll,
-  stopDeliveryPolls,
-} from './delivery.js';
+import { setDeliveryAdapter, startActiveDeliveryPoll, startSweepDeliveryPoll, stopDeliveryPolls } from './delivery.js';
 import { startHostSweep, stopHostSweep } from './host-sweep.js';
 import { startHostModules, stopHostModules } from './host-lifecycle.js';
 import { runOnecliBootPreflight } from './onecli-preflight.js';
-import { stopStorageMaintenanceWorker } from './storage-maintenance-worker.js';
 import { resetStorageActivityState } from './storage-activity.js';
 import { finishInterruptedSessionArchivals } from './storage-manager.js';
-import { startWorktreeCleanup, stopWorktreeCleanup } from './worktree-cleanup.js';
-import { startRepoFreshness, stopRepoFreshness } from './repo-freshness.js';
-import { startPluginUpdater, stopPluginUpdater } from './plugin-updater.js';
-import { startCommitScan, stopCommitScan } from './commit-scan.js';
-import { startBacklogCanvas, stopBacklogCanvas } from './backlog-canvas.js';
-import { startDailySummary, stopDailySummary } from './daily-summary.js';
+// Side-effect only: each registers its onHostStart/onHostShutdown timer with
+// src/host-lifecycle.ts at import time. See "7–10b" in startNanoClaw below.
+import './worktree-cleanup.js';
+import './repo-freshness.js';
+import './plugin-updater.js';
+import './commit-scan.js';
+import './backlog-canvas.js';
+import './daily-summary.js';
 import { restoreRemoteControl } from './remote-control.js';
 import { startDiscordSlashCommands, stopDiscordSlashCommands } from './channels/discord-slash-commands.js';
 import {
@@ -525,58 +520,9 @@ export async function main(): Promise<void> {
   startHostSweep();
   log.info('Host sweep started');
 
-  // 7. Start worktree cleanup cron (6h, first run 60s after startup)
-  startWorktreeCleanup();
-  log.info('Worktree cleanup started');
-
-  // 7b. Local-only canonical recovery: advance clean host working trees from
-  // refs already fetched by scoped containers (10min, first run 90s).
-  startRepoFreshness();
-  log.info('Repo freshness worker started');
-
-  // 8. Start plugin auto-updater (hourly, first run 5min after startup)
-  startPluginUpdater({
-    notify: async (platformId, text) => {
-      // Parse the jid format: <channel_type>:<platform_id>[:<thread_id>]
-      const parts = platformId.split(':');
-      if (parts.length < 2) {
-        log.warn('Plugin updater notify: malformed jid', { platformId });
-        return;
-      }
-      const channelType = parts[0];
-      const realPlatformId = parts.slice(1).join(':');
-      const adapter = getDeliveryAdapter();
-      if (!adapter) {
-        log.warn('Plugin updater notify: no delivery adapter yet', { platformId });
-        return;
-      }
-      await adapter.deliver(channelType, realPlatformId, null, 'chat', JSON.stringify({ text }));
-    },
-  });
-  log.info('Plugin updater started');
-
-  // 9. Start commit-digest scanner (10min interval, first run 90s after
-  //    startup) — records direct commits + external PRs to default branch
-  //    as ship_log entries, complementing the agent-driven add_ship_log.
-  startCommitScan();
-  log.info('Commit scan started');
-
-  // 10. Daily summary digest (5min tick; fires at DAILY_SUMMARY_HOUR in
-  //     DAILY_SUMMARY_TZ once per day, posts per-group activity to the
-  //     primary wired channel — or container.json's dailySummary
-  //     override). Set DAILY_SUMMARY_ENABLED=0 to disable.
-  if (process.env.DAILY_SUMMARY_ENABLED !== '0') {
-    startDailySummary();
-    log.info('Daily summary started');
-  }
-
-  // 10b. Live backlog board (5min tick, edits a Slack channel canvas in place).
-  //      Opt-in per workgroup via container.json's backlogCanvas; no
-  //      declaration anywhere means this loops over nothing.
-  if (process.env.BACKLOG_CANVAS_ENABLED !== '0') {
-    startBacklogCanvas();
-    log.info('Backlog canvas started');
-  }
+  // 7–10b. Worktree cleanup, repo freshness, plugin updater, commit scan,
+  // daily summary, and backlog canvas each start themselves via onHostStart
+  // — see src/host-lifecycle.ts and each module's own registration.
 
   // 11. Restore any Remote Control session that was running before restart
   restoreRemoteControl();
@@ -615,19 +561,9 @@ async function shutdown(signal: string): Promise<void> {
   stopDeliveryPolls();
   stopHostSweep();
   stopChannelRecoveryMonitor();
-  try {
-    await stopStorageMaintenanceWorker();
-  } catch (err) {
-    // Worker teardown failure must not prevent channel teardown and container
-    // reaping; those children otherwise linger until systemd's hard timeout.
-    log.error('Storage maintenance worker failed to stop cleanly', { err });
-  }
-  stopWorktreeCleanup();
-  stopRepoFreshness();
-  stopPluginUpdater();
-  stopCommitScan();
-  stopDailySummary();
-  stopBacklogCanvas();
+  // Worktree cleanup, repo freshness, plugin updater, commit scan, daily
+  // summary, backlog canvas, and storage-maintenance stop themselves via
+  // stopHostModules() above (each guards its own stop failure).
   await stopDiscordSlashCommands();
   await stopCliServer();
   try {
