@@ -2,12 +2,12 @@ import fs from 'fs';
 import path from 'path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-const TEST_ROOT = '/tmp/nanoclaw-group-skills-test';
+const { TEST_ROOT } = vi.hoisted(() => ({ TEST_ROOT: uniqueTmpRoot('group-skills-test') }));
 const DATA_DIR = path.join(TEST_ROOT, 'data');
 
 vi.mock('./config.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('./config.js')>()),
-  DATA_DIR: '/tmp/nanoclaw-group-skills-test/data',
+  DATA_DIR: `${TEST_ROOT}/data`,
 }));
 
 import { materializeTemplateSkills } from './group-skills.js';

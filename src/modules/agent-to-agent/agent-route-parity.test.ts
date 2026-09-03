@@ -14,7 +14,7 @@ import fs from 'fs';
 import path from 'path';
 import { describe, expect, it, beforeEach, afterEach, vi } from 'vitest';
 
-const TEST_DIR = '/tmp/nanoclaw-test-a2a-parity';
+const TEST_DIR = uniqueTmpRoot('test-a2a-parity');
 
 vi.mock('../../container-runner.js', () => ({
   wakeContainer: vi.fn().mockResolvedValue(true),

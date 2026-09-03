@@ -5,7 +5,7 @@ import { pathToFileURL } from 'url';
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-const { TEST_ROOT } = vi.hoisted(() => ({ TEST_ROOT: `/tmp/nanoclaw-message-archive-read-test-${process.pid}` }));
+const { TEST_ROOT } = vi.hoisted(() => ({ TEST_ROOT: uniqueTmpRoot('message-archive-read-test') }));
 
 vi.mock('./config.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('./config.js')>()),

@@ -2,12 +2,12 @@ import fs from 'fs';
 import path from 'path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-const TEST_ROOT = '/tmp/nanoclaw-claude-md-compose-test';
+const { TEST_ROOT } = vi.hoisted(() => ({ TEST_ROOT: uniqueTmpRoot('claude-md-compose-test') }));
 const GROUPS_DIR = path.join(TEST_ROOT, 'groups');
 
 vi.mock('./config.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('./config.js')>()),
-  GROUPS_DIR: '/tmp/nanoclaw-claude-md-compose-test/groups',
+  GROUPS_DIR: `${TEST_ROOT}/groups`,
 }));
 
 vi.mock('./log.js', () => ({

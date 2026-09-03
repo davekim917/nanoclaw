@@ -17,7 +17,7 @@ import { ensureSchema, openInboundDb } from '../../db/session-db.js';
 import { insertTaskRow } from './db.js';
 import { classifyForHostExecution, runHostGatedTaskScripts } from './host-script.js';
 
-const TEST_DIR = '/tmp/nanoclaw-host-script-test';
+const TEST_DIR = uniqueTmpRoot('host-script-test');
 const DB_PATH = path.join(TEST_DIR, 'inbound.db');
 
 function freshDb() {

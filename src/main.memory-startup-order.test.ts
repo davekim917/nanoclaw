@@ -7,7 +7,7 @@ import { expect, it, vi } from 'vitest';
 import { isDirectExecution, runWorkgroupMemoryStartupGate } from './main.js';
 
 it('uses exact main-module identity instead of NODE_ENV to decide startup', () => {
-  const entry = path.resolve('/tmp/nanoclaw-index-entry.ts');
+  const entry = path.resolve(`${uniqueTmpRoot('index-entry')}.ts`);
   const moduleUrl = pathToFileURL(entry).href;
 
   expect(isDirectExecution(moduleUrl, entry)).toBe(true);

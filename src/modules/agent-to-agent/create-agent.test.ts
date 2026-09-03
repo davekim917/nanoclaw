@@ -32,9 +32,9 @@ const FIXTURES = {
 };
 
 // ── Directory constants ──────────────────────────────────────────────────────
-const TEST_GROUPS_DIR = '/tmp/nanoclaw-test-create-agent/groups';
-const TEST_DATA_DIR = '/tmp/nanoclaw-test-create-agent/data';
-const TEST_ROOT = '/tmp/nanoclaw-test-create-agent';
+const { TEST_ROOT } = vi.hoisted(() => ({ TEST_ROOT: uniqueTmpRoot('test-create-agent') }));
+const TEST_GROUPS_DIR = `${TEST_ROOT}/groups`;
+const TEST_DATA_DIR = `${TEST_ROOT}/data`;
 
 // ── Mocks ────────────────────────────────────────────────────────────────────
 vi.mock('../../container-runner.js', () => ({
@@ -48,8 +48,8 @@ vi.mock('../../config.js', async () => {
   const actual = await vi.importActual<typeof import('../../config.js')>('../../config.js');
   return {
     ...actual,
-    GROUPS_DIR: '/tmp/nanoclaw-test-create-agent/groups',
-    DATA_DIR: '/tmp/nanoclaw-test-create-agent/data',
+    GROUPS_DIR: `${TEST_ROOT}/groups`,
+    DATA_DIR: `${TEST_ROOT}/data`,
   };
 });
 

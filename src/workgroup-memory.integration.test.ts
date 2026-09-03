@@ -5,7 +5,7 @@ import Database from 'better-sqlite3';
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const { TEST_ROOT, FAILURES } = vi.hoisted(() => ({
-  TEST_ROOT: `/tmp/nanoclaw-workgroup-memory-integration-${process.pid}`,
+  TEST_ROOT: uniqueTmpRoot('workgroup-memory-integration'),
   FAILURES: { archive: false },
 }));
 

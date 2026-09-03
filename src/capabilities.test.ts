@@ -2,10 +2,10 @@ import fs from 'fs';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const dirs = vi.hoisted(() => {
-  const testRoot = '/tmp/nanoclaw-capabilities-test';
+  const testRoot = uniqueTmpRoot('capabilities-test');
   return {
     TEST_ROOT: testRoot,
-    GROUPS_DIR: '/tmp/nanoclaw-capabilities-test/groups',
+    GROUPS_DIR: `${testRoot}/groups`,
   };
 });
 
@@ -330,7 +330,9 @@ describe('GitHub App sentinel scoping', () => {
     clearGitHubAppTokenCache();
     // Real RSA key so the RS256 signing path runs and the mint succeeds —
     // without it resolveGitHubAppToken fail-closes and the cache stays cold.
-    const keyPath = fs.mkdtempSync('/tmp/nanoclaw-cap-gh-') + '/key.pem';
+    const keyDir = uniqueTmpRoot('cap-gh');
+    fs.mkdirSync(keyDir, { recursive: true });
+    const keyPath = `${keyDir}/key.pem`;
     const crypto = await import('crypto');
     fs.writeFileSync(
       keyPath,

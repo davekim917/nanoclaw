@@ -6,8 +6,8 @@ vi.mock('../../config.js', async () => {
   const actual = await vi.importActual('../../config.js');
   return {
     ...actual,
-    DATA_DIR: '/tmp/nanoclaw-test-cli-tasks',
-    GROUPS_DIR: '/tmp/nanoclaw-test-cli-tasks/groups',
+    DATA_DIR: TEST_DIR,
+    GROUPS_DIR: `${TEST_DIR}/groups`,
     TIMEZONE: 'UTC',
   };
 });
@@ -19,7 +19,7 @@ vi.mock('../../container-runner.js', () => ({
   killContainer: vi.fn(),
 }));
 
-const TEST_DIR = '/tmp/nanoclaw-test-cli-tasks';
+const { TEST_DIR } = vi.hoisted(() => ({ TEST_DIR: uniqueTmpRoot('test-cli-tasks') }));
 
 import { initTestDb, closeDb, runMigrations, createAgentGroup, getDb } from '../../db/index.js';
 import { createMessagingGroup } from '../../db/messaging-groups.js';

@@ -5,7 +5,6 @@
  */
 import Database from 'better-sqlite3';
 import path from 'path';
-import os from 'os';
 import fs from 'fs';
 import { describe, expect, it, afterEach, vi } from 'vitest';
 
@@ -281,7 +280,7 @@ describe('decideTaskAction', () => {
 // Tests use real on-disk SQLite DBs in a temp directory, with vi.mock to
 // redirect outboundDbPath to the temp location.
 
-const TEST_ROOT = path.join(os.tmpdir(), 'watchdog-test-' + process.pid);
+const TEST_ROOT = uniqueTmpRoot('watchdog-test');
 const tmpSessions: string[] = [];
 
 vi.mock('../../session-manager.js', async (importOriginal) => {

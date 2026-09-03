@@ -4,7 +4,7 @@ import path from 'path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const { TEST_ROOT, FAILURES, CAPABILITY_FIXTURE } = vi.hoisted(() => ({
-  TEST_ROOT: '/tmp/nanoclaw-pre-turn-context-test',
+  TEST_ROOT: uniqueTmpRoot('pre-turn-context-test'),
   FAILURES: { archive: false, exactLink: false, capabilities: false },
   CAPABILITY_FIXTURE: { services: null as null | Array<Record<string, unknown>> },
 }));

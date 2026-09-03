@@ -62,6 +62,11 @@ interface CentralSessionSeed {
   agent_group_id?: string;
 }
 
+// Roots that must not exist. uniqueTmpRoot never creates the directory, so a
+// per-process name also guarantees nothing else can create it underneath us.
+const MISSING_SESSIONS_ROOT = uniqueTmpRoot('missing-sessions');
+const MISSING_THREADS_ROOT = uniqueTmpRoot('missing-threads');
+
 function installCentralDb(
   seeds: CentralSessionSeed[],
   options: { activeTripleIndex?: boolean } = {},
@@ -1479,8 +1484,8 @@ describe('storage-manager Docker cleanup', () => {
     const report = getStorageReport({
       mode: 'dry-run',
       now,
-      sessionsRoot: path.join(os.tmpdir(), 'missing-sessions'),
-      threadsRoot: path.join(os.tmpdir(), 'missing-threads'),
+      sessionsRoot: MISSING_SESSIONS_ROOT,
+      threadsRoot: MISSING_THREADS_ROOT,
       policy: { filesystemPath: process.cwd(), cleanupThresholdPct: 85 },
     });
 
@@ -1506,8 +1511,8 @@ describe('storage-manager Docker cleanup', () => {
     const report = getStorageReport({
       mode: 'dry-run',
       now,
-      sessionsRoot: path.join(os.tmpdir(), 'missing-sessions'),
-      threadsRoot: path.join(os.tmpdir(), 'missing-threads'),
+      sessionsRoot: MISSING_SESSIONS_ROOT,
+      threadsRoot: MISSING_THREADS_ROOT,
       policy: { filesystemPath: process.cwd(), cleanupThresholdPct: 85 },
     });
 
@@ -1539,8 +1544,8 @@ describe('storage-manager Docker cleanup', () => {
     const report = getStorageReport({
       mode: 'apply',
       now,
-      sessionsRoot: path.join(os.tmpdir(), 'missing-sessions'),
-      threadsRoot: path.join(os.tmpdir(), 'missing-threads'),
+      sessionsRoot: MISSING_SESSIONS_ROOT,
+      threadsRoot: MISSING_THREADS_ROOT,
       policy: { filesystemPath: process.cwd(), cleanupThresholdPct: 85 },
     });
 
@@ -1556,8 +1561,8 @@ describe('storage-manager Docker cleanup', () => {
     const options = {
       mode: 'apply' as const,
       respectCadence: true,
-      sessionsRoot: path.join(os.tmpdir(), 'missing-sessions'),
-      threadsRoot: path.join(os.tmpdir(), 'missing-threads'),
+      sessionsRoot: MISSING_SESSIONS_ROOT,
+      threadsRoot: MISSING_THREADS_ROOT,
       policy: { filesystemPath: process.cwd(), cleanupThresholdPct: 85, emergencyRetryMs: 60_000 },
     };
 
@@ -1574,8 +1579,8 @@ describe('storage-manager Docker cleanup', () => {
     const baseOptions = {
       mode: 'apply' as const,
       respectCadence: true,
-      sessionsRoot: path.join(os.tmpdir(), 'missing-sessions'),
-      threadsRoot: path.join(os.tmpdir(), 'missing-threads'),
+      sessionsRoot: MISSING_SESSIONS_ROOT,
+      threadsRoot: MISSING_THREADS_ROOT,
       policy: { filesystemPath: process.cwd(), cleanupThresholdPct: 85 },
     };
     getStorageReport({ ...baseOptions, now });
@@ -1592,8 +1597,8 @@ describe('storage-manager Docker cleanup', () => {
       mode: 'apply',
       now,
       respectCadence: true,
-      sessionsRoot: path.join(os.tmpdir(), 'missing-sessions'),
-      threadsRoot: path.join(os.tmpdir(), 'missing-threads'),
+      sessionsRoot: MISSING_SESSIONS_ROOT,
+      threadsRoot: MISSING_THREADS_ROOT,
       policy: { filesystemPath: process.cwd(), cleanupThresholdPct: 85 },
     });
 
@@ -1607,8 +1612,8 @@ describe('storage-manager Docker cleanup', () => {
     const options = {
       mode: 'apply' as const,
       respectCadence: true,
-      sessionsRoot: path.join(os.tmpdir(), 'missing-sessions'),
-      threadsRoot: path.join(os.tmpdir(), 'missing-threads'),
+      sessionsRoot: MISSING_SESSIONS_ROOT,
+      threadsRoot: MISSING_THREADS_ROOT,
       policy: {
         filesystemPath: process.cwd(),
         cleanupThresholdPct: 85,
@@ -1650,8 +1655,8 @@ describe('storage-manager Docker cleanup', () => {
     const report = getStorageReport({
       mode: 'dry-run',
       now,
-      sessionsRoot: path.join(os.tmpdir(), 'missing-sessions'),
-      threadsRoot: path.join(os.tmpdir(), 'missing-threads'),
+      sessionsRoot: MISSING_SESSIONS_ROOT,
+      threadsRoot: MISSING_THREADS_ROOT,
       policy: { filesystemPath: process.cwd(), cleanupThresholdPct: 85 },
     });
 
@@ -1674,8 +1679,8 @@ describe('storage-manager Docker cleanup', () => {
     const report = getStorageReport({
       mode: 'dry-run',
       now,
-      sessionsRoot: path.join(os.tmpdir(), 'missing-sessions'),
-      threadsRoot: path.join(os.tmpdir(), 'missing-threads'),
+      sessionsRoot: MISSING_SESSIONS_ROOT,
+      threadsRoot: MISSING_THREADS_ROOT,
       policy: { filesystemPath: process.cwd(), cleanupThresholdPct: 85 },
     });
 
@@ -1706,8 +1711,8 @@ describe('storage-manager Docker cleanup', () => {
     const report = getStorageReport({
       mode: 'apply',
       now,
-      sessionsRoot: path.join(os.tmpdir(), 'missing-sessions'),
-      threadsRoot: path.join(os.tmpdir(), 'missing-threads'),
+      sessionsRoot: MISSING_SESSIONS_ROOT,
+      threadsRoot: MISSING_THREADS_ROOT,
       policy: { filesystemPath: process.cwd(), cleanupThresholdPct: 85 },
     });
 
@@ -1752,8 +1757,8 @@ describe('storage-manager Docker cleanup', () => {
       mode: 'apply',
       now,
       force: true,
-      sessionsRoot: path.join(os.tmpdir(), 'missing-sessions'),
-      threadsRoot: path.join(os.tmpdir(), 'missing-threads'),
+      sessionsRoot: MISSING_SESSIONS_ROOT,
+      threadsRoot: MISSING_THREADS_ROOT,
       policy: { filesystemPath: process.cwd(), cleanupThresholdPct: 85 },
     });
 
@@ -1777,8 +1782,8 @@ describe('storage-manager Docker cleanup', () => {
   it('preserves the synchronous admission result and reason contract', () => {
     const refused = assertStorageAdmission({
       now,
-      sessionsRoot: path.join(os.tmpdir(), 'missing-sessions'),
-      threadsRoot: path.join(os.tmpdir(), 'missing-threads'),
+      sessionsRoot: MISSING_SESSIONS_ROOT,
+      threadsRoot: MISSING_THREADS_ROOT,
       policy: { filesystemPath: process.cwd(), cleanupThresholdPct: 85, admissionRefusePct: 90 },
     });
     expect(refused).toMatchObject({ allowed: false, reason: 'still-over-threshold' });
@@ -1786,8 +1791,8 @@ describe('storage-manager Docker cleanup', () => {
     usagePct = 60;
     const allowed = assertStorageAdmission({
       now: now + 1_000,
-      sessionsRoot: path.join(os.tmpdir(), 'missing-sessions'),
-      threadsRoot: path.join(os.tmpdir(), 'missing-threads'),
+      sessionsRoot: MISSING_SESSIONS_ROOT,
+      threadsRoot: MISSING_THREADS_ROOT,
       policy: { filesystemPath: process.cwd(), cleanupThresholdPct: 85, admissionRefusePct: 90 },
     });
     expect(allowed).toMatchObject({ allowed: true, reason: 'below-threshold' });
@@ -1795,8 +1800,8 @@ describe('storage-manager Docker cleanup', () => {
 
   it('throttles admission scans to the cadence in the pressure band, but never under critical pressure', () => {
     const options = {
-      sessionsRoot: path.join(os.tmpdir(), 'missing-sessions'),
-      threadsRoot: path.join(os.tmpdir(), 'missing-threads'),
+      sessionsRoot: MISSING_SESSIONS_ROOT,
+      threadsRoot: MISSING_THREADS_ROOT,
       policy: {
         filesystemPath: process.cwd(),
         cleanupThresholdPct: 85,

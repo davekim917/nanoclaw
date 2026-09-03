@@ -75,12 +75,12 @@ vi.mock('../../config.js', async () => {
   const actual = await vi.importActual('../../config.js');
   return {
     ...actual,
-    DATA_DIR: '/tmp/nanoclaw-test-channel-approval',
-    GROUPS_DIR: '/tmp/nanoclaw-test-channel-approval/groups',
+    DATA_DIR: TEST_DIR,
+    GROUPS_DIR: `${TEST_DIR}/groups`,
   };
 });
 
-const TEST_DIR = '/tmp/nanoclaw-test-channel-approval';
+const { TEST_DIR } = vi.hoisted(() => ({ TEST_DIR: uniqueTmpRoot('test-channel-approval') }));
 
 function now() {
   return new Date().toISOString();

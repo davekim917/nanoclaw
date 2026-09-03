@@ -17,7 +17,7 @@ const mocks = vi.hoisted(() => ({
 
 vi.mock('../../config.js', async () => {
   const actual = await vi.importActual('../../config.js');
-  return { ...actual, DATA_DIR: '/tmp/nanoclaw-test-bash-gate' };
+  return { ...actual, DATA_DIR: TEST_DIR };
 });
 
 vi.mock('../../container-runner.js', () => ({
@@ -34,7 +34,7 @@ vi.mock('../../delivery.js', async () => {
   };
 });
 
-const TEST_DIR = '/tmp/nanoclaw-test-bash-gate';
+const { TEST_DIR } = vi.hoisted(() => ({ TEST_DIR: uniqueTmpRoot('test-bash-gate') }));
 
 function now(): string {
   return new Date().toISOString();

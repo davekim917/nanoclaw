@@ -339,7 +339,7 @@ describe('scanBannedPatterns', () => {
 });
 
 describe('checkContainerBytes', () => {
-  const TMP = '/tmp/nanoclaw-fleet-drift-container-test';
+  const TMP = uniqueTmpRoot('fleet-drift-container-test');
   const containerPath = () => path.join(TMP, 'CLAUDE.md');
 
   beforeEach(() => {
@@ -370,7 +370,7 @@ describe('checkContainerBytes', () => {
 });
 
 describe('checkTrunkDocBytes', () => {
-  const TMP = '/tmp/nanoclaw-fleet-drift-trunk-doc-test';
+  const TMP = uniqueTmpRoot('fleet-drift-trunk-doc-test');
   const trunkPath = () => path.join(TMP, 'CLAUDE.md');
 
   beforeEach(() => {
@@ -401,7 +401,7 @@ describe('checkTrunkDocBytes', () => {
 });
 
 describe('checkGroupStandingBytes', () => {
-  const TMP = '/tmp/nanoclaw-fleet-drift-group-standing-test';
+  const TMP = uniqueTmpRoot('fleet-drift-group-standing-test');
   const groupsRoot = () => path.join(TMP, 'groups');
 
   beforeEach(() => {
@@ -535,7 +535,7 @@ describe('checkGroupStandingBytes', () => {
 // symlink/FIFO/oversized file is skipped and reported as its own signal,
 // never read.
 describe('checkGroupStandingBytes safety (P1: symlink containment, non-regular files, size cap)', () => {
-  const TMP = '/tmp/nanoclaw-fleet-drift-safety-test';
+  const TMP = uniqueTmpRoot('fleet-drift-safety-test');
   const groupsRoot = () => path.join(TMP, 'groups');
 
   beforeEach(() => {
@@ -612,7 +612,7 @@ describe('checkGroupStandingBytes safety (P1: symlink containment, non-regular f
 });
 
 describe('checkInstructionStack', () => {
-  const TMP = '/tmp/nanoclaw-fleet-drift-instruction-stack-test';
+  const TMP = uniqueTmpRoot('fleet-drift-instruction-stack-test');
 
   beforeEach(() => {
     fs.rmSync(TMP, { recursive: true, force: true });
@@ -673,7 +673,7 @@ describe('checkInstructionStack', () => {
 });
 
 describe('checkEffectiveStackBytes', () => {
-  const TMP = '/tmp/nanoclaw-fleet-drift-effective-stack-test';
+  const TMP = uniqueTmpRoot('fleet-drift-effective-stack-test');
   const groupsRoot = () => path.join(TMP, 'groups');
 
   beforeEach(() => {
