@@ -32,6 +32,7 @@ import {
   stopDeliveryPolls,
 } from './delivery.js';
 import { startHostSweep, stopHostSweep } from './host-sweep.js';
+import { runOnecliBootPreflight } from './onecli-preflight.js';
 import { stopStorageMaintenanceWorker } from './storage-maintenance-worker.js';
 import { resetStorageActivityState } from './storage-activity.js';
 import { finishInterruptedSessionArchivals } from './storage-manager.js';
@@ -269,6 +270,19 @@ export async function main(): Promise<void> {
   }
 
   log.info('Central DB ready', { path: dbPath });
+
+  // 1-bis. OneCLI control-API preflight — the credential call every spawn
+  // makes, once, before ANY ingress opens. A control API this process cannot
+  // reach means every spawn is refused at WARN and the fleet goes silently
+  // deaf (2026-09-02: 11 minutes, 0/8 spawns, a clean-looking boot).
+  //
+  // Ahead of the dashboard and the channel adapters deliberately: past that
+  // point an inbound message can reach routeInbound() and wake a container
+  // while the probe is still retrying, which both contends with the probe and
+  // means the exit below would kill a host that has already accepted work.
+  // Failing here logs ERROR and exits non-zero BEFORE markDeployBootHealthy(),
+  // so the unit-failure alert fires and the deploy stays rollback-eligible.
+  await runOnecliBootPreflight();
 
   // Host-computed upstreamPin/heldByMerge snapshot for the container-updates
   // audit. Containers can't derive this themselves (/workspace/project has no

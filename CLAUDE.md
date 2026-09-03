@@ -128,6 +128,7 @@ Check these first when something goes wrong:
 | Host logs | `logs/nanoclaw.error.log` first (failures, crash-loop backoff, warnings), then `logs/nanoclaw.log` for the full chain |
 | Setup logs | `logs/setup.log` (overall), `logs/setup-steps/*.log` (per-step) |
 | Session DBs | `data/v2-sessions/<agent-group>/<session>/` — `inbound.db`/`messages_in` (reached container?), `outbound.db`/`messages_out` (agent responded?) |
+| Post-restart health | `grep 'OneCLI preflight ok' logs/nanoclaw.log` — the boot probe of the credential control API every spawn depends on. Adapter-started counts are NOT proof; a host that cannot reach the control API refuses every spawn at WARN and looks clean |
 
 Host logs rotate daily via `/etc/logrotate.d/<systemd-unit-name>` (30-day retention). `copytruncate` is required, not optional — systemd opens the `StandardOutput=append:`/`StandardError=append:` redirect itself, so a normal rename-based rotation would leave the daemon writing to an unlinked file until restart. Container logs vanish on exit (`--rm`) — a silent in-container failure leaves nothing persistent to inspect.
 
