@@ -1,11 +1,11 @@
 /**
  * Acceptance cases for the storage sweep family (convergence seam 2, S2-PR6 —
- * F-6.2, F-6.5 in docs/specs/upstream-host-sweep-seam/plan.md §8). T-3's
- * start-half cases (S2-PR1 module timers) are reproduced here per the
- * S2-PR6 brief; its shutdown-registration cases are NOT, since S2-PR1's
- * `onHostShutdown` registration is not part of this file on this branch's
- * base — see the deviation note in ./index.ts's docstring (take the union at
- * the eventual rebase onto main).
+ * F-6.2, F-6.5 in docs/specs/upstream-host-sweep-seam/plan.md §8), plus T-3
+ * (S2-PR1 module timers) in full. S2-PR6's own branch base carried neither
+ * S2-PR0's `host-lifecycle.ts` nor S2-PR1's version of ./index.ts, so its
+ * copy of this file dropped T-3's shutdown cases and asserted the gap
+ * instead. This integrated lineage HAS both, so T-3's original cases are
+ * restored verbatim against `onHostShutdown` — see ./index.ts's docstring.
  *
  * Hermeticity (brief-common.md HARD RULE): importing this module's ./index.js
  * registers T13 at import — registration only pushes a duty object into an
@@ -62,6 +62,7 @@ afterEach(() => {
 
 const mocks = vi.hoisted(() => ({
   runStorageMaintenanceInBackground: vi.fn(),
+  stopStorageMaintenanceWorker: vi.fn(),
   handleStoragePressureAlert: vi.fn(),
   logInfo: vi.fn(),
   logWarn: vi.fn(),
@@ -71,6 +72,7 @@ const mocks = vi.hoisted(() => ({
 
 vi.mock('../../storage-maintenance-worker.js', () => ({
   runStorageMaintenanceInBackground: mocks.runStorageMaintenanceInBackground,
+  stopStorageMaintenanceWorker: mocks.stopStorageMaintenanceWorker,
 }));
 vi.mock('../../storage-pressure-alert.js', () => ({
   handleStoragePressureAlert: mocks.handleStoragePressureAlert,
@@ -87,6 +89,7 @@ vi.mock('../../log.js', async (importOriginal) => {
 // registered-wrapper case below can obtain it by name, the same accessor R-7
 // uses in src/host-sweep-registry.test.ts. Safe to import unmocked:
 // registration is inert at import time (see docstring above).
+import { getHostShutdownCallbacks } from '../../host-lifecycle.js';
 import { startStorageMaintenanceOnce } from './index.js';
 import { _listSweepRegistrationsForTesting, type SweepTickContext } from '../../host-sweep.js';
 
@@ -133,16 +136,34 @@ describe('storage maintenance start and stop are declared in one module', () => 
     );
   });
 
-  it('this file registers no shutdown callback for the worker (S2-PR1 prerequisite gap)', () => {
-    // Team-lead correction 2026-09-03: S2-PR1's own onHostShutdown
-    // registration does not compile on this branch's base (host-lifecycle.ts
-    // does not exist here) and is NOT reproduced — ./index.ts carries only
-    // what compiles: the start half + T13's registration. src/main.ts is the
-    // sole place that stops the worker today; that stays exactly as-is (S2-PR1's
-    // own job, outside S2-PR6's ownership) until the union happens at rebase.
+  it('registers an onHostShutdown callback that stops the worker, guarding a failed stop', async () => {
+    mocks.stopStorageMaintenanceWorker.mockResolvedValue(undefined);
+
+    const callbacksBefore = getHostShutdownCallbacks().length;
+    expect(callbacksBefore).toBeGreaterThan(0);
+    const shutdown = getHostShutdownCallbacks()[callbacksBefore - 1];
+    await shutdown();
+
+    expect(mocks.stopStorageMaintenanceWorker).toHaveBeenCalledTimes(1);
+  });
+
+  it('a stop failure is logged, not thrown, so the rest of shutdown proceeds', async () => {
+    mocks.stopStorageMaintenanceWorker.mockRejectedValue(new Error('stop boom'));
+
+    const callbacks = getHostShutdownCallbacks();
+    const shutdown = callbacks[callbacks.length - 1];
+    await expect(shutdown()).resolves.toBeUndefined();
+
+    expect(mocks.logError).toHaveBeenCalledWith(
+      'Storage maintenance worker failed to stop cleanly',
+      expect.objectContaining({ err: expect.any(Error) }),
+    );
+  });
+
+  it('src/main.ts references neither startStorageMaintenanceOnce nor stopStorageMaintenanceWorker', () => {
     const source = fs.readFileSync(path.resolve('src/main.ts'), 'utf8');
     expect(source).not.toMatch(/\bstartStorageMaintenanceOnce\b/);
-    expect(source).toMatch(/\bstopStorageMaintenanceWorker\b/);
+    expect(source).not.toMatch(/\bstopStorageMaintenanceWorker\b/);
   });
 });
 
