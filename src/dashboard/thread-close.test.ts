@@ -238,6 +238,67 @@ describe('requestThreadClose', () => {
     expect(again.body).toMatchObject({ error: 'close_already_in_progress' });
   });
 
+  /**
+   * Two overlapping requests must produce ONE closure and ONE wrap-up.
+   *
+   * The `thread_closures` check and the reservation are no longer in the same
+   * synchronous step: `readSessionProposal` awaits since it moved behind the
+   * mailbox seam. Both calls below therefore run to that await before either
+   * writes — no timers or fakes needed, just not awaiting the first before
+   * starting the second, which is exactly a double-click.
+   *
+   * With an unconditional upsert both answered 202, both fanned out a wrap-up,
+   * and the second silently took over the first's actor, reason and
+   * confirmation window.
+   *
+   * Its own thread and session: this case materializes a mailbox and writes to
+   * it, and the scratch root is shared across the file's cases.
+   */
+  it('reserves the closure atomically, so two overlapping requests do not both win', async () => {
+    const THREAD_RACE = 'slack:C1:race';
+    insertSession('s-race', 'ag1', THREAD_RACE);
+    fs.rmSync(path.dirname(dbPathFor('ag1', 's-race', 'inbound.db')), { recursive: true, force: true });
+    materializeSession('ag1', 's-race');
+
+    // Not awaited between the two — both reach the proposal read and yield
+    // before either reserves.
+    const first = requestThreadClose(THREAD_RACE, { confirmations: 2, reason: 'first' }, ctxFor('admin'));
+    const second = requestThreadClose(THREAD_RACE, { confirmations: 2, reason: 'second' }, ctxFor('admin'));
+    const [a, b] = await Promise.all([first, second]);
+
+    // Exactly one winner, and the loser gets the in-flight refusal. Before the
+    // atomic reservation this was [202, 202].
+    expect([a.status, b.status].sort()).toEqual([202, 409]);
+    const winner = a.status === 202 ? a : b;
+    const loser = a.status === 409 ? a : b;
+    expect(loser.body).toMatchObject({ error: 'close_already_in_progress' });
+
+    // One closure, holding the winner's request — the loser did not overwrite
+    // it, and the loser reports the winner's timestamp back.
+    expect(
+      getDb().prepare('SELECT COUNT(*) AS n FROM thread_closures WHERE thread_id = ?').get(THREAD_RACE),
+    ).toMatchObject({
+      n: 1,
+    });
+    const row = getDb().prepare('SELECT * FROM thread_closures WHERE thread_id = ?').get(THREAD_RACE) as {
+      requested_at: string;
+      reason: string;
+      state: string;
+    };
+    expect(row.state).toBe('awaiting_confirmation');
+    expect(row.requested_at).toBe(winner.body.requested_at);
+    expect(loser.body.requested_at).toBe(row.requested_at);
+    expect(['first', 'second']).toContain(row.reason);
+
+    // And one request means one wrap-up: the loser never reached the fan-out.
+    const inbound = new Database(dbPathFor('ag1', 's-race', 'inbound.db'), { readonly: true });
+    const wrapUps = inbound.prepare("SELECT COUNT(*) AS n FROM messages_in WHERE kind = 'system'").get() as {
+      n: number;
+    };
+    inbound.close();
+    expect(wrapUps.n).toBe(1);
+  });
+
   it('lands the wrap-up as a real deferred system row the running container will see', async () => {
     materializeSession('ag1', 's1');
     const res = await requestThreadClose('slack:C1:1.1', { confirmations: 2 }, ctxFor('admin'));
