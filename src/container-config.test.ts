@@ -438,6 +438,33 @@ describe('parseMcpServerConfig', () => {
     );
   });
 
+  it('gates every header on its value, not on a list of credential-sounding names', () => {
+    // Enumerating names is unbounded — `X-Functions-Key` and `X-Client-Key`
+    // matched nothing in the name list, so their secrets were persisted.
+    for (const key of ['X-Functions-Key', 'X-Client-Key', 'X-Whatever-Vendor-Invents-Next']) {
+      expect(() =>
+        parseMcpServerConfig({ url: 'https://example.com/mcp', headers: { [key]: 'aB3xY9kLmN2pQ7rS8t' } }),
+      ).toThrow(/looks like it carries a credential/);
+      expect(
+        parseMcpServerConfig({ url: 'https://example.com/mcp', headers: { [key]: 'onecli-managed' } }),
+      ).toMatchObject({ headers: { [key]: 'onecli-managed' } });
+    }
+    // An auth scheme in front does not launder the token behind it.
+    expect(() =>
+      parseMcpServerConfig({ url: 'https://example.com/mcp', headers: { 'X-Thing': 'Bearer aB3xY9kLmN2pQ7rS8t' } }),
+    ).toThrow(/looks like it carries a credential/);
+    // Ordinary configuration headers stay legal.
+    const ordinary = {
+      'Content-Type': 'application/json',
+      Accept: 'text/event-stream',
+      'X-Api-Version': '2024-01-01',
+      'User-Agent': 'nanoclaw/1.0',
+    };
+    expect(parseMcpServerConfig({ url: 'https://example.com/mcp', headers: ordinary })).toMatchObject({
+      headers: ordinary,
+    });
+  });
+
   it('rejects an env key that is not a valid environment variable name', () => {
     expect(() => parseMcpServerConfig({ command: 'node', env: { 'not-an-env-key': 'v' } })).toThrow(
       /environment variable name/,

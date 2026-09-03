@@ -108,8 +108,32 @@ const MCP_SERVER_NAME_RE = /^[A-Za-z0-9_-]{1,64}$/;
 const ENV_KEY_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
 /** RFC 7230 token charset — what a header field-name may contain. */
 const HEADER_NAME_RE = /^[A-Za-z0-9!#$%&'*+.^_`|~-]{1,64}$/;
-/** Header names that carry a credential; these must use the OneCLI placeholder. */
+/**
+ * Header names we can RECOGNIZE as credential-bearing — a source of better
+ * error messages, not the gate. Enumerating names is unbounded, so the gate is
+ * on the value (`headerValueIsSafe`).
+ */
 const CREDENTIAL_HEADER_RE = /(authorization|auth|token|secret|api[-_]?key|cookie|credential|bearer)/i;
+/** A leading auth-scheme token, so the value behind it is judged on its own. */
+const AUTH_SCHEME_PREFIX_RE = /^[A-Za-z][A-Za-z0-9-]* /;
+
+/**
+ * Mirrors the host's `looksOpaque` / `headerValueIsSafe`
+ * (src/container-config.ts). A value is safe when it is the OneCLI
+ * placeholder form, or when it is not opaque — `application/json` reads as
+ * configuration, `aB3xY9kLmN2pQ7rS8t` does not.
+ */
+function looksOpaque(value: string): boolean {
+  if (value.length < 16) return false;
+  const classes = [/[a-z]/, /[A-Z]/, /[0-9]/].filter((re) => re.test(value)).length;
+  return classes >= 2 && !/[\s.]/.test(value);
+}
+
+function headerValueIsSafe(key: string, value: string): boolean {
+  if (ONECLI_HEADER_VALUE_RE.test(value)) return true;
+  if (CREDENTIAL_HEADER_RE.test(key)) return false;
+  return !looksOpaque(value) && !looksOpaque(value.replace(AUTH_SCHEME_PREFIX_RE, ''));
+}
 const ONECLI_PLACEHOLDER = 'onecli-managed';
 /**
  * The ONLY accepted forms for a credential header: the bare placeholder, or a
@@ -189,9 +213,9 @@ function parseMcpServerInput(args: Record<string, unknown>): { config: ParsedMcp
           error: `header "${key}" carries a raw credential; declare it as "${ONECLI_PLACEHOLDER}" and let the OneCLI gateway inject the real value`,
         };
       }
-      if (CREDENTIAL_HEADER_RE.test(key) && !ONECLI_HEADER_VALUE_RE.test(value)) {
+      if (!headerValueIsSafe(key, value)) {
         return {
-          error: `header "${key}" is a credential header, so its value must be exactly "${ONECLI_PLACEHOLDER}" or an auth scheme followed by it (e.g. "Bearer ${ONECLI_PLACEHOLDER}")`,
+          error: `header "${key}" looks like it carries a credential, so its value must be exactly "${ONECLI_PLACEHOLDER}" or an auth scheme followed by it (e.g. "Bearer ${ONECLI_PLACEHOLDER}")`,
         };
       }
       headers[key] = value;

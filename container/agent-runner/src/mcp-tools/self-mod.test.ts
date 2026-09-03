@@ -105,6 +105,19 @@ describe('add_mcp_server remote Streamable HTTP', () => {
     });
     expect(smuggled.error).toContain('must be exactly');
 
+    // The gate is on the value, so a header name no list anticipates is
+    // covered too — `X-Functions-Key` matched nothing in the name list.
+    const customKey = await submit({
+      name: 'custom',
+      url: 'https://example.com/mcp',
+      headers: { 'X-Functions-Key': 'aB3xY9kLmN2pQ7rS8t' },
+    });
+    expect(customKey.error).toContain('looks like it carries a credential');
+    expect(
+      (await submit({ name: 'ok', url: 'https://example.com/mcp', headers: { 'Content-Type': 'application/json' } }))
+        .payload,
+    ).toBeDefined();
+
     const raw = await submit({ name: 'leaky', url: 'https://example.com/mcp', headers: { 'X-A': 'ghp_deadbeef1234' } });
     expect(raw.error).toContain('raw credential');
   });

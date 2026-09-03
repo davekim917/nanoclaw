@@ -169,8 +169,9 @@ server names are `[A-Za-z0-9_-]{1,64}`, exactly one of `command` or `url` is
 required, remote URLs must be HTTPS (plain HTTP only for `localhost` /
 `host.docker.internal`) with no credentials, fragment, credential-looking
 query parameter, or recognizable credential shape anywhere in the path or a
-query value, and any credential header must be exactly `onecli-managed` or an
-auth scheme followed by it. An unknown field is an error rather than a silent
+query value, and any header whose value looks opaque must be exactly
+`onecli-managed` or an auth scheme followed by it — the header check is on the
+value rather than on a list of credential-sounding names. An unknown field is an error rather than a silent
 drop.
 
 The URL is stored verbatim, and an opaque path segment is indistinguishable

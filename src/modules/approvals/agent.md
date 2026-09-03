@@ -39,7 +39,7 @@ add_mcp_server({
 
 - Does NOT install packages. Use `install_packages` first if the command isn't already available.
 - Remote URLs must use HTTPS (plain HTTP only for `localhost` / `host.docker.internal`) and may not carry credentials, fragments, or credential-looking query parameters. A token in the URL path or a query value is rejected too — the URL is written to disk verbatim, so a secret there is an on-disk secret.
-- Credential headers must be exactly `"onecli-managed"`, or an auth scheme followed by it (`"Bearer onecli-managed"`). The OneCLI gateway substitutes the real secret at the proxy boundary, so the container never holds the token.
+- **Any** header whose value looks opaque must be exactly `"onecli-managed"`, or an auth scheme followed by it (`"Bearer onecli-managed"`). The check is on the value, not on a list of credential-sounding names, so `X-Functions-Key` is covered as surely as `Authorization`. Ordinary configuration headers (`Content-Type: application/json`) pass unchanged. The OneCLI gateway substitutes the real secret at the proxy boundary, so the container never holds the token.
 - **A remote URL is stored verbatim.** Recognizable credential shapes in the path or query are rejected, but an opaque segment could be a token or a tenant id and nothing in the string tells them apart — the approval card names such segments so the admin can judge. Never put a secret in the URL; use a header with the placeholder.
 - On approval, the container is killed and the next message wakes it with the new server wired up. No image rebuild — bun runs TS directly.
 

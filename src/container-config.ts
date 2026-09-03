@@ -92,12 +92,15 @@ const ENV_KEY_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
 /** RFC 7230 token charset — what a header field-name may contain. */
 const HEADER_NAME_RE = /^[A-Za-z0-9!#$%&'*+.^_`|~-]{1,64}$/;
 /**
- * Header names that carry a credential. Such a header MUST be declared with
- * the OneCLI placeholder; the gateway overwrites it at the proxy boundary, so
- * the container never holds the real token (`DATAFOLD_MCP_SERVER` in
- * `src/container-runner.ts` is the reference wiring).
+ * Header names we can recognize as credential-bearing. This list is a source
+ * of better error messages, NOT the gate: enumerating names is unbounded
+ * (`X-Functions-Key`, `X-Client-Key`, whatever the next vendor invents), and
+ * every name missing from it used to mean a secret persisted verbatim. The
+ * gate is on the VALUE — see `headerValueIsSafe`.
  */
 const CREDENTIAL_HEADER_RE = /(authorization|auth|token|secret|api[-_]?key|cookie|credential|bearer)/i;
+/** A leading auth-scheme token, so the value behind it can be judged on its own. */
+const AUTH_SCHEME_PREFIX_RE = /^[A-Za-z][A-Za-z0-9-]* /;
 /** The value the OneCLI gateway replaces at the proxy boundary. */
 const ONECLI_PLACEHOLDER = 'onecli-managed';
 /**
@@ -145,6 +148,29 @@ export function validateMcpServerName(name: string): void {
   }
 }
 
+/**
+ * Whether one header value may be persisted as written.
+ *
+ * Keyed on the VALUE, not the header name. Enumerating credential-bearing
+ * names is unbounded, and each name we missed persisted a secret; an opaque
+ * value is the thing that is actually dangerous, whatever it is called.
+ *
+ * A value is safe when it is the OneCLI placeholder form, or when it is not
+ * opaque — `application/json`, `text/event-stream`, `2024-01-01` and the like
+ * read as configuration, while `aB3xY9kLmN2pQ7rS8t` does not. An auth scheme
+ * in front is stripped so `Bearer <token>` is judged on the token.
+ *
+ * Unlike an opaque segment in a URL path — which may equally be a tenant id
+ * and has no alternative spelling — a header always has a correct
+ * alternative: declare the placeholder and let the gateway inject the real
+ * value. That asymmetry is why headers reject and URL paths only warn.
+ */
+function headerValueIsSafe(key: string, value: string): boolean {
+  if (ONECLI_HEADER_VALUE_RE.test(value)) return true;
+  if (CREDENTIAL_HEADER_RE.test(key)) return false;
+  return !looksOpaque(value) && !looksOpaque(value.replace(AUTH_SCHEME_PREFIX_RE, ''));
+}
+
 /** Validate one `headers` map for a remote MCP server. Returns a fresh copy. */
 function parseMcpHeaders(raw: unknown): Record<string, string> {
   if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
@@ -161,9 +187,9 @@ function parseMcpHeaders(raw: unknown): Record<string, string> {
         `header "${key}" carries a raw credential; declare it as "${ONECLI_PLACEHOLDER}" and let the OneCLI gateway inject the real value`,
       );
     }
-    if (CREDENTIAL_HEADER_RE.test(key) && !ONECLI_HEADER_VALUE_RE.test(value)) {
+    if (!headerValueIsSafe(key, value)) {
       throw new Error(
-        `header "${key}" is a credential header, so its value must be exactly "${ONECLI_PLACEHOLDER}" or an auth scheme followed by it (e.g. "Bearer ${ONECLI_PLACEHOLDER}") — the gateway substitutes the real secret at the proxy boundary`,
+        `header "${key}" looks like it carries a credential, so its value must be exactly "${ONECLI_PLACEHOLDER}" or an auth scheme followed by it (e.g. "Bearer ${ONECLI_PLACEHOLDER}") — the gateway substitutes the real secret at the proxy boundary`,
       );
     }
     headers[key] = value;
