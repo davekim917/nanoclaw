@@ -52,3 +52,7 @@ import './provider-fallback/index.js';
 import './repository-workspaces/index.js';
 
 import './escalation/index.js';
+
+// Sweep-repo-fence (seam 2, PR 8 — G08): T5 approvals-reason-sweep,
+// T22 orphaned-repo-fence-release.
+import './sweep-repo-fence/index.js';
