@@ -442,6 +442,28 @@ export function _resetSweepRegistryForTesting(options: { builtins?: boolean } = 
 // Both paths emit one line, from one place, so each gate stays single-cause
 // (constraint 17).
 
+/**
+ * The driver's own W3 observe read. Not a registration — the `driver:` prefix
+ * says so — but it needs a stable `duty` value because it reads the mailbox and
+ * can therefore fail like a duty.
+ */
+const DRIVER_OBSERVE_DUTY = 'driver:observe';
+
+/**
+ * The per-session yield, injectable so a test can OBSERVE it.
+ *
+ * It is behavior, not decoration: deleting it turns a batch of swept sessions
+ * back into one contiguous event-loop freeze, and a test that only watches duty
+ * order stays green while that happens. R-2b records a marker through this seam.
+ */
+const defaultSweepYield = (): Promise<void> => new Promise((resolve) => setImmediate(resolve));
+let sweepYield: () => Promise<void> = defaultSweepYield;
+
+/** Test-only: wrap or replace the per-session yield. `null` restores it. */
+export function _setSweepYieldForTesting(next: (() => Promise<void>) | null): void {
+  sweepYield = next ?? defaultSweepYield;
+}
+
 const SWEEP_DUTY_TAG = Symbol('sweepDutyTag');
 interface SweepDutyTag {
   duty: string;
@@ -768,32 +790,41 @@ export function decideContinuationWake(args: {
  * outbound.db safe.
  */
 async function incrementStoppedContinuationAttempt(
+  run: SessionRunner,
   session: Session,
   expectedId: string,
 ): Promise<HostWorkContinuation | null> {
   try {
-    const result = await withExistingNanoclawSession(session.agent_group_id, session.id, (mailbox) =>
+    const result = await run((mailbox) =>
       expectedId !== 'legacy-pending-next'
         ? mailbox.incrementWorkContinuationResumeAttempt(expectedId)
         : mailbox.migrateLegacyWorkContinuationForRecovery(),
     );
     return result ?? null;
   } catch (err) {
+    // An OPENER failure was already classified and logged by the window, and it
+    // is unwinding the session — swallowing it here would hand S9b a null and
+    // let it wake the container on W1's stale plan through an unreadable
+    // mailbox. Everything else keeps the pre-seam outcome exactly: warn, return
+    // null, and let a due-count wake proceed without the continuation.
+    if (err instanceof SweepWindowAbort) throw err;
     log.warn('Failed to increment continuation recovery attempt', { sessionId: session.id, err });
     return null;
   }
 }
 
 async function restoreStoppedContinuationAttempt(
+  run: SessionRunner,
   session: Session,
   attempted: HostWorkContinuation,
   previous: HostWorkContinuation,
 ): Promise<void> {
   try {
-    await withExistingNanoclawSession(session.agent_group_id, session.id, (mailbox) =>
-      mailbox.restoreWorkContinuationResumeAttempt(attempted, previous),
-    );
+    await run((mailbox) => mailbox.restoreWorkContinuationResumeAttempt(attempted, previous));
   } catch (err) {
+    // Same split as the increment above: an opener failure is the window's to
+    // report and unwind; anything else keeps the pre-seam warn-and-continue.
+    if (err instanceof SweepWindowAbort) throw err;
     log.warn('Failed to restore continuation recovery attempt after rejected wake', { sessionId: session.id, err });
   }
 }
@@ -1423,7 +1454,7 @@ async function sweepOnce(): Promise<void> {
     // dominant source of the residual 5-8s stall detections (and delivery
     // latency) after the recovery-storm fixes. Per-session setImmediate
     // overhead is microseconds against that cost.
-    await new Promise((resolve) => setImmediate(resolve));
+    await sweepYield();
   }
   // Bound the cache to sessions that still exist (closed sessions drop out
   // of getActiveSessions and would otherwise accumulate forever).
@@ -2010,12 +2041,19 @@ async function sweepSession(session: Session, tick: SweepTickContext): Promise<n
     if (alive && !justWoke && plan.hasOutbound) {
       window = 'session:observe';
       observed =
-        (await ctx.run((m) => ({
-          containerState: m.getContainerState(),
-          processingClaimCount: m.getProcessingClaimRows().length,
-          lastOutboundAtMs: getLastOutboundAtMs(m),
-          lastInboundAtMs: getLastInboundAtMs(m),
-        }))) ?? null;
+        (await ctx.run((m) =>
+          // Machinery, but it reads the mailbox like a duty does, so it carries
+          // a duty identifier of its own. Without one, a throw from any of
+          // these four reads logged 'Host sweep duty failed' with no `duty` and
+          // no `window` at all — the field pair every family PR's post-deploy
+          // check filters on. The `driver:` prefix is not a registrable name.
+          runDutyBody(DRIVER_OBSERVE_DUTY, 'session:observe', () => ({
+            containerState: m.getContainerState(),
+            processingClaimCount: m.getProcessingClaimRows().length,
+            lastOutboundAtMs: getLastOutboundAtMs(m),
+            lastInboundAtMs: getLastInboundAtMs(m),
+          })),
+        )) ?? null;
 
       // ── W4: session:health — EXCLUSIVE, nothing open ───────────────────────
       if (observed) {
@@ -2896,8 +2934,13 @@ function registerBuiltInSweepDuties(): void {
     run: async (ctx) => {
       const c = asSessionContext(ctx);
       const { session, plan } = c;
+      // Both of these open a mailbox of their own, so both go through the
+      // window — an unopenable mailbox here is 'Host sweep mailbox unopenable'
+      // with window 'session:wake', not the helper's legacy warning, and it
+      // takes no quiet mark (W2 never backs off).
+      const wakeRun: SessionRunner = (action) => c.runIn('session:wake', action);
       const resumedContinuation = plan.continuationWakeEligible
-        ? await incrementStoppedContinuationAttempt(session, plan.workContinuation!.id)
+        ? await incrementStoppedContinuationAttempt(wakeRun, session, plan.workContinuation!.id)
         : null;
       const continuationWake = resumedContinuation !== null;
       if ((plan.dueCount > 0 || continuationWake) && !isContainerRunning(session.id)) {
@@ -2914,7 +2957,7 @@ function registerBuiltInSweepDuties(): void {
         const woke = await wakeContainer(session, plan.wakePriority);
         c.reportWoke(woke);
         if (!woke && resumedContinuation) {
-          await restoreStoppedContinuationAttempt(session, resumedContinuation, plan.workContinuation!);
+          await restoreStoppedContinuationAttempt(wakeRun, session, resumedContinuation, plan.workContinuation!);
         }
       }
     },
