@@ -34,6 +34,7 @@ import { markdownHeadingsToBold } from '../text-styles.js';
 import { createChatSdkBridge } from './chat-sdk-bridge.js';
 import type { ChannelRecoveryRequest, ChannelRecoveryTarget } from './adapter.js';
 import { registerChannelAdapter } from './channel-registry.js';
+import { extractSlackRawText } from './slack-raw-text.js';
 import {
   fetchSlackBotIdentity,
   getSlackBotSenderName,
@@ -434,6 +435,10 @@ for (const ws of workspaces) {
 
       const bridge = createChatSdkBridge({
         adapter: slackAdapter,
+        // Slack sends a pasted table as attachments[].blocks[] — it appears in
+        // neither the message text nor the file list, so without this the agent
+        // gets only the sentence before the table.
+        extractRawText: extractSlackRawText,
         concurrency: 'concurrent',
         supportsThreads: true,
         maxTextLength: SLACK_MESSAGE_MAX_TEXT_LENGTH,
@@ -495,8 +500,15 @@ for (const ws of workspaces) {
         },
         detectRecoveredMention: (message) => {
           if (!identity) return false;
-          const raw = message.raw as { text?: string } | undefined;
-          return raw?.text?.includes(`<@${identity.userId}>`) === true;
+          const raw = message.raw as Record<string, unknown> | undefined;
+          if (!raw) return false;
+          const mention = `<@${identity.userId}>`;
+          if (typeof raw.text === 'string' && raw.text.includes(mention)) return true;
+          // A pasted table can be the only place the bot is addressed, and a
+          // REST-fetched recovery row carries no isMention. The same
+          // projection the bridge appends to the body answers this question
+          // too — see the invariant note in slack-raw-text.ts.
+          return extractSlackRawText(raw)?.includes(mention) === true;
         },
         // Sibling-bot messages are admissible in recovery (mirrors discord.ts):
         // without this, a sibling's @-mention that arrives during an event-loop

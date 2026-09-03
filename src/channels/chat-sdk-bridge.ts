@@ -79,6 +79,17 @@ export function clearSlashCommandHandlers(): void {
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 export type ReplyContextExtractor = (raw: Record<string, any>) => ReplyContext | null;
 
+/**
+ * Recover readable content a platform adapter left only in `message.raw`.
+ *
+ * The bridge drops `raw` before persisting (it can be very large), so anything
+ * the adapter did not project into `Message.toJSON()` is lost at that point.
+ * A platform that carries readable content outside the normal text — Slack
+ * puts pasted tables in `attachments[].blocks[]` — returns it here as text.
+ * Return null when there is nothing to recover.
+ */
+export type RawTextExtractor = (raw: Record<string, unknown>) => string | null;
+
 /** Race a promise against a timeout; rejects if the timeout wins. */
 function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
   return Promise.race([
@@ -284,6 +295,13 @@ export interface ChatSdkBridgeConfig {
    * need its own pass.
    */
   transformInboundText?: (text: string) => string;
+  /**
+   * Recover readable content the platform adapter left only in `message.raw`.
+   * The returned text is appended to the message body and persisted; the raw
+   * provider payload is still dropped. See appendRawText for the ordering
+   * constraints inside messageToInbound.
+   */
+  extractRawText?: RawTextExtractor;
   /**
    * Optional live identity override for an inbound author. Chat SDK adapters
    * can expose a stale install-time bot name after the platform profile has
@@ -617,6 +635,22 @@ export function splitForLimit(text: string, limit: number): string[] {
   return chunks;
 }
 
+/**
+ * Append platform-rescued text to the serialized body, before `raw` is dropped.
+ * No extractor, or nothing recovered, leaves the body byte-identical.
+ */
+export function appendRawText(
+  serialized: Record<string, unknown>,
+  raw: Record<string, unknown>,
+  extract?: RawTextExtractor,
+): void {
+  if (!extract) return;
+  const extra = extract(raw);
+  if (!extra) return;
+  const text = typeof serialized.text === 'string' ? serialized.text : '';
+  serialized.text = text ? `${text}\n\n${extra}` : extra;
+}
+
 export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter {
   const { adapter } = config;
   const bridgeChannelType = config.channelType ?? adapter.name;
@@ -842,6 +876,16 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
     if (serialized.formatted) {
       const rebuilt = reconstructInboundText(serialized.formatted);
       if (rebuilt !== null) serialized.text = rebuilt;
+    }
+
+    // Recover platform content the Chat SDK left only in `raw` (Slack puts a
+    // pasted table in attachments[].blocks[]). Runs AFTER the mdast rebuild —
+    // reconstructInboundText REPLACES serialized.text, so appending earlier
+    // (where upstream puts it) would be silently discarded here — and BEFORE
+    // transformInboundText so raw `<@U…>` inside recovered cells resolves to
+    // @name like the rest of the body.
+    if (message.raw) {
+      appendRawText(serialized, message.raw as Record<string, unknown>, config.extractRawText);
     }
 
     // Resolve raw platform mention syntax (Discord's `<@snowflake>`) into
@@ -1520,17 +1564,26 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
         const msgs = (result?.messages ?? []) as Array<{
           id: string;
           text: string;
+          raw?: unknown;
           author: { userId?: string; fullName: string; userName: string; isMe: boolean };
           metadata: { dateSent: Date };
         }>;
         for (const m of msgs) {
           if (m.id === opts?.excludeMessageId) continue;
-          if (!m.text || m.text.length === 0) continue;
+          // Replayed context goes through the same raw-text recovery as the
+          // live path. Without it a Slack message whose only content is a
+          // pasted table has empty `.text` and is skipped outright, and a
+          // table with an introductory sentence replays only the sentence —
+          // the very message that made the thread worth resuming.
+          const projected: Record<string, unknown> = { text: m.text };
+          if (m.raw) appendRawText(projected, m.raw as Record<string, unknown>, config.extractRawText);
+          const text = typeof projected.text === 'string' ? projected.text : '';
+          if (text.length === 0) continue;
           inThread.push({
             sender: m.author.isMe
               ? 'assistant'
               : config.transformInboundSender?.(m.author) || m.author.fullName || m.author.userName || 'unknown',
-            text: applyInboundTransform(m.text),
+            text: applyInboundTransform(text),
             timestamp: m.metadata.dateSent.toISOString(),
           });
         }
