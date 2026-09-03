@@ -56,9 +56,13 @@ export function getDeliveredIds(db: Database.Database): Set<string> {
  * exists (pending or resolved) we don't want to clobber it by accident.
  */
 export function markPending(db: Database.Database, messageOutId: string): void {
+  // Bound ISO, matching `markDelivered`/`markDeliveryFailed` below, which
+  // overwrite this same column on this same row. `datetime('now')` wrote the
+  // naive shape, so a still-pending row's `delivered_at` sorted and parsed
+  // differently from a resolved one (CLAUDE.md, Timestamps).
   db.prepare(
-    "INSERT OR IGNORE INTO delivered (message_out_id, platform_message_id, status, delivered_at) VALUES (?, NULL, 'pending', datetime('now'))",
-  ).run(messageOutId);
+    "INSERT OR IGNORE INTO delivered (message_out_id, platform_message_id, status, delivered_at) VALUES (?, NULL, 'pending', ?)",
+  ).run(messageOutId, new Date().toISOString());
 }
 
 export function markDelivered(db: Database.Database, messageOutId: string, platformMessageId: string | null): void {

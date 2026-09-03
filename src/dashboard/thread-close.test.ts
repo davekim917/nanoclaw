@@ -13,14 +13,33 @@ import type { AuthedRequestContext } from './router.js';
 // The close path calls into the container registry. Both are injected at the
 // call sites the tests exercise; the mock only keeps the spawn path (docker,
 // mounts, onecli) out of the module graph.
-// Mutable so one case can flip container ownership DURING the async clear —
-// the interleave the post-clear re-check exists for. Every other case injects
-// `deps.isContainerRunning` and never reads this.
-const containerOwns = vi.hoisted(() => ({ value: false }));
+// Container ownership, mockable per READ so a case can model a wake landing
+// between the finalizer's branch and the force-clear's own guard — the two
+// places that ask. `queue` answers successive reads in order and then falls
+// back to `value`. Every other case injects `deps.isContainerRunning` instead.
+const containerOwns = vi.hoisted(() => ({ value: false, queue: [] as boolean[] }));
+
+// One-shot hook that fires inside the proposal read — the await that used to
+// straddle the membership snapshot. Lets a case add a sibling session mid-flight
+// without any timing dependence.
+const duringProposalRead = vi.hoisted(() => ({ run: null as (() => void) | null }));
+
+vi.mock('../modules/mailbox/session.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../modules/mailbox/session.js')>();
+  return {
+    ...actual,
+    withExistingNanoclawOutbound: async (agentGroupId: string, sessionId: string, action: never) => {
+      const hook = duringProposalRead.run;
+      duringProposalRead.run = null;
+      hook?.();
+      return actual.withExistingNanoclawOutbound(agentGroupId, sessionId, action);
+    },
+  };
+});
 
 vi.mock('../container-runner.js', () => ({
   isContainerRunning: () => false,
-  containerOwnsOutbound: () => containerOwns.value,
+  containerOwnsOutbound: () => (containerOwns.queue.length > 0 ? containerOwns.queue.shift()! : containerOwns.value),
   killContainer: () => {},
   getActiveContainerSessionIds: () => [],
   resolveAssistantName: (group: { name: string }) => Promise.resolve(group.name),
@@ -125,7 +144,12 @@ function outboundStub(): Database.Database {
   return db;
 }
 
-beforeEach(seed);
+beforeEach(() => {
+  containerOwns.value = false;
+  containerOwns.queue = [];
+  duringProposalRead.run = null;
+  seed();
+});
 
 // ── The guard ────────────────────────────────────────────────────────────────
 
@@ -242,6 +266,28 @@ describe('requestThreadClose', () => {
     expect(
       getDb().prepare('SELECT agent_proposed FROM thread_closures WHERE thread_id = ?').get('slack:C1:1.1'),
     ).toMatchObject({ agent_proposed: 1 });
+  });
+
+  /**
+   * Thread membership must be re-read immediately before it is frozen.
+   *
+   * The visible-session list was computed before the proposal reads, which
+   * await. A sibling session joining the thread during that yield was frozen
+   * out of the reservation, so it never received a wrap-up and was never
+   * finalized — the operator closes the thread and one agent keeps working.
+   */
+  it('includes a sibling that joins the thread during the proposal read', async () => {
+    // The join lands inside the await that used to straddle the snapshot.
+    duringProposalRead.run = () => insertSession('s-late', 'ag2', 'slack:C1:1.1');
+
+    const res = await requestThreadClose('slack:C1:1.1', { confirmations: 2, reason: 'wrap' }, ctxFor('admin'));
+
+    expect(res.status).toBe(202);
+    expect(new Set(res.body.session_ids as string[])).toEqual(new Set(['s1', 's-late']));
+    const row = getDb().prepare('SELECT session_ids FROM thread_closures WHERE thread_id = ?').get('slack:C1:1.1') as {
+      session_ids: string;
+    };
+    expect(new Set(JSON.parse(row.session_ids) as string[])).toEqual(new Set(['s1', 's-late']));
   });
 
   it('collapses an unknown thread and an unprivileged caller into the same 404', async () => {
@@ -455,20 +501,22 @@ describe('the close sequence order', () => {
     };
   }
 
-  it('clears the continuation BEFORE killing, and archives only after the process is gone', async () => {
+  it('kills first, then clears once the process is gone, then archives', async () => {
     startClose();
     const { calls, deps } = recordingDeps();
     await advanceThreadClosures(deps);
-    // The invariant: a kill that precedes the clear resurrects the promise on
-    // the next wake (decideCeilingFollowUp's first branch), so the close would
-    // silently not close.
-    expect(calls.indexOf('clear')).toBeLessThan(calls.indexOf('kill'));
-    expect(calls.indexOf('kill')).toBeLessThan(calls.indexOf('archive'));
-    // Re-cleared once the exit callback proves the container is gone.
-    expect(calls).toEqual(['clear', 'kill', 'clear', 'archive']);
+    // The ordering INVERTED deliberately. It used to clear before the kill, to
+    // stop the dying container's promise surviving. But `outbound.db` has one
+    // writer, and clearing while the container still owns it is a host write
+    // under a live writer. Clearing AFTER `onExit` serves the same concern
+    // better: a continuation persisted during the SIGTERM grace is cleared
+    // rather than raced.
+    expect(calls).toEqual(['kill', 'clear', 'archive']);
+    expect(calls.indexOf('kill')).toBeLessThan(calls.indexOf('clear'));
+    expect(calls.indexOf('clear')).toBeLessThan(calls.indexOf('archive'));
   });
 
-  it('does NOT kill or archive when the continuation cannot be cleared', async () => {
+  it('does NOT archive when the continuation cannot be cleared, and retries next tick', async () => {
     startClose();
     const { calls, deps } = recordingDeps((recorded) => ({
       clearContinuation: () => {
@@ -477,7 +525,10 @@ describe('the close sequence order', () => {
       },
     }));
     await advanceThreadClosures(deps);
-    expect(calls).toEqual(['clear']);
+    // The kill now precedes the clear, so it has already happened; what a
+    // failed clear withholds is the ARCHIVE. The closure stays `finalizing`
+    // and the next tick retries — against a container that is now stopped.
+    expect(calls).toEqual(['kill', 'clear']);
     expect(getDb().prepare('SELECT archived_at FROM sessions WHERE id = ?').get('s1')).toMatchObject({
       archived_at: null,
     });
@@ -509,7 +560,7 @@ describe('the close sequence order', () => {
     startClose({ requestedAt: iso(30_000) });
     const { calls, deps } = recordingDeps({ readProposal: () => ({ reason: 'done', proposed_at: iso(10_000) }) });
     await advanceThreadClosures(deps);
-    expect(calls).toEqual(['clear', 'kill', 'clear', 'archive']);
+    expect(calls).toEqual(['kill', 'clear', 'archive']);
     expect(getDb().prepare('SELECT forced FROM thread_closures WHERE thread_id = ?').get(THREAD)).toMatchObject({
       forced: 0,
     });
@@ -525,7 +576,7 @@ describe('the close sequence order', () => {
     });
   });
 
-  it('end to end: the REAL clear empties the session DB before the container is killed', async () => {
+  it('end to end: the REAL clear empties the session DB once the container is gone', async () => {
     startClose();
     materializeSession('ag1', 's1');
     const out = new Database(dbPathFor('ag1', 's1', 'outbound.db'));
@@ -541,6 +592,11 @@ describe('the close sequence order', () => {
     let continuationAtKill: unknown = 'not-observed';
     // `clearContinuation` is deliberately NOT injected here: this exercises the
     // production force-clear against a real outbound.db.
+    //
+    // The observation point INVERTED with the ordering: the clear now runs
+    // inside `onExit`, so at the moment of the kill the promise is still
+    // there. That is the point — the host does not write outbound.db until the
+    // container that owns it is provably gone.
     await advanceThreadClosures({
       now: NOW,
       isContainerRunning: () => true,
@@ -554,8 +610,8 @@ describe('the close sequence order', () => {
       },
     });
 
-    // The invariant, observed at the exact moment of the kill.
-    expect(continuationAtKill).toBeNull();
+    // Still held when the kill is issued; cleared by the time it returns.
+    expect(continuationAtKill).not.toBeNull();
     const after = new Database(dbPathFor('ag1', 's1', 'outbound.db'), { readonly: true });
     expect(
       after.prepare("SELECT COUNT(*) AS n FROM session_state WHERE key IN ('work_continuation','pending_next')").get(),
@@ -644,46 +700,60 @@ describe('the close sequence order', () => {
   });
 
   /**
-   * The container state must be read AFTER the clear, not before it.
+   * A wake landing between the finalizer's ownership branch and the
+   * force-clear's own guard must not end with an archived session.
    *
-   * `clear` became asynchronous when the force-clear moved behind the mailbox
-   * seam. Concurrent ingress can start waking the session during that yield,
-   * and a `running` sampled beforehand is then stale: the close took the
-   * archive branch and marked the thread closed for the operator while a new
-   * or still-spawning container kept working in it. Archiving is display-only,
-   * so nothing downstream stopped it.
+   * The ordering fix removed the stale sample by construction — ownership is
+   * read immediately before the branch, with no await between. What remains is
+   * the composition: the no-container branch still awaits the clear, and a
+   * container can come up inside it. The clear's own `containerOwnsOutbound`
+   * re-check is what covers that, refusing to write outbound.db under a live
+   * writer and reporting not-cleared, so the caller does not archive and the
+   * closure retries on the next tick.
    *
-   * Deliberately does NOT inject `deps.isContainerRunning` — the point is to
-   * exercise the real ownership predicate, which counts SPAWNING too.
+   * Deliberately uses the REAL clear and the REAL ownership predicate: the
+   * queue answers the finalizer's read `false` and the clear's read `true`,
+   * which is the wake landing in between.
    */
-  it('kills a container that came up during the clear instead of archiving on a stale sample', async () => {
+  it('does not archive when a container takes the session between the branch and the clear', async () => {
     startClose();
-    containerOwns.value = false;
-    let killed: string | null = null;
+    materializeSession('ag1', 's1');
+    const out = new Database(dbPathFor('ag1', 's1', 'outbound.db'));
+    out
+      .prepare('INSERT INTO session_state (key, value, updated_at) VALUES (?, ?, ?)')
+      .run(
+        'work_continuation',
+        JSON.stringify({ id: 'c-wake', task: 'still mine', phase: 'queued', chain: 1, resume_attempts: 0 }),
+        iso(0),
+      );
+    out.close();
+
+    // Read 1 = the finalizer's branch (no container). Read 2 = the clear's
+    // guard (a container took it during the open).
+    containerOwns.queue = [false, true];
     let archived: string | null = null;
 
     await advanceThreadClosures({
       now: NOW,
       readProposal: () => null,
-      // The wake lands here, inside the await the stale sample straddled.
-      clearContinuation: async () => {
-        containerOwns.value = true;
-        return true;
-      },
-      killContainer: (id, _reason, onExit) => {
-        killed = id;
-        onExit?.();
-      },
       archiveSession: (id) => {
         archived = id;
         return true;
       },
     });
 
-    // The kill branch, not the archive-only branch. Archiving still happens,
-    // but AFTER the kill's onExit — never instead of it.
-    expect(killed).toBe('s1');
-    expect(archived).toBe('s1');
+    // Not archived, and the promise is untouched — the host did not write
+    // outbound.db while a container owned it.
+    expect(archived).toBeNull();
+    const after = new Database(dbPathFor('ag1', 's1', 'outbound.db'), { readonly: true });
+    expect(
+      after.prepare("SELECT COUNT(*) AS n FROM session_state WHERE key IN ('work_continuation','pending_next')").get(),
+    ).toMatchObject({ n: 1 });
+    after.close();
+    // Still finalizing, so the next tick retries against a stopped container.
+    expect(getDb().prepare('SELECT state FROM thread_closures WHERE thread_id = ?').get(THREAD)).toMatchObject({
+      state: 'finalizing',
+    });
   });
 
   it('is idempotent — a second tick over an already-closed thread does nothing', async () => {

@@ -297,6 +297,36 @@ describe('NanoclawAgentMailbox', () => {
     expect(row).toEqual({ status: 'delivered', platform_message_id: 'p1', error: null });
   });
 
+  /**
+   * Every timestamp a JS writer puts in a session DB is ISO-8601 UTC.
+   *
+   * `datetime('now')` yields the naive `YYYY-MM-DD HH:MM:SS` shape, which
+   * `new Date()` misparses as LOCAL time and which sorts below ISO as TEXT.
+   * `markPending` wrote that into the same `delivered_at` column its two
+   * siblings fill with bound ISO, so a still-pending row compared and ordered
+   * differently from a resolved one.
+   */
+  it('markPending writes delivered_at as ISO, like its siblings', async () => {
+    const key = freshKey();
+    const mailbox = getAgentMailbox();
+    mailbox.prepare(key);
+
+    await mailbox.session(key, async (mailboxSession) => {
+      const m = fork(mailboxSession);
+      m.markPending('out-iso-pending');
+      m.markPending('out-iso-resolved');
+      m.markDelivered('out-iso-resolved', 'p1');
+    });
+
+    const rows = raw(dbPath(key, 'inbound'), (db) =>
+      db.prepare('SELECT message_out_id, delivered_at FROM delivered ORDER BY message_out_id').all(),
+    ) as Array<{ message_out_id: string; delivered_at: string }>;
+    for (const row of rows) {
+      expect(row.delivered_at).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/);
+      expect(Number.isNaN(Date.parse(row.delivered_at))).toBe(false);
+    }
+  });
+
   it('withMailboxSession throws on same-key nesting and allows other keys', async () => {
     const outer = freshKey();
     const other = freshKey();

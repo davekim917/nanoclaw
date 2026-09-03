@@ -569,6 +569,42 @@ describe('restoreTaskRow', () => {
   // re-insert a snapshot of the source row. Unlike insertTask (which sets
   // series_id = new id, severing identity) restoreTaskRow preserves the
   // snapshot's series_id AND status — a paused row must come back paused.
+  /**
+   * The restored row's own timestamp must be ISO, like every other row's.
+   *
+   * It was `datetime('now')` — the naive `YYYY-MM-DD HH:MM:SS` shape, which
+   * `new Date()` reads as LOCAL time and which sorts BELOW every ISO value as
+   * TEXT. A restored row therefore ordered before every sibling in the same
+   * column and compared wrong against them (CLAUDE.md, Timestamps).
+   */
+  it('test_restore_writes_an_iso_timestamp_alongside_its_siblings', () => {
+    const db = freshDb();
+    insertBasicTask(db, 'sibling-1', null);
+    restoreTaskRow(db, {
+      id: 'restored-iso',
+      series_id: 'S',
+      status: 'pending',
+      process_after: '2026-01-01T00:00:00Z',
+      recurrence: null,
+      content: JSON.stringify({ prompt: 'restore me' }),
+      platform_id: null,
+      channel_type: null,
+      thread_id: null,
+      kind: 'task',
+    });
+
+    const rows = db.prepare('SELECT id, timestamp FROM messages_in ORDER BY id').all() as Array<{
+      id: string;
+      timestamp: string;
+    }>;
+    const restored = rows.find((r) => r.id === 'restored-iso')!;
+    expect(restored.timestamp).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/);
+    // And it sorts WITH its siblings as TEXT, which the naive shape did not.
+    const sibling = rows.find((r) => r.id === 'sibling-1')!;
+    expect(restored.timestamp >= sibling.timestamp).toBe(true);
+    db.close();
+  });
+
   it('test_restore_preserves_series_id_and_status', () => {
     const db = freshDb();
     const snapshot: TaskRowSnapshot = {

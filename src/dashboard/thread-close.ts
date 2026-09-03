@@ -358,6 +358,26 @@ export async function requestThreadClose(
   // itself the lock: a LIVE closure is never overwritten, a finished one still
   // re-opens (the case the upsert exists for), and zero rows changed means
   // somebody else reserved it first.
+  // Membership is re-read HERE, synchronously, immediately before it is frozen
+  // — no await between this and the INSERT below. `visible` above was computed
+  // before the proposal reads, which await; a sibling session joining the
+  // thread during that yield was frozen out of the reservation, so it never
+  // received a wrap-up and was never finalized. The scope rule is re-applied
+  // to the fresh set for the same reason it applies to the first one: closing
+  // a thread that now reaches an agent this caller cannot see would either lie
+  // or escalate, and refusing here is safe because nothing has been reserved
+  // yet.
+  const freshAll = sessionsOnThread(threadId);
+  const freshVisible = ctx.scopes.no_filter
+    ? freshAll
+    : freshAll.filter((s) => ctx.scopes.allowed_group_ids.includes(s.agent_group_id));
+  if (freshVisible.length !== freshAll.length) {
+    return {
+      status: 409,
+      body: { error: 'thread_extends_beyond_your_scope', thread_id: threadId, visible_sessions: freshVisible.length },
+    };
+  }
+
   const reserved = getDb()
     .prepare(
       `INSERT INTO thread_closures
@@ -370,7 +390,14 @@ export async function requestThreadClose(
          forced = 0, closed_at = NULL
        WHERE thread_closures.state = 'closed'`,
     )
-    .run(threadId, ctx.user.id, requestedAt, reason, agentProposed ? 1 : 0, JSON.stringify(visible.map((s) => s.id)));
+    .run(
+      threadId,
+      ctx.user.id,
+      requestedAt,
+      reason,
+      agentProposed ? 1 : 0,
+      JSON.stringify(freshVisible.map((s) => s.id)),
+    );
 
   if (reserved.changes === 0) {
     // Lost the race. The same refusal the early check gives, reported from the
@@ -387,13 +414,17 @@ export async function requestThreadClose(
     };
   }
 
+  // The fan-out follows the frozen set, so a late joiner gets its wrap-up too.
+  // Its `propose_done` is deliberately NOT re-read for `agentProposed` above:
+  // counting it could only LOWER the confirmations the operator owes, and this
+  // path never gets cheaper on a second look (see the EXACT-not-mirror note).
   let delivered = 0;
-  for (const s of visible) if (await writeCloseWrapUp(s, threadId, text, requestedAt)) delivered++;
+  for (const s of freshVisible) if (await writeCloseWrapUp(s, threadId, text, requestedAt)) delivered++;
 
   log.info('thread-close: requested', {
     threadId,
     userId: ctx.user.id,
-    sessions: visible.length,
+    sessions: freshVisible.length,
     delivered,
     agentProposed,
     confirmations,
@@ -404,7 +435,7 @@ export async function requestThreadClose(
       thread_id: threadId,
       state: 'awaiting_confirmation',
       requested_at: requestedAt,
-      session_ids: visible.map((s) => s.id),
+      session_ids: freshVisible.map((s) => s.id),
       wrap_up_delivered: delivered,
       agent_proposed: agentProposed,
       confirm_window_ms: CLOSE_CONFIRM_WINDOW_MS,
@@ -466,6 +497,20 @@ async function forceClearWorkContinuation(session: CloseSession, threadId: strin
   // present but will not open raises from the opener instead, and
   // `ensureContinuationCleared` counts that as not-cleared.
   const cleared = await withExistingNanoclawOutbound(session.agent_group_id, session.id, (outbound) => {
+    // Re-checked INSIDE the session, immediately before the write, with no
+    // await in between — the guard shape PR 5 established for every host write
+    // to the container-owned outbound.db. Opening the session is a yield, and a
+    // wake can start a container in it; `outbound.db` has exactly one writer,
+    // so the host may only write while none is claimed. Not cleared, so the
+    // caller does not archive: the closure retries on the next tick, by which
+    // time the kill has landed.
+    if (containerOwnsOutbound(session.id)) {
+      log.info('thread-close: skipped the force-clear — a container owns outbound.db', {
+        threadId,
+        sessionId: session.id,
+      });
+      return false;
+    }
     const held = outbound.clearWorkContinuation();
     if (held) {
       log.info('thread-close: force-cleared a work_continuation the container still held', {
@@ -541,39 +586,43 @@ async function finalizeSession(session: CloseSession, threadId: string, deps: Th
   const owns = (id: string): boolean =>
     deps.isContainerRunning ? deps.isContainerRunning(id) : containerOwnsOutbound(id);
 
-  // (b)
-  if (!(await clear(session, threadId))) return;
-
-  // Sampled HERE, after the clear and immediately before the branch, with no
-  // await in between. It used to be read at the top of this function, before
-  // `clear` — which became asynchronous when the force-clear moved behind the
-  // mailbox seam. Concurrent ingress can start waking this session during that
-  // yield, and the stale `false` then took the archive branch: the thread is
-  // marked closed for the operator while a new or still-spawning container
-  // keeps working in it. Archiving is display-only, so nothing downstream
-  // stops it.
+  // Ownership is read HERE, and it decides the ORDER, not whether to clear.
+  //
+  // No container: nothing to stop, so clear and archive directly. The clear is
+  // still gated inside itself — see `forceClearWorkContinuation` — because a
+  // wake can land between this branch and the write.
   if (!owns(session.id)) {
+    if (!(await clear(session, threadId))) return;
     archive(session.id); // (e)
     return;
   }
-  // (c)
+
+  // (c) KILL FIRST, then clear once the container is provably gone.
   //
-  // `killContainer`'s onExit is a synchronous callback and the clear is async
-  // now, so the exit work is captured rather than awaited inline. Awaiting the
-  // captured promise afterwards costs nothing in production — the real
-  // `killContainer` fires onExit long after this returns, so `exitWork` is
-  // still undefined here and the closure simply advances on the next tick, as
-  // the comment below has always said. When onExit DOES fire synchronously
-  // (a stopped container, or an injected kill), awaiting it keeps the original
-  // ordering: clear, then archive, both before this function returns.
+  // This used to clear BEFORE the kill, on the reasoning that killing first
+  // would leave the dying container's continuation intact. That has it exactly
+  // backwards: `outbound.db` has ONE writer, and clearing while the container
+  // still owns it is a host write under a live writer. The concern it was
+  // guarding is precisely why the clear belongs AFTER exit — a continuation
+  // persisted during the SIGTERM grace period is then cleared rather than
+  // raced. `killContainer`'s `onExit` is what guarantees the process is gone.
+  //
+  // A failed clear means the promise may still be live, so the session is NOT
+  // archived: the closure stays `finalizing` and the next tick retries, which
+  // is the same answer a failed clear has always given. By then the container
+  // is stopped, so the retry is the one that succeeds.
+  //
+  // `onExit` is a synchronous callback and the clear is async, so the exit work
+  // is captured and awaited after. In production the real `killContainer` fires
+  // `onExit` long after this returns, so `exitWork` is still undefined here and
+  // the closure advances on a later tick; when it fires synchronously (an
+  // already-stopped container, or an injected kill) awaiting it keeps kill,
+  // clear and archive ordered before this function returns.
   let exitWork: Promise<void> | undefined;
   kill(session.id, `thread close ${threadId}`, () => {
     exitWork = (async () => {
-      try {
-        await clear(session, threadId);
-      } finally {
-        archive(session.id); // (e)
-      }
+      if (!(await clear(session, threadId))) return;
+      archive(session.id); // (e)
     })();
   });
   await exitWork;
