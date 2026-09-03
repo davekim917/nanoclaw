@@ -19,7 +19,7 @@ import { writeFileSync } from 'node:fs';
 
 import * as p from '@clack/prompts';
 
-import { firstFailureHint, fullyApplied } from '../../scripts/skill-apply.js';
+import { firstFailureHint, fullyApplied, hasBlockingFailure } from '../../scripts/skill-apply.js';
 import * as setupLog from '../logs.js';
 import { BACK_TO_CHANNEL_SELECTION, backGate, type ChannelFlowResult } from '../lib/back-nav.js';
 import { askOperatorRole, type OperatorRole } from '../lib/role-prompt.js';
@@ -165,19 +165,30 @@ export async function runChannelSkill(
     for (const t of res.agentTasks) {
       const lines = t.reason.split('\n').map((l) => l.trim()).filter(Boolean);
       const more = lines.length > 1 ? ` (+${lines.length - 1} more lines in ${rawLog})` : '';
-      p.log.warn(`Needs an agent (${t.kind}): ${lines[0] ?? t.reason}${more}`);
+      // A protective refusal (copy owned-by-fork — #250) isn't a failure: the
+      // engine already did the safe, complete thing. Still worth telling the
+      // operator, just not under the "needs an agent" banner that implies
+      // something is broken.
+      const label = t.protective ? 'Protected' : 'Needs an agent';
+      p.log.warn(`${label} (${t.kind}): ${lines[0] ?? t.reason}${more}`);
     }
-    // Surface the bounced step's OWN prose as the failure hint + Claude-handoff
-    // context (fail() dims the hint and forwards it to offerClaudeOnFailure),
-    // instead of a generic "couldn't finish" message. Only a real bounce yields a
-    // diagnosis; a purely-deferred run (a missing input) falls back to the generic.
-    const diag = firstFailureHint(res);
-    await failWith(
-      `${channel}-install`,
-      diag?.headline ?? `Couldn't finish setting up ${channel}.`,
-      diag?.hint ?? 'See logs/setup-steps/ for details, then retry setup.',
-      rawLog,
-    );
+    // A purely protective run (every bounce was a #250 refusal, nothing
+    // deferred) is NOT a failure — the skill did everything it safely could.
+    // Aborting here would block credential collection/wiring on a customized
+    // Slack/Discord install every time a sibling file needs a fresh copy.
+    if (hasBlockingFailure(res)) {
+      // Surface the bounced step's OWN prose as the failure hint + Claude-handoff
+      // context (fail() dims the hint and forwards it to offerClaudeOnFailure),
+      // instead of a generic "couldn't finish" message. Only a real bounce yields a
+      // diagnosis; a purely-deferred run (a missing input) falls back to the generic.
+      const diag = firstFailureHint(res);
+      await failWith(
+        `${channel}-install`,
+        diag?.headline ?? `Couldn't finish setting up ${channel}.`,
+        diag?.hint ?? 'See logs/setup-steps/ for details, then retry setup.',
+        rawLog,
+      );
+    }
   }
 
   // Identity confirmation captured by the skill (e.g. add-slack's auth.test).

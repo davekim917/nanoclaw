@@ -1,5 +1,5 @@
 {
-  "notes": "Conformance fixtures for scripts/skill-conformance.test.ts — shaped fake values only, never real credentials. Two scenarios cover both when:connection= legs; the auth.test stub answers the connected_as capture and conversations.open answers platform_id.",
+  "notes": "Conformance fixtures for scripts/skill-conformance.test.ts — shaped fake values only, never real credentials. Two scenarios cover both when:connection= legs; the auth.test stub answers the connected_as capture and conversations.open answers platform_id. The git show stub answers step 1's owned-by-fork copy (#250) — the scratch root never pre-has these files, so it's a plain fresh install with no divergence check; the engine now requires a string result for that content, not just a command that ran (skill-apply.ts's owned-by-fork branch).",
   "scenarios": [
     {
       "name": "socket",
@@ -10,6 +10,7 @@
         "owner_handle": "UTEST00004"
       },
       "exec": [
+        { "match": "git show", "stdout": "// placeholder branch content" },
         { "match": "auth.test", "stdout": "@nano in Acme" },
         { "match": "conversations.open", "stdout": "slack:D0FAKE" }
       ]
@@ -23,6 +24,7 @@
         "owner_handle": "UTEST00004"
       },
       "exec": [
+        { "match": "git show", "stdout": "// placeholder branch content" },
         { "match": "auth.test", "stdout": "@nano in Acme" },
         { "match": "conversations.open", "stdout": "slack:D0FAKE" }
       ]
