@@ -52,13 +52,63 @@ export const SWEEP_INTERVAL_MS = 60_000;
 
 // Quiet-session cache — see the sweep loop. A fully-quiet session is skipped
 // for at most this long (or until its next scheduled row is due, if sooner).
-const QUIET_SESSION_BACKOFF_MS = 30 * 60_000;
+export const QUIET_SESSION_BACKOFF_MS = 30 * 60_000;
+/**
+ * Floor of the per-session jitter band, as a fraction of the cap: a mark
+ * expires somewhere in [floor, 1) x the backoff above, never past it.
+ *
+ * Without a jitter every session marked in the same tick expires in the same
+ * tick. Live (#320): the whole quiet population — ~840 sessions — came back on
+ * one exact 30-minute grid 48 times a day, and each of those was a ~30 s tick
+ * that swept every active session at once. This spreads that cohort across the
+ * 15 minutes below the cap. It only ever SHORTENS a skip, so plan.md §4.4's
+ * 30-minute ceiling still holds and no session waits longer than it does today.
+ */
+const QUIET_SESSION_JITTER_FLOOR = 0.5;
 interface QuietMark {
   skipUntilMs: number;
   lastActive: string | null;
 }
 const quietSessions = new Map<string, QuietMark>();
 let lastSkippedQuiet = 0;
+
+/**
+ * Per-session jitter in [0, 1), derived from the session id — deterministic,
+ * deliberately NOT `Math.random()`: two ticks must agree on the same session,
+ * and the acceptance cases have to reproduce the spread across runs.
+ *
+ * FNV-1a with a murmur3 finalizer. The finalizer is load-bearing, not
+ * ceremony: raw FNV-1a over ids that differ only in their last characters —
+ * which is exactly what `sess-<epoch-ms>-<suffix>` ids are — puts 200 sessions
+ * into five distinct buckets, which is a smaller herd rather than no herd.
+ */
+function quietSessionJitter(sessionId: string): number {
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < sessionId.length; i++) {
+    hash ^= sessionId.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  hash ^= hash >>> 16;
+  hash = Math.imul(hash, 0x85ebca6b);
+  hash ^= hash >>> 13;
+  hash = Math.imul(hash, 0xc2b2ae35);
+  hash ^= hash >>> 16;
+  // `^` yields a SIGNED 32-bit int; without the shift back to unsigned this
+  // returns a negative fraction for half the ids and LENGTHENS their backoff.
+  return (hash >>> 0) / 0x1_0000_0000;
+}
+
+/** This session's jittered backoff cap, in ms. Never exceeds the constant. */
+function quietSessionBackoffMs(sessionId: string): number {
+  const factor = QUIET_SESSION_JITTER_FLOOR + (1 - QUIET_SESSION_JITTER_FLOOR) * quietSessionJitter(sessionId);
+  return Math.round(QUIET_SESSION_BACKOFF_MS * factor);
+}
+
+/** Test-only: empty the quiet cache, the way a host restart does. */
+export function _resetQuietSessionCacheForTesting(): void {
+  quietSessions.clear();
+  lastSkippedQuiet = 0;
+}
 // Absolute idle ceiling for a running container. If the heartbeat file hasn't
 // been touched in this long, the container is either stuck or doing genuinely
 // nothing — kill and restart on the next inbound.
@@ -946,7 +996,7 @@ function getLastOutboundAtMs(mailbox: NanoclawMailboxSession): number | null {
 let unreadableSessions: { sessionId: string; reason: string }[] = [];
 function skipUnreadable(sessionId: string, reason: string): number {
   unreadableSessions.push({ sessionId, reason });
-  return Date.now() + QUIET_SESSION_BACKOFF_MS;
+  return Date.now() + quietSessionBackoffMs(sessionId);
 }
 
 /**
@@ -1132,7 +1182,7 @@ async function sweepSession(session: Session, tick: SweepTickContext): Promise<n
         // the last phase.
         if (plan.dueCount === 0 && plan.admittedTasks === 0 && !justWoke && plan.workContinuation === null && !alive) {
           const nextDue = m.getNextFutureProcessAfter();
-          const cap = Date.now() + QUIET_SESSION_BACKOFF_MS;
+          const cap = Date.now() + quietSessionBackoffMs(session.id);
           const nextDueMs = nextDue ? Date.parse(nextDue) : Number.POSITIVE_INFINITY;
           quietUntil = Math.min(Number.isFinite(nextDueMs) ? nextDueMs : cap, cap);
         }
