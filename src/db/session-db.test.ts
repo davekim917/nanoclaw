@@ -1064,6 +1064,36 @@ describe('host opens never create a session database', () => {
     expect(fs.existsSync(sessionDir)).toBe(false);
   });
 
+  it('openInboundDb releases its activity marker when a corrupt file fails mid-open', () => {
+    // Third failure shape for the open funnel, alongside "file missing" and
+    // "unreadable directory" above: the connection succeeds and a PRAGMA then
+    // throws SQLITE_CORRUPT. Whatever the stage, the .nanoclaw-storage-active
+    // marker must not survive — a leaked one makes every later reclamation
+    // pass read the session as in use until the next host restart, and
+    // repeated failed opens stack them. The empty listing is the proof, same
+    // as the sibling cases.
+    //
+    // NOTE this does NOT reach `assertQueryable`, and no file-corruption
+    // payload does: every shape that fails the readability probe fails
+    // `journal_mode = DELETE` first (measured — corrupt page 1, truncation,
+    // bad page count and whole-file garbage all throw at the pragma; corrupting
+    // only bytes 110-900 throws at neither). The probe's own close path is
+    // still ordered after the releasing wrapper is installed, so it cannot leak
+    // either, but that ordering is unreachable by this route and is asserted by
+    // construction rather than by this test.
+    const sessionDir = reclaimedSessionDir();
+    fs.mkdirSync(sessionDir, { recursive: true });
+    const dbPath = path.join(sessionDir, 'inbound.db');
+    ensureSchema(dbPath, 'inbound');
+    const corrupt = fs.readFileSync(dbPath);
+    corrupt.fill(0xa5, 100, Math.min(1024, corrupt.length));
+    fs.writeFileSync(dbPath, corrupt);
+
+    expect(() => openInboundDb(dbPath)).toThrow();
+    expect(fs.existsSync(dbPath)).toBe(true);
+    expect(fs.readdirSync(sessionDir)).toEqual(['inbound.db']);
+  });
+
   it('openInboundDb leaves no stub and no marker when only the file is missing', () => {
     // The directory survives here (an operator `rm inbound.db`, or a partly
     // completed reclaim), so the marker's mkdir is not what would create the

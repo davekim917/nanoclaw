@@ -86,8 +86,52 @@ import {
   type ContainerState as ForkContainerState,
   type ProcessingClaim,
 } from './ops/sweep.js';
+import {
+  canAttemptContinuationRecovery,
+  incrementWorkContinuationResumeAttempt,
+  migrateLegacyWorkContinuationForRecovery,
+  readContinuationRecoveryAttemptAt,
+  readWorkContinuation,
+  restoreWorkContinuationResumeAttempt,
+  WORK_CONTINUATION_RESUME_MAX_ATTEMPTS,
+  type HostWorkContinuation,
+} from './ops/continuation.js';
+import {
+  countRecoveryAttemptsSinceRealInbound,
+  hasDueRecoveryWake,
+  hasNonStatusReplyTo,
+  latestInboundTimestamp,
+  latestOutboundTimestamp,
+  latestRecoveryMarkerId,
+  latestRecoveryMarkerTimestamp,
+  markInboundCompletedIfPending,
+  outboundHasContentLike,
+  outboundHasRecentContentLike,
+  parkDueRecoveryWakes,
+  readMessageRouting,
+  writeOutboundDirectRow,
+  type DirectOutboundRow,
+  type InboundMessageRouting,
+} from './ops/recovery.js';
 
-export { SessionDbMissingError } from './openers.js';
+export { SessionDbMissingError, SessionDbUnopenableError } from './openers.js';
+export { parseSqliteUtc } from './sqlite-utc.js';
+export {
+  canAttemptContinuationRecovery,
+  WORK_CONTINUATION_RESUME_MAX_ATTEMPTS,
+  type HostWorkContinuation,
+} from './ops/continuation.js';
+export type { DirectOutboundRow, InboundMessageRouting } from './ops/recovery.js';
+export { INTERACTIVE_WAKE_MAX_AGE_MS, type ContainerState as ForkContainerStateRow } from './ops/sweep.js';
+
+/**
+ * The session directory layout, for callers that only need a PATH.
+ *
+ * Re-exported from upstream's `sqlite/paths.ts` so no fork file has to reach
+ * into the driver directory (and so the layout has one definition). A caller
+ * that wants the DATA there opens a mailbox session instead.
+ */
+export { sessionMailboxDir, sessionMailboxPath } from '../../mailbox/sqlite/paths.js';
 
 /**
  * `(mtime, size)` of a session's outbound.db for the delivery sweep's quiet
@@ -192,6 +236,16 @@ export interface NanoclawMailboxSession extends MailboxSession {
   getLatestRoutedTaskRow(seriesId: string): RoutedTaskRow | null;
   getInboundRoutingAnchor(messageId: string): InboundRoutingAnchor | null;
 
+  /**
+   * Does this session have a `outbound.db` yet?
+   *
+   * False for the never-woken cohort (see `exists`). Every outbound READ on
+   * this session already degrades to empty for that case, so callers need this
+   * only where the absence should skip a whole BLOCK of work — the running-
+   * container SLA, and the two callees that still take a raw outbound handle.
+   */
+  hasOutbound(): boolean;
+
   // --- fork-only sweep ----------------------------------------------------
   getNextFutureProcessAfter(): string | null;
   expireStalePending(maxAgeMs: number): number;
@@ -207,6 +261,56 @@ export interface NanoclawMailboxSession extends MailboxSession {
   admitRepoIngressFenceMessage(epoch: string, messageId: string): RepoIngressAdmissionResult;
   releaseRepoIngressFence(epoch: string, generation: string): RepoIngressReleaseResult;
   readRepositoryMountBarrierAck(): string | null;
+
+  // --- fork-only work continuation (outbound session_state) ---------------
+  readWorkContinuation(): HostWorkContinuation | null;
+  readContinuationRecoveryAttemptAt(continuation: HostWorkContinuation): number;
+  /** Writes outbound: opens the writable handle. Only valid with the container stopped. */
+  incrementWorkContinuationResumeAttempt(expectedId: string): HostWorkContinuation | null;
+  migrateLegacyWorkContinuationForRecovery(): HostWorkContinuation | null;
+  restoreWorkContinuationResumeAttempt(
+    attempted: HostWorkContinuation,
+    previous: HostWorkContinuation,
+  ): HostWorkContinuation | null;
+
+  // --- fork-only self-heal accountability ---------------------------------
+  hasDueRecoveryWake(nowIso: string): boolean;
+  parkDueRecoveryWakes(nowIso: string): number;
+  countRecoveryAttemptsSinceRealInbound(idPrefix: string): number;
+  latestRecoveryMarkerTimestamp(idPrefix: string): string | null;
+  latestRecoveryMarkerId(idPrefix: string): string | null;
+  readMessageRouting(messageId: string): InboundMessageRouting | undefined;
+  latestInboundTimestamp(): string | null;
+  latestOutboundTimestamp(): string | null;
+  markInboundCompletedIfPending(messageId: string): void;
+  outboundHasContentLike(marker: string): boolean;
+  outboundHasRecentContentLike(marker: string, withinSeconds: number): boolean;
+  hasNonStatusReplyTo(messageId: string): boolean;
+  /** The fork's `MAX(seq) + 2` direct write; opens the writable outbound handle. */
+  writeOutboundDirect(message: DirectOutboundRow): void;
+
+  // --- TRANSITIONAL: raw handles for callers not yet on the seam ----------
+  /**
+   * The open inbound / readable outbound handles behind this session.
+   *
+   * These exist for exactly one reason: a handful of helpers the host sweep
+   * calls still take a `Database.Database` and live in files owned by other
+   * PRs of this series (`modules/scheduling/*`, `dashboard/thread-close.ts`,
+   * `session-manager.ts`, `db/usage.ts`). Handing them the session's own
+   * handle keeps the sweep on ONE open per session per duty instead of
+   * reopening the file beside a live session.
+   *
+   * Every use is a debt, not an API: `src/mailbox-seam-ratchet.ts` counts
+   * these names as raw access, so a file that calls one stays on the
+   * allowlist until its callee moves behind the seam. PR 7 deletes both.
+   *
+   * The handle is valid only for the duration of the action; never store it.
+   *
+   * @deprecated Removed in mailbox seam PR 7.
+   */
+  legacyInboundHandle(): Database.Database;
+  /** @deprecated Removed in mailbox seam PR 7. See `legacyInboundHandle`. */
+  legacyOutboundHandle(): Database.Database;
 }
 
 export type NanoclawMailboxAction<T> = (mailbox: NanoclawMailboxSession) => T | Promise<T>;
@@ -234,22 +338,33 @@ export class NanoclawAgentMailbox extends SqliteAgentMailbox {
   private readonly nanoclawMigrated = new Set<string>();
 
   /**
-   * True when this session's mailbox files are present.
+   * True when this session has a mailbox — which the fork decides on
+   * `inbound.db` ALONE.
    *
-   * Overrides upstream's `existsSync` probe with the errno-aware one. Only
-   * ENOENT/ENOTDIR mean gone; `existsSync` reports EACCES — a session whose
-   * directory the host merely cannot traverse — as absent too. That answer
-   * propagates: `session()` would raise `SessionDbMissingError` and
-   * `withExistingMailboxSession` would resolve `undefined`, so
-   * `container-restart`'s skip-the-vanished branch would silently leave a
-   * present-but-unreadable session's ingress UNFENCED. A present session must
-   * reach the opener and fail there on its real error.
+   * Two changes from upstream's probe, each load-bearing:
+   *
+   * 1. **Inbound only.** Upstream requires both files. The fork has a live
+   *    cohort that has only ever had `inbound.db` — never-woken sessions,
+   *    documented in `storage-manager.ts` where the idle gates work around
+   *    exactly that shape — because `outbound.db` is the CONTAINER's file and
+   *    a session that never spawned one has no reason to own it. Requiring
+   *    both would report those sessions as having no mailbox at all, so a read
+   *    path would skip their task admission and due-message handling entirely,
+   *    and `container-restart` would leave their ingress unfenced through a
+   *    repository transition while it still accepts host writes. `inbound.db`
+   *    is the host-owned file and the honest marker of "this session exists";
+   *    a missing outbound side is a normal state, and `session()` degrades
+   *    every outbound READ to empty for it rather than failing the caller.
+   * 2. **Errno-aware.** Only ENOENT/ENOTDIR mean gone; `existsSync` reports
+   *    EACCES — a session whose directory the host merely cannot traverse — as
+   *    absent too. That answer propagates: `session()` would raise
+   *    `SessionDbMissingError` and `withExistingMailboxSession` would resolve
+   *    `undefined`, so `container-restart`'s skip-the-vanished branch would
+   *    silently leave a present-but-unreadable session's ingress UNFENCED. A
+   *    present session must reach the opener and fail there on its real error.
    */
   override async exists(key: MailboxSessionKey): Promise<boolean> {
-    return (
-      !sessionDbPathIsGone(sessionMailboxPath(key, 'inbound')) &&
-      !sessionDbPathIsGone(sessionMailboxPath(key, 'outbound'))
-    );
+    return !sessionDbPathIsGone(sessionMailboxPath(key, 'inbound'));
   }
 
   /**
@@ -301,6 +416,11 @@ export class NanoclawAgentMailbox extends SqliteAgentMailbox {
     const inbound = openInboundDb(inboundPath);
     let outbound: Database.Database | undefined;
     let outboundWriter: Database.Database | undefined;
+    // Sampled once, at session entry, because a session is one short logical
+    // operation — the same point the pre-seam host decided it by opening the
+    // file. Only a real ENOENT/ENOTDIR counts as absent, so an unreadable
+    // outbound still reaches the opener and fails there.
+    const outboundPresent = !sessionDbPathIsGone(outboundPath);
     const readableOutbound = () => (outbound ??= openOutboundDb(outboundPath));
     const writableOutbound = () => (outboundWriter ??= openOutboundDbRw(outboundPath));
     try {
@@ -318,12 +438,7 @@ export class NanoclawAgentMailbox extends SqliteAgentMailbox {
       // direct outbound writes scan messages_out) — the host must never read
       // the container-owned outbound.db just to insert an inbound row; the
       // two-DB split exists to avoid exactly that cross-mount coupling.
-      const session: NanoclawMailboxSession = {
-        ...wrapSqliteInbound(inbound),
-        ...wrapSqliteOutbound(readableOutbound, writableOutbound),
-        ...forkOps(inbound, readableOutbound),
-      };
-      return await action(session);
+      return await action(composeNanoclawSession(inbound, readableOutbound, writableOutbound, outboundPresent));
     } finally {
       inbound.close();
       outbound?.close();
@@ -333,22 +448,64 @@ export class NanoclawAgentMailbox extends SqliteAgentMailbox {
 }
 
 /**
+ * Build the session an action receives from handles that are already open.
+ *
+ * `session()` is its only production caller. It is exported so a test can
+ * drive the exact same session surface over in-memory databases without
+ * reimplementing the composition — one definition of "what a Nanoclaw mailbox
+ * session is", which is what invariant I-2 asks for.
+ */
+export function composeNanoclawSession(
+  inbound: Database.Database,
+  readableOutbound: () => Database.Database,
+  writableOutbound: () => Database.Database = readableOutbound,
+  outboundPresent = true,
+): NanoclawMailboxSession {
+  return {
+    ...wrapSqliteInbound(inbound),
+    ...wrapSqliteOutbound(readableOutbound, writableOutbound),
+    ...forkOps(inbound, readableOutbound, writableOutbound, outboundPresent),
+  };
+}
+
+/**
  * The fork's ops, bound to the handles open for this session.
  *
- * Only the readable outbound handle is threaded in: no fork op writes to
- * outbound.db from inside a session today (`writeOutboundDirect` still uses
- * the raw helper in session-manager.ts, which PR 7 removes), and upstream's
- * own wrapper already owns the writable one.
+ * Both outbound accessors are threaded in and both are lazy: an action that
+ * only reads never opens the writable handle, so the host keeps its
+ * read-only-by-default posture on the container-owned file. The writable one
+ * is used by the two host-side writers that already existed — the direct
+ * outbound notice and the work-continuation recovery admission — both of
+ * which only run with the container confirmed stopped.
  */
 function forkOps(
   inbound: Database.Database,
   readableOutbound: () => Database.Database,
+  writableOutbound: () => Database.Database,
+  outboundPresent: boolean,
 ): Omit<NanoclawMailboxSession, keyof MailboxSession> &
   Pick<
     NanoclawMailboxSession,
     'setRouting' | 'countDueMessages' | 'markDelivered' | 'markDeliveryFailed' | 'getContainerState' | 'insertMessage'
   > {
+  /**
+   * Run an outbound READ, or answer `empty` when this session has no
+   * `outbound.db`.
+   *
+   * The never-woken cohort (see `exists`) is a normal state, not a fault, and
+   * the pre-seam sweep expressed exactly this by carrying a nullable outbound
+   * handle and guarding every use of it. One helper here replaces ~8 such
+   * guards at the callers and, unlike them, cannot be forgotten by the next
+   * op. WRITES deliberately do NOT degrade: they still raise
+   * `SessionDbMissingError` from the opener, which is what every host-side
+   * outbound writer already handles.
+   */
+  const readOutbound = <T>(empty: T, read: (outbound: Database.Database) => T): T =>
+    outboundPresent ? read(readableOutbound()) : empty;
+
   return {
+    hasOutbound: () => outboundPresent,
+
     setRouting: (routing) =>
       upsertSessionRouting(inbound, {
         channel_type: routing.channelType,
@@ -359,7 +516,7 @@ function forkOps(
     markDelivered: (messageOutId, platformMessageId) => markDelivered(inbound, messageOutId, platformMessageId),
     markDeliveryFailed: (messageOutId, errorMessage) => markDeliveryFailed(inbound, messageOutId, errorMessage),
     getContainerState: () => {
-      const row = getContainerState(readableOutbound());
+      const row = readOutbound(null, getContainerState);
       if (!row) return null;
       return {
         ...row,
@@ -383,8 +540,8 @@ function forkOps(
     inboundHasMessage: (messageId) => inboundHasMessage(inbound, messageId),
 
     markPending: (messageOutId) => markPending(inbound, messageOutId),
-    getDueOutboundMessages: () => getDueOutboundMessages(readableOutbound()),
-    listOutboundMessageIds: () => listOutboundMessageIds(readableOutbound()),
+    getDueOutboundMessages: () => readOutbound([], getDueOutboundMessages),
+    listOutboundMessageIds: () => readOutbound([], listOutboundMessageIds),
 
     getRecentInboundChatSenders: (limit) => getRecentInboundChatSenders(inbound, limit),
     getChannelDestination: (name) => getChannelDestination(inbound, name),
@@ -395,13 +552,40 @@ function forkOps(
     getNextFutureProcessAfter: () => getNextFutureProcessAfter(inbound),
     expireStalePending: (maxAgeMs) => expireStalePending(inbound, maxAgeMs),
     getDueWakePriority: () => getDueWakePriority(inbound),
-    syncProcessingAcks: () => syncProcessingAcks(inbound, readableOutbound()),
-    getProcessingClaimRows: () => getProcessingClaims(readableOutbound()),
+    syncProcessingAcks: () => readOutbound(undefined, (outbound) => syncProcessingAcks(inbound, outbound)),
+    getProcessingClaimRows: () => readOutbound([], getProcessingClaims),
 
     readRepoIngressFence: () => readRepoIngressFence(inbound),
     activateRepoIngressFence: (epoch) => activateRepoIngressFence(inbound, epoch),
     admitRepoIngressFenceMessage: (epoch, messageId) => admitRepoIngressFenceMessage(inbound, epoch, messageId),
     releaseRepoIngressFence: (epoch, generation) => releaseRepoIngressFence(inbound, epoch, generation),
-    readRepositoryMountBarrierAck: () => readRepositoryMountBarrierAck(readableOutbound()),
+    readRepositoryMountBarrierAck: () => readOutbound(null, readRepositoryMountBarrierAck),
+
+    readWorkContinuation: () => readOutbound(null, readWorkContinuation),
+    readContinuationRecoveryAttemptAt: (continuation) =>
+      readOutbound(0, (outbound) => readContinuationRecoveryAttemptAt(outbound, continuation)),
+    incrementWorkContinuationResumeAttempt: (expectedId) =>
+      incrementWorkContinuationResumeAttempt(writableOutbound(), expectedId),
+    migrateLegacyWorkContinuationForRecovery: () => migrateLegacyWorkContinuationForRecovery(writableOutbound()),
+    restoreWorkContinuationResumeAttempt: (attempted, previous) =>
+      restoreWorkContinuationResumeAttempt(writableOutbound(), attempted, previous),
+
+    hasDueRecoveryWake: (nowIso) => hasDueRecoveryWake(inbound, nowIso),
+    parkDueRecoveryWakes: (nowIso) => parkDueRecoveryWakes(inbound, nowIso),
+    countRecoveryAttemptsSinceRealInbound: (idPrefix) => countRecoveryAttemptsSinceRealInbound(inbound, idPrefix),
+    latestRecoveryMarkerTimestamp: (idPrefix) => latestRecoveryMarkerTimestamp(inbound, idPrefix),
+    latestRecoveryMarkerId: (idPrefix) => latestRecoveryMarkerId(inbound, idPrefix),
+    readMessageRouting: (messageId) => readMessageRouting(inbound, messageId),
+    latestInboundTimestamp: () => latestInboundTimestamp(inbound),
+    latestOutboundTimestamp: () => readOutbound(null, latestOutboundTimestamp),
+    markInboundCompletedIfPending: (messageId) => markInboundCompletedIfPending(inbound, messageId),
+    outboundHasContentLike: (marker) => readOutbound(false, (outbound) => outboundHasContentLike(outbound, marker)),
+    outboundHasRecentContentLike: (marker, withinSeconds) =>
+      readOutbound(false, (outbound) => outboundHasRecentContentLike(outbound, marker, withinSeconds)),
+    hasNonStatusReplyTo: (messageId) => readOutbound(false, (outbound) => hasNonStatusReplyTo(outbound, messageId)),
+    writeOutboundDirect: (message) => writeOutboundDirectRow(writableOutbound(), message),
+
+    legacyInboundHandle: () => inbound,
+    legacyOutboundHandle: () => readableOutbound(),
   };
 }

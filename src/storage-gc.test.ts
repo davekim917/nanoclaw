@@ -35,7 +35,8 @@ vi.mock('child_process', async (importOriginal) => {
     },
   };
 });
-vi.mock('./config.js', () => ({
+vi.mock('./config.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./config.js')>()),
   get DATA_DIR() {
     return state.dataDir;
   },
@@ -71,23 +72,32 @@ vi.mock('./db/connection.js', () => ({
   }),
 }));
 vi.mock('./session-manager.js', () => ({
-  openOutboundDb: (_agentGroupId: string, sessionId: string) => ({
-    sessionId,
-    prepare: () => ({ get: () => undefined }),
-    close: () => undefined,
-  }),
   sessionsBaseDir: () => path.join(state.dataDir, 'v2-sessions'),
   threadsBaseDir: () => path.join(state.dataDir, 'v2-threads'),
   threadWorktreeDir: (key: string) => path.join(state.dataDir, 'v2-threads', key, 'worktrees'),
-  inboundDbPath: (a: string, s: string) => path.join(state.dataDir, 'v2-sessions', a, s, 'inbound.db'),
-  outboundDbPath: (a: string, s: string) => path.join(state.dataDir, 'v2-sessions', a, s, 'outbound.db'),
+  sessionContextPathFor: (sessionPath: string) =>
+    path.join(path.dirname(sessionPath), '.context', `${path.basename(sessionPath)}.json`),
 }));
-vi.mock('./db/session-db.js', () => ({
+// The reclaim gate now reads outbound state through the mailbox module's own
+// open funnel and ops (see worktree-cleanup.ts), so those are what this suite
+// substitutes. The session path helper stays real — it is pure layout over the
+// mocked DATA_DIR.
+vi.mock('./modules/mailbox/openers.js', () => ({
+  openOutboundDb: (dbPath: string) => ({
+    sessionId: String(dbPath).split('/').at(-2)!,
+    close: () => undefined,
+  }),
+}));
+vi.mock('./modules/mailbox/ops/sweep.js', () => ({
   getProcessingClaims: (db: { sessionId: string }) => (state.claiming.has(db.sessionId) ? [{}] : []),
   getContainerState: () => ({ current_tool: null }),
 }));
-vi.mock('./log.js', () => ({
-  log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
+vi.mock('./modules/mailbox/ops/continuation.js', () => ({
+  hasWorkContinuationRow: () => false,
+}));
+vi.mock('./log.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./log.js')>()),
+  log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn(), fatal: vi.fn() },
 }));
 
 import {

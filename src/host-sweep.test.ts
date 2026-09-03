@@ -17,7 +17,10 @@ import {
   deleteOrphanProcessingClaims,
   getProcessingClaims,
   type ContainerState,
-} from './db/session-db.js';
+} from './modules/mailbox/ops/sweep.js';
+import { composeNanoclawSession, type NanoclawMailboxSession } from './modules/mailbox/index.js';
+import { getAgentMailbox } from './mailbox/index.js';
+import { withExistingNanoclawSession } from './modules/mailbox/session.js';
 import { closeDb, initTestDb, runMigrations } from './db/index.js';
 import {
   ABSOLUTE_CEILING_MS,
@@ -40,6 +43,9 @@ import {
   _reportContainerOomTelemetryForTesting,
   _prepareDueWakeForTesting,
   _resetStuckProcessingRowsForTesting,
+  _enforceRunningContainerSlaForTesting,
+  _incrementStoppedContinuationAttemptForTesting,
+  _sweepSessionForTesting,
   _sweepTaskWatchdogForTesting,
   autoArchiveOldCompleted,
   canAttemptContinuationRecovery,
@@ -77,12 +83,24 @@ import type { Session } from './types.js';
 // const, so the mock exposes it as a getter over a mutable box that individual
 // tests flip via armSelfHeal().
 const selfHeal = vi.hoisted(() => ({ enabled: false }));
+// DATA_DIR is redirected at a per-run temp root so anything in this file that
+// resolves a session path (the mailbox seam's `sessionMailboxPath`, heartbeats,
+// `sessionsBaseDir`) can never reach the real install's data directory.
+const testDataDir = vi.hoisted(() => {
+  const nodeFs = require('fs') as typeof import('fs');
+  const nodeOs = require('os') as typeof import('os');
+  const nodePath = require('path') as typeof import('path');
+  return { dir: nodeFs.mkdtempSync(nodePath.join(nodeOs.tmpdir(), 'host-sweep-data-')) };
+});
 vi.mock('./config.js', async (importOriginal) => {
   const real = await importOriginal<typeof import('./config.js')>();
   return {
     ...real,
     get SELF_HEAL_ENABLED() {
       return selfHeal.enabled;
+    },
+    get DATA_DIR() {
+      return testDataDir.dir;
     },
   };
 });
@@ -633,14 +651,14 @@ describe('applyCeilingFollowUp — accountability wake rows', () => {
   };
 
   it('writes one deterministic deferred on_wake pair for a continuation', () => {
-    const { inDb } = makeSessionDbs();
+    const { inDb, mailbox } = makeSessionDbs();
     inDb
       .prepare(
         `INSERT INTO messages_in (id, seq, kind, timestamp, status, trigger, content)
          VALUES ('legacy-user', 2, 'chat', ?, 'completed', 1, 'legacy plain-text inbound')`,
       )
       .run('2026-07-28T11:59:00.000Z');
-    const res = _applyCeilingFollowUpForTesting(inDb, fakeSession(), null, continuation, HB_AGE);
+    const res = _applyCeilingFollowUpForTesting(mailbox, fakeSession(), null, continuation, HB_AGE);
     expect(res).toEqual({ action: 'wake-accountable', reason: 'continuation' });
     const rows = respawnRows(inDb);
     expect(rows).toHaveLength(1);
@@ -662,14 +680,14 @@ describe('applyCeilingFollowUp — accountability wake rows', () => {
     expect(recall.trigger).toBe(0);
     expect(recall.on_wake).toBe(1);
     expect(JSON.parse(recall.content)).toEqual({ subtype: 'recall_context', deferred: true });
-    _applyCeilingFollowUpForTesting(inDb, fakeSession(), null, continuation, HB_AGE);
+    _applyCeilingFollowUpForTesting(mailbox, fakeSession(), null, continuation, HB_AGE);
     expect(respawnRows(inDb)).toHaveLength(1);
   });
 
   it('writes a fresh wake after real inbound starts a new recovery episode', () => {
-    const { inDb } = makeSessionDbs();
-    _applyCeilingFollowUpForTesting(inDb, fakeSession(), null, continuation, HB_AGE);
-    _applyCeilingFollowUpForTesting(inDb, fakeSession(), null, { ...continuation, recovery_episode: 1 }, HB_AGE);
+    const { inDb, mailbox } = makeSessionDbs();
+    _applyCeilingFollowUpForTesting(mailbox, fakeSession(), null, continuation, HB_AGE);
+    _applyCeilingFollowUpForTesting(mailbox, fakeSession(), null, { ...continuation, recovery_episode: 1 }, HB_AGE);
 
     const rows = respawnRows(inDb);
     expect(rows).toHaveLength(2);
@@ -678,9 +696,9 @@ describe('applyCeilingFollowUp — accountability wake rows', () => {
 
   it('wakes on a fresh in-flight-tool signal', () => {
     armSelfHeal(true);
-    const { inDb } = makeSessionDbs();
+    const { inDb, mailbox } = makeSessionDbs();
     const res = _applyCeilingFollowUpForTesting(
-      inDb,
+      mailbox,
       fakeSession(),
       { current_tool: 'Bash', tool_started_at: new Date().toISOString() } as ContainerState,
       null,
@@ -697,9 +715,9 @@ describe('applyCeilingFollowUp — accountability wake rows', () => {
   // wedged tool must leave behind an on_wake row that respawns it.
   it('writes the wedged-tool accountability artifact for a tool stuck since the ceiling', () => {
     armSelfHeal(true);
-    const { inDb } = makeSessionDbs();
+    const { inDb, mailbox } = makeSessionDbs();
     const res = _applyCeilingFollowUpForTesting(
-      inDb,
+      mailbox,
       fakeSession(),
       {
         current_tool: 'Bash',
@@ -720,9 +738,9 @@ describe('applyCeilingFollowUp — accountability wake rows', () => {
 
   it('shadow mode logs but writes nothing for the wedged-tool wake', () => {
     armSelfHeal(false);
-    const { inDb } = makeSessionDbs();
+    const { inDb, mailbox } = makeSessionDbs();
     const res = _applyCeilingFollowUpForTesting(
-      inDb,
+      mailbox,
       fakeSession(),
       { current_tool: 'Bash', tool_started_at: new Date().toISOString() } as ContainerState,
       null,
@@ -734,15 +752,15 @@ describe('applyCeilingFollowUp — accountability wake rows', () => {
 
   it('shadow mode never withholds the long-shipped continuation wake', () => {
     armSelfHeal(false);
-    const { inDb } = makeSessionDbs();
-    const res = _applyCeilingFollowUpForTesting(inDb, fakeSession(), null, continuation, HB_AGE);
+    const { inDb, mailbox } = makeSessionDbs();
+    const res = _applyCeilingFollowUpForTesting(mailbox, fakeSession(), null, continuation, HB_AGE);
     expect(res).toEqual({ action: 'wake-accountable', reason: 'continuation' });
     expect(respawnRows(inDb)).toHaveLength(1);
   });
 
   it('does not fire for a quiet idle container', () => {
-    const { inDb } = makeSessionDbs();
-    const res = _applyCeilingFollowUpForTesting(inDb, fakeSession(), null, null, HB_AGE);
+    const { inDb, mailbox } = makeSessionDbs();
+    const res = _applyCeilingFollowUpForTesting(mailbox, fakeSession(), null, null, HB_AGE);
     expect(res).toEqual({ action: 'none' });
     expect(respawnRows(inDb)).toHaveLength(0);
   });
@@ -853,9 +871,13 @@ describe('sweepProviderHeal — bounds, actions, and accountability', () => {
   }
 
   /** Two failed ticks — the first only arms the debounce. */
-  function twoFailedTicks(inDb: Database.Database, outDb: Database.Database, state = FAILED): boolean {
-    _sweepProviderHealForTesting(inDb, outDb, fakeSession(), 'group-folder', state, intoOutDb(outDb));
-    return _sweepProviderHealForTesting(inDb, outDb, fakeSession(), 'group-folder', state, intoOutDb(outDb));
+  async function twoFailedTicks(
+    mailbox: NanoclawMailboxSession,
+    outDb: Database.Database,
+    state = FAILED,
+  ): Promise<boolean> {
+    await _sweepProviderHealForTesting(mailbox, fakeSession(), 'group-folder', state, intoOutDb(outDb));
+    return _sweepProviderHealForTesting(mailbox, fakeSession(), 'group-folder', state, intoOutDb(outDb));
   }
 
   beforeEach(() => {
@@ -875,29 +897,29 @@ describe('sweepProviderHeal — bounds, actions, and accountability', () => {
     closeDb();
   });
 
-  it('does nothing on the first failed tick, heals on the second', () => {
-    const { inDb, outDb } = makeSessionDbs();
-    expect(_sweepProviderHealForTesting(inDb, outDb, fakeSession(), 'group-folder', FAILED)).toBe(false);
+  it('does nothing on the first failed tick, heals on the second', async () => {
+    const { inDb, outDb, mailbox } = makeSessionDbs();
+    expect(await _sweepProviderHealForTesting(mailbox, fakeSession(), 'group-folder', FAILED)).toBe(false);
     expect(mockKillContainer).not.toHaveBeenCalled();
     expect(healRows(inDb)).toHaveLength(0);
 
-    expect(_sweepProviderHealForTesting(inDb, outDb, fakeSession(), 'group-folder', FAILED)).toBe(true);
+    expect(await _sweepProviderHealForTesting(mailbox, fakeSession(), 'group-folder', FAILED)).toBe(true);
     expect(mockKillContainer).toHaveBeenCalledWith('sess-test', 'provider-failed-selfheal', expect.any(Function));
   });
 
-  it('cancels the debounce when a healthy status lands in between', () => {
-    const { inDb, outDb } = makeSessionDbs();
-    _sweepProviderHealForTesting(inDb, outDb, fakeSession(), 'group-folder', FAILED);
-    _sweepProviderHealForTesting(inDb, outDb, fakeSession(), 'group-folder', {
+  it('cancels the debounce when a healthy status lands in between', async () => {
+    const { inDb, outDb, mailbox } = makeSessionDbs();
+    await _sweepProviderHealForTesting(mailbox, fakeSession(), 'group-folder', FAILED);
+    await _sweepProviderHealForTesting(mailbox, fakeSession(), 'group-folder', {
       provider_status: 'active',
     } as unknown as ContainerState);
-    expect(_sweepProviderHealForTesting(inDb, outDb, fakeSession(), 'group-folder', FAILED)).toBe(false);
+    expect(await _sweepProviderHealForTesting(mailbox, fakeSession(), 'group-folder', FAILED)).toBe(false);
     expect(mockKillContainer).not.toHaveBeenCalled();
   });
 
-  it('writes the accountability artifact that respawns the container', () => {
-    const { inDb, outDb } = makeSessionDbs();
-    expect(twoFailedTicks(inDb, outDb)).toBe(true);
+  it('writes the accountability artifact that respawns the container', async () => {
+    const { inDb, outDb, mailbox } = makeSessionDbs();
+    expect(await twoFailedTicks(mailbox, outDb)).toBe(true);
 
     const rows = healRows(inDb);
     expect(rows).toHaveLength(1);
@@ -914,48 +936,48 @@ describe('sweepProviderHeal — bounds, actions, and accountability', () => {
     expect(mockWakeContainer).toHaveBeenCalledOnce();
   });
 
-  it('routes to the declared fallback by recording a health window first', () => {
+  it('routes to the declared fallback by recording a health window first', async () => {
     mockReadContainerConfig.mockReturnValue({ provider: 'codex', providerFallback: { provider: 'claude' } });
-    const { inDb, outDb } = makeSessionDbs();
-    twoFailedTicks(inDb, outDb);
+    const { inDb, outDb, mailbox } = makeSessionDbs();
+    await twoFailedTicks(mailbox, outDb);
     expect(mockMarkProviderUnavailable).toHaveBeenCalledWith('ag-test', 'codex', 'unavailable', {
       message: 'stream closed',
     });
   });
 
-  it('respawns on the primary and records no health window without a declared fallback', () => {
-    const { inDb, outDb } = makeSessionDbs();
-    twoFailedTicks(inDb, outDb);
+  it('respawns on the primary and records no health window without a declared fallback', async () => {
+    const { inDb, outDb, mailbox } = makeSessionDbs();
+    await twoFailedTicks(mailbox, outDb);
     expect(mockMarkProviderUnavailable).not.toHaveBeenCalled();
     expect(mockKillContainer).toHaveBeenCalledWith('sess-test', 'provider-failed-selfheal', expect.any(Function));
   });
 
-  it('holds off inside the 10-minute cooldown', () => {
-    const { inDb, outDb } = makeSessionDbs();
-    twoFailedTicks(inDb, outDb);
+  it('holds off inside the 10-minute cooldown', async () => {
+    const { inDb, outDb, mailbox } = makeSessionDbs();
+    await twoFailedTicks(mailbox, outDb);
     expect(healRows(inDb)).toHaveLength(1);
 
     mockKillContainer.mockClear();
-    expect(_sweepProviderHealForTesting(inDb, outDb, fakeSession(), 'group-folder', FAILED)).toBe(false);
+    expect(await _sweepProviderHealForTesting(mailbox, fakeSession(), 'group-folder', FAILED)).toBe(false);
     expect(mockKillContainer).not.toHaveBeenCalled();
     expect(healRows(inDb)).toHaveLength(1);
   });
 
-  it('parks with one notice after the attempt budget is spent', () => {
-    const { inDb, outDb } = makeSessionDbs();
+  it('parks with one notice after the attempt budget is spent', async () => {
+    const { inDb, outDb, mailbox } = makeSessionDbs();
     inDb.prepare("INSERT INTO session_routing VALUES (1, 'slack', 'C123', 'thread-1')").run();
 
     for (let i = 0; i < PROVIDER_HEAL_MAX_ATTEMPTS; i++) {
       _resetProviderHealTicksForTesting();
-      expect(twoFailedTicks(inDb, outDb)).toBe(true);
+      expect(await twoFailedTicks(mailbox, outDb)).toBe(true);
       agePastCooldown(inDb);
     }
     expect(healRows(inDb)).toHaveLength(PROVIDER_HEAL_MAX_ATTEMPTS);
-    expect(countProviderHealAttemptsSinceRealInbound(inDb)).toBe(PROVIDER_HEAL_MAX_ATTEMPTS);
+    expect(countProviderHealAttemptsSinceRealInbound(mailbox)).toBe(PROVIDER_HEAL_MAX_ATTEMPTS);
 
     mockKillContainer.mockClear();
     _resetProviderHealTicksForTesting();
-    expect(twoFailedTicks(inDb, outDb)).toBe(true);
+    expect(await twoFailedTicks(mailbox, outDb)).toBe(true);
     // Parked: killed but NOT respawned, and no further marker row written.
     expect(mockKillContainer).toHaveBeenCalledWith('sess-test', 'provider-failed-selfheal-parked');
     expect(healRows(inDb)).toHaveLength(PROVIDER_HEAL_MAX_ATTEMPTS);
@@ -968,17 +990,17 @@ describe('sweepProviderHeal — bounds, actions, and accountability', () => {
 
     // Idempotent across later ticks.
     _resetProviderHealTicksForTesting();
-    twoFailedTicks(inDb, outDb);
+    await twoFailedTicks(mailbox, outDb);
     expect(
       outDb.prepare("SELECT COUNT(*) AS c FROM messages_out WHERE id LIKE 'provider-heal-parked-%'").get(),
     ).toEqual({ c: 1 });
   });
 
-  it('resets the attempt budget after a real inbound message', () => {
-    const { inDb, outDb } = makeSessionDbs();
-    twoFailedTicks(inDb, outDb);
+  it('resets the attempt budget after a real inbound message', async () => {
+    const { inDb, outDb, mailbox } = makeSessionDbs();
+    await twoFailedTicks(mailbox, outDb);
     agePastCooldown(inDb);
-    expect(countProviderHealAttemptsSinceRealInbound(inDb)).toBe(1);
+    expect(countProviderHealAttemptsSinceRealInbound(mailbox)).toBe(1);
 
     inDb
       .prepare(
@@ -986,15 +1008,15 @@ describe('sweepProviderHeal — bounds, actions, and accountability', () => {
          VALUES ('user-1', 900, 'chat', ?, 'pending', 1, ?)`,
       )
       .run(new Date().toISOString(), JSON.stringify({ text: 'hello', senderId: 'U1' }));
-    expect(countProviderHealAttemptsSinceRealInbound(inDb)).toBe(0);
+    expect(countProviderHealAttemptsSinceRealInbound(mailbox)).toBe(0);
   });
 
-  it('shadow mode detects and logs without killing, respawning, or writing', () => {
+  it('shadow mode detects and logs without killing, respawning, or writing', async () => {
     armSelfHeal(false);
-    const { inDb, outDb } = makeSessionDbs();
+    const { inDb, outDb, mailbox } = makeSessionDbs();
     inDb.prepare("INSERT INTO session_routing VALUES (1, 'slack', 'C123', 'thread-1')").run();
 
-    expect(twoFailedTicks(inDb, outDb)).toBe(false);
+    expect(await twoFailedTicks(mailbox, outDb)).toBe(false);
     expect(mockKillContainer).not.toHaveBeenCalled();
     expect(mockWakeContainer).not.toHaveBeenCalled();
     expect(mockMarkProviderUnavailable).not.toHaveBeenCalled();
@@ -1003,8 +1025,8 @@ describe('sweepProviderHeal — bounds, actions, and accountability', () => {
   });
 
   it('stays silent when the session has no routing to post into', () => {
-    const { inDb, outDb } = makeSessionDbs();
-    expect(notifyProviderHealParked(inDb, outDb, fakeSession(), 'boom')).toBe(false);
+    const { inDb, outDb, mailbox } = makeSessionDbs();
+    expect(notifyProviderHealParked(mailbox, fakeSession(), 'boom')).toBe(false);
   });
 });
 
@@ -1144,22 +1166,22 @@ describe('durable continuation wake', () => {
   });
 
   it('caps tool-only episodes and resets the count after real inbound', () => {
-    const { inDb } = makeSessionDbs();
+    const { inDb, mailbox } = makeSessionDbs();
     const insert = inDb.prepare(
       `INSERT INTO messages_in (id, seq, kind, timestamp, status, trigger, content)
        VALUES (?, ?, 'chat', ?, 'completed', 1, ?)`,
     );
     insert.run('ceiling-respawn-tool-1', 2, '2026-07-28T12:00:00.000Z', JSON.stringify({ sender: 'system' }));
     insert.run('ceiling-respawn-tool-2', 4, '2026-07-28T12:01:00.000Z', JSON.stringify({ sender: 'system' }));
-    expect(countToolRecoveryAttemptsSinceRealInbound(inDb)).toBe(2);
+    expect(countToolRecoveryAttemptsSinceRealInbound(mailbox)).toBe(2);
     insert.run('user-1', 6, '2026-07-28T12:02:00.000Z', JSON.stringify({ sender: 'user' }));
-    expect(countToolRecoveryAttemptsSinceRealInbound(inDb)).toBe(0);
+    expect(countToolRecoveryAttemptsSinceRealInbound(mailbox)).toBe(0);
     insert.run('ceiling-respawn-tool-3', 8, '2026-07-28T12:03:00.000Z', JSON.stringify({ sender: 'system' }));
-    expect(countToolRecoveryAttemptsSinceRealInbound(inDb)).toBe(1);
+    expect(countToolRecoveryAttemptsSinceRealInbound(mailbox)).toBe(1);
   });
 
   it('treats historical non-JSON content as real inbound when counting tool recovery attempts', () => {
-    const { inDb } = makeSessionDbs();
+    const { inDb, mailbox } = makeSessionDbs();
     const insert = inDb.prepare(
       `INSERT INTO messages_in (id, seq, kind, timestamp, status, trigger, content)
        VALUES (?, ?, 'chat', ?, 'completed', 1, ?)`,
@@ -1168,11 +1190,11 @@ describe('durable continuation wake', () => {
     insert.run('legacy-user-1', 4, '2026-07-28T12:01:00.000Z', 'legacy plain-text inbound');
     insert.run('ceiling-respawn-tool-2', 6, '2026-07-28T12:02:00.000Z', JSON.stringify({ sender: 'system' }));
 
-    expect(countToolRecoveryAttemptsSinceRealInbound(inDb)).toBe(1);
+    expect(countToolRecoveryAttemptsSinceRealInbound(mailbox)).toBe(1);
   });
 
   it('orders mixed ISO and SQLite-style timestamps chronologically when resetting tool attempts', () => {
-    const { inDb } = makeSessionDbs();
+    const { inDb, mailbox } = makeSessionDbs();
     const insert = inDb.prepare(
       `INSERT INTO messages_in (id, seq, kind, timestamp, status, trigger, content)
        VALUES (?, ?, 'chat', ?, 'completed', 1, ?)`,
@@ -1182,11 +1204,11 @@ describe('durable continuation wake', () => {
     insert.run('user-new', 6, '2026-07-28 02:00:00', JSON.stringify({ sender: 'user' }));
     insert.run('ceiling-respawn-tool-new', 8, '2026-07-28T02:30:00.000Z', JSON.stringify({ sender: 'system' }));
 
-    expect(countToolRecoveryAttemptsSinceRealInbound(inDb)).toBe(1);
+    expect(countToolRecoveryAttemptsSinceRealInbound(mailbox)).toBe(1);
   });
 
   it('writes exactly one public parked accounting for repeated sweeps', () => {
-    const { inDb, outDb } = makeSessionDbs();
+    const { inDb, outDb, mailbox } = makeSessionDbs();
     inDb.prepare('INSERT INTO session_routing VALUES (1, ?, ?, ?)').run('slack', 'C-1', 'T-1');
     const capped = { ...continuation, resume_attempts: WORK_CONTINUATION_RESUME_MAX_ATTEMPTS };
     const write = (message: { id: string; kind: string; content: string }) => {
@@ -1198,16 +1220,16 @@ describe('durable continuation wake', () => {
         .run(message.id, new Date().toISOString(), message.kind, message.content);
     };
 
-    expect(notifyContinuationParked(inDb, outDb, fakeSession(), capped, write)).toBe(true);
-    expect(notifyContinuationParked(inDb, outDb, fakeSession(), capped, write)).toBe(false);
-    expect(notifyContinuationParked(inDb, outDb, fakeSession(), { ...capped, recovery_episode: 1 }, write)).toBe(true);
+    expect(notifyContinuationParked(mailbox, fakeSession(), capped, write)).toBe(true);
+    expect(notifyContinuationParked(mailbox, fakeSession(), capped, write)).toBe(false);
+    expect(notifyContinuationParked(mailbox, fakeSession(), { ...capped, recovery_episode: 1 }, write)).toBe(true);
     expect(
       outDb.prepare("SELECT COUNT(*) AS count FROM messages_out WHERE id LIKE 'continuation-parked-%'").get(),
     ).toEqual({ count: 2 });
   });
 
   it('routes parked accounting through the continuation source in an agent-shared session', () => {
-    const { inDb, outDb } = makeSessionDbs();
+    const { inDb, outDb, mailbox } = makeSessionDbs();
     inDb
       .prepare(
         `INSERT INTO messages_in
@@ -1218,7 +1240,7 @@ describe('durable continuation wake', () => {
     const writes: Array<{ platformId: string | null; channelType: string | null; threadId: string | null }> = [];
 
     expect(
-      notifyContinuationParked(inDb, outDb, fakeSession(), continuation, (message) =>
+      notifyContinuationParked(mailbox, fakeSession(), continuation, (message) =>
         writes.push({
           platformId: message.platformId,
           channelType: message.channelType,
@@ -1243,7 +1265,11 @@ describe('durable continuation wake', () => {
 // container, breaking the loop atomically.
 // ─────────────────────────────────────────────────────────────────────────────
 
-function makeSessionDbs(): { inDb: Database.Database; outDb: Database.Database } {
+function makeSessionDbs(): {
+  inDb: Database.Database;
+  outDb: Database.Database;
+  mailbox: NanoclawMailboxSession;
+} {
   const inDb = new Database(':memory:');
   inDb.exec(`
     CREATE TABLE messages_in (
@@ -1292,7 +1318,10 @@ function makeSessionDbs(): { inDb: Database.Database; outDb: Database.Database }
       updated_at TEXT NOT NULL
     );
   `);
-  return { inDb, outDb };
+  // The exact session surface the registered mailbox hands an action, built
+  // over these in-memory handles by the production composer — so a test drives
+  // the same ops the sweep does, without a temp directory.
+  return { inDb, outDb, mailbox: composeNanoclawSession(inDb, () => outDb) };
 }
 
 function fakeSession(): Session {
@@ -1335,7 +1364,7 @@ describe('deleteOrphanProcessingClaims', () => {
 
 describe('scheduled due admission precedes wake classification', () => {
   it('counts and classifies the trigger inserted by the admission seam', async () => {
-    const { inDb } = makeSessionDbs();
+    const { inDb, mailbox } = makeSessionDbs();
     mockAdmitDueTaskContexts.mockImplementationOnce((db: Database.Database) => {
       db.prepare(
         `INSERT INTO messages_in
@@ -1345,7 +1374,7 @@ describe('scheduled due admission precedes wake classification', () => {
       return 1;
     });
 
-    const result = await _prepareDueWakeForTesting(inDb, 'ag-test', 'sess-test');
+    const result = await _prepareDueWakeForTesting(mailbox, 'ag-test', 'sess-test');
 
     expect(mockAdmitDueTaskContexts).toHaveBeenCalledWith(inDb, 'ag-test', 'sess-test');
     expect(result).toEqual({ admittedTasks: 1, dueCount: 1, wakePriority: 'scheduled' });
@@ -1354,7 +1383,7 @@ describe('scheduled due admission precedes wake classification', () => {
 
 describe('resetStuckProcessingRows — orphan claim cleanup', () => {
   it('deletes orphan processing_ack rows so next sweep tick does not see them', () => {
-    const { inDb, outDb } = makeSessionDbs();
+    const { inDb, outDb, mailbox } = makeSessionDbs();
     const claimedAt = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString(); // 2h ago
 
     // messages_in.status stays 'pending' during processing — only the
@@ -1370,7 +1399,7 @@ describe('resetStuckProcessingRows — orphan claim cleanup', () => {
     // Sanity: the orphan claim is what would trip claim-stuck.
     expect(getProcessingClaims(outDb)).toHaveLength(1);
 
-    _resetStuckProcessingRowsForTesting(inDb, outDb, fakeSession(), 'absolute-ceiling');
+    _resetStuckProcessingRowsForTesting(mailbox, fakeSession(), 'absolute-ceiling');
 
     // Regression assertion: orphan claim is gone — next sweep tick will see
     // an empty claims list and not kill the freshly respawned container.
@@ -1388,7 +1417,7 @@ describe('resetStuckProcessingRows — orphan claim cleanup', () => {
   });
 
   it('makes a paired crashed turn inert with its recall until fresh due admission', () => {
-    const { inDb, outDb } = makeSessionDbs();
+    const { inDb, outDb, mailbox } = makeSessionDbs();
     const claimedAt = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString();
     inDb
       .prepare(
@@ -1407,7 +1436,7 @@ describe('resetStuckProcessingRows — orphan claim cleanup', () => {
       );
     outDb.prepare("INSERT INTO processing_ack VALUES ('m-paired', 'processing', ?)").run(claimedAt);
 
-    _resetStuckProcessingRowsForTesting(inDb, outDb, fakeSession(), 'container-crash');
+    _resetStuckProcessingRowsForTesting(mailbox, fakeSession(), 'container-crash');
 
     const pair = inDb.prepare('SELECT id, trigger, tries, process_after FROM messages_in ORDER BY seq').all() as Array<{
       id: string;
@@ -1439,7 +1468,7 @@ describe('resetStuckProcessingRows — orphan claim cleanup', () => {
     // Edge case: the inbound row was already rescheduled (process_after in
     // future), so the per-message retry loop skips it. The orphan in
     // processing_ack must still be removed — otherwise the bug remains.
-    const { inDb, outDb } = makeSessionDbs();
+    const { inDb, outDb, mailbox } = makeSessionDbs();
     const claimedAt = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString();
     const future = new Date(Date.now() + 60_000).toISOString();
 
@@ -1450,7 +1479,7 @@ describe('resetStuckProcessingRows — orphan claim cleanup', () => {
       .run(claimedAt, future);
     outDb.prepare("INSERT INTO processing_ack VALUES ('m-2', 'processing', ?)").run(claimedAt);
 
-    _resetStuckProcessingRowsForTesting(inDb, outDb, fakeSession(), 'claim-stuck');
+    _resetStuckProcessingRowsForTesting(mailbox, fakeSession(), 'claim-stuck');
 
     expect(getProcessingClaims(outDb)).toEqual([]);
     const row = inDb.prepare('SELECT tries FROM messages_in WHERE id = ?').get('m-2') as { tries: number };
@@ -1458,7 +1487,7 @@ describe('resetStuckProcessingRows — orphan claim cleanup', () => {
   });
 
   it('retries an input that produced only progress/status rows', () => {
-    const { inDb, outDb } = makeSessionDbs();
+    const { inDb, outDb, mailbox } = makeSessionDbs();
     const claimedAt = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString();
 
     inDb
@@ -1473,7 +1502,7 @@ describe('resetStuckProcessingRows — orphan claim cleanup', () => {
       )
       .run(new Date().toISOString());
 
-    _resetStuckProcessingRowsForTesting(inDb, outDb, fakeSession(), 'absolute-ceiling');
+    _resetStuckProcessingRowsForTesting(mailbox, fakeSession(), 'absolute-ceiling');
 
     const row = inDb
       .prepare('SELECT status, tries, process_after FROM messages_in WHERE id = ?')
@@ -1485,7 +1514,7 @@ describe('resetStuckProcessingRows — orphan claim cleanup', () => {
   });
 
   it('does not retry an input after a non-status response was written', () => {
-    const { inDb, outDb } = makeSessionDbs();
+    const { inDb, outDb, mailbox } = makeSessionDbs();
     const claimedAt = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString();
 
     inDb
@@ -1500,7 +1529,7 @@ describe('resetStuckProcessingRows — orphan claim cleanup', () => {
       )
       .run(new Date().toISOString());
 
-    _resetStuckProcessingRowsForTesting(inDb, outDb, fakeSession(), 'absolute-ceiling');
+    _resetStuckProcessingRowsForTesting(mailbox, fakeSession(), 'absolute-ceiling');
 
     const row = inDb.prepare('SELECT status, tries, process_after FROM messages_in WHERE id = ?').get('m-answered') as {
       status: string;
@@ -2326,6 +2355,7 @@ describe('pruneIdleThreadArtifacts', () => {
 function makeNotifyTestDbs(opts?: { withRouting?: boolean; recentNotice?: boolean }): {
   inDb: Database.Database;
   outDb: Database.Database;
+  mailbox: NanoclawMailboxSession;
 } {
   const inDb = new Database(':memory:');
   inDb.exec(`
@@ -2386,7 +2416,7 @@ function makeNotifyTestDbs(opts?: { withRouting?: boolean; recentNotice?: boolea
       )
       .run();
   }
-  return { inDb, outDb };
+  return { inDb, outDb, mailbox: composeNanoclawSession(inDb, () => outDb) };
 }
 
 describe('notifyKillCeiling (Layer-3 fix)', () => {
@@ -2395,10 +2425,10 @@ describe('notifyKillCeiling (Layer-3 fix)', () => {
   // where the notify should fire (see the spam-gate test below for the
   // claims=0 case).
   it('writes a visible chat outbound with the session route before killContainer', () => {
-    const { inDb, outDb } = makeNotifyTestDbs();
+    const { inDb, outDb, mailbox } = makeNotifyTestDbs();
     const heartbeatAgeMs = 32 * 60_000;
 
-    _notifyKillCeilingForTesting(inDb, outDb, fakeSession(), heartbeatAgeMs, 1);
+    _notifyKillCeilingForTesting(mailbox, fakeSession(), heartbeatAgeMs, 1);
 
     const rows = outDb
       .prepare('SELECT timestamp, kind, platform_id, channel_type, thread_id, content FROM messages_out')
@@ -2424,8 +2454,8 @@ describe('notifyKillCeiling (Layer-3 fix)', () => {
   });
 
   it('reports a persisted Codex control-plane failure instead of calling it generic silence', () => {
-    const { inDb, outDb } = makeNotifyTestDbs();
-    _notifyKillCeilingForTesting(inDb, outDb, fakeSession(), 62 * 60_000, 1, {
+    const { inDb, outDb, mailbox } = makeNotifyTestDbs();
+    _notifyKillCeilingForTesting(mailbox, fakeSession(), 62 * 60_000, 1, {
       current_tool: 'CodexItem',
       tool_declared_timeout_ms: 3_600_000,
       tool_started_at: '2026-07-15T11:22:53.000Z',
@@ -2452,20 +2482,20 @@ describe('notifyKillCeiling (Layer-3 fix)', () => {
     // wake before) — the only thing that distinguishes "user waiting" from
     // "idle" is whether any inbound was claimed (processing_ack) when we
     // killed.
-    const { inDb, outDb } = makeNotifyTestDbs();
-    _notifyKillCeilingForTesting(inDb, outDb, fakeSession(), 32 * 60_000, 0);
+    const { inDb, outDb, mailbox } = makeNotifyTestDbs();
+    _notifyKillCeilingForTesting(mailbox, fakeSession(), 32 * 60_000, 0);
     expect(outDb.prepare('SELECT COUNT(*) AS c FROM messages_out').get()).toEqual({ c: 0 });
   });
 
   it('skips when the session has never been routed (fresh session_routing row missing)', () => {
-    const { inDb, outDb } = makeNotifyTestDbs({ withRouting: false });
-    _notifyKillCeilingForTesting(inDb, outDb, fakeSession(), 32 * 60_000, 1);
+    const { inDb, outDb, mailbox } = makeNotifyTestDbs({ withRouting: false });
+    _notifyKillCeilingForTesting(mailbox, fakeSession(), 32 * 60_000, 1);
     expect(outDb.prepare('SELECT COUNT(*) AS c FROM messages_out').get()).toEqual({ c: 0 });
   });
 
   it('is idempotent within 60s — a re-firing sweep tick does not duplicate the notice', () => {
-    const { inDb, outDb } = makeNotifyTestDbs({ recentNotice: true });
-    _notifyKillCeilingForTesting(inDb, outDb, fakeSession(), 32 * 60_000, 1);
+    const { inDb, outDb, mailbox } = makeNotifyTestDbs({ recentNotice: true });
+    _notifyKillCeilingForTesting(mailbox, fakeSession(), 32 * 60_000, 1);
     // Only the seed row should be present; the second call recognized the
     // marker and skipped.
     const rows = outDb.prepare('SELECT id FROM messages_out').all() as Array<{ id: string }>;
@@ -2935,6 +2965,223 @@ describe('shouldSkipUsageRollup', () => {
 // puts it where the AGENT can read it, without waking anything.
 // ─────────────────────────────────────────────────────────────────────────────
 
+// ─── H-10 (mailbox seam §8): reads never provision ───────────────────────────
+describe('sweepSession on a session with no mailbox', () => {
+  it('sweep treats a missing mailbox as no-op via withExistingMailboxSession', async () => {
+    const db = initTestDb();
+    runMigrations(db);
+    db.prepare(
+      `INSERT INTO agent_groups (id, name, folder, created_at)
+       VALUES ('ag-nomailbox', 'no mailbox', 'no-mailbox', ?)`,
+    ).run(new Date().toISOString());
+    mockWakeContainer.mockReset();
+    mockIsContainerRunning.mockReset().mockReturnValue(false);
+    mockHasContainerEverRun.mockReset().mockReturnValue(false);
+
+    const session: Session = { ...fakeSession(), id: 'sess-nomailbox', agent_group_id: 'ag-nomailbox' };
+    const sessionPath = path.join(testDataDir.dir, 'v2-sessions', session.agent_group_id, session.id);
+    expect(fs.existsSync(sessionPath)).toBe(false);
+
+    await expect(_sweepSessionForTesting(session)).resolves.not.toThrow();
+
+    // I-4: a read path never provisions. Nothing was created, and no container
+    // was woken for a session the host cannot even read.
+    expect(fs.existsSync(sessionPath)).toBe(false);
+    expect(fs.existsSync(path.join(sessionPath, 'inbound.db'))).toBe(false);
+    expect(mockWakeContainer).not.toHaveBeenCalled();
+    closeDb();
+  });
+
+  // Round 8. The same TOCTOU class, on the two post-kill write paths that round
+  // 7's audit claimed but did not actually land. `killContainer` is itself a
+  // yield: the session below opens after it, and a replacement wake in that gap
+  // owns outbound.db. Writing anyway deletes the FRESH runner's processing claim
+  // and defers an input it is already working — duplicate execution.
+  function slaFixture(id: string, heartbeatAgeMs: number, claimAgeMs: number) {
+    const session: Session = { ...fakeSession(), id, agent_group_id: 'ag-sla' };
+    getAgentMailbox().prepare({ agentGroupId: session.agent_group_id, sessionId: session.id });
+    const dir = path.join(testDataDir.dir, 'v2-sessions', session.agent_group_id, session.id);
+    const now = Date.now();
+    fs.writeFileSync(path.join(dir, '.heartbeat'), '');
+    fs.utimesSync(path.join(dir, '.heartbeat'), new Date(now - heartbeatAgeMs), new Date(now - heartbeatAgeMs));
+    const out = new Database(path.join(dir, 'outbound.db'));
+    out
+      .prepare("INSERT INTO processing_ack (message_id, status, status_changed) VALUES ('m-live', 'processing', ?)")
+      .run(new Date(now - claimAgeMs).toISOString());
+    out.close();
+    const claims = (): number => {
+      const db = new Database(path.join(dir, 'outbound.db'));
+      const n = (db.prepare('SELECT COUNT(*) AS c FROM processing_ack').get() as { c: number }).c;
+      const outRows = (db.prepare('SELECT COUNT(*) AS c FROM messages_out').get() as { c: number }).c;
+      db.close();
+      return n * 100 + outRows;
+    };
+    const run = (<T>(action: (m: never) => T | Promise<T>) =>
+      withExistingNanoclawSession(session.agent_group_id, session.id, action as never)) as never;
+    return { session, claims, run };
+  }
+
+  it('a replacement container that wakes during the post-kill open keeps its claim (ceiling)', async () => {
+    const db = initTestDb();
+    runMigrations(db);
+    db.prepare(`INSERT INTO agent_groups (id, name, folder, created_at) VALUES ('ag-sla', 'sla', 'sla', ?)`).run(
+      new Date().toISOString(),
+    );
+    mockKillContainer.mockReset();
+    // Live all the way through: the container is alive so the SLA runs, and it
+    // is STILL alive after the kill because a wake replaced it in the gap.
+    mockIsContainerRunning.mockReset().mockReturnValue(true);
+    mockReadContainerConfig.mockReset().mockReturnValue({ provider: 'claude' });
+
+    const f = slaFixture('sess-sla-ceiling', ABSOLUTE_CEILING_MS + 60_000, 10_000);
+    const before = f.claims();
+    await _enforceRunningContainerSlaForTesting(f.run, f.session, 'ag-sla', 'sla');
+
+    expect(mockKillContainer).toHaveBeenCalledWith('sess-sla-ceiling', 'absolute-ceiling');
+    // Claim intact and no restart notice written: both writes were skipped.
+    expect(f.claims()).toBe(before);
+    closeDb();
+  });
+
+  it('a replacement container that wakes during the post-kill open keeps its claim (claim-stuck)', async () => {
+    const db = initTestDb();
+    runMigrations(db);
+    db.prepare(`INSERT INTO agent_groups (id, name, folder, created_at) VALUES ('ag-sla', 'sla', 'sla', ?)`).run(
+      new Date().toISOString(),
+    );
+    mockKillContainer.mockReset();
+    mockIsContainerRunning.mockReset().mockReturnValue(true);
+    mockReadContainerConfig.mockReset().mockReturnValue({ provider: 'claude' });
+
+    // Heartbeat older than the claim and inside the ceiling: kill-claim, not kill-ceiling.
+    const f = slaFixture('sess-sla-claim', 10 * 60_000, 5 * 60_000);
+    const before = f.claims();
+    await _enforceRunningContainerSlaForTesting(f.run, f.session, 'ag-sla', 'sla');
+
+    expect(mockKillContainer).toHaveBeenCalledWith('sess-sla-claim', 'claim-stuck');
+    expect(f.claims()).toBe(before);
+    closeDb();
+  });
+
+  // Round 7 (TOCTOU). Opening a mailbox session is a yield, and a concurrent
+  // inbound wake can start a container inside it. Pre-seam this was a
+  // synchronous check-then-write on an already-open handle, so no such gap
+  // existed. If the container-state check stays outside, the helper writes the
+  // container-owned outbound.db underneath a fresh runner: the continuation
+  // goes back to `queued`, its runner_id is dropped, and a recovery attempt the
+  // new runner never got is consumed — saved work duplicated, parked early, or
+  // lost. This is continue_work's recovery path.
+  it('a container that starts during the open leaves the continuation and its attempt count untouched', async () => {
+    const db = initTestDb();
+    runMigrations(db);
+    db.prepare(
+      `INSERT INTO agent_groups (id, name, folder, created_at)
+       VALUES ('ag-toctou', 'toctou', 'toctou', ?)`,
+    ).run(new Date().toISOString());
+
+    const session: Session = { ...fakeSession(), id: 'sess-toctou', agent_group_id: 'ag-toctou' };
+    getAgentMailbox().prepare({ agentGroupId: session.agent_group_id, sessionId: session.id });
+    const outboundPath = path.join(testDataDir.dir, 'v2-sessions', session.agent_group_id, session.id, 'outbound.db');
+    const saved = {
+      id: 'cont-toctou',
+      task: 'finish the migration',
+      phase: 'running' as const,
+      chain: 0,
+      runner_id: 'runner-fresh',
+      resume_attempts: 0,
+      recovery_episode: 0,
+    };
+    const planted = new Database(outboundPath);
+    planted
+      .prepare(
+        `INSERT INTO session_state (key, value, updated_at) VALUES ('work_continuation', ?, ?)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`,
+      )
+      .run(JSON.stringify(saved), new Date().toISOString());
+    planted.close();
+
+    // The wake landed: by the time the mailbox is open, a container owns this
+    // session and its outbound.db.
+    mockIsContainerRunning.mockReset().mockReturnValue(true);
+
+    const result = await _incrementStoppedContinuationAttemptForTesting(session, saved.id);
+
+    // No attempt consumed, and nothing handed back to wake on.
+    expect(result).toBeNull();
+    // The fresh runner's record is byte-for-byte what it was.
+    const after = new Database(outboundPath);
+    const row = after.prepare("SELECT value FROM session_state WHERE key = 'work_continuation'").get() as {
+      value: string;
+    };
+    after.close();
+    expect(JSON.parse(row.value)).toEqual(saved);
+    closeDb();
+  });
+
+  // Round 4: the outbound handle opens LAZILY, after the duties have started,
+  // so `enteredPlanSession` is already true when it fails. The error class, not
+  // the position, has to decide — otherwise a present-but-unreadable
+  // outbound.db is retried and logged every 60s instead of backing off, which
+  // is the repeated-error load the backoff exists to contain.
+  it('an unreadable outbound.db takes the mailbox backoff, not the per-tick duty retry', async () => {
+    const db = initTestDb();
+    runMigrations(db);
+    db.prepare(
+      `INSERT INTO agent_groups (id, name, folder, created_at)
+       VALUES ('ag-badout', 'bad outbound', 'bad-outbound', ?)`,
+    ).run(new Date().toISOString());
+    mockWakeContainer.mockReset();
+    mockIsContainerRunning.mockReset().mockReturnValue(false);
+    mockHasContainerEverRun.mockReset().mockReturnValue(false);
+    mockAdmitDueTaskContexts.mockReturnValue(0);
+
+    const session: Session = { ...fakeSession(), id: 'sess-badout', agent_group_id: 'ag-badout' };
+    getAgentMailbox().prepare({ agentGroupId: session.agent_group_id, sessionId: session.id });
+    // Present, non-empty, and not a database — exactly what a corrupt file or a
+    // failed hot-journal recovery leaves behind. The inbound side stays fine,
+    // so the failure can only surface from the lazy outbound open mid-duty.
+    const outboundPath = path.join(testDataDir.dir, 'v2-sessions', session.agent_group_id, session.id, 'outbound.db');
+    fs.writeFileSync(outboundPath, 'not a sqlite database at all');
+
+    // Backoff, not a throw: a rethrow here is the per-tick retry this pins against.
+    await expect(_sweepSessionForTesting(session)).resolves.toEqual(expect.any(Number));
+    closeDb();
+  });
+
+  // Round 2: the backoff belongs to an unopenable mailbox, never to a duty
+  // that threw. A transient SQLite lock during admission must retry on the
+  // next 60s tick — quiet-caching it would hold an already-due scheduled task
+  // for the full 30 minutes, and `last_active` does not move on failure, so
+  // nothing would clear it early.
+  it('a duty that throws propagates for the next-tick retry instead of being quiet-cached', async () => {
+    const db = initTestDb();
+    runMigrations(db);
+    db.prepare(
+      `INSERT INTO agent_groups (id, name, folder, created_at)
+       VALUES ('ag-dutythrow', 'duty throw', 'duty-throw', ?)`,
+    ).run(new Date().toISOString());
+    mockWakeContainer.mockReset();
+    mockIsContainerRunning.mockReset().mockReturnValue(false);
+    mockHasContainerEverRun.mockReset().mockReturnValue(false);
+
+    const session: Session = { ...fakeSession(), id: 'sess-dutythrow', agent_group_id: 'ag-dutythrow' };
+    // A real mailbox, so the open succeeds and only the DUTY fails.
+    getAgentMailbox().prepare({ agentGroupId: session.agent_group_id, sessionId: session.id });
+    mockAdmitDueTaskContexts.mockImplementationOnce(() => {
+      throw new Error('database is locked');
+    });
+
+    await expect(_sweepSessionForTesting(session)).rejects.toThrow('database is locked');
+
+    // Contrast: the same catch DOES back off when the mailbox itself is the
+    // problem, which is the case the 30-minute quiet marker exists for.
+    mockAdmitDueTaskContexts.mockReturnValue(0);
+    const gone: Session = { ...fakeSession(), id: 'sess-dutythrow-gone', agent_group_id: 'ag-dutythrow' };
+    await expect(_sweepSessionForTesting(gone)).resolves.toEqual(expect.any(Number));
+    closeDb();
+  });
+});
+
 describe('reportContainerOomTelemetry', () => {
   function oomSession(id: string): Session {
     return { ...fakeSession(), id };
@@ -2956,11 +3203,11 @@ describe('reportContainerOomTelemetry', () => {
   }
 
   it('writes ONE notice for a burst of kills, carrying the cumulative count', () => {
-    const { inDb } = makeNotifyTestDbs();
+    const { inDb, mailbox } = makeNotifyTestDbs();
     const session = oomSession('oom-burst');
 
     for (let i = 1; i <= 346; i++) {
-      _reportContainerOomTelemetryForTesting(inDb, session, 'ag-test', state({ memory_oom_kill_events: i }));
+      _reportContainerOomTelemetryForTesting(mailbox, session, 'ag-test', state({ memory_oom_kill_events: i }));
     }
 
     const rows = noticeRows(inDb);
@@ -2972,10 +3219,10 @@ describe('reportContainerOomTelemetry', () => {
   });
 
   it('never wakes a container — notices are trigger=0 and on_wake=0', () => {
-    const { inDb } = makeNotifyTestDbs();
+    const { inDb, mailbox } = makeNotifyTestDbs();
 
     _reportContainerOomTelemetryForTesting(
-      inDb,
+      mailbox,
       oomSession('oom-nowake'),
       'ag-test',
       state({ memory_oom_kill_events: 7 }),
@@ -2991,11 +3238,11 @@ describe('reportContainerOomTelemetry', () => {
   });
 
   it('writes nothing when there are no kills and no pressure', () => {
-    const { inDb } = makeNotifyTestDbs();
+    const { inDb, mailbox } = makeNotifyTestDbs();
 
     for (let i = 0; i < 10; i++) {
       _reportContainerOomTelemetryForTesting(
-        inDb,
+        mailbox,
         oomSession('oom-quiet'),
         'ag-test',
         state({ memory_oom_kill_events: 0, memory_max_events: 4 }),
@@ -3006,12 +3253,12 @@ describe('reportContainerOomTelemetry', () => {
   });
 
   it('writes the quieter pressure notice when the cgroup thrashes with no kills', () => {
-    const { inDb } = makeNotifyTestDbs();
+    const { inDb, mailbox } = makeNotifyTestDbs();
     const session = oomSession('oom-pressure');
 
     for (let i = 0; i < 5; i++) {
       _reportContainerOomTelemetryForTesting(
-        inDb,
+        mailbox,
         session,
         'ag-test',
         state({ memory_oom_kill_events: 0, memory_max_events: 760 + i }),

@@ -10,13 +10,29 @@
 import Database from 'better-sqlite3';
 import fs from 'fs';
 import path from 'path';
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-const TEST_ROOT = '/tmp/nanoclaw-mailbox-module-test';
+// Per-process fixture root. The constant this replaced was byte-identical in
+// every worktree on the host, and this file `rmSync`s the whole root in both
+// beforeEach and afterEach — so any two concurrent runs, from any two
+// worktrees or agents, deleted each other's session directories mid-test.
+// Observed here as 16 of 18 failing on one run and 18/18 on the next four,
+// which is untrustworthy green as much as red. Same defect and same fix as
+// #287 (`test/unique-tmp-fixture-roots`) on main.
+//
+// ponytail: `process.pid`, NOT `fs.mkdtempSync` — measured, not assumed.
+// `vi.hoisted` runs above the import statements, so the `fs` binding is not
+// initialized yet and the mock factory below cannot see a module-level const
+// either; the mkdtemp form fails with "Cannot access 'TEST_ROOT' before
+// initialization". `process` is a global and is available. One root per
+// process is all this file needs. Do not "improve" this to mkdtemp.
+const { TEST_ROOT } = vi.hoisted(() => ({
+  TEST_ROOT: `/tmp/nanoclaw-mailbox-module-test-${process.pid}`,
+}));
 
 vi.mock('../../config.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../config.js')>()),
-  DATA_DIR: '/tmp/nanoclaw-mailbox-module-test/data',
+  DATA_DIR: `${TEST_ROOT}/data`,
 }));
 
 vi.mock('../../log.js', async (importOriginal) => ({
@@ -78,6 +94,12 @@ beforeEach(() => {
 
 afterEach(() => {
   vi.restoreAllMocks();
+  fs.rmSync(TEST_ROOT, { recursive: true, force: true });
+});
+
+// The per-test cleanup above already removes the root; this is the final sweep
+// so a crashed or skipped case cannot leave this process's root behind.
+afterAll(() => {
   fs.rmSync(TEST_ROOT, { recursive: true, force: true });
 });
 
@@ -364,6 +386,61 @@ describe('NanoclawAgentMailbox', () => {
     } finally {
       fs.chmodSync(sessionDir, 0o700);
     }
+  });
+
+  it('a session with only inbound.db exists, and its outbound reads degrade instead of failing', async () => {
+    const key = freshKey();
+    const mailbox = getAgentMailbox();
+    mailbox.prepare(key);
+    // The never-woken cohort: outbound.db is the CONTAINER's file, and a
+    // session that never spawned one has only ever had inbound.db. Requiring
+    // both files made every read path skip these sessions entirely — their
+    // task admission and due-message handling stopped, and a repository
+    // transition left their ingress unfenced while it still took host writes.
+    fs.rmSync(dbPath(key, 'outbound'));
+
+    expect(await mailbox.exists(key)).toBe(true);
+
+    const observed = await mailbox.session(key, async (m) => {
+      const session = fork(m);
+      await m.insertMessage(message('m-inbound-only'));
+      // Inbound work is unaffected.
+      expect(m.countDueMessages()).toBe(1);
+      // Nothing outbound blows up; every read answers empty.
+      session.syncProcessingAcks();
+      return {
+        hasOutbound: session.hasOutbound(),
+        claims: session.getProcessingClaimRows(),
+        containerState: session.getContainerState(),
+        continuation: session.readWorkContinuation(),
+        barrierAck: session.readRepositoryMountBarrierAck(),
+        lastOutboundAt: session.latestOutboundTimestamp(),
+        due: session.getDueOutboundMessages(),
+        // Every outbound READ degrades, not just the ones with an obvious
+        // caller: `deliverSessionMessages` calls this for every recently active
+        // session, and a throw here is caught as `pending`, so its
+        // quiet-delivery cache never arms and the sweep reopens and refails the
+        // same session on every pass.
+        outboundIds: session.listOutboundMessageIds(),
+        noticed: session.outboundHasContentLike('anything'),
+        answered: session.hasNonStatusReplyTo('m-inbound-only'),
+      };
+    });
+
+    expect(observed).toEqual({
+      hasOutbound: false,
+      claims: [],
+      containerState: null,
+      continuation: null,
+      barrierAck: null,
+      lastOutboundAt: null,
+      due: [],
+      outboundIds: [],
+      noticed: false,
+      answered: false,
+    });
+    // The read path did not provision the file it found missing (invariant I-4).
+    expect(fs.existsSync(dbPath(key, 'outbound'))).toBe(false);
   });
 
   it('syncProcessingAcks applies terminal acks from outbound to inbound in one session', async () => {

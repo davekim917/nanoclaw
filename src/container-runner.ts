@@ -72,7 +72,7 @@ import {
 } from './db/agent-groups.js';
 import { getDb, hasTable } from './db/connection.js';
 import { getMessagingGroup } from './db/messaging-groups.js';
-import { readRepoIngressFence } from './db/session-db.js';
+import { withExistingNanoclawSession } from './modules/mailbox/session.js';
 import { buildCentralProjection } from './db/per-agent-projections.js';
 import { ensureArchiveProjection } from './db/archive-projection-worker.js';
 import { initGroupFilesystem } from './group-init.js';
@@ -113,7 +113,6 @@ import {
   heartbeatPath,
   markContainerRunning,
   markContainerStopped,
-  openInboundDb,
   sessionContextPath,
   sessionDir,
   writeSessionContext,
@@ -830,16 +829,30 @@ async function spawnContainer(
   // per-session DB fence survives a host crash, so it is the recovery gate for
   // a publication/transfer that died after quiescence began. A replay with the
   // same deterministic action epoch releases it at the durable boundary.
-  const repositoryFenceDb = openInboundDb(session.agent_group_id, session.id);
-  try {
-    const repositoryFence = readRepoIngressFence(repositoryFenceDb);
-    if (repositoryFence?.state === 'active') {
-      throw new Error(
-        `Repository mount transition ${repositoryFence.epoch} is still active for session ${session.id}; spawn will retry`,
-      );
-    }
-  } finally {
-    repositoryFenceDb.close();
+  // Read-only, through the seam: a spawn must never provision a mailbox here
+  // (invariant I-4). The session is closed before the read's verdict is acted
+  // on, so nothing downstream of this spawn is inside a mailbox session for
+  // this key (invariant I-3).
+  //
+  // The result is wrapped so "no mailbox" and "no fence" stay distinguishable:
+  // the seam answers `undefined` for the first and `{ fence: null }` for the
+  // second, and reading them as the same thing would let a spawn through for a
+  // session whose inbound.db has been reclaimed. That fails closed on purpose —
+  // `buildMounts` only installs the read-only /workspace/inbound.db overlay
+  // when the file exists, so such a container would come up with no mailbox to
+  // poll and could recreate the host-owned database under the writable parent
+  // mount. The direct open this replaced threw for exactly this state.
+  const repositoryFenceRead = await withExistingNanoclawSession(session.agent_group_id, session.id, (mailbox) => ({
+    fence: mailbox.readRepoIngressFence(),
+  }));
+  if (!repositoryFenceRead) {
+    throw new Error(`Session ${session.id} has no inbound mailbox to poll; spawn will retry`);
+  }
+  const repositoryFence = repositoryFenceRead.fence;
+  if (repositoryFence?.state === 'active') {
+    throw new Error(
+      `Repository mount transition ${repositoryFence.epoch} is still active for session ${session.id}; spawn will retry`,
+    );
   }
 
   const [memoryReport] = reconcileWorkgroupMemory(getDb(), { workgroupIds: [resolvedWgId] });

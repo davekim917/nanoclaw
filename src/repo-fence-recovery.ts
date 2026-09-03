@@ -26,19 +26,14 @@ import { wakeRepositoryMountSessions } from './container-restart.js';
 import { getAgentGroup, getAllAgentGroups } from './db/agent-groups.js';
 import { getMessagingGroup } from './db/messaging-groups.js';
 import { getActiveSessions, getSessionsByAgentGroup } from './db/sessions.js';
-import {
-  countDueMessages,
-  readRepoIngressFence,
-  releaseRepoIngressFence,
-  SessionDbMissingError,
-} from './db/session-db.js';
 import { log } from './log.js';
+import { SessionDbMissingError } from './modules/mailbox/index.js';
+import { withExistingNanoclawSession } from './modules/mailbox/session.js';
 import {
   isRepositoryLifecycleClaimed,
   isWorkgroupRepositoryMountClaimed,
   resolveRepositoryWorkUnit,
 } from './repository-workspaces.js';
-import { openInboundDb } from './session-manager.js';
 import type { Session } from './types.js';
 
 export interface OrphanedRepoFenceRecovery {
@@ -140,23 +135,26 @@ export async function releaseOrphanedRepoIngressFences(
   for (const [index, session] of sessions.entries()) {
     await yieldEventLoop(index);
     try {
-      const inDb = openInboundDb(session.agent_group_id, session.id);
-      try {
+      // `withExistingMailboxSession`: reads never provision (invariant I-4),
+      // and a session with no mailbox has no fence — the ordinary steady state.
+      // The wake happens after the loop, so no mailbox session is ever held
+      // across `wakeRepositoryMountSessions` (invariant I-3).
+      const needsWake = await withExistingNanoclawSession(session.agent_group_id, session.id, (mailbox) => {
         report.scanned += 1;
-        const fence = readRepoIngressFence(inDb);
-        if (fence?.state !== 'active') continue;
+        const fence = mailbox.readRepoIngressFence();
+        if (fence?.state !== 'active') return false;
         report.active += 1;
-        // No `await` between this check and the release below: the claim is
-        // dropped only after the owning publication has released its own
-        // barriers, so a synchronous check-then-release cannot tear a live
-        // publication's fence out from under it.
+        // No `await` inside this action: the claim is dropped only after the
+        // owning publication has released its own barriers, so a synchronous
+        // check-then-release cannot tear a live publication's fence out from
+        // under it.
         if (repositoryTransitionInFlight(session)) {
           report.inFlight += 1;
-          continue;
+          return false;
         }
-        const result = releaseRepoIngressFence(inDb, fence.epoch, fence.generation);
+        const result = mailbox.releaseRepoIngressFence(fence.epoch, fence.generation);
         // A concurrent release won the race — durable state is already correct.
-        if (!result.released) continue;
+        if (!result.released) return false;
         report.released += 1;
         log.warn('Released an orphaned repository ingress fence', {
           reason,
@@ -168,17 +166,16 @@ export async function releaseOrphanedRepoIngressFences(
         // Recompute from durable state rather than trusting the admission
         // result alone: ordinary due rows that predated the fence also need a
         // wake, and they carry no epoch tag.
-        if (result.wakeRequired || countDueMessages(inDb) > 0) wake.push(session);
-      } finally {
-        inDb.close();
-      }
+        return result.wakeRequired || mailbox.countDueMessages() > 0;
+      });
+      if (needsWake) wake.push(session);
     } catch (err) {
-      // The open funnel is the classifier, not `fs.existsSync`: it reports a
-      // session as missing only for a real ENOENT/ENOTDIR, never for a path the
-      // filesystem merely declined to answer about (EACCES, EMFILE). A session
-      // with no inbound DB has no fence and is the ordinary steady state, so it
-      // is skipped silently; anything else is a session we could not read and
-      // must be visible rather than quietly counted as fence-free.
+      // The module's own answer is the classifier, not `fs.existsSync`: a
+      // session is reported gone only for a real ENOENT/ENOTDIR, never for a
+      // path the filesystem merely declined to answer about (EACCES, EMFILE).
+      // A session with no mailbox has no fence and resolves `undefined` above
+      // rather than throwing; anything that DOES throw is a session we could
+      // not read and must be visible rather than quietly counted as fence-free.
       if (err instanceof SessionDbMissingError) continue;
       report.failed += 1;
       log.warn('Orphaned repository fence pass skipped an unreadable session', {
@@ -230,7 +227,7 @@ export async function releaseOrphanedRepoIngressFencesAtStartup(): Promise<Orpha
  * "workgroups that have canonical repositories" filter misses a first
  * publication that failed before creating one, and an `fs.existsSync` filter
  * reports an unreadable-but-present session as absent (see
- * `sessionDbPathIsGone` in db/session-db.ts). Five minutes bounds the worst
+ * `sessionDbPathIsGone` in src/modules/mailbox/openers.ts). Five minutes bounds the worst
  * case a running host can stay deaf while keeping amortised cost near zero,
  * and startup already covers the far more common "host restarted after a
  * failed publication" case immediately.

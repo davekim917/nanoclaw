@@ -72,6 +72,13 @@ const RAW_OPENER_NAMES = [
   'outboundDbPath',
   'getInboundDb',
   'getOutboundDb',
+  // The mailbox module's two transitional handle accessors. A caller that has
+  // moved onto withMailboxSession but still hands the open handle to a helper
+  // owned by a later PR of this series has not finished migrating — counting
+  // them here is what keeps that honest, so such a file stays on the allowlist
+  // instead of appearing clean. PR 7 deletes the accessors and these entries.
+  'legacyInboundHandle',
+  'legacyOutboundHandle',
 ];
 
 const HANDLE_IDENTIFIERS = ['inDb', 'outDb', 'inboundDb', 'outboundDb'];

@@ -15,8 +15,11 @@ import os from 'os';
 import path from 'path';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
-vi.mock('./log.js', () => ({
-  log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
+// Spread the real module: `importOriginal` on the mailbox session seam below
+// pulls in session-manager, which uses more of log.js than these four levels.
+vi.mock('./log.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./log.js')>()),
+  log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn(), fatal: vi.fn() },
 }));
 
 const mockWakeRepositoryMountSessions = vi.fn();
@@ -49,49 +52,56 @@ vi.mock('./db/sessions.js', () => ({
 }));
 
 type Fence = { epoch: string; generation: string; state: 'active' | 'released' };
-type MockDb = { sessionId: string; close: () => void };
 const fences = new Map<string, Fence>();
 const dueMessages = new Map<string, number>();
-const closedDbs: string[] = [];
-
-vi.mock('./db/session-db.js', async (importOriginal) => ({
-  ...(await importOriginal<typeof import('./db/session-db.js')>()),
-  readRepoIngressFence: (db: MockDb) => fences.get(db.sessionId) ?? null,
-  countDueMessages: (db: MockDb) => dueMessages.get(db.sessionId) ?? 0,
-  releaseRepoIngressFence: (db: MockDb, epoch: string, generation: string) => {
-    const current = fences.get(db.sessionId);
-    if (!current || current.epoch !== epoch || current.generation !== generation || current.state !== 'active') {
-      return { released: false, admittedRows: 0, wakeRequired: false };
-    }
-    fences.set(db.sessionId, { epoch, generation, state: 'released' });
-    // The held rows this epoch tagged become due again on release.
-    const held = dueMessages.get(db.sessionId) ?? 0;
-    return { released: true, admittedRows: held, wakeRequired: held > 0 };
-  },
-}));
+/** Session ids the recovery pass actually opened a mailbox session for. */
+const openedSessions: string[] = [];
 
 /** Sessions that are PRESENT but unopenable — EACCES, EMFILE, a corrupt file. */
 const unreadableSessions = new Set<string>();
-/** Sessions whose inbound DB is genuinely gone (ENOENT/ENOTDIR). */
+/** Sessions whose mailbox is genuinely gone (ENOENT/ENOTDIR). */
 const missingDbSessions = new Set<string>();
 let sessionsRoot = '';
-vi.mock('./session-manager.js', async () => {
-  const { SessionDbMissingError } = await import('./db/session-db.js');
+
+/**
+ * The subset of the fork mailbox session this pass touches, modelled in memory.
+ *
+ * The pass now goes through `withExistingMailboxSession`, so the seam is what
+ * this suite substitutes — the raw open funnel it used to mock no longer has a
+ * caller here.
+ */
+function modelMailbox(sessionId: string) {
   return {
-    inboundDbPath: (agentGroupId: string, sessionId: string) =>
-      path.join(sessionsRoot, agentGroupId, sessionId, 'inbound.db'),
-    openInboundDb: (agentGroupId: string, sessionId: string): MockDb => {
-      if (missingDbSessions.has(sessionId)) {
-        throw new SessionDbMissingError(path.join(sessionsRoot, agentGroupId, sessionId, 'inbound.db'));
+    readRepoIngressFence: () => fences.get(sessionId) ?? null,
+    countDueMessages: () => dueMessages.get(sessionId) ?? 0,
+    releaseRepoIngressFence: (epoch: string, generation: string) => {
+      const current = fences.get(sessionId);
+      if (!current || current.epoch !== epoch || current.generation !== generation || current.state !== 'active') {
+        return { released: false, admittedRows: 0, wakeRequired: false };
       }
-      if (unreadableSessions.has(sessionId)) {
-        // Present but unopenable — must stay visible, never counted fence-free.
-        throw new Error('SQLITE_CANTOPEN: unable to open database file');
-      }
-      return { sessionId, close: () => closedDbs.push(sessionId) };
+      fences.set(sessionId, { epoch, generation, state: 'released' });
+      // The held rows this epoch tagged become due again on release.
+      const held = dueMessages.get(sessionId) ?? 0;
+      return { released: true, admittedRows: held, wakeRequired: held > 0 };
     },
   };
-});
+}
+
+vi.mock('./modules/mailbox/session.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./modules/mailbox/session.js')>()),
+  withExistingNanoclawSession: async (
+    _agentGroupId: string,
+    sessionId: string,
+    action: (mailbox: unknown) => unknown,
+  ) => {
+    // A vanished session resolves undefined — the seam never throws for it.
+    if (missingDbSessions.has(sessionId)) return undefined;
+    // Present but unopenable — must stay visible, never counted fence-free.
+    if (unreadableSessions.has(sessionId)) throw new Error('SQLITE_CANTOPEN: unable to open database file');
+    openedSessions.push(sessionId);
+    return action(modelMailbox(sessionId));
+  },
+}));
 
 import {
   ORPHANED_REPO_FENCE_SCAN_INTERVAL_MS,
@@ -127,7 +137,7 @@ beforeEach(() => {
   vi.clearAllMocks();
   sessionsRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'nc-fence-'));
   sessions.length = 0;
-  closedDbs.length = 0;
+  openedSessions.length = 0;
   fences.clear();
   dueMessages.clear();
   unreadableSessions.clear();
@@ -158,7 +168,7 @@ describe('orphaned repository ingress fence recovery (incident 2026-09-01)', () 
     expect(mockWakeRepositoryMountSessions).toHaveBeenCalledWith([orphaned]);
     // Every opened handle is closed — a leaked one makes the session
     // unreclaimable until the next host start.
-    expect(closedDbs.sort()).toEqual(['s-clean', 's-orphaned']);
+    expect(openedSessions.sort()).toEqual(['s-clean', 's-orphaned']);
   });
 
   it('leaves a fence alone while its publication still holds the workgroup mount claim', async () => {

@@ -17,7 +17,17 @@ import { DATA_DIR, GROUPS_DIR } from './config.js';
 import { runningContainerMounts } from './container-mounts.js';
 import { isContainerRunning, isContainerSpawning } from './container-runner.js';
 import { getDb } from './db/connection.js';
-import { getContainerState, getProcessingClaims } from './db/session-db.js';
+import { hasWorkContinuationRow } from './modules/mailbox/ops/continuation.js';
+import { getContainerState, getProcessingClaims } from './modules/mailbox/ops/sweep.js';
+// The GC's reclaim gate is synchronous all the way up through
+// `runStorageGcOnce`, and the mailbox seam's `session()` is async. Rather than
+// turn the whole quarantine/rollback path inside out in this PR, the two reads
+// below stay on the module's OWN open funnel — the same funnel the seam uses,
+// so there is still exactly one implementation of each statement (invariant
+// I-2). This file therefore stays on the raw-access allowlist; moving the GC
+// onto the seam is its own change.
+import { openOutboundDb } from './modules/mailbox/openers.js';
+import { sessionMailboxPath } from './modules/mailbox/index.js';
 import { onHostShutdown, onHostStart } from './host-lifecycle.js';
 import { log } from './log.js';
 import {
@@ -32,7 +42,7 @@ import {
   withRepositoryLifecycleClaims,
   type RepositoryWorkUnit,
 } from './repository-workspaces.js';
-import { inboundDbPath, openOutboundDb } from './session-manager.js';
+
 import { safeGitArgs, safeGitEnv } from './safe-git.js';
 import { dirSizeBytes, sessionWasReclaimed } from './storage-manager.js';
 
@@ -202,7 +212,9 @@ function participantsByTopic(
         agentGroupId: row.agent_group_id,
         status: row.status,
         idleSince: row.idle_since,
-        inboundMtimeMs: statMtimeMs(inboundDbPath(row.agent_group_id, row.session_id)),
+        inboundMtimeMs: statMtimeMs(
+          sessionMailboxPath({ agentGroupId: row.agent_group_id, sessionId: row.session_id }, 'inbound'),
+        ),
       });
       result.set(key, current);
     } catch (err) {
@@ -282,7 +294,7 @@ function participantHasPersistedWork(participant: TopicParticipant, dataDir: str
   // to inactive and must independently retain the shared topic worktree.
   //
   // Two-signal reclaim check, mirroring writeSessionMessageLocked exactly
-  // (session-manager.ts:857: sessionWasReclaimed && !existsSync(inboundDbPath)).
+  // (sessionWasReclaimed && the session's inbound.db is absent).
   // Neither signal alone is proof. The journal line is written BEFORE the
   // archiving->closed CAS (storage-manager.ts:1259 vs :1266-1269); on CAS loss
   // the directory is deliberately kept, so journaled-but-CAS-lost is still
@@ -294,17 +306,19 @@ function participantHasPersistedWork(participant: TopicParticipant, dataDir: str
   // nothing recreates that specific file.
   if (
     sessionWasReclaimed(participant.sessionId, path.join(dataDir, 'v2-sessions')) &&
-    !fs.existsSync(inboundDbPath(participant.agentGroupId, participant.sessionId))
+    !fs.existsSync(
+      sessionMailboxPath({ agentGroupId: participant.agentGroupId, sessionId: participant.sessionId }, 'inbound'),
+    )
   ) {
     return false;
   }
   try {
-    const db = openOutboundDb(participant.agentGroupId, participant.sessionId);
+    const db = openOutboundDb(
+      sessionMailboxPath({ agentGroupId: participant.agentGroupId, sessionId: participant.sessionId }, 'outbound'),
+    );
     try {
       return (
-        getProcessingClaims(db).length > 0 ||
-        Boolean(getContainerState(db)?.current_tool) ||
-        Boolean(db.prepare("SELECT 1 FROM session_state WHERE key = 'work_continuation'").get())
+        getProcessingClaims(db).length > 0 || Boolean(getContainerState(db)?.current_tool) || hasWorkContinuationRow(db)
       );
     } finally {
       db.close();
