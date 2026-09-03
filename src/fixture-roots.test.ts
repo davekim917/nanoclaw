@@ -17,9 +17,12 @@ import { describe, expect, it } from 'vitest';
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
-// Mirrors vitest.config.ts `include`. container/agent-runner runs under Bun
-// with its own setup layer and is deliberately out of scope here.
+// Mirrors vitest.config.ts `include`: these four trees recursively, plus
+// `container/*.test.ts` at the top level only. container/agent-runner runs
+// under Bun with its own setup layer, so vitest never loads it and this guard
+// does not reach it.
 const SCANNED_DIRS = ['src', 'setup', 'scripts', 'tests'];
+const SCANNED_FLAT_DIRS = ['container'];
 
 /**
  * Files allowed to keep a `/tmp/nanoclaw…` literal, with the reason. A suite
@@ -42,6 +45,15 @@ function testFiles(): string[] {
     }
   };
   for (const dir of SCANNED_DIRS) walk(path.join(REPO_ROOT, dir));
+  for (const dir of SCANNED_FLAT_DIRS) {
+    const full = path.join(REPO_ROOT, dir);
+    if (!fs.existsSync(full)) continue;
+    for (const entry of fs.readdirSync(full, { withFileTypes: true })) {
+      if (entry.isFile() && entry.name.endsWith('.test.ts')) {
+        out.push(path.relative(REPO_ROOT, path.join(full, entry.name)));
+      }
+    }
+  }
   return out.sort();
 }
 
@@ -53,6 +65,10 @@ describe('fixture roots are per-process', () => {
     // other assertion here vacuous.
     expect(FILES.length).toBeGreaterThan(200);
     expect(FILES).toContain('src/delivery.test.ts');
+    // Top-level container suites are in vitest's include list and must be
+    // scanned; the agent-runner tree below them must not be.
+    expect(FILES).toContain('container/entrypoint.test.ts');
+    expect(FILES.filter((f) => f.startsWith('container/agent-runner/'))).toEqual([]);
   });
 
   it('no test builds fixtures under a fixed /tmp/nanoclaw path', () => {
