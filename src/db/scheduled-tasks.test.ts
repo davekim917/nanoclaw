@@ -26,6 +26,11 @@ const raceCloses = vi.hoisted(() => ({ sessionId: null as string | null }));
 // row is written. Inert unless a test arms it.
 const raceRevokes = vi.hoisted(() => ({ sessionId: null as string | null }));
 
+// Makes the guarded task-row write itself fail — a busy or corrupt session DB —
+// so a test can see which of the two synchronous statements committed. Inert
+// unless a test arms it.
+const failsTaskWrite = vi.hoisted(() => ({ sessionId: null as string | null }));
+
 vi.mock('../session-manager.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../session-manager.js')>();
   return {
@@ -40,6 +45,17 @@ vi.mock('../session-manager.js', async (importOriginal) => {
         raceRevokes.sessionId = null;
         const { getDb: centralDb } = await import('./connection.js');
         centralDb().prepare('DELETE FROM messaging_group_agents WHERE agent_group_id = ?').run(agentGroupId);
+      }
+      if (failsTaskWrite.sessionId === sessionId) {
+        failsTaskWrite.sessionId = null;
+        const run = action as unknown as (mailbox: Record<string, unknown>) => unknown;
+        return actual.withExistingMailboxSession(agentGroupId, sessionId, ((mailbox: Record<string, unknown>) =>
+          run({
+            ...mailbox,
+            upsertTaskSeries: () => {
+              throw new Error('database is locked');
+            },
+          })) as never);
       }
       return actual.withExistingMailboxSession(agentGroupId, sessionId, action);
     },
@@ -871,6 +887,73 @@ describe('test_scheduleTask_revalidates_the_session_after_the_await', () => {
     const rows = db.prepare("SELECT id FROM messages_in WHERE series_id = 's-stamp'").all() as Array<{ id: string }>;
     db.close();
     expect(rows.map((r) => r.id)).toEqual(['t-stamp-1']);
+  });
+
+  /**
+   * A task write that FAILS must not move where the series is displayed either.
+   *
+   * The stamp and the task row are two statements with nothing awaited between
+   * them, so the only way to get one without the other is a throw from the
+   * write. Stamped first, a busy or corrupt session DB leaves the series shown
+   * at a destination no task row carries — the same partial state the rejected
+   * redirect produces, read from the other side. Stamped last, the failure mode
+   * is "the route did not move" instead of "the display did".
+   *
+   * Reverting the stamp back above `upsertTaskSeries` fails this test: the
+   * stamp is the new destination and the task row is still the old one.
+   */
+  it('leaves the routing stamp alone when the task write itself throws', async () => {
+    const processAfter = new Date(Date.now() + 86400000).toISOString();
+    const base = {
+      agentGroupId: AGENT_GROUP_ID,
+      cron: '0 5 * * *',
+      processAfter,
+      seriesId: 's-write-fail',
+    };
+    await scheduleTask({ ...base, id: 't-wf-1', prompt: 'first', destination: TEST_DESTINATION });
+    const sessionId = taskSessionIdFor('s-write-fail');
+    const stampOf = (): string | null =>
+      (
+        getDb().prepare('SELECT task_routing_platform_id AS p FROM sessions WHERE id = ?').get(sessionId) as {
+          p: string | null;
+        }
+      ).p;
+    expect(stampOf()).toBe(TEST_PLATFORM_ID);
+
+    // A second wired messaging group, so the redirect is legitimate throughout
+    // and only the write fails.
+    const OTHER_PLATFORM = 'discord:test:c1-wf';
+    getDb()
+      .prepare(
+        `INSERT INTO messaging_groups (id, channel_type, platform_id, name, is_group, unknown_sender_policy, created_at)
+         VALUES ('mg-wf-c1', ?, ?, 'Other', 1, 'public', ?)`,
+      )
+      .run(TEST_CHANNEL_TYPE, OTHER_PLATFORM, new Date().toISOString());
+    getDb()
+      .prepare(
+        `INSERT INTO messaging_group_agents (id, messaging_group_id, agent_group_id, created_at)
+         VALUES ('mga-wf-c1', 'mg-wf-c1', ?, ?)`,
+      )
+      .run(AGENT_GROUP_ID, new Date().toISOString());
+
+    failsTaskWrite.sessionId = sessionId;
+    await expect(
+      scheduleTask({
+        ...base,
+        id: 't-wf-2',
+        prompt: 'second',
+        destination: { platformId: OTHER_PLATFORM, channelType: TEST_CHANNEL_TYPE, threadId: null },
+      }),
+    ).rejects.toThrow(/database is locked/);
+
+    // Neither half moved.
+    expect(stampOf()).toBe(TEST_PLATFORM_ID);
+    const db = openInboundDb(inboundPath(sessionId));
+    const rows = db.prepare("SELECT id FROM messages_in WHERE series_id = 's-write-fail'").all() as Array<{
+      id: string;
+    }>;
+    db.close();
+    expect(rows.map((r) => r.id)).toEqual(['t-wf-1']);
   });
 
   /**

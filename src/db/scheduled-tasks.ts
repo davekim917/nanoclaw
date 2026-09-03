@@ -312,7 +312,6 @@ export async function scheduleTask(def: TaskDef): Promise<void> {
       // task anyway. Applying it only once the destination has been re-proved,
       // in the same synchronous step as the write it describes, removes that
       // partial state instead of compensating for it afterwards.
-      setTaskRoutingPlatformId(sessionId, def.destination.platformId);
       mailbox.upsertTaskSeries({
         id: def.id,
         seriesId: def.seriesId,
@@ -323,6 +322,14 @@ export async function scheduleTask(def: TaskDef): Promise<void> {
         channelType: def.destination.channelType,
         threadId: def.destination.threadId,
       });
+      // AFTER the guarded write, not before it. `upsertTaskSeries` can still
+      // throw — a busy or corrupt session DB — and a stamp committed first
+      // would then advertise a destination no task row carries, which is the
+      // same partial state read from the other side. Both statements are
+      // synchronous and nothing awaits between them, so the only way to see
+      // one without the other is that throw; ordering it last makes the
+      // failure mode "the route did not move" instead of "the display did".
+      setTaskRoutingPlatformId(sessionId, def.destination.platformId);
       return 'written';
     };
 
