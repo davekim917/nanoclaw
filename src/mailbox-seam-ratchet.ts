@@ -185,3 +185,93 @@ export function computeOffenders(): OffenderMatch[] {
   }
   return offenders.sort((x, y) => x.file.localeCompare(y.file));
 }
+
+/* ─── Inbound-keyed sessions doing outbound-only work ──────────────────────── */
+
+/**
+ * A `withMailboxSession` / `withExistingMailboxSession` action whose body uses
+ * ONLY outbound-side ops.
+ *
+ * The mailbox session's existence check is keyed on inbound.db. An action that
+ * needs nothing from inbound.db but is wrapped in one therefore answers
+ * `undefined` for a real cohort — a session whose inbound.db is gone while
+ * outbound.db remains — and the caller reports outbound state as empty when it
+ * is not. That is not hypothetical: it is the bug the usage rollup carried
+ * (fixed by reading through the outbound funnel) and the one
+ * `thread-close.ts`'s done-proposal read carried.
+ *
+ * The fix for a flagged site is `withExistingNanoclawOutbound`, the
+ * outbound-keyed funnel, which asks an outbound-only existence question.
+ *
+ * Heuristic by construction, and deliberately conservative in the safe
+ * direction: an action mentioning even one inbound-side op is not reported, and
+ * an op this scanner cannot classify counts as inbound (see op-sides.ts). So it
+ * under-reports rather than crying wolf.
+ */
+export interface OutboundOnlySessionMatch {
+  file: string;
+  line: number;
+  ops: string[];
+}
+
+const SESSION_OPENERS = ['withMailboxSession', 'withExistingMailboxSession'];
+
+/** The action body of one session call, found by balancing from its open paren. */
+function sessionCallBodies(src: string): Array<{ index: number; body: string }> {
+  const out: Array<{ index: number; body: string }> = [];
+  const re = new RegExp(`\\b(?:${SESSION_OPENERS.join('|')})\\s*\\(`, 'g');
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(src))) {
+    const open = m.index + m[0].length - 1;
+    let depth = 0;
+    for (let i = open; i < src.length; i++) {
+      if (src[i] === '(') depth++;
+      else if (src[i] === ')') {
+        depth--;
+        if (depth === 0) {
+          out.push({ index: m.index, body: src.slice(open + 1, i) });
+          break;
+        }
+      }
+    }
+  }
+  return out;
+}
+
+/**
+ * Every inbound-keyed session call in `roots` whose action uses only
+ * outbound-side ops. `outboundOps` is injected so a test can drive the checker
+ * over a string without touching the real module.
+ */
+export function findOutboundOnlySessions(
+  sources: Array<{ file: string; src: string }>,
+  sides: { inbound: ReadonlySet<string>; outbound: ReadonlySet<string> },
+): OutboundOnlySessionMatch[] {
+  const found: OutboundOnlySessionMatch[] = [];
+  for (const { file, src } of sources) {
+    const stripped = stripComments(src);
+    for (const { index, body } of sessionCallBodies(stripped)) {
+      // Ops invoked on whatever the action named its parameter. Matching
+      // `<ident>.<op>(` rather than a fixed `mailbox.` keeps it working for the
+      // handful of sites that name it something else.
+      const ops = [...body.matchAll(/\b[A-Za-z_$][\w$]*\.([A-Za-z_$][\w$]*)\s*\(/g)].map((x) => x[1]);
+      // BOTH sides, or a mixed action reads as outbound-only: filtering the
+      // inbound ops out before the `every` below made the check vacuously true
+      // for exactly the actions it must not flag.
+      const sessionOps = ops.filter((op) => sides.outbound.has(op) || sides.inbound.has(op));
+      if (sessionOps.length === 0) continue;
+      if (!sessionOps.every((op) => sides.outbound.has(op))) continue;
+      found.push({
+        file,
+        line: stripped.slice(0, index).split('\n').length,
+        ops: [...new Set(sessionOps)],
+      });
+    }
+  }
+  return found;
+}
+
+/** Non-test host sources, for the check above. */
+export function hostSourcesForOutboundScan(): Array<{ file: string; src: string }> {
+  return listTsFiles('src').map((file) => ({ file, src: fs.readFileSync(path.join(REPO_ROOT, file), 'utf8') }));
+}

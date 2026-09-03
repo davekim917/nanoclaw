@@ -12,7 +12,13 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { describe, expect, expectTypeOf, it } from 'vitest';
 
-import { computeOffenders, RATCHET_SCAN_ROOTS } from './mailbox-seam-ratchet.js';
+import {
+  computeOffenders,
+  findOutboundOnlySessions,
+  hostSourcesForOutboundScan,
+  RATCHET_SCAN_ROOTS,
+} from './mailbox-seam-ratchet.js';
+import { computeOpSides } from './modules/mailbox/op-sides.js';
 import { DEFERRED_UPSTREAM_FILES, UNPORTABLE_UPSTREAM_FILES, UPSTREAM_FILES } from './mailbox-seam-manifest.js';
 import type { DeliveryActionHandler } from './delivery.js';
 
@@ -137,4 +143,63 @@ describe('no raw session-DB access or passed session handle outside the mailbox 
       ).not.toContain(entry.upstream);
     });
   }
+
+  // An inbound-keyed session whose action needs nothing from inbound.db
+  // answers `undefined` for a session whose inbound.db is gone while
+  // outbound.db remains, and the caller then reports outbound state as empty
+  // when it is not. Two instances of that shipped before this rule existed:
+  // the usage rollup, and thread-close's done-proposal read. The fix is
+  // `withExistingNanoclawOutbound`, which asks an outbound-only existence
+  // question.
+  //
+  // A ratchet, not a target: these three files are pre-existing and may only
+  // shrink. Each needs its own look — `router.ts`'s two writes go to a session
+  // it has just resolved, so inbound.db is almost certainly there — but "safe
+  // today" is not the same as "asking the right question", and none of them
+  // may be joined by a fourth.
+  const OUTBOUND_ONLY_SESSION_ALLOWLIST = ['src/container-restart.ts', 'src/host-sweep.ts', 'src/router.ts'];
+
+  it('no NEW inbound-keyed session does outbound-only work', () => {
+    const matches = findOutboundOnlySessions(hostSourcesForOutboundScan(), computeOpSides());
+    const offenders = matches.filter((m) => !OUTBOUND_ONLY_SESSION_ALLOWLIST.includes(m.file));
+    expect(
+      offenders.map((m) => `${m.file}:${m.line} [${m.ops.join(',')}]`),
+      offenders.length > 0
+        ? 'These actions use only outbound-side ops inside an inbound-keyed mailbox session, so they ' +
+            'answer `undefined` for a session whose inbound.db is gone while outbound.db remains. Use ' +
+            '`withExistingNanoclawOutbound` instead — it asks an outbound-only existence question.'
+        : undefined,
+    ).toEqual([]);
+  });
+
+  it('every allowlisted file still has such a call (stale entries must be pruned)', () => {
+    const files = new Set(findOutboundOnlySessions(hostSourcesForOutboundScan(), computeOpSides()).map((m) => m.file));
+    const stale = OUTBOUND_ONLY_SESSION_ALLOWLIST.filter((f) => !files.has(f));
+    expect(
+      stale,
+      stale.length > 0 ? `${stale.join(', ')} no longer matches; remove it from the allowlist` : undefined,
+    ).toEqual([]);
+  });
+
+  // The checker itself, driven over a string so the property is pinned even
+  // once every real call site is fixed: this is exactly the shape
+  // thread-close.ts carried before it moved to the outbound funnel.
+  it('flags an inbound-keyed session doing an outbound-only read', () => {
+    const bad = `
+      async function readSessionProposal(agentGroupId: string, sessionId: string) {
+        return (await withExistingMailboxSession(agentGroupId, sessionId, (mailbox) => mailbox.readDoneProposal())) ?? null;
+      }`;
+    const hits = findOutboundOnlySessions([{ file: 'fixture.ts', src: bad }], computeOpSides());
+    expect(hits).toHaveLength(1);
+    expect(hits[0].ops).toEqual(['readDoneProposal']);
+  });
+
+  it('does not flag a session that also touches inbound', () => {
+    const fine = `
+      await withExistingMailboxSession(a, b, (mailbox) => {
+        mailbox.readDoneProposal();
+        return mailbox.inboundHasMessage('m-1');
+      });`;
+    expect(findOutboundOnlySessions([{ file: 'fixture.ts', src: fine }], computeOpSides())).toEqual([]);
+  });
 });
