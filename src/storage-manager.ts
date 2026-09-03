@@ -27,14 +27,13 @@ import { getAllContainerConfigs } from './db/container-configs.js';
 import { log } from './log.js';
 import { resolveRepositoryWorkUnit } from './repository-workspaces.js';
 import { tryRunWithStorageCleanupClaim } from './storage-activity.js';
-import {
-  inboundDbPath,
-  outboundDbPath,
-  sessionContextPathFor,
-  sessionsBaseDir,
-  threadsBaseDir,
-  threadWorktreeDir,
-} from './session-manager.js';
+// The session-directory LAYOUT, not the data: this file's reclaim probes open
+// their own read-only handles (they run in a worker thread over an injected
+// sessions root, which the DATA_DIR-keyed mailbox cannot address), so all they
+// need from the seam is where a session's two files live. `session-manager`'s
+// `inboundDbPath`/`outboundDbPath` wrappers go away with PR 7.
+import { sessionMailboxPath } from './modules/mailbox/index.js';
+import { sessionContextPathFor, sessionsBaseDir, threadsBaseDir, threadWorktreeDir } from './session-manager.js';
 
 const DOCKER_PRUNE_IMAGE_LABEL = 'nanoclaw.commit';
 const DEFAULT_CLEANUP_THRESHOLD_PCT = 85;
@@ -717,7 +716,7 @@ const SESSION_ACTIVITY_FILES = ['inbound.db', 'outbound.db', 'archive.db', 'cent
 // never confirmed, and commit dfa6e3db (2026-08-19) already added
 // manifest-and-restore around the reconcile pass on that theory and the event
 // still recurred on 08-25. `migrateMessagesInTable` has ~10 call sites
-// (`src/db/session-db.ts:22-24, 311, 361, 377, 392, 497, 511, 552, 590`) with
+// (now `src/modules/mailbox/schema.ts`, reached from every open funnel) with
 // no mtime bookkeeping on any of them, so the leak — whatever it is — is still
 // live and can poison any future consumer of inbound.db mtime.
 //
@@ -787,7 +786,7 @@ function dbHasRows(dbPath: string, sql: string, params: unknown[] = []): boolean
  */
 export function sessionHasOpenWork(agentGroupId: string, sessionId: string, sessPath?: string): boolean | null {
   const inbound = dbHasRows(
-    sessPath ? path.join(sessPath, 'inbound.db') : inboundDbPath(agentGroupId, sessionId),
+    sessPath ? path.join(sessPath, 'inbound.db') : sessionMailboxPath({ agentGroupId, sessionId }, 'inbound'),
     `SELECT 1 AS found
        FROM messages_in
       WHERE status IN ('processing', 'pending')
@@ -795,7 +794,9 @@ export function sessionHasOpenWork(agentGroupId: string, sessionId: string, sess
   );
   if (inbound === null || inbound) return inbound;
 
-  const outboundPath = sessPath ? path.join(sessPath, 'outbound.db') : outboundDbPath(agentGroupId, sessionId);
+  const outboundPath = sessPath
+    ? path.join(sessPath, 'outbound.db')
+    : sessionMailboxPath({ agentGroupId, sessionId }, 'outbound');
   const claimed = dbHasRows(outboundPath, "SELECT 1 AS found FROM processing_ack WHERE status = 'processing' LIMIT 1");
   if (claimed === null || claimed) return claimed;
 

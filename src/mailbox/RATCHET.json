@@ -15,8 +15,6 @@
   "container/agent-runner/src/scheduling/wiki-lint-gate.ts",
   "container/agent-runner/src/session-recap.ts",
   "src/cli/resources/tasks.ts",
-  "src/container-restart.ts",
-  "src/container-runner.ts",
   "src/dashboard/api/events.ts",
   "src/dashboard/api/scheduled-assembly.ts",
   "src/dashboard/api/scheduled-move.ts",
@@ -44,7 +42,6 @@
   "src/modules/scheduling/host-script.ts",
   "src/modules/scheduling/live-count.ts",
   "src/modules/scheduling/recurrence.ts",
-  "src/repo-fence-recovery.ts",
   "src/session-manager.ts",
   "src/storage-manager.ts",
   "src/worktree-cleanup.ts"
