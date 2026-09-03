@@ -198,7 +198,6 @@ export function openInboundDb(dbPath: string): Database.Database {
     // DB is a real fault, and callers must not mistake it for a gone session.
     throw asMissingDbError(err, dbPath);
   }
-  assertQueryable(db, dbPath);
   // ponytail: patching close() beats a wrapper type — every existing caller
   // already closes, and a new return type would touch all ~20 of them. Known
   // ceiling: better-sqlite3 refuses close() while an iterator is open, which
