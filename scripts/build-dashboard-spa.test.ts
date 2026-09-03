@@ -9,7 +9,6 @@ import {
   computeInputHash,
   decideBuild,
   isDependencyPath,
-  isTestInput,
   isUsableCacheEntry,
   listInputFiles,
   pruneCache,
@@ -76,16 +75,6 @@ describe('scripts/build-dashboard-spa.ts', () => {
   });
 
   describe('input set', () => {
-    it('classifies test files so a test-only edit cannot invalidate the cache', () => {
-      expect(isTestInput('dashboard/src/main.test.tsx')).toBe(true);
-      expect(isTestInput('dashboard/src/lib/derive.test.ts')).toBe(true);
-      expect(isTestInput('dashboard/src/test-setup.ts')).toBe(true);
-      expect(isTestInput('dashboard/src/__tests__/helper.ts')).toBe(true);
-      // Names that merely contain "test" are inputs, not tests.
-      expect(isTestInput('dashboard/src/views/LatestRuns.tsx')).toBe(false);
-      expect(isTestInput('dashboard/src/lib/protest.ts')).toBe(false);
-    });
-
     it('treats a node_modules symlink as a dependency, not an input', () => {
       // .gitignore's `node_modules/` only matches a real directory, so an
       // agent worktree that symlinks the live checkout's deps gets the
@@ -105,14 +94,21 @@ describe('scripts/build-dashboard-spa.ts', () => {
       expect(computeInputHash(root)).toBe(before);
     });
 
-    it('lists the SPA sources and excludes tests and ignored files', () => {
+    it('lists the SPA sources and excludes only ignored files', () => {
       const files = listInputFiles(root);
       expect(files).toContain('dashboard/src/main.tsx');
       expect(files).toContain('dashboard/pnpm-lock.yaml');
       expect(files).toContain('dashboard/vite.config.ts');
-      expect(files).not.toContain('dashboard/src/main.test.tsx');
-      expect(files).not.toContain('dashboard/src/test-setup.ts');
       expect(files.some((f) => f.includes('node_modules'))).toBe(false);
+    });
+
+    it('counts test files, because the SPA build is what typechecks them', () => {
+      // dashboard/tsconfig.json covers the whole src tree and dashboard's build
+      // script is `tsc --noEmit && vite build`. Skipping a rebuild on a
+      // test-only edit would let a type error there pass the build silently.
+      const files = listInputFiles(root);
+      expect(files).toContain('dashboard/src/main.test.tsx');
+      expect(files).toContain('dashboard/src/test-setup.ts');
     });
   });
 
@@ -139,10 +135,10 @@ describe('scripts/build-dashboard-spa.ts', () => {
       expect(computeInputHash(root)).not.toBe(before);
     });
 
-    it('ignores a test-only edit', () => {
+    it('changes on a test-only edit, so the typecheck cannot be cached away', () => {
       const before = computeInputHash(root);
       fs.writeFileSync(path.join(root, 'dashboard', 'src', 'main.test.tsx'), 'it("y", () => {});');
-      expect(computeInputHash(root)).toBe(before);
+      expect(computeInputHash(root)).not.toBe(before);
     });
 
     it('ignores host source changes outside dashboard/', () => {
@@ -161,7 +157,7 @@ describe('scripts/build-dashboard-spa.ts', () => {
 
   describe('decision', () => {
     it('misses when the cache dir does not exist at all', () => {
-      const d = decideBuild({ hash: 'h1', cacheRoot, force: false });
+      const d = decideBuild({ hash: 'h1', cacheRoot, force: false, depsVerified: true });
       expect(fs.existsSync(cacheRoot)).toBe(false);
       expect(d).toMatchObject({ action: 'build', reason: 'cache-miss' });
     });
@@ -169,7 +165,7 @@ describe('scripts/build-dashboard-spa.ts', () => {
     it('misses on an unseen hash when other entries exist', () => {
       makeBundle(bundleDir, 'a');
       storeInCache(bundleDir, path.join(cacheRoot, 'h1'), 'h1');
-      expect(decideBuild({ hash: 'h2', cacheRoot, force: false })).toMatchObject({
+      expect(decideBuild({ hash: 'h2', cacheRoot, force: false, depsVerified: true })).toMatchObject({
         action: 'build',
         reason: 'cache-miss',
       });
@@ -178,7 +174,7 @@ describe('scripts/build-dashboard-spa.ts', () => {
     it('hits on a stored hash', () => {
       makeBundle(bundleDir, 'a');
       storeInCache(bundleDir, path.join(cacheRoot, 'h1'), 'h1');
-      expect(decideBuild({ hash: 'h1', cacheRoot, force: false })).toMatchObject({
+      expect(decideBuild({ hash: 'h1', cacheRoot, force: false, depsVerified: true })).toMatchObject({
         action: 'restore',
         reason: 'cache-hit',
       });
@@ -187,9 +183,42 @@ describe('scripts/build-dashboard-spa.ts', () => {
     it('builds anyway under DASHBOARD_BUILD_FORCE', () => {
       makeBundle(bundleDir, 'a');
       storeInCache(bundleDir, path.join(cacheRoot, 'h1'), 'h1');
-      expect(decideBuild({ hash: 'h1', cacheRoot, force: true })).toMatchObject({
+      expect(decideBuild({ hash: 'h1', cacheRoot, force: true, depsVerified: true })).toMatchObject({
         action: 'build',
         reason: 'forced',
+      });
+    });
+
+    it('will not let a no-install build seed the cache', () => {
+      // scripts/deploy.sh runs `pnpm run build` (-> build:spa, no install)
+      // BEFORE `build:dashboard --install`. On a deploy that bumps
+      // dashboard/package.json or the lockfile, that first call misses on the
+      // new hash and builds against the PREVIOUS deploy's node_modules. If it
+      // stored that bundle, the second call would find a hit, skip the frozen
+      // install, and ship assets built with the old dependency versions.
+      const d = decideBuild({ hash: 'h1', cacheRoot, force: false, depsVerified: false });
+      expect(d).toMatchObject({ action: 'build', reason: 'cache-miss', cacheable: false });
+    });
+
+    it('lets an install-path build seed the cache', () => {
+      const d = decideBuild({ hash: 'h1', cacheRoot, force: false, depsVerified: true });
+      expect(d).toMatchObject({ action: 'build', reason: 'cache-miss', cacheable: true });
+    });
+
+    it('carries the same rule through a forced build', () => {
+      expect(decideBuild({ hash: 'h1', cacheRoot, force: true, depsVerified: false })).toMatchObject({
+        action: 'build',
+        reason: 'forced',
+        cacheable: false,
+      });
+    });
+
+    it('still restores on a hit without an install, since a hit rebuilds nothing', () => {
+      makeBundle(bundleDir, 'a');
+      storeInCache(bundleDir, path.join(cacheRoot, 'h1'), 'h1');
+      expect(decideBuild({ hash: 'h1', cacheRoot, force: false, depsVerified: false })).toMatchObject({
+        action: 'restore',
+        reason: 'cache-hit',
       });
     });
 
@@ -198,7 +227,7 @@ describe('scripts/build-dashboard-spa.ts', () => {
       fs.mkdirSync(path.join(entry, 'bundle'), { recursive: true });
       fs.writeFileSync(path.join(entry, 'bundle', 'index.html'), '<html>');
       expect(isUsableCacheEntry(entry)).toBe(false);
-      expect(decideBuild({ hash: 'h1', cacheRoot, force: false })).toMatchObject({
+      expect(decideBuild({ hash: 'h1', cacheRoot, force: false, depsVerified: true })).toMatchObject({
         action: 'build',
         reason: 'cache-miss',
       });
@@ -208,7 +237,7 @@ describe('scripts/build-dashboard-spa.ts', () => {
       const entry = path.join(cacheRoot, 'h1');
       fs.mkdirSync(entry, { recursive: true });
       fs.writeFileSync(path.join(entry, 'meta.json'), '{}');
-      expect(decideBuild({ hash: 'h1', cacheRoot, force: false })).toMatchObject({
+      expect(decideBuild({ hash: 'h1', cacheRoot, force: false, depsVerified: true })).toMatchObject({
         action: 'build',
         reason: 'cache-miss',
       });
@@ -244,13 +273,13 @@ describe('scripts/build-dashboard-spa.ts', () => {
     it('survives a store/restore round trip through the real hash', () => {
       const hash = computeInputHash(root);
       makeBundle(bundleDir, 'roundtrip');
-      const d1 = decideBuild({ hash, cacheRoot, force: false });
+      const d1 = decideBuild({ hash, cacheRoot, force: false, depsVerified: true });
       expect(d1.action).toBe('build');
       storeInCache(bundleDir, d1.cacheEntry, hash);
 
       fs.rmSync(path.join(root, 'dist'), { recursive: true, force: true });
 
-      const d2 = decideBuild({ hash: computeInputHash(root), cacheRoot, force: false });
+      const d2 = decideBuild({ hash: computeInputHash(root), cacheRoot, force: false, depsVerified: true });
       expect(d2.action).toBe('restore');
       restoreFromCache(d2.cacheEntry, bundleDir);
       expect(fs.existsSync(path.join(bundleDir, 'assets', 'roundtrip.js'))).toBe(true);

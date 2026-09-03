@@ -33,6 +33,7 @@ import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
+import { fileURLToPath } from 'node:url';
 
 /**
  * Bump when the set of hashed inputs or the cache layout changes, so old
@@ -47,14 +48,14 @@ export const CACHE_SUBDIR = path.join('data', 'build-cache', 'dashboard-spa');
 export const BUNDLE_DIR = path.join('dist', 'dashboard-spa');
 
 /**
- * Test-only inputs: they never reach the bundle, so a test-only edit should
- * not invalidate the cache. Matched against the repo-relative path.
+ * Test files are inputs too, even though they never reach the bundle.
+ * `dashboard/tsconfig.json` includes the whole `src` tree and `dashboard`'s own build
+ * script is `tsc -p tsconfig.json --noEmit && vite build`, so the SPA build is
+ * what typechecks them. Excluding them from the hash would let a type error in
+ * a test file pass the top-level build silently on a cache hit; vitest's
+ * transpile-only run does not replace that check. The cost is a rebuild on a
+ * test-only edit, which is cheap against what the gate saves.
  */
-const TEST_FILE = /(^|\/)(__tests__\/|test-setup\.[cm]?tsx?$|.*\.test\.[cm]?[jt]sx?$)/;
-
-export function isTestInput(relPath: string): boolean {
-  return TEST_FILE.test(relPath);
-}
 
 /**
  * Not an input, whatever git thinks. `.gitignore`'s `node_modules/` pattern
@@ -67,8 +68,8 @@ export function isDependencyPath(relPath: string): boolean {
 }
 
 /**
- * Every git-visible file under `dashboard/`, minus test files. Tracked files
- * plus untracked-but-not-ignored ones, so a new component counts before it is
+ * Every git-visible file under `dashboard/`. Tracked files plus
+ * untracked-but-not-ignored ones, so a new component counts before it is
  * committed; .gitignore keeps `node_modules/` and `tsconfig.tsbuildinfo` out.
  */
 export function listInputFiles(repoRoot: string): string[] {
@@ -80,7 +81,7 @@ export function listInputFiles(repoRoot: string): string[] {
   const seen = new Set<string>();
   for (const p of out.split('\0')) {
     if (!p) continue;
-    if (isTestInput(p) || isDependencyPath(p)) continue;
+    if (isDependencyPath(p)) continue;
     seen.add(p);
   }
   return [...seen].sort();
@@ -115,7 +116,7 @@ export function computeInputHash(repoRoot: string): string {
 
 export type BuildDecision =
   | { action: 'restore'; hash: string; cacheEntry: string; reason: 'cache-hit' }
-  | { action: 'build'; hash: string; cacheEntry: string; reason: 'forced' | 'cache-miss' };
+  | { action: 'build'; hash: string; cacheEntry: string; reason: 'forced' | 'cache-miss'; cacheable: boolean };
 
 /**
  * An entry counts as usable only when its completion marker AND an
@@ -127,11 +128,32 @@ export function isUsableCacheEntry(cacheEntry: string): boolean {
   );
 }
 
-export function decideBuild(opts: { hash: string; cacheRoot: string; force: boolean }): BuildDecision {
+/**
+ * `depsVerified` is the answer to "were `dashboard/`'s dependencies just
+ * installed from the lockfile?", and it decides whether this build's output may
+ * seed the cache. Only the deploy path (`--install`) can say yes.
+ *
+ * Without that rule the deploy corrupts its own cache. scripts/deploy.sh calls
+ * `pnpm run build` (which reaches `build:spa`, no install) BEFORE
+ * `build:dashboard --install`. On a deploy that bumps `dashboard/package.json`
+ * or the lockfile, the first call sees the new hash, misses, builds against the
+ * PREVIOUS deploy's `node_modules`, and would store that bundle under the new
+ * hash — after which the second call finds a hit and skips the frozen install
+ * entirely, shipping assets built with the old dependency versions.
+ *
+ * So the no-install path reads the cache but never writes to it.
+ */
+export function decideBuild(opts: {
+  hash: string;
+  cacheRoot: string;
+  force: boolean;
+  depsVerified: boolean;
+}): BuildDecision {
   const cacheEntry = path.join(opts.cacheRoot, opts.hash);
-  if (opts.force) return { action: 'build', hash: opts.hash, cacheEntry, reason: 'forced' };
+  const cacheable = opts.depsVerified;
+  if (opts.force) return { action: 'build', hash: opts.hash, cacheEntry, reason: 'forced', cacheable };
   if (isUsableCacheEntry(cacheEntry)) return { action: 'restore', hash: opts.hash, cacheEntry, reason: 'cache-hit' };
-  return { action: 'build', hash: opts.hash, cacheEntry, reason: 'cache-miss' };
+  return { action: 'build', hash: opts.hash, cacheEntry, reason: 'cache-miss', cacheable };
 }
 
 export function restoreFromCache(cacheEntry: string, bundleDir: string): void {
@@ -212,7 +234,12 @@ function main(): void {
 
   const cacheRoot = path.join(repoRoot, CACHE_SUBDIR);
   const bundleDir = path.join(repoRoot, BUNDLE_DIR);
-  const decision = decideBuild({ hash: computeInputHash(repoRoot), cacheRoot, force });
+  const decision = decideBuild({
+    hash: computeInputHash(repoRoot),
+    cacheRoot,
+    force,
+    depsVerified: withInstall,
+  });
 
   if (decision.action === 'restore') {
     restoreFromCache(decision.cacheEntry, bundleDir);
@@ -236,12 +263,23 @@ function main(): void {
   if (withInstall) run('pnpm', ['exec', 'vite', 'build'], dashboardDir);
   else run('pnpm', ['run', 'build'], dashboardDir);
 
+  if (!decision.cacheable) {
+    console.log(
+      `dashboard SPA: built ${decision.hash.slice(0, 12)} — not cached (dependencies not installed from the lockfile)`,
+    );
+    return;
+  }
+
   storeInCache(bundleDir, decision.cacheEntry, decision.hash);
   pruneCache(cacheRoot);
   console.log(`dashboard SPA: cached ${decision.hash.slice(0, 12)}`);
 }
 
 // `tsx scripts/build-dashboard-spa.ts` runs main; importing it for tests does not.
-if (process.argv[1] && path.resolve(process.argv[1]) === path.resolve(new URL(import.meta.url).pathname)) {
+// fileURLToPath, not `new URL(...).pathname`: the latter stays percent-encoded,
+// so on any install whose path contains a space or non-ASCII character the
+// comparison silently fails, main() never runs, and both package scripts exit 0
+// having built nothing — after deploy.sh has already done `rm -rf dist`.
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   main();
 }
