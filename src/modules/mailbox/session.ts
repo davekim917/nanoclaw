@@ -14,9 +14,6 @@
  */
 import { withExistingMailboxSession, withMailboxSession } from '../../session-manager.js';
 
-/** Test-only depth probe over the nesting guard `session-manager.ts` owns (seam 2 R-10). */
-export { _mailboxSessionDepthForTesting } from '../../session-manager.js';
-
 import type { NanoclawMailboxSession } from './index.js';
 
 /** Run one operation against a session's mailbox, provisioning it if absent. */

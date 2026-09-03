@@ -276,7 +276,7 @@ import {
   SWEEP_DUTY_INVENTORY,
   type SweepSessionContext,
 } from '../../host-sweep.js';
-import { _mailboxSessionDepthForTesting } from '../mailbox/session.js';
+import { _mailboxSessionDepthForTesting } from '../../host-sweep-depth-probe.js';
 
 probe.depth = _mailboxSessionDepthForTesting;
 
