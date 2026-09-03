@@ -3043,6 +3043,60 @@ describe('sweepSession on a session with no mailbox', () => {
     closeDb();
   });
 
+  it('a replacement container that wakes during the post-kill open gets no stale ceiling wake', async () => {
+    const db = initTestDb();
+    runMigrations(db);
+    db.prepare(`INSERT INTO agent_groups (id, name, folder, created_at) VALUES ('ag-sla', 'sla', 'sla', ?)`).run(
+      new Date().toISOString(),
+    );
+    mockKillContainer.mockReset();
+    mockIsContainerRunning.mockReset().mockReturnValue(true);
+    mockReadContainerConfig.mockReset().mockReturnValue({ provider: 'claude' });
+
+    const f = slaFixture('sess-sla-followup', ABSOLUTE_CEILING_MS + 60_000, 10_000);
+    // A resumable continuation is what makes decideCeilingFollowUp actually
+    // WRITE. Without one it returns { action: 'none' } and the test would pass
+    // whichever side of the guard the follow-up sits on.
+    const outPath = path.join(testDataDir.dir, 'v2-sessions', 'ag-sla', 'sess-sla-followup', 'outbound.db');
+    const plant = new Database(outPath);
+    plant
+      .prepare(
+        `INSERT INTO session_state (key, value, updated_at) VALUES ('work_continuation', ?, ?)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`,
+      )
+      .run(
+        JSON.stringify({
+          id: 'cont-followup',
+          task: 'resume the migration',
+          phase: 'running',
+          chain: 0,
+          resume_attempts: 0,
+          recovery_episode: 0,
+        }),
+        new Date().toISOString(),
+      );
+    plant.close();
+
+    await _enforceRunningContainerSlaForTesting(f.run, f.session, 'ag-sla', 'sla');
+
+    // The accountability row is inbound, so no single-writer hazard — but it is
+    // `on_wake = 1`, which the live replacement never consumes. Writing it here
+    // would greet the NEXT fresh container with a stale "your previous
+    // container was killed" notice and burn one of that class's recovery
+    // attempts. The pre-refactor early return skipped it; so must the guard.
+    const inbound = new Database(
+      path.join(testDataDir.dir, 'v2-sessions', 'ag-sla', 'sess-sla-followup', 'inbound.db'),
+    );
+    const respawns = (
+      inbound.prepare("SELECT COUNT(*) AS c FROM messages_in WHERE id LIKE 'ceiling-respawn-%'").get() as {
+        c: number;
+      }
+    ).c;
+    inbound.close();
+    expect(respawns).toBe(0);
+    closeDb();
+  });
+
   it('a replacement container that wakes during the post-kill open keeps its claim (claim-stuck)', async () => {
     const db = initTestDb();
     runMigrations(db);
