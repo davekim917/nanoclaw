@@ -14,10 +14,16 @@ import { allowSubprocess, enforceHermeticity } from '../src/test-hermeticity.js'
 // end (every other property it checks — fail-closed on a tampered symlink, a
 // drifted checksum, an escaped marker — only exists at that level), always
 // against a scratch root under os.tmpdir() (`mkRoot()` below), never the
-// checkout. The one real seam left is the CLI subprocess itself, and its tsx
-// resolution has three shapes depending on the environment: a local
-// node_modules/.bin/tsx, `which tsx`, or the `npx` fallback (issue #305).
-allowSubprocess(['tsx', 'which', 'npx']);
+// checkout. The one real seam left is the CLI subprocess itself: `TSX`
+// resolves to the repo's pinned node_modules/.bin/tsx, falling back to
+// `which tsx` when that is absent (issue #305). `npx` is deliberately NOT
+// exempted here even though it is TSX's last-resort fallback below — unlike
+// the other two, it can reach the npm registry and would run an unpinned
+// tsx (AGENTS.md's exact-resolution rule for runtime tools), which is
+// exactly the escape this guard exists to catch. If a worktree is ever
+// missing both a local tsx and a `tsx` on PATH, this suite should fail
+// loudly on the guard rather than silently phone home.
+allowSubprocess(['tsx', 'which']);
 enforceHermeticity();
 
 const SCRIPT = path.resolve('scripts/verify-workgroup-memory-runtime.ts');
