@@ -373,23 +373,32 @@ export function parseSlackWorkspaces(env: Record<string, string>): SlackWorkspac
 }
 
 /**
- * Workspace suffixes that have a bot token but no signing secret — configured
- * but not yet usable.
+ * ChannelTypes that must carry the declaration but cannot serve traffic.
  *
- * They cannot produce a live adapter, but their channelType is already known,
- * and `getChannelDefaults` resolves through the REGISTRY when no adapter is
- * live (tier 3, "factories that returned null for missing creds"). Registering
- * a declaration-only entry for them is what stops `ncl`/setup from stamping
- * the legacy `strict` schema default on a messaging group created during the
- * window between the two paste steps — a creation-time value that would
- * survive the credentials being completed.
+ * The registration is credential-gated, but the DECLARATION must not be:
+ * `getChannelDefaults` resolves through the REGISTRY when no adapter is live
+ * (tier 3, "factories that returned null for missing creds"), and without an
+ * entry `ncl`/setup stamp the legacy `strict` schema default on a
+ * messaging_groups row — a creation-time value that survives the credentials
+ * being completed.
+ *
+ * Two sources:
+ *  - any suffix seen with a Slack env key but not a complete token/secret
+ *    pair — a bot token pasted before its signing secret, or the reverse;
+ *  - the default `slack` instance when NOTHING is configured, which is the
+ *    state `setup/register.ts` and an offline `ncl` run in. It is added only
+ *    then, so a host with real workspaces does not advertise a phantom
+ *    unconfigured channel in `getRegisteredChannelNames`.
+ *
+ * A suffix that IS complete is excluded here — the bridge factory loop
+ * registers it with a live factory.
  *
  * Exported for testing. Same suffix→channelType derivation as
  * parseSlackWorkspaces, deliberately duplicated rather than folded into it:
- * that function's contract is "workspaces that can serve traffic", and callers
- * (the bridge factory loop) depend on that.
+ * that function's contract is "workspaces that can serve traffic", and the
+ * bridge factory loop depends on that.
  */
-export function incompleteSlackWorkspaceTypes(env: Record<string, string>): string[] {
+export function declarationOnlySlackTypes(env: Record<string, string>): string[] {
   const bySuffix = new Map<string, { botToken?: string; signingSecret?: string }>();
   for (const [key, value] of Object.entries(env)) {
     const m = key.match(/^SLACK_(BOT_TOKEN|SIGNING_SECRET)(?:_([A-Za-z0-9_]+))?$/);
@@ -403,10 +412,15 @@ export function incompleteSlackWorkspaceTypes(env: Record<string, string>): stri
   }
 
   const types: string[] = [];
+  let anyComplete = false;
   for (const [suffix, pair] of bySuffix) {
-    if (!pair.botToken || pair.signingSecret) continue;
+    if (pair.botToken && pair.signingSecret) {
+      anyComplete = true;
+      continue;
+    }
     types.push(suffix ? `slack-${suffix}` : 'slack');
   }
+  if (!anyComplete && types.length === 0) types.push('slack');
   return types;
 }
 
@@ -472,11 +486,13 @@ export async function slackCreateThread(
 const slackEnv = readEnvFileMatching(/^SLACK_(BOT_TOKEN|SIGNING_SECRET)(_[A-Za-z0-9_]+)?$/);
 const workspaces = parseSlackWorkspaces(slackEnv);
 
-// A half-configured workspace still gets its declaration into the registry, so
-// a messaging group created before the signing secret is pasted is not stamped
-// with the legacy `strict` schema default forever. The factory returns null —
+// Declaration-only registrations run BEFORE the live ones so a complete
+// workspace's real factory always wins the key. A half-configured or entirely
+// unconfigured Slack still gets its declaration into the registry, so a
+// messaging group created before the credentials land is not stamped with the
+// legacy `strict` schema default forever. The factory returns null —
 // initChannelAdapters logs the missing credentials and moves on.
-for (const channelType of incompleteSlackWorkspaceTypes(slackEnv)) {
+for (const channelType of declarationOnlySlackTypes(slackEnv)) {
   registerChannelAdapter(channelType, { defaults: SLACK_DEFAULTS, factory: () => null });
 }
 

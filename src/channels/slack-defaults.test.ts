@@ -85,11 +85,9 @@ describe('Slack adapter registration declares channel defaults', () => {
   });
 });
 
-describe('Half-configured workspaces still resolve the declaration', () => {
+describe('Declaration is resolvable without usable credentials', () => {
   it('registers the declaration when the signing secret has not been pasted yet', async () => {
-    const { registry, defaults } = await loadWithWorkspaces({
-      SLACK_BOT_TOKEN_EXAMPLE_LABS: 'xoxb-labs',
-    });
+    const { registry, defaults } = await loadWithWorkspaces({ SLACK_BOT_TOKEN_EXAMPLE_LABS: 'xoxb-labs' });
 
     // No live adapter can exist, but the creation-time value must not be the
     // legacy `strict` schema default — that would survive the credentials
@@ -99,9 +97,26 @@ describe('Half-configured workspaces still resolve the declaration', () => {
     expect(defaults.resolveUnknownSenderPolicy('slack-example-labs', false)).toBe('request_approval');
   });
 
-  it('yields no adapter for the half-configured instance', async () => {
-    const { registry, slack } = await loadWithWorkspaces({ SLACK_BOT_TOKEN: 'xoxb-primary' });
-    expect(slack.incompleteSlackWorkspaceTypes({ SLACK_BOT_TOKEN: 'xoxb-primary' })).toEqual(['slack']);
+  it('covers the reverse order too — a signing secret pasted before the token', async () => {
+    const { registry } = await loadWithWorkspaces({ SLACK_SIGNING_SECRET_EXAMPLE_LABS: 'sec-labs' });
+    expect(registry.hasDeclaredChannelDefaults('slack-example-labs')).toBe(true);
+  });
+
+  it('declares the default instance when nothing is configured at all', async () => {
+    // setup/register.ts and an offline `ncl` run in exactly this state.
+    const { registry, defaults } = await loadWithWorkspaces({});
+    expect(registry.hasDeclaredChannelDefaults('slack')).toBe(true);
+    expect(defaults.resolveUnknownSenderPolicy('slack', true)).toBe('public');
+  });
+
+  it('does not advertise a phantom `slack` on a host whose workspaces are all suffixed', async () => {
+    const { registry } = await loadWithWorkspaces(SUFFIXED);
+    expect(registry.hasDeclaredChannelDefaults('slack-example-labs')).toBe(true);
+    expect(registry.getRegisteredChannelNames()).not.toContain('slack');
+  });
+
+  it('yields no adapter for a declaration-only instance', async () => {
+    const { registry } = await loadWithWorkspaces({ SLACK_BOT_TOKEN: 'xoxb-primary' });
     await registry.initChannelAdapters(
       () =>
         ({
@@ -116,16 +131,26 @@ describe('Half-configured workspaces still resolve the declaration', () => {
     expect(registry.hasDeclaredChannelDefaults('slack')).toBe(true);
   });
 
-  it('classifies a complete workspace as complete, and mixed env correctly', async () => {
+  it('classifies complete, half-configured and unconfigured env correctly', async () => {
     const { slack } = await loadWithWorkspaces(PRIMARY);
     expect(
-      slack.incompleteSlackWorkspaceTypes({
+      slack.declarationOnlySlackTypes({
         ...PRIMARY,
         SLACK_BOT_TOKEN_EXAMPLE_LABS: 'xoxb-labs',
         SLACK_SIGNING_SECRET_ORPHAN: 'sec-only',
       }),
-    ).toEqual(['slack-example-labs']);
-    expect(slack.incompleteSlackWorkspaceTypes(PRIMARY)).toEqual([]);
+    ).toEqual(['slack-example-labs', 'slack-orphan']);
+    // A complete workspace is left to the live factory loop.
+    expect(slack.declarationOnlySlackTypes(PRIMARY)).toEqual([]);
+    expect(slack.declarationOnlySlackTypes({})).toEqual(['slack']);
+  });
+
+  it('never shadows a complete workspace with the null factory', async () => {
+    const { registry } = await loadWithWorkspaces({ ...PRIMARY, ...SUFFIXED });
+    // Both are complete, so neither is declaration-only; the live factories own
+    // the keys and the declaration still resolves.
+    expect(registry.hasDeclaredChannelDefaults('slack')).toBe(true);
+    expect(registry.hasDeclaredChannelDefaults('slack-example-labs')).toBe(true);
   });
 });
 
