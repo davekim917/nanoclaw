@@ -41,6 +41,7 @@ import {
   registerSweepDutySource,
   runSlaObservationHooks,
   runSweepKillFollowUps,
+  writeOutboundWhenStopped,
   writeSystemWake,
   type SessionRunner,
   type StuckDecision,
@@ -296,7 +297,20 @@ async function sweepProviderHeal(
     killContainer(session.id, 'provider-failed-selfheal-parked');
     try {
       await run((mailbox) =>
-        notifyProviderHealParked(mailbox, session, containerState?.provider_failure_reason ?? null, writeParkedMessage),
+        // Same yield boundary as the kill-ceiling notice: the park kill is
+        // above, this session opened after it, and a respawn in that gap owns
+        // outbound.db. The notice is one-per-episode and idempotent, so
+        // skipping it costs nothing a later tick cannot redo. Mailbox seam
+        // PR 5b (#332) made `writeOutboundWhenStopped` the single guarded
+        // body for every host-side outbound write; it travels with this one.
+        writeOutboundWhenStopped(session, mailbox, () =>
+          notifyProviderHealParked(
+            mailbox,
+            session,
+            containerState?.provider_failure_reason ?? null,
+            writeParkedMessage,
+          ),
+        ),
       );
     } catch (err) {
       log.warn('self-heal: parked notice failed', { sessionId: session.id, err });
@@ -599,6 +613,47 @@ function reportContainerOomTelemetry(
 }
 
 export { reportContainerOomTelemetry as _reportContainerOomTelemetryForTesting };
+
+/**
+ * Test-only entry point for the running-container SLA, including both post-kill
+ * write paths. Builds the minimum session context the duty reads: the SLA and
+ * its follow-ups touch `session`, `agentGroupId`, `agentGroupFolder` and the
+ * two window openers, nothing else. Moved here with `enforceRunningContainerSla`
+ * itself (S2-PR10) — it was host-sweep.ts's while the body still lived there.
+ */
+export function _enforceRunningContainerSlaForTesting(
+  run: SessionRunner,
+  session: Session,
+  agentGroupId: string,
+  agentGroupFolder: string,
+): Promise<void> {
+  const ctx: SweepSessionContext = {
+    now: Date.now(),
+    sessions: [session],
+    activeContainerSessionIds: new Set<string>(),
+    session,
+    agentGroupId,
+    agentGroupFolder,
+    mailbox: null,
+    hasOutbound: true,
+    alive: true,
+    justWoke: false,
+    plan: {
+      dueCount: 0,
+      wakePriority: 'interactive',
+      admittedTasks: 0,
+      workContinuation: null,
+      continuationWakeEligible: false,
+      hasOutbound: true,
+    },
+    observed: null,
+    killSnapshot: null,
+    run,
+    runIn: (_window, action) => run(action),
+    reportWoke: () => {},
+  };
+  return enforceRunningContainerSla(ctx);
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Registrations — S11, S14, and S16's SLA-observation hook.

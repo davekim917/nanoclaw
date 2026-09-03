@@ -756,7 +756,7 @@ export function decideContinuationWake(args: {
  * Returns `undefined` when a container owns the file — never an error. Every
  * caller's write is idempotent or retried on the next tick.
  */
-function writeOutboundWhenStopped<T>(
+export function writeOutboundWhenStopped<T>(
   session: Session,
   mailbox: NanoclawMailboxSession,
   action: (mailbox: NanoclawMailboxSession) => T,
@@ -1514,46 +1514,6 @@ async function sweepSession(session: Session, tick: SweepTickContext): Promise<n
     if (err instanceof SweepWindowAbort) return null;
     throw err;
   }
-}
-
-/**
- * Test-only entry point for the running-container SLA, including both post-kill
- * write paths. Builds the minimum session context the duty reads: the SLA and
- * its follow-ups touch `session`, `agentGroupId`, `agentGroupFolder` and the
- * two window openers, nothing else.
- */
-export function _enforceRunningContainerSlaForTesting(
-  run: SessionRunner,
-  session: Session,
-  agentGroupId: string,
-  agentGroupFolder: string,
-): Promise<void> {
-  const ctx: SweepSessionContext = {
-    now: Date.now(),
-    sessions: [session],
-    activeContainerSessionIds: new Set<string>(),
-    session,
-    agentGroupId,
-    agentGroupFolder,
-    mailbox: null,
-    hasOutbound: true,
-    alive: true,
-    justWoke: false,
-    plan: {
-      dueCount: 0,
-      wakePriority: 'interactive',
-      admittedTasks: 0,
-      workContinuation: null,
-      continuationWakeEligible: false,
-      hasOutbound: true,
-    },
-    observed: null,
-    killSnapshot: null,
-    run,
-    runIn: (_window, action) => run(action),
-    reportWoke: () => {},
-  };
-  return enforceRunningContainerSla(ctx);
 }
 
 /**

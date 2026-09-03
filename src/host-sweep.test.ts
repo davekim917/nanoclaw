@@ -35,7 +35,6 @@ import {
   _notifyKillCeilingForTesting,
   _prepareDueWakeForTesting,
   _resetStuckProcessingRowsForTesting,
-  _enforceRunningContainerSlaForTesting,
   _resetSweepRegistryForTesting,
   registerSweepKillFollowUp,
   _incrementStoppedContinuationAttemptForTesting,
@@ -56,6 +55,11 @@ import {
   notifyContinuationParked,
   shouldCloseTaskSession,
 } from './host-sweep.js';
+// S14 (the running-container SLA) and both post-kill write paths moved to the
+// container-health family in S2-PR10; its test-only entry point moved with the
+// body. These SLA cases are mailbox seam PR 5b's and B1's, and they still drive
+// the same duty through the same registry.
+import { _enforceRunningContainerSlaForTesting } from './modules/sweep-container-health/index.js';
 import { getDb } from './db/connection.js';
 import type { Session } from './types.js';
 
