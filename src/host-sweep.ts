@@ -68,6 +68,7 @@ import {
   hasContainerEverRun,
   getActiveContainerSessionIds,
   isContainerRunning,
+  isContainerSpawning,
   killContainer,
   wakeContainer,
 } from './container-runner.js';
@@ -1271,6 +1272,31 @@ export function notifyProviderHealParked(
  * Resolves `undefined` when the mailbox is gone — the read-path contract.
  */
 export type SessionRunner = <T>(action: (mailbox: NanoclawMailboxSession) => T | Promise<T>) => Promise<T | undefined>;
+
+/**
+ * Could a container be writing this session's `outbound.db` right now?
+ *
+ * `outbound.db` has exactly ONE writer. The host may write it only while no
+ * container owns it, and "owns it" includes a container that is still
+ * SPAWNING — a wake issued a moment ago has not reached `isContainerRunning`
+ * yet but is about to hold the file.
+ *
+ * Ported from mailbox seam PR 5 round 7 (`7199be48`) and round 8 (`3b6cbb5f`).
+ * It lives in the driver, not a family module, because families on both sides
+ * of a kill share it: sweep-session-core's orphan resets, sweep-continuation's
+ * park and wake-eligibility decisions, and sweep-container-health's two
+ * post-kill windows.
+ *
+ * The rule this enforces: a host write to outbound.db is safe only when the
+ * check sits INSIDE the session and immediately before the mutation, with no
+ * await in between. Opening a session is a yield, and a concurrent inbound
+ * wake can start a container in it — `alive` sampled by an earlier phase
+ * cannot authorize a write in a later one, and neither can a liveness check
+ * taken before `killContainer` returned.
+ */
+export function containerOwnsOutbound(sessionId: string): boolean {
+  return isContainerRunning(sessionId) || isContainerSpawning(sessionId);
+}
 
 /**
  * Detection + action for one alive session. Always advances the debounce;
