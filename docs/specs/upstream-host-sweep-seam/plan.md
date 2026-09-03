@@ -195,7 +195,7 @@ Three surfaces, one per shape the source actually has. The two hook lists exist 
 | 11b | **OOM telemetry is SLA-only.** `reportContainerOomTelemetry` has exactly one call site, inside `enforceRunningContainerSla`'s own observe session, reached only when the chain falls through | `:2088`, sole call site; comment at `:2086-2087` "the decision and the telemetry row see the same snapshot" | S16 registers on `registerSlaObservationHook`, never as a phase duty (F-10.5) |
 | 12 | Kill → notify → reset → follow-up, in that exact order; claims and continuation snapshotted **inside the observe session, before the kill** | `:2103-2131` | `registerSweepKillFollowUp`: S15 order 10, S17 order 20, S10 order 30 |
 | 13 | Recurrence before the spent-task GC | `:1772-1777` | S18 order 20, S19 order 30, both `session:tail` |
-| 14 | `providerFailedTicks.delete()` on `!alive` | `:1754-1756` | the map moves with S11 into `sweep-container-health`; `ctx.alive` is the shared input |
+| 14 | `providerFailedTicks.delete()` on `!alive` | `:1754-1756` | **amended at build (S2-PR10, Codex F1):** the Map's STORAGE stays a driver-owned export of `host-sweep.ts` so the driver's `!alive` cleanup remains a synchronous delete (a module-owned map needs either an import cycle — TDZ at registration — or a dynamic import, which adds an `await` before W5 that a concurrent wake can observe); S11 in `sweep-container-health` imports it and owns every read/write of its semantics |
 | 15 | The quiet-cache hint is computed last | driver machinery, not a duty | computed after the last phase |
 | 16 | **Three-way failure classification** replaces one silent backoff. Vanished mailbox → silent backoff. Present-but-unopenable → `log.error` **and** backoff, because retrying every 60 s *"is what produced ~4k identical errors in the hot-journal incident"*. A duty that threw → **rethrow, never quiet-cached**: *"Quiet-caching it would hold an already-due scheduled task or recovery wake for the full 30-minute backoff, and `last_active` does not move on failure, so nothing would clear it early."* | `:1632-1663`; the `enteredPlanSession` flag distinguishes arm 2 from arm 3 | the registry owns all three arms once, for every duty (§4.5) |
 | 17 | The sweep's two error sites carry different meanings and must stay separable | `:947` (per-session catch) and `:1645` (unopenable branch) | distinct log strings — `Host sweep duty failed` and `Host sweep mailbox unopenable` — so every gate stays single-cause (§4.5, §6) |
@@ -270,7 +270,7 @@ Preserved as-is:
 
 - **`quietSessions`** (`:121`) stays in `host-sweep.ts` as fan-out machinery: bounded at `sessions.length + 500`, invalidated by `session.last_active`, hint computed after the last phase. It has a time bound and `last_active` invalidation but deliberately **no mtime change-signal and no stagger** — a re-home keeping only the mtime half loses the invalidation; keeping only the time bound re-creates the burst.
 - **`usageRollupMtimeCache`** (`:1816`) moves with T19 into `sweep-usage`. It has the mtime signal and deliberately no time bound, the one sanctioned exception in `docs/architecture.md` because its failure mode is a missed usage rollup, not an undelivered message. Written **only after a real rollup** (constraint 21).
-- **`providerFailedTicks`** (`:570`) moves with S11; **`oomKillObserver`** (`:103`) with S16; **`unreadableSessions`** (`:1500`) and **`lastSkippedQuiet`** (`:122`) stay in the driver.
+- **`providerFailedTicks`** (`:570`) stays a driver-owned export (storage) with S11 owning its semantics — see constraint 14's amendment; **`oomKillObserver`** (`:103`) moves with S16; **`unreadableSessions`** (`:1500`) and **`lastSkippedQuiet`** (`:122`) stay in the driver.
 - **The per-session `setImmediate` yield** after every swept session (`:953`, commit `5ee0739b`): a swept session costs up to ~1.5 s of synchronous work, so a 10-session batch between yields was one contiguous ~15 s event-loop freeze. The driver keeps it in the same place.
 
 ### 4.5 The error rule
@@ -329,7 +329,7 @@ The same four things every time, so review is a template rather than a fresh rea
 | `:1227` | `admitDueTaskContexts` (`session-manager.ts`) | PR 4 | S2-PR11 |
 | `:1594` | `syncDoneProposalMirror` (`dashboard/thread-close.ts`) | PR 4 | S2-PR11, S2-PR13 |
 | `:1770` | `handleRecurrence` (`modules/scheduling/recurrence.ts`) | PR 4 | S2-PR11 |
-| `:1840` | `rollupSessionUsage` (`db/usage.ts`) | PR 6 | S2-PR12 |
+| `:1840` | `rollupSessionUsage` (`db/usage.ts`) | PR 6 (signature only; the sweep's raw outbound open is deliberate — see F-12.2) | S2-PR12 |
 | `:2416` | `deferMessageForFreshContextRetry` (`session-manager.ts`) | PR 4 | S2-PR9 |
 
 **These are prerequisites, not seam-2 work.** Converting the six callees off the bridge belongs to the mailbox series; seam 2 waits for them and takes none of them.
@@ -490,7 +490,7 @@ Host, `vitest`. 70 cases.
 - **F-5.4** `src/host-sweep-registry.test.ts` › "reconciler, thread-close and watchdog run in tick:post-session" — the container-state ordering constraint survives.
 
 **S2-PR6 — claims, storage, egress (5)**
-- **F-6.1** `src/modules/sweep-claims/claims.test.ts` › "the self-heal nudge ladder keeps its 24h per-claim cooldown and 10-minute scan throttle" — the 92 ported claims cases.
+- **F-6.1** `src/modules/sweep-claims/claims.test.ts` › "the self-heal nudge ladder keeps its 24h per-claim cooldown and 10-minute scan throttle" — drives the registered T21 through the real `sweepClaimsSelfHeal` with fake timers (second tick within 10 min throttled; a nudged claim not re-nudged within 24 h, re-nudged after). The 93 pre-existing claims cases stay in `src/modules/claims/*.test.ts` (they were never in host-sweep.test.ts — T20/T21 are thin wrappers; the sizing table's "92 ported" was a miscount) and join PR 6's verification surface.
 - **F-6.2** `src/modules/sweep-storage/storage.test.ts` › "storage maintenance runs after the session fan-out and keeps the worker's own cadence" — phase and order; the ported storage cases.
 - **F-6.3** `src/host-sweep-registry.test.ts` › "claims reconcile is ordered strictly before claims self-heal" — declared order asserted; a probe proves reconcile's deletions are visible to self-heal in the same tick.
 - **F-6.4** same file › "egress re-heal runs before the session fan-out" — phase assertion.
@@ -528,7 +528,7 @@ Host, `vitest`. 70 cases.
 
 **S2-PR12 — usage rollup (3)**
 - **F-12.1** `src/modules/sweep-usage/usage.test.ts` › "shouldSkipUsageRollup keeps its mtime gate" — the 3 ported cases.
-- **F-12.2** same file › "the usage mtime cache is written only after a rollup actually ran" — inbound gone while outbound remains → the session resolves undefined, the rollup does not run, the cache is unchanged and the session is retried next tick; a real rollup updates the cache.
+- **F-12.2** same file › "the usage mtime cache is written only after a rollup actually ran" — (corrected at build against mailbox PR 6's final head `a49b8172`, where the rollup deliberately keeps the module's raw outbound opener because the seam's existence check is keyed on inbound.db) inbound.db gone while outbound.db remains → the rollup STILL runs on outbound alone and the cache updates (constraint 21's purpose); a rollup that fails before completing → cache unchanged, preserved log, re-attempted next tick; a real rollup updates the cache and an unchanged mtime skips on the next tick. The sweep-usage module carries the raw opener and joins the ratchet allowlist (second permanent KEEP-PATCH, same class as scheduled-move).
 - **F-12.3** same file › "the rollup reuses the tick's session list and opens only changed sessions" — no extra `getActiveSessions` call; one open per changed session.
 
 **S2-PR13 — continuation and ceiling accountability (5)**
@@ -542,7 +542,7 @@ Host, `vitest`. 70 cases.
 - **F-14.1** `src/host-sweep-registry.test.ts` › "host-sweep.ts contains no inline duty bodies" — it exports only the driver, registry and phase-list allowlist, and is under 300 lines.
 - **F-14.2** same file › "the registered duty set still matches the inventory after every family has moved" — R-7's assertion re-run at the end state.
 
-**Family-case rule (added at build, 2026-09-03, after Codex found it on PR 3, PR 4 and PR 8):** every family PR must, for each moved registration, drive the REGISTERED duty through the registry (obtain it by name, invoke `claims`/`run` with a mocked context) and assert the underlying dependency was reached — a case that calls the body directly proves nothing about the wrapper the PR actually wrote. Exclusive-chain assertions read the registry's actual order and each duty's `claims` presence (S14 = no predicate).
+**Family-case rule (added at build, 2026-09-03, after Codex found it on PR 3, PR 4 and PR 8):** every family PR must, for each moved registration, drive the REGISTERED duty through the registry (obtain it by name, invoke `claims`/`run` with a mocked context) and assert the underlying dependency was reached — a case that calls the body directly proves nothing about the wrapper the PR actually wrote. Exclusive-chain assertions read the registry's actual order and each duty's `claims` presence (S14 = no predicate). **And (after Codex on PR 7):** each family ships `src/modules/sweep-<family>/wiring.test.ts` › "the production modules barrel registers the <family> duty source" — it imports the production barrel `src/modules/index.ts` and asserts the family's source is registered, because the registry test's direct module import proves mechanics but masks barrel wiring. Case titles are the plan's exact strings.
 
 Each PR lists which cases it makes pass. No case may be renamed or retargeted to a weaker assertion; if a criterion turns out wrong, `plan.md` is corrected first and the change recorded in `run.md`.
 
