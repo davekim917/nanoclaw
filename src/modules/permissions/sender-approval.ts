@@ -34,6 +34,7 @@ import { getDeliveryAdapter } from '../../delivery.js';
 import { log } from '../../log.js';
 import type { InboundEvent } from '../../channels/adapter.js';
 import { pickApprovalDelivery, pickApprover } from '../approvals/primitive.js';
+import { AGENT_ACCESS_SCOPE_WARNING } from './channel-approval.js';
 import { createPendingSenderApproval, getInFlightSenderApproval } from './db/pending-sender-approvals.js';
 
 const APPROVAL_OPTIONS: RawOption[] = [
@@ -116,7 +117,7 @@ export async function requestSenderApproval(input: RequestSenderApprovalInput): 
   const originName = originMg?.name ?? `a ${originChannelType} channel`;
 
   const title = '👤 New sender';
-  const question = `${senderDisplay} wants to talk to your agent in ${originName}. Allow?`;
+  const question = `${senderDisplay} wants to talk to your agent in ${originName}. ${AGENT_ACCESS_SCOPE_WARNING} Allow?`;
   const options = normalizeOptions(APPROVAL_OPTIONS);
 
   const created = createPendingSenderApproval({

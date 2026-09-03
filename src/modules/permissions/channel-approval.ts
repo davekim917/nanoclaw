@@ -70,6 +70,18 @@ export const NEW_AGENT_VALUE = 'new_agent';
 export const CHOOSE_EXISTING_VALUE = 'choose_existing';
 export const REJECT_VALUE = 'reject';
 
+/**
+ * What approving here actually grants, stated on the card itself.
+ *
+ * Deliberately does NOT claim "the same authority as you": an approved member
+ * still cannot run admin commands (`command-gate.ts` gates those on
+ * `hasAdminPrivilege`). It names the real blast radius instead — the agent's
+ * shared context, workspace files, memory and connected tools — because the
+ * approver is deciding about that, not about one message.
+ */
+export const AGENT_ACCESS_SCOPE_WARNING =
+  "Anyone approved here can interact with the agent and potentially access anything the agent can access, including other conversations' context, its workspace files and memory, and any connected tools.";
+
 // ── Utilities ──
 
 function toFolder(name: string): string {
@@ -133,9 +145,9 @@ function buildQuestionText(
   const note = ruleNote ? ` If connected, the agent ${ruleNote}.` : '';
   if (isGroup) {
     const where = channelName ? `${channelName} on ${channelType}` : `a ${channelType} channel`;
-    return `${who} mentioned your bot in ${where}.${note} How would you like to handle this channel?`;
+    return `${who} mentioned your bot in ${where}.${note} ${AGENT_ACCESS_SCOPE_WARNING} How would you like to handle this channel?`;
   }
-  return `${who} sent your bot a DM on ${channelType}.${note} How would you like to handle it?`;
+  return `${who} sent your bot a DM on ${channelType}.${note} ${AGENT_ACCESS_SCOPE_WARNING} How would you like to handle it?`;
 }
 
 /**
