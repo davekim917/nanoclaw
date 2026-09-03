@@ -229,6 +229,10 @@ import {
   type SweepSessionContext,
   type SweepTickContext,
 } from './host-sweep.js';
+// S2-PR13's family registers S6/S7/S8/S9a/S9b/S15/S10 as its own duty source
+// at import time; without this line R-7's inventory is seven registrations
+// short. Import for side effects only.
+import './modules/sweep-continuation/index.js';
 import { log } from './log.js';
 import { SessionDbMissingError, SessionDbUnopenableError } from './modules/mailbox/index.js';
 import { _mailboxSessionDepthForTesting } from './modules/mailbox/session.js';

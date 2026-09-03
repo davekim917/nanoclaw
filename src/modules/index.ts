@@ -52,3 +52,9 @@ import './provider-fallback/index.js';
 import './repository-workspaces/index.js';
 
 import './escalation/index.js';
+
+// Continuation and ceiling accountability (S2-PR13, G09) — S6 done-proposal-mirror,
+// S7 continuation-read, S8 continuation-recovery-parking, S9a
+// continuation-wake-eligibility, S9b container-wake, S15 kill-ceiling-notice,
+// S10 ceiling-kill-accountability.
+import './sweep-continuation/index.js';
