@@ -9,11 +9,11 @@
  * window for every account regardless.
  *
  * Shape rationale, `available` semantics, and the 0-1 utilization convention
- * are documented on RATE_LIMIT_SAMPLES_DDL in connection.ts.
+ * are documented on RATE_LIMIT_SAMPLES_DDL in schema.ts.
  *
  * Claude-only. Nothing here covers Codex or OpenCode.
  */
-import { getOutboundDb } from '../mailbox/sqlite/connection.js';
+import { getOutboundDb } from '../../mailbox/sqlite/connection.js';
 
 /** Which capture path produced the row. Both are kept; the pull is primary. */
 export type RateLimitSampleSource = 'usage_pull' | 'rate_limit_event';

@@ -1,9 +1,11 @@
 import { afterEach, describe, expect, it } from 'bun:test';
-import { Database } from 'bun:sqlite';
+import type { Database } from 'bun:sqlite';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
+import { getInboundDb, getOutboundDb } from '../mailbox/sqlite/connection.js';
+import { closeSessionDb, initTestSessionDb } from '../modules/mailbox/testing.js';
 import { evaluateWikiLintGate } from './wiki-lint-gate.js';
 
 const SERIES_ID = 'memory-lint-ag-1';
@@ -15,40 +17,22 @@ const tempDirs: string[] = [];
 interface Fixtures {
   dir: string;
   wikiPath: string;
-  inboundPath: string;
-  outboundPath: string;
   inbound: Database;
   outbound: Database;
 }
 
+/**
+ * The gate no longer takes DB paths — it reads through the mailbox module, so
+ * the test injects the in-memory session pair instead of two temp files.
+ */
 function fixtures(): Fixtures {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'wiki-lint-gate-'));
   tempDirs.push(dir);
   const wikiPath = path.join(dir, 'wiki');
-  const inboundPath = path.join(dir, 'inbound.db');
-  const outboundPath = path.join(dir, 'outbound.db');
   fs.mkdirSync(wikiPath);
 
-  const inbound = new Database(inboundPath);
-  inbound.exec(`
-    CREATE TABLE messages_in (
-      id TEXT PRIMARY KEY,
-      kind TEXT NOT NULL,
-      series_id TEXT,
-      status TEXT NOT NULL DEFAULT 'pending'
-    );
-  `);
-
-  const outbound = new Database(outboundPath);
-  outbound.exec(`
-    CREATE TABLE processing_ack (
-      message_id TEXT PRIMARY KEY,
-      status TEXT NOT NULL,
-      status_changed TEXT NOT NULL
-    );
-  `);
-
-  return { dir, wikiPath, inboundPath, outboundPath, inbound, outbound };
+  initTestSessionDb();
+  return { dir, wikiPath, inbound: getInboundDb(), outbound: getOutboundDb() };
 }
 
 function writeWikiFile(f: Fixtures, relativePath: string, contents = '# Page\n'): string {
@@ -81,28 +65,54 @@ function addOccurrence(
   inboundStatus = 'pending',
 ): void {
   f.inbound
-    .prepare('INSERT INTO messages_in (id, kind, series_id, status) VALUES (?, ?, ?, ?)')
-    .run(id, 'task', SERIES_ID, inboundStatus);
+    .prepare(
+      `INSERT INTO messages_in (id, seq, kind, timestamp, series_id, status, content)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    )
+    .run(id, ++seq, 'task', OLD, SERIES_ID, inboundStatus, '{}');
   f.outbound
     .prepare('INSERT INTO processing_ack (message_id, status, status_changed) VALUES (?, ?, ?)')
     .run(id, ackStatus, statusChanged);
 }
 
-function closeFixtures(f: Fixtures): void {
-  f.inbound.close();
-  f.outbound.close();
-}
+/** Kept as a no-op seam: the in-memory pair is torn down in afterEach. */
+function closeFixtures(_f: Fixtures): void {}
+
+let seq = 0;
 
 afterEach(() => {
+  closeSessionDb();
+  seq = 0;
   for (const dir of tempDirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
 });
 
 describe('evaluateWikiLintGate', () => {
+  it('wiki lint gate reads and records through the mailbox, not an injected path', async () => {
+    const f = fixtures();
+    writeWikiFile(f, 'index.md');
+    setTreeMtime(f.wikiPath, OLD);
+    addOccurrence(f, 'task-1', 'completed', COMPLETED);
+    closeFixtures(f);
+
+    // The completion boundary comes back from the injected in-memory session
+    // pair — nothing was passed a file path, and no temp DB exists to read.
+    const result = evaluateWikiLintGate(SERIES_ID, f.wikiPath);
+    expect(result.data.lastCompletedRun).toBe(COMPLETED);
+    expect(result.wakeAgent).toBe(false);
+
+    // The gate itself no longer opens or names a session DB: it used to take
+    // inbound/outbound paths and construct its own bun:sqlite handles.
+    const source = await Bun.file(new URL('./wiki-lint-gate.ts', import.meta.url)).text();
+    expect(source).not.toContain('bun:sqlite');
+    expect(source).not.toContain('inbound.db');
+    expect(source).not.toContain('outbound.db');
+  });
+
   it('skips an empty wiki', () => {
     const f = fixtures();
     closeFixtures(f);
 
-    expect(evaluateWikiLintGate(SERIES_ID, f.wikiPath, f.inboundPath, f.outboundPath)).toEqual({
+    expect(evaluateWikiLintGate(SERIES_ID, f.wikiPath)).toEqual({
       wakeAgent: false,
       data: {
         reason: 'wiki-empty',
@@ -120,7 +130,7 @@ describe('evaluateWikiLintGate', () => {
     setTreeMtime(f.wikiPath, NEW);
     closeFixtures(f);
 
-    const result = evaluateWikiLintGate(SERIES_ID, f.wikiPath, f.inboundPath, f.outboundPath);
+    const result = evaluateWikiLintGate(SERIES_ID, f.wikiPath);
     expect(result.wakeAgent).toBe(false);
     expect(result.data.reason).toBe('wiki-empty');
     expect(result.data.contentFiles).toBe(0);
@@ -132,7 +142,7 @@ describe('evaluateWikiLintGate', () => {
     setTreeMtime(f.wikiPath, OLD);
     closeFixtures(f);
 
-    expect(evaluateWikiLintGate(SERIES_ID, f.wikiPath, f.inboundPath, f.outboundPath).wakeAgent).toBe(true);
+    expect(evaluateWikiLintGate(SERIES_ID, f.wikiPath).wakeAgent).toBe(true);
   });
 
   it('uses an explicit deployment baseline until the series has a completed run', () => {
@@ -141,7 +151,7 @@ describe('evaluateWikiLintGate', () => {
     setTreeMtime(f.wikiPath, OLD);
     closeFixtures(f);
 
-    const result = evaluateWikiLintGate(SERIES_ID, f.wikiPath, f.inboundPath, f.outboundPath, COMPLETED);
+    const result = evaluateWikiLintGate(SERIES_ID, f.wikiPath, COMPLETED);
     expect(result.wakeAgent).toBe(false);
     expect(result.data.baselineAt).toBe(COMPLETED);
   });
@@ -153,7 +163,7 @@ describe('evaluateWikiLintGate', () => {
     addOccurrence(f, 'task-1', 'completed', COMPLETED, 'pending');
     closeFixtures(f);
 
-    const result = evaluateWikiLintGate(SERIES_ID, f.wikiPath, f.inboundPath, f.outboundPath);
+    const result = evaluateWikiLintGate(SERIES_ID, f.wikiPath);
     expect(result.wakeAgent).toBe(false);
     expect(result.data.lastCompletedRun).toBe(COMPLETED);
   });
@@ -166,7 +176,7 @@ describe('evaluateWikiLintGate', () => {
     addOccurrence(f, 'task-1', 'completed', COMPLETED);
     closeFixtures(f);
 
-    const result = evaluateWikiLintGate(SERIES_ID, f.wikiPath, f.inboundPath, f.outboundPath);
+    const result = evaluateWikiLintGate(SERIES_ID, f.wikiPath);
     expect(result.wakeAgent).toBe(true);
     expect(result.data.latestWikiChange).toBe(NEW);
   });
@@ -180,7 +190,7 @@ describe('evaluateWikiLintGate', () => {
     addOccurrence(f, 'task-1', 'completed', COMPLETED);
     closeFixtures(f);
 
-    expect(evaluateWikiLintGate(SERIES_ID, f.wikiPath, f.inboundPath, f.outboundPath).wakeAgent).toBe(false);
+    expect(evaluateWikiLintGate(SERIES_ID, f.wikiPath).wakeAgent).toBe(false);
   });
 
   it('detects a deleted page from the containing directory mtime', () => {
@@ -192,7 +202,7 @@ describe('evaluateWikiLintGate', () => {
     fs.rmSync(deletedPath);
     closeFixtures(f);
 
-    expect(evaluateWikiLintGate(SERIES_ID, f.wikiPath, f.inboundPath, f.outboundPath).wakeAgent).toBe(true);
+    expect(evaluateWikiLintGate(SERIES_ID, f.wikiPath).wakeAgent).toBe(true);
   });
 
   it('does not let a failed occurrence suppress the next lint', () => {
@@ -202,6 +212,6 @@ describe('evaluateWikiLintGate', () => {
     addOccurrence(f, 'task-1', 'failed', NEW);
     closeFixtures(f);
 
-    expect(evaluateWikiLintGate(SERIES_ID, f.wikiPath, f.inboundPath, f.outboundPath).wakeAgent).toBe(true);
+    expect(evaluateWikiLintGate(SERIES_ID, f.wikiPath).wakeAgent).toBe(true);
   });
 });

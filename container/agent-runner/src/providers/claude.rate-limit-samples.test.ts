@@ -53,7 +53,7 @@ const {
 } = await import('./claude.js');
 const { MEMORY_SESSION_HOOK } = await import('../memory/session-hook.js');
 const { initTestSessionDb } = await import('../modules/mailbox/testing.js');
-const { getRateLimitSampleRows } = await import('../db/rate-limit-samples.js');
+const { getRateLimitSampleRows } = await import('../modules/mailbox/index.js');
 
 let tmp: string;
 let prevHome: string | undefined;
@@ -100,7 +100,11 @@ describe('planUsagePuller — feature detection', () => {
   });
 
   it('binds the method to its query when present', async () => {
-    const q = { [USAGE_CONTROL_METHOD]: async function (this: unknown) { return { self: this }; } };
+    const q = {
+      [USAGE_CONTROL_METHOD]: async function (this: unknown) {
+        return { self: this };
+      },
+    };
     const pull = planUsagePuller(q);
     expect(pull).not.toBeNull();
     expect((await pull!()) as unknown).toEqual({ self: q } as unknown as never);

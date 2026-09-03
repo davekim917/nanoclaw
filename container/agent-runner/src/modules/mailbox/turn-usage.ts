@@ -24,8 +24,8 @@
  * the fix's dated comment for how inflated pre-fix history is. Codex and
  * OpenCode already report per-turn figures and are written as they arrive.
  */
-import { getOutboundDb } from '../mailbox/sqlite/connection.js';
-import type { TurnUsageInfo } from '../providers/types.js';
+import { getOutboundDb } from '../../mailbox/sqlite/connection.js';
+import type { TurnUsageInfo } from '../../providers/types.js';
 
 export interface TurnUsageRow {
   id: number;

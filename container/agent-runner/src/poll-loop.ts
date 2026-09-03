@@ -14,8 +14,7 @@ import {
 } from './db/messages-in.js';
 import { getConfig } from './config.js';
 import { writeMessageOut } from './db/messages-out.js';
-import { recordTurnUsage } from './db/turn-usage.js';
-import { getInboundDb } from './mailbox/sqlite/connection.js';
+import { getAgentMailbox } from './mailbox/index.js';
 import { touchHeartbeat } from './heartbeat.js';
 import { clearStaleProcessingAcks } from './db/container-state.js';
 import {
@@ -42,6 +41,7 @@ import {
   getWorkContinuation,
   isWorkContinuationRunnable,
   markWorkContinuationRunning,
+  recordTurnUsage,
   releaseProcessingClaims,
   requeueWorkContinuationIfMatches,
   resetWorkContinuationForRealInbound,
@@ -2441,15 +2441,11 @@ async function sendToDestination(dest: DestinationEntry, body: string, routing: 
  */
 function resolveDestinationThread(channelType: string, platformId: string): { threadId: string | null } | null {
   try {
-    const db = getInboundDb();
-    const row = db
-      .prepare(
-        `SELECT thread_id FROM messages_in
-         WHERE channel_type = ? AND platform_id = ?
-         ORDER BY seq DESC LIMIT 1`,
-      )
-      .get(channelType, platformId) as { thread_id: string | null } | undefined;
-    if (row) return { threadId: row.thread_id };
+    // getLatestInboundRoute is the same newest-row-per-channel query this ran
+    // by hand. Its `inReplyTo` (the row id) is deliberately DROPPED here — see
+    // the poison note above; thread context is all this function may return.
+    const route = getAgentMailbox().operations.getLatestInboundRoute(channelType, platformId);
+    if (route) return { threadId: route.threadId };
   } catch (err) {
     log(`resolveDestinationThread error: ${err instanceof Error ? err.message : String(err)}`);
   }

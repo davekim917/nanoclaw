@@ -39,8 +39,16 @@ import {
   type ProviderHealthState,
 } from './container-state.js';
 import { getSessionId, getSessionSpawnTaskId } from './routing.js';
+import { getTurnUsageRows, recordTurnUsage, type TurnMeta, type TurnUsageRow } from './turn-usage.js';
+import {
+  getRateLimitSampleRows,
+  recordRateLimitSamples,
+  type RateLimitSample,
+  type RateLimitSampleRow,
+} from './rate-limit-samples.js';
 import { acknowledgeRepositoryMountBarrier } from './session-state.js';
 import { repositoryFenceAdmissionGate } from './admission.js';
+import { isMailboxTestMode } from './test-mode.js';
 
 export * from './admission.js';
 export * from './schema.js';
@@ -49,6 +57,10 @@ export * from './container-state.js';
 export * from './routing.js';
 export * from './reads.js';
 export * from './session-state.js';
+export * from './turn-usage.js';
+export * from './rate-limit-samples.js';
+export * from './wiki-lint.js';
+export { isMailboxTestMode, setMailboxTestMode } from './test-mode.js';
 export { INBOUND_KINDS, type InboundKind } from './inbound-kinds.js';
 
 /* ─── Admission ────────────────────────────────────────────────────────────── */
@@ -188,13 +200,17 @@ export interface NanoclawMailboxOperations extends MailboxOperations {
   setProviderHealthState(state: ProviderHealthState, outbound?: Database): void;
   clearProviderHealthState(outbound?: Database): void;
   writeResourceTelemetry(snapshot: Parameters<typeof writeResourceTelemetry>[0], outbound?: Database): void;
-}
-
-let testMode = false;
-
-/** Test harness only — skip the on-disk outbound warm-up in in-memory tests. */
-export function setMailboxTestMode(enabled: boolean): void {
-  testMode = enabled;
+  /** Per-turn token/cost accounting (outbound `turn_usage`). Never throws. */
+  recordTurnUsage(
+    provider: string,
+    usage?: Parameters<typeof recordTurnUsage>[1],
+    meta?: TurnMeta,
+    scope?: string,
+  ): void;
+  getTurnUsageRows(): TurnUsageRow[];
+  /** Account-level rate-limit utilization samples (outbound `rate_limit_samples`). Never throws. */
+  recordRateLimitSamples(samples: RateLimitSample[]): void;
+  getRateLimitSampleRows(): RateLimitSampleRow[];
 }
 
 export class NanoclawAgentMailbox extends SqliteAgentMailbox {
@@ -208,7 +224,7 @@ export class NanoclawAgentMailbox extends SqliteAgentMailbox {
    */
   override async start(key: MailboxSessionKey | null): Promise<void> {
     await super.start(key);
-    if (!testMode) prepareOutboundFile();
+    if (!isMailboxTestMode()) prepareOutboundFile();
     ensureNanoclawOutboundSchema(getOutboundDb());
   }
 
@@ -267,4 +283,8 @@ export class NanoclawAgentMailbox extends SqliteAgentMailbox {
   setProviderHealthState = setProviderHealthState;
   clearProviderHealthState = clearProviderHealthState;
   writeResourceTelemetry = writeResourceTelemetry;
+  recordTurnUsage = recordTurnUsage;
+  getTurnUsageRows = getTurnUsageRows;
+  recordRateLimitSamples = recordRateLimitSamples;
+  getRateLimitSampleRows = getRateLimitSampleRows;
 }

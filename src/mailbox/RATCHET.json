@@ -1,9 +1,4 @@
 [
-  "container/agent-runner/src/cli/ncl.ts",
-  "container/agent-runner/src/db/rate-limit-samples.ts",
-  "container/agent-runner/src/db/turn-usage.ts",
-  "container/agent-runner/src/poll-loop.ts",
-  "container/agent-runner/src/scheduling/wiki-lint-gate.ts",
   "src/caller-identity.ts",
   "src/cli/delivery-action.ts",
   "src/cli/resources/tasks.ts",

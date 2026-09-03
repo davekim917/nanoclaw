@@ -298,4 +298,70 @@ describe('runner mailbox seam', () => {
     expect(row.memory_current_bytes).toBe(1024);
     expect(row.memory_max_events).toBe(3);
   });
+
+  // R3: the usage writers moved out of db/turn-usage.ts and
+  // db/rate-limit-samples.ts, which held raw getOutboundDb() SQL, and are now
+  // named ops on NanoclawMailboxOperations. Exercised through `operations` so
+  // the test fails if the ops are only module functions and never reached the
+  // interface.
+  test('usage and rate-limit samples are written through named module ops and readable back', () => {
+    initTestSessionDb();
+    const operations = getAgentMailbox().operations as NanoclawMailboxOperations;
+
+    operations.recordTurnUsage(
+      'codex',
+      { model: 'gpt-5.4', inputTokens: 120, outputTokens: 34, costUsd: 0.5 },
+      {
+        turnId: 'turn-r3',
+        steps: 7,
+        durationMs: 1234,
+        trigger: 'chat',
+        rateLimitType: null,
+        rateLimitUtilization: null,
+        rateLimitResetsAt: null,
+      },
+    );
+    const usage = operations.getTurnUsageRows();
+    expect(usage).toHaveLength(1);
+    expect(usage[0]).toMatchObject({
+      provider: 'codex',
+      model: 'gpt-5.4',
+      turn_id: 'turn-r3',
+      steps: 7,
+      duration_ms: 1234,
+      trigger: 'chat',
+      input_tokens: 120,
+      output_tokens: 34,
+      cost_usd: 0.5,
+    });
+
+    operations.recordRateLimitSamples([
+      {
+        source: 'usage_pull',
+        account: 'oauth_2',
+        credentialSet: 'group:acme',
+        lane: 'interactive',
+        subscriptionType: 'max',
+        available: true,
+        limitType: 'five_hour',
+        utilization: 0.42,
+        resetsAt: '2026-09-03T05:00:00.000Z',
+        status: 'allowed',
+      },
+    ]);
+    const samples = operations.getRateLimitSampleRows();
+    expect(samples).toHaveLength(1);
+    expect(samples[0]).toMatchObject({
+      source: 'usage_pull',
+      account: 'oauth_2',
+      credential_set: 'group:acme',
+      lane: 'interactive',
+      subscription_type: 'max',
+      available: 1,
+      limit_type: 'five_hour',
+      utilization: 0.42,
+      resets_at: '2026-09-03T05:00:00.000Z',
+      status: 'allowed',
+    });
+  });
 });
