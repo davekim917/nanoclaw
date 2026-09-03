@@ -27,8 +27,35 @@ import { describe, expect, it } from 'vitest';
 const REPO_ROOT = path.resolve(__dirname, '..');
 const STANDALONE_ROOTS = ['setup', 'scripts'];
 
-/** Session-provisioning entry points — each reaches getAgentMailbox().prepare(). */
-const PROVISIONING_NAMES = ['initSessionFolder', 'resolveSession', 'resolveTaskSession'];
+/**
+ * `session-manager` exports whose EXECUTION reaches `getAgentMailbox()` from a
+ * standalone entrypoint.
+ *
+ * Provisioning was the original rule, and it was too narrow: mailbox seam PR 7
+ * put `reconcilePendingUpgradeContexts` on `withExistingMailboxSession`, which
+ * does not provision but still calls `getAgentMailbox()` and still throws
+ * `No agent mailbox registered`. `scripts/migrate-workgroup-memory.ts apply`
+ * calls it directly, after the memory cutover has already mutated the install
+ * — so it failed only once the damage was done. Codex round 2 on #297 caught
+ * what this guard did not.
+ *
+ * The seeds are deliberately NOT "every name that touches the seam".
+ * Seeding `writeSessionMessage` and the other pre-existing seam users pulls
+ * nine scripts into the closure on import-graph reachability alone — and
+ * reachability is not execution. Exactly one of those nine (this finding's)
+ * has a demonstrated path from its CLI body to `getAgentMailbox()`; the other
+ * eight were equally reachable before this seam existed, so if they are broken
+ * they are broken independently and want their own investigation rather than a
+ * speculative `compose.js` import bolted onto eight operational entrypoints.
+ *
+ * Seed a name here once a standalone entrypoint is shown to actually call it.
+ */
+const PROVISIONING_NAMES = [
+  'initSessionFolder',
+  'resolveSession',
+  'resolveTaskSession',
+  'reconcilePendingUpgradeContexts',
+];
 
 const COMPOSITION_IMPORT = /['"][^'"]*mailbox\/compose\.js['"]/;
 

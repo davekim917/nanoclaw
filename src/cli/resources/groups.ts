@@ -117,7 +117,7 @@ registerResource({
         '+ skills + paused recurring tasks). Use --folder <slug> and --name <display name>.',
       handler: async (args) => {
         if (args.template) {
-          return createAgentFromTemplate(String(args.template), {
+          return await createAgentFromTemplate(String(args.template), {
             name: args.name ? String(args.name) : undefined,
           });
         }

@@ -32,7 +32,7 @@ export interface CreateAgentOptions {
  *
  * Returns the created group; the caller wires it to a channel as usual.
  */
-export function createAgentFromTemplate(ref: string, opts?: CreateAgentOptions): AgentGroup {
+export async function createAgentFromTemplate(ref: string, opts?: CreateAgentOptions): Promise<AgentGroup> {
   const dir = resolveLocalTemplate(ref);
   const tpl = parseTemplate(dir);
   const tasks = tpl.tasks.map((task) => {
@@ -90,7 +90,7 @@ export function createAgentFromTemplate(ref: string, opts?: CreateAgentOptions):
 
   // Template tasks require explicit activation. The later welcome flow can
   // present these exact paused tasks and resume only the ones the user accepts.
-  for (const task of tasks) createScheduledTask(id, task, { status: 'paused' });
+  for (const task of tasks) await createScheduledTask(id, task, { status: 'paused' });
 
   return group;
 }

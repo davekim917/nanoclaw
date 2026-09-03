@@ -31,6 +31,7 @@ import { getActiveSessions } from './db/sessions.js';
 import { getAgentGroup } from './db/agent-groups.js';
 import {
   SessionDbMissingError,
+  readSessionOutbound,
   SessionDbUnopenableError,
   type ForkContainerStateRow as ContainerState,
   type NanoclawMailboxSession,

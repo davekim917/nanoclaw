@@ -19,16 +19,15 @@ import fs from 'fs';
 import { DATA_DIR, TIMEZONE } from '../../config.js';
 import { getDb } from '../../db/connection.js';
 import { getSession } from '../../db/sessions.js';
-import { openInboundDb } from '../../db/session-db.js';
 import {
   readSessionInbound,
   readSessionOutbound,
+  type NanoclawMailboxSession,
   type ScheduledTaskRow,
   type SessionReadLocation,
 } from '../../modules/mailbox/index.js';
-import { cancelSeriesWithStrandClear, pauseTask, resumeTask, updateTask } from '../../modules/scheduling/db.js';
 import { wakeContainer } from '../../container-runner.js';
-import { admitDueTaskContexts } from '../../session-manager.js';
+import { admitDueTaskContexts, withExistingMailboxSession } from '../../session-manager.js';
 import { log } from '../../log.js';
 import { parseUtcTimestampMs } from '../../thread-context.js';
 import { emitDashboardEvent } from './events.js';
@@ -182,6 +181,19 @@ function resolveTarget(
   };
 }
 
+/**
+ * Run one mutation against the target's inbound mailbox.
+ *
+ * Existing-only by construction: `resolveTarget` has already proved the file
+ * is there and 503'd if not, so `undefined` here means the session vanished
+ * between the gate and the write. That collapses to 0 touched, which every
+ * caller already answers with the same 409 stale_key the pre-seam open's
+ * throw produced.
+ */
+function withMutationSession(t: ResolvedTarget, action: (mailbox: NanoclawMailboxSession) => number): Promise<number> {
+  return withExistingMailboxSession(t.agentGroupId, t.sessionId, action).then((touched) => touched ?? 0);
+}
+
 /** Emit the post-mutation SSE frame (non-null agent_group_id) + invalidate cache. */
 function afterMutation(agentGroupId: string, sessionId: string): void {
   try {
@@ -285,13 +297,11 @@ export const editHandler: AuthHandler = async (req, params, ctx) => {
     update.processAfter = nextSlot(body.cron, nowMs);
   }
 
-  const db = openInboundDb(t.inboundPath);
-  let touched: number;
-  try {
-    touched = updateTask(db, t.seriesId, update);
-  } finally {
-    db.close();
-  }
+  // Existing-only: a mutation must never provision the session it edits
+  // (invariant I-10). `undefined` reads as "nothing was touched", which the
+  // stale-key branch below already answers — the same 409 the pre-seam open
+  // produced for a session that vanished under the gate.
+  const touched = await withMutationSession(t, (mailbox) => mailbox.updateTask(t.seriesId, update));
   if (touched === 0) return json({ error: 'stale_key', reason: 'stale_key' }, 409);
 
   writeAudit(getDb(), {
@@ -326,13 +336,7 @@ export const pauseHandler: AuthHandler = async (_req, params, ctx) => {
   });
   if (!verdict.allowed) return verdictResponse(verdict);
 
-  const db = openInboundDb(t.inboundPath);
-  let touched: number;
-  try {
-    touched = pauseTask(db, t.seriesId);
-  } finally {
-    db.close();
-  }
+  const touched = await withMutationSession(t, (mailbox) => mailbox.pauseTask(t.seriesId));
   if (touched === 0) return json({ error: 'stale_key', reason: 'stale_key' }, 409);
 
   writeAudit(getDb(), {
@@ -361,19 +365,15 @@ export const resumeHandler: AuthHandler = async (_req, params, ctx) => {
   });
   if (!verdict.allowed) return verdictResponse(verdict);
 
-  const db = openInboundDb(t.inboundPath);
-  let touched: number;
-  try {
+  const touched = await withMutationSession(t, (mailbox) => {
     // §4.7: recompute process_after to the next FUTURE slot BEFORE flipping to
     // pending (skip-don't-replay, D3) — a paused-past-its-slot series must not
     // fire immediately on resume.
     if (t.live.recurrence) {
-      updateTask(db, t.seriesId, { processAfter: nextSlot(t.live.recurrence, nowMs) });
+      mailbox.updateTask(t.seriesId, { processAfter: nextSlot(t.live.recurrence, nowMs) });
     }
-    touched = resumeTask(db, t.seriesId);
-  } finally {
-    db.close();
-  }
+    return mailbox.resumeTask(t.seriesId);
+  });
   if (touched === 0) return json({ error: 'stale_key', reason: 'stale_key' }, 409);
 
   writeAudit(getDb(), {
@@ -418,43 +418,21 @@ export const runNowHandler: AuthHandler = async (req, params, ctx) => {
 
   // Fire: process_after = now, then wake the container. Recurrence advances
   // normally on completion (an early fire does not shift the schedule — §4.6).
-  const db = openInboundDb(t.inboundPath);
-  let touched: number;
   let admittedTarget = false;
-  try {
-    touched = updateTask(db, t.seriesId, { processAfter: new Date(nowMs).toISOString() });
-    if (touched > 0) {
-      admitDueTaskContexts(db, t.agentGroupId, t.sessionId);
-      admittedTarget =
-        db
-          .prepare(
-            `SELECT 1
-               FROM messages_in AS task
-               JOIN messages_in AS recall
-                 ON recall.id = 'recall-' || task.id
-                AND recall.seq = task.seq - 2
-                AND recall.kind = 'system'
-                AND recall.trigger = 0
-              WHERE task.id = ?
-                AND task.kind = 'task'
-                AND task.status = 'pending'
-                AND task.trigger = 1`,
-          )
-          .get(t.live.id) !== undefined;
+  const touched = await withMutationSession(t, (mailbox) => {
+    const n = mailbox.updateTask(t.seriesId, { processAfter: new Date(nowMs).toISOString() });
+    if (n > 0) {
+      admitDueTaskContexts(mailbox, t.agentGroupId, t.sessionId);
+      admittedTarget = mailbox.taskPairIsAdmitted(t.live.id);
       if (!admittedTarget) {
         // Do not silently turn a failed run-now request into a later run-now.
         // Keep the row inert (updateTask already invalidated stale recall) but
         // restore its prior schedule so only the pre-existing fire remains.
-        db.prepare(
-          `UPDATE messages_in
-              SET process_after = ?
-            WHERE id = ? AND kind = 'task' AND status = 'pending' AND trigger = 0`,
-        ).run(t.live.process_after, t.live.id);
+        mailbox.restoreInertTaskSchedule(t.live.id, t.live.process_after);
       }
     }
-  } finally {
-    db.close();
-  }
+    return n;
+  });
   if (touched === 0) return json({ error: 'stale_key', reason: 'stale_key' }, 409);
   if (!admittedTarget) {
     return json(
@@ -506,12 +484,10 @@ export const cancelHandler: AuthHandler = async (_req, params, ctx) => {
 
   let touched: number;
   try {
-    const db = openInboundDb(inboundPath);
-    try {
-      touched = cancelSeriesWithStrandClear(db, decoded.seriesId);
-    } finally {
-      db.close();
-    }
+    touched =
+      (await withExistingMailboxSession(decoded.agentGroupId, decoded.sessionId, (mailbox) =>
+        mailbox.cancelSeriesWithStrandClear(decoded.seriesId),
+      )) ?? 0;
   } catch (err) {
     log.warn('scheduled-mutations: cancel failed', { err: err instanceof Error ? err.message : String(err) });
     return json({ error: 'session_unreadable', reason: 'session_unreadable' }, 503);

@@ -6,7 +6,7 @@ import Database from 'better-sqlite3';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { createAgentGroup, getDb, initTestDb, runMigrations } from '../db/index.js';
-import { ensureSchema } from '../db/session-db.js';
+import { ensureSchema } from '../modules/mailbox/schema.js';
 import { guard } from '../guard/index.js';
 import type { AuthedRequestContext } from './router.js';
 

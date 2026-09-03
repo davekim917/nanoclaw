@@ -9,9 +9,9 @@
 import path from 'path';
 import http from 'http';
 import { createHash } from 'crypto';
-import Database from 'better-sqlite3';
 import type { Stats } from 'node:fs';
 
+import { readSessionInbound } from '../../modules/mailbox/index.js';
 import type { AuthedRequestContext, AuthHandler } from '../router.js';
 import { log } from '../../log.js';
 
@@ -228,7 +228,7 @@ export function startSSEFeed(): void {
         if (!agentGroupId || !sessionId) return;
         if (filename !== 'inbound.db' && filename !== 'outbound.db') return;
 
-        _emitInboundChangeEvent(agentGroupId, sessionId, filePath);
+        _emitInboundChangeEvent(agentGroupId, sessionId, filename === 'inbound.db');
       });
     })
     .catch(() => {
@@ -236,22 +236,21 @@ export function startSSEFeed(): void {
     });
 }
 
-function _emitInboundChangeEvent(agentGroupId: string, sessionId: string, filePath: string): void {
+function _emitInboundChangeEvent(agentGroupId: string, sessionId: string, isInbound: boolean): void {
   let messageId = `fs:${agentGroupId}:${sessionId}:${Date.now()}`;
-  try {
-    const db = new Database(filePath, { readonly: true });
-    db.pragma('journal_mode = DELETE');
-    db.pragma('busy_timeout = 500');
+  // Only an inbound.db change can name the row that changed. An outbound.db
+  // touch keeps the synthetic id, exactly as before the seam — the pre-seam
+  // code opened whichever file moved and asked it for `messages_in`, which on
+  // outbound.db threw and fell through to this same fallback.
+  if (isInbound) {
     try {
-      const row = db.prepare('SELECT id FROM messages_in ORDER BY seq DESC LIMIT 1').get() as
-        | { id: string }
-        | undefined;
-      if (row) messageId = row.id;
-    } finally {
-      db.close();
+      const latest = readSessionInbound({ agentGroupId, sessionId }, (mailbox) => mailbox.latestInboundMessageId(), {
+        busyTimeoutMs: 500,
+      });
+      if (latest) messageId = latest;
+    } catch {
+      // ignore — use timestamp-based id
     }
-  } catch {
-    // ignore — use timestamp-based id
   }
 
   emitDashboardEvent('inbound_message', {

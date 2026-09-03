@@ -79,11 +79,26 @@ import {
 } from './ops/lookups.js';
 import { listTurnUsageSince, type SessionTurnUsageRow } from './ops/reads.js';
 import {
+  admitDueRow,
+  admitPendingUpgradeRow,
+  deferForFreshContextRetry,
+  demoteUnpairedLegacyTasks,
+  listDueAdmissionRows,
+  listUnpairedPendingUpgradeRows,
+  restoreInertTaskSchedule,
+  taskPairIsAdmitted,
+  type DueAdmissionRow,
+  type PendingUpgradeRow,
+} from './ops/admission.js';
+import {
   armNextTask,
   cancelSeriesWithStrandClear,
+  getCliTaskRow,
   getCompletedRecurring,
+  getCreatedTaskRow,
   insertRecurrence,
   insertTaskRow,
+  listCliTaskSeries,
   listDueTaskRows,
   resolvePendingTask,
   restoreTaskRow,
@@ -91,6 +106,8 @@ import {
   setPendingTaskContent,
   updateTask,
   upsertTaskSeries,
+  type CliTaskRow,
+  type CreatedTaskRow,
   type HostGatedTaskRow,
   type RecurringMessage as ForkRecurringMessage,
   type TaskRowInsert,
@@ -186,12 +203,15 @@ export {
   restoreTaskRow,
   resumeTask,
   updateTask,
+  type CliTaskRow,
+  type CreatedTaskRow,
   type HostGatedTaskRow,
   type RecurringMessage,
   type TaskRowInsert,
   type TaskRowSnapshot,
   type TaskUpdate,
 } from './ops/tasks.js';
+export type { DueAdmissionRow, PendingUpgradeRow } from './ops/admission.js';
 export {
   CLOSE_REASON_MAX_CHARS,
   clearWorkContinuation,
@@ -224,7 +244,15 @@ export {
   type SessionReadLocation,
   type SessionReadOptions,
 } from './read-only.js';
-export type { OutboundSystemRow, ScheduledTaskRow, SessionTurnUsageRow, TaskFireRow } from './ops/reads.js';
+export type {
+  MessageTailRow,
+  OutboundSystemRow,
+  ScheduledTaskRow,
+  SessionTurnUsageRow,
+  TaskDeliveryRoute,
+  TaskFireRow,
+  TaskRoutingStamp,
+} from './ops/reads.js';
 export type { ContainerState, ProcessingClaim } from './ops/sweep.js';
 
 /**
@@ -404,6 +432,26 @@ export interface NanoclawMailboxSession extends MailboxSession {
   listDueTaskRows(): HostGatedTaskRow[];
   resolvePendingTask(taskId: string, status: 'completed' | 'failed'): void;
   setPendingTaskContent(taskId: string, content: string): void;
+  /**
+   * The `ncl tasks` board's own series view. Not upstream's `listLiveTasks` /
+   * `getTask`: those pick a series' representative row by a paused-or-future
+   * rank and return a `TaskRecord`, which carries no routing columns — and the
+   * CLI's table shows where a task posts.
+   */
+  listCliTaskSeries(status?: 'pending' | 'paused'): CliTaskRow[];
+  getCliTaskRow(id: string): CliTaskRow | undefined;
+  getCreatedTaskRow(id: string): CreatedTaskRow | undefined;
+
+  // --- host-owned due admission -------------------------------------------
+  /** The recall POLICY stays with session-manager; these commit its decision. */
+  demoteUnpairedLegacyTasks(): void;
+  listDueAdmissionRows(): DueAdmissionRow[];
+  admitDueRow(recall: MessageInsert, taskId: string): boolean;
+  listUnpairedPendingUpgradeRows(): PendingUpgradeRow[];
+  admitPendingUpgradeRow(recall: MessageInsert, messageId: string): boolean;
+  deferForFreshContextRetry(messageId: string, backoffSec: number): void;
+  taskPairIsAdmitted(taskId: string): boolean;
+  restoreInertTaskSchedule(taskId: string, processAfter: string | null): void;
 
   // --- fork-only recall pairing -------------------------------------------
   readProviderRecallState(provider: string): ProviderRecallState;
@@ -451,29 +499,6 @@ export interface NanoclawMailboxSession extends MailboxSession {
   hasNonStatusReplyTo(messageId: string): boolean;
   /** The fork's `MAX(seq) + 2` direct write; opens the writable outbound handle. */
   writeOutboundDirect(message: DirectOutboundRow): void;
-
-  // --- TRANSITIONAL: raw handles for callers not yet on the seam ----------
-  /**
-   * The open inbound / readable outbound handles behind this session.
-   *
-   * These exist for exactly one reason: a handful of helpers the host sweep
-   * calls still take a `Database.Database` and live in files owned by other
-   * PRs of this series (`modules/scheduling/*`, `dashboard/thread-close.ts`,
-   * `session-manager.ts`, `db/usage.ts`). Handing them the session's own
-   * handle keeps the sweep on ONE open per session per duty instead of
-   * reopening the file beside a live session.
-   *
-   * Every use is a debt, not an API: `src/mailbox-seam-ratchet.ts` counts
-   * these names as raw access, so a file that calls one stays on the
-   * allowlist until its callee moves behind the seam. PR 7 deletes both.
-   *
-   * The handle is valid only for the duration of the action; never store it.
-   *
-   * @deprecated Removed in mailbox seam PR 7.
-   */
-  legacyInboundHandle(): Database.Database;
-  /** @deprecated Removed in mailbox seam PR 7. See `legacyInboundHandle`. */
-  legacyOutboundHandle(): Database.Database;
 }
 
 export type NanoclawMailboxAction<T> = (mailbox: NanoclawMailboxSession) => T | Promise<T>;
@@ -743,6 +768,18 @@ function forkOps(
     listDueTaskRows: () => listDueTaskRows(inbound),
     resolvePendingTask: (taskId, status) => resolvePendingTask(inbound, taskId, status),
     setPendingTaskContent: (taskId, content) => setPendingTaskContent(inbound, taskId, content),
+    listCliTaskSeries: (status) => listCliTaskSeries(inbound, status),
+    getCliTaskRow: (id) => getCliTaskRow(inbound, id),
+    getCreatedTaskRow: (id) => getCreatedTaskRow(inbound, id),
+
+    demoteUnpairedLegacyTasks: () => demoteUnpairedLegacyTasks(inbound),
+    listDueAdmissionRows: () => listDueAdmissionRows(inbound),
+    admitDueRow: (recall, taskId) => admitDueRow(inbound, recall, taskId),
+    listUnpairedPendingUpgradeRows: () => listUnpairedPendingUpgradeRows(inbound),
+    admitPendingUpgradeRow: (recall, messageId) => admitPendingUpgradeRow(inbound, recall, messageId),
+    deferForFreshContextRetry: (messageId, backoffSec) => deferForFreshContextRetry(inbound, messageId, backoffSec),
+    taskPairIsAdmitted: (taskId) => taskPairIsAdmitted(inbound, taskId),
+    restoreInertTaskSchedule: (taskId, processAfter) => restoreInertTaskSchedule(inbound, taskId, processAfter),
 
     readProviderRecallState: (provider) => readProviderRecallState(readableOutbound(), provider),
     listOpenChatContents: () => listOpenChatContents(inbound),
@@ -784,8 +821,5 @@ function forkOps(
       readOutbound(false, (outbound) => outboundHasRecentContentLike(outbound, marker, withinSeconds)),
     hasNonStatusReplyTo: (messageId) => readOutbound(false, (outbound) => hasNonStatusReplyTo(outbound, messageId)),
     writeOutboundDirect: (message) => writeOutboundDirectRow(writableOutbound(), message),
-
-    legacyInboundHandle: () => inbound,
-    legacyOutboundHandle: () => readableOutbound(),
   };
 }

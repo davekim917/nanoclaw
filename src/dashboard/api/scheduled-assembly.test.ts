@@ -14,7 +14,8 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import Database from 'better-sqlite3';
 
 import { initTestDb, closeDb, getDb } from '../../db/connection.js';
-import { ensureSchema, openInboundDb } from '../../db/session-db.js';
+import { openInboundDb } from '../../modules/mailbox/openers.js';
+import { ensureSchema } from '../../modules/mailbox/schema.js';
 import { invalidateScheduledCache, getScheduledCache, SWEEP_INTERVAL_MS } from './scheduled-shared.js';
 import {
   assembleSnapshot,
