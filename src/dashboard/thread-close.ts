@@ -586,6 +586,31 @@ async function finalizeSession(session: CloseSession, threadId: string, deps: Th
   const owns = (id: string): boolean =>
     deps.isContainerRunning ? deps.isContainerRunning(id) : containerOwnsOutbound(id);
 
+  /**
+   * Clear, re-sample ownership, and archive only if nobody took the session.
+   *
+   * THE settle path — both branches below call it and neither hand-rolls the
+   * sequence. Three separate review findings were the same defect on three
+   * different branches of this function: a clear that awaits, and an archive
+   * decided from a read taken before it. Writing the sequence once is what
+   * stops a fourth branch from getting it wrong.
+   *
+   * The re-sample is synchronous and sits immediately after the clear resolves,
+   * with no await before the archive. `still-owned` means a wake landed inside
+   * the clear: the caller must NOT archive, because archiving is display-only
+   * and would leave that container working in a thread the operator sees as
+   * closed. Leaving the closure `finalizing` sends the next tick down the kill
+   * path against the new container, which is the correct answer for both
+   * callers.
+   */
+  type SettleOutcome = 'settled' | 'not-cleared' | 'still-owned';
+  const clearThenSettle = async (): Promise<SettleOutcome> => {
+    if (!(await clear(session, threadId))) return 'not-cleared';
+    if (owns(session.id)) return 'still-owned';
+    archive(session.id); // (e)
+    return 'settled';
+  };
+
   // Ownership is read HERE, and it decides the ORDER, not whether to clear.
   //
   // No container: nothing to stop, so clear and then archive — but the clear
@@ -601,15 +626,10 @@ async function finalizeSession(session: CloseSession, threadId: string, deps: Th
   // ownership question is re-asked here, after the clear resolves and
   // immediately before the archive, with no await in between.
   if (!owns(session.id)) {
-    if (!(await clear(session, threadId))) return;
-    if (!owns(session.id)) {
-      archive(session.id); // (e)
-      return;
-    }
-    // A container took the session while we cleared. Fall through to the kill
-    // path rather than archiving around it. The clear runs again in `onExit`;
-    // it is idempotent — the DELETEs are no-ops on an already-empty key — and
-    // this time it runs with the process provably gone.
+    // `still-owned` falls through to the kill path below rather than archiving
+    // around the container that just took the session; the clear runs again in
+    // `onExit`, idempotent, with the process provably gone.
+    if ((await clearThenSettle()) !== 'still-owned') return;
   }
 
   // (c) KILL FIRST, then clear once the container is provably gone.
@@ -633,12 +653,15 @@ async function finalizeSession(session: CloseSession, threadId: string, deps: Th
   // the closure advances on a later tick; when it fires synchronously (an
   // already-stopped container, or an injected kill) awaiting it keeps kill,
   // clear and archive ordered before this function returns.
+  //
+  // Through the same settle path: exit does not mean nobody else took the
+  // session. A concurrent group or provider restart can register its own
+  // `onExit` respawn for this process and `wakeContainer` while we sit in the
+  // clear, and archiving then would strand that replacement in a closed thread
+  // — later closure ticks skip an archived session entirely.
   let exitWork: Promise<void> | undefined;
   kill(session.id, `thread close ${threadId}`, () => {
-    exitWork = (async () => {
-      if (!(await clear(session, threadId))) return;
-      archive(session.id); // (e)
-    })();
+    exitWork = clearThenSettle().then(() => undefined);
   });
   await exitWork;
 }

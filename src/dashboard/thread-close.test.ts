@@ -478,11 +478,16 @@ describe('the close sequence order', () => {
   } {
     const calls: string[] = [];
     const over = typeof build === 'function' ? build(calls) : build;
+    // Ownership is now re-sampled AFTER the kill, so the stub has to model what
+    // the real registry does: `killContainer`'s onExit fires once the process
+    // is gone, and `isContainerRunning` is false from then on. A constant
+    // `true` would claim the container survived its own kill.
+    const live = { owned: true };
     return {
       calls,
       deps: {
         now: NOW,
-        isContainerRunning: () => true,
+        isContainerRunning: () => live.owned,
         readProposal: () => null,
         clearContinuation: () => {
           calls.push('clear');
@@ -490,6 +495,7 @@ describe('the close sequence order', () => {
         },
         killContainer: (_id, _reason, onExit) => {
           calls.push('kill');
+          live.owned = false;
           onExit?.();
         },
         archiveSession: (id) => {
@@ -597,11 +603,13 @@ describe('the close sequence order', () => {
     // inside `onExit`, so at the moment of the kill the promise is still
     // there. That is the point — the host does not write outbound.db until the
     // container that owns it is provably gone.
+    const live = { owned: true };
     await advanceThreadClosures({
       now: NOW,
-      isContainerRunning: () => true,
+      isContainerRunning: () => live.owned,
       readProposal: () => null,
       killContainer: (_id, _reason, onExit) => {
+        live.owned = false; // the process is gone once onExit fires
         const db = new Database(dbPathFor('ag1', 's1', 'outbound.db'), { readonly: true });
         continuationAtKill =
           db.prepare("SELECT value FROM session_state WHERE key = 'work_continuation'").get() ?? null;
@@ -783,7 +791,9 @@ describe('the close sequence order', () => {
       isContainerRunning: () => live.owned,
       clearContinuation: async () => {
         calls.push('clear');
-        live.owned = true; // the wake lands here
+        // ONE wake, inside the FIRST clear. The post-exit clear must not flip
+        // it again — that would be a second wake, a different scenario.
+        if (calls.filter((c) => c === 'clear').length === 1) live.owned = true;
         return true;
       },
       killContainer: (id, _reason, onExit) => {
@@ -803,6 +813,56 @@ describe('the close sequence order', () => {
     expect(calls).toEqual(['clear', 'kill', 'clear', 'archive']);
     expect(archived).toBe('s1');
     expect(calls.indexOf('kill')).toBeLessThan(calls.indexOf('archive'));
+  });
+
+  /**
+   * A respawn that lands inside the POST-EXIT clear must not be archived
+   * around either — the third branch of the same defect.
+   *
+   * `onExit` proves the old process is gone, not that nobody else took the
+   * session: a concurrent group or provider restart can register its own
+   * `onExit` respawn for this process and `wakeContainer` while we sit in the
+   * clear. Archiving then strands that replacement in a thread later closure
+   * ticks skip entirely, because an archived session is skipped.
+   *
+   * Both branches run through `clearThenSettle`, so this is the same guard the
+   * other two cases exercise, reached from the exit callback.
+   */
+  it('does not archive when a replacement wakes inside the post-exit clear', async () => {
+    startClose();
+    const live = { owned: true };
+    const calls: string[] = [];
+    let archived: string | null = null;
+
+    await advanceThreadClosures({
+      now: NOW,
+      readProposal: () => null,
+      isContainerRunning: () => live.owned,
+      killContainer: (_id, _reason, onExit) => {
+        calls.push('kill');
+        live.owned = false; // this process is gone
+        onExit?.();
+      },
+      clearContinuation: async () => {
+        calls.push('clear');
+        live.owned = true; // a restart's respawn lands inside the clear
+        return true;
+      },
+      archiveSession: (id) => {
+        calls.push('archive');
+        archived = id;
+        return true;
+      },
+    });
+
+    // Killed and cleared, but NOT archived: something owns the session again.
+    expect(calls).toEqual(['kill', 'clear']);
+    expect(archived).toBeNull();
+    // Left finalizing, so the next tick takes the kill path against the
+    // replacement rather than skipping an archived session forever.
+    expect(getDb().prepare('SELECT state FROM thread_closures WHERE thread_id = ?').get(THREAD)).toMatchObject({
+      state: 'finalizing',
+    });
   });
 
   it('is idempotent — a second tick over an already-closed thread does nothing', async () => {
