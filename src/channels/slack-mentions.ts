@@ -639,6 +639,101 @@ export async function upgradeSlackBotProfile(
  * untouched (better a raw id the model treats as opaque than a wrong name).
  */
 /**
+ * Blank out Slack code regions so mention detection only sees prose.
+ *
+ * Was a single regex — `` /(`{3,}[\s\S]*?`{3,}|``[\s\S]*?``|`[^`\n]+`)/g ``.
+ * Its `` `{3,}…`{3,} `` alternative accepted ANY run of 3+ backticks as a
+ * closer, so a longer fence wrapping content that itself contained a
+ * shorter 3+ run closed early and leaked the rest as prose (#256, e.g.
+ * ` ```` ```<@UBOT> ship ```` `). This scanner instead requires the closer
+ * to be a run at least as long as the opener, which is what actually closes
+ * a fence — the same rule CommonMark uses.
+ *
+ * - A run of 3+ backticks opens a fence; it isn't required to sit alone on
+ *   a line (Slack's own preformatting doesn't require that either, and
+ *   neither did the regex this replaces). It's closed by the next run of
+ *   backticks whose length is >= the opener's. An opener with no such
+ *   closer runs to the end of the text — an unterminated fence is still
+ *   code, never prose, matching CommonMark's own choice here.
+ * - A run of 1-2 backticks is an inline code span, closed by the next run
+ *   of EXACTLY the same length, not crossing a newline (preserves the
+ *   original single-backtick behavior; Slack doesn't render a multi-line
+ *   single-backtick span as code, and there's no case data that a
+ *   multi-line double-backtick span behaves differently).
+ * - Tildes are NOT fence delimiters here: Slack's renderer has no `~~~`
+ *   code-fence syntax, only backticks, so a mention wrapped in tildes still
+ *   renders live and still pings — treating it as protected would be a new
+ *   false negative, not a fix.
+ */
+function stripSlackCodeRegions(text: string): string {
+  let out = '';
+  let i = 0;
+  const n = text.length;
+  while (i < n) {
+    if (text[i] !== '`') {
+      out += text[i];
+      i++;
+      continue;
+    }
+    let j = i;
+    while (j < n && text[j] === '`') j++;
+    const runLen = j - i;
+
+    if (runLen >= 3) {
+      // Fence: find the next run of backticks with length >= runLen.
+      let k = j;
+      let closeEnd = -1;
+      while (k < n) {
+        if (text[k] !== '`') {
+          k++;
+          continue;
+        }
+        let m = k;
+        while (m < n && text[m] === '`') m++;
+        if (m - k >= runLen) {
+          closeEnd = m;
+          break;
+        }
+        k = m;
+      }
+      out += ' ';
+      i = closeEnd === -1 ? n : closeEnd; // unterminated fence: rest is code
+      continue;
+    }
+
+    // Inline code span (1-2 backticks): closed by the next run of exactly
+    // the same length, only on this line.
+    let k = j;
+    let closeStart = -1;
+    let closeEnd = -1;
+    while (k < n && text[k] !== '\n') {
+      if (text[k] !== '`') {
+        k++;
+        continue;
+      }
+      let m = k;
+      while (m < n && text[m] === '`') m++;
+      if (m - k === runLen) {
+        closeStart = k;
+        closeEnd = m;
+        break;
+      }
+      k = m;
+    }
+    if (closeStart === -1) {
+      // No same-length closer on this line — not a code span; keep the
+      // backtick run as literal text and resume scanning after it.
+      out += text.slice(i, j);
+      i = j;
+    } else {
+      out += ' ';
+      i = closeEnd;
+    }
+  }
+  return out;
+}
+
+/**
  * True when the bot's mention appears OUTSIDE code regions of the inbound
  * text. Slack's markdown_text parser fires app_mention even for a literal
  * `@name` inside backticks (documented gate syntax like \`@gatebot ship 42\`),
@@ -647,7 +742,7 @@ export async function upgradeSlackBotProfile(
  * @name (resolveInboundSlackIds), so both forms are checked.
  */
 export function slackMentionOutsideCode(text: string, identity: SlackBotIdentity): boolean {
-  const outsideCode = text.replace(/(`{3,}[\s\S]*?`{3,}|``[\s\S]*?``|`[^`\n]+`)/g, ' ');
+  const outsideCode = stripSlackCodeRegions(text);
   if (outsideCode.includes(`<@${identity.userId}>`)) return true;
   const lower = outsideCode.toLocaleLowerCase('en-US');
   return [identity.displayName, identity.realName, identity.username]

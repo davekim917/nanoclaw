@@ -966,6 +966,49 @@ describe('slackMentionOutsideCode', () => {
   });
 });
 
+// #256 — the regex this scanner replaced accepted ANY run of 3+ backticks
+// as a fence closer, so a longer fence wrapping content that itself
+// contained a shorter 3+ run closed early and leaked a mention as prose.
+describe('slackMentionOutsideCode fence scanning (#256)', () => {
+  const identity = { userId: 'UBOT', username: 'gatebot', teamId: 'T-X' };
+
+  it('wakes on a mention in plain text', () => {
+    expect(slackMentionOutsideCode('<@UBOT> ship it', identity)).toBe(true);
+  });
+
+  it('demotes a mention inside a plain ``` fence', () => {
+    expect(slackMentionOutsideCode('```\n<@UBOT> ship\n```', identity)).toBe(false);
+  });
+
+  it('demotes a mention inside a ```` fence whose content contains a ``` line (the #256 repro)', () => {
+    expect(slackMentionOutsideCode('```` ```<@UBOT> ship ````', identity)).toBe(false);
+    // The exact form from the issue body and from PR #243's regression test.
+    expect(slackMentionOutsideCode('usage:\n````\n```\n<@UBOT> ship\n```\n````\ndone', identity)).toBe(false);
+  });
+
+  it('demotes a mention inside an inline `code` span', () => {
+    expect(slackMentionOutsideCode('see `<@UBOT> ship` above', identity)).toBe(false);
+  });
+
+  it('wakes on a mention after a properly closed fence', () => {
+    expect(slackMentionOutsideCode('```usage```\n<@UBOT> ship', identity)).toBe(true);
+  });
+
+  it('treats an unterminated fence as code through the end of the text', () => {
+    // No closing run at all — the mention is swallowed as code, not prose.
+    expect(slackMentionOutsideCode('```\n<@UBOT> ship', identity)).toBe(false);
+    // A closer that's too short to match the (longer) opener doesn't count
+    // as a close either, so the fence is still open at end of text.
+    expect(slackMentionOutsideCode('````\n<@UBOT> ship\n```', identity)).toBe(false);
+  });
+
+  it('tildes are not a Slack fence delimiter, so a mention "inside" ~~~ still wakes', () => {
+    // Slack's renderer has no ~~~ code-fence syntax — only backticks — so
+    // this still renders as a live, pinging mention in Slack.
+    expect(slackMentionOutsideCode('~~~\n<@UBOT> ship\n~~~', identity)).toBe(true);
+  });
+});
+
 describe('slackPermalink', () => {
   const CHANNEL_TYPE = 'slack-permalink-test';
 
