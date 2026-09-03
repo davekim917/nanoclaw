@@ -20,6 +20,7 @@ import {
 } from './modules/mailbox/ops/sweep.js';
 import { composeNanoclawSession, type NanoclawMailboxSession } from './modules/mailbox/index.js';
 import { getAgentMailbox } from './mailbox/index.js';
+import { withExistingNanoclawSession } from './modules/mailbox/session.js';
 import { closeDb, initTestDb, runMigrations } from './db/index.js';
 import {
   ABSOLUTE_CEILING_MS,
@@ -42,6 +43,7 @@ import {
   _reportContainerOomTelemetryForTesting,
   _prepareDueWakeForTesting,
   _resetStuckProcessingRowsForTesting,
+  _enforceRunningContainerSlaForTesting,
   _incrementStoppedContinuationAttemptForTesting,
   _sweepSessionForTesting,
   _sweepTaskWatchdogForTesting,
@@ -2987,6 +2989,77 @@ describe('sweepSession on a session with no mailbox', () => {
     expect(fs.existsSync(sessionPath)).toBe(false);
     expect(fs.existsSync(path.join(sessionPath, 'inbound.db'))).toBe(false);
     expect(mockWakeContainer).not.toHaveBeenCalled();
+    closeDb();
+  });
+
+  // Round 8. The same TOCTOU class, on the two post-kill write paths that round
+  // 7's audit claimed but did not actually land. `killContainer` is itself a
+  // yield: the session below opens after it, and a replacement wake in that gap
+  // owns outbound.db. Writing anyway deletes the FRESH runner's processing claim
+  // and defers an input it is already working — duplicate execution.
+  function slaFixture(id: string, heartbeatAgeMs: number, claimAgeMs: number) {
+    const session: Session = { ...fakeSession(), id, agent_group_id: 'ag-sla' };
+    getAgentMailbox().prepare({ agentGroupId: session.agent_group_id, sessionId: session.id });
+    const dir = path.join(testDataDir.dir, 'v2-sessions', session.agent_group_id, session.id);
+    const now = Date.now();
+    fs.writeFileSync(path.join(dir, '.heartbeat'), '');
+    fs.utimesSync(path.join(dir, '.heartbeat'), new Date(now - heartbeatAgeMs), new Date(now - heartbeatAgeMs));
+    const out = new Database(path.join(dir, 'outbound.db'));
+    out
+      .prepare("INSERT INTO processing_ack (message_id, status, status_changed) VALUES ('m-live', 'processing', ?)")
+      .run(new Date(now - claimAgeMs).toISOString());
+    out.close();
+    const claims = (): number => {
+      const db = new Database(path.join(dir, 'outbound.db'));
+      const n = (db.prepare('SELECT COUNT(*) AS c FROM processing_ack').get() as { c: number }).c;
+      const outRows = (db.prepare('SELECT COUNT(*) AS c FROM messages_out').get() as { c: number }).c;
+      db.close();
+      return n * 100 + outRows;
+    };
+    const run = (<T>(action: (m: never) => T | Promise<T>) =>
+      withExistingNanoclawSession(session.agent_group_id, session.id, action as never)) as never;
+    return { session, claims, run };
+  }
+
+  it('a replacement container that wakes during the post-kill open keeps its claim (ceiling)', async () => {
+    const db = initTestDb();
+    runMigrations(db);
+    db.prepare(`INSERT INTO agent_groups (id, name, folder, created_at) VALUES ('ag-sla', 'sla', 'sla', ?)`).run(
+      new Date().toISOString(),
+    );
+    mockKillContainer.mockReset();
+    // Live all the way through: the container is alive so the SLA runs, and it
+    // is STILL alive after the kill because a wake replaced it in the gap.
+    mockIsContainerRunning.mockReset().mockReturnValue(true);
+    mockReadContainerConfig.mockReset().mockReturnValue({ provider: 'claude' });
+
+    const f = slaFixture('sess-sla-ceiling', ABSOLUTE_CEILING_MS + 60_000, 10_000);
+    const before = f.claims();
+    await _enforceRunningContainerSlaForTesting(f.run, f.session, 'ag-sla', 'sla');
+
+    expect(mockKillContainer).toHaveBeenCalledWith('sess-sla-ceiling', 'absolute-ceiling');
+    // Claim intact and no restart notice written: both writes were skipped.
+    expect(f.claims()).toBe(before);
+    closeDb();
+  });
+
+  it('a replacement container that wakes during the post-kill open keeps its claim (claim-stuck)', async () => {
+    const db = initTestDb();
+    runMigrations(db);
+    db.prepare(`INSERT INTO agent_groups (id, name, folder, created_at) VALUES ('ag-sla', 'sla', 'sla', ?)`).run(
+      new Date().toISOString(),
+    );
+    mockKillContainer.mockReset();
+    mockIsContainerRunning.mockReset().mockReturnValue(true);
+    mockReadContainerConfig.mockReset().mockReturnValue({ provider: 'claude' });
+
+    // Heartbeat older than the claim and inside the ceiling: kill-claim, not kill-ceiling.
+    const f = slaFixture('sess-sla-claim', 10 * 60_000, 5 * 60_000);
+    const before = f.claims();
+    await _enforceRunningContainerSlaForTesting(f.run, f.session, 'ag-sla', 'sla');
+
+    expect(mockKillContainer).toHaveBeenCalledWith('sess-sla-claim', 'claim-stuck');
+    expect(f.claims()).toBe(before);
     closeDb();
   });
 

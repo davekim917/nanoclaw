@@ -1870,6 +1870,16 @@ async function sweepSession(session: Session): Promise<number | null> {
   return tail ?? null;
 }
 
+/** Test-only entry point for the running-container SLA, including both post-kill write paths. */
+export function _enforceRunningContainerSlaForTesting(
+  run: SessionRunner,
+  session: Session,
+  agentGroupId: string,
+  agentGroupFolder: string,
+): Promise<void> {
+  return enforceRunningContainerSla(run, session, agentGroupId, agentGroupFolder);
+}
+
 /**
  * Test-only entry point for the stopped-container recovery admission — the
  * TOCTOU site: the container-state check must happen INSIDE the session, after
@@ -2198,6 +2208,13 @@ async function enforceRunningContainerSla(
     // waiting) to avoid spamming restart notices on quiet sessions that just
     // naturally reached the 30-min idle ceiling.
     await run((mailbox) => {
+      // The kill above is a yield boundary: this session opened after it, and a
+      // replacement wake landing in that gap owns outbound.db. Checked here,
+      // immediately before the writes, with no await in between. Skipping costs
+      // one restart notice and defers the orphan-claim clear to the next tick —
+      // both idempotent. Writing anyway would delete the FRESH runner's claim
+      // and defer an input it is already processing: duplicate execution.
+      if (containerOwnsOutbound(session.id)) return;
       notifyKillCeiling(mailbox, session, decision.heartbeatAgeMs, pendingClaims, containerState);
       resetStuckProcessingRows(mailbox, session, 'absolute-ceiling');
       // Accountability wake: if the kill plausibly interrupted parked work,
@@ -2228,7 +2245,11 @@ async function enforceRunningContainerSla(
     toleranceMs: decision.toleranceMs,
   });
   killContainer(session.id, 'claim-stuck');
-  await run((mailbox) => resetStuckProcessingRows(mailbox, session, 'claim-stuck'));
+  await run((mailbox) => {
+    // Same yield boundary as the ceiling branch above.
+    if (containerOwnsOutbound(session.id)) return;
+    resetStuckProcessingRows(mailbox, session, 'claim-stuck');
+  });
 }
 
 /**
