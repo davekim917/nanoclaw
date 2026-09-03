@@ -22,8 +22,10 @@ const allowlist: string[] = JSON.parse(fs.readFileSync(RATCHET_PATH, 'utf8'));
 const allowlistSet = new Set(allowlist);
 
 describe('no raw session-DB access or passed session handle outside the mailbox modules except the committed allowlist', () => {
+  const offenders = computeOffenders();
+  const offenderFileSet = new Set(offenders.map((o) => o.file));
+
   it('every offending file is in the committed allowlist (RATCHET.json only shrinks)', () => {
-    const offenders = computeOffenders();
     const newOffenders = offenders.filter((o) => !allowlistSet.has(o.file));
     expect(
       newOffenders,
@@ -39,9 +41,20 @@ describe('no raw session-DB access or passed session handle outside the mailbox 
     ).toEqual([]);
   });
 
-  it('every allowlisted path still exists (deleted files are pruned from RATCHET.json)', () => {
-    const missing = allowlist.filter((relPath) => !fs.existsSync(path.join(REPO_ROOT, relPath)));
-    expect(missing, `RATCHET.json entries no longer on disk — remove them: ${missing.join(', ')}`).toEqual([]);
+  it('every allowlisted path is still a real offender (stale entries — deleted or already cleaned up — must be pruned)', () => {
+    // Existence alone isn't enough: a caller batch that removes raw DB access
+    // from a file but forgets to prune RATCHET.json would pass an
+    // existence-only check forever, silently defeating "never re-enter" — the
+    // subset check above only catches NEW offenders, not stale allowlist
+    // entries that are no longer offenders at all. Require every allowlisted
+    // path to still be in the CURRENT offender set.
+    const stale = allowlist.filter((relPath) => !offenderFileSet.has(relPath));
+    expect(
+      stale,
+      stale.length > 0
+        ? `RATCHET.json entries that are no longer raw-DB offenders (deleted, or cleaned up but left in the allowlist) — remove them: ${stale.join(', ')}`
+        : undefined,
+    ).toEqual([]);
   });
 
   // (e) Ratchet target: DeliveryActionHandler is still 3-argument (content, session, inDb).
