@@ -5,6 +5,11 @@ import { pathToFileURL } from 'url';
 
 import Database from 'better-sqlite3';
 
+// Composition slot. These are standalone `tsx` entrypoints: they never load
+// `src/modules/index.js`, so nothing else registers an AgentMailbox and any
+// path reaching `getAgentMailbox()` throws `No agent mailbox registered`.
+// Importing it for side effect is idempotent — ESM evaluates it once.
+import '../src/mailbox/compose.js';
 import { DATA_DIR, GROUPS_DIR } from '../src/config.js';
 import { cleanupOrphansStrict } from '../src/container-runtime.js';
 import { closeDb, initDb } from '../src/db/connection.js';
