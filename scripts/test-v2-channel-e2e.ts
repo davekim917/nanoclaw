@@ -70,6 +70,10 @@ console.log('✓ Central DB initialized');
 // --- Step 2: Set up mock channel adapter + delivery ---
 console.log('\n=== Step 2: Set up mock channel adapter & delivery ===');
 
+// routeInbound reaches resolveSession → initSessionFolder, which provisions
+// through the registered mailbox; this standalone harness loads the
+// composition slot itself.
+import '../src/mailbox/compose.js';
 import { routeInbound } from '../src/router.js';
 import { setDeliveryAdapter, startActiveDeliveryPoll, stopDeliveryPolls } from '../src/delivery.js';
 import { getChannelAdapter, registerChannelAdapter, initChannelAdapters } from '../src/channels/channel-registry.js';

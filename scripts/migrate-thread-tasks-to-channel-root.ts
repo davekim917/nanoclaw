@@ -31,6 +31,10 @@ import { fileURLToPath } from 'url';
 
 import Database from 'better-sqlite3';
 
+// resolveActiveSession (src/db/scheduled-tasks.ts) provisions through the
+// registered mailbox; this standalone entrypoint loads the composition slot
+// itself.
+import '../src/mailbox/compose.js';
 import { DATA_DIR } from '../src/config.js';
 import { initDb, getDb } from '../src/db/connection.js';
 import { resolveActiveSession } from '../src/db/scheduled-tasks.js';
