@@ -212,6 +212,7 @@ vi.mock('./db/connection.js', () => ({
 import { registerAgentMailbox, resetAgentMailboxForTesting } from './mailbox/index.js';
 import {
   SWEEP_DUTY_INVENTORY,
+  SWEEP_INTERVAL_MS,
   SWEEP_PHASES,
   _listSweepRegistrationsForTesting,
   _resetSweepRegistryForTesting,
@@ -219,6 +220,8 @@ import {
   registerSlaObservationHook,
   registerSweepDuty,
   registerSweepKillFollowUp,
+  startHostSweep,
+  stopHostSweep,
   type SweepDuty,
   type SweepSessionContext,
   type SweepTickContext,
@@ -615,6 +618,83 @@ describe('sweep duty registry (S2-PR2)', () => {
     fs.utimesSync(hb, new Date(old), new Date(old));
     h.heartbeatFile = hb;
   }
+
+  // ── R-4b ───────────────────────────────────────────────────────────────────
+  it('a tick-level duty that throws is logged and the later tick duties still run', async () => {
+    const error = vi.spyOn(log, 'error').mockImplementation(() => {});
+    _resetSweepRegistryForTesting({ builtins: false });
+    const seen: string[] = [];
+    registerSweepDuty({
+      name: 'first',
+      phase: 'tick:housekeeping',
+      order: 10,
+      run: () => {
+        seen.push('first');
+      },
+    });
+    registerSweepDuty({
+      name: 'middle',
+      phase: 'tick:housekeeping',
+      order: 20,
+      run: () => {
+        throw new Error('tick boom');
+      },
+    });
+    registerSweepDuty({
+      name: 'last',
+      phase: 'tick:housekeeping',
+      order: 30,
+      run: () => {
+        seen.push('last');
+      },
+    });
+
+    await _sweepOnceForTesting();
+
+    // Registration IS the guard. Before the seam an unguarded throw here
+    // silently skipped every duty ordered behind it for the rest of the tick.
+    expect(seen).toEqual(['first', 'last']);
+    expect(error).toHaveBeenCalledWith(
+      'Host sweep duty failed',
+      expect.objectContaining({ duty: 'middle', window: 'tick:housekeeping' }),
+    );
+    expect(h.spawns).toEqual([]);
+  });
+
+  // ── R-8b ───────────────────────────────────────────────────────────────────
+  it('a throw from the session scan itself still re-arms the tick', async () => {
+    const sessionsModule = await import('./db/sessions.js');
+    const scan = vi.spyOn(sessionsModule, 'getActiveSessions').mockImplementation((): never => {
+      throw new Error('scan boom');
+    });
+    _resetSweepRegistryForTesting({ builtins: false });
+    let preRuns = 0;
+    registerSweepDuty({
+      name: 'pre',
+      phase: 'tick:pre-session',
+      order: 10,
+      run: () => {
+        preRuns += 1;
+      },
+    });
+
+    vi.useFakeTimers();
+    try {
+      startHostSweep();
+      await vi.waitFor(() => expect(scan).toHaveBeenCalledTimes(1));
+      // The scan is the one thing between the pre-session phase and the fan-out.
+      // Its failure must not replay the phase that already ran this tick.
+      expect(preRuns).toBe(1);
+
+      await vi.advanceTimersByTimeAsync(SWEEP_INTERVAL_MS);
+      await vi.waitFor(() => expect(scan).toHaveBeenCalledTimes(2));
+      expect(preRuns).toBe(2);
+    } finally {
+      stopHostSweep();
+      vi.useRealTimers();
+    }
+    expect(h.spawns).toEqual([]);
+  });
 
   // ── R-5 ────────────────────────────────────────────────────────────────────
   describe('an unopenable mailbox backs the session off at W1 and only at W1', () => {

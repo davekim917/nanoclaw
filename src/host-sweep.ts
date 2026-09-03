@@ -420,13 +420,27 @@ export function _resetSweepRegistryForTesting(options: { builtins?: boolean } = 
   if (options.builtins ?? true) registerBuiltInSweepDuties();
 }
 
-// ── Duty failure tagging ─────────────────────────────────────────────────────
+// ── Duty failure handling ────────────────────────────────────────────────────
 //
 // Every duty body runs through `runDutyBody`, which tags the error with the
-// duty name and the window and RETHROWS. It deliberately does not log or
-// swallow: which failures are fatal to the rest of the tick is each duty's own
-// existing guard shape, unchanged by this PR, and the two log lines stay
-// single-cause at the one place that already owned them (constraint 17).
+// duty name and the window and rethrows. What happens next depends on the
+// phase, and the difference is the point:
+//
+//   TICK phases isolate. `runTickPhase` catches, logs 'Host sweep duty failed'
+//   with `duty` and `window`, and runs the next duty. Registration IS the
+//   guard, so an unguarded duty is impossible — before this seam an unguarded
+//   throw from the reconciler or the receipts prune silently skipped every
+//   later duty in the tick, which is one of the failures this seam was booked
+//   against (constraint 5).
+//
+//   SESSION phases do not. A duty that threw leaves work still due, so the
+//   throw propagates out of `sweepSession` to `sweepOnce`'s per-session catch,
+//   which logs the same line and — critically — does NOT quiet-cache the
+//   session, so the next 60s tick retries it. Isolation there is per session,
+//   not per duty, exactly as before.
+//
+// Both paths emit one line, from one place, so each gate stays single-cause
+// (constraint 17).
 
 const SWEEP_DUTY_TAG = Symbol('sweepDutyTag');
 interface SweepDutyTag {
@@ -471,7 +485,15 @@ async function runDutyBody<T>(duty: string, window: SweepWindow, body: () => T |
 
 async function runTickPhase(ctx: SweepTickContext, phase: SweepPhase): Promise<void> {
   for (const duty of dutiesForPhase(phase)) {
-    await runDutyBody(duty.name, phase, () => duty.run(ctx));
+    try {
+      await runDutyBody(duty.name, phase, () => duty.run(ctx));
+    } catch (err) {
+      // Isolated: one failing central duty must not cost the tick every duty
+      // ordered after it. The `duty` and `window` fields say which body, so a
+      // family PR's post-deploy check filters on its own duty names rather
+      // than counting a shared string.
+      log.error('Host sweep duty failed', { err, duty: duty.name, window: phase });
+    }
   }
 }
 
@@ -2828,11 +2850,11 @@ function resetStuckProcessingRows(mailbox: NanoclawMailboxSession, session: Sess
 // The 39 registrations.
 //
 // Bodies are the pre-registry statements, unchanged, including each duty's own
-// guard (or deliberate lack of one — an unguarded duty still aborts the rest of
-// the tick and is caught by `sweep()`'s wrapper, exactly as before). Phase and
-// order encode the 21 load-bearing ordering constraints from plan.md §4.3; the
-// family PRs move each body into `src/modules/sweep-<family>/` by moving its
-// registration, not by editing the driver.
+// try/catch where it had one. The duties that had none are now guarded by
+// registration itself: a tick duty that throws is logged and the tick carries
+// on. Phase and order encode the 21 load-bearing ordering constraints from
+// plan.md §4.3; the family PRs move each body into `src/modules/sweep-<family>/`
+// by moving its registration, not by editing the driver.
 // ─────────────────────────────────────────────────────────────────────────────
 
 function registerBuiltInSweepDuties(): void {
@@ -3193,8 +3215,9 @@ function registerBuiltInSweepDuties(): void {
     order: 10,
     // MODULE-HOOK:orchestrator-dispatch:reconciler — complete
     // admitted-but-incomplete tasks. Runs after per-session sweeps so container
-    // state is current. Deliberately unguarded, as it always was: it is the
-    // earliest call the tick's own wrapper is the guard for.
+    // state is current. Carries no guard of its own: it was the earliest
+    // unguarded call in the old tick body, and the phase runner is now the
+    // guard that keeps its throw from costing every duty behind it.
     run: () => {
       runReconcilerSweep();
     },
