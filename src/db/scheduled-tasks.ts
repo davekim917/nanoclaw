@@ -23,7 +23,8 @@ import path from 'path';
 
 import { DATA_DIR } from '../config.js';
 import { getAgentMailbox } from '../mailbox/index.js';
-import { resolveTaskSession, withMailboxSession } from '../session-manager.js';
+import { resolveTaskSession, withExistingMailboxSession, withMailboxSession } from '../session-manager.js';
+import type { NanoclawMailboxSession } from '../modules/mailbox/index.js';
 import { createSession, findSessionByAgentGroupAndMessagingGroup } from './sessions.js';
 import { getDb } from './connection.js';
 
@@ -249,12 +250,22 @@ export async function scheduleTask(def: TaskDef, _dataDir?: string): Promise<voi
     ...(def.flagIntent ? { flagIntent: def.flagIntent } : {}),
   });
 
-  // Provisioning is deliberate: `resolveTaskSession` may have just created the
-  // session row, and a task is a legitimate reason to create its mailbox. The
-  // seam also carries what the hand-rolled open used to: the same two pragmas
-  // AND the storage-activity marker that keeps a concurrent reclaim from
-  // unlinking the file between the open and the insert.
-  await withMailboxSession(def.agentGroupId, session.id, (mailbox) => {
+  // Existing-only first, provisioning only if there is genuinely no mailbox.
+  // `resolveTaskSession` may have just created the session row, and a task is
+  // a legitimate reason to author its mailbox — but it just as often hands
+  // back a live series whose container is running, and the provisioning
+  // funnel's `prepare()` runs `ensureSchema(..., 'outbound')`: a read-write
+  // open and DDL on the CONTAINER-owned outbound.db, across the mount, from
+  // the host. Pre-seam this path opened inbound.db and nothing else. Same
+  // rule, and the same reasoning, as the ingress write in `session-manager.ts`
+  // (mailbox seam PR 4, review round 1).
+  //
+  // Either funnel carries what the hand-rolled open used to: the same two
+  // pragmas AND the storage-activity marker that keeps a concurrent reclaim
+  // from unlinking the file between the open and the insert. And `session()`
+  // runs the inbound legacy migrations on both, so nothing a new task row
+  // needs is skipped by not provisioning.
+  const stamp = (mailbox: NanoclawMailboxSession): boolean => {
     mailbox.upsertTaskSeries({
       id: def.id,
       seriesId: def.seriesId,
@@ -265,5 +276,9 @@ export async function scheduleTask(def: TaskDef, _dataDir?: string): Promise<voi
       channelType: def.destination.channelType,
       threadId: def.destination.threadId,
     });
-  });
+    return true;
+  };
+  if (!(await withExistingMailboxSession(def.agentGroupId, session.id, stamp))) {
+    await withMailboxSession(def.agentGroupId, session.id, stamp);
+  }
 }
