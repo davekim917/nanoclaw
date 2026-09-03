@@ -66,6 +66,32 @@ export function getActiveRepositoryMountBarrier(): string | null {
   }
 }
 
+/**
+ * The token the admission gate read at this poll tick's boundary
+ * (`modules/mailbox/admission.ts`), consumed by the selection below so a fenced
+ * poll opens `inbound.db` once instead of twice.
+ *
+ * Only an ACTIVE token short-circuits. A memoized `null` still lets the
+ * selection do its own read, so a fence that commits between the boundary and
+ * the selection is still seen — the memo can only hold rows back for one extra
+ * tick, never release them early. `initTestSessionDb()` clears it.
+ */
+let tickBarrier: string | null | undefined;
+
+export function setTickRepositoryBarrier(token: string | null): void {
+  tickBarrier = token;
+}
+
+export function clearTickRepositoryBarrier(): void {
+  tickBarrier = undefined;
+}
+
+function takeTickRepositoryBarrier(): string | null | undefined {
+  const token = tickBarrier;
+  tickBarrier = undefined;
+  return token;
+}
+
 function recallTargetId(m: MessageInRow): string | null {
   if (m.kind !== 'system' || !m.id.startsWith('recall-')) return null;
   try {
@@ -135,6 +161,9 @@ export function selectPendingRows(
   isFirstPoll: boolean,
   diagnostics?: PendingSelectionDiagnostics,
 ): MessageInRow[] {
+  // The admission gate already read the fence at this tick's boundary — an
+  // active token short-circuits before the open (see setTickRepositoryBarrier).
+  if (takeTickRepositoryBarrier()) return [];
   const inbound = openInboundDb();
   const outbound = getOutboundDb();
 

@@ -2,6 +2,7 @@ import fs from 'fs';
 import path from 'path';
 import { randomUUID } from 'node:crypto';
 
+import { evaluateAdmission } from './admission-gate.js';
 import { findByName, findByRouting, findPeerName, getAllDestinations, type DestinationEntry } from './destinations.js';
 import {
   getPendingMessages,
@@ -25,7 +26,6 @@ import {
   setCurrentInReplyTo,
 } from './db/session-state.js';
 import {
-  acknowledgeRepositoryMountBarrier,
   advanceMemoryContextEpoch,
   classifyTrigger,
   clearDoneProposal,
@@ -314,18 +314,6 @@ async function checkpointTurnEnd(autosaveWorktrees: (reason: string) => Promise<
 }
 
 /**
- * Stop outer-loop admission at a container-visible repository mount barrier.
- * The acknowledgement is written only from this provider-idle boundary; the
- * host never treats the active-query observer below as drained.
- */
-export function repositoryMountBarrierBlocksPoll(): boolean {
-  const epoch = getActiveRepositoryMountBarrier();
-  if (epoch === null) return false;
-  acknowledgeRepositoryMountBarrier(epoch);
-  return true;
-}
-
-/**
  * Main poll loop. Runs indefinitely until the process is killed.
  *
  * 1. Poll messages_in for pending rows
@@ -376,7 +364,10 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
   let isFirstPoll = true;
   while (true) {
     if (config.signal?.aborted) return;
-    if (repositoryMountBarrierBlocksPoll()) {
+    // Provider-idle admission boundary. Registered gates (the repository
+    // ingress fence lives in modules/mailbox/admission.ts) decide whether this
+    // container may start a turn; the loop itself knows nothing about them.
+    if (evaluateAdmission()) {
       await sleep(POLL_INTERVAL_MS, config.signal);
       continue;
     }
@@ -411,10 +402,10 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
         // A fence can commit after the first outer-loop check and while the
         // pending batch is being read. Do not turn durable queued work into a
         // running provider turn once repository admission is closed.
-        if (repositoryMountBarrierBlocksPoll()) continue;
+        if (evaluateAdmission()) continue;
         const runningWork = markWorkContinuationRunning(pending.id, runnerId);
         if (runningWork) {
-          if (repositoryMountBarrierBlocksPoll()) {
+          if (evaluateAdmission()) {
             requeueWorkContinuationIfMatches(runningWork.id, runnerId);
             continue;
           }
@@ -611,7 +602,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     // The barrier may have committed while scripts/settings were awaited.
     // Re-check at the final admission seam and acknowledge from this still-
     // provider-idle boundary rather than creating a new processing claim.
-    if (repositoryMountBarrierBlocksPoll()) continue;
+    if (evaluateAdmission()) continue;
     const keptIds = keep.map((m) => m.id);
     // Per-turn cost attribution (Fleet Hardening Phase 0.1 follow-up):
     // classified once from the admitted batch and reused for every

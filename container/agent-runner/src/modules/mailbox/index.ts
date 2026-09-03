@@ -9,6 +9,7 @@
  */
 import type { Database } from 'bun:sqlite';
 
+import { registerAdmissionGate } from '../../admission-gate.js';
 import { getConfig } from '../../config.js';
 import { getOutboundDb } from '../../mailbox/sqlite/connection.js';
 import { SqliteAgentMailbox } from '../../mailbox/sqlite/index.js';
@@ -39,7 +40,9 @@ import {
 } from './container-state.js';
 import { getSessionId, getSessionSpawnTaskId } from './routing.js';
 import { acknowledgeRepositoryMountBarrier } from './session-state.js';
+import { repositoryFenceAdmissionGate } from './admission.js';
 
+export * from './admission.js';
 export * from './schema.js';
 export * from './selection.js';
 export * from './container-state.js';
@@ -47,6 +50,13 @@ export * from './routing.js';
 export * from './reads.js';
 export * from './session-state.js';
 export { INBOUND_KINDS, type InboundKind } from './inbound-kinds.js';
+
+/* ─── Admission ────────────────────────────────────────────────────────────── */
+
+// The one runner lifecycle seam the storage seam cannot express (plan §4.5).
+// Registering here — the module the singular composition slot already imports —
+// keeps the fence out of poll-loop.ts without patching any upstream barrel.
+registerAdmissionGate(repositoryFenceAdmissionGate);
 
 /* ─── Chat budget ──────────────────────────────────────────────────────────── */
 

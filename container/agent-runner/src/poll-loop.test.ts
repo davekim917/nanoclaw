@@ -3,6 +3,7 @@ import * as fs from 'fs';
 import os from 'os';
 import path from 'path';
 
+import { evaluateAdmission, registerAdmissionGate } from './admission-gate.js';
 import { _resetConfig, loadConfig } from './config.js';
 import { clearStaleProcessingAcks, setContainerToolInFlight } from './db/container-state.js';
 import { getInboundDb, getOutboundDb } from './mailbox/sqlite/connection.js';
@@ -23,7 +24,6 @@ import {
   isAupRefusal,
   isCorruptionError,
   processQuery,
-  repositoryMountBarrierBlocksPoll,
   runPollLoop,
   retainCompleteRecallPairs,
   selectInTurnFollowUps,
@@ -92,7 +92,7 @@ describe('repository mount poll and tool admission barrier', () => {
     expect(
       getOutboundDb().prepare("SELECT value FROM session_state WHERE key = 'repository_mount_barrier_ack'").get(),
     ).toBe(null);
-    expect(repositoryMountBarrierBlocksPoll()).toBe(true);
+    expect(evaluateAdmission()).toBe(true);
     expect(
       getOutboundDb().prepare("SELECT value FROM session_state WHERE key = 'repository_mount_barrier_ack'").get(),
     ).toEqual({
@@ -161,7 +161,7 @@ describe('repository mount poll and tool admission barrier', () => {
 
     // The active-query observer only drains. Exact ACK is deliberately later,
     // after processQuery returned to this provider-idle boundary.
-    expect(repositoryMountBarrierBlocksPoll()).toBe(true);
+    expect(evaluateAdmission()).toBe(true);
     expect(
       getOutboundDb().prepare("SELECT value FROM session_state WHERE key = 'repository_mount_barrier_ack'").get(),
     ).toEqual({
@@ -223,6 +223,76 @@ describe('repository mount poll and tool admission barrier', () => {
     abort.abort();
     await loop;
   }, 5_000);
+
+  // R-8 (plan §8): the outer loop consults the admission seam, not the fence
+  // directly. A registered gate that holds must stop dispatch entirely — no
+  // claim, no provider call — and releasing it must let the same pending row
+  // through.
+  it('poll loop skips dispatch while admission is held and resumes when released', async () => {
+    insertMessage('held-until-admitted', 'chat', { sender: 'Operator', text: 'wait for admission' });
+
+    let holding = true;
+    let gateCalls = 0;
+    registerAdmissionGate(() => {
+      gateCalls += 1;
+      return holding;
+    });
+
+    let queryCalls = 0;
+    const provider = {
+      supportsNativeSlashCommands: false,
+      registerMemorySessionHook: () => {},
+      isSessionInvalid: () => false,
+      isRetryable: () => false,
+      query: () => {
+        queryCalls += 1;
+        async function* events(): AsyncGenerator<ProviderEvent> {
+          yield { type: 'init', continuation: 'admitted-after-release' };
+          yield { type: 'result', text: 'admitted' };
+        }
+        return { push: () => {}, end: () => {}, abort: () => {}, events: events() };
+      },
+    };
+
+    const abort = new AbortController();
+    const loop = runPollLoop({
+      provider: provider as never,
+      providerName: 'claude',
+      cwd: '/tmp',
+      signal: abort.signal,
+      autosaveWorktrees: async () => ({ committed: [], failed: [], skipped: [] }),
+    });
+
+    try {
+      // Two held ticks: the gate is consulted each second and dispatch never starts.
+      const holdDeadline = Date.now() + 4_000;
+      while (gateCalls < 2) {
+        if (Date.now() >= holdDeadline) throw new Error('timed out waiting for two held poll ticks');
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      expect(queryCalls).toBe(0);
+      expect(getOutboundDb().prepare('SELECT COUNT(*) AS count FROM processing_ack').get()).toEqual({ count: 0 });
+
+      holding = false;
+      const releaseDeadline = Date.now() + 4_000;
+      while (
+        (
+          getOutboundDb()
+            .prepare('SELECT status FROM processing_ack WHERE message_id = ?')
+            .get('held-until-admitted') as { status: string } | undefined
+        )?.status === undefined
+      ) {
+        if (Date.now() >= releaseDeadline)
+          throw new Error('timed out waiting for the released message to be processed');
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      expect(queryCalls).toBe(1);
+    } finally {
+      holding = false;
+      abort.abort();
+      await loop;
+    }
+  }, 15_000);
 });
 
 describe('formatter', () => {
