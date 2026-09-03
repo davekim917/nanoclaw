@@ -551,47 +551,35 @@ function updateTaskCommand(args: Record<string, unknown>, ctx: CallerContext) {
   const recurrence = normalizeNullableString(args.recurrence);
   const script = normalizeNullableString(args.script);
 
-  // Wall-clock fields (--process-after, the cron grid) are interpreted in the
-  // OWNING group's timezone. An unscoped host `tasks update` fans out across
-  // every active session, which can span groups with different overrides, so
-  // the persisted instant is computed PER SESSION in the loop below
-  // (`wallClockUpdate`) — never once from whichever group matched first.
-  //
-  // This scan resolves a representative group for VALIDATION only: input
-  // shape and the recurrence ceiling must reject before anything is written,
-  // and neither answer depends on which valid zone is used. The same lookup
-  // yields the task's current script for the ceiling check, so it costs no
-  // extra pass.
-  let ownerGroup: string | undefined;
-  let currentScript: string | null = null;
-  if (args.process_after !== undefined || recurrence !== undefined) {
-    for (const session of selectedSessions(args, ctx)) {
-      const row = withInbound(session, (db) => selectTask(db, id));
-      if (row) {
-        ownerGroup = session.agent_group_id;
-        currentScript = parseContent(row.content).script;
-        break;
-      }
+  // An unscoped host `tasks update` fans out across every active session,
+  // which can span groups with different timezone overrides. There is no
+  // representative zone here: the persisted instant differs per group, and so
+  // does the recurrence ceiling, which counts fires in a rolling 24h window —
+  // a cron whose fires cluster on one weekday can be past that window in one
+  // zone and still inside it in another. So EVERY matched session validates in
+  // its own zone, and all of that happens before the first write.
+  const matched = selectedSessions(args, ctx)
+    .map((session) => ({ session, row: withInbound(session, (db) => selectTask(db, id)) }))
+    .filter((m): m is { session: ScopedSession; row: TaskRow } => m.row !== undefined);
+
+  const validationZones =
+    matched.length > 0
+      ? matched.map((m) => ({ tz: resolveGroupTimezone(m.session.agent_group_id), row: m.row }))
+      : // Nothing matched: still validate the input shape so a typo is reported
+        // as one, rather than as "no live task matched".
+        [{ tz: TIMEZONE, row: undefined }];
+
+  for (const { tz, row } of validationZones) {
+    if (args.process_after !== undefined) parseProcessAfter(args.process_after, tz);
+    if (recurrence !== undefined) {
+      validateRecurrence(recurrence, tz);
+      // Effective script AFTER this update: the new value when provided
+      // (including an explicit clear), else whatever THIS task already has.
+      const scriptAfter: string | null = script !== undefined ? script : row ? parseContent(row.content).script : null;
+      enforceRecurrenceLimit(recurrence, bool(args.dangerously_override_recurrence_limit), scriptAfter != null, tz);
     }
   }
-  const validationTz = ownerGroup ? resolveGroupTimezone(ownerGroup) : TIMEZONE;
-
-  // Parse once up front purely to reject a malformed value before the first
-  // write; the value itself is recomputed per session.
-  if (args.process_after !== undefined) parseProcessAfter(args.process_after, validationTz);
-  if (recurrence !== undefined) {
-    validateRecurrence(recurrence, validationTz);
-    // Effective script AFTER this update: the new value when provided
-    // (including an explicit clear), else whatever the task already has.
-    const scriptAfter: string | null = script !== undefined ? script : currentScript;
-    enforceRecurrenceLimit(
-      recurrence,
-      bool(args.dangerously_override_recurrence_limit),
-      scriptAfter != null,
-      validationTz,
-    );
-    update.recurrence = recurrence;
-  }
+  if (recurrence !== undefined) update.recurrence = recurrence;
 
   // A new cron with the old armed timestamp fires off the new grid (or a day
   // late). Unless the caller pinned --process-after explicitly, re-derive the
@@ -638,7 +626,7 @@ function updateTaskCommand(args: Record<string, unknown>, ctx: CallerContext) {
   if (fields.length === 0) throw new Error('nothing to update');
 
   let touched = 0;
-  for (const session of selectedSessions(args, ctx)) {
+  for (const { session } of matched) {
     // One value per session, and the ONLY one: what gets written is what gets
     // audited and what gets reported. Merging the per-session part at the
     // `updateTask` call while the audit kept reading the pre-merge object is

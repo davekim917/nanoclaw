@@ -167,6 +167,64 @@ describe('tasks CLI resource', () => {
     expect(processAfterOf('ag-kolkata')).toBe('2026-10-01T03:30:00.000Z');
   });
 
+  it('enforces the recurrence ceiling in EVERY matched timezone, not a representative one', async () => {
+    // The ceiling counts fires in a rolling 24h window, and that count is
+    // zone-dependent when a cron's fires cluster on one weekday. Pinned clock:
+    // Monday 2026-01-05T00:00:00Z, cron "0 19,20,21,22,23 * * 1".
+    //   Asia/Tokyo (+9)      → local Mon 09:00; window catches all 5 fires.
+    //   Pacific/Honolulu (-10) → local Sun 14:00; window ends before any fire.
+    // Validating only the first match would let the 5-fire cron through.
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-01-05T00:00:00.000Z'));
+    try {
+      createGroup('ag-honolulu');
+      createGroup('ag-tokyo-cap');
+      ensureContainerConfig('ag-honolulu');
+      ensureContainerConfig('ag-tokyo-cap');
+      updateContainerConfigScalars('ag-honolulu', { timezone: 'Pacific/Honolulu' });
+      updateContainerConfigScalars('ag-tokyo-cap', { timezone: 'Asia/Tokyo' });
+
+      const made: Record<string, { series_id: string; session_id: string }> = {};
+      // Honolulu first: it is the permissive zone, so it is what a
+      // first-match-wins validator would have used.
+      for (const group of ['ag-honolulu', 'ag-tokyo-cap']) {
+        const r = await dispatch(
+          {
+            id: `cap-create-${group}`,
+            command: 'tasks-create',
+            args: { group, prompt: 'digest', name: 'capped', process_after: '2999-01-01T00:00:00Z' },
+          },
+          { caller: 'host' },
+        );
+        expect(r.ok).toBe(true);
+        if (!r.ok) return;
+        made[group] = r.data as { series_id: string; session_id: string };
+      }
+      const sharedId = made['ag-honolulu'].series_id;
+      const tdb = new Database(inboundDbPath('ag-tokyo-cap', made['ag-tokyo-cap'].session_id));
+      tdb.prepare('UPDATE messages_in SET id = ?, series_id = ? WHERE kind = ?').run(sharedId, sharedId, 'task');
+      tdb.close();
+
+      const updated = await dispatch(
+        { id: 'cap-update', command: 'tasks-update', args: { id: sharedId, recurrence: '0 19,20,21,22,23 * * 1' } },
+        { caller: 'host' },
+      );
+      expect(updated.ok).toBe(false);
+
+      // Rejected before any write: neither series took the new cron.
+      for (const group of ['ag-honolulu', 'ag-tokyo-cap']) {
+        const db = new Database(inboundDbPath(group, made[group].session_id), { readonly: true });
+        const row = db.prepare("SELECT recurrence FROM messages_in WHERE kind = 'task'").get() as {
+          recurrence: string | null;
+        };
+        db.close();
+        expect(row.recurrence).toBeNull();
+      }
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('create writes the task into the group system session, not the caller chat session', async () => {
     const resp = await dispatch(
       {
