@@ -27,6 +27,7 @@
   "src/modules/scheduling/create.ts",
   "src/modules/scheduling/live-count.ts",
   "src/modules/sweep-scheduled-move/index.ts",
+  "src/modules/sweep-session-core/index.ts",
   "src/modules/sweep-usage/index.ts",
   "src/session-manager.ts",
   "src/storage-manager.ts",

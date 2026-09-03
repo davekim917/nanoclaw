@@ -82,3 +82,7 @@ import './sweep-storage/index.js';
 import './sweep-claims/index.js';
 // Sweep family: usage-rollup (T19, host-sweep seam S2-PR12).
 import './sweep-usage/index.js';
+// Sweep per-session core — S2 processing_ack sync, S3 stale-pending expiry,
+// S4 pre-wake orphan-claim reset, S17 orphan-claim retry (convergence seam 2,
+// PR 9).
+import './sweep-session-core/index.js';

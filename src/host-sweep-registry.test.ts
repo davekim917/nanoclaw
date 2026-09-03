@@ -257,6 +257,11 @@ import {
 // not just the in-file built-ins) still surfaces the moved duties for R-7,
 // R-10 and R-11.
 import './modules/sweep-container-health/index.js';
+// Registers S2/S3/S4/S17 as a duty source at import time — needed so
+// `_resetSweepRegistryForTesting()`'s default replay (every recorded source,
+// not just the in-file built-ins) still surfaces the moved duties for R-7,
+// R-10 and R-11.
+import './modules/sweep-session-core/index.js';
 import { log } from './log.js';
 // Family module side-effect import (S2-PR7): registers T11
 // (scheduled-move-recovery) and T12 (audit-body-prune) as a duty source, so
@@ -318,6 +323,9 @@ function fakeMailbox(overrides: Record<string, unknown> = {}): NanoclawMailboxSe
     hasOutbound: () => true,
     legacyInboundHandle: () => ({}),
     legacyOutboundHandle: () => ({}),
+    // Added with the mailbox PR 4 merge: S6's mirror now reads the parsed
+    // proposal through the session instead of taking the outbound handle.
+    readDoneProposal: () => null,
     countDueMessages: () => 0,
     getDueWakePriority: () => 'interactive',
     readWorkContinuation: () => null,
