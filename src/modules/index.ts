@@ -52,3 +52,13 @@ import './provider-fallback/index.js';
 import './repository-workspaces/index.js';
 
 import './escalation/index.js';
+
+// Sweep duty families (convergence seam 2) — each self-registers its duties
+// on the host-sweep.ts registry at import time, same pattern as above.
+// sweep-egress: T2 egress-network-reheal (S2-PR6).
+import './sweep-egress/index.js';
+// sweep-storage: T13 storage-maintenance, plus its own start/stop pair
+// (S2-PR1 module timers, carried in the same file — S2-PR6).
+import './sweep-storage/index.js';
+// sweep-claims: T20 claims-reconcile, T21 claims-self-heal (S2-PR6).
+import './sweep-claims/index.js';

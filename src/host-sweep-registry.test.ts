@@ -47,6 +47,12 @@ const h = vi.hoisted(() => {
     opens: [] as string[],
     failNextOpen: null as unknown,
     mailbox: null as NanoclawMailboxSession | null,
+    // F-6.3: order + cross-duty visibility probe for T20 (claims-reconcile) →
+    // T21 (claims-self-heal). `claimsStore` stands in for the claims/ FIFO
+    // directory reconcile deletes from and self-heal reads.
+    claimsOrder: [] as string[],
+    claimsStore: [] as string[],
+    claimsSelfHealSawStore: null as string[] | null,
   };
 });
 
@@ -182,8 +188,19 @@ vi.mock('./storage-maintenance-worker.js', () => ({
   stopStorageMaintenanceWorker: () => undefined,
 }));
 vi.mock('./storage-pressure-alert.js', () => ({ handleStoragePressureAlert: () => undefined }));
-vi.mock('./modules/claims/reconcile.js', () => ({ reconcileMergedClaims: async () => undefined }));
-vi.mock('./modules/claims/self-heal.js', () => ({ sweepClaimsSelfHeal: async () => undefined }));
+vi.mock('./modules/claims/reconcile.js', () => ({
+  reconcileMergedClaims: async () => {
+    h.claimsOrder.push('reconcile');
+    // Simulates the reconcile pass closing a merged claim before self-heal runs.
+    h.claimsStore = h.claimsStore.filter((c) => c !== 'claim-merged');
+  },
+}));
+vi.mock('./modules/claims/self-heal.js', () => ({
+  sweepClaimsSelfHeal: async () => {
+    h.claimsOrder.push('self-heal');
+    h.claimsSelfHealSawStore = [...h.claimsStore];
+  },
+}));
 vi.mock('./repo-fence-recovery.js', () => ({ sweepOrphanedRepoIngressFences: async () => null }));
 vi.mock('./db/channel-ingress-receipts.js', () => ({ pruneChannelIngressReceipts: () => undefined }));
 vi.mock('./db/usage.js', () => ({ rollupSessionUsage: () => 0, pruneOldTurnUsage: () => undefined }));
@@ -232,6 +249,12 @@ import {
 import { log } from './log.js';
 import { SessionDbMissingError, SessionDbUnopenableError } from './modules/mailbox/index.js';
 import { _mailboxSessionDepthForTesting } from './modules/mailbox/session.js';
+// Family modules register their duties at import — imported here (as
+// src/modules/index.ts does at production boot) so R-7's registration pin
+// below sees the full 39-registration set, not just the in-file built-ins.
+import './modules/sweep-egress/index.js';
+import './modules/sweep-storage/index.js';
+import './modules/sweep-claims/index.js';
 
 probe.depth = _mailboxSessionDepthForTesting;
 
@@ -349,6 +372,9 @@ describe('sweep duty registry (S2-PR2)', () => {
     h.opens = [];
     h.failNextOpen = null;
     h.mailbox = fakeMailbox();
+    h.claimsOrder = [];
+    h.claimsStore = ['claim-merged', 'claim-open'];
+    h.claimsSelfHealSawStore = null;
   });
 
   afterEach(() => {
@@ -1009,6 +1035,39 @@ describe('sweep duty registry (S2-PR2)', () => {
     for (const [id, name] of Object.entries(SWEEP_DUTY_INVENTORY)) {
       expect(names, `inventory id ${id}`).toContain(name);
     }
+  });
+
+  // ── F-6.3 (S2-PR6) ───────────────────────────────────────────────────────────
+  it('claims reconcile is ordered strictly before claims self-heal', async () => {
+    // Declared order: T20 (claims-reconcile, order 100) then T21
+    // (claims-self-heal, order 110), both tick:housekeeping (plan.md §4.3
+    // constraint 3). No sessions needed — tick:housekeeping runs regardless.
+    const { duties } = _listSweepRegistrationsForTesting();
+    const byName = new Map(duties.map((d) => [d.name, d]));
+    const reconcile = byName.get(SWEEP_DUTY_INVENTORY.T20);
+    const selfHeal = byName.get(SWEEP_DUTY_INVENTORY.T21);
+    expect(reconcile?.phase).toBe('tick:housekeeping');
+    expect(selfHeal?.phase).toBe('tick:housekeeping');
+    expect(reconcile?.order).toBeLessThan(selfHeal?.order ?? Infinity);
+
+    await _sweepOnceForTesting();
+
+    // Order, and NOT merely declared order — the probe proves reconcile's
+    // deletion of 'claim-merged' is visible to self-heal in the SAME tick.
+    expect(h.claimsOrder).toEqual(['reconcile', 'self-heal']);
+    expect(h.claimsSelfHealSawStore).toEqual(['claim-open']);
+    expect(h.spawns).toEqual([]);
+  });
+
+  // ── F-6.4 (S2-PR6) ───────────────────────────────────────────────────────────
+  it('egress re-heal runs before the session fan-out', () => {
+    // tick:pre-session is, by SWEEP_PHASES's declared order (R-1), the phase
+    // the driver runs before getActiveSessions()/the per-session loop.
+    const { duties } = _listSweepRegistrationsForTesting();
+    const egress = duties.find((d) => d.name === SWEEP_DUTY_INVENTORY.T2);
+    expect(egress).toBeDefined();
+    expect(egress?.phase).toBe('tick:pre-session');
+    expect(SWEEP_PHASES.indexOf('tick:pre-session')).toBeLessThan(SWEEP_PHASES.indexOf('session:plan'));
   });
 
   // ── duty registration sources ───────────────────────────────────────────────
