@@ -105,3 +105,4 @@ Nothing blocking. Plan §9 carries two awareness items: the 15-restart deploy co
 ## Stage: build
 
 Not started.
+- 2026-09-03 07:30 ET — operator approved plan rev 2.2 ('go for it'); build delegated to session update-nanoclaw-3; S2-PR0/PR1 unblocked; PR2+ wait for mailbox PR 5/4 final heads (open Codex P1/P2 fixes pending on #271/#291).
