@@ -76,3 +76,10 @@ import './sweep-scheduled-move/index.js';
 // Sweep container health — S11 provider self-heal, S14 running-container SLA,
 // S16 OOM / memory-pressure notice (convergence seam 2, PR 10).
 import './sweep-container-health/index.js';
+// sweep-egress: T2 egress-network-reheal (S2-PR6).
+import './sweep-egress/index.js';
+// sweep-claims: T20 claims-reconcile, T21 claims-self-heal (S2-PR6).
+import './sweep-claims/index.js';
+// S2-PR6's own barrel line for sweep-storage is deliberately absent: this
+// lineage already imports that module above (S2-PR1 owns it for the
+// onHostShutdown half), and its T13 registration rides that same import.
