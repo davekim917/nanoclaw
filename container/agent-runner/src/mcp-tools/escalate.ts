@@ -34,7 +34,8 @@ export const escalateToOwner: McpToolDefinition = {
       properties: {
         question: {
           type: 'string',
-          description: 'The question for the owner. One or two sentences: what looks suspicious and what you need confirmed.',
+          description:
+            'The question for the owner. One or two sentences: what looks suspicious and what you need confirmed.',
         },
       },
       required: ['question'],
@@ -47,7 +48,7 @@ export const escalateToOwner: McpToolDefinition = {
       return err(`question too long (${question.length} chars, max ${MAX_QUESTION_CHARS})`);
     }
 
-    writeMessageOut({
+    await writeMessageOut({
       id: `escalate-${randomUUID()}`,
       kind: 'system',
       content: JSON.stringify({ action: 'escalate_to_owner', question }),

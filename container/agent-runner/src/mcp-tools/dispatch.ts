@@ -85,7 +85,7 @@ export const spawnTask: McpToolDefinition = {
     }
     const taskId = deriveSpawnTaskId(parentSessionId, idempotencyKey);
 
-    writeMessageOut({
+    await writeMessageOut({
       id: sysId(),
       kind: 'system',
       content: JSON.stringify({
@@ -211,7 +211,7 @@ export const spawnCancel: McpToolDefinition = {
     const content: Record<string, unknown> = { action: 'spawn_cancel', task_id: taskId };
     if (reason !== undefined) content.reason = reason;
 
-    writeMessageOut({
+    await writeMessageOut({
       id: sysId(),
       kind: 'system',
       content: JSON.stringify(content),

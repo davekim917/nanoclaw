@@ -42,11 +42,14 @@ export const createAgent: McpToolDefinition = {
   tool: {
     name: 'create_agent',
     description:
-      'Create a long-lived companion or collaborator sub-agent — a Researcher tracking an ongoing inquiry, a Calendar agent, a Builder handling code while you stay in conversation, a Reviewer running checks in the background. Each gets its own container, workspace, and persistent memory that survives across sessions — a full standalone agent, not a stateless sub-query. Its `name` becomes a destination on both sides: you `send_message({ to: name })` it, and its replies arrive with `from=name`. Use it when the agent needs its own memory/context that builds over time, or needs to work independently without blocking your turn. Do NOT use it for a one-off lookup or anything that finishes before the user\'s next message — use the Agent/Task tool instead, which is stateless and leaves no persistent footprint. Fire-and-forget: returns immediately without waiting for the agent to come up; messages queue until it is ready. May require admin approval before the agent is created.',
+      "Create a long-lived companion or collaborator sub-agent — a Researcher tracking an ongoing inquiry, a Calendar agent, a Builder handling code while you stay in conversation, a Reviewer running checks in the background. Each gets its own container, workspace, and persistent memory that survives across sessions — a full standalone agent, not a stateless sub-query. Its `name` becomes a destination on both sides: you `send_message({ to: name })` it, and its replies arrive with `from=name`. Use it when the agent needs its own memory/context that builds over time, or needs to work independently without blocking your turn. Do NOT use it for a one-off lookup or anything that finishes before the user's next message — use the Agent/Task tool instead, which is stateless and leaves no persistent footprint. Fire-and-forget: returns immediately without waiting for the agent to come up; messages queue until it is ready. May require admin approval before the agent is created.",
     inputSchema: {
       type: 'object' as const,
       properties: {
-        name: { type: 'string', description: 'Human-readable name (also becomes your destination name for this agent)' },
+        name: {
+          type: 'string',
+          description: 'Human-readable name (also becomes your destination name for this agent)',
+        },
         instructions: {
           type: 'string',
           description:
@@ -66,7 +69,7 @@ export const createAgent: McpToolDefinition = {
             "Claude: { model?: string, effort?: 'low'|'medium'|'high'|'xhigh'|'max' }. " +
             "Codex: { model?: string, reasoning_effort?: 'low'|'medium'|'high'|'xhigh'|'max'|'ultra' }. " +
             "Unknown keys are rejected. Keep this in sync with each provider's configSchema — " +
-            "see R6 in the design for the future z.toJSONSchema() migration.",
+            'see R6 in the design for the future z.toJSONSchema() migration.',
         },
       },
       required: ['name'],
@@ -96,7 +99,7 @@ export const createAgent: McpToolDefinition = {
     }
 
     const requestId = generateId();
-    writeMessageOut({
+    await writeMessageOut({
       id: requestId,
       kind: 'system',
       content: JSON.stringify({

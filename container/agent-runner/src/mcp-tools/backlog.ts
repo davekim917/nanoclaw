@@ -47,10 +47,10 @@ function getAgentGroupId(): string | null {
   return getConfig().agentGroupId || null;
 }
 
-function sendAction(action: string, data: Record<string, unknown>): void {
+async function sendAction(action: string, data: Record<string, unknown>): Promise<void> {
   const r = routing();
   const id = generateId('sys');
-  writeMessageOut({
+  await writeMessageOut({
     id,
     kind: 'system',
     platform_id: r.platform_id,
@@ -113,7 +113,7 @@ export const addShipLog: McpToolDefinition = {
     if (!agentGroupId) return err('No agent group ID — container not properly initialized');
     if (!args.title) return err('title is required');
 
-    sendAction('add_ship_log', {
+    await sendAction('add_ship_log', {
       id: generateId('ship'),
       title: args.title,
       description: args.description ?? null,
@@ -156,7 +156,7 @@ export const addBacklogItem: McpToolDefinition = {
   handler: async (args) => {
     if (!args.title) return err('title is required');
 
-    sendAction('add_backlog_item', {
+    await sendAction('add_backlog_item', {
       id: generateId('backlog'),
       title: args.title,
       description: args.description ?? null,
@@ -208,7 +208,7 @@ export const updateBacklogItem: McpToolDefinition = {
     if (args.tags !== undefined) updates.tags = args.tags;
     if (args.notes !== undefined) updates.notes = args.notes;
 
-    sendAction('update_backlog_item', updates);
+    await sendAction('update_backlog_item', updates);
 
     log(`update_backlog_item: ${args.itemId}`);
     return ok(`Backlog item ${args.itemId} update requested.`);
@@ -230,7 +230,7 @@ export const deleteBacklogItem: McpToolDefinition = {
   handler: async (args) => {
     if (!args.itemId) return err('itemId is required');
 
-    sendAction('delete_backlog_item', { itemId: args.itemId });
+    await sendAction('delete_backlog_item', { itemId: args.itemId });
 
     log(`delete_backlog_item: ${args.itemId}`);
     return ok(`Backlog item ${args.itemId} deletion requested.`);

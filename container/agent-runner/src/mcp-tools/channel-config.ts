@@ -38,9 +38,9 @@ function genId(prefix: string): string {
   return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
-function emit(action: string, extra: Record<string, unknown> = {}): void {
+async function emit(action: string, extra: Record<string, unknown> = {}): Promise<void> {
   const r = getSessionRouting();
-  writeMessageOut({
+  await writeMessageOut({
     id: genId('chcfg'),
     kind: 'system',
     platform_id: r.platform_id,
@@ -81,7 +81,7 @@ export const setChannelModelTool: McpToolDefinition = {
     if (model === undefined) {
       return ok('Error: `model` is required. Pass a model id / alias, or null to clear.');
     }
-    emit('set_channel_model', { channel, model });
+    await emit('set_channel_model', { channel, model });
     const action = model === null ? 'clear' : `set to ${model}`;
     return ok(
       `set_channel_model requested (channel=${channel ?? '(current)'}, action=${action}). Host will reply with the outcome.`,
@@ -103,7 +103,8 @@ export const setChannelEffortTool: McpToolDefinition = {
         },
         effort: {
           type: ['string', 'null'],
-          description: 'Provider-specific effort level (Codex: low | medium | high | xhigh | max | ultra) or null to clear the override.',
+          description:
+            'Provider-specific effort level (Codex: low | medium | high | xhigh | max | ultra) or null to clear the override.',
         },
       },
       required: ['effort'],
@@ -111,7 +112,8 @@ export const setChannelEffortTool: McpToolDefinition = {
   },
   handler: async (args: Record<string, unknown>) => {
     const channel = typeof args.channel === 'string' ? args.channel.trim() : undefined;
-    const effort = args.effort === null ? null : typeof args.effort === 'string' ? args.effort.trim().toLowerCase() : undefined;
+    const effort =
+      args.effort === null ? null : typeof args.effort === 'string' ? args.effort.trim().toLowerCase() : undefined;
     if (effort === undefined) {
       return ok('Error: `effort` is required. Pass a provider-supported level (for example max), or null to clear.');
     }
@@ -120,7 +122,7 @@ export const setChannelEffortTool: McpToolDefinition = {
         `Error: effort must be one of low, medium, high, xhigh, max, ultra (or null). Got ${JSON.stringify(args.effort)}.`,
       );
     }
-    emit('set_channel_effort', { channel, effort });
+    await emit('set_channel_effort', { channel, effort });
     const action = effort === null ? 'clear' : `set to ${effort}`;
     return ok(
       `set_channel_effort requested (channel=${channel ?? '(current)'}, action=${action}). Host will reply with the outcome.`,

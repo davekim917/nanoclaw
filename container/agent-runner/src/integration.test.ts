@@ -947,7 +947,10 @@ describe('poll loop — /clear command', () => {
     const controller = new AbortController();
     const loopPromise = runPollLoopWithTimeout(provider, controller.signal, 2000);
 
-    await waitFor(() => deliverableOut().length > 0, 2000);
+    // Wait for the ack, not just the confirmation row: writeMessageOut is
+    // awaited now (upstream's mailbox contract), so the outbound row lands one
+    // tick before markCompleted rather than in the same synchronous block.
+    await waitFor(() => deliverableOut().length > 0 && getPendingMessages().length === 0, 2000);
     controller.abort();
 
     const out = deliverableOut();

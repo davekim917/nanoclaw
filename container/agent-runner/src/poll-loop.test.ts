@@ -1013,7 +1013,7 @@ describe('routing', () => {
     expect(routing.inReplyTo).toBe('m1');
   });
 
-  it('marks a batch of only agent_scheduled_wake rows as selfWake, and dispatch drops its bare text', () => {
+  it('marks a batch of only agent_scheduled_wake rows as selfWake, and dispatch drops its bare text', async () => {
     getInboundDb()
       .prepare(
         `INSERT INTO messages_in (id, kind, timestamp, status, platform_id, channel_type, thread_id, content)
@@ -1029,7 +1029,7 @@ describe('routing', () => {
 
     // The spam shape: bare narration on a wake turn must be logged, not
     // origin-fallback-delivered, and must not trigger the wrap nudge.
-    const result = dispatchResultText('Nothing moved. No post. Next check at 14:36 ET.', routing);
+    const result = await dispatchResultText('Nothing moved. No post. Next check at 14:36 ET.', routing);
     expect(result.sent).toBe(0);
     expect(result.hasUnwrapped).toBe(false);
 
@@ -1363,7 +1363,7 @@ describe('end-to-end with mock provider', () => {
 
     for await (const event of query.events) {
       if (event.type === 'result' && event.text) {
-        writeMessageOut({
+        await writeMessageOut({
           id: `out-${Date.now()}`,
           in_reply_to: routing.inReplyTo,
           kind: 'chat',
@@ -1403,11 +1403,11 @@ describe('dispatchResultText — unwrapped output fallback', () => {
     return { channelType, platformId, threadId: null, inReplyTo: null, quietStatus: false };
   }
 
-  it('routes wrapped <message to=...> blocks to their named destinations', () => {
+  it('routes wrapped <message to=...> blocks to their named destinations', async () => {
     seedDestination('slack-main', 'slack', 'C-MAIN');
     seedDestination('discord-side', 'discord', 'chan-9');
 
-    dispatchResultText('<message to="discord-side">explicit reply</message>', routing('slack', 'C-MAIN'));
+    await dispatchResultText('<message to="discord-side">explicit reply</message>', routing('slack', 'C-MAIN'));
 
     const out = getUndeliveredMessages();
     expect(out).toHaveLength(1);
@@ -1416,14 +1416,14 @@ describe('dispatchResultText — unwrapped output fallback', () => {
     expect(JSON.parse(out[0].content).text).toBe('explicit reply');
   });
 
-  it('multi-destination + unwrapped text → routes to origin destination (the fix)', () => {
+  it('multi-destination + unwrapped text → routes to origin destination (the fix)', async () => {
     // Two destinations wired (e.g. agent-shared mode, or auto-wired channels).
     // The agent forgot to wrap and produced bare text. Origin = slack-main
     // because routing.channelType+platformId match it.
     seedDestination('slack-main', 'slack', 'C-MAIN');
     seedDestination('discord-side', 'discord', 'chan-9');
 
-    dispatchResultText('Sorry, I dropped the wrapping. Here is my actual answer.', routing('slack', 'C-MAIN'));
+    await dispatchResultText('Sorry, I dropped the wrapping. Here is my actual answer.', routing('slack', 'C-MAIN'));
 
     const out = getUndeliveredMessages();
     expect(out).toHaveLength(1);
@@ -1432,23 +1432,23 @@ describe('dispatchResultText — unwrapped output fallback', () => {
     expect(JSON.parse(out[0].content).text).toContain('Here is my actual answer.');
   });
 
-  it('multi-destination + unwrapped text + unresolvable origin → drops (no broadcast)', () => {
+  it('multi-destination + unwrapped text + unresolvable origin → drops (no broadcast)', async () => {
     // Routing has no platformId match in destinations table, and we have
     // multiple destinations — there's no safe target, drop the text.
     seedDestination('slack-main', 'slack', 'C-MAIN');
     seedDestination('discord-side', 'discord', 'chan-9');
 
-    dispatchResultText('unwrapped reply with no resolvable origin', routing('telegram', 'unknown-chat'));
+    await dispatchResultText('unwrapped reply with no resolvable origin', routing('telegram', 'unknown-chat'));
 
     expect(getUndeliveredMessages()).toHaveLength(0);
   });
 
-  it('single-destination + unwrapped text + null routing → routes to the only destination', () => {
+  it('single-destination + unwrapped text + null routing → routes to the only destination', async () => {
     // Legacy behavior preserved: cron-fired tasks with stripped routing in
     // a single-destination group still get rescued.
     seedDestination('slack-only', 'slack', 'C-ONLY');
 
-    dispatchResultText('bare text from a null-routed source', routing(null, null));
+    await dispatchResultText('bare text from a null-routed source', routing(null, null));
 
     const out = getUndeliveredMessages();
     expect(out).toHaveLength(1);
@@ -1456,13 +1456,13 @@ describe('dispatchResultText — unwrapped output fallback', () => {
     expect(out[0].platform_id).toBe('C-ONLY');
   });
 
-  it('wrapped output + scratchpad does NOT trigger fallback', () => {
+  it('wrapped output + scratchpad does NOT trigger fallback', async () => {
     // If the agent wrapped at least one block, scratchpad is just notes
     // — don't double-deliver via fallback.
     seedDestination('slack-main', 'slack', 'C-MAIN');
     seedDestination('discord-side', 'discord', 'chan-9');
 
-    dispatchResultText(
+    await dispatchResultText(
       'thinking out loud<message to="slack-main">final answer</message>more notes',
       routing('slack', 'C-MAIN'),
     );
@@ -1472,15 +1472,15 @@ describe('dispatchResultText — unwrapped output fallback', () => {
     expect(JSON.parse(out[0].content).text).toBe('final answer');
   });
 
-  it('only <internal> tags → empty scratchpad → no delivery', () => {
+  it('only <internal> tags → empty scratchpad → no delivery', async () => {
     seedDestination('slack-main', 'slack', 'C-MAIN');
 
-    dispatchResultText('<internal>just thinking</internal>', routing('slack', 'C-MAIN'));
+    await dispatchResultText('<internal>just thinking</internal>', routing('slack', 'C-MAIN'));
 
     expect(getUndeliveredMessages()).toHaveLength(0);
   });
 
-  it('stages provider-generated files into outbox and routes them to the origin destination', () => {
+  it('stages provider-generated files into outbox and routes them to the origin destination', async () => {
     seedDestination('slack-main', 'slack', 'C-MAIN');
     getInboundDb()
       .prepare(
@@ -1494,7 +1494,7 @@ describe('dispatchResultText — unwrapped output fallback', () => {
     const sourcePath = path.join(sourceDir, 'cafe.png');
     fs.writeFileSync(sourcePath, Buffer.from('png-bytes'));
 
-    const delivered = dispatchFileAttachment(
+    const delivered = await dispatchFileAttachment(
       { path: sourcePath, text: 'Preview', filename: '../cafe.png' },
       { ...routing('slack', 'C-MAIN'), inReplyTo: 'trigger-1' },
       outboxRoot,
@@ -1516,14 +1516,14 @@ describe('dispatchResultText — unwrapped output fallback', () => {
     expect(fs.readFileSync(path.join(outboxRoot, out[0].id, 'cafe.png'), 'utf-8')).toBe('png-bytes');
   });
 
-  it('does not broadcast provider-generated files when the origin cannot be resolved', () => {
+  it('does not broadcast provider-generated files when the origin cannot be resolved', async () => {
     seedDestination('slack-main', 'slack', 'C-MAIN');
     seedDestination('discord-side', 'discord', 'chan-9');
     const sourceDir = fs.mkdtempSync(path.join(os.tmpdir(), 'nanoclaw-image-'));
     const sourcePath = path.join(sourceDir, 'cafe.png');
     fs.writeFileSync(sourcePath, Buffer.from('png-bytes'));
 
-    const delivered = dispatchFileAttachment(
+    const delivered = await dispatchFileAttachment(
       { path: sourcePath },
       routing('slack', 'C-UNKNOWN'),
       fs.mkdtempSync(path.join(os.tmpdir(), 'nanoclaw-outbox-')),
@@ -1548,11 +1548,11 @@ describe('dispatchResultText — "here" alias', () => {
     return { channelType, platformId, threadId: null, inReplyTo: null, quietStatus: false };
   }
 
-  it('routes <message to="here"> to the origin destination', () => {
+  it('routes <message to="here"> to the origin destination', async () => {
     seedDestination('slack-main', 'slack', 'C-MAIN');
     seedDestination('discord-side', 'discord', 'chan-9');
 
-    const result = dispatchResultText('<message to="here">reply in place</message>', routing('slack', 'C-MAIN'));
+    const result = await dispatchResultText('<message to="here">reply in place</message>', routing('slack', 'C-MAIN'));
 
     expect(result.sent).toBe(1);
     const out = getUndeliveredMessages();
@@ -1562,32 +1562,32 @@ describe('dispatchResultText — "here" alias', () => {
     expect(JSON.parse(out[0].content).text).toBe('reply in place');
   });
 
-  it('is case-insensitive — <message to="HERE"> resolves the same way', () => {
+  it('is case-insensitive — <message to="HERE"> resolves the same way', async () => {
     seedDestination('slack-main', 'slack', 'C-MAIN');
 
-    dispatchResultText('<message to="HERE">shout back</message>', routing('slack', 'C-MAIN'));
+    await dispatchResultText('<message to="HERE">shout back</message>', routing('slack', 'C-MAIN'));
 
     const out = getUndeliveredMessages();
     expect(out).toHaveLength(1);
     expect(JSON.parse(out[0].content).text).toBe('shout back');
   });
 
-  it('a real destination literally named "here" wins over the alias', () => {
+  it('a real destination literally named "here" wins over the alias', async () => {
     seedDestination('here', 'slack', 'C-LITERAL');
     seedDestination('slack-main', 'slack', 'C-MAIN');
 
-    dispatchResultText('<message to="here">literal destination</message>', routing('slack', 'C-MAIN'));
+    await dispatchResultText('<message to="here">literal destination</message>', routing('slack', 'C-MAIN'));
 
     const out = getUndeliveredMessages();
     expect(out).toHaveLength(1);
     expect(out[0].platform_id).toBe('C-LITERAL');
   });
 
-  it('unresolvable origin falls through to unknown-destination handling instead of a silent drop', () => {
+  it('unresolvable origin falls through to unknown-destination handling instead of a silent drop', async () => {
     seedDestination('slack-main', 'slack', 'C-MAIN');
     seedDestination('discord-side', 'discord', 'chan-9');
 
-    const result = dispatchResultText(
+    const result = await dispatchResultText(
       '<message to="here">nowhere to land</message>',
       routing('telegram', 'unknown-chat'),
     );
@@ -1598,7 +1598,7 @@ describe('dispatchResultText — "here" alias', () => {
     expect(getUndeliveredMessages()).toHaveLength(0);
   });
 
-  it('is rejected like any other block in a task-run session', () => {
+  it('is rejected like any other block in a task-run session', async () => {
     seedDestination('slack-main', 'slack', 'C-TASK');
     getInboundDb()
       .prepare(
@@ -1608,7 +1608,7 @@ describe('dispatchResultText — "here" alias', () => {
       .run();
 
     const taskRouting = extractRouting(getPendingMessages());
-    const result = dispatchResultText('<message to="here">task reply</message>', taskRouting);
+    const result = await dispatchResultText('<message to="here">task reply</message>', taskRouting);
 
     expect(result).toEqual({
       sent: 0,
@@ -1647,7 +1647,7 @@ describe('task-fire routing — a stamped `ncl tasks` row routes end-to-end', ()
       .run(id, platformId, channelType, threadId);
   }
 
-  it('keeps a task-only batch route available without auto-delivering unwrapped final text', () => {
+  it('keeps a task-only batch route available without auto-delivering unwrapped final text', async () => {
     seedDestination('slack-main', 'slack', 'C-TASK');
     insertTaskRow('task-1', 'C-TASK', 'slack', 'thread-99');
 
@@ -1656,18 +1656,18 @@ describe('task-fire routing — a stamped `ncl tasks` row routes end-to-end', ()
     expect(routing.platformId).toBe('C-TASK');
     expect(routing.threadId).toBe('thread-99');
 
-    const result = dispatchResultText('forgot to wrap — here is the run summary', routing);
+    const result = await dispatchResultText('forgot to wrap — here is the run summary', routing);
 
     expect(result).toEqual({ sent: 0, hasUnwrapped: false, taskBlocks: [] });
     expect(getUndeliveredMessages()).toHaveLength(0);
   });
 
-  it('captures a legacy <message to=...> block for correction without auto-delivering it', () => {
+  it('captures a legacy <message to=...> block for correction without auto-delivering it', async () => {
     seedDestination('slack-main', 'slack', 'C-TASK');
     insertTaskRow('task-2', 'C-TASK', 'slack', 'thread-99');
 
     const routing = extractRouting(getPendingMessages());
-    const result = dispatchResultText('<message to="slack-main">explicit task reply</message>', routing);
+    const result = await dispatchResultText('<message to="slack-main">explicit task reply</message>', routing);
 
     expect(result).toEqual({
       sent: 0,
@@ -1677,7 +1677,7 @@ describe('task-fire routing — a stamped `ncl tasks` row routes end-to-end', ()
     expect(getUndeliveredMessages()).toHaveLength(0);
   });
 
-  it('an isolated (unrouted) task row has no destination match and the unwrapped reply is dropped', () => {
+  it('an isolated (unrouted) task row has no destination match and the unwrapped reply is dropped', async () => {
     // No destination seeded, and the task row itself carries null routing
     // (the --isolated case) — origin-fallback and single-destination
     // fallback both miss, so the reply is discarded, not broadcast.
@@ -1686,7 +1686,7 @@ describe('task-fire routing — a stamped `ncl tasks` row routes end-to-end', ()
     const routing = extractRouting(getPendingMessages());
     expect(routing.platformId).toBeNull();
 
-    dispatchResultText('nobody to tell', routing);
+    await dispatchResultText('nobody to tell', routing);
 
     expect(getUndeliveredMessages()).toHaveLength(0);
   });
@@ -1713,20 +1713,20 @@ describe('dispatchResultText — unclosed-wrapper tolerance', () => {
     return { channelType, platformId, threadId: null, inReplyTo: null, quietStatus: false };
   }
 
-  it('single unclosed opener at end-of-text → body extends to EOT and routes normally', () => {
+  it('single unclosed opener at end-of-text → body extends to EOT and routes normally', async () => {
     seedDestination('slack-main', 'slack', 'C-MAIN');
-    dispatchResultText('<message to="slack-main">no closing tag, please ship this', routing('slack', 'C-MAIN'));
+    await dispatchResultText('<message to="slack-main">no closing tag, please ship this', routing('slack', 'C-MAIN'));
     const out = getUndeliveredMessages();
     expect(out).toHaveLength(1);
     expect(out[0].channel_type).toBe('slack');
     expect(JSON.parse(out[0].content).text).toBe('no closing tag, please ship this');
   });
 
-  it('two consecutive unclosed openers (same dest) → two sends, no markup leak', () => {
+  it('two consecutive unclosed openers (same dest) → two sends, no markup leak', async () => {
     // Mirrors the helper-codex production repro: two `<message to="…">`
     // openers, no closes. Each becomes its own outbound row.
     seedDestination('slack-main', 'slack', 'C-MAIN');
-    dispatchResultText(
+    await dispatchResultText(
       '<message to="slack-main">first body\nspans multiple lines\n' + '<message to="slack-main">second body acked',
       routing('slack', 'C-MAIN'),
     );
@@ -1741,9 +1741,9 @@ describe('dispatchResultText — unclosed-wrapper tolerance', () => {
     }
   });
 
-  it('explicit close before next opener wins as the body endpoint', () => {
+  it('explicit close before next opener wins as the body endpoint', async () => {
     seedDestination('slack-main', 'slack', 'C-MAIN');
-    dispatchResultText(
+    await dispatchResultText(
       '<message to="slack-main">first done</message>\nbetween\n' + '<message to="slack-main">second still open',
       routing('slack', 'C-MAIN'),
     );
@@ -1755,11 +1755,11 @@ describe('dispatchResultText — unclosed-wrapper tolerance', () => {
     // counts as wrapped output, so the fallback doesn't fire).
   });
 
-  it('opener with empty to="" → block dropped, no markup leaks via fallback', () => {
+  it('opener with empty to="" → block dropped, no markup leaks via fallback', async () => {
     // Malformed opener — drop the block and ensure any residual `<message…>`
     // text in the fallback path gets stripped before reaching the user.
     seedDestination('slack-main', 'slack', 'C-MAIN');
-    dispatchResultText('<message to="">malformed body</message>\nrest of reply', routing('slack', 'C-MAIN'));
+    await dispatchResultText('<message to="">malformed body</message>\nrest of reply', routing('slack', 'C-MAIN'));
     const out = getUndeliveredMessages();
     // Since the malformed opener's body becomes scratchpad and there are
     // no successful sends, the fallback fires on the combined scratchpad.
@@ -1771,7 +1771,7 @@ describe('dispatchResultText — unclosed-wrapper tolerance', () => {
     expect(text).not.toContain('</message>');
   });
 
-  it('stray `<message…>` markup in scratchpad-only text gets stripped from fallback', () => {
+  it('stray `<message…>` markup in scratchpad-only text gets stripped from fallback', async () => {
     // Defensive: an agent that emits orphan opener tokens with no
     // matching close but ALSO no valid destination resolution should
     // never expose raw markup to the user. The opener regex requires
@@ -1780,7 +1780,7 @@ describe('dispatchResultText — unclosed-wrapper tolerance', () => {
     // (e.g. an unknown destination plus a stripped wrapper), the strip
     // catches it.
     seedDestination('slack-main', 'slack', 'C-MAIN');
-    dispatchResultText(
+    await dispatchResultText(
       'pre-text\n<message to="unknown-destination">body</message>\npost-text',
       routing('slack', 'C-MAIN'),
     );

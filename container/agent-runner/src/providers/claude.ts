@@ -1626,7 +1626,7 @@ export function createEmailGateHook(): HookCallback {
 
     const routing = getSessionRouting();
     const requestId = `gate-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-    writeMessageOut({
+    await writeMessageOut({
       id: requestId,
       kind: 'system',
       platform_id: routing?.platform_id ?? null,

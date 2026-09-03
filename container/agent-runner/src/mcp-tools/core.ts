@@ -258,7 +258,7 @@ export const sendFile: McpToolDefinition = {
     fs.mkdirSync(outboxDir, { recursive: true });
     fs.writeFileSync(path.join(outboxDir, filename), fileContent);
 
-    writeMessageOut({
+    await writeMessageOut({
       id,
       in_reply_to: getCurrentInReplyTo(),
       kind: 'chat',
@@ -326,7 +326,7 @@ export const editMessage: McpToolDefinition = {
     }
 
     const id = generateId();
-    writeMessageOut({
+    await writeMessageOut({
       id,
       kind: 'chat',
       platform_id: routing.platform_id,
@@ -368,7 +368,7 @@ export const addReaction: McpToolDefinition = {
     }
 
     const id = generateId();
-    writeMessageOut({
+    await writeMessageOut({
       id,
       kind: 'chat',
       platform_id: routing.platform_id,

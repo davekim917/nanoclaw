@@ -70,7 +70,7 @@ export const installPackages: McpToolDefinition = {
     if (invalidNpm) return err(`Invalid npm package name: "${invalidNpm}". No version specs or shell characters.`);
 
     const requestId = generateId();
-    writeMessageOut({
+    await writeMessageOut({
       id: requestId,
       kind: 'system',
       content: JSON.stringify({
@@ -108,7 +108,7 @@ export const addMcpServer: McpToolDefinition = {
     if (!name || !command) return err('name and command are required');
 
     const requestId = generateId();
-    writeMessageOut({
+    await writeMessageOut({
       id: requestId,
       kind: 'system',
       content: JSON.stringify({
