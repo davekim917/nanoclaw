@@ -200,6 +200,120 @@ export function buildArchiveProjection(
 }
 
 /**
+ * Everything the archive projection's contents depend on.
+ *
+ * Recorded next to the projection so a spawn can tell, without reading the
+ * 400 MB source, whether the file it already has is still the file this build
+ * would produce. See `ensureArchiveProjection`.
+ *
+ * Bump `ARCHIVE_PROJECTION_STAMP_VERSION` whenever `buildArchiveProjection`'s
+ * output changes for identical inputs — the schema, the dedup grouping, the
+ * column list. A stamp from an older builder never satisfies a newer one.
+ */
+export const ARCHIVE_PROJECTION_STAMP_VERSION = 1;
+
+export interface ArchiveProjectionStamp {
+  version: number;
+  agentGroupId: string;
+  /** Sorted workgroup member ids, or null for the legacy single-agent filter. */
+  scope: string[] | null;
+  /** Source file identity. Absent when the source does not exist yet. */
+  src: { size: string; mtimeNs: string } | null;
+  /** A `-journal` sidecar means a write was in flight when we looked. */
+  journal: { size: string; mtimeNs: string } | null;
+}
+
+function statSignature(filePath: string): { size: string; mtimeNs: string } | null {
+  try {
+    const stat = fs.statSync(filePath, { bigint: true });
+    return { size: String(stat.size), mtimeNs: String(stat.mtimeNs) };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Describe the inputs of the projection that `buildArchiveProjection` would
+ * write right now.
+ *
+ * Source-change detection is a file-identity check (size plus nanosecond
+ * mtime), NOT a row watermark, and that is deliberate. `messages_archive` is
+ * not append-only: `upsertArchiveMessage` (`src/message-archive.ts`) carries an
+ * `ON CONFLICT(id) DO UPDATE SET text = excluded.text` clause, so an edited
+ * message rewrites a row in place, leaving row count and `MAX(sent_at)`
+ * untouched. Any cheap scoped watermark would therefore miss edits and serve a
+ * container stale history. `PRAGMA data_version` is no help either — SQLite
+ * only guarantees it meaningful within one connection, and every spawn opens a
+ * fresh one.
+ *
+ * The cost of that soundness is a coarser gate: because the file identity
+ * covers the whole archive, a write for ANY agent group invalidates every
+ * group's stamp. Reuse therefore catches quiet periods, spawn bursts and spawn
+ * retries rather than most spawns on a busy host. Removing the stall does not
+ * depend on the hit rate — the rebuild runs off the main thread either way.
+ * `archive.db` runs `journal_mode = TRUNCATE`, so a commit always moves the
+ * main file; there is no WAL sidecar to miss.
+ */
+export function computeArchiveProjectionStamp(
+  srcPath: string,
+  agentGroupId: string,
+  workgroupMemberIds?: string[],
+): ArchiveProjectionStamp {
+  return {
+    version: ARCHIVE_PROJECTION_STAMP_VERSION,
+    agentGroupId,
+    // Sorted so member order from the central DB cannot force a rebuild, and
+    // copied so a later mutation of the caller's array cannot alter the stamp.
+    scope: workgroupMemberIds ? [...workgroupMemberIds].sort() : null,
+    src: statSignature(srcPath),
+    journal: statSignature(`${srcPath}-journal`),
+  };
+}
+
+/** Sidecar path holding the stamp. Never mounted into a container. */
+export function archiveProjectionStampPath(dstPath: string): string {
+  return `${dstPath}.stamp.json`;
+}
+
+export function readArchiveProjectionStamp(dstPath: string): ArchiveProjectionStamp | null {
+  try {
+    return JSON.parse(fs.readFileSync(archiveProjectionStampPath(dstPath), 'utf-8')) as ArchiveProjectionStamp;
+  } catch {
+    return null;
+  }
+}
+
+export function writeArchiveProjectionStamp(dstPath: string, stamp: ArchiveProjectionStamp): void {
+  // Written after the projection, so a crash between the two leaves a missing
+  // or older stamp — which forces a rebuild. The failure mode is a wasted
+  // rebuild, never a stale projection served as fresh.
+  fs.writeFileSync(archiveProjectionStampPath(dstPath), JSON.stringify(stamp));
+}
+
+/**
+ * True when the projection already on disk was built from exactly these
+ * inputs, so rebuilding it would reproduce the same file byte for byte.
+ *
+ * Fails closed in every ambiguous case: a missing or unreadable stamp, a stamp
+ * from an older builder, a missing or empty projection file, or a source that
+ * has moved all return false and force a rebuild. A journal sidecar present at
+ * either build time or now also forces one, since a commit was in flight and
+ * the main file's identity cannot be trusted to describe the committed state.
+ */
+export function archiveProjectionIsFresh(dstPath: string, stamp: ArchiveProjectionStamp): boolean {
+  if (stamp.version !== ARCHIVE_PROJECTION_STAMP_VERSION) return false;
+  if (stamp.journal !== null) return false;
+  const previous = readArchiveProjectionStamp(dstPath);
+  if (!previous) return false;
+  try {
+    if (fs.statSync(dstPath).size === 0) return false;
+  } catch {
+    return false;
+  }
+  return JSON.stringify(previous) === JSON.stringify(stamp);
+}
+
+/**
  * Build a per-agent projection of `central.db` containing ONLY the tables
  * the container reads (backlog_items, ship_log, tasks, agent_group_capabilities)
  * filtered to this agent's rows. Other central tables (pending_approvals,

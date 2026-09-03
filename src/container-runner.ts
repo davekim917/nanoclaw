@@ -73,7 +73,8 @@ import {
 import { getDb, hasTable } from './db/connection.js';
 import { getMessagingGroup } from './db/messaging-groups.js';
 import { readRepoIngressFence } from './db/session-db.js';
-import { buildArchiveProjection, buildCentralProjection } from './db/per-agent-projections.js';
+import { buildCentralProjection } from './db/per-agent-projections.js';
+import { ensureArchiveProjection } from './db/archive-projection-worker.js';
 import { initGroupFilesystem } from './group-init.js';
 import { stopTypingRefresh } from './modules/typing/index.js';
 import { log } from './log.js';
@@ -882,7 +883,7 @@ async function spawnContainer(
   // buildMounts and buildContainerArgs so side effects (mkdir, etc.) fire once.
   const { provider, contribution } = resolveProviderContribution(spawnSession, agentGroup, containerConfig);
 
-  const mounts = buildMounts(agentGroup, session, containerConfig, provider, contribution, resolvedWgId);
+  const mounts = await buildMounts(agentGroup, session, containerConfig, provider, contribution, resolvedWgId);
   const containerName = `nanoclaw-v2-${agentGroup.folder}-${Date.now()}`;
   // OneCLI agent identifier is always the agent group id — stable across
   // sessions and reversible via getAgentGroup() for approval routing.
@@ -1763,7 +1764,7 @@ export function channelInstructionsMounts(
   return mounts;
 }
 
-export function buildMounts(
+export async function buildMounts(
   agentGroup: AgentGroup,
   session: Session,
   containerConfig: import('./container-config.js').ContainerConfig,
@@ -1776,7 +1777,7 @@ export function buildMounts(
   // field for direct callers (tests, etc.) that don't go through
   // spawnContainer.
   resolvedWgId?: string,
-): VolumeMount[] {
+): Promise<VolumeMount[]> {
   const projectRoot = process.cwd();
 
   // Default agent surfaces (composed project doc, skill links, provider state
@@ -2144,7 +2145,12 @@ export function buildMounts(
     });
   }
 
-  buildArchiveProjection(archiveSrc, archiveDst, agentGroup.id, workgroupMemberIds);
+  // Awaited: the projection is rebuilt on a worker thread when its inputs have
+  // moved, and skipped entirely when they have not. It used to run
+  // synchronously here on every spawn, which parked the host event loop for
+  // seconds at a time — the dominant cause of #315. Fail-closed is unchanged:
+  // a build that runs and throws aborts the spawn.
+  await ensureArchiveProjection(archiveSrc, archiveDst, agentGroup.id, workgroupMemberIds);
   mounts.push({ hostPath: archiveDst, containerPath: '/workspace/archive.db', readonly: true });
 
   const centralSrc = path.join(DATA_DIR, 'v2.db');
