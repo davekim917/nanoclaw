@@ -21,11 +21,6 @@ export function ensureSchema(dbPath: string, schema: 'inbound' | 'outbound'): vo
   if (schema === 'inbound') {
     const existing = db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'messages_in'").get();
     if (existing) migrateMessagesInTable(db);
-    db.exec(INBOUND_SCHEMA);
-    // Every fork migration, not just messages_in: `CREATE TABLE IF NOT EXISTS`
-    // is a no-op on a table upstream's baseline already created, so a DB
-    // provisioned by `SqliteAgentMailbox.prepare()` would otherwise keep
-    // upstream's narrower `session_routing` and `delivered` shapes.
     ensureNanoclawInboundSchema(db);
   } else {
     db.exec(OUTBOUND_SCHEMA);
@@ -209,18 +204,17 @@ export function migrateMessagesInTable(db: Database.Database): void {
  * throughout, so it is safe on a DB that already has the current shape and on
  * a legacy one that has none of it.
  *
- * `delivered` and `session_routing` are migrated only when the table exists:
- * upstream's baseline creates both, but a legacy DB predating either has no
- * such table and its `ALTER TABLE` would throw. `messages_in` is not guarded
- * that way — every session DB has it, and a DB without one is corrupt, not
- * legacy.
+ * The baseline runs FIRST, and unconditionally. A legacy DB can predate
+ * `session_routing` or `delivered` entirely, and an additive migration against
+ * an absent table either throws or (if guarded) silently leaves it absent —
+ * after which the next spawn's `writeSessionRouting` fails on
+ * `ALTER TABLE session_routing` for that session, every time. `CREATE TABLE IF
+ * NOT EXISTS` throughout, so it is a no-op on a current DB. This is what
+ * `initSessionFolder`'s unconditional `ensureSchema` has always done.
  */
 export function ensureNanoclawInboundSchema(db: Database.Database): void {
+  db.exec(INBOUND_SCHEMA);
   migrateMessagesInTable(db);
-  if (hasTable(db, 'session_routing')) migrateSessionRoutingTable(db);
-  if (hasTable(db, 'delivered')) migrateDeliveredTable(db);
-}
-
-function hasTable(db: Database.Database, table: string): boolean {
-  return (db.prepare("PRAGMA table_info('" + table + "')").all() as unknown[]).length > 0;
+  migrateSessionRoutingTable(db);
+  migrateDeliveredTable(db);
 }
