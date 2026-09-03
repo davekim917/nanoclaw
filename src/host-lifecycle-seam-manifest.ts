@@ -48,17 +48,14 @@ export const UNPORTABLE_UPSTREAM_FILES: ReadonlyArray<{
     upstream: 'src/host-lifecycle.test.ts',
     forkTest: 'src/host-lifecycle.test.ts',
     reason:
-      "Three of upstream's eight cases describe upstream's own tree, not this fork's: two " +
+      "Two of upstream's eight cases describe upstream's own tree, not this fork's: both " +
       'read src/index.ts for the boot-order strings (this fork boots in src/main.ts — ' +
       "src/index.ts is a 15-line deploy-crash-guard shim, per that file's own header " +
-      'comment, "do not add imports here beyond the guard") and one asserts ' +
-      "src/modules/approvals/index.ts registers with onHostShutdown (this fork's " +
-      "approvals module shuts down via response-registry.ts's own onShutdown until a " +
-      'later seam-2 PR migrates it — migrating it here would also break the S2-PR0 ' +
-      'acceptance case that PR 0 registers zero host-lifecycle callbacks). The five ' +
-      'remaining registry-behavior cases and the two boot-order cases (path-swapped to ' +
-      'src/main.ts) are kept in the fork-owned src/host-lifecycle.test.ts at the same ' +
-      'path; the approvals case is deferred until that migration lands.',
+      'comment, "do not add imports here beyond the guard"). The five remaining ' +
+      'registry-behavior cases and the two boot-order cases (path-swapped to src/main.ts) ' +
+      'are kept in the fork-owned src/host-lifecycle.test.ts at the same path, and so is ' +
+      "upstream's approvals case: S2-PR14 moved src/modules/approvals/index.ts onto " +
+      'onHostShutdown, so that case is carried verbatim and nothing is deferred.',
   },
 ] as const;
 

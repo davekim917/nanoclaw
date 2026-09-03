@@ -116,6 +116,10 @@ const EXPECTED_HOST_SHUTDOWN_REGISTRANTS = [
   // Also reached through the barrel — src/db/archive-projection-worker.ts is
   // imported by src/container-runner.ts, which ten barrel modules import (#324).
   'archiveProjectionHostShutdown',
+  // S2-PR14 moved the approvals module's OneCLI-handler stop off
+  // response-registry.ts's own onShutdown onto the host lifecycle, which is
+  // upstream's shape and what upstream's own case asserts.
+  'approvalsHostShutdown',
 ].sort();
 
 /**

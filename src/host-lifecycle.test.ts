@@ -17,12 +17,11 @@
  * `await stopHostModules()`, `stopDeliveryPolls()`) exist in src/main.ts in the same
  * relative order.
  *
- * REMOVED: "registers built-in approvals cleanup with the host lifecycle". This fork's
- * approvals module shuts down via response-registry.ts's own onShutdown, not
- * host-lifecycle.ts's onHostShutdown — migrating it here would also break S2-PR0's own
- * acceptance case (L-4) that PR 0 registers zero host-lifecycle callbacks. Re-raise
- * trigger: the seam-2 follow-up PR that migrates approvals' shutdown hook from
- * response-registry onShutdown to onHostShutdown must re-add this case verbatim.
+ * RE-ADDED (S2-PR14): "registers built-in approvals cleanup with the host lifecycle",
+ * verbatim from upstream `5c3082a1:src/host-lifecycle.test.ts`. It was removed while this
+ * fork's approvals module still shut down through response-registry.ts's own onShutdown;
+ * that module now registers `approvalsHostShutdown` on the host lifecycle, which is
+ * upstream's shape, so the case is portable again and nothing is deferred.
  */
 import fs from 'fs';
 import path from 'path';
@@ -37,6 +36,10 @@ vi.mock('./log.js', () => ({
     error: vi.fn(),
     fatal: vi.fn(),
   },
+  // The approvals case below imports src/modules/approvals/index.ts, which
+  // reaches delivery.ts → secret-scrubber.ts, and that module calls
+  // `setLogScrubber` at import time. Fake surface only; no assertion uses it.
+  setLogScrubber: vi.fn(),
 }));
 
 beforeEach(() => {
@@ -146,6 +149,22 @@ describe('host module lifecycle registry', () => {
     expect(log.error).toHaveBeenCalledWith('Shutdown callback threw', {
       err: expect.objectContaining({ message: 'shutdown-sentinel' }),
     });
+  });
+
+  it('registers built-in approvals cleanup with the host lifecycle', async () => {
+    const lifecycle = await import('./host-lifecycle.js');
+
+    expect(lifecycle.getHostShutdownCallbacks()).toHaveLength(0);
+    await import('./modules/approvals/index.js');
+    // Upstream asserts a length of exactly 1 here. On this fork the approvals
+    // module's own import graph reaches src/db/archive-projection-worker.ts
+    // (via delivery.ts → container-runner.ts, #324), which registers a second,
+    // unrelated callback — a difference in the fork's module graph, not in what
+    // approvals registers. The assertion is therefore stated on the approvals
+    // registrant by NAME, which pins the same property and one more besides:
+    // approvals registers exactly one shutdown callback, and it is its own.
+    const names = lifecycle.getHostShutdownCallbacks().map((cb) => cb.name);
+    expect(names.filter((name) => name === 'approvalsHostShutdown')).toEqual(['approvalsHostShutdown']);
   });
 });
 
