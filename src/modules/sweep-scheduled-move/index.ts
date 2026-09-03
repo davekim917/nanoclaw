@@ -21,9 +21,9 @@ import { getDb } from '../../db/connection.js';
 import { sessionsBaseDir } from '../../session-manager.js';
 import { parseSqliteUtc } from '../mailbox/sqlite-utc.js';
 // Move recovery resolves its source session through the seam, like every other
-// host caller. The KEEP-PATCH this module used to carry existed for an INJECTED
-// sessions root, but no production caller ever injects one — the sweep's only
-// call site passes `{}` — so the exemption protected test scaffolding rather
+// host caller. The raw-opener exemption this module used to carry existed for
+// an INJECTED sessions root, but no production caller ever injects one — the
+// sweep's only call site passes `{}` — so it protected test scaffolding rather
 // than behaviour, and it is gone (mailbox seam PR 7 made the same change in
 // host-sweep.ts).
 import { withExistingNanoclawSession } from '../mailbox/session.js';

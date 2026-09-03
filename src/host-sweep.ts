@@ -706,22 +706,9 @@ export type SessionRunner = <T>(action: (mailbox: NanoclawMailboxSession) => T |
  * Could a container be writing this session's `outbound.db` right now?
  *
  * `outbound.db` has exactly ONE writer. The host may write it only while no
- * container owns it, and "owns it" includes a container that is still
- * SPAWNING — a wake issued a moment ago has not reached `isContainerRunning`
- * yet but is about to hold the file.
- *
- * Ported from mailbox seam PR 5 round 7 (`7199be48`) and round 8 (`3b6cbb5f`).
- * It lives in the driver, not a family module, because families on both sides
- * of a kill share it: sweep-session-core's orphan resets, sweep-continuation's
- * park and wake-eligibility decisions, and sweep-container-health's two
- * post-kill windows.
- *
- * The rule this enforces: a host write to outbound.db is safe only when the
- * check sits INSIDE the session and immediately before the mutation, with no
- * await in between. Opening a session is a yield, and a concurrent inbound
- * wake can start a container in it — `alive` sampled by an earlier phase
- * cannot authorize a write in a later one, and neither can a liveness check
- * taken before `killContainer` returned.
+ * container owns it, and "owns it" includes a container that is still SPAWNING
+ * — a wake issued a moment ago has not reached `isContainerRunning` yet but is
+ * about to hold the file.
  */
 export function containerOwnsOutbound(sessionId: string): boolean {
   return isContainerRunning(sessionId) || isContainerSpawning(sessionId);
@@ -730,28 +717,20 @@ export function containerOwnsOutbound(sessionId: string): boolean {
 /**
  * THE guard for every host-side write to the container-owned `outbound.db`.
  *
- * `outbound.db` has one writer. The host may write it only while no container
- * owns it, and after the seam made these paths async that check has to sit
- * immediately before the write with no await in between — an open, a kill, or
- * any other yield is a window a replacement wake can land in.
+ * After the seam made these paths async, the ownership check has to sit
+ * immediately before the write with no await in between: an open, a kill, or
+ * any other yield is a window a replacement wake can land in. `action` is
+ * synchronous BY TYPE, which is what makes that gap unrepresentable.
  *
- * Two entry points, one implementation:
- *  - this one, for a write inside a session the caller already holds;
- *  - `withStoppedContainerSession`, which runs a write in its own window and
- *    delegates here.
- *
- * Both exist because the nesting guard forbids opening a second session for a
- * key while one is open (invariant I-3), so the in-session writes physically
- * cannot route through the window-opening form. Every outbound write across the
- * driver and the sweep families is an argument to one of these two, which is
- * what makes the property checkable by grep rather than by reading.
- *
- * Name and semantics mirror mailbox seam PR 5b (#332, `bb9fb1ff`/`417350c0`) so
- * the merge onto a post-cascade main converges on one guard implementation
- * rather than carrying two.
- *
- * Returns `undefined` when a container owns the file — never an error. Every
- * caller's write is idempotent or retried on the next tick.
+ * Two entry points, one implementation — this one for a write inside a session
+ * the caller already holds, `withStoppedContainerSession` for one that needs its
+ * own window (the nesting guard forbids a second session on an open key, I-3).
+ * Every outbound write across the driver and the sweep families is an argument
+ * to one of them, so the property is checkable by grep. Name and semantics
+ * mirror mailbox seam PR 5b (#332, `bb9fb1ff`/`417350c0`) so a merge onto a
+ * post-cascade main converges on one guard, not two. Returns `undefined` when a
+ * container owns the file — never an error; every caller's write is idempotent
+ * or retried next tick.
  */
 export function writeOutboundWhenStopped<T>(
   session: Session,
@@ -766,24 +745,15 @@ export function writeOutboundWhenStopped<T>(
 }
 
 /**
- * Run a host write against the container-owned `outbound.db` in its own window,
- * but only while the container is confirmed stopped.
+ * The same guard for a write that needs its own window.
  *
- * Takes the caller's `SessionRunner` rather than opening a session itself.
- * #332's version calls `withExistingNanoclawSession` directly; on this lineage
- * every duty write goes through a phase window (`ctx.runIn`), which owns opener
- * classification (`SweepWindowAbort`) and the window tag on the error line, and
- * constraint 18 gives S9b's increment and its restore mirror one window each.
- * Opening a session here instead would bypass both and take a second session on
- * a key the window already holds (invariant I-3).
- *
- * `action` is synchronous BY TYPE — that is the mechanism, not a preference. It
- * is what makes it impossible to introduce an await between the ownership check
- * and the mutation without changing this signature. Note the runner's own
- * action type permits a Promise; this narrower one deliberately does not.
- *
- * Resolves `undefined` when the mailbox is gone OR a container took ownership
- * during the open. Callers treat both as "did not run" — never as failure.
+ * Takes the caller's `SessionRunner` rather than opening a session itself
+ * (#332 calls `withExistingNanoclawSession` directly): here every duty write
+ * goes through a phase window that owns opener classification and the window
+ * tag, and constraint 18 gives S9b's increment and its restore mirror one window
+ * each. Opening here would bypass both and take a second session on a key the
+ * window already holds. Resolves `undefined` when the mailbox is gone OR a
+ * container took ownership during the open — both are "did not run".
  */
 export async function withStoppedContainerSession<T>(
   run: SessionRunner,
