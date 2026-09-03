@@ -27,7 +27,12 @@
  *        → kill + reset this message + tries++. Semantics: "container
  *        claimed a message and went quiet past tolerance since the claim."
  */
-import { getActiveSessions } from './db/sessions.js';
+import {
+  getActiveSessions,
+  getWarmQuietSessionMarks,
+  persistQuietSessionMarks,
+  type QuietSessionMark,
+} from './db/sessions.js';
 import { getAgentGroup } from './db/agent-groups.js';
 import {
   SessionDbMissingError,
@@ -109,6 +114,48 @@ export function _resetQuietSessionCacheForTesting(): void {
   quietSessions.clear();
   lastSkippedQuiet = 0;
 }
+
+/**
+ * Rebuild the quiet cache from `sessions.sweep_quiet_until` at boot.
+ *
+ * The map is process-local, so before this every restart threw the whole cache
+ * away and the first tick swept every active session — ~850 of them, a 457 s
+ * tick, nine times in the 22 hours of log #320 was filed against. One query,
+ * no session-DB opens.
+ *
+ * Safe by construction rather than by re-derivation, on three counts:
+ *  - the persisted value was computed as `min(getNextFutureProcessAfter(),
+ *    jittered cap)`, so it can never cross a due row that existed at mark time;
+ *  - a row whose `last_active` has moved since is not returned at all —
+ *    `updateSession` nulls the column in the same statement, and
+ *    `touchSessionActivity` is REQUIRED after any write that changes when work
+ *    is next due, so a newly due row always clears the mark;
+ *  - a session whose container is alive is never quiet, whatever the row says.
+ * Due-ness itself lives only in the session's own `inbound.db`, which this path
+ * deliberately does not open; the jittered cap is the outer bound, so the worst
+ * case for anything the three checks miss is one backoff window, exactly as it
+ * is for a mark taken in this process.
+ *
+ * Advisory: a failed warm degrades to today's behavior — a cold first tick.
+ */
+function warmQuietSessionCache(): void {
+  try {
+    const nowMs = Date.now();
+    const live = new Set(getActiveContainerSessionIds());
+    let warmed = 0;
+    for (const row of getWarmQuietSessionMarks(new Date(nowMs).toISOString())) {
+      if (live.has(row.id)) continue;
+      const skipUntilMs = Date.parse(row.sweep_quiet_until);
+      if (!Number.isFinite(skipUntilMs) || skipUntilMs <= nowMs) continue;
+      quietSessions.set(row.id, { skipUntilMs, lastActive: row.last_active });
+      warmed++;
+    }
+    log.info('Host sweep quiet cache warmed', { warmed });
+  } catch (err) {
+    log.warn('Host sweep quiet cache warm failed', { err });
+  }
+}
+
 // Absolute idle ceiling for a running container. If the heartbeat file hasn't
 // been touched in this long, the container is either stuck or doing genuinely
 // nothing — kill and restart on the next inbound.
@@ -821,6 +868,9 @@ let running = false;
 export function startHostSweep(): void {
   if (running) return;
   running = true;
+  // Before the first tick, never inside it: a warm that ran per tick would be
+  // a second source of truth racing the map the tick is writing.
+  warmQuietSessionCache();
   sweep();
 }
 
@@ -845,6 +895,18 @@ async function sweep(): Promise<void> {
     log.error('Host sweep tick threw — rescheduling anyway', { err });
   }
   setTimeout(sweep, SWEEP_INTERVAL_MS);
+}
+
+/**
+ * Last completed tick, for the acceptance cases that assert on the FIRST tick
+ * after a restart. `Host sweep tick timing` only logs above 1 s, so a spy on it
+ * cannot see a fast tick; `ticks` is what lets a test await one.
+ */
+const lastTickStats = { ticks: 0, sweptSessions: 0, skippedQuiet: 0 };
+
+/** Test-only: the counters from the last completed tick. */
+export function _lastSweepTickStatsForTesting(): { ticks: number; sweptSessions: number; skippedQuiet: number } {
+  return { ...lastTickStats };
 }
 
 async function sweepOnce(): Promise<void> {
@@ -897,6 +959,12 @@ async function sweepOnce(): Promise<void> {
   const sessionsStartedAtMs = Date.now();
   unreadableSessions = [];
   let skippedQuiet = 0;
+  // Marks taken THIS tick, flushed once at the end. One statement per tick,
+  // never one per session, and only on the transition into quiet — a re-write
+  // on every confirming tick would be ~840 UPDATEs a minute, a new cost rather
+  // than a saving. A session already holding a valid mark `continue`s above and
+  // never reaches the write.
+  const newQuietMarks: QuietSessionMark[] = [];
   for (const session of sessions) {
     const mark = quietSessions.get(session.id);
     if (mark && Date.now() < mark.skipUntilMs && mark.lastActive === session.last_active) {
@@ -908,6 +976,7 @@ async function sweepOnce(): Promise<void> {
       const quietUntil = await sweepSession(session, tick);
       if (quietUntil !== null) {
         quietSessions.set(session.id, { skipUntilMs: quietUntil, lastActive: session.last_active });
+        newQuietMarks.push({ sessionId: session.id, quietUntil: new Date(quietUntil).toISOString() });
       }
       sweptSessions++;
     } catch (err) {
@@ -936,6 +1005,27 @@ async function sweepOnce(): Promise<void> {
     const live = new Set(sessions.map((s) => s.id));
     for (const id of quietSessions.keys()) if (!live.has(id)) quietSessions.delete(id);
   }
+  // "I cannot read this session" is not "this session is quiet". `skipUnreadable`
+  // returns the same backoff, and in-process that is right — but its causes are
+  // PROCESS-local (descriptor exhaustion, a hot-journal recovery this process
+  // failed, an agent group this process could not resolve), and a restart is
+  // exactly the event that can clear them. Persisting that mark would carry a
+  // dead process's verdict into a fresh one and hold the session for a further
+  // backoff window. Only the W5 quiet hint is durable.
+  const unreadableIds = new Set(unreadableSessions.map((u) => u.sessionId));
+  const durableQuietMarks = newQuietMarks.filter((mark) => !unreadableIds.has(mark.sessionId));
+  if (durableQuietMarks.length > 0) {
+    try {
+      persistQuietSessionMarks(durableQuietMarks);
+    } catch (err) {
+      // Advisory, and it degrades DOWNWARD on purpose: the in-memory marks go
+      // with the failed write, so the next tick sweeps these sessions instead
+      // of skipping them on a mark no restart could recover. Worst case is the
+      // pre-cache cold sweep, loudly — never a session held past due work.
+      log.warn('Host sweep quiet mark persistence failed', { count: durableQuietMarks.length, err });
+      for (const mark of durableQuietMarks) quietSessions.delete(mark.sessionId);
+    }
+  }
   const sessionsMs = Date.now() - sessionsStartedAtMs;
   lastSkippedQuiet = skippedQuiet;
   // One line per tick, never one per session: this loop runs every 60s over
@@ -950,6 +1040,10 @@ async function sweepOnce(): Promise<void> {
 
   await runTickPhase(tick, 'tick:post-session');
   await runTickPhase(tick, 'tick:housekeeping');
+
+  lastTickStats.ticks++;
+  lastTickStats.sweptSessions = sweptSessions;
+  lastTickStats.skippedQuiet = skippedQuiet;
 
   const sweepMs = Date.now() - sweepStartedAtMs;
   if (sweepMs >= 1_000) {

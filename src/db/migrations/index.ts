@@ -70,6 +70,7 @@ import { migration064 } from './064-container-config-security-json.js';
 import { migration065 } from './065-container-config-timezone.js';
 import { migration066 } from './066-approvals-instance.js';
 import { migration067 } from './067-cli-request-executions.js';
+import { migration068 } from './068-sessions-sweep-quiet-until.js';
 import { migration069 } from './069-messaging-group-name-source.js';
 // Upstream's 014/015 — file numbers clash with local but uniqueness is by `name`.
 // Aliased to avoid JS identifier collisions with the local 014/015 above.
@@ -179,6 +180,9 @@ export const migrations: Migration[] = [
   // Standalone CREATE TABLE with no timestamp for 053 to normalize — position
   // relative to 053 is irrelevant, same reasoning as 054/055/056 above.
   migration067,
+  // Adds a nullable column and writes no timestamp, so 053's position below is
+  // irrelevant here — same reasoning as 054/055/056 above.
+  migration068,
   messagingGroupInstance,
   migration019,
   // After messagingGroupInstance: upstream's 016 RECREATES messaging_groups
