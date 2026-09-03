@@ -49,24 +49,15 @@ async function prepareDueWake(
   // on the host BEFORE admission, so a gated/errored fire never becomes due
   // and never spawns a container. See host-script.ts's runHostGatedTaskScripts.
   //
-  // `runHostGatedTaskScripts` takes this session (mailbox seam PR 4): it is a
-  // sweep callee with no other production caller, and a SESSION parameter is
-  // the seam's sanctioned object — invariant I-9 forbids handing out raw
-  // handles, not sessions, so the callee stays off the ratchet's allowlist.
-  // It can spend the full pre-task timeout per row, so the session is held
-  // across that work exactly as it was when this line passed a raw handle.
-  // `admitDueTaskContexts` still takes one: it lives in `session-manager.ts`
-  // and moves behind the seam in PR 7. `legacyInboundHandle` survives here for
-  // that one call and nothing else — which is why this file, and not
-  // `host-sweep.ts`, is what carries the entry on the mailbox-seam ratchet.
-  //
-  // REMOVAL TRIGGER: drop this file from `src/mailbox/RATCHET.json` at the
-  // rebase onto the mailbox PR that converts `admitDueTaskContexts` (PR 7, per
-  // the bridge table in docs/specs/upstream-host-sweep-seam/plan.md §5). After
-  // that, nothing in this file may touch a raw handle — the allowlist entry
-  // exists for this one call site and expires with it.
+  // `runHostGatedTaskScripts` and `admitDueTaskContexts` both take this
+  // session: they are sweep callees with no other production caller, and a
+  // SESSION parameter is the seam's sanctioned object — invariant I-9 forbids
+  // handing out raw handles, not sessions, so neither callee lands on the
+  // ratchet's allowlist. The script runner can spend the full pre-task timeout
+  // per row, so the session is held across that work exactly as it was when
+  // these lines passed a raw handle.
   await runHostGatedTaskScripts(mailbox, sessionId);
-  const admittedTasks = admitDueTaskContexts(mailbox.legacyInboundHandle(), agentGroupId, sessionId);
+  const admittedTasks = admitDueTaskContexts(mailbox, agentGroupId, sessionId);
   const dueCount = mailbox.countDueMessages();
   return {
     admittedTasks,
