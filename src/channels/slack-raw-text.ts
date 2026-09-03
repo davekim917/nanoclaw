@@ -19,6 +19,9 @@
  * silently never sees. Add it here when you add it there.
  */
 
+import { TIMEZONE } from '../config.js';
+import { formatLocalTime } from '../timezone.js';
+
 const MAX_TABLE_CHARS = 100_000;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -38,10 +41,23 @@ function isRecord(value: unknown): value is Record<string, unknown> {
  * the bridge runs `transformInboundText` over the rescued text after
  * appending it, so `<@U…>` resolves to `@name` exactly like a mention typed
  * in the message body. Returns null when the node carries no readable value.
+ *
+ * This switch is the single owner of "how does one Slack rich_text leaf
+ * read". Slack's documented leaf set is text / link / emoji / user / usergroup
+ * / channel / broadcast / date / color, and all nine are handled — an
+ * unhandled leaf projects as an empty cell, which is indistinguishable from
+ * nothing having been pasted. Add new leaf types HERE, not at a consumer.
  */
 function elementText(node: Record<string, unknown>): string | null {
-  if (typeof node.text === 'string') return node.text;
   const str = (key: string): string | null => (typeof node[key] === 'string' ? (node[key] as string) : null);
+  if (typeof node.text === 'string') {
+    // An inline code run keeps its backticks: the Slack path DEMOTES a
+    // mention that appears only inside code (slackMentionOutsideCode), and a
+    // projection that drops the delimiters would wake a mention-scoped agent
+    // off documented gate syntax pasted into a cell.
+    const style = isRecord(node.style) ? node.style : undefined;
+    return style?.code === true ? `\`${node.text}\`` : node.text;
+  }
   switch (node.type) {
     case 'user': {
       const id = str('user_id');
@@ -72,6 +88,19 @@ function elementText(node: Record<string, unknown>): string | null {
     }
     case 'link':
       return str('url');
+    case 'date': {
+      // Slack pre-renders the human form in `fallback`; prefer it. Otherwise
+      // render the epoch in the install timezone, like every other timestamp
+      // an agent reads.
+      const fallback = str('fallback');
+      if (fallback) return fallback;
+      const timestamp = typeof node.timestamp === 'number' ? node.timestamp : Number(str('timestamp'));
+      return Number.isFinite(timestamp) && timestamp > 0
+        ? formatLocalTime(new Date(timestamp * 1000).toISOString(), TIMEZONE)
+        : null;
+    }
+    case 'color':
+      return str('value');
     default:
       return null;
   }
@@ -108,6 +137,15 @@ function cellText(value: unknown): string {
       // fields only ever appear on leaves), so its own values carry nothing
       // further to collect.
       out += rendered;
+      return;
+    }
+    if (node.type === 'rich_text_preformatted') {
+      // A code block is fenced in the projection for the same reason an inline
+      // code run keeps its backticks — see elementText.
+      const start = out.length;
+      Object.values(node).forEach(visit);
+      const body = out.slice(start).trim();
+      out = body ? `${out.slice(0, start)}\`${body}\`` : out.slice(0, start);
       return;
     }
     Object.values(node).forEach(visit);

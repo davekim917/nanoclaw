@@ -26,6 +26,9 @@ import { closeDb, initTestDb, runMigrations } from '../db/index.js';
 import type { ChannelSetup, InboundMessage } from './adapter.js';
 import { appendRawText, createChatSdkBridge } from './chat-sdk-bridge.js';
 import { extractSlackRawText } from './slack-raw-text.js';
+import { slackMentionOutsideCode, type SlackBotIdentity } from './slack-mentions.js';
+
+const BOT: SlackBotIdentity = { userId: 'UBOT', username: 'nano', teamId: 'T1' };
 
 const pastedTableEvent = {
   text: 'Analyze this attendee list:',
@@ -119,6 +122,53 @@ describe('extractSlackRawText', () => {
     );
   });
 
+  it('renders date and color leaves, which carry no `text` either', () => {
+    expect(
+      extractSlackRawText(
+        cellRaw([{ type: 'date', timestamp: 1_788_393_600, format: '{date_short}', fallback: 'Sep 3, 2026' }]),
+      ),
+    ).toBe('Sep 3, 2026');
+    // No fallback: rendered from the epoch rather than projecting as empty.
+    const rendered = extractSlackRawText(cellRaw([{ type: 'date', timestamp: 1_788_393_600, format: '{date}' }]));
+    expect(rendered).not.toBeNull();
+    expect(rendered).toMatch(/2026/);
+    expect(extractSlackRawText(cellRaw([{ type: 'color', value: '#264653' }]))).toBe('#264653');
+  });
+
+  it('keeps code delimiters so a mention inside code can still be demoted', () => {
+    // slackMentionOutsideCode strips backtick regions; a projection that drops
+    // them would wake a mention-scoped agent off pasted gate syntax.
+    expect(extractSlackRawText(cellRaw([{ type: 'text', text: '<@UBOT> ship 42', style: { code: true } }]))).toBe(
+      '`<@UBOT> ship 42`',
+    );
+
+    const preformatted = {
+      attachments: [
+        {
+          blocks: [
+            {
+              type: 'table',
+              rows: [
+                [
+                  {
+                    type: 'rich_text',
+                    elements: [
+                      {
+                        type: 'rich_text_preformatted',
+                        elements: [{ type: 'text', text: '<@UBOT> ship 42' }],
+                      },
+                    ],
+                  },
+                ],
+              ],
+            },
+          ],
+        },
+      ],
+    };
+    expect(extractSlackRawText(preformatted)).toBe('`<@UBOT> ship 42`');
+  });
+
   it('falls back to :name: when an emoji carries no unicode codepoints', () => {
     expect(extractSlackRawText(cellRaw([{ type: 'emoji', name: 'shipit' }]))).toBe(':shipit:');
   });
@@ -157,7 +207,8 @@ describe('extractSlackRawText', () => {
         },
       ],
     };
-    expect(extractSlackRawText(raw)).toBe('first second a b');
+    // The preformatted block keeps its fence — see the code-delimiter test.
+    expect(extractSlackRawText(raw)).toBe('first second `a b`');
   });
 
   it('returns null for a table whose cells are all empty', () => {
@@ -316,6 +367,39 @@ describe('recovered-mention detection over the table projection', () => {
 
   it('still finds a mention in the ordinary message text', () => {
     expect(detect({ text: 'hey <@UBOT>' }, 'UBOT')).toBe(true);
+  });
+
+  it('leaves a code-fenced cell mention for slackMentionOutsideCode to demote', () => {
+    // detectRecoveredMention is a cheap pre-check; the projection keeps the
+    // backticks so refineInboundMention makes the final call on the same text.
+    const raw = {
+      text: 'gate syntax:',
+      attachments: [
+        {
+          blocks: [
+            {
+              type: 'table',
+              rows: [
+                [
+                  {
+                    type: 'rich_text',
+                    elements: [
+                      {
+                        type: 'rich_text_section',
+                        elements: [{ type: 'text', text: '<@UBOT> ship', style: { code: true } }],
+                      },
+                    ],
+                  },
+                ],
+              ],
+            },
+          ],
+        },
+      ],
+    };
+    expect(extractSlackRawText(raw)).toBe('`<@UBOT> ship`');
+    expect(slackMentionOutsideCode(`gate syntax:\n\n${extractSlackRawText(raw)}`, BOT)).toBe(false);
+    expect(slackMentionOutsideCode('gate syntax:\n\n<@UBOT> ship', BOT)).toBe(true);
   });
 });
 
