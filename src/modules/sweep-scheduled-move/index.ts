@@ -26,7 +26,7 @@ import { parseSqliteUtc } from '../mailbox/sqlite-utc.js';
 // call site passes `{}` — so the exemption protected test scaffolding rather
 // than behaviour, and it is gone (mailbox seam PR 7 made the same change in
 // host-sweep.ts).
-import { withExistingNanoclawSession } from '../mailbox/session.js';
+import { withExistingMailboxSession } from '../../session-manager.js';
 import { type TaskRowSnapshot } from '../scheduling/db.js';
 import { countLiveRowsInSessions } from '../scheduling/live-count.js';
 import { purgeIntentBody } from '../../dashboard/api/scheduled-shared.js';
@@ -225,7 +225,7 @@ export async function recoverMoveIntents(centralDb: Database.Database, options: 
       // Existing-only: the existsSync above already answered "is there a
       // session to restore into", and a recovery pass must never re-provision
       // one it has just been told is gone (invariant I-10).
-      outcome = await withExistingNanoclawSession(intent.agent_group_id, intent.session_id, (mailbox) => {
+      outcome = await withExistingMailboxSession(intent.agent_group_id, intent.session_id, (mailbox) => {
         // Idempotency re-check: the restore + the resolved_at stamp span two DB
         // files (not atomic), so re-confirm a readable zero-live IMMEDIATELY before
         // insert. An unreadable re-check defers (never restore on unknown).

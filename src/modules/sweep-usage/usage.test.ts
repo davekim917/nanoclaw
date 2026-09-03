@@ -375,7 +375,7 @@ describe('registered usage-rollup duty (T19)', () => {
 
   // F-12.2, exact title, corrected by the orchestrator (plan.md amended):
   // confirmed the raw-opener funnel is deliberate as-built (mailbox PR 6
-  // never routed this call through withExistingNanoclawSession — my earlier
+  // never routed this call through withExistingMailboxSession — my earlier
   // brief's framing was stale). Three assertions, each on its own session id:
   //  1. inbound.db GONE while outbound.db remains → the rollup STILL runs on
   //     outbound alone and the cache updates (constraint 21's purpose:

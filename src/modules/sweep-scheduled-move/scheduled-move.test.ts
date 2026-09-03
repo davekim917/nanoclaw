@@ -708,7 +708,7 @@ describe('recoverMoveIntents (D3) + pruneAuditBodies (D4)', () => {
     // only production caller anywhere is the sweep's own `recoverMoveIntents(getDb(), {})`,
     // which passes no root at all (verified on this branch and on origin/main;
     // every `dataDir:`-injecting caller is a test). So the module now resolves
-    // its source session through `withExistingNanoclawSession` exactly as
+    // its source session through `withExistingMailboxSession` exactly as
     // mailbox seam PR 7 made host-sweep.ts do, and this suite points DATA_DIR at
     // its own root the way PR 7's suite does.
     const db = centralDb();
@@ -738,6 +738,6 @@ describe('recoverMoveIntents (D3) + pruneAuditBodies (D4)', () => {
     ]);
     const moduleSource = fs.readFileSync(path.join(repoRoot, 'src/modules/sweep-scheduled-move/index.ts'), 'utf8');
     expect(moduleSource).not.toContain('KEEP-PATCH');
-    expect(moduleSource).toContain('withExistingNanoclawSession');
+    expect(moduleSource).toContain('withExistingMailboxSession');
   });
 });
