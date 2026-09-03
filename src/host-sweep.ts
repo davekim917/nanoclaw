@@ -925,7 +925,11 @@ async function sweepOnce(): Promise<void> {
       }
       sweptSessions++;
     } catch (err) {
-      log.error('Host sweep error', { err, sessionId: session.id });
+      // A duty threw and sweepSession rethrew it: the mailbox is fine and the
+      // work is still due, so this session is NOT quiet-cached and the next
+      // 60s tick retries it. Distinct from 'Host sweep mailbox unopenable',
+      // which is the session the host could not get into at all.
+      log.error('Host sweep duty failed', { err, sessionId: session.id });
     }
     // Yield to the macrotask queue so a large sweep batch cannot trip the
     // event-loop stall detector even on a cold tick.
@@ -1214,8 +1218,9 @@ async function prepareDueWake(
   // and never spawns a container. See host-script.ts's runHostGatedTaskScripts.
   //
   // Both helpers still take a raw handle and live in files this PR must not
-  // touch (`modules/scheduling/host-script.ts` belongs to PR 3,
-  // `session-manager.ts` to PR 4). Handing them this session's own handle
+  // touch — both belong to PR 4, the ingress family (plan §5):
+  // `modules/scheduling/host-script.ts` and `session-manager.ts`. Handing them
+  // this session's own handle
   // keeps the admission seam on ONE open — reopening inbound.db beside a live
   // session would be worse, not cleaner. Both move behind the seam with their
   // own PRs; `legacyInboundHandle` is what keeps host-sweep.ts on the
@@ -1583,7 +1588,7 @@ async function sweepSession(session: Session): Promise<number | null> {
       // failure must never cost this session its sweep.
       //
       // Still a raw-handle callee: `dashboard/thread-close.ts` moves behind the
-      // seam in PR 3, and this line becomes `syncDoneProposalMirror(session.id)`
+      // seam in PR 4, and this line becomes `syncDoneProposalMirror(session.id)`
       // then. It only reads. Guarded on `hasOutbound` because a raw handle is
       // the one thing the module cannot degrade for a never-woken session.
       if (mailbox.hasOutbound()) {
@@ -1640,7 +1645,7 @@ async function sweepSession(session: Session): Promise<number | null> {
     // errors in the hot-journal incident — so this one takes the backoff, with
     // an error line so it is never silently filed as a quiet session.
     if (!enteredPlanSession) {
-      log.error('Host sweep error', { err, sessionId: session.id });
+      log.error('Host sweep mailbox unopenable', { err, sessionId: session.id });
       return skipUnreadable(session.id, `session mailbox unreadable: ${String(err)}`);
     }
     // A DUTY threw — a transient SQLite lock during task admission, say. The
@@ -1762,7 +1767,7 @@ async function sweepSession(session: Session): Promise<number | null> {
     // 8. Recurrence fanout for completed recurring tasks.
     // MODULE-HOOK:scheduling-recurrence:start
     // Still a raw-handle callee: `modules/scheduling/recurrence.ts` moves
-    // behind the seam in PR 3.
+    // behind the seam in PR 4.
     const { handleRecurrence } = await import('./modules/scheduling/recurrence.js');
     await handleRecurrence(mailbox.legacyInboundHandle(), session);
     // MODULE-HOOK:scheduling-recurrence:end
