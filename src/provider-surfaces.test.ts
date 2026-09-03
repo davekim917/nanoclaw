@@ -264,13 +264,17 @@ describe('initGroupFilesystem agent surfaces', async () => {
 
     withWorkgroup(ag);
     ensureContainerConfig(ag.id);
-    await buildMounts(ag, session('s-default-instructions', ag.id), containerConfig(), 'claude', {});
-    expect(fs.readFileSync(path.join(groupDir, '.claude-fragments', 'standing-instructions.md'), 'utf-8')).toBe(
-      'hello',
-    );
+    const mounts = await buildMounts(ag, session('s-default-instructions', ag.id), containerConfig(), 'claude', {});
     // Inlined, not `@`-imported: Claude Code drops imports that resolve
     // outside the project directory (issue #233).
     expect(fs.readFileSync(path.join(groupDir, 'CLAUDE.md'), 'utf-8')).toContain('hello');
+    // No fragment/symlink delivery mechanism left to mount: the composer
+    // writes the composed doc directly, and .claude-fragments/.claude-shared.md
+    // are gone (superseded by full inlining — issue #233 follow-up).
+    expect(fs.existsSync(path.join(groupDir, '.claude-fragments'))).toBe(false);
+    expect(fs.existsSync(path.join(groupDir, '.claude-shared.md'))).toBe(false);
+    expect(mounts.some((m) => m.containerPath === '/workspace/agent/.claude-fragments')).toBe(false);
+    expect(mounts.some((m) => m.containerPath === '/app/CLAUDE.md')).toBe(false);
   });
 
   it('reconciles the managed Bash maximum while preserving an operator-owned default', async () => {
@@ -651,8 +655,12 @@ describe('buildMounts agent surfaces', async () => {
 
     const byContainerPath = new Map(mounts.map((m) => [m.containerPath, m]));
     expect(byContainerPath.has('/home/node/.claude')).toBe(true);
-    expect(byContainerPath.has('/app/CLAUDE.md')).toBe(true);
     expect(byContainerPath.has('/workspace/agent/CLAUDE.md')).toBe(true);
+    // No fragment/symlink delivery mounts: the composer inlines every
+    // section into CLAUDE.md/AGENTS.md directly, so nothing inside the
+    // container ever needs the shared base or fragments at their own paths.
+    expect(byContainerPath.has('/app/CLAUDE.md')).toBe(false);
+    expect(byContainerPath.has('/workspace/agent/.claude-fragments')).toBe(false);
     // Composer ran: the generated project doc exists on disk.
     expect(fs.existsSync(path.join(GROUPS_DIR, ag.folder, 'CLAUDE.md'))).toBe(true);
   });

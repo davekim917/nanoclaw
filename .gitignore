@@ -22,11 +22,11 @@ logs/
 # Groups - per-installation state, not tracked
 groups/*
 
-# Composer-managed CLAUDE.md artifacts (regenerated every spawn) and
-# per-group standing instructions (CLAUDE.local.md) must never be committed.
+# Per-group standing instructions (CLAUDE.local.md) must never be committed.
+# (Composer-managed CLAUDE.md is covered by the groups/* rule above; the
+# .claude-shared.md symlink and .claude-fragments/ dir it used to also write
+# are retired — every instruction section is inlined directly now.)
 **/CLAUDE.local.md
-**/.claude-shared.md
-**/.claude-fragments/
 
 # Secrets
 *.keys.json

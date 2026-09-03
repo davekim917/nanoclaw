@@ -38,30 +38,28 @@ permission checks, the attack surface is limited by what's mounted.
 `buildMounts` (`src/container-runner.ts`) composes a fixed set of mounts per
 spawn. For the default (Claude) provider these are:
 
-| Container path                                 | Host source                                         | Mode                     | Purpose                                                                      |
-| ---------------------------------------------- | --------------------------------------------------- | ------------------------ | ---------------------------------------------------------------------------- |
-| `/workspace`                                   | `data/v2-sessions/<group>/<session>/`               | RW                       | Session folder — DBs, outbox, and heartbeat                                  |
-| `/workspace/worktrees`                         | `data/v2-topics/<workgroup>/<work-unit>/worktrees`  | RW                       | Exact topic checkout root; same-topic siblings share, different topics split |
-| host-absolute canonical `.git` paths           | `data/repositories/<workgroup>/<repo>/.git`         | RW                       | Linked-worktree common metadata; canonical working tree is not mounted       |
-| `/workspace/inbound.db`                        | session `inbound.db`                                | RO overlay               | Host-owned inbound transport; container cannot forge delivery state          |
-| `/workspace/agent`                             | `groups/<folder>/`                                  | RW                       | Agent-private working files and standing instructions                        |
-| `/workspace/workgroup`                         | `data/workgroups/<workgroup>/`                      | RW when shared-FS active | Workgroup house shared by sibling agent groups                               |
-| `/workspace/workgroup/memory`                  | `data/workgroups/<workgroup>/memory`                | RW overlay               | Sole writable workgroup Markdown memory canon; mounted in every mode         |
-| `/workspace/agent/memory`                      | compatibility link to `/workspace/workgroup/memory` | RW view                  | Existing provider/group path backed by the same canon                        |
-| `/workspace/workgroup/.memory-write.lock`      | `data/workgroups/<workgroup>/.memory-write.lock`    | RW exact-file overlay    | Stable shared kernel-lock inode; cannot be replaced through the parent mount |
-| `/home/node/.claude/projects/<project>/memory` | workgroup memory canon                              | RO overlay               | Claude-native compatibility view; never a second memory authority            |
-| `/workspace/agent/container.json`              | group `container.json`                              | RO                       | Container config — readable, not writable                                    |
-| `/workspace/agent/CLAUDE.md`                   | composed `CLAUDE.md`                                | RO                       | Regenerated every spawn; agent edits would be clobbered                      |
-| `/workspace/agent/.claude-fragments`           | group `.claude-fragments/`                          | RO                       | Composer skill/MCP fragments                                                 |
-| `/app/CLAUDE.md`                               | `container/CLAUDE.md`                               | RO                       | Shared base doc imported by the composed entry point                         |
-| `/home/node/.claude`                           | `data/v2-sessions/<group>/.claude-shared/`          | RW with nested overlays  | Claude state, settings, skills, and the read-only native-memory view         |
-| `/app/src`                                     | `container/agent-runner/src/`                       | RO                       | Shared agent-runner source (same for all groups)                             |
-| `/app/skills`                                  | `container/skills/`                                 | RO                       | Shared container skills                                                      |
-| `/workspace/extra/<name>`                      | allowlisted host dir                                | RO (RW only if allowed)  | Operator-configured additional mounts                                        |
+| Container path                                 | Host source                                         | Mode                     | Purpose                                                                        |
+| ---------------------------------------------- | --------------------------------------------------- | ------------------------ | ------------------------------------------------------------------------------ |
+| `/workspace`                                   | `data/v2-sessions/<group>/<session>/`               | RW                       | Session folder — DBs, outbox, and heartbeat                                    |
+| `/workspace/worktrees`                         | `data/v2-topics/<workgroup>/<work-unit>/worktrees`  | RW                       | Exact topic checkout root; same-topic siblings share, different topics split   |
+| host-absolute canonical `.git` paths           | `data/repositories/<workgroup>/<repo>/.git`         | RW                       | Linked-worktree common metadata; canonical working tree is not mounted         |
+| `/workspace/inbound.db`                        | session `inbound.db`                                | RO overlay               | Host-owned inbound transport; container cannot forge delivery state            |
+| `/workspace/agent`                             | `groups/<folder>/`                                  | RW                       | Agent-private working files and standing instructions                          |
+| `/workspace/workgroup`                         | `data/workgroups/<workgroup>/`                      | RW when shared-FS active | Workgroup house shared by sibling agent groups                                 |
+| `/workspace/workgroup/memory`                  | `data/workgroups/<workgroup>/memory`                | RW overlay               | Sole writable workgroup Markdown memory canon; mounted in every mode           |
+| `/workspace/agent/memory`                      | compatibility link to `/workspace/workgroup/memory` | RW view                  | Existing provider/group path backed by the same canon                          |
+| `/workspace/workgroup/.memory-write.lock`      | `data/workgroups/<workgroup>/.memory-write.lock`    | RW exact-file overlay    | Stable shared kernel-lock inode; cannot be replaced through the parent mount   |
+| `/home/node/.claude/projects/<project>/memory` | workgroup memory canon                              | RO overlay               | Claude-native compatibility view; never a second memory authority              |
+| `/workspace/agent/container.json`              | group `container.json`                              | RO                       | Container config — readable, not writable                                      |
+| `/workspace/agent/CLAUDE.md`                   | composed `CLAUDE.md`                                | RO                       | Regenerated every spawn, every section inlined; agent edits would be clobbered |
+| `/home/node/.claude`                           | `data/v2-sessions/<group>/.claude-shared/`          | RW with nested overlays  | Claude state, settings, skills, and the read-only native-memory view           |
+| `/app/src`                                     | `container/agent-runner/src/`                       | RO                       | Shared agent-runner source (same for all groups)                               |
+| `/app/skills`                                  | `container/skills/`                                 | RO                       | Shared container skills                                                        |
+| `/workspace/extra/<name>`                      | allowlisted host dir                                | RO (RW only if allowed)  | Operator-configured additional mounts                                          |
 
-The config mounts (`container.json`, `CLAUDE.md`, `.claude-fragments`) are
-**nested read-only mounts on top of the read-write group dir** — the agent can
-read its config but cannot modify it. The project root is **never mounted**: the
+The config mounts (`container.json`, `CLAUDE.md`) are **nested read-only
+mounts on top of the read-write group dir** — the agent can read its config
+but cannot modify it. The project root is **never mounted**: the
 container only ever sees the paths above plus any provider-contributed mounts
 (e.g. an OpenCode XDG dir). Host application source (`src/`, `dist/`,
 `package.json`) is not reachable.

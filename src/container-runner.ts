@@ -1973,9 +1973,10 @@ export async function buildMounts(
   // pointing at the source group's files.
   //
   // Absolute symlinks whose targets only exist inside the container (e.g.
-  // .claude-shared.md -> /app/CLAUDE.md) are skipped: realpathSync fails
-  // on the host because /app doesn't exist there, and the existing /app
-  // mount makes the symlink work inside the container anyway.
+  // spawn-template.md -> /workspace/workgroup/private-spawn-template.md, a
+  // workgroup-shared-fs compat link) are skipped: realpathSync fails on the
+  // host because that path doesn't resolve there, and the container's own
+  // mount for it makes the symlink work inside the container anyway.
   //
   // SECURITY: the group dir is mounted RW at /workspace/agent, so an agent can
   // plant a symlink here pointing anywhere on the host and it would be
@@ -2098,20 +2099,20 @@ export async function buildMounts(
     mounts.push({ hostPath: containerJsonPath, containerPath: '/workspace/agent/container.json', readonly: true });
   }
 
-  // Composer-managed CLAUDE.md artifacts — nested RO mounts. These are
-  // regenerated from the shared base + fragments on every spawn; any
-  // agent-side writes would be clobbered, so enforce read-only. The shared
+  // Composer-managed CLAUDE.md — nested RO mount. Regenerated from the
+  // shared base + fragments, all INLINED, on every spawn (claude-md-compose.ts);
+  // any agent-side write would be clobbered, so enforce read-only. The shared
   // memory tree and standing-instructions source remain RW via the group mount.
-  // `.claude-shared.md` is a symlink whose target (`/app/CLAUDE.md`) is
-  // already RO-mounted, so writes through it fail regardless — no need for
-  // a nested mount there.
+  //
+  // There used to be a second nested mount here for `.claude-fragments/`
+  // (per-fragment files reached through symlinks from the composed doc) plus
+  // a `/app/CLAUDE.md` mount backing a `.claude-shared.md` symlink in the
+  // group dir. Both are gone: the composer now reads every section straight
+  // from its host path and writes it into CLAUDE.md/AGENTS.md directly, so
+  // nothing inside the container ever needs those paths.
   const composedClaudeMd = path.join(groupDir, 'CLAUDE.md');
   if (defaultSurfaces && fs.existsSync(composedClaudeMd)) {
     mounts.push({ hostPath: composedClaudeMd, containerPath: '/workspace/agent/CLAUDE.md', readonly: true });
-  }
-  const fragmentsDir = path.join(groupDir, '.claude-fragments');
-  if (defaultSurfaces && fs.existsSync(fragmentsDir)) {
-    mounts.push({ hostPath: fragmentsDir, containerPath: '/workspace/agent/.claude-fragments', readonly: true });
   }
 
   // Global memory directory — always read-only.
@@ -2134,13 +2135,6 @@ export async function buildMounts(
         workgroupId: wgId,
       }),
     );
-  }
-
-  // Shared CLAUDE.md — read-only, imported by the composed entry point via
-  // the `.claude-shared.md` symlink inside the group dir.
-  const sharedClaudeMd = path.join(process.cwd(), 'container', 'CLAUDE.md');
-  if (defaultSurfaces && fs.existsSync(sharedClaudeMd)) {
-    mounts.push({ hostPath: sharedClaudeMd, containerPath: '/app/CLAUDE.md', readonly: true });
   }
 
   // Per-agent archive + central projections (NOT the global files).

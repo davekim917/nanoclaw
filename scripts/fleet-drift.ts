@@ -708,10 +708,18 @@ function unscannableBreaches(
 /** ponytail: sanity cap on the flattened doc, same reasoning as MAX_STANDING_FILE_BYTES — no legitimate composed stack gets remotely close. */
 export const EFFECTIVE_STACK_BYTES_CEILING = 24_576;
 
-// Mirrors src/claude-md-compose.ts:219-273's containerToHost map exactly (not
-// imported — those are module-private consts there, and this is a read-only
-// metrics job in a different file, not a shared library). If compose's
-// container-path scheme changes, update both.
+// Defensive translation only — compose (`src/claude-md-compose.ts`) no longer
+// writes any `.claude-shared.md`/`.claude-fragments/` symlink pointing at
+// these container paths (every section is read from its host path and
+// inlined directly as of the fragment-retirement follow-up to issue #233),
+// so a freshly composed CLAUDE.md never contains an `@`-import that resolves
+// through this map. It stays here for two reasons: a group whose CLAUDE.md
+// predates that change still carries the old `@`-import text until its next
+// spawn recomposes it, and flattenClaudeMd's `@`-line handling (see
+// agents-md-flatten.ts) translates ANY literal `@/app/...` reference, symlink
+// or not, so this is also insurance against a stray hand-written one. Keep it
+// in sync with compose's shared-base/module-fragment host paths if those ever
+// move.
 const COMPOSE_CONTAINER_TO_HOST = (repoRoot: string): Record<string, string> => ({
   '/app/CLAUDE.md': path.join(repoRoot, 'container', 'CLAUDE.md'),
   '/app/skills': path.join(repoRoot, 'container', 'skills'),
@@ -830,12 +838,13 @@ function makeFlattenGuard(
  * - codex/opencode: their harnesses don't auto-discover CLAUDE.local.md —
  *   compose embeds it raw into AGENTS.md at spawn time, so AGENTS.md alone
  *   IS the complete artifact.
- * - claude/default: Claude Code resolves CLAUDE.md's @-imports itself and
- *   auto-discovers CLAUDE.local.md independently — neither is embedded in
- *   AGENTS.md's generation inputs in a way that stays current for Claude,
- *   and AGENTS.md is only regenerated at spawn time, so it can miss a
- *   CLAUDE.local.md edited since. Flatten CLAUDE.md ourselves and add
- *   CLAUDE.local.md's bytes on top instead of trusting the snapshot.
+ * - claude/default: compose already writes CLAUDE.md fully flat (no
+ *   `@`-imports left to resolve — the flatten call below is a no-op unless a
+ *   group's CLAUDE.md predates that cutover), but Claude Code auto-discovers
+ *   CLAUDE.local.md independently, and AGENTS.md is only regenerated at spawn
+ *   time, so it can miss a CLAUDE.local.md edited since. Flatten CLAUDE.md
+ *   ourselves and add CLAUDE.local.md's bytes on top instead of trusting the
+ *   snapshot.
  *
  * Returns bytes: null when nothing can be measured (never spawned, or the
  * provider itself couldn't be safely read) — not a breach on its own; an

@@ -3,23 +3,28 @@
  *
  * Replaces the per-group "written once at init, owned by the group" pattern
  * with a host-regenerated entry point that INLINES:
- *   - a shared base (`container/CLAUDE.md`, reached through the
- *     `.claude-shared.md` → `/app/CLAUDE.md` symlink)
+ *   - a shared base (`container/CLAUDE.md`, read directly from its host path)
  *   - built-in module fragments (`<name>.instructions.md` next to each MCP
- *     tool, reached through the `module-<name>.md` symlinks)
+ *     tool, read directly from their host paths)
  *   - optional per-MCP-server fragments (inline `instructions` field in
  *     `container.json`)
  *   - optional provider-neutral standing instructions
  *
  * Every section is written into the file itself rather than `@`-imported:
  * Claude Code silently DROPS an `@`-import whose resolved realpath falls
- * outside the project directory, and the fragments that matter resolve into
- * `/app`, outside the container's project directory of `/workspace/agent`.
- * See the comment on the composition block below for the measurement.
+ * outside the project directory, and a container-path symlink this function
+ * used to write (e.g. `/app/CLAUDE.md`) resolves outside the container's
+ * project directory of `/workspace/agent`. Reading the host source directly
+ * at compose time — rather than writing a dangling on-host symlink to a
+ * container-only path and re-deriving its host equivalent through a
+ * container-to-host translation map — sidesteps that entirely: compose
+ * always runs host-side, so it never needed the container's view of these
+ * paths in the first place. See the comment on the composition block below
+ * for the measurement that motivated inlining.
  *
  * Runs on every spawn from `container-runner.buildMounts()`. Deterministic —
- * same inputs produce the same CLAUDE.md, and stale fragments are pruned.
- * The composition order and fragment sources are documented inline above.
+ * same inputs produce the same CLAUDE.md. The composition order and fragment
+ * sources are documented inline above.
  */
 import fs from 'fs';
 import os from 'os';
@@ -39,13 +44,9 @@ import type { AgentGroup } from './types.js';
 // the shared base) so it is the top of the composed system prompt.
 const STANDING_INSTRUCTIONS_FRAGMENT = 'standing-instructions.md';
 
-// Symlink targets are container paths — dangling on host (hence the readlink
-// dance instead of existsSync), valid inside the container via RO mounts.
-const SHARED_CLAUDE_MD_CONTAINER_PATH = '/app/CLAUDE.md';
-const SHARED_MCP_TOOLS_CONTAINER_BASE = '/app/src/mcp-tools';
-
 // Host-side source paths used to discover fragment sources at compose time.
-// Resolved at call time (process.cwd() = project root) so tests can swap cwd.
+// Joined against `projectRoot` (derived from GROUPS_DIR) at call time so
+// tests, which mock GROUPS_DIR to a scratch dir, resolve these consistently.
 const MCP_TOOLS_HOST_SUBPATH = path.join('container', 'agent-runner', 'src', 'mcp-tools');
 
 const COMPOSED_HEADER =
@@ -93,38 +94,39 @@ export function composeGroupClaudeMd(group: AgentGroup, provider: string): void 
     fs.mkdirSync(groupDir, { recursive: true });
   }
 
-  const sharedLink = path.join(groupDir, '.claude-shared.md');
-  syncSymlink(sharedLink, SHARED_CLAUDE_MD_CONTAINER_PATH);
+  removeStaleFragmentArtifacts(group.folder, groupDir);
 
-  const fragmentsDir = path.join(groupDir, '.claude-fragments');
-  if (!fs.existsSync(fragmentsDir)) {
-    fs.mkdirSync(fragmentsDir, { recursive: true });
-  }
+  // Host-side project root, derived from GROUPS_DIR (not process.cwd()) so
+  // every host source this function reads resolves the same way in tests,
+  // which mock GROUPS_DIR to a scratch dir without also changing cwd.
+  const projectRoot = path.resolve(GROUPS_DIR, '..');
 
-  // Desired fragment set.
+  // Desired fragment set — name -> already-resolved content, ready to be
+  // pushed straight into the composed doc. Nothing here is written to disk;
+  // it exists only in memory for the duration of this call.
   const configRow = getContainerConfig(group.id);
   const mcpServers: Record<string, McpServerConfig> = configRow
     ? validateMcpServers(JSON.parse(configRow.mcp_servers) as Record<string, McpServerConfig>)
     : {};
-  const desired = new Map<string, { type: 'symlink' | 'inline'; content: string }>();
+  const desired = new Map<string, string>();
 
   // Built-in module fragments — every MCP/CLI module that ships a
   // sibling `<name>.instructions.md`. These describe how the agent should
   // use that module's tools (install_packages, ncl tasks, etc.). Scheduling
   // guidance lives entirely in cli.instructions.md and is therefore excluded
   // when cli_scope is disabled; there is no separate scheduling MCP fragment.
+  // Read (and flattened, in case a module fragment ever grows its own
+  // `@`-import) directly from its host path — these are trunk-controlled
+  // files, not agent-writable, so flattening is safe.
   const cliDisabled = configRow?.cli_scope === 'disabled';
-  const mcpToolsHostDir = path.join(process.cwd(), MCP_TOOLS_HOST_SUBPATH);
+  const mcpToolsHostDir = path.join(projectRoot, MCP_TOOLS_HOST_SUBPATH);
   if (fs.existsSync(mcpToolsHostDir)) {
     for (const entry of fs.readdirSync(mcpToolsHostDir)) {
       const match = entry.match(/^(.+)\.instructions\.md$/);
       if (!match) continue;
       const moduleName = match[1];
       if (moduleName === 'cli' && cliDisabled) continue;
-      desired.set(`module-${moduleName}.md`, {
-        type: 'symlink',
-        content: `${SHARED_MCP_TOOLS_CONTAINER_BASE}/${entry}`,
-      });
+      desired.set(`module-${moduleName}.md`, flattenClaudeMd(path.join(mcpToolsHostDir, entry)));
     }
   }
 
@@ -132,10 +134,7 @@ export function composeGroupClaudeMd(group: AgentGroup, provider: string): void 
   // user-added external MCP servers.
   for (const [name, mcp] of Object.entries(mcpServers)) {
     if (mcp.instructions) {
-      desired.set(`mcp-${name}.md`, {
-        type: 'inline',
-        content: mcp.instructions,
-      });
+      desired.set(`mcp-${name}.md`, mcp.instructions);
     }
   }
 
@@ -166,41 +165,21 @@ export function composeGroupClaudeMd(group: AgentGroup, provider: string): void 
       } catch {
         continue;
       }
-      if (content) desired.set(`plugin-${name}.md`, { type: 'inline', content });
+      if (content) desired.set(`plugin-${name}.md`, content);
     }
   }
 
-  // Template persona (if any) — inline so it survives the prune below; imported
-  // first (see the imports assembly) so it prepends the composed system prompt.
+  // Template persona (if any) — inline; imported first (see the imports
+  // assembly) so it prepends the composed system prompt.
   const persona = readGroupPersona(groupDir, personaSymlinkRoots(group, groupDir));
   if (persona) {
-    desired.set(STANDING_INSTRUCTIONS_FRAGMENT, { type: 'inline', content: persona });
+    desired.set(STANDING_INSTRUCTIONS_FRAGMENT, persona);
   }
 
-  // Reconcile: drop stale, write desired.
-  for (const existing of fs.readdirSync(fragmentsDir)) {
-    if (!desired.has(existing)) {
-      fs.unlinkSync(path.join(fragmentsDir, existing));
-    }
-  }
-  for (const [name, frag] of desired) {
-    const fragPath = path.join(fragmentsDir, name);
-    if (frag.type === 'symlink') {
-      syncSymlink(fragPath, frag.content);
-    } else {
-      writeAtomic(fragPath, frag.content);
-    }
-  }
-
-  // The composer's symlinks point at container paths (`/app/CLAUDE.md`,
-  // `/app/src/mcp-tools/<n>.instructions.md`) which dangle on the host —
-  // give the flattener a translation map so it can read those targets from
-  // their host equivalents.
-  const projectRoot = path.resolve(GROUPS_DIR, '..');
-  const containerToHost: Record<string, string> = {
-    [SHARED_CLAUDE_MD_CONTAINER_PATH]: path.join(projectRoot, 'container', 'CLAUDE.md'),
-    [SHARED_MCP_TOOLS_CONTAINER_BASE]: path.join(projectRoot, MCP_TOOLS_HOST_SUBPATH),
-  };
+  // Shared base — read straight from its host path. Flattened in case it
+  // ever grows its own `@`-import; host-controlled, not agent-writable, so
+  // safe to flatten.
+  const sharedBaseHostPath = path.join(projectRoot, 'container', 'CLAUDE.md');
 
   // Composed entry — every section INLINED, in the same order the imports
   // used to be listed: persona first (top of the system prompt), then the
@@ -209,38 +188,37 @@ export function composeGroupClaudeMd(group: AgentGroup, provider: string): void 
   // Inlined rather than `@`-imported because Claude Code silently DROPS an
   // `@`-import whose resolved realpath falls outside the project directory.
   // Inside the container the project directory is `/workspace/agent` (the
-  // group folder), while `.claude-shared.md` → `/app/CLAUDE.md` and every
-  // `module-*.md` → `/app/src/mcp-tools/*.instructions.md` resolve outside
-  // it, so the shared base and every module fragment reached the model as
-  // nothing at all. Measured 2026-09-03 in the real agent image
-  // (claude-code 2.1.257) by capturing the outgoing Messages API request
-  // body: the inline fragment's sentinel was present, both symlinked ones
-  // were absent, and `--add-dir` on the target directory does not widen the
-  // boundary. Non-Claude providers were unaffected — they read the already
-  // flat AGENTS.md below.
+  // group folder); this function used to write a `.claude-shared.md` symlink
+  // to `/app/CLAUDE.md` and a `.claude-fragments/module-*.md` symlink per
+  // module, both of which resolve outside it, so the shared base and every
+  // module fragment reached the model as nothing at all. Measured
+  // 2026-09-03 in the real agent image (claude-code 2.1.257) by capturing
+  // the outgoing Messages API request body: the inline fragment's sentinel
+  // was present, both symlinked ones were absent, and `--add-dir` on the
+  // target directory does not widen the boundary. Non-Claude providers were
+  // unaffected — they read the already flat AGENTS.md below. Now that every
+  // section is read from its host path and inlined directly, the symlinks
+  // (and the RO mounts that backed them) serve no purpose and are gone —
+  // see `removeStaleFragmentArtifacts` above and the mount removal in
+  // `container-runner.ts`.
   //
-  // The fragment files stay on disk and RO-mounted so the agent can still
-  // read them; the model gets its instructions from this one flat file.
-  //
-  // SECURITY: an `inline` fragment's body is emitted VERBATIM — never run
-  // through the flattener. Those bodies come from agent-writable sources
-  // (the group folder is mounted RW at `/workspace/agent`), and the
-  // flattener runs HOST-side with the host user's filesystem access, so
-  // expanding them here would let a container author `@~/.env`, have the
-  // host inline those bytes, and read them back through its own mount —
-  // the same container-to-host exfiltration path the CLAUDE.local.md
-  // handling below is careful to avoid. Only `symlink` fragments, whose
-  // targets are host-controlled files under `/app`, are flattened.
+  // SECURITY: an inline fragment's body (mcp/plugin/persona) is emitted
+  // VERBATIM — never run through the flattener. Those bodies come from
+  // agent-writable sources (the group folder is mounted RW at
+  // `/workspace/agent`), and the flattener runs HOST-side with the host
+  // user's filesystem access, so expanding them here would let a container
+  // author `@~/.env`, have the host inline those bytes, and read them back
+  // through its own mount — the same container-to-host exfiltration path the
+  // CLAUDE.local.md handling below is careful to avoid. Only the shared base
+  // and module fragments, whose sources are host-controlled trunk files, are
+  // flattened, and only at the point they're read above.
   const sections: string[] = [COMPOSED_HEADER];
   const pushFragment = (name: string): void => {
-    const frag = desired.get(name);
-    if (!frag) return;
-    sections.push(
-      frag.type === 'inline' ? frag.content : flattenClaudeMd(path.join(fragmentsDir, name), { containerToHost }),
-    );
+    const content = desired.get(name);
+    if (content !== undefined) sections.push(content);
   };
   pushFragment(STANDING_INSTRUCTIONS_FRAGMENT);
-  sections.push(flattenClaudeMd(sharedLink, { containerToHost }));
+  sections.push(flattenClaudeMd(sharedBaseHostPath));
   for (const name of [...desired.keys()].filter((n) => n !== STANDING_INSTRUCTIONS_FRAGMENT).sort()) {
     pushFragment(name);
   }
@@ -349,20 +327,42 @@ export function migrateGroupsToClaudeLocal(): void {
   }
 }
 
-function syncSymlink(linkPath: string, target: string): void {
-  let currentTarget: string | null = null;
+/**
+ * ONE-RELEASE CLEANUP — delete after the next deploy has reached every group.
+ *
+ * Before instruction sections were inlined, `composeGroupClaudeMd` wrote a
+ * `.claude-shared.md` symlink (→ `/app/CLAUDE.md`) and a `.claude-fragments/`
+ * directory of symlink/inline fragment files so the composed doc could
+ * `@`-import them. Both are superseded: every section this function produces
+ * is now read from its host path and written into the doc directly, and the
+ * mounts that backed those container paths (`/app/CLAUDE.md`,
+ * `/workspace/agent/.claude-fragments`) are gone from `container-runner.ts`.
+ * Existing group dirs still carry the on-disk artifacts from before this
+ * cutover; delete them on next compose so disk state converges without a
+ * separate migration pass. Idempotent — a no-op once a group has been
+ * cleaned. Logs once per group, only when something was actually removed.
+ */
+function removeStaleFragmentArtifacts(groupFolder: string, groupDir: string): void {
+  let removed = false;
+
   try {
-    currentTarget = fs.readlinkSync(linkPath);
+    fs.unlinkSync(path.join(groupDir, '.claude-shared.md'));
+    removed = true;
   } catch {
-    /* missing */
+    /* already gone, or never existed */
   }
-  if (currentTarget === target) return;
-  try {
-    fs.unlinkSync(linkPath);
-  } catch {
-    /* missing */
+
+  const staleFragmentsDir = path.join(groupDir, '.claude-fragments');
+  if (fs.existsSync(staleFragmentsDir)) {
+    fs.rmSync(staleFragmentsDir, { recursive: true, force: true });
+    removed = true;
   }
-  fs.symlinkSync(target, linkPath);
+
+  if (removed) {
+    log.info('Removed vestigial instruction-fragment artifacts (superseded by full inlining)', {
+      group: groupFolder,
+    });
+  }
 }
 
 function writeAtomic(filePath: string, content: string): void {
