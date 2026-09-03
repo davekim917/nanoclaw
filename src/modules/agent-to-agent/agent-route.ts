@@ -39,6 +39,7 @@ import { resolveSession, sessionDir, withExistingMailboxSession, writeSessionMes
 import { prependThreadContext } from '../../thread-context.js';
 import type { PendingApproval, Session, SessionMode } from '../../types.js';
 import { requestApproval } from '../approvals/index.js';
+import { SessionDbMissingError } from '../mailbox/index.js';
 import { A2A_MESSAGE_GATE_ACTION, a2aSend } from './guard.js';
 
 export { isSafeAttachmentName };
@@ -194,14 +195,33 @@ export interface RoutableAgentMessage {
 async function isExactSameSessionLoopback(msg: RoutableAgentMessage, session: Session): Promise<boolean> {
   if (!msg.in_reply_to) return false;
   // A read of the caller's own queue: existing-only, never provisioning.
-  // `undefined` (mailbox gone) is not a loopback.
-  return (
-    (await withExistingMailboxSession(
-      session.agent_group_id,
-      session.id,
-      (mailbox) => mailbox.getInboundSourceSessionId(msg.in_reply_to as string) === session.id,
-    )) ?? false
+  //
+  // `undefined` means the mailbox is GONE, which is not the same answer as
+  // "this is not a loopback" and must not be spelled as one. Pre-seam this was
+  // a definite read that failed hard when inbound storage was missing; the
+  // seam's `?? false` quietly converted unknowable provenance into a licence
+  // to route, so a self-directed reply nobody could vouch for was accepted,
+  // re-provisioned the session and cost an extra self turn.
+  //
+  // Restored to failing: the caller is asking whether this message is safe to
+  // route to itself, and "I cannot tell" is not a yes. A present-but-unreadable
+  // DB already raises from the funnel (`SessionDbUnopenableError`), so this
+  // only has to close the missing case. Reached only on a self-send, so the
+  // blast radius is one agent group talking to itself.
+  const loopback = await withExistingMailboxSession(
+    session.agent_group_id,
+    session.id,
+    (mailbox) => mailbox.getInboundSourceSessionId(msg.in_reply_to as string) === session.id,
   );
+  if (loopback === undefined) {
+    // The session DIRECTORY, not a reconstructed inbound.db path: naming the
+    // file here would mean importing a raw-path helper into a module the
+    // mailbox-seam ratchet keeps off raw session-DB access, and the ratchet
+    // only ever shrinks. The directory is where the missing database lives and
+    // is what an operator needs to look at.
+    throw new SessionDbMissingError(sessionDir(session.agent_group_id, session.id));
+  }
+  return loopback;
 }
 
 /**
@@ -368,7 +388,7 @@ export async function routeAgentMessage(
     return;
   }
 
-  await performAgentRoute(msg, session, targetAgentGroupId);
+  await performAgentRoute(msg, session, targetAgentGroupId, opts.grant ?? null);
 }
 
 const GATE_CARD_BODY_MAX = 1500;
@@ -407,6 +427,9 @@ async function performAgentRoute(
   msg: RoutableAgentMessage,
   session: Session,
   targetAgentGroupId: string,
+  // Carried so the destination grant can be re-proved where the write is,
+  // rather than only where the route was decided.
+  grant: PendingApproval | null,
 ): Promise<void> {
   // Inherit the calling agent's threading context so cross-agent sessions
   // are scoped per-thread (when the caller is per-thread) instead of
@@ -499,6 +522,40 @@ async function performAgentRoute(
   // before the await — otherwise a wiring revoked in that window would leave
   // the backfill quoting a chat the target session is no longer bound to.
   const contentForWrite = await addThreadContext(forwardedContent, effective.mgId, effective.threadId, targetSession);
+
+  // AUTHORIZATION, re-proved immediately before the write it authorizes.
+  //
+  // The `a2aSend` guard above ran before two awaits — the source-mailbox lookup
+  // and the thread-context build, which can be a platform HTTP call lasting
+  // seconds. An admin revoking this `agent_destinations` grant in that window
+  // still gets the message inserted, archived, engaged and the target woken.
+  // Nothing here re-consulted the live guard, and a grant cannot save it: a
+  // grant never loosens a deny, it just was not asked again.
+  //
+  // Synchronous, with no await between it and `writeSessionMessage` below.
+  // `opts.grant` is passed exactly as the first call did, so an approved replay
+  // re-proves on the same terms it was approved under rather than being denied
+  // by its own approval.
+  const stillAuthorized = guard(a2aSend, {
+    actor: { kind: 'agent', agentGroupId: session.agent_group_id, sessionId: session.id },
+    resource: { from: session.agent_group_id, to: targetAgentGroupId },
+    payload: { id: msg.id, platform_id: targetAgentGroupId, content: msg.content, in_reply_to: msg.in_reply_to },
+    grant,
+  });
+  if (stillAuthorized.effect !== 'allow') {
+    // The same refusal the pre-check gives, so the caller's contract is
+    // unchanged and nothing is written. A `hold` here is treated as a refusal
+    // rather than re-opening an approval: this invocation already cleared the
+    // gate once, and asking a second time would double-prompt the operator for
+    // one message.
+    log.warn('agent-route: destination grant was revoked while routing; dropping the message', {
+      from: session.agent_group_id,
+      to: targetAgentGroupId,
+      msgId: msg.id,
+      reason: stillAuthorized.reason,
+    });
+    throw new GuardDenyError(stillAuthorized.reason ?? 'destination grant revoked while routing');
+  }
 
   await writeSessionMessage(targetAgentGroupId, targetSession.id, {
     id: a2aMsgId,

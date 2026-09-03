@@ -9,6 +9,8 @@ import { createDestination } from './db/agent-destinations.js';
 import { initTestDb, closeDb, runMigrations, createAgentGroup } from '../../db/index.js';
 import { createSession, updateSession } from '../../db/sessions.js';
 import { initSessionFolder, inboundDbPath, sessionDir, writeSessionMessage } from '../../session-manager.js';
+import { getDb } from '../../db/connection.js';
+import { SessionDbMissingError } from '../mailbox/index.js';
 import type { Session } from '../../types.js';
 
 vi.mock('../../container-runner.js', () => ({
@@ -21,6 +23,24 @@ vi.mock('../../container-runner.js', () => ({
 vi.mock('../../config.js', async () => {
   const actual = await vi.importActual('../../config.js');
   return { ...actual, DATA_DIR: TEST_DIR };
+});
+
+// One-shot hook that fires inside the source-mailbox lookup — the first await
+// standing between the route's authorization decision and the write it
+// authorizes. Lets a case revoke a grant mid-route with no timing dependence.
+const duringSourceLookup = vi.hoisted(() => ({ run: null as (() => void) | null }));
+
+vi.mock('../../session-manager.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../session-manager.js')>();
+  return {
+    ...actual,
+    withExistingMailboxSession: async (agentGroupId: string, sessionId: string, action: never) => {
+      const hook = duringSourceLookup.run;
+      duringSourceLookup.run = null;
+      hook?.();
+      return actual.withExistingMailboxSession(agentGroupId, sessionId, action);
+    },
+  };
 });
 
 const { TEST_DIR } = vi.hoisted(() => ({ TEST_DIR: uniqueTmpRoot('test-a2a-route') }));
@@ -189,6 +209,7 @@ describe('routeAgentMessage return-path', () => {
   });
 
   afterEach(() => {
+    duringSourceLookup.run = null;
     closeDb();
     if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
   });
@@ -399,6 +420,65 @@ describe('routeAgentMessage return-path', () => {
     const s2Rows = readPairedInboundTriggers(A, S2.id);
     expect(s1Rows).toHaveLength(0);
     expect(s2Rows).toHaveLength(1);
+  });
+
+  /**
+   * A destination revoked mid-route must not still deliver.
+   *
+   * The `a2aSend` guard runs at the top of `routeAgentMessage`, and the route
+   * then awaits — the source-mailbox lookup here, and in production a
+   * thread-context build that can be a platform HTTP call lasting seconds. An
+   * admin revoking the grant inside that window used to get the message
+   * inserted, archived, engaged and the target woken on an authorization that
+   * no longer held.
+   */
+  it('drops a message whose destination grant is revoked while the route is in flight', async () => {
+    // A.S1 → B first, so B has a row to reply to and the reply takes the
+    // return-path lookup — the await this case opens its window inside.
+    await routeAgentMessage(
+      { id: 'msg-fwd', platform_id: B, content: JSON.stringify({ text: 'ping' }), in_reply_to: null },
+      S1,
+    );
+    const inboundId = readPairedInboundTriggers(B, SB.id)[0].id;
+
+    // The admin revokes B→A while the lookup is in flight.
+    duringSourceLookup.run = () => {
+      getDb().prepare('DELETE FROM agent_destinations WHERE agent_group_id = ? AND target_id = ?').run(B, A);
+    };
+
+    await expect(
+      routeAgentMessage(
+        { id: 'msg-reply', platform_id: A, content: JSON.stringify({ text: 'pong' }), in_reply_to: inboundId },
+        SB,
+      ),
+    ).rejects.toThrow(/no destination for/);
+
+    // Nothing written, on either candidate session.
+    expect(readPairedInboundTriggers(A, S1.id)).toHaveLength(0);
+    expect(readPairedInboundTriggers(A, S2.id)).toHaveLength(0);
+  });
+
+  /**
+   * Unprovable provenance is not a licence to route.
+   *
+   * The loopback check asks whether this reply is the caller talking to itself.
+   * When the caller's own inbound storage is gone the answer is unknowable, and
+   * the seam briefly spelled that as `false` — "not a loopback" — which routed
+   * a self-directed reply nobody could vouch for and cost an extra self turn.
+   * A definite read fails instead.
+   */
+  it('fails rather than routing a self-reply whose own inbound storage is gone', async () => {
+    fs.rmSync(inboundDbPath(A, S1.id));
+
+    await expect(
+      routeAgentMessage(
+        { id: 'self-reply', platform_id: A, content: JSON.stringify({ text: 'to myself' }), in_reply_to: 'some-row' },
+        S1,
+      ),
+    ).rejects.toThrow(SessionDbMissingError);
+
+    // And it did not fall through to the newest-session heuristic instead.
+    expect(readPairedInboundTriggers(A, S2.id)).toHaveLength(0);
   });
 
   it('self-message is allowed without a destination row', async () => {
