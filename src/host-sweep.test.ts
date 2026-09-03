@@ -15,6 +15,8 @@ import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
 import {
   countDueMessages,
   deleteOrphanProcessingClaims,
+  ensureSchema,
+  getContainerState,
   getProcessingClaims,
   type ContainerState,
 } from './db/session-db.js';
@@ -3024,5 +3026,54 @@ describe('reportContainerOomTelemetry', () => {
     expect(content._system.kind).toBe('agent_container_memory_pressure');
     expect(content.text).toContain('Nothing has been killed yet');
     expect(rows[0].trigger).toBe(0);
+  });
+});
+
+/**
+ * Cross-process contract for the one reaper term the host cannot derive on its
+ * own. A due inbound row, a processing claim and a work_continuation record are
+ * all host-visible; `provider_executing` is the container telling the host it is
+ * busy during work that shows up in none of them — the pre-task script batch and
+ * the durable-continuation turn (see container/agent-runner/src/db/connection.ts
+ * setProviderExecuting, whose own tests pin the write side). Both ends pin the
+ * literal column name, so a rename on either side goes red here.
+ */
+describe('provider_executing across the container to host seam', () => {
+  const busyUpsert =
+    'INSERT INTO container_state (id, provider_executing, updated_at) VALUES (1, ?, ?) ' +
+    'ON CONFLICT(id) DO UPDATE SET provider_executing = excluded.provider_executing, ' +
+    'updated_at = excluded.updated_at';
+
+  it('keeps a task container the runner flagged busy, and reaps it once the flag clears', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), `nanoclaw-provexec-${process.pid}-`));
+    const dbPath = path.join(dir, 'outbound.db');
+    try {
+      ensureSchema(dbPath, 'outbound');
+      const outDb = new Database(dbPath);
+      try {
+        // Exactly what the runner writes when it enters an unclaimed work
+        // window (a pre-task script, a durable-continuation turn).
+        outDb.prepare(busyUpsert).run(1, new Date().toISOString());
+        const busy = getContainerState(outDb);
+        expect(busy?.provider_executing).toBe(1);
+        // Nothing due, nothing claimed, no continuation — every other term
+        // says "idle", which is precisely the mid-work kill this guards.
+        expect(shouldReapIdleTaskContainer('system:tasks:task-1', 0, 0, busy?.provider_executing === 1, false)).toBe(
+          false,
+        );
+
+        outDb.prepare(busyUpsert).run(0, new Date().toISOString());
+        const idle = getContainerState(outDb);
+        expect(idle?.provider_executing).toBe(0);
+        // The reaper's purpose is intact: a container that finished still goes.
+        expect(shouldReapIdleTaskContainer('system:tasks:task-1', 0, 0, idle?.provider_executing === 1, false)).toBe(
+          true,
+        );
+      } finally {
+        outDb.close();
+      }
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

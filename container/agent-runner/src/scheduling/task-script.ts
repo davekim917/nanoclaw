@@ -2,7 +2,7 @@ import { execFile } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import type { MessageInRow } from '../db/messages-in.js';
-import { touchHeartbeat } from '../db/connection.js';
+import { touchHeartbeat, setProviderExecuting } from '../db/connection.js';
 import { evaluateManagedGitCommand } from '../managed-git-guard.js';
 import { buildSecretEnvVarList, MCP_HEADER_ONLY_SECRET_VARS } from '../providers/secret-env.js';
 
@@ -224,8 +224,21 @@ export async function applyPreTaskScripts(messages: MessageInRow[]): Promise<Tas
     }
 
     log(`running script for task ${msg.id}`);
+    // The batch is deliberately claimed only AFTER these scripts run (see the
+    // caller in poll-loop.ts), so for as long as a script executes the host
+    // sees no processing claim for it. The heartbeat alone does not save the
+    // container: the poll loop touches it every iteration, so it means "alive",
+    // not "busy", and the task reaper does not look at it. provider_executing
+    // is the signal that does mean busy — without it a script that outlives a
+    // sweep tick is killed mid-run once its row stops counting as due.
     touchHeartbeat();
-    const result = await runScript(script, msg.id);
+    setProviderExecuting(true);
+    let result: ScriptResult | null;
+    try {
+      result = await runScript(script, msg.id);
+    } finally {
+      setProviderExecuting(false);
+    }
     touchHeartbeat();
 
     if (!result || !result.wakeAgent) {

@@ -14,7 +14,14 @@
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
 import fs from 'node:fs';
 
-import { initTestSessionDb, closeSessionDb, getInboundDb, getOutboundDb } from '../db/connection.js';
+import {
+  initTestSessionDb,
+  closeSessionDb,
+  getInboundDb,
+  getOutboundDb,
+  setProviderExecuting,
+  clearStaleProcessingAcks,
+} from '../db/connection.js';
 import { getPendingMessages, markScriptSkipped } from '../db/messages-in.js';
 import { applyPreTaskScripts } from './task-script.js';
 
@@ -227,5 +234,64 @@ describe('pre-task managed Git guard', () => {
     expect(keep).toHaveLength(1);
     expect(JSON.parse(keep[0]!.content).scriptOutput).toEqual({ safe: true });
     expect(fs.existsSync(marker)).toBe(true);
+  });
+});
+
+/**
+ * Reaper visibility. A pre-task script runs BEFORE its batch is claimed (see
+ * the claim-ordering note in poll-loop.ts), so while it executes the host sees
+ * no processing_ack claim for it, and once the row stops counting as due the
+ * task reaper's remaining terms all read "idle" — it kills the container
+ * mid-script. `provider_executing` is the term that says "busy"; the host side
+ * of the contract is pinned in src/host-sweep.test.ts, so if either end
+ * renames the column its own test goes red.
+ */
+describe('applyPreTaskScripts provider_executing', () => {
+  const providerExecuting = (): number =>
+    (
+      getOutboundDb().prepare('SELECT provider_executing FROM container_state WHERE id = 1').get() as
+        | { provider_executing: number }
+        | undefined
+    )?.provider_executing ?? 0;
+
+  it('publishes the busy flag while a script runs and clears it when it finishes', async () => {
+    insertTask('t-busy-flag', `sleep 3\necho '{"wakeAgent": true}'`);
+
+    expect(providerExecuting()).toBe(0);
+    const run = applyPreTaskScripts(getPendingMessages());
+
+    // Poll rather than sleep a fixed amount: the first classifyScript call
+    // imports the shared destructive core, whose cost is not bounded here.
+    let sawBusy = 0;
+    const deadline = Date.now() + 2_500;
+    while (Date.now() < deadline) {
+      sawBusy = providerExecuting();
+      if (sawBusy === 1) break;
+      await Bun.sleep(25);
+    }
+    expect(sawBusy).toBe(1);
+
+    const { keep, skipped } = await run;
+    expect(skipped).toHaveLength(0);
+    expect(keep).toHaveLength(1);
+    expect(providerExecuting()).toBe(0);
+  });
+
+  it('clears the busy flag when the script fails, so a broken monitor cannot pin the container', async () => {
+    insertTask('t-busy-flag-error', 'exit 3');
+
+    const { skipped } = await applyPreTaskScripts(getPendingMessages());
+
+    expect(skipped).toEqual([{ id: 't-busy-flag-error', reason: 'error' }]);
+    expect(providerExecuting()).toBe(0);
+  });
+
+  it('clears a flag leaked by a killed container at the next container startup', () => {
+    setProviderExecuting(true);
+    expect(providerExecuting()).toBe(1);
+
+    clearStaleProcessingAcks();
+
+    expect(providerExecuting()).toBe(0);
   });
 });

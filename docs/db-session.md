@@ -218,6 +218,7 @@ CREATE TABLE container_state (
   tool_declared_timeout_ms INTEGER,
   tool_started_at          TEXT,
   provider_status          TEXT,
+  provider_executing       INTEGER NOT NULL DEFAULT 0,
   provider_last_event_at   TEXT,
   provider_last_probe_at   TEXT,
   provider_probe_failures  INTEGER,
@@ -234,6 +235,7 @@ CREATE TABLE container_state (
 ```
 
 - **Writer (container):** operation/provider state helpers in `container/agent-runner/src/db/connection.ts` plus `resource-telemetry.ts` for cgroup samples.
+- **`provider_executing`** is the container's "I am busy right now" flag for the host's idle reapers. They otherwise infer busy-ness from state the host can see — a due inbound row, a `processing` claim, a `work_continuation` record — and work the runner drives on its own behalf appears in none of it: the pre-task script batch runs before its rows are claimed (up to `NANOCLAW_TASK_SCRIPT_TIMEOUT_MS`, 120s by default) and a durable-continuation turn claims nothing and drops its continuation record on the provider's `result` event, with delivery, archiving and the turn-end git checkpoint still to go. `setProviderExecuting()` brackets those windows in a `try`/`finally`; a container killed mid-window cannot clear the flag, so the next container clears it at startup.
 - **Reader (host):** `getContainerState()` in `src/db/session-db.ts`; consumed by the sweep's `activeOperationTimeoutMs()` helper in `src/host-sweep.ts`.
 - **Restart cleanup:** container startup clears prior operation/provider state and immediately overwrites resource fields with the new cgroup's counters.
 - `CREATE TABLE IF NOT EXISTS` — forward-compatible with `outbound.db` files created before this table existed; `getContainerState()` returns `null` if the table or row is absent.

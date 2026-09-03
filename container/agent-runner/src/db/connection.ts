@@ -202,6 +202,7 @@ export function configureOutboundDb(outbound: Database): void {
         tool_declared_timeout_ms INTEGER,
         tool_started_at          TEXT,
         provider_status          TEXT,
+        provider_executing       INTEGER NOT NULL DEFAULT 0,
         provider_last_event_at   TEXT,
         provider_last_probe_at   TEXT,
         provider_probe_failures  INTEGER,
@@ -229,6 +230,12 @@ export function configureOutboundDb(outbound: Database): void {
     ['tool_declared_timeout_ms', 'INTEGER'],
     ['tool_started_at', 'TEXT'],
     ['provider_status', 'TEXT'],
+    // The host's idle reaper reads this column to tell "busy but holding no
+    // inbound claim" from "finished". It was in the host schema and the reap
+    // decision from day one with NO writer on either side, so the guard was
+    // permanently false; the writer below is what makes it real. Older
+    // outbound.db files predate the column, hence this backfill entry.
+    ['provider_executing', 'INTEGER NOT NULL DEFAULT 0'],
     ['provider_last_event_at', 'TEXT'],
     ['provider_last_probe_at', 'TEXT'],
     ['provider_probe_failures', 'INTEGER'],
@@ -411,6 +418,38 @@ export function clearProviderHealthState(outbound: Database = getOutboundDb()): 
 }
 
 /**
+ * Publish "this container is doing work right now" for the host's idle
+ * reapers (`shouldReapIdleTaskContainer` in src/host-sweep.ts).
+ *
+ * The reapers otherwise infer busy-ness from state the HOST can see: a due
+ * inbound row, or a `processing` claim in processing_ack. Both are absent
+ * during work the runner drives on its own behalf — the pre-task script batch
+ * (up to NANOCLAW_TASK_SCRIPT_TIMEOUT_MS, 120s by default) runs before the
+ * batch is claimed, and the durable-continuation turn runs with an empty
+ * claim list and clears its work_continuation record on the provider's
+ * `result` event, while the runner is still delivering, archiving and running
+ * its turn-end git checkpoint. In those windows every term the task reaper
+ * looks at reads "idle" and the container is killed mid-work.
+ *
+ * Always set it in a `try`/`finally` pair: a window that is entered and never
+ * left would hold the container past the reaper (the 30-minute heartbeat
+ * ceiling is still a backstop, and clearStaleProcessingAcks resets the flag
+ * at the next container's startup).
+ */
+export function setProviderExecuting(executing: boolean, outbound: Database = getOutboundDb()): void {
+  const now = new Date().toISOString();
+  outbound
+    .prepare(
+      `INSERT INTO container_state (id, provider_executing, updated_at)
+       VALUES (1, ?, ?)
+       ON CONFLICT(id) DO UPDATE SET
+         provider_executing = excluded.provider_executing,
+         updated_at = excluded.updated_at`,
+    )
+    .run(executing ? 1 : 0, now);
+}
+
+/**
  * Touch the heartbeat file — replaces the old touchProcessing() DB writes.
  * The host checks this file's mtime for stale container detection.
  * A file touch is cheaper and avoids cross-boundary DB write contention.
@@ -438,6 +477,11 @@ export function clearStaleProcessingAcks(): void {
   getOutboundDb().prepare("DELETE FROM processing_ack WHERE status = 'processing'").run();
   clearContainerToolInFlight();
   clearProviderHealthState();
+  // A container killed mid-work cannot run its own `finally`, so the flag can
+  // survive in outbound.db. Clearing it here — the fresh container's startup,
+  // before its first poll — means a leaked 1 can never make the NEXT container
+  // unreapable.
+  setProviderExecuting(false);
 }
 
 /** For tests — creates in-memory DBs with the session schemas. */
@@ -520,6 +564,7 @@ export function initTestSessionDb(): { inbound: Database; outbound: Database } {
       tool_declared_timeout_ms INTEGER,
       tool_started_at          TEXT,
       provider_status          TEXT,
+      provider_executing       INTEGER NOT NULL DEFAULT 0,
       provider_last_event_at   TEXT,
       provider_last_probe_at   TEXT,
       provider_probe_failures  INTEGER,

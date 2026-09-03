@@ -20,7 +20,7 @@ import { getConfig } from './config.js';
 import { setChatLimit, writeMessageOut } from './db/messages-out.js';
 import { recordTurnUsage } from './db/turn-usage.js';
 import { getSessionSpawnTaskId } from './db/session-routing.js';
-import { getInboundDb, touchHeartbeat, clearStaleProcessingAcks } from './db/connection.js';
+import { getInboundDb, touchHeartbeat, clearStaleProcessingAcks, setProviderExecuting } from './db/connection.js';
 import {
   advanceMemoryContextEpoch,
   clearContinuation,
@@ -426,6 +426,14 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
           setCurrentBatchAnchors(sourceBatch);
           let query: AgentQuery | undefined;
           const abortDirectQuery = () => query?.abort();
+          // This turn is invisible to every signal the host's task reaper
+          // reads: it claims no inbound rows (processingIds is []), nothing is
+          // due (the outer branch only runs when no trigger row is pending),
+          // and processQuery clears the work_continuation record the moment
+          // the provider emits `result` — while delivery, archiving and the
+          // turn-end git checkpoint below are still running. Publish the busy
+          // flag across the whole window instead.
+          setProviderExecuting(true);
           try {
             query = config.provider.query({
               prompt,
@@ -469,8 +477,12 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
             clearCurrentInReplyTo();
             clearBatchAnchors();
           }
-          emitTurnEnd();
-          await checkpointTurnEnd(autosaveWorktrees);
+          try {
+            emitTurnEnd();
+            await checkpointTurnEnd(autosaveWorktrees);
+          } finally {
+            setProviderExecuting(false);
+          }
           continue;
         }
       }

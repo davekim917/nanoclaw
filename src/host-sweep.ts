@@ -776,7 +776,8 @@ export function _applyCeilingFollowUpForTesting(
 // provider's own "I am done" verdict. Today only the Codex provider ever writes
 // it (container/agent-runner/src/providers/codex.ts) — Claude and OpenCode
 // never do — so this heals Codex sessions only until they follow. It is
-// deliberately NOT built on provider_executing, which has no writer anywhere.
+// deliberately NOT built on provider_executing: that flag says "busy", not
+// "given up", and a wedged provider can be either.
 //
 // Two consecutive sweep ticks are required so a transition the container
 // recovers from on its own never costs it a kill.
@@ -1311,10 +1312,23 @@ export function shouldCloseTaskSession(
  * only the Codex provider ever writes it again — so for every other provider
  * the old `providerStatus === 'idle'` term was true from second one of the
  * container's life and the guard did nothing. `provider_executing` is the
- * maintained equivalent: the shared poll loop sets it around every turn for
- * every provider, including the runner-pushed follow-up turns (wrapping-retry
- * nudges, post-compaction bootstrap re-injection) that hold no processing
- * claim and would otherwise be killable mid-turn.
+ * maintained equivalent, and it exists because the other three terms are all
+ * things the HOST can see — a due inbound row, a processing claim, a
+ * work_continuation record. Work the runner drives on its own behalf shows up
+ * in none of them, and every such window was a silent mid-work kill until the
+ * runner started publishing this flag (container/agent-runner/src/db/
+ * connection.ts setProviderExecuting):
+ *
+ *   - the pre-task script batch, which by design runs BEFORE the rows it
+ *     belongs to are claimed and may take NANOCLAW_TASK_SCRIPT_TIMEOUT_MS
+ *     (120s default) — several sweep ticks;
+ *   - the durable-continuation turn, which claims nothing at all and drops
+ *     its work_continuation record on the provider's `result` event, while
+ *     delivery, archiving and the turn-end git checkpoint are still running.
+ *
+ * A container that dies mid-window cannot clear the flag, so the fresh one
+ * clears it at startup (clearStaleProcessingAcks) and the 30-minute heartbeat
+ * ceiling remains the backstop.
  *
  * An active work_continuation also blocks the reap. `continue_work` is the
  * only sanctioned way to promise follow-up, and between turn end and
