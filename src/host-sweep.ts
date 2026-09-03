@@ -311,6 +311,40 @@ function containerOwnsOutbound(sessionId: string): boolean {
 }
 
 /**
+ * THE guard for every host-side write to the container-owned `outbound.db`.
+ *
+ * `outbound.db` has one writer. The host may write it only while no container
+ * owns it, and after the seam made these paths async that check has to sit
+ * immediately before the write with no await in between — an open, a kill, or
+ * any other yield is a window a replacement wake can land in.
+ *
+ * Two entry points, one implementation:
+ *  - this one, for a write inside a session the caller already holds;
+ *  - `withStoppedContainerSession`, which opens a short session and delegates
+ *    here, for a write that needs its own.
+ *
+ * Both exist because the nesting guard forbids opening a second session for a
+ * key while one is open (invariant I-3), so the in-session writes physically
+ * cannot route through the session-opening form. Every outbound write in this
+ * file is an argument to one of these two, which is what makes the property
+ * checkable by grep rather than by reading.
+ *
+ * Returns `undefined` when a container owns the file — never an error. Every
+ * caller's write is idempotent or retried on the next tick.
+ */
+function writeOutboundWhenStopped<T>(
+  session: Session,
+  mailbox: NanoclawMailboxSession,
+  action: (mailbox: NanoclawMailboxSession) => T,
+): T | undefined {
+  if (containerOwnsOutbound(session.id)) {
+    log.debug('Skipped a host outbound write — a container owns this session', { sessionId: session.id });
+    return undefined;
+  }
+  return action(mailbox);
+}
+
+/**
  * Run a host write against the container-owned `outbound.db`, but only while
  * the container is confirmed stopped.
  *
@@ -329,15 +363,9 @@ async function withStoppedContainerSession<T>(
   session: Session,
   action: (mailbox: NanoclawMailboxSession) => T,
 ): Promise<T | undefined> {
-  return withExistingNanoclawSession(session.agent_group_id, session.id, (mailbox) => {
-    if (containerOwnsOutbound(session.id)) {
-      log.debug('Skipped a host outbound write — a container took the session during the open', {
-        sessionId: session.id,
-      });
-      return undefined;
-    }
-    return action(mailbox);
-  });
+  return withExistingNanoclawSession(session.agent_group_id, session.id, (mailbox) =>
+    writeOutboundWhenStopped(session, mailbox, action),
+  );
 }
 
 async function incrementStoppedContinuationAttempt(
@@ -852,12 +880,13 @@ async function sweepProviderHeal(
         // above, this session opened after it, and a respawn in that gap owns
         // outbound.db. The notice is one-per-episode and idempotent, so
         // skipping it costs nothing a later tick cannot redo.
-        if (containerOwnsOutbound(session.id)) return false;
-        return notifyProviderHealParked(
-          mailbox,
-          session,
-          containerState?.provider_failure_reason ?? null,
-          writeParkedMessage,
+        return writeOutboundWhenStopped(session, mailbox, () =>
+          notifyProviderHealParked(
+            mailbox,
+            session,
+            containerState?.provider_failure_reason ?? null,
+            writeParkedMessage,
+          ),
         );
       });
     } catch (err) {
@@ -1618,8 +1647,10 @@ async function sweepSession(session: Session): Promise<number | null> {
       // orphan claim before any due-count or wake decision can expose its stale
       // recall to a replacement/warm poller. When backoff elapses, the admission
       // seam below replaces that recall from current host state.
-      if (!containerOwnsOutbound(session.id) && mailbox.getProcessingClaimRows().length > 0) {
-        resetStuckProcessingRows(mailbox, session, 'container not running');
+      if (mailbox.getProcessingClaimRows().length > 0) {
+        writeOutboundWhenStopped(session, mailbox, () =>
+          resetStuckProcessingRows(mailbox, session, 'container not running'),
+        );
       }
 
       // 3. Admit due scheduled occurrences and lifecycle wakes with fresh
@@ -1671,7 +1702,11 @@ async function sweepSession(session: Session): Promise<number | null> {
           dueCount = mailbox.countDueMessages();
           wakePriority = dueCount > 0 ? mailbox.getDueWakePriority() : 'interactive';
         }
-        if (dueCount === 0) notifyContinuationParked(mailbox, session, workContinuation);
+        if (dueCount === 0) {
+          writeOutboundWhenStopped(session, mailbox, () =>
+            notifyContinuationParked(mailbox, session, workContinuation),
+          );
+        }
       }
 
       // Every stopped-session wake must pass through continuation recovery
@@ -1829,8 +1864,10 @@ async function sweepSession(session: Session): Promise<number | null> {
     // `alive` was sampled BEFORE this session opened, so it cannot authorize a
     // write to outbound.db on its own — re-checked here, immediately before,
     // with no await in between.
-    if (plan.hasOutbound && !containerOwnsOutbound(session.id)) {
-      resetStuckProcessingRows(mailbox, session, 'container not running');
+    if (plan.hasOutbound) {
+      writeOutboundWhenStopped(session, mailbox, () =>
+        resetStuckProcessingRows(mailbox, session, 'container not running'),
+      );
     }
 
     // 8. Recurrence fanout for completed recurring tasks.
@@ -2214,9 +2251,10 @@ async function enforceRunningContainerSla(
       // one restart notice and defers the orphan-claim clear to the next tick —
       // both idempotent. Writing anyway would delete the FRESH runner's claim
       // and defer an input it is already processing: duplicate execution.
-      if (containerOwnsOutbound(session.id)) return;
-      notifyKillCeiling(mailbox, session, decision.heartbeatAgeMs, pendingClaims, containerState);
-      resetStuckProcessingRows(mailbox, session, 'absolute-ceiling');
+      writeOutboundWhenStopped(session, mailbox, () => {
+        notifyKillCeiling(mailbox, session, decision.heartbeatAgeMs, pendingClaims, containerState);
+        resetStuckProcessingRows(mailbox, session, 'absolute-ceiling');
+      });
       // Accountability wake: if the kill plausibly interrupted parked work,
       // queue an on_wake row so the session respawns (next sweep tick's
       // due-wake step) and answers for the interruption instead of staying
@@ -2247,8 +2285,7 @@ async function enforceRunningContainerSla(
   killContainer(session.id, 'claim-stuck');
   await run((mailbox) => {
     // Same yield boundary as the ceiling branch above.
-    if (containerOwnsOutbound(session.id)) return;
-    resetStuckProcessingRows(mailbox, session, 'claim-stuck');
+    writeOutboundWhenStopped(session, mailbox, () => resetStuckProcessingRows(mailbox, session, 'claim-stuck'));
   });
 }
 
