@@ -31,6 +31,14 @@ const SCANNED_FLAT_DIRS = ['container'];
 const FIXED_PATH_EXEMPT: Record<string, string> = {
   'src/cli/transport-errors.test.ts': 'formats a socket-path error message; the path is never opened or created',
   'src/fixture-roots.test.ts': 'this guard',
+  // These three are ported upstream files (docs/specs/upstream-mailbox-seam/plan.md
+  // §4.6.1) and must stay byte-for-byte identical to nanocoai/nanoclaw — drift is
+  // caught by src/mailbox-seam-upstream.test.ts against UPSTREAM-MANIFEST.json.
+  // Switching them to uniqueTmpRoot() is a real fix but has to land upstream first
+  // and get re-ported, not be hand-edited here.
+  'src/mailbox/sqlite/arm-next-task.test.ts': 'ported upstream file — see mailbox-seam-upstream.test.ts',
+  'src/mailbox/sqlite/session-db.test.ts': 'ported upstream file — see mailbox-seam-upstream.test.ts',
+  'src/mailbox/sqlite/tasks.test.ts': 'ported upstream file — see mailbox-seam-upstream.test.ts',
 };
 
 function testFiles(): string[] {
