@@ -86,6 +86,14 @@ export interface ApplyResult {
   attempts: number;
   /** Wall time of every attempt, in order. */
   durationsMs: number[];
+  /**
+   * What each failed attempt reported, in order. A mixed sequence — attempt 1
+   * throws a 429, attempt 2 returns a bare `false` — is exactly the case where
+   * a single overwritten field would throw away the only concrete status the
+   * host ever saw, so every attempt keeps its own record.
+   */
+  attemptDiagnoses: ApplyDiagnosis[];
+  /** The most concrete of `attemptDiagnoses`, for the one-line refusal message. */
   diagnosis?: ApplyDiagnosis;
 }
 
@@ -150,6 +158,19 @@ const realDeps: Omit<ApplyDeps, 'applyContainerConfig'> = {
 };
 
 /**
+ * Pick the attempt worth naming: the first that carries a status, an error
+ * code, or a message. A bare `returned-false` says only that the SDK gave up,
+ * so it never displaces an attempt that named something. Pure, exported for
+ * tests.
+ */
+export function pickDiagnosis(attemptDiagnoses: ApplyDiagnosis[]): ApplyDiagnosis | undefined {
+  return (
+    attemptDiagnoses.find((d) => d.statusCode !== undefined || d.causeCode !== undefined || d.message !== undefined) ??
+    attemptDiagnoses[attemptDiagnoses.length - 1]
+  );
+}
+
+/**
  * Run the apply with one bounded retry for the proved-transient class.
  *
  * Safe to retry with the same `args` array: the SDK fetches the config before
@@ -165,26 +186,35 @@ export async function runApplyWithRetry(
   deps: ApplyDeps,
 ): Promise<ApplyResult> {
   const durationsMs: number[] = [];
-  let diagnosis: ApplyDiagnosis | undefined;
+  const attemptDiagnoses: ApplyDiagnosis[] = [];
 
   for (let attempt = 1; attempt <= 2; attempt++) {
     const startedAt = deps.now();
     try {
       const applied = await deps.applyContainerConfig(args, options);
       durationsMs.push(deps.now() - startedAt);
-      if (applied) return { applied: true, attempts: attempt, durationsMs, diagnosis };
+      if (applied) {
+        return {
+          applied: true,
+          attempts: attempt,
+          durationsMs,
+          attemptDiagnoses,
+          diagnosis: pickDiagnosis(attemptDiagnoses),
+        };
+      }
       // `false` is transport-or-5xx by construction (the SDK rethrows 4xx), so
-      // it is always in the retryable class.
-      diagnosis = { outcome: 'returned-false' };
+      // it is always in the retryable class. It carries no detail at all, which
+      // is why it is appended rather than allowed to overwrite attempt 1.
+      attemptDiagnoses.push({ outcome: 'returned-false' });
     } catch (err) {
       durationsMs.push(deps.now() - startedAt);
       const statusCode = httpStatusOf(err);
-      diagnosis = {
+      attemptDiagnoses.push({
         outcome: 'threw',
         statusCode,
         message: err instanceof Error ? err.message : String(err),
         causeCode: causeCodeOf(err),
-      };
+      });
       // A deterministic 4xx (bad key, unregistered identity) cannot be retried
       // into success. Rethrow so the caller sees the real error, not a generic
       // refusal — this is the one path that must stay loud and immediate.
@@ -194,15 +224,17 @@ export async function runApplyWithRetry(
     if (attempt === 1) await deps.sleep(deps.retryDelayMs);
   }
 
-  // Both attempts failed. Name the cause the SDK flattened away.
+  // Both attempts failed. Name the cause the SDK flattened away, without
+  // letting the probe's verdict overwrite a status an attempt already reported.
   const probe = await deps.diagnose(options.agent);
-  diagnosis = {
-    ...(diagnosis ?? { outcome: 'returned-false' }),
+  const picked = pickDiagnosis(attemptDiagnoses) ?? { outcome: 'returned-false' };
+  const diagnosis: ApplyDiagnosis = {
+    ...picked,
     probe: probe.probe,
-    causeCode: probe.causeCode ?? diagnosis?.causeCode,
-    statusCode: diagnosis?.statusCode ?? probe.statusCode,
+    causeCode: picked.causeCode ?? probe.causeCode,
+    statusCode: picked.statusCode ?? probe.statusCode,
   };
-  return { applied: false, attempts: 2, durationsMs, diagnosis };
+  return { applied: false, attempts: 2, durationsMs, attemptDiagnoses, diagnosis };
 }
 
 /**
@@ -230,6 +262,7 @@ export async function applyOnecliContainerConfig(
       outcome: result.diagnosis?.outcome ?? null,
       statusCode: result.diagnosis?.statusCode ?? null,
       causeCode: result.diagnosis?.causeCode ?? null,
+      perAttempt: result.attemptDiagnoses.map(describeDiagnosis),
     });
     return result;
   }
@@ -243,6 +276,7 @@ export async function applyOnecliContainerConfig(
     causeCode: result.diagnosis?.causeCode ?? null,
     message: result.diagnosis?.message ?? null,
     probe: result.diagnosis?.probe ?? null,
+    perAttempt: result.attemptDiagnoses.map(describeDiagnosis),
     url: ONECLI_URL ?? null,
   });
   return result;

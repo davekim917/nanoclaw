@@ -17,6 +17,7 @@ import {
   applyOnecliContainerConfig,
   causeCodeOf,
   describeDiagnosis,
+  pickDiagnosis,
   runApplyWithRetry,
   type ApplyDeps,
 } from './onecli-apply.js';
@@ -160,6 +161,49 @@ describe('runApplyWithRetry', () => {
     expect(d.diagnoseCalls).toEqual([]);
   });
 
+  it('keeps a thrown 429 when the retry returns a detail-free false', async () => {
+    // The mixed-failure sequence: attempt 1 names a status, attempt 2 names
+    // nothing. A single overwritten field would report only "transient" and
+    // discard the one concrete status the host ever saw.
+    let attempts = 0;
+    const d = deps({
+      applyContainerConfig: async () => {
+        attempts++;
+        if (attempts === 1) throw requestError(429);
+        return false;
+      },
+      diagnose: async () => ({ probe: 'control API answered 200 on the diagnostic probe — the failure was transient' }),
+    });
+
+    const result = await runApplyWithRetry([], { addHostMapping: false, agent: 'ag-1' }, d);
+
+    expect(result.applied).toBe(false);
+    expect(result.diagnosis).toMatchObject({
+      outcome: 'threw',
+      statusCode: 429,
+      message: 'OneCLI returned 429',
+      probe: 'control API answered 200 on the diagnostic probe — the failure was transient',
+    });
+    expect(result.attemptDiagnoses.map((a) => a.outcome)).toEqual(['threw', 'returned-false']);
+  });
+
+  it('records both attempts even when the first is the detail-free one', async () => {
+    let attempts = 0;
+    const d = deps({
+      applyContainerConfig: async () => {
+        attempts++;
+        if (attempts === 1) return false;
+        throw requestError(503);
+      },
+      diagnose: async () => ({ probe: 'diagnostic probe failed: fetch failed (ECONNRESET)', causeCode: 'ECONNRESET' }),
+    });
+
+    const result = await runApplyWithRetry([], { addHostMapping: false, agent: 'ag-1' }, d);
+
+    expect(result.attemptDiagnoses.map((a) => a.outcome)).toEqual(['returned-false', 'threw']);
+    expect(result.diagnosis).toMatchObject({ statusCode: 503, causeCode: 'ECONNRESET' });
+  });
+
   it('shares its status classification with the boot preflight', () => {
     // Guards against the spawn path and the boot probe drifting apart on what
     // counts as transient.
@@ -205,6 +249,7 @@ describe('applyOnecliContainerConfig logging shape', () => {
     expect(message).toBe('OneCLI gateway apply failed once, retry succeeded');
     expect(fields).toMatchObject({ agent: 'ag-noslack', attempts: 2, outcome: 'returned-false' });
     expect(fields.durationsMs).toHaveLength(2);
+    expect(fields.perAttempt).toEqual(['SDK returned false']);
   });
 
   it('warns with the underlying cause, status and probe when the spawn is refused', async () => {
@@ -238,6 +283,32 @@ describe('applyOnecliContainerConfig logging shape', () => {
       message: 'OneCLI returned 503',
       probe: 'diagnostic probe failed: fetch failed (UND_ERR_SOCKET)',
     });
+    // Every attempt is on the line, not just the one chosen for the message.
+    expect(fields.perAttempt).toEqual([
+      'SDK threw; status 503; OneCLI returned 503',
+      'SDK threw; status 503; OneCLI returned 503',
+    ]);
+  });
+});
+
+describe('pickDiagnosis', () => {
+  it('prefers the attempt that named something over a bare returned-false', () => {
+    expect(
+      pickDiagnosis([
+        { outcome: 'threw', statusCode: 429, message: 'OneCLI returned 429' },
+        { outcome: 'returned-false' },
+      ]),
+    ).toMatchObject({ statusCode: 429 });
+  });
+
+  it('falls back to the last attempt when none named anything', () => {
+    expect(pickDiagnosis([{ outcome: 'returned-false' }, { outcome: 'returned-false' }])).toEqual({
+      outcome: 'returned-false',
+    });
+  });
+
+  it('returns undefined when no attempt failed', () => {
+    expect(pickDiagnosis([])).toBeUndefined();
   });
 });
 
