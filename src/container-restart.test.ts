@@ -2,8 +2,11 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 // --- Mocks ---
 
-vi.mock('./log.js', () => ({
-  log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
+// Spread the real module: session-manager (now loaded for real, for the
+// real-mailbox case) uses more of log.js than the four levels stubbed here.
+vi.mock('./log.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./log.js')>()),
+  log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn(), fatal: vi.fn() },
 }));
 
 const mockIsContainerRunning = vi.fn<(id: string) => boolean>();
@@ -26,60 +29,60 @@ vi.mock('./db/sessions.js', () => ({
 }));
 
 const mockWriteSessionMessage = vi.fn();
-type MockSessionDb = { sessionId: string; close: ReturnType<typeof vi.fn> };
-/** Session rows that exist in the central DB but own no inbound DB file. */
+/** Session rows that exist in the central DB but own no mailbox. */
 const missingInboundDbs = new Set<string>();
-/** Session DBs that exist but are unreadable (present file, no schema). */
+/** Session mailboxes that exist but are unreadable (present file, no schema). */
 const unreadableInboundDbs = new Set<string>();
-/** Session ids the inbound funnel actually handed back a handle for. */
+/** Session ids the seam actually handed a mailbox session back for. */
 const openedInboundDbs: string[] = [];
-/** Fires before every inbound open, so a test can reclaim a session mid-loop. */
+/** Fires before every mailbox open, so a test can reclaim a session mid-loop. */
 let beforeInboundOpen: ((sessionId: string) => void) | null = null;
-
 /**
- * Stands in for the real error type: the host's open funnels refuse to CREATE
- * a session DB, so a vanished session is reported as this rather than as an
- * empty stub. Hoisted because both mock factories below close over it.
+ * Session ids that go through the REAL mailbox seam against a temp DATA_DIR
+ * instead of the in-memory model below. The model keeps the engine's control
+ * flow (activation failures, reclaimed sessions, drain gating) cheap to
+ * express; the exact-generation ack contract is pinned against a real mailbox.
  */
-const { MockSessionDbMissingError } = vi.hoisted(() => ({
-  MockSessionDbMissingError: class SessionDbMissingError extends Error {
-    readonly dbPath: string;
-    constructor(dbPath: string) {
-      super(`session database does not exist: ${dbPath}`);
-      this.name = 'SessionDbMissingError';
-      this.dbPath = dbPath;
-    }
+const realMailboxSessions = vi.hoisted(() => new Set<string>());
+
+// DATA_DIR is a per-run temp root: the real-mailbox case provisions actual
+// session DBs under it, and nothing here can reach the install's data dir.
+const testDataDir = vi.hoisted(() => {
+  const nodeFs = require('fs') as typeof import('fs');
+  const nodeOs = require('os') as typeof import('os');
+  const nodePath = require('path') as typeof import('path');
+  return { dir: nodeFs.mkdtempSync(nodePath.join(nodeOs.tmpdir(), 'container-restart-data-')) };
+});
+vi.mock('./config.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./config.js')>()),
+  get DATA_DIR() {
+    return testDataDir.dir;
   },
 }));
 
-vi.mock('./session-manager.js', () => ({
+// Only the outbound message write is stubbed; the rest of session-manager
+// (the nesting guard, the provision/exists split) is the real thing, because
+// the real-mailbox case runs through it.
+vi.mock('./session-manager.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./session-manager.js')>()),
   writeSessionMessage: (...args: unknown[]) => mockWriteSessionMessage(...args),
-  openInboundDb: (...args: unknown[]) => {
-    const sessionId = args[1] as string;
-    beforeInboundOpen?.(sessionId);
-    if (missingInboundDbs.has(sessionId)) {
-      throw new MockSessionDbMissingError(`/mock-sessions/${args[0]}/${sessionId}/inbound.db`);
-    }
-    if (unreadableInboundDbs.has(sessionId)) {
-      // A present-but-schemaless inbound.db: exactly what the migration throws.
-      throw new Error('no such table: messages_in');
-    }
-    openedInboundDbs.push(sessionId);
-    return { sessionId, close: vi.fn() };
-  },
-  openOutboundDb: (...args: unknown[]) => ({ sessionId: args[1] as string, close: vi.fn() }),
-  inboundDbPath: (...args: unknown[]) => `/mock-sessions/${args[0]}/${args[1]}/inbound.db`,
-}));
-vi.mock('fs', () => ({
-  default: {
-    existsSync: (target: string) => {
-      const sessionId = String(target).split('/').at(-2);
-      return sessionId !== undefined && !missingInboundDbs.has(sessionId);
-    },
-  },
 }));
 
-const mockCountDueMessages = vi.fn((..._args: unknown[]) => 0);
+// Real fs, except that a MODEL session's inbound.db existence is answered from
+// the sets above — those sessions have no files on disk. A real-mailbox
+// session, and every other path, falls through to the real answer.
+vi.mock('fs', async (importOriginal) => {
+  const real = await importOriginal<typeof import('fs')>();
+  const existsSync = ((target: fs.PathLike): boolean => {
+    const match = String(target).match(/v2-sessions\/[^/]+\/([^/]+)\/inbound\.db$/);
+    if (match && !realMailboxSessions.has(match[1]!)) return !missingInboundDbs.has(match[1]!);
+    return real.existsSync(target);
+  }) as typeof real.existsSync;
+  const asNamespace = real as unknown as { default?: typeof real };
+  return { ...real, existsSync, default: { ...(asNamespace.default ?? real), existsSync } };
+});
+
+const mockCountDueMessages = vi.fn((_sessionId: string) => 0);
 const activeEpochs = new Map<string, { epoch: string; generation: string; state: 'active' | 'released' }>();
 const acknowledgedEpochs = new Map<string, string>();
 const processingSessions = new Set<string>();
@@ -89,41 +92,73 @@ const activationFailures = new Set<string>();
 const releaseFailures = new Set<string>();
 let autoAcknowledgeBarrier = true;
 let barrierGeneration = 0;
-const mockActivateRepoIngressFence = vi.fn((db: MockSessionDb, epoch: string) => {
-  if (activationFailures.has(db.sessionId)) throw new Error(`activation failed for ${db.sessionId}`);
-  const prior = activeEpochs.get(db.sessionId);
+const mockActivateRepoIngressFence = vi.fn((sessionId: string, epoch: string) => {
+  if (activationFailures.has(sessionId)) throw new Error(`activation failed for ${sessionId}`);
+  const prior = activeEpochs.get(sessionId);
   const active =
     prior?.state === 'active' && prior.epoch === epoch
       ? prior
       : { epoch, generation: `generation-${++barrierGeneration}`, state: 'active' as const };
-  activeEpochs.set(db.sessionId, active);
-  if (autoAcknowledgeBarrier) acknowledgedEpochs.set(db.sessionId, JSON.stringify([epoch, active.generation]));
+  activeEpochs.set(sessionId, active);
+  if (autoAcknowledgeBarrier) acknowledgedEpochs.set(sessionId, JSON.stringify([epoch, active.generation]));
   return active;
 });
-const mockReleaseRepoIngressFence = vi.fn((db: MockSessionDb, epoch: string, generation: string) => {
-  if (releaseFailures.has(db.sessionId)) throw new Error(`release failed for ${db.sessionId}`);
-  const current = activeEpochs.get(db.sessionId);
+const mockReleaseRepoIngressFence = vi.fn((sessionId: string, epoch: string, generation: string) => {
+  if (releaseFailures.has(sessionId)) throw new Error(`release failed for ${sessionId}`);
+  const current = activeEpochs.get(sessionId);
   if (!current || current.epoch !== epoch || current.generation !== generation || current.state !== 'active') {
     return { released: false, admittedRows: 0, wakeRequired: false };
   }
-  activeEpochs.set(db.sessionId, { epoch, generation, state: 'released' });
-  return { released: true, admittedRows: 0, wakeRequired: mockCountDueMessages(db) > 0 };
+  activeEpochs.set(sessionId, { epoch, generation, state: 'released' });
+  return { released: true, admittedRows: 0, wakeRequired: mockCountDueMessages(sessionId) > 0 };
 });
-vi.mock('./db/session-db.js', () => ({
-  countDueMessages: (...args: unknown[]) => mockCountDueMessages(...args),
-  activateRepoIngressFence: (...args: unknown[]) =>
-    mockActivateRepoIngressFence(args[0] as MockSessionDb, args[1] as string),
-  releaseRepoIngressFence: (...args: unknown[]) =>
-    mockReleaseRepoIngressFence(args[0] as MockSessionDb, args[1] as string, args[2] as string),
-  repoIngressFenceAckToken: (fence: { epoch: string; generation: string }) =>
-    JSON.stringify([fence.epoch, fence.generation]),
-  readRepoIngressFence: (db: MockSessionDb) => activeEpochs.get(db.sessionId) ?? null,
-  readRepositoryMountBarrierAck: (db: MockSessionDb) => acknowledgedEpochs.get(db.sessionId) ?? null,
-  getProcessingClaims: (db: MockSessionDb) => (processingSessions.has(db.sessionId) ? [{ message_id: 'late' }] : []),
-  getContainerState: (db: MockSessionDb) => (toolSessions.has(db.sessionId) ? { current_tool: 'Bash' } : null),
-  SessionDbMissingError: MockSessionDbMissingError,
-}));
 
+/** The subset of NanoclawMailboxSession the barrier engine touches. */
+function modelMailbox(sessionId: string): NanoclawMailboxSession {
+  return {
+    readRepoIngressFence: () => activeEpochs.get(sessionId) ?? null,
+    activateRepoIngressFence: (epoch: string) => mockActivateRepoIngressFence(sessionId, epoch),
+    releaseRepoIngressFence: (epoch: string, generation: string) =>
+      mockReleaseRepoIngressFence(sessionId, epoch, generation),
+    readRepositoryMountBarrierAck: () => acknowledgedEpochs.get(sessionId) ?? null,
+    getProcessingClaimRows: () =>
+      processingSessions.has(sessionId) ? [{ message_id: 'late', status_changed: new Date().toISOString() }] : [],
+    getContainerState: () => (toolSessions.has(sessionId) ? { current_tool: 'Bash' } : null),
+    countDueMessages: () => mockCountDueMessages(sessionId),
+  } as unknown as NanoclawMailboxSession;
+}
+
+vi.mock('./modules/mailbox/session.js', async (importOriginal) => {
+  const real = await importOriginal<typeof import('./modules/mailbox/session.js')>();
+  const { SessionDbMissingError } = await import('./modules/mailbox/index.js');
+  return {
+    ...real,
+    withExistingNanoclawSession: async (
+      agentGroupId: string,
+      sessionId: string,
+      action: (mailbox: NanoclawMailboxSession) => unknown,
+    ) => {
+      if (realMailboxSessions.has(sessionId)) return real.withExistingNanoclawSession(agentGroupId, sessionId, action);
+      beforeInboundOpen?.(sessionId);
+      // The seam reports a vanished session as `undefined`, never as a throw.
+      if (missingInboundDbs.has(sessionId)) return undefined;
+      if (unreadableInboundDbs.has(sessionId)) throw new Error('no such table: messages_in');
+      openedInboundDbs.push(sessionId);
+      return action(modelMailbox(sessionId));
+    },
+    // Referenced only so the unused-import lint stays quiet if the real class
+    // is needed by a future case; the engine imports it from the barrel.
+    __SessionDbMissingError: SessionDbMissingError,
+  };
+});
+
+import Database from 'better-sqlite3';
+import fs from 'fs';
+import path from 'path';
+
+import { getAgentMailbox } from './mailbox/index.js';
+import type { NanoclawMailboxSession } from './modules/mailbox/index.js';
+import { withMailboxSession } from './session-manager.js';
 import {
   quiesceAgentGroupsForRepositoryMounts,
   quiesceSessionsForRepositoryMounts,
@@ -150,9 +185,72 @@ beforeEach(() => {
   autoAcknowledgeBarrier = true;
   barrierGeneration = 0;
   mockCountDueMessages.mockReturnValue(0);
+  realMailboxSessions.clear();
 });
 
 describe('repository mount reconciliation', () => {
+  it('activateRepositoryMountBarriers and release run through the mailbox session and keep the exact-generation ack contract', async () => {
+    const session = makeSession('s-real', 'ag-real');
+    const outboundPath = provisionRealMailbox('ag-real', 's-real');
+    mockGetSessionsByAgentGroup.mockReturnValue([session]);
+    const running = new Set(['s-real']);
+    mockIsContainerRunning.mockImplementation((id) => running.has(id));
+    mockIsContainerSpawning.mockReturnValue(false);
+    mockKillContainer.mockImplementation((id) => {
+      running.delete(id);
+    });
+
+    const epoch = 'repository-publish:real-1';
+    const pending = quiesceSessionsForRepositoryMounts([session] as never, epoch, 5_000);
+    await new Promise((resolve) => setImmediate(resolve));
+
+    // Activation went through a mailbox session and fenced this session's
+    // ingress: a row written now is epoch-tagged and inert, so nothing is due.
+    const generation = await withMailboxSession('ag-real', 's-real', async (mailbox) => {
+      const fork = mailbox as NanoclawMailboxSession;
+      await mailbox.insertMessage({
+        id: 'behind-the-fence',
+        kind: 'chat',
+        timestamp: new Date().toISOString(),
+        platformId: 'slack:C1',
+        channelType: 'slack',
+        threadId: null,
+        content: 'held',
+        processAfter: null,
+        recurrence: null,
+      });
+      expect(mailbox.countDueMessages()).toBe(0);
+      const fence = fork.readRepoIngressFence();
+      expect(fence?.state).toBe('active');
+      expect(fence?.epoch).toBe(epoch);
+      return fence!.generation;
+    });
+
+    // A stale-generation ack is NOT a drain — the container is still running
+    // and must not be stopped on it.
+    writeBarrierAck(outboundPath, JSON.stringify([epoch, 'generation-from-a-previous-barrier']));
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    expect(mockKillContainer).not.toHaveBeenCalled();
+    expect(running.has('s-real')).toBe(true);
+
+    // The exact activation token is.
+    writeBarrierAck(outboundPath, JSON.stringify([epoch, generation]));
+    const quiescence = await pending;
+    expect(mockKillContainer).toHaveBeenCalledWith('s-real', 'repository mount set changed', undefined);
+    expect(quiescence.barrierSessions.map((entry) => entry.id)).toEqual(['s-real']);
+    expect(quiescence.barrierGenerations['s-real']).toBe(generation);
+    expect(quiescence.barrierAcks['s-real']).toBe(JSON.stringify([epoch, generation]));
+
+    // Release restores ingress: the row held behind the fence becomes due, and
+    // the release reports this session as needing a wake.
+    const wake = await releaseRepositoryMountQuiescence(quiescence);
+    expect(wake.map((entry) => entry.id)).toEqual(['s-real']);
+    await withMailboxSession('ag-real', 's-real', (mailbox) => {
+      expect(mailbox.countDueMessages()).toBe(1);
+      expect((mailbox as NanoclawMailboxSession).readRepoIngressFence()?.state).toBe('released');
+    });
+  });
+
   it('stops every affected sibling and wakes the exact set after claim release', async () => {
     const sessions = [makeSession('s1', 'g1'), makeSession('s2', 'g2')];
     mockGetSessionsByAgentGroup.mockImplementation((id) => sessions.filter((session) => session.agent_group_id === id));
@@ -216,7 +314,7 @@ describe('repository mount reconciliation', () => {
     const live = new Set(['s1']);
     mockIsContainerRunning.mockImplementation((id) => live.has(id));
     mockKillContainer.mockImplementation((id) => live.delete(id));
-    mockCountDueMessages.mockImplementation((db: unknown) => ((db as MockSessionDb).sessionId === 's2' ? 1 : 0));
+    mockCountDueMessages.mockImplementation((sessionId: string) => (sessionId === 's2' ? 1 : 0));
 
     const quiescence = await quiesceSessionsForRepositoryMounts(
       [running, initiallyIdle] as never,
@@ -448,7 +546,7 @@ describe('repository mount reconciliation', () => {
     mockKillContainer.mockImplementation((id) => {
       if (id === 's1') running.delete(id);
     });
-    mockCountDueMessages.mockImplementation((db: unknown) => ((db as MockSessionDb).sessionId === 's1' ? 1 : 0));
+    mockCountDueMessages.mockImplementation((sessionId: string) => (sessionId === 's1' ? 1 : 0));
 
     const error = await quiesceSessionsForRepositoryMounts(
       [first, stuck] as never,
@@ -472,6 +570,30 @@ describe('repository mount reconciliation', () => {
 
 function makeSession(id: string, agentGroupId: string, status = 'active') {
   return { id, agent_group_id: agentGroupId, status };
+}
+
+/** Provision a REAL mailbox under the temp DATA_DIR and route the seam to it. */
+function provisionRealMailbox(agentGroupId: string, sessionId: string): string {
+  fs.mkdirSync(path.join(testDataDir.dir, 'v2-sessions', agentGroupId, sessionId), { recursive: true });
+  getAgentMailbox().prepare({ agentGroupId, sessionId });
+  realMailboxSessions.add(sessionId);
+  return path.join(testDataDir.dir, 'v2-sessions', agentGroupId, sessionId, 'outbound.db');
+}
+
+/**
+ * Plant the acknowledgement the CONTAINER writes at its poll boundary. Raw,
+ * because no host-side op writes it — the host only ever reads it.
+ */
+function writeBarrierAck(outboundPath: string, token: string): void {
+  const db = new Database(outboundPath);
+  try {
+    db.prepare(
+      `INSERT INTO session_state (key, value, updated_at) VALUES ('repository_mount_barrier_ack', ?, ?)
+       ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`,
+    ).run(token, new Date().toISOString());
+  } finally {
+    db.close();
+  }
 }
 
 // --- Tests ---

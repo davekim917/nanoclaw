@@ -6,29 +6,31 @@
  */
 import { isContainerRunning, isContainerSpawning, killContainer, wakeContainer } from './container-runner.js';
 import { randomUUID } from 'crypto';
-import {
-  activateRepoIngressFence,
-  countDueMessages,
-  getContainerState,
-  getProcessingClaims,
-  repoIngressFenceAckToken,
-  readRepoIngressFence,
-  readRepositoryMountBarrierAck,
-  releaseRepoIngressFence,
-  SessionDbMissingError,
-} from './db/session-db.js';
 import { getSession, getSessionsByAgentGroup } from './db/sessions.js';
 import { log } from './log.js';
-import { inboundDbPath, openInboundDb, openOutboundDb, writeSessionMessage } from './session-manager.js';
+import { SessionDbMissingError, sessionMailboxPath, type NanoclawMailboxSession } from './modules/mailbox/index.js';
+import { repoIngressFenceAckToken } from './modules/mailbox/ops/fence.js';
+import { withExistingNanoclawSession } from './modules/mailbox/session.js';
+import { writeSessionMessage } from './session-manager.js';
 import type { Session } from './types.js';
 import fs from 'fs';
 
-async function waitUntil(predicate: () => boolean, message: string, timeoutMs = 120_000): Promise<void> {
+async function waitUntil(
+  predicate: () => boolean | Promise<boolean>,
+  message: string,
+  timeoutMs = 120_000,
+): Promise<void> {
   const deadline = Date.now() + timeoutMs;
-  while (!predicate()) {
+  while (!(await predicate())) {
     if (Date.now() >= deadline) throw new Error(message);
     await new Promise((resolve) => setTimeout(resolve, 100));
   }
+}
+
+/** True only when EVERY session satisfies an async predicate. Sequential by design: the drain probe opens a session per call. */
+async function everySession(sessions: Session[], predicate: (session: Session) => Promise<boolean>): Promise<boolean> {
+  for (const session of sessions) if (!(await predicate(session))) return false;
+  return true;
 }
 
 export interface RepositoryMountQuiescence {
@@ -98,8 +100,12 @@ function uniqueSessions(sessions: Session[]): Session[] {
  * for the whole quiescence window. Opening it instead throws inside
  * better-sqlite3 ("directory does not exist") and fails the entire publication.
  */
+function sessionInboundPath(session: Session): string {
+  return sessionMailboxPath({ agentGroupId: session.agent_group_id, sessionId: session.id }, 'inbound');
+}
+
 function hasFenceableIngress(session: Session): boolean {
-  return fs.existsSync(inboundDbPath(session.agent_group_id, session.id));
+  return fs.existsSync(sessionInboundPath(session));
 }
 
 /**
@@ -115,14 +121,56 @@ function hasFenceableIngress(session: Session): boolean {
  */
 function vanishedSessionIsSkippable(err: unknown, session: Session): boolean {
   if (!(err instanceof SessionDbMissingError)) return false;
+  return sessionVanishIsSkippable(session);
+}
+
+/**
+ * A session whose mailbox `withExistingMailboxSession` reports as absent is the
+ * same case `vanishedSessionIsSkippable` decides for a thrown
+ * `SessionDbMissingError` — the seam resolves `undefined` where the raw opener
+ * threw. A LIVE container is still the exception: it must own a mailbox to
+ * poll, so its absence is an inconsistent host view and fails closed.
+ */
+function sessionVanishIsSkippable(session: Session): boolean {
   return !isContainerRunning(session.id) && !isContainerSpawning(session.id);
+}
+
+/** Sentinel for "the mailbox is gone", distinct from any value an action returns. */
+const MAILBOX_GONE = Symbol('mailbox-gone');
+
+/**
+ * One fence operation against a session, with the vanished case surfaced as a
+ * value rather than an exception.
+ *
+ * `withExistingMailboxSession` is deliberate here rather than the provisioning
+ * variant: fencing a session the storage reclaim has already removed would
+ * recreate its directory (invariant I-4), and the 2026-09-01 incident was
+ * exactly a reclaim landing inside this window.
+ */
+async function inSessionMailbox<T>(
+  session: Session,
+  phase: string,
+  action: (mailbox: NanoclawMailboxSession) => T,
+): Promise<T | typeof MAILBOX_GONE> {
+  let result: T | undefined;
+  try {
+    result = await withExistingNanoclawSession(session.agent_group_id, session.id, action);
+  } catch (err) {
+    if (vanishedSessionIsSkippable(err, session)) return MAILBOX_GONE;
+    throw barrierSessionError(err, session, phase);
+  }
+  if (result === undefined) {
+    if (sessionVanishIsSkippable(session)) return MAILBOX_GONE;
+    throw barrierSessionError(new SessionDbMissingError(sessionInboundPath(session)), session, phase);
+  }
+  return result;
 }
 
 /** Every barrier failure names its session and DB path, so one log line diagnoses it. */
 function barrierSessionError(err: unknown, session: Session, phase: string): Error {
   return new Error(
     `repository mount barrier ${phase} failed for session ${session.id} ` +
-      `(${inboundDbPath(session.agent_group_id, session.id)}): ${err instanceof Error ? err.message : String(err)}`,
+      `(${sessionInboundPath(session)}): ${err instanceof Error ? err.message : String(err)}`,
     { cause: err },
   );
 }
@@ -154,34 +202,29 @@ async function activateRepositoryMountBarriers(
   try {
     for (const [index, session] of sessions.entries()) {
       await yieldEventLoop(index);
-      let inDb: ReturnType<typeof openInboundDb>;
-      try {
-        inDb = openInboundDb(session.agent_group_id, session.id);
-      } catch (openError) {
-        if (vanishedSessionIsSkippable(openError, session)) {
-          log.warn('Repository mount barrier skipped: session inbound DB vanished after eligibility check', {
-            sessionId: session.id,
-            agentGroupId: session.agent_group_id,
-          });
-          continue;
-        }
-        throw barrierSessionError(openError, session, 'activation');
+      const outcome = await inSessionMailbox(session, 'activation', (mailbox) => {
+        const prior = mailbox.readRepoIngressFence();
+        const active = mailbox.activateRepoIngressFence(epoch);
+        return {
+          active,
+          // A replay may be adopting a crash-left active barrier with this
+          // exact deterministic epoch. It did not create that barrier and
+          // therefore must never roll it back if a later session activation
+          // fails.
+          created: prior?.state !== 'active' || prior.epoch !== epoch,
+        };
+      });
+      if (outcome === MAILBOX_GONE) {
+        log.warn('Repository mount barrier skipped: session inbound DB vanished after eligibility check', {
+          sessionId: session.id,
+          agentGroupId: session.agent_group_id,
+        });
+        continue;
       }
-      try {
-        const prior = readRepoIngressFence(inDb);
-        const active = activateRepoIngressFence(inDb, epoch);
-        fenced.push(session);
-        barrierAcks[session.id] = repoIngressFenceAckToken(active);
-        barrierGenerations[session.id] = active.generation;
-        // A replay may be adopting a crash-left active barrier with this exact
-        // deterministic epoch. It did not create that barrier and therefore
-        // must never roll it back if a later session activation fails.
-        if (prior?.state !== 'active' || prior.epoch !== epoch) activated.push(session);
-      } catch (fenceError) {
-        throw barrierSessionError(fenceError, session, 'activation');
-      } finally {
-        inDb.close();
-      }
+      fenced.push(session);
+      barrierAcks[session.id] = repoIngressFenceAckToken(outcome.active);
+      barrierGenerations[session.id] = outcome.active.generation;
+      if (outcome.created) activated.push(session);
     }
   } catch (error) {
     // No topology mutation has happened yet. Restore every DB fenced by this
@@ -190,30 +233,21 @@ async function activateRepositoryMountBarriers(
     const stranded: Session[] = [];
     for (const session of activated.reverse()) {
       try {
-        let inDb: ReturnType<typeof openInboundDb>;
-        try {
-          inDb = openInboundDb(session.agent_group_id, session.id);
-        } catch (openError) {
-          // A session reclaimed since we fenced it has no fence row left to
-          // restore — the whole DB is gone. Skipping reaches the same end state
-          // a successful release would.
-          if (vanishedSessionIsSkippable(openError, session)) {
-            log.warn('Repository mount barrier rollback skipped: session inbound DB vanished', {
-              sessionId: session.id,
-              agentGroupId: session.agent_group_id,
-            });
-            continue;
-          }
-          throw barrierSessionError(openError, session, 'activation rollback');
+        const generation = barrierGenerations[session.id];
+        if (!generation) {
+          throw new Error(`repository mount barrier generation missing for session ${session.id}`, { cause: error });
         }
-        try {
-          const generation = barrierGenerations[session.id];
-          if (!generation) {
-            throw new Error(`repository mount barrier generation missing for session ${session.id}`, { cause: error });
-          }
-          releaseRepoIngressFence(inDb, epoch, generation);
-        } finally {
-          inDb.close();
+        // A session reclaimed since we fenced it has no fence row left to
+        // restore — the whole mailbox is gone. Skipping reaches the same end
+        // state a successful release would.
+        const rolledBack = await inSessionMailbox(session, 'activation rollback', (mailbox) =>
+          mailbox.releaseRepoIngressFence(epoch, generation),
+        );
+        if (rolledBack === MAILBOX_GONE) {
+          log.warn('Repository mount barrier rollback skipped: session inbound DB vanished', {
+            sessionId: session.id,
+            agentGroupId: session.agent_group_id,
+          });
         }
       } catch (releaseError) {
         releaseErrors.push(releaseError);
@@ -237,21 +271,24 @@ async function activateRepositoryMountBarriers(
   return { fenced, barrierAcks, barrierGenerations };
 }
 
-function sessionReachedRepositoryBarrier(session: Session, expectedAck: string): boolean {
+async function sessionReachedRepositoryBarrier(session: Session, expectedAck: string): Promise<boolean> {
   if (!isContainerRunning(session.id) && !isContainerSpawning(session.id)) return true;
   try {
-    const outDb = openOutboundDb(session.agent_group_id, session.id);
-    try {
-      return (
-        readRepositoryMountBarrierAck(outDb) === expectedAck &&
-        getProcessingClaims(outDb).length === 0 &&
-        !getContainerState(outDb)?.current_tool
-      );
-    } finally {
-      outDb.close();
-    }
-  } catch {
+    const drained = await withExistingNanoclawSession(
+      session.agent_group_id,
+      session.id,
+      (mailbox) =>
+        // The EXACT activation token, never merely "some ack": a stale
+        // generation from a previous barrier on this session would otherwise
+        // read as drained.
+        mailbox.readRepositoryMountBarrierAck() === expectedAck &&
+        mailbox.getProcessingClaimRows().length === 0 &&
+        !mailbox.getContainerState()?.current_tool,
+    );
+    // undefined = no mailbox for a session the host believes is running.
     // Unknown acknowledgement or work state is never safe to stop.
+    return drained ?? false;
+  } catch {
     return false;
   }
 }
@@ -265,29 +302,16 @@ export async function releaseRepositoryMountQuiescence(quiescence: RepositoryMou
   const wakeRequired: Session[] = [];
   for (const [index, session] of quiescence.barrierSessions.entries()) {
     await yieldEventLoop(index);
-    let inDb: ReturnType<typeof openInboundDb>;
-    try {
-      inDb = openInboundDb(session.agent_group_id, session.id);
-    } catch (openError) {
-      // Consistent for the maps too: barrierAcks/barrierGenerations are keyed
-      // by session id and only ever read for a session this loop reaches, so
-      // dropping one strands nothing — and a reclaimed session has no fence row
-      // left to release and no due rows left to wake for.
-      if (vanishedSessionIsSkippable(openError, session)) {
-        log.warn('Repository mount barrier release skipped: session inbound DB vanished', {
-          sessionId: session.id,
-          agentGroupId: session.agent_group_id,
-        });
-        continue;
-      }
-      throw barrierSessionError(openError, session, 'release');
-    }
-    try {
-      const generation = quiescence.barrierGenerations[session.id];
-      if (!generation) throw new Error(`repository mount barrier generation missing for session ${session.id}`);
-      const result = releaseRepoIngressFence(inDb, quiescence.epoch, generation);
+    const generation = quiescence.barrierGenerations[session.id];
+    if (!generation) throw new Error(`repository mount barrier generation missing for session ${session.id}`);
+    // Consistent for the maps too: barrierAcks/barrierGenerations are keyed
+    // by session id and only ever read for a session this loop reaches, so
+    // dropping one strands nothing — and a reclaimed session has no fence row
+    // left to release and no due rows left to wake for.
+    const outcome = await inSessionMailbox(session, 'release', (mailbox) => {
+      const result = mailbox.releaseRepoIngressFence(quiescence.epoch, generation);
       if (!result.released) {
-        const current = readRepoIngressFence(inDb);
+        const current = mailbox.readRepoIngressFence();
         if (
           !current ||
           current.epoch !== quiescence.epoch ||
@@ -300,10 +324,16 @@ export async function releaseRepositoryMountQuiescence(quiescence: RepositoryMou
       // Recompute from durable state even on an idempotent replay. This closes
       // the crash-after-release-before-wake boundary for both rows tagged by
       // this epoch and ordinary due rows that predated the fence.
-      if (countDueMessages(inDb) > 0) wakeRequired.push(session);
-    } finally {
-      inDb.close();
+      return { wake: mailbox.countDueMessages() > 0 };
+    });
+    if (outcome === MAILBOX_GONE) {
+      log.warn('Repository mount barrier release skipped: session inbound DB vanished', {
+        sessionId: session.id,
+        agentGroupId: session.agent_group_id,
+      });
+      continue;
     }
+    if (outcome.wake) wakeRequired.push(session);
   }
   return wakeRequired;
 }
@@ -383,7 +413,7 @@ export async function quiesceSessionsForRepositoryMounts(
       timeoutMs,
     );
     await waitUntil(
-      () => affected.every((session) => sessionReachedRepositoryBarrier(session, barrierAcks[session.id]!)),
+      () => everySession(affected, (session) => sessionReachedRepositoryBarrier(session, barrierAcks[session.id]!)),
       'timed out waiting for container poll admission and active repository work to drain',
       timeoutMs,
     );
@@ -503,14 +533,18 @@ export async function restartAgentGroupContainers(
     // reclaim claim — same rule as the write: cost this session, not the loop.
     let hasPending: boolean;
     try {
-      const inDb = openInboundDb(session.agent_group_id, session.id);
-      try {
-        hasPending = countDueMessages(inDb) > 0;
-      } finally {
-        // Callers own the connection lifecycle (session-db.ts) — close per op
-        // or each restart leaks one better-sqlite3 FD + mmap segment.
-        inDb.close();
-      }
+      // Read-only, so `withExistingMailboxSession` — never the provisioning
+      // variant, which would resurrect a reclaimed session (invariant I-4).
+      // `undefined` (no mailbox) is treated exactly like a read failure rather
+      // than as "nothing pending": this session's container is RUNNING, so a
+      // missing mailbox is an inconsistent host view, and the conservative
+      // answer is to leave it alone. Same rule as the write above: cost this
+      // session, not the loop.
+      const due = await withExistingNanoclawSession(session.agent_group_id, session.id, (mailbox) =>
+        mailbox.countDueMessages(),
+      );
+      if (due === undefined) throw new Error(`session ${session.id} has no mailbox to read pending work from`);
+      hasPending = due > 0;
     } catch (err) {
       failed += 1;
       log.warn('Restart: could not read pending work; leaving this container running', {
