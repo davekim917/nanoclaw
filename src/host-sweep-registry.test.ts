@@ -1233,10 +1233,12 @@ describe('sweep duty registry (S2-PR2)', () => {
       'SPAWN_GRACE_MS',
       'providerFailedTicks',
       'writeSystemWake',
-      // The one ownership predicate every family on both sides of a kill shares
-      // (mailbox seam PR 5, 7199be48 / 3b6cbb5f). A pure predicate, not a duty
-      // body — it holds no session and writes nothing.
+      // The outbound-ownership guard the families share on both sides of a kill
+      // (mailbox seam PR 5 / 5b — 7199be48, 3b6cbb5f, bb9fb1ff). A predicate and
+      // two wrappers around a caller's own action: no duty body, no session held.
       'containerOwnsOutbound',
+      'writeOutboundWhenStopped',
+      'withStoppedContainerSession',
       // re-exports the families and their callers reach through the driver
       'parseSqliteUtc',
       'decideCeilingFollowUp',

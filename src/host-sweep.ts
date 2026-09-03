@@ -727,6 +727,72 @@ export function containerOwnsOutbound(sessionId: string): boolean {
   return isContainerRunning(sessionId) || isContainerSpawning(sessionId);
 }
 
+/**
+ * THE guard for every host-side write to the container-owned `outbound.db`.
+ *
+ * `outbound.db` has one writer. The host may write it only while no container
+ * owns it, and after the seam made these paths async that check has to sit
+ * immediately before the write with no await in between — an open, a kill, or
+ * any other yield is a window a replacement wake can land in.
+ *
+ * Two entry points, one implementation:
+ *  - this one, for a write inside a session the caller already holds;
+ *  - `withStoppedContainerSession`, which runs a write in its own window and
+ *    delegates here.
+ *
+ * Both exist because the nesting guard forbids opening a second session for a
+ * key while one is open (invariant I-3), so the in-session writes physically
+ * cannot route through the window-opening form. Every outbound write across the
+ * driver and the sweep families is an argument to one of these two, which is
+ * what makes the property checkable by grep rather than by reading.
+ *
+ * Name and semantics mirror mailbox seam PR 5b (#332, `bb9fb1ff`/`417350c0`) so
+ * the merge onto a post-cascade main converges on one guard implementation
+ * rather than carrying two.
+ *
+ * Returns `undefined` when a container owns the file — never an error. Every
+ * caller's write is idempotent or retried on the next tick.
+ */
+export function writeOutboundWhenStopped<T>(
+  session: Session,
+  mailbox: NanoclawMailboxSession,
+  action: (mailbox: NanoclawMailboxSession) => T,
+): T | undefined {
+  if (containerOwnsOutbound(session.id)) {
+    log.debug('Skipped a host outbound write — a container owns this session', { sessionId: session.id });
+    return undefined;
+  }
+  return action(mailbox);
+}
+
+/**
+ * Run a host write against the container-owned `outbound.db` in its own window,
+ * but only while the container is confirmed stopped.
+ *
+ * Takes the caller's `SessionRunner` rather than opening a session itself.
+ * #332's version calls `withExistingNanoclawSession` directly; on this lineage
+ * every duty write goes through a phase window (`ctx.runIn`), which owns opener
+ * classification (`SweepWindowAbort`) and the window tag on the error line, and
+ * constraint 18 gives S9b's increment and its restore mirror one window each.
+ * Opening a session here instead would bypass both and take a second session on
+ * a key the window already holds (invariant I-3).
+ *
+ * `action` is synchronous BY TYPE — that is the mechanism, not a preference. It
+ * is what makes it impossible to introduce an await between the ownership check
+ * and the mutation without changing this signature. Note the runner's own
+ * action type permits a Promise; this narrower one deliberately does not.
+ *
+ * Resolves `undefined` when the mailbox is gone OR a container took ownership
+ * during the open. Callers treat both as "did not run" — never as failure.
+ */
+export async function withStoppedContainerSession<T>(
+  run: SessionRunner,
+  session: Session,
+  action: (mailbox: NanoclawMailboxSession) => T,
+): Promise<T | undefined> {
+  return run((mailbox) => writeOutboundWhenStopped(session, mailbox, action));
+}
+
 let running = false;
 
 export function startHostSweep(): void {

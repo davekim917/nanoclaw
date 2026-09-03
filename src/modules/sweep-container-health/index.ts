@@ -37,6 +37,7 @@ import {
   SWEEP_DUTY_INVENTORY,
   asSessionContext,
   containerOwnsOutbound,
+  writeOutboundWhenStopped,
   providerFailedTicks,
   registerSlaObservationHook,
   registerSweepDuty,
@@ -297,20 +298,21 @@ async function sweepProviderHeal(
     log.warn('self-heal: provider heal budget exhausted — parking', bounds);
     killContainer(session.id, 'provider-failed-selfheal-parked');
     try {
-      await run((mailbox) => {
+      await run((mailbox) =>
         // The park kill is above, this session opened after it, and a respawn
-        // landing in that gap owns outbound.db. Checked here, immediately
-        // before the write, with no await in between (mailbox seam PR 5,
-        // 7199be48). The notice is one-per-episode and idempotent, so skipping
-        // costs nothing a later tick cannot redo.
-        if (containerOwnsOutbound(session.id)) return false;
-        return notifyProviderHealParked(
-          mailbox,
-          session,
-          containerState?.provider_failure_reason ?? null,
-          writeParkedMessage,
-        );
-      });
+        // landing in that gap owns outbound.db. The guard puts the check
+        // immediately before the write with no await in between. The notice is
+        // one-per-episode and idempotent, so skipping costs nothing a later
+        // tick cannot redo.
+        writeOutboundWhenStopped(session, mailbox, () =>
+          notifyProviderHealParked(
+            mailbox,
+            session,
+            containerState?.provider_failure_reason ?? null,
+            writeParkedMessage,
+          ),
+        ),
+      );
     } catch (err) {
       log.warn('self-heal: parked notice failed', { sessionId: session.id, err });
     }
@@ -477,14 +479,12 @@ async function enforceRunningContainerSla(ctx: SweepSessionContext): Promise<voi
     // honor the outbound.db single-writer invariant; the module opens the
     // writable outbound handle lazily, only for the notice write.
     await ctx.runIn('session:health:post-kill', (mailbox) => {
-      // The kill above is a yield boundary: this window opened after it, and a
-      // replacement wake landing in the gap owns outbound.db. Guarding HERE
-      // rather than inside each follow-up covers every registered one at once
-      // (mailbox seam PR 5 round 8, 3b6cbb5f, which had to guard its two write
-      // sites individually). Skipping costs one restart notice and defers the
-      // orphan-claim clear to the next tick, both idempotent; writing anyway
-      // would delete the FRESH runner's claim and defer an input it is already
-      // processing — duplicate execution.
+      // Early-out only. The kill above is a yield boundary, so if a replacement
+      // already owns the session there is no point running the chain at all.
+      // It is NOT what makes the writes safe: `runSweepKillFollowUps` awaits
+      // after every follow-up, so ownership can flip at a microtask boundary
+      // between them, and each follow-up carries its own
+      // `writeOutboundWhenStopped` immediately before its own mutation.
       if (containerOwnsOutbound(session.id)) return;
       return runSweepKillFollowUps(ctx, decision, mailbox, {
         reason: 'absolute-ceiling',
