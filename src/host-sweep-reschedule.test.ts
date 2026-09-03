@@ -86,6 +86,10 @@ vi.mock('./dashboard/db/dashboard-tokens.js', () => ({ pruneDashboardTokens: () 
 
 import { SWEEP_INTERVAL_MS, startHostSweep, stopHostSweep } from './host-sweep.js';
 import { log } from './log.js';
+// T6 orchestrator-reconciler now lives in this family module, registering at
+// import — needed so the case below (which drives a whole real tick through
+// the registry) actually finds it registered. See src/modules/index.ts.
+import './modules/sweep-orchestrator/index.js';
 
 describe('host sweep reschedule', () => {
   beforeEach(() => {
