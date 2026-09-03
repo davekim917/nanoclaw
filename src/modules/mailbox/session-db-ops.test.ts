@@ -25,7 +25,9 @@ import {
   openOutboundDbWritable,
   recoverHotJournal,
   SessionDbMissingError,
+  SessionDbUnopenableError,
 } from './openers.js';
+import { readSessionOutbound } from './read-only.js';
 import { ensureSchema, migrateMessagesInTable } from './schema.js';
 import { activateRepoIngressFence, releaseRepoIngressFence } from './ops/fence.js';
 import {
@@ -1340,6 +1342,46 @@ describe('host opens never create a session database', () => {
   // which is the one case that has to fail closed. Root bypasses file modes, so
   // the precondition cannot be established there.
   const notRoot = process.getuid?.() !== 0;
+
+  // The read-only session and the read-write funnels must classify an
+  // unopenable DB the SAME way. They did not: `openRead` handed out an
+  // unprobed handle, so a corrupt or unreadable outbound.db was a silent empty
+  // read through the read session and a classified error through the opener —
+  // one behavior with two answers. That fork is why the usage rollup could not
+  // simply move onto the read session (mailbox seam PR 7 merge-down).
+  it.skipIf(!notRoot)('an unopenable outbound.db classifies identically through readSessionOutbound', () => {
+    const dbPath = unreadableDb('outbound.db');
+    const dataDir = path.resolve(dbPath, '..', '..', '..', '..');
+
+    let viaOpener: unknown;
+    try {
+      openOutboundDb(dbPath);
+    } catch (err) {
+      viaOpener = err;
+    }
+
+    let viaSession: unknown;
+    try {
+      readSessionOutbound({ agentGroupId: 'ag-1', sessionId: 'sess-1', dataDir }, () => 'unreachable');
+    } catch (err) {
+      viaSession = err;
+    }
+
+    expect(viaOpener).toBeInstanceOf(SessionDbUnopenableError);
+    expect(viaSession).toBeInstanceOf(SessionDbUnopenableError);
+    // Not merely the same class — the same driver code, which callers branch on.
+    expect((viaSession as { code?: string }).code).toBe((viaOpener as { code?: string }).code);
+    expect((viaSession as { code?: string }).code).toBe('SQLITE_CANTOPEN');
+    // And emphatically not the absence answer: a broken session must never
+    // read as an empty one.
+    expect(viaSession).not.toBeInstanceOf(SessionDbMissingError);
+  });
+
+  it('an absent outbound.db is still absence, not an error, through readSessionOutbound', () => {
+    const sessionDir = reclaimedSessionDir();
+    const dataDir = path.resolve(sessionDir, '..', '..', '..');
+    expect(readSessionOutbound({ agentGroupId: 'ag-1', sessionId: 'sess-1', dataDir }, () => 'ran')).toBeUndefined();
+  });
 
   it.skipIf(!notRoot)('a present but unreadable inbound.db is NOT reported as missing', () => {
     const dbPath = unreadableDb('inbound.db');

@@ -36,11 +36,13 @@ import { getActiveSessions, getSession, isTaskThread, updateSession } from './db
 import { getAgentGroup } from './db/agent-groups.js';
 import {
   SessionDbMissingError,
+  readSessionOutbound,
   SessionDbUnopenableError,
   type ForkContainerStateRow as ContainerState,
   type NanoclawMailboxSession,
 } from './modules/mailbox/index.js';
 import { withExistingNanoclawSession } from './modules/mailbox/session.js';
+
 import { runHostGatedTaskScripts } from './modules/scheduling/host-script.js';
 import { advanceThreadClosures, syncDoneProposalMirror } from './dashboard/thread-close.js';
 import { log } from './log.js';

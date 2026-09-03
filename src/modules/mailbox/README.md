@@ -43,3 +43,11 @@ Its reclaim probes run in a worker thread over an **injected** sessions root,
 which the `DATA_DIR`-keyed mailbox cannot address, and they are strictly
 read-only. The rationale is at the top of that file; a second exemption needs
 one written there first, and `src/mailbox-seam-ratchet.test.ts` pins the list.
+
+Both read funnels share one failure classification: `read-only.ts`'s `openRead`
+calls the same `assertQueryable` the read-write openers do, so a
+present-but-unopenable session DB raises `SessionDbUnopenableError` whichever
+way it was opened. What the read path deliberately does not share is anything
+that writes — the hot-journal rollback stays opt-in, and inbound reads never go
+through `openInboundDb`, which opens read-write and plants a reclaim-blocking
+marker.
