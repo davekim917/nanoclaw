@@ -168,32 +168,18 @@ export async function requestAddMcpServerHold(content: Record<string, unknown>, 
 
   let fields: string[];
   if (serverConfig.type === 'http') {
-    // Redact per path segment and per query value, never the origin — the
-    // admin must always see the true destination host, and SECRET_VALUE_RE
-    // is start-anchored so testing the whole URL would match nothing. A
-    // Zapier-style https://host/s/<token>/mcp must not render the token raw.
-    const u = new URL(serverConfig.url);
-    const redactSeg = (v: string): string => (SECRET_VALUE_RE.test(v) ? redactSecret(v) : v);
-    const urlPath = u.pathname.split('/').map(redactSeg).join('/');
-    // Keep the query byte-faithful unless a value actually needs redacting —
-    // re-serializing decodes percent-escapes and can invent structure.
-    const entries = [...u.searchParams];
-    const query = entries.some(([, v]) => SECRET_VALUE_RE.test(v))
-      ? `?${entries.map(([k, v]) => `${k}=${redactSeg(v)}`).join('&')}`
-      : u.search;
+    // No redaction on the URL: `parseMcpServerConfig` rejects a credential in
+    // the path, the query, or a header before we get here, so the card shows
+    // exactly the destination that will be persisted — which is the thing an
+    // admin has to judge. Redacting here instead would have meant approving a
+    // secret we then wrote to container.json unredacted.
     fields = [
       `name: ${escapeInvisibles(JSON.stringify(serverName))}`,
       `type: ${escapeInvisibles(JSON.stringify(serverConfig.type))}`,
-      `url: ${escapeInvisibles(JSON.stringify(u.origin + urlPath + query))}`,
+      `url: ${escapeInvisibles(JSON.stringify(serverConfig.url))}`,
     ];
     if (serverConfig.headers !== undefined) {
-      // Header values are placeholder-only by construction (parseMcpServerConfig
-      // rejects raw credentials), but redact defensively so a future relaxation
-      // cannot leak one onto an admin's chat card.
-      const displayHeaders = Object.fromEntries(
-        Object.entries(serverConfig.headers).map(([k, v]) => [k, SECRET_VALUE_RE.test(v) ? redactSecret(v) : v]),
-      );
-      fields.push(`headers: ${escapeInvisibles(JSON.stringify(displayHeaders))}`);
+      fields.push(`headers: ${escapeInvisibles(JSON.stringify(serverConfig.headers))}`);
     }
   } else {
     const args = serverConfig.args ?? [];

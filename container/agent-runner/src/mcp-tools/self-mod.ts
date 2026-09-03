@@ -148,9 +148,23 @@ function parseMcpServerInput(args: Record<string, unknown>): { config: ParsedMcp
     if (parsed.username || parsed.password || parsed.hash) {
       return { error: 'url must not contain credentials or fragments; use the OneCLI gateway for authentication' };
     }
-    for (const key of parsed.searchParams.keys()) {
+    for (const [key, value] of parsed.searchParams) {
       if (SECRET_QUERY_KEY_RE.test(key.replace(CAMEL_SPLIT_RE, '$1_$2'))) {
         return { error: `url query parameter "${key}" looks like a credential; use the OneCLI gateway for authentication` };
+      }
+      if (RAW_SECRET_VALUE_RE.test(value)) {
+        return { error: `url query parameter "${key}" carries a raw credential; use the OneCLI gateway for authentication` };
+      }
+    }
+    // Some vendors put the token in the PATH (a Zapier-style
+    // https://host/s/<token>/mcp). The URL is persisted verbatim, so reject
+    // a credential there at intake rather than redacting it for display.
+    for (const segment of parsed.pathname.split('/')) {
+      if (RAW_SECRET_VALUE_RE.test(decodeURIComponent(segment))) {
+        return {
+          error:
+            'url path carries a raw credential; use the OneCLI gateway for authentication rather than a secret in the URL',
+        };
       }
     }
     if (args.headers === undefined) return { config: { type: 'http', url } };

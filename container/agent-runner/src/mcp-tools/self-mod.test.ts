@@ -122,6 +122,17 @@ describe('add_mcp_server remote Streamable HTTP', () => {
     expect((await submit({ name: 'exa', url: 'https://mcp.exa.ai/mcp?tools=web_search_exa' })).payload).toBeDefined();
   });
 
+  it('rejects a raw credential in the url path or a query value', async () => {
+    expect((await submit({ name: 'zapier', url: 'https://hooks.example.com/s/sk-abc123/mcp' })).error).toContain(
+      'url path carries a raw credential',
+    );
+    expect((await submit({ name: 'q', url: 'https://example.com/mcp?tools=ghp_deadbeef1234' })).error).toContain(
+      'carries a raw credential',
+    );
+    // An opaque segment matching no known credential shape stays legal.
+    expect((await submit({ name: 'ok', url: 'https://hooks.example.com/s/abc123/mcp' })).payload).toBeDefined();
+  });
+
   it('rejects a bad server name, both transports at once, and cross-transport fields', async () => {
     expect((await submit({ name: 'bad name!', url: 'https://example.com/mcp' })).error).toContain('1-64 characters');
     expect((await submit({ name: 'both', command: 'node', url: 'https://example.com/mcp' })).error).toContain(

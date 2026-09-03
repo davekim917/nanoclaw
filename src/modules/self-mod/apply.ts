@@ -23,9 +23,8 @@ import { getSession } from '../../db/sessions.js';
 import { isOpenCodeModelSlug } from '../../flag-parser.js';
 import {
   parseMcpServerConfig,
+  updateContainerConfig,
   validateMcpServerName,
-  validateMcpServers,
-  type McpServerConfig,
   type ParsedMcpServerConfig,
 } from '../../container-config.js';
 import { log } from '../../log.js';
@@ -144,10 +143,16 @@ export async function applyAddMcpServer(payload: Record<string, unknown>, sessio
     return;
   }
 
-  // Add the new MCP server to the existing map in the DB
-  const servers = JSON.parse(configRow.mcp_servers) as Record<string, McpServerConfig>;
-  servers[name] = serverConfig;
-  updateContainerConfigJson(agentGroup.id, 'mcp_servers', validateMcpServers(servers));
+  // Dual-write, exactly as `ncl groups config add-mcp-server` does: the FILE
+  // is what the spawn path reads (`readContainerConfig`), the DB column is the
+  // projection `groups config get` reports and the next file-to-DB backfill
+  // would otherwise overwrite. Writing only the DB restarted the container
+  // without the server the admin just approved.
+  const fileConfig = updateContainerConfig(agentGroup.folder, (config) => {
+    if (!config.mcpServers) config.mcpServers = {};
+    config.mcpServers[name] = serverConfig;
+  });
+  updateContainerConfigJson(agentGroup.id, 'mcp_servers', fileConfig.mcpServers ?? {});
 
   await writeSessionMessage(session.agent_group_id, session.id, {
     id: `appr-note-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,

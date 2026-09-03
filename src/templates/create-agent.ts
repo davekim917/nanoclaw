@@ -102,6 +102,13 @@ export async function createAgentFromTemplate(ref: string, opts?: CreateAgentOpt
     fs.writeFileSync(dest, content);
   }
 
+  // Dual-write, same as every other MCP write path: container.json is what
+  // the spawn reads. Writing only the DB projection left a stamped template's
+  // servers unwired on first spawn, where the absent file materializes as an
+  // empty config.
+  updateContainerConfig(folder, (config) => {
+    config.mcpServers = { ...(config.mcpServers ?? {}), ...tpl.mcpServers };
+  });
   updateContainerConfigJson(id, 'mcp_servers', tpl.mcpServers);
 
   // Per-group skills overlay — keyed by group id, never shared. cpSync creates

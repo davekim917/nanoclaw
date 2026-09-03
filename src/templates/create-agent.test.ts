@@ -155,6 +155,19 @@ describe('createAgentFromTemplate', () => {
     expect(getContainerConfig(g.id)?.timezone).toBeNull();
   });
 
+  it('writes template MCP servers into container.json, not only the DB projection', async () => {
+    // The spawn path reads container.json; a DB-only write left a stamped
+    // template's servers unwired, since the absent file materializes empty.
+    const g = await createAgentFromTemplate('sales/sdr', { name: 'SDR MCP' });
+    const fileConfig = JSON.parse(fs.readFileSync(path.join(GROUPS_DIR, g.folder, 'container.json'), 'utf8')) as {
+      mcpServers?: Record<string, unknown>;
+    };
+    expect(fileConfig.mcpServers).toEqual({
+      hubspot: { command: 'npx', args: ['-y', '@hubspot/mcp-server'], env: {} },
+    });
+    expect(JSON.parse(getContainerConfig(g.id)!.mcp_servers)).toEqual(fileConfig.mcpServers);
+  });
+
   it('forwards multiline scripts unchanged through the shared task creation path', async () => {
     const script = 'count=2\necho \'{"wakeAgent": true, "data": {"count": 2}}\'';
     writeTask('alert-watch', '*/15 * * * *', 'Investigate new alerts.', script);

@@ -375,16 +375,25 @@ describe('add_mcp_server remote Streamable HTTP servers', () => {
     expect(lastQuestion()).toContain(`url: ${JSON.stringify(url)}`);
   });
 
-  it('redacts a secret-shaped path segment but never the origin', async () => {
-    const token = 'sk-abc123def456';
-    await submitAddMcpServer({ name: 'zapier', url: `https://hooks.example.com/s/${token}/mcp` }, session);
-    const question = lastQuestion();
-    expect(question).toContain('https://hooks.example.com/');
-    expect(question).not.toContain(token);
-    expect(question).toContain('sha256');
-    // The payload keeps the verbatim URL — the card is a view, not the value.
+  it('rejects a credential embedded in the url path before anything is persisted', async () => {
+    // A Zapier-style https://host/s/<token>/mcp. The URL is written verbatim
+    // to container.json and to the approval row, so redacting it for display
+    // would still leave the secret on disk — reject at intake instead.
+    await submitAddMcpServer({ name: 'zapier', url: 'https://hooks.example.com/s/sk-abc123def456/mcp' }, session);
+    expect(expectRejected()).toMatch(/url path carries a raw credential/);
+  });
+
+  it('rejects a raw credential in a query value', async () => {
+    await submitAddMcpServer({ name: 'q', url: 'https://example.com/mcp?tools=ghp_deadbeefcafe1234' }, session);
+    expect(expectRejected()).toMatch(/carries a raw credential/);
+  });
+
+  it('shows the remote url unredacted on the card — it is credential-free by construction', async () => {
+    const url = 'https://hooks.example.com/s/abc123/mcp';
+    await submitAddMcpServer({ name: 'zapier', url }, session);
+    expect(lastQuestion()).toContain(`url: ${JSON.stringify(url)}`);
     const [row] = getPendingApprovalsByAction('add_mcp_server');
-    expect(JSON.parse(row.payload as string).url).toBe(`https://hooks.example.com/s/${token}/mcp`);
+    expect(JSON.parse(row.payload as string).url).toBe(url);
   });
 
   it('carries OneCLI placeholder headers through to the payload and the card', async () => {

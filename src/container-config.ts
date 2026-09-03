@@ -176,10 +176,26 @@ export function parseMcpServerConfig(input: Record<string, unknown>): ParsedMcpS
     if (parsed.username || parsed.password || parsed.hash) {
       throw new Error('url must not contain credentials or fragments; use the OneCLI gateway for authentication');
     }
-    for (const key of parsed.searchParams.keys()) {
+    for (const [key, value] of parsed.searchParams) {
       if (SECRET_QUERY_KEY_RE.test(key.replace(CAMEL_SPLIT_RE, '$1_$2'))) {
         throw new Error(
           `url query parameter "${key}" looks like a credential; use the OneCLI gateway for authentication`,
+        );
+      }
+      if (RAW_SECRET_VALUE_RE.test(value)) {
+        throw new Error(
+          `url query parameter "${key}" carries a raw credential; use the OneCLI gateway for authentication`,
+        );
+      }
+    }
+    // Some vendors put the token in the PATH (a Zapier-style
+    // https://host/s/<token>/mcp). The URL is persisted verbatim to
+    // container.json and to the approval row, so a credential there is an
+    // on-disk secret no amount of card redaction undoes — reject at intake.
+    for (const segment of parsed.pathname.split('/')) {
+      if (RAW_SECRET_VALUE_RE.test(decodeURIComponent(segment))) {
+        throw new Error(
+          'url path carries a raw credential; use the OneCLI gateway for authentication rather than a secret in the URL',
         );
       }
     }

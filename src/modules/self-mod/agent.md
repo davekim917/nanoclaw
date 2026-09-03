@@ -18,7 +18,9 @@ only with admin approval.
   Pass exactly one of `command` (a local stdio server) or `url` (a remote
   Streamable HTTP server). Remote URLs must use HTTPS — plain HTTP is
   allowed only for `localhost` and `host.docker.internal` — and may not
-  carry credentials, fragments, or credential-looking query parameters.
+  carry credentials, fragments, credential-looking query parameters, or a
+  token anywhere in the path or a query value: the URL is persisted
+  verbatim, so a secret in it is a secret on disk.
   Credential headers must use the `"onecli-managed"` placeholder; the
   OneCLI gateway substitutes the real secret at the proxy boundary.
 

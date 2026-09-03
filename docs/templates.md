@@ -167,9 +167,10 @@ Entries are validated at parse time by the same parser the `ncl` and approval
 paths use, so a template cannot stamp a config those paths would reject:
 server names are `[A-Za-z0-9_-]{1,64}`, exactly one of `command` or `url` is
 required, remote URLs must be HTTPS (plain HTTP only for `localhost` /
-`host.docker.internal`) with no credentials, fragment, or credential-looking
-query parameter, and any credential header must carry the `onecli-managed`
-placeholder. An unknown field is an error rather than a silent drop.
+`host.docker.internal`) with no credentials, fragment, credential-looking
+query parameter, or credential anywhere in the path or a query value, and any
+credential header must carry the `onecli-managed` placeholder. An unknown
+field is an error rather than a silent drop.
 
 Credentials are held by the **credentials proxy** and injected into outbound
 HTTPS calls at the proxy boundary, matched by API host, at request time. The key

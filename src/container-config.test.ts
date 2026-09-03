@@ -391,6 +391,23 @@ describe('parseMcpServerConfig', () => {
     });
   });
 
+  it('rejects a raw credential in the path or a query value, not just in a key', () => {
+    // The URL is persisted verbatim to container.json and to the approval row,
+    // so a Zapier-style token in the path is an on-disk secret.
+    expect(() => parseMcpServerConfig({ url: 'https://hooks.example.com/s/sk-abc123/mcp' })).toThrow(
+      /url path carries a raw credential/,
+    );
+    expect(() => parseMcpServerConfig({ url: 'https://example.com/mcp?tools=ghp_deadbeef1234' })).toThrow(
+      /carries a raw credential/,
+    );
+    // Percent-encoding must not smuggle one past the check.
+    expect(() => parseMcpServerConfig({ url: 'https://example.com/s/ghp_deadbeef1234/mcp' })).toThrow(/raw credential/);
+    // An opaque path segment that matches no known credential shape is fine.
+    expect(parseMcpServerConfig({ url: 'https://hooks.example.com/s/abc123/mcp' })).toMatchObject({
+      url: 'https://hooks.example.com/s/abc123/mcp',
+    });
+  });
+
   it('forces credential headers through the OneCLI placeholder', () => {
     expect(() =>
       parseMcpServerConfig({ url: 'https://example.com/mcp', headers: { Authorization: 'Bearer real' } }),
