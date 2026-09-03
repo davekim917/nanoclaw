@@ -91,8 +91,7 @@ import {
   pruneIdleThreadArtifacts as pruneIdleThreadArtifactsImpl,
   type ThreadWorktreeActivity,
 } from './storage-manager.js';
-import { handleStoragePressureAlert } from './storage-pressure-alert.js';
-import { runStorageMaintenanceInBackground } from './storage-maintenance-worker.js';
+import { startStorageMaintenanceOnce } from './modules/sweep-storage/index.js';
 import type { Session } from './types.js';
 import { getDb } from './db/connection.js';
 import {
@@ -1203,9 +1202,7 @@ async function sweepOnce(): Promise<void> {
   // Fire-and-forget into a persistent worker. The worker owns the expensive
   // synchronous filesystem/Docker implementation and its cadence state; the
   // host event loop stays available for channel heartbeats and inbound events.
-  void runStorageMaintenanceInBackground(getActiveContainerSessionIds())
-    .then((storageReport) => (storageReport ? handleStoragePressureAlert(storageReport) : undefined))
-    .catch((err) => log.warn('storage-manager: background maintenance failed', { err }));
+  startStorageMaintenanceOnce(getActiveContainerSessionIds());
 
   // Auto-archive completed tasks older than 24h so the "Done" lane stays
   // representative of recent work; failed tasks are intentionally skipped.
