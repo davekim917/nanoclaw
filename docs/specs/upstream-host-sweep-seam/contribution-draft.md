@@ -83,11 +83,30 @@ written without them.
 The fork-only tests that do **not** travel: the ratchet suite and the family suites for
 duties upstream does not have.
 
-## 5. Open item this draft cannot close
+## 5. The size of what would be offered
 
-`plan.md` §8 F-14.1 requires `src/host-sweep.ts` to be under 300 lines at the end state.
-It is 1,137 (631 code, 420 comment, 86 blank) and holds no duty body: driver, registry,
-phase list, shared context, error rule and inventory, nothing else. The ceiling was an
-estimate made before the build and is wrong by roughly 2x on code alone. Either the
-number is corrected or the driver is split — a decision for the operator, not for this
-draft. Any contribution offer should quote the real shape, not the estimate.
+`src/host-sweep.ts` is **1,136 lines** at the end state — 631 code, 420 comment, 85 blank
+— and holds no duty body. It is the driver, the registry, the phase list, the shared
+context, the error rule and the duty inventory, and nothing else. That is the shape any
+contribution offer should quote.
+
+The plan's original acceptance criterion asked for "under 300 lines". That number was an
+estimate written before the build and it was wrong by roughly 2x on code alone, so it was
+replaced rather than met: F-14.1 keeps its title and now asserts the property the number
+was standing in for, structurally.
+
+1. Re-evaluating `host-sweep.ts` in a fresh module graph — its own imports, no family
+   module and no modules barrel — leaves the registry empty. No duty originates in the
+   driver. Because `registerSweepDutySource` invokes its registrar immediately, this also
+   proves the built-in registrar registers nothing rather than merely going uncalled.
+2. Each of the three duty registration surfaces is defined once and called zero times.
+   The one `registerSweepDutySource` call site is the driver declaring its own empty
+   source, which the registry contract depends on by name.
+3. The export set is a subset of an explicit driver / registry / phase-list / context /
+   error-rule / test-accessor allowlist, so a duty helper cannot leak back out.
+
+A regrowth ratchet of 1,200 lines sits underneath those three. It is a ceiling against a
+duty body creeping home, not a target, and the driver is not split. An adopter porting
+this seam should expect the same order of magnitude: the registry and phase list are
+small, and most of the file is the tick and per-session driver plus the design commentary
+that makes the ordering constraints readable.
