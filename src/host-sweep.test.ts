@@ -63,10 +63,7 @@ import {
   migrateLegacyWorkContinuationForRecovery,
   notifyContinuationParked,
   shouldCloseTaskSession,
-  shouldReapIdleTaskContainer,
-  shouldReapIdleChatContainer,
   shouldSkipUsageRollup,
-  CHAT_IDLE_REAP_MS,
 } from './host-sweep.js';
 import { getDb } from './db/connection.js';
 import type { Session } from './types.js';
@@ -2869,79 +2866,8 @@ describe('shouldCloseTaskSession', () => {
   });
 });
 
-describe('shouldReapIdleTaskContainer', () => {
-  it('reaps an idle scheduled-task container with no claimed or due work', () => {
-    expect(shouldReapIdleTaskContainer('system:tasks:task-1', 0, 0, false, false)).toBe(true);
-  });
-
-  it('keeps a scheduled-task container while work is due or claimed', () => {
-    expect(shouldReapIdleTaskContainer('system:tasks:task-1', 1, 0, false, false)).toBe(false);
-    expect(shouldReapIdleTaskContainer('system:tasks:task-1', 0, 1, false, false)).toBe(false);
-  });
-
-  it('keeps a scheduled-task container while the provider is executing a turn', () => {
-    // Runner-pushed follow-up turns (wrapping-retry nudges, post-compaction
-    // bootstrap re-injection) execute with no processing claim at all.
-    expect(shouldReapIdleTaskContainer('system:tasks:task-1', 0, 0, true, false)).toBe(false);
-  });
-
-  it('keeps a scheduled-task container holding a work continuation', () => {
-    // `continue_work` is the sanctioned follow-up promise. Between turn end
-    // and continuation admission there is no claim and no execution, and
-    // reaping there demotes the agent to the throttled recovery path.
-    expect(shouldReapIdleTaskContainer('system:tasks:task-1', 0, 0, false, true)).toBe(false);
-  });
-
-  it('never reaps an interactive session through the scheduled-task policy', () => {
-    expect(shouldReapIdleTaskContainer('discord:guild:channel:thread', 0, 0, false, false)).toBe(false);
-    expect(shouldReapIdleTaskContainer(null, 0, 0, false, false)).toBe(false);
-  });
-});
-
-describe('shouldReapIdleChatContainer', () => {
-  const THREAD = 'discord:guild:channel:thread';
-  const NOW = 1_700_000_000_000;
-  const LONG_QUIET = NOW - CHAT_IDLE_REAP_MS - 1;
-  const JUST_QUIET = NOW - CHAT_IDLE_REAP_MS + 1;
-
-  it('reaps a chat container quiet past the floor with nothing pending', () => {
-    expect(shouldReapIdleChatContainer(THREAD, 0, 0, false, LONG_QUIET, LONG_QUIET, NOW)).toBe(true);
-  });
-
-  it('keeps a chat container inside the quiet floor', () => {
-    expect(shouldReapIdleChatContainer(THREAD, 0, 0, false, JUST_QUIET, JUST_QUIET, NOW)).toBe(false);
-  });
-
-  it('keeps a chat container while work is due or claimed', () => {
-    expect(shouldReapIdleChatContainer(THREAD, 1, 0, false, LONG_QUIET, LONG_QUIET, NOW)).toBe(false);
-    expect(shouldReapIdleChatContainer(THREAD, 0, 1, false, LONG_QUIET, LONG_QUIET, NOW)).toBe(false);
-  });
-
-  it('keeps a chat container with a pending work_continuation promise', () => {
-    expect(shouldReapIdleChatContainer(THREAD, 0, 0, true, LONG_QUIET, LONG_QUIET, NOW)).toBe(false);
-  });
-
-  it('keeps a chat container that has never produced output', () => {
-    expect(shouldReapIdleChatContainer(THREAD, 0, 0, false, null, LONG_QUIET, NOW)).toBe(false);
-  });
-
-  it('never reaps a task-thread session through the chat policy', () => {
-    expect(shouldReapIdleChatContainer('system:tasks:task-1', 0, 0, false, LONG_QUIET, LONG_QUIET, NOW)).toBe(false);
-  });
-
-  // The live failure: a user message arrives 16 min after the previous reply,
-  // the container consumes it (so dueCount is already 0) and is killed 11s
-  // into the turn before emitting its first status. Outbound alone cannot see
-  // this; inbound can.
-  it('keeps a chat container that just consumed a message but has not replied yet', () => {
-    expect(shouldReapIdleChatContainer(THREAD, 0, 0, false, LONG_QUIET, JUST_QUIET, NOW)).toBe(false);
-  });
-
-  it('still reaps when the newest inbound is also past the floor', () => {
-    expect(shouldReapIdleChatContainer(THREAD, 0, 0, false, JUST_QUIET, LONG_QUIET, NOW)).toBe(false);
-    expect(shouldReapIdleChatContainer(THREAD, 0, 0, false, LONG_QUIET, null, NOW)).toBe(true);
-  });
-});
+// shouldReapIdleTaskContainer / shouldReapIdleChatContainer cases moved to
+// src/modules/sweep-idle-reap/idle-reap.test.ts (seam 2, S2-PR3 — F-3.1).
 
 describe('shouldSkipUsageRollup', () => {
   it('skips when the cached mtime matches the current outbound.db mtime (unchanged since last rollup)', () => {
