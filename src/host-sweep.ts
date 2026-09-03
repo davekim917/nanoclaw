@@ -32,7 +32,6 @@ import fs from 'fs';
 import path from 'path';
 
 import { SELF_HEAL_ENABLED } from './config.js';
-import { ensureEgressNetwork } from './egress-lockdown.js';
 import { getActiveSessions, getSession, isTaskThread, updateSession } from './db/sessions.js';
 import { getAgentGroup } from './db/agent-groups.js';
 import {
@@ -1748,24 +1747,8 @@ function resetStuckProcessingRows(mailbox: NanoclawMailboxSession, session: Sess
 function registerBuiltInSweepDuties(): void {
   const id = SWEEP_DUTY_INVENTORY;
 
-  // ── tick:pre-session ───────────────────────────────────────────────────────
-
-  registerSweepDuty({
-    name: id.T2,
-    phase: 'tick:pre-session',
-    order: 10,
-    run: () => {
-      // Re-heal the egress network so already-running agents keep their gateway
-      // hop if it was detached out-of-band. Best-effort here: a heal failure
-      // isn't a leak (agents stay on the internal net), so log and continue.
-      // No-op when lockdown is disabled.
-      try {
-        ensureEgressNetwork();
-      } catch (err) {
-        log.error('Egress lockdown re-heal failed', { err });
-      }
-    },
-  });
+  // T2 (egress-network-reheal, tick:pre-session) moved to
+  // src/modules/sweep-egress/index.ts (S2-PR6).
 
   // ── session:plan (W1) ──────────────────────────────────────────────────────
 
