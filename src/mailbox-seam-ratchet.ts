@@ -112,21 +112,22 @@ function matchesPatternB(src: string): boolean {
 }
 
 function matchesPatternC(src: string): boolean {
-  // (c) new Database( where either (c1) the constructor argument expression
+  // (c) `new Database(` where either (c1) the constructor argument expression
   // itself names an inbound/outbound path — `new Database(inboundDbPath, ...)`,
   // `new Database(outboundPath, ...)` — regardless of where that variable was
-  // built, or (c2) the same statement or the preceding 3 lines mention the
-  // inbound.db/outbound.db literal directly.
+  // built, or (c2) the inbound.db/outbound.db literal appears ANYWHERE in the
+  // same file as a `new Database(` call — not just a 3-line window. A caller
+  // can filter/validate a generically-named path variable (e.g. `filePath`)
+  // against the literal in one function and open it with `new Database(...)`
+  // in a completely different one; a same-file check still catches that
+  // without tracking dataflow across functions.
+  if (!/new\s+Database\s*\(/.test(src)) return false;
   const lines = src.split('\n');
-  for (let i = 0; i < lines.length; i++) {
-    const dbCall = lines[i].match(/new\s+Database\s*\(\s*([^,)]*)/);
-    if (!dbCall) continue;
-    if (/inbound|outbound/i.test(dbCall[1])) return true;
-    const windowStart = Math.max(0, i - 3);
-    const window = lines.slice(windowStart, i + 1).join('\n');
-    if (window.includes('inbound.db') || window.includes('outbound.db')) return true;
+  for (const line of lines) {
+    const dbCall = line.match(/new\s+Database\s*\(\s*([^,)]*)/);
+    if (dbCall && /inbound|outbound/i.test(dbCall[1])) return true;
   }
-  return false;
+  return src.includes('inbound.db') || src.includes('outbound.db');
 }
 
 function matchesPatternD(src: string): boolean {
