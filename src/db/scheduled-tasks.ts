@@ -269,6 +269,10 @@ export async function scheduleTask(def: TaskDef, _dataDir?: string): Promise<voi
           `UPDATE messages_in
               SET seq           = ?,
                   process_after = ?,
+                  -- Moves with process_after: an operator rescheduling a live
+                  -- series genuinely changes which slot the occurrence is for,
+                  -- unlike a retry backoff, which only moves process_after.
+                  scheduled_for = ?,
                   recurrence    = ?,
                   content       = ?,
                   platform_id   = ?,
@@ -277,20 +281,33 @@ export async function scheduleTask(def: TaskDef, _dataDir?: string): Promise<voi
                   tries         = 0,
                   trigger       = 0
             WHERE id = ?`,
-        ).run(seq, def.processAfter, def.cron, content, platformId, channelType, threadId, activeRow.id);
+        ).run(
+          seq,
+          def.processAfter,
+          def.processAfter,
+          def.cron,
+          content,
+          platformId,
+          channelType,
+          threadId,
+          activeRow.id,
+        );
         return;
       }
 
       const seq = nextEvenSeq(db);
       db.prepare(
         `INSERT INTO messages_in
-           (id, seq, kind, timestamp, status, tries, process_after, recurrence, series_id, content,
+           (id, seq, kind, timestamp, status, tries, process_after, scheduled_for, recurrence, series_id, content,
             platform_id, channel_type, thread_id, trigger)
-         VALUES (?, ?, 'task', ?, 'pending', 0, ?, ?, ?, ?, ?, ?, ?, 0)`,
+         VALUES (?, ?, 'task', ?, 'pending', 0, ?, ?, ?, ?, ?, ?, ?, ?, 0)`,
       ).run(
         def.id,
         seq,
         new Date().toISOString(),
+        def.processAfter,
+        // Stamped equal at insert, then diverges — a deferral moves only
+        // process_after, so the occurrence keeps the slot it was armed for.
         def.processAfter,
         def.cron,
         def.seriesId,

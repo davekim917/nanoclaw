@@ -4,6 +4,7 @@
 import { getConfig } from '../config.js';
 import { getAgentMailbox } from '../mailbox/index.js';
 import type { InboundMessage } from '../mailbox/types.js';
+import type { NanoclawInboundMessage } from '../modules/mailbox/index.js';
 
 export interface MessageInRow {
   id: string;
@@ -11,7 +12,15 @@ export interface MessageInRow {
   kind: InboundMessage['kind'];
   timestamp: string;
   status: string;
+  /** When the row becomes runnable. Deferral paths rewrite this. */
   process_after: string | null;
+  /**
+   * Which scheduled slot a task occurrence is FOR. Stamped at insert and moved
+   * only by a genuine reschedule, so it survives a retry backoff that pushes
+   * `process_after` forward. NULL on non-task rows and on task rows written
+   * before the column existed — readers fall back to `process_after`.
+   */
+  scheduled_for?: string | null;
   recurrence: string | null;
   series_id: string | null;
   tries: number;
@@ -33,6 +42,10 @@ function messageRow(message: InboundMessage): MessageInRow {
     timestamp: message.timestamp,
     status: message.status,
     process_after: message.processAfter,
+    // Fork-only, so it is present only on records the fork's own selection
+    // built (the pending path). Records from upstream's ops carry none, and
+    // the formatter's documented fallback to `process_after` covers them.
+    scheduled_for: (message as Partial<NanoclawInboundMessage>).scheduledFor ?? null,
     recurrence: message.recurrence,
     series_id: message.seriesId,
     tries: message.tries,

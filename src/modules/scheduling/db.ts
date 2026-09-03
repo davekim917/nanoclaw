@@ -19,6 +19,11 @@ import { nextEvenSeq } from '../../db/session-db.js';
  * to `id` for a brand-new series, or the existing series for a recurrence clone
  * or an on-demand run.
  *
+ * `scheduled_for` is stamped from the SAME value as `process_after`, then
+ * diverges: deferral paths (fresh-context retry backoff, stale-message backoff)
+ * rewrite `process_after` and leave `scheduled_for` alone, so the occurrence
+ * keeps the slot it was armed for. The formatter renders `scheduled_for`.
+ *
  * New-style `ncl tasks` rows fire into an isolated system session and pass no
  * routing (platform/channel/thread default NULL). Fork: MCP-scheduled tasks
  * (actions.ts) and recurrence clones DO carry routing — channel-scoped tasks
@@ -40,8 +45,8 @@ export function insertTaskRow(
   },
 ): void {
   db.prepare(
-    `INSERT INTO messages_in (id, seq, timestamp, status, tries, process_after, recurrence, kind, platform_id, channel_type, thread_id, content, series_id, trigger)
-     VALUES (@id, @seq, @timestamp, @status, 0, @processAfter, @recurrence, 'task', @platformId, @channelType, @threadId, @content, @seriesId, 0)`,
+    `INSERT INTO messages_in (id, seq, timestamp, status, tries, process_after, scheduled_for, recurrence, kind, platform_id, channel_type, thread_id, content, series_id, trigger)
+     VALUES (@id, @seq, @timestamp, @status, 0, @processAfter, @processAfter, @recurrence, 'task', @platformId, @channelType, @threadId, @content, @seriesId, 0)`,
   ).run({
     status: 'pending',
     platformId: null,
@@ -122,6 +127,17 @@ export interface TaskUpdate {
   recurrence?: string | null;
   processAfter?: string;
   /**
+   * Treat `processAfter` as an execution deadline only, leaving the row's
+   * `scheduled_for` where it is.
+   *
+   * The board's run-now fires a task early WITHOUT shifting its schedule
+   * (design §4.6), so the occurrence is still FOR its original slot and must
+   * keep announcing that slot to the agent. Every other caller is a genuine
+   * reschedule — a cron edit, a resume recomputed to the next future slot, an
+   * explicit `--process-after` — and moves both.
+   */
+  keepScheduledFor?: boolean;
+  /**
    * Per-fire model/effort pin (merged into content.flagIntent, not replaced).
    * Values are already validated against the agent's provider vocab by the
    * caller (resolveTaskFlagIntent → parseMessageFlags), so effort is a plain
@@ -196,6 +212,10 @@ export function updateTask(db: Database.Database, taskId: string, update: TaskUp
       if (setProcessAfter && applySchedule) {
         sets.push('process_after = ?');
         params.push(update.processAfter);
+        if (!update.keepScheduledFor) {
+          sets.push('scheduled_for = ?');
+          params.push(update.processAfter);
+        }
       }
       if (setRecurrence && applySchedule) {
         sets.push('recurrence = ?');
@@ -308,6 +328,13 @@ export interface TaskRowSnapshot {
   series_id: string;
   status: 'pending' | 'paused';
   process_after: string | null;
+  /**
+   * Optional: a snapshot recorded in a `move_intent` audit row BEFORE this
+   * column existed has no value here, and recovery must still be able to
+   * restore from it. Absent means "fall back to process_after", which is what
+   * the restored row's readers would do anyway.
+   */
+  scheduled_for?: string | null;
   recurrence: string | null;
   content: string;
   platform_id: string | null;
@@ -336,14 +363,18 @@ export interface TaskRowSnapshot {
  */
 export function restoreTaskRow(db: Database.Database, snapshot: TaskRowSnapshot): void {
   db.prepare(
-    `INSERT INTO messages_in (id, seq, kind, timestamp, status, tries, process_after, recurrence, platform_id, channel_type, thread_id, content, series_id, trigger)
-     VALUES (@id, @seq, @kind, datetime('now'), @status, 0, @processAfter, @recurrence, @platformId, @channelType, @threadId, @content, @seriesId, 0)`,
+    `INSERT INTO messages_in (id, seq, kind, timestamp, status, tries, process_after, scheduled_for, recurrence, platform_id, channel_type, thread_id, content, series_id, trigger)
+     VALUES (@id, @seq, @kind, datetime('now'), @status, 0, @processAfter, @scheduledFor, @recurrence, @platformId, @channelType, @threadId, @content, @seriesId, 0)`,
   ).run({
     id: snapshot.id,
     seq: nextEvenSeq(db),
     kind: snapshot.kind,
     status: snapshot.status,
     processAfter: snapshot.process_after,
+    // A restore re-creates the SAME occurrence, so it carries the slot the
+    // source row was for — not the restore's own moment. `?? process_after`
+    // covers a pre-column audit snapshot.
+    scheduledFor: snapshot.scheduled_for ?? snapshot.process_after,
     recurrence: snapshot.recurrence,
     platformId: snapshot.platform_id,
     channelType: snapshot.channel_type,

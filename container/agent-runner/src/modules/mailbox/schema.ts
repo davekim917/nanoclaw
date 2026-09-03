@@ -259,6 +259,12 @@ export function ensureNanoclawInboundTestSchema(inbound: Database): void {
     ['repo_fence_epoch', 'TEXT'],
     ['repo_fence_original_trigger', 'INTEGER'],
     ['source_session_id', 'TEXT'],
+    // Which scheduled slot a task occurrence is FOR, as distinct from
+    // process_after's "when to run next". The HOST owns inbound.db and adds
+    // this in its own migrateMessagesInTable; the container only reads it, so
+    // this entry exists for the in-memory test pair built from upstream's
+    // baseline CREATE TABLE.
+    ['scheduled_for', 'TEXT'],
   ] as const) {
     if (!cols.has(name)) inbound.exec(`ALTER TABLE messages_in ADD COLUMN ${name} ${type}`);
   }

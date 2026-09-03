@@ -181,6 +181,7 @@ interface SourceLiveRow {
   id: string;
   status: string;
   process_after: string | null;
+  scheduled_for: string | null;
   recurrence: string | null;
   content: string;
   platform_id: string | null;
@@ -221,7 +222,7 @@ function readSourceLiveRow(
     const row =
       (db
         .prepare(
-          `SELECT id, status, process_after, recurrence, content, platform_id, channel_type, thread_id, kind
+          `SELECT id, status, process_after, scheduled_for, recurrence, content, platform_id, channel_type, thread_id, kind
              FROM messages_in
             WHERE series_id = ? AND kind = 'task' AND status IN ('pending', 'paused')
             ORDER BY seq DESC LIMIT 1`,
@@ -512,6 +513,7 @@ export const moveExecuteHandler: AuthHandler = async (req, params, ctx) => {
         series_id: source.seriesId,
         status: snapshot.status,
         process_after: snapshot.process_after,
+        scheduled_for: snapshot.scheduled_for,
         recurrence: snapshot.recurrence,
         content: snapshot.content,
         platform_id: snapshot.platform_id,
@@ -537,6 +539,9 @@ export const moveExecuteHandler: AuthHandler = async (req, params, ctx) => {
     series_id: source.seriesId,
     status: wasPaused ? 'paused' : 'pending',
     process_after: snapshot.process_after,
+    // The occurrence's slot survives the move-and-compensate round trip; a
+    // restore is the SAME occurrence, not a new one.
+    scheduled_for: snapshot.scheduled_for,
     recurrence: snapshot.recurrence,
     content: snapshot.content,
     platform_id: snapshot.platform_id,

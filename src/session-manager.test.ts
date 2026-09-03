@@ -1056,6 +1056,37 @@ describe('writeSessionMessage re-provisions a deleted session folder', () => {
     db.close();
   });
 
+  it('a retry backoff moves process_after but NEVER the occurrence\'s scheduled slot', async () => {
+    initSessionFolder(AG, SESS);
+    const db = new Database(inboundDbPath(AG, SESS));
+    try {
+      insertTaskRow(db, {
+        id: 'task-crash-retry',
+        seriesId: 'task-crash-retry',
+        processAfter: '2026-01-05T09:00:00.000Z',
+        recurrence: '0 9 * * *',
+        content: JSON.stringify({ prompt: "prepare today's brief" }),
+      });
+
+      await deferMessageForFreshContextRetry(db, 'task-crash-retry', 600);
+
+      const row = db
+        .prepare('SELECT process_after, scheduled_for, tries FROM messages_in WHERE id = ?')
+        .get('task-crash-retry') as { process_after: string; scheduled_for: string; tries: number };
+
+      // The backoff deadline is a "don't touch me until", not a new slot.
+      expect(row.tries).toBe(1);
+      expect(row.process_after).not.toBe('2026-01-05T09:00:00.000Z');
+      expect(Date.parse(row.process_after)).toBeGreaterThan(Date.now());
+      // The occurrence is still the 9am one. This is the whole point: an agent
+      // asked for "today's" numbers, and anything date-windowed or idempotent
+      // keyed off the slot, must survive the retry with the same identity.
+      expect(row.scheduled_for).toBe('2026-01-05T09:00:00.000Z');
+    } finally {
+      db.close();
+    }
+  });
+
   it('replaces crashed-turn recall with current memory and capabilities when backoff becomes due', async () => {
     const memoryRoot = path.join(TEST_DATA_DIR, 'workgroups', 'reset', 'memory');
     fs.mkdirSync(path.join(memoryRoot, 'system'), { recursive: true });

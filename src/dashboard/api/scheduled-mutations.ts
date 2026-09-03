@@ -430,7 +430,13 @@ export const runNowHandler: AuthHandler = async (req, params, ctx) => {
   let touched: number;
   let admittedTarget = false;
   try {
-    touched = updateTask(db, t.seriesId, { processAfter: new Date(nowMs).toISOString() });
+    // keepScheduledFor: an early fire does not shift the schedule (§4.6), so the
+    // occurrence is still FOR its original slot and must keep announcing that
+    // slot to the agent. Only `process_after` moves to now.
+    touched = updateTask(db, t.seriesId, {
+      processAfter: new Date(nowMs).toISOString(),
+      keepScheduledFor: true,
+    });
     if (touched > 0) {
       admitDueTaskContexts(db, t.agentGroupId, t.sessionId);
       admittedTarget =

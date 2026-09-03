@@ -180,6 +180,19 @@ CREATE TABLE IF NOT EXISTS messages_in (
   timestamp      TEXT NOT NULL,
   status         TEXT DEFAULT 'pending',
   process_after  TEXT,
+                 -- WHEN TO RUN NEXT, and nothing else. Deferral paths
+                 -- (fresh-context retry backoff, stale-message backoff) rewrite
+                 -- this, so it is not a stable identity for the occurrence.
+  scheduled_for  TEXT,
+                 -- WHICH SLOT THIS OCCURRENCE IS FOR. Stamped once at insert
+                 -- from the process_after the task was created/re-armed with,
+                 -- and moved only by a genuine reschedule (cron edit, resume to
+                 -- the next future slot, an explicit process_after update).
+                 -- A retry backoff must never touch it: the agent reasons from
+                 -- this value, and anything date-windowed or idempotent keyed
+                 -- off it would lose its occurrence identity across a retry.
+                 -- NULL on rows written before this column existed and on
+                 -- non-task rows; readers fall back to process_after.
   recurrence     TEXT,
   series_id      TEXT,
   tries          INTEGER DEFAULT 0,

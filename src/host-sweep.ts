@@ -1893,6 +1893,9 @@ export function recoverMoveIntents(centralDb: Database.Database, options: MoveRe
           series_id: snapshot.series_id,
           status: snapshot.status,
           process_after: snapshot.process_after,
+          // Optional on the parsed audit body: an intent written before the
+          // column existed has none, and restoreTaskRow falls back.
+          scheduled_for: snapshot.scheduled_for,
           recurrence: snapshot.recurrence,
           content: snapshot.content,
           platform_id: snapshot.platform_id,

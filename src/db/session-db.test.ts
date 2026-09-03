@@ -294,6 +294,46 @@ describe('migrateMessagesInTable', () => {
     db.close();
   });
 
+  it('adds scheduled_for on a legacy DB WITHOUT backfilling it, and is idempotent', () => {
+    if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
+    fs.mkdirSync(TEST_DIR, { recursive: true });
+
+    const db = new Database(DB_PATH);
+    db.exec(`
+      CREATE TABLE messages_in (
+        id             TEXT PRIMARY KEY,
+        seq            INTEGER UNIQUE,
+        kind           TEXT NOT NULL,
+        timestamp      TEXT NOT NULL,
+        status         TEXT DEFAULT 'pending',
+        process_after  TEXT,
+        recurrence     TEXT,
+        tries          INTEGER DEFAULT 0,
+        platform_id    TEXT,
+        channel_type   TEXT,
+        thread_id      TEXT,
+        content        TEXT NOT NULL
+      );
+    `);
+    // A legacy task row sitting in retry backoff: its process_after is the
+    // backoff deadline, NOT the slot it was scheduled for. Copying that value
+    // into scheduled_for would freeze the exact wrong answer, which is why the
+    // migration adds the column empty and lets readers fall back.
+    db.prepare(
+      "INSERT INTO messages_in (id, seq, kind, timestamp, status, process_after, content) VALUES (?, ?, 'task', ?, 'pending', ?, '{}')",
+    ).run('legacy-backoff', 2, '2026-01-05T09:00:00.000Z', '2026-01-05T11:47:00.000Z');
+
+    migrateMessagesInTable(db);
+    migrateMessagesInTable(db); // idempotent
+
+    const cols = (db.prepare("PRAGMA table_info('messages_in')").all() as Array<{ name: string }>).map((c) => c.name);
+    expect(cols).toContain('scheduled_for');
+
+    const row = db.prepare('SELECT scheduled_for, process_after FROM messages_in WHERE id = ?').get('legacy-backoff');
+    expect(row).toEqual({ scheduled_for: null, process_after: '2026-01-05T11:47:00.000Z' });
+    db.close();
+  });
+
   it('adds source_session_id on a legacy DB, leaves existing rows NULL, is idempotent', () => {
     if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
     fs.mkdirSync(TEST_DIR, { recursive: true });

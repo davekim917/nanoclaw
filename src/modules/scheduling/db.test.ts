@@ -71,6 +71,22 @@ describe('insertTaskRow', () => {
     db.close();
   });
 
+  it('stamps scheduled_for from the same value as process_after', () => {
+    const db = freshDb();
+    insertTaskRow(db, {
+      id: 'task-slot',
+      seriesId: 'task-slot',
+      processAfter: '2026-01-05T09:00:00.000Z',
+      recurrence: '0 9 * * *',
+      content: JSON.stringify({ prompt: 'daily brief' }),
+    });
+    expect(db.prepare('SELECT process_after, scheduled_for FROM messages_in WHERE id = ?').get('task-slot')).toEqual({
+      process_after: '2026-01-05T09:00:00.000Z',
+      scheduled_for: '2026-01-05T09:00:00.000Z',
+    });
+    db.close();
+  });
+
   it('persists thread_id for a thread-scoped task', () => {
     const db = freshDb();
     insertTaskRow(db, {
@@ -324,6 +340,43 @@ describe('updateTask', () => {
     db.close();
   });
 
+  it('moves scheduled_for with process_after — a reschedule changes the slot', () => {
+    const db = freshDb();
+    insertTaskRow(db, {
+      id: 'task-resched',
+      seriesId: 'task-resched',
+      processAfter: '2026-01-05T09:00:00.000Z',
+      recurrence: '0 9 * * *',
+      content: JSON.stringify({ prompt: 'daily brief' }),
+    });
+
+    updateTask(db, 'task-resched', { processAfter: '2026-01-05T14:00:00.000Z' });
+
+    expect(db.prepare('SELECT process_after, scheduled_for FROM messages_in WHERE id = ?').get('task-resched')).toEqual(
+      { process_after: '2026-01-05T14:00:00.000Z', scheduled_for: '2026-01-05T14:00:00.000Z' },
+    );
+    db.close();
+  });
+
+  it('keepScheduledFor moves ONLY process_after — run-now fires early without shifting the slot', () => {
+    const db = freshDb();
+    insertTaskRow(db, {
+      id: 'task-runnow',
+      seriesId: 'task-runnow',
+      processAfter: '2026-01-05T09:00:00.000Z',
+      recurrence: '0 9 * * *',
+      content: JSON.stringify({ prompt: 'daily brief' }),
+    });
+
+    updateTask(db, 'task-runnow', { processAfter: '2026-01-05T07:12:00.000Z', keepScheduledFor: true });
+
+    expect(db.prepare('SELECT process_after, scheduled_for FROM messages_in WHERE id = ?').get('task-runnow')).toEqual({
+      process_after: '2026-01-05T07:12:00.000Z',
+      scheduled_for: '2026-01-05T09:00:00.000Z',
+    });
+    db.close();
+  });
+
   it('merges supplied fields into content JSON without clobbering others', () => {
     const db = freshDb();
     insertTaskRow(db, {
@@ -545,6 +598,36 @@ describe('restoreTaskRow', () => {
     db.close();
   });
 
+  it('carries scheduled_for through a restore, falling back for a pre-column snapshot', () => {
+    const db = freshDb();
+    const base: TaskRowSnapshot = {
+      id: 'restored-slot',
+      series_id: 'series-slot',
+      status: 'pending',
+      process_after: '2026-01-05T11:47:00.000Z',
+      scheduled_for: '2026-01-05T09:00:00.000Z',
+      recurrence: '0 9 * * *',
+      content: JSON.stringify({ prompt: 'daily brief' }),
+      platform_id: null,
+      channel_type: null,
+      thread_id: null,
+      kind: 'task',
+    };
+    restoreTaskRow(db, base);
+    expect(
+      db.prepare('SELECT process_after, scheduled_for FROM messages_in WHERE id = ?').get('restored-slot'),
+    ).toEqual({ process_after: '2026-01-05T11:47:00.000Z', scheduled_for: '2026-01-05T09:00:00.000Z' });
+
+    // A move_intent audit body written before the column existed carries no
+    // scheduled_for; the restore must still produce a usable row.
+    const { scheduled_for: _omitted, ...legacy } = base;
+    restoreTaskRow(db, { ...legacy, id: 'restored-legacy' });
+    expect(
+      db.prepare('SELECT process_after, scheduled_for FROM messages_in WHERE id = ?').get('restored-legacy'),
+    ).toEqual({ process_after: '2026-01-05T11:47:00.000Z', scheduled_for: '2026-01-05T11:47:00.000Z' });
+    db.close();
+  });
+
   it('restores a pending snapshot as pending', () => {
     const db = freshDb();
     const snapshot: TaskRowSnapshot = {
@@ -637,6 +720,27 @@ describe('cancelSeriesWithStrandClear', () => {
 });
 
 describe('insertRecurrence', () => {
+  it('stamps the successor occurrence with its OWN slot, not the previous run\'s', () => {
+    const db = freshDb();
+    const previous: RecurringMessage = {
+      id: 'task-day1',
+      kind: 'task',
+      content: JSON.stringify({ prompt: 'daily brief' }),
+      recurrence: '0 9 * * *',
+      process_after: '2026-01-04T09:00:00.000Z',
+      platform_id: null,
+      channel_type: null,
+      thread_id: null,
+      series_id: 'task-day1',
+    };
+    insertRecurrence(db, previous, 'task-day2', '2026-01-05T09:00:00.000Z');
+    expect(db.prepare('SELECT process_after, scheduled_for FROM messages_in WHERE id = ?').get('task-day2')).toEqual({
+      process_after: '2026-01-05T09:00:00.000Z',
+      scheduled_for: '2026-01-05T09:00:00.000Z',
+    });
+    db.close();
+  });
+
   it('copies series_id forward', () => {
     const db = freshDb();
     insertBasicTask(db, 'task-orig', '0 9 * * *');
