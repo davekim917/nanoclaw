@@ -1,14 +1,24 @@
 /**
  * Issue #300 (see src/mailbox-seam-unreachable-scripts.test.ts for the full
- * proof and its rationale). This half covers the one check that needs to
- * import a scripts/ module: scripts/verify-workgroup-memory-runtime.ts
- * imports `parseMigrationReport` (a value import) from
- * scripts/migrate-workgroup-memory.ts, which has a top-level
- * `reconcilePendingUpgradeContexts` call — but only inside `runCli()`,
- * itself gated behind `pathToFileURL(process.argv[1]) === import.meta.url`.
- * That's false for any importer other than migrate-workgroup-memory.ts
- * itself run directly, so loading the module for a value export never
- * executes runCli() or reaches the seam through it.
+ * proof and its rationale). This half covers the checks that need to import
+ * a scripts/ module:
+ *
+ *   - scripts/verify-workgroup-memory-runtime.ts imports
+ *     `parseMigrationReport` (a value import) from
+ *     scripts/migrate-workgroup-memory.ts, which has a top-level
+ *     `reconcilePendingUpgradeContexts` call — but only inside `runCli()`,
+ *     itself gated behind `pathToFileURL(process.argv[1]) === import.meta.url`.
+ *     That's false for any importer other than migrate-workgroup-memory.ts
+ *     itself run directly, so loading the module for a value export never
+ *     executes runCli() or reaches the seam through it.
+ *   - scripts/verify-workgroup-memory-runtime.ts itself has the same
+ *     `isMain` guard around its own `runCli()`, so a bare import of it is
+ *     equally safe — but that was never actually exercised here (only its
+ *     migrate-workgroup-memory.ts dependency was imported directly), so a
+ *     future top-level mailbox call or seam-reaching import added directly
+ *     to the verifier would have broken standalone execution while every
+ *     test in this file stayed green. Imported directly below to close that
+ *     gap.
  *
  * src/mailbox-seam-unreachable-scripts.test.ts's tsconfig rootDir is `src/`,
  * so it cannot import a scripts/ module — hence this separate file, which
@@ -57,6 +67,19 @@ describe('scripts/verify-workgroup-memory-runtime.ts — importing migrate-workg
     // anywhere in this module's transitive graph would throw
     // "No agent mailbox registered" instead of resolving.
     expect(typeof mod.parseMigrationReport).toBe('function');
+  });
+
+  it('the verifier module itself (verify-workgroup-memory-runtime.ts) is also safe to import bare', async () => {
+    const mod = await import('./verify-workgroup-memory-runtime.js');
+    // scripts/verify-workgroup-memory-runtime.ts has the same isMain guard
+    // around its own runCli() (`pathToFileURL(process.argv[1]) ===
+    // import.meta.url`), false for any importer other than the script run
+    // directly — so a bare import here never executes runCli() either. With
+    // the mailbox factory unregistered above, a top-level seam call
+    // anywhere in ITS transitive import graph (not just
+    // migrate-workgroup-memory.ts's) would throw "No agent mailbox
+    // registered" instead of resolving.
+    expect(typeof mod.verifyWorkgroupMemoryRuntime).toBe('function');
   });
 });
 

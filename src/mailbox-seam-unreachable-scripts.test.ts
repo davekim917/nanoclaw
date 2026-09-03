@@ -152,10 +152,37 @@ describe('scripts/verify-workgroup-memory-runtime.ts', () => {
     });
   });
 
+  // It is NOT eligible for the "no relative-import path to the seam at
+  // all" walk below (TARGETS) — it genuinely does reach
+  // src/session-manager.ts (a SEAM_ADJACENT_FILES entry), just through a
+  // non-seam binding. Adding it there would fail that walk's "zero path"
+  // assertion for a correct reason (the path exists) while asserting the
+  // wrong thing (the walk can't tell a non-seam binding from a seam one).
+  // The right proof for this shape — same one used above for
+  // isAdmissiblePreTurnTrigger, and for storage-manager.ts /
+  // worktree-cleanup.ts below — is pinning the exact import set so a
+  // future import drift re-triggers this review instead of silently
+  // widening reachability.
+  it('its only session-manager.js imports are isAdmissiblePreTurnTrigger, pinned so a future import here re-triggers this review', () => {
+    const src = fs.readFileSync(path.join(REPO_ROOT, 'scripts/verify-workgroup-memory-runtime.ts'), 'utf8');
+    const match = /import\s*\{([^}]*)\}\s*from\s*['"]\.\.\/src\/session-manager\.js['"]/.exec(src);
+    expect(
+      match,
+      'verify-workgroup-memory-runtime.ts must import from ../src/session-manager.js for this test to be meaningful',
+    ).not.toBeNull();
+    const names = match![1]
+      .split(',')
+      .map((n) => n.trim())
+      .filter(Boolean);
+    expect(names.sort()).toEqual(['isAdmissiblePreTurnTrigger'].sort());
+  });
+
   // The module-load side of this script — does importing
   // scripts/migrate-workgroup-memory.ts (for parseMigrationReport) run its
-  // CLI body — is covered in scripts/mailbox-seam-unreachable.test.ts. This
-  // file's tsconfig rootDir is src/, so it cannot import a scripts/ module.
+  // CLI body, and is the verifier module itself (verify-workgroup-memory-
+  // runtime.ts) safe to import bare — is covered in
+  // scripts/mailbox-seam-unreachable.test.ts. This file's tsconfig rootDir
+  // is src/, so it cannot import a scripts/ module.
 });
 
 describe('storage-manager.ts / storage-activity.ts contain no literal seam call', () => {
