@@ -48,8 +48,12 @@ registerDeliveryAction(
     // just read out of this session's own mailbox, so it exists; if it has
     // vanished, no container is left to read the response.
     // trigger=0: don't wake the agent — this is an inline response to a tool call.
-    const written = await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) =>
-      mailbox.insertMessage({
+    // The callback returns a sentinel, not the insert's own result:
+    // `insertMessage` resolves to `void`, so returning it would make a
+    // successful write indistinguishable from the helper's own `undefined`
+    // for a vanished mailbox.
+    const written = await withExistingMailboxSession(session.agent_group_id, session.id, async (mailbox) => {
+      await mailbox.insertMessage({
         id: `cli-resp-${requestId}`,
         kind: 'system',
         timestamp: new Date().toISOString(),
@@ -64,8 +68,9 @@ registerDeliveryAction(
         processAfter: null,
         recurrence: null,
         trigger: 0,
-      }),
-    );
+      });
+      return true;
+    });
 
     if (written === undefined) {
       log.warn('CLI response dropped — session mailbox is gone', { requestId, sessionId: session.id });
