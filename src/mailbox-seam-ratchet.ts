@@ -34,12 +34,24 @@ export const RATCHET_EXCLUDED_DIRS: readonly string[] = [
 ];
 
 /**
- * Files exempt from the scan by exact path — this module itself. It names
- * pattern (d)'s handle identifiers as string literals to search for them,
- * which otherwise self-matches once this file lives under src/ (rootDir
- * requires that — see the module doc comment above).
+ * Files exempt from the scan by exact path.
+ *
+ *  - src/mailbox-seam-ratchet.ts (this module): names pattern (d)'s handle
+ *    identifiers as string literals to search for them, which otherwise
+ *    self-matches once this file lives under src/ (rootDir requires that —
+ *    see the module doc comment above).
+ *  - src/dashboard-pusher.ts: NOT present in the base tree — it only exists
+ *    after a user runs the separate /add-dashboard skill, which copies
+ *    .claude/skills/add-dashboard/resources/dashboard-pusher.ts here
+ *    verbatim. That resource does raw session-DB reads for the dashboard's
+ *    own message-volume charts; migrating it onto NanoclawAgentMailbox isn't
+ *    buildable in this PR — the seam doesn't exist yet (host: PR 2, runner:
+ *    R1). Tracked as a real, deliberate exclusion, not an oversight: this
+ *    ratchet covers the mailbox-seam migration's own surface, not every
+ *    skill-installed resource with its own install lifecycle and test file
+ *    (dashboard-pusher.test.ts, alongside it in the skill resources dir).
  */
-const RATCHET_EXCLUDED_FILES: readonly string[] = ['src/mailbox-seam-ratchet.ts'];
+const RATCHET_EXCLUDED_FILES: readonly string[] = ['src/mailbox-seam-ratchet.ts', 'src/dashboard-pusher.ts'];
 
 const RAW_OPENER_NAMES = [
   'openInboundDb',
