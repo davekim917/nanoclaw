@@ -330,7 +330,22 @@ export async function requestThreadClose(
 
   // The fan-out is FROZEN here: an agent that joins the thread after this
   // moment was not part of what the operator closed.
-  getDb()
+  //
+  // This is an atomic RESERVATION, not a bare upsert, because the
+  // `thread_closures` check above is no longer in the same synchronous step as
+  // this write. `readSessionProposal` became awaiting when it moved behind the
+  // mailbox seam (PR 4; pre-seam it was a synchronous open), so two
+  // sufficiently-confirmed requests for one thread — a double-click, or two
+  // admins — can both pass that check and both yield before either writes. An
+  // unconditional DO UPDATE then let the second silently replace the first's
+  // actor, reason, timestamp and confirmation window, answer 202, and fan out
+  // a second wrap-up.
+  //
+  // `WHERE thread_closures.state = 'closed'` on the DO UPDATE makes the row
+  // itself the lock: a LIVE closure is never overwritten, a finished one still
+  // re-opens (the case the upsert exists for), and zero rows changed means
+  // somebody else reserved it first.
+  const reserved = getDb()
     .prepare(
       `INSERT INTO thread_closures
          (thread_id, requested_by, requested_at, reason, agent_proposed, session_ids, state, forced, closed_at)
@@ -339,9 +354,25 @@ export async function requestThreadClose(
          requested_by = excluded.requested_by, requested_at = excluded.requested_at,
          reason = excluded.reason, agent_proposed = excluded.agent_proposed,
          session_ids = excluded.session_ids, state = 'awaiting_confirmation',
-         forced = 0, closed_at = NULL`,
+         forced = 0, closed_at = NULL
+       WHERE thread_closures.state = 'closed'`,
     )
     .run(threadId, ctx.user.id, requestedAt, reason, agentProposed ? 1 : 0, JSON.stringify(visible.map((s) => s.id)));
+
+  if (reserved.changes === 0) {
+    // Lost the race. The same refusal the early check gives, reported from the
+    // row the winner just wrote — and, the point of returning here, the loser
+    // never reaches the fan-out below, so one close request produces one
+    // wrap-up.
+    const winner = getDb().prepare('SELECT requested_at FROM thread_closures WHERE thread_id = ?').get(threadId) as
+      | { requested_at: string }
+      | undefined;
+    log.info('thread-close: lost the reservation race', { threadId, userId: ctx.user.id });
+    return {
+      status: 409,
+      body: { error: 'close_already_in_progress', thread_id: threadId, requested_at: winner?.requested_at ?? null },
+    };
+  }
 
   let delivered = 0;
   for (const s of visible) if (await writeCloseWrapUp(s, threadId, text, requestedAt)) delivered++;
