@@ -51,6 +51,8 @@ import {
   inboundDbPath,
   outboundDbPath,
   sessionClaudeProjectsDir,
+  sessionContextPath,
+  sessionContextPathFor,
   sessionDir,
   sessionMessageExists,
   writeOutboundDirect,
@@ -2148,5 +2150,15 @@ describe('writeSessionMessage does not race an in-flight session archival', () =
     expect(inboundIds()).toEqual(['ordinary']);
     // The lease leaves nothing behind for the next reclaim to trip over.
     expect(fs.existsSync(path.join(sessionDir(AG, SESS), '.nanoclaw-storage-active'))).toBe(false);
+  });
+});
+
+describe('runner session context path', () => {
+  it('the DATA_DIR form and the session-directory form name the same file', () => {
+    // The storage reclaim walks an injected sessions root and can only use the
+    // directory-derived form. If these two ever disagree, the reclaim silently
+    // stops removing context files and each reclaimed session leaks one.
+    expect(sessionContextPathFor(sessionDir('ag-ctx', 'sess-ctx'))).toBe(sessionContextPath('ag-ctx', 'sess-ctx'));
+    expect(sessionContextPath('ag-ctx', 'sess-ctx').endsWith('/ag-ctx/.context/sess-ctx.json')).toBe(true);
   });
 });
