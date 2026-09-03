@@ -533,7 +533,16 @@ function chatLimitArg(args: Record<string, unknown>): number | undefined {
 function updateTaskCommand(args: Record<string, unknown>, ctx: CallerContext) {
   const id = taskId(args);
   const update: TaskUpdate = {};
-  if (typeof args.prompt === 'string') update.prompt = args.prompt;
+  if (typeof args.prompt === 'string') {
+    // `create` refuses an empty prompt (`--prompt is required`); `update` must
+    // too. A shell substitution over a missing file (`--prompt "$(cat gone.md)"`)
+    // otherwise blanks a live series in place, and every later occurrence wakes
+    // the agent with no instruction at all — a recurring series quietly turns
+    // into a recurring no-op that still burns a container spawn. Whitespace is
+    // treated as empty for the same reason `create` does.
+    if (!args.prompt.trim()) throw new Error('--prompt must not be empty; omit it to keep the current prompt');
+    update.prompt = args.prompt;
+  }
   if (chatLimitArg(args) !== undefined) update.chatLimit = chatLimitArg(args);
   if (args.quiet_status !== undefined) update.quietStatus = bool(args.quiet_status);
   if (args.process_after !== undefined) update.processAfter = parseProcessAfter(args.process_after);
