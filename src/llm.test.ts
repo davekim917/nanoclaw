@@ -6,7 +6,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 // tests never touch the real on-disk `.env` (which, on a live install, holds
 // real OAuth tokens) — credential slots for these tests come exclusively
 // from process.env, set explicitly per test below.
-vi.mock('./env.js', () => ({
+vi.mock('./env.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./env.js')>()),
   readEnvFileMatching: vi.fn(() => ({})),
 }));
 

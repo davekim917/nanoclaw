@@ -8,7 +8,35 @@ import { staticHandler, indexHtmlHandler, STATIC_ROOT } from './static.js';
 
 import fs from 'fs';
 
-vi.mock('fs');
+// Partial mock (not a full `vi.mock('fs')` automock): the mailbox seam's
+// global `beforeEach` (src/test-setup.ts) imports `mailbox/compose.js`,
+// which pulls in `config.ts` → `env.ts`'s `readEnvFile()` at module load —
+// that call hits `fs.readFileSync` before any test in this file gets to set
+// its own mock return value. A full automock makes an unconfigured
+// `readFileSync` return `undefined` instead of throwing, so `readEnvFile`'s
+// `content.split('\n')` blows up. Spread the real `fs` module and override
+// only the two functions this file actually needs to control, with
+// `readFileSync` defaulting to an ENOENT-shaped throw — matching what real
+// `fs` does for a missing `.env` file, which `env.ts`'s catch already
+// handles. Every test below still fully controls both via
+// mockReturnValue/mockImplementation before asserting.
+vi.mock('fs', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('fs')>();
+  const statSync = vi.fn<typeof fs.statSync>();
+  const readFileSync = vi.fn<typeof fs.readFileSync>(() => {
+    throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' });
+  });
+  return {
+    ...actual,
+    statSync,
+    readFileSync,
+    default: {
+      ...actual,
+      statSync,
+      readFileSync,
+    },
+  };
+});
 
 const mockStatSync = vi.mocked(fs.statSync);
 const mockReadFileSync = vi.mocked(fs.readFileSync);
