@@ -124,14 +124,34 @@ function httpStatusOf(err: unknown): number | undefined {
 }
 
 /**
+ * 4xx statuses that describe a moment rather than a misconfiguration:
+ * 408 Request Timeout, 425 Too Early, 429 Too Many Requests. A cloud gateway
+ * rate-limiting one boot probe must not take the host down — these ride the
+ * same retry path as a transport failure. Every other 4xx (400/401/403/404 and
+ * friends) is a credential or wiring fault that no amount of retrying fixes.
+ *
+ * `Retry-After` is deliberately not honored: the SDK's `OneCLIRequestError`
+ * carries only `url` and `statusCode`, and reading the header would mean
+ * bypassing `getContainerConfig` — the very call this probe exists to make.
+ */
+const RETRYABLE_4XX = new Set([408, 425, 429]);
+
+function isRetryableStatus(status: number | undefined): boolean {
+  if (status === undefined) return true; // transport failure — no response at all
+  if (status >= 500) return true;
+  return RETRYABLE_4XX.has(status);
+}
+
+/**
  * Run the probe. Pure of logging and exiting so tests can assert the decision
  * separately from its consequences.
  *
  * Retry policy follows what the failure can mean:
- *   - No HTTP status (DNS, connection refused, proxy interception, timeout) or
- *     a 5xx: the gateway may still be coming up. Retry.
- *   - A 4xx: a deterministic misconfiguration (bad API key, unknown agent).
- *     Retrying cannot heal it, so fail immediately.
+ *   - No HTTP status (DNS, connection refused, proxy interception, timeout),
+ *     a 5xx, or a momentary 4xx (408/425/429 — see RETRYABLE_4XX): the gateway
+ *     may still be coming up or be briefly rate-limiting. Retry.
+ *   - Any other 4xx: a deterministic misconfiguration (bad API key, unknown
+ *     agent). Retrying cannot heal it, so fail immediately.
  *   - The one exception is a 404 for a NAMED agent, which means the vault has
  *     no such agent yet rather than that the control API is unreachable. Verified
  *     against a live gateway: an unknown `?agent=` returns 404 while the same
@@ -174,7 +194,7 @@ export async function probeOnecliControlApi(deps: PreflightDeps): Promise<Prefli
         }
       }
 
-      if (lastHttpStatus !== undefined && lastHttpStatus >= 400 && lastHttpStatus < 500) break;
+      if (!isRetryableStatus(lastHttpStatus)) break;
       if (attempt < deps.attempts) await deps.sleep(deps.retryDelayMs);
     }
   }

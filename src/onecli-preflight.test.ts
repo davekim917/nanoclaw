@@ -5,6 +5,8 @@
  * exit the process, a succeeding one must let startup continue and emit the
  * greppable health line.
  */
+import fs from 'fs';
+import path from 'path';
 import { describe, expect, it, vi } from 'vitest';
 
 import {
@@ -37,6 +39,28 @@ function deps(overrides: Partial<PreflightDeps> = {}): PreflightDeps & { exitCod
     ...overrides,
   };
 }
+
+describe('boot wiring', () => {
+  /**
+   * The gate has to close before anything can accept work. Past the dashboard
+   * and the channel adapters an inbound message reaches routeInbound() and can
+   * wake a container mid-probe, which both contends with the probe and means
+   * the exit would kill a host that has already taken work on.
+   */
+  it('runs the preflight before the dashboard and the channel adapters', () => {
+    const main = fs.readFileSync(path.join(import.meta.dirname, 'main.ts'), 'utf-8');
+
+    const preflight = main.indexOf('await runOnecliBootPreflight(');
+    const dashboard = main.indexOf('startDashboard()');
+    const adapters = main.indexOf('await initChannelAdapters(');
+
+    expect(preflight).toBeGreaterThan(-1);
+    expect(dashboard).toBeGreaterThan(-1);
+    expect(adapters).toBeGreaterThan(-1);
+    expect(preflight).toBeLessThan(dashboard);
+    expect(preflight).toBeLessThan(adapters);
+  });
+});
 
 describe('pickProbeAgent', () => {
   it('picks the oldest agent group, breaking ties by id', () => {
@@ -133,16 +157,39 @@ describe('probeOnecliControlApi', () => {
     expect(result).toEqual({ status: 'failed', agent: 'ag-probe', attempts: 3, httpStatus: undefined, err });
   });
 
-  it('retries a 5xx but fails a 4xx immediately', async () => {
+  it('retries a 5xx but fails a configuration 4xx immediately', async () => {
     const serverErrorCalls = vi.fn(async () => Promise.reject(requestError(503)));
     const serverError = await probeOnecliControlApi(deps({ getContainerConfig: serverErrorCalls }));
     expect(serverError).toMatchObject({ status: 'failed', attempts: 3, httpStatus: 503 });
     expect(serverErrorCalls).toHaveBeenCalledTimes(3);
 
-    const authErrorCalls = vi.fn(async () => Promise.reject(requestError(401)));
-    const authError = await probeOnecliControlApi(deps({ getContainerConfig: authErrorCalls }));
-    expect(authError).toMatchObject({ status: 'failed', attempts: 1, httpStatus: 401 });
-    expect(authErrorCalls).toHaveBeenCalledTimes(1);
+    for (const status of [400, 401, 403]) {
+      const calls = vi.fn(async () => Promise.reject(requestError(status)));
+      const result = await probeOnecliControlApi(deps({ getContainerConfig: calls }));
+      expect(result).toMatchObject({ status: 'failed', attempts: 1, httpStatus: status });
+      expect(calls).toHaveBeenCalledTimes(1);
+    }
+  });
+
+  it('retries a momentary 4xx instead of taking the host down', async () => {
+    for (const status of [408, 425, 429]) {
+      let attempt = 0;
+      const result = await probeOnecliControlApi(
+        deps({
+          getContainerConfig: async () => {
+            attempt += 1;
+            if (attempt < 3) throw requestError(status);
+            return {};
+          },
+        }),
+      );
+      expect(result).toMatchObject({ status: 'ok', attempts: 3 });
+    }
+
+    const rateLimited = vi.fn(async () => Promise.reject(requestError(429)));
+    const exhausted = await probeOnecliControlApi(deps({ getContainerConfig: rateLimited }));
+    expect(exhausted).toMatchObject({ status: 'failed', attempts: 3, httpStatus: 429 });
+    expect(rateLimited).toHaveBeenCalledTimes(3);
   });
 
   it('treats a 404 for an unregistered probe agent as reachable when the default agent answers', async () => {

@@ -271,6 +271,19 @@ export async function main(): Promise<void> {
 
   log.info('Central DB ready', { path: dbPath });
 
+  // 1-bis. OneCLI control-API preflight — the credential call every spawn
+  // makes, once, before ANY ingress opens. A control API this process cannot
+  // reach means every spawn is refused at WARN and the fleet goes silently
+  // deaf (2026-09-02: 11 minutes, 0/8 spawns, a clean-looking boot).
+  //
+  // Ahead of the dashboard and the channel adapters deliberately: past that
+  // point an inbound message can reach routeInbound() and wake a container
+  // while the probe is still retrying, which both contends with the probe and
+  // means the exit below would kill a host that has already accepted work.
+  // Failing here logs ERROR and exits non-zero BEFORE markDeployBootHealthy(),
+  // so the unit-failure alert fires and the deploy stays rollback-eligible.
+  await runOnecliBootPreflight();
+
   // Host-computed upstreamPin/heldByMerge snapshot for the container-updates
   // audit. Containers can't derive this themselves (/workspace/project has no
   // `.git`), so the host computes it here where git works and refreshes it
@@ -459,14 +472,6 @@ export async function main(): Promise<void> {
   // also carries our support-thread surfaces (deleteMessage/postParent/
   // createThread). See createChannelDeliveryAdapter in channel-registry.ts.
   setDeliveryAdapter(createChannelDeliveryAdapter());
-
-  // 4a. OneCLI control-API preflight — the credential call every spawn makes,
-  // once, before this host starts accepting work. A control API this process
-  // cannot reach means every spawn is refused at WARN and the fleet goes
-  // silently deaf (2026-09-02: 11 minutes, 0/8 spawns, a clean-looking boot).
-  // Failing here logs ERROR and exits non-zero BEFORE markDeployBootHealthy(),
-  // so the unit-failure alert fires and the deploy stays rollback-eligible.
-  await runOnecliBootPreflight();
 
   // Start recovery only after permissions and delivery are fully wired. A
   // replay can immediately exercise either surface (sibling bots, unknown
