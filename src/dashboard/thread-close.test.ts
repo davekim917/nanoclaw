@@ -469,6 +469,45 @@ describe('the close sequence order', () => {
     });
   });
 
+  /**
+   * The never-woken shape: inbound.db exists, outbound.db never did, because
+   * outbound.db is the CONTAINER's file and no container ever ran here.
+   * `exists()` answers on inbound.db alone, so the force-clear's session opens
+   * normally and then reaches a writable outbound op with no file under it.
+   *
+   * There is provably no continuation to clear on such a session, so the close
+   * must proceed. Before the `hasOutbound` guard the opener threw,
+   * `ensureContinuationCleared` read that as not-cleared, and the closure sat
+   * in `finalizing` on every later tick — a thread an operator confirmed twice
+   * that never closes.
+   */
+  it('closes a never-woken session that has no outbound.db, without authoring one', async () => {
+    startClose();
+    // Inbound only — deliberately NOT materializeSession, which makes both.
+    // The scratch root is shared across this file's cases, so clear the
+    // directory first: an earlier case materialized the same session id.
+    fs.rmSync(path.dirname(dbPathFor('ag1', 's1', 'inbound.db')), { recursive: true, force: true });
+    fs.mkdirSync(path.dirname(dbPathFor('ag1', 's1', 'inbound.db')), { recursive: true });
+    ensureSchema(dbPathFor('ag1', 's1', 'inbound.db'), 'inbound');
+    expect(fs.existsSync(dbPathFor('ag1', 's1', 'outbound.db'))).toBe(false);
+
+    // The production force-clear, not an injected one.
+    await advanceThreadClosures({
+      now: NOW,
+      isContainerRunning: () => false,
+      readProposal: () => null,
+    });
+
+    // It closed, and the host did not author the container's file to do it.
+    expect(getDb().prepare('SELECT state FROM thread_closures WHERE thread_id = ?').get(THREAD)).toMatchObject({
+      state: 'closed',
+    });
+    expect(getDb().prepare('SELECT archived_at FROM sessions WHERE id = ?').get('s1')).not.toMatchObject({
+      archived_at: null,
+    });
+    expect(fs.existsSync(dbPathFor('ag1', 's1', 'outbound.db'))).toBe(false);
+  });
+
   it('is idempotent — a second tick over an already-closed thread does nothing', async () => {
     startClose();
     await advanceThreadClosures(recordingDeps().deps);
