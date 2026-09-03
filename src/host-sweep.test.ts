@@ -44,6 +44,8 @@ import {
   _prepareDueWakeForTesting,
   _resetStuckProcessingRowsForTesting,
   _enforceRunningContainerSlaForTesting,
+  _resetSweepRegistryForTesting,
+  registerSweepKillFollowUp,
   _incrementStoppedContinuationAttemptForTesting,
   _sweepSessionForTesting,
   _sweepTaskWatchdogForTesting,
@@ -2959,6 +2961,101 @@ describe('sweepSession on a session with no mailbox', () => {
 
     expect(mockKillContainer).toHaveBeenCalledWith('sess-sla-claim', 'claim-stuck');
     expect(f.claims()).toBe(before);
+    closeDb();
+  });
+
+  // Codex round 9, on the seam-2 duty registry. Upstream guards the post-kill
+  // window with ONE `writeOutboundWhenStopped` around all three follow-ups,
+  // which is sound there because they are a single synchronous block. PR 2
+  // runs them as SEPARATE awaited duties, so a single check authorizes writes
+  // that happen two yields later: S15 writes the notice, the loop awaits, a
+  // replacement wake takes outbound.db, and S17 then deletes the FRESH
+  // runner's processing claim (duplicate execution) while S10 queues a stale
+  // accountability wake against its recovery cap. Each follow-up therefore
+  // guards its own write. The first half of this case is the control that
+  // proves the second half is not vacuous.
+  it('a wake that takes ownership between post-kill follow-ups stops the later follow-ups from writing', async () => {
+    const db = initTestDb();
+    runMigrations(db);
+    db.prepare(`INSERT INTO agent_groups (id, name, folder, created_at) VALUES ('ag-sla', 'sla', 'sla', ?)`).run(
+      new Date().toISOString(),
+    );
+    mockReadContainerConfig.mockReset().mockReturnValue({ provider: 'claude' });
+
+    const sessionDir = (session: Session): string =>
+      path.join(testDataDir.dir, 'v2-sessions', session.agent_group_id, session.id);
+    // A live continuation is what makes S10 (the accountability wake) write at
+    // all — without one `decideCeilingFollowUp` returns 'none' and the S10 half
+    // of the assertion would pass for the wrong reason.
+    const plantContinuation = (session: Session): void => {
+      const out = new Database(path.join(sessionDir(session), 'outbound.db'));
+      out
+        .prepare(
+          `INSERT INTO session_state (key, value, updated_at) VALUES ('work_continuation', ?, ?)
+           ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`,
+        )
+        .run(
+          JSON.stringify({
+            id: 'cont-followups',
+            task: 'finish the migration',
+            phase: 'running',
+            chain: 0,
+            runner_id: 'runner-old',
+            resume_attempts: 0,
+            recovery_episode: 0,
+          }),
+          new Date().toISOString(),
+        );
+      out.close();
+    };
+    const respawnWakes = (session: Session): number => {
+      const inbound = new Database(path.join(sessionDir(session), 'inbound.db'));
+      const n = (
+        inbound.prepare("SELECT COUNT(*) AS c FROM messages_in WHERE id LIKE 'ceiling-respawn-%'").get() as {
+          c: number;
+        }
+      ).c;
+      inbound.close();
+      return n;
+    };
+
+    // Control: ownership never flips, so every follow-up writes.
+    mockKillContainer.mockReset();
+    mockIsContainerRunning.mockReset().mockReturnValue(false);
+    const control = slaFixture('sess-followups-control', ABSOLUTE_CEILING_MS + 60_000, 10_000);
+    plantContinuation(control.session);
+    await _enforceRunningContainerSlaForTesting(control.run, control.session, 'ag-sla', 'sla');
+
+    expect(mockKillContainer).toHaveBeenCalledWith('sess-followups-control', 'absolute-ceiling');
+    expect(control.claims()).toBe(0); // S17 cleared the orphan claim
+    expect(respawnWakes(control.session)).toBe(1); // S10 queued the accountability wake
+
+    // Guarded: a wake takes the session between S15 (order 10) and S17 (order
+    // 20) — registered as a follow-up at order 15, which is exactly the yield
+    // boundary the loop's `await` creates.
+    mockKillContainer.mockReset();
+    mockIsContainerRunning.mockReset().mockReturnValue(false);
+    registerSweepKillFollowUp({
+      name: 'test:wake-between-post-kill-follow-ups',
+      order: 15,
+      run: () => {
+        mockIsContainerRunning.mockReturnValue(true);
+      },
+    });
+    try {
+      const guarded = slaFixture('sess-followups-guarded', ABSOLUTE_CEILING_MS + 60_000, 10_000);
+      plantContinuation(guarded.session);
+      const claimsBefore = guarded.claims();
+      await _enforceRunningContainerSlaForTesting(guarded.run, guarded.session, 'ag-sla', 'sla');
+
+      expect(mockKillContainer).toHaveBeenCalledWith('sess-followups-guarded', 'absolute-ceiling');
+      // Both later follow-ups skipped: the fresh runner keeps its claim and no
+      // stale accountability wake was queued against its recovery cap.
+      expect(guarded.claims()).toBe(claimsBefore);
+      expect(respawnWakes(guarded.session)).toBe(0);
+    } finally {
+      _resetSweepRegistryForTesting();
+    }
     closeDb();
   });
 
