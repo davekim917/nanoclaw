@@ -15,6 +15,9 @@
  *  - An expired (>24h) stamp declines again
  *  - Policy flips in both directions across the shared UNIQUE key
  *  - A group messaging group degrades to strict (no public decline)
+ *  - An adapter that reports no DM/group context degrades to strict too
+ *  - The FYI goes to an owner, not to the first admin pickApprover would card
+ *  - The FYI tells the truth when the decline itself failed to deliver
  *  - Caller-supplied copy + conversation-scoped dedupe overrides
  */
 import fs from 'fs';
@@ -155,6 +158,9 @@ function strangerDm(text: string) {
     channelType: 'telegram',
     platformId: 'dm-stranger',
     threadId: null,
+    // Positive DM evidence — the flow requires it, because is_group = 0 on
+    // its own can mean "the adapter didn't say".
+    isDM: true,
     message: {
       id: `stranger-${Math.random().toString(36).slice(2, 8)}`,
       kind: 'chat' as const,
@@ -356,6 +362,8 @@ describe('unknown-sender decline_notify flow', () => {
     });
 
     const { routeInbound } = await import('../../router.js');
+    // isDM stays true on the event: the row is the authority for a group, so
+    // this pins the row half of the check independently of the evidence half.
     await routeInbound({ ...strangerDm('hi all'), platformId: 'group-team' });
     await settle();
 
@@ -369,6 +377,77 @@ describe('unknown-sender decline_notify flow', () => {
     expect(drop!.user_id).toBe('tg:stranger');
     const stamps = (await db()).prepare('SELECT COUNT(*) AS c FROM pending_sender_approvals').get() as { c: number };
     expect(stamps.c).toBe(0);
+  });
+
+  it('no DM/group evidence from the adapter: silent drop, no decline, no stamp', async () => {
+    const { routeInbound } = await import('../../router.js');
+    // An older chat-sdk plugin build: adapterIsDM returns undefined, so the
+    // event carries neither isDM nor isGroup and the row's is_group = 0 is
+    // the router's default rather than a fact.
+    const { isDM: _dropped, ...noEvidence } = strangerDm('hi');
+    await routeInbound(noEvidence);
+    await settle();
+
+    expect(deliverMock).not.toHaveBeenCalled();
+    const stamps = (await db()).prepare('SELECT COUNT(*) AS c FROM pending_sender_approvals').get() as { c: number };
+    expect(stamps.c).toBe(0);
+    // Still dropped and accounted for.
+    const drop = (await db())
+      .prepare('SELECT user_id FROM unregistered_senders WHERE platform_id = ?')
+      .get('dm-stranger') as { user_id: string } | undefined;
+    expect(drop).toBeDefined();
+  });
+
+  it('sends the FYI to the owner, not to the admin the approval card would go to', async () => {
+    // A scoped admin of ag-1 with a reachable DM. pickApprover puts this
+    // user FIRST (scoped admins → global admins → owners), so a card would
+    // land here; the personal FYI must not.
+    upsertUser({ id: 'telegram:admin', kind: 'telegram', display_name: 'Admin', created_at: now() });
+    grantRole({
+      user_id: 'telegram:admin',
+      role: 'admin',
+      agent_group_id: 'ag-1',
+      granted_by: 'telegram:owner',
+      granted_at: now(),
+    });
+    createMessagingGroup({
+      id: 'mg-dm-admin',
+      channel_type: 'telegram',
+      instance: 'telegram-owner-bot',
+      platform_id: 'dm-admin',
+      name: 'Admin DM',
+      is_group: 0,
+      unknown_sender_policy: 'public',
+      created_at: now(),
+    });
+    (await db())
+      .prepare(
+        `INSERT INTO user_dms (user_id, channel_type, messaging_group_id, resolved_at)
+         VALUES (?, ?, ?, ?)`,
+      )
+      .run('telegram:admin', 'telegram', 'mg-dm-admin', now());
+
+    // Sanity: the card audience really does put the admin first.
+    const { pickApprover } = await import('../approvals/primitive.js');
+    expect(pickApprover('ag-1')[0]).toBe('telegram:admin');
+
+    const { routeInbound } = await import('../../router.js');
+    await routeInbound(strangerDm('hello'));
+    await waitForDeliveries(2);
+
+    expect(deliverMock.mock.calls[1][1]).toBe('dm-owner');
+  });
+
+  it('tells the owner the truth when the decline itself failed to deliver', async () => {
+    deliverMock.mockRejectedValueOnce(new Error('telegram 429'));
+
+    const { routeInbound } = await import('../../router.js');
+    await routeInbound(strangerDm('hello'));
+    await waitForDeliveries(2);
+
+    const fyi = JSON.parse(deliverMock.mock.calls[1][4] as string);
+    expect(fyi.text).toContain("couldn't deliver the decline");
+    expect(fyi.text).not.toContain('I sent a polite decline');
   });
 
   it('honors caller-supplied copy and conversation-scoped dedupe', async () => {

@@ -185,13 +185,20 @@ async function handleUnknownSender(
   // guard (./guard.ts) is the decision seam, so a future policy change that
   // makes decline_notify hold must card, not decline behind the guard's back.
   if (decision.effect === 'deny' && isDeclineNotify) {
-    // The decline copy assumes a 1:1 DM surface. The policy is settable on
-    // groups (ncl / setup register / auto-wire env), where delivering it
-    // would post the decline publicly into the channel — treat groups as
-    // strict: the drop above stands, nothing is sent.
-    if (mg.is_group === 1) {
-      log.warn('decline_notify on a group messaging group — treated as strict (no public decline)', {
+    // The decline copy assumes a 1:1 DM surface, so this needs POSITIVE
+    // evidence of one — `mg.is_group !== 1` is not that. An adapter that
+    // reports neither isDM nor isGroup (older chat-sdk plugin builds;
+    // `adapterIsDM` returns undefined) gets is_group = 0 from the router's
+    // auto-create default, so 0 can mean "uncertain", not "confirmed DM"
+    // — the same reason the user_dms cache requires `event.isDM === true`
+    // (src/router.ts, the 2a branch). Without the evidence the drop above
+    // stands and nothing is sent: silence beats posting "I'm <owner>'s
+    // personal agent" into a channel.
+    const confirmedDm = mg.is_group !== 1 && (event.isDM === true || event.message.isGroup === false);
+    if (!confirmedDm) {
+      log.warn('decline_notify skipped — no confirmed 1:1 DM context (no public decline)', {
         messagingGroupId: mg.id,
+        isGroupRow: mg.is_group,
       });
       return false;
     }

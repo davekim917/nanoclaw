@@ -48,7 +48,7 @@ import {
   getInFlightSenderApproval,
   upsertDeclineStamp,
 } from './db/pending-sender-approvals.js';
-import { getOwners } from './db/user-roles.js';
+import { getAdminsOfAgentGroup, getGlobalAdmins, getOwners } from './db/user-roles.js';
 import { getUser } from './db/users.js';
 
 const APPROVAL_OPTIONS: RawOption[] = [
@@ -215,6 +215,35 @@ export const DECLINE_NOTIFY_DEDUPE_MS = 24 * 60 * 60 * 1000;
  *  group (a 1:1 DM) still keys the pair, so dedupe holds. */
 const UNKNOWN_SENDER_KEY = 'unknown';
 
+/**
+ * OWNERS-FIRST candidate order for the FYI — the reverse of pickApprover.
+ *
+ * The FYI is a personal notice ("someone DMed YOUR agent"), not a decision
+ * anyone can act on, so routing it to a group admin tells the wrong person.
+ * pickApprover deliberately puts scoped admins first because a card needs
+ * whoever can decide it; this notification needs whoever owns the agent.
+ * Same reasoning, and the same live failure, as the escalation module's
+ * escalationApprovers (src/modules/escalation/index.ts): the card landed in
+ * a teammate's DM while the owner saw nothing. Admins stay on as
+ * reachability fallback.
+ */
+function fyiRecipients(agentGroupId: string | null): string[] {
+  const ordered: string[] = [];
+  const seen = new Set<string>();
+  const add = (id: string): void => {
+    if (!seen.has(id)) {
+      seen.add(id);
+      ordered.push(id);
+    }
+  };
+  for (const r of getOwners()) add(r.user_id);
+  for (const r of getGlobalAdmins()) add(r.user_id);
+  if (agentGroupId) {
+    for (const r of getAdminsOfAgentGroup(agentGroupId)) add(r.user_id);
+  }
+  return ordered;
+}
+
 /** First owner with a display_name, for the decline copy. */
 function ownerDisplayName(): string | null {
   for (const owner of getOwners()) {
@@ -296,6 +325,7 @@ export async function declineAndNotify(input: DeclineAndNotifyInput): Promise<vo
   // as itself.
   const owner = ownerDisplayName();
   const declineText = input.declineText ?? `I'm ${owner ?? 'my owner'}'s personal agent — I can't help you directly.`;
+  let declined = true;
   try {
     await adapter.deliver(
       event.channelType,
@@ -307,15 +337,16 @@ export async function declineAndNotify(input: DeclineAndNotifyInput): Promise<vo
       originMg?.instance ?? event.instance,
     );
   } catch (err) {
+    declined = false;
     log.warn('decline_notify: decline delivery failed', { messagingGroupId, err });
   }
 
-  // (b) Owner FYI — informational one-liner through the same approver-DM
-  // resolution the card flow uses, including its same-channel-type
-  // restriction: the FYI names a sender identity originating in THIS
-  // workspace, so it must not fall back to a different surface where the
-  // same owner happens to be registered (cross-tenant audit 2026-05-03).
-  const approvers = pickApprover(agentGroupId);
+  // (b) Owner FYI — owners first (see fyiRecipients), delivered through the
+  // card flow's same-channel-type restriction: the FYI names a sender
+  // identity originating in THIS workspace, so it must not fall back to a
+  // different surface where the same owner happens to be registered
+  // (cross-tenant audit 2026-05-03).
+  const approvers = fyiRecipients(agentGroupId);
   if (approvers.length === 0) {
     log.warn('decline_notify FYI skipped — no owner or admin configured', { messagingGroupId, senderIdentity });
     return;
@@ -332,9 +363,15 @@ export async function declineAndNotify(input: DeclineAndNotifyInput): Promise<vo
   const senderDisplay = senderName && senderName.length > 0 ? senderName : (senderIdentity ?? 'An unknown sender');
   const who =
     senderIdentity && senderDisplay !== senderIdentity ? `${senderDisplay} (${senderIdentity})` : senderDisplay;
+  // The FYI must not claim a decline that a platform error swallowed —
+  // otherwise a transient failure leaves the stranger on silence while the
+  // owner believes they were answered.
+  const outcome = declined
+    ? 'I sent a polite decline'
+    : "I couldn't deliver the decline, so they've had no reply (see the host log)";
   const fyiText =
     input.fyiText ??
-    `FYI: ${who} DMed your agent on ${event.channelType} — I sent a polite decline. Allow them any time with \`ncl members add\`.`;
+    `FYI: ${who} DMed your agent on ${event.channelType} — ${outcome}. Allow them any time with \`ncl members add\`.`;
   try {
     await adapter.deliver(
       target.messagingGroup.channel_type,
