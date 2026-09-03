@@ -169,7 +169,7 @@ import { log } from '../../log.js';
 import './index.js';
 
 describe('the child_process tripwire bites when a seam mock is removed', () => {
-  it('throws and records the attempted spawn', () => {
+  it('throws and records the attempted spawn', async () => {
     const record: string[] = [];
     const tripwire = childProcessTripwire(record);
     expect(() => tripwire.execSync!('git pull')).toThrow(/real process spawn attempted/);
@@ -193,7 +193,7 @@ describe('registered scheduled-move-recovery / audit-body-prune duties', () => {
     return duty;
   }
 
-  it('T11/T12 are registered on tick:housekeeping at order 50/60', () => {
+  it('T11/T12 are registered on tick:housekeeping at order 50/60', async () => {
     const t11 = getDuty(SWEEP_DUTY_INVENTORY.T11);
     const t12 = getDuty(SWEEP_DUTY_INVENTORY.T12);
     expect(t11.phase).toBe('tick:housekeeping');
@@ -282,15 +282,25 @@ describe('recoverMoveIntents (D3) + pruneAuditBodies (D4)', () => {
   const NOW = Date.parse('2026-06-13T12:00:00Z');
   const SWEEP_MS = 60_000;
 
+  let savedDataDir: string;
+
   beforeEach(async () => {
     ({ recoverMoveIntents, pruneAuditBodies } = await import('./index.js'));
     ({ migration043 } = await import('../../db/migrations/043-scheduled-audit.js'));
     ({ ensureSchema } = await import('../mailbox/schema.js'));
     ({ openInboundDb } = await import('../mailbox/openers.js'));
+    // Recovery resolves its source session through the seam now, and the seam
+    // is keyed on DATA_DIR. Point DATA_DIR at this suite's own root for the
+    // duration, the same way mailbox seam PR 7 did in src/host-sweep.test.ts
+    // when it made the equivalent conversion. `options.dataDir` still drives
+    // the live-count scan, so both halves read the same tree.
+    savedDataDir = h.dataDir;
+    h.dataDir = DIR;
     if (fs.existsSync(DIR)) fs.rmSync(DIR, { recursive: true });
     fs.mkdirSync(DIR, { recursive: true });
   });
   afterEach(() => {
+    h.dataDir = savedDataDir;
     if (fs.existsSync(DIR)) fs.rmSync(DIR, { recursive: true });
   });
 
@@ -374,13 +384,13 @@ describe('recoverMoveIntents (D3) + pruneAuditBodies (D4)', () => {
     );
   }
 
-  it('test_recover_stamps_when_live_row_exists', () => {
+  it('test_recover_stamps_when_live_row_exists', async () => {
     const db = centralDb();
     const inbound = seedInbound('src-ag', 'src-sess');
     insertLive(inbound, 'ser-1'); // a live row exists for the series
     writeIntent(db, { seriesId: 'ser-1', ag: 'src-ag', sess: 'src-sess', tsMs: NOW - 2 * SWEEP_MS });
 
-    recoverMoveIntents(db, { dataDir: DIR, nowMs: NOW });
+    await recoverMoveIntents(db, { dataDir: DIR, nowMs: NOW });
 
     const row = db
       .prepare("SELECT detail_json, resolved_at FROM scheduled_audit WHERE correlation_id = 'corr-ser-1'")
@@ -395,12 +405,12 @@ describe('recoverMoveIntents (D3) + pruneAuditBodies (D4)', () => {
     db.close();
   });
 
-  it('test_recover_restores_when_zero_live_rows', () => {
+  it('test_recover_restores_when_zero_live_rows', async () => {
     const db = centralDb();
     const inbound = seedInbound('src-ag', 'src-sess'); // empty — simulates crash post-cancel
     writeIntent(db, { seriesId: 'ser-2', ag: 'src-ag', sess: 'src-sess', tsMs: NOW - 2 * SWEEP_MS });
 
-    recoverMoveIntents(db, { dataDir: DIR, nowMs: NOW });
+    await recoverMoveIntents(db, { dataDir: DIR, nowMs: NOW });
 
     // restoreTaskRow inserted a live row from the snapshot.
     const live = openInboundDb(inbound)
@@ -418,13 +428,13 @@ describe('recoverMoveIntents (D3) + pruneAuditBodies (D4)', () => {
     db.close();
   });
 
-  it('test_recover_idempotent_no_double_restore', () => {
+  it('test_recover_idempotent_no_double_restore', async () => {
     const db = centralDb();
     const inbound = seedInbound('src-ag', 'src-sess');
     writeIntent(db, { seriesId: 'ser-3', ag: 'src-ag', sess: 'src-sess', tsMs: NOW - 2 * SWEEP_MS });
 
-    recoverMoveIntents(db, { dataDir: DIR, nowMs: NOW }); // first pass restores
-    recoverMoveIntents(db, { dataDir: DIR, nowMs: NOW }); // second pass must be a no-op
+    await recoverMoveIntents(db, { dataDir: DIR, nowMs: NOW }); // first pass restores
+    await recoverMoveIntents(db, { dataDir: DIR, nowMs: NOW }); // second pass must be a no-op
 
     const live = openInboundDb(inbound)
       .prepare("SELECT COUNT(*) AS c FROM messages_in WHERE series_id='ser-3' AND status IN ('pending','paused')")
@@ -433,12 +443,12 @@ describe('recoverMoveIntents (D3) + pruneAuditBodies (D4)', () => {
     db.close();
   });
 
-  it('does not recover an intent younger than one sweep interval', () => {
+  it('does not recover an intent younger than one sweep interval', async () => {
     const db = centralDb();
     seedInbound('src-ag', 'src-sess');
     writeIntent(db, { seriesId: 'ser-4', ag: 'src-ag', sess: 'src-sess', tsMs: NOW - 5_000 }); // 5s old
 
-    recoverMoveIntents(db, { dataDir: DIR, nowMs: NOW });
+    await recoverMoveIntents(db, { dataDir: DIR, nowMs: NOW });
 
     const row = db.prepare("SELECT resolved_at FROM scheduled_audit WHERE correlation_id = 'corr-ser-4'").get() as {
       resolved_at: string | null;
@@ -449,7 +459,7 @@ describe('recoverMoveIntents (D3) + pruneAuditBodies (D4)', () => {
 
   // ── M1: scoped {source,target} count — an UNRELATED group's same series_id ─────
   // must NOT cause a false resolve. The crashed source still gets restored.
-  it('test_recover_scoped_count_ignores_unrelated_group', () => {
+  it('test_recover_scoped_count_ignores_unrelated_group', async () => {
     const db = centralDb();
     // Source session is EMPTY (crashed post-cancel, before the target insert).
     const srcInbound = seedInbound('src-ag', 'src-sess');
@@ -470,7 +480,7 @@ describe('recoverMoveIntents (D3) + pruneAuditBodies (D4)', () => {
       targetMessagingGroupId: 'tgt-mg',
     });
 
-    recoverMoveIntents(db, { dataDir: DIR, nowMs: NOW });
+    await recoverMoveIntents(db, { dataDir: DIR, nowMs: NOW });
 
     // The scoped {source,target} count is 0 → the crashed source IS restored,
     // the unrelated group's row is ignored.
@@ -485,7 +495,7 @@ describe('recoverMoveIntents (D3) + pruneAuditBodies (D4)', () => {
     db.close();
   });
 
-  it('test_recover_scoped_count_stamps_when_target_has_live_row', () => {
+  it('test_recover_scoped_count_stamps_when_target_has_live_row', async () => {
     // The move SUCCEEDED (target has the live row) but the intent was never
     // stamped (crash after insert). Scoped count sees the target row → stamp, do
     // NOT restore the source (would double the live rows).
@@ -504,7 +514,7 @@ describe('recoverMoveIntents (D3) + pruneAuditBodies (D4)', () => {
       targetMessagingGroupId: 'tgt-mg',
     });
 
-    recoverMoveIntents(db, { dataDir: DIR, nowMs: NOW });
+    await recoverMoveIntents(db, { dataDir: DIR, nowMs: NOW });
 
     // Source NOT restored (the target's live row is the one live row).
     const srcCount = openInboundDb(srcInbound)
@@ -519,7 +529,7 @@ describe('recoverMoveIntents (D3) + pruneAuditBodies (D4)', () => {
   });
 
   // ── ADV-S2: a dangling unrecoverable intent must resolve (no permanent zombie) ─
-  it('test_recover_no_snapshot_resolves_intent', () => {
+  it('test_recover_no_snapshot_resolves_intent', async () => {
     const db = centralDb();
     seedInbound('src-ag', 'src-sess');
     // Intent with NO snapshot body (purged-but-still-unresolved) → unrecoverable,
@@ -532,7 +542,7 @@ describe('recoverMoveIntents (D3) + pruneAuditBodies (D4)', () => {
       noSnapshot: true,
     });
 
-    recoverMoveIntents(db, { dataDir: DIR, nowMs: NOW });
+    await recoverMoveIntents(db, { dataDir: DIR, nowMs: NOW });
 
     const row = db
       .prepare("SELECT resolved_at FROM scheduled_audit WHERE correlation_id = 'corr-ser-nosnap'")
@@ -541,7 +551,7 @@ describe('recoverMoveIntents (D3) + pruneAuditBodies (D4)', () => {
     db.close();
   });
 
-  it('test_recover_source_dir_missing_resolves_intent', () => {
+  it('test_recover_source_dir_missing_resolves_intent', async () => {
     const db = centralDb();
     // No source inbound.db on disk at all → cannot restore, but must resolve so
     // it does not surface as an unclearable stalled repair row forever.
@@ -552,7 +562,7 @@ describe('recoverMoveIntents (D3) + pruneAuditBodies (D4)', () => {
       tsMs: NOW - 2 * SWEEP_MS,
     });
 
-    recoverMoveIntents(db, { dataDir: DIR, nowMs: NOW });
+    await recoverMoveIntents(db, { dataDir: DIR, nowMs: NOW });
 
     const row = db.prepare("SELECT resolved_at FROM scheduled_audit WHERE correlation_id = 'corr-ser-nodir'").get() as {
       resolved_at: string | null;
@@ -578,7 +588,7 @@ describe('recoverMoveIntents (D3) + pruneAuditBodies (D4)', () => {
     return Number(r.lastInsertRowid);
   }
 
-  it('test_prune_nulls_bodies_after_90d', () => {
+  it('test_prune_nulls_bodies_after_90d', async () => {
     const db = centralDb();
     const id = insertAudit(db, { action: 'edit', tsMs: NOW - 91 * 24 * 3600_000 });
     pruneAuditBodies(db, { nowMs: NOW });
@@ -593,7 +603,7 @@ describe('recoverMoveIntents (D3) + pruneAuditBodies (D4)', () => {
     db.close();
   });
 
-  it('test_prune_keeps_recent_bodies', () => {
+  it('test_prune_keeps_recent_bodies', async () => {
     const db = centralDb();
     const id = insertAudit(db, { action: 'edit', tsMs: NOW - 10 * 24 * 3600_000 });
     pruneAuditBodies(db, { nowMs: NOW });
@@ -604,7 +614,7 @@ describe('recoverMoveIntents (D3) + pruneAuditBodies (D4)', () => {
     db.close();
   });
 
-  it('test_prune_preserves_cancel_metadata', () => {
+  it('test_prune_preserves_cancel_metadata', async () => {
     const db = centralDb();
     const id = insertAudit(db, { action: 'cancel', tsMs: NOW - 100 * 24 * 3600_000 });
     pruneAuditBodies(db, { nowMs: NOW });
@@ -617,7 +627,7 @@ describe('recoverMoveIntents (D3) + pruneAuditBodies (D4)', () => {
   // on efb8350a..73e6c960, finding F1: the describe title above is an
   // aggregate label, not itself an acceptance case) ──────────────────────────
 
-  it('move-intent recovery restores from snapshot and defers on an unreadable live count', () => {
+  it('move-intent recovery restores from snapshot and defers on an unreadable live count', async () => {
     const db = centralDb();
 
     // Branch 1 (already covered individually above, restated here under the
@@ -640,7 +650,7 @@ describe('recoverMoveIntents (D3) + pruneAuditBodies (D4)', () => {
       .prepare("SELECT detail_json FROM scheduled_audit WHERE correlation_id = 'corr-ser-named-unreadable'")
       .get() as { detail_json: string };
 
-    recoverMoveIntents(db, { dataDir: DIR, nowMs: NOW });
+    await recoverMoveIntents(db, { dataDir: DIR, nowMs: NOW });
 
     // Branch 1: restored and resolved.
     const restoredLive = openInboundDb(restoreInbound)
@@ -665,7 +675,7 @@ describe('recoverMoveIntents (D3) + pruneAuditBodies (D4)', () => {
     db.close();
   });
 
-  it('audit-body prune nulls the three preview columns at 90 days and keeps the metadata row', () => {
+  it('audit-body prune nulls the three preview columns at 90 days and keeps the metadata row', async () => {
     const db = centralDb();
     const id = insertAudit(db, { action: 'edit', tsMs: NOW - 91 * 24 * 3600_000 });
 
@@ -691,39 +701,43 @@ describe('recoverMoveIntents (D3) + pruneAuditBodies (D4)', () => {
     db.close();
   });
 
-  it('recovery walks the injected sessions root by path and is exempt from the mailbox seam', () => {
-    // The injected root this call passes is NOT the real DATA_DIR (the value
-    // src/config.js resolves to, mocked at file scope to `h.dataDir` above) —
-    // recoverMoveIntents never falls back to it when an explicit `dataDir` is
-    // given, and a session addressed only under the injected root is still
-    // recovered.
-    expect(path.resolve(DIR)).not.toBe(path.resolve(h.dataDir));
-
+  it("move recovery resolves sessions through the seam and restores from the seam's root", async () => {
+    // F-7.3, rewritten. The old contract was the opposite: recovery walked an
+    // INJECTED sessions root by path and was exempt from the seam. That
+    // exemption turned out to protect test scaffolding, not behaviour — the
+    // only production caller anywhere is the sweep's own `recoverMoveIntents(getDb(), {})`,
+    // which passes no root at all (verified on this branch and on origin/main;
+    // every `dataDir:`-injecting caller is a test). So the module now resolves
+    // its source session through `withExistingNanoclawSession` exactly as
+    // mailbox seam PR 7 made host-sweep.ts do, and this suite points DATA_DIR at
+    // its own root the way PR 7's suite does.
     const db = centralDb();
-    const inbound = seedInbound('exempt-ag', 'exempt-sess');
-    writeIntent(db, { seriesId: 'ser-exempt', ag: 'exempt-ag', sess: 'exempt-sess', tsMs: NOW - 2 * SWEEP_MS });
+    const inbound = seedInbound('seam-ag', 'seam-sess');
+    writeIntent(db, { seriesId: 'ser-seam', ag: 'seam-ag', sess: 'seam-sess', tsMs: NOW - 2 * SWEEP_MS });
 
-    recoverMoveIntents(db, { dataDir: DIR, nowMs: NOW });
+    await recoverMoveIntents(db, { dataDir: DIR, nowMs: NOW });
 
     const restored = openInboundDb(inbound)
-      .prepare("SELECT COUNT(*) AS c FROM messages_in WHERE series_id='ser-exempt' AND status IN ('pending','paused')")
+      .prepare("SELECT COUNT(*) AS c FROM messages_in WHERE series_id='ser-seam' AND status IN ('pending','paused')")
       .get() as { c: number };
     expect(restored.c).toBe(1);
     const resolvedRow = db
-      .prepare("SELECT resolved_at FROM scheduled_audit WHERE correlation_id = 'corr-ser-exempt'")
+      .prepare("SELECT resolved_at FROM scheduled_audit WHERE correlation_id = 'corr-ser-seam'")
       .get() as { resolved_at: string | null };
     expect(resolvedRow.resolved_at).toBeTruthy();
     db.close();
 
-    // The permanent KEEP-PATCH: the module stays on the ratchet allowlist,
-    // and the reason is restated at the import site — not residue, a
-    // deliberate, documented exception (plan.md §5).
+    // The exemption is gone, so the module is off the ratchet allowlist and the
+    // host half of that allowlist is exactly what mailbox seam PR 7's H-1b
+    // asserts. No raw opener is left in this module.
     const repoRoot = path.resolve(__dirname, '../../..');
     const ratchet = JSON.parse(fs.readFileSync(path.join(repoRoot, 'src/mailbox/RATCHET.json'), 'utf8')) as string[];
-    expect(ratchet).toContain('src/modules/sweep-scheduled-move/index.ts');
+    expect(ratchet).not.toContain('src/modules/sweep-scheduled-move/index.ts');
+    expect(ratchet.filter((entry) => !entry.startsWith('container/agent-runner/src/'))).toEqual([
+      'src/storage-manager.ts',
+    ]);
     const moduleSource = fs.readFileSync(path.join(repoRoot, 'src/modules/sweep-scheduled-move/index.ts'), 'utf8');
-    expect(moduleSource).toContain('INJECTED sessions root');
-    expect(moduleSource).toContain('cannot go through the seam');
-    expect(moduleSource).toContain('KEEP-PATCH');
+    expect(moduleSource).not.toContain('KEEP-PATCH');
+    expect(moduleSource).toContain('withExistingNanoclawSession');
   });
 });

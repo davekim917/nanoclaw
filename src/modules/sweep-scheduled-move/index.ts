@@ -20,13 +20,14 @@ import { log } from '../../log.js';
 import { getDb } from '../../db/connection.js';
 import { sessionsBaseDir } from '../../session-manager.js';
 import { parseSqliteUtc } from '../mailbox/sqlite-utc.js';
-// The scheduled-move recovery below walks an INJECTED sessions root, not
-// DATA_DIR, so its session DBs are not addressable by a mailbox key and it
-// cannot go through the seam (plan.md §5 "One permanent KEEP-PATCH"). This is
-// the one place in this module that still opens a session DB by path — a
-// deliberate, permanent exception, not residue to eliminate (F-7.3).
-import { openInboundDb as openInboundDbByPath } from '../mailbox/openers.js';
-import { restoreTaskRow, type TaskRowSnapshot } from '../scheduling/db.js';
+// Move recovery resolves its source session through the seam, like every other
+// host caller. The KEEP-PATCH this module used to carry existed for an INJECTED
+// sessions root, but no production caller ever injects one — the sweep's only
+// call site passes `{}` — so the exemption protected test scaffolding rather
+// than behaviour, and it is gone (mailbox seam PR 7 made the same change in
+// host-sweep.ts).
+import { withExistingNanoclawSession } from '../mailbox/session.js';
+import { type TaskRowSnapshot } from '../scheduling/db.js';
 import { countLiveRowsInSessions } from '../scheduling/live-count.js';
 import { purgeIntentBody } from '../../dashboard/api/scheduled-shared.js';
 import {
@@ -120,7 +121,7 @@ function parseIntentDetail(detailJson: string | null): ParsedIntentDetail {
  *
  * Autonomous, not just observable. Additive — no firing-path change (C1).
  */
-export function recoverMoveIntents(centralDb: Database.Database, options: MoveRecoveryOptions): void {
+export async function recoverMoveIntents(centralDb: Database.Database, options: MoveRecoveryOptions): Promise<void> {
   const nowMs = options.nowMs ?? Date.now();
   const dataDir = options.dataDir ?? path.dirname(sessionsBaseDir());
   const sessionsRoot = options.dataDir ? path.join(options.dataDir, 'v2-sessions') : sessionsBaseDir();
@@ -219,45 +220,59 @@ export function recoverMoveIntents(centralDb: Database.Database, options: MoveRe
       continue;
     }
     const snapshot = detail.snapshot;
-    let db: Database.Database | null = null;
+    let outcome: 'restored' | 'deferred' | undefined;
     try {
-      db = openInboundDbByPath(inboundPath);
-      // Idempotency re-check: the restore + the resolved_at stamp span two DB
-      // files (not atomic), so re-confirm a readable zero-live IMMEDIATELY before
-      // insert. An unreadable re-check defers (never restore on unknown).
-      const recheck = countLiveRowsInSessions(dataDir, [source, target], intent.series_id);
-      if (recheck.unreadable) {
-        log.warn('scheduled-move-recovery: re-check unreadable — deferring restore', {
-          seriesId: intent.series_id,
-        });
-        continue;
-      }
-      if (recheck.count === 0) {
-        restoreTaskRow(db, {
-          // Fresh id — the cancelled source row may still hold the snapshot id.
-          id: `task-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-          series_id: snapshot.series_id,
-          status: snapshot.status,
-          process_after: snapshot.process_after,
-          // Optional on the parsed audit body: an intent written before the
-          // column existed has none, and restoreTaskRow falls back.
-          scheduled_for: snapshot.scheduled_for,
-          recurrence: snapshot.recurrence,
-          content: snapshot.content,
-          platform_id: snapshot.platform_id,
-          channel_type: snapshot.channel_type,
-          thread_id: snapshot.thread_id,
-          kind: snapshot.kind,
-        });
-      }
+      // Existing-only: the existsSync above already answered "is there a
+      // session to restore into", and a recovery pass must never re-provision
+      // one it has just been told is gone (invariant I-10).
+      outcome = await withExistingNanoclawSession(intent.agent_group_id, intent.session_id, (mailbox) => {
+        // Idempotency re-check: the restore + the resolved_at stamp span two DB
+        // files (not atomic), so re-confirm a readable zero-live IMMEDIATELY before
+        // insert. An unreadable re-check defers (never restore on unknown).
+        const recheck = countLiveRowsInSessions(dataDir, [source, target], intent.series_id);
+        if (recheck.unreadable) return 'deferred' as const;
+        if (recheck.count === 0) {
+          mailbox.restoreTaskRow({
+            // Fresh id — the cancelled source row may still hold the snapshot id.
+            id: `task-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+            series_id: snapshot.series_id,
+            status: snapshot.status,
+            process_after: snapshot.process_after,
+            // Optional on the parsed audit body: an intent written before the
+            // column existed has none, and restoreTaskRow falls back.
+            scheduled_for: snapshot.scheduled_for,
+            recurrence: snapshot.recurrence,
+            content: snapshot.content,
+            platform_id: snapshot.platform_id,
+            channel_type: snapshot.channel_type,
+            thread_id: snapshot.thread_id,
+            kind: snapshot.kind,
+          });
+        }
+        return 'restored' as const;
+      });
     } catch (err) {
       log.error('scheduled-move-recovery: restore failed', {
         seriesId: intent.series_id,
         err: err instanceof Error ? err.message : String(err),
       });
       continue;
-    } finally {
-      db?.close();
+    }
+    if (outcome === undefined) {
+      // The mailbox went away between the existsSync above and the open. The
+      // pre-seam open threw here and landed in the catch; same outcome, said
+      // out loud rather than as an exception.
+      log.error('scheduled-move-recovery: restore failed', {
+        seriesId: intent.series_id,
+        err: 'source inbound mailbox vanished before the restore',
+      });
+      continue;
+    }
+    if (outcome === 'deferred') {
+      log.warn('scheduled-move-recovery: re-check unreadable — deferring restore', {
+        seriesId: intent.series_id,
+      });
+      continue;
     }
     // Stamp + purge AFTER the restore (so a crash before this makes the next
     // pass re-evaluate; now a live row exists → it stamps without re-restoring).
@@ -309,9 +324,9 @@ export function registerScheduledMoveSweepDuties(): void {
     // move intents. Additive (same pattern as the recurrence hook); touches only
     // scheduled_audit (central) + the move's own session inbound rows — no
     // firing-path change (C1).
-    run: () => {
+    run: async () => {
       try {
-        recoverMoveIntents(getDb(), {});
+        await recoverMoveIntents(getDb(), {});
       } catch (err) {
         log.warn('scheduled-move-recovery: sweep hook failed', { err });
       }
