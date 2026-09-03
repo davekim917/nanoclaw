@@ -73,45 +73,120 @@ describe('L-3: startHostModules fires after the delivery adapter and before the 
 /**
  * L-4 ("the lifecycle port registers no callbacks") is superseded here: PR 1
  * gives the six main.ts timers + sweep-storage real registrants, so an empty
- * registry is no longer the invariant post-PR-1. T-5 replaces it with the
- * new invariant — a stable registration COUNT, independent of env gates.
+ * registry is no longer the invariant post-PR-1. T-5 replaces it with the new
+ * invariant — the exact SET of registrant NAMES, independent of env gates.
+ *
+ * Names, not a count. A count says "8" and names nothing, so it breaks on every
+ * legitimate new registrant with a diff that cannot tell a missing duty from an
+ * added one — which is exactly how this case went red when #324's archive
+ * projection worker became the 8th shutdown registrant. Every callback is
+ * therefore registered as a NAMED function expression at its registration site,
+ * and this case asserts the sorted name lists.
+ *
+ * The names are deliberately NOT the module's own `startX`/`stopX` symbols: a
+ * function expression's name binds inside its own body, so
+ * `onHostStart(function startWorktreeCleanup() { startWorktreeCleanup(); })`
+ * would call itself forever instead of the module function. Each registrant is
+ * named `<duty>HostStart` / `<duty>HostShutdown`.
+ *
+ * `src/host-lifecycle.ts` is byte-locked to upstream (sha256 manifest), so
+ * `onHostStart`/`onHostShutdown` cannot grow a name parameter — naming the
+ * callback itself is the only way to get an identity across that seam.
  */
-describe('T-5: after PR 1 the registries hold exactly the six timer starts and seven shutdowns, regardless of env gates', () => {
-  it('importing the modules barrel plus the six timer modules registers 6 starts and 7 shutdowns', async () => {
-    const lifecycle = await import('./host-lifecycle.js');
-    // Production barrel — side-effect imports populate module registries
-    // (sweep-storage's onHostShutdown), same pattern as src/guard/conformance.test.ts.
-    await import('./modules/index.js');
-    // The six timer modules are NOT part of the modules barrel — main.ts
-    // imports them directly for their onHostStart/onHostShutdown side effects.
-    await import('./worktree-cleanup.js');
-    await import('./repo-freshness.js');
-    await import('./plugin-updater.js');
-    await import('./commit-scan.js');
-    await import('./daily-summary.js');
-    await import('./backlog-canvas.js');
+const EXPECTED_HOST_START_REGISTRANTS = [
+  'backlogCanvasHostStart',
+  'commitScanHostStart',
+  'dailySummaryHostStart',
+  'pluginUpdaterHostStart',
+  'repoFreshnessHostStart',
+  'worktreeCleanupHostStart',
+].sort();
 
-    expect(lifecycle.getHostStartCallbacks()).toHaveLength(6);
-    expect(lifecycle.getHostShutdownCallbacks()).toHaveLength(7);
-  });
+const EXPECTED_HOST_SHUTDOWN_REGISTRANTS = [
+  // The six main.ts timer modules.
+  'backlogCanvasHostShutdown',
+  'commitScanHostShutdown',
+  'dailySummaryHostShutdown',
+  'pluginUpdaterHostShutdown',
+  'repoFreshnessHostShutdown',
+  'worktreeCleanupHostShutdown',
+  // Reached through the modules barrel: sweep-storage stops the persistent
+  // maintenance worker (its start half, T13, was never in main.ts).
+  'storageMaintenanceHostShutdown',
+  // Also reached through the barrel — src/db/archive-projection-worker.ts is
+  // imported by src/container-runner.ts, which ten barrel modules import (#324).
+  'archiveProjectionHostShutdown',
+].sort();
 
-  it('holds the same counts with DAILY_SUMMARY_ENABLED=0 and BACKLOG_CANVAS_ENABLED=0 — a disabled duty still registers and no-ops', async () => {
-    vi.stubEnv('DAILY_SUMMARY_ENABLED', '0');
-    vi.stubEnv('BACKLOG_CANVAS_ENABLED', '0');
-    try {
-      const lifecycle = await import('./host-lifecycle.js');
-      await import('./modules/index.js');
-      await import('./worktree-cleanup.js');
-      await import('./repo-freshness.js');
-      await import('./plugin-updater.js');
-      await import('./commit-scan.js');
-      await import('./daily-summary.js');
-      await import('./backlog-canvas.js');
+/**
+ * Cold-importing the whole modules barrel plus the six timer modules costs
+ * ~4.5 s on a loaded 8-core box, inside vitest's 5 s default by only a hair —
+ * this case flaked under CPU contention before the explicit budget.
+ */
+const IMPORT_EVERY_REGISTRANT_TIMEOUT_MS = 30_000;
 
-      expect(lifecycle.getHostStartCallbacks()).toHaveLength(6);
-      expect(lifecycle.getHostShutdownCallbacks()).toHaveLength(7);
-    } finally {
-      vi.unstubAllEnvs();
-    }
-  });
+async function importEveryLifecycleRegistrant(): Promise<typeof import('./host-lifecycle.js')> {
+  const lifecycle = await import('./host-lifecycle.js');
+  // Production barrel — side-effect imports populate module registries
+  // (sweep-storage's onHostShutdown), same pattern as src/guard/conformance.test.ts.
+  await import('./modules/index.js');
+  // The six timer modules are NOT part of the modules barrel — main.ts
+  // imports them directly for their onHostStart/onHostShutdown side effects.
+  await import('./worktree-cleanup.js');
+  await import('./repo-freshness.js');
+  await import('./plugin-updater.js');
+  await import('./commit-scan.js');
+  await import('./daily-summary.js');
+  await import('./backlog-canvas.js');
+  return lifecycle;
+}
+
+describe("T-5: after PR 1 the registries hold exactly the six timer starts and the host's shutdown registrants, regardless of env gates", () => {
+  it(
+    'importing the modules barrel plus the six timer modules registers exactly the named start and shutdown registrants',
+    async () => {
+      const lifecycle = await importEveryLifecycleRegistrant();
+
+      expect(
+        lifecycle
+          .getHostStartCallbacks()
+          .map((cb) => cb.name)
+          .sort(),
+      ).toEqual(EXPECTED_HOST_START_REGISTRANTS);
+      expect(
+        lifecycle
+          .getHostShutdownCallbacks()
+          .map((cb) => cb.name)
+          .sort(),
+      ).toEqual(EXPECTED_HOST_SHUTDOWN_REGISTRANTS);
+    },
+    IMPORT_EVERY_REGISTRANT_TIMEOUT_MS,
+  );
+
+  it(
+    'holds the same named registrants with DAILY_SUMMARY_ENABLED=0 and BACKLOG_CANVAS_ENABLED=0 — a disabled duty still registers and no-ops',
+    async () => {
+      vi.stubEnv('DAILY_SUMMARY_ENABLED', '0');
+      vi.stubEnv('BACKLOG_CANVAS_ENABLED', '0');
+      try {
+        const lifecycle = await importEveryLifecycleRegistrant();
+
+        expect(
+          lifecycle
+            .getHostStartCallbacks()
+            .map((cb) => cb.name)
+            .sort(),
+        ).toEqual(EXPECTED_HOST_START_REGISTRANTS);
+        expect(
+          lifecycle
+            .getHostShutdownCallbacks()
+            .map((cb) => cb.name)
+            .sort(),
+        ).toEqual(EXPECTED_HOST_SHUTDOWN_REGISTRANTS);
+      } finally {
+        vi.unstubAllEnvs();
+      }
+    },
+    IMPORT_EVERY_REGISTRANT_TIMEOUT_MS,
+  );
 });

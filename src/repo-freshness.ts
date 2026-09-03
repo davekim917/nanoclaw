@@ -139,13 +139,13 @@ export function stopRepoFreshness(): void {
   intervalHandle = null;
 }
 
-onHostStart(() => {
+onHostStart(function repoFreshnessHostStart() {
   // UNGUARDED — a synchronous startup failure must abort boot (§4.2).
   startRepoFreshness();
   log.info('Repo freshness worker started');
 });
 
-onHostShutdown(() => {
+onHostShutdown(function repoFreshnessHostShutdown() {
   try {
     stopRepoFreshness();
   } catch (err) {

@@ -80,7 +80,7 @@ export function stopDailySummary(): void {
 
 // Set DAILY_SUMMARY_ENABLED=0 to disable. A disabled duty still registers and
 // no-ops, so the registration count is stable across configurations.
-onHostStart(() => {
+onHostStart(function dailySummaryHostStart() {
   if (process.env.DAILY_SUMMARY_ENABLED !== '0') {
     // UNGUARDED — a synchronous startup failure must abort boot (§4.2).
     startDailySummary();
@@ -88,7 +88,7 @@ onHostStart(() => {
   }
 });
 
-onHostShutdown(() => {
+onHostShutdown(function dailySummaryHostShutdown() {
   try {
     stopDailySummary();
   } catch (err) {

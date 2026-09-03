@@ -232,7 +232,7 @@ export function stopArchiveProjectionWorker(): Promise<void> {
 // worker is also unref'd, so a shutdown that never reaches this hook still
 // cannot be held open by it; an in-flight rebuild killed mid-write leaves no
 // stamp, so the next spawn rebuilds rather than trusting a partial file.
-onHostShutdown(async () => {
+onHostShutdown(async function archiveProjectionHostShutdown() {
   try {
     await stopArchiveProjectionWorker();
   } catch (err) {

@@ -310,7 +310,7 @@ export function stopPluginUpdater(): void {
   }
 }
 
-onHostStart(() => {
+onHostStart(function pluginUpdaterHostStart() {
   // UNGUARDED — a synchronous startup failure must abort boot (§4.2).
   startPluginUpdater({
     notify: async (platformId, text) => {
@@ -333,7 +333,7 @@ onHostStart(() => {
   log.info('Plugin updater started');
 });
 
-onHostShutdown(() => {
+onHostShutdown(function pluginUpdaterHostShutdown() {
   try {
     stopPluginUpdater();
   } catch (err) {
