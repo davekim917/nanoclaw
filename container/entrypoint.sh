@@ -133,6 +133,31 @@ WRAPPER
     fi
   fi
 
+  # `git config --global` writes under $HOME, and the image owns /home/node as
+  # the build-time HOST_UID (1001, the Dockerfile default that build.sh does not
+  # override). A host whose uid differs — a macOS install runs the service as
+  # 501 — is remapped in with `--user` but still gets EACCES there. Reproduced
+  # against the shipped image: the write fails and, under this file's `set -e`,
+  # takes the whole container down during startup.
+  #
+  # That crash already existed for GITHUB_ALLOWED_ORGS installs, which have
+  # always written git config directly. The unscoped path only escaped it
+  # because `gh auth setup-git 2>/dev/null || true` swallowed the error, leaving
+  # git unauthenticated rather than the container dead — so writing config
+  # directly below would have turned a quiet misconfiguration into a boot
+  # failure for the DEFAULT path.
+  #
+  # Redirect to a writable file rather than swallow: remapped-uid hosts then get
+  # working git auth instead of a quieter failure, and the org-scoped crash goes
+  # away with it. The image ships no /home/node/.gitconfig, so nothing is
+  # shadowed. Exported so the agent's own git calls read the same file.
+  if [ -z "$GIT_CONFIG_GLOBAL" ] && ! ( umask 077; touch "$HOME/.gitconfig" ) 2>/dev/null; then
+    export GIT_CONFIG_GLOBAL=/tmp/nanoclaw-gitconfig
+    touch "$GIT_CONFIG_GLOBAL" 2>/dev/null || true
+    chmod 0600 "$GIT_CONFIG_GLOBAL" 2>/dev/null || true
+    echo "[entrypoint] \$HOME ($HOME) not writable by uid $(id -u) — git config redirected to $GIT_CONFIG_GLOBAL" >&2
+  fi
+
   if [ -n "$GITHUB_ALLOWED_ORGS" ]; then
     IFS=',' read -ra _gh_orgs <<< "$GITHUB_ALLOWED_ORGS"
     for _org in "${_gh_orgs[@]}"; do
