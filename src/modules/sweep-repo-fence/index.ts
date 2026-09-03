@@ -14,16 +14,17 @@
  * `src/modules/repository-workspaces/job-runner.ts` (dropped-message
  * recovery), both outside this family PR's ownership boundary.
  *
- * `registerSweepRepoFenceDuties` is exported (not just run as an import-time
- * side effect) so `src/host-sweep-registry.test.ts`'s `_resetSweepRegistryForTesting()`
- * — which clears the registry and rebuilds only the duties still inline in
- * `registerBuiltInSweepDuties()` — can restore this family's two after every
- * reset. Without that, R-7's 39/38 inventory assertion (and any other test
- * that drives a full tick after the file's first reset) silently loses T5 and
- * T22 the moment this module's own one-time import registration is wiped.
+ * Registered via `registerSweepDutySource('sweep-repo-fence', ...)` rather
+ * than a bare import-time `registerSweepDuty` call: PR 2's registry replays
+ * every recorded source's registrar on `_resetSweepRegistryForTesting()`'s
+ * default reset, so this family's two duties survive a test-file reset
+ * instead of being silently dropped (found while building this PR — see
+ * `src/host-sweep-registry.test.ts`'s "duty registration sources" case).
+ * `registerSweepRepoFenceDuties` stays exported for that test file to
+ * reference directly if ever needed.
  */
 import { log } from '../../log.js';
-import { SWEEP_DUTY_INVENTORY, registerSweepDuty } from '../../host-sweep.js';
+import { SWEEP_DUTY_INVENTORY, registerSweepDuty, registerSweepDutySource } from '../../host-sweep.js';
 import { sweepOrphanedRepoIngressFences } from '../../repo-fence-recovery.js';
 import type { Session } from '../../types.js';
 
@@ -70,4 +71,4 @@ export function registerSweepRepoFenceDuties(): void {
   });
 }
 
-registerSweepRepoFenceDuties();
+registerSweepDutySource('sweep-repo-fence', registerSweepRepoFenceDuties);
