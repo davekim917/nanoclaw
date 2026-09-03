@@ -23,6 +23,7 @@ const { TEST_DIR } = vi.hoisted(() => ({ TEST_DIR: uniqueTmpRoot('test-cli-tasks
 
 import { initTestDb, closeDb, runMigrations, createAgentGroup, getDb } from '../../db/index.js';
 import { createMessagingGroup } from '../../db/messaging-groups.js';
+import { ensureContainerConfig, updateContainerConfigScalars } from '../../db/container-configs.js';
 import { createSession, findSessionByAgentGroup, getSessionsByAgentGroup, taskThreadId } from '../../db/sessions.js';
 import { countDueMessages } from '../../db/session-db.js';
 import { inboundDbPath, initSessionFolder } from '../../session-manager.js';
@@ -109,6 +110,61 @@ describe('tasks CLI resource', () => {
   afterEach(() => {
     closeDb();
     if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
+  });
+
+  it("computes an unscoped --process-after in EACH matched group's timezone", async () => {
+    // An unscoped host `tasks update` fans out across every active session,
+    // which can span groups whose timezone overrides differ. Computing the
+    // instant once from whichever group matched first would write one group's
+    // wall-clock reading onto another group's series.
+    createGroup('ag-tokyo');
+    createGroup('ag-kolkata');
+    ensureContainerConfig('ag-tokyo');
+    ensureContainerConfig('ag-kolkata');
+    updateContainerConfigScalars('ag-tokyo', { timezone: 'Asia/Tokyo' }); // UTC+9, no DST
+    updateContainerConfigScalars('ag-kolkata', { timezone: 'Asia/Kolkata' }); // UTC+5:30, no DST
+
+    const made: Record<string, { series_id: string; session_id: string }> = {};
+    for (const group of ['ag-tokyo', 'ag-kolkata']) {
+      const resp = await dispatch(
+        {
+          id: `create-${group}`,
+          command: 'tasks-create',
+          args: { group, prompt: 'digest', name: 'digest', process_after: '2026-01-15T09:00:00Z' },
+        },
+        { caller: 'host' },
+      );
+      expect(resp.ok).toBe(true);
+      if (!resp.ok) return;
+      made[group] = resp.data as { series_id: string; session_id: string };
+    }
+
+    // Force a shared series id so one unscoped update matches both groups —
+    // the exact collision the fan-out has to survive.
+    const sharedId = made['ag-tokyo'].series_id;
+    const kolkataDb = new Database(inboundDbPath('ag-kolkata', made['ag-kolkata'].session_id));
+    kolkataDb.prepare('UPDATE messages_in SET id = ?, series_id = ? WHERE kind = ?').run(sharedId, sharedId, 'task');
+    kolkataDb.close();
+
+    const updated = await dispatch(
+      { id: 'tz-fanout', command: 'tasks-update', args: { id: sharedId, process_after: '2026-10-01T09:00:00' } },
+      { caller: 'host' },
+    );
+    expect(updated.ok).toBe(true);
+
+    const processAfterOf = (group: string): string => {
+      const db = new Database(inboundDbPath(group, made[group].session_id), { readonly: true });
+      const row = db.prepare("SELECT process_after FROM messages_in WHERE kind = 'task'").get() as {
+        process_after: string;
+      };
+      db.close();
+      return row.process_after;
+    };
+
+    // 09:00 local: Tokyo is UTC+9, Kolkata UTC+5:30. One shared value for both
+    // would mean the fan-out used a single group's zone.
+    expect(processAfterOf('ag-tokyo')).toBe('2026-10-01T00:00:00.000Z');
+    expect(processAfterOf('ag-kolkata')).toBe('2026-10-01T03:30:00.000Z');
   });
 
   it('create writes the task into the group system session, not the caller chat session', async () => {

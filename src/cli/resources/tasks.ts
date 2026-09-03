@@ -36,7 +36,6 @@ import {
 import { resolveTaskFlagIntent } from '../../modules/scheduling/task-flags.js';
 import { writeAudit } from '../../dashboard/api/scheduled-shared.js';
 import { inboundDbPath, resolveTaskSession, withInboundDb } from '../../session-manager.js';
-import { formatLocalStamp, parseZonedToUtc } from '../../timezone.js';
 import { registerResource } from '../crud.js';
 import { appendRunLog } from '../../modules/scheduling/run-log.js';
 import { formatTasksTable } from '../format-tasks.js';
@@ -553,9 +552,16 @@ function updateTaskCommand(args: Record<string, unknown>, ctx: CallerContext) {
   const script = normalizeNullableString(args.script);
 
   // Wall-clock fields (--process-after, the cron grid) are interpreted in the
-  // OWNING group's timezone, so that group must be resolved before parsing.
-  // The same lookup yields the task's current script for the recurrence-limit
-  // check, so it costs no extra scan.
+  // OWNING group's timezone. An unscoped host `tasks update` fans out across
+  // every active session, which can span groups with different overrides, so
+  // the persisted instant is computed PER SESSION in the loop below
+  // (`wallClockUpdate`) — never once from whichever group matched first.
+  //
+  // This scan resolves a representative group for VALIDATION only: input
+  // shape and the recurrence ceiling must reject before anything is written,
+  // and neither answer depends on which valid zone is used. The same lookup
+  // yields the task's current script for the ceiling check, so it costs no
+  // extra pass.
   let ownerGroup: string | undefined;
   let currentScript: string | null = null;
   if (args.process_after !== undefined || recurrence !== undefined) {
@@ -568,22 +574,36 @@ function updateTaskCommand(args: Record<string, unknown>, ctx: CallerContext) {
       }
     }
   }
-  const tz = ownerGroup ? resolveGroupTimezone(ownerGroup) : TIMEZONE;
+  const validationTz = ownerGroup ? resolveGroupTimezone(ownerGroup) : TIMEZONE;
 
-  if (args.process_after !== undefined) update.processAfter = parseProcessAfter(args.process_after, tz);
+  // Parse once up front purely to reject a malformed value before the first
+  // write; the value itself is recomputed per session.
+  if (args.process_after !== undefined) parseProcessAfter(args.process_after, validationTz);
   if (recurrence !== undefined) {
-    validateRecurrence(recurrence, tz);
+    validateRecurrence(recurrence, validationTz);
     // Effective script AFTER this update: the new value when provided
     // (including an explicit clear), else whatever the task already has.
     const scriptAfter: string | null = script !== undefined ? script : currentScript;
-    enforceRecurrenceLimit(recurrence, bool(args.dangerously_override_recurrence_limit), scriptAfter != null, tz);
+    enforceRecurrenceLimit(
+      recurrence,
+      bool(args.dangerously_override_recurrence_limit),
+      scriptAfter != null,
+      validationTz,
+    );
     update.recurrence = recurrence;
-    // A new cron with the old armed timestamp fires off the new grid (or a
-    // day late). Unless the caller pinned --process-after explicitly,
-    // re-derive the next fire from the new expression.
-    if (recurrence !== null && args.process_after === undefined) {
-      update.processAfter = CronExpressionParser.parse(recurrence, { tz }).next().toDate().toISOString();
-    }
+  }
+
+  // A new cron with the old armed timestamp fires off the new grid (or a day
+  // late). Unless the caller pinned --process-after explicitly, re-derive the
+  // next fire from the new expression — in the receiving group's zone.
+  const rearmFromCron = recurrence !== undefined && recurrence !== null && args.process_after === undefined;
+  const hasWallClockUpdate = args.process_after !== undefined || rearmFromCron;
+
+  function wallClockUpdate(agentGroupId: string): TaskUpdate {
+    if (!hasWallClockUpdate) return {};
+    const tz = resolveGroupTimezone(agentGroupId);
+    if (args.process_after !== undefined) return { processAfter: parseProcessAfter(args.process_after, tz) };
+    return { processAfter: CronExpressionParser.parse(recurrence!, { tz }).next().toDate().toISOString() };
   }
   if (script !== undefined) update.script = script;
   if (args.script_host !== undefined) {
@@ -612,7 +632,7 @@ function updateTaskCommand(args: Record<string, unknown>, ctx: CallerContext) {
     if (flagIntent && (flagIntent.turnModel || flagIntent.turnEffort)) update.flagIntent = flagIntent;
   }
   const fields = Object.keys(update);
-  if (fields.length === 0) throw new Error('nothing to update');
+  if (fields.length === 0 && !hasWallClockUpdate) throw new Error('nothing to update');
 
   let touched = 0;
   for (const session of selectedSessions(args, ctx)) {
@@ -631,7 +651,7 @@ function updateTaskCommand(args: Record<string, unknown>, ctx: CallerContext) {
       ) {
         throw new Error('this series runs its script on the host — an operator must make script changes');
       }
-      const n = updateTask(db, id, update);
+      const n = updateTask(db, id, { ...update, ...wallClockUpdate(session.agent_group_id) });
       return { before, n };
     });
     if (!result) continue;

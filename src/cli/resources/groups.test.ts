@@ -503,6 +503,27 @@ describe('groups CLI resource config', () => {
     expect(readContainerConfig(folder).assistantName).toBe('Renamed');
   });
 
+  it('test_groups_create_timezone_lands_in_the_db_row_not_only_container_json', async () => {
+    // initGroupFilesystem deliberately skips the container_configs insert, so
+    // without an explicit stamp the scalar write here updates zero rows — the
+    // container would get the requested zone while host-side scheduling kept
+    // following the install one until the next startup backfill.
+    const response = await dispatch(
+      {
+        id: 'req-create-tz',
+        command: 'groups-create',
+        args: { folder: 'created-with-tz', name: 'Created With TZ', timezone: 'Europe/Lisbon' },
+      },
+      { caller: 'host' },
+    );
+    expect(response.ok).toBe(true);
+    if (!response.ok) return;
+
+    const created = response.data as { id: string; folder: string };
+    expect(getContainerConfig(created.id)?.timezone).toBe('Europe/Lisbon');
+    expect(readContainerConfig(created.folder).timezone).toBe('Europe/Lisbon');
+  });
+
   it('test_groups_config_update_timezone_dual_writes_and_clears', async () => {
     // Same trap as provider: scheduling reads the DB row, the container's TZ
     // env comes from container.json. A one-sided write splits the two.

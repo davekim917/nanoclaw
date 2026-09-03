@@ -18,6 +18,7 @@ import { getDb, hasTable } from '../../db/connection.js';
 import { getSession } from '../../db/sessions.js';
 import { writeSessionMessage } from '../../session-manager.js';
 import {
+  ensureContainerConfig,
   getContainerConfig,
   updateContainerConfigScalars,
   updateContainerConfigJson,
@@ -162,10 +163,17 @@ registerResource({
         // backfill ran (#2415). The template branch above provisions its own
         // config + folder in `createAgentFromTemplate`; this covers the bare
         // path. Mirrors what `setup/register.ts` does after creating an agent
-        // group via the setup flow. The config row is stamped with the
-        // instance default provider (`ensureContainerConfig` inside) — per-group
-        // `groups config update --provider` still wins.
+        // group via the setup flow.
         initGroupFilesystem(group);
+        // `initGroupFilesystem` deliberately does NOT insert the config row —
+        // its caller in the create-agent flow runs it before the agent_groups
+        // insert, where the FK would fail (see the note in group-init.ts). The
+        // row exists by here only because the insert above already ran, so
+        // stamp it explicitly. Idempotent (INSERT OR IGNORE), and without it
+        // the scalar write below silently updates zero rows and the group's
+        // scheduling keeps following the install timezone until the next host
+        // startup backfill.
+        ensureContainerConfig(id);
         if (timezone) {
           updateContainerConfigScalars(id, { timezone });
           updateContainerConfig(folder, (config) => {
