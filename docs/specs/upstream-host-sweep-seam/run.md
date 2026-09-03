@@ -106,3 +106,12 @@ Nothing blocking. Plan §9 carries two awareness items: the 15-restart deploy co
 
 Not started.
 - 2026-09-03 07:30 ET — operator approved plan rev 2.2 ('go for it'); build delegated to session update-nanoclaw-3; S2-PR0/PR1 unblocked; PR2+ wait for mailbox PR 5/4 final heads (open Codex P1/P2 fixes pending on #271/#291).
+
+### Build start (2026-09-03 11:20 ET-morning, orchestrator session `update-nanoclaw-3`)
+
+- Approved plan: `docs/specs/upstream-host-sweep-seam/plan.md` rev 2.2 (status line committed at `2713edc0`). Git state at start: live checkout clean on `main` = `origin/main` = `2713edc0`.
+- Scratch worktrees under the session scratchpad (never the live checkout; `node_modules` symlinked read-only to the live tree; binaries invoked directly, `nice -n 10`, targeted suites only): `wt-s2-pr0` → `feat/host-sweep-seam-pr0-lifecycle`, `wt-s2-pr1` → `feat/host-sweep-seam-pr1-module-timers`, both cut from `origin/main` `2713edc0`. PR 1 stacks on PR 0's first commit (it needs `onHostStart`); the PR 0 builder hands the sha over by file.
+- Dispatch: two `worker`-tier builders IN PARALLEL (plan §5 tier column), briefs at `<scratchpad>/brief-{common,pr0,pr1}.md`; reports go to files (seam-1 lesson: long teammate messages arrive late and truncated).
+- Verified before dispatch: `git show 5c3082a1:src/host-lifecycle.ts` sha256 `fbf37333e51a…` (matches plan); `src/host-lifecycle.test.ts` `aa8077a4b73e…`; scratch-worktree + symlink recipe runs `src/mailbox-seam-upstream.test.ts` 25/25.
+
+**Plan correction (§4.1) found at dispatch:** upstream's `src/host-lifecycle.ts` imports `type { DbDriver } from './db/driver.js'`; the fork has no `src/db/driver.ts`, so a byte-identical port cannot typecheck as written. Resolution (engineering, no intent change): PR 0 adds a fork-owned TYPE shim `src/db/driver.ts` exporting `DbDriver` as an alias for the fork's better-sqlite3 handle (what `initDb` returns), so `HostStartContext.db` is the sync handle exactly as §4.1 states and the ported file stays byte-identical under the manifest. The shim is not in `UPSTREAM_FILES`; upstream's real async driver replaces it in the async-DB seam. plan.md §4.1 is amended in the same commit as this note.

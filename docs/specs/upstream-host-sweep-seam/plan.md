@@ -105,6 +105,8 @@ Fork `main` already runs six duties on hand-rolled timers: started at `main.ts:5
 
 `src/host-lifecycle.ts` and `src/host-lifecycle.test.ts` copied byte-identical via `git show 5c3082a1:<path>`, locked by a sha256 manifest (§4.6). No barrel edit: modules that register a hook import it directly, exactly as upstream's approvals module does. `src/main.ts` gains two calls at upstream's positions — `await startHostModules({ db, signal })` after `setDeliveryAdapter()` (`main.ts:490`) and before `startActiveDeliveryPoll()` (`:508`); `await stopHostModules()` as the first shutdown action, before `stopDeliveryPolls()` (`:598`).
 
+Upstream's file imports `type { DbDriver } from './db/driver.js'`, which the fork does not have; PR 0 adds a fork-owned **type shim** `src/db/driver.ts` (`DbDriver` = the fork's better-sqlite3 handle) so the ported file stays byte-identical and `HostStartContext.db` is the sync handle below. The shim is not an upstream file and is replaced by upstream's real async driver in the async-DB seam (found at build dispatch, run.md).
+
 The fork has no `hostAbortController`. PR 0 adds one, aborted as the first shutdown action to match upstream `index.ts:179`, so `HostStartContext.signal` carries real semantics rather than a stub. `HostStartContext.db` takes the fork's sync handle from `initDb` (`main.ts:187`); the registry awaits callbacks either way, so a sync callback is already legal (`HostStartCallback` returns `void | Promise<void>`).
 
 PR 0 registers nothing and is inert by construction. Acceptance case L-4 asserts that.
