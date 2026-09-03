@@ -58,7 +58,13 @@ import { getDb } from '../db/index.js';
 import { archiveSessionById } from '../db/sessions.js';
 import { guard } from '../guard/index.js';
 import { log } from '../log.js';
-import { CLOSE_REASON_MAX_CHARS, type DoneProposal } from '../modules/mailbox/index.js';
+import {
+  clearWorkContinuation,
+  readContinuationPresence,
+  CLOSE_REASON_MAX_CHARS,
+  type DoneProposal,
+} from '../modules/mailbox/index.js';
+import { withExistingNanoclawOutbound } from '../modules/mailbox/session.js';
 import { hasAdminPrivilege } from '../modules/permissions/db/user-roles.js';
 import { withExistingMailboxSession } from '../session-manager.js';
 import { requiredConfirmations, threadsClose, type ThreadClosePayload } from './thread-close-guard.js';
@@ -435,20 +441,25 @@ export async function requestThreadClose(
  * around them (invariant I-2).
  */
 async function forceClearWorkContinuation(session: CloseSession, threadId: string): Promise<boolean> {
-  // Existing-only, and the ONE fork op that opens outbound.db read-write from
-  // inside a session. The file must already exist: `prepare()` here would
-  // author a container-owned outbound.db for a session the host is closing.
-  const cleared = await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) => {
-    // No outbound.db means no container ever ran here, so there is no
-    // continuation to clear and nothing to resurrect — cleared is the honest
-    // answer. Checked BEFORE the writable op, because `clearWorkContinuation`
-    // opens outbound read-write and the opener throws for a file the host must
-    // never author; `ensureContinuationCleared` would read that throw as
-    // not-cleared and leave the closure `finalizing` forever. Not an edge
-    // case: `exists()` answers on inbound.db alone, so this callback runs for
-    // the whole never-woken cohort.
-    if (!mailbox.hasOutbound()) return true;
-    const held = mailbox.clearWorkContinuation();
+  // OUTBOUND-keyed, not a mailbox session. `work_continuation` lives in
+  // outbound.db and nothing here reads inbound at all, so the existence
+  // question this path must ask is about outbound.db alone.
+  //
+  // Going through `withExistingMailboxSession` asked the wrong one: that
+  // funnel keys existence on inbound.db, so a session whose inbound.db is gone
+  // while outbound.db remains — a real cohort, the same one `host-sweep.ts`'s
+  // usage rollup names — resolved `undefined`, which this function read as
+  // "cleared". The finalizer would then archive a session with a live
+  // `work_continuation` (or `pending_next`) still sitting in outbound.
+  //
+  // `undefined` from this funnel means outbound.db is genuinely ABSENT: the
+  // container owns that file, one that never ran has not written it, and a
+  // session with no outbound.db holds no continuation to clear. That is the
+  // only shape this function may call cleared without looking. A file that is
+  // present but will not open raises from the opener instead, and
+  // `ensureContinuationCleared` counts that as not-cleared.
+  const cleared = await withExistingNanoclawOutbound(session.agent_group_id, session.id, (outbound) => {
+    const held = clearWorkContinuation(outbound);
     if (held) {
       log.info('thread-close: force-cleared a work_continuation the container still held', {
         threadId,
@@ -460,12 +471,8 @@ async function forceClearWorkContinuation(session: CloseSession, threadId: strin
     }
     // Presence, not validity: a record that will not parse is still a record,
     // and "we could not read it" is not a state this path may call cleared.
-    return mailbox.readContinuationPresence() === null;
+    return readContinuationPresence(outbound) === null;
   });
-  // `undefined` means the mailbox is gone entirely — nothing left to
-  // resurrect, so the close may proceed. The never-woken shape (inbound.db
-  // present, outbound.db absent) does NOT arrive here as `undefined`; it is
-  // answered by the `hasOutbound` branch inside.
   return cleared ?? true;
 }
 

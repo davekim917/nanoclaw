@@ -130,22 +130,19 @@ describe('test_scheduleTask_rejects_unwired_destination', () => {
     ).run();
 
     await expect(
-      scheduleTask(
-        {
-          id: 't-unwired',
-          agentGroupId: AGENT_GROUP_ID,
-          cron: '0 3 * * *',
-          processAfter: new Date(Date.now() + 86400000).toISOString(),
-          seriesId: 's-unwired',
-          prompt: 'should not schedule',
-          destination: {
-            platformId: 'discord:test:unwired',
-            channelType: 'discord',
-            threadId: null,
-          },
+      scheduleTask({
+        id: 't-unwired',
+        agentGroupId: AGENT_GROUP_ID,
+        cron: '0 3 * * *',
+        processAfter: new Date(Date.now() + 86400000).toISOString(),
+        seriesId: 's-unwired',
+        prompt: 'should not schedule',
+        destination: {
+          platformId: 'discord:test:unwired',
+          channelType: 'discord',
+          threadId: null,
         },
-        TEST_DIR,
-      ),
+      }),
     ).rejects.toThrow(/not wired/);
   });
 
@@ -154,22 +151,19 @@ describe('test_scheduleTask_rejects_unwired_destination', () => {
     seedInboundDb();
 
     await expect(
-      scheduleTask(
-        {
-          id: 't-missing-mg',
-          agentGroupId: AGENT_GROUP_ID,
-          cron: '0 3 * * *',
-          processAfter: new Date(Date.now() + 86400000).toISOString(),
-          seriesId: 's-missing-mg',
-          prompt: 'should not schedule',
-          destination: {
-            platformId: 'discord:test:does-not-exist',
-            channelType: 'discord',
-            threadId: null,
-          },
+      scheduleTask({
+        id: 't-missing-mg',
+        agentGroupId: AGENT_GROUP_ID,
+        cron: '0 3 * * *',
+        processAfter: new Date(Date.now() + 86400000).toISOString(),
+        seriesId: 's-missing-mg',
+        prompt: 'should not schedule',
+        destination: {
+          platformId: 'discord:test:does-not-exist',
+          channelType: 'discord',
+          threadId: null,
         },
-        TEST_DIR,
-      ),
+      }),
     ).rejects.toThrow(/no messaging group/);
   });
 });
@@ -199,18 +193,15 @@ describe('test_scheduleTask_rejects_cross_workgroup_peer', () => {
     ).run(MESSAGING_GROUP_ID);
 
     await expect(
-      scheduleTask(
-        {
-          id: 't-xwg',
-          agentGroupId: AGENT_GROUP_ID,
-          cron: '0 3 * * *',
-          processAfter: new Date(Date.now() + 86400000).toISOString(),
-          seriesId: 's-xwg',
-          prompt: 'should not schedule',
-          destination: TEST_DESTINATION,
-        },
-        TEST_DIR,
-      ),
+      scheduleTask({
+        id: 't-xwg',
+        agentGroupId: AGENT_GROUP_ID,
+        cron: '0 3 * * *',
+        processAfter: new Date(Date.now() + 86400000).toISOString(),
+        seriesId: 's-xwg',
+        prompt: 'should not schedule',
+        destination: TEST_DESTINATION,
+      }),
     ).rejects.toThrow(/cross workgroup boundaries/i);
   });
 
@@ -235,18 +226,15 @@ describe('test_scheduleTask_rejects_cross_workgroup_peer', () => {
     ).run(MESSAGING_GROUP_ID);
 
     await expect(
-      scheduleTask(
-        {
-          id: 't-peer-null',
-          agentGroupId: AGENT_GROUP_ID,
-          cron: '0 3 * * *',
-          processAfter: new Date(Date.now() + 86400000).toISOString(),
-          seriesId: 's-peer-null',
-          prompt: 'should not schedule',
-          destination: TEST_DESTINATION,
-        },
-        TEST_DIR,
-      ),
+      scheduleTask({
+        id: 't-peer-null',
+        agentGroupId: AGENT_GROUP_ID,
+        cron: '0 3 * * *',
+        processAfter: new Date(Date.now() + 86400000).toISOString(),
+        seriesId: 's-peer-null',
+        prompt: 'should not schedule',
+        destination: TEST_DESTINATION,
+      }),
     ).rejects.toThrow(/cross workgroup boundaries/i);
   });
 
@@ -271,18 +259,15 @@ describe('test_scheduleTask_rejects_cross_workgroup_peer', () => {
     ).run(MESSAGING_GROUP_ID);
 
     await expect(
-      scheduleTask(
-        {
-          id: 't-sibling',
-          agentGroupId: AGENT_GROUP_ID,
-          cron: '0 3 * * *',
-          processAfter: new Date(Date.now() + 86400000).toISOString(),
-          seriesId: 's-sibling',
-          prompt: 'should schedule',
-          destination: TEST_DESTINATION,
-        },
-        TEST_DIR,
-      ),
+      scheduleTask({
+        id: 't-sibling',
+        agentGroupId: AGENT_GROUP_ID,
+        cron: '0 3 * * *',
+        processAfter: new Date(Date.now() + 86400000).toISOString(),
+        seriesId: 's-sibling',
+        prompt: 'should schedule',
+        destination: TEST_DESTINATION,
+      }),
     ).resolves.toBeUndefined();
   });
 
@@ -311,18 +296,15 @@ describe('test_scheduleTask_rejects_cross_workgroup_peer', () => {
     // AGENT_GROUP_ID already has workgroup_id NULL (default).
 
     await expect(
-      scheduleTask(
-        {
-          id: 't-null-wg',
-          agentGroupId: AGENT_GROUP_ID,
-          cron: '0 3 * * *',
-          processAfter: new Date(Date.now() + 86400000).toISOString(),
-          seriesId: 's-null-wg',
-          prompt: 'should not schedule',
-          destination: TEST_DESTINATION,
-        },
-        TEST_DIR,
-      ),
+      scheduleTask({
+        id: 't-null-wg',
+        agentGroupId: AGENT_GROUP_ID,
+        cron: '0 3 * * *',
+        processAfter: new Date(Date.now() + 86400000).toISOString(),
+        seriesId: 's-null-wg',
+        prompt: 'should not schedule',
+        destination: TEST_DESTINATION,
+      }),
     ).rejects.toThrow(/cross workgroup boundaries/i);
   });
 });
@@ -333,18 +315,15 @@ describe('test_scheduletask_omits_script_when_absent', () => {
     seedActiveSession();
     seedInboundDb();
 
-    await scheduleTask(
-      {
-        id: 't-no-script',
-        agentGroupId: AGENT_GROUP_ID,
-        cron: '0 3 * * *',
-        processAfter: new Date(Date.now() + 86400000).toISOString(),
-        seriesId: 's-no-script',
-        prompt: 'do thing',
-        destination: TEST_DESTINATION,
-      },
-      TEST_DIR,
-    );
+    await scheduleTask({
+      id: 't-no-script',
+      agentGroupId: AGENT_GROUP_ID,
+      cron: '0 3 * * *',
+      processAfter: new Date(Date.now() + 86400000).toISOString(),
+      seriesId: 's-no-script',
+      prompt: 'do thing',
+      destination: TEST_DESTINATION,
+    });
 
     const db = openInboundDb(taskInboundPath('s-no-script'));
     const row = db.prepare("SELECT content FROM messages_in WHERE series_id = 's-no-script'").get() as {
@@ -364,19 +343,16 @@ describe('test_scheduletask_includes_script_when_present', () => {
     seedActiveSession();
     seedInboundDb();
 
-    await scheduleTask(
-      {
-        id: 't-with-script',
-        agentGroupId: AGENT_GROUP_ID,
-        cron: '0 3 * * *',
-        processAfter: new Date(Date.now() + 86400000).toISOString(),
-        seriesId: 's-with-script',
-        prompt: 'do thing',
-        script: 'echo hi',
-        destination: TEST_DESTINATION,
-      },
-      TEST_DIR,
-    );
+    await scheduleTask({
+      id: 't-with-script',
+      agentGroupId: AGENT_GROUP_ID,
+      cron: '0 3 * * *',
+      processAfter: new Date(Date.now() + 86400000).toISOString(),
+      seriesId: 's-with-script',
+      prompt: 'do thing',
+      script: 'echo hi',
+      destination: TEST_DESTINATION,
+    });
 
     const db = openInboundDb(taskInboundPath('s-with-script'));
     const row = db.prepare("SELECT content FROM messages_in WHERE series_id = 's-with-script'").get() as {
@@ -397,18 +373,15 @@ describe('test_scheduleTask_inserts_new', () => {
     seedInboundDb();
 
     const processAfter = new Date(Date.now() + 86400000).toISOString();
-    await scheduleTask(
-      {
-        id: 't1',
-        agentGroupId: AGENT_GROUP_ID,
-        cron: '0 3 * * *',
-        processAfter,
-        seriesId: 's1',
-        prompt: 'do thing',
-        destination: TEST_DESTINATION,
-      },
-      TEST_DIR,
-    );
+    await scheduleTask({
+      id: 't1',
+      agentGroupId: AGENT_GROUP_ID,
+      cron: '0 3 * * *',
+      processAfter,
+      seriesId: 's1',
+      prompt: 'do thing',
+      destination: TEST_DESTINATION,
+    });
 
     const db = openInboundDb(taskInboundPath('s1'));
     const rows = db.prepare("SELECT * FROM messages_in WHERE series_id = 's1'").all() as Array<{
@@ -446,30 +419,24 @@ describe('test_scheduleTask_idempotent', () => {
     const processAfter1 = new Date(Date.now() + 86400000).toISOString();
     const processAfter2 = new Date(Date.now() + 172800000).toISOString();
 
-    await scheduleTask(
-      {
-        id: 't2a',
-        agentGroupId: AGENT_GROUP_ID,
-        cron: '0 3 * * *',
-        processAfter: processAfter1,
-        seriesId: 's-idempotent',
-        destination: TEST_DESTINATION,
-        prompt: 'do thing',
-      },
-      TEST_DIR,
-    );
-    await scheduleTask(
-      {
-        id: 't2b',
-        agentGroupId: AGENT_GROUP_ID,
-        cron: '0 3 * * *',
-        processAfter: processAfter2,
-        destination: TEST_DESTINATION,
-        seriesId: 's-idempotent',
-        prompt: 'do thing updated',
-      },
-      TEST_DIR,
-    );
+    await scheduleTask({
+      id: 't2a',
+      agentGroupId: AGENT_GROUP_ID,
+      cron: '0 3 * * *',
+      processAfter: processAfter1,
+      seriesId: 's-idempotent',
+      destination: TEST_DESTINATION,
+      prompt: 'do thing',
+    });
+    await scheduleTask({
+      id: 't2b',
+      agentGroupId: AGENT_GROUP_ID,
+      cron: '0 3 * * *',
+      processAfter: processAfter2,
+      destination: TEST_DESTINATION,
+      seriesId: 's-idempotent',
+      prompt: 'do thing updated',
+    });
 
     const db = openInboundDb(taskInboundPath('s-idempotent'));
     const rows = db.prepare("SELECT * FROM messages_in WHERE series_id = 's-idempotent'").all() as Array<{
@@ -487,18 +454,15 @@ describe('test_scheduleTask_idempotent', () => {
     seedInboundDb();
 
     const initialProcessAfter = new Date(Date.now() + 86400000).toISOString();
-    await scheduleTask(
-      {
-        id: 't-admitted',
-        agentGroupId: AGENT_GROUP_ID,
-        cron: '0 3 * * *',
-        processAfter: initialProcessAfter,
-        seriesId: 's-admitted',
-        destination: TEST_DESTINATION,
-        prompt: 'first version',
-      },
-      TEST_DIR,
-    );
+    await scheduleTask({
+      id: 't-admitted',
+      agentGroupId: AGENT_GROUP_ID,
+      cron: '0 3 * * *',
+      processAfter: initialProcessAfter,
+      seriesId: 's-admitted',
+      destination: TEST_DESTINATION,
+      prompt: 'first version',
+    });
 
     const inboundDbPath = taskInboundPath('s-admitted');
     {
@@ -523,18 +487,15 @@ describe('test_scheduleTask_idempotent', () => {
     }
 
     const updatedProcessAfter = new Date(Date.now() + 172800000).toISOString();
-    await scheduleTask(
-      {
-        id: 'ignored-for-active-update',
-        agentGroupId: AGENT_GROUP_ID,
-        cron: '0 4 * * *',
-        processAfter: updatedProcessAfter,
-        seriesId: 's-admitted',
-        destination: TEST_DESTINATION,
-        prompt: 'second version',
-      },
-      TEST_DIR,
-    );
+    await scheduleTask({
+      id: 'ignored-for-active-update',
+      agentGroupId: AGENT_GROUP_ID,
+      cron: '0 4 * * *',
+      processAfter: updatedProcessAfter,
+      seriesId: 's-admitted',
+      destination: TEST_DESTINATION,
+      prompt: 'second version',
+    });
 
     const db = openInboundDb(inboundDbPath);
     const rows = db
@@ -573,18 +534,15 @@ describe('test_scheduleTask_does_not_resurrect_completed_row', () => {
     const processAfter2 = new Date(Date.now() + 172800000).toISOString();
 
     // Schedule, then mark the row completed (simulating sweeper-clone after task fired).
-    await scheduleTask(
-      {
-        id: 'tcompleted',
-        agentGroupId: AGENT_GROUP_ID,
-        cron: '0 3 * * *',
-        destination: TEST_DESTINATION,
-        processAfter: processAfter1,
-        seriesId: 's-completed-history',
-        prompt: 'first',
-      },
-      TEST_DIR,
-    );
+    await scheduleTask({
+      id: 'tcompleted',
+      agentGroupId: AGENT_GROUP_ID,
+      cron: '0 3 * * *',
+      destination: TEST_DESTINATION,
+      processAfter: processAfter1,
+      seriesId: 's-completed-history',
+      prompt: 'first',
+    });
     {
       const db = openInboundDb(taskInboundPath('s-completed-history'));
       db.prepare("UPDATE messages_in SET status = 'completed' WHERE series_id = ?").run('s-completed-history');
@@ -592,18 +550,15 @@ describe('test_scheduleTask_does_not_resurrect_completed_row', () => {
     }
 
     // Re-schedule with same seriesId. The completed row must NOT be updated; a new row is inserted.
-    await scheduleTask(
-      {
-        id: 'tnew',
-        agentGroupId: AGENT_GROUP_ID,
-        destination: TEST_DESTINATION,
-        cron: '0 4 * * *',
-        processAfter: processAfter2,
-        seriesId: 's-completed-history',
-        prompt: 'second',
-      },
-      TEST_DIR,
-    );
+    await scheduleTask({
+      id: 'tnew',
+      agentGroupId: AGENT_GROUP_ID,
+      destination: TEST_DESTINATION,
+      cron: '0 4 * * *',
+      processAfter: processAfter2,
+      seriesId: 's-completed-history',
+      prompt: 'second',
+    });
 
     const db = openInboundDb(taskInboundPath('s-completed-history'));
     const rows = db
@@ -629,18 +584,15 @@ describe('test_scheduleTask_re_enable_after_cancel', () => {
     seedActiveSession();
     seedInboundDb();
 
-    await scheduleTask(
-      {
-        id: 'tc1',
-        destination: TEST_DESTINATION,
-        agentGroupId: AGENT_GROUP_ID,
-        cron: '0 3 * * *',
-        processAfter: new Date(Date.now() + 86400000).toISOString(),
-        seriesId: 's-cancel-reenable',
-        prompt: 'before-cancel',
-      },
-      TEST_DIR,
-    );
+    await scheduleTask({
+      id: 'tc1',
+      destination: TEST_DESTINATION,
+      agentGroupId: AGENT_GROUP_ID,
+      cron: '0 3 * * *',
+      processAfter: new Date(Date.now() + 86400000).toISOString(),
+      seriesId: 's-cancel-reenable',
+      prompt: 'before-cancel',
+    });
     // A module disable flow flips the seeded row to cancelled.
     {
       const db = openInboundDb(taskInboundPath('s-cancel-reenable'));
@@ -652,18 +604,15 @@ describe('test_scheduleTask_re_enable_after_cancel', () => {
 
     // Re-enable.
     const newProcessAfter = new Date(Date.now() + 172800000).toISOString();
-    await scheduleTask(
-      {
-        destination: TEST_DESTINATION,
-        id: 'tc2',
-        agentGroupId: AGENT_GROUP_ID,
-        cron: '0 3 * * *',
-        processAfter: newProcessAfter,
-        seriesId: 's-cancel-reenable',
-        prompt: 'after-reenable',
-      },
-      TEST_DIR,
-    );
+    await scheduleTask({
+      destination: TEST_DESTINATION,
+      id: 'tc2',
+      agentGroupId: AGENT_GROUP_ID,
+      cron: '0 3 * * *',
+      processAfter: newProcessAfter,
+      seriesId: 's-cancel-reenable',
+      prompt: 'after-reenable',
+    });
 
     const db = openInboundDb(taskInboundPath('s-cancel-reenable'));
     const rows = db
@@ -682,18 +631,15 @@ describe('test_scheduleTask_resolves_session_when_missing', () => {
   it('creates a session stub when no active session exists for the agent group', async () => {
     // No session seeded — scheduleTask should create one.
     const processAfter = new Date(Date.now() + 86400000).toISOString();
-    await scheduleTask(
-      {
-        id: 't3',
-        agentGroupId: AGENT_GROUP_ID,
-        cron: '0 3 * * *',
-        processAfter,
-        seriesId: 's3',
-        prompt: 'created session',
-        destination: TEST_DESTINATION,
-      },
-      TEST_DIR,
-    );
+    await scheduleTask({
+      id: 't3',
+      agentGroupId: AGENT_GROUP_ID,
+      cron: '0 3 * * *',
+      processAfter,
+      seriesId: 's3',
+      prompt: 'created session',
+      destination: TEST_DESTINATION,
+    });
 
     // A per-series system session row should now exist in the central DB.
     const centralDb = getDb();
@@ -743,7 +689,7 @@ describe('test_scheduleTask_leaves_the_container_owned_outbound_alone', () => {
     };
 
     // First call creates the session and provisions both DBs.
-    await scheduleTask({ ...base, id: 't-outbound-1', prompt: 'first' }, TEST_DIR);
+    await scheduleTask({ ...base, id: 't-outbound-1', prompt: 'first' });
     const sessionRow = getDb()
       .prepare(
         "SELECT id FROM sessions WHERE agent_group_id = ? AND messaging_group_id IS NULL AND thread_id = ? AND status = 'active' LIMIT 1",
@@ -754,7 +700,7 @@ describe('test_scheduleTask_leaves_the_container_owned_outbound_alone', () => {
     fs.rmSync(outbound);
 
     // Second call on the same series — the session exists now.
-    await scheduleTask({ ...base, id: 't-outbound-2', prompt: 'second' }, TEST_DIR);
+    await scheduleTask({ ...base, id: 't-outbound-2', prompt: 'second' });
 
     expect(fs.existsSync(outbound)).toBe(false);
     // `upsertTaskSeries` keeps one live row per series and updates it in place,
@@ -795,8 +741,32 @@ describe('test_resolveActiveSession_unique_index_handles_race', () => {
     // Easier test: just call resolveActiveSession twice — second call hits
     // the existing row via lookup. That validates the lookup path. The
     // catch-on-conflict path is exercised by the unique-index test below.
-    const first = await resolveActiveSession(AGENT_GROUP_ID, MESSAGING_GROUP_ID, TEST_DIR);
+    const first = await resolveActiveSession(AGENT_GROUP_ID, MESSAGING_GROUP_ID);
     expect(first.id).toBe(winnerId);
+  });
+
+  /**
+   * The mailbox must land under the SAME root the rest of the process uses.
+   *
+   * This used to take a `dataDir` argument, mkdir a session directory under
+   * it, and then call `prepare()`, which derives its own paths from the
+   * configured `DATA_DIR`. A caller passing anything else got an empty
+   * directory under its root and the real databases under `DATA_DIR` — a
+   * session with no mailbox where it was asked for, and a write into the
+   * configured root. There is no root argument any more, and `prepare()`
+   * mkdirs the directory itself, so this pins the one remaining root.
+   *
+   * The scratch root here is the mocked `DATA_DIR` at the top of the file,
+   * which is what makes this a real scratch-root assertion rather than a
+   * tautology.
+   */
+  it('provisions the session mailbox under the configured root, both files', async () => {
+    const { id } = await resolveActiveSession(AGENT_GROUP_ID, MESSAGING_GROUP_ID);
+
+    expect(fs.existsSync(path.join(agentSessionDir(id), 'inbound.db'))).toBe(true);
+    expect(fs.existsSync(path.join(agentSessionDir(id), 'outbound.db'))).toBe(true);
+    // And nothing was created outside it — the whole tree lives under the root.
+    expect(agentSessionDir(id).startsWith(TEST_DIR)).toBe(true);
   });
 
   it('rejects a duplicate channel-root INSERT once the unique index is applied', () => {
