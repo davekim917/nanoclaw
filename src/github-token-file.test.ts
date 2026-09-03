@@ -21,6 +21,9 @@ import {
 
 let dataDir: string;
 
+/** Default liveness stub — these cases are not about group deletion. */
+const alwaysExists = () => true;
+
 beforeEach(() => {
   dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gh-token-file-'));
   clearGroupTokenRefreshers();
@@ -159,7 +162,7 @@ describe('refreshGroupGitHubTokenFiles', () => {
     const fd = fs.openSync(groupTokenPath('group-a', dataDir), 'r');
     registerGroupTokenRefresher('group-a', async () => 'ghs_new');
 
-    await expect(refreshGroupGitHubTokenFiles(dataDir)).resolves.toBe(1);
+    await expect(refreshGroupGitHubTokenFiles(dataDir, alwaysExists)).resolves.toBe(1);
     expect(readGroupGitHubTokenFile('group-a', dataDir)).toBe('ghs_new');
     try {
       const buf = Buffer.alloc(128);
@@ -174,7 +177,7 @@ describe('refreshGroupGitHubTokenFiles', () => {
     planGitHubTokenSpawn({ agentGroupId: 'group-a', token: 'ghs_same', env: {}, dataDir, hostUid: 1001 });
     registerGroupTokenRefresher('group-a', async () => 'ghs_same');
 
-    await expect(refreshGroupGitHubTokenFiles(dataDir)).resolves.toBe(0);
+    await expect(refreshGroupGitHubTokenFiles(dataDir, alwaysExists)).resolves.toBe(0);
   });
 
   it('leaves the last good token in place when a resolver fails or returns nothing', async () => {
@@ -185,7 +188,7 @@ describe('refreshGroupGitHubTokenFiles', () => {
     });
     registerGroupTokenRefresher('group-b', async () => undefined);
 
-    await expect(refreshGroupGitHubTokenFiles(dataDir)).resolves.toBe(0);
+    await expect(refreshGroupGitHubTokenFiles(dataDir, alwaysExists)).resolves.toBe(0);
     expect(readGroupGitHubTokenFile('group-a', dataDir)).toBe('ghs_good');
     expect(readGroupGitHubTokenFile('group-b', dataDir)).toBe('ghs_good_b');
   });
@@ -198,7 +201,7 @@ describe('refreshGroupGitHubTokenFiles', () => {
     });
     registerGroupTokenRefresher('group-b', async () => 'ghs_new_b');
 
-    await expect(refreshGroupGitHubTokenFiles(dataDir)).resolves.toBe(1);
+    await expect(refreshGroupGitHubTokenFiles(dataDir, alwaysExists)).resolves.toBe(1);
     expect(readGroupGitHubTokenFile('group-b', dataDir)).toBe('ghs_new_b');
   });
 
@@ -207,7 +210,7 @@ describe('refreshGroupGitHubTokenFiles', () => {
     registerGroupTokenRefresher('group-a', async () => 'ghs_first');
     registerGroupTokenRefresher('group-a', async () => 'ghs_second');
 
-    await expect(refreshGroupGitHubTokenFiles(dataDir)).resolves.toBe(1);
+    await expect(refreshGroupGitHubTokenFiles(dataDir, alwaysExists)).resolves.toBe(1);
     expect(readGroupGitHubTokenFile('group-a', dataDir)).toBe('ghs_second');
   });
 });
@@ -238,7 +241,7 @@ describe('refresh never creates a file', () => {
     // A caller that registered anyway must still not put a credential on disk.
     registerGroupTokenRefresher('group-a', async () => 'ghs_env');
 
-    await expect(refreshGroupGitHubTokenFiles(dataDir)).resolves.toBe(0);
+    await expect(refreshGroupGitHubTokenFiles(dataDir, alwaysExists)).resolves.toBe(0);
     expect(fs.existsSync(groupTokenPath('group-a', dataDir))).toBe(false);
   });
 });
@@ -291,7 +294,7 @@ describe('refresh concurrency', () => {
       });
     }
 
-    const done = refreshGroupGitHubTokenFiles(dataDir);
+    const done = refreshGroupGitHubTokenFiles(dataDir, alwaysExists);
     // All three resolvers must be in flight before any of them is allowed to
     // finish. Serial awaits would deadlock here instead of reaching 3.
     await new Promise((r) => setImmediate(r));
@@ -324,5 +327,57 @@ describe('githubTokenDeliveredAsEnv', () => {
       expect(plan.envArgs.some((a) => a.startsWith('GITHUB_TOKEN='))).toBe(saysEnv);
       expect(plan.mount === undefined).toBe(saysEnv);
     }
+  });
+});
+
+describe('revoking a deleted group', () => {
+  it('deletes the token file when the group is gone, so the orphaned container loses GitHub access', async () => {
+    planGitHubTokenSpawn({ agentGroupId: 'group-gone', token: 'ghs_live', env: {}, dataDir, hostUid: 1001 });
+    registerGroupTokenRefresher('group-gone', async () => 'ghs_fresh');
+    expect(readGroupGitHubTokenFile('group-gone', dataDir)).toBe('ghs_live');
+
+    // `ncl groups delete` removes the rows and leaves the container running.
+    await expect(refreshGroupGitHubTokenFiles(dataDir, () => false)).resolves.toBe(0);
+
+    expect(fs.existsSync(groupTokenPath('group-gone', dataDir))).toBe(false);
+    expect(fs.existsSync(path.join(dataDir, 'gh-token', 'group-gone'))).toBe(false);
+  });
+
+  it('never re-mints for a deleted group — the revocation must not be undone on the next tick', async () => {
+    planGitHubTokenSpawn({ agentGroupId: 'group-gone', token: 'ghs_live', env: {}, dataDir, hostUid: 1001 });
+    let resolverCalls = 0;
+    registerGroupTokenRefresher('group-gone', async () => {
+      resolverCalls += 1;
+      return 'ghs_fresh';
+    });
+
+    await refreshGroupGitHubTokenFiles(dataDir, () => false);
+    await refreshGroupGitHubTokenFiles(dataDir, () => false);
+
+    expect(resolverCalls).toBe(0);
+    expect(fs.existsSync(groupTokenPath('group-gone', dataDir))).toBe(false);
+  });
+
+  it('revokes a group deleted while the host was down, which has no registry entry to find', async () => {
+    // No registerGroupTokenRefresher: a fresh host process has an empty map,
+    // but the file is still on disk and still mounted into whatever is running.
+    planGitHubTokenSpawn({ agentGroupId: 'group-orphan', token: 'ghs_live', env: {}, dataDir, hostUid: 1001 });
+    clearGroupTokenRefreshers();
+
+    await refreshGroupGitHubTokenFiles(dataDir, () => false);
+
+    expect(fs.existsSync(path.join(dataDir, 'gh-token', 'group-orphan'))).toBe(false);
+  });
+
+  it('leaves live groups alone while revoking the deleted one', async () => {
+    planGitHubTokenSpawn({ agentGroupId: 'group-live', token: 'ghs_old', env: {}, dataDir, hostUid: 1001 });
+    planGitHubTokenSpawn({ agentGroupId: 'group-gone', token: 'ghs_old', env: {}, dataDir, hostUid: 1001 });
+    registerGroupTokenRefresher('group-live', async () => 'ghs_new');
+    registerGroupTokenRefresher('group-gone', async () => 'ghs_new');
+
+    await expect(refreshGroupGitHubTokenFiles(dataDir, (id) => id === 'group-live')).resolves.toBe(1);
+
+    expect(readGroupGitHubTokenFile('group-live', dataDir)).toBe('ghs_new');
+    expect(fs.existsSync(groupTokenPath('group-gone', dataDir))).toBe(false);
   });
 });

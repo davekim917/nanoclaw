@@ -197,6 +197,54 @@ export function clearGroupTokenRefreshers(): void {
   refreshers.clear();
 }
 
+/** Default liveness check — is this agent group still in the central DB? */
+async function groupStillExists(agentGroupId: string): Promise<boolean> {
+  const { getAgentGroup } = await import('./db/agent-groups.js');
+  return getAgentGroup(agentGroupId) !== undefined;
+}
+
+/**
+ * Revoke the mounted credential of any group that no longer exists.
+ *
+ * `ncl groups delete` removes the DB rows and says so in its own description:
+ * killing running containers and cleaning on-disk state are out of scope. That
+ * used to be survivable for GitHub auth — the deleted group's container kept an
+ * env frozen at spawn, and its App installation token died within the hour.
+ * A file the host keeps rewriting does not die, so without this an operator's
+ * delete would leave the orphaned container authenticated to GitHub forever.
+ * Deleting the file is the revocation: the container loses access on its next
+ * git or gh call.
+ *
+ * Scans the directory rather than the in-memory registry on purpose — a group
+ * deleted while the host was down has no registry entry to find, but its token
+ * file is still on disk and still mounted into whatever is still running.
+ */
+async function revokeDeletedGroupTokens(
+  dataDir: string,
+  groupExists: (id: string) => boolean | Promise<boolean>,
+): Promise<number> {
+  const root = path.join(dataDir, 'gh-token');
+  let entries: string[];
+  try {
+    entries = fs.readdirSync(root);
+  } catch {
+    return 0;
+  }
+  let revoked = 0;
+  for (const agentGroupId of entries) {
+    try {
+      if (await groupExists(agentGroupId)) continue;
+      refreshers.delete(agentGroupId);
+      fs.rmSync(path.join(root, agentGroupId), { recursive: true, force: true });
+      revoked += 1;
+      log.warn('Agent group no longer exists — revoked its mounted GitHub token', { agentGroupId });
+    } catch (err) {
+      log.warn('Could not revoke the mounted GitHub token of a deleted group', { agentGroupId, err });
+    }
+  }
+  return revoked;
+}
+
 /**
  * Rewrite every registered group's token file whose value has changed. Returns
  * the count rewritten.
@@ -204,9 +252,16 @@ export function clearGroupTokenRefreshers(): void {
  * REFRESHES, NEVER CREATES. A group that spawned under the rollback flag has no
  * file, and this must not conjure one — the flag's whole promise is that env
  * mode writes no credential to disk. Absent file means nothing to refresh.
+ *
+ * Revokes deleted groups first, so a group removed since the last tick loses
+ * its credential in the same pass rather than being re-minted one last time.
  */
-export async function refreshGroupGitHubTokenFiles(dataDir: string = DATA_DIR): Promise<number> {
+export async function refreshGroupGitHubTokenFiles(
+  dataDir: string = DATA_DIR,
+  groupExists: (id: string) => boolean | Promise<boolean> = groupStillExists,
+): Promise<number> {
   if (githubTokenInEnv()) return 0;
+  await revokeDeletedGroupTokens(dataDir, groupExists);
   // CONCURRENT, not serial. Resolving an App-sentinel group can enter a mint
   // with a 10s timeout; awaiting the groups one at a time would make a GitHub
   // outage cost `group count x 10s` on a sweep that also owns due-message
