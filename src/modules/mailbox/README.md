@@ -36,19 +36,18 @@ or on `NanoclawMailboxSession` in `index.ts` when a writer needs it in the same
 session. There is deliberately no "run this SQL" escape hatch — that hole is
 what every ratchet pattern exists to close.
 
-## The two exemptions
+## The one exemption
 
-`src/mailbox/RATCHET.json`'s host half is exactly two entries, each with its
-rationale written at the top of the file it names.
-`src/mailbox-seam-ratchet.test.ts` pins the list; a third needs the same kind
-of justification written first.
+`src/storage-manager.ts` is the sole host entry on `src/mailbox/RATCHET.json`.
+Its reclaim probes run in a worker thread over an **injected** sessions root,
+which the `DATA_DIR`-keyed mailbox cannot address, and they are strictly
+read-only. The rationale is at the top of that file; a second exemption needs
+one written there first, and `src/mailbox-seam-ratchet.test.ts` pins the list.
 
-- **`src/storage-manager.ts`** — its reclaim probes run in a worker thread over
-  an **injected** sessions root, which the `DATA_DIR`-keyed mailbox cannot
-  address, and they are strictly read-only.
-- **`src/host-sweep.ts`** — the usage rollup reads outbound.db through
-  `openOutboundDb` rather than a session. The seam's existence check is keyed
-  on **inbound.db**, so putting a pure outbound projection behind it stranded
-  the `turn_usage` rows of any session whose inbound.db was gone. The funnel
-  also carries the unopenable-DB classification that `read-only.ts` does not,
-  so the read-only session is not a drop-in here.
+Both read funnels share one failure classification: `read-only.ts`'s `openRead`
+calls the same `assertQueryable` the read-write openers do, so a
+present-but-unopenable session DB raises `SessionDbUnopenableError` whichever
+way it was opened. What the read path deliberately does not share is anything
+that writes — the hot-journal rollback stays opt-in, and inbound reads never go
+through `openInboundDb`, which opens read-write and plants a reclaim-blocking
+marker.

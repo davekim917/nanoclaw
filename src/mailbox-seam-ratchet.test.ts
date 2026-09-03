@@ -24,21 +24,14 @@ const allowlistSet = new Set(allowlist);
 /**
  * The host half of the allowlist is DONE (PR 7), so it is no longer a
  * shrinking subset — it is an exact set, and this is what it may contain.
- * Every entry is a DOCUMENTED exemption with its rationale written at the top
- * of the file it names; adding a third means writing that justification first.
  *
- *  - `src/storage-manager.ts`: reclaim probes run in a worker thread over an
- *    INJECTED sessions root, which the DATA_DIR-keyed mailbox cannot address,
- *    and they are strictly read-only.
- *  - `src/host-sweep.ts`: the usage rollup reads outbound.db through the
- *    module's own open funnel rather than a mailbox session. The seam's
- *    existence check is keyed on inbound.db, so routing a pure OUTBOUND
- *    projection through it stranded the `turn_usage` rows of every session
- *    whose inbound.db was gone (mailbox seam PR 5). The funnel also carries
- *    PR 5's unopenable-DB classification, which the read-only session does
- *    not, so this is a behavior requirement rather than a style preference.
+ * `src/storage-manager.ts` is the single documented exemption: its reclaim
+ * probes run in a worker thread over an INJECTED sessions root, which the
+ * DATA_DIR-keyed mailbox cannot address, and they are strictly read-only. The
+ * rationale lives at the top of that file; adding a second entry here means
+ * writing the same kind of justification there first.
  */
-const HOST_ALLOWLIST_EXEMPTIONS = ['src/host-sweep.ts', 'src/storage-manager.ts'];
+const HOST_ALLOWLIST_EXEMPTIONS = ['src/storage-manager.ts'];
 const RUNNER_ROOT = 'container/agent-runner/src';
 const isRunnerPath = (relPath: string): boolean => relPath.startsWith(RUNNER_ROOT + '/');
 

@@ -42,22 +42,13 @@ import { getActiveSessions, getSession, isTaskThread, updateSession } from './db
 import { getAgentGroup } from './db/agent-groups.js';
 import {
   SessionDbMissingError,
+  readSessionOutbound,
   SessionDbUnopenableError,
   sessionMailboxPath,
   type ForkContainerStateRow as ContainerState,
   type NanoclawMailboxSession,
 } from './modules/mailbox/index.js';
 import { withExistingNanoclawSession } from './modules/mailbox/session.js';
-// The usage rollup below reads outbound.db through the module's own open
-// funnel rather than a mailbox session — the seam's existence check is keyed
-// on inbound.db, and gating a pure outbound projection on that stranded the
-// turn_usage rows of any session whose inbound.db was gone (mailbox seam
-// PR 5). It is the one place in this file that still opens a session DB by
-// path, and `src/mailbox/RATCHET.json` documents it.
-//
-// The scheduled-move recovery no longer needs a path open: PR 7 moved it onto
-// `withExistingNanoclawSession`, and `openInboundDb` has no caller here.
-import { openOutboundDb } from './modules/mailbox/openers.js';
 import { restoreTaskRow, type TaskRowSnapshot } from './modules/scheduling/db.js';
 import { countLiveRowsInSessions } from './modules/scheduling/live-count.js';
 import { runHostGatedTaskScripts } from './modules/scheduling/host-script.js';
@@ -73,7 +64,6 @@ import {
   deferMessageForFreshContextRetry,
 } from './session-manager.js';
 import { rollupSessionUsage, pruneOldTurnUsage } from './db/usage.js';
-import { listTurnUsageSince } from './modules/mailbox/ops/reads.js';
 import {
   getContainerSpawnedAt,
   hasContainerEverRun,
@@ -1865,30 +1855,31 @@ async function sweepUsageRollup(sessions: Session[]): Promise<void> {
       }
       if (shouldSkipUsageRollup(usageRollupMtimeCache.get(session.id), mtimeMs)) continue;
 
-      // Read through the module's own outbound funnel, NOT the mailbox
-      // session. This projection touches outbound.db only, and the seam's
-      // existence check is keyed on inbound.db — routing it through a session
-      // added a gate the pre-seam code never had, so a session whose
-      // inbound.db is gone while outbound.db remains stopped being rolled up
-      // at all, and its turn_usage rows would never reach the central totals.
-      // `outPath` above is already the gate that belongs here: no outbound
-      // file, no rollup. Same funnel `worktree-cleanup.ts` and the GC use, so
-      // there is still one implementation of every statement.
-      const outDb = openOutboundDb(outPath);
-      try {
-        // `rollupSessionUsage` asks for only the op it uses (mailbox seam
-        // PR 6), so the funnel's handle is bound to that one op here. This is
-        // PR 6's original two-line adapter, kept rather than collapsed: what
-        // it was waiting for was PR 5 moving this loop onto a session, and
-        // PR 5 has since deliberately moved it back off one.
-        rollupSessionUsage(
-          { listTurnUsageSince: (afterId) => listTurnUsageSince(outDb, afterId) },
-          session.agent_group_id,
-          `${session.agent_group_id}/${session.id}`,
-        );
-      } finally {
-        outDb.close();
-      }
+      // Read through the module's OUTBOUND read session, not a mailbox
+      // session. The seam's existence check is keyed on inbound.db, and gating
+      // a pure outbound projection on that stranded the turn_usage rows of any
+      // session whose inbound.db was gone (mailbox seam PR 5). `outPath` above
+      // is already the gate that belongs here: no outbound file, no rollup.
+      //
+      // The two options restate what the read-write outbound funnel does, so
+      // this keeps PR 5's behavior exactly: the write path's 5s busy_timeout,
+      // and the hot-journal rollback without which a SIGKILLed container's
+      // outbound.db is unreadable forever. `readSessionOutbound` carries the
+      // same `assertQueryable` classification, so a present-but-unopenable DB
+      // raises SessionDbUnopenableError here just as the opener would.
+      //
+      // `rollupSessionUsage` asks for only the op it uses (mailbox seam PR 6),
+      // and the read session exposes exactly that op.
+      const rolled = readSessionOutbound(
+        { agentGroupId: session.agent_group_id, sessionId: session.id },
+        (mailbox) => {
+          rollupSessionUsage(mailbox, session.agent_group_id, `${session.agent_group_id}/${session.id}`);
+          return true;
+        },
+        { busyTimeoutMs: 5000, recoverJournal: true },
+      );
+      // Only a rollup that RAN may claim this mtime as processed.
+      if (!rolled) continue;
       usageRollupMtimeCache.set(session.id, mtimeMs);
     } catch (err) {
       log.warn('Usage rollup failed for session', { err, sessionId: session.id });

@@ -16,6 +16,16 @@
  *    the write path's 5s — a slow session must degrade to `unreadable` on that
  *    request, never hold the console's event loop for five seconds per file.
  *
+ * These helpers do NOT reuse the module's read-write funnels wholesale, and
+ * `readSessionInbound` in particular must not: `openInboundDb` opens
+ * READ-WRITE (no `readonly`), sets `journal_mode = DELETE` — a write to the
+ * header — and plants a storage-activity marker whose lifetime is the
+ * handle's. A console request fans out across every session in the fleet, so
+ * routing it there would write to every session it merely lists and would
+ * churn a reclaim-blocking marker per session per poll. What the two funnels
+ * share is the FAILURE CLASSIFICATION (`assertQueryable`, below), which is the
+ * part that was genuinely forked.
+ *
  * So the operator surfaces get a genuinely read-only session: a `readonly`
  * handle (SQLite itself refuses a write), no schema-ensure, no migration memo,
  * no storage-activity marker, and no provisioning of any kind. A session whose
@@ -68,7 +78,13 @@ import {
   type TaskFireRow,
   type TaskRoutingStamp,
 } from './ops/reads.js';
-import { recoverHotJournal, sessionDbPathIsGone } from './openers.js';
+import {
+  assertQueryable,
+  asMissingDbError,
+  recoverHotJournal,
+  SessionDbMissingError,
+  sessionDbPathIsGone,
+} from './openers.js';
 
 /**
  * Which session to read, and where its data lives.
@@ -165,11 +181,60 @@ function resolveReadPath(location: SessionReadLocation, side: 'inbound' | 'outbo
   return resolved === expected && resolved.startsWith(base + path.sep) ? resolved : null;
 }
 
+/**
+ * Open one side read-only, with the SAME failure classification the module's
+ * read-write funnels apply.
+ *
+ * `assertQueryable` is the shared half: a handle that constructs but cannot
+ * answer `SELECT 1 FROM sqlite_master` is a present-but-unopenable DB, and it
+ * raises `SessionDbUnopenableError` here exactly as it does through
+ * `openInboundDb`/`openOutboundDb`. Before this, the read path constructed a
+ * handle and handed it out unprobed, so the same corrupt file was a silent
+ * empty read on one funnel and a classified error on the other — one behavior
+ * with two answers, which is the fork this closes.
+ *
+ * What is deliberately NOT shared is the part that writes. `openOutboundDb`
+ * recovers a hot journal unconditionally; a rollback is a write, and a
+ * fleet-wide console read must not perform one on every session it lists, so
+ * it stays opt-in through `recoverJournal`. Callers that own the session's
+ * write anyway (the steer probe, the usage rollup) pass it and get byte-for-byte
+ * the read-write funnel's behavior.
+ */
 function openRead(dbPath: string, options: SessionReadOptions): Database.Database {
   if (options.recoverJournal) recoverHotJournal(dbPath);
-  const db = new Database(dbPath, { readonly: true });
-  db.pragma(`busy_timeout = ${options.busyTimeoutMs ?? 1000}`);
+  let db: Database.Database | undefined;
+  try {
+    db = new Database(dbPath, { readonly: true });
+    db.pragma(`busy_timeout = ${options.busyTimeoutMs ?? 1000}`);
+  } catch (err) {
+    // The construction half. better-sqlite3 opens eagerly, so a mode-000 file
+    // or an exhausted descriptor table fails HERE, not at the first query —
+    // classifying only post-construction failures would have left the common
+    // case raising a raw SqliteError on this funnel and a classified one on
+    // the read-write funnels.
+    db?.close();
+    throw asMissingDbError(err, dbPath);
+  }
+  assertQueryable(db, dbPath);
   return db;
+}
+
+/**
+ * `openRead`, with a vanished file answered as absence rather than an error.
+ *
+ * The public contract is "`undefined` means ABSENT, and only absent". The
+ * `sessionDbPathIsGone` pre-check answers that for every ordinary case, and
+ * this closes the race where the file is removed between that check and the
+ * open — which classifies as `SessionDbMissingError` and is still, honestly,
+ * absence. A present-but-unopenable DB keeps throwing.
+ */
+function openReadOrAbsent(dbPath: string, options: SessionReadOptions): Database.Database | undefined {
+  try {
+    return openRead(dbPath, options);
+  } catch (err) {
+    if (err instanceof SessionDbMissingError) return undefined;
+    throw err;
+  }
 }
 
 /**
@@ -187,7 +252,8 @@ export function readSessionInbound<T>(
 ): T | undefined {
   const dbPath = resolveReadPath(location, 'inbound');
   if (dbPath === null || sessionDbPathIsGone(dbPath)) return undefined;
-  const db = openRead(dbPath, options);
+  const db = openReadOrAbsent(dbPath, options);
+  if (!db) return undefined;
   try {
     return action({
       inboundHasMessage: (messageId) => inboundHasMessage(db, messageId),
@@ -222,7 +288,8 @@ export function readSessionOutbound<T>(
 ): T | undefined {
   const dbPath = resolveReadPath(location, 'outbound');
   if (dbPath === null || sessionDbPathIsGone(dbPath)) return undefined;
-  const db = openRead(dbPath, options);
+  const db = openReadOrAbsent(dbPath, options);
+  if (!db) return undefined;
   try {
     return action({
       getContainerState: () => getContainerState(db),
