@@ -666,6 +666,7 @@ export const SWEEP_DUTY_INVENTORY: Readonly<Record<string, string>> = {
   T20: 'claims-reconcile',
   T21: 'claims-self-heal',
   T22: 'orphaned-repo-fence-release',
+  T23: 'cli-request-execution-prune',
   S2: 'processing-ack-sync',
   S3: 'stale-pending-expiry',
   S4: 'pre-wake-orphan-claim-reset',

@@ -68,6 +68,7 @@ import { migration062 } from './062-thread-titles.js';
 import { migration063 } from './063-channel-instructions-profile.js';
 import { migration064 } from './064-container-config-security-json.js';
 import { migration066 } from './066-approvals-instance.js';
+import { migration067 } from './067-cli-request-executions.js';
 // Upstream's 014/015 — file numbers clash with local but uniqueness is by `name`.
 // Aliased to avoid JS identifier collisions with the local 014/015 above.
 import { migration014 as containerConfigs } from './014-container-configs.js';
@@ -170,6 +171,9 @@ export const migrations: Migration[] = [
   // number — registering 064 next to 063 runs it before the table exists.
   migration064,
   migration066,
+  // Standalone CREATE TABLE with no timestamp for 053 to normalize — position
+  // relative to 053 is irrelevant, same reasoning as 054/055/056 above.
+  migration067,
   messagingGroupInstance,
   migration019,
   // Last on purpose: normalizes whatever naive timestamps every migration

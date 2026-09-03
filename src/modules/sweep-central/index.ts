@@ -8,6 +8,12 @@
  * and order are unchanged from the PR 5 baseline — those coordinates encode
  * ordering constraints (plan.md §4.3 table) and must never move.
  *
+ * T23 cli-request-execution-prune (42) was added later (issue #273's
+ * at-most-once ncl ledger): slotted right after T10 since both are
+ * order-free receipt/ledger prunes with no dependency on one another (42, not
+ * 45 — host-sweep-registry.test.ts's F-4.4 probe reserves order 45 in this
+ * phase to prove tick-level duty isolation past T10's throw).
+ *
  * Registers at import — this module has no other consumer. It is imported by
  * src/modules/index.ts (production boot) and, for hermetic coverage, by
  * src/host-sweep-registry.test.ts alongside the other family-duty mocks that
@@ -17,6 +23,7 @@
  * directly, so `_resetSweepRegistryForTesting()` can replay it — see the
  * comment above `registerSweepDutySource` in src/host-sweep.ts.
  */
+import { pruneCliRequestExecutions } from '../../cli/request-ledger.js';
 import { pruneChannelIngressReceipts } from '../../db/channel-ingress-receipts.js';
 import { registerSweepDuty, registerSweepDutySource, SWEEP_DUTY_INVENTORY } from '../../host-sweep.js';
 import { log } from '../../log.js';
@@ -60,6 +67,17 @@ function registerCentralSweepDuties(): void {
     order: 40,
     run: () => {
       pruneChannelIngressReceipts();
+    },
+  });
+
+  registerSweepDuty({
+    name: id.T23,
+    phase: 'tick:housekeeping',
+    order: 42,
+    // Prune the agent `ncl` at-most-once execution ledger (issue #273). Its
+    // rows only have to outlive the delivery loop's retry of one outbound row.
+    run: () => {
+      pruneCliRequestExecutions();
     },
   });
 

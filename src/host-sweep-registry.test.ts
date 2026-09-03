@@ -978,6 +978,7 @@ describe('sweep duty registry (S2-PR2)', () => {
     ['duty', 'github-app-token-refresh', 'tick:housekeeping', 20],
     ['duty', 'steer-idempotency-prune', 'tick:housekeeping', 30],
     ['duty', 'channel-ingress-receipt-prune', 'tick:housekeeping', 40],
+    ['duty', 'cli-request-execution-prune', 'tick:housekeeping', 42],
     ['duty', 'scheduled-move-recovery', 'tick:housekeeping', 50],
     ['duty', 'audit-body-prune', 'tick:housekeeping', 60],
     ['duty', 'completed-task-auto-archive', 'tick:housekeeping', 70],
@@ -1013,11 +1014,11 @@ describe('sweep duty registry (S2-PR2)', () => {
     // Surface, name, phase AND order, in run order — a swap anywhere fails.
     expect(actual).toEqual(EXPECTED_REGISTRATIONS);
 
-    expect(actual).toHaveLength(39);
+    expect(actual).toHaveLength(40);
     const names = new Set(actual.map((r) => r[1]));
-    expect(names.size).toBe(38);
+    expect(names.size).toBe(39);
     expect(names).toEqual(new Set(Object.values(SWEEP_DUTY_INVENTORY)));
-    expect(Object.keys(SWEEP_DUTY_INVENTORY)).toHaveLength(38);
+    expect(Object.keys(SWEEP_DUTY_INVENTORY)).toHaveLength(39);
     // The one duty registered twice is the orphan-claim reset: once in the tail
     // window, once as the post-kill follow-up (rev-3 grounding §2, S17).
     expect(actual.filter((r) => r[1] === SWEEP_DUTY_INVENTORY.S17)).toHaveLength(2);
