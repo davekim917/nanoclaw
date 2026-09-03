@@ -851,6 +851,35 @@ describe('sweep duty registry (S2-PR2)', () => {
 
   // ── R-10 ───────────────────────────────────────────────────────────────────
   describe('every real wake and kill runs at mailbox depth zero', () => {
+    // Without this, every "depth: 0" below could be vacuously true — the probe
+    // must actually see the production guard's store through the fake mailbox.
+    it('the depth probe reads non-zero inside a window that holds a session', async () => {
+      _resetSweepRegistryForTesting({ builtins: false });
+      const depths: number[] = [];
+      h.sessions = [fakeSession('sess-depth')];
+      registerSweepDuty({
+        name: 'inside-plan',
+        phase: 'session:plan',
+        order: 10,
+        run: () => {
+          depths.push(probe.depth());
+        },
+      });
+      registerSweepDuty({
+        name: 'outside-wake',
+        phase: 'session:wake',
+        order: 10,
+        run: () => {
+          depths.push(probe.depth());
+        },
+      });
+
+      await _sweepOnceForTesting();
+
+      expect(depths).toEqual([1, 0]);
+      expect(h.spawns).toEqual([]);
+    });
+
     it('W2 wakeContainer', async () => {
       const session = fakeSession('sess-wake');
       h.sessions = [session];
