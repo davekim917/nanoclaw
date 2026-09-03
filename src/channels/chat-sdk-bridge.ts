@@ -75,6 +75,12 @@ export function clearSlashCommandHandlers(): void {
   slashCommandHandlers.clear();
 }
 
+/** Which dispatch an inboundFilter call is serving. */
+export interface InboundFilterContext {
+  /** True on the missed-message recovery scan, false on live dispatch. */
+  recovered: boolean;
+}
+
 /** Extract reply context from a platform-specific raw message. Return null if no reply. */
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 export type ReplyContextExtractor = (raw: Record<string, any>) => ReplyContext | null;
@@ -320,8 +326,15 @@ export interface ChatSdkBridgeConfig {
    * suppress platform-emitted system messages the SDK doesn't filter (e.g.
    * Discord MESSAGE_CREATE events for thread renames, member joins, etc.)
    * which would otherwise reach the agent as ordinary user messages.
+   *
+   * Runs on BOTH live dispatch and the recovery scan; `ctx.recovered` says
+   * which. A content filter (system messages) wants both. A filter carrying
+   * conversational state must opt out of recovery: recovery pages arrive
+   * newest-first and are sorted only afterwards, so feeding them to a
+   * stateful filter both mis-orders its state and re-judges history the live
+   * path already judged.
    */
-  inboundFilter?: (message: ChatMessage) => boolean;
+  inboundFilter?: (message: ChatMessage, ctx: InboundFilterContext) => boolean;
   /** Recover mention semantics from REST-fetched history (SDK fetches may omit isMention). */
   detectRecoveredMention?: (message: ChatMessage) => boolean;
   /** Allow selected bot-authored history rows (default recovery policy drops bots). */
@@ -1029,7 +1042,7 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
       };
 
       const passesFilter = (message: ChatMessage): boolean =>
-        config.inboundFilter ? config.inboundFilter(message) : true;
+        config.inboundFilter ? config.inboundFilter(message, { recovered: false }) : true;
 
       // Subscribed threads — every message in a thread we've previously
       // engaged. Carry the SDK's `message.isMention` through so mention-mode
@@ -1760,7 +1773,7 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
                 if (messageMs <= sinceMs) continue;
                 if (message.author.isMe) continue;
                 if (message.author.isBot === true && !config.allowRecoveredBotMessage?.(message)) continue;
-                if (config.inboundFilter && !config.inboundFilter(message)) continue;
+                if (config.inboundFilter && !config.inboundFilter(message, { recovered: true })) continue;
                 const dedupeKey = `${target.platformId}\u0000${message.id}`;
                 if (seen.has(dedupeKey)) continue;
                 seen.add(dedupeKey);

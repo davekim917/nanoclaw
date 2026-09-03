@@ -659,8 +659,11 @@ for (const ws of workspaces) {
           return self ? slackMentionOutsideCode(text, self) : true;
         },
         // Loop governor: bound a sibling-bot ping-pong that no human is in.
-        // Live traffic only — recovery has its own bot policy below.
-        inboundFilter: (message) => slackHopInboundFilter(hopGovernor, identity, message),
+        // Live dispatch only. Recovery pages arrive newest-first and are
+        // sorted afterwards, so counting them would both mis-order the hop
+        // state and re-judge history the live path already judged; recovery
+        // is separately bounded by its window and allowRecoveredBotMessage.
+        inboundFilter: (message, ctx) => (ctx.recovered ? true : slackHopInboundFilter(hopGovernor, identity, message)),
         detectRecoveredMention: (message) => {
           if (!identity) return false;
           const raw = message.raw as Record<string, unknown> | undefined;

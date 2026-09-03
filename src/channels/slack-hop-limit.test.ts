@@ -176,7 +176,7 @@ async function runThroughBridge(
   const bridge = createChatSdkBridge({
     adapter,
     supportsThreads: true,
-    inboundFilter: (message) => slackHopInboundFilter(governor, SELF, message),
+    inboundFilter: (message, ctx) => (ctx.recovered ? true : slackHopInboundFilter(governor, SELF, message)),
   });
 
   const delivered: string[] = [];
@@ -207,6 +207,32 @@ async function runThroughBridge(
   }
   return delivered;
 }
+
+describe('the governor never runs on recovery', () => {
+  /**
+   * Recovery pages arrive newest-first and are sorted only afterwards, so a
+   * stateful filter fed from them both mis-orders its state and re-judges
+   * history the live path already judged. Goes red if the ctx.recovered
+   * opt-out is dropped from the Slack wiring.
+   */
+  const wired =
+    (governor: ReturnType<typeof createSlackHopGovernor>) =>
+    (
+      message: { threadId: string; author?: { userId?: string; isBot?: boolean | 'unknown' } },
+      ctx: { recovered: boolean },
+    ) => (ctx.recovered ? true : slackHopInboundFilter(governor, SELF, message));
+
+  it('admits recovered sibling messages past the limit and leaves the counter untouched', () => {
+    const governor = createSlackHopGovernor('slack', () => 1);
+    const filter = wired(governor);
+    const message = { threadId: THREAD, author: { userId: SIBLING.userId, isBot: true } };
+    for (let i = 0; i < 5; i++) expect(filter(message, { recovered: true })).toBe(true);
+    expect(governor.hops(THREAD)).toBe(0);
+    // The live path is still governed afterwards.
+    expect(filter(message, { recovered: false })).toBe(true);
+    expect(filter(message, { recovered: false })).toBe(false);
+  });
+});
 
 describe('the governor as the Slack bridge inboundFilter', () => {
   beforeEach(() => {
