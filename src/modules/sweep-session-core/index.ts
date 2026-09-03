@@ -21,6 +21,7 @@
 import {
   SWEEP_DUTY_INVENTORY,
   asSessionContext,
+  containerOwnsOutbound,
   writeOutboundWhenStopped,
   registerSweepDuty,
   registerSweepDutySource,
@@ -165,7 +166,11 @@ export function registerSessionCoreSweepDuties(): void {
       const { session, mailbox } = asSessionContext(ctx);
       // Ownership, not just liveness: a container still SPAWNING is about to
       // own outbound.db, and this reset writes it (mailbox seam PR 5, 7199be48).
-      if (mailbox!.getProcessingClaimRows().length > 0) {
+      // Ownership short-circuits BEFORE the claim read: a live container clears
+      // its own claims, and this duty does nothing at all for one — the case
+      // below pins that no mailbox op is even reached. The guard on the write
+      // is the separate, per-write property (main uses the same pairing).
+      if (!containerOwnsOutbound(session.id) && mailbox!.getProcessingClaimRows().length > 0) {
         writeOutboundWhenStopped(session, mailbox!, () =>
           resetStuckProcessingRows(mailbox!, session, 'container not running'),
         );
