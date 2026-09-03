@@ -52,3 +52,7 @@ import './provider-fallback/index.js';
 import './repository-workspaces/index.js';
 
 import './escalation/index.js';
+
+// Sweep container health — S11 provider self-heal, S14 running-container SLA,
+// S16 OOM / memory-pressure notice (convergence seam 2, PR 10).
+import './sweep-container-health/index.js';
