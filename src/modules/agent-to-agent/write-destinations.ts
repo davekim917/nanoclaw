@@ -7,19 +7,14 @@
  * `hasTable('agent_destinations')` check — without the agent-to-agent module
  * installed, the central table doesn't exist and the projection is skipped.
  */
-import fs from 'fs';
-
 import { getAgentGroup } from '../../db/agent-groups.js';
 import { getMessagingGroup } from '../../db/messaging-groups.js';
-import { replaceDestinations, type DestinationRow } from '../../db/session-db.js';
 import { log } from '../../log.js';
-import { inboundDbPath, openInboundDb } from '../../session-manager.js';
+import type { DestinationRow } from '../mailbox/index.js';
+import { withExistingMailboxSession } from '../../session-manager.js';
 import { getDestinations } from './db/agent-destinations.js';
 
-export function writeDestinations(agentGroupId: string, sessionId: string): void {
-  const dbPath = inboundDbPath(agentGroupId, sessionId);
-  if (!fs.existsSync(dbPath)) return;
-
+export async function writeDestinations(agentGroupId: string, sessionId: string): Promise<void> {
   const rows = getDestinations(agentGroupId);
   const resolved: DestinationRow[] = [];
 
@@ -49,11 +44,14 @@ export function writeDestinations(agentGroupId: string, sessionId: string): void
     }
   }
 
-  const db = openInboundDb(agentGroupId, sessionId);
-  try {
-    replaceDestinations(db, resolved);
-  } finally {
-    db.close();
-  }
+  // Existing-only: the projection is refreshed on every wake and after admin
+  // edits, and a session with no mailbox has no container to resolve names
+  // for. Provisioning here would recreate a reclaimed directory (I-10); the
+  // old code expressed the same rule as an existsSync on inbound.db.
+  const written = await withExistingMailboxSession(agentGroupId, sessionId, (mailbox) => {
+    mailbox.replaceDestinationRows(resolved);
+    return true;
+  });
+  if (!written) return;
   log.debug('Destination map written', { sessionId, count: resolved.length });
 }

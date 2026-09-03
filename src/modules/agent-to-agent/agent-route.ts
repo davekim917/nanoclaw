@@ -29,14 +29,13 @@ import { gateCommand } from '../../command-gate.js';
 import { getAgentGroup } from '../../db/agent-groups.js';
 import { getDb } from '../../db/connection.js';
 import { getMessagingGroup } from '../../db/messaging-groups.js';
-import { getInboundSourceSessionId, getMostRecentPeerSourceSessionId } from '../../db/session-db.js';
 import { getSession, markSessionEngaged } from '../../db/sessions.js';
 import { wakeContainer } from '../../container-runner.js';
 import { GuardDenyError, guard } from '../../guard/index.js';
 import { log } from '../../log.js';
 import { upsertArchiveMessage } from '../../message-archive.js';
 import { scrubSecrets } from '../../secret-scrubber.js';
-import { openInboundDb, resolveSession, sessionDir, writeSessionMessage } from '../../session-manager.js';
+import { resolveSession, sessionDir, withExistingMailboxSession, writeSessionMessage } from '../../session-manager.js';
 import { prependThreadContext } from '../../thread-context.js';
 import type { PendingApproval, Session, SessionMode } from '../../types.js';
 import { requestApproval } from '../approvals/index.js';
@@ -192,14 +191,17 @@ export interface RoutableAgentMessage {
   in_reply_to: string | null;
 }
 
-function isExactSameSessionLoopback(msg: RoutableAgentMessage, session: Session): boolean {
+async function isExactSameSessionLoopback(msg: RoutableAgentMessage, session: Session): Promise<boolean> {
   if (!msg.in_reply_to) return false;
-  const db = openInboundDb(session.agent_group_id, session.id);
-  try {
-    return getInboundSourceSessionId(db, msg.in_reply_to) === session.id;
-  } finally {
-    db.close();
-  }
+  // A read of the caller's own queue: existing-only, never provisioning.
+  // `undefined` (mailbox gone) is not a loopback.
+  return (
+    (await withExistingMailboxSession(
+      session.agent_group_id,
+      session.id,
+      (mailbox) => mailbox.getInboundSourceSessionId(msg.in_reply_to as string) === session.id,
+    )) ?? false
+  );
 }
 
 /**
@@ -231,27 +233,23 @@ interface SessionFallback {
   mode: Exclude<SessionMode, 'shared'>;
 }
 
-function resolveTargetSession(
+async function resolveTargetSession(
   msg: RoutableAgentMessage,
   sourceSession: Session,
   targetAgentGroupId: string,
   fallback: SessionFallback,
-): { session: Session; created: boolean } {
-  const srcDb = openInboundDb(sourceSession.agent_group_id, sourceSession.id);
-  let originSessionId: string | null = null;
-  try {
-    if (msg.in_reply_to) {
-      originSessionId = getInboundSourceSessionId(srcDb, msg.in_reply_to);
-    }
-    if (!originSessionId) {
+): Promise<{ session: Session; created: boolean }> {
+  // Both lookups read the SOURCE session's queue, in one short session of its
+  // own. Existing-only: this is the return-path read, and a source whose
+  // mailbox is gone simply falls through to the newest-active heuristic.
+  const originSessionId =
+    (await withExistingMailboxSession(sourceSession.agent_group_id, sourceSession.id, (mailbox) => {
+      const direct = msg.in_reply_to ? mailbox.getInboundSourceSessionId(msg.in_reply_to) : null;
       // Peer-affinity fallback — covers the case where the container's
       // outbound write didn't carry in_reply_to (e.g. legacy MCP send_message
       // path, container running pre-fix code).
-      originSessionId = getMostRecentPeerSourceSessionId(srcDb, targetAgentGroupId);
-    }
-  } finally {
-    srcDb.close();
-  }
+      return direct ?? mailbox.getMostRecentPeerSourceSessionId(targetAgentGroupId);
+    })) ?? null;
   if (originSessionId) {
     const candidate = getSession(originSessionId);
     if (candidate && candidate.agent_group_id === targetAgentGroupId && candidate.status === 'active') {
@@ -288,7 +286,7 @@ export async function routeAgentMessage(
   const loopReason =
     isSelf && msg.kind === 'status'
       ? 'self-directed status'
-      : isSelf && isExactSameSessionLoopback(msg, session)
+      : isSelf && (await isExactSameSessionLoopback(msg, session))
         ? 'same-session loopback'
         : null;
   if (loopReason) {
@@ -440,7 +438,7 @@ async function performAgentRoute(
   // Return-path lookup (in_reply_to → source_session_id) takes precedence
   // when the candidate session matches the caller's effective mg context;
   // otherwise we fall through to the threading-aware resolveSession.
-  const { session: targetSession } = resolveTargetSession(msg, session, targetAgentGroupId, {
+  const { session: targetSession } = await resolveTargetSession(msg, session, targetAgentGroupId, {
     mgId: effectiveMgId,
     threadId: effectiveThreadId,
     mode: targetMode,

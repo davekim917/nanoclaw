@@ -11,6 +11,7 @@ import path from 'path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { ensureSchema, openInboundDb } from '../../db/session-db.js';
+import { composeNanoclawSession } from '../mailbox/index.js';
 import { insertTaskRow } from './db.js';
 import { handleRecurrence, scriptBackoffMinutes } from './recurrence.js';
 import type { Session } from '../../types.js';
@@ -19,7 +20,11 @@ import type { Session } from '../../types.js';
 // Asia/Tokyo is UTC+9 with no DST: "0 9 * * *" must land at 00:00:00Z sharp.
 vi.mock('../../config.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../../config.js')>();
-  return { ...actual, TIMEZONE: 'Asia/Tokyo', GROUPS_DIR: '/tmp/nanoclaw-recurrence-test/groups' };
+  return {
+    ...actual,
+    TIMEZONE: 'Asia/Tokyo',
+    GROUPS_DIR: '/tmp/nanoclaw-recurrence-test/groups',
+  };
 });
 
 // The auto-pause note goes through the shared appendRunLog helper, which
@@ -36,6 +41,28 @@ function freshDb() {
   fs.mkdirSync(TEST_DIR, { recursive: true });
   ensureSchema(DB_PATH, 'inbound');
   return openInboundDb(DB_PATH);
+}
+
+/**
+ * The mailbox session the sweep hands `handleRecurrence`.
+ *
+ * Built with the module's own `composeNanoclawSession` over the fixture's
+ * inbound handle, so the recurrence ops under test are the production ones
+ * (invariant I-2). No real mailbox is provisioned — a unit test must not go
+ * through `prepare()`.
+ *
+ * Recurrence is an inbound-only path, so the outbound accessor throws and
+ * `outboundPresent` is false: an accidental outbound read fails loudly.
+ */
+function sessionFor(db: ReturnType<typeof openInboundDb>) {
+  return composeNanoclawSession(
+    db,
+    () => {
+      throw new Error('recurrence must not touch outbound.db');
+    },
+    undefined,
+    false,
+  );
 }
 
 function fakeSession(): Session {
@@ -67,7 +94,7 @@ describe('handleRecurrence', () => {
     });
     db.prepare(`UPDATE messages_in SET status='completed' WHERE id='task-1'`).run();
 
-    await handleRecurrence(db, fakeSession());
+    await handleRecurrence(sessionFor(db), fakeSession());
 
     const rows = db
       .prepare(`SELECT id, status, process_after, recurrence, series_id FROM messages_in ORDER BY seq`)
@@ -99,7 +126,7 @@ describe('handleRecurrence', () => {
     });
     db.prepare(`UPDATE messages_in SET status='completed' WHERE id='task-tz'`).run();
 
-    await handleRecurrence(db, fakeSession());
+    await handleRecurrence(sessionFor(db), fakeSession());
 
     const follow = db.prepare(`SELECT process_after FROM messages_in WHERE id != 'task-tz'`).get() as {
       process_after: string;
@@ -120,7 +147,7 @@ describe('handleRecurrence', () => {
     });
     db.prepare(`UPDATE messages_in SET status='completed' WHERE id='task-1'`).run();
 
-    await handleRecurrence(db, fakeSession());
+    await handleRecurrence(sessionFor(db), fakeSession());
 
     const count = (db.prepare(`SELECT COUNT(*) AS c FROM messages_in`).get() as { c: number }).c;
     expect(count).toBe(1);
@@ -164,7 +191,7 @@ describe('handleRecurrence — script-failure backoff (streak derived from faile
   it('pushes the clone past raw cron cadence while the script is failing', async () => {
     const db = freshDb();
     seedFailedStreak(db, 3); // streak 3 → backoff 8 min; cron next ≈ +1 min
-    await handleRecurrence(db, fakeSession());
+    await handleRecurrence(sessionFor(db), fakeSession());
 
     const next = clone(db);
     expect(next.status).toBe('pending');
@@ -175,7 +202,7 @@ describe('handleRecurrence — script-failure backoff (streak derived from faile
   it('a healthy series (trailing run completed) re-arms on the raw cron grid', async () => {
     const db = freshDb();
     seedFailedStreak(db, 0);
-    await handleRecurrence(db, fakeSession());
+    await handleRecurrence(sessionFor(db), fakeSession());
 
     const next = clone(db);
     expect(next.status).toBe('pending');
@@ -186,7 +213,7 @@ describe('handleRecurrence — script-failure backoff (streak derived from faile
   it('auto-pauses the series at the cap instead of re-arming', async () => {
     const db = freshDb();
     const liveId = seedFailedStreak(db, 8);
-    await handleRecurrence(db, fakeSession());
+    await handleRecurrence(sessionFor(db), fakeSession());
 
     const next = clone(db);
     expect(next.status).toBe('paused'); // `ncl tasks resume` revives in place
@@ -200,7 +227,7 @@ describe('handleRecurrence — script-failure backoff (streak derived from faile
   it('writes the auto-pause note into the series run log via the shared appendRunLog', async () => {
     const db = freshDb();
     seedFailedStreak(db, 8);
-    await handleRecurrence(db, fakeSession());
+    await handleRecurrence(sessionFor(db), fakeSession());
 
     // Same file + format appendRunLog owns: groups/<folder>/tasks/<series>.md
     const logFile = path.join(TEST_DIR, 'groups', 'g-test', 'tasks', 'task-s-0.md');
@@ -217,7 +244,7 @@ describe('handleRecurrence — script-failure backoff (streak derived from faile
   it('leaves the owning agent an obligation, due now rather than on-wake', async () => {
     const db = freshDb();
     seedFailedStreak(db, 8);
-    await handleRecurrence(db, fakeSession());
+    await handleRecurrence(sessionFor(db), fakeSession());
 
     const note = db.prepare(`SELECT * FROM messages_in WHERE id = ?`).get('task-paused-task-s-0') as
       | { content: string; process_after: string | null; on_wake: number; kind: string }
@@ -239,8 +266,8 @@ describe('handleRecurrence — script-failure backoff (streak derived from faile
   it('raises one notice per pause, not one per sweep', async () => {
     const db = freshDb();
     seedFailedStreak(db, 8);
-    await handleRecurrence(db, fakeSession());
-    await handleRecurrence(db, fakeSession());
+    await handleRecurrence(sessionFor(db), fakeSession());
+    await handleRecurrence(sessionFor(db), fakeSession());
 
     const n = db.prepare(`SELECT COUNT(*) c FROM messages_in WHERE id = ?`).get('task-paused-task-s-0') as {
       c: number;

@@ -11,15 +11,13 @@
  * direct dynamic import. When scheduling moves to the modules branch in
  * PR #8, the install skill re-fills the marker on install.
  */
-import type Database from 'better-sqlite3';
 import { touchSessionActivity } from '../../db/sessions.js';
 import { CronExpressionParser } from 'cron-parser';
 
 import { TIMEZONE } from '../../config.js';
 import { log } from '../../log.js';
+import type { NanoclawMailboxSession } from '../mailbox/index.js';
 import type { Session } from '../../types.js';
-import { insertDeferredMessageWithContextIfNew } from '../../db/session-db.js';
-import { clearRecurrence, getCompletedRecurring, insertRecurrence, trailingFailedRuns } from './db.js';
 import { appendRunLog } from './run-log.js';
 
 // Consecutive pre-task-script failures (the series' trailing FAILED runs —
@@ -46,9 +44,14 @@ const SCRIPT_BACKOFF_CAP_MIN = 60;
  * `dueCount > 0` branch), so the obligation lands even on an otherwise idle
  * agent. Dedup id is the series, so one pause raises one note.
  */
-function notifyOwnerOfPause(inDb: Database.Database, session: Session, seriesId: string, scriptFails: number): void {
+function notifyOwnerOfPause(
+  mailbox: NanoclawMailboxSession,
+  session: Session,
+  seriesId: string,
+  scriptFails: number,
+): void {
   try {
-    insertDeferredMessageWithContextIfNew(inDb, {
+    mailbox.insertDeferredMessageWithContextIfNew({
       id: `task-paused-${seriesId}`,
       kind: 'chat',
       timestamp: new Date().toISOString(),
@@ -93,8 +96,17 @@ function appendHostTaskNote(agentGroupId: string, seriesId: string, note: string
   }
 }
 
-export async function handleRecurrence(inDb: Database.Database, session: Session): Promise<void> {
-  const recurring = getCompletedRecurring(inDb);
+/**
+ * Fan out completed recurring tasks into their next occurrence.
+ *
+ * Takes the sweep's own mailbox SESSION rather than a raw handle. `host-sweep.ts`
+ * is the only production caller and already holds a session for this key, so
+ * opening a second one here would trip the same-key nesting guard (invariant
+ * I-3); a session parameter is the seam's sanctioned object, and unlike a
+ * handle it keeps this file off the ratchet's raw-access allowlist (I-9).
+ */
+export async function handleRecurrence(mailbox: NanoclawMailboxSession, session: Session): Promise<void> {
+  const recurring = mailbox.getCompletedRecurringRows();
 
   for (const msg of recurring) {
     try {
@@ -106,24 +118,21 @@ export async function handleRecurrence(inDb: Database.Database, session: Session
       const cronNext = interval.next().toDate();
       const newId = `task-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 
-      const scriptFails = trailingFailedRuns(inDb, msg.series_id ?? msg.id);
+      const scriptFails = mailbox.trailingFailedRuns(msg.series_id ?? msg.id);
 
       if (scriptFails >= SCRIPT_FAIL_PAUSE_CAP) {
         // Re-arm PAUSED at the cron time so `ncl tasks resume` revives the
         // series in place; leave the why in the run log. Insert + clear are
         // one transaction: a crash between them would leave the predecessor
         // still recurrence-armed next to a live successor → double-fire.
-        inDb.transaction(() => {
-          insertRecurrence(inDb, msg, newId, cronNext.toISOString(), 'paused');
-          clearRecurrence(inDb, msg.id);
-        })();
+        mailbox.armNextRecurrence(msg.id, msg, newId, cronNext.toISOString(), 'paused');
         touchSessionActivity(session.id);
         appendHostTaskNote(
           session.agent_group_id,
           msg.series_id,
           `auto-paused after ${scriptFails} consecutive script failures (host); fix the script, then \`ncl tasks resume ${msg.series_id}\``,
         );
-        notifyOwnerOfPause(inDb, session, msg.series_id ?? msg.id, scriptFails);
+        notifyOwnerOfPause(mailbox, session, msg.series_id ?? msg.id, scriptFails);
         log.warn('Task series auto-paused: script keeps failing', {
           seriesId: msg.series_id,
           scriptFails,
@@ -135,10 +144,7 @@ export async function handleRecurrence(inDb: Database.Database, session: Session
       const backoffAt = scriptFails > 0 ? Date.now() + scriptBackoffMinutes(scriptFails) * 60_000 : 0;
       const nextRun = new Date(Math.max(cronNext.getTime(), backoffAt)).toISOString();
 
-      inDb.transaction(() => {
-        insertRecurrence(inDb, msg, newId, nextRun);
-        clearRecurrence(inDb, msg.id);
-      })();
+      mailbox.armNextRecurrence(msg.id, msg, newId, nextRun);
       touchSessionActivity(session.id);
 
       log.info('Inserted next recurrence', {

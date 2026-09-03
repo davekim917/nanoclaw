@@ -745,9 +745,9 @@ async function spawnContainer(
   // module — skip when the module isn't installed (table absent).
   if (hasTable(getDb(), 'agent_destinations')) {
     const { writeDestinations } = await import('./modules/agent-to-agent/write-destinations.js');
-    writeDestinations(agentGroup.id, session.id);
+    await writeDestinations(agentGroup.id, session.id);
   }
-  writeSessionRouting(agentGroup.id, session.id);
+  await writeSessionRouting(agentGroup.id, session.id);
 
   // Materialize the runner's immutable startup context before buildMounts
   // pushes its bind mount. The SQLite mailbox has no context to hand over, so

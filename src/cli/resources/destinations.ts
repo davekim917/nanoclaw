@@ -22,7 +22,7 @@ export async function projectDestinationsToSessions(agentGroupId: string): Promi
   const { writeDestinations } = await import('../../modules/agent-to-agent/write-destinations.js');
   for (const session of getSessionsByAgentGroup(agentGroupId)) {
     try {
-      writeDestinations(agentGroupId, session.id);
+      await writeDestinations(agentGroupId, session.id);
     } catch (err) {
       log.warn('Failed to project destinations to session inbound.db', { agentGroupId, sessionId: session.id, err });
     }
