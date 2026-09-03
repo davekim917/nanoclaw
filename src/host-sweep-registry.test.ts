@@ -69,21 +69,38 @@ describe('main.ts starts no duty timer directly', () => {
  * the end — that assertion is what actually fails the test if a seam mock is
  * ever weakened or a new duty adds an unguarded child_process call, instead
  * of a real process (git, docker, …) spawning silently from a unit test run.
+ *
+ * Covers every named value export any src/**\/*.ts file imports from
+ * 'child_process' / 'node:child_process' — verified via
+ * `grep -rh "from '\(node:\)\?child_process'" src --include=*.ts | sort -u`:
+ * exec, execFile, execFileSync (worktree-cleanup.ts, commit-scan.ts,
+ * modules/repository-workspaces/index.ts, repository-workspaces.ts),
+ * execSync, spawn (repository-workspaces.ts), spawnSync. `fork` is not
+ * imported anywhere today but is included so a future duty adding it can't
+ * silently bypass the tripwire. `ChildProcess` / `ExecFileException` /
+ * `ExecFileSyncOptionsWithStringEncoding` are type-only imports, erased at
+ * compile time — no runtime member needed. A `default` export carries the
+ * same members, so a `import cp from 'child_process'`-style default import
+ * (none exists today) would be covered too — a missing-export error must
+ * never be the reason a real spawn goes unrecorded.
  */
-function childProcessTripwireFactory(record: string[]): Record<string, (...args: unknown[]) => never> {
+function childProcessTripwireFactory(record: string[]): Record<string, unknown> {
   const spawnAttempted =
     (name: string) =>
     (...args: unknown[]): never => {
       record.push(name);
       throw new Error(`host-sweep-registry.test: real process spawn attempted (${name}(${JSON.stringify(args[0])}))`);
     };
-  return {
+  const members = {
     exec: spawnAttempted('exec'),
     execFile: spawnAttempted('execFile'),
-    spawn: spawnAttempted('spawn'),
+    execFileSync: spawnAttempted('execFileSync'),
     execSync: spawnAttempted('execSync'),
+    spawn: spawnAttempted('spawn'),
     spawnSync: spawnAttempted('spawnSync'),
+    fork: spawnAttempted('fork'),
   };
+  return { ...members, default: members };
 }
 
 function mockWorktreeCleanupDeps(
