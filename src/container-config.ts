@@ -65,16 +65,23 @@ export interface SseMcpServerConfig {
 }
 
 /**
- * Query keys that name a credential. Keys are camelCase-normalized, then
- * matched as whole words between [_.-] separators: `author` never matches
- * `auth`, but `authToken`, `clientSecret`, and `x-auth` all do. A match
- * hard-blocks registration — the URL persists to container.json and renders
- * on the approval card, so secrets must ride via the OneCLI gateway. Ordinary
- * query params stay legal: they are endpoint config, not credentials (the
- * install's own `exa` wiring carries `?tools=web_search_exa,...`).
+ * Query keys that name a credential.
+ *
+ * The nouns here are bare — `key`, `token`, `secret` — rather than a list of
+ * full parameter names. Enumerating names does not converge: `apiKey` was
+ * covered while `accessKey`, `clientKey` and `subscriptionKey` were not, and
+ * the next vendor invents another. The noun is the part that actually signals
+ * a credential.
+ *
+ * Keys are camelCase-normalized first, then matched as whole words between
+ * [_.-] separators, so `accessKey` and `x-auth` hit while `author` and
+ * `monkey` do not. Ordinary query params stay legal: they are endpoint
+ * config, not credentials (the install's own `exa` wiring carries
+ * `?tools=web_search_exa,...`). A match hard-blocks registration, because the
+ * URL persists to container.json and renders on the approval card.
  */
 const SECRET_QUERY_KEY_RE =
-  /(^|[_.-])(o?auth(orization)?|(auth|access|api|session|id)?[_-]?token|secret|passw(or)?d|pwd|api[_-]?key|private[_-]?key|credentials?|bearer|jwt|sig(nature)?)([_.-]|$)/i;
+  /(^|[_.-])(o?auth(orization)?|token|key|secret|passw(or)?d|pwd|credentials?|bearer|jwt|sig(nature)?)([_.-]|$)/i;
 
 /** camelCase → snake_case before matching, so `authToken` hits the word list. */
 const CAMEL_SPLIT_RE = /([a-z0-9])([A-Z])/g;

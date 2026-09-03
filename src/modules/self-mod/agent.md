@@ -18,9 +18,13 @@ only with admin approval.
   Pass exactly one of `command` (a local stdio server) or `url` (a remote
   Streamable HTTP server). Remote URLs must use HTTPS — plain HTTP is
   allowed only for `localhost` and `host.docker.internal` — and may not
-  carry credentials, fragments, credential-looking query parameters, or a
-  token anywhere in the path or a query value: the URL is persisted
-  verbatim, so a secret in it is a secret on disk.
+  carry credentials in the userinfo, a fragment, a credential-named query
+  parameter, or a recognizable credential shape anywhere in the path or a
+  query value. Recognition is a backstop, not a guarantee: an opaque path
+  segment cannot be told apart from a tenant id, so it is shown to the
+  approving admin rather than refused. **The URL is persisted verbatim**, so
+  never put a secret in one — say that plainly rather than assuring anyone
+  no credential can reach disk.
   Only known configuration headers may hold a literal value (`Accept`,
   `Accept-Encoding`, `Accept-Language`, `Content-Type`, `User-Agent`,
   `MCP-Protocol-Version`, `X-Api-Version`, `X-Request-Id`); every other header

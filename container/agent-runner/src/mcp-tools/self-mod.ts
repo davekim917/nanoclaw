@@ -87,13 +87,13 @@ export const installPackages: McpToolDefinition = {
 };
 
 /**
- * Query keys that name a credential: camelCase-normalized, then matched as
- * whole words between [_.-] separators (`author` never matches `auth`, but
- * `authToken` does) — the URL persists to container.json and renders on the
- * approval card, so secrets must ride via the OneCLI gateway.
+ * Query keys that name a credential. Bare nouns rather than full parameter
+ * names: enumerating names does not converge (`apiKey` covered, `accessKey`
+ * and `subscriptionKey` not). camelCase-normalized, then matched as whole
+ * words between [_.-] separators, so `accessKey` hits while `monkey` does not.
  */
 const SECRET_QUERY_KEY_RE =
-  /(^|[_.-])(o?auth(orization)?|(auth|access|api|session|id)?[_-]?token|secret|passw(or)?d|pwd|api[_-]?key|private[_-]?key|credentials?|bearer|jwt|sig(nature)?)([_.-]|$)/i;
+  /(^|[_.-])(o?auth(orization)?|token|key|secret|passw(or)?d|pwd|credentials?|bearer|jwt|sig(nature)?)([_.-]|$)/i;
 
 /** camelCase → snake_case before matching, so `authToken` hits the word list. */
 const CAMEL_SPLIT_RE = /([a-z0-9])([A-Z])/g;
