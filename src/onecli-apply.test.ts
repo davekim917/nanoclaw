@@ -17,6 +17,8 @@ import {
   applyOnecliContainerConfig,
   causeCodeOf,
   describeDiagnosis,
+  diagnoseControlApi,
+  FAST_TRANSIENT_BUDGET_MS,
   mergeDiagnoses,
   runApplyWithRetry,
   type ApplyDeps,
@@ -47,6 +49,7 @@ function deps(overrides: Partial<ApplyDeps> = {}): ApplyDeps & { diagnoseCalls: 
     })(),
     sleep: async () => {},
     retryDelayMs: 0,
+    fastTransientBudgetMs: FAST_TRANSIENT_BUDGET_MS,
     diagnoseCalls,
     ...overrides,
   };
@@ -54,6 +57,7 @@ function deps(overrides: Partial<ApplyDeps> = {}): ApplyDeps & { diagnoseCalls: 
 
 afterEach(() => {
   vi.restoreAllMocks();
+  vi.unstubAllGlobals();
 });
 
 describe('runApplyWithRetry', () => {
@@ -222,6 +226,56 @@ describe('runApplyWithRetry', () => {
     expect(result.diagnosis).toMatchObject({ statusCode: 503, causeCode: 'ECONNRESET' });
   });
 
+  it('does not retry a first attempt that burned the fast-transient budget', async () => {
+    // A gateway that has gone away ends only at the SDK's 30s timeout. Retrying
+    // there holds the serial host sweep for another 30s and cannot succeed.
+    let attempts = 0;
+    let clock = 0;
+    let slept = 0;
+    const d = deps({
+      applyContainerConfig: async () => {
+        attempts++;
+        clock += 30_000;
+        return false;
+      },
+      now: () => clock,
+      sleep: async () => {
+        slept++;
+      },
+      diagnose: async () => ({
+        probe: 'diagnostic probe failed: fetch failed (ECONNREFUSED)',
+        causeCode: 'ECONNREFUSED',
+      }),
+    });
+
+    const result = await runApplyWithRetry([], { addHostMapping: false, agent: 'ag-1' }, d);
+
+    expect(attempts).toBe(1);
+    expect(slept).toBe(0);
+    expect(result.applied).toBe(false);
+    expect(result.attempts).toBe(1);
+    expect(result.durationsMs).toEqual([30_000]);
+    expect(result.diagnosis).toMatchObject({ causeCode: 'ECONNREFUSED' });
+  });
+
+  it('still retries a first attempt that failed inside the budget', async () => {
+    let attempts = 0;
+    let clock = 0;
+    const d = deps({
+      applyContainerConfig: async () => {
+        attempts++;
+        clock += FAST_TRANSIENT_BUDGET_MS - 1;
+        return attempts > 1;
+      },
+      now: () => clock,
+    });
+
+    const result = await runApplyWithRetry([], { addHostMapping: false, agent: 'ag-1' }, d);
+
+    expect(attempts).toBe(2);
+    expect(result.applied).toBe(true);
+  });
+
   it('shares its status classification with the boot preflight', () => {
     // Guards against the spawn path and the boot probe drifting apart on what
     // counts as transient.
@@ -291,7 +345,7 @@ describe('applyOnecliContainerConfig logging shape', () => {
     expect(result.applied).toBe(false);
     expect(warn).toHaveBeenCalledTimes(1);
     const [message, fields] = warn.mock.calls[0] as [string, Record<string, unknown>];
-    expect(message).toBe('OneCLI gateway apply failed on both attempts — spawn will be refused');
+    expect(message).toBe('OneCLI gateway apply failed — spawn will be refused');
     expect(fields).toMatchObject({
       agent: 'ag-1',
       attempts: 2,
@@ -350,6 +404,59 @@ describe('mergeDiagnoses', () => {
 
   it('returns undefined when no attempt failed', () => {
     expect(mergeDiagnoses([])).toBeUndefined();
+  });
+});
+
+describe('diagnoseControlApi', () => {
+  it('reports a body-read failure with its cause instead of claiming a clean 200', async () => {
+    // The regression this exists for: an earlier revision swallowed the read
+    // error and reported "the control API answered 200 — the failure was
+    // transient", hiding the very fault that can break the SDK's own apply,
+    // which must consume this same body to build the container arguments.
+    vi.stubGlobal('fetch', async () => ({
+      ok: true,
+      status: 200,
+      statusText: 'OK',
+      text: async () => {
+        throw Object.assign(new TypeError('terminated'), {
+          cause: Object.assign(new Error('aborted'), { code: 'UND_ERR_SOCKET' }),
+        });
+      },
+    }));
+
+    const result = await diagnoseControlApi('ag-1');
+
+    expect(result.probe).toContain('diagnostic probe failed');
+    expect(result.probe).toContain('UND_ERR_SOCKET');
+    expect(result.causeCode).toBe('UND_ERR_SOCKET');
+  });
+
+  it('reports a clean 200 as transient once the body actually reads', async () => {
+    vi.stubGlobal('fetch', async () => ({
+      ok: true,
+      status: 200,
+      statusText: 'OK',
+      text: async () => '{"env":{}}',
+    }));
+
+    const result = await diagnoseControlApi('ag-1');
+
+    expect(result.probe).toContain('answered 200');
+    expect(result.causeCode).toBeUndefined();
+  });
+
+  it('reports a non-2xx status', async () => {
+    vi.stubGlobal('fetch', async () => ({
+      ok: false,
+      status: 503,
+      statusText: 'Service Unavailable',
+      text: async () => 'upstream down',
+    }));
+
+    const result = await diagnoseControlApi('ag-1');
+
+    expect(result.statusCode).toBe(503);
+    expect(result.probe).toContain('503');
   });
 });
 

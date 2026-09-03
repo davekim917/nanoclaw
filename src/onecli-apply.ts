@@ -67,6 +67,23 @@ export const APPLY_RETRY_DELAY_MS = 250;
 /** Bound on the diagnostic probe, which must never itself stall a spawn. */
 export const DIAGNOSE_TIMEOUT_MS = 5_000;
 
+/**
+ * How slow a first attempt may be and still be worth retrying.
+ *
+ * The retry exists for one measured class: a per-request transport fault with
+ * a p50 of 39ms, a p90 of 294ms and a p99 of 5.5s. A first attempt slower than
+ * that is not in the class — it is a gateway that has gone away, where the
+ * SDK's 30s timeout is the only thing that ends the call. Retrying there buys
+ * nothing and costs another 30s.
+ *
+ * The cost is not local. `sweepOnce` in `src/host-sweep.ts` awaits each
+ * `wakeContainer` serially, so one refused spawn holds the whole 60s sweep —
+ * every later session's wake, plus the stale, recurrence and ceiling work the
+ * same tick owns. Without this cap the worst case is 30s + 30s + a 5s probe.
+ * With it, a timed-out first attempt goes straight to the probe: ~35s.
+ */
+export const FAST_TRANSIENT_BUDGET_MS = 5_000;
+
 /** Why the apply failed, as far as we can name it. */
 export interface ApplyDiagnosis {
   /** `false` when the SDK returned false; `throw` when it threw. */
@@ -105,6 +122,8 @@ export interface ApplyDeps {
   now: () => number;
   sleep: (ms: number) => Promise<void>;
   retryDelayMs: number;
+  /** Above this, a first attempt is out of the retryable class — see the const. */
+  fastTransientBudgetMs: number;
 }
 
 /**
@@ -130,7 +149,7 @@ export function causeCodeOf(err: unknown): string | undefined {
  * `ContainerClient.getContainerConfig` exactly — if that shape ever moves, the
  * probe reports a status mismatch rather than lying about the cause.
  */
-async function realDiagnose(agent: string | undefined): Promise<{
+export async function diagnoseControlApi(agent: string | undefined): Promise<{
   probe: string;
   causeCode?: string;
   statusCode?: number;
@@ -146,7 +165,13 @@ async function realDiagnose(agent: string | undefined): Promise<{
     // investigates pooled-connection failures would feed the bug it is here
     // to diagnose. The payload is a small container config, so reading and
     // discarding it is cheaper than cancelling and destroying the socket.
-    await res.text().catch(() => undefined);
+    //
+    // Deliberately uncaught. A truncated body or a socket reset mid-read is
+    // not bookkeeping noise — the SDK must consume this same body to build the
+    // container arguments, so a read fault here can be the exact reason both
+    // apply attempts failed. Letting it fall to the outer catch reports it
+    // with its undici cause instead of claiming the control API answered 200.
+    await res.text();
     if (!res.ok) return { probe: `control API answered ${res.status} ${res.statusText}`, statusCode: res.status };
     return { probe: 'control API answered 200 on the diagnostic probe — the failure was transient' };
   } catch (err) {
@@ -157,10 +182,11 @@ async function realDiagnose(agent: string | undefined): Promise<{
 }
 
 const realDeps: Omit<ApplyDeps, 'applyContainerConfig'> = {
-  diagnose: realDiagnose,
+  diagnose: diagnoseControlApi,
   now: () => Date.now(),
   sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
   retryDelayMs: APPLY_RETRY_DELAY_MS,
+  fastTransientBudgetMs: FAST_TRANSIENT_BUDGET_MS,
 };
 
 /**
@@ -193,7 +219,9 @@ export function mergeDiagnoses(attemptDiagnoses: ApplyDiagnosis[]): ApplyDiagnos
 }
 
 /**
- * Run the apply with one bounded retry for the proved-transient class.
+ * Run the apply with at most one retry, and only for the proved-transient
+ * class: a first attempt that failed fast. A first attempt that burned the
+ * fast-transient budget is a different failure and gets no second one.
  *
  * Safe to retry with the same `args` array: the SDK fetches the config before
  * pushing a single `-e`/`-v`, so a failed attempt leaves `args` untouched and
@@ -243,6 +271,11 @@ export async function runApplyWithRetry(
       if (!isRetryableStatus(statusCode)) throw err;
     }
 
+    // A first attempt slower than the fast-transient budget is a different
+    // failure — a gateway that has gone away, ended only by the SDK's 30s
+    // timeout. Go straight to the probe rather than holding the serial sweep
+    // for another one.
+    if (durationsMs[durationsMs.length - 1] >= deps.fastTransientBudgetMs) break;
     if (attempt === 1) await deps.sleep(deps.retryDelayMs);
   }
 
@@ -256,7 +289,7 @@ export async function runApplyWithRetry(
     causeCode: merged.causeCode ?? probe.causeCode,
     statusCode: merged.statusCode ?? probe.statusCode,
   };
-  return { applied: false, attempts: 2, durationsMs, attemptDiagnoses, diagnosis };
+  return { applied: false, attempts: durationsMs.length, durationsMs, attemptDiagnoses, diagnosis };
 }
 
 /**
@@ -289,7 +322,7 @@ export async function applyOnecliContainerConfig(
     return result;
   }
 
-  log.warn('OneCLI gateway apply failed on both attempts — spawn will be refused', {
+  log.warn('OneCLI gateway apply failed — spawn will be refused', {
     agent: options.agent ?? null,
     attempts: result.attempts,
     durationsMs: result.durationsMs,
