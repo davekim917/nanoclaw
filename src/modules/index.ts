@@ -80,3 +80,5 @@ import './sweep-egress/index.js';
 import './sweep-storage/index.js';
 // sweep-claims: T20 claims-reconcile, T21 claims-self-heal (S2-PR6).
 import './sweep-claims/index.js';
+// Sweep family: usage-rollup (T19, host-sweep seam S2-PR12).
+import './sweep-usage/index.js';

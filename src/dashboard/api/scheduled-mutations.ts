@@ -15,14 +15,17 @@
  */
 import { CronExpressionParser } from 'cron-parser';
 import fs from 'fs';
-import path from 'path';
-
-import Database from 'better-sqlite3';
 
 import { DATA_DIR, TIMEZONE } from '../../config.js';
 import { getDb } from '../../db/connection.js';
 import { getSession } from '../../db/sessions.js';
 import { openInboundDb } from '../../db/session-db.js';
+import {
+  readSessionInbound,
+  readSessionOutbound,
+  type ScheduledTaskRow,
+  type SessionReadLocation,
+} from '../../modules/mailbox/index.js';
 import { cancelSeriesWithStrandClear, pauseTask, resumeTask, updateTask } from '../../modules/scheduling/db.js';
 import { wakeContainer } from '../../container-runner.js';
 import { admitDueTaskContexts } from '../../session-manager.js';
@@ -63,21 +66,16 @@ function json(body: unknown, status = 200): Response {
 
 // ── Shared resolve + gate + live-row read ────────────────────────────────────────
 
-interface LiveRow {
-  id: string;
-  status: string;
-  process_after: string | null;
-  recurrence: string | null;
-  content: string;
-  thread_id: string | null;
-}
+// Read through the mailbox module's named ops, so the row shape is the
+// module's. (The WRITE half of these handlers still opens a raw inbound handle
+// for modules/scheduling/db.ts's task mutators — see the file header note.)
+type LiveRow = ScheduledTaskRow;
 
 interface ResolvedTarget {
   agentGroupId: string;
   sessionId: string;
   seriesId: string;
   inboundPath: string;
-  outboundPath: string;
   live: LiveRow;
   health: HealthState;
   kind: SeriesKind;
@@ -112,27 +110,30 @@ function resolveTarget(
   // outside data/v2-sessions.
   const inboundPath = sessionInboundPathFor(dataDir, decoded.agentGroupId, decoded.sessionId);
   if (!inboundPath) return { error: json({ error: 'not_found' }, 404) };
-  const outboundPath = path.join(path.dirname(inboundPath), 'outbound.db');
   // Unreadable / missing session inbound → 503 fail-closed (§3a).
   if (!fs.existsSync(inboundPath))
     return { error: json({ error: 'session_unreadable', reason: 'session_unreadable' }, 503) };
 
+  const location: SessionReadLocation = { dataDir, agentGroupId: decoded.agentGroupId, sessionId: decoded.sessionId };
   let live: LiveRow | undefined;
   try {
-    const db = openInboundDb(inboundPath);
-    try {
-      live =
-        (db
-          .prepare(
-            `SELECT id, status, process_after, recurrence, content, thread_id
-               FROM messages_in
-              WHERE series_id = ? AND kind = 'task' AND status IN ('pending', 'paused')
-              ORDER BY seq DESC LIMIT 1`,
-          )
-          .get(decoded.seriesId) as LiveRow | undefined) ?? undefined;
-    } finally {
-      db.close();
-    }
+    // Read-only seam: resolving the gate must not provision or migrate the
+    // session (invariant I-4). `undefined` is "no mailbox", which the
+    // existsSync guard above has already turned into a 503.
+    //
+    // The options restate what `openInboundDb` gave this read before the seam,
+    // because both matter on a MUTATION gate: the write path's 5s
+    // busy_timeout, so a contended session waits rather than 503-ing an
+    // operator's edit, and the hot-journal rollback, without which a session
+    // whose container was SIGKILLed answers every gate with 503 until some
+    // other subsystem recovers it. This is one named session the handler is
+    // about to write to anyway — not the console's fleet fan-out, which is
+    // what the 1s no-recovery default exists for.
+    live =
+      readSessionInbound(location, (mailbox) => mailbox.getLiveTaskRow(decoded.seriesId), {
+        busyTimeoutMs: 5000,
+        recoverJournal: true,
+      }) ?? undefined;
   } catch (err) {
     log.warn('scheduled-mutations: inbound read failed', { err: err instanceof Error ? err.message : String(err) });
     return { error: json({ error: 'session_unreadable', reason: 'session_unreadable' }, 503) };
@@ -147,22 +148,14 @@ function resolveTarget(
   const overdue = processAfterMs !== null && processAfterMs <= nowMs;
   let claimed = false;
   let outboundReadable = false;
-  if (fs.existsSync(outboundPath)) {
-    try {
-      const odb = new Database(outboundPath, { readonly: true });
-      odb.pragma('busy_timeout = 1000');
-      try {
-        const row = odb
-          .prepare("SELECT 1 AS ok FROM processing_ack WHERE message_id = ? AND status = 'processing' LIMIT 1")
-          .get(live.id) as { ok: number } | undefined;
-        claimed = !!row;
-        outboundReadable = true;
-      } finally {
-        odb.close();
-      }
-    } catch {
-      outboundReadable = false;
+  try {
+    const claimedIds = readSessionOutbound(location, (mailbox) => mailbox.listProcessingClaimedMessageIds());
+    if (claimedIds) {
+      claimed = claimedIds.includes(live.id);
+      outboundReadable = true;
     }
+  } catch {
+    outboundReadable = false;
   }
 
   let health: HealthState;
@@ -180,7 +173,6 @@ function resolveTarget(
       sessionId: decoded.sessionId,
       seriesId: decoded.seriesId,
       inboundPath,
-      outboundPath,
       live,
       health,
       kind,

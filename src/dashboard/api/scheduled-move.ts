@@ -17,8 +17,6 @@ import { createHash } from 'crypto';
 import fs from 'fs';
 import path from 'path';
 
-import Database from 'better-sqlite3';
-
 import { randomUUID } from 'crypto';
 
 import { DATA_DIR, GROUPS_DIR } from '../../config.js';
@@ -28,6 +26,7 @@ import { getMessagingGroup } from '../../db/messaging-groups.js';
 import { getDb } from '../../db/connection.js';
 import { findSystemSession, taskThreadId } from '../../db/sessions.js';
 import { openInboundDb } from '../../db/session-db.js';
+import { readSessionInbound, type ScheduledTaskRow } from '../../modules/mailbox/index.js';
 import * as scheduledTasks from '../../db/scheduled-tasks.js';
 import { type TaskDef } from '../../db/scheduled-tasks.js';
 import {
@@ -177,17 +176,10 @@ function isWired(agentGroupId: string, messagingGroupId: string): boolean {
 
 // ── Source live row (for scriptPresent + the execute snapshot) ──────────────────
 
-interface SourceLiveRow {
-  id: string;
-  status: string;
-  process_after: string | null;
-  recurrence: string | null;
-  content: string;
-  platform_id: string | null;
-  channel_type: string | null;
-  thread_id: string | null;
-  kind: string;
-}
+// Read through the mailbox module's named ops, so the row shape is the
+// module's. (The WRITE half of this flow still opens a raw inbound handle for
+// modules/scheduling/db.ts's task mutators — see the file header note.)
+type SourceLiveRow = ScheduledTaskRow;
 
 /**
  * Read the source series' live row. The result DISTINGUISHES three cases (ADV-S1,
@@ -209,33 +201,20 @@ function readSourceLiveRow(
   sessionId: string,
   seriesId: string,
 ): SourceLiveReadResult {
-  // Route through the containment-checked chokepoint (security re-QA SUGGESTION) so
-  // the preview READ path has the same traversal backstop as the execute path — a
-  // null (containment failure) is treated as "no live row" (→ no script in preview).
-  const inboundPath = sessionInboundPathFor(dataDir, agentGroupId, sessionId);
-  if (!inboundPath || !fs.existsSync(inboundPath)) return { unreadable: false, row: null };
-  let db: Database.Database | null = null;
   try {
-    db = new Database(inboundPath, { readonly: true });
-    db.pragma('busy_timeout = 1000');
-    const row =
-      (db
-        .prepare(
-          `SELECT id, status, process_after, recurrence, content, platform_id, channel_type, thread_id, kind
-             FROM messages_in
-            WHERE series_id = ? AND kind = 'task' AND status IN ('pending', 'paused')
-            ORDER BY seq DESC LIMIT 1`,
-        )
-        .get(seriesId) as SourceLiveRow | undefined) ?? null;
-    return { unreadable: false, row };
+    // Read-only seam: a move PREVIEW must never provision or migrate the
+    // session it is previewing (invariant I-4). The module applies the same
+    // canonicalize-and-contain check the pre-seam chokepoint did, so a
+    // locator that resolves outside data/v2-sessions — like a session with no
+    // mailbox — reads as "no live row", never as unreadable.
+    const row = readSessionInbound({ dataDir, agentGroupId, sessionId }, (mailbox) => mailbox.getLiveTaskRow(seriesId));
+    return { unreadable: false, row: row ?? null };
   } catch (err) {
     log.warn('scheduled-move: source live row read failed', {
       seriesId,
       err: err instanceof Error ? err.message : String(err),
     });
     return { unreadable: true, row: null };
-  } finally {
-    db?.close();
   }
 }
 

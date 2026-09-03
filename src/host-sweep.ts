@@ -37,16 +37,10 @@ import { getAgentGroup } from './db/agent-groups.js';
 import {
   SessionDbMissingError,
   SessionDbUnopenableError,
-  sessionMailboxPath,
   type ForkContainerStateRow as ContainerState,
   type NanoclawMailboxSession,
 } from './modules/mailbox/index.js';
 import { withExistingNanoclawSession } from './modules/mailbox/session.js';
-// The usage-rollup outbound read below still opens a session DB by path — the
-// one remaining raw opener use in this file (rev-3 grounding §5); the
-// scheduled-move recovery's own raw inbound opener moved to
-// src/modules/sweep-scheduled-move/ (S2-PR7).
-import { openOutboundDb } from './modules/mailbox/openers.js';
 import { runHostGatedTaskScripts } from './modules/scheduling/host-script.js';
 import { advanceThreadClosures, syncDoneProposalMirror } from './dashboard/thread-close.js';
 import { log } from './log.js';
@@ -56,7 +50,6 @@ import {
   admitDueTaskContexts,
   deferMessageForFreshContextRetry,
 } from './session-manager.js';
-import { rollupSessionUsage, pruneOldTurnUsage } from './db/usage.js';
 import {
   getContainerSpawnedAt,
   getActiveContainerSessionIds,
@@ -1204,15 +1197,16 @@ async function prepareDueWake(
   // on the host BEFORE admission, so a gated/errored fire never becomes due
   // and never spawns a container. See host-script.ts's runHostGatedTaskScripts.
   //
-  // Both helpers still take a raw handle and live in files this PR must not
-  // touch — both belong to PR 4, the ingress family (plan §5):
-  // `modules/scheduling/host-script.ts` and `session-manager.ts`. Handing them
-  // this session's own handle
-  // keeps the admission seam on ONE open — reopening inbound.db beside a live
-  // session would be worse, not cleaner. Both move behind the seam with their
-  // own PRs; `legacyInboundHandle` is what keeps host-sweep.ts on the
-  // raw-access allowlist until they do.
-  await runHostGatedTaskScripts(mailbox.legacyInboundHandle(), sessionId);
+  // `runHostGatedTaskScripts` takes this session (mailbox seam PR 4): it is a
+  // sweep callee with no other production caller, and a SESSION parameter is
+  // the seam's sanctioned object — invariant I-9 forbids handing out raw
+  // handles, not sessions, so the callee stays off the ratchet's allowlist.
+  // It can spend the full pre-task timeout per row, so the session is held
+  // across that work exactly as it was when this line passed a raw handle.
+  // `admitDueTaskContexts` still takes one: it lives in `session-manager.ts`
+  // and moves behind the seam in PR 7. `legacyInboundHandle` survives here for
+  // that one call and nothing else.
+  await runHostGatedTaskScripts(mailbox, sessionId);
   const admittedTasks = admitDueTaskContexts(mailbox.legacyInboundHandle(), agentGroupId, sessionId);
   const dueCount = mailbox.countDueMessages();
   return {
@@ -1457,62 +1451,6 @@ export function _sweepSessionForTesting(session: Session): Promise<number | null
     },
   };
   return sweepSession(session, tick);
-}
-
-// ── Usage rollup (fleet-hardening Phase 0.1) ──
-//
-// Per-session cache of the outbound.db mtime last successfully rolled up, so
-// a session whose outbound.db hasn't changed since the last tick costs one
-// fs.statSync and nothing else — no DB open, no query. Same shape as the
-// `quietSessions` cache above (module-level Map, bounded to sessions still
-// active). Lost on host restart, which just means the next tick re-checks
-// every session once; rollupSessionUsage's own watermark still guarantees no
-// double-counting either way.
-const usageRollupMtimeCache = new Map<string, number>(); // session.id -> outbound.db mtimeMs
-
-/** Pure so the cache decision has one thing to unit-test. */
-export function shouldSkipUsageRollup(cachedMtimeMs: number | undefined, currentMtimeMs: number): boolean {
-  return cachedMtimeMs === currentMtimeMs;
-}
-
-async function sweepUsageRollup(sessions: readonly Session[]): Promise<void> {
-  for (const session of sessions) {
-    try {
-      const outPath = sessionMailboxPath({ agentGroupId: session.agent_group_id, sessionId: session.id }, 'outbound');
-      let mtimeMs: number;
-      try {
-        mtimeMs = fs.statSync(outPath).mtimeMs;
-      } catch {
-        continue; // container never spawned yet — no outbound.db to roll up
-      }
-      if (shouldSkipUsageRollup(usageRollupMtimeCache.get(session.id), mtimeMs)) continue;
-
-      // Read through the module's own outbound funnel, NOT the mailbox
-      // session. This projection touches outbound.db only, and the seam's
-      // existence check is keyed on inbound.db — routing it through a session
-      // added a gate the pre-seam code never had, so a session whose
-      // inbound.db is gone while outbound.db remains stopped being rolled up
-      // at all, and its turn_usage rows would never reach the central totals.
-      // `outPath` above is already the gate that belongs here: no outbound
-      // file, no rollup. Same funnel `worktree-cleanup.ts` and the GC use, so
-      // there is still one implementation of every statement.
-      const outDb = openOutboundDb(outPath);
-      try {
-        rollupSessionUsage(outDb, session.agent_group_id, `${session.agent_group_id}/${session.id}`);
-      } finally {
-        outDb.close();
-      }
-      usageRollupMtimeCache.set(session.id, mtimeMs);
-    } catch (err) {
-      log.warn('Usage rollup failed for session', { err, sessionId: session.id });
-    }
-  }
-  // Bound the cache to sessions that still exist, mirroring the quietSessions
-  // cleanup above — closed sessions would otherwise accumulate forever.
-  if (usageRollupMtimeCache.size > sessions.length + 500) {
-    const live = new Set(sessions.map((s) => s.id));
-    for (const id of usageRollupMtimeCache.keys()) if (!live.has(id)) usageRollupMtimeCache.delete(id);
-  }
 }
 
 // G64 (S2-PR6): the pruneIdleSessionArtifacts/pruneIdleThreadArtifacts
@@ -1807,20 +1745,21 @@ function registerBuiltInSweepDuties(): void {
     order: 50,
     // Mirror the container's own `propose_done` record onto the central
     // `sessions` row so the Observatory list can show "proposes closing"
-    // without opening a per-session SQLite file per row. Free here — the handle
-    // is already open and it is one SELECT — and deliberately NOT the copy the
-    // close path trusts (see thread-close.ts). Isolated: a mirror failure must
-    // never cost this session its sweep.
+    // without opening a per-session SQLite file per row. Free here — the
+    // session is already open and it is one SELECT — and deliberately NOT the
+    // copy the close path trusts (see thread-close.ts). Isolated: a mirror
+    // failure must never cost this session its sweep.
     //
-    // Still a raw-handle callee: `dashboard/thread-close.ts` moves behind the
-    // seam in PR 4, and this line becomes `syncDoneProposalMirror(session.id)`
-    // then. It only reads. Guarded on `hasOutbound` because a raw handle is the
-    // one thing the module cannot degrade for a never-woken session.
+    // `syncDoneProposalMirror` now takes the PARSED proposal (mailbox seam
+    // PR 4), so the read is the module's own op and no handle leaves the
+    // session. The `hasOutbound` guard is kept for what it costs: a
+    // never-woken session has no proposal to mirror and no outbound file to
+    // open looking for one.
     run: (ctx) => {
       const { session, mailbox } = asSessionContext(ctx);
       if (mailbox!.hasOutbound()) {
         try {
-          syncDoneProposalMirror(session.id, mailbox!.legacyOutboundHandle());
+          syncDoneProposalMirror(session.id, mailbox!.readDoneProposal());
         } catch (err) {
           log.warn('done_proposal mirror failed', { sessionId: session.id, err });
         }
@@ -1956,12 +1895,14 @@ function registerBuiltInSweepDuties(): void {
     order: 20,
     // 8. Recurrence fanout for completed recurring tasks.
     // MODULE-HOOK:scheduling-recurrence:start
-    // Still a raw-handle callee: `modules/scheduling/recurrence.ts` moves behind
-    // the seam in PR 4.
+    // Takes this session (mailbox seam PR 4). Same rule as
+    // `runHostGatedTaskScripts`: a sweep callee with no other production
+    // caller receives the sweep's session, never a raw handle and never its
+    // own nested open on the same key.
     run: async (ctx) => {
       const { session, mailbox } = asSessionContext(ctx);
       const { handleRecurrence } = await import('./modules/scheduling/recurrence.js');
-      await handleRecurrence(mailbox!.legacyInboundHandle(), session);
+      await handleRecurrence(mailbox!, session);
     },
     // MODULE-HOOK:scheduling-recurrence:end
   });
@@ -2002,9 +1943,9 @@ function registerBuiltInSweepDuties(): void {
     // in that order (src/dashboard/thread-close.ts). Central-DB scan of the few
     // in-flight rows, once per tick, after the per-session loop so container
     // state is current. Nothing here can START a close; only an operator can.
-    run: () => {
+    run: async () => {
       try {
-        advanceThreadClosures();
+        await advanceThreadClosures();
       } catch (err) {
         log.warn('thread-close sweep step failed', { err });
       }
@@ -2013,27 +1954,6 @@ function registerBuiltInSweepDuties(): void {
 
   // T13 (storage-maintenance, tick:post-session, order 30) moved to
   // src/modules/sweep-storage/index.ts (S2-PR6).
-
-  registerSweepDuty({
-    name: id.T19,
-    phase: 'tick:post-session',
-    order: 40,
-    // Fleet-hardening Phase 0.1 (per-turn usage accounting): roll per-session
-    // turn_usage rows into the central usage_daily table for `ncl usage`. Reuses
-    // the same `sessions` list the per-session loop above already fetched — no
-    // extra DB query. Isolated so a rollup failure never blocks the rest of the
-    // tick. `pruneOldTurnUsage` is its companion, not a separate duty: fleet
-    // volume is ~300-600 turns/day, so trimming the ledger the rollup just fed
-    // is trivial per-tick cost.
-    run: async (ctx) => {
-      try {
-        await sweepUsageRollup(ctx.sessions);
-      } catch (err) {
-        log.warn('Usage rollup sweep step failed', { err });
-      }
-      pruneOldTurnUsage();
-    },
-  });
 
   // T22 (orphaned-repo-fence-release) moved to src/modules/sweep-repo-fence/
   // (seam 2, PR 8 — G08). The wrapper moved; `repo-fence-recovery.ts` itself

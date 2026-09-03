@@ -15,7 +15,6 @@ import { getAgentGroup, getAllAgentGroups } from '../../db/agent-groups.js';
 import { getDb } from '../../db/connection.js';
 import { getMessagingGroup } from '../../db/messaging-groups.js';
 import { getSessionsByAgentGroup } from '../../db/sessions.js';
-import { getContainerState, getProcessingClaims } from '../../db/session-db.js';
 import { registerDeliveryAction } from '../../delivery.js';
 import { unguarded } from '../../guard/index.js';
 import { log } from '../../log.js';
@@ -36,12 +35,8 @@ import {
   type RepositoryWorkUnit,
 } from '../../repository-workspaces.js';
 import { observedOriginsSha256 } from '../../repository-migration-recovery.js';
-import {
-  openOutboundDb,
-  sessionDir,
-  withExistingMailboxSession,
-  writeSessionMessageIfNew,
-} from '../../session-manager.js';
+import { readSessionOutbound } from '../mailbox/index.js';
+import { sessionDir, withExistingMailboxSession, writeSessionMessageIfNew } from '../../session-manager.js';
 import { safeGitArgs, safeGitConfigGet, safeGitEnv } from '../../safe-git.js';
 import type { Session } from '../../types.js';
 
@@ -780,14 +775,35 @@ async function sourceSessionStates(source: RepositoryWorkUnit): Promise<Reposito
     let activeTool = false;
     let continuation = false;
     try {
-      const outDb = openOutboundDb(row.agent_group_id, row.id);
-      try {
-        processing = getProcessingClaims(outDb).length > 0;
-        activeTool = Boolean(getContainerState(outDb)?.current_tool);
-        continuation = Boolean(outDb.prepare("SELECT 1 FROM session_state WHERE key = 'work_continuation'").get());
-      } finally {
-        outDb.close();
-      }
+      // Read-only seam: the quiescence probe must never provision or migrate a
+      // session it is only inspecting.
+      // Both options restate what `openOutboundDb` did before the seam, and
+      // both matter here. The 5s busy_timeout is the write path's, because
+      // this is a handful of named sessions rather than a console fan-out.
+      // The hot-journal rollback is load-bearing: a SIGKILLed or OOM-killed
+      // container leaves a journal a read-only handle cannot get past, so
+      // without recovery the read throws, the catch calls the session active,
+      // and the transfer is refused until some other subsystem happens to
+      // recover the file.
+      const state = readSessionOutbound(
+        { agentGroupId: row.agent_group_id, sessionId: row.id },
+        (mailbox) => ({
+          processing: mailbox.getProcessingClaimRows().length > 0,
+          activeTool: Boolean(mailbox.getContainerState()?.current_tool),
+          continuation: mailbox.hasWorkContinuation(),
+        }),
+        { busyTimeoutMs: 5000, recoverJournal: true },
+      );
+      // `undefined` (no outbound.db) counts as ACTIVE, deliberately. Before the
+      // seam the raw opener threw SessionDbMissingError on that file and the
+      // catch below made it active; keeping it active is what makes this a
+      // behavior-preserving refactor. It is arguably over-conservative — a
+      // session whose container never ran holds no claim — but relaxing it is
+      // a fail-closed policy change and does not belong in a seam move.
+      if (!state) throw new Error(`no outbound mailbox for session ${row.id}`);
+      processing = state.processing;
+      activeTool = state.activeTool;
+      continuation = state.continuation;
     } catch {
       // Unknown state is active: a transfer must fail closed.
       processing = true;

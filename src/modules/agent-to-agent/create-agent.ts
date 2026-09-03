@@ -287,7 +287,7 @@ export const applyCreateAgent: ApprovalHandler = async ({ session, payload, noti
   // inbound.db. See the top-of-file invariant in db/agent-destinations.ts
   // — forgetting this causes "dropped: unknown destination" when the parent
   // tries to send to the newly-created child.
-  writeDestinations(session.agent_group_id, session.id);
+  await writeDestinations(session.agent_group_id, session.id);
 
   // notifyAgent is async since the writeSessionMessage signature change.
   // Awaiting ensures the notification commits before the container wakes.
