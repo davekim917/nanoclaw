@@ -176,22 +176,34 @@ write_status "running" "build" ""
 # outside dist/ — so the steps below repopulate the bundle on every deploy
 # whether they rebuild it or restore it. Do not move that cache into dist/.
 rm -rf dist
-if ! pnpm run build >> "$LOG" 2>&1; then
-  write_status "failed" "build" "TypeScript build failed"
-  exit 1
-fi
 
 # Dashboard SPA is a separate Vite project outside the pnpm workspace, so it
 # needs its own install. Without this step `/deploy` could ship server code
 # with stale SPA assets (browser keeps loading the previous bundle hash).
 #
-# Both this and `build:spa` above route through scripts/build-dashboard-spa.ts,
+# MUST run before `pnpm run build` below (#309): `build` reaches `build:spa`,
+# which never installs. If `build:spa` ran first against a deploy that both
+# bumps a dashboard dependency and imports it, the typecheck+vite build fails
+# against the PREVIOUS deploy's stale dashboard/node_modules and the deploy
+# exits before ever reaching the install that would have fixed it. Running
+# the frozen install here first means `build:spa` below always sees
+# dashboard/node_modules that matches the current lockfile.
+#
+# Both this and `build:spa` below route through scripts/build-dashboard-spa.ts,
 # which rebuilds only when the content hash of dashboard/ changed and otherwise
 # restores the cached bundle. Unchanged dashboard/ => this step is a file copy,
 # not a `pnpm install` + `vite build`. DASHBOARD_BUILD_FORCE=1 bypasses it.
+# build-dashboard-spa.ts's cache is only ever seeded by the --install path
+# (depsVerified), so this must also run before `build:spa` for the cache to
+# be populated for that restore.
 write_status "running" "dashboard build" ""
 if ! pnpm run build:dashboard >> "$LOG" 2>&1; then
   write_status "failed" "dashboard build" "Vite SPA build failed"
+  exit 1
+fi
+
+if ! pnpm run build >> "$LOG" 2>&1; then
+  write_status "failed" "build" "TypeScript build failed"
   exit 1
 fi
 

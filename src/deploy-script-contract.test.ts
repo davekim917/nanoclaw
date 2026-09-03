@@ -29,4 +29,15 @@ describe('deploy rollback shell contract', () => {
     expect(script).toContain('Pre-restart rollback preserved tracked source changes; commit reset skipped');
     expect(script).toContain('rm -rf "${name}.failed-deploy"');
   });
+
+  it('installs dashboard deps before the first SPA-touching build (#309)', () => {
+    // `pnpm run build` reaches `build:spa`, which never installs — see
+    // scripts/build-dashboard-spa.ts's depsVerified gate. If it ran before
+    // `build:dashboard`'s frozen install, a deploy that both bumps a
+    // dashboard dependency and imports it would typecheck+build against the
+    // PREVIOUS deploy's stale dashboard/node_modules and fail before ever
+    // reaching the install that would fix it.
+    expect(script.indexOf('rm -rf dist')).toBeLessThan(script.indexOf('pnpm run build:dashboard'));
+    expect(script.indexOf('pnpm run build:dashboard')).toBeLessThan(script.indexOf('pnpm run build >>'));
+  });
 });
