@@ -77,6 +77,10 @@ export function claimCliRequest(sessionId: string, requestId: string, command: s
     }
   }
 
+  // Either still executing, or `done` with the payload dropped by the prune's
+  // backstop below. Both mean the same thing to a caller: the command was
+  // dispatched and its result is not available to replay, so do not run it
+  // again.
   return { state: 'executing' };
 }
 
@@ -111,22 +115,62 @@ export function releaseCliRequest(sessionId: string, requestId: string): void {
     .run(sessionId, requestId);
 }
 
-/** Retry window is seconds; an hour of history is already generous. */
-const CLI_REQUEST_LEDGER_TTL_SECONDS = 3600;
+/**
+ * A row younger than this is never touched, whatever else is true of it. The
+ * delivery loop's three attempts land within a couple of sweep cycles, so this
+ * is already an order of magnitude of slack on the ordinary retry.
+ */
+const PRUNE_FLOOR_SECONDS = 600;
+
+/** After this long, a claim keeps its "it ran" fact but drops its payload. */
+const PAYLOAD_RETENTION_DAYS = 7;
 
 /**
- * Sweep step. Completed frames are only needed while the delivery loop can
- * still retry the row, and an `executing` row only has to outlive the retry
- * that follows a host restart.
+ * Sweep step.
+ *
+ * Deliberately NOT an age-based delete. A claim is only safe to drop once its
+ * outbound row can no longer be re-dispatched, and elapsed time does not prove
+ * that: a host that restarts mid-retry resets the delivery loop's in-memory
+ * attempt counter, so an hours-old undelivered row is still retryable, and
+ * deleting its claim would let the command run a second time — the hole this
+ * table exists to close.
+ *
+ * The terminal test is ordering, not age. `drainSession` breaks on the first
+ * failed row and resumes from it, so a session's later outbound rows cannot be
+ * delivered past a stuck one. A NEWER completed request from the same session
+ * is therefore proof that this one's outbound row already reached a terminal
+ * state — delivered, or dropped by `markDeliveryFailed` after three attempts.
+ * Either way nothing will dispatch it again.
+ *
+ * That leaves the newest claim per session, plus any claim from a session that
+ * never spoke again. Those keep their row and lose only their cached response
+ * after a week, which costs a replay its stored frame but not the at-most-once
+ * guarantee: a claim with no payload reports `executing`, and the agent is told
+ * the command was dispatched rather than having it run again.
  */
 export function pruneCliRequestExecutions(): void {
   try {
-    getDb()
-      .prepare(
-        `DELETE FROM cli_request_executions
-          WHERE datetime(claimed_at) < datetime('now', '-${CLI_REQUEST_LEDGER_TTL_SECONDS} seconds')`,
-      )
-      .run();
+    const db = getDb();
+
+    db.prepare(
+      `DELETE FROM cli_request_executions
+        WHERE completed_at IS NOT NULL
+          AND datetime(claimed_at) < datetime('now', '-${PRUNE_FLOOR_SECONDS} seconds')
+          AND EXISTS (
+                SELECT 1
+                  FROM cli_request_executions newer
+                 WHERE newer.session_id = cli_request_executions.session_id
+                   AND newer.completed_at IS NOT NULL
+                   AND newer.claimed_at > cli_request_executions.claimed_at
+              )`,
+    ).run();
+
+    db.prepare(
+      `UPDATE cli_request_executions
+          SET response = NULL
+        WHERE response IS NOT NULL
+          AND datetime(claimed_at) < datetime('now', '-${PAYLOAD_RETENTION_DAYS} days')`,
+    ).run();
   } catch (err) {
     log.warn('pruneCliRequestExecutions: failed', { err });
   }

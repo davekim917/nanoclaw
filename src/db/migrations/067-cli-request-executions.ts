@@ -28,8 +28,11 @@ import type { Migration } from './index.js';
  *     deletes its own claim, so `executing` never means "never started".
  *   - `done` — `response` holds the ResponseFrame JSON to replay.
  *
- * Rows are pruned by the host sweep; the retry window is seconds, so nothing
- * here is long-lived state.
+ * Rows are pruned by the host sweep, but never on a wall clock alone: an aged
+ * claim that the delivery loop can still retry would re-open the exact hole
+ * this table closes. The prune's index is (session_id, claimed_at) because the
+ * terminal test is "does this session have a NEWER completed request" — see
+ * `pruneCliRequestExecutions`.
  */
 export const migration067: Migration = {
   version: 67,
@@ -47,7 +50,7 @@ export const migration067: Migration = {
         PRIMARY KEY (session_id, request_id)
       );
       CREATE INDEX IF NOT EXISTS idx_cli_request_executions_prune
-        ON cli_request_executions(status, claimed_at);
+        ON cli_request_executions(session_id, claimed_at);
     `);
   },
 };

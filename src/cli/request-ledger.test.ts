@@ -89,6 +89,17 @@ function ledgerRows(): Array<{ status: string; response: string | null }> {
   }>;
 }
 
+function requestIds(): string[] {
+  return (getDb().prepare('SELECT request_id FROM cli_request_executions').all() as Array<{ request_id: string }>).map(
+    (r) => r.request_id,
+  );
+}
+
+/** Backdate a claim so the prune's floor and retention windows are in play. */
+function age(requestId: string, claimedAt: string): void {
+  getDb().prepare('UPDATE cli_request_executions SET claimed_at = ? WHERE request_id = ?').run(claimedAt, requestId);
+}
+
 beforeEach(() => {
   fs.rmSync(TEST_DIR, { recursive: true, force: true });
   fs.mkdirSync(TEST_DIR, { recursive: true });
@@ -220,17 +231,68 @@ describe('ledger mechanics', () => {
     expect(claimCliRequest(SESSION_ID, 'req-9', 'groups-list').state).toBe('executing');
   });
 
-  it('prune drops rows past the retry window and keeps fresh ones', () => {
-    getDb()
-      .prepare(`UPDATE cli_request_executions SET claimed_at = '2020-01-01T00:00:00.000Z' WHERE request_id = 'req-9'`)
-      .run();
-    claimCliRequest(SESSION_ID, 'req-10', 'groups-list');
+  it('prune keeps an aged claim that nothing has superseded — age alone is not terminal', () => {
+    // A host that restarts mid-retry resets the delivery loop's attempt
+    // counter, so an hours-old undelivered outbound row is still retryable.
+    // Dropping its claim on a clock would let the command run twice.
+    age('req-9', '2020-01-01T00:00:00.000Z');
 
     pruneCliRequestExecutions();
 
-    const remaining = getDb().prepare('SELECT request_id FROM cli_request_executions').all() as Array<{
-      request_id: string;
-    }>;
-    expect(remaining.map((r) => r.request_id)).toEqual(['req-10']);
+    expect(requestIds()).toEqual(['req-9']);
+  });
+
+  it('prune drops a claim a newer completed request from the same session has superseded', () => {
+    // `drainSession` breaks on the first failed row, so a later row could only
+    // be delivered once this one reached delivered-or-dropped.
+    completeCliRequest(SESSION_ID, 'req-9', { id: 'req-9', ok: true, data: 1 });
+    age('req-9', '2026-09-01T00:00:00.000Z');
+    claimCliRequest(SESSION_ID, 'req-10', 'groups-list');
+    completeCliRequest(SESSION_ID, 'req-10', { id: 'req-10', ok: true, data: 2 });
+    age('req-10', '2026-09-02T00:00:00.000Z');
+
+    pruneCliRequestExecutions();
+
+    expect(requestIds()).toEqual(['req-10']);
+  });
+
+  it("prune never drops another session's claim, however new this session's requests are", () => {
+    completeCliRequest(SESSION_ID, 'req-9', { id: 'req-9', ok: true, data: 1 });
+    age('req-9', '2026-09-01T00:00:00.000Z');
+    claimCliRequest('other-session', 'req-8', 'groups-list');
+    completeCliRequest('other-session', 'req-8', { id: 'req-8', ok: true, data: 0 });
+    age('req-8', '2026-09-01T00:00:00.000Z');
+    claimCliRequest(SESSION_ID, 'req-10', 'groups-list');
+    completeCliRequest(SESSION_ID, 'req-10', { id: 'req-10', ok: true, data: 2 });
+
+    pruneCliRequestExecutions();
+
+    expect(requestIds().sort()).toEqual(['req-10', 'req-8']);
+  });
+
+  it('prune leaves a superseded claim alone inside the floor, and never drops an executing one', () => {
+    // Fresh rows are untouchable, and an `executing` claim is the one that most
+    // needs to survive — it is the marker of a host that died mid-command.
+    completeCliRequest(SESSION_ID, 'req-9', { id: 'req-9', ok: true, data: 1 });
+    claimCliRequest(SESSION_ID, 'req-10', 'groups-list');
+    completeCliRequest(SESSION_ID, 'req-10', { id: 'req-10', ok: true, data: 2 });
+    claimCliRequest(SESSION_ID, 'req-11', 'groups-list'); // never completed
+    age('req-11', '2020-01-01T00:00:00.000Z');
+
+    pruneCliRequestExecutions();
+
+    expect(requestIds().sort()).toEqual(['req-10', 'req-11', 'req-9']);
+  });
+
+  it('a week-old unsuperseded claim keeps the fact it ran and loses only its payload', () => {
+    completeCliRequest(SESSION_ID, 'req-9', { id: 'req-9', ok: true, data: 'stale' });
+    age('req-9', '2020-01-01T00:00:00.000Z');
+
+    pruneCliRequestExecutions();
+
+    // Still refuses to re-run — a dropped payload downgrades a replay to the
+    // ambiguous answer, it does not restore at-least-once.
+    expect(claimCliRequest(SESSION_ID, 'req-9', 'groups-list').state).toBe('executing');
+    expect(requestIds()).toEqual(['req-9']);
   });
 });
