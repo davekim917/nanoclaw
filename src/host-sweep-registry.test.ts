@@ -244,12 +244,14 @@ vi.mock('./db/connection.js', () => ({
 import './modules/sweep-repo-fence/index.js';
 import { registerAgentMailbox, resetAgentMailboxForTesting } from './mailbox/index.js';
 import {
+  QUIET_SESSION_BACKOFF_MS,
   SWEEP_DUTY_INVENTORY,
   SWEEP_INTERVAL_MS,
   SWEEP_PHASES,
   _listSweepRegistrationsForTesting,
   _resetSweepRegistryForTesting,
   _unregisterSweepDutySourceForTesting,
+  _resetQuietSessionCacheForTesting,
   _setSweepYieldForTesting,
   _sweepOnceForTesting,
   registerSlaObservationHook,
@@ -1233,6 +1235,7 @@ describe('sweep duty registry (S2-PR2)', () => {
       'ABSOLUTE_CEILING_MS',
       'CLAIM_STUCK_MS',
       'SPAWN_GRACE_MS',
+      'QUIET_SESSION_BACKOFF_MS',
       'providerFailedTicks',
       'writeSystemWake',
       // re-exports the families and their callers reach through the driver
@@ -1241,6 +1244,7 @@ describe('sweep duty registry (S2-PR2)', () => {
       'WORK_CONTINUATION_RESUME_MAX_ATTEMPTS',
       // test accessors
       '_listSweepRegistrationsForTesting',
+      '_resetQuietSessionCacheForTesting',
       '_resetSweepRegistryForTesting',
       '_unregisterSweepDutySourceForTesting',
       '_setSweepYieldForTesting',
@@ -1413,6 +1417,94 @@ describe('sweep duty registry (S2-PR2)', () => {
       h.sessions = [fakeSession('sess-invalidate', { last_active: '2026-04-20T13:30:00.000Z' })];
       await _sweepOnceForTesting();
       expect(h.opens).toContain('sess-invalidate');
+      expect(h.spawns).toEqual([]);
+    });
+  });
+
+  // ── S2-PR15 (#320): the quiet backoff is jittered ────────────────────────────
+  //
+  // Live evidence the cases below pin: the whole quiet population (~840
+  // sessions) took its mark in one tick and therefore expired in one tick, on
+  // an exact 30-minute grid, 48 times a day. The jitter never LENGTHENS a
+  // skip — the 30-minute ceiling §4.4 pins is untouched — it only spreads the
+  // cohort's expiry across the window below it.
+  describe('quiet backoff jitter (S2-PR15)', () => {
+    const HERD = 200;
+    const MINUTE = 60_000;
+
+    /**
+     * Mark `HERD` sessions quiet in one tick, then step a tick per minute and
+     * record, for each session, the FIRST minute at which it was swept again.
+     * That minute IS the observed backoff — the skip check is a `Date.now() <
+     * skipUntilMs` compare, so the first tick past `skipUntilMs` sweeps it.
+     *
+     * Registry stripped to the driver (`builtins: false`): 200 sessions × 17
+     * ticks through 39 duty bodies measures the duties, not the cache, and the
+     * quiet hint is driver machinery that runs either way.
+     */
+    async function observeBackoffMinutes(): Promise<Map<string, number>> {
+      _resetSweepRegistryForTesting({ builtins: false });
+      _resetQuietSessionCacheForTesting();
+      _setSweepYieldForTesting(async () => undefined);
+      h.sessions = Array.from({ length: HERD }, (_, i) => fakeSession(`sess-herd-${i}`));
+      h.mailbox = fakeMailbox({ getNextFutureProcessAfter: () => null });
+
+      const startMs = Date.UTC(2026, 8, 3, 12, 0, 0);
+      vi.setSystemTime(startMs);
+      h.opens = [];
+      await _sweepOnceForTesting();
+      // A swept session opens twice (W1 and W5); a skipped one opens not at all.
+      expect(new Set(h.opens).size).toBe(HERD);
+
+      const firstSweptAt = new Map<string, number>();
+      for (let minute = 1; minute <= 31; minute++) {
+        vi.setSystemTime(startMs + minute * MINUTE);
+        h.opens = [];
+        await _sweepOnceForTesting();
+        for (const id of new Set(h.opens)) if (!firstSweptAt.has(id)) firstSweptAt.set(id, minute);
+      }
+      return firstSweptAt;
+    }
+
+    beforeEach(() => {
+      vi.useFakeTimers({ shouldAdvanceTime: false });
+    });
+    afterEach(() => {
+      vi.useRealTimers();
+      _resetQuietSessionCacheForTesting();
+    });
+
+    // ── Q-7 ──────────────────────────────────────────────────────────────────
+    it('quiet backoff is jittered so one cohort does not expire in one tick', async () => {
+      const observed = await observeBackoffMinutes();
+      expect(observed.size).toBe(HERD);
+
+      const minutes = [...observed.values()];
+      const spread = Math.max(...minutes) - Math.min(...minutes);
+      expect(spread, 'the cohort expires across a window, not on one grid line').toBeGreaterThan(10);
+      // Never past the cap: the jitter only ever shortens the skip, so §4.4's
+      // 30-minute bound still holds for every session.
+      expect(Math.max(...minutes)).toBeLessThanOrEqual(QUIET_SESSION_BACKOFF_MS / MINUTE);
+      expect(h.spawns).toEqual([]);
+    });
+
+    // ── S2-PR15 acceptance ───────────────────────────────────────────────────
+    it('quiet marks expire on a jittered schedule, never all on one tick', async () => {
+      const first = await observeBackoffMinutes();
+
+      const minutes = [...first.values()];
+      const window = QUIET_SESSION_BACKOFF_MS / MINUTE;
+      expect(Math.max(...minutes) - Math.min(...minutes)).toBeGreaterThanOrEqual(window * 0.2);
+
+      // The herd assertion: no single tick takes the whole cohort back.
+      const perMinute = new Map<number, number>();
+      for (const m of minutes) perMinute.set(m, (perMinute.get(m) ?? 0) + 1);
+      expect(Math.max(...perMinute.values()), 'a whole cohort still expires on one tick').toBeLessThan(HERD);
+
+      // Deterministic: the jitter is a hash of the session id, not
+      // Math.random, so a second identical run reproduces every expiry.
+      const second = await observeBackoffMinutes();
+      expect([...second.entries()].sort()).toEqual([...first.entries()].sort());
       expect(h.spawns).toEqual([]);
     });
   });
