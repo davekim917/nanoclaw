@@ -199,7 +199,7 @@ Every PR: branch from `main` in a scratch worktree the operator has approved for
 | 6 | Host callers, operator surfaces: `dashboard/api/{threads,scheduled-move,scheduled-mutations}.ts`, `dashboard/steer.ts`, `modules/repository-workspaces/index.ts`, `orchestrator-dispatch`, `migrate-tasks-to-system-sessions.ts`, `threads.ts` | host | dashboard reads via the seam | worker | 2 |
 | R2 | `registerAdmissionGate` seam + fence gate in the module; poll-loop idle ack moves behind it | runner | idle-boundary ack path | worker-high | R1 |
 | 7 | Delete `src/db/session-db.ts` façade and `session-manager.ts` raw wrappers; host allowlist → empty; docs | host | none | worker-fast | 3–6 |
-| R3 | `poll-loop.ts`, `codex.ts`, `cli/ncl.ts`, `self-mod.ts`, `session-recap.ts`, `resource-telemetry.ts`, `scheduling/wiki-lint-gate.ts` (opens both session DBs by injected path — found by the PR 1 ratchet) off raw handles; port upstream's runner `mailbox/registry.test.ts`; runner allowlist → empty | runner | none | worker | R1, R2 |
+| R3 | the five runner files still on the allowlist after R1 — `poll-loop.ts`, `cli/ncl.ts`, `db/turn-usage.ts`, `db/rate-limit-samples.ts` (usage writers take the opener from upstream's connection module; move their SQL into the module as named ops), `scheduling/wiki-lint-gate.ts` (opens both session DBs by injected path) — off raw handles; port upstream's runner `mailbox/registry.test.ts`; runner allowlist → empty | runner | none | worker | R1, R2 |
 
 Sequencing notes:
 
