@@ -226,6 +226,87 @@ async function inboundThroughBridge(
   return received[0];
 }
 
+/**
+ * Thread-context replay: the router rebuilds an unengaged thread's history
+ * through bridge.fetchThreadHistory, which reads `.text` only. A table-only
+ * message has empty text and would be skipped outright.
+ */
+function historyBridge(messages: Array<Record<string, unknown>>, extract = true) {
+  const adapter = {
+    name: 'slack',
+    initialize: async () => {},
+    channelIdFromThreadId: (threadId: string) => threadId,
+    fetchMessages: async () => ({ messages }),
+  } as unknown as Adapter;
+  return createChatSdkBridge({
+    adapter,
+    supportsThreads: true,
+    extractRawText: extract ? extractSlackRawText : undefined,
+  });
+}
+
+const historyAuthor = { userId: 'U1', fullName: 'Gavriel C', userName: 'gavriel', isMe: false };
+const historyMeta = { dateSent: new Date('2026-09-02T10:00:00Z') };
+
+describe('Slack pasted tables in replayed thread context', () => {
+  it('recovers a table-only history message instead of skipping it as empty', async () => {
+    const bridge = historyBridge([
+      {
+        id: 'm1',
+        text: '',
+        raw: { attachments: pastedTableEvent.attachments },
+        author: historyAuthor,
+        metadata: historyMeta,
+      },
+    ]);
+    const history = await bridge.fetchThreadHistory!('slack:C1:ts-1');
+    expect(history).toHaveLength(1);
+    expect(history[0].text).toContain('Agria Pet Insurance | Head of IT Operations');
+  });
+
+  it('replays the table alongside its introductory sentence', async () => {
+    const bridge = historyBridge([
+      {
+        id: 'm1',
+        text: 'Analyze this attendee list:',
+        raw: pastedTableEvent,
+        author: historyAuthor,
+        metadata: historyMeta,
+      },
+    ]);
+    const history = await bridge.fetchThreadHistory!('slack:C1:ts-1');
+    expect(history[0].text).toBe(
+      'Analyze this attendee list:\n\nCompany | Title\nAgria Pet Insurance | Head of IT Operations\nAVEVA | Head of Cyber Security Risk and Assurance',
+    );
+  });
+
+  it('still skips a genuinely empty message when there is nothing to recover', async () => {
+    const bridge = historyBridge([
+      { id: 'm1', text: '', raw: { text: '' }, author: historyAuthor, metadata: historyMeta },
+      { id: 'm2', text: 'hello', raw: {}, author: historyAuthor, metadata: historyMeta },
+    ]);
+    const history = await bridge.fetchThreadHistory!('slack:C1:ts-1');
+    expect(history.map((h) => h.text)).toEqual(['hello']);
+  });
+
+  it('leaves history byte-identical for an adapter with no extractor', async () => {
+    const bridge = historyBridge(
+      [
+        {
+          id: 'm1',
+          text: 'Analyze this attendee list:',
+          raw: pastedTableEvent,
+          author: historyAuthor,
+          metadata: historyMeta,
+        },
+      ],
+      false,
+    );
+    const history = await bridge.fetchThreadHistory!('slack:C1:ts-1');
+    expect(history[0].text).toBe('Analyze this attendee list:');
+  });
+});
+
 describe('Slack pasted tables through the chat-sdk bridge', () => {
   beforeEach(() => {
     captured.chat = null;

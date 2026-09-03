@@ -1564,17 +1564,26 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
         const msgs = (result?.messages ?? []) as Array<{
           id: string;
           text: string;
+          raw?: unknown;
           author: { userId?: string; fullName: string; userName: string; isMe: boolean };
           metadata: { dateSent: Date };
         }>;
         for (const m of msgs) {
           if (m.id === opts?.excludeMessageId) continue;
-          if (!m.text || m.text.length === 0) continue;
+          // Replayed context goes through the same raw-text recovery as the
+          // live path. Without it a Slack message whose only content is a
+          // pasted table has empty `.text` and is skipped outright, and a
+          // table with an introductory sentence replays only the sentence —
+          // the very message that made the thread worth resuming.
+          const projected: Record<string, unknown> = { text: m.text };
+          if (m.raw) appendRawText(projected, m.raw as Record<string, unknown>, config.extractRawText);
+          const text = typeof projected.text === 'string' ? projected.text : '';
+          if (text.length === 0) continue;
           inThread.push({
             sender: m.author.isMe
               ? 'assistant'
               : config.transformInboundSender?.(m.author) || m.author.fullName || m.author.userName || 'unknown',
-            text: applyInboundTransform(m.text),
+            text: applyInboundTransform(text),
             timestamp: m.metadata.dateSent.toISOString(),
           });
         }
