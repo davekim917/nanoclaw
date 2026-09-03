@@ -5,50 +5,55 @@ import { randomUUID } from 'node:crypto';
 import { findByName, findByRouting, findPeerName, getAllDestinations, type DestinationEntry } from './destinations.js';
 import {
   getPendingMessages,
-  getActiveRepositoryMountBarrier,
   getMessageIn,
   markProcessing,
-  releaseProcessingClaims,
   markCompleted,
   markScriptSkipped,
-  retainCompleteRecallUnits,
-  classifyTrigger,
   type MessageInRow,
-  type TurnTrigger,
 } from './db/messages-in.js';
 import { getConfig } from './config.js';
-import { setChatLimit, writeMessageOut } from './db/messages-out.js';
+import { writeMessageOut } from './db/messages-out.js';
 import { recordTurnUsage } from './db/turn-usage.js';
-import { getSessionSpawnTaskId } from './db/session-routing.js';
-import { getInboundDb, touchHeartbeat, clearStaleProcessingAcks } from './db/connection.js';
+import { getInboundDb } from './mailbox/sqlite/connection.js';
+import { touchHeartbeat } from './heartbeat.js';
+import { clearStaleProcessingAcks } from './db/container-state.js';
 import {
-  advanceMemoryContextEpoch,
   clearContinuation,
   clearCurrentInReplyTo,
+  migrateLegacyContinuation,
+  setContinuation,
+  setCurrentInReplyTo,
+} from './db/session-state.js';
+import {
+  acknowledgeRepositoryMountBarrier,
+  advanceMemoryContextEpoch,
+  classifyTrigger,
+  clearDoneProposal,
+  clearStickyEffort,
+  clearStickyModel,
+  clearStickyUltracode,
   clearWorkContinuationIfMatches,
+  getActiveRepositoryMountBarrier,
+  getSessionSpawnTaskId,
+  getStickyEffort,
+  getStickyFast,
+  getStickyModel,
+  getStickyUltracode,
   getWorkContinuation,
   isWorkContinuationRunnable,
   markWorkContinuationRunning,
-  migrateLegacyContinuation,
+  releaseProcessingClaims,
   requeueWorkContinuationIfMatches,
   resetWorkContinuationForRealInbound,
-  clearDoneProposal,
-  setContinuation,
-  setCurrentInReplyTo,
-  getStickyModel,
-  setStickyModel,
-  clearStickyModel,
-  getStickyEffort,
+  retainCompleteRecallUnits,
+  setChatLimit,
   setStickyEffort,
-  clearStickyEffort,
-  getStickyUltracode,
-  setStickyUltracode,
-  clearStickyUltracode,
-  getStickyFast,
   setStickyFast,
+  setStickyModel,
+  setStickyUltracode,
   shouldPostInfraWarning,
-  acknowledgeRepositoryMountBarrier,
-} from './db/session-state.js';
+  type TurnTrigger,
+} from './modules/mailbox/index.js';
 import { clearBatchAnchors, getBatchAnchor, setCurrentBatchAnchors } from './current-batch.js';
 import {
   formatMessages,
@@ -185,7 +190,11 @@ function isProviderQuotaExhausted(err: unknown): boolean {
  * genuine bug that breaks both providers still surfaces — one turn later,
  * having been tried on two runtimes instead of one.
  */
-function reportProviderUnavailable(providerName: string | null, message: string, recognizedQuota: boolean): boolean {
+async function reportProviderUnavailable(
+  providerName: string | null,
+  message: string,
+  recognizedQuota: boolean,
+): Promise<boolean> {
   let runnerConfig: ReturnType<typeof getConfig>;
   try {
     runnerConfig = getConfig();
@@ -206,7 +215,7 @@ function reportProviderUnavailable(providerName: string | null, message: string,
     typeof process !== 'undefined' ? process.env?.NANOCLAW_PROVIDER_OVERRIDE : undefined,
   );
   try {
-    writeMessageOut({
+    await writeMessageOut({
       id: generateId(),
       kind: 'system',
       content: JSON.stringify({
@@ -1149,11 +1158,11 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       const quotaHandled =
         !recovered &&
         !deferredForRepositoryBarrier &&
-        reportProviderUnavailable(
+        (await reportProviderUnavailable(
           config.providerName,
           err instanceof Error ? err.message : String(err),
           quotaExhausted,
-        );
+        ));
       deferredToFallback = quotaHandled;
 
       // Only surface the error to the user if we couldn't recover inline.
@@ -1750,7 +1759,7 @@ export async function processQuery(
         throw err;
       }
 
-      handleEvent(event, routing);
+      await handleEvent(event, routing);
       touchHeartbeat();
 
       if (event.type === 'init') {
@@ -1961,7 +1970,7 @@ function notifyExchangeComplete(
   }
 }
 
-export function handleEvent(event: ProviderEvent, routing: RoutingContext): void {
+export async function handleEvent(event: ProviderEvent, routing: RoutingContext): Promise<void> {
   switch (event.type) {
     case 'init':
       log(`Session: ${event.continuation}`);
@@ -1986,7 +1995,7 @@ export function handleEvent(event: ProviderEvent, routing: RoutingContext): void
       // instead of shown: the session respawns on the fallback provider.
       // See the thrown-error sibling branch for the same decision.
       if (event.retryable === false && event.classification === 'quota') {
-        if (reportProviderUnavailable(null, event.message, true)) break;
+        if (await reportProviderUnavailable(null, event.message, true)) break;
       }
       if (event.retryable === false) {
         // `log()` above already covers unconditional logging for this

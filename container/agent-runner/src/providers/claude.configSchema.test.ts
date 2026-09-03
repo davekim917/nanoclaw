@@ -39,9 +39,9 @@ mock.module('@anthropic-ai/claude-agent-sdk', () => ({
 // bun's mock.module leaks across test files in the same process, and a
 // bare two-export mock strips getOutboundDb/transaction from later files
 // (task-script.test.ts markScriptSkipped went red on exactly this).
-const realConnection = await import('../db/connection.js');
-mock.module('../db/connection.js', () => ({
-  ...realConnection,
+const realContainerState = await import('../db/container-state.js');
+mock.module('../db/container-state.js', () => ({
+  ...realContainerState,
   clearContainerToolInFlight: () => {},
   setContainerToolInFlight: () => {},
 }));

@@ -19,12 +19,8 @@ import path from 'path';
 import { z } from 'zod';
 
 import { memoryContextForSessionStart, type MemorySessionHookRegistration } from '../memory/session-hook.js';
-import {
-  clearContainerToolInFlight,
-  setContainerToolInFlight,
-  setProviderHealthState,
-  type ProviderHealthState,
-} from '../db/connection.js';
+import { clearContainerToolInFlight, setContainerToolInFlight } from '../db/container-state.js';
+import { setProviderHealthState, type ProviderHealthState } from '../modules/mailbox/index.js';
 import { registerProvider, registerProviderConfigSchema } from './provider-registry.js';
 import type { AgentProvider, AgentQuery, ProviderEvent, ProviderOptions, QueryInput } from './types.js';
 import {

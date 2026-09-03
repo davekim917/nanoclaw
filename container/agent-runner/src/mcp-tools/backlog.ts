@@ -16,7 +16,7 @@
  * it can call `git log` via Bash.
  */
 import { getConfig } from '../config.js';
-import { getCentralDb } from '../db/connection.js';
+import { getCentralDb } from '../central-db.js';
 import { writeMessageOut } from '../db/messages-out.js';
 import { getSessionRouting } from '../db/session-routing.js';
 import { registerTools } from './server.js';

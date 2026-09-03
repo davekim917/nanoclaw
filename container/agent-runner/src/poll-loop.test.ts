@@ -4,14 +4,9 @@ import os from 'os';
 import path from 'path';
 
 import { _resetConfig, loadConfig } from './config.js';
-import {
-  clearStaleProcessingAcks,
-  closeSessionDb,
-  getInboundDb,
-  getOutboundDb,
-  initTestSessionDb,
-  setContainerToolInFlight,
-} from './db/connection.js';
+import { clearStaleProcessingAcks, setContainerToolInFlight } from './db/container-state.js';
+import { getInboundDb, getOutboundDb } from './mailbox/sqlite/connection.js';
+import { closeSessionDb, initTestSessionDb } from './modules/mailbox/testing.js';
 import { getPendingMessages, markCompleted } from './db/messages-in.js';
 import { getUndeliveredMessages } from './db/messages-out.js';
 import { getTurnUsageRows } from './db/turn-usage.js';
@@ -36,9 +31,10 @@ import {
 import {
   cancelWorkContinuation,
   getWorkContinuation,
+  getPendingMessagesWithDiagnostics,
   markWorkContinuationRunning,
   queueWorkContinuation,
-} from './db/session-state.js';
+} from './modules/mailbox/index.js';
 import { MockProvider } from './providers/mock.js';
 import { postToolUseHook, preToolUseHook } from './providers/claude.js';
 import type { AgentQuery, ProviderEvent } from './providers/types.js';
@@ -300,12 +296,12 @@ describe('chat budget from task content', () => {
   // every later kind:'chat' write in the whole run — which looks exactly like
   // the unrelated "expected length 1, received 0" failures.
   afterEach(() => {
-    const { setChatLimit } = require('./db/messages-out.js');
+    const { setChatLimit } = require('./modules/mailbox/index.js');
     setChatLimit(null);
   });
 
   it('muteChat zeroes the budget; chatLimit sets it; absent leaves unlimited', () => {
-    const { isChatMuted } = require('./db/messages-out.js');
+    const { isChatMuted } = require('./modules/mailbox/index.js');
     insertMessage('t-mute', 'task', { prompt: 'watch', muteChat: true });
     let messages = getPendingMessages().filter((m) => m.id === 't-mute');
     applyChatBudget(messages);
@@ -326,7 +322,7 @@ describe('chat budget from task content', () => {
     // Regression: a deferred recall row arriving mid-turn hit the settings
     // re-check path (applyFlagBatch with no task rows) and un-muted a muted
     // task turn — observed live 2026-08-02.
-    const { isChatMuted } = require('./db/messages-out.js');
+    const { isChatMuted } = require('./modules/mailbox/index.js');
     insertMessage('t-mute-2', 'task', { prompt: 'watch', muteChat: true });
     let messages = getPendingMessages().filter((m) => m.id === 't-mute-2');
     applyChatBudget(messages);
@@ -341,23 +337,24 @@ describe('chat budget from task content', () => {
     expect(isChatMuted()).toBe(false);
   });
 
-  it('budget counts new posts only — edits and reactions stay allowed after exhaustion', () => {
-    const { setChatLimit, chatBudgetExhausted, writeMessageOut } = require('./db/messages-out.js');
+  it('budget counts new posts only — edits and reactions stay allowed after exhaustion', async () => {
+    const { setChatLimit, chatBudgetExhausted } = require('./modules/mailbox/index.js');
+    const { writeMessageOut } = require('./db/messages-out.js');
     setChatLimit(1);
     expect(chatBudgetExhausted()).toBe(false);
 
-    const first = writeMessageOut({ id: 'b-post-1', kind: 'chat', content: JSON.stringify({ text: 'digest' }) });
+    const first = await writeMessageOut({ id: 'b-post-1', kind: 'chat', content: JSON.stringify({ text: 'digest' }) });
     expect(first).toBeGreaterThan(0);
     expect(chatBudgetExhausted()).toBe(true);
 
-    const second = writeMessageOut({
+    const second = await writeMessageOut({
       id: 'b-post-2',
       kind: 'chat',
       content: JSON.stringify({ text: 'follow-up summary' }),
     });
     expect(second).toBe(-1);
 
-    const edit = writeMessageOut({
+    const edit = await writeMessageOut({
       id: 'b-edit-1',
       kind: 'chat',
       content: JSON.stringify({ operation: 'edit', messageId: 'x', text: 'digest v2' }),
@@ -891,7 +888,7 @@ describe('accumulate gate (trigger column)', () => {
     }
 
     const diagnostics = { inboundRowsRead: 0, inboundRowBudget: 0 };
-    const messages = getPendingMessages(false, diagnostics);
+    const messages = getPendingMessagesWithDiagnostics(false, diagnostics);
     const ids = messages.map((row) => row.id);
 
     expect(messages).toHaveLength(11);
@@ -1904,8 +1901,8 @@ describe('handleEvent — terminal-error visibility (Layer-1 fix)', () => {
     };
   }
 
-  it('retryable=false writes a visible chat outbound on the session route', () => {
-    handleEvent({ type: 'error', message: 'Turn timed out after 300000ms', retryable: false }, routingFixture());
+  it('retryable=false writes a visible chat outbound on the session route', async () => {
+    await handleEvent({ type: 'error', message: 'Turn timed out after 300000ms', retryable: false }, routingFixture());
     const out = getUndeliveredMessages();
     expect(out).toHaveLength(1);
     expect(out[0].kind).toBe('chat');
@@ -1917,13 +1914,16 @@ describe('handleEvent — terminal-error visibility (Layer-1 fix)', () => {
     expect(body.text).toContain('pick up from your next message');
   });
 
-  it('retryable=true is silent — runner is still working on a fix internally', () => {
-    handleEvent({ type: 'error', message: 'API retry', retryable: true }, routingFixture());
+  it('retryable=true is silent — runner is still working on a fix internally', async () => {
+    await handleEvent({ type: 'error', message: 'API retry', retryable: true }, routingFixture());
     expect(getUndeliveredMessages()).toHaveLength(0);
   });
 
-  it('classification is included in the chat surface for terminal errors', () => {
-    handleEvent({ type: 'error', message: 'Rate limit', retryable: false, classification: 'quota' }, routingFixture());
+  it('classification is included in the chat surface for terminal errors', async () => {
+    await handleEvent(
+      { type: 'error', message: 'Rate limit', retryable: false, classification: 'quota' },
+      routingFixture(),
+    );
     const out = getUndeliveredMessages();
     expect(out).toHaveLength(1);
     const body = JSON.parse(out[0].content) as { text: string };

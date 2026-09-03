@@ -14,9 +14,9 @@
  * cross-group dispatch primitive — group is the trust boundary, session is
  * the work-unit boundary.
  */
-import { getCentralDb } from '../db/connection.js';
+import { getCentralDb } from '../central-db.js';
 import { writeMessageOut } from '../db/messages-out.js';
-import { getSessionId } from '../db/session-routing.js';
+import { getSessionId } from '../modules/mailbox/index.js';
 import { deriveSpawnTaskId } from '../dispatch/derive-task-id.js';
 import type { McpToolDefinition } from './types.js';
 

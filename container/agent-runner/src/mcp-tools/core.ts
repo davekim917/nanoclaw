@@ -12,13 +12,8 @@ import path from 'path';
 
 import { awaitDeliveryAck } from '../db/delivery-acks.js';
 import { findByName, getAllDestinations } from '../destinations.js';
-import {
-  chatBudgetExhausted,
-  isChatMuted,
-  getMessageIdBySeq,
-  getRoutingBySeq,
-  writeMessageOut,
-} from '../db/messages-out.js';
+import { getMessageIdBySeq, getRoutingBySeq, writeMessageOut } from '../db/messages-out.js';
+import { chatBudgetExhausted, isChatMuted } from '../modules/mailbox/index.js';
 
 // Shared refusal copy for send paths under the physical chat budget. Edits and
 // reactions stay allowed — amending the already-sent message is the sanctioned
@@ -180,7 +175,7 @@ export const sendMessage: McpToolDefinition = {
     const id = generateId();
     const denial = chatSendDenial();
     if (denial) return err(denial);
-    const seq = writeMessageOut({
+    const seq = await writeMessageOut({
       id,
       in_reply_to: getCurrentInReplyTo(),
       kind: 'chat',

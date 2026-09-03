@@ -11,7 +11,7 @@
  * NOT used on credential rotation: the .jsonl is local to the container
  * and resumes cleanly under the new token, so no recap is needed there.
  */
-import { getInboundDb, getOutboundDb } from './db/connection.js';
+import { readRecapInboundRows, readRecapOutboundRows } from './modules/mailbox/index.js';
 
 const DEFAULT_MAX_MESSAGES = 30;
 const DEFAULT_MAX_CHARS = 12_000;
@@ -54,28 +54,13 @@ export function buildSessionRecap(opts: SessionRecapOptions = {}): string | null
   let outRows: Array<{ timestamp: string; content: string }> = [];
 
   try {
-    inRows = getInboundDb()
-      .prepare(
-        `SELECT timestamp, content FROM messages_in
-         WHERE kind IN ('chat', 'chat-sdk')
-           AND status = 'completed'
-         ORDER BY timestamp DESC
-         LIMIT ?`,
-      )
-      .all(maxMessages) as Array<{ timestamp: string; content: string }>;
+    inRows = readRecapInboundRows(maxMessages);
   } catch {
     // Tables missing (test harness, fresh session). Treat as no history.
   }
 
   try {
-    outRows = getOutboundDb()
-      .prepare(
-        `SELECT timestamp, content FROM messages_out
-         WHERE kind = 'chat'
-         ORDER BY timestamp DESC
-         LIMIT ?`,
-      )
-      .all(maxMessages) as Array<{ timestamp: string; content: string }>;
+    outRows = readRecapOutboundRows(maxMessages);
   } catch {
     // Same as above.
   }

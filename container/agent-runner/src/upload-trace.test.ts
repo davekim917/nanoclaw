@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
 
-import { initTestSessionDb, closeSessionDb, getInboundDb } from './db/connection.js';
+import { getInboundDb } from './mailbox/sqlite/connection.js';
+import { closeSessionDb, initTestSessionDb } from './modules/mailbox/testing.js';
 import { getUndeliveredMessages } from './db/messages-out.js';
 import { getPendingMessages } from './db/messages-in.js';
 import type { MessageInRow } from './db/messages-in.js';

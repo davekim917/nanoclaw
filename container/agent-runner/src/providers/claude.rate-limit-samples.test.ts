@@ -52,7 +52,7 @@ const {
   _resetUsagePullThrottleForTesting,
 } = await import('./claude.js');
 const { MEMORY_SESSION_HOOK } = await import('../memory/session-hook.js');
-const { initTestSessionDb } = await import('../db/connection.js');
+const { initTestSessionDb } = await import('../modules/mailbox/testing.js');
 const { getRateLimitSampleRows } = await import('../db/rate-limit-samples.js');
 
 let tmp: string;

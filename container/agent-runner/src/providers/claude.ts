@@ -13,7 +13,7 @@ import {
   type SdkPluginConfig,
 } from '@anthropic-ai/claude-agent-sdk';
 
-import { clearContainerToolInFlight, setContainerToolInFlight } from '../db/connection.js';
+import { clearContainerToolInFlight, setContainerToolInFlight } from '../db/container-state.js';
 import { recordRateLimitSamples, type AccountIdentity, type RateLimitSample } from '../db/rate-limit-samples.js';
 import type { MemorySessionHookRegistration } from '../memory/session-hook.js';
 import { TIMEZONE, formatLocalStamp } from '../timezone.js';

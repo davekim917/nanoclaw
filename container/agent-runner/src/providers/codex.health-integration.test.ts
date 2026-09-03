@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from 'bun:test';
 
-import { closeSessionDb, initTestSessionDb } from '../db/connection.js';
+import { closeSessionDb, initTestSessionDb } from '../modules/mailbox/testing.js';
 import type { AppServer } from './codex-app-server.js';
 import { runOneTurn, type CodexTurnHealthConfig } from './codex.js';
 import type { ProviderEvent } from './types.js';

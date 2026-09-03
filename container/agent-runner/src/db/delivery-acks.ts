@@ -16,7 +16,7 @@
  *
  * Read-only against inbound.db — no schema changes on the container side.
  */
-import { getInboundDb } from './connection.js';
+import { readDeliveredRow, type DeliveredRow } from '../modules/mailbox/index.js';
 
 export interface DeliveryAck {
   status: 'delivered' | 'failed';
@@ -24,18 +24,10 @@ export interface DeliveryAck {
   error?: string;
 }
 
-interface DeliveredRow {
-  status: string;
-  platform_message_id: string | null;
-  error: string | null;
-}
-
 const POLL_INTERVAL_MS = 300;
 
 function readRow(messageId: string): DeliveredRow | undefined {
-  const row = getInboundDb()
-    .prepare('SELECT status, platform_message_id, error FROM delivered WHERE message_out_id = ?')
-    .get(messageId) as DeliveredRow | undefined;
+  const row = readDeliveredRow(messageId);
   // Host writes status='pending' to stop the delivery loop from
   // re-dispatching a gate on every poll. From the container's
   // perspective a pending row is "not yet resolved" — keep polling until

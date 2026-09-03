@@ -19,8 +19,8 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 
 import type { McpToolDefinition } from './types.js';
-import { getSessionSpawnTaskId } from '../db/session-routing.js';
-import { getCentralDb } from '../db/connection.js';
+import { getSessionSpawnTaskId } from '../modules/mailbox/index.js';
+import { getCentralDb } from '../central-db.js';
 import { getConfig } from '../config.js';
 
 function log(msg: string): void {

@@ -3,7 +3,9 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 
-import { clearStaleProcessingAcks, closeSessionDb, getInboundDb, initTestSessionDb } from './db/connection.js';
+import { clearStaleProcessingAcks } from './db/container-state.js';
+import { getInboundDb } from './mailbox/sqlite/connection.js';
+import { closeSessionDb, initTestSessionDb } from './modules/mailbox/testing.js';
 import { getPendingMessages, markCompleted, markProcessing, type MessageInRow } from './db/messages-in.js';
 import { formatMessages } from './formatter.js';
 import { selectInTurnFollowUps } from './poll-loop.js';

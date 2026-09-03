@@ -19,7 +19,7 @@ import type { McpToolDefinition } from './types.js';
 const SQLITE_LOCK_RETRY_DELAYS_MS = [50, 100, 250, 500] as const;
 
 type SupportActionWriteDependencies = {
-  write?: (message: WriteMessageOut) => number;
+  write?: (message: WriteMessageOut) => number | Promise<number>;
   sleep?: (ms: number) => Promise<void>;
 };
 
@@ -56,7 +56,7 @@ export async function writeSupportAction(
 
   for (let attempt = 0; ; attempt += 1) {
     try {
-      write(message);
+      await write(message);
       return;
     } catch (error) {
       const delay = SQLITE_LOCK_RETRY_DELAYS_MS[attempt];

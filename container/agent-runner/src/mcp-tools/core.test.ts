@@ -13,7 +13,8 @@
  */
 import { describe, it, test, expect, beforeEach, afterEach } from 'bun:test';
 
-import { initTestSessionDb, closeSessionDb, getInboundDb, getOutboundDb } from '../db/connection.js';
+import { getInboundDb, getOutboundDb } from '../mailbox/sqlite/connection.js';
+import { closeSessionDb, initTestSessionDb } from '../modules/mailbox/testing.js';
 import { getUndeliveredMessages } from '../db/messages-out.js';
 import { sendMessage, isAllowedFilePath } from './core.js';
 

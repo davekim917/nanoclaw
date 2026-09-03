@@ -11,6 +11,9 @@
  */
 import { getAllDestinations } from './destinations.js';
 import { getTaskSeriesId } from './db/session-routing.js';
+// Module barrel — loads registration modules, including the singular mailbox slot.
+import './modules/index.js';
+import { getAgentMailbox, readMailboxContext } from './mailbox/index.js';
 
 export function buildCompactInstructions(names: string[], taskId: string | null): string {
   const deliveryReminder = taskId
@@ -46,6 +49,9 @@ function formatDestinationNames(names: string[]): string {
 }
 
 if (import.meta.main) {
+  // getTaskSeriesId reads through the mailbox, so this hook process has to
+  // boot it the same way the runner and the MCP server do.
+  await getAgentMailbox().start(await readMailboxContext());
   const names = getAllDestinations().map((destination) => destination.name);
   console.log(buildCompactInstructions(names, getTaskSeriesId()));
 }

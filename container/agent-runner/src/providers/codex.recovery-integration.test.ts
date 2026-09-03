@@ -3,7 +3,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 
-import { closeSessionDb, initTestSessionDb } from '../db/connection.js';
+import { closeSessionDb, initTestSessionDb } from '../modules/mailbox/testing.js';
 import { MEMORY_SESSION_HOOK } from '../memory/session-hook.js';
 import { CodexProvider } from './codex.js';
 

@@ -12,9 +12,9 @@
  * Package names are sanitized here at the tool boundary AND re-validated on
  * the host side (defense in depth).
  */
-import { getCentralDb } from '../db/connection.js';
+import { getCentralDb } from '../central-db.js';
 import { writeMessageOut } from '../db/messages-out.js';
-import { setStickyModel, setStickyEffort } from '../db/session-state.js';
+import { setStickyModel, setStickyEffort } from '../modules/mailbox/index.js';
 import { getConfig } from '../config.js';
 import { registerTools } from './server.js';
 import type { McpToolDefinition } from './types.js';

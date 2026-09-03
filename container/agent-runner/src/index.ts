@@ -30,6 +30,9 @@ import { buildSystemPromptAddendum } from './destinations.js';
 import { getTaskSeriesId } from './db/session-routing.js';
 import { ensureMemoryScaffold } from './memory/scaffold.js';
 import { MEMORY_SESSION_HOOK } from './memory/session-hook.js';
+// Module barrel — loads registration modules, including the singular mailbox slot.
+import './modules/index.js';
+import { getAgentMailbox, readMailboxContext } from './mailbox/index.js';
 // Providers barrel — each enabled provider self-registers on import.
 // Provider skills append imports to providers/index.ts.
 import './providers/index.js';
@@ -63,6 +66,8 @@ const CWD = '/workspace/agent';
 async function main(): Promise<void> {
   const config = loadConfig();
   const providerName = config.provider.toLowerCase() as ProviderName;
+  const mailbox = getAgentMailbox();
+  await mailbox.start(await readMailboxContext());
 
   log(`Starting v2 agent-runner (provider: ${providerName})`);
 
@@ -293,6 +298,7 @@ async function main(): Promise<void> {
     });
   } finally {
     stopResourceTelemetry();
+    await mailbox.stop();
   }
 }
 
