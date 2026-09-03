@@ -19,6 +19,7 @@ import {
   type ContainerState,
 } from './modules/mailbox/ops/sweep.js';
 import { composeNanoclawSession, type NanoclawMailboxSession } from './modules/mailbox/index.js';
+import { getAgentMailbox } from './mailbox/index.js';
 import { closeDb, initTestDb, runMigrations } from './db/index.js';
 import {
   ABSOLUTE_CEILING_MS,
@@ -2985,6 +2986,39 @@ describe('sweepSession on a session with no mailbox', () => {
     expect(fs.existsSync(sessionPath)).toBe(false);
     expect(fs.existsSync(path.join(sessionPath, 'inbound.db'))).toBe(false);
     expect(mockWakeContainer).not.toHaveBeenCalled();
+    closeDb();
+  });
+
+  // Round 2: the backoff belongs to an unopenable mailbox, never to a duty
+  // that threw. A transient SQLite lock during admission must retry on the
+  // next 60s tick — quiet-caching it would hold an already-due scheduled task
+  // for the full 30 minutes, and `last_active` does not move on failure, so
+  // nothing would clear it early.
+  it('a duty that throws propagates for the next-tick retry instead of being quiet-cached', async () => {
+    const db = initTestDb();
+    runMigrations(db);
+    db.prepare(
+      `INSERT INTO agent_groups (id, name, folder, created_at)
+       VALUES ('ag-dutythrow', 'duty throw', 'duty-throw', ?)`,
+    ).run(new Date().toISOString());
+    mockWakeContainer.mockReset();
+    mockIsContainerRunning.mockReset().mockReturnValue(false);
+    mockHasContainerEverRun.mockReset().mockReturnValue(false);
+
+    const session: Session = { ...fakeSession(), id: 'sess-dutythrow', agent_group_id: 'ag-dutythrow' };
+    // A real mailbox, so the open succeeds and only the DUTY fails.
+    getAgentMailbox().prepare({ agentGroupId: session.agent_group_id, sessionId: session.id });
+    mockAdmitDueTaskContexts.mockImplementationOnce(() => {
+      throw new Error('database is locked');
+    });
+
+    await expect(_sweepSessionForTesting(session)).rejects.toThrow('database is locked');
+
+    // Contrast: the same catch DOES back off when the mailbox itself is the
+    // problem, which is the case the 30-minute quiet marker exists for.
+    mockAdmitDueTaskContexts.mockReturnValue(0);
+    const gone: Session = { ...fakeSession(), id: 'sess-dutythrow-gone', agent_group_id: 'ag-dutythrow' };
+    await expect(_sweepSessionForTesting(gone)).resolves.toEqual(expect.any(Number));
     closeDb();
   });
 });
