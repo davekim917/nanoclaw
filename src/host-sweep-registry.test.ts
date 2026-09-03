@@ -236,6 +236,11 @@ import {
   type SweepTickContext,
 } from './host-sweep.js';
 import { log } from './log.js';
+// Family module side-effect import (S2-PR7): registers T11
+// (scheduled-move-recovery) and T12 (audit-body-prune) as a duty source, so
+// R-7 below sees them at tick:housekeeping order 50/60 the same as every
+// other family this registry tracks.
+import './modules/sweep-scheduled-move/index.js';
 import { SessionDbMissingError, SessionDbUnopenableError } from './modules/mailbox/index.js';
 import { _mailboxSessionDepthForTesting } from './modules/mailbox/session.js';
 // S2-PR3 moved S12/S13 (idle-task-reap, idle-chat-reap) out of host-sweep.ts

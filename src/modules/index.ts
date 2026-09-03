@@ -67,3 +67,6 @@ import './sweep-central/index.js';
 // Sweep-repo-fence (seam 2, PR 8 — G08): T5 approvals-reason-sweep,
 // T22 orphaned-repo-fence-release.
 import './sweep-repo-fence/index.js';
+// Sweep family: scheduled-move recovery (seam 2, S2-PR7) — T11
+// scheduled-move-recovery, T12 audit-body-prune on tick:housekeeping.
+import './sweep-scheduled-move/index.js';
