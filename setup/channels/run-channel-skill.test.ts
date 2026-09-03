@@ -39,6 +39,10 @@ describe('runChannelSkill adapter (Option A)', () => {
       if (c.includes('auth.test')) return '@bot in Acme\n'; // identity capture
       // the resolve run: conversations.open piped through jq → "slack:<channel>"
       if (c.includes('conversations.open')) return 'slack:D0SLACK\n';
+      // step 1's owned-by-fork copy (#250) needs its `git show` content as a
+      // string — an exec that discards it now bounces instead of silently
+      // writing an empty file (skill-apply.ts's owned-by-fork branch).
+      if (c.startsWith('git show')) return '// placeholder branch content\n';
     };
     const wired: Array<Record<string, unknown>> = [];
 

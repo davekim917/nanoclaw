@@ -7,6 +7,7 @@ import {
   removeSkill,
   planSkill,
   fullyApplied,
+  hasBlockingFailure,
   firstFailureHint,
   referenceProse,
   stepLabel,
@@ -156,6 +157,257 @@ describe('from-branch copy apply path', () => {
 
     rmSync(fskill, { recursive: true, force: true });
     rmSync(froot, { recursive: true, force: true });
+  });
+});
+
+// owned-by-fork: a copy whose destinations THIS fork customizes beyond the
+// registry branch (#250 — Slack's/Discord's adapters diverged from the stale
+// `channels` branch). Three files in one directive exercise all three
+// per-file outcomes in a single apply() call: a present+diverged file is
+// refused, a present+identical file is a no-op, and a missing file still
+// installs fresh — proving a sibling refusal doesn't block the rest.
+const OWNED_SKILL = `# owned-by-fork demo
+
+## Pull the adapter from the branch
+\`\`\`nc:copy from-branch:channels owned-by-fork
+src/channels/demo-adapter.ts
+src/channels/demo-registration.test.ts
+src/channels/demo-formatting.md
+\`\`\`
+`;
+const LIVE_CUSTOM_ADAPTER = 'export const adapter = "fork-customized, 528 lines of it";\n';
+const STALE_BRANCH_ADAPTER = 'export const adapter = "april snapshot";\n';
+const FRESH_REGISTRATION_TEST = 'export const registered = true;\n';
+const SHARED_FORMATTING_DOC = '# formatting\nunchanged either way\n';
+
+function ownedByForkExec(cmds: string[]): (c: string) => string | void {
+  return (c: string) => {
+    cmds.push(c);
+    if (c.includes('git show origin/channels:src/channels/demo-adapter.ts')) return STALE_BRANCH_ADAPTER;
+    if (c.includes('git show origin/channels:src/channels/demo-registration.test.ts')) return FRESH_REGISTRATION_TEST;
+    if (c.includes('git show origin/channels:src/channels/demo-formatting.md')) return SHARED_FORMATTING_DOC;
+    return undefined;
+  };
+}
+
+describe('owned-by-fork copy protection (#250)', () => {
+  let oskill: string;
+  let oroot: string;
+  beforeEach(() => {
+    oskill = mkdtempSync(join(tmpdir(), 'nc-skill-owned-'));
+    oroot = mkdtempSync(join(tmpdir(), 'nc-proj-owned-'));
+    writeFileSync(join(oskill, 'SKILL.md'), OWNED_SKILL);
+    mkdirSync(join(oroot, 'src/channels'), { recursive: true });
+    writeFileSync(join(oroot, 'src/channels/demo-adapter.ts'), LIVE_CUSTOM_ADAPTER); // present, diverged
+    writeFileSync(join(oroot, 'src/channels/demo-formatting.md'), SHARED_FORMATTING_DOC); // present, identical
+    // demo-registration.test.ts deliberately absent — the fresh-install case
+    writeFileSync(join(oroot, '.env'), '');
+    writeFileSync(join(oroot, 'package.json'), '{"name":"scratch"}');
+  });
+
+  it('refuses the diverged file, no-ops the identical one, and still installs the missing one', async () => {
+    const cmds: string[] = [];
+    const res = await applySkill(oskill, oroot, { exec: ownedByForkExec(cmds), resolveRemote: () => 'origin' });
+
+    // diverged: left untouched, bounced with the specific reason (not the
+    // generic "engine could not apply" wrapper) — no --force in the message.
+    expect(readFileSync(join(oroot, 'src/channels/demo-adapter.ts'), 'utf8')).toBe(LIVE_CUSTOM_ADAPTER);
+    expect(res.agentTasks).toHaveLength(1);
+    expect(res.agentTasks[0].reason).toContain('src/channels/demo-adapter.ts');
+    expect(res.agentTasks[0].reason).toContain('already installed and customized');
+    expect(res.agentTasks[0].reason).toContain('force');
+    expect(res.agentTasks[0].reason).not.toContain('engine could not apply');
+
+    // missing: still installed fresh in THIS SAME apply() call, despite the
+    // sibling refusal ordered before it in the directive body.
+    expect(readFileSync(join(oroot, 'src/channels/demo-registration.test.ts'), 'utf8')).toBe(FRESH_REGISTRATION_TEST);
+    expect(res.journal).toContainEqual({ op: 'wrote', path: 'src/channels/demo-registration.test.ts' });
+
+    // identical: untouched and not journaled — a true no-op.
+    expect(readFileSync(join(oroot, 'src/channels/demo-formatting.md'), 'utf8')).toBe(SHARED_FORMATTING_DOC);
+    expect(res.journal.some((e) => e.op === 'wrote' && e.path === 'src/channels/demo-formatting.md')).toBe(false);
+
+    // content is captured and written via writeFileSync, never shell-redirected
+    // (a `git show` failure on one of these three paths could never truncate
+    // a sibling's live file).
+    expect(cmds.some((c) => c.includes(' > '))).toBe(false);
+  });
+
+  it('is idempotent: once the fresh file is installed, every dest is present so the whole directive goes quiet (skip) — the diverged file is never re-touched', async () => {
+    const first = await applySkill(oskill, oroot, { exec: ownedByForkExec([]), resolveRemote: () => 'origin' });
+    expect(first.journal.length).toBeGreaterThan(0); // sanity: the first run actually wrote the fresh file
+    const second = await applySkill(oskill, oroot, { exec: ownedByForkExec([]), resolveRemote: () => 'origin' });
+    // all three dests now exist ⇒ selfStatus reports skip for the whole
+    // directive — applyOne never runs again, so the engine doesn't even
+    // re-inspect (let alone re-flag or touch) the still-diverged adapter.
+    expect(second.agentTasks).toEqual([]);
+    expect(second.journal).toEqual([]);
+    expect(fullyApplied(second)).toBe(true);
+    expect(readFileSync(join(oroot, 'src/channels/demo-adapter.ts'), 'utf8')).toBe(LIVE_CUSTOM_ADAPTER);
+  });
+
+  it('force:true overwrites the diverged file with the branch version', async () => {
+    const res = await applySkill(oskill, oroot, {
+      exec: ownedByForkExec([]),
+      resolveRemote: () => 'origin',
+      force: true,
+    });
+    expect(readFileSync(join(oroot, 'src/channels/demo-adapter.ts'), 'utf8')).toBe(STALE_BRANCH_ADAPTER);
+    expect(res.agentTasks).toEqual([]);
+    expect(fullyApplied(res)).toBe(true);
+    expect(res.journal).toContainEqual({ op: 'wrote', path: 'src/channels/demo-adapter.ts' });
+  });
+
+  it('plan says apply (not a blind skip) while any dest is missing, and skip once everything is present', () => {
+    const before = planSkill(oskill, oroot);
+    expect(before.steps[0].status).toBe('apply');
+    expect(before.steps[0].detail).toContain('refused');
+    // simulate: the missing file got installed, nothing else changed
+    writeFileSync(join(oroot, 'src/channels/demo-registration.test.ts'), FRESH_REGISTRATION_TEST);
+    const after = planSkill(oskill, oroot);
+    expect(after.steps[0].status).toBe('skip'); // all dests present ⇒ leave it alone entirely
+  });
+
+  // Codex review, PR #264, finding 2: once the missing sibling is installed
+  // every dest exists, so the pre-existing "all present ⇒ skip" rule short-
+  // circuited BEFORE applyOne could see `force` — the documented "re-run with
+  // force to replace" escape hatch was a no-op in the steady state, which is
+  // the common case (everything present, one file still diverged).
+  it('force:true still forces the overwrite once every destination already exists (steady state)', async () => {
+    const first = await applySkill(oskill, oroot, { exec: ownedByForkExec([]), resolveRemote: () => 'origin' });
+    expect(first.agentTasks).toHaveLength(1); // the refusal from the first run
+    // now every dest is present — the pre-#264-fix bug: selfStatus would say
+    // 'skip' unconditionally here, so applyOne (and force) never ran again.
+    expect(existsSync(join(oroot, 'src/channels/demo-registration.test.ts'))).toBe(true);
+
+    const forced = await applySkill(oskill, oroot, {
+      exec: ownedByForkExec([]),
+      resolveRemote: () => 'origin',
+      force: true,
+    });
+    expect(readFileSync(join(oroot, 'src/channels/demo-adapter.ts'), 'utf8')).toBe(STALE_BRANCH_ADAPTER);
+    expect(forced.agentTasks).toEqual([]);
+    expect(fullyApplied(forced)).toBe(true);
+    expect(forced.journal).toContainEqual({ op: 'wrote', path: 'src/channels/demo-adapter.ts' });
+  });
+});
+
+// Codex review, PR #264, finding 1: `ApplyOptions.exec` is explicitly allowed
+// to return void, but for an owned-by-fork copy the return value IS the file
+// content being written — silently coercing a missing result to '' would
+// plant a zero-byte file, journal it as written, and let the run report
+// fullyApplied. The engine must bounce instead of guessing.
+describe('owned-by-fork copy protection: exec must return the branch content as a string (#264 finding 1)', () => {
+  const BROKEN_SKILL = `# owned-by-fork with a void-returning exec
+
+## Pull a fresh file from an executor that discards stdout
+\`\`\`nc:copy from-branch:channels owned-by-fork
+src/channels/demo-broken.ts
+\`\`\`
+`;
+
+  it('bounces (not a silent empty-file write) when exec returns void for the branch content', async () => {
+    const bskill = mkdtempSync(join(tmpdir(), 'nc-skill-broken-'));
+    const broot = mkdtempSync(join(tmpdir(), 'nc-proj-broken-'));
+    writeFileSync(join(bskill, 'SKILL.md'), BROKEN_SKILL);
+    mkdirSync(join(broot, 'src/channels'), { recursive: true });
+    writeFileSync(join(broot, '.env'), '');
+    writeFileSync(join(broot, 'package.json'), '{"name":"scratch"}');
+    // demo-broken.ts deliberately absent — a void-returning exec must still
+    // refuse to fabricate its content, even on an ordinary fresh install.
+
+    const res = await applySkill(bskill, broot, {
+      exec: () => undefined, // ran, but discarded stdout — a legal ApplyOptions.exec per its own type
+      resolveRemote: () => 'origin',
+    });
+
+    expect(existsSync(join(broot, 'src/channels/demo-broken.ts'))).toBe(false); // never planted
+    expect(res.journal).toEqual([]);
+    expect(res.agentTasks).toHaveLength(1);
+    expect(res.agentTasks[0].reason).toContain('exec');
+    expect(res.agentTasks[0].reason).toContain('string');
+    expect(res.agentTasks[0].protective).toBeFalsy(); // a real contract violation, not a #250 refusal
+    expect(fullyApplied(res)).toBe(false);
+    expect(hasBlockingFailure(res)).toBe(true); // this one genuinely needs an agent
+
+    rmSync(bskill, { recursive: true, force: true });
+    rmSync(broot, { recursive: true, force: true });
+  });
+});
+
+// Codex review, PR #264, finding 3: a protective refusal (#250) is the engine
+// doing the safe, complete thing — it must not (a) block a later restart via
+// the run-health gate, or (b) read as a blocking failure to a consumer like
+// setup/channels/run-channel-skill.ts, which used to abort setup entirely
+// (before credential collection) on ANY non-empty agentTasks.
+describe('protective bounces do not block later side effects or read as failures (#264 finding 3)', () => {
+  const OWNED_WITH_RESTART_SKILL = `# owned-by-fork demo with a later restart
+
+## Pull the adapter from the branch
+\`\`\`nc:copy from-branch:channels owned-by-fork
+src/channels/demo-adapter.ts
+src/channels/demo-registration.test.ts
+\`\`\`
+
+## Restart
+\`\`\`nc:run effect:restart
+echo restarting
+\`\`\`
+`;
+
+  it('a protective refusal does not set the run-health gate — the later restart still executes', async () => {
+    const rskill = mkdtempSync(join(tmpdir(), 'nc-skill-restart-'));
+    const rroot = mkdtempSync(join(tmpdir(), 'nc-proj-restart-'));
+    writeFileSync(join(rskill, 'SKILL.md'), OWNED_WITH_RESTART_SKILL);
+    mkdirSync(join(rroot, 'src/channels'), { recursive: true });
+    writeFileSync(join(rroot, 'src/channels/demo-adapter.ts'), LIVE_CUSTOM_ADAPTER); // present, diverged
+    // demo-registration.test.ts deliberately absent
+    writeFileSync(join(rroot, '.env'), '');
+    writeFileSync(join(rroot, 'package.json'), '{"name":"scratch"}');
+
+    const cmds: string[] = [];
+    const res = await applySkill(rskill, rroot, {
+      exec: (c: string) => {
+        cmds.push(c);
+        if (c.includes('git show origin/channels:src/channels/demo-adapter.ts')) return STALE_BRANCH_ADAPTER;
+        if (c.includes('git show origin/channels:src/channels/demo-registration.test.ts')) return FRESH_REGISTRATION_TEST;
+        return undefined;
+      },
+      resolveRemote: () => 'origin',
+    });
+
+    // the refusal is recorded, and it's protective
+    expect(res.agentTasks).toHaveLength(1);
+    expect(res.agentTasks[0].protective).toBe(true);
+    // …but the restart still ran — NOT gated by the protective bounce, and
+    // NOT itself bounced as "an earlier step did not complete".
+    expect(cmds).toContain('echo restarting');
+    expect(res.applied.some((a) => a.includes('restart'))).toBe(true);
+
+    // a consumer deciding whether to abort sees no blocking failure, and the
+    // failure-hint helper correctly finds nothing worth surfacing as a
+    // diagnosis (the only bounce is the harmless, protective one).
+    expect(hasBlockingFailure(res)).toBe(false);
+    expect(firstFailureHint(res)).toBeUndefined();
+    expect(fullyApplied(res)).toBe(false); // still an honest "not everything was applied"
+
+    rmSync(rskill, { recursive: true, force: true });
+    rmSync(rroot, { recursive: true, force: true });
+  });
+
+  it('hasBlockingFailure is true when a non-protective bounce or a deferred value is present', () => {
+    const protectiveOnly = {
+      applied: [], skipped: [], deferred: [], operatorMessages: [], vars: {}, journal: [], referenceProse: '',
+      agentTasks: [{ kind: 'copy', line: 1, reason: 'refused', prose: '', protective: true }],
+    };
+    const withDeferred = { ...protectiveOnly, deferred: ['some_var'] };
+    const withRealBounce = {
+      ...protectiveOnly,
+      agentTasks: [...protectiveOnly.agentTasks, { kind: 'run', line: 2, reason: 'no deterministic handler', prose: '' }],
+    };
+    expect(hasBlockingFailure(protectiveOnly)).toBe(false);
+    expect(hasBlockingFailure(withDeferred)).toBe(true);
+    expect(hasBlockingFailure(withRealBounce)).toBe(true);
   });
 });
 

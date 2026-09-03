@@ -113,15 +113,30 @@ function jsonArrayHasKey(root: string, rel: string, key: string, value: unknown)
 }
 
 // Per-directive idempotency check + "what it would do". Read-only.
-function selfStatus(d: Directive, root: string): { status: StepStatus; detail: string } {
+function selfStatus(d: Directive, root: string, force = false): { status: StepStatus; detail: string } {
   switch (d.kind) {
     case 'copy': {
       const dests = d.body.map(destOf);
       const missing = dests.filter((p) => !has(root, p));
+      const forkOwned = d.args.includes('owned-by-fork');
+      if (missing.length === 0) {
+        // force overrides an owned-by-fork refusal, but only applyOne can
+        // tell whether any present dest actually diverged — a blanket 'skip'
+        // here (the pre-#250-fix rule: nothing missing ⇒ nothing to do) would
+        // make `force` a documented no-op the moment the run stabilizes
+        // (every dest present, which is the common steady state). Run
+        // applyOne so it can re-check and force-overwrite where needed.
+        if (forkOwned && force) {
+          return { status: 'apply', detail: `${dests.join(', ')} present — force re-checks each against the branch` };
+        }
+        return { status: 'skip', detail: `${dests.join(', ')} present` };
+      }
       const from = d.attrs['from-branch'] ? `fetch ${String(d.attrs['from-branch'])} → ` : '';
-      return missing.length
-        ? { status: 'apply', detail: `${from}copy ${missing.join(', ')} (absent)` }
-        : { status: 'skip', detail: `${dests.join(', ')} present` };
+      // owned-by-fork: some dest is missing so applyOne runs, but every dest
+      // that's already present is compared to the branch and REFUSED (not
+      // overwritten) if it diverged — only the missing ones actually copy.
+      const forkNote = forkOwned ? '; present files are compared to the branch and refused (not overwritten) if diverged' : '';
+      return { status: 'apply', detail: `${from}copy ${missing.join(', ')} (absent)${forkNote}` };
     }
     case 'append': {
       const to = String(d.attrs.to ?? '');
@@ -210,6 +225,15 @@ export interface AgentTask {
   line: number;
   reason: string;
   prose: string; // the surrounding prose the agent reads to apply the step
+  // True only for a `copy owned-by-fork` refusal (#250): the engine already
+  // did the safe, complete thing (installed what it safely could, left a
+  // diverged file alone) — nothing is broken and no follow-up is required
+  // unless the operator deliberately wants `force`. Undefined/false for
+  // every other bounce, which DOES need an agent/operator to finish the step.
+  // See `hasBlockingFailure` — the predicate a consumer should gate on
+  // instead of `agentTasks.length`/`fullyApplied` when it wants to treat a
+  // protective refusal as informational rather than fatal.
+  protective?: boolean;
 }
 
 export interface ApplyResult {
@@ -269,6 +293,12 @@ export interface ApplyOptions {
   // generic resolver (env override → first remote that has the branch → origin);
   // setup injects one that reuses setup/lib/channels-remote.sh for exact parity.
   resolveRemote?: (branch: string) => string;
+  // Overrides a `copy owned-by-fork` refusal (see selfStatus/applyOne): when
+  // true, a fork-owned destination that has diverged from the registry branch
+  // IS overwritten with the branch version instead of being refused. The
+  // engine's only opinion of what "force" means — mirrors a driver's --force
+  // flag (#250). Absent/false ⇒ the protective default: refuse and bounce.
+  force?: boolean;
 }
 
 /**
@@ -281,16 +311,33 @@ export function fullyApplied(res: ApplyResult): boolean {
 }
 
 /**
- * The failure diagnosis for the FIRST directive that bounced to an agent, in
- * document order: a concise headline (the nearest section heading) plus the
+ * True when `res` has a genuine blocking issue — deferred input, or a
+ * non-`protective` agentTask — that a human/agent must resolve before a
+ * caller can safely treat the skill as done (#250). `fullyApplied` stays
+ * strict (a protective refusal still isn't "nothing left to report"; the CLI
+ * should still print it), but a consumer deciding whether to ABORT a flow
+ * (e.g. the setup driver, mid credential collection) should gate on this
+ * instead: a `copy owned-by-fork` refusal means the engine already did the
+ * safe, complete thing, so it must not stop a setup that's otherwise fine.
+ */
+export function hasBlockingFailure(res: ApplyResult): boolean {
+  return res.deferred.length > 0 || res.agentTasks.some((t) => !t.protective);
+}
+
+/**
+ * The failure diagnosis for the FIRST BLOCKING directive that bounced to an
+ * agent, in document order — a purely `protective` refusal (#250) is skipped
+ * so it never becomes the reported headline for a real failure elsewhere in
+ * the same run: a concise headline (the nearest section heading) plus the
  * bounced step's own prose as the hint. The setup driver surfaces this when a
  * channel skill doesn't fully apply — the prose beside the step that failed
  * becomes the operator's failure hint and the Claude-handoff context, instead
  * of a generic "couldn't finish" message. Returns undefined when nothing
- * bounced (e.g. a headless rebuild only left prompts deferred — not a failure).
+ * blocking bounced (e.g. a headless rebuild only left prompts deferred, or
+ * every bounce was protective — neither is a failure).
  */
 export function firstFailureHint(res: ApplyResult): { headline: string; hint: string } | undefined {
-  const first = res.agentTasks[0];
+  const first = res.agentTasks.find((t) => !t.protective);
   if (!first) return undefined;
   const hint = first.prose.trim();
   // The concise headline: the nearest `#`-heading the prose carries, stripped of
@@ -547,7 +594,7 @@ function bindCapture(
 // is derivable. Throws on failure → caught and bounced to an agent.
 async function applyOne(
   d: Directive,
-  ctx: { root: string; skillDir: string; exec: (c: string) => string | void | Promise<string | void>; execStream?: (c: string) => Promise<StepOutcome>; resolveRemote: (b: string) => string; vars: Map<string, { value: string; secret: boolean }>; journal: JournalEntry[] },
+  ctx: { root: string; skillDir: string; exec: (c: string) => string | void | Promise<string | void>; execStream?: (c: string) => Promise<StepOutcome>; resolveRemote: (b: string) => string; vars: Map<string, { value: string; secret: boolean }>; journal: JournalEntry[]; force: boolean },
 ): Promise<void> {
   const { root, skillDir, exec, vars, journal } = ctx;
   switch (d.kind) {
@@ -556,12 +603,62 @@ async function applyOne(
         const b = String(d.attrs['from-branch']);
         const remote = ctx.resolveRemote(b);
         await exec(`git fetch ${remote} ${b}`);
-        for (const l of d.body) {
-          // The shell redirect can't create parent directories, and the dest
-          // may not exist on trunk (e.g. container skills that live only on
-          // the channels branch). Mirror the local-copy path's mkdir.
-          mkdirSync(dirname(join(root, destOf(l))), { recursive: true });
-          await exec(`git show ${remote}/${b}:${srcOf(l)} > ${destOf(l)}`);
+        if (d.args.includes('owned-by-fork')) {
+          // This fork has customized these destinations beyond the registry
+          // branch (Slack/Discord's multi-workspace suffix tokens, mention
+          // resolution, missed-message recovery, on top of the channels
+          // branch's stale snapshot — #250): the branch is a REFERENCE for a
+          // file never installed here, not a source of truth to replay over
+          // a live one. Content is captured via `exec` and written with
+          // writeFileSync — never a shell redirect — so a branch path that
+          // doesn't exist (git show fails, e.g. a registration test the
+          // branch never had) can never truncate a live file. Per file: a
+          // missing dest is a safe fresh install; a present dest is compared
+          // byte-for-byte — identical is a no-op, diverged is collected and
+          // REFUSED (every other listed file still applies) unless the
+          // caller passed `force`.
+          const refused: string[] = [];
+          for (const l of d.body) {
+            const dst = join(root, destOf(l));
+            mkdirSync(dirname(dst), { recursive: true });
+            const out = await exec(`git show ${remote}/${b}:${srcOf(l)}`);
+            // ApplyOptions.exec is allowed to return void (most directives
+            // discard its result), but here the return value IS the file
+            // content this line writes — silently coercing a missing result
+            // to '' would plant a zero-byte file, journal it as written, and
+            // let the run report fullyApplied. An executor that discards
+            // stdout for this command can't safely resolve an owned-by-fork
+            // copy, so bounce instead of guessing.
+            if (typeof out !== 'string') {
+              throw new Error(
+                `copy owned-by-fork needs ${remote}/${b}:${srcOf(l)}'s content as a string from exec (got ${typeof out}) to write ${destOf(l)} — an executor that discards git show's stdout can't safely resolve this copy`,
+              );
+            }
+            const branchContent = out;
+            if (existsSync(dst)) {
+              if (readFileSync(dst, 'utf8') === branchContent) continue; // already matches — no-op
+              if (!ctx.force) {
+                refused.push(destOf(l));
+                continue;
+              }
+            }
+            writeFileSync(dst, branchContent);
+            journal.push({ op: 'wrote', path: destOf(l) });
+          }
+          if (refused.length) {
+            throw new Error(
+              `FORK_OWNED_DIVERGED: ${refused.join(', ')} already installed and customized beyond ${remote}/${b} — refusing to overwrite; re-run with force to replace`,
+            );
+          }
+        } else {
+          for (const l of d.body) {
+            // The shell redirect can't create parent directories, and the dest
+            // may not exist on trunk (e.g. container skills that live only on
+            // the channels branch). Mirror the local-copy path's mkdir.
+            mkdirSync(dirname(join(root, destOf(l))), { recursive: true });
+            await exec(`git show ${remote}/${b}:${srcOf(l)} > ${destOf(l)}`);
+          }
+          for (const l of d.body) journal.push({ op: 'wrote', path: destOf(l) });
         }
       } else {
         for (const l of d.body) {
@@ -569,8 +666,8 @@ async function applyOne(
           mkdirSync(dirname(dst), { recursive: true });
           copyFileSync(join(skillDir, srcOf(l)), dst);
         }
+        for (const l of d.body) journal.push({ op: 'wrote', path: destOf(l) });
       }
-      for (const l of d.body) journal.push({ op: 'wrote', path: destOf(l) });
       break;
     case 'append': {
       const to = String(d.attrs.to);
@@ -712,12 +809,17 @@ export async function applySkill(skillDir: string, root: string, opts: ApplyOpti
   // bounce; a later side-effecting run becomes its own bounce so the agent
   // finishes it from the prose once the upstream failure is fixed. A DEFERRED
   // prompt (headless rebuild, no answer) is not a failure — it never bounces, so
-  // `blocked` stays false and a later restart remains runnable.
+  // `blocked` stays false and a later restart remains runnable. A PROTECTIVE
+  // bounce (`copy owned-by-fork` refusing a diverged file — #250) also leaves
+  // `blocked` false: the engine already did the safe, complete thing, the run
+  // is NOT in a known-bad state, and a later restart/wire still needs to fire
+  // normally (e.g. so a channel install still restarts and loads the new
+  // credentials even though a customized adapter file was correctly left alone).
   let blocked = false;
   const SIDE_EFFECTS = new Set(['restart', 'step', 'wire']);
-  const bounce = (d: Directive, reason: string) => {
-    blocked = true;
-    res.agentTasks.push({ kind: d.kind, line: d.line, reason, prose: proseFor(md, d.line) });
+  const bounce = (d: Directive, reason: string, opts?: { protective?: boolean }) => {
+    if (!opts?.protective) blocked = true;
+    res.agentTasks.push({ kind: d.kind, line: d.line, reason, prose: proseFor(md, d.line), protective: opts?.protective });
   };
 
   for (const d of directives) {
@@ -809,7 +911,7 @@ export async function applySkill(skillDir: string, root: string, opts: ApplyOpti
         bounce(d, 'skipped: an earlier step did not complete — run this from the prose after fixing it');
         continue;
       }
-      const st = selfStatus(d, root);
+      const st = selfStatus(d, root, opts.force ?? false);
       if (st.status === 'agent') { bounce(d, 'no deterministic handler'); continue; }
       if (st.status === 'skip') { res.skipped.push(`${d.kind}: ${st.detail}`); continue; }
       // Bracket the real mutation with step events so a consumer can render
@@ -820,7 +922,7 @@ export async function applySkill(skillDir: string, root: string, opts: ApplyOpti
       const label = stepLabel(d, md);
       if (opts.onEvent) await opts.onEvent({ type: 'step-start', kind: d.kind, line: d.line, label });
       inFlight = { label, at: Date.now() };
-      await applyOne(d, { root, skillDir, exec, execStream: opts.execStream, resolveRemote, vars, journal: res.journal });
+      await applyOne(d, { root, skillDir, exec, execStream: opts.execStream, resolveRemote, vars, journal: res.journal, force: opts.force ?? false });
       const durationMs = Date.now() - inFlight.at;
       inFlight = null;
       if (opts.onEvent) await opts.onEvent({ type: 'step-end', kind: d.kind, line: d.line, label, ok: true, durationMs });
@@ -838,6 +940,14 @@ export async function applySkill(skillDir: string, root: string, opts: ApplyOpti
       }
       if (/unresolved \{\{/.test(msg)) {
         res.deferred.push(msg); // blocked on a prompt input
+      } else if (msg.startsWith('FORK_OWNED_DIVERGED: ')) {
+        // A protective refusal, not an engine failure — bounce with the
+        // specific reason verbatim (never the generic "could not apply"
+        // wrapper) so the agent (or operator) reads exactly what diverged
+        // and what force does, per #250. protective:true keeps it out of
+        // `hasBlockingFailure` and off the run-health gate (`blocked` stays
+        // false) — the engine already did the safe, complete thing.
+        bounce(d, msg.slice('FORK_OWNED_DIVERGED: '.length), { protective: true });
       } else {
         bounce(d, `engine could not apply (${msg}) — an agent applies it from the prose`);
         // `effect:check` is a PRECONDITION, not a best-effort health signal.

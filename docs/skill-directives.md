@@ -34,9 +34,11 @@ Two invariants follow, and both are non-negotiable:
 
 Every directive is idempotent — apply is safe to re-run, per the skills model.
 
-### `copy [from-branch:<b>]`
+### `copy [from-branch:<b>] [owned-by-fork]`
 
-Body: one path per line — `PATH` (source == destination) or `SRC -> DST`. Copies the file in; with `from-branch:` the source is fetched from a registry branch (`git show origin/<b>:<path>`). **Idempotency: skip when every destination is present; when any is missing, all listed files are (re)copied — copying overwrites.**
+Body: one path per line — `PATH` (source == destination) or `SRC -> DST`. Copies the file in; with `from-branch:` the source is fetched from a registry branch (`git show origin/<b>:<path>`). **Idempotency: skip when every destination is present.**
+
+Otherwise the two modes diverge. By **default**, `applyOne` loops the entire directive body: the branch is canonical, so ANY missing destination drags every OTHER listed file back through `git show` too — a present sibling is overwritten right along with the missing one, exactly the destructive-replay hazard `owned-by-fork` exists to close (#250). `owned-by-fork` (from-branch only — a lint error otherwise) changes that to per-file: a missing dest still copies fresh, but a present dest is compared to the branch byte-for-byte first — identical is a no-op, and a diverged file is **refused** (bounced to an agent with the specific file(s), never silently overwritten) instead of replayed, while every other listed file in the same directive still applies normally. `ApplyOptions.force` overrides the refusal for a deliberate reset to the branch version. Content is always captured via `exec` and written with `writeFileSync`, never a shell redirect, so a branch path that doesn't exist can never truncate a live file.
 
 ### `append to:<file> [at:<marker>]`
 

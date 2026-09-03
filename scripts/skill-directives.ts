@@ -17,7 +17,14 @@
 // *applies* it, referenced as `{{name}}`. That keeps "ask the human" decoupled
 // from "what you do with the answer" (env, ncl, the OneCLI vault, a file).
 //
-//   copy [from-branch:<b>]  body: `PATH` (src==dst) or `SRC -> DST`   overwrite
+//   copy [from-branch:<b>] [owned-by-fork]  body: `PATH` (src==dst) or `SRC -> DST`
+//        Default: overwrite. `owned-by-fork` (from-branch only) marks a copy
+//        whose destinations a fork customizes beyond the branch: a missing
+//        dest still copies fresh, but a PRESENT dest is compared to the
+//        branch and REFUSED (bounced to an agent, not overwritten) if it
+//        diverged — protects e.g. a customized Slack/Discord adapter from a
+//        stale registry-branch replay (#250). ApplyOptions.force overrides
+//        the refusal.
 //   append to:<file> [at:<marker>]  body: line(s) to add             skip if present
 //   dep [manager:pnpm]      body: `pkg@<exact-semver>` line(s)        reinstall no-op
 //   run [effect:build|test|fetch|external|wire|restart|step|check] [capture:<spec>]  re-runnable
@@ -234,6 +241,12 @@ export function validate(directives: Directive[], ctx?: { chatVersion?: string }
         break;
       case 'copy':
         if (d.body.length === 0) flag(d, 'copy requires at least one path');
+        if (d.args.includes('owned-by-fork') && !d.attrs['from-branch']) {
+          flag(
+            d,
+            'copy owned-by-fork requires from-branch: — it protects a branch-sourced file from a stale replay; a local copy (from the skill dir) has no branch to diverge from',
+          );
+        }
         break;
       case 'json-merge': {
         if (!d.attrs.into) flag(d, 'json-merge requires into:<json-file>');

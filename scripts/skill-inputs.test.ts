@@ -66,6 +66,10 @@ describe('inputsFromEnv (docs/skill-engine-seam.md §6)', () => {
       const res = await applySkill(skillDir, root, {
         inputs,
         exec: (c) => {
+          // step 1's owned-by-fork copy (#250) needs its `git show` content as
+          // a string; the scratch root never pre-has these files, so it's a
+          // plain fresh install with no divergence check.
+          if (c.includes('git show')) return '// placeholder branch content';
           if (c.includes('auth.test')) return '@nano in Acme';
           if (c.includes('conversations.open')) return 'slack:D0FAKE';
         },

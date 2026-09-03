@@ -457,6 +457,13 @@ export interface RunSkillOptions {
   /** Offer to reuse credentials already in `.env` instead of re-prompting. */
   reuse?: boolean;
   /**
+   * Overrides a `copy owned-by-fork` refusal: replaces a fork-owned file that
+   * has diverged from its registry branch with the branch version instead of
+   * refusing to touch it (#250). Mirrors the CLI's `--force`. Defaults to
+   * false — the protective behavior.
+   */
+  force?: boolean;
+  /**
    * Consumer for every engine emission (step events + operator blocks). When
    * injected it REPLACES the driver's default policy handler ENTIRELY — the
    * spinner, the note, the URL offer, and the natural-barrier confirm are all
@@ -526,19 +533,25 @@ export async function runSkill(skillDir: string, opts: RunSkillOptions = {}): Pr
     execStream: opts.execStream ?? hostExecStream(projectRoot),
     resolveRemote: opts.resolveRemote ?? channelsRemote(projectRoot),
     skipEffects: opts.skipEffects,
+    force: opts.force,
   });
 }
 
-// CLI: pnpm exec tsx setup/lib/skill-driver.ts <skillDir>   — apply a skill interactively.
+// CLI: pnpm exec tsx setup/lib/skill-driver.ts <skillDir> [--force]   — apply a
+// skill interactively. --force overrides an owned-by-fork refusal (#250) —
+// use it only after confirming with the operator that replacing a customized
+// file with the registry-branch version is actually wanted.
 if (process.argv[1] && import.meta.url === `file://${process.argv[1]}`) {
   void (async () => {
-    const skillDir = process.argv[2];
+    const args = process.argv.slice(2);
+    const force = args.includes('--force');
+    const skillDir = args.find((a) => !a.startsWith('--'));
     if (!skillDir) {
-      console.error('usage: pnpm exec tsx setup/lib/skill-driver.ts <skillDir>');
+      console.error('usage: pnpm exec tsx setup/lib/skill-driver.ts <skillDir> [--force]');
       process.exit(2);
     }
     p.intro(`Applying ${skillDir}`);
-    const res = await runSkill(skillDir);
+    const res = await runSkill(skillDir, { force });
     if (fullyApplied(res)) {
       p.outro('Done — fully applied.');
     } else {
