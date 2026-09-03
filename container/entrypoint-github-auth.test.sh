@@ -2,10 +2,11 @@
 # Container-side GitHub credential wiring, run with plain bash — no docker.
 #
 # The block under test is lifted VERBATIM out of entrypoint.sh between its two
-# section markers, with the one substitution that makes it safe to run on a
-# developer's machine: the hardcoded `/tmp/bin` helper directory is rewritten to
-# a temp dir. Everything else — the heredocs, the git config calls, the retry
-# loop — is the shipped text, so this cannot drift into testing a copy.
+# section markers, with the only substitutions that make it safe to run on a
+# developer's machine: its two hardcoded /tmp paths (the helper directory and
+# the fallback git-config file) are rewritten under a temp dir. Everything else
+# — the heredocs, the git config calls, the retry loop — is the shipped text, so
+# this cannot drift into testing a copy.
 #
 # Run: bash container/entrypoint-github-auth.test.sh
 set -uo pipefail
@@ -24,11 +25,13 @@ pass() { echo "  ok — $*"; }
 
 # --- Lift the block out of the shipped entrypoint -------------------------
 BLOCK="$ROOT/github-auth-block.sh"
+FALLBACK_CFG="$ROOT/nanoclaw-gitconfig"
 awk '/^# --- GitHub git auth ---$/{f=1} /^# --- Render CLI workspace pre-config ---$/{f=0} f' "$ENTRYPOINT" \
-  | sed "s|/tmp/bin|$BIN|g" > "$BLOCK"
+  | sed -e "s|/tmp/nanoclaw-gitconfig|$FALLBACK_CFG|g" -e "s|/tmp/bin|$BIN|g" > "$BLOCK"
 grep -q 'nanoclaw-git-creds' "$BLOCK" || fail "could not extract the GitHub auth block from entrypoint.sh"
 grep -q 'GITHUB_TOKEN_FILE' "$BLOCK" || fail "extracted block has no GITHUB_TOKEN_FILE handling"
 grep -q '/tmp/bin' "$BLOCK" && fail "extraction left a literal /tmp/bin — the test would write to the real host path"
+grep -q '/tmp/nanoclaw-gitconfig' "$BLOCK" && fail "extraction left the literal fallback git-config path"
 pass "extracted the shipped block ($(wc -l < "$BLOCK") lines)"
 
 # --- gh stub: records its argv and the GH_TOKEN it was handed -------------
@@ -190,8 +193,45 @@ GITHUB_TOKEN_FILE=/nonexistent/nanoclaw/token "$BIN/nanoclaw-git-creds" get >/de
 pass "hard failure when neither lane has a credential"
 
 # =========================================================================
-echo "7. no credential at all"
+echo "7. \$HOME not writable (uid remapped in, as on a macOS install)"
 CASE="$ROOT/case7"
+printf 'ghs_from_file\n' > "$TOKEN_FILE"
+rm -f "$FALLBACK_CFG"
+# run_block creates the case dir; make it unwritable so `git config --global`
+# cannot create $HOME/.gitconfig, exactly as uid 501 hits /home/node (owned by
+# the image's build-time uid 1001, mode 0755).
+mkdir -p "$CASE" && chmod 0555 "$CASE"
+run_block_keep_home() {
+  rm -rf "$BIN"; mkdir -p "$BIN"
+  : > "$CASE/../case7-gh.log"
+  env -i PATH="$STUBS:/usr/bin:/bin" HOME="$CASE" GH_STUB_LOG="$CASE/../case7-gh.log" \
+    GITHUB_TOKEN_FILE="$TOKEN_FILE" \
+    bash -c 'set -e; set +u; source "$0"' "$BLOCK"
+}
+run_block_keep_home || fail "block exited nonzero with an unwritable \$HOME — this is the boot-failure regression"
+pass "container still boots when \$HOME is not writable"
+
+[ -f "$FALLBACK_CFG" ] || fail "git config was not redirected to a writable path"
+grep -q 'nanoclaw-git-creds' "$FALLBACK_CFG" \
+  || fail "redirected config has no credential helper: $(cat "$FALLBACK_CFG")"
+pass "git config redirected to a writable path, helper actually configured"
+
+chmod 0755 "$CASE"
+[ -e "$CASE/.gitconfig" ] && fail "wrote into the unwritable HOME after all"
+pass "nothing written into the unwritable HOME"
+
+# The redirect must engage ONLY when it has to — a normal install keeps ~/.gitconfig.
+CASE="$ROOT/case7b"
+rm -f "$FALLBACK_CFG"
+run_block "$CASE" GITHUB_TOKEN_FILE="$TOKEN_FILE" || fail "block exited nonzero with a writable HOME"
+[ -f "$FALLBACK_CFG" ] && fail "redirected git config on a host that did not need it"
+HOME="$CASE" git config --global --get 'credential.https://github.com.helper' >/dev/null \
+  || fail "writable HOME did not get the helper in ~/.gitconfig"
+pass "no redirect when \$HOME is writable"
+
+# =========================================================================
+echo "8. no credential at all"
+CASE="$ROOT/case8"
 run_block "$CASE" || fail "block exited nonzero with no credential"
 [ -e "$BIN/nanoclaw-git-creds" ] && fail "helper written with no credential configured"
 [ -e "$CASE/.gitconfig" ] && fail "git config touched with no credential configured"

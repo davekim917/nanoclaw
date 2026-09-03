@@ -87,5 +87,34 @@ tok=$($IN gh auth token 2>/dev/null)
 [ "$tok" = "ghs_smoke_rotated" ] || fail "gh still on the old token: $tok"
 pass "an in-place host rewrite reaches a RUNNING container — no respawn"
 
+# A remapped uid: the image owns /home/node as its build-time uid (1001) and a
+# macOS install runs the host service as 501, so $HOME is not writable in the
+# container. `git config --global` fails there and, under the entrypoint's
+# `set -e`, used to take the container down during startup.
+echo
+echo "remapped uid (501) — the shape a macOS install lands in:"
+# A real uid-501 host writes this file AS uid 501 at 0600, so the container
+# reads it by ownership. This test cannot chown without root, so it stands the
+# ownership in for permissions. The mode is the fixture's, not the product's —
+# planGitHubTokenSpawn still writes 0600, asserted in github-token-file.test.ts.
+mkdir -p "$ROOT/gh-token-501"
+chmod 0755 "$ROOT/gh-token-501"
+cp "$ROOT/gh-token/token" "$ROOT/gh-token-501/token"
+chmod 0644 "$ROOT/gh-token-501/token"
+docker run --rm --user 501:501 -e HOME=/home/node \
+  -e GITHUB_TOKEN_FILE=/run/nanoclaw/gh-token/token \
+  -v "$ROOT/gh-token-501:/run/nanoclaw/gh-token:ro" \
+  -v "$ENTRYPOINT:/tmp/entrypoint-under-test.sh:ro" \
+  --entrypoint bash "$IMAGE" -c '
+    awk "/^# --- GitHub git auth ---\$/{f=1} /^# --- Render CLI workspace pre-config ---\$/{f=0} f" \
+      /tmp/entrypoint-under-test.sh > /tmp/blk.sh
+    set -e; set +u; source /tmp/blk.sh; set +e
+    printf "protocol=https\nhost=github.com\n\n" | git credential fill
+    gh auth token' > "$ROOT/uid501.txt" 2>"$ROOT/uid501.err" \
+  || fail "entrypoint died on a remapped uid: $(cat "$ROOT/uid501.err")"
+grep -qx 'password=ghs_smoke_rotated' "$ROOT/uid501.txt" || fail "no git credential on a remapped uid: $(cat "$ROOT/uid501.txt")"
+grep -qx 'ghs_smoke_rotated' "$ROOT/uid501.txt" || fail "gh not authenticated on a remapped uid"
+pass "remapped uid boots and gets working git + gh auth"
+
 echo
 echo "PASS — by-reference GitHub credential smoke against $IMAGE"
