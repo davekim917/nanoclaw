@@ -9,12 +9,19 @@
 # Nothing here talks to GitHub. Token values are fake.
 #
 # Usage: bash container/entrypoint-github-auth.smoke.sh [image]
-#        (default image: nanoclaw-agent:latest)
+#        With no argument, uses this install's own agent image.
 set -uo pipefail
 
-IMAGE="${1:-nanoclaw-agent:latest}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 ENTRYPOINT="$SCRIPT_DIR/entrypoint.sh"
+
+# Image names are per-checkout so two installs on one host don't collide, so a
+# hardcoded default would be wrong everywhere. Derive it the way build.sh and
+# setup/probe.sh do.
+# shellcheck source=../setup/lib/install-slug.sh
+source "$PROJECT_ROOT/setup/lib/install-slug.sh"
+IMAGE="${1:-$(container_image_base):latest}"
 ROOT="$(mktemp -d)"
 NAME="nanoclaw-ghtoken-smoke-$$"
 cleanup() { docker rm -f "$NAME" >/dev/null 2>&1; rm -rf "$ROOT"; }
@@ -33,7 +40,8 @@ docker run -d --rm --name "$NAME" \
   -e GITHUB_TOKEN_FILE=/run/nanoclaw/gh-token/token \
   -v "$ROOT/gh-token:/run/nanoclaw/gh-token:ro" \
   -v "$ENTRYPOINT:/tmp/entrypoint-under-test.sh:ro" \
-  "$IMAGE" -c 'sleep 300' >/dev/null || fail "could not start $IMAGE"
+  "$IMAGE" -c 'sleep 300' >/dev/null \
+  || fail "could not start $IMAGE — run ./container/build.sh first, or pass an existing image as \$1 (the derived name follows the checkout path, so a worktree derives a different one)"
 
 # Run the shipped GitHub block, then persist the resulting env for later execs.
 docker exec "$NAME" bash -c '
