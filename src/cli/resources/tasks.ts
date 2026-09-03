@@ -755,7 +755,7 @@ registerResource({
       // cron grid (firstRunIso). Required only for one-shots, enforced in the
       // create handler — so the generic col.required validator must stay off here.
       description:
-        'Next run time (ISO 8601 or naive local). Required for one-shots; with --recurrence the first run is derived from the cron grid.',
+        "Next run time (ISO 8601, or naive wall-clock read in the owning group's timezone). Required for one-shots; with --recurrence the first run is derived from the cron grid, also in that timezone.",
       updatable: true,
     },
     { name: 'recurrence', type: 'string', description: 'Optional cron expression.', updatable: true },
@@ -805,7 +805,7 @@ registerResource({
       access: 'open',
       description:
         `Create a scheduled task (recurring or one-shot) in the agent group system session.\n\n` +
-        `Requires --prompt plus EITHER --recurrence (recurring; first run derived from the cron grid) OR --process-after (one-shot, ISO 8601 or naive local). Always pass --name for a readable id.\n\n` +
+        `Requires --prompt plus EITHER --recurrence (recurring; first run derived from the cron grid) OR --process-after (one-shot, ISO 8601 or naive wall-clock in the group's timezone). Always pass --name for a readable id.\n\n` +
         `--script contract (pre-task gate, runs BEFORE the agent wakes):\n` +
         `  bash, 30s timeout, 1MB output cap. Its LAST stdout line must be JSON:\n` +
         `    {"wakeAgent": <bool>, "data": {...}}\n` +
@@ -844,7 +844,8 @@ registerResource({
         {
           name: 'process_after',
           type: 'string',
-          description: 'First/next run time (ISO 8601 or naive local). Required for one-shots.',
+          description:
+            "First/next run time (ISO 8601, or naive wall-clock read in the owning group's timezone). Required for one-shots.",
         },
         {
           name: 'script',
@@ -959,7 +960,11 @@ registerResource({
       args: [
         { name: 'id', type: 'string', description: 'Task series id.', required: true },
         { name: 'prompt', type: 'string', description: 'Replace the task prompt.' },
-        { name: 'process_after', type: 'string', description: 'New next-run time (ISO 8601 or naive local).' },
+        {
+          name: 'process_after',
+          type: 'string',
+          description: "New next-run time (ISO 8601, or naive wall-clock read in the owning group's timezone).",
+        },
         {
           name: 'chat_limit',
           type: 'string',
