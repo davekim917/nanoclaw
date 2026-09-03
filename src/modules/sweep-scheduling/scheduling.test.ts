@@ -106,6 +106,11 @@ vi.mock('../../container-runner.js', async (importOriginal) => {
     killContainer: (sessionId: string, reason: string, onExit?: () => void) => {
       calls.order.push('kill');
       calls.kills.push({ sessionId, reason });
+      // The process is provably gone once `onExit` fires — the container no
+      // longer owns outbound.db from this point on. Without this the guarded
+      // finalizer (mailbox seam round 8) reads the SAME `calls.running` it saw
+      // before the kill and never re-clears/archives after it.
+      calls.running = false;
       onExit?.();
     },
   };
@@ -542,11 +547,16 @@ describe('S2-PR11 scheduling + thread-close', () => {
 
     await duty(SWEEP_DUTY_INVENTORY.T8).run(makeCtx());
 
-    // The invariant: a kill that precedes the clear resurrects the promise on
-    // the next wake (decideCeilingFollowUp's first branch), so the close would
-    // look like it worked and would not have. Re-cleared once the exit callback
-    // proves the container is gone, and archived only then.
-    expect(calls.order).toEqual(['clear', 'kill', 'clear', 'archive']);
+    // Mirrors src/dashboard/thread-close.test.ts's "kills first, then clears
+    // once the process is gone, then archives" (the `recordingDeps()` default:
+    // a container running throughout, no wake race). Mailbox seam round 6-8
+    // inverted this ordering from the pre-guard shape (clear, then kill only
+    // if still running, then clear+archive in onExit): outbound.db has one
+    // writer, so the host may not clear it while a container still owns it —
+    // kill first, then clear once `onExit` proves the process is gone, then
+    // archive. The container-runner mock's `killContainer` flips `calls.running`
+    // to `false` when it fires `onExit`, matching the real registry.
+    expect(calls.order).toEqual(['kill', 'clear', 'archive']);
     expect(calls.kills).toEqual([{ sessionId: 's1', reason: `thread close ${thread}` }]);
     expect(calls.archives).toEqual(['s1']);
     expect(
