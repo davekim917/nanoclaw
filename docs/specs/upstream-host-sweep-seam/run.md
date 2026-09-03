@@ -145,3 +145,8 @@ Not started.
 
 - Reviewer's own note on the shutdown-order question: observable but fail-closed (the storage worker's `failPending` rejects with `Storage maintenance worker stopped`, caught by the tick's `.catch`); not raised as a finding. Recorded as accepted reasoning.
 - Coverage: cross-model review complete (other-family reviewer). One correction batch allowed; affected checks re-run once after it.
+
+### Branch point for S2-PR2+ (2026-09-03 ~12:05Z)
+
+- Mailbox PR 5 `#271` is FINAL at **`9078f5cf`** (six Codex rounds, 8 threads resolved, last push declined). Per the mailbox session, since `3030d050` it gained two commits inside the mailbox module and host-sweep's backoff: openers prove queryability and raise `SessionDbUnopenableError` (routed to the unreadable-mailbox backoff regardless of `enteredPlanSession`), the usage rollup reads through the module's outbound opener again, and the releasing `close()` installs before the probe; the W4 health chain is untouched. **§4.5's error rule must be re-grounded on this head before PR 2 is briefed** — a scout produces `seam2-fork-rev3.md` (line-accurate duty map, error classification, wake/kill sites, exports, delta table vs plan §3/§4.3–4.5).
+- Worktree `wt-s2-pr2` → `feat/host-sweep-seam-pr2-duty-registry` cut at `9078f5cf` (`host-sweep.ts` 2,448 lines; `host-sweep.test.ts` 3,146). Mailbox PR 4 `#291` is at `2d1e345d` awaiting its Codex pass; S2-PR9/11/13 wait for its final sha.
