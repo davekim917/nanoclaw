@@ -96,6 +96,12 @@ export function pendingTerminalSpawnOutboundSeenAt(agentGroupId: string, session
     // Read-only seam: the watchdog inspects a child it does not own, on the
     // sweep's schedule, and must never provision or migrate it (invariant
     // I-4). A session with no outbound.db has nothing to report.
+    //
+    // The pre-seam open set no busy_timeout at all, so a contended read raised
+    // SQLITE_BUSY immediately and this returned null — "no terminal spawn
+    // seen", which feeds the reap decision. The seam's 1s default is a
+    // deliberate, strictly-more-tolerant change: a busy child is exactly the
+    // one whose answer matters, and waiting a second for it beats guessing.
     const rows = readSessionOutbound({ agentGroupId, sessionId }, (mailbox) => mailbox.listOutboundSystemMessages());
     if (!rows) return null;
 
