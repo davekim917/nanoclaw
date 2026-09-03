@@ -25,9 +25,12 @@
  * tree-cleanliness guard in scripts/check-build-clean.ts.
  *
  * Usage:
- *   tsx scripts/build-dashboard-spa.ts            # dev/`build:spa`: tsc --noEmit + vite build
- *   tsx scripts/build-dashboard-spa.ts --install  # deploy/`build:dashboard`: pnpm install + vite build
+ *   tsx scripts/build-dashboard-spa.ts            # dev/`build:spa`: build only, never seeds the cache
+ *   tsx scripts/build-dashboard-spa.ts --install  # deploy/`build:dashboard`: frozen install first, may seed the cache
  *   DASHBOARD_BUILD_FORCE=1 ...                   # ignore the cache, always rebuild
+ *
+ * Both modes run the same build (`tsc --noEmit && vite build`); the install is
+ * the only difference, and it is what earns the right to write to the cache.
  */
 import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
@@ -258,10 +261,19 @@ function main(): void {
   }
 
   console.log(`dashboard SPA: ${decision.reason} ${decision.hash.slice(0, 12)} — building`);
-  // Deploy (`--install`) skips `tsc --noEmit`; the dev path keeps it. Both
-  // emit the same bundle, so their cache entries are interchangeable.
-  if (withInstall) run('pnpm', ['exec', 'vite', 'build'], dashboardDir);
-  else run('pnpm', ['run', 'build'], dashboardDir);
+  // One build command for both entry points: `dashboard`'s own `build` script,
+  // which is `tsc -p tsconfig.json --noEmit && vite build`.
+  //
+  // The deploy path used to run bare `vite build`, matching what `build:dashboard`
+  // did before this gate existed. That was safe only because the deploy also ran
+  // `build:spa` (which typechecks) first. With a cache in play it stopped being
+  // safe: a bare-vite build seeds an entry that a later `pnpm run build` restores,
+  // and that restore skips the dashboard typecheck entirely — so a type error
+  // could be cached and then pass every subsequent build. Vite transpiles without
+  // typechecking, so only `tsc` closes this.
+  //
+  // Every cached bundle is therefore a typechecked bundle.
+  run('pnpm', ['run', 'build'], dashboardDir);
 
   if (!decision.cacheable) {
     console.log(
