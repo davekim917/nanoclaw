@@ -11,7 +11,7 @@ import { getAgentMailbox } from './mailbox/index.js';
 import { closeSessionDb, initTestSessionDb } from './modules/mailbox/testing.js';
 import { getPendingMessages, markCompleted } from './db/messages-in.js';
 import { getUndeliveredMessages } from './db/messages-out.js';
-import { getTurnUsageRows } from './db/turn-usage.js';
+import { getTurnUsageRows } from './modules/mailbox/index.js';
 import { formatMessages, extractRouting } from './formatter.js';
 import {
   dispatchFileAttachment,

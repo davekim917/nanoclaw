@@ -14,7 +14,6 @@ import {
 } from './db/messages-in.js';
 import { getConfig } from './config.js';
 import { writeMessageOut } from './db/messages-out.js';
-import { recordTurnUsage } from './db/turn-usage.js';
 import { getInboundDb } from './mailbox/sqlite/connection.js';
 import { touchHeartbeat } from './heartbeat.js';
 import { clearStaleProcessingAcks } from './db/container-state.js';
@@ -42,6 +41,7 @@ import {
   getWorkContinuation,
   isWorkContinuationRunnable,
   markWorkContinuationRunning,
+  recordTurnUsage,
   releaseProcessingClaims,
   requeueWorkContinuationIfMatches,
   resetWorkContinuationForRealInbound,

@@ -19,14 +19,17 @@ const SRC = path.resolve(import.meta.dir);
 const ENTRYPOINT_MARKERS = [/^#!/, /import\.meta\.main/, /^main\(\)\.(?:catch|then)\(/m];
 
 /**
- * Entrypoints that reach the mailbox only through an import edge they never
- * call. Importing is harmless — registration is a side effect of
- * modules/index.ts, and nothing in the mailbox module runs at import time — so
- * these do not need to boot. Each entry names why.
+ * Entrypoints that reach the mailbox but do not need to boot it. Importing is
+ * harmless — registration is a side effect of modules/index.ts, and nothing in
+ * the mailbox module runs at import time. An entry belongs here only when the
+ * process calls no op that depends on the started singletons; each one names
+ * why, and adding one is a deliberate act, not a way to quiet the tripwire.
  */
-const IMPORT_ONLY: Record<string, string> = {
+const NO_BOOT_REQUIRED: Record<string, string> = {
   'mcp-tools/memory-write-process-helper.ts':
     'imports mcp-tools/memory-write.ts for writeMemoryFile; the mailbox arrives via that module’s registerTools import and no mailbox op is ever called',
+  'scheduling/wiki-lint-gate.ts':
+    'calls exactly one op, readSeriesLastCompletedRun, which opens its own read-only inbound and outbound handles and closes them; the gate runs as a pre-task subprocess alongside the runner that owns outbound.db, so booting would make a read-only gate a second writer of the fork schema',
 };
 
 /** Modules whose functions all go through getAgentMailbox(). */
@@ -110,18 +113,18 @@ describe('container entrypoints boot the mailbox', () => {
 
     const source = fs.readFileSync(entry, 'utf8');
     const boots = source.includes('getAgentMailbox') && source.includes('.start(');
-    if (IMPORT_ONLY[relative]) {
+    if (NO_BOOT_REQUIRED[relative]) {
       expect(
         boots,
-        `${relative} is allowlisted as import-only but now boots the mailbox — drop it from IMPORT_ONLY`,
+        `${relative} is allowlisted as not needing a boot but now boots the mailbox — drop it from NO_BOOT_REQUIRED`,
       ).toBe(false);
       return;
     }
     expect(
       boots,
       `${relative} can reach the mailbox but never calls start(). Add the modules/index.js barrel import ` +
-        'and `await getAgentMailbox().start(await readMailboxContext())`, or add it to IMPORT_ONLY with the ' +
-        'reason it never calls a mailbox op.',
+        'and `await getAgentMailbox().start(await readMailboxContext())`, or add it to NO_BOOT_REQUIRED with ' +
+        'the reason it calls no op that needs the started singletons.',
     ).toBe(true);
   });
 });

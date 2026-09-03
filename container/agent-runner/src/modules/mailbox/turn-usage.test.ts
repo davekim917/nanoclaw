@@ -4,9 +4,9 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-import { getOutboundDb } from '../mailbox/sqlite/connection.js';
-import { ensureNanoclawOutboundSchema, prepareOutboundFile } from '../modules/mailbox/index.js';
-import { initTestSessionDb } from '../modules/mailbox/testing.js';
+import { getOutboundDb } from '../../mailbox/sqlite/connection.js';
+import { ensureNanoclawOutboundSchema, prepareOutboundFile } from './index.js';
+import { initTestSessionDb } from './testing.js';
 import { getTurnUsageRows, recordTurnUsage, _resetCumulativeTrackingForTesting } from './turn-usage.js';
 
 const tempDirs: string[] = [];
