@@ -194,31 +194,42 @@ pass "hard failure when neither lane has a credential"
 
 # =========================================================================
 echo "7. \$HOME not writable (uid remapped in, as on a macOS install)"
-CASE="$ROOT/case7"
-printf 'ghs_from_file\n' > "$TOKEN_FILE"
-rm -f "$FALLBACK_CFG"
-# run_block creates the case dir; make it unwritable so `git config --global`
-# cannot create $HOME/.gitconfig, exactly as uid 501 hits /home/node (owned by
-# the image's build-time uid 1001, mode 0755).
-mkdir -p "$CASE" && chmod 0555 "$CASE"
-run_block_keep_home() {
-  rm -rf "$BIN"; mkdir -p "$BIN"
-  : > "$CASE/../case7-gh.log"
-  env -i PATH="$STUBS:/usr/bin:/bin" HOME="$CASE" GH_STUB_LOG="$CASE/../case7-gh.log" \
-    GITHUB_TOKEN_FILE="$TOKEN_FILE" \
-    bash -c 'set -e; set +u; source "$0"' "$BLOCK"
-}
-run_block_keep_home || fail "block exited nonzero with an unwritable \$HOME — this is the boot-failure regression"
-pass "container still boots when \$HOME is not writable"
+if [ "$(id -u)" = "0" ]; then
+  # chmod 0555 (below) relies on the directory permission bits actually being
+  # enforced. Linux root bypasses them, so as root `touch "$HOME/.gitconfig"`
+  # would succeed, the redirect this case exists to test would never engage,
+  # and every assertion below would fail on the harness, not on entrypoint.sh.
+  # Skip rather than report a false failure; case 7b below (writable HOME) and
+  # the docker smoke's uid-501 run (container/entrypoint-github-auth.smoke.sh)
+  # still cover the writable and remapped-uid paths without needing root.
+  echo "  skip — running as root: chmod cannot make a directory unwritable to root, so this fixture can't simulate an unwritable \$HOME here"
+else
+  CASE="$ROOT/case7"
+  printf 'ghs_from_file\n' > "$TOKEN_FILE"
+  rm -f "$FALLBACK_CFG"
+  # run_block creates the case dir; make it unwritable so `git config --global`
+  # cannot create $HOME/.gitconfig, exactly as uid 501 hits /home/node (owned by
+  # the image's build-time uid 1001, mode 0755).
+  mkdir -p "$CASE" && chmod 0555 "$CASE"
+  run_block_keep_home() {
+    rm -rf "$BIN"; mkdir -p "$BIN"
+    : > "$CASE/../case7-gh.log"
+    env -i PATH="$STUBS:/usr/bin:/bin" HOME="$CASE" GH_STUB_LOG="$CASE/../case7-gh.log" \
+      GITHUB_TOKEN_FILE="$TOKEN_FILE" \
+      bash -c 'set -e; set +u; source "$0"' "$BLOCK"
+  }
+  run_block_keep_home || fail "block exited nonzero with an unwritable \$HOME — this is the boot-failure regression"
+  pass "container still boots when \$HOME is not writable"
 
-[ -f "$FALLBACK_CFG" ] || fail "git config was not redirected to a writable path"
-grep -q 'nanoclaw-git-creds' "$FALLBACK_CFG" \
-  || fail "redirected config has no credential helper: $(cat "$FALLBACK_CFG")"
-pass "git config redirected to a writable path, helper actually configured"
+  [ -f "$FALLBACK_CFG" ] || fail "git config was not redirected to a writable path"
+  grep -q 'nanoclaw-git-creds' "$FALLBACK_CFG" \
+    || fail "redirected config has no credential helper: $(cat "$FALLBACK_CFG")"
+  pass "git config redirected to a writable path, helper actually configured"
 
-chmod 0755 "$CASE"
-[ -e "$CASE/.gitconfig" ] && fail "wrote into the unwritable HOME after all"
-pass "nothing written into the unwritable HOME"
+  chmod 0755 "$CASE"
+  [ -e "$CASE/.gitconfig" ] && fail "wrote into the unwritable HOME after all"
+  pass "nothing written into the unwritable HOME"
+fi
 
 # The redirect must engage ONLY when it has to — a normal install keeps ~/.gitconfig.
 CASE="$ROOT/case7b"
