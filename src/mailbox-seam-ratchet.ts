@@ -40,6 +40,11 @@ export const RATCHET_EXCLUDED_DIRS: readonly string[] = [
  *    identifiers as string literals to search for them, which otherwise
  *    self-matches once this file lives under src/ (rootDir requires that —
  *    see the module doc comment above).
+ *  - src/mailbox-seam-manifest.ts (sibling module): UPSTREAM_FILES /
+ *    DEFERRED_UPSTREAM_FILES legitimately list upstream path strings like
+ *    'src/mailbox/sqlite/session-db.ts' and 'session-db.test.ts' — pattern
+ *    (a)'s whole-file 'session-db' substring check (round 5) otherwise
+ *    self-matches on those string literals.
  *  - src/dashboard-pusher.ts: NOT present in the base tree — it only exists
  *    after a user runs the separate /add-dashboard skill, which copies
  *    .claude/skills/add-dashboard/resources/dashboard-pusher.ts here
@@ -51,7 +56,11 @@ export const RATCHET_EXCLUDED_DIRS: readonly string[] = [
  *    skill-installed resource with its own install lifecycle and test file
  *    (dashboard-pusher.test.ts, alongside it in the skill resources dir).
  */
-const RATCHET_EXCLUDED_FILES: readonly string[] = ['src/mailbox-seam-ratchet.ts', 'src/dashboard-pusher.ts'];
+const RATCHET_EXCLUDED_FILES: readonly string[] = [
+  'src/mailbox-seam-ratchet.ts',
+  'src/mailbox-seam-manifest.ts',
+  'src/dashboard-pusher.ts',
+];
 
 const RAW_OPENER_NAMES = [
   'openInboundDb',
@@ -103,24 +112,23 @@ function stripComments(src: string): string {
 }
 
 function matchesPatternA(src: string): boolean {
-  // (a) an import from a path ending in session-db.js
-  return /from\s+['"][^'"]*session-db\.js['"]/.test(src);
+  // (a) the literal 'session-db' appears anywhere in the file (comments already
+  // stripped). Broadened from "an import from a path ending in session-db.js"
+  // (PR #249 review round 5): a static-import-shaped regex misses a dynamic
+  // `await import('.../session-db.js')`, a destructured re-export, or an alias
+  // — a whole-file substring check covers all of those in one rule, so there is
+  // no import-shape evasion of this class left to find.
+  return src.includes('session-db');
 }
 
 function matchesPatternB(src: string): boolean {
-  // (b) an import of any raw opener/path helper name
-  const importBlockRe = /import\s+(?:type\s+)?\{([^}]*)\}\s+from\s+['"][^'"]+['"]/g;
-  let m: RegExpExecArray | null;
-  while ((m = importBlockRe.exec(src))) {
-    const names = m[1].split(',').map((s) =>
-      s
-        .trim()
-        .split(/\s+as\s+/)[0]
-        .trim(),
-    );
-    if (names.some((n) => RAW_OPENER_NAMES.includes(n))) return true;
-  }
-  return false;
+  // (b) any raw opener/path-helper name appears anywhere in the file as a whole
+  // word (comments already stripped). Broadened from "an import of any raw
+  // opener/path helper name" (PR #249 review round 5, same reasoning as (a)):
+  // covers static imports, dynamic import() with destructuring, and re-export
+  // aliases in one rule.
+  const re = new RegExp(`\\b(?:${RAW_OPENER_NAMES.join('|')})\\b`);
+  return re.test(src);
 }
 
 function matchesPatternC(src: string): boolean {
