@@ -22,6 +22,10 @@ import type { NanoclawMailboxSession } from '../mailbox/index.js';
 import type { Session } from '../../types.js';
 
 import { shouldReapIdleChatContainer, shouldReapIdleTaskContainer, CHAT_IDLE_REAP_MS } from './index.js';
+// PR 14 integration: the exclusive-chain case below asserts the WHOLE
+// session:health chain, and S11/S14 moved to the container-health family
+// (S2-PR10). Side-effect import so the registry the case reads holds them.
+import '../sweep-container-health/index.js';
 
 // ── F-3.1: the 13 ported pure-predicate cases, assertions unchanged ─────────
 
