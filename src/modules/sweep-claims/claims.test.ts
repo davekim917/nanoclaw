@@ -91,19 +91,19 @@ function getDuty(name: string) {
   return duty;
 }
 
-describe('the self-heal nudge ladder keeps its 24h per-claim cooldown and 10-minute scan throttle', () => {
-  // F-6.1: the 92/93 ported cases proving the cooldown/throttle behavior live
-  // in ../claims/self-heal.test.ts (`describe('ladder', ...)`,
-  // `describe('throttle', ...)`) and ../claims/reconcile.test.ts — see the
-  // docstring above for why they were not moved. This case proves the
-  // REGISTERED T21 wrapper is the thing that actually reaches
-  // sweepClaimsSelfHeal, so that pre-existing behavior is exercised in
-  // production, not bypassed by the move.
+describe('F-6.1', () => {
   beforeEach(() => {
     mockSweepClaimsSelfHeal.mockReset();
   });
 
-  it('run(ctx) calls sweepClaimsSelfHeal with no arguments', async () => {
+  // Plan.md §8 F-6.1, exact title. The 92/93 ported cases proving the
+  // cooldown/throttle behavior itself live in ../claims/self-heal.test.ts
+  // (`describe('ladder', ...)`, `describe('throttle', ...)`) and
+  // ../claims/reconcile.test.ts — see the docstring above for why they were
+  // not moved. This case proves the REGISTERED T21 wrapper is the thing that
+  // actually reaches sweepClaimsSelfHeal, so that pre-existing, untouched
+  // behavior is exercised in production, not bypassed by the move.
+  it('the self-heal nudge ladder keeps its 24h per-claim cooldown and 10-minute scan throttle', async () => {
     const duty = getDuty('claims-self-heal');
 
     await duty.run(fakeTickContext());
