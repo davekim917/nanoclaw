@@ -170,15 +170,25 @@ write_status "running" "build" ""
 # `build` is bare `tsc` — it never prunes dist/. A renamed or deleted source
 # file leaves an orphan .js behind that the service (ExecStart runs
 # dist/index.js) still resolves at runtime. Clean first.
+#
+# This also wipes `dist/dashboard-spa/`. That is safe *because* the SPA build
+# gate (scripts/build-dashboard-spa.ts) keeps its bundle cache under `data/`,
+# outside dist/ — so the steps below repopulate the bundle on every deploy
+# whether they rebuild it or restore it. Do not move that cache into dist/.
 rm -rf dist
 if ! pnpm run build >> "$LOG" 2>&1; then
   write_status "failed" "build" "TypeScript build failed"
   exit 1
 fi
 
-# Dashboard SPA is a separate Vite project — top-level `pnpm run build` is
-# tsc-only. Without this step `/deploy` ships server code with stale SPA
-# assets (browser keeps loading the previous bundle hash).
+# Dashboard SPA is a separate Vite project outside the pnpm workspace, so it
+# needs its own install. Without this step `/deploy` could ship server code
+# with stale SPA assets (browser keeps loading the previous bundle hash).
+#
+# Both this and `build:spa` above route through scripts/build-dashboard-spa.ts,
+# which rebuilds only when the content hash of dashboard/ changed and otherwise
+# restores the cached bundle. Unchanged dashboard/ => this step is a file copy,
+# not a `pnpm install` + `vite build`. DASHBOARD_BUILD_FORCE=1 bypasses it.
 write_status "running" "dashboard build" ""
 if ! pnpm run build:dashboard >> "$LOG" 2>&1; then
   write_status "failed" "dashboard build" "Vite SPA build failed"

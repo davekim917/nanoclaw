@@ -12,7 +12,7 @@
     "prebuild": "tsx scripts/check-build-clean.ts",
     "build": "tsc && pnpm run build:spa",
     "postbuild": "tsx scripts/write-build-info.ts",
-    "build:spa": "[ -d dashboard/node_modules ] || { echo 'WARN: dashboard deps not installed — SPA not rebuilt; run: pnpm --dir dashboard install'; exit 0; }; pnpm --dir dashboard run build",
+    "build:spa": "tsx scripts/build-dashboard-spa.ts",
     "start": "node dist/index.js",
     "dev": "tsx src/index.ts",
     "typecheck": "tsc --noEmit",
@@ -29,7 +29,7 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "check:public-boundary": "tsx scripts/check-public-boundary.ts",
-    "build:dashboard": "cd dashboard && pnpm install --ignore-workspace --frozen-lockfile && pnpm vite build",
+    "build:dashboard": "tsx scripts/build-dashboard-spa.ts --install",
     "mailbox-model:generate": "cp src/mailbox/model.ts container/agent-runner/src/mailbox/model.generated.ts",
     "mailbox-model:check": "cmp src/mailbox/model.ts container/agent-runner/src/mailbox/model.generated.ts"
   },
