@@ -17,6 +17,11 @@ import fs from 'node:fs';
 import { getInboundDb, getOutboundDb } from '../mailbox/sqlite/connection.js';
 import { closeSessionDb, initTestSessionDb } from '../modules/mailbox/testing.js';
 import { getPendingMessages, markScriptSkipped } from '../db/messages-in.js';
+import {
+  beginProviderBusyScope,
+  clearStaleProcessingAcks,
+  setProviderTurnExecuting,
+} from '../modules/mailbox/index.js';
 import { applyPreTaskScripts, runScript } from './task-script.js';
 
 // Point the pre-task classifier at the real shared destructive core (same
@@ -298,5 +303,101 @@ describe('a timed-out script is reported as a timeout', () => {
     } finally {
       delete process.env.NANOCLAW_TASK_SCRIPT_TIMEOUT_MS;
     }
+  });
+});
+
+/**
+ * Reaper visibility. A pre-task script runs BEFORE its batch is claimed (see
+ * the claim-ordering note in poll-loop.ts), so while it executes the host sees
+ * no processing_ack claim for it, and once the row stops counting as due the
+ * task reaper's remaining terms all read "idle" — it kills the container
+ * mid-script. `provider_executing` is the term that says "busy"; the host side
+ * of the contract is pinned in src/modules/mailbox/mailbox.test.ts, so if
+ * either end renames the column its own test goes red.
+ */
+describe('applyPreTaskScripts provider_executing', () => {
+  const providerExecuting = (): number =>
+    (
+      getOutboundDb().prepare('SELECT provider_executing FROM container_state WHERE id = 1').get() as
+        | { provider_executing: number }
+        | undefined
+    )?.provider_executing ?? 0;
+
+  it('publishes the busy flag while a script runs and clears it when it finishes', async () => {
+    insertTask('t-busy-flag', `sleep 3\necho '{"wakeAgent": true}'`);
+
+    expect(providerExecuting()).toBe(0);
+    const run = applyPreTaskScripts(getPendingMessages());
+
+    // Poll rather than sleep a fixed amount: the first classifyScript call
+    // imports the shared destructive core, whose cost is not bounded here.
+    let sawBusy = 0;
+    const deadline = Date.now() + 2_500;
+    while (Date.now() < deadline) {
+      sawBusy = providerExecuting();
+      if (sawBusy === 1) break;
+      await Bun.sleep(25);
+    }
+    expect(sawBusy).toBe(1);
+
+    const { keep, skipped } = await run;
+    expect(skipped).toHaveLength(0);
+    expect(keep).toHaveLength(1);
+    expect(providerExecuting()).toBe(0);
+  });
+
+  it('clears the busy flag when the script fails, so a broken monitor cannot pin the container', async () => {
+    insertTask('t-busy-flag-error', 'exit 3');
+
+    const { skipped } = await applyPreTaskScripts(getPendingMessages());
+
+    expect(skipped).toEqual([{ id: 't-busy-flag-error', reason: 'error' }]);
+    expect(providerExecuting()).toBe(0);
+  });
+
+  it('clears a flag leaked by a killed container at the next container startup', () => {
+    beginProviderBusyScope();
+    expect(providerExecuting()).toBe(1);
+
+    clearStaleProcessingAcks();
+
+    expect(providerExecuting()).toBe(0);
+  });
+
+  // The active poll callback runs pre-task scripts for in-turn follow-ups while
+  // a provider turn is streaming. One shared boolean made the two scopes cut
+  // each other down: whichever finished first published idle and exposed the
+  // other to the reaper. They are tracked separately, so each ends on its own.
+  it('does not clear a provider turn that is still running when a script ends', async () => {
+    setProviderTurnExecuting(true);
+    insertTask('t-scope-under-turn', `echo '{"wakeAgent": false}'`);
+
+    await applyPreTaskScripts(getPendingMessages());
+
+    expect(providerExecuting()).toBe(1);
+    setProviderTurnExecuting(false);
+    expect(providerExecuting()).toBe(0);
+  });
+
+  it('does not clear a running script when the turn it overlaps ends first', async () => {
+    const marker = freshMarker('turn-ends-first');
+    setProviderTurnExecuting(true);
+    insertTask('t-turn-ends-first', `touch ${marker}\nsleep 2\necho '{"wakeAgent": true}'`);
+    const run = applyPreTaskScripts(getPendingMessages());
+
+    // The published bit is already 1 from the turn, so poll the marker: it
+    // only exists once the script is actually executing inside its scope.
+    const deadline = Date.now() + 3_000;
+    while (Date.now() < deadline && !fs.existsSync(marker)) await Bun.sleep(25);
+    expect(fs.existsSync(marker)).toBe(true);
+
+    // The stream's `result` lands while the script is still executing.
+    setProviderTurnExecuting(false);
+    const sawBusy = providerExecuting();
+
+    await run;
+
+    expect(sawBusy).toBe(1);
+    expect(providerExecuting()).toBe(0);
   });
 });

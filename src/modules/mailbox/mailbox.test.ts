@@ -44,6 +44,7 @@ import { getAgentMailbox } from '../../mailbox/index.js';
 import type { InboundMessage, MailboxSessionKey } from '../../mailbox/types.js';
 import { SessionDbMissingError } from './openers.js';
 import { withMailboxSession } from '../../session-manager.js';
+import { shouldReapIdleTaskContainer } from '../sweep-idle-reap/index.js';
 import { sessionOutboundStorageStat, type NanoclawMailboxSession } from './index.js';
 
 const DATA_DIR = path.join(TEST_ROOT, 'data');
@@ -633,5 +634,83 @@ describe('sessionOutboundStorageStat', () => {
     // ambiguous and must not arm the quiet gate.
     fs.writeFileSync(`${dbPath(key, 'outbound')}-journal`, 'rollback pending');
     expect(sessionOutboundStorageStat(key.agentGroupId, key.sessionId)).toBeNull();
+  });
+});
+
+/**
+ * Cross-process contract for the one reaper term the host cannot derive on its
+ * own. A due inbound row, a processing claim and a work_continuation record are
+ * all host-visible; `provider_executing` is the container telling the host it is
+ * busy during work that shows up in none of them — the pre-task script batch and
+ * every turn after the first one in a stream. The write side lives in
+ * container/agent-runner/src/modules/mailbox/container-state.ts and its own
+ * tests pin it; this pins that the host's module-side reader sees what that
+ * writer wrote. Both ends name the literal column, so a rename on either side
+ * goes red on its own test.
+ */
+describe('provider_executing across the container to host seam', () => {
+  // Byte-identical to the runner's publishProviderExecuting UPSERT.
+  const busyUpsert =
+    'INSERT INTO container_state (id, provider_executing, updated_at) VALUES (1, ?, ?) ' +
+    'ON CONFLICT(id) DO UPDATE SET provider_executing = excluded.provider_executing, ' +
+    'updated_at = excluded.updated_at';
+
+  it('keeps a task container the runner flagged busy, and reaps it once the flag clears', async () => {
+    const key = freshKey();
+    const mailbox = getAgentMailbox();
+    mailbox.prepare(key);
+
+    // Exactly what the runner writes when it enters an unclaimed work window
+    // (a pre-task script, a pushed follow-up turn, a durable continuation).
+    raw(dbPath(key, 'outbound'), (db) => db.prepare(busyUpsert).run(1, new Date().toISOString()));
+
+    const busy = await mailbox.session(key, (m) => fork(m).getContainerState());
+    expect(busy?.provider_executing).toBe(1);
+    // Nothing due, nothing claimed, no continuation — every other term says
+    // "idle", which is precisely the mid-work kill this guards.
+    expect(shouldReapIdleTaskContainer('system:tasks:task-1', 0, 0, busy?.provider_executing === 1, false)).toBe(false);
+
+    raw(dbPath(key, 'outbound'), (db) => db.prepare(busyUpsert).run(0, new Date().toISOString()));
+
+    const idle = await mailbox.session(key, (m) => fork(m).getContainerState());
+    expect(idle?.provider_executing).toBe(0);
+    // The reaper's purpose is intact: a container that finished still goes.
+    expect(shouldReapIdleTaskContainer('system:tasks:task-1', 0, 0, idle?.provider_executing === 1, false)).toBe(true);
+  });
+
+  it('reads the flag on the wider shape a booted container leaves behind', async () => {
+    const key = freshKey();
+    const mailbox = getAgentMailbox();
+    mailbox.prepare(key);
+
+    // The case above is a session the host prepared and no container has
+    // booted yet. In production the host reads this row only while a container
+    // is alive, and that container's own ensureNanoclawOutboundSchema has
+    // added the provider and memory columns — a different read tier. Pin both,
+    // so narrowing the tier list cannot take the flag away from either.
+    raw(dbPath(key, 'outbound'), (db) => {
+      for (const column of [
+        'provider_status TEXT',
+        'provider_last_event_at TEXT',
+        'provider_last_probe_at TEXT',
+        'provider_probe_failures INTEGER',
+        'provider_recovery_attempts INTEGER',
+        'provider_failure_reason TEXT',
+        'memory_current_bytes INTEGER',
+        'memory_peak_bytes INTEGER',
+        'memory_max_bytes INTEGER',
+        'memory_oom_events INTEGER',
+        'memory_oom_kill_events INTEGER',
+        'memory_max_events INTEGER',
+        'memory_telemetry_at TEXT',
+      ]) {
+        db.exec(`ALTER TABLE container_state ADD COLUMN ${column}`);
+      }
+      db.prepare(busyUpsert).run(1, new Date().toISOString());
+    });
+
+    const busy = await mailbox.session(key, (m) => fork(m).getContainerState());
+    expect(busy?.provider_executing).toBe(1);
+    expect(shouldReapIdleTaskContainer('system:tasks:task-1', 0, 0, busy?.provider_executing === 1, false)).toBe(false);
   });
 });

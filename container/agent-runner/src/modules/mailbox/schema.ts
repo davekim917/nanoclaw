@@ -147,6 +147,7 @@ export function ensureNanoclawOutboundSchema(outbound: Database): void {
         tool_declared_timeout_ms INTEGER,
         tool_started_at          TEXT,
         provider_status          TEXT,
+        provider_executing       INTEGER NOT NULL DEFAULT 0,
         provider_last_event_at   TEXT,
         provider_last_probe_at   TEXT,
         provider_probe_failures  INTEGER,
@@ -174,6 +175,13 @@ export function ensureNanoclawOutboundSchema(outbound: Database): void {
     ['tool_declared_timeout_ms', 'INTEGER'],
     ['tool_started_at', 'TEXT'],
     ['provider_status', 'TEXT'],
+    // The host's idle reaper reads this column to tell "busy but holding no
+    // inbound claim" from "finished". It was in the HOST schema and the reap
+    // decision from day one with no writer on either side, so the guard was
+    // permanently false; the writer in container-state.ts is what makes it
+    // real. Older outbound.db files predate the column, hence this backfill
+    // entry alongside the CREATE TABLE above.
+    ['provider_executing', 'INTEGER NOT NULL DEFAULT 0'],
     ['provider_last_event_at', 'TEXT'],
     ['provider_last_probe_at', 'TEXT'],
     ['provider_probe_failures', 'INTEGER'],

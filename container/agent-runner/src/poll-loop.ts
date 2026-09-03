@@ -26,6 +26,7 @@ import {
 } from './db/session-state.js';
 import {
   advanceMemoryContextEpoch,
+  beginProviderBusyScope,
   classifyTrigger,
   clearDoneProposal,
   clearStickyEffort,
@@ -42,11 +43,13 @@ import {
   isWorkContinuationRunnable,
   markWorkContinuationRunning,
   recordTurnUsage,
+  endProviderBusyScope,
   releaseProcessingClaims,
   requeueWorkContinuationIfMatches,
   resetWorkContinuationForRealInbound,
   retainCompleteRecallUnits,
   setChatLimit,
+  setProviderTurnExecuting,
   setStickyEffort,
   setStickyFast,
   setStickyModel,
@@ -469,8 +472,17 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
             clearCurrentInReplyTo();
             clearBatchAnchors();
           }
-          await emitTurnEnd();
-          await checkpointTurnEnd(autosaveWorktrees);
+          // processQuery tracks the turn itself. This tail does not: the
+          // continuation record is already cleared, this path claims no
+          // inbound rows, and the turn-end git checkpoint below is real work
+          // the host would otherwise read as idle. Bounded, unlike the stream.
+          beginProviderBusyScope();
+          try {
+            await emitTurnEnd();
+            await checkpointTurnEnd(autosaveWorktrees);
+          } finally {
+            endProviderBusyScope();
+          }
           continue;
         }
       }
@@ -1191,12 +1203,21 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       clearBatchAnchors();
     }
 
-    await emitTurnEnd();
+    // Same bracket as the durable-continuation tail above, for the same
+    // reason: processQuery lowered the turn level at `result`, the batch was
+    // completed there too, and the git checkpoint below is real work the host
+    // would otherwise read as idle. Bounded, so it cannot pin the container.
+    beginProviderBusyScope();
+    try {
+      await emitTurnEnd();
 
-    // Compatibility callback is intentionally non-mutating in production.
-    // Sibling agents share this topic checkout, so turn-end code must never
-    // stage, commit, reset, or remove another sibling's live index lock.
-    await checkpointTurnEnd(autosaveWorktrees);
+      // Compatibility callback is intentionally non-mutating in production.
+      // Sibling agents share this topic checkout, so turn-end code must never
+      // stage, commit, reset, or remove another sibling's live index lock.
+      await checkpointTurnEnd(autosaveWorktrees);
+    } finally {
+      endProviderBusyScope();
+    }
 
     // Ensure completed even if processQuery ended without a result event
     // (e.g. stream closed unexpectedly). The one exception is a batch handed
@@ -1446,6 +1467,11 @@ export async function processQuery(
   let turnStartedAtMs = Date.now();
   const pushToQuery = (message: string): void => {
     turnIdle = false;
+    // Same boundary as `turnIdle`, published for the host. A pushed turn runs
+    // with no processing claim of its own (the initial batch was completed at
+    // the previous `result`), so this is the only thing standing between it
+    // and the idle reaper.
+    setProviderTurnExecuting(true);
     turnStartedAtMs = Date.now();
     query.push(message);
   };
@@ -1728,6 +1754,8 @@ export async function processQuery(
     })();
   }, ACTIVE_POLL_INTERVAL_MS);
 
+  // The initial prompt is a turn the same way a push is; `result` clears it.
+  setProviderTurnExecuting(true);
   try {
     for await (const event of query.events) {
       if (event.type === 'error') {
@@ -1768,6 +1796,15 @@ export async function processQuery(
         // handling below, so any push it makes (nudge, continuation launch)
         // clears the flag again and leaves it truthful on exit.
         turnIdle = true;
+        // The host's copy of that same fact. It has to be published HERE and
+        // not around the whole call: a multi-turn stream stays open after
+        // `result` to accept pushes (claude.ts's generator exits only on
+        // end()/abort), so a flag cleared on return would sit at 1 through
+        // the entire idle stretch and keep the task reaper off a container
+        // that has nothing left to do. It lowers only the TURN level: a
+        // pre-task script the poll callback started concurrently keeps its own
+        // scope, so this cannot cut the ground out from under it.
+        setProviderTurnExecuting(false);
         // Fleet Hardening Phase 0.1: one turn_usage row per completed turn,
         // written here because every provider's query converges on this
         // event regardless of which one ran. Whatever the provider didn't
@@ -1944,6 +1981,8 @@ export async function processQuery(
   } finally {
     done = true;
     clearInterval(pollHandle);
+    // Floor for the abort/throw paths, which never reach a `result`.
+    setProviderTurnExecuting(false);
   }
 
   return { continuation: queryContinuation };

@@ -252,9 +252,17 @@ const CONTAINER_STATE_PROVIDER_COLUMNS =
 const CONTAINER_STATE_MEMORY_COLUMNS =
   `${CONTAINER_STATE_PROVIDER_COLUMNS}, memory_current_bytes, memory_peak_bytes, memory_max_bytes, ` +
   'memory_oom_events, memory_oom_kill_events, memory_telemetry_at';
+// `provider_executing` is the one fork column the HOST adds itself
+// (schema.ts's ensureSchema), because the reap decision needs it; every other
+// fork column arrives when the container first boots and runs its own
+// ensureNanoclawOutboundSchema. Without this tier a session DB the host
+// prepared but no container has booted yet drops straight to the tool-only
+// tier and the column the host just added reads back as undefined.
+const CONTAINER_STATE_EXECUTING_COLUMNS = `${CONTAINER_STATE_TOOL_COLUMNS}, provider_executing`;
 const CONTAINER_STATE_COLUMN_TIERS = [
   `${CONTAINER_STATE_MEMORY_COLUMNS}, memory_max_events`,
   CONTAINER_STATE_MEMORY_COLUMNS,
   CONTAINER_STATE_PROVIDER_COLUMNS,
+  CONTAINER_STATE_EXECUTING_COLUMNS,
   CONTAINER_STATE_TOOL_COLUMNS,
 ];

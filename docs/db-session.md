@@ -218,6 +218,7 @@ CREATE TABLE container_state (
   tool_declared_timeout_ms INTEGER,
   tool_started_at          TEXT,
   provider_status          TEXT,
+  provider_executing       INTEGER NOT NULL DEFAULT 0,
   provider_last_event_at   TEXT,
   provider_last_probe_at   TEXT,
   provider_probe_failures  INTEGER,
@@ -233,7 +234,8 @@ CREATE TABLE container_state (
 );
 ```
 
-- **Writer (container):** operation/provider state helpers in `container/agent-runner/src/db/connection.ts` plus `resource-telemetry.ts` for cgroup samples.
+- **Writer (container):** operation/provider state helpers in `container/agent-runner/src/modules/mailbox/container-state.ts` plus `resource-telemetry.ts` for cgroup samples.
+- **`provider_executing`** is the container's "I am busy right now" flag for the host's idle reapers. They otherwise infer busy-ness from state the host can see — a due inbound row, a `processing` claim, a `work_continuation` record — and work the runner drives on its own behalf appears in none of it: the pre-task script batch runs before its rows are claimed (up to `NANOCLAW_TASK_SCRIPT_TIMEOUT_MS`, 120s by default), and every turn after the first one in a stream runs with no claim at all, because the initial batch is completed at its `result`. The flag tracks **turns, not stream lifetime** — `setProviderTurnExecuting()` is raised by the prompt that starts a turn and lowered by the `result` that ends it, the same boundary `poll-loop.ts` maintains `turnIdle` at. A multi-turn stream stays open after `result` to accept pushes, so a flag held for the whole stream would keep the reaper off an idle container. Windows outside a turn (the script batch, the turn-end checkpoint) are a second, counted scope — `beginProviderBusyScope()`/`endProviderBusyScope()` in a bounded `try`/`finally`. They are separate because they overlap: the active poll callback runs a follow-up's pre-task script concurrently with the turn it belongs to, and one shared boolean let whichever finished first expose the other to the reaper. The published column is their union. A container killed mid-window cannot clear it, so the next container clears it at startup.
 - **Reader (host):** `getContainerState()` in `src/db/session-db.ts`; consumed by the sweep's `activeOperationTimeoutMs()` helper in `src/host-sweep.ts`.
 - **Restart cleanup:** container startup clears prior operation/provider state and immediately overwrites resource fields with the new cgroup's counters.
 - `CREATE TABLE IF NOT EXISTS` — forward-compatible with `outbound.db` files created before this table existed; `getContainerState()` returns `null` if the table or row is absent.

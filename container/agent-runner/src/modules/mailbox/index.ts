@@ -32,9 +32,13 @@ import {
   type PendingSelectionDiagnostics,
 } from './selection.js';
 import {
+  beginProviderBusyScope,
   clearProviderHealthState,
   clearStaleProcessingAcks,
+  endProviderBusyScope,
+  resetProviderExecuting,
   setProviderHealthState,
+  setProviderTurnExecuting,
   writeResourceTelemetry,
   type ProviderHealthState,
 } from './container-state.js';
@@ -199,6 +203,15 @@ export interface NanoclawMailboxOperations extends MailboxOperations {
   getSessionId(): string | null;
   setProviderHealthState(state: ProviderHealthState, outbound?: Database): void;
   clearProviderHealthState(outbound?: Database): void;
+  /**
+   * The host-visible "busy right now" flag (`container_state.provider_executing`),
+   * read by the sweep's idle reapers. The turn level and the bracketed windows
+   * are separate scopes whose union is published — see container-state.ts.
+   */
+  setProviderTurnExecuting(executing: boolean, outbound?: Database): void;
+  beginProviderBusyScope(outbound?: Database): void;
+  endProviderBusyScope(outbound?: Database): void;
+  resetProviderExecuting(outbound?: Database): void;
   writeResourceTelemetry(snapshot: Parameters<typeof writeResourceTelemetry>[0], outbound?: Database): void;
   /** Per-turn token/cost accounting (outbound `turn_usage`). Never throws. */
   recordTurnUsage(
@@ -282,6 +295,10 @@ export class NanoclawAgentMailbox extends SqliteAgentMailbox {
   getSessionId = getSessionId;
   setProviderHealthState = setProviderHealthState;
   clearProviderHealthState = clearProviderHealthState;
+  setProviderTurnExecuting = setProviderTurnExecuting;
+  beginProviderBusyScope = beginProviderBusyScope;
+  endProviderBusyScope = endProviderBusyScope;
+  resetProviderExecuting = resetProviderExecuting;
   writeResourceTelemetry = writeResourceTelemetry;
   recordTurnUsage = recordTurnUsage;
   getTurnUsageRows = getTurnUsageRows;
