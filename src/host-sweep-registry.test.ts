@@ -1862,16 +1862,18 @@ describe('sweep duty registry (S2-PR2)', () => {
       expect(h.quietWrites[0]!.map((m) => m.sessionId)).toEqual(['sess-restored']);
       expect([...h.persistedQuiet.keys()], 'the flush wrote a mark the restore had already cleared').toEqual([]);
 
-      // In-process: the next tick sees the moved last_active and sweeps.
-      h.opens = [];
-      await _sweepOnceForTesting();
-      expect(h.opens).toContain('sess-restored');
-
-      // And across a restart: nothing was persisted, so nothing is warmed.
+      // Restart IMMEDIATELY, with no intervening tick: the mark this tick took
+      // is gone from the row, so the warm has nothing to offer and the session
+      // is swept. Deliberately no in-process tick in between — a second tick
+      // would sweep the session (proving the in-process half, which R-9's
+      // "a last_active change invalidates the mark immediately" already owns),
+      // find it quiet again and take a FRESH, legitimate mark, which the warm
+      // would then honour. That is correct behavior, not the regression this
+      // case exists for.
       _resetQuietSessionCacheForTesting();
       h.opens = [];
       await firstTickAfterRestart();
-      expect(h.opens).toContain('sess-restored');
+      expect(h.opens, 'a mark cleared by housekeeping survived the restart').toContain('sess-restored');
       expect(_lastSweepTickStatsForTesting().skippedQuiet).toBe(0);
       expect(h.spawns).toEqual([]);
     });
