@@ -756,6 +756,55 @@ describe('the close sequence order', () => {
     });
   });
 
+  /**
+   * A wake issued DURING the clear must be killed, not archived around.
+   *
+   * The no-container branch awaits the clear, so a container can take the
+   * session inside it. Archiving then leaves that container running in a thread
+   * the operator sees as closed — archiving is display-only and stops nothing.
+   *
+   * The force-clear's own guard does not cover this case: a session with no
+   * continuation to clear never reaches it (the funnel resolves `undefined`
+   * before the action), and "nothing to clear" is a legitimate success. So the
+   * ownership question is re-asked after the clear.
+   *
+   * Injects `isContainerRunning` as the single ownership knob and flips it
+   * inside the injected clear — the wake landing in the await.
+   */
+  it('kills a container that took the session during the clear instead of archiving around it', async () => {
+    startClose();
+    const live = { owned: false };
+    const calls: string[] = [];
+    let archived: string | null = null;
+
+    await advanceThreadClosures({
+      now: NOW,
+      readProposal: () => null,
+      isContainerRunning: () => live.owned,
+      clearContinuation: async () => {
+        calls.push('clear');
+        live.owned = true; // the wake lands here
+        return true;
+      },
+      killContainer: (id, _reason, onExit) => {
+        calls.push('kill');
+        live.owned = false; // the process is gone once onExit fires
+        onExit?.();
+      },
+      archiveSession: (id) => {
+        calls.push('archive');
+        archived = id;
+        return true;
+      },
+    });
+
+    // It took the kill path: cleared, found the session taken, killed, cleared
+    // again after exit, then archived. Never archive-without-kill.
+    expect(calls).toEqual(['clear', 'kill', 'clear', 'archive']);
+    expect(archived).toBe('s1');
+    expect(calls.indexOf('kill')).toBeLessThan(calls.indexOf('archive'));
+  });
+
   it('is idempotent — a second tick over an already-closed thread does nothing', async () => {
     startClose();
     await advanceThreadClosures(recordingDeps().deps);

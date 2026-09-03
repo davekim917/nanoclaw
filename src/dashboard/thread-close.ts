@@ -588,13 +588,28 @@ async function finalizeSession(session: CloseSession, threadId: string, deps: Th
 
   // Ownership is read HERE, and it decides the ORDER, not whether to clear.
   //
-  // No container: nothing to stop, so clear and archive directly. The clear is
-  // still gated inside itself — see `forceClearWorkContinuation` — because a
-  // wake can land between this branch and the write.
+  // No container: nothing to stop, so clear and then archive — but the clear
+  // AWAITS, and a wake issued during it leaves a live container that this
+  // branch would archive around. Archiving is display-only, so nothing stops
+  // that container: the operator sees a closed thread with an agent still
+  // working in it.
+  //
+  // `forceClearWorkContinuation`'s own guard does not cover this on its own.
+  // It refuses to WRITE under a live container, but a session with no
+  // outbound.db never runs that guard at all — the funnel resolves `undefined`
+  // before the action, and "nothing to clear" is a legitimate success. So the
+  // ownership question is re-asked here, after the clear resolves and
+  // immediately before the archive, with no await in between.
   if (!owns(session.id)) {
     if (!(await clear(session, threadId))) return;
-    archive(session.id); // (e)
-    return;
+    if (!owns(session.id)) {
+      archive(session.id); // (e)
+      return;
+    }
+    // A container took the session while we cleared. Fall through to the kill
+    // path rather than archiving around it. The clear runs again in `onExit`;
+    // it is idempotent — the DELETEs are no-ops on an already-empty key — and
+    // this time it runs with the process provably gone.
   }
 
   // (c) KILL FIRST, then clear once the container is provably gone.
