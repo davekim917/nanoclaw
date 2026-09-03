@@ -167,28 +167,38 @@ export function migrateMessagesInTable(db: Database.Database): void {
     db.prepare('ALTER TABLE messages_in ADD COLUMN on_wake INTEGER NOT NULL DEFAULT 0').run();
   }
   if (!cols.has('scheduled_for')) {
-    db.prepare('ALTER TABLE messages_in ADD COLUMN scheduled_for TEXT').run();
-    // Backfilled from process_after for existing TASK rows, once, here.
-    //
-    // Leaving them NULL looks conservative and is not: a legacy occurrence
-    // would carry no slot until something rewrote it, so its FIRST crash after
-    // the upgrade would defer process_after, the formatter would fall back to
-    // the backoff deadline, and the exact defect this column exists to prevent
-    // would reproduce on every pre-migration task.
-    //
-    // The backfill is never worse than NULL. For a row not currently deferred,
-    // process_after IS its slot and this is simply correct. For one already
-    // sitting in backoff the value is the deadline — but that is precisely what
-    // the NULL fallback would have rendered anyway, so nothing is lost, and the
-    // next genuine reschedule corrects it.
-    //
-    // At the migration seam rather than in each deferral path: `scheduled_for`
-    // has to be present before ANY writer of process_after runs, and there is
-    // more than one (fresh-context retry, stale-message backoff). One statement
-    // here covers every such path, including ones added later.
-    db.prepare(
-      "UPDATE messages_in SET scheduled_for = process_after WHERE kind = 'task' AND process_after IS NOT NULL",
-    ).run();
+    // ALTER and backfill in ONE transaction. SQLite makes DDL transactional,
+    // and better-sqlite3 nests via SAVEPOINT, so this is safe wherever the
+    // migration is called from. Split, a crash between the two statements
+    // leaves the column present and every legacy task's slot NULL — and
+    // because the next open sees the column in PRAGMA table_info, the backfill
+    // never runs again. The first retry after that would rewrite
+    // `process_after`, the formatter would fall back to the backoff deadline,
+    // and the regression this column exists to prevent would be permanent.
+    db.transaction(() => {
+      db.prepare('ALTER TABLE messages_in ADD COLUMN scheduled_for TEXT').run();
+      // Backfilled from process_after for existing TASK rows, once, here.
+      //
+      // Leaving them NULL looks conservative and is not: a legacy occurrence
+      // would carry no slot until something rewrote it, so its FIRST crash after
+      // the upgrade would defer process_after, the formatter would fall back to
+      // the backoff deadline, and the exact defect this column exists to prevent
+      // would reproduce on every pre-migration task.
+      //
+      // The backfill is never worse than NULL. For a row not currently deferred,
+      // process_after IS its slot and this is simply correct. For one already
+      // sitting in backoff the value is the deadline — but that is precisely what
+      // the NULL fallback would have rendered anyway, so nothing is lost, and the
+      // next genuine reschedule corrects it.
+      //
+      // At the migration seam rather than in each deferral path: `scheduled_for`
+      // has to be present before ANY writer of process_after runs, and there is
+      // more than one (fresh-context retry, stale-message backoff). One statement
+      // here covers every such path, including ones added later.
+      db.prepare(
+        "UPDATE messages_in SET scheduled_for = process_after WHERE kind = 'task' AND process_after IS NOT NULL",
+      ).run();
+    })();
   }
   if (!cols.has('repo_fence_epoch')) {
     db.prepare('ALTER TABLE messages_in ADD COLUMN repo_fence_epoch TEXT').run();

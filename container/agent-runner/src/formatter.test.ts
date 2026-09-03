@@ -226,6 +226,30 @@ describe('task timestamps', () => {
     expect(formatMessages(getPendingMessages())).toContain(`time="${formatLocalTime(scheduled, TIMEZONE)}"`);
   });
 
+  it('reads a naive scheduled_for as UTC, the way it reads process_after', () => {
+    // Codex round 2, P1. The host's one-time backfill copies process_after
+    // verbatim, so a row migrated on an install whose older writers used
+    // SQLite's naive `YYYY-MM-DD HH:MM:SS` shape carries that shape here.
+    // `new Date()` reads it as LOCAL time, which shifts the announced slot by
+    // the install's offset and, near midnight, onto the wrong day.
+    const naive = '2026-01-05 09:00:00';
+    const iso = '2026-01-05T09:00:00.000Z';
+    insertMessage(
+      't-naive-slot',
+      'task',
+      { prompt: 'migrated occurrence' },
+      { timestamp: '2026-01-04T12:05:00.000Z', processAfter: iso, scheduledFor: naive },
+    );
+
+    const rows = getPendingMessages();
+    // Normalized on the way out of the mailbox, the same as process_after —
+    // asserted on the row because this host runs in UTC, where the naive and
+    // ISO forms happen to render alike and the formatter cannot tell them
+    // apart. On a non-UTC install they differ by the whole offset.
+    expect(rows.find((row) => row.id === 't-naive-slot')?.scheduled_for).toBe(iso);
+    expect(formatMessages(rows)).toContain(`time="${formatLocalTime(iso, TIMEZONE)}"`);
+  });
+
   it('carries current_time so a late run can still resolve "today"', () => {
     insertMessage(
       't2',

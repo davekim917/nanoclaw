@@ -352,6 +352,58 @@ describe('migrateMessagesInTable', () => {
     db.close();
   });
 
+  it('leaves the column absent when the backfill fails, so the next open retries both', () => {
+    // Codex round 2, P2. Split, a crash between the ALTER and the UPDATE left
+    // the column present with every legacy slot NULL — and because the next
+    // open sees it in PRAGMA table_info, the backfill never ran again. The
+    // first retry after that would rewrite process_after and the formatter
+    // would announce the backoff deadline: the regression made permanent.
+    if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
+    fs.mkdirSync(TEST_DIR, { recursive: true });
+
+    const db = new Database(DB_PATH);
+    db.exec(`
+      CREATE TABLE messages_in (
+        id             TEXT PRIMARY KEY,
+        seq            INTEGER UNIQUE,
+        kind           TEXT NOT NULL,
+        timestamp      TEXT NOT NULL,
+        status         TEXT DEFAULT 'pending',
+        process_after  TEXT,
+        recurrence     TEXT,
+        tries          INTEGER DEFAULT 0,
+        platform_id    TEXT,
+        channel_type   TEXT,
+        thread_id      TEXT,
+        content        TEXT NOT NULL
+      );
+    `);
+    db.prepare(
+      "INSERT INTO messages_in (id, seq, kind, timestamp, status, process_after, content) VALUES (?, ?, 'task', ?, 'pending', ?, '{}')",
+    ).run('legacy-atomic', 2, '2026-01-04T12:05:00.000Z', '2026-01-05T09:00:00.000Z');
+
+    // Deterministic injection of "the backfill did not complete": a trigger
+    // that aborts the UPDATE the migration is about to run.
+    db.exec(`
+      CREATE TRIGGER fail_backfill BEFORE UPDATE ON messages_in
+      BEGIN SELECT RAISE(ABORT, 'injected backfill failure'); END;
+    `);
+    expect(() => migrateMessagesInTable(db)).toThrow('injected backfill failure');
+
+    // Rolled back together: no column, so the next open runs both again.
+    const afterFailure = (db.prepare("PRAGMA table_info('messages_in')").all() as Array<{ name: string }>).map(
+      (c) => c.name,
+    );
+    expect(afterFailure).not.toContain('scheduled_for');
+
+    db.exec('DROP TRIGGER fail_backfill');
+    migrateMessagesInTable(db);
+    expect(db.prepare('SELECT scheduled_for FROM messages_in WHERE id = ?').get('legacy-atomic')).toEqual({
+      scheduled_for: '2026-01-05T09:00:00.000Z',
+    });
+    db.close();
+  });
+
   it('a legacy task migrated then crashed keeps its slot through the retry backoff', () => {
     // The end-to-end shape finding #1 named: upgrade, then the FIRST crash.
     if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });

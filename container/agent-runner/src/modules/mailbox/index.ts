@@ -166,7 +166,16 @@ function inboundMessage(row: MessageInRow): NanoclawInboundMessage {
     sourceSessionId: row.source_session_id ?? null,
     onWake: row.on_wake === 1,
   });
-  return { ...record, scheduledFor: row.scheduled_for ?? null };
+  return {
+    ...record,
+    // Through sqliteTimestamp for the same reason `process_after` is: the
+    // host's one-time backfill copies `process_after` verbatim, so a row
+    // migrated on an install whose older writers used SQLite's naive
+    // `YYYY-MM-DD HH:MM:SS` shape carries that shape here. `new Date()` reads
+    // it as LOCAL time, which would shift the announced slot by the install's
+    // offset and, near midnight, onto the wrong day.
+    scheduledFor: row.scheduled_for == null ? null : sqliteTimestamp(row.scheduled_for),
+  };
 }
 
 function parseInboundMessage(row: MessageInRow): NanoclawInboundMessage | undefined {
