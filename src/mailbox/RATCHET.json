@@ -18,6 +18,7 @@
   "src/cli/resources/tasks.ts",
   "src/container-restart.ts",
   "src/container-runner.ts",
+  "src/dashboard/api/events.ts",
   "src/dashboard/api/scheduled-assembly.ts",
   "src/dashboard/api/scheduled-move.ts",
   "src/dashboard/api/scheduled-mutations.ts",
