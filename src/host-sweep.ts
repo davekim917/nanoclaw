@@ -2265,10 +2265,13 @@ async function sweepUsageRollup(sessions: readonly Session[]): Promise<void> {
       // rollup. `rollupSessionUsage` (mailbox seam PR 6) asks for only the
       // one op it uses, `readSessionOutbound`'s read-only wrapper supplies
       // it, and neither one provisions or writes.
-      const rolledUp = readSessionOutbound({ agentGroupId: session.agent_group_id, sessionId: session.id }, (mailbox) => {
-        rollupSessionUsage(mailbox, session.agent_group_id, `${session.agent_group_id}/${session.id}`);
-        return true;
-      });
+      const rolledUp = readSessionOutbound(
+        { agentGroupId: session.agent_group_id, sessionId: session.id },
+        (mailbox) => {
+          rollupSessionUsage(mailbox, session.agent_group_id, `${session.agent_group_id}/${session.id}`);
+          return true;
+        },
+      );
       // Only a rollup that RAN may claim this mtime as processed. A session
       // whose inbound.db is gone while outbound.db remains resolves undefined
       // here, and marking it done would skip it on every later sweep for as
