@@ -14,8 +14,8 @@
  *   - No cron-parser dep. Hourly is hard-coded; a later refactor can
  *     generalize if we need sub-hour or TZ-aware schedules.
  *
- * The notification is fire-and-forget via a callback injected at
- * startup so this module doesn't pull in delivery.ts directly.
+ * The notification is fire-and-forget via a callback the module builds for
+ * itself at registration (below), closing over the delivery adapter.
  */
 import { execFile } from 'child_process';
 import fs from 'fs';
@@ -25,7 +25,9 @@ import { promisify } from 'util';
 
 import { syncCodexLocalMarketplacePluginCache, syncCodexSubagents } from './codex-sync.js';
 import { refreshMaterializedCodexSkills } from './codex-skill-materialize.js';
+import { getDeliveryAdapter } from './delivery.js';
 import { vendorDesignArtifactLoop } from './design-artifact-loop-vendor.js';
+import { onHostShutdown, onHostStart } from './host-lifecycle.js';
 import { log } from './log.js';
 import { syncOpenCodeSubagents } from './opencode-sync.js';
 
@@ -290,9 +292,11 @@ export function startPluginUpdater(deps: PluginUpdaterDeps = {}): void {
     startupHandle = null;
     runOnce(deps).catch((err) => log.error('Plugin updater startup run failed', { err }));
   }, STARTUP_DELAY_MS);
+  startupHandle.unref?.();
   intervalHandle = setInterval(() => {
     runOnce(deps).catch((err) => log.error('Plugin updater periodic run failed', { err }));
   }, INTERVAL_MS);
+  intervalHandle.unref?.();
 }
 
 export function stopPluginUpdater(): void {
@@ -305,3 +309,34 @@ export function stopPluginUpdater(): void {
     intervalHandle = null;
   }
 }
+
+onHostStart(() => {
+  // UNGUARDED — a synchronous startup failure must abort boot (§4.2).
+  startPluginUpdater({
+    notify: async (platformId, text) => {
+      // Parse the jid format: <channel_type>:<platform_id>[:<thread_id>]
+      const parts = platformId.split(':');
+      if (parts.length < 2) {
+        log.warn('Plugin updater notify: malformed jid', { platformId });
+        return;
+      }
+      const channelType = parts[0];
+      const realPlatformId = parts.slice(1).join(':');
+      const adapter = getDeliveryAdapter();
+      if (!adapter) {
+        log.warn('Plugin updater notify: no delivery adapter yet', { platformId });
+        return;
+      }
+      await adapter.deliver(channelType, realPlatformId, null, 'chat', JSON.stringify({ text }));
+    },
+  });
+  log.info('Plugin updater started');
+});
+
+onHostShutdown(() => {
+  try {
+    stopPluginUpdater();
+  } catch (err) {
+    log.error('Plugin updater failed to stop', { err });
+  }
+});

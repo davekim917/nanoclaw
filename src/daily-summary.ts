@@ -43,6 +43,7 @@ import { getMessagingGroup } from './db/messaging-groups.js';
 import { getDeliveryAdapter } from './delivery.js';
 import type { ChannelDeliveryAdapter } from './delivery.js';
 import { resolveGitHubToken } from './github-token.js';
+import { onHostShutdown, onHostStart } from './host-lifecycle.js';
 import { log } from './log.js';
 import type { AgentGroup, MessagingGroup } from './types.js';
 
@@ -65,7 +66,9 @@ export function startDailySummary(): void {
   timer = setTimeout(function tick() {
     runTick().catch((err) => log.error('Daily summary tick failed', { err }));
     timer = setTimeout(tick, TICK_INTERVAL_MS);
+    timer.unref?.();
   }, STARTUP_DELAY_MS);
+  timer.unref?.();
 }
 
 export function stopDailySummary(): void {
@@ -74,6 +77,24 @@ export function stopDailySummary(): void {
     timer = null;
   }
 }
+
+// Set DAILY_SUMMARY_ENABLED=0 to disable. A disabled duty still registers and
+// no-ops, so the registration count is stable across configurations.
+onHostStart(() => {
+  if (process.env.DAILY_SUMMARY_ENABLED !== '0') {
+    // UNGUARDED — a synchronous startup failure must abort boot (§4.2).
+    startDailySummary();
+    log.info('Daily summary started');
+  }
+});
+
+onHostShutdown(() => {
+  try {
+    stopDailySummary();
+  } catch (err) {
+    log.error('Daily summary failed to stop', { err });
+  }
+});
 
 /** Exposed for tests — runs one tick synchronously and returns. */
 export async function _tickForTest(): Promise<void> {

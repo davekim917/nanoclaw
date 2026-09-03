@@ -55,6 +55,7 @@ import { getMessagingGroup } from './db/messaging-groups.js';
 import { readEnvFileMatching } from './env.js';
 import { extractSlackChannelId, parseSlackWorkspaces } from './channels/slack.js';
 import { slackPermalink } from './channels/slack-mentions.js';
+import { onHostShutdown, onHostStart } from './host-lifecycle.js';
 import { log } from './log.js';
 import { formatLocalTime } from './timezone.js';
 
@@ -193,7 +194,9 @@ export function startBacklogCanvas(): void {
   timer = setTimeout(function tick() {
     runTick().catch((err) => log.error('Backlog canvas tick failed', { err }));
     timer = setTimeout(tick, TICK_INTERVAL_MS);
+    timer.unref?.();
   }, STARTUP_DELAY_MS);
+  timer.unref?.();
 }
 
 export function stopBacklogCanvas(): void {
@@ -202,6 +205,26 @@ export function stopBacklogCanvas(): void {
     timer = null;
   }
 }
+
+// Opt-in per workgroup via container.json's backlogCanvas; no declaration
+// anywhere means this loops over nothing. Set BACKLOG_CANVAS_ENABLED=0 to
+// disable outright. A disabled duty still registers and no-ops, so the
+// registration count is stable across configurations.
+onHostStart(() => {
+  if (process.env.BACKLOG_CANVAS_ENABLED !== '0') {
+    // UNGUARDED — a synchronous startup failure must abort boot (§4.2).
+    startBacklogCanvas();
+    log.info('Backlog canvas started');
+  }
+});
+
+onHostShutdown(() => {
+  try {
+    stopBacklogCanvas();
+  } catch (err) {
+    log.error('Backlog canvas failed to stop', { err });
+  }
+});
 
 /** Exposed for tests and for `scripts/refresh-backlog-canvas.ts`. */
 export async function runTick(): Promise<void> {

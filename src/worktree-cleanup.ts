@@ -18,6 +18,7 @@ import { runningContainerMounts } from './container-mounts.js';
 import { isContainerRunning, isContainerSpawning } from './container-runner.js';
 import { getDb } from './db/connection.js';
 import { getContainerState, getProcessingClaims } from './db/session-db.js';
+import { onHostShutdown, onHostStart } from './host-lifecycle.js';
 import { log } from './log.js';
 import {
   canonicalRepoDir,
@@ -1866,9 +1867,11 @@ export function startWorktreeCleanup(): void {
     startupHandle = null;
     void runWorktreeCleanupOnce().catch((err) => log.error('Worktree cleanup: startup run failed', { err }));
   }, STARTUP_DELAY_MS);
+  startupHandle.unref?.();
   intervalHandle = setInterval(() => {
     void runWorktreeCleanupOnce().catch((err) => log.error('Worktree cleanup: periodic run failed', { err }));
   }, CLEANUP_INTERVAL_MS);
+  intervalHandle.unref?.();
 }
 
 export function stopWorktreeCleanup(): void {
@@ -1877,3 +1880,17 @@ export function stopWorktreeCleanup(): void {
   startupHandle = null;
   intervalHandle = null;
 }
+
+onHostStart(() => {
+  // UNGUARDED — a synchronous startup failure must abort boot (§4.2).
+  startWorktreeCleanup();
+  log.info('Worktree cleanup started');
+});
+
+onHostShutdown(() => {
+  try {
+    stopWorktreeCleanup();
+  } catch (err) {
+    log.error('Worktree cleanup failed to stop', { err });
+  }
+});
