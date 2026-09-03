@@ -612,20 +612,14 @@ async function seriesRoutingStamp(
   sessionId: string,
   seriesId: string,
 ): Promise<{ messagingGroupId: string; deliverThreadId: string | null } | null> {
-  const { inboundDbPath, withInboundDb } = await import('../../session-manager.js');
-  if (!fs.existsSync(inboundDbPath(agentGroupId, sessionId))) return null;
-
-  const stamp = withInboundDb(agentGroupId, sessionId, (inbound) =>
-    inbound
-      .prepare(
-        `SELECT platform_id AS platformId, channel_type AS channelType, thread_id AS threadId
-           FROM messages_in
-          WHERE kind = 'task' AND series_id = ? AND platform_id IS NOT NULL
-          ORDER BY seq DESC
-          LIMIT 1`,
-      )
-      .get(seriesId),
-  ) as { platformId: string; channelType: string; threadId: string | null } | undefined;
+  // Read-only seam: a self-heal probe must never provision or migrate the task
+  // session it is asking about (invariant I-4). `undefined` is "no mailbox",
+  // which reads the same as "no routing stamp" here — both leave the claim
+  // unrouted rather than guessing a destination.
+  const { readSessionInbound } = await import('../mailbox/index.js');
+  const stamp = readSessionInbound({ agentGroupId, sessionId }, (mailbox) =>
+    mailbox.getLatestTaskRoutingStamp(seriesId),
+  );
   if (!stamp) return null; // `--isolated`: stamped no routing on purpose
 
   const mg = db

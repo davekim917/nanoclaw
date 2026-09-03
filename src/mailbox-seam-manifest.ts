@@ -40,8 +40,7 @@ export const UPSTREAM_FILES: readonly string[] = [
   'src/mailbox/index.ts',
   'src/mailbox/model.test.ts',
   'src/mailbox/model.ts',
-  // 'src/mailbox/registry.test.ts' — deferred: asserts the end state (no
-  // session-db.ts, entrypoint imports the barrel); ported in PR 7 (host) / R3 (runner).
+  // 'src/mailbox/registry.test.ts' — UNPORTABLE, see UNPORTABLE_UPSTREAM_FILES.
   'src/mailbox/sqlite/arm-next-task.test.ts',
   'src/mailbox/sqlite/index.ts',
   'src/mailbox/sqlite/paths.ts',
@@ -70,12 +69,39 @@ export const UPSTREAM_FILES: readonly string[] = [
 
 /**
  * Deferred ported-file paths: not in UPSTREAM_FILES yet (they assert the end
- * state of the migration), but must land no later than the raw-access ratchet
- * (RATCHET.json) reaching empty — see the assertion in src/mailbox-seam-ratchet.test.ts.
+ * state of the migration), but must land no later than their half of the
+ * raw-access ratchet (RATCHET.json) being done — asserted in
+ * src/mailbox-seam-ratchet.test.ts.
  */
 export const DEFERRED_UPSTREAM_FILES: readonly string[] = [
-  'src/mailbox/registry.test.ts',
   'container/agent-runner/src/mailbox/registry.test.ts',
+] as const;
+
+/**
+ * Upstream files this fork CANNOT carry byte-for-byte, with the fork-owned
+ * test that covers the same invariants instead.
+ *
+ * This is not a deferral and never becomes one: adding such a file to
+ * UPSTREAM_FILES would put a permanently red test in CI. The ratchet test
+ * asserts both halves of that — the replacement exists, and the upstream path
+ * stays out of UPSTREAM_FILES.
+ */
+export const UNPORTABLE_UPSTREAM_FILES: ReadonlyArray<{
+  upstream: string;
+  forkTest: string;
+  reason: string;
+}> = [
+  {
+    upstream: 'src/mailbox/registry.test.ts',
+    forkTest: 'src/modules/mailbox/registry.test.ts',
+    reason:
+      "Four assertions describe upstream's tree, not the migration's end state. It reads " +
+      'src/modules/scheduling/task-content.ts and src/modules/cross-session-context/prune.ts, neither of ' +
+      'which exists in this fork. It forbids better-sqlite3 and .prepare( in session-manager.ts and ' +
+      'host-sweep.ts, where the fork legitimately holds CENTRAL-DB access the seam never claimed. And it ' +
+      'expects src/index.ts to import the modules barrel, where the fork keeps a three-line deploy ' +
+      'crash-guard shim and the barrel import is one file further in (main.ts).',
+  },
 ] as const;
 
 export interface MailboxSeamManifest {

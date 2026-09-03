@@ -18,7 +18,8 @@ vi.mock('../../config.js', async (importOriginal) => ({
 }));
 
 import { initTestDb, closeDb, getDb } from '../../db/connection.js';
-import { ensureSchema, openInboundDb } from '../../db/session-db.js';
+import { openInboundDb } from '../../modules/mailbox/openers.js';
+import { ensureSchema } from '../../modules/mailbox/schema.js';
 import { taskThreadId } from '../../db/sessions.js';
 import { migration043 } from '../../db/migrations/043-scheduled-audit.js';
 import { encodeKey, invalidateScheduledCache, _resetScheduledRateLimitForTesting } from './scheduled-shared.js';

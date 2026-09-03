@@ -24,8 +24,9 @@ const TEST_DIR = '/tmp/nanoclaw-test-cli-tasks';
 import { initTestDb, closeDb, runMigrations, createAgentGroup, getDb } from '../../db/index.js';
 import { createMessagingGroup } from '../../db/messaging-groups.js';
 import { createSession, findSessionByAgentGroup, getSessionsByAgentGroup, taskThreadId } from '../../db/sessions.js';
-import { countDueMessages } from '../../db/session-db.js';
-import { inboundDbPath, initSessionFolder } from '../../session-manager.js';
+import { countDueMessages } from '../../modules/mailbox/ops/sweep.js';
+import { initSessionFolder } from '../../session-manager.js';
+import { inboundDbPath } from '../../mailbox/sqlite/paths.js';
 import { dispatch } from '../dispatch.js';
 import { formatTasksTable } from '../format-tasks.js';
 import type { CallerContext } from '../frame.js';
@@ -87,11 +88,16 @@ function agentCtx(group = 'ag-1', session = 'chat-1'): CallerContext {
   return { caller: 'agent', agentGroupId: group, sessionId: session, messagingGroupId: 'mg-1' };
 }
 
-async function admitDueTaskContexts(db: Database.Database, agentGroupId: string, sessionId: string): Promise<number> {
-  const module = (await import('../../session-manager.js')) as typeof import('../../session-manager.js') & {
-    admitDueTaskContexts: (db: Database.Database, agentGroupId: string, sessionId: string) => number;
-  };
-  return module.admitDueTaskContexts(db, agentGroupId, sessionId);
+// Admission takes a mailbox SESSION now (mailbox seam PR 7). The fixtures keep
+// their own handle on the same file for assertions; session DBs are
+// journal_mode=DELETE, so the committed rows are visible on it afterwards.
+async function admitDueTaskContexts(agentGroupId: string, sessionId: string): Promise<number> {
+  const module = await import('../../session-manager.js');
+  return (
+    (await module.withExistingMailboxSession(agentGroupId, sessionId, (mailbox) =>
+      module.admitDueTaskContexts(mailbox, agentGroupId, sessionId),
+    )) ?? 0
+  );
 }
 
 describe('tasks CLI resource', () => {
@@ -594,7 +600,7 @@ describe('tasks CLI resource', () => {
     fs.writeFileSync(`${memoryRoot}/index.md`, '# Current canon\nrun-now memory written after scheduling');
     fs.writeFileSync(`${memoryRoot}/system/definition.md`, '# Definition\nfresh context at admission');
 
-    expect(await admitDueTaskContexts(db, 'ag-1', session_id)).toBe(1);
+    expect(await admitDueTaskContexts('ag-1', session_id)).toBe(1);
     const pair = db
       .prepare('SELECT id, seq, kind, trigger, content FROM messages_in WHERE id IN (?, ?) ORDER BY seq')
       .all(`recall-${fired.row_id}`, fired.row_id) as Array<{
@@ -617,7 +623,7 @@ describe('tasks CLI resource', () => {
       expect.arrayContaining([expect.objectContaining({ name: 'Exa' })]),
     );
     expect(JSON.stringify(recall.memoryEvidence)).toContain('run-now memory written after scheduling');
-    expect(await admitDueTaskContexts(db, 'ag-1', session_id)).toBe(0);
+    expect(await admitDueTaskContexts('ag-1', session_id)).toBe(0);
     expect(
       (
         db
@@ -700,7 +706,10 @@ describe('tasks CLI resource', () => {
     const row = (list.data as Array<Record<string, unknown>>).find((t) => t.series_id === series_id);
     expect(row).toBeDefined();
     expect(row?.runs).toBe(3);
-    expect(row?.last_run).toBe('2026-01-15T09:04:00Z'); // max completed process_after
+    // max completed process_after, normalized to canonical ISO by upstream's
+    // getTaskStats — the fixture wrote a second-precision stamp; every stamp
+    // the host actually writes is already `.000Z`-shaped.
+    expect(row?.last_run).toBe('2026-01-15T09:04:00.000Z');
     expect(String(row?.next_run)).toMatch(/^2026-01-15T09:05:00/); // the live pending occurrence
     expect(row?.schedule).toBe('0 9 * * *');
     expect(row?.log).toBe(`tasks/${series_id}.md`);
@@ -721,7 +730,7 @@ describe('tasks CLI resource', () => {
 
       const dueDb = new Database(inboundDbPath('ag-1', systemId));
       expect(countDueMessages(dueDb)).toBe(0);
-      expect(await admitDueTaskContexts(dueDb, 'ag-1', systemId)).toBe(1);
+      expect(await admitDueTaskContexts('ag-1', systemId)).toBe(1);
       expect(countDueMessages(dueDb)).toBe(1); // host sweep would wake this session
       dueDb.close();
 

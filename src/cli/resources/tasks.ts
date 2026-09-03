@@ -1,6 +1,5 @@
 import fs from 'fs';
 
-import type Database from 'better-sqlite3';
 import { CronExpressionParser } from 'cron-parser';
 
 import { GROUPS_DIR, TIMEZONE } from '../../config.js';
@@ -15,16 +14,8 @@ import {
   TASKS_SYSTEM_THREAD_ID,
   touchSessionActivity,
 } from '../../db/sessions.js';
-import {
-  cancelAllTasks,
-  cancelTask,
-  deleteTask,
-  insertTaskRow,
-  pauseTask,
-  resumeTask,
-  updateTask,
-  type TaskUpdate,
-} from '../../modules/scheduling/db.js';
+import { type TaskUpdate } from '../../modules/scheduling/db.js';
+import type { CliTaskRow, NanoclawMailboxSession } from '../../modules/mailbox/index.js';
 import {
   enforceRecurrenceLimit,
   makeTaskId,
@@ -34,7 +25,7 @@ import {
 } from '../../modules/scheduling/create.js';
 import { resolveTaskFlagIntent } from '../../modules/scheduling/task-flags.js';
 import { writeAudit } from '../../dashboard/api/scheduled-shared.js';
-import { inboundDbPath, resolveTaskSession, withInboundDb } from '../../session-manager.js';
+import { resolveTaskSession, withExistingMailboxSession } from '../../session-manager.js';
 import { formatLocalStamp, parseZonedToUtc } from '../../timezone.js';
 import { registerResource } from '../crud.js';
 import { appendRunLog } from '../../modules/scheduling/run-log.js';
@@ -43,20 +34,8 @@ import type { CallerContext } from '../frame.js';
 
 type TaskStatus = 'pending' | 'paused';
 
-interface TaskRow {
-  row_id: string;
-  series_id: string | null;
-  status: string;
-  process_after: string | null;
-  recurrence: string | null;
-  content: string;
-  timestamp: string;
-  tries: number;
-  seq: number;
-  platform_id: string | null;
-  channel_type: string | null;
-  thread_id: string | null;
-}
+/** The board row shape is the mailbox module's — this file no longer selects it. */
+type TaskRow = CliTaskRow;
 
 /** Routing a task series posts to on fire; all-null means unaddressed output is discarded. */
 interface TaskRouting {
@@ -147,9 +126,16 @@ function selectedSessions(args: Record<string, unknown>, ctx: CallerContext): Sc
   return getActiveSessions().map((s) => ({ id: s.id, agent_group_id: s.agent_group_id }));
 }
 
-function withInbound<T>(session: ScopedSession, fn: (db: Database.Database) => T): T | undefined {
-  if (!fs.existsSync(inboundDbPath(session.agent_group_id, session.id))) return undefined;
-  return withInboundDb(session.agent_group_id, session.id, fn);
+/**
+ * Run one CLI operation against a task session's mailbox.
+ *
+ * Existing-only (invariant I-10): `ncl tasks` fans out across every session
+ * the caller can see, and listing or mutating one must never be what creates
+ * a mailbox. `undefined` is "this session has none", which every call site
+ * below already treats as "nothing here".
+ */
+function withInbound<T>(session: ScopedSession, fn: (mailbox: NanoclawMailboxSession) => T): Promise<T | undefined> {
+  return withExistingMailboxSession(session.agent_group_id, session.id, fn);
 }
 
 function parseContent(raw: string): {
@@ -197,35 +183,6 @@ function toOutput(session: ScopedSession, row: TaskRow) {
       ? { channel_type: row.channel_type, platform_id: row.platform_id, thread_id: row.thread_id }
       : null,
   };
-}
-
-function selectLiveTasks(db: Database.Database, status?: TaskStatus): TaskRow[] {
-  const statusSql = status ? 'status = ?' : "status IN ('pending', 'paused')";
-  return db
-    .prepare(
-      `SELECT id AS row_id, series_id, status, process_after, recurrence, content, timestamp, tries,
-              platform_id, channel_type, thread_id, MAX(seq) AS seq
-         FROM messages_in
-        WHERE kind = 'task'
-          AND ${statusSql}
-        GROUP BY series_id
-        ORDER BY datetime(process_after) ASC, seq ASC`,
-    )
-    .all(...(status ? [status] : [])) as TaskRow[];
-}
-
-function selectTask(db: Database.Database, id: string): TaskRow | undefined {
-  return db
-    .prepare(
-      `SELECT id AS row_id, series_id, status, process_after, recurrence, content, timestamp, tries, seq,
-              platform_id, channel_type, thread_id
-         FROM messages_in
-        WHERE kind = 'task'
-          AND (id = ? OR series_id = ?)
-        ORDER BY CASE WHEN status IN ('pending', 'paused') THEN 0 ELSE 1 END, seq DESC
-        LIMIT 1`,
-    )
-    .get(id, id) as TaskRow | undefined;
 }
 
 function taskId(args: Record<string, unknown>): string {
@@ -290,7 +247,7 @@ function resolveTaskRouting(
   return { routing: { platformId: mg.platform_id, channelType: mg.channel_type, threadId: threadIdArg ?? null } };
 }
 
-function createTask(args: Record<string, unknown>, ctx: CallerContext) {
+async function createTask(args: Record<string, unknown>, ctx: CallerContext) {
   const group = groupArg(args, ctx);
   if (!group) throw new Error('--group is required');
   const prompt = str(args.prompt);
@@ -327,8 +284,8 @@ function createTask(args: Record<string, unknown>, ctx: CallerContext) {
   // routed to (migration 056). NO_ROUTING passes null and stamps nothing.
   const { session } = resolveTaskSession(group, id, routing.platformId);
 
-  const created = withInbound(session, (db) => {
-    insertTaskRow(db, {
+  const created = await withInbound(session, (mailbox) => {
+    mailbox.insertTaskRow({
       id,
       seriesId: id,
       processAfter,
@@ -354,7 +311,7 @@ function createTask(args: Record<string, unknown>, ctx: CallerContext) {
         ...(chatLimitArg(args) !== undefined ? { chatLimit: chatLimitArg(args) } : {}),
       }),
     });
-    return selectTask(db, id);
+    return mailbox.getCliTaskRow(id);
   });
   if (!created) throw new Error('task system session inbound.db not found');
   touchSessionActivity(session.id);
@@ -411,19 +368,14 @@ function appendTaskLog(
  * `cancelled`, not `completed`, so they never inflate the run count.
  */
 function seriesStats(
-  db: Database.Database,
+  mailbox: NanoclawMailboxSession,
   seriesKey: string,
 ): { runs: number; last_run: string | null; failed_runs: number } {
-  return db
-    .prepare(
-      `SELECT
-         COUNT(*) FILTER (WHERE status = 'completed') AS runs,
-         MAX(process_after) FILTER (WHERE status = 'completed') AS last_run,
-         COUNT(*) FILTER (WHERE status = 'failed') AS failed_runs
-       FROM messages_in
-      WHERE kind = 'task' AND (id = ? OR series_id = ?)`,
-    )
-    .get(seriesKey, seriesKey) as { runs: number; last_run: string | null; failed_runs: number };
+  // Upstream's own op, not a fork copy of the same SELECT (invariant I-2). It
+  // normalizes `lastRun` through Date.parse, which is a no-op for the ISO
+  // timestamps this fork writes and repairs a naive legacy one.
+  const stats = mailbox.getTaskStats(seriesKey);
+  return { runs: stats.runs, last_run: stats.lastRun, failed_runs: stats.failedRuns };
 }
 
 /** Last ~10 lines of a series' run log (`tasks/<series>.md`), newest last. */
@@ -442,9 +394,9 @@ function tailRunLog(agentGroupId: string, seriesKey: string, lines = 10): string
  * pointer to the agent's own run log — so `tasks list` reads as a compact
  * run-history table.
  */
-function enrichListRow(db: Database.Database, base: ReturnType<typeof toOutput>) {
+function enrichListRow(mailbox: NanoclawMailboxSession, base: ReturnType<typeof toOutput>) {
   const seriesKey = base.series_id;
-  const stats = seriesStats(db, seriesKey);
+  const stats = seriesStats(mailbox, seriesKey);
   return {
     ...base,
     schedule: base.recurrence ?? 'once',
@@ -456,26 +408,26 @@ function enrichListRow(db: Database.Database, base: ReturnType<typeof toOutput>)
   };
 }
 
-function listTasks(args: Record<string, unknown>, ctx: CallerContext) {
+async function listTasks(args: Record<string, unknown>, ctx: CallerContext) {
   const status = statusFilter(args);
   const rows = [];
   for (const session of selectedSessions(args, ctx)) {
-    const sessionRows = withInbound(session, (db) =>
-      selectLiveTasks(db, status).map((row) => enrichListRow(db, toOutput(session, row))),
+    const sessionRows = await withInbound(session, (mailbox) =>
+      mailbox.listCliTaskSeries(status).map((row) => enrichListRow(mailbox, toOutput(session, row))),
     );
     if (sessionRows) rows.push(...sessionRows);
   }
   return rows;
 }
 
-function getTask(args: Record<string, unknown>, ctx: CallerContext) {
+async function getTask(args: Record<string, unknown>, ctx: CallerContext) {
   const id = taskId(args);
   for (const session of selectedSessions(args, ctx)) {
-    const found = withInbound(session, (db) => {
-      const row = selectTask(db, id);
+    const found = await withInbound(session, (mailbox) => {
+      const row = mailbox.getCliTaskRow(id);
       if (!row) return undefined;
       const seriesKey = row.series_id ?? row.row_id;
-      const stats = seriesStats(db, seriesKey);
+      const stats = seriesStats(mailbox, seriesKey);
       const content = parseContent(row.content);
       return {
         ...toOutput(session, row),
@@ -492,16 +444,16 @@ function getTask(args: Record<string, unknown>, ctx: CallerContext) {
   throw new Error(`task not found: ${id}`);
 }
 
-function mutateTask(
+async function mutateTask(
   args: Record<string, unknown>,
   ctx: CallerContext,
   action: 'pause' | 'resume' | 'delete' | 'cancel',
-  fn: (db: Database.Database, id: string) => number,
+  fn: (mailbox: NanoclawMailboxSession, id: string) => number,
 ) {
   const id = taskId(args);
   let touched = 0;
   for (const session of selectedSessions(args, ctx)) {
-    const n = withInbound(session, (db) => fn(db, id)) ?? 0;
+    const n = (await withInbound(session, (mailbox) => fn(mailbox, id))) ?? 0;
     // Quiet-cache/delivery-horizon invalidation — see touchSessionActivity.
     if (n > 0) {
       touchSessionActivity(session.id);
@@ -530,7 +482,7 @@ function chatLimitArg(args: Record<string, unknown>): number | undefined {
   return n;
 }
 
-function updateTaskCommand(args: Record<string, unknown>, ctx: CallerContext) {
+async function updateTaskCommand(args: Record<string, unknown>, ctx: CallerContext) {
   const id = taskId(args);
   const update: TaskUpdate = {};
   if (typeof args.prompt === 'string') update.prompt = args.prompt;
@@ -546,7 +498,7 @@ function updateTaskCommand(args: Record<string, unknown>, ctx: CallerContext) {
     let scriptAfter: string | null = script !== undefined ? script : null;
     if (script === undefined) {
       for (const session of selectedSessions(args, ctx)) {
-        const row = withInbound(session, (db) => selectTask(db, id));
+        const row = await withInbound(session, (mailbox) => mailbox.getCliTaskRow(id));
         if (row) {
           scriptAfter = parseContent(row.content).script;
           break;
@@ -593,8 +545,8 @@ function updateTaskCommand(args: Record<string, unknown>, ctx: CallerContext) {
 
   let touched = 0;
   for (const session of selectedSessions(args, ctx)) {
-    const result = withInbound(session, (db) => {
-      const before = selectTask(db, id);
+    const result = await withInbound(session, (mailbox) => {
+      const before = mailbox.getCliTaskRow(id);
       // Close the indirect path to host execution: an agent swapping the
       // script text on a series a host operator flagged scriptHost would get
       // its own script run on the host next fire. Unless the same call also
@@ -608,7 +560,7 @@ function updateTaskCommand(args: Record<string, unknown>, ctx: CallerContext) {
       ) {
         throw new Error('this series runs its script on the host — an operator must make script changes');
       }
-      const n = updateTask(db, id, update);
+      const n = mailbox.updateTask(id, update);
       return { before, n };
     });
     if (!result) continue;
@@ -636,16 +588,18 @@ function updateTaskCommand(args: Record<string, unknown>, ctx: CallerContext) {
   return { series_id: id, touched, fields };
 }
 
-function cancelTaskCommand(args: Record<string, unknown>, ctx: CallerContext) {
+async function cancelTaskCommand(args: Record<string, unknown>, ctx: CallerContext) {
   if (!bool(args.all)) {
-    return mutateTask(args, ctx, 'cancel', cancelTask);
+    return mutateTask(args, ctx, 'cancel', (mailbox, id) => mailbox.cancelTask(id));
   }
 
   let touched = 0;
   for (const session of selectedSessions(args, ctx)) {
-    const result = withInbound(session, (db) => {
-      const seriesIds = selectLiveTasks(db).map((r) => r.series_id ?? r.row_id);
-      return { seriesIds, n: cancelAllTasks(db) };
+    const result = await withInbound(session, (mailbox) => {
+      const seriesIds = mailbox.listCliTaskSeries().map((r) => r.series_id ?? r.row_id);
+      // Upstream's `cancelTask()` with no id IS cancel-all; there is one
+      // statement behind both names (invariant I-2).
+      return { seriesIds, n: mailbox.cancelTask() };
     });
     if (!result) continue;
     if (result.n > 0) {
@@ -673,11 +627,11 @@ function cancelTaskCommand(args: Record<string, unknown>, ctx: CallerContext) {
  * `update --process-after now`, it neither consumes a one-shot nor force-advances
  * a recurring series' armed occurrence, so it is safe for testing a task.
  */
-function runTaskCommand(args: Record<string, unknown>, ctx: CallerContext) {
+async function runTaskCommand(args: Record<string, unknown>, ctx: CallerContext) {
   const id = taskId(args);
   for (const session of selectedSessions(args, ctx)) {
-    const fired = withInbound(session, (db) => {
-      const row = selectTask(db, id);
+    const fired = await withInbound(session, (mailbox) => {
+      const row = mailbox.getCliTaskRow(id);
       if (!row) return undefined;
       const seriesKey = row.series_id ?? row.row_id;
       const rowId = makeTaskId(`${seriesKey}-run`);
@@ -685,7 +639,7 @@ function runTaskCommand(args: Record<string, unknown>, ctx: CallerContext) {
       // handleRecurrence into a phantom series. Routing carries forward from
       // the source row — an on-demand fire reports to the same destination
       // the series is wired to.
-      insertTaskRow(db, {
+      mailbox.insertTaskRow({
         id: rowId,
         seriesId: seriesKey,
         processAfter: new Date().toISOString(),
@@ -1028,7 +982,7 @@ registerResource({
         },
         { name: 'session', type: 'string', description: 'Limit to one task session id.' },
       ],
-      handler: async (args, ctx) => mutateTask(args, ctx, 'pause', pauseTask),
+      handler: async (args, ctx) => mutateTask(args, ctx, 'pause', (mailbox, id) => mailbox.pauseTask(id)),
     },
     resume: {
       access: 'open',
@@ -1042,7 +996,7 @@ registerResource({
         },
         { name: 'session', type: 'string', description: 'Limit to one task session id.' },
       ],
-      handler: async (args, ctx) => mutateTask(args, ctx, 'resume', resumeTask),
+      handler: async (args, ctx) => mutateTask(args, ctx, 'resume', (mailbox, id) => mailbox.resumeTask(id)),
     },
     delete: {
       access: 'open',
@@ -1056,7 +1010,7 @@ registerResource({
         },
         { name: 'session', type: 'string', description: 'Limit to one task session id.' },
       ],
-      handler: async (args, ctx) => mutateTask(args, ctx, 'delete', deleteTask),
+      handler: async (args, ctx) => mutateTask(args, ctx, 'delete', (mailbox, id) => mailbox.deleteTask(id)),
     },
   },
 });

@@ -9,7 +9,8 @@ vi.mock('./log.js', () => ({
 }));
 
 import { log } from './log.js';
-import { ensureSchema, openInboundDb } from './db/session-db.js';
+import { openInboundDb } from './modules/mailbox/openers.js';
+import { ensureSchema } from './modules/mailbox/schema.js';
 
 import {
   acquireStorageActivityLease,

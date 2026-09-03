@@ -443,9 +443,9 @@ export async function runHostGatedTaskScripts(mailbox: NanoclawMailboxSession, s
   // Read every candidate first, then run the scripts: the read is one
   // statement and the loop below can spend the full pre-task timeout per row.
   // The caller therefore holds its session across script execution — which is
-  // exactly what PR 5's reviewed state already did by passing
-  // `legacyInboundHandle()`, so this is not a regression. Closing the session
-  // before the scripts run is a host-sweep restructure, not this PR.
+  // exactly what the pre-seam state already did by passing the sweep's open
+  // inbound handle, so this is not a regression. Closing the session before
+  // the scripts run is a host-sweep restructure, not this PR.
   const due = mailbox.listDueTaskRows();
 
   for (const row of due) {

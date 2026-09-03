@@ -42,10 +42,20 @@ const TEST_DIR = '/tmp/nanoclaw-test-support-dispatch';
 import { initTestDb, closeDb, runMigrations, createAgentGroup, createMessagingGroup, getDb } from '../../db/index.js';
 import { getSession } from '../../db/sessions.js';
 import { getSupportThread } from '../../db/support-threads.js';
-import { openInboundDb, resolveSession, resolveTaskSession } from '../../session-manager.js';
+import { resolveSession, resolveTaskSession } from '../../session-manager.js';
+import { openInboundDb as openInboundDbAt } from '../../modules/mailbox/openers.js';
+import { inboundDbPath } from '../../mailbox/sqlite/paths.js';
 import { insertTaskRow } from '../scheduling/db.js';
 import { wakeContainer } from '../../container-runner.js';
 import { handleDispatchSupportIssue, handleUpdateSupportTicket } from './dispatch.js';
+
+// `session-manager`'s ids-addressed inbound opener went away with the mailbox
+// seam's raw wrappers (PR 7). Production code opens sessions through the seam;
+// this fixture still wants a plain handle on a named session's file, which is
+// the module's own path-addressed funnel plus the layout helper.
+function openInboundDb(agentGroupId: string, sessionId: string): Database.Database {
+  return openInboundDbAt(inboundDbPath(agentGroupId, sessionId));
+}
 
 function now(): string {
   return new Date().toISOString();

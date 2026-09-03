@@ -1,8 +1,5 @@
-import Database from 'better-sqlite3';
-import fs from 'fs';
-
 import { log } from '../../log.js';
-import { outboundDbPath } from '../../session-manager.js';
+import { readSessionOutbound } from '../mailbox/index.js';
 import type { Task } from './db/tasks.js';
 
 export type TaskActionDecision =
@@ -95,17 +92,18 @@ export function decideTaskAction(args: {
  * Content is deserialized as JSON to avoid substring false-positive matches (S20).
  */
 export function pendingTerminalSpawnOutboundSeenAt(agentGroupId: string, sessionId: string): string | null {
-  const dbPath = outboundDbPath(agentGroupId, sessionId);
-  if (!fs.existsSync(dbPath)) return null;
-
-  let db: Database.Database | null = null;
   try {
-    db = new Database(dbPath, { readonly: true });
-
-    const rows = db.prepare(`SELECT timestamp, content FROM messages_out WHERE kind = 'system'`).all() as Array<{
-      timestamp: string;
-      content: string;
-    }>;
+    // Read-only seam: the watchdog inspects a child it does not own, on the
+    // sweep's schedule, and must never provision or migrate it (invariant
+    // I-4). A session with no outbound.db has nothing to report.
+    //
+    // The pre-seam open set no busy_timeout at all, so a contended read raised
+    // SQLITE_BUSY immediately and this returned null — "no terminal spawn
+    // seen", which feeds the reap decision. The seam's 1s default is a
+    // deliberate, strictly-more-tolerant change: a busy child is exactly the
+    // one whose answer matters, and waiting a second for it beats guessing.
+    const rows = readSessionOutbound({ agentGroupId, sessionId }, (mailbox) => mailbox.listOutboundSystemMessages());
+    if (!rows) return null;
 
     let earliest: string | null = null;
     for (const row of rows) {
@@ -124,11 +122,5 @@ export function pendingTerminalSpawnOutboundSeenAt(agentGroupId: string, session
   } catch (err) {
     log.warn('pendingTerminalSpawnOutboundSeenAt: failed to read outbound.db', { agentGroupId, sessionId, err });
     return null;
-  } finally {
-    try {
-      db?.close();
-    } catch {
-      /* ignore close errors */
-    }
   }
 }
