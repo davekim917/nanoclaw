@@ -32,10 +32,10 @@ import { getMessagingGroupsByAgentGroup } from '../../src/db/messaging-groups.js
 import { runMigrations } from '../../src/db/migrations/index.js';
 import { resolveSession, writeSessionRouting } from '../../src/session-manager.js';
 // The session-directory LAYOUT only. `session-manager`'s path wrappers went
-// away with the mailbox seam's raw surface; upstream's own helper is where the
-// layout lives. Deliberately not the seam itself: this runs under `tsx` from
-// migrate-v2.sh, before any host boot, so `mailbox/compose.js` has not
-// registered an implementation and `withMailboxSession` would throw.
+// away with the mailbox seam's raw surface (PR 7), so this reaches upstream's
+// own helper instead. Deliberately not the seam: this runs under `tsx` from
+// migrate-v2.sh, before any host boot, so `mailbox/compose.js` has registered
+// no implementation and `withMailboxSession` would throw.
 import { outboundDbPath } from '../../src/mailbox/sqlite/paths.js';
 
 const SKIP_NAMES = new Set(['.DS_Store']);
@@ -64,7 +64,7 @@ function copyTree(src: string, dst: string): number {
   return written;
 }
 
-function main(): void {
+async function main(): Promise<void> {
   const v1Path = process.argv[2];
   if (!v1Path) {
     console.error('Usage: tsx setup/migrate-v2/sessions.ts <v1-path>');
@@ -121,8 +121,13 @@ function main(): void {
       const { session, created } = resolveSession(ag.id, mg.id, null, 'shared');
 
       if (created) {
-        // Write routing so the container knows where to reply
-        writeSessionRouting(ag.id, session.id);
+        // Write routing so the container knows where to reply. AWAITED:
+        // `writeSessionRouting` returns a promise since it moved behind the
+        // mailbox seam, and an unawaited one lets `closeDb()` and the `OK:`
+        // line below run while the write is still suspended — reporting a
+        // successful migration for routing that never landed, and turning a
+        // failure into an unhandled rejection instead of aborting the step.
+        await writeSessionRouting(ag.id, session.id);
         sessionsCreated++;
       } else {
         sessionsReused++;
@@ -185,4 +190,7 @@ function main(): void {
   console.log(`OK:created=${sessionsCreated},reused=${sessionsReused},skipped=${sessionsSkipped},files=${filesCopied}`);
 }
 
-main();
+main().catch((err) => {
+  console.error(`FAIL:${err instanceof Error ? err.message : String(err)}`);
+  process.exit(1);
+});

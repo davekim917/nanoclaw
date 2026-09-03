@@ -82,8 +82,8 @@ import {
   assertQueryable,
   asMissingDbError,
   recoverHotJournal,
-  SessionDbMissingError,
   sessionDbPathIsGone,
+  withOpenedSessionDb,
 } from './openers.js';
 
 /**
@@ -220,24 +220,6 @@ function openRead(dbPath: string, options: SessionReadOptions): Database.Databas
 }
 
 /**
- * `openRead`, with a vanished file answered as absence rather than an error.
- *
- * The public contract is "`undefined` means ABSENT, and only absent". The
- * `sessionDbPathIsGone` pre-check answers that for every ordinary case, and
- * this closes the race where the file is removed between that check and the
- * open — which classifies as `SessionDbMissingError` and is still, honestly,
- * absence. A present-but-unopenable DB keeps throwing.
- */
-function openReadOrAbsent(dbPath: string, options: SessionReadOptions): Database.Database | undefined {
-  try {
-    return openRead(dbPath, options);
-  } catch (err) {
-    if (err instanceof SessionDbMissingError) return undefined;
-    throw err;
-  }
-}
-
-/**
  * Read a session's inbound.db, or `undefined` when it has no mailbox.
  *
  * `undefined` means ABSENT, and only absent — a present-but-unreadable file
@@ -252,32 +234,34 @@ export function readSessionInbound<T>(
 ): T | undefined {
   const dbPath = resolveReadPath(location, 'inbound');
   if (dbPath === null || sessionDbPathIsGone(dbPath)) return undefined;
-  const db = openReadOrAbsent(dbPath, options);
-  if (!db) return undefined;
-  try {
-    return action({
-      inboundHasMessage: (messageId) => inboundHasMessage(db, messageId),
-      listDuplicateLiveTaskSeriesIds: () => listDuplicateLiveTaskSeriesIds(db),
-      listLatestRecurringSeriesRows: () => listLatestRecurringSeriesRows(db),
-      listLiveOneOffTaskRows: () => listLiveOneOffTaskRows(db),
-      listLiveTaskRows: () => listLiveTaskRows(db),
-      listLiveTaskRowsForSeries: (seriesId) => listLiveTaskRowsForSeries(db, seriesId),
-      getLiveSeriesRow: (seriesId) => getLiveSeriesRow(db, seriesId),
-      getLatestSeriesRow: (seriesId) => getLatestSeriesRow(db, seriesId),
-      getLiveTaskRow: (seriesId) => getLiveTaskRow(db, seriesId),
-      getLatestTaskRow: (seriesId) => getLatestTaskRow(db, seriesId),
-      listRecentTaskFires: (seriesId, limit) => listRecentTaskFires(db, seriesId, limit),
-      latestInboundMessageId: () => latestInboundMessageId(db),
-      hasPendingRecurrence: () => hasPendingRecurrence(db),
-      hasTriggeredInboundRow: () => hasTriggeredInboundRow(db),
-      listInboundTail: (limit) => listInboundTail(db, limit),
-      countLiveSeriesRows: (seriesId) => countLiveSeriesRows(db, seriesId),
-      getLatestTaskRoutingStamp: (seriesId) => getLatestTaskRoutingStamp(db, seriesId),
-      getLatestTaskDeliveryRoute: () => getLatestTaskDeliveryRoute(db),
-    });
-  } finally {
-    db.close();
-  }
+  // Shared open/absent/close (openers.ts). The `sessionDbPathIsGone` check
+  // above answers the ordinary absent case; the helper also answers the race
+  // where the file is removed between that check and the open, which
+  // classifies as missing and is still, honestly, absence.
+  return withOpenedSessionDb(
+    () => openRead(dbPath, options),
+    (db) =>
+      action({
+        inboundHasMessage: (messageId) => inboundHasMessage(db, messageId),
+        listDuplicateLiveTaskSeriesIds: () => listDuplicateLiveTaskSeriesIds(db),
+        listLatestRecurringSeriesRows: () => listLatestRecurringSeriesRows(db),
+        listLiveOneOffTaskRows: () => listLiveOneOffTaskRows(db),
+        listLiveTaskRows: () => listLiveTaskRows(db),
+        listLiveTaskRowsForSeries: (seriesId) => listLiveTaskRowsForSeries(db, seriesId),
+        getLiveSeriesRow: (seriesId) => getLiveSeriesRow(db, seriesId),
+        getLatestSeriesRow: (seriesId) => getLatestSeriesRow(db, seriesId),
+        getLiveTaskRow: (seriesId) => getLiveTaskRow(db, seriesId),
+        getLatestTaskRow: (seriesId) => getLatestTaskRow(db, seriesId),
+        listRecentTaskFires: (seriesId, limit) => listRecentTaskFires(db, seriesId, limit),
+        latestInboundMessageId: () => latestInboundMessageId(db),
+        hasPendingRecurrence: () => hasPendingRecurrence(db),
+        hasTriggeredInboundRow: () => hasTriggeredInboundRow(db),
+        listInboundTail: (limit) => listInboundTail(db, limit),
+        countLiveSeriesRows: (seriesId) => countLiveSeriesRows(db, seriesId),
+        getLatestTaskRoutingStamp: (seriesId) => getLatestTaskRoutingStamp(db, seriesId),
+        getLatestTaskDeliveryRoute: () => getLatestTaskDeliveryRoute(db),
+      }),
+  );
 }
 
 /** Read a session's outbound.db, or `undefined` when it has no mailbox. */
@@ -288,20 +272,18 @@ export function readSessionOutbound<T>(
 ): T | undefined {
   const dbPath = resolveReadPath(location, 'outbound');
   if (dbPath === null || sessionDbPathIsGone(dbPath)) return undefined;
-  const db = openReadOrAbsent(dbPath, options);
-  if (!db) return undefined;
-  try {
-    return action({
-      getContainerState: () => getContainerState(db),
-      getProcessingClaimRows: () => getProcessingClaims(db),
-      listProcessingClaimedMessageIds: () => listProcessingClaimedMessageIds(db),
-      hasWorkContinuation: () => hasWorkContinuation(db),
-      latestReplyTimestampByTrigger: () => latestReplyTimestampByTrigger(db),
-      listOutboundSystemMessages: () => listOutboundSystemMessages(db),
-      listTurnUsageSince: (afterId) => listTurnUsageSince(db, afterId),
-      listOutboundTail: (limit) => listOutboundTail(db, limit),
-    });
-  } finally {
-    db.close();
-  }
+  return withOpenedSessionDb(
+    () => openRead(dbPath, options),
+    (db) =>
+      action({
+        getContainerState: () => getContainerState(db),
+        getProcessingClaimRows: () => getProcessingClaims(db),
+        listProcessingClaimedMessageIds: () => listProcessingClaimedMessageIds(db),
+        hasWorkContinuation: () => hasWorkContinuation(db),
+        latestReplyTimestampByTrigger: () => latestReplyTimestampByTrigger(db),
+        listOutboundSystemMessages: () => listOutboundSystemMessages(db),
+        listTurnUsageSince: (afterId) => listTurnUsageSince(db, afterId),
+        listOutboundTail: (limit) => listOutboundTail(db, limit),
+      }),
+  );
 }

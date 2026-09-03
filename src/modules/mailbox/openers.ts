@@ -224,6 +224,39 @@ export function openInboundDb(dbPath: string): Database.Database {
 }
 
 /**
+ * Open, run, close — with an ABSENT database answered as `undefined` rather
+ * than thrown, and every other failure left alone.
+ *
+ * The module has three existing-only funnels — the writable outbound session
+ * (`modules/mailbox/session.ts`) and the two read-only sessions
+ * (`read-only.ts`) — and each was repeating the same four moves: open, map
+ * `SessionDbMissingError` to absence, run the action, always close. One copy
+ * of that, here, next to the openers whose error contract it depends on.
+ *
+ * The `open` thunk is what varies: writable vs read-only, and which pragmas.
+ * The absence rule does not, and neither does the guarantee that a
+ * present-but-unopenable DB keeps throwing — a broken session must never read
+ * as an empty one.
+ */
+export function withOpenedSessionDb<T>(
+  open: () => Database.Database,
+  action: (db: Database.Database) => T,
+): T | undefined {
+  let db: Database.Database;
+  try {
+    db = open();
+  } catch (err) {
+    if (err instanceof SessionDbMissingError) return undefined;
+    throw err;
+  }
+  try {
+    return action(db);
+  } finally {
+    db.close();
+  }
+}
+
+/**
  * Roll back a hot journal before a READ-ONLY open.
  *
  * When a container is SIGKILLed mid-transaction (exit 137 / OOM kill), SQLite
