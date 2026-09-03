@@ -362,25 +362,33 @@ describe('migrateMessagesInTable', () => {
     fs.mkdirSync(TEST_DIR, { recursive: true });
 
     const db = new Database(DB_PATH);
+    // Every earlier column the migration would add is already present, so the
+    // scheduled_for backfill is the ONLY messages_in UPDATE the run reaches.
+    // Without that, the trigger below aborts the series_id backfill instead
+    // and the test passes for the wrong reason.
     db.exec(`
       CREATE TABLE messages_in (
-        id             TEXT PRIMARY KEY,
-        seq            INTEGER UNIQUE,
-        kind           TEXT NOT NULL,
-        timestamp      TEXT NOT NULL,
-        status         TEXT DEFAULT 'pending',
-        process_after  TEXT,
-        recurrence     TEXT,
-        tries          INTEGER DEFAULT 0,
-        platform_id    TEXT,
-        channel_type   TEXT,
-        thread_id      TEXT,
-        content        TEXT NOT NULL
+        id                TEXT PRIMARY KEY,
+        seq               INTEGER UNIQUE,
+        kind              TEXT NOT NULL,
+        timestamp         TEXT NOT NULL,
+        status            TEXT DEFAULT 'pending',
+        process_after     TEXT,
+        recurrence        TEXT,
+        series_id         TEXT,
+        tries             INTEGER DEFAULT 0,
+        trigger           INTEGER NOT NULL DEFAULT 1,
+        source_session_id TEXT,
+        on_wake           INTEGER NOT NULL DEFAULT 0,
+        platform_id       TEXT,
+        channel_type      TEXT,
+        thread_id         TEXT,
+        content           TEXT NOT NULL
       );
     `);
     db.prepare(
-      "INSERT INTO messages_in (id, seq, kind, timestamp, status, process_after, content) VALUES (?, ?, 'task', ?, 'pending', ?, '{}')",
-    ).run('legacy-atomic', 2, '2026-01-04T12:05:00.000Z', '2026-01-05T09:00:00.000Z');
+      "INSERT INTO messages_in (id, seq, kind, timestamp, status, process_after, series_id, content) VALUES (?, ?, 'task', ?, 'pending', ?, ?, '{}')",
+    ).run('legacy-atomic', 2, '2026-01-04T12:05:00.000Z', '2026-01-05T09:00:00.000Z', 'legacy-atomic');
 
     // Deterministic injection of "the backfill did not complete": a trigger
     // that aborts the UPDATE the migration is about to run.
