@@ -93,7 +93,7 @@ Follow `.claude/skills/add-slack/SKILL.md` to install a new app in the same work
 
 Required bot scopes (per add-slack skill step 6): `app_mentions:read`, `channels:history`, `channels:read`, `chat:write`, `groups:history`, `groups:read`, `im:history`, `im:read`, `im:write`, `mpim:history`, `mpim:read`, `reactions:read`, `users:read`.
 
-Required bot events (step 10): `message.channels`, `message.groups`, `message.im`, `app_mention`.
+Required bot events (step 10): `message.channels`, `message.groups`, `message.im`, `message.mpim`, `app_mention`.
 
 Set the Request URL to the same `https://<your-domain>/webhook/slack` as the existing source app — the host's webhook router dispatches by Slack app id, not by URL path.
 

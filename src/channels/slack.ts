@@ -33,12 +33,7 @@ import { log } from '../log.js';
 import { markdownHeadingsToBold } from '../text-styles.js';
 import { createChatSdkBridge } from './chat-sdk-bridge.js';
 import { conversationDisplayName } from './adapter.js';
-import type {
-  ChannelConversation,
-  ChannelDefaults,
-  ChannelRecoveryRequest,
-  ChannelRecoveryTarget,
-} from './adapter.js';
+import type { ChannelConversation, ChannelDefaults, ChannelRecoveryRequest, ChannelRecoveryTarget } from './adapter.js';
 import { registerChannelAdapter } from './channel-registry.js';
 import { extractSlackRawText } from './slack-raw-text.js';
 import { createSlackHopGovernor, type SlackHopGovernor } from './slack-hop-limit.js';
