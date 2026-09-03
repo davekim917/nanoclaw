@@ -15,43 +15,56 @@ import { withExistingMailboxSession } from '../../session-manager.js';
 import { getDestinations } from './db/agent-destinations.js';
 
 export async function writeDestinations(agentGroupId: string, sessionId: string): Promise<void> {
-  const rows = getDestinations(agentGroupId);
-  const resolved: DestinationRow[] = [];
+  // Resolved INSIDE the session, not before it. `getDestinations` and the
+  // `getMessagingGroup`/`getAgentGroup` lookups it feeds read the central DB;
+  // the funnel below yields between that read and `replaceDestinationRows`,
+  // and this projection is REPLACE-shaped — it overwrites the whole map. A set
+  // resolved before the yield can therefore reinstate a destination an admin
+  // revoked in the window, which is the one direction that matters here: the
+  // container resolves names against this table to decide where it may send.
+  // All three lookups are synchronous, so there is no yield left between the
+  // resolution and the write.
+  const resolve = (): DestinationRow[] => {
+    const rows = getDestinations(agentGroupId);
+    const resolved: DestinationRow[] = [];
 
-  for (const row of rows) {
-    if (row.target_type === 'channel') {
-      const mg = getMessagingGroup(row.target_id);
-      if (!mg) continue;
-      resolved.push({
-        name: row.local_name,
-        display_name: mg.name ?? row.local_name,
-        type: 'channel',
-        channel_type: mg.channel_type,
-        platform_id: mg.platform_id,
-        agent_group_id: null,
-      });
-    } else if (row.target_type === 'agent') {
-      const ag = getAgentGroup(row.target_id);
-      if (!ag) continue;
-      resolved.push({
-        name: row.local_name,
-        display_name: ag.name,
-        type: 'agent',
-        channel_type: null,
-        platform_id: null,
-        agent_group_id: ag.id,
-      });
+    for (const row of rows) {
+      if (row.target_type === 'channel') {
+        const mg = getMessagingGroup(row.target_id);
+        if (!mg) continue;
+        resolved.push({
+          name: row.local_name,
+          display_name: mg.name ?? row.local_name,
+          type: 'channel',
+          channel_type: mg.channel_type,
+          platform_id: mg.platform_id,
+          agent_group_id: null,
+        });
+      } else if (row.target_type === 'agent') {
+        const ag = getAgentGroup(row.target_id);
+        if (!ag) continue;
+        resolved.push({
+          name: row.local_name,
+          display_name: ag.name,
+          type: 'agent',
+          channel_type: null,
+          platform_id: null,
+          agent_group_id: ag.id,
+        });
+      }
     }
-  }
+    return resolved;
+  };
 
   // Existing-only: the projection is refreshed on every wake and after admin
   // edits, and a session with no mailbox has no container to resolve names
   // for. Provisioning here would recreate a reclaimed directory (I-10); the
   // old code expressed the same rule as an existsSync on inbound.db.
-  const written = await withExistingMailboxSession(agentGroupId, sessionId, (mailbox) => {
+  const count = await withExistingMailboxSession(agentGroupId, sessionId, (mailbox) => {
+    const resolved = resolve();
     mailbox.replaceDestinationRows(resolved);
-    return true;
+    return resolved.length;
   });
-  if (!written) return;
-  log.debug('Destination map written', { sessionId, count: resolved.length });
+  if (count === undefined) return;
+  log.debug('Destination map written', { sessionId, count });
 }

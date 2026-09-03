@@ -587,37 +587,58 @@ async function runMailboxSession<T>(
  * place, including after admin rewiring.
  */
 export async function writeSessionRouting(agentGroupId: string, sessionId: string): Promise<void> {
-  const session = getSession(sessionId);
-  if (!session) return;
+  // Resolved INSIDE the session. The route is read from the central DB and the
+  // funnel below yields before the upsert, so a session rewired or closed in
+  // that window would otherwise be stamped with the route it had on entry.
+  // Every lookup here is synchronous, so nothing yields between the resolution
+  // and the write.
+  const resolveRoute = ():
+    | { channelType: string | null; platformId: string | null; threadId: string | null }
+    | undefined => {
+    const session = getSession(sessionId);
+    if (!session) return undefined;
 
-  let channelType: string | null = null;
-  let platformId: string | null = null;
-  if (session.messaging_group_id) {
-    const mg = getMessagingGroup(session.messaging_group_id);
-    if (mg) {
-      channelType = mg.channel_type;
-      platformId = mg.platform_id;
+    let channelType: string | null = null;
+    let platformId: string | null = null;
+    if (session.messaging_group_id) {
+      const mg = getMessagingGroup(session.messaging_group_id);
+      if (mg) {
+        channelType = mg.channel_type;
+        platformId = mg.platform_id;
+      }
     }
-  }
 
-  assertChannelRoutingConsistency({ channelType, platformId });
+    assertChannelRoutingConsistency({ channelType, platformId });
+    return { channelType, platformId, threadId: session.thread_id };
+  };
+
+  // Cheap short-circuit: a session that is already gone needs no mailbox
+  // opened. The authoritative read is the one inside the callback.
+  if (!resolveRoute()) return;
 
   // Existing-only. Routing is refreshed on every wake, and a session whose
   // mailbox is gone has nothing to route to; provisioning one here would
   // resurrect a reclaimed directory (invariant I-10). The old code expressed
   // the same rule as an existsSync on inbound.db.
   const written = await withExistingMailboxSession(agentGroupId, sessionId, (mailbox) => {
+    const route = resolveRoute();
+    if (!route) return undefined;
     mailbox.upsertSessionRouting({
-      channel_type: channelType,
-      platform_id: platformId,
-      thread_id: session.thread_id,
+      channel_type: route.channelType,
+      platform_id: route.platformId,
+      thread_id: route.threadId,
       session_id: sessionId,
       // spawn_task_id intentionally omitted — preserved via COALESCE on conflict
     });
-    return true;
+    return route;
   });
   if (!written) return;
-  log.debug('Session routing written', { sessionId, channelType, platformId, threadId: session.thread_id });
+  log.debug('Session routing written', {
+    sessionId,
+    channelType: written.channelType,
+    platformId: written.platformId,
+    threadId: written.threadId,
+  });
 }
 
 /**

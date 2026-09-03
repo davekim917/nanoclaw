@@ -37,6 +37,32 @@ vi.mock('../modules/mailbox/session.js', async (importOriginal) => {
   };
 });
 
+// The same shape one step later in the close: the wrap-up fan-out awaits per
+// session, so a session named by the frozen set can close or move off the
+// thread while an earlier sibling's mailbox is open. Fires inside the funnel
+// for `whenOpening`, before that session's own write. Same seam as
+// `raceCloses` in src/db/scheduled-tasks.test.ts; inert unless armed.
+const raceDuringWrapUp = vi.hoisted(() => ({
+  whenOpening: null as string | null,
+  run: null as (() => void) | null,
+}));
+
+vi.mock('../session-manager.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../session-manager.js')>();
+  return {
+    ...actual,
+    withExistingMailboxSession: async (agentGroupId: string, sessionId: string, action: never) => {
+      if (raceDuringWrapUp.whenOpening === sessionId) {
+        raceDuringWrapUp.whenOpening = null;
+        const hook = raceDuringWrapUp.run;
+        raceDuringWrapUp.run = null;
+        hook?.();
+      }
+      return actual.withExistingMailboxSession(agentGroupId, sessionId, action);
+    },
+  };
+});
+
 vi.mock('../container-runner.js', () => ({
   isContainerRunning: () => false,
   containerOwnsOutbound: () => (containerOwns.queue.length > 0 ? containerOwns.queue.shift()! : containerOwns.value),
@@ -148,6 +174,8 @@ beforeEach(() => {
   containerOwns.value = false;
   containerOwns.queue = [];
   duringProposalRead.run = null;
+  raceDuringWrapUp.whenOpening = null;
+  raceDuringWrapUp.run = null;
   seed();
 });
 
@@ -405,6 +433,92 @@ describe('requestThreadClose', () => {
     expect(content.sender).toBe('system');
     expect(content._system.kind).toBe('thread_close_wrap_up');
     expect(content.text).toContain('propose_done');
+  });
+
+  /**
+   * Membership is re-asked per session, inside the funnel.
+   *
+   * The frozen set is sampled once and the fan-out awaits per session, so by
+   * the time a later sibling's mailbox opens, the snapshot can name a session
+   * that has since closed or moved off the thread. Writing to it anyway asks
+   * an agent to wrap up work for a thread it is no longer on — the
+   * "who told you that?" shape — and inflates the delivered count the operator
+   * is shown into a claim about a session that was never asked.
+   *
+   * Its own thread and sessions: this case materializes mailboxes and writes
+   * to them, and the scratch root is shared across the file's cases.
+   */
+  it('skips a session that leaves the thread while an earlier sibling is being written', async () => {
+    const THREAD_LEAVE = 'slack:C1:leave';
+    insertSession('s-stay', 'ag1', THREAD_LEAVE);
+    insertSession('s-leave', 'ag2', THREAD_LEAVE);
+    for (const [ag, id] of [
+      ['ag1', 's-stay'],
+      ['ag2', 's-leave'],
+    ] as const) {
+      fs.rmSync(path.dirname(dbPathFor(ag, id, 'inbound.db')), { recursive: true, force: true });
+      materializeSession(ag, id);
+    }
+
+    // s-leave closes while s-stay's mailbox is open — after the set was
+    // frozen, before s-leave's own write.
+    raceDuringWrapUp.whenOpening = 's-stay';
+    raceDuringWrapUp.run = () => {
+      getDb().prepare("UPDATE sessions SET status = 'closed' WHERE id = 's-leave'").run();
+    };
+
+    const res = await requestThreadClose(THREAD_LEAVE, { confirmations: 2 }, ctxFor('admin'));
+
+    expect(res.status).toBe(202);
+    // Both were frozen into the closure — that set is deliberately not
+    // re-narrowed — but only the one still on the thread was asked.
+    expect(new Set(res.body.session_ids as string[])).toEqual(new Set(['s-stay', 's-leave']));
+    // Without the in-funnel re-check this was 2.
+    expect(res.body.wrap_up_delivered).toBe(1);
+
+    const countRows = (ag: string, id: string): number => {
+      const db = new Database(dbPathFor(ag, id, 'inbound.db'), { readonly: true });
+      const row = db.prepare('SELECT COUNT(*) AS n FROM messages_in').get() as { n: number };
+      db.close();
+      return row.n;
+    };
+    // The recall marker plus the deferred trigger for the session still there…
+    expect(countRows('ag1', 's-stay')).toBe(2);
+    // …and nothing at all for the one that left.
+    expect(countRows('ag2', 's-leave')).toBe(0);
+  });
+
+  /**
+   * Due-ness travels with the row.
+   *
+   * The wrap-up is a deferred trigger row, and the sweep's quiet cache and the
+   * delivery sweep's activity horizon both key on `last_active`. Written into
+   * a quiet session without a bump, it sits unseen until the cache expires —
+   * the wake the row triggers would bump it, but not until the wake happens,
+   * and that insert-to-wake window is the gap. Asserted here as a stamp that
+   * moves forward synchronously with the insert, not as a wake that arrives.
+   */
+  it('bumps the session activity stamp with the wrap-up insert', async () => {
+    const THREAD_DUE = 'slack:C1:due';
+    insertSession('s-due', 'ag1', THREAD_DUE);
+    fs.rmSync(path.dirname(dbPathFor('ag1', 's-due', 'inbound.db')), { recursive: true, force: true });
+    materializeSession('ag1', 's-due');
+
+    const stampOf = (): string =>
+      (getDb().prepare('SELECT last_active FROM sessions WHERE id = ?').get('s-due') as { last_active: string })
+        .last_active;
+    const before = stampOf();
+
+    const res = await requestThreadClose(THREAD_DUE, { confirmations: 2 }, ctxFor('admin'));
+    expect(res.status).toBe(202);
+    expect(res.body.wrap_up_delivered).toBe(1);
+
+    // Strictly forward, and the row it accounts for really landed.
+    expect(stampOf() > before).toBe(true);
+    const db = new Database(dbPathFor('ag1', 's-due', 'inbound.db'), { readonly: true });
+    const n = (db.prepare('SELECT COUNT(*) AS n FROM messages_in').get() as { n: number }).n;
+    db.close();
+    expect(n).toBe(2);
   });
 
   it('the wrap-up asks for the confirmation and names the deadline', async () => {

@@ -20,6 +20,12 @@ vi.mock('../config.js', async (importOriginal) => ({
 // against the real session-manager.
 const raceCloses = vi.hoisted(() => ({ sessionId: null as string | null }));
 
+// The same interleave for AUTHORIZATION rather than session liveness: an admin
+// unwiring the agent from the destination's messaging group inside the funnel's
+// await, after `resolveAndValidateDestination` proved the wiring and before the
+// row is written. Inert unless a test arms it.
+const raceRevokes = vi.hoisted(() => ({ sessionId: null as string | null }));
+
 vi.mock('../session-manager.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../session-manager.js')>();
   return {
@@ -29,6 +35,11 @@ vi.mock('../session-manager.js', async (importOriginal) => {
         raceCloses.sessionId = null;
         const { getDb: centralDb } = await import('./connection.js');
         centralDb().prepare("UPDATE sessions SET status = 'closed' WHERE id = ?").run(sessionId);
+      }
+      if (raceRevokes.sessionId === sessionId) {
+        raceRevokes.sessionId = null;
+        const { getDb: centralDb } = await import('./connection.js');
+        centralDb().prepare('DELETE FROM messaging_group_agents WHERE agent_group_id = ?').run(agentGroupId);
       }
       return actual.withExistingMailboxSession(agentGroupId, sessionId, action);
     },
@@ -794,6 +805,45 @@ describe('test_scheduleTask_revalidates_the_session_after_the_await', () => {
     const rows = db.prepare("SELECT id FROM messages_in WHERE series_id = 's-race'").all() as Array<{ id: string }>;
     db.close();
     expect(rows.map((r) => r.id)).toEqual(['t-race-2']);
+  });
+
+  /**
+   * Authorization is a precondition read before the funnel's await, and the
+   * task row it guards is written after it. Revoke the wiring in that window
+   * and the pre-check's proof is stale: the row would persist a route to a
+   * chat the agent is no longer authorized for, and `delivery.ts` permits a
+   * non-origin send when `agent_destinations` has no entry — so the stale
+   * authorization becomes a real one at fire time.
+   *
+   * Reverting the in-session `resolveAndValidateDestination(def)` call fails
+   * this test: the task persists and nothing is thrown.
+   */
+  it('refuses to persist a task when the destination wiring is revoked during the open', async () => {
+    const processAfter = new Date(Date.now() + 86400000).toISOString();
+    const base = {
+      agentGroupId: AGENT_GROUP_ID,
+      cron: '0 5 * * *',
+      processAfter,
+      seriesId: 's-revoke',
+      destination: TEST_DESTINATION,
+    };
+    // First write proves the wiring is good and creates the series' session.
+    await scheduleTask({ ...base, id: 't-revoke-1', prompt: 'first' });
+    const sessionId = taskSessionIdFor('s-revoke');
+
+    // Arm the interleave: the wiring is deleted inside the next funnel open,
+    // after the pre-check has already passed.
+    raceRevokes.sessionId = sessionId;
+    await expect(scheduleTask({ ...base, id: 't-revoke-2', prompt: 'second' })).rejects.toThrow(
+      /is not wired to messaging group/,
+    );
+
+    // Same rejection shape as the pre-check, and NOTHING was written: the
+    // second task is absent, and the first one is untouched.
+    const db = openInboundDb(inboundPath(sessionId));
+    const rows = db.prepare("SELECT id FROM messages_in WHERE series_id = 's-revoke'").all() as Array<{ id: string }>;
+    db.close();
+    expect(rows.map((r) => r.id)).toEqual(['t-revoke-1']);
   });
 });
 

@@ -283,6 +283,19 @@ export async function scheduleTask(def: TaskDef): Promise<void> {
       // check-then-write adjacency the seam's await broke, at the seam rather
       // than at each call site.
       if (getSession(sessionId)?.status !== 'active') return 'session-closed';
+      // AUTHORIZATION, re-validated here too, for the same reason and in the
+      // same place: `resolveAndValidateDestination` ran before the funnel's
+      // await, and the wiring it proved can be revoked in that window — a
+      // `messaging_group_agents` row removed, or a cross-workgroup peer added.
+      // The task row persists the route, and `delivery.ts` permits a
+      // non-origin send when `agent_destinations` has no entry, so a stale
+      // authorization here becomes a real one at fire time.
+      //
+      // It throws on failure, exactly as the pre-check does, so the caller's
+      // contract is unchanged and nothing is written — the throw lands before
+      // `upsertTaskSeries`. Re-running it is a read-only IMMEDIATE transaction
+      // on the central DB; it has no side effects.
+      resolveAndValidateDestination(def);
       mailbox.upsertTaskSeries({
         id: def.id,
         seriesId: def.seriesId,

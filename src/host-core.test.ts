@@ -39,6 +39,44 @@ vi.mock('./container-runner.js', () => ({
   killContainer: vi.fn(),
 }));
 
+// Models the ONE interleave that matters for `writeSessionRouting`: the
+// session being rewired inside the mailbox funnel's await, between the route
+// being read and it being stamped into inbound.db.
+//
+// It arms one seam deeper than `raceCloses`/`raceRevokes` in
+// src/db/scheduled-tasks.test.ts, and for a mechanical reason:
+// `writeSessionRouting` lives INSIDE session-manager and calls its own
+// module-local `withExistingMailboxSession`, which an ESM mock of
+// session-manager cannot reach — a mock only replaces what OTHER modules
+// import. The funnel's single await is the mailbox store's `exists`, so that
+// is the yield this hooks. Inert unless a test arms it.
+const raceRewires = vi.hoisted(() => ({ sessionId: null as string | null, run: null as (() => void) | null }));
+
+vi.mock('./mailbox/index.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./mailbox/index.js')>();
+  return {
+    ...actual,
+    getAgentMailbox: () => {
+      const store = actual.getAgentMailbox();
+      return new Proxy(store, {
+        get(target, prop) {
+          const value = Reflect.get(target, prop, target);
+          if (prop !== 'exists') return typeof value === 'function' ? value.bind(target) : value;
+          return async (key: { agentGroupId: string; sessionId: string }) => {
+            if (raceRewires.sessionId === key.sessionId) {
+              raceRewires.sessionId = null;
+              const hook = raceRewires.run;
+              raceRewires.run = null;
+              hook?.();
+            }
+            return target.exists(key);
+          };
+        },
+      });
+    },
+  };
+});
+
 // Override DATA_DIR for tests
 vi.mock('./config.js', async () => {
   const actual = await vi.importActual('./config.js');
@@ -98,6 +136,8 @@ function readPairedInboundTriggers(db: Database.Database): TestInboundRow[] {
 }
 
 beforeEach(() => {
+  raceRewires.sessionId = null;
+  raceRewires.run = null;
   // Clean test directory
   if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
   fs.mkdirSync(TEST_DIR, { recursive: true });
@@ -1377,6 +1417,65 @@ describe('writeSessionRouting', () => {
 
     expect(row).toBeDefined();
     expect(row!.session_id).toBe(session.id);
+  });
+
+  /**
+   * The route stamped into inbound.db must be the route as of the WRITE.
+   *
+   * The route used to be resolved once, before the mailbox funnel, and the
+   * funnel yields. A session rewired in that window — an admin moving it to
+   * another chat — was stamped with the channel it had on entry, and the
+   * container then answers into a conversation it is no longer bound to. The
+   * fix resolves inside the callback, where nothing yields before the upsert.
+   */
+  it('stamps the route the session has at the write, not the one read on entry', async () => {
+    createAgentGroup({
+      id: 'ag-1',
+      name: 'Agent',
+      folder: 'agent',
+      agent_provider: null,
+      created_at: now(),
+    });
+    createMessagingGroup({
+      id: 'mg-before',
+      channel_type: 'telegram',
+      platform_id: 'tg:before',
+      name: 'Before',
+      is_group: 0,
+      unknown_sender_policy: 'public',
+      created_at: now(),
+    });
+    createMessagingGroup({
+      id: 'mg-after',
+      channel_type: 'discord',
+      platform_id: 'chan-after',
+      name: 'After',
+      is_group: 1,
+      unknown_sender_policy: 'public',
+      created_at: now(),
+    });
+
+    const { session } = resolveSession('ag-1', 'mg-before', null, 'shared');
+
+    // The rewire lands inside the funnel's await, after the route has been
+    // read once and before the row is written.
+    raceRewires.sessionId = session.id;
+    raceRewires.run = () => {
+      getDb().prepare('UPDATE sessions SET messaging_group_id = ? WHERE id = ?').run('mg-after', session.id);
+    };
+
+    await writeSessionRouting('ag-1', session.id);
+
+    const db = new Database(inboundDbPath('ag-1', session.id));
+    const row = db.prepare('SELECT channel_type, platform_id FROM session_routing WHERE id = 1').get() as
+      | { channel_type: string | null; platform_id: string | null }
+      | undefined;
+    db.close();
+
+    // Resolved before the funnel, this was telegram / tg:before.
+    expect(row).toBeDefined();
+    expect(row!.platform_id).toBe('chan-after');
+    expect(row!.channel_type).toBe('discord');
   });
 });
 

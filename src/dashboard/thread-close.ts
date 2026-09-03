@@ -55,7 +55,7 @@
  */
 import { containerOwnsOutbound, killContainer } from '../container-runner.js';
 import { getDb } from '../db/index.js';
-import { archiveSessionById } from '../db/sessions.js';
+import { archiveSessionById, touchSessionActivity } from '../db/sessions.js';
 import { guard } from '../guard/index.js';
 import { log } from '../log.js';
 import { CLOSE_REASON_MAX_CHARS, type DoneProposal } from '../modules/mailbox/index.js';
@@ -166,6 +166,23 @@ function sessionsOnThread(threadId: string): CloseSession[] {
     .all(threadId) as CloseSession[];
 }
 
+/**
+ * Is this ONE session still active and still on this thread? Same predicate as
+ * `sessionsOnThread`, keyed to a single id, so a caller holding a snapshot can
+ * re-ask the question it snapshotted without re-running the fan-out.
+ */
+function stillOnThread(sessionId: string, threadId: string): boolean {
+  return (
+    getDb()
+      .prepare(
+        `SELECT 1
+           FROM sessions
+          WHERE id = ? AND status = 'active' AND COALESCE(thread_id, 'session:' || id) = ?`,
+      )
+      .get(sessionId, threadId) !== undefined
+  );
+}
+
 /* ─── (a) The wrap-up request ──────────────────────────────────────────────── */
 
 /**
@@ -205,14 +222,22 @@ async function writeCloseWrapUp(
     // Existing-only: the wrap-up asks a live agent to land its work, and a
     // session with no mailbox has no agent to ask. Provisioning one here would
     // author an outbound.db the host must never create (invariant I-10).
-    const inserted = await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) =>
+    const inserted = await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) => {
+      // Membership and liveness, re-asked in-session. `freshVisible` was
+      // sampled once and the fan-out awaits per session, so by this iteration
+      // the snapshot can name a session that has since closed or moved off the
+      // thread. Asking an agent that is not on this thread to wrap up for it is
+      // the "who told you that?" shape this file exists to avoid, and a closed
+      // session has no one to ask. Synchronous, so nothing yields before the
+      // insert below.
+      if (!stillOnThread(session.id, threadId)) return false;
       // Same primitive and row shape as `writeCeilingRespawn`'s `writeSystemWake`
       // in host-sweep.ts — a deferred trigger row plus its inert recall marker,
       // admitted by the next sweep tick with fresh context. `onWake: 0` because
       // the container that is running RIGHT NOW is exactly who this is for; the
       // ceiling path's `1` exists to keep a DYING container from eating its own
       // accountability notice, which is not the situation here.
-      mailbox.insertDeferredMessageWithContextIfNew({
+      const wrote = mailbox.insertDeferredMessageWithContextIfNew({
         id: `${CLOSE_WAKE_ID_PREFIX}${session.id}-${requestedAt}`,
         kind: 'chat',
         timestamp: requestedAt,
@@ -228,8 +253,20 @@ async function writeCloseWrapUp(
         processAfter: null,
         recurrence: null,
         onWake: 0,
-      }),
-    );
+      });
+      // Due-ness. The wrap-up is a deferred trigger row, and both the sweep's
+      // quiet cache and the delivery sweep's activity horizon key on
+      // `last_active` — a row written into a quiet session without this bump
+      // sits unseen until the cache expires, or indefinitely past the 7-day
+      // horizon. The wake this row triggers would bump it, but not until the
+      // wake happens; the insert-to-wake window is exactly the gap. Same call
+      // every other deferred-write path makes (`modules/scheduling/create.ts`,
+      // `recurrence.ts`, `cli/resources/tasks.ts`), synchronous with the
+      // insert, and advisory — it swallows its own failure rather than
+      // aborting the write it rides on.
+      if (wrote) touchSessionActivity(session.id);
+      return wrote;
+    });
     return inserted ?? false;
   } catch (err) {
     log.warn('thread-close: could not write the wrap-up request', { sessionId: session.id, err });
