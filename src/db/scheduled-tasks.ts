@@ -22,11 +22,10 @@ import fs from 'fs';
 import path from 'path';
 
 import { DATA_DIR } from '../config.js';
-import { resolveTaskSession } from '../session-manager.js';
+import { getAgentMailbox } from '../mailbox/index.js';
+import { resolveTaskSession, withMailboxSession } from '../session-manager.js';
 import { createSession, findSessionByAgentGroupAndMessagingGroup } from './sessions.js';
 import { getDb } from './connection.js';
-import { ensureSchema, openInboundDb } from './session-db.js';
-import { nextEvenSeq } from './session-db.js';
 
 export interface TaskDef {
   id: string;
@@ -91,13 +90,23 @@ function generateSessionId(): string {
   return `sess-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
+/**
+ * Provision the mailbox for a freshly created channel-root session.
+ *
+ * `prepare()` is the single provisioning path — it creates whichever mailbox
+ * files are absent with upstream's baseline plus the fork's schema. The
+ * directory is still mkdir'd here first because `dataDir` may name a scratch
+ * root in tests and the mailbox derives its own paths from DATA_DIR; the two
+ * agree everywhere this is called (the only non-default caller passes a
+ * dataDir equal to the configured DATA_DIR).
+ *
+ * Deliberately NOT `initSessionFolder`: that also creates the `outbox/`
+ * directory, and a stub session that has never run a container has no outbox
+ * to hold. Keeping the shapes distinct preserves the existing on-disk result.
+ */
 function initStubSessionFolder(dataDir: string, agentGroupId: string, sessionId: string): void {
-  const dir = path.join(dataDir, 'v2-sessions', agentGroupId, sessionId);
-  fs.mkdirSync(dir, { recursive: true });
-  const inboundPath = path.join(dir, 'inbound.db');
-  ensureSchema(inboundPath, 'inbound');
-  const outboundPath = path.join(dir, 'outbound.db');
-  ensureSchema(outboundPath, 'outbound');
+  fs.mkdirSync(path.join(dataDir, 'v2-sessions', agentGroupId, sessionId), { recursive: true });
+  getAgentMailbox().prepare({ agentGroupId, sessionId });
 }
 
 /**
@@ -225,7 +234,6 @@ function resolveAndValidateDestination(def: TaskDef): { messagingGroupId: string
 }
 
 export async function scheduleTask(def: TaskDef, _dataDir?: string): Promise<void> {
-  const dataDir = _dataDir ?? DATA_DIR;
   resolveAndValidateDestination(def);
   // Stamp the session with the same destination the `messages_in` row below
   // carries. `resolveAndValidateDestination` has already proved it names a
@@ -233,75 +241,29 @@ export async function scheduleTask(def: TaskDef, _dataDir?: string): Promise<voi
   // agent isn't authorized for. A `scheduled-move` re-schedule lands here too
   // and re-stamps the series' new home (migration 056).
   const { session } = resolveTaskSession(def.agentGroupId, def.seriesId, def.destination.platformId);
-  const inboundDbPath = path.join(dataDir, 'v2-sessions', def.agentGroupId, session.id, 'inbound.db');
 
-  // Through the funnel, not a hand-rolled open: openInboundDb sets these same
-  // two pragmas AND plants the storage-activity marker that keeps a concurrent
-  // reclaim from unlinking this file between the open and the insert below.
-  const db = openInboundDb(inboundDbPath);
-  try {
-    const content = JSON.stringify({
-      prompt: def.prompt,
-      ...(def.script !== undefined ? { script: def.script } : {}),
-      ...(def.quietStatus ? { quietStatus: true } : {}),
-      ...(def.flagIntent ? { flagIntent: def.flagIntent } : {}),
+  const content = JSON.stringify({
+    prompt: def.prompt,
+    ...(def.script !== undefined ? { script: def.script } : {}),
+    ...(def.quietStatus ? { quietStatus: true } : {}),
+    ...(def.flagIntent ? { flagIntent: def.flagIntent } : {}),
+  });
+
+  // Provisioning is deliberate: `resolveTaskSession` may have just created the
+  // session row, and a task is a legitimate reason to create its mailbox. The
+  // seam also carries what the hand-rolled open used to: the same two pragmas
+  // AND the storage-activity marker that keeps a concurrent reclaim from
+  // unlinking the file between the open and the insert.
+  await withMailboxSession(def.agentGroupId, session.id, (mailbox) => {
+    mailbox.upsertTaskSeries({
+      id: def.id,
+      seriesId: def.seriesId,
+      processAfter: def.processAfter,
+      recurrence: def.cron,
+      content,
+      platformId: def.destination.platformId,
+      channelType: def.destination.channelType,
+      threadId: def.destination.threadId,
     });
-    const platformId = def.destination.platformId;
-    const channelType = def.destination.channelType;
-    const threadId = def.destination.threadId;
-
-    const persist = db.transaction(() => {
-      // Idempotency: active series (pending/paused) → UPDATE; terminal rows
-      // (completed/failed/cancelled) are treated as absent so a fresh row is
-      // inserted, enabling re-scheduling after cancellation.
-      const activeRow = db
-        .prepare("SELECT id FROM messages_in WHERE series_id = ? AND status IN ('pending', 'paused')")
-        .get(def.seriesId) as { id: string } | undefined;
-
-      if (activeRow) {
-        // A due row may already have been admitted as recall + trigger before
-        // an operator reschedules it. Remove that now-stale recall and move the
-        // task to a fresh inert seq atomically; the next due sweep will build
-        // current context immediately before making it wakeable again.
-        db.prepare("DELETE FROM messages_in WHERE id = ? AND kind = 'system'").run(`recall-${activeRow.id}`);
-        const seq = nextEvenSeq(db);
-        db.prepare(
-          `UPDATE messages_in
-              SET seq           = ?,
-                  process_after = ?,
-                  recurrence    = ?,
-                  content       = ?,
-                  platform_id   = ?,
-                  channel_type  = ?,
-                  thread_id     = ?,
-                  tries         = 0,
-                  trigger       = 0
-            WHERE id = ?`,
-        ).run(seq, def.processAfter, def.cron, content, platformId, channelType, threadId, activeRow.id);
-        return;
-      }
-
-      const seq = nextEvenSeq(db);
-      db.prepare(
-        `INSERT INTO messages_in
-           (id, seq, kind, timestamp, status, tries, process_after, recurrence, series_id, content,
-            platform_id, channel_type, thread_id, trigger)
-         VALUES (?, ?, 'task', ?, 'pending', 0, ?, ?, ?, ?, ?, ?, ?, 0)`,
-      ).run(
-        def.id,
-        seq,
-        new Date().toISOString(),
-        def.processAfter,
-        def.cron,
-        def.seriesId,
-        content,
-        platformId,
-        channelType,
-        threadId,
-      );
-    });
-    persist.immediate();
-  } finally {
-    db.close();
-  }
+  });
 }

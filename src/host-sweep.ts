@@ -993,7 +993,7 @@ async function sweepOnce(): Promise<void> {
   // in-flight rows, once per tick, after the per-session loop so container
   // state is current. Nothing here can START a close; only an operator can.
   try {
-    advanceThreadClosures();
+    await advanceThreadClosures();
   } catch (err) {
     log.warn('thread-close sweep step failed', { err });
   }
@@ -1220,15 +1220,16 @@ async function prepareDueWake(
   // on the host BEFORE admission, so a gated/errored fire never becomes due
   // and never spawns a container. See host-script.ts's runHostGatedTaskScripts.
   //
-  // Both helpers still take a raw handle and live in files this PR must not
-  // touch — both belong to PR 4, the ingress family (plan §5):
-  // `modules/scheduling/host-script.ts` and `session-manager.ts`. Handing them
-  // this session's own handle
-  // keeps the admission seam on ONE open — reopening inbound.db beside a live
-  // session would be worse, not cleaner. Both move behind the seam with their
-  // own PRs; `legacyInboundHandle` is what keeps host-sweep.ts on the
-  // raw-access allowlist until they do.
-  await runHostGatedTaskScripts(mailbox.legacyInboundHandle(), sessionId);
+  // `runHostGatedTaskScripts` takes this session (mailbox seam PR 4): it is a
+  // sweep callee with no other production caller, and a SESSION parameter is
+  // the seam's sanctioned object — invariant I-9 forbids handing out raw
+  // handles, not sessions, so the callee stays off the ratchet's allowlist.
+  // It can spend the full pre-task timeout per row, so the session is held
+  // across that work exactly as it was when this line passed a raw handle.
+  // `admitDueTaskContexts` still takes one: it lives in `session-manager.ts`
+  // and moves behind the seam in PR 7. `legacyInboundHandle` survives here for
+  // that one call and nothing else.
+  await runHostGatedTaskScripts(mailbox, sessionId);
   const admittedTasks = admitDueTaskContexts(mailbox.legacyInboundHandle(), agentGroupId, sessionId);
   const dueCount = mailbox.countDueMessages();
   return {
@@ -1586,17 +1587,18 @@ async function sweepSession(session: Session): Promise<number | null> {
       // Mirror the container's own `propose_done` record onto the central
       // `sessions` row so the Observatory list can show "proposes closing"
       // without opening a per-session SQLite file per row. Free here — the
-      // handle is already open and it is one SELECT — and deliberately NOT the
+      // session is already open and it is one SELECT — and deliberately NOT the
       // copy the close path trusts (see thread-close.ts). Isolated: a mirror
       // failure must never cost this session its sweep.
       //
-      // Still a raw-handle callee: `dashboard/thread-close.ts` moves behind the
-      // seam in PR 4, and this line becomes `syncDoneProposalMirror(session.id)`
-      // then. It only reads. Guarded on `hasOutbound` because a raw handle is
-      // the one thing the module cannot degrade for a never-woken session.
+      // `syncDoneProposalMirror` now takes the PARSED proposal (mailbox seam
+      // PR 4), so the read is the module's own op and no handle leaves the
+      // session. The `hasOutbound` guard is kept for what it costs: a
+      // never-woken session has no proposal to mirror and no outbound file to
+      // open looking for one.
       if (mailbox.hasOutbound()) {
         try {
-          syncDoneProposalMirror(session.id, mailbox.legacyOutboundHandle());
+          syncDoneProposalMirror(session.id, mailbox.readDoneProposal());
         } catch (err) {
           log.warn('done_proposal mirror failed', { sessionId: session.id, err });
         }
@@ -1769,10 +1771,12 @@ async function sweepSession(session: Session): Promise<number | null> {
 
     // 8. Recurrence fanout for completed recurring tasks.
     // MODULE-HOOK:scheduling-recurrence:start
-    // Still a raw-handle callee: `modules/scheduling/recurrence.ts` moves
-    // behind the seam in PR 4.
+    // Takes this session (mailbox seam PR 4). Same rule as
+    // `runHostGatedTaskScripts` above: a sweep callee with no other production
+    // caller receives the sweep's session, never a raw handle and never its
+    // own nested open on the same key.
     const { handleRecurrence } = await import('./modules/scheduling/recurrence.js');
-    await handleRecurrence(mailbox.legacyInboundHandle(), session);
+    await handleRecurrence(mailbox, session);
     // MODULE-HOOK:scheduling-recurrence:end
 
     // 9. GC spent task sessions. An isolated per-task session with no live task

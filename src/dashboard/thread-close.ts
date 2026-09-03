@@ -53,18 +53,14 @@
  * and are not coming back: `archiveSessionById` is reachable from here only as
  * step (e) of a completed close.
  */
-import fs from 'fs';
-
-import type Database from 'better-sqlite3';
-
 import { isContainerRunning, killContainer } from '../container-runner.js';
 import { getDb } from '../db/index.js';
-import { insertDeferredMessageWithContextIfNew } from '../db/session-db.js';
 import { archiveSessionById } from '../db/sessions.js';
 import { guard } from '../guard/index.js';
 import { log } from '../log.js';
+import { CLOSE_REASON_MAX_CHARS, type DoneProposal } from '../modules/mailbox/index.js';
 import { hasAdminPrivilege } from '../modules/permissions/db/user-roles.js';
-import { openInboundDb, openOutboundDb, openOutboundDbRw, outboundDbPath } from '../session-manager.js';
+import { withExistingMailboxSession } from '../session-manager.js';
 import { requiredConfirmations, threadsClose, type ThreadClosePayload } from './thread-close-guard.js';
 import type { AuthHandler, AuthedRequestContext } from './router.js';
 
@@ -85,56 +81,29 @@ const json = (status: number, body: unknown): Response =>
 export const CLOSE_CONFIRM_WINDOW_MS = 10 * 60 * 1000;
 
 /** Reason cap, mirroring the container's own `DONE_PROPOSAL_REASON_MAX_CHARS`. */
-export const CLOSE_REASON_MAX_CHARS = 500;
+export { CLOSE_REASON_MAX_CHARS, readDoneProposal, type DoneProposal } from '../modules/mailbox/index.js';
 
 const CLOSE_WAKE_ID_PREFIX = 'thread-close-';
 
 /* ─── The agent's proposal ─────────────────────────────────────────────────── */
 
 /** `session_state.done_proposal` as the container writes it. */
-export interface DoneProposal {
-  reason: string;
-  proposed_at: string;
-}
-
-/**
- * Parse a proposal off an open outbound.db handle.
- *
- * Validated the same way the container validates it on write: anything that
- * does not parse is treated as absent, never as a proposal. This function is
- * the ONLY way a proposal enters the host, and its only source is the row
- * `propose_done` writes — there is no host-side path that can mint one, which
- * is what keeps the one-confirmation close unreachable without an actual agent
- * saying it is finished.
- */
-export function readDoneProposal(outDb: Database.Database): DoneProposal | null {
-  try {
-    const row = outDb.prepare("SELECT value FROM session_state WHERE key = 'done_proposal'").get() as
-      | { value: string }
-      | undefined;
-    if (!row) return null;
-    const parsed = JSON.parse(row.value) as Partial<DoneProposal>;
-    if (typeof parsed.reason !== 'string' || parsed.reason.trim() === '') return null;
-    if (parsed.reason.length > CLOSE_REASON_MAX_CHARS) return null;
-    if (typeof parsed.proposed_at !== 'string' || Number.isNaN(Date.parse(parsed.proposed_at))) return null;
-    return { reason: parsed.reason.trim(), proposed_at: parsed.proposed_at };
-  } catch {
-    return null;
-  }
-}
-
 /**
  * Copy one session's proposal into `sessions.done_proposal`.
  *
- * Called from the sweep, off the outbound.db handle it already holds, so the
- * thread list can render the flag without opening a file per row (see
- * migration 055 for why the mirror exists at all). Writes only on change so a
- * quiet session costs one SELECT per tick and nothing else.
+ * Called from the sweep, which reads the proposal off the mailbox session it
+ * is already inside, so the thread list can render the flag without opening a
+ * file per row (see migration 055 for why the mirror exists at all). Writes
+ * only on change so a quiet session costs one central-DB SELECT per tick and
+ * nothing else.
  *
- * Returns the proposal it observed.
+ * Takes the proposal rather than a handle: the read is `readDoneProposal`, a
+ * mailbox op, and this half is pure central-DB bookkeeping (invariant I-9 —
+ * nothing outside the module receives a session handle).
+ *
+ * Returns the proposal it was given, so the sweep's call site stays one line.
  */
-export function syncDoneProposalMirror(sessionId: string, outDb: Database.Database): DoneProposal | null {
-  const proposal = readDoneProposal(outDb);
+export function syncDoneProposalMirror(sessionId: string, proposal: DoneProposal | null): DoneProposal | null {
   const encoded = proposal ? JSON.stringify(proposal) : null;
   try {
     const current = getDb().prepare('SELECT done_proposal FROM sessions WHERE id = ?').get(sessionId) as
@@ -149,17 +118,15 @@ export function syncDoneProposalMirror(sessionId: string, outDb: Database.Databa
 }
 
 /** Read a session's proposal from its own outbound.db — exact, never the mirror. */
-function readSessionProposal(agentGroupId: string, sessionId: string): DoneProposal | null {
-  let db: Database.Database | null = null;
+async function readSessionProposal(agentGroupId: string, sessionId: string): Promise<DoneProposal | null> {
   try {
-    db = openOutboundDb(agentGroupId, sessionId);
-    return readDoneProposal(db);
+    // Existing-only. No mailbox yet (a session whose container never started)
+    // is not a proposal, and a read must never author the outbound.db the host
+    // is not allowed to create.
+    return (await withExistingMailboxSession(agentGroupId, sessionId, (mailbox) => mailbox.readDoneProposal())) ?? null;
   } catch {
-    // No outbound.db yet (a session whose container never started) is not a
-    // proposal. Absent is honest.
+    // Absent is honest.
     return null;
-  } finally {
-    db?.close();
   }
 }
 
@@ -215,38 +182,45 @@ export function composeCloseWrapUp(opts: { who: string; reason: string | null; w
 }
 
 /** Write the wrap-up into one session's inbound queue. */
-function writeCloseWrapUp(session: CloseSession, threadId: string, text: string, requestedAt: string): boolean {
-  let inDb: Database.Database | null = null;
+async function writeCloseWrapUp(
+  session: CloseSession,
+  threadId: string,
+  text: string,
+  requestedAt: string,
+): Promise<boolean> {
   try {
-    inDb = openInboundDb(session.agent_group_id, session.id);
-    // Same primitive and row shape as `writeCeilingRespawn`'s `writeSystemWake`
-    // in host-sweep.ts — a deferred trigger row plus its inert recall marker,
-    // admitted by the next sweep tick with fresh context. `onWake: 0` because
-    // the container that is running RIGHT NOW is exactly who this is for; the
-    // ceiling path's `1` exists to keep a DYING container from eating its own
-    // accountability notice, which is not the situation here.
-    return insertDeferredMessageWithContextIfNew(inDb, {
-      id: `${CLOSE_WAKE_ID_PREFIX}${session.id}-${requestedAt}`,
-      kind: 'chat',
-      timestamp: requestedAt,
-      platformId: session.agent_group_id,
-      channelType: 'agent',
-      threadId: null,
-      content: JSON.stringify({
-        text,
-        sender: 'system',
-        senderId: 'system',
-        _system: { kind: 'thread_close_wrap_up', thread_id: threadId },
+    // Existing-only: the wrap-up asks a live agent to land its work, and a
+    // session with no mailbox has no agent to ask. Provisioning one here would
+    // author an outbound.db the host must never create (invariant I-10).
+    const inserted = await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) =>
+      // Same primitive and row shape as `writeCeilingRespawn`'s `writeSystemWake`
+      // in host-sweep.ts — a deferred trigger row plus its inert recall marker,
+      // admitted by the next sweep tick with fresh context. `onWake: 0` because
+      // the container that is running RIGHT NOW is exactly who this is for; the
+      // ceiling path's `1` exists to keep a DYING container from eating its own
+      // accountability notice, which is not the situation here.
+      mailbox.insertDeferredMessageWithContextIfNew({
+        id: `${CLOSE_WAKE_ID_PREFIX}${session.id}-${requestedAt}`,
+        kind: 'chat',
+        timestamp: requestedAt,
+        platformId: session.agent_group_id,
+        channelType: 'agent',
+        threadId: null,
+        content: JSON.stringify({
+          text,
+          sender: 'system',
+          senderId: 'system',
+          _system: { kind: 'thread_close_wrap_up', thread_id: threadId },
+        }),
+        processAfter: null,
+        recurrence: null,
+        onWake: 0,
       }),
-      processAfter: null,
-      recurrence: null,
-      onWake: 0,
-    });
+    );
+    return inserted ?? false;
   } catch (err) {
     log.warn('thread-close: could not write the wrap-up request', { sessionId: session.id, err });
     return false;
-  } finally {
-    inDb?.close();
   }
 }
 
@@ -313,7 +287,9 @@ export async function requestThreadClose(
   // owes, so a proposal the sweep has not copied across yet must not cost them
   // a second click, and — far more importantly — a mirror row left behind by a
   // proposal the agent has since retracted must not buy them a cheaper one.
-  const agentProposed = visible.some((s) => readSessionProposal(s.agent_group_id, s.id) !== null);
+  const agentProposed = (await Promise.all(visible.map((s) => readSessionProposal(s.agent_group_id, s.id)))).some(
+    (proposal) => proposal !== null,
+  );
 
   const payload: ThreadClosePayload = {
     agentGroupIds: visible.map((s) => s.agent_group_id),
@@ -368,7 +344,7 @@ export async function requestThreadClose(
     .run(threadId, ctx.user.id, requestedAt, reason, agentProposed ? 1 : 0, JSON.stringify(visible.map((s) => s.id)));
 
   let delivered = 0;
-  for (const s of visible) if (writeCloseWrapUp(s, threadId, text, requestedAt)) delivered++;
+  for (const s of visible) if (await writeCloseWrapUp(s, threadId, text, requestedAt)) delivered++;
 
   log.info('thread-close: requested', {
     threadId,
@@ -422,49 +398,34 @@ export async function requestThreadClose(
  *
  * Logged at info with the thread, the session and the task it dropped, because
  * "we ended work an agent still believed it had" must be findable afterwards.
- */
-function forceClearWorkContinuation(outDb: Database.Database, ctx: { threadId: string; sessionId: string }): void {
-  const held = rawContinuationRow(outDb);
-  if (!held) return;
-  outDb.transaction(() => {
-    outDb.prepare("DELETE FROM session_state WHERE key = 'work_continuation'").run();
-    // Both keys. `cancelWorkContinuation` clears both and the host's
-    // `readWorkContinuation` falls back to the legacy one, so leaving
-    // `pending_next` behind would leave a promise the next wake still finds.
-    outDb.prepare("DELETE FROM session_state WHERE key = 'pending_next'").run();
-  })();
-  log.info('thread-close: force-cleared a work_continuation the container still held', {
-    threadId: ctx.threadId,
-    sessionId: ctx.sessionId,
-    key: held.key,
-    continuationId: held.id,
-    droppedTask: held.task,
-  });
-}
-
-/**
- * Raw presence of either continuation key, with whatever is readable for the
- * log line.
  *
- * Deliberately NOT `host-sweep.readWorkContinuation`: that parser returns null
- * for a malformed record, and "the row is there but we could not parse it" is
- * not a state this path may treat as cleared. Presence is the question.
+ * The statements themselves are `clearWorkContinuation` / `readContinuationPresence`
+ * in `src/modules/mailbox/ops/session-state.ts`; this function is the policy
+ * around them (invariant I-2).
  */
-function rawContinuationRow(outDb: Database.Database): { key: string; id: string | null; task: string | null } | null {
-  const row = outDb
-    .prepare("SELECT key, value FROM session_state WHERE key IN ('work_continuation', 'pending_next') LIMIT 1")
-    .get() as { key: string; value: string } | undefined;
-  if (!row) return null;
-  try {
-    const parsed = JSON.parse(row.value) as { id?: unknown; task?: unknown };
-    return {
-      key: row.key,
-      id: typeof parsed.id === 'string' ? parsed.id : null,
-      task: typeof parsed.task === 'string' ? parsed.task : null,
-    };
-  } catch {
-    return { key: row.key, id: null, task: null };
-  }
+async function forceClearWorkContinuation(session: CloseSession, threadId: string): Promise<boolean> {
+  // Existing-only, and the ONE fork op that opens outbound.db read-write from
+  // inside a session. The file must already exist: `prepare()` here would
+  // author a container-owned outbound.db for a session the host is closing.
+  const cleared = await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) => {
+    const held = mailbox.clearWorkContinuation();
+    if (held) {
+      log.info('thread-close: force-cleared a work_continuation the container still held', {
+        threadId,
+        sessionId: session.id,
+        key: held.key,
+        continuationId: held.id,
+        droppedTask: held.task,
+      });
+    }
+    // Presence, not validity: a record that will not parse is still a record,
+    // and "we could not read it" is not a state this path may call cleared.
+    return mailbox.readContinuationPresence() === null;
+  });
+  // `undefined` means the mailbox is gone — nothing left to resurrect, so the
+  // close may proceed. That is the same answer the old `existsSync` on
+  // outbound.db gave for a session whose container never started.
+  return cleared ?? true;
 }
 
 /**
@@ -472,27 +433,18 @@ function rawContinuationRow(outDb: Database.Database): { key: string; id: string
  * the close must NOT proceed to the kill for this session — see the ordering
  * note in the file header.
  */
-function ensureContinuationCleared(session: CloseSession, threadId: string): boolean {
-  // No outbound.db at all (a session whose container never started) is a
-  // cleared state: there is no record to resurrect. Checked as file existence
-  // rather than by pattern-matching an open error, so a REAL open failure —
-  // permissions, corruption, a full disk — still counts as not-cleared and
-  // stops the kill.
-  if (!fs.existsSync(outboundDbPath(session.agent_group_id, session.id))) return true;
-  let db: Database.Database | null = null;
+async function ensureContinuationCleared(session: CloseSession, threadId: string): Promise<boolean> {
   try {
-    db = openOutboundDbRw(session.agent_group_id, session.id);
-    forceClearWorkContinuation(db, { threadId, sessionId: session.id });
-    return rawContinuationRow(db) === null;
+    return await forceClearWorkContinuation(session, threadId);
   } catch (err) {
+    // A REAL open failure — permissions, corruption, a full disk — counts as
+    // not-cleared and stops the kill.
     log.error('thread-close: could not clear work_continuation — not killing this container', {
       threadId,
       sessionId: session.id,
       err,
     });
     return false;
-  } finally {
-    db?.close();
   }
 }
 
@@ -504,22 +456,9 @@ export interface ThreadCloseDeps {
   isContainerRunning?: (sessionId: string) => boolean;
   killContainer?: (sessionId: string, reason: string, onExit?: () => void) => void;
   archiveSession?: (sessionId: string) => boolean;
-  clearContinuation?: (session: CloseSession, threadId: string) => boolean;
+  clearContinuation?: (session: CloseSession, threadId: string) => boolean | Promise<boolean>;
   /** The agent's confirmation source; defaults to the session's own outbound.db. */
-  readProposal?: (agentGroupId: string, sessionId: string) => DoneProposal | null;
-}
-
-/**
- * Test-only handle on the force-clear, matching `host-sweep.ts`'s
- * `_resetStuckProcessingRowsForTesting` convention. Takes an already-open
- * handle so a test never has to materialize a session directory — and, being
- * named this way, is not something a caller reaches for by accident.
- */
-export function _forceClearWorkContinuationForTesting(
-  outDb: Database.Database,
-  ctx: { threadId: string; sessionId: string },
-): void {
-  forceClearWorkContinuation(outDb, ctx);
+  readProposal?: (agentGroupId: string, sessionId: string) => DoneProposal | null | Promise<DoneProposal | null>;
 }
 
 /**
@@ -536,23 +475,39 @@ export function _forceClearWorkContinuationForTesting(
  * (d) is absent on purpose: `resetStuckProcessingRows` in the sweep already
  * releases the claims of a session whose container is gone.
  */
-function finalizeSession(session: CloseSession, threadId: string, deps: ThreadCloseDeps): void {
+async function finalizeSession(session: CloseSession, threadId: string, deps: ThreadCloseDeps): Promise<void> {
   const running = (deps.isContainerRunning ?? isContainerRunning)(session.id);
   const kill = deps.killContainer ?? killContainer;
   const archive = deps.archiveSession ?? archiveSessionById;
   const clear = deps.clearContinuation ?? ensureContinuationCleared;
 
   // (b)
-  if (!clear(session, threadId)) return;
+  if (!(await clear(session, threadId))) return;
   if (!running) {
     archive(session.id); // (e)
     return;
   }
   // (c)
+  //
+  // `killContainer`'s onExit is a synchronous callback and the clear is async
+  // now, so the exit work is captured rather than awaited inline. Awaiting the
+  // captured promise afterwards costs nothing in production — the real
+  // `killContainer` fires onExit long after this returns, so `exitWork` is
+  // still undefined here and the closure simply advances on the next tick, as
+  // the comment below has always said. When onExit DOES fire synchronously
+  // (a stopped container, or an injected kill), awaiting it keeps the original
+  // ordering: clear, then archive, both before this function returns.
+  let exitWork: Promise<void> | undefined;
   kill(session.id, `thread close ${threadId}`, () => {
-    clear(session, threadId);
-    archive(session.id); // (e)
+    exitWork = (async () => {
+      try {
+        await clear(session, threadId);
+      } finally {
+        archive(session.id); // (e)
+      }
+    })();
   });
+  await exitWork;
 }
 
 /**
@@ -583,7 +538,7 @@ export function decideCloseFinalization(args: {
  * Idempotent by construction — it re-derives from `archived_at` each tick, so a
  * host restart mid-close resumes rather than losing or double-applying it.
  */
-export function advanceThreadClosures(deps: ThreadCloseDeps = {}): void {
+export async function advanceThreadClosures(deps: ThreadCloseDeps = {}): Promise<void> {
   const now = deps.now ?? Date.now();
   let rows: ThreadClosureRow[];
   try {
@@ -596,14 +551,14 @@ export function advanceThreadClosures(deps: ThreadCloseDeps = {}): void {
   }
   for (const row of rows) {
     try {
-      advanceOneClosure(row, now, deps);
+      await advanceOneClosure(row, now, deps);
     } catch (err) {
       log.warn('thread-close: advancing a closure failed', { threadId: row.thread_id, err });
     }
   }
 }
 
-function advanceOneClosure(row: ThreadClosureRow, now: number, deps: ThreadCloseDeps): void {
+async function advanceOneClosure(row: ThreadClosureRow, now: number, deps: ThreadCloseDeps): Promise<void> {
   let sessionIds: string[];
   try {
     sessionIds = JSON.parse(row.session_ids) as string[];
@@ -638,11 +593,15 @@ function advanceOneClosure(row: ThreadClosureRow, now: number, deps: ThreadClose
     const decision = decideCloseFinalization({
       requestedAtMs: Number.isNaN(requestedAtMs) ? 0 : requestedAtMs,
       now,
-      proposalAtMs: live.map((s) => {
-        const p = (deps.readProposal ?? readSessionProposal)(s.agent_group_id, s.id);
-        const at = p ? Date.parse(p.proposed_at) : NaN;
-        return Number.isNaN(at) ? null : at;
-      }),
+      // Resolved BEFORE the decision so the fan-out is frozen the way it
+      // always was: one read per session, all of them taken now.
+      proposalAtMs: await Promise.all(
+        live.map(async (s) => {
+          const p = await (deps.readProposal ?? readSessionProposal)(s.agent_group_id, s.id);
+          const at = p ? Date.parse(p.proposed_at) : NaN;
+          return Number.isNaN(at) ? null : at;
+        }),
+      ),
     });
     if (!decision.finalize) return;
     forced = decision.forced;
@@ -661,7 +620,7 @@ function advanceOneClosure(row: ThreadClosureRow, now: number, deps: ThreadClose
 
   for (const session of live) {
     if (session.archived_at) continue;
-    finalizeSession(session, row.thread_id, deps);
+    await finalizeSession(session, row.thread_id, deps);
   }
 
   // Re-read rather than trusting the loop above: `finalizeSession` archives
