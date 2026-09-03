@@ -226,10 +226,13 @@ export function listProcessingClaimedMessageIds(db: Database.Database): string[]
   ).map((r) => r.message_id);
 }
 
-/** Is a work-continuation chain queued or running for this session? */
-export function hasWorkContinuation(db: Database.Database): boolean {
-  return db.prepare("SELECT 1 FROM session_state WHERE key = 'work_continuation'").get() !== undefined;
-}
+/**
+ * Is a work-continuation chain queued or running for this session?
+ *
+ * The continuation family owns the statement (invariant I-2); this is the
+ * read-side name for it, re-exported rather than re-implemented.
+ */
+export { hasWorkContinuationRow as hasWorkContinuation } from './continuation.js';
 
 /* ─── Outbound message history ─────────────────────────────────────────────── */
 

@@ -17,8 +17,6 @@ import { DATA_DIR, GROUPS_DIR } from './config.js';
 import { runningContainerMounts } from './container-mounts.js';
 import { isContainerRunning, isContainerSpawning } from './container-runner.js';
 import { getDb } from './db/connection.js';
-import { hasWorkContinuationRow } from './modules/mailbox/ops/continuation.js';
-import { getContainerState, getProcessingClaims } from './modules/mailbox/ops/sweep.js';
 // The GC's reclaim gate is synchronous all the way up through
 // `runStorageGcOnce`, and the mailbox seam's `session()` is async. Rather than
 // turn the whole quarantine/rollback path inside out in this PR, the two reads
@@ -26,8 +24,7 @@ import { getContainerState, getProcessingClaims } from './modules/mailbox/ops/sw
 // so there is still exactly one implementation of each statement (invariant
 // I-2). This file therefore stays on the raw-access allowlist; moving the GC
 // onto the seam is its own change.
-import { openOutboundDb } from './modules/mailbox/openers.js';
-import { sessionMailboxPath } from './modules/mailbox/index.js';
+import { readSessionOutbound, sessionMailboxPath } from './modules/mailbox/index.js';
 import { onHostShutdown, onHostStart } from './host-lifecycle.js';
 import { log } from './log.js';
 import {
@@ -313,16 +310,23 @@ function participantHasPersistedWork(participant: TopicParticipant, dataDir: str
     return false;
   }
   try {
-    const db = openOutboundDb(
-      sessionMailboxPath({ agentGroupId: participant.agentGroupId, sessionId: participant.sessionId }, 'outbound'),
+    // The options restate what the raw outbound opener gave this read before
+    // the seam: the write path's 5s busy_timeout, and the hot-journal rollback
+    // without which a SIGKILLed container leaves every read of its outbound.db
+    // failing permanently — which here would pin the worktree forever.
+    //
+    // `undefined` (no outbound.db) counts as busy, deliberately and unchanged:
+    // before the seam the open threw and landed in the same fail-closed catch.
+    return (
+      readSessionOutbound(
+        { agentGroupId: participant.agentGroupId, sessionId: participant.sessionId },
+        (mailbox) =>
+          mailbox.getProcessingClaimRows().length > 0 ||
+          Boolean(mailbox.getContainerState()?.current_tool) ||
+          mailbox.hasWorkContinuation(),
+        { busyTimeoutMs: 5000, recoverJournal: true },
+      ) ?? true
     );
-    try {
-      return (
-        getProcessingClaims(db).length > 0 || Boolean(getContainerState(db)?.current_tool) || hasWorkContinuationRow(db)
-      );
-    } finally {
-      db.close();
-    }
   } catch {
     // Unknown state fails closed.
     return true;

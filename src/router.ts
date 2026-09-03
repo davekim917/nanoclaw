@@ -51,8 +51,8 @@ import { log } from './log.js';
 import {
   resolveSession,
   sessionMessageExists,
+  withExistingMailboxSession,
   writeSessionMessageIfNew,
-  writeOutboundDirect,
 } from './session-manager.js';
 import { archiveMessage } from './message-archive.js';
 import { parseMessageFlags, formatFlagConfirmation, type FlagIntent } from './flag-parser.js';
@@ -1320,14 +1320,18 @@ async function deliverToAgent(
       return;
     }
     if (gate.action === 'deny') {
-      writeOutboundDirect(session.agent_group_id, session.id, {
-        id: `deny-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-        kind: 'chat',
-        platformId: deliveryAddr.platformId,
-        channelType: deliveryAddr.channelType,
-        threadId: deliveryAddr.threadId,
-        content: JSON.stringify({ text: `Permission denied: ${gate.command} requires admin access.` }),
-      });
+      // Existing-only: a denial is not a reason to provision a mailbox
+      // (invariant I-10). The session was resolved above, so it has one.
+      await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) =>
+        mailbox.writeOutboundDirect({
+          id: `deny-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+          kind: 'chat',
+          platformId: deliveryAddr.platformId,
+          channelType: deliveryAddr.channelType,
+          threadId: deliveryAddr.threadId,
+          content: JSON.stringify({ text: `Permission denied: ${gate.command} requires admin access.` }),
+        }),
+      );
       log.info('Admin command denied by gate', { command: gate.command, userId, agentGroupId: agent.agent_group_id });
       return;
     }
@@ -1370,14 +1374,16 @@ async function deliverToAgent(
       flagCleanedText = parsed.cleanedText;
       const notice = formatFlagConfirmation(parsed.intent ?? {}, parsed.warnings, parsed.errors);
       if (notice) {
-        writeOutboundDirect(session.agent_group_id, session.id, {
-          id: `flag-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-          kind: 'chat',
-          platformId: deliveryAddr.platformId,
-          channelType: deliveryAddr.channelType,
-          threadId: deliveryAddr.threadId,
-          content: JSON.stringify({ text: notice }),
-        });
+        await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) =>
+          mailbox.writeOutboundDirect({
+            id: `flag-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+            kind: 'chat',
+            platformId: deliveryAddr.platformId,
+            channelType: deliveryAddr.channelType,
+            threadId: deliveryAddr.threadId,
+            content: JSON.stringify({ text: notice }),
+          }),
+        );
       }
     }
   }
