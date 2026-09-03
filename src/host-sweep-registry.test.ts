@@ -229,6 +229,11 @@ import {
   type SweepSessionContext,
   type SweepTickContext,
 } from './host-sweep.js';
+// Registers S2/S3/S4/S17 as a duty source at import time — needed so
+// `_resetSweepRegistryForTesting()`'s default replay (every recorded source,
+// not just the in-file built-ins) still surfaces the moved duties for R-7,
+// R-10 and R-11.
+import './modules/sweep-session-core/index.js';
 import { log } from './log.js';
 import { SessionDbMissingError, SessionDbUnopenableError } from './modules/mailbox/index.js';
 import { _mailboxSessionDepthForTesting } from './modules/mailbox/session.js';

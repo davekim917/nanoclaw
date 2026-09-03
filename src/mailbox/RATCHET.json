@@ -34,6 +34,7 @@
   "src/modules/repository-workspaces/index.ts",
   "src/modules/scheduling/create.ts",
   "src/modules/scheduling/live-count.ts",
+  "src/modules/sweep-session-core/index.ts",
   "src/session-manager.ts",
   "src/storage-manager.ts",
   "src/worktree-cleanup.ts"

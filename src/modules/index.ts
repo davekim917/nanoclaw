@@ -52,3 +52,8 @@ import './provider-fallback/index.js';
 import './repository-workspaces/index.js';
 
 import './escalation/index.js';
+
+// Sweep per-session core — S2 processing_ack sync, S3 stale-pending expiry,
+// S4 pre-wake orphan-claim reset, S17 orphan-claim retry (convergence seam 2,
+// PR 9).
+import './sweep-session-core/index.js';
