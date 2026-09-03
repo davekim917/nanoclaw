@@ -448,16 +448,22 @@ export function _resetSweepRegistryForTesting(options: { builtins?: boolean } = 
 }
 
 /**
- * Test-only: drop every duty source except the in-file built-ins, so a test
- * that registered a fake source via `registerSweepDutySource` doesn't leak it
- * into later tests' registry state. Does not touch the duty/hook/follow-up
- * registries — call this after `_resetSweepRegistryForTesting()` has already
- * restored them, not instead of it.
+ * Test-only: drop exactly the named duty source, so a test that registered a
+ * fake source via `registerSweepDutySource` doesn't leak it into later tests'
+ * registry state. Throws on `'host-sweep:builtin'` — that source is not
+ * test-owned. A no-op if `name` isn't currently registered. Does not touch
+ * the duty/hook/follow-up registries — call this after
+ * `_resetSweepRegistryForTesting()` has already restored them, not instead
+ * of it. Never clear the whole source list: a real family module's source
+ * (registered at its own import time, same as the built-ins) would be wiped
+ * along with it for the rest of the test file.
  */
-export function _resetSweepDutySourcesForTesting(): void {
-  const builtins = sweepDutySources.filter((s) => s.name === 'host-sweep:builtin');
-  sweepDutySources.length = 0;
-  sweepDutySources.push(...builtins);
+export function _unregisterSweepDutySourceForTesting(name: string): void {
+  if (name === 'host-sweep:builtin') {
+    throw new Error("_unregisterSweepDutySourceForTesting: 'host-sweep:builtin' is not test-owned");
+  }
+  const index = sweepDutySources.findIndex((s) => s.name === name);
+  if (index !== -1) sweepDutySources.splice(index, 1);
 }
 
 // ── Duty failure handling ────────────────────────────────────────────────────
