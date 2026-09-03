@@ -3,13 +3,15 @@
  * The decideTaskAction tests are pure (no DB required).
  * The pendingTerminalSpawnOutboundSeenAt tests use in-memory SQLite via mocked path resolution.
  */
+import { spawn } from 'child_process';
 import Database from 'better-sqlite3';
 import path from 'path';
 import fs from 'fs';
-import { describe, expect, it, afterEach } from 'vitest';
+import { describe, expect, it, afterEach, vi } from 'vitest';
 
 import { decideTaskAction } from './watchdog.js';
 import type { Task } from './db/tasks.js';
+import * as mailboxIndex from '../mailbox/index.js';
 
 const BASE = Date.parse('2026-04-20T12:00:00.000Z');
 
@@ -406,4 +408,84 @@ describe('pendingTerminalSpawnOutboundSeenAt', () => {
     const result = pendingTerminalSpawnOutboundSeenAt(agentGroupId, sessionId);
     expect(result).toBe('2026-01-01T00:05:00.000Z');
   });
+});
+
+// Codex P2 (thread PRRT_kwDORfvfVM6fE-8N): the pre-seam open
+// (`new Database(dbPath, { readonly: true })`, no `timeout` key) took
+// better-sqlite3's own default of 5000ms, not "none" — the seam's 1s
+// fleet-fan-out default was a real regression here, not a tolerant one. A
+// read that times out early answers null — "no terminal spawn seen" — which
+// bypasses the drain-first guard and can fail a task whose
+// spawn_complete/spawn_failed is still on its way in under lock contention.
+describe('pendingTerminalSpawnOutboundSeenAt busy_timeout', () => {
+  it('passes the write path busy_timeout (5s, no journal recovery) to readSessionOutbound', async () => {
+    const spy = vi.spyOn(mailboxIndex, 'readSessionOutbound').mockReturnValue(undefined);
+    const { pendingTerminalSpawnOutboundSeenAt } = await import('./watchdog.js');
+    pendingTerminalSpawnOutboundSeenAt('ag-wd-opts', 'sess-wd-opts');
+
+    expect(spy).toHaveBeenCalledTimes(1);
+    expect(spy.mock.calls[0]?.[0]).toEqual({ agentGroupId: 'ag-wd-opts', sessionId: 'sess-wd-opts' });
+    // No `recoverJournal`: the pre-seam open never recovered a hot journal
+    // either, so the fix restates that behavior exactly rather than widening
+    // it — only the timeout regressed.
+    expect(spy.mock.calls[0]?.[2]).toEqual({ busyTimeoutMs: 5000 });
+    spy.mockRestore();
+  });
+
+  // Deterministic, environment-independent proof the guard survives real lock
+  // contention: a separate PROCESS holds an EXCLUSIVE write transaction on
+  // outbound.db for longer than the seam's old 1s default but well inside the
+  // fixed 5s. better-sqlite3 is synchronous, so a same-process lock (e.g. a
+  // second connection plus a same-thread timer) can never interleave with the
+  // watchdog's own synchronous read — the read would simply block the one JS
+  // thread the "releasing" timer also needs. A child process is the only way
+  // to hold the lock concurrently with the parent's read.
+  it('reads through real lock contention that outlasts the old 1s default', () => {
+    const agentGroupId = TEST_AG_PREFIX + 'lock-test';
+    const sessionId = 'sess-lock-test';
+    const db = makeTmpOutboundDb(agentGroupId, sessionId);
+    db.prepare("INSERT INTO messages_out VALUES ('m1', 1, null, '2026-01-01T00:05:00.000Z', 'system', ?)").run(
+      JSON.stringify({ action: 'spawn_complete', task_id: 'task-1' }),
+    );
+    db.close();
+    const dbPath = path.join(TEST_ROOT, agentGroupId, sessionId, 'outbound.db');
+
+    // Holds an EXCLUSIVE transaction for ~1.5s (past the old 1s default,
+    // inside the fixed 5s) before committing and exiting.
+    const child = `
+      const Database = require('better-sqlite3');
+      const db = new Database(${JSON.stringify(dbPath)});
+      db.prepare('BEGIN EXCLUSIVE').run();
+      setTimeout(() => {
+        db.prepare('COMMIT').run();
+        db.close();
+        process.exit(0);
+      }, 1500);
+    `;
+    const holder = spawn(process.execPath, ['-e', child], { cwd: process.cwd(), stdio: 'ignore' });
+
+    // Give the child a moment to actually acquire the lock before the parent
+    // reads — a race the other direction (parent reads first) would prove
+    // nothing about contention.
+    const lockAcquired = new Promise<void>((resolve) => setTimeout(resolve, 200));
+
+    return lockAcquired.then(async () => {
+      const start = Date.now();
+      const { pendingTerminalSpawnOutboundSeenAt } = await import('./watchdog.js');
+      // With the fix (5s busy_timeout): waits out the child's ~1.3s remaining
+      // hold and reads the committed row. Without it (1s default): times out
+      // well before the child commits and answers null — the false "no
+      // terminal spawn seen" this whole fix exists to close.
+      const result = pendingTerminalSpawnOutboundSeenAt(agentGroupId, sessionId);
+      const elapsedMs = Date.now() - start;
+
+      expect(result).toBe('2026-01-01T00:05:00.000Z');
+      // Proves the read actually waited on the lock rather than finding it
+      // already free — a read that returned instantly wouldn't demonstrate
+      // contention tolerance at all.
+      expect(elapsedMs).toBeGreaterThan(800);
+
+      holder.kill();
+    });
+  }, 10000);
 });

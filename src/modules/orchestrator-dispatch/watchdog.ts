@@ -97,12 +97,19 @@ export function pendingTerminalSpawnOutboundSeenAt(agentGroupId: string, session
     // sweep's schedule, and must never provision or migrate it (invariant
     // I-4). A session with no outbound.db has nothing to report.
     //
-    // The pre-seam open set no busy_timeout at all, so a contended read raised
-    // SQLITE_BUSY immediately and this returned null — "no terminal spawn
-    // seen", which feeds the reap decision. The seam's 1s default is a
-    // deliberate, strictly-more-tolerant change: a busy child is exactly the
-    // one whose answer matters, and waiting a second for it beats guessing.
-    const rows = readSessionOutbound({ agentGroupId, sessionId }, (mailbox) => mailbox.listOutboundSystemMessages());
+    // `busyTimeoutMs: 5000` restates what the pre-seam open actually gave
+    // this read: `new Database(dbPath, { readonly: true })` with no `timeout`
+    // key takes better-sqlite3's own default, which is 5000ms, not "none" —
+    // the seam's 1s fleet-fan-out default is a real regression here, not a
+    // tolerant one. A watchdog read that times out early answers `null` —
+    // "no terminal spawn seen" — which bypasses the drain-first guard and can
+    // fail a task whose spawn_complete/spawn_failed is still on its way in
+    // under lock contention on a busy outbound.db. No `recoverJournal`: the
+    // pre-seam open never recovered a hot journal either, so this restates
+    // the old behavior exactly rather than widening it.
+    const rows = readSessionOutbound({ agentGroupId, sessionId }, (mailbox) => mailbox.listOutboundSystemMessages(), {
+      busyTimeoutMs: 5000,
+    });
     if (!rows) return null;
 
     let earliest: string | null = null;
