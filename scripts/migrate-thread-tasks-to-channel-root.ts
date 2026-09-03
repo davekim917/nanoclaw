@@ -39,7 +39,8 @@ import { DATA_DIR } from '../src/config.js';
 import { initDb, getDb } from '../src/db/connection.js';
 import { resolveActiveSession } from '../src/db/scheduled-tasks.js';
 import { findSessionByAgentGroupAndMessagingGroup } from '../src/db/sessions.js';
-import { ensureSchema, nextEvenSeq } from '../src/db/session-db.js';
+import { ensureSchema } from '../src/modules/mailbox/schema.js';
+import { nextEvenSeq } from '../src/modules/mailbox/ops/ingress.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DB_PATH = path.join(__dirname, '..', 'data', 'v2.db');

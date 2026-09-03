@@ -2,11 +2,11 @@
  * Typed entry points for fork callers.
  *
  * `session-manager.ts` owns the nesting guard and the provision-vs-exists
- * decision, and types its action against upstream's `MailboxSession` — the
- * only shape upstream's contract promises. The fork registers
- * `NanoclawAgentMailbox`, so every action actually receives a
- * `NanoclawMailboxSession`; these two wrappers say so once, here, instead of
- * making each of the ~20 fork callers repeat the same cast.
+ * decision, and already types its action as `NanoclawMailboxSession` — the
+ * shape `mailbox/compose.ts` guarantees every action receives, since it is
+ * what registers `NanoclawAgentMailbox`. These two wrappers are the
+ * fork-named entry points most callers reach for; they supply the name, not a
+ * narrowing.
  *
  * Deliberately a separate file from `index.ts`: this one imports
  * `session-manager.ts`, which imports the mailbox barrel, which composes this
@@ -19,8 +19,8 @@ import { withExistingMailboxSession, withMailboxSession } from '../../session-ma
 /** Test-only depth probe over the nesting guard `session-manager.ts` owns (seam 2 R-10). */
 export { _mailboxSessionDepthForTesting } from '../../session-manager.js';
 
-import { sessionMailboxPath, SessionDbMissingError } from './index.js';
-import { openOutboundDbWritable } from './openers.js';
+import { sessionMailboxPath } from './index.js';
+import { openOutboundDbWritable, withOpenedSessionDb } from './openers.js';
 import type { NanoclawMailboxSession } from './index.js';
 
 /** Run one operation against a session's mailbox, provisioning it if absent. */
@@ -71,16 +71,11 @@ export async function withExistingNanoclawOutbound<T>(
   sessionId: string,
   action: (outbound: Database.Database) => T,
 ): Promise<T | undefined> {
-  let outbound: Database.Database;
-  try {
-    outbound = openOutboundDbWritable(sessionMailboxPath({ agentGroupId, sessionId }, 'outbound'));
-  } catch (err) {
-    if (err instanceof SessionDbMissingError) return undefined;
-    throw err;
-  }
-  try {
-    return action(outbound);
-  } finally {
-    outbound.close();
-  }
+  // The open/absent/close dance is the module's shared one — see
+  // `withOpenedSessionDb`. What is specific here is only WHICH opener: the
+  // writable outbound funnel, because the force-clear writes.
+  return withOpenedSessionDb(
+    () => openOutboundDbWritable(sessionMailboxPath({ agentGroupId, sessionId }, 'outbound')),
+    action,
+  );
 }

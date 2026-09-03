@@ -28,10 +28,18 @@ import { log } from './log.js';
 import { resolveRepositoryWorkUnit } from './repository-workspaces.js';
 import { tryRunWithStorageCleanupClaim } from './storage-activity.js';
 // The session-directory LAYOUT, not the data: this file's reclaim probes open
-// their own read-only handles (they run in a worker thread over an injected
-// sessions root, which the DATA_DIR-keyed mailbox cannot address), so all they
-// need from the seam is where a session's two files live. `session-manager`'s
-// `inboundDbPath`/`outboundDbPath` wrappers go away with PR 7.
+// their own read-only handles, so all they need from the seam is where a
+// session's two files live.
+//
+// This is the ONE documented exemption on the host half of the raw-access
+// ratchet (`src/mailbox/RATCHET.json`, asserted by
+// `src/mailbox-seam-ratchet.test.ts`). The probes run in a WORKER THREAD over
+// an INJECTED sessions root — the reclaim scans a directory tree it is handed,
+// including roots that are not this install's `DATA_DIR` — and the mailbox is
+// keyed by `DATA_DIR`, so it cannot address them. They are also strictly
+// read-only (`readonly: true, fileMustExist: true`), never provision, and
+// answer `null` for "could not tell", which every caller treats as
+// fail-closed. Nothing else on the host may open a session DB directly.
 import { sessionMailboxPath } from './modules/mailbox/index.js';
 import { sessionContextPathFor, sessionsBaseDir, threadsBaseDir, threadWorktreeDir } from './session-manager.js';
 

@@ -17,8 +17,11 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 
 import Database from 'better-sqlite3';
 
+import type { NanoclawMailboxSession } from '../../modules/mailbox/index.js';
+
 import { initTestDb, closeDb, getDb } from '../../db/connection.js';
-import { ensureSchema, openInboundDb } from '../../db/session-db.js';
+import { openInboundDb } from '../../modules/mailbox/openers.js';
+import { ensureSchema } from '../../modules/mailbox/schema.js';
 import { migration043 } from '../../db/migrations/043-scheduled-audit.js';
 import {
   encodeKey,
@@ -28,6 +31,21 @@ import {
   _resetScheduledRateLimitForTesting,
 } from './scheduled-shared.js';
 import type { AuthedRequestContext } from '../router.js';
+
+// Unique per-file temp dir (mkdtemp) — no fixed /tmp path a sibling file or a
+// parallel agent process could collide on (hermeticity, matches the read/
+// assembly test fix). Hoisted because DATA_DIR is mocked to it below: the
+// mutation writes go through the mailbox seam, which resolves session paths
+// from DATA_DIR, so the injected `dataDir` and DATA_DIR have to be the same
+// root or the gate would read the fixture and the write would miss it.
+const TEST_DIR = vi.hoisted(() => {
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  return require('fs').mkdtempSync(require('path').join(require('os').tmpdir(), 'nc-sched-mut-')) as string;
+});
+vi.mock('../../config.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../config.js')>()),
+  DATA_DIR: TEST_DIR,
+}));
 
 // wakeContainer is mocked so run-now doesn't try to spawn a real container.
 const mockWakeContainer = vi.fn().mockResolvedValue(true);
@@ -53,10 +71,6 @@ import {
   _setMutationsTestOptions,
 } from './scheduled-mutations.js';
 
-// Unique per-file temp dir (mkdtemp) — no fixed /tmp path a sibling file or a
-// parallel agent process could collide on (hermeticity, matches the read/
-// assembly test fix).
-const TEST_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'nc-sched-mut-'));
 const NOW = Date.parse('2026-06-13T12:00:00Z');
 const AG = 'ag-1';
 const SESS = 'sess-1';
@@ -216,34 +230,32 @@ beforeEach(() => {
   _resetScheduledRateLimitForTesting();
   mockWakeContainer.mockClear();
   mockAdmitDueTaskContexts.mockReset();
-  mockAdmitDueTaskContexts.mockImplementation((db: Database.Database) => {
-    const task = db
-      .prepare(
-        `SELECT id, timestamp, process_after
-           FROM messages_in
-          WHERE kind = 'task' AND status = 'pending' AND trigger = 0
-            AND (process_after IS NULL OR datetime(process_after) <= datetime('now'))
-          ORDER BY seq
-          LIMIT 1`,
-      )
-      .get() as { id: string; timestamp: string; process_after: string | null } | undefined;
+  // The stub stands in for the recall POLICY only — which row deserves a pair
+  // and what the pair says. The COMMIT is the module's real `admitDueRow`, so
+  // run-now's admission probe is checked against the production transaction
+  // rather than a second hand-written copy of it.
+  mockAdmitDueTaskContexts.mockImplementation((mailbox: NanoclawMailboxSession) => {
+    const [task] = mailbox.listDueAdmissionRows();
     if (!task) return 0;
-    const maxSeq = (db.prepare('SELECT COALESCE(MAX(seq), 0) AS seq FROM messages_in').get() as { seq: number }).seq;
-    const recallSeq = maxSeq + 2 - (maxSeq % 2);
-    db.prepare(
-      `INSERT INTO messages_in
-         (id, seq, kind, timestamp, status, process_after, recurrence, series_id, trigger, content)
-       VALUES (?, ?, 'system', ?, 'pending', ?, NULL, ?, 0, ?)`,
-    ).run(
-      `recall-${task.id}`,
-      recallSeq,
-      task.timestamp,
-      task.process_after,
-      `recall-${task.id}`,
-      JSON.stringify({ subtype: 'recall_context', source: 'fresh-test-admission' }),
-    );
-    db.prepare('UPDATE messages_in SET seq = ?, trigger = 1 WHERE id = ? AND trigger = 0').run(recallSeq + 2, task.id);
-    return 1;
+    return mailbox.admitDueRow(
+      {
+        id: `recall-${task.id}`,
+        kind: 'system',
+        timestamp: task.timestamp,
+        platformId: null,
+        channelType: null,
+        threadId: null,
+        content: JSON.stringify({ subtype: 'recall_context', source: 'fresh-test-admission' }),
+        processAfter: task.process_after,
+        recurrence: null,
+        trigger: 0,
+        sourceSessionId: null,
+        onWake: 0,
+      },
+      task.id,
+    )
+      ? 1
+      : 0;
   });
   _setMutationsTestOptions({ dataDir: TEST_DIR, nowMs: NOW });
   addUser('owner');
