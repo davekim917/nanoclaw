@@ -281,6 +281,10 @@ import './modules/sweep-orchestrator/index.js';
 import './modules/sweep-egress/index.js';
 import './modules/sweep-storage/index.js';
 import './modules/sweep-claims/index.js';
+// Side-effect import: registers 'sweep-usage' as a duty source (S2-PR12) so
+// R-7's registration count includes T19 after the family module moved it out
+// of host-sweep.ts's own in-file builtins.
+import './modules/sweep-usage/index.js';
 
 probe.depth = _mailboxSessionDepthForTesting;
 

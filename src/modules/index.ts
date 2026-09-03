@@ -83,3 +83,5 @@ import './sweep-claims/index.js';
 // S2-PR6's own barrel line for sweep-storage is deliberately absent: this
 // lineage already imports that module above (S2-PR1 owns it for the
 // onHostShutdown half), and its T13 registration rides that same import.
+// Sweep family: usage-rollup (T19, host-sweep seam S2-PR12).
+import './sweep-usage/index.js';

@@ -47,7 +47,6 @@ import {
   migrateLegacyWorkContinuationForRecovery,
   notifyContinuationParked,
   shouldCloseTaskSession,
-  shouldSkipUsageRollup,
 } from './host-sweep.js';
 import { getDb } from './db/connection.js';
 import type { Session } from './types.js';
@@ -1172,19 +1171,7 @@ describe('shouldCloseTaskSession', () => {
 // shouldReapIdleTaskContainer / shouldReapIdleChatContainer cases moved to
 // src/modules/sweep-idle-reap/idle-reap.test.ts (seam 2, S2-PR3 — F-3.1).
 
-describe('shouldSkipUsageRollup', () => {
-  it('skips when the cached mtime matches the current outbound.db mtime (unchanged since last rollup)', () => {
-    expect(shouldSkipUsageRollup(1000, 1000)).toBe(true);
-  });
-
-  it('does not skip when the outbound.db mtime moved (new turn_usage rows written)', () => {
-    expect(shouldSkipUsageRollup(1000, 2000)).toBe(false);
-  });
-
-  it('does not skip a session never seen before (no cache entry)', () => {
-    expect(shouldSkipUsageRollup(undefined, 1000)).toBe(false);
-  });
-});
+// shouldSkipUsageRollup moved to src/modules/sweep-usage/usage.test.ts (S2-PR12, F-12.1).
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Container OOM notices — detection already worked; these cover the half that
