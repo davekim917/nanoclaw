@@ -14,11 +14,14 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('../config.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../config.js')>()),
-  DATA_DIR: '/tmp/nanoclaw-test-cli-request-ledger',
-  GROUPS_DIR: '/tmp/nanoclaw-test-cli-request-ledger/groups',
+  DATA_DIR: TEST_DIR,
+  GROUPS_DIR: `${TEST_DIR}/groups`,
 }));
 
-const TEST_DIR = '/tmp/nanoclaw-test-cli-request-ledger';
+// Process-unique, not a fixed /tmp path: two worktrees running this suite
+// concurrently would otherwise chmod/delete each other's SQLite files (issue
+// #274) — enforced by src/fixture-roots.test.ts.
+const { TEST_DIR } = vi.hoisted(() => ({ TEST_DIR: uniqueTmpRoot('cli-request-ledger') }));
 
 const dispatch = vi.fn();
 vi.mock('./dispatch.js', () => ({ dispatch: (...args: unknown[]) => dispatch(...args) }));
