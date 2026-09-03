@@ -32,7 +32,7 @@ import fs from 'fs';
 import path from 'path';
 
 import { SELF_HEAL_ENABLED } from './config.js';
-import { getActiveSessions, getSession, isTaskThread, updateSession } from './db/sessions.js';
+import { getActiveSessions, getSession, isTaskThread } from './db/sessions.js';
 import { getAgentGroup } from './db/agent-groups.js';
 import {
   SessionDbMissingError,
@@ -41,10 +41,9 @@ import {
   type NanoclawMailboxSession,
 } from './modules/mailbox/index.js';
 import { withExistingNanoclawSession } from './modules/mailbox/session.js';
-import { runHostGatedTaskScripts } from './modules/scheduling/host-script.js';
-import { advanceThreadClosures, syncDoneProposalMirror } from './dashboard/thread-close.js';
+import { syncDoneProposalMirror } from './dashboard/thread-close.js';
 import { log } from './log.js';
-import { sessionDir, sessionsBaseDir, admitDueTaskContexts } from './session-manager.js';
+import { sessionDir, sessionsBaseDir } from './session-manager.js';
 import {
   getContainerSpawnedAt,
   getActiveContainerSessionIds,
@@ -1147,15 +1146,6 @@ export async function _sweepOnceForTesting(): Promise<void> {
   }
 }
 
-/** A per-task session with no live tasks and no running container is spent → close it. */
-export function shouldCloseTaskSession(
-  threadId: string | null,
-  containerRunning: boolean,
-  liveTaskCount: number,
-): boolean {
-  return isTaskThread(threadId) && !containerRunning && liveTaskCount === 0;
-}
-
 /** Most recent messages_in timestamp for a session, or null if it has none. */
 function getLastInboundAtMs(mailbox: NanoclawMailboxSession): number | null {
   const timestamp = mailbox.latestInboundTimestamp();
@@ -1170,42 +1160,6 @@ function getLastOutboundAtMs(mailbox: NanoclawMailboxSession): number | null {
   if (timestamp === null) return null;
   const ms = parseSqliteUtc(timestamp);
   return Number.isNaN(ms) ? null : ms;
-}
-
-async function prepareDueWake(
-  mailbox: NanoclawMailboxSession,
-  agentGroupId: string,
-  sessionId: string,
-): Promise<{ admittedTasks: number; dueCount: number; wakePriority: 'interactive' | 'scheduled' }> {
-  // Fleet-hardening Phase 1.1: run any opted-in (scriptHost) pre-task scripts
-  // on the host BEFORE admission, so a gated/errored fire never becomes due
-  // and never spawns a container. See host-script.ts's runHostGatedTaskScripts.
-  //
-  // `runHostGatedTaskScripts` takes this session (mailbox seam PR 4): it is a
-  // sweep callee with no other production caller, and a SESSION parameter is
-  // the seam's sanctioned object — invariant I-9 forbids handing out raw
-  // handles, not sessions, so the callee stays off the ratchet's allowlist.
-  // It can spend the full pre-task timeout per row, so the session is held
-  // across that work exactly as it was when this line passed a raw handle.
-  // `admitDueTaskContexts` still takes one: it lives in `session-manager.ts`
-  // and moves behind the seam in PR 7. `legacyInboundHandle` survives here for
-  // that one call and nothing else.
-  await runHostGatedTaskScripts(mailbox, sessionId);
-  const admittedTasks = admitDueTaskContexts(mailbox.legacyInboundHandle(), agentGroupId, sessionId);
-  const dueCount = mailbox.countDueMessages();
-  return {
-    admittedTasks,
-    dueCount,
-    wakePriority: dueCount > 0 ? mailbox.getDueWakePriority() : 'interactive',
-  };
-}
-
-export async function _prepareDueWakeForTesting(
-  mailbox: NanoclawMailboxSession,
-  agentGroupId: string,
-  sessionId: string,
-): Promise<{ admittedTasks: number; dueCount: number; wakePriority: 'interactive' | 'scheduled' }> {
-  return prepareDueWake(mailbox, agentGroupId, sessionId);
 }
 
 /**
@@ -1577,30 +1531,6 @@ function registerBuiltInSweepDuties(): void {
   // ── session:plan (W1) ──────────────────────────────────────────────────────
 
   registerSweepDuty({
-    name: id.S5,
-    phase: 'session:plan',
-    order: 40,
-    // 3. Admit due scheduled occurrences and lifecycle wakes with fresh
-    // recall/capabilities immediately before they become wakeable. Task rows
-    // stay trigger=0 from creation through this point; paired lifecycle wakes
-    // stay trigger=0 throughout backoff. A warm poller cannot race ahead of
-    // either context pair, and a repeated sweep is idempotent.
-    run: async (ctx) => {
-      const { session, agentGroupId, mailbox, plan } = asSessionContext(ctx);
-      const preparedWake = await prepareDueWake(mailbox!, agentGroupId, session.id);
-      plan.admittedTasks = preparedWake.admittedTasks;
-      plan.dueCount = preparedWake.dueCount;
-      plan.wakePriority = preparedWake.wakePriority;
-      if (plan.admittedTasks > 0) {
-        log.debug('Admitted due turns with fresh context', {
-          sessionId: session.id,
-          count: plan.admittedTasks,
-        });
-      }
-    },
-  });
-
-  registerSweepDuty({
     name: id.S6,
     phase: 'session:plan',
     order: 50,
@@ -1737,68 +1667,10 @@ function registerBuiltInSweepDuties(): void {
 
   // ── session:tail (W5) ──────────────────────────────────────────────────────
 
-  registerSweepDuty({
-    name: id.S18,
-    phase: 'session:tail',
-    order: 20,
-    // 8. Recurrence fanout for completed recurring tasks.
-    // MODULE-HOOK:scheduling-recurrence:start
-    // Takes this session (mailbox seam PR 4). Same rule as
-    // `runHostGatedTaskScripts` in prepareDueWake: a sweep callee with no other
-    // production caller receives the sweep's session, never a raw handle and
-    // never its own nested open on the same key.
-    run: async (ctx) => {
-      const { session, mailbox } = asSessionContext(ctx);
-      const { handleRecurrence } = await import('./modules/scheduling/recurrence.js');
-      await handleRecurrence(mailbox!, session);
-    },
-    // MODULE-HOOK:scheduling-recurrence:end
-  });
-
-  registerSweepDuty({
-    name: id.S19,
-    phase: 'session:tail',
-    order: 30,
-    // 9. GC spent task sessions. An isolated per-task session with no live task
-    // rows left (one-shot fired, or all cancelled/deleted) and no container
-    // running is dead — close it so it stops being swept and listed. Runs after
-    // recurrence so a just-fired recurring series has already re-armed its next
-    // pending row and is never collected. The per-task log file in the workspace
-    // is the durable history and survives the close.
-    run: (ctx) => {
-      const { session, mailbox } = asSessionContext(ctx);
-      if (isTaskThread(session.thread_id)) {
-        const liveTasks = mailbox!.countLiveTasks();
-        if (shouldCloseTaskSession(session.thread_id, isContainerRunning(session.id), liveTasks)) {
-          updateSession(session.id, { status: 'closed' });
-          log.info('Closed spent task session', { sessionId: session.id, threadId: session.thread_id });
-        }
-      }
-    },
-  });
-
   // ── tick:post-session — container state is now current ─────────────────────
   //
   // T6 orchestrator-reconciler (order 10) and T18 task-watchdog (order 25)
   // moved to src/modules/sweep-orchestrator/index.ts (S2-PR5).
-
-  registerSweepDuty({
-    name: id.T8,
-    phase: 'tick:post-session',
-    order: 20,
-    // Advance operator-confirmed thread closes: wait for the agent's wrap-up
-    // confirmation, then clear its saved work, stop the container and archive —
-    // in that order (src/dashboard/thread-close.ts). Central-DB scan of the few
-    // in-flight rows, once per tick, after the per-session loop so container
-    // state is current. Nothing here can START a close; only an operator can.
-    run: async () => {
-      try {
-        await advanceThreadClosures();
-      } catch (err) {
-        log.warn('thread-close sweep step failed', { err });
-      }
-    },
-  });
 
   // T13 (storage-maintenance, tick:post-session, order 30) moved to
   // src/modules/sweep-storage/index.ts (S2-PR6).

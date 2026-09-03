@@ -25,7 +25,6 @@ import {
   _applyCeilingFollowUpForTesting,
   _hasWorkContinuationForTesting,
   _notifyKillCeilingForTesting,
-  _prepareDueWakeForTesting,
   _sweepSessionForTesting,
   canAttemptContinuationRecovery,
   countToolRecoveryAttemptsSinceRealInbound,
@@ -40,8 +39,11 @@ import {
   incrementWorkContinuationResumeAttempt,
   migrateLegacyWorkContinuationForRecovery,
   notifyContinuationParked,
-  shouldCloseTaskSession,
 } from './host-sweep.js';
+// The error-rule case below drives a THROW through the due-admission duty
+// (S5), which now lives in the scheduling family module (S2-PR11) — importing
+// it registers that duty so the case keeps its original vehicle.
+import './modules/sweep-scheduling/index.js';
 import { getDb } from './db/connection.js';
 import type { Session } from './types.js';
 
@@ -734,25 +736,6 @@ function fakeSession(): Session {
   };
 }
 
-describe('scheduled due admission precedes wake classification', () => {
-  it('counts and classifies the trigger inserted by the admission seam', async () => {
-    const { inDb, mailbox } = makeSessionDbs();
-    mockAdmitDueTaskContexts.mockImplementationOnce((db: Database.Database) => {
-      db.prepare(
-        `INSERT INTO messages_in
-           (id, seq, kind, timestamp, status, process_after, recurrence, series_id, trigger, content)
-         VALUES ('task-admitted', 2, 'task', ?, 'pending', ?, NULL, 'task-admitted', 1, '{}')`,
-      ).run(new Date().toISOString(), new Date(Date.now() - 1_000).toISOString());
-      return 1;
-    });
-
-    const result = await _prepareDueWakeForTesting(mailbox, 'ag-test', 'sess-test');
-
-    expect(mockAdmitDueTaskContexts).toHaveBeenCalledWith(inDb, 'ag-test', 'sess-test');
-    expect(result).toEqual({ admittedTasks: 1, dueCount: 1, wakePriority: 'scheduled' });
-  });
-});
-
 describe('parseSqliteUtc', () => {
   // Regression: SQLite TIMESTAMP strings have no zone marker, but Date.parse
   // treats those as local time. On non-UTC hosts this made every claim look
@@ -954,25 +937,6 @@ describe('notifyKillCeiling (Layer-3 fix)', () => {
     const rows = outDb.prepare('SELECT id FROM messages_out').all() as Array<{ id: string }>;
     expect(rows).toHaveLength(1);
     expect(rows[0].id).toBe('prior');
-  });
-});
-
-describe('shouldCloseTaskSession', () => {
-  it('closes a spent per-task session (no live tasks, no container)', () => {
-    expect(shouldCloseTaskSession('system:tasks:task-1', false, 0)).toBe(true);
-  });
-
-  it('keeps it while a task is still live (recurring re-armed, or pending/paused)', () => {
-    expect(shouldCloseTaskSession('system:tasks:task-1', false, 1)).toBe(false);
-  });
-
-  it('keeps it while its container is running (mid-fire)', () => {
-    expect(shouldCloseTaskSession('system:tasks:task-1', true, 0)).toBe(false);
-  });
-
-  it('never touches non-task sessions', () => {
-    expect(shouldCloseTaskSession('telegram:12345', false, 0)).toBe(false);
-    expect(shouldCloseTaskSession(null, false, 0)).toBe(false);
   });
 });
 

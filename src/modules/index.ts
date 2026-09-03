@@ -86,3 +86,6 @@ import './sweep-usage/index.js';
 // S4 pre-wake orphan-claim reset, S17 orphan-claim retry (convergence seam 2,
 // PR 9).
 import './sweep-session-core/index.js';
+// Sweep duty family: scheduling + thread-close (S2-PR11) — thread-close-advance,
+// due-wake-admission, recurrence-fanout, spent-task-session-gc.
+import './sweep-scheduling/index.js';
