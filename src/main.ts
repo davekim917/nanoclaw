@@ -156,6 +156,32 @@ export function runWorkgroupMemoryStartupGate(
   return (deps.reconcile ?? reconcileWorkgroupMemory)(db);
 }
 
+/**
+ * Which fields `onMetadata`'s one-shot channel-metadata discovery should
+ * persist for a freshly-seen channel. `name` is set-once, never overwrite:
+ * `reportChannelMetadata` (chat-sdk-bridge.ts) fires this at most once per
+ * channel per process and races the unwired-channel approval flow
+ * (`requestChannelApproval`, channel-approval.ts), which does its own
+ * (richer, e.g. group-DM participant) name classification on the same first
+ * inbound event. Both write to `messaging_groups.name` with no ordering
+ * guarantee between them — this generic discovery losing that race to an
+ * already-set name is always correct, since the approval flow's answer is
+ * strictly more informed and this callback only ever gets one shot anyway.
+ */
+export function resolveChannelMetadataUpdates(
+  mg: { name: string | null; is_group: number },
+  name: string | undefined,
+  isGroup: boolean | undefined,
+): Partial<{ name: string; is_group: number }> {
+  const updates: Partial<{ name: string; is_group: number }> = {};
+  if (name && !mg.name) updates.name = name;
+  if (isGroup !== undefined) {
+    const isGroupFlag = isGroup ? 1 : 0;
+    if (mg.is_group !== isGroupFlag) updates.is_group = isGroupFlag;
+  }
+  return updates;
+}
+
 export async function main(): Promise<void> {
   log.info('NanoClaw starting');
 
@@ -418,12 +444,7 @@ export async function main(): Promise<void> {
       onMetadata(platformId, name, isGroup) {
         const mg = getMessagingGroupByPlatform(adapter.channelType, platformId);
         if (!mg) return; // router hasn't auto-created it yet — next inbound will
-        const updates: Parameters<typeof updateMessagingGroup>[1] = {};
-        if (name && mg.name !== name) updates.name = name;
-        if (isGroup !== undefined) {
-          const isGroupFlag = isGroup ? 1 : 0;
-          if (mg.is_group !== isGroupFlag) updates.is_group = isGroupFlag;
-        }
+        const updates = resolveChannelMetadataUpdates(mg, name, isGroup);
         if (Object.keys(updates).length === 0) return;
         updateMessagingGroup(mg.id, updates);
         log.info('Channel metadata persisted', {

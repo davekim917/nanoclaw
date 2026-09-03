@@ -913,4 +913,50 @@ describe('the conversation is classified once, not twice', () => {
     expect(resolveChannelNameSpy).toHaveBeenCalledTimes(1);
     expect(await persistedName('chan-failed')).toBe('#general');
   });
+
+  // Codex review (PR #251): reportChannelMetadata's one-shot legacy name
+  // lookup (chat-sdk-bridge.ts) races this exact classification on the same
+  // first inbound event, with no ordering guarantee between the two writers.
+  // Simulate the race having already gone the "wrong" way — the raw platform
+  // slug landed in messaging_groups.name before this classification ran —
+  // and confirm the richer classified name still wins.
+  it('overwrites a name a racing legacy metadata lookup already set', async () => {
+    createMessagingGroup({
+      id: 'mg-mpdm-raced',
+      channel_type: 'telegram',
+      platform_id: 'mpdm-raced',
+      name: 'mpdm-alice--bob-1',
+      is_group: 1,
+      unknown_sender_policy: 'request_approval',
+      created_at: new Date().toISOString(),
+    });
+    await liveAdapterWithConversation('telegram', async () => ({
+      type: 'group_dm',
+      name: null,
+      participantNames: ['Alice', 'Bob'],
+    }));
+    const { routeInbound } = await import('../../router.js');
+    await routeInbound(groupMention('mpdm-raced'));
+    await cardQuestion();
+
+    expect(await persistedName('mpdm-raced')).toBe('Group DM: Alice and Bob');
+  });
+
+  it('leaves an existing name alone when the classified name is unavailable', async () => {
+    createMessagingGroup({
+      id: 'mg-mpdm-noroster',
+      channel_type: 'telegram',
+      platform_id: 'mpdm-noroster',
+      name: 'mpdm-alice--bob-1',
+      is_group: 1,
+      unknown_sender_policy: 'request_approval',
+      created_at: new Date().toISOString(),
+    });
+    await liveAdapterWithConversation('telegram', async () => ({ type: 'group_dm', name: null }));
+    const { routeInbound } = await import('../../router.js');
+    await routeInbound(groupMention('mpdm-noroster'));
+    await cardQuestion();
+
+    expect(await persistedName('mpdm-noroster')).toBe('mpdm-alice--bob-1');
+  });
 });

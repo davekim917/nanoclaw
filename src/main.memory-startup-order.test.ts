@@ -2,9 +2,41 @@ import Database from 'better-sqlite3';
 import fs from 'fs';
 import path from 'path';
 import { pathToFileURL } from 'url';
-import { expect, it, vi } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
-import { isDirectExecution, runWorkgroupMemoryStartupGate } from './main.js';
+import { isDirectExecution, resolveChannelMetadataUpdates, runWorkgroupMemoryStartupGate } from './main.js';
+
+// Codex review (PR #251): reportChannelMetadata's one-shot legacy channel-
+// metadata lookup (chat-sdk-bridge.ts) races the unwired-channel approval
+// flow's own, richer name classification (channel-approval.ts) on the same
+// first inbound event, with no ordering guarantee between the two writers.
+// This callback fires at most once per channel per process, so "never
+// overwrite an existing name" loses that race safely without losing any
+// legitimate rename-tracking it never did in the first place.
+describe('resolveChannelMetadataUpdates', () => {
+  it('sets the name only when the messaging group has none yet', () => {
+    expect(resolveChannelMetadataUpdates({ name: null, is_group: 0 }, 'General', undefined)).toEqual({
+      name: 'General',
+    });
+  });
+
+  it('never overwrites an already-set name, even a differing one', () => {
+    expect(
+      resolveChannelMetadataUpdates({ name: 'Group DM: Alice and Bob', is_group: 1 }, 'mpdm-alice--bob-1', undefined),
+    ).toEqual({});
+  });
+
+  it('still updates is_group independently of the name decision', () => {
+    expect(resolveChannelMetadataUpdates({ name: 'Existing', is_group: 0 }, 'Existing', true)).toEqual({
+      is_group: 1,
+    });
+  });
+
+  it('returns an empty object when nothing changed', () => {
+    expect(resolveChannelMetadataUpdates({ name: 'Existing', is_group: 1 }, 'Existing', true)).toEqual({});
+    expect(resolveChannelMetadataUpdates({ name: 'Existing', is_group: 1 }, undefined, undefined)).toEqual({});
+  });
+});
 
 it('uses exact main-module identity instead of NODE_ENV to decide startup', () => {
   const entry = path.resolve(`${uniqueTmpRoot('index-entry')}.ts`);

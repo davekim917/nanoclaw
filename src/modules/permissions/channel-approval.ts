@@ -264,23 +264,36 @@ export async function requestChannelApproval(input: RequestChannelApprovalInput)
         /* non-critical — the card falls back to generic rendering */
       }
     }
-    if (!originMg.name) {
-      // The classification above already carries the name — deriving it here
-      // is what keeps this to ONE round trip. `resolveChannelName` is the
-      // fallback for an adapter without the rich seam, or one whose lookup
-      // failed; for Slack it would repeat conversations.info, conversations.
-      // members and every users.info call.
-      let name = conversation ? conversationDisplayName(conversation) : null;
-      if (!conversation && channelAdapter?.resolveChannelName) {
-        try {
-          name = await channelAdapter.resolveChannelName(originMg.platform_id);
-        } catch {
-          /* non-critical */
-        }
-      }
-      if (name) {
+    if (conversation) {
+      // The classification above already carries the name — deriving it
+      // here is what keeps this to ONE round trip.
+      //
+      // Written unconditionally (not gated on `!originMg.name`): this is the
+      // first inbound event for a fresh, unwired mg, and `reportChannelMetadata`
+      // (chat-sdk-bridge.ts, one-shot per channel per process) races this same
+      // event with its own, cruder name lookup — main.ts's `onMetadata` never
+      // overwrites a name once set, so whichever of the two writers runs
+      // second here always wins with the richer answer, instead of the
+      // outcome depending on which network round trip happened to finish
+      // first.
+      const name = conversationDisplayName(conversation);
+      if (name && name !== originMg.name) {
         updateMessagingGroup(originMg.id, { name });
         originMg.name = name;
+      }
+    } else if (!originMg.name && channelAdapter?.resolveChannelName) {
+      // No rich classification available (adapter lacks the seam, or the
+      // lookup failed) — fall back to the plain resolver. Set-once: an
+      // adapter without the seam can't tell a stale legacy name from a good
+      // one, so an already-set name is left alone here as before.
+      try {
+        const name = await channelAdapter.resolveChannelName(originMg.platform_id);
+        if (name) {
+          updateMessagingGroup(originMg.id, { name });
+          originMg.name = name;
+        }
+      } catch {
+        /* non-critical */
       }
     }
   }
