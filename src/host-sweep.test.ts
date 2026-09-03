@@ -3003,6 +3003,36 @@ describe('sweepSession on a session with no mailbox', () => {
     closeDb();
   });
 
+  // Round 4: the outbound handle opens LAZILY, after the duties have started,
+  // so `enteredPlanSession` is already true when it fails. The error class, not
+  // the position, has to decide — otherwise a present-but-unreadable
+  // outbound.db is retried and logged every 60s instead of backing off, which
+  // is the repeated-error load the backoff exists to contain.
+  it('an unreadable outbound.db takes the mailbox backoff, not the per-tick duty retry', async () => {
+    const db = initTestDb();
+    runMigrations(db);
+    db.prepare(
+      `INSERT INTO agent_groups (id, name, folder, created_at)
+       VALUES ('ag-badout', 'bad outbound', 'bad-outbound', ?)`,
+    ).run(new Date().toISOString());
+    mockWakeContainer.mockReset();
+    mockIsContainerRunning.mockReset().mockReturnValue(false);
+    mockHasContainerEverRun.mockReset().mockReturnValue(false);
+    mockAdmitDueTaskContexts.mockReturnValue(0);
+
+    const session: Session = { ...fakeSession(), id: 'sess-badout', agent_group_id: 'ag-badout' };
+    getAgentMailbox().prepare({ agentGroupId: session.agent_group_id, sessionId: session.id });
+    // Present, non-empty, and not a database — exactly what a corrupt file or a
+    // failed hot-journal recovery leaves behind. The inbound side stays fine,
+    // so the failure can only surface from the lazy outbound open mid-duty.
+    const outboundPath = path.join(testDataDir.dir, 'v2-sessions', session.agent_group_id, session.id, 'outbound.db');
+    fs.writeFileSync(outboundPath, 'not a sqlite database at all');
+
+    // Backoff, not a throw: a rethrow here is the per-tick retry this pins against.
+    await expect(_sweepSessionForTesting(session)).resolves.toEqual(expect.any(Number));
+    closeDb();
+  });
+
   // Round 2: the backoff belongs to an unopenable mailbox, never to a duty
   // that threw. A transient SQLite lock during admission must retry on the
   // next 60s tick — quiet-caching it would hold an already-due scheduled task

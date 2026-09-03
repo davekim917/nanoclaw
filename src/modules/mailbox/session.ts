@@ -2,11 +2,11 @@
  * Typed entry points for fork callers.
  *
  * `session-manager.ts` owns the nesting guard and the provision-vs-exists
- * decision, and types its action against upstream's `MailboxSession` — the
- * only shape upstream's contract promises. The fork registers
- * `NanoclawAgentMailbox`, so every action actually receives a
- * `NanoclawMailboxSession`; these two wrappers say so once, here, instead of
- * making each of the ~20 fork callers repeat the same cast.
+ * decision, and already types its action as `NanoclawMailboxSession` — the
+ * shape `mailbox/compose.ts` guarantees every action receives, since it is
+ * what registers `NanoclawAgentMailbox`. These two wrappers are the
+ * fork-named entry points most callers reach for; they supply the name, not a
+ * narrowing.
  *
  * Deliberately a separate file from `index.ts`: this one imports
  * `session-manager.ts`, which imports the mailbox barrel, which composes this

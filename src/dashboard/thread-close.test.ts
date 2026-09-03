@@ -238,6 +238,67 @@ describe('requestThreadClose', () => {
     expect(again.body).toMatchObject({ error: 'close_already_in_progress' });
   });
 
+  /**
+   * Two overlapping requests must produce ONE closure and ONE wrap-up.
+   *
+   * The `thread_closures` check and the reservation are no longer in the same
+   * synchronous step: `readSessionProposal` awaits since it moved behind the
+   * mailbox seam. Both calls below therefore run to that await before either
+   * writes — no timers or fakes needed, just not awaiting the first before
+   * starting the second, which is exactly a double-click.
+   *
+   * With an unconditional upsert both answered 202, both fanned out a wrap-up,
+   * and the second silently took over the first's actor, reason and
+   * confirmation window.
+   *
+   * Its own thread and session: this case materializes a mailbox and writes to
+   * it, and the scratch root is shared across the file's cases.
+   */
+  it('reserves the closure atomically, so two overlapping requests do not both win', async () => {
+    const THREAD_RACE = 'slack:C1:race';
+    insertSession('s-race', 'ag1', THREAD_RACE);
+    fs.rmSync(path.dirname(dbPathFor('ag1', 's-race', 'inbound.db')), { recursive: true, force: true });
+    materializeSession('ag1', 's-race');
+
+    // Not awaited between the two — both reach the proposal read and yield
+    // before either reserves.
+    const first = requestThreadClose(THREAD_RACE, { confirmations: 2, reason: 'first' }, ctxFor('admin'));
+    const second = requestThreadClose(THREAD_RACE, { confirmations: 2, reason: 'second' }, ctxFor('admin'));
+    const [a, b] = await Promise.all([first, second]);
+
+    // Exactly one winner, and the loser gets the in-flight refusal. Before the
+    // atomic reservation this was [202, 202].
+    expect([a.status, b.status].sort()).toEqual([202, 409]);
+    const winner = a.status === 202 ? a : b;
+    const loser = a.status === 409 ? a : b;
+    expect(loser.body).toMatchObject({ error: 'close_already_in_progress' });
+
+    // One closure, holding the winner's request — the loser did not overwrite
+    // it, and the loser reports the winner's timestamp back.
+    expect(
+      getDb().prepare('SELECT COUNT(*) AS n FROM thread_closures WHERE thread_id = ?').get(THREAD_RACE),
+    ).toMatchObject({
+      n: 1,
+    });
+    const row = getDb().prepare('SELECT * FROM thread_closures WHERE thread_id = ?').get(THREAD_RACE) as {
+      requested_at: string;
+      reason: string;
+      state: string;
+    };
+    expect(row.state).toBe('awaiting_confirmation');
+    expect(row.requested_at).toBe(winner.body.requested_at);
+    expect(loser.body.requested_at).toBe(row.requested_at);
+    expect(['first', 'second']).toContain(row.reason);
+
+    // And one request means one wrap-up: the loser never reached the fan-out.
+    const inbound = new Database(dbPathFor('ag1', 's-race', 'inbound.db'), { readonly: true });
+    const wrapUps = inbound.prepare("SELECT COUNT(*) AS n FROM messages_in WHERE kind = 'system'").get() as {
+      n: number;
+    };
+    inbound.close();
+    expect(wrapUps.n).toBe(1);
+  });
+
   it('lands the wrap-up as a real deferred system row the running container will see', async () => {
     materializeSession('ag1', 's1');
     const res = await requestThreadClose('slack:C1:1.1', { confirmations: 2 }, ctxFor('admin'));
@@ -467,6 +528,45 @@ describe('the close sequence order', () => {
     expect(getDb().prepare('SELECT archived_at FROM sessions WHERE id = ?').get('s1')).not.toMatchObject({
       archived_at: null,
     });
+  });
+
+  /**
+   * The never-woken shape: inbound.db exists, outbound.db never did, because
+   * outbound.db is the CONTAINER's file and no container ever ran here.
+   * `exists()` answers on inbound.db alone, so the force-clear's session opens
+   * normally and then reaches a writable outbound op with no file under it.
+   *
+   * There is provably no continuation to clear on such a session, so the close
+   * must proceed. Before the `hasOutbound` guard the opener threw,
+   * `ensureContinuationCleared` read that as not-cleared, and the closure sat
+   * in `finalizing` on every later tick — a thread an operator confirmed twice
+   * that never closes.
+   */
+  it('closes a never-woken session that has no outbound.db, without authoring one', async () => {
+    startClose();
+    // Inbound only — deliberately NOT materializeSession, which makes both.
+    // The scratch root is shared across this file's cases, so clear the
+    // directory first: an earlier case materialized the same session id.
+    fs.rmSync(path.dirname(dbPathFor('ag1', 's1', 'inbound.db')), { recursive: true, force: true });
+    fs.mkdirSync(path.dirname(dbPathFor('ag1', 's1', 'inbound.db')), { recursive: true });
+    ensureSchema(dbPathFor('ag1', 's1', 'inbound.db'), 'inbound');
+    expect(fs.existsSync(dbPathFor('ag1', 's1', 'outbound.db'))).toBe(false);
+
+    // The production force-clear, not an injected one.
+    await advanceThreadClosures({
+      now: NOW,
+      isContainerRunning: () => false,
+      readProposal: () => null,
+    });
+
+    // It closed, and the host did not author the container's file to do it.
+    expect(getDb().prepare('SELECT state FROM thread_closures WHERE thread_id = ?').get(THREAD)).toMatchObject({
+      state: 'closed',
+    });
+    expect(getDb().prepare('SELECT archived_at FROM sessions WHERE id = ?').get('s1')).not.toMatchObject({
+      archived_at: null,
+    });
+    expect(fs.existsSync(dbPathFor('ag1', 's1', 'outbound.db'))).toBe(false);
   });
 
   it('is idempotent — a second tick over an already-closed thread does nothing', async () => {

@@ -79,9 +79,15 @@ describe('agent mailbox registry', () => {
     // ratchet scanner answers, so this asks it rather than writing a second
     // pattern set that could drift from it.
     const offenders = new Set(computeOffenders().map((o) => o.file));
-    for (const relative of ['src/session-manager.ts', 'src/host-sweep.ts', 'src/modules/scheduling/recurrence.ts']) {
+    for (const relative of ['src/session-manager.ts', 'src/modules/scheduling/recurrence.ts']) {
       expect(offenders.has(relative), `${relative} still reaches a session DB directly`).toBe(false);
     }
+    // `src/host-sweep.ts` is deliberately absent from that list: its usage
+    // rollup reads outbound.db through the module's open funnel on purpose
+    // (the seam's existence gate is inbound-keyed and stranded turn_usage
+    // rows), so it is a documented entry on RATCHET.json rather than a clean
+    // file. `src/mailbox-seam-ratchet.test.ts` is what pins that exemption —
+    // asserting it here too would just duplicate the pin in a second place.
   });
 
   it('does not hide a missing composition behind a fallback', () => {

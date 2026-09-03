@@ -332,6 +332,47 @@ describe('writeSessionMessage re-provisions a deleted session folder', () => {
     expect(fs.existsSync(sessionDir(AG, SESS))).toBe(false);
   });
 
+  /**
+   * Routine ingress must never write the container-owned outbound.db.
+   *
+   * The provisioning funnel's `prepare()` calls `ensureSchema(..., 'outbound')`,
+   * which opens that file read-write and runs DDL. A message arriving while the
+   * container is live would make the host a second writer on a cross-mount
+   * SQLite file, on every message — which is not what the pre-seam path did
+   * (it opened inbound.db and nothing else).
+   *
+   * Deleting outbound.db is the crisp probe: `ensureSchema` would recreate it,
+   * so its continued absence proves no writable outbound open happened. The
+   * message must still land, because the whole point is that the inbound write
+   * is unaffected.
+   */
+  it('does not open or recreate outbound.db when writing to a session that already exists', async () => {
+    initSessionFolder(AG, SESS);
+    expect(fs.existsSync(outboundDbPath(AG, SESS))).toBe(true);
+    fs.rmSync(outboundDbPath(AG, SESS));
+
+    await writeSessionMessage(AG, SESS, {
+      id: 'no-outbound-write-1',
+      kind: 'chat',
+      timestamp: new Date().toISOString(),
+      platformId: 'slack:C1',
+      channelType: 'slack',
+      threadId: null,
+      content: JSON.stringify({ text: 'routine ingress' }),
+    });
+
+    expect(fs.existsSync(outboundDbPath(AG, SESS))).toBe(false);
+    const db = new Database(inboundDbPath(AG, SESS), { readonly: true });
+    try {
+      const row = db.prepare('SELECT id FROM messages_in WHERE id = ?').get('no-outbound-write-1') as
+        | { id: string }
+        | undefined;
+      expect(row?.id).toBe('no-outbound-write-1');
+    } finally {
+      db.close();
+    }
+  });
+
   it('deduplicates replayed platform message ids before they can create a second agent turn', async () => {
     const input = {
       id: 'discord-message-1:ag-test',

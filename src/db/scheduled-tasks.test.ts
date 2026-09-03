@@ -717,6 +717,60 @@ describe('test_scheduleTask_resolves_session_when_missing', () => {
   });
 });
 
+// ── test_scheduleTask_leaves_the_container_owned_outbound_alone ────────────
+describe('test_scheduleTask_leaves_the_container_owned_outbound_alone', () => {
+  /**
+   * A second task on a live series must not write the container's file.
+   *
+   * `resolveTaskSession` hands back the EXISTING per-series session here, and
+   * its container may be running. The provisioning funnel's `prepare()` calls
+   * `ensureSchema(..., 'outbound')`, which opens outbound.db read-write and
+   * runs DDL across the mount — the same defect Codex raised against routine
+   * ingress on #291, in the other place it occurred. Pre-seam this path opened
+   * inbound.db alone.
+   *
+   * Deleting outbound.db is the probe: `ensureSchema` would recreate it, so
+   * its continued absence proves no writable outbound open happened. The task
+   * row must still land, because the inbound write is what this path is for.
+   */
+  it('does not open or recreate outbound.db when the series session already exists', async () => {
+    const processAfter = new Date(Date.now() + 86400000).toISOString();
+    const base = {
+      agentGroupId: AGENT_GROUP_ID,
+      cron: '0 4 * * *',
+      processAfter,
+      seriesId: 's-outbound',
+      destination: TEST_DESTINATION,
+    };
+
+    // First call creates the session and provisions both DBs.
+    await scheduleTask({ ...base, id: 't-outbound-1', prompt: 'first' }, TEST_DIR);
+    const sessionRow = getDb()
+      .prepare(
+        "SELECT id FROM sessions WHERE agent_group_id = ? AND messaging_group_id IS NULL AND thread_id = ? AND status = 'active' LIMIT 1",
+      )
+      .get(AGENT_GROUP_ID, taskThreadId('s-outbound')) as { id: string };
+    const outbound = path.join(agentSessionDir(sessionRow.id), 'outbound.db');
+    expect(fs.existsSync(outbound)).toBe(true);
+    fs.rmSync(outbound);
+
+    // Second call on the same series — the session exists now.
+    await scheduleTask({ ...base, id: 't-outbound-2', prompt: 'second' }, TEST_DIR);
+
+    expect(fs.existsSync(outbound)).toBe(false);
+    // `upsertTaskSeries` keeps one live row per series and updates it in place,
+    // so the second call is visible as the new content on the same row — which
+    // is the point: the inbound write still happened.
+    const db = openInboundDb(inboundPath(sessionRow.id));
+    const rows = db
+      .prepare("SELECT id, content FROM messages_in WHERE series_id = 's-outbound' ORDER BY seq")
+      .all() as Array<{ id: string; content: string }>;
+    db.close();
+    expect(rows).toHaveLength(1);
+    expect(JSON.parse(rows[0]!.content).prompt).toBe('second');
+  });
+});
+
 // ── test_resolveActiveSession_unique_index_handles_race ────────────────────
 describe('test_resolveActiveSession_unique_index_handles_race', () => {
   it('returns the existing session when UNIQUE constraint blocks a concurrent INSERT', async () => {

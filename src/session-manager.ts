@@ -974,20 +974,39 @@ async function writeSessionMessageLocked(
   };
   // One session for the whole write: the recall lifecycle reads and the paired
   // insert are one logical step against this session's mailbox, and the pair
-  // must be decided from the same snapshot the insert lands in. Provisioning
-  // is deliberate here — this is the write that legitimately creates a session
-  // (the re-provision branch above is the documented operator reset).
+  // must be decided from the same snapshot the insert lands in.
   //
-  // Callers must not already hold a session on this key: withMailboxSession
-  // throws on same-key nesting. Every host caller was audited for this in the
-  // ingress batch; delivery action handlers in particular run with no session
-  // open (plan §4.5b, invariant I-9).
-  const inserted = await withMailboxSession(agentGroupId, sessionId, (mailbox) => {
+  // EXISTING-ONLY first, and that is the point. The provisioning funnel runs
+  // `prepare()`, which runs `ensureSchema(..., 'outbound')` — it opens the
+  // CONTAINER-owned outbound.db read-write and executes DDL. Routine ingress
+  // runs while that container is live and writing the same file across the
+  // mount, and pre-seam this path only ever opened inbound.db, so taking the
+  // provisioning funnel per message made the host a second writer for no gain.
+  //
+  // Nothing is lost by skipping `prepare()` here. Both branches above already
+  // provision explicitly when they must, so the mailbox exists by this line;
+  // and the inbound repair `prepare()` would do is done by `session()` itself
+  // on either funnel — the first touch of a path in a process runs upstream's
+  // `migrateMessagesInTable` plus `ensureNanoclawInboundSchema`, which creates
+  // and migrates `session_routing`. What is skipped is exactly the write to
+  // the file the host does not own.
+  //
+  // The provisioning fallback is the reclaim race between the check above and
+  // this open, and it keeps this path's behavior identical to what it replaced.
+  //
+  // Callers must not already hold a session on this key: both funnels throw on
+  // same-key nesting. Every host caller was audited for this in the ingress
+  // batch; delivery action handlers in particular run with no session open
+  // (plan §4.5b, invariant I-9).
+  const insert = (mailbox: NanoclawMailboxSession): boolean => {
     const recallRow = isScheduledTask ? null : buildRecallRow(agentGroupId, sessionId, message, content, mailbox);
     if (ignoreDuplicateId) return mailbox.insertMessageWithContextIfNew(row, recallRow);
     mailbox.insertMessageWithContext(row, recallRow);
     return true;
-  });
+  };
+  const inserted =
+    (await withExistingMailboxSession(agentGroupId, sessionId, insert)) ??
+    (await withMailboxSession(agentGroupId, sessionId, insert));
 
   if (!inserted) {
     log.debug('Duplicate inbound message ignored', { agentGroupId, sessionId, messageId: message.id });
