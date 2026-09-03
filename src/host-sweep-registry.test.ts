@@ -1216,7 +1216,8 @@ describe('sweep duty registry (S2-PR2)', () => {
   // ── F-14.1 (S2-PR14, plan.md §8) ─────────────────────────────────────────────
   //
   // Structural, not a line budget. The plan's original "under 300 lines" was an
-  // estimate written before the build; the end state is 1,136 lines (`wc -l`) —
+  // estimate written before the build; on this lineage the end state is 1,347
+  // lines (`wc -l`). S2-PR14's own branch measured 1,136 lines —
   // 631 code, 420 comment, 85 blank — and holds no duty body at all. The
   // assertion below counts `split('\n')` elements, which is one more (1,137) for
   // a file ending in a newline; the ceiling is set against that measure. Section
@@ -1321,16 +1322,19 @@ describe('sweep duty registry (S2-PR2)', () => {
       expect(actualExports, `host-sweep.ts no longer exports ${core}`).toContain(core);
     }
 
-    // Regrowth ratchet. 1,281 by this measure today (1,280 by `wc -l`); the
-    // headroom is for comments and the driver's own evolution, never for a duty
-    // body coming home. Raised from 1,200 at S2-PR15, which added ~144 lines of
-    // DRIVER machinery to the quiet cache — the jittered backoff, the batched
-    // mark persistence and the boot-time warm — a section §4.4 already assigns
-    // to this file. The three structural assertions above are what the F-14.1
-    // criterion actually means and none of them moved: no duty originates here,
-    // no registration surface is called inline, and the export allowlist grew
-    // by one tick constant and two test accessors.
-    expect(source.split('\n').length).toBeLessThanOrEqual(1300);
+    // Regrowth ratchet. 1,348 by this measure on the B3 integration lineage
+    // (1,347 by `wc -l`), against 1,281 on S2-PR14's own branch. The 67-line
+    // difference is not a duty coming home: it is mailbox seam PR 5b's guard
+    // prose (`writeOutboundWhenStopped` / `withStoppedContainerSession` carry
+    // their full doc blocks here) plus mailbox PR 7's rewritten comments on the
+    // admission and usage-rollup seams — comment lines in a file that holds no
+    // duty body at all. Raised from 1,300 for that reason; the headroom is for
+    // comments and the driver's own evolution, never for a duty body. Set as
+    // measured + ~60, rounded up to the next hundred. The three structural
+    // assertions above are what the F-14.1 criterion actually means and none of
+    // them moved: no duty originates here, no registration surface is called
+    // inline, and the export allowlist is unchanged.
+    expect(source.split('\n').length).toBeLessThanOrEqual(1500);
     expect(h.spawns).toEqual([]);
   });
 
