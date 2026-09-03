@@ -151,3 +151,25 @@ function parseUserId(user: User): { channelType: string; handle: string } | { ch
   }
   return { channelType: prefix, handle };
 }
+
+/**
+ * The channel kind a user is actually reachable on — the same answer
+ * `ensureUserDm` resolves internally, exposed for callers that must decide
+ * reachability BEFORE paying for a DM resolution.
+ *
+ * Not the same thing as the user id's prefix. Teams ids carry a Bot Framework
+ * `29:` prefix rather than `teams:`, so a caller that splits the id itself
+ * reads `29` and compares it against a channel_type of `teams` — the match
+ * fails and the approver is dropped before `ensureUserDm` is ever called.
+ * Routing that question through `parseUserId` is what keeps the two layers
+ * from disagreeing: whatever kind ensureUserDm would DM this user on is the
+ * kind reported here.
+ *
+ * Returns null when the user is unknown or the id is not resolvable to a
+ * channel at all — callers should read that as "not reachable on any origin".
+ */
+export function resolveUserChannelType(userId: string): string | null {
+  const user = getUser(userId);
+  if (!user) return null;
+  return parseUserId(user).channelType;
+}

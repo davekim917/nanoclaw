@@ -35,7 +35,7 @@ import { log } from '../../log.js';
 import { writeSessionMessage } from '../../session-manager.js';
 import type { MessagingGroup, PendingApproval, Session } from '../../types.js';
 import { getAdminsOfAgentGroup, getGlobalAdmins, getOwners } from '../permissions/db/user-roles.js';
-import { ensureUserDm } from '../permissions/user-dm.js';
+import { ensureUserDm, resolveUserChannelType } from '../permissions/user-dm.js';
 
 /**
  * Card value for the "Reject with reason…" button. Selecting it doesn't
@@ -186,7 +186,14 @@ export async function pickApprovalDelivery(
 ): Promise<{ userId: string; messagingGroup: MessagingGroup } | null> {
   if (originChannelType) {
     for (const userId of approvers) {
-      if (channelTypeOf(userId) !== originChannelType) continue;
+      // resolveUserChannelType, NOT a split on the id's own `:` prefix. A
+      // Teams owner's id is `29:<aad-id>`, so the raw prefix is `29` and the
+      // comparison against a `teams` origin never matches — with
+      // sameChannelTypeOnly the whole function then returns null and no
+      // approver is reachable at all. The permissions layer already resolves
+      // this (parseUserId falls back to user.kind); asking it is what keeps
+      // the two sides from disagreeing.
+      if (resolveUserChannelType(userId) !== originChannelType) continue;
       const mg = await ensureUserDm(userId);
       if (mg) return { userId, messagingGroup: mg };
     }
@@ -199,10 +206,6 @@ export async function pickApprovalDelivery(
   return null;
 }
 
-function channelTypeOf(userId: string): string {
-  const idx = userId.indexOf(':');
-  return idx < 0 ? '' : userId.slice(0, idx);
-}
 
 // ── Request API ──
 
