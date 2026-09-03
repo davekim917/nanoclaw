@@ -24,7 +24,9 @@
  * PR 4's head `2d1e345d`), so `legacyInboundHandle()` moves here with the body
  * and this file joins `src/mailbox/RATCHET.json` until the mailbox series
  * converts it — the same deliberate, written-down exception S2-PR7 carries for
- * its raw opener.
+ * its raw opener. Removal trigger: remove this allowlist entry when the mailbox
+ * seam converts that callee to take a session; nothing else in this file
+ * touches a raw session-DB handle.
  */
 import { isContainerRunning } from '../../container-runner.js';
 import {
@@ -49,8 +51,10 @@ import { parseSqliteUtc } from '../mailbox/sqlite-utc.js';
 const parsedMaxAgeHours = Number(process.env.PENDING_MESSAGE_MAX_AGE_HOURS);
 export const PENDING_MESSAGE_MAX_AGE_MS =
   (Number.isFinite(parsedMaxAgeHours) && parsedMaxAgeHours > 0 ? parsedMaxAgeHours : 24) * 60 * 60 * 1000;
-const MAX_TRIES = 5;
-const BACKOFF_BASE_MS = 5000;
+// Exported so a test pins the retry ladder against the numbers the body
+// actually uses (`BACKOFF_BASE_MS * 2 ** tries`) rather than restating them.
+export const MAX_TRIES = 5;
+export const BACKOFF_BASE_MS = 5000;
 
 function resetStuckProcessingRows(mailbox: NanoclawMailboxSession, session: Session, reason: string): void {
   const claims = mailbox.getProcessingClaimRows();
@@ -119,14 +123,6 @@ function resetStuckProcessingRows(mailbox: NanoclawMailboxSession, session: Sess
   } catch (err) {
     log.warn('Failed to clear orphan processing claims', { sessionId: session.id, err });
   }
-}
-
-export function _resetStuckProcessingRowsForTesting(
-  mailbox: NanoclawMailboxSession,
-  session: Session,
-  reason: string,
-): void {
-  resetStuckProcessingRows(mailbox, session, reason);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

@@ -25,7 +25,7 @@ import {
   type SweepKillFollowUp,
   type SweepSessionContext,
 } from '../../host-sweep.js';
-import { PENDING_MESSAGE_MAX_AGE_MS, _resetStuckProcessingRowsForTesting } from './index.js';
+import { BACKOFF_BASE_MS, MAX_TRIES, PENDING_MESSAGE_MAX_AGE_MS } from './index.js';
 // Importing the module registers S2/S3/S4/S17 as a duty source — every case
 // below reads them back out of the registry rather than calling a body.
 import './index.js';
@@ -248,6 +248,19 @@ function registeredKillFollowUp(name: string): SweepKillFollowUp {
   return followUp;
 }
 
+/**
+ * Drive the REGISTERED S17 tail duty over a stopped session that has an
+ * outbound file — the only shape in which it does anything. Every case that
+ * exercises the orphan-claim reset goes through this, never through the body:
+ * a case that called the body directly would stay green even if the registered
+ * wrapper dropped `ctx.mailbox` or no-oped (series rule, plan §8).
+ */
+async function runRegisteredOrphanReset(mailbox: NanoclawMailboxSession, calls: string[] = []): Promise<void> {
+  const duty = registeredDuty(SWEEP_DUTY_INVENTORY.S17);
+  expect(duty.claims).toBeUndefined();
+  await duty.run(sessionCtx(recordingMailbox(mailbox, calls), { alive: false, hasOutbound: true }));
+}
+
 const HOUR_MS = 60 * 60 * 1000;
 
 beforeEach(() => {
@@ -380,53 +393,85 @@ describe('S2-PR9 — per-session core', () => {
     const s17 = registeredDuty(SWEEP_DUTY_INVENTORY.S17);
     expect([s17.phase, s17.order]).toEqual(['session:tail', 10]);
 
-    const { inDb, outDb, mailbox } = makeSessionDbs();
-    const claimedAt = new Date(Date.now() - 2 * HOUR_MS).toISOString();
-    inDb
-      .prepare(
-        `INSERT INTO messages_in (id, seq, kind, timestamp, status, tries, content)
-         VALUES ('m-answered', 1, 'chat', ?, 'pending', 0, '{}'),
-                ('m-spent', 2, 'chat', ?, 'pending', 5, '{}'),
-                ('m-retry', 3, 'chat', ?, 'pending', 2, '{}')`,
-      )
-      .run(claimedAt, claimedAt, claimedAt);
-    outDb
-      .prepare(
-        `INSERT INTO processing_ack VALUES ('m-answered', 'processing', ?),
-                                           ('m-spent', 'processing', ?),
-                                           ('m-retry', 'processing', ?)`,
-      )
-      .run(claimedAt, claimedAt, claimedAt);
-    outDb
-      .prepare(
-        `INSERT INTO messages_out (id, seq, in_reply_to, timestamp, kind, content)
-         VALUES ('reply-1', 1, 'm-answered', ?, 'chat', '{}')`,
-      )
-      .run(new Date().toISOString());
+    // Fake timers so the deferred stamp is an exact value, not "some future
+    // time": the body computes `BACKOFF_BASE_MS * 2 ** tries`, floors it to
+    // whole seconds, and `deferMessageForFreshContextRetry` stamps
+    // `Date.now() + backoffSec * 1000`. Both constants are imported from the
+    // module under test so the ladder cannot drift away from this assertion.
+    vi.useFakeTimers();
+    const t0 = Date.parse('2026-04-20T12:00:00.000Z');
+    vi.setSystemTime(t0);
+    try {
+      const { inDb, outDb, mailbox } = makeSessionDbs();
+      const claimedAt = new Date(t0 - 2 * HOUR_MS).toISOString();
+      inDb
+        .prepare(
+          `INSERT INTO messages_in (id, seq, kind, timestamp, status, tries, content)
+           VALUES ('m-answered', 1, 'chat', ?, 'pending', 0, '{}'),
+                  ('m-spent', 2, 'chat', ?, 'pending', ?, '{}'),
+                  ('m-retry', 3, 'chat', ?, 'pending', 2, '{}')`,
+        )
+        .run(claimedAt, claimedAt, MAX_TRIES, claimedAt);
+      const claimAll = (): void => {
+        outDb
+          .prepare(
+            `INSERT OR REPLACE INTO processing_ack VALUES ('m-answered', 'processing', ?),
+                                                          ('m-spent', 'processing', ?),
+                                                          ('m-retry', 'processing', ?)`,
+          )
+          .run(claimedAt, claimedAt, claimedAt);
+      };
+      claimAll();
+      outDb
+        .prepare(
+          `INSERT INTO messages_out (id, seq, in_reply_to, timestamp, kind, content)
+           VALUES ('reply-1', 1, 'm-answered', ?, 'chat', '{}')`,
+        )
+        .run(new Date(t0).toISOString());
 
-    const calls: string[] = [];
-    await s17.run(sessionCtx(recordingMailbox(mailbox, calls), { alive: false, hasOutbound: true }));
+      const calls: string[] = [];
+      await runRegisteredOrphanReset(mailbox, calls);
 
-    const rows = Object.fromEntries(
-      (
-        inDb.prepare('SELECT id, status, tries, process_after FROM messages_in').all() as Array<{
-          id: string;
+      const read = (id: string): { status: string; tries: number; process_after: string | null } =>
+        inDb.prepare('SELECT status, tries, process_after FROM messages_in WHERE id = ?').get(id) as {
           status: string;
           tries: number;
           process_after: string | null;
-        }>
-      ).map((r) => [r.id, r]),
-    );
-    // Dup-reply guard: an already-answered input is completed, never retried.
-    expect(rows['m-answered']).toMatchObject({ status: 'completed', tries: 0, process_after: null });
-    // Past MAX_TRIES (5): failed, not deferred again.
-    expect(rows['m-spent']).toMatchObject({ status: 'failed', tries: 5 });
-    // Retry backoff: tries bumped and a future process_after stamped.
-    expect(rows['m-retry']!.status).toBe('pending');
-    expect(rows['m-retry']!.tries).toBe(3);
-    expect(Date.parse(rows['m-retry']!.process_after!)).toBeGreaterThan(Date.now());
-    expect(calls).toContain('markInboundCompletedIfPending');
-    expect(calls).toContain('markMessageFailed');
+        };
+
+      // Dup-reply guard: an already-answered input is completed, never retried.
+      expect(read('m-answered')).toEqual({ status: 'completed', tries: 0, process_after: null });
+      // At MAX_TRIES: failed, not deferred again.
+      expect(read('m-spent')).toMatchObject({ status: 'failed', tries: MAX_TRIES });
+      expect(read('m-spent').process_after).toBeNull();
+      // Retry backoff, attempt 1: tries 2 -> 3, deferred by exactly
+      // BACKOFF_BASE_MS * 2 ** 2 (20 s) from now.
+      const firstDelayMs = Math.floor((BACKOFF_BASE_MS * 2 ** 2) / 1000) * 1000;
+      expect(firstDelayMs).toBe(20_000);
+      expect(read('m-retry')).toEqual({
+        status: 'pending',
+        tries: 3,
+        process_after: new Date(t0 + firstDelayMs).toISOString(),
+      });
+      expect(calls).toContain('markInboundCompletedIfPending');
+      expect(calls).toContain('markMessageFailed');
+
+      // A second crash after the backoff elapsed doubles the delay — the ladder
+      // grows with `tries`, it is not a fixed pause.
+      const t1 = t0 + firstDelayMs + 1_000;
+      vi.setSystemTime(t1);
+      claimAll();
+      await runRegisteredOrphanReset(mailbox);
+      const secondDelayMs = Math.floor((BACKOFF_BASE_MS * 2 ** 3) / 1000) * 1000;
+      expect(secondDelayMs).toBe(firstDelayMs * 2);
+      expect(read('m-retry')).toEqual({
+        status: 'pending',
+        tries: 4,
+        process_after: new Date(t1 + secondDelayMs).toISOString(),
+      });
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   // ── F-9.4 ──────────────────────────────────────────────────────────────────
@@ -583,8 +628,13 @@ describe('deleteOrphanProcessingClaims', () => {
   });
 });
 
+// Ported verbatim except for the invocation: each case now drives the
+// REGISTERED S17 tail duty through the registry instead of the moved body's
+// test-only alias (series rule, plan §8). Every assertion is unchanged; the
+// alias's `reason` argument becomes the tail duty's own 'container not
+// running', which no assertion here reads.
 describe('resetStuckProcessingRows — orphan claim cleanup', () => {
-  it('deletes orphan processing_ack rows so next sweep tick does not see them', () => {
+  it('deletes orphan processing_ack rows so next sweep tick does not see them', async () => {
     const { inDb, outDb, mailbox } = makeSessionDbs();
     const claimedAt = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString(); // 2h ago
 
@@ -601,7 +651,7 @@ describe('resetStuckProcessingRows — orphan claim cleanup', () => {
     // Sanity: the orphan claim is what would trip claim-stuck.
     expect(getProcessingClaims(outDb)).toHaveLength(1);
 
-    _resetStuckProcessingRowsForTesting(mailbox, fakeSession(), 'absolute-ceiling');
+    await runRegisteredOrphanReset(mailbox);
 
     // Regression assertion: orphan claim is gone — next sweep tick will see
     // an empty claims list and not kill the freshly respawned container.
@@ -618,7 +668,7 @@ describe('resetStuckProcessingRows — orphan claim cleanup', () => {
     expect(row.process_after).not.toBeNull();
   });
 
-  it('makes a paired crashed turn inert with its recall until fresh due admission', () => {
+  it('makes a paired crashed turn inert with its recall until fresh due admission', async () => {
     const { inDb, outDb, mailbox } = makeSessionDbs();
     const claimedAt = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString();
     inDb
@@ -638,7 +688,7 @@ describe('resetStuckProcessingRows — orphan claim cleanup', () => {
       );
     outDb.prepare("INSERT INTO processing_ack VALUES ('m-paired', 'processing', ?)").run(claimedAt);
 
-    _resetStuckProcessingRowsForTesting(mailbox, fakeSession(), 'container-crash');
+    await runRegisteredOrphanReset(mailbox);
 
     const pair = inDb.prepare('SELECT id, trigger, tries, process_after FROM messages_in ORDER BY seq').all() as Array<{
       id: string;
@@ -666,7 +716,7 @@ describe('resetStuckProcessingRows — orphan claim cleanup', () => {
     expect(getProcessingClaims(outDb)).toEqual([]);
   });
 
-  it('still clears orphan claims even when the inbound message has already been retried (skip path)', () => {
+  it('still clears orphan claims even when the inbound message has already been retried (skip path)', async () => {
     // Edge case: the inbound row was already rescheduled (process_after in
     // future), so the per-message retry loop skips it. The orphan in
     // processing_ack must still be removed — otherwise the bug remains.
@@ -681,14 +731,14 @@ describe('resetStuckProcessingRows — orphan claim cleanup', () => {
       .run(claimedAt, future);
     outDb.prepare("INSERT INTO processing_ack VALUES ('m-2', 'processing', ?)").run(claimedAt);
 
-    _resetStuckProcessingRowsForTesting(mailbox, fakeSession(), 'claim-stuck');
+    await runRegisteredOrphanReset(mailbox);
 
     expect(getProcessingClaims(outDb)).toEqual([]);
     const row = inDb.prepare('SELECT tries FROM messages_in WHERE id = ?').get('m-2') as { tries: number };
     expect(row.tries).toBe(1); // not bumped, the skip path held
   });
 
-  it('retries an input that produced only progress/status rows', () => {
+  it('retries an input that produced only progress/status rows', async () => {
     const { inDb, outDb, mailbox } = makeSessionDbs();
     const claimedAt = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString();
 
@@ -704,7 +754,7 @@ describe('resetStuckProcessingRows — orphan claim cleanup', () => {
       )
       .run(new Date().toISOString());
 
-    _resetStuckProcessingRowsForTesting(mailbox, fakeSession(), 'absolute-ceiling');
+    await runRegisteredOrphanReset(mailbox);
 
     const row = inDb
       .prepare('SELECT status, tries, process_after FROM messages_in WHERE id = ?')
@@ -715,7 +765,7 @@ describe('resetStuckProcessingRows — orphan claim cleanup', () => {
     expect(getProcessingClaims(outDb)).toEqual([]);
   });
 
-  it('does not retry an input after a non-status response was written', () => {
+  it('does not retry an input after a non-status response was written', async () => {
     const { inDb, outDb, mailbox } = makeSessionDbs();
     const claimedAt = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString();
 
@@ -731,7 +781,7 @@ describe('resetStuckProcessingRows — orphan claim cleanup', () => {
       )
       .run(new Date().toISOString());
 
-    _resetStuckProcessingRowsForTesting(mailbox, fakeSession(), 'absolute-ceiling');
+    await runRegisteredOrphanReset(mailbox);
 
     const row = inDb.prepare('SELECT status, tries, process_after FROM messages_in WHERE id = ?').get('m-answered') as {
       status: string;
