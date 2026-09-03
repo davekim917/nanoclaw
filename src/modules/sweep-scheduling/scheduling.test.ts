@@ -191,6 +191,9 @@ import { _prepareDueWakeForTesting, shouldCloseTaskSession } from './index.js';
 // Importing the module registers T8/S5/S18/S19 as a duty source, which is what
 // every case below drives through.
 import './index.js';
+// PR 14 integration: the session:tail chain case also pins S17, which moved
+// to the per-session-core family (S2-PR9).
+import '../sweep-session-core/index.js';
 
 // ─── fixtures ────────────────────────────────────────────────────────────────
 

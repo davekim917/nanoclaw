@@ -29,6 +29,9 @@ import { BACKOFF_BASE_MS, MAX_TRIES, PENDING_MESSAGE_MAX_AGE_MS } from './index.
 // Importing the module registers S2/S3/S4/S17 as a duty source — every case
 // below reads them back out of the registry rather than calling a body.
 import './index.js';
+// PR 14 integration: the ordering case below drives session:plan up to S5,
+// which moved to the scheduling family (S2-PR11).
+import '../sweep-scheduling/index.js';
 import { log } from '../../log.js';
 import type { Session } from '../../types.js';
 

@@ -51,6 +51,10 @@ import {
 // needed so the registry lookups below and `_sweepSessionForTesting` (F-13.2,
 // F-13.4) see the real duties rather than the driver's remaining set.
 import './index.js';
+// PR 14 integration: the kill-sequence case drives the SLA duty (S14,
+// S2-PR10) and the post-kill orphan-claim reset (S17, S2-PR9).
+import '../sweep-container-health/index.js';
+import '../sweep-session-core/index.js';
 import { log } from '../../log.js';
 import type { Session } from '../../types.js';
 
