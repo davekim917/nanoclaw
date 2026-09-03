@@ -54,6 +54,12 @@ const h = vi.hoisted(() => {
     claimsOrder: [] as string[],
     claimsStore: [] as string[],
     claimsSelfHealSawStore: null as string[] | null,
+    // S2-PR15: the durable half of the quiet cache. `quietWrites` is one entry
+    // per persistence CALL (so a per-tick re-write shows up as a second entry);
+    // `persistedQuiet` stands in for the `sessions.sweep_quiet_until` column.
+    quietWrites: [] as { sessionId: string; quietUntil: string }[][],
+    persistedQuiet: new Map<string, { quietUntil: string; lastActiveAtWrite: string | null }>(),
+    failQuietPersist: false,
   };
 });
 
@@ -111,6 +117,32 @@ vi.mock('./db/sessions.js', async (importOriginal) => {
     getActiveSessions: () => h.sessions,
     getSession: (id: string) => h.sessions.find((s) => s.id === id),
     updateSession: () => undefined,
+    persistQuietSessionMarks: (marks: readonly { sessionId: string; quietUntil: string }[]) => {
+      if (h.failQuietPersist) throw new Error('quiet mark persistence: disk I/O error');
+      h.quietWrites.push(marks.map((m) => ({ ...m })));
+      for (const m of marks) {
+        const row = h.sessions.find((s) => s.id === m.sessionId);
+        h.persistedQuiet.set(m.sessionId, { quietUntil: m.quietUntil, lastActiveAtWrite: row?.last_active ?? null });
+      }
+    },
+    // The real query's three filters, over the fake column. The `last_active`
+    // arm models the production mechanism exactly: `updateSession` NULLs
+    // `sweep_quiet_until` in the same statement that writes `last_active`, so a
+    // moved `last_active` means the row simply is not returned. That clear is
+    // asserted against a real SQLite DB in
+    // src/db/migrations/065-sessions-sweep-quiet-until.test.ts.
+    getWarmQuietSessionMarks: (nowIso: string) => {
+      const nowMs = Date.parse(nowIso);
+      const rows: { id: string; sweep_quiet_until: string; last_active: string | null }[] = [];
+      for (const session of h.sessions) {
+        if (session.status !== 'active') continue;
+        const mark = h.persistedQuiet.get(session.id);
+        if (!mark || mark.lastActiveAtWrite !== session.last_active) continue;
+        if (!(Date.parse(mark.quietUntil) > nowMs)) continue;
+        rows.push({ id: session.id, sweep_quiet_until: mark.quietUntil, last_active: session.last_active });
+      }
+      return rows;
+    },
   };
 });
 
@@ -251,6 +283,7 @@ import {
   _listSweepRegistrationsForTesting,
   _resetSweepRegistryForTesting,
   _unregisterSweepDutySourceForTesting,
+  _lastSweepTickStatsForTesting,
   _resetQuietSessionCacheForTesting,
   _setSweepYieldForTesting,
   _sweepOnceForTesting,
@@ -436,6 +469,9 @@ describe('sweep duty registry (S2-PR2)', () => {
     h.claimsOrder = [];
     h.claimsStore = ['claim-merged', 'claim-open'];
     h.claimsSelfHealSawStore = null;
+    h.quietWrites.length = 0;
+    h.persistedQuiet.clear();
+    h.failQuietPersist = false;
   });
 
   afterEach(() => {
@@ -1243,6 +1279,7 @@ describe('sweep duty registry (S2-PR2)', () => {
       'decideCeilingFollowUp',
       'WORK_CONTINUATION_RESUME_MAX_ATTEMPTS',
       // test accessors
+      '_lastSweepTickStatsForTesting',
       '_listSweepRegistrationsForTesting',
       '_resetQuietSessionCacheForTesting',
       '_resetSweepRegistryForTesting',
@@ -1259,10 +1296,16 @@ describe('sweep duty registry (S2-PR2)', () => {
       expect(actualExports, `host-sweep.ts no longer exports ${core}`).toContain(core);
     }
 
-    // Regrowth ratchet. 1,137 by this measure today (1,136 by `wc -l`); the
+    // Regrowth ratchet. 1,281 by this measure today (1,280 by `wc -l`); the
     // headroom is for comments and the driver's own evolution, never for a duty
-    // body coming home.
-    expect(source.split('\n').length).toBeLessThanOrEqual(1200);
+    // body coming home. Raised from 1,200 at S2-PR15, which added ~144 lines of
+    // DRIVER machinery to the quiet cache — the jittered backoff, the batched
+    // mark persistence and the boot-time warm — a section §4.4 already assigns
+    // to this file. The three structural assertions above are what the F-14.1
+    // criterion actually means and none of them moved: no duty originates here,
+    // no registration surface is called inline, and the export allowlist grew
+    // by one tick constant and two test accessors.
+    expect(source.split('\n').length).toBeLessThanOrEqual(1300);
     expect(h.spawns).toEqual([]);
   });
 
@@ -1505,6 +1548,229 @@ describe('sweep duty registry (S2-PR2)', () => {
       // Math.random, so a second identical run reproduces every expiry.
       const second = await observeBackoffMinutes();
       expect([...second.entries()].sort()).toEqual([...first.entries()].sort());
+      expect(h.spawns).toEqual([]);
+    });
+  });
+
+  // ── S2-PR15 (#320): the quiet mark survives a restart ────────────────────────
+  //
+  // The cache was process-local, so every boot threw it away and the first tick
+  // after one swept every active session — ~850 of them, a 457 s tick, nine
+  // times in the 22 hours of log #320 was filed against. The mark now lives on
+  // the session row (migration 065) and `startHostSweep` warms the map from it.
+  describe('quiet-cache durability (S2-PR15)', () => {
+    const MINUTE = 60_000;
+
+    /**
+     * Drive ONE tick the way a fresh host does: through `startHostSweep`, which
+     * is where the warm happens. `_sweepOnceForTesting` deliberately does not
+     * warm — a case that used it would pass with the warm path deleted.
+     */
+    async function firstTickAfterRestart(): Promise<void> {
+      stopHostSweep();
+      const before = _lastSweepTickStatsForTesting().ticks;
+      // Fake ONLY setTimeout, so the driver's 60 s re-arm is a timer this test
+      // can drop while the tick's own awaits and setImmediate yields stay real.
+      // A caller that is ALREADY on fake timers keeps its own clock — calling
+      // `useFakeTimers` again reinstalls it and would silently undo a
+      // `setSystemTime` the case depends on.
+      const callerFakedTimers = vi.isFakeTimers();
+      if (!callerFakedTimers) vi.useFakeTimers({ toFake: ['setTimeout'] });
+      try {
+        startHostSweep();
+        for (let i = 0; i < 500 && _lastSweepTickStatsForTesting().ticks === before; i++) {
+          await new Promise((resolve) => setImmediate(resolve));
+        }
+      } finally {
+        stopHostSweep();
+        vi.clearAllTimers();
+        if (!callerFakedTimers) vi.useRealTimers();
+      }
+      expect(_lastSweepTickStatsForTesting().ticks, 'the restart tick never completed').toBe(before + 1);
+    }
+
+    /** A driver-only registry and an empty cache — a cold process. */
+    function coldDriver(sessions: Session[]): void {
+      _resetSweepRegistryForTesting({ builtins: false });
+      _resetQuietSessionCacheForTesting();
+      h.sessions = sessions;
+      h.mailbox = fakeMailbox({ getNextFutureProcessAfter: () => null });
+    }
+
+    afterEach(() => {
+      stopHostSweep();
+      _resetQuietSessionCacheForTesting();
+    });
+
+    // ── Q-1 ──────────────────────────────────────────────────────────────────
+    it('a quiet mark survives a driver restart and is warmed without opening any session DB', async () => {
+      coldDriver([fakeSession('sess-warm-a'), fakeSession('sess-warm-b')]);
+
+      await _sweepOnceForTesting();
+      expect(h.quietWrites).toHaveLength(1);
+      expect(h.quietWrites[0]!.map((m) => m.sessionId).sort()).toEqual(['sess-warm-a', 'sess-warm-b']);
+
+      // The restart: the process-local map is gone, the rows are not.
+      _resetQuietSessionCacheForTesting();
+      h.opens = [];
+      await firstTickAfterRestart();
+
+      expect(_lastSweepTickStatsForTesting()).toMatchObject({ skippedQuiet: 2, sweptSessions: 0 });
+      expect(h.opens, 'a warmed session must cost zero session-DB opens').toEqual([]);
+      expect(h.spawns).toEqual([]);
+    });
+
+    // ── S2-PR15 acceptance ───────────────────────────────────────────────────
+    it('the quiet cache is warm on the first tick after a restart', async () => {
+      const ids = ['w-1', 'w-2', 'w-3', 'w-4', 'w-5'];
+      coldDriver(ids.map((id) => fakeSession(id)));
+
+      await _sweepOnceForTesting();
+      _resetQuietSessionCacheForTesting();
+      h.opens = [];
+      await firstTickAfterRestart();
+
+      expect(_lastSweepTickStatsForTesting()).toMatchObject({ skippedQuiet: ids.length, sweptSessions: 0 });
+      expect(h.opens).toEqual([]);
+      expect(h.spawns).toEqual([]);
+    });
+
+    // ── Q-2 ──────────────────────────────────────────────────────────────────
+    it('a warmed mark whose last_active moved is dropped, and that session is swept on the first tick after the restart', async () => {
+      coldDriver([fakeSession('sess-moved')]);
+      await _sweepOnceForTesting();
+      expect(h.quietWrites).toHaveLength(1);
+
+      // Production nulls the column in the same statement that writes
+      // last_active (updateSession), so the warm query never returns the row.
+      _resetQuietSessionCacheForTesting();
+      h.sessions = [fakeSession('sess-moved', { last_active: '2026-04-20T13:30:00.000Z' })];
+      h.opens = [];
+      await firstTickAfterRestart();
+
+      expect(_lastSweepTickStatsForTesting()).toMatchObject({ skippedQuiet: 0, sweptSessions: 1 });
+      expect(h.opens).toContain('sess-moved');
+      expect(h.spawns).toEqual([]);
+    });
+
+    // ── S2-PR15 acceptance ───────────────────────────────────────────────────
+    it('a persisted quiet mark is ignored when last_active moved after it', async () => {
+      coldDriver([fakeSession('sess-ignored')]);
+      await _sweepOnceForTesting();
+      const persisted = h.quietWrites[0]![0]!;
+      // The mark itself is still in the future — only the moved last_active
+      // disqualifies it, so this is not an expiry test in disguise.
+      expect(Date.parse(persisted.quietUntil)).toBeGreaterThan(Date.now());
+
+      _resetQuietSessionCacheForTesting();
+      h.sessions = [fakeSession('sess-ignored', { last_active: '2026-04-20T14:00:00.000Z' })];
+      h.opens = [];
+      await firstTickAfterRestart();
+
+      expect(h.opens, 'the session was skipped on a mark older than its last_active').toContain('sess-ignored');
+      expect(_lastSweepTickStatsForTesting().skippedQuiet).toBe(0);
+      expect(h.spawns).toEqual([]);
+    });
+
+    // ── Q-3 ──────────────────────────────────────────────────────────────────
+    it('a warmed mark never outlives its next due row', async () => {
+      const startMs = Date.UTC(2026, 8, 3, 12, 0, 0);
+      // `setImmediate` stays REAL: the driver's per-session yield uses it, and
+      // `firstTickAfterRestart` awaits macrotasks to observe the tick complete.
+      vi.useFakeTimers({ toFake: ['Date', 'setTimeout'] });
+      try {
+        vi.setSystemTime(startMs);
+        coldDriver([fakeSession('sess-due')]);
+        h.mailbox = fakeMailbox({
+          getNextFutureProcessAfter: () => new Date(startMs + 5 * MINUTE).toISOString(),
+        });
+
+        await _sweepOnceForTesting();
+        // The persisted value IS the due row, not the backoff cap — which is
+        // why a warm can never cross one that already existed at mark time.
+        expect(h.quietWrites[0]![0]!.quietUntil).toBe(new Date(startMs + 5 * MINUTE).toISOString());
+
+        _resetQuietSessionCacheForTesting();
+        vi.setSystemTime(startMs + 6 * MINUTE);
+        h.opens = [];
+        await firstTickAfterRestart();
+
+        expect(h.opens).toContain('sess-due');
+        expect(_lastSweepTickStatsForTesting()).toMatchObject({ skippedQuiet: 0, sweptSessions: 1 });
+      } finally {
+        vi.useRealTimers();
+      }
+      expect(h.spawns).toEqual([]);
+    });
+
+    // ── Q-4 ──────────────────────────────────────────────────────────────────
+    it('a session with a live container is never warmed as quiet', async () => {
+      coldDriver([fakeSession('sess-live')]);
+      await _sweepOnceForTesting();
+      expect(h.quietWrites).toHaveLength(1);
+
+      // The container came back between the mark and the boot. A live session
+      // is never quiet, whatever the row says.
+      _resetQuietSessionCacheForTesting();
+      h.running.add('sess-live');
+      h.opens = [];
+      await firstTickAfterRestart();
+
+      expect(h.opens).toContain('sess-live');
+      expect(_lastSweepTickStatsForTesting().skippedQuiet).toBe(0);
+      expect(h.spawns).toEqual([]);
+    });
+
+    // ── Q-5 ──────────────────────────────────────────────────────────────────
+    it('the quiet mark is written on the transition only, not on every confirming tick', async () => {
+      coldDriver([fakeSession('sess-once')]);
+
+      await _sweepOnceForTesting();
+      await _sweepOnceForTesting();
+      await _sweepOnceForTesting();
+
+      // Three ticks, one write. A per-tick write of the ~840 rows the cache
+      // holds would be a new cost, not a saving.
+      expect(h.quietWrites).toHaveLength(1);
+      expect(h.quietWrites[0]).toHaveLength(1);
+      expect(h.spawns).toEqual([]);
+    });
+
+    // Not a plan-named case; the property the `skipUnreadable` carve-out exists
+    // for. Its causes are process-local, so a fresh process must re-try rather
+    // than inherit a dead one's verdict.
+    it('an unreadable session takes the backoff in-process but persists no mark', async () => {
+      _resetSweepRegistryForTesting({ builtins: false });
+      _resetQuietSessionCacheForTesting();
+      h.sessions = [fakeSession('sess-unreadable')];
+      h.mailbox = fakeMailbox();
+      h.exists = false; // the mailbox store answers "gone" — the read-path contract
+
+      await _sweepOnceForTesting();
+      expect(h.quietWrites, 'an unreadable session must not persist a mark').toEqual([]);
+
+      // In-process it is still backed off, exactly as before this PR.
+      h.opens = [];
+      await _sweepOnceForTesting();
+      expect(h.opens).toEqual([]);
+      expect(h.spawns).toEqual([]);
+    });
+
+    // ── Q-6 ──────────────────────────────────────────────────────────────────
+    it('a failed persistence write degrades to a cold sweep and never to a skipped due session', async () => {
+      const warn = vi.spyOn(log, 'warn').mockImplementation(() => {});
+      coldDriver([fakeSession('sess-writefail')]);
+      h.failQuietPersist = true;
+
+      await expect(_sweepOnceForTesting()).resolves.toBeUndefined();
+      expect(warn.mock.calls.map((c) => c[0])).toContain('Host sweep quiet mark persistence failed');
+
+      // Degraded to today's pre-cache behavior: the in-memory mark goes with
+      // the failed write, so the very next tick sweeps the session rather than
+      // skipping it on a mark no restart could ever recover.
+      h.opens = [];
+      await _sweepOnceForTesting();
+      expect(h.opens).toContain('sess-writefail');
       expect(h.spawns).toEqual([]);
     });
   });

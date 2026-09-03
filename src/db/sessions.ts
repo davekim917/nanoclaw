@@ -180,6 +180,16 @@ export function updateSession(
       values[key] = value;
     }
   }
+  // The host sweep's persisted quiet mark (migration 065) is a prediction of
+  // when this session next has work — taken while `last_active` held some
+  // earlier value. Moving `last_active` is precisely the event that says the
+  // prediction is stale, so the mark dies in the SAME statement, never in a
+  // second write a caller could forget or a crash could lose. This is the
+  // durable half of the in-memory cache's `mark.lastActive === last_active`
+  // check, and `updateSession` is the only writer of `last_active` in the host
+  // — a future raw-SQL writer would silently reintroduce a mark that outlives
+  // a newly due row.
+  if (updates.last_active !== undefined) fields.push('sweep_quiet_until = NULL');
   if (fields.length === 0) return;
 
   getDb()
@@ -204,6 +214,67 @@ export function touchSessionActivity(id: string): void {
     // expiry), loudly.
     log.warn('touchSessionActivity failed', { sessionId: id, err });
   }
+}
+
+/** One quiet mark to persist: the session, and the ISO instant its skip expires. */
+export interface QuietSessionMark {
+  sessionId: string;
+  /** ISO-8601 UTC. */
+  quietUntil: string;
+}
+
+/**
+ * Persist a whole tick's newly-taken quiet marks.
+ *
+ * ONE statement for the batch, not one per session, and called only on the
+ * quiet TRANSITION — never on a tick that merely re-confirms an existing mark.
+ * A per-tick write of the ~840 rows the cache already holds would be a new
+ * cost, not a saving; the whole point of the cache is that a quiet session
+ * costs nothing per tick.
+ *
+ * Advisory: the caller treats a throw as "no mark", which degrades to a cold
+ * sweep and never to a session skipped past due work.
+ */
+export function persistQuietSessionMarks(marks: readonly QuietSessionMark[]): void {
+  if (marks.length === 0) return;
+  const byId: Record<string, string> = {};
+  for (const mark of marks) byId[mark.sessionId] = mark.quietUntil;
+  getDb()
+    .prepare(
+      `UPDATE sessions
+          SET sweep_quiet_until = j.value
+         FROM json_each(@marks) AS j
+        WHERE sessions.id = j.key`,
+    )
+    .run({ marks: JSON.stringify(byId) });
+}
+
+/** A persisted quiet mark, with the `last_active` the warm path re-bases it on. */
+export interface WarmQuietSessionMark {
+  id: string;
+  sweep_quiet_until: string;
+  last_active: string | null;
+}
+
+/**
+ * Every still-valid persisted quiet mark, for `startHostSweep` to warm the
+ * in-memory cache from. One query, no per-session DB opens.
+ *
+ * `status = 'active'` is what makes a prune duty unnecessary: a closed or
+ * archiving session is never in the sweep's session list, so a mark left on
+ * its row is unreachable rather than stale, and the reclaim deletes the row.
+ * An expired mark is filtered here rather than cleared, so this is a pure read.
+ */
+export function getWarmQuietSessionMarks(nowIso: string): WarmQuietSessionMark[] {
+  return getDb()
+    .prepare(
+      `SELECT id, sweep_quiet_until, last_active
+         FROM sessions
+        WHERE status = 'active'
+          AND sweep_quiet_until IS NOT NULL
+          AND datetime(sweep_quiet_until) > datetime(@now)`,
+    )
+    .all({ now: nowIso }) as WarmQuietSessionMark[];
 }
 
 export function deleteSession(id: string): void {

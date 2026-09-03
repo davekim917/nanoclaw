@@ -67,6 +67,7 @@ import { migration061 } from './061-turn-usage-turn-id.js';
 import { migration062 } from './062-thread-titles.js';
 import { migration063 } from './063-channel-instructions-profile.js';
 import { migration064 } from './064-container-config-security-json.js';
+import { migration065 } from './065-sessions-sweep-quiet-until.js';
 // Upstream's 014/015 — file numbers clash with local but uniqueness is by `name`.
 // Aliased to avoid JS identifier collisions with the local 014/015 above.
 import { migration014 as containerConfigs } from './014-container-configs.js';
@@ -168,6 +169,9 @@ export const migrations: Migration[] = [
   // `containerConfigs` creates. Ordering here is execution order, not file
   // number — registering 064 next to 063 runs it before the table exists.
   migration064,
+  // Adds a nullable column and writes no timestamp, so 053's position below is
+  // irrelevant here — same reasoning as 054/055/056 above.
+  migration065,
   messagingGroupInstance,
   migration019,
   // Last on purpose: normalizes whatever naive timestamps every migration
