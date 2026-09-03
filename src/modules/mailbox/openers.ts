@@ -198,12 +198,19 @@ export function openInboundDb(dbPath: string): Database.Database {
     // DB is a real fault, and callers must not mistake it for a gone session.
     throw asMissingDbError(err, dbPath);
   }
-  assertQueryable(db, dbPath);
   // ponytail: patching close() beats a wrapper type — every existing caller
   // already closes, and a new return type would touch all ~20 of them. Known
   // ceiling: better-sqlite3 refuses close() while an iterator is open, which
   // would throw before the marker is released. No non-test caller iterates an
   // inbound handle today; revisit with an explicit release if one appears.
+  //
+  // Installed BEFORE the readability probe, deliberately. The probe closes the
+  // handle and rethrows on a file that opened but cannot be queried, and if it
+  // ran first that close would be the RAW one — the marker would survive, and
+  // every later reclamation pass would read the session as in use until the
+  // next host restart, with repeated failed opens stacking markers. Ordering
+  // it this way leaves exactly ONE path that owns the release, instead of a
+  // second release call that the next failure mode would have to remember.
   const close = db.close.bind(db);
   db.close = function releasingClose(this: Database.Database): Database.Database {
     try {
@@ -212,6 +219,7 @@ export function openInboundDb(dbPath: string): Database.Database {
       release();
     }
   };
+  assertQueryable(db, dbPath);
   return db;
 }
 
