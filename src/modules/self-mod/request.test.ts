@@ -444,9 +444,21 @@ describe('add_mcp_server remote Streamable HTTP servers', () => {
     expect(expectRejected()).toMatch(/onecli-managed/);
   });
 
-  it('rejects a raw credential in any header value', async () => {
+  it('rejects a literal on any header outside the configuration allowlist', async () => {
+    // Whatever the value looks like: `abc123` is a perfectly good API key.
+    for (const value of ['ghp_deadbeefcafe1234', 'abc123']) {
+      delivered = [];
+      await submitAddMcpServer(
+        { name: 'leaky', url: 'https://example.com/mcp', headers: { 'X-Functions-Key': value } },
+        session,
+      );
+      expect(expectRejected()).toMatch(/not a known configuration header/);
+    }
+  });
+
+  it('still refuses a recognizable credential inside an allowlisted header', async () => {
     await submitAddMcpServer(
-      { name: 'leaky', url: 'https://example.com/mcp', headers: { 'X-Thing': 'ghp_deadbeefcafe1234' } },
+      { name: 'leaky', url: 'https://example.com/mcp', headers: { 'User-Agent': 'ghp_deadbeefcafe1234' } },
       session,
     );
     expect(expectRejected()).toMatch(/raw credential/);

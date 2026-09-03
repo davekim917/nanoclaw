@@ -169,9 +169,15 @@ server names are `[A-Za-z0-9_-]{1,64}`, exactly one of `command` or `url` is
 required, remote URLs must be HTTPS (plain HTTP only for `localhost` /
 `host.docker.internal`) with no credentials, fragment, credential-looking
 query parameter, or recognizable credential shape anywhere in the path or a
-query value, and any header whose value looks opaque must be exactly
-`onecli-managed` or an auth scheme followed by it — the header check is on the
-value rather than on a list of credential-sounding names. An unknown field is an error rather than a silent
+query value. A declared `type` must agree with the fields (`stdio` with
+`command`, `http`/`streamable-http` with `url`). Only known configuration
+headers may hold a literal value — `Accept`, `Accept-Encoding`,
+`Accept-Language`, `Content-Type`, `User-Agent`, `MCP-Protocol-Version`,
+`X-Api-Version`, `X-Request-Id` — and every other header must be exactly
+`onecli-managed` or an auth scheme followed by it. That is an allowlist of
+configuration rather than a denylist of credentials, because credential header
+names and credential values are both open sets while configuration headers are
+not. An unknown field is an error rather than a silent
 drop.
 
 The URL is stored verbatim, and an opaque path segment is indistinguishable

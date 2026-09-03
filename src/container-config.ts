@@ -92,15 +92,30 @@ const ENV_KEY_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
 /** RFC 7230 token charset — what a header field-name may contain. */
 const HEADER_NAME_RE = /^[A-Za-z0-9!#$%&'*+.^_`|~-]{1,64}$/;
 /**
- * Header names we can recognize as credential-bearing. This list is a source
- * of better error messages, NOT the gate: enumerating names is unbounded
- * (`X-Functions-Key`, `X-Client-Key`, whatever the next vendor invents), and
- * every name missing from it used to mean a secret persisted verbatim. The
- * gate is on the VALUE — see `headerValueIsSafe`.
+ * The ONLY header names a remote MCP server may set to a literal value.
+ *
+ * This is deliberately an allowlist of configuration, not a denylist of
+ * credentials. Two earlier shapes of this rule both leaked, for the same
+ * reason: credential header NAMES are an open set (`X-Functions-Key`,
+ * `X-Client-Key`, whatever the next vendor ships) and so are credential
+ * VALUES (`abc123` is a perfectly good API key and looks like nothing).
+ * Neither side can be enumerated, so neither can gate. Configuration headers
+ * ARE a small closed set, so that is what gets enumerated, and everything
+ * else must be the OneCLI placeholder.
+ *
+ * A genuinely non-credential vendor header that is missing here is a one-line
+ * addition. A credential that is missing from a denylist is a secret on disk.
  */
-const CREDENTIAL_HEADER_RE = /(authorization|auth|token|secret|api[-_]?key|cookie|credential|bearer)/i;
-/** A leading auth-scheme token, so the value behind it can be judged on its own. */
-const AUTH_SCHEME_PREFIX_RE = /^[A-Za-z][A-Za-z0-9-]* /;
+const LITERAL_HEADER_ALLOWLIST = new Set([
+  'accept',
+  'accept-encoding',
+  'accept-language',
+  'content-type',
+  'user-agent',
+  'mcp-protocol-version',
+  'x-api-version',
+  'x-request-id',
+]);
 /** The value the OneCLI gateway replaces at the proxy boundary. */
 const ONECLI_PLACEHOLDER = 'onecli-managed';
 /**
@@ -148,29 +163,6 @@ export function validateMcpServerName(name: string): void {
   }
 }
 
-/**
- * Whether one header value may be persisted as written.
- *
- * Keyed on the VALUE, not the header name. Enumerating credential-bearing
- * names is unbounded, and each name we missed persisted a secret; an opaque
- * value is the thing that is actually dangerous, whatever it is called.
- *
- * A value is safe when it is the OneCLI placeholder form, or when it is not
- * opaque — `application/json`, `text/event-stream`, `2024-01-01` and the like
- * read as configuration, while `aB3xY9kLmN2pQ7rS8t` does not. An auth scheme
- * in front is stripped so `Bearer <token>` is judged on the token.
- *
- * Unlike an opaque segment in a URL path — which may equally be a tenant id
- * and has no alternative spelling — a header always has a correct
- * alternative: declare the placeholder and let the gateway inject the real
- * value. That asymmetry is why headers reject and URL paths only warn.
- */
-function headerValueIsSafe(key: string, value: string): boolean {
-  if (ONECLI_HEADER_VALUE_RE.test(value)) return true;
-  if (CREDENTIAL_HEADER_RE.test(key)) return false;
-  return !looksOpaque(value) && !looksOpaque(value.replace(AUTH_SCHEME_PREFIX_RE, ''));
-}
-
 /** Validate one `headers` map for a remote MCP server. Returns a fresh copy. */
 function parseMcpHeaders(raw: unknown): Record<string, string> {
   if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
@@ -182,14 +174,18 @@ function parseMcpHeaders(raw: unknown): Record<string, string> {
     if (!HEADER_NAME_RE.test(key)) {
       throw new Error(`header name ${JSON.stringify(key)} is not a valid HTTP header field name`);
     }
+    // Allowlisted configuration headers may hold a literal; everything else
+    // must be the placeholder, whatever it is named and however short its
+    // value. `abc123` is a perfectly good API key, so value length and
+    // character mix cannot decide this.
+    if (!LITERAL_HEADER_ALLOWLIST.has(key.toLowerCase()) && !ONECLI_HEADER_VALUE_RE.test(value)) {
+      throw new Error(
+        `header "${key}" is not a known configuration header, so its value must be exactly "${ONECLI_PLACEHOLDER}" or an auth scheme followed by it (e.g. "Bearer ${ONECLI_PLACEHOLDER}") — the gateway substitutes the real secret at the proxy boundary. Configuration headers that carry no credential: ${[...LITERAL_HEADER_ALLOWLIST].join(', ')}`,
+      );
+    }
     if (RAW_SECRET_VALUE_RE.test(value)) {
       throw new Error(
         `header "${key}" carries a raw credential; declare it as "${ONECLI_PLACEHOLDER}" and let the OneCLI gateway inject the real value`,
-      );
-    }
-    if (!headerValueIsSafe(key, value)) {
-      throw new Error(
-        `header "${key}" looks like it carries a credential, so its value must be exactly "${ONECLI_PLACEHOLDER}" or an auth scheme followed by it (e.g. "Bearer ${ONECLI_PLACEHOLDER}") — the gateway substitutes the real secret at the proxy boundary`,
       );
     }
     headers[key] = value;
@@ -207,9 +203,9 @@ function parseMcpHeaders(raw: unknown): Record<string, string> {
  * host/container boundary; keep the two in sync.
  */
 export function parseMcpServerConfig(input: Record<string, unknown>): ParsedMcpServerConfig {
-  const declaredType = input.type;
-  if (declaredType !== undefined && !['stdio', 'http', 'streamable-http'].includes(String(declaredType))) {
-    throw new Error(`unsupported MCP transport ${JSON.stringify(declaredType)}; use "stdio" or "http"`);
+  const declaredType = input.type === undefined ? undefined : String(input.type);
+  if (declaredType !== undefined && !['stdio', 'http', 'streamable-http'].includes(declaredType)) {
+    throw new Error(`unsupported MCP transport ${JSON.stringify(input.type)}; use "stdio" or "http"`);
   }
   const command = typeof input.command === 'string' && input.command.trim() ? input.command : undefined;
   const url = typeof input.url === 'string' && input.url.trim() ? input.url.trim() : undefined;
@@ -221,6 +217,10 @@ export function parseMcpServerConfig(input: Record<string, unknown>): ParsedMcpS
 
   if (url !== undefined) {
     if (command !== undefined) throw new Error('Provide exactly one of command or url');
+    // A declared type that contradicts the fields is a mistake, not something
+    // to silently rewrite — the whole point of parsing strictly is that a
+    // pasted vendor snippet fails loudly.
+    if (declaredType === 'stdio') throw new Error('type "stdio" cannot be used with url; use "http"');
     if (input.args !== undefined || input.env !== undefined) {
       throw new Error('args and env are only valid with command');
     }
@@ -269,6 +269,9 @@ export function parseMcpServerConfig(input: Record<string, unknown>): ParsedMcpS
     };
   }
   if (command === undefined) throw new Error('Provide exactly one of command or url');
+  if (declaredType !== undefined && declaredType !== 'stdio') {
+    throw new Error(`type ${JSON.stringify(declaredType)} cannot be used with command; use "stdio" or omit it`);
+  }
   if (input.headers !== undefined) throw new Error('headers are only valid with url');
 
   const args = input.args ?? [];

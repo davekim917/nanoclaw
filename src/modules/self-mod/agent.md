@@ -21,11 +21,14 @@ only with admin approval.
   carry credentials, fragments, credential-looking query parameters, or a
   token anywhere in the path or a query value: the URL is persisted
   verbatim, so a secret in it is a secret on disk.
-  Any header whose value looks opaque must be exactly `"onecli-managed"` or an
-  auth scheme followed by it (`"Bearer onecli-managed"`) — the check is on the
-  value, not on a list of credential-sounding names, so `X-Functions-Key` is
-  covered too, while `Content-Type: application/json` passes unchanged. The
-  OneCLI gateway substitutes the real secret at the proxy boundary. A remote URL is stored verbatim, so
+  Only known configuration headers may hold a literal value (`Accept`,
+  `Accept-Encoding`, `Accept-Language`, `Content-Type`, `User-Agent`,
+  `MCP-Protocol-Version`, `X-Api-Version`, `X-Request-Id`); every other header
+  must be exactly `"onecli-managed"` or an auth scheme followed by it
+  (`"Bearer onecli-managed"`), whatever its name and however short its value.
+  The OneCLI gateway substitutes the real secret at the proxy boundary. A
+  declared `type` must agree with the fields — `stdio` with `command`, `http`
+  with `url`. A remote URL is stored verbatim, so
   never put a secret in it — recognizable credential shapes are rejected, but
   an opaque path segment cannot be told apart from a tenant id and is only
   flagged for the approving admin.

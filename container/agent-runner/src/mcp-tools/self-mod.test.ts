@@ -107,12 +107,17 @@ describe('add_mcp_server remote Streamable HTTP', () => {
 
     // The gate is on the value, so a header name no list anticipates is
     // covered too — `X-Functions-Key` matched nothing in the name list.
-    const customKey = await submit({
-      name: 'custom',
-      url: 'https://example.com/mcp',
-      headers: { 'X-Functions-Key': 'aB3xY9kLmN2pQ7rS8t' },
-    });
-    expect(customKey.error).toContain('looks like it carries a credential');
+    // The gate is an allowlist of configuration headers, so a vendor key
+    // header is covered whatever its value looks like — `abc123` is a fine
+    // API key and no length or character-mix rule catches it.
+    for (const value of ['aB3xY9kLmN2pQ7rS8t', 'abc123']) {
+      const customKey = await submit({
+        name: 'custom',
+        url: 'https://example.com/mcp',
+        headers: { 'X-Functions-Key': value },
+      });
+      expect(customKey.error).toContain('not a known configuration header');
+    }
     expect(
       (await submit({ name: 'ok', url: 'https://example.com/mcp', headers: { 'Content-Type': 'application/json' } }))
         .payload,
@@ -153,6 +158,15 @@ describe('add_mcp_server remote Streamable HTTP', () => {
     );
     // An opaque segment matching no known credential shape stays legal.
     expect((await submit({ name: 'ok', url: 'https://hooks.example.com/s/abc123/mcp' })).payload).toBeDefined();
+  });
+
+  it('rejects a declared transport that contradicts the fields', async () => {
+    expect((await submit({ name: 'x', type: 'stdio', url: 'https://example.com/mcp' })).error).toContain(
+      'cannot be used with url',
+    );
+    expect((await submit({ name: 'x', type: 'http', command: 'node' })).error).toContain('cannot be used with command');
+    // The alias still works where it agrees with the fields.
+    expect((await submit({ name: 'x', type: 'streamable-http', url: 'https://example.com/mcp' })).payload).toBeDefined();
   });
 
   it('rejects a bad server name, both transports at once, and cross-transport fields', async () => {
