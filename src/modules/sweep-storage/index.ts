@@ -1,31 +1,21 @@
 /**
- * Storage-maintenance start and stop, declared together.
+ * PR 1 (main) adds the onHostShutdown stop for the worker here; at the
+ * rebase onto main after PR 0/PR 1 deploy, take the UNION of both versions.
  *
  * `startStorageMaintenanceOnce` is fire-and-forget, called once per sweep
- * tick (T13, host-sweep.ts) with the tick's already-computed active session
- * ids; the persistent worker owns its own 1h/6h cadence internally
- * (storage-maintenance-worker.ts), so there is no host-owned timer to START
- * here — only a persistent worker to STOP cleanly on the way down. That
- * asymmetry is why both halves live in one module instead of splitting
- * across host-sweep.ts (start) and main.ts (stop), as they did before.
- *
- * S2-PR1's content (module timers), reproduced here per the S2-PR6 brief so
- * the eventual rebase merges cleanly — S2-PR1 is not merged under S2-PR2 on
- * this branch's base. One deliberate adaptation: S2-PR1's own file registers
- * its stop via `onHostShutdown` from `host-lifecycle.ts` (S2-PR0), which also
- * does not exist on this base; this file uses the currently-live equivalent,
- * `onShutdown` from `response-registry.js` (the mechanism every other module
- * already registers shutdown work through — see modules/approvals/index.ts).
- * `src/main.ts` still ALSO calls `stopStorageMaintenanceWorker()` directly at
- * shutdown (its own S2-PR1 job to remove) — harmless since `close()` is
- * idempotent (`storage-maintenance-worker.ts`'s `stopped` guard), but flagged
- * here rather than silently touching main.ts, which is outside S2-PR6's
- * ownership.
+ * tick (T13 below) with the tick's already-computed active session ids; the
+ * persistent worker owns its own 1h/6h cadence internally
+ * (storage-maintenance-worker.ts). On this branch's base (S2-PR2, mailbox
+ * PR 5 lineage) neither S2-PR0's `host-lifecycle.ts` nor S2-PR1's own
+ * version of this file exist, so this file carries ONLY what compiles here
+ * — the start half and T13's registration — and none of PR 1's shutdown
+ * registration. `src/main.ts` still calls `stopStorageMaintenanceWorker()`
+ * directly at shutdown today; that stays exactly as-is (PR 1's job, outside
+ * S2-PR6's ownership) until the union above happens.
  */
 import { registerSweepDuty, registerSweepDutySource, SWEEP_DUTY_INVENTORY } from '../../host-sweep.js';
 import { log } from '../../log.js';
-import { onShutdown } from '../../response-registry.js';
-import { runStorageMaintenanceInBackground, stopStorageMaintenanceWorker } from '../../storage-maintenance-worker.js';
+import { runStorageMaintenanceInBackground } from '../../storage-maintenance-worker.js';
 import { handleStoragePressureAlert } from '../../storage-pressure-alert.js';
 
 /**
@@ -39,16 +29,6 @@ export function startStorageMaintenanceOnce(activeSessionIds: string[]): void {
     .then((storageReport) => (storageReport ? handleStoragePressureAlert(storageReport) : undefined))
     .catch((err) => log.warn('storage-manager: background maintenance failed', { err }));
 }
-
-onShutdown(async () => {
-  try {
-    await stopStorageMaintenanceWorker();
-  } catch (err) {
-    // Worker teardown failure must not prevent channel teardown and container
-    // reaping; those children otherwise linger until systemd's hard timeout.
-    log.error('Storage maintenance worker failed to stop cleanly', { err });
-  }
-});
 
 // ─────────────────────────────────────────────────────────────────────────────
 // S2-PR6: T13 (storage-maintenance) sweep duty registration.

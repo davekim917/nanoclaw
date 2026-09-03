@@ -1,9 +1,11 @@
 /**
  * Acceptance cases for the storage sweep family (convergence seam 2, S2-PR6 —
- * F-6.2, F-6.5 in docs/specs/upstream-host-sweep-seam/plan.md §8). T-3 (S2-PR1
- * module timers) is reproduced here per the S2-PR6 brief, since S2-PR1 is not
- * merged under S2-PR2 on this branch's base — see the deviation note in
- * ./index.ts's docstring (onShutdown vs onHostShutdown).
+ * F-6.2, F-6.5 in docs/specs/upstream-host-sweep-seam/plan.md §8). T-3's
+ * start-half cases (S2-PR1 module timers) are reproduced here per the
+ * S2-PR6 brief; its shutdown-registration cases are NOT, since S2-PR1's
+ * `onHostShutdown` registration is not part of this file on this branch's
+ * base — see the deviation note in ./index.ts's docstring (take the union at
+ * the eventual rebase onto main).
  *
  * Hermeticity (brief-common.md HARD RULE): importing this module's ./index.js
  * registers T13 at import — registration only pushes a duty object into an
@@ -60,7 +62,6 @@ afterEach(() => {
 
 const mocks = vi.hoisted(() => ({
   runStorageMaintenanceInBackground: vi.fn(),
-  stopStorageMaintenanceWorker: vi.fn(),
   handleStoragePressureAlert: vi.fn(),
   logInfo: vi.fn(),
   logWarn: vi.fn(),
@@ -70,7 +71,6 @@ const mocks = vi.hoisted(() => ({
 
 vi.mock('../../storage-maintenance-worker.js', () => ({
   runStorageMaintenanceInBackground: mocks.runStorageMaintenanceInBackground,
-  stopStorageMaintenanceWorker: mocks.stopStorageMaintenanceWorker,
 }));
 vi.mock('../../storage-pressure-alert.js', () => ({
   handleStoragePressureAlert: mocks.handleStoragePressureAlert,
@@ -83,7 +83,6 @@ vi.mock('../../log.js', async (importOriginal) => {
   };
 });
 
-import { getShutdownCallbacks } from '../../response-registry.js';
 // Registers T13 into host-sweep.ts's live registry — needed so the F-6.2
 // registered-wrapper case below can obtain it by name, the same accessor R-7
 // uses in src/host-sweep-registry.test.ts. Safe to import unmocked:
@@ -134,37 +133,13 @@ describe('storage maintenance start and stop are declared in one module', () => 
     );
   });
 
-  it('registers a shutdown callback that stops the worker, guarding a failed stop', async () => {
-    mocks.stopStorageMaintenanceWorker.mockResolvedValue(undefined);
-
-    const callbacksBefore = getShutdownCallbacks().length;
-    expect(callbacksBefore).toBeGreaterThan(0);
-    const shutdown = getShutdownCallbacks()[callbacksBefore - 1];
-    await shutdown();
-
-    expect(mocks.stopStorageMaintenanceWorker).toHaveBeenCalledTimes(1);
-  });
-
-  it('a stop failure is logged, not thrown, so the rest of shutdown proceeds', async () => {
-    mocks.stopStorageMaintenanceWorker.mockRejectedValue(new Error('stop boom'));
-
-    const callbacks = getShutdownCallbacks();
-    const shutdown = callbacks[callbacks.length - 1];
-    await expect(shutdown()).resolves.toBeUndefined();
-
-    expect(mocks.logError).toHaveBeenCalledWith(
-      'Storage maintenance worker failed to stop cleanly',
-      expect.objectContaining({ err: expect.any(Error) }),
-    );
-  });
-
-  it('src/main.ts still references stopStorageMaintenanceWorker directly (S2-PR1 prerequisite gap)', () => {
-    // Deviation from T-3's original assertion ("main.ts references neither"):
-    // S2-PR1 has not landed on this branch's base, so main.ts's own direct
-    // call is still there — harmless (stopStorageMaintenanceWorker's
-    // underlying close() is idempotent) but not yet removed, since removing
-    // it is S2-PR1's job, outside S2-PR6's ownership. See ./index.ts's
-    // docstring.
+  it('this file registers no shutdown callback for the worker (S2-PR1 prerequisite gap)', () => {
+    // Team-lead correction 2026-09-03: S2-PR1's own onHostShutdown
+    // registration does not compile on this branch's base (host-lifecycle.ts
+    // does not exist here) and is NOT reproduced — ./index.ts carries only
+    // what compiles: the start half + T13's registration. src/main.ts is the
+    // sole place that stops the worker today; that stays exactly as-is (S2-PR1's
+    // own job, outside S2-PR6's ownership) until the union happens at rebase.
     const source = fs.readFileSync(path.resolve('src/main.ts'), 'utf8');
     expect(source).not.toMatch(/\bstartStorageMaintenanceOnce\b/);
     expect(source).toMatch(/\bstopStorageMaintenanceWorker\b/);
@@ -173,17 +148,35 @@ describe('storage maintenance start and stop are declared in one module', () => 
 
 // ── F-6.2 ────────────────────────────────────────────────────────────────────
 
-describe("storage maintenance runs after the session fan-out and keeps the worker's own cadence", () => {
+describe('F-6.2', () => {
   beforeEach(() => {
     vi.clearAllMocks();
   });
 
-  it('T13 is registered on tick:post-session at order 30, after the per-session fan-out phases', () => {
+  // Plan.md §8 F-6.2, exact title. tick:post-session (order 30, after every
+  // session:* phase) is the "after the session fan-out" half; the worker's
+  // own cadence is asserted by NOT re-implementing it in the wrapper — the
+  // worker's own 1h/6h internal throttle lives entirely in
+  // storage-maintenance-worker.ts (mocked wholesale here, its own test
+  // surface, not this family's) and the wrapper adds no throttle of its own:
+  // calling run(ctx) twice reaches the (mocked) worker twice.
+  it("storage maintenance runs after the session fan-out and keeps the worker's own cadence", () => {
     const { duties } = _listSweepRegistrationsForTesting();
     const t13 = duties.find((d) => d.name === 'storage-maintenance');
     expect(t13).toBeDefined();
     expect(t13?.phase).toBe('tick:post-session');
     expect(t13?.order).toBe(30);
+
+    mocks.runStorageMaintenanceInBackground.mockResolvedValue(null);
+    const ctx = {
+      now: Date.now(),
+      sessions: [],
+      activeContainerSessionIds: new Set<string>(),
+    } as unknown as SweepTickContext;
+    t13!.run(ctx);
+    t13!.run(ctx);
+
+    expect(mocks.runStorageMaintenanceInBackground).toHaveBeenCalledTimes(2);
   });
 
   it("run(ctx) forwards the tick's active container session ids, without calling its own session scan", async () => {
@@ -202,30 +195,6 @@ describe("storage maintenance runs after the session fan-out and keeps the worke
 
     expect(mocks.runStorageMaintenanceInBackground).toHaveBeenCalledWith(['sentinel-session-a', 'sentinel-session-b']);
   });
-
-  // The worker's own 1h scan / 6h prune cadence lives entirely inside
-  // storage-maintenance-worker.ts (BackgroundStorageMaintenance), which this
-  // duty's registered wrapper never re-implements — it is mocked wholesale
-  // above, and its own cadence is that file's test surface, not this
-  // family's. Asserted here only as "the wrapper does not own a cadence of
-  // its own": calling run(ctx) twice calls the (mocked) worker twice, with no
-  // throttling at the sweep-duty layer.
-  it("the registered wrapper adds no throttle of its own — cadence is entirely the worker's", () => {
-    const { duties } = _listSweepRegistrationsForTesting();
-    const t13 = duties.find((d) => d.name === 'storage-maintenance');
-    if (!t13) throw new Error('duty storage-maintenance not registered');
-    mocks.runStorageMaintenanceInBackground.mockResolvedValue(null);
-    const ctx = {
-      now: Date.now(),
-      sessions: [],
-      activeContainerSessionIds: new Set<string>(),
-    } as unknown as SweepTickContext;
-
-    t13.run(ctx);
-    t13.run(ctx);
-
-    expect(mocks.runStorageMaintenanceInBackground).toHaveBeenCalledTimes(2);
-  });
 });
 
 // ── F-6.5 (G64 deletion) ─────────────────────────────────────────────────────
@@ -241,8 +210,9 @@ describe("storage maintenance runs after the session fan-out and keeps the worke
 // directly and passing isContainerRunning explicitly where the pre-move
 // cases relied on host-sweep.ts's bound default.
 
-describe('the idle-artifact prune shims are gone and callers use storage-manager directly', () => {
-  it('pruneIdleSessionArtifacts and pruneIdleThreadArtifacts are no longer exported from host-sweep.ts', async () => {
+describe('F-6.5', () => {
+  // Plan.md §8 F-6.5, exact title.
+  it('the idle-artifact prune shims are gone and callers use storage-manager directly', async () => {
     const hostSweep = (await import('../../host-sweep.js')) as unknown as Record<string, unknown>;
     expect(hostSweep.pruneIdleSessionArtifacts).toBeUndefined();
     expect(hostSweep.pruneIdleThreadArtifacts).toBeUndefined();
