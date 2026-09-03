@@ -7,9 +7,6 @@
  *   - Tracks delivery in inbound.db's `delivered` table (host-owned)
  *   - Never writes to outbound.db — preserves single-writer-per-file invariant
  */
-import type Database from 'better-sqlite3';
-import fs from 'fs';
-
 import {
   bumpLastOutbound,
   getRunningSessions,
@@ -27,20 +24,15 @@ import {
   anchorRotationKey,
 } from './db/task-thread-anchors.js';
 import { getMessagingGroup, getMessagingGroupByPlatform } from './db/messaging-groups.js';
-import {
-  getDueOutboundMessages,
-  getDeliveredIds,
-  markDelivered,
-  markDeliveryFailed,
-  migrateDeliveredTable,
-} from './db/session-db.js';
 import { runGuarded, type DeliveryGuardSpec, type GuardedDeliveryHandler } from './delivery-guard.js';
 import { isUnguarded, unguarded, type Unguarded } from './guard/index.js';
 import { log } from './log.js';
 import { scrubSecrets } from './secret-scrubber.js';
 import { archiveMessage } from './message-archive.js';
 import { normalizeOptions } from './channels/ask-question.js';
-import { clearOutbox, openInboundDb, openOutboundDb, outboundDbPath, readOutboxFiles } from './session-manager.js';
+import { clearOutbox, readOutboxFiles, withExistingMailboxSession } from './session-manager.js';
+import { sessionOutboundStorageStat, type NanoclawMailboxSession } from './modules/mailbox/index.js';
+import type { OutboundMessage } from './modules/mailbox/ops/delivery.js';
 import { pauseTypingRefreshAfterDelivery, setTypingAdapter } from './modules/typing/index.js';
 import { flagNeedsInput, getTaskByChildSession } from './modules/orchestrator-dispatch/db/tasks.js';
 import { appendRunLog } from './modules/scheduling/run-log.js';
@@ -521,166 +513,195 @@ async function drainSession(session: Session): Promise<DrainOutcome> {
   const agentGroup = getAgentGroup(session.agent_group_id);
   if (!agentGroup) return 'pending';
 
-  let outDb: Database.Database | undefined;
-  let inDb: Database.Database;
+  // The whole queue snapshot in ONE mailbox session, closed before anything
+  // else runs. Nothing below this block may execute while a session is open on
+  // this key: a delivery action handler that writes to the session it is
+  // delivering for — `spawn_cancel` notifying its parent is the live case —
+  // opens its own session and would hit the nesting guard, and the channel
+  // adapter call is a network round trip with no business holding SQLite
+  // handles. Plan §4.5b, invariants I-3 and I-9.
+  let snapshot: { delivered: ReadonlySet<string>; outstanding: string[]; due: OutboundMessage[] } | undefined;
   try {
-    outDb = openOutboundDb(agentGroup.id, session.id);
-    inDb = openInboundDb(agentGroup.id, session.id);
+    snapshot = await withExistingMailboxSession(agentGroup.id, session.id, (mailbox) => {
+      const delivered = mailbox.getDeliveredIds();
+      return {
+        delivered,
+        // Everything outstanding, not just what is due — a row scheduled for
+        // later sits in a file that may never change again, so it must block
+        // arming.
+        outstanding: mailbox.listOutboundMessageIds().filter((id) => !delivered.has(id)),
+        due: mailbox.getDueOutboundMessages(),
+      };
+    });
   } catch {
-    // The inbound open can now throw on a reclaim claim, not just on a missing
-    // file, so the already-open outbound handle has to be closed here or every
-    // poll under a stale claim leaks one FD + mmap segment.
-    outDb?.close();
-    return 'pending'; // DBs might not exist yet
+    // Same answer the two raw opens gave: a session whose files are present
+    // but unopenable (a stale reclaim claim, a descriptor ceiling) is
+    // 'pending', so the sweep retries and never arms the quiet gate off a
+    // failure.
+    return 'pending';
+  }
+  // `undefined` is the vanished/not-yet-provisioned session: a read never
+  // provisions one (invariant I-4), and there is nothing to deliver from a
+  // mailbox that does not exist.
+  if (snapshot === undefined) return 'pending';
+  const { delivered, outstanding } = snapshot;
+
+  if (outstanding.length === 0) return 'clean';
+
+  const undelivered = snapshot.due.filter((m) => !delivered.has(m.id));
+  if (undelivered.length === 0) return 'pending';
+
+  // Bump `tasks.last_progress_at` once per drain if this session is a
+  // spawn-task child. Only `spawn_progress` MCP calls update that column
+  // today, so an agent that's actively thinking, posting status, and
+  // running tool calls but hasn't explicitly pinged `spawn_progress`
+  // within 30 minutes gets reaped by the no-progress watchdog as if it
+  // were stuck. Observed against spawn-9048e8cfbcc024c2 (EXAMPLE-61) at
+  // 20:11:05 UTC on 2026-05-11: the watchdog reaped exactly 33 seconds
+  // before the child called spawn_complete — the agent was delivering
+  // status messages within the same second. Counting any outbound row as
+  // "progress" makes the no-progress timer mean what it says.
+  if (isSpawnChildSession(session.id)) {
+    try {
+      getDb()
+        .prepare(`UPDATE tasks SET last_progress_at = ? WHERE child_session_id = ?`)
+        .run(new Date().toISOString(), session.id);
+    } catch (err) {
+      log.warn('Failed to bump last_progress_at for spawn child', {
+        sessionId: session.id,
+        err: err instanceof Error ? err.message : String(err),
+      });
+    }
   }
 
-  try {
-    // Everything outstanding, not just what is due — a row scheduled for later
-    // sits in a file that may never change again, so it must block arming.
-    const delivered = getDeliveredIds(inDb);
-    const outstanding = (outDb.prepare('SELECT id FROM messages_out').all() as Array<{ id: string }>)
-      .map((r) => r.id)
-      .filter((id) => !delivered.has(id));
-    if (outstanding.length === 0) return 'clean';
-
-    // Read all due messages from outbound.db (read-only)
-    const allDue = getDueOutboundMessages(outDb);
-    const undelivered = allDue.filter((m) => !delivered.has(m.id));
-    if (undelivered.length === 0) return 'pending';
-
-    // Ensure platform_message_id column exists (migration for existing sessions)
-    migrateDeliveredTable(inDb);
-
-    // Bump `tasks.last_progress_at` once per drain if this session is a
-    // spawn-task child. Only `spawn_progress` MCP calls update that column
-    // today, so an agent that's actively thinking, posting status, and
-    // running tool calls but hasn't explicitly pinged `spawn_progress`
-    // within 30 minutes gets reaped by the no-progress watchdog as if it
-    // were stuck. Observed against spawn-9048e8cfbcc024c2 (EXAMPLE-61) at
-    // 20:11:05 UTC on 2026-05-11: the watchdog reaped exactly 33 seconds
-    // before the child called spawn_complete — the agent was delivering
-    // status messages within the same second. Counting any outbound row as
-    // "progress" makes the no-progress timer mean what it says.
-    if (isSpawnChildSession(session.id)) {
-      try {
-        getDb()
-          .prepare(`UPDATE tasks SET last_progress_at = ? WHERE child_session_id = ?`)
-          .run(new Date().toISOString(), session.id);
-      } catch (err) {
-        log.warn('Failed to bump last_progress_at for spawn child', {
-          sessionId: session.id,
-          err: err instanceof Error ? err.message : String(err),
-        });
-      }
-    }
-
-    let sawError = false;
-    const deliveredNow = new Set<string>();
-    for (const msg of undelivered) {
-      try {
-        const result = await deliverMessage(msg, session, inDb);
-        // System actions like request_bash_gate return deferAck:true — the
-        // handler owns the `delivered` row lifecycle and writes it later
-        // (on admin approval or timeout). Auto-acking here would race
-        // ahead of the human and silently unblock a gated command.
-        if (!result.deferAck) {
-          markDelivered(inDb, msg.id, result.platformMsgId ?? null);
-          deliveredNow.add(msg.id);
-          // Mirror the outbound timestamp into the central sessions row so
-          // the inbox board can compute attention-state without opening
-          // every per-session outbound.db. Only bump for messages that
-          // actually went to a platform — system actions handled in-host
-          // and agent-to-agent internal traffic aren't operator-visible
-          // and would otherwise keep dormant sessions out of the stale
-          // lane forever. Mirrors the typing-indicator gate below.
-          if (msg.kind !== 'system' && msg.channel_type !== 'agent') {
-            const tag = outboundKindTag(msg);
-            try {
-              bumpLastOutbound(session.id, tag);
-            } catch (err) {
-              log.warn('bumpLastOutbound failed', {
-                sessionId: session.id,
-                err: err instanceof Error ? err.message : String(err),
-              });
-            }
-            // Push the inbox-board SSE so an operator watching the inbox
-            // sees the new last_outbound_at without waiting for poll.
-            emitSessionEvent({
-              session_id: session.id,
-              agent_group_id: session.agent_group_id,
-              kind: 'outbound',
-              outbound_kind: tag,
-            });
-          }
-        }
-        deliveryAttempts.delete(msg.id);
-
-        // Pause the typing indicator after a real user-facing message
-        // lands on the user's screen, so the client has time to visually
-        // clear the indicator before the next heartbeat tick brings it
-        // back. Skip the pause for internal traffic (system actions,
-        // agent-to-agent routing) — the user doesn't see those and
-        // shouldn't get a gap in their typing indicator for them.
+  let sawError = false;
+  const deliveredNow = new Set<string>();
+  for (const msg of undelivered) {
+    try {
+      const result = await deliverMessage(msg, session);
+      // System actions like request_bash_gate return deferAck:true — the
+      // handler owns the `delivered` row lifecycle and writes it later
+      // (on admin approval or timeout). Auto-acking here would race
+      // ahead of the human and silently unblock a gated command.
+      if (!result.deferAck) {
+        await ackDelivery(agentGroup.id, session.id, (mailbox) =>
+          mailbox.markDelivered(msg.id, result.platformMsgId ?? null),
+        );
+        deliveredNow.add(msg.id);
+        // Mirror the outbound timestamp into the central sessions row so
+        // the inbox board can compute attention-state without opening
+        // every per-session outbound.db. Only bump for messages that
+        // actually went to a platform — system actions handled in-host
+        // and agent-to-agent internal traffic aren't operator-visible
+        // and would otherwise keep dormant sessions out of the stale
+        // lane forever. Mirrors the typing-indicator gate below.
         if (msg.kind !== 'system' && msg.channel_type !== 'agent') {
-          pauseTypingRefreshAfterDelivery(session.id);
-        }
-      } catch (err) {
-        sawError = true;
-        const attempts = (deliveryAttempts.get(msg.id) ?? 0) + 1;
-        deliveryAttempts.set(msg.id, attempts);
-        if (attempts >= MAX_DELIVERY_ATTEMPTS) {
-          log.error('Message delivery failed permanently, giving up', {
-            messageId: msg.id,
-            sessionId: session.id,
-            attempts,
-            err,
-          });
-          const errMsg = err instanceof Error ? err.message : String(err);
-          markDeliveryFailed(inDb, msg.id, errMsg);
-          deliveryAttempts.delete(msg.id);
-          // Incident 2026-09-01: the row dropped here was a repository
-          // publication that had already fenced ~1400 session inbound DBs in
-          // its workgroup. Its strict release fails fast on the first bad
-          // session, so every session behind that one stayed fenced — deaf,
-          // unspawnable, and with no code path left to free it. Giving up on
-          // the message is the last moment the host knows the transition has
-          // ended, so release any fence no live publication still owns.
-          // Lazy import: session-manager already imports delivery, so a static
-          // edge here would close a module-init cycle (CLAUDE.md).
+          const tag = outboundKindTag(msg);
           try {
-            const { releaseOrphanedRepoIngressFencesForDroppedMessage } = await import('./repo-fence-recovery.js');
-            await releaseOrphanedRepoIngressFencesForDroppedMessage(msg, session);
-          } catch (recoveryErr) {
-            log.error('Orphaned repository fence recovery after a dropped delivery failed', {
-              messageId: msg.id,
+            bumpLastOutbound(session.id, tag);
+          } catch (err) {
+            log.warn('bumpLastOutbound failed', {
               sessionId: session.id,
-              err: recoveryErr,
+              err: err instanceof Error ? err.message : String(err),
             });
           }
-        } else {
-          log.warn('Message delivery failed, will retry', {
-            messageId: msg.id,
-            sessionId: session.id,
-            attempt: attempts,
-            maxAttempts: MAX_DELIVERY_ATTEMPTS,
-            err,
+          // Push the inbox-board SSE so an operator watching the inbox
+          // sees the new last_outbound_at without waiting for poll.
+          emitSessionEvent({
+            session_id: session.id,
+            agent_group_id: session.agent_group_id,
+            kind: 'outbound',
+            outbound_kind: tag,
           });
-          // Preserve outbound ordering across retries. Continuing would let a
-          // newer status/chat overtake this row; if the failed row later
-          // retries, it can overwrite newer progress or appear after the final
-          // answer. The next poll resumes from this oldest undelivered row.
-          break;
         }
       }
+      deliveryAttempts.delete(msg.id);
+
+      // Pause the typing indicator after a real user-facing message
+      // lands on the user's screen, so the client has time to visually
+      // clear the indicator before the next heartbeat tick brings it
+      // back. Skip the pause for internal traffic (system actions,
+      // agent-to-agent routing) — the user doesn't see those and
+      // shouldn't get a gap in their typing indicator for them.
+      if (msg.kind !== 'system' && msg.channel_type !== 'agent') {
+        pauseTypingRefreshAfterDelivery(session.id);
+      }
+    } catch (err) {
+      sawError = true;
+      const attempts = (deliveryAttempts.get(msg.id) ?? 0) + 1;
+      deliveryAttempts.set(msg.id, attempts);
+      if (attempts >= MAX_DELIVERY_ATTEMPTS) {
+        log.error('Message delivery failed permanently, giving up', {
+          messageId: msg.id,
+          sessionId: session.id,
+          attempts,
+          err,
+        });
+        const errMsg = err instanceof Error ? err.message : String(err);
+        await ackDelivery(agentGroup.id, session.id, (mailbox) => mailbox.markDeliveryFailed(msg.id, errMsg));
+        deliveryAttempts.delete(msg.id);
+        // Incident 2026-09-01: the row dropped here was a repository
+        // publication that had already fenced ~1400 session inbound DBs in
+        // its workgroup. Its strict release fails fast on the first bad
+        // session, so every session behind that one stayed fenced — deaf,
+        // unspawnable, and with no code path left to free it. Giving up on
+        // the message is the last moment the host knows the transition has
+        // ended, so release any fence no live publication still owns.
+        // Lazy import: session-manager already imports delivery, so a static
+        // edge here would close a module-init cycle (CLAUDE.md).
+        try {
+          const { releaseOrphanedRepoIngressFencesForDroppedMessage } = await import('./repo-fence-recovery.js');
+          await releaseOrphanedRepoIngressFencesForDroppedMessage(msg, session);
+        } catch (recoveryErr) {
+          log.error('Orphaned repository fence recovery after a dropped delivery failed', {
+            messageId: msg.id,
+            sessionId: session.id,
+            err: recoveryErr,
+          });
+        }
+      } else {
+        log.warn('Message delivery failed, will retry', {
+          messageId: msg.id,
+          sessionId: session.id,
+          attempt: attempts,
+          maxAttempts: MAX_DELIVERY_ATTEMPTS,
+          err,
+        });
+        // Preserve outbound ordering across retries. Continuing would let a
+        // newer status/chat overtake this row; if the failed row later
+        // retries, it can overwrite newer progress or appear after the final
+        // answer. The next poll resumes from this oldest undelivered row.
+        break;
+      }
     }
-    if (sawError) return 'error';
-    // A `deferAck` handler owns its row's lifecycle and writes `delivered`
-    // later, so those rows are still outstanding and must block arming.
-    return outstanding.every((id) => deliveredNow.has(id)) ? 'clean' : 'pending';
-  } finally {
-    outDb.close();
-    inDb.close();
   }
+  if (sawError) return 'error';
+  // A `deferAck` handler owns its row's lifecycle and writes `delivered`
+  // later, so those rows are still outstanding and must block arming.
+  return outstanding.every((id) => deliveredNow.has(id)) ? 'clean' : 'pending';
+}
+
+/**
+ * Write one `delivered` row in its own short mailbox session.
+ *
+ * `withExistingMailboxSession`, not `withMailboxSession`: the mailbox this
+ * acks was open moments ago to read the row, so provisioning can only mean the
+ * session was reclaimed underneath us — and provisioning would then recreate
+ * the directory a reclaim had just removed and create the outbound.db the host
+ * must never author (`modules/mailbox/openers.ts`). A vanished session loses
+ * its ack, which leaves the row outstanding exactly as an unwritable handle
+ * did before, and says so instead of writing into an unlinked inode.
+ */
+async function ackDelivery(
+  agentGroupId: string,
+  sessionId: string,
+  write: (mailbox: NanoclawMailboxSession) => void,
+): Promise<void> {
+  const acked = await withExistingMailboxSession(agentGroupId, sessionId, (mailbox) => {
+    write(mailbox);
+    return true;
+  });
+  if (!acked) log.warn('Delivery ack skipped — session mailbox is gone', { sessionId });
 }
 
 /**
@@ -691,8 +712,6 @@ async function drainSession(session: Session): Promise<DrainOutcome> {
  * armed one and is re-polled next cycle instead of being swallowed.
  */
 export async function sweepDeliverSession(session: Session, nowMs: number): Promise<DrainOutcome | 'skipped'> {
-  const outPath = outboundDbPath(session.agent_group_id, session.id);
-
   // A live container is about to write, and pollActive already drains it every
   // second — never gate it. `isContainerRunning` is the authoritative signal:
   // spawn records the container in its in-memory map (container-runner.ts,
@@ -708,19 +727,9 @@ export async function sweepDeliverSession(session: Session, nowMs: number): Prom
   const containerLive =
     isContainerRunning(session.id) || session.container_status === 'running' || session.container_status === 'idle';
 
-  let current: { mtimeNs: bigint; size: number } | null = null;
-  if (!containerLive) {
-    try {
-      // A hot journal means a rollback (a write) is still owed on this file —
-      // see recoverHotJournal. Pre-rollback stat state is ambiguous, so poll.
-      if (!fs.existsSync(`${outPath}-journal`)) {
-        const st = fs.statSync(outPath, { bigint: true });
-        current = { mtimeNs: st.mtimeNs, size: Number(st.size) };
-      }
-    } catch {
-      current = null; // no outbound.db yet — fall through and let the drain decide
-    }
-  }
+  // `null` — no storage yet, unreadable, or a rollback still owed on the file
+  // — falls through and lets the drain decide instead of arming.
+  const current = containerLive ? null : sessionOutboundStorageStat(session.agent_group_id, session.id);
 
   if (current && shouldSkipQuietDelivery(quietDeliveryCache.get(session.id), current, nowMs, session.id)) {
     return 'skipped';
@@ -790,7 +799,7 @@ export async function runSweepDeliveryCycle(nowMs: number = Date.now()): Promise
 const threadAnchorExemptCache = new Map<string, { exempt: boolean; at: number }>();
 const THREAD_ANCHOR_CACHE_TTL_MS = 5 * 60 * 1000;
 
-function isThreadAnchorExempt(session: Session): boolean {
+async function isThreadAnchorExempt(session: Session): Promise<boolean> {
   const prefix = `${TASKS_SYSTEM_THREAD_ID}:`;
   if (!session.thread_id?.startsWith(prefix)) return false;
   const cached = threadAnchorExemptCache.get(session.id);
@@ -799,17 +808,10 @@ function isThreadAnchorExempt(session: Session): boolean {
   let exempt = false;
   try {
     const seriesId = session.thread_id.slice(prefix.length);
-    const inDb = openInboundDb(session.agent_group_id, session.id);
-    try {
-      const row = inDb
-        .prepare(
-          "SELECT content FROM messages_in WHERE kind = 'task' AND series_id = ? ORDER BY timestamp DESC LIMIT 1",
-        )
-        .get(seriesId) as { content: string } | undefined;
-      if (row) exempt = (JSON.parse(row.content) as { threadAnchor?: unknown }).threadAnchor === false;
-    } finally {
-      inDb.close();
-    }
+    const content = await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) =>
+      mailbox.getLatestTaskContent(seriesId),
+    );
+    if (content) exempt = (JSON.parse(content) as { threadAnchor?: unknown }).threadAnchor === false;
   } catch {
     exempt = false;
   }
@@ -828,7 +830,6 @@ async function deliverMessage(
     in_reply_to: string | null;
   },
   session: Session,
-  inDb: Database.Database,
 ): Promise<{ platformMsgId?: string; deferAck?: true }> {
   assertChannelRoutingConsistency({ channelType: msg.channel_type, platformId: msg.platform_id });
 
@@ -873,7 +874,7 @@ async function deliverMessage(
   // System actions — handle internally (self-mod, cli_request, agent routing, etc.)
 
   if (msg.kind === 'system') {
-    const result = await handleSystemAction(content, session, inDb);
+    const result = await handleSystemAction(content, session);
     if (result && result.deferAck) return { deferAck: true };
     return {};
   }
@@ -1200,7 +1201,7 @@ async function deliverMessage(
   // the whole series; the anchor default stays ON because the storm shape
   // (repeated status posts) is the common case.
   const isTaskSessionPost = session.messaging_group_id === null && isTaskThread(session.thread_id);
-  const taskAnchorEligible = isTaskSessionPost && baseThreadId === null && !isThreadAnchorExempt(session);
+  const taskAnchorEligible = isTaskSessionPost && baseThreadId === null && !(await isThreadAnchorExempt(session));
 
   // Per-turn channel-root threading (see ChatThreadAnchor above) — everything
   // that isn't a task-session post. Only engages when the agent didn't
@@ -1405,7 +1406,6 @@ export type DeliveryActionResult = void | { deferAck: true };
 export type DeliveryActionHandler = (
   content: Record<string, unknown>,
   session: Session,
-  inDb: Database.Database,
 ) => Promise<DeliveryActionResult>;
 
 type DeliveryEntry =
@@ -1479,17 +1479,13 @@ export function getDeliveryAction(action: string): DeliveryActionHandler | undef
  * These are written to messages_out because the container can't write to inbound.db.
  * The host applies them to inbound.db here.
  */
-async function handleSystemAction(
-  content: Record<string, unknown>,
-  session: Session,
-  inDb: Database.Database,
-): Promise<DeliveryActionResult> {
+async function handleSystemAction(content: Record<string, unknown>, session: Session): Promise<DeliveryActionResult> {
   const action = content.action as string;
   log.info('System action from agent', { sessionId: session.id, action });
 
   const registered = getDeliveryAction(action);
   if (registered) {
-    return registered(content, session, inDb);
+    return registered(content, session);
   }
 
   log.warn('Unknown system action', { action });

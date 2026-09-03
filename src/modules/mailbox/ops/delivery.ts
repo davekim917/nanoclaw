@@ -3,6 +3,7 @@
  * outbound rows. Internal to `src/modules/mailbox/`.
  */
 import type Database from 'better-sqlite3';
+import fs from 'fs';
 
 export interface OutboundMessage {
   id: string;
@@ -22,6 +23,17 @@ export function getDueOutboundMessages(db: Database.Database): OutboundMessage[]
        ORDER BY timestamp ASC`,
     )
     .all() as OutboundMessage[];
+}
+
+/**
+ * Every id in `messages_out`, due or not.
+ *
+ * The delivery loop arms a session as quiet only when nothing is outstanding,
+ * and a row scheduled for later sits in a file that may never change again —
+ * so "outstanding" has to mean every undelivered id, not just the due ones.
+ */
+export function listOutboundMessageIds(db: Database.Database): string[] {
+  return (db.prepare('SELECT id FROM messages_out').all() as Array<{ id: string }>).map((row) => row.id);
 }
 
 export function getDeliveredIds(db: Database.Database): Set<string> {
@@ -70,4 +82,27 @@ export function markDeliveryFailed(db: Database.Database, messageOutId: string, 
        error = excluded.error,
        delivered_at = excluded.delivered_at`,
   ).run(messageOutId, errorMessage ?? null, new Date().toISOString());
+}
+
+/**
+ * The quiet-delivery gate's view of a session's outbound file.
+ *
+ * The delivery sweep arms a session as quiet off `(mtime, size)` of
+ * outbound.db and re-polls when either moves. That is a storage question, not
+ * a mailbox-session one — it must be answered BEFORE any handle is opened, and
+ * for sessions that have no mailbox at all — so it lives here as a path-level
+ * op rather than on `MailboxSession`.
+ *
+ * `null` means "do not arm": the file is absent, unreadable, or carries a hot
+ * journal, and a hot journal means a rollback (a write) is still owed on it, so
+ * the pre-rollback stat is ambiguous. See `recoverHotJournal` in the openers.
+ */
+export function outboundStorageStat(dbPath: string): { mtimeNs: bigint; size: number } | null {
+  try {
+    if (fs.existsSync(`${dbPath}-journal`)) return null;
+    const stat = fs.statSync(dbPath, { bigint: true });
+    return { mtimeNs: stat.mtimeNs, size: Number(stat.size) };
+  } catch {
+    return null;
+  }
 }
