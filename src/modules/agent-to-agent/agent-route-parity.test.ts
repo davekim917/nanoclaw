@@ -84,7 +84,7 @@ async function route(content: string, sourceSessionId: string) {
 
 async function targetInbound(): Promise<Array<{ content: string; channel_type: string | null }>> {
   const { getSessionsByAgentGroup } = await import('../../db/sessions.js');
-  const { inboundDbPath } = await import('../../session-manager.js');
+  const { inboundDbPath } = await import('../../mailbox/sqlite/paths.js');
   const sessions = getSessionsByAgentGroup(B);
   expect(sessions.length).toBeGreaterThanOrEqual(1);
   const db = new Database(inboundDbPath(B, sessions[0].id), { readonly: true });

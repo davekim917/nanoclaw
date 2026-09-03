@@ -144,7 +144,7 @@ registerResource({
       handler: async (args) => {
         const timezone = parseTimezoneFlag(args.timezone) ?? undefined;
         if (args.template) {
-          return createAgentFromTemplate(String(args.template), {
+          return await createAgentFromTemplate(String(args.template), {
             name: args.name ? String(args.name) : undefined,
             timezone,
           });

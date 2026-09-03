@@ -48,24 +48,23 @@ import {
   threadWorktreeDir,
   threadsBaseDir,
   initSessionFolder,
-  inboundDbPath,
-  outboundDbPath,
   sessionClaudeProjectsDir,
   sessionContextPath,
   sessionContextPathFor,
   sessionDir,
   sessionMessageExists,
+  withExistingMailboxSession,
   withMailboxSession,
-  writeOutboundDirect,
   writeSessionMessage,
   writeSessionMessageIfNew,
   SessionWriteRefusedError,
   isAdmissiblePreTurnTrigger,
   reconcilePendingUpgradeContexts,
 } from './session-manager.js';
+import { inboundDbPath, outboundDbPath } from './mailbox/sqlite/paths.js';
 import { initTestDb, closeDb, runMigrations, createAgentGroup, getDb } from './db/index.js';
 import { createSession } from './db/sessions.js';
-import { insertDeferredMessageWithContextIfNew } from './db/session-db.js';
+import { insertDeferredMessageWithContextIfNew } from './modules/mailbox/ops/ingress.js';
 import { insertRecurrence, insertTaskRow, type RecurringMessage } from './modules/scheduling/db.js';
 import { getSessionClaudeMounts } from './session-claude-mounts.js';
 import type { AgentGroup, Session } from './types.js';
@@ -154,18 +153,30 @@ describe('threadWorktreeDir', () => {
 });
 
 /**
- * Tests for session-manager's direct outbound write path.
+ * Tests for the direct outbound write path.
  *
- * Drives the real `writeOutboundDirect` entry against a real session folder
- * on disk. A previous implementation opened the outbound DB through
- * `openOutboundDb` (readonly: true), so every INSERT threw SQLITE_READONLY
- * and the command-gate denial path silently never delivered. Goes red if the
- * open call reverts to the readonly form.
+ * Drives the real `writeOutboundDirect` op through the mailbox seam against a
+ * real session folder on disk. A previous implementation opened the outbound
+ * DB readonly, so every INSERT threw SQLITE_READONLY and the command-gate
+ * denial path silently never delivered. Goes red if the open reverts to the
+ * readonly form.
  */
 describe('writeOutboundDirect', () => {
   const TEST_DIR = TEST_DATA_DIR;
   const AG = 'ag-test';
   const SESS = 'sess-test';
+
+  /** The seam's op, for a session the fixture has already provisioned. */
+  async function writeOutboundDirectRow(message: {
+    id: string;
+    kind: string;
+    platformId: string | null;
+    channelType: string | null;
+    threadId: string | null;
+    content: string;
+  }): Promise<void> {
+    await withExistingMailboxSession(AG, SESS, (mailbox) => mailbox.writeOutboundDirect(message));
+  }
 
   function readMessagesOut(): Array<{ id: string; seq: number; kind: string; content: string }> {
     const db = new Database(outboundDbPath(AG, SESS), { readonly: true });
@@ -193,7 +204,7 @@ describe('writeOutboundDirect', () => {
 
   it('inserts into messages_out with an even host-side seq (requires a writable outbound.db)', async () => {
     // With a readonly open this very call throws SQLITE_READONLY.
-    writeOutboundDirect(AG, SESS, {
+    await writeOutboundDirectRow({
       id: 'denial-1',
       kind: 'chat',
       platformId: 'slack:C1',
@@ -211,7 +222,7 @@ describe('writeOutboundDirect', () => {
   });
 
   it('keeps host seq numbers even across multiple writes and ignores duplicate ids', async () => {
-    writeOutboundDirect(AG, SESS, {
+    await writeOutboundDirectRow({
       id: 'denial-1',
       kind: 'chat',
       platformId: null,
@@ -219,7 +230,7 @@ describe('writeOutboundDirect', () => {
       threadId: null,
       content: '{"text":"first"}',
     });
-    writeOutboundDirect(AG, SESS, {
+    await writeOutboundDirectRow({
       id: 'denial-2',
       kind: 'chat',
       platformId: null,
@@ -228,7 +239,7 @@ describe('writeOutboundDirect', () => {
       content: '{"text":"second"}',
     });
     // INSERT OR IGNORE — a delivery retry with the same id must not throw or duplicate.
-    writeOutboundDirect(AG, SESS, {
+    await writeOutboundDirectRow({
       id: 'denial-1',
       kind: 'chat',
       platformId: null,
@@ -938,7 +949,7 @@ describe('writeSessionMessage re-provisions a deleted session folder', () => {
       content: JSON.stringify({ prompt: 'deferred by the fence' }),
     });
 
-    const { activateRepoIngressFence, releaseRepoIngressFence } = await import('./db/session-db.js');
+    const { activateRepoIngressFence, releaseRepoIngressFence } = await import('./modules/mailbox/ops/fence.js');
     const fence = activateRepoIngressFence(fencedDb, 'repository-activation:test');
 
     expect(await admitDueTaskContexts(AG, SESS)).toBe(0);

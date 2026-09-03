@@ -20,7 +20,8 @@ import Database from 'better-sqlite3';
 import type { NanoclawMailboxSession } from '../../modules/mailbox/index.js';
 
 import { initTestDb, closeDb, getDb } from '../../db/connection.js';
-import { ensureSchema, openInboundDb } from '../../db/session-db.js';
+import { openInboundDb } from '../../modules/mailbox/openers.js';
+import { ensureSchema } from '../../modules/mailbox/schema.js';
 import { migration043 } from '../../db/migrations/043-scheduled-audit.js';
 import {
   encodeKey,

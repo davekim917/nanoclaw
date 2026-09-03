@@ -18,7 +18,11 @@ vi.mock('../../config.js', async (importOriginal) => ({
   DATA_DIR: `${TEST_ROOT}/data`,
 }));
 
-import { ensureSchema, openInboundDb } from '../../db/session-db.js';
+import { openInboundDb } from '../mailbox/openers.js';
+import { ensureSchema } from '../mailbox/schema.js';
+import { withMailboxSession } from '../../session-manager.js';
+import { parseProcessingAckRecord } from '../../mailbox/model.js';
+import type { NanoclawMailboxSession } from '../../modules/mailbox/index.js';
 import {
   insertTaskRow,
   insertRecurrence,

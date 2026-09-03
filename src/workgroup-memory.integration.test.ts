@@ -52,8 +52,19 @@ vi.mock('../container/agent-runner/src/destinations.js', () => ({
 
 import { closeDb, getDb, initTestDb, runMigrations } from './db/index.js';
 import { upsertArchiveMessage } from './message-archive.js';
-import { openInboundDb, outboundDbPath, writeSessionMessageIfNew } from './session-manager.js';
+import { writeSessionMessageIfNew } from './session-manager.js';
+import { openInboundDb as openInboundDbAt } from './modules/mailbox/openers.js';
+import { inboundDbPath } from './mailbox/sqlite/paths.js';
+import { outboundDbPath } from './mailbox/sqlite/paths.js';
 import { memoryTreeSha256 } from './modules/workgroup/shared-dirs.js';
+
+// `session-manager`'s ids-addressed inbound opener went away with the mailbox
+// seam's raw wrappers (PR 7). Production code opens sessions through the seam;
+// this fixture still wants a plain handle on a named session's file, which is
+// the module's own path-addressed funnel plus the layout helper.
+function openInboundDb(agentGroupId: string, sessionId: string): Database.Database {
+  return openInboundDbAt(inboundDbPath(agentGroupId, sessionId));
+}
 
 interface RunnerMessageRow {
   id: string;

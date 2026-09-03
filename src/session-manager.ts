@@ -42,26 +42,11 @@ import type { MailboxSession, MailboxSessionKey } from './mailbox/types.js';
 // cast; an action written against upstream's narrower `MailboxSession` is
 // still accepted, since the parameter only widens.
 import {
-  hasMatchingBootstrapRecall,
-  listOpenChatContents,
-  listRecentRecallRows,
-  nextEvenSeq,
-  readProviderRecallState,
-  readRepoIngressFence,
+  sessionMailboxPath,
   type MessageInsert,
   type NanoclawMailboxSession,
   type ProviderRecallState,
 } from './modules/mailbox/index.js';
-// The module's open funnels, reached directly. These back the raw
-// openInboundDb/openOutboundDb/openOutboundDbRw/withInboundDb/writeOutboundDirect
-// helpers this file still exports for callers PR 7 has not converted yet —
-// which is also why session-manager.ts stays on the raw-access allowlist.
-import {
-  openInboundDb as openInboundDbRaw,
-  openOutboundDb as openOutboundDbRaw,
-  openOutboundDbRw as openOutboundDbRwRaw,
-} from './modules/mailbox/openers.js';
-import { migrateMessagesInTable } from './modules/mailbox/schema.js';
 import { log } from './log.js';
 import { buildPreTurnContext } from './modules/memory/pre-turn-context.js';
 import type { Session, SessionMode } from './types.js';
@@ -107,7 +92,7 @@ export function sessionContextPathFor(sessionPath: string): string {
  */
 export function writeSessionContext(agentGroupId: string, sessionId: string, mailbox: unknown): void {
   const contextPath = sessionContextPath(agentGroupId, sessionId);
-  const fileMode = existingMode(inboundDbPath(agentGroupId, sessionId), 0o644);
+  const fileMode = existingMode(sessionMailboxPath({ agentGroupId, sessionId }, 'inbound'), 0o644);
   const dirMode = existingMode(sessionDir(agentGroupId, sessionId), 0o755);
   fs.mkdirSync(path.dirname(contextPath), { recursive: true });
   fs.chmodSync(path.dirname(contextPath), dirMode);
@@ -234,16 +219,6 @@ export function stampThreadDirOwner(stateDir: string, workgroupId: string): void
   } catch {
     /* advisory marker — never block a spawn on it */
   }
-}
-
-/** Path to the host-owned inbound DB (messages_in + delivered). */
-export function inboundDbPath(agentGroupId: string, sessionId: string): string {
-  return path.join(sessionDir(agentGroupId, sessionId), 'inbound.db');
-}
-
-/** Path to the container-owned outbound DB (messages_out + processing_ack). */
-export function outboundDbPath(agentGroupId: string, sessionId: string): string {
-  return path.join(sessionDir(agentGroupId, sessionId), 'outbound.db');
 }
 
 /** Path to the container heartbeat file (touched instead of DB writes). */
@@ -715,37 +690,18 @@ export function isAdmissiblePreTurnTrigger(message: SessionMessageInput): boolea
 }
 
 /**
- * The four recall reads, however the caller reached them.
+ * The four recall reads a pre-turn context is built from.
  *
- * `NanoclawMailboxSession` satisfies this structurally, which is the whole
- * point: the write path passes its open session, while the two admission
- * passes that still receive a raw handle from `host-sweep.ts` pass
- * {@link recallSourceForHandle}. Both run the SAME statements — the module
- * owns them (invariant I-2); this interface only decides which handle they
- * execute against. The adapter disappears with the raw helpers in PR 7.
+ * Every caller now passes its open `NanoclawMailboxSession`, which satisfies
+ * this structurally. It is still named rather than taking the whole session
+ * type, because these four are the entire dependency the recall builder has —
+ * and saying so is what keeps a fifth from being reached for by accident.
  */
 interface RecallSource {
   readProviderRecallState(provider: string): ProviderRecallState;
   listOpenChatContents(): Array<{ content: string }>;
   listRecentRecallRows(limit: number): Array<{ id: string; status: string; content: string }>;
   hasMatchingBootstrapRecall(excludeRecallId: string | null, provider: string, contextEpoch: number): boolean;
-}
-
-function recallSourceForHandle(agentGroupId: string, sessionId: string, inbound: Database.Database): RecallSource {
-  return {
-    readProviderRecallState: (provider) => {
-      const outbound = openOutboundDb(agentGroupId, sessionId);
-      try {
-        return readProviderRecallState(outbound, provider);
-      } finally {
-        outbound.close();
-      }
-    },
-    listOpenChatContents: () => listOpenChatContents(inbound),
-    listRecentRecallRows: (limit) => listRecentRecallRows(inbound, limit),
-    hasMatchingBootstrapRecall: (excludeRecallId, provider, contextEpoch) =>
-      hasMatchingBootstrapRecall(inbound, excludeRecallId, provider, contextEpoch),
-  };
 }
 
 function buildRecallRow(
@@ -1079,7 +1035,7 @@ async function writeSessionMessageLocked(
   // the documented operator `rm -rf`. All three re-provision below, as they
   // must.
   const { sessionWasReclaimed } = await import('./storage-manager.js');
-  if (sessionWasReclaimed(sessionId) && !fs.existsSync(inboundDbPath(agentGroupId, sessionId))) {
+  if (sessionWasReclaimed(sessionId) && !fs.existsSync(sessionMailboxPath({ agentGroupId, sessionId }, 'inbound'))) {
     throw new Error(`session ${sessionId} has been reclaimed; route this message to a fresh session`);
   }
 
@@ -1089,7 +1045,7 @@ async function writeSessionMessageLocked(
   // below would throw and the message would be logged-and-dropped forever.
   // Re-provision the folder + DBs (initSessionFolder is idempotent) so the
   // documented reset actually re-provisions instead of killing the chat.
-  if (!fs.existsSync(inboundDbPath(agentGroupId, sessionId))) {
+  if (!fs.existsSync(sessionMailboxPath({ agentGroupId, sessionId }, 'inbound'))) {
     initSessionFolder(agentGroupId, sessionId);
   }
 
@@ -1225,23 +1181,6 @@ async function writeSessionMessageLocked(
       /* dashboard module not initialized — tests + early boot */
     });
   return true;
-}
-
-interface DueTaskForAdmission {
-  id: string;
-  kind: string;
-  timestamp: string;
-  platform_id: string | null;
-  channel_type: string | null;
-  thread_id: string | null;
-  content: string;
-  process_after: string | null;
-  source_session_id: string | null;
-  on_wake: 0 | 1;
-}
-
-interface PendingUpgradeForAdmission extends DueTaskForAdmission {
-  status: 'pending' | 'processing';
 }
 
 /**
@@ -1800,83 +1739,6 @@ function removeExtractedAttachments(writtenPaths: string[]): void {
     } catch {
       // Non-empty or already gone; tidying, not the guarantee.
     }
-  }
-}
-
-/** Open the inbound DB for a session (host reads/writes). */
-export function openInboundDb(agentGroupId: string, sessionId: string): Database.Database {
-  const db = openInboundDbRaw(inboundDbPath(agentGroupId, sessionId));
-  try {
-    migrateMessagesInTable(db);
-  } catch (err) {
-    // close() releases the storage-activity marker; without this a failed
-    // migration leaks both the handle and the marker, and a leaked marker
-    // makes this session unreclaimable until the next host start.
-    db.close();
-    throw err;
-  }
-  return db;
-}
-
-/** Open a session's inbound DB, run `fn`, and always close it. */
-export function withInboundDb<T>(agentGroupId: string, sessionId: string, fn: (db: Database.Database) => T): T {
-  const db = openInboundDb(agentGroupId, sessionId);
-  try {
-    return fn(db);
-  } finally {
-    db.close();
-  }
-}
-
-/** Open the outbound DB for a session (host reads only). */
-export function openOutboundDb(agentGroupId: string, sessionId: string): Database.Database {
-  return openOutboundDbRaw(outboundDbPath(agentGroupId, sessionId));
-}
-
-/** Open the outbound DB for a session with write access. Only safe to call when no container is running. */
-export function openOutboundDbRw(agentGroupId: string, sessionId: string): Database.Database {
-  return openOutboundDbRwRaw(outboundDbPath(agentGroupId, sessionId));
-}
-
-/**
- * Write a message directly to a session's outbound DB so the host delivery
- * loop picks it up. Used by the command gate to send denial responses
- * without waking a container.
- *
- * Needs the read-write open — the readonly handle the delivery poll uses
- * can't INSERT. This is a host-side write to the container-owned outbound.db,
- * but it's safe even with a container running: both sides open with DELETE
- * journal + busy_timeout, and the even host seq stays out of the container's
- * odd-seq space.
- */
-export function writeOutboundDirect(
-  agentGroupId: string,
-  sessionId: string,
-  message: {
-    id: string;
-    kind: string;
-    platformId: string | null;
-    channelType: string | null;
-    threadId: string | null;
-    content: string;
-  },
-): void {
-  const db = openOutboundDbRw(agentGroupId, sessionId);
-  try {
-    db.prepare(
-      `INSERT OR IGNORE INTO messages_out (id, seq, timestamp, kind, platform_id, channel_type, thread_id, content)
-       VALUES (?, (SELECT COALESCE(MAX(seq), 0) + 2 FROM messages_out), ?, ?, ?, ?, ?, ?)`,
-    ).run(
-      message.id,
-      new Date().toISOString(),
-      message.kind,
-      message.platformId,
-      message.channelType,
-      message.threadId,
-      message.content,
-    );
-  } finally {
-    db.close();
   }
 }
 

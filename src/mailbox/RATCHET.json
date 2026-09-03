@@ -1,18 +1,1 @@
-[
-  "src/cli/resources/tasks.ts",
-  "src/dashboard/api/events.ts",
-  "src/dashboard/api/scheduled-move.ts",
-  "src/dashboard/api/scheduled-mutations.ts",
-  "src/dashboard/api/sessions.ts",
-  "src/dashboard/session-title-sweep.ts",
-  "src/db/session-db.ts",
-  "src/host-sweep.ts",
-  "src/modules/claims/self-heal.ts",
-  "src/modules/permissions/task-slack-subject.ts",
-  "src/modules/scheduling/create.ts",
-  "src/modules/scheduling/live-count.ts",
-  "src/modules/sweep-scheduled-move/index.ts",
-  "src/session-manager.ts",
-  "src/storage-manager.ts",
-  "src/worktree-cleanup.ts"
-]
+["src/modules/sweep-scheduled-move/index.ts", "src/storage-manager.ts"]

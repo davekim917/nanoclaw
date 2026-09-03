@@ -27,16 +27,10 @@ vi.mock('./config.js', async () => {
 const { TEST_DIR } = vi.hoisted(() => ({ TEST_DIR: uniqueTmpRoot('test-delivery') }));
 
 import { initTestDb, closeDb, runMigrations, createAgentGroup, createMessagingGroup } from './db/index.js';
-import { getDeliveredIds } from './db/session-db.js';
-import {
-  resolveSession,
-  resolveTaskSession,
-  outboundDbPath,
-  inboundDbPath,
-  openInboundDb,
-  withMailboxSession,
-  writeSessionMessage,
-} from './session-manager.js';
+import { getDeliveredIds } from './modules/mailbox/ops/delivery.js';
+import { resolveSession, resolveTaskSession, withMailboxSession, writeSessionMessage } from './session-manager.js';
+import { openInboundDb as openInboundDbAt } from './modules/mailbox/openers.js';
+import { inboundDbPath, outboundDbPath } from './mailbox/sqlite/paths.js';
 import { getTaskThreadAnchor, setTaskThreadAnchor } from './db/task-thread-anchors.js';
 import { getDb } from './db/connection.js';
 import {
@@ -1385,6 +1379,14 @@ import {
   QUIET_DELIVERY_BACKOFF_MS,
 } from './delivery.js';
 import { log } from './log.js';
+
+// `session-manager`'s ids-addressed inbound opener went away with the mailbox
+// seam's raw wrappers (PR 7). Production code opens sessions through the seam;
+// this fixture still wants a plain handle on a named session's file, which is
+// the module's own path-addressed funnel plus the layout helper.
+function openInboundDb(agentGroupId: string, sessionId: string): Database.Database {
+  return openInboundDbAt(inboundDbPath(agentGroupId, sessionId));
+}
 
 const STAT = { mtimeNs: 1_000n, size: 4096 };
 

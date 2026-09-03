@@ -1,13 +1,11 @@
 import { randomUUID } from 'crypto';
 import { touchSessionActivity } from '../../db/sessions.js';
-import fs from 'fs';
 
 import { CronExpressionParser } from 'cron-parser';
 
 import { TIMEZONE } from '../../config.js';
-import { inboundDbPath, resolveTaskSession, withInboundDb } from '../../session-manager.js';
+import { resolveTaskSession, withExistingMailboxSession } from '../../session-manager.js';
 import { parseZonedToUtc } from '../../timezone.js';
-import { insertTaskRow } from './db.js';
 
 export const MAX_DAILY_FIRES = 4;
 
@@ -144,20 +142,25 @@ export function prepareScheduledTask(input: {
   };
 }
 
-/** Persist a prepared task through NanoClaw's single task/session representation. */
-export function createScheduledTask(
+/**
+ * Persist a prepared task through NanoClaw's single task/session representation.
+ *
+ * Asynchronous since mailbox seam PR 7: the write goes through the seam, whose
+ * `session()` is a promise. `resolveTaskSession` above provisions the mailbox,
+ * so this uses the existing-only funnel and treats `undefined` as the same
+ * hard error the pre-seam existsSync guard raised (invariant I-10 — a task
+ * writer must not be what resurrects a reclaimed session directory).
+ */
+export async function createScheduledTask(
   agentGroupId: string,
   task: PreparedScheduledTask,
   options?: { status?: 'pending' | 'paused'; originSessionId?: string | null },
-): { session: { id: string; agent_group_id: string }; row: ScheduledTaskRow } {
+): Promise<{ session: { id: string; agent_group_id: string }; row: ScheduledTaskRow }> {
   const id = makeTaskId(task.name);
   const { session } = resolveTaskSession(agentGroupId, id);
 
-  if (!fs.existsSync(inboundDbPath(agentGroupId, session.id))) {
-    throw new Error('task system session inbound.db not found');
-  }
-  const row = withInboundDb(agentGroupId, session.id, (db) => {
-    insertTaskRow(db, {
+  const row = await withExistingMailboxSession(agentGroupId, session.id, (mailbox) => {
+    mailbox.insertTaskRow({
       id,
       seriesId: id,
       processAfter: task.processAfter,
@@ -173,13 +176,9 @@ export function createScheduledTask(
       }),
       status: options?.status ?? 'pending',
     });
-    return db
-      .prepare(
-        `SELECT id AS row_id, series_id, status, process_after, recurrence, content, timestamp, tries, seq
-           FROM messages_in WHERE id = ?`,
-      )
-      .get(id) as ScheduledTaskRow;
+    return mailbox.getCreatedTaskRow(id) as ScheduledTaskRow;
   });
+  if (!row) throw new Error('task system session inbound.db not found');
   // Quiet-cache/delivery-horizon invalidation — see touchSessionActivity.
   touchSessionActivity(session.id);
 

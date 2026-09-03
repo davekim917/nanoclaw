@@ -16,7 +16,9 @@ const { TEST_DIR } = vi.hoisted(() => ({ TEST_DIR: uniqueTmpRoot('test-slack-sub
 import { initTestDb, closeDb, runMigrations, createAgentGroup, getDb } from '../../db/index.js';
 import { createMessagingGroup } from '../../db/messaging-groups.js';
 import { createSession, taskThreadId, TASKS_SYSTEM_THREAD_ID } from '../../db/sessions.js';
-import { initSessionFolder, withInboundDb } from '../../session-manager.js';
+import { initSessionFolder } from '../../session-manager.js';
+import { openInboundDb } from '../../modules/mailbox/openers.js';
+import { inboundDbPath } from '../../mailbox/sqlite/paths.js';
 import type { Session } from '../../types.js';
 import { resolveSlackSafetyMessagingGroupId } from './task-slack-subject.js';
 
@@ -44,12 +46,15 @@ function makeSession(id: string, threadId: string | null, mgId: string | null = 
 
 /** Insert a task row the way the scheduler does — destination on the row itself. */
 function addTaskRow(sessionId: string, channelType: string, platformId: string, seq = 2): void {
-  withInboundDb(GROUP, sessionId, (db) => {
+  const db = openInboundDb(inboundDbPath(GROUP, sessionId));
+  try {
     db.prepare(
       `INSERT INTO messages_in (id, seq, timestamp, status, tries, kind, channel_type, platform_id, content)
        VALUES (?, ?, ?, 'pending', 0, 'task', ?, ?, ?)`,
     ).run(`task-${seq}`, seq, NOW, channelType, platformId, JSON.stringify({ prompt: 'x' }));
-  });
+  } finally {
+    db.close();
+  }
 }
 
 beforeEach(() => {
