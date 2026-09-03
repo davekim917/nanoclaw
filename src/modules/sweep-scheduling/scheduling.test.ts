@@ -211,7 +211,8 @@ vi.mock('../orchestrator-dispatch/db/tasks.js', async (importOriginal) => {
 
 import { CLOSE_CONFIRM_WINDOW_MS } from '../../dashboard/thread-close.js';
 import { closeDb, createAgentGroup, getDb, initTestDb, runMigrations } from '../../db/index.js';
-import { ensureSchema, openInboundDb } from '../../db/session-db.js';
+import { openInboundDb } from '../mailbox/openers.js';
+import { ensureSchema } from '../mailbox/schema.js';
 import { SWEEP_DUTY_INVENTORY, _listSweepRegistrationsForTesting } from '../../host-sweep.js';
 import { composeNanoclawSession } from '../mailbox/index.js';
 import { insertTaskRow } from '../scheduling/db.js';
@@ -235,8 +236,9 @@ function freshInbound(): Database.Database {
   fs.mkdirSync(dir, { recursive: true });
   const dbPath = path.join(dir, 'inbound.db');
   ensureSchema(dbPath, 'inbound');
-  openInbound = openInboundDb(dbPath);
-  return openInbound;
+  const db = openInboundDb(dbPath);
+  openInbound = db;
+  return db;
 }
 
 /**

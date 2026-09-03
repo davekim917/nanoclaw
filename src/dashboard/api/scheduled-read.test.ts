@@ -14,7 +14,8 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import Database from 'better-sqlite3';
 
 import { initTestDb, closeDb, getDb } from '../../db/connection.js';
-import { ensureSchema, openInboundDb } from '../../db/session-db.js';
+import { openInboundDb } from '../../modules/mailbox/openers.js';
+import { ensureSchema } from '../../modules/mailbox/schema.js';
 import { migration043 } from '../../db/migrations/043-scheduled-audit.js';
 import { invalidateScheduledCache, encodeKey, writeAudit } from './scheduled-shared.js';
 import { _resetAssemblyInFlightForTesting } from './scheduled-assembly.js';
@@ -761,5 +762,72 @@ describe('scheduledSearchHandler', () => {
     expect(Object.keys(JSON.parse(raw))).toEqual(['keys']);
     expect(raw).not.toContain('aardvark');
     expect(raw).not.toContain('rm -rf');
+  });
+});
+
+// ── Mailbox seam (PR 6): reads never provision, unreadable never silently
+// becomes healthy-and-empty ────────────────────────────────────────────────────
+describe('mailbox seam', () => {
+  it('dashboard reads skip an unreadable session and never provision one', async () => {
+    addGroup('ag-1', 'G1');
+    addGroup('ag-2', 'G2');
+    addGroup('ag-3', 'G3');
+    addGroup('ag-4', 'G4');
+    addMg('mg-1', 'discord', 'd:1', 'chan-1');
+    // 1. readable
+    addSession('s-ok', 'ag-1', 'mg-1');
+    insertRow(seedSession('ag-1', 's-ok').inbound, { id: 'r-ok', series_id: 'ser-ok' });
+    // 2. no mailbox on disk at all — the central row exists, the directory does not
+    addSession('s-gone', 'ag-2', 'mg-1');
+    const goneDir = path.join(TEST_DIR, 'v2-sessions', 'ag-2', 's-gone');
+    // 3. present but corrupt — SQLite cannot open it
+    addSession('s-corrupt', 'ag-3', 'mg-1');
+    const corruptDir = path.join(TEST_DIR, 'v2-sessions', 'ag-3', 's-corrupt');
+    fs.mkdirSync(corruptDir, { recursive: true });
+    const corruptPath = path.join(corruptDir, 'inbound.db');
+    const corruptBytes = Buffer.from('this is not a sqlite database, not even close\n');
+    fs.writeFileSync(corruptPath, corruptBytes);
+
+    // 4. readable rows, but the session DIRECTORY is not writable. A read-only
+    //    open answers it; anything that opens read-write or plants a marker
+    //    (i.e. the write path's `session()`) fails on EACCES and would report
+    //    this live session as unreadable. This is what makes the case above a
+    //    real assertion rather than a restatement of today's code.
+    addSession('s-ro', 'ag-4', 'mg-1');
+    insertRow(seedSession('ag-4', 's-ro').inbound, { id: 'r-ro', series_id: 'ser-ro' });
+    const readOnlyDir = path.join(TEST_DIR, 'v2-sessions', 'ag-4', 's-ro');
+    fs.chmodSync(readOnlyDir, 0o555);
+
+    addUser('owner');
+    grant('owner', 'owner', null);
+
+    let body: Record<string, unknown>;
+    try {
+      const res = (await scheduledListHandler(listReq(), {}, ctxFor('owner', OWNER_SCOPES)))!;
+      body = await readJson(res);
+    } finally {
+      // Restore before afterEach's recursive rm, which cannot unlink out of a
+      // non-writable directory.
+      fs.chmodSync(readOnlyDir, 0o755);
+    }
+    const rows = body.rows as Array<{ key: string }>;
+    const counts = body.counts as Record<string, number>;
+
+    // Both readable sessions contribute rows; the non-writable one included.
+    expect(rows.map((r) => r.key).sort()).toEqual(
+      [encodeKey('ag-1', 's-ok', 'ser-ok'), encodeKey('ag-4', 's-ro', 'ser-ro')].sort(),
+    );
+    // The corrupt one is counted, never silently reported as having nothing.
+    expect(counts.unreadable).toBe(1);
+
+    // A read never provisions: the absent session's directory (and inbound.db)
+    // must still not exist after a full fleet assembly.
+    expect(fs.existsSync(goneDir)).toBe(false);
+    expect(fs.existsSync(path.join(goneDir, 'inbound.db'))).toBe(false);
+
+    // A read never runs DDL: the corrupt file is byte-for-byte untouched, and
+    // no journal/WAL sidecar was left beside it.
+    expect(fs.readFileSync(corruptPath)).toEqual(corruptBytes);
+    expect(fs.readdirSync(corruptDir).sort()).toEqual(['inbound.db']);
   });
 });

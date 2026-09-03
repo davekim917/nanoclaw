@@ -12,14 +12,16 @@
  *
  * See docs/specs/scheduled-tasks-board/design.md §3a, §4.1, §4.2, §4.4, §4.5.
  */
-import fs from 'fs';
-import path from 'path';
-
-import Database from 'better-sqlite3';
-
 import { DATA_DIR } from '../../config.js';
 import { getDb } from '../../db/connection.js';
 import { log } from '../../log.js';
+import {
+  readSessionInbound,
+  readSessionOutbound,
+  type ScheduledTaskRow,
+  type SessionReadLocation,
+  type TaskFireRow,
+} from '../../modules/mailbox/index.js';
 import type { AuthHandler, AuthedRequestContext } from '../router.js';
 import {
   assembleSnapshot,
@@ -251,24 +253,10 @@ export const scheduledSearchHandler: AuthHandler = async (req, _params, ctx) => 
 
 // ── B4: detail handler ───────────────────────────────────────────────────────────
 
-interface DetailLiveRow {
-  id: string;
-  series_id: string | null;
-  recurrence: string | null;
-  process_after: string | null;
-  status: string;
-  content: string;
-  platform_id: string | null;
-  channel_type: string | null;
-  thread_id: string | null;
-}
-
-interface HistoryRow {
-  id: string;
-  status: string;
-  process_after: string | null;
-  timestamp: string;
-}
+// The detail bodies and the fire history are read through the mailbox
+// module's named ops, so their row shapes are the module's.
+type DetailLiveRow = ScheduledTaskRow;
+type HistoryRow = TaskFireRow;
 
 function parseUtcMs(s: string | null): number | null {
   if (!s) return null;
@@ -310,42 +298,17 @@ function outcomeFor(row: HistoryRow, replyTs: string | undefined, cancelTsMs: nu
   return 'completed (no chat output)';
 }
 
-function readHistory(
-  inboundPath: string,
-  outboundPath: string,
-  seriesId: string,
-  cancelTsMs: number | null,
-): FireOutcome[] {
-  let inDb: Database.Database | null = null;
-  let outDb: Database.Database | null = null;
-  try {
-    inDb = new Database(inboundPath, { readonly: true });
-    inDb.pragma('busy_timeout = 1000');
-    const rows = inDb
-      .prepare(
-        `SELECT id, status, process_after, timestamp
-           FROM messages_in
-          WHERE series_id = ? AND kind = 'task'
-            AND status IN ('completed', 'failed', 'expired', 'cancelled')
-          ORDER BY seq DESC LIMIT 5`,
-      )
-      .all(seriesId) as HistoryRow[];
+const HISTORY_TAIL = 5;
 
-    const replies = new Map<string, string>();
-    if (fs.existsSync(outboundPath)) {
-      try {
-        outDb = new Database(outboundPath, { readonly: true });
-        outDb.pragma('busy_timeout = 1000');
-        for (const r of outDb
-          .prepare(
-            'SELECT in_reply_to, MAX(timestamp) AS ts FROM messages_out WHERE in_reply_to IS NOT NULL GROUP BY in_reply_to',
-          )
-          .all() as Array<{ in_reply_to: string; ts: string }>) {
-          replies.set(r.in_reply_to, r.ts);
-        }
-      } catch {
-        /* outbound unreadable — replies stay empty (→ no-chat-output labels) */
-      }
+function readHistory(location: SessionReadLocation, seriesId: string, cancelTsMs: number | null): FireOutcome[] {
+  try {
+    const rows = readSessionInbound(location, (mailbox) => mailbox.listRecentTaskFires(seriesId, HISTORY_TAIL)) ?? [];
+
+    let replies = new Map<string, string>();
+    try {
+      replies = readSessionOutbound(location, (mailbox) => mailbox.latestReplyTimestampByTrigger()) ?? replies;
+    } catch {
+      /* outbound unreadable — replies stay empty (→ no-chat-output labels) */
     }
 
     return rows.map((r) => ({
@@ -359,9 +322,6 @@ function readHistory(
       err: err instanceof Error ? err.message : String(err),
     });
     return [];
-  } finally {
-    inDb?.close();
-    outDb?.close();
   }
 }
 
@@ -403,28 +363,17 @@ function cancelAuditTsMs(seriesId: string): number | null {
  * no live row exists (the series ended/moved since the list — the handler maps
  * that to 404 / stale).
  */
-function readLiveRow(inboundPath: string, seriesId: string): DetailLiveRow | null {
-  if (!fs.existsSync(inboundPath)) return null;
-  let db: Database.Database | null = null;
+function readLiveRow(location: SessionReadLocation, seriesId: string): DetailLiveRow | null {
   try {
-    db = new Database(inboundPath, { readonly: true });
-    db.pragma('busy_timeout = 1000');
-    const cols = `id, series_id, recurrence, process_after, status, content, platform_id, channel_type, thread_id`;
-    // Prefer the latest LIVE (pending|paused) row — that carries the current
-    // prompt/script/schedule. Fall back to the latest row of any status so an
-    // ended series still renders its bodies (detail is read-only).
-    const liveRow = db
-      .prepare(
-        `SELECT ${cols} FROM messages_in
-          WHERE series_id = ? AND kind = 'task' AND status IN ('pending', 'paused')
-          ORDER BY seq DESC LIMIT 1`,
-      )
-      .get(seriesId) as DetailLiveRow | undefined;
-    if (liveRow) return liveRow;
+    // Prefer the latest LIVE (pending|paused) task row — that carries the
+    // current prompt/script/schedule. Fall back to the latest row of any
+    // status so an ended series still renders its bodies (detail is
+    // read-only, and so is the seam it reads through).
     return (
-      (db
-        .prepare(`SELECT ${cols} FROM messages_in WHERE series_id = ? AND kind = 'task' ORDER BY seq DESC LIMIT 1`)
-        .get(seriesId) as DetailLiveRow | undefined) ?? null
+      readSessionInbound(
+        location,
+        (mailbox) => mailbox.getLiveTaskRow(seriesId) ?? mailbox.getLatestTaskRow(seriesId),
+      ) ?? null
     );
   } catch (err) {
     log.warn('scheduled-detail: live row read failed', {
@@ -432,8 +381,6 @@ function readLiveRow(inboundPath: string, seriesId: string): DetailLiveRow | nul
       err: err instanceof Error ? err.message : String(err),
     });
     return null;
-  } finally {
-    db?.close();
   }
 }
 
@@ -454,17 +401,24 @@ export const scheduledDetailHandler: AuthHandler = async (_req, params, ctx) => 
     return json({ error: 'not_found' }, 404);
   }
 
-  // M4: containment-checked open. A null path (containment violation — decodeKey
-  // already rejects traversal segments, this is defense in depth) → 404
-  // disclose-as-not-found, never an open outside data/v2-sessions.
-  const inboundPath = sessionInboundPathFor(dataDir, decoded.agentGroupId, decoded.sessionId);
-  if (!inboundPath) return json({ error: 'not_found' }, 404);
-  const outboundPath = path.join(path.dirname(inboundPath), 'outbound.db');
+  // M4: containment-checked locator. The mailbox module's read path applies
+  // the same canonicalize-and-contain check on the way in — a locator that
+  // resolves outside data/v2-sessions reads as "no mailbox" — so the null
+  // here is the disclose-as-not-found 404 the handler has always returned,
+  // kept as the caller-visible half of that guard.
+  if (!sessionInboundPathFor(dataDir, decoded.agentGroupId, decoded.sessionId)) {
+    return json({ error: 'not_found' }, 404);
+  }
+  const location: SessionReadLocation = {
+    dataDir,
+    agentGroupId: decoded.agentGroupId,
+    sessionId: decoded.sessionId,
+  };
 
   // Read the series' live/latest row for the full prompt + script bodies (the
   // snapshot carries neither). null → the series ended/moved since the list →
   // 404 (detail is read-only; a stale key just doesn't resolve).
-  const live = readLiveRow(inboundPath, decoded.seriesId);
+  const live = readLiveRow(location, decoded.seriesId);
   if (!live) return json({ error: 'not_found' }, 404);
 
   // The `row` MUST be a complete ScheduledRow — the drawer reads
@@ -486,7 +440,7 @@ export const scheduledDetailHandler: AuthHandler = async (_req, params, ctx) => 
   const script = typeof parsed.script === 'string' ? (parsed.script as string) : null;
 
   const cancelTsMs = cancelAuditTsMs(decoded.seriesId);
-  const history = readHistory(inboundPath, outboundPath, decoded.seriesId, cancelTsMs);
+  const history = readHistory(location, decoded.seriesId, cancelTsMs);
 
   const body: Record<string, unknown> = { row, prompt, script, history };
 

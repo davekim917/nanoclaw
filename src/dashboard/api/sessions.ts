@@ -50,12 +50,10 @@
  * expensive, and the check is purely a stale-false-positive guard.
  */
 import fs from 'fs';
-import path from 'path';
-
-import Database from 'better-sqlite3';
 
 import { DATA_DIR } from '../../config.js';
 import { getDb } from '../../db/connection.js';
+import { readSessionInbound, readSessionOutbound, type MessageTailRow } from '../../modules/mailbox/index.js';
 import { heartbeatPath } from '../../session-manager.js';
 import { log } from '../../log.js';
 import type { AuthHandler } from '../router.js';
@@ -123,30 +121,16 @@ export function deriveContainerStatus(agentGroupId: string, sessionId: string): 
  * recoverable by the next refresh once the file lands.
  */
 function hasPendingRecurrence(agentGroupId: string, sessionId: string, dataDir: string): boolean {
-  const inboundPath = path.join(dataDir, 'v2-sessions', agentGroupId, sessionId, 'inbound.db');
-  if (!fs.existsSync(inboundPath)) return false;
-  let db: Database.Database | null = null;
   try {
-    db = new Database(inboundPath, { readonly: true });
-    db.pragma('busy_timeout = 1000');
-    const row = db
-      .prepare(
-        `SELECT 1 AS ok
-           FROM messages_in
-          WHERE status IN ('pending', 'paused')
-            AND recurrence IS NOT NULL
-          LIMIT 1`,
-      )
-      .get() as { ok: number } | undefined;
-    return !!row;
+    return (
+      readSessionInbound({ agentGroupId, sessionId, dataDir }, (mailbox) => mailbox.hasPendingRecurrence()) ?? false
+    );
   } catch (err) {
     log.warn('hasPendingRecurrence: probe failed', {
       sessionId,
       err: err instanceof Error ? err.message : String(err),
     });
     return false;
-  } finally {
-    db?.close();
   }
 }
 
@@ -458,59 +442,50 @@ export function resolveTranscriptAuthor(content: unknown): TranscriptAuthor | nu
  */
 export function readSessionTranscript(agentGroupId: string, sessionId: string): SessionTranscriptEntry[] {
   const out: SessionTranscriptEntry[] = [];
+  const location = { agentGroupId, sessionId };
 
   function readSide(side: 'in' | 'out'): void {
-    const file = side === 'in' ? 'inbound.db' : 'outbound.db';
-    const table = side === 'in' ? 'messages_in' : 'messages_out';
-    const p = path.join(DATA_DIR, 'v2-sessions', agentGroupId, sessionId, file);
-    if (!fs.existsSync(p)) return;
-    let db: Database.Database | null = null;
+    let rows: MessageTailRow[] | undefined;
     try {
-      db = new Database(p, { readonly: true });
-      db.pragma('busy_timeout = 1000');
-      const rows = db
-        .prepare(
-          `SELECT seq, kind, timestamp, content
-             FROM ${table}
-            WHERE content IS NOT NULL AND content <> ''
-            ORDER BY seq DESC
-            LIMIT ?`,
-        )
-        .all(TRANSCRIPT_TAIL) as Array<{ seq: number; kind: string; timestamp: string; content: string }>;
-      for (const r of rows) {
-        let text: string;
-        // `parsed` is hoisted out of the try so the author can be read from the
-        // SAME parse the text came from. A blob that will not parse leaves it
-        // `undefined`, `resolveTranscriptAuthor` returns null for that, and the
-        // row still renders its raw text — the reader's best-effort contract.
-        let parsed: unknown;
-        try {
-          parsed = JSON.parse(r.content);
-          const p = parsed as { text?: unknown; prompt?: unknown; question?: unknown };
-          text = String(p.text ?? p.prompt ?? p.question ?? r.content).trim();
-        } catch {
-          text = r.content;
-        }
-        out.push({
-          direction: side,
-          kind: r.kind,
-          seq: r.seq,
-          timestamp: r.timestamp,
-          text,
-          // Outbound is the agent, and its identity already rides on
-          // `agent_name`; only the inbound side is resolved, so the outbound
-          // shape is provably untouched by this field.
-          author: side === 'in' ? resolveTranscriptAuthor(parsed) : null,
-        });
-      }
+      rows =
+        side === 'in'
+          ? readSessionInbound(location, (mailbox) => mailbox.listInboundTail(TRANSCRIPT_TAIL))
+          : readSessionOutbound(location, (mailbox) => mailbox.listOutboundTail(TRANSCRIPT_TAIL));
     } catch (err) {
       log.warn('sessionsDetailHandler: transcript read failed', {
         side,
         sessionId,
         err: err instanceof Error ? err.message : String(err),
       });
-    } finally {
-      db?.close();
+      return;
+    }
+    // `undefined` is "no mailbox" — the page renders its meta header either way.
+    if (!rows) return;
+    for (const r of rows) {
+      let text: string;
+      // `parsed` is hoisted out of the try so the author can be read from the
+      // SAME parse the text came from. A blob that will not parse leaves it
+      // `undefined`, `resolveTranscriptAuthor` returns null for that, and the
+      // row still renders its raw text — the reader's best-effort contract.
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(r.content);
+        const p = parsed as { text?: unknown; prompt?: unknown; question?: unknown };
+        text = String(p.text ?? p.prompt ?? p.question ?? r.content).trim();
+      } catch {
+        text = r.content;
+      }
+      out.push({
+        direction: side,
+        kind: r.kind,
+        seq: r.seq,
+        timestamp: r.timestamp,
+        text,
+        // Outbound is the agent, and its identity already rides on
+        // `agent_name`; only the inbound side is resolved, so the outbound
+        // shape is provably untouched by this field.
+        author: side === 'in' ? resolveTranscriptAuthor(parsed) : null,
+      });
     }
   }
 

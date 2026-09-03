@@ -23,7 +23,8 @@ vi.mock('../../config.js', async (importOriginal) => ({
 const TEST_DIR = '/tmp/nanoclaw-workgroups-api-test';
 
 import { initTestDb, closeDb, getDb } from '../../db/connection.js';
-import { ensureSchema, openInboundDb } from '../../db/session-db.js';
+import { openInboundDb } from '../../modules/mailbox/openers.js';
+import { ensureSchema } from '../../modules/mailbox/schema.js';
 import { invalidateScheduledCache } from './scheduled-shared.js';
 import { _resetAssemblyInFlightForTesting } from './scheduled-assembly.js';
 import {

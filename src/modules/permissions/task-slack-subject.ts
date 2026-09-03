@@ -1,7 +1,7 @@
 import { TASKS_SYSTEM_THREAD_ID } from '../../db/sessions.js';
 import { getMessagingGroupByPlatform } from '../../db/messaging-groups.js';
 import { log } from '../../log.js';
-import { withInboundDb } from '../../session-manager.js';
+import { readSessionInbound } from '../mailbox/index.js';
 import type { Session } from '../../types.js';
 
 /**
@@ -45,15 +45,12 @@ export function resolveSlackSafetyMessagingGroupId(session: Session): string | n
   if (!session.thread_id?.startsWith(`${TASKS_SYSTEM_THREAD_ID}:`)) return null;
 
   try {
-    const row = withInboundDb(session.agent_group_id, session.id, (db) =>
-      db
-        .prepare(
-          `SELECT channel_type, platform_id FROM messages_in
-            WHERE kind = 'task' AND platform_id IS NOT NULL AND platform_id <> ''
-         ORDER BY rowid DESC LIMIT 1`,
-        )
-        .get(),
-    ) as { channel_type: string | null; platform_id: string } | undefined;
+    // Read-only seam: the spawn gate must never provision or migrate the
+    // session it is judging (invariant I-4). `undefined` is "no mailbox",
+    // which falls through to the same fail-closed null as "no route".
+    const row = readSessionInbound({ agentGroupId: session.agent_group_id, sessionId: session.id }, (mailbox) =>
+      mailbox.getLatestTaskDeliveryRoute(),
+    );
 
     if (!row?.channel_type) return null;
     return getMessagingGroupByPlatform(row.channel_type, row.platform_id)?.id ?? null;

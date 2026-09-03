@@ -25,15 +25,11 @@
  * hasn't changed — and a refresh that reshuffles a card's label on every
  * inbox refresh would be more distracting than useful.
  */
-import path from 'path';
-import fs from 'fs';
-
-import Database from 'better-sqlite3';
 import { EnvHttpProxyAgent, fetch as undiciFetch, type Dispatcher } from 'undici';
 
-import { DATA_DIR } from '../config.js';
 import { getDb } from '../db/connection.js';
 import { log } from '../log.js';
+import { readSessionInbound, readSessionOutbound, type MessageTailRow } from '../modules/mailbox/index.js';
 import {
   anthropicCredentialHttpError,
   callWithCredentialRotation,
@@ -378,68 +374,40 @@ interface SliceResult {
  * so the rest of the sweep's session list can still be processed.
  */
 function readSessionSlice(agentGroupId: string, sessionId: string): SliceResult {
-  const inboundPath = path.join(DATA_DIR, 'v2-sessions', agentGroupId, sessionId, 'inbound.db');
-  const outboundPath = path.join(DATA_DIR, 'v2-sessions', agentGroupId, sessionId, 'outbound.db');
+  const location = { agentGroupId, sessionId };
 
-  let inboundLines: Array<{ seq: number; content: string; kind: string }> = [];
-  let outboundLines: Array<{ seq: number; content: string; kind: string }> = [];
+  let inboundLines: MessageTailRow[] = [];
+  let outboundLines: MessageTailRow[] = [];
   let neverWoken = false;
 
-  if (fs.existsSync(inboundPath)) {
-    let db: Database.Database | null = null;
-    try {
-      db = new Database(inboundPath, { readonly: true });
-      db.pragma('busy_timeout = 1000');
-      inboundLines = db
-        .prepare(
-          `SELECT seq, content, kind FROM messages_in
-            WHERE content IS NOT NULL AND content <> ''
-            ORDER BY seq DESC
-            LIMIT ?`,
-        )
-        .all(MAX_MESSAGES_PER_SLICE) as typeof inboundLines;
-      // `trigger` was added after the initial schema (LEGACY-COMPAT in
-      // db/session-db.ts backfills existing rows to 1). A missing column on
-      // an old/test DB is caught separately so it fails closed to "has
-      // woken" — never suppresses a real title, and never triggers the
-      // "read failed" warning below for what is otherwise a clean read.
+  try {
+    readSessionInbound(location, (mailbox) => {
+      inboundLines = mailbox.listInboundTail(MAX_MESSAGES_PER_SLICE);
+      // `trigger` was added after the initial schema (the module's inbound
+      // migration backfills existing rows to 1). A missing column on an
+      // old/test DB is caught separately so it fails closed to "has woken" —
+      // never suppresses a real title, and never triggers the "read failed"
+      // warning below for what is otherwise a clean read.
       try {
-        const woke = db.prepare(`SELECT 1 FROM messages_in WHERE trigger = 1 LIMIT 1`).get();
-        neverWoken = woke === undefined;
+        neverWoken = !mailbox.hasTriggeredInboundRow();
       } catch {
         neverWoken = false;
       }
-    } catch (err) {
-      log.warn('session-title: inbound.db read failed', {
-        sessionId,
-        err: err instanceof Error ? err.message : String(err),
-      });
-    } finally {
-      db?.close();
-    }
+    });
+  } catch (err) {
+    log.warn('session-title: inbound.db read failed', {
+      sessionId,
+      err: err instanceof Error ? err.message : String(err),
+    });
   }
 
-  if (fs.existsSync(outboundPath)) {
-    let db: Database.Database | null = null;
-    try {
-      db = new Database(outboundPath, { readonly: true });
-      db.pragma('busy_timeout = 1000');
-      outboundLines = db
-        .prepare(
-          `SELECT seq, content, kind FROM messages_out
-            WHERE content IS NOT NULL AND content <> ''
-            ORDER BY seq DESC
-            LIMIT ?`,
-        )
-        .all(MAX_MESSAGES_PER_SLICE) as typeof outboundLines;
-    } catch (err) {
-      log.warn('session-title: outbound.db read failed', {
-        sessionId,
-        err: err instanceof Error ? err.message : String(err),
-      });
-    } finally {
-      db?.close();
-    }
+  try {
+    outboundLines = readSessionOutbound(location, (mailbox) => mailbox.listOutboundTail(MAX_MESSAGES_PER_SLICE)) ?? [];
+  } catch (err) {
+    log.warn('session-title: outbound.db read failed', {
+      sessionId,
+      err: err instanceof Error ? err.message : String(err),
+    });
   }
 
   // Merge by seq ascending and trim to a window.

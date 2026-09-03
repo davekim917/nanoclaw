@@ -168,7 +168,6 @@ vi.mock('./session-manager.js', async (importOriginal) => {
     ...real,
     admitDueTaskContexts: (...args: unknown[]) => mockAdmitDueTaskContexts(...args),
     writeSessionMessage: (...args: unknown[]) => mockWriteSessionMessage(...args),
-    outboundDbPath: real.outboundDbPath,
   };
 });
 
@@ -2493,8 +2492,8 @@ describe('recoverMoveIntents (D3) + pruneAuditBodies (D4)', () => {
   let recoverMoveIntents: typeof import('./host-sweep.js').recoverMoveIntents;
   let pruneAuditBodies: typeof import('./host-sweep.js').pruneAuditBodies;
   let migration043: typeof import('./db/migrations/043-scheduled-audit.js').migration043;
-  let ensureSchema: typeof import('./db/session-db.js').ensureSchema;
-  let openInboundDb: typeof import('./db/session-db.js').openInboundDb;
+  let ensureSchema: typeof import('./modules/mailbox/schema.js').ensureSchema;
+  let openInboundDb: typeof import('./modules/mailbox/openers.js').openInboundDb;
 
   // Unique per-file temp root (mkdtempSync) so parallel vitest workers never
   // share a fixed path and clobber each other's rmSync.
@@ -2502,14 +2501,24 @@ describe('recoverMoveIntents (D3) + pruneAuditBodies (D4)', () => {
   const NOW = Date.parse('2026-06-13T12:00:00Z');
   const SWEEP_MS = 60_000;
 
+  // The restore now runs through the mailbox seam, which resolves a session
+  // path from DATA_DIR — so the root these helpers are handed as `dataDir` and
+  // the root the seam reads have to be the same one. Swapped for this block
+  // only, and put back after, so the file's other suites keep their own root.
+  let savedDataDir: string;
+
   beforeEach(async () => {
     ({ recoverMoveIntents, pruneAuditBodies } = await import('./host-sweep.js'));
     ({ migration043 } = await import('./db/migrations/043-scheduled-audit.js'));
-    ({ ensureSchema, openInboundDb } = await import('./db/session-db.js'));
+    ({ ensureSchema } = await import('./modules/mailbox/schema.js'));
+    ({ openInboundDb } = await import('./modules/mailbox/openers.js'));
+    savedDataDir = testDataDir.dir;
+    testDataDir.dir = DIR;
     if (fs.existsSync(DIR)) fs.rmSync(DIR, { recursive: true });
     fs.mkdirSync(DIR, { recursive: true });
   });
   afterEach(() => {
+    testDataDir.dir = savedDataDir;
     if (fs.existsSync(DIR)) fs.rmSync(DIR, { recursive: true });
   });
 
@@ -2593,13 +2602,13 @@ describe('recoverMoveIntents (D3) + pruneAuditBodies (D4)', () => {
     );
   }
 
-  it('test_recover_stamps_when_live_row_exists', () => {
+  it('test_recover_stamps_when_live_row_exists', async () => {
     const db = centralDb();
     const inbound = seedInbound('src-ag', 'src-sess');
     insertLive(inbound, 'ser-1'); // a live row exists for the series
     writeIntent(db, { seriesId: 'ser-1', ag: 'src-ag', sess: 'src-sess', tsMs: NOW - 2 * SWEEP_MS });
 
-    recoverMoveIntents(db, { dataDir: DIR, nowMs: NOW });
+    await recoverMoveIntents(db, { dataDir: DIR, nowMs: NOW });
 
     const row = db
       .prepare("SELECT detail_json, resolved_at FROM scheduled_audit WHERE correlation_id = 'corr-ser-1'")
@@ -2614,12 +2623,12 @@ describe('recoverMoveIntents (D3) + pruneAuditBodies (D4)', () => {
     db.close();
   });
 
-  it('test_recover_restores_when_zero_live_rows', () => {
+  it('test_recover_restores_when_zero_live_rows', async () => {
     const db = centralDb();
     const inbound = seedInbound('src-ag', 'src-sess'); // empty — simulates crash post-cancel
     writeIntent(db, { seriesId: 'ser-2', ag: 'src-ag', sess: 'src-sess', tsMs: NOW - 2 * SWEEP_MS });
 
-    recoverMoveIntents(db, { dataDir: DIR, nowMs: NOW });
+    await recoverMoveIntents(db, { dataDir: DIR, nowMs: NOW });
 
     // restoreTaskRow inserted a live row from the snapshot.
     const live = openInboundDb(inbound)
@@ -2637,13 +2646,13 @@ describe('recoverMoveIntents (D3) + pruneAuditBodies (D4)', () => {
     db.close();
   });
 
-  it('test_recover_idempotent_no_double_restore', () => {
+  it('test_recover_idempotent_no_double_restore', async () => {
     const db = centralDb();
     const inbound = seedInbound('src-ag', 'src-sess');
     writeIntent(db, { seriesId: 'ser-3', ag: 'src-ag', sess: 'src-sess', tsMs: NOW - 2 * SWEEP_MS });
 
-    recoverMoveIntents(db, { dataDir: DIR, nowMs: NOW }); // first pass restores
-    recoverMoveIntents(db, { dataDir: DIR, nowMs: NOW }); // second pass must be a no-op
+    await recoverMoveIntents(db, { dataDir: DIR, nowMs: NOW }); // first pass restores
+    await recoverMoveIntents(db, { dataDir: DIR, nowMs: NOW }); // second pass must be a no-op
 
     const live = openInboundDb(inbound)
       .prepare("SELECT COUNT(*) AS c FROM messages_in WHERE series_id='ser-3' AND status IN ('pending','paused')")
@@ -2652,12 +2661,12 @@ describe('recoverMoveIntents (D3) + pruneAuditBodies (D4)', () => {
     db.close();
   });
 
-  it('does not recover an intent younger than one sweep interval', () => {
+  it('does not recover an intent younger than one sweep interval', async () => {
     const db = centralDb();
     seedInbound('src-ag', 'src-sess');
     writeIntent(db, { seriesId: 'ser-4', ag: 'src-ag', sess: 'src-sess', tsMs: NOW - 5_000 }); // 5s old
 
-    recoverMoveIntents(db, { dataDir: DIR, nowMs: NOW });
+    await recoverMoveIntents(db, { dataDir: DIR, nowMs: NOW });
 
     const row = db.prepare("SELECT resolved_at FROM scheduled_audit WHERE correlation_id = 'corr-ser-4'").get() as {
       resolved_at: string | null;
@@ -2668,7 +2677,7 @@ describe('recoverMoveIntents (D3) + pruneAuditBodies (D4)', () => {
 
   // ── M1: scoped {source,target} count — an UNRELATED group's same series_id ─────
   // must NOT cause a false resolve. The crashed source still gets restored.
-  it('test_recover_scoped_count_ignores_unrelated_group', () => {
+  it('test_recover_scoped_count_ignores_unrelated_group', async () => {
     const db = centralDb();
     // Source session is EMPTY (crashed post-cancel, before the target insert).
     const srcInbound = seedInbound('src-ag', 'src-sess');
@@ -2689,7 +2698,7 @@ describe('recoverMoveIntents (D3) + pruneAuditBodies (D4)', () => {
       targetMessagingGroupId: 'tgt-mg',
     });
 
-    recoverMoveIntents(db, { dataDir: DIR, nowMs: NOW });
+    await recoverMoveIntents(db, { dataDir: DIR, nowMs: NOW });
 
     // The scoped {source,target} count is 0 → the crashed source IS restored,
     // the unrelated group's row is ignored.
@@ -2704,7 +2713,7 @@ describe('recoverMoveIntents (D3) + pruneAuditBodies (D4)', () => {
     db.close();
   });
 
-  it('test_recover_scoped_count_stamps_when_target_has_live_row', () => {
+  it('test_recover_scoped_count_stamps_when_target_has_live_row', async () => {
     // The move SUCCEEDED (target has the live row) but the intent was never
     // stamped (crash after insert). Scoped count sees the target row → stamp, do
     // NOT restore the source (would double the live rows).
@@ -2723,7 +2732,7 @@ describe('recoverMoveIntents (D3) + pruneAuditBodies (D4)', () => {
       targetMessagingGroupId: 'tgt-mg',
     });
 
-    recoverMoveIntents(db, { dataDir: DIR, nowMs: NOW });
+    await recoverMoveIntents(db, { dataDir: DIR, nowMs: NOW });
 
     // Source NOT restored (the target's live row is the one live row).
     const srcCount = openInboundDb(srcInbound)
@@ -2738,7 +2747,7 @@ describe('recoverMoveIntents (D3) + pruneAuditBodies (D4)', () => {
   });
 
   // ── ADV-S2: a dangling unrecoverable intent must resolve (no permanent zombie) ─
-  it('test_recover_no_snapshot_resolves_intent', () => {
+  it('test_recover_no_snapshot_resolves_intent', async () => {
     const db = centralDb();
     seedInbound('src-ag', 'src-sess');
     // Intent with NO snapshot body (purged-but-still-unresolved) → unrecoverable,
@@ -2751,7 +2760,7 @@ describe('recoverMoveIntents (D3) + pruneAuditBodies (D4)', () => {
       noSnapshot: true,
     });
 
-    recoverMoveIntents(db, { dataDir: DIR, nowMs: NOW });
+    await recoverMoveIntents(db, { dataDir: DIR, nowMs: NOW });
 
     const row = db
       .prepare("SELECT resolved_at FROM scheduled_audit WHERE correlation_id = 'corr-ser-nosnap'")
@@ -2760,7 +2769,7 @@ describe('recoverMoveIntents (D3) + pruneAuditBodies (D4)', () => {
     db.close();
   });
 
-  it('test_recover_source_dir_missing_resolves_intent', () => {
+  it('test_recover_source_dir_missing_resolves_intent', async () => {
     const db = centralDb();
     // No source inbound.db on disk at all → cannot restore, but must resolve so
     // it does not surface as an unclearable stalled repair row forever.
@@ -2771,7 +2780,7 @@ describe('recoverMoveIntents (D3) + pruneAuditBodies (D4)', () => {
       tsMs: NOW - 2 * SWEEP_MS,
     });
 
-    recoverMoveIntents(db, { dataDir: DIR, nowMs: NOW });
+    await recoverMoveIntents(db, { dataDir: DIR, nowMs: NOW });
 
     const row = db.prepare("SELECT resolved_at FROM scheduled_audit WHERE correlation_id = 'corr-ser-nodir'").get() as {
       resolved_at: string | null;

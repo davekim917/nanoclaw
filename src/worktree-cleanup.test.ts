@@ -29,25 +29,31 @@ vi.mock('./container-runner.js', () => ({
 vi.mock('./db/connection.js', () => ({
   getDb: () => ({ prepare: () => ({ all: () => state.rows }) }),
 }));
-// The GC's reclaim gate reads outbound state through the mailbox module's own
-// open funnel (it is synchronous; the seam's session() is not), so the funnel
-// and the module ops are what this suite substitutes.
-vi.mock('./modules/mailbox/openers.js', () => ({
-  openOutboundDb: (dbPath: string) => {
-    const sessionId = String(dbPath).split('/').at(-2)!;
-    if (state.unreadable.has(sessionId)) throw new Error('persisted state unavailable');
-    return { sessionId, close: () => undefined };
-  },
-}));
-vi.mock('./modules/mailbox/ops/sweep.js', () => ({
-  getProcessingClaims: (db: { sessionId: string }) => (state.processing.has(db.sessionId) ? [{}] : []),
-  getContainerState: (db: { sessionId: string }) => ({
-    current_tool: state.tools.has(db.sessionId) ? 'git' : null,
-  }),
-}));
-vi.mock('./modules/mailbox/ops/continuation.js', () => ({
-  hasWorkContinuationRow: (db: { sessionId: string }) => state.continuations.has(db.sessionId),
-}));
+// The GC's reclaim gate reads outbound state through the mailbox module's
+// read-only session (it is synchronous; the seam's session() is not), so that
+// is the one seam this suite substitutes. Throwing stands for
+// present-but-unreadable, which the gate must fail closed on.
+vi.mock('./modules/mailbox/index.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./modules/mailbox/index.js')>();
+  return {
+    ...actual,
+    readSessionOutbound: (
+      location: { sessionId: string },
+      action: (mailbox: {
+        getProcessingClaimRows: () => unknown[];
+        getContainerState: () => { current_tool: string | null };
+        hasWorkContinuation: () => boolean;
+      }) => unknown,
+    ) => {
+      if (state.unreadable.has(location.sessionId)) throw new Error('persisted state unavailable');
+      return action({
+        getProcessingClaimRows: () => (state.processing.has(location.sessionId) ? [{}] : []),
+        getContainerState: () => ({ current_tool: state.tools.has(location.sessionId) ? 'git' : null }),
+        hasWorkContinuation: () => state.continuations.has(location.sessionId),
+      });
+    },
+  };
+});
 // Spread the real module: the mailbox module barrel (imported for the session
 // path helper) pulls in code that uses more of log.js than these four levels.
 vi.mock('./log.js', async (importOriginal) => ({

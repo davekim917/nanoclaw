@@ -10,7 +10,8 @@ import fs from 'fs';
 import path from 'path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { ensureSchema, openInboundDb } from '../../db/session-db.js';
+import { openInboundDb } from '../mailbox/openers.js';
+import { ensureSchema } from '../mailbox/schema.js';
 import { composeNanoclawSession } from '../mailbox/index.js';
 import { insertTaskRow } from './db.js';
 import { handleRecurrence, scriptBackoffMinutes } from './recurrence.js';

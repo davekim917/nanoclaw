@@ -78,23 +78,29 @@ vi.mock('./session-manager.js', () => ({
   sessionContextPathFor: (sessionPath: string) =>
     path.join(path.dirname(sessionPath), '.context', `${path.basename(sessionPath)}.json`),
 }));
-// The reclaim gate now reads outbound state through the mailbox module's own
-// open funnel and ops (see worktree-cleanup.ts), so those are what this suite
+// The reclaim gate reads outbound state through the mailbox module's read-only
+// session (see worktree-cleanup.ts), so that is the one seam this suite
 // substitutes. The session path helper stays real — it is pure layout over the
 // mocked DATA_DIR.
-vi.mock('./modules/mailbox/openers.js', () => ({
-  openOutboundDb: (dbPath: string) => ({
-    sessionId: String(dbPath).split('/').at(-2)!,
-    close: () => undefined,
-  }),
-}));
-vi.mock('./modules/mailbox/ops/sweep.js', () => ({
-  getProcessingClaims: (db: { sessionId: string }) => (state.claiming.has(db.sessionId) ? [{}] : []),
-  getContainerState: () => ({ current_tool: null }),
-}));
-vi.mock('./modules/mailbox/ops/continuation.js', () => ({
-  hasWorkContinuationRow: () => false,
-}));
+vi.mock('./modules/mailbox/index.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./modules/mailbox/index.js')>();
+  return {
+    ...actual,
+    readSessionOutbound: (
+      location: { sessionId: string },
+      action: (mailbox: {
+        getProcessingClaimRows: () => unknown[];
+        getContainerState: () => { current_tool: string | null };
+        hasWorkContinuation: () => boolean;
+      }) => unknown,
+    ) =>
+      action({
+        getProcessingClaimRows: () => (state.claiming.has(location.sessionId) ? [{}] : []),
+        getContainerState: () => ({ current_tool: null }),
+        hasWorkContinuation: () => false,
+      }),
+  };
+});
 vi.mock('./log.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('./log.js')>()),
   log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn(), fatal: vi.fn() },
