@@ -32,16 +32,22 @@ because `session-manager.ts` already types its action that way.
   surfaces' read path, and the only synchronous one. A `readonly` handle, no
   schema-ensure, no migration, no provisioning, and a 1s busy_timeout by
   default. `read-only.ts` states the full rationale.
-- `withExistingNanoclawOutbound` (`read-only.ts`) — the writable
-  **outbound-keyed** session, for an outbound-only write such as the
-  thread-close force-clear. Deliberately not the mailbox session: that one's
-  existence check is inbound-keyed, so it answers `undefined` for a session
-  whose inbound.db is gone while outbound.db remains.
+- `withExistingNanoclawOutbound` (`index.ts`) — the **outbound-keyed** session,
+  for outbound-only work: the thread-close force-clear, the router's two
+  notices, the done-proposal read. The action receives the module's TYPED
+  outbound ops, never a raw handle. Deliberately not the mailbox session: that
+  one's existence check is inbound-keyed, so it answers `undefined` for a
+  session whose inbound.db is gone while outbound.db remains. It sits in
+  `index.ts` rather than beside the read funnels because it is composed from
+  `composeOutboundOps`, and `read-only.ts` cannot import that without a static
+  cycle through the barrel.
 
-All three are existing-only and share one open/absent/close implementation,
-`withOpenedSessionDb` in `openers.ts`. Only the opener varies. An absent DB is
+All three are existing-only and answer absence the same way: an absent DB is
 `undefined`; a present-but-unopenable one raises `SessionDbUnopenableError`
-whichever funnel opened it.
+whichever funnel opened it. **The existence question a funnel asks is keyed to
+the file the action actually touches** — four separate review findings across
+this series were one violation of that rule, and both mailbox-seam ratchet
+rules exist to keep it.
 
 ## Adding a read op
 

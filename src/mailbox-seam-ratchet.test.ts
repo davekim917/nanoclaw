@@ -154,18 +154,20 @@ describe('no raw session-DB access or passed session handle outside the mailbox 
   // `withExistingNanoclawOutbound`, which asks an outbound-only existence
   // question.
   //
-  // A ratchet, not a target: these files are pre-existing and may only shrink.
+  // EMPTY, and it got there the honest way — every entry was fixed, none was
+  // deleted. `router.ts` in round 4 (both notices moved to the outbound
+  // funnel); `container-restart.ts`'s drain probe and `host-sweep.ts`'s usage
+  // rollup by PR 4 and PR 6, arriving with the cascade.
   //
-  // `src/router.ts` was on this list and has been removed — both of its
-  // notices are on the outbound funnel now. It is worth recording WHY it was
-  // ever allowlisted, because the reasoning was wrong in an instructive way:
-  // the entry said the two writes go to a session the router has just
-  // resolved, so inbound.db is "almost certainly there". Resolving a session
-  // is a central-DB fact; it says nothing about whether that session's
-  // inbound.db file still exists on disk. Review caught it. "Safe today"
-  // was never the question this rule asks — the question is whether the
-  // existence check is keyed on the file the action actually touches.
-  const OUTBOUND_ONLY_SESSION_ALLOWLIST = ['src/container-restart.ts', 'src/host-sweep.ts'];
+  // Worth keeping the record of why `router.ts` was ever allowlisted, because
+  // the reasoning was wrong in an instructive way: the entry said the writes go
+  // to a session the router has just resolved, so inbound.db is "almost
+  // certainly there". Resolving a session is a central-DB fact; it says nothing
+  // about whether that session's inbound.db still exists on disk. Review caught
+  // it. "Safe today" was never the question this rule asks — the question is
+  // whether the existence check is keyed on the file the action actually
+  // touches.
+  const OUTBOUND_ONLY_SESSION_ALLOWLIST: string[] = [];
 
   it('no NEW inbound-keyed session does outbound-only work', () => {
     const matches = findOutboundOnlySessions(hostSourcesForOutboundScan(), computeOpSides());
@@ -239,17 +241,21 @@ describe('host outbound writes go through the stopped-container guard', () => {
   //  - src/host-sweep.ts leaves on the cascade merge. PR 5's head puts both
   //    continuation writes behind `withStoppedContainerSession`; running this
   //    checker over that host-sweep.ts reports nothing.
-  // src/router.ts was the second entry and is gone, but NOT because the
-  // property now holds there — because its two notices moved to
+  // EMPTY. `src/host-sweep.ts` left it exactly as predicted when the rule was
+  // written: PR 5's `withStoppedContainerSession` arrived with the cascade and
+  // both continuation writes are behind it.
+  //
+  // `src/router.ts` left for a different reason, and NOT because the property
+  // now holds there — because its two notices moved to
   // `withExistingNanoclawOutbound`, which is not a `with*Session` call and so
-  // is outside this rule's lexical reach entirely. That is the honest state:
-  // this rule covers writes made through the MAILBOX SESSION. Writes through
-  // the outbound funnel (the router's notices, thread-close's force-clear)
-  // are a separate class, deliberately made while a container may be running,
-  // and `withStoppedContainerSession` is not their remedy — allowlisting them
-  // here would only record "this one is fine" under a rule whose fix does not
-  // apply. If that class wants a check, it wants its own.
-  const OUTBOUND_WRITE_ALLOWLIST = ['src/host-sweep.ts'];
+  // is outside this rule's lexical reach entirely. This rule covers writes made
+  // through the MAILBOX SESSION. Writes through the outbound funnel (the
+  // router's notices, thread-close's force-clear) are a separate class,
+  // deliberately made while a container may be running, and
+  // `withStoppedContainerSession` is not their remedy — allowlisting them here
+  // would only record "this one is fine" under a rule whose fix does not apply.
+  // If that class wants a check, it wants its own.
+  const OUTBOUND_WRITE_ALLOWLIST: string[] = [];
 
   it('no NEW host outbound write sits outside the guard', () => {
     const matches = findUnguardedOutboundWrites(hostSourcesForOutboundScan(), outboundWriteOps());

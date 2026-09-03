@@ -562,17 +562,21 @@ export type NanoclawOutboundRead = Pick<
 >;
 
 /**
- * The reads plus the one outbound WRITE the host performs on this head.
+ * The reads plus the outbound WRITES the host performs.
  *
- * `clearWorkContinuation` is the thread-close force-clear — a host write to a
- * container-owned key, valid only with the container confirmed stopped (see
- * the policy around it in `dashboard/thread-close.ts`). It is the single
- * reason this type is not simply `NanoclawOutboundRead`, and the reason PR 7's
- * read-only type is the narrower of the two: `OutboundSessionRead` is a
- * `Pick` of this, or this is `OutboundSessionRead & { clearWorkContinuation }`,
- * whichever direction reads better once both exist in one tree.
+ * Two, and they are the reason this type is not simply `NanoclawOutboundRead`:
+ *
+ *  - `clearWorkContinuation` — the thread-close force-clear, a host write to a
+ *    container-owned key, valid only with the container confirmed stopped (see
+ *    the policy around it in `dashboard/thread-close.ts`).
+ *  - `writeOutboundDirect` — the router's two notices (a command-gate denial,
+ *    a flag confirmation), which append an id-unique row rather than mutating
+ *    container-owned state. Outbound-keyed because they read nothing from
+ *    inbound.db; through the mailbox session they were silently dropped for a
+ *    session whose inbound.db had been reclaimed.
  */
-export type NanoclawOutboundSession = NanoclawOutboundRead & Pick<NanoclawMailboxSession, 'clearWorkContinuation'>;
+export type NanoclawOutboundSession = NanoclawOutboundRead &
+  Pick<NanoclawMailboxSession, 'clearWorkContinuation' | 'writeOutboundDirect'>;
 
 export type NanoclawMailboxAction<T> = (mailbox: NanoclawMailboxSession) => T | Promise<T>;
 
@@ -764,6 +768,14 @@ export function composeOutboundOps(
     readDoneProposal: () => readOutbound(null, readDoneProposal),
     readContinuationPresence: () => readOutbound(null, readContinuationPresence),
     clearWorkContinuation: () => (outboundPresent ? clearWorkContinuation(writableOutbound()) : null),
+    // The direct notice deliberately does NOT degrade, which is the write rule
+    // rather than an exception to it: `openOutboundDbWritable` refuses a
+    // missing file instead of creating one, so a never-woken session raises
+    // `SessionDbMissingError` here — the failure the router's two notice
+    // writers already handle. `clearWorkContinuation` degrades because
+    // "nothing to clear" is a true answer for a session that never ran;
+    // "the notice was written" would not be.
+    writeOutboundDirect: (message) => writeOutboundDirectRow(writableOutbound(), message),
   };
 }
 

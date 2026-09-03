@@ -1,17 +1,14 @@
 /**
- * The module's existing-only session funnels — the three ways to reach ONE
- * session's storage without provisioning it.
+ * The module's two READ-ONLY session funnels — `readSessionInbound` and
+ * `readSessionOutbound` — which reach one session's storage without
+ * provisioning it.
  *
- * Two are read-only (`readSessionInbound`, `readSessionOutbound`) and one
- * writes (`withExistingNanoclawOutbound`, the thread-close force-clear). They
- * live together because they share the same absence rule and the same
- * classified openers via `withOpenedSessionDb`; only which opener, and whether
- * the handle can write, differs. The read-only rationale below governs the
- * first two.
- *
- * (Filename is narrower than the contents now. PR 4's round 4 introduces its
- * own outbound-ops module and these converge there, so renaming this file now
- * would only manufacture a conflict for that merge.)
+ * The third existing-only funnel, the outbound-keyed WRITE session
+ * `withExistingNanoclawOutbound`, is not here: it hands the action the module's
+ * typed outbound ops, built from `composeOutboundOps`, and that lives in
+ * `index.ts`. Importing it here would put a static cycle through the barrel.
+ * All three share the same absence rule — an absent DB is `undefined`, a
+ * present-but-unopenable one raises — and the README lists them together.
  *
  * Read-only session access for the host's operator surfaces.
  *
@@ -328,4 +325,3 @@ export function readSessionOutbound<T>(
     db.close();
   }
 }
-

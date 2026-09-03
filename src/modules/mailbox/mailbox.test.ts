@@ -45,7 +45,7 @@ import type { InboundMessage, MailboxSessionKey } from '../../mailbox/types.js';
 import { SessionDbMissingError } from './openers.js';
 import { withExistingMailboxSession, withMailboxSession } from '../../session-manager.js';
 import { shouldReapIdleTaskContainer } from '../sweep-idle-reap/index.js';
-import { withExistingNanoclawOutbound } from './session.js';
+import { withExistingNanoclawOutbound } from './index.js';
 import { sessionOutboundStorageStat, type NanoclawMailboxSession } from './index.js';
 
 const DATA_DIR = path.join(TEST_ROOT, 'data');

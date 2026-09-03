@@ -81,6 +81,35 @@ function objectLiteralBody(source: string, fnName: string): string {
   throw new Error(`op-sides: ${fnName} object literal never closes`);
 }
 
+/**
+ * Object literals that `forkOps` SPREADS into its own, and which therefore
+ * carry ops just as much as its literal entries do.
+ *
+ * PR 4's round 8 moved the outbound half into `composeOutboundOps` so the
+ * outbound-keyed funnel could share it. Reading only `forkOps` after that
+ * silently classified every one of those ops as inbound (the fail-closed
+ * default), which quietly narrowed both ratchet rules instead of breaking
+ * them — so the spread list is asserted below rather than assumed.
+ */
+const COMPOSED_INTO_FORK_OPS = ['composeOutboundOps'];
+
+/** Every op entry `forkOps` contributes, its spreads included. */
+function forkOpEntries(source: string): Array<{ key: string; value: string }> {
+  const body = objectLiteralBody(source, 'forkOps');
+  const entries = splitEntries(body);
+  for (const m of body.matchAll(/\.\.\.\s*([A-Za-z_$][\w$]*)\s*\(/g)) {
+    if (!COMPOSED_INTO_FORK_OPS.includes(m[1])) {
+      throw new Error(
+        `op-sides: forkOps spreads ${m[1]}(), which this module does not read — its ops would be ` +
+          'classified inbound by default and the ratchet rules would silently stop covering them. ' +
+          'Add it to COMPOSED_INTO_FORK_OPS.',
+      );
+    }
+  }
+  for (const fn of COMPOSED_INTO_FORK_OPS) entries.push(...splitEntries(objectLiteralBody(source, fn)));
+  return entries;
+}
+
 const mentions = (text: string, names: string[]): boolean => names.some((n) => new RegExp(`\\b${n}\\b`).test(text));
 
 /**
@@ -103,7 +132,7 @@ export function computeOpSides(): OpSides {
   );
 
   const source = fs.readFileSync(INDEX_PATH, 'utf8');
-  for (const { key, value } of splitEntries(objectLiteralBody(source, 'forkOps'))) {
+  for (const { key, value } of forkOpEntries(source)) {
     const touchesOutbound = mentions(value, OUTBOUND_HANDLES);
     const touchesInbound = mentions(value, INBOUND_HANDLES);
     // Both, or neither-and-therefore-unknown, count as inbound: this map is
@@ -159,7 +188,7 @@ export function outboundWriteOps(): Set<string> {
   const writes = new Set<string>();
 
   const forkSource = fs.readFileSync(INDEX_PATH, 'utf8');
-  for (const { key, value } of splitEntries(objectLiteralBody(forkSource, 'forkOps'))) {
+  for (const { key, value } of forkOpEntries(forkSource)) {
     if (FORK_WRITABLE_HANDLE.test(value)) writes.add(key);
   }
 

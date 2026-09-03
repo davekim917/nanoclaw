@@ -49,7 +49,7 @@ import { cancelPendingGatesForSession, sessionHasActiveGates } from './modules/b
 import { startTypingRefresh, stopTypingRefresh } from './modules/typing/index.js';
 import { log } from './log.js';
 import { resolveSession, sessionMessageExists, writeSessionMessageIfNew } from './session-manager.js';
-import { withExistingNanoclawOutbound, writeOutboundDirectRow } from './modules/mailbox/index.js';
+import { withExistingNanoclawOutbound } from './modules/mailbox/index.js';
 import { archiveMessage } from './message-archive.js';
 import { parseMessageFlags, formatFlagConfirmation, type FlagIntent } from './flag-parser.js';
 import { maybeRenameNewThread } from './topic-title.js';
@@ -1324,7 +1324,7 @@ async function deliverToAgent(
       // with no reply ever written. Pre-seam this opened outbound.db directly,
       // so the inbound dependency would have been new.
       await withExistingNanoclawOutbound(session.agent_group_id, session.id, (outbound) =>
-        writeOutboundDirectRow(outbound, {
+        outbound.writeOutboundDirect({
           id: `deny-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
           kind: 'chat',
           platformId: deliveryAddr.platformId,
@@ -1379,7 +1379,7 @@ async function deliverToAgent(
         // inbound-keyed existence check would silently drop this confirmation
         // for a session whose inbound.db is gone and outbound.db is not.
         await withExistingNanoclawOutbound(session.agent_group_id, session.id, (outbound) =>
-          writeOutboundDirectRow(outbound, {
+          outbound.writeOutboundDirect({
             id: `flag-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
             kind: 'chat',
             platformId: deliveryAddr.platformId,

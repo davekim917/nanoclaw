@@ -67,13 +67,13 @@ vi.mock('./channels/channel-registry.js', () => ({
 // on — because that is exactly what this fix is about. `sessionFiles` says
 // which of a session's two databases is present; a funnel whose file is gone
 // resolves `undefined` without running its action, which is what the real
-// `withOpenedSessionDb` does (covered against real files in
+// funnels do (covered against real files in
 // src/modules/mailbox/session-db-ops.test.ts).
 const sessionFiles = vi.hoisted(() => ({ inbound: true, outbound: true }));
 /** The mailbox session's op — no longer used by these two writes. */
 const writeOutboundDirect = vi.hoisted(() => vi.fn());
-/** The raw outbound op the two notices now use. */
-const writeOutboundDirectRow = vi.hoisted(() => vi.fn());
+/** The outbound SESSION's write op — what the two notices call now. */
+const outboundSessionWrite = vi.hoisted(() => vi.fn());
 vi.mock('./session-manager.js', () => ({
   resolveSession: vi.fn(),
   sessionMessageExists: vi.fn(() => false),
@@ -85,11 +85,12 @@ vi.mock('./session-manager.js', () => ({
 }));
 vi.mock('./modules/mailbox/index.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('./modules/mailbox/index.js')>()),
+  // PR 4's round 8 made this a TYPED outbound session, so the stub carries the
+  // one op the notices use rather than a bare handle.
   withExistingNanoclawOutbound: vi.fn(
     async (_agentGroupId: string, _sessionId: string, action: (outbound: unknown) => unknown) =>
-      sessionFiles.outbound ? action({}) : undefined,
+      sessionFiles.outbound ? action({ writeOutboundDirect: outboundSessionWrite }) : undefined,
   ),
-  writeOutboundDirectRow,
 }));
 
 // `...real` carries `sessionStillActive` through UNCHANGED — the REAL
@@ -461,7 +462,7 @@ describe('flag dispatcher wake gate', () => {
     expect(writeOutboundDirect).not.toHaveBeenCalled();
     // The notices go through the outbound funnel now, so this guard names
     // that spy too — asserting only on the session op would be vacuous.
-    expect(writeOutboundDirectRow).not.toHaveBeenCalled();
+    expect(outboundSessionWrite).not.toHaveBeenCalled();
   });
 
   it('still runs parseMessageFlags when wake=true (the addressed agent)', async () => {
@@ -868,7 +869,7 @@ describe('34: pre-fanout intercept fan-out dedup + denial reply', () => {
     expect(writeOutboundDirect).not.toHaveBeenCalled();
     // The notices go through the outbound funnel now, so this guard names
     // that spy too — asserting only on the session op would be vacuous.
-    expect(writeOutboundDirectRow).not.toHaveBeenCalled();
+    expect(outboundSessionWrite).not.toHaveBeenCalled();
   });
 
   it('does not send a duplicate denial from a non-responding sibling', async () => {
@@ -1028,8 +1029,8 @@ describe('router notices survive a session whose inbound.db is gone', () => {
 
     await routeAs('/clear');
 
-    expect(writeOutboundDirectRow).toHaveBeenCalledOnce();
-    const [, row] = writeOutboundDirectRow.mock.calls[0] as [unknown, { content: string; kind: string }];
+    expect(outboundSessionWrite).toHaveBeenCalledOnce();
+    const [row] = outboundSessionWrite.mock.calls[0] as [{ content: string; kind: string }];
     expect(row.kind).toBe('chat');
     expect(JSON.parse(row.content).text).toContain('Permission denied');
     // The inbound-keyed funnel is not what carried this write.
@@ -1049,8 +1050,8 @@ describe('router notices survive a session whose inbound.db is gone', () => {
 
     await routeAs('-e max hello');
 
-    expect(writeOutboundDirectRow).toHaveBeenCalledOnce();
-    const [, row] = writeOutboundDirectRow.mock.calls[0] as [unknown, { content: string }];
+    expect(outboundSessionWrite).toHaveBeenCalledOnce();
+    const [row] = outboundSessionWrite.mock.calls[0] as [{ content: string }];
     expect(JSON.parse(row.content).text).toBeTruthy();
     expect(writeOutboundDirect).not.toHaveBeenCalled();
   });
@@ -1064,6 +1065,6 @@ describe('router notices survive a session whose inbound.db is gone', () => {
 
     await routeAs('/clear');
 
-    expect(writeOutboundDirectRow).not.toHaveBeenCalled();
+    expect(outboundSessionWrite).not.toHaveBeenCalled();
   });
 });
