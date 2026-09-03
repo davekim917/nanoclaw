@@ -7,7 +7,7 @@
  *      sight. Returns null when the payload doesn't carry enough to identify
  *      a sender.
  *   2. setAccessGate — runs after agent resolution. Enforces the
- *      unknown_sender_policy (strict/request_approval/public) and the
+ *      unknown_sender_policy (strict/request_approval/decline_notify/public) and the
  *      owner/global-admin/scoped-admin/member access hierarchy. Records its
  *      own `dropped_messages` row on refusal (structural drops are recorded
  *      by core).
@@ -57,7 +57,7 @@ import { deletePendingSenderApproval, getPendingSenderApproval } from './db/pend
 import { hasAdminPrivilege } from './db/user-roles.js';
 import { getUser, upsertUser } from './db/users.js';
 import './grant.js';
-import { requestSenderApproval } from './sender-approval.js';
+import { declineAndNotify, requestSenderApproval } from './sender-approval.js';
 import { channelsRegister, sendersAdmit } from './guard.js';
 import { ensureUserDm } from './user-dm.js';
 
@@ -146,8 +146,8 @@ async function handleUnknownSender(
 
   // The admission decision is the guard's senders.admit decision (./guard.ts)
   // — unknown_sender_policy verbatim: strict → deny, request_approval → hold,
-  // public → allow (short-circuited before the gate). Drop-recording and the
-  // hold creation stay here.
+  // decline_notify → deny, public → allow (short-circuited before the gate).
+  // Drop-recording, the hold creation and the decline side effects stay here.
   const decision = guard(sendersAdmit, {
     actor: userId ? { kind: 'human', userId } : { kind: 'system' },
     payload: {
@@ -160,10 +160,14 @@ async function handleUnknownSender(
 
   if (decision.effect === 'allow') return false; // public is handled before this gate.
 
+  const isDeclineNotify = mg.unknown_sender_policy === 'decline_notify';
+
   log.info(
-    decision.effect === 'hold'
-      ? 'MESSAGE DROPPED — unknown sender (approval requested)'
-      : 'MESSAGE DROPPED — unknown sender (strict policy)',
+    isDeclineNotify
+      ? 'MESSAGE DROPPED — unknown sender (decline-and-notify policy)'
+      : decision.effect === 'hold'
+        ? 'MESSAGE DROPPED — unknown sender (approval requested)'
+        : 'MESSAGE DROPPED — unknown sender (strict policy)',
     {
       messagingGroupId: mg.id,
       agentGroupId,
@@ -172,6 +176,34 @@ async function handleUnknownSender(
     },
   );
   recordDroppedMessage(dropRecord);
+
+  // decline_notify: polite in-DM decline + one-line owner FYI, no card.
+  // Fire-and-forget like the hold path — declineAndNotify dedupes itself
+  // (24h stamp) and logs its own failures; the sender's message stays
+  // dropped either way, so nothing is retained for replay.
+  // Gated on the guard's own verdict, not on the policy string alone: the
+  // guard (./guard.ts) is the decision seam, so a future policy change that
+  // makes decline_notify hold must card, not decline behind the guard's back.
+  if (decision.effect === 'deny' && isDeclineNotify) {
+    // The decline copy assumes a 1:1 DM surface. The policy is settable on
+    // groups (ncl / setup register / auto-wire env), where delivering it
+    // would post the decline publicly into the channel — treat groups as
+    // strict: the drop above stands, nothing is sent.
+    if (mg.is_group === 1) {
+      log.warn('decline_notify on a group messaging group — treated as strict (no public decline)', {
+        messagingGroupId: mg.id,
+      });
+      return false;
+    }
+    void declineAndNotify({
+      messagingGroupId: mg.id,
+      agentGroupId,
+      senderIdentity: userId,
+      senderName,
+      event,
+    }).catch((err) => log.error('decline_notify flow threw', { err }));
+    return false;
+  }
 
   // Persist the exact event only for a held sender with a stable identity.
   // A deny or identity-less hold remains an ordinary completed drop.

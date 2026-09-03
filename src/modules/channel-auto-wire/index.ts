@@ -69,7 +69,7 @@ import { SESSION_MODES } from '../../types.js';
 
 const VALID_SESSION_MODES = new Set<string>(SESSION_MODES);
 
-const VALID_SENDER_POLICIES = new Set(['strict', 'request_approval', 'public'] as const);
+const VALID_SENDER_POLICIES = new Set(['strict', 'request_approval', 'decline_notify', 'public'] as const);
 type SenderPolicy = MessagingGroup['unknown_sender_policy'];
 
 const VALID_IGNORED_POLICIES = new Set(['drop', 'accumulate'] as const);

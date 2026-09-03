@@ -66,3 +66,85 @@ export function getInFlightSenderApproval(
 export function deletePendingSenderApproval(id: string): void {
   getDb().prepare('DELETE FROM pending_sender_approvals WHERE id = ?').run(id);
 }
+
+// ── Decline stamps (decline_notify dedupe) ──
+// The decline-and-notify flow persists "last declined at" per (messaging
+// group, sender) by reusing this table's UNIQUE key — an id prefix
+// distinguishes stamps from real card rows. Stamps never render a card and
+// no click can resolve one: response handlers look a row up by exact id, and
+// a stamp's id is not a `nsa-` id any card was ever delivered with.
+//
+// Two collisions on the UNIQUE key, both deliberate:
+//   - policy flipped decline_notify → request_approval, stale stamp in the
+//     way: requestSenderApproval clears the stamp before carding.
+//   - policy flipped request_approval → decline_notify, card row in the way:
+//     upsertDeclineStamp converts the row into the stamp shape. The card is
+//     obsolete once the policy no longer cards.
+
+const DECLINE_STAMP_ID_PREFIX = 'decline:';
+
+/** True for a decline stamp rather than a real, clickable card row. */
+export function isDeclineStamp(id: string): boolean {
+  return id.startsWith(DECLINE_STAMP_ID_PREFIX);
+}
+
+/** ISO timestamp of the last decline for this pair, if any. */
+export function getDeclineStampAt(messagingGroupId: string, senderIdentity: string): string | undefined {
+  const row = getDb()
+    .prepare(
+      `SELECT created_at FROM pending_sender_approvals
+        WHERE messaging_group_id = ? AND sender_identity = ? AND id LIKE '${DECLINE_STAMP_ID_PREFIX}%'`,
+    )
+    .get(messagingGroupId, senderIdentity) as { created_at: string } | undefined;
+  return row?.created_at;
+}
+
+/**
+ * Record (or refresh) the decline stamp. `agent_group_id` must reference a
+ * real agent group (FK). title / question / options_json keep their column
+ * defaults, so `getAskQuestionRender` can never build a clickable card out of
+ * a stamp.
+ */
+export function upsertDeclineStamp(stamp: {
+  messaging_group_id: string;
+  agent_group_id: string;
+  sender_identity: string;
+  sender_name: string | null;
+  original_message: string;
+}): void {
+  getDb()
+    .prepare(
+      `INSERT INTO pending_sender_approvals (
+         id, messaging_group_id, agent_group_id, sender_identity,
+         sender_name, original_message, approver_user_id, created_at
+       )
+       VALUES (
+         @id, @messaging_group_id, @agent_group_id, @sender_identity,
+         @sender_name, @original_message, '', @created_at
+       )
+       ON CONFLICT(messaging_group_id, sender_identity) DO UPDATE SET
+         id = excluded.id,
+         created_at = excluded.created_at,
+         sender_name = excluded.sender_name,
+         original_message = excluded.original_message,
+         approver_user_id = excluded.approver_user_id,
+         title = excluded.title,
+         question = excluded.question,
+         options_json = excluded.options_json`,
+    )
+    .run({
+      id: `${DECLINE_STAMP_ID_PREFIX}${stamp.messaging_group_id}:${stamp.sender_identity}`,
+      ...stamp,
+      created_at: new Date().toISOString(),
+    });
+}
+
+/** Remove any decline stamp for this pair — real card rows are untouched. */
+export function clearDeclineStamp(messagingGroupId: string, senderIdentity: string): void {
+  getDb()
+    .prepare(
+      `DELETE FROM pending_sender_approvals
+        WHERE messaging_group_id = ? AND sender_identity = ? AND id LIKE '${DECLINE_STAMP_ID_PREFIX}%'`,
+    )
+    .run(messagingGroupId, senderIdentity);
+}

@@ -72,7 +72,7 @@ interface ChannelContextDefaults {
                             // regex-escaped agent_group name
   threads: boolean;         // whether thread ids are honored in this context by default;
                             // must be false when the adapter's supportsThreads is false
-  unknownSenderPolicy: 'strict' | 'request_approval' | 'public';
+  unknownSenderPolicy: 'strict' | 'request_approval' | 'decline_notify' | 'public';
 }
 
 interface ChannelDefaults {

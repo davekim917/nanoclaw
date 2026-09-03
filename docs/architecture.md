@@ -786,7 +786,7 @@ CREATE TABLE messaging_groups (
   instance               TEXT NOT NULL,     -- adapter-instance name; default = channel_type
   name                   TEXT,
   is_group               INTEGER DEFAULT 0,
-  unknown_sender_policy  TEXT NOT NULL DEFAULT 'strict',  -- 'strict' | 'request_approval' | 'public'
+  unknown_sender_policy  TEXT NOT NULL DEFAULT 'strict',  -- 'strict' | 'request_approval' | 'decline_notify' | 'public'
   created_at             TEXT NOT NULL,
   denied_at              TEXT,
   UNIQUE(channel_type, platform_id, instance)
