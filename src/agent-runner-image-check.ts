@@ -16,10 +16,25 @@
  * recompute the on-disk hash and compare against the image label. Mismatch →
  * refuse to spawn with an actionable message naming the rebuild command.
  *
- * Intentionally uncached: the failure mode is exactly "operator edits
- * package.json without rebuilding", so a cache keyed on imageRef alone would
- * mask the very edits we're guarding against. ~50ms per spawn (two file reads
- * + one docker inspect) is negligible against multi-second spawn cost.
+ * Success is cached, keyed on (imageRef, package.json/bun.lock mtime+size) —
+ * NOT on imageRef alone, which is the case the original "intentionally
+ * uncached" design was guarding against: a cache keyed only on imageRef would
+ * mask "operator edits package.json without rebuilding", since the edit
+ * never touches the key. Keying on the file stats instead means any edit
+ * (which always bumps mtime) busts the cache and forces a fresh check, so
+ * that failure mode stays fully covered. What the cache buys back is the
+ * steady-state case — package.json/bun.lock unchanged since the last check —
+ * which is the overwhelming majority of spawns; those skip both file hashing
+ * and the `docker inspect` round-trip (and, when the label read landed
+ * mid-relabel, the LABEL_RETRY_DELAY_MS pause) entirely.
+ *
+ * Only `ok: true` results are cached. A failing check (drift, missing image,
+ * inspect error, unresolved label) is never cached, deliberately: the fix for
+ * those is almost always "rebuild the image", which doesn't touch
+ * package.json/bun.lock, so caching a failure would mask the fix landing —
+ * host-sweep's retry loop needs every subsequent spawn to actually re-check
+ * until the rebuild lands. See checkAgentRunnerDepsDrift's cache lookup below
+ * for where this is enforced.
  *
  * The read has to be careful about one thing. `container/build.sh` re-stamps
  * the ARG-driven retention LABEL layer on every run, which means a periodic
@@ -34,7 +49,7 @@
  * absent map exactly one re-read before refusing.
  */
 import { createHash } from 'crypto';
-import { readFile } from 'fs/promises';
+import { readFile, stat } from 'fs/promises';
 import { execFile } from 'child_process';
 import { promisify } from 'util';
 import * as path from 'path';
@@ -84,6 +99,53 @@ export interface DriftCheckOptions {
 }
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
+/** package.json + bun.lock identity at the moment a cached result was produced. */
+interface DepsFileFingerprint {
+  pkgMtimeMs: number;
+  pkgSize: number;
+  lockMtimeMs: number;
+  lockSize: number;
+}
+
+interface CachedDriftCheck {
+  fingerprint: DepsFileFingerprint;
+  result: DepsDriftCheck;
+}
+
+/**
+ * imageRef -> last known-good (ok: true) result + the file fingerprint it was
+ * computed against. Only ever holds passing results — see the module doc
+ * comment above for why failures are never cached. Module-scoped, so it
+ * lives for the host process's lifetime and is naturally cleared by a
+ * restart, same as the rest of this check was already implicitly
+ * process-lifetime-scoped (nothing here was ever persisted).
+ */
+const okResultCache = new Map<string, CachedDriftCheck>();
+
+async function currentDepsFileFingerprint(): Promise<DepsFileFingerprint> {
+  const [pkgStat, lockStat] = await Promise.all([stat(PKG_PATH), stat(LOCK_PATH)]);
+  return {
+    pkgMtimeMs: pkgStat.mtimeMs,
+    pkgSize: pkgStat.size,
+    lockMtimeMs: lockStat.mtimeMs,
+    lockSize: lockStat.size,
+  };
+}
+
+function fingerprintsMatch(a: DepsFileFingerprint, b: DepsFileFingerprint): boolean {
+  return (
+    a.pkgMtimeMs === b.pkgMtimeMs &&
+    a.pkgSize === b.pkgSize &&
+    a.lockMtimeMs === b.lockMtimeMs &&
+    a.lockSize === b.lockSize
+  );
+}
+
+/** Test-only: clear the cache so cases don't leak state across `it()` blocks. */
+export function resetDepsDriftCacheForTests(): void {
+  okResultCache.clear();
+}
 
 async function fileSha256Hex(p: string): Promise<string> {
   const buf = await readFile(p);
@@ -201,6 +263,18 @@ export async function checkAgentRunnerDepsDrift(
   const inspect = options.inspect ?? dockerInspectLabels;
   const retryDelayMs = options.retryDelayMs ?? LABEL_RETRY_DELAY_MS;
 
+  // Cheap up front (two stat calls) so it's worth doing even on a miss: if
+  // package.json/bun.lock haven't moved since the last *passing* check for
+  // this exact imageRef, skip re-hashing the files and re-inspecting the
+  // image entirely — that's the `docker inspect` round-trip (and, on a
+  // relabel race, the LABEL_RETRY_DELAY_MS pause) most spawns pay for a
+  // question that was already answered "yes, in sync".
+  const fingerprint = await currentDepsFileFingerprint();
+  const cached = okResultCache.get(imageRef);
+  if (cached && fingerprintsMatch(cached.fingerprint, fingerprint)) {
+    return cached.result;
+  }
+
   const [expected, first] = await Promise.all([computeAgentRunnerDepsHash(), lookupImageLabel(imageRef, inspect)]);
 
   // A label map that didn't resolve is ambiguous, and the ambiguity is
@@ -215,78 +289,89 @@ export async function checkAgentRunnerDepsDrift(
     lookup = await lookupImageLabel(imageRef, inspect);
   }
 
-  switch (lookup.kind) {
-    case 'inspect-error':
-      return {
-        ok: false,
-        imageRef,
-        expected,
-        actual: null,
-        lookup,
-        retried,
-        message: `agent-runner deps check: docker inspect ${imageRef} failed, so no label was read (${lookup.reason}). This is an inspect failure, NOT a missing label — verify the container runtime is reachable before rebuilding anything.`,
-      };
-    case 'no-image':
-      return {
-        ok: false,
-        imageRef,
-        expected,
-        actual: null,
-        lookup,
-        retried,
-        message: `agent-runner image ${imageRef} not found — build it: ${rebuildHint(imageRef)}`,
-      };
-    case 'missing':
-    case 'unresolved': {
-      // The image inspected cleanly and still has no deps-hash label — either
-      // it carries other labels but not ours ('missing'), or two reads a
-      // retry-delay apart both came back with no label map at all
-      // ('unresolved'). Two interpretations:
-      //  - For the shared base image, this means an older build.sh was used →
-      //    require a rebuild (fail closed).
-      //  - For an admin-set image_tag override, this can legitimately be a
-      //    custom prebuilt image that never went through container/build.sh.
-      //    Permanently blocking those would lock admins out of their override.
-      //    Fail open with a warning — operator opted into the override.
-      const evidence =
-        lookup.kind === 'missing'
-          ? 'the image is labeled but carries no such label'
-          : `no label map resolved on two reads ${retryDelayMs}ms apart`;
-      if (imageRef !== CONTAINER_IMAGE) {
+  const result: DepsDriftCheck = ((): DepsDriftCheck => {
+    switch (lookup.kind) {
+      case 'inspect-error':
         return {
-          ok: true,
+          ok: false,
           imageRef,
           expected,
           actual: null,
           lookup,
           retried,
-          message: `agent-runner image ${imageRef} has no ${LABEL_KEY} label (${evidence}) — treating admin-set image_tag override as opt-out from drift check. If this is a derived image from ${CONTAINER_IMAGE}, rebuild base then re-run install_packages.`,
+          message: `agent-runner deps check: docker inspect ${imageRef} failed, so no label was read (${lookup.reason}). This is an inspect failure, NOT a missing label — verify the container runtime is reachable before rebuilding anything.`,
         };
-      }
-      return {
-        ok: false,
-        imageRef,
-        expected,
-        actual: null,
-        lookup,
-        retried,
-        message: `agent-runner image ${imageRef} has no ${LABEL_KEY} label (${evidence}; built by an older build.sh) — rebuild: ${rebuildHint(imageRef)}`,
-      };
-    }
-    case 'found': {
-      const actual = lookup.value;
-      if (actual !== expected) {
+      case 'no-image':
         return {
           ok: false,
           imageRef,
           expected,
-          actual,
+          actual: null,
           lookup,
           retried,
-          message: `agent-runner deps drift on ${imageRef}: image baked from ${actual}, current files hash to ${expected}. Run: ${rebuildHint(imageRef)}`,
+          message: `agent-runner image ${imageRef} not found — build it: ${rebuildHint(imageRef)}`,
+        };
+      case 'missing':
+      case 'unresolved': {
+        // The image inspected cleanly and still has no deps-hash label — either
+        // it carries other labels but not ours ('missing'), or two reads a
+        // retry-delay apart both came back with no label map at all
+        // ('unresolved'). Two interpretations:
+        //  - For the shared base image, this means an older build.sh was used →
+        //    require a rebuild (fail closed).
+        //  - For an admin-set image_tag override, this can legitimately be a
+        //    custom prebuilt image that never went through container/build.sh.
+        //    Permanently blocking those would lock admins out of their override.
+        //    Fail open with a warning — operator opted into the override.
+        const evidence =
+          lookup.kind === 'missing'
+            ? 'the image is labeled but carries no such label'
+            : `no label map resolved on two reads ${retryDelayMs}ms apart`;
+        if (imageRef !== CONTAINER_IMAGE) {
+          return {
+            ok: true,
+            imageRef,
+            expected,
+            actual: null,
+            lookup,
+            retried,
+            message: `agent-runner image ${imageRef} has no ${LABEL_KEY} label (${evidence}) — treating admin-set image_tag override as opt-out from drift check. If this is a derived image from ${CONTAINER_IMAGE}, rebuild base then re-run install_packages.`,
+          };
+        }
+        return {
+          ok: false,
+          imageRef,
+          expected,
+          actual: null,
+          lookup,
+          retried,
+          message: `agent-runner image ${imageRef} has no ${LABEL_KEY} label (${evidence}; built by an older build.sh) — rebuild: ${rebuildHint(imageRef)}`,
         };
       }
-      return { ok: true, imageRef, expected, actual, lookup, retried, message: 'agent-runner deps in sync' };
+      case 'found': {
+        const actual = lookup.value;
+        if (actual !== expected) {
+          return {
+            ok: false,
+            imageRef,
+            expected,
+            actual,
+            lookup,
+            retried,
+            message: `agent-runner deps drift on ${imageRef}: image baked from ${actual}, current files hash to ${expected}. Run: ${rebuildHint(imageRef)}`,
+          };
+        }
+        return { ok: true, imageRef, expected, actual, lookup, retried, message: 'agent-runner deps in sync' };
+      }
     }
+  })();
+
+  // Only a passing result is safe to cache — see the module doc comment for
+  // why a failure never is. The fingerprint captured at the top of this call
+  // is the right key: if the files change between now and the next call,
+  // that call's own fingerprint won't match and it re-checks for real.
+  if (result.ok) {
+    okResultCache.set(imageRef, { fingerprint, result });
   }
+  return result;
 }
