@@ -151,7 +151,9 @@ export async function runScript(
           // merely slow, when the fix is NANOCLAW_TASK_SCRIPT_TIMEOUT_MS. Name
           // the timeout and the ceiling it hit.
           if ((error as { killed?: boolean }).killed) {
-            log(`[${taskId}] timed out after ${timeoutMs}ms and was killed; output discarded — raise NANOCLAW_TASK_SCRIPT_TIMEOUT_MS if the script is legitimately this slow`);
+            log(
+              `[${taskId}] timed out after ${timeoutMs}ms and was killed; output discarded — raise NANOCLAW_TASK_SCRIPT_TIMEOUT_MS if the script is legitimately this slow`,
+            );
           } else {
             log(`[${taskId}] error: ${error.message}`);
           }
