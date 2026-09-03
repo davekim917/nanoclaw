@@ -48,6 +48,13 @@ import { _incrementStoppedContinuationAttemptForTesting } from './modules/sweep-
 // (S5), which now lives in the scheduling family module (S2-PR11) — importing
 // it registers that duty so the case keeps its original vehicle.
 import './modules/sweep-scheduling/index.js';
+// The post-kill follow-up chain this file asserts is now spread across three
+// families: S15 (ceiling notice) and S10 (accountability wake) register from
+// sweep-continuation, S17's post-kill orphan-claim reset from sweep-session-core.
+// Without these side-effect imports `runSweepKillFollowUps` dispatches nothing
+// and the control arm of the post-kill case fails — the sibling-family import
+// S2-PR14's 23f0c4ab added to the family suites, owed here for the same reason.
+import './modules/sweep-session-core/index.js';
 import { getDb } from './db/connection.js';
 import type { Session } from './types.js';
 
