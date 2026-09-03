@@ -16,7 +16,22 @@
  * tests can assert on the user-visible outcome.
  */
 import Database from 'better-sqlite3';
+import fs from 'fs';
 import { beforeEach, afterEach, describe, expect, it, vi } from 'vitest';
+
+// deriveCallerId now opens the session's real mailbox instead of taking a
+// handle from the delivery loop (plan §4.5b), so these tests run against a
+// real temp session mailbox rather than an in-memory stand-in.
+vi.mock('../../config.js', async () => {
+  const actual = await vi.importActual('../../config.js');
+  return {
+    ...actual,
+    DATA_DIR: '/tmp/nanoclaw-test-permissions-grant',
+    GROUPS_DIR: '/tmp/nanoclaw-test-permissions-grant/groups',
+  };
+});
+
+const TEST_DIR = '/tmp/nanoclaw-test-permissions-grant';
 
 const notifyCalls: Array<{ sessionId: string; text: string }> = [];
 vi.mock('../approvals/index.js', () => ({
@@ -26,6 +41,7 @@ vi.mock('../approvals/index.js', () => ({
 }));
 
 import { closeDb, createAgentGroup, createMessagingGroup, initTestDb, runMigrations } from '../../db/index.js';
+import { initSessionFolder, inboundDbPath } from '../../session-manager.js';
 import type { AgentGroup, MessagingGroup, Session } from '../../types.js';
 import { addMember, isMember } from './db/agent-group-members.js';
 import { createUser } from './db/users.js';
@@ -73,46 +89,43 @@ function makeAg(id: string, folder: string, name: string): AgentGroup {
   return { id, folder, name, agent_provider: null, created_at: now() };
 }
 
-function inboundDb(): Database.Database {
-  const db = new Database(':memory:');
-  db.exec(`
-    CREATE TABLE messages_in (
-      id TEXT PRIMARY KEY,
-      seq INTEGER,
-      kind TEXT NOT NULL,
-      timestamp TEXT NOT NULL,
-      status TEXT,
-      process_after TEXT,
-      recurrence TEXT,
-      series_id TEXT,
-      tries INTEGER,
-      platform_id TEXT,
-      channel_type TEXT,
-      thread_id TEXT,
-      content TEXT NOT NULL
-    );
-  `);
-  return db;
-}
-
+/** Write straight into the session's real inbound.db, the way the host would. */
 function insertChatInbound(
-  db: Database.Database,
   content: Record<string, unknown>,
   opts: { channelType?: string; timestamp?: string; kind?: string } = {},
 ): void {
-  db.prepare(`INSERT INTO messages_in (id, kind, timestamp, channel_type, content) VALUES (?, ?, ?, ?, ?)`).run(
-    `in-${Math.random().toString(36).slice(2, 8)}`,
-    opts.kind ?? 'chat',
-    opts.timestamp ?? now(),
-    opts.channelType ?? 'slack-example-labs',
-    JSON.stringify(content),
-  );
+  const db = new Database(inboundDbPath('ag-helper', 'sess-test'));
+  try {
+    db.prepare(`INSERT INTO messages_in (id, kind, timestamp, channel_type, content) VALUES (?, ?, ?, ?, ?)`).run(
+      `in-${Math.random().toString(36).slice(2, 8)}`,
+      opts.kind ?? 'chat',
+      opts.timestamp ?? now(),
+      opts.channelType ?? 'slack-example-labs',
+      JSON.stringify(content),
+    );
+  } finally {
+    db.close();
+  }
+}
+
+function insertRawInbound(id: string, content: string): void {
+  const db = new Database(inboundDbPath('ag-helper', 'sess-test'));
+  try {
+    db.prepare(
+      `INSERT INTO messages_in (id, kind, timestamp, channel_type, content) VALUES (?, 'chat', ?, 'slack-example-labs', ?)`,
+    ).run(id, now(), content);
+  } finally {
+    db.close();
+  }
 }
 
 beforeEach(() => {
+  if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true, force: true });
+  fs.mkdirSync(TEST_DIR, { recursive: true });
   const db = initTestDb();
   runMigrations(db);
   notifyCalls.length = 0;
+  initSessionFolder('ag-helper', 'sess-test');
 
   createMessagingGroup(makeMg('mg-test', 'slack-example-labs', 'slack:C1'));
   createAgentGroup(makeAg('ag-helper', 'example-labs-v2', 'helper'));
@@ -167,6 +180,7 @@ beforeEach(() => {
 
 afterEach(() => {
   closeDb();
+  if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true, force: true });
 });
 
 describe('_resolveTargetUserId', () => {
@@ -196,115 +210,99 @@ describe('_resolveTargetUserId', () => {
 });
 
 describe('_deriveCallerId', () => {
-  it('reads senderId from the latest chat inbound', () => {
-    const db = inboundDb();
-    insertChatInbound(db, { senderId: 'slack-example-labs:OWNER', text: 'hi' });
-    expect(_deriveCallerId(makeSession(), db)).toBe('slack-example-labs:OWNER');
+  it('reads senderId from the latest chat inbound', async () => {
+    insertChatInbound({ senderId: 'slack-example-labs:OWNER', text: 'hi' });
+    expect(await _deriveCallerId(makeSession())).toBe('slack-example-labs:OWNER');
   });
 
-  it('falls back to author.userId when senderId is absent', () => {
-    const db = inboundDb();
-    insertChatInbound(db, { author: { userId: 'slack-example-labs:OWNER' }, text: 'hi' });
-    expect(_deriveCallerId(makeSession(), db)).toBe('slack-example-labs:OWNER');
+  it('falls back to author.userId when senderId is absent', async () => {
+    insertChatInbound({ author: { userId: 'slack-example-labs:OWNER' }, text: 'hi' });
+    expect(await _deriveCallerId(makeSession())).toBe('slack-example-labs:OWNER');
   });
 
-  it('prepends channel_type when the raw id is bare', () => {
-    const db = inboundDb();
-    insertChatInbound(db, { senderId: 'OWNER', text: 'hi' });
-    expect(_deriveCallerId(makeSession(), db)).toBe('slack-example-labs:OWNER');
+  it('prepends channel_type when the raw id is bare', async () => {
+    insertChatInbound({ senderId: 'OWNER', text: 'hi' });
+    expect(await _deriveCallerId(makeSession())).toBe('slack-example-labs:OWNER');
   });
 
-  it('returns null when there are no chat messages', () => {
-    expect(_deriveCallerId(makeSession(), inboundDb())).toBeNull();
+  it('returns null when there are no chat messages', async () => {
+    expect(await _deriveCallerId(makeSession())).toBeNull();
   });
 
   // Regression: the chat-SDK bridge writes kind='chat-sdk'. A `kind='chat'`-only
   // filter matched nothing, so every admin action was denied as "unidentified".
-  it("reads kind='chat-sdk' rows", () => {
-    const db = inboundDb();
-    insertChatInbound(db, { senderId: 'OWNER', author: { userId: 'OWNER' } }, { kind: 'chat-sdk' });
-    expect(_deriveCallerId(makeSession(), db)).toBe('slack-example-labs:OWNER');
+  it("reads kind='chat-sdk' rows", async () => {
+    insertChatInbound({ senderId: 'OWNER', author: { userId: 'OWNER' } }, { kind: 'chat-sdk' });
+    expect(await _deriveCallerId(makeSession())).toBe('slack-example-labs:OWNER');
   });
 
   // Regression: notifyAgent writes its own failure notice as kind='chat' with
   // senderId 'system'. Without the skip, a retry attributes the action to the
   // previous attempt's error message instead of the human.
-  it("skips the host's own system notices", () => {
-    const db = inboundDb();
-    insertChatInbound(db, { senderId: 'OWNER' }, { kind: 'chat-sdk', timestamp: '2026-01-01T00:00:00.000Z' });
+  it("skips the host's own system notices", async () => {
+    insertChatInbound({ senderId: 'OWNER' }, { kind: 'chat-sdk', timestamp: '2026-01-01T00:00:00.000Z' });
     insertChatInbound(
-      db,
       { text: 'grant_access failed: ...', sender: 'system', senderId: 'system' },
       { channelType: 'agent', timestamp: '2026-01-01T00:00:01.000Z' },
     );
-    expect(_deriveCallerId(makeSession(), db)).toBe('slack-example-labs:OWNER');
+    expect(await _deriveCallerId(makeSession())).toBe('slack-example-labs:OWNER');
   });
 
-  it('returns null on malformed content JSON', () => {
-    const db = inboundDb();
-    db.prepare(
-      `INSERT INTO messages_in (id, kind, timestamp, channel_type, content) VALUES (?, 'chat', ?, 'slack-example-labs', ?)`,
-    ).run('bad', now(), 'not json');
-    expect(_deriveCallerId(makeSession(), db)).toBeNull();
+  it('returns null on malformed content JSON', async () => {
+    insertRawInbound('bad', 'not json');
+    expect(await _deriveCallerId(makeSession())).toBeNull();
   });
 });
 
 describe('handleGrantAccess', () => {
   it('owner can grant member', async () => {
-    const db = inboundDb();
-    insertChatInbound(db, { senderId: 'OWNER' });
-    await handleGrantAccess({ user: '<@BOB>' }, makeSession(), db);
+    insertChatInbound({ senderId: 'OWNER' });
+    await handleGrantAccess({ user: '<@BOB>' }, makeSession());
     expect(isMember('slack-example-labs:BOB', 'ag-helper')).toBe(true);
     expect(notifyCalls.at(-1)?.text).toMatch(/Granted member access/);
   });
 
   it('owner can grant admin', async () => {
-    const db = inboundDb();
-    insertChatInbound(db, { senderId: 'OWNER' });
-    await handleGrantAccess({ user: '<@BOB>', role: 'admin' }, makeSession(), db);
+    insertChatInbound({ senderId: 'OWNER' });
+    await handleGrantAccess({ user: '<@BOB>', role: 'admin' }, makeSession());
     expect(isAdminOfAgentGroup('slack-example-labs:BOB', 'ag-helper')).toBe(true);
   });
 
   it('scoped admin can grant member but NOT admin', async () => {
-    const db = inboundDb();
-    insertChatInbound(db, { senderId: 'SADMIN' });
-    await handleGrantAccess({ user: '<@BOB>' }, makeSession(), db);
+    insertChatInbound({ senderId: 'SADMIN' });
+    await handleGrantAccess({ user: '<@BOB>' }, makeSession());
     expect(isMember('slack-example-labs:BOB', 'ag-helper')).toBe(true);
 
-    insertChatInbound(db, { senderId: 'SADMIN' });
-    await handleGrantAccess({ user: '<@CAROL>', role: 'admin' }, makeSession(), db);
+    insertChatInbound({ senderId: 'SADMIN' });
+    await handleGrantAccess({ user: '<@CAROL>', role: 'admin' }, makeSession());
     expect(isAdminOfAgentGroup('slack-example-labs:CAROL', 'ag-helper')).toBe(false);
     expect(notifyCalls.at(-1)?.text).toMatch(/only owner \/ global admin can grant `admin`/);
   });
 
   it('stranger is denied', async () => {
-    const db = inboundDb();
-    insertChatInbound(db, { senderId: 'STRANGER' });
-    await handleGrantAccess({ user: '<@BOB>' }, makeSession(), db);
+    insertChatInbound({ senderId: 'STRANGER' });
+    await handleGrantAccess({ user: '<@BOB>' }, makeSession());
     expect(isMember('slack-example-labs:BOB', 'ag-helper')).toBe(false);
     expect(notifyCalls.at(-1)?.text).toMatch(/denied: you don't have authority/);
   });
 
   it('scoped admin is denied on OTHER groups', async () => {
-    const db = inboundDb();
-    insertChatInbound(db, { senderId: 'SADMIN' });
-    await handleGrantAccess({ user: '<@BOB>', agentGroupId: 'ag-other' }, makeSession(), db);
+    insertChatInbound({ senderId: 'SADMIN' });
+    await handleGrantAccess({ user: '<@BOB>', agentGroupId: 'ag-other' }, makeSession());
     expect(isMember('slack-example-labs:BOB', 'ag-other')).toBe(false);
   });
 
   it('rejects unknown agent groups', async () => {
-    const db = inboundDb();
-    insertChatInbound(db, { senderId: 'OWNER' });
-    await handleGrantAccess({ user: '<@BOB>', agentGroupId: 'ag-missing' }, makeSession(), db);
+    insertChatInbound({ senderId: 'OWNER' });
+    await handleGrantAccess({ user: '<@BOB>', agentGroupId: 'ag-missing' }, makeSession());
     expect(notifyCalls.at(-1)?.text).toMatch(/does not exist/);
   });
 
   it('is idempotent on repeat grants', async () => {
-    const db = inboundDb();
-    insertChatInbound(db, { senderId: 'OWNER' });
-    await handleGrantAccess({ user: '<@BOB>' }, makeSession(), db);
-    insertChatInbound(db, { senderId: 'OWNER' });
-    await handleGrantAccess({ user: '<@BOB>' }, makeSession(), db);
+    insertChatInbound({ senderId: 'OWNER' });
+    await handleGrantAccess({ user: '<@BOB>' }, makeSession());
+    insertChatInbound({ senderId: 'OWNER' });
+    await handleGrantAccess({ user: '<@BOB>' }, makeSession());
     expect(notifyCalls.at(-1)?.text).toMatch(/already has access/);
   });
 });
@@ -312,9 +310,8 @@ describe('handleGrantAccess', () => {
 describe('handleRevokeAccess', () => {
   it('owner can revoke a member', async () => {
     addMember({ user_id: 'slack-example-labs:BOB', agent_group_id: 'ag-helper', added_by: null, added_at: now() });
-    const db = inboundDb();
-    insertChatInbound(db, { senderId: 'OWNER' });
-    await handleRevokeAccess({ user: '<@BOB>' }, makeSession(), db);
+    insertChatInbound({ senderId: 'OWNER' });
+    await handleRevokeAccess({ user: '<@BOB>' }, makeSession());
     expect(isMember('slack-example-labs:BOB', 'ag-helper')).toBe(false);
   });
 
@@ -326,17 +323,15 @@ describe('handleRevokeAccess', () => {
       granted_by: null,
       granted_at: now(),
     });
-    const db = inboundDb();
-    insertChatInbound(db, { senderId: 'SADMIN' });
-    await handleRevokeAccess({ user: '<@CAROL>' }, makeSession(), db);
+    insertChatInbound({ senderId: 'SADMIN' });
+    await handleRevokeAccess({ user: '<@CAROL>' }, makeSession());
     expect(isAdminOfAgentGroup('slack-example-labs:CAROL', 'ag-helper')).toBe(true);
     expect(notifyCalls.at(-1)?.text).toMatch(/only a global admin can revoke another admin/);
   });
 
   it('never revokes an owner', async () => {
-    const db = inboundDb();
-    insertChatInbound(db, { senderId: 'GADMIN' });
-    await handleRevokeAccess({ user: '<@OWNER>' }, makeSession(), db);
+    insertChatInbound({ senderId: 'GADMIN' });
+    await handleRevokeAccess({ user: '<@OWNER>' }, makeSession());
     expect(isOwner('slack-example-labs:OWNER')).toBe(true);
     expect(notifyCalls.at(-1)?.text).toMatch(/owner revocation must be done by direct edit/);
   });
@@ -345,7 +340,7 @@ describe('handleRevokeAccess', () => {
 describe('handleListAccess', () => {
   it('lists owners, global admins, scoped admins, members', async () => {
     addMember({ user_id: 'slack-example-labs:BOB', agent_group_id: 'ag-helper', added_by: null, added_at: now() });
-    await handleListAccess({}, makeSession(), inboundDb());
+    await handleListAccess({}, makeSession());
     const text = notifyCalls.at(-1)?.text ?? '';
     expect(text).toMatch(/Access for `ag-helper`/);
     expect(text).toMatch(/slack-example-labs:OWNER/);

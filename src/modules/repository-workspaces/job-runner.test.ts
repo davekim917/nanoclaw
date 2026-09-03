@@ -15,17 +15,33 @@ vi.mock('../../log.js', () => ({
   log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
 }));
 
+// The ack goes through the mailbox seam now (plan §4.5b) — `ackRow` opens its
+// own short `withExistingMailboxSession` instead of taking a raw handle — so
+// the session-db mock this suite used to carry moved onto the seam helper.
+// `openMailbox` is the seam of the fixture: it either yields a recording
+// session or fails the way a vanished mailbox does.
 const marks: Array<{ kind: 'delivered' | 'failed'; id: string; error?: string }> = [];
-vi.mock('../../db/session-db.js', () => ({
-  markDelivered: (_db: unknown, id: string) => marks.push({ kind: 'delivered', id }),
-  markDeliveryFailed: (_db: unknown, id: string, error?: string) => marks.push({ kind: 'failed', id, error }),
+const opened: number[] = [];
+let openMailbox: () => {
+  markDelivered: (id: string, platformMessageId: string | null) => void;
+  markDeliveryFailed: (id: string, error?: string) => void;
+};
+let mailboxExists = true;
+vi.mock('../../session-manager.js', () => ({
+  // The real helper resolves `undefined` — without running the action — when
+  // the session has no mailbox. That answer has to reach `ackRow`.
+  withExistingMailboxSession: async (_agentGroupId: string, _sessionId: string, action: (m: unknown) => unknown) =>
+    mailboxExists ? action(openMailbox()) : undefined,
 }));
 
-let openInboundDbImpl: () => { close: () => void };
-const closed: number[] = [];
-vi.mock('../../session-manager.js', () => ({
-  openInboundDb: () => openInboundDbImpl(),
-}));
+/** A mailbox that records what the ack wrote, and counts as one session opened. */
+function recordingMailbox(): ReturnType<typeof openMailbox> {
+  opened.push(1);
+  return {
+    markDelivered: (id: string) => marks.push({ kind: 'delivered', id }),
+    markDeliveryFailed: (id: string, error?: string) => marks.push({ kind: 'failed', id, error }),
+  };
+}
 
 const releaseOrphans = vi.fn(async (_msg: { kind: string }, _session: Session) => null);
 vi.mock('../../repo-fence-recovery.js', () => ({
@@ -52,10 +68,11 @@ const tick = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 0
 beforeEach(() => {
   _resetRepositoryActionsForTesting();
   marks.length = 0;
-  closed.length = 0;
+  opened.length = 0;
   releaseOrphans.mockClear();
   vi.mocked(log.error).mockReset();
-  openInboundDbImpl = () => ({ close: () => closed.push(1) });
+  openMailbox = recordingMailbox;
+  mailboxExists = true;
 });
 
 describe('runRepositoryActionDetached', () => {
@@ -99,13 +116,13 @@ describe('runRepositoryActionDetached', () => {
     expect(marks).toEqual([{ kind: 'delivered', id: content.requestId }]);
   });
 
-  it('marks the row delivered on success and closes the inbound handle it opened', async () => {
+  it('marks the row delivered on success in one mailbox session of its own', async () => {
     const id = requestId('c');
     await runRepositoryActionDetached('repository_publish', async () => {}, { requestId: id }, session);
     await _repositoryActionChainForTesting();
 
     expect(marks).toEqual([{ kind: 'delivered', id }]);
-    expect(closed).toHaveLength(1);
+    expect(opened).toHaveLength(1);
   });
 
   it('marks the row failed and releases orphaned fences when the action throws', async () => {
@@ -153,7 +170,7 @@ describe('runRepositoryActionDetached', () => {
 
   it('keeps the in-flight guard when the ack cannot be written, so the job is not re-run', async () => {
     const id = requestId('0a');
-    openInboundDbImpl = () => {
+    openMailbox = () => {
       throw new Error('session inbound database is gone');
     };
     const apply = vi.fn(async () => {});
@@ -177,7 +194,7 @@ describe('runRepositoryActionDetached', () => {
     // unhandled rejection, which is the failure class this change removes.
     const escaped = requestId('0b');
     const queued = requestId('0c');
-    openInboundDbImpl = () => {
+    openMailbox = () => {
       throw new Error('session inbound database is gone');
     };
     vi.mocked(log.error).mockImplementationOnce(() => {
@@ -185,7 +202,7 @@ describe('runRepositoryActionDetached', () => {
     });
     const escapedApply = vi.fn(async () => {});
     const queuedApply = vi.fn(async () => {
-      openInboundDbImpl = () => ({ close: () => closed.push(1) });
+      openMailbox = recordingMailbox;
     });
 
     await runRepositoryActionDetached('repository_publish', escapedApply, { requestId: escaped }, session);
@@ -200,6 +217,27 @@ describe('runRepositoryActionDetached', () => {
     await runRepositoryActionDetached('repository_publish', escapedApply, { requestId: escaped }, session);
     await _repositoryActionChainForTesting();
     expect(escapedApply).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps the in-flight guard when the session mailbox has vanished', async () => {
+    // `withExistingMailboxSession` resolving undefined is the reclaimed-session
+    // answer. It must count as an unwritten ack, exactly like a throwing open:
+    // the row stays undelivered for the next host start, and this process does
+    // not re-run a ten-minute quiescence.
+    const id = requestId('0d');
+    mailboxExists = false;
+    const apply = vi.fn(async () => {});
+
+    await runRepositoryActionDetached('repository_publish', apply, { requestId: id }, session);
+    await _repositoryActionChainForTesting();
+    expect(marks).toEqual([]);
+    expect(vi.mocked(log.error).mock.calls.at(-1)?.[0]).toBe(
+      'Repository action finished but its delivery ack could not be written',
+    );
+
+    await runRepositoryActionDetached('repository_publish', apply, { requestId: id }, session);
+    await _repositoryActionChainForTesting();
+    expect(apply).toHaveBeenCalledTimes(1);
   });
 
   it('runs an unkeyable payload inline so the delivery loop keeps owning that row', async () => {

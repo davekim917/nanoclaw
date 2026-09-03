@@ -28,7 +28,15 @@ const TEST_DIR = '/tmp/nanoclaw-test-delivery';
 
 import { initTestDb, closeDb, runMigrations, createAgentGroup, createMessagingGroup } from './db/index.js';
 import { getDeliveredIds } from './db/session-db.js';
-import { resolveSession, resolveTaskSession, outboundDbPath, inboundDbPath, openInboundDb } from './session-manager.js';
+import {
+  resolveSession,
+  resolveTaskSession,
+  outboundDbPath,
+  inboundDbPath,
+  openInboundDb,
+  withMailboxSession,
+  writeSessionMessage,
+} from './session-manager.js';
 import { getTaskThreadAnchor, setTaskThreadAnchor } from './db/task-thread-anchors.js';
 import { getDb } from './db/connection.js';
 import {
@@ -1566,9 +1574,14 @@ describe('delivery sweep gate — arming rules (A6-A12)', () => {
   });
 
   it('A18 one unreadable session does not abort the cycle for the rest', async () => {
-    // The drain now reads `delivered` for every swept session, not just ones
-    // with due rows, so a legacy/corrupt session DB has a wider blast radius
-    // than before. It must cost that session, not the whole sweep.
+    // The drain reads `delivered` for every swept session, not just ones with
+    // due rows, so a corrupt session DB has a wide blast radius. It must cost
+    // that session, not the whole sweep.
+    //
+    // The fixture is a corrupt FILE, not a dropped table: since the drain went
+    // through the mailbox seam, opening a session runs the fork's schema
+    // ensure first, so a missing `delivered` table is recreated rather than
+    // raised. Unreadable now means the bytes are not a database at all.
     createMessagingGroup({
       id: 'mg-2',
       channel_type: 'telegram',
@@ -1581,9 +1594,7 @@ describe('delivery sweep gate — arming rules (A6-A12)', () => {
     const { session: broken } = resolveSession('ag-1', 'mg-2', null, 'shared');
     const { session: healthy } = resolveSession('ag-1', 'mg-1', null, 'shared');
     insertOutbound('ag-1', healthy.id, 'out-ok');
-    const inDb = new Database(inboundDbPath('ag-1', broken.id));
-    inDb.exec('DROP TABLE delivered');
-    inDb.close();
+    fs.writeFileSync(inboundDbPath('ag-1', broken.id), 'this is not a sqlite database');
 
     const delivered: string[] = [];
     setDeliveryAdapter({
@@ -1796,5 +1807,176 @@ describe('deliverSessionMessages — deferAck system actions', () => {
     expect(ids.has('out-deferred')).toBe(false);
     expect(ids.has('out-after')).toBe(true);
     expect(outcome).toBe('pending');
+  });
+});
+
+/**
+ * Mailbox seam, PR 3 (plan §4.5b, invariants I-8 and I-9).
+ *
+ * The drain loop now reads due rows in one mailbox session, CLOSES it, invokes
+ * the handler with no session open, then opens a short session to write the
+ * ack. Two things have to stay true through that rearrangement: a handler may
+ * write to the very session it is delivering for (the `spawn_cancel` shape),
+ * and a row that carries no thread origin still posts at the channel root.
+ */
+describe('delivery through the mailbox seam', () => {
+  function insertSystemAction(sessionId: string, msgId: string, action: string): void {
+    const db = new Database(outboundDbPath('ag-1', sessionId));
+    db.prepare(
+      `INSERT INTO messages_out (id, timestamp, kind, platform_id, channel_type, content)
+       VALUES (?, datetime('now'), 'system', NULL, NULL, ?)`,
+    ).run(msgId, JSON.stringify({ action }));
+    db.close();
+  }
+
+  function deliveredStatus(sessionId: string, msgId: string): string | undefined {
+    const db = new Database(inboundDbPath('ag-1', sessionId), { readonly: true });
+    try {
+      return (
+        db.prepare('SELECT status FROM delivered WHERE message_out_id = ?').get(msgId) as { status: string } | undefined
+      )?.status;
+    } finally {
+      db.close();
+    }
+  }
+
+  function inboundHas(sessionId: string, messageId: string): boolean {
+    const db = new Database(inboundDbPath('ag-1', sessionId), { readonly: true });
+    try {
+      return db.prepare('SELECT 1 FROM messages_in WHERE id = ?').get(messageId) !== undefined;
+    } finally {
+      db.close();
+    }
+  }
+
+  /** Every warn/error the drain logged, flattened so a nesting throw cannot hide in a nested field. */
+  function loggedText(warn: ReturnType<typeof vi.spyOn>, error: ReturnType<typeof vi.spyOn>): string {
+    return [...warn.mock.calls, ...error.mock.calls]
+      .map((args) => args.map((a: unknown) => (typeof a === 'string' ? a : JSON.stringify(a, replaceErrors))).join(' '))
+      .join('\n');
+  }
+
+  function replaceErrors(_key: string, value: unknown): unknown {
+    return value instanceof Error ? `${value.name}: ${value.message}` : value;
+  }
+
+  /** System actions are only dispatched once an adapter is configured. */
+  function setNoopAdapter(): void {
+    setDeliveryAdapter({
+      async deliver() {
+        return 'plat-noop';
+      },
+    });
+  }
+
+  it('a delivery action handler that writes to its own session succeeds and the action is acked', async () => {
+    seedAgentAndChannel();
+    setNoopAdapter();
+    const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
+
+    // The handler does what `spawn_cancel` does — writes an inbound row for a
+    // session through the ordinary writer — and, on top of that, opens a
+    // mailbox session on the DELIVERING key, which is the open the loop used
+    // to be holding across the handler.
+    registerDeliveryAction(
+      'test_writes_own_session',
+      async (_content, s) => {
+        await writeSessionMessage(s.agent_group_id, s.id, {
+          id: 'handler-write-1',
+          kind: 'system',
+          timestamp: new Date().toISOString(),
+          content: JSON.stringify({ note: 'written from inside the handler' }),
+        });
+        await withMailboxSession(s.agent_group_id, s.id, (m) => m.countDueMessages());
+        return undefined;
+      },
+      unguarded('test-only action that writes to its own session'),
+    );
+
+    insertSystemAction(session.id, 'out-own-write', 'test_writes_own_session');
+
+    const warn = vi.spyOn(log, 'warn');
+    const error = vi.spyOn(log, 'error');
+    try {
+      const outcome = await deliverSessionMessages(session);
+
+      expect(loggedText(warn, error)).not.toMatch(/Nested mailbox session/);
+      expect(inboundHas(session.id, 'handler-write-1')).toBe(true);
+      expect(deliveredStatus(session.id, 'out-own-write')).toBe('delivered');
+      expect(outcome).toBe('clean');
+    } finally {
+      warn.mockRestore();
+      error.mockRestore();
+    }
+  });
+
+  it('a deferAck handler that writes to its own session leaves the delivered row to itself', async () => {
+    seedAgentAndChannel();
+    setNoopAdapter();
+    const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
+
+    registerDeliveryAction(
+      'test_writes_own_session_defer',
+      async (_content, s) => {
+        await writeSessionMessage(s.agent_group_id, s.id, {
+          id: 'handler-write-2',
+          kind: 'system',
+          timestamp: new Date().toISOString(),
+          content: JSON.stringify({ note: 'deferred handler write' }),
+        });
+        return { deferAck: true } as const;
+      },
+      unguarded('test-only deferring action that writes to its own session'),
+    );
+
+    insertSystemAction(session.id, 'out-own-write-defer', 'test_writes_own_session_defer');
+
+    const warn = vi.spyOn(log, 'warn');
+    const error = vi.spyOn(log, 'error');
+    try {
+      const outcome = await deliverSessionMessages(session);
+
+      expect(loggedText(warn, error)).not.toMatch(/Nested mailbox session/);
+      expect(inboundHas(session.id, 'handler-write-2')).toBe(true);
+      // The outer loop must not have touched `delivered` — the handler owns it.
+      expect(deliveredStatus(session.id, 'out-own-write-defer')).toBeUndefined();
+      expect(outcome).toBe('pending');
+    } finally {
+      warn.mockRestore();
+      error.mockRestore();
+    }
+  });
+
+  it('an outbound row with no thread origin is delivered top-level', async () => {
+    seedAgentAndChannel();
+    const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
+
+    // No thread_id and no in_reply_to: nothing anchors this row to a thread,
+    // so it must post at the channel root rather than being held or dropped.
+    insertOutboundKind(
+      'ag-1',
+      session.id,
+      'out-orphan',
+      'chat',
+      'telegram',
+      'telegram:123',
+      { text: 'orphan' },
+      null,
+      null,
+    );
+
+    const threadIds: Array<string | null | undefined> = [];
+    setDeliveryAdapter({
+      async deliver(_channelType, _platformId, threadId, _kind, _content) {
+        threadIds.push(threadId);
+        return 'plat-orphan';
+      },
+    });
+
+    const outcome = await deliverSessionMessages(session);
+
+    expect(threadIds).toEqual([null]);
+    expect(deliveredStatus(session.id, 'out-orphan')).toBe('delivered');
+    expect(outcome).toBe('clean');
   });
 });
