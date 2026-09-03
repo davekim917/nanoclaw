@@ -41,21 +41,17 @@ import { resolveContainerResources } from './container-resources.js';
 import { getActiveSessions, getSession, isTaskThread, updateSession } from './db/sessions.js';
 import { getAgentGroup } from './db/agent-groups.js';
 import {
-  countDueMessages,
-  getNextFutureProcessAfter,
-  deleteOrphanProcessingClaims,
-  expireStalePending,
-  getContainerState,
-  getDueWakePriority,
-  getMessageForRetry,
-  getProcessingClaims,
-  insertDeferredMessageWithContextIfNew,
-  markMessageFailed,
-  openInboundDb as openInboundDbByPath,
-  readSessionRouting,
-  syncProcessingAcks,
-  type ContainerState,
-} from './db/session-db.js';
+  SessionDbMissingError,
+  sessionMailboxPath,
+  type ForkContainerStateRow as ContainerState,
+  type NanoclawMailboxSession,
+} from './modules/mailbox/index.js';
+import { withExistingNanoclawSession } from './modules/mailbox/session.js';
+// The scheduled-move recovery below walks an INJECTED sessions root, not
+// DATA_DIR, so its session DBs are not addressable by a mailbox key and it
+// cannot go through the seam. It stays on the module's own open funnel — the
+// one place in this file that still opens a session DB by path.
+import { openInboundDb as openInboundDbByPath } from './modules/mailbox/openers.js';
 import { restoreTaskRow, type TaskRowSnapshot } from './modules/scheduling/db.js';
 import { countLiveRowsInSessions } from './modules/scheduling/live-count.js';
 import { runHostGatedTaskScripts } from './modules/scheduling/host-script.js';
@@ -63,14 +59,9 @@ import { purgeIntentBody } from './dashboard/api/scheduled-shared.js';
 import { advanceThreadClosures, syncDoneProposalMirror } from './dashboard/thread-close.js';
 import { log } from './log.js';
 import {
-  openInboundDb,
-  openOutboundDb,
-  openOutboundDbRw,
-  inboundDbPath,
-  outboundDbPath,
   heartbeatPath,
+  sessionDir,
   sessionsBaseDir,
-  writeOutboundDirect,
   writeSessionMessage,
   admitDueTaskContexts,
   deferMessageForFreshContextRetry,
@@ -111,15 +102,11 @@ import { sweepOrphanedRepoIngressFences } from './repo-fence-recovery.js';
 const oomKillObserver = new OomKillObserver();
 
 /**
- * SQLite TIMESTAMP columns store UTC without a timezone marker. Date.parse
- * treats timezoneless ISO strings as local time, so on non-UTC hosts every
- * timestamp looks (TZ offset) hours stale — leading to spurious kill-claim
- * decisions on freshly-claimed messages. Append "Z" when no zone marker is
- * present so Date.parse interprets the string as UTC.
+ * Session-DB timestamp parsing now lives with the mailbox module that owns
+ * those columns; re-exported here so existing importers are unchanged.
  */
-export function parseSqliteUtc(s: string): number {
-  return Date.parse(/[zZ]|[+-]\d{2}:?\d{2}$/.test(s) ? s : s + 'Z');
-}
+export { parseSqliteUtc } from './modules/mailbox/sqlite-utc.js';
+import { parseSqliteUtc } from './modules/mailbox/sqlite-utc.js';
 
 export const SWEEP_INTERVAL_MS = 60_000;
 
@@ -254,9 +241,41 @@ export function decideStuckAction(args: {
 // resets that counter in the runner without deleting the saved task.
 // ─────────────────────────────────────────────────────────────────────────────
 
-export const WORK_CONTINUATION_RESUME_MAX_ATTEMPTS = 2;
 export const CONTINUATION_WAKE_MIN_INTERVAL_MS = 10 * 60 * 1000;
-const WORK_CONTINUATION_TASK_MAX_CHARS = 500;
+
+/**
+ * The durable work-continuation record and its SQL live in the mailbox module
+ * (`src/modules/mailbox/ops/continuation.ts`) — the sweep owns the throttle
+ * and the cap, not the storage. Re-exported unchanged so `host-restart-warn`
+ * and the existing tests keep their import path and signatures.
+ */
+export {
+  canAttemptContinuationRecovery,
+  incrementWorkContinuationResumeAttempt,
+  migrateLegacyWorkContinuationForRecovery,
+  readContinuationRecoveryAttemptAt,
+  readWorkContinuation,
+  restoreWorkContinuationResumeAttempt,
+  WORK_CONTINUATION_RESUME_MAX_ATTEMPTS,
+  type HostWorkContinuation,
+} from './modules/mailbox/ops/continuation.js';
+import {
+  canAttemptContinuationRecovery,
+  readWorkContinuation,
+  WORK_CONTINUATION_RESUME_MAX_ATTEMPTS,
+  type HostWorkContinuation,
+} from './modules/mailbox/ops/continuation.js';
+
+/** Test-only predicate over an injected outbound DB handle. */
+export function _hasWorkContinuationForTesting(db: Database.Database): boolean {
+  return readWorkContinuation(db) !== null;
+}
+
+/**
+ * The deferred recovery-wake rows the sweep parks when a budget is spent.
+ * SQL in the mailbox module; re-exported unchanged for the existing tests.
+ */
+export { hasDueRecoveryWake, parkDueRecoveryWakes } from './modules/mailbox/ops/recovery.js';
 
 /** Throttle gate: wake only when the last spawn/recovery attempt is old. */
 export function decideContinuationWake(args: {
@@ -269,261 +288,47 @@ export function decideContinuationWake(args: {
   return args.now - lastAttemptAtMs >= CONTINUATION_WAKE_MIN_INTERVAL_MS;
 }
 
-export interface HostWorkContinuation {
-  id: string;
-  task: string;
-  source_message_id?: string;
-  phase: 'queued' | 'running';
-  chain: number;
-  runner_id?: string;
-  resume_attempts: number;
-  recovery_episode: number;
-}
-
-export function canAttemptContinuationRecovery(continuation: HostWorkContinuation): boolean {
-  return continuation.resume_attempts < WORK_CONTINUATION_RESUME_MAX_ATTEMPTS;
-}
-
-export function readWorkContinuation(outDb: Database.Database): HostWorkContinuation | null {
-  try {
-    const row = outDb.prepare("SELECT value FROM session_state WHERE key = 'work_continuation'").get() as
-      | { value: string }
-      | undefined;
-    if (row) {
-      const parsed = JSON.parse(row.value) as Partial<HostWorkContinuation>;
-      if (
-        typeof parsed.id !== 'string' ||
-        parsed.id === '' ||
-        typeof parsed.task !== 'string' ||
-        parsed.task.trim() === '' ||
-        parsed.task.length > WORK_CONTINUATION_TASK_MAX_CHARS ||
-        (parsed.phase !== 'queued' && parsed.phase !== 'running') ||
-        !Number.isSafeInteger(parsed.chain) ||
-        (parsed.chain ?? -1) < 0 ||
-        !Number.isSafeInteger(parsed.resume_attempts) ||
-        (parsed.resume_attempts ?? -1) < 0 ||
-        (parsed.recovery_episode !== undefined &&
-          (!Number.isSafeInteger(parsed.recovery_episode) || parsed.recovery_episode < 0)) ||
-        (parsed.runner_id !== undefined && (typeof parsed.runner_id !== 'string' || parsed.runner_id === ''))
-      ) {
-        return null;
-      }
-      return {
-        id: parsed.id,
-        task: parsed.task.trim(),
-        ...(typeof parsed.source_message_id === 'string' &&
-        parsed.source_message_id.length > 0 &&
-        parsed.source_message_id.length <= 1024
-          ? { source_message_id: parsed.source_message_id }
-          : {}),
-        phase: parsed.phase,
-        chain: parsed.chain as number,
-        ...(parsed.runner_id ? { runner_id: parsed.runner_id } : {}),
-        resume_attempts: parsed.resume_attempts as number,
-        recovery_episode: parsed.recovery_episode ?? 0,
-      };
-    }
-
-    // Rollout compatibility: the fresh runner owns migration/deletion because
-    // the host normally opens outbound.db read-only. A valid legacy promise is
-    // sufficient to wake once; the runner converts it before executing.
-    const legacy = outDb.prepare("SELECT value FROM session_state WHERE key = 'pending_next'").get() as
-      | { value: string }
-      | undefined;
-    if (!legacy) return null;
-    const parsed = JSON.parse(legacy.value) as { task?: unknown; chain?: unknown };
-    if (
-      typeof parsed.task !== 'string' ||
-      parsed.task.trim() === '' ||
-      parsed.task.length > WORK_CONTINUATION_TASK_MAX_CHARS
-    ) {
-      return null;
-    }
-    return {
-      id: 'legacy-pending-next',
-      task: parsed.task.trim(),
-      phase: 'queued',
-      chain: Number.isSafeInteger(parsed.chain) && (parsed.chain as number) >= 0 ? (parsed.chain as number) : 0,
-      resume_attempts: 0,
-      recovery_episode: 0,
-    };
-  } catch {
-    return null;
-  }
-}
-
 /**
- * Durable throttle timestamp for an already-attempted recovery. The active
- * container registry is cleared on exit, but session_state survives the
- * crash, so a fast-failing replacement cannot be respawned every sweep tick.
+ * Consume one recovery attempt for a STOPPED session's saved continuation.
+ *
+ * Its own short mailbox session: the caller must not be holding one for this
+ * key (invariant I-3), and the write only ever runs with the container
+ * confirmed stopped, which is what makes a host write to the container-owned
+ * outbound.db safe.
  */
-export function readContinuationRecoveryAttemptAt(
-  outDb: Database.Database,
-  continuation: HostWorkContinuation,
-): number {
-  if (continuation.id === 'legacy-pending-next' || continuation.resume_attempts === 0) return 0;
-  try {
-    const row = outDb.prepare("SELECT updated_at FROM session_state WHERE key = 'work_continuation'").get() as
-      | { updated_at: string }
-      | undefined;
-    if (!row) return 0;
-    const parsed = parseSqliteUtc(row.updated_at);
-    return Number.isFinite(parsed) ? parsed : 0;
-  } catch {
-    return 0;
-  }
-}
-
-/** Test-only re-export with an injected outbound DB handle. */
-export function _hasWorkContinuationForTesting(outDb: Database.Database): boolean {
-  return readWorkContinuation(outDb) !== null;
-}
-
-export function incrementWorkContinuationResumeAttempt(
-  outDb: Database.Database,
+async function incrementStoppedContinuationAttempt(
+  session: Session,
   expectedId: string,
-): HostWorkContinuation | null {
-  return outDb.transaction(() => {
-    const current = readWorkContinuation(outDb);
-    if (
-      !current ||
-      current.id !== expectedId ||
-      current.id === 'legacy-pending-next' ||
-      current.resume_attempts >= WORK_CONTINUATION_RESUME_MAX_ATTEMPTS
-    ) {
-      return null;
-    }
-    // The stopped-container host is authorizing one fresh runner to consume
-    // this recovery attempt. Clear the prior runner claim so the container can
-    // distinguish this authorized start from a capped attempt that has already
-    // run and is merely hitchhiking on an unrelated wake.
-    const updated: HostWorkContinuation = {
-      ...current,
-      phase: 'queued',
-      resume_attempts: current.resume_attempts + 1,
-    };
-    delete updated.runner_id;
-    outDb
-      .prepare("UPDATE session_state SET value = ?, updated_at = ? WHERE key = 'work_continuation'")
-      .run(JSON.stringify(updated), new Date().toISOString());
-    return updated;
-  })();
-}
-
-export function migrateLegacyWorkContinuationForRecovery(outDb: Database.Database): HostWorkContinuation | null {
-  return outDb.transaction(() => {
-    const legacy = readWorkContinuation(outDb);
-    if (!legacy || legacy.id !== 'legacy-pending-next') return null;
-    const migrated: HostWorkContinuation = {
-      ...legacy,
-      id: randomUUID(),
-      resume_attempts: 1,
-    };
-    outDb
-      .prepare(
-        `INSERT INTO session_state (key, value, updated_at) VALUES ('work_continuation', ?, ?)
-         ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`,
-      )
-      .run(JSON.stringify(migrated), new Date().toISOString());
-    outDb.prepare("DELETE FROM session_state WHERE key = 'pending_next'").run();
-    return migrated;
-  })();
-}
-
-function incrementStoppedContinuationAttempt(session: Session, expectedId: string): HostWorkContinuation | null {
-  let db: Database.Database | null = null;
+): Promise<HostWorkContinuation | null> {
   try {
-    db = openOutboundDbRw(session.agent_group_id, session.id);
-    if (expectedId !== 'legacy-pending-next') return incrementWorkContinuationResumeAttempt(db, expectedId);
-    return migrateLegacyWorkContinuationForRecovery(db);
+    const result = await withExistingNanoclawSession(session.agent_group_id, session.id, (mailbox) =>
+      expectedId !== 'legacy-pending-next'
+        ? mailbox.incrementWorkContinuationResumeAttempt(expectedId)
+        : mailbox.migrateLegacyWorkContinuationForRecovery(),
+    );
+    return result ?? null;
   } catch (err) {
     log.warn('Failed to increment continuation recovery attempt', { sessionId: session.id, err });
     return null;
-  } finally {
-    db?.close();
   }
 }
 
-export function restoreWorkContinuationResumeAttempt(
-  outDb: Database.Database,
-  attempted: HostWorkContinuation,
-  previous: HostWorkContinuation,
-): HostWorkContinuation | null {
-  return outDb.transaction(() => {
-    const current = readWorkContinuation(outDb);
-    if (
-      !current ||
-      current.id !== attempted.id ||
-      current.resume_attempts !== attempted.resume_attempts ||
-      previous.resume_attempts !== attempted.resume_attempts - 1
-    ) {
-      return null;
-    }
-    if (previous.id === 'legacy-pending-next') {
-      outDb.prepare("DELETE FROM session_state WHERE key = 'work_continuation'").run();
-      outDb
-        .prepare(
-          `INSERT INTO session_state (key, value, updated_at) VALUES ('pending_next', ?, ?)
-           ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`,
-        )
-        .run(JSON.stringify({ task: previous.task, chain: previous.chain }), new Date().toISOString());
-      return previous;
-    }
-    const restored = { ...previous };
-    outDb
-      .prepare("UPDATE session_state SET value = ?, updated_at = ? WHERE key = 'work_continuation'")
-      .run(JSON.stringify(restored), new Date().toISOString());
-    return restored;
-  })();
-}
-
-function restoreStoppedContinuationAttempt(
+async function restoreStoppedContinuationAttempt(
   session: Session,
   attempted: HostWorkContinuation,
   previous: HostWorkContinuation,
-): void {
-  let db: Database.Database | null = null;
+): Promise<void> {
   try {
-    db = openOutboundDbRw(session.agent_group_id, session.id);
-    restoreWorkContinuationResumeAttempt(db, attempted, previous);
+    await withExistingNanoclawSession(session.agent_group_id, session.id, (mailbox) =>
+      mailbox.restoreWorkContinuationResumeAttempt(attempted, previous),
+    );
   } catch (err) {
     log.warn('Failed to restore continuation recovery attempt after rejected wake', { sessionId: session.id, err });
-  } finally {
-    db?.close();
   }
 }
 
-export function hasDueRecoveryWake(inDb: Database.Database, nowIso: string): boolean {
-  return Boolean(
-    inDb
-      .prepare(
-        `SELECT 1 FROM messages_in
-         WHERE status = 'pending'
-           AND trigger = 1
-           AND (process_after IS NULL OR datetime(process_after) <= datetime(?))
-           AND (id LIKE 'ceiling-respawn-%' OR id LIKE 'host-restart-%' OR id LIKE 'provider-heal-%')
-         LIMIT 1`,
-      )
-      .get(nowIso),
-  );
-}
-
-export function parkDueRecoveryWakes(inDb: Database.Database, nowIso: string): number {
-  return inDb
-    .prepare(
-      `UPDATE messages_in
-       SET status = 'completed'
-       WHERE status = 'pending'
-         AND trigger = 1
-         AND (process_after IS NULL OR datetime(process_after) <= datetime(?))
-         AND (id LIKE 'ceiling-respawn-%' OR id LIKE 'host-restart-%' OR id LIKE 'provider-heal-%')`,
-    )
-    .run(nowIso).changes;
-}
-
 export function notifyContinuationParked(
-  inDb: Database.Database,
-  outDb: Database.Database,
+  mailbox: NanoclawMailboxSession,
   session: Session,
   continuation: HostWorkContinuation,
   writeMessage: (message: {
@@ -533,18 +338,15 @@ export function notifyContinuationParked(
     channelType: string | null;
     threadId: string | null;
     content: string;
-  }) => void = (message) => writeOutboundDirect(session.agent_group_id, session.id, message),
+  }) => void = (message) => mailbox.writeOutboundDirect(message),
 ): boolean {
   const marker = `continuation_recovery_parked:${continuation.id}:${continuation.recovery_episode}`;
-  if (outDb.prepare('SELECT 1 FROM messages_out WHERE content LIKE ? LIMIT 1').get(`%${marker}%`)) return false;
+  if (mailbox.outboundHasContentLike(marker)) return false;
   const sourceRouting = continuation.source_message_id
-    ? (inDb
-        .prepare('SELECT channel_type, platform_id, thread_id FROM messages_in WHERE id = ?')
-        .get(continuation.source_message_id) as
-        | { channel_type: string | null; platform_id: string | null; thread_id: string | null }
-        | undefined)
+    ? mailbox.readMessageRouting(continuation.source_message_id)
     : undefined;
-  const routing = sourceRouting?.channel_type && sourceRouting.platform_id ? sourceRouting : readSessionRouting(inDb);
+  const routing =
+    sourceRouting?.channel_type && sourceRouting.platform_id ? sourceRouting : mailbox.readSessionRouting();
   if (!routing) return false;
   writeMessage({
     id: `continuation-parked-${continuation.id}-${continuation.recovery_episode}`,
@@ -607,35 +409,8 @@ export function decideCeilingFollowUp(args: {
 
 const CEILING_RESPAWN_ID_PREFIX = 'ceiling-respawn-';
 
-/**
- * How many self-heal marker rows carrying `idPrefix` were written since the
- * last genuine (non-system) inbound message. Real user input is what resets a
- * recovery budget, so the cap is expressed against it rather than a wall clock.
- */
-function countRecoveryAttemptsSinceRealInbound(inDb: Database.Database, idPrefix: string): number {
-  const row = inDb
-    .prepare(
-      `SELECT COUNT(*) AS count FROM messages_in
-       WHERE id LIKE ?
-         AND datetime(timestamp) > COALESCE((
-           SELECT MAX(datetime(timestamp)) FROM messages_in
-           WHERE kind != 'system'
-             AND COALESCE(
-               json_extract(CASE WHEN json_valid(content) THEN content ELSE '{}' END, '$.senderId'),
-               ''
-             ) != 'system'
-             AND COALESCE(
-               json_extract(CASE WHEN json_valid(content) THEN content ELSE '{}' END, '$.sender'),
-               ''
-             ) != 'system'
-         ), datetime('0001-01-01T00:00:00.000Z'))`,
-    )
-    .get(`${idPrefix}%`) as { count: number };
-  return row.count;
-}
-
-export function countToolRecoveryAttemptsSinceRealInbound(inDb: Database.Database): number {
-  return countRecoveryAttemptsSinceRealInbound(inDb, `${CEILING_RESPAWN_ID_PREFIX}tool-`);
+export function countToolRecoveryAttemptsSinceRealInbound(mailbox: NanoclawMailboxSession): number {
+  return mailbox.countRecoveryAttemptsSinceRealInbound(`${CEILING_RESPAWN_ID_PREFIX}tool-`);
 }
 
 /**
@@ -644,7 +419,7 @@ export function countToolRecoveryAttemptsSinceRealInbound(inDb: Database.Databas
  * per-class attempt caps count, so every self-heal action goes through here.
  */
 function writeSystemWake(
-  inDb: Database.Database,
+  mailbox: NanoclawMailboxSession,
   session: Session,
   id: string,
   text: string,
@@ -656,7 +431,7 @@ function writeSystemWake(
    */
   onWake: 0 | 1 = 1,
 ): boolean {
-  return insertDeferredMessageWithContextIfNew(inDb, {
+  return mailbox.insertDeferredMessageWithContextIfNew({
     id,
     kind: 'chat',
     timestamp: new Date().toISOString(),
@@ -671,7 +446,7 @@ function writeSystemWake(
 }
 
 function writeCeilingRespawn(
-  inDb: Database.Database,
+  mailbox: NanoclawMailboxSession,
   session: Session,
   reason: 'continuation' | 'tool',
   recoveryKey: string,
@@ -698,7 +473,7 @@ function writeCeilingRespawn(
     `In-container background tasks, sleeps, and /tmp do not survive a restart; before going idle with ` +
     `work in flight, checkpoint to a durable path and call continue_work, or use wait for a real time delay. ` +
     `If nothing was in flight, say so in one line.${savedWork}`;
-  writeSystemWake(inDb, session, `${CEILING_RESPAWN_ID_PREFIX}${recoveryKey}`, text, {
+  writeSystemWake(mailbox, session, `${CEILING_RESPAWN_ID_PREFIX}${recoveryKey}`, text, {
     kind: 'agent_ceiling_respawn',
     reason,
     heartbeat_age_ms: heartbeatAgeMs,
@@ -707,14 +482,14 @@ function writeCeilingRespawn(
 
 /** The follow-up half of the kill-ceiling branch, driven only by durable work state or a fresh tool start. */
 function applyCeilingFollowUp(
-  inDb: Database.Database,
+  mailbox: NanoclawMailboxSession,
   session: Session,
   containerState: ContainerState | null,
   workContinuation: HostWorkContinuation | null,
   heartbeatAgeMs: number,
   ceilingMs: number = ABSOLUTE_CEILING_MS,
 ): CeilingFollowUp {
-  const priorToolAttempts = countToolRecoveryAttemptsSinceRealInbound(inDb);
+  const priorToolAttempts = countToolRecoveryAttemptsSinceRealInbound(mailbox);
   const followUp = decideCeilingFollowUp({
     hasContinuation: workContinuation !== null && canAttemptContinuationRecovery(workContinuation),
     currentTool: containerState?.current_tool ?? null,
@@ -746,21 +521,21 @@ function applyCeilingFollowUp(
     followUp.reason === 'continuation'
       ? `continuation-${workContinuation!.id}-${workContinuation!.recovery_episode}-${workContinuation!.resume_attempts}`
       : `tool-${encodeURIComponent(containerState?.tool_started_at ?? 'unknown')}`;
-  writeCeilingRespawn(inDb, session, followUp.reason, recoveryKey, heartbeatAgeMs, workContinuation, ceilingMs);
+  writeCeilingRespawn(mailbox, session, followUp.reason, recoveryKey, heartbeatAgeMs, workContinuation, ceilingMs);
   log.info('Queued ceiling-kill accountability wake', { sessionId: session.id, reason: followUp.reason });
   return followUp;
 }
 
 /** Test-only re-export with injected session-DB handles. */
 export function _applyCeilingFollowUpForTesting(
-  inDb: Database.Database,
+  mailbox: NanoclawMailboxSession,
   session: Session,
   containerState: ContainerState | null,
   workContinuation: HostWorkContinuation | null,
   heartbeatAgeMs: number,
   ceilingMs: number = ABSOLUTE_CEILING_MS,
 ): CeilingFollowUp {
-  return applyCeilingFollowUp(inDb, session, containerState, workContinuation, heartbeatAgeMs, ceilingMs);
+  return applyCeilingFollowUp(mailbox, session, containerState, workContinuation, heartbeatAgeMs, ceilingMs);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -821,26 +596,21 @@ export function observeProviderStatus(sessionId: string, providerStatus: string 
   return ticks;
 }
 
-export function countProviderHealAttemptsSinceRealInbound(inDb: Database.Database): number {
-  return countRecoveryAttemptsSinceRealInbound(inDb, PROVIDER_HEAL_ID_PREFIX);
+export function countProviderHealAttemptsSinceRealInbound(mailbox: NanoclawMailboxSession): number {
+  return mailbox.countRecoveryAttemptsSinceRealInbound(PROVIDER_HEAL_ID_PREFIX);
 }
 
 /** Age of the newest provider-heal marker row, or null when there is none. */
-export function providerHealLastAttemptAgeMs(inDb: Database.Database, now: number): number | null {
-  const row = inDb
-    .prepare('SELECT MAX(timestamp) AS ts FROM messages_in WHERE id LIKE ?')
-    .get(`${PROVIDER_HEAL_ID_PREFIX}%`) as { ts: string | null } | undefined;
-  if (!row?.ts) return null;
-  const at = parseSqliteUtc(row.ts);
+export function providerHealLastAttemptAgeMs(mailbox: NanoclawMailboxSession, now: number): number | null {
+  const ts = mailbox.latestRecoveryMarkerTimestamp(PROVIDER_HEAL_ID_PREFIX);
+  if (!ts) return null;
+  const at = parseSqliteUtc(ts);
   return Number.isFinite(at) ? Math.max(0, now - at) : null;
 }
 
 /** Newest provider-heal marker id — the per-episode idempotency key for the parked notice. */
-function providerHealLastAttemptId(inDb: Database.Database): string | null {
-  const row = inDb
-    .prepare('SELECT MAX(id) AS id FROM messages_in WHERE id LIKE ?')
-    .get(`${PROVIDER_HEAL_ID_PREFIX}%`) as { id: string | null } | undefined;
-  return row?.id ?? null;
+function providerHealLastAttemptId(mailbox: NanoclawMailboxSession): string | null {
+  return mailbox.latestRecoveryMarkerId(PROVIDER_HEAL_ID_PREFIX);
 }
 
 /**
@@ -850,7 +620,7 @@ function providerHealLastAttemptId(inDb: Database.Database): string | null {
  * container's first poll, so the dying one cannot steal it.
  */
 function applyProviderHeal(
-  inDb: Database.Database,
+  mailbox: NanoclawMailboxSession,
   session: Session,
   agentGroupFolder: string,
   containerState: ContainerState | null,
@@ -880,7 +650,7 @@ function applyProviderHeal(
   const routedNote =
     routedTo && primaryProvider && routedTo !== primaryProvider ? `; this session is now running on ${routedTo}` : '';
   writeSystemWake(
-    inDb,
+    mailbox,
     session,
     `${PROVIDER_HEAL_ID_PREFIX}${Date.now()}`,
     `[system] Your previous container was restarted because its provider reported a hard failure` +
@@ -898,6 +668,19 @@ function applyProviderHeal(
     routedTo,
     failureReason,
   });
+}
+
+/**
+ * The kill half of a provider heal.
+ *
+ * Split out of `applyProviderHeal` so it can run with NO mailbox session open.
+ * `killContainer`'s `onExit` respawns the session, and its status-cleanup hop
+ * through `delivery.ts` opens a session of its own — both on THIS key. Running
+ * either from inside a session would trip the same-key nesting guard
+ * (invariant I-3); the wake row is already durable by the time we get here,
+ * which is the ordering the heal has always relied on.
+ */
+function killForProviderHeal(session: Session): void {
   killContainer(session.id, 'provider-failed-selfheal', () => {
     const fresh = getSession(session.id);
     if (fresh) void wakeContainer(fresh);
@@ -911,8 +694,7 @@ function applyProviderHeal(
  * resets the whole budget.
  */
 export function notifyProviderHealParked(
-  inDb: Database.Database,
-  outDb: Database.Database,
+  mailbox: NanoclawMailboxSession,
   session: Session,
   failureReason: string | null,
   writeMessage: (message: {
@@ -922,12 +704,12 @@ export function notifyProviderHealParked(
     channelType: string | null;
     threadId: string | null;
     content: string;
-  }) => void = (message) => writeOutboundDirect(session.agent_group_id, session.id, message),
+  }) => void = (message) => mailbox.writeOutboundDirect(message),
 ): boolean {
-  const episode = providerHealLastAttemptId(inDb) ?? 'unknown';
+  const episode = providerHealLastAttemptId(mailbox) ?? 'unknown';
   const marker = `provider_heal_parked:${episode}`;
-  if (outDb.prepare('SELECT 1 FROM messages_out WHERE content LIKE ? LIMIT 1').get(`%${marker}%`)) return false;
-  const routing = readSessionRouting(inDb);
+  if (mailbox.outboundHasContentLike(marker)) return false;
+  const routing = mailbox.readSessionRouting();
   if (!routing) return false;
   writeMessage({
     id: `provider-heal-parked-${episode}`,
@@ -946,22 +728,43 @@ export function notifyProviderHealParked(
 }
 
 /**
+ * Run one short mailbox session for a session id.
+ *
+ * Threaded through the sweep duties that must OPEN AND CLOSE a session around
+ * a `killContainer` call rather than hold one across it (invariant I-3):
+ * a kill respawns through `onExit` and clears the session's status through
+ * `delivery.ts`, and both of those open a mailbox session on this same key.
+ * Production passes `withExistingNanoclawSession`; a test passes a runner over
+ * its own in-memory handles.
+ *
+ * Resolves `undefined` when the mailbox is gone — the read-path contract.
+ */
+export type SessionRunner = <T>(action: (mailbox: NanoclawMailboxSession) => T | Promise<T>) => Promise<T | undefined>;
+
+/**
  * Detection + action for one alive session. Always advances the debounce;
  * acts only when NANOCLAW_SELF_HEAL is armed. Returns true when the container
  * was killed, so the caller skips the reap/SLA checks for this tick.
+ *
+ * `containerState` is read by the caller (it needs it for the reap decisions
+ * too); everything else this needs is read inside its own short session, and
+ * every kill happens between two of them.
  */
-function sweepProviderHeal(
-  inDb: Database.Database,
-  outDb: Database.Database,
+async function sweepProviderHeal(
+  run: SessionRunner,
   session: Session,
   agentGroupFolder: string,
   containerState: ContainerState | null,
-  writeParkedMessage?: Parameters<typeof notifyProviderHealParked>[4],
-): boolean {
+  writeParkedMessage?: Parameters<typeof notifyProviderHealParked>[3],
+): Promise<boolean> {
   const providerStatus = containerState?.provider_status ?? null;
   const consecutiveFailedTicks = observeProviderStatus(session.id, providerStatus);
-  const priorAttempts = countProviderHealAttemptsSinceRealInbound(inDb);
-  const msSinceLastAttempt = providerHealLastAttemptAgeMs(inDb, Date.now());
+  const budget = await run((mailbox) => ({
+    priorAttempts: countProviderHealAttemptsSinceRealInbound(mailbox),
+    msSinceLastAttempt: providerHealLastAttemptAgeMs(mailbox, Date.now()),
+  }));
+  if (!budget) return false;
+  const { priorAttempts, msSinceLastAttempt } = budget;
   const decision = decideProviderHeal({
     alive: true,
     providerStatus,
@@ -995,12 +798,8 @@ function sweepProviderHeal(
     log.warn('self-heal: provider heal budget exhausted — parking', bounds);
     killContainer(session.id, 'provider-failed-selfheal-parked');
     try {
-      notifyProviderHealParked(
-        inDb,
-        outDb,
-        session,
-        containerState?.provider_failure_reason ?? null,
-        writeParkedMessage,
+      await run((mailbox) =>
+        notifyProviderHealParked(mailbox, session, containerState?.provider_failure_reason ?? null, writeParkedMessage),
       );
     } catch (err) {
       log.warn('self-heal: parked notice failed', { sessionId: session.id, err });
@@ -1008,20 +807,32 @@ function sweepProviderHeal(
     return true;
   }
 
-  applyProviderHeal(inDb, session, agentGroupFolder, containerState);
+  // Wake row first (durably counted even if the kill fizzles), session closed,
+  // then the kill and its respawn.
+  const wrote = await run((mailbox) => {
+    applyProviderHeal(mailbox, session, agentGroupFolder, containerState);
+    return true;
+  });
+  if (!wrote) return false;
+  killForProviderHeal(session);
   return true;
 }
 
-/** Test-only re-export with injected session-DB handles. */
+/** Test-only entry point over an injected session. */
 export function _sweepProviderHealForTesting(
-  inDb: Database.Database,
-  outDb: Database.Database,
+  mailbox: NanoclawMailboxSession,
   session: Session,
   agentGroupFolder: string,
   containerState: ContainerState | null,
-  writeParkedMessage?: Parameters<typeof notifyProviderHealParked>[4],
-): boolean {
-  return sweepProviderHeal(inDb, outDb, session, agentGroupFolder, containerState, writeParkedMessage);
+  writeParkedMessage?: Parameters<typeof notifyProviderHealParked>[3],
+): Promise<boolean> {
+  return sweepProviderHeal(
+    async (action) => action(mailbox),
+    session,
+    agentGroupFolder,
+    containerState,
+    writeParkedMessage,
+  );
 }
 
 /** Test-only: clear the module-level two-tick debounce between cases. */
@@ -1242,7 +1053,7 @@ async function sweepOnce(): Promise<void> {
   // fetched — no extra DB query. Isolated so a rollup failure never blocks
   // the rest of the tick.
   try {
-    sweepUsageRollup(sessions);
+    await sweepUsageRollup(sessions);
   } catch (err) {
     log.warn('Usage rollup sweep step failed', { err });
   }
@@ -1378,49 +1189,53 @@ export function shouldReapIdleChatContainer(
 }
 
 /** Most recent messages_in timestamp for a session, or null if it has none. */
-function getLastInboundAtMs(inDb: Database.Database): number | null {
-  const row = inDb.prepare('SELECT timestamp FROM messages_in ORDER BY seq DESC LIMIT 1').get() as
-    | { timestamp: string }
-    | undefined;
-  if (!row) return null;
-  const ms = Date.parse(row.timestamp);
+function getLastInboundAtMs(mailbox: NanoclawMailboxSession): number | null {
+  const timestamp = mailbox.latestInboundTimestamp();
+  if (timestamp === null) return null;
+  const ms = Date.parse(timestamp);
   return Number.isFinite(ms) ? ms : null;
 }
 
 /** Most recent messages_out timestamp for a session, or null if it has never produced output. */
-function getLastOutboundAtMs(outDb: Database.Database): number | null {
-  const row = outDb.prepare('SELECT timestamp FROM messages_out ORDER BY seq DESC LIMIT 1').get() as
-    | { timestamp: string }
-    | undefined;
-  if (!row) return null;
-  const ms = parseSqliteUtc(row.timestamp);
+function getLastOutboundAtMs(mailbox: NanoclawMailboxSession): number | null {
+  const timestamp = mailbox.latestOutboundTimestamp();
+  if (timestamp === null) return null;
+  const ms = parseSqliteUtc(timestamp);
   return Number.isNaN(ms) ? null : ms;
 }
 
 async function prepareDueWake(
-  inDb: Database.Database,
+  mailbox: NanoclawMailboxSession,
   agentGroupId: string,
   sessionId: string,
 ): Promise<{ admittedTasks: number; dueCount: number; wakePriority: 'interactive' | 'scheduled' }> {
   // Fleet-hardening Phase 1.1: run any opted-in (scriptHost) pre-task scripts
   // on the host BEFORE admission, so a gated/errored fire never becomes due
   // and never spawns a container. See host-script.ts's runHostGatedTaskScripts.
-  await runHostGatedTaskScripts(inDb, sessionId);
-  const admittedTasks = admitDueTaskContexts(inDb, agentGroupId, sessionId);
-  const dueCount = countDueMessages(inDb);
+  //
+  // Both helpers still take a raw handle and live in files this PR must not
+  // touch (`modules/scheduling/host-script.ts` belongs to PR 3,
+  // `session-manager.ts` to PR 4). Handing them this session's own handle
+  // keeps the admission seam on ONE open — reopening inbound.db beside a live
+  // session would be worse, not cleaner. Both move behind the seam with their
+  // own PRs; `legacyInboundHandle` is what keeps host-sweep.ts on the
+  // raw-access allowlist until they do.
+  await runHostGatedTaskScripts(mailbox.legacyInboundHandle(), sessionId);
+  const admittedTasks = admitDueTaskContexts(mailbox.legacyInboundHandle(), agentGroupId, sessionId);
+  const dueCount = mailbox.countDueMessages();
   return {
     admittedTasks,
     dueCount,
-    wakePriority: dueCount > 0 ? getDueWakePriority(inDb) : 'interactive',
+    wakePriority: dueCount > 0 ? mailbox.getDueWakePriority() : 'interactive',
   };
 }
 
 export async function _prepareDueWakeForTesting(
-  inDb: Database.Database,
+  mailbox: NanoclawMailboxSession,
   agentGroupId: string,
   sessionId: string,
 ): Promise<{ admittedTasks: number; dueCount: number; wakePriority: 'interactive' | 'scheduled' }> {
-  return prepareDueWake(inDb, agentGroupId, sessionId);
+  return prepareDueWake(mailbox, agentGroupId, sessionId);
 }
 
 // ─── Scheduled-move recovery + audit-body prune (D3 / D4) ─────────────────────
@@ -1693,148 +1508,174 @@ async function sweepSession(session: Session): Promise<number | null> {
   const agentGroup = getAgentGroup(session.agent_group_id);
   if (!agentGroup) return skipUnreadable(session.id, 'agent group missing');
 
-  const inPath = inboundDbPath(agentGroup.id, session.id);
-  if (!fs.existsSync(inPath)) return skipUnreadable(session.id, 'no inbound.db');
+  // Every duty below runs inside one of these — a short session, opened and
+  // closed, never held across a wake or a kill (invariant I-3). Reads never
+  // provision (invariant I-4): a session whose mailbox is gone resolves
+  // undefined and is counted as unreadable rather than silently recreated.
+  const run: SessionRunner = (action) => withExistingNanoclawSession(agentGroup.id, session.id, action);
 
-  let inDb: Database.Database;
-  let outDb: Database.Database | null = null;
-  try {
-    inDb = openInboundDb(agentGroup.id, session.id);
-  } catch (err) {
-    return skipUnreadable(session.id, `inbound.db unreadable: ${String(err)}`);
+  interface WakePlan {
+    dueCount: number;
+    wakePriority: 'interactive' | 'scheduled';
+    admittedTasks: number;
+    workContinuation: HostWorkContinuation | null;
+    continuationWakeEligible: boolean;
   }
 
+  let plan: WakePlan | undefined;
   try {
-    outDb = openOutboundDb(agentGroup.id, session.id);
-  } catch {
-    // outbound.db might not exist yet (container hasn't started)
-  }
+    plan = await run(async (mailbox): Promise<WakePlan> => {
+      // 1. Sync processing_ack → messages_in status
+      mailbox.syncProcessingAcks();
 
-  try {
-    // 1. Sync processing_ack → messages_in status
-    if (outDb) {
-      syncProcessingAcks(inDb, outDb);
-    }
+      // 1a. Expire long-pending rows so sweep stops re-waking sessions on
+      // messages that have been sitting unprocessed past the age cutoff.
+      const expired = mailbox.expireStalePending(PENDING_MESSAGE_MAX_AGE_MS);
+      if (expired > 0) {
+        log.info('Expired stale pending messages', {
+          sessionId: session.id,
+          count: expired,
+          maxAgeMs: PENDING_MESSAGE_MAX_AGE_MS,
+        });
+      }
 
-    // 1a. Expire long-pending rows so sweep stops re-waking sessions on
-    // messages that have been sitting unprocessed past the age cutoff.
-    const expired = expireStalePending(inDb, PENDING_MESSAGE_MAX_AGE_MS);
-    if (expired > 0) {
-      log.info('Expired stale pending messages', {
-        sessionId: session.id,
-        count: expired,
-        maxAgeMs: PENDING_MESSAGE_MAX_AGE_MS,
-      });
-    }
+      // 2. A stopped container with processing claims crashed mid-turn. Defer
+      // the paired input first, while it is still inert-able, and clear the
+      // orphan claim before any due-count or wake decision can expose its stale
+      // recall to a replacement/warm poller. When backoff elapses, the admission
+      // seam below replaces that recall from current host state.
+      if (!isContainerRunning(session.id) && mailbox.getProcessingClaimRows().length > 0) {
+        resetStuckProcessingRows(mailbox, session, 'container not running');
+      }
 
-    // 2. A stopped container with processing claims crashed mid-turn. Defer
-    // the paired input first, while it is still inert-able, and clear the
-    // orphan claim before any due-count or wake decision can expose its stale
-    // recall to a replacement/warm poller. When backoff elapses, the admission
-    // seam below replaces that recall from current host state.
-    if (!isContainerRunning(session.id) && outDb && getProcessingClaims(outDb).length > 0) {
-      resetStuckProcessingRows(inDb, outDb, session, 'container not running');
-    }
+      // 3. Admit due scheduled occurrences and lifecycle wakes with fresh
+      // recall/capabilities
+      // immediately before they become wakeable. Task rows stay trigger=0 from
+      // creation through this point; paired lifecycle wakes stay trigger=0 throughout
+      // backoff. A warm poller cannot race ahead of either context pair, and a
+      // repeated sweep is idempotent.
+      const preparedWake = await prepareDueWake(mailbox, agentGroup.id, session.id);
+      const { admittedTasks } = preparedWake;
+      let { dueCount, wakePriority } = preparedWake;
+      if (admittedTasks > 0) {
+        log.debug('Admitted due turns with fresh context', {
+          sessionId: session.id,
+          count: admittedTasks,
+        });
+      }
 
-    // 3. Admit due scheduled occurrences and lifecycle wakes with fresh
-    // recall/capabilities
-    // immediately before they become wakeable. Task rows stay trigger=0 from
-    // creation through this point; paired lifecycle wakes stay trigger=0 throughout
-    // backoff. A warm poller cannot race ahead of either context pair, and a
-    // repeated sweep is idempotent.
-    const preparedWake = await prepareDueWake(inDb, agentGroup.id, session.id);
-    const { admittedTasks } = preparedWake;
-    let { dueCount, wakePriority } = preparedWake;
-    if (admittedTasks > 0) {
-      log.debug('Admitted due turns with fresh context', {
-        sessionId: session.id,
-        count: admittedTasks,
-      });
-    }
+      // 4. Durable continuation state is a wake source, but its automatic crash
+      // recovery is both throttled and hard-capped per continuation id.
+      const workContinuation = mailbox.readWorkContinuation();
 
-    // 4. Wake a container if work is due and nothing is running. Durable
-    // continuation state is also a wake source, but its automatic crash
-    // recovery is both throttled and hard-capped per continuation id.
-    let justWoke = false;
-    const workContinuation = outDb ? readWorkContinuation(outDb) : null;
-
-    // Mirror the container's own `propose_done` record onto the central
-    // `sessions` row so the Observatory list can show "proposes closing"
-    // without opening a per-session SQLite file per row. Free here — the
-    // handle is already open and it is one SELECT — and deliberately NOT the
-    // copy the close path trusts (see thread-close.ts). Isolated: a mirror
-    // failure must never cost this session its sweep.
-    if (outDb) {
+      // Mirror the container's own `propose_done` record onto the central
+      // `sessions` row so the Observatory list can show "proposes closing"
+      // without opening a per-session SQLite file per row. Free here — the
+      // handle is already open and it is one SELECT — and deliberately NOT the
+      // copy the close path trusts (see thread-close.ts). Isolated: a mirror
+      // failure must never cost this session its sweep.
+      //
+      // Still a raw-handle callee: `dashboard/thread-close.ts` moves behind the
+      // seam in PR 3, and this line becomes `syncDoneProposalMirror(session.id)`
+      // then. It only reads.
       try {
-        syncDoneProposalMirror(session.id, outDb);
+        syncDoneProposalMirror(session.id, mailbox.legacyOutboundHandle());
       } catch (err) {
         log.warn('done_proposal mirror failed', { sessionId: session.id, err });
       }
-    }
-    if (
-      !isContainerRunning(session.id) &&
-      workContinuation &&
-      workContinuation.resume_attempts >= WORK_CONTINUATION_RESUME_MAX_ATTEMPTS
-    ) {
-      const parked = parkDueRecoveryWakes(inDb, new Date().toISOString());
-      if (parked > 0) {
-        dueCount = countDueMessages(inDb);
-        wakePriority = dueCount > 0 ? getDueWakePriority(inDb) : 'interactive';
-      }
-      if (dueCount === 0) notifyContinuationParked(inDb, outDb!, session, workContinuation);
-    }
-    // Every stopped-session wake must pass through continuation recovery
-    // admission, even when an unrelated scheduled row is already due. The
-    // runner retains its prior owner claim until this path clears it, so a
-    // scheduled wake cannot make saved work bypass the throttle or cap.
-    const continuationWakeEligible =
-      outDb !== null &&
-      !isContainerRunning(session.id) &&
-      workContinuation !== null &&
-      canAttemptContinuationRecovery(workContinuation) &&
-      decideContinuationWake({
-        now: Date.now(),
-        spawnedAtMs: getContainerSpawnedAt(session.id),
-        lastRecoveryAttemptAtMs: readContinuationRecoveryAttemptAt(outDb!, workContinuation),
-      });
-    const resumedContinuation = continuationWakeEligible
-      ? incrementStoppedContinuationAttempt(session, workContinuation!.id)
-      : null;
-    const continuationWake = resumedContinuation !== null;
-    if ((dueCount > 0 || continuationWake) && !isContainerRunning(session.id)) {
-      log.info('Waking container for due messages', {
-        sessionId: session.id,
-        count: dueCount,
-        priority: wakePriority,
-        continuationId: resumedContinuation?.id,
-      });
-      // wakeContainer never throws — transient spawn failures (OneCLI down,
-      // etc.) return false and leave messages pending for the next tick.
-      // Classification is passed into the atomic admission decision so a
-      // scheduled wake can never reserve memory as interactive first.
-      const woke = await wakeContainer(session, wakePriority);
-      justWoke = woke;
-      if (!woke && resumedContinuation) {
-        restoreStoppedContinuationAttempt(session, resumedContinuation, workContinuation!);
-      }
-    }
 
-    const alive = isContainerRunning(session.id);
+      if (
+        !isContainerRunning(session.id) &&
+        workContinuation &&
+        workContinuation.resume_attempts >= WORK_CONTINUATION_RESUME_MAX_ATTEMPTS
+      ) {
+        const parked = mailbox.parkDueRecoveryWakes(new Date().toISOString());
+        if (parked > 0) {
+          dueCount = mailbox.countDueMessages();
+          wakePriority = dueCount > 0 ? mailbox.getDueWakePriority() : 'interactive';
+        }
+        if (dueCount === 0) notifyContinuationParked(mailbox, session, workContinuation);
+      }
 
-    // 5. Running-container SLA: absolute ceiling + per-claim stuck rules.
-    // Skip on the same iteration that just woke the container — it hasn't
-    // had a chance to clear stale processing_ack rows from a previous crash
-    // yet. Without this grace period, stale claims cause an immediate
-    // spawn-kill loop.
-    if (alive && outDb && !justWoke) {
-      const containerState = getContainerState(outDb);
-      const processingClaimCount = getProcessingClaims(outDb).length;
-      // 5a. Failed-provider self-heal. Runs first: a container whose provider
+      // Every stopped-session wake must pass through continuation recovery
+      // admission, even when an unrelated scheduled row is already due. The
+      // runner retains its prior owner claim until this path clears it, so a
+      // scheduled wake cannot make saved work bypass the throttle or cap.
+      const continuationWakeEligible =
+        !isContainerRunning(session.id) &&
+        workContinuation !== null &&
+        canAttemptContinuationRecovery(workContinuation) &&
+        decideContinuationWake({
+          now: Date.now(),
+          spawnedAtMs: getContainerSpawnedAt(session.id),
+          lastRecoveryAttemptAtMs: mailbox.readContinuationRecoveryAttemptAt(workContinuation),
+        });
+
+      return { dueCount, wakePriority, admittedTasks, workContinuation, continuationWakeEligible };
+    });
+  } catch (err) {
+    if (err instanceof SessionDbMissingError) return skipUnreadable(session.id, 'session mailbox vanished');
+    return skipUnreadable(session.id, `session mailbox unreadable: ${String(err)}`);
+  }
+  // The seam is the ONLY gate on "does this session have a mailbox". There is
+  // deliberately no `fs.existsSync` pre-check beside it: two answers to that
+  // question drift, and the one that matters is the implementation's own.
+  // `exists()` covers BOTH mailbox files, so an inbound.db with no outbound.db
+  // beside it reads as half-provisioned — unreadable, not quiet — and a
+  // reclaimed session is never re-created by a read (invariant I-4).
+  if (!plan) return skipUnreadable(session.id, 'no session mailbox');
+
+  const { admittedTasks, dueCount, wakePriority, workContinuation } = plan;
+
+  // 5. Wake a container if work is due and nothing is running. Deliberately
+  // OUTSIDE any mailbox session: the spawn path reads this session's
+  // repository ingress fence through a session of its own, and the recovery
+  // admission below writes through one too (invariant I-3).
+  let justWoke = false;
+  const resumedContinuation = plan.continuationWakeEligible
+    ? await incrementStoppedContinuationAttempt(session, workContinuation!.id)
+    : null;
+  const continuationWake = resumedContinuation !== null;
+  if ((dueCount > 0 || continuationWake) && !isContainerRunning(session.id)) {
+    log.info('Waking container for due messages', {
+      sessionId: session.id,
+      count: dueCount,
+      priority: wakePriority,
+      continuationId: resumedContinuation?.id,
+    });
+    // wakeContainer never throws — transient spawn failures (OneCLI down,
+    // etc.) return false and leave messages pending for the next tick.
+    // Classification is passed into the atomic admission decision so a
+    // scheduled wake can never reserve memory as interactive first.
+    const woke = await wakeContainer(session, wakePriority);
+    justWoke = woke;
+    if (!woke && resumedContinuation) {
+      await restoreStoppedContinuationAttempt(session, resumedContinuation, workContinuation!);
+    }
+  }
+
+  const alive = isContainerRunning(session.id);
+
+  // 6. Running-container SLA: absolute ceiling + per-claim stuck rules.
+  // Skip on the same iteration that just woke the container — it hasn't
+  // had a chance to clear stale processing_ack rows from a previous crash
+  // yet. Without this grace period, stale claims cause an immediate
+  // spawn-kill loop.
+  if (alive && !justWoke) {
+    const observed = await run((mailbox) => ({
+      containerState: mailbox.getContainerState(),
+      processingClaimCount: mailbox.getProcessingClaimRows().length,
+      lastOutboundAtMs: getLastOutboundAtMs(mailbox),
+      lastInboundAtMs: getLastInboundAtMs(mailbox),
+    }));
+    if (observed) {
+      const { containerState, processingClaimCount } = observed;
+      // 6a. Failed-provider self-heal. Runs first: a container whose provider
       // has given up is not idle and not merely stuck, and healing it beats
       // both reaping it as idle and waiting out the 30-minute ceiling. Returns
       // true only when it killed the container, in which case the reap/SLA
       // checks below have nothing left to decide this tick.
-      if (sweepProviderHeal(inDb, outDb, session, agentGroup.folder, containerState)) {
+      if (await sweepProviderHeal(run, session, agentGroup.folder, containerState)) {
         log.debug('Provider self-heal handled this tick — skipping reap/SLA checks', { sessionId: session.id });
       } else if (
         shouldReapIdleTaskContainer(
@@ -1853,8 +1694,8 @@ async function sweepSession(session: Session): Promise<number | null> {
           dueCount,
           processingClaimCount,
           workContinuation !== null,
-          getLastOutboundAtMs(outDb),
-          getLastInboundAtMs(inDb),
+          observed.lastOutboundAtMs,
+          observed.lastInboundAtMs,
           Date.now(),
         )
       ) {
@@ -1865,39 +1706,38 @@ async function sweepSession(session: Session): Promise<number | null> {
         });
         killContainer(session.id, 'chat-idle-reap');
       } else {
-        enforceRunningContainerSla(inDb, outDb, session, agentGroup.id, agentGroup.folder);
+        await enforceRunningContainerSla(run, session, agentGroup.id, agentGroup.folder);
       }
     }
+  }
 
-    // 6. Retry cleanup if the pre-wake orphan-claim clear could not finish.
+  // A container that is gone cannot be mid-failure. Clearing here stops a
+  // fresh container from inheriting the dead one's half-finished debounce and
+  // being killed on its first 'failed' observation.
+  if (!alive) providerFailedTicks.delete(session.id);
+
+  const tail = await run(async (mailbox) => {
+    // 7. Retry cleanup if the pre-wake orphan-claim clear could not finish.
     // resetStuckProcessingRows is idempotent: future retries are not bumped
     // again, and already-cleared claim sets are a no-op.
-    if (!alive && outDb) {
-      resetStuckProcessingRows(inDb, outDb, session, 'container not running');
-    }
-    // A container that is gone cannot be mid-failure. Clearing here stops a
-    // fresh container from inheriting the dead one's half-finished debounce and
-    // being killed on its first 'failed' observation.
-    if (!alive) providerFailedTicks.delete(session.id);
+    if (!alive) resetStuckProcessingRows(mailbox, session, 'container not running');
 
-    // 7. Recurrence fanout for completed recurring tasks.
+    // 8. Recurrence fanout for completed recurring tasks.
     // MODULE-HOOK:scheduling-recurrence:start
+    // Still a raw-handle callee: `modules/scheduling/recurrence.ts` moves
+    // behind the seam in PR 3.
     const { handleRecurrence } = await import('./modules/scheduling/recurrence.js');
-    await handleRecurrence(inDb, session);
+    await handleRecurrence(mailbox.legacyInboundHandle(), session);
     // MODULE-HOOK:scheduling-recurrence:end
 
-    // 8. GC spent task sessions. An isolated per-task session with no live task
+    // 9. GC spent task sessions. An isolated per-task session with no live task
     // rows left (one-shot fired, or all cancelled/deleted) and no container
     // running is dead — close it so it stops being swept and listed. Runs after
     // recurrence so a just-fired recurring series has already re-armed its next
     // pending row and is never collected. The per-task log file in the workspace
     // is the durable history and survives the close.
     if (isTaskThread(session.thread_id)) {
-      const liveTasks = (
-        inDb
-          .prepare("SELECT COUNT(*) AS c FROM messages_in WHERE kind = 'task' AND status IN ('pending', 'paused')")
-          .get() as { c: number }
-      ).c;
+      const liveTasks = mailbox.countLiveTasks();
       if (shouldCloseTaskSession(session.thread_id, isContainerRunning(session.id), liveTasks)) {
         updateSession(session.id, { status: 'closed' });
         log.info('Closed spent task session', { sessionId: session.id, threadId: session.thread_id });
@@ -1909,16 +1749,19 @@ async function sweepSession(session: Session): Promise<number | null> {
     // due (never past it) or the backoff cap. New inbound invalidates via
     // last_active in the sweep loop.
     if (dueCount === 0 && admittedTasks === 0 && !justWoke && workContinuation === null && !alive) {
-      const nextDue = getNextFutureProcessAfter(inDb);
+      const nextDue = mailbox.getNextFutureProcessAfter();
       const cap = Date.now() + QUIET_SESSION_BACKOFF_MS;
       const nextDueMs = nextDue ? Date.parse(nextDue) : Number.POSITIVE_INFINITY;
       return Math.min(Number.isFinite(nextDueMs) ? nextDueMs : cap, cap);
     }
     return null;
-  } finally {
-    inDb.close();
-    outDb?.close();
-  }
+  });
+  return tail ?? null;
+}
+
+/** Test-only entry point for one session's sweep tick. */
+export function _sweepSessionForTesting(session: Session): Promise<number | null> {
+  return sweepSession(session);
 }
 
 // ── Usage rollup (fleet-hardening Phase 0.1) ──
@@ -1937,10 +1780,10 @@ export function shouldSkipUsageRollup(cachedMtimeMs: number | undefined, current
   return cachedMtimeMs === currentMtimeMs;
 }
 
-function sweepUsageRollup(sessions: Session[]): void {
+async function sweepUsageRollup(sessions: Session[]): Promise<void> {
   for (const session of sessions) {
     try {
-      const outPath = outboundDbPath(session.agent_group_id, session.id);
+      const outPath = sessionMailboxPath({ agentGroupId: session.agent_group_id, sessionId: session.id }, 'outbound');
       let mtimeMs: number;
       try {
         mtimeMs = fs.statSync(outPath).mtimeMs;
@@ -1949,12 +1792,16 @@ function sweepUsageRollup(sessions: Session[]): void {
       }
       if (shouldSkipUsageRollup(usageRollupMtimeCache.get(session.id), mtimeMs)) continue;
 
-      const outDb = openOutboundDb(session.agent_group_id, session.id);
-      try {
-        rollupSessionUsage(outDb, session.agent_group_id, `${session.agent_group_id}/${session.id}`);
-      } finally {
-        outDb.close();
-      }
+      // `rollupSessionUsage` still takes a raw outbound handle (`db/usage.ts`
+      // has no PR in this series yet); it only reads. Handing it this
+      // session's own handle keeps the rollup on one open.
+      await withExistingNanoclawSession(session.agent_group_id, session.id, (mailbox) =>
+        rollupSessionUsage(
+          mailbox.legacyOutboundHandle(),
+          session.agent_group_id,
+          `${session.agent_group_id}/${session.id}`,
+        ),
+      );
       usageRollupMtimeCache.set(session.id, mtimeMs);
     } catch (err) {
       log.warn('Usage rollup failed for session', { err, sessionId: session.id });
@@ -2177,22 +2024,36 @@ function activeOperationTimeoutMs(state: ContainerState | null): number | null {
   return typeof state.tool_declared_timeout_ms === 'number' ? state.tool_declared_timeout_ms : null;
 }
 
-function enforceRunningContainerSla(
-  inDb: Database.Database,
-  outDb: Database.Database,
+async function enforceRunningContainerSla(
+  run: SessionRunner,
   session: Session,
   agentGroupId: string,
   agentGroupFolder: string,
-): void {
-  const containerState = getContainerState(outDb);
-  reportContainerOomTelemetry(inDb, session, agentGroupFolder, containerState);
-  const decision = decideStuckAction({
-    now: Date.now(),
-    heartbeatMtimeMs: heartbeatMtimeMs(agentGroupId, session.id),
-    containerState,
-    claims: getProcessingClaims(outDb),
-    spawnedAtMs: getContainerSpawnedAt(session.id),
+): Promise<void> {
+  // Read + OOM notice in one session, so the decision and the telemetry row
+  // see the same snapshot. The kill below then runs with nothing open.
+  const observed = await run((mailbox) => {
+    const containerState = mailbox.getContainerState();
+    reportContainerOomTelemetry(mailbox, session, agentGroupFolder, containerState);
+    const decision = decideStuckAction({
+      now: Date.now(),
+      heartbeatMtimeMs: heartbeatMtimeMs(agentGroupId, session.id),
+      containerState,
+      claims: mailbox.getProcessingClaimRows(),
+      spawnedAtMs: getContainerSpawnedAt(session.id),
+    });
+    // Snapshot BEFORE the kill so the notify helper has the pre-kill state —
+    // resetStuckProcessingRows clears the claims, so a read afterward would
+    // always be empty.
+    return {
+      containerState,
+      decision,
+      pendingClaims: decision.action === 'kill-ceiling' ? mailbox.getProcessingClaimRows().length : 0,
+      workContinuation: decision.action === 'kill-ceiling' ? mailbox.readWorkContinuation() : null,
+    };
   });
+  if (!observed) return;
+  const { containerState, decision, pendingClaims, workContinuation } = observed;
 
   if (decision.action === 'ok') return;
 
@@ -2202,36 +2063,33 @@ function enforceRunningContainerSla(
       heartbeatAgeMs: decision.heartbeatAgeMs,
       ceilingMs: decision.ceilingMs,
     });
-    // Snapshot claims BEFORE kill so the notify helper has the pre-kill
-    // state — resetStuckProcessingRows clears the claims, so a read
-    // afterward would always be empty.
-    const pendingClaims = getProcessingClaims(outDb).length;
-    const workContinuation = readWorkContinuation(outDb);
     killContainer(session.id, 'absolute-ceiling');
-    // Posted AFTER kill to honor the outbound.db single-writer invariant
-    // (session-db.ts:openOutboundDbWritable). The helper itself gates on
-    // `pendingClaims === 0` (no user was waiting) to avoid spamming
-    // restart notices on quiet sessions that just naturally reached the
-    // 30-min idle ceiling.
-    notifyKillCeiling(inDb, outDb, session, decision.heartbeatAgeMs, pendingClaims, undefined, containerState);
-    resetStuckProcessingRows(inDb, outDb, session, 'absolute-ceiling');
-    // Accountability wake: if the kill plausibly interrupted parked work,
-    // queue an on_wake row so the session respawns (next sweep tick's
-    // due-wake step) and answers for the interruption instead of staying
-    // dead until the next human ping. Best-effort — a failure here must
-    // not break the sweep's kill path.
-    try {
-      applyCeilingFollowUp(
-        inDb,
-        session,
-        containerState,
-        workContinuation,
-        decision.heartbeatAgeMs,
-        decision.ceilingMs,
-      );
-    } catch (err) {
-      log.warn('ceiling-kill follow-up failed', { sessionId: session.id, err });
-    }
+    // Posted AFTER kill to honor the outbound.db single-writer invariant; the
+    // module opens the writable outbound handle lazily, only for this write.
+    // notifyKillCeiling itself gates on `pendingClaims === 0` (no user was
+    // waiting) to avoid spamming restart notices on quiet sessions that just
+    // naturally reached the 30-min idle ceiling.
+    await run((mailbox) => {
+      notifyKillCeiling(mailbox, session, decision.heartbeatAgeMs, pendingClaims, containerState);
+      resetStuckProcessingRows(mailbox, session, 'absolute-ceiling');
+      // Accountability wake: if the kill plausibly interrupted parked work,
+      // queue an on_wake row so the session respawns (next sweep tick's
+      // due-wake step) and answers for the interruption instead of staying
+      // dead until the next human ping. Best-effort — a failure here must
+      // not break the sweep's kill path.
+      try {
+        applyCeilingFollowUp(
+          mailbox,
+          session,
+          containerState,
+          workContinuation,
+          decision.heartbeatAgeMs,
+          decision.ceilingMs,
+        );
+      } catch (err) {
+        log.warn('ceiling-kill follow-up failed', { sessionId: session.id, err });
+      }
+    });
     return;
   }
 
@@ -2242,7 +2100,7 @@ function enforceRunningContainerSla(
     toleranceMs: decision.toleranceMs,
   });
   killContainer(session.id, 'claim-stuck');
-  resetStuckProcessingRows(inDb, outDb, session, 'claim-stuck');
+  await run((mailbox) => resetStuckProcessingRows(mailbox, session, 'claim-stuck'));
 }
 
 /**
@@ -2262,7 +2120,7 @@ function enforceRunningContainerSla(
  * message or the next turn.
  */
 function reportContainerOomTelemetry(
-  inDb: Database.Database,
+  mailbox: NanoclawMailboxSession,
   session: Session,
   agentGroupFolder: string,
   state: ContainerState | null,
@@ -2308,7 +2166,7 @@ function reportContainerOomTelemetry(
   if (decision.notifyKills) {
     const plural = decision.killCount === 1 ? 'process' : 'processes';
     writeSystemWake(
-      inDb,
+      mailbox,
       session,
       `oom-kill-${spawnedAtMs}-${decision.killCount}`,
       `[system] The Linux kernel has killed ${decision.killCount} ${plural} inside this container for exceeding ` +
@@ -2335,7 +2193,7 @@ function reportContainerOomTelemetry(
       cgroupMaxMb,
     });
     writeSystemWake(
-      inDb,
+      mailbox,
       session,
       `oom-pressure-${spawnedAtMs}`,
       `[system] This container has hit ${limitText} ${decision.pressureCount} times and had to reclaim memory to ` +
@@ -2351,12 +2209,11 @@ function reportContainerOomTelemetry(
 export { reportContainerOomTelemetry as _reportContainerOomTelemetryForTesting };
 
 export function _resetStuckProcessingRowsForTesting(
-  inDb: Database.Database,
-  outDb: Database.Database,
+  mailbox: NanoclawMailboxSession,
   session: Session,
   reason: string,
 ): void {
-  resetStuckProcessingRows(inDb, outDb, session, reason, outDb);
+  resetStuckProcessingRows(mailbox, session, reason);
 }
 
 export { sweepTaskWatchdog as _sweepTaskWatchdogForTesting };
@@ -2374,17 +2231,16 @@ export { sweepTaskWatchdog as _sweepTaskWatchdogForTesting };
  *      operator across every quiet session every half hour.
  *   3. Duplicate notice in the last 60s (racing sweep tick).
  *
- * The optional `writableOutDb` parameter mirrors `resetStuckProcessingRows`:
- * tests pass an in-memory writable handle; production omits it and the
- * function opens a fresh writable handle by path via writeOutboundDirect.
+ * The write goes through the mailbox session's own writable outbound handle,
+ * which the module opens lazily — so a tick that never reaches this branch
+ * never opens outbound.db for writing at all, and the earlier
+ * `writableOutDb` test seam is gone with it.
  */
 export function notifyKillCeiling(
-  inDb: Database.Database,
-  outDb: Database.Database,
+  mailbox: NanoclawMailboxSession,
   session: Session,
   heartbeatAgeMs: number,
   pendingClaims: number,
-  writableOutDb?: Database.Database,
   containerState?: ContainerState | null,
 ): void {
   try {
@@ -2394,7 +2250,7 @@ export function notifyKillCeiling(
       });
       return;
     }
-    const routing = readSessionRouting(inDb);
+    const routing = mailbox.readSessionRouting();
     if (!routing) {
       log.debug('kill-ceiling notify skipped — no session_routing', {
         sessionId: session.id,
@@ -2405,11 +2261,7 @@ export function notifyKillCeiling(
     // last 60s (e.g. a sweep raced and re-fired), skip the duplicate. The
     // check is by content marker rather than a dedicated column to avoid
     // a schema migration. Cheap query against an already-open handle.
-    const recent = outDb
-      .prepare(
-        "SELECT 1 FROM messages_out WHERE datetime(timestamp) > datetime('now', '-60 seconds') AND content LIKE '%agent_restart_inactivity%' LIMIT 1",
-      )
-      .get();
+    const recent = mailbox.outboundHasRecentContentLike('agent_restart_inactivity', 60);
     if (recent) {
       log.debug('kill-ceiling notify skipped — duplicate within 60s', {
         sessionId: session.id,
@@ -2446,66 +2298,36 @@ export function notifyKillCeiling(
         provider_failure_reason: failureReason,
       },
     });
-    if (writableOutDb) {
-      writableOutDb
-        .prepare(
-          `INSERT OR IGNORE INTO messages_out (id, seq, timestamp, kind, platform_id, channel_type, thread_id, content)
-           VALUES (?, (SELECT COALESCE(MAX(seq), 0) + 2 FROM messages_out), ?, ?, ?, ?, ?, ?)`,
-        )
-        .run(
-          id,
-          new Date().toISOString(),
-          'chat',
-          routing.platform_id,
-          routing.channel_type,
-          routing.thread_id,
-          content,
-        );
-    } else {
-      writeOutboundDirect(session.agent_group_id, session.id, {
-        id,
-        kind: 'chat',
-        platformId: routing.platform_id,
-        channelType: routing.channel_type,
-        threadId: routing.thread_id,
-        content,
-      });
-    }
+    mailbox.writeOutboundDirect({
+      id,
+      kind: 'chat',
+      platformId: routing.platform_id,
+      channelType: routing.channel_type,
+      threadId: routing.thread_id,
+      content,
+    });
   } catch (err) {
     log.warn('kill-ceiling notify failed', { sessionId: session.id, err });
   }
 }
 
-/** Test-only re-export with an injected writable outbound DB handle. */
+/** Test-only alias kept so the existing suite's call sites read unchanged. */
 export function _notifyKillCeilingForTesting(
-  inDb: Database.Database,
-  outDb: Database.Database,
+  mailbox: NanoclawMailboxSession,
   session: Session,
   heartbeatAgeMs: number,
   pendingClaims: number,
   containerState?: ContainerState | null,
 ): void {
-  notifyKillCeiling(inDb, outDb, session, heartbeatAgeMs, pendingClaims, outDb, containerState);
+  notifyKillCeiling(mailbox, session, heartbeatAgeMs, pendingClaims, containerState);
 }
 
-function resetStuckProcessingRows(
-  inDb: Database.Database,
-  outDb: Database.Database,
-  session: Session,
-  reason: string,
-  writableOutDb?: Database.Database,
-): void {
-  const claims = getProcessingClaims(outDb);
-  // Progress rows are not answers. Match the container-side pending-message
-  // query so an interrupted turn that emitted only status updates is retried.
-  const respondedStmt = outDb.prepare("SELECT 1 FROM messages_out WHERE in_reply_to = ? AND kind != 'status' LIMIT 1");
-  const markCompletedInboundStmt = inDb.prepare(
-    "UPDATE messages_in SET status = 'completed' WHERE id = ? AND status = 'pending'",
-  );
+function resetStuckProcessingRows(mailbox: NanoclawMailboxSession, session: Session, reason: string): void {
+  const claims = mailbox.getProcessingClaimRows();
   const now = Date.now();
 
   for (const { message_id } of claims) {
-    const msg = getMessageForRetry(inDb, message_id, 'pending');
+    const msg = mailbox.getMessageForRetry(message_id, 'pending');
     if (!msg) continue;
 
     // Idempotency guard: if this input already has a response in
@@ -2519,9 +2341,9 @@ function resetStuckProcessingRows(
     // won't re-dispatch an already-answered input. Writing to outbound.db
     // here would violate the one-writer invariant (host reads outbound,
     // container writes) and the readonly handle would throw.
-    const responded = respondedStmt.get(msg.id);
+    const responded = mailbox.hasNonStatusReplyTo(msg.id);
     if (responded) {
-      markCompletedInboundStmt.run(msg.id);
+      mailbox.markInboundCompletedIfPending(msg.id);
       log.info('Reset skipped — response already written; marking completed', {
         messageId: msg.id,
         sessionId: session.id,
@@ -2536,7 +2358,7 @@ function resetStuckProcessingRows(
     if (msg.processAfter && parseSqliteUtc(msg.processAfter) > now) continue;
 
     if (msg.tries >= MAX_TRIES) {
-      markMessageFailed(inDb, msg.id);
+      mailbox.markMessageFailed(msg.id);
       log.warn('Message marked as failed after max retries', {
         messageId: msg.id,
         sessionId: session.id,
@@ -2545,7 +2367,7 @@ function resetStuckProcessingRows(
     } else {
       const backoffMs = BACKOFF_BASE_MS * Math.pow(2, msg.tries);
       const backoffSec = Math.floor(backoffMs / 1000);
-      deferMessageForFreshContextRetry(inDb, msg.id, backoffSec);
+      deferMessageForFreshContextRetry(mailbox.legacyInboundHandle(), msg.id, backoffSec);
       log.info('Reset stale message with backoff', {
         messageId: msg.id,
         tries: msg.tries,
@@ -2559,17 +2381,12 @@ function resetStuckProcessingRows(
   // would re-read them, see the old status_changed timestamp, conclude the
   // freshly respawned container is stuck, and SIGKILL it before its
   // agent-runner has a chance to run clearStaleProcessingAcks() on startup.
-  const ownsDb = !writableOutDb;
-  let useDb: Database.Database | null = writableOutDb ?? null;
   try {
-    if (!useDb) useDb = openOutboundDbRw(session.agent_group_id, session.id);
-    const cleared = deleteOrphanProcessingClaims(useDb);
+    const cleared = mailbox.deleteOrphanProcessingClaims();
     if (cleared > 0) {
       log.info('Cleared orphan processing claims', { sessionId: session.id, cleared, reason });
     }
   } catch (err) {
     log.warn('Failed to clear orphan processing claims', { sessionId: session.id, err });
-  } finally {
-    if (ownsDb) useDb?.close();
   }
 }

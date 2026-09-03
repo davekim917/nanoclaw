@@ -86,8 +86,52 @@ import {
   type ContainerState as ForkContainerState,
   type ProcessingClaim,
 } from './ops/sweep.js';
+import {
+  canAttemptContinuationRecovery,
+  incrementWorkContinuationResumeAttempt,
+  migrateLegacyWorkContinuationForRecovery,
+  readContinuationRecoveryAttemptAt,
+  readWorkContinuation,
+  restoreWorkContinuationResumeAttempt,
+  WORK_CONTINUATION_RESUME_MAX_ATTEMPTS,
+  type HostWorkContinuation,
+} from './ops/continuation.js';
+import {
+  countRecoveryAttemptsSinceRealInbound,
+  hasDueRecoveryWake,
+  hasNonStatusReplyTo,
+  latestInboundTimestamp,
+  latestOutboundTimestamp,
+  latestRecoveryMarkerId,
+  latestRecoveryMarkerTimestamp,
+  markInboundCompletedIfPending,
+  outboundHasContentLike,
+  outboundHasRecentContentLike,
+  parkDueRecoveryWakes,
+  readMessageRouting,
+  writeOutboundDirectRow,
+  type DirectOutboundRow,
+  type InboundMessageRouting,
+} from './ops/recovery.js';
 
 export { SessionDbMissingError } from './openers.js';
+export { parseSqliteUtc } from './sqlite-utc.js';
+export {
+  canAttemptContinuationRecovery,
+  WORK_CONTINUATION_RESUME_MAX_ATTEMPTS,
+  type HostWorkContinuation,
+} from './ops/continuation.js';
+export type { DirectOutboundRow, InboundMessageRouting } from './ops/recovery.js';
+export { INTERACTIVE_WAKE_MAX_AGE_MS, type ContainerState as ForkContainerStateRow } from './ops/sweep.js';
+
+/**
+ * The session directory layout, for callers that only need a PATH.
+ *
+ * Re-exported from upstream's `sqlite/paths.ts` so no fork file has to reach
+ * into the driver directory (and so the layout has one definition). A caller
+ * that wants the DATA there opens a mailbox session instead.
+ */
+export { sessionMailboxDir, sessionMailboxPath } from '../../mailbox/sqlite/paths.js';
 
 /**
  * `(mtime, size)` of a session's outbound.db for the delivery sweep's quiet
@@ -207,6 +251,53 @@ export interface NanoclawMailboxSession extends MailboxSession {
   admitRepoIngressFenceMessage(epoch: string, messageId: string): RepoIngressAdmissionResult;
   releaseRepoIngressFence(epoch: string, generation: string): RepoIngressReleaseResult;
   readRepositoryMountBarrierAck(): string | null;
+
+  // --- fork-only work continuation (outbound session_state) ---------------
+  readWorkContinuation(): HostWorkContinuation | null;
+  readContinuationRecoveryAttemptAt(continuation: HostWorkContinuation): number;
+  /** Writes outbound: opens the writable handle. Only valid with the container stopped. */
+  incrementWorkContinuationResumeAttempt(expectedId: string): HostWorkContinuation | null;
+  migrateLegacyWorkContinuationForRecovery(): HostWorkContinuation | null;
+  restoreWorkContinuationResumeAttempt(
+    attempted: HostWorkContinuation,
+    previous: HostWorkContinuation,
+  ): HostWorkContinuation | null;
+
+  // --- fork-only self-heal accountability ---------------------------------
+  hasDueRecoveryWake(nowIso: string): boolean;
+  parkDueRecoveryWakes(nowIso: string): number;
+  countRecoveryAttemptsSinceRealInbound(idPrefix: string): number;
+  latestRecoveryMarkerTimestamp(idPrefix: string): string | null;
+  latestRecoveryMarkerId(idPrefix: string): string | null;
+  readMessageRouting(messageId: string): InboundMessageRouting | undefined;
+  latestInboundTimestamp(): string | null;
+  latestOutboundTimestamp(): string | null;
+  markInboundCompletedIfPending(messageId: string): void;
+  outboundHasContentLike(marker: string): boolean;
+  outboundHasRecentContentLike(marker: string, withinSeconds: number): boolean;
+  hasNonStatusReplyTo(messageId: string): boolean;
+  /** The fork's `MAX(seq) + 2` direct write; opens the writable outbound handle. */
+  writeOutboundDirect(message: DirectOutboundRow): void;
+
+  // --- TRANSITIONAL: raw handles for callers not yet on the seam ----------
+  /**
+   * The open inbound / readable outbound handles behind this session.
+   *
+   * These exist for exactly one reason: a handful of helpers the host sweep
+   * calls still take a `Database.Database` and live in files owned by other
+   * PRs of this series (`modules/scheduling/*`, `dashboard/thread-close.ts`,
+   * `session-manager.ts`, `db/usage.ts`). Handing them the session's own
+   * handle keeps the sweep on ONE open per session per duty instead of
+   * reopening the file beside a live session.
+   *
+   * Every use is a debt, not an API: `src/mailbox-seam-ratchet.ts` counts
+   * these names as raw access, so a file that calls one stays on the
+   * allowlist until its callee moves behind the seam. PR 7 deletes both.
+   *
+   * The handle is valid only for the duration of the action; never store it.
+   */
+  legacyInboundHandle(): Database.Database;
+  legacyOutboundHandle(): Database.Database;
 }
 
 export type NanoclawMailboxAction<T> = (mailbox: NanoclawMailboxSession) => T | Promise<T>;
@@ -318,12 +409,7 @@ export class NanoclawAgentMailbox extends SqliteAgentMailbox {
       // direct outbound writes scan messages_out) — the host must never read
       // the container-owned outbound.db just to insert an inbound row; the
       // two-DB split exists to avoid exactly that cross-mount coupling.
-      const session: NanoclawMailboxSession = {
-        ...wrapSqliteInbound(inbound),
-        ...wrapSqliteOutbound(readableOutbound, writableOutbound),
-        ...forkOps(inbound, readableOutbound),
-      };
-      return await action(session);
+      return await action(composeNanoclawSession(inbound, readableOutbound, writableOutbound));
     } finally {
       inbound.close();
       outbound?.close();
@@ -333,16 +419,39 @@ export class NanoclawAgentMailbox extends SqliteAgentMailbox {
 }
 
 /**
+ * Build the session an action receives from handles that are already open.
+ *
+ * `session()` is its only production caller. It is exported so a test can
+ * drive the exact same session surface over in-memory databases without
+ * reimplementing the composition — one definition of "what a Nanoclaw mailbox
+ * session is", which is what invariant I-2 asks for.
+ */
+export function composeNanoclawSession(
+  inbound: Database.Database,
+  readableOutbound: () => Database.Database,
+  writableOutbound: () => Database.Database = readableOutbound,
+): NanoclawMailboxSession {
+  return {
+    ...wrapSqliteInbound(inbound),
+    ...wrapSqliteOutbound(readableOutbound, writableOutbound),
+    ...forkOps(inbound, readableOutbound, writableOutbound),
+  };
+}
+
+/**
  * The fork's ops, bound to the handles open for this session.
  *
- * Only the readable outbound handle is threaded in: no fork op writes to
- * outbound.db from inside a session today (`writeOutboundDirect` still uses
- * the raw helper in session-manager.ts, which PR 7 removes), and upstream's
- * own wrapper already owns the writable one.
+ * Both outbound accessors are threaded in and both are lazy: an action that
+ * only reads never opens the writable handle, so the host keeps its
+ * read-only-by-default posture on the container-owned file. The writable one
+ * is used by the two host-side writers that already existed — the direct
+ * outbound notice and the work-continuation recovery admission — both of
+ * which only run with the container confirmed stopped.
  */
 function forkOps(
   inbound: Database.Database,
   readableOutbound: () => Database.Database,
+  writableOutbound: () => Database.Database,
 ): Omit<NanoclawMailboxSession, keyof MailboxSession> &
   Pick<
     NanoclawMailboxSession,
@@ -403,5 +512,32 @@ function forkOps(
     admitRepoIngressFenceMessage: (epoch, messageId) => admitRepoIngressFenceMessage(inbound, epoch, messageId),
     releaseRepoIngressFence: (epoch, generation) => releaseRepoIngressFence(inbound, epoch, generation),
     readRepositoryMountBarrierAck: () => readRepositoryMountBarrierAck(readableOutbound()),
+
+    readWorkContinuation: () => readWorkContinuation(readableOutbound()),
+    readContinuationRecoveryAttemptAt: (continuation) =>
+      readContinuationRecoveryAttemptAt(readableOutbound(), continuation),
+    incrementWorkContinuationResumeAttempt: (expectedId) =>
+      incrementWorkContinuationResumeAttempt(writableOutbound(), expectedId),
+    migrateLegacyWorkContinuationForRecovery: () => migrateLegacyWorkContinuationForRecovery(writableOutbound()),
+    restoreWorkContinuationResumeAttempt: (attempted, previous) =>
+      restoreWorkContinuationResumeAttempt(writableOutbound(), attempted, previous),
+
+    hasDueRecoveryWake: (nowIso) => hasDueRecoveryWake(inbound, nowIso),
+    parkDueRecoveryWakes: (nowIso) => parkDueRecoveryWakes(inbound, nowIso),
+    countRecoveryAttemptsSinceRealInbound: (idPrefix) => countRecoveryAttemptsSinceRealInbound(inbound, idPrefix),
+    latestRecoveryMarkerTimestamp: (idPrefix) => latestRecoveryMarkerTimestamp(inbound, idPrefix),
+    latestRecoveryMarkerId: (idPrefix) => latestRecoveryMarkerId(inbound, idPrefix),
+    readMessageRouting: (messageId) => readMessageRouting(inbound, messageId),
+    latestInboundTimestamp: () => latestInboundTimestamp(inbound),
+    latestOutboundTimestamp: () => latestOutboundTimestamp(readableOutbound()),
+    markInboundCompletedIfPending: (messageId) => markInboundCompletedIfPending(inbound, messageId),
+    outboundHasContentLike: (marker) => outboundHasContentLike(readableOutbound(), marker),
+    outboundHasRecentContentLike: (marker, withinSeconds) =>
+      outboundHasRecentContentLike(readableOutbound(), marker, withinSeconds),
+    hasNonStatusReplyTo: (messageId) => hasNonStatusReplyTo(readableOutbound(), messageId),
+    writeOutboundDirect: (message) => writeOutboundDirectRow(writableOutbound(), message),
+
+    legacyInboundHandle: () => inbound,
+    legacyOutboundHandle: () => readableOutbound(),
   };
 }
