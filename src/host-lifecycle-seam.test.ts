@@ -1,10 +1,15 @@
 /**
  * Drift tripwire for the ported upstream host-lifecycle seam (S2-PR0).
  *
- * The files in UPSTREAM_FILES (src/host-lifecycle-seam-manifest.ts) are byte-for-byte
- * copies of nanocoai/nanoclaw@<upstream sha>. This test fails when either is
- * hand-edited without regenerating src/host-lifecycle-seam/UPSTREAM-MANIFEST.json, so
- * drift surfaces on the next host test run instead of at the next upstream sync.
+ * The files in UPSTREAM_FILES (src/host-lifecycle-seam-manifest.ts) — just
+ * src/host-lifecycle.ts — are byte-for-byte copies of nanocoai/nanoclaw@<upstream sha>.
+ * This test fails when that file is hand-edited without regenerating
+ * src/host-lifecycle-seam/UPSTREAM-MANIFEST.json, so drift surfaces on the next host
+ * test run instead of at the next upstream sync.
+ *
+ * upstream's src/host-lifecycle.test.ts is UNPORTABLE on this fork's boot topology —
+ * see UNPORTABLE_UPSTREAM_FILES below and src/host-lifecycle.test.ts's own header
+ * comment for the fork-owned replacement.
  *
  * A manifest (rather than `git show <sha>:<path>`) is used because the fork's CI
  * clone does not carry upstream commits — see docs/specs/upstream-host-sweep-seam/plan.md
@@ -15,7 +20,11 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 
-import { UPSTREAM_FILES, type HostLifecycleSeamManifest } from './host-lifecycle-seam-manifest.js';
+import {
+  UNPORTABLE_UPSTREAM_FILES,
+  UPSTREAM_FILES,
+  type HostLifecycleSeamManifest,
+} from './host-lifecycle-seam-manifest.js';
 
 const REPO_ROOT = path.resolve(__dirname, '..');
 const MANIFEST_PATH = path.join(REPO_ROOT, 'src/host-lifecycle-seam/UPSTREAM-MANIFEST.json');
@@ -41,6 +50,26 @@ describe('every ported upstream file matches UPSTREAM-MANIFEST.json', () => {
         actualHash,
         `${relPath} drifted from upstream ${manifest.upstream}; regenerate with scripts/host-lifecycle-seam-manifest.ts --update ${manifest.upstream} only when intentionally syncing upstream`,
       ).toBe(expectedHash);
+    });
+  }
+});
+
+describe('unportable upstream files are replaced, not carried verbatim', () => {
+  // src/host-lifecycle.test.ts is not deferred, it is UNPORTABLE: three of its eight
+  // upstream cases describe upstream's own tree (src/index.ts boot order, approvals
+  // wired to onHostShutdown) rather than this fork's topology — see
+  // UNPORTABLE_UPSTREAM_FILES for the reasons. Both halves of that decision are checked
+  // so it cannot rot into a silent omission: the fork-owned replacement has to exist,
+  // and the upstream path must stay out of UPSTREAM_FILES — adding it would put a
+  // permanently red test in CI.
+  for (const entry of UNPORTABLE_UPSTREAM_FILES) {
+    it(`${entry.upstream} is replaced by ${entry.forkTest}, not carried verbatim`, () => {
+      expect(fs.existsSync(path.join(REPO_ROOT, entry.forkTest)), `${entry.forkTest} is missing`).toBe(true);
+      expect(entry.reason.length, `${entry.upstream} needs a written reason`).toBeGreaterThan(0);
+      expect(
+        UPSTREAM_FILES as readonly string[],
+        `${entry.upstream} cannot pass byte-for-byte on this fork — see UNPORTABLE_UPSTREAM_FILES`,
+      ).not.toContain(entry.upstream);
     });
   }
 });

@@ -1,9 +1,9 @@
 /**
  * Upstream host-lifecycle-seam manifest.
  *
- * The files listed in UPSTREAM_FILES are ported byte-for-byte from upstream
+ * The file(s) listed in UPSTREAM_FILES are ported byte-for-byte from upstream
  * nanocoai/nanoclaw and must never be hand-edited — src/host-lifecycle-seam.test.ts
- * fails the build if either of them drifts from src/host-lifecycle-seam/UPSTREAM-MANIFEST.json.
+ * fails the build if any of them drifts from src/host-lifecycle-seam/UPSTREAM-MANIFEST.json.
  *
  * To intentionally sync with a newer upstream commit, re-run:
  *   pnpm exec tsx scripts/host-lifecycle-seam-manifest.ts --update <upstream-sha>
@@ -25,7 +25,42 @@ const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..
 export const MANIFEST_PATH = path.join(REPO_ROOT, 'src/host-lifecycle-seam/UPSTREAM-MANIFEST.json');
 
 /** Every file ported verbatim from upstream for the host-lifecycle seam (S2-PR0). */
-export const UPSTREAM_FILES = ['src/host-lifecycle.ts', 'src/host-lifecycle.test.ts'] as const;
+export const UPSTREAM_FILES = ['src/host-lifecycle.ts'] as const;
+
+/**
+ * Upstream files this fork CANNOT carry byte-for-byte, with the fork-owned test that
+ * covers the same invariants instead. Same shape and same reasoning as
+ * src/mailbox-seam-manifest.ts's UNPORTABLE_UPSTREAM_FILES (mailbox seam PR 7) — see
+ * that file's header comment for the general rationale.
+ *
+ * This is not a deferral and never becomes one: adding such a file to UPSTREAM_FILES
+ * would put a permanently red test in CI (three of its cases hard-code assumptions this
+ * fork's boot topology does not share). The seam test asserts both halves of that — the
+ * fork-owned replacement exists with a written reason, and the upstream path stays out
+ * of UPSTREAM_FILES.
+ */
+export const UNPORTABLE_UPSTREAM_FILES: ReadonlyArray<{
+  upstream: string;
+  forkTest: string;
+  reason: string;
+}> = [
+  {
+    upstream: 'src/host-lifecycle.test.ts',
+    forkTest: 'src/host-lifecycle.test.ts',
+    reason:
+      "Three of upstream's eight cases describe upstream's own tree, not this fork's: two " +
+      'read src/index.ts for the boot-order strings (this fork boots in src/main.ts — ' +
+      "src/index.ts is a 15-line deploy-crash-guard shim, per that file's own header " +
+      'comment, "do not add imports here beyond the guard") and one asserts ' +
+      "src/modules/approvals/index.ts registers with onHostShutdown (this fork's " +
+      "approvals module shuts down via response-registry.ts's own onShutdown until a " +
+      'later seam-2 PR migrates it — migrating it here would also break the S2-PR0 ' +
+      'acceptance case that PR 0 registers zero host-lifecycle callbacks). The five ' +
+      'remaining registry-behavior cases and the two boot-order cases (path-swapped to ' +
+      'src/main.ts) are kept in the fork-owned src/host-lifecycle.test.ts at the same ' +
+      'path; the approvals case is deferred until that migration lands.',
+  },
+] as const;
 
 export interface HostLifecycleSeamManifest {
   upstream: string;

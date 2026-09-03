@@ -1,3 +1,29 @@
+/**
+ * Fork-owned. Derived from nanocoai/nanoclaw@5c3082a1 src/host-lifecycle.test.ts —
+ * see src/host-lifecycle-seam-manifest.ts's UNPORTABLE_UPSTREAM_FILES for why upstream's
+ * copy cannot be carried byte-for-byte, and docs/specs/upstream-host-sweep-seam/plan.md
+ * §8 "S2-PR0" (L-2) for the acceptance case this file satisfies.
+ *
+ * Kept verbatim from upstream: all five `host module lifecycle registry` cases
+ * ("registration is inert…", "returns callback snapshots…", "starts callbacks
+ * serially…", "propagates a startup error…", "stops callbacks LIFO…").
+ *
+ * Kept with ONE change — the read path — in `host lifecycle orchestration`: both cases
+ * read src/main.ts instead of upstream's src/index.ts, because this fork's boot sequence
+ * lives in main.ts (src/index.ts here is a 15-line deploy-crash-guard shim; see its own
+ * header comment, "do not add imports here beyond the guard"). No other adaptation was
+ * needed — the same anchor strings (`setDeliveryAdapter(createChannelDeliveryAdapter())`,
+ * `await startHostModules(`, `startActiveDeliveryPoll()`, `hostAbortController.abort()`,
+ * `await stopHostModules()`, `stopDeliveryPolls()`) exist in src/main.ts in the same
+ * relative order.
+ *
+ * REMOVED: "registers built-in approvals cleanup with the host lifecycle". This fork's
+ * approvals module shuts down via response-registry.ts's own onShutdown, not
+ * host-lifecycle.ts's onHostShutdown — migrating it here would also break S2-PR0's own
+ * acceptance case (L-4) that PR 0 registers zero host-lifecycle callbacks. Re-raise
+ * trigger: the seam-2 follow-up PR that migrates approvals' shutdown hook from
+ * response-registry onShutdown to onHostShutdown must re-add this case verbatim.
+ */
 import fs from 'fs';
 import path from 'path';
 
@@ -121,19 +147,11 @@ describe('host module lifecycle registry', () => {
       err: expect.objectContaining({ message: 'shutdown-sentinel' }),
     });
   });
-
-  it('registers built-in approvals cleanup with the host lifecycle', async () => {
-    const lifecycle = await import('./host-lifecycle.js');
-
-    expect(lifecycle.getHostShutdownCallbacks()).toHaveLength(0);
-    await import('./modules/approvals/index.js');
-    expect(lifecycle.getHostShutdownCallbacks()).toHaveLength(1);
-  });
 });
 
 describe('host lifecycle orchestration', () => {
   it('starts after delivery is ready and before delivery polling', () => {
-    const source = fs.readFileSync(path.join(process.cwd(), 'src', 'index.ts'), 'utf8');
+    const source = fs.readFileSync(path.join(process.cwd(), 'src', 'main.ts'), 'utf8');
     const deliveryReady = source.indexOf('setDeliveryAdapter(createChannelDeliveryAdapter())');
     const modulesStart = source.indexOf('await startHostModules(');
     const pollingStart = source.indexOf('startActiveDeliveryPoll()');
@@ -144,7 +162,7 @@ describe('host lifecycle orchestration', () => {
   });
 
   it('aborts modules and awaits their LIFO shutdown before host cleanup', () => {
-    const source = fs.readFileSync(path.join(process.cwd(), 'src', 'index.ts'), 'utf8');
+    const source = fs.readFileSync(path.join(process.cwd(), 'src', 'main.ts'), 'utf8');
     const abort = source.indexOf('hostAbortController.abort()');
     const modulesStop = source.indexOf('await stopHostModules()');
     const pollsStop = source.indexOf('stopDeliveryPolls()');
