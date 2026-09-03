@@ -119,7 +119,7 @@ beforeEach(async () => {
   });
 
   // Owner (display name feeds the decline copy) + their DM.
-  upsertUser({ id: 'telegram:owner', kind: 'telegram', display_name: 'Dave', created_at: now() });
+  upsertUser({ id: 'telegram:owner', kind: 'telegram', display_name: 'Owner', created_at: now() });
   grantRole({
     user_id: 'telegram:owner',
     role: 'owner',
