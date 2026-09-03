@@ -1,4 +1,4 @@
-import { describe, expect, it, beforeEach, vi } from 'vitest';
+import { afterEach, describe, expect, it, beforeEach, vi } from 'vitest';
 
 // Only the wake-admission block below needs this; nothing else in the file
 // asserts on logs. The refusal's log line is the ONLY observable difference —
@@ -9,6 +9,83 @@ vi.mock('./log.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('./log.js')>();
   return { ...actual, log: { ...actual.log, warn: vi.fn(), error: vi.fn(), info: vi.fn(), debug: vi.fn() } };
 });
+
+// getMemoryAdmission() sizes its budget from a `docker info` probe at first
+// use. That is a real daemon round-trip from a unit test — the hermeticity
+// tripwire flags it — so point the runtime binary at a name that does not
+// exist: the probe fails instantly into its documented os.totalmem() fallback,
+// and nothing leaves the process. Everything else in container-runtime is real.
+vi.mock('./container-runtime.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./container-runtime.js')>();
+  return { ...actual, CONTAINER_RUNTIME_BIN: ABSENT_CONTAINER_RUNTIME_BIN };
+});
+
+// The memory-admission controller is stubbed so the queue can be driven
+// deterministically. The real controller's budget is a module-level singleton
+// derived from Docker-visible RAM at first use — unreachable from a unit test,
+// and host-dependent — so exhausting it for real is not an option. Everything
+// AROUND the controller stays real: the queued payload, releaseMemoryReservation
+// and its drain, and the startReservedWake continuation are the code under test.
+const ABSENT_CONTAINER_RUNTIME_BIN = vi.hoisted(() => 'nanoclaw-absent-container-runtime');
+
+const memoryStub = vi.hoisted(() => ({
+  queueNext: new Set<string>(),
+  queuedPayloads: [] as unknown[],
+  requestedIds: [] as string[],
+  releasedIds: [] as string[],
+  reset() {
+    this.queueNext.clear();
+    this.queuedPayloads = [];
+    this.requestedIds = [];
+    this.releasedIds = [];
+  },
+}));
+
+vi.mock('./memory-admission.js', () => {
+  class StubMemoryAdmissionController<T> {
+    readonly budgetMb: number;
+    constructor(budgetMb: number) {
+      this.budgetMb = budgetMb;
+    }
+    get reservedMb(): number {
+      return 0;
+    }
+    get queuedCount(): number {
+      return memoryStub.queuedPayloads.length;
+    }
+    isQueued(id: string): boolean {
+      return memoryStub.queueNext.has(id);
+    }
+    hasReservation(): boolean {
+      return false;
+    }
+    request(id: string, requestMb: number, payload: T): MemoryAdmissionResult {
+      memoryStub.requestedIds.push(id);
+      if (memoryStub.queueNext.has(id)) {
+        memoryStub.queuedPayloads.push(payload);
+        return { status: 'queued', budgetMb: this.budgetMb, requestMb, position: memoryStub.queuedPayloads.length };
+      }
+      return { status: 'admitted', budgetMb: this.budgetMb, requestMb };
+    }
+    release(id: string): T[] {
+      memoryStub.releasedIds.push(id);
+      const drained = memoryStub.queuedPayloads as T[];
+      memoryStub.queuedPayloads = [];
+      return drained;
+    }
+    cancel(id: string): T[] {
+      return this.release(id);
+    }
+    shutdown(): void {
+      memoryStub.queuedPayloads = [];
+    }
+  }
+  return {
+    MemoryAdmissionController:
+      StubMemoryAdmissionController as unknown as typeof import('./memory-admission.js').MemoryAdmissionController,
+  };
+});
+
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
@@ -42,6 +119,9 @@ import { formatMemoryMb, resolveContainerResources } from './container-resources
 import { mergeWorkgroupAndGroupSecrets } from './onecli-secrets.js';
 import { getProviderContainerConfig } from './providers/provider-container-registry.js';
 import { log } from './log.js';
+import { closeDb, getDb, initTestDb } from './db/connection.js';
+import { allowSubprocess } from './test-hermeticity.js';
+import type { MemoryAdmissionResult } from './memory-admission.js';
 import type { Session } from './types.js';
 
 describe('resolveProviderName', () => {
@@ -1410,6 +1490,143 @@ describe('wakeContainer session-status admission', () => {
     } finally {
       vi.unstubAllEnvs();
     }
+  });
+});
+
+// The guard above runs on the object the CALLER handed us, and the wake path
+// then awaits — storage admission, an unbounded wait in the memory-admission
+// queue, the storage-activity lease. A reclaim closes the session row inside any
+// of those windows, and spawning on a closed row produces a container
+// getActiveSessions() will never return. These cover the re-reads that follow
+// each await; the DB row, not the caller's snapshot, is the authority.
+describe('wakeContainer re-reads the session after every admission await', () => {
+  const AGENT_GROUP_ID = 'ag-wake-admission';
+  // Deliberately a folder that does not exist under groups/: readContainerConfig
+  // returns the empty config for it (no disk fixture, no spawn side effects),
+  // while the strict spawn-fence read fails on it — which is how the trigger
+  // session below reaches releaseMemoryReservation without touching Docker.
+  const AGENT_GROUP_FOLDER = '__wake-admission-test__';
+
+  function seedSession(id: string, status: string): void {
+    getDb()
+      .prepare(
+        `INSERT INTO sessions (id, agent_group_id, messaging_group_id, thread_id, agent_provider, status,
+                               container_status, last_active, created_at)
+         VALUES (?, ?, NULL, NULL, NULL, ?, 'stopped', NULL, '2026-08-19T00:00:00.000Z')`,
+      )
+      .run(id, AGENT_GROUP_ID, status);
+  }
+
+  function archive(id: string): void {
+    getDb().prepare("UPDATE sessions SET status = 'closed' WHERE id = ?").run(id);
+  }
+
+  /** What the caller still believes: an active session, by id. */
+  function callerSnapshot(id: string): Session {
+    return {
+      id,
+      agent_group_id: AGENT_GROUP_ID,
+      messaging_group_id: null,
+      thread_id: null,
+      agent_provider: null,
+      status: 'active',
+      container_status: 'stopped',
+      last_active: null,
+      created_at: '2026-08-19T00:00:00.000Z',
+    };
+  }
+
+  function abandons(): Array<{ sessionId: string; stage: string; status: string }> {
+    return vi
+      .mocked(log.warn)
+      .mock.calls.filter((call) => String(call[0]).startsWith('Container wake abandoned'))
+      .map((call) => {
+        const meta = call[1] as { sessionId: string; stage: string; status: string };
+        return { sessionId: meta.sessionId, stage: meta.stage, status: meta.status };
+      });
+  }
+
+  beforeEach(() => {
+    vi.mocked(log.warn).mockClear();
+    memoryStub.reset();
+    initTestDb();
+    getDb().exec(`
+      CREATE TABLE sessions (
+        id TEXT PRIMARY KEY,
+        agent_group_id TEXT,
+        messaging_group_id TEXT,
+        thread_id TEXT,
+        agent_provider TEXT,
+        status TEXT,
+        container_status TEXT,
+        last_active TEXT,
+        created_at TEXT
+      );
+      CREATE TABLE agent_groups (
+        id TEXT PRIMARY KEY,
+        name TEXT,
+        folder TEXT,
+        agent_provider TEXT,
+        workgroup_id TEXT
+      );
+    `);
+    getDb()
+      .prepare('INSERT INTO agent_groups (id, name, folder, agent_provider, workgroup_id) VALUES (?, ?, ?, NULL, ?)')
+      .run(AGENT_GROUP_ID, 'wake admission', AGENT_GROUP_FOLDER, 'wg-wake-admission');
+    // Keep these independent of the host's real disk pressure; otherwise a full
+    // filesystem sends them into the real cleanup worker.
+    vi.stubEnv('NANOCLAW_STORAGE_MANAGER_ENABLED', '0');
+    // The mocked runtime binary above does not exist, so this permits a call
+    // that resolves to ENOENT — nothing actually escapes the process.
+    allowSubprocess([ABSENT_CONTAINER_RUNTIME_BIN]);
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    memoryStub.reset();
+    closeDb();
+  });
+
+  it('does not spawn a session that was archived while storage admission was awaited', async () => {
+    seedSession('sess-storage', 'active');
+    // The reclaim lands while checkStorageAdmission is in flight: the caller's
+    // object still says active, the row does not.
+    archive('sess-storage');
+
+    await expect(wakeContainer(callerSnapshot('sess-storage'))).resolves.toBe(false);
+
+    expect(abandons()).toEqual([{ sessionId: 'sess-storage', stage: 'storage-admission', status: 'closed' }]);
+    // Never reached memory admission, so it never reached the spawn either.
+    expect(memoryStub.requestedIds).not.toContain('sess-storage');
+    expect(memoryStub.releasedIds).toEqual([]);
+  });
+
+  it('does not spawn a session that was archived while it sat in the memory-admission queue', async () => {
+    seedSession('sess-queued', 'active');
+    seedSession('sess-trigger', 'active');
+
+    memoryStub.queueNext.add('sess-queued');
+    await expect(wakeContainer(callerSnapshot('sess-queued'))).resolves.toBe(false);
+    // Queued holding no reservation, on the row as it looked when it queued.
+    expect(memoryStub.queuedPayloads).toHaveLength(1);
+    expect((memoryStub.queuedPayloads[0] as Session).status).toBe('active');
+
+    // The wait in the queue is unbounded; the reclaim lands inside it.
+    archive('sess-queued');
+    vi.mocked(log.warn).mockClear();
+
+    // Any release drains the queue and hands the payload to startReservedWake.
+    // This one fails its authoritative spawn-config read, which is an existing
+    // release path — no Docker, no disk fixture.
+    vi.stubEnv('NANOCLAW_CONTAINER_SPAWN_WORKGROUP_ALLOWLIST', '');
+    await expect(wakeContainer(callerSnapshot('sess-trigger'))).resolves.toBe(false);
+    await Promise.resolve();
+
+    // Caught at the dequeue, before the queued session spends its slot — not
+    // later, at the pre-spawn re-read.
+    expect(abandons()).toEqual([{ sessionId: 'sess-queued', stage: 'memory-admission-dequeue', status: 'closed' }]);
+    // And the reservation it was just admitted into is handed back, not leaked.
+    expect(memoryStub.releasedIds).toEqual(['sess-trigger', 'sess-queued']);
   });
 });
 

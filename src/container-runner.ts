@@ -73,6 +73,7 @@ import {
 } from './db/agent-groups.js';
 import { getDb, hasTable } from './db/connection.js';
 import { getMessagingGroup } from './db/messaging-groups.js';
+import { getSession } from './db/sessions.js';
 import { withExistingNanoclawSession } from './modules/mailbox/session.js';
 import { buildCentralProjection } from './db/per-agent-projections.js';
 import { ensureArchiveProjection } from './db/archive-projection-worker.js';
@@ -406,6 +407,52 @@ export function resolveWorkgroupIdAtSpawn(
 }
 
 /**
+ * Re-read the session from the central DB and return it only while it is still
+ * active. The wake path's status guard runs on the object the CALLER handed us,
+ * but the path then awaits — storage admission, an unbounded wait in the memory
+ * admission queue, the storage-activity lease — and a reclaim closes the row
+ * (it never deletes it) at any point in that window. Spawning on a closed row
+ * produces a container `getActiveSessions()` will never return: no stuck
+ * detection, no heartbeat ceiling, no claim tolerance, for as long as it runs.
+ *
+ * So every await in the wake path is followed by this, and the fresh row — not
+ * the caller's snapshot — is what continues. Callers keeping their own pre-wake
+ * re-read are then belt-and-braces rather than load-bearing.
+ *
+ * Fail closed: a DB that cannot be read is treated as "do not spawn". The
+ * inbound row stays pending and host-sweep retries on its next tick.
+ *
+ * Callers own the release of anything already held at their bail point — see
+ * each call site; this helper deliberately holds and releases nothing.
+ */
+function refreshActiveSession(session: Session, stage: string): Session | null {
+  let fresh: Session | undefined;
+  try {
+    fresh = getSession(session.id);
+  } catch (err) {
+    log.warn('Container wake abandoned — session re-read failed', { sessionId: session.id, stage, err });
+    return null;
+  }
+  if (!fresh) {
+    log.warn('Container wake abandoned — session no longer exists', {
+      sessionId: session.id,
+      stage,
+      status: 'missing',
+    });
+    return null;
+  }
+  if (fresh.status !== 'active') {
+    log.warn('Container wake abandoned — session is no longer active', {
+      sessionId: session.id,
+      stage,
+      status: fresh.status,
+    });
+    return null;
+  }
+  return fresh;
+}
+
+/**
  * Wake up a container for a session. If already running or mid-spawn, no-op
  * (the in-flight wake promise is reused).
  *
@@ -447,13 +494,18 @@ export function wakeContainer(session: Session, priority: MemoryAdmissionPriorit
 
   return trackWake(session.id, async () => {
     if (!(await checkStorageAdmission(session, false))) return false;
+    // First await behind us. Nothing is held yet — storage admission takes no
+    // lease and the memory request has not been made — so this bail releases
+    // nothing. Everything below runs on the fresh row.
+    const admitted = refreshActiveSession(session, 'storage-admission');
+    if (!admitted) return false;
 
     const admission = getMemoryAdmission();
-    const agentGroup = getAgentGroup(session.agent_group_id);
+    const agentGroup = getAgentGroup(admitted.agent_group_id);
     if (!agentGroup) {
       log.error('Container wake rejected — agent group not found', {
-        sessionId: session.id,
-        agentGroupId: session.agent_group_id,
+        sessionId: admitted.id,
+        agentGroupId: admitted.agent_group_id,
       });
       return false;
     }
@@ -462,7 +514,7 @@ export function wakeContainer(session: Session, priority: MemoryAdmissionPriorit
       effectiveResources = resolveContainerResources(readContainerConfig(agentGroup.folder).resources);
     } catch (err) {
       log.error('Container wake rejected — invalid resource configuration', {
-        sessionId: session.id,
+        sessionId: admitted.id,
         agentGroup: agentGroup.folder,
         err,
       });
@@ -472,10 +524,13 @@ export function wakeContainer(session: Session, priority: MemoryAdmissionPriorit
     // Priority is part of the atomic admission decision. A task-only wake must
     // never enter as interactive and be demoted afterward: it could otherwise
     // reserve free memory and bypass an older scheduled head before demotion.
-    const decision = admission.request(session.id, effectiveResources.memory.requestMb, session, priority);
+    // The queued payload is what startReservedWake later resumes on, so it must
+    // be the fresh row — not the caller's snapshot — even though that row is
+    // itself re-read again at dequeue.
+    const decision = admission.request(admitted.id, effectiveResources.memory.requestMb, admitted, priority);
     if (decision.status === 'rejected') {
       log.error('Container wake rejected — memory request exceeds host budget', {
-        sessionId: session.id,
+        sessionId: admitted.id,
         agentGroup: agentGroup.folder,
         requestMb: decision.requestMb,
         budgetMb: decision.budgetMb,
@@ -484,7 +539,7 @@ export function wakeContainer(session: Session, priority: MemoryAdmissionPriorit
     }
     if (decision.status === 'queued') {
       log.warn('Container wake queued — memory budget exhausted', {
-        sessionId: session.id,
+        sessionId: admitted.id,
         agentGroup: agentGroup.folder,
         requestMb: decision.requestMb,
         budgetMb: decision.budgetMb,
@@ -495,7 +550,7 @@ export function wakeContainer(session: Session, priority: MemoryAdmissionPriorit
       return false;
     }
 
-    return spawnReservedContainer(session);
+    return spawnReservedContainer(admitted);
   });
 }
 
@@ -525,11 +580,25 @@ function startReservedWake(session: Session): Promise<boolean> {
   if (existing) return existing;
 
   return trackWake(session.id, async () => {
-    if (!(await checkStorageAdmission(session, true))) {
+    // Dequeued from the memory-admission queue holding a reservation, carrying
+    // the session object captured when the wake was first queued — which can be
+    // an arbitrarily long wait. Re-read before spending the slot, and release
+    // the reservation on a bail so the next queued session can take it.
+    const dequeued = refreshActiveSession(session, 'memory-admission-dequeue');
+    if (!dequeued) {
       releaseMemoryReservation(session.id);
       return false;
     }
-    return spawnReservedContainer(session);
+    if (!(await checkStorageAdmission(dequeued, true))) {
+      releaseMemoryReservation(dequeued.id);
+      return false;
+    }
+    const admitted = refreshActiveSession(dequeued, 'queued-storage-admission');
+    if (!admitted) {
+      releaseMemoryReservation(dequeued.id);
+      return false;
+    }
+    return spawnReservedContainer(admitted);
   });
 }
 
@@ -582,8 +651,16 @@ async function checkStorageAdmission(session: Session, queued: boolean): Promise
   }
 }
 
-async function spawnReservedContainer(session: Session): Promise<boolean> {
+async function spawnReservedContainer(caller: Session): Promise<boolean> {
   if (containerShutdownInProgress) return false;
+  // Entry re-read. Reached both straight off an admitted request and as the
+  // memory-queue dequeue continuation; either way a reservation is held by now,
+  // so a bail here must give it back.
+  const session = refreshActiveSession(caller, 'reserved-spawn');
+  if (!session) {
+    releaseMemoryReservation(caller.id);
+    return false;
+  }
   const spawnAgentGroup = getAgentGroup(session.agent_group_id);
   if (!spawnAgentGroup) {
     log.error('Container wake rejected — agent group not found at reserved spawn', {
@@ -645,7 +722,16 @@ async function spawnReservedContainer(session: Session): Promise<boolean> {
   let storageActivity: StorageActivityLease | null = null;
   try {
     storageActivity = await acquireContainerStorageActivity(session, spawnWorkgroupId);
-    await spawnContainer(session, storageActivity, spawnAgentGroup, spawnContainerConfig, spawnWorkgroupId);
+    // Last re-read, after the final await and immediately before the actual
+    // spawn. Two things are held here: the storage-activity lease, which the
+    // `finally` below releases because `storageActivity` is still non-null, and
+    // the memory reservation, which is ours to hand back explicitly.
+    const spawnSession = refreshActiveSession(session, 'pre-spawn');
+    if (!spawnSession) {
+      releaseMemoryReservation(session.id);
+      return false;
+    }
+    await spawnContainer(spawnSession, storageActivity, spawnAgentGroup, spawnContainerConfig, spawnWorkgroupId);
     storageActivity = null; // activeContainers owns it until process exit
     return true;
   } catch (err) {

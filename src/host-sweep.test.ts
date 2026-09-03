@@ -1712,6 +1712,41 @@ describe('sweepTaskWatchdog (C3)', () => {
     expect(mockWakeContainer).toHaveBeenCalled();
   });
 
+  /**
+   * The parent can be archived while the notification is being written.
+   *
+   * `parentSession` is fetched before the awaited mailbox write and was handed
+   * straight to `wakeContainer` after it. A reclaim inside that window leaves a
+   * snapshot that still says `active`, and waking on it spawns a container
+   * `getActiveSessions()` will never return — no stuck detection, no heartbeat
+   * ceiling, no claim tolerance, for as long as it runs.
+   *
+   * The notification itself still lands: the row is durable and the parent may
+   * come back. Only the wake is withheld.
+   */
+  it('does not wake a parent session that was archived while the notification was being written', async () => {
+    const task = makeTask({
+      last_progress_at: new Date(NOW - 2 * 60 * 60 * 1000).toISOString(),
+    });
+    mockGetActiveTasks.mockReturnValue([task]);
+    mockTransitionToTerminal.mockReturnValue(true);
+    // The reclaim lands inside the awaited write, so the pre-await fetch saw an
+    // active parent and the post-await one does not.
+    let parentGone = false;
+    mockWriteSessionMessage.mockImplementation(async () => {
+      parentGone = true;
+    });
+    mockGetSession.mockImplementation(() => (parentGone ? undefined : fakeParentSession()));
+
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW);
+
+    await _sweepTaskWatchdogForTesting();
+
+    expect(mockWriteSessionMessage).toHaveBeenCalled();
+    expect(mockWakeContainer).not.toHaveBeenCalled();
+  });
+
   it('test_watchdog_skips_when_drain_active: task with recent terminal outbound is not reaped', async () => {
     const task = makeTask({
       last_progress_at: new Date(NOW - 2 * 60 * 60 * 1000).toISOString(), // 2 hours ago

@@ -2417,9 +2417,18 @@ async function sweepTaskWatchdog(): Promise<void> {
             },
           }),
         });
-        void wakeContainer(parentSession).catch((err) =>
-          log.warn('Task watchdog: wakeContainer(parent) failed', { taskId: task.task_id, err }),
-        );
+        // Re-read before the wake: `parentSession` was fetched before the
+        // awaited mailbox write above, and the parent can be archived in that
+        // window. Belt-and-braces now that `wakeContainer` re-reads internally
+        // after every admission await — but it is one central lookup, and the
+        // duty that hands it a stale object is the one that has to stop doing
+        // so.
+        const freshParent = getSession(parentSession.id);
+        if (freshParent) {
+          void wakeContainer(freshParent).catch((err) =>
+            log.warn('Task watchdog: wakeContainer(parent) failed', { taskId: task.task_id, err }),
+          );
+        }
       } catch (err) {
         log.warn('Task watchdog: failed to notify parent', { taskId: task.task_id, err });
       }
