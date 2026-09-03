@@ -1228,7 +1228,7 @@ async function deliverToAgent(
   // their old platform ids. Check the actual per-session id before every side
   // effect as a migration-safe second line of defense, and also make a partial
   // fan-out retry harmless for agents whose row was already committed.
-  if (sessionMessageExists(agent.agent_group_id, session.id, routedMessageId)) {
+  if (await sessionMessageExists(agent.agent_group_id, session.id, routedMessageId)) {
     log.debug('Duplicate session message ignored before agent side effects', {
       sessionId: session.id,
       agentGroup: session.agent_group_id,

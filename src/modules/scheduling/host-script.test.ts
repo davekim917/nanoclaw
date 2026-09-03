@@ -14,10 +14,12 @@ import path from 'path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { ensureSchema, openInboundDb } from '../../db/session-db.js';
+import { composeNanoclawSession } from '../mailbox/index.js';
 import { insertTaskRow } from './db.js';
 import { classifyForHostExecution, runHostGatedTaskScripts } from './host-script.js';
 
 const TEST_DIR = '/tmp/nanoclaw-host-script-test';
+const SESS = 'sess-test';
 const DB_PATH = path.join(TEST_DIR, 'inbound.db');
 
 function freshDb() {
@@ -25,6 +27,28 @@ function freshDb() {
   fs.mkdirSync(TEST_DIR, { recursive: true });
   ensureSchema(DB_PATH, 'inbound');
   return openInboundDb(DB_PATH);
+}
+
+/**
+ * The mailbox session the sweep would hand `runHostGatedTaskScripts`.
+ *
+ * Built with the module's own `composeNanoclawSession` over the fixture's
+ * inbound handle, so the ops under test are the production ones and there is
+ * exactly one definition of what a session is (invariant I-2). No real mailbox
+ * is provisioned — a unit test must not go through `prepare()`.
+ *
+ * The outbound accessor throws and `outboundPresent` is false: this path is
+ * inbound-only, so an accidental outbound read should be loud, not silent.
+ */
+function sessionFor(db: ReturnType<typeof openInboundDb>) {
+  return composeNanoclawSession(
+    db,
+    () => {
+      throw new Error('host-gated task scripts must not touch outbound.db');
+    },
+    undefined,
+    false,
+  );
 }
 
 function insertHostGatedTask(
@@ -85,7 +109,7 @@ describe('runHostGatedTaskScripts', () => {
     const db = freshDb();
     insertHostGatedTask(db, 't-gated', 'echo \'{"wakeAgent": false}\'');
 
-    await runHostGatedTaskScripts(db, 'sess-test');
+    await runHostGatedTaskScripts(sessionFor(db), SESS);
 
     expect(rowStatus(db, 't-gated')).toBe('completed');
     db.close();
@@ -95,7 +119,7 @@ describe('runHostGatedTaskScripts', () => {
     const db = freshDb();
     insertHostGatedTask(db, 't-wake', 'echo \'{"wakeAgent": true, "data": {"alerts": 3}}\'');
 
-    await runHostGatedTaskScripts(db, 'sess-test');
+    await runHostGatedTaskScripts(sessionFor(db), SESS);
 
     expect(rowStatus(db, 't-wake')).toBe('pending');
     expect(rowContent(db, 't-wake').scriptOutput).toEqual({ alerts: 3 });
@@ -106,7 +130,7 @@ describe('runHostGatedTaskScripts', () => {
     const db = freshDb();
     insertHostGatedTask(db, 't-err', 'echo boom >&2; exit 1');
 
-    await runHostGatedTaskScripts(db, 'sess-test');
+    await runHostGatedTaskScripts(sessionFor(db), SESS);
 
     expect(rowStatus(db, 't-err')).toBe('failed');
     db.close();
@@ -122,7 +146,7 @@ describe('runHostGatedTaskScripts', () => {
       `touch ${marker}\nrm -rf /workspace/agent/scratch\necho '{"wakeAgent": false}'`,
     );
 
-    await runHostGatedTaskScripts(db, 'sess-test');
+    await runHostGatedTaskScripts(sessionFor(db), SESS);
 
     expect(fs.existsSync(marker)).toBe(false);
     // Row untouched: still pending/trigger=0, no scriptOutput — the normal
@@ -137,7 +161,7 @@ describe('runHostGatedTaskScripts', () => {
     const marker = path.join(TEST_DIR, 'ran.marker');
     insertHostGatedTask(db, 't-sql', `touch ${marker}\npsql -c "DROP TABLE customers"\necho '{"wakeAgent": false}'`);
 
-    await runHostGatedTaskScripts(db, 'sess-test');
+    await runHostGatedTaskScripts(sessionFor(db), SESS);
 
     expect(fs.existsSync(marker)).toBe(false);
     expect(rowStatus(db, 't-sql')).toBe('pending');
@@ -153,7 +177,7 @@ describe('runHostGatedTaskScripts', () => {
       `touch ${marker}\ncommand git --git-dir=/host/canonical/.git worktree prune --expire now\necho '{"wakeAgent": false}'`,
     );
 
-    await runHostGatedTaskScripts(db, 'sess-test');
+    await runHostGatedTaskScripts(sessionFor(db), SESS);
 
     expect(fs.existsSync(marker)).toBe(false);
     expect(rowStatus(db, 't-managed-git')).toBe('pending');
@@ -171,7 +195,7 @@ describe('runHostGatedTaskScripts', () => {
         't-env',
         'echo "{\\"wakeAgent\\": true, \\"data\\": {\\"canary\\": \\"${HOST_SCRIPT_TEST_CANARY:-absent}\\"}}"',
       );
-      await runHostGatedTaskScripts(db, 'sess-test');
+      await runHostGatedTaskScripts(sessionFor(db), SESS);
       expect(rowContent(db, 't-env').scriptOutput).toEqual({ canary: 'absent' });
     } finally {
       if (before === undefined) delete process.env.HOST_SCRIPT_TEST_CANARY;
@@ -184,7 +208,7 @@ describe('runHostGatedTaskScripts', () => {
     const db = freshDb();
     insertHostGatedTask(db, 't-container-only', 'echo \'{"wakeAgent": false}\'', { scriptHost: false });
 
-    await runHostGatedTaskScripts(db, 'sess-test');
+    await runHostGatedTaskScripts(sessionFor(db), SESS);
 
     expect(rowStatus(db, 't-container-only')).toBe('pending');
     expect(rowContent(db, 't-container-only').scriptOutput).toBeUndefined();
