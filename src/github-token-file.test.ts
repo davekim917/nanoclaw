@@ -9,6 +9,7 @@ import {
   GH_TOKEN_CONTAINER_PATH,
   clearGroupTokenRefreshers,
   containerRunsAsHostUser,
+  githubTokenDeliveredAsEnv,
   githubTokenInEnv,
   groupTokenPath,
   planGitHubTokenSpawn,
@@ -298,5 +299,30 @@ describe('refresh concurrency', () => {
 
     release();
     await expect(done).resolves.toBe(3);
+  });
+});
+
+describe('githubTokenDeliveredAsEnv', () => {
+  it('is the single answer both the spawn plan and the capabilities snapshot use', () => {
+    expect(githubTokenDeliveredAsEnv({}, 1001)).toBe(false);
+    expect(githubTokenDeliveredAsEnv({ GITHUB_TOKEN_IN_ENV: '1' }, 1001)).toBe(true);
+    // Fallback uids: the agent must not be told "no GITHUB_TOKEN in your env"
+    // on an install where the spawn puts one there.
+    expect(githubTokenDeliveredAsEnv({}, 0)).toBe(true);
+    expect(githubTokenDeliveredAsEnv({}, 1000)).toBe(true);
+  });
+
+  it('agrees with what planGitHubTokenSpawn actually does', () => {
+    for (const [env, hostUid] of [
+      [{}, 1001],
+      [{ GITHUB_TOKEN_IN_ENV: '1' }, 1001],
+      [{}, 0],
+      [{}, 1000],
+    ] as [NodeJS.ProcessEnv, number][]) {
+      const plan = planGitHubTokenSpawn({ agentGroupId: `g-${hostUid}`, token: 'ghs_x', env, dataDir, hostUid });
+      const saysEnv = githubTokenDeliveredAsEnv(env, hostUid);
+      expect(plan.envArgs.some((a) => a.startsWith('GITHUB_TOKEN='))).toBe(saysEnv);
+      expect(plan.mount === undefined).toBe(saysEnv);
+    }
   });
 });
