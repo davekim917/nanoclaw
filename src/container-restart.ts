@@ -501,14 +501,70 @@ export async function restartAgentGroupContainers(
   let restarted = 0;
   let failed = 0;
   for (const session of sessions) {
+    // The container can exit at any point below, and killContainer no-ops on a
+    // session it no longer tracks — counting that as a restart reports work
+    // that did not happen.
+    if (!isContainerRunning(session.id)) continue;
+    // Generation token for the process we are about to kill. The reads below
+    // are async, so the snapshotted container can exit and an inbound wake can
+    // install a REPLACEMENT before control returns — and killing that one is
+    // both wrong and silent: if the read saw no due rows, no onExit is
+    // installed, so the replacement's freshly claimed input goes dark until a
+    // later recovery pass. `spawnedAt` changes on every spawn, so comparing it
+    // across the await identifies the process rather than merely the session.
+    const spawnGeneration = getContainerSpawnedAt(session.id);
+
+    // Always respawn after the kill when there is anything to process: an
+    // explicit wake message, or in-flight messages the dying container had
+    // claimed. Without this, a provider switch mid-conversation leaves the
+    // claimed messages dark until the next inbound or a slow sweep backoff.
+    //
+    // This open can throw, now that the inbound funnel refuses under a reclaim
+    // claim — cost this session, not the loop.
+    let hasPending: boolean;
+    try {
+      // Read-only, so `withExistingMailboxSession` — never the provisioning
+      // variant, which would resurrect a reclaimed session (invariant I-4).
+      // `undefined` (no mailbox) is treated exactly like a read failure rather
+      // than as "nothing pending": this session's container is RUNNING, so a
+      // missing mailbox is an inconsistent host view, and the conservative
+      // answer is to leave it alone.
+      const due = await withExistingNanoclawSession(session.agent_group_id, session.id, (mailbox) =>
+        mailbox.countDueMessages(),
+      );
+      if (due === undefined) throw new Error(`session ${session.id} has no mailbox to read pending work from`);
+      hasPending = due > 0;
+    } catch (err) {
+      failed += 1;
+      log.warn('Restart: could not read pending work; leaving this container running', {
+        agentGroupId,
+        sessionId: session.id,
+        err,
+      });
+      continue;
+    }
+    // Re-check the generation, not just liveness: a replacement is "running"
+    // too. Leave it alone — it is doing the work this restart wanted done.
+    if (getContainerSpawnedAt(session.id) !== spawnGeneration) {
+      log.info('Restart: container was replaced while reading pending work; leaving the replacement alone', {
+        agentGroupId,
+        sessionId: session.id,
+      });
+      continue;
+    }
+
+    // The wake row is written LAST, after every path that can decline this
+    // session. It is a `trigger: 1` / `onWake: 1` row, and `on_wake` rows are
+    // consumed only by a FRESH container's first poll — so a row written
+    // before a decline is not merely wasted, it survives to greet some
+    // unrelated future spawn with a "restarted to apply X" that never
+    // happened. Writing it only once the kill is decided keeps the claim and
+    // the act together. Awaited so the row is durable before `killContainer`,
+    // and a failure still costs this session only: before the await existed
+    // the write was fire-and-forget and its rejection escaped as an
+    // unhandledRejection, so the loop always finished; letting it throw here
+    // would kill the sessions ahead of it and strand every one behind it.
     if (wakeMessage) {
-      // Awaited so the write is durable before killContainer — but a failure
-      // must cost this session only. Before the await existed, the write was
-      // fire-and-forget and its rejection escaped as an unhandledRejection, so
-      // the loop always finished; letting it throw here instead would kill the
-      // sessions ahead of it and strand every one behind it, half-restarting
-      // the group. Skip this session's kill (never kill a container whose wake
-      // message did not land), count it, and carry on.
       try {
         await writeSessionMessage(agentGroupId, session.id, {
           id: `restart-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
@@ -533,59 +589,19 @@ export async function restartAgentGroupContainers(
         });
         continue;
       }
+      // The write awaits too. A replacement installed under it will consume
+      // this row on its own first poll, which is prompt delivery to a live
+      // container rather than the indefinite stranding above — but it is not
+      // the process this restart chose, so it is not killed.
+      if (getContainerSpawnedAt(session.id) !== spawnGeneration) {
+        log.info('Restart: container was replaced while writing the wake message; leaving the replacement alone', {
+          agentGroupId,
+          sessionId: session.id,
+        });
+        continue;
+      }
     }
-    // The container can exit during the awaited write above, and killContainer
-    // no-ops on a session it no longer tracks — counting that as a restart
-    // reports work that did not happen.
-    if (!isContainerRunning(session.id)) continue;
-    // Generation token for the process we are about to kill. The pending read
-    // below is async now, so the snapshotted container can exit and an inbound
-    // wake can install a REPLACEMENT before control returns — and killing that
-    // one is both wrong and silent: if the read saw no due rows, no onExit is
-    // installed, so the replacement's freshly claimed input goes dark until a
-    // later recovery pass. `spawnedAt` changes on every spawn, so comparing it
-    // across the await identifies the process rather than merely the session.
-    const spawnGeneration = getContainerSpawnedAt(session.id);
 
-    // Always respawn after the kill when there is anything to process: an
-    // explicit wake message, or in-flight messages the dying container had
-    // claimed. Without this, a provider switch mid-conversation leaves the
-    // claimed messages dark until the next inbound or a slow sweep backoff.
-    //
-    // This open can throw too, now that the inbound funnel refuses under a
-    // reclaim claim — same rule as the write: cost this session, not the loop.
-    let hasPending: boolean;
-    try {
-      // Read-only, so `withExistingMailboxSession` — never the provisioning
-      // variant, which would resurrect a reclaimed session (invariant I-4).
-      // `undefined` (no mailbox) is treated exactly like a read failure rather
-      // than as "nothing pending": this session's container is RUNNING, so a
-      // missing mailbox is an inconsistent host view, and the conservative
-      // answer is to leave it alone. Same rule as the write above: cost this
-      // session, not the loop.
-      const due = await withExistingNanoclawSession(session.agent_group_id, session.id, (mailbox) =>
-        mailbox.countDueMessages(),
-      );
-      if (due === undefined) throw new Error(`session ${session.id} has no mailbox to read pending work from`);
-      hasPending = due > 0;
-    } catch (err) {
-      failed += 1;
-      log.warn('Restart: could not read pending work; leaving this container running', {
-        agentGroupId,
-        sessionId: session.id,
-        err,
-      });
-      continue;
-    }
-    // Re-check the generation, not just liveness: a replacement is "running"
-    // too. Leave it alone — it is doing the work this restart wanted done.
-    if (getContainerSpawnedAt(session.id) !== spawnGeneration) {
-      log.info('Restart: container was replaced while reading pending work; leaving the replacement alone', {
-        agentGroupId,
-        sessionId: session.id,
-      });
-      continue;
-    }
     killContainer(
       session.id,
       reason,

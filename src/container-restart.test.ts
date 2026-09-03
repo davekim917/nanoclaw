@@ -649,10 +649,13 @@ describe('restartAgentGroupContainers', () => {
     mockWriteSessionMessage.mockReset();
   });
 
-  it('does not count a session whose container exited during the wake write', async () => {
+  it('does not count a session whose container exited after it was collected', async () => {
     mockGetSessionsByAgentGroup.mockReturnValue([makeSession('s1', 'g1')]);
     let calls = 0;
-    // Running at collection, gone by the time the write returns.
+    // Running at collection, gone by the liveness check. This used to be
+    // "gone by the time the WRITE returns" — the wake write now happens after
+    // this check rather than before it, so the exit is caught one step
+    // earlier. The outcome it pins is unchanged: no kill, not a restart.
     mockIsContainerRunning.mockImplementation(() => {
       calls += 1;
       return calls < 2;
@@ -662,6 +665,29 @@ describe('restartAgentGroupContainers', () => {
 
     expect(count, 'killContainer would no-op, so this is not a restart').toBe(0);
     expect(mockKillContainer).not.toHaveBeenCalled();
+  });
+
+  /**
+   * A wake row is a claim that a restart happened. It must not outlive a
+   * restart that did not.
+   *
+   * `onWake: 1` rows are consumed only by a FRESH container's first poll, so
+   * one written before a path that declines to kill is not merely wasted — it
+   * survives to greet some unrelated later spawn with a "restarted to apply X"
+   * that never happened. Every decline now precedes the write.
+   */
+  it('writes no wake message for a session it decides not to restart', async () => {
+    mockGetSessionsByAgentGroup.mockReturnValue([makeSession('s1', 'g1'), makeSession('s2', 'g1')]);
+    mockIsContainerRunning.mockReturnValue(true);
+    // s1 declines at the pending read; s2 goes through.
+    missingInboundDbs.add('s1');
+
+    const count = await restartAgentGroupContainers('g1', 'test', 'Resuming.');
+
+    expect(count).toBe(1);
+    expect(mockKillContainer.mock.calls.map((c) => c[0])).toEqual(['s2']);
+    // The claim was made only for the session that was actually restarted.
+    expect(mockWriteSessionMessage.mock.calls.map((c) => c[1])).toEqual(['s2']);
   });
 
   it('keeps going when the pending-work open throws, without killing that container', async () => {
