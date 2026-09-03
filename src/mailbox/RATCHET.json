@@ -21,7 +21,6 @@
   "src/dashboard/api/sessions.ts",
   "src/dashboard/session-title-sweep.ts",
   "src/db/session-db.ts",
-  "src/host-sweep.ts",
   "src/modules/claims/self-heal.ts",
   "src/modules/permissions/task-slack-subject.ts",
   "src/modules/scheduling/create.ts",
