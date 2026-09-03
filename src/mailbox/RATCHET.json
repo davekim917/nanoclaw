@@ -15,6 +15,5 @@
   "container/agent-runner/src/scheduling/wiki-lint-gate.ts",
   "container/agent-runner/src/session-recap.ts",
   "src/modules/sweep-scheduled-move/index.ts",
-  "src/modules/sweep-usage/index.ts",
   "src/storage-manager.ts"
 ]
