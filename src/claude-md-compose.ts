@@ -2,11 +2,20 @@
  * CLAUDE.md composition for agent groups.
  *
  * Replaces the per-group "written once at init, owned by the group" pattern
- * with a host-regenerated entry point that imports:
- *   - a shared base (`container/CLAUDE.md` mounted RO at `/app/CLAUDE.md`)
+ * with a host-regenerated entry point that INLINES:
+ *   - a shared base (`container/CLAUDE.md`, reached through the
+ *     `.claude-shared.md` → `/app/CLAUDE.md` symlink)
+ *   - built-in module fragments (`<name>.instructions.md` next to each MCP
+ *     tool, reached through the `module-<name>.md` symlinks)
  *   - optional per-MCP-server fragments (inline `instructions` field in
  *     `container.json`)
  *   - optional provider-neutral standing instructions
+ *
+ * Every section is written into the file itself rather than `@`-imported:
+ * Claude Code silently DROPS an `@`-import whose resolved realpath falls
+ * outside the project directory, and the fragments that matter resolve into
+ * `/app`, outside the container's project directory of `/workspace/agent`.
+ * See the comment on the composition block below for the measurement.
  *
  * Runs on every spawn from `container-runner.buildMounts()`. Deterministic —
  * same inputs produce the same CLAUDE.md, and stale fragments are pruned.
@@ -183,39 +192,73 @@ export function composeGroupClaudeMd(group: AgentGroup, provider: string): void 
     }
   }
 
-  // Composed entry — imports only. Persona first (top of the system prompt),
-  // then the shared base, then the remaining fragments sorted.
-  const imports: string[] = [];
-  if (desired.has(STANDING_INSTRUCTIONS_FRAGMENT)) {
-    imports.push(`@./.claude-fragments/${STANDING_INSTRUCTIONS_FRAGMENT}`);
-  }
-  imports.push('@./.claude-shared.md');
-  for (const name of [...desired.keys()].filter((n) => n !== STANDING_INSTRUCTIONS_FRAGMENT).sort()) {
-    imports.push(`@./.claude-fragments/${name}`);
-  }
-  const body = [COMPOSED_HEADER, ...imports, ''].join('\n');
-  writeAtomic(path.join(groupDir, 'CLAUDE.md'), body);
-
-  // Codex parity: also emit an AGENTS.md with the same content but with
-  // @-includes resolved inline. Codex doesn't expand @-references in
-  // AGENTS.md, so the references would otherwise reach the model as
-  // literal text. The composer's symlinks point at container paths
-  // (`/app/CLAUDE.md`, `/app/src/mcp-tools/<n>.instructions.md`) — pass a
-  // translation map to the flattener so it can read those targets from
-  // their host paths.
+  // The composer's symlinks point at container paths (`/app/CLAUDE.md`,
+  // `/app/src/mcp-tools/<n>.instructions.md`) which dangle on the host —
+  // give the flattener a translation map so it can read those targets from
+  // their host equivalents.
   const projectRoot = path.resolve(GROUPS_DIR, '..');
   const containerToHost: Record<string, string> = {
     [SHARED_CLAUDE_MD_CONTAINER_PATH]: path.join(projectRoot, 'container', 'CLAUDE.md'),
     [SHARED_MCP_TOOLS_CONTAINER_BASE]: path.join(projectRoot, MCP_TOOLS_HOST_SUBPATH),
   };
-  // Ensure the local file exists BEFORE flattening — it is part of the AGENTS.md
-  // body below, so creating it afterwards would omit it on a group's first spawn.
+
+  // Composed entry — every section INLINED, in the same order the imports
+  // used to be listed: persona first (top of the system prompt), then the
+  // shared base, then the remaining fragments sorted.
+  //
+  // Inlined rather than `@`-imported because Claude Code silently DROPS an
+  // `@`-import whose resolved realpath falls outside the project directory.
+  // Inside the container the project directory is `/workspace/agent` (the
+  // group folder), while `.claude-shared.md` → `/app/CLAUDE.md` and every
+  // `module-*.md` → `/app/src/mcp-tools/*.instructions.md` resolve outside
+  // it, so the shared base and every module fragment reached the model as
+  // nothing at all. Measured 2026-09-03 in the real agent image
+  // (claude-code 2.1.257) by capturing the outgoing Messages API request
+  // body: the inline fragment's sentinel was present, both symlinked ones
+  // were absent, and `--add-dir` on the target directory does not widen the
+  // boundary. Non-Claude providers were unaffected — they read the already
+  // flat AGENTS.md below.
+  //
+  // The fragment files stay on disk and RO-mounted so the agent can still
+  // read them; the model gets its instructions from this one flat file.
+  //
+  // SECURITY: an `inline` fragment's body is emitted VERBATIM — never run
+  // through the flattener. Those bodies come from agent-writable sources
+  // (the group folder is mounted RW at `/workspace/agent`), and the
+  // flattener runs HOST-side with the host user's filesystem access, so
+  // expanding them here would let a container author `@~/.env`, have the
+  // host inline those bytes, and read them back through its own mount —
+  // the same container-to-host exfiltration path the CLAUDE.local.md
+  // handling below is careful to avoid. Only `symlink` fragments, whose
+  // targets are host-controlled files under `/app`, are flattened.
+  const sections: string[] = [COMPOSED_HEADER];
+  const pushFragment = (name: string): void => {
+    const frag = desired.get(name);
+    if (!frag) return;
+    sections.push(
+      frag.type === 'inline' ? frag.content : flattenClaudeMd(path.join(fragmentsDir, name), { containerToHost }),
+    );
+  };
+  pushFragment(STANDING_INSTRUCTIONS_FRAGMENT);
+  sections.push(flattenClaudeMd(sharedLink, { containerToHost }));
+  for (const name of [...desired.keys()].filter((n) => n !== STANDING_INSTRUCTIONS_FRAGMENT).sort()) {
+    pushFragment(name);
+  }
+  const body = [...sections, ''].join('\n');
+  writeAtomic(path.join(groupDir, 'CLAUDE.md'), body);
+
+  // Codex parity: also emit an AGENTS.md carrying the same flat body plus
+  // this group's local standing instructions. Codex doesn't expand
+  // @-references in AGENTS.md, so a reference would reach the model as
+  // literal text — which is exactly why the body above is already flat.
+  //
+  // Ensure the local file exists BEFORE reading it — it is part of the
+  // AGENTS.md body below, so creating it afterwards would omit it on a
+  // group's first spawn.
   const localFile = path.join(groupDir, 'CLAUDE.local.md');
   if (!fs.existsSync(localFile)) {
     fs.writeFileSync(localFile, '');
   }
-
-  const agentsBody = flattenClaudeMd(path.join(groupDir, 'CLAUDE.md'), { containerToHost });
 
   // Operator standing instructions must reach EVERY provider, not just Claude.
   // Claude Code auto-discovers `CLAUDE.local.md`; Codex and OpenCode read only
@@ -238,14 +281,14 @@ export function composeGroupClaudeMd(group: AgentGroup, provider: string): void 
   // safe failure. No group's local file uses includes today.
   const localBody = fs.readFileSync(localFile, 'utf-8').trim();
   const agentsHeader =
-    '<!-- Generated by composeGroupClaudeMd from CLAUDE.md. Do not edit. @-includes resolved inline for Codex. -->\n\n';
+    '<!-- Generated by composeGroupClaudeMd from CLAUDE.md. Do not edit. All instruction sections inlined. -->\n\n';
   // Written UNCAPPED for every provider — content bloat is judged by a human
   // reading the file, not by a byte number. Codex containers raise their own
   // `project_doc_max_bytes` to CODEX_PROJECT_DOC_CONFIGURED_MAX_BYTES
   // (codex-app-server.ts); warn loudly if we ever exceed that, since it means
   // either the doc grew absurdly or the container override stopped applying.
   const fullAgents =
-    agentsHeader + agentsBody + (localBody ? `\n\n## Standing instructions for this group\n\n${localBody}\n` : '');
+    agentsHeader + body + (localBody ? `\n\n## Standing instructions for this group\n\n${localBody}\n` : '');
   if (provider === 'codex') {
     warnIfOversized(`${group.folder}/AGENTS.md`, fullAgents, CODEX_PROJECT_DOC_CONFIGURED_MAX_BYTES);
   }
