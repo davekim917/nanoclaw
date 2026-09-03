@@ -48,6 +48,27 @@ detect_platform() {
 
 # --- Node.js check ---
 
+# Floor is the highest node:22.x requirement any locked dependency declares
+# (eslint@10 / eslint-visitor-keys@5 need ^22.13.0; vite@8 needs >=22.12.0) —
+# a bare major check would pass 22.0–22.12 and then fail `pnpm run build` or
+# lint. Must match package.json's engines.node and setup/install-node.sh's
+# NODE_MIN_VERSION; bump all three together.
+NODE_MIN_VERSION="22.13.0"
+
+# Returns success if dotted numeric version $1 >= $2 (e.g. "22.13.0" >= "22.13.0").
+version_ge() {
+  local IFS=.
+  local -a a=($1) b=($2)
+  local i x y
+  for i in 0 1 2; do
+    x=${a[i]:-0}
+    y=${b[i]:-0}
+    if [ "$x" -gt "$y" ] 2>/dev/null; then return 0; fi
+    if [ "$x" -lt "$y" ] 2>/dev/null; then return 1; fi
+  done
+  return 0
+}
+
 check_node() {
   NODE_OK="false"
   NODE_VERSION="not_found"
@@ -56,12 +77,10 @@ check_node() {
   if command -v node >/dev/null 2>&1; then
     NODE_VERSION=$(node --version 2>/dev/null | sed 's/^v//')
     NODE_PATH_FOUND=$(command -v node)
-    local major
-    major=$(echo "$NODE_VERSION" | cut -d. -f1)
-    if [ "$major" -ge 22 ] 2>/dev/null; then
+    if version_ge "$NODE_VERSION" "$NODE_MIN_VERSION" 2>/dev/null; then
       NODE_OK="true"
     fi
-    log "Node $NODE_VERSION at $NODE_PATH_FOUND (major=$major, ok=$NODE_OK)"
+    log "Node $NODE_VERSION at $NODE_PATH_FOUND (min=$NODE_MIN_VERSION, ok=$NODE_OK)"
   else
     log "Node not found"
   fi
