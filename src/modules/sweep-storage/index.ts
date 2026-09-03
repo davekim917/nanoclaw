@@ -26,7 +26,7 @@ export function startStorageMaintenanceOnce(activeSessionIds: string[]): void {
     .catch((err) => log.warn('storage-manager: background maintenance failed', { err }));
 }
 
-onHostShutdown(async () => {
+onHostShutdown(async function storageMaintenanceHostShutdown() {
   try {
     await stopStorageMaintenanceWorker();
   } catch (err) {

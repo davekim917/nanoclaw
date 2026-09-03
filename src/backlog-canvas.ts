@@ -210,7 +210,7 @@ export function stopBacklogCanvas(): void {
 // anywhere means this loops over nothing. Set BACKLOG_CANVAS_ENABLED=0 to
 // disable outright. A disabled duty still registers and no-ops, so the
 // registration count is stable across configurations.
-onHostStart(() => {
+onHostStart(function backlogCanvasHostStart() {
   if (process.env.BACKLOG_CANVAS_ENABLED !== '0') {
     // UNGUARDED — a synchronous startup failure must abort boot (§4.2).
     startBacklogCanvas();
@@ -218,7 +218,7 @@ onHostStart(() => {
   }
 });
 
-onHostShutdown(() => {
+onHostShutdown(function backlogCanvasHostShutdown() {
   try {
     stopBacklogCanvas();
   } catch (err) {

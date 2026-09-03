@@ -1895,13 +1895,13 @@ export function stopWorktreeCleanup(): void {
   intervalHandle = null;
 }
 
-onHostStart(() => {
+onHostStart(function worktreeCleanupHostStart() {
   // UNGUARDED — a synchronous startup failure must abort boot (§4.2).
   startWorktreeCleanup();
   log.info('Worktree cleanup started');
 });
 
-onHostShutdown(() => {
+onHostShutdown(function worktreeCleanupHostShutdown() {
   try {
     stopWorktreeCleanup();
   } catch (err) {

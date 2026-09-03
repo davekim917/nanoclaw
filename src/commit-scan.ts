@@ -56,13 +56,13 @@ export function stopCommitScan(): void {
   }
 }
 
-onHostStart(() => {
+onHostStart(function commitScanHostStart() {
   // UNGUARDED — a synchronous startup failure must abort boot (§4.2).
   startCommitScan();
   log.info('Commit scan started');
 });
 
-onHostShutdown(() => {
+onHostShutdown(function commitScanHostShutdown() {
   try {
     stopCommitScan();
   } catch (err) {
