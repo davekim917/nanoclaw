@@ -313,23 +313,60 @@ describe('scripts/init-cli-agent.ts, scripts/init-first-agent.ts, scripts/refres
 
   const read = (relPath: string): string => fs.readFileSync(path.join(REPO_ROOT, relPath), 'utf8');
 
-  /** Relative import targets — VALUE imports only; `import type` is erased at compile time and never executes. */
-  function relativeValueImports(relPath: string, src: string): string[] {
-    const out: string[] = [];
-    const importRe = /^import\s+(type\s+)?(?:[\s\S]*?)\s+from\s+['"](\.[^'"]+)['"];?|^import\s+['"](\.[^'"]+)['"];?/gm;
+  /**
+   * Relative import/export specifiers that create a runtime module-graph
+   * edge — VALUE imports only; `import type` / `export type { … } from` are
+   * erased at compile time and create no runtime edge. Covers three source
+   * shapes, each independently able to reach code an author wrote:
+   *   - static `import … from './x.js'` (and bare `import './x.js'`)
+   *   - dynamic `import('./x.js')`, with or without a preceding `await`
+   *   - re-exports: `export * from './x.js'` / `export * as ns from './x.js'`
+   *     / `export { a, b } from './x.js'`
+   */
+  function relativeValueSpecifiers(src: string): string[] {
+    const specifiers = new Set<string>();
+
+    const staticImportRe =
+      /^import\s+(type\s+)?(?:[\s\S]*?)\s+from\s+['"](\.[^'"]+)['"];?|^import\s+['"](\.[^'"]+)['"];?/gm;
     let match: RegExpExecArray | null;
-    while ((match = importRe.exec(src))) {
+    while ((match = staticImportRe.exec(src))) {
       if (match[1]) continue; // `import type` — no runtime edge
       const specifier = match[2] ?? match[3];
-      if (!specifier) continue;
-      const resolved = path.posix
-        .normalize(path.posix.join(path.posix.dirname(relPath), specifier))
-        .replace(/\.js$/, '.ts');
-      if (fs.existsSync(path.join(REPO_ROOT, resolved))) out.push(resolved);
-      else {
-        const idx = resolved.replace(/\.ts$/, '') + '/index.ts';
-        if (fs.existsSync(path.join(REPO_ROOT, idx))) out.push(idx);
-      }
+      if (specifier) specifiers.add(specifier);
+    }
+
+    const dynamicImportRe = /\bimport\s*\(\s*['"](\.[^'"]+)['"]\s*\)/g;
+    while ((match = dynamicImportRe.exec(src))) {
+      specifiers.add(match[1]);
+    }
+
+    // `export type { … } from` is intentionally NOT matched here: after
+    // `export\s*` the next literal must be `*` or `{`, and `type` fails
+    // that — same erased-at-compile-time reasoning as `import type`.
+    const reExportRe = /^export\s*(?:\*(?:\s+as\s+\w+)?|\{[^}]*\})\s*from\s*['"](\.[^'"]+)['"];?/gm;
+    while ((match = reExportRe.exec(src))) {
+      specifiers.add(match[1]);
+    }
+
+    return [...specifiers];
+  }
+
+  /** Resolve a relative specifier from `relPath` to a repo-root-relative .ts file path under `root`, if one exists. */
+  function resolveSpecifier(relPath: string, specifier: string, root: string): string | undefined {
+    const resolved = path.posix
+      .normalize(path.posix.join(path.posix.dirname(relPath), specifier))
+      .replace(/\.js$/, '.ts');
+    if (fs.existsSync(path.join(root, resolved))) return resolved;
+    const idx = resolved.replace(/\.ts$/, '') + '/index.ts';
+    if (fs.existsSync(path.join(root, idx))) return idx;
+    return undefined;
+  }
+
+  function relativeValueImports(relPath: string, src: string, root: string = REPO_ROOT): string[] {
+    const out: string[] = [];
+    for (const specifier of relativeValueSpecifiers(src)) {
+      const resolved = resolveSpecifier(relPath, specifier, root);
+      if (resolved) out.push(resolved);
     }
     return out;
   }
@@ -355,4 +392,66 @@ describe('scripts/init-cli-agent.ts, scripts/init-first-agent.ts, scripts/refres
       expect(hit, `${target} reaches ${hit} — this proof is stale, re-run the trace`).toBeUndefined();
     });
   }
+
+  describe('relativeValueImports walker — dynamic import() and re-export edges', () => {
+    it('resolves a dynamic import(), an `export * from`, and an `export { … } from` specifier, each to its target file', () => {
+      const dir = tmpDir('walker-edges');
+      fs.writeFileSync(
+        path.join(dir, 'entry.ts'),
+        [
+          'export async function loadDynamic() {',
+          "  return await import('./dynamic-target.js');",
+          '}',
+          "export * from './star-target.js';",
+          "export { value } from './named-target.js';",
+        ].join('\n'),
+      );
+      fs.writeFileSync(path.join(dir, 'dynamic-target.ts'), 'export const dynamicValue = 1;\n');
+      fs.writeFileSync(path.join(dir, 'star-target.ts'), 'export const starValue = 1;\n');
+      fs.writeFileSync(path.join(dir, 'named-target.ts'), 'export const value = 1;\n');
+
+      const src = fs.readFileSync(path.join(dir, 'entry.ts'), 'utf8');
+      const deps = relativeValueImports('entry.ts', src, dir);
+
+      expect(deps.sort()).toEqual(['dynamic-target.ts', 'named-target.ts', 'star-target.ts'].sort());
+    });
+
+    it('does not resolve an `export type { … } from` re-export (erased at compile time, no runtime edge)', () => {
+      const dir = tmpDir('walker-type-only');
+      fs.writeFileSync(path.join(dir, 'entry.ts'), "export type { Foo } from './types-only.js';\n");
+      fs.writeFileSync(path.join(dir, 'types-only.ts'), 'export type Foo = { x: number };\n');
+
+      const src = fs.readFileSync(path.join(dir, 'entry.ts'), 'utf8');
+      const deps = relativeValueImports('entry.ts', src, dir);
+
+      expect(deps).toEqual([]);
+    });
+
+    it('follows a dynamic import() transitively across two hops', () => {
+      const dir = tmpDir('walker-transitive');
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(path.join(dir, 'entry.ts'), "export const load = () => import('./middle.js');\n");
+      fs.writeFileSync(path.join(dir, 'middle.ts'), "export * from './leaf.js';\n");
+      fs.writeFileSync(path.join(dir, 'leaf.ts'), 'export const leaf = 1;\n');
+
+      const sources = new Map(
+        ['entry.ts', 'middle.ts', 'leaf.ts'].map((f) => [f, fs.readFileSync(path.join(dir, f), 'utf8')]),
+      );
+      const visited = new Set(['entry.ts']);
+      const queue = ['entry.ts'];
+      while (queue.length) {
+        const cur = queue.shift()!;
+        const src = sources.get(cur);
+        if (!src) continue;
+        for (const dep of relativeValueImports(cur, src, dir)) {
+          if (!visited.has(dep)) {
+            visited.add(dep);
+            queue.push(dep);
+          }
+        }
+      }
+
+      expect(visited).toEqual(new Set(['entry.ts', 'middle.ts', 'leaf.ts']));
+    });
+  });
 });
