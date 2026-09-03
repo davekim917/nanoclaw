@@ -24,8 +24,8 @@ const h = vi.hoisted(() => {
     spawns: [] as string[],
     // getActiveSessions is spied so F-12.3 can assert it is NEVER called by
     // the registered duty (constraint 4: T19 reuses the tick's own
-    // ctx.sessions, no extra query). openOutboundDb / listTurnUsageSince /
-    // rollupSessionUsage are THE dependencies this family's duty consumes —
+    // ctx.sessions, no extra query). openOutboundDb / rollupSessionUsage are
+    // THE dependencies this family's duty consumes —
     // spies, not stubs, so the registered-duty cases below can assert on
     // them directly (the "acceptance tests must drive the REGISTERED duty"
     // rule). `vi` is available here even though it isn't `require`d: the
@@ -33,8 +33,7 @@ const h = vi.hoisted(() => {
     // the module system itself before this factory runs.
     mockGetActiveSessions: vi.fn(() => [] as unknown[]),
     mockOpenOutboundDb: vi.fn((_path: string) => ({ close: () => undefined }) as unknown),
-    mockListTurnUsageSince: vi.fn((_db: unknown, _afterId: number) => [] as unknown[]),
-    mockRollupSessionUsage: vi.fn((_mailbox: unknown, _agentGroupId: string, _sessionDirKey: string) => 0),
+    mockRollupSessionUsage: vi.fn((_outDb: unknown, _agentGroupId: string, _sessionDirKey: string) => 0),
     mockPruneOldTurnUsage: vi.fn(() => undefined),
   };
 });
@@ -178,13 +177,9 @@ vi.mock('../mailbox/openers.js', async (importOriginal) => {
   const real = await importOriginal<typeof import('../mailbox/openers.js')>();
   return { ...real, openOutboundDb: (p: string) => h.mockOpenOutboundDb(p) };
 });
-vi.mock('../mailbox/ops/reads.js', async (importOriginal) => {
-  const real = await importOriginal<typeof import('../mailbox/ops/reads.js')>();
-  return { ...real, listTurnUsageSince: (db: unknown, afterId: number) => h.mockListTurnUsageSince(db, afterId) };
-});
 vi.mock('../../db/usage.js', () => ({
-  rollupSessionUsage: (mailbox: unknown, agentGroupId: string, sessionDirKey: string) =>
-    h.mockRollupSessionUsage(mailbox, agentGroupId, sessionDirKey),
+  rollupSessionUsage: (outDb: unknown, agentGroupId: string, sessionDirKey: string) =>
+    h.mockRollupSessionUsage(outDb, agentGroupId, sessionDirKey),
   pruneOldTurnUsage: () => h.mockPruneOldTurnUsage(),
 }));
 
@@ -263,7 +258,6 @@ describe('registered usage-rollup duty (T19)', () => {
     h.spawns.length = 0;
     h.mockGetActiveSessions.mockClear();
     h.mockOpenOutboundDb.mockClear();
-    h.mockListTurnUsageSince.mockClear();
     h.mockRollupSessionUsage.mockClear();
     h.mockPruneOldTurnUsage.mockClear();
     _resetSweepRegistryForTesting();

@@ -5,11 +5,14 @@
  * (constraint 4), no extra `getActiveSessions()` call.
  *
  * Moved from src/host-sweep.ts UNCHANGED (cut/paste, same statements, same
- * log strings, same thresholds, same helper calls), taking mailbox PR 6's
- * shape for the `rollupSessionUsage` call (host-sweep.ts merge sha
- * 47b71dcf: `rollupSessionUsage` now asks for only the
- * `Pick<NanoclawMailboxSession, 'listTurnUsageSince'>` op it uses, bound here
- * to the module's own outbound handle via `listTurnUsageSince`).
+ * log strings, same thresholds, same helper calls). S2-PR12's own branch sat
+ * on mailbox PR 6, where `rollupSessionUsage` takes only the
+ * `Pick<NanoclawMailboxSession, 'listTurnUsageSince'>` op it uses; this
+ * integration lineage is mailbox PR 5 rebased onto main, where it still takes
+ * the raw outbound handle and `../mailbox/ops/reads.ts` does not exist. The
+ * call therefore keeps host-sweep.ts's own pre-move shape,
+ * `rollupSessionUsage(outDb, …)`. The op-injected form returns when this work
+ * is rebased onto mailbox PR 7's head.
  *
  * Deliberately NOT routed through a mailbox session (`withExistingNanoclawSession`):
  * this projection touches outbound.db only, and the seam's existence check is
@@ -31,7 +34,6 @@ import { rollupSessionUsage, pruneOldTurnUsage } from '../../db/usage.js';
 import type { Session } from '../../types.js';
 import { sessionMailboxPath } from '../mailbox/index.js';
 import { openOutboundDb } from '../mailbox/openers.js';
-import { listTurnUsageSince } from '../mailbox/ops/reads.js';
 import { registerSweepDuty, registerSweepDutySource, SWEEP_DUTY_INVENTORY } from '../../host-sweep.js';
 
 const id = SWEEP_DUTY_INVENTORY;
@@ -66,13 +68,9 @@ export async function sweepUsageRollup(sessions: readonly Session[]): Promise<vo
       // session — see the module doc comment above (constraint 21).
       const outDb = openOutboundDb(outPath);
       try {
-        // `rollupSessionUsage` asks for only the op it uses (mailbox seam
-        // PR 6), so the funnel's handle is bound to that one op here.
-        rollupSessionUsage(
-          { listTurnUsageSince: (afterId) => listTurnUsageSince(outDb, afterId) },
-          session.agent_group_id,
-          `${session.agent_group_id}/${session.id}`,
-        );
+        // `rollupSessionUsage` takes the raw outbound handle on this lineage
+        // (mailbox PR 5 on main) — the op-injected form is mailbox PR 6's.
+        rollupSessionUsage(outDb, session.agent_group_id, `${session.agent_group_id}/${session.id}`);
       } finally {
         outDb.close();
       }
