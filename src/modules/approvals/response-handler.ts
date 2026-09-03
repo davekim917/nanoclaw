@@ -10,7 +10,8 @@
  *      a one-line reason (see reason-capture.ts). Reject finalization is shared
  *      via finalizeReject.
  *   2. OneCLI credential approvals (`action = 'onecli_credential'`). Resolved
- *      via an in-memory Promise — see onecli-approvals.ts.
+ *      row-keyed, so the card stays clickable across a host restart — see
+ *      onecli-approvals.ts.
  *
  * The response handler is registered via core's `registerResponseHandler`;
  * core iterates handlers and the first one to return `true` claims the response.
@@ -44,10 +45,11 @@ function isThreadDelivery(approval: PendingApproval, session: Session): boolean 
 }
 
 export async function handleApprovalsResponse(payload: ResponsePayload): Promise<boolean> {
-  // OneCLI credential approvals — resolved via in-memory Promise first.
-  // The 3-arg resolver enforces its own cross-tenant approver-set auth
-  // (onecli-approvals.ts), so this runs ahead of isAuthorizedApprovalClick.
-  if (resolveOneCLIApproval(payload.questionId, payload.value, payload.userId ?? '')) {
+  // OneCLI credential approvals — row-keyed resolution first. The 3-arg
+  // resolver looks the row up itself and enforces its own cross-tenant
+  // approver-set auth (onecli-approvals.ts), so this runs ahead of
+  // isAuthorizedApprovalClick and claims every onecli_credential row.
+  if (await resolveOneCLIApproval(payload.questionId, payload.value, payload.userId ?? '')) {
     return true;
   }
 
@@ -66,10 +68,15 @@ export async function handleApprovalsResponse(payload: ResponsePayload): Promise
   }
 
   if (approval.action === ONECLI_ACTION) {
-    // OneCLI rows are resolved by the in-memory 3-arg resolver at the top of
-    // handleApprovalsResponse. Reaching here means the resolver is gone (timer
-    // fired or odd process state) — nothing to apply, just drop the row.
-    deletePendingApproval(payload.questionId);
+    // Unreachable in practice: resolveOneCLIApproval above claims every
+    // onecli_credential row it can find, and this branch is only reached when
+    // getPendingApproval found one. Kept as a guard so a future refactor can't
+    // route a credential row into the module-approval path below — that path
+    // deletes the row, which would silently kill a card that is still
+    // clickable and still has a held request behind it.
+    log.warn('OneCLI approval row reached the module-approval path — ignoring', {
+      approvalId: approval.approval_id,
+    });
     return true;
   }
 

@@ -374,11 +374,11 @@ export function createPendingApproval(
     .prepare(
       `INSERT OR IGNORE INTO pending_approvals
          (approval_id, session_id, request_id, action, payload, created_at,
-          agent_group_id, channel_type, platform_id, thread_id, platform_message_id, expires_at, status,
+          agent_group_id, channel_type, platform_id, instance, thread_id, platform_message_id, expires_at, status,
           title, question, options_json, approver_user_id)
        VALUES
          (@approval_id, @session_id, @request_id, @action, @payload, @created_at,
-          @agent_group_id, @channel_type, @platform_id, @thread_id, @platform_message_id, @expires_at, @status,
+          @agent_group_id, @channel_type, @platform_id, @instance, @thread_id, @platform_message_id, @expires_at, @status,
           @title, @question, @options_json, @approver_user_id)`,
     )
     .run({
@@ -386,6 +386,7 @@ export function createPendingApproval(
       agent_group_id: null,
       channel_type: null,
       platform_id: null,
+      instance: null,
       thread_id: null,
       platform_message_id: null,
       expires_at: null,
@@ -423,6 +424,28 @@ export function getPendingApproval(approvalId: string): PendingApproval | undefi
 
 export function updatePendingApprovalStatus(approvalId: string, status: PendingApproval['status']): void {
   getDb().prepare('UPDATE pending_approvals SET status = ? WHERE approval_id = ?').run(status, approvalId);
+}
+
+/**
+ * Compare-and-swap on an approval's status. Returns true only for the caller
+ * that actually moved the row from `from` to `to`.
+ *
+ * This is the claim primitive for row-keyed resolution: a card stays clickable
+ * across a host restart, so two paths can race for the same row (an admin
+ * click and the expiry sweep, or a click that arrives while the pre-TTL timer
+ * is firing). An unconditional UPDATE lets both "win" and the request gets
+ * decided twice. Single-statement UPDATE ... WHERE status = ? is atomic in
+ * SQLite, so the loser sees changes === 0 and backs off.
+ */
+export function transitionPendingApprovalStatus(
+  approvalId: string,
+  from: PendingApproval['status'],
+  to: PendingApproval['status'],
+): boolean {
+  const result = getDb()
+    .prepare('UPDATE pending_approvals SET status = ? WHERE approval_id = ? AND status = ?')
+    .run(to, approvalId, from);
+  return result.changes > 0;
 }
 
 /**
