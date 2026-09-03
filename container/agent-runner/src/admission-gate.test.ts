@@ -113,4 +113,28 @@ describe('admission gate', () => {
     getInboundDb().prepare("UPDATE repo_ingress_fence SET state = 'released' WHERE id = 1").run();
     expect(evaluateAdmission()).toBe(false);
   });
+
+  // Round 1 (Codex P2): the seam's fail-open catch is right for an optional
+  // observer and wrong for this gate. The loop's late re-checks run after
+  // selection has already produced a batch, so a swallowed read error there
+  // would admit a turn under an active fence with nothing left to stop it.
+  test('the fence gate holds when the barrier read fails, and reports it once', () => {
+    // A fence table the read cannot understand: 'no such table' is a legitimate
+    // pre-fence session DB and returns null, but 'no such column' rethrows.
+    getInboundDb().exec('DROP TABLE repo_ingress_fence');
+    getInboundDb().exec('CREATE TABLE repo_ingress_fence (id INTEGER PRIMARY KEY)');
+
+    const errors = spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      registerAdmissionGate(repositoryFenceAdmissionGate);
+      expect(evaluateAdmission()).toBe(true);
+      expect(evaluateAdmission()).toBe(true);
+      expect(errors.mock.calls.length).toBe(1);
+      // The gate absorbed it — the seam never saw a throwing gate.
+      expect(String(errors.mock.calls[0][0])).toContain('[admission] repository fence read failed');
+      expect(ackRow()).toBeNull();
+    } finally {
+      errors.mockRestore();
+    }
+  });
 });
