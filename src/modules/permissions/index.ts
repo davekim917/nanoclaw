@@ -37,6 +37,7 @@ import { log } from '../../log.js';
 import type { MessagingGroup, MessagingGroupAgent } from '../../types.js';
 import { canAccessAgentGroup, isSiblingBotSender } from './access.js';
 import {
+  AGENT_ACCESS_SCOPE_WARNING,
   buildAgentSelectionOptions,
   CHOOSE_EXISTING_VALUE,
   CONNECT_PREFIX,
@@ -525,7 +526,7 @@ async function handleChannelApprovalResponse(payload: ResponsePayload): Promise<
     const agentGroups = getAllAgentGroups();
     const options = buildAgentSelectionOptions(agentGroups, approverId);
     const title = '📋 Choose an agent';
-    const question = 'Which agent should handle this channel?';
+    const question = `Which agent should handle this channel? ${AGENT_ACCESS_SCOPE_WARNING}`;
     updatePendingChannelApprovalCard(row.messaging_group_id, title, question, JSON.stringify(options));
 
     try {
