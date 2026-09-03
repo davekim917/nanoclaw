@@ -285,6 +285,8 @@ Mailbox PR 5 already ships the two distinct strings, with the classifying flag a
 | W2 / W3 / W5 / SLA observe / post-kill opener | will not open | `Host sweep mailbox unopenable` + a `window` field | **no quiet mark**; retried next tick |
 | W2 / W3 / W5 / SLA observe / post-kill duty body | threw | `Host sweep duty failed` + `duty` and `window` fields | **no quiet mark**; retried next tick |
 
+**As built on mailbox PR 5's final head `9078f5cf` (rev-3 grounding, build stage):** only W1 has a classifying try/catch (`:1544-1667`, keyed on `SessionDbMissingError` / `SessionDbUnopenableError` / the entered marker); every later-window failure falls to `sweepOnce`'s generic per-session catch (`:934`, `Host sweep duty failed`, no `window` field, no quiet mark). The rows below for W2–W5, SLA observe and post-kill are therefore what PR 2 **builds** — new log structure with the same outcome (no backoff), not a port of existing classification.
+
 Two things this table settles that revision 1 got wrong:
 
 - **Classification happens at every boundary, not only W1.** Revision 1 claimed one flag covered every duty. It cannot: once W1 succeeds the flag is true, so a later opener failure was indistinguishable from a duty exception. Each open now carries its own marker and the log line names the `window`, so an operator can tell a W5 opener fault from a recurrence duty fault.
@@ -332,7 +334,7 @@ The same four things every time, so review is a template rather than a fresh rea
 
 **These are prerequisites, not seam-2 work.** Converting the six callees off the bridge belongs to the mailbox series; seam 2 waits for them and takes none of them.
 
-The `db/usage.ts` conversion is **done** on mailbox PR 6 and verified at `75c24b52`: `rollupSessionUsage` now takes `mailbox: Pick<NanoclawMailboxSession, 'listTurnUsageSince'>` (`src/db/usage.ts:118-124`) instead of a raw handle, reading through the named op in `src/modules/mailbox/ops/reads.ts`. The PR 5 source comment at `:1836-1838` reads as if the bridge had no owner; it does, and the work has landed on that branch.
+The `db/usage.ts` conversion is **done** on mailbox PR 6's branch (verified at `75c24b52`; PR 6 final head `a49b8172`) — on PR 5's head `9078f5cf`, S2-PR2's base, `rollupSessionUsage` still takes a raw handle (`src/db/usage.ts:130`) and the sweep opens outbound through the module's raw opener (`:1855`), a second consumer of the KEEP-PATCH import beside `recoverMoveIntents` (`:1433`); PR 2 registers T19 as-is and S2-PR12 branches from PR 6's head: `rollupSessionUsage` now takes `mailbox: Pick<NanoclawMailboxSession, 'listTurnUsageSince'>` (`src/db/usage.ts:118-124`) instead of a raw handle, reading through the named op in `src/modules/mailbox/ops/reads.ts`. The PR 5 source comment at `:1836-1838` reads as if the bridge had no owner; it does, and the work has landed on that branch.
 
 One sequencing note: three comments on the PR 5 branch (`:1223-1224`, `:1591`, `:1768-1769`) say those callees move in "PR 3" where the mailbox plan says PR 4. The comments are being corrected on #271. Seam 2 sequences against **PR 4** regardless of which text a builder happens to read.
 
