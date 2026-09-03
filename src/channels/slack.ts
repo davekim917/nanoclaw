@@ -459,9 +459,18 @@ async function resolveMpdmParticipants(client: SlackConversationClient, channelI
         };
       }
     ).user;
-    if (!res.ok || !u || !isSlackHumanMember(members[index]!, u)) continue;
+    // A LOOKUP FAILURE is not a filtered member. Skipping it would present a
+    // truncated roster as complete — "a group DM with Alice" when Bob's
+    // profile call merely failed — and that label is then persisted as the
+    // messaging group's name. All-or-nothing: an unresolved roster degrades
+    // the card to "a group DM", which is true.
+    if (!res.ok || !u) return null;
+    if (!isSlackHumanMember(members[index]!, u)) continue;
     const name = slackUserDisplayName(u);
-    if (name) names.push(name);
+    // A resolvable human with no usable name is the same problem: naming the
+    // rest would claim a completeness we do not have.
+    if (!name) return null;
+    names.push(name);
   }
   return names.length > 0 ? names : null;
 }

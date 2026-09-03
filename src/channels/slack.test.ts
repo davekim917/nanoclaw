@@ -417,6 +417,28 @@ describe('resolveSlackConversation', () => {
     });
   });
 
+  it('reports an unresolved roster rather than a partial one when a profile lookup fails', async () => {
+    // "with Alice" when Bob's users.info merely failed would be a false claim,
+    // and it gets persisted as the messaging group's name.
+    const c = client(
+      { is_mpim: true, name: 'mpdm-alice--bob-1' },
+      { members: ['U-alice', 'U-bob'], users: { 'U-alice': alice } },
+    );
+    await expect(resolveSlackConversation(c, 'slack:G1')).resolves.toEqual({ type: 'group_dm', name: null });
+  });
+
+  it('still names the roster when every lookup succeeds and only bots are filtered', async () => {
+    const c = client(
+      { is_mpim: true, name: 'mpdm-alice--bob-1' },
+      { members: ['U-alice', 'U-bot'], users: { 'U-alice': alice, 'U-bot': botMember } },
+    );
+    await expect(resolveSlackConversation(c, 'slack:G1')).resolves.toEqual({
+      type: 'group_dm',
+      name: null,
+      participantNames: ['Alice'],
+    });
+  });
+
   it('still reports a group DM when the roster cannot be resolved', async () => {
     const c = client({ is_mpim: true, name: 'mpdm-alice--bob-1' }, { members: [] });
     await expect(resolveSlackConversation(c, 'slack:G1')).resolves.toEqual({ type: 'group_dm', name: null });
