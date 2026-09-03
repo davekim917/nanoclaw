@@ -114,7 +114,7 @@ import {
   type InboundMessageRouting,
 } from './ops/recovery.js';
 
-export { SessionDbMissingError } from './openers.js';
+export { SessionDbMissingError, SessionDbUnopenableError } from './openers.js';
 export { parseSqliteUtc } from './sqlite-utc.js';
 export {
   canAttemptContinuationRecovery,

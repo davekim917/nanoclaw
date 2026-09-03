@@ -42,6 +42,7 @@ import { getActiveSessions, getSession, isTaskThread, updateSession } from './db
 import { getAgentGroup } from './db/agent-groups.js';
 import {
   SessionDbMissingError,
+  SessionDbUnopenableError,
   sessionMailboxPath,
   type ForkContainerStateRow as ContainerState,
   type NanoclawMailboxSession,
@@ -51,7 +52,7 @@ import { withExistingNanoclawSession } from './modules/mailbox/session.js';
 // DATA_DIR, so its session DBs are not addressable by a mailbox key and it
 // cannot go through the seam. It stays on the module's own open funnel — the
 // one place in this file that still opens a session DB by path.
-import { openInboundDb as openInboundDbByPath } from './modules/mailbox/openers.js';
+import { openInboundDb as openInboundDbByPath, openOutboundDb } from './modules/mailbox/openers.js';
 import { restoreTaskRow, type TaskRowSnapshot } from './modules/scheduling/db.js';
 import { countLiveRowsInSessions } from './modules/scheduling/live-count.js';
 import { runHostGatedTaskScripts } from './modules/scheduling/host-script.js';
@@ -1533,9 +1534,12 @@ async function sweepSession(session: Session): Promise<number | null> {
   }
 
   let plan: WakePlan | undefined;
-  // Distinguishes "the mailbox would not open" from "a duty threw", which the
-  // catch below cannot tell apart from the error alone. The open happens
-  // before the action body runs, so this flag is set iff we got inside.
+  // Distinguishes "a duty threw" from "the mailbox would not open". The INBOUND
+  // open happens before the action body, so this flag alone settles that one —
+  // but the OUTBOUND handle opens lazily, partway through the action, and by
+  // then the flag is already true. Position cannot classify that, so the funnel
+  // does: it raises SessionDbUnopenableError, which the catch routes to the
+  // backoff whatever this flag says.
   let enteredPlanSession = false;
   try {
     plan = await run(async (mailbox): Promise<WakePlan> => {
@@ -1642,12 +1646,14 @@ async function sweepSession(session: Session): Promise<number | null> {
     // A session that vanished under us is the ordinary steady state — counted,
     // backed off, not logged as a fault.
     if (err instanceof SessionDbMissingError) return skipUnreadable(session.id, 'session mailbox vanished');
-    // The mailbox itself would not open: present but unreadable (EACCES,
-    // descriptor exhaustion, a corrupt file). There is nothing to sweep until
-    // that changes, and retrying every 60s is what produced ~4k identical
-    // errors in the hot-journal incident — so this one takes the backoff, with
-    // an error line so it is never silently filed as a quiet session.
-    if (!enteredPlanSession) {
+    // Present but unopenable: EACCES, descriptor exhaustion, a corrupt file, a
+    // failed hot-journal recovery. There is nothing to sweep until that
+    // changes, and retrying every 60s is what produced ~4k identical errors in
+    // the hot-journal incident — so this takes the backoff, with an error line
+    // so it is never silently filed as a quiet session. The error CLASS is what
+    // decides, not how far we got: a lazily-opened outbound handle fails after
+    // the duties have started and must still land here.
+    if (err instanceof SessionDbUnopenableError || !enteredPlanSession) {
       log.error('Host sweep mailbox unopenable', { err, sessionId: session.id });
       return skipUnreadable(session.id, `session mailbox unreadable: ${String(err)}`);
     }
@@ -1837,23 +1843,22 @@ async function sweepUsageRollup(sessions: Session[]): Promise<void> {
       }
       if (shouldSkipUsageRollup(usageRollupMtimeCache.get(session.id), mtimeMs)) continue;
 
-      // `rollupSessionUsage` still takes a raw outbound handle (`db/usage.ts`
-      // has no PR in this series yet); it only reads. Handing it this
-      // session's own handle keeps the rollup on one open.
-      const rolledUp = await withExistingNanoclawSession(session.agent_group_id, session.id, (mailbox) => {
-        rollupSessionUsage(
-          mailbox.legacyOutboundHandle(),
-          session.agent_group_id,
-          `${session.agent_group_id}/${session.id}`,
-        );
-        return true;
-      });
-      // Only a rollup that RAN may claim this mtime as processed. A session
-      // whose inbound.db is gone while outbound.db remains resolves undefined
-      // here, and marking it done would skip it on every later sweep for as
-      // long as the outbound file is untouched — its turn_usage rows would
-      // never reach the central totals.
-      if (rolledUp) usageRollupMtimeCache.set(session.id, mtimeMs);
+      // Read through the module's own outbound funnel, NOT the mailbox
+      // session. This projection touches outbound.db only, and the seam's
+      // existence check is keyed on inbound.db — routing it through a session
+      // added a gate the pre-seam code never had, so a session whose
+      // inbound.db is gone while outbound.db remains stopped being rolled up
+      // at all, and its turn_usage rows would never reach the central totals.
+      // `outPath` above is already the gate that belongs here: no outbound
+      // file, no rollup. Same funnel `worktree-cleanup.ts` and the GC use, so
+      // there is still one implementation of every statement.
+      const outDb = openOutboundDb(outPath);
+      try {
+        rollupSessionUsage(outDb, session.agent_group_id, `${session.agent_group_id}/${session.id}`);
+      } finally {
+        outDb.close();
+      }
+      usageRollupMtimeCache.set(session.id, mtimeMs);
     } catch (err) {
       log.warn('Usage rollup failed for session', { err, sessionId: session.id });
     }
