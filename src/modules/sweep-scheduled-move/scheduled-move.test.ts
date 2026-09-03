@@ -611,4 +611,118 @@ describe('recoverMoveIntents (D3) + pruneAuditBodies (D4)', () => {
     expect(row.action).toBe('cancel'); // row survives so history can still label the cancellation
     db.close();
   });
+
+  // ── plan.md §8's three named acceptance cases, as leaf `it()`s (Codex round
+  // on efb8350a..73e6c960, finding F1: the describe title above is an
+  // aggregate label, not itself an acceptance case) ──────────────────────────
+
+  it('move-intent recovery restores from snapshot and defers on an unreadable live count', () => {
+    const db = centralDb();
+
+    // Branch 1 (already covered individually above, restated here under the
+    // plan-named case): zero readable live rows → restore from the snapshot.
+    const restoreInbound = seedInbound('src-ag', 'src-sess');
+    writeIntent(db, { seriesId: 'ser-named-restore', ag: 'src-ag', sess: 'src-sess', tsMs: NOW - 2 * SWEEP_MS });
+
+    // Branch 2 (the gap Codex found — never exercised by the ported cases):
+    // the source's inbound.db EXISTS but is UNREADABLE (garbage bytes, not a
+    // valid sqlite file), so `countLiveRowsInSessions`'s scoped count comes
+    // back `unreadable: true`. The FAIL-SAFE (F6 / M2, recoverMoveIntents'
+    // own doc comment) says live state is UNKNOWN in that case: recovery must
+    // DEFER — no restore, the intent stays unresolved, and the audit row's
+    // body is untouched — never fall through to "zero live rows → restore".
+    const badDir = path.join(DIR, 'v2-sessions', 'bad-ag', 'bad-sess');
+    fs.mkdirSync(badDir, { recursive: true });
+    fs.writeFileSync(path.join(badDir, 'inbound.db'), 'not a sqlite file, deliberately garbage bytes');
+    writeIntent(db, { seriesId: 'ser-named-unreadable', ag: 'bad-ag', sess: 'bad-sess', tsMs: NOW - 2 * SWEEP_MS });
+    const before = db
+      .prepare("SELECT detail_json FROM scheduled_audit WHERE correlation_id = 'corr-ser-named-unreadable'")
+      .get() as { detail_json: string };
+
+    recoverMoveIntents(db, { dataDir: DIR, nowMs: NOW });
+
+    // Branch 1: restored and resolved.
+    const restoredLive = openInboundDb(restoreInbound)
+      .prepare(
+        "SELECT COUNT(*) AS c FROM messages_in WHERE series_id='ser-named-restore' AND status IN ('pending','paused')",
+      )
+      .get() as { c: number };
+    expect(restoredLive.c).toBe(1);
+    const restoredRow = db
+      .prepare("SELECT resolved_at FROM scheduled_audit WHERE correlation_id = 'corr-ser-named-restore'")
+      .get() as { resolved_at: string | null };
+    expect(restoredRow.resolved_at).toBeTruthy();
+
+    // Branch 2: deferred — no restore, left unresolved, audit body unchanged.
+    const deferredRow = db
+      .prepare(
+        "SELECT resolved_at, detail_json FROM scheduled_audit WHERE correlation_id = 'corr-ser-named-unreadable'",
+      )
+      .get() as { resolved_at: string | null; detail_json: string };
+    expect(deferredRow.resolved_at).toBeNull();
+    expect(deferredRow.detail_json).toBe(before.detail_json);
+    db.close();
+  });
+
+  it('audit-body prune nulls the three preview columns at 90 days and keeps the metadata row', () => {
+    const db = centralDb();
+    const id = insertAudit(db, { action: 'edit', tsMs: NOW - 91 * 24 * 3600_000 });
+
+    pruneAuditBodies(db, { nowMs: NOW });
+
+    const row = db
+      .prepare(
+        'SELECT actor, action, agent_group_id, session_id, series_id, correlation_id, before_preview, after_preview, detail_json FROM scheduled_audit WHERE id = ?',
+      )
+      .get(id) as Record<string, unknown> | undefined;
+    // The metadata row still exists — a nulled body is not a deleted row.
+    expect(row).toBeDefined();
+    // All THREE preview columns nulled, nothing less.
+    expect(row!.before_preview).toBeNull();
+    expect(row!.after_preview).toBeNull();
+    expect(row!.detail_json).toBeNull();
+    // Metadata untouched.
+    expect(row!.actor).toBe('owner');
+    expect(row!.action).toBe('edit');
+    expect(row!.agent_group_id).toBe('ag');
+    expect(row!.session_id).toBe('sess');
+    expect(row!.series_id).toBe('ser');
+    db.close();
+  });
+
+  it('recovery walks the injected sessions root by path and is exempt from the mailbox seam', () => {
+    // The injected root this call passes is NOT the real DATA_DIR (the value
+    // src/config.js resolves to, mocked at file scope to `h.dataDir` above) —
+    // recoverMoveIntents never falls back to it when an explicit `dataDir` is
+    // given, and a session addressed only under the injected root is still
+    // recovered.
+    expect(path.resolve(DIR)).not.toBe(path.resolve(h.dataDir));
+
+    const db = centralDb();
+    const inbound = seedInbound('exempt-ag', 'exempt-sess');
+    writeIntent(db, { seriesId: 'ser-exempt', ag: 'exempt-ag', sess: 'exempt-sess', tsMs: NOW - 2 * SWEEP_MS });
+
+    recoverMoveIntents(db, { dataDir: DIR, nowMs: NOW });
+
+    const restored = openInboundDb(inbound)
+      .prepare("SELECT COUNT(*) AS c FROM messages_in WHERE series_id='ser-exempt' AND status IN ('pending','paused')")
+      .get() as { c: number };
+    expect(restored.c).toBe(1);
+    const resolvedRow = db
+      .prepare("SELECT resolved_at FROM scheduled_audit WHERE correlation_id = 'corr-ser-exempt'")
+      .get() as { resolved_at: string | null };
+    expect(resolvedRow.resolved_at).toBeTruthy();
+    db.close();
+
+    // The permanent KEEP-PATCH: the module stays on the ratchet allowlist,
+    // and the reason is restated at the import site — not residue, a
+    // deliberate, documented exception (plan.md §5).
+    const repoRoot = path.resolve(__dirname, '../../..');
+    const ratchet = JSON.parse(fs.readFileSync(path.join(repoRoot, 'src/mailbox/RATCHET.json'), 'utf8')) as string[];
+    expect(ratchet).toContain('src/modules/sweep-scheduled-move/index.ts');
+    const moduleSource = fs.readFileSync(path.join(repoRoot, 'src/modules/sweep-scheduled-move/index.ts'), 'utf8');
+    expect(moduleSource).toContain('INJECTED sessions root');
+    expect(moduleSource).toContain('cannot go through the seam');
+    expect(moduleSource).toContain('KEEP-PATCH');
+  });
 });
