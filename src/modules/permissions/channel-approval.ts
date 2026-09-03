@@ -53,7 +53,8 @@ import { getMessagingGroup, updateMessagingGroup } from '../../db/messaging-grou
 import { getDeliveryAdapter } from '../../delivery.js';
 import { initGroupFilesystem } from '../../group-init.js';
 import { log } from '../../log.js';
-import type { InboundEvent } from '../../channels/adapter.js';
+import { formatParticipantList } from '../../channels/adapter.js';
+import type { ChannelConversation, InboundEvent } from '../../channels/adapter.js';
 import type { AgentGroup } from '../../types.js';
 import { pickApprovalDelivery, pickApprover } from '../approvals/primitive.js';
 import {
@@ -140,14 +141,35 @@ function buildQuestionText(
   channelName: string | null,
   channelType: string,
   ruleNote: string | null,
+  conversation?: ChannelConversation | null,
 ): string {
   const who = senderName ?? 'Someone';
   const note = ruleNote ? ` If connected, the agent ${ruleNote}.` : '';
   if (isGroup) {
-    const where = channelName ? `${channelName} on ${channelType}` : `a ${channelType} channel`;
+    const where = describeWhere(channelName, channelType, conversation);
     return `${who} mentioned your bot in ${where}.${note} ${AGENT_ACCESS_SCOPE_WARNING} How would you like to handle this channel?`;
   }
   return `${who} sent your bot a DM on ${channelType}.${note} ${AGENT_ACCESS_SCOPE_WARNING} How would you like to handle it?`;
+}
+
+/**
+ * Where the mention happened, in the most specific form the adapter could
+ * give us. A group DM has no name a human recognizes — the platform's own
+ * label is a slug like `mpdm-alice--bob--carol-1` — so it is described by who
+ * is in it. Everything else keeps the existing channel-name rendering.
+ */
+function describeWhere(
+  channelName: string | null,
+  channelType: string,
+  conversation?: ChannelConversation | null,
+): string {
+  if (conversation?.type === 'group_dm') {
+    const names = conversation.participantNames;
+    return names && names.length > 0
+      ? `a group DM with ${formatParticipantList(names)} on ${channelType}`
+      : `a group DM on ${channelType}`;
+  }
+  return channelName ? `${channelName} on ${channelType}` : `a ${channelType} channel`;
 }
 
 /**
@@ -228,11 +250,21 @@ export async function requestChannelApproval(input: RequestChannelApprovalInput)
   const originMg = getMessagingGroup(messagingGroupId);
   const originChannelType = originMg?.channel_type ?? '';
 
-  // Resolve channel name if not yet persisted. Key by instance so a named
-  // instance's own adapter (and bot identity) does the lookup.
-  if (originMg && !originMg.name) {
+  // Classify the conversation once, and reuse it for both the persisted name
+  // and the card text — a second lookup would be a second API round trip for
+  // the same answer. Key by instance so a named instance's own adapter (and
+  // bot identity) does the lookup.
+  let conversation: ChannelConversation | null = null;
+  if (originMg) {
     const channelAdapter = getChannelAdapter(originMg.instance ?? originMg.channel_type);
-    if (channelAdapter?.resolveChannelName) {
+    if (channelAdapter?.resolveConversation) {
+      try {
+        conversation = await channelAdapter.resolveConversation(originMg.platform_id);
+      } catch {
+        /* non-critical — the card falls back to generic rendering */
+      }
+    }
+    if (!originMg.name && channelAdapter?.resolveChannelName) {
       try {
         const name = await channelAdapter.resolveChannelName(originMg.platform_id);
         if (name) {
@@ -283,7 +315,7 @@ export async function requestChannelApproval(input: RequestChannelApprovalInput)
     referenceGroup.name,
     originChannelType,
   );
-  const question = buildQuestionText(isGroup, senderName, channelName, originChannelType, ruleNote);
+  const question = buildQuestionText(isGroup, senderName, channelName, originChannelType, ruleNote, conversation);
   const options = normalizeOptions(buildApprovalOptions(agentGroups, delivery.userId));
 
   const created = createPendingChannelApproval({

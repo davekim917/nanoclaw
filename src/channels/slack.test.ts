@@ -9,8 +9,10 @@ import {
   discoverSlackRecoveryTargets,
   makeSlackRecoveryPageFetcher,
   SLACK_MESSAGE_MAX_TEXT_LENGTH,
+  resolveSlackConversation,
   type SlackPostMessageClient,
 } from './slack.js';
+import { formatParticipantList } from './adapter.js';
 
 describe('Slack outbound limits', () => {
   it('keeps bridge chunks below the Block Kit section-text ceiling', () => {
@@ -352,5 +354,96 @@ describe('slackChannelDisplayName', () => {
       },
     };
     await expect(slackChannelDisplayName(throwing, 'slack:C1')).resolves.toBeNull();
+  });
+});
+
+describe('resolveSlackConversation', () => {
+  const alice = { ok: true, user: { name: 'alice', profile: { display_name: 'Alice' } } };
+  const bob = { ok: true, user: { name: 'bob', real_name: 'Bob Bobson' } };
+  const botMember = { ok: true, user: { name: 'nano', is_bot: true } };
+  const deactivated = { ok: true, user: { name: 'ghost', deleted: true } };
+
+  function client(
+    channel: Record<string, unknown> | undefined,
+    opts: { members?: string[]; users?: Record<string, unknown>; noMembers?: boolean } = {},
+  ) {
+    return {
+      conversations: {
+        info: vi.fn().mockResolvedValue(channel ? { ok: true, channel } : { ok: false }),
+        ...(opts.noMembers ? {} : { members: vi.fn().mockResolvedValue({ ok: true, members: opts.members ?? [] }) }),
+      },
+      users: {
+        info: vi.fn(async ({ user }: { user: string }) => opts.users?.[user] ?? { ok: false }),
+      },
+    } as never;
+  }
+
+  it('classifies a channel and keeps its #name, with no roster lookup', async () => {
+    const c = client({ name: 'general' }, { members: ['U1'] });
+    await expect(resolveSlackConversation(c, 'slack:C1')).resolves.toEqual({ type: 'channel', name: '#general' });
+    expect(
+      (c as unknown as { conversations: { members: ReturnType<typeof vi.fn> } }).conversations.members,
+    ).not.toHaveBeenCalled();
+  });
+
+  it('resolves the counterpart profile name for a 1:1 DM', async () => {
+    const c = client({ is_im: true, user: 'U-alice' }, { users: { 'U-alice': alice } });
+    await expect(resolveSlackConversation(c, 'slack:D1')).resolves.toEqual({ type: 'direct', name: 'Alice' });
+  });
+
+  it('names the human participants of a group DM, excluding bots and deactivated members', async () => {
+    const c = client(
+      { is_mpim: true, name: 'mpdm-alice--bob--nano-1' },
+      {
+        members: ['U-alice', 'U-bob', 'U-bot', 'U-ghost'],
+        users: { 'U-alice': alice, 'U-bob': bob, 'U-bot': botMember, 'U-ghost': deactivated },
+      },
+    );
+    await expect(resolveSlackConversation(c, 'slack:G1')).resolves.toEqual({
+      type: 'group_dm',
+      name: null,
+      participantNames: ['Alice', 'Bob Bobson'],
+    });
+  });
+
+  it('still reports a group DM when the roster cannot be resolved', async () => {
+    const c = client({ is_mpim: true, name: 'mpdm-alice--bob-1' }, { members: [] });
+    await expect(resolveSlackConversation(c, 'slack:G1')).resolves.toEqual({ type: 'group_dm', name: null });
+  });
+
+  it('returns null when the API cannot classify the conversation', async () => {
+    await expect(resolveSlackConversation(client(undefined), 'slack:C1')).resolves.toBeNull();
+    const throwing = {
+      conversations: { info: vi.fn().mockRejectedValue(new Error('network')) },
+    } as never;
+    await expect(resolveSlackConversation(throwing, 'slack:C1')).resolves.toBeNull();
+  });
+});
+
+describe('slackChannelDisplayName over the classifier', () => {
+  it('names a group DM by its participants instead of the mpdm slug', async () => {
+    const c = {
+      conversations: {
+        info: vi.fn().mockResolvedValue({ ok: true, channel: { is_mpim: true, name: 'mpdm-a--b--c-1' } }),
+        members: vi.fn().mockResolvedValue({ ok: true, members: ['U1', 'U2'] }),
+      },
+      users: {
+        info: vi.fn(async ({ user }: { user: string }) => ({
+          ok: true,
+          user: { name: user === 'U1' ? 'alice' : 'bob' },
+        })),
+      },
+    } as never;
+    await expect(slackChannelDisplayName(c, 'slack:G1')).resolves.toBe('Group DM: alice and bob');
+  });
+});
+
+describe('formatParticipantList', () => {
+  it('reads as a sentence at every length, and counts the overflow', () => {
+    expect(formatParticipantList(['Alice'])).toBe('Alice');
+    expect(formatParticipantList(['Alice', 'Bob'])).toBe('Alice and Bob');
+    expect(formatParticipantList(['Alice', 'Bob', 'Carol'])).toBe('Alice, Bob and Carol');
+    const many = Array.from({ length: 11 }, (_, i) => `P${i + 1}`);
+    expect(formatParticipantList(many)).toBe('P1, P2, P3, P4, P5, P6, P7 and P8 +3 more');
   });
 });

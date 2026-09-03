@@ -160,6 +160,36 @@ export interface ConversationInfo {
   isGroup: boolean;
 }
 
+/**
+ * A conversation as a human would describe it. `participantNames` is set only
+ * for `group_dm`, and only when the platform could resolve them — a group DM
+ * with an unresolvable roster is still a group DM.
+ */
+export interface ChannelConversation {
+  type: 'direct' | 'group_dm' | 'channel';
+  /** Display name, when the conversation has one. Null for a nameless group DM. */
+  name: string | null;
+  /** Human members of a group DM, excluding bots. */
+  participantNames?: string[];
+}
+
+/** Longest participant roster rendered before the label starts counting. */
+const MAX_RENDERED_PARTICIPANTS = 8;
+
+/**
+ * Canonical rendering of a `ChannelConversation`'s participants: "Alice",
+ * "Alice and Bob", "Alice, Bob and Carol", then "+N more". Lives beside the
+ * interface so the adapter that produces the list and the core surfaces that
+ * render it cannot drift — core must never import a skill-installed channel
+ * module to borrow a formatter.
+ */
+export function formatParticipantList(names: string[]): string {
+  const shown = names.slice(0, MAX_RENDERED_PARTICIPANTS);
+  const extra = names.length - shown.length;
+  const joined = shown.length === 1 ? shown[0] : `${shown.slice(0, -1).join(', ')} and ${shown[shown.length - 1]}`;
+  return extra > 0 ? `${joined} +${extra} more` : joined;
+}
+
 /** Wiring/mg defaults for one conversation context (DM vs group/channel). */
 export interface ChannelContextDefaults {
   /** Default engage_mode for wirings created in this context. */
@@ -261,6 +291,18 @@ export interface ChannelAdapter {
   deleteMessage?(platformId: string, threadId: string | null, messageId: string): Promise<void>;
   syncConversations?(): Promise<ConversationInfo[]>;
   resolveChannelName?(platformId: string): Promise<string | null>;
+  /**
+   * Richer classification of a conversation, for surfaces that render it to a
+   * human. `resolveChannelName` answers "what do I call this?"; this answers
+   * "what KIND of place is this, and who is in it?" — the difference between
+   * an approval card saying `#mpdm-alice--bob--carol-1` and one saying
+   * "a group DM with Alice, Bob and Carol".
+   *
+   * Optional and best-effort: return null when the platform API cannot
+   * classify the conversation (network failure, missing scope) so the caller
+   * falls back to its generic rendering. Never throws.
+   */
+  resolveConversation?(platformId: string): Promise<ChannelConversation | null>;
 
   /**
    * Human-clickable URL for a thread, or null when one can't be built.

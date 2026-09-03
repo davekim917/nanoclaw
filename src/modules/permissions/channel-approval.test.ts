@@ -20,8 +20,8 @@ import { initTestDb, closeDb, runMigrations } from '../../db/index.js';
 import { createAgentGroup } from '../../db/agent-groups.js';
 import { AGENT_ACCESS_SCOPE_WARNING } from './channel-approval.js';
 import { createMessagingGroup, getMessagingGroupByPlatform } from '../../db/messaging-groups.js';
-import { registerChannelAdapter } from '../../channels/channel-registry.js';
-import type { ChannelDefaults } from '../../channels/adapter.js';
+import { initChannelAdapters, registerChannelAdapter } from '../../channels/channel-registry.js';
+import type { ChannelAdapter, ChannelConversation, ChannelDefaults } from '../../channels/adapter.js';
 import { upsertUser } from './db/users.js';
 import { grantRole } from './db/user-roles.js';
 
@@ -776,5 +776,93 @@ describe('no-owner / no-agent failure modes', () => {
     expect(deliverMock).not.toHaveBeenCalled();
     const count = (getDb().prepare('SELECT COUNT(*) AS c FROM pending_channel_approvals').get() as { c: number }).c;
     expect(count).toBe(0);
+  });
+});
+
+/**
+ * MPDM-aware card text.
+ *
+ * Drives the real registration flow end to end (routeInbound → the card the
+ * approver is delivered), with a LIVE adapter that implements the optional
+ * `resolveConversation` seam. A group DM has no name a human recognizes —
+ * Slack's own label is a slug like `mpdm-alice--bob--carol-1` — so the card
+ * has to describe it by who is in it.
+ */
+async function liveAdapterWithConversation(
+  channelType: string,
+  resolveConversation?: (platformId: string) => Promise<ChannelConversation | null>,
+  channelName = '#mpdm-alice--bob--carol-1',
+): Promise<void> {
+  const adapter = {
+    name: channelType,
+    channelType,
+    supportsThreads: true,
+    defaults: telegramDefaults,
+    async setup() {},
+    async teardown() {},
+    isConnected: () => true,
+    async deliver() {
+      return undefined;
+    },
+    async resolveChannelName() {
+      return channelName;
+    },
+    ...(resolveConversation ? { resolveConversation } : {}),
+  } as unknown as ChannelAdapter;
+  registerChannelAdapter(channelType, { factory: () => adapter, defaults: telegramDefaults });
+  await initChannelAdapters(
+    () =>
+      ({
+        onInbound: () => {},
+        onInboundEvent: () => {},
+        onMetadata: () => {},
+        onAction: () => {},
+      }) as never,
+  );
+}
+
+async function cardQuestion(): Promise<string> {
+  await new Promise((r) => setTimeout(r, 10));
+  expect(deliverMock).toHaveBeenCalledTimes(1);
+  return (JSON.parse(deliverMock.mock.calls[0][4] as string) as { question: string }).question;
+}
+
+describe('approval card names a group DM by its participants', () => {
+  it('describes the people instead of the platform slug', async () => {
+    await liveAdapterWithConversation('telegram', async () => ({
+      type: 'group_dm',
+      name: null,
+      participantNames: ['Alice', 'Bob', 'Carol'],
+    }));
+    const { routeInbound } = await import('../../router.js');
+    await routeInbound(groupMention('mpdm-1'));
+
+    const question = await cardQuestion();
+    expect(question).toContain('in a group DM with Alice, Bob and Carol on telegram');
+    expect(question).not.toContain('mpdm-alice--bob--carol-1');
+  });
+
+  it('still says "a group DM" when the roster cannot be resolved', async () => {
+    await liveAdapterWithConversation('telegram', async () => ({ type: 'group_dm', name: null }));
+    const { routeInbound } = await import('../../router.js');
+    await routeInbound(groupMention('mpdm-2'));
+
+    expect(await cardQuestion()).toContain('in a group DM on telegram');
+  });
+
+  it('keeps the channel-name rendering for an ordinary channel', async () => {
+    await liveAdapterWithConversation('telegram', async () => ({ type: 'channel', name: '#general' }), '#general');
+    const { routeInbound } = await import('../../router.js');
+    await routeInbound(groupMention('chan-1'));
+
+    expect(await cardQuestion()).toContain('#general on telegram');
+  });
+
+  it('falls back to the generic rendering for an adapter without the seam', async () => {
+    await liveAdapterWithConversation('telegram', undefined, '#general');
+    const { routeInbound } = await import('../../router.js');
+    await routeInbound(groupMention('chan-2'));
+
+    expect(await cardQuestion()).toContain('#general on telegram');
   });
 });
