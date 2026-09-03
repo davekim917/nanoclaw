@@ -115,6 +115,7 @@ function armSelfHeal(enabled: boolean): void {
 const mockKillContainer = vi.fn();
 const mockWakeContainer = vi.fn();
 const mockIsContainerRunning = vi.fn();
+const mockIsContainerSpawning = vi.fn();
 const mockHasContainerEverRun = vi.fn();
 const mockGetContainerSpawnedAt = vi.fn().mockReturnValue(0);
 const mockGetSession = vi.fn();
@@ -126,6 +127,7 @@ vi.mock('../../container-runner.js', async (importOriginal) => {
   return {
     ...real,
     isContainerRunning: (...args: unknown[]) => mockIsContainerRunning(...args),
+    isContainerSpawning: (...args: unknown[]) => mockIsContainerSpawning(...args),
     hasContainerEverRun: (...args: unknown[]) => mockHasContainerEverRun(...args),
     getContainerSpawnedAt: (...args: unknown[]) => mockGetContainerSpawnedAt(...args),
     wakeContainer: (...args: unknown[]) => mockWakeContainer(...args),
@@ -997,6 +999,7 @@ beforeEach(() => {
   mockKillContainer.mockReset();
   mockWakeContainer.mockReset().mockResolvedValue(true);
   mockIsContainerRunning.mockReset().mockReturnValue(false);
+  mockIsContainerSpawning.mockReset().mockReturnValue(false);
   mockHasContainerEverRun.mockReset().mockReturnValue(true);
   mockGetContainerSpawnedAt.mockReset().mockReturnValue(0);
   mockGetSession.mockReset();
@@ -1250,6 +1253,12 @@ describe('S2-PR13 — continuation and ceiling accountability, through the regis
       const h = new Database(outboundPath, { readonly: true });
       outboundAtKill = (h.prepare('SELECT COUNT(*) AS c FROM messages_out').get() as { c: number }).c;
       h.close();
+      // A real kill stops the container, so the post-kill window sees it gone.
+      // Leaving it "running" here would model a REPLACEMENT wake landing in the
+      // kill's yield gap, which the ownership guard deliberately skips — that
+      // case has its own two cases in the container-health suite (mailbox seam
+      // PR 5 round 8, 3b6cbb5f).
+      mockIsContainerRunning.mockReturnValue(false);
     });
 
     await _sweepSessionForTesting(session);
