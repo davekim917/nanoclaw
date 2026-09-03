@@ -26,6 +26,7 @@ vi.mock('../../log.js', async (importOriginal) => ({
 
 import { getAgentMailbox } from '../../mailbox/index.js';
 import type { InboundMessage, MailboxSessionKey } from '../../mailbox/types.js';
+import { SessionDbMissingError } from './openers.js';
 import { withMailboxSession } from '../../session-manager.js';
 import type { NanoclawMailboxSession } from './index.js';
 
@@ -284,6 +285,31 @@ describe('NanoclawAgentMailbox', () => {
       db.prepare('SELECT trigger, repo_fence_epoch FROM messages_in WHERE id = ?').get('m-fenced'),
     ) as { trigger: number; repo_fence_epoch: string | null };
     expect(row).toEqual({ trigger: 1, repo_fence_epoch: null });
+  });
+
+  it('an unreadable session is present, not vanished — only ENOENT/ENOTDIR report as missing', async () => {
+    const key = freshKey();
+    const mailbox = getAgentMailbox();
+    mailbox.prepare(key);
+    const sessionDir = path.dirname(dbPath(key, 'inbound'));
+
+    // Genuinely gone: both files removed. exists() is false and session()
+    // reports the vanished session that sweep/delivery branch on.
+    const goneKey = freshKey();
+    expect(await mailbox.exists(goneKey)).toBe(false);
+    await expect(mailbox.session(goneKey, async () => 'unreachable')).rejects.toBeInstanceOf(SessionDbMissingError);
+
+    // Present but unreadable: the directory cannot be traversed. `existsSync`
+    // reports that as absent, which would make container-restart skip the
+    // session and leave its ingress unfenced. It must reach the opener and
+    // fail there on the real error instead.
+    fs.chmodSync(sessionDir, 0o000);
+    try {
+      expect(await mailbox.exists(key)).toBe(true);
+      await expect(mailbox.session(key, async () => 'unreachable')).rejects.not.toBeInstanceOf(SessionDbMissingError);
+    } finally {
+      fs.chmodSync(sessionDir, 0o700);
+    }
   });
 
   it('syncProcessingAcks applies terminal acks from outbound to inbound in one session', async () => {

@@ -23,7 +23,13 @@ import type {
   SessionRouting as UpstreamSessionRouting,
 } from '../../mailbox/types.js';
 
-import { SessionDbMissingError, openInboundDb, openOutboundDb, openOutboundDbRw } from './openers.js';
+import {
+  SessionDbMissingError,
+  openInboundDb,
+  openOutboundDb,
+  openOutboundDbRw,
+  sessionDbPathIsGone,
+} from './openers.js';
 import { ensureNanoclawInboundSchema, ensureSchema } from './schema.js';
 import {
   activateRepoIngressFence,
@@ -190,6 +196,25 @@ export class NanoclawAgentMailbox extends SqliteAgentMailbox {
    * there would suppress the legacy migrations that DB needs (H-2).
    */
   private readonly nanoclawMigrated = new Set<string>();
+
+  /**
+   * True when this session's mailbox files are present.
+   *
+   * Overrides upstream's `existsSync` probe with the errno-aware one. Only
+   * ENOENT/ENOTDIR mean gone; `existsSync` reports EACCES — a session whose
+   * directory the host merely cannot traverse — as absent too. That answer
+   * propagates: `session()` would raise `SessionDbMissingError` and
+   * `withExistingMailboxSession` would resolve `undefined`, so
+   * `container-restart`'s skip-the-vanished branch would silently leave a
+   * present-but-unreadable session's ingress UNFENCED. A present session must
+   * reach the opener and fail there on its real error.
+   */
+  override async exists(key: MailboxSessionKey): Promise<boolean> {
+    return (
+      !sessionDbPathIsGone(sessionMailboxPath(key, 'inbound')) &&
+      !sessionDbPathIsGone(sessionMailboxPath(key, 'outbound'))
+    );
+  }
 
   /**
    * Create the session's mailbox files if they are absent.
