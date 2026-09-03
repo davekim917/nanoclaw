@@ -200,3 +200,10 @@ Started 2026-09-02. Record continues below.
 - Stop rule recorded: a fourth instance means either a caller bypassing the helper or that post-hoc re-check is the wrong primitive (ownership held across the clear = a lock, a design conversation). Report, do not patch.
 - PR 6 cascade: 02990921 → 16d9ba85 (onto b094b788, 9 conflicting commits, one real auto-merge bug fixed: duplicate `assertQueryable` in `openInboundDb`) → 05e85b0a (onto dda6d6f3, zero conflicts, 953 tests) → rebasing onto cf0900eb. Report `pr6-cascade-report.md`.
 - Slot: seam-2 B1 (#306+#307+#310+#308 on a7b795f1) merges/builds/restarts first; PR 4's BUILD START waits for "B1 gate green", then #291 rebases onto post-B1 main (B1 moves ~70 sweep duties into `src/modules/sweep-*`; duty→file map requested from update-nanoclaw-3).
+
+## 2026-09-03 20:37Z — PR 6 cascaded head pushed; PR 7 cascade dispatched; #331 round 2
+
+- PR 6: 05e85b0a → **`7330b5dd`** on cf0900eb, zero conflicts, 954 tests, ratchet host 15 / runner 0. Pushed with lease (old head 02990921); #282 base stays PR 4's branch until #291 merges. Head sent to update-nanoclaw-3 as a pre-B1 head.
+- PR 7: rebase onto 7330b5dd dispatched to pr7-builder (expected conflicts: thread-close `clearThenSettle()`, host-sweep predicate move + usage rollup, openers/barrel, RATCHET.json → exactly `["src/storage-manager.ts"]`).
+- #331 (`ef04775d`): Codex round 1 (19:09:40Z) left two valid findings untouched — the bare-import test ran with the mailbox factory already registered by `src/test-setup.ts`, and the dependency walk ignored dynamic imports and re-exports. Round 2 dispatched (worker `pr331-round2`, report `pr331-round-2.md`). No restart needed for #331.
+- Codex on #291 cf0900eb: 👀 20:30:35Z, no verdict yet; 15-min fallback reviewer at 20:45Z if still silent.
