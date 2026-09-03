@@ -8,6 +8,7 @@ import fs from 'fs';
 import path from 'path';
 import { pathToFileURL } from 'url';
 
+import { activateAgentRunnerSource } from './agent-runner-source.js';
 import { backfillContainerConfigs } from './backfill-container-configs.js';
 import { markDeployBootHealthy } from './deploy-crash-guard.js';
 import { formatBuildInfoLog, readBuildInfo } from './build-info.js';
@@ -184,6 +185,12 @@ export async function main(): Promise<void> {
   const dbPath = path.join(DATA_DIR, 'v2.db');
   const db = initDb(dbPath);
   runMigrations(db);
+
+  // Snapshot the agent-runner source for this boot (mailbox seam PR 0) —
+  // must happen before anything can spawn a container, so every spawn this
+  // process makes mounts the same tree, not the live checkout mid-`git pull`.
+  activateAgentRunnerSource();
+
   resetProcessingChannelIngress();
 
   // Workgroup FS reconciliation — runs after migrations to drain the

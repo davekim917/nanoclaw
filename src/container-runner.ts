@@ -11,6 +11,7 @@ import { promisify } from 'util';
 
 import { OneCLI } from '@onecli-sh/sdk';
 
+import { agentRunnerSourcePath } from './agent-runner-source.js';
 import { getHostCapabilities } from './capabilities.js';
 import {
   CONTAINER_IMAGE,
@@ -2151,8 +2152,10 @@ export function buildMounts(
   buildCentralProjection(centralSrc, centralDst, agentGroup.id);
   mounts.push({ hostPath: centralDst, containerPath: '/workspace/central.db', readonly: true });
 
-  // Shared agent-runner source — read-only, same code for all groups.
-  const agentRunnerSrc = path.join(projectRoot, 'container', 'agent-runner', 'src');
+  // Shared agent-runner source — read-only, same code for all groups. This
+  // is the boot-time snapshot activated in main.ts (mailbox seam PR 0), not
+  // the live checkout — see src/agent-runner-source.ts.
+  const agentRunnerSrc = agentRunnerSourcePath();
   mounts.push({ hostPath: agentRunnerSrc, containerPath: '/app/src', readonly: true });
 
   // Shared skills — read-only, symlinks in .claude-shared/skills/ point here.
