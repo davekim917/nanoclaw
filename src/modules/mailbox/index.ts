@@ -57,11 +57,24 @@ import {
 } from './ops/ingress.js';
 import {
   getDueOutboundMessages,
+  listOutboundMessageIds,
+  outboundStorageStat,
   markDelivered,
   markDeliveryFailed,
   markPending,
   type OutboundMessage as ForkOutboundMessage,
 } from './ops/delivery.js';
+import {
+  getChannelDestination,
+  getInboundRoutingAnchor,
+  getLatestRoutedTaskRow,
+  getLatestTaskContent,
+  getRecentInboundChatSenders,
+  type ChannelDestination,
+  type InboundChatSenderRow,
+  type InboundRoutingAnchor,
+  type RoutedTaskRow,
+} from './ops/lookups.js';
 import {
   countDueMessages,
   expireStalePending,
@@ -75,6 +88,19 @@ import {
 } from './ops/sweep.js';
 
 export { SessionDbMissingError } from './openers.js';
+
+/**
+ * `(mtime, size)` of a session's outbound.db for the delivery sweep's quiet
+ * gate, or `null` when the file must not be armed off (absent, unreadable, or
+ * mid-rollback). Path-level rather than a session op: the sweep needs the
+ * answer before any handle opens, and for sessions that have no mailbox.
+ */
+export function sessionOutboundStorageStat(
+  agentGroupId: string,
+  sessionId: string,
+): { mtimeNs: bigint; size: number } | null {
+  return outboundStorageStat(sessionMailboxPath({ agentGroupId, sessionId }, 'outbound'));
+}
 
 const SQLITE_TIMESTAMP = /^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:\.\d+)?$/;
 
@@ -154,6 +180,17 @@ export interface NanoclawMailboxSession extends MailboxSession {
   // --- fork-only delivery -------------------------------------------------
   markPending(messageOutId: string): void;
   getDueOutboundMessages(): ForkOutboundMessage[];
+  /** Every outbound id, due or not — what "outstanding" means to the drain loop. */
+  listOutboundMessageIds(): string[];
+
+  // --- fork-only lookups --------------------------------------------------
+  // Narrow reads the delivery family used to run on the handle the loop
+  // passed its action handlers (plan §4.5b, invariant I-9).
+  getRecentInboundChatSenders(limit: number): InboundChatSenderRow[];
+  getChannelDestination(name: string): ChannelDestination | null;
+  getLatestTaskContent(seriesId: string): string | null;
+  getLatestRoutedTaskRow(seriesId: string): RoutedTaskRow | null;
+  getInboundRoutingAnchor(messageId: string): InboundRoutingAnchor | null;
 
   // --- fork-only sweep ----------------------------------------------------
   getNextFutureProcessAfter(): string | null;
@@ -347,6 +384,13 @@ function forkOps(
 
     markPending: (messageOutId) => markPending(inbound, messageOutId),
     getDueOutboundMessages: () => getDueOutboundMessages(readableOutbound()),
+    listOutboundMessageIds: () => listOutboundMessageIds(readableOutbound()),
+
+    getRecentInboundChatSenders: (limit) => getRecentInboundChatSenders(inbound, limit),
+    getChannelDestination: (name) => getChannelDestination(inbound, name),
+    getLatestTaskContent: (seriesId) => getLatestTaskContent(inbound, seriesId),
+    getLatestRoutedTaskRow: (seriesId) => getLatestRoutedTaskRow(inbound, seriesId),
+    getInboundRoutingAnchor: (messageId) => getInboundRoutingAnchor(inbound, messageId),
 
     getNextFutureProcessAfter: () => getNextFutureProcessAfter(inbound),
     expireStalePending: (maxAgeMs) => expireStalePending(inbound, maxAgeMs),

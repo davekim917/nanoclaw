@@ -10,7 +10,15 @@ import { guard, type GuardedAction } from './guard/index.js';
 import { log } from './log.js';
 import type { PendingApproval, Session } from './types.js';
 
-/** Handler shape for guard-wrapped actions — must not touch inDb (replays run without one). */
+/**
+ * Handler shape for guard-wrapped actions.
+ *
+ * Same two-argument contract as `DeliveryActionHandler` since the mailbox
+ * seam removed the session handle (plan §4.5b): a handler that needs session
+ * state opens its own mailbox session. That is what makes an approved
+ * replay identical to a fresh dispatch — the replay runs long after the drain
+ * that raised the hold, and there was never a handle it could have carried.
+ */
 export type GuardedDeliveryHandler = (content: Record<string, unknown>, session: Session) => Promise<void>;
 
 export interface DeliveryGuardSpec {

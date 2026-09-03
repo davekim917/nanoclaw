@@ -28,7 +28,7 @@ import { getAgentMailbox } from '../../mailbox/index.js';
 import type { InboundMessage, MailboxSessionKey } from '../../mailbox/types.js';
 import { SessionDbMissingError } from './openers.js';
 import { withMailboxSession } from '../../session-manager.js';
-import type { NanoclawMailboxSession } from './index.js';
+import { sessionOutboundStorageStat, type NanoclawMailboxSession } from './index.js';
 
 const DATA_DIR = path.join(TEST_ROOT, 'data');
 
@@ -399,5 +399,162 @@ describe('NanoclawAgentMailbox', () => {
       ),
     );
     expect(statuses).toEqual({ 'm-done': 'completed', 'm-script-failed': 'failed', 'm-untouched': 'pending' });
+  });
+});
+
+/**
+ * The named reads PR 3 moved into the module when the delivery family stopped
+ * receiving a raw handle (plan §4.5b, invariant I-9). Each op replaced exactly
+ * one SELECT a delivery action handler used to run on the loop's handle, so
+ * each is pinned against the row shapes those callers depend on.
+ */
+describe('delivery-family lookups', () => {
+  it('getRecentInboundChatSenders returns only chat rows, newest first, capped at the limit', async () => {
+    const key = freshKey();
+    const mailbox = getAgentMailbox();
+    mailbox.prepare(key);
+    await mailbox.session(key, async (m) => {
+      await m.insertMessage(message('c-old', { kind: 'chat', timestamp: '2026-01-01T00:00:00.000Z' }));
+      await m.insertMessage(message('c-new', { kind: 'chat-sdk', timestamp: '2026-01-02T00:00:00.000Z' }));
+      await m.insertMessage(message('t-task', { kind: 'task', timestamp: '2026-01-03T00:00:00.000Z' }));
+      await m.insertMessage(message('s-system', { kind: 'system', timestamp: '2026-01-04T00:00:00.000Z' }));
+    });
+
+    const all = await mailbox.session(key, (m) => fork(m).getRecentInboundChatSenders(10));
+    expect(all.map((r) => r.content)).toEqual(['content c-new', 'content c-old']);
+    const capped = await mailbox.session(key, (m) => fork(m).getRecentInboundChatSenders(1));
+    expect(capped.map((r) => r.content)).toEqual(['content c-new']);
+  });
+
+  it('getChannelDestination resolves a channel by name and ignores other destination types', async () => {
+    const key = freshKey();
+    const mailbox = getAgentMailbox();
+    mailbox.prepare(key);
+    await mailbox.session(key, (m) =>
+      fork(m).replaceDestinationRows([
+        {
+          name: 'ops',
+          display_name: 'Ops',
+          type: 'channel',
+          channel_type: 'slack',
+          platform_id: 'slack:C-OPS',
+          agent_group_id: null,
+        },
+        {
+          name: 'peer',
+          display_name: 'Peer',
+          type: 'agent',
+          channel_type: 'agent',
+          platform_id: 'ag-peer',
+          agent_group_id: 'ag-peer',
+        },
+      ]),
+    );
+
+    expect(await mailbox.session(key, (m) => fork(m).getChannelDestination('ops'))).toEqual({
+      channel_type: 'slack',
+      platform_id: 'slack:C-OPS',
+    });
+    // An agent destination is not a channel, and an unknown name is not an error.
+    expect(await mailbox.session(key, (m) => fork(m).getChannelDestination('peer'))).toBeNull();
+    expect(await mailbox.session(key, (m) => fork(m).getChannelDestination('nope'))).toBeNull();
+  });
+
+  it('getLatestTaskContent returns the series’ newest task body by timestamp', async () => {
+    const key = freshKey();
+    const mailbox = getAgentMailbox();
+    mailbox.prepare(key);
+    raw(dbPath(key, 'inbound'), (db) => {
+      const stmt = db.prepare(
+        `INSERT INTO messages_in (id, seq, kind, timestamp, status, trigger, series_id, content)
+         VALUES (?, ?, 'task', ?, 'pending', 0, ?, ?)`,
+      );
+      stmt.run('fire-1', 2, '2026-01-01T00:00:00.000Z', 'series-A', JSON.stringify({ threadAnchor: true }));
+      stmt.run('fire-2', 4, '2026-01-02T00:00:00.000Z', 'series-A', JSON.stringify({ threadAnchor: false }));
+      stmt.run('other', 6, '2026-01-03T00:00:00.000Z', 'series-B', JSON.stringify({ threadAnchor: true }));
+    });
+
+    const content = await mailbox.session(key, (m) => fork(m).getLatestTaskContent('series-A'));
+    expect(JSON.parse(content!)).toEqual({ threadAnchor: false });
+    expect(await mailbox.session(key, (m) => fork(m).getLatestTaskContent('missing'))).toBeNull();
+  });
+
+  it('getLatestRoutedTaskRow skips occurrences that carry no route', async () => {
+    const key = freshKey();
+    const mailbox = getAgentMailbox();
+    mailbox.prepare(key);
+    raw(dbPath(key, 'inbound'), (db) => {
+      const stmt = db.prepare(
+        `INSERT INTO messages_in (id, seq, kind, timestamp, status, trigger, series_id, channel_type, platform_id, content)
+         VALUES (?, ?, 'task', ?, 'pending', 0, 'series-S', ?, ?, ?)`,
+      );
+      stmt.run('routed', 2, '2026-01-01T00:00:00.000Z', 'slack', 'slack:C1', '{"prompt":"older but routed"}');
+      // Higher seq, but no route — must not shadow the routed row.
+      stmt.run('unrouted', 4, '2026-01-02T00:00:00.000Z', null, null, '{"prompt":"newer, no route"}');
+    });
+
+    expect(await mailbox.session(key, (m) => fork(m).getLatestRoutedTaskRow('series-S'))).toEqual({
+      channel_type: 'slack',
+      platform_id: 'slack:C1',
+      content: '{"prompt":"older but routed"}',
+    });
+    expect(await mailbox.session(key, (m) => fork(m).getLatestRoutedTaskRow('series-none'))).toBeNull();
+  });
+
+  it('getInboundRoutingAnchor answers only for rows in this session', async () => {
+    const key = freshKey();
+    const mailbox = getAgentMailbox();
+    mailbox.prepare(key);
+    await mailbox.session(key, async (m) => {
+      await m.insertMessage(message('anchor-1', { platformId: 'ag-peer', channelType: 'agent', threadId: null }));
+    });
+
+    expect(await mailbox.session(key, (m) => fork(m).getInboundRoutingAnchor('anchor-1'))).toEqual({
+      platform_id: 'ag-peer',
+      channel_type: 'agent',
+      thread_id: null,
+      source_session_id: null,
+    });
+    // The miss is load-bearing: schedule_wake rejects an anchor it cannot find.
+    expect(await mailbox.session(key, (m) => fork(m).getInboundRoutingAnchor('elsewhere'))).toBeNull();
+  });
+
+  it('listOutboundMessageIds returns every outbound id, due or not', async () => {
+    const key = freshKey();
+    const mailbox = getAgentMailbox();
+    mailbox.prepare(key);
+    // Container-side rows: the host never writes messages_out.
+    raw(dbPath(key, 'outbound'), (db) => {
+      const stmt = db.prepare(
+        `INSERT INTO messages_out (id, timestamp, kind, platform_id, channel_type, content, deliver_after)
+         VALUES (?, ?, 'chat', 'slack:C1', 'slack', '{}', ?)`,
+      );
+      stmt.run('out-due', '2026-01-01T00:00:00.000Z', null);
+      stmt.run('out-later', '2026-01-01T00:00:01.000Z', '2099-01-01T00:00:00.000Z');
+    });
+
+    const ids = await mailbox.session(key, (m) => fork(m).listOutboundMessageIds());
+    expect(new Set(ids)).toEqual(new Set(['out-due', 'out-later']));
+    // Only the undeferred one is due — the pair is what lets the drain tell
+    // "nothing outstanding" from "nothing due yet".
+    const due = await mailbox.session(key, (m) => fork(m).getDueOutboundMessages());
+    expect(due.map((r) => r.id)).toEqual(['out-due']);
+  });
+});
+
+describe('sessionOutboundStorageStat', () => {
+  it('reports mtime and size, and refuses to answer for a missing file or a hot journal', () => {
+    const key = freshKey();
+    expect(sessionOutboundStorageStat(key.agentGroupId, key.sessionId)).toBeNull();
+
+    getAgentMailbox().prepare(key);
+    const stat = sessionOutboundStorageStat(key.agentGroupId, key.sessionId);
+    expect(stat).not.toBeNull();
+    expect(stat!.size).toBeGreaterThan(0);
+
+    // A hot journal means a rollback is still owed on the file, so the stat is
+    // ambiguous and must not arm the quiet gate.
+    fs.writeFileSync(`${dbPath(key, 'outbound')}-journal`, 'rollback pending');
+    expect(sessionOutboundStorageStat(key.agentGroupId, key.sessionId)).toBeNull();
   });
 });

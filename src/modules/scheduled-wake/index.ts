@@ -11,13 +11,12 @@
  * destination, which is the wrong shape for "I'll check CI in 15 minutes"
  * said inside a thread.
  */
-import type Database from 'better-sqlite3';
 import { createHash } from 'crypto';
 
-import { insertDeferredMessageWithContextIfNew, readSessionRouting } from '../../db/session-db.js';
 import { registerDeliveryAction, type DeliveryActionResult } from '../../delivery.js';
 import { unguarded } from '../../guard/index.js';
 import { log } from '../../log.js';
+import { withExistingMailboxSession } from '../../session-manager.js';
 import type { Session } from '../../types.js';
 
 const MAX_PROMPT_CHARS = 2000;
@@ -28,7 +27,6 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-
 export async function applyScheduleWake(
   content: Record<string, unknown>,
   session: Session,
-  inDb: Database.Database,
 ): Promise<DeliveryActionResult> {
   const prompt = typeof content.prompt === 'string' ? content.prompt.trim() : '';
   const wakeId = typeof content.wake_id === 'string' ? content.wake_id : '';
@@ -60,51 +58,60 @@ export async function applyScheduleWake(
     throw new Error('schedule_wake rejected: invalid payload');
   }
 
-  const anchoredRouting = inReplyTo
-    ? (inDb
-        .prepare('SELECT platform_id, channel_type, thread_id, source_session_id FROM messages_in WHERE id = ?')
-        .get(inReplyTo) as
-        | {
-            platform_id: string | null;
-            channel_type: string | null;
-            thread_id: string | null;
-            source_session_id: string | null;
-          }
-        | undefined)
-    : undefined;
-  if (inReplyTo && !anchoredRouting) {
-    log.warn('schedule_wake rejected: reply anchor is not in the caller session', {
-      sessionId: session.id,
-      inReplyTo,
-    });
-    throw new Error('schedule_wake rejected: invalid reply anchor');
-  }
-  const routing = anchoredRouting ?? readSessionRouting(inDb);
+  // One short mailbox session of its own for the whole handler: the anchor
+  // lookup, the routing fallback and the deferred insert are one logical step
+  // against the caller's own inbound queue, and delivery holds no session
+  // while a handler runs (plan §4.5b). The rejection throws from inside the
+  // action so the anchor check still precedes the insert; the helper closes
+  // its handles on the way out.
+  //
+  // Existing-only, never provisioning: `prepare()` would open the
+  // container-owned outbound.db read-write to apply its schema, and this
+  // request was read out of that very mailbox, so it exists. A session that
+  // has vanished has nothing left to wake.
   const effectiveWakeId =
     wakeId ||
     `legacy-${createHash('sha256').update(`${session.id}\0${processAfterRaw}\0${prompt}`).digest('hex').slice(0, 32)}`;
   const processAfter = new Date(Math.max(fireAtMs, now)).toISOString();
-  const inserted = insertDeferredMessageWithContextIfNew(inDb, {
-    id: `schedule-wake-${effectiveWakeId}`,
-    kind: 'chat',
-    timestamp: new Date(now).toISOString(),
-    platformId: routing?.platform_id ?? null,
-    channelType: routing?.channel_type ?? null,
-    threadId: routing?.thread_id ?? null,
-    sourceSessionId: anchoredRouting?.source_session_id ?? null,
-    content: JSON.stringify({
-      // Delivery contract stated at fire time: on a self-wake, bare final
-      // text is logged, never posted (see Routing.selfWake in the runner) —
-      // without this line agents narrated "nothing moved, no post" and the
-      // origin-fallback posted exactly that to the channel, every wake.
-      text: `[system] ${prompt}\n\n(Scheduled wake: bare final text is NOT delivered. Wrap anything that should post in a <message> block; if nothing needs posting, end with no message at all.)`,
-      sender: 'system',
-      senderId: 'system',
-      _system: { kind: 'agent_scheduled_wake' },
-    }),
-    processAfter,
-    recurrence: null,
+
+  const inserted = await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) => {
+    const anchoredRouting = inReplyTo ? mailbox.getInboundRoutingAnchor(inReplyTo) : null;
+    if (inReplyTo && !anchoredRouting) {
+      log.warn('schedule_wake rejected: reply anchor is not in the caller session', {
+        sessionId: session.id,
+        inReplyTo,
+      });
+      throw new Error('schedule_wake rejected: invalid reply anchor');
+    }
+    const routing = anchoredRouting ?? mailbox.readSessionRouting();
+    return mailbox.insertDeferredMessageWithContextIfNew({
+      id: `schedule-wake-${effectiveWakeId}`,
+      kind: 'chat',
+      timestamp: new Date(now).toISOString(),
+      platformId: routing?.platform_id ?? null,
+      channelType: routing?.channel_type ?? null,
+      threadId: routing?.thread_id ?? null,
+      sourceSessionId: anchoredRouting?.source_session_id ?? null,
+      content: JSON.stringify({
+        // Delivery contract stated at fire time: on a self-wake, bare final
+        // text is logged, never posted (see Routing.selfWake in the runner) —
+        // without this line agents narrated "nothing moved, no post" and the
+        // origin-fallback posted exactly that to the channel, every wake.
+        text: `[system] ${prompt}\n\n(Scheduled wake: bare final text is NOT delivered. Wrap anything that should post in a <message> block; if nothing needs posting, end with no message at all.)`,
+        sender: 'system',
+        senderId: 'system',
+        _system: { kind: 'agent_scheduled_wake' },
+      }),
+      processAfter,
+      recurrence: null,
+    });
   });
+
+  if (inserted === undefined) {
+    log.warn('schedule_wake rejected: session mailbox is gone', { sessionId: session.id });
+    throw new Error('schedule_wake rejected: session mailbox is gone');
+  }
+
   log.info(inserted ? 'schedule_wake queued' : 'schedule_wake replay ignored', {
     sessionId: session.id,
     wakeId: effectiveWakeId,

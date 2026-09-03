@@ -2,7 +2,6 @@
 import { execFileSync } from 'child_process';
 import fs from 'fs';
 import path from 'path';
-import type Database from 'better-sqlite3';
 
 import {
   quiesceSessionsForRepositoryMounts,
@@ -16,7 +15,7 @@ import { getAgentGroup, getAllAgentGroups } from '../../db/agent-groups.js';
 import { getDb } from '../../db/connection.js';
 import { getMessagingGroup } from '../../db/messaging-groups.js';
 import { getSessionsByAgentGroup } from '../../db/sessions.js';
-import { getContainerState, getProcessingClaims, insertMessage } from '../../db/session-db.js';
+import { getContainerState, getProcessingClaims } from '../../db/session-db.js';
 import { registerDeliveryAction } from '../../delivery.js';
 import { unguarded } from '../../guard/index.js';
 import { log } from '../../log.js';
@@ -37,7 +36,12 @@ import {
   type RepositoryWorkUnit,
 } from '../../repository-workspaces.js';
 import { observedOriginsSha256 } from '../../repository-migration-recovery.js';
-import { openInboundDb, openOutboundDb, sessionDir, writeSessionMessageIfNew } from '../../session-manager.js';
+import {
+  openOutboundDb,
+  sessionDir,
+  withExistingMailboxSession,
+  writeSessionMessageIfNew,
+} from '../../session-manager.js';
 import { safeGitArgs, safeGitConfigGet, safeGitEnv } from '../../safe-git.js';
 import type { Session } from '../../types.js';
 
@@ -476,21 +480,39 @@ export async function transferRepositoryWorktree(
   );
 }
 
-function response(inDb: Database.Database, requestId: string, ok: boolean, message: string): void {
+/**
+ * Answer one repository action in the caller's own inbound queue.
+ *
+ * Opens its own short mailbox session. This runs on the detached job chain,
+ * by which time the drain that dispatched the action has long returned, and
+ * delivery holds no session while a handler runs (plan §4.5b).
+ *
+ * Existing-only, never provisioning: `prepare()` would open the
+ * container-owned outbound.db read-write to apply its schema, and the request
+ * this answers was read out of that very mailbox, so it exists. A session that
+ * has vanished has no container left to read the answer.
+ */
+async function response(session: Session, requestId: string, ok: boolean, message: string): Promise<void> {
   const id = `repository-action-response-${requestId}`;
-  if (inDb.prepare('SELECT 1 FROM messages_in WHERE id = ?').get(id)) return;
-  insertMessage(inDb, {
-    id,
-    kind: 'system',
-    timestamp: new Date().toISOString(),
-    platformId: null,
-    channelType: null,
-    threadId: null,
-    content: JSON.stringify({ type: 'repository_action_response', requestId, ok, message }),
-    processAfter: null,
-    recurrence: null,
-    trigger: 0,
+  const written = await withExistingMailboxSession(session.agent_group_id, session.id, async (mailbox) => {
+    if (mailbox.inboundHasMessage(id)) return true;
+    await mailbox.insertMessage({
+      id,
+      kind: 'system',
+      timestamp: new Date().toISOString(),
+      platformId: null,
+      channelType: null,
+      threadId: null,
+      content: JSON.stringify({ type: 'repository_action_response', requestId, ok, message }),
+      processAfter: null,
+      recurrence: null,
+      trigger: 0,
+    });
+    return true;
   });
+  if (written === undefined) {
+    log.warn('Repository action response dropped — session mailbox is gone', { requestId, sessionId: session.id });
+  }
 }
 
 function assertRepositoryRequestId(requestId: string): void {
@@ -664,15 +686,7 @@ export async function applyRepositoryRefreshAction(content: Record<string, unkno
     await refreshCanonicalFromLocalRefs({ workgroupId, repo });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    // Opened here rather than taken from the delivery loop: this runs on the
-    // detached chain, by which time the handle the loop passed handlers has
-    // been closed by `drainSession`'s finally.
-    const inDb = openInboundDb(session.agent_group_id, session.id);
-    try {
-      response(inDb, requestId, false, `Host canonical refresh failed for ${repo}: ${message}`);
-    } finally {
-      inDb.close();
-    }
+    await response(session, requestId, false, `Host canonical refresh failed for ${repo}: ${message}`);
     log.error('repository refresh failed', { workgroupId, repo, sessionId: session.id, error: message });
     await writeSessionMessageIfNew(session.agent_group_id, session.id, {
       id: `repository-refresh-failed-${requestId}`,

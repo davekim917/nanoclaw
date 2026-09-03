@@ -63,7 +63,6 @@ describe('provider_unavailable handler', () => {
     await handleProviderUnavailable(
       { action: 'provider_unavailable', provider: 'codex', message: QUOTA_MESSAGE },
       session,
-      {} as never,
     );
     expect(isProviderUnavailable(GID, 'codex')).toBe(true);
     // The stated reset parsed, but it is only an upper bound: the retry lands
@@ -79,7 +78,7 @@ describe('provider_unavailable handler', () => {
 
   it('does nothing when the group declares no fallback — the outage stays loud', async () => {
     writeConfig({ provider: 'codex' });
-    await handleProviderUnavailable({ provider: 'codex', message: QUOTA_MESSAGE }, session, {} as never);
+    await handleProviderUnavailable({ provider: 'codex', message: QUOTA_MESSAGE }, session);
     expect(isProviderUnavailable(GID, 'codex')).toBe(false);
     expect(killed).toHaveLength(0);
   });
@@ -88,21 +87,21 @@ describe('provider_unavailable handler', () => {
     writeConfig({ provider: 'codex', providerFallback: { provider: 'claude' } });
     // The fallback died first (this container was already running on it).
     markProviderUnavailable(GID, 'claude', 'quota', {});
-    await handleProviderUnavailable({ provider: 'codex', message: QUOTA_MESSAGE }, session, {} as never);
+    await handleProviderUnavailable({ provider: 'codex', message: QUOTA_MESSAGE }, session);
     expect(isProviderUnavailable(GID, 'codex')).toBe(true);
     expect(killed).toHaveLength(0);
   });
 
   it('ignores a report with no provider', async () => {
     writeConfig({ provider: 'codex', providerFallback: { provider: 'claude' } });
-    await handleProviderUnavailable({ message: QUOTA_MESSAGE }, session, {} as never);
+    await handleProviderUnavailable({ message: QUOTA_MESSAGE }, session);
     expect(getProviderHealth(GID, 'codex')).toBeUndefined();
     expect(killed).toHaveLength(0);
   });
 
   it('falls back to backoff when the provider states no reset time', async () => {
     writeConfig({ provider: 'codex', providerFallback: { provider: 'claude' } });
-    await handleProviderUnavailable({ provider: 'codex', message: 'usage limit reached' }, session, {} as never);
+    await handleProviderUnavailable({ provider: 'codex', message: 'usage limit reached' }, session);
     const row = getProviderHealth(GID, 'codex');
     expect(row?.consecutive_failures).toBe(1);
     expect(isProviderUnavailable(GID, 'codex')).toBe(true);
