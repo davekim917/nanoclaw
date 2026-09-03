@@ -305,8 +305,11 @@ export interface NanoclawMailboxSession extends MailboxSession {
    * allowlist until its callee moves behind the seam. PR 7 deletes both.
    *
    * The handle is valid only for the duration of the action; never store it.
+   *
+   * @deprecated Removed in mailbox seam PR 7.
    */
   legacyInboundHandle(): Database.Database;
+  /** @deprecated Removed in mailbox seam PR 7. See `legacyInboundHandle`. */
   legacyOutboundHandle(): Database.Database;
 }
 
