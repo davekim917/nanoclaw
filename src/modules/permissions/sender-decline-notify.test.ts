@@ -123,9 +123,12 @@ beforeEach(async () => {
     granted_by: null,
     granted_at: now(),
   });
+  // Named instance, not the bare channel_type: on such an install nothing is
+  // registered under 'telegram', so an omitted instance resolves no adapter.
   createMessagingGroup({
     id: 'mg-dm-owner',
     channel_type: 'telegram',
+    instance: 'telegram-owner-bot',
     platform_id: 'dm-owner',
     name: 'Owner DM',
     is_group: 0,
@@ -214,11 +217,13 @@ describe('unknown-sender decline_notify flow', () => {
     expect(decline.type).toBeUndefined(); // plain text, not ask_question
     expect(decline.options).toBeUndefined(); // no buttons
 
-    // (b) One-line FYI to the owner's DM — informational, not a card.
-    const [fChannel, fPlatform, , fKind, fContent] = deliverMock.mock.calls[1];
+    // (b) One-line FYI to the owner's DM — informational, not a card, and
+    // dispatched on that DM's own adapter instance.
+    const [fChannel, fPlatform, , fKind, fContent, , fInstance] = deliverMock.mock.calls[1];
     expect(fChannel).toBe('telegram');
     expect(fPlatform).toBe('dm-owner');
     expect(fKind).toBe('chat-sdk');
+    expect(fInstance).toBe('telegram-owner-bot');
     const fyi = JSON.parse(fContent as string);
     expect(fyi.type).toBeUndefined();
     expect(fyi.options).toBeUndefined();

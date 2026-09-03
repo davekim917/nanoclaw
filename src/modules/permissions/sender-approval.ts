@@ -342,6 +342,12 @@ export async function declineAndNotify(input: DeclineAndNotifyInput): Promise<vo
       null,
       'chat-sdk',
       JSON.stringify({ text: fyiText }),
+      undefined,
+      // Exact-key dispatch: on an install whose bots are all named
+      // instances there is nothing registered under the bare channel_type,
+      // so an omitted instance either sends as the wrong sibling bot or
+      // resolves no adapter at all.
+      target.messagingGroup.instance,
     );
     log.info('decline_notify handled — decline sent, owner notified', {
       messagingGroupId,
