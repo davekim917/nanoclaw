@@ -1,6 +1,17 @@
-import { describe, it, expect } from 'vitest';
+import fs from 'fs';
+import path from 'path';
 
-import { formatLocalTime, isValidTimezone, parseZonedToUtc, resolveTimezone } from './timezone.js';
+import { describe, it, expect, afterEach, vi } from 'vitest';
+
+import {
+  canonicalizeIanaTimezone,
+  formatLocalTime,
+  isIanaTimezone,
+  isValidTimezone,
+  parseZonedToUtc,
+  resolveTimezone,
+  timezoneRejectionReason,
+} from './timezone.js';
 
 // --- formatLocalTime ---
 
@@ -87,5 +98,64 @@ describe('parseZonedToUtc', () => {
 
   it('falls back to UTC for an invalid zone', () => {
     expect(iso('2026-06-20T09:00:00', 'Not/AZone')).toBe('2026-06-20T09:00:00.000Z');
+  });
+});
+
+// --- canonicalizeIanaTimezone / isIanaTimezone ---
+
+const ZONEINFO_DIR = '/usr/share/zoneinfo';
+
+/**
+ * A zone this host's database actually has, so the suite asserts against the
+ * same authority the code consults rather than against one machine's tzdata
+ * vintage. Undefined only if the host has no zone database at all, which the
+ * fail-closed tests below cover on their own.
+ */
+function anyLocalZone(): string | undefined {
+  return ['Europe/Lisbon', 'Asia/Tokyo', 'America/New_York'].find((tz) => fs.existsSync(path.join(ZONEINFO_DIR, tz)));
+}
+
+describe('canonicalizeIanaTimezone', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('accepts a spelling the host zone database has', () => {
+    const tz = anyLocalZone();
+    if (!tz) return;
+    expect(canonicalizeIanaTimezone(tz)).toBe(tz);
+    expect(isIanaTimezone(tz)).toBe(true);
+  });
+
+  it('accepts UTC without consulting the zone database', () => {
+    expect(canonicalizeIanaTimezone('UTC')).toBe('UTC');
+  });
+
+  it('rejects what POSIX TZ cannot open, however lenient ICU is', () => {
+    // ICU accepts all three; none is a file the container can open.
+    expect(canonicalizeIanaTimezone('asia/tokyo')).toBeNull(); // wrong case
+    expect(canonicalizeIanaTimezone('+01:00')).toBeNull(); // opposite sign to POSIX
+    expect(canonicalizeIanaTimezone('CST')).toBeNull(); // ambiguous abbreviation
+  });
+
+  it('FAILS CLOSED on a host with no zone database', () => {
+    // The whole point of the check is that the stored string is handed to the
+    // container as a POSIX `TZ` path. With no database to confirm a spelling
+    // there is no second authority to fall back on — ICU would take
+    // `asia/tokyo` and retired aliases — so nothing is honoured and the group
+    // keeps the install timezone.
+    const enoent = Object.assign(new Error('ENOENT'), { code: 'ENOENT' });
+    vi.spyOn(fs, 'existsSync').mockImplementation((p) => !String(p).startsWith(ZONEINFO_DIR));
+    vi.spyOn(fs, 'statSync').mockImplementation(((p: fs.PathLike) => {
+      if (String(p).startsWith(ZONEINFO_DIR)) throw enoent;
+      throw enoent;
+    }) as typeof fs.statSync);
+
+    expect(canonicalizeIanaTimezone('Europe/Lisbon')).toBeNull();
+    expect(canonicalizeIanaTimezone('Asia/Tokyo')).toBeNull();
+    expect(isIanaTimezone('Europe/Lisbon')).toBe(false);
+    // UTC needs no database entry and stays available.
+    expect(canonicalizeIanaTimezone('UTC')).toBe('UTC');
+    expect(timezoneRejectionReason('Europe/Lisbon')).toContain('no zone database');
   });
 });

@@ -19,6 +19,8 @@ import path from 'path';
 import Database from 'better-sqlite3';
 
 import { DATA_DIR, TIMEZONE as CONFIG_TIMEZONE } from '../src/config.js';
+import { resolveGroupTimezone } from '../src/container-config.js';
+import { initDb } from '../src/db/connection.js';
 
 const SHOW_ALL = process.argv.includes('--all');
 const FULL = process.argv.includes('--full');
@@ -89,11 +91,15 @@ const mgByDestination = new Map(
   [...messagingGroups.values()].map((m) => [`${m.channel_type}\0${m.platform_id}`, m]),
 );
 central.close();
+// Reopened through the shared connection so this report resolves a group's
+// timezone the same way the firing path does, instead of re-reading
+// container_configs itself. Read-only use.
+initDb(path.join(DATA_DIR, 'v2.db'));
 
-function fmtWhen(iso: string | null): string {
+function fmtWhen(iso: string | null, tz: string): string {
   if (!iso) return '-';
   const d = new Date(iso.includes('T') ? iso : `${iso.replace(' ', 'T')}Z`);
-  return `${d.toISOString().slice(0, 16)}Z (${d.toLocaleString('en-US', { timeZone: TIMEZONE, dateStyle: 'short', timeStyle: 'short' })} ${TIMEZONE})`;
+  return `${d.toISOString().slice(0, 16)}Z (${d.toLocaleString('en-US', { timeZone: tz, dateStyle: 'short', timeStyle: 'short' })} ${tz})`;
 }
 
 function clip(s: string, n: number): string {
@@ -107,6 +113,11 @@ let count = 0;
 for (const groupDir of fs.readdirSync(sessionsRoot).sort()) {
   const groupPath = path.join(sessionsRoot, groupDir);
   if (!fs.statSync(groupPath).isDirectory()) continue;
+  // The directory name IS the agent group id (storage-activity.ts:319). A
+  // group with a timezone override runs its whole series on that grid, so both
+  // the cron interpretation and the rendered fire time report it — every line
+  // already names the zone it is in, so nothing here reads ambiguously.
+  const groupTz = resolveGroupTimezone(groupDir, TIMEZONE);
   for (const sessDir of fs.readdirSync(groupPath).sort()) {
     const inboundPath = path.join(groupPath, sessDir, 'inbound.db');
     if (!fs.existsSync(inboundPath)) continue;
@@ -155,8 +166,8 @@ for (const groupDir of fs.readdirSync(sessionsRoot).sort()) {
       console.log(`  agent group : ${ag ? `${ag.name} (${ag.folder}${ag.agent_provider ? `, ${ag.agent_provider}` : ''})` : groupDir}`);
       console.log(`  channel     : ${destMg?.name ?? sessionMg?.name ?? '?'} [${row.channel_type ?? sessionMg?.channel_type ?? '?'}] ${row.thread_id ? `thread ${row.thread_id}` : 'channel root'}`);
       console.log(`  session     : ${groupDir}/${sessDir}`);
-      console.log(`  cron        : ${row.recurrence}  (interpreted in ${TIMEZONE})`);
-      console.log(`  next fire   : ${fmtWhen(row.process_after)}`);
+      console.log(`  cron        : ${row.recurrence}  (interpreted in ${groupTz})`);
+      console.log(`  next fire   : ${fmtWhen(row.process_after, groupTz)}`);
       if (content.quietStatus) console.log(`  quietStatus : true`);
       if (content.flagIntent) console.log(`  flagIntent  : ${JSON.stringify(content.flagIntent)}`);
       console.log(`  prompt      : ${clip(prompt, 160)}`);

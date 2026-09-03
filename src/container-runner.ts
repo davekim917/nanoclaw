@@ -24,10 +24,10 @@ import {
   ONECLI_API_KEY,
   ONECLI_URL,
   TASK_SCRIPT_TIMEOUT_MS,
-  TIMEZONE,
   WORKGROUP_SHARED_FS,
 } from './config.js';
 import {
+  effectiveTimezone,
   readContainerConfig,
   readContainerConfigForSpawn,
   validateMcpServers,
@@ -43,7 +43,6 @@ import {
   resolveContainerResources,
   type ContainerResources,
 } from './container-resources.js';
-import { isIanaTimezone } from './timezone.js';
 import { resolveSpawnProvider } from './provider-fallback.js';
 import { markProviderAvailable } from './db/provider-health.js';
 import { getContainerConfig, resolveProviderName } from './db/container-configs.js';
@@ -3316,14 +3315,13 @@ async function buildContainerArgs(
   // Everything NanoClaw-specific is in container.json (read by runner at startup).
   for (const [key, value] of Object.entries(mailboxEnvironment ?? {})) args.push('-e', `${key}=${value}`);
   // A per-group timezone override rides container.json (mirrored there by the
-  // ncl write paths). Only a region-based IANA id is honoured: this string
-  // becomes POSIX `TZ` here while the host schedules through Intl, and a fixed
-  // offset means the OPPOSITE sign to POSIX. Anything else falls back to the
-  // install timezone rather than to UTC, so a hand-edited file can't silently
-  // move an agent's clock.
-  const containerTimezone =
-    containerConfig.timezone && isIanaTimezone(containerConfig.timezone) ? containerConfig.timezone : TIMEZONE;
-  args.push('-e', `TZ=${containerTimezone}`);
+  // ncl write paths). The verdict comes from `effectiveTimezone`, the same
+  // predicate `resolveGroupTimezone` applies to the DB row, so the container's
+  // POSIX `TZ` and the host's scheduling grid can never disagree about which
+  // override is honoured. Anything unconfirmed falls back to the install
+  // timezone rather than to UTC, so a hand-edited file can't silently move an
+  // agent's clock.
+  args.push('-e', `TZ=${effectiveTimezone(containerConfig.timezone)}`);
 
   // Claude Code behavior locks — duplicated from settings.json env block so
   // the values are set regardless of the SDK's settings-loading order.

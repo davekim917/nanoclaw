@@ -9,11 +9,15 @@ import fs from 'fs';
 import path from 'path';
 
 import { GROUPS_DIR } from './config.js';
-import { validateMcpServers, type McpServerConfig, type AdditionalMountConfig } from './container-config.js';
+import {
+  honouredTimezoneOverride,
+  validateMcpServers,
+  type McpServerConfig,
+  type AdditionalMountConfig,
+} from './container-config.js';
 import { getAllAgentGroups } from './db/agent-groups.js';
 import { getContainerConfig, createContainerConfig } from './db/container-configs.js';
 import { log } from './log.js';
-import { isIanaTimezone } from './timezone.js';
 import type { ContainerConfigRow } from './types.js';
 
 interface LegacyContainerJson {
@@ -70,7 +74,7 @@ export function backfillContainerConfigs(): void {
       security_json: null,
       // Follow the install-global timezone; a legacy container.json may already
       // carry an override, which the spawn path reads from the file directly.
-      timezone: legacy.timezone && isIanaTimezone(legacy.timezone) ? legacy.timezone : null,
+      timezone: honouredTimezoneOverride(legacy.timezone) ?? null,
       updated_at: new Date().toISOString(),
     };
 

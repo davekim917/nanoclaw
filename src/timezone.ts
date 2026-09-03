@@ -84,8 +84,15 @@ function zoneSpellingHints(tz: string): string[] {
  * Intl still has to accept the value too, so a name the host has a file for
  * but the scheduler cannot use is refused rather than half-working.
  *
- * If the zone database is not present (an unusual host), this falls back to
- * the shape check alone rather than refusing every override.
+ * FAILS CLOSED. If the zone database is absent, every override is refused and
+ * the group keeps the install timezone. There is no second authority to fall
+ * back to: ICU accepts `asia/tokyo` and retired aliases that POSIX cannot
+ * open, and ICU's own canonical list is not a substitute either — on this
+ * host's Node 22 build `Intl.supportedValuesOf('timeZone')` omits both
+ * `UTC` and `Asia/Kolkata` while listing the legacy `Asia/Calcutta`,
+ * i.e. exactly the alias the paragraph above rejects. Accepting an unverified
+ * name splits the host clock from the container's; refusing one leaves the
+ * group exactly where it was.
  *
  * BOUNDARY: this checks the HOST's zone database, not the agent image's. The
  * two are independent filesystems, so a host carrying newer tzdata than an
@@ -99,7 +106,6 @@ function zoneSpellingHints(tz: string): string[] {
 export function canonicalizeIanaTimezone(tz: string): string | null {
   if (!isValidTimezone(tz) || !isRegionZoneShape(tz)) return null;
   if (tz === 'UTC') return tz;
-  if (!fs.existsSync(ZONEINFO_DIR)) return tz;
   return zoneFileExists(tz) ? tz : null;
 }
 
@@ -121,6 +127,9 @@ export function timezoneRejectionReason(tz: string): string {
   if (!isValidTimezone(tz)) return `"${tz}" is not a timezone this runtime knows`;
   if (!isRegionZoneShape(tz)) {
     return `"${tz}" does not name a region — use a "Region/City" id like "Europe/Lisbon" (a fixed offset means the opposite sign to POSIX, and an abbreviation like "CST" is ambiguous)`;
+  }
+  if (!fs.existsSync(ZONEINFO_DIR)) {
+    return `"${tz}" cannot be verified: this host has no zone database at ${ZONEINFO_DIR}, so an unverified id would reach the container as a POSIX TZ path it may not be able to open`;
   }
   const hints = zoneSpellingHints(tz);
   if (hints.length > 0)

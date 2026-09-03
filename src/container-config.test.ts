@@ -8,6 +8,8 @@ import {
   readContainerConfig,
   readContainerConfigForSpawn,
   readContainerConfigStrict,
+  effectiveTimezone,
+  honouredTimezoneOverride,
   resolveGroupTimezone,
   writeContainerConfig,
 } from './container-config.js';
@@ -269,6 +271,30 @@ describe('resolveGroupTimezone', () => {
       const expected = fs.existsSync(path.join('/usr/share/zoneinfo', alias)) ? alias : TIMEZONE;
       expect(resolveGroupTimezone(TZ_GROUP.id)).toBe(expected);
     }
+  });
+
+  it('honours a caller-supplied fallback instead of the install timezone', () => {
+    // The one caller with a better default than config's TIMEZONE is the
+    // fleet report, which reads the running service's own TZ off its systemd
+    // unit. An override still outranks it.
+    expect(resolveGroupTimezone(TZ_GROUP.id, 'America/Denver')).toBe('America/Denver');
+    expect(resolveGroupTimezone('ag-no-such-group', 'America/Denver')).toBe('America/Denver');
+
+    updateContainerConfigScalars(TZ_GROUP.id, { timezone: 'Asia/Tokyo' });
+    expect(resolveGroupTimezone(TZ_GROUP.id, 'America/Denver')).toBe('Asia/Tokyo');
+  });
+
+  it('effectiveTimezone is the one predicate the spawn path shares', () => {
+    // container-runner.ts holds the container.json value rather than a group
+    // id, so it calls this directly. Same verdict either way — the container's
+    // POSIX TZ and the host's cron grid can never disagree.
+    expect(effectiveTimezone('Asia/Tokyo')).toBe('Asia/Tokyo');
+    expect(effectiveTimezone(null)).toBe(TIMEZONE);
+    expect(effectiveTimezone('europe/lisbon')).toBe(TIMEZONE);
+    expect(effectiveTimezone('+01:00')).toBe(TIMEZONE);
+    expect(effectiveTimezone(null, 'America/Denver')).toBe('America/Denver');
+    expect(honouredTimezoneOverride('europe/lisbon')).toBeUndefined();
+    expect(honouredTimezoneOverride('Asia/Tokyo')).toBe('Asia/Tokyo');
   });
 
   it('configFromDb ships a valid timezone to the container and drops an invalid one', () => {

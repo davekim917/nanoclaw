@@ -385,25 +385,62 @@ describe('deriveHealth', () => {
     };
   }
 
+  // Europe/Lisbon springs forward at 2026-03-29T01:00Z. A daily "0 9 * * *"
+  // there fires 03-28 09:00Z, 03-29 08:00Z, 03-30 08:00Z — a 23-hour gap
+  // opened by the 03-28 occurrence, 24-hour gaps on either side of it.
+  // stallGrace is half the cadence, so an 11.75h-overdue row is `stalled` on
+  // the 23h grid and `late` on the 24h one. Both tests below use that edge;
+  // neither needs fake timers, because the cadence is now read from the armed
+  // occurrence rather than the clock.
+  const LISBON_PRE_DST_FIRE = Date.parse('2026-03-28T09:00:00.000Z');
+  const LISBON_POST_DST_FIRE = Date.parse('2026-03-29T08:00:00.000Z');
+  const OVERDUE_BY = 11.75 * 3600_000;
+
   it('measures cadence on the owning group timezone, so a DST change is not read as a stall', () => {
-    // stallGrace is half the cadence interval. A daily 09:00 cron across
-    // Europe/Lisbon's 2026-03-29 spring-forward measures 23 hours, not 24, so
-    // the grace is 11.5h there and 12h in a zone with no transition. An
-    // 11.75h-overdue row therefore lands on opposite sides of the line, and
-    // reading both in the install zone would silently pick one answer for
-    // both groups.
-    vi.useFakeTimers();
-    // Pinned so cron-parser's default `currentDate` straddles the transition:
-    // Lisbon is 08:00 WET, so the next two 09:00 fires are Sat WET and Sun WEST.
-    vi.setSystemTime(new Date('2026-03-28T08:00:00.000Z'));
-    try {
-      const nowMs = Date.parse('2026-03-28T08:00:00.000Z');
-      const overdue = { nowMs, recurrence: '0 9 * * *', processAfterMs: nowMs - 11.75 * 3600_000 };
-      expect(deriveHealth(ctx({ ...overdue, timezone: 'Europe/Lisbon' }))).toBe('stalled');
-      expect(deriveHealth(ctx({ ...overdue, timezone: 'Asia/Tokyo' }))).toBe('late');
-    } finally {
-      vi.useRealTimers();
+    // Same row, same overdueness, two zones: only Lisbon has a transition in
+    // this window, so reading both on the install grid would silently give one
+    // group the other's answer.
+    const armed = {
+      recurrence: '0 9 * * *',
+      processAfterMs: LISBON_PRE_DST_FIRE,
+      nowMs: LISBON_PRE_DST_FIRE + OVERDUE_BY,
+    };
+    expect(deriveHealth(ctx({ ...armed, timezone: 'Europe/Lisbon' }))).toBe('stalled');
+    expect(deriveHealth(ctx({ ...armed, timezone: 'Asia/Tokyo' }))).toBe('late');
+  });
+
+  it('anchors cadence at the armed occurrence, not the wall clock, across a DST edge', () => {
+    // The regression: reading the interval from "now" made the same overdue
+    // 03-28 row switch from the 23h pre-transition cadence to the 24h
+    // post-transition one the moment its own due time slipped into the past —
+    // `stalled` at one instant, `late` at the next, with nothing about the row
+    // having changed. A row armed on 03-28 must stay on the 23h grid however
+    // late it gets.
+    for (const overdueBy of [OVERDUE_BY, OVERDUE_BY + 24 * 3600_000, OVERDUE_BY + 72 * 3600_000]) {
+      expect(
+        deriveHealth(
+          ctx({
+            recurrence: '0 9 * * *',
+            timezone: 'Europe/Lisbon',
+            processAfterMs: LISBON_PRE_DST_FIRE,
+            nowMs: LISBON_PRE_DST_FIRE + overdueBy,
+          }),
+        ),
+      ).toBe('stalled');
     }
+
+    // And the occurrence one slot later, past the transition, is measured on
+    // its own 24h gap — 11.75h overdue is still only `late` there.
+    expect(
+      deriveHealth(
+        ctx({
+          recurrence: '0 9 * * *',
+          timezone: 'Europe/Lisbon',
+          processAfterMs: LISBON_POST_DST_FIRE,
+          nowMs: LISBON_POST_DST_FIRE + OVERDUE_BY,
+        }),
+      ),
+    ).toBe('late');
   });
 
   it('paused status → paused', () => {

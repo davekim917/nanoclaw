@@ -26,9 +26,19 @@ import path from 'path';
 import Database from 'better-sqlite3';
 import { CronExpressionParser } from 'cron-parser';
 
-import { DATA_DIR, TIMEZONE } from '../src/config.js';
+import { DATA_DIR } from '../src/config.js';
+import { resolveGroupTimezone } from '../src/container-config.js';
+import { initDb } from '../src/db/connection.js';
 
 const APPLY = process.argv.includes('--apply');
+
+// The replacement `process_after` must land on the SAME grid the firing path
+// will re-arm on (recurrence.ts), and that grid is the owning group's
+// effective timezone, not the install-wide one. Computing it here from
+// `TIMEZONE` put every override group's repaired series one slot off until its
+// next normal re-arm. Opening the central DB is what `resolveGroupTimezone`
+// needs; the script only ever reads from it.
+initDb(path.join(DATA_DIR, 'v2.db'));
 
 interface PendingRecurring {
   id: string;
@@ -52,6 +62,8 @@ let skipped = 0;
 for (const group of fs.readdirSync(sessionsRoot)) {
   const groupDir = path.join(sessionsRoot, group);
   if (!fs.statSync(groupDir).isDirectory()) continue;
+  // The directory name IS the agent group id (storage-activity.ts:319).
+  const tz = resolveGroupTimezone(group);
   for (const sess of fs.readdirSync(groupDir)) {
     const inboundPath = path.join(groupDir, sess, 'inbound.db');
     const outboundPath = path.join(groupDir, sess, 'outbound.db');
@@ -85,9 +97,11 @@ for (const group of fs.readdirSync(sessionsRoot)) {
           continue;
         }
 
-        const next = CronExpressionParser.parse(row.recurrence, { tz: TIMEZONE }).next().toISOString();
+        const next = CronExpressionParser.parse(row.recurrence, { tz }).next().toISOString();
         console.log(`${APPLY ? 'REPAIR' : 'WOULD REPAIR'}: ${label}`);
-        console.log(`    phantom reply at ${reply.ts} → process_after ${row.process_after} → ${next}`);
+        console.log(
+          `    phantom reply at ${reply.ts} → process_after ${row.process_after} → ${next} (cron grid ${tz})`,
+        );
         if (APPLY) {
           inDb.prepare('UPDATE messages_in SET process_after = ? WHERE id = ?').run(next, row.id);
         }
