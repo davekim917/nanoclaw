@@ -1528,8 +1528,13 @@ async function sweepSession(session: Session): Promise<number | null> {
   }
 
   let plan: WakePlan | undefined;
+  // Distinguishes "the mailbox would not open" from "a duty threw", which the
+  // catch below cannot tell apart from the error alone. The open happens
+  // before the action body runs, so this flag is set iff we got inside.
+  let enteredPlanSession = false;
   try {
     plan = await run(async (mailbox): Promise<WakePlan> => {
+      enteredPlanSession = true;
       // 1. Sync processing_ack → messages_in status
       mailbox.syncProcessingAcks();
 
@@ -1632,15 +1637,22 @@ async function sweepSession(session: Session): Promise<number | null> {
     // A session that vanished under us is the ordinary steady state — counted,
     // backed off, not logged as a fault.
     if (err instanceof SessionDbMissingError) return skipUnreadable(session.id, 'session mailbox vanished');
-    // Anything else is either an unopenable-but-present mailbox or a duty that
-    // threw, and this catch cannot tell them apart from here. Both get the
-    // backoff (a session the host cannot get through has nothing to sweep, and
-    // retrying every 60s is what produced ~4k identical errors in the
-    // hot-journal incident) AND an error-level line, so a real bug in a duty is
-    // never quietly filed as a quiet session. `sweepOnce` isolates per session
-    // either way; `last_active` moving clears the backoff.
-    log.error('Host sweep error', { err, sessionId: session.id });
-    return skipUnreadable(session.id, `session mailbox unreadable: ${String(err)}`);
+    // The mailbox itself would not open: present but unreadable (EACCES,
+    // descriptor exhaustion, a corrupt file). There is nothing to sweep until
+    // that changes, and retrying every 60s is what produced ~4k identical
+    // errors in the hot-journal incident — so this one takes the backoff, with
+    // an error line so it is never silently filed as a quiet session.
+    if (!enteredPlanSession) {
+      log.error('Host sweep error', { err, sessionId: session.id });
+      return skipUnreadable(session.id, `session mailbox unreadable: ${String(err)}`);
+    }
+    // A DUTY threw — a transient SQLite lock during task admission, say. The
+    // mailbox is fine and the work is still due, so this must retry on the next
+    // 60s tick, exactly as it did before the seam. Quiet-caching it would hold
+    // an already-due scheduled task or recovery wake for the full 30-minute
+    // backoff, and `last_active` does not move on failure, so nothing would
+    // clear it early. `sweepOnce`'s per-session catch logs and isolates it.
+    throw err;
   }
   // The seam is the ONLY gate on "does this session have a mailbox". There is
   // deliberately no `fs.existsSync` pre-check beside it: two answers to that
@@ -1823,14 +1835,20 @@ async function sweepUsageRollup(sessions: Session[]): Promise<void> {
       // `rollupSessionUsage` still takes a raw outbound handle (`db/usage.ts`
       // has no PR in this series yet); it only reads. Handing it this
       // session's own handle keeps the rollup on one open.
-      await withExistingNanoclawSession(session.agent_group_id, session.id, (mailbox) =>
+      const rolledUp = await withExistingNanoclawSession(session.agent_group_id, session.id, (mailbox) => {
         rollupSessionUsage(
           mailbox.legacyOutboundHandle(),
           session.agent_group_id,
           `${session.agent_group_id}/${session.id}`,
-        ),
-      );
-      usageRollupMtimeCache.set(session.id, mtimeMs);
+        );
+        return true;
+      });
+      // Only a rollup that RAN may claim this mtime as processed. A session
+      // whose inbound.db is gone while outbound.db remains resolves undefined
+      // here, and marking it done would skip it on every later sweep for as
+      // long as the outbound file is untouched — its turn_usage rows would
+      // never reach the central totals.
+      if (rolledUp) usageRollupMtimeCache.set(session.id, mtimeMs);
     } catch (err) {
       log.warn('Usage rollup failed for session', { err, sessionId: session.id });
     }
