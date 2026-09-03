@@ -21,7 +21,6 @@ import { getAgentMailbox } from '../../mailbox/index.js';
 import { closeDb, initTestDb, runMigrations } from '../../db/index.js';
 import {
   ABSOLUTE_CEILING_MS,
-  CHAT_IDLE_REAP_MS,
   CLAIM_STUCK_MS,
   SPAWN_GRACE_MS,
   SWEEP_DUTY_INVENTORY,
@@ -29,6 +28,10 @@ import {
   _sweepSessionForTesting,
   providerFailedTicks,
 } from '../../host-sweep.js';
+// PR 3 moved this threshold out of host-sweep.ts with the idle-reap family; it
+// is imported from its owner, not re-exported by the driver (F-3.3 pins that
+// host-sweep.ts no longer exports it).
+import { CHAT_IDLE_REAP_MS } from '../sweep-idle-reap/index.js';
 import {
   PROVIDER_HEAL_COOLDOWN_MS,
   PROVIDER_HEAL_MAX_ATTEMPTS,
