@@ -36,6 +36,12 @@ import {
 } from './db/sessions.js';
 import { getAgentMailbox } from './mailbox/index.js';
 import type { MailboxSession, MailboxSessionKey } from './mailbox/types.js';
+// The host's registered implementation is NanoclawAgentMailbox, so every
+// session() here hands the action the fork's narrowed session (plan §4.2).
+// Typing the helpers with it is what lets a caller reach a fork op without a
+// cast; an action written against upstream's narrower `MailboxSession` is
+// still accepted, since the parameter only widens.
+import type { NanoclawMailboxSession } from './modules/mailbox/index.js';
 import {
   openInboundDb as openInboundDbRaw,
   openOutboundDb as openOutboundDbRaw,
@@ -507,7 +513,7 @@ const activeMailboxKeys = new AsyncLocalStorage<ReadonlySet<string>>();
 export function withMailboxSession<T>(
   agentGroupId: string,
   sessionId: string,
-  action: (mailbox: MailboxSession) => T | Promise<T>,
+  action: (mailbox: NanoclawMailboxSession) => T | Promise<T>,
 ): Promise<T> {
   return runMailboxSession(agentGroupId, sessionId, action, true) as Promise<T>;
 }
@@ -516,7 +522,7 @@ export function withMailboxSession<T>(
 export function withExistingMailboxSession<T>(
   agentGroupId: string,
   sessionId: string,
-  action: (mailbox: MailboxSession) => T | Promise<T>,
+  action: (mailbox: NanoclawMailboxSession) => T | Promise<T>,
 ): Promise<T | undefined> {
   return runMailboxSession(agentGroupId, sessionId, action, false);
 }
@@ -524,7 +530,7 @@ export function withExistingMailboxSession<T>(
 async function runMailboxSession<T>(
   agentGroupId: string,
   sessionId: string,
-  action: (mailbox: MailboxSession) => T | Promise<T>,
+  action: (mailbox: NanoclawMailboxSession) => T | Promise<T>,
   provision: boolean,
 ): Promise<T | undefined> {
   const store = getAgentMailbox();
@@ -536,7 +542,15 @@ async function runMailboxSession<T>(
   }
   if (provision) store.prepare(key);
   else if (!(await store.exists(key))) return undefined;
-  return activeMailboxKeys.run(new Set(held).add(keyId), () => store.session(key, action));
+  return activeMailboxKeys.run(new Set(held).add(keyId), () =>
+    // One cast, here and nowhere else. `mailbox/compose.ts` registers
+    // NanoclawAgentMailbox, whose session() hands the action the fork's
+    // narrowed session; upstream's `AgentMailbox` interface can only promise
+    // the narrower `MailboxSession`, and TypeScript checks that parameter
+    // contravariantly. A different implementation registered here would break
+    // this, which is exactly what `compose.ts` being the singular slot rules out.
+    store.session(key, action as (mailbox: MailboxSession) => T | Promise<T>),
+  );
 }
 
 /**
