@@ -452,6 +452,26 @@ describe('moveExecuteHandler', () => {
     expect(tgtLive[0]!.scheduled_for).toBe(slot);
   });
 
+  // Codex round: a move PERSISTS the source slot into another session DB, so a
+  // naive `YYYY-MM-DD HH:MM:SS` left by a pre-upgrade writer would be copied
+  // in as-is — a value `new Date()` reads as LOCAL time and string comparisons
+  // rank against ISO ones. Displaying it wrong was the earlier finding; storing
+  // it wrong is this one.
+  it('normalizes a naive legacy slot to ISO UTC when it carries it into the target', async () => {
+    const { key } = seedMoveFixture({
+      sourceProcessAfter: isoIn(10 * 3600_000),
+      sourceScheduledFor: '2026-01-05 09:00:00',
+    });
+
+    const res = (await moveExecuteHandler(req(moveBody()), { key }, ctxFor('owner', OWNER_SCOPES)))!;
+    expect(res.status).toBe(200);
+
+    const tgtLive = liveRowsForSeries('tgt-ag', targetSessionId()!, 'ser-1');
+    expect(tgtLive).toHaveLength(1);
+    // Same instant, canonical shape — not the raw string it was read as.
+    expect(tgtLive[0]!.scheduled_for).toBe('2026-01-05T09:00:00.000Z');
+  });
+
   it('the paused staged path restores the run time without clobbering the slot', async () => {
     // The staged insert arms a grace process_after, then restores the real one.
     // That second write must not drag scheduled_for along with it.

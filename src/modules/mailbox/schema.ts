@@ -195,8 +195,19 @@ export function migrateMessagesInTable(db: Database.Database): void {
       // has to be present before ANY writer of process_after runs, and there is
       // more than one (fresh-context retry, stale-message backoff). One statement
       // here covers every such path, including ones added later.
+      //
+      // Through strftime, not a bare copy. `process_after` on a pre-upgrade
+      // install can hold SQLite's naive `YYYY-MM-DD HH:MM:SS`, and copying
+      // that shape verbatim would seed the new column with values that
+      // `new Date()` reads as LOCAL time and that string comparisons rank
+      // against ISO ones. strftime treats a naive value as UTC — which is what
+      // it is — and re-renders an already-ISO one unchanged, so one expression
+      // normalizes both. This is the root fix: no naive `scheduled_for` is
+      // ever created, so no reader downstream has to cope with one.
       db.prepare(
-        "UPDATE messages_in SET scheduled_for = process_after WHERE kind = 'task' AND process_after IS NOT NULL",
+        `UPDATE messages_in
+            SET scheduled_for = strftime('%Y-%m-%dT%H:%M:%fZ', process_after)
+          WHERE kind = 'task' AND process_after IS NOT NULL`,
       ).run();
     })();
   }

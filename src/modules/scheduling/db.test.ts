@@ -782,6 +782,53 @@ describe('insertRecurrence', () => {
  * exposure and a worse outcome — scheduling, editing or restoring a task fails
  * outright rather than degrading — so each migrates the handle it is given.
  */
+describe('slots copied out of a session DB are normalized to ISO UTC', () => {
+  it('restoreTaskRow rewrites a naive snapshot slot', () => {
+    const db = freshDb();
+    restoreTaskRow(db, {
+      id: 'task-naive-slot',
+      series_id: 'ser-naive-slot',
+      status: 'pending',
+      process_after: '2026-01-05T11:47:00.000Z',
+      scheduled_for: '2026-01-05 09:00:00',
+      recurrence: '0 9 * * *',
+      content: '{}',
+      platform_id: null,
+      channel_type: null,
+      thread_id: null,
+      kind: 'task',
+    });
+
+    expect(db.prepare('SELECT scheduled_for FROM messages_in WHERE id = ?').get('task-naive-slot')).toEqual({
+      scheduled_for: '2026-01-05T09:00:00.000Z',
+    });
+    db.close();
+  });
+
+  it('restoreTaskRow rewrites a naive process_after when it is the only slot available', () => {
+    // A pre-column audit snapshot has no scheduled_for at all, so the restore
+    // falls back to process_after — which on the same install is naive too.
+    const db = freshDb();
+    restoreTaskRow(db, {
+      id: 'task-naive-fallback',
+      series_id: 'ser-naive-fallback',
+      status: 'paused',
+      process_after: '2026-01-05 09:00:00',
+      recurrence: null,
+      content: '{}',
+      platform_id: null,
+      channel_type: null,
+      thread_id: null,
+      kind: 'task',
+    });
+
+    expect(db.prepare('SELECT scheduled_for FROM messages_in WHERE id = ?').get('task-naive-fallback')).toEqual({
+      scheduled_for: '2026-01-05T09:00:00.000Z',
+    });
+    db.close();
+  });
+});
+
 describe('task writers on a session that predates scheduled_for', () => {
   /** The pre-migration on-disk shape, produced from the migrated one. */
   function legacyDb() {

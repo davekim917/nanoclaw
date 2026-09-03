@@ -26,6 +26,7 @@ import { resolveTaskSession } from '../session-manager.js';
 import { createSession, findSessionByAgentGroupAndMessagingGroup } from './sessions.js';
 import { getDb } from './connection.js';
 import { ensureSchema, migrateMessagesInTable, openInboundDb } from './session-db.js';
+import { sqliteUtcToIso } from '../modules/mailbox/sqlite-utc.js';
 import { nextEvenSeq } from './session-db.js';
 
 export interface TaskDef {
@@ -94,6 +95,19 @@ export interface TaskDef {
     clearStickyModel?: boolean;
     clearStickyEffort?: boolean;
   };
+}
+
+/**
+ * ISO-normalize a slot that came out of a session-DB column.
+ *
+ * A move carries the SOURCE occurrence's slot into the destination DB, and on
+ * a pre-upgrade install either source column can still hold SQLite's naive
+ * `YYYY-MM-DD HH:MM:SS`. Persisting that shape into `scheduled_for` would put
+ * a value in the destination that every reader compares as a string against
+ * ISO ones, and that `new Date()` reads as local time. NULL stays NULL.
+ */
+function isoSlot(value: string | null | undefined): string | null {
+  return value == null ? null : sqliteUtcToIso(value);
 }
 
 function generateSessionId(): string {
@@ -299,7 +313,7 @@ export async function scheduleTask(def: TaskDef, _dataDir?: string): Promise<voi
         ).run(
           seq,
           def.processAfter,
-          def.scheduledFor ?? def.processAfter,
+          isoSlot(def.scheduledFor ?? def.processAfter),
           def.cron,
           content,
           platformId,
@@ -325,7 +339,7 @@ export async function scheduleTask(def: TaskDef, _dataDir?: string): Promise<voi
         // process_after, so the occurrence keeps the slot it was armed for.
         // A move is the one caller that arms them apart, preserving the source
         // occurrence's slot across the transfer.
-        def.scheduledFor ?? def.processAfter,
+        isoSlot(def.scheduledFor ?? def.processAfter),
         def.cron,
         def.seriesId,
         content,

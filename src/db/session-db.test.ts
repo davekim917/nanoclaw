@@ -352,6 +352,52 @@ describe('migrateMessagesInTable', () => {
     db.close();
   });
 
+  it('normalizes a naive legacy process_after as it backfills the slot', () => {
+    // Codex round: the backfill is where `scheduled_for` values are BORN on an
+    // upgrade. A bare copy would seed the new column with SQLite's naive
+    // `YYYY-MM-DD HH:MM:SS` on any install whose older writers used it — a
+    // value `new Date()` reads as LOCAL time. strftime treats it as UTC, which
+    // is what it is, and re-renders an already-ISO value unchanged.
+    if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
+    fs.mkdirSync(TEST_DIR, { recursive: true });
+
+    const db = new Database(DB_PATH);
+    db.exec(`
+      CREATE TABLE messages_in (
+        id             TEXT PRIMARY KEY,
+        seq            INTEGER UNIQUE,
+        kind           TEXT NOT NULL,
+        timestamp      TEXT NOT NULL,
+        status         TEXT DEFAULT 'pending',
+        process_after  TEXT,
+        recurrence     TEXT,
+        tries          INTEGER DEFAULT 0,
+        platform_id    TEXT,
+        channel_type   TEXT,
+        thread_id      TEXT,
+        content        TEXT NOT NULL
+      );
+    `);
+    const insert = db.prepare(
+      "INSERT INTO messages_in (id, seq, kind, timestamp, status, process_after, content) VALUES (?, ?, 'task', ?, 'pending', ?, '{}')",
+    );
+    insert.run('legacy-naive', 2, '2026-01-04T12:05:00.000Z', '2026-01-05 09:00:00');
+    insert.run('legacy-iso', 4, '2026-01-04T12:05:00.000Z', '2026-01-05T09:00:00.000Z');
+
+    migrateMessagesInTable(db);
+
+    const rows = db.prepare('SELECT id, scheduled_for FROM messages_in ORDER BY seq').all() as Array<{
+      id: string;
+      scheduled_for: string | null;
+    }>;
+    expect(rows).toEqual([
+      // Same instant, canonical shape.
+      { id: 'legacy-naive', scheduled_for: '2026-01-05T09:00:00.000Z' },
+      { id: 'legacy-iso', scheduled_for: '2026-01-05T09:00:00.000Z' },
+    ]);
+    db.close();
+  });
+
   it('leaves the column absent when the backfill fails, so the next open retries both', () => {
     // Codex round 2, P2. Split, a crash between the ALTER and the UPDATE left
     // the column present with every legacy slot NULL — and because the next

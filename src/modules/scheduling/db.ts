@@ -13,6 +13,7 @@
 import type Database from 'better-sqlite3';
 
 import { migrateMessagesInTable, nextEvenSeq } from '../../db/session-db.js';
+import { sqliteUtcToIso } from '../mailbox/sqlite-utc.js';
 
 /**
  * `scheduled_for` is added lazily, on the first writable open of a given
@@ -373,6 +374,11 @@ export interface TaskRowSnapshot {
  * C1: writes no status value the firing path doesn't already read
  * (`pending`/`paused` are both existing live states).
  */
+/** ISO-normalize a slot copied out of a session-DB column. NULL stays NULL. */
+function isoSlot(value: string | null | undefined): string | null {
+  return value == null ? null : sqliteUtcToIso(value);
+}
+
 export function restoreTaskRow(db: Database.Database, snapshot: TaskRowSnapshot): void {
   migrateMessagesInTable(db);
   db.prepare(
@@ -392,7 +398,12 @@ export function restoreTaskRow(db: Database.Database, snapshot: TaskRowSnapshot)
     // A restore re-creates the SAME occurrence, so it carries the slot the
     // source row was for — not the restore's own moment. `?? process_after`
     // covers a pre-column audit snapshot.
-    scheduledFor: snapshot.scheduled_for ?? snapshot.process_after,
+    //
+    // Normalized on the way through: both source columns can hold SQLite's
+    // naive `YYYY-MM-DD HH:MM:SS` on a pre-upgrade install, and copying that
+    // shape into `scheduled_for` would put a value here that every reader
+    // compares as a string against ISO ones.
+    scheduledFor: isoSlot(snapshot.scheduled_for ?? snapshot.process_after),
     recurrence: snapshot.recurrence,
     platformId: snapshot.platform_id,
     channelType: snapshot.channel_type,
