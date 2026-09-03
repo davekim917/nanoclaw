@@ -27,12 +27,7 @@
  *        → kill + reset this message + tries++. Semantics: "container
  *        claimed a message and went quiet past tolerance since the claim."
  */
-import type Database from 'better-sqlite3';
-import fs from 'fs';
-import path from 'path';
-
-import { SELF_HEAL_ENABLED } from './config.js';
-import { getActiveSessions, getSession, isTaskThread } from './db/sessions.js';
+import { getActiveSessions } from './db/sessions.js';
 import { getAgentGroup } from './db/agent-groups.js';
 import {
   SessionDbMissingError,
@@ -43,16 +38,8 @@ import {
 import { withExistingNanoclawSession } from './modules/mailbox/session.js';
 import type { HostWorkContinuation } from './modules/mailbox/ops/continuation.js';
 import { log } from './log.js';
-import { sessionDir, sessionsBaseDir } from './session-manager.js';
-import {
-  getContainerSpawnedAt,
-  getActiveContainerSessionIds,
-  isContainerRunning,
-  killContainer,
-  wakeContainer,
-} from './container-runner.js';
+import { getActiveContainerSessionIds, isContainerRunning } from './container-runner.js';
 import type { Session } from './types.js';
-import { getDb } from './db/connection.js';
 
 /**
  * Session-DB timestamp parsing now lives with the mailbox module that owns
@@ -1132,70 +1119,18 @@ export function _sweepSessionForTesting(session: Session): Promise<number | null
 export { sweepTaskWatchdog as _sweepTaskWatchdogForTesting } from './modules/sweep-orchestrator/task-watchdog.js';
 
 // ─────────────────────────────────────────────────────────────────────────────
-// The 39 registrations.
+// The 38 duty names, 39 registrations — none of them here any more.
 //
-// Bodies are the pre-registry statements, unchanged, including each duty's own
-// try/catch where it had one. The duties that had none are now guarded by
-// registration itself: a tick duty that throws is logged and the tick carries
-// on. Phase and order encode the 21 load-bearing ordering constraints from
-// plan.md §4.3; the family PRs move each body into `src/modules/sweep-<family>/`
-// by moving its registration, not by editing the driver.
+// Every duty this driver runs is registered by its own `src/modules/sweep-*`
+// module at import time (the modules barrel `src/modules/index.ts` is what
+// production loads). `SWEEP_DUTY_INVENTORY` above is the map from the inventory
+// id in plan.md §4.3 to the registered name, and it is the only place this file
+// names a duty. The built-in source stays registered and empty: it is part of
+// the registry's own contract — `_resetSweepRegistryForTesting()` replays every
+// recorded source, and `_unregisterSweepDutySourceForTesting` refuses this one
+// as not test-owned.
 // ─────────────────────────────────────────────────────────────────────────────
 
-function registerBuiltInSweepDuties(): void {
-  const id = SWEEP_DUTY_INVENTORY;
-
-  // T2 (egress-network-reheal, tick:pre-session) moved to
-  // src/modules/sweep-egress/index.ts (S2-PR6).
-
-  // ── session:health (W4) — EXCLUSIVE, nothing open ──────────────────────────
-  //
-  // S11 (provider self-heal, order 10) and S14 (running-container SLA, order
-  // 40, the fallthrough) register from
-  // src/modules/sweep-container-health/index.ts (convergence seam 2, PR 10).
-  // S12/S13 stay here (S2-PR3's family) — order in the exclusive chain is
-  // heal (10) → idle-task-reap (20) → idle-chat-reap (30) → SLA (40).
-
-  // S12 (idle-task-reap) and S13 (idle-chat-reap) register from
-  // src/modules/sweep-idle-reap/index.ts (seam 2, S2-PR3) at order 20/30 —
-  // between this heal duty and the SLA fallthrough below. Do not re-add them
-  // here; see plan.md §8 "S2-PR3 — idle reaps".
-
-  // ── session:tail (W5) ──────────────────────────────────────────────────────
-
-  // ── tick:post-session — container state is now current ─────────────────────
-  //
-  // T6 orchestrator-reconciler (order 10) and T18 task-watchdog (order 25)
-  // moved to src/modules/sweep-orchestrator/index.ts (S2-PR5).
-
-  // T13 (storage-maintenance, tick:post-session, order 30) moved to
-  // src/modules/sweep-storage/index.ts (S2-PR6).
-
-  // T22 (orphaned-repo-fence-release) moved to src/modules/sweep-repo-fence/
-  // (seam 2, PR 8 — G08). The wrapper moved; `repo-fence-recovery.ts` itself
-  // did not (src/main.ts and src/delivery.ts / job-runner.ts import it
-  // directly, both outside that family PR's ownership boundary).
-
-  // ── tick:housekeeping — order-free central work ────────────────────────────
-
-  // T5 (approvals-reason-sweep) moved to src/modules/sweep-repo-fence/
-  // (seam 2, PR 8 — G08). The wrapper moved; modules/approvals/index.ts did
-  // not.
-
-  // T11 (scheduled-move-recovery) and T12 (audit-body-prune) are registered by
-  // src/modules/sweep-scheduled-move/index.ts (S2-PR7) — order 50/60 in this
-  // same 'tick:housekeeping' phase, between T10 above and T14 below.
-
-  // T14 completed-task-auto-archive (order 70) moved to
-  // src/modules/sweep-orchestrator/index.ts (S2-PR5).
-
-  // T20 (claims-reconcile, order 100) and T21 (claims-self-heal, order 110,
-  // strictly after T20) moved to src/modules/sweep-claims/index.ts (S2-PR6).
-
-  // ── SLA observation hooks — inside the SLA duty's own observe session ───────
-  //
-  // S16 (OOM / memory-pressure notice) registers from
-  // src/modules/sweep-container-health/index.ts (convergence seam 2, PR 10).
-}
+function registerBuiltInSweepDuties(): void {}
 
 registerSweepDutySource('host-sweep:builtin', registerBuiltInSweepDuties);
