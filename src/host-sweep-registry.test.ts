@@ -57,7 +57,7 @@ const h = vi.hoisted(() => {
     // S2-PR15: the durable half of the quiet cache. `quietWrites` is one entry
     // per persistence CALL (so a per-tick re-write shows up as a second entry);
     // `persistedQuiet` stands in for the `sessions.sweep_quiet_until` column.
-    quietWrites: [] as { sessionId: string; quietUntil: string }[][],
+    quietWrites: [] as { sessionId: string; quietUntil: string; lastActive: string | null }[][],
     persistedQuiet: new Map<string, { quietUntil: string; lastActiveAtWrite: string | null }>(),
     failQuietPersist: false,
   };
@@ -117,12 +117,19 @@ vi.mock('./db/sessions.js', async (importOriginal) => {
     getActiveSessions: () => h.sessions,
     getSession: (id: string) => h.sessions.find((s) => s.id === id),
     updateSession: () => undefined,
-    persistQuietSessionMarks: (marks: readonly { sessionId: string; quietUntil: string }[]) => {
+    persistQuietSessionMarks: (
+      marks: readonly { sessionId: string; quietUntil: string; lastActive: string | null }[],
+    ) => {
       if (h.failQuietPersist) throw new Error('quiet mark persistence: disk I/O error');
       h.quietWrites.push(marks.map((m) => ({ ...m })));
       for (const m of marks) {
         const row = h.sessions.find((s) => s.id === m.sessionId);
-        h.persistedQuiet.set(m.sessionId, { quietUntil: m.quietUntil, lastActiveAtWrite: row?.last_active ?? null });
+        // The real statement's `AND sessions.last_active IS json_extract(...,'$.basis')`
+        // guard: a row whose last_active moved between the sweep and the flush
+        // is not written. Asserted against real SQLite in
+        // src/db/migrations/065-sessions-sweep-quiet-until.test.ts.
+        if ((row?.last_active ?? null) !== m.lastActive) continue;
+        h.persistedQuiet.set(m.sessionId, { quietUntil: m.quietUntil, lastActiveAtWrite: m.lastActive });
       }
     },
     // The real query's three filters, over the fake column. The `last_active`
@@ -1771,6 +1778,43 @@ describe('sweep duty registry (S2-PR2)', () => {
       h.opens = [];
       await _sweepOnceForTesting();
       expect(h.opens).toEqual([]);
+      expect(h.spawns).toEqual([]);
+    });
+
+    // Codex F1, driven through the registered path. The batch is flushed after
+    // the WHOLE fan-out, so a session marked early can have its last_active moved
+    // by ingress while a LATER session is still being swept. The write must not
+    // put that stale expiry back, or a restart before the next tick warms it and
+    // skips a due session without opening its inbound.db.
+    it('a mark invalidated during the fan-out is not written back, and that session is swept after a restart', async () => {
+      const early = fakeSession('sess-early');
+      const late = fakeSession('sess-late');
+      coldDriver([early, late]);
+
+      // Ingress landing in the yield after the FIRST session: the central row's
+      // last_active advances (and production's `updateSession` nulls the column
+      // in that same statement).
+      let yields = 0;
+      _setSweepYieldForTesting(async () => {
+        if (++yields === 1) {
+          h.sessions[0] = fakeSession('sess-early', { last_active: '2026-04-20T13:45:00.000Z' });
+          h.persistedQuiet.delete('sess-early');
+        }
+      });
+
+      await _sweepOnceForTesting();
+
+      // Both were queued — the driver cannot know — but only the untouched one
+      // is actually persisted.
+      expect(h.quietWrites[0]!.map((m) => m.sessionId).sort()).toEqual(['sess-early', 'sess-late']);
+      expect([...h.persistedQuiet.keys()]).toEqual(['sess-late']);
+
+      _resetQuietSessionCacheForTesting();
+      h.opens = [];
+      await firstTickAfterRestart();
+
+      expect(h.opens, 'a stale mark was written back and warmed').toContain('sess-early');
+      expect(_lastSweepTickStatsForTesting()).toMatchObject({ skippedQuiet: 1, sweptSessions: 1 });
       expect(h.spawns).toEqual([]);
     });
 

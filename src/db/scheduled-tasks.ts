@@ -28,6 +28,7 @@ import {
   findSessionByAgentGroupAndMessagingGroup,
   getSession,
   setTaskRoutingPlatformId,
+  touchSessionActivity,
 } from './sessions.js';
 import { getDb } from './connection.js';
 
@@ -395,13 +396,29 @@ export async function scheduleTask(def: TaskDef): Promise<void> {
     return await withMailboxSession(def.agentGroupId, sessionId, action);
   };
 
-  if ((await write(session.id)) === 'written') return;
+  // A task row just changed when this session next has work due, and due-ness
+  // lives only in the session DB where the host sweep's quiet cache cannot see
+  // it. `touchSessionActivity` is the central-DB write that invalidates the
+  // quiet mark (`updateSession` nulls `sweep_quiet_until` in the same
+  // statement), so the session is swept on the next tick rather than sleeping
+  // through its first fire — and, since S2-PR15 persists that mark, across a
+  // restart too. Here rather than at the call sites: this is the chokepoint
+  // every scheduled task insert passes through, including `scheduled-move`'s
+  // re-home into a target session that may have been quiet for days. It fires
+  // for whichever session the row actually landed in, retry included.
+  if ((await write(session.id)) === 'written') {
+    touchSessionActivity(session.id);
+    return;
+  }
 
   // Lost the race. Re-resolve and try once more. This terminates: the lookups
   // behind `resolveTaskSession` filter `status = 'active'`, so the closed row
   // can never come back — a fresh active task session is minted instead.
   const retry = resolveTaskSession(def.agentGroupId, def.seriesId);
-  if ((await write(retry.session.id)) === 'written') return;
+  if ((await write(retry.session.id)) === 'written') {
+    touchSessionActivity(retry.session.id);
+    return;
+  }
   throw new Error(
     `scheduleTask: task session for series ${def.seriesId} was closed twice while scheduling; not retrying again`,
   );

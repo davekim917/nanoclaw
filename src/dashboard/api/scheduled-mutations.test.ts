@@ -95,7 +95,7 @@ function setupCentralDb(): void {
   db.exec(`
     CREATE TABLE agent_groups (id TEXT PRIMARY KEY, name TEXT NOT NULL, folder TEXT NOT NULL UNIQUE, agent_provider TEXT, created_at TEXT NOT NULL);
     CREATE TABLE messaging_groups (id TEXT PRIMARY KEY, channel_type TEXT NOT NULL, platform_id TEXT NOT NULL, name TEXT, created_at TEXT NOT NULL, UNIQUE(channel_type, platform_id));
-    CREATE TABLE sessions (id TEXT PRIMARY KEY, agent_group_id TEXT NOT NULL, messaging_group_id TEXT, thread_id TEXT, agent_provider TEXT, status TEXT DEFAULT 'active', container_status TEXT DEFAULT 'stopped', last_active TEXT, created_at TEXT NOT NULL);
+    CREATE TABLE sessions (id TEXT PRIMARY KEY, agent_group_id TEXT NOT NULL, messaging_group_id TEXT, thread_id TEXT, agent_provider TEXT, status TEXT DEFAULT 'active', container_status TEXT DEFAULT 'stopped', last_active TEXT, sweep_quiet_until TEXT, created_at TEXT NOT NULL);
     CREATE TABLE users (id TEXT PRIMARY KEY, kind TEXT NOT NULL, display_name TEXT, created_at TEXT NOT NULL);
     CREATE TABLE user_roles (user_id TEXT NOT NULL, role TEXT NOT NULL, agent_group_id TEXT, granted_by TEXT, granted_at TEXT NOT NULL, PRIMARY KEY (user_id, role, agent_group_id));
     -- Cron edits resolve the owning group's timezone override (resolveGroupTimezone).
@@ -288,6 +288,69 @@ afterEach(() => {
 });
 
 // ── C1: edit ────────────────────────────────────────────────────────────────
+// Codex F2. `updateSession` is the sole writer of `last_active`, but these
+// handlers move `process_after` STRAIGHT into the session DB — a cron edit
+// recomputes the next slot, a resume skips forward to the next future one — and
+// due-ness lives nowhere the host sweep's quiet cache can see it. Without a
+// central-DB touch the session stays quiet past its new due time, and since
+// S2-PR15 persists that mark, across a restart too.
+//
+// Asserted on the central `sessions` row, deliberately not on the funnel: mailbox
+// PR 7 rewrites this module onto the outbound funnel and this property must
+// survive that rewrite unchanged.
+describe('scheduled mutations invalidate the quiet mark (S2-PR15 / F2)', () => {
+  function markSessionQuiet(): void {
+    getDb()
+      .prepare("UPDATE sessions SET last_active = ?, sweep_quiet_until = '2099-01-01T00:00:00.000Z' WHERE id = ?")
+      .run('2026-06-01T00:00:00.000Z', SESS);
+  }
+  function sessionRow(): { last_active: string | null; sweep_quiet_until: string | null } {
+    return getDb().prepare('SELECT last_active, sweep_quiet_until FROM sessions WHERE id = ?').get(SESS) as {
+      last_active: string | null;
+      sweep_quiet_until: string | null;
+    };
+  }
+
+  it('a cron edit clears the quiet mark and moves last_active', async () => {
+    insertRow(seedSession().inbound, {
+      id: 'r1',
+      series_id: 'ser-1',
+      recurrence: '0 9 * * *',
+      process_after: isoIn(3600_000),
+    });
+    markSessionQuiet();
+
+    const res = (await editHandler(
+      putReq({ cron: '0 6 * * *' }),
+      { key: keyFor('ser-1') },
+      ctxFor('owner', OWNER_SCOPES),
+    ))!;
+    expect(res.status).toBe(200);
+
+    const row = sessionRow();
+    expect(row.sweep_quiet_until, 'the quiet mark outlived a due-time change').toBeNull();
+    expect(row.last_active).not.toBe('2026-06-01T00:00:00.000Z');
+  });
+
+  it('a resume clears the quiet mark and moves last_active', async () => {
+    insertRow(seedSession().inbound, {
+      id: 'r1',
+      series_id: 'ser-1',
+      recurrence: '0 9 * * *',
+      process_after: isoIn(3600_000),
+      status: 'paused',
+    });
+    markSessionQuiet();
+
+    const res = (await resumeHandler(putReq({}), { key: keyFor('ser-1') }, ctxFor('owner', OWNER_SCOPES)))!;
+    expect(res.status).toBe(200);
+
+    const row = sessionRow();
+    expect(row.sweep_quiet_until).toBeNull();
+    expect(row.last_active).not.toBe('2026-06-01T00:00:00.000Z');
+  });
+});
+
 describe('editHandler', () => {
   it('test_edit_cron_recomputes_process_after', async () => {
     insertRow(seedSession().inbound, {
