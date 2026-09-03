@@ -1216,21 +1216,22 @@ describe('sweep duty registry (S2-PR2)', () => {
   // ── F-14.1 (S2-PR14, plan.md §8) ─────────────────────────────────────────────
   //
   // Structural, not a line budget. The plan's original "under 300 lines" was an
-  // estimate written before the build; on this lineage the end state is 1,347
-  // lines (`wc -l`). S2-PR14's own branch measured 1,136 lines —
-  // 631 code, 420 comment, 85 blank — and holds no duty body at all. The
-  // assertion below counts `split('\n')` elements, which is one more (1,137) for
-  // a file ending in a newline; the ceiling is set against that measure. Section
+  // estimate written before the build. Re-measured on the B3 integration
+  // lineage (`sed -n '<start>,<end>p' src/host-sweep.ts | wc -l` per section,
+  // summing exactly to `wc -l`'s 1,347 — 1,348 by the `split('\n')` count the
+  // assertion below uses, one more for the trailing newline). Section
   // breakdown, in `split('\n')` elements:
-  // sweepSession + helpers 260, driver start/stop/sweep/sweepOnce 150, registry
-  // 158, error rule 100, shared context + duty types 99, re-exports +
-  // writeSystemWake + providerFailedTicks 80, SLA hooks + kill follow-ups +
-  // windowedRunner 65, phase list 53, duty inventory 50, tick constants + quiet
-  // cache 45, file header 29, tail re-exports + the empty built-in source 27,
-  // imports 21. The three assertions below are what the criterion actually
-  // means; the 1,200 ceiling at the end is a REGROWTH ratchet, not a target — it
-  // catches a duty body creeping back into the driver, which is the failure this
-  // case exists to prevent.
+  // sweepSession + helpers 273, driver start/stop/sweep/sweepOnce 214, registry
+  // 170, error rule + SLA hooks + kill follow-ups + windowedRunner 155, tick
+  // constants + quiet cache 137, re-exports + writeSystemWake +
+  // providerFailedTicks + the outbound-ownership guard docs 140, shared context
+  // + duty types 98, phase list 55, duty inventory 47, imports 28, file header
+  // 27, tail re-exports + the empty built-in source 3. (S2-PR14's own head,
+  // dc440893, measured 1,198 lines by the same count — see the ratchet comment
+  // below for the +149 delta's real cause.) The three assertions below are what
+  // the criterion actually means; the ceiling at the end is a REGROWTH ratchet,
+  // not a target — it catches a duty body creeping back into the driver, which
+  // is the failure this case exists to prevent.
   it('host-sweep.ts contains no inline duty bodies', async () => {
     const source = fs.readFileSync(path.join(REPO_ROOT, 'src/host-sweep.ts'), 'utf8');
 
@@ -1323,18 +1324,33 @@ describe('sweep duty registry (S2-PR2)', () => {
     }
 
     // Regrowth ratchet. 1,348 by this measure on the B3 integration lineage
-    // (1,347 by `wc -l`), against 1,281 on S2-PR14's own branch. The 67-line
-    // difference is not a duty coming home: it is mailbox seam PR 5b's guard
-    // prose (`writeOutboundWhenStopped` / `withStoppedContainerSession` carry
-    // their full doc blocks here) plus mailbox PR 7's rewritten comments on the
-    // admission and usage-rollup seams — comment lines in a file that holds no
-    // duty body at all. Raised from 1,300 for that reason; the headroom is for
-    // comments and the driver's own evolution, never for a duty body. Set as
-    // measured + ~60, rounded up to the next hundred. The three structural
-    // assertions above are what the F-14.1 criterion actually means and none of
-    // them moved: no duty originates here, no registration surface is called
-    // inline, and the export allowlist is unchanged.
-    expect(source.split('\n').length).toBeLessThanOrEqual(1500);
+    // (1,347 by `wc -l`), against 1,198 on S2-PR14's own head (dc440893, same
+    // count). The +149-line delta is NOT a duty coming home — measured with
+    // `git diff --stat dc440893 HEAD -- src/host-sweep.ts` (219 insertions, 70
+    // deletions, net +149) and read hunk by hunk, the two largest pieces are:
+    //  - ~90 lines: S2-PR15's quiet-session backoff jitter + boot-time cache
+    //    warm (`quietSessionJitter`/`quietSessionBackoffMs`/
+    //    `warmQuietSessionCache`, issue #320), plus its per-tick flush further
+    //    down (`newQuietMarks`/`persistQuietSessionMarks`) and
+    //    `_lastSweepTickStatsForTesting` — real driver code, not comment, but
+    //    not a registrable duty body either: it is the sweep loop's own cache,
+    //    same status as `sweepDuties`/`sweepKillFollowUps` above.
+    //  - a near-wash (-59/+58 across two hunks): `containerOwnsOutbound`/
+    //    `writeOutboundWhenStopped`/`withStoppedContainerSession` moved from a
+    //    local PR14 definition to an import from `container-runner.js`
+    //    (mailbox PR 4 round 8) plus PR 7's re-worded doc block at the new
+    //    (earlier) location.
+    // The remainder is the `withExistingMailboxSession` rename (PR 7) and other
+    // one-line diffs scattered through `sweepOnce`/`sweepSession`. None of it is
+    // a duty body: no duty originates here, no registration surface is called
+    // inline, and the export allowlist is unchanged (the three structural
+    // assertions above, which is what the F-14.1 criterion actually means).
+    // Ratchet raised from 1,300 to 1,400 — measured (1,348) + ~50 — for the
+    // same reason plan.md's own estimate was always going to be wrong:
+    // `warmQuietSessionCache` and its persistence path are legitimate
+    // driver-owned functionality that arrived after the plan's line budget was
+    // written, not scope creep into a duty body.
+    expect(source.split('\n').length).toBeLessThanOrEqual(1400);
     expect(h.spawns).toEqual([]);
   });
 
