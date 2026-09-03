@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
+import { describe, it, expect, beforeEach, afterEach, spyOn, test } from 'bun:test';
 import * as fs from 'fs';
 import os from 'os';
 import path from 'path';
@@ -6,6 +6,7 @@ import path from 'path';
 import { _resetConfig, loadConfig } from './config.js';
 import { clearStaleProcessingAcks, setContainerToolInFlight } from './db/container-state.js';
 import { getInboundDb, getOutboundDb } from './mailbox/sqlite/connection.js';
+import { getAgentMailbox } from './mailbox/index.js';
 import { closeSessionDb, initTestSessionDb } from './modules/mailbox/testing.js';
 import { getPendingMessages, markCompleted } from './db/messages-in.js';
 import { getUndeliveredMessages } from './db/messages-out.js';
@@ -1982,6 +1983,55 @@ const ERR_ROUTING = {
   inReplyTo: 'm1',
   quietStatus: false,
 };
+
+describe('provider-event ordering across the awaited outbound write', () => {
+  // R1 made writeMessageOut Promise-returning (upstream's mailbox contract) and
+  // handleEvent async with it. The poll loop's `for await (const event of
+  // query.events)` awaits handleEvent (poll-loop.ts:1762), so the change is
+  // shape-only: event N's outbound row is committed before event N+1 is
+  // handled. Drop that one await and this test fails on the trace — the three
+  // writes start before any finishes, and the seq order stops tracking the
+  // event order.
+  test('outbound writes from consecutive provider events keep monotonic seq and arrive before the next event is handled', async () => {
+    const operations = getAgentMailbox().operations;
+    const write = operations.writeMessageOut.bind(operations);
+    const trace: string[] = [];
+    const spy = spyOn(operations, 'writeMessageOut').mockImplementation(async (message) => {
+      const label = (JSON.parse(message.content) as { text: string }).text;
+      trace.push(`start:${label}`);
+      // Yield across a macrotask, so a caller that did not await would
+      // provably have started the next write before this one finished.
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      const sequence = await write(message);
+      trace.push(`end:${label}`);
+      return sequence;
+    });
+
+    async function* events(): AsyncGenerator<ProviderEvent> {
+      yield { type: 'progress', message: 'first' };
+      yield { type: 'progress', message: 'second' };
+      yield { type: 'progress', message: 'third' };
+    }
+    const query: AgentQuery = { push: () => {}, end: () => {}, abort: () => {}, events: events() };
+
+    try {
+      await processQuery(query, ERR_ROUTING, [], 'claude', undefined, 'prompt', undefined, {});
+    } finally {
+      spy.mockRestore();
+    }
+
+    // Each write completes before the next event is handled.
+    expect(trace).toEqual(['start:first', 'end:first', 'start:second', 'end:second', 'start:third', 'end:third']);
+
+    const rows = getOutboundDb()
+      .prepare("SELECT seq, content FROM messages_out WHERE kind = 'status' ORDER BY seq ASC")
+      .all() as Array<{ seq: number; content: string }>;
+    expect(rows.map((row) => (JSON.parse(row.content) as { text: string }).text)).toEqual(['first', 'second', 'third']);
+    const sequences = rows.map((row) => row.seq);
+    expect(sequences).toEqual([...sequences].sort((a, b) => a - b));
+    expect(new Set(sequences).size).toBe(3);
+  });
+});
 
 describe('turn_id — correlates split rows of one turn, distinguishes separate turns', () => {
   it('a multi-model result event writes N turn_usage rows sharing one turn_id; a later result event gets a different one', async () => {
