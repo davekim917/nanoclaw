@@ -150,3 +150,14 @@ Not started.
 
 - Mailbox PR 5 `#271` is FINAL at **`9078f5cf`** (six Codex rounds, 8 threads resolved, last push declined). Per the mailbox session, since `3030d050` it gained two commits inside the mailbox module and host-sweep's backoff: openers prove queryability and raise `SessionDbUnopenableError` (routed to the unreadable-mailbox backoff regardless of `enteredPlanSession`), the usage rollup reads through the module's outbound opener again, and the releasing `close()` installs before the probe; the W4 health chain is untouched. **§4.5's error rule must be re-grounded on this head before PR 2 is briefed** — a scout produces `seam2-fork-rev3.md` (line-accurate duty map, error classification, wake/kill sites, exports, delta table vs plan §3/§4.3–4.5).
 - Worktree `wt-s2-pr2` → `feat/host-sweep-seam-pr2-duty-registry` cut at `9078f5cf` (`host-sweep.ts` 2,448 lines; `host-sweep.test.ts` 3,146). Mailbox PR 4 `#291` is at `2d1e345d` awaiting its Codex pass; S2-PR9/11/13 wait for its final sha.
+
+### Cross-model review — S2-PR0 implementation (`2713edc0..444b5366`)
+
+- Stage: implementation. Primary: Claude (Fable 5.1 orchestrator; Sonnet builder). Reviewer: Codex CLI `gpt-5.6-sol`, `model_reasoning_effort="high"`, same transport as PR 1 (vendored prompt, schema-enforced output). Exit 0, status **completed** (started 11:54Z, verdict 11:58Z). Raw verdict **needs-attention**, 2 findings (both medium) → `must_fix` on the plan text; no code change. Artifacts: `<scratchpad>/review/pr0/`.
+
+| # | Finding (sev, conf) | Lead verification | Disposition |
+|---|---|---|---|
+| F1 | L-3 never spies on the production boot/shutdown sequence — source-position text plus a runtime call with a test-made context; a call moved into an unreachable branch would stay green (medium, 0.99) | **Confirmed as described.** `src/main.test.ts:24-70`. Driving the real `main()` needs mocks for ~40 imports (DB, migrations, docker, channels, dashboard…); the repo's precedent for boot-order assertions is the same source-position form (`src/main.memory-startup-order.test.ts`). Not blocking-class (verification quality; no destructive path). | **Accepted in part → plan text aligned to the case** (L-3 now states the source-position + runtime-ctx form) and the stronger form **deferred** with a re-raise trigger: the first seam PR that makes `main()`'s boot sequence executable under test upgrades L-3 to ordered spies. Recorded here; no PR 0 change. |
+| F2 | §10's PR 0 verification command omits `src/main.test.ts`, so the documented gate would pass without L-3/L-4 (medium, 1.0) | **Confirmed.** plan §10 line listed two files. The lead's actual run included `main.test.ts` (6 files, 48 passed). | **Accepted.** §10 corrected to three files. |
+
+- Reviewer: "production wiring looks correct". Coverage: cross-model review complete (other-family). PR 0 is **review-clear** at `444b5366` with plan amendments only; opening the PR for the GitHub-side Codex round.

@@ -443,7 +443,7 @@ Host, `vitest`. 68 cases.
 **S2-PR0 — lifecycle port (4)**
 - **L-1** `src/host-lifecycle-seam.test.ts` › "every ported upstream file matches UPSTREAM-MANIFEST.json" — manifest key set equals `UPSTREAM_FILES`; recompute sha256 for each; assert equality.
 - **L-2** `src/host-lifecycle.test.ts` (fork-owned copy of upstream's five `host module lifecycle registry` cases, verbatim — §4.1) › "start callbacks run FIFO and a throw propagates; shutdown callbacks run LIFO and a throw is swallowed" — upstream's assertions, unmodified; the two boot-order cases are kept with only the `src/index.ts` → `src/main.ts` path swapped; the approvals case is deferred.
-- **L-3** `src/main.test.ts` › "startHostModules fires after the delivery adapter and before the delivery polls; stopHostModules is the first shutdown action" — spy the boot sequence; assert relative order against `setDeliveryAdapter`, `startActiveDeliveryPoll`, `stopDeliveryPolls`.
+- **L-3** `src/main.test.ts` › "startHostModules fires after the delivery adapter and before the delivery polls; stopHostModules is the first shutdown action" — source-position assertions inside `main()` and `shutdown()` in `src/main.ts` (the precedent `src/main.memory-startup-order.test.ts` uses; `main()` cannot be driven under test without mocking its ~40 imports) — `startHostModules(` sits between `setDeliveryAdapter(` and `startActiveDeliveryPoll(`, and `hostAbortController.abort()` + `stopHostModules()` precede `stopDeliveryPolls()` — plus a runtime assertion that `startHostModules` hands every callback the same `{db, signal}` context. Deferred, with a re-raise trigger: when any seam PR makes `main()`'s boot sequence executable under test, L-3 upgrades to ordered spies over the real path (Codex PR 0 review, run.md).
 - **L-4** same file › "the lifecycle port registers no callbacks" — after importing the modules barrel, both getters return empty at PR 0. **Superseded at PR 1** (the timers register), replaced by T-5 below; the case is removed in PR 1's diff, not weakened in place.
 
 **S2-PR1 — module timers (5)**
@@ -553,7 +553,7 @@ Everything else here is an engineering decision already made and stated (§11).
 ```bash
 ./node_modules/.bin/prettier --check .
 ./node_modules/.bin/tsc --noEmit
-./node_modules/.bin/vitest run src/host-lifecycle.test.ts src/host-lifecycle-seam.test.ts     # PR 0
+./node_modules/.bin/vitest run src/host-lifecycle.test.ts src/host-lifecycle-seam.test.ts src/main.test.ts   # PR 0 (L-1..L-4)
 ./node_modules/.bin/vitest run src/host-sweep-registry.test.ts src/host-sweep-reschedule.test.ts
 ./node_modules/.bin/vitest run src/host-sweep.test.ts src/modules/sweep-<family>/*.test.ts    # per family PR
 ./node_modules/.bin/vitest run src/mailbox-seam-upstream.test.ts src/mailbox-seam-ratchet.test.ts
