@@ -2072,6 +2072,36 @@ describe('processQuery provider_executing', () => {
     // The stream ended without a further `result`; the finally is the floor.
     expect(providerExecuting()).toBe(0);
   });
+
+  // Codex review on #333: lowering the turn level at `result` is correct, but
+  // the handling that FOLLOWS completes the batch's processing claim and only
+  // then decides whether to push a corrective follow-up. A sweep tick landing
+  // in that gap saw no due row, no claim, no continuation and no raised turn,
+  // and killed the container mid-decision. The bounded scope spans the gap.
+  it('stays raised while result handling completes the claim and decides on a follow-up', async () => {
+    const operations = getAgentMailbox().operations;
+    const markMessages = operations.markMessages.bind(operations);
+    const atCompletion: number[] = [];
+    const spy = spyOn(operations, 'markMessages').mockImplementation((ids, status) => {
+      if (status === 'completed') atCompletion.push(providerExecuting());
+      markMessages(ids, status);
+    });
+
+    try {
+      // Unwrapped output draws the one-shot re-wrap nudge, so handling pushes
+      // a follow-up turn AFTER completing the batch — the exact ordering the
+      // race depends on.
+      const { query } = makeResultQuery({ type: 'result', text: 'unwrapped' });
+      await processQuery(query, ERR_ROUTING, ['m-claimed'], 'claude', undefined, 'prompt', undefined, {});
+    } finally {
+      spy.mockRestore();
+    }
+
+    // The claim was completed at least once, and the flag was raised every
+    // time — never the window where every reaper term reads idle.
+    expect(atCompletion.length).toBeGreaterThan(0);
+    expect(atCompletion.every((value) => value === 1)).toBe(true);
+  });
 });
 
 it('re-bootstraps bounded canon and capabilities immediately after provider compaction', async () => {

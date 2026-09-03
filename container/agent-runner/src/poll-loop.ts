@@ -1754,6 +1754,35 @@ export async function processQuery(
     })();
   }, ACTIVE_POLL_INTERVAL_MS);
 
+  /**
+   * A bounded busy scope held across `result` HANDLING, not just the turn.
+   *
+   * Lowering the turn level at `result` is correct — the turn really is over —
+   * but the handling that follows completes the initial batch's processing
+   * claim and only THEN decides whether to push a corrective follow-up (a
+   * task-block nudge, a wrapping retry, a queued continuation). Between the
+   * `markCompleted` and that push, a task container has no due row, no claim,
+   * no continuation and no raised turn: every reaper term reads idle and a
+   * sweep tick landing there kills the container and loses the follow-up this
+   * change exists to protect. The scope spans that gap, and because the
+   * published bit is the union, closing it leaves the flag raised whenever
+   * handling did push a new turn.
+   *
+   * Idempotent, and also closed in the outer `finally`, so an exception thrown
+   * mid-handling cannot leak a scope and pin the container until the ceiling.
+   */
+  let resultScopeOpen = false;
+  const openResultScope = (): void => {
+    if (resultScopeOpen) return;
+    resultScopeOpen = true;
+    beginProviderBusyScope();
+  };
+  const closeResultScope = (): void => {
+    if (!resultScopeOpen) return;
+    resultScopeOpen = false;
+    endProviderBusyScope();
+  };
+
   // The initial prompt is a turn the same way a push is; `result` clears it.
   setProviderTurnExecuting(true);
   try {
@@ -1803,7 +1832,11 @@ export async function processQuery(
         // the entire idle stretch and keep the task reaper off a container
         // that has nothing left to do. It lowers only the TURN level: a
         // pre-task script the poll callback started concurrently keeps its own
-        // scope, so this cannot cut the ground out from under it.
+        // scope, so this cannot cut the ground out from under it. The scope
+        // opened first keeps the published bit raised across the handling
+        // below, which completes this batch's claim before it decides whether
+        // to push a follow-up turn.
+        openResultScope();
         setProviderTurnExecuting(false);
         // Fleet Hardening Phase 0.1: one turn_usage row per completed turn,
         // written here because every provider's query converges on this
@@ -1941,6 +1974,10 @@ export async function processQuery(
         } else {
           pauseAnsweredPrompt();
         }
+        // Handling is done deciding. If it pushed, the turn level is raised
+        // again and the published bit stays 1; if it did not, this is where
+        // the container becomes reapable.
+        closeResultScope();
       } else if (event.type === 'compacted') {
         advanceMemoryContextEpoch(providerName);
         // The SDK auto-compacted the conversation. After compaction the
@@ -1982,6 +2019,7 @@ export async function processQuery(
     done = true;
     clearInterval(pollHandle);
     // Floor for the abort/throw paths, which never reach a `result`.
+    closeResultScope();
     setProviderTurnExecuting(false);
   }
 
