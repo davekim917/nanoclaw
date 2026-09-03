@@ -8,6 +8,7 @@ import fs from 'fs';
 import path from 'path';
 import { pathToFileURL } from 'url';
 
+import { activateAgentRunnerSource, pruneAgentRunnerSnapshots } from './agent-runner-source.js';
 import { backfillContainerConfigs } from './backfill-container-configs.js';
 import { markDeployBootHealthy } from './deploy-crash-guard.js';
 import { formatBuildInfoLog, readBuildInfo } from './build-info.js';
@@ -185,6 +186,12 @@ export async function main(): Promise<void> {
   const dbPath = path.join(DATA_DIR, 'v2.db');
   const db = initDb(dbPath);
   runMigrations(db);
+
+  // Snapshot the agent-runner source for this boot (mailbox seam PR 0) —
+  // must happen before anything can spawn a container, so every spawn this
+  // process makes mounts the same tree, not the live checkout mid-`git pull`.
+  activateAgentRunnerSource();
+
   resetProcessingChannelIngress();
 
   // Workgroup FS reconciliation — runs after migrations to drain the
@@ -223,6 +230,15 @@ export async function main(): Promise<void> {
     log.error('host-restart startup warn failed', { err });
   }
   const memoryReports = runWorkgroupMemoryStartupGate(db);
+
+  // Prune old agent-runner-source snapshots now that cleanupOrphansStrict()
+  // (inside runWorkgroupMemoryStartupGate, above) has stopped every
+  // container left running by an unclean previous host — pruning any
+  // earlier is unsafe (a bind mount pins the directory, not its entries).
+  // When container adoption across restarts lands (mailbox seam 2), this
+  // ordering assumption needs revisiting: an adopted container is a live
+  // reference this call must not delete out from under.
+  pruneAgentRunnerSnapshots();
   for (const report of memoryReports) {
     if (report.state.status === 'migration-required') {
       log.warn('Workgroup memory requires operator migration; automatic startup left it untouched', {
