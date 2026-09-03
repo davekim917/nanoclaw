@@ -217,13 +217,22 @@ function makeSessionDbs(): {
       status         TEXT NOT NULL,
       status_changed TEXT NOT NULL
     );
+    -- Mirrors src/db/schema.ts's messages_out. The four routing/scheduling
+    -- columns were missing here, so any case that drove a real outbound write
+    -- (the ceiling notice, the parked notice) failed on 'no column named
+    -- platform_id' and was silently swallowed by the notifier's own try/catch.
     CREATE TABLE messages_out (
-      id          TEXT PRIMARY KEY,
-      seq         INTEGER UNIQUE,
-      in_reply_to TEXT,
-      timestamp   TEXT NOT NULL,
-      kind        TEXT NOT NULL,
-      content     TEXT NOT NULL
+      id            TEXT PRIMARY KEY,
+      seq           INTEGER UNIQUE,
+      in_reply_to   TEXT,
+      timestamp     TEXT NOT NULL,
+      deliver_after TEXT,
+      recurrence    TEXT,
+      kind          TEXT NOT NULL,
+      platform_id   TEXT,
+      channel_type  TEXT,
+      thread_id     TEXT,
+      content       TEXT NOT NULL
     );
     CREATE TABLE session_state (
       key        TEXT PRIMARY KEY,
@@ -1585,7 +1594,10 @@ describe('host outbound writes yield to a container that takes the session', () 
   // registered follow-up, so ownership can flip at a microtask boundary between
   // them — after S15's notice, before S17's reset and before S10's wake row.
   it('a wake that takes ownership between post-kill follow-ups stops the later follow-ups from writing', async () => {
-    const { outDb, mailbox } = makeSessionDbs();
+    const { inDb, outDb, mailbox } = makeSessionDbs();
+    // notifyKillCeiling posts only when a user WAS waiting (pendingClaims > 0)
+    // and only when it knows where to post, so both preconditions are set here.
+    inDb.prepare('INSERT INTO session_routing VALUES (1, ?, ?, ?)').run('slack', 'C-1', 'T-1');
     outDb
       .prepare("INSERT INTO processing_ack (message_id, status, status_changed) VALUES ('m-live', 'processing', ?)")
       .run(new Date(Date.now() - 2 * 60 * 60_000).toISOString());
@@ -1593,7 +1605,7 @@ describe('host outbound writes yield to a container that takes the session', () 
     const notices = (): number => (outDb.prepare('SELECT COUNT(*) AS c FROM messages_out').get() as { c: number }).c;
 
     const ctx = sessionCtx(mailbox, emptyPlan(), {
-      killSnapshot: { reason: 'absolute-ceiling', pendingClaims: 0, containerState: null, workContinuation: null },
+      killSnapshot: { reason: 'absolute-ceiling', pendingClaims: 1, containerState: null, workContinuation: null },
     });
     const outcome = {
       action: 'kill-ceiling' as const,
