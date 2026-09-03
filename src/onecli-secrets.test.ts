@@ -1,3 +1,5 @@
+import { readFileSync } from 'fs';
+
 import { describe, expect, test, vi, beforeEach, afterEach } from 'vitest';
 
 import {
@@ -9,20 +11,51 @@ import {
   __test,
 } from './onecli-secrets.js';
 
-// Mock child_process.execFileSync so tests never call the local gateway.
+// Mock child_process so tests never call the local gateway or spawn a real
+// process. `execFileSync` is mocked too — not because the module may use it,
+// but so the tripwire below can prove it never does.
 // Hoisted via vi.mock so it applies before the module imports.
 vi.mock('child_process', async () => {
   const actual = await vi.importActual<typeof import('child_process')>('child_process');
   return {
     ...actual,
+    execFile: vi.fn(),
     execFileSync: vi.fn(),
+    execSync: vi.fn(),
+    spawnSync: vi.fn(),
   };
 });
 
-import { execFileSync } from 'child_process';
+import { execFile, execFileSync, execSync, spawnSync } from 'child_process';
 
-// Type-safe handle to the mocked function.
-const mockedExec = vi.mocked(execFileSync);
+// Type-safe handles to the mocked functions. `mockedExec` keeps the historic
+// name and the historic `[bin, argv]` call shape — `execFile`'s first two
+// parameters are the same as `execFileSync`'s.
+const mockedExec = vi.mocked(execFile) as unknown as ReturnType<typeof vi.fn>;
+const syncSpies = [vi.mocked(execFileSync), vi.mocked(execSync), vi.mocked(spawnSync)];
+
+type ExecFileCallback = (error: Error | null, stdout: string, stderr: string) => void;
+
+/**
+ * Adapts a `(bin, argv) => stdout` responder to `execFile`'s callback shape,
+ * answering on a later microtask so the tests exercise the real asynchrony.
+ */
+function toCallbackImpl(fn: (bin: unknown, argv: unknown) => string) {
+  return (bin: unknown, argv: unknown, _options: unknown, callback: unknown) => {
+    const done = callback as ExecFileCallback;
+    const out = fn(bin, argv);
+    queueMicrotask(() => done(null, out, ''));
+    return undefined;
+  };
+}
+
+function respond(fn: (bin: unknown, argv: unknown) => string): void {
+  mockedExec.mockImplementation(toCallbackImpl(fn));
+}
+
+function respondOnce(fn: (bin: unknown, argv: unknown) => string): void {
+  mockedExec.mockImplementationOnce(toCallbackImpl(fn));
+}
 
 // OneCLI gateway calls go through curl. These predicates match an
 // execFileSync call shaped as [bin, args].
@@ -48,6 +81,14 @@ const grantMutation = (c: unknown[]): { method: string; url: string } | undefine
 beforeEach(() => {
   __resetCachesForTest();
   mockedExec.mockReset();
+  for (const spy of syncSpies) spy.mockReset();
+});
+
+afterEach(() => {
+  // Tripwire: nothing in this module may reach a BLOCKING child_process call.
+  // A sync curl here parks the host event loop for the whole gateway round
+  // trip on every container spawn — issue #315.
+  for (const spy of syncSpies) expect(spy).not.toHaveBeenCalled();
 });
 
 afterEach(() => {
@@ -81,7 +122,7 @@ const SECRET_FIXTURE = {
 };
 
 function setupCliResponses(): void {
-  mockedExec.mockImplementation((bin: unknown, rawArgs: unknown) => {
+  respond((bin: unknown, rawArgs: unknown) => {
     const argv = (rawArgs ?? []) as string[];
     // LIST ops go through the gateway API via curl; route by the URL in argv.
     if (bin === 'curl') {
@@ -98,49 +139,49 @@ function setupCliResponses(): void {
   });
 }
 
-describe('isUuid', () => {
-  test('accepts canonical UUID', () => {
+describe('isUuid', async () => {
+  test('accepts canonical UUID', async () => {
     expect(__test.isUuid('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa')).toBe(true);
   });
 
-  test('accepts mixed-case hex', () => {
+  test('accepts mixed-case hex', async () => {
     expect(__test.isUuid('AAaaAAaa-AAAA-aaaa-AAAA-aaaaAAAAaaaa')).toBe(true);
   });
 
-  test('rejects non-UUID strings (secret names)', () => {
+  test('rejects non-UUID strings (secret names)', async () => {
     expect(__test.isUuid('Datafold-ExampleRetail')).toBe(false);
     expect(__test.isUuid('Anthropic')).toBe(false);
     expect(__test.isUuid('')).toBe(false);
   });
 
-  test('rejects malformed UUIDs', () => {
+  test('rejects malformed UUIDs', async () => {
     expect(__test.isUuid('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaa')).toBe(false); // short
     expect(__test.isUuid('zzzzzzzz-aaaa-aaaa-aaaa-aaaaaaaaaaaa')).toBe(false); // bad hex
   });
 });
 
-describe('applyOnecliSecrets — no-op paths', () => {
-  test('does nothing when declarations is undefined', () => {
-    applyOnecliSecrets('example-retail', undefined);
+describe('applyOnecliSecrets — no-op paths', async () => {
+  test('does nothing when declarations is undefined', async () => {
+    await applyOnecliSecrets('example-retail', undefined);
     expect(mockedExec).not.toHaveBeenCalled();
   });
 
-  test('does nothing when declarations is empty', () => {
-    applyOnecliSecrets('example-retail', []);
+  test('does nothing when declarations is empty', async () => {
+    await applyOnecliSecrets('example-retail', []);
     expect(mockedExec).not.toHaveBeenCalled();
   });
 });
 
-describe('ensureOnecliAgent', () => {
-  test('lists once and skips create for an existing agent, then reuses the cache', () => {
+describe('ensureOnecliAgent', async () => {
+  test('lists once and skips create for an existing agent, then reuses the cache', async () => {
     setupCliResponses();
 
-    expect(ensureOnecliAgent({ name: 'Example Retail', identifier: 'example-retail' })).toEqual({
+    await expect(ensureOnecliAgent({ name: 'Example Retail', identifier: 'example-retail' })).resolves.toEqual({
       name: 'Example Retail',
       identifier: 'example-retail',
       created: false,
     });
-    expect(ensureOnecliAgent({ name: 'Example Retail', identifier: 'example-retail' })).toEqual({
+    await expect(ensureOnecliAgent({ name: 'Example Retail', identifier: 'example-retail' })).resolves.toEqual({
       name: 'Example Retail',
       identifier: 'example-retail',
       created: false,
@@ -150,8 +191,8 @@ describe('ensureOnecliAgent', () => {
     expect(mockedExec.mock.calls.filter(isAgentCreateCall)).toHaveLength(0);
   });
 
-  test('creates a missing agent once and caches the returned UUID', () => {
-    mockedExec.mockImplementation((bin: unknown, rawArgs: unknown) => {
+  test('creates a missing agent once and caches the returned UUID', async () => {
+    respond((bin: unknown, rawArgs: unknown) => {
       const argv = (rawArgs ?? []) as string[];
       if (bin !== 'curl') return '';
       const url = argv.join(' ');
@@ -166,19 +207,19 @@ describe('ensureOnecliAgent', () => {
       return '';
     });
 
-    expect(ensureOnecliAgent({ name: 'New Agent', identifier: 'new-agent' })).toEqual({
+    await expect(ensureOnecliAgent({ name: 'New Agent', identifier: 'new-agent' })).resolves.toEqual({
       name: 'New Agent',
       identifier: 'new-agent',
       created: true,
     });
-    expect(ensureOnecliAgent({ name: 'New Agent', identifier: 'new-agent' }).created).toBe(false);
+    expect((await ensureOnecliAgent({ name: 'New Agent', identifier: 'new-agent' })).created).toBe(false);
     expect(mockedExec.mock.calls.filter(isAgentsListCall)).toHaveLength(1);
     expect(mockedExec.mock.calls.filter(isAgentCreateCall)).toHaveLength(1);
   });
 
-  test('treats a create race returning 409 as success only after the agent is visible', () => {
+  test('treats a create race returning 409 as success only after the agent is visible', async () => {
     let listCalls = 0;
-    mockedExec.mockImplementation((bin: unknown, rawArgs: unknown) => {
+    respond((bin: unknown, rawArgs: unknown) => {
       const argv = (rawArgs ?? []) as string[];
       if (bin !== 'curl') return '';
       const url = argv.join(' ');
@@ -200,12 +241,12 @@ describe('ensureOnecliAgent', () => {
       return '';
     });
 
-    expect(ensureOnecliAgent({ name: 'Raced Agent', identifier: 'raced-agent' }).created).toBe(false);
+    expect((await ensureOnecliAgent({ name: 'Raced Agent', identifier: 'raced-agent' })).created).toBe(false);
     expect(listCalls).toBe(2);
   });
 
-  test('fails closed on an unexpected create response', () => {
-    mockedExec.mockImplementation((bin: unknown, rawArgs: unknown) => {
+  test('fails closed on an unexpected create response', async () => {
+    respond((bin: unknown, rawArgs: unknown) => {
       const argv = (rawArgs ?? []) as string[];
       if (bin !== 'curl') return '';
       const url = argv.join(' ');
@@ -214,26 +255,26 @@ describe('ensureOnecliAgent', () => {
       return '';
     });
 
-    expect(() => ensureOnecliAgent({ name: 'New Agent', identifier: 'new-agent' })).toThrow(
+    await expect(ensureOnecliAgent({ name: 'New Agent', identifier: 'new-agent' })).rejects.toThrow(
       /OneCLI agent create failed with HTTP 503/,
     );
   });
 });
 
-describe('applyOnecliSecrets — happy path', () => {
-  test('uses the grants API instead of removed legacy OneCLI agent commands', () => {
+describe('applyOnecliSecrets — happy path', async () => {
+  test('uses the grants API instead of removed legacy OneCLI agent commands', async () => {
     setupCliResponses();
 
-    applyOnecliSecrets('example-retail', ['Anthropic']);
+    await applyOnecliSecrets('example-retail', ['Anthropic']);
 
     expect(mockedExec.mock.calls.some(isAgentGrantsCall)).toBe(true);
     expect(mockedExec.mock.calls.some((c) => c[0] === 'onecli')).toBe(false);
   });
 
-  test('resolves names to UUIDs and attaches each missing secret grant', () => {
+  test('resolves names to UUIDs and attaches each missing secret grant', async () => {
     setupCliResponses();
 
-    applyOnecliSecrets('example-retail', ['Datafold-ExampleRetail', 'Hex', 'Anthropic']);
+    await applyOnecliSecrets('example-retail', ['Datafold-ExampleRetail', 'Hex', 'Anthropic']);
 
     const rawCalls = mockedExec.mock.calls;
 
@@ -262,20 +303,20 @@ describe('applyOnecliSecrets — happy path', () => {
     ]);
   });
 
-  test('accepts UUIDs passed directly in declarations', () => {
+  test('accepts UUIDs passed directly in declarations', async () => {
     setupCliResponses();
 
-    applyOnecliSecrets('example-retail', ['aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa']);
+    await applyOnecliSecrets('example-retail', ['aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa']);
 
     const mutations = mockedExec.mock.calls.map(grantMutation).filter(Boolean);
     expect(mutations).toHaveLength(1);
     expect(mutations[0]?.url).toContain('/grants/secrets/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa');
   });
 
-  test('mixes names and UUIDs in a single call', () => {
+  test('mixes names and UUIDs in a single call', async () => {
     setupCliResponses();
 
-    applyOnecliSecrets('example-retail', ['Datafold-ExampleRetail', 'cccccccc-cccc-cccc-cccc-cccccccccccc']);
+    await applyOnecliSecrets('example-retail', ['Datafold-ExampleRetail', 'cccccccc-cccc-cccc-cccc-cccccccccccc']);
 
     const urls = mockedExec.mock.calls
       .map(grantMutation)
@@ -287,8 +328,8 @@ describe('applyOnecliSecrets — happy path', () => {
     ]);
   });
 
-  test('removes undeclared secret grants before adding missing grants without touching connections', () => {
-    mockedExec.mockImplementation((bin: unknown, rawArgs: unknown) => {
+  test('removes undeclared secret grants before adding missing grants without touching connections', async () => {
+    respond((bin: unknown, rawArgs: unknown) => {
       const argv = (rawArgs ?? []) as string[];
       if (bin !== 'curl') return '';
       const url = argv.join(' ');
@@ -308,7 +349,7 @@ describe('applyOnecliSecrets — happy path', () => {
       return '';
     });
 
-    applyOnecliSecrets('example-retail', ['Datafold-ExampleRetail', 'Anthropic']);
+    await applyOnecliSecrets('example-retail', ['Datafold-ExampleRetail', 'Anthropic']);
 
     expect(mockedExec.mock.calls.map(grantMutation).filter(Boolean)).toEqual([
       {
@@ -326,72 +367,76 @@ describe('applyOnecliSecrets — happy path', () => {
   });
 });
 
-describe('applyOnecliSecrets — fail-closed paths', () => {
-  test("throws when agent identifier doesn't exist in vault", () => {
+describe('applyOnecliSecrets — fail-closed paths', async () => {
+  test("throws when agent identifier doesn't exist in vault", async () => {
     setupCliResponses();
 
-    expect(() => applyOnecliSecrets('does-not-exist', ['Anthropic'])).toThrow(
+    await expect(applyOnecliSecrets('does-not-exist', ['Anthropic'])).rejects.toThrow(
       /agent with identifier "does-not-exist" not found/,
     );
     expect(mockedExec.mock.calls.map(grantMutation).filter(Boolean)).toHaveLength(0);
   });
 
-  test("throws when a declared secret NAME doesn't resolve", () => {
+  test("throws when a declared secret NAME doesn't resolve", async () => {
     setupCliResponses();
 
-    expect(() => applyOnecliSecrets('example-retail', ['Datafold-ExampleRetail', 'Mistyped-Name'])).toThrow(
+    await expect(applyOnecliSecrets('example-retail', ['Datafold-ExampleRetail', 'Mistyped-Name'])).rejects.toThrow(
       /secret\(s\) not found in vault: Mistyped-Name/,
     );
     // No grant mutation should have been issued — fail-closed before apply.
     expect(mockedExec.mock.calls.map(grantMutation).filter(Boolean)).toHaveLength(0);
   });
 
-  test("throws when a declared UUID doesn't exist in vault", () => {
+  test("throws when a declared UUID doesn't exist in vault", async () => {
     setupCliResponses();
     const phantomUuid = '99999999-9999-9999-9999-999999999999';
 
-    expect(() => applyOnecliSecrets('example-retail', [phantomUuid])).toThrow(
+    await expect(applyOnecliSecrets('example-retail', [phantomUuid])).rejects.toThrow(
       new RegExp(`secret\\(s\\) not found in vault: ${phantomUuid}`),
     );
   });
 
-  test('reports ALL unresolvable names in one error', () => {
+  test('reports ALL unresolvable names in one error', async () => {
     setupCliResponses();
 
-    expect(() => applyOnecliSecrets('example-retail', ['Bad-One', 'Anthropic', 'Bad-Two'])).toThrow(/Bad-One, Bad-Two/);
+    await expect(applyOnecliSecrets('example-retail', ['Bad-One', 'Anthropic', 'Bad-Two'])).rejects.toThrow(
+      /Bad-One, Bad-Two/,
+    );
   });
 
-  test('throws without mutating when the grants response is malformed', () => {
+  test('throws without mutating when the grants response is malformed', async () => {
     setupCliResponses();
-    mockedExec.mockImplementationOnce(() => JSON.stringify(AGENT_FIXTURE));
-    mockedExec.mockImplementationOnce(() => JSON.stringify(SECRET_FIXTURE));
-    mockedExec.mockImplementationOnce(() => JSON.stringify({ mode: 'grants', connections: [], secrets: [] }));
+    respondOnce(() => JSON.stringify(AGENT_FIXTURE));
+    respondOnce(() => JSON.stringify(SECRET_FIXTURE));
+    respondOnce(() => JSON.stringify({ mode: 'grants', connections: [], secrets: [] }));
 
-    expect(() => applyOnecliSecrets('example-retail', ['Anthropic'])).toThrow(/Malformed OneCLI grants response/);
+    await expect(applyOnecliSecrets('example-retail', ['Anthropic'])).rejects.toThrow(
+      /Malformed OneCLI grants response/,
+    );
     expect(mockedExec.mock.calls.map(grantMutation).filter(Boolean)).toHaveLength(0);
   });
 });
 
-describe('applyOnecliSecrets — caching', () => {
-  test('reuses cached identifier→UUID after first lookup', () => {
+describe('applyOnecliSecrets — caching', async () => {
+  test('reuses cached identifier→UUID after first lookup', async () => {
     setupCliResponses();
 
-    applyOnecliSecrets('example-retail', ['Anthropic']);
+    await applyOnecliSecrets('example-retail', ['Anthropic']);
     const firstCallCount = mockedExec.mock.calls.filter(isAgentsListCall).length;
 
-    applyOnecliSecrets('example-retail', ['Hex']);
+    await applyOnecliSecrets('example-retail', ['Hex']);
     const secondCallCount = mockedExec.mock.calls.filter(isAgentsListCall).length;
 
     // First call populated the cache; second call should NOT re-list agents.
     expect(secondCallCount).toBe(firstCallCount);
   });
 
-  test('cache miss triggers refresh of agents list', () => {
+  test('cache miss triggers refresh of agents list', async () => {
     // First call resolves 'example-retail'. Then we add a NEW agent fixture
     // that contains an identifier we'll ask for — the cache miss should
     // re-issue `agents list` and discover it.
     let callsToAgentsList = 0;
-    mockedExec.mockImplementation((bin: unknown, rawArgs: unknown) => {
+    respond((bin: unknown, rawArgs: unknown) => {
       const argv = (rawArgs ?? []) as string[];
       if (bin === 'curl') {
         const url = argv.join(' ');
@@ -421,37 +466,37 @@ describe('applyOnecliSecrets — caching', () => {
       return '';
     });
 
-    applyOnecliSecrets('example-retail', ['Anthropic']);
+    await applyOnecliSecrets('example-retail', ['Anthropic']);
     expect(callsToAgentsList).toBe(1);
 
-    applyOnecliSecrets('newly-created-identifier', ['Anthropic']);
+    await applyOnecliSecrets('newly-created-identifier', ['Anthropic']);
     expect(callsToAgentsList).toBe(2);
   });
 });
 
-describe('mergeWorkgroupAndGroupSecrets — C3', () => {
-  test('test_merge_workgroup_baseline_plus_group_additive', () => {
+describe('mergeWorkgroupAndGroupSecrets — C3', async () => {
+  test('test_merge_workgroup_baseline_plus_group_additive', async () => {
     const result = mergeWorkgroupAndGroupSecrets(['Anthropic', 'Exa'], ['Datafold-Example Labs']);
     expect(result).toEqual(['Anthropic', 'Exa', 'Datafold-Example Labs']);
   });
 
-  test('test_merge_dedup_when_group_repeats_workgroup_secret', () => {
+  test('test_merge_dedup_when_group_repeats_workgroup_secret', async () => {
     const result = mergeWorkgroupAndGroupSecrets(['Anthropic', 'Exa'], ['Anthropic', 'Datafold-Example Labs']);
     // Anthropic appears in both — only one copy in output, workgroup order preserved
     expect(result).toEqual(['Anthropic', 'Exa', 'Datafold-Example Labs']);
   });
 
-  test('test_merge_empty_workgroup_passes_through', () => {
+  test('test_merge_empty_workgroup_passes_through', async () => {
     const result = mergeWorkgroupAndGroupSecrets([], ['Datafold-Example Labs']);
     expect(result).toEqual(['Datafold-Example Labs']);
   });
 
-  test('test_merge_empty_group_passes_through', () => {
+  test('test_merge_empty_group_passes_through', async () => {
     const result = mergeWorkgroupAndGroupSecrets(['Anthropic', 'Exa'], []);
     expect(result).toEqual(['Anthropic', 'Exa']);
   });
 
-  test('test_merge_per_group_cannot_subtract', () => {
+  test('test_merge_per_group_cannot_subtract', async () => {
     // Per-group list is additive only — cannot remove workgroup secrets
     const result = mergeWorkgroupAndGroupSecrets(['Anthropic', 'Exa'], ['Datafold-Example Labs']);
     // Anthropic + Exa from workgroup MUST be present
@@ -460,34 +505,34 @@ describe('mergeWorkgroupAndGroupSecrets — C3', () => {
     expect(result).toContain('Datafold-Example Labs');
   });
 
-  test('handles undefined workgroup secrets', () => {
+  test('handles undefined workgroup secrets', async () => {
     const result = mergeWorkgroupAndGroupSecrets(undefined, ['Datafold-Example Labs']);
     expect(result).toEqual(['Datafold-Example Labs']);
   });
 
-  test('handles undefined group secrets', () => {
+  test('handles undefined group secrets', async () => {
     const result = mergeWorkgroupAndGroupSecrets(['Anthropic'], undefined);
     expect(result).toEqual(['Anthropic']);
   });
 
-  test('handles both undefined', () => {
+  test('handles both undefined', async () => {
     const result = mergeWorkgroupAndGroupSecrets(undefined, undefined);
     expect(result).toEqual([]);
   });
 });
 
-describe('slackUserTokenSecrets', () => {
+describe('slackUserTokenSecrets', async () => {
   const merged = ['Anthropic', 'Slack-User-Token-example-retail', 'Slack-Bot-Token-Example-Retail', 'GranolaAPI'];
 
-  test('convention match selects the user-token secret, not the bot token', () => {
+  test('convention match selects the user-token secret, not the bot token', async () => {
     expect(slackUserTokenSecrets(merged)).toEqual(['Slack-User-Token-example-retail']);
   });
 
-  test('convention is case-insensitive', () => {
+  test('convention is case-insensitive', async () => {
     expect(slackUserTokenSecrets(['slack-USER-token-x'])).toEqual(['slack-USER-token-x']);
   });
 
-  test('explicit names take precedence over the convention', () => {
+  test('explicit names take precedence over the convention', async () => {
     // An explicitly-named secret that does NOT match the convention is still
     // selected; a convention-matching secret NOT in the explicit list is not.
     expect(
@@ -495,16 +540,175 @@ describe('slackUserTokenSecrets', () => {
     ).toEqual(['Slack-Example-Retail']);
   });
 
-  test('explicit match is case-insensitive and returns names as they appear', () => {
+  test('explicit match is case-insensitive and returns names as they appear', async () => {
     expect(slackUserTokenSecrets(['Slack-Example-Retail'], ['slack-example-retail'])).toEqual(['Slack-Example-Retail']);
   });
 
-  test('no match returns empty', () => {
+  test('no match returns empty', async () => {
     expect(slackUserTokenSecrets(['Anthropic', 'GranolaAPI'])).toEqual([]);
     expect(slackUserTokenSecrets([])).toEqual([]);
   });
 
-  test('empty explicit list falls back to convention', () => {
+  test('empty explicit list falls back to convention', async () => {
     expect(slackUserTokenSecrets(merged, [])).toEqual(['Slack-User-Token-example-retail']);
+  });
+});
+
+// ── #315 regression suite ────────────────────────────────────────────────────
+//
+// The host event loop stalled ~20×/hour (p50 18 s) because this module ran the
+// OneCLI control-API calls with `execFileSync('curl', …)` on every container
+// spawn. These tests hold the seam async and keep the fail-closed contract.
+
+describe('#315 — no blocking child_process on the spawn path', () => {
+  test('a full resolve/ensure/apply cycle never calls a sync child_process API', async () => {
+    setupCliResponses();
+
+    await ensureOnecliAgent({ name: 'Example Retail', identifier: 'example-retail' });
+    await applyOnecliSecrets('example-retail', ['Anthropic', 'Hex']);
+
+    // The afterEach tripwire asserts this too; stated here so the intent is
+    // visible at the point of failure.
+    expect(vi.mocked(execFileSync)).not.toHaveBeenCalled();
+    expect(vi.mocked(execSync)).not.toHaveBeenCalled();
+    expect(vi.mocked(spawnSync)).not.toHaveBeenCalled();
+    expect(mockedExec).toHaveBeenCalled();
+  });
+
+  test('the module source contains no synchronous child_process call', () => {
+    const source = readFileSync(new URL('./onecli-secrets.ts', import.meta.url), 'utf-8');
+    // Call syntax, not the bare word — the prose above `curl()` names the old
+    // API on purpose, to say why it is gone.
+    for (const banned of ['execFileSync', 'execSync', 'spawnSync']) {
+      expect(source).not.toMatch(new RegExp(`\\b${banned}\\s*\\(`));
+    }
+    // And it must not even import them.
+    const importLine = source.match(/^import \{[^}]*\} from 'child_process';$/m)?.[0];
+    expect(importLine).toBe("import { execFile } from 'child_process';");
+  });
+
+  test('the spawn path awaits both gateway calls', () => {
+    const source = readFileSync(new URL('./container-runner.ts', import.meta.url), 'utf-8');
+    expect(source).toContain('await ensureOnecliAgent(');
+    expect(source).toContain('await applyOnecliSecrets(');
+    // A bare call would silently drop the rejection and spawn uncredentialed.
+    expect(source).not.toMatch(/(?<!await )(?<!\w)ensureOnecliAgent\(\{/);
+    expect(source).not.toMatch(/(?<!await )(?<!\w)applyOnecliSecrets\(/);
+  });
+
+  test('both entry points return promises rather than blocking', () => {
+    setupCliResponses();
+    const ensured = ensureOnecliAgent({ name: 'Example Retail', identifier: 'example-retail' });
+    const applied = applyOnecliSecrets('example-retail', ['Anthropic']);
+    expect(ensured).toBeInstanceOf(Promise);
+    expect(applied).toBeInstanceOf(Promise);
+    return Promise.all([ensured, applied]);
+  });
+});
+
+describe('#315 — secrets listing is cached, never at the cost of fail-closed', () => {
+  test('a second spawn inside the TTL does not re-list secrets', async () => {
+    setupCliResponses();
+
+    await applyOnecliSecrets('example-retail', ['Anthropic']);
+    expect(mockedExec.mock.calls.filter(isSecretsListCall)).toHaveLength(1);
+
+    await applyOnecliSecrets('example-retail', ['Hex']);
+    expect(mockedExec.mock.calls.filter(isSecretsListCall)).toHaveLength(1);
+  });
+
+  test('a secret added to the vault after the cache filled still resolves', async () => {
+    let secretsListCalls = 0;
+    respond((bin: unknown, rawArgs: unknown) => {
+      const argv = (rawArgs ?? []) as string[];
+      if (bin !== 'curl') return '';
+      const url = argv.join(' ');
+      if (url.includes('/grants')) {
+        const agentId = url.match(/\/api\/agents\/([^/]+)\/grants/)?.[1];
+        return JSON.stringify({ agentId, mode: 'grants', connections: [], secrets: [] });
+      }
+      if (url.includes('/api/agents')) return JSON.stringify(AGENT_FIXTURE);
+      if (url.includes('/api/secrets')) {
+        secretsListCalls++;
+        if (secretsListCalls === 1) return JSON.stringify(SECRET_FIXTURE);
+        return JSON.stringify({
+          data: [...SECRET_FIXTURE.data, { id: 'eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee', name: 'Freshly-Added' }],
+        });
+      }
+      return '';
+    });
+
+    await applyOnecliSecrets('example-retail', ['Anthropic']);
+    expect(secretsListCalls).toBe(1);
+
+    // Served from cache first, missed, force-refreshed, resolved — no throw.
+    await applyOnecliSecrets('example-retail', ['Freshly-Added']);
+    expect(secretsListCalls).toBe(2);
+    expect(mockedExec.mock.calls.map(grantMutation).filter(Boolean)).toContainEqual({
+      method: 'PUT',
+      url: 'http://127.0.0.1:10254/api/agents/11111111-1111-1111-1111-111111111111/grants/secrets/eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee',
+    });
+  });
+
+  test('a genuinely missing secret still fails closed after the forced refresh', async () => {
+    setupCliResponses();
+
+    await applyOnecliSecrets('example-retail', ['Anthropic']);
+    const listsBefore = mockedExec.mock.calls.filter(isSecretsListCall).length;
+
+    await expect(applyOnecliSecrets('example-retail', ['Never-Existed'])).rejects.toThrow(
+      /secret\(s\) not found in vault: Never-Existed/,
+    );
+    // It re-read the vault before refusing, rather than trusting the cache.
+    expect(mockedExec.mock.calls.filter(isSecretsListCall).length).toBe(listsBefore + 1);
+    expect(mockedExec.mock.calls.map(grantMutation).filter(Boolean)).toHaveLength(1);
+  });
+});
+
+describe('#315 — concurrent spawns of one identity stay serialized', () => {
+  test('two overlapping applies do not union their grant sets', async () => {
+    let grantsReads = 0;
+    let granted: string[] = ['bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb'];
+    respond((bin: unknown, rawArgs: unknown) => {
+      const argv = (rawArgs ?? []) as string[];
+      if (bin !== 'curl') return '';
+      const url = argv.join(' ');
+      const mutation = grantMutation([bin, argv]);
+      if (mutation) {
+        const secretId = mutation.url.split('/grants/secrets/')[1];
+        granted =
+          mutation.method === 'PUT' ? [...new Set([...granted, secretId])] : granted.filter((id) => id !== secretId);
+        return '';
+      }
+      if (url.includes('/grants')) {
+        grantsReads++;
+        return JSON.stringify({
+          agentId: '11111111-1111-1111-1111-111111111111',
+          mode: 'grants',
+          connections: [],
+          secrets: granted.map((secretId) => ({ secretId })),
+        });
+      }
+      if (url.includes('/api/agents')) return JSON.stringify(AGENT_FIXTURE);
+      if (url.includes('/api/secrets')) return JSON.stringify(SECRET_FIXTURE);
+      return '';
+    });
+
+    // Interleaved without the lock, both would read `granted` before either
+    // wrote, and the vault would end up holding BOTH sets.
+    await Promise.all([
+      applyOnecliSecrets('example-retail', ['Datafold-ExampleRetail']),
+      applyOnecliSecrets('example-retail', ['Hex']),
+    ]);
+
+    expect(grantsReads).toBe(2);
+    expect(granted).toEqual(['cccccccc-cccc-cccc-cccc-cccccccccccc']);
+  });
+
+  test('a failed apply does not wedge the next spawn of the same identity', async () => {
+    setupCliResponses();
+
+    await expect(applyOnecliSecrets('example-retail', ['Mistyped-Name'])).rejects.toThrow(/not found in vault/);
+    await expect(applyOnecliSecrets('example-retail', ['Anthropic'])).resolves.toBeUndefined();
   });
 });

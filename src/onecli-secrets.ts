@@ -27,7 +27,7 @@
  * to the gateway API. List operations also bypass the CLI because its list
  * output caps at 20 rows with no pagination.
  */
-import { execFileSync } from 'child_process';
+import { execFile } from 'child_process';
 
 import { ONECLI_URL, ONECLI_API_KEY } from './config.js';
 import { log } from './log.js';
@@ -86,6 +86,76 @@ function isUuid(s: string): boolean {
 }
 
 /**
+ * Promise-wrapped `execFile('curl', …)`.
+ *
+ * The whole point of this module's #315 fix: every gateway round trip yields
+ * to the event loop instead of parking it. `curl -f` still turns a non-2xx
+ * response into a rejection, so callers keep their fail-closed behavior
+ * unchanged — only the blocking changes, not the outcomes.
+ *
+ * `curl` rather than `fetch`: host `fetch` must never traverse the OneCLI
+ * gateway proxy (`NODE_USE_ENV_PROXY` was stripped from the daemon env after
+ * it broke every spawn on 2026-09-02), and curl's behavior here is proven.
+ */
+function curl(args: string[]): Promise<string> {
+  return new Promise((resolve, reject) => {
+    execFile('curl', args, { encoding: 'utf-8' }, (error, stdout) => {
+      if (error) {
+        reject(error);
+        return;
+      }
+      resolve(typeof stdout === 'string' ? stdout : String(stdout));
+    });
+  });
+}
+
+/**
+ * Cached vault secrets listing.
+ *
+ * `/api/secrets?limit=10000` used to run on EVERY spawn (the largest single
+ * contributor to the #315 stalls). It is cached instead, and the cache can
+ * never turn a resolvable declaration into a spawn refusal: `resolveSecretUuids`
+ * force-refreshes before it throws whenever the failing resolution was served
+ * from cache. A stale entry therefore costs at most one extra listing, never a
+ * wrong answer.
+ *
+ * Cleared by `__resetCachesForTest`.
+ */
+const SECRETS_CACHE_TTL_MS = 5 * 60 * 1000;
+let secretsCache: { at: number; secrets: OnecliSecret[] } | null = null;
+
+/**
+ * Serializes the read-modify-write grant reconcile per OneCLI identity.
+ *
+ * `execFileSync` used to make resolve → grants-read → mutate atomic with
+ * respect to every other spawn for free. Awaiting reintroduces interleaving,
+ * and two concurrent spawns of the same identity whose declarations differ
+ * (an operator edits `container.json` mid-flight) could each read the same
+ * pre-state and write the UNION of both sets — a silently broadened grant
+ * list. Chaining per identity restores last-writer-wins.
+ */
+const identityLocks = new Map<string, Promise<unknown>>();
+
+async function withIdentityLock<T>(identity: string, fn: () => Promise<T>): Promise<T> {
+  const previous = identityLocks.get(identity) ?? Promise.resolve();
+  // Run regardless of whether the predecessor settled or threw — one spawn's
+  // failure must not wedge the next spawn of the same group.
+  const run = previous.then(fn, fn);
+  const guarded = run.then(
+    () => undefined,
+    () => undefined,
+  );
+  identityLocks.set(identity, guarded);
+  try {
+    return await run;
+  } finally {
+    // Drop the entry only when nothing queued behind us, so the map does not
+    // grow one entry per identity for the life of the host process.
+    if (identityLocks.get(identity) === guarded) identityLocks.delete(identity);
+  }
+}
+
+/**
  * Fetch a FULL list (agents or secrets) from the OneCLI gateway API.
  *
  * Why not `onecli <resource> list`: the CLI hard-caps its output at 20 rows
@@ -97,14 +167,17 @@ function isUuid(s: string): boolean {
  * high limit. Localhost gateway (ONECLI_URL), auth'd with the same key the SDK
  * uses; the API returns the full set (a bare array, or `{data:[...]}`).
  *
- * Kept synchronous (curl via execFileSync) so the resolve/apply call chain
- * stays sync.
+ * Runs asynchronously (promise-wrapped `execFile`). It used to be
+ * `execFileSync`, purely so the resolve/apply call chain could stay sync; that
+ * blocked the host event loop for the full round trip on EVERY container spawn
+ * (issue #315). `curl` is retained rather than `fetch` because host `fetch`
+ * must never traverse the gateway proxy.
  */
-function listViaApi(resource: 'agents' | 'secrets'): unknown[] {
+async function listViaApi(resource: 'agents' | 'secrets'): Promise<unknown[]> {
   const base = (ONECLI_URL || 'http://127.0.0.1:10254').replace(/\/$/, '');
   const args = ['-fsS', ...CURL_TIMEOUT_ARGS, `${base}/api/${resource}?limit=10000`];
   if (ONECLI_API_KEY) args.unshift('-H', `Authorization: Bearer ${ONECLI_API_KEY}`);
-  const out = execFileSync('curl', args, { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'pipe'] });
+  const out = await curl(args);
   const parsed = JSON.parse(out) as unknown;
   if (Array.isArray(parsed)) return parsed;
   const data = (parsed as { data?: unknown }).data;
@@ -112,16 +185,16 @@ function listViaApi(resource: 'agents' | 'secrets'): unknown[] {
 }
 
 /**
- * Call the OneCLI gateway synchronously. `curl -f` turns every non-2xx response
- * into an exception, preserving the fail-closed spawn behavior. No secret
+ * Call the OneCLI gateway. `curl -f` turns every non-2xx response into a
+ * rejected promise, preserving the fail-closed spawn behavior. No secret
  * values travel on this path; only agent and secret UUIDs are used in URLs.
  */
-function requestViaApi(method: 'GET' | 'PUT' | 'DELETE', path: string): unknown {
+async function requestViaApi(method: 'GET' | 'PUT' | 'DELETE', path: string): Promise<unknown> {
   const base = (ONECLI_URL || 'http://127.0.0.1:10254').replace(/\/$/, '');
   const args = ['-fsS', ...CURL_TIMEOUT_ARGS, '-X', method];
   if (ONECLI_API_KEY) args.push('-H', `Authorization: Bearer ${ONECLI_API_KEY}`);
   args.push(`${base}/api/${path.replace(/^\//, '')}`);
-  const out = execFileSync('curl', args, { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'pipe'] });
+  const out = await curl(args);
   return out.trim() ? (JSON.parse(out) as unknown) : undefined;
 }
 
@@ -130,13 +203,13 @@ function requestViaApi(method: 'GET' | 'PUT' | 'DELETE', path: string): unknown 
  * status. A concurrent creator can legitimately win after our list read, so
  * callers must be able to distinguish that 409 from every other failure.
  */
-function createAgentViaApi(input: EnsureOnecliAgentInput): { status: number; body: unknown } {
+async function createAgentViaApi(input: EnsureOnecliAgentInput): Promise<{ status: number; body: unknown }> {
   const base = (ONECLI_URL || 'http://127.0.0.1:10254').replace(/\/$/, '');
   const args = ['-sS', ...CURL_TIMEOUT_ARGS, '-X', 'POST', '-H', 'Content-Type: application/json'];
   if (ONECLI_API_KEY) args.push('-H', `Authorization: Bearer ${ONECLI_API_KEY}`);
   args.push('--data-binary', JSON.stringify(input), '-w', '\n%{http_code}', `${base}/v1/agents`);
 
-  const out = execFileSync('curl', args, { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'pipe'] });
+  const out = await curl(args);
   const statusSeparator = out.lastIndexOf('\n');
   if (statusSeparator < 0) {
     throw new Error('Malformed OneCLI agent create response: missing HTTP status');
@@ -158,8 +231,8 @@ function createAgentViaApi(input: EnsureOnecliAgentInput): { status: number; bod
   return { status, body };
 }
 
-function getAgentGrants(agentUuid: string): OnecliAgentGrants {
-  const parsed = requestViaApi('GET', `agents/${encodeURIComponent(agentUuid)}/grants`);
+async function getAgentGrants(agentUuid: string): Promise<OnecliAgentGrants> {
+  const parsed = await requestViaApi('GET', `agents/${encodeURIComponent(agentUuid)}/grants`);
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
     throw new Error(`Malformed OneCLI grants response for agent ${agentUuid}`);
   }
@@ -184,16 +257,26 @@ function getAgentGrants(agentUuid: string): OnecliAgentGrants {
   return grants as OnecliAgentGrants;
 }
 
-function listAgents(): OnecliAgent[] {
-  return listViaApi('agents') as OnecliAgent[];
+async function listAgents(): Promise<OnecliAgent[]> {
+  return (await listViaApi('agents')) as OnecliAgent[];
 }
 
-function listSecrets(): OnecliSecret[] {
-  return listViaApi('secrets') as OnecliSecret[];
+/**
+ * Read the vault secrets list, serving a fresh-enough cache when one exists.
+ * `fromCache` tells the caller whether a miss is worth re-checking against the
+ * gateway before failing the spawn.
+ */
+async function loadSecrets(forceRefresh: boolean): Promise<{ secrets: OnecliSecret[]; fromCache: boolean }> {
+  if (!forceRefresh && secretsCache && Date.now() - secretsCache.at < SECRETS_CACHE_TTL_MS) {
+    return { secrets: secretsCache.secrets, fromCache: true };
+  }
+  const secrets = (await listViaApi('secrets')) as OnecliSecret[];
+  secretsCache = { at: Date.now(), secrets };
+  return { secrets, fromCache: false };
 }
 
-function refreshAgentCache(): void {
-  const agents = listAgents();
+async function refreshAgentCache(): Promise<void> {
+  const agents = await listAgents();
   const refreshed = new Map<string, string>();
   for (const agent of agents) {
     if (
@@ -221,13 +304,13 @@ function refreshAgentCache(): void {
  * a missing agent as a fail-closed condition rather than silently
  * proceeding without applying secrets).
  */
-function resolveAgentUuid(identifier: string): string {
+async function resolveAgentUuid(identifier: string): Promise<string> {
   const cached = identifierToUuid.get(identifier);
   if (cached) return cached;
 
   // Cache miss — refresh and try again. We replace the whole map so
   // stale entries (agents renamed/deleted) get evicted.
-  refreshAgentCache();
+  await refreshAgentCache();
   const refreshed = identifierToUuid.get(identifier);
   if (!refreshed) {
     throw new Error(
@@ -238,23 +321,31 @@ function resolveAgentUuid(identifier: string): string {
 }
 
 /**
- * Synchronously ensure a OneCLI agent exists without issuing a redundant
- * create request on every container spawn. The first cache miss refreshes the
- * full agents list; only a genuinely absent identifier is created.
+ * Ensure a OneCLI agent exists without issuing a redundant create request on
+ * every container spawn. The first cache miss refreshes the full agents list;
+ * only a genuinely absent identifier is created.
  *
  * A 409 is the expected create race and counts as success only after a fresh
  * list confirms the agent. Every other response fails closed so the caller
  * cannot continue into an unscoped container configuration.
+ *
+ * Async since #315 — the spawn path awaits it rather than blocking the host
+ * event loop for the gateway round trip. Serialized per identity so two
+ * concurrent spawns of the same group cannot both take the create branch.
  */
-export function ensureOnecliAgent(input: EnsureOnecliAgentInput): EnsureOnecliAgentResult {
+export function ensureOnecliAgent(input: EnsureOnecliAgentInput): Promise<EnsureOnecliAgentResult> {
+  return withIdentityLock(input.identifier, () => ensureOnecliAgentLocked(input));
+}
+
+async function ensureOnecliAgentLocked(input: EnsureOnecliAgentInput): Promise<EnsureOnecliAgentResult> {
   if (identifierToUuid.has(input.identifier)) return { ...input, created: false };
 
-  refreshAgentCache();
+  await refreshAgentCache();
   if (identifierToUuid.has(input.identifier)) return { ...input, created: false };
 
-  const response = createAgentViaApi(input);
+  const response = await createAgentViaApi(input);
   if (response.status === 409) {
-    refreshAgentCache();
+    await refreshAgentCache();
     if (!identifierToUuid.has(input.identifier)) {
       throw new Error(
         `OneCLI agent create returned HTTP 409 but identifier "${input.identifier}" was not found after refresh`,
@@ -284,10 +375,34 @@ export function ensureOnecliAgent(input: EnsureOnecliAgentInput): EnsureOnecliAg
  * leave the agent in an under-credentialed state without a clear
  * error signal.
  */
-export function resolveSecretUuids(declarations: string[]): string[] {
+export async function resolveSecretUuids(declarations: string[]): Promise<string[]> {
   if (declarations.length === 0) return [];
 
-  const secrets = listSecrets();
+  const first = await loadSecrets(false);
+  let match = matchDeclarations(first.secrets, declarations);
+
+  // A miss against a cached listing is not yet a failure: the secret may have
+  // been added to the vault since the cache was filled. Re-read before
+  // refusing, so caching can never manufacture a spawn refusal.
+  if (match.unresolved.length > 0 && first.fromCache) {
+    const fresh = await loadSecrets(true);
+    match = matchDeclarations(fresh.secrets, declarations);
+  }
+
+  if (match.unresolved.length > 0) {
+    throw new Error(
+      `OneCLI secret(s) not found in vault: ${match.unresolved.join(', ')} — ` +
+        `check spelling, that the secret exists, and that 'onecli secrets list' returns it`,
+    );
+  }
+
+  return match.resolved;
+}
+
+function matchDeclarations(
+  secrets: OnecliSecret[],
+  declarations: string[],
+): { resolved: string[]; unresolved: string[] } {
   const nameToId = new Map(secrets.map((s) => [s.name, s.id] as const));
   const idSet = new Set(secrets.map((s) => s.id));
 
@@ -311,19 +426,13 @@ export function resolveSecretUuids(declarations: string[]): string[] {
     }
   }
 
-  if (unresolved.length > 0) {
-    throw new Error(
-      `OneCLI secret(s) not found in vault: ${unresolved.join(', ')} — ` +
-        `check spelling, that the secret exists, and that 'onecli secrets list' returns it`,
-    );
-  }
-
-  return resolved;
+  return { resolved, unresolved };
 }
 
 /**
  * Apply a group's per-spawn OneCLI secret scoping. Does nothing when
- * `declarations` is empty or undefined.
+ * `declarations` is empty or undefined. Async since #315; callers in the spawn
+ * path MUST await it (see the tripwire in `onecli-secrets.test.ts`).
  *
  * Steps when declarations are present:
  *   1. Resolve agent identifier → UUID (cached, with miss refresh).
@@ -334,12 +443,15 @@ export function resolveSecretUuids(declarations: string[]): string[] {
  *      are deliberately untouched. OneCLI's grants-only model has no mutable
  *      all/selective mode.
  */
-export function applyOnecliSecrets(agentIdentifier: string, declarations: string[] | undefined): void {
-  if (!declarations || declarations.length === 0) return;
+export function applyOnecliSecrets(agentIdentifier: string, declarations: string[] | undefined): Promise<void> {
+  if (!declarations || declarations.length === 0) return Promise.resolve();
+  return withIdentityLock(agentIdentifier, () => applyOnecliSecretsLocked(agentIdentifier, declarations));
+}
 
-  const agentUuid = resolveAgentUuid(agentIdentifier);
-  const secretUuids = resolveSecretUuids(declarations);
-  const grants = getAgentGrants(agentUuid);
+async function applyOnecliSecretsLocked(agentIdentifier: string, declarations: string[]): Promise<void> {
+  const agentUuid = await resolveAgentUuid(agentIdentifier);
+  const secretUuids = await resolveSecretUuids(declarations);
+  const grants = await getAgentGrants(agentUuid);
   const declaredSet = new Set(secretUuids);
   const grantedSet = new Set(grants.secrets.map((secret) => secret.secretId));
   const toRemove = [...grantedSet].filter((secretUuid) => !declaredSet.has(secretUuid));
@@ -348,10 +460,16 @@ export function applyOnecliSecrets(agentIdentifier: string, declarations: string
   // Remove excess access before adding missing access. If a request fails,
   // spawn aborts instead of leaving a newly broadened partial configuration.
   for (const secretUuid of toRemove) {
-    requestViaApi('DELETE', `agents/${encodeURIComponent(agentUuid)}/grants/secrets/${encodeURIComponent(secretUuid)}`);
+    await requestViaApi(
+      'DELETE',
+      `agents/${encodeURIComponent(agentUuid)}/grants/secrets/${encodeURIComponent(secretUuid)}`,
+    );
   }
   for (const secretUuid of toAdd) {
-    requestViaApi('PUT', `agents/${encodeURIComponent(agentUuid)}/grants/secrets/${encodeURIComponent(secretUuid)}`);
+    await requestViaApi(
+      'PUT',
+      `agents/${encodeURIComponent(agentUuid)}/grants/secrets/${encodeURIComponent(secretUuid)}`,
+    );
   }
 
   log.info('OneCLI secrets applied', {
@@ -432,6 +550,8 @@ export function slackUserTokenSecrets(secrets: string[], explicitNames?: string[
 /** Test hook — clears the in-memory caches so each test starts clean. */
 export function __resetCachesForTest(): void {
   identifierToUuid.clear();
+  secretsCache = null;
+  identityLocks.clear();
 }
 
 /**

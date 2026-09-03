@@ -3788,12 +3788,17 @@ async function buildContainerArgs(
         }
       }
 
-      ensureOnecliAgent({
+      // Awaited: these hit the OneCLI control API. They were synchronous
+      // (execFileSync curl) until #315, which parked the host event loop for
+      // the full round trip on every spawn. Ordering with the mount/env
+      // assembly below is unchanged — the whole block is sequential inside
+      // this one async function, and `args` is local to this call.
+      await ensureOnecliAgent({
         name:
           identity === agentIdentifier ? agentGroup.name : `${agentGroup.name} (no Slack — non-owner-safe sessions)`,
         identifier: identity,
       });
-      applyOnecliSecrets(identity, effectiveSecrets);
+      await applyOnecliSecrets(identity, effectiveSecrets);
       effectiveIdentifier = identity;
     }
     const onecliApplied = await onecli.applyContainerConfig(args, {

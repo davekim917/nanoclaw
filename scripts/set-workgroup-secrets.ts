@@ -46,15 +46,13 @@ export interface SetWorkgroupSecretsOptions {
  * Core logic — exported so tests can call it directly without spawning a
  * subprocess. Returns the exit code.
  */
-export function setWorkgroupSecrets(opts: SetWorkgroupSecretsOptions): number {
+export async function setWorkgroupSecrets(opts: SetWorkgroupSecretsOptions): Promise<number> {
   const { workgroupId, secrets, dbPath = DEFAULT_DB_PATH } = opts;
 
   const db = new Database(dbPath);
   try {
     // Step 1: verify workgroup exists
-    const row = db.prepare('SELECT id FROM workgroups WHERE id = ?').get(workgroupId) as
-      | { id: string }
-      | undefined;
+    const row = db.prepare('SELECT id FROM workgroups WHERE id = ?').get(workgroupId) as { id: string } | undefined;
     if (!row) {
       console.error(`Error: workgroup "${workgroupId}" not found in workgroups table`);
       console.error('Run the migration first or check the workgroup id with:');
@@ -66,7 +64,7 @@ export function setWorkgroupSecrets(opts: SetWorkgroupSecretsOptions): number {
     // resolveSecretUuids throws on unresolvable names — we catch and exit 1.
     if (secrets.length > 0) {
       try {
-        resolveSecretUuids(secrets);
+        await resolveSecretUuids(secrets);
       } catch (err) {
         console.error(`Error: ${err instanceof Error ? err.message : String(err)}`);
         return 1;
@@ -79,9 +77,11 @@ export function setWorkgroupSecrets(opts: SetWorkgroupSecretsOptions): number {
     const secretsJson = JSON.stringify(secrets);
     const now = new Date().toISOString();
 
-    db.prepare(
-      'UPDATE workgroups SET onecli_secrets = ?, updated_at = ? WHERE id = ?',
-    ).run(secretsJson, now, workgroupId);
+    db.prepare('UPDATE workgroups SET onecli_secrets = ?, updated_at = ? WHERE id = ?').run(
+      secretsJson,
+      now,
+      workgroupId,
+    );
 
     console.log(`Updated workgroup "${workgroupId}" secrets: ${secretsJson}`);
     return 0;
@@ -123,6 +123,6 @@ if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
     console.error('Usage: pnpm exec tsx scripts/set-workgroup-secrets.ts <workgroup-id> --secrets <name1,name2,...>');
     process.exit(2);
   }
-  const code = setWorkgroupSecrets(opts);
+  const code = await setWorkgroupSecrets(opts);
   process.exit(code);
 }
