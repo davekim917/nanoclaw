@@ -220,6 +220,7 @@ export function computeSeriesStats(rowsDescBySeq: TaskRow[]): Map<string, Series
  * script runs on the same host/TZ as the logger, which it does (both are
  * plain host processes, no TZ override).
  */
+// eslint-disable-next-line no-control-regex -- deliberately matches the ANSI CSI escape byte to strip src/log.ts's color codes
 const ANSI_RE = /\x1b\[[0-9;]*m/g;
 const ERROR_LINE_RE = /^\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3})\] ERROR\b/;
 export function countRecentErrorLines(content: string, nowMs: number, windowMs = 24 * 60 * 60 * 1000): number {
@@ -253,7 +254,7 @@ function readLogFile(p: string, requiredToExist: boolean): string {
   } catch (err) {
     const code = (err as NodeJS.ErrnoException).code;
     if (code === 'ENOENT' && !requiredToExist) return '';
-    throw new Error(`cannot read log ${p}: ${err instanceof Error ? err.message : String(err)}`);
+    throw new Error(`cannot read log ${p}: ${err instanceof Error ? err.message : String(err)}`, { cause: err });
   }
 }
 
@@ -270,7 +271,9 @@ function readPauseState(p: string): PauseState {
   } catch (err) {
     const code = (err as NodeJS.ErrnoException).code;
     if (code === 'ENOENT') return {};
-    throw new Error(`cannot read pause-tracking state ${p}: ${err instanceof Error ? err.message : String(err)}`);
+    throw new Error(`cannot read pause-tracking state ${p}: ${err instanceof Error ? err.message : String(err)}`, {
+      cause: err,
+    });
   }
 }
 

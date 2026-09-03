@@ -70,6 +70,7 @@ try {
     default_model: null,
     default_effort: null,
     default_tone: null,
+    instructions_profile: null,
     created_at: new Date().toISOString(),
   });
   console.log('Created messaging_group_agent link');

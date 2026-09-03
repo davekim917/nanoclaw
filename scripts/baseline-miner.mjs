@@ -33,7 +33,7 @@ const PROBES = [
 const files = [];
 (function walk(d, depth) {
   if (depth > 3) return;
-  let entries = [];
+  let entries;
   try { entries = fs.readdirSync(d, { withFileTypes: true }); } catch { return; }
   for (const e of entries) {
     if (e.isDirectory()) walk(path.join(d, e.name), depth + 1);

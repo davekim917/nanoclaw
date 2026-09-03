@@ -5,7 +5,14 @@
  * agent-runner → Claude → messages_out → delivery → mock adapter.deliver()
  *
  * Usage: pnpm exec tsx scripts/test-v2-channel-e2e.ts
+ *
+ * TODO(#335): stale — the mock ChannelSetup/deliverToChannel shapes here
+ * predate onInboundEvent/onAction and the string-returning deliver
+ * signature, and createMessagingGroupAgent is missing fields added since.
+ * Excluded from tsconfig.scripts.json. Needs a rewrite against the current
+ * channel-adapter API, not a typecheck/lint fix.
  */
+/* eslint-disable @typescript-eslint/no-unused-vars */
 import Database from 'better-sqlite3';
 import fs from 'fs';
 import path from 'path';

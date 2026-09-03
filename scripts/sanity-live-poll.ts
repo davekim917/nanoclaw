@@ -72,6 +72,7 @@ for (const journalMode of ["DELETE", "WAL"]) {
 
   // Give container a moment to start
   const waitUntil = Date.now() + 2000;
+  // eslint-disable-next-line no-empty -- deliberate busy-wait (this is a throwaway timing-sanity script, not production code)
   while (Date.now() < waitUntil) {}
 
   // Host opens, writes, CLOSES each time (matches production session-manager pattern)
@@ -83,6 +84,7 @@ for (const journalMode of ["DELETE", "WAL"]) {
     h.close();
     console.log(`  [host] wrote+closed seq=${i} t=${Date.now() % 100000}`);
     const sleepUntil = Date.now() + 1000;
+    // eslint-disable-next-line no-empty -- deliberate busy-wait (this is a throwaway timing-sanity script, not production code)
     while (Date.now() < sleepUntil) {}
   }
 

@@ -3,7 +3,15 @@
  * run the v2 poll loop with the Claude provider, verify output.
  *
  * Usage: pnpm exec tsx scripts/test-v2-agent.ts
+ *
+ * TODO(#335): stale — reaches into container/agent-runner (a separate Bun
+ * tree; its bun:sqlite / Bun globals don't resolve under this Node
+ * tsconfig, so it's excluded from tsconfig.scripts.json) and calls
+ * runPollLoop with a PollLoopConfig shape (mcpServers) that has since
+ * drifted from the current type. Needs a rewrite against the current
+ * poll-loop API, not a typecheck/lint fix.
  */
+/* eslint-disable @typescript-eslint/no-unused-vars */
 import Database from 'better-sqlite3';
 import fs from 'fs';
 
