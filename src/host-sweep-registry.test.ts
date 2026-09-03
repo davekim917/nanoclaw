@@ -216,6 +216,7 @@ import {
   SWEEP_PHASES,
   _listSweepRegistrationsForTesting,
   _resetSweepRegistryForTesting,
+  _setSweepYieldForTesting,
   _sweepOnceForTesting,
   registerSlaObservationHook,
   registerSweepDuty,
@@ -350,6 +351,7 @@ describe('sweep duty registry (S2-PR2)', () => {
 
   afterEach(() => {
     _resetSweepRegistryForTesting();
+    _setSweepYieldForTesting(null);
     vi.restoreAllMocks();
   });
 
@@ -473,11 +475,35 @@ describe('sweep duty registry (S2-PR2)', () => {
       },
     });
 
+    // The yield is part of the sequence under test, not scaffolding around it:
+    // without a marker for it, deleting the per-session setImmediate leaves
+    // this case green while a batch of sessions becomes one event-loop freeze.
+    const realYield = (): Promise<void> => new Promise((resolve) => setImmediate(resolve));
+    _setSweepYieldForTesting(async () => {
+      seen.push('YIELD');
+      await realYield();
+    });
+
     await _sweepOnceForTesting();
 
-    expect(seen).toEqual(['tick-pre', 'A-plan', 'A-wake', 'A-tail', 'B-plan', 'B-wake', 'B-tail', 'tick-post']);
+    expect(seen).toEqual([
+      'tick-pre',
+      'A-plan',
+      'A-wake',
+      'A-tail',
+      'YIELD',
+      'B-plan',
+      'B-wake',
+      'B-tail',
+      'YIELD',
+      'tick-post',
+    ]);
     // Not phase-major: A's whole sequence precedes B's first phase.
     expect(seen.indexOf('A-tail')).toBeLessThan(seen.indexOf('B-plan'));
+    // Exactly one yield after each swept session — never every N.
+    expect(seen.filter((s) => s === 'YIELD')).toHaveLength(2);
+    expect(seen.indexOf('YIELD')).toBe(seen.indexOf('A-tail') + 1);
+    expect(seen.lastIndexOf('YIELD')).toBe(seen.indexOf('B-tail') + 1);
     // The tick phases ran exactly once each, around the loop.
     expect(seen.filter((s) => s === 'tick-pre')).toHaveLength(1);
     expect(seen.filter((s) => s === 'tick-post')).toHaveLength(1);
@@ -512,36 +538,36 @@ describe('sweep duty registry (S2-PR2)', () => {
     const windows: Array<{
       label: string;
       window: string;
+      duty: string;
       arm: (boom: () => never) => void;
     }> = [
       {
         label: 'session:plan',
         window: 'session:plan',
+        duty: 'probe',
         arm: (boom) => registerSweepDuty({ name: 'probe', phase: 'session:plan', order: 15, run: boom }),
       },
       {
         label: 'session:wake',
         window: 'session:wake',
+        duty: 'probe',
         arm: (boom) => registerSweepDuty({ name: 'probe', phase: 'session:wake', order: 20, run: boom }),
       },
       {
-        label: 'the driver observe read (a claims() consulting ctx.observed)',
-        window: 'session:health',
-        arm: (boom) =>
-          registerSweepDuty({
-            name: 'probe',
-            phase: 'session:health',
-            order: 5,
-            claims: (ctx) => {
-              expect(ctx.observed).not.toBeNull();
-              return boom();
-            },
-            run: () => undefined,
-          }),
+        // The driver's own W3 read, failing at a mailbox method it really
+        // calls — not a stand-in duty. It is machinery, so it carries a
+        // `driver:` identifier rather than a registrable duty name.
+        label: 'the driver observe read',
+        window: 'session:observe',
+        duty: 'driver:observe',
+        arm: (boom) => {
+          h.mailbox = fakeMailbox({ getContainerState: boom });
+        },
       },
       {
         label: 'session:health',
         window: 'session:health',
+        duty: 'probe',
         arm: (boom) =>
           registerSweepDuty({
             name: 'probe',
@@ -554,16 +580,18 @@ describe('sweep duty registry (S2-PR2)', () => {
       {
         label: 'session:tail',
         window: 'session:tail',
+        duty: 'probe',
         arm: (boom) => registerSweepDuty({ name: 'probe', phase: 'session:tail', order: 15, run: boom }),
       },
       {
         label: 'the SLA observation hook list',
         window: 'session:health:sla-observe',
+        duty: 'probe',
         arm: (boom) => registerSlaObservationHook({ name: 'probe', order: 99, run: boom }),
       },
     ];
 
-    for (const { label, window, arm } of windows) {
+    for (const { label, window, duty, arm } of windows) {
       it(`in ${label}`, async () => {
         const error = vi.spyOn(log, 'error').mockImplementation(() => {});
         const session = aliveSession();
@@ -575,7 +603,7 @@ describe('sweep duty registry (S2-PR2)', () => {
 
         expect(error).toHaveBeenCalledWith(
           'Host sweep duty failed',
-          expect.objectContaining({ sessionId: session.id, duty: 'probe', window }),
+          expect.objectContaining({ sessionId: session.id, duty, window }),
         );
         expect(error).not.toHaveBeenCalledWith('Host sweep mailbox unopenable', expect.anything());
         // Not quiet-cached: the mailbox is fine and the work is still due, so
@@ -609,6 +637,43 @@ describe('sweep duty registry (S2-PR2)', () => {
       expect(h.spawns).toEqual([]);
     });
   });
+
+  /** Register a probe duty against a fresh alive session, and hand the session back. */
+  function armOnAliveSession(duty: SweepDuty): Session {
+    const session = aliveSession();
+    registerSweepDuty(duty);
+    return session;
+  }
+
+  /**
+   * A STOPPED session with saved work due for a recovery attempt, so the real
+   * `session:wake` duty opens a mailbox of its own — the increment W2 has always
+   * done outside any held session. `failWith` is armed at the end of the plan
+   * phase, so the open it breaks is S9b's, not W1's.
+   */
+  function continuationWakeSession(failWith: unknown): Session {
+    const session = fakeSession(`sess-${++sessionSeq}`);
+    h.sessions = [session];
+    const continuation = { id: 'c1', task: 't', resume_attempts: 0, recovery_episode: 0 };
+    h.mailbox = fakeMailbox({
+      // A due row as WELL as the continuation. Without it the wake assertion is
+      // vacuous: a swallowed increment answers null and the wake is skipped for
+      // want of anything due. With it, a swallowed increment leaves dueCount at
+      // 1 and S9b wakes the container through the mailbox that just failed.
+      countDueMessages: () => 1,
+      readWorkContinuation: () => continuation,
+      incrementWorkContinuationResumeAttempt: () => ({ ...continuation, resume_attempts: 1 }),
+    });
+    registerSweepDuty({
+      name: 'arm-wake-failure',
+      phase: 'session:plan',
+      order: 90,
+      run: () => {
+        h.failNextOpen = failWith;
+      },
+    });
+    return session;
+  }
 
   /** Heartbeat older than the ceiling → decideStuckAction returns kill-ceiling. */
   function armCeilingKill(): void {
@@ -717,26 +782,23 @@ describe('sweep duty registry (S2-PR2)', () => {
       expect(h.spawns).toEqual([]);
     });
 
-    const laterWindows: Array<{ label: string; window: string; arm: () => void }> = [
+    const laterWindows: Array<{ label: string; window: string; arm: () => Session; then?: () => void }> = [
       {
-        label: 'session:wake',
+        label: 'session:wake (the real continuation attempt increment)',
         window: 'session:wake',
-        arm: () =>
-          registerSweepDuty({
-            name: 'probe',
-            phase: 'session:wake',
-            order: 20,
-            run: async (ctx) => {
-              h.failNextOpen = new SessionDbUnopenableError('/tmp/inbound.db', new Error('boom'));
-              await (ctx as SweepSessionContext).run(() => undefined);
-            },
-          }),
+        arm: () => continuationWakeSession(new SessionDbUnopenableError('/tmp/outbound.db', new Error('boom'))),
+        then: () => {
+          // The increment used to swallow this and answer null, which let S9b
+          // fall through and wake the container on W1's stale plan through a
+          // mailbox the host cannot read.
+          expect(h.wakes).toEqual([]);
+        },
       },
       {
         label: 'the driver observe read',
         window: 'session:observe',
         arm: () =>
-          registerSweepDuty({
+          armOnAliveSession({
             name: 'probe',
             phase: 'session:plan',
             order: 90,
@@ -751,7 +813,7 @@ describe('sweep duty registry (S2-PR2)', () => {
         // Order 35 — after every other predicate has had its own opens, and
         // immediately before the SLA fallthrough at 40.
         arm: () =>
-          registerSweepDuty({
+          armOnAliveSession({
             name: 'probe',
             phase: 'session:health',
             order: 35,
@@ -766,6 +828,7 @@ describe('sweep duty registry (S2-PR2)', () => {
         label: 'the post-kill session',
         window: 'session:health:post-kill',
         arm: () => {
+          const session = aliveSession();
           armCeilingKill();
           registerSlaObservationHook({
             name: 'probe',
@@ -774,13 +837,14 @@ describe('sweep duty registry (S2-PR2)', () => {
               h.failNextOpen = new SessionDbUnopenableError('/tmp/outbound.db', new Error('boom'));
             },
           });
+          return session;
         },
       },
       {
         label: 'session:tail',
         window: 'session:tail',
         arm: () =>
-          registerSweepDuty({
+          armOnAliveSession({
             name: 'probe',
             phase: 'session:health',
             order: 5,
@@ -793,13 +857,14 @@ describe('sweep duty registry (S2-PR2)', () => {
       },
     ];
 
-    for (const { label, window, arm } of laterWindows) {
+    for (const { label, window, arm, then } of laterWindows) {
       it(`${label}: same string with its window field, and no quiet mark`, async () => {
         const error = vi.spyOn(log, 'error').mockImplementation(() => {});
-        const session = aliveSession();
-        arm();
+        const session = arm();
 
         await _sweepOnceForTesting();
+
+        then?.();
 
         expect(error).toHaveBeenCalledWith(
           'Host sweep mailbox unopenable',
@@ -836,20 +901,20 @@ describe('sweep duty registry (S2-PR2)', () => {
 
     it('after W1: a mid-tick vanish is retried, not treated as a fault', async () => {
       const error = vi.spyOn(log, 'error').mockImplementation(() => {});
-      aliveSession();
-      registerSweepDuty({
-        name: 'probe',
-        phase: 'session:plan',
-        order: 90,
-        run: () => {
-          h.failNextOpen = new SessionDbMissingError('/gone/outbound.db');
-        },
-      });
+      const warn = vi.spyOn(log, 'warn').mockImplementation(() => {});
+      // The real session:wake path again — S9b's own increment is the open that
+      // finds the mailbox gone, not a synthetic duty standing in for it.
+      continuationWakeSession(new SessionDbMissingError('/gone/inbound.db'));
 
       await _sweepOnceForTesting();
 
       expect(error).not.toHaveBeenCalledWith('Host sweep mailbox unopenable', expect.anything());
       expect(error).not.toHaveBeenCalledWith('Host sweep duty failed', expect.anything());
+      // Not the helper's legacy warning either: a vanished mailbox is the
+      // ordinary steady state, and the window owns that classification now.
+      expect(warn).not.toHaveBeenCalledWith('Failed to increment continuation recovery attempt', expect.anything());
+      // A session the host can no longer read is not woken on W1's stale plan.
+      expect(h.wakes).toEqual([]);
       // Retried, not backed off.
       h.opens = [];
       h.failNextOpen = null;
@@ -860,19 +925,88 @@ describe('sweep duty registry (S2-PR2)', () => {
   });
 
   // ── R-7 ────────────────────────────────────────────────────────────────────
+  /**
+   * plan.md §4.3's table, transcribed. Names and counts alone are not enough:
+   * they stay green when recurrence and the spent-task GC swap, or when claims
+   * reconcile lands after self-heal — and both of those are cited ordering
+   * constraints (13 and 3). The tuple is (surface, name, phase, order), in the
+   * order the driver runs them.
+   */
+  const EXPECTED_REGISTRATIONS: Array<[string, string, string, number]> = [
+    ['duty', 'egress-network-reheal', 'tick:pre-session', 10],
+    ['duty', 'processing-ack-sync', 'session:plan', 10],
+    ['duty', 'stale-pending-expiry', 'session:plan', 20],
+    ['duty', 'pre-wake-orphan-claim-reset', 'session:plan', 30],
+    ['duty', 'due-wake-admission', 'session:plan', 40],
+    ['duty', 'done-proposal-mirror', 'session:plan', 50],
+    ['duty', 'continuation-read', 'session:plan', 60],
+    ['duty', 'continuation-recovery-parking', 'session:plan', 70],
+    ['duty', 'continuation-wake-eligibility', 'session:plan', 80],
+    ['duty', 'container-wake', 'session:wake', 10],
+    ['duty', 'provider-self-heal', 'session:health', 10],
+    ['duty', 'idle-task-reap', 'session:health', 20],
+    ['duty', 'idle-chat-reap', 'session:health', 30],
+    ['duty', 'running-container-sla', 'session:health', 40],
+    ['duty', 'orphan-claim-reset', 'session:tail', 10],
+    ['duty', 'recurrence-fanout', 'session:tail', 20],
+    ['duty', 'spent-task-session-gc', 'session:tail', 30],
+    ['duty', 'orchestrator-reconciler', 'tick:post-session', 10],
+    ['duty', 'thread-close-advance', 'tick:post-session', 20],
+    ['duty', 'task-watchdog', 'tick:post-session', 25],
+    ['duty', 'storage-maintenance', 'tick:post-session', 30],
+    ['duty', 'usage-rollup', 'tick:post-session', 40],
+    ['duty', 'orphaned-repo-fence-release', 'tick:post-session', 50],
+    ['duty', 'approvals-reason-sweep', 'tick:housekeeping', 10],
+    ['duty', 'github-app-token-refresh', 'tick:housekeeping', 20],
+    ['duty', 'steer-idempotency-prune', 'tick:housekeeping', 30],
+    ['duty', 'channel-ingress-receipt-prune', 'tick:housekeeping', 40],
+    ['duty', 'scheduled-move-recovery', 'tick:housekeeping', 50],
+    ['duty', 'audit-body-prune', 'tick:housekeeping', 60],
+    ['duty', 'completed-task-auto-archive', 'tick:housekeeping', 70],
+    ['duty', 'session-title-sweep', 'tick:housekeeping', 80],
+    ['duty', 'thread-title-retry', 'tick:housekeeping', 90],
+    ['duty', 'claims-reconcile', 'tick:housekeeping', 100],
+    ['duty', 'claims-self-heal', 'tick:housekeeping', 110],
+    ['duty', 'dashboard-token-prune', 'tick:housekeeping', 120],
+    ['sla-observation-hook', 'container-oom-notice', 'sla-observation-hook', 10],
+    ['kill-follow-up', 'kill-ceiling-notice', 'kill-follow-up', 10],
+    ['kill-follow-up', 'orphan-claim-reset', 'kill-follow-up', 20],
+    ['kill-follow-up', 'ceiling-kill-accountability', 'kill-follow-up', 30],
+  ];
+
   it('the registered duty set matches the seam-2 inventory', () => {
     const { duties, slaObservationHooks, killFollowUps } = _listSweepRegistrationsForTesting();
-    const registrations = [...duties, ...slaObservationHooks, ...killFollowUps];
+    const actual: Array<[string, string, string, number]> = [
+      ...duties.map((d): [string, string, string, number] => ['duty', d.name, d.phase, d.order]),
+      ...slaObservationHooks.map((hk): [string, string, string, number] => [
+        'sla-observation-hook',
+        hk.name,
+        'sla-observation-hook',
+        hk.order,
+      ]),
+      ...killFollowUps.map((f): [string, string, string, number] => [
+        'kill-follow-up',
+        f.name,
+        'kill-follow-up',
+        f.order,
+      ]),
+    ];
 
-    expect(registrations).toHaveLength(39);
-    const names = new Set(registrations.map((r) => r.name));
+    // Surface, name, phase AND order, in run order — a swap anywhere fails.
+    expect(actual).toEqual(EXPECTED_REGISTRATIONS);
+
+    expect(actual).toHaveLength(39);
+    const names = new Set(actual.map((r) => r[1]));
     expect(names.size).toBe(38);
     expect(names).toEqual(new Set(Object.values(SWEEP_DUTY_INVENTORY)));
     expect(Object.keys(SWEEP_DUTY_INVENTORY)).toHaveLength(38);
     // The one duty registered twice is the orphan-claim reset: once in the tail
     // window, once as the post-kill follow-up (rev-3 grounding §2, S17).
-    const twice = registrations.filter((r) => r.name === SWEEP_DUTY_INVENTORY.S17);
-    expect(twice).toHaveLength(2);
+    expect(actual.filter((r) => r[1] === SWEEP_DUTY_INVENTORY.S17)).toHaveLength(2);
+    // Every inventory id maps to a name the registry actually uses.
+    for (const [id, name] of Object.entries(SWEEP_DUTY_INVENTORY)) {
+      expect(names, `inventory id ${id}`).toContain(name);
+    }
   });
 
   // ── R-9 ────────────────────────────────────────────────────────────────────
