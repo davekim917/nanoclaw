@@ -37,25 +37,36 @@ import { DATA_DIR } from '../../config.js';
 import { getContainerState, getProcessingClaims, type ContainerState, type ProcessingClaim } from './ops/sweep.js';
 import { inboundHasMessage } from './ops/ingress.js';
 import {
+  countLiveSeriesRows,
   getLatestSeriesRow,
+  getLatestTaskDeliveryRoute,
+  getLatestTaskRoutingStamp,
   getLatestTaskRow,
   getLiveSeriesRow,
   getLiveTaskRow,
+  hasPendingRecurrence,
+  hasTriggeredInboundRow,
   hasWorkContinuation,
+  latestInboundMessageId,
   latestReplyTimestampByTrigger,
   listDuplicateLiveTaskSeriesIds,
+  listInboundTail,
   listLatestRecurringSeriesRows,
   listLiveOneOffTaskRows,
   listLiveTaskRows,
   listLiveTaskRowsForSeries,
   listOutboundSystemMessages,
+  listOutboundTail,
   listProcessingClaimedMessageIds,
   listRecentTaskFires,
   listTurnUsageSince,
+  type MessageTailRow,
   type OutboundSystemRow,
   type ScheduledTaskRow,
   type SessionTurnUsageRow,
+  type TaskDeliveryRoute,
   type TaskFireRow,
+  type TaskRoutingStamp,
 } from './ops/reads.js';
 import { recoverHotJournal, sessionDbPathIsGone } from './openers.js';
 
@@ -107,6 +118,13 @@ export interface InboundSessionRead {
   getLiveTaskRow(seriesId: string): ScheduledTaskRow | null;
   getLatestTaskRow(seriesId: string): ScheduledTaskRow | null;
   listRecentTaskFires(seriesId: string, limit: number): TaskFireRow[];
+  latestInboundMessageId(): string | null;
+  hasPendingRecurrence(): boolean;
+  hasTriggeredInboundRow(): boolean;
+  listInboundTail(limit: number): MessageTailRow[];
+  countLiveSeriesRows(seriesId: string): number;
+  getLatestTaskRoutingStamp(seriesId: string): TaskRoutingStamp | null;
+  getLatestTaskDeliveryRoute(): TaskDeliveryRoute | null;
 }
 
 export interface OutboundSessionRead {
@@ -117,9 +135,20 @@ export interface OutboundSessionRead {
   latestReplyTimestampByTrigger(): Map<string, string>;
   listOutboundSystemMessages(): OutboundSystemRow[];
   listTurnUsageSince(afterId: number): SessionTurnUsageRow[];
+  listOutboundTail(limit: number): MessageTailRow[];
 }
 
-export type { ContainerState, OutboundSystemRow, ProcessingClaim, ScheduledTaskRow, SessionTurnUsageRow, TaskFireRow };
+export type {
+  ContainerState,
+  MessageTailRow,
+  OutboundSystemRow,
+  ProcessingClaim,
+  ScheduledTaskRow,
+  SessionTurnUsageRow,
+  TaskDeliveryRoute,
+  TaskFireRow,
+  TaskRoutingStamp,
+};
 
 /**
  * Resolve one side of a session's mailbox under `dataDir`, with the same
@@ -172,6 +201,13 @@ export function readSessionInbound<T>(
       getLiveTaskRow: (seriesId) => getLiveTaskRow(db, seriesId),
       getLatestTaskRow: (seriesId) => getLatestTaskRow(db, seriesId),
       listRecentTaskFires: (seriesId, limit) => listRecentTaskFires(db, seriesId, limit),
+      latestInboundMessageId: () => latestInboundMessageId(db),
+      hasPendingRecurrence: () => hasPendingRecurrence(db),
+      hasTriggeredInboundRow: () => hasTriggeredInboundRow(db),
+      listInboundTail: (limit) => listInboundTail(db, limit),
+      countLiveSeriesRows: (seriesId) => countLiveSeriesRows(db, seriesId),
+      getLatestTaskRoutingStamp: (seriesId) => getLatestTaskRoutingStamp(db, seriesId),
+      getLatestTaskDeliveryRoute: () => getLatestTaskDeliveryRoute(db),
     });
   } finally {
     db.close();
@@ -196,6 +232,7 @@ export function readSessionOutbound<T>(
       latestReplyTimestampByTrigger: () => latestReplyTimestampByTrigger(db),
       listOutboundSystemMessages: () => listOutboundSystemMessages(db),
       listTurnUsageSince: (afterId) => listTurnUsageSince(db, afterId),
+      listOutboundTail: (limit) => listOutboundTail(db, limit),
     });
   } finally {
     db.close();
