@@ -8,13 +8,37 @@
 # it. Pure bash by design — runs before Node exists on the host.
 set -euo pipefail
 
+# Floor is the highest node:22.x requirement any locked dependency declares
+# (eslint@10 / eslint-visitor-keys@5 need ^22.13.0; vite@8 needs >=22.12.0).
+# Must match package.json's engines.node and setup.sh's NODE_MIN_VERSION;
+# bump all three together.
+NODE_MIN_VERSION="22.13.0"
+
+# Returns success if dotted numeric version $1 >= $2 (e.g. "22.13.0" >= "22.13.0").
+version_ge() {
+  local IFS=.
+  local -a a=($1) b=($2)
+  local i x y
+  for i in 0 1 2; do
+    x=${a[i]:-0}
+    y=${b[i]:-0}
+    if [ "$x" -gt "$y" ] 2>/dev/null; then return 0; fi
+    if [ "$x" -lt "$y" ] 2>/dev/null; then return 1; fi
+  done
+  return 0
+}
+
 echo "=== NANOCLAW SETUP: INSTALL_NODE ==="
 
 if command -v node >/dev/null 2>&1; then
-  echo "STATUS: already-installed"
-  echo "NODE_VERSION: $(node --version)"
-  echo "=== END ==="
-  exit 0
+  EXISTING_VERSION=$(node --version | sed 's/^v//')
+  if version_ge "$EXISTING_VERSION" "$NODE_MIN_VERSION" 2>/dev/null; then
+    echo "STATUS: already-installed"
+    echo "NODE_VERSION: $(node --version)"
+    echo "=== END ==="
+    exit 0
+  fi
+  echo "STEP: existing-node-too-old (found $(node --version), need >=${NODE_MIN_VERSION} — upgrading)"
 fi
 
 if command -v uvx >/dev/null 2>&1; then
@@ -55,6 +79,18 @@ fi
 if ! command -v node >/dev/null 2>&1; then
   echo "STATUS: failed"
   echo "ERROR: node not found on PATH after install"
+  echo "=== END ==="
+  exit 1
+fi
+
+# `command -v node` finding a binary isn't enough — if an older node earlier
+# on PATH shadows the one just installed (uvx: ~/.local/bin not ahead of
+# /usr/bin; brew: node@22 is keg-only and not linked), this would otherwise
+# report success while `node --version` still prints the old major.
+FINAL_VERSION=$(node --version | sed 's/^v//')
+if ! version_ge "$FINAL_VERSION" "$NODE_MIN_VERSION" 2>/dev/null; then
+  echo "STATUS: failed"
+  echo "ERROR: node on PATH is still v${FINAL_VERSION} (need >=${NODE_MIN_VERSION}) — an older node is shadowing the new install. Open a new shell, or fix PATH directly: uvx installs put it at ~/.local/bin/node (put that ahead of $(command -v node)); Homebrew's node@22 is keg-only — run 'brew link --force node@22' or prepend \"\$(brew --prefix node@22)/bin\" to PATH."
   echo "=== END ==="
   exit 1
 fi
