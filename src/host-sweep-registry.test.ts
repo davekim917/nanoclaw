@@ -232,6 +232,10 @@ import {
 import { log } from './log.js';
 import { SessionDbMissingError, SessionDbUnopenableError } from './modules/mailbox/index.js';
 import { _mailboxSessionDepthForTesting } from './modules/mailbox/session.js';
+// Family modules register their duties at import — imported here (as
+// src/modules/index.ts does at production boot) so R-7's registration pin
+// below sees the full 39-registration set, not just the in-file built-ins.
+import './modules/sweep-orchestrator/index.js';
 
 probe.depth = _mailboxSessionDepthForTesting;
 
@@ -1008,6 +1012,20 @@ describe('sweep duty registry (S2-PR2)', () => {
     // Every inventory id maps to a name the registry actually uses.
     for (const [id, name] of Object.entries(SWEEP_DUTY_INVENTORY)) {
       expect(names, `inventory id ${id}`).toContain(name);
+    }
+  });
+
+  // ── F-5.4 (S2-PR5, plan.md §8) ───────────────────────────────────────────────
+  it('reconciler, thread-close and watchdog run in tick:post-session', () => {
+    // The container-state ordering constraint (plan.md §4.3 constraint 1)
+    // survives the move of T6/T18 into src/modules/sweep-orchestrator/. T8
+    // thread-close is S2-PR11's family — assert its declared phase only, not
+    // its behavior.
+    const { duties } = _listSweepRegistrationsForTesting();
+    const byName = new Map(duties.map((d) => [d.name, d]));
+    for (const name of [SWEEP_DUTY_INVENTORY.T6, SWEEP_DUTY_INVENTORY.T8, SWEEP_DUTY_INVENTORY.T18]) {
+      expect(byName.get(name), `duty ${name}`).toBeDefined();
+      expect(byName.get(name)?.phase, `duty ${name}`).toBe('tick:post-session');
     }
   });
 
