@@ -43,6 +43,7 @@ import {
   SWEEP_DUTY_INVENTORY,
   SweepWindowAbort,
   asSessionContext,
+  containerOwnsOutbound,
   registerSweepDuty,
   registerSweepDutySource,
   registerSweepKillFollowUp,
@@ -465,7 +466,9 @@ export function registerContinuationSweepDuties(): void {
     run: (ctx) => {
       const { session, mailbox, plan } = asSessionContext(ctx);
       if (
-        !isContainerRunning(session.id) &&
+        // Ownership, not liveness: both writes below land in outbound.db, and a
+        // container still spawning is about to own it (mailbox seam PR 5, 7199be48).
+        !containerOwnsOutbound(session.id) &&
         plan.workContinuation &&
         plan.workContinuation.resume_attempts >= WORK_CONTINUATION_RESUME_MAX_ATTEMPTS
       ) {
@@ -490,7 +493,8 @@ export function registerContinuationSweepDuties(): void {
     run: (ctx) => {
       const { session, mailbox, plan } = asSessionContext(ctx);
       plan.continuationWakeEligible =
-        !isContainerRunning(session.id) &&
+        // Gates S9b's attempt increment, which writes outbound.db (7199be48).
+        !containerOwnsOutbound(session.id) &&
         plan.workContinuation !== null &&
         canAttemptContinuationRecovery(plan.workContinuation) &&
         decideContinuationWake({

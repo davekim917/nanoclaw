@@ -136,6 +136,7 @@ const mockWriteSessionMessage = vi.fn();
 const mockAdmitDueTaskContexts = vi.fn().mockReturnValue(0);
 const mockWakeContainer = vi.fn();
 const mockIsContainerRunning = vi.fn();
+const mockIsContainerSpawning = vi.fn();
 const mockHasContainerEverRun = vi.fn();
 const mockGetSession = vi.fn();
 const mockRunReconcilerSweep = vi.fn();
@@ -176,6 +177,7 @@ vi.mock('../../container-runner.js', async (importOriginal) => {
   return {
     ...real,
     isContainerRunning: (...args: unknown[]) => mockIsContainerRunning(...args),
+    isContainerSpawning: (...args: unknown[]) => mockIsContainerSpawning(...args),
     hasContainerEverRun: (...args: unknown[]) => mockHasContainerEverRun(...args),
     wakeContainer: (...args: unknown[]) => mockWakeContainer(...args),
     killContainer: (...args: unknown[]) => mockKillContainer(...args),
@@ -1457,4 +1459,104 @@ it('the child_process tripwire bites when a seam mock is removed', () => {
   const tripwire = childProcessTripwire(record);
   expect(() => tripwire.execFileSync!('docker')).toThrow(/real process spawn attempted/);
   expect(record).toEqual(['execFileSync']);
+});
+
+// ─── Post-kill ownership guard (mailbox seam PR 5 round 8, 3b6cbb5f) ─────────
+//
+// `killContainer` is itself a yield: the `session:health:post-kill` window
+// below opens AFTER it, and a replacement wake landing in that gap owns
+// outbound.db. Writing anyway deletes the FRESH runner's processing claim and
+// defers an input it is already working — duplicate execution.
+//
+// On this lineage both of round 8's write sites sit behind ONE guard, on the
+// window rather than on each write, because every post-kill write is a
+// registered kill follow-up dispatched by `runSweepKillFollowUps`. Case titles
+// are taken verbatim from 3b6cbb5f.
+describe('post-kill writes yield to a replacement container', () => {
+  function slaFixture(
+    id: string,
+    heartbeatAgeMs: number,
+    claimAgeMs: number,
+  ): { session: Session; state: () => string } {
+    const session: Session = { ...fakeSession(), id, agent_group_id: 'ag-sla' };
+    getAgentMailbox().prepare({ agentGroupId: session.agent_group_id, sessionId: session.id });
+    const dir = path.join(testDataDir.dir, 'v2-sessions', session.agent_group_id, session.id);
+    const now = Date.now();
+    const hb = path.join(dir, '.heartbeat');
+    fs.writeFileSync(hb, '');
+    fs.utimesSync(hb, new Date(now - heartbeatAgeMs), new Date(now - heartbeatAgeMs));
+    const outboundPath = path.join(dir, 'outbound.db');
+    const out = new Database(outboundPath);
+    out
+      .prepare("INSERT INTO processing_ack (message_id, status, status_changed) VALUES ('m-live', 'processing', ?)")
+      .run(new Date(now - claimAgeMs).toISOString());
+    out.close();
+    // Routing is inbound-side; a ceiling notice needs it to know where to post.
+    const inRaw = new Database(path.join(dir, 'inbound.db'));
+    inRaw
+      .prepare('INSERT INTO session_routing (id, channel_type, platform_id, thread_id) VALUES (1, ?, ?, ?)')
+      .run('slack', 'C-SLA', 'T-SLA');
+    inRaw.close();
+    // Claims and notices together: the guard must skip BOTH writes.
+    const state = (): string => {
+      const db = new Database(outboundPath, { readonly: true });
+      const claims = (db.prepare('SELECT COUNT(*) AS c FROM processing_ack').get() as { c: number }).c;
+      const notices = (db.prepare('SELECT COUNT(*) AS c FROM messages_out').get() as { c: number }).c;
+      db.close();
+      return `claims=${claims} notices=${notices}`;
+    };
+    return { session, state };
+  }
+
+  beforeEach(() => {
+    const db = initTestDb();
+    runMigrations(db);
+    db.prepare(`INSERT INTO agent_groups (id, name, folder, created_at) VALUES ('ag-sla', 'sla', 'sla-folder', ?)`).run(
+      new Date().toISOString(),
+    );
+    mockKillContainer.mockReset();
+    mockHasContainerEverRun.mockReset().mockReturnValue(true);
+    mockAdmitDueTaskContexts.mockReset().mockReturnValue(0);
+    // Live all the way through: alive so the SLA branch runs at all, and STILL
+    // alive after the kill because a wake replaced it in the gap. The mocked
+    // kill deliberately does NOT clear it — that is the race being pinned.
+    mockIsContainerRunning.mockReset().mockReturnValue(true);
+    mockIsContainerSpawning.mockReset().mockReturnValue(false);
+  });
+  afterEach(() => closeDb());
+
+  it('a replacement container that wakes during the post-kill open keeps its claim (ceiling)', async () => {
+    const f = slaFixture('sess-sla-ceiling', ABSOLUTE_CEILING_MS + 60_000, 10_000);
+    const before = f.state();
+
+    await _sweepSessionForTesting(f.session);
+
+    expect(mockKillContainer).toHaveBeenCalledWith('sess-sla-ceiling', 'absolute-ceiling');
+    // Claim intact and no restart notice written: both writes were skipped.
+    expect(f.state()).toBe(before);
+  });
+
+  it('a replacement container that wakes during the post-kill open keeps its claim (claim-stuck)', async () => {
+    // Heartbeat older than the claim but inside the ceiling: claim-stuck, not ceiling.
+    const f = slaFixture('sess-sla-claim', 10 * 60_000, 5 * 60_000);
+    const before = f.state();
+
+    await _sweepSessionForTesting(f.session);
+
+    expect(mockKillContainer).toHaveBeenCalledWith('sess-sla-claim', 'claim-stuck');
+    expect(f.state()).toBe(before);
+  });
+
+  it('the same two paths DO write once the container is really gone', async () => {
+    // The mirror of the two cases above: with no replacement in the gap the
+    // guard must not fire, so this proves it gates on ownership rather than
+    // silencing the post-kill writes outright.
+    mockKillContainer.mockImplementation(() => mockIsContainerRunning.mockReturnValue(false));
+    const f = slaFixture('sess-sla-gone', ABSOLUTE_CEILING_MS + 60_000, 10_000);
+
+    await _sweepSessionForTesting(f.session);
+
+    expect(mockKillContainer).toHaveBeenCalledWith('sess-sla-gone', 'absolute-ceiling');
+    expect(f.state()).toBe('claims=0 notices=1');
+  });
 });
