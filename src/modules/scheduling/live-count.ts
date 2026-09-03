@@ -15,8 +15,10 @@
  * NOT unreadable — a missing target session legitimately means no insert
  * landed there.
  *
- * Opens are { readonly: true } + busy_timeout 1000 (the board read-path
- * precedent — never the write path's 5000ms; M2 hygiene / ADV-S3).
+ * Opens go through the module's read-only session, which is { readonly: true }
+ * + busy_timeout 1000 by default (the board read-path precedent — never the
+ * write path's 5000ms; M2 hygiene / ADV-S3) and can neither provision nor
+ * migrate a session it is only counting.
  *
  * DEPENDENCY: the recovery idempotency story (host-sweep.ts recoverMoveIntents)
  * relies on `journal_mode=DELETE` on session DBs — a readonly count opened right
@@ -24,10 +26,7 @@
  * after-write visibility guarantee changes and the re-check semantics would need
  * re-verification. DELETE is load-bearing (container/agent-runner connection.ts).
  */
-import fs from 'fs';
-import path from 'path';
-
-import Database from 'better-sqlite3';
+import { readSessionInbound } from '../mailbox/index.js';
 
 export interface SessionLocator {
   agentGroupId: string;
@@ -39,9 +38,6 @@ export interface LiveCountResult {
   /** True if ANY existing session's inbound.db threw on read → live state UNKNOWN. */
   unreadable: boolean;
 }
-
-const LIVE_COUNT_SQL =
-  "SELECT COUNT(*) AS c FROM messages_in WHERE series_id = ? AND kind = 'task' AND status IN ('pending','paused')";
 
 /**
  * Count live (pending|paused) task rows for `seriesId` across exactly the named
@@ -58,20 +54,16 @@ export function countLiveRowsInSessions(
 
   for (const loc of locators) {
     if (!loc) continue;
-    const inboundPath = path.join(dataDir, 'v2-sessions', loc.agentGroupId, loc.sessionId, 'inbound.db');
-    // Absent file → no insert landed here → contributes 0, not unreadable.
-    if (!fs.existsSync(inboundPath)) continue;
-    let db: Database.Database | null = null;
     try {
-      db = new Database(inboundPath, { readonly: true });
-      db.pragma('busy_timeout = 1000');
-      count += (db.prepare(LIVE_COUNT_SQL).get(seriesId) as { c: number }).c;
+      // `undefined` = no mailbox at that locator → contributes 0, NOT
+      // unreadable: a missing target session legitimately means no insert
+      // landed there. A present-but-unreadable file throws instead, which is
+      // what taints the result below.
+      count += readSessionInbound({ ...loc, dataDir }, (mailbox) => mailbox.countLiveSeriesRows(seriesId)) ?? 0;
     } catch {
       // Existent-but-unreadable → live state UNKNOWN. Taint the whole result so
       // callers never silently treat it as "0 live rows" and restore.
       unreadable = true;
-    } finally {
-      db?.close();
     }
   }
 

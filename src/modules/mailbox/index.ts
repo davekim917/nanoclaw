@@ -231,7 +231,15 @@ export {
   type SessionReadLocation,
   type SessionReadOptions,
 } from './read-only.js';
-export type { OutboundSystemRow, ScheduledTaskRow, SessionTurnUsageRow, TaskFireRow } from './ops/reads.js';
+export type {
+  MessageTailRow,
+  OutboundSystemRow,
+  ScheduledTaskRow,
+  SessionTurnUsageRow,
+  TaskDeliveryRoute,
+  TaskFireRow,
+  TaskRoutingStamp,
+} from './ops/reads.js';
 export type { ContainerState, ProcessingClaim } from './ops/sweep.js';
 
 /**
