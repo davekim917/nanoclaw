@@ -326,6 +326,28 @@ const sweepDuties: SweepDuty[] = [];
 const slaObservationHooks: SlaObservationHook[] = [];
 const sweepKillFollowUps: SweepKillFollowUp[] = [];
 
+interface SweepDutySource {
+  name: string;
+  registrar: () => void;
+}
+
+// Registration sources, in registration order. The in-file built-ins are the
+// first source (registered below, at module init); a family module
+// (`src/modules/sweep-<family>/`) registers itself as a further source at its
+// own import time. The test reset replays every recorded source's registrar
+// so a family module's duties survive `_resetSweepRegistryForTesting()`
+// instead of silently dropping out (found by two family builders: R-7 fell
+// 39→33 under the old builtins-only reset).
+const sweepDutySources: SweepDutySource[] = [];
+
+export function registerSweepDutySource(name: string, registrar: () => void): void {
+  if (sweepDutySources.some((s) => s.name === name)) {
+    throw new Error(`Sweep duty source ${name}: already registered`);
+  }
+  sweepDutySources.push({ name, registrar });
+  registrar();
+}
+
 export function registerSweepDuty(duty: SweepDuty): void {
   if (!SWEEP_PHASES.includes(duty.phase)) {
     throw new Error(`Sweep duty ${duty.name}: unknown phase ${duty.phase}`);
@@ -408,15 +430,33 @@ export function _listSweepRegistrationsForTesting(): {
 
 /**
  * Test-only: clear the registry. `builtins: false` leaves it EMPTY so a test
- * can drive the driver over its own probes; the default restores the 39
- * registrations this module makes at import.
+ * can drive the driver over its own probes; the default replays every
+ * recorded duty source's registrar, in registration order — the in-file
+ * built-ins plus any family module that registered itself via
+ * `registerSweepDutySource` — restoring the full registration set rather
+ * than only the 39 the built-ins alone would give.
  */
 export function _resetSweepRegistryForTesting(options: { builtins?: boolean } = {}): void {
   sweepDuties.length = 0;
   slaObservationHooks.length = 0;
   sweepKillFollowUps.length = 0;
   dutiesByPhase = new Map();
-  if (options.builtins ?? true) registerBuiltInSweepDuties();
+  if (options.builtins ?? true) {
+    for (const source of sweepDutySources) source.registrar();
+  }
+}
+
+/**
+ * Test-only: drop every duty source except the in-file built-ins, so a test
+ * that registered a fake source via `registerSweepDutySource` doesn't leak it
+ * into later tests' registry state. Does not touch the duty/hook/follow-up
+ * registries — call this after `_resetSweepRegistryForTesting()` has already
+ * restored them, not instead of it.
+ */
+export function _resetSweepDutySourcesForTesting(): void {
+  const builtins = sweepDutySources.filter((s) => s.name === 'host-sweep:builtin');
+  sweepDutySources.length = 0;
+  sweepDutySources.push(...builtins);
 }
 
 // ── Duty failure handling ────────────────────────────────────────────────────
@@ -3434,4 +3474,4 @@ function registerBuiltInSweepDuties(): void {
   });
 }
 
-registerBuiltInSweepDuties();
+registerSweepDutySource('host-sweep:builtin', registerBuiltInSweepDuties);
