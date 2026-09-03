@@ -117,7 +117,7 @@ Decisions:
 - **The runner's compat surface is upstream's.** `db/messages-in.ts`, `db/session-state.ts`, `db/session-routing.ts`, `db/container-state.ts`, `db/messages-out.ts` become upstream's verbatim shims. `getPendingMessages(isFirstPoll)` keeps its compat signature; the fork's `PendingSelectionDiagnostics` becomes a module export (`getPendingMessagesWithDiagnostics`) for the one poll-loop site that reads it, if any (builder verifies).
 - **Fork-only ops** (sticky settings, work continuation, done proposals, infra-warning dedupe, memory epoch, provider health, `getSessionSpawnTaskId`/`getSessionId`, `classifyTrigger`, `retainCompleteRecallUnits`, `releaseProcessingClaims`, `getCentralDb`, `initTestSessionDb`) are exported from `modules/mailbox/index.ts` under their current names. The 25 callers change import paths only — a mechanical rewrite with unchanged call sites.
 - **Test harness**: the fork's `initTestSessionDb` (in-memory test mode, used by 22 runner suites) moves into the module and installs its schema through the same `ensureNanoclawOutboundSchema` the production path uses, so tests and production share one schema source (today `connection.ts:test-schema-*` uids duplicate it).
-- **PRAGMAs**: inbound `busy_timeout=5000` → `mmap_size=0` on a fresh RO open per poll; outbound `busy_timeout` → `journal_mode=DELETE` → `foreign_keys=ON` (test R-2). The comment block on cross-mount visibility is carried into the module verbatim.
+- **PRAGMAs**: inbound `busy_timeout=5000` → `mmap_size=0` on a fresh RO open per poll; outbound must see `busy_timeout` before `journal_mode=DELETE` (switching journal mode takes an exclusive lock; the fork has a live-regression test with a sibling MCP writer). Upstream's manifest-locked opener runs them in the opposite order, so the fork module pre-pins `journal_mode=DELETE` behind a busy handler in `start()` before upstream's opener runs, making upstream's PRAGMA a lock-free no-op (test R-2). Upstream ask after R1 soaks: swap the two lines. The comment block on cross-mount visibility is carried into the module verbatim.
 - `start(key|null)`: the fork accepts `null` (pre-seam host) exactly like upstream; `stop()` closes the singletons.
 
 ### 4.4 Fork op families (what moves, where from)
@@ -183,6 +183,8 @@ At host boot, `container-runner.ts` copies `container/agent-runner/src` to `data
 
 ## 5. PR series (ordered; each deploys alone)
 
+**Stacked-PR CI rule:** `.github/workflows/ci.yml` runs only for PRs targeting `main`, so a stacked PR gets no CI until GitHub retargets it after the PR below merges; builders' local targeted checks are the gate until then, and a stacked PR merges only after that retargeted CI run is green. No workflow change (Actions minutes are quota-bound).
+
 Every PR: branch from `main` in a scratch worktree the operator has approved for this program (never in `/home/ubuntu/nanoclaw-v2` — its `dist/` is live and its `HEAD` is shared), own `node_modules` via `pnpm install --frozen-lockfile` and `bun install` in `container/agent-runner`, format + typecheck both trees, host tests **serially**, runner tests, `pnpm run check:public-boundary -- --portable`, Codex review loop (`/pr-review-loop`, effort `high`), merge with a merge commit, deploy in a quiet-hour window (§6). Owner = one builder per PR (worker tier noted); the orchestrator reviews the diff against the acceptance cases before merge.
 
 | # | PR | Tree | Runtime effect | Owner tier | Depends on |
@@ -197,7 +199,7 @@ Every PR: branch from `main` in a scratch worktree the operator has approved for
 | 6 | Host callers, operator surfaces: `dashboard/api/{threads,scheduled-move,scheduled-mutations}.ts`, `dashboard/steer.ts`, `modules/repository-workspaces/index.ts`, `orchestrator-dispatch`, `migrate-tasks-to-system-sessions.ts`, `threads.ts` | host | dashboard reads via the seam | worker | 2 |
 | R2 | `registerAdmissionGate` seam + fence gate in the module; poll-loop idle ack moves behind it | runner | idle-boundary ack path | worker-high | R1 |
 | 7 | Delete `src/db/session-db.ts` façade and `session-manager.ts` raw wrappers; host allowlist → empty; docs | host | none | worker-fast | 3–6 |
-| R3 | `poll-loop.ts`, `codex.ts`, `cli/ncl.ts`, `self-mod.ts`, `session-recap.ts`, `resource-telemetry.ts` off raw handles; runner allowlist → empty | runner | none | worker | R1, R2 |
+| R3 | `poll-loop.ts`, `codex.ts`, `cli/ncl.ts`, `self-mod.ts`, `session-recap.ts`, `resource-telemetry.ts`, `scheduling/wiki-lint-gate.ts` (opens both session DBs by injected path — found by the PR 1 ratchet) off raw handles; port upstream's runner `mailbox/registry.test.ts`; runner allowlist → empty | runner | none | worker | R1, R2 |
 
 Sequencing notes:
 
