@@ -49,6 +49,7 @@ import {
   sessionsBaseDir,
   admitDueTaskContexts,
   deferMessageForFreshContextRetry,
+  withExistingMailboxSession,
 } from './session-manager.js';
 import {
   getContainerSpawnedAt,
@@ -1272,21 +1273,19 @@ async function prepareDueWake(
   // on the host BEFORE admission, so a gated/errored fire never becomes due
   // and never spawns a container. See host-script.ts's runHostGatedTaskScripts.
   //
-  // `runHostGatedTaskScripts` takes this session (mailbox seam PR 4): it is a
-  // sweep callee with no other production caller, and a SESSION parameter is
-  // the seam's sanctioned object — invariant I-9 forbids handing out raw
-  // handles, not sessions, so the callee stays off the ratchet's allowlist.
-  // It can spend the full pre-task timeout per row, so the session is held
-  // across that work exactly as it was when this line passed a raw handle.
-  // `admitDueTaskContexts` still takes one: it lives in `session-manager.ts`
-  // and moves behind the seam in PR 7. `legacyInboundHandle` survives here for
-  // that one call and nothing else.
+  // `runHostGatedTaskScripts` and `admitDueTaskContexts` both take this
+  // session: they are sweep callees with no other production caller, and a
+  // SESSION parameter is the seam's sanctioned object — invariant I-9 forbids
+  // handing out raw handles, not sessions, so neither callee lands on the
+  // ratchet's allowlist. The script runner can spend the full pre-task timeout
+  // per row, so the session is held across that work exactly as it was when
+  // these lines passed a raw handle.
   //
   // `agentGroupId` rides along because the callee resolves the GROUP's
   // timezone for its local-time gate: a session parameter identifies the
   // mailbox, not the group whose zone override applies.
   await runHostGatedTaskScripts(mailbox, agentGroupId, sessionId);
-  const admittedTasks = admitDueTaskContexts(mailbox.legacyInboundHandle(), agentGroupId, sessionId);
+  const admittedTasks = admitDueTaskContexts(mailbox, agentGroupId, sessionId);
   const dueCount = mailbox.countDueMessages();
   return {
     admittedTasks,
@@ -1302,6 +1301,7 @@ export async function _prepareDueWakeForTesting(
 ): Promise<{ admittedTasks: number; dueCount: number; wakePriority: 'interactive' | 'scheduled' }> {
   return prepareDueWake(mailbox, agentGroupId, sessionId);
 }
+
 
 /**
  * "I cannot read this session" is not "this session is quiet", but both took
@@ -1718,7 +1718,7 @@ function resetStuckProcessingRows(mailbox: NanoclawMailboxSession, session: Sess
     } else {
       const backoffMs = BACKOFF_BASE_MS * Math.pow(2, msg.tries);
       const backoffSec = Math.floor(backoffMs / 1000);
-      deferMessageForFreshContextRetry(mailbox.legacyInboundHandle(), msg.id, backoffSec);
+      deferMessageForFreshContextRetry(mailbox, msg.id, backoffSec);
       log.info('Reset stale message with backoff', {
         messageId: msg.id,
         tries: msg.tries,
@@ -2090,7 +2090,6 @@ function registerBuiltInSweepDuties(): void {
   // T11 (scheduled-move-recovery) and T12 (audit-body-prune) are registered by
   // src/modules/sweep-scheduled-move/index.ts (S2-PR7) — order 50/60 in this
   // same 'tick:housekeeping' phase, between T10 above and T14 below.
-
   // T14 completed-task-auto-archive (order 70) moved to
   // src/modules/sweep-orchestrator/index.ts (S2-PR5).
 

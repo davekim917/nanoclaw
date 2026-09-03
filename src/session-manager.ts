@@ -1251,26 +1251,13 @@ interface PendingUpgradeForAdmission extends DueTaskForAdmission {
  * can safely return to pending. Scheduled tasks stay untouched: their existing
  * due-time seam admits context immediately before execution.
  */
-export function admitPendingUpgradeContexts(db: Database.Database, agentGroupId: string, sessionId: string): number {
-  const pending = db
-    .prepare(
-      `SELECT id, kind, timestamp, status, platform_id, channel_type, thread_id, content, process_after,
-              source_session_id, on_wake
-         FROM messages_in
-        WHERE status IN ('pending', 'processing')
-          AND trigger = 1
-          AND kind NOT IN ('system', 'task')
-          AND NOT EXISTS (
-            SELECT 1
-              FROM messages_in AS recall
-             WHERE recall.id = 'recall-' || messages_in.id
-          )
-        ORDER BY seq`,
-    )
-    .all() as PendingUpgradeForAdmission[];
-
+export function admitPendingUpgradeContexts(
+  mailbox: NanoclawMailboxSession,
+  agentGroupId: string,
+  sessionId: string,
+): number {
   let admitted = 0;
-  for (const message of pending) {
+  for (const message of mailbox.listUnpairedPendingUpgradeRows()) {
     const recall = buildRecallRow(
       agentGroupId,
       sessionId,
@@ -1288,50 +1275,10 @@ export function admitPendingUpgradeContexts(db: Database.Database, agentGroupId:
         onWake: message.on_wake,
       },
       message.content,
-      recallSourceForHandle(agentGroupId, sessionId, db),
+      mailbox,
     );
     if (!recall) continue;
-
-    const inserted = db.transaction(() => {
-      const stillUnpaired = db
-        .prepare(
-          `SELECT 1
-             FROM messages_in
-            WHERE id = ?
-              AND status IN ('pending', 'processing')
-              AND trigger = 1
-              AND kind NOT IN ('system', 'task')
-              AND NOT EXISTS (
-                SELECT 1
-                  FROM messages_in AS recall
-                 WHERE recall.id = 'recall-' || messages_in.id
-              )`,
-        )
-        .get(message.id);
-      if (!stillUnpaired) return false;
-
-      const recallSeq = nextEvenSeq(db);
-      db.prepare(
-        `INSERT INTO messages_in
-           (id, seq, kind, timestamp, status, platform_id, channel_type, thread_id, content,
-            process_after, recurrence, series_id, trigger, source_session_id, on_wake)
-         VALUES
-           (@id, @seq, @kind, @timestamp, 'pending', @platformId, @channelType, @threadId, @content,
-            @processAfter, NULL, @id, 0, @sourceSessionId, @onWake)`,
-      ).run({ ...recall, seq: recallSeq });
-      const changed = db
-        .prepare(
-          `UPDATE messages_in
-              SET seq = ?, status = 'pending'
-            WHERE id = ?
-              AND status IN ('pending', 'processing')
-              AND trigger = 1`,
-        )
-        .run(recallSeq + 2, message.id).changes;
-      if (changed !== 1) throw new Error(`pending upgrade turn ${message.id} changed during context admission`);
-      return true;
-    })();
-    if (inserted) admitted++;
+    if (mailbox.admitPendingUpgradeRow(recall, message.id)) admitted++;
   }
   return admitted;
 }
@@ -1464,11 +1411,11 @@ export function replayUpgradeMtimeManifest(dataDir = DATA_DIR, centralDb?: Datab
  * bookkeeping, not session activity: the pre-pass mtime is restored afterward.
  * A session that ADMITS work here is genuinely active and keeps its new clock.
  */
-export function reconcilePendingUpgradeContexts(
+export async function reconcilePendingUpgradeContexts(
   centralDb: Database.Database,
   workgroupIds: string[],
   dataDir = DATA_DIR,
-): { sessions: number; admitted: number; mtimesRestored: number; skipped: number; stubsRemoved: number } {
+): Promise<{ sessions: number; admitted: number; mtimesRestored: number; skipped: number; stubsRemoved: number }> {
   replayUpgradeMtimeManifest(dataDir, centralDb);
 
   let stubsRemoved = 0;
@@ -1542,15 +1489,17 @@ export function reconcilePendingUpgradeContexts(
     // seven times). A bad session DB is that session's problem; the pass owns
     // every other session and the manifest bookkeeping below.
     try {
-      const inbound = openInboundDbRaw(target.inboundPath);
-      try {
-        migrateMessagesInTable(inbound);
+      // Existing-only: `targets` was built from a successful stat of each
+      // inbound.db, so `undefined` here means the session vanished between
+      // that stat and now — nothing to admit, and never something to
+      // re-provision on the startup path (invariant I-10). The legacy
+      // migrations the raw open used to run by hand are what session() runs on
+      // its first touch of a path.
+      await withExistingMailboxSession(target.agentGroupId, target.id, (mailbox) => {
         sessions++;
-        admittedHere = admitPendingUpgradeContexts(inbound, target.agentGroupId, target.id);
+        admittedHere = admitPendingUpgradeContexts(mailbox, target.agentGroupId, target.id);
         admitted += admittedHere;
-      } finally {
-        inbound.close();
-      }
+      });
     } catch (err) {
       log.error('Session inbound DB unreadable during startup reconciliation; skipping session', {
         sessionId: target.id,
@@ -1594,37 +1543,18 @@ export function reconcilePendingUpgradeContexts(
 
 /**
  * Put a crashed provider turn behind its retry deadline without exposing the
- * old pair to a warm poller. The existing recall row is retained as a
- * no-schema admission marker, but both rows become non-triggering and share
- * the future process_after. Due admission replaces that recall from current
- * host state before restoring trigger=1.
+ * old pair to a warm poller.
  *
- * Rows without a recall keep their current trigger value. In particular, an
- * ordinary trigger=0 accumulated chat row cannot become a provider turn merely
- * because generic crash cleanup touched its id.
+ * A thin pass-through to the module's admission op — kept here because the
+ * sweep and the recovery paths reach it through this file's vocabulary, not
+ * because any SQL lives here any more.
  */
-export function deferMessageForFreshContextRetry(db: Database.Database, messageId: string, backoffSec: number): void {
-  const processAfter = new Date(Date.now() + backoffSec * 1000).toISOString();
-  db.transaction(() => {
-    const recallId = `recall-${messageId}`;
-    const hasRecall =
-      db.prepare("SELECT 1 FROM messages_in WHERE id = ? AND kind = 'system' LIMIT 1").get(recallId) !== undefined;
-    const changed = db
-      .prepare(
-        `UPDATE messages_in
-            SET tries = tries + 1,
-                process_after = ?,
-                trigger = CASE WHEN ? THEN 0 ELSE trigger END
-          WHERE id = ? AND status = 'pending'`,
-      )
-      .run(processAfter, hasRecall ? 1 : 0, messageId).changes;
-    if (changed === 1 && hasRecall) {
-      db.prepare("UPDATE messages_in SET process_after = ?, trigger = 0 WHERE id = ? AND kind = 'system'").run(
-        processAfter,
-        recallId,
-      );
-    }
-  }).immediate();
+export function deferMessageForFreshContextRetry(
+  mailbox: NanoclawMailboxSession,
+  messageId: string,
+  backoffSec: number,
+): void {
+  mailbox.deferForFreshContextRetry(messageId, backoffSec);
 }
 
 /**
@@ -1641,56 +1571,26 @@ export function deferMessageForFreshContextRetry(db: Database.Database, messageI
  * Deferred on-wake rows keep on_wake=1 only until this host-owned barrier;
  * admission clears it on both halves so a fresh container that was concurrently
  * started by real inbound can still consume the now-safe pair on a later poll.
+ *
+ * What stays here is the POLICY — which rows get a recall and what it says.
+ * Every statement it commits lives in the mailbox module's admission ops.
  */
-export function admitDueTaskContexts(db: Database.Database, agentGroupId: string, sessionId: string): number {
+export function admitDueTaskContexts(mailbox: NanoclawMailboxSession, agentGroupId: string, sessionId: string): number {
   // An active repository ingress fence means this session must admit nothing:
   // the whole point is that no new turn starts while its mounts change. The
   // admission below sets trigger = 1, which a fenced row may never carry, so
   // proceeding aborts the sweep for this session on the fence guard. Release
   // has its own admission path (admitTaggedRows) and replays the deferred rows
   // with their original triggers, so skipping here defers rather than drops.
-  if (readRepoIngressFence(db)?.state === 'active') return 0;
+  if (mailbox.readRepoIngressFence()?.state === 'active') return 0;
 
   // Legacy rows predate inert scheduling and were stored trigger=1. Demote
   // only unpaired live tasks before selecting due work; already-admitted
   // pairs remain wakeable and untouched.
-  db.prepare(
-    `UPDATE messages_in
-        SET trigger = 0
-      WHERE kind = 'task'
-        AND status = 'pending'
-        AND trigger = 1
-        AND NOT EXISTS (
-          SELECT 1
-            FROM messages_in AS recall
-           WHERE recall.id = 'recall-' || messages_in.id
-        )`,
-  ).run();
-
-  const due = db
-    .prepare(
-      `SELECT id, kind, timestamp, platform_id, channel_type, thread_id, content, process_after,
-              source_session_id, on_wake
-         FROM messages_in
-        WHERE status = 'pending'
-          AND trigger = 0
-          AND (process_after IS NULL OR datetime(process_after) <= datetime('now'))
-          AND (
-            kind = 'task'
-            OR EXISTS (
-              SELECT 1
-                FROM messages_in AS recall
-               WHERE recall.id = 'recall-' || messages_in.id
-                 AND recall.kind = 'system'
-                 AND recall.trigger = 0
-            )
-          )
-        ORDER BY seq`,
-    )
-    .all() as DueTaskForAdmission[];
+  mailbox.demoteUnpairedLegacyTasks();
 
   let admitted = 0;
-  for (const task of due) {
+  for (const task of mailbox.listDueAdmissionRows()) {
     let recall: MessageInsert;
     try {
       recall = buildRecallRow(
@@ -1710,7 +1610,9 @@ export function admitDueTaskContexts(db: Database.Database, agentGroupId: string
           onWake: 0,
         },
         task.content,
-        recallSourceForHandle(agentGroupId, sessionId, db),
+        // The open session IS the recall source: it exposes the same four
+        // reads the adapter used to wrap, on the handle already in hand.
+        mailbox,
       )!;
     } catch (error) {
       if (!(error instanceof Error)) throw error;
@@ -1732,50 +1634,7 @@ export function admitDueTaskContexts(db: Database.Database, agentGroupId: string
       continue;
     }
 
-    const inserted = db.transaction(() => {
-      const stillDue = db
-        .prepare(
-          `SELECT 1
-             FROM messages_in
-            WHERE id = ?
-              AND status = 'pending'
-              AND trigger = 0
-              AND (process_after IS NULL OR datetime(process_after) <= datetime('now'))
-              AND (
-                kind = 'task'
-                OR EXISTS (
-                  SELECT 1
-                    FROM messages_in AS recall
-                   WHERE recall.id = 'recall-' || messages_in.id
-                     AND recall.kind = 'system'
-                     AND recall.trigger = 0
-                )
-              )`,
-        )
-        .get(task.id);
-      if (!stillDue) return false;
-      db.prepare("DELETE FROM messages_in WHERE id = ? AND kind = 'system'").run(recall.id);
-
-      const recallSeq = nextEvenSeq(db);
-      db.prepare(
-        `INSERT INTO messages_in
-           (id, seq, kind, timestamp, status, platform_id, channel_type, thread_id, content,
-            process_after, recurrence, series_id, trigger, source_session_id, on_wake)
-         VALUES
-           (@id, @seq, @kind, @timestamp, 'pending', @platformId, @channelType, @threadId, @content,
-            @processAfter, NULL, @id, 0, @sourceSessionId, @onWake)`,
-      ).run({ ...recall, seq: recallSeq });
-      const changed = db
-        .prepare(
-          `UPDATE messages_in
-              SET seq = ?, trigger = 1, on_wake = 0
-            WHERE id = ? AND status = 'pending' AND trigger = 0`,
-        )
-        .run(recallSeq + 2, task.id).changes;
-      if (changed !== 1) throw new Error(`due turn ${task.id} changed during context admission`);
-      return true;
-    })();
-    if (inserted) admitted++;
+    if (mailbox.admitDueRow(recall, task.id)) admitted++;
   }
   return admitted;
 }

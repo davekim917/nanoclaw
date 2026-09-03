@@ -707,3 +707,83 @@ export function setPendingTaskContent(db: Database.Database, taskId: string, con
     taskId,
   );
 }
+
+/* ─── `ncl tasks` board ────────────────────────────────────────────────────── */
+
+/**
+ * One task series as the admin CLI renders it.
+ *
+ * Wider than the dashboard's {@link ScheduledTaskRow} on purpose: the CLI's
+ * table shows `tries` and the aggregated `seq`, and its `row_id`/`series_id`
+ * split is what `ncl tasks get <id>` resolves a series by.
+ */
+export interface CliTaskRow {
+  row_id: string;
+  series_id: string | null;
+  status: string;
+  process_after: string | null;
+  recurrence: string | null;
+  content: string;
+  timestamp: string;
+  tries: number;
+  seq: number;
+  platform_id: string | null;
+  channel_type: string | null;
+  thread_id: string | null;
+}
+
+/**
+ * The live rows of every task series, one per series, next fire first.
+ *
+ * `GROUP BY series_id` with `MAX(seq)` collapses a series to its newest live
+ * occurrence — the CronJob-like view the CLI list shows. Without a status
+ * filter it means pending AND paused; a paused series still has a next run.
+ */
+export function listCliTaskSeries(db: Database.Database, status?: 'pending' | 'paused'): CliTaskRow[] {
+  const statusSql = status ? 'status = ?' : "status IN ('pending', 'paused')";
+  return db
+    .prepare(
+      `SELECT id AS row_id, series_id, status, process_after, recurrence, content, timestamp, tries,
+              platform_id, channel_type, thread_id, MAX(seq) AS seq
+         FROM messages_in
+        WHERE kind = 'task'
+          AND ${statusSql}
+        GROUP BY series_id
+        ORDER BY datetime(process_after) ASC, seq ASC`,
+    )
+    .all(...(status ? [status] : [])) as CliTaskRow[];
+}
+
+/**
+ * One task by row id OR series id, live occurrence preferred.
+ *
+ * The ORDER BY is the whole point: an agent remembers the id it created, which
+ * after the first fire names a `completed` row while the series' live next
+ * occurrence carries a different row id. Live first, then newest.
+ */
+export function getCliTaskRow(db: Database.Database, id: string): CliTaskRow | undefined {
+  return db
+    .prepare(
+      `SELECT id AS row_id, series_id, status, process_after, recurrence, content, timestamp, tries, seq,
+              platform_id, channel_type, thread_id
+         FROM messages_in
+        WHERE kind = 'task'
+          AND (id = ? OR series_id = ?)
+        ORDER BY CASE WHEN status IN ('pending', 'paused') THEN 0 ELSE 1 END, seq DESC
+        LIMIT 1`,
+    )
+    .get(id, id) as CliTaskRow | undefined;
+}
+
+/** A task row without its routing columns — what the create paths echo back. */
+export type CreatedTaskRow = Omit<CliTaskRow, 'platform_id' | 'channel_type' | 'thread_id'>;
+
+/** The row a freshly created series inserted, as the create paths echo it back. */
+export function getCreatedTaskRow(db: Database.Database, id: string): CreatedTaskRow | undefined {
+  return db
+    .prepare(
+      `SELECT id AS row_id, series_id, status, process_after, recurrence, content, timestamp, tries, seq
+         FROM messages_in WHERE id = ?`,
+    )
+    .get(id) as CreatedTaskRow | undefined;
+}

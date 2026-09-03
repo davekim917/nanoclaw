@@ -793,18 +793,23 @@ describe('deleteOrphanProcessingClaims', () => {
 describe('scheduled due admission precedes wake classification', () => {
   it('counts and classifies the trigger inserted by the admission seam', async () => {
     const { inDb, mailbox } = makeSessionDbs();
-    mockAdmitDueTaskContexts.mockImplementationOnce((db: Database.Database) => {
-      db.prepare(
-        `INSERT INTO messages_in
+    // The sweep hands `admitDueTaskContexts` the SESSION now, not a handle
+    // (invariant I-9). The stub writes the admitted trigger straight into the
+    // fixture DB behind that session, which is what the assertions below read.
+    mockAdmitDueTaskContexts.mockImplementationOnce(() => {
+      inDb
+        .prepare(
+          `INSERT INTO messages_in
            (id, seq, kind, timestamp, status, process_after, recurrence, series_id, trigger, content)
          VALUES ('task-admitted', 2, 'task', ?, 'pending', ?, NULL, 'task-admitted', 1, '{}')`,
-      ).run(new Date().toISOString(), new Date(Date.now() - 1_000).toISOString());
+        )
+        .run(new Date().toISOString(), new Date(Date.now() - 1_000).toISOString());
       return 1;
     });
 
     const result = await _prepareDueWakeForTesting(mailbox, 'ag-test', 'sess-test');
 
-    expect(mockAdmitDueTaskContexts).toHaveBeenCalledWith(inDb, 'ag-test', 'sess-test');
+    expect(mockAdmitDueTaskContexts).toHaveBeenCalledWith(mailbox, 'ag-test', 'sess-test');
     expect(result).toEqual({ admittedTasks: 1, dueCount: 1, wakePriority: 'scheduled' });
   });
 });
@@ -1174,6 +1179,7 @@ describe('notifyKillCeiling (Layer-3 fix)', () => {
     expect(rows[0].id).toBe('prior');
   });
 });
+
 
 describe('shouldCloseTaskSession', () => {
   it('closes a spent per-task session (no live tasks, no container)', () => {
