@@ -218,7 +218,7 @@ grep -c NanoclawAgentMailbox dist/modules/mailbox/index.js                      
 sudo systemctl restart nanoclaw-v2
 ```
 
-Post-restart gate (all four, or it is not deployed): runtime + `NRestarts` stable; `NODE_USE_ENV_PROXY` count 0 in the daemon environ; `grep -c 'OneCLI gateway applied' logs/nanoclaw.log` > 0 within 2 min (the spawn-success signal; one refusal is not a regression, zero successes is); `docker ps --filter name=nanoclaw-v2-` non-empty.
+**Quiet rule (operator, 2026-09-02):** a restart runs only when the fleet is quiet — no deliveries for 10 minutes and no container younger than 5 minutes — and every restart is surfaced for approval first. Post-restart gate (all four, plus the `OneCLI preflight ok` line from #245, or it is not deployed): runtime + `NRestarts` stable; `NODE_USE_ENV_PROXY` count 0 in the daemon environ; `grep -c 'OneCLI gateway applied' logs/nanoclaw.log` > 0 within 2 min (the spawn-success signal; one refusal is not a regression, zero successes is); `docker ps --filter name=nanoclaw-v2-` non-empty.
 
 Canary (decided: QA seat first): immediately after the gate, `ncl groups restart --id <qa-seat> --message <smoke prompt>` so the QA seat is the **first container on the new runner code** — true only because of PR 0: before it, any group spawning between `git pull` and the restart would have loaded a partially updated tree. Other running containers keep the old code in memory until their next natural spawn (that is the runner-side canary). Then a live Slack round trip on the QA seat and one on each production workgroup with actual tools, not curl. The host side has no partial rollout (one process); canary there means verification-first.
 
