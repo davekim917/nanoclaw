@@ -49,9 +49,13 @@ describe('skill-directives parser, on the converted add-slack', () => {
     expect(ops[2].attrs.when).toBe('connection=webhook');
   });
 
-  it('reads copy as a branch fetch with the full channel payload', () => {
+  it('reads copy as a branch fetch with the full channel payload, marked owned-by-fork (#250)', () => {
     const copy = directives.find((d) => d.kind === 'copy')!;
     expect(copy.attrs['from-branch']).toBe('channels');
+    // #250: the branch is stale relative to this fork's customized adapter —
+    // owned-by-fork tells the engine to refuse overwriting a diverged file
+    // instead of replaying the branch over it.
+    expect(copy.args).toContain('owned-by-fork');
     expect(copy.body).toEqual([
       'src/channels/slack.ts',
       'src/channels/slack-registration.test.ts',
@@ -153,6 +157,20 @@ describe('validation catches malformed directives', () => {
   it('accepts a @chat-adapter pin that matches the chat core', () => {
     const md = ['```nc:dep', '@chat-adapter/slack@4.26.0', '```'].join('\n');
     expect(validate(parseDirectives(md), { chatVersion: '4.26.0' })).toEqual([]);
+  });
+
+  // #250: owned-by-fork only means something on a from-branch copy (it
+  // protects a branch-sourced file from a stale replay) — a local copy has
+  // no branch to diverge from, so authoring it there is a lint error.
+  it('flags copy owned-by-fork without from-branch:', () => {
+    const md = ['```nc:copy owned-by-fork', 'resources/sample.ts -> src/sample.ts', '```'].join('\n');
+    const problems = validate(parseDirectives(md));
+    expect(problems.some((p) => /owned-by-fork requires from-branch/.test(p.message))).toBe(true);
+  });
+
+  it('accepts copy from-branch: owned-by-fork', () => {
+    const md = ['```nc:copy from-branch:channels owned-by-fork', 'src/channels/slack.ts', '```'].join('\n');
+    expect(validate(parseDirectives(md))).toEqual([]);
   });
 });
 

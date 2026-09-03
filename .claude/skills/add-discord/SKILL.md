@@ -17,10 +17,16 @@ safe to re-run; anything a parser can't apply falls back to the prose beside it.
 
 ### 1. Copy the adapter and its registration test
 
-Fetch the `channels` branch and copy the Discord adapter and its registration
-test into `src/channels/` (overwrite — the branch is canonical):
+Fetch the `channels` branch and copy in anything genuinely missing. This
+fork's Discord adapter has diverged far past that branch — multi-workspace
+tokens, mention resolution, missed-message recovery — so the branch is a
+fallback for a file that was never installed here, not a source of truth to
+replay over a live one (#250). `owned-by-fork` tells the engine to compare
+each destination against the branch first: a file already present and
+different from the branch is left alone — refused, not overwritten; only a
+genuinely missing file is copied in:
 
-```nc:copy from-branch:channels
+```nc:copy from-branch:channels owned-by-fork
 src/channels/discord.ts
 src/channels/discord-registration.test.ts
 ```
@@ -164,3 +170,5 @@ this channel with `/init-first-agent` (or `/manage-channels`).
 **The bot is online but never sees your messages.** Two usual causes: Message Content Intent is off (Bot tab → Privileged Gateway Intents), so message bodies arrive empty and nothing triggers; or the bot doesn't share a server with you — in which case `POST /users/@me/channels` also refuses. Open the invite URL and add the bot to a server you're in, then retry.
 
 **Adapter looks installed but Discord never connects.** Run `pnpm exec vitest run src/channels/discord-registration.test.ts` — red means the barrel import or the `@chat-adapter/discord` install drifted, so re-run the Apply steps. If it's green, the service probably hasn't restarted since the credentials were stored: `bash setup/lib/restart.sh`, then check `logs/nanoclaw.error.log` for missing `DISCORD_PUBLIC_KEY` / `DISCORD_APPLICATION_ID` complaints.
+
+**Step 1 reports a file "already installed and customized — refusing to overwrite."** Working as intended (#250): the `owned-by-fork` copy compares each destination against the `channels` branch before touching it, and a file that has drifted from the branch is left alone rather than downgraded. Don't force past this without checking — the branch is a stale snapshot, so a refusal almost always means the live file is *more* current, not less. Only pass `force` (`ApplyOptions.force` / the driver's `--force`) after confirming with the operator that replacing the live file with the branch version is actually wanted.

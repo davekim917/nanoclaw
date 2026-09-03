@@ -118,10 +118,15 @@ function selfStatus(d: Directive, root: string): { status: StepStatus; detail: s
     case 'copy': {
       const dests = d.body.map(destOf);
       const missing = dests.filter((p) => !has(root, p));
+      if (missing.length === 0) return { status: 'skip', detail: `${dests.join(', ')} present` };
       const from = d.attrs['from-branch'] ? `fetch ${String(d.attrs['from-branch'])} → ` : '';
-      return missing.length
-        ? { status: 'apply', detail: `${from}copy ${missing.join(', ')} (absent)` }
-        : { status: 'skip', detail: `${dests.join(', ')} present` };
+      // owned-by-fork: some dest is missing so applyOne runs, but every dest
+      // that's already present is compared to the branch and REFUSED (not
+      // overwritten) if it diverged — only the missing ones actually copy.
+      const forkNote = d.args.includes('owned-by-fork')
+        ? '; present files are compared to the branch and refused (not overwritten) if diverged'
+        : '';
+      return { status: 'apply', detail: `${from}copy ${missing.join(', ')} (absent)${forkNote}` };
     }
     case 'append': {
       const to = String(d.attrs.to ?? '');
@@ -269,6 +274,12 @@ export interface ApplyOptions {
   // generic resolver (env override → first remote that has the branch → origin);
   // setup injects one that reuses setup/lib/channels-remote.sh for exact parity.
   resolveRemote?: (branch: string) => string;
+  // Overrides a `copy owned-by-fork` refusal (see selfStatus/applyOne): when
+  // true, a fork-owned destination that has diverged from the registry branch
+  // IS overwritten with the branch version instead of being refused. The
+  // engine's only opinion of what "force" means — mirrors a driver's --force
+  // flag (#250). Absent/false ⇒ the protective default: refuse and bounce.
+  force?: boolean;
 }
 
 /**
@@ -547,7 +558,7 @@ function bindCapture(
 // is derivable. Throws on failure → caught and bounced to an agent.
 async function applyOne(
   d: Directive,
-  ctx: { root: string; skillDir: string; exec: (c: string) => string | void | Promise<string | void>; execStream?: (c: string) => Promise<StepOutcome>; resolveRemote: (b: string) => string; vars: Map<string, { value: string; secret: boolean }>; journal: JournalEntry[] },
+  ctx: { root: string; skillDir: string; exec: (c: string) => string | void | Promise<string | void>; execStream?: (c: string) => Promise<StepOutcome>; resolveRemote: (b: string) => string; vars: Map<string, { value: string; secret: boolean }>; journal: JournalEntry[]; force: boolean },
 ): Promise<void> {
   const { root, skillDir, exec, vars, journal } = ctx;
   switch (d.kind) {
@@ -556,12 +567,50 @@ async function applyOne(
         const b = String(d.attrs['from-branch']);
         const remote = ctx.resolveRemote(b);
         await exec(`git fetch ${remote} ${b}`);
-        for (const l of d.body) {
-          // The shell redirect can't create parent directories, and the dest
-          // may not exist on trunk (e.g. container skills that live only on
-          // the channels branch). Mirror the local-copy path's mkdir.
-          mkdirSync(dirname(join(root, destOf(l))), { recursive: true });
-          await exec(`git show ${remote}/${b}:${srcOf(l)} > ${destOf(l)}`);
+        if (d.args.includes('owned-by-fork')) {
+          // This fork has customized these destinations beyond the registry
+          // branch (Slack/Discord's multi-workspace suffix tokens, mention
+          // resolution, missed-message recovery, on top of the channels
+          // branch's stale snapshot — #250): the branch is a REFERENCE for a
+          // file never installed here, not a source of truth to replay over
+          // a live one. Content is captured via `exec` and written with
+          // writeFileSync — never a shell redirect — so a branch path that
+          // doesn't exist (git show fails, e.g. a registration test the
+          // branch never had) can never truncate a live file. Per file: a
+          // missing dest is a safe fresh install; a present dest is compared
+          // byte-for-byte — identical is a no-op, diverged is collected and
+          // REFUSED (every other listed file still applies) unless the
+          // caller passed `force`.
+          const refused: string[] = [];
+          for (const l of d.body) {
+            const dst = join(root, destOf(l));
+            mkdirSync(dirname(dst), { recursive: true });
+            const out = await exec(`git show ${remote}/${b}:${srcOf(l)}`);
+            const branchContent = typeof out === 'string' ? out : '';
+            if (existsSync(dst)) {
+              if (readFileSync(dst, 'utf8') === branchContent) continue; // already matches — no-op
+              if (!ctx.force) {
+                refused.push(destOf(l));
+                continue;
+              }
+            }
+            writeFileSync(dst, branchContent);
+            journal.push({ op: 'wrote', path: destOf(l) });
+          }
+          if (refused.length) {
+            throw new Error(
+              `FORK_OWNED_DIVERGED: ${refused.join(', ')} already installed and customized beyond ${remote}/${b} — refusing to overwrite; re-run with force to replace`,
+            );
+          }
+        } else {
+          for (const l of d.body) {
+            // The shell redirect can't create parent directories, and the dest
+            // may not exist on trunk (e.g. container skills that live only on
+            // the channels branch). Mirror the local-copy path's mkdir.
+            mkdirSync(dirname(join(root, destOf(l))), { recursive: true });
+            await exec(`git show ${remote}/${b}:${srcOf(l)} > ${destOf(l)}`);
+          }
+          for (const l of d.body) journal.push({ op: 'wrote', path: destOf(l) });
         }
       } else {
         for (const l of d.body) {
@@ -569,8 +618,8 @@ async function applyOne(
           mkdirSync(dirname(dst), { recursive: true });
           copyFileSync(join(skillDir, srcOf(l)), dst);
         }
+        for (const l of d.body) journal.push({ op: 'wrote', path: destOf(l) });
       }
-      for (const l of d.body) journal.push({ op: 'wrote', path: destOf(l) });
       break;
     case 'append': {
       const to = String(d.attrs.to);
@@ -820,7 +869,7 @@ export async function applySkill(skillDir: string, root: string, opts: ApplyOpti
       const label = stepLabel(d, md);
       if (opts.onEvent) await opts.onEvent({ type: 'step-start', kind: d.kind, line: d.line, label });
       inFlight = { label, at: Date.now() };
-      await applyOne(d, { root, skillDir, exec, execStream: opts.execStream, resolveRemote, vars, journal: res.journal });
+      await applyOne(d, { root, skillDir, exec, execStream: opts.execStream, resolveRemote, vars, journal: res.journal, force: opts.force ?? false });
       const durationMs = Date.now() - inFlight.at;
       inFlight = null;
       if (opts.onEvent) await opts.onEvent({ type: 'step-end', kind: d.kind, line: d.line, label, ok: true, durationMs });
@@ -838,6 +887,12 @@ export async function applySkill(skillDir: string, root: string, opts: ApplyOpti
       }
       if (/unresolved \{\{/.test(msg)) {
         res.deferred.push(msg); // blocked on a prompt input
+      } else if (msg.startsWith('FORK_OWNED_DIVERGED: ')) {
+        // A protective refusal, not an engine failure — bounce with the
+        // specific reason verbatim (never the generic "could not apply"
+        // wrapper) so the agent (or operator) reads exactly what diverged
+        // and what force does, per #250.
+        bounce(d, msg.slice('FORK_OWNED_DIVERGED: '.length));
       } else {
         bounce(d, `engine could not apply (${msg}) — an agent applies it from the prose`);
         // `effect:check` is a PRECONDITION, not a best-effort health signal.

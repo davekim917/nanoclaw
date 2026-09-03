@@ -159,6 +159,115 @@ describe('from-branch copy apply path', () => {
   });
 });
 
+// owned-by-fork: a copy whose destinations THIS fork customizes beyond the
+// registry branch (#250 — Slack's/Discord's adapters diverged from the stale
+// `channels` branch). Three files in one directive exercise all three
+// per-file outcomes in a single apply() call: a present+diverged file is
+// refused, a present+identical file is a no-op, and a missing file still
+// installs fresh — proving a sibling refusal doesn't block the rest.
+const OWNED_SKILL = `# owned-by-fork demo
+
+## Pull the adapter from the branch
+\`\`\`nc:copy from-branch:channels owned-by-fork
+src/channels/demo-adapter.ts
+src/channels/demo-registration.test.ts
+src/channels/demo-formatting.md
+\`\`\`
+`;
+const LIVE_CUSTOM_ADAPTER = 'export const adapter = "fork-customized, 528 lines of it";\n';
+const STALE_BRANCH_ADAPTER = 'export const adapter = "april snapshot";\n';
+const FRESH_REGISTRATION_TEST = 'export const registered = true;\n';
+const SHARED_FORMATTING_DOC = '# formatting\nunchanged either way\n';
+
+function ownedByForkExec(cmds: string[]): (c: string) => string | void {
+  return (c: string) => {
+    cmds.push(c);
+    if (c.includes('git show origin/channels:src/channels/demo-adapter.ts')) return STALE_BRANCH_ADAPTER;
+    if (c.includes('git show origin/channels:src/channels/demo-registration.test.ts')) return FRESH_REGISTRATION_TEST;
+    if (c.includes('git show origin/channels:src/channels/demo-formatting.md')) return SHARED_FORMATTING_DOC;
+    return undefined;
+  };
+}
+
+describe('owned-by-fork copy protection (#250)', () => {
+  let oskill: string;
+  let oroot: string;
+  beforeEach(() => {
+    oskill = mkdtempSync(join(tmpdir(), 'nc-skill-owned-'));
+    oroot = mkdtempSync(join(tmpdir(), 'nc-proj-owned-'));
+    writeFileSync(join(oskill, 'SKILL.md'), OWNED_SKILL);
+    mkdirSync(join(oroot, 'src/channels'), { recursive: true });
+    writeFileSync(join(oroot, 'src/channels/demo-adapter.ts'), LIVE_CUSTOM_ADAPTER); // present, diverged
+    writeFileSync(join(oroot, 'src/channels/demo-formatting.md'), SHARED_FORMATTING_DOC); // present, identical
+    // demo-registration.test.ts deliberately absent — the fresh-install case
+    writeFileSync(join(oroot, '.env'), '');
+    writeFileSync(join(oroot, 'package.json'), '{"name":"scratch"}');
+  });
+
+  it('refuses the diverged file, no-ops the identical one, and still installs the missing one', async () => {
+    const cmds: string[] = [];
+    const res = await applySkill(oskill, oroot, { exec: ownedByForkExec(cmds), resolveRemote: () => 'origin' });
+
+    // diverged: left untouched, bounced with the specific reason (not the
+    // generic "engine could not apply" wrapper) — no --force in the message.
+    expect(readFileSync(join(oroot, 'src/channels/demo-adapter.ts'), 'utf8')).toBe(LIVE_CUSTOM_ADAPTER);
+    expect(res.agentTasks).toHaveLength(1);
+    expect(res.agentTasks[0].reason).toContain('src/channels/demo-adapter.ts');
+    expect(res.agentTasks[0].reason).toContain('already installed and customized');
+    expect(res.agentTasks[0].reason).toContain('force');
+    expect(res.agentTasks[0].reason).not.toContain('engine could not apply');
+
+    // missing: still installed fresh in THIS SAME apply() call, despite the
+    // sibling refusal ordered before it in the directive body.
+    expect(readFileSync(join(oroot, 'src/channels/demo-registration.test.ts'), 'utf8')).toBe(FRESH_REGISTRATION_TEST);
+    expect(res.journal).toContainEqual({ op: 'wrote', path: 'src/channels/demo-registration.test.ts' });
+
+    // identical: untouched and not journaled — a true no-op.
+    expect(readFileSync(join(oroot, 'src/channels/demo-formatting.md'), 'utf8')).toBe(SHARED_FORMATTING_DOC);
+    expect(res.journal.some((e) => e.op === 'wrote' && e.path === 'src/channels/demo-formatting.md')).toBe(false);
+
+    // content is captured and written via writeFileSync, never shell-redirected
+    // (a `git show` failure on one of these three paths could never truncate
+    // a sibling's live file).
+    expect(cmds.some((c) => c.includes(' > '))).toBe(false);
+  });
+
+  it('is idempotent: once the fresh file is installed, every dest is present so the whole directive goes quiet (skip) — the diverged file is never re-touched', async () => {
+    const first = await applySkill(oskill, oroot, { exec: ownedByForkExec([]), resolveRemote: () => 'origin' });
+    expect(first.journal.length).toBeGreaterThan(0); // sanity: the first run actually wrote the fresh file
+    const second = await applySkill(oskill, oroot, { exec: ownedByForkExec([]), resolveRemote: () => 'origin' });
+    // all three dests now exist ⇒ selfStatus reports skip for the whole
+    // directive — applyOne never runs again, so the engine doesn't even
+    // re-inspect (let alone re-flag or touch) the still-diverged adapter.
+    expect(second.agentTasks).toEqual([]);
+    expect(second.journal).toEqual([]);
+    expect(fullyApplied(second)).toBe(true);
+    expect(readFileSync(join(oroot, 'src/channels/demo-adapter.ts'), 'utf8')).toBe(LIVE_CUSTOM_ADAPTER);
+  });
+
+  it('force:true overwrites the diverged file with the branch version', async () => {
+    const res = await applySkill(oskill, oroot, {
+      exec: ownedByForkExec([]),
+      resolveRemote: () => 'origin',
+      force: true,
+    });
+    expect(readFileSync(join(oroot, 'src/channels/demo-adapter.ts'), 'utf8')).toBe(STALE_BRANCH_ADAPTER);
+    expect(res.agentTasks).toEqual([]);
+    expect(fullyApplied(res)).toBe(true);
+    expect(res.journal).toContainEqual({ op: 'wrote', path: 'src/channels/demo-adapter.ts' });
+  });
+
+  it('plan says apply (not a blind skip) while any dest is missing, and skip once everything is present', () => {
+    const before = planSkill(oskill, oroot);
+    expect(before.steps[0].status).toBe('apply');
+    expect(before.steps[0].detail).toContain('refused');
+    // simulate: the missing file got installed, nothing else changed
+    writeFileSync(join(oroot, 'src/channels/demo-registration.test.ts'), FRESH_REGISTRATION_TEST);
+    const after = planSkill(oskill, oroot);
+    expect(after.steps[0].status).toBe('skip'); // all dests present ⇒ leave it alone entirely
+  });
+});
+
 // json-merge: push a body object into an array-of-objects JSON file, keyed.
 const JSON_MERGE_SKILL = `# json-merge demo
 

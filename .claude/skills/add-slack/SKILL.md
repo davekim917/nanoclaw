@@ -17,11 +17,17 @@ safe to re-run; anything a parser can't apply falls back to the prose beside it.
 
 ### 1. Copy the adapter, registration test, and formatting skill
 
-Fetch the `channels` branch and copy the Slack adapter, its registration test,
-and the formatting container skill into place (overwrite — the branch is
-canonical):
+Fetch the `channels` branch and copy in anything genuinely missing. This
+fork's Slack adapter has diverged far past that branch — multi-workspace
+`SLACK_BOT_TOKEN_<SUFFIX>` parsing, inbound/outbound mention resolution,
+missed-message recovery, permalinks — so the branch is a fallback for a file
+that was never installed here, not a source of truth to replay over a live
+one (#250). `owned-by-fork` tells the engine to compare each destination
+against the branch first: a file already present and different from the
+branch is left alone — refused, not overwritten; only a genuinely missing
+file is copied in:
 
-```nc:copy from-branch:channels
+```nc:copy from-branch:channels owned-by-fork
 src/channels/slack.ts
 src/channels/slack-registration.test.ts
 container/skills/slack-formatting/SKILL.md
@@ -207,3 +213,5 @@ this channel with `/init-first-agent` (or `/manage-channels`).
 **The greeting arrives but your replies vanish.** Sending works with just the bot token; *receiving* needs the event path. Socket Mode: the toggle on, `SLACK_APP_TOKEN` set with `connections:write`, and the bot events (`message.im`, `message.channels`, `message.groups`, `app_mention`) subscribed. Webhook: the Request URL must have passed Slack's challenge and the same events subscribed. Either way, App Home's Messages Tab must be enabled or Slack refuses DMs to the app.
 
 **Adapter registered but Slack never connects.** Run `pnpm exec vitest run src/channels/slack-registration.test.ts` — red means the barrel import or the `@chat-adapter/slack` install drifted, so re-run the Apply steps. If green, restart the service (`bash setup/lib/restart.sh`) so it picks up the adapter and tokens, then check `logs/nanoclaw.error.log`.
+
+**Step 1 reports a file "already installed and customized — refusing to overwrite."** Working as intended (#250): the `owned-by-fork` copy compares each destination against the `channels` branch before touching it, and a file that has drifted from the branch is left alone rather than downgraded. Don't force past this without checking — the branch is a stale April snapshot, so a refusal almost always means the live file is *more* current, not less. Only pass `force` (`ApplyOptions.force` / the driver's `--force`) after confirming with the operator that replacing the live file with the branch version is actually wanted.

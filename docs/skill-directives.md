@@ -34,9 +34,11 @@ Two invariants follow, and both are non-negotiable:
 
 Every directive is idempotent — apply is safe to re-run, per the skills model.
 
-### `copy [from-branch:<b>]`
+### `copy [from-branch:<b>] [owned-by-fork]`
 
-Body: one path per line — `PATH` (source == destination) or `SRC -> DST`. Copies the file in; with `from-branch:` the source is fetched from a registry branch (`git show origin/<b>:<path>`). **Idempotency: skip when every destination is present; when any is missing, all listed files are (re)copied — copying overwrites.**
+Body: one path per line — `PATH` (source == destination) or `SRC -> DST`. Copies the file in; with `from-branch:` the source is fetched from a registry branch (`git show origin/<b>:<path>`). **Idempotency: skip when every destination is present; when any is missing, the missing ones (re)copy.**
+
+By default a `from-branch:` copy treats the branch as canonical: a present destination is overwritten just like a missing one. `owned-by-fork` (from-branch only — a lint error otherwise) flips that for a destination this fork customizes beyond the branch (e.g. Slack/Discord's adapters — #250): a missing dest still copies fresh, but a present dest is compared to the branch byte-for-byte first — identical is a no-op, and a diverged file is **refused** (bounced to an agent with the specific file(s), never silently overwritten) instead of replayed. `ApplyOptions.force` overrides the refusal for a deliberate reset to the branch version. Content is always captured via `exec` and written with `writeFileSync`, never a shell redirect, so a branch path that doesn't exist can never truncate a live file.
 
 ### `append to:<file> [at:<marker>]`
 

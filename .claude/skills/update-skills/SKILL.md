@@ -116,6 +116,18 @@ removed behavior has a proven compatible replacement and targeted
 verification. Generic build and full-suite success do not replace this
 comparison.
 
+**A copy directive marked `owned-by-fork`** (Slack's and Discord's adapter
+files, as of #250 — check the fence itself, `nc:copy from-branch:<b>
+owned-by-fork`) is mechanically protected: the apply engine compares each
+destination against the branch itself and refuses to overwrite one that has
+diverged, regardless of this audit. Treat that engine refusal the same as a
+manual `BLOCK` — a resolved preservation result, not evidence the live
+adapter is stale — and don't pass `force` to push past it without confirming
+with the operator first. The manual diff above is still worth doing for these
+skills (it's how you'd notice the branch gained something worth porting by
+hand), it just isn't the only thing standing between the candidate and a
+downgrade.
+
 # Step 4: Re-apply each cleared skill
 
 For each selected skill (process one at a time):
