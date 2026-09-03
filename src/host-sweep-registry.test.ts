@@ -287,7 +287,7 @@ import { log } from './log.js';
 // other family this registry tracks.
 import './modules/sweep-scheduled-move/index.js';
 import { SessionDbMissingError, SessionDbUnopenableError } from './modules/mailbox/index.js';
-import { _mailboxSessionDepthForTesting } from './modules/mailbox/session.js';
+import { _mailboxSessionDepthForTesting } from './host-sweep-depth-probe.js';
 // S2-PR3 moved S12/S13 (idle-task-reap, idle-chat-reap) out of host-sweep.ts
 // into this module, which registers itself via `registerSweepDutySource` at
 // import — a default (builtins-restoring) `_resetSweepRegistryForTesting()`
