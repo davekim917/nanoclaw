@@ -177,6 +177,15 @@ vi.mock('../../container-runner.js', async (importOriginal) => {
   return {
     ...real,
     isContainerRunning: (...args: unknown[]) => mockIsContainerRunning(...args),
+    // `containerOwnsOutbound` moved from host-sweep.ts into container-runner.ts
+    // (it now has a second caller, thread-close's finalizer). Composed here from
+    // the MOCKED running check plus the real spawning one, which is exactly what
+    // the host-sweep-local version did under this mock — spreading `...real`
+    // alone would silently bypass `mockIsContainerRunning`. Same composition
+    // src/host-sweep.test.ts already uses; this suite was written against the
+    // older base where the helper was local to host-sweep.ts.
+    containerOwnsOutbound: (sessionId: string) =>
+      Boolean(mockIsContainerRunning(sessionId)) || real.isContainerSpawning(sessionId),
     hasContainerEverRun: (...args: unknown[]) => mockHasContainerEverRun(...args),
     wakeContainer: (...args: unknown[]) => mockWakeContainer(...args),
     killContainer: (...args: unknown[]) => mockKillContainer(...args),
