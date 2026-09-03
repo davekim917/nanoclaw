@@ -209,6 +209,16 @@ vi.mock('./db/connection.js', () => ({
   }),
 }));
 
+// Family modules self-register their duties at import (plan.md §4.7 step 1),
+// once, when this file's module graph first loads. `_resetSweepRegistryForTesting()`
+// (default `builtins: true`) clears the registry and rebuilds only the duties
+// still inline in `registerBuiltInSweepDuties()`, so every bare-default reset
+// call below is followed by `registerSweepRepoFenceDuties()` to restore this
+// family's two — otherwise R-7's 39/38 inventory assertion (and any other
+// case that drives a full tick after the file's first reset) silently loses
+// T5 and T22. The underlying bodies stay mocked above (`./repo-fence-recovery.js`,
+// `./modules/approvals/index.js`).
+import { registerSweepRepoFenceDuties } from './modules/sweep-repo-fence/index.js';
 import { registerAgentMailbox, resetAgentMailboxForTesting } from './mailbox/index.js';
 import {
   SWEEP_DUTY_INVENTORY,
@@ -363,6 +373,7 @@ describe('sweep duty registry (S2-PR2)', () => {
 
   afterEach(() => {
     _resetSweepRegistryForTesting();
+    registerSweepRepoFenceDuties();
     _setSweepYieldForTesting(null);
     vi.restoreAllMocks();
   });
@@ -1110,6 +1121,7 @@ describe('sweep duty registry (S2-PR2)', () => {
 
       // A due row sooner than the cap shortens the skip.
       _resetSweepRegistryForTesting();
+      registerSweepRepoFenceDuties();
       const soon = new Date(Date.now() + 5_000).toISOString();
       h.mailbox = fakeMailbox({ getNextFutureProcessAfter: () => soon });
       const nudged = fakeSession('sess-quiet-due', { last_active: '2026-04-20T13:00:00.000Z' });
@@ -1337,6 +1349,7 @@ describe('sweep duty registry (S2-PR2)', () => {
 
     // A quiet session opens ZERO — the bound the whole cache exists for.
     _resetSweepRegistryForTesting();
+    registerSweepRepoFenceDuties();
     h.selfHeal = false;
     h.heartbeatFile = path.join(h.dataDir, 'no-such-heartbeat');
     h.mailbox = fakeMailbox();
