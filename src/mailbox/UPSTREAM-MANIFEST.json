@@ -1,0 +1,31 @@
+{
+  "upstream": "5c3082a1",
+  "files": {
+    "container/agent-runner/src/db/container-state.ts": "551bed7b9ac4039c28e6d218ffe81dbb512ac709b27b6e733dd6ea23c72d832b",
+    "container/agent-runner/src/heartbeat.ts": "0af906120acbba6a0615f0b39276ae7a187404d17d2ea55a101f9f89e2dd049b",
+    "container/agent-runner/src/mailbox/index.ts": "d8568702a9b5a287f75a4dd9821deccba44c14b534f92a669ba313ba9c59dde3",
+    "container/agent-runner/src/mailbox/model.generated.ts": "f23a848fd794001aec5d10fe05f699b20cf93f2e756f23a498c1654441be159e",
+    "container/agent-runner/src/mailbox/registry.test.ts": "ddb6ae7549d2c9a113c11c888af7c14c58fd8be547e36a14862b5f2b97578335",
+    "container/agent-runner/src/mailbox/sqlite/connection.ts": "31c899bf05fa4eaf67bd96e39715c589c6420f132f5a4b06ecd3f067a37cbc17",
+    "container/agent-runner/src/mailbox/sqlite/index.ts": "fff275870f80edfd069ad44ec509df81d5d9e8f10bd56bdfc0a3a3dcfb07561d",
+    "container/agent-runner/src/mailbox/sqlite/operations.ts": "1897b356ce62692b993a019ef807b240c7b5dc4182452d496093815f8f5bdc17",
+    "container/agent-runner/src/mailbox/sqlite/sqlite.test.ts": "61e226aa8ed73b14269536cfedbc712a339c5d6d58358fed2a6fb908723b0d5b",
+    "container/agent-runner/src/mailbox/types.ts": "23d21570401d49ebf0e4f7adec85218444475ee879a5437fb510a2a76b68860f",
+    "container/agent-runner/src/modules/index.ts": "1cbb0245332efe0f76bdf0778b451eee0386ab881f22ce0db0c8b41e2a0b3e4c",
+    "docs/agent-mailbox-seam-migration.md": "5320304b4277812e874bb0f02813d0c55d6e57f640e8515e3ba67ad72dc54ee4",
+    "src/mailbox/index.ts": "17ae8da9c7b266144485f09c7e0095520901afc435717c986840ccfb8840c9a3",
+    "src/mailbox/model.test.ts": "ea459e8e5ea26ba0a009b53d315fcabfd2e314af393b3ed323232942799785ab",
+    "src/mailbox/model.ts": "f23a848fd794001aec5d10fe05f699b20cf93f2e756f23a498c1654441be159e",
+    "src/mailbox/registry.test.ts": "79e362b60b0d1b74f760d65934f13f0ed25bed07ecfb42504afe5fa4fc5d8ce3",
+    "src/mailbox/sqlite/arm-next-task.test.ts": "64bfd93cdce22ff0ef109ab6c0951adea5ec9db5f0b7f5c6fee6a1313a6c6a6b",
+    "src/mailbox/sqlite/index.ts": "2c0abfdd3ad7f0c13a10d291a7d56a71631bf9efda882f9c92dc71cdcddbeea0",
+    "src/mailbox/sqlite/paths.ts": "42f2c772908b81611f0a9c964afcc03ce56090591b333069e73e609c042805ab",
+    "src/mailbox/sqlite/schema.ts": "3062faf2cb56c33bec84420eea2a4bbe786e651773fc37e74669b136ad6f859d",
+    "src/mailbox/sqlite/session-db.test.ts": "6e809959b30ca0d24bb50cc5a2e8c0561d2c75fc72a87e4c6e859e09adc2b8e9",
+    "src/mailbox/sqlite/session-db.ts": "67157872c856d08de3ce8be1d0b99ad56a3882cf44a8cda27ddb897ae4f5241a",
+    "src/mailbox/sqlite/sqlite.test.ts": "981fe929e0968443315666ceaa778945207cb9c8ec5db3aa5ddc86d97b3fefbf",
+    "src/mailbox/sqlite/tasks.test.ts": "b382adcc0bcf57e9b2d311e8bedb2edf6d638818e54057df4f481e6056dcbc9a",
+    "src/mailbox/sqlite/tasks.ts": "3309ea5c0ae33af72e95bb4e77145b75916c9416cd31cd81ccbe604079b5d0e9",
+    "src/mailbox/types.ts": "49c4db08d0b1bfccf4620d587952ccef83b6e0fcea84b285aebd47ba44251215"
+  }
+}
