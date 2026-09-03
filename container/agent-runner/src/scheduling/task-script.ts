@@ -10,10 +10,14 @@ import { buildSecretEnvVarList, MCP_HEADER_ONLY_SECRET_VARS } from '../providers
 // killed a working 56s watcher script eight times in a row on 2026-08-22,
 // which auto-paused the series and left the board blind for ~6h the day
 // before a release. A script that truly hangs still dies here — just later.
-const SCRIPT_TIMEOUT_MS = (() => {
+// Read per call, not once at module load: the value is fixed for the life of a
+// container in production (the env is set at spawn), so this changes nothing
+// there — but it lets the seam test drive a real timeout through
+// applyPreTaskScripts instead of waiting out the full ceiling.
+function scriptTimeoutMs(): number {
   const parsed = Number.parseInt(process.env.NANOCLAW_TASK_SCRIPT_TIMEOUT_MS ?? '', 10);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : 120_000;
-})();
+}
 const SCRIPT_MAX_BUFFER = 1024 * 1024;
 
 export interface ScriptResult {
@@ -110,7 +114,11 @@ function scriptEnv(): NodeJS.ProcessEnv {
   return env;
 }
 
-export async function runScript(script: string, taskId: string): Promise<ScriptResult | null> {
+export async function runScript(
+  script: string,
+  taskId: string,
+  timeoutMs: number = scriptTimeoutMs(),
+): Promise<ScriptResult | null> {
   const scriptPath = path.join('/tmp', `task-script-${taskId}.sh`);
   fs.writeFileSync(scriptPath, script, { mode: 0o755 });
 
@@ -118,7 +126,7 @@ export async function runScript(script: string, taskId: string): Promise<ScriptR
     execFile(
       'bash',
       [scriptPath],
-      { timeout: SCRIPT_TIMEOUT_MS, maxBuffer: SCRIPT_MAX_BUFFER, env: scriptEnv() },
+      { timeout: timeoutMs, maxBuffer: SCRIPT_MAX_BUFFER, env: scriptEnv() },
       (error, stdout, stderr) => {
         try {
           fs.unlinkSync(scriptPath);
@@ -131,7 +139,22 @@ export async function runScript(script: string, taskId: string): Promise<ScriptR
         }
 
         if (error) {
-          log(`[${taskId}] error: ${error.message}`);
+          // execFile kills on timeout, so a script that ran too long arrives
+          // here as a generic "Command failed: bash /tmp/task-script-<id>.sh"
+          // — the same string a script that exited non-zero on its first line
+          // produces. `killed` is the only thing that separates them.
+          //
+          // This matters more here than upstream: a timeout acks as reason
+          // 'error', and eight consecutive 'error' acks auto-pause the whole
+          // series (recurrence.ts SCRIPT_FAIL_PAUSE_CAP). An operator reading
+          // "error: Command failed" goes hunting for a bug in a script that is
+          // merely slow, when the fix is NANOCLAW_TASK_SCRIPT_TIMEOUT_MS. Name
+          // the timeout and the ceiling it hit.
+          if ((error as { killed?: boolean }).killed) {
+            log(`[${taskId}] timed out after ${timeoutMs}ms and was killed; output discarded — raise NANOCLAW_TASK_SCRIPT_TIMEOUT_MS if the script is legitimately this slow`);
+          } else {
+            log(`[${taskId}] error: ${error.message}`);
+          }
           return resolve(null);
         }
 
@@ -230,7 +253,7 @@ export async function applyPreTaskScripts(messages: MessageInRow[]): Promise<Tas
 
     if (!result || !result.wakeAgent) {
       const reason: ScriptSkipReason = result ? 'gated' : 'error';
-      log(`task ${msg.id} skipped: ${reason === 'gated' ? 'wakeAgent=false' : 'script error/no output'}`);
+      log(`task ${msg.id} skipped: ${reason === 'gated' ? 'wakeAgent=false' : 'script error, timeout, or no output'}`);
       skipped.push({ id: msg.id, reason });
       continue;
     }
