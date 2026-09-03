@@ -19,11 +19,15 @@ import {
   initTestSessionDb as upstreamInitTestSessionDb,
 } from '../../mailbox/sqlite/connection.js';
 import { ensureNanoclawInboundTestSchema, ensureNanoclawOutboundSchema } from './schema.js';
+import { clearTickRepositoryBarrier } from './selection.js';
 import { setMailboxTestMode } from './index.js';
 
 /** For tests — creates in-memory DBs with the session schemas. */
 export function initTestSessionDb(): { inbound: Database; outbound: Database } {
   setMailboxTestMode(true);
+  // A fresh session DB starts a fresh poll tick — never inherit the previous
+  // test's memoized fence token.
+  clearTickRepositoryBarrier();
   const { inbound, outbound } = upstreamInitTestSessionDb();
   ensureNanoclawInboundTestSchema(inbound);
   ensureNanoclawOutboundSchema(outbound);

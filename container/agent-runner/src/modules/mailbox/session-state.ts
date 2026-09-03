@@ -47,6 +47,11 @@ export function acknowledgeRepositoryMountBarrier(epoch: string): void {
   setValue(REPOSITORY_MOUNT_BARRIER_ACK_KEY, epoch);
 }
 
+/** The token this session last acknowledged — lets the gate skip a duplicate write. */
+export function getRepositoryMountBarrierAck(): string | null {
+  return getValue(REPOSITORY_MOUNT_BARRIER_ACK_KEY) ?? null;
+}
+
 /**
  * Monotonic provider-context identity used by host-side recall deduplication.
  * This reuses session_state rather than introducing a second lifecycle store.
