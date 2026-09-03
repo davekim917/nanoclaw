@@ -30,6 +30,7 @@ import {
   killContainer,
   sessionStillActive,
   wakeContainer,
+  containerOwnsOutbound,
 } from '../../container-runner.js';
 import { log } from '../../log.js';
 import type { Session } from '../../types.js';
@@ -536,14 +537,23 @@ async function enforceRunningContainerSla(ctx: SweepSessionContext): Promise<voi
     // The follow-ups run AFTER the kill, in a session opened only then, to
     // honor the outbound.db single-writer invariant; the module opens the
     // writable outbound handle lazily, only for the notice write.
-    await ctx.runIn('session:health:post-kill', (mailbox) =>
-      runSweepKillFollowUps(ctx, decision, mailbox, {
+    await ctx.runIn('session:health:post-kill', (mailbox) => {
+      // The kill above is a yield boundary: this window opened after it, and a
+      // replacement wake landing in the gap owns outbound.db. Guarding HERE
+      // rather than inside each follow-up covers every registered one at once
+      // (mailbox seam PR 5 round 8, 3b6cbb5f, which had to guard its two write
+      // sites individually). Skipping costs one restart notice and defers the
+      // orphan-claim clear to the next tick, both idempotent; writing anyway
+      // would delete the FRESH runner's claim and defer an input it is already
+      // processing — duplicate execution.
+      if (containerOwnsOutbound(session.id)) return;
+      return runSweepKillFollowUps(ctx, decision, mailbox, {
         reason: 'absolute-ceiling',
         containerState,
         pendingClaims,
         workContinuation,
-      }),
-    );
+      });
+    });
     return;
   }
 
@@ -554,14 +564,16 @@ async function enforceRunningContainerSla(ctx: SweepSessionContext): Promise<voi
     toleranceMs: decision.toleranceMs,
   });
   killContainer(session.id, 'claim-stuck');
-  await ctx.runIn('session:health:post-kill', (mailbox) =>
-    runSweepKillFollowUps(ctx, decision, mailbox, {
+  await ctx.runIn('session:health:post-kill', (mailbox) => {
+    // Same yield boundary as the ceiling branch above.
+    if (containerOwnsOutbound(session.id)) return;
+    return runSweepKillFollowUps(ctx, decision, mailbox, {
       reason: 'claim-stuck',
       containerState,
       pendingClaims,
       workContinuation,
-    }),
-  );
+    });
+  });
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

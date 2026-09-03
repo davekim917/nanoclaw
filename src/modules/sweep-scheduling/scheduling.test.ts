@@ -151,33 +151,29 @@ vi.mock('../../session-manager.js', async (importOriginal) => {
 
 /**
  * Round 3 (6f131298) moved `forceClearWorkContinuation` off the inbound-keyed
- * `withExistingMailboxSession` onto this outbound-keyed funnel. The fake
- * outbound handle is opaque here — `clearWorkContinuation`/
- * `readContinuationPresence` below are what actually get called with it, and
- * neither reads it — so `withExistingNanoclawOutbound` only needs to invoke
- * the action; it is what records `clear` in the order F-11.4 asserts.
+ * `withExistingMailboxSession` onto the outbound-keyed
+ * `withExistingNanoclawOutbound`, and round 4 (c00708ba) made that funnel yield
+ * a typed `NanoclawOutboundSession` — so the force-clear is now
+ * `outbound.clearWorkContinuation()`, a METHOD on the yielded session rather
+ * than a module-level export. The fake session below is what records `clear`
+ * in the order F-11.4 asserts; nothing else reads it.
  */
-vi.mock('../mailbox/session.js', async (importOriginal) => {
-  const real = await importOriginal<typeof import('../mailbox/session.js')>();
+vi.mock('../mailbox/index.js', async (importOriginal) => {
+  const real = await importOriginal<typeof import('../mailbox/index.js')>();
   return {
     ...real,
     withExistingNanoclawOutbound: async <T>(
       _agentGroupId: string,
       _sessionId: string,
       action: (outbound: unknown) => T | Promise<T>,
-    ): Promise<T> => action({}),
-  };
-});
-
-vi.mock('../mailbox/index.js', async (importOriginal) => {
-  const real = await importOriginal<typeof import('../mailbox/index.js')>();
-  return {
-    ...real,
-    clearWorkContinuation: () => {
-      calls.order.push('clear');
-      return null;
-    },
-    readContinuationPresence: () => null,
+    ): Promise<T> =>
+      action({
+        clearWorkContinuation: () => {
+          calls.order.push('clear');
+          return null;
+        },
+        readContinuationPresence: () => null,
+      }),
   };
 });
 
@@ -211,7 +207,8 @@ vi.mock('../orchestrator-dispatch/db/tasks.js', async (importOriginal) => {
 
 import { CLOSE_CONFIRM_WINDOW_MS } from '../../dashboard/thread-close.js';
 import { closeDb, createAgentGroup, getDb, initTestDb, runMigrations } from '../../db/index.js';
-import { ensureSchema, openInboundDb } from '../../db/session-db.js';
+import { openInboundDb } from '../mailbox/openers.js';
+import { ensureSchema } from '../mailbox/schema.js';
 import { SWEEP_DUTY_INVENTORY, _listSweepRegistrationsForTesting } from '../../host-sweep.js';
 import { composeNanoclawSession } from '../mailbox/index.js';
 import { insertTaskRow } from '../scheduling/db.js';
@@ -238,8 +235,9 @@ function freshInbound(): Database.Database {
   fs.mkdirSync(dir, { recursive: true });
   const dbPath = path.join(dir, 'inbound.db');
   ensureSchema(dbPath, 'inbound');
-  openInbound = openInboundDb(dbPath);
-  return openInbound;
+  const db = openInboundDb(dbPath);
+  openInbound = db;
+  return db;
 }
 
 /**

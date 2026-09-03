@@ -18,7 +18,6 @@
  * so all four run inside the window the driver already holds — `ctx.mailbox`
  * is that window's session.
  */
-import { isContainerRunning } from '../../container-runner.js';
 import {
   SWEEP_DUTY_INVENTORY,
   asSessionContext,
@@ -26,6 +25,7 @@ import {
   registerSweepDutySource,
   registerSweepKillFollowUp,
 } from '../../host-sweep.js';
+import { containerOwnsOutbound } from '../../container-runner.js';
 import { log } from '../../log.js';
 import { deferMessageForFreshContextRetry } from '../../session-manager.js';
 import type { Session } from '../../types.js';
@@ -163,7 +163,9 @@ export function registerSessionCoreSweepDuties(): void {
     // replaces that recall from current host state.
     run: (ctx) => {
       const { session, mailbox } = asSessionContext(ctx);
-      if (!isContainerRunning(session.id) && mailbox!.getProcessingClaimRows().length > 0) {
+      // Ownership, not just liveness: a container still SPAWNING is about to
+      // own outbound.db, and this reset writes it (mailbox seam PR 5, 7199be48).
+      if (!containerOwnsOutbound(session.id) && mailbox!.getProcessingClaimRows().length > 0) {
         resetStuckProcessingRows(mailbox!, session, 'container not running');
       }
     },
@@ -178,7 +180,17 @@ export function registerSessionCoreSweepDuties(): void {
     // again, and already-cleared claim sets are a no-op.
     run: (ctx) => {
       const { session, mailbox, alive, hasOutbound } = asSessionContext(ctx);
-      if (!alive && hasOutbound) resetStuckProcessingRows(mailbox!, session, 'container not running');
+      // `alive` is sampled in W1, BEFORE this tail window opened, so it cannot
+      // authorize a write to outbound.db ON ITS OWN — re-checked here,
+      // immediately before the reset, with no await in between (7199be48).
+      // Both conditions, not just the fresh one: `alive` stays the phase
+      // decision this duty has always made (a live container clears its own
+      // claims), and the ownership check is the added TOCTOU close. PR 5
+      // replaced `alive` outright because there it was a local; here it is part
+      // of the session-context contract other duties read.
+      if (!alive && hasOutbound && !containerOwnsOutbound(session.id)) {
+        resetStuckProcessingRows(mailbox!, session, 'container not running');
+      }
     },
   });
 

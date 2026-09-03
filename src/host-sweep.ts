@@ -1151,19 +1151,6 @@ async function sweepSession(session: Session, tick: SweepTickContext): Promise<n
   }
 }
 
-/**
- * Test-only entry point for the stopped-container recovery admission — the
- * TOCTOU site: the container-state check must happen INSIDE the session, after
- * the open and immediately before the mutation.
- */
-export function _incrementStoppedContinuationAttemptForTesting(
-  session: Session,
-  expectedId: string,
-): Promise<HostWorkContinuation | null> {
-  const run: SessionRunner = (action) => withExistingMailboxSession(session.agent_group_id, session.id, action);
-  return incrementStoppedContinuationAttempt(run, session, expectedId);
-}
-
 /** Test-only entry point for one session's sweep tick, over a one-session tick context. */
 export function _sweepSessionForTesting(session: Session): Promise<number | null> {
   let sessions: Session[] | undefined;

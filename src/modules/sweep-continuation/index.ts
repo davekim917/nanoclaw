@@ -38,9 +38,11 @@ import {
   isContainerRunning,
   sessionStillActive,
   wakeContainer,
+  containerOwnsOutbound,
 } from '../../container-runner.js';
 import { syncDoneProposalMirror } from '../../dashboard/thread-close.js';
 import { log } from '../../log.js';
+import { withExistingMailboxSession } from '../../session-manager.js';
 import type { Session } from '../../types.js';
 import { type ForkContainerStateRow as ContainerState, type NanoclawMailboxSession } from '../mailbox/index.js';
 import {
@@ -153,6 +155,24 @@ async function incrementStoppedContinuationAttempt(
     log.warn('Failed to increment continuation recovery attempt', { sessionId: session.id, err });
     return null;
   }
+}
+
+/**
+ * Test-only entry point for the stopped-container recovery admission — the
+ * TOCTOU site: the container-state check must happen INSIDE the session, after
+ * the open and immediately before the mutation.
+ *
+ * Lives here rather than in host-sweep.ts because S2-PR13 moved
+ * `incrementStoppedContinuationAttempt` into this family; the shim travels with
+ * its body, exactly as S2-PR10's SLA entry point did. Its signature and the
+ * cases that call it are unchanged.
+ */
+export function _incrementStoppedContinuationAttemptForTesting(
+  session: Session,
+  expectedId: string,
+): Promise<HostWorkContinuation | null> {
+  const run: SessionRunner = (action) => withExistingMailboxSession(session.agent_group_id, session.id, action);
+  return incrementStoppedContinuationAttempt(run, session, expectedId);
 }
 
 async function restoreStoppedContinuationAttempt(
@@ -470,7 +490,9 @@ export function registerContinuationSweepDuties(): void {
     run: (ctx) => {
       const { session, mailbox, plan } = asSessionContext(ctx);
       if (
-        !isContainerRunning(session.id) &&
+        // Ownership, not liveness: both writes below land in outbound.db, and a
+        // container still spawning is about to own it (mailbox seam PR 5, 7199be48).
+        !containerOwnsOutbound(session.id) &&
         plan.workContinuation &&
         plan.workContinuation.resume_attempts >= WORK_CONTINUATION_RESUME_MAX_ATTEMPTS
       ) {
@@ -495,7 +517,8 @@ export function registerContinuationSweepDuties(): void {
     run: (ctx) => {
       const { session, mailbox, plan } = asSessionContext(ctx);
       plan.continuationWakeEligible =
-        !isContainerRunning(session.id) &&
+        // Gates S9b's attempt increment, which writes outbound.db (7199be48).
+        !containerOwnsOutbound(session.id) &&
         plan.workContinuation !== null &&
         canAttemptContinuationRecovery(plan.workContinuation) &&
         decideContinuationWake({

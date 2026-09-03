@@ -24,7 +24,6 @@ import {
   SPAWN_GRACE_MS,
   _resetSweepRegistryForTesting,
   registerSweepKillFollowUp,
-  _incrementStoppedContinuationAttemptForTesting,
   _sweepSessionForTesting,
   parseSqliteUtc,
 } from './host-sweep.js';
@@ -42,6 +41,9 @@ import { _enforceRunningContainerSlaForTesting } from './modules/sweep-container
 // cases stay on this file's fixture and reach across for the moved body, the
 // same way the SLA cases above do.
 import { sweepUsageRollup as _sweepUsageRollupForTesting } from './modules/sweep-usage/index.js';
+// The TOCTOU entry point moved with `incrementStoppedContinuationAttempt` into
+// the continuation family (S2-PR13); the case below is unchanged.
+import { _incrementStoppedContinuationAttemptForTesting } from './modules/sweep-continuation/index.js';
 // The error-rule case below drives a THROW through the due-admission duty
 // (S5), which now lives in the scheduling family module (S2-PR11) — importing
 // it registers that duty so the case keeps its original vehicle.
