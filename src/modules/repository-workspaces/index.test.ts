@@ -18,7 +18,7 @@ const hostActionMocks = vi.hoisted(() => ({
   getAgentGroup: vi.fn(),
   getAllAgentGroups: vi.fn(),
   getSessionsByAgentGroup: vi.fn(),
-  openOutboundDb: vi.fn(),
+  readSessionOutbound: vi.fn(),
   quiesceSessionsForRepositoryMounts: vi.fn(),
   releaseRepositoryMountQuiescence: vi.fn(),
   wakeRepositoryMountSessions: vi.fn(),
@@ -55,9 +55,17 @@ vi.mock('../../session-manager.js', async () => {
   const actual = await vi.importActual<typeof import('../../session-manager.js')>('../../session-manager.js');
   return {
     ...actual,
-    openOutboundDb: hostActionMocks.openOutboundDb,
     writeSessionMessageIfNew: hostActionMocks.writeSessionMessageIfNew,
   };
+});
+
+// The quiescence probe reads the source sessions' outbound state through the
+// mailbox module's read-only seam (PR 6). Mocked at the seam rather than at a
+// raw opener: these fixtures have no outbound.db on disk, and the real seam
+// answers `undefined` for that, which the probe treats as ACTIVE (fail-closed).
+vi.mock('../mailbox/read-only.js', async () => {
+  const actual = await vi.importActual<typeof import('../mailbox/read-only.js')>('../mailbox/read-only.js');
+  return { ...actual, readSessionOutbound: hostActionMocks.readSessionOutbound };
 });
 
 import {
@@ -117,7 +125,7 @@ beforeEach(() => {
   hostActionMocks.getAgentGroup.mockReset();
   hostActionMocks.getAllAgentGroups.mockReset();
   hostActionMocks.getSessionsByAgentGroup.mockReset();
-  hostActionMocks.openOutboundDb.mockReset();
+  hostActionMocks.readSessionOutbound.mockReset();
   hostActionMocks.quiesceSessionsForRepositoryMounts.mockReset();
   hostActionMocks.releaseRepositoryMountQuiescence.mockReset();
   hostActionMocks.wakeRepositoryMountSessions.mockReset();
@@ -127,10 +135,15 @@ beforeEach(() => {
   root = fs.mkdtempSync(path.join(os.tmpdir(), 'repository-actions-'));
   process.env.NANOCLAW_REPOSITORY_ALLOW_LOCAL_ORIGIN = '1';
   seedRemote();
-  hostActionMocks.openOutboundDb.mockReturnValue({
-    prepare: () => ({ all: () => [], get: () => undefined }),
-    close: () => {},
-  });
+  // Default: a readable, fully quiescent session. The real callback still runs,
+  // so the probe's own derivation stays under test.
+  hostActionMocks.readSessionOutbound.mockImplementation((_location: unknown, action: (m: unknown) => unknown) =>
+    action({
+      getProcessingClaimRows: () => [],
+      getContainerState: () => null,
+      hasWorkContinuation: () => false,
+    }),
+  );
 });
 
 afterEach(() => {
