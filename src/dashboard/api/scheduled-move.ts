@@ -181,6 +181,7 @@ interface SourceLiveRow {
   id: string;
   status: string;
   process_after: string | null;
+  scheduled_for: string | null;
   recurrence: string | null;
   content: string;
   platform_id: string | null;
@@ -218,10 +219,24 @@ function readSourceLiveRow(
   try {
     db = new Database(inboundPath, { readonly: true });
     db.pragma('busy_timeout = 1000');
+    // `scheduled_for` is added lazily, by the first WRITABLE open of a given
+    // session. This handle is deliberately read-only, so on an upgraded
+    // install it can meet a session no writer has touched yet — and naming a
+    // missing column throws, which this function reports as `unreadable`.
+    // Preview would then silently claim the series has no script, and execute
+    // would answer 503 session_unreadable, for every not-yet-migrated session
+    // until the sweep happened to reach it. The dashboard serves from host
+    // start, well before that. Selected conditionally instead: absent means
+    // NULL, and every consumer of this row already falls back to
+    // `process_after` for a row written before the column existed.
+    const hasScheduledFor = (db.prepare("PRAGMA table_info('messages_in')").all() as Array<{ name: string }>).some(
+      (column) => column.name === 'scheduled_for',
+    );
+    const scheduledForColumn = hasScheduledFor ? 'scheduled_for' : 'NULL AS scheduled_for';
     const row =
       (db
         .prepare(
-          `SELECT id, status, process_after, recurrence, content, platform_id, channel_type, thread_id, kind
+          `SELECT id, status, process_after, ${scheduledForColumn}, recurrence, content, platform_id, channel_type, thread_id, kind
              FROM messages_in
             WHERE series_id = ? AND kind = 'task' AND status IN ('pending', 'paused')
             ORDER BY seq DESC LIMIT 1`,
@@ -389,6 +404,11 @@ function taskDefFromSnapshot(
     agentGroupId: targetAgentGroupId,
     cron: snapshot.recurrence ?? '',
     processAfter: processAfterOverride ?? snapshot.process_after ?? new Date().toISOString(),
+    // The moved row is the SAME occurrence, so it keeps the slot it was armed
+    // for. Without this the destination's scheduled_for would be stamped from
+    // process_after — which is the staged grace time on the paused path, and
+    // the retry deadline for a source row sitting in backoff.
+    ...(snapshot.scheduled_for ? { scheduledFor: snapshot.scheduled_for } : {}),
     seriesId,
     prompt: typeof content.prompt === 'string' ? content.prompt : snapshot.content,
     ...(typeof content.script === 'string' ? { script: content.script } : {}),
@@ -512,6 +532,7 @@ export const moveExecuteHandler: AuthHandler = async (req, params, ctx) => {
         series_id: source.seriesId,
         status: snapshot.status,
         process_after: snapshot.process_after,
+        scheduled_for: snapshot.scheduled_for,
         recurrence: snapshot.recurrence,
         content: snapshot.content,
         platform_id: snapshot.platform_id,
@@ -537,6 +558,9 @@ export const moveExecuteHandler: AuthHandler = async (req, params, ctx) => {
     series_id: source.seriesId,
     status: wasPaused ? 'paused' : 'pending',
     process_after: snapshot.process_after,
+    // The occurrence's slot survives the move-and-compensate round trip; a
+    // restore is the SAME occurrence, not a new one.
+    scheduled_for: snapshot.scheduled_for,
     recurrence: snapshot.recurrence,
     content: snapshot.content,
     platform_id: snapshot.platform_id,
@@ -581,7 +605,16 @@ export const moveExecuteHandler: AuthHandler = async (req, params, ctx) => {
         const tgtDb = openInboundDb(inboundPathOf(dataDir, target.agentGroupId, tgtSessId));
         try {
           pauseTask(tgtDb, source.seriesId);
-          if (snapshot.process_after) updateTask(tgtDb, source.seriesId, { processAfter: snapshot.process_after });
+          // keepScheduledFor: this restores the row's RUN time after the
+          // staged grace insert. scheduleTask already stamped the occurrence's
+          // slot from the snapshot, and moving it again here would overwrite it
+          // with the run time.
+          if (snapshot.process_after) {
+            updateTask(tgtDb, source.seriesId, {
+              processAfter: snapshot.process_after,
+              keepScheduledFor: true,
+            });
+          }
         } finally {
           tgtDb.close();
         }

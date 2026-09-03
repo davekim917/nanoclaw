@@ -469,10 +469,20 @@ function formatTaskMessage(msg: MessageInRow): string {
   // previous run completes (recurrence.ts insert-then-clear), so its
   // `timestamp` is the PREVIOUS occurrence — a daily 9am task rendered
   // `time="Jan 4, 9:05 AM"` on the run due Jan 5, and an agent asked for
-  // "today's" numbers reasoned from the wrong date. `process_after` is the
-  // occurrence's own grid slot. Legacy rows without one fall back to
-  // `timestamp`, which is what they always used.
-  const time = formatLocalTime(msg.process_after ?? msg.timestamp, TIMEZONE);
+  // "today's" numbers reasoned from the wrong date.
+  //
+  // `scheduled_for`, NOT `process_after`. The two are stamped equal at insert
+  // and then diverge: a crashed provider turn is put behind a retry deadline by
+  // rewriting `process_after` (deferMessageForFreshContextRetry), which is a
+  // "don't touch me until", not a new slot. Reading `process_after` here made a
+  // retried 9am occurrence announce its backoff time as its scheduled slot, so
+  // anything date-windowed or idempotent keyed off it lost its occurrence
+  // identity across a retry.
+  //
+  // The two fallbacks are both real: `process_after` for a task row written
+  // before the column existed, `timestamp` for one that never had a
+  // process_after either. Each keeps exactly the behavior that row already had.
+  const time = formatLocalTime(msg.scheduled_for ?? msg.process_after ?? msg.timestamp, TIMEZONE);
   // When the run actually reached the agent. A task can be due at 9:00 and run
   // at 11:30 (container busy, host restart, ceiling respawn, a paused series
   // resumed days later), and without this the agent has no wall clock at all —

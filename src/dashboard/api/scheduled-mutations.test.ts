@@ -116,20 +116,24 @@ function insertRow(
     status?: string;
     recurrence?: string | null;
     process_after?: string | null;
+    scheduled_for?: string | null;
     content?: string;
   },
 ): void {
   const db = openInboundDb(inboundPath);
   const seq = (db.prepare('SELECT COALESCE(MAX(seq),0) AS m FROM messages_in').get() as { m: number }).m + 2;
+  const processAfter = row.process_after === undefined ? isoIn(3600_000) : row.process_after;
   db.prepare(
-    `INSERT INTO messages_in (id, seq, kind, timestamp, status, process_after, recurrence, series_id, content, platform_id, channel_type)
-     VALUES (@id, @seq, 'task', @ts, @status, @processAfter, @recurrence, @seriesId, @content, 'd:1', 'discord')`,
+    `INSERT INTO messages_in (id, seq, kind, timestamp, status, process_after, scheduled_for, recurrence, series_id, content, platform_id, channel_type)
+     VALUES (@id, @seq, 'task', @ts, @status, @processAfter, @scheduledFor, @recurrence, @seriesId, @content, 'd:1', 'discord')`,
   ).run({
     id: row.id,
     seq,
     ts: isoIn(-3600_000),
     status: row.status ?? 'pending',
-    processAfter: row.process_after === undefined ? isoIn(3600_000) : row.process_after,
+    processAfter,
+    // Mirrors what every real insert path stamps.
+    scheduledFor: row.scheduled_for === undefined ? processAfter : row.scheduled_for,
     recurrence: row.recurrence === undefined ? '0 9 * * *' : row.recurrence,
     seriesId: row.series_id ?? row.id,
     content: row.content ?? JSON.stringify({ prompt: 'old prompt', script: 'echo old' }),
@@ -153,6 +157,7 @@ function liveRow(seriesId: string):
       status: string;
       trigger: number;
       process_after: string | null;
+      scheduled_for: string | null;
       recurrence: string | null;
       content: string;
     }
@@ -160,7 +165,7 @@ function liveRow(seriesId: string):
   const db = openInboundDb(path.join(TEST_DIR, 'v2-sessions', AG, SESS, 'inbound.db'));
   const row = db
     .prepare(
-      'SELECT id, seq, status, trigger, process_after, recurrence, content FROM messages_in WHERE series_id = ? ORDER BY seq DESC LIMIT 1',
+      'SELECT id, seq, status, trigger, process_after, scheduled_for, recurrence, content FROM messages_in WHERE series_id = ? ORDER BY seq DESC LIMIT 1',
     )
     .get(seriesId) as
     | {
@@ -169,6 +174,7 @@ function liveRow(seriesId: string):
         status: string;
         trigger: number;
         process_after: string | null;
+        scheduled_for: string | null;
         recurrence: string | null;
         content: string;
       }
@@ -524,6 +530,20 @@ describe('runNowHandler', () => {
     const row = liveRow('ser-1')!;
     expect(Date.parse(row.process_after!)).toBeLessThanOrEqual(NOW + 1000);
     expect(row.trigger).toBe(1);
+  });
+
+  it("an early fire moves process_after but leaves the occurrence's slot alone", async () => {
+    // §4.6: run-now does not shift the schedule. The row is still FOR its
+    // original slot, so that is what the agent must be told it is running.
+    const originalSlot = isoIn(-60_000);
+    insertRow(seedSession().inbound, { id: 'r1', series_id: 'ser-1', process_after: originalSlot });
+
+    const res = (await runNowHandler(postReq(), { key: keyFor('ser-1') }, ctxFor('owner', OWNER_SCOPES)))!;
+    expect(res.status).toBe(200);
+
+    const row = liveRow('ser-1')!;
+    expect(Date.parse(row.process_after!)).toBeLessThanOrEqual(NOW + 1000);
+    expect(row.scheduled_for).toBe(originalSlot);
   });
 
   it('does not report fired or wake when fresh context admission fails', async () => {

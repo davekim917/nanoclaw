@@ -71,6 +71,22 @@ describe('insertTaskRow', () => {
     db.close();
   });
 
+  it('stamps scheduled_for from the same value as process_after', () => {
+    const db = freshDb();
+    insertTaskRow(db, {
+      id: 'task-slot',
+      seriesId: 'task-slot',
+      processAfter: '2026-01-05T09:00:00.000Z',
+      recurrence: '0 9 * * *',
+      content: JSON.stringify({ prompt: 'daily brief' }),
+    });
+    expect(db.prepare('SELECT process_after, scheduled_for FROM messages_in WHERE id = ?').get('task-slot')).toEqual({
+      process_after: '2026-01-05T09:00:00.000Z',
+      scheduled_for: '2026-01-05T09:00:00.000Z',
+    });
+    db.close();
+  });
+
   it('persists thread_id for a thread-scoped task', () => {
     const db = freshDb();
     insertTaskRow(db, {
@@ -324,6 +340,43 @@ describe('updateTask', () => {
     db.close();
   });
 
+  it('moves scheduled_for with process_after — a reschedule changes the slot', () => {
+    const db = freshDb();
+    insertTaskRow(db, {
+      id: 'task-resched',
+      seriesId: 'task-resched',
+      processAfter: '2026-01-05T09:00:00.000Z',
+      recurrence: '0 9 * * *',
+      content: JSON.stringify({ prompt: 'daily brief' }),
+    });
+
+    updateTask(db, 'task-resched', { processAfter: '2026-01-05T14:00:00.000Z' });
+
+    expect(db.prepare('SELECT process_after, scheduled_for FROM messages_in WHERE id = ?').get('task-resched')).toEqual(
+      { process_after: '2026-01-05T14:00:00.000Z', scheduled_for: '2026-01-05T14:00:00.000Z' },
+    );
+    db.close();
+  });
+
+  it('keepScheduledFor moves ONLY process_after — run-now fires early without shifting the slot', () => {
+    const db = freshDb();
+    insertTaskRow(db, {
+      id: 'task-runnow',
+      seriesId: 'task-runnow',
+      processAfter: '2026-01-05T09:00:00.000Z',
+      recurrence: '0 9 * * *',
+      content: JSON.stringify({ prompt: 'daily brief' }),
+    });
+
+    updateTask(db, 'task-runnow', { processAfter: '2026-01-05T07:12:00.000Z', keepScheduledFor: true });
+
+    expect(db.prepare('SELECT process_after, scheduled_for FROM messages_in WHERE id = ?').get('task-runnow')).toEqual({
+      process_after: '2026-01-05T07:12:00.000Z',
+      scheduled_for: '2026-01-05T09:00:00.000Z',
+    });
+    db.close();
+  });
+
   it('merges supplied fields into content JSON without clobbering others', () => {
     const db = freshDb();
     insertTaskRow(db, {
@@ -545,6 +598,44 @@ describe('restoreTaskRow', () => {
     db.close();
   });
 
+  it('carries scheduled_for through a restore, falling back for a pre-column snapshot', () => {
+    const db = freshDb();
+    const base: TaskRowSnapshot = {
+      id: 'restored-slot',
+      series_id: 'series-slot',
+      status: 'pending',
+      process_after: '2026-01-05T11:47:00.000Z',
+      scheduled_for: '2026-01-05T09:00:00.000Z',
+      recurrence: '0 9 * * *',
+      content: JSON.stringify({ prompt: 'daily brief' }),
+      platform_id: null,
+      channel_type: null,
+      thread_id: null,
+      kind: 'task',
+    };
+    restoreTaskRow(db, base);
+    expect(
+      db.prepare('SELECT process_after, scheduled_for FROM messages_in WHERE id = ?').get('restored-slot'),
+    ).toEqual({ process_after: '2026-01-05T11:47:00.000Z', scheduled_for: '2026-01-05T09:00:00.000Z' });
+
+    // ISO-8601 UTC, not datetime('now')'s naive shape — `new Date()` reads that
+    // as LOCAL time, skewing display and string comparisons against every other
+    // row in the table.
+    const stamped = db.prepare('SELECT timestamp FROM messages_in WHERE id = ?').get('restored-slot') as {
+      timestamp: string;
+    };
+    expect(stamped.timestamp).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/);
+
+    // A move_intent audit body written before the column existed carries no
+    // scheduled_for; the restore must still produce a usable row.
+    const { scheduled_for: _omitted, ...legacy } = base;
+    restoreTaskRow(db, { ...legacy, id: 'restored-legacy' });
+    expect(
+      db.prepare('SELECT process_after, scheduled_for FROM messages_in WHERE id = ?').get('restored-legacy'),
+    ).toEqual({ process_after: '2026-01-05T11:47:00.000Z', scheduled_for: '2026-01-05T11:47:00.000Z' });
+    db.close();
+  });
+
   it('restores a pending snapshot as pending', () => {
     const db = freshDb();
     const snapshot: TaskRowSnapshot = {
@@ -637,6 +728,27 @@ describe('cancelSeriesWithStrandClear', () => {
 });
 
 describe('insertRecurrence', () => {
+  it("stamps the successor occurrence with its OWN slot, not the previous run's", () => {
+    const db = freshDb();
+    const previous: RecurringMessage = {
+      id: 'task-day1',
+      kind: 'task',
+      content: JSON.stringify({ prompt: 'daily brief' }),
+      recurrence: '0 9 * * *',
+      process_after: '2026-01-04T09:00:00.000Z',
+      platform_id: null,
+      channel_type: null,
+      thread_id: null,
+      series_id: 'task-day1',
+    };
+    insertRecurrence(db, previous, 'task-day2', '2026-01-05T09:00:00.000Z');
+    expect(db.prepare('SELECT process_after, scheduled_for FROM messages_in WHERE id = ?').get('task-day2')).toEqual({
+      process_after: '2026-01-05T09:00:00.000Z',
+      scheduled_for: '2026-01-05T09:00:00.000Z',
+    });
+    db.close();
+  });
+
   it('copies series_id forward', () => {
     const db = freshDb();
     insertBasicTask(db, 'task-orig', '0 9 * * *');
@@ -659,6 +771,138 @@ describe('insertRecurrence', () => {
       series_id: string;
     };
     expect(row.series_id).toBe('task-orig');
+    db.close();
+  });
+});
+
+/**
+ * Codex round, generalized. The reviewer found the read-only preview path
+ * throwing `no such column: scheduled_for` on a session the lazy migration has
+ * not reached yet. The WRITE helpers that name the column have the same
+ * exposure and a worse outcome — scheduling, editing or restoring a task fails
+ * outright rather than degrading — so each migrates the handle it is given.
+ */
+describe('slots copied out of a session DB are normalized to ISO UTC', () => {
+  it('restoreTaskRow rewrites a naive snapshot slot', () => {
+    const db = freshDb();
+    restoreTaskRow(db, {
+      id: 'task-naive-slot',
+      series_id: 'ser-naive-slot',
+      status: 'pending',
+      process_after: '2026-01-05T11:47:00.000Z',
+      scheduled_for: '2026-01-05 09:00:00',
+      recurrence: '0 9 * * *',
+      content: '{}',
+      platform_id: null,
+      channel_type: null,
+      thread_id: null,
+      kind: 'task',
+    });
+
+    expect(db.prepare('SELECT scheduled_for FROM messages_in WHERE id = ?').get('task-naive-slot')).toEqual({
+      scheduled_for: '2026-01-05T09:00:00.000Z',
+    });
+    db.close();
+  });
+
+  it('restoreTaskRow rewrites a naive process_after when it is the only slot available', () => {
+    // A pre-column audit snapshot has no scheduled_for at all, so the restore
+    // falls back to process_after — which on the same install is naive too.
+    const db = freshDb();
+    restoreTaskRow(db, {
+      id: 'task-naive-fallback',
+      series_id: 'ser-naive-fallback',
+      status: 'paused',
+      process_after: '2026-01-05 09:00:00',
+      recurrence: null,
+      content: '{}',
+      platform_id: null,
+      channel_type: null,
+      thread_id: null,
+      kind: 'task',
+    });
+
+    expect(db.prepare('SELECT scheduled_for FROM messages_in WHERE id = ?').get('task-naive-fallback')).toEqual({
+      scheduled_for: '2026-01-05T09:00:00.000Z',
+    });
+    db.close();
+  });
+});
+
+describe('task writers on a session that predates scheduled_for', () => {
+  /** The pre-migration on-disk shape, produced from the migrated one. */
+  function legacyDb() {
+    const db = freshDb();
+    db.exec('ALTER TABLE messages_in DROP COLUMN scheduled_for');
+    return db;
+  }
+
+  const columns = (db: ReturnType<typeof freshDb>) =>
+    (db.prepare("PRAGMA table_info('messages_in')").all() as Array<{ name: string }>).map((c) => c.name);
+
+  it('insertTaskRow migrates the column into place', () => {
+    const db = legacyDb();
+    expect(columns(db)).not.toContain('scheduled_for');
+
+    insertTaskRow(db, {
+      id: 'task-legacy-insert',
+      seriesId: 'task-legacy-insert',
+      processAfter: '2026-01-05T09:00:00.000Z',
+      recurrence: null,
+      content: '{}',
+    });
+
+    expect(columns(db)).toContain('scheduled_for');
+    expect(db.prepare('SELECT scheduled_for FROM messages_in WHERE id = ?').get('task-legacy-insert')).toEqual({
+      scheduled_for: '2026-01-05T09:00:00.000Z',
+    });
+    db.close();
+  });
+
+  it('updateTask migrates the column into place', () => {
+    const db = freshDb();
+    insertTaskRow(db, {
+      id: 'task-legacy-update',
+      seriesId: 'ser-legacy-update',
+      processAfter: '2026-01-05T09:00:00.000Z',
+      recurrence: '0 9 * * *',
+      content: '{}',
+    });
+    db.exec('ALTER TABLE messages_in DROP COLUMN scheduled_for');
+    expect(columns(db)).not.toContain('scheduled_for');
+
+    expect(updateTask(db, 'ser-legacy-update', { processAfter: '2026-01-06T09:00:00.000Z' })).toBe(1);
+
+    expect(
+      db.prepare('SELECT process_after, scheduled_for FROM messages_in WHERE id = ?').get('task-legacy-update'),
+    ).toEqual({ process_after: '2026-01-06T09:00:00.000Z', scheduled_for: '2026-01-06T09:00:00.000Z' });
+    db.close();
+  });
+
+  it('restoreTaskRow migrates the column into place', () => {
+    const db = legacyDb();
+    const snapshot: TaskRowSnapshot = {
+      id: 'task-legacy-restore',
+      series_id: 'ser-legacy-restore',
+      status: 'paused',
+      process_after: '2026-01-05T09:00:00.000Z',
+      scheduled_for: '2026-01-05T09:00:00.000Z',
+      recurrence: '0 9 * * *',
+      content: '{}',
+      platform_id: null,
+      channel_type: null,
+      thread_id: null,
+      kind: 'task',
+    };
+
+    restoreTaskRow(db, snapshot);
+
+    expect(db.prepare('SELECT status, scheduled_for FROM messages_in WHERE id = ?').get('task-legacy-restore')).toEqual(
+      {
+        status: 'paused',
+        scheduled_for: '2026-01-05T09:00:00.000Z',
+      },
+    );
     db.close();
   });
 });

@@ -56,8 +56,16 @@ export function runInsertMessage(db: Database.Database, message: MessageInsert, 
   // already admitted its prior rows, stranding the new row forever.
   const result = db
     .prepare(
-      `INSERT INTO messages_in (id, seq, kind, timestamp, status, platform_id, channel_type, thread_id, content, process_after, recurrence, series_id, trigger, source_session_id, on_wake, repo_fence_epoch, repo_fence_original_trigger)
-       VALUES (@id, @seq, @kind, @timestamp, 'pending', @platformId, @channelType, @threadId, @content, @processAfter, @recurrence, @id, @trigger, @sourceSessionId, @onWake, @repoFenceEpoch, @repoFenceOriginalTrigger)${conflictClause}`,
+      `INSERT INTO messages_in (id, seq, kind, timestamp, status, platform_id, channel_type, thread_id, content, process_after, scheduled_for, recurrence, series_id, trigger, source_session_id, on_wake, repo_fence_epoch, repo_fence_original_trigger)
+       VALUES (@id, @seq, @kind, @timestamp, 'pending', @platformId, @channelType, @threadId, @content, @processAfter,
+               -- Occurrence identity is a TASK concept. A chat or system row's
+               -- process_after is a plain "hold until", so it gets no slot.
+               -- Tasks normally arrive via insertTaskRow; this covers the case
+               -- writeSessionMessage's isScheduledTask branch already
+               -- anticipates, so a task written through the general writer is
+               -- not left slotless.
+               CASE WHEN @kind = 'task' THEN @processAfter END,
+               @recurrence, @id, @trigger, @sourceSessionId, @onWake, @repoFenceEpoch, @repoFenceOriginalTrigger)${conflictClause}`,
     )
     .run({
       ...message,

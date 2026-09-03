@@ -40,7 +40,8 @@ CREATE TABLE messages_in (
   kind           TEXT NOT NULL,
   timestamp      TEXT NOT NULL,
   status         TEXT DEFAULT 'pending',   -- pending|completed|failed|paused
-  process_after  TEXT,
+  process_after  TEXT,                     -- when to run NEXT; deferral paths rewrite it
+  scheduled_for  TEXT,                     -- which slot a task occurrence is FOR; NULL pre-column
   recurrence     TEXT,                     -- cron expr for recurring
   series_id      TEXT,                     -- groups occurrences of a recurring task
   tries          INTEGER DEFAULT 0,
@@ -61,6 +62,20 @@ Content shapes: see [api-details.md §Session DB Schema Details](api-details.md#
 
 **Writers (host):** `insertMessage()` (and `nextEvenSeq()`) in `src/db/session-db.ts`; `insertTask()` and `insertRecurrence()` in `src/modules/scheduling/db.ts`. Each calls `nextEvenSeq()`.
 **Reader (container):** `container/agent-runner/src/db/messages-in.ts` — polls `status='pending' AND (process_after IS NULL OR process_after <= now)`.
+
+**`process_after` vs `scheduled_for`.** They are stamped from the same value at
+insert and then diverge. `process_after` answers _when to run next_, so the
+deferral paths rewrite it — a crashed provider turn put behind a retry backoff
+(`deferMessageForFreshContextRetry`), a stale message re-armed with
+`retryWithBackoff`. `scheduled_for` answers _which occurrence this is_, and only
+a genuine reschedule moves it: a cron edit, a resume recomputed to the next
+future slot, an explicit `--process-after`, an operator re-`scheduleTask`. The
+board's run-now is the deliberate exception — it fires early WITHOUT shifting
+the schedule, so it moves `process_after` alone (`updateTask`'s
+`keepScheduledFor`). The formatter renders `scheduled_for` as the `<task>`
+element's `time`, falling back to `process_after` then `timestamp` for rows
+written before the column existed; the Scheduled Tasks Board renders
+`process_after`, which is the right answer for "next run".
 
 ### 2.2 `delivered`
 

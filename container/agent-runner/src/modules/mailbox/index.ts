@@ -134,8 +134,21 @@ function admitChatWrite(id: string, kind: string, content: string): boolean {
 // row→record mapping (and the same skip-and-log on a row that fails the
 // canonical parse) has to run here. M-1 (inbound-kinds.ts) proved the fork
 // writes only upstream's five kinds, so upstream's parser is sufficient.
-function inboundMessage(row: MessageInRow): InboundMessage {
-  return parseInboundRecord({
+/**
+ * Upstream's inbound record plus the fork-only columns it does not model.
+ *
+ * `scheduled_for` is the host's; upstream's `InboundRecord` has no field for
+ * it and `mailbox/types.ts` is upstream's file, so the value would be dropped
+ * by the row→record mapping below and never reach the formatter. Carried here
+ * instead, and read back in `db/messages-in.ts`'s `messageRow`.
+ */
+export interface NanoclawInboundMessage extends InboundMessage {
+  /** Which scheduled slot a task occurrence is FOR. NULL on non-task rows. */
+  scheduledFor: string | null;
+}
+
+function inboundMessage(row: MessageInRow): NanoclawInboundMessage {
+  const record = parseInboundRecord({
     id: row.id,
     sequence: row.seq,
     kind: row.kind,
@@ -153,9 +166,19 @@ function inboundMessage(row: MessageInRow): InboundMessage {
     sourceSessionId: row.source_session_id ?? null,
     onWake: row.on_wake === 1,
   });
+  return {
+    ...record,
+    // Through sqliteTimestamp for the same reason `process_after` is: the
+    // host's one-time backfill copies `process_after` verbatim, so a row
+    // migrated on an install whose older writers used SQLite's naive
+    // `YYYY-MM-DD HH:MM:SS` shape carries that shape here. `new Date()` reads
+    // it as LOCAL time, which would shift the announced slot by the install's
+    // offset and, near midnight, onto the wrong day.
+    scheduledFor: row.scheduled_for == null ? null : sqliteTimestamp(row.scheduled_for),
+  };
 }
 
-function parseInboundMessage(row: MessageInRow): InboundMessage | undefined {
+function parseInboundMessage(row: MessageInRow): NanoclawInboundMessage | undefined {
   try {
     return inboundMessage(row);
   } catch (error) {
@@ -228,7 +251,7 @@ export class NanoclawAgentMailbox extends SqliteAgentMailbox {
     ensureNanoclawOutboundSchema(getOutboundDb());
   }
 
-  override getPendingMessages(limit: number, isFirstPoll: boolean): InboundMessage[] {
+  override getPendingMessages(limit: number, isFirstPoll: boolean): NanoclawInboundMessage[] {
     return selectPendingRows(limit, isFirstPoll).flatMap((row) => {
       const message = parseInboundMessage(row);
       return message ? [message] : [];

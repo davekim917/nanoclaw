@@ -458,11 +458,18 @@ themselves are never shown.
   Review open PRs</task>
   ```
 
-  `time` is the occurrence's effective scheduled time (`process_after`, falling
-  back to the row's creation timestamp for legacy rows that have none). This
-  matters for a recurring series: the successor row is inserted the moment the
-  previous run completes, so its creation timestamp belongs to the PREVIOUS
-  occurrence.
+  `time` is the occurrence's scheduled slot — `scheduled_for`, falling back to
+  `process_after` and then the row's creation timestamp for rows written before
+  that column existed. This matters for a recurring series: the successor row is
+  inserted the moment the previous run completes, so its creation timestamp
+  belongs to the PREVIOUS occurrence.
+
+  `scheduled_for` rather than `process_after` because the two diverge under a
+  retry. A crashed provider turn is put behind a retry deadline by rewriting
+  `process_after`, which is a "don't touch me until", not a new slot — reading
+  it here told the agent a 9:00 run was scheduled for 11:47, and anything
+  date-windowed or idempotent keyed off that time lost its occurrence identity
+  across the retry. See [db-session.md §2.1](db-session.md).
 
   `current_time` is generated when the task reaches the agent, so relative
   instructions such as "today" stay correct after a pause, a delayed run, a

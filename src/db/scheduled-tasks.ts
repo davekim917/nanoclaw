@@ -25,7 +25,8 @@ import { DATA_DIR } from '../config.js';
 import { resolveTaskSession } from '../session-manager.js';
 import { createSession, findSessionByAgentGroupAndMessagingGroup } from './sessions.js';
 import { getDb } from './connection.js';
-import { ensureSchema, openInboundDb } from './session-db.js';
+import { ensureSchema, migrateMessagesInTable, openInboundDb } from './session-db.js';
+import { sqliteUtcToIso } from '../modules/mailbox/sqlite-utc.js';
 import { nextEvenSeq } from './session-db.js';
 
 export interface TaskDef {
@@ -33,6 +34,15 @@ export interface TaskDef {
   agentGroupId: string;
   cron: string;
   processAfter: string;
+  /**
+   * The scheduled slot this occurrence is FOR, when it differs from
+   * `processAfter`. Only the board's move flow needs it: a source row sitting
+   * in retry backoff carries the backoff deadline in `process_after`, and
+   * stamping the destination's `scheduled_for` from that would change the
+   * occurrence's identity as a side effect of moving it. Omitted by every
+   * other caller, which arms a slot and a run time that are the same instant.
+   */
+  scheduledFor?: string;
   seriesId: string;
   prompt: string;
   /**
@@ -85,6 +95,19 @@ export interface TaskDef {
     clearStickyModel?: boolean;
     clearStickyEffort?: boolean;
   };
+}
+
+/**
+ * ISO-normalize a slot that came out of a session-DB column.
+ *
+ * A move carries the SOURCE occurrence's slot into the destination DB, and on
+ * a pre-upgrade install either source column can still hold SQLite's naive
+ * `YYYY-MM-DD HH:MM:SS`. Persisting that shape into `scheduled_for` would put
+ * a value in the destination that every reader compares as a string against
+ * ISO ones, and that `new Date()` reads as local time. NULL stays NULL.
+ */
+function isoSlot(value: string | null | undefined): string | null {
+  return value == null ? null : sqliteUtcToIso(value);
 }
 
 function generateSessionId(): string {
@@ -240,6 +263,12 @@ export async function scheduleTask(def: TaskDef, _dataDir?: string): Promise<voi
   // reclaim from unlinking this file between the open and the insert below.
   const db = openInboundDb(inboundDbPath);
   try {
+    // The statements below name `scheduled_for`, which is added lazily on the
+    // first writable open of a session. `resolveTaskSession` returns an
+    // EXISTING task session untouched, and this opener does not migrate, so on
+    // an upgraded install scheduling into a series whose session predates the
+    // column would throw `no such column` until the sweep reached it.
+    migrateMessagesInTable(db);
     const content = JSON.stringify({
       prompt: def.prompt,
       ...(def.script !== undefined ? { script: def.script } : {}),
@@ -269,6 +298,10 @@ export async function scheduleTask(def: TaskDef, _dataDir?: string): Promise<voi
           `UPDATE messages_in
               SET seq           = ?,
                   process_after = ?,
+                  -- Moves with process_after: an operator rescheduling a live
+                  -- series genuinely changes which slot the occurrence is for,
+                  -- unlike a retry backoff, which only moves process_after.
+                  scheduled_for = ?,
                   recurrence    = ?,
                   content       = ?,
                   platform_id   = ?,
@@ -277,21 +310,36 @@ export async function scheduleTask(def: TaskDef, _dataDir?: string): Promise<voi
                   tries         = 0,
                   trigger       = 0
             WHERE id = ?`,
-        ).run(seq, def.processAfter, def.cron, content, platformId, channelType, threadId, activeRow.id);
+        ).run(
+          seq,
+          def.processAfter,
+          isoSlot(def.scheduledFor ?? def.processAfter),
+          def.cron,
+          content,
+          platformId,
+          channelType,
+          threadId,
+          activeRow.id,
+        );
         return;
       }
 
       const seq = nextEvenSeq(db);
       db.prepare(
         `INSERT INTO messages_in
-           (id, seq, kind, timestamp, status, tries, process_after, recurrence, series_id, content,
+           (id, seq, kind, timestamp, status, tries, process_after, scheduled_for, recurrence, series_id, content,
             platform_id, channel_type, thread_id, trigger)
-         VALUES (?, ?, 'task', ?, 'pending', 0, ?, ?, ?, ?, ?, ?, ?, 0)`,
+         VALUES (?, ?, 'task', ?, 'pending', 0, ?, ?, ?, ?, ?, ?, ?, ?, 0)`,
       ).run(
         def.id,
         seq,
         new Date().toISOString(),
         def.processAfter,
+        // Stamped equal at insert, then diverges — a deferral moves only
+        // process_after, so the occurrence keeps the slot it was armed for.
+        // A move is the one caller that arms them apart, preserving the source
+        // occurrence's slot across the transfer.
+        isoSlot(def.scheduledFor ?? def.processAfter),
         def.cron,
         def.seriesId,
         content,

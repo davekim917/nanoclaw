@@ -12,12 +12,28 @@
  */
 import type Database from 'better-sqlite3';
 
-import { nextEvenSeq } from '../../db/session-db.js';
+import { migrateMessagesInTable, nextEvenSeq } from '../../db/session-db.js';
+import { sqliteUtcToIso } from '../mailbox/sqlite-utc.js';
+
+/**
+ * `scheduled_for` is added lazily, on the first writable open of a given
+ * session, so on an upgraded install a handle can arrive here still without
+ * it and every statement below that names the column would throw `no such
+ * column`. Each writer that names it migrates its own handle first — the same
+ * self-contained pattern `runInsertMessage` uses — so no caller, present or
+ * future, has to remember to do it. Idempotent and guarded by
+ * `PRAGMA table_info`, so a migrated handle pays only the pragma.
+ */
 
 /**
  * Insert one pending task occurrence. `seriesId` is the series join key — equal
  * to `id` for a brand-new series, or the existing series for a recurrence clone
  * or an on-demand run.
+ *
+ * `scheduled_for` is stamped from the SAME value as `process_after`, then
+ * diverges: deferral paths (fresh-context retry backoff, stale-message backoff)
+ * rewrite `process_after` and leave `scheduled_for` alone, so the occurrence
+ * keeps the slot it was armed for. The formatter renders `scheduled_for`.
  *
  * New-style `ncl tasks` rows fire into an isolated system session and pass no
  * routing (platform/channel/thread default NULL). Fork: MCP-scheduled tasks
@@ -39,9 +55,10 @@ export function insertTaskRow(
     threadId?: string | null;
   },
 ): void {
+  migrateMessagesInTable(db);
   db.prepare(
-    `INSERT INTO messages_in (id, seq, timestamp, status, tries, process_after, recurrence, kind, platform_id, channel_type, thread_id, content, series_id, trigger)
-     VALUES (@id, @seq, @timestamp, @status, 0, @processAfter, @recurrence, 'task', @platformId, @channelType, @threadId, @content, @seriesId, 0)`,
+    `INSERT INTO messages_in (id, seq, timestamp, status, tries, process_after, scheduled_for, recurrence, kind, platform_id, channel_type, thread_id, content, series_id, trigger)
+     VALUES (@id, @seq, @timestamp, @status, 0, @processAfter, @processAfter, @recurrence, 'task', @platformId, @channelType, @threadId, @content, @seriesId, 0)`,
   ).run({
     status: 'pending',
     platformId: null,
@@ -122,6 +139,17 @@ export interface TaskUpdate {
   recurrence?: string | null;
   processAfter?: string;
   /**
+   * Treat `processAfter` as an execution deadline only, leaving the row's
+   * `scheduled_for` where it is.
+   *
+   * The board's run-now fires a task early WITHOUT shifting its schedule
+   * (design §4.6), so the occurrence is still FOR its original slot and must
+   * keep announcing that slot to the agent. Every other caller is a genuine
+   * reschedule — a cron edit, a resume recomputed to the next future slot, an
+   * explicit `--process-after` — and moves both.
+   */
+  keepScheduledFor?: boolean;
+  /**
    * Per-fire model/effort pin (merged into content.flagIntent, not replaced).
    * Values are already validated against the agent's provider vocab by the
    * caller (resolveTaskFlagIntent → parseMessageFlags), so effort is a plain
@@ -136,6 +164,7 @@ export interface TaskUpdate {
 // occurrence of a recurring task is updated, not just the completed row the
 // agent last saw. Returns the number of rows touched.
 export function updateTask(db: Database.Database, taskId: string, update: TaskUpdate): number {
+  migrateMessagesInTable(db);
   const setProcessAfter = update.processAfter !== undefined;
   const setRecurrence = update.recurrence !== undefined;
   const mergeContent =
@@ -196,6 +225,10 @@ export function updateTask(db: Database.Database, taskId: string, update: TaskUp
       if (setProcessAfter && applySchedule) {
         sets.push('process_after = ?');
         params.push(update.processAfter);
+        if (!update.keepScheduledFor) {
+          sets.push('scheduled_for = ?');
+          params.push(update.processAfter);
+        }
       }
       if (setRecurrence && applySchedule) {
         sets.push('recurrence = ?');
@@ -308,6 +341,13 @@ export interface TaskRowSnapshot {
   series_id: string;
   status: 'pending' | 'paused';
   process_after: string | null;
+  /**
+   * Optional: a snapshot recorded in a `move_intent` audit row BEFORE this
+   * column existed has no value here, and recovery must still be able to
+   * restore from it. Absent means "fall back to process_after", which is what
+   * the restored row's readers would do anyway.
+   */
+  scheduled_for?: string | null;
   recurrence: string | null;
   content: string;
   platform_id: string | null;
@@ -334,16 +374,36 @@ export interface TaskRowSnapshot {
  * C1: writes no status value the firing path doesn't already read
  * (`pending`/`paused` are both existing live states).
  */
+/** ISO-normalize a slot copied out of a session-DB column. NULL stays NULL. */
+function isoSlot(value: string | null | undefined): string | null {
+  return value == null ? null : sqliteUtcToIso(value);
+}
+
 export function restoreTaskRow(db: Database.Database, snapshot: TaskRowSnapshot): void {
+  migrateMessagesInTable(db);
   db.prepare(
-    `INSERT INTO messages_in (id, seq, kind, timestamp, status, tries, process_after, recurrence, platform_id, channel_type, thread_id, content, series_id, trigger)
-     VALUES (@id, @seq, @kind, datetime('now'), @status, 0, @processAfter, @recurrence, @platformId, @channelType, @threadId, @content, @seriesId, 0)`,
+    `INSERT INTO messages_in (id, seq, kind, timestamp, status, tries, process_after, scheduled_for, recurrence, platform_id, channel_type, thread_id, content, series_id, trigger)
+     VALUES (@id, @seq, @kind, @timestamp, @status, 0, @processAfter, @scheduledFor, @recurrence, @platformId, @channelType, @threadId, @content, @seriesId, 0)`,
   ).run({
     id: snapshot.id,
     seq: nextEvenSeq(db),
+    // ISO-8601 UTC, never datetime('now'): its naive 'YYYY-MM-DD HH:MM:SS'
+    // shape is read as LOCAL time by `new Date()`, which skews display and
+    // breaks string comparisons against the ISO values every other writer here
+    // produces.
+    timestamp: new Date().toISOString(),
     kind: snapshot.kind,
     status: snapshot.status,
     processAfter: snapshot.process_after,
+    // A restore re-creates the SAME occurrence, so it carries the slot the
+    // source row was for — not the restore's own moment. `?? process_after`
+    // covers a pre-column audit snapshot.
+    //
+    // Normalized on the way through: both source columns can hold SQLite's
+    // naive `YYYY-MM-DD HH:MM:SS` on a pre-upgrade install, and copying that
+    // shape into `scheduled_for` would put a value here that every reader
+    // compares as a string against ISO ones.
+    scheduledFor: isoSlot(snapshot.scheduled_for ?? snapshot.process_after),
     recurrence: snapshot.recurrence,
     platformId: snapshot.platform_id,
     channelType: snapshot.channel_type,

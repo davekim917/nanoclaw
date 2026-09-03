@@ -16,3 +16,21 @@
 export function parseSqliteUtc(s: string): number {
   return Date.parse(/[zZ]|[+-]\d{2}:?\d{2}$/.test(s) ? s : s + 'Z');
 }
+
+/**
+ * The same reading, rendered back as a canonical ISO-8601 UTC string.
+ *
+ * Session-DB timestamp columns hold two shapes: the ISO form every JS writer
+ * produces, and SQLite's naive `YYYY-MM-DD HH:MM:SS` left behind by older
+ * writers. A value read out of one column and written into another has to be
+ * normalized on the way through, or the naive shape propagates into a column
+ * whose readers compare it as a string against ISO values.
+ *
+ * Unparseable input is returned unchanged — a column holding something that is
+ * not a timestamp at all is a different defect, and silently substituting the
+ * epoch for it would hide that.
+ */
+export function sqliteUtcToIso(value: string): string {
+  const milliseconds = parseSqliteUtc(value);
+  return Number.isFinite(milliseconds) ? new Date(milliseconds).toISOString() : value;
+}

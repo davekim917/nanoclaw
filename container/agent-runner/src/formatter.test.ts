@@ -42,17 +42,26 @@ function insertMessage(
   id: string,
   kind: string,
   content: object,
-  opts?: { timestamp?: string; trigger?: number; seq?: number; processAfter?: string },
+  opts?: { timestamp?: string; trigger?: number; seq?: number; processAfter?: string; scheduledFor?: string },
 ) {
   const timestamp = opts?.timestamp ?? new Date().toISOString();
   const trigger = opts?.trigger ?? 1;
   const seq = opts?.seq ?? nextSeq++;
   getInboundDb()
     .prepare(
-      `INSERT INTO messages_in (id, kind, timestamp, status, trigger, seq, process_after, content)
-       VALUES (?, ?, ?, 'pending', ?, ?, ?, ?)`,
+      `INSERT INTO messages_in (id, kind, timestamp, status, trigger, seq, process_after, scheduled_for, content)
+       VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?)`,
     )
-    .run(id, kind, timestamp, trigger, seq, opts?.processAfter ?? null, JSON.stringify(content));
+    .run(
+      id,
+      kind,
+      timestamp,
+      trigger,
+      seq,
+      opts?.processAfter ?? null,
+      opts?.scheduledFor ?? null,
+      JSON.stringify(content),
+    );
 }
 
 describe('context timezone header', () => {
@@ -174,12 +183,71 @@ describe('task timestamps', () => {
     // yesterday's date to the agent.
     const created = '2026-01-04T12:05:00.000Z';
     const scheduled = '2026-01-05T09:00:00.000Z';
-    insertMessage('t1', 'task', { prompt: "prepare today's brief" }, { timestamp: created, processAfter: scheduled });
+    insertMessage(
+      't1',
+      'task',
+      { prompt: "prepare today's brief" },
+      { timestamp: created, processAfter: scheduled, scheduledFor: scheduled },
+    );
 
     const result = formatMessages(getPendingMessages());
 
     expect(result).toContain(`time="${formatLocalTime(scheduled, TIMEZONE)}"`);
     expect(result).not.toContain(`time="${formatLocalTime(created, TIMEZONE)}"`);
+  });
+
+  it('renders the ORIGINAL slot for an occurrence sitting in retry backoff', () => {
+    // deferMessageForFreshContextRetry puts a crashed provider turn behind a
+    // retry deadline by rewriting process_after. That is a "don't touch me
+    // until", not a new slot — reading it here told the agent its 9am run was
+    // scheduled for 11:47, and anything date-windowed or idempotent keyed off
+    // that time lost its occurrence identity across the retry.
+    const scheduled = '2026-01-05T09:00:00.000Z';
+    const backoffDeadline = '2026-01-05T11:47:00.000Z';
+    insertMessage(
+      't-retry',
+      'task',
+      { prompt: "prepare today's brief" },
+      { timestamp: '2026-01-04T12:05:00.000Z', processAfter: backoffDeadline, scheduledFor: scheduled },
+    );
+
+    const result = formatMessages(getPendingMessages());
+
+    expect(result).toContain(`time="${formatLocalTime(scheduled, TIMEZONE)}"`);
+    expect(result).not.toContain(`time="${formatLocalTime(backoffDeadline, TIMEZONE)}"`);
+  });
+
+  it('falls back to process_after on a task row written before scheduled_for existed', () => {
+    // A legacy row keeps exactly the behavior it already had — the migration
+    // adds the column empty rather than backfilling a possibly-wrong value.
+    const scheduled = '2026-01-05T09:00:00.000Z';
+    insertMessage('t-legacy', 'task', { prompt: 'legacy occurrence' }, { processAfter: scheduled });
+
+    expect(formatMessages(getPendingMessages())).toContain(`time="${formatLocalTime(scheduled, TIMEZONE)}"`);
+  });
+
+  it('reads a naive scheduled_for as UTC, the way it reads process_after', () => {
+    // Codex round 2, P1. The host's one-time backfill copies process_after
+    // verbatim, so a row migrated on an install whose older writers used
+    // SQLite's naive `YYYY-MM-DD HH:MM:SS` shape carries that shape here.
+    // `new Date()` reads it as LOCAL time, which shifts the announced slot by
+    // the install's offset and, near midnight, onto the wrong day.
+    const naive = '2026-01-05 09:00:00';
+    const iso = '2026-01-05T09:00:00.000Z';
+    insertMessage(
+      't-naive-slot',
+      'task',
+      { prompt: 'migrated occurrence' },
+      { timestamp: '2026-01-04T12:05:00.000Z', processAfter: iso, scheduledFor: naive },
+    );
+
+    const rows = getPendingMessages();
+    // Normalized on the way out of the mailbox, the same as process_after —
+    // asserted on the row because this host runs in UTC, where the naive and
+    // ISO forms happen to render alike and the formatter cannot tell them
+    // apart. On a non-UTC install they differ by the whole offset.
+    expect(rows.find((row) => row.id === 't-naive-slot')?.scheduled_for).toBe(iso);
+    expect(formatMessages(rows)).toContain(`time="${formatLocalTime(iso, TIMEZONE)}"`);
   });
 
   it('carries current_time so a late run can still resolve "today"', () => {

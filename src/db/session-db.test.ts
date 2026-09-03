@@ -12,6 +12,7 @@ import os from 'os';
 import path from 'path';
 import { describe, it, expect, afterEach, vi } from 'vitest';
 
+import { deferMessageForFreshContextRetry } from '../session-manager.js';
 import {
   activateRepoIngressFence,
   ensureSchema,
@@ -291,6 +292,206 @@ describe('migrateMessagesInTable', () => {
       series_id: string;
     };
     expect(row.series_id).toBe('legacy-1');
+    db.close();
+  });
+
+  it('adds scheduled_for and backfills legacy TASK rows from process_after, idempotently', () => {
+    if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
+    fs.mkdirSync(TEST_DIR, { recursive: true });
+
+    const db = new Database(DB_PATH);
+    db.exec(`
+      CREATE TABLE messages_in (
+        id             TEXT PRIMARY KEY,
+        seq            INTEGER UNIQUE,
+        kind           TEXT NOT NULL,
+        timestamp      TEXT NOT NULL,
+        status         TEXT DEFAULT 'pending',
+        process_after  TEXT,
+        recurrence     TEXT,
+        tries          INTEGER DEFAULT 0,
+        platform_id    TEXT,
+        channel_type   TEXT,
+        thread_id      TEXT,
+        content        TEXT NOT NULL
+      );
+    `);
+    // A legacy task row whose process_after IS its slot. Leaving it NULL would
+    // mean its first crash after the upgrade deferred process_after with no
+    // slot recorded, and the formatter would fall back to the backoff deadline
+    // — reproducing the exact defect this column prevents.
+    db.prepare(
+      "INSERT INTO messages_in (id, seq, kind, timestamp, status, process_after, content) VALUES (?, ?, 'task', ?, 'pending', ?, '{}')",
+    ).run('legacy-task', 2, '2026-01-04T12:05:00.000Z', '2026-01-05T09:00:00.000Z');
+    // A chat row: occurrence identity is a task concept, so it gets no slot.
+    db.prepare(
+      "INSERT INTO messages_in (id, seq, kind, timestamp, status, process_after, content) VALUES (?, ?, 'chat', ?, 'pending', ?, '{}')",
+    ).run('legacy-chat', 4, '2026-01-04T12:05:00.000Z', '2026-01-04T12:10:00.000Z');
+    // A task row with no process_after at all stays NULL — there is nothing to
+    // copy, and the formatter's timestamp fallback already covers it.
+    db.prepare(
+      "INSERT INTO messages_in (id, seq, kind, timestamp, status, content) VALUES (?, ?, 'task', ?, 'pending', '{}')",
+    ).run('legacy-slotless', 6, '2026-01-04T12:05:00.000Z');
+
+    migrateMessagesInTable(db);
+    migrateMessagesInTable(db); // idempotent
+
+    const cols = (db.prepare("PRAGMA table_info('messages_in')").all() as Array<{ name: string }>).map((c) => c.name);
+    expect(cols).toContain('scheduled_for');
+
+    const rows = db.prepare('SELECT id, scheduled_for, process_after FROM messages_in ORDER BY seq').all() as Array<{
+      id: string;
+      scheduled_for: string | null;
+      process_after: string | null;
+    }>;
+    expect(rows).toEqual([
+      { id: 'legacy-task', scheduled_for: '2026-01-05T09:00:00.000Z', process_after: '2026-01-05T09:00:00.000Z' },
+      { id: 'legacy-chat', scheduled_for: null, process_after: '2026-01-04T12:10:00.000Z' },
+      { id: 'legacy-slotless', scheduled_for: null, process_after: null },
+    ]);
+    db.close();
+  });
+
+  it('normalizes a naive legacy process_after as it backfills the slot', () => {
+    // Codex round: the backfill is where `scheduled_for` values are BORN on an
+    // upgrade. A bare copy would seed the new column with SQLite's naive
+    // `YYYY-MM-DD HH:MM:SS` on any install whose older writers used it — a
+    // value `new Date()` reads as LOCAL time. strftime treats it as UTC, which
+    // is what it is, and re-renders an already-ISO value unchanged.
+    if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
+    fs.mkdirSync(TEST_DIR, { recursive: true });
+
+    const db = new Database(DB_PATH);
+    db.exec(`
+      CREATE TABLE messages_in (
+        id             TEXT PRIMARY KEY,
+        seq            INTEGER UNIQUE,
+        kind           TEXT NOT NULL,
+        timestamp      TEXT NOT NULL,
+        status         TEXT DEFAULT 'pending',
+        process_after  TEXT,
+        recurrence     TEXT,
+        tries          INTEGER DEFAULT 0,
+        platform_id    TEXT,
+        channel_type   TEXT,
+        thread_id      TEXT,
+        content        TEXT NOT NULL
+      );
+    `);
+    const insert = db.prepare(
+      "INSERT INTO messages_in (id, seq, kind, timestamp, status, process_after, content) VALUES (?, ?, 'task', ?, 'pending', ?, '{}')",
+    );
+    insert.run('legacy-naive', 2, '2026-01-04T12:05:00.000Z', '2026-01-05 09:00:00');
+    insert.run('legacy-iso', 4, '2026-01-04T12:05:00.000Z', '2026-01-05T09:00:00.000Z');
+
+    migrateMessagesInTable(db);
+
+    const rows = db.prepare('SELECT id, scheduled_for FROM messages_in ORDER BY seq').all() as Array<{
+      id: string;
+      scheduled_for: string | null;
+    }>;
+    expect(rows).toEqual([
+      // Same instant, canonical shape.
+      { id: 'legacy-naive', scheduled_for: '2026-01-05T09:00:00.000Z' },
+      { id: 'legacy-iso', scheduled_for: '2026-01-05T09:00:00.000Z' },
+    ]);
+    db.close();
+  });
+
+  it('leaves the column absent when the backfill fails, so the next open retries both', () => {
+    // Codex round 2, P2. Split, a crash between the ALTER and the UPDATE left
+    // the column present with every legacy slot NULL — and because the next
+    // open sees it in PRAGMA table_info, the backfill never ran again. The
+    // first retry after that would rewrite process_after and the formatter
+    // would announce the backoff deadline: the regression made permanent.
+    if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
+    fs.mkdirSync(TEST_DIR, { recursive: true });
+
+    const db = new Database(DB_PATH);
+    // Every earlier column the migration would add is already present, so the
+    // scheduled_for backfill is the ONLY messages_in UPDATE the run reaches.
+    // Without that, the trigger below aborts the series_id backfill instead
+    // and the test passes for the wrong reason.
+    db.exec(`
+      CREATE TABLE messages_in (
+        id                TEXT PRIMARY KEY,
+        seq               INTEGER UNIQUE,
+        kind              TEXT NOT NULL,
+        timestamp         TEXT NOT NULL,
+        status            TEXT DEFAULT 'pending',
+        process_after     TEXT,
+        recurrence        TEXT,
+        series_id         TEXT,
+        tries             INTEGER DEFAULT 0,
+        trigger           INTEGER NOT NULL DEFAULT 1,
+        source_session_id TEXT,
+        on_wake           INTEGER NOT NULL DEFAULT 0,
+        platform_id       TEXT,
+        channel_type      TEXT,
+        thread_id         TEXT,
+        content           TEXT NOT NULL
+      );
+    `);
+    db.prepare(
+      "INSERT INTO messages_in (id, seq, kind, timestamp, status, process_after, series_id, content) VALUES (?, ?, 'task', ?, 'pending', ?, ?, '{}')",
+    ).run('legacy-atomic', 2, '2026-01-04T12:05:00.000Z', '2026-01-05T09:00:00.000Z', 'legacy-atomic');
+
+    // Deterministic injection of "the backfill did not complete": a trigger
+    // that aborts the UPDATE the migration is about to run.
+    db.exec(`
+      CREATE TRIGGER fail_backfill BEFORE UPDATE ON messages_in
+      BEGIN SELECT RAISE(ABORT, 'injected backfill failure'); END;
+    `);
+    expect(() => migrateMessagesInTable(db)).toThrow('injected backfill failure');
+
+    // Rolled back together: no column, so the next open runs both again.
+    const afterFailure = (db.prepare("PRAGMA table_info('messages_in')").all() as Array<{ name: string }>).map(
+      (c) => c.name,
+    );
+    expect(afterFailure).not.toContain('scheduled_for');
+
+    db.exec('DROP TRIGGER fail_backfill');
+    migrateMessagesInTable(db);
+    expect(db.prepare('SELECT scheduled_for FROM messages_in WHERE id = ?').get('legacy-atomic')).toEqual({
+      scheduled_for: '2026-01-05T09:00:00.000Z',
+    });
+    db.close();
+  });
+
+  it('a legacy task migrated then crashed keeps its slot through the retry backoff', () => {
+    // The end-to-end shape finding #1 named: upgrade, then the FIRST crash.
+    if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
+    fs.mkdirSync(TEST_DIR, { recursive: true });
+
+    const db = new Database(DB_PATH);
+    db.exec(`
+      CREATE TABLE messages_in (
+        id             TEXT PRIMARY KEY,
+        seq            INTEGER UNIQUE,
+        kind           TEXT NOT NULL,
+        timestamp      TEXT NOT NULL,
+        status         TEXT DEFAULT 'pending',
+        process_after  TEXT,
+        recurrence     TEXT,
+        tries          INTEGER DEFAULT 0,
+        platform_id    TEXT,
+        channel_type   TEXT,
+        thread_id      TEXT,
+        content        TEXT NOT NULL
+      );
+    `);
+    db.prepare(
+      "INSERT INTO messages_in (id, seq, kind, timestamp, status, process_after, content) VALUES (?, ?, 'task', ?, 'pending', ?, '{}')",
+    ).run('legacy-then-crash', 2, '2026-01-04T12:05:00.000Z', '2026-01-05T09:00:00.000Z');
+
+    migrateMessagesInTable(db);
+    deferMessageForFreshContextRetry(db, 'legacy-then-crash', 600);
+
+    const row = db
+      .prepare('SELECT process_after, scheduled_for FROM messages_in WHERE id = ?')
+      .get('legacy-then-crash') as { process_after: string; scheduled_for: string };
+    expect(row.process_after).not.toBe('2026-01-05T09:00:00.000Z');
+    expect(row.scheduled_for).toBe('2026-01-05T09:00:00.000Z');
     db.close();
   });
 
