@@ -14,7 +14,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 
-import { UPSTREAM_FILES, type MailboxSeamManifest } from '../scripts/mailbox-seam-manifest.js';
+import { UPSTREAM_FILES, type MailboxSeamManifest } from './mailbox-seam-manifest.js';
 
 const REPO_ROOT = path.resolve(__dirname, '..');
 const MANIFEST_PATH = path.join(REPO_ROOT, 'src/mailbox/UPSTREAM-MANIFEST.json');

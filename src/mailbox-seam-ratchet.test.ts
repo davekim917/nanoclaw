@@ -12,7 +12,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { describe, expect, expectTypeOf, it } from 'vitest';
 
-import { computeOffenders } from '../scripts/mailbox-seam-ratchet-scan.js';
+import { computeOffenders } from './mailbox-seam-ratchet.js';
 import type { DeliveryActionHandler } from './delivery.js';
 
 const REPO_ROOT = path.resolve(__dirname, '..');
