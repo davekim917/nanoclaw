@@ -64,7 +64,20 @@ export function sessionDir(agentGroupId: string, sessionId: string): string {
 
 /** Host-owned runner context, kept outside the agent-writable session directory. */
 export function sessionContextPath(agentGroupId: string, sessionId: string): string {
-  return path.join(DATA_DIR, 'v2-sessions', agentGroupId, '.context', `${sessionId}.json`);
+  return sessionContextPathFor(sessionDir(agentGroupId, sessionId));
+}
+
+/**
+ * The same path, derived from a session DIRECTORY rather than from DATA_DIR.
+ *
+ * The storage reclaim walks an injected sessions root, so it cannot go through
+ * `sessionContextPath`. One definition of the layout keeps the two from
+ * drifting — and they must not: the context file is a SIBLING of the session
+ * directory, so removing that directory does not take it, and a reclaim that
+ * misses it leaks one file per session forever.
+ */
+export function sessionContextPathFor(sessionPath: string): string {
+  return path.join(path.dirname(sessionPath), '.context', `${path.basename(sessionPath)}.json`);
 }
 
 /** Materialize the immutable context the runner receives at startup. */

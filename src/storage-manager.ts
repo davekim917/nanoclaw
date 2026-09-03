@@ -30,6 +30,7 @@ import { tryRunWithStorageCleanupClaim } from './storage-activity.js';
 import {
   inboundDbPath,
   outboundDbPath,
+  sessionContextPathFor,
   sessionsBaseDir,
   threadsBaseDir,
   threadWorktreeDir,
@@ -1432,6 +1433,10 @@ function createArchiveSessionAction(args: {
           }
         }
         fs.rmSync(args.sessPath, { recursive: true, force: true });
+        // The runner context file is a SIBLING of the session directory
+        // (<group>/.context/<session>.json), so removing the directory does
+        // not take it. Left behind, every reclaimed session leaks one.
+        fs.rmSync(sessionContextPathFor(args.sessPath), { force: true });
       });
       return claimed && acted;
     },
@@ -1479,6 +1484,8 @@ export function finishInterruptedSessionArchivals(sessionsRoot: string = session
         continue;
       }
       if (fs.existsSync(sessPath)) fs.rmSync(sessPath, { recursive: true, force: true });
+      // Sibling of the session directory — see the note in the archival path.
+      fs.rmSync(sessionContextPathFor(sessPath), { force: true });
       result.finished += 1;
       continue;
     }
