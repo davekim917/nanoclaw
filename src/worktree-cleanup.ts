@@ -18,12 +18,14 @@ import { runningContainerMounts } from './container-mounts.js';
 import { isContainerRunning, isContainerSpawning } from './container-runner.js';
 import { getDb } from './db/connection.js';
 // The GC's reclaim gate is synchronous all the way up through
-// `runStorageGcOnce`, and the mailbox seam's `session()` is async. Rather than
-// turn the whole quarantine/rollback path inside out in this PR, the two reads
-// below stay on the module's OWN open funnel — the same funnel the seam uses,
-// so there is still exactly one implementation of each statement (invariant
-// I-2). This file therefore stays on the raw-access allowlist; moving the GC
-// onto the seam is its own change.
+// `runStorageGcOnce`, and the mailbox session is async, so the busy probe below
+// uses `readSessionOutbound` — the module's SYNCHRONOUS read funnel — rather
+// than a mailbox session. Same module, same single implementation of each
+// statement (invariant I-2), and it asks an outbound-keyed existence question,
+// which is the right one for a probe that reads only outbound state.
+//
+// This file is NOT on the raw-access allowlist; PR 7 took it off. The two
+// inbound touches that remain are `fs.existsSync` on a path, not opens.
 import { readSessionOutbound, sessionMailboxPath } from './modules/mailbox/index.js';
 import { onHostShutdown, onHostStart } from './host-lifecycle.js';
 import { log } from './log.js';

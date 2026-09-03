@@ -48,8 +48,18 @@ export function resolveSlackSafetyMessagingGroupId(session: Session): string | n
     // Read-only seam: the spawn gate must never provision or migrate the
     // session it is judging (invariant I-4). `undefined` is "no mailbox",
     // which falls through to the same fail-closed null as "no route".
-    const row = readSessionInbound({ agentGroupId: session.agent_group_id, sessionId: session.id }, (mailbox) =>
-      mailbox.getLatestTaskDeliveryRoute(),
+    //
+    // Same two options as the self-heal probe, and for the same reason: the
+    // replaced `withInboundDb` opened READ-WRITE with a 5s busy_timeout, which
+    // is both a longer wait and the mechanism that rolls a hot journal back.
+    // Defaulting here makes the spawn gate stricter than the code it replaced,
+    // and a gate that cannot resolve its route falls through to the fail-closed
+    // null — which is what spawns every scheduled fire under the `-noslack`
+    // identity, the regression this site exists to prevent.
+    const row = readSessionInbound(
+      { agentGroupId: session.agent_group_id, sessionId: session.id },
+      (mailbox) => mailbox.getLatestTaskDeliveryRoute(),
+      { busyTimeoutMs: 5000, recoverJournal: true },
     );
 
     if (!row?.channel_type) return null;

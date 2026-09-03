@@ -616,9 +616,27 @@ async function seriesRoutingStamp(
   // session it is asking about (invariant I-4). `undefined` is "no mailbox",
   // which reads the same as "no routing stamp" here — both leave the claim
   // unrouted rather than guessing a destination.
+  //
+  // The two options restore what the replaced `withInboundDb` did. It reached
+  // `openInboundDb`: a READ-WRITE open with `busy_timeout = 5000` and
+  // `journal_mode = DELETE`. The funnel defaults to the console fan-out's 1s
+  // and no recovery, which is stricter on both counts.
+  //
+  // The timeout is the demonstrable half — 5000 to 1000, so a contended
+  // session gives up where it used to wait. `recoverJournal` is here on
+  // MECHANISM rather than a reproduced failure: `recoverHotJournal` is a
+  // read-write open that touches the DB, which is what the replaced open
+  // already was, so this restores its behavior rather than adding one. (A hot
+  // journal would not reproduce on this host to prove it end to end — the
+  // header comes back zeroed and SQLite ignores it.)
+  //
+  // What the conversion still drops is the schema-ensure, the migration and
+  // the reclaim-blocking activity marker, which is the whole point of it.
   const { readSessionInbound } = await import('../mailbox/index.js');
-  const stamp = readSessionInbound({ agentGroupId, sessionId }, (mailbox) =>
-    mailbox.getLatestTaskRoutingStamp(seriesId),
+  const stamp = readSessionInbound(
+    { agentGroupId, sessionId },
+    (mailbox) => mailbox.getLatestTaskRoutingStamp(seriesId),
+    { busyTimeoutMs: 5000, recoverJournal: true },
   );
   if (!stamp) return null; // `--isolated`: stamped no routing on purpose
 
