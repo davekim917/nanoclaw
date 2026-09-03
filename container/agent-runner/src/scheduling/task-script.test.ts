@@ -17,7 +17,7 @@ import fs from 'node:fs';
 import { getInboundDb, getOutboundDb } from '../mailbox/sqlite/connection.js';
 import { closeSessionDb, initTestSessionDb } from '../modules/mailbox/testing.js';
 import { getPendingMessages, markScriptSkipped } from '../db/messages-in.js';
-import { applyPreTaskScripts } from './task-script.js';
+import { applyPreTaskScripts, runScript } from './task-script.js';
 
 // Point the pre-task classifier at the real shared destructive core (same
 // module the interactive Bash gate uses). In a container this lives at
@@ -228,5 +228,75 @@ describe('pre-task managed Git guard', () => {
     expect(keep).toHaveLength(1);
     expect(JSON.parse(keep[0]!.content).scriptOutput).toEqual({ safe: true });
     expect(fs.existsSync(marker)).toBe(true);
+  });
+});
+
+describe('a timed-out script is reported as a timeout', () => {
+  /**
+   * execFile kills on timeout, so the callback receives a generic
+   * "Command failed" — the same shape a script that exited non-zero produces.
+   * `killed` is the only thing that tells them apart. Without it the log said
+   * `error: Command failed: bash /tmp/task-script-<id>.sh` for a script that
+   * merely ran long, which reads as a broken script and sends whoever is
+   * debugging it looking for a bug that isn't there. The fork's 120s ceiling
+   * and 8-failure auto-pause make that misread expensive: the series pauses
+   * and the operator never learns the ceiling was the cause.
+   */
+  const captureLogs = async (fn: () => Promise<unknown>): Promise<string[]> => {
+    const lines: string[] = [];
+    const original = console.error;
+    console.error = (...args: unknown[]) => void lines.push(args.map(String).join(' '));
+    try {
+      await fn();
+    } finally {
+      console.error = original;
+    }
+    return lines;
+  };
+
+  it('names the timeout and the ceiling it hit, not a generic command failure', async () => {
+    const lines = await captureLogs(() => runScript('sleep 5', 't-timeout', 150));
+    const joined = lines.join('\n');
+    expect(joined).toContain('[t-timeout] timed out after 150ms');
+    expect(joined).toContain('NANOCLAW_TASK_SCRIPT_TIMEOUT_MS');
+    expect(joined).not.toContain('error: Command failed');
+  });
+
+  it('still resolves null, so the task is skipped exactly as before', async () => {
+    await captureLogs(async () => {
+      expect(await runScript('sleep 5', 't-timeout-null', 150)).toBeNull();
+    });
+  });
+
+  it('leaves a genuine non-zero exit reported as an error', async () => {
+    const lines = await captureLogs(() => runScript('exit 3', 't-exit', 5000));
+    const joined = lines.join('\n');
+    expect(joined).toContain('error: Command failed');
+    expect(joined).not.toContain('timed out');
+  });
+
+  it("a timed-out script still acks 'script-skip:error', so auto-pause accounting is unchanged", async () => {
+    // The skip reason stays 'error' on purpose. A script that hangs every fire
+    // is as broken as one that exits 1, and the 8-consecutive-failure pause
+    // (src/modules/scheduling/recurrence.ts, SCRIPT_FAIL_PAUSE_CAP) is exactly
+    // the right response. Only the log line that tells the operator WHY it
+    // failed changes — the ack the host counts does not.
+    process.env.NANOCLAW_TASK_SCRIPT_TIMEOUT_MS = '150';
+    try {
+      insertTask('t-timeout-ack', 'sleep 5');
+      let outcome!: Awaited<ReturnType<typeof applyPreTaskScripts>>;
+      const lines = await captureLogs(async () => {
+        outcome = await applyPreTaskScripts(getPendingMessages());
+      });
+
+      expect(outcome.keep).toHaveLength(0);
+      expect(outcome.skipped).toEqual([{ id: 't-timeout-ack', reason: 'error' }]);
+      expect(lines.join('\n')).toContain('[t-timeout-ack] timed out after 150ms');
+
+      markScriptSkipped(outcome.skipped);
+      expect(ackStatus('t-timeout-ack')).toBe('script-skip:error');
+    } finally {
+      delete process.env.NANOCLAW_TASK_SCRIPT_TIMEOUT_MS;
+    }
   });
 });
