@@ -206,8 +206,21 @@ export function touchSessionActivity(id: string): void {
   }
 }
 
+/**
+ * Delete a session and the central rows keyed to it.
+ *
+ * `cli_request_executions` (src/cli/request-ledger.ts) is retained on a
+ * terminal signal rather than a clock, so its newest claim per session has no
+ * age at which it expires — without this it would outlive the session forever.
+ * A session with no row has no container and no delivery loop, so nothing is
+ * left that could replay or re-execute the request the claim guarded.
+ */
 export function deleteSession(id: string): void {
-  getDb().prepare('DELETE FROM sessions WHERE id = ?').run(id);
+  const db = getDb();
+  db.transaction(() => {
+    db.prepare('DELETE FROM cli_request_executions WHERE session_id = ?').run(id);
+    db.prepare('DELETE FROM sessions WHERE id = ?').run(id);
+  })();
 }
 
 /**

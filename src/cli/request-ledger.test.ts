@@ -28,7 +28,7 @@ vi.mock('../log.js', async (importOriginal) => ({
   log: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn(), fatal: vi.fn() },
 }));
 
-import { closeDb, getDb, initTestDb, runMigrations } from '../db/index.js';
+import { closeDb, deleteSession, getDb, initTestDb, runMigrations } from '../db/index.js';
 import { getDeliveryAction, type DeliveryActionHandler } from '../delivery.js';
 import { inboundDbPath, initSessionFolder } from '../session-manager.js';
 import type { Session } from '../types.js';
@@ -282,6 +282,17 @@ describe('ledger mechanics', () => {
     pruneCliRequestExecutions();
 
     expect(requestIds().sort()).toEqual(['req-10', 'req-11', 'req-9']);
+  });
+
+  it('deleting the session takes its claims with it — nothing is left to retry them', () => {
+    // The newest claim per session has no age at which it expires, so session
+    // teardown is the only thing that can clear it.
+    completeCliRequest(SESSION_ID, 'req-9', { id: 'req-9', ok: true, data: 1 });
+    claimCliRequest('survivor-session', 'req-8', 'groups-list');
+
+    deleteSession(SESSION_ID);
+
+    expect(requestIds()).toEqual(['req-8']);
   });
 
   it('a week-old unsuperseded claim keeps the fact it ran and loses only its payload', () => {
