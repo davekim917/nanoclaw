@@ -1,6 +1,6 @@
 # Plan: Upstream host-lifecycle seam and host-sweep duty registry (convergence seam 2 of 9)
 
-Status: draft (revision 2.2 — gating only, on top of revision 2's Codex correction batch; see run.md) — approval pending
+Status: APPROVED by the operator 2026-09-03 07:30 ET (revision 2.2 — gating only, on top of revision 2's Codex correction batch; see run.md). Build owner: session update-nanoclaw-3. S2-PR0/PR1 unblocked from main; PR2+ wait for the mailbox stack's final heads.
 Primary runtime: Claude (orchestrator: Fable 5.1; builders: worker tiers per PR)
 Program: upstream convergence, seam 2 (`groups/_ops/upstream-rebaseline-2026-09/`, memory `project_upstream_convergence_program`)
 Upstream target: `nanocoai/nanoclaw` `5c3082a1` (2.3.0, 2026-09-01). `src/host-lifecycle.ts` is byte-identical at `5c3082a1` and at `upstream/main` `0d9328d2` (sha256 `fbf37333…`, verified 2026-09-03), so the port does not age before the next sync.
