@@ -13,12 +13,24 @@ import fs from 'fs';
 import path from 'path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
+import { TIMEZONE } from '../../config.js';
 import { ensureSchema, openInboundDb } from '../../db/session-db.js';
 import { insertTaskRow } from './db.js';
 import { classifyForHostExecution, runHostGatedTaskScripts } from './host-script.js';
 
+// runHostGatedTaskScripts resolves the owning group's timezone via
+// resolveGroupTimezone, which reads container_configs from the central DB
+// (not initialized here) — mock it, same pattern as recurrence.test.ts.
+// Default null → falls back to the real install TIMEZONE; individual tests
+// set an override to test propagation.
+const containerConfigState = vi.hoisted(() => ({ timezone: null as string | null }));
+vi.mock('../../db/container-configs.js', () => ({
+  getContainerConfig: () => ({ timezone: containerConfigState.timezone }),
+}));
+
 const TEST_DIR = uniqueTmpRoot('host-script-test');
 const DB_PATH = path.join(TEST_DIR, 'inbound.db');
+const TEST_GROUP_ID = 'ag-test';
 
 function freshDb() {
   if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
@@ -53,6 +65,7 @@ function rowContent(db: ReturnType<typeof openInboundDb>, id: string): Record<st
 }
 
 afterEach(() => {
+  containerConfigState.timezone = null;
   if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
 });
 
@@ -85,7 +98,7 @@ describe('runHostGatedTaskScripts', () => {
     const db = freshDb();
     insertHostGatedTask(db, 't-gated', 'echo \'{"wakeAgent": false}\'');
 
-    await runHostGatedTaskScripts(db, 'sess-test');
+    await runHostGatedTaskScripts(db, TEST_GROUP_ID, 'sess-test');
 
     expect(rowStatus(db, 't-gated')).toBe('completed');
     db.close();
@@ -95,7 +108,7 @@ describe('runHostGatedTaskScripts', () => {
     const db = freshDb();
     insertHostGatedTask(db, 't-wake', 'echo \'{"wakeAgent": true, "data": {"alerts": 3}}\'');
 
-    await runHostGatedTaskScripts(db, 'sess-test');
+    await runHostGatedTaskScripts(db, TEST_GROUP_ID, 'sess-test');
 
     expect(rowStatus(db, 't-wake')).toBe('pending');
     expect(rowContent(db, 't-wake').scriptOutput).toEqual({ alerts: 3 });
@@ -106,7 +119,7 @@ describe('runHostGatedTaskScripts', () => {
     const db = freshDb();
     insertHostGatedTask(db, 't-err', 'echo boom >&2; exit 1');
 
-    await runHostGatedTaskScripts(db, 'sess-test');
+    await runHostGatedTaskScripts(db, TEST_GROUP_ID, 'sess-test');
 
     expect(rowStatus(db, 't-err')).toBe('failed');
     db.close();
@@ -122,7 +135,7 @@ describe('runHostGatedTaskScripts', () => {
       `touch ${marker}\nrm -rf /workspace/agent/scratch\necho '{"wakeAgent": false}'`,
     );
 
-    await runHostGatedTaskScripts(db, 'sess-test');
+    await runHostGatedTaskScripts(db, TEST_GROUP_ID, 'sess-test');
 
     expect(fs.existsSync(marker)).toBe(false);
     // Row untouched: still pending/trigger=0, no scriptOutput — the normal
@@ -137,7 +150,7 @@ describe('runHostGatedTaskScripts', () => {
     const marker = path.join(TEST_DIR, 'ran.marker');
     insertHostGatedTask(db, 't-sql', `touch ${marker}\npsql -c "DROP TABLE customers"\necho '{"wakeAgent": false}'`);
 
-    await runHostGatedTaskScripts(db, 'sess-test');
+    await runHostGatedTaskScripts(db, TEST_GROUP_ID, 'sess-test');
 
     expect(fs.existsSync(marker)).toBe(false);
     expect(rowStatus(db, 't-sql')).toBe('pending');
@@ -153,7 +166,7 @@ describe('runHostGatedTaskScripts', () => {
       `touch ${marker}\ncommand git --git-dir=/host/canonical/.git worktree prune --expire now\necho '{"wakeAgent": false}'`,
     );
 
-    await runHostGatedTaskScripts(db, 'sess-test');
+    await runHostGatedTaskScripts(db, TEST_GROUP_ID, 'sess-test');
 
     expect(fs.existsSync(marker)).toBe(false);
     expect(rowStatus(db, 't-managed-git')).toBe('pending');
@@ -171,7 +184,7 @@ describe('runHostGatedTaskScripts', () => {
         't-env',
         'echo "{\\"wakeAgent\\": true, \\"data\\": {\\"canary\\": \\"${HOST_SCRIPT_TEST_CANARY:-absent}\\"}}"',
       );
-      await runHostGatedTaskScripts(db, 'sess-test');
+      await runHostGatedTaskScripts(db, TEST_GROUP_ID, 'sess-test');
       expect(rowContent(db, 't-env').scriptOutput).toEqual({ canary: 'absent' });
     } finally {
       if (before === undefined) delete process.env.HOST_SCRIPT_TEST_CANARY;
@@ -184,10 +197,38 @@ describe('runHostGatedTaskScripts', () => {
     const db = freshDb();
     insertHostGatedTask(db, 't-container-only', 'echo \'{"wakeAgent": false}\'', { scriptHost: false });
 
-    await runHostGatedTaskScripts(db, 'sess-test');
+    await runHostGatedTaskScripts(db, TEST_GROUP_ID, 'sess-test');
 
     expect(rowStatus(db, 't-container-only')).toBe('pending');
     expect(rowContent(db, 't-container-only').scriptOutput).toBeUndefined();
+    db.close();
+  });
+
+  // codex: minimalEnv used to read process.env.TZ — the HOST DAEMON's own
+  // clock, same for every group. A gate that reads `date`/weekday must see
+  // the same clock the container path (container-runner.ts's `TZ=` push)
+  // would give it, or a wake decision can flip depending solely on whether
+  // the fire took the host-gated path or the container path.
+  it("applies the owning group's timezone override to a host-gated script", async () => {
+    containerConfigState.timezone = 'Asia/Tokyo';
+    const db = freshDb();
+    insertHostGatedTask(db, 't-tz-override', 'echo "{\\"wakeAgent\\": true, \\"data\\": {\\"tz\\": \\"$TZ\\"}}"');
+
+    await runHostGatedTaskScripts(db, TEST_GROUP_ID, 'sess-test');
+
+    expect(rowContent(db, 't-tz-override').scriptOutput).toEqual({ tz: 'Asia/Tokyo' });
+    db.close();
+  });
+
+  it('falls back to the install timezone when the group has no override', async () => {
+    // containerConfigState.timezone stays null (afterEach default / no group
+    // config row) — resolveGroupTimezone falls back to the install TIMEZONE.
+    const db = freshDb();
+    insertHostGatedTask(db, 't-tz-default', 'echo "{\\"wakeAgent\\": true, \\"data\\": {\\"tz\\": \\"$TZ\\"}}"');
+
+    await runHostGatedTaskScripts(db, TEST_GROUP_ID, 'sess-test');
+
+    expect(rowContent(db, 't-tz-default').scriptOutput).toEqual({ tz: TIMEZONE });
     db.close();
   });
 });

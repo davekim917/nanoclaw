@@ -37,7 +37,8 @@ import { evaluateManagedGitCommand } from '../../managed-git-command-guard.js';
 // Import-order trap (see config.ts): process.env alone misses values that
 // exist only in .env, because this module is imported before index.ts's
 // loadEnvIntoProcess() runs.
-import { TASK_SCRIPT_TIMEOUT_MS } from '../../config.js';
+import { TASK_SCRIPT_TIMEOUT_MS, TIMEZONE } from '../../config.js';
+import { resolveGroupTimezone } from '../../container-config.js';
 
 // Same rationale as the container-side constant (task-script.ts): the flat
 // 30s default killed a working 56s watcher script into an auto-pause.
@@ -127,16 +128,21 @@ export function classifyForHostExecution(script: string): ClassifyResult {
  * Explicit minimal env — NEVER the host process's full process.env, which
  * carries credentials for every session on the fleet. A task script only
  * needs a normal shell environment.
+ *
+ * `tz` is the OWNING GROUP's effective timezone, not the host daemon's own —
+ * see the container-runner.ts comment above the equivalent container-side
+ * `TZ=` push. A gate that reads `date`, weekday, or other local-time logic
+ * must see the same clock the container path would give it.
  */
-function minimalEnv(): NodeJS.ProcessEnv {
+function minimalEnv(tz: string): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {};
   if (process.env.PATH) env.PATH = process.env.PATH;
   if (process.env.HOME) env.HOME = process.env.HOME;
-  if (process.env.TZ) env.TZ = process.env.TZ;
+  env.TZ = tz;
   return env;
 }
 
-export function runHostScript(script: string, taskId: string): Promise<ScriptResult | null> {
+export function runHostScript(script: string, taskId: string, tz: string = TIMEZONE): Promise<ScriptResult | null> {
   // PRIVATE 0700 DIRECTORY, not a predictable name in shared /tmp.
   //
   // The old path was `${os.tmpdir()}/host-task-script-${taskId}-${Date.now()}.sh`
@@ -221,7 +227,7 @@ export function runHostScript(script: string, taskId: string): Promise<ScriptRes
     let child: ReturnType<typeof spawn>;
     try {
       child = spawn('bash', [scriptPath], {
-        env: minimalEnv(),
+        env: minimalEnv(tz),
         detached: true,
         stdio: ['ignore', 'pipe', 'pipe'],
       });
@@ -437,7 +443,11 @@ interface HostGatedTaskRow {
  *   - classifier hit (hard-block or gated) → left untouched entirely; falls
  *     through to the existing, unchanged container-side script execution.
  */
-export async function runHostGatedTaskScripts(inDb: Database.Database, sessionId: string): Promise<void> {
+export async function runHostGatedTaskScripts(
+  inDb: Database.Database,
+  agentGroupId: string,
+  sessionId: string,
+): Promise<void> {
   const due = inDb
     .prepare(
       `SELECT id, content FROM messages_in
@@ -445,6 +455,14 @@ export async function runHostGatedTaskScripts(inDb: Database.Database, sessionId
           AND (process_after IS NULL OR datetime(process_after) <= datetime('now'))`,
     )
     .all() as HostGatedTaskRow[];
+  if (due.length === 0) return;
+
+  // Resolved once per sweep tick, not per row: every due row here belongs to
+  // the same session and therefore the same group. Same value the container
+  // path would get (container-runner.ts's `TZ=` push) — a gate that reads
+  // local-time logic must not disagree with the container it might still hand
+  // off to.
+  const tz = resolveGroupTimezone(agentGroupId);
 
   for (const row of due) {
     let content: Record<string, unknown>;
@@ -467,7 +485,7 @@ export async function runHostGatedTaskScripts(inDb: Database.Database, sessionId
       continue;
     }
 
-    const result = await runHostScript(script, row.id);
+    const result = await runHostScript(script, row.id, tz);
     if (!result || !result.wakeAgent) {
       const status = result ? 'completed' : 'failed';
       inDb.prepare("UPDATE messages_in SET status = ? WHERE id = ? AND status = 'pending'").run(status, row.id);

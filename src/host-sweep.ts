@@ -1676,7 +1676,7 @@ async function prepareDueWake(
   // session would be worse, not cleaner. Both move behind the seam with their
   // own PRs; `legacyInboundHandle` is what keeps host-sweep.ts on the
   // raw-access allowlist until they do.
-  await runHostGatedTaskScripts(mailbox.legacyInboundHandle(), sessionId);
+  await runHostGatedTaskScripts(mailbox.legacyInboundHandle(), agentGroupId, sessionId);
   const admittedTasks = admitDueTaskContexts(mailbox.legacyInboundHandle(), agentGroupId, sessionId);
   const dueCount = mailbox.countDueMessages();
   return {

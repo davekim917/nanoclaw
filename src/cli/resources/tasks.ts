@@ -558,9 +558,22 @@ function updateTaskCommand(args: Record<string, unknown>, ctx: CallerContext) {
   // a cron whose fires cluster on one weekday can be past that window in one
   // zone and still inside it in another. So EVERY matched session validates in
   // its own zone, and all of that happens before the first write.
+  //
+  // codex: selectTask() prioritizes a live row but falls back to terminal
+  // (completed/cancelled) history when a session has none — right for getTask
+  // and the audit before/after lookups below, which want that history, but
+  // WRONG here: updateTask() only ever mutates pending/paused rows, so a
+  // terminal row can never be one of the writes this validates for. Left
+  // unfiltered, a live series edited in one session can be rejected by a
+  // same-id terminal row's stale script/timezone in a different one. Require
+  // live status at the one place `matched` is built, rather than in
+  // selectTask() itself, which other callers rely on for terminal history.
   const matched = selectedSessions(args, ctx)
     .map((session) => ({ session, row: withInbound(session, (db) => selectTask(db, id)) }))
-    .filter((m): m is { session: ScopedSession; row: TaskRow } => m.row !== undefined);
+    .filter(
+      (m): m is { session: ScopedSession; row: TaskRow } =>
+        m.row !== undefined && (m.row.status === 'pending' || m.row.status === 'paused'),
+    );
 
   const validationZones =
     matched.length > 0

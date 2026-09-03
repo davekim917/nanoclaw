@@ -225,6 +225,72 @@ describe('tasks CLI resource', () => {
     }
   });
 
+  it("excludes a same-id terminal row in another session from an unscoped update's validation set", async () => {
+    // selectTask() prioritizes a live row but falls back to terminal
+    // (completed/cancelled) history when a session has none for the matched
+    // id — right for getTask and the audit before/after lookups, wrong for
+    // the unscoped-update validation set, which must cover exactly the rows
+    // updateTask() can actually mutate. Left unfiltered, a scriptless
+    // terminal row in one session could subject a SCRIPTED live task in
+    // another session to the (script-exempt) recurrence ceiling.
+    createGroup('ag-terminal-a');
+    createGroup('ag-terminal-b');
+
+    const a = await dispatch(
+      {
+        id: 'create-a',
+        command: 'tasks-create',
+        args: {
+          group: 'ag-terminal-a',
+          prompt: 'digest',
+          name: 'scripted',
+          process_after: '2026-01-15T09:00:00Z',
+          script: 'echo \'{"wakeAgent": false}\'',
+        },
+      },
+      { caller: 'host' },
+    );
+    expect(a.ok).toBe(true);
+    if (!a.ok) return;
+    const { series_id: sharedId, session_id: sessionA } = a.data as { series_id: string; session_id: string };
+
+    const b = await dispatch(
+      {
+        id: 'create-b',
+        command: 'tasks-create',
+        args: { group: 'ag-terminal-b', prompt: 'digest', name: 'scriptless', process_after: '2026-01-15T09:00:00Z' },
+      },
+      { caller: 'host' },
+    );
+    expect(b.ok).toBe(true);
+    if (!b.ok) return;
+    const { session_id: sessionB } = b.data as { series_id: string; session_id: string };
+
+    // Force the same series id onto B's row, then terminate it — the exact
+    // shape selectTask()'s live-first fallback exists for.
+    const bDb = new Database(inboundDbPath('ag-terminal-b', sessionB));
+    bDb
+      .prepare("UPDATE messages_in SET id = ?, series_id = ?, status = 'cancelled' WHERE kind = ?")
+      .run(sharedId, sharedId, 'task');
+    bDb.close();
+
+    // Every 5 minutes comfortably exceeds the 4-fire/24h ceiling in any zone:
+    // rejected if B's scriptless terminal row is (wrongly) validated,
+    // accepted if it's excluded — A's own row IS scripted, so A is exempt.
+    const updated = await dispatch(
+      { id: 'terminal-exclude', command: 'tasks-update', args: { id: sharedId, recurrence: '*/5 * * * *' } },
+      { caller: 'host' },
+    );
+    expect(updated.ok).toBe(true);
+
+    const aDb = new Database(inboundDbPath('ag-terminal-a', sessionA), { readonly: true });
+    const row = aDb.prepare("SELECT recurrence FROM messages_in WHERE kind = 'task'").get() as {
+      recurrence: string | null;
+    };
+    aDb.close();
+    expect(row.recurrence).toBe('*/5 * * * *');
+  });
+
   it('create writes the task into the group system session, not the caller chat session', async () => {
     const resp = await dispatch(
       {
