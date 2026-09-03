@@ -33,6 +33,7 @@ import {
   stopDeliveryPolls,
 } from './delivery.js';
 import { startHostSweep, stopHostSweep } from './host-sweep.js';
+import { startHostModules, stopHostModules } from './host-lifecycle.js';
 import { runOnecliBootPreflight } from './onecli-preflight.js';
 import { stopStorageMaintenanceWorker } from './storage-maintenance-worker.js';
 import { resetStorageActivityState } from './storage-activity.js';
@@ -64,6 +65,11 @@ import { releaseOrphanedRepoIngressFencesAtStartup } from './repo-fence-recovery
 // level — which would hit a TDZ error if the arrays lived here. Re-exported
 // here so existing callers see the same surface.
 import { getResponseHandlers, getShutdownCallbacks, type ResponsePayload } from './response-registry.js';
+
+// Upstream host-lifecycle seam (docs/specs/upstream-host-sweep-seam/plan.md §4.1).
+// Aborted as the first shutdown action so `HostStartContext.signal` carries real
+// semantics for any module that registers a start callback.
+export const hostAbortController = new AbortController();
 
 async function dispatchResponse(payload: ResponsePayload): Promise<void> {
   for (const handler of getResponseHandlers()) {
@@ -489,6 +495,12 @@ export async function main(): Promise<void> {
   // createThread). See createChannelDeliveryAdapter in channel-registry.ts.
   setDeliveryAdapter(createChannelDeliveryAdapter());
 
+  // 4b. Host module lifecycle (upstream seam) — modules register onHostStart/
+  // onHostShutdown callbacks at import time; this is where registered start
+  // work actually begins (docs/specs/upstream-host-sweep-seam/plan.md §4.1).
+  // PR 0 registers nothing, so this is inert by construction.
+  await startHostModules({ db, signal: hostAbortController.signal });
+
   // Start recovery only after permissions and delivery are fully wired. A
   // replay can immediately exercise either surface (sibling bots, unknown
   // sender/channel approval), so it must not race partial host startup.
@@ -588,6 +600,11 @@ export async function main(): Promise<void> {
 /** Graceful shutdown. */
 async function shutdown(signal: string): Promise<void> {
   log.info('Shutdown signal received', { signal });
+  // Upstream host-lifecycle seam: abort registered modules' signal, then run
+  // their onHostShutdown callbacks LIFO, before any other shutdown work
+  // (docs/specs/upstream-host-sweep-seam/plan.md §4.1).
+  hostAbortController.abort();
+  await stopHostModules();
   for (const cb of getShutdownCallbacks()) {
     try {
       await cb();

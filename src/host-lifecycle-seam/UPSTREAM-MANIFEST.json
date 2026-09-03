@@ -1,0 +1,7 @@
+{
+  "upstream": "5c3082a1",
+  "files": {
+    "src/host-lifecycle.test.ts": "aa8077a4b73e5cc784dbe8eefd6c858db62a92fd4eb0a7c97bb6f24a1b4d0b63",
+    "src/host-lifecycle.ts": "fbf37333e51a27663e45402f1a20bfd1a837a7b0bcc9c30c3874d06268b8db3b"
+  }
+}
