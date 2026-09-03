@@ -285,6 +285,63 @@ function historyBridge(messages: Array<Record<string, unknown>>, extract = true)
 const historyAuthor = { userId: 'U1', fullName: 'Gavriel C', userName: 'gavriel', isMe: false };
 const historyMeta = { dateSent: new Date('2026-09-02T10:00:00Z') };
 
+describe('recovered-mention detection over the table projection', () => {
+  /**
+   * The third consumer of the projection. A REST-fetched recovery row carries
+   * no isMention, and the bot may be addressed ONLY inside a pasted cell.
+   * Mirrors the Slack adapter's detectRecoveredMention hook.
+   */
+  const detect = (raw: Record<string, unknown>, botId: string): boolean => {
+    const mention = `<@${botId}>`;
+    if (typeof raw.text === 'string' && raw.text.includes(mention)) return true;
+    return extractSlackRawText(raw)?.includes(mention) === true;
+  };
+
+  const tableMentioning = (userId: string) => ({
+    text: 'who owns these:',
+    attachments: [
+      {
+        blocks: [{ type: 'table', rows: [[{ type: 'rich_text', elements: [{ type: 'user', user_id: userId }] }]] }],
+      },
+    ],
+  });
+
+  it('finds the bot when the mention lives only in a table cell', () => {
+    expect(detect(tableMentioning('UBOT'), 'UBOT')).toBe(true);
+  });
+
+  it('does not fire for a different user mentioned in the table', () => {
+    expect(detect(tableMentioning('UHUMAN'), 'UBOT')).toBe(false);
+  });
+
+  it('still finds a mention in the ordinary message text', () => {
+    expect(detect({ text: 'hey <@UBOT>' }, 'UBOT')).toBe(true);
+  });
+});
+
+describe('truncation', () => {
+  it('does not split a surrogate pair at the cap', () => {
+    // Rows of one emoji each, rendered from codepoints, so the cut lands
+    // mid-pair without the guard.
+    const rows = Array.from({ length: 60_000 }, () => [
+      { type: 'rich_text', elements: [{ type: 'emoji', name: 'tada', unicode: '1f389' }] },
+    ]);
+    const text = extractSlackRawText({ attachments: [{ blocks: [{ type: 'table', rows }] }] });
+    expect(text).toContain('[table truncated]');
+    for (let i = 0; i < text!.length; i++) {
+      const code = text!.charCodeAt(i);
+      if (code >= 0xd800 && code <= 0xdbff) {
+        const next = text!.charCodeAt(i + 1);
+        expect(next).toBeGreaterThanOrEqual(0xdc00);
+        expect(next).toBeLessThanOrEqual(0xdfff);
+        i++;
+      } else {
+        expect(code < 0xdc00 || code > 0xdfff).toBe(true);
+      }
+    }
+  });
+});
+
 describe('Slack pasted tables in replayed thread context', () => {
   it('recovers a table-only history message instead of skipping it as empty', async () => {
     const bridge = historyBridge([

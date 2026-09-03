@@ -4,6 +4,19 @@
  * Slack sends pasted tables as attachment blocks instead of message text or
  * files. The Chat SDK adapter currently leaves those blocks only in
  * `message.raw`, which the host deliberately drops before persistence.
+ *
+ * THE INVARIANT, and the reason this comment exists: the projection below is
+ * part of the message body. Every consumer that reads a Slack message's text
+ * has to consult it, not just the one that persists the body — a table can be
+ * the ONLY content of a message, including the only place the bot is
+ * @-mentioned. Three consumers do today:
+ *
+ *  - `messageToInbound` appends it to the persisted body (chat-sdk-bridge.ts);
+ *  - `fetchThreadHistory` appends it to replayed thread context (same file);
+ *  - `detectRecoveredMention` searches it for the bot's id (slack.ts).
+ *
+ * A fourth consumer that reads `.text` and skips this is a message the agent
+ * silently never sees. Add it here when you add it there.
  */
 
 const MAX_TABLE_CHARS = 100_000;
@@ -105,6 +118,15 @@ function cellText(value: unknown): string {
   return out.replace(/\s+/g, ' ').trim();
 }
 
+/** Slice without splitting a surrogate pair — an emoji rendered from its
+ *  codepoints sits right on the truncation boundary often enough to matter,
+ *  and half a pair is an invalid character in the persisted body. */
+function sliceWholeCharacters(text: string, limit: number): string {
+  const cut = text.slice(0, limit);
+  const last = cut.charCodeAt(cut.length - 1);
+  return last >= 0xd800 && last <= 0xdbff ? cut.slice(0, -1) : cut;
+}
+
 export function extractSlackRawText(raw: Record<string, unknown>): string | null {
   const attachments = Array.isArray(raw.attachments) ? raw.attachments : [];
   const lines: string[] = [];
@@ -126,5 +148,5 @@ export function extractSlackRawText(raw: Record<string, unknown>): string | null
   // null rather than handing the bridge a body of separators and blank lines.
   if (text.trim() === '') return null;
   if (text.length <= MAX_TABLE_CHARS) return text;
-  return `${text.slice(0, MAX_TABLE_CHARS - 20)}\n[table truncated]`;
+  return `${sliceWholeCharacters(text, MAX_TABLE_CHARS - 20)}\n[table truncated]`;
 }

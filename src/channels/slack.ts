@@ -500,8 +500,15 @@ for (const ws of workspaces) {
         },
         detectRecoveredMention: (message) => {
           if (!identity) return false;
-          const raw = message.raw as { text?: string } | undefined;
-          return raw?.text?.includes(`<@${identity.userId}>`) === true;
+          const raw = message.raw as Record<string, unknown> | undefined;
+          if (!raw) return false;
+          const mention = `<@${identity.userId}>`;
+          if (typeof raw.text === 'string' && raw.text.includes(mention)) return true;
+          // A pasted table can be the only place the bot is addressed, and a
+          // REST-fetched recovery row carries no isMention. The same
+          // projection the bridge appends to the body answers this question
+          // too — see the invariant note in slack-raw-text.ts.
+          return extractSlackRawText(raw)?.includes(mention) === true;
         },
         // Sibling-bot messages are admissible in recovery (mirrors discord.ts):
         // without this, a sibling's @-mention that arrives during an event-loop
