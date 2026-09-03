@@ -30,7 +30,7 @@ standing brief and marks the folder as a template.
 │   │                          #           CLAUDE.md/AGENTS.md every spawn
 │   └── additional_context/    # optional: extra .md files
 │       └── *.md
-├── .mcp.json             # optional: { "mcpServers": { ... } } — command + args, NO secrets
+├── .mcp.json             # optional: { "mcpServers": { ... } } — command + args, or a remote url, NO secrets
 ├── skills/<name>/        # optional: one folder per skill (SKILL.md + references/), copied whole
 └── README.md             # recommended: per-template docs
 ```

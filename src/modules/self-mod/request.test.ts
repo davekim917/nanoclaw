@@ -351,6 +351,118 @@ describe('add_mcp_server validation', () => {
   });
 });
 
+describe('add_mcp_server remote Streamable HTTP servers', () => {
+  it('accepts a remote https url and renders it on the card', async () => {
+    await submitAddMcpServer({ name: 'deepwiki', url: 'https://mcp.deepwiki.com/mcp' }, session);
+    expect(delivered).toHaveLength(1);
+    const question = lastQuestion();
+    expect(question).toContain('type: "http"');
+    expect(question).toContain('url: "https://mcp.deepwiki.com/mcp"');
+    // The stdio-only fields must not appear on a remote card.
+    expect(question).not.toContain('command:');
+
+    const [row] = getPendingApprovalsByAction('add_mcp_server');
+    expect(JSON.parse(row.payload as string)).toEqual({
+      name: 'deepwiki',
+      type: 'http',
+      url: 'https://mcp.deepwiki.com/mcp',
+    });
+  });
+
+  it('keeps a non-secret query string byte-faithful on the card', async () => {
+    const url = 'https://mcp.exa.ai/mcp?tools=web_search_exa,web_fetch_exa';
+    await submitAddMcpServer({ name: 'exa', url }, session);
+    expect(lastQuestion()).toContain(`url: ${JSON.stringify(url)}`);
+  });
+
+  it('redacts a secret-shaped path segment but never the origin', async () => {
+    const token = 'sk-abc123def456';
+    await submitAddMcpServer({ name: 'zapier', url: `https://hooks.example.com/s/${token}/mcp` }, session);
+    const question = lastQuestion();
+    expect(question).toContain('https://hooks.example.com/');
+    expect(question).not.toContain(token);
+    expect(question).toContain('sha256');
+    // The payload keeps the verbatim URL — the card is a view, not the value.
+    const [row] = getPendingApprovalsByAction('add_mcp_server');
+    expect(JSON.parse(row.payload as string).url).toBe(`https://hooks.example.com/s/${token}/mcp`);
+  });
+
+  it('carries OneCLI placeholder headers through to the payload and the card', async () => {
+    await submitAddMcpServer(
+      { name: 'datafold', url: 'https://app.datafold.com/mcp/', headers: { Authorization: 'Key onecli-managed' } },
+      session,
+    );
+    expect(lastQuestion()).toContain('headers: {"Authorization":"Key onecli-managed"}');
+    const [row] = getPendingApprovalsByAction('add_mcp_server');
+    expect(JSON.parse(row.payload as string).headers).toEqual({ Authorization: 'Key onecli-managed' });
+  });
+
+  it('rejects a credential header that is not the OneCLI placeholder', async () => {
+    await submitAddMcpServer(
+      { name: 'leaky', url: 'https://example.com/mcp', headers: { Authorization: 'Bearer real-token-here' } },
+      session,
+    );
+    expect(expectRejected()).toMatch(/onecli-managed/);
+  });
+
+  it('rejects a raw credential in any header value', async () => {
+    await submitAddMcpServer(
+      { name: 'leaky', url: 'https://example.com/mcp', headers: { 'X-Thing': 'ghp_deadbeefcafe1234' } },
+      session,
+    );
+    expect(expectRejected()).toMatch(/raw credential/);
+  });
+
+  it('rejects plain http except for localhost and host.docker.internal', async () => {
+    await submitAddMcpServer({ name: 'insecure', url: 'http://example.com/mcp' }, session);
+    expect(expectRejected()).toMatch(/must use HTTPS/);
+
+    delivered = [];
+    await submitAddMcpServer({ name: 'local', url: 'http://localhost:8080/mcp' }, session);
+    expect(delivered).toHaveLength(1);
+
+    delivered = [];
+    await submitAddMcpServer({ name: 'hostgw', url: 'http://host.docker.internal:8080/mcp' }, session);
+    expect(delivered).toHaveLength(1);
+  });
+
+  it('rejects credentials, fragments, and credential-shaped query keys in the url', async () => {
+    for (const url of [
+      'https://user:pass@example.com/mcp',
+      'https://example.com/mcp#frag',
+      'https://example.com/mcp?authToken=abc',
+      'https://example.com/mcp?api_key=abc',
+    ]) {
+      delivered = [];
+      await submitAddMcpServer({ name: 'bad', url }, session);
+      expectRejected();
+    }
+  });
+
+  it('rejects command and url together, and stdio-only fields on a remote server', async () => {
+    await submitAddMcpServer({ name: 'both', command: 'node', url: 'https://example.com/mcp' }, session);
+    expect(expectRejected()).toMatch(/exactly one of command or url/);
+
+    delivered = [];
+    await submitAddMcpServer({ name: 'mixed', url: 'https://example.com/mcp', env: { K: 'v' } }, session);
+    expect(expectRejected()).toMatch(/only valid with command/);
+
+    delivered = [];
+    await submitAddMcpServer({ name: 'mixed', command: 'node', headers: { 'X-A': 'b' } }, session);
+    expect(expectRejected()).toMatch(/headers are only valid with url/);
+  });
+
+  it('rejects a server name outside the [A-Za-z0-9_-] charset', async () => {
+    await submitAddMcpServer({ name: 'bad name!', url: 'https://example.com/mcp' }, session);
+    expect(expectRejected()).toMatch(/1-64 characters/);
+  });
+
+  it('rejects an env key that is not a valid environment variable name', async () => {
+    await submitAddMcpServer({ name: 'ok', command: 'node', env: { 'not-an-env-key': 'v' } }, session);
+    expect(expectRejected()).toMatch(/environment variable name/);
+  });
+});
+
 describe('add_mcp_server secret redaction', () => {
   function redactedForm(value: string): string {
     const digest = createHash('sha256').update(value).digest('hex').slice(0, 8);

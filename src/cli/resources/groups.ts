@@ -4,8 +4,10 @@ import path from 'path';
 
 import { GROUPS_DIR } from '../../config.js';
 import {
+  parseMcpServerConfig,
   readContainerConfig,
   resolveContainerSecurity,
+  validateMcpServerName,
   type AdditionalMountConfig,
   type McpServerConfig,
   updateContainerConfig,
@@ -532,25 +534,29 @@ registerResource({
       access: 'approval',
       description:
         'Add an MCP server to a group. Requires `ncl groups restart` to take effect. ' +
-        'Use --id <group-id> --name <server-name> --command <cmd> [--args <json-array>] [--env <json-object>].',
+        'Use --id <group-id> --name <server-name> with EITHER --command <cmd> [--args <json-array>] [--env <json-object>] ' +
+        'for a local stdio server, OR --url <https-url> [--headers <json-object>] for a remote Streamable HTTP server ' +
+        '(plain HTTP only for localhost / host.docker.internal). Credential headers must carry the "onecli-managed" ' +
+        'placeholder — the OneCLI gateway substitutes the real secret at the proxy boundary.',
       handler: async (args) => {
         const id = args.id as string;
         if (!id) throw new Error('--id is required');
         const name = args.name as string;
         if (!name) throw new Error('--name is required');
-        const command = args.command as string;
-        if (!command) throw new Error('--command is required');
+        validateMcpServerName(name);
 
         const group = getAgentGroup(id);
         if (!group) throw new Error(`No agent group: ${id}`);
         const row = getContainerConfig(id);
         if (!row) throw new Error(`No container config for group: ${id}`);
 
-        const newEntry: McpServerConfig = {
-          command,
-          args: args.args ? (JSON.parse(args.args as string) as string[]) : [],
-          env: args.env ? (JSON.parse(args.env as string) as Record<string, string>) : {},
-        };
+        const newEntry: McpServerConfig = parseMcpServerConfig({
+          command: args.command,
+          url: args.url,
+          args: args.args === undefined ? undefined : JSON.parse(String(args.args)),
+          env: args.env === undefined ? undefined : JSON.parse(String(args.env)),
+          headers: args.headers === undefined ? undefined : JSON.parse(String(args.headers)),
+        });
 
         // Dual-write: container.json (canonical — what the spawn reads via
         // readContainerConfig) + container_configs.mcp_servers (cache — what

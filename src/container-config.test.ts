@@ -5,6 +5,8 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import {
   configFromDb,
+  parseMcpServerConfig,
+  validateMcpServerName,
   readContainerConfig,
   readContainerConfigForSpawn,
   readContainerConfigStrict,
@@ -314,5 +316,103 @@ describe('resolveGroupTimezone', () => {
       timezone: 'Asia/Tokyo',
     });
     expect(readContainerConfig('tz-file').timezone).toBe('Asia/Tokyo');
+ * `parseMcpServerConfig` is the single validator behind the ncl flag path, the
+ * approval payload path, and template `.mcp.json` — and it is mirrored by
+ * hand in container/agent-runner/src/mcp-tools/self-mod.ts. These pin the
+ * rules that mirror has to match.
+ */
+describe('parseMcpServerConfig', () => {
+  it('normalizes a local stdio server and leaves `type` implicit', () => {
+    expect(parseMcpServerConfig({ command: 'mcp-fs', args: ['/data'] })).toEqual({
+      command: 'mcp-fs',
+      args: ['/data'],
+      env: {},
+    });
+  });
+
+  it('parses a remote Streamable HTTP server, with and without headers', () => {
+    expect(parseMcpServerConfig({ url: 'https://mcp.deepwiki.com/mcp' })).toEqual({
+      type: 'http',
+      url: 'https://mcp.deepwiki.com/mcp',
+    });
+    expect(
+      parseMcpServerConfig({
+        url: 'https://app.datafold.com/mcp/',
+        headers: { Authorization: 'Key onecli-managed' },
+      }),
+    ).toEqual({
+      type: 'http',
+      url: 'https://app.datafold.com/mcp/',
+      headers: { Authorization: 'Key onecli-managed' },
+    });
+  });
+
+  it('accepts the "streamable-http" type alias and rejects any other transport', () => {
+    expect(parseMcpServerConfig({ type: 'streamable-http', url: 'https://example.com/mcp' })).toEqual({
+      type: 'http',
+      url: 'https://example.com/mcp',
+    });
+    expect(() => parseMcpServerConfig({ type: 'sse', url: 'https://example.com/sse' })).toThrow(
+      /unsupported MCP transport/,
+    );
+  });
+
+  it('requires exactly one transport and keeps their fields apart', () => {
+    expect(() => parseMcpServerConfig({})).toThrow(/exactly one of command or url/);
+    expect(() => parseMcpServerConfig({ command: 'node', url: 'https://example.com/mcp' })).toThrow(
+      /exactly one of command or url/,
+    );
+    expect(() => parseMcpServerConfig({ url: 'https://example.com/mcp', args: ['x'] })).toThrow(
+      /only valid with command/,
+    );
+    expect(() => parseMcpServerConfig({ command: 'node', headers: { 'X-A': 'b' } })).toThrow(
+      /headers are only valid with url/,
+    );
+  });
+
+  it('requires HTTPS except on loopback and the docker host gateway', () => {
+    expect(() => parseMcpServerConfig({ url: 'http://example.com/mcp' })).toThrow(/must use HTTPS/);
+    for (const host of ['localhost', '127.0.0.1', '[::1]', 'host.docker.internal']) {
+      expect(parseMcpServerConfig({ url: `http://${host}:8080/mcp` })).toMatchObject({ type: 'http' });
+    }
+  });
+
+  it('rejects credentials in the URL and credential-shaped query keys, but keeps ordinary ones', () => {
+    expect(() => parseMcpServerConfig({ url: 'https://u:p@example.com/mcp' })).toThrow(/must not contain credentials/);
+    expect(() => parseMcpServerConfig({ url: 'https://example.com/mcp#f' })).toThrow(/must not contain credentials/);
+    for (const key of ['authToken', 'api_key', 'clientSecret', 'x-auth', 'jwt']) {
+      expect(() => parseMcpServerConfig({ url: `https://example.com/mcp?${key}=v` })).toThrow(
+        /looks like a credential/,
+      );
+    }
+    // `author` must not trip the `auth` word — the match is word-bounded.
+    expect(parseMcpServerConfig({ url: 'https://example.com/mcp?author=me&tools=a,b' })).toMatchObject({
+      url: 'https://example.com/mcp?author=me&tools=a,b',
+    });
+  });
+
+  it('forces credential headers through the OneCLI placeholder', () => {
+    expect(() =>
+      parseMcpServerConfig({ url: 'https://example.com/mcp', headers: { Authorization: 'Bearer real' } }),
+    ).toThrow(/onecli-managed/);
+    expect(() =>
+      parseMcpServerConfig({ url: 'https://example.com/mcp', headers: { 'X-Thing': 'ghp_deadbeef1234' } }),
+    ).toThrow(/raw credential/);
+    expect(() => parseMcpServerConfig({ url: 'https://example.com/mcp', headers: { 'bad header': 'v' } })).toThrow(
+      /valid HTTP header field name/,
+    );
+  });
+
+  it('rejects an env key that is not a valid environment variable name', () => {
+    expect(() => parseMcpServerConfig({ command: 'node', env: { 'not-an-env-key': 'v' } })).toThrow(
+      /environment variable name/,
+    );
+  });
+
+  it('validateMcpServerName allows the [A-Za-z0-9_-] charset only', () => {
+    expect(() => validateMcpServerName('ok_name-1')).not.toThrow();
+    for (const bad of ['', 'has space', 'dot.name', 'a'.repeat(65)]) {
+      expect(() => validateMcpServerName(bad)).toThrow(/1-64 characters/);
+    }
   });
 });

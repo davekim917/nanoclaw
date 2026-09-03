@@ -11,10 +11,16 @@ only with admin approval.
   Package names are validated strictly (`[a-z0-9._+-]` for apt, standard
   npm naming with optional scope). Max 20 packages per request.
 
-- `add_mcp_server({ name, command, args?, env? })` — adds a new MCP server
-  to your container config and restarts the container so the new server
-  is wired up on the next message. No image rebuild is required (bun runs
-  TS directly).
+- `add_mcp_server({ name, command, args?, env? })` or
+  `add_mcp_server({ name, url, headers? })` — adds a new MCP server to your
+  container config and restarts the container so the new server is wired up
+  on the next message. No image rebuild is required (bun runs TS directly).
+  Pass exactly one of `command` (a local stdio server) or `url` (a remote
+  Streamable HTTP server). Remote URLs must use HTTPS — plain HTTP is
+  allowed only for `localhost` and `host.docker.internal` — and may not
+  carry credentials, fragments, or credential-looking query parameters.
+  Credential headers must use the `"onecli-managed"` placeholder; the
+  OneCLI gateway substitutes the real secret at the proxy boundary.
 
 ## Flow
 

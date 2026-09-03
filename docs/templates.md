@@ -53,7 +53,7 @@ is optional and defaults sensibly:
 │   ├── instructions.md        # REQUIRED: the agent's standing persona; marks the folder as a template
 │   └── additional_context/    # optional: extra .md files, referenced from instructions.md by relative path
 │       └── *.md
-├── .mcp.json             # optional: MCP servers (command + args), NO secrets
+├── .mcp.json             # optional: MCP servers (command + args, or url), NO secrets
 ├── skills/<name>/        # optional: one folder per skill (SKILL.md + any references/), copied whole
 ├── tasks/*.md             # optional: recurring tasks, created paused
 └── README.md             # recommended: per-template docs
@@ -148,17 +148,28 @@ won't reach an already-created agent. Re-stamp the same name to update it.
 
 ## MCP servers and credentials
 
-**Templates declare MCP servers, not secrets.** `.mcp.json` carries `command` +
-`args` only:
+**Templates declare MCP servers, not secrets.** Each entry is either a local
+stdio server (`command` + optional `args`/`env`) or a remote Streamable HTTP
+server (`url` + optional `headers`):
 
 ```json
 {
   "mcpServers": {
-    "hubspot": { "command": "npx", "args": ["-y", "@hubspot/mcp-server"] },
-    "exa":     { "command": "npx", "args": ["-y", "exa-mcp-server"] }
+    "hubspot":  { "command": "npx", "args": ["-y", "@hubspot/mcp-server"] },
+    "exa":      { "command": "npx", "args": ["-y", "exa-mcp-server"] },
+    "datafold": { "type": "http", "url": "https://app.datafold.com/mcp/",
+                  "headers": { "Authorization": "Key onecli-managed" } }
   }
 }
 ```
+
+Entries are validated at parse time by the same parser the `ncl` and approval
+paths use, so a template cannot stamp a config those paths would reject:
+server names are `[A-Za-z0-9_-]{1,64}`, exactly one of `command` or `url` is
+required, remote URLs must be HTTPS (plain HTTP only for `localhost` /
+`host.docker.internal`) with no credentials, fragment, or credential-looking
+query parameter, and any credential header must carry the `onecli-managed`
+placeholder. An unknown field is an error rather than a silent drop.
 
 Credentials are held by the **credentials proxy** and injected into outbound
 HTTPS calls at the proxy boundary, matched by API host, at request time. The key

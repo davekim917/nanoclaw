@@ -1,14 +1,43 @@
-import { beforeEach, describe, expect, it, mock } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, it, mock } from 'bun:test';
+
+import { initTestSessionDb, closeSessionDb, getOutboundDb } from '../db/connection.js';
 
 const registeredToolNames: string[][] = [];
 mock.module('./server.js', () => ({
   registerTools: (tools: Array<{ tool: { name: string } }>) => registeredToolNames.push(tools.map((tool) => tool.tool.name)),
 }));
 
-const { unavailableModelInventory, registerProviderSpecificSelfModTools } = await import('./self-mod.js');
+// NOTE: do NOT mock.module('../db/messages-out.js') here. bun runs every test
+// file sequentially in ONE process and mock.module is process-global and
+// permanent, so stubbing writeMessageOut sends every later file's outbound
+// writes nowhere — see the same warning at the top of agents.test.ts. Assert
+// against the real in-memory session DB instead.
+const { unavailableModelInventory, registerProviderSpecificSelfModTools, addMcpServer } = await import(
+  './self-mod.js'
+);
+
+/** The most recent system action add_mcp_server wrote to the outbound DB. */
+function lastSystemAction(): Record<string, unknown> | undefined {
+  const row = getOutboundDb()
+    .prepare(`SELECT content FROM messages_out WHERE kind = 'system' ORDER BY seq DESC LIMIT 1`)
+    .get() as { content: string } | undefined;
+  return row ? (JSON.parse(row.content) as Record<string, unknown>) : undefined;
+}
+
+/** Run the tool and return either the submitted payload or the error text. */
+async function submit(args: Record<string, unknown>): Promise<{ payload?: Record<string, unknown>; error?: string }> {
+  const result = await addMcpServer.handler(args);
+  if (result.isError) return { error: result.content[0]?.text ?? '' };
+  return { payload: lastSystemAction() };
+}
 
 beforeEach(() => {
   registeredToolNames.length = 0;
+  initTestSessionDb();
+});
+
+afterEach(() => {
+  closeSessionDb();
 });
 
 describe('list_models', () => {
@@ -21,5 +50,89 @@ describe('list_models', () => {
   it('does not expose the OpenCode inventory tool to Codex agents', () => {
     registerProviderSpecificSelfModTools('codex');
     expect(registeredToolNames.flat()).not.toContain('list_models');
+  });
+});
+
+/**
+ * The container-side parser mirrors the host's `parseMcpServerConfig`
+ * (src/container-config.ts) so the agent hears about a bad config
+ * immediately instead of after an approval round-trip. These pin the shared
+ * rules on this side; the host side is pinned in src/modules/self-mod/request.test.ts.
+ */
+describe('add_mcp_server remote Streamable HTTP', () => {
+  it('submits a remote https server as an http payload', async () => {
+    const { payload } = await submit({ name: 'deepwiki', url: 'https://mcp.deepwiki.com/mcp' });
+    expect(payload).toEqual({
+      action: 'add_mcp_server',
+      name: 'deepwiki',
+      type: 'http',
+      url: 'https://mcp.deepwiki.com/mcp',
+    });
+  });
+
+  it('still submits a local stdio server without a type field', async () => {
+    const { payload } = await submit({ name: 'fs', command: 'mcp-fs', args: ['/data'] });
+    expect(payload).toEqual({
+      action: 'add_mcp_server',
+      name: 'fs',
+      command: 'mcp-fs',
+      args: ['/data'],
+      env: {},
+    });
+  });
+
+  it('carries OneCLI placeholder headers and rejects a real credential', async () => {
+    const ok = await submit({
+      name: 'datafold',
+      url: 'https://app.datafold.com/mcp/',
+      headers: { Authorization: 'Key onecli-managed' },
+    });
+    expect(ok.payload?.headers).toEqual({ Authorization: 'Key onecli-managed' });
+
+    const bad = await submit({
+      name: 'leaky',
+      url: 'https://example.com/mcp',
+      headers: { Authorization: 'Bearer real-token' },
+    });
+    expect(bad.error).toContain('onecli-managed');
+
+    const raw = await submit({ name: 'leaky', url: 'https://example.com/mcp', headers: { 'X-A': 'ghp_deadbeef1234' } });
+    expect(raw.error).toContain('raw credential');
+  });
+
+  it('rejects plain http off-loopback but allows localhost and host.docker.internal', async () => {
+    expect((await submit({ name: 'insecure', url: 'http://example.com/mcp' })).error).toContain('HTTPS');
+    expect((await submit({ name: 'local', url: 'http://localhost:8080/mcp' })).payload?.url).toBe(
+      'http://localhost:8080/mcp',
+    );
+    expect((await submit({ name: 'hostgw', url: 'http://host.docker.internal:8080/mcp' })).payload?.url).toBe(
+      'http://host.docker.internal:8080/mcp',
+    );
+  });
+
+  it('rejects credentials, fragments, and credential-shaped query keys', async () => {
+    for (const url of [
+      'https://user:pass@example.com/mcp',
+      'https://example.com/mcp#frag',
+      'https://example.com/mcp?authToken=abc',
+    ]) {
+      expect((await submit({ name: 'bad', url })).error).toBeDefined();
+    }
+    // A non-credential query string is legitimate endpoint config.
+    expect((await submit({ name: 'exa', url: 'https://mcp.exa.ai/mcp?tools=web_search_exa' })).payload).toBeDefined();
+  });
+
+  it('rejects a bad server name, both transports at once, and cross-transport fields', async () => {
+    expect((await submit({ name: 'bad name!', url: 'https://example.com/mcp' })).error).toContain('1-64 characters');
+    expect((await submit({ name: 'both', command: 'node', url: 'https://example.com/mcp' })).error).toContain(
+      'exactly one of command or url',
+    );
+    expect((await submit({ name: 'mixed', url: 'https://example.com/mcp', env: { K: 'v' } })).error).toContain(
+      'only valid with command',
+    );
+    expect((await submit({ name: 'mixed', command: 'node', headers: { 'X-A': 'b' } })).error).toContain(
+      'headers are only valid with url',
+    );
+    expect((await submit({ name: 'neither' })).error).toContain('exactly one of command or url');
   });
 });

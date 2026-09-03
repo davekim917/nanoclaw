@@ -33,6 +33,13 @@ import type { AgentGroup, ContainerConfigRow } from './types.js';
  */
 export type McpServerConfig = StdioMcpServerConfig | HttpMcpServerConfig | SseMcpServerConfig;
 
+/**
+ * What `parseMcpServerConfig` may produce — the deprecated SSE transport is
+ * rejected there, so callers narrowing on `type === 'http'` get a clean
+ * two-way discriminated union.
+ */
+export type ParsedMcpServerConfig = StdioMcpServerConfig | HttpMcpServerConfig;
+
 export interface StdioMcpServerConfig {
   type?: 'stdio';
   command: string;
@@ -55,6 +62,163 @@ export interface SseMcpServerConfig {
   headers?: Record<string, string>;
   // Optional always-in-context guidance; host imports into composed CLAUDE.md.
   instructions?: string;
+}
+
+/**
+ * Query keys that name a credential. Keys are camelCase-normalized, then
+ * matched as whole words between [_.-] separators: `author` never matches
+ * `auth`, but `authToken`, `clientSecret`, and `x-auth` all do. A match
+ * hard-blocks registration — the URL persists to container.json and renders
+ * on the approval card, so secrets must ride via the OneCLI gateway. Ordinary
+ * query params stay legal: they are endpoint config, not credentials (the
+ * install's own `exa` wiring carries `?tools=web_search_exa,...`).
+ */
+const SECRET_QUERY_KEY_RE =
+  /(^|[_.-])(o?auth(orization)?|(auth|access|api|session|id)?[_-]?token|secret|passw(or)?d|pwd|api[_-]?key|private[_-]?key|credentials?|bearer|jwt|sig(nature)?)([_.-]|$)/i;
+
+/** camelCase → snake_case before matching, so `authToken` hits the word list. */
+const CAMEL_SPLIT_RE = /([a-z0-9])([A-Z])/g;
+
+/**
+ * Server names and env keys end up in provider config writers that emit
+ * formats with structural syntax (the codex writer emits TOML table headers;
+ * `mcpAllowPattern` in the Claude provider collapses non-[A-Za-z0-9_-] to
+ * `_`, so unvalidated names can collide). Allowlist the charset at every
+ * entry point so no downstream writer has to defend. Mirrored in
+ * `container/agent-runner/src/mcp-tools/self-mod.ts`; keep the two in sync.
+ */
+const MCP_SERVER_NAME_RE = /^[A-Za-z0-9_-]{1,64}$/;
+const ENV_KEY_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
+/** RFC 7230 token charset — what a header field-name may contain. */
+const HEADER_NAME_RE = /^[A-Za-z0-9!#$%&'*+.^_`|~-]{1,64}$/;
+/**
+ * Header names that carry a credential. Such a header MUST be declared with
+ * the OneCLI placeholder; the gateway overwrites it at the proxy boundary, so
+ * the container never holds the real token (`DATAFOLD_MCP_SERVER` in
+ * `src/container-runner.ts` is the reference wiring).
+ */
+const CREDENTIAL_HEADER_RE = /(authorization|auth|token|secret|api[-_]?key|cookie|credential|bearer)/i;
+/** The value the OneCLI gateway replaces at the proxy boundary. */
+const ONECLI_PLACEHOLDER = 'onecli-managed';
+/** Shapes of real credentials that must never be written into container.json. */
+const RAW_SECRET_VALUE_RE = /(^|\s)(sk-|ghp_|github_pat_|xox[a-z]-|AKIA|-----BEGIN )/;
+
+/** Throws unless `name` is a safe MCP server name (1-64 chars of [A-Za-z0-9_-]). */
+export function validateMcpServerName(name: string): void {
+  if (!MCP_SERVER_NAME_RE.test(name)) {
+    throw new Error('server name must be 1-64 characters of letters, digits, "_" or "-"');
+  }
+}
+
+/** Validate one `headers` map for a remote MCP server. Returns a fresh copy. */
+function parseMcpHeaders(raw: unknown): Record<string, string> {
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
+    throw new Error('headers must be a JSON object with string values');
+  }
+  const headers: Record<string, string> = {};
+  for (const [key, value] of Object.entries(raw)) {
+    if (typeof value !== 'string') throw new Error('headers must be a JSON object with string values');
+    if (!HEADER_NAME_RE.test(key)) {
+      throw new Error(`header name ${JSON.stringify(key)} is not a valid HTTP header field name`);
+    }
+    if (RAW_SECRET_VALUE_RE.test(value)) {
+      throw new Error(
+        `header "${key}" carries a raw credential; declare it as "${ONECLI_PLACEHOLDER}" and let the OneCLI gateway inject the real value`,
+      );
+    }
+    if (CREDENTIAL_HEADER_RE.test(key) && !value.includes(ONECLI_PLACEHOLDER)) {
+      throw new Error(
+        `header "${key}" is a credential header, so its value must contain "${ONECLI_PLACEHOLDER}" (e.g. "Bearer ${ONECLI_PLACEHOLDER}") — the gateway substitutes the real secret at the proxy boundary`,
+      );
+    }
+    headers[key] = value;
+  }
+  return headers;
+}
+
+/**
+ * Parse one CLI, template, or approval payload into the persisted MCP config
+ * shape. Exactly one of `command` (local stdio subprocess) or `url` (remote
+ * Streamable HTTP) is required.
+ *
+ * Duplicated in `container/agent-runner/src/mcp-tools/self-mod.ts`
+ * (`parseMcpServerInput`) — there are no shared modules across the
+ * host/container boundary; keep the two in sync.
+ */
+export function parseMcpServerConfig(input: Record<string, unknown>): ParsedMcpServerConfig {
+  const declaredType = input.type;
+  if (declaredType !== undefined && !['stdio', 'http', 'streamable-http'].includes(String(declaredType))) {
+    throw new Error(`unsupported MCP transport ${JSON.stringify(declaredType)}; use "stdio" or "http"`);
+  }
+  const command = typeof input.command === 'string' && input.command.trim() ? input.command : undefined;
+  const url = typeof input.url === 'string' && input.url.trim() ? input.url.trim() : undefined;
+
+  const instructions = input.instructions;
+  if (instructions !== undefined && typeof instructions !== 'string') {
+    throw new Error('MCP instructions must be a string');
+  }
+
+  if (url !== undefined) {
+    if (command !== undefined) throw new Error('Provide exactly one of command or url');
+    if (input.args !== undefined || input.env !== undefined) {
+      throw new Error('args and env are only valid with command');
+    }
+    let parsed: URL;
+    try {
+      parsed = new URL(url);
+    } catch (err) {
+      throw new Error('url must be a valid HTTP(S) URL', { cause: err });
+    }
+    const loopback = ['localhost', '127.0.0.1', '[::1]', 'host.docker.internal'].includes(parsed.hostname);
+    if (parsed.protocol !== 'https:' && !(parsed.protocol === 'http:' && loopback)) {
+      throw new Error('url must use HTTPS (plain HTTP is allowed only for localhost and host.docker.internal)');
+    }
+    if (parsed.username || parsed.password || parsed.hash) {
+      throw new Error('url must not contain credentials or fragments; use the OneCLI gateway for authentication');
+    }
+    for (const key of parsed.searchParams.keys()) {
+      if (SECRET_QUERY_KEY_RE.test(key.replace(CAMEL_SPLIT_RE, '$1_$2'))) {
+        throw new Error(
+          `url query parameter "${key}" looks like a credential; use the OneCLI gateway for authentication`,
+        );
+      }
+    }
+    const headers = input.headers === undefined ? undefined : parseMcpHeaders(input.headers);
+    return {
+      type: 'http',
+      url,
+      ...(headers === undefined || Object.keys(headers).length === 0 ? {} : { headers }),
+      ...(instructions === undefined ? {} : { instructions }),
+    };
+  }
+  if (command === undefined) throw new Error('Provide exactly one of command or url');
+  if (input.headers !== undefined) throw new Error('headers are only valid with url');
+
+  const args = input.args ?? [];
+  if (!Array.isArray(args) || !args.every((arg) => typeof arg === 'string')) {
+    throw new Error('args must be a JSON array of strings');
+  }
+  const rawEnv = input.env ?? {};
+  if (typeof rawEnv !== 'object' || rawEnv === null || Array.isArray(rawEnv)) {
+    throw new Error('env must be a JSON object with string values');
+  }
+  const env: Record<string, string> = {};
+  for (const [key, value] of Object.entries(rawEnv)) {
+    if (typeof value !== 'string') throw new Error('env must be a JSON object with string values');
+    if (!ENV_KEY_RE.test(key)) {
+      throw new Error(`env key ${JSON.stringify(key)} must be a valid environment variable name`);
+    }
+    env[key] = value;
+  }
+  // No explicit `type` on the stdio branch: it is the union's default and the
+  // pre-existing writers omit it, so emitting one would churn every
+  // container.json without changing behavior.
+  return {
+    command,
+    args,
+    env,
+    ...(instructions === undefined ? {} : { instructions }),
+  };
 }
 
 export function validateMcpServers(servers: Record<string, McpServerConfig>): Record<string, McpServerConfig> {

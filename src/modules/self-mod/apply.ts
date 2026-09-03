@@ -21,7 +21,13 @@ import {
 import { getDeniedModel } from '../../db/denied-models.js';
 import { getSession } from '../../db/sessions.js';
 import { isOpenCodeModelSlug } from '../../flag-parser.js';
-import { validateMcpServers, type McpServerConfig } from '../../container-config.js';
+import {
+  parseMcpServerConfig,
+  validateMcpServerName,
+  validateMcpServers,
+  type McpServerConfig,
+  type ParsedMcpServerConfig,
+} from '../../container-config.js';
 import { log } from '../../log.js';
 import { writeSessionMessage } from '../../session-manager.js';
 import type { Session } from '../../types.js';
@@ -117,13 +123,30 @@ export async function applyAddMcpServer(payload: Record<string, unknown>, sessio
     return;
   }
 
+  // Re-validate the approved payload before it reaches container.json. The
+  // request path already parsed it, but this is the last gate before a config
+  // the container will actually load, so it fails closed on its own.
+  const name = typeof payload.name === 'string' ? payload.name : '';
+  if (!name) {
+    notifyAgent(session, 'add_mcp_server approved but server name is missing.');
+    return;
+  }
+  let serverConfig: ParsedMcpServerConfig;
+  try {
+    validateMcpServerName(name);
+    serverConfig = parseMcpServerConfig(payload);
+    // eslint-disable-next-line no-catch-all/no-catch-all -- approval payload validation must fail closed
+  } catch (err) {
+    notifyAgent(
+      session,
+      `add_mcp_server approved but config is invalid: ${err instanceof Error ? err.message : String(err)}.`,
+    );
+    return;
+  }
+
   // Add the new MCP server to the existing map in the DB
   const servers = JSON.parse(configRow.mcp_servers) as Record<string, McpServerConfig>;
-  servers[payload.name as string] = {
-    command: payload.command as string,
-    args: (payload.args as string[]) || [],
-    env: (payload.env as Record<string, string>) || {},
-  };
+  servers[name] = serverConfig;
   updateContainerConfigJson(agentGroup.id, 'mcp_servers', validateMcpServers(servers));
 
   await writeSessionMessage(session.agent_group_id, session.id, {
@@ -134,7 +157,7 @@ export async function applyAddMcpServer(payload: Record<string, unknown>, sessio
     channelType: 'agent',
     threadId: null,
     content: JSON.stringify({
-      text: `MCP server "${payload.name}" added. Verify it's available (e.g. list your tools) and report the result to the user.`,
+      text: `MCP server "${name}" added. Verify it's available (e.g. list your tools) and report the result to the user.`,
       sender: 'system',
       senderId: 'system',
     }),

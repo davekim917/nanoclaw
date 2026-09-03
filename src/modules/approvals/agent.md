@@ -20,18 +20,26 @@ install_packages({
 
 ### add_mcp_server
 
-Wire an EXISTING third-party MCP server into your runtime config. You must already know the exact `command` and `args`.
+Wire an EXISTING third-party MCP server into your runtime config. Pass exactly one of `command` (a local stdio server, whose exact `command`/`args` you must already know) or `url` (a remote Streamable HTTP server).
 
 ```
 add_mcp_server({
   name: "github",
   command: "npx",
   args: ["@modelcontextprotocol/server-github"],
-  env: { GITHUB_TOKEN: "..." }
+  env: { GITHUB_TOKEN: "onecli-managed" }
+})
+
+add_mcp_server({
+  name: "datafold",
+  url: "https://app.datafold.com/mcp/",
+  headers: { Authorization: "Key onecli-managed" }
 })
 ```
 
 - Does NOT install packages. Use `install_packages` first if the command isn't already available.
+- Remote URLs must use HTTPS (plain HTTP only for `localhost` / `host.docker.internal`) and may not carry credentials, fragments, or credential-looking query parameters.
+- Credential headers must use the `"onecli-managed"` placeholder — the OneCLI gateway substitutes the real secret at the proxy boundary, so the container never holds the token.
 - On approval, the container is killed and the next message wakes it with the new server wired up. No image rebuild — bun runs TS directly.
 
 ### How approval works

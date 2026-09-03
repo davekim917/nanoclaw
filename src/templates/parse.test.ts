@@ -36,7 +36,9 @@ describe('parseTemplate', () => {
 
     const tpl = parseTemplate(dir);
 
-    expect(tpl.mcpServers).toEqual({ fs: { command: 'mcp-fs', args: ['/data'] } });
+    // Entries are normalized through the shared parser, which fills the
+    // omitted `env` the same way the ncl and approval paths always have.
+    expect(tpl.mcpServers).toEqual({ fs: { command: 'mcp-fs', args: ['/data'], env: {} } });
     expect(tpl.instructions).toBe('Be helpful.'); // trimEnd, instructions.md excluded from extras
     // Nested extras keep their context/-relative path as the name.
     expect(tpl.contextExtras.map((c) => c.name).sort()).toEqual(['additional_context/faq.md', 'playbook.md']);
@@ -57,6 +59,47 @@ describe('parseTemplate', () => {
         source: 'tasks/weekly-review.md',
       },
     ]);
+  });
+
+  it('parses a remote Streamable HTTP server entry with OneCLI placeholder headers', () => {
+    write(
+      '.mcp.json',
+      JSON.stringify({
+        mcpServers: {
+          datafold: {
+            type: 'http',
+            url: 'https://app.datafold.com/mcp/',
+            headers: { Authorization: 'Key onecli-managed' },
+          },
+        },
+      }),
+    );
+    write('context/instructions.md', 'Be helpful.');
+    expect(parseTemplate(dir).mcpServers).toEqual({
+      datafold: {
+        type: 'http',
+        url: 'https://app.datafold.com/mcp/',
+        headers: { Authorization: 'Key onecli-managed' },
+      },
+    });
+  });
+
+  it('rejects an unknown field rather than silently dropping it', () => {
+    write('.mcp.json', JSON.stringify({ mcpServers: { fs: { command: 'mcp-fs', transport: 'stdio' } } }));
+    write('context/instructions.md', 'Be helpful.');
+    expect(() => parseTemplate(dir)).toThrow(/unknown field "transport"/);
+  });
+
+  it('rejects an invalid server name', () => {
+    write('.mcp.json', JSON.stringify({ mcpServers: { 'bad name': { command: 'x' } } }));
+    write('context/instructions.md', 'Be helpful.');
+    expect(() => parseTemplate(dir)).toThrow(/1-64 characters/);
+  });
+
+  it('rejects a remote url that is not HTTPS', () => {
+    write('.mcp.json', JSON.stringify({ mcpServers: { r: { url: 'http://example.com/mcp' } } }));
+    write('context/instructions.md', 'Be helpful.');
+    expect(() => parseTemplate(dir)).toThrow(/must use HTTPS/);
   });
 
   it('accepts a single-line script string', () => {
