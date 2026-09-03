@@ -120,8 +120,8 @@ describe('handleRecurrence', () => {
 
   it('re-arms in the group timezone override, not the install TIMEZONE', async () => {
     // Install tz is pinned to Asia/Tokyo above; the group override must win.
-    // Asia/Calcutta (the canonical spelling of Asia/Kolkata) is UTC+5:30 with no DST: 09:00 local === 03:30 UTC, exactly.
-    containerConfigState.timezone = 'Asia/Calcutta';
+    // Asia/Kolkata is UTC+5:30 with no DST: 09:00 local === 03:30 UTC, exactly.
+    containerConfigState.timezone = 'Asia/Kolkata';
     const db = freshDb();
     insertTaskRow(db, {
       id: 'task-group-tz',

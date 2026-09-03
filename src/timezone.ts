@@ -1,3 +1,6 @@
+import fs from 'fs';
+import path from 'path';
+
 /**
  * Check whether a timezone string is a valid IANA identifier
  * that Intl.DateTimeFormat can use.
@@ -13,57 +16,107 @@ export function isValidTimezone(tz: string): boolean {
 
 /**
  * Region/City, or UTC — the only shapes Intl and POSIX `TZ` agree on.
- *
- * A per-group override is handed to the container verbatim as POSIX `TZ`
- * while the host schedules through Intl, so the two must read the same string
- * the same way. Fixed offsets do not: POSIX `TZ=+01:00` means UTC-1, the
- * opposite sign. Region-less abbreviations do not either: POSIX reads a bare
- * `CST` as a zero-offset abbreviation, while Intl maps it to America/Chicago.
+ * Fixed offsets do not: POSIX reads `TZ=+01:00` as UTC-1, the opposite sign.
+ * Region-less abbreviations do not either, and are ambiguous besides: `CST`
+ * is US Central to ICU and China Standard to plenty of humans.
  */
 function isRegionZoneShape(tz: string): boolean {
   return tz === 'UTC' || tz.includes('/');
 }
 
 /**
- * The spelling of `tz` safe to persist as a per-group override, or null.
- *
- * `isValidTimezone` is deliberately looser — it asks only whether Intl can
- * format with the value. This is the write-path gate, and what it returns is
- * what gets stored.
- *
- * Two rules, and the second one is why an earlier version of this was wrong:
- *
- * 1. The INPUT must name a region. An abbreviation is ambiguous — `CST` is US
- *    Central to ICU and China Standard to plenty of humans — so the operator
- *    is asked to say which, rather than having one picked for them. Fixed
- *    offsets are refused outright: POSIX reads `TZ=+01:00` as UTC-1.
- * 2. The STORED value is always what the resolver returns, never what was
- *    typed. Keeping the typed spelling looked friendlier and did not work:
- *    `asia/kolkata` resolves to `Asia/Calcutta`, so it cannot be case-corrected
- *    from its own resolution, and POSIX zoneinfo lookup is case-sensitive —
- *    the host would have scheduled on Kolkata time while the container read an
- *    unresolvable `TZ` and fell back to UTC. The resolver's answer is always a
- *    real tzdata name in the casing POSIX needs.
- *
- * The visible cost of rule 2 is that `Asia/Kolkata` is stored as its ICU
- * canonical `Asia/Calcutta`. Both are the same zone and both ship in tzdata;
- * `ncl groups config get` shows what was stored.
+ * The zone database POSIX consumers actually read. `TZ` is opened as a file
+ * path under here, case-sensitively.
  */
-export function canonicalizeIanaTimezone(tz: string): string | null {
-  if (!isValidTimezone(tz)) return null;
-  if (tz.toUpperCase() !== 'UTC' && !tz.includes('/')) return null;
-  const resolved = Intl.DateTimeFormat(undefined, { timeZone: tz }).resolvedOptions().timeZone;
-  return isRegionZoneShape(resolved) ? resolved : null;
+const ZONEINFO_DIR = '/usr/share/zoneinfo';
+
+/** Whether the zone database on disk has this exact spelling. */
+function zoneFileExists(tz: string): boolean {
+  const file = path.join(ZONEINFO_DIR, tz);
+  // Reject traversal before touching the filesystem: `tz` reaches here from a
+  // CLI flag and an approval payload.
+  if (!path.resolve(file).startsWith(`${ZONEINFO_DIR}/`)) return false;
+  try {
+    return fs.statSync(file).isFile();
+  } catch {
+    return false;
+  }
+}
+
+/** Correctly-cased spellings that differ from `tz` only by case, for an error hint. */
+function zoneSpellingHints(tz: string): string[] {
+  const wanted = tz.toLowerCase();
+  const hits: string[] = [];
+  const walk = (dir: string, prefix: string): void => {
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      const name = prefix ? `${prefix}/${entry.name}` : entry.name;
+      if (entry.isDirectory()) walk(path.join(dir, entry.name), name);
+      else if (name.toLowerCase() === wanted) hits.push(name);
+    }
+  };
+  walk(ZONEINFO_DIR, '');
+  return hits;
 }
 
 /**
- * Whether a STORED override is safe to honour. Anything the write path would
- * have rewritten or refused — wrong case, an alias spelling, a fixed offset,
- * an abbreviation — is ignored in favour of the install timezone, so a
- * hand-edited value cannot split the host clock from the container clock.
+ * The spelling of `tz` safe to persist as a per-group override, or null.
+ *
+ * The value is stored VERBATIM and handed to the container as POSIX `TZ`,
+ * which opens it as a case-sensitive path under the zone database. So the
+ * database on disk is the authority on which spellings work — and it is the
+ * only authority that turned out to be right. Two earlier rules both failed,
+ * in opposite directions:
+ *
+ * - Keeping whatever was typed accepted `asia/kolkata`, which no POSIX
+ *   consumer can open.
+ * - Storing ICU's `resolvedOptions().timeZone` accepted `Asia/Kolkata` and
+ *   stored the legacy `Asia/Calcutta`, whose backward-link file current
+ *   tzdata omits. On tzdata 2026c, `TZ=Asia/Calcutta` silently yields +0000
+ *   while `TZ=Asia/Kolkata` yields IST — the host would have scheduled in
+ *   India while the container ran on UTC.
+ *
+ * Intl still has to accept the value too, so a name the host has a file for
+ * but the scheduler cannot use is refused rather than half-working.
+ *
+ * If the zone database is not present (an unusual host), this falls back to
+ * the shape check alone rather than refusing every override.
+ */
+export function canonicalizeIanaTimezone(tz: string): string | null {
+  if (!isValidTimezone(tz) || !isRegionZoneShape(tz)) return null;
+  if (tz === 'UTC') return tz;
+  if (!fs.existsSync(ZONEINFO_DIR)) return tz;
+  return zoneFileExists(tz) ? tz : null;
+}
+
+/**
+ * Whether a STORED override is safe to honour. Identical to the write-path
+ * gate, so a hand-edited value that POSIX could not open — wrong case, a
+ * retired alias, a fixed offset, an abbreviation — is ignored in favour of the
+ * install timezone rather than splitting the host clock from the container's.
  */
 export function isIanaTimezone(tz: string): boolean {
   return canonicalizeIanaTimezone(tz) === tz;
+}
+
+/**
+ * Human-facing reason `tz` was refused, for the `ncl` error. Suggests the
+ * correctly-cased spelling when the only problem is case.
+ */
+export function timezoneRejectionReason(tz: string): string {
+  if (!isValidTimezone(tz)) return `"${tz}" is not a timezone this runtime knows`;
+  if (!isRegionZoneShape(tz)) {
+    return `"${tz}" does not name a region — use a "Region/City" id like "Europe/Lisbon" (a fixed offset means the opposite sign to POSIX, and an abbreviation like "CST" is ambiguous)`;
+  }
+  const hints = zoneSpellingHints(tz);
+  if (hints.length > 0)
+    return `"${tz}" is misspelled for the zone database — use ${hints.map((h) => `"${h}"`).join(' or ')}`;
+  return `"${tz}" has no entry in the zone database, so the container could not resolve it as POSIX TZ`;
 }
 
 /**

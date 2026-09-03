@@ -569,27 +569,27 @@ describe('groups CLI resource config', () => {
     );
 
     // Intl accepts all of these; POSIX TZ reads them differently — "+01:00"
-    // with the opposite sign, "CST" as a zero-offset abbreviation — so the
-    // host clock and the container clock would disagree.
-    for (const bad of ['+01:00', '-05:00', 'CST', 'EST']) {
+    // with the opposite sign, "CST" as a zero-offset abbreviation, and
+    // "europe/lisbon" is not a zoneinfo path at all. Asia/Calcutta is the ICU
+    // canonical name for Asia/Kolkata whose backward-link file current tzdata
+    // omits, so TZ=Asia/Calcutta silently yields +0000.
+    for (const bad of ['+01:00', '-05:00', 'CST', 'EST', 'europe/lisbon', 'Asia/Calcutta']) {
       const rejected = await dispatch(
         { id: `req-tz-${bad}`, command: 'groups-config-update', args: { id, timezone: bad } },
         { caller: 'host' },
       );
       expect(rejected.ok).toBe(false);
-      expect(JSON.stringify(rejected)).toMatch(/region-based IANA timezone id/);
+      expect(JSON.stringify(rejected)).toMatch(/invalid --timezone/);
     }
     expect(getContainerConfig(id)?.timezone).toBeNull();
 
-    // What gets stored is always the resolver's spelling, because POSIX looks
-    // the zone up as a zoneinfo FILE and the lookup is case-sensitive. An
-    // alias cannot be case-corrected from its own resolution — `asia/kolkata`
-    // resolves to `Asia/Calcutta` — so the resolved name is what lands.
+    // A spelling the zone database has is stored verbatim — including the
+    // modern names, which is the whole point: ICU would have rewritten
+    // Asia/Kolkata to a file this system does not ship.
     for (const [typed, stored] of [
-      ['europe/lisbon', 'Europe/Lisbon'],
-      ['Asia/Kolkata', 'Asia/Calcutta'],
-      ['asia/kolkata', 'Asia/Calcutta'],
-      ['Europe/Kyiv', 'Europe/Kiev'],
+      ['Europe/Lisbon', 'Europe/Lisbon'],
+      ['Asia/Kolkata', 'Asia/Kolkata'],
+      ['Europe/Kyiv', 'Europe/Kyiv'],
     ]) {
       const ok = await dispatch(
         { id: `req-tz-canon-${typed}`, command: 'groups-config-update', args: { id, timezone: typed } },
@@ -612,7 +612,7 @@ describe('groups CLI resource config', () => {
       { caller: 'host' },
     );
     expect(response.ok).toBe(false);
-    expect(JSON.stringify(response)).toMatch(/region-based IANA timezone id/);
+    expect(JSON.stringify(response)).toMatch(/invalid --timezone/);
     expect(getContainerConfig(id)?.timezone).toBeNull();
   });
 
