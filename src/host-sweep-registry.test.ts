@@ -215,11 +215,13 @@ import {
   SWEEP_INTERVAL_MS,
   SWEEP_PHASES,
   _listSweepRegistrationsForTesting,
+  _resetSweepDutySourcesForTesting,
   _resetSweepRegistryForTesting,
   _setSweepYieldForTesting,
   _sweepOnceForTesting,
   registerSlaObservationHook,
   registerSweepDuty,
+  registerSweepDutySource,
   registerSweepKillFollowUp,
   startHostSweep,
   stopHostSweep,
@@ -1007,6 +1009,35 @@ describe('sweep duty registry (S2-PR2)', () => {
     for (const [id, name] of Object.entries(SWEEP_DUTY_INVENTORY)) {
       expect(names, `inventory id ${id}`).toContain(name);
     }
+  });
+
+  // ── duty registration sources ───────────────────────────────────────────────
+  describe('duty registration sources', () => {
+    afterEach(() => {
+      // Drop the fake source so it doesn't leak into R-7's exact-39 count.
+      _resetSweepDutySourcesForTesting();
+    });
+
+    it('a duty source registered by a module survives the test reset', () => {
+      const seen: string[] = [];
+      registerSweepDutySource('fake-family', () => {
+        registerSweepDuty(probeDuty('fake-family-duty', 'tick:housekeeping', 999, seen));
+      });
+
+      // registerSweepDutySource invokes the registrar immediately.
+      let { duties } = _listSweepRegistrationsForTesting();
+      expect(duties.some((d) => d.name === 'fake-family-duty')).toBe(true);
+      expect(duties.some((d) => d.name === SWEEP_DUTY_INVENTORY.T2)).toBe(true);
+
+      _resetSweepRegistryForTesting();
+      ({ duties } = _listSweepRegistrationsForTesting());
+      expect(duties.some((d) => d.name === 'fake-family-duty')).toBe(true);
+      expect(duties.some((d) => d.name === SWEEP_DUTY_INVENTORY.T2)).toBe(true);
+
+      _resetSweepRegistryForTesting({ builtins: false });
+      ({ duties } = _listSweepRegistrationsForTesting());
+      expect(duties).toHaveLength(0);
+    });
   });
 
   // ── R-9 ────────────────────────────────────────────────────────────────────
