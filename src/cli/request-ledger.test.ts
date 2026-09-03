@@ -60,13 +60,23 @@ function handler(): DeliveryActionHandler {
   return h;
 }
 
-/** One delivery attempt. `writable: false` makes the response write genuinely fail. */
+/**
+ * One delivery attempt. `writable: false` makes the response write genuinely
+ * fail: the handler now opens its own mailbox session internally (no `inDb`
+ * handle is passed in — the delivery loop stopped threading one through after
+ * the mailbox seam moved this action off it), so the file itself is dropped
+ * to read-only rather than an injected readonly handle. `sessionDbPathIsGone`
+ * (the mailbox opener's missing-vs-broken test) only trusts `fs.statSync`,
+ * which a permission bit doesn't affect, so this surfaces as a real open
+ * failure — not the vanished-mailbox path.
+ */
 async function attempt(writable: boolean): Promise<void> {
-  const db = new Database(inboundDbPath(AG, SESSION_ID), { readonly: !writable });
+  const dbFile = inboundDbPath(AG, SESSION_ID);
+  if (!writable) fs.chmodSync(dbFile, 0o444);
   try {
-    await handler()(request, session(), db);
+    await handler()(request, session());
   } finally {
-    db.close();
+    if (!writable) fs.chmodSync(dbFile, 0o644);
   }
 }
 
