@@ -30,6 +30,7 @@ import { wrapSqliteInbound, wrapSqliteOutbound } from '../../mailbox/sqlite/inde
 
 const MODULE_DIR = path.dirname(fileURLToPath(import.meta.url));
 const INDEX_PATH = path.join(MODULE_DIR, 'index.ts');
+const UPSTREAM_SQLITE_PATH = path.join(MODULE_DIR, '..', '..', 'mailbox', 'sqlite', 'index.ts');
 
 /** Handle identifiers `forkOps` binds its ops to, by side. */
 const OUTBOUND_HANDLES = ['readableOutbound', 'writableOutbound', 'readOutbound'];
@@ -62,12 +63,12 @@ function splitEntries(body: string): Array<{ key: string; value: string }> {
   return out;
 }
 
-/** The object literal `forkOps` returns, as source text. */
-function forkOpsBody(source: string): string {
-  const fnAt = source.indexOf('function forkOps(');
-  if (fnAt === -1) throw new Error('op-sides: forkOps not found — the composition moved');
+/** The object literal a named function returns, as source text. */
+function objectLiteralBody(source: string, fnName: string): string {
+  const fnAt = source.search(new RegExp(`function\\s+${fnName}\\s*\\(`));
+  if (fnAt === -1) throw new Error(`op-sides: ${fnName} not found — the composition moved`);
   const returnAt = source.indexOf('return {', fnAt);
-  if (returnAt === -1) throw new Error('op-sides: forkOps has no object literal to read');
+  if (returnAt === -1) throw new Error(`op-sides: ${fnName} has no object literal to read`);
   let depth = 0;
   const open = source.indexOf('{', returnAt);
   for (let i = open; i < source.length; i++) {
@@ -77,7 +78,7 @@ function forkOpsBody(source: string): string {
       if (depth === 0) return source.slice(open + 1, i);
     }
   }
-  throw new Error('op-sides: forkOps object literal never closes');
+  throw new Error(`op-sides: ${fnName} object literal never closes`);
 }
 
 const mentions = (text: string, names: string[]): boolean => names.some((n) => new RegExp(`\\b${n}\\b`).test(text));
@@ -102,7 +103,7 @@ export function computeOpSides(): OpSides {
   );
 
   const source = fs.readFileSync(INDEX_PATH, 'utf8');
-  for (const { key, value } of splitEntries(forkOpsBody(source))) {
+  for (const { key, value } of splitEntries(objectLiteralBody(source, 'forkOps'))) {
     const touchesOutbound = mentions(value, OUTBOUND_HANDLES);
     const touchesInbound = mentions(value, INBOUND_HANDLES);
     // Both, or neither-and-therefore-unknown, count as inbound: this map is
@@ -122,4 +123,66 @@ export function computeOpSides(): OpSides {
 /** Ops that provably touch outbound.db and nothing else. */
 export function outboundOnlyOps(): Set<string> {
   return computeOpSides().outbound;
+}
+
+/* ─── Outbound WRITES ─────────────────────────────────────────────────────── */
+
+/** The handle a fork op must use to be a write: `writableOutbound`, nothing else. */
+const FORK_WRITABLE_HANDLE = /\bwritableOutbound\b/;
+/** Upstream's outbound half takes its writer from `writable()`; reads use `readable()`. */
+const UPSTREAM_WRITABLE_HANDLE = /\bwritable\s*\(/;
+
+/**
+ * Every session op that MUTATES `outbound.db`.
+ *
+ * Derived the same way and for the same reason as `computeOpSides` — a hand
+ * list would go stale the first time an op is added. Both halves of the
+ * composition are read, not just the fork's:
+ *
+ *  - the fork's, from `forkOps`: an entry is a write exactly when it uses the
+ *    `writableOutbound` handle (the read handles are `readableOutbound` and
+ *    the `readOutbound` degrade-to-empty helper);
+ *  - upstream's, from `wrapSqliteOutbound`: an entry is a write exactly when
+ *    it takes `writable()`. `composeNanoclawSession` spreads that half onto
+ *    the same session object, so `deleteOrphanProcessingClaims` is as much a
+ *    host-reachable outbound write as `writeOutboundDirect` is, and a set that
+ *    listed only the fork's would have a hole where the sweep's orphan-claim
+ *    clear sits.
+ *
+ * Upstream's half is parsed rather than probed for the same reason the fork's
+ * is: read-vs-write is a property of the body, and there is no runtime signal
+ * for it short of invoking the op. The parse is cross-checked against the
+ * runtime key set below, so a literal this hand-rolled splitter mis-slices
+ * fails loudly instead of silently shrinking the rule's reach.
+ */
+export function outboundWriteOps(): Set<string> {
+  const writes = new Set<string>();
+
+  const forkSource = fs.readFileSync(INDEX_PATH, 'utf8');
+  for (const { key, value } of splitEntries(objectLiteralBody(forkSource, 'forkOps'))) {
+    if (FORK_WRITABLE_HANDLE.test(value)) writes.add(key);
+  }
+
+  const upstreamSource = fs.readFileSync(UPSTREAM_SQLITE_PATH, 'utf8');
+  const upstreamEntries = splitEntries(objectLiteralBody(upstreamSource, 'wrapSqliteOutbound'));
+  const stub = {} as never;
+  const runtimeKeys = Object.keys(
+    wrapSqliteOutbound(
+      () => stub,
+      () => stub,
+    ),
+  ).sort();
+  const parsedKeys = upstreamEntries.map((e) => e.key).sort();
+  if (parsedKeys.join(',') !== runtimeKeys.join(',')) {
+    throw new Error(
+      `op-sides: the wrapSqliteOutbound literal parsed as [${parsedKeys.join(', ')}] but the composed ` +
+        `half has [${runtimeKeys.join(', ')}] — the parse drifted and the write set cannot be trusted`,
+    );
+  }
+  for (const { key, value } of upstreamEntries) {
+    if (UPSTREAM_WRITABLE_HANDLE.test(value)) writes.add(key);
+  }
+
+  if (writes.size === 0) throw new Error('op-sides: no outbound writes found — the derivation broke');
+  return writes;
 }

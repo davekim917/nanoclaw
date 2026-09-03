@@ -15,10 +15,12 @@ import { describe, expect, expectTypeOf, it } from 'vitest';
 import {
   computeOffenders,
   findOutboundOnlySessions,
+  findUnguardedOutboundWrites,
   hostSourcesForOutboundScan,
+  OUTBOUND_WRITE_GUARD,
   RATCHET_SCAN_ROOTS,
 } from './mailbox-seam-ratchet.js';
-import { computeOpSides } from './modules/mailbox/op-sides.js';
+import { computeOpSides, outboundWriteOps } from './modules/mailbox/op-sides.js';
 import { DEFERRED_UPSTREAM_FILES, UNPORTABLE_UPSTREAM_FILES, UPSTREAM_FILES } from './mailbox-seam-manifest.js';
 import type { DeliveryActionHandler } from './delivery.js';
 
@@ -201,5 +203,130 @@ describe('no raw session-DB access or passed session handle outside the mailbox 
         return mailbox.inboundHasMessage('m-1');
       });`;
     expect(findOutboundOnlySessions([{ file: 'fixture.ts', src: fine }], computeOpSides())).toEqual([]);
+  });
+});
+
+describe('host outbound writes go through the stopped-container guard', () => {
+  // `outbound.db` has ONE writer. A host write to a session a container owns
+  // deletes the fresh runner's processing claim, pushes its continuation back
+  // to `queued`, or contends for the write lock — and the window is real,
+  // because opening a mailbox session is a yield and a wake can land in it.
+  // Review found four instances of this by reading; reading is not a check.
+  //
+  // The sanctioned shape is `withStoppedContainerSession`, which re-checks
+  // container ownership INSIDE the session, immediately before the write.
+
+  // The op set is derived from the composition, so this pins the derivation
+  // rather than the list: a write from each half, and no read from either.
+  it('the write-op set is derived from both halves of the composed session', () => {
+    const writes = outboundWriteOps();
+    expect(writes.has('writeOutboundDirect'), 'fork half: forkOps over writableOutbound').toBe(true);
+    expect(writes.has('deleteOrphanProcessingClaims'), 'upstream half: wrapSqliteOutbound over writable()').toBe(true);
+    for (const read of ['readDoneProposal', 'readWorkContinuation', 'getDueMessages', 'getProcessingClaims']) {
+      expect(writes.has(read), `${read} is a read and must not be in the write set`).toBe(false);
+    }
+  });
+
+  // A ratchet, not a target — and the two entries are NOT the same kind of
+  // debt:
+  //
+  //  - src/host-sweep.ts leaves on the cascade merge. PR 5's head puts both
+  //    continuation writes behind `withStoppedContainerSession`; running this
+  //    checker over that host-sweep.ts reports nothing.
+  //  - src/router.ts does NOT leave on the cascade. PR 5 never touched it —
+  //    router.ts is not on the seam on that branch at all — so these two
+  //    sites are this rule's own finding. They are milder than the post-kill
+  //    class: both are `INSERT OR IGNORE` appends of an id-unique row, so a
+  //    concurrent container write loses nothing, though the in-statement
+  //    `MAX(seq) + 2` can hand two appends the same `seq`. Left as a
+  //    documented exception for the operator to route, not fixed here.
+  const OUTBOUND_WRITE_ALLOWLIST = ['src/host-sweep.ts', 'src/router.ts'];
+
+  it('no NEW host outbound write sits outside the guard', () => {
+    const matches = findUnguardedOutboundWrites(hostSourcesForOutboundScan(), outboundWriteOps());
+    const offenders = matches.filter((m) => !OUTBOUND_WRITE_ALLOWLIST.includes(m.file));
+    expect(
+      offenders.map((m) => `${m.file}:${m.line} [${m.ops.join(',')}]`),
+      offenders.length > 0
+        ? `These session actions write outbound.db without ${OUTBOUND_WRITE_GUARD}, so a container that ` +
+            'takes the session during the open owns the file the write lands on. Wrap the action in ' +
+            `${OUTBOUND_WRITE_GUARD} — it re-checks ownership inside the session, immediately before the write.`
+        : undefined,
+    ).toEqual([]);
+  });
+
+  it('every allowlisted file still has such a write (stale entries must be pruned)', () => {
+    const files = new Set(
+      findUnguardedOutboundWrites(hostSourcesForOutboundScan(), outboundWriteOps()).map((m) => m.file),
+    );
+    const stale = OUTBOUND_WRITE_ALLOWLIST.filter((f) => !files.has(f));
+    expect(
+      stale,
+      stale.length > 0 ? `${stale.join(', ')} no longer matches; remove it from the allowlist` : undefined,
+    ).toEqual([]);
+  });
+
+  // The checker driven over strings, so the property stays pinned once the
+  // cascade has emptied the host-sweep half of the allowlist. This first
+  // fixture is the pre-round-7 shape verbatim.
+  it('flags the pre-round-7 continuation write', () => {
+    const bad = `
+      async function incrementStoppedContinuationAttempt(session: Session, expectedId: string) {
+        const result = await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) =>
+          expectedId !== 'legacy-pending-next'
+            ? mailbox.incrementWorkContinuationResumeAttempt(expectedId)
+            : mailbox.migrateLegacyWorkContinuationForRecovery(),
+        );
+        return result ?? null;
+      }`;
+    const hits = findUnguardedOutboundWrites([{ file: 'fixture.ts', src: bad }], outboundWriteOps());
+    expect(hits).toHaveLength(1);
+    expect(hits[0].ops.sort()).toEqual([
+      'incrementWorkContinuationResumeAttempt',
+      'migrateLegacyWorkContinuationForRecovery',
+    ]);
+    expect(hits[0].opener).toBe('withExistingMailboxSession');
+  });
+
+  it('does not flag the same write once it is behind the guard', () => {
+    const fine = `
+      async function incrementStoppedContinuationAttempt(session: Session, expectedId: string) {
+        const result = await withStoppedContainerSession(session, (mailbox) =>
+          mailbox.incrementWorkContinuationResumeAttempt(expectedId),
+        );
+        return result ?? null;
+      }`;
+    expect(findUnguardedOutboundWrites([{ file: 'fixture.ts', src: fine }], outboundWriteOps())).toEqual([]);
+  });
+
+  // The guard is itself built out of a mailbox session; that inner session
+  // must not read as an offender, however deeply the write is nested in it.
+  it('does not flag a session nested inside the guard', () => {
+    const fine = `
+      await withStoppedContainerSession(session, () =>
+        withExistingMailboxSession(a, b, (mailbox) => mailbox.writeOutboundDirect(message)),
+      );`;
+    expect(findUnguardedOutboundWrites([{ file: 'fixture.ts', src: fine }], outboundWriteOps())).toEqual([]);
+  });
+
+  it('does not flag a read-only session', () => {
+    const fine = `
+      await withExistingMailboxSession(a, b, (mailbox) => mailbox.readWorkContinuation());`;
+    expect(findUnguardedOutboundWrites([{ file: 'fixture.ts', src: fine }], outboundWriteOps())).toEqual([]);
+  });
+
+  // Line numbers are the real file's — a failure message that sent the next
+  // engineer to the wrong line would be worse than no message.
+  it('reports the line the call is on, not the line after comments are removed', () => {
+    const src = [
+      '/* one',
+      ' * two',
+      ' */',
+      'const x = 1;',
+      'await withExistingMailboxSession(a, b, (m) => m.writeOutboundDirect(v));',
+    ].join('\n');
+    const hits = findUnguardedOutboundWrites([{ file: 'fixture.ts', src }], outboundWriteOps());
+    expect(hits).toHaveLength(1);
+    expect(hits[0].line).toBe(5);
   });
 });

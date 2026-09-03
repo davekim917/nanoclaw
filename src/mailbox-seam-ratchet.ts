@@ -118,6 +118,24 @@ function stripComments(src: string): string {
   return src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:])\/\/.*$/gm, '$1');
 }
 
+/**
+ * The same strip, but LENGTH-PRESERVING: every comment character becomes a
+ * space and every newline survives, so an offset into the result is an offset
+ * into the original.
+ *
+ * `stripComments` deletes, which shifts every offset after the first comment —
+ * fine for the boolean pattern checks that consume it, wrong for any rule that
+ * reports a line number. The two exist side by side rather than merged because
+ * deleting also JOINS the text either side of a comment, and patterns (a)-(d)
+ * were reviewed against that behaviour.
+ */
+function blankComments(src: string): string {
+  const blank = (match: string): string => match.replace(/[^\n]/g, ' ');
+  return src
+    .replace(/\/\*[\s\S]*?\*\//g, blank)
+    .replace(/(^|[^:])(\/\/.*)$/gm, (_m, head, comment) => head + blank(comment));
+}
+
 function matchesPatternA(src: string): boolean {
   // (a) the literal 'session-db' appears anywhere in the file (comments already
   // stripped). Broadened from "an import from a path ending in session-db.js"
@@ -216,10 +234,21 @@ export interface OutboundOnlySessionMatch {
 
 const SESSION_OPENERS = ['withMailboxSession', 'withExistingMailboxSession'];
 
-/** The action body of one session call, found by balancing from its open paren. */
-function sessionCallBodies(src: string): Array<{ index: number; body: string }> {
-  const out: Array<{ index: number; body: string }> = [];
-  const re = new RegExp(`\\b(?:${SESSION_OPENERS.join('|')})\\s*\\(`, 'g');
+interface CallSite {
+  /** The callee's name. */
+  name: string;
+  /** Offset of the callee name in `src`. */
+  index: number;
+  /** Offset of the closing paren, so one call's span can contain another's. */
+  end: number;
+  /** Everything between the parens — the arguments, action callback included. */
+  body: string;
+}
+
+/** Every call to a function whose name matches `namePattern`, with its span. */
+function callSites(src: string, namePattern: string): CallSite[] {
+  const out: CallSite[] = [];
+  const re = new RegExp(`\\b(${namePattern})\\s*\\(`, 'g');
   let m: RegExpExecArray | null;
   while ((m = re.exec(src))) {
     const open = m.index + m[0].length - 1;
@@ -229,13 +258,18 @@ function sessionCallBodies(src: string): Array<{ index: number; body: string }> 
       else if (src[i] === ')') {
         depth--;
         if (depth === 0) {
-          out.push({ index: m.index, body: src.slice(open + 1, i) });
+          out.push({ name: m[1], index: m.index, end: i, body: src.slice(open + 1, i) });
           break;
         }
       }
     }
   }
   return out;
+}
+
+/** The action body of one session call, found by balancing from its open paren. */
+function sessionCallBodies(src: string): Array<{ index: number; body: string }> {
+  return callSites(src, `(?:${SESSION_OPENERS.join('|')})`).map(({ index, body }) => ({ index, body }));
 }
 
 /**
@@ -274,4 +308,78 @@ export function findOutboundOnlySessions(
 /** Non-test host sources, for the check above. */
 export function hostSourcesForOutboundScan(): Array<{ file: string; src: string }> {
   return listTsFiles('src').map((file) => ({ file, src: fs.readFileSync(path.join(REPO_ROOT, file), 'utf8') }));
+}
+
+/* ─── Host outbound writes outside the stopped-container guard ─────────────── */
+
+/**
+ * The one sanctioned way for the host to write a session's `outbound.db`.
+ *
+ * `outbound.db` has a single writer. The host may write it only while no
+ * container owns the session, and the check has to sit INSIDE the session and
+ * immediately before the mutation, with no await between the two: opening a
+ * mailbox session is a yield, and a wake landing in that gap starts a container
+ * that now owns the file. `withStoppedContainerSession` (src/host-sweep.ts) is
+ * that shape — it re-checks `containerOwnsOutbound()` inside the session and
+ * resolves `undefined` when a container took it.
+ */
+export const OUTBOUND_WRITE_GUARD = 'withStoppedContainerSession';
+
+/**
+ * A host-side session action that MUTATES `outbound.db` without that guard.
+ *
+ * This is a structural close on a defect class rather than a lint: four
+ * separate review rounds found instances of it by reading, and reading is not
+ * a repeatable check. Each instance costs the same way — the write lands on a
+ * file a live container owns, deleting the fresh runner's processing claim,
+ * pushing its continuation back to `queued`, or contending for the write lock.
+ *
+ * Reach, stated plainly so the residue is not mistaken for coverage: the check
+ * is LEXICAL. It sees a write op called on a session inside a `with*Session(…)`
+ * action. It does NOT see a write reached through a `SessionRunner`-style
+ * callback parameter, or one made by a helper the action calls, because the op
+ * name is not in the body it scans. Those sites carry the ownership check
+ * inline instead; they are outside this rule, not exempt from the property.
+ */
+export interface OutboundWriteMatch {
+  file: string;
+  line: number;
+  /** The session opener the action was passed to. */
+  opener: string;
+  ops: string[];
+}
+
+/**
+ * Every host-side session action that writes `outbound.db` outside the guard.
+ *
+ * `writeOps` is injected (from `outboundWriteOps()`) so a test can drive the
+ * checker over a fixture string without touching the real module.
+ */
+export function findUnguardedOutboundWrites(
+  sources: Array<{ file: string; src: string }>,
+  writeOps: ReadonlySet<string>,
+): OutboundWriteMatch[] {
+  const found: OutboundWriteMatch[] = [];
+  for (const { file, src } of sources) {
+    // Length-preserving, so the reported line is the line in the real file.
+    const stripped = blankComments(src);
+    // Spans of every guarded session, so a write nested inside one is exempt
+    // however deeply it is wrapped.
+    const guarded = callSites(stripped, OUTBOUND_WRITE_GUARD).map((c) => ({ from: c.index, to: c.end }));
+    for (const call of callSites(stripped, 'with[A-Za-z0-9_$]*Session')) {
+      if (call.name === OUTBOUND_WRITE_GUARD) continue;
+      if (guarded.some((g) => call.index > g.from && call.index < g.to)) continue;
+      const ops = [...call.body.matchAll(/\b[A-Za-z_$][\w$]*\.([A-Za-z_$][\w$]*)\s*\(/g)]
+        .map((x) => x[1])
+        .filter((op) => writeOps.has(op));
+      if (ops.length === 0) continue;
+      found.push({
+        file,
+        line: stripped.slice(0, call.index).split('\n').length,
+        opener: call.name,
+        ops: [...new Set(ops)],
+      });
+    }
+  }
+  return found;
 }
