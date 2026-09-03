@@ -28,28 +28,39 @@ function isRegionZoneShape(tz: string): boolean {
  * The spelling of `tz` safe to persist as a per-group override, or null.
  *
  * `isValidTimezone` is deliberately looser — it asks only whether Intl can
- * format with the value. This is the write-path gate.
+ * format with the value. This is the write-path gate, and what it returns is
+ * what gets stored.
  *
- * Case is normalized because POSIX looks the name up as a zoneinfo FILE, so
- * `europe/lisbon` would not resolve inside the container even though Intl
- * accepts it. Aliases are NOT normalized: `Asia/Kolkata` resolves to the
- * legacy `Asia/Calcutta` under ICU, both ship in tzdata, and rewriting what
- * the operator typed would be surprising for no gain. An abbreviation is
- * refused rather than rewritten — `CST` has meant more than one region, so
- * the operator should say which.
+ * Two rules, and the second one is why an earlier version of this was wrong:
+ *
+ * 1. The INPUT must name a region. An abbreviation is ambiguous — `CST` is US
+ *    Central to ICU and China Standard to plenty of humans — so the operator
+ *    is asked to say which, rather than having one picked for them. Fixed
+ *    offsets are refused outright: POSIX reads `TZ=+01:00` as UTC-1.
+ * 2. The STORED value is always what the resolver returns, never what was
+ *    typed. Keeping the typed spelling looked friendlier and did not work:
+ *    `asia/kolkata` resolves to `Asia/Calcutta`, so it cannot be case-corrected
+ *    from its own resolution, and POSIX zoneinfo lookup is case-sensitive —
+ *    the host would have scheduled on Kolkata time while the container read an
+ *    unresolvable `TZ` and fell back to UTC. The resolver's answer is always a
+ *    real tzdata name in the casing POSIX needs.
+ *
+ * The visible cost of rule 2 is that `Asia/Kolkata` is stored as its ICU
+ * canonical `Asia/Calcutta`. Both are the same zone and both ship in tzdata;
+ * `ncl groups config get` shows what was stored.
  */
 export function canonicalizeIanaTimezone(tz: string): string | null {
   if (!isValidTimezone(tz)) return null;
+  if (tz.toUpperCase() !== 'UTC' && !tz.includes('/')) return null;
   const resolved = Intl.DateTimeFormat(undefined, { timeZone: tz }).resolvedOptions().timeZone;
-  if (tz.toLowerCase() === resolved.toLowerCase()) return isRegionZoneShape(resolved) ? resolved : null;
-  return isRegionZoneShape(tz) ? tz : null;
+  return isRegionZoneShape(resolved) ? resolved : null;
 }
 
 /**
  * Whether a STORED override is safe to honour. Anything the write path would
- * have rewritten or refused — wrong case, a fixed offset, an abbreviation — is
- * ignored in favour of the install timezone, so a hand-edited value cannot
- * split the host clock from the container clock.
+ * have rewritten or refused — wrong case, an alias spelling, a fixed offset,
+ * an abbreviation — is ignored in favour of the install timezone, so a
+ * hand-edited value cannot split the host clock from the container clock.
  */
 export function isIanaTimezone(tz: string): boolean {
   return canonicalizeIanaTimezone(tz) === tz;

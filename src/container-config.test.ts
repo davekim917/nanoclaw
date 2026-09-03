@@ -258,10 +258,15 @@ describe('resolveGroupTimezone', () => {
       expect(resolveGroupTimezone(TZ_GROUP.id)).toBe(TIMEZONE);
       expect(configFromDb(getContainerConfig(TZ_GROUP.id)!, TZ_GROUP).timezone).toBeUndefined();
     }
-    // A modern alias is honoured as stored — Asia/Kolkata resolves to the
-    // legacy Asia/Calcutta under ICU, and both ship in tzdata.
-    updateContainerConfigScalars(TZ_GROUP.id, { timezone: 'Asia/Kolkata' });
-    expect(resolveGroupTimezone(TZ_GROUP.id)).toBe('Asia/Kolkata');
+    // An alias spelling is refused on the read side too: the write path stores
+    // the resolver's canonical name, so anything else in the row was not put
+    // there by `ncl` and may not be resolvable as a zoneinfo file.
+    for (const alias of ['Asia/Kolkata', 'asia/kolkata', 'Europe/Kyiv']) {
+      updateContainerConfigScalars(TZ_GROUP.id, { timezone: alias });
+      expect(resolveGroupTimezone(TZ_GROUP.id)).toBe(TIMEZONE);
+    }
+    updateContainerConfigScalars(TZ_GROUP.id, { timezone: 'Asia/Calcutta' });
+    expect(resolveGroupTimezone(TZ_GROUP.id)).toBe('Asia/Calcutta');
   });
 
   it('configFromDb ships a valid timezone to the container and drops an invalid one', () => {

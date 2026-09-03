@@ -122,7 +122,7 @@ describe('tasks CLI resource', () => {
     ensureContainerConfig('ag-tokyo');
     ensureContainerConfig('ag-kolkata');
     updateContainerConfigScalars('ag-tokyo', { timezone: 'Asia/Tokyo' }); // UTC+9, no DST
-    updateContainerConfigScalars('ag-kolkata', { timezone: 'Asia/Kolkata' }); // UTC+5:30, no DST
+    updateContainerConfigScalars('ag-kolkata', { timezone: 'Asia/Calcutta' }); // UTC+5:30, no DST
 
     const made: Record<string, { series_id: string; session_id: string }> = {};
     for (const group of ['ag-tokyo', 'ag-kolkata']) {
@@ -1309,7 +1309,7 @@ describe('tasks CLI resource', () => {
       ensureContainerConfig('ag-audit-tokyo');
       ensureContainerConfig('ag-audit-kolkata');
       updateContainerConfigScalars('ag-audit-tokyo', { timezone: 'Asia/Tokyo' });
-      updateContainerConfigScalars('ag-audit-kolkata', { timezone: 'Asia/Kolkata' });
+      updateContainerConfigScalars('ag-audit-kolkata', { timezone: 'Asia/Calcutta' });
 
       const made: Record<string, { series_id: string }> = {};
       for (const group of ['ag-audit-tokyo', 'ag-audit-kolkata']) {

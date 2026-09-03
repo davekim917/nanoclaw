@@ -581,12 +581,15 @@ describe('groups CLI resource config', () => {
     }
     expect(getContainerConfig(id)?.timezone).toBeNull();
 
-    // Case is normalized, because POSIX looks the zone up as a zoneinfo FILE.
-    // An alias is left as typed: Asia/Kolkata resolves to the legacy
-    // Asia/Calcutta under ICU and both ship in tzdata.
+    // What gets stored is always the resolver's spelling, because POSIX looks
+    // the zone up as a zoneinfo FILE and the lookup is case-sensitive. An
+    // alias cannot be case-corrected from its own resolution — `asia/kolkata`
+    // resolves to `Asia/Calcutta` — so the resolved name is what lands.
     for (const [typed, stored] of [
       ['europe/lisbon', 'Europe/Lisbon'],
-      ['Asia/Kolkata', 'Asia/Kolkata'],
+      ['Asia/Kolkata', 'Asia/Calcutta'],
+      ['asia/kolkata', 'Asia/Calcutta'],
+      ['Europe/Kyiv', 'Europe/Kiev'],
     ]) {
       const ok = await dispatch(
         { id: `req-tz-canon-${typed}`, command: 'groups-config-update', args: { id, timezone: typed } },
