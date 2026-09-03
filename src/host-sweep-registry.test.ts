@@ -1016,6 +1016,19 @@ describe('sweep duty registry (S2-PR2)', () => {
     }
   });
 
+  // ── F-3.3 (S2-PR3) ─────────────────────────────────────────────────────────
+  it('the idle-reap bodies are gone from host-sweep.ts', async () => {
+    const hostSweep = (await import('./host-sweep.js')) as unknown as Record<string, unknown>;
+    expect(hostSweep.shouldReapIdleTaskContainer).toBeUndefined();
+    expect(hostSweep.shouldReapIdleChatContainer).toBeUndefined();
+    expect(hostSweep.CHAT_IDLE_REAP_MS).toBeUndefined();
+    // They now live in, and are exported from, the family module instead.
+    const idleReap = await import('./modules/sweep-idle-reap/index.js');
+    expect(typeof idleReap.shouldReapIdleTaskContainer).toBe('function');
+    expect(typeof idleReap.shouldReapIdleChatContainer).toBe('function');
+    expect(idleReap.CHAT_IDLE_REAP_MS).toBe(15 * 60 * 1000);
+  });
+
   // ── duty registration sources ───────────────────────────────────────────────
   describe('duty registration sources', () => {
     // Stands in for a real family module, which registers its source once at
