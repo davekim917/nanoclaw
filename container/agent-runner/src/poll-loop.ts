@@ -20,7 +20,14 @@ import { getConfig } from './config.js';
 import { setChatLimit, writeMessageOut } from './db/messages-out.js';
 import { recordTurnUsage } from './db/turn-usage.js';
 import { getSessionSpawnTaskId } from './db/session-routing.js';
-import { getInboundDb, touchHeartbeat, clearStaleProcessingAcks, setProviderExecuting } from './db/connection.js';
+import {
+  getInboundDb,
+  touchHeartbeat,
+  clearStaleProcessingAcks,
+  setProviderTurnExecuting,
+  beginProviderBusyScope,
+  endProviderBusyScope,
+} from './db/connection.js';
 import {
   advanceMemoryContextEpoch,
   clearContinuation,
@@ -473,12 +480,12 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
           // continuation record is already cleared, this path claims no
           // inbound rows, and the turn-end git checkpoint below is real work
           // the host would otherwise read as idle. Bounded, unlike the stream.
-          setProviderExecuting(true);
+          beginProviderBusyScope();
           try {
             emitTurnEnd();
             await checkpointTurnEnd(autosaveWorktrees);
           } finally {
-            setProviderExecuting(false);
+            endProviderBusyScope();
           }
           continue;
         }
@@ -1459,7 +1466,7 @@ export async function processQuery(
     // with no processing claim of its own (the initial batch was completed at
     // the previous `result`), so this is the only thing standing between it
     // and the idle reaper.
-    setProviderExecuting(true);
+    setProviderTurnExecuting(true);
     turnStartedAtMs = Date.now();
     query.push(message);
   };
@@ -1743,7 +1750,7 @@ export async function processQuery(
   }, ACTIVE_POLL_INTERVAL_MS);
 
   // The initial prompt is a turn the same way a push is; `result` clears it.
-  setProviderExecuting(true);
+  setProviderTurnExecuting(true);
   try {
     for await (const event of query.events) {
       if (event.type === 'error') {
@@ -1789,8 +1796,10 @@ export async function processQuery(
         // `result` to accept pushes (claude.ts's generator exits only on
         // end()/abort), so a flag cleared on return would sit at 1 through
         // the entire idle stretch and keep the task reaper off a container
-        // that has nothing left to do.
-        setProviderExecuting(false);
+        // that has nothing left to do. It lowers only the TURN level: a
+        // pre-task script the poll callback started concurrently keeps its own
+        // scope, so this cannot cut the ground out from under it.
+        setProviderTurnExecuting(false);
         // Fleet Hardening Phase 0.1: one turn_usage row per completed turn,
         // written here because every provider's query converges on this
         // event regardless of which one ran. Whatever the provider didn't
@@ -1968,7 +1977,7 @@ export async function processQuery(
     done = true;
     clearInterval(pollHandle);
     // Floor for the abort/throw paths, which never reach a `result`.
-    setProviderExecuting(false);
+    setProviderTurnExecuting(false);
   }
 
   return { continuation: queryContinuation };

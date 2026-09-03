@@ -2,7 +2,7 @@ import { execFile } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import type { MessageInRow } from '../db/messages-in.js';
-import { touchHeartbeat, setProviderExecuting } from '../db/connection.js';
+import { touchHeartbeat, beginProviderBusyScope, endProviderBusyScope } from '../db/connection.js';
 import { evaluateManagedGitCommand } from '../managed-git-guard.js';
 import { buildSecretEnvVarList, MCP_HEADER_ONLY_SECRET_VARS } from '../providers/secret-env.js';
 
@@ -231,13 +231,16 @@ export async function applyPreTaskScripts(messages: MessageInRow[]): Promise<Tas
     // not "busy", and the task reaper does not look at it. provider_executing
     // is the signal that does mean busy — without it a script that outlives a
     // sweep tick is killed mid-run once its row stops counting as due.
+    //
+    // A scope, not the turn level: the active poll callback runs this path
+    // concurrently with a provider turn, and neither side may clear the other.
     touchHeartbeat();
-    setProviderExecuting(true);
+    beginProviderBusyScope();
     let result: ScriptResult | null;
     try {
       result = await runScript(script, msg.id);
     } finally {
-      setProviderExecuting(false);
+      endProviderBusyScope();
     }
     touchHeartbeat();
 

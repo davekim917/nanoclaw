@@ -19,7 +19,8 @@ import {
   closeSessionDb,
   getInboundDb,
   getOutboundDb,
-  setProviderExecuting,
+  setProviderTurnExecuting,
+  beginProviderBusyScope,
   clearStaleProcessingAcks,
 } from '../db/connection.js';
 import { getPendingMessages, markScriptSkipped } from '../db/messages-in.js';
@@ -287,11 +288,48 @@ describe('applyPreTaskScripts provider_executing', () => {
   });
 
   it('clears a flag leaked by a killed container at the next container startup', () => {
-    setProviderExecuting(true);
+    beginProviderBusyScope();
     expect(providerExecuting()).toBe(1);
 
     clearStaleProcessingAcks();
 
+    expect(providerExecuting()).toBe(0);
+  });
+
+  // The active poll callback runs pre-task scripts for in-turn follow-ups while
+  // a provider turn is streaming. One shared boolean made the two scopes cut
+  // each other down: whichever finished first published idle and exposed the
+  // other to the reaper. They are tracked separately, so each ends on its own.
+  it('does not clear a provider turn that is still running when a script ends', async () => {
+    setProviderTurnExecuting(true);
+    insertTask('t-scope-under-turn', `echo '{"wakeAgent": false}'`);
+
+    await applyPreTaskScripts(getPendingMessages());
+
+    expect(providerExecuting()).toBe(1);
+    setProviderTurnExecuting(false);
+    expect(providerExecuting()).toBe(0);
+  });
+
+  it('does not clear a running script when the turn it overlaps ends first', async () => {
+    const marker = freshMarker('turn-ends-first');
+    setProviderTurnExecuting(true);
+    insertTask('t-turn-ends-first', `touch ${marker}\nsleep 2\necho '{"wakeAgent": true}'`);
+    const run = applyPreTaskScripts(getPendingMessages());
+
+    // The published bit is already 1 from the turn, so poll the marker: it
+    // only exists once the script is actually executing inside its scope.
+    const deadline = Date.now() + 3_000;
+    while (Date.now() < deadline && !fs.existsSync(marker)) await Bun.sleep(25);
+    expect(fs.existsSync(marker)).toBe(true);
+
+    // The stream's `result` lands while the script is still executing.
+    setProviderTurnExecuting(false);
+    const sawBusy = providerExecuting();
+
+    await run;
+
+    expect(sawBusy).toBe(1);
     expect(providerExecuting()).toBe(0);
   });
 });

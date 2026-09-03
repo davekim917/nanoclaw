@@ -430,20 +430,30 @@ export function clearProviderHealthState(outbound: Database = getOutboundDb()): 
  * so they hold no claim at all. In those windows every term the task reaper
  * looks at reads "idle" and the container is killed mid-work.
  *
- * The flag tracks TURNS, not stream lifetime. A multi-turn stream stays open
- * after `result` to accept pushes, so poll-loop.ts publishes this at the same
- * two boundaries it already maintains `turnIdle` at — set on the prompt that
- * starts a turn, cleared on the `result` that ends one. Bracketing a whole
- * `processQuery` call instead would pin the flag at 1 through the container's
- * entire idle stretch and defeat the reaper.
+ * TWO busy scopes share the one published bit, and they are tracked
+ * separately because they overlap and have different shapes:
  *
- * Windows outside a provider turn (the script batch, a turn-end checkpoint)
- * take a `try`/`finally` pair, and they must be bounded: a window entered and
- * never left holds the container past the reaper. The 30-minute heartbeat
- * ceiling is still a backstop, and clearStaleProcessingAcks resets the flag at
- * the next container's startup.
+ *   - **the provider turn** — a LEVEL, not a nesting scope. It is raised by
+ *     the prompt that starts a turn (the initial one, every pushToQuery) and
+ *     lowered by the `result` that ends one, which are not balanced: two
+ *     nudges can be pushed before a single result. The flag tracks turns and
+ *     NOT stream lifetime, because a multi-turn stream stays open after
+ *     `result` to accept pushes — holding the bit for the whole stream would
+ *     pin it through the container's entire idle stretch and defeat the
+ *     reaper.
+ *   - **bracketed windows outside a turn** — the pre-task script batch, the
+ *     turn-end git checkpoint. These nest, so they are counted.
+ *
+ * The active poll callback runs pre-task scripts CONCURRENTLY with a provider
+ * turn, so one boolean cannot serve both: the script's exit would clear the
+ * running turn's bit, and a `result` landing mid-script would clear the
+ * script's. Publishing `turn || scopes > 0` is what makes either scope safe to
+ * end while the other is still live.
  */
-export function setProviderExecuting(executing: boolean, outbound: Database = getOutboundDb()): void {
+let turnExecuting = false;
+let busyScopeDepth = 0;
+
+function publishProviderExecuting(outbound: Database): void {
   const now = new Date().toISOString();
   outbound
     .prepare(
@@ -453,7 +463,37 @@ export function setProviderExecuting(executing: boolean, outbound: Database = ge
          provider_executing = excluded.provider_executing,
          updated_at = excluded.updated_at`,
     )
-    .run(executing ? 1 : 0, now);
+    .run(turnExecuting || busyScopeDepth > 0 ? 1 : 0, now);
+}
+
+/** Raise/lower the provider-turn level. Idempotent — repeats are not counted. */
+export function setProviderTurnExecuting(executing: boolean, outbound: Database = getOutboundDb()): void {
+  turnExecuting = executing;
+  publishProviderExecuting(outbound);
+}
+
+/**
+ * Enter a bracketed busy window outside a provider turn. ALWAYS pair with
+ * `endProviderBusyScope` in a `finally`, and keep the window bounded: one
+ * entered and never left holds the container past the reaper until the
+ * 30-minute heartbeat ceiling.
+ */
+export function beginProviderBusyScope(outbound: Database = getOutboundDb()): void {
+  busyScopeDepth += 1;
+  publishProviderExecuting(outbound);
+}
+
+/** Leave a bracketed busy window. */
+export function endProviderBusyScope(outbound: Database = getOutboundDb()): void {
+  if (busyScopeDepth > 0) busyScopeDepth -= 1;
+  publishProviderExecuting(outbound);
+}
+
+/** Drop both scopes and publish idle. Container startup, and tests. */
+export function resetProviderExecuting(outbound: Database = getOutboundDb()): void {
+  turnExecuting = false;
+  busyScopeDepth = 0;
+  publishProviderExecuting(outbound);
 }
 
 /**
@@ -488,12 +528,15 @@ export function clearStaleProcessingAcks(): void {
   // survive in outbound.db. Clearing it here — the fresh container's startup,
   // before its first poll — means a leaked 1 can never make the NEXT container
   // unreapable.
-  setProviderExecuting(false);
+  resetProviderExecuting();
 }
 
 /** For tests — creates in-memory DBs with the session schemas. */
 export function initTestSessionDb(): { inbound: Database; outbound: Database } {
   _testMode = true;
+  // Scope state is module-level and would otherwise leak between tests.
+  turnExecuting = false;
+  busyScopeDepth = 0;
   _inbound = new Database(':memory:');
   _inbound.exec('PRAGMA foreign_keys = ON');
   _inbound.exec(`

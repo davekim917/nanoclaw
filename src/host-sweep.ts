@@ -1316,8 +1316,8 @@ export function shouldCloseTaskSession(
  * things the HOST can see — a due inbound row, a processing claim, a
  * work_continuation record. Work the runner drives on its own behalf shows up
  * in none of them, and every such window was a silent mid-work kill until the
- * runner started publishing this flag (container/agent-runner/src/db/
- * connection.ts setProviderExecuting):
+ * runner started publishing this flag (the scope helpers in
+ * container/agent-runner/src/db/connection.ts):
  *
  *   - the pre-task script batch, which by design runs BEFORE the rows it
  *     belongs to are claimed and may take NANOCLAW_TASK_SCRIPT_TIMEOUT_MS
@@ -1328,7 +1328,10 @@ export function shouldCloseTaskSession(
  *
  * It tracks turns, not stream lifetime — set on the prompt that starts one,
  * cleared on the `result` that ends it — so a container parked in an open
- * multi-turn stream still reaps on the same tick it goes quiet.
+ * multi-turn stream still reaps on the same tick it goes quiet. The turn and
+ * the bracketed windows are tracked as separate scopes on the container side,
+ * because a pre-task script for an in-turn follow-up runs concurrently with
+ * the turn it belongs to; the host sees their union.
  *
  * A container that dies mid-window cannot clear the flag, so the fresh one
  * clears it at startup (clearStaleProcessingAcks) and the 30-minute heartbeat
