@@ -32,7 +32,7 @@ import { readEnvFileMatching } from '../env.js';
 import { log } from '../log.js';
 import { markdownHeadingsToBold } from '../text-styles.js';
 import { createChatSdkBridge } from './chat-sdk-bridge.js';
-import type { ChannelRecoveryRequest, ChannelRecoveryTarget } from './adapter.js';
+import type { ChannelDefaults, ChannelRecoveryRequest, ChannelRecoveryTarget } from './adapter.js';
 import { registerChannelAdapter } from './channel-registry.js';
 import { extractSlackRawText } from './slack-raw-text.js';
 import {
@@ -55,6 +55,60 @@ import {
 // little headroom for adapter-side serialization while preserving complete
 // replies by letting the shared bridge split longer chat messages.
 export const SLACK_MESSAGE_MAX_TEXT_LENGTH = 2800;
+
+/**
+ * Declared wiring-time defaults for every Slack instance.
+ *
+ * Until this existed, `registerChannelAdapter` passed no `defaults` and every
+ * Slack wiring resolved through `fallbackChannelDefaults` — the lenient
+ * undeclared-adapter path. That was not neutral: the `ncl`/wizard creation
+ * surfaces gate declaration-derived defaults on `hasDeclaredChannelDefaults`,
+ * so a Slack wiring created through `ncl` got the static schema defaults
+ * (engage_mode 'mention', unknown_sender_policy 'strict') while the router's
+ * auto-create branch and the card-approval flow used the fallback. The live
+ * install shows the split: some Slack DM messaging_groups carry 'strict',
+ * their card-approved siblings 'public'.
+ *
+ * Shape mirrors upstream/channels slack.ts, VALUES are the fork's policies:
+ *  - group.engageMode 'mention', not upstream's 'mention-sticky' (owner
+ *    directive 2026-05-26 — sibling agents co-reside in channels and sticky
+ *    let one agent auto-dominate a thread);
+ *  - group.unknownSenderPolicy 'public', not upstream's 'request_approval'
+ *    (owner directive 2026-08-06 — inviting the bot to a channel IS the
+ *    access decision);
+ *  - dm.unknownSenderPolicy 'request_approval' (upstream's 'decline_notify'
+ *    is not in this fork's enum);
+ *  - no sessionMode: this fork's ChannelContextDefaults has no such field;
+ *    session_mode 'per-thread' is stamped by `wireApprovedChannel`.
+ *
+ * CREATION-TIME STAMPS vs LIVE INHERIT — the rule that keeps existing
+ * installs still: engageMode, engagePattern and unknownSenderPolicy are read
+ * only when a wiring or messaging_groups row is CREATED, so they can differ
+ * from history without touching a single existing row. `threads` is the one
+ * value re-read on every routed message (`resolveThreadPolicy`, NULL =
+ * inherit), so it MUST equal what the fallback resolved to or ~48 live Slack
+ * wirings would silently change threading on deploy. The fallback resolves
+ * `threads: supportsThreads`, and the Slack bridge declares
+ * supportsThreads:true — hence true in BOTH contexts. Upstream declares
+ * dm.threads:false; adopting that here would collapse every existing Slack DM
+ * sub-thread into one session (this fork threads DM replies by default — see
+ * the DM auto-threading block in chat-sdk-bridge.ts). Operators who want a
+ * different value set it per wiring with `--threads`.
+ */
+export const SLACK_DEFAULTS: ChannelDefaults = {
+  dm: {
+    engageMode: 'pattern',
+    engagePattern: '.',
+    threads: true,
+    unknownSenderPolicy: 'request_approval',
+  },
+  group: {
+    engageMode: 'mention',
+    threads: true,
+    unknownSenderPolicy: 'public',
+  },
+  mentions: 'platform',
+};
 
 /**
  * Fetch the workspace's human members and register them for outbound
@@ -319,6 +373,58 @@ export function parseSlackWorkspaces(env: Record<string, string>): SlackWorkspac
   return workspaces;
 }
 
+/**
+ * ChannelTypes that must carry the declaration but cannot serve traffic.
+ *
+ * The registration is credential-gated, but the DECLARATION must not be:
+ * `getChannelDefaults` resolves through the REGISTRY when no adapter is live
+ * (tier 3, "factories that returned null for missing creds"), and without an
+ * entry `ncl`/setup stamp the legacy `strict` schema default on a
+ * messaging_groups row — a creation-time value that survives the credentials
+ * being completed.
+ *
+ * Two sources:
+ *  - any suffix seen with a Slack env key but not a complete token/secret
+ *    pair — a bot token pasted before its signing secret, or the reverse;
+ *  - the default `slack` instance when NOTHING is configured, which is the
+ *    state `setup/register.ts` and an offline `ncl` run in. It is added only
+ *    then, so a host with real workspaces does not advertise a phantom
+ *    unconfigured channel in `getRegisteredChannelNames`.
+ *
+ * A suffix that IS complete is excluded here — the bridge factory loop
+ * registers it with a live factory.
+ *
+ * Exported for testing. Same suffix→channelType derivation as
+ * parseSlackWorkspaces, deliberately duplicated rather than folded into it:
+ * that function's contract is "workspaces that can serve traffic", and the
+ * bridge factory loop depends on that.
+ */
+export function declarationOnlySlackTypes(env: Record<string, string>): string[] {
+  const bySuffix = new Map<string, { botToken?: string; signingSecret?: string }>();
+  for (const [key, value] of Object.entries(env)) {
+    const m = key.match(/^SLACK_(BOT_TOKEN|SIGNING_SECRET)(?:_([A-Za-z0-9_]+))?$/);
+    if (!m) continue;
+    const [, kind, rawSuffix] = m;
+    const suffix = rawSuffix ? rawSuffix.toLowerCase().replace(/_/g, '-') : '';
+    const entry = bySuffix.get(suffix) ?? {};
+    if (kind === 'BOT_TOKEN') entry.botToken = value;
+    else entry.signingSecret = value;
+    bySuffix.set(suffix, entry);
+  }
+
+  const types: string[] = [];
+  let anyComplete = false;
+  for (const [suffix, pair] of bySuffix) {
+    if (pair.botToken && pair.signingSecret) {
+      anyComplete = true;
+      continue;
+    }
+    types.push(suffix ? `slack-${suffix}` : 'slack');
+  }
+  if (!anyComplete && types.length === 0) types.push('slack');
+  return types;
+}
+
 /** Minimal interface for the Slack chat.postMessage client — narrow surface for testing. */
 export interface SlackPostMessageClient {
   chat: {
@@ -378,10 +484,25 @@ export async function slackCreateThread(
 // parseSlackWorkspaces — both must allow `_` in the suffix, otherwise
 // env vars like SLACK_BOT_TOKEN_EXAMPLE_LABS_CODEX get dropped here before
 // they ever reach the parser.
-const workspaces = parseSlackWorkspaces(readEnvFileMatching(/^SLACK_(BOT_TOKEN|SIGNING_SECRET)(_[A-Za-z0-9_]+)?$/));
+const slackEnv = readEnvFileMatching(/^SLACK_(BOT_TOKEN|SIGNING_SECRET)(_[A-Za-z0-9_]+)?$/);
+const workspaces = parseSlackWorkspaces(slackEnv);
+
+// Declaration-only registrations run BEFORE the live ones so a complete
+// workspace's real factory always wins the key. A half-configured or entirely
+// unconfigured Slack still gets its declaration into the registry, so a
+// messaging group created before the credentials land is not stamped with the
+// legacy `strict` schema default forever. The factory returns null —
+// initChannelAdapters logs the missing credentials and moves on.
+for (const channelType of declarationOnlySlackTypes(slackEnv)) {
+  registerChannelAdapter(channelType, { defaults: SLACK_DEFAULTS, factory: () => null });
+}
 
 for (const ws of workspaces) {
   registerChannelAdapter(ws.channelType, {
+    // Also on the registration, so offline creation paths (setup wizard,
+    // scripts, `ncl` against a host whose factory returned null for missing
+    // creds) resolve the same declaration without instantiating the adapter.
+    defaults: SLACK_DEFAULTS,
     factory: async () => {
       const slackAdapter = createSlackAdapter({
         botToken: ws.botToken,
@@ -441,6 +562,7 @@ for (const ws of workspaces) {
         extractRawText: extractSlackRawText,
         concurrency: 'concurrent',
         supportsThreads: true,
+        defaults: SLACK_DEFAULTS,
         maxTextLength: SLACK_MESSAGE_MAX_TEXT_LENGTH,
         // Oversize channel-level posts: continuation chunks reply in the
         // first chunk's thread rather than landing as sibling parents that
