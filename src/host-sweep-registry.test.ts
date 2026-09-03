@@ -235,7 +235,7 @@ import {
 import './modules/sweep-continuation/index.js';
 import { log } from './log.js';
 import { SessionDbMissingError, SessionDbUnopenableError } from './modules/mailbox/index.js';
-import { _mailboxSessionDepthForTesting } from './modules/mailbox/session.js';
+import { _mailboxSessionDepthForTesting } from './host-sweep-depth-probe.js';
 
 probe.depth = _mailboxSessionDepthForTesting;
 
