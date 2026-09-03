@@ -232,6 +232,11 @@ import {
 import { log } from './log.js';
 import { SessionDbMissingError, SessionDbUnopenableError } from './modules/mailbox/index.js';
 import { _mailboxSessionDepthForTesting } from './modules/mailbox/session.js';
+// S2-PR3 moved S12/S13 (idle-task-reap, idle-chat-reap) out of host-sweep.ts
+// into this module, which registers itself via `registerSweepDutySource` at
+// import — a default (builtins-restoring) `_resetSweepRegistryForTesting()`
+// replays it automatically, same as the in-file builtins.
+import './modules/sweep-idle-reap/index.js';
 
 probe.depth = _mailboxSessionDepthForTesting;
 
@@ -1009,6 +1014,19 @@ describe('sweep duty registry (S2-PR2)', () => {
     for (const [id, name] of Object.entries(SWEEP_DUTY_INVENTORY)) {
       expect(names, `inventory id ${id}`).toContain(name);
     }
+  });
+
+  // ── F-3.3 (S2-PR3) ─────────────────────────────────────────────────────────
+  it('the idle-reap bodies are gone from host-sweep.ts', async () => {
+    const hostSweep = (await import('./host-sweep.js')) as unknown as Record<string, unknown>;
+    expect(hostSweep.shouldReapIdleTaskContainer).toBeUndefined();
+    expect(hostSweep.shouldReapIdleChatContainer).toBeUndefined();
+    expect(hostSweep.CHAT_IDLE_REAP_MS).toBeUndefined();
+    // They now live in, and are exported from, the family module instead.
+    const idleReap = await import('./modules/sweep-idle-reap/index.js');
+    expect(typeof idleReap.shouldReapIdleTaskContainer).toBe('function');
+    expect(typeof idleReap.shouldReapIdleChatContainer).toBe('function');
+    expect(idleReap.CHAT_IDLE_REAP_MS).toBe(15 * 60 * 1000);
   });
 
   // ── duty registration sources ───────────────────────────────────────────────

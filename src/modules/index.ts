@@ -52,3 +52,8 @@ import './provider-fallback/index.js';
 import './repository-workspaces/index.js';
 
 import './escalation/index.js';
+
+// Sweep duty families (convergence seam 2) — each self-registers its duties
+// on the host-sweep.ts registry at import time, same pattern as above.
+// sweep-idle-reap: S12 idle-task-reap, S13 idle-chat-reap (S2-PR3).
+import './sweep-idle-reap/index.js';
