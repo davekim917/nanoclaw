@@ -119,13 +119,16 @@ const h = vi.hoisted(() => {
     agentGroup: { id: 'ag-1', name: 'ag', folder: 'ag-folder' } as unknown,
     running: new Set<string>(),
     heartbeatFile: '',
-    kills: [] as { sessionId: string; reason: string }[],
+    kills: [] as { sessionId: string; reason: string; depth: number }[],
     spawns: [] as string[],
     exists: true,
     mailbox: null as NanoclawMailboxSession | null,
     oomWritten: 0,
   };
 });
+
+/** Filled in after the imports below; the mock factory below cannot import. */
+const probe = vi.hoisted(() => ({ depth: (): number => 0 }));
 
 function childProcessTripwire(record: string[]): Record<string, (...args: unknown[]) => never> {
   const spawnAttempted =
@@ -187,7 +190,7 @@ vi.mock('../../container-runner.js', async (importOriginal) => {
     getContainerSpawnedAt: () => 0,
     getActiveContainerSessionIds: () => [...h.running],
     killContainer: (sessionId: string, reason: string, onExit?: () => void) => {
-      h.kills.push({ sessionId, reason });
+      h.kills.push({ sessionId, reason, depth: probe.depth() });
       h.running.delete(sessionId);
       onExit?.();
     },
@@ -266,7 +269,16 @@ vi.mock('../../db/connection.js', () => ({
 }));
 
 import { registerAgentMailbox, resetAgentMailboxForTesting } from '../../mailbox/index.js';
-import { _resetSweepRegistryForTesting, _sweepOnceForTesting } from '../../host-sweep.js';
+import {
+  _listSweepRegistrationsForTesting,
+  _resetSweepRegistryForTesting,
+  _sweepOnceForTesting,
+  SWEEP_DUTY_INVENTORY,
+  type SweepSessionContext,
+} from '../../host-sweep.js';
+import { _mailboxSessionDepthForTesting } from '../mailbox/session.js';
+
+probe.depth = _mailboxSessionDepthForTesting;
 
 function fakeSession(id: string, overrides: Partial<Session> = {}): Session {
   return {
@@ -376,7 +388,7 @@ describe('the idle reaps win over ceiling enforcement in the exclusive chain', (
 
     await _sweepOnceForTesting();
 
-    expect(h.kills).toEqual([{ sessionId: session.id, reason: 'scheduled-task-idle' }]);
+    expect(h.kills).toEqual([{ sessionId: session.id, reason: 'scheduled-task-idle', depth: 0 }]);
     // The SLA branch never ran, so no OOM/SLA telemetry row was written.
     expect(h.oomWritten).toBe(0);
     expect(h.spawns).toEqual([]);
@@ -399,21 +411,105 @@ describe('the idle reaps win over ceiling enforcement in the exclusive chain', (
 
     await _sweepOnceForTesting();
 
-    expect(h.kills).toEqual([{ sessionId: session.id, reason: 'chat-idle-reap' }]);
+    expect(h.kills).toEqual([{ sessionId: session.id, reason: 'chat-idle-reap', depth: 0 }]);
     expect(h.oomWritten).toBe(0);
     expect(h.spawns).toEqual([]);
   });
 
-  it('the declared chain is heal (10) -> idle task (20) -> idle chat (30) -> SLA (40, fallthrough)', async () => {
-    const { _listSweepRegistrationsForTesting, SWEEP_DUTY_INVENTORY } = await import('../../host-sweep.js');
+  it('the declared chain is heal (10) -> idle task (20) -> idle chat (30) -> SLA (40, fallthrough)', () => {
     const { duties } = _listSweepRegistrationsForTesting();
-    const health = duties.filter((d) => d.phase === 'session:health').sort((a, b) => a.order - b.order);
+    // The registry's OWN returned order, not a re-sort — a re-sort by `order`
+    // alone would still pass if the registry silently returned duties in a
+    // different sequence than it actually runs them in.
+    const health = duties.filter((d) => d.phase === 'session:health');
     expect(health.map((d) => ({ name: d.name, order: d.order }))).toEqual([
       { name: SWEEP_DUTY_INVENTORY.S11, order: 10 },
       { name: SWEEP_DUTY_INVENTORY.S12, order: 20 },
       { name: SWEEP_DUTY_INVENTORY.S13, order: 30 },
       { name: SWEEP_DUTY_INVENTORY.S14, order: 40 },
     ]);
+    // The exclusive-chain contract is `claims()` on every duty but the
+    // fallthrough — sorting on name/order alone would stay green even if S14
+    // (the SLA) acquired a predicate, which the registry's own validation
+    // permits (a second `claims()`-bearing duty is legal; only a SECOND
+    // no-claims duty in the same exclusive phase throws). That would let an
+    // unclaimed running container silently skip ceiling enforcement.
+    const byName = new Map(health.map((d) => [d.name, d]));
+    expect(typeof byName.get(SWEEP_DUTY_INVENTORY.S11)!.claims).toBe('function');
+    expect(typeof byName.get(SWEEP_DUTY_INVENTORY.S12)!.claims).toBe('function');
+    expect(typeof byName.get(SWEEP_DUTY_INVENTORY.S13)!.claims).toBe('function');
+    expect(byName.get(SWEEP_DUTY_INVENTORY.S14)!.claims).toBeUndefined();
+  });
+
+  // ── "Acceptance tests must drive the REGISTERED duty" (brief-family-template.md,
+  // rule added 2026-09-03 14:35Z) — a case that calls the moved body directly
+  // proves nothing about the move itself: the registered `run`/`claims` could
+  // be wired to the wrong predicate, drop a field off `ctx`, or (per Codex's
+  // finding above) the exclusive-chain contract could quietly break while
+  // name/order still matched. These obtain S12/S13 from the registry by name
+  // (`_listSweepRegistrationsForTesting`, the same accessor R-7 uses) and
+  // drive their real `claims(ctx)`/`run(ctx)` with a hand-built context.
+  describe('the registered S12/S13 duties, driven directly', () => {
+    function fakeHealthCtx(overrides: {
+      threadId?: string | null;
+      dueCount?: number;
+      processingClaimCount?: number;
+      providerExecuting?: boolean;
+      hasContinuation?: boolean;
+      lastOutboundAtMs?: number | null;
+      lastInboundAtMs?: number | null;
+    }): SweepSessionContext {
+      return {
+        session: { id: 'sess-direct', thread_id: overrides.threadId ?? null } as unknown,
+        plan: {
+          dueCount: overrides.dueCount ?? 0,
+          workContinuation: overrides.hasContinuation ? { id: 'c1' } : null,
+        } as unknown,
+        observed: {
+          containerState: { provider_executing: overrides.providerExecuting ? 1 : 0 },
+          processingClaimCount: overrides.processingClaimCount ?? 0,
+          lastOutboundAtMs: overrides.lastOutboundAtMs ?? null,
+          lastInboundAtMs: overrides.lastInboundAtMs ?? null,
+        } as unknown,
+      } as unknown as SweepSessionContext;
+    }
+
+    function getHealthDuty(name: string) {
+      const duty = _listSweepRegistrationsForTesting().duties.find(
+        (d) => d.phase === 'session:health' && d.name === name,
+      );
+      if (!duty) throw new Error(`duty not registered: ${name}`);
+      return duty;
+    }
+
+    it('S12 (idle-task-reap): claims() true when idle, false when work is due; run() kills scheduled-task-idle at depth 0', async () => {
+      const duty = getHealthDuty(SWEEP_DUTY_INVENTORY.S12);
+      const idleCtx = fakeHealthCtx({ threadId: 'system:tasks:series-direct' });
+      const busyCtx = fakeHealthCtx({ threadId: 'system:tasks:series-direct', dueCount: 1 });
+
+      expect(await duty.claims!(idleCtx)).toBe(true);
+      expect(await duty.claims!(busyCtx)).toBe(false);
+
+      await duty.run(idleCtx);
+
+      expect(h.kills).toEqual([{ sessionId: 'sess-direct', reason: 'scheduled-task-idle', depth: 0 }]);
+      expect(h.spawns).toEqual([]);
+    });
+
+    it('S13 (idle-chat-reap): claims() true when quiet past the floor, false when recently active; run() kills chat-idle-reap at depth 0', async () => {
+      const duty = getHealthDuty(SWEEP_DUTY_INVENTORY.S13);
+      const longQuiet = Date.now() - CHAT_IDLE_REAP_MS - 1;
+      const quietCtx = fakeHealthCtx({ lastOutboundAtMs: longQuiet, lastInboundAtMs: longQuiet });
+      const activeCtx = fakeHealthCtx({ lastOutboundAtMs: Date.now(), lastInboundAtMs: Date.now() });
+
+      expect(await duty.claims!(quietCtx)).toBe(true);
+      expect(await duty.claims!(activeCtx)).toBe(false);
+
+      await duty.run(quietCtx);
+
+      expect(h.kills).toEqual([{ sessionId: 'sess-direct', reason: 'chat-idle-reap', depth: 0 }]);
+      expect(h.spawns).toEqual([]);
+    });
   });
 
   // ── Tripwire self-check (brief-common.md HARD RULE step 3) ─────────────────
