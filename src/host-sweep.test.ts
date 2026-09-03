@@ -3151,6 +3151,55 @@ describe('sweepSession on a session with no mailbox', () => {
     closeDb();
   });
 
+  /**
+   * The wake must be handed the session row as it is NOW, not the tick's
+   * snapshot.
+   *
+   * `sessions` is read once per tick by `getActiveSessions()`, before a serial
+   * per-session loop that awaits container spawns, so the object reaching this
+   * duty can be many seconds old. The storage worker the same tick starts
+   * closes rows with `UPDATE sessions SET status = 'archiving' … WHERE status =
+   * 'active'`. `wakeContainer`'s only liveness gate reads `status` off the
+   * object it is given, so a stale one defeats it and spawns a container
+   * `getActiveSessions()` will never return — no stuck detection, no heartbeat
+   * ceiling, no claim tolerance, for as long as it runs.
+   */
+  it('hands the wake the current session row, not the tick snapshot', async () => {
+    const db = initTestDb();
+    runMigrations(db);
+    db.prepare(
+      `INSERT INTO agent_groups (id, name, folder, created_at)
+       VALUES ('ag-stale', 'stale snapshot', 'stale-snapshot', ?)`,
+    ).run(new Date().toISOString());
+    mockWakeContainer.mockReset().mockResolvedValue(true);
+    mockIsContainerRunning.mockReset().mockReturnValue(false);
+    mockHasContainerEverRun.mockReset().mockReturnValue(false);
+    mockAdmitDueTaskContexts.mockReturnValue(0);
+
+    const snapshot: Session = { ...fakeSession(), id: 'sess-stale', agent_group_id: 'ag-stale', status: 'active' };
+    getAgentMailbox().prepare({ agentGroupId: snapshot.agent_group_id, sessionId: snapshot.id });
+    const inboundPath = path.join(testDataDir.dir, 'v2-sessions', snapshot.agent_group_id, snapshot.id, 'inbound.db');
+    const inDb = new Database(inboundPath);
+    inDb
+      .prepare(
+        `INSERT INTO messages_in (id, seq, kind, timestamp, status, trigger, content)
+         VALUES ('due-1', 2, 'chat', ?, 'pending', 1, ?)`,
+      )
+      .run(new Date().toISOString(), JSON.stringify({ text: 'hello', senderId: 'U1' }));
+    inDb.close();
+
+    // The row was closed by the reclaim after the tick's snapshot was taken.
+    mockGetSession.mockReset().mockReturnValue({ ...snapshot, status: 'closed' });
+
+    await _sweepSessionForTesting(snapshot);
+
+    // Woken with the CURRENT row, whose status lets wakeContainer's own guard
+    // refuse. Handed the snapshot, that guard sees 'active' and spawns.
+    expect(mockWakeContainer).toHaveBeenCalledTimes(1);
+    expect(mockWakeContainer.mock.calls[0][0]).toMatchObject({ id: 'sess-stale', status: 'closed' });
+    closeDb();
+  });
+
   // Round 2: the backoff belongs to an unopenable mailbox, never to a duty
   // that threw. A transient SQLite lock during admission must retry on the
   // next 60s tick — quiet-caching it would hold an already-due scheduled task

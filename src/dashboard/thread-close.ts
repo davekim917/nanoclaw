@@ -337,9 +337,16 @@ export async function requestThreadClose(
   // owes, so a proposal the sweep has not copied across yet must not cost them
   // a second click, and — far more importantly — a mirror row left behind by a
   // proposal the agent has since retracted must not buy them a cheaper one.
-  const agentProposed = (await Promise.all(visible.map((s) => readSessionProposal(s.agent_group_id, s.id)))).some(
-    (proposal) => proposal !== null,
+  // WHICH sessions proposed, not merely whether any did. The boolean alone
+  // cannot survive the fresh membership read below: if the only proposer goes
+  // inactive during these reads it drops out of the frozen set, and a bare
+  // `true` would then buy the operator the cheaper one-confirmation close over
+  // sessions that never proposed anything.
+  const proposals = await Promise.all(
+    visible.map(async (s) => ({ id: s.id, proposed: (await readSessionProposal(s.agent_group_id, s.id)) !== null })),
   );
+  const proposingIds = new Set(proposals.filter((p) => p.proposed).map((p) => p.id));
+  const agentProposed = proposingIds.size > 0;
 
   const payload: ThreadClosePayload = {
     agentGroupIds: visible.map((s) => s.agent_group_id),
@@ -415,6 +422,51 @@ export async function requestThreadClose(
     };
   }
 
+  // The proposal that bought the cheaper confirmation bar has to still be on
+  // the thread that is about to be closed. `agentProposed` was computed from
+  // `visible`, before the reads that await; a proposer going inactive in that
+  // window leaves the frozen set without it while the boolean still says a
+  // proposal stands. `requiredConfirmations` turns that into a ONE-click close
+  // of sessions that never proposed — the one direction round 6's
+  // "it only makes the close stricter" note got wrong.
+  //
+  // Recomputed rather than re-read: a session that joined during the window is
+  // counted as NOT proposing, which can only raise the bar. Nothing has been
+  // reserved yet, so re-running the guard here is free, and it returns the
+  // same refusal the first guard would have.
+  const effectiveProposed = freshVisible.some((s) => proposingIds.has(s.id));
+  if (agentProposed && !effectiveProposed) {
+    const freshDecision = guard(threadsClose, {
+      actor: { kind: 'human', userId: ctx.user.id },
+      resource: { threadId },
+      payload: {
+        agentGroupIds: freshVisible.map((s) => s.agent_group_id),
+        agentProposed: false,
+        confirmations,
+      },
+    });
+    if (freshDecision.effect !== 'allow') {
+      const required = requiredConfirmations(false);
+      log.info('thread-close: the proposing session left the thread during the proposal reads', {
+        threadId,
+        userId: ctx.user.id,
+      });
+      if (confirmations < required && freshVisible.some((s) => hasAdminPrivilege(ctx.user.id, s.agent_group_id))) {
+        return {
+          status: 409,
+          body: {
+            error: 'confirmation_required',
+            thread_id: threadId,
+            required_confirmations: required,
+            confirmations,
+            agent_proposed: false,
+          },
+        };
+      }
+      return NOT_FOUND;
+    }
+  }
+
   const reserved = getDb()
     .prepare(
       `INSERT INTO thread_closures
@@ -432,7 +484,7 @@ export async function requestThreadClose(
       ctx.user.id,
       requestedAt,
       reason,
-      agentProposed ? 1 : 0,
+      effectiveProposed ? 1 : 0,
       JSON.stringify(freshVisible.map((s) => s.id)),
     );
 
@@ -799,7 +851,18 @@ async function advanceOneClosure(row: ThreadClosureRow, now: number, deps: Threa
     if (!decision.finalize) return;
     forced = decision.forced;
     getDb()
-      .prepare(`UPDATE thread_closures SET state = 'finalizing', forced = ? WHERE thread_id = ?`)
+      // `AND state = 'awaiting_confirmation'`: `row` was read before the
+      // proposal reads above, which await, so the state that authorized this
+      // transition is not the state at the moment of it. Without the predicate
+      // the statement will move a row from 'closed' back to 'finalizing' and
+      // re-run the kills. Nothing can do that today — the sweep is a
+      // self-rescheduling chain, so ticks never overlap — but that is a
+      // property of the scheduler, not of this statement, and the statement is
+      // where it belongs.
+      .prepare(
+        `UPDATE thread_closures SET state = 'finalizing', forced = ?
+          WHERE thread_id = ? AND state = 'awaiting_confirmation'`,
+      )
       .run(forced ? 1 : 0, row.thread_id);
     log.info('thread-close: finalizing', {
       threadId: row.thread_id,

@@ -3063,7 +3063,19 @@ function registerBuiltInSweepDuties(): void {
         // etc.) return false and leave messages pending for the next tick.
         // Classification is passed into the atomic admission decision so a
         // scheduled wake can never reserve memory as interactive first.
-        const woke = await wakeContainer(session, plan.wakePriority);
+        // Re-read immediately before the wake. `session` came from the tick's
+        // `getActiveSessions()` snapshot, taken before a serial per-session
+        // loop that awaits container spawns, so by this duty it can be many
+        // seconds old — and the storage worker this same tick starts closes
+        // rows with `UPDATE sessions SET status = 'archiving' … WHERE status =
+        // 'active'`. `wakeContainer`'s only liveness gate reads `status` off
+        // the object it is handed, so a stale one defeats it and spawns a
+        // container `getActiveSessions()` will never return: no stuck
+        // detection, no heartbeat ceiling, no claim tolerance. Every other
+        // by-id caller already re-reads (`router.ts`, `agent-route.ts`,
+        // `container-restart.ts`); this one did not.
+        const fresh = getSession(session.id);
+        const woke = fresh ? await wakeContainer(fresh, plan.wakePriority) : false;
         c.reportWoke(woke);
         if (!woke && resumedContinuation) {
           await restoreStoppedContinuationAttempt(wakeRun, session, resumedContinuation, plan.workContinuation!);

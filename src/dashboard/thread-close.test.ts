@@ -297,6 +297,55 @@ describe('requestThreadClose', () => {
   });
 
   /**
+   * The proposal that bought the cheaper bar must still be on the thread.
+   *
+   * `agentProposed` is computed from the pre-await visible set and decides
+   * `requiredConfirmations` — one click when an agent has proposed, two when
+   * none has. If the ONLY proposing session goes inactive during the proposal
+   * reads, the fresh membership read drops it while a bare boolean still says
+   * a proposal stands, and the operator gets a one-click force-close of
+   * sessions that never proposed anything. Round 6 recorded this direction as
+   * "only stricter"; it is not.
+   */
+  it('refuses the one-click close when the only proposing session leaves during the read', async () => {
+    const THREAD_P = 'slack:C1:proposer';
+    insertSession('s-proposer', 'ag1', THREAD_P);
+    insertSession('s-other', 'ag2', THREAD_P);
+    for (const [ag, id] of [
+      ['ag1', 's-proposer'],
+      ['ag2', 's-other'],
+    ] as const) {
+      fs.rmSync(path.dirname(dbPathFor(ag, id, 'inbound.db')), { recursive: true, force: true });
+      materializeSession(ag, id);
+    }
+    // Only s-proposer has a standing proposal.
+    const out = new Database(dbPathFor('ag1', 's-proposer', 'outbound.db'));
+    out
+      .prepare('INSERT INTO session_state (key, value, updated_at) VALUES (?, ?, ?)')
+      .run('done_proposal', JSON.stringify({ reason: 'wrapped up', proposed_at: iso(0) }), iso(0));
+    out.close();
+
+    // It goes inactive inside the proposal reads, after the visible set was
+    // taken and before membership is re-read.
+    duringProposalRead.run = () => {
+      getDb().prepare("UPDATE sessions SET status = 'closed' WHERE id = 's-proposer'").run();
+    };
+
+    const res = await requestThreadClose(THREAD_P, { confirmations: 1 }, ctxFor('admin'));
+
+    // One confirmation no longer buys the close: the proposal left with the
+    // session that made it. Without the recompute this was a 202.
+    expect(res.status).toBe(409);
+    expect(res.body).toMatchObject({
+      error: 'confirmation_required',
+      required_confirmations: 2,
+      agent_proposed: false,
+    });
+    // And nothing was reserved.
+    expect(getDb().prepare('SELECT 1 FROM thread_closures WHERE thread_id = ?').get(THREAD_P)).toBeUndefined();
+  });
+
+  /**
    * Thread membership must be re-read immediately before it is frozen.
    *
    * The visible-session list was computed before the proposal reads, which

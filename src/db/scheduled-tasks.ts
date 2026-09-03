@@ -313,10 +313,18 @@ export async function scheduleTask(def: TaskDef): Promise<void> {
   // provisioning funnel; 'session-closed' is the new, separate outcome.
   const write = async (sessionId: string): Promise<StampOutcome> => {
     const action = stamp(sessionId);
-    return (
-      (await withExistingMailboxSession(def.agentGroupId, sessionId, action)) ??
-      (await withMailboxSession(def.agentGroupId, sessionId, action))
-    );
+    const existing = await withExistingMailboxSession(def.agentGroupId, sessionId, action);
+    if (existing !== undefined) return existing;
+    // Asked BEFORE the provisioning funnel, not only inside its action.
+    // `withMailboxSession` calls `prepare()`, which runs `ensureSchema` on
+    // inbound.db AND on the container-owned outbound.db — so provisioning
+    // completes before the action can answer 'session-closed', and a session
+    // closed during the read above would be handed a host-authored
+    // outbound.db it must never have (invariants I-4/I-10). This narrows that
+    // window rather than closing it: one await still follows. The action's own
+    // check remains the authoritative one.
+    if (getSession(sessionId)?.status !== 'active') return 'session-closed';
+    return await withMailboxSession(def.agentGroupId, sessionId, action);
   };
 
   if ((await write(session.id)) === 'written') return;

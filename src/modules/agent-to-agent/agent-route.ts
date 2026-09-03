@@ -237,8 +237,16 @@ async function resolveTargetSession(
   msg: RoutableAgentMessage,
   sourceSession: Session,
   targetAgentGroupId: string,
-  fallback: SessionFallback,
-): Promise<{ session: Session; created: boolean }> {
+  // A THUNK, not a value. The wiring gate that decides whether the caller's
+  // messaging group may be inherited is a central-DB read, and the lookup
+  // below awaits — so a value computed by the caller is a proof from before
+  // the yield, used to link a session created after it. Evaluated once, after
+  // the await, immediately before the branch that resolves or creates.
+  freshFallback: () => SessionFallback,
+  // Returns the fallback it actually used, so callers that need the caller's
+  // effective mg context after this point read the same one that governed the
+  // session link rather than their own pre-await copy.
+): Promise<{ session: Session; created: boolean; fallback: SessionFallback }> {
   // Both lookups read the SOURCE session's queue, in one short session of its
   // own. Existing-only: this is the return-path read, and a source whose
   // mailbox is gone simply falls through to the newest-active heuristic.
@@ -250,6 +258,11 @@ async function resolveTargetSession(
       // path, container running pre-fix code).
       return direct ?? mailbox.getMostRecentPeerSourceSessionId(targetAgentGroupId);
     })) ?? null;
+  // Re-derived here, after the yield and before anything is resolved or
+  // created. If the wiring was revoked in the window this now takes the same
+  // agent-shared path the pre-check takes on failure, so the outcome matches
+  // what an identical request arriving a moment later would get.
+  const fallback = freshFallback();
   if (originSessionId) {
     const candidate = getSession(originSessionId);
     if (candidate && candidate.agent_group_id === targetAgentGroupId && candidate.status === 'active') {
@@ -265,11 +278,11 @@ async function resolveTargetSession(
       // fallback.mgId is null). The originating-session semantic wins;
       // any cross-mg context already crossed at the original send.
       if (fallback.mgId === null || candidate.messaging_group_id === fallback.mgId) {
-        return { session: candidate, created: false };
+        return { session: candidate, created: false, fallback };
       }
     }
   }
-  return resolveSession(targetAgentGroupId, fallback.mgId, fallback.threadId, fallback.mode);
+  return { ...resolveSession(targetAgentGroupId, fallback.mgId, fallback.threadId, fallback.mode), fallback };
 }
 
 export async function routeAgentMessage(
@@ -415,34 +428,43 @@ async function performAgentRoute(
   // surface. Self-sends (target == source) are exempt from this check.
   const callerMgId = session.messaging_group_id;
   const callerThreadId = session.thread_id;
-  let inheritMg = false;
-  if (callerMgId && targetAgentGroupId !== session.agent_group_id) {
-    const wired = getDb()
-      .prepare('SELECT 1 AS ok FROM messaging_group_agents WHERE agent_group_id = ? AND messaging_group_id = ?')
-      .get(targetAgentGroupId, callerMgId) as { ok: number } | undefined;
-    inheritMg = !!wired;
-    if (!inheritMg) {
-      log.info('agent-route: target not wired to caller mg — using agent-shared session', {
-        from: session.agent_group_id,
-        to: targetAgentGroupId,
-        callerMgId,
-      });
+  // Named and re-runnable because it is re-run: the session below is resolved
+  // behind an await, and this gate must hold at the moment the link is made,
+  // not merely when the message arrived.
+  const resolveFallback = (): SessionFallback => {
+    let inheritMg = false;
+    if (callerMgId && targetAgentGroupId !== session.agent_group_id) {
+      const wired = getDb()
+        .prepare('SELECT 1 AS ok FROM messaging_group_agents WHERE agent_group_id = ? AND messaging_group_id = ?')
+        .get(targetAgentGroupId, callerMgId) as { ok: number } | undefined;
+      inheritMg = !!wired;
+      if (!inheritMg) {
+        log.info('agent-route: target not wired to caller mg — using agent-shared session', {
+          from: session.agent_group_id,
+          to: targetAgentGroupId,
+          callerMgId,
+        });
+      }
+    } else if (targetAgentGroupId === session.agent_group_id) {
+      // Self-send: keep caller's threading.
+      inheritMg = !!callerMgId;
     }
-  } else if (targetAgentGroupId === session.agent_group_id) {
-    // Self-send: keep caller's threading.
-    inheritMg = !!callerMgId;
-  }
-  const effectiveMgId = inheritMg ? callerMgId : null;
-  const effectiveThreadId = inheritMg ? callerThreadId : null;
-  const targetMode: Exclude<SessionMode, 'shared'> = effectiveMgId ? 'per-thread' : 'agent-shared';
+    const effectiveMgId = inheritMg ? callerMgId : null;
+    return {
+      mgId: effectiveMgId,
+      threadId: inheritMg ? callerThreadId : null,
+      mode: effectiveMgId ? 'per-thread' : 'agent-shared',
+    };
+  };
   // Return-path lookup (in_reply_to → source_session_id) takes precedence
   // when the candidate session matches the caller's effective mg context;
   // otherwise we fall through to the threading-aware resolveSession.
-  const { session: targetSession } = await resolveTargetSession(msg, session, targetAgentGroupId, {
-    mgId: effectiveMgId,
-    threadId: effectiveThreadId,
-    mode: targetMode,
-  });
+  const { session: targetSession, fallback: effective } = await resolveTargetSession(
+    msg,
+    session,
+    targetAgentGroupId,
+    resolveFallback,
+  );
 
   const a2aMsgId = `a2a-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 
@@ -473,7 +495,10 @@ async function performAgentRoute(
   // `targetSession` was read before `markSessionEngaged` runs below, so its
   // `engaged_at` still describes the state BEFORE this wake — the question the
   // backfill asks.
-  const contentForWrite = await addThreadContext(forwardedContent, effectiveMgId, effectiveThreadId, targetSession);
+  // The SAME fallback that governed the session link above, not a copy taken
+  // before the await — otherwise a wiring revoked in that window would leave
+  // the backfill quoting a chat the target session is no longer bound to.
+  const contentForWrite = await addThreadContext(forwardedContent, effective.mgId, effective.threadId, targetSession);
 
   await writeSessionMessage(targetAgentGroupId, targetSession.id, {
     id: a2aMsgId,
