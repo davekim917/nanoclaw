@@ -10,13 +10,29 @@
 import Database from 'better-sqlite3';
 import fs from 'fs';
 import path from 'path';
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-const TEST_ROOT = '/tmp/nanoclaw-mailbox-module-test';
+// Per-process fixture root. The constant this replaced was byte-identical in
+// every worktree on the host, and this file `rmSync`s the whole root in both
+// beforeEach and afterEach — so any two concurrent runs, from any two
+// worktrees or agents, deleted each other's session directories mid-test.
+// Observed here as 16 of 18 failing on one run and 18/18 on the next four,
+// which is untrustworthy green as much as red. Same defect and same fix as
+// #287 (`test/unique-tmp-fixture-roots`) on main.
+//
+// ponytail: `process.pid`, NOT `fs.mkdtempSync` — measured, not assumed.
+// `vi.hoisted` runs above the import statements, so the `fs` binding is not
+// initialized yet and the mock factory below cannot see a module-level const
+// either; the mkdtemp form fails with "Cannot access 'TEST_ROOT' before
+// initialization". `process` is a global and is available. One root per
+// process is all this file needs. Do not "improve" this to mkdtemp.
+const { TEST_ROOT } = vi.hoisted(() => ({
+  TEST_ROOT: `/tmp/nanoclaw-mailbox-module-test-${process.pid}`,
+}));
 
 vi.mock('../../config.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../config.js')>()),
-  DATA_DIR: '/tmp/nanoclaw-mailbox-module-test/data',
+  DATA_DIR: `${TEST_ROOT}/data`,
 }));
 
 vi.mock('../../log.js', async (importOriginal) => ({
@@ -78,6 +94,12 @@ beforeEach(() => {
 
 afterEach(() => {
   vi.restoreAllMocks();
+  fs.rmSync(TEST_ROOT, { recursive: true, force: true });
+});
+
+// The per-test cleanup above already removes the root; this is the final sweep
+// so a crashed or skipped case cannot leave this process's root behind.
+afterAll(() => {
   fs.rmSync(TEST_ROOT, { recursive: true, force: true });
 });
 
