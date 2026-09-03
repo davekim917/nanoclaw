@@ -49,6 +49,24 @@ export function githubTokenInEnv(env: NodeJS.ProcessEnv = process.env): boolean 
   return v === '1' || v === 'true';
 }
 
+/**
+ * Does the container run as the HOST user?
+ *
+ * `buildContainerArgs` passes `--user <hostUid>:<hostGid>` for every uid except
+ * 0 and 1000, so for those two the container runs as the image's own `node`
+ * user instead — uid 1001 by the Dockerfile default, which `container/build.sh`
+ * does not override. A host-owned `0600` file inside a `0700` directory is then
+ * unreadable inside the container, and every `git` and `gh` call would fail
+ * with a credential that looks configured.
+ *
+ * This is the single definition of that condition: `buildContainerArgs` calls
+ * it for the `--user` decision and `planGitHubTokenSpawn` calls it to decide
+ * whether the file lane is usable at all, so the two cannot drift apart.
+ */
+export function containerRunsAsHostUser(uid: number | undefined = process.getuid?.()): boolean {
+  return uid != null && uid !== 0 && uid !== 1000;
+}
+
 export function groupTokenDir(agentGroupId: string, dataDir: string = DATA_DIR): string {
   // The id becomes a path segment. Ids are host-generated (`ag-<ms>-<rand>`),
   // but a traversal here would let one group's spawn write over another's token
@@ -116,11 +134,25 @@ export function planGitHubTokenSpawn(opts: {
   token: string;
   env?: NodeJS.ProcessEnv;
   dataDir?: string;
+  /** Host uid this spawn will run under. Defaults to the current process. */
+  hostUid?: number;
 }): GitHubTokenSpawnPlan {
   const { agentGroupId, token } = opts;
   const env = opts.env ?? process.env;
   const dataDir = opts.dataDir ?? DATA_DIR;
   if (githubTokenInEnv(env)) {
+    return { envArgs: ['-e', `GH_TOKEN=${token}`, '-e', `GITHUB_TOKEN=${token}`] };
+  }
+  // Root and uid-1000 hosts run the container as the image's own user, which
+  // cannot read a host-owned 0600 file. Fall back to the env lane rather than
+  // mount a credential the container will only ever get EACCES on — an
+  // unreadable token breaks git and gh completely, which is worse than the
+  // exposure this change removes.
+  if (!containerRunsAsHostUser(opts.hostUid)) {
+    log.warn('Container will not run as the host user — forwarding the GitHub token as env instead of a mounted file', {
+      hostUid: opts.hostUid ?? process.getuid?.(),
+      agentGroupId,
+    });
     return { envArgs: ['-e', `GH_TOKEN=${token}`, '-e', `GITHUB_TOKEN=${token}`] };
   }
   const file = writeGroupGitHubTokenFile(agentGroupId, token, dataDir);
@@ -152,22 +184,40 @@ export function clearGroupTokenRefreshers(): void {
   refreshers.clear();
 }
 
-/** Rewrite every registered group's token file whose value has changed. Returns the count rewritten. */
+/**
+ * Rewrite every registered group's token file whose value has changed. Returns
+ * the count rewritten.
+ *
+ * REFRESHES, NEVER CREATES. A group that spawned under the rollback flag has no
+ * file, and this must not conjure one — the flag's whole promise is that env
+ * mode writes no credential to disk. Absent file means nothing to refresh.
+ */
 export async function refreshGroupGitHubTokenFiles(dataDir: string = DATA_DIR): Promise<number> {
-  let rewritten = 0;
-  for (const [agentGroupId, resolve] of refreshers) {
-    try {
-      const token = await resolve();
-      if (!token) continue;
-      if (readGroupGitHubTokenFile(agentGroupId, dataDir) === token) continue;
-      writeGroupGitHubTokenFile(agentGroupId, token, dataDir);
-      rewritten += 1;
-      log.info('Rewrote mounted GitHub token file — running containers pick it up on next git/gh call', {
-        agentGroupId,
-      });
-    } catch (err) {
-      log.warn('GitHub token file refresh failed for group', { agentGroupId, err });
-    }
-  }
-  return rewritten;
+  if (githubTokenInEnv()) return 0;
+  // CONCURRENT, not serial. Resolving an App-sentinel group can enter a mint
+  // with a 10s timeout; awaiting the groups one at a time would make a GitHub
+  // outage cost `group count x 10s` on a sweep that also owns due-message
+  // wakes, recurrence and stale detection. Run together and
+  // `mintOrReuseGitHubAppToken`'s per-installation in-flight dedup collapses
+  // them into one network mint, capping the whole step at a single timeout no
+  // matter how many groups are registered.
+  const results = await Promise.all(
+    [...refreshers].map(async ([agentGroupId, resolve]) => {
+      try {
+        if (!fs.existsSync(groupTokenPath(agentGroupId, dataDir))) return 0;
+        const token = await resolve();
+        if (!token) return 0;
+        if (readGroupGitHubTokenFile(agentGroupId, dataDir) === token) return 0;
+        writeGroupGitHubTokenFile(agentGroupId, token, dataDir);
+        log.info('Rewrote mounted GitHub token file — running containers pick it up on next git/gh call', {
+          agentGroupId,
+        });
+        return 1;
+      } catch (err) {
+        log.warn('GitHub token file refresh failed for group', { agentGroupId, err });
+        return 0;
+      }
+    }),
+  );
+  return results.reduce<number>((a, b) => a + b, 0);
 }

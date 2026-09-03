@@ -63,7 +63,7 @@ import { resolveEffectiveModel, DEFAULT_OPUS_MODEL, DEFAULT_SONNET_MODEL, DEFAUL
 import { readEnvFileMatching } from './env.js';
 import { resolveGitHubToken as resolveGitHubTokenForContainer } from './github-token.js';
 export { resolveGitHubToken } from './github-token.js';
-import { planGitHubTokenSpawn, registerGroupTokenRefresher } from './github-token-file.js';
+import { containerRunsAsHostUser, planGitHubTokenSpawn, registerGroupTokenRefresher } from './github-token-file.js';
 import {
   getAgentGroup,
   getAllAgentGroups,
@@ -3602,12 +3602,18 @@ async function buildContainerArgs(
     // its next git/gh call instead of dying with a frozen env. `GITHUB_TOKEN_IN_ENV=1`
     // restores value-forwarding for one release. See github-token-file.ts.
     const ghPlan = planGitHubTokenSpawn({ agentGroupId: agentGroup.id, token: ghToken });
-    if (ghPlan.mount) mounts.push(ghPlan.mount);
+    if (ghPlan.mount) {
+      mounts.push(ghPlan.mount);
+      // Re-resolution closure for the sweep. Registered per spawn so the sweep
+      // rewrites the file using this group's own lookup order (githubTokenEnv →
+      // scoped → global → App mint), not a host-wide default. Only registered
+      // when a file was actually mounted — under the rollback flag there is
+      // nothing on disk to keep fresh.
+      registerGroupTokenRefresher(agentGroup.id, () =>
+        resolveGitHubTokenForContainer(credentialFolder, containerConfig),
+      );
+    }
     args.push(...ghPlan.envArgs);
-    // Re-resolution closure for the sweep. Registered per spawn so the sweep
-    // rewrites the file using this group's own lookup order (githubTokenEnv →
-    // scoped → global → App mint), not a host-wide default.
-    registerGroupTokenRefresher(agentGroup.id, () => resolveGitHubTokenForContainer(credentialFolder, containerConfig));
     // Optional URL-scoped credential allowlist. When set, entrypoint.sh
     // configures git's credential helper to only return the token for the
     // listed orgs (comma-separated), and skips the global `gh auth login`
@@ -3961,7 +3967,9 @@ async function buildContainerArgs(
   // User mapping
   const hostUid = process.getuid?.();
   const hostGid = process.getgid?.();
-  if (hostUid != null && hostUid !== 0 && hostUid !== 1000) {
+  // Single definition, shared with the GitHub token file lane so the two
+  // cannot drift — see containerRunsAsHostUser.
+  if (containerRunsAsHostUser(hostUid)) {
     args.push('--user', `${hostUid}:${hostGid}`);
     args.push('-e', 'HOME=/home/node');
   }
