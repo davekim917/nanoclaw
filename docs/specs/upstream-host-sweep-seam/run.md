@@ -161,3 +161,4 @@ Not started.
 | F2 | §10's PR 0 verification command omits `src/main.test.ts`, so the documented gate would pass without L-3/L-4 (medium, 1.0) | **Confirmed.** plan §10 line listed two files. The lead's actual run included `main.test.ts` (6 files, 48 passed). | **Accepted.** §10 corrected to three files. |
 
 - Reviewer: "production wiring looks correct". Coverage: cross-model review complete (other-family). PR 0 is **review-clear** at `444b5366` with plan amendments only; opening the PR for the GitHub-side Codex round.
+- **S2-PR0 opened as #302** (`feat/host-sweep-seam-pr0-lifecycle` @ `444b5366` → `main`), 2026-09-03 ~12:20Z. Parked, not merged (deploy-night rule). GitHub Codex round + CI watched; the pr-review-loop applies (rounds counted via GraphQL `reviewThreads`, never REST login filters).
