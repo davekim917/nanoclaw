@@ -408,6 +408,15 @@ async function forceClearWorkContinuation(session: CloseSession, threadId: strin
   // inside a session. The file must already exist: `prepare()` here would
   // author a container-owned outbound.db for a session the host is closing.
   const cleared = await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) => {
+    // No outbound.db means no container ever ran here, so there is no
+    // continuation to clear and nothing to resurrect — cleared is the honest
+    // answer. Checked BEFORE the writable op, because `clearWorkContinuation`
+    // opens outbound read-write and the opener throws for a file the host must
+    // never author; `ensureContinuationCleared` would read that throw as
+    // not-cleared and leave the closure `finalizing` forever. Not an edge
+    // case: `exists()` answers on inbound.db alone, so this callback runs for
+    // the whole never-woken cohort.
+    if (!mailbox.hasOutbound()) return true;
     const held = mailbox.clearWorkContinuation();
     if (held) {
       log.info('thread-close: force-cleared a work_continuation the container still held', {
@@ -422,9 +431,10 @@ async function forceClearWorkContinuation(session: CloseSession, threadId: strin
     // and "we could not read it" is not a state this path may call cleared.
     return mailbox.readContinuationPresence() === null;
   });
-  // `undefined` means the mailbox is gone — nothing left to resurrect, so the
-  // close may proceed. That is the same answer the old `existsSync` on
-  // outbound.db gave for a session whose container never started.
+  // `undefined` means the mailbox is gone entirely — nothing left to
+  // resurrect, so the close may proceed. The never-woken shape (inbound.db
+  // present, outbound.db absent) does NOT arrive here as `undefined`; it is
+  // answered by the `hasOutbound` branch inside.
   return cleared ?? true;
 }
 
