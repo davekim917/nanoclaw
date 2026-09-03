@@ -283,12 +283,29 @@ RUN --mount=type=cache,target=/root/.bun/install/cache \
 #     the SDK fails at spawn time with "native binary not found".
 ENV PNPM_HOME="/pnpm"
 ENV PATH="$PNPM_HOME:$PATH"
+# `corepack prepare --activate` below pins pnpm by writing a "Last Known
+# Good" record to $COREPACK_HOME (default: $HOME/.cache/node/corepack) —
+# i.e. scoped to whichever OS user runs it. This RUN executes as root
+# (HOME=/root), but the container runs the agent as the unprivileged `node`
+# user (HOME=/home/node): a different HOME, so `node` never sees root's LKG
+# record. Corepack then falls back to auto-downloading whatever is
+# currently "latest" on the npm registry on its first invocation — this is
+# exactly how the pin silently drifted before (PNPM_VERSION pinned 10.x,
+# the image actually ran 11.x). Pointing COREPACK_HOME at a fixed,
+# non-HOME path makes the LKG record and the already-downloaded pnpm
+# tarball visible to every UID that runs pnpm in this image, so the pin
+# holds regardless of which user resolves it.
+ENV COREPACK_HOME="/opt/corepack"
 # Pin pnpm to match the host (package.json packageManager). Build approvals are
 # deliberately written in both formats: pnpm 10 global installs still honor
 # the legacy .npmrc keys, while pnpm 11 removes those keys and reads the global
 # `allowBuilds` YAML setting. Keep this in lockstep with package.json.
 ARG PNPM_VERSION
-RUN corepack enable && corepack prepare pnpm@${PNPM_VERSION} --activate
+RUN corepack enable && corepack prepare pnpm@${PNPM_VERSION} --activate && \
+    chmod -R a+rX "$COREPACK_HOME" && \
+    resolved="$(pnpm --version)" && \
+    [ "$resolved" = "${PNPM_VERSION}" ] || \
+      { echo "pnpm --version ($resolved) != PNPM_VERSION (${PNPM_VERSION}) as root right after activation" >&2; exit 1; }
 
 # The npm bundled with node:22-slim (10.9.8) vendors tar <7.5.19, which carries
 # a fixable critical (GHSA-23hp-3jrh-7fpw). Patch-level bump only. Drop this
@@ -423,6 +440,13 @@ RUN groupmod -g ${HOST_GID} node && usermod -u ${HOST_UID} -g ${HOST_GID} node &
     chmod 755 /home/node
 
 USER node
+# Re-assert the pnpm pin as the actual runtime user (not just as root right
+# after `corepack prepare --activate` above) — this is the check that would
+# have caught the COREPACK_HOME/HOME-scoping drift this image once shipped
+# with (PNPM_VERSION pinned 10.x, `node` resolving 11.x latest at runtime).
+RUN resolved="$(pnpm --version)" \
+    && [ "$resolved" = "${PNPM_VERSION}" ] \
+    || { echo "pnpm --version ($resolved) != PNPM_VERSION (${PNPM_VERSION}) as node — pin drifted" >&2; exit 1; }
 RUN unreadable="$(find /opt/remotion \( -type f ! -readable -o -type d ! -executable \) -print -quit)" \
     && test -z "$unreadable" \
     && test -r /app/package.json \
