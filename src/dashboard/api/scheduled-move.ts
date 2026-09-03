@@ -598,7 +598,6 @@ export const moveExecuteHandler: AuthHandler = async (req, params, ctx) => {
       const stagedProcessAfter = new Date(nowMs + GUARD_GRACE_MS).toISOString();
       await scheduledTasks.scheduleTask(
         taskDefFromSnapshot(snapshot, source.seriesId, target.agentGroupId, targetMg, stagedProcessAfter),
-        dataDir,
       );
       const tgtSessId = targetSessionIdFor(target.agentGroupId, source.seriesId);
       if (tgtSessId) {
@@ -620,10 +619,7 @@ export const moveExecuteHandler: AuthHandler = async (req, params, ctx) => {
         }
       }
     } else {
-      await scheduledTasks.scheduleTask(
-        taskDefFromSnapshot(snapshot, source.seriesId, target.agentGroupId, targetMg),
-        dataDir,
-      );
+      await scheduledTasks.scheduleTask(taskDefFromSnapshot(snapshot, source.seriesId, target.agentGroupId, targetMg));
     }
   } catch (err) {
     // Step 5: target insert failed → restore the source — but ONLY when the
