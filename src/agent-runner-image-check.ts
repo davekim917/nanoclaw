@@ -296,11 +296,21 @@ function rebuildHint(imageRef: string): string {
  * this one already resolved — goes through okResultCache/TTL normally rather
  * than being coalesced onto a check that isn't running anymore.
  *
- * Keyed alongside each in-flight promise is the deps fingerprint it started
- * with, so a joiner can tell whether it's still safe to trust: see the
- * revalidation in checkAgentRunnerDepsDrift below.
+ * Keyed on (imageRef, fingerprint) rather than imageRef alone — see
+ * inFlightKey below — so a caller only ever joins a check that started
+ * against the exact deps state it just observed. That also means callers
+ * arriving after an edit, while an older check is still in flight, don't
+ * wait on that stale check at all: they land on a different key, miss, and
+ * start (or join) a fresh check keyed to the new fingerprint — which is what
+ * lets several such callers coalesce with each other instead of each paying
+ * the full check cost independently.
  */
 const inFlightChecks = new Map<string, Promise<{ fingerprint: DepsFileFingerprint; result: DepsDriftCheck }>>();
+
+/** Composite key so in-flight coalescing only ever joins an exact fingerprint match. */
+function inFlightKey(imageRef: string, fingerprint: DepsFileFingerprint): string {
+  return `${imageRef}::${fingerprint.pkgMtimeMs}:${fingerprint.pkgSize}:${fingerprint.lockMtimeMs}:${fingerprint.lockSize}`;
+}
 
 /**
  * Check the given image (defaults to CONTAINER_IMAGE — the shared base).
@@ -310,44 +320,36 @@ const inFlightChecks = new Map<string, Promise<{ fingerprint: DepsFileFingerprin
  * derived FROM a freshly-rebuilt base get the new label automatically.
  *
  * Thin coalescing wrapper around performDriftCheck — see inFlightChecks doc
- * comment for why. Concurrent callers for the same imageRef share one
- * in-flight check and its result (including the options — inspect/
- * retryDelayMs — of whichever call started it), but only when the deps
- * fingerprint hasn't moved since that check started: if package.json/
- * bun.lock were edited after the in-flight check read its hash but while it
- * is still awaiting the slower image inspection, a caller arriving after the
- * edit must not be handed that check's answer — its `ok: true` was computed
- * against inputs that are no longer current. Such a caller falls through and
- * runs its own fresh check against the fingerprint it actually observed. A
- * call that arrives after the in-flight one has already settled runs its own
- * fresh check too (subject to okResultCache as usual); it is never coalesced
- * onto a finished promise.
+ * comment for why. Concurrent callers for the same (imageRef, fingerprint)
+ * share one in-flight check and its result (including the options —
+ * inspect/retryDelayMs — of whichever call started it). A caller whose
+ * fingerprint doesn't match any in-flight entry — because package.json/
+ * bun.lock were edited after an older check started, or because none is
+ * running yet — misses the map and starts its own check keyed to the
+ * fingerprint it actually observed; a second such caller arriving before
+ * that settles joins it instead of paying the cost again. A call that
+ * arrives after the in-flight one has already settled runs its own fresh
+ * check too (subject to okResultCache as usual); it is never coalesced onto
+ * a finished promise, since `finally` below removes the entry on settle.
  */
 export async function checkAgentRunnerDepsDrift(
   imageRef: string = CONTAINER_IMAGE,
   options: DriftCheckOptions = {},
 ): Promise<DepsDriftCheck> {
-  // Read this call's own fingerprint first, before even looking at
-  // inFlightChecks, so it always reflects what's on disk right now rather
-  // than whatever an in-flight check happened to start with.
   const fingerprint = await currentDepsFileFingerprint();
+  const key = inFlightKey(imageRef, fingerprint);
 
-  const existing = inFlightChecks.get(imageRef);
+  const existing = inFlightChecks.get(key);
   if (existing) {
-    const settled = await existing;
-    if (fingerprintsMatch(settled.fingerprint, fingerprint)) {
-      return settled.result;
-    }
-    // Fingerprint moved since that check started — its result is stale for
-    // this caller. Fall through and run a fresh check below.
+    return (await existing).result;
   }
 
   const check = performDriftCheck(imageRef, options, fingerprint)
     .then((result) => ({ fingerprint, result }))
     .finally(() => {
-      inFlightChecks.delete(imageRef);
+      inFlightChecks.delete(key);
     });
-  inFlightChecks.set(imageRef, check);
+  inFlightChecks.set(key, check);
   return (await check).result;
 }
 
