@@ -381,6 +381,13 @@ describe('registered usage-rollup duty (T19)', () => {
     });
     // No throw escapes the duty — the try/catch in sweepUsageRollup swallows
     // it (and logs); awaiting duty.run would itself throw if this regressed.
+    // The preserved string is 'Usage rollup failed for session' (this duty's
+    // OWN per-session catch, unchanged from the pre-move body) — NOT the
+    // registry driver's generic 'Host sweep duty failed', which only fires
+    // when a duty's run(ctx) itself throws uncaught (runDutyBody/runTickPhase,
+    // host-sweep.ts:544-561). T19 deliberately never lets that happen: "a
+    // rollup failure never blocks the rest of the tick" (module doc comment)
+    // means every failure is caught here, one level below the driver.
     await duty.run(tickContext([fakeSession(failId)]) as never);
     expect(warnSpy).toHaveBeenCalledWith(
       'Usage rollup failed for session',
@@ -388,9 +395,11 @@ describe('registered usage-rollup duty (T19)', () => {
     );
     h.mockOpenOutboundDb.mockClear();
     h.mockRollupSessionUsage.mockClear();
-    // Same (unchanged) outbound.db mtime, next tick: retried, not skipped,
-    // because tick 1 never reached the cache write (rollupSessionUsage threw
-    // before it).
+    // usageRollupMtimeCache has no entry for this session (it's module-
+    // private, no test accessor — proven behaviorally, the same style as
+    // shouldSkipUsageRollup's own cache tests): same (unchanged) outbound.db
+    // mtime, next tick: retried, not skipped, because tick 1 never reached
+    // the cache write (rollupSessionUsage threw before it).
     await duty.run(tickContext([fakeSession(failId)]) as never);
     expect(h.mockOpenOutboundDb).toHaveBeenCalledTimes(1);
     expect(h.mockRollupSessionUsage).toHaveBeenCalledTimes(1);
