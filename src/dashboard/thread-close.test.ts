@@ -22,16 +22,24 @@ const containerOwns = vi.hoisted(() => ({ value: false, queue: [] as boolean[] }
 // One-shot hook that fires inside the proposal read — the await that used to
 // straddle the membership snapshot. Lets a case add a sibling session mid-flight
 // without any timing dependence.
-const duringProposalRead = vi.hoisted(() => ({ run: null as (() => void) | null }));
+const duringProposalRead = vi.hoisted(() => ({
+  run: null as (() => void) | null,
+  /** Reads to let pass untouched before firing — 0 means the very first one. */
+  skip: 0,
+}));
 
 vi.mock('../modules/mailbox/session.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../modules/mailbox/session.js')>();
   return {
     ...actual,
     withExistingNanoclawOutbound: async (agentGroupId: string, sessionId: string, action: never) => {
-      const hook = duringProposalRead.run;
-      duringProposalRead.run = null;
-      hook?.();
+      if (duringProposalRead.skip > 0) {
+        duringProposalRead.skip -= 1;
+      } else {
+        const hook = duringProposalRead.run;
+        duringProposalRead.run = null;
+        hook?.();
+      }
       return actual.withExistingNanoclawOutbound(agentGroupId, sessionId, action);
     },
   };
@@ -103,6 +111,7 @@ function materializeSession(agentGroupId: string, sessionId: string): void {
   ensureSchema(dbPathFor(agentGroupId, sessionId, 'outbound.db'), 'outbound');
 }
 
+import { log } from '../log.js';
 import { parseDirectOutboundWrite } from '../mailbox/model.js';
 import { clearWorkContinuation } from '../modules/mailbox/index.js';
 import { withExistingMailboxSession } from '../session-manager.js';
@@ -174,6 +183,7 @@ beforeEach(() => {
   containerOwns.value = false;
   containerOwns.queue = [];
   duringProposalRead.run = null;
+  duringProposalRead.skip = 0;
   raceDuringWrapUp.whenOpening = null;
   raceDuringWrapUp.run = null;
   seed();
@@ -294,6 +304,48 @@ describe('requestThreadClose', () => {
     expect(
       getDb().prepare('SELECT agent_proposed FROM thread_closures WHERE thread_id = ?').get('slack:C1:1.1'),
     ).toMatchObject({ agent_proposed: 1 });
+  });
+
+  /**
+   * A proposal retracted while the reads are settling must not buy the close.
+   *
+   * Refreshing membership catches a proposer that LEFT the thread; it cannot
+   * catch one that stayed and cleared its `done_proposal`, which is exactly
+   * what a container does the moment it takes on new work. One confirmation
+   * would then close a thread over an agent that is mid-turn.
+   */
+  it('does not count a proposal that is retracted while the reads are settling', async () => {
+    const THREAD_RETRACT = 'slack:C1:retract';
+    insertSession('s-retractor', 'ag1', THREAD_RETRACT);
+    fs.rmSync(path.dirname(dbPathFor('ag1', 's-retractor', 'inbound.db')), { recursive: true, force: true });
+    materializeSession('ag1', 's-retractor');
+    const out = new Database(dbPathFor('ag1', 's-retractor', 'outbound.db'));
+    out
+      .prepare('INSERT INTO session_state (key, value, updated_at) VALUES (?, ?, ?)')
+      .run('done_proposal', JSON.stringify({ reason: 'done', proposed_at: iso(0) }), iso(0));
+    out.close();
+
+    // The agent takes new work and clears its proposal BETWEEN the samples:
+    // the first read sees it standing, the second does not. With a single
+    // sample this interleave is invisible.
+    duringProposalRead.skip = 1;
+    duringProposalRead.run = () => {
+      const db = new Database(dbPathFor('ag1', 's-retractor', 'outbound.db'));
+      db.prepare("DELETE FROM session_state WHERE key = 'done_proposal'").run();
+      db.close();
+    };
+
+    // ONE confirmation, which only a standing proposal can buy.
+    const res = await requestThreadClose(THREAD_RETRACT, { confirmations: 1 }, ctxFor('admin'));
+
+    // Refused. With a single sample this was a 202 that killed a working agent.
+    expect(res.status).toBe(409);
+    expect(res.body).toMatchObject({
+      error: 'confirmation_required',
+      required_confirmations: 2,
+      agent_proposed: false,
+    });
+    expect(getDb().prepare('SELECT 1 FROM thread_closures WHERE thread_id = ?').get(THREAD_RETRACT)).toBeUndefined();
   });
 
   /**
@@ -816,6 +868,132 @@ describe('the close sequence order', () => {
     expect(getDb().prepare('SELECT forced FROM thread_closures WHERE thread_id = ?').get(THREAD)).toMatchObject({
       forced: 0,
     });
+  });
+
+  /**
+   * A confirmation retracted while the reads settle must not buy the kill.
+   *
+   * The finalizer samples one proposal per live session, each behind its own
+   * await, and then decides. A container clears `done_proposal` the moment it
+   * takes on new work, so a proposal read early can be gone before the last one
+   * lands — and acting on the stale read kills a container that has since
+   * picked up a real turn, before the forced deadline the operator was
+   * promised.
+   *
+   * Declining costs nothing durable. The row stays `awaiting_confirmation` and
+   * the next tick asks again; the FORCED path is time-based and untouched, so a
+   * proposal that keeps standing still lands and one that does not falls back
+   * to the deadline.
+   */
+  it('does not finalize on a confirmation retracted while the proposal reads settle', async () => {
+    // Inside the window, so only a standing proposal can finalize this.
+    startClose({ requestedAt: iso(30_000) });
+    let reads = 0;
+    const { calls, deps } = recordingDeps({
+      // Sample one sees the proposal; sample two does not.
+      readProposal: () => (++reads === 1 ? { reason: 'done', proposed_at: iso(10_000) } : null),
+    });
+
+    await advanceThreadClosures(deps);
+
+    // No kill, no clear, no archive — and both samples were actually taken.
+    expect(calls).toEqual([]);
+    expect(reads).toBe(2);
+    expect(getDb().prepare('SELECT state FROM thread_closures WHERE thread_id = ?').get(THREAD)).toMatchObject({
+      state: 'awaiting_confirmation',
+    });
+  });
+
+  /**
+   * The real `killContainer` fires `onExit` long after it returns.
+   *
+   * The exit work used to be captured into a variable assigned inside that
+   * callback and awaited immediately — while it was still `undefined` for every
+   * real kill. So the await was awaiting nothing, and when the later exit's
+   * settle failed, it rejected a promise with no local catch: the error escaped
+   * this function's caller and surfaced at the process `unhandledRejection`
+   * handler, outside the closure loop's per-row containment, where the close
+   * could neither report nor retry it.
+   *
+   * Resolving from the callback keeps both shapes right. A synchronous exit —
+   * an already-stopped container, or an injected kill — still orders kill,
+   * clear and archive before the tick returns, which the other cases here pin.
+   * This one pins the asynchronous shape: the tick must not block on an exit
+   * that has not happened, and the later exit's work must still be this
+   * function's to catch.
+   */
+  it('returns without blocking on a kill whose exit lands on a later tick', async () => {
+    startClose();
+    let fireExit: (() => void) | undefined;
+    // Models the real registry: the process is gone only once `onExit` fires,
+    // so ownership flips there and not at the call to kill.
+    const live = { owned: true };
+    const { calls, deps } = recordingDeps((recorded) => ({
+      isContainerRunning: () => live.owned,
+      killContainer: (_id, _reason, onExit) => {
+        recorded.push('kill');
+        fireExit = () => {
+          live.owned = false;
+          onExit?.();
+        };
+      },
+    }));
+
+    await advanceThreadClosures(deps);
+
+    // The tick is over and the exit has not happened, so nothing after the kill
+    // has run. A promise that only the callback can settle would hang here.
+    expect(calls).toEqual(['kill']);
+    expect(getDb().prepare('SELECT state FROM thread_closures WHERE thread_id = ?').get(THREAD)).toMatchObject({
+      state: 'finalizing',
+    });
+
+    // The container exits later, and the settle still runs on that exit.
+    fireExit!();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(calls).toEqual(['kill', 'clear', 'archive']);
+  });
+
+  /**
+   * And the later exit's FAILURE is this function's to catch.
+   *
+   * That is the half the old shape lost. `await exitWork` read a variable the
+   * callback had not assigned yet, so a settle that threw on a real exit
+   * rejected a promise nobody was holding: it bypassed `advanceThreadClosures`'
+   * per-row containment and reached the process `unhandledRejection` handler,
+   * where the closure could not associate it with a thread or retry it.
+   */
+  it('contains a failure from an exit that lands on a later tick', async () => {
+    startClose();
+    let fireExit: (() => void) | undefined;
+    const live = { owned: true };
+    const warn = vi.spyOn(log, 'warn').mockImplementation(() => {});
+    const { deps } = recordingDeps((recorded) => ({
+      isContainerRunning: () => live.owned,
+      killContainer: (_id, _reason, onExit) => {
+        recorded.push('kill');
+        fireExit = () => {
+          live.owned = false;
+          onExit?.();
+        };
+      },
+      archiveSession: () => {
+        throw new Error('archive failed');
+      },
+    }));
+
+    await advanceThreadClosures(deps);
+    fireExit!();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(warn.mock.calls.map((call) => String(call[0]))).toContain(
+      'thread-close: the post-exit settle failed; the closure stays finalizing for the next tick',
+    );
+    // Reported through the close path, and left for the next tick to retry.
+    expect(getDb().prepare('SELECT state FROM thread_closures WHERE thread_id = ?').get(THREAD)).toMatchObject({
+      state: 'finalizing',
+    });
+    warn.mockRestore();
   });
 
   it('does nothing at all while the agent still has time to answer', async () => {

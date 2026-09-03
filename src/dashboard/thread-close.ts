@@ -419,10 +419,28 @@ export async function requestThreadClose(
   // during these reads takes its proposal with it.
   //
   // THIS IS THE LAST AWAIT. Everything after it is one synchronous block.
+  //
+  // TWO SAMPLES, and a proposal counts only if both saw it. Refreshing
+  // membership below catches a proposer that LEFT; it cannot catch one that
+  // stayed and RETRACTED, which buys the cheaper bar by a different route — a
+  // container clears `done_proposal` the moment it takes new work. The read is
+  // async and cannot be made synchronous, so it cannot be moved adjacent to the
+  // decision; what it can be is repeated, with any disagreement resolved
+  // against the close. Both samples finish BEFORE the synchronous block, so
+  // this adds no await between the membership read and the decision.
+  //
+  // The cost is one extra outbound open per session on this thread, on an
+  // operator action that already opens them once.
+  const sampleProposals = async (): Promise<Map<string, boolean>> =>
+    new Map(
+      await Promise.all(
+        visible.map(async (s) => [s.id, (await readSessionProposal(s.agent_group_id, s.id)) !== null] as const),
+      ),
+    );
+  const firstSample = await sampleProposals();
+  const secondSample = await sampleProposals();
   const proposalsBySession = new Map(
-    await Promise.all(
-      visible.map(async (s) => [s.id, (await readSessionProposal(s.agent_group_id, s.id)) !== null] as const),
-    ),
+    visible.map((s) => [s.id, firstSample.get(s.id) === true && secondSample.get(s.id) === true] as const),
   );
 
   // ── One synchronous decision. No await from here to the reservation. ──────
@@ -761,22 +779,56 @@ async function finalizeSession(session: CloseSession, threadId: string, deps: Th
   // is stopped, so the retry is the one that succeeds.
   //
   // `onExit` is a synchronous callback and the clear is async, so the exit work
-  // is captured and awaited after. In production the real `killContainer` fires
-  // `onExit` long after this returns, so `exitWork` is still undefined here and
-  // the closure advances on a later tick; when it fires synchronously (an
-  // already-stopped container, or an injected kill) awaiting it keeps kill,
-  // clear and archive ordered before this function returns.
+  // is handed back through a promise created HERE rather than a variable
+  // assigned inside the callback. That assignment was read immediately after
+  // `kill` returned — while it was still `undefined` for the real
+  // `killContainer`, which fires `onExit` long after — so `await exitWork` was
+  // awaiting nothing, and a settle error on a later real exit rejected a
+  // promise with no local catch. It escaped this function's caller entirely and
+  // surfaced at the process `unhandledRejection` handler, outside
+  // `advanceThreadClosures`' per-row containment, so the close could neither
+  // report nor retry it.
+  //
+  // Resolving from the callback keeps both shapes correct: a synchronous
+  // `onExit` (an already-stopped container, or an injected kill) still orders
+  // kill, clear and archive before this returns, and an asynchronous one is
+  // still caught — by this function, where the closure can act on it.
   //
   // Through the same settle path: exit does not mean nobody else took the
   // session. A concurrent group or provider restart can register its own
   // `onExit` respawn for this process and `wakeContainer` while we sit in the
   // clear, and archiving then would strand that replacement in a closed thread
   // — later closure ticks skip an archived session entirely.
-  let exitWork: Promise<void> | undefined;
-  kill(session.id, `thread close ${threadId}`, () => {
-    exitWork = clearThenSettle().then(() => undefined);
+  let settleExit: () => void = () => {};
+  let exitFailed: ((err: unknown) => void) | undefined;
+  const exitWork = new Promise<void>((resolve, reject) => {
+    settleExit = resolve;
+    exitFailed = reject;
   });
-  await exitWork;
+  let fired = false;
+  kill(session.id, `thread close ${threadId}`, () => {
+    fired = true;
+    void clearThenSettle().then(
+      () => settleExit(),
+      (err) => exitFailed?.(err),
+    );
+  });
+  // Only await an exit that actually happened in this turn. The real
+  // `killContainer` fires `onExit` on a later tick and this promise would
+  // otherwise never settle, hanging the sweep step — the failure the old
+  // `undefined` read was accidentally avoiding. A later exit's rejection is
+  // still caught below rather than escaping to the process handler.
+  if (fired) {
+    await exitWork;
+    return;
+  }
+  void exitWork.catch((err) =>
+    log.warn('thread-close: the post-exit settle failed; the closure stays finalizing for the next tick', {
+      threadId,
+      sessionId: session.id,
+      err,
+    }),
+  );
 }
 
 /**
@@ -859,20 +911,49 @@ async function advanceOneClosure(row: ThreadClosureRow, now: number, deps: Threa
     if (Number.isNaN(requestedAtMs)) {
       log.warn('thread-close: unparseable requested_at — finalizing', { threadId: row.thread_id });
     }
-    const decision = decideCloseFinalization({
-      requestedAtMs: Number.isNaN(requestedAtMs) ? 0 : requestedAtMs,
-      now,
-      // Resolved BEFORE the decision so the fan-out is frozen the way it
-      // always was: one read per session, all of them taken now.
-      proposalAtMs: await Promise.all(
+    const sampleProposalAtMs = async (): Promise<(number | null)[]> =>
+      Promise.all(
         live.map(async (s) => {
           const p = await (deps.readProposal ?? readSessionProposal)(s.agent_group_id, s.id);
           const at = p ? Date.parse(p.proposed_at) : NaN;
           return Number.isNaN(at) ? null : at;
         }),
-      ),
+      );
+    const decision = decideCloseFinalization({
+      requestedAtMs: Number.isNaN(requestedAtMs) ? 0 : requestedAtMs,
+      now,
+      // Resolved BEFORE the decision so the fan-out is frozen the way it
+      // always was: one read per session, all of them taken now.
+      proposalAtMs: await sampleProposalAtMs(),
     });
     if (!decision.finalize) return;
+    // A CONFIRMED finalization needs the confirmation to still stand.
+    //
+    // These reads await, one per session, so a proposal sampled early can be
+    // retracted while a later one is still settling — and a container clears
+    // `done_proposal` exactly when it takes on new work. Acting on the stale
+    // read means killing a container that has since picked up a real turn,
+    // before the forced deadline the operator was promised.
+    //
+    // The read cannot be made synchronous, so it is taken twice and any
+    // disagreement is resolved against finalizing. Declining costs nothing
+    // durable: the row stays `awaiting_confirmation` and the next tick asks
+    // again, while the FORCED path is time-based and unaffected — so a genuine
+    // confirmation that keeps standing still lands, and one that does not falls
+    // back to the deadline rather than to an early kill.
+    if (!decision.forced) {
+      const reconfirm = decideCloseFinalization({
+        requestedAtMs: Number.isNaN(requestedAtMs) ? 0 : requestedAtMs,
+        now,
+        proposalAtMs: await sampleProposalAtMs(),
+      });
+      if (!reconfirm.finalize || reconfirm.forced) {
+        log.info('thread-close: the proposal was withdrawn while confirming; waiting for the deadline instead', {
+          threadId: row.thread_id,
+        });
+        return;
+      }
+    }
     forced = decision.forced;
     getDb()
       // `AND state = 'awaiting_confirmation'`: `row` was read before the
