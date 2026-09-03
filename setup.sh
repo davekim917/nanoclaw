@@ -58,7 +58,7 @@ check_node() {
     NODE_PATH_FOUND=$(command -v node)
     local major
     major=$(echo "$NODE_VERSION" | cut -d. -f1)
-    if [ "$major" -ge 20 ] 2>/dev/null; then
+    if [ "$major" -ge 22 ] 2>/dev/null; then
       NODE_OK="true"
     fi
     log "Node $NODE_VERSION at $NODE_PATH_FOUND (major=$major, ok=$NODE_OK)"
