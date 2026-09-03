@@ -102,19 +102,21 @@ describe('buildSystemPromptAddendum — multi-destination routing guidance', () 
     expect(prompt).toContain('Keep the whole run in one place');
   });
 
-  it('offers the channel list only as the unrouted fallback, never as the default', () => {
+  it('keeps an unrouted task fail-closed instead of naming a channel to guess at', () => {
     seedDestination('casa', 'Casa', 'whatsapp', 'group1@fixture6.example.com');
     seedDestination('ops', 'Ops', 'slack', 'C0OPS');
 
     const prompt = buildSystemPromptAddendum('Casa', { kind: 'task', taskId: 'weekly-report' });
 
-    // Both channels are named, but explicitly behind "if the task carries no
-    // `from`" — a multi-channel agent must not read the list as a menu of
-    // equally correct places to escalate to.
-    expect(prompt).toContain(
-      'If the task carries no `from` (an unrouted task), fall back to a channel destination of your own: `casa`, `ops`.',
-    );
-    expect(prompt).not.toContain('default to your own channel destination(s)');
+    // A task with no routing stamp was created `--isolated`, and that path is
+    // documented fail-closed: "unaddressed replies are discarded, only an
+    // explicit <message to=...> reaches anyone" (ncl tasks create --help).
+    // Listing the agent's channels here would hand it a menu and quietly turn
+    // an isolated task into one that posts wherever it liked the look of.
+    expect(prompt).toContain('it was created isolated on purpose');
+    expect(prompt).toContain('do not pick a destination just because one is available');
+    expect(prompt).not.toContain('`casa`, `ops`');
+    expect(prompt).not.toContain('fall back');
   });
 
   it('names every agent destination, plural, rather than a hardcoded example', () => {
@@ -136,7 +138,7 @@ describe('buildSystemPromptAddendum — multi-destination routing guidance', () 
     // would be worse than the generic instruction it already gets.
     expect(prompt).toContain('Always pass the explicit named destination.');
     expect(prompt).not.toContain('<task from="name">');
-    expect(prompt).not.toContain('fall back to a channel destination of your own');
+    expect(prompt).not.toContain('it was created isolated on purpose');
     expect(prompt).not.toContain('Keep the whole run in one place');
   });
 

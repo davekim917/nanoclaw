@@ -284,18 +284,24 @@ function buildDestinationsSection(mode: SessionMode): string {
     const channelDestinations = all.filter((destination) => destination.type === 'channel');
     const agentDestinations = all.filter((destination) => destination.type === 'agent');
     if (channelDestinations.length > 0) {
-      const channelNames = channelDestinations.map((destination) => `\`${destination.name}\``).join(', ');
       // The task row carries ONE routing stamp, and the formatter already
-      // renders it as the `<task from="name">` attribute. Point at that rather
-      // than at the channel list: an agent wired to several channels has
+      // renders it as the `<task from="name">` attribute. Point at that, not
+      // at the destination list: an agent wired to several channels has
       // several plausible-looking recipients here, and only one of them is the
-      // conversation this task was created in. The list is the fallback for an
-      // unrouted task, which genuinely has no origin to prefer.
+      // conversation this task was created in.
+      //
+      // No fallback list for an unrouted task, deliberately. A task with no
+      // stamp was created `--isolated` (or host-created with no
+      // --messaging-group), and that path is documented fail-closed:
+      // "unaddressed replies are discarded, only an explicit <message to=...>
+      // reaches anyone" (ncl tasks create --help). Offering a menu of channels
+      // there would quietly convert an isolated task into one that posts to
+      // whichever conversation it liked the look of.
       lines.push(
         '',
         `For user-visible escalation — a blocker, a question you need answered, anything a person has to act on — send to the destination named in this task's \`<task from="name">\` attribute. That is the conversation the task was created in, and where whoever scheduled it is watching.`,
         '',
-        `If the task carries no \`from\` (an unrouted task), fall back to a channel destination of your own: ${channelNames}.`,
+        'If the task carries no `from`, it was created isolated on purpose. Send only when the task text itself names who to tell; do not pick a destination just because one is available.',
       );
       // Same policy the chat branch states below: one run, one place. A task
       // that posts interim notes to a channel and its result to a DM has split
