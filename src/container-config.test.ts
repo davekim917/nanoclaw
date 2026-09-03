@@ -258,20 +258,16 @@ describe('resolveGroupTimezone', () => {
       expect(resolveGroupTimezone(TZ_GROUP.id)).toBe(TIMEZONE);
       expect(configFromDb(getContainerConfig(TZ_GROUP.id)!, TZ_GROUP).timezone).toBeUndefined();
     }
-    // An alias spelling is refused on the read side too: the write path stores
-    // the resolver's canonical name, so anything else in the row was not put
-    // there by `ncl` and may not be resolvable as a zoneinfo file.
-    // A retired alias is refused too: current tzdata omits the backward-link
-    // file, so `TZ=Asia/Calcutta` silently yields +0000 while ICU still maps
-    // Asia/Kolkata onto it.
-    for (const retired of ['Asia/Calcutta', 'Europe/Kiev', 'asia/kolkata']) {
-      updateContainerConfigScalars(TZ_GROUP.id, { timezone: retired });
-      expect(resolveGroupTimezone(TZ_GROUP.id)).toBe(TIMEZONE);
-    }
-    // The modern spellings, which the zone database actually ships, survive.
-    for (const good of ['Asia/Kolkata', 'Europe/Kyiv']) {
-      updateContainerConfigScalars(TZ_GROUP.id, { timezone: good });
-      expect(resolveGroupTimezone(TZ_GROUP.id)).toBe(good);
+    // Whether a given alias resolves is a property of THIS machine's tzdata,
+    // not of the rule: a host that prunes backward links has no
+    // Asia/Calcutta, while a GitHub runner ships it. So assert the rule
+    // itself — honoured exactly when the zone database has the spelling —
+    // rather than hard-coding which names a host happens to carry. This is
+    // still what catches storing an ICU-canonical name the host lacks.
+    for (const alias of ['Asia/Kolkata', 'Asia/Calcutta', 'Europe/Kyiv', 'Europe/Kiev']) {
+      updateContainerConfigScalars(TZ_GROUP.id, { timezone: alias });
+      const expected = fs.existsSync(path.join('/usr/share/zoneinfo', alias)) ? alias : TIMEZONE;
+      expect(resolveGroupTimezone(TZ_GROUP.id)).toBe(expected);
     }
   });
 

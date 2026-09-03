@@ -12,6 +12,7 @@
  * with the host caller — same code path a real approval would take.
  */
 import fs from 'fs';
+import path from 'path';
 import { describe, expect, it, beforeEach, afterEach, vi } from 'vitest';
 
 vi.mock('../../container-runner.js', () => ({
@@ -570,10 +571,11 @@ describe('groups CLI resource config', () => {
 
     // Intl accepts all of these; POSIX TZ reads them differently — "+01:00"
     // with the opposite sign, "CST" as a zero-offset abbreviation, and
-    // "europe/lisbon" is not a zoneinfo path at all. Asia/Calcutta is the ICU
-    // canonical name for Asia/Kolkata whose backward-link file current tzdata
-    // omits, so TZ=Asia/Calcutta silently yields +0000.
-    for (const bad of ['+01:00', '-05:00', 'CST', 'EST', 'europe/lisbon', 'Asia/Calcutta']) {
+    // "europe/lisbon" is not a zoneinfo path at all, since the lookup is a
+    // case-sensitive file path. None of these depends on which tzdata the
+    // machine carries, unlike a retired alias such as Asia/Calcutta, which is
+    // pruned on some hosts and shipped on others.
+    for (const bad of ['+01:00', '-05:00', 'CST', 'EST', 'europe/lisbon']) {
       const rejected = await dispatch(
         { id: `req-tz-${bad}`, command: 'groups-config-update', args: { id, timezone: bad } },
         { caller: 'host' },
@@ -583,21 +585,22 @@ describe('groups CLI resource config', () => {
     }
     expect(getContainerConfig(id)?.timezone).toBeNull();
 
-    // A spelling the zone database has is stored verbatim — including the
-    // modern names, which is the whole point: ICU would have rewritten
-    // Asia/Kolkata to a file this system does not ship.
-    for (const [typed, stored] of [
-      ['Europe/Lisbon', 'Europe/Lisbon'],
-      ['Asia/Kolkata', 'Asia/Kolkata'],
-      ['Europe/Kyiv', 'Europe/Kyiv'],
-    ]) {
+    // A spelling the zone database has is stored VERBATIM — no ICU rewriting.
+    // That is the whole point: ICU maps Asia/Kolkata onto Asia/Calcutta, whose
+    // file some hosts prune, so storing the resolved name would have handed
+    // the container a zone it cannot open. Which aliases exist varies by
+    // machine, so drive the case off the database rather than assuming.
+    const zoneExists = (tz: string): boolean => fs.existsSync(path.join('/usr/share/zoneinfo', tz));
+    const shipped = ['Europe/Lisbon', 'Asia/Tokyo', 'Asia/Kolkata', 'Europe/Kyiv'].filter(zoneExists);
+    expect(shipped.length).toBeGreaterThan(0);
+    for (const typed of shipped) {
       const ok = await dispatch(
         { id: `req-tz-canon-${typed}`, command: 'groups-config-update', args: { id, timezone: typed } },
         { caller: 'host' },
       );
       expect(ok.ok).toBe(true);
-      expect(getContainerConfig(id)?.timezone).toBe(stored);
-      expect(readContainerConfig(folder).timezone).toBe(stored);
+      expect(getContainerConfig(id)?.timezone).toBe(typed);
+      expect(readContainerConfig(folder).timezone).toBe(typed);
     }
   });
 
