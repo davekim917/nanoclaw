@@ -11,6 +11,10 @@ import path from 'path';
 // registerChannelAdapter() at module scope (factories are NOT invoked, no
 // adapter connects), so declared channel defaults resolve without the service.
 import '../src/channels/index.js';
+// Session provisioning goes through the registered mailbox (initSessionFolder →
+// getAgentMailbox().prepare()), so this standalone entrypoint has to load the
+// composition slot itself — it never imports src/modules/index.js.
+import '../src/mailbox/compose.js';
 import {
   resolveUnknownSenderPolicy,
   resolveWiringDefaults,
