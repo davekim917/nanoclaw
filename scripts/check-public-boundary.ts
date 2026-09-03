@@ -217,8 +217,8 @@ export function loadRegistryIdentifiers(dbPath: string): Set<string> {
   let db: Database.Database;
   try {
     db = new Database(dbPath, { readonly: true, fileMustExist: true });
-  } catch {
-    throw new Error('install registry is unreadable');
+  } catch (err) {
+    throw new Error('install registry is unreadable', { cause: err });
   }
 
   const identifiers = new Set<string>();
@@ -255,8 +255,8 @@ export function loadLocalIdentifiers(identifiersPath: string): Set<string> {
   let text: string;
   try {
     text = fs.readFileSync(identifiersPath, 'utf8');
-  } catch {
-    throw new Error('local identifier inventory is missing or unreadable');
+  } catch (err) {
+    throw new Error('local identifier inventory is missing or unreadable', { cause: err });
   }
   const identifiers = new Set<string>();
   for (const line of text.split(/\r?\n/)) {
@@ -272,8 +272,8 @@ function loadAllowlist(allowlistPath: string): AllowlistEntry[] {
   let parsed: unknown;
   try {
     parsed = JSON.parse(fs.readFileSync(allowlistPath, 'utf8'));
-  } catch {
-    throw new Error('public boundary allowlist is missing or invalid');
+  } catch (err) {
+    throw new Error('public boundary allowlist is missing or invalid', { cause: err });
   }
   if (
     !parsed ||

@@ -7,6 +7,11 @@
  * 4. Poll outbound.db for messages_out response
  *
  * Usage: pnpm exec tsx scripts/test-v2-host.ts
+ *
+ * TODO(#335): stale — createMessagingGroupAgent here was missing fields
+ * added to the schema since this was last touched. Excluded from
+ * tsconfig.scripts.json pending a pass that brings it in line with the
+ * current wiring API (see PR body).
  */
 import Database from 'better-sqlite3';
 import fs from 'fs';

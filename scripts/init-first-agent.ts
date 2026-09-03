@@ -193,6 +193,7 @@ function wireIfMissing(mg: MessagingGroup, ag: AgentGroup, now: string, label: s
     default_model: null,
     default_effort: null,
     default_tone: null,
+    instructions_profile: null,
     created_at: now,
   });
   console.log(`Wired ${label}: ${mg.id} -> ${ag.id}`);

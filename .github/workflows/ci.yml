@@ -36,6 +36,9 @@ jobs:
       - name: Typecheck host
         run: pnpm exec tsc --noEmit
 
+      - name: Typecheck scripts
+        run: pnpm exec tsc -p tsconfig.scripts.json --noEmit
+
       - name: Typecheck container
         run: pnpm exec tsc -p container/agent-runner/tsconfig.json --noEmit
 

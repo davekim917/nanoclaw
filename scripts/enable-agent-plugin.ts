@@ -357,7 +357,7 @@ function ensureCodexSubPluginManifests(repoDir: string, dryRun: boolean): { dir:
   const declared = declaredCodexSourceDirs(repoDir);
   for (const container of [path.join(repoDir, 'plugins'), repoDir]) {
     if (!isDirectory(container)) continue;
-    let subs: string[] = [];
+    let subs: string[];
     try {
       subs = fs.readdirSync(container);
     } catch {
