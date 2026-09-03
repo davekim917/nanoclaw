@@ -1,5 +1,5 @@
 import { createHash } from 'crypto';
-import { execSync, spawnSync } from 'child_process';
+import { spawnSync } from 'child_process';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
@@ -8,20 +8,31 @@ import Database from 'better-sqlite3';
 import { afterEach, describe, expect, it } from 'vitest';
 
 import { memoryTreeSha256, WORKGROUP_MEMORY_CONTAINER_PATH } from '../src/modules/workgroup/shared-dirs.js';
+import { allowSubprocess, enforceHermeticity } from '../src/test-hermeticity.js';
+
+// This suite drives the real `verify-workgroup-memory-runtime.ts` CLI end to
+// end (every other property it checks — fail-closed on a tampered symlink, a
+// drifted checksum, an escaped marker — only exists at that level), always
+// against a scratch root under os.tmpdir() (`mkRoot()` below), never the
+// checkout. The one real seam left is the CLI subprocess itself, and it is
+// held to the repo's pinned tsx specifically (issue #305): a `which
+// tsx`-resolved PATH binary or an `npx`-fetched one would both run something
+// other than the repository's locked dependency (AGENTS.md's exact-resolution
+// rule for runtime tools) — `which` doesn't reach the network the way `npx`
+// does, but "some other tsx" is still not this suite's job to accept, so
+// there is no PATH/npx fallback below: a worktree missing the local install
+// fails this suite loudly instead of silently drifting.
+allowSubprocess(['tsx']);
+enforceHermeticity();
 
 const SCRIPT = path.resolve('scripts/verify-workgroup-memory-runtime.ts');
-// A literal join, not Node's ancestor-walk resolution — silently missing
-// in a worktree without its own install. Same fallback as run-migrations.ts's resolveTsx().
-const localTsx = path.resolve('node_modules/.bin/tsx');
-const TSX = fs.existsSync(localTsx)
-  ? localTsx
-  : (() => {
-      try {
-        return execSync('which tsx', { encoding: 'utf8' }).trim();
-      } catch {
-        return 'npx';
-      }
-    })();
+const TSX = path.resolve('node_modules/.bin/tsx');
+if (!fs.existsSync(TSX)) {
+  throw new Error(
+    `${TSX} not found — this suite requires the repo's pinned tsx (AGENTS.md exact-resolution); ` +
+      'run pnpm install rather than falling back to a PATH or npx tsx.',
+  );
+}
 const roots: string[] = [];
 
 interface CliResult {
@@ -320,12 +331,8 @@ function seedAppliedWorkgroup(
   );
 }
 
-// npx (last-resort TSX fallback) needs the package name as its first arg; a
-// direct tsx binary does not.
-const tsxArgs = (args: string[]) => (TSX.endsWith('npx') ? ['tsx', ...args] : args);
-
 function run(root: string, args: string[]): CliResult {
-  const result = spawnSync(TSX, tsxArgs([SCRIPT, ...args]), {
+  const result = spawnSync(TSX, [SCRIPT, ...args], {
     cwd: root,
     encoding: 'utf8',
     env: { ...process.env },

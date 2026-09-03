@@ -5,7 +5,20 @@ import path from 'path';
 import http from 'http';
 
 import { closeDb, createAgentGroup, getDb, initTestDb, runMigrations } from '../db/index.js';
+import { enforceHermeticity } from '../test-hermeticity.js';
 import type { AuthedRequestContext } from './router.js';
+
+// `resolveSession` (session-manager.js) creates the session directory under
+// `DATA_DIR/v2-sessions/` as a side effect of resolving a thread's session —
+// unmocked, that lands in the checkout's own `data/` tree, which on a live
+// install is production session state (issue #305).
+const { TEST_DATA_DIR } = vi.hoisted(() => ({ TEST_DATA_DIR: uniqueTmpRoot('thread-message') }));
+vi.mock('../config.js', async () => {
+  const actual = await vi.importActual<typeof import('../config.js')>('../config.js');
+  return { ...actual, DATA_DIR: TEST_DATA_DIR };
+});
+
+enforceHermeticity();
 
 /**
  * The console's ONE primitive, at the seam that matters: which session a send

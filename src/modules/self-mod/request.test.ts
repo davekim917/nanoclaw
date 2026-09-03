@@ -30,8 +30,28 @@ import { writeSessionMessage } from '../../session-manager.js';
 import { upsertUser } from '../permissions/db/users.js';
 import { upsertUserDm } from '../permissions/db/user-dms.js';
 import { grantRole } from '../permissions/db/user-roles.js';
+import { enforceHermeticity } from '../../test-hermeticity.js';
 import type { Session } from '../../types.js';
 import { escapeInvisibles, requestAddMcpServerHold, validateAddMcpServer } from './request.js';
+
+// This suite's I/O seams (network, out-of-tree writes) are all mocked below —
+// hold it to the strict hermeticity guard so it can't regress (issue #305).
+enforceHermeticity();
+
+// setDeliveryAdapter() below fires onDeliveryAdapterReady, which starts the
+// OneCLI manual-approval handler (approvals/onecli-approvals.ts). That
+// module constructs `new OneCLI(...)` at import time and its
+// configureManualApproval() kicks off an unawaited ApprovalClient.start(),
+// which resolves the gateway URL against the real
+// `https://api.onecli.sh/v1/gateway-url` — a fire-and-forget promise the SDK
+// swallows on failure, so this suite stayed green while doing it. Mocked at
+// the SDK client boundary so the approval-card flow under test never talks
+// to the network.
+vi.mock('@onecli-sh/sdk', () => ({
+  OneCLI: class {
+    configureManualApproval = vi.fn().mockReturnValue({ stop: vi.fn() });
+  },
+}));
 
 vi.mock('../../container-runner.js', () => ({
   wakeContainer: vi.fn().mockResolvedValue(undefined),
