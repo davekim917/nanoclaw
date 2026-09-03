@@ -238,7 +238,7 @@ export async function main(): Promise<void> {
     }
   }
   try {
-    const pendingUpgrade = reconcilePendingUpgradeContexts(
+    const pendingUpgrade = await reconcilePendingUpgradeContexts(
       db,
       memoryReports
         .filter((report) => report.state.status !== 'migration-required')

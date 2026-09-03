@@ -79,11 +79,26 @@ import {
 } from './ops/lookups.js';
 import { listTurnUsageSince, type SessionTurnUsageRow } from './ops/reads.js';
 import {
+  admitDueRow,
+  admitPendingUpgradeRow,
+  deferForFreshContextRetry,
+  demoteUnpairedLegacyTasks,
+  listDueAdmissionRows,
+  listUnpairedPendingUpgradeRows,
+  restoreInertTaskSchedule,
+  taskPairIsAdmitted,
+  type DueAdmissionRow,
+  type PendingUpgradeRow,
+} from './ops/admission.js';
+import {
   armNextTask,
   cancelSeriesWithStrandClear,
+  getCliTaskRow,
   getCompletedRecurring,
+  getCreatedTaskRow,
   insertRecurrence,
   insertTaskRow,
+  listCliTaskSeries,
   listDueTaskRows,
   resolvePendingTask,
   restoreTaskRow,
@@ -91,6 +106,8 @@ import {
   setPendingTaskContent,
   updateTask,
   upsertTaskSeries,
+  type CliTaskRow,
+  type CreatedTaskRow,
   type HostGatedTaskRow,
   type RecurringMessage as ForkRecurringMessage,
   type TaskRowInsert,
@@ -186,12 +203,15 @@ export {
   restoreTaskRow,
   resumeTask,
   updateTask,
+  type CliTaskRow,
+  type CreatedTaskRow,
   type HostGatedTaskRow,
   type RecurringMessage,
   type TaskRowInsert,
   type TaskRowSnapshot,
   type TaskUpdate,
 } from './ops/tasks.js';
+export type { DueAdmissionRow, PendingUpgradeRow } from './ops/admission.js';
 export {
   CLOSE_REASON_MAX_CHARS,
   clearWorkContinuation,
@@ -412,6 +432,26 @@ export interface NanoclawMailboxSession extends MailboxSession {
   listDueTaskRows(): HostGatedTaskRow[];
   resolvePendingTask(taskId: string, status: 'completed' | 'failed'): void;
   setPendingTaskContent(taskId: string, content: string): void;
+  /**
+   * The `ncl tasks` board's own series view. Not upstream's `listLiveTasks` /
+   * `getTask`: those pick a series' representative row by a paused-or-future
+   * rank and return a `TaskRecord`, which carries no routing columns — and the
+   * CLI's table shows where a task posts.
+   */
+  listCliTaskSeries(status?: 'pending' | 'paused'): CliTaskRow[];
+  getCliTaskRow(id: string): CliTaskRow | undefined;
+  getCreatedTaskRow(id: string): CreatedTaskRow | undefined;
+
+  // --- host-owned due admission -------------------------------------------
+  /** The recall POLICY stays with session-manager; these commit its decision. */
+  demoteUnpairedLegacyTasks(): void;
+  listDueAdmissionRows(): DueAdmissionRow[];
+  admitDueRow(recall: MessageInsert, taskId: string): boolean;
+  listUnpairedPendingUpgradeRows(): PendingUpgradeRow[];
+  admitPendingUpgradeRow(recall: MessageInsert, messageId: string): boolean;
+  deferForFreshContextRetry(messageId: string, backoffSec: number): void;
+  taskPairIsAdmitted(taskId: string): boolean;
+  restoreInertTaskSchedule(taskId: string, processAfter: string | null): void;
 
   // --- fork-only recall pairing -------------------------------------------
   readProviderRecallState(provider: string): ProviderRecallState;
@@ -751,6 +791,18 @@ function forkOps(
     listDueTaskRows: () => listDueTaskRows(inbound),
     resolvePendingTask: (taskId, status) => resolvePendingTask(inbound, taskId, status),
     setPendingTaskContent: (taskId, content) => setPendingTaskContent(inbound, taskId, content),
+    listCliTaskSeries: (status) => listCliTaskSeries(inbound, status),
+    getCliTaskRow: (id) => getCliTaskRow(inbound, id),
+    getCreatedTaskRow: (id) => getCreatedTaskRow(inbound, id),
+
+    demoteUnpairedLegacyTasks: () => demoteUnpairedLegacyTasks(inbound),
+    listDueAdmissionRows: () => listDueAdmissionRows(inbound),
+    admitDueRow: (recall, taskId) => admitDueRow(inbound, recall, taskId),
+    listUnpairedPendingUpgradeRows: () => listUnpairedPendingUpgradeRows(inbound),
+    admitPendingUpgradeRow: (recall, messageId) => admitPendingUpgradeRow(inbound, recall, messageId),
+    deferForFreshContextRetry: (messageId, backoffSec) => deferForFreshContextRetry(inbound, messageId, backoffSec),
+    taskPairIsAdmitted: (taskId) => taskPairIsAdmitted(inbound, taskId),
+    restoreInertTaskSchedule: (taskId, processAfter) => restoreInertTaskSchedule(inbound, taskId, processAfter),
 
     readProviderRecallState: (provider) => readProviderRecallState(readableOutbound(), provider),
     listOpenChatContents: () => listOpenChatContents(inbound),
