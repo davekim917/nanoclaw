@@ -248,6 +248,10 @@ import './modules/sweep-idle-reap/index.js';
 // Their own duty-body mocks are already declared above (this file predates
 // the move and anticipated it).
 import './modules/sweep-central/index.js';
+// Family modules register their duties at import — imported here (as
+// src/modules/index.ts does at production boot) so R-7's registration pin
+// below sees the full 39-registration set, not just the in-file built-ins.
+import './modules/sweep-orchestrator/index.js';
 
 probe.depth = _mailboxSessionDepthForTesting;
 
@@ -1038,6 +1042,20 @@ describe('sweep duty registry (S2-PR2)', () => {
     expect(typeof idleReap.shouldReapIdleTaskContainer).toBe('function');
     expect(typeof idleReap.shouldReapIdleChatContainer).toBe('function');
     expect(idleReap.CHAT_IDLE_REAP_MS).toBe(15 * 60 * 1000);
+  });
+
+  // ── F-5.4 (S2-PR5, plan.md §8) ───────────────────────────────────────────────
+  it('reconciler, thread-close and watchdog run in tick:post-session', () => {
+    // The container-state ordering constraint (plan.md §4.3 constraint 1)
+    // survives the move of T6/T18 into src/modules/sweep-orchestrator/. T8
+    // thread-close is S2-PR11's family — assert its declared phase only, not
+    // its behavior.
+    const { duties } = _listSweepRegistrationsForTesting();
+    const byName = new Map(duties.map((d) => [d.name, d]));
+    for (const name of [SWEEP_DUTY_INVENTORY.T6, SWEEP_DUTY_INVENTORY.T8, SWEEP_DUTY_INVENTORY.T18]) {
+      expect(byName.get(name), `duty ${name}`).toBeDefined();
+      expect(byName.get(name)?.phase, `duty ${name}`).toBe('tick:post-session');
+    }
   });
 
   // ── duty registration sources ───────────────────────────────────────────────

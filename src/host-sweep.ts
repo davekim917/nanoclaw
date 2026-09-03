@@ -28,7 +28,6 @@
  *        claimed a message and went quiet past tolerance since the claim."
  */
 import type Database from 'better-sqlite3';
-import { randomUUID } from 'crypto';
 import fs from 'fs';
 import path from 'path';
 
@@ -63,14 +62,12 @@ import {
   heartbeatPath,
   sessionDir,
   sessionsBaseDir,
-  writeSessionMessage,
   admitDueTaskContexts,
   deferMessageForFreshContextRetry,
 } from './session-manager.js';
 import { rollupSessionUsage, pruneOldTurnUsage } from './db/usage.js';
 import {
   getContainerSpawnedAt,
-  hasContainerEverRun,
   getActiveContainerSessionIds,
   isContainerRunning,
   killContainer,
@@ -87,14 +84,6 @@ import { handleStoragePressureAlert } from './storage-pressure-alert.js';
 import { runStorageMaintenanceInBackground } from './storage-maintenance-worker.js';
 import type { Session } from './types.js';
 import { getDb } from './db/connection.js';
-import {
-  autoArchiveCompletedBefore,
-  getActiveTasks,
-  transitionToTerminal,
-} from './modules/orchestrator-dispatch/db/tasks.js';
-import { getCapabilityConfig } from './modules/orchestrator-dispatch/db/agent-group-capabilities.js';
-import { runReconcilerSweep } from './modules/orchestrator-dispatch/reconciler.js';
-import { decideTaskAction, pendingTerminalSpawnOutboundSeenAt } from './modules/orchestrator-dispatch/watchdog.js';
 import { OomKillObserver } from './resource-oom-observer.js';
 import { reconcileMergedClaims } from './modules/claims/reconcile.js';
 import { sweepClaimsSelfHeal } from './modules/claims/self-heal.js';
@@ -2135,173 +2124,6 @@ async function sweepUsageRollup(sessions: readonly Session[]): Promise<void> {
   }
 }
 
-const DEFAULT_NO_PROGRESS_TIMEOUT_SEC = 1800;
-const DEFAULT_SPAWN_DEADLINE_SEC = 300;
-const DEFAULT_DRAIN_GRACE_SEC = 120;
-
-const ACTION_TO_FAIL_REASON: Record<string, string> = {
-  'fail-deadline': 'deadline_exceeded',
-  'fail-no-progress': 'no_progress_timeout',
-  'fail-container-exit': 'container_exit',
-  'fail-spawn-deadline': 'spawn_deadline',
-};
-
-async function sweepTaskWatchdog(): Promise<void> {
-  let tasks;
-  try {
-    tasks = getActiveTasks();
-  } catch (err) {
-    log.error('Task watchdog: failed to load active tasks', { err });
-    return;
-  }
-
-  const now = Date.now();
-
-  for (const task of tasks) {
-    try {
-      // Get child container status from in-memory container set.
-      //
-      // Three-state, not two. `'stopped'` means "ran and has since exited" —
-      // ONLY then is `fail-container-exit` a correct reap. `null` covers two
-      // legitimately-not-failed cases: (a) container hasn't been spawned yet
-      // because the orchestrator's concurrency cap is queueing it, (b) wake
-      // is in flight. Both look identical to `isContainerRunning` (returns
-      // false) but neither should reap. `hasContainerEverRun` is the sticky
-      // signal that disambiguates — set when activeContainers.add fires,
-      // never cleared, so true iff this host has observed the container
-      // running at some point in this process lifetime.
-      let childContainerStatus: 'running' | 'stopped' | null = null;
-      if (task.child_session_id !== null) {
-        if (isContainerRunning(task.child_session_id)) {
-          childContainerStatus = 'running';
-        } else if (hasContainerEverRun(task.child_session_id)) {
-          childContainerStatus = 'stopped';
-        } else {
-          childContainerStatus = null;
-        }
-      }
-
-      // Check child's outbound.db for pending terminal spawn actions (drain-first guard).
-      // Self-orchestration: child session lives in the SAME agent group as the parent,
-      // so the lookup uses parent_agent_group_id.
-      const terminalOutboundSeenAt =
-        task.child_session_id !== null
-          ? pendingTerminalSpawnOutboundSeenAt(task.parent_agent_group_id, task.child_session_id)
-          : null;
-
-      // Pull per-orchestrator timeout config; fall back to defaults when absent.
-      const cap = getCapabilityConfig(task.parent_agent_group_id, 'orchestrator');
-      const noProgressTimeoutSec = cap?.noProgressTimeoutSec ?? DEFAULT_NO_PROGRESS_TIMEOUT_SEC;
-      const spawnDeadlineSec = cap?.spawnDeadlineSec ?? DEFAULT_SPAWN_DEADLINE_SEC;
-      const drainGraceSec = cap?.drainGraceSec ?? DEFAULT_DRAIN_GRACE_SEC;
-
-      const decision = decideTaskAction({
-        now,
-        task,
-        childContainerStatus,
-        terminalOutboundSeenAt,
-        noProgressTimeoutSec,
-        spawnDeadlineSec,
-        drainGraceSec,
-      });
-
-      if (decision.action === 'ok') continue;
-
-      const nowIso = new Date(now).toISOString();
-      const failReason = ACTION_TO_FAIL_REASON[decision.action] ?? decision.action;
-      if (!(decision.action in ACTION_TO_FAIL_REASON)) {
-        log.warn('Task watchdog: unknown action, using raw value as fail_reason', { action: decision.action });
-      }
-      const transitioned = transitionToTerminal(task.task_id, 'failed', {
-        fail_reason: failReason,
-        failed_at: nowIso,
-      });
-
-      if (!transitioned) {
-        // Already in terminal state (race with reconciler or another path) — skip notify.
-        log.debug('Task watchdog: task already terminal, skipping notify', { taskId: task.task_id });
-        continue;
-      }
-
-      // Dashboard SSE emit (post-build drift fix B5 — watchdog-fail emit callsite)
-      void import('./dashboard/api/events.js')
-        .then((mod) =>
-          mod.emitDashboardEvent('task_event', {
-            task_id: task.task_id,
-            kind: 'failed',
-            agent_group_id: task.parent_agent_group_id,
-          }),
-        )
-        .catch(() => {
-          /* dashboard module may not be initialized in tests */
-        });
-
-      log.warn('Task watchdog: reaped task', {
-        taskId: task.task_id,
-        reason: decision.action,
-        parentAgentGroupId: task.parent_agent_group_id,
-        parentSessionId: task.parent_session_id,
-      });
-
-      const parentSession = getSession(task.parent_session_id);
-      if (!parentSession) continue;
-
-      try {
-        // Mirror applySpawnFailed's notify shape — kind='chat' with visible
-        // `text` so the orchestrator sees a normal turn input and reports
-        // the failure to the user. The prior `kind='system'` envelope
-        // (action `spawn_task_watchdog_fail`) had no consumer anywhere in
-        // the codebase — it sat silently in the parent's inbound and no
-        // human was ever told the task failed. The `_task_update` envelope
-        // keeps the machine-readable surface for any future consumer that
-        // wants to react to status transitions without parsing the text.
-        await writeSessionMessage(task.parent_agent_group_id, task.parent_session_id, {
-          id: randomUUID(),
-          kind: 'chat',
-          timestamp: nowIso,
-          content: JSON.stringify({
-            text:
-              `Task failed (watchdog): ${task.task_id}. Reason: ${failReason}. ` +
-              `The orchestrator should notify the user and decide whether to re-spawn.`,
-            _task_update: {
-              task_id: task.task_id,
-              status: 'failed',
-              fail_reason: failReason,
-              source: 'watchdog',
-            },
-          }),
-        });
-        void wakeContainer(parentSession).catch((err) =>
-          log.warn('Task watchdog: wakeContainer(parent) failed', { taskId: task.task_id, err }),
-        );
-      } catch (err) {
-        log.warn('Task watchdog: failed to notify parent', { taskId: task.task_id, err });
-      }
-    } catch (err) {
-      log.error('Task watchdog: error processing task', { taskId: task.task_id, err });
-    }
-  }
-}
-
-/**
- * Auto-archive completed tasks older than 24h. Failed tasks are excluded
- * deliberately — operator must dismiss them explicitly so they stay
- * visible until acknowledged. No per-row SSE emit: the volume is "every
- * `done` card from yesterday at once," which would flood the bus; the
- * next dashboard list refresh picks the change up naturally.
- */
-const COMPLETED_AUTO_ARCHIVE_AGE_HOURS = 24;
-
-export function autoArchiveOldCompleted(): void {
-  try {
-    const cutoff = new Date(Date.now() - COMPLETED_AUTO_ARCHIVE_AGE_HOURS * 60 * 60 * 1000).toISOString();
-    const count = autoArchiveCompletedBefore(cutoff);
-    if (count > 0) log.info('Auto-archived completed tasks', { count });
-  } catch (err) {
-    log.warn('autoArchiveOldCompleted: failed', { err });
-  }
-}
-
 export function pruneIdleSessionArtifacts(now: number = Date.now(), root: string = sessionsBaseDir()): void {
   pruneIdleSessionArtifactsImpl(now, root, isContainerRunning);
 }
@@ -2509,7 +2331,12 @@ export function _resetStuckProcessingRowsForTesting(
   resetStuckProcessingRows(mailbox, session, reason);
 }
 
-export { sweepTaskWatchdog as _sweepTaskWatchdogForTesting };
+// sweepTaskWatchdog moved with the orchestrator family (S2-PR5) into
+// src/modules/sweep-orchestrator/task-watchdog.ts — a sibling of that
+// family's index.ts, not index.ts itself, so this re-export doesn't create a
+// static cycle back through index.ts's own import of this file (registerSweepDuty
+// / registerSweepDutySource / SWEEP_DUTY_INVENTORY).
+export { sweepTaskWatchdog as _sweepTaskWatchdogForTesting } from './modules/sweep-orchestrator/task-watchdog.js';
 
 /**
  * Tell the user we just reaped their container for inactivity. The
@@ -2999,20 +2826,9 @@ function registerBuiltInSweepDuties(): void {
   });
 
   // ── tick:post-session — container state is now current ─────────────────────
-
-  registerSweepDuty({
-    name: id.T6,
-    phase: 'tick:post-session',
-    order: 10,
-    // MODULE-HOOK:orchestrator-dispatch:reconciler — complete
-    // admitted-but-incomplete tasks. Runs after per-session sweeps so container
-    // state is current. Carries no guard of its own: it was the earliest
-    // unguarded call in the old tick body, and the phase runner is now the
-    // guard that keeps its throw from costing every duty behind it.
-    run: () => {
-      runReconcilerSweep();
-    },
-  });
+  //
+  // T6 orchestrator-reconciler (order 10) and T18 task-watchdog (order 25)
+  // moved to src/modules/sweep-orchestrator/index.ts (S2-PR5).
 
   registerSweepDuty({
     name: id.T8,
@@ -3030,16 +2846,6 @@ function registerBuiltInSweepDuties(): void {
         log.warn('thread-close sweep step failed', { err });
       }
     },
-  });
-
-  registerSweepDuty({
-    name: id.T18,
-    phase: 'tick:post-session',
-    order: 25,
-    // MODULE-HOOK:orchestrator-dispatch:watchdog — reap tasks that have exceeded
-    // their deadline, spawn window, no-progress timeout, or whose child
-    // container exited.
-    run: () => sweepTaskWatchdog(),
   });
 
   registerSweepDuty({
@@ -3121,16 +2927,8 @@ function registerBuiltInSweepDuties(): void {
     },
   });
 
-  registerSweepDuty({
-    name: id.T14,
-    phase: 'tick:housekeeping',
-    order: 70,
-    // Auto-archive completed tasks older than 24h so the "Done" lane stays
-    // representative of recent work; failed tasks are intentionally skipped.
-    run: () => {
-      autoArchiveOldCompleted();
-    },
-  });
+  // T14 completed-task-auto-archive (order 70) moved to
+  // src/modules/sweep-orchestrator/index.ts (S2-PR5).
 
   registerSweepDuty({
     name: id.T20,

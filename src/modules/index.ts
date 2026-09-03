@@ -31,6 +31,9 @@ import './channel-auto-wire/index.js';
 import './bash-gate/index.js';
 // Orchestrator dispatch — task dispatch pipeline + reconciler.
 import './orchestrator-dispatch/index.js';
+// Sweep family: orchestrator, dormant (seam 2, S2-PR5) — T6 reconciler,
+// T14 auto-archive, T18 task watchdog. Registers at import.
+import './sweep-orchestrator/index.js';
 // Backlog + ship-log delivery action handlers (add_ship_log, add/update/delete_backlog_item).
 import './backlog/index.js';
 // Channel-config registers delivery actions for set_channel_model /
