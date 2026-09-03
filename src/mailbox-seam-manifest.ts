@@ -56,8 +56,7 @@ export const UPSTREAM_FILES: readonly string[] = [
   // Runner
   'container/agent-runner/src/mailbox/index.ts',
   'container/agent-runner/src/mailbox/model.generated.ts',
-  // 'container/agent-runner/src/mailbox/registry.test.ts' — deferred: asserts the
-  // end state (no session-db.ts, entrypoint imports the barrel); ported in PR 7 (host) / R3 (runner).
+  'container/agent-runner/src/mailbox/registry.test.ts',
   'container/agent-runner/src/mailbox/sqlite/connection.ts',
   'container/agent-runner/src/mailbox/sqlite/index.ts',
   'container/agent-runner/src/mailbox/sqlite/operations.ts',
@@ -71,6 +70,11 @@ export const UPSTREAM_FILES: readonly string[] = [
   'container/agent-runner/src/db/messages-out.ts',
   'container/agent-runner/src/db/session-routing.ts',
   'container/agent-runner/src/db/session-state.ts',
+  // Not in the plan's enumerated set, but the registry test ported in R3
+  // asserts its exact `preload` line, so an unmanifested hand-edit would
+  // silently break the guarantee that every runner entrypoint composes the
+  // real barrel. Byte-identical to upstream.
+  'container/agent-runner/bunfig.toml',
 ] as const;
 
 /**
@@ -79,8 +83,9 @@ export const UPSTREAM_FILES: readonly string[] = [
  * (RATCHET.json) reaching empty — see the assertion in src/mailbox-seam-ratchet.test.ts.
  */
 export const DEFERRED_UPSTREAM_FILES: readonly string[] = [
+  // The runner half was ported in R3 (its allowlist reached zero). The host
+  // half lands in PR 7, when the host allowlist does.
   'src/mailbox/registry.test.ts',
-  'container/agent-runner/src/mailbox/registry.test.ts',
 ] as const;
 
 export interface MailboxSeamManifest {

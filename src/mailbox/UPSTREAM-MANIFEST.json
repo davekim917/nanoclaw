@@ -1,6 +1,7 @@
 {
   "upstream": "5c3082a1",
   "files": {
+    "container/agent-runner/bunfig.toml": "3c35bbe6522d71981d126ea0ad6a1cfea291c0223f11f7deaf5b58a44bd13b43",
     "container/agent-runner/src/db/container-state.ts": "551bed7b9ac4039c28e6d218ffe81dbb512ac709b27b6e733dd6ea23c72d832b",
     "container/agent-runner/src/db/index.ts": "39bab9732a23047c55729d06f63e7725f9063b52918544a8effcddb584585546",
     "container/agent-runner/src/db/messages-in.ts": "69ae36398582e998d1b113dbb2e0141d8f2141a24ab0bec25d2eeb8240bcd492",
@@ -10,6 +11,7 @@
     "container/agent-runner/src/heartbeat.ts": "0af906120acbba6a0615f0b39276ae7a187404d17d2ea55a101f9f89e2dd049b",
     "container/agent-runner/src/mailbox/index.ts": "d8568702a9b5a287f75a4dd9821deccba44c14b534f92a669ba313ba9c59dde3",
     "container/agent-runner/src/mailbox/model.generated.ts": "f23a848fd794001aec5d10fe05f699b20cf93f2e756f23a498c1654441be159e",
+    "container/agent-runner/src/mailbox/registry.test.ts": "ddb6ae7549d2c9a113c11c888af7c14c58fd8be547e36a14862b5f2b97578335",
     "container/agent-runner/src/mailbox/sqlite/connection.ts": "31c899bf05fa4eaf67bd96e39715c589c6420f132f5a4b06ecd3f067a37cbc17",
     "container/agent-runner/src/mailbox/sqlite/index.ts": "fff275870f80edfd069ad44ec509df81d5d9e8f10bd56bdfc0a3a3dcfb07561d",
     "container/agent-runner/src/mailbox/sqlite/operations.ts": "1897b356ce62692b993a019ef807b240c7b5dc4182452d496093815f8f5bdc17",
