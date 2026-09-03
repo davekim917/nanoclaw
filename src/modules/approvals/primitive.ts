@@ -206,7 +206,6 @@ export async function pickApprovalDelivery(
   return null;
 }
 
-
 // ── Request API ──
 
 /** Send a system chat to the agent's session. Used by callers and by the response handler. */

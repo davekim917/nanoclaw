@@ -159,7 +159,7 @@ describe('pickApprovalDelivery', () => {
     expect(strictResult).toBeNull();
   });
 
-  it('resolves the approver\'s channel kind, not the raw id prefix (Teams `29:`)', async () => {
+  it("resolves the approver's channel kind, not the raw id prefix (Teams `29:`)", async () => {
     // Teams user ids carry a Bot Framework `29:` prefix, not `teams:`.
     // Splitting the id on the first `:` reads `29`, which never equals a
     // `teams` origin channel_type, so the only reachable owner was skipped
