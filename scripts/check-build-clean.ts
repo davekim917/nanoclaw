@@ -11,8 +11,16 @@
  * build the way a src/ or scripts/ change could. The whitelist below is
  * intentionally narrow — anything under src/, container/, scripts/,
  * dashboard/, setup/, .github/, or a build-relevant manifest still blocks.
+ *
+ * Second guard, same failure family: a build must also start from a HEAD
+ * that matches origin/main — a peer committing then resetting local main
+ * mid-build must not have its stale dist/ mistaken for current. BUILD_ALLOW_LOCAL=1
+ * overrides (loudly) for a deliberate local/unpushed build. The HEAD sha this
+ * check settles on is written to dist/.build-start-sha so the postbuild step
+ * (scripts/write-build-info.ts) can detect HEAD moving *during* the build.
  */
 import { execFileSync } from 'node:child_process';
+import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -72,6 +80,36 @@ export function partitionDirt(lines: string[]): DirtPartition {
   return { blocking, ignored };
 }
 
+export interface FreshnessCheck {
+  ok: boolean;
+  /** Printed via console.warn when ok+overridden, console.error when refused. Null when HEAD already matches. */
+  message: string | null;
+}
+
+/** Decides whether HEAD is fresh enough to build from: it must match origin/main unless BUILD_ALLOW_LOCAL=1 overrides. */
+export function checkFreshness(head: string, originMain: string, allowLocal: boolean): FreshnessCheck {
+  if (head === originMain) return { ok: true, message: null };
+  if (allowLocal) {
+    return {
+      ok: true,
+      message: `WARNING: BUILD_ALLOW_LOCAL=1 — HEAD (${head}) does not match origin/main (${originMain}). Building a local/unpushed tree.`,
+    };
+  }
+  return {
+    ok: false,
+    message: [
+      `BUILD REFUSED: HEAD (${head}) does not match origin/main (${originMain}).`,
+      '',
+      'A build must start from a tree matching origin/main so a build compiled from a',
+      "stale local HEAD can't be mistaken for current after a reset or rebase.",
+      '',
+      'To proceed, either:',
+      '  1. Fetch and fast-forward/rebase onto origin/main, then rebuild.',
+      '  2. Set BUILD_ALLOW_LOCAL=1 to build the local tree anyway (prints a warning).',
+    ].join('\n'),
+  };
+}
+
 function main(): void {
   // NOTE: don't .trim() the raw output before splitting — porcelain status
   // codes can start with a leading space (e.g. " M path" for an unstaged
@@ -80,34 +118,55 @@ function main(): void {
   // prefix slice by one and corrupting the path. Split first, then drop the
   // empty trailing element from the output's final newline.
   const raw = execFileSync('git', ['status', '--porcelain'], { encoding: 'utf8' });
+  const files = raw.trim() ? raw.split('\n').filter((line) => line.length > 0) : [];
 
-  if (!raw.trim()) process.exit(0);
+  if (files.length > 0) {
+    if (process.env.BUILD_ALLOW_DIRTY === '1') {
+      console.warn('WARNING: BUILD_ALLOW_DIRTY=1 — building a dirty working tree. dist/ will not match HEAD:');
+      for (const f of files) console.warn(`  ${f}`);
+    } else {
+      const { blocking, ignored } = partitionDirt(files);
 
-  const files = raw.split('\n').filter((line) => line.length > 0);
+      if (ignored.length > 0) {
+        console.warn(`ignoring docs-only dirt: ${ignored.map((line) => line.slice(3)).join(', ')}`);
+      }
 
-  if (process.env.BUILD_ALLOW_DIRTY === '1') {
-    console.warn('WARNING: BUILD_ALLOW_DIRTY=1 — building a dirty working tree. dist/ will not match HEAD:');
-    for (const f of files) console.warn(`  ${f}`);
-    process.exit(0);
+      if (blocking.length > 0) {
+        console.error('BUILD REFUSED: working tree is dirty.\n');
+        console.error('dist/ is compiled from the working tree, not from HEAD. Building now would bake');
+        console.error('these uncommitted changes into dist/, which a restart could then run.\n');
+        console.error('Dirty paths (git status --porcelain):');
+        for (const f of blocking) console.error(`  ${f}`);
+        console.error('\nTo proceed, either:');
+        console.error('  1. Commit or stash the changes above, then rebuild.');
+        console.error('  2. Set BUILD_ALLOW_DIRTY=1 to build anyway (prints a warning, stamps dirty:true).');
+        process.exit(1);
+      }
+    }
   }
 
-  const { blocking, ignored } = partitionDirt(files);
-
-  if (ignored.length > 0) {
-    console.warn(`ignoring docs-only dirt: ${ignored.map((line) => line.slice(3)).join(', ')}`);
+  let head: string;
+  let originMain: string;
+  try {
+    execFileSync('git', ['fetch', '-q', 'origin', 'main']);
+    head = execFileSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+    originMain = execFileSync('git', ['rev-parse', 'origin/main'], { encoding: 'utf8' }).trim();
+  } catch (err) {
+    console.error('BUILD REFUSED: could not verify HEAD against origin/main.');
+    console.error(err instanceof Error ? err.message : String(err));
+    process.exit(1);
   }
 
-  if (blocking.length === 0) process.exit(0);
+  const freshness = checkFreshness(head, originMain, process.env.BUILD_ALLOW_LOCAL === '1');
+  if (freshness.message) {
+    if (freshness.ok) console.warn(freshness.message);
+    else console.error(freshness.message);
+  }
+  if (!freshness.ok) process.exit(1);
 
-  console.error('BUILD REFUSED: working tree is dirty.\n');
-  console.error('dist/ is compiled from the working tree, not from HEAD. Building now would bake');
-  console.error('these uncommitted changes into dist/, which a restart could then run.\n');
-  console.error('Dirty paths (git status --porcelain):');
-  for (const f of blocking) console.error(`  ${f}`);
-  console.error('\nTo proceed, either:');
-  console.error('  1. Commit or stash the changes above, then rebuild.');
-  console.error('  2. Set BUILD_ALLOW_DIRTY=1 to build anyway (prints a warning, stamps dirty:true).');
-  process.exit(1);
+  fs.mkdirSync('dist', { recursive: true });
+  fs.writeFileSync(path.join('dist', '.build-start-sha'), `${head}\n`);
+  process.exit(0);
 }
 
 // tsx runs this file directly; vitest imports it for the pure helpers above,
