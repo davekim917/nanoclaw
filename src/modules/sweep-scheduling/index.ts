@@ -22,26 +22,14 @@ import { advanceThreadClosures } from '../../dashboard/thread-close.js';
 import { isTaskThread, updateSession } from '../../db/sessions.js';
 import {
   SWEEP_DUTY_INVENTORY,
+  asSessionContext,
   registerSweepDuty,
   registerSweepDutySource,
-  type SweepSessionContext,
-  type SweepTickContext,
 } from '../../host-sweep.js';
 import { log } from '../../log.js';
 import { admitDueTaskContexts } from '../../session-manager.js';
 import type { NanoclawMailboxSession } from '../mailbox/index.js';
 import { runHostGatedTaskScripts } from '../scheduling/host-script.js';
-
-/**
- * Narrow the union `SweepDuty.run` declares. A session-phase duty can only be
- * reached through the per-session driver, so this is a shape assertion with a
- * loud failure rather than a silent cast — the same guard `host-sweep.ts`
- * keeps module-private for its own remaining in-file duties.
- */
-function asSessionContext(ctx: SweepTickContext | SweepSessionContext): SweepSessionContext {
-  if (!('session' in ctx)) throw new Error('a session-phase duty ran with a tick context');
-  return ctx;
-}
 
 /** A per-task session with no live tasks and no running container is spent → close it. */
 export function shouldCloseTaskSession(
