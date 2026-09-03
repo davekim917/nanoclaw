@@ -90,7 +90,6 @@ vi.mock('./session-manager.js', async (importOriginal) => {
   return {
     ...real,
     admitDueTaskContexts: (...args: unknown[]) => mockAdmitDueTaskContexts(...args),
-    outboundDbPath: real.outboundDbPath,
   };
 });
 
