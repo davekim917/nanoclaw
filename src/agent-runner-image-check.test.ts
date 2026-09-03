@@ -384,6 +384,43 @@ describe('checkAgentRunnerDepsDrift result cache', () => {
       vi.useRealTimers();
     }
   });
+
+  /**
+   * Regression cover for the Codex P2 finding on this PR:
+   * wakeRepositoryMountSessions (src/container-restart.ts) fires
+   * wakeContainer for every session in a group without awaiting between
+   * them, so a burst of spawns sharing an imageRef can all reach this check
+   * before any one of them has populated okResultCache. Without coalescing,
+   * every one of them would independently pay the full inspect cost —
+   * exactly the burst case caching is meant to help most.
+   */
+  it('coalesces concurrent calls for the same imageRef into a single check', async () => {
+    const expected = await computeAgentRunnerDepsHash();
+    const imageRef = 'nanoclaw-agent-cache-test:coalesce';
+    const inspect = scriptedInspect([labeled(expected)]);
+
+    // Two calls fired back-to-back, neither awaited before the other starts —
+    // the shape of an un-awaited wakeContainer burst.
+    const [r1, r2] = await Promise.all([
+      checkAgentRunnerDepsDrift(imageRef, { inspect: inspect.run, retryDelayMs: 0 }),
+      checkAgentRunnerDepsDrift(imageRef, { inspect: inspect.run, retryDelayMs: 0 }),
+    ]);
+
+    expect(r1.ok).toBe(true);
+    expect(r2).toEqual(r1);
+    expect(inspect.calls()).toBe(1); // both calls shared one in-flight check
+
+    // Once the burst has settled, a later call is no longer coalesced — it
+    // goes through okResultCache/TTL as usual, and (files unchanged) is
+    // served from there without a second inspect.
+    const r3 = await checkAgentRunnerDepsDrift(imageRef, {
+      inspect: async () => {
+        throw new Error('should not be called — post-settle call should hit okResultCache, not re-inspect');
+      },
+      retryDelayMs: 0,
+    });
+    expect(r3).toEqual(r1);
+  });
 });
 
 /**

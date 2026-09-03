@@ -41,6 +41,11 @@
  * out-of-band (no file edit involved), and an unbounded cache would serve a
  * stale "in sync" forever in that case — see the constant's doc comment.
  *
+ * Concurrent calls for the same imageRef are coalesced onto one in-flight
+ * check (see inFlightChecks below) — a burst of spawns waking together
+ * (e.g. wakeRepositoryMountSessions) would otherwise all race past an empty
+ * cache and each pay the full check cost independently.
+ *
  * The read has to be careful about one thing. `container/build.sh` re-stamps
  * the ARG-driven retention LABEL layer on every run, which means a periodic
  * `docker build` against the canonical tag; on a containerd image store that
@@ -164,9 +169,15 @@ function fingerprintsMatch(a: DepsFileFingerprint, b: DepsFileFingerprint): bool
   );
 }
 
-/** Test-only: clear the cache so cases don't leak state across `it()` blocks. */
+/**
+ * Test-only: clear the result cache and any coalesced in-flight check so
+ * cases don't leak state across `it()` blocks. inFlightChecks self-cleans on
+ * settle, so it's normally already empty between tests — cleared here too
+ * defensively, in case a test ever leaves one unawaited.
+ */
 export function resetDepsDriftCacheForTests(): void {
   okResultCache.clear();
+  inFlightChecks.clear();
 }
 
 async function fileSha256Hex(p: string): Promise<string> {
@@ -272,16 +283,51 @@ function rebuildHint(imageRef: string): string {
 }
 
 /**
+ * imageRef -> the in-flight check for it, if one is already running. Coalesces
+ * concurrent calls into a single check: wakeRepositoryMountSessions
+ * (src/container-restart.ts) fires wakeContainer for every session in a
+ * repository-mount group WITHOUT awaiting between them, so a burst of spawns
+ * sharing an image can all reach checkAgentRunnerDepsDrift before any one of
+ * them has populated okResultCache — without this, each would independently
+ * pay the full file-hash + docker-inspect (+ possible retry-sleep) cost,
+ * defeating the point of caching for exactly the burst case it's meant to
+ * help most. The entry is removed once the check settles (success or
+ * failure) so the next call — including one arriving microtasks later, once
+ * this one already resolved — goes through okResultCache/TTL normally rather
+ * than being coalesced onto a check that isn't running anymore.
+ */
+const inFlightChecks = new Map<string, Promise<DepsDriftCheck>>();
+
+/**
  * Check the given image (defaults to CONTAINER_IMAGE — the shared base).
  * Per-agent images built via install_packages override the spawn image, so
  * spawnContainer passes the resolved containerConfig.imageTag to catch
  * derived-image drift too. Docker label inheritance means per-agent images
  * derived FROM a freshly-rebuilt base get the new label automatically.
+ *
+ * Thin coalescing wrapper around performDriftCheck — see inFlightChecks doc
+ * comment for why. Concurrent callers for the same imageRef share one
+ * in-flight check and its result (including the options — inspect/
+ * retryDelayMs — of whichever call started it); a call that arrives after
+ * the in-flight one has already settled runs its own fresh check (subject to
+ * okResultCache as usual), it is never coalesced onto a finished promise.
  */
 export async function checkAgentRunnerDepsDrift(
   imageRef: string = CONTAINER_IMAGE,
   options: DriftCheckOptions = {},
 ): Promise<DepsDriftCheck> {
+  const existing = inFlightChecks.get(imageRef);
+  if (existing) {
+    return existing;
+  }
+  const check = performDriftCheck(imageRef, options).finally(() => {
+    inFlightChecks.delete(imageRef);
+  });
+  inFlightChecks.set(imageRef, check);
+  return check;
+}
+
+async function performDriftCheck(imageRef: string, options: DriftCheckOptions): Promise<DepsDriftCheck> {
   const inspect = options.inspect ?? dockerInspectLabels;
   const retryDelayMs = options.retryDelayMs ?? LABEL_RETRY_DELAY_MS;
 
