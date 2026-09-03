@@ -1,7 +1,7 @@
 import { getSessionRouting } from './db/session-routing.js';
 import { findByRouting } from './destinations.js';
 import type { MessageInRow } from './db/messages-in.js';
-import { TIMEZONE, formatLocalTime } from './timezone.js';
+import { TIMEZONE, formatLocalTime, formatLocalDateTimeFull } from './timezone.js';
 
 /**
  * Command categories for messages starting with '/'.
@@ -464,13 +464,26 @@ function originAttr(msg: MessageInRow): string {
 function formatTaskMessage(msg: MessageInRow): string {
   const content = parseContent(msg.content);
   const from = originAttr(msg);
-  const time = formatLocalTime(msg.timestamp, TIMEZONE);
+  // `time` is the occurrence's SCHEDULED time, not the row's creation time.
+  // For a recurring series the successor row is inserted the moment the
+  // previous run completes (recurrence.ts insert-then-clear), so its
+  // `timestamp` is the PREVIOUS occurrence — a daily 9am task rendered
+  // `time="Jan 4, 9:05 AM"` on the run due Jan 5, and an agent asked for
+  // "today's" numbers reasoned from the wrong date. `process_after` is the
+  // occurrence's own grid slot. Legacy rows without one fall back to
+  // `timestamp`, which is what they always used.
+  const time = formatLocalTime(msg.process_after ?? msg.timestamp, TIMEZONE);
+  // When the run actually reached the agent. A task can be due at 9:00 and run
+  // at 11:30 (container busy, host restart, ceiling respawn, a paused series
+  // resumed days later), and without this the agent has no wall clock at all —
+  // "today" and "yesterday" in the prompt resolve against nothing.
+  const currentTime = formatLocalDateTimeFull(new Date(), TIMEZONE);
   const parts: string[] = [];
   if (content.scriptOutput) {
     parts.push('Script output:', JSON.stringify(content.scriptOutput, null, 2), '');
   }
   parts.push('Instructions:', stripLegacyTaskContract(content.prompt || ''));
-  return `<task${from} time="${escapeXml(time)}">${parts.join('\n')}</task>`;
+  return `<task${from} time="${escapeXml(time)}" current_time="${escapeXml(currentTime)}">${parts.join('\n')}</task>`;
 }
 
 const LEGACY_TASK_CONTRACT_MARKERS = [

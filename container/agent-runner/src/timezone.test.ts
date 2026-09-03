@@ -1,6 +1,12 @@
 import { describe, it, expect } from 'bun:test';
 
-import { formatLocalTime, isValidTimezone, parseZonedToUtc, resolveTimezone } from './timezone.js';
+import {
+  formatLocalDateTimeFull,
+  formatLocalTime,
+  isValidTimezone,
+  parseZonedToUtc,
+  resolveTimezone,
+} from './timezone.js';
 
 // --- formatLocalTime ---
 
@@ -30,6 +36,18 @@ describe('formatLocalTime', () => {
     // Should format as UTC (noon UTC = 12:00 PM)
     expect(result).toContain('12:00');
     expect(result).toContain('PM');
+  });
+});
+
+describe('formatLocalDateTimeFull', () => {
+  const noon = new Date('2026-01-05T17:00:00.000Z');
+
+  it('renders a weekday-qualified wall clock in the given zone', () => {
+    expect(formatLocalDateTimeFull(noon, 'America/New_York')).toBe('Monday, January 5, 2026 at 12:00 PM');
+  });
+
+  it('falls back to UTC on an invalid zone instead of throwing mid-prompt', () => {
+    expect(formatLocalDateTimeFull(noon, 'Not/AZone')).toBe('Monday, January 5, 2026 at 5:00 PM');
   });
 });
 

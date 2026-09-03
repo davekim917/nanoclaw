@@ -9,7 +9,7 @@
  * is host locale-dependent for decorators (month abbr, "," separator) but
  * stable for the numeric parts we assert on (hour, minute, year).
  */
-import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
+import { describe, it, expect, beforeEach, afterEach, setSystemTime } from 'bun:test';
 
 import { getInboundDb } from './mailbox/sqlite/connection.js';
 import { closeSessionDb, initTestSessionDb } from './modules/mailbox/testing.js';
@@ -23,7 +23,7 @@ import {
   isClearCommand,
 } from './formatter.js';
 import type { MessageInRow } from './db/messages-in.js';
-import { TIMEZONE, formatLocalTime } from './timezone.js';
+import { TIMEZONE, formatLocalTime, formatLocalDateTimeFull } from './timezone.js';
 
 // seq is NULL-allowed in the schema; assign monotonically per test so
 // `getPendingMessages` ORDER BY seq is deterministic.
@@ -42,17 +42,17 @@ function insertMessage(
   id: string,
   kind: string,
   content: object,
-  opts?: { timestamp?: string; trigger?: number; seq?: number },
+  opts?: { timestamp?: string; trigger?: number; seq?: number; processAfter?: string },
 ) {
   const timestamp = opts?.timestamp ?? new Date().toISOString();
   const trigger = opts?.trigger ?? 1;
   const seq = opts?.seq ?? nextSeq++;
   getInboundDb()
     .prepare(
-      `INSERT INTO messages_in (id, kind, timestamp, status, trigger, seq, content)
-       VALUES (?, ?, ?, 'pending', ?, ?, ?)`,
+      `INSERT INTO messages_in (id, kind, timestamp, status, trigger, seq, process_after, content)
+       VALUES (?, ?, ?, 'pending', ?, ?, ?, ?)`,
     )
-    .run(id, kind, timestamp, trigger, seq, JSON.stringify(content));
+    .run(id, kind, timestamp, trigger, seq, opts?.processAfter ?? null, JSON.stringify(content));
 }
 
 describe('context timezone header', () => {
@@ -60,6 +60,9 @@ describe('context timezone header', () => {
     insertMessage('m1', 'chat', { sender: 'Alice', text: 'hello' });
     const result = formatMessages(getPendingMessages());
     expect(result).toContain(`<context timezone="${TIMEZONE}"`);
+    // current_time is a task-only attribute — a chat turn already has the
+    // user's own message time and does not need a second clock.
+    expect(result).not.toContain('current_time=');
   });
 
   it('includes the header even when the message list is empty', () => {
@@ -158,10 +161,72 @@ describe('timestamp formatting', () => {
 });
 
 describe('task timestamps', () => {
-  it('renders task time in the user TZ, same as chat rows', () => {
+  it('falls back to creation time for legacy rows without process_after', () => {
     insertMessage('t1', 'task', { prompt: 'do the thing' }, { timestamp: '2026-01-05T12:00:00.000Z' });
     const result = formatMessages(getPendingMessages());
     expect(result).toContain(`time="${formatLocalTime('2026-01-05T12:00:00.000Z', TIMEZONE)}"`);
+  });
+
+  it("renders the occurrence's scheduled time, not the row's creation time", () => {
+    // The shape recurrence.ts produces: the successor row is inserted when the
+    // PREVIOUS run completes, so `timestamp` is a day behind the slot it is
+    // actually for. Rendering `timestamp` made a daily 9am task announce
+    // yesterday's date to the agent.
+    const created = '2026-01-04T12:05:00.000Z';
+    const scheduled = '2026-01-05T09:00:00.000Z';
+    insertMessage('t1', 'task', { prompt: "prepare today's brief" }, { timestamp: created, processAfter: scheduled });
+
+    const result = formatMessages(getPendingMessages());
+
+    expect(result).toContain(`time="${formatLocalTime(scheduled, TIMEZONE)}"`);
+    expect(result).not.toContain(`time="${formatLocalTime(created, TIMEZONE)}"`);
+  });
+
+  it('carries current_time so a late run can still resolve "today"', () => {
+    insertMessage(
+      't2',
+      'task',
+      { prompt: 'daily digest' },
+      { timestamp: '2026-01-04T12:05:00.000Z', processAfter: '2026-01-05T09:00:00.000Z' },
+    );
+
+    // Frozen: `current_time` is generated inside formatMessages, and the
+    // expected value below is computed after it returns. Across a minute
+    // boundary the two land on different minutes and the test fails for no
+    // reason. Restored in the finally, so nothing downstream sees a fake clock.
+    const frozen = new Date('2026-01-05T09:30:00.000Z');
+    setSystemTime(frozen);
+    try {
+      const result = formatMessages(getPendingMessages());
+
+      // Generated at format time, in the group timezone — a weekday-qualified
+      // wall clock the agent can anchor relative dates against.
+      //
+      // `[A-Za-z]+day` rather than the seven names spelled out: one of them
+      // collides with a private identifier and trips check-public-boundary. The
+      // assertion loses nothing, because the line below pins the exact rendered
+      // value; this one only pins the SHAPE, that a weekday prefix is present.
+      expect(result).toMatch(/current_time="[A-Za-z]+day, [^"]+"/);
+      expect(result).toContain(`current_time="${formatLocalDateTimeFull(frozen, TIMEZONE)}"`);
+    } finally {
+      setSystemTime();
+    }
+  });
+
+  it('keeps script output rendering intact alongside the new attribute', () => {
+    insertMessage(
+      't3',
+      'task',
+      { prompt: 'check alerts', scriptOutput: { alerts: 2 } },
+      { processAfter: '2026-01-05T09:00:00.000Z' },
+    );
+
+    const result = formatMessages(getPendingMessages());
+
+    expect(result).toContain('Script output:');
+    expect(result).toContain('"alerts": 2');
+    expect(result).toContain('Instructions:');
+    expect(result).toContain('check alerts');
   });
 });
 
