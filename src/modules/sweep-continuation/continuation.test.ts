@@ -1557,3 +1557,68 @@ it('the child_process tripwire bites when a seam mock is removed', () => {
   expect(() => tripwire.execFileSync!('docker')).toThrow(/real process spawn attempted/);
   expect(record).toEqual(['execFileSync']);
 });
+// ─── Ownership guards on the outbound writes (mailbox seam PR 5 / 5b) ────────
+describe('host outbound writes yield to a container that takes the session', () => {
+  // Round 7's case, under its reserved title. The TOCTOU: opening the wake
+  // window is a yield, and a concurrent inbound wake can start a container
+  // inside it. Writing then pushes the continuation back to `queued`, drops the
+  // fresh runner's runner_id and consumes a recovery attempt it never got —
+  // saved work duplicated, parked early, or lost.
+  it('a container that starts during the open leaves the continuation and its attempt count untouched', async () => {
+    const { outDb, mailbox } = makeSessionDbs();
+    const saved = { ...CONTINUATION, phase: 'running' as const, runner_id: 'runner-fresh', resume_attempts: 0 };
+    saveContinuation(outDb, saved);
+    const before = readWorkContinuation(outDb);
+
+    const s9b = duty(SWEEP_DUTY_INVENTORY.S9b);
+    const plan = emptyPlan({ workContinuation: before, continuationWakeEligible: true });
+    // The wake landed: by the time the window is open, a container owns this
+    // session and its outbound.db.
+    mockIsContainerRunning.mockReturnValue(true);
+
+    await s9b.run(sessionCtx(mailbox, plan));
+
+    // No attempt consumed, no wake issued, and the record is byte-for-byte what
+    // the fresh runner left.
+    expect(mockWakeContainer).not.toHaveBeenCalled();
+    expect(readWorkContinuation(outDb)).toEqual(before);
+  });
+
+  // Round 8 + Codex's follow-on: a single guard at the top of the post-kill
+  // window is NOT sufficient. `runSweepKillFollowUps` awaits after every
+  // registered follow-up, so ownership can flip at a microtask boundary between
+  // them — after S15's notice, before S17's reset and before S10's wake row.
+  it('a wake that takes ownership between post-kill follow-ups stops the later follow-ups from writing', async () => {
+    const { outDb, mailbox } = makeSessionDbs();
+    outDb
+      .prepare("INSERT INTO processing_ack (message_id, status, status_changed) VALUES ('m-live', 'processing', ?)")
+      .run(new Date(Date.now() - 2 * 60 * 60_000).toISOString());
+    const claims = (): number => (outDb.prepare('SELECT COUNT(*) AS c FROM processing_ack').get() as { c: number }).c;
+    const notices = (): number => (outDb.prepare('SELECT COUNT(*) AS c FROM messages_out').get() as { c: number }).c;
+
+    const ctx = sessionCtx(mailbox, emptyPlan(), {
+      killSnapshot: { reason: 'absolute-ceiling', pendingClaims: 0, containerState: null, workContinuation: null },
+    });
+    const outcome = {
+      action: 'kill-ceiling' as const,
+      heartbeatAgeMs: ABSOLUTE_CEILING_MS + 1,
+      ceilingMs: ABSOLUTE_CEILING_MS,
+    };
+
+    // Stopped for S15's notice, then a replacement takes the session in the
+    // await between follow-ups — exactly the boundary the window guard misses.
+    mockIsContainerRunning.mockReturnValue(false);
+    await killFollowUp(SWEEP_DUTY_INVENTORY.S15).run(ctx, outcome, mailbox);
+    const noticesAfterS15 = notices();
+    const claimsBefore = claims();
+
+    mockIsContainerRunning.mockReturnValue(true);
+    await killFollowUp(SWEEP_DUTY_INVENTORY.S10).run(ctx, outcome, mailbox);
+
+    // S15 wrote while stopped; S10 did not write after ownership flipped, and
+    // the fresh runner's claim survives for S17 to leave alone as well.
+    expect(noticesAfterS15).toBe(1);
+    expect(claims()).toBe(claimsBefore);
+    expect(notices()).toBe(noticesAfterS15);
+  });
+});

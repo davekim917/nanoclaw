@@ -696,7 +696,7 @@ export function writeOutboundWhenStopped<T>(
  * Resolves `undefined` when the mailbox is gone OR a container took ownership
  * during the open. Callers treat both as "did not run" — never as failure.
  */
-async function withStoppedContainerSession<T>(
+export async function withStoppedContainerSession<T>(
   run: SessionRunner,
   session: Session,
   action: (mailbox: NanoclawMailboxSession) => T,

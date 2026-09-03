@@ -21,6 +21,7 @@
 import {
   SWEEP_DUTY_INVENTORY,
   asSessionContext,
+  writeOutboundWhenStopped,
   registerSweepDuty,
   registerSweepDutySource,
   registerSweepKillFollowUp,
@@ -165,8 +166,10 @@ export function registerSessionCoreSweepDuties(): void {
       const { session, mailbox } = asSessionContext(ctx);
       // Ownership, not just liveness: a container still SPAWNING is about to
       // own outbound.db, and this reset writes it (mailbox seam PR 5, 7199be48).
-      if (!containerOwnsOutbound(session.id) && mailbox!.getProcessingClaimRows().length > 0) {
-        resetStuckProcessingRows(mailbox!, session, 'container not running');
+      if (mailbox!.getProcessingClaimRows().length > 0) {
+        writeOutboundWhenStopped(session, mailbox!, () =>
+          resetStuckProcessingRows(mailbox!, session, 'container not running'),
+        );
       }
     },
   });
@@ -188,8 +191,10 @@ export function registerSessionCoreSweepDuties(): void {
       // claims), and the ownership check is the added TOCTOU close. PR 5
       // replaced `alive` outright because there it was a local; here it is part
       // of the session-context contract other duties read.
-      if (!alive && hasOutbound && !containerOwnsOutbound(session.id)) {
-        resetStuckProcessingRows(mailbox!, session, 'container not running');
+      if (!alive && hasOutbound) {
+        writeOutboundWhenStopped(session, mailbox!, () =>
+          resetStuckProcessingRows(mailbox!, session, 'container not running'),
+        );
       }
     },
   });
@@ -200,7 +205,13 @@ export function registerSessionCoreSweepDuties(): void {
     // The same orphan-claim reset the tail runs, here for the post-kill path.
     // Both kill branches reset; only the reason differs.
     run: (ctx, _outcome, mailbox) => {
-      resetStuckProcessingRows(mailbox, ctx.session, ctx.killSnapshot!.reason);
+      // Per-write, not per-window: `runSweepKillFollowUps` awaits after every
+      // registered follow-up, so a replacement wake can take outbound ownership
+      // at a microtask boundary between them — after S15's notice and before
+      // this reset. The window's early-out is not enough on its own.
+      writeOutboundWhenStopped(ctx.session, mailbox, () =>
+        resetStuckProcessingRows(mailbox, ctx.session, ctx.killSnapshot!.reason),
+      );
     },
   });
 }

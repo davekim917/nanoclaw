@@ -42,8 +42,6 @@ const id = SWEEP_DUTY_INVENTORY;
 // ─── Scheduled-move recovery + audit-body prune (D3 / D4) ─────────────────────
 
 interface MoveRecoveryOptions {
-  /** Sessions root parent; defaults to the real DATA_DIR's parent of v2-sessions. */
-  dataDir?: string;
   nowMs?: number;
 }
 
@@ -123,8 +121,15 @@ function parseIntentDetail(detailJson: string | null): ParsedIntentDetail {
  */
 export async function recoverMoveIntents(centralDb: Database.Database, options: MoveRecoveryOptions): Promise<void> {
   const nowMs = options.nowMs ?? Date.now();
-  const dataDir = options.dataDir ?? path.dirname(sessionsBaseDir());
-  const sessionsRoot = options.dataDir ? path.join(options.dataDir, 'v2-sessions') : sessionsBaseDir();
+  // ONE sessions root, always the real one. `dataDir` used to be injectable and
+  // no production caller ever injected it — the sweep's only call site passes
+  // `{}`. Worse, once the restore moved onto the seam a non-default root
+  // silently SPLIT this function: the live count and the inbound.db pre-check
+  // honoured the injected root while `withExistingNanoclawSession` resolved
+  // through DATA_DIR, so reads and writes could address different trees. The
+  // option is gone rather than threaded, which makes that split unrepresentable.
+  const dataDir = path.dirname(sessionsBaseDir());
+  const sessionsRoot = sessionsBaseDir();
 
   let intents: Array<{
     session_id: string;
