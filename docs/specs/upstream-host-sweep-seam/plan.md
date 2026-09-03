@@ -484,7 +484,7 @@ Host, `vitest`. 70 cases.
 - **F-4.4** `src/host-sweep-registry.test.ts` › "the receipts prune is registered and therefore guarded" — the duty that had no try/catch of its own now runs through the registry wrapper; a throw does not abort the tick.
 
 **S2-PR5 — orchestrator, dormant (4)**
-- **F-5.1** `src/modules/sweep-orchestrator/orchestrator.test.ts` › "the task watchdog transitions and parent notifications are unchanged" — the 31 ported watchdog cases.
+- **F-5.1** `src/modules/sweep-orchestrator/orchestrator.test.ts` › "the task watchdog transitions and parent notifications are unchanged" — the ported watchdog cases (11 on `9078f5cf`; "31" was a stale count from the sizing table, corrected at build).
 - **F-5.2** same file › "auto-archive covers completed tasks older than 24h and never failed tasks" — ported.
 - **F-5.3** same file › "the dormant module takes no action when the spawn_task capability is revoked" — with the capability absent, the reconciler and watchdog duties run and change nothing.
 - **F-5.4** `src/host-sweep-registry.test.ts` › "reconciler, thread-close and watchdog run in tick:post-session" — the container-state ordering constraint survives.
@@ -541,6 +541,8 @@ Host, `vitest`. 70 cases.
 **S2-PR14 — final (2)**
 - **F-14.1** `src/host-sweep-registry.test.ts` › "host-sweep.ts contains no inline duty bodies" — it exports only the driver, registry and phase-list allowlist, and is under 300 lines.
 - **F-14.2** same file › "the registered duty set still matches the inventory after every family has moved" — R-7's assertion re-run at the end state.
+
+**Family-case rule (added at build, 2026-09-03, after Codex found it on PR 3, PR 4 and PR 8):** every family PR must, for each moved registration, drive the REGISTERED duty through the registry (obtain it by name, invoke `claims`/`run` with a mocked context) and assert the underlying dependency was reached — a case that calls the body directly proves nothing about the wrapper the PR actually wrote. Exclusive-chain assertions read the registry's actual order and each duty's `claims` presence (S14 = no predicate).
 
 Each PR lists which cases it makes pass. No case may be renamed or retargeted to a weaker assertion; if a criterion turns out wrong, `plan.md` is corrected first and the change recorded in `run.md`.
 
