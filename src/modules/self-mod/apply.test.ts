@@ -36,6 +36,7 @@ vi.mock('../../session-manager.js', async () => {
 });
 
 import { readContainerConfig, writeContainerConfig } from '../../container-config.js';
+import { writeSessionMessage } from '../../session-manager.js';
 import { createAgentGroup } from '../../db/agent-groups.js';
 import { closeDb, initTestDb, runMigrations } from '../../db/index.js';
 import { ensureContainerConfig, getContainerConfig } from '../../db/container-configs.js';
@@ -106,6 +107,31 @@ describe('applyAddMcpServer', () => {
     expect(file.mcpServers.existing).toBeDefined();
     expect(file.onecliSecrets).toEqual(['Keep-Me']);
     expect(JSON.parse(getContainerConfig('ag-1')!.mcp_servers)).toEqual(file.mcpServers);
+  });
+
+  it('tells the agent how a 401 gets fixed when the server authenticates', async () => {
+    // Declaring the placeholder wires the header; the gateway can only
+    // substitute a secret ASSIGNED to the group, and auto-created agents
+    // default to selective mode with nothing assigned.
+    await applyAddMcpServer(
+      {
+        name: 'datafold',
+        type: 'http',
+        url: 'https://app.datafold.com/mcp/',
+        headers: { Authorization: 'Key onecli-managed' },
+      },
+      session,
+    );
+    const note = vi.mocked(writeSessionMessage).mock.calls.at(-1)!;
+    const text = (JSON.parse(note[2].content) as { text: string }).text;
+    expect(text).toContain('401');
+    expect(text).toContain('onecliSecrets');
+
+    // A server with no credential header gets no such tail.
+    vi.mocked(writeSessionMessage).mockClear();
+    await applyAddMcpServer({ name: 'deepwiki', type: 'http', url: 'https://mcp.deepwiki.com/mcp' }, session);
+    const plain = vi.mocked(writeSessionMessage).mock.calls.at(-1)!;
+    expect((JSON.parse(plain[2].content) as { text: string }).text).not.toContain('401');
   });
 
   it('writes a stdio server the same way', async () => {

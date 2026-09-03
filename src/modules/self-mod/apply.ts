@@ -154,6 +154,9 @@ export async function applyAddMcpServer(payload: Record<string, unknown>, sessio
   });
   updateContainerConfigJson(agentGroup.id, 'mcp_servers', fileConfig.mcpServers ?? {});
 
+  // Declaring the placeholder wires the header; it does not grant the secret.
+  const needsCredential = serverConfig.type === 'http' && serverConfig.headers !== undefined;
+
   await writeSessionMessage(session.agent_group_id, session.id, {
     id: `appr-note-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
     kind: 'chat',
@@ -162,7 +165,17 @@ export async function applyAddMcpServer(payload: Record<string, unknown>, sessio
     channelType: 'agent',
     threadId: null,
     content: JSON.stringify({
-      text: `MCP server "${name}" added. Verify it's available (e.g. list your tools) and report the result to the user.`,
+      // A remote server declared with a placeholder header still needs the
+      // matching vault secret ASSIGNED to this group before the gateway can
+      // substitute it. Auto-created agents default to `selective` mode with
+      // nothing assigned, so the symptom is a 401 from an API whose
+      // credential is in the vault — name the remedy here rather than leave
+      // the agent to rediscover it (CLAUDE.md, Secrets / Credentials / OneCLI).
+      text:
+        `MCP server "${name}" added. Verify it's available (e.g. list your tools) and report the result to the user.` +
+        (needsCredential
+          ? " It authenticates through the OneCLI gateway: if calls come back 401, the credential exists but is not assigned to this agent group — an operator adds it to `onecliSecrets` in the group's container.json, or runs `onecli agents set-secrets`."
+          : ''),
       sender: 'system',
       senderId: 'system',
     }),

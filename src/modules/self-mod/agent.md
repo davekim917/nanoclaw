@@ -26,9 +26,12 @@ only with admin approval.
   `MCP-Protocol-Version`, `X-Api-Version`, `X-Request-Id`); every other header
   must be exactly `"onecli-managed"` or an auth scheme followed by it
   (`"Bearer onecli-managed"`), whatever its name and however short its value.
-  The OneCLI gateway substitutes the real secret at the proxy boundary. A
-  declared `type` must agree with the fields — `stdio` with `command`, `http`
-  with `url`. A remote URL is stored verbatim, so
+  The OneCLI gateway substitutes the real secret at the proxy boundary, but
+  only for a secret ASSIGNED to your group: a 401 from a newly added remote
+  server means the credential is in the vault and not assigned, which an
+  operator fixes via `onecliSecrets` in container.json or
+  `onecli agents set-secrets`. A declared `type` must agree with the fields —
+  `stdio` with `command`, `http` with `url`. A remote URL is stored verbatim, so
   never put a secret in it — recognizable credential shapes are rejected, but
   an opaque path segment cannot be told apart from a tenant id and is only
   flagged for the approving admin.
