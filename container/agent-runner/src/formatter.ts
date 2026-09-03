@@ -1,7 +1,7 @@
 import { getSessionRouting } from './db/session-routing.js';
 import { findByRouting } from './destinations.js';
 import type { MessageInRow } from './db/messages-in.js';
-import { TIMEZONE, formatLocalTime } from './timezone.js';
+import { TIMEZONE, formatLocalTime, formatLocalDateTimeFull } from './timezone.js';
 
 /**
  * Command categories for messages starting with '/'.
@@ -475,11 +475,7 @@ function formatTaskMessage(msg: MessageInRow): string {
   // at 11:30 (container busy, host restart, ceiling respawn, a paused series
   // resumed days later), and without this the agent has no wall clock at all —
   // "today" and "yesterday" in the prompt resolve against nothing.
-  const currentTime = new Date().toLocaleString('en-US', {
-    timeZone: TIMEZONE,
-    dateStyle: 'full',
-    timeStyle: 'short',
-  });
+  const currentTime = formatLocalDateTimeFull(new Date(), TIMEZONE);
   const parts: string[] = [];
   if (content.scriptOutput) {
     parts.push('Script output:', JSON.stringify(content.scriptOutput, null, 2), '');

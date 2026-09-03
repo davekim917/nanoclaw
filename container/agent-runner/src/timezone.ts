@@ -49,6 +49,29 @@ export function formatLocalTime(utcIso: string, timezone: string): string {
 }
 
 /**
+ * Full weekday-qualified wall clock for a moment: "Monday, January 5, 2026 at
+ * 11:30 AM" in `timezone`. Used for the `current_time` attribute on a task
+ * run, where the agent has no chat history to anchor "today" against and the
+ * weekday is the part that makes a relative date checkable.
+ *
+ * Lives here rather than inline at the call site so display policy stays in
+ * one module and picks up the `resolveTimezone` fallback: an invalid TZ
+ * renders UTC instead of throwing mid-prompt.
+ *
+ * Container-only, deliberately. The alignment this module keeps with
+ * src/timezone.ts is about behaviour that has to match ACROSS the session-DB
+ * boundary; nothing on the host renders this shape, and mirroring an uncalled
+ * export there would be dead code.
+ */
+export function formatLocalDateTimeFull(date: Date, timezone: string): string {
+  return date.toLocaleString('en-US', {
+    timeZone: resolveTimezone(timezone),
+    dateStyle: 'full',
+    timeStyle: 'short',
+  });
+}
+
+/**
  * Compact sortable local stamp for log lines: "YYYY-MM-DD HH:mm" in `timezone`.
  * (sv-SE is the one locale whose default rendering is this exact shape.)
  */

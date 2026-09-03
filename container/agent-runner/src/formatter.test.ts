@@ -23,7 +23,7 @@ import {
   isClearCommand,
 } from './formatter.js';
 import type { MessageInRow } from './db/messages-in.js';
-import { TIMEZONE, formatLocalTime } from './timezone.js';
+import { TIMEZONE, formatLocalTime, formatLocalDateTimeFull } from './timezone.js';
 
 // seq is NULL-allowed in the schema; assign monotonically per test so
 // `getPendingMessages` ORDER BY seq is deterministic.
@@ -195,12 +195,7 @@ describe('task timestamps', () => {
     // Generated at format time, in the group timezone — a weekday-qualified
     // wall clock the agent can anchor relative dates against.
     expect(result).toMatch(/current_time="(?:Sunday|Monday|Tuesday|Wednesday|Thursday|Friday|Saturday), [^"]+"/);
-    const expected = new Date().toLocaleString('en-US', {
-      timeZone: TIMEZONE,
-      dateStyle: 'full',
-      timeStyle: 'short',
-    });
-    expect(result).toContain(`current_time="${expected}"`);
+    expect(result).toContain(`current_time="${formatLocalDateTimeFull(new Date(), TIMEZONE)}"`);
   });
 
   it('keeps script output rendering intact alongside the new attribute', () => {
