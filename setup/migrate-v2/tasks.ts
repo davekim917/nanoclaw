@@ -132,24 +132,39 @@ async function main(): Promise<void> {
   for (const t of activeTasks) {
     try {
       const ag = getAgentGroupByFolder(t.group_folder);
-      if (!ag) { skipped++; continue; }
+      if (!ag) {
+        skipped++;
+        continue;
+      }
 
       const parsed = parseJid(t.chat_jid);
-      if (!parsed) { skipped++; continue; }
+      if (!parsed) {
+        skipped++;
+        continue;
+      }
 
       let platformId: string;
       if (parsed.channel_type === 'discord') {
         const resolved = discordResolver?.resolve(parsed.id) ?? null;
-        if (!resolved) { skipped++; continue; }
+        if (!resolved) {
+          skipped++;
+          continue;
+        }
         platformId = resolved;
       } else {
         platformId = v2PlatformId(parsed.channel_type, t.chat_jid);
       }
       const mg = getMessagingGroupByPlatform(parsed.channel_type, platformId);
-      if (!mg) { skipped++; continue; }
+      if (!mg) {
+        skipped++;
+        continue;
+      }
 
       const scheduling = toCron(t);
-      if (!scheduling) { skipped++; continue; }
+      if (!scheduling) {
+        skipped++;
+        continue;
+      }
 
       const { session } = resolveSession(ag.id, mg.id, null, 'shared');
       const inboxDb = openInboundDb(inboundDbPath(ag.id, session.id));
@@ -157,10 +172,13 @@ async function main(): Promise<void> {
         // What the removed session-manager wrapper did on every open.
         migrateMessagesInTable(inboxDb);
         // Idempotence check
-        const existing = inboxDb
-          .prepare("SELECT id FROM messages_in WHERE id = ? AND kind = 'task'")
-          .get(t.id) as { id: string } | undefined;
-        if (existing) { skipped++; continue; }
+        const existing = inboxDb.prepare("SELECT id FROM messages_in WHERE id = ? AND kind = 'task'").get(t.id) as
+          | { id: string }
+          | undefined;
+        if (existing) {
+          skipped++;
+          continue;
+        }
 
         insertTaskRow(inboxDb, {
           id: t.id,
