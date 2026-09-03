@@ -1,8 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it } from 'bun:test';
 import { Database } from 'bun:sqlite';
 
-import { clearProviderHealthState, setProviderHealthState } from './connection.js';
-
+import { clearProviderHealthState, setProviderHealthState } from './container-state.js';
 let outbound: Database;
 
 beforeEach(() => {

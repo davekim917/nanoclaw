@@ -1,5 +1,5 @@
 /** Singular mailbox composition slot. See docs/agent-mailbox-seam-migration.md. */
 import { registerAgentMailbox } from './index.js';
-import { SqliteAgentMailbox } from './sqlite/index.js';
+import { NanoclawAgentMailbox } from '../modules/mailbox/index.js';
 
-registerAgentMailbox(() => new SqliteAgentMailbox());
+registerAgentMailbox(() => new NanoclawAgentMailbox());
