@@ -44,7 +44,7 @@ All are committed. CI and the Dockerfile run frozen/hash-locked install variants
 - **BuildKit cache mounts** — `/var/cache/apt`, `/var/lib/apt`, `/root/.bun/install/cache`, `/root/.cache/pnpm`. Rebuilds where `package.json`/`bun.lock` haven't changed are fast. Requires BuildKit (default on Docker 23+, Apple Container-compat).
 - **`tini` as init** — reaps Chromium zombies, forwards signals so in-flight `outbound.db` writes finalize on SIGTERM.
 - **`entrypoint.sh`** (extracted) — `exec bun run /app/src/index.ts` under tini. Readable and diffable.
-- **No compiled `/app/dist`** — Bun runs TS directly. The host also mounts fresh source over `/app/src` at session start, so host edits take effect without rebuilding the image.
+- **No compiled `/app/dist`** — Bun runs TS directly. The host also mounts source over `/app/src` at session start. Since PR 0 of the mailbox seam (`src/agent-runner-source.ts`), that mount is a snapshot of `container/agent-runner/src` taken once at host boot, not the live checkout — a runner-source edit takes effect at the next host restart, not the next spawn. `NANOCLAW_AGENT_RUNNER_SRC_LIVE=1` mounts the checkout directly for local dev.
 
 ## Build versus activation
 

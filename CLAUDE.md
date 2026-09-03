@@ -45,7 +45,7 @@ Most of `src/` is discoverable by reading it. These are the ones you would not g
 - **`src/host-sweep.ts`** — one 60s sweep owns `processing_ack` sync, stale detection, due-message wake, recurrence, ceiling-kill accountability. Anything "on a timer" happens here.
 - **`src/router.ts` → `src/delivery.ts`** — the two ends of the message path; everything else hangs off them.
 - **`scripts/vendor-design-artifact-loop.ts`** — the design-artifact-loop skill and `design_review` engine are **vendored**; develop in `~/plugins/design-artifact-loop`, not in-tree — `src/design-artifact-loop-vendor.test.ts` fails on drift.
-- **`src/group-init.ts`** — the agent-runner source is a shared read-only mount, NOT copied per group; editing it affects every group next spawn.
+- **`src/group-init.ts`** — the agent-runner source is a shared read-only mount, NOT copied per group; the agent-runner source is snapshotted at host boot (`src/agent-runner-source.ts`) and the snapshot is mounted read-only for every group; a source edit takes effect at the next host restart, not the next spawn (`NANOCLAW_AGENT_RUNNER_SRC_LIVE=1` mounts the checkout for local dev).
 
 ## Admin CLI (`ncl`)
 
