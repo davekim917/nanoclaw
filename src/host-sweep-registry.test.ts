@@ -235,6 +235,11 @@ import {
   type SweepSessionContext,
   type SweepTickContext,
 } from './host-sweep.js';
+// Registers S11/S14/S16 as a duty source at import time — needed so
+// `_resetSweepRegistryForTesting()`'s default replay (every recorded source,
+// not just the in-file built-ins) still surfaces the moved duties for R-7,
+// R-10 and R-11.
+import './modules/sweep-container-health/index.js';
 import { log } from './log.js';
 // Family module side-effect import (S2-PR7): registers T11
 // (scheduled-move-recovery) and T12 (audit-body-prune) as a duty source, so
