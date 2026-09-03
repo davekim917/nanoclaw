@@ -89,7 +89,7 @@ function childProcessTripwireFactory(record: string[]): Record<string, unknown> 
     (name: string) =>
     (...args: unknown[]): never => {
       record.push(name);
-      throw new Error(`host-sweep-registry.test: real process spawn attempted (${name}(${JSON.stringify(args[0])}))`);
+      throw new Error(`host-lifecycle-timers.test: real process spawn attempted (${name}(${JSON.stringify(args[0])}))`);
     };
   const members = {
     exec: spawnAttempted('exec'),
@@ -105,7 +105,7 @@ function childProcessTripwireFactory(record: string[]): Record<string, unknown> 
 
 function mockWorktreeCleanupDeps(
   logMock: Record<string, ReturnType<typeof vi.fn>>,
-  dataDir = '/tmp/host-sweep-registry-test',
+  dataDir = '/tmp/host-lifecycle-timers-test',
 ): void {
   vi.doMock('./config.js', () => ({
     DATA_DIR: dataDir,
@@ -278,7 +278,7 @@ describe("module intervals are unref'd and cleared on shutdown", () => {
     // repo-freshness (both resolve their real targets from it, and an empty
     // dir means zero targets, so neither ever reaches its own git calls); a
     // fake-home this test never populates for plugin-updater, below.
-    const tmpRoot = fs.mkdtempSync('/tmp/host-sweep-registry-t4-');
+    const tmpRoot = fs.mkdtempSync('/tmp/host-lifecycle-timers-t4-');
     // Vitest does not intercept `os`/`node:os` in this project's config
     // (verified: vi.doMock('os', …) has zero effect on a dynamically
     // imported consumer's os.homedir()) — so plugin-updater's own
