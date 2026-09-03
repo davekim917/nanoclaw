@@ -16,9 +16,6 @@ import type Database from 'better-sqlite3';
 
 import { withExistingMailboxSession, withMailboxSession } from '../../session-manager.js';
 
-/** Test-only depth probe over the nesting guard `session-manager.ts` owns (seam 2 R-10). */
-export { _mailboxSessionDepthForTesting } from '../../session-manager.js';
-
 import { sessionMailboxPath } from './index.js';
 import { openOutboundDbWritable, withOpenedSessionDb } from './openers.js';
 import type { NanoclawMailboxSession } from './index.js';
