@@ -19,8 +19,7 @@ import { log } from '../log.js';
 import { withExistingMailboxSession } from '../session-manager.js';
 import { dispatch } from './dispatch.js';
 import type { RequestFrame, ResponseFrame } from './frame.js';
-import { claimCliRequest, completeCliRequest, releaseCliRequest } from './request-ledger.js';
-import type { Session } from '../types.js';
+import { claimCliRequest, completeCliRequest } from './request-ledger.js';
 
 registerDeliveryAction(
   'cli_request',
@@ -42,7 +41,7 @@ registerDeliveryAction(
       messagingGroupId: session.messaging_group_id ?? '',
     };
 
-    const response = await executeOnce(req, ctx, session);
+    const response = await executeOnce(req, ctx);
 
     // Write response to inbound.db so the container can read it. Its own
     // short mailbox session, because the delivery loop holds none while a
@@ -101,23 +100,30 @@ registerDeliveryAction(
  * Three outcomes:
  *  - fresh      → dispatch, record the frame, return it.
  *  - done       → a previous attempt already ran it; replay the stored frame.
- *  - executing  → a previous attempt claimed it and never recorded an outcome,
- *                 which only happens when the host died mid-dispatch. Whether
- *                 the command applied is unknowable, so answer the agent
- *                 honestly instead of guessing by re-running it.
+ *  - executing  → a previous attempt claimed it and never recorded an outcome:
+ *                 the host died mid-dispatch, or `dispatch()` itself threw.
+ *                 Whether the command applied is unknowable, so answer the
+ *                 agent honestly instead of guessing by re-running it.
+ *
+ * A thrown `dispatch()` deliberately leaves its claim standing. It is tempting
+ * to hand the claim back on the grounds that `dispatch()` converts every
+ * command-handler failure into an error frame, so a throw must have come from
+ * its own pre-handler plumbing — but "the command handler never ran" is not
+ * "nothing happened". The hold path posts an approval card (writing the
+ * pending_approvals row, then delivering it) and can still reject afterwards,
+ * and a released claim would card the same request a second time.
  */
 async function executeOnce(
   req: RequestFrame,
   ctx: { caller: 'agent'; sessionId: string; agentGroupId: string; messagingGroupId: string },
-  session: Session,
 ): Promise<ResponseFrame> {
-  const claim = claimCliRequest(session.id, req.id, req.command);
+  const claim = claimCliRequest(ctx.sessionId, req.id, req.command);
 
   if (claim.state === 'done') {
     log.info('CLI request replayed from the execution ledger — command not re-run', {
       requestId: req.id,
       command: req.command,
-      sessionId: session.id,
+      sessionId: ctx.sessionId,
     });
     return claim.response;
   }
@@ -126,7 +132,7 @@ async function executeOnce(
     log.warn('CLI request was already dispatched by an earlier attempt — refusing to re-run', {
       requestId: req.id,
       command: req.command,
-      sessionId: session.id,
+      sessionId: ctx.sessionId,
     });
     const ambiguous: ResponseFrame = {
       id: req.id,
@@ -134,28 +140,19 @@ async function executeOnce(
       error: {
         code: 'handler-error',
         message:
-          `An earlier attempt at this \`ncl ${req.command}\` was dispatched and its outcome was never recorded ` +
-          `(the host restarted mid-command). It was NOT run again — check whether it took effect before retrying.`,
+          `An earlier attempt at this \`ncl ${req.command}\` was dispatched and left no result to replay. ` +
+          `It was NOT run again — check whether it took effect, then reissue the command if it did not.`,
       },
     };
-    completeCliRequest(session.id, req.id, ambiguous);
+    completeCliRequest(ctx.sessionId, req.id, ambiguous);
     return ambiguous;
   }
 
-  log.info('CLI request from agent', { requestId: req.id, command: req.command, sessionId: session.id });
+  log.info('CLI request from agent', { requestId: req.id, command: req.command, sessionId: ctx.sessionId });
 
-  let response: ResponseFrame;
-  try {
-    response = await dispatch(req, ctx);
-  } catch (err) {
-    // `dispatch()` converts every command-handler failure into an error frame,
-    // so an exception here escaped its pre-handler plumbing and the command
-    // never ran. Drop the claim so the delivery loop's retry gets a real first
-    // attempt — the pre-#273 behavior for a genuinely failed dispatch.
-    releaseCliRequest(session.id, req.id);
-    throw err;
-  }
-
-  completeCliRequest(session.id, req.id, response);
+  // A throw propagates with the claim still standing, so the delivery loop's
+  // retry takes the `executing` branch above rather than dispatching again.
+  const response = await dispatch(req, ctx);
+  completeCliRequest(ctx.sessionId, req.id, response);
   return response;
 }

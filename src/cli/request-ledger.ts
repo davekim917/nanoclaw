@@ -10,6 +10,10 @@
  * after it, so the retry replays a stored result instead of executing again.
  * The key is (session_id, request_id): request ids are minted in-container as
  * `cli-<ms>-<6 random chars>` and are only unique within a session.
+ *
+ * A claim is never handed back. Once the host has started acting on a request
+ * it cannot prove that nothing happened — `dispatch()` posts approval cards
+ * before it can fail, so an exception is "outcome unknown", not "nothing ran".
  */
 import { getDb } from '../db/connection.js';
 import { log } from '../log.js';
@@ -19,9 +23,10 @@ export type CliRequestClaim =
   /** Nothing has run for this request id — the caller owns dispatching it. */
   | { state: 'fresh' }
   /**
-   * A previous attempt claimed the request and never recorded an outcome — the
-   * host died between dispatch and completion. The command may or may not have
-   * applied, so it must not be re-run.
+   * A previous attempt claimed the request and left no result to replay: it is
+   * still running, the host died mid-dispatch, `dispatch()` threw, or the prune
+   * dropped a week-old payload. The command may or may not have applied, so it
+   * must not be re-run.
    */
   | { state: 'executing' }
   /** The command already ran; replay this frame instead of dispatching. */
@@ -98,21 +103,6 @@ export function completeCliRequest(sessionId: string, requestId: string, respons
       response: JSON.stringify(response),
       completed_at: new Date().toISOString(),
     });
-}
-
-/**
- * Drop a claim whose command provably never ran.
- *
- * `dispatch()` turns every command-handler failure into an error frame, so an
- * exception escaping it comes from its own pre-handler plumbing — registry
- * lookup, container-config read, guard evaluation, approval carding. Releasing
- * the claim there keeps the pre-#273 behavior for a genuinely failed dispatch:
- * the delivery loop retries and the command gets its first real attempt.
- */
-export function releaseCliRequest(sessionId: string, requestId: string): void {
-  getDb()
-    .prepare(`DELETE FROM cli_request_executions WHERE session_id = ? AND request_id = ? AND status = 'executing'`)
-    .run(sessionId, requestId);
 }
 
 /**

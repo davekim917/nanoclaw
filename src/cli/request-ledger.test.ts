@@ -33,7 +33,7 @@ import { getDeliveryAction, type DeliveryActionHandler } from '../delivery.js';
 import { inboundDbPath, initSessionFolder } from '../session-manager.js';
 import type { Session } from '../types.js';
 import './delivery-action.js';
-import { claimCliRequest, completeCliRequest, pruneCliRequestExecutions, releaseCliRequest } from './request-ledger.js';
+import { claimCliRequest, completeCliRequest, pruneCliRequestExecutions } from './request-ledger.js';
 
 const AG = 'ag-ledger';
 const SESSION_ID = 'sess-ledger';
@@ -157,24 +157,24 @@ describe('cli_request execution is at most once per request id', () => {
     expect(responseRows()).toHaveLength(1);
   });
 
-  it('a dispatch that throws before the command ran is retried as before', async () => {
-    // `dispatch()` turns handler failures into error frames, so a throw is its
-    // own pre-handler plumbing failing — the command never ran, and the retry
-    // must be a real first attempt.
+  it('a dispatch that throws keeps its claim — the retry answers, it does not re-dispatch', async () => {
+    // Tempting to release the claim here: `dispatch()` converts every
+    // command-handler failure into an error frame, so a throw came from its own
+    // pre-handler plumbing. But the hold path writes a pending_approvals row
+    // and delivers a card BEFORE it can fail, so a released claim would card
+    // the same request twice.
     dispatch.mockRejectedValueOnce(new Error('container config read failed'));
 
     await expect(attempt(true)).rejects.toThrow('container config read failed');
-    expect(ledgerRows()).toHaveLength(0); // claim released
+    expect(ledgerRows()).toEqual([{ status: 'executing', response: null }]);
     expect(responseRows()).toHaveLength(0);
 
     await attempt(true);
 
-    expect(dispatch).toHaveBeenCalledTimes(2);
-    expect(JSON.parse(responseRows()[0].content).frame).toEqual({
-      id: 'req-1',
-      ok: true,
-      data: { id: 'task-created-once' },
-    });
+    expect(dispatch).toHaveBeenCalledTimes(1); // not re-dispatched
+    const frame = JSON.parse(responseRows()[0].content).frame;
+    expect(frame.ok).toBe(false);
+    expect(frame.error.message).toMatch(/NOT run again/);
   });
 
   it('a claim left executing by a host that died mid-command is answered, never re-run', async () => {
@@ -213,15 +213,6 @@ describe('ledger mechanics', () => {
     completeCliRequest(SESSION_ID, 'req-9', { id: 'req-9', ok: true, data: 'second' });
     const claim = claimCliRequest(SESSION_ID, 'req-9', 'groups-list');
     expect(claim).toEqual({ state: 'done', response: { id: 'req-9', ok: true, data: 'first' } });
-  });
-
-  it('releaseCliRequest frees an executing claim but not a completed one', () => {
-    releaseCliRequest(SESSION_ID, 'req-9');
-    expect(claimCliRequest(SESSION_ID, 'req-9', 'groups-list').state).toBe('fresh');
-
-    completeCliRequest(SESSION_ID, 'req-9', { id: 'req-9', ok: true, data: 'kept' });
-    releaseCliRequest(SESSION_ID, 'req-9');
-    expect(claimCliRequest(SESSION_ID, 'req-9', 'groups-list').state).toBe('done');
   });
 
   it('an unparseable stored frame reports ambiguity rather than re-running the command', () => {
