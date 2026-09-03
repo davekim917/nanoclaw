@@ -1002,6 +1002,18 @@ export function _applyCeilingFollowUpForTesting(
 // Failed-provider self-heal (S11), running-container SLA (S14) and the OOM /
 // memory-pressure notice (S16) moved to
 // `src/modules/sweep-container-health/index.ts` (convergence seam 2, PR 10).
+//
+// `providerFailedTicks` itself stays here, exported, rather than moving with
+// the rest of S11's body: the driver's own `!alive` cleanup below must stay
+// SYNCHRONOUS (a dynamic import there proved to add an await suspension
+// point the pre-seam code never had, letting a concurrent wake observe a
+// stale `alive=false` across the gap — Codex review, S2-PR10). The map's
+// SEMANTICS — the two-tick debounce, read and written only by
+// `observeProviderStatus`/`decideProviderHeal` — belong entirely to S11 in
+// `sweep-container-health`; that module imports this export directly
+// (module → host-sweep.js, the same direction every family already uses for
+// `SWEEP_DUTY_INVENTORY` — no cycle, no TDZ).
+export const providerFailedTicks = new Map<string, number>();
 
 /**
  * Run one short mailbox session for a session id.
@@ -1407,16 +1419,11 @@ async function sweepSession(session: Session, tick: SweepTickContext): Promise<n
 
     // A container that is gone cannot be mid-failure. Clearing here stops a
     // fresh container from inheriting the dead one's half-finished debounce and
-    // being killed on its first 'failed' observation. The debounce map moved
-    // into the container-health family module (constraint 14); a dynamic
-    // import here (module already loaded well before any tick runs) avoids a
-    // static import cycle with that module's own top-level
-    // registerSweepDutySource call, which needs THIS file's registries already
-    // initialized.
-    if (!alive) {
-      const { clearProviderFailedTicks } = await import('./modules/sweep-container-health/index.js');
-      clearProviderFailedTicks(session.id);
-    }
+    // being killed on its first 'failed' observation. Synchronous, same as
+    // pre-seam: a dynamic import here would add an await suspension point on
+    // this branch that never existed before, letting a concurrent wake
+    // observe a stale `alive=false` across the gap.
+    if (!alive) providerFailedTicks.delete(session.id);
 
     // ── W5: session:tail ─────────────────────────────────────────────────────
     window = 'session:tail';
