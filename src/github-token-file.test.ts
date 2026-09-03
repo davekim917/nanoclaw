@@ -8,6 +8,7 @@ import {
   GH_TOKEN_CONTAINER_DIR,
   GH_TOKEN_CONTAINER_PATH,
   clearGroupTokenRefreshers,
+  containerRunsAsHostUser,
   githubTokenInEnv,
   groupTokenPath,
   planGitHubTokenSpawn,
@@ -107,7 +108,7 @@ describe('readGroupGitHubTokenFile', () => {
 
 describe('planGitHubTokenSpawn', () => {
   it('by default puts a PATH in the spec and no credential value anywhere', () => {
-    const plan = planGitHubTokenSpawn({ agentGroupId: 'group-a', token: 'ghs_alpha', env: {}, dataDir });
+    const plan = planGitHubTokenSpawn({ agentGroupId: 'group-a', token: 'ghs_alpha', env: {}, dataDir, hostUid: 1001 });
 
     expect(plan.envArgs).toEqual(['-e', `GITHUB_TOKEN_FILE=${GH_TOKEN_CONTAINER_PATH}`]);
     expect(plan.envArgs.join(' ')).not.toContain('ghs_alpha');
@@ -120,7 +121,7 @@ describe('planGitHubTokenSpawn', () => {
   });
 
   it('mounts the group directory read-only, not the file — the host rewrites the file underneath it', () => {
-    const plan = planGitHubTokenSpawn({ agentGroupId: 'group-a', token: 'ghs_alpha', env: {}, dataDir });
+    const plan = planGitHubTokenSpawn({ agentGroupId: 'group-a', token: 'ghs_alpha', env: {}, dataDir, hostUid: 1001 });
 
     expect(plan.mount?.readonly).toBe(true);
     expect(fs.statSync(plan.mount!.hostPath).isDirectory()).toBe(true);
@@ -132,6 +133,7 @@ describe('planGitHubTokenSpawn', () => {
       token: 'ghs_alpha',
       env: { GITHUB_TOKEN_IN_ENV: '1' },
       dataDir,
+      hostUid: 1001,
     });
 
     expect(plan.envArgs).toEqual(['-e', 'GH_TOKEN=ghs_alpha', '-e', 'GITHUB_TOKEN=ghs_alpha']);
@@ -151,7 +153,7 @@ describe('planGitHubTokenSpawn', () => {
 
 describe('refreshGroupGitHubTokenFiles', () => {
   it('rewrites in place when the resolver returns a new token, so a running container sees it', async () => {
-    planGitHubTokenSpawn({ agentGroupId: 'group-a', token: 'ghs_old', env: {}, dataDir });
+    planGitHubTokenSpawn({ agentGroupId: 'group-a', token: 'ghs_old', env: {}, dataDir, hostUid: 1001 });
     // Stand in for the running container: a descriptor opened at spawn time.
     const fd = fs.openSync(groupTokenPath('group-a', dataDir), 'r');
     registerGroupTokenRefresher('group-a', async () => 'ghs_new');
@@ -168,15 +170,15 @@ describe('refreshGroupGitHubTokenFiles', () => {
   });
 
   it('is a no-op when the token is unchanged', async () => {
-    planGitHubTokenSpawn({ agentGroupId: 'group-a', token: 'ghs_same', env: {}, dataDir });
+    planGitHubTokenSpawn({ agentGroupId: 'group-a', token: 'ghs_same', env: {}, dataDir, hostUid: 1001 });
     registerGroupTokenRefresher('group-a', async () => 'ghs_same');
 
     await expect(refreshGroupGitHubTokenFiles(dataDir)).resolves.toBe(0);
   });
 
   it('leaves the last good token in place when a resolver fails or returns nothing', async () => {
-    planGitHubTokenSpawn({ agentGroupId: 'group-a', token: 'ghs_good', env: {}, dataDir });
-    planGitHubTokenSpawn({ agentGroupId: 'group-b', token: 'ghs_good_b', env: {}, dataDir });
+    planGitHubTokenSpawn({ agentGroupId: 'group-a', token: 'ghs_good', env: {}, dataDir, hostUid: 1001 });
+    planGitHubTokenSpawn({ agentGroupId: 'group-b', token: 'ghs_good_b', env: {}, dataDir, hostUid: 1001 });
     registerGroupTokenRefresher('group-a', async () => {
       throw new Error('mint down');
     });
@@ -188,8 +190,8 @@ describe('refreshGroupGitHubTokenFiles', () => {
   });
 
   it('one failing group does not stop the others', async () => {
-    planGitHubTokenSpawn({ agentGroupId: 'group-a', token: 'ghs_old_a', env: {}, dataDir });
-    planGitHubTokenSpawn({ agentGroupId: 'group-b', token: 'ghs_old_b', env: {}, dataDir });
+    planGitHubTokenSpawn({ agentGroupId: 'group-a', token: 'ghs_old_a', env: {}, dataDir, hostUid: 1001 });
+    planGitHubTokenSpawn({ agentGroupId: 'group-b', token: 'ghs_old_b', env: {}, dataDir, hostUid: 1001 });
     registerGroupTokenRefresher('group-a', async () => {
       throw new Error('mint down');
     });
@@ -200,7 +202,7 @@ describe('refreshGroupGitHubTokenFiles', () => {
   });
 
   it('re-registering a group replaces its resolver instead of accumulating entries', async () => {
-    planGitHubTokenSpawn({ agentGroupId: 'group-a', token: 'ghs_old', env: {}, dataDir });
+    planGitHubTokenSpawn({ agentGroupId: 'group-a', token: 'ghs_old', env: {}, dataDir, hostUid: 1001 });
     registerGroupTokenRefresher('group-a', async () => 'ghs_first');
     registerGroupTokenRefresher('group-a', async () => 'ghs_second');
 
@@ -220,5 +222,81 @@ describe('path safety', () => {
   it('locks down the shared gh-token parent directory too', () => {
     writeGroupGitHubTokenFile('ag-000000000000-example', 'ghs_x', dataDir);
     expect(fs.statSync(path.join(dataDir, 'gh-token')).mode & 0o777).toBe(0o700);
+  });
+});
+
+describe('refresh never creates a file', () => {
+  it('does not write a token file for a group that spawned under the rollback flag', async () => {
+    planGitHubTokenSpawn({
+      agentGroupId: 'group-a',
+      token: 'ghs_env',
+      env: { GITHUB_TOKEN_IN_ENV: '1' },
+      dataDir,
+      hostUid: 1001,
+    });
+    // A caller that registered anyway must still not put a credential on disk.
+    registerGroupTokenRefresher('group-a', async () => 'ghs_env');
+
+    await expect(refreshGroupGitHubTokenFiles(dataDir)).resolves.toBe(0);
+    expect(fs.existsSync(groupTokenPath('group-a', dataDir))).toBe(false);
+  });
+});
+
+describe('container uid alignment', () => {
+  it('knows which host uids get --user, and therefore which ones can use the file lane', () => {
+    expect(containerRunsAsHostUser(1001)).toBe(true);
+    expect(containerRunsAsHostUser(501)).toBe(true);
+    // buildContainerArgs omits --user for these two, so the container runs as
+    // the image's own uid instead and cannot read a host-owned 0600 file.
+    expect(containerRunsAsHostUser(0)).toBe(false);
+    expect(containerRunsAsHostUser(1000)).toBe(false);
+    // Omitting the argument means "this process", which is how the spawn path
+    // calls it — not an unknown uid.
+    expect(containerRunsAsHostUser()).toBe(containerRunsAsHostUser(process.getuid?.()));
+  });
+
+  it('falls back to env forwarding when the container will not run as the host user', () => {
+    for (const hostUid of [0, 1000]) {
+      const plan = planGitHubTokenSpawn({
+        agentGroupId: `group-${hostUid}`,
+        token: 'ghs_alpha',
+        env: {},
+        dataDir,
+        hostUid,
+      });
+
+      expect(plan.mount).toBeUndefined();
+      expect(plan.envArgs).toEqual(['-e', 'GH_TOKEN=ghs_alpha', '-e', 'GITHUB_TOKEN=ghs_alpha']);
+      // Nothing on disk: a file the container can only get EACCES on is worse
+      // than the env value, and it would be a credential at rest for nothing.
+      expect(fs.existsSync(groupTokenPath(`group-${hostUid}`, dataDir))).toBe(false);
+    }
+  });
+});
+
+describe('refresh concurrency', () => {
+  it('resolves groups together, so a stalled mint costs one timeout rather than one per group', async () => {
+    const started: number[] = [];
+    let release: () => void = () => {};
+    const gate = new Promise<void>((r) => {
+      release = r;
+    });
+    for (const id of ['group-a', 'group-b', 'group-c']) {
+      planGitHubTokenSpawn({ agentGroupId: id, token: 'ghs_old', env: {}, dataDir, hostUid: 1001 });
+      registerGroupTokenRefresher(id, async () => {
+        started.push(Date.now());
+        await gate;
+        return 'ghs_new';
+      });
+    }
+
+    const done = refreshGroupGitHubTokenFiles(dataDir);
+    // All three resolvers must be in flight before any of them is allowed to
+    // finish. Serial awaits would deadlock here instead of reaching 3.
+    await new Promise((r) => setImmediate(r));
+    expect(started.length).toBe(3);
+
+    release();
+    await expect(done).resolves.toBe(3);
   });
 });
