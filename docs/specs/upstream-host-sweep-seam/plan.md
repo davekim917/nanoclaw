@@ -6,7 +6,7 @@ Program: upstream convergence, seam 2 (`groups/_ops/upstream-rebaseline-2026-09/
 Upstream target: `nanocoai/nanoclaw` `5c3082a1` (2.3.0, 2026-09-01). `src/host-lifecycle.ts` is byte-identical at `5c3082a1` and at `upstream/main` `0d9328d2` (sha256 `fbf37333…`, verified 2026-09-03), so the port does not age before the next sync.
 Fork base: `origin/feat/mailbox-seam-pr5-sweep-family` = `756f5d02` — a stack of mailbox PRs 1, 2 and 5, 28 commits off merge-base `167c96e6`. Every fork line number below is relative to that branch.
 Predecessor: seam 1, `docs/specs/upstream-mailbox-seam/plan.md` — §6, §8 and §10 conventions are reused verbatim.
-Executable acceptance criteria: **required** — behavior-preserving restructuring of the host's only periodic control path; every PR carries the named cases in §8 (68 total).
+Executable acceptance criteria: **required** — behavior-preserving restructuring of the host's only periodic control path; every PR carries the named cases in §8 (70 total).
 
 ## 1. Outcome
 
@@ -204,7 +204,7 @@ Three surfaces, one per shape the source actually has. The two hook lists exist 
 | 20 | A session exists on `inbound.db` alone; outbound reads degrade to empty. There is no `fs.existsSync` pre-check beside the seam: *"two answers to that question drift, and the one that matters is the implementation's own"* | `:1656-1659`; `hasOutbound()` reproduces the old `outDb !== null` guard at S6, S14 entry and S17 retry | `ctx.hasOutbound` is the only guard the context exposes |
 | 21 | Usage-rollup mtime cached only after a rollup actually ran — a session whose `inbound.db` vanished while `outbound.db` remains would otherwise be skipped forever and its `turn_usage` never reach central totals | `:1843-1851`, commit `756f5d02` | acceptance case F-12.2 |
 
-**The 38 duties by surface (39 registrations — S17 registers twice under two names for its two call sites):**
+**The 38 duties by surface (39 registrations — S17 registers ONE name, `orphan-claim-reset`, on two surfaces: `session:tail` and the kill follow-up list; name uniqueness is per surface, `(phase, order)` uniqueness within the phase registry):**
 
 | Surface | Kind | Duties (order) |
 |---|---|---|
@@ -440,7 +440,7 @@ Plus the moved family's own log lines at their previous rate — each family PR 
 
 ## 8. Acceptance criteria (executable; `/team-build` materializes these, names verbatim)
 
-Host, `vitest`. 68 cases.
+Host, `vitest`. 70 cases.
 
 **S2-PR0 — lifecycle port (4)**
 - **L-1** `src/host-lifecycle-seam.test.ts` › "every ported upstream file matches UPSTREAM-MANIFEST.json" — manifest key set equals `UPSTREAM_FILES`; recompute sha256 for each; assert equality.
@@ -455,8 +455,8 @@ Host, `vitest`. 68 cases.
 - **T-4** `src/host-sweep-registry.test.ts` › "module intervals are unref'd and cleared on shutdown" — after `startHostModules` then `stopHostModules`, no timer keeps the loop alive and each interval had `unref` called.
 - **T-5** `src/main.test.ts` › "after PR 1 the registries hold exactly the six timer starts and seven shutdowns, regardless of env gates" — with a fresh module registry, import the modules barrel and the six timer modules; assert exactly 6 start callbacks and 7 shutdown callbacks (six timers + storage); repeat with `DAILY_SUMMARY_ENABLED=0` and `BACKLOG_CANVAS_ENABLED=0` and assert the same counts (a disabled duty registers and no-ops, §4.2). Replaces L-4 from PR 1 onward.
 
-**S2-PR2 — registry (13)**
-- **R-1** `src/host-sweep-registry.test.ts` › "duties run in SWEEP_PHASES order and by order within a phase" — probes across all eight phases with interleaved `order` values; observed sequence equals the declared one.
+**S2-PR2 — registry (15)**
+- **R-1** `src/host-sweep-registry.test.ts` › "duties run in SWEEP_PHASES order and by order within a phase" — probes across all seven phases (the `SweepPhase` union in §4.3; "eight" was a miscount) with interleaved `order` values; observed sequence equals the declared one.
 - **R-2** same file › "a duplicate (phase, order) pair is a registration error, and claims() is required exactly in exclusive phases" — two duties at the same coordinates throws; a `session:health` duty without `claims()` other than the fallthrough throws; an `all`-phase duty carrying `claims()` throws.
 - **R-2b** same file › "the driver is session-major: session A completes every phase and yields before session B starts" — two sessions, probes in `session:plan`, `session:wake` and `session:tail`; assert the observed order is A-plan, A-wake, A-tail, yield, B-plan, B-wake, B-tail, and **not** A-plan, B-plan, A-wake…; assert the tick phases ran exactly once each around the loop.
 - **R-3** same file › "one getActiveSessions call per tick regardless of duty count" — three duties in three phases; one tick; assert exactly one call and that each duty saw the same `ctx.sessions` reference.
@@ -465,7 +465,9 @@ Host, `vitest`. 68 cases.
 - **R-6** same file › "a vanished mailbox backs off silently at any window" — `SessionDbMissingError` raised at each window in turn; assert a quiet mark at W1, no error log of either string, and that a mid-tick vanish after W1 is retried rather than treated as a fault.
 - **R-7** same file › "the registered duty set matches the seam-2 inventory" — 39 registrations across 38 distinct names; the name set equals the checked-in inventory id set.
 - **R-8** `src/host-sweep-reschedule.test.ts` › "the tick re-arms after a duty throws" — existing case, carried unchanged, now driven through the registry.
-- **R-9** `src/host-sweep.test.ts` › "quiet-session cache keeps its time bound and last_active invalidation" — a fully quiet session is skipped until the earlier of its next due row and 30 minutes; a `last_active` change invalidates the mark immediately.
+- **R-8b** `src/host-sweep-registry.test.ts` › "a throw from the session scan itself still re-arms the tick" — `getActiveSessions` throws; the timer re-arms; tick-pre duties are not re-run in the same tick. (Added at build: with tick-level duty isolation, R-8's duty-throw path no longer reaches the re-arm guard, so the machinery path needs its own case.)
+- **R-4b** same file › "a tick-level duty that throws is logged and the later tick duties still run" — three tick duties, the middle throws; the third runs; the log carries `duty` and `window`. (Constraint 5 made executable at PR 2; F-4.4 re-proves it for T10 at PR 4.)
+- **R-9** `src/host-sweep-registry.test.ts` (not `host-sweep.test.ts`: the quiet cache lives in the tick, and a tick driven from that file would reach docker, GitHub and an LLM — hermeticity outranks placement) › "quiet-session cache keeps its time bound and last_active invalidation" — a fully quiet session is skipped until the earlier of its next due row and 30 minutes; a `last_active` change invalidates the mark immediately.
 - **R-10** `src/host-sweep-registry.test.ts` › "every real wake and kill runs at mailbox depth zero" — instrument the `AsyncLocalStorage` nesting guard to record open-session depth at the moment of the call, then drive **every** wake and kill branch and assert depth 0 at each: `wakeContainer` in W2 (`:1692`) and the task watchdog's parent wake (`:2005`); `killContainer` for `provider-failed-selfheal` (`:685`) plus its `onExit` wake (`:687`), `provider-failed-selfheal-parked` (`:800`), `killForProviderHeal` (`:818`), `scheduled-task-idle` (`:1735`), `chat-idle-reap` (`:1752`), `absolute-ceiling` (`:2117`), `claim-stuck` (`:2153`). Asserting `ctx.mailbox === null` is explicitly **not** the assertion — a duty could open its own session and kill inside the callback while that still passed.
 - **R-11** same file › "kill follow-ups run in order in a session opened only after the kill returns" — three registered follow-ups and a simulated `kill-ceiling` outcome; assert order 10 → 20 → 30, all inside one session, and that the session opened strictly after `killContainer` returned.
 - **R-12** same file › "a swept session opens no more windows than the PR 5 baseline" — count `session()` opens on the full path; assert it does not exceed eight, and that a quiet session opens zero.
