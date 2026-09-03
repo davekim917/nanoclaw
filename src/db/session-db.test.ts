@@ -12,6 +12,7 @@ import os from 'os';
 import path from 'path';
 import { describe, it, expect, afterEach, vi } from 'vitest';
 
+import { deferMessageForFreshContextRetry } from '../session-manager.js';
 import {
   activateRepoIngressFence,
   ensureSchema,
@@ -294,7 +295,7 @@ describe('migrateMessagesInTable', () => {
     db.close();
   });
 
-  it('adds scheduled_for on a legacy DB WITHOUT backfilling it, and is idempotent', () => {
+  it('adds scheduled_for and backfills legacy TASK rows from process_after, idempotently', () => {
     if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
     fs.mkdirSync(TEST_DIR, { recursive: true });
 
@@ -315,13 +316,22 @@ describe('migrateMessagesInTable', () => {
         content        TEXT NOT NULL
       );
     `);
-    // A legacy task row sitting in retry backoff: its process_after is the
-    // backoff deadline, NOT the slot it was scheduled for. Copying that value
-    // into scheduled_for would freeze the exact wrong answer, which is why the
-    // migration adds the column empty and lets readers fall back.
+    // A legacy task row whose process_after IS its slot. Leaving it NULL would
+    // mean its first crash after the upgrade deferred process_after with no
+    // slot recorded, and the formatter would fall back to the backoff deadline
+    // — reproducing the exact defect this column prevents.
     db.prepare(
       "INSERT INTO messages_in (id, seq, kind, timestamp, status, process_after, content) VALUES (?, ?, 'task', ?, 'pending', ?, '{}')",
-    ).run('legacy-backoff', 2, '2026-01-05T09:00:00.000Z', '2026-01-05T11:47:00.000Z');
+    ).run('legacy-task', 2, '2026-01-04T12:05:00.000Z', '2026-01-05T09:00:00.000Z');
+    // A chat row: occurrence identity is a task concept, so it gets no slot.
+    db.prepare(
+      "INSERT INTO messages_in (id, seq, kind, timestamp, status, process_after, content) VALUES (?, ?, 'chat', ?, 'pending', ?, '{}')",
+    ).run('legacy-chat', 4, '2026-01-04T12:05:00.000Z', '2026-01-04T12:10:00.000Z');
+    // A task row with no process_after at all stays NULL — there is nothing to
+    // copy, and the formatter's timestamp fallback already covers it.
+    db.prepare(
+      "INSERT INTO messages_in (id, seq, kind, timestamp, status, content) VALUES (?, ?, 'task', ?, 'pending', '{}')",
+    ).run('legacy-slotless', 6, '2026-01-04T12:05:00.000Z');
 
     migrateMessagesInTable(db);
     migrateMessagesInTable(db); // idempotent
@@ -329,8 +339,51 @@ describe('migrateMessagesInTable', () => {
     const cols = (db.prepare("PRAGMA table_info('messages_in')").all() as Array<{ name: string }>).map((c) => c.name);
     expect(cols).toContain('scheduled_for');
 
-    const row = db.prepare('SELECT scheduled_for, process_after FROM messages_in WHERE id = ?').get('legacy-backoff');
-    expect(row).toEqual({ scheduled_for: null, process_after: '2026-01-05T11:47:00.000Z' });
+    const rows = db
+      .prepare('SELECT id, scheduled_for, process_after FROM messages_in ORDER BY seq')
+      .all() as Array<{ id: string; scheduled_for: string | null; process_after: string | null }>;
+    expect(rows).toEqual([
+      { id: 'legacy-task', scheduled_for: '2026-01-05T09:00:00.000Z', process_after: '2026-01-05T09:00:00.000Z' },
+      { id: 'legacy-chat', scheduled_for: null, process_after: '2026-01-04T12:10:00.000Z' },
+      { id: 'legacy-slotless', scheduled_for: null, process_after: null },
+    ]);
+    db.close();
+  });
+
+  it('a legacy task migrated then crashed keeps its slot through the retry backoff', () => {
+    // The end-to-end shape finding #1 named: upgrade, then the FIRST crash.
+    if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
+    fs.mkdirSync(TEST_DIR, { recursive: true });
+
+    const db = new Database(DB_PATH);
+    db.exec(`
+      CREATE TABLE messages_in (
+        id             TEXT PRIMARY KEY,
+        seq            INTEGER UNIQUE,
+        kind           TEXT NOT NULL,
+        timestamp      TEXT NOT NULL,
+        status         TEXT DEFAULT 'pending',
+        process_after  TEXT,
+        recurrence     TEXT,
+        tries          INTEGER DEFAULT 0,
+        platform_id    TEXT,
+        channel_type   TEXT,
+        thread_id      TEXT,
+        content        TEXT NOT NULL
+      );
+    `);
+    db.prepare(
+      "INSERT INTO messages_in (id, seq, kind, timestamp, status, process_after, content) VALUES (?, ?, 'task', ?, 'pending', ?, '{}')",
+    ).run('legacy-then-crash', 2, '2026-01-04T12:05:00.000Z', '2026-01-05T09:00:00.000Z');
+
+    migrateMessagesInTable(db);
+    deferMessageForFreshContextRetry(db, 'legacy-then-crash', 600);
+
+    const row = db
+      .prepare('SELECT process_after, scheduled_for FROM messages_in WHERE id = ?')
+      .get('legacy-then-crash') as { process_after: string; scheduled_for: string };
+    expect(row.process_after).not.toBe('2026-01-05T09:00:00.000Z');
+    expect(row.scheduled_for).toBe('2026-01-05T09:00:00.000Z');
     db.close();
   });
 

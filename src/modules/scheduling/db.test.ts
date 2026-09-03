@@ -618,6 +618,14 @@ describe('restoreTaskRow', () => {
       db.prepare('SELECT process_after, scheduled_for FROM messages_in WHERE id = ?').get('restored-slot'),
     ).toEqual({ process_after: '2026-01-05T11:47:00.000Z', scheduled_for: '2026-01-05T09:00:00.000Z' });
 
+    // ISO-8601 UTC, not datetime('now')'s naive shape — `new Date()` reads that
+    // as LOCAL time, skewing display and string comparisons against every other
+    // row in the table.
+    const stamped = db.prepare('SELECT timestamp FROM messages_in WHERE id = ?').get('restored-slot') as {
+      timestamp: string;
+    };
+    expect(stamped.timestamp).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/);
+
     // A move_intent audit body written before the column existed carries no
     // scheduled_for; the restore must still produce a usable row.
     const { scheduled_for: _omitted, ...legacy } = base;

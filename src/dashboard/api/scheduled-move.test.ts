@@ -137,6 +137,7 @@ function insertRow(
     status?: string;
     recurrence?: string | null;
     process_after?: string | null;
+    scheduled_for?: string | null;
     content?: string;
     platform_id?: string;
     channel_type?: string;
@@ -144,15 +145,18 @@ function insertRow(
 ): void {
   const db = openInboundDb(inboundPath);
   const seq = (db.prepare('SELECT COALESCE(MAX(seq),0) AS m FROM messages_in').get() as { m: number }).m + 2;
+  const processAfter = row.process_after ?? isoIn(3600_000);
   db.prepare(
-    `INSERT INTO messages_in (id, seq, kind, timestamp, status, process_after, recurrence, series_id, content, platform_id, channel_type)
-     VALUES (@id, @seq, 'task', @ts, @status, @processAfter, @recurrence, @seriesId, @content, @platformId, @channelType)`,
+    `INSERT INTO messages_in (id, seq, kind, timestamp, status, process_after, scheduled_for, recurrence, series_id, content, platform_id, channel_type)
+     VALUES (@id, @seq, 'task', @ts, @status, @processAfter, @scheduledFor, @recurrence, @seriesId, @content, @platformId, @channelType)`,
   ).run({
     id: row.id,
     seq,
     ts: isoIn(-3600_000),
     status: row.status ?? 'pending',
-    processAfter: row.process_after ?? isoIn(3600_000),
+    processAfter,
+    // Mirrors what every real insert path stamps unless a test arms them apart.
+    scheduledFor: row.scheduled_for === undefined ? processAfter : row.scheduled_for,
     recurrence: row.recurrence === undefined ? '0 9 * * *' : row.recurrence,
     seriesId: row.series_id ?? row.id,
     content: row.content ?? JSON.stringify({ prompt: 'do thing', script: 'echo hi' }),
@@ -200,7 +204,11 @@ afterEach(() => {
 });
 
 // ── Common fixture: source group/session/series + a target group/channel ──────
-function seedMoveFixture(opts?: { sourceStatus?: string; sourceProcessAfter?: string | null }): { key: string } {
+function seedMoveFixture(opts?: {
+  sourceStatus?: string;
+  sourceProcessAfter?: string | null;
+  sourceScheduledFor?: string | null;
+}): { key: string } {
   addWorkgroup('wg-1', ['Anthropic', 'Linear']);
   addGroup('src-ag', 'src-folder', 'wg-1');
   addGroup('tgt-ag', 'tgt-folder', 'wg-1');
@@ -217,6 +225,7 @@ function seedMoveFixture(opts?: { sourceStatus?: string; sourceProcessAfter?: st
     series_id: 'ser-1',
     status: opts?.sourceStatus ?? 'pending',
     process_after: opts?.sourceProcessAfter ?? isoIn(3600_000),
+    ...(opts?.sourceScheduledFor === undefined ? {} : { scheduled_for: opts.sourceScheduledFor }),
   });
   addUser('owner');
   grant('owner', 'owner', null);
@@ -333,15 +342,27 @@ function liveRowsForSeries(
   agentGroupId: string,
   sessionId: string,
   seriesId: string,
-): Array<{ id: string; status: string; process_after: string | null; recurrence: string | null }> {
+): Array<{
+  id: string;
+  status: string;
+  process_after: string | null;
+  scheduled_for: string | null;
+  recurrence: string | null;
+}> {
   const p = path.join(TEST_DIR, 'v2-sessions', agentGroupId, sessionId, 'inbound.db');
   if (!fs.existsSync(p)) return [];
   const db = openInboundDb(p);
   const rows = db
     .prepare(
-      "SELECT id, status, process_after, recurrence FROM messages_in WHERE series_id = ? AND kind = 'task' AND status IN ('pending','paused')",
+      "SELECT id, status, process_after, scheduled_for, recurrence FROM messages_in WHERE series_id = ? AND kind = 'task' AND status IN ('pending','paused')",
     )
-    .all(seriesId) as Array<{ id: string; status: string; process_after: string | null; recurrence: string | null }>;
+    .all(seriesId) as Array<{
+    id: string;
+    status: string;
+    process_after: string | null;
+    scheduled_for: string | null;
+    recurrence: string | null;
+  }>;
   db.close();
   return rows;
 }
@@ -379,6 +400,46 @@ describe('moveExecuteHandler', () => {
     const tgtLive = liveRowsForSeries('tgt-ag', tgtSess!, 'ser-1');
     expect(tgtLive).toHaveLength(1);
     expect(tgtLive[0].recurrence).toBe('0 9 * * *');
+  });
+
+  it('a successful move carries the occurrence\'s slot, not its retry deadline', async () => {
+    // The source row crashed and was deferred: process_after is a backoff
+    // deadline ten hours out, scheduled_for is still the 9:00 slot. Stamping
+    // the destination from process_after would change the occurrence's identity
+    // as a side effect of moving it.
+    const slot = isoIn(-30 * 60_000);
+    const { key } = seedMoveFixture({
+      sourceProcessAfter: isoIn(10 * 3600_000),
+      sourceScheduledFor: slot,
+    });
+
+    const res = (await moveExecuteHandler(req(moveBody()), { key }, ctxFor('owner', OWNER_SCOPES)))!;
+    expect(res.status).toBe(200);
+
+    const tgtLive = liveRowsForSeries('tgt-ag', targetSessionId()!, 'ser-1');
+    expect(tgtLive).toHaveLength(1);
+    expect(tgtLive[0]!.process_after).toBe(isoIn(10 * 3600_000));
+    expect(tgtLive[0]!.scheduled_for).toBe(slot);
+  });
+
+  it('the paused staged path restores the run time without clobbering the slot', async () => {
+    // The staged insert arms a grace process_after, then restores the real one.
+    // That second write must not drag scheduled_for along with it.
+    const slot = isoIn(-72 * 3600_000);
+    const { key } = seedMoveFixture({
+      sourceStatus: 'paused',
+      sourceProcessAfter: isoIn(-48 * 3600_000),
+      sourceScheduledFor: slot,
+    });
+
+    const res = (await moveExecuteHandler(req(moveBody()), { key }, ctxFor('owner', OWNER_SCOPES)))!;
+    expect(res.status).toBe(200);
+
+    const tgtLive = liveRowsForSeries('tgt-ag', targetSessionId()!, 'ser-1');
+    expect(tgtLive).toHaveLength(1);
+    expect(tgtLive[0]!.status).toBe('paused');
+    expect(tgtLive[0]!.process_after).toBe(isoIn(-48 * 3600_000));
+    expect(tgtLive[0]!.scheduled_for).toBe(slot);
   });
 
   it('same-agent paused move reuses one system session without double-counting or breaking staged restore', async () => {

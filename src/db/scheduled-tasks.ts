@@ -33,6 +33,15 @@ export interface TaskDef {
   agentGroupId: string;
   cron: string;
   processAfter: string;
+  /**
+   * The scheduled slot this occurrence is FOR, when it differs from
+   * `processAfter`. Only the board's move flow needs it: a source row sitting
+   * in retry backoff carries the backoff deadline in `process_after`, and
+   * stamping the destination's `scheduled_for` from that would change the
+   * occurrence's identity as a side effect of moving it. Omitted by every
+   * other caller, which arms a slot and a run time that are the same instant.
+   */
+  scheduledFor?: string;
   seriesId: string;
   prompt: string;
   /**
@@ -284,7 +293,7 @@ export async function scheduleTask(def: TaskDef, _dataDir?: string): Promise<voi
         ).run(
           seq,
           def.processAfter,
-          def.processAfter,
+          def.scheduledFor ?? def.processAfter,
           def.cron,
           content,
           platformId,
@@ -308,7 +317,9 @@ export async function scheduleTask(def: TaskDef, _dataDir?: string): Promise<voi
         def.processAfter,
         // Stamped equal at insert, then diverges — a deferral moves only
         // process_after, so the occurrence keeps the slot it was armed for.
-        def.processAfter,
+        // A move is the one caller that arms them apart, preserving the source
+        // occurrence's slot across the transfer.
+        def.scheduledFor ?? def.processAfter,
         def.cron,
         def.seriesId,
         content,

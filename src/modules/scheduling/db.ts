@@ -364,10 +364,15 @@ export interface TaskRowSnapshot {
 export function restoreTaskRow(db: Database.Database, snapshot: TaskRowSnapshot): void {
   db.prepare(
     `INSERT INTO messages_in (id, seq, kind, timestamp, status, tries, process_after, scheduled_for, recurrence, platform_id, channel_type, thread_id, content, series_id, trigger)
-     VALUES (@id, @seq, @kind, datetime('now'), @status, 0, @processAfter, @scheduledFor, @recurrence, @platformId, @channelType, @threadId, @content, @seriesId, 0)`,
+     VALUES (@id, @seq, @kind, @timestamp, @status, 0, @processAfter, @scheduledFor, @recurrence, @platformId, @channelType, @threadId, @content, @seriesId, 0)`,
   ).run({
     id: snapshot.id,
     seq: nextEvenSeq(db),
+    // ISO-8601 UTC, never datetime('now'): its naive 'YYYY-MM-DD HH:MM:SS'
+    // shape is read as LOCAL time by `new Date()`, which skews display and
+    // breaks string comparisons against the ISO values every other writer here
+    // produces.
+    timestamp: new Date().toISOString(),
     kind: snapshot.kind,
     status: snapshot.status,
     processAfter: snapshot.process_after,

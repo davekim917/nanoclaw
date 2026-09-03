@@ -390,6 +390,11 @@ function taskDefFromSnapshot(
     agentGroupId: targetAgentGroupId,
     cron: snapshot.recurrence ?? '',
     processAfter: processAfterOverride ?? snapshot.process_after ?? new Date().toISOString(),
+    // The moved row is the SAME occurrence, so it keeps the slot it was armed
+    // for. Without this the destination's scheduled_for would be stamped from
+    // process_after — which is the staged grace time on the paused path, and
+    // the retry deadline for a source row sitting in backoff.
+    ...(snapshot.scheduled_for ? { scheduledFor: snapshot.scheduled_for } : {}),
     seriesId,
     prompt: typeof content.prompt === 'string' ? content.prompt : snapshot.content,
     ...(typeof content.script === 'string' ? { script: content.script } : {}),
@@ -586,7 +591,16 @@ export const moveExecuteHandler: AuthHandler = async (req, params, ctx) => {
         const tgtDb = openInboundDb(inboundPathOf(dataDir, target.agentGroupId, tgtSessId));
         try {
           pauseTask(tgtDb, source.seriesId);
-          if (snapshot.process_after) updateTask(tgtDb, source.seriesId, { processAfter: snapshot.process_after });
+          // keepScheduledFor: this restores the row's RUN time after the
+          // staged grace insert. scheduleTask already stamped the occurrence's
+          // slot from the snapshot, and moving it again here would overwrite it
+          // with the run time.
+          if (snapshot.process_after) {
+            updateTask(tgtDb, source.seriesId, {
+              processAfter: snapshot.process_after,
+              keepScheduledFor: true,
+            });
+          }
         } finally {
           tgtDb.close();
         }
