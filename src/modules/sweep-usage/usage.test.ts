@@ -24,16 +24,24 @@ const h = vi.hoisted(() => {
     spawns: [] as string[],
     // getActiveSessions is spied so F-12.3 can assert it is NEVER called by
     // the registered duty (constraint 4: T19 reuses the tick's own
-    // ctx.sessions, no extra query). openOutboundDb / listTurnUsageSince /
-    // rollupSessionUsage are THE dependencies this family's duty consumes —
-    // spies, not stubs, so the registered-duty cases below can assert on
-    // them directly (the "acceptance tests must drive the REGISTERED duty"
-    // rule). `vi` is available here even though it isn't `require`d: the
+    // ctx.sessions, no extra query). readSessionOutbound / rollupSessionUsage
+    // are THE dependencies this family's duty consumes — spies, not stubs, so
+    // the registered-duty cases below can assert on them directly (the
+    // "acceptance tests must drive the REGISTERED duty" rule).
+    //
+    // openOutboundDb is spied for the OPPOSITE reason: it is the raw opener
+    // this duty must never call. Mailbox seam PR 6 routes the rollup through
+    // the read-only funnel, and a move that quietly restored the raw opener
+    // would still pass every other case here — so it is asserted absent.
+    //
+    // `vi` is available here even though it isn't `require`d: the
     // `import { vi } from 'vitest'` below is a real ES import, hoisted by
     // the module system itself before this factory runs.
     mockGetActiveSessions: vi.fn(() => [] as unknown[]),
     mockOpenOutboundDb: vi.fn((_path: string) => ({ close: () => undefined }) as unknown),
-    mockListTurnUsageSince: vi.fn((_db: unknown, _afterId: number) => [] as unknown[]),
+    mockReadSessionOutbound: vi.fn((_location: unknown, action: (mailbox: unknown) => unknown, _options?: unknown) =>
+      action({ listTurnUsageSince: (_afterId: number) => [] as unknown[] }),
+    ),
     mockRollupSessionUsage: vi.fn((_mailbox: unknown, _agentGroupId: string, _sessionDirKey: string) => 0),
     mockPruneOldTurnUsage: vi.fn(() => undefined),
   };
@@ -178,9 +186,13 @@ vi.mock('../mailbox/openers.js', async (importOriginal) => {
   const real = await importOriginal<typeof import('../mailbox/openers.js')>();
   return { ...real, openOutboundDb: (p: string) => h.mockOpenOutboundDb(p) };
 });
-vi.mock('../mailbox/ops/reads.js', async (importOriginal) => {
-  const real = await importOriginal<typeof import('../mailbox/ops/reads.js')>();
-  return { ...real, listTurnUsageSince: (db: unknown, afterId: number) => h.mockListTurnUsageSince(db, afterId) };
+vi.mock('../mailbox/index.js', async (importOriginal) => {
+  const real = await importOriginal<typeof import('../mailbox/index.js')>();
+  return {
+    ...real,
+    readSessionOutbound: (location: unknown, action: unknown, options?: unknown) =>
+      h.mockReadSessionOutbound(location, action as (mailbox: unknown) => unknown, options),
+  };
 });
 vi.mock('../../db/usage.js', () => ({
   rollupSessionUsage: (mailbox: unknown, agentGroupId: string, sessionDirKey: string) =>
@@ -263,7 +275,7 @@ describe('registered usage-rollup duty (T19)', () => {
     h.spawns.length = 0;
     h.mockGetActiveSessions.mockClear();
     h.mockOpenOutboundDb.mockClear();
-    h.mockListTurnUsageSince.mockClear();
+    h.mockReadSessionOutbound.mockClear();
     h.mockRollupSessionUsage.mockClear();
     h.mockPruneOldTurnUsage.mockClear();
     _resetSweepRegistryForTesting();
@@ -305,7 +317,7 @@ describe('registered usage-rollup duty (T19)', () => {
     await duty.run(tickContext(sentinel) as never);
 
     expect(h.mockGetActiveSessions).not.toHaveBeenCalled();
-    expect(h.mockOpenOutboundDb).toHaveBeenCalledTimes(1);
+    expect(h.mockReadSessionOutbound).toHaveBeenCalledTimes(1);
     expect(h.mockRollupSessionUsage).toHaveBeenCalledTimes(1);
     expect(h.mockRollupSessionUsage).toHaveBeenCalledWith(expect.anything(), 'ag-test', 'ag-test/sess-changed');
     expect(h.mockPruneOldTurnUsage).toHaveBeenCalledTimes(1);
@@ -314,7 +326,7 @@ describe('registered usage-rollup duty (T19)', () => {
 
   it('logs the preserved failure string when the rollup throws, without blocking pruneOldTurnUsage', async () => {
     const warnSpy = vi.spyOn(log, 'warn').mockImplementation(() => undefined);
-    h.mockOpenOutboundDb.mockImplementationOnce(() => {
+    h.mockReadSessionOutbound.mockImplementationOnce(() => {
       throw new Error('outbound.db unopenable');
     });
     const dir = path.join(h.dataDir, 'v2-sessions', 'ag-test', 'sess-fail');
@@ -360,13 +372,13 @@ describe('registered usage-rollup duty (T19)', () => {
     expect(fs.existsSync(path.join(goneDir, 'inbound.db'))).toBe(false);
 
     await duty.run(tickContext([fakeSession(goneId)]) as never);
-    expect(h.mockOpenOutboundDb).toHaveBeenCalledTimes(1);
+    expect(h.mockReadSessionOutbound).toHaveBeenCalledTimes(1);
     expect(h.mockRollupSessionUsage).toHaveBeenCalledTimes(1);
     // Cache written: an immediate re-tick over the unchanged file skips.
-    h.mockOpenOutboundDb.mockClear();
+    h.mockReadSessionOutbound.mockClear();
     h.mockRollupSessionUsage.mockClear();
     await duty.run(tickContext([fakeSession(goneId)]) as never);
-    expect(h.mockOpenOutboundDb).not.toHaveBeenCalled();
+    expect(h.mockReadSessionOutbound).not.toHaveBeenCalled();
     expect(h.mockRollupSessionUsage).not.toHaveBeenCalled();
 
     // (2) a rollup that fails before completing — cache unchanged, no throw
@@ -393,7 +405,7 @@ describe('registered usage-rollup duty (T19)', () => {
       'Usage rollup failed for session',
       expect.objectContaining({ sessionId: failId }),
     );
-    h.mockOpenOutboundDb.mockClear();
+    h.mockReadSessionOutbound.mockClear();
     h.mockRollupSessionUsage.mockClear();
     // usageRollupMtimeCache has no entry for this session (it's module-
     // private, no test accessor — proven behaviorally, the same style as
@@ -401,20 +413,62 @@ describe('registered usage-rollup duty (T19)', () => {
     // mtime, next tick: retried, not skipped, because tick 1 never reached
     // the cache write (rollupSessionUsage threw before it).
     await duty.run(tickContext([fakeSession(failId)]) as never);
-    expect(h.mockOpenOutboundDb).toHaveBeenCalledTimes(1);
+    expect(h.mockReadSessionOutbound).toHaveBeenCalledTimes(1);
     expect(h.mockRollupSessionUsage).toHaveBeenCalledTimes(1);
     warnSpy.mockRestore();
 
     // (3) a real rollup updates the cache to the outbound mtime specifically
     // (not a placeholder): a genuinely NEW mtime rolls up again even though
     // the cache is already populated from this same session's earlier ticks.
-    h.mockOpenOutboundDb.mockClear();
+    h.mockReadSessionOutbound.mockClear();
     h.mockRollupSessionUsage.mockClear();
     fs.utimesSync(path.join(failDir, 'outbound.db'), new Date(Date.now() + 60_000), new Date(Date.now() + 60_000));
     await duty.run(tickContext([fakeSession(failId)]) as never);
-    expect(h.mockOpenOutboundDb).toHaveBeenCalledTimes(1);
+    expect(h.mockReadSessionOutbound).toHaveBeenCalledTimes(1);
     expect(h.mockRollupSessionUsage).toHaveBeenCalledTimes(1);
 
+    expect(h.spawns).toEqual([]);
+  });
+
+  // The read goes through the SEAM, not a raw opener, and carries the raw
+  // opener's durability options. Both halves matter and neither is implied by
+  // the cases above, which only assert that some read happened:
+  //
+  //  - `openOutboundDb` never called: mailbox seam PR 6 moved this projection
+  //    behind `readSessionOutbound`, and that is why this module is no longer
+  //    on src/mailbox/RATCHET.json. A move that quietly restored the raw
+  //    opener would pass every other case in this file and silently put the
+  //    file back on the wrong side of the ratchet.
+  //  - the options object: the funnel defaults to a 1s busy_timeout and does
+  //    NOT recover a hot journal, because its first caller was a fleet-wide
+  //    console read that must degrade rather than stall or write. The raw
+  //    opener this replaced did both. Dropping the options is therefore
+  //    invisible until a container crashes mid-write, after which that
+  //    session throws on every tick and its turn_usage rows never reach the
+  //    central ledger — exactly the regression this case exists to catch.
+  it("T19 reads through readSessionOutbound with the raw opener's durability options, never openOutboundDb", async () => {
+    const sessionId = 'sess-funnel';
+    const dir = path.join(h.dataDir, 'v2-sessions', 'ag-test', sessionId);
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, 'outbound.db'), '');
+
+    const duty = getDuty();
+    await duty.run(tickContext([fakeSession(sessionId)]) as never);
+
+    expect(h.mockOpenOutboundDb).not.toHaveBeenCalled();
+    expect(h.mockReadSessionOutbound).toHaveBeenCalledTimes(1);
+    expect(h.mockReadSessionOutbound).toHaveBeenCalledWith(
+      { agentGroupId: 'ag-test', sessionId },
+      expect.any(Function),
+      { busyTimeoutMs: 5000, recoverJournal: true },
+    );
+    // And the funnel's own session object is what reaches the rollup — the
+    // op-shaped read, not a raw better-sqlite3 handle.
+    expect(h.mockRollupSessionUsage).toHaveBeenCalledWith(
+      expect.objectContaining({ listTurnUsageSince: expect.any(Function) }),
+      'ag-test',
+      `ag-test/${sessionId}`,
+    );
     expect(h.spawns).toEqual([]);
   });
 });
