@@ -1071,25 +1071,97 @@ describe('S2-PR13 — continuation and ceiling accountability, through the regis
     expect(s9a.order).toBeGreaterThan(duty(SWEEP_DUTY_INVENTORY.S7).order);
     expect(SWEEP_DUTY_INVENTORY.S9b).toBe('container-wake');
 
-    const { outDb, mailbox } = makeSessionDbs();
-    // Budget spent: the continuation is NOT resumable this tick.
-    saveContinuation(outDb, { ...CONTINUATION, resume_attempts: WORK_CONTINUATION_RESUME_MAX_ATTEMPTS });
-    mockGetContainerSpawnedAt.mockReturnValue(0);
+    // The fixture has to be work the runner WOULD resume if admission were
+    // wrong, or the case proves nothing. Ownership is the mechanism, not the
+    // attempt count: the runner never reads `resume_attempts`, and a queued
+    // record with no `runner_id` is runnable on sight. What holds saved work
+    // back after a crash is the DEAD RUNNER'S CLAIM still on the record, and
+    // `incrementWorkContinuationResumeAttempt` (ops/continuation.ts) is the
+    // only thing that clears it — "so the container can distinguish this
+    // authorized start from a capped attempt that has already run and is
+    // merely hitchhiking on an unrelated wake."
+    //
+    // So: valid, under the cap, one throttle away from resumable, still
+    // claimed by the container that crashed holding it.
+    const owned = { ...CONTINUATION, phase: 'running' as const, runner_id: 'crashed-runner', resume_attempts: 0 };
 
-    // …and an unrelated scheduled row IS due, which on its own wakes the
-    // container.
-    const plan = emptyPlan({ dueCount: 1, wakePriority: 'scheduled', workContinuation: readWorkContinuation(outDb) });
-    await s9a.run(sessionCtx(mailbox, plan));
-    expect(plan.continuationWakeEligible).toBe(false);
+    async function scheduledWakeWith(
+      record: Record<string, unknown>,
+      spawnedAtMs: number,
+    ): Promise<{ outDb: Database.Database; before: unknown; mailbox: NanoclawMailboxSession; plan: WakePlan }> {
+      const { outDb, mailbox } = makeSessionDbs();
+      saveContinuation(outDb, record);
+      const before = outDb.prepare("SELECT value, updated_at FROM session_state WHERE key = 'work_continuation'").get();
+      mockGetContainerSpawnedAt.mockReturnValue(spawnedAtMs);
 
-    await s9b.run(sessionCtx(mailbox, plan));
+      // An unrelated scheduled row IS due, which on its own wakes the container.
+      const plan = emptyPlan({
+        dueCount: 1,
+        wakePriority: 'scheduled',
+        workContinuation: readWorkContinuation(outDb),
+      });
+      await s9a.run(sessionCtx(mailbox, plan));
+      await s9b.run(sessionCtx(mailbox, plan));
+      return { outDb, before, mailbox, plan };
+    }
 
-    // The container woke for the scheduled row…
+    // ── Throttled: under the cap, but the last spawn was a minute ago. ────────
+    const info = vi.spyOn(log, 'info').mockImplementation(() => undefined);
+    const throttled = await scheduledWakeWith(owned, Date.now() - 60_000);
+    expect(throttled.plan.continuationWakeEligible).toBe(false);
+
+    // The container woke — for the SCHEDULED row, at scheduled priority, and
+    // the wake names no continuation.
     expect(mockWakeContainer).toHaveBeenCalledTimes(1);
     expect(mockWakeContainer.mock.calls[0][1]).toBe('scheduled');
-    // …but the saved work did not ride along: no attempt was consumed, so the
-    // cap still holds and the parked notice still owes the user an answer.
-    expect(readWorkContinuation(outDb)?.resume_attempts).toBe(WORK_CONTINUATION_RESUME_MAX_ATTEMPTS);
+    const wakeLog = info.mock.calls.find((c) => c[0] === 'Waking container for due messages')!;
+    expect(wakeLog).toBeDefined();
+    expect((wakeLog[1] as { priority: string; continuationId?: string }).priority).toBe('scheduled');
+    expect((wakeLog[1] as { continuationId?: string }).continuationId).toBeUndefined();
+    info.mockRestore();
+
+    // …and the saved work did not ride along. The row is byte-identical,
+    // updated_at included, so the crashed runner's claim is still on it and the
+    // fresh container cannot read this scheduled wake as an authorized resume.
+    expect(
+      throttled.outDb.prepare("SELECT value, updated_at FROM session_state WHERE key = 'work_continuation'").get(),
+    ).toEqual(throttled.before);
+    const stillOwned = readWorkContinuation(throttled.outDb)!;
+    expect(stillOwned.runner_id).toBe('crashed-runner');
+    expect(stillOwned.phase).toBe('running');
+    expect(stillOwned.resume_attempts).toBe(0);
+    expect(readContinuationRecoveryAttemptAt(throttled.outDb, stillOwned)).toBe(0);
+
+    // ── Capped: throttle long elapsed, budget spent. Same conclusion. ─────────
+    mockWakeContainer.mockClear();
+    const capped = await scheduledWakeWith({ ...owned, resume_attempts: WORK_CONTINUATION_RESUME_MAX_ATTEMPTS }, 0);
+    expect(capped.plan.continuationWakeEligible).toBe(false);
+    expect(mockWakeContainer).toHaveBeenCalledTimes(1);
+    expect(
+      capped.outDb.prepare("SELECT value, updated_at FROM session_state WHERE key = 'work_continuation'").get(),
+    ).toEqual(capped.before);
+    expect(readWorkContinuation(capped.outDb)?.runner_id).toBe('crashed-runner');
+
+    // ── Control: the SAME fixture, admitted. Ownership transfers, which is
+    //    exactly the state the two assertions above deny — so they discriminate
+    //    rather than merely observing a row nothing was going to touch.
+    mockWakeContainer.mockClear();
+    const { outDb, mailbox } = makeSessionDbs();
+    saveContinuation(outDb, owned);
+    mockGetContainerSpawnedAt.mockReturnValue(0);
+    const admitted = emptyPlan({
+      dueCount: 1,
+      wakePriority: 'scheduled',
+      workContinuation: readWorkContinuation(outDb),
+    });
+    await s9a.run(sessionCtx(mailbox, admitted));
+    expect(admitted.continuationWakeEligible).toBe(true);
+    await s9b.run(sessionCtx(mailbox, admitted));
+
+    const resumed = readWorkContinuation(outDb)!;
+    expect(resumed.runner_id).toBeUndefined();
+    expect(resumed.phase).toBe('queued');
+    expect(resumed.resume_attempts).toBe(1);
   });
 
   // ── F-13.3 ─────────────────────────────────────────────────────────────────
