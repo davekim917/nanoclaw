@@ -1173,8 +1173,11 @@ describe('sweep duty registry (S2-PR2)', () => {
   // ── F-14.1 (S2-PR14, plan.md §8) ─────────────────────────────────────────────
   //
   // Structural, not a line budget. The plan's original "under 300 lines" was an
-  // estimate written before the build; the end state is 1,137 lines — 631 code,
-  // 420 comment, 86 blank — and holds no duty body at all. Section breakdown:
+  // estimate written before the build; the end state is 1,136 lines (`wc -l`) —
+  // 631 code, 420 comment, 85 blank — and holds no duty body at all. The
+  // assertion below counts `split('\n')` elements, which is one more (1,137) for
+  // a file ending in a newline; the ceiling is set against that measure. Section
+  // breakdown, in `split('\n')` elements:
   // sweepSession + helpers 260, driver start/stop/sweep/sweepOnce 150, registry
   // 158, error rule 100, shared context + duty types 99, re-exports +
   // writeSystemWake + providerFailedTicks 80, SLA hooks + kill follow-ups +
@@ -1266,8 +1269,9 @@ describe('sweep duty registry (S2-PR2)', () => {
       expect(actualExports, `host-sweep.ts no longer exports ${core}`).toContain(core);
     }
 
-    // Regrowth ratchet. 1,137 today; the headroom is for comments and the
-    // driver's own evolution, never for a duty body coming home.
+    // Regrowth ratchet. 1,137 by this measure today (1,136 by `wc -l`); the
+    // headroom is for comments and the driver's own evolution, never for a duty
+    // body coming home.
     expect(source.split('\n').length).toBeLessThanOrEqual(1200);
     expect(h.spawns).toEqual([]);
   });
@@ -1277,10 +1281,20 @@ describe('sweep duty registry (S2-PR2)', () => {
     // R-7's assertion, re-run at the end state and reached the way production
     // reaches it: through the modules barrel src/main.ts imports, not through
     // this file's own per-family side-effect imports.
+    //
+    // Codex round on bea7c74f (F1): the barrel has to be loaded into a FRESH
+    // module graph and the registry read from THAT graph's host-sweep instance.
+    // Importing the barrel while `_listSweepRegistrationsForTesting` is still
+    // this file's static binding reads a registry the file's own per-family
+    // imports already populated — the case would stay green with a family line
+    // deleted from src/modules/index.ts, which is exactly the regression it
+    // exists to catch. `vi.mock` factories survive `resetModules()`, so the
+    // fresh graph gets the same stubs.
+    vi.resetModules();
     await import('./modules/index.js');
-    _resetSweepRegistryForTesting();
+    const hs = await import('./host-sweep.js');
 
-    const { duties, slaObservationHooks, killFollowUps } = _listSweepRegistrationsForTesting();
+    const { duties, slaObservationHooks, killFollowUps } = hs._listSweepRegistrationsForTesting();
     const actual: Array<[string, string, string, number]> = [
       ...duties.map((d): [string, string, string, number] => ['duty', d.name, d.phase, d.order]),
       ...slaObservationHooks.map((hk): [string, string, string, number] => [
@@ -1301,8 +1315,10 @@ describe('sweep duty registry (S2-PR2)', () => {
     expect(actual).toHaveLength(39);
     const names = new Set(actual.map((r) => r[1]));
     expect(names.size).toBe(38);
-    expect(names).toEqual(new Set(Object.values(SWEEP_DUTY_INVENTORY)));
-    expect(actual.filter((r) => r[1] === SWEEP_DUTY_INVENTORY.S17)).toHaveLength(2);
+    // The inventory comes from the same fresh instance, not this file's binding.
+    expect(names).toEqual(new Set(Object.values(hs.SWEEP_DUTY_INVENTORY)));
+    expect(Object.keys(hs.SWEEP_DUTY_INVENTORY)).toHaveLength(38);
+    expect(actual.filter((r) => r[1] === hs.SWEEP_DUTY_INVENTORY.S17)).toHaveLength(2);
     expect(h.spawns).toEqual([]);
   });
 
