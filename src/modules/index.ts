@@ -52,3 +52,8 @@ import './provider-fallback/index.js';
 import './repository-workspaces/index.js';
 
 import './escalation/index.js';
+
+// Sweep family: central housekeeping (seam 2, S2-PR4) — github-app-token-refresh,
+// steer-idempotency-prune, channel-ingress-receipt-prune, session-title-sweep,
+// thread-title-retry, dashboard-token-prune (all tick:housekeeping).
+import './sweep-central/index.js';
