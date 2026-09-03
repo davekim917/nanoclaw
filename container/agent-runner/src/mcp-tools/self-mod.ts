@@ -87,16 +87,26 @@ export const installPackages: McpToolDefinition = {
 };
 
 /**
- * Query keys that name a credential. Bare nouns rather than full parameter
- * names: enumerating names does not converge (`apiKey` covered, `accessKey`
- * and `subscriptionKey` not). camelCase-normalized, then matched as whole
- * words between [_.-] separators, so `accessKey` hits while `monkey` does not.
+ * Query keys that name a credential. Mirrors the host's `isCredentialQueryKey`
+ * (src/container-config.ts).
+ *
+ * Two passes: word-bounded after camelCase splitting catches `authToken` and
+ * `api_key`, and a SUFFIX pass catches the all-lowercase compounds `apikey`,
+ * `accesskey`, `authtoken` that have no boundary to find. `monkey` and
+ * `turnkey` are refused as a deliberate cost — nobody passes those to an MCP
+ * endpoint, while `?apikey=` is how half the internet spells auth.
  */
-const SECRET_QUERY_KEY_RE =
-  /(^|[_.-])(o?auth(orization)?|token|key|secret|passw(or)?d|pwd|credentials?|bearer|jwt|sig(nature)?)([_.-]|$)/i;
+const CREDENTIAL_NOUNS = 'o?auth(orization)?|token|key|secret|passw(or)?d|pwd|credentials?|bearer|jwt|sig(nature)?';
+const SECRET_QUERY_WORD_RE = new RegExp(`(^|[_.-])(${CREDENTIAL_NOUNS})([_.-]|$)`, 'i');
+const SECRET_QUERY_SUFFIX_RE = new RegExp(`(${CREDENTIAL_NOUNS})$`, 'i');
 
 /** camelCase → snake_case before matching, so `authToken` hits the word list. */
 const CAMEL_SPLIT_RE = /([a-z0-9])([A-Z])/g;
+
+function isCredentialQueryKey(key: string): boolean {
+  const normalized = key.replace(CAMEL_SPLIT_RE, '$1_$2');
+  return SECRET_QUERY_WORD_RE.test(normalized) || SECRET_QUERY_SUFFIX_RE.test(normalized);
+}
 
 /**
  * Names and env keys reach provider config writers with structural syntax —
@@ -175,7 +185,7 @@ function parseMcpServerInput(args: Record<string, unknown>): { config: ParsedMcp
       return { error: 'url must not contain credentials or fragments; use the OneCLI gateway for authentication' };
     }
     for (const [key, value] of parsed.searchParams) {
-      if (SECRET_QUERY_KEY_RE.test(key.replace(CAMEL_SPLIT_RE, '$1_$2'))) {
+      if (isCredentialQueryKey(key)) {
         return { error: `url query parameter "${key}" looks like a credential; use the OneCLI gateway for authentication` };
       }
       if (RAW_SECRET_VALUE_RE.test(value)) {

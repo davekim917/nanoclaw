@@ -67,24 +67,35 @@ export interface SseMcpServerConfig {
 /**
  * Query keys that name a credential.
  *
- * The nouns here are bare — `key`, `token`, `secret` — rather than a list of
- * full parameter names. Enumerating names does not converge: `apiKey` was
- * covered while `accessKey`, `clientKey` and `subscriptionKey` were not, and
- * the next vendor invents another. The noun is the part that actually signals
- * a credential.
+ * Two passes, because one was never enough. Word-bounded matching after
+ * camelCase splitting catches `authToken`, `api_key` and `x-auth`, but not
+ * the all-lowercase compounds `apikey`, `accesskey` and `authtoken`, which
+ * have no boundary to find. So the noun is also matched as a SUFFIX of the
+ * whole key: credential names in the wild put it last.
  *
- * Keys are camelCase-normalized first, then matched as whole words between
- * [_.-] separators, so `accessKey` and `x-auth` hit while `author` and
- * `monkey` do not. Ordinary query params stay legal: they are endpoint
- * config, not credentials (the install's own `exa` wiring carries
- * `?tools=web_search_exa,...`). A match hard-blocks registration, because the
- * URL persists to container.json and renders on the approval card.
+ * Deliberate cost: `monkey` and `turnkey` end in a credential noun and are
+ * refused. An earlier revision protected them with word boundaries, which is
+ * exactly what let `apikey` through — and nobody passes `?monkey=` to an MCP
+ * endpoint, while `?apikey=` is how half the vendors on the internet spell
+ * authentication. A false positive costs a clear error message; a false
+ * negative writes a credential to container.json.
+ *
+ * Ordinary query params stay legal: they are endpoint config, not credentials
+ * (the install's own `exa` wiring carries `?tools=web_search_exa,...`, and a
+ * search endpoint's `?keyword=` is a prefix, not a suffix).
  */
-const SECRET_QUERY_KEY_RE =
-  /(^|[_.-])(o?auth(orization)?|token|key|secret|passw(or)?d|pwd|credentials?|bearer|jwt|sig(nature)?)([_.-]|$)/i;
+const CREDENTIAL_NOUNS = 'o?auth(orization)?|token|key|secret|passw(or)?d|pwd|credentials?|bearer|jwt|sig(nature)?';
+const SECRET_QUERY_WORD_RE = new RegExp(`(^|[_.-])(${CREDENTIAL_NOUNS})([_.-]|$)`, 'i');
+const SECRET_QUERY_SUFFIX_RE = new RegExp(`(${CREDENTIAL_NOUNS})$`, 'i');
 
 /** camelCase → snake_case before matching, so `authToken` hits the word list. */
 const CAMEL_SPLIT_RE = /([a-z0-9])([A-Z])/g;
+
+/** Whether a query parameter NAME signals a credential. */
+export function isCredentialQueryKey(key: string): boolean {
+  const normalized = key.replace(CAMEL_SPLIT_RE, '$1_$2');
+  return SECRET_QUERY_WORD_RE.test(normalized) || SECRET_QUERY_SUFFIX_RE.test(normalized);
+}
 
 /**
  * Server names and env keys end up in provider config writers that emit
@@ -250,7 +261,7 @@ export function parseMcpServerConfig(input: Record<string, unknown>): ParsedMcpS
       throw new Error('url must not contain credentials or fragments; use the OneCLI gateway for authentication');
     }
     for (const [key, value] of parsed.searchParams) {
-      if (SECRET_QUERY_KEY_RE.test(key.replace(CAMEL_SPLIT_RE, '$1_$2'))) {
+      if (isCredentialQueryKey(key)) {
         throw new Error(
           `url query parameter "${key}" looks like a credential; use the OneCLI gateway for authentication`,
         );

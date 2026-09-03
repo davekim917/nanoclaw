@@ -147,14 +147,14 @@ describe('add_mcp_server remote Streamable HTTP', () => {
     }
     // Credential nouns, not a list of names: accessKey/clientKey/subscriptionKey
     // all signal a credential even though none of them is `apiKey`.
-    for (const key of ['accessKey', 'clientKey', 'subscriptionKey']) {
+    for (const key of ['accessKey', 'clientKey', 'subscriptionKey', 'apikey', 'accesskey', 'authtoken']) {
       expect((await submit({ name: 'q', url: `https://example.com/mcp?${key}=abc123` })).error).toContain(
         'looks like a credential',
       );
     }
     // A non-credential query string is legitimate endpoint config.
     expect((await submit({ name: 'exa', url: 'https://mcp.exa.ai/mcp?tools=web_search_exa' })).payload).toBeDefined();
-    expect((await submit({ name: 'mk', url: 'https://example.com/mcp?monkey=v' })).payload).toBeDefined();
+    expect((await submit({ name: 'kw', url: 'https://example.com/mcp?keyword=v' })).payload).toBeDefined();
   });
 
   it('rejects a raw credential in the url path or a query value', async () => {
