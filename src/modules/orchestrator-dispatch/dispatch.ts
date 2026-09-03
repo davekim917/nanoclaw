@@ -36,7 +36,7 @@ async function lazyEmit(kind: string, payload: _IMP | _TEP | _SEP): Promise<void
 import { getMessagingGroup } from '../../db/messaging-groups.js';
 import { getSession } from '../../db/sessions.js';
 import { log } from '../../log.js';
-import { resolveSession, withExistingMailboxSession, writeSessionMessage } from '../../session-manager.js';
+import { resolveSession, withMailboxSession, writeSessionMessage } from '../../session-manager.js';
 import { wakeContainer } from '../../container-runner.js';
 import type { Session } from '../../types.js';
 import { CapabilityConfig, getCapabilityConfig, hasOrchestratorCapability } from './db/agent-group-capabilities.js';
@@ -473,10 +473,15 @@ async function _runHeadlessPath(task: Task, childAgentGroupId: string): Promise<
 }
 
 async function _writeSpawnTaskIdToRouting(agentGroupId: string, sessionId: string, taskId: string): Promise<void> {
-  // `withExistingMailboxSession`, not `withMailboxSession`: a child session
-  // whose mailbox is gone must not be re-provisioned by a routing stamp
-  // (invariant I-4). That is the same skip the pre-seam existsSync guard did.
-  await withExistingMailboxSession(agentGroupId, sessionId, (mailbox) => mailbox.setSessionRoutingSpawnTaskId(taskId));
+  // `withMailboxSession` — the PROVISIONING one. I-4 governs reads, and this
+  // is a write on a child session `resolveSession` just created, which may
+  // have no mailbox on disk at all yet; its first inbound message is written
+  // one line later through the same provisioning path. Taking the
+  // existing-only funnel here would skip the stamp on exactly that child and
+  // leave it running with no `spawn_task_id`, so `mountSpawnTools()` would
+  // give it no way to report progress or completion — while the very next call
+  // provisions the mailbox anyway.
+  await withMailboxSession(agentGroupId, sessionId, (mailbox) => mailbox.setSessionRoutingSpawnTaskId(taskId));
 }
 
 function _resolveParentSession(task: Task): Session | null {

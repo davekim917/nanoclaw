@@ -345,6 +345,41 @@ describe('NanoclawAgentMailbox', () => {
     expect(nestedOther).toBe(0);
   });
 
+  // A session row can exist with NO mailbox on disk yet — the shape
+  // `resolveSession` hands back before anything provisions it. Every read must
+  // take `exists()` at face value there; a WRITE on a session the caller is in
+  // the middle of creating must not, or it silently drops the write and the
+  // caller never learns. That is exactly what happened to the spawn_task_id
+  // stamp in orchestrator-dispatch: skipped on a child with no mailbox, which
+  // then ran with no way to report progress or completion.
+  //
+  // Deliberately keyed on the fully-absent shape, not the half-provisioned one
+  // (inbound.db present, outbound.db not): `exists()` answers on inbound.db
+  // ALONE, so that second shape is PRESENT and its outbound reads degrade to
+  // empty — pinned by 'a session with only inbound.db exists' below.
+  it('an unprovisioned mailbox is absent to withExistingMailboxSession and provisioned by withMailboxSession', async () => {
+    const key = freshKey();
+    expect(fs.existsSync(dbPath(key, 'inbound'))).toBe(false);
+
+    const read = await withExistingMailboxSession(key.agentGroupId, key.sessionId, async (m) =>
+      fork(m).countDueMessages(),
+    );
+    expect(read).toBeUndefined();
+    // The read did not repair it either — reads never provision.
+    expect(fs.existsSync(dbPath(key, 'inbound'))).toBe(false);
+
+    const written = await withMailboxSession(key.agentGroupId, key.sessionId, async (m) => {
+      fork(m).setSessionRoutingSpawnTaskId('task-unprovisioned');
+      return fork(m).readSessionRouting();
+    });
+    expect(written).not.toBeUndefined();
+    expect(fs.existsSync(dbPath(key, 'outbound'))).toBe(true);
+    const routing = raw(dbPath(key, 'inbound'), (db) =>
+      db.prepare('SELECT spawn_task_id FROM session_routing WHERE id = 1').get(),
+    ) as { spawn_task_id: string | null };
+    expect(routing.spawn_task_id).toBe('task-unprovisioned');
+  });
+
   it('fence holds ingress out of countDueMessages until released with the exact generation', async () => {
     const key = freshKey();
     const mailbox = getAgentMailbox();
