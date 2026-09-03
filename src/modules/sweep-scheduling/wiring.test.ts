@@ -40,9 +40,10 @@ afterEach(() => {
 });
 
 describe('the production modules barrel registers the scheduling duty source', () => {
-  it('T8, S5, S18 and S19 are registered duties after importing the real barrel', async () => {
-    // The real barrel (`src/modules/index.js`) — NOT `./index.js`, which every
-    // other case in this directory already proves registers in isolation.
+  it('the production modules barrel registers the scheduling duty source', async () => {
+    // T8, S5, S18 and S19 are registered duties after importing the real
+    // barrel (`src/modules/index.js`) — NOT `./index.js`, which every other
+    // case in this directory already proves registers in isolation.
     await import('../index.js');
     const { _listSweepRegistrationsForTesting, SWEEP_DUTY_INVENTORY } = await import('../../host-sweep.js');
 

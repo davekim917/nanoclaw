@@ -41,10 +41,11 @@ afterEach(() => {
 });
 
 describe('the production modules barrel registers the session-core duty source', () => {
-  it('S2, S3, S4 and S17 are registered — S17 on both surfaces — after importing the real barrel', async () => {
-    // The real barrel (`src/modules/index.js`), NOT `./index.js` (this
-    // family's own module, which every case in session-core.test.ts already
-    // proves registers correctly in isolation).
+  it('the production modules barrel registers the session-core duty source', async () => {
+    // S2, S3, S4 and S17 are registered — S17 on both surfaces — after
+    // importing the real barrel (`src/modules/index.js`), NOT `./index.js`
+    // (this family's own module, which every case in session-core.test.ts
+    // already proves registers correctly in isolation).
     await import('../index.js');
     const { _listSweepRegistrationsForTesting, SWEEP_DUTY_INVENTORY } = await import('../../host-sweep.js');
 
