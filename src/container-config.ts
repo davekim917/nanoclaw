@@ -156,6 +156,11 @@ export function opaqueUrlParts(url: string): string[] {
   ];
 }
 
+/** Whether a header value is the OneCLI placeholder the gateway substitutes. */
+export function isOneCliPlaceholder(value: string): boolean {
+  return ONECLI_HEADER_VALUE_RE.test(value);
+}
+
 /** Throws unless `name` is a safe MCP server name (1-64 chars of [A-Za-z0-9_-]). */
 export function validateMcpServerName(name: string): void {
   if (!MCP_SERVER_NAME_RE.test(name)) {

@@ -127,11 +127,24 @@ describe('applyAddMcpServer', () => {
     expect(text).toContain('401');
     expect(text).toContain('onecliSecrets');
 
-    // A server with no credential header gets no such tail.
-    vi.mocked(writeSessionMessage).mockClear();
-    await applyAddMcpServer({ name: 'deepwiki', type: 'http', url: 'https://mcp.deepwiki.com/mcp' }, session);
-    const plain = vi.mocked(writeSessionMessage).mock.calls.at(-1)!;
-    expect((JSON.parse(plain[2].content) as { text: string }).text).not.toContain('401');
+    // A server that authenticates with nothing gets no such tail — including
+    // one that carries only a configuration header. Claiming OneCLI auth there
+    // would send an operator after a credential that does not exist.
+    for (const server of [
+      { name: 'deepwiki', type: 'http', url: 'https://mcp.deepwiki.com/mcp' },
+      {
+        name: 'plainheaders',
+        type: 'http',
+        url: 'https://mcp.deepwiki.com/mcp',
+        headers: { 'Content-Type': 'application/json' },
+      },
+      { name: 'fs2', command: 'mcp-fs', args: [], env: {} },
+    ]) {
+      vi.mocked(writeSessionMessage).mockClear();
+      await applyAddMcpServer(server, session);
+      const plain = vi.mocked(writeSessionMessage).mock.calls.at(-1)!;
+      expect((JSON.parse(plain[2].content) as { text: string }).text).not.toContain('401');
+    }
   });
 
   it('writes a stdio server the same way', async () => {

@@ -22,6 +22,7 @@ import { getDeniedModel } from '../../db/denied-models.js';
 import { getSession } from '../../db/sessions.js';
 import { isOpenCodeModelSlug } from '../../flag-parser.js';
 import {
+  isOneCliPlaceholder,
   parseMcpServerConfig,
   updateContainerConfig,
   validateMcpServerName,
@@ -155,7 +156,12 @@ export async function applyAddMcpServer(payload: Record<string, unknown>, sessio
   updateContainerConfigJson(agentGroup.id, 'mcp_servers', fileConfig.mcpServers ?? {});
 
   // Declaring the placeholder wires the header; it does not grant the secret.
-  const needsCredential = serverConfig.type === 'http' && serverConfig.headers !== undefined;
+  // Keyed on the placeholder VALUE, not on headers being present at all — a
+  // server carrying only `Content-Type` authenticates with nothing, and
+  // telling its operator to go assign a vault secret would send them after a
+  // credential that does not exist.
+  const needsCredential =
+    serverConfig.type === 'http' && Object.values(serverConfig.headers ?? {}).some(isOneCliPlaceholder);
 
   await writeSessionMessage(session.agent_group_id, session.id, {
     id: `appr-note-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
