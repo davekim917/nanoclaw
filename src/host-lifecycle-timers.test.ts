@@ -1,3 +1,5 @@
+import { EventEmitter } from 'node:events';
+
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
@@ -372,6 +374,112 @@ describe("module intervals are unref'd and cleared on shutdown", () => {
       expect(spawnAttempts).toEqual([]);
     } finally {
       fs.rmSync(tmpRoot, { recursive: true, force: true });
+    }
+  });
+});
+
+/**
+ * F-16.3 — S2-PR16 folded into B3 as verification only.
+ *
+ * Two persistent worker threads now hang off the host lifecycle: the storage
+ * maintenance worker (S2-PR1's T-3, registered by src/modules/sweep-storage)
+ * and the archive projection worker (#324, registered by
+ * src/db/archive-projection-worker.ts and reached through container-runner.ts).
+ * Codex's PR 6 F1 finding was about shutdown OWNERSHIP — a stop that is
+ * registered twice runs twice, and a stop that is registered nowhere leaves a
+ * thread alive past `stopHostModules()`, which systemd then has to kill on its
+ * hard timeout. Exactly once, each, is the property.
+ *
+ * Hermeticity: `node:worker_threads` is faked, so no real thread starts; the
+ * child_process tripwire is armed and asserted empty.
+ */
+describe('F-16.3', () => {
+  afterEach(() => {
+    vi.doUnmock('node:worker_threads');
+    vi.doUnmock('./log.js');
+    vi.doUnmock('child_process');
+    vi.doUnmock('node:child_process');
+    vi.resetModules();
+  });
+
+  it('the projection worker and the storage worker each stop exactly once', async () => {
+    vi.resetModules();
+
+    class FakeWorker extends EventEmitter {
+      readonly terminate = vi.fn(async () => 0);
+      readonly postMessage = vi.fn();
+      unref(): void {}
+    }
+    const storageWorkers: FakeWorker[] = [];
+    vi.doMock('node:worker_threads', () => ({
+      Worker: class extends FakeWorker {
+        constructor() {
+          super();
+          storageWorkers.push(this as unknown as FakeWorker);
+        }
+      },
+    }));
+
+    const logMock = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() };
+    // `setLogScrubber` is part of log.js's surface: secret-scrubber.ts calls it
+    // at import time, and storage-manager.ts's graph reaches it.
+    vi.doMock('./log.js', () => ({ log: logMock, setLogScrubber: vi.fn() }));
+
+    const spawnAttempts: string[] = [];
+    vi.doMock('child_process', () => childProcessTripwireFactory(spawnAttempts));
+    vi.doMock('node:child_process', () => childProcessTripwireFactory(spawnAttempts));
+
+    const { startHostModules, stopHostModules, getHostShutdownCallbacks } = await import('./host-lifecycle.js');
+    const storage = await import('./storage-maintenance-worker.js');
+    const projection = await import('./db/archive-projection-worker.js');
+    // The stop half of T13 is registered by the sweep-storage FAMILY, not by
+    // the worker module it wraps — that split is what S2-PR1/S2-PR6 settled.
+    await import('./modules/sweep-storage/index.js');
+
+    // Both registrants are present, and each exactly once — the F1 property
+    // before anything runs.
+    expect(
+      getHostShutdownCallbacks()
+        .map((cb) => cb.name)
+        .sort(),
+    ).toEqual(['archiveProjectionHostShutdown', 'storageMaintenanceHostShutdown']);
+
+    await startHostModules({ db: {} as never, signal: new AbortController().signal });
+
+    // Bring both workers into existence through each module's own entry point;
+    // neither request is ever answered, so nothing runs — the close below is
+    // what rejects them.
+    const pendingStorage = storage.runStorageMaintenanceInBackground([]).catch(() => undefined);
+    const projectionWorker = new FakeWorker();
+    projection.__setArchiveProjectionWorkerFactoryForTest(() => projectionWorker as never);
+    const tmpRoot = fs.mkdtempSync('/tmp/host-lifecycle-timers-f163-');
+    const pendingProjection = projection
+      .ensureArchiveProjection(path.join(tmpRoot, 'archive.db'), path.join(tmpRoot, 'projection.db'), 'ag-f163')
+      .catch(() => undefined);
+
+    try {
+      expect(storageWorkers).toHaveLength(1);
+
+      await stopHostModules();
+      await Promise.all([pendingStorage, pendingProjection]);
+
+      expect(storageWorkers[0].terminate).toHaveBeenCalledTimes(1);
+      expect(projectionWorker.terminate).toHaveBeenCalledTimes(1);
+
+      // A clean stop, not a swallowed failure: the storage module logs this
+      // line only when its own teardown threw.
+      expect(logMock.error).not.toHaveBeenCalledWith(
+        'Storage maintenance worker failed to stop cleanly',
+        expect.anything(),
+      );
+      expect(logMock.warn).not.toHaveBeenCalledWith(
+        'storage-manager: background maintenance failed',
+        expect.anything(),
+      );
+      expect(spawnAttempts).toEqual([]);
+    } finally {
+      fs.rmSync(tmpRoot, { recursive: true, force: true });
+      projection.__setArchiveProjectionWorkerFactoryForTest(null);
     }
   });
 });

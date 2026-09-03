@@ -167,6 +167,32 @@ describe('storage maintenance start and stop are declared in one module', () => 
   });
 });
 
+// ── F-16.2 ───────────────────────────────────────────────────────────────────
+
+describe('F-16.2', () => {
+  /**
+   * S2-PR16 folded into B3 as verification only: #324 moved the archive
+   * projection off the host thread, and the seam-2 lineage inherits that
+   * through its base. The hazard this case exists for is a MERGE, not a
+   * feature — a conflict resolution on `src/container-runner.ts` that
+   * reinstates the synchronous `buildArchiveProjection(...)` call would put a
+   * multi-second blocking build back in front of every container spawn, and
+   * nothing else in this suite would notice.
+   *
+   * Source-text, deliberately: the property is "this file does not contain
+   * that call", which no runtime assertion states as directly.
+   */
+  it('the host thread never calls buildArchiveProjection directly', () => {
+    const source = fs.readFileSync(path.resolve('src/container-runner.ts'), 'utf8');
+
+    expect(source.match(/(?<!\w)buildArchiveProjection\(/g) ?? []).toEqual([]);
+    // And exactly one awaited hand-off to the worker, so the spawn path still
+    // waits for the projection rather than racing it.
+    expect(source.match(/(?<!\w)ensureArchiveProjection\(/g) ?? []).toHaveLength(1);
+    expect(source).toContain('await ensureArchiveProjection(');
+  });
+});
+
 // ── F-6.2 ────────────────────────────────────────────────────────────────────
 
 describe('F-6.2', () => {
