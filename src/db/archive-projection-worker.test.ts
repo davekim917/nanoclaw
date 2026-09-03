@@ -25,6 +25,7 @@ import {
   archiveProjectionStampPath,
   buildArchiveProjection,
   computeArchiveProjectionStamp,
+  readArchiveProjectionStamp,
 } from './per-agent-projections.js';
 
 const tmpFiles: string[] = [];
@@ -187,7 +188,7 @@ function tableNames(file: string): string[] {
 class FakeWorker extends EventEmitter {
   readonly posted: Array<Record<string, unknown>> = [];
   readonly terminate = vi.fn(async () => 0);
-  constructor(private readonly behavior: 'build' | 'fail' = 'build') {
+  constructor(private readonly behavior: 'build' | 'fail' | 'partial' = 'build') {
     super();
   }
   postMessage(message: Record<string, unknown>): void {
@@ -195,6 +196,13 @@ class FakeWorker extends EventEmitter {
     queueMicrotask(() => {
       if (this.behavior === 'fail') {
         this.emit('message', { id: message.id, ok: false, error: 'source is corrupt' });
+        return;
+      }
+      if (this.behavior === 'partial') {
+        // What a build that dies after writing the schema leaves behind: a
+        // non-empty file with no rows in it.
+        fs.writeFileSync(message.dstPath as string, 'SQLite format 3\u0000partial');
+        this.emit('message', { id: message.id, ok: false, error: 'disk went away mid-build' });
         return;
       }
       try {
@@ -212,7 +220,7 @@ class FakeWorker extends EventEmitter {
   }
 }
 
-function useFakeWorker(behavior: 'build' | 'fail' = 'build'): FakeWorker {
+function useFakeWorker(behavior: 'build' | 'fail' | 'partial' = 'build'): FakeWorker {
   const worker = new FakeWorker(behavior);
   __setArchiveProjectionWorkerFactoryForTest(() => worker as never);
   return worker;
@@ -537,5 +545,94 @@ describe('#315 — ground truth for the projection contents', () => {
     expect(source).toContain('.iterate(...workgroupMemberIds)');
     expect(source).toContain('.iterate(agentGroupId)');
     expect(source).not.toMatch(/\.all\(\.\.\.workgroupMemberIds\)/);
+  });
+});
+
+describe('#315 review r2 — the stamp cannot be reached from a container', () => {
+  it('keeps the stamp out of the session directory that is bind-mounted read-write', async () => {
+    const src = makeTwoWorkgroupSource('stamp-location');
+    useFakeWorker();
+    const dst = tmpPath('stamp-location-dst');
+    await ensureArchiveProjection(src, dst, 'ag-one-a', ['ag-one-a']);
+
+    const stampPath = archiveProjectionStampPath(dst);
+    expect(fs.existsSync(stampPath)).toBe(true);
+    expect(stampPath).not.toBe(`${dst}.stamp.json`);
+    expect(path.dirname(stampPath).endsWith(`${path.sep}projection-stamps`)).toBe(true);
+
+    // The property that matters, stated against a real session layout rather
+    // than the test's temp paths: `buildMounts` mounts the whole session
+    // directory read-write at /workspace, so nothing the host later writes by
+    // name may live inside it. A sidecar there could be swapped for a symlink
+    // and the next stamp write would truncate whatever it pointed at.
+    const sessionDirectory = path.join(os.tmpdir(), 'v2-sessions', 'ag-mounted', 'sess-mounted');
+    const projectionInSession = path.join(sessionDirectory, 'archive.db');
+    expect(archiveProjectionStampPath(projectionInSession).startsWith(`${sessionDirectory}${path.sep}`)).toBe(false);
+  });
+
+  it('refuses to follow a symlink planted at the stamp path', async () => {
+    const src = makeTwoWorkgroupSource('stamp-symlink');
+    useFakeWorker();
+    const dst = tmpPath('stamp-symlink-dst');
+    await ensureArchiveProjection(src, dst, 'ag-one-a', ['ag-one-a']);
+
+    const stampPath = archiveProjectionStampPath(dst);
+    const victim = tmpPath('stamp-symlink-victim');
+    fs.writeFileSync(victim, 'precious host data');
+    fs.rmSync(stampPath, { force: true });
+    fs.symlinkSync(victim, stampPath);
+
+    // A symlinked stamp reads as no stamp, and the rebuild that follows
+    // replaces the link itself rather than writing through it.
+    expect(readArchiveProjectionStamp(dst)).toBeNull();
+    await ensureArchiveProjection(src, dst, 'ag-one-a', ['ag-one-a']);
+    expect(fs.readFileSync(victim, 'utf-8')).toBe('precious host data');
+    expect(fs.lstatSync(stampPath).isSymbolicLink()).toBe(false);
+  });
+});
+
+describe('#315 review r2 — a partial rebuild is never served as fresh', () => {
+  it('does not reuse a partial projection left beside a still-matching earlier stamp', async () => {
+    const src = makeTwoWorkgroupSource('partial');
+    const scope = ['ag-one-a', 'ag-one-b'];
+    const dst = tmpPath('partial-dst');
+
+    // A good build first, so a matching stamp exists on disk.
+    useFakeWorker('build');
+    await ensureArchiveProjection(src, dst, 'ag-one-a', scope);
+    expect(archiveProjectionIsFresh(dst, computeArchiveProjectionStamp(src, 'ag-one-a', scope))).toBe(true);
+
+    // Storage cleanup reclaims the projection but not the stamp.
+    fs.unlinkSync(dst);
+
+    // The rebuild dies after writing the schema, leaving a non-empty file.
+    useFakeWorker('partial');
+    await expect(ensureArchiveProjection(src, dst, 'ag-one-a', scope)).rejects.toThrow(/disk went away/);
+    expect(fs.existsSync(dst)).toBe(true);
+    expect(fs.statSync(dst).size).toBeGreaterThan(0);
+
+    // The source has not moved, so an earlier stamp surviving here would make
+    // this partial file look current.
+    expect(archiveProjectionIsFresh(dst, computeArchiveProjectionStamp(src, 'ag-one-a', scope))).toBe(false);
+
+    const worker = useFakeWorker('build');
+    await ensureArchiveProjection(src, dst, 'ag-one-a', scope);
+    expect(worker.posted).toHaveLength(1);
+    expect(allRows(dst).map((row) => row.text)).toContain('shared question');
+  });
+
+  it('drops the stamp before dispatching, not after succeeding', async () => {
+    const src = makeTwoWorkgroupSource('invalidate-first');
+    const scope = ['ag-one-a'];
+    const dst = tmpPath('invalidate-first-dst');
+
+    useFakeWorker('build');
+    await ensureArchiveProjection(src, dst, 'ag-one-a', scope);
+    expect(readArchiveProjectionStamp(dst)).not.toBeNull();
+
+    useFakeWorker('fail');
+    // Force a rebuild by changing the scope, then fail it.
+    await expect(ensureArchiveProjection(src, dst, 'ag-one-a', ['ag-one-a', 'ag-one-b'])).rejects.toThrow();
+    expect(readArchiveProjectionStamp(dst)).toBeNull();
   });
 });

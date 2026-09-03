@@ -18,9 +18,13 @@
  * The on-disk projection files live alongside the session DBs at
  * `data/v2-sessions/<ag>/<sess>/archive.db` and `central.db`.
  */
+import { createHash } from 'crypto';
 import fs from 'fs';
+import path from 'path';
+
 import Database from 'better-sqlite3';
 
+import { DATA_DIR } from '../config.js';
 import { log } from '../log.js';
 
 /**
@@ -303,24 +307,78 @@ export function computeArchiveProjectionStamp(
   };
 }
 
-/** Sidecar path holding the stamp. Never mounted into a container. */
+/**
+ * Where the stamp lives: a host-only tree under `DATA_DIR`, never a sidecar
+ * beside the projection.
+ *
+ * The projection sits in the session directory, and `buildMounts` bind-mounts
+ * that entire directory read-write at `/workspace`. A sidecar there would be
+ * container-writable, so a compromised container could replace it with a
+ * relative symlink and the host's next stamp write would follow it and
+ * truncate the target — the central database, say — as the host user. The
+ * projection file itself is safe from that because it is re-mounted read-only
+ * over its own path; a new sidecar had no such cover. Keeping stamps out of
+ * every mounted tree removes the class rather than guarding one instance of
+ * it. `writeArchiveProjectionStamp` still refuses to follow a symlink.
+ *
+ * Named by digest because the projection's absolute path is too long and too
+ * punctuated to be a filename. The path it describes is stored inside the
+ * stamp, so an operator can still tell which session a file belongs to.
+ */
 export function archiveProjectionStampPath(dstPath: string): string {
-  return `${dstPath}.stamp.json`;
+  const digest = createHash('sha256').update(path.resolve(dstPath)).digest('hex').slice(0, 32);
+  return path.join(DATA_DIR, 'projection-stamps', `${digest}.json`);
 }
 
 export function readArchiveProjectionStamp(dstPath: string): ArchiveProjectionStamp | null {
+  const stampPath = archiveProjectionStampPath(dstPath);
+  let handle: number | undefined;
   try {
-    return JSON.parse(fs.readFileSync(archiveProjectionStampPath(dstPath), 'utf-8')) as ArchiveProjectionStamp;
+    // O_NOFOLLOW: a stamp that has become a symlink is not a stamp. Reading it
+    // would be harmless on its own, but refusing keeps read and write agreeing
+    // on what counts as a valid stamp file.
+    handle = fs.openSync(stampPath, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+    return JSON.parse(fs.readFileSync(handle, 'utf-8')) as ArchiveProjectionStamp;
   } catch {
     return null;
+  } finally {
+    if (handle !== undefined) fs.closeSync(handle);
   }
 }
 
 export function writeArchiveProjectionStamp(dstPath: string, stamp: ArchiveProjectionStamp): void {
-  // Written after the projection, so a crash between the two leaves a missing
-  // or older stamp — which forces a rebuild. The failure mode is a wasted
-  // rebuild, never a stale projection served as fresh.
-  fs.writeFileSync(archiveProjectionStampPath(dstPath), JSON.stringify(stamp));
+  // Written only after the projection succeeds. `ensureArchiveProjection`
+  // removes any earlier stamp BEFORE dispatching a build, so a crash between
+  // the two leaves no stamp at all and the next spawn rebuilds. The failure
+  // mode is a wasted rebuild, never a partial projection served as fresh.
+  const stampPath = archiveProjectionStampPath(dstPath);
+  fs.mkdirSync(path.dirname(stampPath), { recursive: true });
+  // Unlink first, then create exclusively: O_CREAT|O_EXCL never follows a
+  // symlink, and `rm` removes a symlink itself rather than its target. Belt
+  // and braces — this tree is not mounted anywhere.
+  fs.rmSync(stampPath, { force: true });
+  const handle = fs.openSync(
+    stampPath,
+    fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW,
+    0o600,
+  );
+  try {
+    fs.writeFileSync(handle, JSON.stringify({ ...stamp, dstPath: path.resolve(dstPath) }));
+  } finally {
+    fs.closeSync(handle);
+  }
+}
+
+/**
+ * Drop the stamp, so nothing on disk claims the projection is current.
+ *
+ * Called before every rebuild. Without it, a rebuild that leaves a non-empty
+ * partial file behind — the schema is written before any row — would sit next
+ * to a still-matching earlier stamp, and the next spawn would mount that
+ * partial projection as fresh.
+ */
+export function removeArchiveProjectionStamp(dstPath: string): void {
+  fs.rmSync(archiveProjectionStampPath(dstPath), { force: true });
 }
 
 /**
@@ -345,7 +403,10 @@ export function archiveProjectionIsFresh(dstPath: string, stamp: ArchiveProjecti
   } catch {
     return false;
   }
-  return JSON.stringify(previous) === JSON.stringify(stamp);
+  // Compare only the fields that decide the contents. `dstPath` is recorded
+  // for operators, not for the decision.
+  const { dstPath: _recordedPath, ...comparable } = previous as ArchiveProjectionStamp & { dstPath?: string };
+  return JSON.stringify(comparable) === JSON.stringify(stamp);
 }
 
 /**

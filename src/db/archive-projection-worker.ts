@@ -32,6 +32,7 @@ import {
   archiveProjectionIsFresh,
   buildArchiveProjection,
   computeArchiveProjectionStamp,
+  removeArchiveProjectionStamp,
   writeArchiveProjectionStamp,
 } from './per-agent-projections.js';
 import type { ArchiveProjectionRequest, ArchiveProjectionResponse } from './archive-projection-worker-thread.js';
@@ -179,6 +180,13 @@ export async function ensureArchiveProjection(
     });
     return;
   }
+
+  // Invalidate BEFORE building. A build can leave a non-empty partial file
+  // behind — the schema is written before the first row — and an earlier stamp
+  // that still matches the unchanged source would make the next spawn mount
+  // that partial projection as fresh. Storage cleanup deleting the projection
+  // and leaving the stamp is one way to get there.
+  removeArchiveProjectionStamp(dstPath);
 
   const startedAt = Date.now();
   let bytes: number;
