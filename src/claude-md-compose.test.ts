@@ -15,7 +15,11 @@ vi.mock('./log.js', () => ({
 }));
 
 import { composeGroupClaudeMd } from './claude-md-compose.js';
-import { ensureContainerConfig, updateContainerConfigScalars } from './db/container-configs.js';
+import {
+  ensureContainerConfig,
+  updateContainerConfigJson,
+  updateContainerConfigScalars,
+} from './db/container-configs.js';
 import { closeDb, createAgentGroup, initTestDb, runMigrations } from './db/index.js';
 import { STANDING_INSTRUCTIONS_FILE } from './group-persona.js';
 import type { AgentGroup } from './types.js';
@@ -153,9 +157,6 @@ describe('composeGroupClaudeMd persona prepend', () => {
     const doc = docOf(ag.folder);
     expect(doc).toContain('You are an SDR agent.');
     expect(doc.indexOf('You are an SDR agent.')).toBeLessThan(doc.indexOf(SHARED_BASE_SENTINEL));
-    expect(
-      fs.readFileSync(path.join(GROUPS_DIR, ag.folder, '.claude-fragments', 'standing-instructions.md'), 'utf-8'),
-    ).toBe('You are an SDR agent.');
   });
 
   it('keeps the persona across a second compose (not pruned)', () => {
@@ -166,7 +167,6 @@ describe('composeGroupClaudeMd persona prepend', () => {
     composeGroupClaudeMd(ag, 'claude');
     composeGroupClaudeMd(ag, 'claude');
 
-    expect(fs.existsSync(path.join(GROUPS_DIR, ag.folder, '.claude-fragments', 'standing-instructions.md'))).toBe(true);
     const doc = docOf(ag.folder);
     expect(doc).toContain('persona body');
     expect(doc.indexOf('persona body')).toBeLessThan(doc.indexOf(SHARED_BASE_SENTINEL));
@@ -182,9 +182,47 @@ describe('composeGroupClaudeMd persona prepend', () => {
     expect(doc).toContain(SHARED_BASE_SENTINEL);
     // The shared base is the first section after the composed header.
     expect(doc.split('\n')[1]).toBe('# Shared base');
-    expect(fs.existsSync(path.join(GROUPS_DIR, ag.folder, '.claude-fragments', 'standing-instructions.md'))).toBe(
-      false,
-    );
+  });
+});
+
+describe('no vestigial fragment/symlink artifacts are written (post issue #233 inlining)', () => {
+  // Before every instruction section was inlined into CLAUDE.md/AGENTS.md,
+  // composeGroupClaudeMd also wrote a `.claude-shared.md` symlink and a
+  // `.claude-fragments/` directory of per-fragment files so the composed doc
+  // could `@`-import them. Both are superseded now that every section is
+  // read from its host path and written into the doc directly.
+  it('never creates .claude-fragments or .claude-shared.md', () => {
+    const ag = group('ag-no-artifacts', 'no-artifacts-group');
+    seed(ag);
+    writePersona(ag.folder, 'persona body\n');
+    updateContainerConfigJson(ag.id, 'mcp_servers', {
+      demo: { command: 'demo', instructions: 'demo instructions' },
+    });
+
+    composeGroupClaudeMd(ag, 'codex');
+
+    const groupDir = path.join(GROUPS_DIR, ag.folder);
+    expect(fs.existsSync(path.join(groupDir, '.claude-fragments'))).toBe(false);
+    expect(fs.existsSync(path.join(groupDir, '.claude-shared.md'))).toBe(false);
+  });
+
+  it('deletes a stale .claude-fragments/ and .claude-shared.md left by a pre-cutover compose, idempotently', () => {
+    const ag = group('ag-cleanup', 'cleanup-group');
+    seed(ag);
+    const groupDir = path.join(GROUPS_DIR, ag.folder);
+    fs.mkdirSync(path.join(groupDir, '.claude-fragments'), { recursive: true });
+    fs.writeFileSync(path.join(groupDir, '.claude-fragments', 'stale-fragment.md'), 'stale');
+    fs.symlinkSync('/app/CLAUDE.md', path.join(groupDir, '.claude-shared.md'));
+
+    composeGroupClaudeMd(ag, 'claude');
+
+    expect(fs.existsSync(path.join(groupDir, '.claude-fragments'))).toBe(false);
+    expect(fs.existsSync(path.join(groupDir, '.claude-shared.md'))).toBe(false);
+
+    // Idempotent: nothing stale is left, so a second compose is a clean no-op.
+    expect(() => composeGroupClaudeMd(ag, 'claude')).not.toThrow();
+    expect(fs.existsSync(path.join(groupDir, '.claude-fragments'))).toBe(false);
+    expect(fs.existsSync(path.join(groupDir, '.claude-shared.md'))).toBe(false);
   });
 });
 
@@ -197,7 +235,6 @@ describe('composeGroupClaudeMd scheduling instructions through ncl tasks', () =>
 
     const doc = docOf(ag.folder);
     expect(doc).toContain(MODULE_CLI_SENTINEL);
-    expect(fs.existsSync(path.join(GROUPS_DIR, ag.folder, '.claude-fragments', 'module-scheduling.md'))).toBe(false);
     expect(
       fs.readFileSync(
         path.join(process.cwd(), 'container', 'agent-runner', 'src', 'mcp-tools', 'cli.instructions.md'),
@@ -214,8 +251,6 @@ describe('composeGroupClaudeMd scheduling instructions through ncl tasks', () =>
     composeGroupClaudeMd(ag, 'claude');
 
     expect(docOf(ag.folder)).not.toContain(MODULE_CLI_SENTINEL);
-    expect(fs.existsSync(path.join(GROUPS_DIR, ag.folder, '.claude-fragments', 'module-cli.md'))).toBe(false);
-    expect(fs.existsSync(path.join(GROUPS_DIR, ag.folder, '.claude-fragments', 'module-scheduling.md'))).toBe(false);
   });
 });
 
@@ -226,7 +261,8 @@ describe('instruction-stack-prune L2 fragment retirement (acceptance criterion 2
 
     composeGroupClaudeMd(ag, 'claude');
 
-    expect(docOf(ag.folder)).toContain(MODULE_CLI_SENTINEL);
+    const doc = docOf(ag.folder);
+    expect(doc).toContain(MODULE_CLI_SENTINEL);
     for (const retired of [
       'module-agents.md',
       'module-core.md',
@@ -234,7 +270,9 @@ describe('instruction-stack-prune L2 fragment retirement (acceptance criterion 2
       'module-orchestrator-workers.md',
       'skill-onecli-gateway.md',
     ]) {
-      expect(fs.existsSync(path.join(GROUPS_DIR, ag.folder, '.claude-fragments', retired))).toBe(false);
+      // Retired fragments never had a `<name>.instructions.md` source under
+      // mcp-tools/, so their name can never appear as composed content.
+      expect(doc).not.toContain(retired);
     }
   });
 });
@@ -247,7 +285,6 @@ describe('session capability authority', () => {
     composeGroupClaudeMd(ag, 'claude');
 
     expect(docOf(ag.folder)).not.toContain('session-capabilities');
-    expect(fs.existsSync(path.join(GROUPS_DIR, ag.folder, '.claude-fragments', 'session-capabilities.md'))).toBe(false);
   });
 });
 

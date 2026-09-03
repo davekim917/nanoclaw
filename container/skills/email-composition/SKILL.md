@@ -61,7 +61,7 @@ human mail looks like this.
 
 ## Body: draft, then humanize
 
-`/app/CLAUDE.md` already requires `humanizer` on outbound prose. Treat it as the
+Your CLAUDE.md already requires `humanizer` on outbound prose. Treat it as the
 drafting step, not a final polish: write the body, pass the **whole** body
 through `humanizer`, and run it again after any substantive edit. A prior run
 does not cover a new revision.
