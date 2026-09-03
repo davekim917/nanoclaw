@@ -234,7 +234,6 @@ function fakeSession(): Session {
   };
 }
 
-
 describe('parseSqliteUtc', () => {
   // Regression: SQLite TIMESTAMP strings have no zone marker, but Date.parse
   // treats those as local time. On non-UTC hosts this made every claim look
