@@ -13,18 +13,18 @@
  * src/host-sweep-registry.test.ts alongside the other family-duty mocks that
  * file already carries.
  *
- * Registration goes through `registerSweepFamily`, not `registerSweepDuty`
+ * Registration goes through `registerSweepDutySource`, not `registerSweepDuty`
  * directly, so `_resetSweepRegistryForTesting()` can replay it — see the
- * comment above `registerSweepFamily` in src/host-sweep.ts.
+ * comment above `registerSweepDutySource` in src/host-sweep.ts.
  */
 import { pruneChannelIngressReceipts } from '../../db/channel-ingress-receipts.js';
-import { registerSweepDuty, registerSweepFamily, SWEEP_DUTY_INVENTORY } from '../../host-sweep.js';
+import { registerSweepDuty, registerSweepDutySource, SWEEP_DUTY_INVENTORY } from '../../host-sweep.js';
 import { log } from '../../log.js';
 import { pruneSteerIdempotency } from './steer-idempotency.js';
 
-const id = SWEEP_DUTY_INVENTORY;
+function registerCentralSweepDuties(): void {
+  const id = SWEEP_DUTY_INVENTORY;
 
-registerSweepFamily(() => {
   registerSweepDuty({
     name: id.T7,
     phase: 'tick:housekeeping',
@@ -107,4 +107,6 @@ registerSweepFamily(() => {
         });
     },
   });
-});
+}
+
+registerSweepDutySource('sweep-central', registerCentralSweepDuties);
