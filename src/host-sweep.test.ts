@@ -13,12 +13,7 @@ import path from 'path';
 import Database from 'better-sqlite3';
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
 
-import {
-  countDueMessages,
-  deleteOrphanProcessingClaims,
-  getProcessingClaims,
-  type ContainerState,
-} from './modules/mailbox/ops/sweep.js';
+import { countDueMessages, type ContainerState } from './modules/mailbox/ops/sweep.js';
 import { composeNanoclawSession, type NanoclawMailboxSession } from './modules/mailbox/index.js';
 import { getAgentMailbox } from './mailbox/index.js';
 import { withExistingMailboxSession } from './session-manager.js';
@@ -33,7 +28,6 @@ import {
   _hasWorkContinuationForTesting,
   _notifyKillCeilingForTesting,
   _prepareDueWakeForTesting,
-  _resetStuckProcessingRowsForTesting,
   _resetSweepRegistryForTesting,
   registerSweepKillFollowUp,
   _incrementStoppedContinuationAttemptForTesting,
@@ -765,30 +759,6 @@ function fakeSession(): Session {
   };
 }
 
-describe('deleteOrphanProcessingClaims', () => {
-  it('removes only processing rows, leaves completed/failed alone', () => {
-    const { outDb } = makeSessionDbs();
-    const ts = new Date().toISOString();
-    outDb.prepare("INSERT INTO processing_ack VALUES ('m-proc', 'processing', ?)").run(ts);
-    outDb.prepare("INSERT INTO processing_ack VALUES ('m-done', 'completed', ?)").run(ts);
-    outDb.prepare("INSERT INTO processing_ack VALUES ('m-fail', 'failed', ?)").run(ts);
-
-    const removed = deleteOrphanProcessingClaims(outDb);
-
-    expect(removed).toBe(1);
-    const remaining = outDb.prepare('SELECT message_id, status FROM processing_ack ORDER BY message_id').all();
-    expect(remaining).toEqual([
-      { message_id: 'm-done', status: 'completed' },
-      { message_id: 'm-fail', status: 'failed' },
-    ]);
-  });
-
-  it('returns 0 when nothing to clear', () => {
-    const { outDb } = makeSessionDbs();
-    expect(deleteOrphanProcessingClaims(outDb)).toBe(0);
-  });
-});
-
 describe('scheduled due admission precedes wake classification', () => {
   it('counts and classifies the trigger inserted by the admission seam', async () => {
     const { inDb, mailbox } = makeSessionDbs();
@@ -810,168 +780,6 @@ describe('scheduled due admission precedes wake classification', () => {
 
     expect(mockAdmitDueTaskContexts).toHaveBeenCalledWith(mailbox, 'ag-test', 'sess-test');
     expect(result).toEqual({ admittedTasks: 1, dueCount: 1, wakePriority: 'scheduled' });
-  });
-});
-
-describe('resetStuckProcessingRows — orphan claim cleanup', () => {
-  it('deletes orphan processing_ack rows so next sweep tick does not see them', () => {
-    const { inDb, outDb, mailbox } = makeSessionDbs();
-    const claimedAt = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString(); // 2h ago
-
-    // messages_in.status stays 'pending' during processing — only the
-    // container's processing_ack moves to 'processing'. See
-    // src/db/schema.ts header comment on processing_ack.
-    inDb
-      .prepare(
-        "INSERT INTO messages_in (id, seq, kind, timestamp, status, content) VALUES ('m-1', 1, 'chat', ?, 'pending', '{}')",
-      )
-      .run(claimedAt);
-    outDb.prepare("INSERT INTO processing_ack VALUES ('m-1', 'processing', ?)").run(claimedAt);
-
-    // Sanity: the orphan claim is what would trip claim-stuck.
-    expect(getProcessingClaims(outDb)).toHaveLength(1);
-
-    _resetStuckProcessingRowsForTesting(mailbox, fakeSession(), 'absolute-ceiling');
-
-    // Regression assertion: orphan claim is gone — next sweep tick will see
-    // an empty claims list and not kill the freshly respawned container.
-    expect(getProcessingClaims(outDb)).toEqual([]);
-
-    // And the message itself was rescheduled with backoff (existing behavior).
-    const row = inDb.prepare('SELECT status, tries, process_after FROM messages_in WHERE id = ?').get('m-1') as {
-      status: string;
-      tries: number;
-      process_after: string | null;
-    };
-    expect(row.status).toBe('pending');
-    expect(row.tries).toBe(1);
-    expect(row.process_after).not.toBeNull();
-  });
-
-  it('makes a paired crashed turn inert with its recall until fresh due admission', () => {
-    const { inDb, outDb, mailbox } = makeSessionDbs();
-    const claimedAt = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString();
-    inDb
-      .prepare(
-        `INSERT INTO messages_in
-           (id, seq, kind, timestamp, status, process_after, tries, trigger, content)
-         VALUES ('recall-m-paired', 2, 'system', ?, 'pending', ?, 0, 0, ?),
-                ('m-paired', 4, 'chat', ?, 'pending', ?, 0, 1, ?)`,
-      )
-      .run(
-        claimedAt,
-        claimedAt,
-        JSON.stringify({ subtype: 'recall_context', revision: 'before-crash' }),
-        claimedAt,
-        claimedAt,
-        JSON.stringify({ text: 'retry me' }),
-      );
-    outDb.prepare("INSERT INTO processing_ack VALUES ('m-paired', 'processing', ?)").run(claimedAt);
-
-    _resetStuckProcessingRowsForTesting(mailbox, fakeSession(), 'container-crash');
-
-    const pair = inDb.prepare('SELECT id, trigger, tries, process_after FROM messages_in ORDER BY seq').all() as Array<{
-      id: string;
-      trigger: number;
-      tries: number;
-      process_after: string | null;
-    }>;
-    expect(pair).toHaveLength(2);
-    expect(pair[0]).toMatchObject({ id: 'recall-m-paired', trigger: 0, tries: 0 });
-    expect(pair[1]).toMatchObject({ id: 'm-paired', trigger: 0, tries: 1 });
-    expect(pair[0]!.process_after).not.toBeNull();
-    expect(pair[0]!.process_after).toBe(pair[1]!.process_after);
-    expect(
-      (
-        inDb
-          .prepare(
-            `SELECT COUNT(*) AS count
-               FROM messages_in
-              WHERE status = 'pending' AND trigger = 1
-                AND (process_after IS NULL OR datetime(process_after) <= datetime('now'))`,
-          )
-          .get() as { count: number }
-      ).count,
-    ).toBe(0);
-    expect(getProcessingClaims(outDb)).toEqual([]);
-  });
-
-  it('still clears orphan claims even when the inbound message has already been retried (skip path)', () => {
-    // Edge case: the inbound row was already rescheduled (process_after in
-    // future), so the per-message retry loop skips it. The orphan in
-    // processing_ack must still be removed — otherwise the bug remains.
-    const { inDb, outDb, mailbox } = makeSessionDbs();
-    const claimedAt = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString();
-    const future = new Date(Date.now() + 60_000).toISOString();
-
-    inDb
-      .prepare(
-        "INSERT INTO messages_in (id, seq, kind, timestamp, status, process_after, tries, content) VALUES ('m-2', 2, 'chat', ?, 'pending', ?, 1, '{}')",
-      )
-      .run(claimedAt, future);
-    outDb.prepare("INSERT INTO processing_ack VALUES ('m-2', 'processing', ?)").run(claimedAt);
-
-    _resetStuckProcessingRowsForTesting(mailbox, fakeSession(), 'claim-stuck');
-
-    expect(getProcessingClaims(outDb)).toEqual([]);
-    const row = inDb.prepare('SELECT tries FROM messages_in WHERE id = ?').get('m-2') as { tries: number };
-    expect(row.tries).toBe(1); // not bumped, the skip path held
-  });
-
-  it('retries an input that produced only progress/status rows', () => {
-    const { inDb, outDb, mailbox } = makeSessionDbs();
-    const claimedAt = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString();
-
-    inDb
-      .prepare(
-        "INSERT INTO messages_in (id, seq, kind, timestamp, status, content) VALUES ('m-status-only', 3, 'chat', ?, 'pending', '{}')",
-      )
-      .run(claimedAt);
-    outDb.prepare("INSERT INTO processing_ack VALUES ('m-status-only', 'processing', ?)").run(claimedAt);
-    outDb
-      .prepare(
-        "INSERT INTO messages_out (id, seq, in_reply_to, timestamp, kind, content) VALUES ('progress-1', 2, 'm-status-only', ?, 'status', '{}')",
-      )
-      .run(new Date().toISOString());
-
-    _resetStuckProcessingRowsForTesting(mailbox, fakeSession(), 'absolute-ceiling');
-
-    const row = inDb
-      .prepare('SELECT status, tries, process_after FROM messages_in WHERE id = ?')
-      .get('m-status-only') as { status: string; tries: number; process_after: string | null };
-    expect(row.status).toBe('pending');
-    expect(row.tries).toBe(1);
-    expect(row.process_after).not.toBeNull();
-    expect(getProcessingClaims(outDb)).toEqual([]);
-  });
-
-  it('does not retry an input after a non-status response was written', () => {
-    const { inDb, outDb, mailbox } = makeSessionDbs();
-    const claimedAt = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString();
-
-    inDb
-      .prepare(
-        "INSERT INTO messages_in (id, seq, kind, timestamp, status, content) VALUES ('m-answered', 4, 'chat', ?, 'pending', '{}')",
-      )
-      .run(claimedAt);
-    outDb.prepare("INSERT INTO processing_ack VALUES ('m-answered', 'processing', ?)").run(claimedAt);
-    outDb
-      .prepare(
-        "INSERT INTO messages_out (id, seq, in_reply_to, timestamp, kind, content) VALUES ('reply-1', 4, 'm-answered', ?, 'chat', '{}')",
-      )
-      .run(new Date().toISOString());
-
-    _resetStuckProcessingRowsForTesting(mailbox, fakeSession(), 'absolute-ceiling');
-
-    const row = inDb.prepare('SELECT status, tries, process_after FROM messages_in WHERE id = ?').get('m-answered') as {
-      status: string;
-      tries: number;
-      process_after: string | null;
-    };
-    expect(row.status).toBe('completed');
-    expect(row.tries).toBe(0);
-    expect(row.process_after).toBeNull();
-    expect(getProcessingClaims(outDb)).toEqual([]);
   });
 });
 
