@@ -247,6 +247,72 @@ describe('tasks CLI resource', () => {
     expect(overridden.ok).toBe(true);
   });
 
+  it('update rejects an empty --prompt instead of blanking the series', async () => {
+    // A wired channel session, so the create actually stamps routing and the
+    // "nothing was touched" assertion below has something real to check.
+    createMg('mg-1');
+    createMgSession('ag-1', 'chan-1', 'mg-1');
+    const created = await dispatch(
+      {
+        id: 'c',
+        command: 'tasks-create',
+        args: { prompt: 'keep me', name: 'blank-guard', recurrence: '0 9 * * *' },
+      },
+      agentCtx('ag-1', 'chan-1'),
+    );
+    expect(created.ok).toBe(true);
+    if (!created.ok) return;
+    const seriesId = (created.data as { series_id: string }).series_id;
+    expect((created.data as { routed: unknown }).routed).toEqual({
+      channel_type: 'slack',
+      platform_id: 'C123',
+      thread_id: null,
+    });
+
+    for (const prompt of ['', '   \n']) {
+      const upd = await dispatch(
+        { id: 'u', command: 'tasks-update', args: { id: seriesId, prompt } },
+        agentCtx('ag-1', 'chan-1'),
+      );
+      expect(upd.ok).toBe(false);
+      if (!upd.ok) expect(upd.error.message).toContain('--prompt must not be empty');
+    }
+
+    // The row is untouched: prompt intact AND the routing stamp the fork
+    // writes at create time still on it, so a refused update cannot strand a
+    // series with no delivery target.
+    const got = await dispatch({ id: 'g', command: 'tasks-get', args: { id: seriesId } }, agentCtx('ag-1', 'chan-1'));
+    expect(got.ok).toBe(true);
+    if (!got.ok) return;
+    expect((got.data as { prompt: string }).prompt).toBe('keep me');
+    expect((got.data as { routed: unknown }).routed).toEqual({
+      channel_type: 'slack',
+      platform_id: 'C123',
+      thread_id: null,
+    });
+  });
+
+  it('update still accepts a non-empty prompt and a whitespace-padded one', async () => {
+    const created = await dispatch(
+      { id: 'c2', command: 'tasks-create', args: { prompt: 'before', name: 'blank-ok', recurrence: '0 9 * * *' } },
+      agentCtx(),
+    );
+    expect(created.ok).toBe(true);
+    if (!created.ok) return;
+    const seriesId = (created.data as { series_id: string }).series_id;
+
+    const upd = await dispatch(
+      { id: 'u2', command: 'tasks-update', args: { id: seriesId, prompt: '  after  ' } },
+      agentCtx(),
+    );
+    expect(upd.ok).toBe(true);
+
+    const got = await dispatch({ id: 'g2', command: 'tasks-get', args: { id: seriesId } }, agentCtx());
+    expect(got.ok).toBe(true);
+    // Stored verbatim — the guard only rejects, it never trims what it accepts.
+    if (got.ok) expect((got.data as { prompt: string }).prompt).toBe('  after  ');
+  });
+
   it('a --script gate exempts frequent recurrence — the sanctioned monitor pattern', async () => {
     const scripted = await dispatch(
       {
