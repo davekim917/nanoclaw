@@ -67,6 +67,20 @@ export function containerRunsAsHostUser(uid: number | undefined = process.getuid
   return uid != null && uid !== 0 && uid !== 1000;
 }
 
+/**
+ * Will this spawn hand the container a credential VALUE in its env, rather than
+ * a path to a mounted file? True under the rollback flag, and true on the host
+ * uids whose container cannot read a host-owned file.
+ *
+ * One predicate, two callers: `planGitHubTokenSpawn` acts on it, and the
+ * capabilities snapshot describes it to the agent. Splitting them would let the
+ * snapshot tell an agent "there is no GITHUB_TOKEN in your env" on an install
+ * where there is one.
+ */
+export function githubTokenDeliveredAsEnv(env: NodeJS.ProcessEnv = process.env, uid?: number): boolean {
+  return githubTokenInEnv(env) || !containerRunsAsHostUser(uid);
+}
+
 export function groupTokenDir(agentGroupId: string, dataDir: string = DATA_DIR): string {
   // The id becomes a path segment. Ids are host-generated (`ag-<ms>-<rand>`),
   // but a traversal here would let one group's spawn write over another's token
@@ -140,19 +154,18 @@ export function planGitHubTokenSpawn(opts: {
   const { agentGroupId, token } = opts;
   const env = opts.env ?? process.env;
   const dataDir = opts.dataDir ?? DATA_DIR;
-  if (githubTokenInEnv(env)) {
-    return { envArgs: ['-e', `GH_TOKEN=${token}`, '-e', `GITHUB_TOKEN=${token}`] };
-  }
   // Root and uid-1000 hosts run the container as the image's own user, which
   // cannot read a host-owned 0600 file. Fall back to the env lane rather than
   // mount a credential the container will only ever get EACCES on — an
   // unreadable token breaks git and gh completely, which is worse than the
   // exposure this change removes.
-  if (!containerRunsAsHostUser(opts.hostUid)) {
-    log.warn('Container will not run as the host user — forwarding the GitHub token as env instead of a mounted file', {
-      hostUid: opts.hostUid ?? process.getuid?.(),
-      agentGroupId,
-    });
+  if (githubTokenDeliveredAsEnv(env, opts.hostUid)) {
+    if (!githubTokenInEnv(env)) {
+      log.warn(
+        'Container will not run as the host user — forwarding the GitHub token as env instead of a mounted file',
+        { hostUid: opts.hostUid ?? process.getuid?.(), agentGroupId },
+      );
+    }
     return { envArgs: ['-e', `GH_TOKEN=${token}`, '-e', `GITHUB_TOKEN=${token}`] };
   }
   const file = writeGroupGitHubTokenFile(agentGroupId, token, dataDir);
