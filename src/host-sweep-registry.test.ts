@@ -14,6 +14,7 @@
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
+import { fileURLToPath } from 'node:url';
 
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -205,7 +206,16 @@ vi.mock('./repo-fence-recovery.js', () => ({ sweepOrphanedRepoIngressFences: asy
 vi.mock('./db/channel-ingress-receipts.js', () => ({ pruneChannelIngressReceipts: vi.fn(() => undefined) }));
 vi.mock('./db/usage.js', () => ({ rollupSessionUsage: () => 0, pruneOldTurnUsage: () => undefined }));
 vi.mock('./github-app-token.js', () => ({ refreshExpiringGitHubAppTokens: async () => undefined }));
-vi.mock('./modules/approvals/index.js', () => ({ sweepAwaitingReasonRejects: async () => undefined }));
+// F-14.2 imports the production modules barrel, and several barrel modules
+// register approval handlers at import. Stub those members too — the duty this
+// file drives (T5) only needs `sweepAwaitingReasonRejects`, and loading the real
+// approvals module here would pull the delivery adapter into a registry test.
+vi.mock('./modules/approvals/index.js', () => ({
+  sweepAwaitingReasonRejects: async () => undefined,
+  registerApprovalHandler: () => undefined,
+  requestApproval: async () => undefined,
+  notifyAgent: async () => undefined,
+}));
 vi.mock('./dashboard/session-title-sweep.js', () => ({ runSessionTitleSweep: async () => undefined }));
 vi.mock('./topic-title.js', () => ({ retryPendingThreadTitles: async () => undefined }));
 vi.mock('./dashboard/db/dashboard-tokens.js', () => ({ pruneDashboardTokens: () => undefined }));
@@ -298,6 +308,8 @@ import './modules/sweep-claims/index.js';
 // R-7's registration count includes T19 after the family module moved it out
 // of host-sweep.ts's own in-file builtins.
 import './modules/sweep-usage/index.js';
+
+const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
 probe.depth = _mailboxSessionDepthForTesting;
 
@@ -1156,6 +1168,114 @@ describe('sweep duty registry (S2-PR2)', () => {
     expect(egress).toBeDefined();
     expect(egress?.phase).toBe('tick:pre-session');
     expect(SWEEP_PHASES.indexOf('tick:pre-session')).toBeLessThan(SWEEP_PHASES.indexOf('session:plan'));
+  });
+
+  // ── F-14.1 (S2-PR14, plan.md §8) ─────────────────────────────────────────────
+  it('host-sweep.ts contains no inline duty bodies', async () => {
+    const source = fs.readFileSync(path.join(REPO_ROOT, 'src/host-sweep.ts'), 'utf8');
+
+    // No inline body: the driver DEFINES the three registration surfaces and
+    // never CALLS them. Every call site is a `src/modules/sweep-*` module. A
+    // definition reads `export function registerSweepDuty(`; a call reads
+    // `registerSweepDuty({`.
+    for (const surface of ['registerSweepDuty', 'registerSlaObservationHook', 'registerSweepKillFollowUp']) {
+      expect(source.includes(`${surface}({`), `${surface} is called inline in host-sweep.ts`).toBe(false);
+    }
+    // The built-in source is still registered (the registry's reset replays it
+    // and the unregister helper refuses it) but registers nothing.
+    expect(source).toContain("registerSweepDutySource('host-sweep:builtin', registerBuiltInSweepDuties)");
+    expect(source).toContain('function registerBuiltInSweepDuties(): void {}');
+
+    // Exports only the driver, the registry and the phase-list allowlist.
+    const hostSweep = (await import('./host-sweep.js')) as unknown as Record<string, unknown>;
+    expect(new Set(Object.keys(hostSweep))).toEqual(
+      new Set([
+        // phase list + its kinds
+        'SWEEP_PHASES',
+        'sweepPhaseKind',
+        // registry
+        'registerSweepDuty',
+        'registerSweepDutySource',
+        'registerSlaObservationHook',
+        'registerSweepKillFollowUp',
+        'runSlaObservationHooks',
+        'runSweepKillFollowUps',
+        'SWEEP_DUTY_INVENTORY',
+        'asSessionContext',
+        'SweepWindowAbort',
+        // driver + its tick constants
+        'startHostSweep',
+        'stopHostSweep',
+        'SWEEP_INTERVAL_MS',
+        'ABSOLUTE_CEILING_MS',
+        'CLAIM_STUCK_MS',
+        'SPAWN_GRACE_MS',
+        'providerFailedTicks',
+        'writeSystemWake',
+        // re-exports the families and their callers consume through the driver
+        'parseSqliteUtc',
+        'decideCeilingFollowUp',
+        'WORK_CONTINUATION_RESUME_MAX_ATTEMPTS',
+        // test-only accessors
+        '_listSweepRegistrationsForTesting',
+        '_resetSweepRegistryForTesting',
+        '_unregisterSweepDutySourceForTesting',
+        '_setSweepYieldForTesting',
+        '_sweepOnceForTesting',
+        '_sweepSessionForTesting',
+        '_sweepTaskWatchdogForTesting',
+      ]),
+    );
+
+    // plan.md §8's ceiling, asserted verbatim and NOT relaxed. It does not hold
+    // at the end state and the number, not the code, is what is wrong: the file
+    // is now exactly what §1 asked for — a tick driver, a duty registry and an
+    // ordered phase list, with no duty body left — and that is 1,137 lines
+    // (631 code, 420 comment, 86 blank). Breakdown: sweepSession + its helpers
+    // 260, sweepOnce + start/stop 150, the registry 158, the error rule 100,
+    // the shared context and duty types 99, the file header 29, SLA hooks +
+    // kill follow-ups + windowedRunner 65, the phase list 53, the inventory 50,
+    // re-exports + writeSystemWake 80, imports 21, tick constants + quiet cache
+    // 45, tail re-exports + the empty built-in source 27. Getting under 300
+    // means splitting the driver itself, which S2-PR14's brief forbids without
+    // an explicit decision. Reported to the operator; plan.md §8 F-14.1 and §11
+    // D6 need the number corrected (or the split authorised) before this passes.
+    expect(source.split('\n').length).toBeLessThan(300);
+    expect(h.spawns).toEqual([]);
+  });
+
+  // ── F-14.2 (S2-PR14, plan.md §8) ─────────────────────────────────────────────
+  it('the registered duty set still matches the inventory after every family has moved', async () => {
+    // R-7's assertion, re-run at the end state and reached the way production
+    // reaches it: through the modules barrel src/main.ts imports, not through
+    // this file's own per-family side-effect imports.
+    await import('./modules/index.js');
+    _resetSweepRegistryForTesting();
+
+    const { duties, slaObservationHooks, killFollowUps } = _listSweepRegistrationsForTesting();
+    const actual: Array<[string, string, string, number]> = [
+      ...duties.map((d): [string, string, string, number] => ['duty', d.name, d.phase, d.order]),
+      ...slaObservationHooks.map((hk): [string, string, string, number] => [
+        'sla-observation-hook',
+        hk.name,
+        'sla-observation-hook',
+        hk.order,
+      ]),
+      ...killFollowUps.map((f): [string, string, string, number] => [
+        'kill-follow-up',
+        f.name,
+        'kill-follow-up',
+        f.order,
+      ]),
+    ];
+
+    expect(actual).toEqual(EXPECTED_REGISTRATIONS);
+    expect(actual).toHaveLength(39);
+    const names = new Set(actual.map((r) => r[1]));
+    expect(names.size).toBe(38);
+    expect(names).toEqual(new Set(Object.values(SWEEP_DUTY_INVENTORY)));
+    expect(actual.filter((r) => r[1] === SWEEP_DUTY_INVENTORY.S17)).toHaveLength(2);
+    expect(h.spawns).toEqual([]);
   });
 
   // ── duty registration sources ───────────────────────────────────────────────
