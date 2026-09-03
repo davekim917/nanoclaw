@@ -450,26 +450,45 @@ export interface NanoclawMailboxSession extends MailboxSession {
 }
 
 /**
- * The outbound-owned ops, named once.
+ * The outbound-owned READS, named once.
  *
  * Every signature is the session's own — a `Pick`, not a second declaration —
- * so each op has one definition however it is reached (invariant I-2).
+ * so each op has one definition however it is reached (invariant I-2). This
+ * is the half that is safe on any session, including one the host is only
+ * inspecting: nothing here writes the container-owned file.
  *
- * Deliberately the surface PR 7's read-only `OutboundSessionRead` converges
- * on: `getContainerState` and `getProcessingClaimRows` already match it by
- * name and shape. It is a superset by exactly one write,
- * `clearWorkContinuation` — the thread-close force-clear is a host write to a
- * container-owned key, and on this head there is nowhere else for it to live.
+ * Deliberately the SAME op vocabulary as PR 7's read-only `OutboundSessionRead`
+ * — same names, same signatures — so the two can be expressed in terms of each
+ * other rather than maintained as parallel types. `getProcessingClaimRows`
+ * matches it exactly; `getContainerState` returns `NanoclawContainerState`,
+ * which extends `ops/sweep`'s `ContainerState` that PR 7 declares, so it is
+ * assignable in that direction. PR 7's other reads (`listTurnUsageSince`,
+ * `listOutboundTail`, `hasWorkContinuation`, …) live in `ops/reads.ts`, which
+ * is PR 6's file and does not exist on this head; they join this vocabulary
+ * when PR 6 merges down, and the union belongs in ONE of these two types then,
+ * not in a third.
  */
-export type NanoclawOutboundSession = Pick<
+export type NanoclawOutboundRead = Pick<
   NanoclawMailboxSession,
   | 'getContainerState'
   | 'getProcessingClaimRows'
   | 'readRepositoryMountBarrierAck'
   | 'readDoneProposal'
   | 'readContinuationPresence'
-  | 'clearWorkContinuation'
 >;
+
+/**
+ * The reads plus the one outbound WRITE the host performs on this head.
+ *
+ * `clearWorkContinuation` is the thread-close force-clear — a host write to a
+ * container-owned key, valid only with the container confirmed stopped (see
+ * the policy around it in `dashboard/thread-close.ts`). It is the single
+ * reason this type is not simply `NanoclawOutboundRead`, and the reason PR 7's
+ * read-only type is the narrower of the two: `OutboundSessionRead` is a
+ * `Pick` of this, or this is `OutboundSessionRead & { clearWorkContinuation }`,
+ * whichever direction reads better once both exist in one tree.
+ */
+export type NanoclawOutboundSession = NanoclawOutboundRead & Pick<NanoclawMailboxSession, 'clearWorkContinuation'>;
 
 export type NanoclawMailboxAction<T> = (mailbox: NanoclawMailboxSession) => T | Promise<T>;
 
