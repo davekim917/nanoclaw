@@ -11,10 +11,10 @@ const { CAPABILITY_STATE, TEST_DATA_DIR } = vi.hoisted(() => ({
   // delete each other's session directories mid-test. Measured: 20-33 of ~50
   // tests failing non-deterministically with SQLITE_READONLY_DBMOVED and
   // friends, in both directions, which is untrustworthy green as well as red.
-  // ponytail: pid, not mkdtempSync — the hoisted factory runs before the `fs`
-  // import is initialized, and one root per process is all this needs. Switch
-  // to mkdtemp if a single process ever needs two.
-  TEST_DATA_DIR: `/tmp/nanoclaw-test-write-outbound-${process.pid}`,
+  // uniqueTmpRoot is installed on globalThis by src/test-setup.ts, so it is
+  // callable here: a hoisted factory runs before this file's imports are
+  // initialized and cannot reference one.
+  TEST_DATA_DIR: uniqueTmpRoot('test-write-outbound'),
 }));
 
 vi.mock('./config.js', async () => {

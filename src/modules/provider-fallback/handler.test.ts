@@ -13,12 +13,12 @@ vi.mock('../../config.js', async () => {
   const actual = await vi.importActual('../../config.js');
   return {
     ...actual,
-    DATA_DIR: '/tmp/nanoclaw-test-provider-fallback',
-    GROUPS_DIR: '/tmp/nanoclaw-test-provider-fallback/groups',
+    DATA_DIR: TEST_DIR,
+    GROUPS_DIR: `${TEST_DIR}/groups`,
   };
 });
 
-const TEST_DIR = '/tmp/nanoclaw-test-provider-fallback';
+const { TEST_DIR } = vi.hoisted(() => ({ TEST_DIR: uniqueTmpRoot('test-provider-fallback') }));
 
 import { initTestDb, closeDb, runMigrations, createAgentGroup } from '../../db/index.js';
 import { getProviderHealth, isProviderUnavailable, markProviderUnavailable } from '../../db/provider-health.js';

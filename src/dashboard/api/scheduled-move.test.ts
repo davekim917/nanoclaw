@@ -7,14 +7,15 @@
  * central DB, driving the AuthHandlers directly with a synthetic ctx.
  */
 import fs from 'fs';
-import os from 'os';
 import path from 'path';
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 
+const { TEST_DIR } = vi.hoisted(() => ({ TEST_DIR: uniqueTmpRoot('scheduled-move-test') }));
+
 vi.mock('../../config.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../config.js')>()),
-  DATA_DIR: '/tmp/nanoclaw-scheduled-move-test',
-  GROUPS_DIR: '/tmp/nanoclaw-scheduled-move-test/groups',
+  DATA_DIR: TEST_DIR,
+  GROUPS_DIR: `${TEST_DIR}/groups`,
 }));
 
 import { initTestDb, closeDb, getDb } from '../../db/connection.js';
@@ -28,7 +29,6 @@ import type { AuthedRequestContext } from '../router.js';
 
 // Config is mocked to this test-only root because resolveTaskSession owns task
 // session folder creation and uses DATA_DIR directly.
-const TEST_DIR = path.join(os.tmpdir(), 'nanoclaw-scheduled-move-test');
 const NOW = Date.parse('2026-06-13T12:00:00Z');
 
 function isoIn(ms: number): string {

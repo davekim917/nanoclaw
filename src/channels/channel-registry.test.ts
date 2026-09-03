@@ -18,10 +18,10 @@ vi.mock('../container-runner.js', () => ({
 // Override DATA_DIR for tests
 vi.mock('../config.js', async () => {
   const actual = await vi.importActual('../config.js');
-  return { ...actual, DATA_DIR: '/tmp/nanoclaw-test-channels' };
+  return { ...actual, DATA_DIR: TEST_DIR };
 });
 
-const TEST_DIR = '/tmp/nanoclaw-test-channels';
+const { TEST_DIR } = vi.hoisted(() => ({ TEST_DIR: uniqueTmpRoot('test-channels') }));
 
 function now() {
   return new Date().toISOString();

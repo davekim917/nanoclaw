@@ -11,7 +11,7 @@ import { describe, it, expect, afterEach, beforeEach, vi } from 'vitest';
 
 vi.mock('../../config.js', async () => {
   const actual = await vi.importActual('../../config.js');
-  return { ...actual, DATA_DIR: '/tmp/nanoclaw-test-typing' };
+  return { ...actual, DATA_DIR: uniqueTmpRoot('test-typing') };
 });
 
 import { setTypingAdapter, startTypingRefresh, stopTypingRefresh } from './index.js';

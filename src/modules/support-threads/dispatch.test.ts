@@ -25,7 +25,7 @@ vi.mock('../../container-runner.js', () => ({
 
 vi.mock('../../config.js', async () => {
   const actual = await vi.importActual<typeof import('../../config.js')>('../../config.js');
-  return { ...actual, DATA_DIR: '/tmp/nanoclaw-test-support-dispatch' };
+  return { ...actual, DATA_DIR: TEST_DIR };
 });
 
 const { postParent, createThread, adapterDeliver } = vi.hoisted(() => ({
@@ -37,7 +37,7 @@ vi.mock('../../channels/channel-registry.js', () => ({
   getChannelAdapter: () => ({ postParent, createThread, deliver: adapterDeliver }),
 }));
 
-const TEST_DIR = '/tmp/nanoclaw-test-support-dispatch';
+const { TEST_DIR } = vi.hoisted(() => ({ TEST_DIR: uniqueTmpRoot('test-support-dispatch') }));
 
 import { initTestDb, closeDb, runMigrations, createAgentGroup, createMessagingGroup, getDb } from '../../db/index.js';
 import { getSession } from '../../db/sessions.js';

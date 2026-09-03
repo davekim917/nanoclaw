@@ -5,7 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import Database from 'better-sqlite3';
 
 const { TEST_ROOT } = vi.hoisted(() => ({
-  TEST_ROOT: `/tmp/nanoclaw-migration051-test-${process.pid}`,
+  TEST_ROOT: uniqueTmpRoot('migration051-test'),
 }));
 
 vi.mock('../../config.js', async (importOriginal) => ({

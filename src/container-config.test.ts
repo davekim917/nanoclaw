@@ -28,10 +28,10 @@ import { vi } from 'vitest';
 
 vi.mock('./config.js', async () => {
   const actual = await vi.importActual<typeof import('./config.js')>('./config.js');
-  return { ...actual, GROUPS_DIR: '/tmp/nanoclaw-cc-test-groups' };
+  return { ...actual, GROUPS_DIR: GROUPS_DIR };
 });
 
-const GROUPS_DIR = '/tmp/nanoclaw-cc-test-groups';
+const { GROUPS_DIR } = vi.hoisted(() => ({ GROUPS_DIR: uniqueTmpRoot('cc-test-groups') }));
 
 function writeGroupConfig(folder: string, content: object): void {
   const dir = path.join(GROUPS_DIR, folder);

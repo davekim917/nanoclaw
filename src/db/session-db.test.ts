@@ -34,7 +34,7 @@ import {
 import { INBOUND_SCHEMA } from './schema.js';
 import { DATA_DIR } from '../config.js';
 
-const TEST_DIR = '/tmp/nanoclaw-session-db-test';
+const TEST_DIR = uniqueTmpRoot('session-db-test');
 const DB_PATH = path.join(TEST_DIR, 'inbound.db');
 
 afterEach(() => {

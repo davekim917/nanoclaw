@@ -26,12 +26,12 @@ vi.mock('../../config.js', async () => {
   const actual = await vi.importActual('../../config.js');
   return {
     ...actual,
-    DATA_DIR: '/tmp/nanoclaw-test-cli-groups',
-    GROUPS_DIR: '/tmp/nanoclaw-test-cli-groups/groups',
+    DATA_DIR: TEST_DIR,
+    GROUPS_DIR: `${TEST_DIR}/groups`,
   };
 });
 
-const TEST_DIR = '/tmp/nanoclaw-test-cli-groups';
+const { TEST_DIR } = vi.hoisted(() => ({ TEST_DIR: uniqueTmpRoot('test-cli-groups') }));
 
 import { initTestDb, closeDb, runMigrations, createAgentGroup, getDb } from '../../db/index.js';
 import { createSession } from '../../db/sessions.js';

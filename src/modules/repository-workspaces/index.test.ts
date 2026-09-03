@@ -27,7 +27,7 @@ const hostActionMocks = vi.hoisted(() => ({
 
 vi.mock('../../config.js', async () => {
   const actual = await vi.importActual<typeof import('../../config.js')>('../../config.js');
-  return { ...actual, DATA_DIR: `/tmp/nanoclaw-repository-action-${process.pid}` };
+  return { ...actual, DATA_DIR: hostActionDataDir };
 });
 
 vi.mock('../../container-restart.js', () => ({
@@ -85,7 +85,7 @@ import {
 
 let root: string;
 let remote: string;
-const hostActionDataDir = `/tmp/nanoclaw-repository-action-${process.pid}`;
+const { hostActionDataDir } = vi.hoisted(() => ({ hostActionDataDir: uniqueTmpRoot('repository-action') }));
 
 const git = (cwd: string, args: string[]) =>
   execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', ...args], {

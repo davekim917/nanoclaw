@@ -19,7 +19,7 @@ import type { Session } from '../../types.js';
 // Asia/Tokyo is UTC+9 with no DST: "0 9 * * *" must land at 00:00:00Z sharp.
 vi.mock('../../config.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../../config.js')>();
-  return { ...actual, TIMEZONE: 'Asia/Tokyo', GROUPS_DIR: '/tmp/nanoclaw-recurrence-test/groups' };
+  return { ...actual, TIMEZONE: 'Asia/Tokyo', GROUPS_DIR: `${TEST_DIR}/groups` };
 });
 
 // The auto-pause note goes through the shared appendRunLog helper, which
@@ -28,7 +28,7 @@ vi.mock('../../db/agent-groups.js', () => ({
   getAgentGroup: (id: string) => (id === 'ag-test' ? { id, folder: 'g-test' } : undefined),
 }));
 
-const TEST_DIR = '/tmp/nanoclaw-recurrence-test';
+const { TEST_DIR } = vi.hoisted(() => ({ TEST_DIR: uniqueTmpRoot('recurrence-test') }));
 const DB_PATH = path.join(TEST_DIR, 'inbound.db');
 
 function freshDb() {

@@ -20,7 +20,7 @@ import {
   type RecurringMessage,
 } from './tasks.js';
 
-const TEST_DIR = '/tmp/nanoclaw-scheduling-db-test';
+const TEST_DIR = uniqueTmpRoot('scheduling-db-test');
 const DB_PATH = path.join(TEST_DIR, 'inbound.db');
 
 function freshDb() {

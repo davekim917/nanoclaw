@@ -39,7 +39,7 @@ vi.mock('../../container-runner.js', () => ({
 
 vi.mock('../../config.js', async () => {
   const actual = await vi.importActual('../../config.js');
-  return { ...actual, DATA_DIR: '/tmp/nanoclaw-test-mcp-approval' };
+  return { ...actual, DATA_DIR: TEST_DIR };
 });
 
 vi.mock('../../session-manager.js', async () => {
@@ -51,7 +51,7 @@ vi.mock('../../webhook-server.js', () => ({
   registerWebhookAdapter: vi.fn(),
 }));
 
-const TEST_DIR = '/tmp/nanoclaw-test-mcp-approval';
+const { TEST_DIR } = vi.hoisted(() => ({ TEST_DIR: uniqueTmpRoot('test-mcp-approval') }));
 const DM_CHANNEL = 'slack';
 const DM_PLATFORM = 'D-admin-1';
 

@@ -5,13 +5,13 @@ vi.mock('../../config.js', async () => {
   const actual = await vi.importActual('../../config.js');
   return {
     ...actual,
-    DATA_DIR: '/tmp/nanoclaw-test-slack-subject',
-    GROUPS_DIR: '/tmp/nanoclaw-test-slack-subject/groups',
+    DATA_DIR: TEST_DIR,
+    GROUPS_DIR: `${TEST_DIR}/groups`,
     TIMEZONE: 'UTC',
   };
 });
 
-const TEST_DIR = '/tmp/nanoclaw-test-slack-subject';
+const { TEST_DIR } = vi.hoisted(() => ({ TEST_DIR: uniqueTmpRoot('test-slack-subject') }));
 
 import { initTestDb, closeDb, runMigrations, createAgentGroup, getDb } from '../../db/index.js';
 import { createMessagingGroup } from '../../db/messaging-groups.js';

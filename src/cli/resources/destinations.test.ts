@@ -20,10 +20,10 @@ vi.mock('../../container-runner.js', () => ({
 
 vi.mock('../../config.js', async () => {
   const actual = await vi.importActual('../../config.js');
-  return { ...actual, DATA_DIR: '/tmp/nanoclaw-test-cli-destinations' };
+  return { ...actual, DATA_DIR: TEST_DIR };
 });
 
-const TEST_DIR = '/tmp/nanoclaw-test-cli-destinations';
+const { TEST_DIR } = vi.hoisted(() => ({ TEST_DIR: uniqueTmpRoot('test-cli-destinations') }));
 
 import { initTestDb, closeDb, runMigrations, createAgentGroup } from '../../db/index.js';
 import { createSession } from '../../db/sessions.js';

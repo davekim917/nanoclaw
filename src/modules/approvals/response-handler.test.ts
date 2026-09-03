@@ -20,10 +20,10 @@ vi.mock('../../container-runner.js', () => ({
 
 vi.mock('../../config.js', async () => {
   const actual = await vi.importActual('../../config.js');
-  return { ...actual, DATA_DIR: '/tmp/nanoclaw-test-approval-response-authz' };
+  return { ...actual, DATA_DIR: TEST_DIR };
 });
 
-const TEST_DIR = '/tmp/nanoclaw-test-approval-response-authz';
+const { TEST_DIR } = vi.hoisted(() => ({ TEST_DIR: uniqueTmpRoot('test-approval-response-authz') }));
 
 function now() {
   return new Date().toISOString();

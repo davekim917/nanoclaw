@@ -13,7 +13,7 @@ import { execFileSync } from 'child_process';
 // DATA_DIR/workgroups/*/claims/*.json directly via claimsBaseDir().
 vi.mock('../../config.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../config.js')>()),
-  DATA_DIR: '/tmp/nanoclaw-observatory-api-test',
+  DATA_DIR: TEST_DIR,
 }));
 
 // The registry's live adapter map has no injection seam (adapters self-register
@@ -24,7 +24,7 @@ vi.mock('../../channels/channel-registry.js', () => ({
   getChannelAdapter: vi.fn(() => undefined),
 }));
 
-const TEST_DIR = '/tmp/nanoclaw-observatory-api-test';
+const { TEST_DIR } = vi.hoisted(() => ({ TEST_DIR: uniqueTmpRoot('observatory-api-test') }));
 
 import { initTestDb, closeDb, getDb } from '../../db/connection.js';
 import { getChannelAdapter } from '../../channels/channel-registry.js';
@@ -936,7 +936,7 @@ describe('threadPermalink — multi-workspace adapter resolution', () => {
  * anything softer than a fresh timestamp inside the workgroup's own directory.
  */
 describe('readWorkgroupSignals', () => {
-  const SIG_ROOT = path.join(os.tmpdir(), 'nanoclaw-observatory-signals-test');
+  const SIG_ROOT = uniqueTmpRoot('observatory-signals-test');
   // Fixed clock. Nothing here is allowed to depend on how long the suite takes.
   const NOW = Date.parse('2026-08-19T12:00:00.000Z');
   const minutesAgo = (m: number) => new Date(NOW - m * 60_000).toISOString();
@@ -1163,7 +1163,7 @@ describe('readWorkgroupSignals', () => {
 });
 
 describe('the scene carries signals additively', () => {
-  const SIG_ROOT = path.join(os.tmpdir(), 'nanoclaw-observatory-signals-scene-test');
+  const SIG_ROOT = uniqueTmpRoot('observatory-signals-scene-test');
   const repoRoot = path.join(SIG_ROOT, 'repo');
 
   beforeEach(() => {

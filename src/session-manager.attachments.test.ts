@@ -24,7 +24,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('./config.js', async () => {
   const actual = await vi.importActual<typeof import('./config.js')>('./config.js');
-  return { ...actual, DATA_DIR: '/tmp/nanoclaw-test-saveatt-gap' };
+  return { ...actual, DATA_DIR: TEST_DIR };
 });
 
 import { initTestDb, closeDb, runMigrations, createAgentGroup } from './db/index.js';
@@ -32,7 +32,7 @@ import { createSession } from './db/sessions.js';
 import { initSessionFolder, sessionDir, writeSessionMessage } from './session-manager.js';
 import type { Session } from './types.js';
 
-const TEST_DIR = '/tmp/nanoclaw-test-saveatt-gap';
+const { TEST_DIR } = vi.hoisted(() => ({ TEST_DIR: uniqueTmpRoot('test-saveatt-gap') }));
 const AG = 'ag-saveatt';
 const SESS = 'sess-saveatt';
 

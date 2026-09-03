@@ -16,11 +16,11 @@ import http from 'http';
 // factories are hoisted above top-level variable declarations.
 vi.mock('../../config.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../config.js')>()),
-  DATA_DIR: '/tmp/nanoclaw-workgroups-api-test',
-  GROUPS_DIR: '/tmp/nanoclaw-workgroups-api-test/groups',
+  DATA_DIR: TEST_DIR,
+  GROUPS_DIR: `${TEST_DIR}/groups`,
 }));
 
-const TEST_DIR = '/tmp/nanoclaw-workgroups-api-test';
+const { TEST_DIR } = vi.hoisted(() => ({ TEST_DIR: uniqueTmpRoot('workgroups-api-test') }));
 
 import { initTestDb, closeDb, getDb } from '../../db/connection.js';
 import { ensureSchema, openInboundDb } from '../../db/session-db.js';

@@ -11,7 +11,7 @@ import { describe, it, expect, afterEach, beforeEach, vi } from 'vitest';
 
 vi.mock('../config.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../config.js')>()),
-  DATA_DIR: '/tmp/nanoclaw-scheduled-tasks-test',
+  DATA_DIR: TEST_DIR,
 }));
 
 import { initTestDb, closeDb, getDb } from './connection.js';
@@ -20,7 +20,7 @@ import { scheduleTask, resolveActiveSession } from './scheduled-tasks.js';
 import { migration024 } from './migrations/024-sessions-channel-root-unique.js';
 import { taskThreadId } from './sessions.js';
 
-const TEST_DIR = '/tmp/nanoclaw-scheduled-tasks-test';
+const { TEST_DIR } = vi.hoisted(() => ({ TEST_DIR: uniqueTmpRoot('scheduled-tasks-test') }));
 const AGENT_GROUP_ID = 'ag-test-c1';
 const SESSION_ID = 'sess-test-c1';
 const MESSAGING_GROUP_ID = 'mg-test-c1';

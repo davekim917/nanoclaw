@@ -3,7 +3,7 @@ import os from 'os';
 import path from 'path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-const TEST_ROOT = '/tmp/nanoclaw-agent-runner-source-test';
+const { TEST_ROOT } = vi.hoisted(() => ({ TEST_ROOT: uniqueTmpRoot('agent-runner-source-test') }));
 const GROUPS_DIR = path.join(TEST_ROOT, 'groups');
 const DATA_DIR = path.join(TEST_ROOT, 'data');
 
@@ -12,8 +12,8 @@ const DATA_DIR = path.join(TEST_ROOT, 'data');
 // agent-runner-source.ts's default sourceDir) untouched.
 vi.mock('./config.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('./config.js')>()),
-  DATA_DIR: '/tmp/nanoclaw-agent-runner-source-test/data',
-  GROUPS_DIR: '/tmp/nanoclaw-agent-runner-source-test/groups',
+  DATA_DIR: `${TEST_ROOT}/data`,
+  GROUPS_DIR: `${TEST_ROOT}/groups`,
   WORKGROUP_SHARED_FS: false,
 }));
 
