@@ -21,7 +21,6 @@
  *   3. Owner role is never grantable via tool. Set via
  *      `/init-first-agent` or a direct DB edit.
  */
-import type Database from 'better-sqlite3';
 
 import { registerDeliveryAction } from '../../delivery.js';
 import { unguarded } from '../../guard/index.js';
@@ -91,11 +90,7 @@ function ensureUserExists(userId: string): void {
 // intentionally not exported — they self-register via registerDeliveryAction.
 export { deriveCallerId as _deriveCallerId, resolveTargetUserId as _resolveTargetUserId };
 
-export async function handleGrantAccess(
-  content: Record<string, unknown>,
-  session: Session,
-  inDb: Database.Database,
-): Promise<void> {
+export async function handleGrantAccess(content: Record<string, unknown>, session: Session): Promise<void> {
   const args = content as GrantArgs;
   const rawUser = typeof args.user === 'string' ? args.user : '';
   const role = typeof args.role === 'string' ? args.role.trim().toLowerCase() : 'member';
@@ -114,7 +109,7 @@ export async function handleGrantAccess(
     return;
   }
 
-  const callerId = deriveCallerId(session, inDb);
+  const callerId = await deriveCallerId(session);
   if (!callerId) {
     notifyAgent(session, 'grant_access failed: could not determine caller (no recent inbound message).');
     return;
@@ -180,11 +175,7 @@ export async function handleGrantAccess(
   notifyAgent(session, `Granted admin: \`${targetUserId}\` → \`${targetAgentGroupId}\`.`);
 }
 
-export async function handleRevokeAccess(
-  content: Record<string, unknown>,
-  session: Session,
-  inDb: Database.Database,
-): Promise<void> {
+export async function handleRevokeAccess(content: Record<string, unknown>, session: Session): Promise<void> {
   const args = content as GrantArgs;
   const rawUser = typeof args.user === 'string' ? args.user : '';
   const targetAgentGroupId = typeof args.agentGroupId === 'string' ? args.agentGroupId : session.agent_group_id;
@@ -198,7 +189,7 @@ export async function handleRevokeAccess(
     return;
   }
 
-  const callerId = deriveCallerId(session, inDb);
+  const callerId = await deriveCallerId(session);
   if (!callerId) {
     notifyAgent(session, 'revoke_access failed: could not determine caller.');
     return;
@@ -251,11 +242,7 @@ export async function handleRevokeAccess(
   notifyAgent(session, `Revoked access: \`${targetUserId}\` ← \`${targetAgentGroupId}\`.`);
 }
 
-export async function handleListAccess(
-  content: Record<string, unknown>,
-  session: Session,
-  _inDb: Database.Database,
-): Promise<void> {
+export async function handleListAccess(content: Record<string, unknown>, session: Session): Promise<void> {
   const args = content as GrantArgs;
   const targetAgentGroupId = typeof args.agentGroupId === 'string' ? args.agentGroupId : session.agent_group_id;
   if (!getAgentGroup(targetAgentGroupId)) {

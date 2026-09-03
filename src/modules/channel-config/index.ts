@@ -31,7 +31,6 @@
  * current model until the user types `-m` or the container otherwise
  * cycles. notify message says so.
  */
-import type Database from 'better-sqlite3';
 
 import { registerDeliveryAction } from '../../delivery.js';
 import { unguarded } from '../../guard/index.js';
@@ -45,6 +44,7 @@ import {
 } from '../../db/messaging-groups.js';
 import { parseMessageFlags } from '../../flag-parser.js';
 import { log } from '../../log.js';
+import { withExistingMailboxSession } from '../../session-manager.js';
 import type { Session } from '../../types.js';
 import { notifyAgent } from '../approvals/primitive.js';
 import { isAdminOfAgentGroup, isGlobalAdmin, isOwner } from '../permissions/db/user-roles.js';
@@ -58,21 +58,22 @@ function hasMutateAuthority(userId: string, agentGroupId: string): boolean {
  * look it up in the session's destinations map (inbound.db). Otherwise
  * use the session's own messaging_group. Returns null if unresolved.
  */
-function resolveChannelMessagingGroupId(
+async function resolveChannelMessagingGroupId(
   session: Session,
-  inDb: Database.Database,
   channelName: string | undefined,
-): string | null {
+): Promise<string | null> {
   if (!channelName) {
     return session.messaging_group_id ?? null;
   }
   // Look up the destination by name from inbound.db's destinations table
   // (host writes this before each container wake; container reads it
   // live). type='channel' rows carry channel_type + platform_id; map
-  // those back to a messaging_group id.
-  const row = inDb
-    .prepare(`SELECT channel_type, platform_id FROM destinations WHERE name = ? AND type = 'channel'`)
-    .get(channelName) as { channel_type?: string; platform_id?: string } | undefined;
+  // those back to a messaging_group id. Its own short mailbox session:
+  // delivery holds none while a handler runs (plan §4.5b), and a session with
+  // no mailbox has no destinations map to resolve against.
+  const row = await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) =>
+    mailbox.getChannelDestination(channelName),
+  );
   if (!row?.channel_type || !row.platform_id) return null;
   // destinations lives in the session's inbound.db (host writes it at
   // wake). messaging_groups lives in central v2.db — cross-DB join by
@@ -119,11 +120,7 @@ function parseChannelEffort(effort: string, provider: string): ParsedChannelValu
   return { value: parsed.intent.stickyEffort };
 }
 
-async function handleSetChannelModel(
-  content: Record<string, unknown>,
-  session: Session,
-  inDb: Database.Database,
-): Promise<void> {
+async function handleSetChannelModel(content: Record<string, unknown>, session: Session): Promise<void> {
   const args = content as ChannelConfigArgs;
   const channelName = typeof args.channel === 'string' ? args.channel : undefined;
   // model: string = set, null = clear, anything else = reject
@@ -133,7 +130,7 @@ async function handleSetChannelModel(
     return;
   }
 
-  const callerId = deriveCallerId(session, inDb);
+  const callerId = await deriveCallerId(session);
   if (!callerId) {
     notifyAgent(session, 'set_channel_model failed: could not identify the user who sent this message.');
     return;
@@ -148,7 +145,7 @@ async function handleSetChannelModel(
     return;
   }
 
-  const mgId = resolveChannelMessagingGroupId(session, inDb, channelName);
+  const mgId = await resolveChannelMessagingGroupId(session, channelName);
   if (!mgId) {
     notifyAgent(session, `set_channel_model failed: channel ${channelName ?? '(current)'} not resolvable.`);
     return;
@@ -191,11 +188,7 @@ async function handleSetChannelModel(
   );
 }
 
-async function handleSetChannelEffort(
-  content: Record<string, unknown>,
-  session: Session,
-  inDb: Database.Database,
-): Promise<void> {
+async function handleSetChannelEffort(content: Record<string, unknown>, session: Session): Promise<void> {
   const args = content as ChannelConfigArgs;
   const channelName = typeof args.channel === 'string' ? args.channel : undefined;
   const effort = args.effort === null ? null : typeof args.effort === 'string' ? args.effort : undefined;
@@ -204,7 +197,7 @@ async function handleSetChannelEffort(
     return;
   }
 
-  const callerId = deriveCallerId(session, inDb);
+  const callerId = await deriveCallerId(session);
   if (!callerId) {
     notifyAgent(session, 'set_channel_effort failed: could not identify the user who sent this message.');
     return;
@@ -219,7 +212,7 @@ async function handleSetChannelEffort(
     return;
   }
 
-  const mgId = resolveChannelMessagingGroupId(session, inDb, channelName);
+  const mgId = await resolveChannelMessagingGroupId(session, channelName);
   if (!mgId) {
     notifyAgent(session, `set_channel_effort failed: channel ${channelName ?? '(current)'} not resolvable.`);
     return;
