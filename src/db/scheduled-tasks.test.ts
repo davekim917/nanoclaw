@@ -324,13 +324,37 @@ describe('test_scheduleTask_rejects_cross_workgroup_peer', () => {
 // the mark, including the persisted one S2-PR15 warms after a restart.
 describe('scheduleTask invalidates the target session quiet mark (S2-PR15)', () => {
   it('clears sweep_quiet_until and advances last_active on the task session', async () => {
-    seedActiveSession();
-    seedInboundDb();
+    // Pre-create the EXACT row scheduleTask will resolve — the per-series
+    // `system:tasks:s-quiet` session — and seed it ALREADY quiet-marked.
+    // `resolveTaskSession` reuses it via `findSystemSession`, so the mark is
+    // genuinely present when the touch runs.
+    //
+    // The earlier shape of this case marked "every active session" first and
+    // then let scheduleTask CREATE the task session, which starts with
+    // `sweep_quiet_until` NULL — so the null assertion held with the touch
+    // deleted (Codex round 3). Only the `last_active` half bit. Hence the
+    // before-state assertion below: it is what stops this going vacuous again.
+    const TASK_SESSION_ID = 'sess-task-quiet';
+    const STALE = '2026-06-01T00:00:00.000Z';
+    const MARK = '2099-01-01T00:00:00.000Z';
+    getDb()
+      .prepare(
+        `INSERT INTO sessions (id, agent_group_id, messaging_group_id, thread_id, agent_provider, status,
+                               container_status, last_active, sweep_quiet_until, created_at)
+         VALUES (?, ?, NULL, ?, NULL, 'active', 'stopped', ?, ?, datetime('now'))`,
+      )
+      .run(TASK_SESSION_ID, AGENT_GROUP_ID, taskThreadId('s-quiet'), STALE, MARK);
+    seedInboundDb(TASK_SESSION_ID);
 
-    // The task session scheduleTask resolves is its own system:tasks row, not
-    // SESSION_ID, so mark every active session quiet and let it pick.
-    const stale = '2026-06-01T00:00:00.000Z';
-    getDb().prepare("UPDATE sessions SET last_active = ?, sweep_quiet_until = '2099-01-01T00:00:00.000Z'").run(stale);
+    const read = (): { last_active: string | null; sweep_quiet_until: string | null } =>
+      getDb().prepare('SELECT last_active, sweep_quiet_until FROM sessions WHERE id = ?').get(TASK_SESSION_ID) as {
+        last_active: string | null;
+        sweep_quiet_until: string | null;
+      };
+    expect(read(), 'the fixture is not marked, so the assertions below prove nothing').toEqual({
+      last_active: STALE,
+      sweep_quiet_until: MARK,
+    });
 
     await scheduleTask({
       id: 't-quiet',
@@ -342,16 +366,17 @@ describe('scheduleTask invalidates the target session quiet mark (S2-PR15)', () 
       destination: TEST_DESTINATION,
     });
 
-    const row = getDb()
-      .prepare(
-        "SELECT last_active, sweep_quiet_until FROM sessions WHERE thread_id = 'system:tasks:s-quiet' AND status = 'active'",
-      )
-      .get() as { last_active: string | null; sweep_quiet_until: string | null } | undefined;
+    // The pre-created row is the one that was used — no fresh sibling was made,
+    // which would put the marked row back out of the assertion's reach.
+    const sessions = getDb()
+      .prepare("SELECT id FROM sessions WHERE agent_group_id = ? AND thread_id = ? AND status = 'active'")
+      .all(AGENT_GROUP_ID, taskThreadId('s-quiet')) as Array<{ id: string }>;
+    expect(sessions.map((r) => r.id)).toEqual([TASK_SESSION_ID]);
 
-    expect(row, 'no task session was resolved').toBeDefined();
-    expect(row!.sweep_quiet_until, 'the quiet mark outlived a new task row').toBeNull();
-    expect(row!.last_active).not.toBe(stale);
-    expect(row!.last_active).not.toBeNull();
+    const after = read();
+    expect(after.sweep_quiet_until, 'the quiet mark outlived a new task row').toBeNull();
+    expect(after.last_active).not.toBe(STALE);
+    expect(after.last_active).not.toBeNull();
   });
 });
 
