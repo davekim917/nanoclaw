@@ -712,3 +712,51 @@ describe('#315 — concurrent spawns of one identity stay serialized', () => {
     await expect(applyOnecliSecrets('example-retail', ['Anthropic'])).resolves.toBeUndefined();
   });
 });
+
+describe('#315 — the secrets cache staleness window is bounded and specified', () => {
+  /**
+   * A cached HIT is only as fresh as the TTL, and a rename is the case that
+   * shows it: the old declaration name keeps resolving until the entry expires.
+   * That window is a deliberate trade against re-listing on every spawn (the
+   * stall this PR removes), so it is pinned here rather than left to drift.
+   */
+  test('a renamed secret resolves from cache inside the TTL and fails closed after it', async () => {
+    const startedAt = 1_700_000_000_000;
+    const now = vi.spyOn(Date, 'now').mockReturnValue(startedAt);
+
+    let renamed = false;
+    respond((bin: unknown, rawArgs: unknown) => {
+      const argv = (rawArgs ?? []) as string[];
+      if (bin !== 'curl') return '';
+      const url = argv.join(' ');
+      if (url.includes('/grants')) {
+        const agentId = url.match(/\/api\/agents\/([^/]+)\/grants/)?.[1];
+        return JSON.stringify({ agentId, mode: 'grants', connections: [], secrets: [] });
+      }
+      if (url.includes('/api/agents')) return JSON.stringify(AGENT_FIXTURE);
+      if (url.includes('/api/secrets')) {
+        if (!renamed) return JSON.stringify(SECRET_FIXTURE);
+        return JSON.stringify({
+          data: SECRET_FIXTURE.data.map((secret) =>
+            secret.name === 'Anthropic' ? { ...secret, name: 'Anthropic-Renamed' } : secret,
+          ),
+        });
+      }
+      return '';
+    });
+
+    await applyOnecliSecrets('example-retail', ['Anthropic']);
+    renamed = true;
+
+    // Inside the TTL: still resolves, to the same secret's unchanged UUID.
+    // No widening — this is the UUID the operator's own declaration already
+    // resolved to on the previous spawn.
+    await expect(applyOnecliSecrets('example-retail', ['Anthropic'])).resolves.toBeUndefined();
+
+    // Past the TTL: the stale entry is gone and the spawn fails closed.
+    now.mockReturnValue(startedAt + 61 * 1000);
+    await expect(applyOnecliSecrets('example-retail', ['Anthropic'])).rejects.toThrow(
+      /secret\(s\) not found in vault: Anthropic/,
+    );
+  });
+});

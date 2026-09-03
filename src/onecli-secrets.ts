@@ -113,15 +113,24 @@ function curl(args: string[]): Promise<string> {
  * Cached vault secrets listing.
  *
  * `/api/secrets?limit=10000` used to run on EVERY spawn (the largest single
- * contributor to the #315 stalls). It is cached instead, and the cache can
- * never turn a resolvable declaration into a spawn refusal: `resolveSecretUuids`
- * force-refreshes before it throws whenever the failing resolution was served
- * from cache. A stale entry therefore costs at most one extra listing, never a
- * wrong answer.
+ * contributor to the #315 stalls).
+ *
+ * The guarantee is one-directional, and the direction matters:
+ *
+ *   - A cached MISS is never final. `resolveSecretUuids` force-refreshes and
+ *     re-resolves before it throws, so the cache can never turn a name that
+ *     exists in the vault into a spawn refusal.
+ *   - A cached HIT is only as fresh as the TTL. If an operator RENAMES a vault
+ *     secret, a declaration carrying the old name keeps resolving — to that
+ *     same secret's unchanged UUID — until the entry expires, and only then
+ *     starts failing closed. Revalidating positive hits means re-listing on
+ *     every spawn, which is the stall this PR exists to remove; the window is
+ *     bounded by the TTL below instead. Nothing widens: the UUID handed back is
+ *     the one the operator's own declaration resolved to on the previous spawn.
  *
  * Cleared by `__resetCachesForTest`.
  */
-const SECRETS_CACHE_TTL_MS = 5 * 60 * 1000;
+const SECRETS_CACHE_TTL_MS = 60 * 1000;
 let secretsCache: { at: number; secrets: OnecliSecret[] } | null = null;
 
 /**
