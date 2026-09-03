@@ -93,7 +93,7 @@ export interface ApplyResult {
    * host ever saw, so every attempt keeps its own record.
    */
   attemptDiagnoses: ApplyDiagnosis[];
-  /** The most concrete of `attemptDiagnoses`, for the one-line refusal message. */
+  /** `attemptDiagnoses` folded field by field, for the one-line refusal message. */
   diagnosis?: ApplyDiagnosis;
 }
 
@@ -141,6 +141,12 @@ async function realDiagnose(agent: string | undefined): Promise<{
   if (ONECLI_API_KEY) headers.Authorization = `Bearer ${ONECLI_API_KEY}`;
   try {
     const res = await fetch(url, { headers, signal: AbortSignal.timeout(DIAGNOSE_TIMEOUT_MS) });
+    // Drain the body before returning. An unread undici response pins its
+    // connection until GC, and leaking sockets from the very path that
+    // investigates pooled-connection failures would feed the bug it is here
+    // to diagnose. The payload is a small container config, so reading and
+    // discarding it is cheaper than cancelling and destroying the socket.
+    await res.text().catch(() => undefined);
     if (!res.ok) return { probe: `control API answered ${res.status} ${res.statusText}`, statusCode: res.status };
     return { probe: 'control API answered 200 on the diagnostic probe — the failure was transient' };
   } catch (err) {
@@ -158,16 +164,32 @@ const realDeps: Omit<ApplyDeps, 'applyContainerConfig'> = {
 };
 
 /**
- * Pick the attempt worth naming: the first that carries a status, an error
- * code, or a message. A bare `returned-false` says only that the SDK gave up,
- * so it never displaces an attempt that named something. Pure, exported for
- * tests.
+ * Fold the attempts into the one summary line, taking each field from whichever
+ * attempt actually observed it.
+ *
+ * Choosing a single attempt to represent both cannot work, and the two review
+ * rounds that landed here proved it from opposite directions: pick the last and
+ * a 429 followed by a bare `false` reports nothing; pick the first that named
+ * anything and a flattened `fetch failed` followed by a 503 hides the 503. The
+ * invariant underneath is that no concrete field any attempt observed may be
+ * dropped, so this merges per field rather than ranking attempts. `outcome` and
+ * `message` follow the status, because they describe the same failure.
+ *
+ * The full per-attempt sequence is logged alongside this, so nothing is lost
+ * even when two attempts fail differently. Pure, exported for tests.
  */
-export function pickDiagnosis(attemptDiagnoses: ApplyDiagnosis[]): ApplyDiagnosis | undefined {
-  return (
-    attemptDiagnoses.find((d) => d.statusCode !== undefined || d.causeCode !== undefined || d.message !== undefined) ??
-    attemptDiagnoses[attemptDiagnoses.length - 1]
-  );
+export function mergeDiagnoses(attemptDiagnoses: ApplyDiagnosis[]): ApplyDiagnosis | undefined {
+  if (attemptDiagnoses.length === 0) return undefined;
+  const withStatus = attemptDiagnoses.find((d) => d.statusCode !== undefined);
+  const withCause = attemptDiagnoses.find((d) => d.causeCode !== undefined);
+  const withMessage = attemptDiagnoses.find((d) => d.message !== undefined);
+  const primary = withStatus ?? withCause ?? withMessage ?? attemptDiagnoses[attemptDiagnoses.length - 1];
+  return {
+    outcome: primary.outcome,
+    statusCode: withStatus?.statusCode,
+    causeCode: withCause?.causeCode,
+    message: primary.message ?? withMessage?.message,
+  };
 }
 
 /**
@@ -199,7 +221,7 @@ export async function runApplyWithRetry(
           attempts: attempt,
           durationsMs,
           attemptDiagnoses,
-          diagnosis: pickDiagnosis(attemptDiagnoses),
+          diagnosis: mergeDiagnoses(attemptDiagnoses),
         };
       }
       // `false` is transport-or-5xx by construction (the SDK rethrows 4xx), so
@@ -227,12 +249,12 @@ export async function runApplyWithRetry(
   // Both attempts failed. Name the cause the SDK flattened away, without
   // letting the probe's verdict overwrite a status an attempt already reported.
   const probe = await deps.diagnose(options.agent);
-  const picked = pickDiagnosis(attemptDiagnoses) ?? { outcome: 'returned-false' };
+  const merged = mergeDiagnoses(attemptDiagnoses) ?? { outcome: 'returned-false' };
   const diagnosis: ApplyDiagnosis = {
-    ...picked,
+    ...merged,
     probe: probe.probe,
-    causeCode: picked.causeCode ?? probe.causeCode,
-    statusCode: picked.statusCode ?? probe.statusCode,
+    causeCode: merged.causeCode ?? probe.causeCode,
+    statusCode: merged.statusCode ?? probe.statusCode,
   };
   return { applied: false, attempts: 2, durationsMs, attemptDiagnoses, diagnosis };
 }

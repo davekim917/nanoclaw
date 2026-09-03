@@ -17,7 +17,7 @@ import {
   applyOnecliContainerConfig,
   causeCodeOf,
   describeDiagnosis,
-  pickDiagnosis,
+  mergeDiagnoses,
   runApplyWithRetry,
   type ApplyDeps,
 } from './onecli-apply.js';
@@ -187,6 +187,24 @@ describe('runApplyWithRetry', () => {
     expect(result.attemptDiagnoses.map((a) => a.outcome)).toEqual(['threw', 'returned-false']);
   });
 
+  it('surfaces a second-attempt 503 behind a first-attempt flattened fetch failure', async () => {
+    let attempts = 0;
+    const d = deps({
+      applyContainerConfig: async () => {
+        attempts++;
+        if (attempts === 1) throw flattenedTransportError();
+        throw requestError(503);
+      },
+      diagnose: async () => ({ probe: 'control API answered 200 on the diagnostic probe — the failure was transient' }),
+    });
+
+    const result = await runApplyWithRetry([], { addHostMapping: false, agent: 'ag-1' }, d);
+
+    expect(result.applied).toBe(false);
+    expect(result.diagnosis).toMatchObject({ statusCode: 503, message: 'OneCLI returned 503' });
+    expect(result.attemptDiagnoses.map((a) => a.message)).toEqual(['fetch failed', 'OneCLI returned 503']);
+  });
+
   it('records both attempts even when the first is the detail-free one', async () => {
     let attempts = 0;
     const d = deps({
@@ -291,24 +309,47 @@ describe('applyOnecliContainerConfig logging shape', () => {
   });
 });
 
-describe('pickDiagnosis', () => {
-  it('prefers the attempt that named something over a bare returned-false', () => {
+describe('mergeDiagnoses', () => {
+  it('keeps a status the first attempt named over a bare returned-false', () => {
     expect(
-      pickDiagnosis([
+      mergeDiagnoses([
         { outcome: 'threw', statusCode: 429, message: 'OneCLI returned 429' },
         { outcome: 'returned-false' },
       ]),
-    ).toMatchObject({ statusCode: 429 });
+    ).toMatchObject({ outcome: 'threw', statusCode: 429, message: 'OneCLI returned 429' });
+  });
+
+  it('keeps a status the SECOND attempt named over a generic first message', () => {
+    // The reverse sequence: attempt 1 is a flattened `fetch failed` that
+    // carries a message and nothing else, attempt 2 names a 503. Ranking
+    // attempts would surface the message and hide the status.
+    expect(
+      mergeDiagnoses([
+        { outcome: 'threw', message: 'fetch failed' },
+        { outcome: 'threw', statusCode: 503, message: 'OneCLI returned 503' },
+      ]),
+    ).toMatchObject({ statusCode: 503, message: 'OneCLI returned 503' });
+  });
+
+  it('takes each field from whichever attempt observed it', () => {
+    expect(
+      mergeDiagnoses([
+        { outcome: 'threw', causeCode: 'ECONNRESET', message: 'fetch failed' },
+        { outcome: 'threw', statusCode: 503, message: 'OneCLI returned 503' },
+      ]),
+    ).toMatchObject({ statusCode: 503, causeCode: 'ECONNRESET' });
   });
 
   it('falls back to the last attempt when none named anything', () => {
-    expect(pickDiagnosis([{ outcome: 'returned-false' }, { outcome: 'returned-false' }])).toEqual({
+    expect(mergeDiagnoses([{ outcome: 'returned-false' }, { outcome: 'returned-false' }])).toMatchObject({
       outcome: 'returned-false',
+      statusCode: undefined,
+      causeCode: undefined,
     });
   });
 
   it('returns undefined when no attempt failed', () => {
-    expect(pickDiagnosis([])).toBeUndefined();
+    expect(mergeDiagnoses([])).toBeUndefined();
   });
 });
 
