@@ -32,7 +32,6 @@ import fs from 'fs';
 import path from 'path';
 
 import { SELF_HEAL_ENABLED } from './config.js';
-import { ensureEgressNetwork } from './egress-lockdown.js';
 import { getActiveSessions, getSession, isTaskThread, updateSession } from './db/sessions.js';
 import { getAgentGroup } from './db/agent-groups.js';
 import {
@@ -65,19 +64,8 @@ import {
   killContainer,
   wakeContainer,
 } from './container-runner.js';
-import {
-  SESSION_ARTIFACT_IDLE_MS as STORAGE_SESSION_ARTIFACT_IDLE_MS,
-  collectThreadWorktreeActivity,
-  pruneIdleSessionArtifacts as pruneIdleSessionArtifactsImpl,
-  pruneIdleThreadArtifacts as pruneIdleThreadArtifactsImpl,
-  type ThreadWorktreeActivity,
-} from './storage-manager.js';
-import { handleStoragePressureAlert } from './storage-pressure-alert.js';
-import { runStorageMaintenanceInBackground } from './storage-maintenance-worker.js';
 import type { Session } from './types.js';
 import { getDb } from './db/connection.js';
-import { reconcileMergedClaims } from './modules/claims/reconcile.js';
-import { sweepClaimsSelfHeal } from './modules/claims/self-heal.js';
 
 /**
  * Session-DB timestamp parsing now lives with the mailbox module that owns
@@ -123,10 +111,6 @@ export const PENDING_MESSAGE_MAX_AGE_MS =
   (Number.isFinite(parsedMaxAgeHours) && parsedMaxAgeHours > 0 ? parsedMaxAgeHours : 24) * 60 * 60 * 1000;
 const MAX_TRIES = 5;
 const BACKOFF_BASE_MS = 5000;
-
-// Back-compat export for callers that still reference the old host-sweep
-// cleanup threshold. Storage-manager owns the actual cache cleanup policy.
-export const SESSION_ARTIFACT_IDLE_MS = STORAGE_SESSION_ARTIFACT_IDLE_MS;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Sweep duty registry (convergence seam 2, PR 2)
@@ -1531,17 +1515,10 @@ async function sweepUsageRollup(sessions: readonly Session[]): Promise<void> {
   }
 }
 
-export function pruneIdleSessionArtifacts(now: number = Date.now(), root: string = sessionsBaseDir()): void {
-  pruneIdleSessionArtifactsImpl(now, root, isContainerRunning);
-}
-
-export function pruneIdleThreadArtifacts(
-  now: number = Date.now(),
-  root: string = path.join(path.dirname(sessionsBaseDir()), 'v2-threads'),
-  activityByWorktreeDir: Map<string, ThreadWorktreeActivity> = collectThreadWorktreeActivity(isContainerRunning),
-): void {
-  pruneIdleThreadArtifactsImpl(now, root, activityByWorktreeDir);
-}
+// G64 (S2-PR6): the pruneIdleSessionArtifacts/pruneIdleThreadArtifacts
+// back-compat shims that used to live here are gone — callers use
+// storage-manager.ts's own exports (which already default `isContainerRunning`
+// and the sessions/threads roots) directly.
 
 // Running-container SLA (S14) and the OOM / memory-pressure notice (S16)
 // moved to src/modules/sweep-container-health/index.ts (convergence seam 2,
@@ -1749,24 +1726,8 @@ function resetStuckProcessingRows(mailbox: NanoclawMailboxSession, session: Sess
 function registerBuiltInSweepDuties(): void {
   const id = SWEEP_DUTY_INVENTORY;
 
-  // ── tick:pre-session ───────────────────────────────────────────────────────
-
-  registerSweepDuty({
-    name: id.T2,
-    phase: 'tick:pre-session',
-    order: 10,
-    run: () => {
-      // Re-heal the egress network so already-running agents keep their gateway
-      // hop if it was detached out-of-band. Best-effort here: a heal failure
-      // isn't a leak (agents stay on the internal net), so log and continue.
-      // No-op when lockdown is disabled.
-      try {
-        ensureEgressNetwork();
-      } catch (err) {
-        log.error('Egress lockdown re-heal failed', { err });
-      }
-    },
-  });
+  // T2 (egress-network-reheal, tick:pre-session) moved to
+  // src/modules/sweep-egress/index.ts (S2-PR6).
 
   // ── session:plan (W1) ──────────────────────────────────────────────────────
 
@@ -2050,21 +2011,8 @@ function registerBuiltInSweepDuties(): void {
     },
   });
 
-  registerSweepDuty({
-    name: id.T13,
-    phase: 'tick:post-session',
-    order: 30,
-    // Reclaim disk from idle caches and Docker artifacts after per-session sweep
-    // work has had a chance to notice and wake due messages. Fire-and-forget
-    // into a persistent worker. The worker owns the expensive synchronous
-    // filesystem/Docker implementation and its cadence state; the host event
-    // loop stays available for channel heartbeats and inbound events.
-    run: (ctx) => {
-      void runStorageMaintenanceInBackground([...ctx.activeContainerSessionIds])
-        .then((storageReport) => (storageReport ? handleStoragePressureAlert(storageReport) : undefined))
-        .catch((err) => log.warn('storage-manager: background maintenance failed', { err }));
-    },
-  });
+  // T13 (storage-maintenance, tick:post-session, order 30) moved to
+  // src/modules/sweep-storage/index.ts (S2-PR6).
 
   registerSweepDuty({
     name: id.T19,
@@ -2105,37 +2053,8 @@ function registerBuiltInSweepDuties(): void {
   // T14 completed-task-auto-archive (order 70) moved to
   // src/modules/sweep-orchestrator/index.ts (S2-PR5).
 
-  registerSweepDuty({
-    name: id.T20,
-    phase: 'tick:housekeeping',
-    order: 100,
-    // Claim reconciliation, then self-heal. Order is load-bearing: a claim whose
-    // pull request has merged must be CLOSED, not escalated at somebody — the
-    // reconcile pass deletes those files first, so the ladder below never sees
-    // them. Both are throttled internally to once per 10 minutes and each is
-    // isolated, so a GitHub outage cannot take the nudge ladder down with it.
-    run: async () => {
-      try {
-        await reconcileMergedClaims();
-      } catch (err) {
-        log.warn('Claims reconcile sweep step failed', { err });
-      }
-    },
-  });
-
-  registerSweepDuty({
-    name: id.T21,
-    phase: 'tick:housekeeping',
-    order: 110,
-    // Strictly after T20 — see the comment there.
-    run: async () => {
-      try {
-        await sweepClaimsSelfHeal();
-      } catch (err) {
-        log.warn('Claims self-heal sweep step failed', { err });
-      }
-    },
-  });
+  // T20 (claims-reconcile, order 100) and T21 (claims-self-heal, order 110,
+  // strictly after T20) moved to src/modules/sweep-claims/index.ts (S2-PR6).
 
   // ── SLA observation hooks — inside the SLA duty's own observe session ───────
   //

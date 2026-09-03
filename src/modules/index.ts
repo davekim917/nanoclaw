@@ -73,3 +73,10 @@ import './sweep-scheduled-move/index.js';
 // Sweep container health — S11 provider self-heal, S14 running-container SLA,
 // S16 OOM / memory-pressure notice (convergence seam 2, PR 10).
 import './sweep-container-health/index.js';
+// sweep-egress: T2 egress-network-reheal (S2-PR6).
+import './sweep-egress/index.js';
+// sweep-storage: T13 storage-maintenance, plus its own start/stop pair
+// (S2-PR1 module timers, carried in the same file — S2-PR6).
+import './sweep-storage/index.js';
+// sweep-claims: T20 claims-reconcile, T21 claims-self-heal (S2-PR6).
+import './sweep-claims/index.js';
