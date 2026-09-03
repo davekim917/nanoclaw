@@ -80,6 +80,53 @@ Channel recovery is an adapter contract rather than a Discord special case. Befo
 
 Any failure fails the PR.
 
+## Test hermeticity
+
+Unit tests on both trees run behind a tripwire that records and reports any call
+reaching outside the process (issue #305). It exists because two suites were
+found doing exactly that on the same day: one advanced fake timers past the
+plugin updater's startup delay and ran a real `git pull` across every repo under
+`~/plugins` — a live, fail-closed mount into every agent container, where a
+mid-pull tree denies every tool fleet-wide — and another had been doing a real
+disk walk plus a GitHub and an Anthropic API call since before anyone looked.
+
+- Host: `src/test-hermeticity.ts`, loaded from `setupFiles` in `vitest.config.ts`.
+- Agent-runner: `container/agent-runner/src/test-hermeticity.ts`, loaded from
+  `preload` in `bunfig.toml` ahead of the composition barrel.
+
+Three seams are guarded. `child_process` and `node:child_process` have every
+spawning export wrapped. `globalThis.fetch`, and `undici`'s `fetch`/`request` on
+the host, are wrapped the same way. Writes through `fs` and `fs/promises` are
+checked against a denylist of paths a unit test has no business touching:
+`~/plugins`, and the checkout's own `data/`, `groups/`, `dist/`, `logs/` and
+`node_modules/`, plus `$HOME` dotfiles. Writes under the temp directory, where
+`uniqueTmpRoot` puts every fixture, are untouched — a denylist rather than an
+allowlist, because fixtures live all over `/tmp` while the escapes worth
+catching are a short known list.
+
+A test that legitimately needs one of these opts in by name, so the exemption
+shows up in the diff:
+
+```ts
+import { allowSubprocess, allowNetwork, allowWritesTo } from './test-hermeticity.js';
+beforeAll(() => allowSubprocess(['git']));
+```
+
+`NANOCLAW_TEST_HERMETICITY` sets the mode: `warn` (the default) records and logs
+the call site, `enforce` throws, `off` disables the guard. The default is `warn`
+because the suite is not clean yet — the first full host run under the guard
+failed 40 of 313 files, nearly all of them suites that shell out to real `git`
+against a scratch checkout. The ratchet is per file: a host suite that is
+hermetic calls `enforceHermeticity()` in its own body and can never regress.
+There is no per-file equivalent on the runner, because `bun test` shares one
+process across every file and flipping the mode would silently enforce
+everything that ran afterwards; a runner suite wraps the call in
+`withHermeticityMode('enforce', ...)` instead.
+
+Recording matters independently of throwing. Most host callers already wrap
+their real work in `try`/`catch` so a git or network failure never crashes the
+host, which means a throw-only tripwire can fire and still leave a test green.
+
 ## Key invariants
 
 - **Session DBs must use `journal_mode=DELETE`.** WAL's `-shm` memory-map doesn't cross VirtioFS between host and guest. See the doc comment at the top of `container/agent-runner/src/db/connection.ts` and `src/session-manager.ts`.

@@ -53,7 +53,10 @@ describe('agent mailbox registry', () => {
     expect(await read('../index.ts')).toContain("import './modules/index.js';");
     expect(await read('../mcp-tools/index.ts')).toContain("import '../modules/index.js';");
     expect(await read('../cli/ncl.ts')).toContain("import '../modules/index.js';");
-    expect(await read('../../bunfig.toml')).toContain('preload = ["./src/modules/index.ts"]');
+    // The barrel must be preloaded; it need not be the only entry. The test
+    // hermeticity tripwire is preloaded ahead of it so its module mocks are in
+    // place before anything the barrel pulls in resolves (issue #305).
+    expect(await read('../../bunfig.toml')).toContain('"./src/modules/index.ts"');
   });
 
   test('keeps SQLite connections and SQL inside the SQLite driver', async () => {
