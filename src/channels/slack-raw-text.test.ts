@@ -142,6 +142,24 @@ describe('extractSlackRawText', () => {
       '`<@UBOT> ship 42`',
     );
 
+    // A backtick INSIDE the content would close a single-backtick fence early
+    // and leave the mention as prose — the fence grows past the longest run.
+    for (const inner of ['a`b <@UBOT>', 'a``b <@UBOT>', '`<@UBOT>`', '``<@UBOT>``']) {
+      const projected = extractSlackRawText(cellRaw([{ type: 'text', text: inner, style: { code: true } }]))!;
+      expect(slackMentionOutsideCode(projected, BOT)).toBe(false);
+    }
+
+    // Known limit, asserted so it is visible rather than silent: content
+    // carrying a run of THREE or more backticks cannot be protected, because
+    // slackMentionOutsideCode's `{3,}…`{3,} alternative lets any such run act
+    // as a closer. It is a property of that regex, not of this projection —
+    // the same body typed by hand leaks identically:
+    //   '```` ```<@UBOT> ship ````'  →  mention read as prose.
+    // Tracked as davekim917/nanoclaw#256; the fix belongs in slack-mentions.ts.
+    const unprotectable = extractSlackRawText(cellRaw([{ type: 'text', text: '```<@UBOT>', style: { code: true } }]))!;
+    expect(slackMentionOutsideCode(unprotectable, BOT)).toBe(true);
+    expect(slackMentionOutsideCode('```` ```<@UBOT> ship ````', BOT)).toBe(true);
+
     const preformatted = {
       attachments: [
         {

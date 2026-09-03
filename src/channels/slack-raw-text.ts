@@ -29,6 +29,26 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 /**
+ * Fence code content so it cannot close its own fence.
+ *
+ * `slackMentionOutsideCode` strips 1-, 2- and 3-or-more-backtick regions, so a
+ * fence one backtick longer than the longest run INSIDE the content is always
+ * stripped whole. A single backtick would not be: a cell reading
+ * `` a`b <@UBOT> `` fenced with one backtick closes at the inner backtick and
+ * leaves the mention as prose, which PROMOTES it — a mention-scoped agent
+ * wakes on documented gate syntax someone pasted into a table.
+ *
+ * Content that starts or ends with a backtick is padded so its run cannot
+ * merge with the fence's.
+ */
+function fenceCode(text: string): string {
+  const longestRun = Math.max(0, ...[...text.matchAll(/`+/g)].map((match) => match[0].length));
+  const fence = '`'.repeat(longestRun + 1);
+  const pad = text.startsWith('`') || text.endsWith('`') ? ' ' : '';
+  return `${fence}${pad}${text}${pad}${fence}`;
+}
+
+/**
  * Render one rich_text element node to readable text.
  *
  * Only plain runs carry their content in `text`. A mention, emoji, channel
@@ -56,7 +76,7 @@ function elementText(node: Record<string, unknown>): string | null {
     // projection that drops the delimiters would wake a mention-scoped agent
     // off documented gate syntax pasted into a cell.
     const style = isRecord(node.style) ? node.style : undefined;
-    return style?.code === true ? `\`${node.text}\`` : node.text;
+    return style?.code === true ? fenceCode(node.text) : node.text;
   }
   switch (node.type) {
     case 'user': {
@@ -145,7 +165,7 @@ function cellText(value: unknown): string {
       const start = out.length;
       Object.values(node).forEach(visit);
       const body = out.slice(start).trim();
-      out = body ? `${out.slice(0, start)}\`${body}\`` : out.slice(0, start);
+      out = body ? `${out.slice(0, start)}${fenceCode(body)}` : out.slice(0, start);
       return;
     }
     Object.values(node).forEach(visit);
