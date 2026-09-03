@@ -96,8 +96,11 @@ function appendHostTaskNote(agentGroupId: string, seriesId: string, note: string
 export async function handleRecurrence(inDb: Database.Database, session: Session): Promise<void> {
   const recurring = getCompletedRecurring(inDb);
   // Resolved per call, not cached at module load: a group timezone change
-  // (approved `groups config update --timezone`) must shift the series from
-  // the very next re-arm.
+  // (approved `groups config update --timezone`) shifts the series from the
+  // very next re-arm. The occurrence already armed keeps its absolute UTC
+  // instant — changing the override deliberately does not reach into live
+  // session DBs to rewrite `process_after`, so one more fire can land at the
+  // old local time before the series settles onto the new grid.
   const tz = resolveGroupTimezone(session.agent_group_id);
 
   for (const msg of recurring) {

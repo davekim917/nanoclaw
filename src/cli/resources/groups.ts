@@ -380,7 +380,7 @@ registerResource({
         'Update container config fields. Changes are saved but do NOT take effect until you run `ncl groups restart`. ' +
         'Use --id <group-id> and scalar flags, or resource flags: --memory-request-mb, --memory-limit-mb, ' +
         '--memory-swap-limit-mb, --cpus, --cpu-shares, --pids-limit. ' +
-        '--timezone takes an IANA id like "Europe/Lisbon" ("" clears back to the install default); scheduled-task times follow it immediately, the container clock after a restart.',
+        '--timezone takes an IANA id like "Europe/Lisbon" ("" clears back to the install default). Tasks created or edited afterwards use the new zone; an already-armed occurrence keeps its absolute fire time and the series moves onto the new grid at its next re-arm. The container clock follows after a restart.',
       handler: async (args) => {
         const id = args.id as string;
         if (!id) throw new Error('--id is required');
