@@ -182,6 +182,7 @@ export {
   WORK_CONTINUATION_TASK_MAX_CHARS,
   type HostWorkContinuation,
 } from './ops/continuation.js';
+export { writeOutboundDirectRow } from './ops/recovery.js';
 export type { DirectOutboundRow, InboundMessageRouting } from './ops/recovery.js';
 export { INTERACTIVE_WAKE_MAX_AGE_MS, type ContainerState as ForkContainerStateRow } from './ops/sweep.js';
 export { readRepoIngressFence } from './ops/fence.js';

@@ -335,11 +335,20 @@ export const OUTBOUND_WRITE_GUARD = 'withStoppedContainerSession';
  * pushing its continuation back to `queued`, or contending for the write lock.
  *
  * Reach, stated plainly so the residue is not mistaken for coverage: the check
- * is LEXICAL. It sees a write op called on a session inside a `with*Session(…)`
- * action. It does NOT see a write reached through a `SessionRunner`-style
- * callback parameter, or one made by a helper the action calls, because the op
- * name is not in the body it scans. Those sites carry the ownership check
- * inline instead; they are outside this rule, not exempt from the property.
+ * is LEXICAL, and it is about writes made through the MAILBOX SESSION. It does
+ * NOT see:
+ *
+ *  - a write reached through a `SessionRunner`-style callback parameter, or
+ *    one made by a helper the action calls, because the op name is not in the
+ *    body it scans. Those sites carry the ownership check inline instead.
+ *  - a write made through `withExistingNanoclawOutbound`, the outbound funnel,
+ *    which is not a `with*Session` call. Those writes (the router's two
+ *    notices, thread-close's force-clear) are a separate class made
+ *    deliberately while a container may be running; this guard is not their
+ *    remedy.
+ *
+ * All of them are outside this rule, none of them are exempt from the
+ * property.
  */
 export interface OutboundWriteMatch {
   file: string;

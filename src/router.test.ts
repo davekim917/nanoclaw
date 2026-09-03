@@ -62,18 +62,34 @@ vi.mock('./channels/channel-registry.js', () => ({
 }));
 
 // The router's two direct outbound writes (command denial, flag confirmation)
-// go through the mailbox seam now. The stub session carries only the one op
-// they use, so an assertion on `writeOutboundDirect` still names exactly the
-// write the router performed.
+// go through the OUTBOUND-keyed funnel. Both mocks model the thing that
+// distinguishes the two funnels — which file their existence check is keyed
+// on — because that is exactly what this fix is about. `sessionFiles` says
+// which of a session's two databases is present; a funnel whose file is gone
+// resolves `undefined` without running its action, which is what the real
+// `withOpenedSessionDb` does (covered against real files in
+// src/modules/mailbox/session-db-ops.test.ts).
+const sessionFiles = vi.hoisted(() => ({ inbound: true, outbound: true }));
+/** The mailbox session's op — no longer used by these two writes. */
 const writeOutboundDirect = vi.hoisted(() => vi.fn());
+/** The raw outbound op the two notices now use. */
+const writeOutboundDirectRow = vi.hoisted(() => vi.fn());
 vi.mock('./session-manager.js', () => ({
   resolveSession: vi.fn(),
   sessionMessageExists: vi.fn(() => false),
   writeSessionMessageIfNew: vi.fn(async () => true),
   withExistingMailboxSession: vi.fn(
     async (_agentGroupId: string, _sessionId: string, action: (mailbox: unknown) => unknown) =>
-      action({ writeOutboundDirect }),
+      sessionFiles.inbound ? action({ writeOutboundDirect }) : undefined,
   ),
+}));
+vi.mock('./modules/mailbox/index.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./modules/mailbox/index.js')>()),
+  withExistingNanoclawOutbound: vi.fn(
+    async (_agentGroupId: string, _sessionId: string, action: (outbound: unknown) => unknown) =>
+      sessionFiles.outbound ? action({}) : undefined,
+  ),
+  writeOutboundDirectRow,
 }));
 
 // `...real` carries `sessionStillActive` through UNCHANGED — the REAL
@@ -132,6 +148,9 @@ vi.mock('./topic-title.js', () => ({
 
 vi.mock('./modules/permissions/db/user-roles.js', () => ({
   isAnyAdmin: vi.fn(() => false),
+  // command-gate's isAdmin() gate for ADMIN_COMMANDS. Default deny, so a test
+  // that wants the denial branch only has to send the command.
+  hasAdminPrivilege: vi.fn(() => false),
 }));
 
 vi.mock('./modules/permissions/db/agent-group-members.js', () => ({
@@ -164,6 +183,7 @@ import { writeSessionMessageIfNew, resolveSession } from './session-manager.js';
 import { wakeContainer } from './container-runner.js';
 import { getSession } from './db/sessions.js';
 import { isAnyAdmin } from './modules/permissions/db/user-roles.js';
+import { formatFlagConfirmation, parseMessageFlags } from './flag-parser.js';
 import { claimChannelIngress, completeChannelIngress } from './db/channel-ingress-receipts.js';
 import { registerInterceptHandler, clearInterceptHandlers } from './command-gate.js';
 import { getDeliveryAdapter } from './delivery.js';
@@ -237,6 +257,8 @@ function mockInterceptTiebreakWinner(winnerMgId: string | undefined): void {
 beforeEach(() => {
   vi.clearAllMocks();
   clearInterceptHandlers();
+  sessionFiles.inbound = true;
+  sessionFiles.outbound = true;
   // Reset singleton hook state
   setSenderResolver(() => 'u1');
   setAccessGate(() => ({ allowed: true }));
@@ -437,6 +459,9 @@ describe('flag dispatcher wake gate', () => {
     expect(parseMessageFlags).not.toHaveBeenCalled();
     // The host must NOT post a sibling "effort → max" notice.
     expect(writeOutboundDirect).not.toHaveBeenCalled();
+    // The notices go through the outbound funnel now, so this guard names
+    // that spy too — asserting only on the session op would be vacuous.
+    expect(writeOutboundDirectRow).not.toHaveBeenCalled();
   });
 
   it('still runs parseMessageFlags when wake=true (the addressed agent)', async () => {
@@ -841,6 +866,9 @@ describe('34: pre-fanout intercept fan-out dedup + denial reply', () => {
     // No credential value, internal role-table name, or user-id leakage.
     expect(parsed.text.toLowerCase()).not.toMatch(/owner|scoped|user_role|\bu1\b/);
     expect(writeOutboundDirect).not.toHaveBeenCalled();
+    // The notices go through the outbound funnel now, so this guard names
+    // that spy too — asserting only on the session op would be vacuous.
+    expect(writeOutboundDirectRow).not.toHaveBeenCalled();
   });
 
   it('does not send a duplicate denial from a non-responding sibling', async () => {
@@ -942,5 +970,100 @@ describe('archive-before-session-write ordering', () => {
     const archiveCallOrder = vi.mocked(archiveMessage).mock.invocationCallOrder[0]!;
     const writeCallOrder = vi.mocked(writeSessionMessageIfNew).mock.invocationCallOrder[0]!;
     expect(archiveCallOrder).toBeLessThan(writeCallOrder);
+  });
+});
+
+/**
+ * The router's two direct outbound notices — the command-gate denial and the
+ * flag confirmation — write `outbound.db` and read nothing from `inbound.db`.
+ *
+ * They must therefore ask an OUTBOUND-keyed existence question. Routing them
+ * through the inbound-keyed mailbox session made them silently conditional on
+ * a file they do not touch: for a retained session whose `inbound.db` has been
+ * reclaimed while `outbound.db` remains, the funnel resolves `undefined`, the
+ * action never runs, and the router logs the denial having written no reply at
+ * all. Pre-seam both opened `outbound.db` directly, so that dependency would
+ * have been newly introduced rather than inherited.
+ *
+ * Each test here fails if the write is moved back to the mailbox session.
+ */
+describe('router notices survive a session whose inbound.db is gone', () => {
+  const session = {
+    id: 's-1',
+    agent_group_id: 'ag-1',
+    messaging_group_id: 'mg-1',
+    thread_id: null,
+    agent_provider: null,
+    status: 'active' as const,
+    container_status: 'idle' as const,
+    last_active: null,
+    created_at: new Date().toISOString(),
+  };
+
+  async function routeAs(text: string, isMention = true): Promise<void> {
+    const { getAgentGroup } = await import('./db/agent-groups.js');
+    const mg = makeMg({ id: 'mg-1', channel_type: 'slack-test', platform_id: 'platform-1', is_group: 0 });
+    vi.mocked(getMessagingGroupWithAgentCount).mockReturnValue({ mg, agentCount: 1 });
+    vi.mocked(getMessagingGroupAgents).mockReturnValue([makeAgent()]);
+    vi.mocked(getAgentGroup).mockReturnValue({
+      id: 'ag-1',
+      name: 'Test Agent',
+      folder: 'test',
+      agent_provider: null,
+      created_at: new Date().toISOString(),
+    });
+    vi.mocked(resolveSession).mockReturnValue({ session, created: false });
+    vi.mocked(getSession).mockReturnValue(session);
+    vi.mocked(wakeContainer).mockResolvedValue(false);
+    const event = makeChatEvent(text, {
+      message: { ...makeChatEvent(text).message, isMention },
+    });
+    await routeInbound(event);
+  }
+
+  it('writes the permission-denied notice when only outbound.db is present', async () => {
+    vi.mocked(isAnyAdmin).mockReturnValue(false);
+    sessionFiles.inbound = false;
+    sessionFiles.outbound = true;
+
+    await routeAs('/clear');
+
+    expect(writeOutboundDirectRow).toHaveBeenCalledOnce();
+    const [, row] = writeOutboundDirectRow.mock.calls[0] as [unknown, { content: string; kind: string }];
+    expect(row.kind).toBe('chat');
+    expect(JSON.parse(row.content).text).toContain('Permission denied');
+    // The inbound-keyed funnel is not what carried this write.
+    expect(writeOutboundDirect).not.toHaveBeenCalled();
+  });
+
+  it('writes the flag confirmation when only outbound.db is present', async () => {
+    sessionFiles.inbound = false;
+    sessionFiles.outbound = true;
+    vi.mocked(parseMessageFlags).mockReturnValue({
+      intent: { turnEffort: 'max' },
+      errors: [],
+      warnings: [],
+      cleanedText: 'hello',
+    });
+    vi.mocked(formatFlagConfirmation).mockReturnValue('Effort set to max.');
+
+    await routeAs('-e max hello');
+
+    expect(writeOutboundDirectRow).toHaveBeenCalledOnce();
+    const [, row] = writeOutboundDirectRow.mock.calls[0] as [unknown, { content: string }];
+    expect(JSON.parse(row.content).text).toBeTruthy();
+    expect(writeOutboundDirect).not.toHaveBeenCalled();
+  });
+
+  // The other half of the funnel's contract: absent outbound.db is the
+  // never-woken shape and answers `undefined` rather than provisioning one.
+  it('writes nothing when outbound.db is absent too', async () => {
+    vi.mocked(isAnyAdmin).mockReturnValue(false);
+    sessionFiles.inbound = false;
+    sessionFiles.outbound = false;
+
+    await routeAs('/clear');
+
+    expect(writeOutboundDirectRow).not.toHaveBeenCalled();
   });
 });
