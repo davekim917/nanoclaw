@@ -219,10 +219,24 @@ function readSourceLiveRow(
   try {
     db = new Database(inboundPath, { readonly: true });
     db.pragma('busy_timeout = 1000');
+    // `scheduled_for` is added lazily, by the first WRITABLE open of a given
+    // session. This handle is deliberately read-only, so on an upgraded
+    // install it can meet a session no writer has touched yet — and naming a
+    // missing column throws, which this function reports as `unreadable`.
+    // Preview would then silently claim the series has no script, and execute
+    // would answer 503 session_unreadable, for every not-yet-migrated session
+    // until the sweep happened to reach it. The dashboard serves from host
+    // start, well before that. Selected conditionally instead: absent means
+    // NULL, and every consumer of this row already falls back to
+    // `process_after` for a row written before the column existed.
+    const hasScheduledFor = (db.prepare("PRAGMA table_info('messages_in')").all() as Array<{ name: string }>).some(
+      (column) => column.name === 'scheduled_for',
+    );
+    const scheduledForColumn = hasScheduledFor ? 'scheduled_for' : 'NULL AS scheduled_for';
     const row =
       (db
         .prepare(
-          `SELECT id, status, process_after, scheduled_for, recurrence, content, platform_id, channel_type, thread_id, kind
+          `SELECT id, status, process_after, ${scheduledForColumn}, recurrence, content, platform_id, channel_type, thread_id, kind
              FROM messages_in
             WHERE series_id = ? AND kind = 'task' AND status IN ('pending', 'paused')
             ORDER BY seq DESC LIMIT 1`,

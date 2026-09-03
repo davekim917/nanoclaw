@@ -12,7 +12,17 @@
  */
 import type Database from 'better-sqlite3';
 
-import { nextEvenSeq } from '../../db/session-db.js';
+import { migrateMessagesInTable, nextEvenSeq } from '../../db/session-db.js';
+
+/**
+ * `scheduled_for` is added lazily, on the first writable open of a given
+ * session, so on an upgraded install a handle can arrive here still without
+ * it and every statement below that names the column would throw `no such
+ * column`. Each writer that names it migrates its own handle first — the same
+ * self-contained pattern `runInsertMessage` uses — so no caller, present or
+ * future, has to remember to do it. Idempotent and guarded by
+ * `PRAGMA table_info`, so a migrated handle pays only the pragma.
+ */
 
 /**
  * Insert one pending task occurrence. `seriesId` is the series join key — equal
@@ -44,6 +54,7 @@ export function insertTaskRow(
     threadId?: string | null;
   },
 ): void {
+  migrateMessagesInTable(db);
   db.prepare(
     `INSERT INTO messages_in (id, seq, timestamp, status, tries, process_after, scheduled_for, recurrence, kind, platform_id, channel_type, thread_id, content, series_id, trigger)
      VALUES (@id, @seq, @timestamp, @status, 0, @processAfter, @processAfter, @recurrence, 'task', @platformId, @channelType, @threadId, @content, @seriesId, 0)`,
@@ -152,6 +163,7 @@ export interface TaskUpdate {
 // occurrence of a recurring task is updated, not just the completed row the
 // agent last saw. Returns the number of rows touched.
 export function updateTask(db: Database.Database, taskId: string, update: TaskUpdate): number {
+  migrateMessagesInTable(db);
   const setProcessAfter = update.processAfter !== undefined;
   const setRecurrence = update.recurrence !== undefined;
   const mergeContent =
@@ -362,6 +374,7 @@ export interface TaskRowSnapshot {
  * (`pending`/`paused` are both existing live states).
  */
 export function restoreTaskRow(db: Database.Database, snapshot: TaskRowSnapshot): void {
+  migrateMessagesInTable(db);
   db.prepare(
     `INSERT INTO messages_in (id, seq, kind, timestamp, status, tries, process_after, scheduled_for, recurrence, platform_id, channel_type, thread_id, content, series_id, trigger)
      VALUES (@id, @seq, @kind, @timestamp, @status, 0, @processAfter, @scheduledFor, @recurrence, @platformId, @channelType, @threadId, @content, @seriesId, 0)`,

@@ -25,7 +25,7 @@ import { DATA_DIR } from '../config.js';
 import { resolveTaskSession } from '../session-manager.js';
 import { createSession, findSessionByAgentGroupAndMessagingGroup } from './sessions.js';
 import { getDb } from './connection.js';
-import { ensureSchema, openInboundDb } from './session-db.js';
+import { ensureSchema, migrateMessagesInTable, openInboundDb } from './session-db.js';
 import { nextEvenSeq } from './session-db.js';
 
 export interface TaskDef {
@@ -249,6 +249,12 @@ export async function scheduleTask(def: TaskDef, _dataDir?: string): Promise<voi
   // reclaim from unlinking this file between the open and the insert below.
   const db = openInboundDb(inboundDbPath);
   try {
+    // The statements below name `scheduled_for`, which is added lazily on the
+    // first writable open of a session. `resolveTaskSession` returns an
+    // EXISTING task session untouched, and this opener does not migrate, so on
+    // an upgraded install scheduling into a series whose session predates the
+    // column would throw `no such column` until the sweep reached it.
+    migrateMessagesInTable(db);
     const content = JSON.stringify({
       prompt: def.prompt,
       ...(def.script !== undefined ? { script: def.script } : {}),

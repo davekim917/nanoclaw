@@ -774,3 +774,88 @@ describe('insertRecurrence', () => {
     db.close();
   });
 });
+
+/**
+ * Codex round, generalized. The reviewer found the read-only preview path
+ * throwing `no such column: scheduled_for` on a session the lazy migration has
+ * not reached yet. The WRITE helpers that name the column have the same
+ * exposure and a worse outcome — scheduling, editing or restoring a task fails
+ * outright rather than degrading — so each migrates the handle it is given.
+ */
+describe('task writers on a session that predates scheduled_for', () => {
+  /** The pre-migration on-disk shape, produced from the migrated one. */
+  function legacyDb() {
+    const db = freshDb();
+    db.exec('ALTER TABLE messages_in DROP COLUMN scheduled_for');
+    return db;
+  }
+
+  const columns = (db: ReturnType<typeof freshDb>) =>
+    (db.prepare("PRAGMA table_info('messages_in')").all() as Array<{ name: string }>).map((c) => c.name);
+
+  it('insertTaskRow migrates the column into place', () => {
+    const db = legacyDb();
+    expect(columns(db)).not.toContain('scheduled_for');
+
+    insertTaskRow(db, {
+      id: 'task-legacy-insert',
+      seriesId: 'task-legacy-insert',
+      processAfter: '2026-01-05T09:00:00.000Z',
+      recurrence: null,
+      content: '{}',
+    });
+
+    expect(columns(db)).toContain('scheduled_for');
+    expect(db.prepare('SELECT scheduled_for FROM messages_in WHERE id = ?').get('task-legacy-insert')).toEqual({
+      scheduled_for: '2026-01-05T09:00:00.000Z',
+    });
+    db.close();
+  });
+
+  it('updateTask migrates the column into place', () => {
+    const db = freshDb();
+    insertTaskRow(db, {
+      id: 'task-legacy-update',
+      seriesId: 'ser-legacy-update',
+      processAfter: '2026-01-05T09:00:00.000Z',
+      recurrence: '0 9 * * *',
+      content: '{}',
+    });
+    db.exec('ALTER TABLE messages_in DROP COLUMN scheduled_for');
+    expect(columns(db)).not.toContain('scheduled_for');
+
+    expect(updateTask(db, 'ser-legacy-update', { processAfter: '2026-01-06T09:00:00.000Z' })).toBe(1);
+
+    expect(
+      db.prepare('SELECT process_after, scheduled_for FROM messages_in WHERE id = ?').get('task-legacy-update'),
+    ).toEqual({ process_after: '2026-01-06T09:00:00.000Z', scheduled_for: '2026-01-06T09:00:00.000Z' });
+    db.close();
+  });
+
+  it('restoreTaskRow migrates the column into place', () => {
+    const db = legacyDb();
+    const snapshot: TaskRowSnapshot = {
+      id: 'task-legacy-restore',
+      series_id: 'ser-legacy-restore',
+      status: 'paused',
+      process_after: '2026-01-05T09:00:00.000Z',
+      scheduled_for: '2026-01-05T09:00:00.000Z',
+      recurrence: '0 9 * * *',
+      content: '{}',
+      platform_id: null,
+      channel_type: null,
+      thread_id: null,
+      kind: 'task',
+    };
+
+    restoreTaskRow(db, snapshot);
+
+    expect(db.prepare('SELECT status, scheduled_for FROM messages_in WHERE id = ?').get('task-legacy-restore')).toEqual(
+      {
+        status: 'paused',
+        scheduled_for: '2026-01-05T09:00:00.000Z',
+      },
+    );
+    db.close();
+  });
+});

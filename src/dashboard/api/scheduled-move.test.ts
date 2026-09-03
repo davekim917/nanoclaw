@@ -248,6 +248,36 @@ describe('movePreviewHandler', () => {
     expect(res.status).toBe(404);
   });
 
+  // Codex round: `scheduled_for` is added lazily by the first WRITABLE open of
+  // a session, and the preview read opens read-only. On an upgraded install it
+  // therefore meets sessions that still lack the column, and naming it threw —
+  // reported as `unreadable`, so preview claimed the series had no script and
+  // execute answered 503. The dashboard serves from host start, long before the
+  // sweep migrates any given session, so this was every move on a fresh deploy.
+  it('previews a session whose inbound.db predates the scheduled_for column', async () => {
+    const { key } = seedMoveFixture();
+    // The pre-migration on-disk shape, produced from the migrated one.
+    const inbound = path.join(TEST_DIR, 'v2-sessions', 'src-ag', 'src-sess', 'inbound.db');
+    const db = openInboundDb(inbound);
+    try {
+      db.exec('ALTER TABLE messages_in DROP COLUMN scheduled_for');
+    } finally {
+      db.close();
+    }
+
+    const res = (await movePreviewHandler(
+      req({ targetAgentGroupId: 'tgt-ag', targetMessagingGroupId: 'tgt-mg' }),
+      { key },
+      ctxFor('owner', OWNER_SCOPES),
+    ))!;
+
+    expect(res.status).toBe(200);
+    const body = await readJson(res);
+    // The row was read, not swallowed as unreadable.
+    expect(body.scriptPresent).toBe(true);
+    expect(body.wiringOk).toBe(true);
+  });
+
   it('test_preview_returns_names_not_values', async () => {
     const { key } = seedMoveFixture();
     const res = (await movePreviewHandler(
