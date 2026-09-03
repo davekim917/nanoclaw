@@ -67,19 +67,35 @@ function handler(): DeliveryActionHandler {
  * One delivery attempt. `writable: false` makes the response write genuinely
  * fail: the handler now opens its own mailbox session internally (no `inDb`
  * handle is passed in — the delivery loop stopped threading one through after
- * the mailbox seam moved this action off it), so the file itself is dropped
- * to read-only rather than an injected readonly handle. `sessionDbPathIsGone`
- * (the mailbox opener's missing-vs-broken test) only trusts `fs.statSync`,
- * which a permission bit doesn't affect, so this surfaces as a real open
- * failure — not the vanished-mailbox path.
+ * the mailbox seam moved this action off it), so the real open path has to
+ * fail on its own, not via an injected readonly handle.
+ *
+ * The failure is induced by swapping the file for a same-named directory,
+ * not by chmod (review finding, 2026-09-03): root bypasses permission bits,
+ * as this suite's own containerized runs commonly are, so `0o444` silently
+ * stopped producing a write failure there. Nothing can open a directory as a
+ * regular sqlite file regardless of UID — better-sqlite3 raises
+ * `SQLITE_CANTOPEN` either way, verified empirically as both root and a
+ * non-root user. `sessionDbPathIsGone` (the mailbox opener's
+ * missing-vs-broken test) only trusts `fs.statSync`, which a directory still
+ * satisfies, so this surfaces as a real open failure — not the
+ * vanished-mailbox path. The original file is renamed aside and restored so
+ * the second attempt sees its real, unmodified content.
  */
 async function attempt(writable: boolean): Promise<void> {
   const dbFile = inboundDbPath(AG, SESSION_ID);
-  if (!writable) fs.chmodSync(dbFile, 0o444);
+  const backup = `${dbFile}.bak`;
+  if (!writable) {
+    fs.renameSync(dbFile, backup);
+    fs.mkdirSync(dbFile);
+  }
   try {
     await handler()(request, session());
   } finally {
-    if (!writable) fs.chmodSync(dbFile, 0o644);
+    if (!writable) {
+      fs.rmdirSync(dbFile);
+      fs.renameSync(backup, dbFile);
+    }
   }
 }
 
