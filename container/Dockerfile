@@ -295,6 +295,17 @@ ENV PATH="$PNPM_HOME:$PATH"
 # non-HOME path makes the LKG record and the already-downloaded pnpm
 # tarball visible to every UID that runs pnpm in this image, so the pin
 # holds regardless of which user resolves it.
+#
+# Ownership (not just readability) matters here: agents clone and work in
+# arbitrary repos, and a workspace whose own package.json pins a different
+# pnpm — or Yarn — version makes Corepack download that version into this
+# same $COREPACK_HOME at runtime (getInstallFolder()/installVersion()) to
+# honor the project's pin. `node` must be able to write here, not just
+# read the baked-in default, or that install fails EACCES. The HOST_UID
+# remap block further down chowns this dir (alongside /workspace and
+# /home/node) to the runtime user so both cases work: our own pin resolves
+# from the pre-downloaded, read-accessible LKG entry with no network call,
+# and an on-demand different pin can still download and write here.
 ENV COREPACK_HOME="/opt/corepack"
 # Pin pnpm to match the host (package.json packageManager). Build approvals are
 # deliberately written in both formats: pnpm 10 global installs still honor
@@ -302,7 +313,6 @@ ENV COREPACK_HOME="/opt/corepack"
 # `allowBuilds` YAML setting. Keep this in lockstep with package.json.
 ARG PNPM_VERSION
 RUN corepack enable && corepack prepare pnpm@${PNPM_VERSION} --activate && \
-    chmod -R a+rX "$COREPACK_HOME" && \
     resolved="$(pnpm --version)" && \
     [ "$resolved" = "${PNPM_VERSION}" ] || \
       { echo "pnpm --version ($resolved) != PNPM_VERSION (${PNPM_VERSION}) as root right after activation" >&2; exit 1; }
@@ -436,7 +446,7 @@ ARG HOST_GID=1001
 # nested read-only cred paths, which nothing needs to write.
 RUN groupmod -g ${HOST_GID} node && usermod -u ${HOST_UID} -g ${HOST_GID} node && \
     mkdir -p /workspace/agent /workspace/global /workspace/extra /home/node/.config && \
-    chown -R ${HOST_UID}:${HOST_GID} /workspace /home/node && \
+    chown -R ${HOST_UID}:${HOST_GID} /workspace /home/node /opt/corepack && \
     chmod 755 /home/node
 
 USER node
@@ -447,6 +457,15 @@ USER node
 RUN resolved="$(pnpm --version)" \
     && [ "$resolved" = "${PNPM_VERSION}" ] \
     || { echo "pnpm --version ($resolved) != PNPM_VERSION (${PNPM_VERSION}) as node — pin drifted" >&2; exit 1; }
+# Corepack must be able to WRITE into COREPACK_HOME as node, not just read the
+# baked-in pin: a cloned repo whose own packageManager field names a different
+# pnpm/Yarn version makes Corepack download it into this same dir at runtime.
+# Catches a regression to the old world-readable-only chmod (or a dropped
+# chown) at build time instead of as an EACCES the first time an agent works
+# a repo with a different pin.
+RUN probe="$COREPACK_HOME/.write-probe" \
+    && { touch "$probe" || { echo "COREPACK_HOME ($COREPACK_HOME) not writable by node — Corepack can't install an on-demand pnpm/Yarn pin" >&2; exit 1; }; } \
+    && rm -f "$probe"
 RUN unreadable="$(find /opt/remotion \( -type f ! -readable -o -type d ! -executable \) -print -quit)" \
     && test -z "$unreadable" \
     && test -r /app/package.json \
