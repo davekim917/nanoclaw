@@ -1989,47 +1989,61 @@ describe('provider-event ordering across the awaited outbound write', () => {
   // handleEvent async with it. The poll loop's `for await (const event of
   // query.events)` awaits handleEvent (poll-loop.ts:1762), so the change is
   // shape-only: event N's outbound row is committed before event N+1 is
-  // handled. Drop that one await and this test fails on the trace — the three
-  // writes start before any finishes, and the seq order stops tracking the
-  // event order.
+  // handled. Each write is held open by a gate this test releases by hand, so
+  // "the next event has not been handled yet" is a fact about that await and
+  // not a race against a timer. Drop the await and this fails on the first
+  // assertion — all three writes start before any is released.
   test('outbound writes from consecutive provider events keep monotonic seq and arrive before the next event is handled', async () => {
     const operations = getAgentMailbox().operations;
     const write = operations.writeMessageOut.bind(operations);
+    const order = ['first', 'second', 'third'];
     const trace: string[] = [];
+    const gates: Array<() => void> = [];
+
     const spy = spyOn(operations, 'writeMessageOut').mockImplementation(async (message) => {
       const label = (JSON.parse(message.content) as { text: string }).text;
       trace.push(`start:${label}`);
-      // Yield across a macrotask, so a caller that did not await would
-      // provably have started the next write before this one finished.
-      await new Promise((resolve) => setTimeout(resolve, 5));
+      await new Promise<void>((resolve) => gates.push(resolve));
       const sequence = await write(message);
       trace.push(`end:${label}`);
       return sequence;
     });
 
     async function* events(): AsyncGenerator<ProviderEvent> {
-      yield { type: 'progress', message: 'first' };
-      yield { type: 'progress', message: 'second' };
-      yield { type: 'progress', message: 'third' };
+      for (const message of order) yield { type: 'progress', message };
     }
     const query: AgentQuery = { push: () => {}, end: () => {}, abort: () => {}, events: events() };
 
+    // Not awaited yet: the stream parks inside the first write until released.
+    const finished = processQuery(query, ERR_ROUTING, [], 'claude', undefined, 'prompt', undefined, {});
+    // Generous enough that a loop which did NOT await would have run the whole
+    // stream and pushed all three starts by the time the first assertion runs.
+    const settle = () => new Promise((resolve) => setTimeout(resolve, 25));
+
     try {
-      await processQuery(query, ERR_ROUTING, [], 'claude', undefined, 'prompt', undefined, {});
+      for (let index = 0; index < order.length; index++) {
+        await settle();
+        expect(trace).toEqual([
+          ...order.slice(0, index).flatMap((label) => [`start:${label}`, `end:${label}`]),
+          `start:${order[index]}`,
+        ]);
+        gates[index]!();
+      }
+      await finished;
     } finally {
       spy.mockRestore();
     }
 
-    // Each write completes before the next event is handled.
-    expect(trace).toEqual(['start:first', 'end:first', 'start:second', 'end:second', 'start:third', 'end:third']);
+    await settle();
+    expect(trace).toEqual(order.flatMap((label) => [`start:${label}`, `end:${label}`]));
 
     const rows = getOutboundDb()
       .prepare("SELECT seq, content FROM messages_out WHERE kind = 'status' ORDER BY seq ASC")
       .all() as Array<{ seq: number; content: string }>;
-    expect(rows.map((row) => (JSON.parse(row.content) as { text: string }).text)).toEqual(['first', 'second', 'third']);
+    expect(rows.map((row) => (JSON.parse(row.content) as { text: string }).text)).toEqual(order);
     const sequences = rows.map((row) => row.seq);
     expect(sequences).toEqual([...sequences].sort((a, b) => a - b));
-    expect(new Set(sequences).size).toBe(3);
+    expect(new Set(sequences).size).toBe(order.length);
   });
 });
 
