@@ -64,3 +64,6 @@ import './sweep-idle-reap/index.js';
 // steer-idempotency-prune, channel-ingress-receipt-prune, session-title-sweep,
 // thread-title-retry, dashboard-token-prune (all tick:housekeeping).
 import './sweep-central/index.js';
+// Sweep-repo-fence (seam 2, PR 8 — G08): T5 approvals-reason-sweep,
+// T22 orphaned-repo-fence-release.
+import './sweep-repo-fence/index.js';
