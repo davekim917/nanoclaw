@@ -81,7 +81,10 @@ describe('the persisted quiet mark (S2-PR15)', () => {
       id,
       agent_group_id: 'ag-1',
       messaging_group_id: null,
-      thread_id: null,
+      // Distinct per session: migration 049's partial unique index over
+      // (agent_group_id, COALESCE(messaging_group_id,''), COALESCE(thread_id,''))
+      // WHERE status='active' rejects a second active row with the same triple.
+      thread_id: `thr-${id}`,
       agent_provider: null,
       status: 'active',
       container_status: 'stopped',
