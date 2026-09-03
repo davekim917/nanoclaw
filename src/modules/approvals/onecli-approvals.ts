@@ -18,9 +18,14 @@
  * redelivers every request it is still holding. `handleRequest` recognizes
  * those by `request_id` and re-arms the surviving row's Promise instead of
  * posting a second card, which makes a click on the pre-restart card resolve
- * the real request. A row whose request died gateway-side during the downtime
- * takes the late-decision path: the click is recorded and the card is told the
- * truth — the agent has to retry.
+ * the real request.
+ *
+ * A click can also land in the gap between this process starting and that first
+ * redelivery, with nothing armed in memory yet. The decision is then HELD on the
+ * row (status approved/rejected, row not deleted) and consumed by the
+ * redelivery, so the held request still gets the human's real answer. Only when
+ * the TTL passes with the decision unconsumed is the request genuinely gone,
+ * and the card is then told the truth — the agent has to retry.
  *
  * Expiry is row-driven as well as timer-driven. A timer dies with the process
  * that armed it, so a periodic sweep expires overdue rows regardless of which
@@ -128,7 +133,23 @@ export async function resolveOneCLIApproval(
   // falls through with a warning rather than blocking, since legacy
   // installs predate userId propagation.
   const approvers = approversFor(row);
-  if (approvers.length > 0 && userId && !approvers.includes(userId)) {
+  // Fail closed on an empty set. `handleRequest` denies outright when there is
+  // no eligible approver, so before this port the set could never be empty by
+  // the time a card existed. Deriving it at click time makes empty reachable —
+  // the last admin/owner role for the group is revoked while the card sits in
+  // a DM — and "no approvers, so skip the check" would let anyone who can post
+  // the callback approve a credentialed call. The card then expires on the
+  // sweep, which is the correct outcome for material nobody is allowed to
+  // decide.
+  if (approvers.length === 0) {
+    log.warn('OneCLI approval click rejected: no eligible approver for the originating agent group', {
+      approvalId,
+      agentGroupId: row.agent_group_id,
+      userId,
+    });
+    return true;
+  }
+  if (userId && !approvers.includes(userId)) {
     log.warn('OneCLI approval click rejected: clicker not in approver set', {
       approvalId,
       userId,
@@ -167,40 +188,53 @@ export async function resolveOneCLIApproval(
   if (state) {
     pending.delete(approvalId);
     clearTimeout(state.timer);
-  }
-  // Card is auto-edited to "✅ <option>" by chat-sdk-bridge's onAction handler,
-  // so the happy path needs no edit here.
-  deletePendingApproval(approvalId);
-
-  if (state) {
+    // Card is auto-edited to "✅ <option>" by chat-sdk-bridge's onAction
+    // handler, so the happy path needs no edit here.
+    deletePendingApproval(approvalId);
     state.resolve(decision);
     log.info('OneCLI approval resolved', { approvalId, decision, userId });
     return true;
   }
 
-  await deliverLateDecision(row, decision, userId);
+  // Nothing armed in memory. That does NOT mean the request is gone: for up to
+  // one poll cycle after a restart the gateway is still holding it and simply
+  // has not redelivered it yet. Deleting the row here would throw the decision
+  // away and let the redelivery post a second card, so the row STAYS as the
+  // recorded decision. `handleRequest` consumes it on redelivery; the sweep
+  // settles it if the TTL passes first.
+  log.info('OneCLI approval decided while unarmed — holding the decision for redelivery', {
+    approvalId,
+    decision,
+    userId,
+    expiresAt: row.expires_at,
+  });
   return true;
 }
 
 /**
- * A decision for a request whose waiting callback died with a previous process
- * and which the gateway did not redeliver — i.e. the held request is gone.
+ * A recorded decision whose TTL passed without the gateway ever coming back
+ * for it — the held request is gone and the decision cannot be delivered.
  *
  * The SDK exposes no out-of-band decision API (`ApprovalClient.submitDecision`
  * is private and takes the gateway URL resolved inside `start()`), so there is
  * nothing to submit. An approval must then tell the human the truth: the
  * credentialed call ended and the agent has to retry it. The auto-edit from
  * chat-sdk-bridge will already have flipped the card to "✅ Approved", which
- * on its own would be a lie.
+ * on its own would be a lie. A rejection needs no correction — the request was
+ * denied either way, which is what the card already says.
  */
-async function deliverLateDecision(row: PendingApproval, decision: Decision, userId: string): Promise<void> {
-  if (decision === 'approve') {
+async function settleUnconsumedDecision(row: PendingApproval): Promise<void> {
+  if (row.status === 'approved') {
     await editCardResolution(
       row,
       '✅ Approved — recorded, but the original request ended when the host restarted. Ask the agent to retry the action.',
     );
   }
-  log.info('OneCLI approval resolved late', { approvalId: row.approval_id, decision, userId });
+  deletePendingApproval(row.approval_id);
+  log.info('OneCLI approval decision expired undelivered', {
+    approvalId: row.approval_id,
+    status: row.status,
+  });
 }
 
 export function startOneCLIApprovalHandler(deliveryAdapter: ChannelDeliveryAdapter): void {
@@ -276,9 +310,21 @@ async function handleRequest(request: ApprovalRequest): Promise<Decision> {
   // second one — that is what makes the pre-restart card resolve the real
   // request. A redelivery while we are still armed (poll race) shares the
   // Promise already waiting rather than arming a competing one.
-  const existing = getPendingApprovalsByAction(ONECLI_ACTION).find(
-    (row) => row.request_id === request.id && row.status === 'pending',
-  );
+  const existing = getPendingApprovalsByAction(ONECLI_ACTION).find((row) => row.request_id === request.id);
+  if (existing && existing.status !== 'pending') {
+    // The human already decided, in the window between this process starting
+    // and the gateway's first redelivery. The decision was held on the row
+    // precisely for this moment — consume it and give the held request the
+    // real answer instead of a second card.
+    deletePendingApproval(existing.approval_id);
+    const decided: Decision = existing.status === 'approved' ? 'approve' : 'deny';
+    log.info('Applied a decision recorded before the gateway redelivered', {
+      approvalId: existing.approval_id,
+      requestId: request.id,
+      decision: decided,
+    });
+    return decided;
+  }
   if (existing) {
     const armed = pending.get(existing.approval_id);
     if (armed) return armed.promise;
@@ -405,14 +451,17 @@ async function reattachSurvivingApprovals(): Promise<void> {
 
   let rearmed = 0;
   let expired = 0;
+  let held = 0;
   for (const row of rows) {
+    const stillOpen = row.expires_at !== null && new Date(row.expires_at).getTime() > Date.now();
     if (row.status !== 'pending') {
-      // Decided or expired by a previous process that died before it could
-      // clean up. The decision already happened; just drop the record.
-      deletePendingApproval(row.approval_id);
+      // A decision the previous process recorded but never got to deliver. If
+      // the TTL is still open the gateway may redeliver on this boot, so the
+      // row stays and handleRequest consumes it; otherwise it is unconsumable.
+      if (stillOpen) held += 1;
+      else await settleUnconsumedDecision(row);
       continue;
     }
-    const stillOpen = row.expires_at !== null && new Date(row.expires_at).getTime() > Date.now();
     if (!stillOpen) {
       await expireApproval(row.approval_id, 'host restarted');
       expired += 1;
@@ -425,7 +474,7 @@ async function reattachSurvivingApprovals(): Promise<void> {
       expiresAt: row.expires_at,
     });
   }
-  log.info('OneCLI approval re-attach complete', { rearmed, expired });
+  log.info('OneCLI approval re-attach complete', { rearmed, held, expired });
 }
 
 /** Row-driven expiry sweep: overdue rows expire regardless of which process armed them. */
@@ -433,8 +482,13 @@ export async function expireOverdueApprovals(): Promise<void> {
   /* eslint-disable no-catch-all/no-catch-all -- the sweep must survive any single row's failure */
   try {
     for (const row of getPendingApprovalsByAction(ONECLI_ACTION)) {
-      if (row.status !== 'pending') continue;
       if (row.expires_at !== null && new Date(row.expires_at).getTime() > Date.now()) continue;
+      if (row.status !== 'pending') {
+        // A recorded decision the gateway never came back for. Past the TTL the
+        // held request is definitely gone, so stop holding it.
+        await settleUnconsumedDecision(row);
+        continue;
+      }
       // Live requests have their own pre-TTL timer; the sweep owns the rest.
       if (pending.has(row.approval_id)) continue;
       await expireApproval(row.approval_id, 'no response');
