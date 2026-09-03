@@ -569,6 +569,44 @@ describe('the close sequence order', () => {
     expect(fs.existsSync(dbPathFor('ag1', 's1', 'outbound.db'))).toBe(false);
   });
 
+  /**
+   * The inverse cohort: inbound.db gone, outbound.db still holding work.
+   *
+   * `exists()` is inbound-keyed, so routing the force-clear through a mailbox
+   * session answered `undefined` here and `cleared ?? true` read that as
+   * success — the finalizer would archive a session with a live
+   * `work_continuation` still in outbound. The force-clear is outbound-keyed
+   * now, so the record is actually dropped before the close completes.
+   */
+  it('clears a continuation in outbound.db even when inbound.db is gone', async () => {
+    startClose();
+    fs.rmSync(path.dirname(dbPathFor('ag1', 's1', 'inbound.db')), { recursive: true, force: true });
+    materializeSession('ag1', 's1');
+    const out = new Database(dbPathFor('ag1', 's1', 'outbound.db'));
+    out
+      .prepare('INSERT INTO session_state (key, value, updated_at) VALUES (?, ?, ?)')
+      .run(
+        'work_continuation',
+        JSON.stringify({ id: 'c-orphan', task: 'still promised', phase: 'queued', chain: 1, resume_attempts: 0 }),
+        iso(0),
+      );
+    out.close();
+    // The host-owned half of the mailbox is gone; the container's half is not.
+    fs.rmSync(dbPathFor('ag1', 's1', 'inbound.db'));
+
+    await advanceThreadClosures({ now: NOW, isContainerRunning: () => false, readProposal: () => null });
+
+    // The promise is actually gone, not merely reported gone.
+    const after = new Database(dbPathFor('ag1', 's1', 'outbound.db'), { readonly: true });
+    expect(
+      after.prepare("SELECT COUNT(*) AS n FROM session_state WHERE key IN ('work_continuation','pending_next')").get(),
+    ).toMatchObject({ n: 0 });
+    after.close();
+    expect(getDb().prepare('SELECT state FROM thread_closures WHERE thread_id = ?').get(THREAD)).toMatchObject({
+      state: 'closed',
+    });
+  });
+
   it('is idempotent — a second tick over an already-closed thread does nothing', async () => {
     startClose();
     await advanceThreadClosures(recordingDeps().deps);
