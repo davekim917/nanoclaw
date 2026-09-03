@@ -15,6 +15,7 @@ import path from 'node:path';
 import Database from 'better-sqlite3';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
+import { enforceHermeticity } from '../test-hermeticity.js';
 import {
   __setArchiveProjectionWorkerFactoryForTest,
   ensureArchiveProjection,
@@ -27,6 +28,19 @@ import {
   computeArchiveProjectionStamp,
   readArchiveProjectionStamp,
 } from './per-agent-projections.js';
+
+// The stamp path (per-agent-projections.js) is always `DATA_DIR/projection-
+// stamps/<digest>.json`, regardless of where the projection db itself lives —
+// so without this mock every test that writes a real stamp lands in the
+// checkout's own `data/projection-stamps/`, which on a live install is
+// production session state (issue #305).
+const { TEST_DATA_DIR } = vi.hoisted(() => ({ TEST_DATA_DIR: uniqueTmpRoot('archive-projection-worker') }));
+vi.mock('../config.js', async () => {
+  const actual = await vi.importActual<typeof import('../config.js')>('../config.js');
+  return { ...actual, DATA_DIR: TEST_DATA_DIR };
+});
+
+enforceHermeticity();
 
 const tmpFiles: string[] = [];
 

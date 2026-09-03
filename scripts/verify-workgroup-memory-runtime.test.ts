@@ -8,6 +8,17 @@ import Database from 'better-sqlite3';
 import { afterEach, describe, expect, it } from 'vitest';
 
 import { memoryTreeSha256, WORKGROUP_MEMORY_CONTAINER_PATH } from '../src/modules/workgroup/shared-dirs.js';
+import { allowSubprocess, enforceHermeticity } from '../src/test-hermeticity.js';
+
+// This suite drives the real `verify-workgroup-memory-runtime.ts` CLI end to
+// end (every other property it checks — fail-closed on a tampered symlink, a
+// drifted checksum, an escaped marker — only exists at that level), always
+// against a scratch root under os.tmpdir() (`mkRoot()` below), never the
+// checkout. The one real seam left is the CLI subprocess itself, and its tsx
+// resolution has three shapes depending on the environment: a local
+// node_modules/.bin/tsx, `which tsx`, or the `npx` fallback (issue #305).
+allowSubprocess(['tsx', 'which', 'npx']);
+enforceHermeticity();
 
 const SCRIPT = path.resolve('scripts/verify-workgroup-memory-runtime.ts');
 // A literal join, not Node's ancestor-walk resolution — silently missing

@@ -1,11 +1,26 @@
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import fs from 'fs';
 import path from 'path';
 
 import Database from 'better-sqlite3';
 
 import { DATA_DIR } from '../../config.js';
+import { enforceHermeticity } from '../../test-hermeticity.js';
 import { readSessionTranscript } from './sessions.js';
+
+// This suite writes real session DB files to exercise `readSessionTranscript`
+// against the actual on-disk layout — both sides (the fixture writer here and
+// `sessions.js`'s own DATA_DIR-relative path resolution) must agree on where
+// that layout lives. Unmocked, DATA_DIR resolves to the checkout's own
+// `data/` tree, which on a live install is production session state (issue
+// #305).
+const { TEST_DATA_DIR } = vi.hoisted(() => ({ TEST_DATA_DIR: uniqueTmpRoot('session-transcript') }));
+vi.mock('../../config.js', async () => {
+  const actual = await vi.importActual<typeof import('../../config.js')>('../../config.js');
+  return { ...actual, DATA_DIR: TEST_DATA_DIR };
+});
+
+enforceHermeticity();
 
 /**
  * `readSessionTranscript` against REAL session DB files, because the two things
