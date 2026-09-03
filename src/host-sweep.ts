@@ -53,7 +53,7 @@ import { withExistingNanoclawSession } from './modules/mailbox/session.js';
 // DATA_DIR, so its session DBs are not addressable by a mailbox key and it
 // cannot go through the seam. It stays on the module's own open funnel — the
 // one place in this file that still opens a session DB by path.
-import { openInboundDb as openInboundDbByPath } from './modules/mailbox/openers.js';
+import { openInboundDb as openInboundDbByPath, openOutboundDb } from './modules/mailbox/openers.js';
 import { restoreTaskRow, type TaskRowSnapshot } from './modules/scheduling/db.js';
 import { countLiveRowsInSessions } from './modules/scheduling/live-count.js';
 import { runHostGatedTaskScripts } from './modules/scheduling/host-script.js';
