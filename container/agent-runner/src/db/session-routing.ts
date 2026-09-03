@@ -5,7 +5,7 @@
  * Read by MCP tools to preserve the current thread when an explicitly named
  * destination resolves to the chat this session is bound to.
  */
-import { getInboundDb } from './connection.js';
+import { getAgentMailbox } from '../mailbox/index.js';
 
 export interface SessionRouting {
   channel_type: string | null;
@@ -14,16 +14,12 @@ export interface SessionRouting {
 }
 
 export function getSessionRouting(): SessionRouting {
-  const db = getInboundDb();
-  try {
-    const row = db.prepare('SELECT channel_type, platform_id, thread_id FROM session_routing WHERE id = 1').get() as
-      | SessionRouting
-      | undefined;
-    if (row) return row;
-  } catch {
-    // Table may not exist on an older session DB — fall through to defaults.
-  }
-  return { channel_type: null, platform_id: null, thread_id: null };
+  const routing = getAgentMailbox().operations.getSessionRouting();
+  return {
+    channel_type: routing.channelType,
+    platform_id: routing.platformId,
+    thread_id: routing.threadId,
+  };
 }
 
 const TASK_THREAD_PREFIX = 'system:tasks:';
@@ -32,52 +28,4 @@ const TASK_THREAD_PREFIX = 'system:tasks:';
 export function getTaskSeriesId(): string | null {
   const threadId = getSessionRouting().thread_id;
   return threadId?.startsWith(TASK_THREAD_PREFIX) ? threadId.slice(TASK_THREAD_PREFIX.length) : null;
-}
-
-/**
- * Returns the spawn task_id for this session if it is a child of an
- * orchestrator's spawn, or null if it is a plain (non-spawned) session.
- *
- * Reads `spawn_task_id` from inbound.db's `session_routing` table.
- * The host writes this column via applySpawnTask when launching a child
- * session for a spawned task.
- *
- * Returns null when:
- * - No session_routing row exists (before first host wake)
- * - The column value is NULL (non-spawned session)
- * - The column doesn't exist (legacy session DB pre-migration)
- */
-export function getSessionSpawnTaskId(): string | null {
-  const db = getInboundDb();
-  try {
-    const row = db
-      .prepare('SELECT spawn_task_id FROM session_routing WHERE id = 1')
-      .get() as { spawn_task_id: string | null } | undefined;
-    return row?.spawn_task_id ?? null;
-  } catch {
-    // Column may not exist on a legacy session DB — return null gracefully
-    return null;
-  }
-}
-
-/**
- * Returns this session's own ID, or null if the host hasn't written it yet
- * or the session_routing table doesn't have a session_id column (legacy).
- *
- * The host writes `session_id` into session_routing when writing the
- * spawn_task_id (applySpawnTask). Non-spawned sessions and legacy sessions
- * return null; callers degrade gracefully (e.g., list_spawned_tasks returns
- * an empty list when session_id is null).
- */
-export function getSessionId(): string | null {
-  const db = getInboundDb();
-  try {
-    const row = db
-      .prepare('SELECT session_id FROM session_routing WHERE id = 1')
-      .get() as { session_id: string | null } | undefined;
-    return row?.session_id ?? null;
-  } catch {
-    // Column may not exist on a legacy session DB — return null gracefully
-    return null;
-  }
 }

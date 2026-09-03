@@ -2,6 +2,11 @@
   "upstream": "5c3082a1",
   "files": {
     "container/agent-runner/src/db/container-state.ts": "551bed7b9ac4039c28e6d218ffe81dbb512ac709b27b6e733dd6ea23c72d832b",
+    "container/agent-runner/src/db/index.ts": "39bab9732a23047c55729d06f63e7725f9063b52918544a8effcddb584585546",
+    "container/agent-runner/src/db/messages-in.ts": "69ae36398582e998d1b113dbb2e0141d8f2141a24ab0bec25d2eeb8240bcd492",
+    "container/agent-runner/src/db/messages-out.ts": "705e8829d2c0300fd925dbafac6b3aeed5b543329aabad647637c458985a0ce2",
+    "container/agent-runner/src/db/session-routing.ts": "a52e5941ffa7623a63e495cd2b908e5408700cde3c9028a5d8e6a1f83980b96e",
+    "container/agent-runner/src/db/session-state.ts": "6b1f428f5559abf9013bdd889e013185d5c456e3294846d661ad844caa642914",
     "container/agent-runner/src/heartbeat.ts": "0af906120acbba6a0615f0b39276ae7a187404d17d2ea55a101f9f89e2dd049b",
     "container/agent-runner/src/mailbox/index.ts": "d8568702a9b5a287f75a4dd9821deccba44c14b534f92a669ba313ba9c59dde3",
     "container/agent-runner/src/mailbox/model.generated.ts": "f23a848fd794001aec5d10fe05f699b20cf93f2e756f23a498c1654441be159e",

@@ -66,6 +66,11 @@ export const UPSTREAM_FILES: readonly string[] = [
   'container/agent-runner/src/modules/index.ts',
   'container/agent-runner/src/heartbeat.ts',
   'container/agent-runner/src/db/container-state.ts',
+  'container/agent-runner/src/db/index.ts',
+  'container/agent-runner/src/db/messages-in.ts',
+  'container/agent-runner/src/db/messages-out.ts',
+  'container/agent-runner/src/db/session-routing.ts',
+  'container/agent-runner/src/db/session-state.ts',
 ] as const;
 
 /**
