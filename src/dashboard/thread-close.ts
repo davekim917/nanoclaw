@@ -295,6 +295,81 @@ export interface ThreadCloseBody {
 
 const NOT_FOUND = { status: 404 as const, body: { error: 'thread_not_found' } };
 
+/** The single decision every reservation input and reported field comes from. */
+export interface ClosureDecision {
+  outcome: 'reserve' | 'confirmation-required' | 'refused';
+  /** As of `freshVisible` — this is what the row stores AND what the response reports. */
+  agentProposed: boolean;
+  required: 1 | 2;
+  sessionIds: string[];
+  agentGroupIds: string[];
+  reason?: string;
+}
+
+/**
+ * The whole close decision, in one place, with no await in it.
+ *
+ * Everything this returns — the reservation inputs AND the fields the response
+ * and the log report — comes out of one evaluation against one set of
+ * sessions. That is the point. The close used to decide twice: once on the
+ * pre-await `visible` set and again, conditionally, on the fresh one, and the
+ * two could disagree in both directions. If the admin-backed session left
+ * during the proposal reads and a member-visible one joined, the fresh set
+ * could contain no group the caller administers while the first decision's
+ * `allow` still stood. And the response reported the pre-await proposal value
+ * while the row persisted the recomputed one, so the operator was told
+ * something the record contradicts.
+ *
+ * Neither is a line to patch; both are the same structural fact, that a
+ * decision made before an await was still load-bearing after it. So there is
+ * exactly one decision now, it happens after the last await, and nothing
+ * computed before that await reaches the caller except through
+ * `freshVisible`.
+ *
+ * Pure in the sense that matters here: no awaits and no writes. It does read —
+ * `guard` and `hasAdminPrivilege` consult current privilege, which is the
+ * whole reason to run them late — but it decides nothing from state it has not
+ * just looked at, and a test can drive it directly with any interleave.
+ *
+ * @param freshVisible sessions on the thread NOW, already scope-filtered.
+ * @param proposalsBySession which sessions were found to hold a standing
+ *   `propose_done`. A session ABSENT from this map counts as not proposing: it
+ *   joined after the reads, and reading it here would need the one thing this
+ *   function may not have. Under-counting proposals can only raise the
+ *   confirmation bar, never lower it.
+ */
+export function decideClosure(
+  freshVisible: CloseSession[],
+  proposalsBySession: ReadonlyMap<string, boolean>,
+  confirmations: number,
+  caller: { userId: string; threadId: string },
+): ClosureDecision {
+  const agentProposed = freshVisible.some((s) => proposalsBySession.get(s.id) === true);
+  const required = requiredConfirmations(agentProposed);
+  const reported = {
+    agentProposed,
+    required,
+    sessionIds: freshVisible.map((s) => s.id),
+    agentGroupIds: freshVisible.map((s) => s.agent_group_id),
+  };
+
+  const decision = guard(threadsClose, {
+    actor: { kind: 'human', userId: caller.userId },
+    resource: { threadId: caller.threadId },
+    payload: { agentGroupIds: reported.agentGroupIds, agentProposed, confirmations },
+  });
+  if (decision.effect === 'allow') return { ...reported, outcome: 'reserve' };
+
+  // Two refusals that must not look alike. Too few confirmations is a state
+  // the caller can act on — it is told the number and asks again. Anything
+  // else (not an admin on this thread any more, no sessions) collapses to the
+  // not-found so the surface never discloses that a thread exists.
+  if (confirmations < required && freshVisible.some((s) => hasAdminPrivilege(caller.userId, s.agent_group_id))) {
+    return { ...reported, outcome: 'confirmation-required', reason: decision.reason };
+  }
+  return { ...reported, outcome: 'refused', reason: decision.reason };
+}
+
 export async function requestThreadClose(
   threadId: string,
   body: ThreadCloseBody,
@@ -333,49 +408,60 @@ export async function requestThreadClose(
     };
   }
 
-  // EXACT, not the mirror: this decides how many confirmations the operator
-  // owes, so a proposal the sweep has not copied across yet must not cost them
-  // a second click, and — far more importantly — a mirror row left behind by a
-  // proposal the agent has since retracted must not buy them a cheaper one.
-  // WHICH sessions proposed, not merely whether any did. The boolean alone
-  // cannot survive the fresh membership read below: if the only proposer goes
-  // inactive during these reads it drops out of the frozen set, and a bare
-  // `true` would then buy the operator the cheaper one-confirmation close over
-  // sessions that never proposed anything.
-  const proposals = await Promise.all(
-    visible.map(async (s) => ({ id: s.id, proposed: (await readSessionProposal(s.agent_group_id, s.id)) !== null })),
+  // EXACT, not the mirror: the decision below reads how many confirmations the
+  // operator owes off these values, so a proposal the sweep has not copied
+  // across yet must not cost them a second click, and — far more importantly —
+  // a mirror row left behind by a proposal the agent has since retracted must
+  // not buy them a cheaper one.
+  //
+  // WHICH sessions proposed, not merely whether any did: the set below is
+  // intersected with the fresh membership, so a proposer that goes inactive
+  // during these reads takes its proposal with it.
+  //
+  // THIS IS THE LAST AWAIT. Everything after it is one synchronous block.
+  const proposalsBySession = new Map(
+    await Promise.all(
+      visible.map(async (s) => [s.id, (await readSessionProposal(s.agent_group_id, s.id)) !== null] as const),
+    ),
   );
-  const proposingIds = new Set(proposals.filter((p) => p.proposed).map((p) => p.id));
-  const agentProposed = proposingIds.size > 0;
 
-  const payload: ThreadClosePayload = {
-    agentGroupIds: visible.map((s) => s.agent_group_id),
-    agentProposed,
-    confirmations,
-  };
-  const decision = guard(threadsClose, {
-    actor: { kind: 'human', userId: ctx.user.id },
-    resource: { threadId },
-    payload,
+  // ── One synchronous decision. No await from here to the reservation. ──────
+  //
+  // Membership is re-read HERE. `visible` above was computed before the
+  // proposal reads; a sibling joining during that yield was frozen out of the
+  // reservation, so it never received a wrap-up and was never finalized. The
+  // scope rule is re-applied to the fresh set for the same reason it applied to
+  // the first one: closing a thread that now reaches an agent this caller
+  // cannot see would either lie or escalate, and refusing here is safe because
+  // nothing has been reserved yet.
+  const freshAll = sessionsOnThread(threadId);
+  const freshVisible = ctx.scopes.no_filter
+    ? freshAll
+    : freshAll.filter((s) => ctx.scopes.allowed_group_ids.includes(s.agent_group_id));
+  if (freshVisible.length !== freshAll.length) {
+    return {
+      status: 409,
+      body: { error: 'thread_extends_beyond_your_scope', thread_id: threadId, visible_sessions: freshVisible.length },
+    };
+  }
+
+  const decision = decideClosure(freshVisible, proposalsBySession, confirmations, {
+    userId: ctx.user.id,
+    threadId,
   });
-  if (decision.effect !== 'allow') {
-    const required = requiredConfirmations(agentProposed);
-    // Two different refusals, and they must not look alike. Too few
-    // confirmations is a state the caller can act on — it is told the number
-    // and asks again. Anything else (not an admin here, no sessions) collapses
-    // to §2a's not-found so the surface never discloses that a thread exists.
-    if (confirmations < required && visible.some((s) => hasAdminPrivilege(ctx.user.id, s.agent_group_id))) {
-      return {
-        status: 409,
-        body: {
-          error: 'confirmation_required',
-          thread_id: threadId,
-          required_confirmations: required,
-          confirmations,
-          agent_proposed: agentProposed,
-        },
-      };
-    }
+  if (decision.outcome === 'confirmation-required') {
+    return {
+      status: 409,
+      body: {
+        error: 'confirmation_required',
+        thread_id: threadId,
+        required_confirmations: decision.required,
+        confirmations,
+        agent_proposed: decision.agentProposed,
+      },
+    };
+  }
+  if (decision.outcome === 'refused') {
     log.info('thread-close: refused', { threadId, userId: ctx.user.id, reason: decision.reason });
     return NOT_FOUND;
   }
@@ -389,9 +475,9 @@ export async function requestThreadClose(
   // moment was not part of what the operator closed.
   //
   // This is an atomic RESERVATION, not a bare upsert, because the
-  // `thread_closures` check above is no longer in the same synchronous step as
-  // this write. `readSessionProposal` became awaiting when it moved behind the
-  // mailbox seam (PR 4; pre-seam it was a synchronous open), so two
+  // `thread_closures` check earlier is no longer in the same synchronous step
+  // as this write. `readSessionProposal` became awaiting when it moved behind
+  // the mailbox seam (PR 4; pre-seam it was a synchronous open), so two
   // sufficiently-confirmed requests for one thread — a double-click, or two
   // admins — can both pass that check and both yield before either writes. An
   // unconditional DO UPDATE then let the second silently replace the first's
@@ -402,71 +488,6 @@ export async function requestThreadClose(
   // itself the lock: a LIVE closure is never overwritten, a finished one still
   // re-opens (the case the upsert exists for), and zero rows changed means
   // somebody else reserved it first.
-  // Membership is re-read HERE, synchronously, immediately before it is frozen
-  // — no await between this and the INSERT below. `visible` above was computed
-  // before the proposal reads, which await; a sibling session joining the
-  // thread during that yield was frozen out of the reservation, so it never
-  // received a wrap-up and was never finalized. The scope rule is re-applied
-  // to the fresh set for the same reason it applies to the first one: closing
-  // a thread that now reaches an agent this caller cannot see would either lie
-  // or escalate, and refusing here is safe because nothing has been reserved
-  // yet.
-  const freshAll = sessionsOnThread(threadId);
-  const freshVisible = ctx.scopes.no_filter
-    ? freshAll
-    : freshAll.filter((s) => ctx.scopes.allowed_group_ids.includes(s.agent_group_id));
-  if (freshVisible.length !== freshAll.length) {
-    return {
-      status: 409,
-      body: { error: 'thread_extends_beyond_your_scope', thread_id: threadId, visible_sessions: freshVisible.length },
-    };
-  }
-
-  // The proposal that bought the cheaper confirmation bar has to still be on
-  // the thread that is about to be closed. `agentProposed` was computed from
-  // `visible`, before the reads that await; a proposer going inactive in that
-  // window leaves the frozen set without it while the boolean still says a
-  // proposal stands. `requiredConfirmations` turns that into a ONE-click close
-  // of sessions that never proposed — the one direction round 6's
-  // "it only makes the close stricter" note got wrong.
-  //
-  // Recomputed rather than re-read: a session that joined during the window is
-  // counted as NOT proposing, which can only raise the bar. Nothing has been
-  // reserved yet, so re-running the guard here is free, and it returns the
-  // same refusal the first guard would have.
-  const effectiveProposed = freshVisible.some((s) => proposingIds.has(s.id));
-  if (agentProposed && !effectiveProposed) {
-    const freshDecision = guard(threadsClose, {
-      actor: { kind: 'human', userId: ctx.user.id },
-      resource: { threadId },
-      payload: {
-        agentGroupIds: freshVisible.map((s) => s.agent_group_id),
-        agentProposed: false,
-        confirmations,
-      },
-    });
-    if (freshDecision.effect !== 'allow') {
-      const required = requiredConfirmations(false);
-      log.info('thread-close: the proposing session left the thread during the proposal reads', {
-        threadId,
-        userId: ctx.user.id,
-      });
-      if (confirmations < required && freshVisible.some((s) => hasAdminPrivilege(ctx.user.id, s.agent_group_id))) {
-        return {
-          status: 409,
-          body: {
-            error: 'confirmation_required',
-            thread_id: threadId,
-            required_confirmations: required,
-            confirmations,
-            agent_proposed: false,
-          },
-        };
-      }
-      return NOT_FOUND;
-    }
-  }
-
   const reserved = getDb()
     .prepare(
       `INSERT INTO thread_closures
@@ -484,8 +505,8 @@ export async function requestThreadClose(
       ctx.user.id,
       requestedAt,
       reason,
-      effectiveProposed ? 1 : 0,
-      JSON.stringify(freshVisible.map((s) => s.id)),
+      decision.agentProposed ? 1 : 0,
+      JSON.stringify(decision.sessionIds),
     );
 
   if (reserved.changes === 0) {
@@ -510,12 +531,15 @@ export async function requestThreadClose(
   let delivered = 0;
   for (const s of freshVisible) if (await writeCloseWrapUp(s, threadId, text, requestedAt)) delivered++;
 
+  // Reported straight off the decision — the same object the row was written
+  // from. Reading `agentProposed` from anywhere else is how the response came
+  // to contradict the record it had just persisted.
   log.info('thread-close: requested', {
     threadId,
     userId: ctx.user.id,
-    sessions: freshVisible.length,
+    sessions: decision.sessionIds.length,
     delivered,
-    agentProposed,
+    agentProposed: decision.agentProposed,
     confirmations,
   });
   return {
@@ -524,9 +548,9 @@ export async function requestThreadClose(
       thread_id: threadId,
       state: 'awaiting_confirmation',
       requested_at: requestedAt,
-      session_ids: freshVisible.map((s) => s.id),
+      session_ids: decision.sessionIds,
       wrap_up_delivered: delivered,
-      agent_proposed: agentProposed,
+      agent_proposed: decision.agentProposed,
       confirm_window_ms: CLOSE_CONFIRM_WINDOW_MS,
     },
   };

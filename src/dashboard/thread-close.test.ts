@@ -297,6 +297,89 @@ describe('requestThreadClose', () => {
   });
 
   /**
+   * The privilege check has to be made against the sessions actually closed.
+   *
+   * The decision used to be made twice — once on the pre-await visible set,
+   * again only when the proposer had dropped — so a fresh set the caller does
+   * not administer could still ride the first decision's `allow`. Two
+   * confirmations then reserved a close over an agent group the caller holds
+   * no privilege over, which is the escalation the guard exists to stop.
+   *
+   * There is one decision now, after the last await, on the fresh set.
+   */
+  it('refuses when the only group the caller administers leaves during the proposal reads', async () => {
+    const THREAD_ESC = 'slack:C1:escalate';
+    // A caller who administers ag1 and nothing else.
+    getDb()
+      .prepare(`INSERT INTO users (id, kind, display_name, created_at) VALUES ('scoped', 'dashboard', 'scoped', ?)`)
+      .run(iso(0));
+    getDb()
+      .prepare(
+        `INSERT INTO user_roles (user_id, role, agent_group_id, granted_by, granted_at)
+         VALUES ('scoped', 'admin', 'ag1', NULL, ?)`,
+      )
+      .run(iso(0));
+    insertSession('s-admin', 'ag1', THREAD_ESC);
+    fs.rmSync(path.dirname(dbPathFor('ag1', 's-admin', 'inbound.db')), { recursive: true, force: true });
+    materializeSession('ag1', 's-admin');
+
+    // The ag1 session leaves and an ag2 session joins, both inside the reads.
+    duringProposalRead.run = () => {
+      getDb().prepare("UPDATE sessions SET status = 'closed' WHERE id = 's-admin'").run();
+      insertSession('s-other-group', 'ag2', THREAD_ESC);
+    };
+
+    // Two confirmations — enough for any thread this caller may close.
+    const res = await requestThreadClose(THREAD_ESC, { confirmations: 2 }, ctxFor('scoped'));
+
+    // Refused, and as a not-found: the surface must not disclose the thread.
+    expect(res.status).toBe(404);
+    // Nothing reserved. Without one decision on the fresh set this was a 202.
+    expect(getDb().prepare('SELECT 1 FROM thread_closures WHERE thread_id = ?').get(THREAD_ESC)).toBeUndefined();
+  });
+
+  /**
+   * What the operator is told and what the record says must be the same value.
+   *
+   * The row persisted the recomputed proposal status while the response and the
+   * request log reported the pre-await one. An operator confirming a close was
+   * told an agent had proposed it, over a record that says none did.
+   */
+  it('reports the same proposal status it persists when the proposer leaves', async () => {
+    const THREAD_R = 'slack:C1:report';
+    insertSession('s-prop', 'ag1', THREAD_R);
+    insertSession('s-stay2', 'ag2', THREAD_R);
+    for (const [ag, id] of [
+      ['ag1', 's-prop'],
+      ['ag2', 's-stay2'],
+    ] as const) {
+      fs.rmSync(path.dirname(dbPathFor(ag, id, 'inbound.db')), { recursive: true, force: true });
+      materializeSession(ag, id);
+    }
+    const out = new Database(dbPathFor('ag1', 's-prop', 'outbound.db'));
+    out
+      .prepare('INSERT INTO session_state (key, value, updated_at) VALUES (?, ?, ?)')
+      .run('done_proposal', JSON.stringify({ reason: 'done', proposed_at: iso(0) }), iso(0));
+    out.close();
+
+    duringProposalRead.run = () => {
+      getDb().prepare("UPDATE sessions SET status = 'closed' WHERE id = 's-prop'").run();
+    };
+
+    // TWO confirmations, so the close still succeeds — this pins what is
+    // REPORTED, not whether it is allowed.
+    const res = await requestThreadClose(THREAD_R, { confirmations: 2 }, ctxFor('admin'));
+
+    expect(res.status).toBe(202);
+    // The proposal left with the session that made it. Reported false…
+    expect(res.body.agent_proposed).toBe(false);
+    // …and the record agrees. These used to disagree.
+    expect(
+      getDb().prepare('SELECT agent_proposed FROM thread_closures WHERE thread_id = ?').get(THREAD_R),
+    ).toMatchObject({ agent_proposed: 0 });
+  });
+
+  /**
    * The proposal that bought the cheaper bar must still be on the thread.
    *
    * `agentProposed` is computed from the pre-await visible set and decides
