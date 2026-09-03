@@ -15,7 +15,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { AgentMailbox, MailboxSessionKey } from './mailbox/types.js';
 import type { MailboxSession } from './mailbox/types.js';
@@ -215,8 +215,8 @@ import {
   SWEEP_INTERVAL_MS,
   SWEEP_PHASES,
   _listSweepRegistrationsForTesting,
-  _resetSweepDutySourcesForTesting,
   _resetSweepRegistryForTesting,
+  _unregisterSweepDutySourceForTesting,
   _setSweepYieldForTesting,
   _sweepOnceForTesting,
   registerSlaObservationHook,
@@ -1013,9 +1013,24 @@ describe('sweep duty registry (S2-PR2)', () => {
 
   // ── duty registration sources ───────────────────────────────────────────────
   describe('duty registration sources', () => {
+    // Stands in for a real family module, which registers its source once at
+    // its own import time — long-lived, not scoped to one test. The
+    // regression this guards: a prior version of the test-only unregister
+    // helper dropped EVERY non-builtin source, so removing 'fake-family'
+    // below also wiped this one for the rest of the file.
+    beforeAll(() => {
+      registerSweepDutySource('fake-persistent-family', () => {
+        registerSweepDuty(probeDuty('fake-persistent-family-duty', 'tick:housekeeping', 998, []));
+      });
+    });
+
+    afterAll(() => {
+      _unregisterSweepDutySourceForTesting('fake-persistent-family');
+    });
+
     afterEach(() => {
-      // Drop the fake source so it doesn't leak into R-7's exact-39 count.
-      _resetSweepDutySourcesForTesting();
+      // Drop only the test-scoped fake source, never the persistent one.
+      _unregisterSweepDutySourceForTesting('fake-family');
     });
 
     it('a duty source registered by a module survives the test reset', () => {
@@ -1037,6 +1052,17 @@ describe('sweep duty registry (S2-PR2)', () => {
       _resetSweepRegistryForTesting({ builtins: false });
       ({ duties } = _listSweepRegistrationsForTesting());
       expect(duties).toHaveLength(0);
+    });
+
+    // Regression test: unregistering the test-scoped source above must not
+    // touch a sibling family's source. Runs after the case above, whose
+    // afterEach has already removed 'fake-family' and whose enclosing
+    // afterEach has already called `_resetSweepRegistryForTesting()`.
+    it("unregistering one test's duty source leaves a sibling family's source registered", () => {
+      _resetSweepRegistryForTesting();
+      const { duties } = _listSweepRegistrationsForTesting();
+      expect(duties.some((d) => d.name === 'fake-persistent-family-duty')).toBe(true);
+      expect(duties.some((d) => d.name === 'fake-family-duty')).toBe(false);
     });
   });
 
