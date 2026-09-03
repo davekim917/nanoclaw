@@ -1500,6 +1500,11 @@ export class CodexProvider implements AgentProvider {
         pending.push(message);
         kick();
       },
+      // Steering keeps the push inside the running turn, but the fallbacks
+      // above queue it as a separate future turn — same shape as opencode.
+      // Reported so the poll-loop doesn't publish idle in the gap before a
+      // queued turn starts. See AgentQuery.hasQueuedWork.
+      hasQueuedWork: () => pending.length > 0,
       end: () => {
         ended = true;
         kick();

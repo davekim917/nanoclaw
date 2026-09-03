@@ -2102,6 +2102,54 @@ describe('processQuery provider_executing', () => {
     expect(atCompletion.length).toBeGreaterThan(0);
     expect(atCompletion.every((value) => value === 1)).toBe(true);
   });
+
+  // Codex review on #333, round 2: OpenCodeProvider.push() has no merge path.
+  // Every push is appended to `pending` and dequeued later as its OWN turn, so
+  // the `result` that ends the running turn can arrive with a follow-up already
+  // accepted and not yet dispatched. Lowering the turn level there published
+  // idle across that whole gap — and since the follow-up's rows were completed
+  // when they were pushed, no due row, claim or continuation covered it either.
+  // The provider now reports its queue and the poll-loop holds the level up.
+  it('stays raised across a provider-queued follow-up turn (opencode push semantics)', async () => {
+    const pending: string[] = [];
+    const observed: Record<string, number> = {};
+    async function* events(): AsyncGenerator<ProviderEvent> {
+      yield { type: 'init', continuation: 'sess-queued' };
+      // A compaction re-injects the bootstrap through pushToQuery while this
+      // turn is still running. On a queueing provider it lands in `pending`
+      // instead of merging into the turn.
+      yield { type: 'compacted', text: 'Context compacted.' };
+      expect(pending.length).toBe(1);
+      // The running turn now ends. Scratchpad-only text so result handling
+      // pushes nothing of its own — the queued prompt is the ONLY work left,
+      // and it has not started.
+      yield { type: 'result', text: '<internal>just thinking</internal>' };
+      // The generator resumes only after result handling finished, so this is
+      // exactly the window a sweep tick could land in.
+      observed.inGap = providerExecuting();
+      pending.shift(); // the queued turn starts
+      observed.queuedTurnRunning = providerExecuting();
+      yield { type: 'result', text: '<internal>done</internal>' };
+      observed.afterQueuedTurnEnds = providerExecuting();
+    }
+    const query: AgentQuery = {
+      push: (m: string) => {
+        pending.push(m);
+      },
+      end: () => {},
+      events: events(),
+      abort: () => {},
+      hasQueuedWork: () => pending.length > 0,
+    };
+
+    await processQuery(query, ERR_ROUTING, ['m-queued'], 'opencode', undefined, 'prompt', undefined, {});
+
+    expect(observed.inGap).toBe(1);
+    expect(observed.queuedTurnRunning).toBe(1);
+    // Queue drained and nothing pushed — the container is genuinely idle now.
+    expect(observed.afterQueuedTurnEnds).toBe(0);
+    expect(providerExecuting()).toBe(0);
+  });
 });
 
 it('re-bootstraps bounded canon and capabilities immediately after provider compaction', async () => {

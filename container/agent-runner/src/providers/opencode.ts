@@ -986,6 +986,12 @@ export class OpenCodeProvider implements AgentProvider {
         pending.push(wrapPromptWithContext(message, systemInstructions, effectiveModel));
         kick();
       },
+      // OpenCode has no mid-turn merge: `push` above always appends, and the
+      // generator dequeues only between turns, so a follow-up pushed while a
+      // turn is running is still sitting here when that turn's `result` fires.
+      // The poll-loop reads this to keep `provider_executing` raised across
+      // that gap instead of publishing idle to the host's task reaper.
+      hasQueuedWork: () => pending.length > 0,
       end: () => {
         ended = true;
         kick();

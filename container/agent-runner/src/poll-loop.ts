@@ -1783,6 +1783,31 @@ export async function processQuery(
     endProviderBusyScope();
   };
 
+  /**
+   * Lower the turn level unless the provider is holding work it has accepted
+   * but not started.
+   *
+   * `claude.ts` merges a mid-turn push into the running turn, so its `result`
+   * really does settle everything pushed so far. `opencode.ts` has no merge
+   * path: every push is queued as a separate future turn, so the same `result`
+   * can arrive with a follow-up already accepted and not yet dispatched.
+   * Lowering there publishes idle across the gap between this result and the
+   * queued turn's first event — the follow-up rows were completed when they
+   * were pushed, so no due row, claim or continuation covers it either — and a
+   * sweep tick landing in that gap kills the container and loses the follow-up.
+   *
+   * The queued turn's own `result` re-runs this check with the queue drained,
+   * so the flag still drops on the tick the container really goes idle.
+   *
+   * Deliberately asks the PROVIDER, not `archivePrompts`: a merged push leaves
+   * a phantom ledger entry behind forever (see `turnIdle`), so gating on the
+   * ledger would pin every Claude session busy after its first merge.
+   */
+  const lowerTurnLevelUnlessQueued = (): void => {
+    if (query.hasQueuedWork?.()) return;
+    setProviderTurnExecuting(false);
+  };
+
   // The initial prompt is a turn the same way a push is; `result` clears it.
   setProviderTurnExecuting(true);
   try {
@@ -1836,8 +1861,10 @@ export async function processQuery(
         // opened first keeps the published bit raised across the handling
         // below, which completes this batch's claim before it decides whether
         // to push a follow-up turn.
+        // A provider that QUEUES pushes instead of merging them holds the
+        // level up for itself — see lowerTurnLevelUnlessQueued.
         openResultScope();
-        setProviderTurnExecuting(false);
+        lowerTurnLevelUnlessQueued();
         // Fleet Hardening Phase 0.1: one turn_usage row per completed turn,
         // written here because every provider's query converges on this
         // event regardless of which one ran. Whatever the provider didn't

@@ -238,6 +238,28 @@ export interface AgentQuery {
   /** Push a follow-up message into the active query. */
   push(message: string): void;
 
+  /**
+   * Optional. True when the provider is holding work it has ACCEPTED but not
+   * started running: a `push()` it queued as its own future turn rather than
+   * merging into the turn already in flight.
+   *
+   * Only providers whose `push()` queues need this. `claude.ts` merges every
+   * push into the running turn (one `result` settles them all) and `codex.ts`
+   * steers the live turn, so both omit it and the poll-loop reads `false`.
+   * `opencode.ts` has no merge path at all: every push lands in `pending` and
+   * is dequeued later as a separate turn.
+   *
+   * The poll-loop reads it at `result` to decide whether it may lower the
+   * published busy level. Without it, the result that ends turn A publishes
+   * idle across the whole gap before queued turn B starts — no due row, no
+   * processing claim, no continuation, no busy flag — and the host's task
+   * reaper can kill the container and lose the follow-up. The provider's own
+   * queue is the only honest source: the poll-loop's prompt ledger over-counts
+   * permanently once a merging provider absorbs a mid-turn push (see the
+   * `turnIdle` comment in poll-loop.ts).
+   */
+  hasQueuedWork?(): boolean;
+
   /** Signal that no more input will be sent. */
   end(): void;
 
