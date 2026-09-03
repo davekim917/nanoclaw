@@ -25,7 +25,7 @@ import {
 } from '../../db/container-configs.js';
 import { getDeniedModel } from '../../db/denied-models.js';
 import { assertValidGroupFolder } from '../../group-folder.js';
-import { isValidTimezone } from '../../timezone.js';
+import { canonicalizeIanaTimezone } from '../../timezone.js';
 import { initGroupFilesystem } from '../../group-init.js';
 import { findSiblingParityDrifts } from '../../sibling-parity.js';
 import { createAgentFromTemplate } from '../../templates/create-agent.js';
@@ -34,20 +34,27 @@ import { registerResource } from '../crud.js';
 
 /**
  * Parse a --timezone flag: undefined = not passed, null = explicit clear
- * (empty string → follow the install default), otherwise a validated IANA id.
- * Invalid ids throw here, in the handler — for agent callers that is after
+ * (empty string → follow the install default), otherwise the CANONICAL IANA
+ * id. Invalid ids throw here, in the handler — for agent callers that is after
  * approval (rare, self-healing: a retry raises a fresh card).
+ *
+ * Canonical, not merely Intl-acceptable: the stored string is also handed to
+ * the container as POSIX `TZ`, where `+01:00` means UTC-1 (opposite sign) and
+ * `CST` is a zero-offset abbreviation rather than America/Chicago. Storing the
+ * region-based name is what keeps host scheduling and the container clock
+ * reading the same zone.
  */
 function parseTimezoneFlag(value: unknown): string | null | undefined {
   if (value === undefined) return undefined;
   const tz = String(value);
   if (tz === '') return null;
-  if (!isValidTimezone(tz)) {
+  const canonical = canonicalizeIanaTimezone(tz);
+  if (canonical === null) {
     throw new Error(
-      `invalid --timezone: "${tz}" is not an IANA timezone id (e.g. "Europe/Lisbon"); pass "" to follow the install default`,
+      `invalid --timezone: "${tz}" is not a region-based IANA timezone id (e.g. "Europe/Lisbon"). Fixed offsets like "+01:00" and abbreviations without a region are refused because the container reads the same string as POSIX TZ, where they mean something else. Pass "" to follow the install default`,
     );
   }
-  return tz;
+  return canonical;
 }
 
 /** Deserialize JSON columns for display. */

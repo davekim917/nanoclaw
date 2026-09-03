@@ -13,7 +13,7 @@ import { validateMcpServers, type McpServerConfig, type AdditionalMountConfig } 
 import { getAllAgentGroups } from './db/agent-groups.js';
 import { getContainerConfig, createContainerConfig } from './db/container-configs.js';
 import { log } from './log.js';
-import { isValidTimezone } from './timezone.js';
+import { isIanaTimezone } from './timezone.js';
 import type { ContainerConfigRow } from './types.js';
 
 interface LegacyContainerJson {
@@ -70,7 +70,7 @@ export function backfillContainerConfigs(): void {
       security_json: null,
       // Follow the install-global timezone; a legacy container.json may already
       // carry an override, which the spawn path reads from the file directly.
-      timezone: legacy.timezone && isValidTimezone(legacy.timezone) ? legacy.timezone : null,
+      timezone: legacy.timezone && isIanaTimezone(legacy.timezone) ? legacy.timezone : null,
       updated_at: new Date().toISOString(),
     };
 

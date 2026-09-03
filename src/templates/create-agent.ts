@@ -11,7 +11,7 @@ import {
   updateContainerConfigScalars,
 } from '../db/container-configs.js';
 import { assertValidGroupFolder, resolveGroupFolderPath } from '../group-folder.js';
-import { isValidTimezone } from '../timezone.js';
+import { canonicalizeIanaTimezone } from '../timezone.js';
 import { stageGroupPersona } from '../group-persona.js';
 import { normalizeName } from '../modules/agent-to-agent/db/agent-destinations.js';
 import { createScheduledTask, prepareScheduledTask } from '../modules/scheduling/create.js';
@@ -47,7 +47,7 @@ export function createAgentFromTemplate(ref: string, opts?: CreateAgentOptions):
   // effective timezone is derived from the option here and stamped onto the
   // config row below, BEFORE tasks are created, so a template task's first
   // run and its later re-arms agree on the same zone.
-  const timezone = opts?.timezone && isValidTimezone(opts.timezone) ? opts.timezone : undefined;
+  const timezone = (opts?.timezone && canonicalizeIanaTimezone(opts.timezone)) || undefined;
   const tasks = tpl.tasks.map((task) => {
     try {
       return prepareScheduledTask({

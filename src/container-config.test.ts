@@ -247,6 +247,23 @@ describe('resolveGroupTimezone', () => {
     expect(resolveGroupTimezone(TZ_GROUP.id)).toBe(TIMEZONE);
   });
 
+  it('refuses a stored value the write path would have rewritten or refused', () => {
+    // Intl accepts every one of these; the container gets the same string as
+    // POSIX `TZ`, where "+01:00" means UTC-1, "CST" is a zero-offset
+    // abbreviation rather than America/Chicago, and "europe/lisbon" is not a
+    // zoneinfo file at all. A hand-edited row must not split the host clock
+    // from the container clock.
+    for (const bad of ['+01:00', '-05:00', 'CST', 'EST', 'europe/lisbon']) {
+      updateContainerConfigScalars(TZ_GROUP.id, { timezone: bad });
+      expect(resolveGroupTimezone(TZ_GROUP.id)).toBe(TIMEZONE);
+      expect(configFromDb(getContainerConfig(TZ_GROUP.id)!, TZ_GROUP).timezone).toBeUndefined();
+    }
+    // A modern alias is honoured as stored — Asia/Kolkata resolves to the
+    // legacy Asia/Calcutta under ICU, and both ship in tzdata.
+    updateContainerConfigScalars(TZ_GROUP.id, { timezone: 'Asia/Kolkata' });
+    expect(resolveGroupTimezone(TZ_GROUP.id)).toBe('Asia/Kolkata');
+  });
+
   it('configFromDb ships a valid timezone to the container and drops an invalid one', () => {
     updateContainerConfigScalars(TZ_GROUP.id, { timezone: 'Asia/Tokyo' });
     expect(configFromDb(getContainerConfig(TZ_GROUP.id)!, TZ_GROUP).timezone).toBe('Asia/Tokyo');

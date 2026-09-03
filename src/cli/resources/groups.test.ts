@@ -556,6 +556,48 @@ describe('groups CLI resource config', () => {
     expect(readContainerConfig(folder).timezone).toBeUndefined();
   });
 
+  it('test_groups_config_update_rejects_a_fixed_offset_and_canonicalizes_an_alias', async () => {
+    const id = 'ag-timezone-canon';
+    const folder = 'timezone-canon';
+    createAgentGroup({ id, name: folder, folder, agent_provider: null, created_at: now() });
+    ensureContainerConfig(id);
+    const groupDir = `${TEST_DIR}/groups/${folder}`;
+    fs.mkdirSync(groupDir, { recursive: true });
+    fs.writeFileSync(
+      `${groupDir}/container.json`,
+      JSON.stringify({ mcpServers: {}, packages: { apt: [], npm: [] }, skills: 'all' }) + '\n',
+    );
+
+    // Intl accepts all of these; POSIX TZ reads them differently — "+01:00"
+    // with the opposite sign, "CST" as a zero-offset abbreviation — so the
+    // host clock and the container clock would disagree.
+    for (const bad of ['+01:00', '-05:00', 'CST', 'EST']) {
+      const rejected = await dispatch(
+        { id: `req-tz-${bad}`, command: 'groups-config-update', args: { id, timezone: bad } },
+        { caller: 'host' },
+      );
+      expect(rejected.ok).toBe(false);
+      expect(JSON.stringify(rejected)).toMatch(/region-based IANA timezone id/);
+    }
+    expect(getContainerConfig(id)?.timezone).toBeNull();
+
+    // Case is normalized, because POSIX looks the zone up as a zoneinfo FILE.
+    // An alias is left as typed: Asia/Kolkata resolves to the legacy
+    // Asia/Calcutta under ICU and both ship in tzdata.
+    for (const [typed, stored] of [
+      ['europe/lisbon', 'Europe/Lisbon'],
+      ['Asia/Kolkata', 'Asia/Kolkata'],
+    ]) {
+      const ok = await dispatch(
+        { id: `req-tz-canon-${typed}`, command: 'groups-config-update', args: { id, timezone: typed } },
+        { caller: 'host' },
+      );
+      expect(ok.ok).toBe(true);
+      expect(getContainerConfig(id)?.timezone).toBe(stored);
+      expect(readContainerConfig(folder).timezone).toBe(stored);
+    }
+  });
+
   it('test_groups_config_update_rejects_a_non_iana_timezone', async () => {
     const id = 'ag-timezone-bad';
     const folder = 'timezone-bad';
@@ -567,7 +609,7 @@ describe('groups CLI resource config', () => {
       { caller: 'host' },
     );
     expect(response.ok).toBe(false);
-    expect(JSON.stringify(response)).toMatch(/not an IANA timezone id/);
+    expect(JSON.stringify(response)).toMatch(/region-based IANA timezone id/);
     expect(getContainerConfig(id)?.timezone).toBeNull();
   });
 

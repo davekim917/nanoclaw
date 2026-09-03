@@ -22,7 +22,7 @@ import path from 'path';
 import { GROUPS_DIR, TIMEZONE } from './config.js';
 import { validateContainerResources, type ContainerResources } from './container-resources.js';
 import { getContainerConfig } from './db/container-configs.js';
-import { isValidTimezone } from './timezone.js';
+import { isIanaTimezone } from './timezone.js';
 import type { AgentGroup, ContainerConfigRow } from './types.js';
 
 /**
@@ -502,9 +502,10 @@ function configPath(folder: string): string {
 
 /**
  * Effective timezone for an agent group: per-group override → install global.
- * The ncl write path validates, but a hand-edited DB value must not silently
- * flip scheduling to UTC — an invalid override falls back to the global tz,
- * same as no override.
+ * The ncl write path validates and canonicalizes, but a hand-edited DB value
+ * must not silently flip scheduling — anything that is not a region-based
+ * IANA id (a fixed offset, an abbreviation) falls back to the global tz, same
+ * as no override.
  *
  * This is the HOST-side resolver: it grounds scheduling (cron interpretation,
  * `--process-after`, run-log stamps), which reads the DB row. The container's
@@ -513,7 +514,7 @@ function configPath(folder: string): string {
  */
 export function resolveGroupTimezone(agentGroupId: string): string {
   const tz = getContainerConfig(agentGroupId)?.timezone;
-  return tz && isValidTimezone(tz) ? tz : TIMEZONE;
+  return tz && isIanaTimezone(tz) ? tz : TIMEZONE;
 }
 
 /** Build a `ContainerConfig` from a DB row + agent group identity. */
@@ -534,7 +535,7 @@ export function configFromDb(row: ContainerConfigRow, group: AgentGroup): Contai
     maxMessagesPerPrompt: row.max_messages_per_prompt ?? undefined,
     model: row.model ?? undefined,
     effort: row.effort ?? undefined,
-    timezone: row.timezone && isValidTimezone(row.timezone) ? row.timezone : undefined,
+    timezone: row.timezone && isIanaTimezone(row.timezone) ? row.timezone : undefined,
     security: row.security_json ? (JSON.parse(row.security_json) as SecurityConfig) : undefined,
   };
 }
