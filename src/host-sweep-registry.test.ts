@@ -237,7 +237,7 @@ import {
 } from './host-sweep.js';
 import { log } from './log.js';
 import { SessionDbMissingError, SessionDbUnopenableError } from './modules/mailbox/index.js';
-import { _mailboxSessionDepthForTesting } from './modules/mailbox/session.js';
+import { _mailboxSessionDepthForTesting } from './host-sweep-depth-probe.js';
 // Family modules moved out of host-sweep.ts register at import — pull them in
 // here so the hermetic registry harness sees the full 39-registration set.
 // Each registers itself via `registerSweepDutySource`, so a default
