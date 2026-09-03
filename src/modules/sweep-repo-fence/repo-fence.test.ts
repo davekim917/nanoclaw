@@ -1,14 +1,31 @@
 /**
- * Regression tests for the 2026-09-01 19:10 UTC orphaned-fence incident.
+ * S2-PR8 — repo fence + approvals scan (G08): T5 `approvals-reason-sweep`,
+ * T22 `orphaned-repo-fence-release` (plan.md §8 F-8.1..F-8.3).
  *
- * A repository publication fenced ~1400 session inbound DBs in one
- * workgroup with the epoch `repository-publish:repo-1788289675241-b13bcab3ec972233`,
- * then failed on a session whose DB had just been reclaimed. Its strict release
- * fails fast, so every session behind that one stayed fenced; delivery retried
- * three times, dropped the message, and 1401 of 1638 session DBs were still
- * `state = 'active'` 2.5 hours later — inbound held at trigger=0, every spawn
- * refused, the whole workgroup silently deaf. These tests pin the recovery that
- * did not exist.
+ * F-8.1 and F-8.2 are the 9 cases ported unchanged (import-path updates only)
+ * from `src/repo-fence-recovery.test.ts` — the source module itself does NOT
+ * move here (see index.ts's header comment: `src/main.ts` and
+ * `src/delivery.ts` / `src/modules/repository-workspaces/job-runner.ts` also
+ * import it directly, both outside this family PR's ownership boundary), so
+ * only the wrapper this file's sibling `index.ts` now owns moved; the test
+ * for the underlying `repo-fence-recovery.ts` module moves with it because
+ * every case in it is exercising that module's contract, which this duty is
+ * the periodic (and only fully-automatic) caller of.
+ *
+ * F-8.3 is ported from `src/modules/approvals/reason-capture.test.ts`'s
+ * `describe('reject-with-reason host sweep', ...)`. That file drives
+ * `sweepAwaitingReasonRejects` against the REAL central DB (`initTestDb`) and
+ * a real delivery adapter fake — a fixture style that cannot share a test
+ * file with this suite's fully-mocked `db/sessions.js` / mailbox-session
+ * seam (two `vi.mock` factories for the same module in one file is not
+ * expressible; whichever runs last wins for every test in the file). The
+ * scenario is ported here as an equivalent lightweight mock of
+ * `getExpiredAwaitingReasonApprovals` / `getSession` / `deletePendingApproval`
+ * / `finalizeReject`, consistent with this file's existing style — a REWRITE,
+ * not a verbatim move; the original describe block is deliberately left in
+ * place in `reason-capture.test.ts` (out of this family PR's ownership, and
+ * its own `armReasonCapture` / `captureReasonReply` coverage in that file is
+ * unrelated to this duty).
  */
 import fs from 'fs';
 import os from 'os';
@@ -17,13 +34,39 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 // Spread the real module: `importOriginal` on the mailbox session seam below
 // pulls in session-manager, which uses more of log.js than these four levels.
-vi.mock('./log.js', async (importOriginal) => ({
-  ...(await importOriginal<typeof import('./log.js')>()),
+vi.mock('../../log.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../log.js')>()),
   log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn(), fatal: vi.fn() },
 }));
 
+/**
+ * Hermeticity HARD RULE (brief-common.md step 2). Neither duty body this file
+ * exercises has any legitimate reason to shell out — reused from
+ * `src/host-sweep-registry.test.ts`'s tripwire factory.
+ */
+const spawns: string[] = vi.hoisted(() => [] as string[]);
+function childProcessTripwire(record: string[]): Record<string, (...args: unknown[]) => never> {
+  const spawnAttempted =
+    (name: string) =>
+    (...args: unknown[]): never => {
+      record.push(name);
+      throw new Error(`repo-fence.test: real process spawn attempted (${name}(${JSON.stringify(args[0])}))`);
+    };
+  return {
+    exec: spawnAttempted('exec'),
+    execFile: spawnAttempted('execFile'),
+    spawn: spawnAttempted('spawn'),
+    execSync: spawnAttempted('execSync'),
+    execFileSync: spawnAttempted('execFileSync'),
+    spawnSync: spawnAttempted('spawnSync'),
+    fork: spawnAttempted('fork'),
+  };
+}
+vi.mock('child_process', () => childProcessTripwire(spawns));
+vi.mock('node:child_process', () => childProcessTripwire(spawns));
+
 const mockWakeRepositoryMountSessions = vi.fn();
-vi.mock('./container-restart.js', () => ({
+vi.mock('../../container-restart.js', () => ({
   wakeRepositoryMountSessions: (...args: unknown[]) => mockWakeRepositoryMountSessions(...args),
 }));
 
@@ -36,19 +79,50 @@ interface TestSession {
 }
 
 const agentGroups = new Map<string, { id: string; folder: string; workgroup_id: string | null }>();
-vi.mock('./db/agent-groups.js', () => ({
+
+const sessions: TestSession[] = [];
+/** F-8.2: counts every call, across both describe blocks, so a regression that
+ *  makes the duty re-query sessions itself instead of reusing `ctx.sessions`
+ *  cannot slip past a fresh-suite reset. */
+const getActiveSessionsCalls = { count: 0 };
+
+interface ApprovalRow {
+  approval_id: string;
+  session_id: string | null;
+  expires_at: string;
+}
+const awaitingReasonApprovals: ApprovalRow[] = [];
+const deletedApprovalIds: string[] = [];
+const finalizeRejectCalls: Array<{ approvalId: string; sessionId: string; userId: string; reason?: string }> = [];
+
+vi.mock('../../db/agent-groups.js', () => ({
   getAgentGroup: (id: string) => agentGroups.get(id),
   getAllAgentGroups: () => [...agentGroups.values()],
 }));
 
-vi.mock('./db/messaging-groups.js', () => ({
+vi.mock('../../db/messaging-groups.js', () => ({
   getMessagingGroup: (id: string) => ({ id, platform_id: `platform-${id}` }),
 }));
 
-const sessions: TestSession[] = [];
-vi.mock('./db/sessions.js', () => ({
-  getActiveSessions: () => sessions.filter((session) => session.status === 'active'),
+vi.mock('../../db/sessions.js', () => ({
+  getActiveSessions: () => {
+    getActiveSessionsCalls.count += 1;
+    return sessions.filter((session) => session.status === 'active');
+  },
   getSessionsByAgentGroup: (id: string) => sessions.filter((session) => session.agent_group_id === id),
+  // F-8.3's fakes — only what `sweepAwaitingReasonRejects` reads.
+  getExpiredAwaitingReasonApprovals: (nowIso: string) =>
+    awaitingReasonApprovals.filter((row) => row.expires_at <= nowIso),
+  getSession: (id: string) => sessions.find((session) => session.id === id),
+  deletePendingApproval: (approvalId: string) => {
+    deletedApprovalIds.push(approvalId);
+  },
+}));
+
+vi.mock('../approvals/finalize.js', () => ({
+  finalizeReject: (approval: ApprovalRow, session: TestSession, userId: string, reason?: string) => {
+    finalizeRejectCalls.push({ approvalId: approval.approval_id, sessionId: session.id, userId, reason });
+  },
 }));
 
 type Fence = { epoch: string; generation: string; state: 'active' | 'released' };
@@ -87,8 +161,8 @@ function modelMailbox(sessionId: string) {
   };
 }
 
-vi.mock('./modules/mailbox/session.js', async (importOriginal) => ({
-  ...(await importOriginal<typeof import('./modules/mailbox/session.js')>()),
+vi.mock('../mailbox/session.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../mailbox/session.js')>()),
   withExistingNanoclawSession: async (
     _agentGroupId: string,
     sessionId: string,
@@ -110,8 +184,9 @@ import {
   releaseOrphanedRepoIngressFencesForDroppedMessage,
   sweepOrphanedRepoIngressFences,
   _resetOrphanedRepoFenceScanForTesting,
-} from './repo-fence-recovery.js';
-import { withWorkgroupRepositoryMountClaim } from './repository-workspaces.js';
+} from '../../repo-fence-recovery.js';
+import { withWorkgroupRepositoryMountClaim } from '../../repository-workspaces.js';
+import { sweepAwaitingReasonRejects } from '../approvals/reason-capture.js';
 
 const PUBLISH_EPOCH = 'repository-publish:repo-1788289675241-b13bcab3ec972233';
 
@@ -145,14 +220,21 @@ beforeEach(() => {
   agentGroups.clear();
   agentGroups.set('ag-primary', { id: 'ag-primary', folder: 'wg-a', workgroup_id: 'wg-a' });
   agentGroups.set('ag-sibling', { id: 'ag-sibling', folder: 'sibling', workgroup_id: 'wg-a' });
+  getActiveSessionsCalls.count = 0;
+  awaitingReasonApprovals.length = 0;
+  deletedApprovalIds.length = 0;
+  finalizeRejectCalls.length = 0;
   _resetOrphanedRepoFenceScanForTesting();
 });
 
 afterEach(() => {
   fs.rmSync(sessionsRoot, { recursive: true, force: true });
+  // Hermeticity HARD RULE step 2 — every test here runs a duty body.
+  expect(spawns).toEqual([]);
+  spawns.length = 0;
 });
 
-describe('orphaned repository ingress fence recovery (incident 2026-09-01)', () => {
+describe('orphaned fences whose publication is gone are released and their sessions woken after the loop', () => {
   it('releases a fence whose publication is gone and wakes the session holding its trigger=1 rows', async () => {
     const orphaned = addSession('s-orphaned');
     addSession('s-clean');
@@ -301,4 +383,70 @@ describe('orphaned repository ingress fence recovery (incident 2026-09-01)', () 
       stop = true;
     }
   });
+});
+
+// ── F-8.2 ─────────────────────────────────────────────────────────────────────
+it("the fence scan keeps its 5-minute internal throttle and reuses the tick's session list", async () => {
+  const orphaned = addSession('s1');
+  fence(orphaned.id);
+
+  const first = await sweepOrphanedRepoIngressFences(sessions as never, 1_000);
+  expect(first).toMatchObject({ released: 1 });
+
+  fence(orphaned.id, PUBLISH_EPOCH, 'gen-second');
+  const throttled = await sweepOrphanedRepoIngressFences(sessions as never, 1_000 + 60_000);
+  expect(throttled).toBeNull();
+  expect(fences.get(orphaned.id)?.state).toBe('active');
+
+  const later = await sweepOrphanedRepoIngressFences(sessions as never, 1_000 + ORPHANED_REPO_FENCE_SCAN_INTERVAL_MS);
+  expect(later).toMatchObject({ released: 1 });
+
+  // The duty passes `ctx.sessions` straight through (constraint 4) — the
+  // scan never re-queries the central DB itself, on either the throttled or
+  // the real pass.
+  expect(getActiveSessionsCalls.count).toBe(0);
+});
+
+// ── F-8.3 ─────────────────────────────────────────────────────────────────────
+describe('the approvals reason-reject scan finalizes elapsed holds', () => {
+  it('finalizes a hold whose window elapsed as a plain reject', async () => {
+    const session = addSession('s-hold');
+    awaitingReasonApprovals.push({
+      approval_id: 'appr-1',
+      session_id: session.id,
+      expires_at: '2026-01-01T00:00:00.000Z',
+    });
+
+    await sweepAwaitingReasonRejects();
+
+    expect(finalizeRejectCalls).toEqual([
+      { approvalId: 'appr-1', sessionId: session.id, userId: '', reason: undefined },
+    ]);
+    expect(deletedApprovalIds).toEqual([]);
+  });
+
+  it('leaves a still-open hold untouched', async () => {
+    const session = addSession('s-hold-open');
+    // Not expired: `getExpiredAwaitingReasonApprovals` is the real function's
+    // own filter, so a hold whose window hasn't elapsed is never returned to
+    // the sweep in the first place.
+    awaitingReasonApprovals.push({
+      approval_id: 'appr-2',
+      session_id: session.id,
+      expires_at: '2999-01-01T00:00:00.000Z',
+    });
+
+    await sweepAwaitingReasonRejects();
+
+    expect(finalizeRejectCalls).toEqual([]);
+    expect(deletedApprovalIds).toEqual([]);
+  });
+});
+
+// ── Tripwire self-check (brief-common.md HARD RULE step 3) ─────────────────
+it('the child_process tripwire bites when a seam mock is removed', () => {
+  const record: string[] = [];
+  const tripwire = childProcessTripwire(record);
+  expect(() => tripwire.execSync!('git pull')).toThrow(/real process spawn attempted/);
+  expect(record).toEqual(['execSync']);
 });
