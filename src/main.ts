@@ -32,6 +32,7 @@ import {
   stopDeliveryPolls,
 } from './delivery.js';
 import { startHostSweep, stopHostSweep } from './host-sweep.js';
+import { runOnecliBootPreflight } from './onecli-preflight.js';
 import { stopStorageMaintenanceWorker } from './storage-maintenance-worker.js';
 import { resetStorageActivityState } from './storage-activity.js';
 import { finishInterruptedSessionArchivals } from './storage-manager.js';
@@ -458,6 +459,14 @@ export async function main(): Promise<void> {
   // also carries our support-thread surfaces (deleteMessage/postParent/
   // createThread). See createChannelDeliveryAdapter in channel-registry.ts.
   setDeliveryAdapter(createChannelDeliveryAdapter());
+
+  // 4a. OneCLI control-API preflight — the credential call every spawn makes,
+  // once, before this host starts accepting work. A control API this process
+  // cannot reach means every spawn is refused at WARN and the fleet goes
+  // silently deaf (2026-09-02: 11 minutes, 0/8 spawns, a clean-looking boot).
+  // Failing here logs ERROR and exits non-zero BEFORE markDeployBootHealthy(),
+  // so the unit-failure alert fires and the deploy stays rollback-eligible.
+  await runOnecliBootPreflight();
 
   // Start recovery only after permissions and delivery are fully wired. A
   // replay can immediately exercise either surface (sibling bots, unknown
