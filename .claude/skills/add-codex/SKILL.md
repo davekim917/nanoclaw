@@ -124,7 +124,7 @@ pnpm vitest run src/providers/codex-registration.test.ts src/providers/codex.con
 ```
 
 ```nc:run effect:test
-cd container/agent-runner && bun test src/providers/
+cd container/agent-runner && bun run test src/providers/
 ```
 
 ```nc:run effect:test

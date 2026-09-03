@@ -108,7 +108,7 @@ pnpm test             # vitest
 
 # Agent-runner (Bun — separate package tree)
 cd container/agent-runner && bun install   # after editing deps
-cd container/agent-runner && bun run test  # bun:test (bun run, not bare `bun test` — the script adds the hermeticity preload)
+cd container/agent-runner && bun run test  # bun:test + hermeticity
 ```
 
 Container typecheck is a separate tsconfig — after editing `container/agent-runner/src/`, run `pnpm exec tsc -p container/agent-runner/tsconfig.json --noEmit` (or `bun run typecheck` from that dir).

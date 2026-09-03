@@ -181,7 +181,7 @@ pnpm exec tsc -p container/agent-runner/tsconfig.json --noEmit
 # Host tree: buildContainerArgs wiring
 pnpm exec vitest run src/ollama-wiring.test.ts
 # Container tree: index.ts registration
-(cd container/agent-runner && bun test src/ollama-registration.test.ts)
+(cd container/agent-runner && bun run test src/ollama-registration.test.ts)
 ./container/build.sh
 ```
 

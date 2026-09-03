@@ -63,7 +63,7 @@ pnpm run build
 pnpm exec tsc -p container/agent-runner/tsconfig.json --noEmit
 ./container/build.sh
 pnpm test
-cd container/agent-runner && bun test
+cd container/agent-runner && bun run test
 ```
 
 All suites green and `ncl groups list` showing no codex groups means the removal is complete. Restart the service (`launchctl kickstart -k gui/$(id -u)/<label>` on macOS, `systemctl --user restart <unit>` on Linux).

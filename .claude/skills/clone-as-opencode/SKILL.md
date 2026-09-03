@@ -681,7 +681,7 @@ Optionally, uninstall the sibling's bot app from the platform.
 - Worktrees are thread-scoped when `NANOCLAW_THREAD_WORKTREES=1`. Concurrent git ops across siblings share standard `.git/index.lock` semantics; turn-taking via `@`-mentions mitigates by design.
 - **OpenCode's exact Docker pin is the source of truth** for the CLI and
   `@opencode-ai/sdk`. Derive both from it, never use `bun update`, and re-run
-  `bun test src/providers/` after a deliberate bump.
+  `bun run test src/providers/` after a deliberate bump.
 
 ### Notes on cross-sibling auth and OpenCode plan choice
 

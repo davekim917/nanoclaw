@@ -203,7 +203,7 @@ and rejected inside containers, even at global `cli_scope`.
 ```bash
 pnpm run build
 pnpm exec tsc -p container/agent-runner/tsconfig.json --noEmit
-(cd container/agent-runner && bun test src/providers/gmail-dockerfile.test.ts src/providers/gmail-allow-pattern.test.ts)
+(cd container/agent-runner && bun run test src/providers/gmail-dockerfile.test.ts src/providers/gmail-allow-pattern.test.ts)
 ```
 
 All must be clean before proceeding. `gmail-dockerfile.test.ts` confirms the package install is wired into the image; `gmail-allow-pattern.test.ts` confirms the allow-pattern derivation that exposes `mcp__gmail__*`. A failure means one drifted.
