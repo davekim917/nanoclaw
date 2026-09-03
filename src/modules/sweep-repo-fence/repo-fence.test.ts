@@ -185,8 +185,16 @@ import {
   sweepOrphanedRepoIngressFences,
   _resetOrphanedRepoFenceScanForTesting,
 } from '../../repo-fence-recovery.js';
+import * as repoFenceRecoveryModule from '../../repo-fence-recovery.js';
 import { withWorkgroupRepositoryMountClaim } from '../../repository-workspaces.js';
 import { sweepAwaitingReasonRejects } from '../approvals/reason-capture.js';
+import * as reasonCaptureModule from '../approvals/reason-capture.js';
+import { log } from '../../log.js';
+// Side effect: registers this family's two duties via registerSweepDutySource
+// (see ./index.ts) so `_listSweepRegistrationsForTesting()` below finds them —
+// they are no longer inline in host-sweep.ts's own built-ins.
+import './index.js';
+import { SWEEP_DUTY_INVENTORY, _listSweepRegistrationsForTesting, type SweepTickContext } from '../../host-sweep.js';
 
 const PUBLISH_EPOCH = 'repository-publish:repo-1788289675241-b13bcab3ec972233';
 
@@ -407,6 +415,84 @@ it("the fence scan keeps its 5-minute internal throttle and reuses the tick's se
   expect(getActiveSessionsCalls.count).toBe(0);
 });
 
+/**
+ * Codex review (efb8350a..10ada631, medium, accepted): the case above calls
+ * `sweepOrphanedRepoIngressFences` directly, so the registered T22 wrapper —
+ * the `registerSweepDuty({ name: id.T22, run: (ctx) => {...} })` block in
+ * `./index.ts` that actually forwards `ctx.sessions` and owns the try/catch —
+ * is never executed, making the "no extra getActiveSessions call" assertion
+ * vacuous. These drive the wrapper itself, found by name via the same
+ * registry accessor R-7 uses.
+ */
+function findRegisteredDuty(name: string) {
+  const { duties } = _listSweepRegistrationsForTesting();
+  const duty = duties.find((d) => d.name === name);
+  if (!duty) throw new Error(`duty ${name} is not registered`);
+  return duty;
+}
+
+function fakeTickCtx(tickSessions: TestSession[]): SweepTickContext {
+  return {
+    now: Date.now(),
+    sessions: tickSessions as never,
+    activeContainerSessionIds: new Set<string>(),
+  } as unknown as SweepTickContext;
+}
+
+describe('the T22 registered wrapper', () => {
+  it('forwards ctx.sessions untouched (never calls getActiveSessions) and keeps the 5-minute throttle across two runs', async () => {
+    const t22 = findRegisteredDuty(SWEEP_DUTY_INVENTORY.T22);
+    // Present on disk and fenced, but deliberately NOT pushed into the global
+    // `sessions` array `getActiveSessions()` reads from — if the wrapper ever
+    // fell back to re-querying instead of forwarding `ctx.sessions`, this
+    // session would never be found and nothing would be released.
+    const sentinel: TestSession = {
+      id: 'sentinel-1',
+      agent_group_id: 'ag-primary',
+      messaging_group_id: 'mg-sentinel-1',
+      thread_id: null,
+      status: 'active',
+    };
+    fs.mkdirSync(path.join(sessionsRoot, sentinel.agent_group_id, sentinel.id), { recursive: true });
+    fs.writeFileSync(path.join(sessionsRoot, sentinel.agent_group_id, sentinel.id, 'inbound.db'), '');
+    fence(sentinel.id);
+
+    await t22.run(fakeTickCtx([sentinel]) as never);
+
+    expect(getActiveSessionsCalls.count).toBe(0);
+    expect(openedSessions).toEqual(['sentinel-1']);
+    expect(fences.get(sentinel.id)?.state).toBe('released');
+
+    // Second run, moments later (well inside the 5-minute window) — a fresh
+    // "active" fence on the same session must NOT be released; the wrapper
+    // calls `sweepOrphanedRepoIngressFences(ctx.sessions)` with no explicit
+    // clock argument, so this exercises the throttle against real wall time.
+    openedSessions.length = 0;
+    fence(sentinel.id, PUBLISH_EPOCH, 'gen-second');
+    await t22.run(fakeTickCtx([sentinel]) as never);
+
+    expect(openedSessions).toEqual([]);
+    expect(fences.get(sentinel.id)?.state).toBe('active');
+    expect(getActiveSessionsCalls.count).toBe(0);
+  });
+
+  it('logs "Orphaned repository fence sweep step failed" and does not throw when the scan itself throws', async () => {
+    const t22 = findRegisteredDuty(SWEEP_DUTY_INVENTORY.T22);
+    const spy = vi
+      .spyOn(repoFenceRecoveryModule, 'sweepOrphanedRepoIngressFences')
+      .mockRejectedValueOnce(new Error('boom'));
+    try {
+      await expect(t22.run(fakeTickCtx([]) as never)).resolves.toBeUndefined();
+      expect(log.warn).toHaveBeenCalledWith(
+        'Orphaned repository fence sweep step failed',
+        expect.objectContaining({ err: expect.any(Error) }),
+      );
+    } finally {
+      spy.mockRestore();
+    }
+  });
+});
+
 // ── F-8.3 ─────────────────────────────────────────────────────────────────────
 describe('the approvals reason-reject scan finalizes elapsed holds', () => {
   it('finalizes a hold whose window elapsed as a plain reject', async () => {
@@ -440,6 +526,45 @@ describe('the approvals reason-reject scan finalizes elapsed holds', () => {
 
     expect(finalizeRejectCalls).toEqual([]);
     expect(deletedApprovalIds).toEqual([]);
+  });
+});
+
+/**
+ * Codex review (efb8350a..10ada631, medium, accepted): the describe above
+ * calls `sweepAwaitingReasonRejects` directly, so the registered T5 wrapper —
+ * the `registerSweepDuty({ name: id.T5, run: async () => {...} })` block in
+ * `./index.ts` that dynamically imports `../approvals/index.js` inside a
+ * try/catch — is never executed. These drive the wrapper itself.
+ */
+describe('the T5 registered wrapper', () => {
+  it('reaches the approvals finalizer through its own dynamic import', async () => {
+    const t5 = findRegisteredDuty(SWEEP_DUTY_INVENTORY.T5);
+    const session = addSession('s-wrapper-hold');
+    awaitingReasonApprovals.push({
+      approval_id: 'appr-wrapper',
+      session_id: session.id,
+      expires_at: '2026-01-01T00:00:00.000Z',
+    });
+
+    await t5.run(fakeTickCtx([]) as never);
+
+    expect(finalizeRejectCalls).toEqual([
+      { approvalId: 'appr-wrapper', sessionId: session.id, userId: '', reason: undefined },
+    ]);
+  });
+
+  it('logs "Reject-with-reason sweep failed" and does not throw when the scan itself throws', async () => {
+    const t5 = findRegisteredDuty(SWEEP_DUTY_INVENTORY.T5);
+    const spy = vi.spyOn(reasonCaptureModule, 'sweepAwaitingReasonRejects').mockRejectedValueOnce(new Error('boom'));
+    try {
+      await expect(t5.run(fakeTickCtx([]) as never)).resolves.toBeUndefined();
+      expect(log.error).toHaveBeenCalledWith(
+        'Reject-with-reason sweep failed',
+        expect.objectContaining({ err: expect.any(Error) }),
+      );
+    } finally {
+      spy.mockRestore();
+    }
   });
 });
 
