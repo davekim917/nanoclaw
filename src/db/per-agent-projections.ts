@@ -219,7 +219,10 @@ export interface ArchiveProjectionStamp {
   scope: string[] | null;
   /** Source file identity. Absent when the source does not exist yet. */
   src: { size: string; mtimeNs: string } | null;
-  /** A `-journal` sidecar means a write was in flight when we looked. */
+  /**
+   * A HOT `-journal` sidecar, meaning a write was in flight when we looked.
+   * Null in the normal case, including when a zero-byte journal is present.
+   */
   journal: { size: string; mtimeNs: string } | null;
 }
 
@@ -230,6 +233,23 @@ function statSignature(filePath: string): { size: string; mtimeNs: string } | nu
   } catch {
     return null;
   }
+}
+
+/**
+ * A rollback journal that actually holds pages, meaning a write was in flight.
+ *
+ * Existence alone does NOT mean that. Under `journal_mode = TRUNCATE` — which
+ * is what `archive.db` uses — SQLite commits by truncating the journal to zero
+ * bytes rather than deleting it, so `archive.db-journal` sits there
+ * permanently at length 0 on every healthy install. Treating its presence as a
+ * hot journal would make every freshness check fail and every spawn rebuild,
+ * which is the cost this stamp exists to avoid. Verified against the live host:
+ * `data/archive.db-journal` is a persistent zero-byte file.
+ */
+function hotJournalSignature(filePath: string): { size: string; mtimeNs: string } | null {
+  const signature = statSignature(filePath);
+  if (!signature || signature.size === '0') return null;
+  return signature;
 }
 
 /**
@@ -252,7 +272,9 @@ function statSignature(filePath: string): { size: string; mtimeNs: string } | nu
  * retries rather than most spawns on a busy host. Removing the stall does not
  * depend on the hit rate — the rebuild runs off the main thread either way.
  * `archive.db` runs `journal_mode = TRUNCATE`, so a commit always moves the
- * main file; there is no WAL sidecar to miss.
+ * main file; there is no WAL sidecar to miss. That mode also leaves a
+ * permanent zero-byte `-journal` file behind, which is why only a NON-EMPTY
+ * journal counts as a write in flight — see `hotJournalSignature`.
  */
 export function computeArchiveProjectionStamp(
   srcPath: string,
@@ -266,7 +288,7 @@ export function computeArchiveProjectionStamp(
     // copied so a later mutation of the caller's array cannot alter the stamp.
     scope: workgroupMemberIds ? [...workgroupMemberIds].sort() : null,
     src: statSignature(srcPath),
-    journal: statSignature(`${srcPath}-journal`),
+    journal: hotJournalSignature(`${srcPath}-journal`),
   };
 }
 
@@ -296,9 +318,11 @@ export function writeArchiveProjectionStamp(dstPath: string, stamp: ArchiveProje
  *
  * Fails closed in every ambiguous case: a missing or unreadable stamp, a stamp
  * from an older builder, a missing or empty projection file, or a source that
- * has moved all return false and force a rebuild. A journal sidecar present at
- * either build time or now also forces one, since a commit was in flight and
- * the main file's identity cannot be trusted to describe the committed state.
+ * has moved all return false and force a rebuild. A NON-EMPTY journal at either
+ * build time or now also forces one, since a commit was in flight and the main
+ * file's identity cannot be trusted to describe the committed state. The
+ * zero-byte journal that `journal_mode = TRUNCATE` leaves behind after every
+ * successful commit is not that, and must not block reuse.
  */
 export function archiveProjectionIsFresh(dstPath: string, stamp: ArchiveProjectionStamp): boolean {
   if (stamp.version !== ARCHIVE_PROJECTION_STAMP_VERSION) return false;

@@ -21,6 +21,7 @@ import {
   stopArchiveProjectionWorker,
 } from './archive-projection-worker.js';
 import {
+  archiveProjectionIsFresh,
   archiveProjectionStampPath,
   buildArchiveProjection,
   computeArchiveProjectionStamp,
@@ -409,5 +410,71 @@ describe('#315 — the spawn path awaits the projection', () => {
     // A bare call would rebuild on the main thread again, or drop the rejection.
     expect(source).not.toMatch(/(?<!await )(?<!\w)ensureArchiveProjection\(/);
     expect(source).not.toMatch(/(?<!\w)buildArchiveProjection\(/);
+  });
+});
+
+describe('#315 review r1 — a TRUNCATE-mode journal must not disable reuse', () => {
+  /**
+   * `journal_mode = TRUNCATE` commits by truncating the rollback journal to
+   * zero bytes rather than deleting it, so `archive.db-journal` is present on
+   * every healthy install. Treating its existence as a write in flight would
+   * fail every freshness check and rebuild on every spawn.
+   */
+  it('reuses the projection when a zero-byte journal sits next to the source', async () => {
+    const src = makeTwoWorkgroupSource('zero-journal');
+    const worker = useFakeWorker();
+    const dst = tmpPath('zero-journal-dst');
+
+    fs.writeFileSync(`${src}-journal`, '');
+    tmpFiles.push(`${src}-journal`);
+
+    await ensureArchiveProjection(src, dst, 'ag-one-a', ['ag-one-a', 'ag-one-b']);
+    expect(worker.posted).toHaveLength(1);
+
+    await ensureArchiveProjection(src, dst, 'ag-one-a', ['ag-one-a', 'ag-one-b']);
+    expect(worker.posted).toHaveLength(1);
+    expect(computeArchiveProjectionStamp(src, 'ag-one-a', ['ag-one-a', 'ag-one-b']).journal).toBeNull();
+  });
+
+  it('still refuses to reuse while a non-empty journal shows a write in flight', async () => {
+    const src = makeTwoWorkgroupSource('hot-journal');
+    const worker = useFakeWorker();
+    const dst = tmpPath('hot-journal-dst');
+    const scope = ['ag-one-a', 'ag-one-b'];
+
+    await ensureArchiveProjection(src, dst, 'ag-one-a', scope);
+    expect(worker.posted).toHaveLength(1);
+    expect(archiveProjectionIsFresh(dst, computeArchiveProjectionStamp(src, 'ag-one-a', scope))).toBe(true);
+
+    // Asserted at the freshness gate rather than by driving another build: a
+    // genuinely hot journal makes SQLite refuse the read-only open of the
+    // source, so the build behind it fails closed anyway.
+    fs.writeFileSync(`${src}-journal`, 'rollback pages in flight');
+    tmpFiles.push(`${src}-journal`);
+
+    const hotStamp = computeArchiveProjectionStamp(src, 'ag-one-a', scope);
+    expect(hotStamp.journal).not.toBeNull();
+    expect(archiveProjectionIsFresh(dst, hotStamp)).toBe(false);
+  });
+
+  it('matches what a real TRUNCATE-mode commit leaves on disk', async () => {
+    const src = makeTwoWorkgroupSource('real-truncate');
+    const db = new Database(src);
+    db.pragma('journal_mode = TRUNCATE');
+    db.prepare("UPDATE messages_archive SET text = 'committed' WHERE id = 'w1-a-a'").run();
+    db.close();
+    tmpFiles.push(`${src}-journal`);
+
+    // The commit leaves the journal in place at zero bytes, and that must read
+    // as clean rather than as a write in flight.
+    expect(fs.existsSync(`${src}-journal`)).toBe(true);
+    expect(fs.statSync(`${src}-journal`).size).toBe(0);
+    expect(computeArchiveProjectionStamp(src, 'ag-one-a', ['ag-one-a']).journal).toBeNull();
+
+    const worker = useFakeWorker();
+    const dst = tmpPath('real-truncate-dst');
+    await ensureArchiveProjection(src, dst, 'ag-one-a', ['ag-one-a']);
+    await ensureArchiveProjection(src, dst, 'ag-one-a', ['ag-one-a']);
+    expect(worker.posted).toHaveLength(1);
   });
 });
