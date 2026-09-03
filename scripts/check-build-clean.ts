@@ -18,8 +18,16 @@
  * overrides (loudly) for a deliberate local/unpushed build. The HEAD sha this
  * check settles on is written to dist/.build-start-sha so the postbuild step
  * (scripts/write-build-info.ts) can detect HEAD moving *during* the build.
+ *
+ * A content fingerprint of whatever blocking dirt BUILD_ALLOW_DIRTY=1 let
+ * through is written alongside it (dist/.build-allowed-dirt-fingerprint), so
+ * BUILD_ALLOW_DIRTY waives the check for exactly the dirt that was present
+ * at prebuild time — not for a peer's mid-build edit to an already-dirty (or
+ * newly dirty) file, which would otherwise slip through unnoticed just
+ * because *some* dirt was already permitted.
  */
 import { execFileSync } from 'node:child_process';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -80,6 +88,37 @@ export function partitionDirt(lines: string[]): DirtPartition {
   return { blocking, ignored };
 }
 
+/** The distinct paths referenced by a set of `git status --porcelain` lines, sorted for determinism. */
+export function pathsForLines(lines: string[]): string[] {
+  const paths = new Set<string>();
+  for (const line of lines) {
+    for (const p of pathsForLine(line)) paths.add(p);
+  }
+  return [...paths].sort();
+}
+
+/**
+ * Content fingerprint of a set of blocking dirty paths, read relative to the
+ * current working directory. Order-independent and stable across separate
+ * processes (prebuild writes it, postbuild recomputes it) so a BUILD_ALLOW_DIRTY
+ * build can detect its allowed dirt changing content mid-build, not just a
+ * change in *which* paths are dirty.
+ */
+export function fingerprintDirt(blockingLines: string[]): string {
+  const hash = crypto.createHash('sha256');
+  for (const p of pathsForLines(blockingLines)) {
+    hash.update(p);
+    hash.update('\0');
+    try {
+      hash.update(fs.readFileSync(p));
+    } catch {
+      hash.update('<missing>'); // deleted/renamed-away path
+    }
+    hash.update('\0');
+  }
+  return hash.digest('hex');
+}
+
 export interface FreshnessCheck {
   ok: boolean;
   /** Printed via console.warn when ok+overridden, console.error when refused. Null when HEAD already matches. */
@@ -120,15 +159,17 @@ function main(): void {
   const raw = execFileSync('git', ['status', '--porcelain'], { encoding: 'utf8' });
   const files = raw.trim() ? raw.split('\n').filter((line) => line.length > 0) : [];
 
+  let blocking: string[] = [];
   if (files.length > 0) {
+    const partition = partitionDirt(files);
+    blocking = partition.blocking;
+
     if (process.env.BUILD_ALLOW_DIRTY === '1') {
       console.warn('WARNING: BUILD_ALLOW_DIRTY=1 — building a dirty working tree. dist/ will not match HEAD:');
       for (const f of files) console.warn(`  ${f}`);
     } else {
-      const { blocking, ignored } = partitionDirt(files);
-
-      if (ignored.length > 0) {
-        console.warn(`ignoring docs-only dirt: ${ignored.map((line) => line.slice(3)).join(', ')}`);
+      if (partition.ignored.length > 0) {
+        console.warn(`ignoring docs-only dirt: ${partition.ignored.map((line) => line.slice(3)).join(', ')}`);
       }
 
       if (blocking.length > 0) {
@@ -166,6 +207,7 @@ function main(): void {
 
   fs.mkdirSync('dist', { recursive: true });
   fs.writeFileSync(path.join('dist', '.build-start-sha'), `${head}\n`);
+  fs.writeFileSync(path.join('dist', '.build-allowed-dirt-fingerprint'), fingerprintDirt(blocking));
   process.exit(0);
 }
 

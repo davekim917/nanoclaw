@@ -5,7 +5,13 @@ import path from 'path';
 
 import { describe, expect, it, afterEach, beforeEach } from 'vitest';
 
-import { checkFreshness, isIgnorableDirtPath, partitionDirt } from './check-build-clean.js';
+import {
+  checkFreshness,
+  fingerprintDirt,
+  isIgnorableDirtPath,
+  partitionDirt,
+  pathsForLines,
+} from './check-build-clean.js';
 import { checkBuildDidNotMove } from './write-build-info.js';
 
 /**
@@ -85,6 +91,67 @@ describe('partitionDirt', () => {
   });
 });
 
+describe('pathsForLines', () => {
+  it('dedupes and sorts paths across lines, including rename sides', () => {
+    expect(pathsForLines([' M b.ts', ' M a.ts', 'R  c.ts -> a.ts'])).toEqual(['a.ts', 'b.ts', 'c.ts']);
+  });
+
+  it('handles an empty list', () => {
+    expect(pathsForLines([])).toEqual([]);
+  });
+});
+
+describe('fingerprintDirt', () => {
+  let dir: string;
+  let originalCwd: string;
+
+  beforeEach(() => {
+    originalCwd = process.cwd();
+    dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'fingerprint-test-')));
+    process.chdir(dir);
+  });
+
+  afterEach(() => {
+    process.chdir(originalCwd);
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('is stable for the same content', () => {
+    fs.writeFileSync('a.ts', 'hello');
+    const lines = [' M a.ts'];
+    expect(fingerprintDirt(lines)).toBe(fingerprintDirt(lines));
+  });
+
+  it('changes when a blocking path is edited', () => {
+    fs.writeFileSync('a.ts', 'hello');
+    const before = fingerprintDirt([' M a.ts']);
+    fs.writeFileSync('a.ts', 'goodbye');
+    expect(fingerprintDirt([' M a.ts'])).not.toBe(before);
+  });
+
+  it('changes when the set of blocking paths changes', () => {
+    fs.writeFileSync('a.ts', 'hello');
+    fs.writeFileSync('b.ts', 'world');
+    const before = fingerprintDirt([' M a.ts']);
+    expect(fingerprintDirt([' M a.ts', ' M b.ts'])).not.toBe(before);
+  });
+
+  it('is stable regardless of input line order', () => {
+    fs.writeFileSync('a.ts', 'hello');
+    fs.writeFileSync('b.ts', 'world');
+    expect(fingerprintDirt([' M a.ts', ' M b.ts'])).toBe(fingerprintDirt([' M b.ts', ' M a.ts']));
+  });
+
+  it('is stable for a missing (deleted) path', () => {
+    const lines = [' D a.ts'];
+    expect(fingerprintDirt(lines)).toBe(fingerprintDirt(lines));
+  });
+
+  it('gives a stable value for an empty blocking set', () => {
+    expect(fingerprintDirt([])).toBe(fingerprintDirt([]));
+  });
+});
+
 describe('checkFreshness', () => {
   const head = 'a'.repeat(40);
   const originMain = 'b'.repeat(40);
@@ -113,17 +180,33 @@ describe('checkFreshness', () => {
 describe('checkBuildDidNotMove', () => {
   const sha = 'c'.repeat(40);
   const otherSha = 'd'.repeat(40);
+  const fpA = 'fingerprint-a';
+  const fpB = 'fingerprint-b';
 
   it('passes when there is no recorded start sha to compare against', () => {
-    expect(checkBuildDidNotMove({ startSha: null, currentSha: sha, blockingDirtNow: true, allowDirty: false })).toEqual(
-      { ok: true, message: null },
-    );
+    expect(
+      checkBuildDidNotMove({
+        startSha: null,
+        currentSha: sha,
+        blockingDirtNow: true,
+        allowDirty: false,
+        startDirtFingerprint: null,
+        currentDirtFingerprint: fpA,
+      }),
+    ).toEqual({ ok: true, message: null });
   });
 
   it('passes when HEAD is unchanged and there is no new blocking dirt', () => {
-    expect(checkBuildDidNotMove({ startSha: sha, currentSha: sha, blockingDirtNow: false, allowDirty: false })).toEqual(
-      { ok: true, message: null },
-    );
+    expect(
+      checkBuildDidNotMove({
+        startSha: sha,
+        currentSha: sha,
+        blockingDirtNow: false,
+        allowDirty: false,
+        startDirtFingerprint: null,
+        currentDirtFingerprint: fpA,
+      }),
+    ).toEqual({ ok: true, message: null });
   });
 
   it('refuses when HEAD moved since the recorded start sha', () => {
@@ -132,6 +215,8 @@ describe('checkBuildDidNotMove', () => {
       currentSha: otherSha,
       blockingDirtNow: false,
       allowDirty: false,
+      startDirtFingerprint: null,
+      currentDirtFingerprint: fpA,
     });
     expect(result.ok).toBe(false);
     expect(result.message).toContain('HEAD moved during the build');
@@ -140,16 +225,63 @@ describe('checkBuildDidNotMove', () => {
   });
 
   it('refuses when new blocking dirt appeared and it was not allowed via BUILD_ALLOW_DIRTY', () => {
-    const result = checkBuildDidNotMove({ startSha: sha, currentSha: sha, blockingDirtNow: true, allowDirty: false });
+    const result = checkBuildDidNotMove({
+      startSha: sha,
+      currentSha: sha,
+      blockingDirtNow: true,
+      allowDirty: false,
+      startDirtFingerprint: null,
+      currentDirtFingerprint: fpA,
+    });
     expect(result.ok).toBe(false);
     expect(result.message).toContain('HEAD moved during the build');
   });
 
-  it('does not refuse for dirt that was already allowed via BUILD_ALLOW_DIRTY', () => {
-    expect(checkBuildDidNotMove({ startSha: sha, currentSha: sha, blockingDirtNow: true, allowDirty: true })).toEqual({
-      ok: true,
-      message: null,
+  it('does not refuse for dirt that was already allowed via BUILD_ALLOW_DIRTY, with a matching fingerprint', () => {
+    expect(
+      checkBuildDidNotMove({
+        startSha: sha,
+        currentSha: sha,
+        blockingDirtNow: true,
+        allowDirty: true,
+        startDirtFingerprint: fpA,
+        currentDirtFingerprint: fpA,
+      }),
+    ).toEqual({ ok: true, message: null });
+  });
+
+  // Codex review finding on #328: BUILD_ALLOW_DIRTY must waive the refusal
+  // for exactly the dirt present at prebuild time, not for any blocking dirt
+  // whatsoever — otherwise a peer's mid-build edit to an already-dirty (or
+  // newly dirty) file would slip through unnoticed.
+  it('refuses under BUILD_ALLOW_DIRTY when the allowed dirt fingerprint has drifted', () => {
+    const result = checkBuildDidNotMove({
+      startSha: sha,
+      currentSha: sha,
+      blockingDirtNow: true,
+      allowDirty: true,
+      startDirtFingerprint: fpA,
+      currentDirtFingerprint: fpB,
     });
+    expect(result.ok).toBe(false);
+    expect(result.message).toContain('HEAD moved during the build');
+    expect(result.message).toContain('BUILD_ALLOW_DIRTY');
+  });
+
+  it('does not refuse under BUILD_ALLOW_DIRTY when no fingerprint was recorded at all', () => {
+    // Defensive fallback for mixed script versions (prebuild ran an older
+    // build that never wrote the fingerprint file) — best-effort, matching
+    // the startSha === null fallback above.
+    expect(
+      checkBuildDidNotMove({
+        startSha: sha,
+        currentSha: sha,
+        blockingDirtNow: true,
+        allowDirty: true,
+        startDirtFingerprint: null,
+        currentDirtFingerprint: fpA,
+      }),
+    ).toEqual({ ok: true, message: null });
   });
 });
 
@@ -350,6 +482,46 @@ describe('scripts/check-build-clean.ts and scripts/write-build-info.ts (integrat
 
       runWriteInfo({ BUILD_ALLOW_DIRTY: '1' });
       expect(readBuildInfo().dirty).toBe(true);
+    });
+
+    it('refuses a BUILD_ALLOW_DIRTY build when the ALLOWED dirt changes content mid-build', () => {
+      // Codex review finding on #328: BUILD_ALLOW_DIRTY must not waive the
+      // refusal for a peer's mid-build edit to the already-permitted file —
+      // only the dirt actually present at prebuild time is allowed through.
+      fs.appendFileSync(path.join(dir, 'src', 'index.ts'), '\nexport const y = 2;\n');
+
+      const startResult = runCheck({ BUILD_ALLOW_DIRTY: '1' });
+      expect(startResult.status).toBe(0);
+
+      fs.appendFileSync(path.join(dir, 'src', 'index.ts'), '\nexport const z = 3;\n'); // mid-build edit
+
+      const writeResult = spawnSync(tsx, [writeInfoScript], {
+        cwd: dir,
+        encoding: 'utf8',
+        env: { ...process.env, BUILD_ALLOW_DIRTY: '1' },
+      });
+      expect(writeResult.status).toBe(1);
+      expect(writeResult.stderr).toContain('HEAD moved during the build');
+      expect(writeResult.stderr).toContain('BUILD_ALLOW_DIRTY');
+      expect(fs.existsSync(path.join(dir, 'dist', 'BUILD_INFO.json'))).toBe(false);
+    });
+
+    it('refuses a BUILD_ALLOW_DIRTY build when a NEW blocking file appears mid-build', () => {
+      fs.appendFileSync(path.join(dir, 'src', 'index.ts'), '\nexport const y = 2;\n');
+
+      const startResult = runCheck({ BUILD_ALLOW_DIRTY: '1' });
+      expect(startResult.status).toBe(0);
+
+      fs.writeFileSync(path.join(dir, 'src', 'new-file.ts'), 'export const brandNew = true;\n'); // mid-build addition
+
+      const writeResult = spawnSync(tsx, [writeInfoScript], {
+        cwd: dir,
+        encoding: 'utf8',
+        env: { ...process.env, BUILD_ALLOW_DIRTY: '1' },
+      });
+      expect(writeResult.status).toBe(1);
+      expect(writeResult.stderr).toContain('HEAD moved during the build');
+      expect(fs.existsSync(path.join(dir, 'dist', 'BUILD_INFO.json'))).toBe(false);
     });
   });
 });

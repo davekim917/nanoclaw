@@ -16,16 +16,25 @@
  * tree tsc actually compiled no longer matches what's on disk now — refuse
  * and remove any BUILD_INFO.json rather than stamp a build that doesn't match
  * either the tree it started from or the tree it finished on.
+ *
+ * Third check, closing a gap in the second: BUILD_ALLOW_DIRTY=1 must waive
+ * the "new blocking dirt" refusal for exactly the dirt present at prebuild
+ * time, not for any blocking dirt whatsoever — otherwise a peer's mid-build
+ * edit to an already-dirty (or newly dirty) file would be silently accepted
+ * just because *some* dirt was already permitted. dist/.build-allowed-dirt-fingerprint
+ * (written by the prebuild guard) is compared against a fresh fingerprint of
+ * the current blocking dirt; a mismatch under BUILD_ALLOW_DIRTY still refuses.
  */
 import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { partitionDirt } from './check-build-clean.js';
+import { fingerprintDirt, partitionDirt } from './check-build-clean.js';
 
 const BUILD_INFO_PATH = path.join('dist', 'BUILD_INFO.json');
 const START_SHA_PATH = path.join('dist', '.build-start-sha');
+const ALLOWED_DIRT_FINGERPRINT_PATH = path.join('dist', '.build-allowed-dirt-fingerprint');
 
 export interface PostbuildCheck {
   ok: boolean;
@@ -36,16 +45,19 @@ export interface PostbuildCheck {
 /**
  * Decides whether the build that just finished is still trustworthy: HEAD
  * must not have moved since the prebuild guard recorded it, and no new
- * build-blocking dirt may have appeared unless BUILD_ALLOW_DIRTY was the
- * (already-accounted-for) reason the tree was dirty to begin with.
+ * build-blocking dirt may have appeared — even under BUILD_ALLOW_DIRTY,
+ * which only waives the check for the SAME dirt (by content fingerprint)
+ * that was present at prebuild time, not for whatever is dirty now.
  */
 export function checkBuildDidNotMove(params: {
   startSha: string | null;
   currentSha: string;
   blockingDirtNow: boolean;
   allowDirty: boolean;
+  startDirtFingerprint: string | null;
+  currentDirtFingerprint: string;
 }): PostbuildCheck {
-  const { startSha, currentSha, blockingDirtNow, allowDirty } = params;
+  const { startSha, currentSha, blockingDirtNow, allowDirty, startDirtFingerprint, currentDirtFingerprint } = params;
 
   // No recorded start sha (e.g. write-build-info.ts run directly, without the
   // prebuild guard having run first) — nothing to compare against.
@@ -58,12 +70,25 @@ export function checkBuildDidNotMove(params: {
     };
   }
 
-  if (blockingDirtNow && !allowDirty) {
-    return {
-      ok: false,
-      message:
-        'BUILD REFUSED: HEAD moved during the build (the working tree picked up new build-blocking changes since the prebuild check ran).',
-    };
+  if (blockingDirtNow) {
+    if (!allowDirty) {
+      return {
+        ok: false,
+        message:
+          'BUILD REFUSED: HEAD moved during the build (the working tree picked up new build-blocking changes since the prebuild check ran).',
+      };
+    }
+    // BUILD_ALLOW_DIRTY waives the refusal above, but only for the dirt that
+    // was actually present at prebuild time — a mismatched fingerprint means
+    // the allowed dirt's content (or membership) changed mid-build, which is
+    // exactly the drift this whole guard exists to catch.
+    if (startDirtFingerprint !== null && startDirtFingerprint !== currentDirtFingerprint) {
+      return {
+        ok: false,
+        message:
+          'BUILD REFUSED: HEAD moved during the build (the BUILD_ALLOW_DIRTY-permitted dirt changed content since the prebuild check ran).',
+      };
+    }
   }
 
   return { ok: true, message: null };
@@ -78,7 +103,8 @@ function main(): void {
   // otherwise be swallowed by a whole-string .trim(), corrupting path parsing.
   const rawStatus = execFileSync('git', ['status', '--porcelain'], { encoding: 'utf8' });
   const statusLines = rawStatus.trim() ? rawStatus.split('\n').filter((line) => line.length > 0) : [];
-  const dirty = partitionDirt(statusLines).blocking.length > 0;
+  const currentBlocking = partitionDirt(statusLines).blocking;
+  const dirty = currentBlocking.length > 0;
 
   let startSha: string | null;
   try {
@@ -87,11 +113,20 @@ function main(): void {
     startSha = null;
   }
 
+  let startDirtFingerprint: string | null;
+  try {
+    startDirtFingerprint = fs.readFileSync(ALLOWED_DIRT_FINGERPRINT_PATH, 'utf8').trim();
+  } catch {
+    startDirtFingerprint = null;
+  }
+
   const moveCheck = checkBuildDidNotMove({
     startSha,
     currentSha: sha,
     blockingDirtNow: dirty,
     allowDirty: process.env.BUILD_ALLOW_DIRTY === '1',
+    startDirtFingerprint,
+    currentDirtFingerprint: fingerprintDirt(currentBlocking),
   });
 
   if (!moveCheck.ok) {
