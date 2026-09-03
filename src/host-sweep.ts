@@ -152,6 +152,453 @@ const BACKOFF_BASE_MS = 5000;
 // cleanup threshold. Storage-manager owns the actual cache cleanup policy.
 export const SESSION_ARTIFACT_IDLE_MS = STORAGE_SESSION_ARTIFACT_IDLE_MS;
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Sweep duty registry (convergence seam 2, PR 2)
+//
+// The tick used to be a prose list of statements. It is now a driver over this
+// registry: a duty declares WHICH window it runs in (`phase`) and WHERE in that
+// window (`order`), and the driver opens each window once and hands the
+// already-open mailbox session to every duty in it. That is the perf invariant
+// — one `getActiveSessions()` per tick, one mailbox open per duty-group per
+// window — expressed as data instead of as the order of statements in one
+// function. docs/specs/upstream-host-sweep-seam/plan.md §4.3-§4.5.
+//
+// PR 2 is behavior-preserving: the same duty bodies run in the same windows
+// with the same guards, the same cadences and the same two error strings. What
+// is new is structure — both error lines now carry `duty` and `window`, and a
+// family PR can move a body into `src/modules/sweep-<family>/` by moving its
+// registration, without touching the driver.
+// ─────────────────────────────────────────────────────────────────────────────
+
+export type SweepPhase =
+  /** Before the fan-out; `ctx.sessions` is not loaded yet. */
+  | 'tick:pre-session'
+  /** W1 — inside one plan session. */
+  | 'session:plan'
+  /** W2 — NOTHING open; the wake and its attempt bookkeeping. */
+  | 'session:wake'
+  /** W4 — EXCLUSIVE chain; nothing open; duties open their own windows. */
+  | 'session:health'
+  /** W5 — inside one tail session. */
+  | 'session:tail'
+  /** After the fan-out; container state is current. */
+  | 'tick:post-session'
+  /** Order-free central work. */
+  | 'tick:housekeeping';
+
+export const SWEEP_PHASES: readonly SweepPhase[] = [
+  'tick:pre-session',
+  'session:plan',
+  'session:wake',
+  'session:health',
+  'session:tail',
+  'tick:post-session',
+  'tick:housekeeping',
+];
+
+/**
+ * 'all' runs every duty in the phase in ascending `order`. 'exclusive' is an
+ * if/else-if chain: the first duty whose `claims()` predicate holds runs and
+ * the rest do NOT — `session:health`'s shape, where registering the SLA before
+ * the reaps would reclassify an idle container past the ceiling from
+ * `scheduled-task-idle` to `absolute-ceiling`.
+ */
+export type PhaseKind = 'all' | 'exclusive';
+
+const SWEEP_PHASE_KINDS: Readonly<Record<SweepPhase, PhaseKind>> = {
+  'tick:pre-session': 'all',
+  'session:plan': 'all',
+  'session:wake': 'all',
+  'session:health': 'exclusive',
+  'session:tail': 'all',
+  'tick:post-session': 'all',
+  'tick:housekeeping': 'all',
+};
+
+export function sweepPhaseKind(phase: SweepPhase): PhaseKind {
+  return SWEEP_PHASE_KINDS[phase];
+}
+
+/**
+ * The opening boundary a duty (or an opener) ran at — the `window` field on
+ * both sweep error lines. Every phase is a window; three more exist inside
+ * windows a duty owns rather than the driver: the driver's own observe read,
+ * and the two sessions the running-container SLA opens around its kill.
+ */
+export type SweepWindow = SweepPhase | 'session:observe' | 'session:health:sla-observe' | 'session:health:post-kill';
+
+/** The plan `session:plan` builds and every later phase reads. */
+export interface WakePlan {
+  dueCount: number;
+  wakePriority: 'interactive' | 'scheduled';
+  admittedTasks: number;
+  workContinuation: HostWorkContinuation | null;
+  continuationWakeEligible: boolean;
+  /** False for a never-woken session that has only ever had an inbound.db. */
+  hasOutbound: boolean;
+}
+
+/** The driver's W3 read, consulted by the `session:health` predicates. */
+export interface ContainerObservation {
+  containerState: ContainerState | null;
+  processingClaimCount: number;
+  lastOutboundAtMs: number | null;
+  lastInboundAtMs: number | null;
+}
+
+/**
+ * What the SLA duty snapshotted INSIDE its observe session, before the kill.
+ * `resetStuckProcessingRows` clears the claims, so a post-kill read would
+ * always come back empty — constraint 12's "snapshotted before the kill".
+ */
+export interface SweepKillSnapshot {
+  reason: string;
+  containerState: ContainerState | null;
+  pendingClaims: number;
+  workContinuation: HostWorkContinuation | null;
+}
+
+export interface SweepTickContext {
+  readonly now: number;
+  /** The ONE getActiveSessions() call per tick. Not readable in tick:pre-session. */
+  readonly sessions: readonly Session[];
+  readonly activeContainerSessionIds: ReadonlySet<string>;
+}
+
+export interface SweepSessionContext extends SweepTickContext {
+  readonly session: Session;
+  readonly agentGroupId: string;
+  readonly agentGroupFolder: string;
+  /** The window's handle; null in the 'nothing open' phases. */
+  readonly mailbox: NanoclawMailboxSession | null;
+  /** Constraint 20 — the W1 snapshot, the only outbound guard the context exposes. */
+  readonly hasOutbound: boolean;
+  readonly alive: boolean;
+  readonly justWoke: boolean;
+  readonly plan: WakePlan;
+  readonly observed: ContainerObservation | null;
+  readonly killSnapshot: SweepKillSnapshot | null;
+  /** A short session in the phase's own window, for a duty that must kill (constraint 18). */
+  readonly run: SessionRunner;
+  /** Same, for a duty that owns more than one window of its own (the SLA). */
+  runIn<T>(window: SweepWindow, action: (mailbox: NanoclawMailboxSession) => T | Promise<T>): Promise<T | undefined>;
+  /**
+   * The one thing a duty tells the driver rather than the other way round:
+   * `session:wake` reports whether it actually woke the container this tick,
+   * which gates the observe read and the whole health chain (constraint 10).
+   */
+  reportWoke(woke: boolean): void;
+}
+
+/**
+ * Narrow the union `SweepDuty.run` declares. A session-phase duty can only be
+ * reached through the per-session driver, so this is a shape assertion with a
+ * loud failure rather than a silent cast.
+ */
+function asSessionContext(ctx: SweepTickContext | SweepSessionContext): SweepSessionContext {
+  if (!('session' in ctx)) throw new Error('a session-phase duty ran with a tick context');
+  return ctx;
+}
+
+export interface SweepDuty {
+  /** Stable id; the drift test's name set and the `duty` field on both error lines. */
+  name: string;
+  phase: SweepPhase;
+  /** Within-phase; a duplicate (phase, order) throws at registration. */
+  order: number;
+  /** Required in an exclusive phase (except the single fallthrough), forbidden in an 'all' phase. */
+  claims?(ctx: SweepSessionContext): boolean | Promise<boolean>;
+  run(ctx: SweepTickContext | SweepSessionContext): void | Promise<void>;
+}
+
+export interface SlaObservationHook {
+  name: string;
+  order: number;
+  run(ctx: SweepSessionContext, state: ContainerState | null, mailbox: NanoclawMailboxSession): void;
+}
+
+export interface SweepKillFollowUp {
+  name: string;
+  order: number;
+  run(ctx: SweepSessionContext, outcome: StuckDecision, mailbox: NanoclawMailboxSession): void | Promise<void>;
+}
+
+const sweepDuties: SweepDuty[] = [];
+const slaObservationHooks: SlaObservationHook[] = [];
+const sweepKillFollowUps: SweepKillFollowUp[] = [];
+
+export function registerSweepDuty(duty: SweepDuty): void {
+  if (!SWEEP_PHASES.includes(duty.phase)) {
+    throw new Error(`Sweep duty ${duty.name}: unknown phase ${duty.phase}`);
+  }
+  const kind = SWEEP_PHASE_KINDS[duty.phase];
+  if (kind === 'all' && duty.claims) {
+    throw new Error(`Sweep duty ${duty.name}: claims() is forbidden in the '${duty.phase}' phase (kind 'all')`);
+  }
+  if (kind === 'exclusive' && !duty.claims) {
+    const fallthrough = sweepDuties.find((d) => d.phase === duty.phase && !d.claims);
+    if (fallthrough) {
+      throw new Error(
+        `Sweep duty ${duty.name}: '${duty.phase}' is exclusive and already has a fallthrough (${fallthrough.name}) — every other duty needs claims()`,
+      );
+    }
+  }
+  const clash = sweepDuties.find((d) => d.phase === duty.phase && d.order === duty.order);
+  if (clash) {
+    throw new Error(`Sweep duty ${duty.name}: (${duty.phase}, ${duty.order}) is already held by ${clash.name}`);
+  }
+  const sameName = sweepDuties.find((d) => d.name === duty.name);
+  if (sameName) throw new Error(`Sweep duty ${duty.name}: already registered in phase ${sameName.phase}`);
+  sweepDuties.push(duty);
+  sweepDuties.sort((a, b) => SWEEP_PHASES.indexOf(a.phase) - SWEEP_PHASES.indexOf(b.phase) || a.order - b.order);
+  dutiesByPhase = new Map();
+}
+
+/**
+ * Runs inside the SLA duty's OWN observe session, before `decideStuckAction`,
+ * so the decision and the telemetry row see one snapshot. Reached only when the
+ * exclusive chain falls through to the SLA branch — never on heal or reap paths.
+ */
+export function registerSlaObservationHook(hook: SlaObservationHook): void {
+  const clash = slaObservationHooks.find((h) => h.order === hook.order);
+  if (clash) throw new Error(`SLA observation hook ${hook.name}: order ${hook.order} is already held by ${clash.name}`);
+  slaObservationHooks.push(hook);
+  slaObservationHooks.sort((a, b) => a.order - b.order);
+}
+
+/**
+ * Runs inside the post-kill session the SLA duty opens AFTER `killContainer`
+ * returns. A kill respawns through `onExit` and clears status through
+ * `delivery.ts`, both of which open a session on the same key, so nothing may
+ * be held across it (invariant I-3).
+ */
+export function registerSweepKillFollowUp(followUp: SweepKillFollowUp): void {
+  const clash = sweepKillFollowUps.find((f) => f.order === followUp.order);
+  if (clash)
+    throw new Error(`Sweep kill follow-up ${followUp.name}: order ${followUp.order} is already held by ${clash.name}`);
+  sweepKillFollowUps.push(followUp);
+  sweepKillFollowUps.sort((a, b) => a.order - b.order);
+}
+
+// Memoized: `dutiesForPhase` runs four times per swept session, and the tick
+// walks ~3,200 of them. Registration is import-time, so the only invalidation
+// is a registration (and the test-only reset).
+let dutiesByPhase = new Map<SweepPhase, SweepDuty[]>();
+
+function dutiesForPhase(phase: SweepPhase): SweepDuty[] {
+  let duties = dutiesByPhase.get(phase);
+  if (!duties) {
+    duties = sweepDuties.filter((d) => d.phase === phase);
+    dutiesByPhase.set(phase, duties);
+  }
+  return duties;
+}
+
+/** Test-only: the full registration set, in run order. */
+export function _listSweepRegistrationsForTesting(): {
+  duties: readonly SweepDuty[];
+  slaObservationHooks: readonly SlaObservationHook[];
+  killFollowUps: readonly SweepKillFollowUp[];
+} {
+  return {
+    duties: [...sweepDuties],
+    slaObservationHooks: [...slaObservationHooks],
+    killFollowUps: [...sweepKillFollowUps],
+  };
+}
+
+/**
+ * Test-only: clear the registry. `builtins: false` leaves it EMPTY so a test
+ * can drive the driver over its own probes; the default restores the 39
+ * registrations this module makes at import.
+ */
+export function _resetSweepRegistryForTesting(options: { builtins?: boolean } = {}): void {
+  sweepDuties.length = 0;
+  slaObservationHooks.length = 0;
+  sweepKillFollowUps.length = 0;
+  dutiesByPhase = new Map();
+  if (options.builtins ?? true) registerBuiltInSweepDuties();
+}
+
+// ── Duty failure tagging ─────────────────────────────────────────────────────
+//
+// Every duty body runs through `runDutyBody`, which tags the error with the
+// duty name and the window and RETHROWS. It deliberately does not log or
+// swallow: which failures are fatal to the rest of the tick is each duty's own
+// existing guard shape, unchanged by this PR, and the two log lines stay
+// single-cause at the one place that already owned them (constraint 17).
+
+const SWEEP_DUTY_TAG = Symbol('sweepDutyTag');
+interface SweepDutyTag {
+  duty: string;
+  window: SweepWindow;
+}
+
+/**
+ * A later window's opener failed (or its mailbox vanished mid-tick). Already
+ * classified and, where it warrants one, already logged — the per-session frame
+ * turns it into "no quiet mark, retried next tick" without a second line.
+ */
+class SweepWindowAbort extends Error {
+  constructor(readonly window: SweepWindow) {
+    super(`sweep window ${window} aborted`);
+    this.name = 'SweepWindowAbort';
+  }
+}
+
+function tagDutyFailure(err: unknown, duty: string, window: SweepWindow): unknown {
+  if (err instanceof SweepWindowAbort) return err;
+  if (err !== null && typeof err === 'object' && !(SWEEP_DUTY_TAG in err)) {
+    Object.defineProperty(err, SWEEP_DUTY_TAG, { value: { duty, window } satisfies SweepDutyTag, enumerable: false });
+  }
+  return err;
+}
+
+/** The `duty`/`window` fields for whichever body threw, or nothing. */
+function dutyFailureFields(err: unknown): { duty?: string; window?: SweepWindow } {
+  if (err === null || typeof err !== 'object' || !(SWEEP_DUTY_TAG in err)) return {};
+  const tag = (err as Record<symbol, SweepDutyTag>)[SWEEP_DUTY_TAG];
+  return { duty: tag.duty, window: tag.window };
+}
+
+async function runDutyBody<T>(duty: string, window: SweepWindow, body: () => T | Promise<T>): Promise<T> {
+  try {
+    return await body();
+  } catch (err) {
+    throw tagDutyFailure(err, duty, window);
+  }
+}
+
+async function runTickPhase(ctx: SweepTickContext, phase: SweepPhase): Promise<void> {
+  for (const duty of dutiesForPhase(phase)) {
+    await runDutyBody(duty.name, phase, () => duty.run(ctx));
+  }
+}
+
+async function runSessionPhase(ctx: SweepSessionContext, phase: SweepPhase): Promise<void> {
+  for (const duty of dutiesForPhase(phase)) {
+    await runDutyBody(duty.name, phase, () => duty.run(ctx));
+  }
+}
+
+/** The if/else-if chain, as data: first `claims()` wins, else the fallthrough. */
+async function runExclusiveSessionPhase(ctx: SweepSessionContext, phase: SweepPhase): Promise<void> {
+  const duties = dutiesForPhase(phase);
+  for (const duty of duties) {
+    if (!duty.claims) continue;
+    const claimed = await runDutyBody(duty.name, phase, () => duty.claims!(ctx));
+    if (claimed) {
+      await runDutyBody(duty.name, phase, () => duty.run(ctx));
+      return;
+    }
+  }
+  const fallthrough = duties.find((d) => !d.claims);
+  if (fallthrough) await runDutyBody(fallthrough.name, phase, () => fallthrough.run(ctx));
+}
+
+async function runSlaObservationHooks(
+  ctx: SweepSessionContext,
+  state: ContainerState | null,
+  mailbox: NanoclawMailboxSession,
+): Promise<void> {
+  for (const hook of slaObservationHooks) {
+    await runDutyBody(hook.name, 'session:health:sla-observe', () => hook.run(ctx, state, mailbox));
+  }
+}
+
+async function runSweepKillFollowUps(
+  ctx: SweepSessionContext,
+  outcome: StuckDecision,
+  mailbox: NanoclawMailboxSession,
+  snapshot: SweepKillSnapshot,
+): Promise<void> {
+  // The snapshot was taken inside the observe session, BEFORE the kill —
+  // resetStuckProcessingRows clears the claims, so a read here would always be
+  // empty (constraint 12). `Object.create` shadows one field and leaves every
+  // other accessor live on the driver's own context.
+  const followUpCtx: SweepSessionContext = Object.create(ctx, {
+    killSnapshot: { value: snapshot, enumerable: true },
+  }) as SweepSessionContext;
+  for (const followUp of sweepKillFollowUps) {
+    await runDutyBody(followUp.name, 'session:health:post-kill', () => followUp.run(followUpCtx, outcome, mailbox));
+  }
+}
+
+/**
+ * A short session tagged with the window it belongs to.
+ *
+ * Classification is per OPENING BOUNDARY, not one flag per session. Only a W1
+ * opener failure backs the session off, and that is deliberate: W1 already
+ * proved the mailbox openable this tick, so a failure at a later window is far
+ * more likely a reclaim race than a persistent EACCES — and a genuinely
+ * persistent fault fails at W1 on the very next tick and takes the backoff
+ * there. Extending the backoff later would hold an already-due scheduled task
+ * for 30 minutes on a transient condition. plan.md §4.5.
+ */
+function windowedRunner(run: SessionRunner, sessionId: string, window: () => SweepWindow): SessionRunner {
+  return async <T>(action: (mailbox: NanoclawMailboxSession) => T | Promise<T>): Promise<T | undefined> => {
+    const at = window();
+    let entered = false;
+    try {
+      return await run((mailbox) => {
+        entered = true;
+        return action(mailbox);
+      });
+    } catch (err) {
+      // A session that vanished under us is the ordinary steady state — not a
+      // fault, not logged, and retried on the next tick rather than backed off.
+      if (err instanceof SessionDbMissingError) throw new SweepWindowAbort(at);
+      if (err instanceof SessionDbUnopenableError || !entered) {
+        log.error('Host sweep mailbox unopenable', { err, sessionId, window: at });
+        throw new SweepWindowAbort(at);
+      }
+      throw err;
+    }
+  };
+}
+
+/** The 38 duties this module still owns, as 39 registrations. Ids from seam2-inventory.md §3. */
+export const SWEEP_DUTY_INVENTORY: Readonly<Record<string, string>> = {
+  T2: 'egress-network-reheal',
+  T5: 'approvals-reason-sweep',
+  T6: 'orchestrator-reconciler',
+  T7: 'github-app-token-refresh',
+  T8: 'thread-close-advance',
+  T9: 'steer-idempotency-prune',
+  T10: 'channel-ingress-receipt-prune',
+  T11: 'scheduled-move-recovery',
+  T12: 'audit-body-prune',
+  T13: 'storage-maintenance',
+  T14: 'completed-task-auto-archive',
+  T15: 'session-title-sweep',
+  T16: 'thread-title-retry',
+  T17: 'dashboard-token-prune',
+  T18: 'task-watchdog',
+  T19: 'usage-rollup',
+  T20: 'claims-reconcile',
+  T21: 'claims-self-heal',
+  T22: 'orphaned-repo-fence-release',
+  S2: 'processing-ack-sync',
+  S3: 'stale-pending-expiry',
+  S4: 'pre-wake-orphan-claim-reset',
+  S5: 'due-wake-admission',
+  S6: 'done-proposal-mirror',
+  S7: 'continuation-read',
+  S8: 'continuation-recovery-parking',
+  S9a: 'continuation-wake-eligibility',
+  S9b: 'container-wake',
+  S10: 'ceiling-kill-accountability',
+  S11: 'provider-self-heal',
+  S12: 'idle-task-reap',
+  S13: 'idle-chat-reap',
+  S14: 'running-container-sla',
+  S15: 'kill-ceiling-notice',
+  S16: 'container-oom-notice',
+  S17: 'orphan-claim-reset',
+  S18: 'recurrence-fanout',
+  S19: 'spent-task-session-gc',
+};
+
 export type StuckDecision =
   | { action: 'ok' }
   | { action: 'kill-ceiling'; heartbeatAgeMs: number; ceilingMs: number }
@@ -968,21 +1415,31 @@ async function sweepOnce(): Promise<void> {
   let sweptSessions = 0;
   if (!running) return;
 
-  // Re-heal the egress network so already-running agents keep their gateway hop
-  // if it was detached out-of-band. Best-effort here: a heal failure isn't a
-  // leak (agents stay on the internal net), so log and continue. No-op when
-  // lockdown is disabled.
-  try {
-    ensureEgressNetwork();
-  } catch (err) {
-    log.error('Egress lockdown re-heal failed', { err });
-  }
+  // ONE context per tick. `sessions` is the single getActiveSessions() scan
+  // every duty shares; `activeContainerSessionIds` is read lazily so it is
+  // still taken at the point in the tick the duty that wants it runs.
+  let sessions: Session[] | undefined;
+  let activeContainerSessionIds: ReadonlySet<string> | undefined;
+  const tick: SweepTickContext = {
+    now: sweepStartedAtMs,
+    get sessions(): readonly Session[] {
+      if (!sessions) {
+        throw new Error('ctx.sessions read before the tick’s active-session scan — tick:pre-session runs before it');
+      }
+      return sessions;
+    },
+    get activeContainerSessionIds(): ReadonlySet<string> {
+      return (activeContainerSessionIds ??= new Set(getActiveContainerSessionIds()));
+    },
+  };
 
-  let sessions: Session[] = [];
+  await runTickPhase(tick, 'tick:pre-session');
+
   try {
     sessions = getActiveSessions();
   } catch (err) {
     log.error('Host sweep: failed to load active sessions', { err });
+    sessions = [];
   }
 
   // Isolate failures per-session — a throw from one stuck session's
@@ -1007,7 +1464,7 @@ async function sweepOnce(): Promise<void> {
     }
     quietSessions.delete(session.id);
     try {
-      const quietUntil = await sweepSession(session);
+      const quietUntil = await sweepSession(session, tick);
       if (quietUntil !== null) {
         quietSessions.set(session.id, { skipUntilMs: quietUntil, lastActive: session.last_active });
       }
@@ -1016,8 +1473,11 @@ async function sweepOnce(): Promise<void> {
       // A duty threw and sweepSession rethrew it: the mailbox is fine and the
       // work is still due, so this session is NOT quiet-cached and the next
       // 60s tick retries it. Distinct from 'Host sweep mailbox unopenable',
-      // which is the session the host could not get into at all.
-      log.error('Host sweep duty failed', { err, sessionId: session.id });
+      // which is the session the host could not get into at all. `duty` and
+      // `window` name which body and which opening boundary produced it, so a
+      // family PR's post-deploy check filters on its own duty names rather
+      // than counting a shared string.
+      log.error('Host sweep duty failed', { err, sessionId: session.id, ...dutyFailureFields(err) });
     }
     // Yield to the macrotask queue so a large sweep batch cannot trip the
     // event-loop stall detector even on a cold tick.
@@ -1047,146 +1507,27 @@ async function sweepOnce(): Promise<void> {
     });
   }
 
-  // Finalize any "Reject with reason…" holds whose reply window elapsed (admin
-  // ghosted, or the host restarted mid-capture). Central-DB scan, once per tick
-  // — not per session.
-  // MODULE-HOOK:approvals-reason-sweep:start
-  try {
-    const { sweepAwaitingReasonRejects } = await import('./modules/approvals/index.js');
-    await sweepAwaitingReasonRejects();
-  } catch (err) {
-    log.error('Reject-with-reason sweep failed', { err });
-  }
-  // MODULE-HOOK:approvals-reason-sweep:end
-
-  // MODULE-HOOK:orchestrator-dispatch:reconciler — complete admitted-but-incomplete tasks.
-  // Runs after per-session sweeps so container state is current.
-  runReconcilerSweep();
-
-  // Proactively re-mint GitHub App installation tokens inside their refresh
-  // margin, so a container respawning mid-hour gets a fresh credential instead
-  // of one about to die (2026-08-23: an hour-old token flapped mid-session and
-  // stalled release-day work). Opportunistic — failures log and retry next tick.
-  try {
-    const { refreshExpiringGitHubAppTokens } = await import('./github-app-token.js');
-    await refreshExpiringGitHubAppTokens();
-  } catch (err) {
-    log.warn('GitHub App token refresh sweep step failed', { err });
-  }
-
-  // Advance operator-confirmed thread closes: wait for the agent's wrap-up
-  // confirmation, then clear its saved work, stop the container and archive —
-  // in that order (src/dashboard/thread-close.ts). Central-DB scan of the few
-  // in-flight rows, once per tick, after the per-session loop so container
-  // state is current. Nothing here can START a close; only an operator can.
-  try {
-    advanceThreadClosures();
-  } catch (err) {
-    log.warn('thread-close sweep step failed', { err });
-  }
-
-  // Prune steer_idempotency rows: applied rows older than 60s, pending rows older than 5min.
-  pruneSteerIdempotency();
-  pruneChannelIngressReceipts();
-
-  // MODULE-HOOK:scheduled-move-recovery — autonomous recovery of unresolved
-  // move intents + 90d audit-body prune. Additive (same pattern as the
-  // recurrence hook); touches only scheduled_audit (central) + the move's own
-  // session inbound rows — no firing-path change (C1).
-  try {
-    recoverMoveIntents(getDb(), {});
-    pruneAuditBodies(getDb(), {});
-  } catch (err) {
-    log.warn('scheduled-move-recovery: sweep hook failed', { err });
-  }
-
-  // Reclaim disk from idle caches and Docker artifacts after per-session
-  // sweep work has had a chance to notice and wake due messages.
-  // Fire-and-forget into a persistent worker. The worker owns the expensive
-  // synchronous filesystem/Docker implementation and its cadence state; the
-  // host event loop stays available for channel heartbeats and inbound events.
-  startStorageMaintenanceOnce(getActiveContainerSessionIds());
-
-  // Auto-archive completed tasks older than 24h so the "Done" lane stays
-  // representative of recent work; failed tasks are intentionally skipped.
-  autoArchiveOldCompleted();
-
-  // Inbox: generate Haiku titles for sessions that don't have one (or
-  // whose existing title is ≥1h old AND has ≥10 new messages since).
-  // Concurrency-capped at 3 per tick — keeps the API spend bounded.
-  void import('./dashboard/session-title-sweep.js')
-    .then((mod) => mod.runSessionTitleSweep())
-    .catch((err) => log.warn('session-title sweep failed', { err }));
-
-  // Retry Discord thread titles whose earlier attempts all failed (e.g. a
-  // 429 window that outlasted callHaiku's own retry budget). Regenerates
-  // from the STORED, ORIGINAL first_message — never a later follow-up, which
-  // is the bug this table exists to fix. Capped at 3/tick (inside
-  // retryPendingThreadTitles) so a backlog of permanently-broken threads
-  // can't itself become a Haiku/Discord-REST quota hog. See src/topic-title.ts.
-  void import('./topic-title.js')
-    .then((mod) => mod.retryPendingThreadTitles())
-    .catch((err) => log.warn('thread-title retry sweep failed', { err }));
-
-  // Prune dashboard_tokens rows past expiry + 1d grace (post-build QA fix SF-6).
-  void import('./dashboard/db/dashboard-tokens.js')
-    .then((mod) => mod.pruneDashboardTokens())
-    .catch(() => {
-      /* dashboard module may not be initialized in tests */
-    });
-
-  // MODULE-HOOK:orchestrator-dispatch:watchdog — reap tasks that have exceeded
-  // their deadline, spawn window, no-progress timeout, or whose child container exited.
-  await sweepTaskWatchdog();
-
-  // Fleet-hardening Phase 0.1 (per-turn usage accounting): roll
-  // per-session turn_usage rows into the central usage_daily table for `ncl
-  // usage`. Reuses the same `sessions` list the per-session loop above already
-  // fetched — no extra DB query. Isolated so a rollup failure never blocks
-  // the rest of the tick.
-  try {
-    await sweepUsageRollup(sessions);
-  } catch (err) {
-    log.warn('Usage rollup sweep step failed', { err });
-  }
-  // Fleet-hardening Phase 0.1 follow-up (per-turn cost attribution): trim the
-  // central per-turn ledger the rollup above just fed. Fleet volume is
-  // ~300-600 turns/day, so this is trivial per-tick cost — no separate timer.
-  pruneOldTurnUsage();
-
-  // Claim reconciliation, then self-heal. Order is load-bearing: a claim whose
-  // pull request has merged must be CLOSED, not escalated at somebody — the
-  // reconcile pass deletes those files first, so the ladder below never sees
-  // them. Both are throttled internally to once per 10 minutes and each is
-  // isolated, so a GitHub outage cannot take the nudge ladder down with it.
-  try {
-    await reconcileMergedClaims();
-  } catch (err) {
-    log.warn('Claims reconcile sweep step failed', { err });
-  }
-
-  try {
-    await sweepClaimsSelfHeal();
-  } catch (err) {
-    log.warn('Claims self-heal sweep step failed', { err });
-  }
-
-  // Incident 2026-09-01: a failed repository publication left 1401 session
-  // inbound DBs fenced (`repo_ingress_fence.state = 'active'`) with no
-  // publication left to release them. Every inbound row since was held with
-  // trigger=0 and every spawn refused, so the workgroup went silently deaf for
-  // hours. Nothing else in the host releases a fence whose publication is gone.
-  // Reuses the session list the per-session loop already loaded — no extra
-  // query — and throttles its own full pass internally.
-  try {
-    await sweepOrphanedRepoIngressFences(sessions);
-  } catch (err) {
-    log.warn('Orphaned repository fence sweep step failed', { err });
-  }
+  await runTickPhase(tick, 'tick:post-session');
+  await runTickPhase(tick, 'tick:housekeeping');
 
   const sweepMs = Date.now() - sweepStartedAtMs;
   if (sweepMs >= 1_000) {
     log.info('Host sweep tick timing', { sweepMs, sessionsMs, sweptSessions, skippedQuiet: lastSkippedQuiet });
+  }
+}
+
+/**
+ * Test-only entry point for one whole tick, without the timer chain. Drives the
+ * registry exactly as production does — the acceptance cases in
+ * `host-sweep-registry.test.ts` need the driver, not the 60s `setTimeout`.
+ */
+export async function _sweepOnceForTesting(): Promise<void> {
+  const wasRunning = running;
+  running = true;
+  try {
+    await sweepOnce();
+  } finally {
+    running = wasRunning;
   }
 }
 
@@ -1597,7 +1938,7 @@ function skipUnreadable(sessionId: string, reason: string): number {
  * Sweep one session. Returns a quiet-until timestamp (ms) when the session is
  * fully quiet and safe to skip until then, or null when it must stay hot.
  */
-async function sweepSession(session: Session): Promise<number | null> {
+async function sweepSession(session: Session, tick: SweepTickContext): Promise<number | null> {
   const agentGroup = getAgentGroup(session.agent_group_id);
   if (!agentGroup) return skipUnreadable(session.id, 'agent group missing');
 
@@ -1605,19 +1946,63 @@ async function sweepSession(session: Session): Promise<number | null> {
   // closed, never held across a wake or a kill (invariant I-3). Reads never
   // provision (invariant I-4): a session whose mailbox is gone resolves
   // undefined and is counted as unreadable rather than silently recreated.
-  const run: SessionRunner = (action) => withExistingNanoclawSession(agentGroup.id, session.id, action);
+  const baseRun: SessionRunner = (action) => withExistingNanoclawSession(agentGroup.id, session.id, action);
 
-  interface WakePlan {
-    dueCount: number;
-    wakePriority: 'interactive' | 'scheduled';
-    admittedTasks: number;
-    workContinuation: HostWorkContinuation | null;
-    continuationWakeEligible: boolean;
-    /** False for a never-woken session that has only ever had an inbound.db. */
-    hasOutbound: boolean;
-  }
+  // `session:plan` fills this in; every later phase reads it.
+  const plan: WakePlan = {
+    dueCount: 0,
+    wakePriority: 'interactive',
+    admittedTasks: 0,
+    workContinuation: null,
+    continuationWakeEligible: false,
+    hasOutbound: false,
+  };
+  let mailbox: NanoclawMailboxSession | null = null;
+  let alive = false;
+  let justWoke = false;
+  let observed: ContainerObservation | null = null;
+  let window: SweepWindow = 'session:plan';
+  const runIn = <T>(at: SweepWindow, action: (m: NanoclawMailboxSession) => T | Promise<T>): Promise<T | undefined> =>
+    windowedRunner(baseRun, session.id, () => at)(action);
 
-  let plan: WakePlan | undefined;
+  const ctx: SweepSessionContext = {
+    now: tick.now,
+    get sessions(): readonly Session[] {
+      return tick.sessions;
+    },
+    get activeContainerSessionIds(): ReadonlySet<string> {
+      return tick.activeContainerSessionIds;
+    },
+    session,
+    agentGroupId: agentGroup.id,
+    agentGroupFolder: agentGroup.folder,
+    get mailbox(): NanoclawMailboxSession | null {
+      return mailbox;
+    },
+    get hasOutbound(): boolean {
+      return plan.hasOutbound;
+    },
+    get alive(): boolean {
+      return alive;
+    },
+    get justWoke(): boolean {
+      return justWoke;
+    },
+    plan,
+    get observed(): ContainerObservation | null {
+      return observed;
+    },
+    killSnapshot: null,
+    get run(): SessionRunner {
+      return windowedRunner(baseRun, session.id, () => window);
+    },
+    runIn,
+    reportWoke(woke: boolean): void {
+      justWoke = woke;
+    },
+  };
+
+  // ── W1: session:plan ───────────────────────────────────────────────────────
   // Distinguishes "a duty threw" from "the mailbox would not open". The INBOUND
   // open happens before the action body, so this flag alone settles that one —
   // but the OUTBOUND handle opens lazily, partway through the action, and by
@@ -1625,112 +2010,18 @@ async function sweepSession(session: Session): Promise<number | null> {
   // does: it raises SessionDbUnopenableError, which the catch routes to the
   // backoff whatever this flag says.
   let enteredPlanSession = false;
+  let planned: { ok: true } | undefined;
   try {
-    plan = await run(async (mailbox): Promise<WakePlan> => {
+    planned = await baseRun(async (m): Promise<{ ok: true }> => {
       enteredPlanSession = true;
-      // 1. Sync processing_ack → messages_in status
-      mailbox.syncProcessingAcks();
-
-      // 1a. Expire long-pending rows so sweep stops re-waking sessions on
-      // messages that have been sitting unprocessed past the age cutoff.
-      const expired = mailbox.expireStalePending(PENDING_MESSAGE_MAX_AGE_MS);
-      if (expired > 0) {
-        log.info('Expired stale pending messages', {
-          sessionId: session.id,
-          count: expired,
-          maxAgeMs: PENDING_MESSAGE_MAX_AGE_MS,
-        });
+      mailbox = m;
+      try {
+        await runSessionPhase(ctx, 'session:plan');
+        plan.hasOutbound = m.hasOutbound();
+      } finally {
+        mailbox = null;
       }
-
-      // 2. A stopped container with processing claims crashed mid-turn. Defer
-      // the paired input first, while it is still inert-able, and clear the
-      // orphan claim before any due-count or wake decision can expose its stale
-      // recall to a replacement/warm poller. When backoff elapses, the admission
-      // seam below replaces that recall from current host state.
-      if (mailbox.getProcessingClaimRows().length > 0) {
-        writeOutboundWhenStopped(session, mailbox, () =>
-          resetStuckProcessingRows(mailbox, session, 'container not running'),
-        );
-      }
-
-      // 3. Admit due scheduled occurrences and lifecycle wakes with fresh
-      // recall/capabilities
-      // immediately before they become wakeable. Task rows stay trigger=0 from
-      // creation through this point; paired lifecycle wakes stay trigger=0 throughout
-      // backoff. A warm poller cannot race ahead of either context pair, and a
-      // repeated sweep is idempotent.
-      const preparedWake = await prepareDueWake(mailbox, agentGroup.id, session.id);
-      const { admittedTasks } = preparedWake;
-      let { dueCount, wakePriority } = preparedWake;
-      if (admittedTasks > 0) {
-        log.debug('Admitted due turns with fresh context', {
-          sessionId: session.id,
-          count: admittedTasks,
-        });
-      }
-
-      // 4. Durable continuation state is a wake source, but its automatic crash
-      // recovery is both throttled and hard-capped per continuation id.
-      const workContinuation = mailbox.readWorkContinuation();
-
-      // Mirror the container's own `propose_done` record onto the central
-      // `sessions` row so the Observatory list can show "proposes closing"
-      // without opening a per-session SQLite file per row. Free here — the
-      // handle is already open and it is one SELECT — and deliberately NOT the
-      // copy the close path trusts (see thread-close.ts). Isolated: a mirror
-      // failure must never cost this session its sweep.
-      //
-      // Still a raw-handle callee: `dashboard/thread-close.ts` moves behind the
-      // seam in PR 4, and this line becomes `syncDoneProposalMirror(session.id)`
-      // then. It only reads. Guarded on `hasOutbound` because a raw handle is
-      // the one thing the module cannot degrade for a never-woken session.
-      if (mailbox.hasOutbound()) {
-        try {
-          syncDoneProposalMirror(session.id, mailbox.legacyOutboundHandle());
-        } catch (err) {
-          log.warn('done_proposal mirror failed', { sessionId: session.id, err });
-        }
-      }
-
-      if (
-        !containerOwnsOutbound(session.id) &&
-        workContinuation &&
-        workContinuation.resume_attempts >= WORK_CONTINUATION_RESUME_MAX_ATTEMPTS
-      ) {
-        const parked = mailbox.parkDueRecoveryWakes(new Date().toISOString());
-        if (parked > 0) {
-          dueCount = mailbox.countDueMessages();
-          wakePriority = dueCount > 0 ? mailbox.getDueWakePriority() : 'interactive';
-        }
-        if (dueCount === 0) {
-          writeOutboundWhenStopped(session, mailbox, () =>
-            notifyContinuationParked(mailbox, session, workContinuation),
-          );
-        }
-      }
-
-      // Every stopped-session wake must pass through continuation recovery
-      // admission, even when an unrelated scheduled row is already due. The
-      // runner retains its prior owner claim until this path clears it, so a
-      // scheduled wake cannot make saved work bypass the throttle or cap.
-      const continuationWakeEligible =
-        !containerOwnsOutbound(session.id) &&
-        workContinuation !== null &&
-        canAttemptContinuationRecovery(workContinuation) &&
-        decideContinuationWake({
-          now: Date.now(),
-          spawnedAtMs: getContainerSpawnedAt(session.id),
-          lastRecoveryAttemptAtMs: mailbox.readContinuationRecoveryAttemptAt(workContinuation),
-        });
-
-      return {
-        dueCount,
-        wakePriority,
-        admittedTasks,
-        workContinuation,
-        continuationWakeEligible,
-        hasOutbound: mailbox.hasOutbound(),
-      };
+      return { ok: true };
     });
   } catch (err) {
     // A session that vanished under us is the ordinary steady state — counted,
@@ -1744,7 +2035,7 @@ async function sweepSession(session: Session): Promise<number | null> {
     // decides, not how far we got: a lazily-opened outbound handle fails after
     // the duties have started and must still land here.
     if (err instanceof SessionDbUnopenableError || !enteredPlanSession) {
-      log.error('Host sweep mailbox unopenable', { err, sessionId: session.id });
+      log.error('Host sweep mailbox unopenable', { err, sessionId: session.id, window: 'session:plan' });
       return skipUnreadable(session.id, `session mailbox unreadable: ${String(err)}`);
     }
     // A DUTY threw — a transient SQLite lock during task admission, say. The
@@ -1761,160 +2052,118 @@ async function sweepSession(session: Session): Promise<number | null> {
   // answers on inbound.db alone, so a never-woken session with no outbound.db
   // is swept normally (its outbound reads answer empty) — only a session with
   // no inbound.db at all is skipped, and a read never re-creates one (I-4).
-  if (!plan) return skipUnreadable(session.id, 'no session mailbox');
+  if (!planned) return skipUnreadable(session.id, 'no session mailbox');
 
-  const { admittedTasks, dueCount, wakePriority, workContinuation } = plan;
+  try {
+    // ── W2: session:wake — NOTHING open ──────────────────────────────────────
+    // Deliberately outside any mailbox session: the spawn path reads this
+    // session's repository ingress fence through a session of its own, and the
+    // recovery admission writes through one too (invariant I-3).
+    window = 'session:wake';
+    await runSessionPhase(ctx, 'session:wake');
 
-  // 5. Wake a container if work is due and nothing is running. Deliberately
-  // OUTSIDE any mailbox session: the spawn path reads this session's
-  // repository ingress fence through a session of its own, and the recovery
-  // admission below writes through one too (invariant I-3).
-  let justWoke = false;
-  const resumedContinuation = plan.continuationWakeEligible
-    ? await incrementStoppedContinuationAttempt(session, workContinuation!.id)
-    : null;
-  const continuationWake = resumedContinuation !== null;
-  if ((dueCount > 0 || continuationWake) && !isContainerRunning(session.id)) {
-    log.info('Waking container for due messages', {
-      sessionId: session.id,
-      count: dueCount,
-      priority: wakePriority,
-      continuationId: resumedContinuation?.id,
+    alive = isContainerRunning(session.id);
+
+    // ── W3: the driver's observe read ────────────────────────────────────────
+    // Machinery, not a duty: it feeds ctx.observed, which is what the
+    // session:health predicates consult. Skipped on the same iteration that
+    // just woke the container — it hasn't had a chance to clear stale
+    // processing_ack rows from a previous crash yet, and without this grace
+    // period stale claims cause an immediate spawn-kill loop. `hasOutbound`
+    // reproduces the pre-seam `outDb !== null` guard exactly.
+    if (alive && !justWoke && plan.hasOutbound) {
+      window = 'session:observe';
+      observed =
+        (await ctx.run((m) => ({
+          containerState: m.getContainerState(),
+          processingClaimCount: m.getProcessingClaimRows().length,
+          lastOutboundAtMs: getLastOutboundAtMs(m),
+          lastInboundAtMs: getLastInboundAtMs(m),
+        }))) ?? null;
+
+      // ── W4: session:health — EXCLUSIVE, nothing open ───────────────────────
+      if (observed) {
+        window = 'session:health';
+        await runExclusiveSessionPhase(ctx, 'session:health');
+      }
+    }
+
+    // A container that is gone cannot be mid-failure. Clearing here stops a
+    // fresh container from inheriting the dead one's half-finished debounce and
+    // being killed on its first 'failed' observation.
+    if (!alive) providerFailedTicks.delete(session.id);
+
+    // ── W5: session:tail ─────────────────────────────────────────────────────
+    window = 'session:tail';
+    let quietUntil: number | null = null;
+    const tail = await ctx.run(async (m): Promise<{ ok: true }> => {
+      mailbox = m;
+      try {
+        await runSessionPhase(ctx, 'session:tail');
+        // Quiet-cache hint: nothing live here — no container, nothing due or
+        // admitted, no continuation. Safe to skip until the next scheduled row
+        // is due (never past it) or the backoff cap. New inbound invalidates
+        // via last_active in the sweep loop. Driver machinery, computed after
+        // the last phase.
+        if (plan.dueCount === 0 && plan.admittedTasks === 0 && !justWoke && plan.workContinuation === null && !alive) {
+          const nextDue = m.getNextFutureProcessAfter();
+          const cap = Date.now() + QUIET_SESSION_BACKOFF_MS;
+          const nextDueMs = nextDue ? Date.parse(nextDue) : Number.POSITIVE_INFINITY;
+          quietUntil = Math.min(Number.isFinite(nextDueMs) ? nextDueMs : cap, cap);
+        }
+      } finally {
+        mailbox = null;
+      }
+      return { ok: true };
     });
-    // wakeContainer never throws — transient spawn failures (OneCLI down,
-    // etc.) return false and leave messages pending for the next tick.
-    // Classification is passed into the atomic admission decision so a
-    // scheduled wake can never reserve memory as interactive first.
-    const woke = await wakeContainer(session, wakePriority);
-    justWoke = woke;
-    if (!woke && resumedContinuation) {
-      await restoreStoppedContinuationAttempt(session, resumedContinuation, workContinuation!);
-    }
+    return tail ? quietUntil : null;
+  } catch (err) {
+    // A later window's opener failed, or its mailbox vanished mid-tick. Already
+    // classified at the boundary; the session takes no quiet mark and is swept
+    // again on the next tick, exactly as it was before the seam.
+    if (err instanceof SweepWindowAbort) return null;
+    throw err;
   }
-
-  const alive = isContainerRunning(session.id);
-
-  // 6. Running-container SLA: absolute ceiling + per-claim stuck rules.
-  // Skip on the same iteration that just woke the container — it hasn't
-  // had a chance to clear stale processing_ack rows from a previous crash
-  // yet. Without this grace period, stale claims cause an immediate
-  // spawn-kill loop.
-  // `hasOutbound` reproduces the pre-seam `outDb !== null` guard exactly: a
-  // session with no outbound.db has no container state, no claims and no
-  // telemetry to enforce an SLA against, and the reap decisions all read it.
-  if (alive && !justWoke && plan.hasOutbound) {
-    const observed = await run((mailbox) => ({
-      containerState: mailbox.getContainerState(),
-      processingClaimCount: mailbox.getProcessingClaimRows().length,
-      lastOutboundAtMs: getLastOutboundAtMs(mailbox),
-      lastInboundAtMs: getLastInboundAtMs(mailbox),
-    }));
-    if (observed) {
-      const { containerState, processingClaimCount } = observed;
-      // 6a. Failed-provider self-heal. Runs first: a container whose provider
-      // has given up is not idle and not merely stuck, and healing it beats
-      // both reaping it as idle and waiting out the 30-minute ceiling. Returns
-      // true only when it killed the container, in which case the reap/SLA
-      // checks below have nothing left to decide this tick.
-      if (await sweepProviderHeal(run, session, agentGroup.folder, containerState)) {
-        log.debug('Provider self-heal handled this tick — skipping reap/SLA checks', { sessionId: session.id });
-      } else if (
-        shouldReapIdleTaskContainer(
-          session.thread_id,
-          dueCount,
-          processingClaimCount,
-          containerState?.provider_executing === 1,
-          workContinuation !== null,
-        )
-      ) {
-        log.info('Reaping idle scheduled-task container', { sessionId: session.id, threadId: session.thread_id });
-        killContainer(session.id, 'scheduled-task-idle');
-      } else if (
-        shouldReapIdleChatContainer(
-          session.thread_id,
-          dueCount,
-          processingClaimCount,
-          workContinuation !== null,
-          observed.lastOutboundAtMs,
-          observed.lastInboundAtMs,
-          Date.now(),
-        )
-      ) {
-        log.info('Reaping idle chat container', {
-          sessionId: session.id,
-          threadId: session.thread_id,
-          idleFloorMs: CHAT_IDLE_REAP_MS,
-        });
-        killContainer(session.id, 'chat-idle-reap');
-      } else {
-        await enforceRunningContainerSla(run, session, agentGroup.id, agentGroup.folder);
-      }
-    }
-  }
-
-  // A container that is gone cannot be mid-failure. Clearing here stops a
-  // fresh container from inheriting the dead one's half-finished debounce and
-  // being killed on its first 'failed' observation.
-  if (!alive) providerFailedTicks.delete(session.id);
-
-  const tail = await run(async (mailbox) => {
-    // 7. Retry cleanup if the pre-wake orphan-claim clear could not finish.
-    // resetStuckProcessingRows is idempotent: future retries are not bumped
-    // again, and already-cleared claim sets are a no-op.
-    // `alive` was sampled BEFORE this session opened, so it cannot authorize a
-    // write to outbound.db on its own — re-checked here, immediately before,
-    // with no await in between.
-    if (plan.hasOutbound) {
-      writeOutboundWhenStopped(session, mailbox, () =>
-        resetStuckProcessingRows(mailbox, session, 'container not running'),
-      );
-    }
-
-    // 8. Recurrence fanout for completed recurring tasks.
-    // MODULE-HOOK:scheduling-recurrence:start
-    // Still a raw-handle callee: `modules/scheduling/recurrence.ts` moves
-    // behind the seam in PR 4.
-    const { handleRecurrence } = await import('./modules/scheduling/recurrence.js');
-    await handleRecurrence(mailbox.legacyInboundHandle(), session);
-    // MODULE-HOOK:scheduling-recurrence:end
-
-    // 9. GC spent task sessions. An isolated per-task session with no live task
-    // rows left (one-shot fired, or all cancelled/deleted) and no container
-    // running is dead — close it so it stops being swept and listed. Runs after
-    // recurrence so a just-fired recurring series has already re-armed its next
-    // pending row and is never collected. The per-task log file in the workspace
-    // is the durable history and survives the close.
-    if (isTaskThread(session.thread_id)) {
-      const liveTasks = mailbox.countLiveTasks();
-      if (shouldCloseTaskSession(session.thread_id, isContainerRunning(session.id), liveTasks)) {
-        updateSession(session.id, { status: 'closed' });
-        log.info('Closed spent task session', { sessionId: session.id, threadId: session.thread_id });
-      }
-    }
-
-    // Quiet-cache hint: nothing live here — no container, nothing due or
-    // admitted, no continuation. Safe to skip until the next scheduled row is
-    // due (never past it) or the backoff cap. New inbound invalidates via
-    // last_active in the sweep loop.
-    if (dueCount === 0 && admittedTasks === 0 && !justWoke && workContinuation === null && !alive) {
-      const nextDue = mailbox.getNextFutureProcessAfter();
-      const cap = Date.now() + QUIET_SESSION_BACKOFF_MS;
-      const nextDueMs = nextDue ? Date.parse(nextDue) : Number.POSITIVE_INFINITY;
-      return Math.min(Number.isFinite(nextDueMs) ? nextDueMs : cap, cap);
-    }
-    return null;
-  });
-  return tail ?? null;
 }
 
-/** Test-only entry point for the running-container SLA, including both post-kill write paths. */
+/**
+ * Test-only entry point for the running-container SLA, including both post-kill
+ * write paths. Builds the minimum session context the duty reads: the SLA and
+ * its follow-ups touch `session`, `agentGroupId`, `agentGroupFolder` and the
+ * two window openers, nothing else.
+ */
 export function _enforceRunningContainerSlaForTesting(
   run: SessionRunner,
   session: Session,
   agentGroupId: string,
   agentGroupFolder: string,
 ): Promise<void> {
-  return enforceRunningContainerSla(run, session, agentGroupId, agentGroupFolder);
+  const ctx: SweepSessionContext = {
+    now: Date.now(),
+    sessions: [session],
+    activeContainerSessionIds: new Set<string>(),
+    session,
+    agentGroupId,
+    agentGroupFolder,
+    mailbox: null,
+    hasOutbound: true,
+    alive: true,
+    justWoke: false,
+    plan: {
+      dueCount: 0,
+      wakePriority: 'interactive',
+      admittedTasks: 0,
+      workContinuation: null,
+      continuationWakeEligible: false,
+      hasOutbound: true,
+    },
+    observed: null,
+    killSnapshot: null,
+    run,
+    runIn: (_window, action) => run(action),
+    reportWoke: () => {},
+  };
+  return enforceRunningContainerSla(ctx);
 }
 
 /**
@@ -1929,9 +2178,20 @@ export function _incrementStoppedContinuationAttemptForTesting(
   return incrementStoppedContinuationAttempt(session, expectedId);
 }
 
-/** Test-only entry point for one session's sweep tick. */
+/** Test-only entry point for one session's sweep tick, over a one-session tick context. */
 export function _sweepSessionForTesting(session: Session): Promise<number | null> {
-  return sweepSession(session);
+  let sessions: Session[] | undefined;
+  let activeContainerSessionIds: ReadonlySet<string> | undefined;
+  const tick: SweepTickContext = {
+    now: Date.now(),
+    get sessions(): readonly Session[] {
+      return (sessions ??= getActiveSessions());
+    },
+    get activeContainerSessionIds(): ReadonlySet<string> {
+      return (activeContainerSessionIds ??= new Set(getActiveContainerSessionIds()));
+    },
+  };
+  return sweepSession(session, tick);
 }
 
 // ── Usage rollup (fleet-hardening Phase 0.1) ──
@@ -1950,7 +2210,7 @@ export function shouldSkipUsageRollup(cachedMtimeMs: number | undefined, current
   return cachedMtimeMs === currentMtimeMs;
 }
 
-async function sweepUsageRollup(sessions: Session[]): Promise<void> {
+async function sweepUsageRollup(sessions: readonly Session[]): Promise<void> {
   for (const session of sessions) {
     try {
       const outPath = sessionMailboxPath({ agentGroupId: session.agent_group_id, sessionId: session.id }, 'outbound');
@@ -2199,25 +2459,22 @@ function activeOperationTimeoutMs(state: ContainerState | null): number | null {
   return typeof state.tool_declared_timeout_ms === 'number' ? state.tool_declared_timeout_ms : null;
 }
 
-async function enforceRunningContainerSla(
-  run: SessionRunner,
-  session: Session,
-  agentGroupId: string,
-  agentGroupFolder: string,
-): Promise<void> {
-  // Read + OOM notice in one session, so the decision and the telemetry row
-  // see the same snapshot. The kill below then runs with nothing open.
-  const observed = await run((mailbox) => {
+async function enforceRunningContainerSla(ctx: SweepSessionContext): Promise<void> {
+  const session = ctx.session;
+  // Read + the observation hooks in one session, so the decision and the
+  // telemetry row see the same snapshot. The kill below then runs with nothing
+  // open (invariant I-3).
+  const observed = await ctx.runIn('session:health:sla-observe', async (mailbox) => {
     const containerState = mailbox.getContainerState();
-    reportContainerOomTelemetry(mailbox, session, agentGroupFolder, containerState);
+    await runSlaObservationHooks(ctx, containerState, mailbox);
     const decision = decideStuckAction({
       now: Date.now(),
-      heartbeatMtimeMs: heartbeatMtimeMs(agentGroupId, session.id),
+      heartbeatMtimeMs: heartbeatMtimeMs(ctx.agentGroupId, session.id),
       containerState,
       claims: mailbox.getProcessingClaimRows(),
       spawnedAtMs: getContainerSpawnedAt(session.id),
     });
-    // Snapshot BEFORE the kill so the notify helper has the pre-kill state —
+    // Snapshot BEFORE the kill so the follow-ups have the pre-kill state —
     // resetStuckProcessingRows clears the claims, so a read afterward would
     // always be empty.
     return {
@@ -2239,49 +2496,25 @@ async function enforceRunningContainerSla(
       ceilingMs: decision.ceilingMs,
     });
     killContainer(session.id, 'absolute-ceiling');
-    // Posted AFTER kill to honor the outbound.db single-writer invariant; the
-    // module opens the writable outbound handle lazily, only for this write.
-    // notifyKillCeiling itself gates on `pendingClaims === 0` (no user was
-    // waiting) to avoid spamming restart notices on quiet sessions that just
-    // naturally reached the 30-min idle ceiling.
-    await run((mailbox) => {
-      // The kill above is a yield boundary: this session opened after it, and a
-      // replacement wake landing in that gap owns outbound.db. Checked here,
-      // immediately before the writes, with no await in between. Skipping costs
-      // one restart notice and defers the orphan-claim clear to the next tick —
-      // both idempotent. Writing anyway would delete the FRESH runner's claim
-      // and defer an input it is already processing: duplicate execution.
-      writeOutboundWhenStopped(session, mailbox, () => {
-        notifyKillCeiling(mailbox, session, decision.heartbeatAgeMs, pendingClaims, containerState);
-        resetStuckProcessingRows(mailbox, session, 'absolute-ceiling');
-        // Accountability wake: if the kill plausibly interrupted parked work,
-        // queue an on_wake row so the session respawns (next sweep tick's
-        // due-wake step) and answers for the interruption instead of staying
-        // dead until the next human ping. Best-effort — a failure here must
-        // not break the sweep's kill path.
-        //
-        // INSIDE the guard, which is where the pre-refactor `return` also left
-        // it. The row itself is inbound (host-owned, no single-writer hazard),
-        // but a replacement that took the session has already recovered from
-        // this kill: the row is `on_wake = 1`, so the live replacement never
-        // consumes it and it instead greets the NEXT fresh container with a
-        // stale "your previous container was killed" notice — while counting
-        // against that class's recovery-attempt cap. Skipping is correct, not
-        // merely safe.
-        try {
-          applyCeilingFollowUp(
-            mailbox,
-            session,
-            containerState,
-            workContinuation,
-            decision.heartbeatAgeMs,
-            decision.ceilingMs,
-          );
-        } catch (err) {
-          log.warn('ceiling-kill follow-up failed', { sessionId: session.id, err });
-        }
-      });
-    });
+    // The follow-ups run AFTER the kill, in a session opened only then, to
+    // honor the outbound.db single-writer invariant; the module opens the
+    // writable outbound handle lazily, only for the notice write.
+    //
+    // The kill above is a yield boundary: this session opened after it, and a
+    // replacement wake landing in that gap owns outbound.db. Upstream guards
+    // that with ONE `writeOutboundWhenStopped` around all three follow-ups,
+    // which is sound there because they are one synchronous block. Here the
+    // registry runs them as separate awaited duties, so a single check would
+    // authorize writes two yields later — each follow-up guards its OWN write
+    // instead (`registerBuiltInSweepDuties`, the three post-kill registrations).
+    await ctx.runIn('session:health:post-kill', (mailbox) =>
+      runSweepKillFollowUps(ctx, decision, mailbox, {
+        reason: 'absolute-ceiling',
+        containerState,
+        pendingClaims,
+        workContinuation,
+      }),
+    );
     return;
   }
 
@@ -2292,10 +2525,15 @@ async function enforceRunningContainerSla(
     toleranceMs: decision.toleranceMs,
   });
   killContainer(session.id, 'claim-stuck');
-  await run((mailbox) => {
-    // Same yield boundary as the ceiling branch above.
-    writeOutboundWhenStopped(session, mailbox, () => resetStuckProcessingRows(mailbox, session, 'claim-stuck'));
-  });
+  // Same yield boundary as the ceiling branch above; same per-follow-up guard.
+  await ctx.runIn('session:health:post-kill', (mailbox) =>
+    runSweepKillFollowUps(ctx, decision, mailbox, {
+      reason: 'claim-stuck',
+      containerState,
+      pendingClaims,
+      workContinuation,
+    }),
+  );
 }
 
 /**
@@ -2585,3 +2823,729 @@ function resetStuckProcessingRows(mailbox: NanoclawMailboxSession, session: Sess
     log.warn('Failed to clear orphan processing claims', { sessionId: session.id, err });
   }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The 39 registrations.
+//
+// Bodies are the pre-registry statements, unchanged, including each duty's own
+// guard (or deliberate lack of one — an unguarded duty still aborts the rest of
+// the tick and is caught by `sweep()`'s wrapper, exactly as before). Phase and
+// order encode the 21 load-bearing ordering constraints from plan.md §4.3; the
+// family PRs move each body into `src/modules/sweep-<family>/` by moving its
+// registration, not by editing the driver.
+// ─────────────────────────────────────────────────────────────────────────────
+
+function registerBuiltInSweepDuties(): void {
+  const id = SWEEP_DUTY_INVENTORY;
+
+  // ── tick:pre-session ───────────────────────────────────────────────────────
+
+  registerSweepDuty({
+    name: id.T2,
+    phase: 'tick:pre-session',
+    order: 10,
+    run: () => {
+      // Re-heal the egress network so already-running agents keep their gateway
+      // hop if it was detached out-of-band. Best-effort here: a heal failure
+      // isn't a leak (agents stay on the internal net), so log and continue.
+      // No-op when lockdown is disabled.
+      try {
+        ensureEgressNetwork();
+      } catch (err) {
+        log.error('Egress lockdown re-heal failed', { err });
+      }
+    },
+  });
+
+  // ── session:plan (W1) ──────────────────────────────────────────────────────
+
+  registerSweepDuty({
+    name: id.S2,
+    phase: 'session:plan',
+    order: 10,
+    // 1. Sync processing_ack → messages_in status
+    run: (ctx) => {
+      asSessionContext(ctx).mailbox!.syncProcessingAcks();
+    },
+  });
+
+  registerSweepDuty({
+    name: id.S3,
+    phase: 'session:plan',
+    order: 20,
+    // 1a. Expire long-pending rows so sweep stops re-waking sessions on
+    // messages that have been sitting unprocessed past the age cutoff.
+    run: (ctx) => {
+      const { session, mailbox } = asSessionContext(ctx);
+      const expired = mailbox!.expireStalePending(PENDING_MESSAGE_MAX_AGE_MS);
+      if (expired > 0) {
+        log.info('Expired stale pending messages', {
+          sessionId: session.id,
+          count: expired,
+          maxAgeMs: PENDING_MESSAGE_MAX_AGE_MS,
+        });
+      }
+    },
+  });
+
+  registerSweepDuty({
+    name: id.S4,
+    phase: 'session:plan',
+    order: 30,
+    // 2. A stopped container with processing claims crashed mid-turn. Defer the
+    // paired input first, while it is still inert-able, and clear the orphan
+    // claim before any due-count or wake decision can expose its stale recall to
+    // a replacement/warm poller. When backoff elapses, the admission seam below
+    // replaces that recall from current host state.
+    run: (ctx) => {
+      const { session, mailbox } = asSessionContext(ctx);
+      if (mailbox!.getProcessingClaimRows().length > 0) {
+        writeOutboundWhenStopped(session, mailbox!, () =>
+          resetStuckProcessingRows(mailbox!, session, 'container not running'),
+        );
+      }
+    },
+  });
+
+  registerSweepDuty({
+    name: id.S5,
+    phase: 'session:plan',
+    order: 40,
+    // 3. Admit due scheduled occurrences and lifecycle wakes with fresh
+    // recall/capabilities immediately before they become wakeable. Task rows
+    // stay trigger=0 from creation through this point; paired lifecycle wakes
+    // stay trigger=0 throughout backoff. A warm poller cannot race ahead of
+    // either context pair, and a repeated sweep is idempotent.
+    run: async (ctx) => {
+      const { session, agentGroupId, mailbox, plan } = asSessionContext(ctx);
+      const preparedWake = await prepareDueWake(mailbox!, agentGroupId, session.id);
+      plan.admittedTasks = preparedWake.admittedTasks;
+      plan.dueCount = preparedWake.dueCount;
+      plan.wakePriority = preparedWake.wakePriority;
+      if (plan.admittedTasks > 0) {
+        log.debug('Admitted due turns with fresh context', {
+          sessionId: session.id,
+          count: plan.admittedTasks,
+        });
+      }
+    },
+  });
+
+  registerSweepDuty({
+    name: id.S6,
+    phase: 'session:plan',
+    order: 50,
+    // Mirror the container's own `propose_done` record onto the central
+    // `sessions` row so the Observatory list can show "proposes closing"
+    // without opening a per-session SQLite file per row. Free here — the handle
+    // is already open and it is one SELECT — and deliberately NOT the copy the
+    // close path trusts (see thread-close.ts). Isolated: a mirror failure must
+    // never cost this session its sweep.
+    //
+    // Still a raw-handle callee: `dashboard/thread-close.ts` moves behind the
+    // seam in PR 4, and this line becomes `syncDoneProposalMirror(session.id)`
+    // then. It only reads. Guarded on `hasOutbound` because a raw handle is the
+    // one thing the module cannot degrade for a never-woken session.
+    run: (ctx) => {
+      const { session, mailbox } = asSessionContext(ctx);
+      if (mailbox!.hasOutbound()) {
+        try {
+          syncDoneProposalMirror(session.id, mailbox!.legacyOutboundHandle());
+        } catch (err) {
+          log.warn('done_proposal mirror failed', { sessionId: session.id, err });
+        }
+      }
+    },
+  });
+
+  registerSweepDuty({
+    name: id.S7,
+    phase: 'session:plan',
+    order: 60,
+    // 4. Durable continuation state is a wake source, but its automatic crash
+    // recovery is both throttled and hard-capped per continuation id.
+    run: (ctx) => {
+      const { mailbox, plan } = asSessionContext(ctx);
+      plan.workContinuation = mailbox!.readWorkContinuation();
+    },
+  });
+
+  registerSweepDuty({
+    name: id.S8,
+    phase: 'session:plan',
+    order: 70,
+    run: (ctx) => {
+      const { session, mailbox, plan } = asSessionContext(ctx);
+      if (
+        !containerOwnsOutbound(session.id) &&
+        plan.workContinuation &&
+        plan.workContinuation.resume_attempts >= WORK_CONTINUATION_RESUME_MAX_ATTEMPTS
+      ) {
+        const parked = mailbox!.parkDueRecoveryWakes(new Date().toISOString());
+        if (parked > 0) {
+          plan.dueCount = mailbox!.countDueMessages();
+          plan.wakePriority = plan.dueCount > 0 ? mailbox!.getDueWakePriority() : 'interactive';
+        }
+        if (plan.dueCount === 0) {
+          writeOutboundWhenStopped(session, mailbox!, () =>
+            notifyContinuationParked(mailbox!, session, plan.workContinuation!),
+          );
+        }
+      }
+    },
+  });
+
+  registerSweepDuty({
+    name: id.S9a,
+    phase: 'session:plan',
+    order: 80,
+    // Every stopped-session wake must pass through continuation recovery
+    // admission, even when an unrelated scheduled row is already due. The runner
+    // retains its prior owner claim until this path clears it, so a scheduled
+    // wake cannot make saved work bypass the throttle or cap.
+    run: (ctx) => {
+      const { session, mailbox, plan } = asSessionContext(ctx);
+      plan.continuationWakeEligible =
+        !containerOwnsOutbound(session.id) &&
+        plan.workContinuation !== null &&
+        canAttemptContinuationRecovery(plan.workContinuation) &&
+        decideContinuationWake({
+          now: Date.now(),
+          spawnedAtMs: getContainerSpawnedAt(session.id),
+          lastRecoveryAttemptAtMs: mailbox!.readContinuationRecoveryAttemptAt(plan.workContinuation),
+        });
+    },
+  });
+
+  // ── session:wake (W2) — NOTHING open ───────────────────────────────────────
+
+  registerSweepDuty({
+    name: id.S9b,
+    phase: 'session:wake',
+    order: 10,
+    // 5. Wake a container if work is due and nothing is running.
+    run: async (ctx) => {
+      const c = asSessionContext(ctx);
+      const { session, plan } = c;
+      const resumedContinuation = plan.continuationWakeEligible
+        ? await incrementStoppedContinuationAttempt(session, plan.workContinuation!.id)
+        : null;
+      const continuationWake = resumedContinuation !== null;
+      if ((plan.dueCount > 0 || continuationWake) && !isContainerRunning(session.id)) {
+        log.info('Waking container for due messages', {
+          sessionId: session.id,
+          count: plan.dueCount,
+          priority: plan.wakePriority,
+          continuationId: resumedContinuation?.id,
+        });
+        // wakeContainer never throws — transient spawn failures (OneCLI down,
+        // etc.) return false and leave messages pending for the next tick.
+        // Classification is passed into the atomic admission decision so a
+        // scheduled wake can never reserve memory as interactive first.
+        const woke = await wakeContainer(session, plan.wakePriority);
+        c.reportWoke(woke);
+        if (!woke && resumedContinuation) {
+          await restoreStoppedContinuationAttempt(session, resumedContinuation, plan.workContinuation!);
+        }
+      }
+    },
+  });
+
+  // ── session:health (W4) — EXCLUSIVE, nothing open ──────────────────────────
+
+  registerSweepDuty({
+    name: id.S11,
+    phase: 'session:health',
+    order: 10,
+    // 6a. Failed-provider self-heal. Runs first: a container whose provider has
+    // given up is not idle and not merely stuck, and healing it beats both
+    // reaping it as idle and waiting out the 30-minute ceiling. Returns true
+    // only when it killed the container, in which case the reap/SLA checks
+    // below have nothing left to decide this tick — which is exactly the
+    // `claims()` contract of an exclusive phase.
+    claims: (ctx) =>
+      sweepProviderHeal(ctx.run, ctx.session, ctx.agentGroupFolder, ctx.observed?.containerState ?? null),
+    run: (ctx) => {
+      log.debug('Provider self-heal handled this tick — skipping reap/SLA checks', {
+        sessionId: asSessionContext(ctx).session.id,
+      });
+    },
+  });
+
+  registerSweepDuty({
+    name: id.S12,
+    phase: 'session:health',
+    order: 20,
+    claims: (ctx) =>
+      shouldReapIdleTaskContainer(
+        ctx.session.thread_id,
+        ctx.plan.dueCount,
+        ctx.observed!.processingClaimCount,
+        ctx.observed!.containerState?.provider_executing === 1,
+        ctx.plan.workContinuation !== null,
+      ),
+    run: (ctx) => {
+      const { session } = asSessionContext(ctx);
+      log.info('Reaping idle scheduled-task container', { sessionId: session.id, threadId: session.thread_id });
+      killContainer(session.id, 'scheduled-task-idle');
+    },
+  });
+
+  registerSweepDuty({
+    name: id.S13,
+    phase: 'session:health',
+    order: 30,
+    claims: (ctx) =>
+      shouldReapIdleChatContainer(
+        ctx.session.thread_id,
+        ctx.plan.dueCount,
+        ctx.observed!.processingClaimCount,
+        ctx.plan.workContinuation !== null,
+        ctx.observed!.lastOutboundAtMs,
+        ctx.observed!.lastInboundAtMs,
+        Date.now(),
+      ),
+    run: (ctx) => {
+      const { session } = asSessionContext(ctx);
+      log.info('Reaping idle chat container', {
+        sessionId: session.id,
+        threadId: session.thread_id,
+        idleFloorMs: CHAT_IDLE_REAP_MS,
+      });
+      killContainer(session.id, 'chat-idle-reap');
+    },
+  });
+
+  registerSweepDuty({
+    name: id.S14,
+    phase: 'session:health',
+    order: 40,
+    // 6. Running-container SLA: absolute ceiling + per-claim stuck rules. The
+    // fallthrough — no claims(), so it runs when nothing above it claimed.
+    run: (ctx) => enforceRunningContainerSla(asSessionContext(ctx)),
+  });
+
+  // ── session:tail (W5) ──────────────────────────────────────────────────────
+
+  registerSweepDuty({
+    name: id.S17,
+    phase: 'session:tail',
+    order: 10,
+    // 7. Retry cleanup if the pre-wake orphan-claim clear could not finish.
+    // resetStuckProcessingRows is idempotent: future retries are not bumped
+    // again, and already-cleared claim sets are a no-op.
+    run: (ctx) => {
+      const { session, mailbox, hasOutbound } = asSessionContext(ctx);
+      // `ctx.alive` was sampled BEFORE this window opened, so it cannot
+      // authorize a write to outbound.db on its own — the helper re-checks
+      // immediately before the write, with no await in between.
+      if (hasOutbound) {
+        writeOutboundWhenStopped(session, mailbox!, () =>
+          resetStuckProcessingRows(mailbox!, session, 'container not running'),
+        );
+      }
+    },
+  });
+
+  registerSweepDuty({
+    name: id.S18,
+    phase: 'session:tail',
+    order: 20,
+    // 8. Recurrence fanout for completed recurring tasks.
+    // MODULE-HOOK:scheduling-recurrence:start
+    // Still a raw-handle callee: `modules/scheduling/recurrence.ts` moves behind
+    // the seam in PR 4.
+    run: async (ctx) => {
+      const { session, mailbox } = asSessionContext(ctx);
+      const { handleRecurrence } = await import('./modules/scheduling/recurrence.js');
+      await handleRecurrence(mailbox!.legacyInboundHandle(), session);
+    },
+    // MODULE-HOOK:scheduling-recurrence:end
+  });
+
+  registerSweepDuty({
+    name: id.S19,
+    phase: 'session:tail',
+    order: 30,
+    // 9. GC spent task sessions. An isolated per-task session with no live task
+    // rows left (one-shot fired, or all cancelled/deleted) and no container
+    // running is dead — close it so it stops being swept and listed. Runs after
+    // recurrence so a just-fired recurring series has already re-armed its next
+    // pending row and is never collected. The per-task log file in the workspace
+    // is the durable history and survives the close.
+    run: (ctx) => {
+      const { session, mailbox } = asSessionContext(ctx);
+      if (isTaskThread(session.thread_id)) {
+        const liveTasks = mailbox!.countLiveTasks();
+        if (shouldCloseTaskSession(session.thread_id, isContainerRunning(session.id), liveTasks)) {
+          updateSession(session.id, { status: 'closed' });
+          log.info('Closed spent task session', { sessionId: session.id, threadId: session.thread_id });
+        }
+      }
+    },
+  });
+
+  // ── tick:post-session — container state is now current ─────────────────────
+
+  registerSweepDuty({
+    name: id.T6,
+    phase: 'tick:post-session',
+    order: 10,
+    // MODULE-HOOK:orchestrator-dispatch:reconciler — complete
+    // admitted-but-incomplete tasks. Runs after per-session sweeps so container
+    // state is current. Deliberately unguarded, as it always was: it is the
+    // earliest call the tick's own wrapper is the guard for.
+    run: () => {
+      runReconcilerSweep();
+    },
+  });
+
+  registerSweepDuty({
+    name: id.T8,
+    phase: 'tick:post-session',
+    order: 20,
+    // Advance operator-confirmed thread closes: wait for the agent's wrap-up
+    // confirmation, then clear its saved work, stop the container and archive —
+    // in that order (src/dashboard/thread-close.ts). Central-DB scan of the few
+    // in-flight rows, once per tick, after the per-session loop so container
+    // state is current. Nothing here can START a close; only an operator can.
+    run: () => {
+      try {
+        advanceThreadClosures();
+      } catch (err) {
+        log.warn('thread-close sweep step failed', { err });
+      }
+    },
+  });
+
+  registerSweepDuty({
+    name: id.T18,
+    phase: 'tick:post-session',
+    order: 25,
+    // MODULE-HOOK:orchestrator-dispatch:watchdog — reap tasks that have exceeded
+    // their deadline, spawn window, no-progress timeout, or whose child
+    // container exited.
+    run: () => sweepTaskWatchdog(),
+  });
+
+  registerSweepDuty({
+    name: id.T13,
+    phase: 'tick:post-session',
+    order: 30,
+    // Reclaim disk from idle caches and Docker artifacts after per-session sweep
+    // work has had a chance to notice and wake due messages. Fire-and-forget
+    // into a persistent worker. The worker owns the expensive synchronous
+    // filesystem/Docker implementation and its cadence state; the host event
+    // loop stays available for channel heartbeats and inbound events.
+    run: (ctx) => {
+      startStorageMaintenanceOnce([...ctx.activeContainerSessionIds]);
+    },
+  });
+
+  registerSweepDuty({
+    name: id.T19,
+    phase: 'tick:post-session',
+    order: 40,
+    // Fleet-hardening Phase 0.1 (per-turn usage accounting): roll per-session
+    // turn_usage rows into the central usage_daily table for `ncl usage`. Reuses
+    // the same `sessions` list the per-session loop above already fetched — no
+    // extra DB query. Isolated so a rollup failure never blocks the rest of the
+    // tick. `pruneOldTurnUsage` is its companion, not a separate duty: fleet
+    // volume is ~300-600 turns/day, so trimming the ledger the rollup just fed
+    // is trivial per-tick cost.
+    run: async (ctx) => {
+      try {
+        await sweepUsageRollup(ctx.sessions);
+      } catch (err) {
+        log.warn('Usage rollup sweep step failed', { err });
+      }
+      pruneOldTurnUsage();
+    },
+  });
+
+  registerSweepDuty({
+    name: id.T22,
+    phase: 'tick:post-session',
+    order: 50,
+    // Incident 2026-09-01: a failed repository publication left 1401 session
+    // inbound DBs fenced (`repo_ingress_fence.state = 'active'`) with no
+    // publication left to release them. Every inbound row since was held with
+    // trigger=0 and every spawn refused, so the workgroup went silently deaf for
+    // hours. Nothing else in the host releases a fence whose publication is gone.
+    // Reuses the session list the per-session loop already loaded — no extra
+    // query — and throttles its own full pass internally.
+    run: async (ctx) => {
+      try {
+        await sweepOrphanedRepoIngressFences(ctx.sessions as Session[]);
+      } catch (err) {
+        log.warn('Orphaned repository fence sweep step failed', { err });
+      }
+    },
+  });
+
+  // ── tick:housekeeping — order-free central work ────────────────────────────
+
+  registerSweepDuty({
+    name: id.T5,
+    phase: 'tick:housekeeping',
+    order: 10,
+    // Finalize any "Reject with reason…" holds whose reply window elapsed (admin
+    // ghosted, or the host restarted mid-capture). Central-DB scan, once per
+    // tick — not per session.
+    // MODULE-HOOK:approvals-reason-sweep:start
+    run: async () => {
+      try {
+        const { sweepAwaitingReasonRejects } = await import('./modules/approvals/index.js');
+        await sweepAwaitingReasonRejects();
+      } catch (err) {
+        log.error('Reject-with-reason sweep failed', { err });
+      }
+    },
+    // MODULE-HOOK:approvals-reason-sweep:end
+  });
+
+  registerSweepDuty({
+    name: id.T7,
+    phase: 'tick:housekeeping',
+    order: 20,
+    // Proactively re-mint GitHub App installation tokens inside their refresh
+    // margin, so a container respawning mid-hour gets a fresh credential instead
+    // of one about to die (2026-08-23: an hour-old token flapped mid-session and
+    // stalled release-day work). Opportunistic — failures log and retry next tick.
+    run: async () => {
+      try {
+        const { refreshExpiringGitHubAppTokens } = await import('./github-app-token.js');
+        await refreshExpiringGitHubAppTokens();
+      } catch (err) {
+        log.warn('GitHub App token refresh sweep step failed', { err });
+      }
+    },
+  });
+
+  registerSweepDuty({
+    name: id.T9,
+    phase: 'tick:housekeeping',
+    order: 30,
+    // Prune steer_idempotency rows: applied rows older than 60s, pending rows
+    // older than 5min.
+    run: () => {
+      pruneSteerIdempotency();
+    },
+  });
+
+  registerSweepDuty({
+    name: id.T10,
+    phase: 'tick:housekeeping',
+    order: 40,
+    run: () => {
+      pruneChannelIngressReceipts();
+    },
+  });
+
+  registerSweepDuty({
+    name: id.T11,
+    phase: 'tick:housekeeping',
+    order: 50,
+    // MODULE-HOOK:scheduled-move-recovery — autonomous recovery of unresolved
+    // move intents. Additive (same pattern as the recurrence hook); touches only
+    // scheduled_audit (central) + the move's own session inbound rows — no
+    // firing-path change (C1).
+    run: () => {
+      try {
+        recoverMoveIntents(getDb(), {});
+      } catch (err) {
+        log.warn('scheduled-move-recovery: sweep hook failed', { err });
+      }
+    },
+  });
+
+  registerSweepDuty({
+    name: id.T12,
+    phase: 'tick:housekeeping',
+    order: 60,
+    // 90d audit-body prune, the companion of the move recovery above.
+    run: () => {
+      try {
+        pruneAuditBodies(getDb(), {});
+      } catch (err) {
+        log.warn('scheduled-move-recovery: sweep hook failed', { err });
+      }
+    },
+  });
+
+  registerSweepDuty({
+    name: id.T14,
+    phase: 'tick:housekeeping',
+    order: 70,
+    // Auto-archive completed tasks older than 24h so the "Done" lane stays
+    // representative of recent work; failed tasks are intentionally skipped.
+    run: () => {
+      autoArchiveOldCompleted();
+    },
+  });
+
+  registerSweepDuty({
+    name: id.T15,
+    phase: 'tick:housekeeping',
+    order: 80,
+    // Inbox: generate Haiku titles for sessions that don't have one (or whose
+    // existing title is ≥1h old AND has ≥10 new messages since).
+    // Concurrency-capped at 3 per tick — keeps the API spend bounded.
+    run: () => {
+      void import('./dashboard/session-title-sweep.js')
+        .then((mod) => mod.runSessionTitleSweep())
+        .catch((err) => log.warn('session-title sweep failed', { err }));
+    },
+  });
+
+  registerSweepDuty({
+    name: id.T16,
+    phase: 'tick:housekeeping',
+    order: 90,
+    // Retry Discord thread titles whose earlier attempts all failed (e.g. a 429
+    // window that outlasted callHaiku's own retry budget). Regenerates from the
+    // STORED, ORIGINAL first_message — never a later follow-up, which is the bug
+    // this table exists to fix. Capped at 3/tick (inside retryPendingThreadTitles)
+    // so a backlog of permanently-broken threads can't itself become a
+    // Haiku/Discord-REST quota hog. See src/topic-title.ts.
+    run: () => {
+      void import('./topic-title.js')
+        .then((mod) => mod.retryPendingThreadTitles())
+        .catch((err) => log.warn('thread-title retry sweep failed', { err }));
+    },
+  });
+
+  registerSweepDuty({
+    name: id.T20,
+    phase: 'tick:housekeeping',
+    order: 100,
+    // Claim reconciliation, then self-heal. Order is load-bearing: a claim whose
+    // pull request has merged must be CLOSED, not escalated at somebody — the
+    // reconcile pass deletes those files first, so the ladder below never sees
+    // them. Both are throttled internally to once per 10 minutes and each is
+    // isolated, so a GitHub outage cannot take the nudge ladder down with it.
+    run: async () => {
+      try {
+        await reconcileMergedClaims();
+      } catch (err) {
+        log.warn('Claims reconcile sweep step failed', { err });
+      }
+    },
+  });
+
+  registerSweepDuty({
+    name: id.T21,
+    phase: 'tick:housekeeping',
+    order: 110,
+    // Strictly after T20 — see the comment there.
+    run: async () => {
+      try {
+        await sweepClaimsSelfHeal();
+      } catch (err) {
+        log.warn('Claims self-heal sweep step failed', { err });
+      }
+    },
+  });
+
+  registerSweepDuty({
+    name: id.T17,
+    phase: 'tick:housekeeping',
+    order: 120,
+    // Prune dashboard_tokens rows past expiry + 1d grace (post-build QA fix SF-6).
+    run: () => {
+      void import('./dashboard/db/dashboard-tokens.js')
+        .then((mod) => mod.pruneDashboardTokens())
+        .catch(() => {
+          /* dashboard module may not be initialized in tests */
+        });
+    },
+  });
+
+  // ── SLA observation hooks — inside the SLA duty's own observe session ───────
+
+  registerSlaObservationHook({
+    name: id.S16,
+    order: 10,
+    // OOM / memory-pressure notice. SLA-only by construction: it is reached only
+    // when the exclusive chain falls through to the SLA branch, and it must see
+    // the same containerState snapshot the decision does.
+    run: (ctx, state, mailbox) => {
+      reportContainerOomTelemetry(mailbox, ctx.session, ctx.agentGroupFolder, state);
+    },
+  });
+
+  // ── Kill follow-ups — inside the session opened AFTER killContainer returns ─
+
+  registerSweepKillFollowUp({
+    name: id.S15,
+    order: 10,
+    // Posted AFTER the kill to honor the outbound.db single-writer invariant;
+    // the module opens the writable outbound handle lazily, only for this write.
+    // notifyKillCeiling itself gates on `pendingClaims === 0` (no user was
+    // waiting) to avoid spamming restart notices on quiet sessions that just
+    // naturally reached the 30-min idle ceiling. Ceiling kills only — the
+    // claim-stuck branch has never notified.
+    run: (ctx, outcome, mailbox) => {
+      if (outcome.action !== 'kill-ceiling') return;
+      const snapshot = ctx.killSnapshot!;
+      writeOutboundWhenStopped(ctx.session, mailbox, () =>
+        notifyKillCeiling(
+          mailbox,
+          ctx.session,
+          outcome.heartbeatAgeMs,
+          snapshot.pendingClaims,
+          snapshot.containerState,
+        ),
+      );
+    },
+  });
+
+  registerSweepKillFollowUp({
+    name: id.S17,
+    order: 20,
+    // The same orphan-claim reset the tail runs, here for the post-kill path.
+    // Both kill branches reset; only the reason differs.
+    run: (ctx, _outcome, mailbox) => {
+      writeOutboundWhenStopped(ctx.session, mailbox, () =>
+        resetStuckProcessingRows(mailbox, ctx.session, ctx.killSnapshot!.reason),
+      );
+    },
+  });
+
+  registerSweepKillFollowUp({
+    name: id.S10,
+    order: 30,
+    // Accountability wake: if the kill plausibly interrupted parked work, queue
+    // an on_wake row so the session respawns (next sweep tick's due-wake step)
+    // and answers for the interruption instead of staying dead until the next
+    // human ping. Best-effort — a failure here must not break the sweep's kill
+    // path. Ceiling kills only.
+    run: (ctx, outcome, mailbox) => {
+      if (outcome.action !== 'kill-ceiling') return;
+      const snapshot = ctx.killSnapshot!;
+      // INSIDE the guard, which is where upstream's single guarded block also
+      // leaves it. The row itself is inbound (host-owned, no single-writer
+      // hazard), but a replacement that took the session has already recovered
+      // from this kill: the row is `on_wake = 1`, so the live replacement never
+      // consumes it and it instead greets the NEXT fresh container with a stale
+      // "your previous container was killed" notice — while counting against
+      // that class's recovery-attempt cap. Skipping is correct, not merely safe.
+      writeOutboundWhenStopped(ctx.session, mailbox, () => {
+        try {
+          applyCeilingFollowUp(
+            mailbox,
+            ctx.session,
+            snapshot.containerState,
+            snapshot.workContinuation,
+            outcome.heartbeatAgeMs,
+            outcome.ceilingMs,
+          );
+        } catch (err) {
+          log.warn('ceiling-kill follow-up failed', { sessionId: ctx.session.id, err });
+        }
+      });
+    },
+  });
+}
+
+registerBuiltInSweepDuties();
