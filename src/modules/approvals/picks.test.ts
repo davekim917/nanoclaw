@@ -159,6 +159,36 @@ describe('pickApprovalDelivery', () => {
     expect(strictResult).toBeNull();
   });
 
+  it("resolves the approver's channel kind, not the raw id prefix (Teams `29:`)", async () => {
+    // Teams user ids carry a Bot Framework `29:` prefix, not `teams:`.
+    // Splitting the id on the first `:` reads `29`, which never equals a
+    // `teams` origin channel_type, so the only reachable owner was skipped
+    // before ensureUserDm was called — and with sameChannelTypeOnly the whole
+    // function returned null.
+    const { openDMCalls } = await mountMockAdapter('teams', async (h) => `dm-${h}`);
+    seedUser('29:aad-owner-guid', 'teams');
+
+    const result = await pickApprovalDelivery(['29:aad-owner-guid'], 'teams', {
+      sameChannelTypeOnly: true,
+    });
+
+    expect(result?.userId).toBe('29:aad-owner-guid');
+    expect(result?.messagingGroup.channel_type).toBe('teams');
+    // parseUserId hands the FULL id to openDM for this shape — the `29:` is
+    // part of the handle, not a namespace to strip.
+    expect(openDMCalls).toEqual(['29:aad-owner-guid']);
+  });
+
+  it('keeps a prefix-shaped approver off a foreign origin under sameChannelTypeOnly', async () => {
+    // The kind fallback must not become "any registered user matches any
+    // origin": a telegram approver stays unreachable from a teams origin.
+    await mountMockAdapter('teams', async (h) => `dm-${h}`);
+    await mountMockAdapter('telegram');
+    seedUser('telegram:111', 'telegram');
+
+    expect(await pickApprovalDelivery(['telegram:111'], 'teams', { sameChannelTypeOnly: true })).toBeNull();
+  });
+
   it('sameChannelTypeOnly=true: still returns in-workspace approver when one exists', async () => {
     await mountMockAdapter('discord', async (h) => `dm-${h}`);
     await mountMockAdapter('telegram');

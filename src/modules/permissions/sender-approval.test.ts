@@ -40,7 +40,12 @@ vi.mock('../../delivery.js', () => ({
 
 // Mock ensureUserDm to return the approver's existing messaging group
 // instead of hitting a real openDM RPC.
-vi.mock('./user-dm.js', () => ({
+// importOriginal, not a bare factory: only `ensureUserDm` needs stubbing
+// (these tests pre-seed user_dms and must not hit a platform openDM).
+// `resolveUserChannelType` stays real so the approver-reachability check
+// under test is the shipped one.
+vi.mock('./user-dm.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./user-dm.js')>()),
   ensureUserDm: vi.fn(async (userId: string) => {
     const { getDb } = await import('../../db/connection.js');
     const row = getDb()
