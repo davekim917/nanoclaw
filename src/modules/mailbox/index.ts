@@ -70,11 +70,45 @@ import {
   getLatestRoutedTaskRow,
   getLatestTaskContent,
   getRecentInboundChatSenders,
+  hasRestartNoteSince,
   type ChannelDestination,
   type InboundChatSenderRow,
   type InboundRoutingAnchor,
   type RoutedTaskRow,
 } from './ops/lookups.js';
+import {
+  armNextTask,
+  cancelSeriesWithStrandClear,
+  getCompletedRecurring,
+  insertRecurrence,
+  insertTaskRow,
+  listDueTaskRows,
+  resolvePendingTask,
+  restoreTaskRow,
+  resumeTask,
+  setPendingTaskContent,
+  updateTask,
+  upsertTaskSeries,
+  type HostGatedTaskRow,
+  type RecurringMessage as ForkRecurringMessage,
+  type TaskRowInsert,
+  type TaskRowSnapshot,
+  type TaskUpdate as ForkTaskUpdate,
+} from './ops/tasks.js';
+import {
+  hasMatchingBootstrapRecall,
+  listOpenChatContents,
+  listRecentRecallRows,
+  readProviderRecallState,
+  type ProviderRecallState,
+} from './ops/recall.js';
+import {
+  clearWorkContinuation,
+  readContinuationPresence,
+  readDoneProposal,
+  type ContinuationPresence,
+  type DoneProposal,
+} from './ops/session-state.js';
 import {
   countDueMessages,
   expireStalePending,
@@ -118,11 +152,52 @@ export { SessionDbMissingError, SessionDbUnopenableError } from './openers.js';
 export { parseSqliteUtc } from './sqlite-utc.js';
 export {
   canAttemptContinuationRecovery,
+  readWorkContinuation,
   WORK_CONTINUATION_RESUME_MAX_ATTEMPTS,
+  WORK_CONTINUATION_TASK_MAX_CHARS,
   type HostWorkContinuation,
 } from './ops/continuation.js';
 export type { DirectOutboundRow, InboundMessageRouting } from './ops/recovery.js';
 export { INTERACTIVE_WAKE_MAX_AGE_MS, type ContainerState as ForkContainerStateRow } from './ops/sweep.js';
+export { readRepoIngressFence } from './ops/fence.js';
+export {
+  hasMatchingBootstrapRecall,
+  listOpenChatContents,
+  listRecentRecallRows,
+  readProviderRecallState,
+  type ProviderRecallState,
+} from './ops/recall.js';
+export { nextEvenSeq, type DestinationRow, type MessageInsert } from './ops/ingress.js';
+export {
+  cancelAllTasks,
+  cancelTask,
+  clearRecurrence,
+  deleteTask,
+  pauseTask,
+  trailingFailedRuns,
+} from '../../mailbox/sqlite/tasks.js';
+export {
+  cancelSeriesWithStrandClear,
+  getCompletedRecurring,
+  insertRecurrence,
+  insertTaskRow,
+  restoreTaskRow,
+  resumeTask,
+  updateTask,
+  type HostGatedTaskRow,
+  type RecurringMessage,
+  type TaskRowInsert,
+  type TaskRowSnapshot,
+  type TaskUpdate,
+} from './ops/tasks.js';
+export {
+  CLOSE_REASON_MAX_CHARS,
+  clearWorkContinuation,
+  readContinuationPresence,
+  readDoneProposal,
+  type ContinuationPresence,
+  type DoneProposal,
+} from './ops/session-state.js';
 
 /**
  * The session directory layout, for callers that only need a PATH.
@@ -254,6 +329,67 @@ export interface NanoclawMailboxSession extends MailboxSession {
   syncProcessingAcks(): void;
   /** Raw snake_case claim rows; upstream's `getProcessingClaims` returns the record shape. */
   getProcessingClaimRows(): ProcessingClaim[];
+
+  // --- fork-only tasks ----------------------------------------------------
+  // Upstream's task ops on `MailboxSession` are reused wherever the statement
+  // matches (`cancelTask`, `pauseTask`, `deleteTask`, `clearRecurrence`,
+  // `trailingFailedRuns`, `listLiveTasks`, `getTask`, `getTaskStats`,
+  // `countLiveTasks`, `findTaskBySeriesSlug`); only the ops below differ.
+  /** Fork insert: routing columns, and `trigger = 0` so the row lands inert. */
+  insertTaskRow(row: TaskRowInsert): void;
+  /** Fork resume: also drops the stale recall pair and re-seqs the occurrence. */
+  resumeTask(taskId: string): number;
+  /** Fork update: script/threadAnchor/quietStatus/flagIntent/chatLimit + recall invalidation. */
+  updateTask(taskId: string, update: ForkTaskUpdate): number;
+  /** Fork shape: includes 'expired' and carries the routing columns forward. */
+  getCompletedRecurringRows(): ForkRecurringMessage[];
+  insertRecurrence(
+    msg: ForkRecurringMessage,
+    newId: string,
+    nextRun: string | null,
+    status?: 'pending' | 'paused',
+  ): void;
+  /**
+   * Upstream's `armNextTask` under a fork name: same one-transaction guarantee,
+   * fork insert semantics. Renamed rather than overridden because the fork's
+   * clone needs the whole source row, which upstream's two-argument shape
+   * cannot carry.
+   */
+  armNextRecurrence(
+    originalId: string,
+    msg: ForkRecurringMessage,
+    newId: string,
+    nextRun: string | null,
+    status?: 'pending' | 'paused',
+  ): void;
+  restoreTaskRow(snapshot: TaskRowSnapshot): void;
+  cancelSeriesWithStrandClear(taskId: string): number;
+  upsertTaskSeries(row: {
+    id: string;
+    seriesId: string;
+    processAfter: string;
+    recurrence: string;
+    content: string;
+    platformId: string | null;
+    channelType: string | null;
+    threadId: string | null;
+  }): void;
+  listDueTaskRows(): HostGatedTaskRow[];
+  resolvePendingTask(taskId: string, status: 'completed' | 'failed'): void;
+  setPendingTaskContent(taskId: string, content: string): void;
+
+  // --- fork-only recall pairing -------------------------------------------
+  readProviderRecallState(provider: string): ProviderRecallState;
+  listOpenChatContents(): Array<{ content: string }>;
+  listRecentRecallRows(limit: number): Array<{ id: string; status: string; content: string }>;
+  hasMatchingBootstrapRecall(excludeRecallId: string | null, provider: string, contextEpoch: number): boolean;
+
+  // --- fork-only container session state ----------------------------------
+  readContinuationPresence(): ContinuationPresence | null;
+  /** Opens outbound.db read-write. The only host write to a container-owned key. */
+  clearWorkContinuation(): ContinuationPresence | null;
+  readDoneProposal(): DoneProposal | null;
+  hasRestartNoteSince(since: string): boolean;
 
   // --- fork-only repository fence ----------------------------------------
   readRepoIngressFence(): RepoIngressFence | null;
@@ -471,12 +607,13 @@ export function composeNanoclawSession(
 /**
  * The fork's ops, bound to the handles open for this session.
  *
- * Both outbound accessors are threaded in and both are lazy: an action that
- * only reads never opens the writable handle, so the host keeps its
- * read-only-by-default posture on the container-owned file. The writable one
- * is used by the two host-side writers that already existed — the direct
- * outbound notice and the work-continuation recovery admission — both of
- * which only run with the container confirmed stopped.
+ * Both outbound accessors are threaded in and both are lazy: a session that
+ * never touches outbound.db opens no handle, and one that only reads it never
+ * opens the writer. The writable one serves the three host-side writers that
+ * already existed — the direct outbound notice, the work-continuation recovery
+ * admission, and the thread-close path force-clearing a container-owned
+ * continuation (`clearWorkContinuation`) — every one of which runs only with
+ * the container confirmed stopped.
  */
 function forkOps(
   inbound: Database.Database,
@@ -486,7 +623,14 @@ function forkOps(
 ): Omit<NanoclawMailboxSession, keyof MailboxSession> &
   Pick<
     NanoclawMailboxSession,
-    'setRouting' | 'countDueMessages' | 'markDelivered' | 'markDeliveryFailed' | 'getContainerState' | 'insertMessage'
+    | 'setRouting'
+    | 'countDueMessages'
+    | 'markDelivered'
+    | 'markDeliveryFailed'
+    | 'getContainerState'
+    | 'insertMessage'
+    | 'resumeTask'
+    | 'updateTask'
   > {
   /**
    * Run an outbound READ, or answer `empty` when this session has no
@@ -554,6 +698,31 @@ function forkOps(
     getDueWakePriority: () => getDueWakePriority(inbound),
     syncProcessingAcks: () => readOutbound(undefined, (outbound) => syncProcessingAcks(inbound, outbound)),
     getProcessingClaimRows: () => readOutbound([], getProcessingClaims),
+
+    insertTaskRow: (row) => insertTaskRow(inbound, row),
+    resumeTask: (taskId) => resumeTask(inbound, taskId),
+    updateTask: (taskId, update) => updateTask(inbound, taskId, update),
+    getCompletedRecurringRows: () => getCompletedRecurring(inbound),
+    insertRecurrence: (msg, newId, nextRun, status) => insertRecurrence(inbound, msg, newId, nextRun, status),
+    armNextRecurrence: (originalId, msg, newId, nextRun, status) =>
+      armNextTask(inbound, originalId, msg, newId, nextRun, status),
+    restoreTaskRow: (snapshot) => restoreTaskRow(inbound, snapshot),
+    cancelSeriesWithStrandClear: (taskId) => cancelSeriesWithStrandClear(inbound, taskId),
+    upsertTaskSeries: (row) => upsertTaskSeries(inbound, row),
+    listDueTaskRows: () => listDueTaskRows(inbound),
+    resolvePendingTask: (taskId, status) => resolvePendingTask(inbound, taskId, status),
+    setPendingTaskContent: (taskId, content) => setPendingTaskContent(inbound, taskId, content),
+
+    readProviderRecallState: (provider) => readProviderRecallState(readableOutbound(), provider),
+    listOpenChatContents: () => listOpenChatContents(inbound),
+    listRecentRecallRows: (limit) => listRecentRecallRows(inbound, limit),
+    hasMatchingBootstrapRecall: (excludeRecallId, provider, contextEpoch) =>
+      hasMatchingBootstrapRecall(inbound, excludeRecallId, provider, contextEpoch),
+
+    readContinuationPresence: () => readContinuationPresence(readableOutbound()),
+    clearWorkContinuation: () => clearWorkContinuation(writableOutbound()),
+    readDoneProposal: () => readDoneProposal(readableOutbound()),
+    hasRestartNoteSince: (since) => hasRestartNoteSince(inbound, since),
 
     readRepoIngressFence: () => readRepoIngressFence(inbound),
     activateRepoIngressFence: (epoch) => activateRepoIngressFence(inbound, epoch),

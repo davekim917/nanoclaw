@@ -124,3 +124,23 @@ export function getInboundRoutingAnchor(db: Database.Database, messageId: string
       .get(messageId) as InboundRoutingAnchor | undefined) ?? null
   );
 }
+
+/**
+ * True when this session already carries a host-restart accountability note
+ * timestamped at or after `since`.
+ *
+ * The dedupe window is the caller's (`host-restart-warn.ts`); the id prefix is
+ * the note's identity, so the predicate belongs to the row shape rather than
+ * to the caller.
+ */
+export function hasRestartNoteSince(db: Database.Database, since: string): boolean {
+  return (
+    db
+      .prepare(
+        `SELECT 1 FROM messages_in
+          WHERE id LIKE 'host-restart-%' AND datetime(timestamp) >= datetime(?)
+          LIMIT 1`,
+      )
+      .get(since) !== undefined
+  );
+}

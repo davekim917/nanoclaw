@@ -1265,7 +1265,7 @@ describe('writeSessionRouting', () => {
     });
 
     const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
-    writeSessionRouting('ag-1', session.id);
+    await writeSessionRouting('ag-1', session.id);
 
     const db = new Database(inboundDbPath('ag-1', session.id));
     const row = db.prepare('SELECT channel_type, platform_id, thread_id FROM session_routing WHERE id = 1').get() as
@@ -1293,7 +1293,7 @@ describe('writeSessionRouting', () => {
     });
 
     const { session } = resolveSession('ag-1', null, null, 'agent-shared');
-    writeSessionRouting('ag-1', session.id);
+    await writeSessionRouting('ag-1', session.id);
 
     const db = new Database(inboundDbPath('ag-1', session.id));
     const row = db.prepare('SELECT channel_type, platform_id, thread_id FROM session_routing WHERE id = 1').get() as
@@ -1330,7 +1330,7 @@ describe('writeSessionRouting', () => {
     });
 
     const { session } = resolveSession('ag-1', 'mg-1', 'thread-77', 'per-thread');
-    writeSessionRouting('ag-1', session.id);
+    await writeSessionRouting('ag-1', session.id);
 
     const db = new Database(inboundDbPath('ag-1', session.id));
     const row = db.prepare('SELECT channel_type, platform_id, thread_id FROM session_routing WHERE id = 1').get() as
@@ -1367,7 +1367,7 @@ describe('writeSessionRouting', () => {
     });
 
     const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
-    writeSessionRouting('ag-1', session.id);
+    await writeSessionRouting('ag-1', session.id);
 
     const db = new Database(inboundDbPath('ag-1', session.id));
     const row = db.prepare('SELECT session_id FROM session_routing WHERE id = 1').get() as
@@ -1607,7 +1607,7 @@ describe('agent-to-agent routing', () => {
     const researcherSessions = getSessionsByAgentGroup('ag-researcher');
     expect(researcherSessions).toHaveLength(1);
 
-    writeSessionRouting('ag-researcher', researcherSessions[0].id);
+    await writeSessionRouting('ag-researcher', researcherSessions[0].id);
 
     const rDb = new Database(inboundDbPath('ag-researcher', researcherSessions[0].id));
     const routing = rDb.prepare('SELECT channel_type, platform_id FROM session_routing WHERE id = 1').get() as

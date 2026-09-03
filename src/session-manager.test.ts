@@ -55,6 +55,7 @@ import {
   sessionContextPathFor,
   sessionDir,
   sessionMessageExists,
+  withMailboxSession,
   writeOutboundDirect,
   writeSessionMessage,
   writeSessionMessageIfNew,
@@ -310,7 +311,7 @@ describe('writeSessionMessage re-provisions a deleted session folder', () => {
   it('treats a missing inbound DB as unseen without creating it', async () => {
     fs.rmSync(sessionDir(AG, SESS), { recursive: true, force: true });
 
-    expect(sessionMessageExists(AG, SESS, 'next-platform-message')).toBe(false);
+    expect(await sessionMessageExists(AG, SESS, 'next-platform-message')).toBe(false);
     expect(fs.existsSync(sessionDir(AG, SESS))).toBe(false);
   });
 
@@ -2191,5 +2192,100 @@ describe('runner session context path', () => {
     // stops removing context files and each reclaimed session leaks one.
     expect(sessionContextPathFor(sessionDir('ag-ctx', 'sess-ctx'))).toBe(sessionContextPath('ag-ctx', 'sess-ctx'));
     expect(sessionContextPath('ag-ctx', 'sess-ctx').endsWith('/ag-ctx/.context/sess-ctx.json')).toBe(true);
+  });
+});
+
+/**
+ * PR 4 (mailbox seam, ingress family): `writeSessionMessage` writes through
+ * `withMailboxSession`, so the mailbox's `prepare()` is now the provisioning
+ * path AND the same-key nesting guard is live on the host's busiest write.
+ */
+describe('mailbox seam: ingress writes', () => {
+  const AG_ING = 'ag-ingress';
+  const SESS_ING = 'sess-ingress';
+
+  const ingressMessage = (id: string) => ({
+    id,
+    kind: 'chat' as const,
+    timestamp: new Date().toISOString(),
+    platformId: 'slack:C1',
+    channelType: 'slack' as const,
+    threadId: null,
+    content: JSON.stringify({ text: 'through the seam' }),
+  });
+
+  beforeEach(() => {
+    fs.rmSync(sessionDir(AG_ING, SESS_ING), { recursive: true, force: true });
+    const db = initTestDb();
+    runMigrations(db);
+    createAgentGroup({
+      id: AG_ING,
+      name: 'Ingress',
+      folder: 'ingress',
+      agent_provider: null,
+      created_at: new Date().toISOString(),
+    });
+    for (const id of [SESS_ING, 'sess-ingress-other']) {
+      createSession({
+        id,
+        agent_group_id: AG_ING,
+        messaging_group_id: null,
+        thread_id: id === SESS_ING ? null : 'slack:C1:other',
+        agent_provider: null,
+        status: 'active',
+        container_status: 'stopped',
+        last_active: null,
+        created_at: new Date().toISOString(),
+      });
+    }
+  });
+
+  afterEach(() => {
+    fs.rmSync(sessionDir(AG_ING, SESS_ING), { recursive: true, force: true });
+    fs.rmSync(sessionDir(AG_ING, 'sess-ingress-other'), { recursive: true, force: true });
+    closeDb();
+  });
+
+  it('writeSessionMessage provisions through prepare() and never nests a same-key session', async () => {
+    // (1) Provisioning. Nothing on disk for this session yet — the write itself
+    // has to create the mailbox, which is `prepare()`'s job now that the raw
+    // `initSessionFolder` open is gone from the write path.
+    expect(fs.existsSync(inboundDbPath(AG_ING, SESS_ING))).toBe(false);
+    await writeSessionMessage(AG_ING, SESS_ING, ingressMessage('provisioned'));
+    expect(fs.existsSync(inboundDbPath(AG_ING, SESS_ING))).toBe(true);
+    expect(fs.existsSync(outboundDbPath(AG_ING, SESS_ING))).toBe(true);
+    const written = new Database(inboundDbPath(AG_ING, SESS_ING), { readonly: true });
+    try {
+      expect(
+        (written.prepare("SELECT id FROM messages_in WHERE id NOT LIKE 'recall-%'").all() as { id: string }[]).map(
+          (r) => r.id,
+        ),
+      ).toEqual(['provisioned']);
+    } finally {
+      written.close();
+    }
+
+    // (2) The nesting guard. Calling the writer from inside an open session on
+    // the SAME key must reject — a serialized implementation would deadlock
+    // there (invariant I-3). This is the case that would only have shown up in
+    // production before the guard existed.
+    await expect(
+      withMailboxSession(AG_ING, SESS_ING, async () => {
+        await writeSessionMessage(AG_ING, SESS_ING, ingressMessage('nested'));
+      }),
+    ).rejects.toThrow(/Nested mailbox session/);
+
+    // (3) A different key from inside an open session is fine, and the refused
+    // nested write left nothing behind.
+    await withMailboxSession(AG_ING, SESS_ING, async () => {
+      await writeSessionMessage(AG_ING, 'sess-ingress-other', ingressMessage('sibling'));
+    });
+    const after = new Database(inboundDbPath(AG_ING, SESS_ING), { readonly: true });
+    try {
+      expect(after.prepare('SELECT 1 FROM messages_in WHERE id = ?').get('nested')).toBeUndefined();
+    } finally {
+      after.close();
+    }
+    fs.rmSync(sessionDir(AG_ING, 'sess-ingress-other'), { recursive: true, force: true });
   });
 });
