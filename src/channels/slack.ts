@@ -372,6 +372,44 @@ export function parseSlackWorkspaces(env: Record<string, string>): SlackWorkspac
   return workspaces;
 }
 
+/**
+ * Workspace suffixes that have a bot token but no signing secret — configured
+ * but not yet usable.
+ *
+ * They cannot produce a live adapter, but their channelType is already known,
+ * and `getChannelDefaults` resolves through the REGISTRY when no adapter is
+ * live (tier 3, "factories that returned null for missing creds"). Registering
+ * a declaration-only entry for them is what stops `ncl`/setup from stamping
+ * the legacy `strict` schema default on a messaging group created during the
+ * window between the two paste steps — a creation-time value that would
+ * survive the credentials being completed.
+ *
+ * Exported for testing. Same suffix→channelType derivation as
+ * parseSlackWorkspaces, deliberately duplicated rather than folded into it:
+ * that function's contract is "workspaces that can serve traffic", and callers
+ * (the bridge factory loop) depend on that.
+ */
+export function incompleteSlackWorkspaceTypes(env: Record<string, string>): string[] {
+  const bySuffix = new Map<string, { botToken?: string; signingSecret?: string }>();
+  for (const [key, value] of Object.entries(env)) {
+    const m = key.match(/^SLACK_(BOT_TOKEN|SIGNING_SECRET)(?:_([A-Za-z0-9_]+))?$/);
+    if (!m) continue;
+    const [, kind, rawSuffix] = m;
+    const suffix = rawSuffix ? rawSuffix.toLowerCase().replace(/_/g, '-') : '';
+    const entry = bySuffix.get(suffix) ?? {};
+    if (kind === 'BOT_TOKEN') entry.botToken = value;
+    else entry.signingSecret = value;
+    bySuffix.set(suffix, entry);
+  }
+
+  const types: string[] = [];
+  for (const [suffix, pair] of bySuffix) {
+    if (!pair.botToken || pair.signingSecret) continue;
+    types.push(suffix ? `slack-${suffix}` : 'slack');
+  }
+  return types;
+}
+
 /** Minimal interface for the Slack chat.postMessage client — narrow surface for testing. */
 export interface SlackPostMessageClient {
   chat: {
@@ -431,7 +469,16 @@ export async function slackCreateThread(
 // parseSlackWorkspaces — both must allow `_` in the suffix, otherwise
 // env vars like SLACK_BOT_TOKEN_EXAMPLE_LABS_CODEX get dropped here before
 // they ever reach the parser.
-const workspaces = parseSlackWorkspaces(readEnvFileMatching(/^SLACK_(BOT_TOKEN|SIGNING_SECRET)(_[A-Za-z0-9_]+)?$/));
+const slackEnv = readEnvFileMatching(/^SLACK_(BOT_TOKEN|SIGNING_SECRET)(_[A-Za-z0-9_]+)?$/);
+const workspaces = parseSlackWorkspaces(slackEnv);
+
+// A half-configured workspace still gets its declaration into the registry, so
+// a messaging group created before the signing secret is pasted is not stamped
+// with the legacy `strict` schema default forever. The factory returns null —
+// initChannelAdapters logs the missing credentials and moves on.
+for (const channelType of incompleteSlackWorkspaceTypes(slackEnv)) {
+  registerChannelAdapter(channelType, { defaults: SLACK_DEFAULTS, factory: () => null });
+}
 
 for (const ws of workspaces) {
   registerChannelAdapter(ws.channelType, {

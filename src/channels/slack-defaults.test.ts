@@ -85,6 +85,50 @@ describe('Slack adapter registration declares channel defaults', () => {
   });
 });
 
+describe('Half-configured workspaces still resolve the declaration', () => {
+  it('registers the declaration when the signing secret has not been pasted yet', async () => {
+    const { registry, defaults } = await loadWithWorkspaces({
+      SLACK_BOT_TOKEN_EXAMPLE_LABS: 'xoxb-labs',
+    });
+
+    // No live adapter can exist, but the creation-time value must not be the
+    // legacy `strict` schema default — that would survive the credentials
+    // being completed.
+    expect(registry.hasDeclaredChannelDefaults('slack-example-labs')).toBe(true);
+    expect(defaults.resolveUnknownSenderPolicy('slack-example-labs', true)).toBe('public');
+    expect(defaults.resolveUnknownSenderPolicy('slack-example-labs', false)).toBe('request_approval');
+  });
+
+  it('yields no adapter for the half-configured instance', async () => {
+    const { registry, slack } = await loadWithWorkspaces({ SLACK_BOT_TOKEN: 'xoxb-primary' });
+    expect(slack.incompleteSlackWorkspaceTypes({ SLACK_BOT_TOKEN: 'xoxb-primary' })).toEqual(['slack']);
+    await registry.initChannelAdapters(
+      () =>
+        ({
+          onInbound: async () => {},
+          onInboundEvent: async () => {},
+          onMetadata: () => {},
+          onAction: () => {},
+        }) as never,
+    );
+    expect(registry.getChannelAdapterExact('slack')).toBeUndefined();
+    // The declaration is still resolvable through the registration.
+    expect(registry.hasDeclaredChannelDefaults('slack')).toBe(true);
+  });
+
+  it('classifies a complete workspace as complete, and mixed env correctly', async () => {
+    const { slack } = await loadWithWorkspaces(PRIMARY);
+    expect(
+      slack.incompleteSlackWorkspaceTypes({
+        ...PRIMARY,
+        SLACK_BOT_TOKEN_EXAMPLE_LABS: 'xoxb-labs',
+        SLACK_SIGNING_SECRET_ORPHAN: 'sec-only',
+      }),
+    ).toEqual(['slack-example-labs']);
+    expect(slack.incompleteSlackWorkspaceTypes(PRIMARY)).toEqual([]);
+  });
+});
+
 describe('Slack defaults do not flip existing live wirings', () => {
   /**
    * `threads` is the only declared value re-read on every routed message
