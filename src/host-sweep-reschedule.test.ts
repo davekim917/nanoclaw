@@ -46,6 +46,9 @@ describe('host sweep reschedule', () => {
     vi.useRealTimers();
   });
 
+  // Seam-2 R-8: carried unchanged, now driven through the duty registry —
+  // `runReconcilerSweep` is the `orchestrator-reconciler` duty's whole body and
+  // is still deliberately unguarded, so its throw still reaches this wrapper.
   it('re-arms the timer even when the tick body throws', async () => {
     mockRunReconcilerSweep.mockImplementation(() => {
       throw new Error('boom');
