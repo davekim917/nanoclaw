@@ -89,13 +89,32 @@ describe('buildSystemPromptAddendum — multi-destination routing guidance', () 
 
     const prompt = buildSystemPromptAddendum('Casa', { kind: 'task', taskId: 'weekly-report' });
 
-    expect(prompt).toContain('default to your own channel destination(s): `casa`');
+    // The task row carries exactly one routing stamp and the formatter renders
+    // it as `<task from="name">`. That single origin is the default, NOT the
+    // channel list — an agent wired to several channels would otherwise have
+    // several equally-endorsed recipients and only one of them is right.
+    expect(prompt).toContain('send to the destination named in this task\'s `<task from="name">` attribute');
     expect(prompt).toContain('`codex-sibling` is an agent-type destination');
     expect(prompt).toContain('never as your default escalation path');
     // The fork's conversation-locality policy holds in task mode too: the
     // chat branch's `to="here"` wording does not apply here, so the task
     // branch has to say it in its own terms.
     expect(prompt).toContain('Keep the whole run in one place');
+  });
+
+  it('offers the channel list only as the unrouted fallback, never as the default', () => {
+    seedDestination('casa', 'Casa', 'whatsapp', 'group1@fixture6.example.com');
+    seedDestination('ops', 'Ops', 'slack', 'C0OPS');
+
+    const prompt = buildSystemPromptAddendum('Casa', { kind: 'task', taskId: 'weekly-report' });
+
+    // Both channels are named, but explicitly behind "if the task carries no
+    // `from`" — a multi-channel agent must not read the list as a menu of
+    // equally correct places to escalate to.
+    expect(prompt).toContain(
+      'If the task carries no `from` (an unrouted task), fall back to a channel destination of your own: `casa`, `ops`.',
+    );
+    expect(prompt).not.toContain('default to your own channel destination(s)');
   });
 
   it('names every agent destination, plural, rather than a hardcoded example', () => {
@@ -116,7 +135,8 @@ describe('buildSystemPromptAddendum — multi-destination routing guidance', () 
     // An agent destination alone is not an escalation path, and inventing one
     // would be worse than the generic instruction it already gets.
     expect(prompt).toContain('Always pass the explicit named destination.');
-    expect(prompt).not.toContain('default to your own channel destination(s)');
+    expect(prompt).not.toContain('<task from="name">');
+    expect(prompt).not.toContain('fall back to a channel destination of your own');
     expect(prompt).not.toContain('Keep the whole run in one place');
   });
 
@@ -126,7 +146,7 @@ describe('buildSystemPromptAddendum — multi-destination routing guidance', () 
 
     const prompt = buildSystemPromptAddendum('Casa');
 
-    expect(prompt).not.toContain('default to your own channel destination(s)');
+    expect(prompt).not.toContain('<task from="name">');
     expect(prompt).not.toContain('agent-type destination');
     expect(prompt).toContain('Keep the WHOLE conversation in the place it started');
   });

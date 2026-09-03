@@ -279,22 +279,30 @@ function buildDestinationsSection(mode: SessionMode): string {
     // human's channel. Left to itself it escalates INTO another agent, which
     // reads as delivery but reaches no person: the sibling gets a message it
     // was never asked to act on, and the operator waiting on the answer sees
-    // nothing. Name the channels explicitly as the default, and say plainly
-    // what an agent destination is for.
+    // nothing. Point at the task's own routed origin, and say plainly what an
+    // agent destination is for.
     const channelDestinations = all.filter((destination) => destination.type === 'channel');
     const agentDestinations = all.filter((destination) => destination.type === 'agent');
     if (channelDestinations.length > 0) {
       const channelNames = channelDestinations.map((destination) => `\`${destination.name}\``).join(', ');
+      // The task row carries ONE routing stamp, and the formatter already
+      // renders it as the `<task from="name">` attribute. Point at that rather
+      // than at the channel list: an agent wired to several channels has
+      // several plausible-looking recipients here, and only one of them is the
+      // conversation this task was created in. The list is the fallback for an
+      // unrouted task, which genuinely has no origin to prefer.
       lines.push(
         '',
-        `For user-visible escalation — a blocker, a question you need answered, anything a person has to act on — default to your own channel destination(s): ${channelNames}. That is the operator's actual conversation with you.`,
+        `For user-visible escalation — a blocker, a question you need answered, anything a person has to act on — send to the destination named in this task's \`<task from="name">\` attribute. That is the conversation the task was created in, and where whoever scheduled it is watching.`,
+        '',
+        `If the task carries no \`from\` (an unrouted task), fall back to a channel destination of your own: ${channelNames}.`,
       );
       // Same policy the chat branch states below: one run, one place. A task
       // that posts interim notes to a channel and its result to a DM has split
       // the record in half, and neither half is the whole answer.
       lines.push(
         '',
-        'Keep the whole run in one place. Interim notes and the final escalation go to the SAME destination — do not report progress in one channel and the outcome in someone\'s DM.',
+        "Keep the whole run in one place. Interim notes and the final escalation go to the SAME destination — do not report progress in one channel and the outcome in someone's DM.",
       );
       if (agentDestinations.length > 0) {
         const agentNames = agentDestinations.map((destination) => `\`${destination.name}\``).join(', ');
