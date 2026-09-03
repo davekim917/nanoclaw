@@ -242,23 +242,21 @@ describe('the child_process tripwire bites when a seam mock is removed', () => {
   });
 });
 
-// ── F-12.1 (the 3 ported cases) ──────────────────────────────────────────────
+// ── F-12.1 ───────────────────────────────────────────────────────────────────
+// Exact it() title per plan.md §8 (series rule added 2026-09-03: every case
+// must exist under its verbatim title, not folded into an aggregate describe
+// name — see src/modules/sweep-claims/claims.test.ts's F-6.1 for precedent).
 
-describe('shouldSkipUsageRollup keeps its mtime gate', () => {
-  it('skips when the cached mtime matches the current outbound.db mtime (unchanged since last rollup)', () => {
-    expect(shouldSkipUsageRollup(1000, 1000)).toBe(true);
-  });
-
-  it('does not skip when the outbound.db mtime moved (new turn_usage rows written)', () => {
-    expect(shouldSkipUsageRollup(1000, 2000)).toBe(false);
-  });
-
-  it('does not skip a session never seen before (no cache entry)', () => {
-    expect(shouldSkipUsageRollup(undefined, 1000)).toBe(false);
+describe('F-12.1', () => {
+  it('shouldSkipUsageRollup keeps its mtime gate', () => {
+    // The 3 ported cases.
+    expect(shouldSkipUsageRollup(1000, 1000)).toBe(true); // unchanged since last rollup
+    expect(shouldSkipUsageRollup(1000, 2000)).toBe(false); // outbound.db mtime moved
+    expect(shouldSkipUsageRollup(undefined, 1000)).toBe(false); // never seen before, no cache entry
   });
 });
 
-// ── F-12.3 + registry acceptance: the registered duty, not the raw body ─────
+// ── registered usage-rollup duty (T19): F-12.2, F-12.3 + supporting cases ────
 
 describe('registered usage-rollup duty (T19)', () => {
   beforeEach(() => {
@@ -288,7 +286,7 @@ describe('registered usage-rollup duty (T19)', () => {
     expect(h.spawns).toEqual([]);
   });
 
-  it('F-12.3: reuses the tick sessions list — no extra getActiveSessions call, one open per changed session', async () => {
+  it("the rollup reuses the tick's session list and opens only changed sessions", async () => {
     // Three sessions in ctx.sessions (the SAME array T3 already built this
     // tick — a sentinel, not re-derived): one has no outbound.db yet, one's
     // outbound.db mtime matches the cache (unchanged), one is new/changed.
@@ -336,106 +334,78 @@ describe('registered usage-rollup duty (T19)', () => {
     warnSpy.mockRestore();
     expect(h.spawns).toEqual([]);
   });
-});
 
-// ── F-12.2 ───────────────────────────────────────────────────────────────────
-//
-// BUILDER NOTE (flagged to the orchestrator, unresolved as of this commit):
-// plan.md's F-12.2 text reads "inbound gone while outbound remains → the
-// session resolves undefined, the rollup does not run, the cache is
-// unchanged and the session is retried next tick; a real rollup updates the
-// cache." Taken as one flow, that contradicts constraint 21 and this very
-// duty's own source comment (src/modules/sweep-usage/index.ts), which exist
-// SPECIFICALLY so a session whose inbound.db is gone while outbound.db
-// remains keeps being rolled up — verified against mailbox PR 6's actual
-// diff (host-sweep.ts merge sha 47b71dcf): the sweep call was NOT changed to
-// route through `withExistingNanoclawSession` (which is what "the session
-// resolves undefined" would describe — that accessor's existence check is
-// keyed on inbound.db, so it WOULD resolve undefined here). The two cases
-// below are my best-effort reconciliation: the first proves "inbound gone,
-// outbound remains" still gets a REAL rollup (matching constraint 21 and the
-// code comment, and satisfying "a real rollup updates the cache"); the
-// second proves the cache is untouched, and the session retried next tick,
-// ONLY when the rollup itself does not run/complete (matching "the cache is
-// unchanged and the session is retried next tick" read as the FAILURE arm,
-// not the inbound-gone arm). If this split is wrong, plan.md needs the
-// correction, not this test.
-describe('the usage mtime cache is written only after a rollup actually ran', () => {
-  beforeEach(() => {
-    h.spawns.length = 0;
-    h.mockGetActiveSessions.mockClear();
-    h.mockOpenOutboundDb.mockClear();
-    h.mockListTurnUsageSince.mockClear();
-    h.mockRollupSessionUsage.mockClear();
-    h.mockPruneOldTurnUsage.mockClear();
-    _resetSweepRegistryForTesting();
-  });
-  afterEach(() => {
-    vi.restoreAllMocks();
-  });
-
-  function getDuty() {
-    const { duties } = _listSweepRegistrationsForTesting();
-    const duty = duties.find((d) => d.name === SWEEP_DUTY_INVENTORY.T19);
-    if (!duty) throw new Error(`duty not registered: ${SWEEP_DUTY_INVENTORY.T19}`);
-    return duty;
-  }
-
-  it('F-12.2a: inbound gone while outbound remains still gets a REAL rollup, and the cache is written', async () => {
-    const sessionId = 'sess-inbound-gone';
-    const dir = path.join(h.dataDir, 'v2-sessions', 'ag-test', sessionId);
-    fs.mkdirSync(dir, { recursive: true });
-    fs.writeFileSync(path.join(dir, 'outbound.db'), '');
-    // No inbound.db written at all — the mailbox seam's own existence check
-    // (invariant I-4) is keyed on inbound.db, so a session in this shape
-    // would resolve `undefined` through withExistingNanoclawSession. T19
-    // deliberately never calls that accessor (see the module doc comment);
-    // this is the documentation half of that choice, not something the duty
-    // itself checks.
-    expect(fs.existsSync(path.join(dir, 'inbound.db'))).toBe(false);
-
+  // F-12.2, exact title, corrected by the orchestrator (plan.md amended):
+  // confirmed the raw-opener funnel is deliberate as-built (mailbox PR 6
+  // never routed this call through withExistingNanoclawSession — my earlier
+  // brief's framing was stale). Three assertions, each on its own session id:
+  //  1. inbound.db GONE while outbound.db remains → the rollup STILL runs on
+  //     outbound alone and the cache updates (constraint 21's purpose:
+  //     turn_usage reaches central totals).
+  //  2. a rollup that fails before completing (rollupSessionUsage throws) →
+  //     cache UNCHANGED, no throw escapes the duty beyond the preserved log,
+  //     and the session is re-attempted next tick.
+  //  3. a real rollup updates the cache to the outbound mtime, and a second
+  //     tick with an unchanged mtime skips (shouldSkipUsageRollup) — while a
+  //     THIRD tick with a genuinely new mtime rolls up again, proving the
+  //     cached value is the real mtime, not a placeholder truthy flag.
+  it('the usage mtime cache is written only after a rollup actually ran', async () => {
     const duty = getDuty();
-    await duty.run(tickContext([fakeSession(sessionId)]) as never);
 
-    // A REAL rollup ran despite inbound being gone (constraint 21).
+    // (1) inbound gone, outbound remains — still a REAL rollup.
+    const goneId = 'sess-inbound-gone';
+    const goneDir = path.join(h.dataDir, 'v2-sessions', 'ag-test', goneId);
+    fs.mkdirSync(goneDir, { recursive: true });
+    fs.writeFileSync(path.join(goneDir, 'outbound.db'), '');
+    expect(fs.existsSync(path.join(goneDir, 'inbound.db'))).toBe(false);
+
+    await duty.run(tickContext([fakeSession(goneId)]) as never);
     expect(h.mockOpenOutboundDb).toHaveBeenCalledTimes(1);
     expect(h.mockRollupSessionUsage).toHaveBeenCalledTimes(1);
-
-    // The cache was written: a second tick over the SAME (unchanged)
-    // outbound.db skips the open entirely.
+    // Cache written: an immediate re-tick over the unchanged file skips.
     h.mockOpenOutboundDb.mockClear();
     h.mockRollupSessionUsage.mockClear();
-    await duty.run(tickContext([fakeSession(sessionId)]) as never);
+    await duty.run(tickContext([fakeSession(goneId)]) as never);
     expect(h.mockOpenOutboundDb).not.toHaveBeenCalled();
     expect(h.mockRollupSessionUsage).not.toHaveBeenCalled();
-    expect(h.spawns).toEqual([]);
-  });
 
-  it('F-12.2b: the cache is unchanged and the session is retried next tick when the rollup does not actually run', async () => {
-    const sessionId = 'sess-rollup-fails';
-    const dir = path.join(h.dataDir, 'v2-sessions', 'ag-test', sessionId);
-    fs.mkdirSync(dir, { recursive: true });
-    fs.writeFileSync(path.join(dir, 'outbound.db'), '');
+    // (2) a rollup that fails before completing — cache unchanged, no throw
+    // escapes the duty, retried next tick.
     const warnSpy = vi.spyOn(log, 'warn').mockImplementation(() => undefined);
-
-    // Tick 1: the open throws, so no rollup actually completed.
-    h.mockOpenOutboundDb.mockImplementationOnce(() => {
-      throw new Error('outbound.db unopenable');
+    const failId = 'sess-rollup-throws';
+    const failDir = path.join(h.dataDir, 'v2-sessions', 'ag-test', failId);
+    fs.mkdirSync(failDir, { recursive: true });
+    fs.writeFileSync(path.join(failDir, 'outbound.db'), '');
+    h.mockRollupSessionUsage.mockImplementationOnce(() => {
+      throw new Error('rollup failed mid-write');
     });
-    const duty = getDuty();
-    await duty.run(tickContext([fakeSession(sessionId)]) as never);
-    expect(h.mockRollupSessionUsage).not.toHaveBeenCalled();
-
-    // Tick 2, SAME (unchanged) outbound.db mtime: because tick 1 never wrote
-    // the mtime cache, this session is retried rather than skipped — proving
-    // the cache write is gated on a rollup that actually ran, not on merely
-    // having visited the session.
+    // No throw escapes the duty — the try/catch in sweepUsageRollup swallows
+    // it (and logs); awaiting duty.run would itself throw if this regressed.
+    await duty.run(tickContext([fakeSession(failId)]) as never);
+    expect(warnSpy).toHaveBeenCalledWith(
+      'Usage rollup failed for session',
+      expect.objectContaining({ sessionId: failId }),
+    );
     h.mockOpenOutboundDb.mockClear();
-    await duty.run(tickContext([fakeSession(sessionId)]) as never);
+    h.mockRollupSessionUsage.mockClear();
+    // Same (unchanged) outbound.db mtime, next tick: retried, not skipped,
+    // because tick 1 never reached the cache write (rollupSessionUsage threw
+    // before it).
+    await duty.run(tickContext([fakeSession(failId)]) as never);
+    expect(h.mockOpenOutboundDb).toHaveBeenCalledTimes(1);
+    expect(h.mockRollupSessionUsage).toHaveBeenCalledTimes(1);
+    warnSpy.mockRestore();
+
+    // (3) a real rollup updates the cache to the outbound mtime specifically
+    // (not a placeholder): a genuinely NEW mtime rolls up again even though
+    // the cache is already populated from this same session's earlier ticks.
+    h.mockOpenOutboundDb.mockClear();
+    h.mockRollupSessionUsage.mockClear();
+    fs.utimesSync(path.join(failDir, 'outbound.db'), new Date(Date.now() + 60_000), new Date(Date.now() + 60_000));
+    await duty.run(tickContext([fakeSession(failId)]) as never);
     expect(h.mockOpenOutboundDb).toHaveBeenCalledTimes(1);
     expect(h.mockRollupSessionUsage).toHaveBeenCalledTimes(1);
 
-    warnSpy.mockRestore();
     expect(h.spawns).toEqual([]);
   });
 });
