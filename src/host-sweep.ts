@@ -73,7 +73,7 @@ import {
   hasContainerEverRun,
   getActiveContainerSessionIds,
   isContainerRunning,
-  isContainerSpawning,
+  containerOwnsOutbound,
   killContainer,
   wakeContainer,
 } from './container-runner.js';
@@ -839,18 +839,6 @@ export function decideContinuationWake(args: {
  * confirmed stopped, which is what makes a host write to the container-owned
  * outbound.db safe.
  */
-/**
- * Could a container be writing this session's `outbound.db` right now?
- *
- * `outbound.db` has exactly ONE writer. The host may write it only while no
- * container owns it, and "owns it" includes a container that is still
- * SPAWNING — a wake issued a moment ago has not reached `isContainerRunning`
- * yet but is about to hold the file.
- */
-function containerOwnsOutbound(sessionId: string): boolean {
-  return isContainerRunning(sessionId) || isContainerSpawning(sessionId);
-}
-
 /**
  * THE guard for every host-side write to the container-owned `outbound.db`.
  *

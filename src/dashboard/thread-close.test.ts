@@ -13,8 +13,14 @@ import type { AuthedRequestContext } from './router.js';
 // The close path calls into the container registry. Both are injected at the
 // call sites the tests exercise; the mock only keeps the spawn path (docker,
 // mounts, onecli) out of the module graph.
+// Mutable so one case can flip container ownership DURING the async clear —
+// the interleave the post-clear re-check exists for. Every other case injects
+// `deps.isContainerRunning` and never reads this.
+const containerOwns = vi.hoisted(() => ({ value: false }));
+
 vi.mock('../container-runner.js', () => ({
   isContainerRunning: () => false,
+  containerOwnsOutbound: () => containerOwns.value,
   killContainer: () => {},
   getActiveContainerSessionIds: () => [],
   resolveAssistantName: (group: { name: string }) => Promise.resolve(group.name),
@@ -635,6 +641,49 @@ describe('the close sequence order', () => {
     expect(getDb().prepare('SELECT state FROM thread_closures WHERE thread_id = ?').get(THREAD)).toMatchObject({
       state: 'closed',
     });
+  });
+
+  /**
+   * The container state must be read AFTER the clear, not before it.
+   *
+   * `clear` became asynchronous when the force-clear moved behind the mailbox
+   * seam. Concurrent ingress can start waking the session during that yield,
+   * and a `running` sampled beforehand is then stale: the close took the
+   * archive branch and marked the thread closed for the operator while a new
+   * or still-spawning container kept working in it. Archiving is display-only,
+   * so nothing downstream stopped it.
+   *
+   * Deliberately does NOT inject `deps.isContainerRunning` — the point is to
+   * exercise the real ownership predicate, which counts SPAWNING too.
+   */
+  it('kills a container that came up during the clear instead of archiving on a stale sample', async () => {
+    startClose();
+    containerOwns.value = false;
+    let killed: string | null = null;
+    let archived: string | null = null;
+
+    await advanceThreadClosures({
+      now: NOW,
+      readProposal: () => null,
+      // The wake lands here, inside the await the stale sample straddled.
+      clearContinuation: async () => {
+        containerOwns.value = true;
+        return true;
+      },
+      killContainer: (id, _reason, onExit) => {
+        killed = id;
+        onExit?.();
+      },
+      archiveSession: (id) => {
+        archived = id;
+        return true;
+      },
+    });
+
+    // The kill branch, not the archive-only branch. Archiving still happens,
+    // but AFTER the kill's onExit — never instead of it.
+    expect(killed).toBe('s1');
+    expect(archived).toBe('s1');
   });
 
   it('is idempotent — a second tick over an already-closed thread does nothing', async () => {

@@ -53,7 +53,7 @@
  * and are not coming back: `archiveSessionById` is reachable from here only as
  * step (e) of a completed close.
  */
-import { isContainerRunning, killContainer } from '../container-runner.js';
+import { containerOwnsOutbound, killContainer } from '../container-runner.js';
 import { getDb } from '../db/index.js';
 import { archiveSessionById } from '../db/sessions.js';
 import { guard } from '../guard/index.js';
@@ -531,14 +531,28 @@ export interface ThreadCloseDeps {
  * releases the claims of a session whose container is gone.
  */
 async function finalizeSession(session: CloseSession, threadId: string, deps: ThreadCloseDeps): Promise<void> {
-  const running = (deps.isContainerRunning ?? isContainerRunning)(session.id);
   const kill = deps.killContainer ?? killContainer;
   const archive = deps.archiveSession ?? archiveSessionById;
   const clear = deps.clearContinuation ?? ensureContinuationCleared;
+  // `containerOwnsOutbound` rather than `isContainerRunning`: a wake issued a
+  // moment ago is SPAWNING and has not reached the running registry yet, but it
+  // is about to hold the session. An injected `isContainerRunning` still wins,
+  // so tests keep one knob.
+  const owns = (id: string): boolean =>
+    deps.isContainerRunning ? deps.isContainerRunning(id) : containerOwnsOutbound(id);
 
   // (b)
   if (!(await clear(session, threadId))) return;
-  if (!running) {
+
+  // Sampled HERE, after the clear and immediately before the branch, with no
+  // await in between. It used to be read at the top of this function, before
+  // `clear` — which became asynchronous when the force-clear moved behind the
+  // mailbox seam. Concurrent ingress can start waking this session during that
+  // yield, and the stale `false` then took the archive branch: the thread is
+  // marked closed for the operator while a new or still-spawning container
+  // keeps working in it. Archiving is display-only, so nothing downstream
+  // stops it.
+  if (!owns(session.id)) {
     archive(session.id); // (e)
     return;
   }

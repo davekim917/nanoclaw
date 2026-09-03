@@ -301,6 +301,24 @@ export function isContainerSpawning(sessionId: string): boolean {
   return spawningSessions.has(sessionId) || wakePromises.has(sessionId);
 }
 
+/**
+ * Could a container be writing this session's `outbound.db` right now?
+ *
+ * `outbound.db` has exactly ONE writer. The host may write it only while no
+ * container owns it, and "owns it" includes a container that is still
+ * SPAWNING — a wake issued a moment ago has not reached `isContainerRunning`
+ * yet but is about to hold the file.
+ *
+ * Lives here rather than in a caller because it is a question about the
+ * container registry above, and it now has two callers on different paths:
+ * the sweep's stopped-container writes and the thread-close finalizer's
+ * archive-or-kill decision. Two copies of this predicate would be two
+ * definitions of "owns", which is the drift the seam work exists to remove.
+ */
+export function containerOwnsOutbound(sessionId: string): boolean {
+  return isContainerRunning(sessionId) || isContainerSpawning(sessionId);
+}
+
 /** Snapshot passed to isolated maintenance workers; never expose the mutable map. */
 export function getActiveContainerSessionIds(): string[] {
   return [...activeContainers.keys()];
