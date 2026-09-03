@@ -73,3 +73,6 @@ import './sweep-repo-fence/index.js';
 // Sweep family: scheduled-move recovery (seam 2, S2-PR7) — T11
 // scheduled-move-recovery, T12 audit-body-prune on tick:housekeeping.
 import './sweep-scheduled-move/index.js';
+// Sweep container health — S11 provider self-heal, S14 running-container SLA,
+// S16 OOM / memory-pressure notice (convergence seam 2, PR 10).
+import './sweep-container-health/index.js';
