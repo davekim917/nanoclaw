@@ -8,10 +8,11 @@
  * tripwire and assert the recorded attempt count is non-zero" case.
  */
 import { afterEach, describe, expect, test } from 'bun:test';
-import { execFileSync } from 'node:child_process';
+import { execFile, execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { promisify } from 'node:util';
 
 import {
   allowSubprocess,
@@ -48,6 +49,43 @@ describe('hermeticity tripwire', () => {
     expect(hermeticityAttempts().length).toBeGreaterThan(0);
     expect(hermeticityAttempts()[0]!.kind).toBe('subprocess');
     expect(hermeticityAttempts()[0]!.callSite).toContain('test-hermeticity.test.ts');
+  });
+
+  test('guards the promisified form too', () => {
+    // `promisify` calls the function's `nodejs.util.promisify.custom`
+    // implementation instead of the function itself, so copying the original's
+    // symbol across would hand every promisified caller a straight line to the
+    // real binary. The guard throws ahead of the promise, so nothing spawns.
+    const execFileAsync = promisify(execFile);
+    enforcing(() => expect(() => execFileAsync('git', ['--version'])).toThrow(/subprocess escape — execFile\(git\)/));
+  });
+
+  test('records an escape the code under test swallows', () => {
+    enforcing(() => {
+      try {
+        execFileSync('git', ['--version']);
+      } catch {
+        // Swallowed exactly as production code swallows a failing git.
+      }
+    });
+    expect(hermeticityAttempts()).toHaveLength(1);
+  });
+
+  test('checks both operands of a rename, which mutates the source too', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'runner-hermeticity-rename-'));
+    const inTmp = path.join(root, 'a');
+    fs.writeFileSync(inTmp, 'x');
+    // Moving state OUT of the checkout passes a destination-only check, because
+    // the destination is an innocent temp path.
+    enforcing(() =>
+      expect(() => fs.renameSync(path.join(process.cwd(), 'data', 'v2.db'), path.join(root, 'stolen'))).toThrow(
+        /fs-write escape — fs.renameSync/,
+      ),
+    );
+    clearHermeticityAttempts();
+    enforcing(() => fs.renameSync(inTmp, path.join(root, 'b')));
+    expect(hermeticityAttempts()).toHaveLength(0);
+    fs.rmSync(root, { recursive: true, force: true });
   });
 
   test('lets an opted-in command through', () => {

@@ -226,6 +226,15 @@ function subprocessAllowed(command: string): boolean {
 
 type AnyFn = (...args: unknown[]) => unknown;
 
+/**
+ * The guard body shared by the direct call and its promisified twin.
+ */
+function checkSubprocess(api: string, args: unknown[]): void {
+  const command = commandOf(api, args);
+  if (subprocessAllowed(command)) return;
+  trip('subprocess', api, command, `Mock the seam, or opt in with allowSubprocess(['${nodePath.basename(command)}']).`);
+}
+
 function guardChildProcess(real: Record<string, unknown>): Record<string, unknown> {
   const spawning = ['exec', 'execFile', 'execSync', 'execFileSync', 'spawn', 'spawnSync', 'fork'];
   const guarded: Record<string, unknown> = { ...real };
@@ -233,21 +242,21 @@ function guardChildProcess(real: Record<string, unknown>): Record<string, unknow
     const original = real[api] as AnyFn | undefined;
     if (typeof original !== 'function') continue;
     const wrapper = (...args: unknown[]): unknown => {
-      const command = commandOf(api, args);
-      if (!subprocessAllowed(command)) {
-        trip(
-          'subprocess',
-          api,
-          command,
-          `Mock the seam, or opt in with allowSubprocess(['${nodePath.basename(command)}']).`,
-        );
-      }
+      checkSubprocess(api, args);
       return original(...args);
     };
-    // `promisify(exec)` reads this symbol off the function it is handed.
-    const custom = (original as unknown as Record<symbol, unknown>)[Symbol.for('nodejs.util.promisify.custom')];
-    if (custom !== undefined) {
-      (wrapper as unknown as Record<symbol, unknown>)[Symbol.for('nodejs.util.promisify.custom')] = custom;
+    // `promisify(execFile)` reads this symbol off the function it is handed and
+    // calls it INSTEAD of the function itself. Copying the original's
+    // implementation across would therefore hand every promisified caller —
+    // `src/container-updates.ts` among them — a straight line to the real
+    // binary, past the check above. Wrap it instead.
+    const promisifyCustom = Symbol.for('nodejs.util.promisify.custom');
+    const custom = (original as unknown as Record<symbol, unknown>)[promisifyCustom];
+    if (typeof custom === 'function') {
+      (wrapper as unknown as Record<symbol, unknown>)[promisifyCustom] = (...args: unknown[]): unknown => {
+        checkSubprocess(api, args);
+        return (custom as AnyFn)(...args);
+      };
     }
     guarded[api] = wrapper;
   }
@@ -370,13 +379,20 @@ function writeDenied(target: unknown): string | null {
 }
 
 /**
- * The argument holding the path that gets WRITTEN. For most of the API it is
- * the first; for the two-path calls it is the second, and reading the first
- * there flags the source — which is how this guard first "caught" a container
- * mount copying a real Snowflake key it was only reading.
+ * Which arguments hold a path this call MUTATES.
+ *
+ * Most of the API mutates its first. `copyFile`, `cp`, `symlink` and `link`
+ * only create their second — checking the first there flags the source, which
+ * is how this guard first "caught" a container mount copying a real Snowflake
+ * key it was only reading. `rename` is the one that mutates both: it removes
+ * the source as well as creating the destination, so
+ * `renameSync('<checkout>/data/v2.db', '/tmp/x')` would move live central state
+ * out of the checkout while passing a destination-only check.
  */
-function writeArgIndex(api: string): number {
-  return /^(copyFile|rename|cp|symlink|link)/.test(api) ? 1 : 0;
+function writeArgIndices(api: string): number[] {
+  if (/^rename/.test(api)) return [0, 1];
+  if (/^(copyFile|cp|symlink|link)/.test(api)) return [1];
+  return [0];
 }
 
 const WRITE_APIS = [
@@ -414,14 +430,15 @@ function guardWrites(module: Record<string, unknown>, prefix: string): Record<st
   for (const api of WRITE_APIS) {
     const original = module[api] as AnyFn | undefined;
     if (typeof original !== 'function') continue;
-    const target = writeArgIndex(api);
+    const targets = writeArgIndices(api);
     guarded[api] = (...args: unknown[]): unknown => {
-      const denied = writeDenied(args[target]);
-      if (denied !== null) {
+      const offending = targets.map((i) => [i, writeDenied(args[i])] as const).find(([, denied]) => denied !== null);
+      if (offending !== undefined) {
+        const [index, denied] = offending;
         trip(
           'fs-write',
           `${prefix}${api}`,
-          String(pathOf(args[target])),
+          String(pathOf(args[index])),
           `${denied} is off limits to unit tests. Write under a uniqueTmpRoot() fixture, or opt in with allowWritesTo().`,
         );
       }
@@ -457,18 +474,8 @@ vi.mock('node:fs/promises', async (importOriginal) => {
 
 afterAll(() => {
   const s = state();
-  if (s.mode === 'warn' && s.attempts.length > 0) {
-    const byKind = s.attempts.reduce<Record<string, number>>((acc, a) => {
-      acc[a.kind] = (acc[a.kind] ?? 0) + 1;
-      return acc;
-    }, {});
-    const tally = Object.entries(byKind)
-      .map(([k, n]) => `${k}=${n}`)
-      .join(' ');
-    console.warn(
-      `[hermeticity] ${s.attempts.length} escape(s) in this file (${tally}); run with NANOCLAW_TEST_HERMETICITY=enforce to fail on them.`,
-    );
-  }
+  const unacknowledged = s.attempts.slice();
+  const mode = s.mode;
   // `enforceHermeticity()` mutates the mode for the file that called it; put
   // the repo default back so a reused worker context cannot inherit it.
   s.mode = readMode();
@@ -477,4 +484,32 @@ afterAll(() => {
   s.network = false;
   s.writePaths.length = 0;
   s.attempts.length = 0;
+
+  if (unacknowledged.length === 0) return;
+
+  if (mode !== 'enforce') {
+    const byKind = unacknowledged.reduce<Record<string, number>>((acc, a) => {
+      acc[a.kind] = (acc[a.kind] ?? 0) + 1;
+      return acc;
+    }, {});
+    const tally = Object.entries(byKind)
+      .map(([k, n]) => `${k}=${n}`)
+      .join(' ');
+    console.warn(
+      `[hermeticity] ${unacknowledged.length} escape(s) in this file (${tally}); run with NANOCLAW_TEST_HERMETICITY=enforce to fail on them.`,
+    );
+    return;
+  }
+
+  // Throwing from the guarded call is not enough on its own. Much of the host
+  // wraps its real work in try/catch precisely so a git or network failure
+  // never crashes the daemon, so an escape can be caught by the code under test
+  // and leave the file green in `enforce` mode. Failing here closes that gap: a
+  // file that reached out has to say so, by calling clearHermeticityAttempts()
+  // once it has asserted on the record.
+  const detail = unacknowledged.map((a) => `  ${a.kind} ${a.api}(${a.target}) at ${a.callSite}`).join('\n');
+  throw new Error(
+    `test hermeticity: ${unacknowledged.length} escape(s) were recorded but never acknowledged:\n${detail}\n` +
+      'Mock the seam, opt in by name, or call clearHermeticityAttempts() after asserting on the record.',
+  );
 });

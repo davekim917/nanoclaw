@@ -1,2 +1,2 @@
 [test]
-preload = ["./src/test-hermeticity.ts", "./src/modules/index.ts"]
+preload = ["./src/modules/index.ts"]

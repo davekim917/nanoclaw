@@ -57,4 +57,9 @@ jobs:
         # after it — green locally, red here, different tests each run. If this
         # step fails with rows that "should exist" missing, look for a
         # mock.module of a src/ module, not for concurrency.
-        run: bun test
+        #
+        # `bun run test`, not bare `bun test`: the package script adds the
+        # hermeticity tripwire preload (issue #305). bunfig.toml would be the
+        # natural home for it, but that file is a byte-for-byte upstream port
+        # pinned by src/mailbox-seam-upstream.test.ts.
+        run: bun run test

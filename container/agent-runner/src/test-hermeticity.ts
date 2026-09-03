@@ -19,7 +19,7 @@
  * afterwards. A suite that wants the strict guard wraps the call in
  * `withHermeticityMode('enforce', ...)`, which restores the previous mode.
  */
-import { mock } from 'bun:test';
+import { afterAll, mock } from 'bun:test';
 import nodeOs from 'node:os';
 import nodePath from 'node:path';
 
@@ -138,26 +138,33 @@ function commandOf(api: string, args: unknown[]): string {
   return first;
 }
 
+/** The guard body shared by the direct call and its promisified twin. */
+function checkSubprocess(api: string, args: unknown[]): void {
+  const command = commandOf(api, args);
+  if (state.mode === 'off' || state.commands.has(nodePath.basename(command))) return;
+  trip('subprocess', api, command, `Mock the seam, or opt in with allowSubprocess(['${nodePath.basename(command)}']).`);
+}
+
 function guardChildProcess(real: Record<string, unknown>): Record<string, unknown> {
   const guarded: Record<string, unknown> = { ...real };
   for (const api of ['exec', 'execFile', 'execSync', 'execFileSync', 'spawn', 'spawnSync', 'fork']) {
     const original = real[api] as AnyFn | undefined;
     if (typeof original !== 'function') continue;
     const wrapper = (...args: unknown[]): unknown => {
-      const command = commandOf(api, args);
-      if (state.mode !== 'off' && !state.commands.has(nodePath.basename(command))) {
-        trip(
-          'subprocess',
-          api,
-          command,
-          `Mock the seam, or opt in with allowSubprocess(['${nodePath.basename(command)}']).`,
-        );
-      }
+      checkSubprocess(api, args);
       return original(...args);
     };
-    const promisified = (original as unknown as Record<symbol, unknown>)[Symbol.for('nodejs.util.promisify.custom')];
-    if (promisified !== undefined) {
-      (wrapper as unknown as Record<symbol, unknown>)[Symbol.for('nodejs.util.promisify.custom')] = promisified;
+    // `promisify(execFile)` reads this symbol off the function it is handed and
+    // calls it INSTEAD of the function itself, so copying the original's
+    // implementation across would hand every promisified caller a straight line
+    // to the real binary, past the check above. Wrap it instead.
+    const promisifyCustom = Symbol.for('nodejs.util.promisify.custom');
+    const custom = (original as unknown as Record<symbol, unknown>)[promisifyCustom];
+    if (typeof custom === 'function') {
+      (wrapper as unknown as Record<symbol, unknown>)[promisifyCustom] = (...args: unknown[]): unknown => {
+        checkSubprocess(api, args);
+        return (custom as AnyFn)(...args);
+      };
     }
     guarded[api] = wrapper;
   }
@@ -289,12 +296,20 @@ const WRITE_APIS = [
 ];
 
 /**
- * Which argument holds the path that gets WRITTEN. Two-path calls write the
- * second; reading the first there flags the source, which on the host produced
- * a false positive against a credential file the code was only reading.
+ * Which arguments hold a path this call MUTATES.
+ *
+ * Most of the API mutates its first. `copyFile`, `cp`, `symlink` and `link`
+ * only create their second — checking the first there flags the source, which
+ * is how this guard first "caught" a container mount copying a real Snowflake
+ * key it was only reading. `rename` is the one that mutates both: it removes
+ * the source as well as creating the destination, so
+ * `renameSync('<checkout>/data/v2.db', '/tmp/x')` would move live central state
+ * out of the checkout while passing a destination-only check.
  */
-function writeArgIndex(api: string): number {
-  return /^(copyFile|rename|cp|symlink|link)/.test(api) ? 1 : 0;
+function writeArgIndices(api: string): number[] {
+  if (/^rename/.test(api)) return [0, 1];
+  if (/^(copyFile|cp|symlink|link)/.test(api)) return [1];
+  return [0];
 }
 
 function guardWrites(module: Record<string, unknown>, prefix: string): Record<string, unknown> {
@@ -302,10 +317,11 @@ function guardWrites(module: Record<string, unknown>, prefix: string): Record<st
   for (const api of WRITE_APIS) {
     const original = module[api] as AnyFn | undefined;
     if (typeof original !== 'function') continue;
-    const index = writeArgIndex(api);
+    const targets = writeArgIndices(api);
     guarded[api] = (...args: unknown[]): unknown => {
-      const denied = writeDenied(args[index]);
-      if (denied !== null) {
+      const offending = targets.map((i) => [i, writeDenied(args[i])] as const).find(([, denied]) => denied !== null);
+      if (offending !== undefined) {
+        const [index, denied] = offending;
         trip(
           'fs-write',
           `${prefix}${api}`,
@@ -333,3 +349,25 @@ const guardedFsPromises = guardWrites(realFsPromises, 'fs/promises.');
 guardedFsPromises.default = guardedFsPromises;
 mock.module('fs/promises', () => guardedFsPromises);
 mock.module('node:fs/promises', () => guardedFsPromises);
+
+// ── end-of-scope accounting ──────────────────────────────────────────────────
+
+/**
+ * Throwing from the guarded call is not enough on its own. Much of the runner
+ * wraps its real work in try/catch precisely so a flaky host never takes the
+ * session down, so an escape can be caught by the code under test and leave the
+ * run green even under `enforce`. Failing here closes that gap: anything that
+ * reached out has to say so, by calling clearHermeticityAttempts() once it has
+ * asserted on the record.
+ */
+afterAll(() => {
+  const unacknowledged = state.attempts.slice();
+  state.attempts.length = 0;
+  state.warned.clear();
+  if (unacknowledged.length === 0 || state.mode !== 'enforce') return;
+  const detail = unacknowledged.map((a) => `  ${a.kind} ${a.api}(${a.target}) at ${a.callSite}`).join('\n');
+  throw new Error(
+    `test hermeticity: ${unacknowledged.length} escape(s) were recorded but never acknowledged:\n${detail}\n` +
+      'Mock the seam, opt in by name, or call clearHermeticityAttempts() after asserting on the record.',
+  );
+});
