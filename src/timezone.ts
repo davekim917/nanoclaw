@@ -86,6 +86,15 @@ function zoneSpellingHints(tz: string): string[] {
  *
  * If the zone database is not present (an unusual host), this falls back to
  * the shape check alone rather than refusing every override.
+ *
+ * BOUNDARY: this checks the HOST's zone database, not the agent image's. The
+ * two are independent filesystems, so a host carrying newer tzdata than an
+ * older image can accept a recently added or renamed zone the container
+ * cannot resolve. That exposure is not new and not specific to per-group
+ * overrides — the install-wide `TIMEZONE` from `.env` has reached every
+ * container as `TZ` with no validation at all — and this check narrows it
+ * rather than widening it. Closing it properly means asking the image, which
+ * is tracked separately.
  */
 export function canonicalizeIanaTimezone(tz: string): string | null {
   if (!isValidTimezone(tz) || !isRegionZoneShape(tz)) return null;
