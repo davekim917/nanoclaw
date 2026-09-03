@@ -24,16 +24,23 @@ const h = vi.hoisted(() => {
     spawns: [] as string[],
     // getActiveSessions is spied so F-12.3 can assert it is NEVER called by
     // the registered duty (constraint 4: T19 reuses the tick's own
-    // ctx.sessions, no extra query). openOutboundDb / listTurnUsageSince /
-    // rollupSessionUsage are THE dependencies this family's duty consumes —
-    // spies, not stubs, so the registered-duty cases below can assert on
-    // them directly (the "acceptance tests must drive the REGISTERED duty"
-    // rule). `vi` is available here even though it isn't `require`d: the
+    // ctx.sessions, no extra query). readSessionOutbound / rollupSessionUsage
+    // are THE dependencies this family's duty consumes — spies, not stubs, so
+    // the registered-duty cases below can assert on them directly (the
+    // "acceptance tests must drive the REGISTERED duty" rule). `vi` is
+    // available here even though it isn't `require`d: the
     // `import { vi } from 'vitest'` below is a real ES import, hoisted by
     // the module system itself before this factory runs.
+    //
+    // The default impl runs the caller's action against a read session
+    // exposing the one op `rollupSessionUsage` asks for, and returns what the
+    // action returned — the real funnel's contract. A case that needs the
+    // "outbound gone" answer overrides it to return undefined.
     mockGetActiveSessions: vi.fn(() => [] as unknown[]),
-    mockOpenOutboundDb: vi.fn((_path: string) => ({ close: () => undefined }) as unknown),
-    mockListTurnUsageSince: vi.fn((_db: unknown, _afterId: number) => [] as unknown[]),
+    mockReadSessionOutbound: vi.fn(
+      (_location: unknown, action: (session: unknown) => unknown, _options?: unknown): unknown =>
+        action({ listTurnUsageSince: () => [] as unknown[] }),
+    ),
     mockRollupSessionUsage: vi.fn((_mailbox: unknown, _agentGroupId: string, _sessionDirKey: string) => 0),
     mockPruneOldTurnUsage: vi.fn(() => undefined),
   };
@@ -174,13 +181,15 @@ vi.mock('../../modules/scheduling/live-count.js', () => ({
 }));
 vi.mock('../../dashboard/api/scheduled-shared.js', () => ({ purgeIntentBody: () => undefined }));
 
-vi.mock('../mailbox/openers.js', async (importOriginal) => {
-  const real = await importOriginal<typeof import('../mailbox/openers.js')>();
-  return { ...real, openOutboundDb: (p: string) => h.mockOpenOutboundDb(p) };
-});
-vi.mock('../mailbox/ops/reads.js', async (importOriginal) => {
-  const real = await importOriginal<typeof import('../mailbox/ops/reads.js')>();
-  return { ...real, listTurnUsageSince: (db: unknown, afterId: number) => h.mockListTurnUsageSince(db, afterId) };
+// `sessionMailboxPath` stays real (it is the duty's own mtime gate); only the
+// read funnel is spied.
+vi.mock('../mailbox/index.js', async (importOriginal) => {
+  const real = await importOriginal<typeof import('../mailbox/index.js')>();
+  return {
+    ...real,
+    readSessionOutbound: (location: unknown, action: (session: unknown) => unknown, options?: unknown) =>
+      h.mockReadSessionOutbound(location, action, options),
+  };
 });
 vi.mock('../../db/usage.js', () => ({
   rollupSessionUsage: (mailbox: unknown, agentGroupId: string, sessionDirKey: string) =>
@@ -200,6 +209,7 @@ import {
   type SweepTickContext,
 } from '../../host-sweep.js';
 import { log } from '../../log.js';
+import { SessionDbUnopenableError } from '../mailbox/index.js';
 import type { Session } from '../../types.js';
 // Side-effect import: registers 'sweep-usage' as a duty source
 // (registerSweepDutySource calls the registrar immediately, and records it
@@ -262,8 +272,7 @@ describe('registered usage-rollup duty (T19)', () => {
   beforeEach(() => {
     h.spawns.length = 0;
     h.mockGetActiveSessions.mockClear();
-    h.mockOpenOutboundDb.mockClear();
-    h.mockListTurnUsageSince.mockClear();
+    h.mockReadSessionOutbound.mockClear();
     h.mockRollupSessionUsage.mockClear();
     h.mockPruneOldTurnUsage.mockClear();
     _resetSweepRegistryForTesting();
@@ -296,7 +305,7 @@ describe('registered usage-rollup duty (T19)', () => {
 
     // sess-changed has a real outbound.db on disk so fs.statSync succeeds;
     // sess-no-outbound has none, so the duty's own `continue` (no outbound.db
-    // yet) fires without ever calling openOutboundDb for it.
+    // yet) fires without ever calling readSessionOutbound for it.
     const dir = path.join(h.dataDir, 'v2-sessions', 'ag-test', 'sess-changed');
     fs.mkdirSync(dir, { recursive: true });
     fs.writeFileSync(path.join(dir, 'outbound.db'), '');
@@ -305,7 +314,7 @@ describe('registered usage-rollup duty (T19)', () => {
     await duty.run(tickContext(sentinel) as never);
 
     expect(h.mockGetActiveSessions).not.toHaveBeenCalled();
-    expect(h.mockOpenOutboundDb).toHaveBeenCalledTimes(1);
+    expect(h.mockReadSessionOutbound).toHaveBeenCalledTimes(1);
     expect(h.mockRollupSessionUsage).toHaveBeenCalledTimes(1);
     expect(h.mockRollupSessionUsage).toHaveBeenCalledWith(expect.anything(), 'ag-test', 'ag-test/sess-changed');
     expect(h.mockPruneOldTurnUsage).toHaveBeenCalledTimes(1);
@@ -314,8 +323,10 @@ describe('registered usage-rollup duty (T19)', () => {
 
   it('logs the preserved failure string when the rollup throws, without blocking pruneOldTurnUsage', async () => {
     const warnSpy = vi.spyOn(log, 'warn').mockImplementation(() => undefined);
-    h.mockOpenOutboundDb.mockImplementationOnce(() => {
-      throw new Error('outbound.db unopenable');
+    h.mockReadSessionOutbound.mockImplementationOnce(() => {
+      // The classification the real read funnel raises for a present-but-
+      // unopenable outbound.db — routed to this duty's own per-session catch.
+      throw new SessionDbUnopenableError('/fixture/outbound.db', new Error('outbound.db unopenable'));
     });
     const dir = path.join(h.dataDir, 'v2-sessions', 'ag-test', 'sess-fail');
     fs.mkdirSync(dir, { recursive: true });
@@ -360,13 +371,13 @@ describe('registered usage-rollup duty (T19)', () => {
     expect(fs.existsSync(path.join(goneDir, 'inbound.db'))).toBe(false);
 
     await duty.run(tickContext([fakeSession(goneId)]) as never);
-    expect(h.mockOpenOutboundDb).toHaveBeenCalledTimes(1);
+    expect(h.mockReadSessionOutbound).toHaveBeenCalledTimes(1);
     expect(h.mockRollupSessionUsage).toHaveBeenCalledTimes(1);
     // Cache written: an immediate re-tick over the unchanged file skips.
-    h.mockOpenOutboundDb.mockClear();
+    h.mockReadSessionOutbound.mockClear();
     h.mockRollupSessionUsage.mockClear();
     await duty.run(tickContext([fakeSession(goneId)]) as never);
-    expect(h.mockOpenOutboundDb).not.toHaveBeenCalled();
+    expect(h.mockReadSessionOutbound).not.toHaveBeenCalled();
     expect(h.mockRollupSessionUsage).not.toHaveBeenCalled();
 
     // (2) a rollup that fails before completing — cache unchanged, no throw
@@ -393,7 +404,7 @@ describe('registered usage-rollup duty (T19)', () => {
       'Usage rollup failed for session',
       expect.objectContaining({ sessionId: failId }),
     );
-    h.mockOpenOutboundDb.mockClear();
+    h.mockReadSessionOutbound.mockClear();
     h.mockRollupSessionUsage.mockClear();
     // usageRollupMtimeCache has no entry for this session (it's module-
     // private, no test accessor — proven behaviorally, the same style as
@@ -401,18 +412,18 @@ describe('registered usage-rollup duty (T19)', () => {
     // mtime, next tick: retried, not skipped, because tick 1 never reached
     // the cache write (rollupSessionUsage threw before it).
     await duty.run(tickContext([fakeSession(failId)]) as never);
-    expect(h.mockOpenOutboundDb).toHaveBeenCalledTimes(1);
+    expect(h.mockReadSessionOutbound).toHaveBeenCalledTimes(1);
     expect(h.mockRollupSessionUsage).toHaveBeenCalledTimes(1);
     warnSpy.mockRestore();
 
     // (3) a real rollup updates the cache to the outbound mtime specifically
     // (not a placeholder): a genuinely NEW mtime rolls up again even though
     // the cache is already populated from this same session's earlier ticks.
-    h.mockOpenOutboundDb.mockClear();
+    h.mockReadSessionOutbound.mockClear();
     h.mockRollupSessionUsage.mockClear();
     fs.utimesSync(path.join(failDir, 'outbound.db'), new Date(Date.now() + 60_000), new Date(Date.now() + 60_000));
     await duty.run(tickContext([fakeSession(failId)]) as never);
-    expect(h.mockOpenOutboundDb).toHaveBeenCalledTimes(1);
+    expect(h.mockReadSessionOutbound).toHaveBeenCalledTimes(1);
     expect(h.mockRollupSessionUsage).toHaveBeenCalledTimes(1);
 
     expect(h.spawns).toEqual([]);
