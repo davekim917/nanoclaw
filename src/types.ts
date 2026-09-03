@@ -354,6 +354,13 @@ export interface PendingApproval {
   options_json: string;
   /** When set, only this exact user may resolve the approval. */
   approver_user_id: string | null;
+  /**
+   * Adapter instance that delivered the card. Outbound dispatch is exact-key,
+   * so a later edit (expiry, late decision) must be addressed to the instance
+   * that owns the conversation. NULL on rows written before migration 066 and
+   * on single-instance installs — callers fall back to `channel_type`.
+   */
+  instance: string | null;
 }
 
 // ── Agent destinations (central DB) ──

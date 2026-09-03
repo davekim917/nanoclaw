@@ -114,6 +114,7 @@ async function runCreateAgent(content: Record<string, unknown>, session: Session
         agent_group_id: (req.session as Session).agent_group_id,
         channel_type: null,
         platform_id: null,
+        instance: null,
         thread_id: null,
         platform_message_id: null,
         expires_at: null,
