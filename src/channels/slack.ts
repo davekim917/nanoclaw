@@ -35,6 +35,7 @@ import { createChatSdkBridge } from './chat-sdk-bridge.js';
 import type { ChannelDefaults, ChannelRecoveryRequest, ChannelRecoveryTarget } from './adapter.js';
 import { registerChannelAdapter } from './channel-registry.js';
 import { extractSlackRawText } from './slack-raw-text.js';
+import { createSlackHopGovernor, type SlackHopGovernor } from './slack-hop-limit.js';
 import {
   fetchSlackBotIdentity,
   getSlackBotSenderName,
@@ -109,6 +110,40 @@ export const SLACK_DEFAULTS: ChannelDefaults = {
   },
   mentions: 'platform',
 };
+
+/**
+ * Bridge `inboundFilter` that applies the sibling-bot loop governor.
+ *
+ * Projects a Chat SDK message onto the three facts the governor needs. Two
+ * judgments live here rather than in the governor:
+ *
+ *  - **Sibling detection is registry-based and team-scoped.** Only ids in this
+ *    workspace's known-bot registry count as ours. Without our own identity
+ *    there is no teamId to scope by, so this fails CLOSED — nothing is treated
+ *    as a sibling and the governor never drops. Same discipline as
+ *    resolveInboundSlackIds, and for the same reason: an unscoped id match
+ *    could pick up another workspace's bot.
+ *  - **"Human" is everything that is not one of ours and not flagged a bot.**
+ *    The SDK's `isBot` is `boolean | 'unknown'`; an unknown author resets the
+ *    counter rather than being ignored. Failing open on the RESET is the safe
+ *    direction — the alternative silently mutes a channel forever.
+ */
+export function slackHopInboundFilter(
+  governor: SlackHopGovernor,
+  identity: SlackBotIdentity | null,
+  message: { threadId: string; author?: { userId?: string; isBot?: boolean | 'unknown' } },
+): boolean {
+  const authorId = message.author?.userId;
+  const isSiblingBot =
+    identity !== null &&
+    authorId !== undefined &&
+    [...getKnownSlackBots().values()].some((bot) => bot.teamId === identity.teamId && bot.userId === authorId);
+  return governor.admit({
+    threadId: message.threadId,
+    isSiblingBot,
+    isHuman: !isSiblingBot && message.author?.isBot !== true,
+  });
+}
 
 /**
  * Fetch the workspace's human members and register them for outbound
@@ -554,6 +589,9 @@ for (const ws of workspaces) {
         });
       }
 
+      // One governor per bridge instance — each instance is one bot identity.
+      const hopGovernor = createSlackHopGovernor(ws.channelType);
+
       const bridge = createChatSdkBridge({
         adapter: slackAdapter,
         // Slack sends a pasted table as attachments[].blocks[] — it appears in
@@ -620,6 +658,12 @@ for (const ws of workspaces) {
           const self = getKnownSlackBots().get(ws.channelType);
           return self ? slackMentionOutsideCode(text, self) : true;
         },
+        // Loop governor: bound a sibling-bot ping-pong that no human is in.
+        // Live dispatch only. Recovery pages arrive newest-first and are
+        // sorted afterwards, so counting them would both mis-order the hop
+        // state and re-judge history the live path already judged; recovery
+        // is separately bounded by its window and allowRecoveredBotMessage.
+        inboundFilter: (message, ctx) => (ctx.recovered ? true : slackHopInboundFilter(hopGovernor, identity, message)),
         detectRecoveredMention: (message) => {
           if (!identity) return false;
           const raw = message.raw as Record<string, unknown> | undefined;

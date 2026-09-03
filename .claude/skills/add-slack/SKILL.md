@@ -204,6 +204,19 @@ this channel with `/init-first-agent` (or `/manage-channels`).
 - **typical-use**: Interactive chat — team channels or direct messages
 - **default-isolation**: Same agent group for channels where you're the primary user. Separate agent group for channels with different teams or sensitive contexts.
 
+## Optional tuning
+
+**`SLACK_MAX_BOT_HOPS`** bounds a sibling-bot loop: two of your own agents in
+the same channel can @-mention each other forever, and every turn is a
+container wake. After this many consecutive turns authored by your own bots in
+one thread with no human message, the adapter drops further sibling traffic in
+that thread until a human speaks. Default 24; `0` disables it. Third-party bots
+(CI, GitHub, alerting) are never counted and never dropped by it.
+
+```
+SLACK_MAX_BOT_HOPS=24
+```
+
 ## Troubleshooting
 
 **A token paste is rejected.** Each secret has a fixed shape: the Bot User OAuth Token starts `xoxb-` (OAuth & Permissions, after Install to Workspace), the App-Level Token starts `xapp-` (Basic Information → App-Level Tokens), and the Signing Secret is a hex string (Basic Information). The classic mix-up is pasting a user token (`xoxp-`) instead of the bot token, or the app's Client Secret instead of the Signing Secret.
