@@ -631,11 +631,19 @@ function updateTaskCommand(args: Record<string, unknown>, ctx: CallerContext) {
     if (flagError) throw new Error(flagError);
     if (flagIntent && (flagIntent.turnModel || flagIntent.turnEffort)) update.flagIntent = flagIntent;
   }
-  const fields = Object.keys(update);
-  if (fields.length === 0 && !hasWallClockUpdate) throw new Error('nothing to update');
+  // `wallClockUpdate` contributes exactly one key when it contributes any, so
+  // the reported field list is the same for every session even though the
+  // instant behind `processAfter` differs per group.
+  const fields = hasWallClockUpdate ? [...Object.keys(update), 'processAfter'] : Object.keys(update);
+  if (fields.length === 0) throw new Error('nothing to update');
 
   let touched = 0;
   for (const session of selectedSessions(args, ctx)) {
+    // One value per session, and the ONLY one: what gets written is what gets
+    // audited and what gets reported. Merging the per-session part at the
+    // `updateTask` call while the audit kept reading the pre-merge object is
+    // how a schedule-only update wrote a new instant and recorded nothing.
+    const sessionUpdate: TaskUpdate = { ...update, ...wallClockUpdate(session.agent_group_id) };
     const result = withInbound(session, (db) => {
       const before = selectTask(db, id);
       // Close the indirect path to host execution: an agent swapping the
@@ -644,14 +652,14 @@ function updateTaskCommand(args: Record<string, unknown>, ctx: CallerContext) {
       // clears the flag, reject.
       if (
         ctx.caller === 'agent' &&
-        update.script !== undefined &&
-        update.scriptHost !== false &&
+        sessionUpdate.script !== undefined &&
+        sessionUpdate.scriptHost !== false &&
         before &&
         parseContent(before.content).scriptHost
       ) {
         throw new Error('this series runs its script on the host — an operator must make script changes');
       }
-      const n = updateTask(db, id, { ...update, ...wallClockUpdate(session.agent_group_id) });
+      const n = updateTask(db, id, sessionUpdate);
       return { before, n };
     });
     if (!result) continue;
@@ -665,11 +673,13 @@ function updateTaskCommand(args: Record<string, unknown>, ctx: CallerContext) {
         sessionId: session.id,
         seriesId: id,
         before: before ? parseContent(before.content).prompt : undefined,
-        ...(update.prompt !== undefined ? { after: update.prompt } : {}),
-        ...(update.script !== undefined && update.script !== null ? { scriptAfter: update.script } : {}),
+        ...(sessionUpdate.prompt !== undefined ? { after: sessionUpdate.prompt } : {}),
+        ...(sessionUpdate.script !== undefined && sessionUpdate.script !== null
+          ? { scriptAfter: sessionUpdate.script }
+          : {}),
         detail: {
-          ...(update.recurrence !== undefined ? { recurrence: update.recurrence } : {}),
-          ...(update.processAfter !== undefined ? { processAfter: update.processAfter } : {}),
+          ...(sessionUpdate.recurrence !== undefined ? { recurrence: sessionUpdate.recurrence } : {}),
+          ...(sessionUpdate.processAfter !== undefined ? { processAfter: sessionUpdate.processAfter } : {}),
         },
       });
     }

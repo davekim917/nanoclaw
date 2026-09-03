@@ -1241,6 +1241,61 @@ describe('tasks CLI resource', () => {
       expect(rows[0]!.ts).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/); // explicit ISO, not sqlite's naive default
     });
 
+    it('records the instant it actually wrote, per group, on a schedule-only update', async () => {
+      // The written value and the audited value must be the same object. When
+      // the per-session merge happened at the write call while the audit read
+      // the pre-merge update, a schedule-only edit wrote a new instant and
+      // recorded nothing — and each group can receive a different instant.
+      createGroup('ag-audit-tokyo');
+      createGroup('ag-audit-kolkata');
+      ensureContainerConfig('ag-audit-tokyo');
+      ensureContainerConfig('ag-audit-kolkata');
+      updateContainerConfigScalars('ag-audit-tokyo', { timezone: 'Asia/Tokyo' });
+      updateContainerConfigScalars('ag-audit-kolkata', { timezone: 'Asia/Kolkata' });
+
+      const made: Record<string, { series_id: string }> = {};
+      for (const group of ['ag-audit-tokyo', 'ag-audit-kolkata']) {
+        const r = await dispatch(
+          {
+            id: `audit-create-${group}`,
+            command: 'tasks-create',
+            args: { group, prompt: 'digest', name: 'audited-digest', process_after: '2999-01-01T00:00:00Z' },
+          },
+          { caller: 'host' },
+        );
+        expect(r.ok).toBe(true);
+        if (!r.ok) return;
+        made[group] = r.data as { series_id: string };
+      }
+      const sharedId = made['ag-audit-tokyo'].series_id;
+      const kolkataSession = getSessionsByAgentGroup('ag-audit-kolkata').find(
+        (sess) => sess.thread_id === taskThreadId(made['ag-audit-kolkata'].series_id),
+      )!;
+      const kdb = new Database(inboundDbPath('ag-audit-kolkata', kolkataSession.id));
+      kdb.prepare('UPDATE messages_in SET id = ?, series_id = ? WHERE kind = ?').run(sharedId, sharedId, 'task');
+      kdb.close();
+
+      const updated = await dispatch(
+        { id: 'audit-tz', command: 'tasks-update', args: { id: sharedId, process_after: '2026-10-01T09:00:00' } },
+        { caller: 'host' },
+      );
+      expect(updated.ok).toBe(true);
+      if (!updated.ok) return;
+      // The reported field list names what changed, even though the only
+      // changed field is computed per session.
+      expect((updated.data as { fields: string[] }).fields).toContain('processAfter');
+
+      const details = (
+        getDb()
+          .prepare("SELECT agent_group_id, detail_json FROM scheduled_audit WHERE series_id = ? AND action = 'update'")
+          .all(sharedId) as Array<{ agent_group_id: string; detail_json: string | null }>
+      ).map((r) => ({ group: r.agent_group_id, processAfter: JSON.parse(r.detail_json ?? '{}').processAfter }));
+
+      expect(details).toHaveLength(2);
+      expect(details.find((d) => d.group === 'ag-audit-tokyo')?.processAfter).toBe('2026-10-01T00:00:00.000Z');
+      expect(details.find((d) => d.group === 'ag-audit-kolkata')?.processAfter).toBe('2026-10-01T03:30:00.000Z');
+    });
+
     it('update writes before+after with differing hashes when the prompt changes', async () => {
       const created = await dispatch(
         { id: 'a-u0', command: 'tasks-create', args: { prompt: 'v1', process_after: '2999-01-01T00:00:00Z' } },
