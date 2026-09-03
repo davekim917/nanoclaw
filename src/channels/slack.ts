@@ -34,6 +34,7 @@ import { markdownHeadingsToBold } from '../text-styles.js';
 import { createChatSdkBridge } from './chat-sdk-bridge.js';
 import type { ChannelRecoveryRequest, ChannelRecoveryTarget } from './adapter.js';
 import { registerChannelAdapter } from './channel-registry.js';
+import { extractSlackRawText } from './slack-raw-text.js';
 import {
   fetchSlackBotIdentity,
   getSlackBotSenderName,
@@ -434,6 +435,10 @@ for (const ws of workspaces) {
 
       const bridge = createChatSdkBridge({
         adapter: slackAdapter,
+        // Slack sends a pasted table as attachments[].blocks[] — it appears in
+        // neither the message text nor the file list, so without this the agent
+        // gets only the sentence before the table.
+        extractRawText: extractSlackRawText,
         concurrency: 'concurrent',
         supportsThreads: true,
         maxTextLength: SLACK_MESSAGE_MAX_TEXT_LENGTH,
