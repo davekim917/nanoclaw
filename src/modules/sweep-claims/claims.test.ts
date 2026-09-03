@@ -1,28 +1,28 @@
 /**
- * Acceptance cases for the claims sweep family (convergence seam 2, S2-PR6 —
- * F-6.1 in docs/specs/upstream-host-sweep-seam/plan.md §8). F-6.3 (order +
+ * Acceptance cases for the claims sweep family (convergence seam 2, S2-PR6).
+ * F-6.1 (plan.md §8, exact title) lives in ./claims-throttle.test.ts, NOT
+ * here — it needs the REAL sweepClaimsSelfHeal (this file mocks it wholesale
+ * for the other cases below, see Codex review finding F3). F-6.3 (order +
  * cross-duty visibility) lives in src/host-sweep-registry.test.ts — a
  * registry-level property, not a property of this module's own code, same
  * split S2-PR5's F-5.4 used.
  *
- * F-6.1 ("the self-heal nudge ladder keeps its 24h per-claim cooldown and
- * 10-minute scan throttle — the 92 ported claims cases"): the 93 cases that
- * exercise this behavior already live beside the claims logic itself —
- * `../claims/reconcile.test.ts` (21), `../claims/self-heal.test.ts` (51) and
- * `../claims/escalation.test.ts` (21) — and were never inside
- * host-sweep.test.ts to move: T20/T21's pre-move bodies in host-sweep.ts were
- * already thin `registerSweepDuty` wrappers around `reconcileMergedClaims`/
- * `sweepClaimsSelfHeal`, calling logic that predates the sweep registry and
- * is owned elsewhere (mailbox PR 7 converts self-heal.ts's internals with its
- * exported signature explicitly UNCHANGED — plan.md §5). Moving those
- * pre-existing suites into this file would touch code outside S2-PR6's
- * ownership for no behavior change, so they stay put, untouched. What DID
- * move is the ~30-line wrapper each duty sat behind — the cases below drive
- * exactly that move, per the family-case rule (brief-family-template.md,
- * added 2026-09-03 after Codex hit PR 4 and PR 8): obtain each duty from the
- * registry by name (the same accessor R-7 uses), invoke `run(ctx)`, and
- * assert the underlying dependency was reached and the preserved failure log
- * string fires on a throw.
+ * The 93 pre-existing cases proving the cooldown/throttle/ladder logic itself
+ * already live beside the claims logic itself — `../claims/reconcile.test.ts`
+ * (21), `../claims/self-heal.test.ts` (51) and `../claims/escalation.test.ts`
+ * (21) — and were never inside host-sweep.test.ts to move: T20/T21's pre-move
+ * bodies in host-sweep.ts were already thin `registerSweepDuty` wrappers
+ * around `reconcileMergedClaims`/`sweepClaimsSelfHeal`, calling logic that
+ * predates the sweep registry and is owned elsewhere (mailbox PR 7 converts
+ * self-heal.ts's internals with its exported signature explicitly UNCHANGED —
+ * plan.md §5). Moving those pre-existing suites into this file would touch
+ * code outside S2-PR6's ownership for no behavior change, so they stay put,
+ * untouched. What DID move is the ~30-line wrapper each duty sat behind — the
+ * cases below drive exactly that move, per the family-case rule
+ * (brief-family-template.md, added 2026-09-03 after Codex hit PR 4 and PR 8):
+ * obtain each duty from the registry by name (the same accessor R-7 uses),
+ * invoke `run(ctx)`, and assert the underlying dependency was reached and the
+ * preserved failure log string fires on a throw.
  *
  * Hermeticity (brief-common.md HARD RULE): importing this module's ./index.js
  * registers T20/T21 at import — registration only pushes duty objects into an
@@ -91,27 +91,15 @@ function getDuty(name: string) {
   return duty;
 }
 
-describe('F-6.1', () => {
-  beforeEach(() => {
-    mockSweepClaimsSelfHeal.mockReset();
-  });
-
-  // Plan.md §8 F-6.1, exact title. The 92/93 ported cases proving the
-  // cooldown/throttle behavior itself live in ../claims/self-heal.test.ts
-  // (`describe('ladder', ...)`, `describe('throttle', ...)`) and
-  // ../claims/reconcile.test.ts — see the docstring above for why they were
-  // not moved. This case proves the REGISTERED T21 wrapper is the thing that
-  // actually reaches sweepClaimsSelfHeal, so that pre-existing, untouched
-  // behavior is exercised in production, not bypassed by the move.
-  it('the self-heal nudge ladder keeps its 24h per-claim cooldown and 10-minute scan throttle', async () => {
-    const duty = getDuty('claims-self-heal');
-
-    await duty.run(fakeTickContext());
-
-    expect(mockSweepClaimsSelfHeal).toHaveBeenCalledTimes(1);
-    expect(mockSweepClaimsSelfHeal).toHaveBeenCalledWith();
-  });
-});
+// F-6.1's exact-title case (plan.md §8) now lives in ./claims-throttle.test.ts,
+// which does NOT mock self-heal.js — it drives the registered T21 wrapper
+// through the REAL sweepClaimsSelfHeal with a real central DB, fake timers and
+// claim fixtures, mocking only self-heal.ts's own I/O seams (GitHub dispatch),
+// per Codex's PR6 review finding F3 (a mocked-dependency call-through proves
+// only that the wrapper calls something, not that the ladder/throttle
+// survived the move). The mocked call-through case below still stands as
+// family-case-rule evidence that the REGISTERED wrapper is what reaches
+// sweepClaimsSelfHeal at all.
 
 describe('the registered claims-reconcile wrapper calls reconcileMergedClaims', () => {
   beforeEach(() => {
@@ -146,6 +134,15 @@ describe('the registered claims-reconcile wrapper calls reconcileMergedClaims', 
 describe('the registered claims-self-heal wrapper calls sweepClaimsSelfHeal', () => {
   beforeEach(() => {
     mockSweepClaimsSelfHeal.mockReset();
+  });
+
+  it('run(ctx) calls sweepClaimsSelfHeal with no arguments', async () => {
+    const duty = getDuty('claims-self-heal');
+
+    await duty.run(fakeTickContext());
+
+    expect(mockSweepClaimsSelfHeal).toHaveBeenCalledTimes(1);
+    expect(mockSweepClaimsSelfHeal).toHaveBeenCalledWith();
   });
 
   it('a failure inside sweepClaimsSelfHeal logs the preserved string and does not reject', async () => {

@@ -1,17 +1,25 @@
 /**
- * PR 1 (main) adds the onHostShutdown stop for the worker here; at the
- * rebase onto main after PR 0/PR 1 deploy, take the UNION of both versions.
+ * On main, S2-PR1 owns the worker's stop via `onHostShutdown` —
+ * `stopHostModules()` runs before `stopHostSweep()` there by design, and
+ * S2-PR1 removes main.ts's own direct stop call. At the rebase onto main,
+ * take PR 1's version of this file verbatim (this file registers NO
+ * shutdown of its own — see the Codex PR6 review finding below).
  *
  * `startStorageMaintenanceOnce` is fire-and-forget, called once per sweep
  * tick (T13 below) with the tick's already-computed active session ids; the
  * persistent worker owns its own 1h/6h cadence internally
  * (storage-maintenance-worker.ts). On this branch's base (S2-PR2, mailbox
  * PR 5 lineage) neither S2-PR0's `host-lifecycle.ts` nor S2-PR1's own
- * version of this file exist, so this file carries ONLY what compiles here
- * — the start half and T13's registration — and none of PR 1's shutdown
- * registration. `src/main.ts` still calls `stopStorageMaintenanceWorker()`
- * directly at shutdown today; that stays exactly as-is (PR 1's job, outside
- * S2-PR6's ownership) until the union above happens.
+ * version of this file exist. An earlier draft of this file registered a
+ * stop via `response-registry.js`'s `onShutdown` as a substitute — Codex's
+ * PR6 review (F1, accepted) found that wrong on THIS base: response-registry
+ * callbacks fire before `stopHostSweep()` in `main.ts`'s `shutdown()`, so
+ * T13 could still tick against an already-stopped worker (a new
+ * `storage-manager: background maintenance failed` line) and `main.ts`
+ * would then stop the worker a second time. `src/main.ts`'s own direct
+ * `stopStorageMaintenanceWorker()` call is the sole, exactly-once shutdown
+ * owner on this branch and is untouched (S2-PR1's job to remove, outside
+ * S2-PR6's ownership).
  */
 import { registerSweepDuty, registerSweepDutySource, SWEEP_DUTY_INVENTORY } from '../../host-sweep.js';
 import { log } from '../../log.js';
