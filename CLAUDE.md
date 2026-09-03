@@ -35,7 +35,7 @@ Full schema: [docs/db-central.md](docs/db-central.md)
 
 Each session has **two** SQLite files under `data/v2-sessions/<session_id>/`: `inbound.db` (host writes, container reads) and `outbound.db` (container writes, host reads) — one writer per file, no cross-mount lock contention. Heartbeat is a file touch at `/workspace/.heartbeat`, not a DB update; host uses even `seq` numbers, container odd. [docs/db-session.md](docs/db-session.md)
 
-`data/v2.db` holds everything that isn't per-session (migrations: `src/db/migrations/`). For ad-hoc queries, use `pnpm exec tsx scripts/q.ts <db> "<sql>"`, not the `sqlite3` CLI — setup avoids depending on that binary (`setup/verify.ts:5`); the wrapper goes through the already-installed `better-sqlite3` dep. [docs/db-central.md](docs/db-central.md)
+`data/v2.db` holds everything that isn't per-session (migrations: `src/db/migrations/`). For ad-hoc queries use `pnpm exec tsx scripts/q.ts <db> "<sql>"`, not the `sqlite3` CLI (setup avoids that binary, `setup/verify.ts:5`; the wrapper uses the installed `better-sqlite3`). [docs/db-central.md](docs/db-central.md)
 
 ## Key Files
 
@@ -44,12 +44,12 @@ Most of `src/` is discoverable by reading it. These are the ones you would not g
 - **`src/guard/`** — the privileged-action decision seam: `guard(action, input)` → allow | hold | deny. `ncl`/delivery actions *demand* a guard at registration; approved replays re-run checks with the approval row as a grant.
 - **`src/host-sweep.ts`** — one 60s sweep owns `processing_ack` sync, stale detection, due-message wake, recurrence, ceiling-kill accountability. Anything "on a timer" happens here.
 - **`src/router.ts` → `src/delivery.ts`** — the two ends of the message path; everything else hangs off them.
-- **`scripts/vendor-design-artifact-loop.ts`** — the design-artifact-loop skill and `design_review` engine are **vendored**; develop in `~/plugins/design-artifact-loop`, not in-tree — `src/design-artifact-loop-vendor.test.ts` fails on drift.
-- **`src/group-init.ts`** — the agent-runner source is a shared read-only mount, NOT copied per group; the agent-runner source is snapshotted at host boot (`src/agent-runner-source.ts`) and the snapshot is mounted read-only for every group; a source edit takes effect at the next host restart, not the next spawn (`NANOCLAW_AGENT_RUNNER_SRC_LIVE=1` mounts the checkout for local dev).
+- **`scripts/vendor-design-artifact-loop.ts`** — the design-artifact-loop skill and `design_review` engine are **vendored** from `~/plugins/design-artifact-loop` (develop there, not in-tree); `src/design-artifact-loop-vendor.test.ts` fails on drift.
+- **`src/group-init.ts`** — the agent-runner source is a boot snapshot (`src/agent-runner-source.ts`) mounted read-only for every group; edits take effect at the next host restart, not the next spawn.
 
 ## Admin CLI (`ncl`)
 
-Queries/modifies the central DB — agent groups, messaging groups, wirings, users, roles, tasks. Host: Unix socket (`src/cli/socket-server.ts`). Container: session-DB transport (`container/agent-runner/src/cli/ncl.ts`). `ncl help` / `ncl <resource> help` generate from the registry — always current, don't mirror them here.
+Queries/modifies the central DB — agent groups, messaging groups, wirings, users, roles, tasks. Host: Unix socket (`src/cli/socket-server.ts`). Container: session-DB transport (`container/agent-runner/src/cli/ncl.ts`). `ncl help` / `ncl <resource> help` are generated from the registry; don't mirror them here.
 
 ## Channels and Providers (skill-installed)
 
@@ -59,11 +59,11 @@ Trunk ships no channel adapter or non-default agent provider — those live on l
 
 ## Self-Modification
 
-`install_packages`/`add_mcp_server` edit an agent group's container config (deps, MCP wiring) behind a single admin approval; `src/modules/self-mod/apply.ts` rebuilds the image if needed and respawns via `on_wake` — picked up only on the fresh container's first poll, so a dying one can never steal it. A second tier (source-level self-edits via draft/activate) is planned, not built. `container/agent-runner/src/mcp-tools/self-mod.ts`
+`install_packages`/`add_mcp_server` edit an agent group's container config (deps, MCP wiring) behind a single admin approval; `src/modules/self-mod/apply.ts` rebuilds the image if needed and respawns via `on_wake` (race semantics under Container Restart). A second tier (source-level self-edits via draft/activate) is planned, not built. `container/agent-runner/src/mcp-tools/self-mod.ts`
 
 ## Container Config
 
-Per-agent-group container runtime config (provider, model, packages, MCP servers, mounts) is split across two stores — easy to get wrong. `groups/<folder>/container.json` is authoritative: the spawn path reads it (`readContainerConfig`), bind-mounts it read-only, and the runner reads `provider`/`model`/`effort` from it — no DB→file materialization at spawn, only identity fields (`agentGroupId`, `groupName`) sync (`configFromDb()` exists, no callers). `container_configs` (central DB) is a read-side projection for `-m`/`-e` flag vocabulary, scheduled-task validation, and image builds.
+Per-agent-group container runtime config (provider, model, packages, MCP servers, mounts) is split across two stores. `groups/<folder>/container.json` is authoritative: the spawn path reads it (`readContainerConfig`), bind-mounts it read-only, and the runner reads `provider`/`model`/`effort` from it — no DB→file materialization at spawn, only identity fields (`agentGroupId`, `groupName`) sync (`configFromDb()` exists, no callers). `container_configs` (central DB) is a read-side projection for `-m`/`-e` flag vocabulary, scheduled-task validation, and image builds.
 
 `ncl groups config get/update` and the self-mod MCP tools manage both: `config update` writes `provider`/`model`/`effort` to the DB row *and* mirrors them into `container.json`, so a provider change takes effect next restart — writing only the DB row leaves the container booting its old provider.
 
@@ -128,20 +128,20 @@ Check these first when something goes wrong:
 | Host logs | `logs/nanoclaw.error.log` first (failures, crash-loop backoff, warnings), then `logs/nanoclaw.log` for the full chain |
 | Setup logs | `logs/setup.log` (overall), `logs/setup-steps/*.log` (per-step) |
 | Session DBs | `data/v2-sessions/<agent-group>/<session>/` — `inbound.db`/`messages_in` (reached container?), `outbound.db`/`messages_out` (agent responded?) |
-| Post-restart health | `grep 'OneCLI preflight ok' logs/nanoclaw.log` — the boot probe of the credential control API every spawn depends on. Adapter-started counts are NOT proof; a host that cannot reach the control API refuses every spawn at WARN and looks clean |
+| Post-restart health | `grep 'OneCLI preflight ok' logs/nanoclaw.log` — adapter counts are not proof; a host that cannot reach the OneCLI control API refuses every spawn at WARN |
 
-Host logs rotate daily via `/etc/logrotate.d/<systemd-unit-name>` (30-day retention). `copytruncate` is required, not optional — systemd opens the `StandardOutput=append:`/`StandardError=append:` redirect itself, so a normal rename-based rotation would leave the daemon writing to an unlinked file until restart. Container logs vanish on exit (`--rm`) — a silent in-container failure leaves nothing persistent to inspect.
+Host logs rotate daily via `/etc/logrotate.d/<systemd-unit-name>` (30 days) with `copytruncate` — required: systemd holds the `StandardOutput=append:` redirect open, so rename-based rotation leaves the daemon writing to an unlinked file until restart. Container logs vanish on exit (`--rm`); a silent in-container failure leaves nothing to inspect.
 
 ## Timestamps
 
 Two rules, no exceptions:
 
-- **Storage**: every timestamp written from JS is `new Date().toISOString()` (ISO-8601 UTC, `Z`). Never `datetime('now')` — its naive `YYYY-MM-DD HH:MM:SS` shape is misparsed as local time by `new Date()`, breaking string comparisons against ISO values. Pure-SQL contexts use `strftime('%Y-%m-%dT%H:%M:%fZ','now')`; SQL-side *comparisons* wrap both sides in `datetime()`.
-- **Display**: anything shown to an agent or user renders in the install timezone — `formatLocalTime`/`formatLocalStamp` (`src/timezone.ts` / `container/agent-runner/src/timezone.ts`). `--json`, DB values, operator logs stay ISO.
+- **Storage**: every timestamp written from JS is `new Date().toISOString()` (ISO-8601 UTC, `Z`). Never `datetime('now')`: its naive `YYYY-MM-DD HH:MM:SS` parses as local time in `new Date()` and breaks string comparisons against ISO values. Pure SQL uses `strftime('%Y-%m-%dT%H:%M:%fZ','now')`; SQL comparisons wrap both sides in `datetime()`.
+- **Display**: anything shown to an agent or user renders in the install timezone via `formatLocalTime`/`formatLocalStamp` (`src/timezone.ts`, runner `timezone.ts`); `--json`, DB values, operator logs stay ISO.
 
 ## Supply Chain Security (pnpm)
 
-Tracks latest stable, including majors. Prerelease, beta, RC, dev, nightly, draft, yanked, source-only, and target-incompatible releases are rejected; no release-age delay. Audit/apply flow: [docs/dependency-updates.md](docs/dependency-updates.md).
+Tracks latest stable, including majors; prerelease/beta/RC/dev/nightly/draft/yanked/source-only/target-incompatible releases are rejected, no release-age delay. Flow: [docs/dependency-updates.md](docs/dependency-updates.md).
 
 **Do not bypass without explicit human approval:**
 - **`allowBuilds`**: never add/enable packages here without approval — build scripts execute arbitrary code during install.
@@ -170,7 +170,7 @@ Tracks latest stable, including majors. Prerelease, beta, RC, dev, nightly, draf
 | Setup, customizing | `setup-wiring.md`, `customizing.md` |
 | CJK fonts | `cjk-fonts.md` |
 | Directive audit | `always-on-directive-classification.md`, `always-on-directive-baseline.md` |
-| Agent mailbox seam (in progress) | `agent-mailbox-seam-migration.md` is upstream's guide and describes the seam's END state; the fork reaches it PR by PR — current step and what exists today: `docs/specs/upstream-mailbox-seam/plan.md` §5 |
+| Agent mailbox seam | `docs/specs/upstream-mailbox-seam/plan.md` §5 (upstream doc = end state) |
 
 ## Container Runtime (Bun)
 
