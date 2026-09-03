@@ -134,6 +134,34 @@ const SECRETS_CACHE_TTL_MS = 60 * 1000;
 let secretsCache: { at: number; secrets: OnecliSecret[] } | null = null;
 
 /**
+ * One in-flight listing per resource, shared by every caller that arrives
+ * while it is running.
+ *
+ * A host restart wakes many agent groups at once, and the per-identity lock
+ * does not serialize them because they hold different identities. Without
+ * this, each one sees the same empty cache and starts its own
+ * `?limit=10000` listing — with a 24-container admission limit, dozens of
+ * heavyweight gateway requests at once, which can hit the 10 s curl ceiling
+ * and defer spawns that would otherwise have succeeded.
+ *
+ * Rejection is shared too, and the entry is cleared either way, so a failed
+ * listing fails every waiter that was already committed to it and the next
+ * caller retries from scratch. That preserves fail-closed: no caller ever
+ * proceeds on a listing that did not arrive.
+ */
+const inFlightListings = new Map<'agents' | 'secrets', Promise<unknown[]>>();
+
+function listViaApiOnce(resource: 'agents' | 'secrets'): Promise<unknown[]> {
+  const existing = inFlightListings.get(resource);
+  if (existing) return existing;
+  const tracked = listViaApi(resource).finally(() => {
+    if (inFlightListings.get(resource) === tracked) inFlightListings.delete(resource);
+  });
+  inFlightListings.set(resource, tracked);
+  return tracked;
+}
+
+/**
  * Serializes the read-modify-write grant reconcile per OneCLI identity.
  *
  * `execFileSync` used to make resolve → grants-read → mutate atomic with
@@ -266,8 +294,8 @@ async function getAgentGrants(agentUuid: string): Promise<OnecliAgentGrants> {
   return grants as OnecliAgentGrants;
 }
 
-async function listAgents(): Promise<OnecliAgent[]> {
-  return (await listViaApi('agents')) as OnecliAgent[];
+async function listAgents(force = false): Promise<OnecliAgent[]> {
+  return (await (force ? listViaApi('agents') : listViaApiOnce('agents'))) as OnecliAgent[];
 }
 
 /**
@@ -279,13 +307,25 @@ async function loadSecrets(forceRefresh: boolean): Promise<{ secrets: OnecliSecr
   if (!forceRefresh && secretsCache && Date.now() - secretsCache.at < SECRETS_CACHE_TTL_MS) {
     return { secrets: secretsCache.secrets, fromCache: true };
   }
-  const secrets = (await listViaApi('secrets')) as OnecliSecret[];
+  // A forced refresh deliberately does NOT join an in-flight listing. It runs
+  // only when a declaration missed against the cache, and its whole job is to
+  // answer "does this secret exist NOW" before refusing a spawn. Joining a
+  // listing that began before that question was asked could return data from
+  // before the secret was added, which would manufacture exactly the refusal
+  // this refresh exists to prevent.
+  const secrets = (await (forceRefresh ? listViaApi('secrets') : listViaApiOnce('secrets'))) as OnecliSecret[];
   secretsCache = { at: Date.now(), secrets };
   return { secrets, fromCache: false };
 }
 
-async function refreshAgentCache(): Promise<void> {
-  const agents = await listAgents();
+/**
+ * `force` skips the shared in-flight listing. Used only after a create
+ * returned 409, where the caller needs a listing that began AFTER the create
+ * — an earlier one would not contain the agent and would turn a won race into
+ * a spurious failure.
+ */
+async function refreshAgentCache(options?: { force?: boolean }): Promise<void> {
+  const agents = await listAgents(options?.force ?? false);
   const refreshed = new Map<string, string>();
   for (const agent of agents) {
     if (
@@ -354,7 +394,7 @@ async function ensureOnecliAgentLocked(input: EnsureOnecliAgentInput): Promise<E
 
   const response = await createAgentViaApi(input);
   if (response.status === 409) {
-    await refreshAgentCache();
+    await refreshAgentCache({ force: true });
     if (!identifierToUuid.has(input.identifier)) {
       throw new Error(
         `OneCLI agent create returned HTTP 409 but identifier "${input.identifier}" was not found after refresh`,
@@ -561,6 +601,7 @@ export function __resetCachesForTest(): void {
   identifierToUuid.clear();
   secretsCache = null;
   identityLocks.clear();
+  inFlightListings.clear();
 }
 
 /**

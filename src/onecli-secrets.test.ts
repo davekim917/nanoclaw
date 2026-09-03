@@ -6,6 +6,7 @@ import {
   applyOnecliSecrets,
   ensureOnecliAgent,
   mergeWorkgroupAndGroupSecrets,
+  resolveSecretUuids,
   slackUserTokenSecrets,
   __resetCachesForTest,
   __test,
@@ -55,6 +56,30 @@ function respond(fn: (bin: unknown, argv: unknown) => string): void {
 
 function respondOnce(fn: (bin: unknown, argv: unknown) => string): void {
   mockedExec.mockImplementationOnce(toCallbackImpl(fn));
+}
+
+/**
+ * Like `respond`, but every call parks until the test releases it. Lets a test
+ * hold a listing open while other callers arrive, which is the only way to
+ * observe whether concurrent misses coalesce onto one request.
+ */
+function respondDeferred(fn: (bin: unknown, argv: unknown) => string): { releaseAll: () => void; parked: number } {
+  const waiting: Array<() => void> = [];
+  const state = {
+    releaseAll: () => {
+      const pending = waiting.splice(0, waiting.length);
+      for (const release of pending) release();
+    },
+    get parked() {
+      return waiting.length;
+    },
+  };
+  mockedExec.mockImplementation((bin: unknown, argv: unknown, _options: unknown, callback: unknown) => {
+    const done = callback as ExecFileCallback;
+    waiting.push(() => done(null, fn(bin, argv), ''));
+    return undefined;
+  });
+  return state as { releaseAll: () => void; parked: number };
 }
 
 // OneCLI gateway calls go through curl. These predicates match an
@@ -758,5 +783,104 @@ describe('#315 — the secrets cache staleness window is bounded and specified',
     await expect(applyOnecliSecrets('example-retail', ['Anthropic'])).rejects.toThrow(
       /secret\(s\) not found in vault: Anthropic/,
     );
+  });
+});
+
+// ── #319 review r2 — concurrent cache refreshes coalesce ─────────────────────
+//
+// A host restart wakes many agent groups at once. The per-identity lock does
+// not serialize them, because they hold different identities, so without
+// single-flight every one of them sees the same empty cache and starts its own
+// `?limit=10000` listing.
+
+describe('#319 review r2 — cold-cache stampede', () => {
+  test('concurrent agent-cache misses issue exactly one agents listing', async () => {
+    const deferred = respondDeferred((bin: unknown, rawArgs: unknown) => {
+      const argv = (rawArgs ?? []) as string[];
+      if (bin !== 'curl') return '';
+      return argv.join(' ').includes('/api/agents') ? JSON.stringify(AGENT_FIXTURE) : '';
+    });
+
+    // Eight distinct identities, so the per-identity lock cannot help.
+    const identifiers = Array.from({ length: 8 }, (_, i) => `example-retail-${i}`);
+    const pending = Promise.allSettled(
+      identifiers.map((identifier) => ensureOnecliAgent({ name: identifier, identifier })),
+    );
+
+    // Let every caller reach the listing before any response arrives.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(mockedExec.mock.calls.filter(isAgentsListCall)).toHaveLength(1);
+
+    deferred.releaseAll();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    deferred.releaseAll();
+    await pending;
+
+    expect(mockedExec.mock.calls.filter(isAgentsListCall)).toHaveLength(1);
+  });
+
+  test('concurrent secret resolutions issue exactly one secrets listing', async () => {
+    const deferred = respondDeferred((bin: unknown, rawArgs: unknown) => {
+      const argv = (rawArgs ?? []) as string[];
+      if (bin !== 'curl') return '';
+      return argv.join(' ').includes('/api/secrets') ? JSON.stringify(SECRET_FIXTURE) : '';
+    });
+
+    const pending = Promise.all(Array.from({ length: 8 }, () => resolveSecretUuids(['Anthropic'])));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(mockedExec.mock.calls.filter(isSecretsListCall)).toHaveLength(1);
+
+    deferred.releaseAll();
+    const resolved = await pending;
+
+    expect(mockedExec.mock.calls.filter(isSecretsListCall)).toHaveLength(1);
+    // Every caller gets the real answer, not a placeholder.
+    for (const uuids of resolved) expect(uuids).toEqual(['dddddddd-dddd-dddd-dddd-dddddddddddd']);
+  });
+
+  test('a failed listing rejects its waiters and does not poison the next call', async () => {
+    let attempt = 0;
+    respond((bin: unknown, rawArgs: unknown) => {
+      const argv = (rawArgs ?? []) as string[];
+      if (bin !== 'curl') return '';
+      if (!argv.join(' ').includes('/api/secrets')) return '';
+      attempt++;
+      if (attempt === 1) throw new Error('gateway unreachable');
+      return JSON.stringify(SECRET_FIXTURE);
+    });
+
+    const results = await Promise.allSettled(Array.from({ length: 4 }, () => resolveSecretUuids(['Anthropic'])));
+    // Fail-closed: nobody proceeds on a listing that never arrived.
+    expect(results.every((result) => result.status === 'rejected')).toBe(true);
+    expect(attempt).toBe(1);
+
+    // The in-flight entry is cleared, so the next caller retries rather than
+    // inheriting the failure forever.
+    await expect(resolveSecretUuids(['Anthropic'])).resolves.toEqual(['dddddddd-dddd-dddd-dddd-dddddddddddd']);
+    expect(attempt).toBe(2);
+  });
+
+  test('a forced refresh does not join a listing that started before it', async () => {
+    // Cache warmed WITHOUT the secret, so the next resolution misses and forces.
+    let listings = 0;
+    respond((bin: unknown, rawArgs: unknown) => {
+      const argv = (rawArgs ?? []) as string[];
+      if (bin !== 'curl') return '';
+      if (!argv.join(' ').includes('/api/secrets')) return '';
+      listings++;
+      if (listings === 1) return JSON.stringify(SECRET_FIXTURE);
+      return JSON.stringify({
+        data: [...SECRET_FIXTURE.data, { id: 'eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee', name: 'Added-Late' }],
+      });
+    });
+
+    await resolveSecretUuids(['Anthropic']);
+    expect(listings).toBe(1);
+
+    // The forced re-read must be its own request. Joining an in-flight listing
+    // that began before the miss could return pre-addition data and refuse a
+    // spawn for a secret that exists.
+    await expect(resolveSecretUuids(['Added-Late'])).resolves.toEqual(['eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee']);
+    expect(listings).toBe(2);
   });
 });
