@@ -1,4 +1,5 @@
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
@@ -57,10 +58,41 @@ describe('main.ts starts no duty timer directly', () => {
  * of accumulating registrations across cases (registration happens once, at
  * import time).
  */
-function mockWorktreeCleanupDeps(logMock: Record<string, ReturnType<typeof vi.fn>>): void {
+/**
+ * A tripwire, not a functional mock. It records the call (so the test can
+ * assert on that record even though the thrown error itself may be
+ * swallowed — every caller here already wraps its real work in try/catch or
+ * .catch, precisely so a git/network failure never crashes the host, which
+ * means an uncaught-throw-only tripwire could fire and still leave a test
+ * green) and then throws, so a caller that does NOT catch it fails loudly
+ * too. Pass a fresh `record` array per test and assert `record` is empty at
+ * the end — that assertion is what actually fails the test if a seam mock is
+ * ever weakened or a new duty adds an unguarded child_process call, instead
+ * of a real process (git, docker, …) spawning silently from a unit test run.
+ */
+function childProcessTripwireFactory(record: string[]): Record<string, (...args: unknown[]) => never> {
+  const spawnAttempted =
+    (name: string) =>
+    (...args: unknown[]): never => {
+      record.push(name);
+      throw new Error(`host-sweep-registry.test: real process spawn attempted (${name}(${JSON.stringify(args[0])}))`);
+    };
+  return {
+    exec: spawnAttempted('exec'),
+    execFile: spawnAttempted('execFile'),
+    spawn: spawnAttempted('spawn'),
+    execSync: spawnAttempted('execSync'),
+    spawnSync: spawnAttempted('spawnSync'),
+  };
+}
+
+function mockWorktreeCleanupDeps(
+  logMock: Record<string, ReturnType<typeof vi.fn>>,
+  dataDir = '/tmp/host-sweep-registry-test',
+): void {
   vi.doMock('./config.js', () => ({
-    DATA_DIR: '/tmp/host-sweep-registry-test',
-    GROUPS_DIR: '/tmp/host-sweep-registry-test/groups',
+    DATA_DIR: dataDir,
+    GROUPS_DIR: `${dataDir}/groups`,
   }));
   vi.doMock('./container-runner.js', () => ({ isContainerRunning: () => false, isContainerSpawning: () => false }));
   vi.doMock('./db/connection.js', () => ({ getDb: () => ({ prepare: () => ({ all: () => [] }) }) }));
@@ -91,6 +123,8 @@ describe('a timer that fails to start still aborts boot, and a failing interval 
     vi.doUnmock('./db/session-db.js');
     vi.doUnmock('./log.js');
     vi.doUnmock('./db/agent-groups.js');
+    vi.doUnmock('child_process');
+    vi.doUnmock('node:child_process');
     vi.restoreAllMocks();
     vi.useRealTimers();
   });
@@ -144,6 +178,16 @@ describe('a timer that fails to start still aborts boot, and a failing interval 
     }));
     const logMock = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() };
     vi.doMock('./log.js', () => ({ log: logMock }));
+    // Tripwire (see childProcessTripwireFactory): getAllAgentGroups()
+    // returning [] already means commit-scan's own group loop — the only
+    // path that reaches execFileSync('git', …) — never runs; this is
+    // regression insurance, not the primary guard. spawnAttempts must stay
+    // empty (asserted below) even though the module already `.catch`es its
+    // own git failures, which would otherwise swallow a bare thrown tripwire
+    // without ever failing the test.
+    const spawnAttempts: string[] = [];
+    vi.doMock('child_process', () => childProcessTripwireFactory(spawnAttempts));
+    vi.doMock('node:child_process', () => childProcessTripwireFactory(spawnAttempts));
 
     try {
       const commitScan = await import('./commit-scan.js');
@@ -166,6 +210,8 @@ describe('a timer that fails to start still aborts boot, and a failing interval 
       process.off('unhandledRejection', onUnhandledRejection);
     }
 
+    expect(spawnAttempts).toEqual([]);
+
     expect(unhandled).toEqual([]);
   });
 });
@@ -186,6 +232,9 @@ describe("module intervals are unref'd and cleared on shutdown", () => {
     vi.doUnmock('./container-config.js');
     vi.doUnmock('./github-token.js');
     vi.doUnmock('./log.js');
+    vi.doUnmock('fs');
+    vi.doUnmock('child_process');
+    vi.doUnmock('node:child_process');
   });
 
   it("T-4: every timer handle the six modules create is unref'd, and none remain pending after stopHostModules", async () => {
@@ -208,50 +257,104 @@ describe("module intervals are unref'd and cleared on shutdown", () => {
     vi.stubGlobal('setTimeout', wrapTimerFn(globalThis.setTimeout));
     vi.stubGlobal('setInterval', wrapTimerFn(globalThis.setInterval));
 
-    const logMock = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() };
-    mockWorktreeCleanupDeps(logMock);
-    vi.doMock('./db/agent-groups.js', () => ({ getAllAgentGroups: () => [] }));
-    vi.doMock('./db/backlog.js', () => ({
-      getBacklog: () => [],
-      getBacklogResolvedSince: () => [],
-      getShipLogSince: () => [],
-      addShipLogEntry: () => undefined,
-      getCommitDigestState: () => null,
-      upsertCommitDigestState: () => undefined,
-    }));
-    vi.doMock('./db/messaging-groups.js', () => ({ getMessagingGroup: () => null }));
-    // NOT mocked: ./delivery.js. repo-freshness.js pulls in
-    // ./modules/repository-workspaces/index.js, which calls
-    // registerDeliveryAction(...) from ./delivery.js at IMPORT time — a
-    // stub lacking that export breaks module evaluation itself, not just a
-    // later call. repo-freshness.test.ts already proves the real module is
-    // safe to import unmocked; its own getDeliveryAdapter() returns null
-    // with no adapter registered, which every tick body here already
-    // handles as a no-op.
-    vi.doMock('./container-config.js', () => ({ readContainerConfig: () => ({}) }));
-    vi.doMock('./github-token.js', () => ({ resolveGitHubToken: () => null }));
+    // A real, empty, test-owned tmp dir: DATA_DIR for worktree-cleanup and
+    // repo-freshness (both resolve their real targets from it, and an empty
+    // dir means zero targets, so neither ever reaches its own git calls); a
+    // fake-home this test never populates for plugin-updater, below.
+    const tmpRoot = fs.mkdtempSync('/tmp/host-sweep-registry-t4-');
+    // Vitest does not intercept `os`/`node:os` in this project's config
+    // (verified: vi.doMock('os', …) has zero effect on a dynamically
+    // imported consumer's os.homedir()) — so plugin-updater's own
+    // `path.join(os.homedir(), 'plugins')` is computed here, for real,
+    // against the REAL home directory, to know exactly what path the
+    // fs.existsSync seam below needs to intercept.
+    const realPluginsRoot = path.join(os.homedir(), 'plugins');
 
-    const { startHostModules, stopHostModules } = await import('./host-lifecycle.js');
-    await import('./worktree-cleanup.js');
-    await import('./repo-freshness.js');
-    await import('./plugin-updater.js');
-    await import('./commit-scan.js');
-    await import('./daily-summary.js');
-    await import('./backlog-canvas.js');
+    try {
+      const logMock = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() };
+      mockWorktreeCleanupDeps(logMock, tmpRoot);
+      vi.doMock('./db/agent-groups.js', () => ({ getAllAgentGroups: () => [] }));
+      vi.doMock('./db/backlog.js', () => ({
+        getBacklog: () => [],
+        getBacklogResolvedSince: () => [],
+        getShipLogSince: () => [],
+        addShipLogEntry: () => undefined,
+        getCommitDigestState: () => null,
+        upsertCommitDigestState: () => undefined,
+      }));
+      vi.doMock('./db/messaging-groups.js', () => ({ getMessagingGroup: () => null }));
+      // NOT mocked: ./delivery.js. repo-freshness.js pulls in
+      // ./modules/repository-workspaces/index.js, which calls
+      // registerDeliveryAction(...) from ./delivery.js at IMPORT time — a
+      // stub lacking that export breaks module evaluation itself, not just a
+      // later call. repo-freshness.test.ts already proves the real module is
+      // safe to import unmocked; its own getDeliveryAdapter() returns null
+      // with no adapter registered, which every tick body here already
+      // handles as a no-op.
+      vi.doMock('./container-config.js', () => ({ readContainerConfig: () => ({}) }));
+      vi.doMock('./github-token.js', () => ({ resolveGitHubToken: () => null }));
+      // plugin-updater's own seam: runPluginUpdates()' very first line is
+      // `path.join(os.homedir(), 'plugins')`, then a real fs.existsSync
+      // check that returns early (before ever calling git) the moment it is
+      // false. Since os.homedir() can't be intercepted (see realPluginsRoot
+      // above), the seam has to sit one call later: fs.existsSync itself,
+      // wrapped so ONLY that one exact real path is faked to "missing" —
+      // every other fs call (worktree-cleanup's and repo-freshness's real
+      // scans of tmpRoot included) passes straight through to the real fs.
+      vi.doMock('fs', async (importOriginal) => {
+        const actual = (await importOriginal<typeof import('fs')>()) as unknown as Record<string, unknown> & {
+          existsSync: typeof fs.existsSync;
+          default?: Record<string, unknown>;
+        };
+        const guardedExistsSync = ((p: fs.PathLike, ...rest: unknown[]) =>
+          String(p) === realPluginsRoot
+            ? false
+            : (actual.existsSync as (...a: unknown[]) => boolean)(p, ...rest)) as typeof fs.existsSync;
+        return {
+          ...actual,
+          default: { ...actual.default, existsSync: guardedExistsSync },
+          existsSync: guardedExistsSync,
+        };
+      });
+      // Tripwire (see childProcessTripwireFactory) — regression insurance on
+      // top of the seam mocks above, not the primary guard. spawnAttempts
+      // must stay empty (asserted below) even though every one of these
+      // modules already catches its own git/network failures, which would
+      // otherwise swallow a bare thrown tripwire without ever failing the
+      // test.
+      const spawnAttempts: string[] = [];
+      vi.doMock('child_process', () => childProcessTripwireFactory(spawnAttempts));
+      vi.doMock('node:child_process', () => childProcessTripwireFactory(spawnAttempts));
 
-    await startHostModules({ db: {} as never, signal: new AbortController().signal });
+      const { startHostModules, stopHostModules } = await import('./host-lifecycle.js');
+      await import('./worktree-cleanup.js');
+      await import('./repo-freshness.js');
+      await import('./plugin-updater.js');
+      await import('./commit-scan.js');
+      await import('./daily-summary.js');
+      await import('./backlog-canvas.js');
 
-    // Advance far enough to trigger the first self-reschedule of the
-    // self-rescheduling chains (commit-scan/daily-summary/backlog-canvas),
-    // so their RESCHEDULED handle — not just the initial one — is checked too.
-    await vi.advanceTimersByTimeAsync(11 * 60 * 1000);
+      await startHostModules({ db: {} as never, signal: new AbortController().signal });
 
-    expect(createdHandles.length).toBeGreaterThan(0);
-    expect(createdHandles.every((h) => h.unrefCalled)).toBe(true);
-    expect(vi.getTimerCount()).toBeGreaterThan(0);
+      // Advance far enough to trigger the first self-reschedule of the
+      // self-rescheduling chains (commit-scan/daily-summary/backlog-canvas),
+      // so their RESCHEDULED handle — not just the initial one — is checked
+      // too. This also crosses plugin-updater's 5-minute startup delay,
+      // which is exactly why the os.js seam mock above matters: without it
+      // this advance would fire a REAL `git pull --ff-only` against every
+      // repo under ~/plugins.
+      await vi.advanceTimersByTimeAsync(11 * 60 * 1000);
 
-    await stopHostModules();
+      expect(createdHandles.length).toBeGreaterThan(0);
+      expect(createdHandles.every((h) => h.unrefCalled)).toBe(true);
+      expect(vi.getTimerCount()).toBeGreaterThan(0);
 
-    expect(vi.getTimerCount()).toBe(0);
+      await stopHostModules();
+
+      expect(vi.getTimerCount()).toBe(0);
+      expect(spawnAttempts).toEqual([]);
+    } finally {
+      fs.rmSync(tmpRoot, { recursive: true, force: true });
+    }
   });
 });
