@@ -4,9 +4,13 @@
  *
  *  A gate that throws anyway is caught, reported once per gate per distinct message (the
  *  boundary runs every second — a repeated failure must not become a log flood) and treated
- *  as NOT holding. Fail-open is safe here because holding is an optimization of the
- *  observer's own invariant, never its enforcement: the repository fence, for example, still
- *  returns [] from the fenced getPendingMessages path whatever this gate does. */
+ *  as NOT holding, so one broken observer cannot wedge every container.
+ *
+ *  That default is for observers whose hold is advisory. A gate enforcing an invariant owns
+ *  its own fail-closed handling and must not reach this catch: the loop consults gates at
+ *  several boundaries, and the later ones run after message selection has already produced a
+ *  batch, so there is nothing downstream to stop a turn that this catch lets through. See
+ *  modules/mailbox/admission.ts for the worked example. */
 export type AdmissionGate = () => boolean;
 
 const gates: AdmissionGate[] = [];
