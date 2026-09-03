@@ -538,13 +538,22 @@ describe('#315 — ground truth for the projection contents', () => {
     ]);
   });
 
-  it('streams rather than materializing the whole result set', () => {
+  it('does not hold a source read transaction across the projection write', () => {
     const source = fs.readFileSync(new URL('./per-agent-projections.ts', import.meta.url), 'utf-8');
-    // `.all()` on the archive read is what held every row, `text` included, in
-    // one JS array. The central projection still uses `.all()` on small tables.
-    expect(source).toContain('.iterate(...workgroupMemberIds)');
-    expect(source).toContain('.iterate(agentGroupId)');
-    expect(source).not.toMatch(/\.all\(\.\.\.workgroupMemberIds\)/);
+    // `archive.db` is in `journal_mode = TRUNCATE`, where a reader blocks a
+    // writer, and the host's archiveMessage writer is synchronous on the main
+    // thread. An open `.iterate()` cursor would hold a shared lock on the
+    // canonical archive through the whole insert phase and stall that writer
+    // or drop its row. WAL would fix the conflict but is ruled out upstream:
+    // containers mount archive.db read-only with no -wal sidecar.
+    // Comment lines stripped first — the prose above the read names
+    // `.iterate()` on purpose, to say why it is not used.
+    const code = source
+      .split('\n')
+      .filter((line) => !/^\s*(\/\/|\*|\/\*)/.test(line))
+      .join('\n');
+    expect(code).not.toMatch(/\.iterate\(/);
+    expect(code).toContain('.all(...workgroupMemberIds)');
   });
 });
 

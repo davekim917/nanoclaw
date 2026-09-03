@@ -132,15 +132,27 @@ export function buildArchiveProjection(
     }
     const src = new Database(srcPath, { readonly: true });
     try {
-      // Streamed with `.iterate()`, not materialized with `.all()`.
+      // Materialized with `.all()`, deliberately, NOT streamed with
+      // `.iterate()`.
       //
-      // `.all()` built one JS array holding every matching row, `text` column
-      // included — measured at 2.26 s and a 237 MB heap spike for the largest
-      // workgroup, the single biggest component of the per-spawn cost in #315.
-      // Streaming hands each row straight to the insert instead. `src` and
-      // `dst` are separate connections to separate files, so reading one while
-      // a write transaction is open on the other is safe.
-      let rows: Iterable<Record<string, unknown>>;
+      // Streaming looks better: `.all()` builds one JS array holding every
+      // matching row, `text` included, measured at 2.26 s and a 237 MB heap
+      // peak for the largest workgroup. But `archive.db` runs
+      // `journal_mode = TRUNCATE`, where a reader blocks a writer, and an open
+      // iterator would hold a shared lock on the canonical archive for the
+      // whole insert phase as well as the read. The host's `archiveMessage`
+      // writer is synchronous and on the main thread, so it would stall behind
+      // that lock or fail `SQLITE_BUSY` and drop the archive row — trading the
+      // stall this file is fixing for a different one. WAL would remove the
+      // conflict but is ruled out upstream: containers read `archive.db`
+      // through a read-only mount with no `-wal`/`-shm` sidecars, so WAL
+      // writes would be invisible to them (see `src/message-archive.ts`).
+      //
+      // `.all()` therefore holds the read lock only while reading, and the
+      // insert phase runs with the source released. The 2.26 s and the heap
+      // peak now land on the projection worker thread rather than the host's,
+      // which is what made them affordable.
+      let rows: Array<Record<string, unknown>>;
       if (workgroupMemberIds && workgroupMemberIds.length > 0) {
         // ── Workgroup-widened SELECT with dedup ─────────────────────────
         // Intentional sibling sharing within a workgroup (the workgroup is
@@ -176,21 +188,20 @@ export function buildArchiveProjection(
              WHERE agent_group_id IN (${placeholders})
              GROUP BY messaging_group_id, thread_id, role, sender_id, sent_at, text`,
           )
-          .iterate(...workgroupMemberIds) as Iterable<Record<string, unknown>>;
+          .all(...workgroupMemberIds) as Array<Record<string, unknown>>;
       } else {
         // ── Legacy single-agent filter (test fixtures, fresh installs pre-migration) ─
         rows = src
           .prepare(`SELECT ${ARCHIVE_COLS.join(', ')} FROM messages_archive WHERE agent_group_id = ?`)
-          .iterate(agentGroupId) as Iterable<Record<string, unknown>>;
+          .all(agentGroupId) as Array<Record<string, unknown>>;
       }
 
       const colList = ARCHIVE_COLS.join(', ');
       const placeholders = ARCHIVE_COLS.map(() => '?').join(', ');
       const insertStmt = dst.prepare(`INSERT INTO messages_archive (${colList}) VALUES (${placeholders})`);
       // Already one transaction around one prepared statement — the shape a
-      // row-at-a-time loop needs. What changed is only where the rows come
-      // from: an iterator rather than a fully materialized array.
-      const insertMany = dst.transaction((batch: Iterable<Record<string, unknown>>) => {
+      // row-at-a-time loop needs. Unchanged by this PR.
+      const insertMany = dst.transaction((batch: Array<Record<string, unknown>>) => {
         for (const row of batch) {
           // Stamp the spawning agent's id onto every deduped row (see
           // workgroup-widened SELECT comment above). Keeps the NOT NULL
