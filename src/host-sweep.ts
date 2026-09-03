@@ -66,8 +66,6 @@ import {
 } from './container-runner.js';
 import type { Session } from './types.js';
 import { getDb } from './db/connection.js';
-import { reconcileMergedClaims } from './modules/claims/reconcile.js';
-import { sweepClaimsSelfHeal } from './modules/claims/self-heal.js';
 
 /**
  * Session-DB timestamp parsing now lives with the mailbox module that owns
@@ -2055,37 +2053,8 @@ function registerBuiltInSweepDuties(): void {
   // T14 completed-task-auto-archive (order 70) moved to
   // src/modules/sweep-orchestrator/index.ts (S2-PR5).
 
-  registerSweepDuty({
-    name: id.T20,
-    phase: 'tick:housekeeping',
-    order: 100,
-    // Claim reconciliation, then self-heal. Order is load-bearing: a claim whose
-    // pull request has merged must be CLOSED, not escalated at somebody — the
-    // reconcile pass deletes those files first, so the ladder below never sees
-    // them. Both are throttled internally to once per 10 minutes and each is
-    // isolated, so a GitHub outage cannot take the nudge ladder down with it.
-    run: async () => {
-      try {
-        await reconcileMergedClaims();
-      } catch (err) {
-        log.warn('Claims reconcile sweep step failed', { err });
-      }
-    },
-  });
-
-  registerSweepDuty({
-    name: id.T21,
-    phase: 'tick:housekeeping',
-    order: 110,
-    // Strictly after T20 — see the comment there.
-    run: async () => {
-      try {
-        await sweepClaimsSelfHeal();
-      } catch (err) {
-        log.warn('Claims self-heal sweep step failed', { err });
-      }
-    },
-  });
+  // T20 (claims-reconcile, order 100) and T21 (claims-self-heal, order 110,
+  // strictly after T20) moved to src/modules/sweep-claims/index.ts (S2-PR6).
 
   // ── SLA observation hooks — inside the SLA duty's own observe session ───────
   //
