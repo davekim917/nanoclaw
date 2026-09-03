@@ -160,7 +160,7 @@ pnpm exec tsc -p container/agent-runner/tsconfig.json --noEmit
 # Host tree: buildContainerArgs wiring
 pnpm exec vitest run src/atomic-chat-wiring.test.ts
 # Container tree: index.ts registration
-(cd container/agent-runner && bun test src/atomic-chat-registration.test.ts)
+(cd container/agent-runner && bun run test src/atomic-chat-registration.test.ts)
 ./container/build.sh
 ```
 

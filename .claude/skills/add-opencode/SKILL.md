@@ -281,6 +281,6 @@ grep -q "./opencode.js" src/providers/index.ts && echo "host barrel: OK"
 grep -q "@opencode-ai/sdk" container/agent-runner/package.json && echo "agent-runner dep: OK"
 grep -q "opencode-ai@" container/Dockerfile && echo "Dockerfile install: OK"
 pnpm exec vitest run src/providers/opencode-registration.test.ts
-cd container/agent-runner && bun test src/providers/ && cd -
+cd container/agent-runner && bun run test src/providers/ && cd -
 pnpm exec tsx scripts/provider-memory-contract.ts --provider opencode --require-payload
 ```
