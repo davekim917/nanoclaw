@@ -30,7 +30,6 @@ import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import type Database from 'better-sqlite3';
 
 import { log } from '../../log.js';
 import { evaluateManagedGitCommand } from '../../managed-git-command-guard.js';
@@ -39,6 +38,7 @@ import { evaluateManagedGitCommand } from '../../managed-git-command-guard.js';
 // loadEnvIntoProcess() runs.
 import { TASK_SCRIPT_TIMEOUT_MS, TIMEZONE } from '../../config.js';
 import { resolveGroupTimezone } from '../../container-config.js';
+import type { NanoclawMailboxSession } from '../mailbox/index.js';
 
 // Same rationale as the container-side constant (task-script.ts): the flat
 // 30s default killed a working 56s watcher script into an auto-pause.
@@ -412,11 +412,6 @@ export function runHostScript(script: string, taskId: string, tz: string = TIMEZ
 
 // ── Sweep integration ───────────────────────────────────────────────────────
 
-interface HostGatedTaskRow {
-  id: string;
-  content: string;
-}
-
 /**
  * Run host-side pre-task scripts for due task rows that opted in
  * (`content.scriptHost === true`). Called from host-sweep.ts's
@@ -430,7 +425,7 @@ interface HostGatedTaskRow {
  *
  * Outcomes mirror applyPreTaskScripts, written directly to messages_in.status
  * — the host-owned equivalent of the container's processing_ack ack (see
- * syncProcessingAcks in db/session-db.ts, which maps the same two outcomes
+ * syncProcessingAcks in the mailbox module, which maps the same two outcomes
  * onto the same two statuses):
  *   - wakeAgent=false → status='completed' (gated; recurrence never backs off)
  *   - script error     → status='failed' (recurrence reads the trailing
@@ -444,17 +439,24 @@ interface HostGatedTaskRow {
  *     through to the existing, unchanged container-side script execution.
  */
 export async function runHostGatedTaskScripts(
-  inDb: Database.Database,
+  mailbox: NanoclawMailboxSession,
   agentGroupId: string,
   sessionId: string,
 ): Promise<void> {
-  const due = inDb
-    .prepare(
-      `SELECT id, content FROM messages_in
-        WHERE kind = 'task' AND status = 'pending' AND trigger = 0
-          AND (process_after IS NULL OR datetime(process_after) <= datetime('now'))`,
-    )
-    .all() as HostGatedTaskRow[];
+  // The sweep's own session, passed down. `host-sweep.ts` is the only
+  // production caller and already holds one for this key, so opening a second
+  // here would trip the same-key nesting guard (invariant I-3). Taking the
+  // SESSION rather than a raw handle is what keeps this file off the mailbox
+  // ratchet's raw-access allowlist (invariant I-9 forbids handles, not
+  // sessions).
+  //
+  // Read every candidate first, then run the scripts: the read is one
+  // statement and the loop below can spend the full pre-task timeout per row.
+  // The caller therefore holds its session across script execution — which is
+  // exactly what PR 5's reviewed state already did by passing
+  // `legacyInboundHandle()`, so this is not a regression. Closing the session
+  // before the scripts run is a host-sweep restructure, not this PR.
+  const due = mailbox.listDueTaskRows();
   if (due.length === 0) return;
 
   // Resolved once per sweep tick, not per row: every due row here belongs to
@@ -488,7 +490,7 @@ export async function runHostGatedTaskScripts(
     const result = await runHostScript(script, row.id, tz);
     if (!result || !result.wakeAgent) {
       const status = result ? 'completed' : 'failed';
-      inDb.prepare("UPDATE messages_in SET status = ? WHERE id = ? AND status = 'pending'").run(status, row.id);
+      mailbox.resolvePendingTask(row.id, status);
       log.info('Host-gated script handled task without spawning a container', {
         sessionId,
         taskId: row.id,
@@ -498,8 +500,6 @@ export async function runHostGatedTaskScripts(
     }
 
     content.scriptOutput = result.data ?? null;
-    inDb
-      .prepare("UPDATE messages_in SET content = ? WHERE id = ? AND status = 'pending' AND trigger = 0")
-      .run(JSON.stringify(content), row.id);
+    mailbox.setPendingTaskContent(row.id, JSON.stringify(content));
   }
 }

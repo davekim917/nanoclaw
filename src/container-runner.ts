@@ -749,9 +749,9 @@ async function spawnContainer(
   const routingWritesStartedAt = Date.now();
   if (hasTable(getDb(), 'agent_destinations')) {
     const { writeDestinations } = await import('./modules/agent-to-agent/write-destinations.js');
-    writeDestinations(agentGroup.id, session.id);
+    await writeDestinations(agentGroup.id, session.id);
   }
-  writeSessionRouting(agentGroup.id, session.id);
+  await writeSessionRouting(agentGroup.id, session.id);
   logSpawnStage('routing-writes', routingWritesStartedAt);
 
   // Materialize the runner's immutable startup context before buildMounts

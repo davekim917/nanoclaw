@@ -17,6 +17,8 @@
 import type Database from 'better-sqlite3';
 
 import { cancelTask, clearRecurrence } from '../../../mailbox/sqlite/tasks.js';
+import { migrateMessagesInTable } from '../schema.js';
+import { sqliteUtcToIso } from '../sqlite-utc.js';
 import { nextEvenSeq } from './ingress.js';
 
 // Byte-identical to the fork's own copies; upstream owns the implementation.
@@ -57,9 +59,10 @@ export interface TaskRowInsert {
 }
 
 export function insertTaskRow(db: Database.Database, row: TaskRowInsert): void {
+  migrateMessagesInTable(db);
   db.prepare(
-    `INSERT INTO messages_in (id, seq, timestamp, status, tries, process_after, recurrence, kind, platform_id, channel_type, thread_id, content, series_id, trigger)
-     VALUES (@id, @seq, @timestamp, @status, 0, @processAfter, @recurrence, 'task', @platformId, @channelType, @threadId, @content, @seriesId, 0)`,
+    `INSERT INTO messages_in (id, seq, timestamp, status, tries, process_after, scheduled_for, recurrence, kind, platform_id, channel_type, thread_id, content, series_id, trigger)
+     VALUES (@id, @seq, @timestamp, @status, 0, @processAfter, @processAfter, @recurrence, 'task', @platformId, @channelType, @threadId, @content, @seriesId, 0)`,
   ).run({
     status: 'pending',
     platformId: null,
@@ -108,6 +111,17 @@ export interface TaskUpdate {
   quietStatus?: boolean;
   recurrence?: string | null;
   processAfter?: string;
+  /**
+   * Treat `processAfter` as an execution deadline only, leaving the row's
+   * `scheduled_for` where it is.
+   *
+   * The board's run-now fires a task early WITHOUT shifting its schedule
+   * (design §4.6), so the occurrence is still FOR its original slot and must
+   * keep announcing that slot to the agent. Every other caller is a genuine
+   * reschedule — a cron edit, a resume recomputed to the next future slot, an
+   * explicit `--process-after` — and moves both.
+   */
+  keepScheduledFor?: boolean;
   /**
    * Per-fire model/effort pin (merged into content.flagIntent, not replaced).
    * Values are already validated against the agent's provider vocab by the
@@ -183,6 +197,10 @@ export function updateTask(db: Database.Database, taskId: string, update: TaskUp
       if (setProcessAfter && applySchedule) {
         sets.push('process_after = ?');
         params.push(update.processAfter);
+        if (!update.keepScheduledFor) {
+          sets.push('scheduled_for = ?');
+          params.push(update.processAfter);
+        }
       }
       if (setRecurrence && applySchedule) {
         sets.push('recurrence = ?');
@@ -294,12 +312,24 @@ export interface TaskRowSnapshot {
   series_id: string;
   status: 'pending' | 'paused';
   process_after: string | null;
+  /**
+   * Optional: a snapshot recorded in a `move_intent` audit row BEFORE this
+   * column existed has no value here, and recovery must still be able to
+   * restore from it. Absent means "fall back to process_after", which is what
+   * the restored row's readers would do anyway.
+   */
+  scheduled_for?: string | null;
   recurrence: string | null;
   content: string;
   platform_id: string | null;
   channel_type: string | null;
   thread_id: string | null;
   kind: string;
+}
+
+/** ISO-normalize a slot copied out of a session-DB column. NULL stays NULL. */
+function isoSlot(value: string | null | undefined): string | null {
+  return value == null ? null : sqliteUtcToIso(value);
 }
 
 /**
@@ -320,15 +350,30 @@ export interface TaskRowSnapshot {
  * (`pending`/`paused` are both existing live states).
  */
 export function restoreTaskRow(db: Database.Database, snapshot: TaskRowSnapshot): void {
+  migrateMessagesInTable(db);
   db.prepare(
-    `INSERT INTO messages_in (id, seq, kind, timestamp, status, tries, process_after, recurrence, platform_id, channel_type, thread_id, content, series_id, trigger)
-     VALUES (@id, @seq, @kind, datetime('now'), @status, 0, @processAfter, @recurrence, @platformId, @channelType, @threadId, @content, @seriesId, 0)`,
+    `INSERT INTO messages_in (id, seq, kind, timestamp, status, tries, process_after, scheduled_for, recurrence, platform_id, channel_type, thread_id, content, series_id, trigger)
+     VALUES (@id, @seq, @kind, @timestamp, @status, 0, @processAfter, @scheduledFor, @recurrence, @platformId, @channelType, @threadId, @content, @seriesId, 0)`,
   ).run({
     id: snapshot.id,
     seq: nextEvenSeq(db),
+    // ISO-8601 UTC, never datetime('now'): its naive 'YYYY-MM-DD HH:MM:SS'
+    // shape is read as LOCAL time by `new Date()`, which skews display and
+    // breaks string comparisons against the ISO values every other writer here
+    // produces.
+    timestamp: new Date().toISOString(),
     kind: snapshot.kind,
     status: snapshot.status,
     processAfter: snapshot.process_after,
+    // A restore re-creates the SAME occurrence, so it carries the slot the
+    // source row was for — not the restore's own moment. `?? process_after`
+    // covers a pre-column audit snapshot.
+    //
+    // Normalized on the way through: both source columns can hold SQLite's
+    // naive `YYYY-MM-DD HH:MM:SS` on a pre-upgrade install, and copying that
+    // shape into `scheduled_for` would put a value here that every reader
+    // compares as a string against ISO ones.
+    scheduledFor: isoSlot(snapshot.scheduled_for ?? snapshot.process_after),
     recurrence: snapshot.recurrence,
     platformId: snapshot.platform_id,
     channelType: snapshot.channel_type,
@@ -423,6 +468,7 @@ export function upsertTaskSeries(
         `UPDATE messages_in
             SET seq           = ?,
                 process_after = ?,
+                scheduled_for = ?,
                 recurrence    = ?,
                 content       = ?,
                 platform_id   = ?,
@@ -433,6 +479,7 @@ export function upsertTaskSeries(
           WHERE id = ?`,
       ).run(
         nextEvenSeq(db),
+        row.processAfter,
         row.processAfter,
         row.recurrence,
         row.content,
@@ -446,13 +493,14 @@ export function upsertTaskSeries(
 
     db.prepare(
       `INSERT INTO messages_in
-         (id, seq, kind, timestamp, status, tries, process_after, recurrence, series_id, content,
+         (id, seq, kind, timestamp, status, tries, process_after, scheduled_for, recurrence, series_id, content,
           platform_id, channel_type, thread_id, trigger)
-       VALUES (?, ?, 'task', ?, 'pending', 0, ?, ?, ?, ?, ?, ?, ?, 0)`,
+       VALUES (?, ?, 'task', ?, 'pending', 0, ?, ?, ?, ?, ?, ?, ?, ?, 0)`,
     ).run(
       row.id,
       nextEvenSeq(db),
       new Date().toISOString(),
+      row.processAfter,
       row.processAfter,
       row.recurrence,
       row.seriesId,

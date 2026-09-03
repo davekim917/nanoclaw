@@ -2,7 +2,32 @@ import Database from 'better-sqlite3';
 import { describe, expect, it, vi } from 'vitest';
 
 import { warnSessionIfWorkInFlight } from './host-restart-warn.js';
+import { hasRestartNoteSince } from './modules/mailbox/ops/lookups.js';
+import { getContainerState, getProcessingClaims } from './modules/mailbox/ops/sweep.js';
+import { insertDeferredMessageWithContextIfNew } from './modules/mailbox/ops/ingress.js';
+import { readWorkContinuation } from './modules/mailbox/ops/continuation.js';
+import type { NanoclawMailboxSession } from './modules/mailbox/index.js';
 import type { Session } from './types.js';
+
+/**
+ * The five ops `warnSessionIfWorkInFlight` reaches for, bound to the pair of
+ * in-memory handles this suite builds.
+ *
+ * The functions are the module's REAL ops, so the statements under test are
+ * exactly the production ones — only the handles are the fixture's. That is
+ * what lets these cases keep asserting on `inDb`/`outDb` after the mailbox
+ * seam removed the handle parameters (mailbox seam PR 4).
+ */
+function mailboxOver(inDb: Database.Database, outDb: Database.Database): NanoclawMailboxSession {
+  return {
+    hasRestartNoteSince: (since: string) => hasRestartNoteSince(inDb, since),
+    getContainerState: () => getContainerState(outDb),
+    readWorkContinuation: () => readWorkContinuation(outDb),
+    getProcessingClaimRows: () => getProcessingClaims(outDb),
+    insertDeferredMessageWithContextIfNew: (message: Parameters<typeof insertDeferredMessageWithContextIfNew>[1]) =>
+      insertDeferredMessageWithContextIfNew(inDb, message),
+  } as unknown as NanoclawMailboxSession;
+}
 
 function makeDbs(): { inDb: Database.Database; outDb: Database.Database } {
   const inDb = new Database(':memory:');
@@ -96,7 +121,7 @@ describe('warnSessionIfWorkInFlight', () => {
       .prepare("INSERT INTO messages_out (id, seq, timestamp, kind, content) VALUES ('o1', 1, ?, 'status', '{}')")
       .run(new Date().toISOString());
 
-    expect(warnSessionIfWorkInFlight(inDb, outDb, fakeSession(), 'graceful host shutdown')).toBe(false);
+    expect(warnSessionIfWorkInFlight(mailboxOver(inDb, outDb), fakeSession(), 'graceful host shutdown')).toBe(false);
     expect(noteRows(inDb)).toHaveLength(0);
   });
 
@@ -109,7 +134,9 @@ describe('warnSessionIfWorkInFlight', () => {
       .prepare("INSERT INTO container_state (id, current_tool, tool_started_at, updated_at) VALUES (1, 'Bash', ?, ?)")
       .run(new Date().toISOString(), new Date().toISOString());
 
-    expect(warnSessionIfWorkInFlight(inDb, outDb, fakeSession(), 'host startup after an unclean stop')).toBe(true);
+    expect(
+      warnSessionIfWorkInFlight(mailboxOver(inDb, outDb), fakeSession(), 'host startup after an unclean stop'),
+    ).toBe(true);
     expect(noteRows(inDb)).toHaveLength(1);
   });
 
@@ -131,7 +158,7 @@ describe('warnSessionIfWorkInFlight', () => {
       new Date().toISOString(),
     );
 
-    expect(warnSessionIfWorkInFlight(inDb, outDb, fakeSession(), 'graceful host shutdown')).toBe(true);
+    expect(warnSessionIfWorkInFlight(mailboxOver(inDb, outDb), fakeSession(), 'graceful host shutdown')).toBe(true);
     expect(noteRows(inDb)).toHaveLength(1);
     const pair = inDb.prepare('SELECT id, trigger, on_wake, content FROM messages_in ORDER BY seq').all() as Array<{
       id: string;
@@ -152,7 +179,7 @@ describe('warnSessionIfWorkInFlight', () => {
       .prepare("INSERT INTO messages_out (id, seq, timestamp, kind, content) VALUES ('o1', 1, ?, 'chat', '{}')")
       .run(new Date().toISOString());
 
-    expect(warnSessionIfWorkInFlight(inDb, outDb, fakeSession(), 'graceful host shutdown')).toBe(false);
+    expect(warnSessionIfWorkInFlight(mailboxOver(inDb, outDb), fakeSession(), 'graceful host shutdown')).toBe(false);
     expect(noteRows(inDb)).toHaveLength(0);
   });
 
@@ -160,8 +187,8 @@ describe('warnSessionIfWorkInFlight', () => {
     const { inDb, outDb } = makeDbs();
     outDb.prepare('INSERT INTO processing_ack VALUES (?, ?, ?)').run('m-1', 'processing', new Date().toISOString());
 
-    expect(warnSessionIfWorkInFlight(inDb, outDb, fakeSession(), 'first')).toBe(true);
-    expect(warnSessionIfWorkInFlight(inDb, outDb, fakeSession(), 'second')).toBe(false);
+    expect(warnSessionIfWorkInFlight(mailboxOver(inDb, outDb), fakeSession(), 'first')).toBe(true);
+    expect(warnSessionIfWorkInFlight(mailboxOver(inDb, outDb), fakeSession(), 'second')).toBe(false);
     expect(noteRows(inDb)).toHaveLength(1);
   });
 
@@ -173,7 +200,7 @@ describe('warnSessionIfWorkInFlight', () => {
       .run(stale, stale);
     outDb.prepare('INSERT INTO processing_ack VALUES (?, ?, ?)').run('m-1', 'processing', stale);
 
-    expect(warnSessionIfWorkInFlight(inDb, outDb, fakeSession(), 'startup')).toBe(false);
+    expect(warnSessionIfWorkInFlight(mailboxOver(inDb, outDb), fakeSession(), 'startup')).toBe(false);
     expect(noteRows(inDb)).toHaveLength(0);
   });
 
@@ -185,10 +212,10 @@ describe('warnSessionIfWorkInFlight', () => {
       outDb
         .prepare("INSERT INTO container_state (id, current_tool, tool_started_at, updated_at) VALUES (1, 'Bash', ?, ?)")
         .run(new Date().toISOString(), new Date().toISOString());
-      expect(warnSessionIfWorkInFlight(inDb, outDb, fakeSession(), 'first restart')).toBe(true);
+      expect(warnSessionIfWorkInFlight(mailboxOver(inDb, outDb), fakeSession(), 'first restart')).toBe(true);
 
       vi.setSystemTime(new Date('2026-07-28T12:11:00.000Z'));
-      expect(warnSessionIfWorkInFlight(inDb, outDb, fakeSession(), 'second restart')).toBe(true);
+      expect(warnSessionIfWorkInFlight(mailboxOver(inDb, outDb), fakeSession(), 'second restart')).toBe(true);
       expect(noteRows(inDb)).toHaveLength(2);
     } finally {
       vi.useRealTimers();
@@ -198,7 +225,7 @@ describe('warnSessionIfWorkInFlight', () => {
   it('tolerates a legacy outbound DB without processing_ack', () => {
     const { inDb, outDb } = makeDbs();
     outDb.exec('DROP TABLE processing_ack');
-    expect(warnSessionIfWorkInFlight(inDb, outDb, fakeSession(), 'startup')).toBe(false);
+    expect(warnSessionIfWorkInFlight(mailboxOver(inDb, outDb), fakeSession(), 'startup')).toBe(false);
     expect(noteRows(inDb)).toHaveLength(0);
   });
 });

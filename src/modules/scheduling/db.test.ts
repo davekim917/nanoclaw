@@ -6,10 +6,23 @@
  */
 import fs from 'fs';
 import path from 'path';
-import { describe, it, expect, afterEach } from 'vitest';
+import { describe, it, expect, afterEach, vi } from 'vitest';
+
+const { TEST_ROOT } = vi.hoisted(() => ({ TEST_ROOT: uniqueTmpRoot('scheduling-db-test') }));
+
+// The seam's ops run against DATA_DIR-derived mailbox paths, so the mailbox
+// case below needs a real session directory under a scratch data root. The
+// handle-level cases keep using their own file.
+vi.mock('../../config.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../config.js')>()),
+  DATA_DIR: `${TEST_ROOT}/data`,
+}));
 
 import { ensureSchema, openInboundDb } from '../../db/session-db.js';
 import {
+import { withMailboxSession } from '../../session-manager.js';
+import { parseProcessingAckRecord } from '../../mailbox/model.js';
+import type { NanoclawMailboxSession } from '../../modules/mailbox/index.js';
   insertTaskRow,
   insertRecurrence,
   cancelTask,
@@ -23,7 +36,7 @@ import {
   type TaskRowSnapshot,
 } from './db.js';
 
-const TEST_DIR = uniqueTmpRoot('scheduling-db-test');
+const TEST_DIR = TEST_ROOT;
 const DB_PATH = path.join(TEST_DIR, 'inbound.db');
 
 function freshDb() {
@@ -904,5 +917,104 @@ describe('task writers on a session that predates scheduled_for', () => {
       },
     );
     db.close();
+  });
+});
+
+/**
+ * PR 4 (mailbox seam, ingress family): the task SQL above now lives in
+ * `src/modules/mailbox/ops/tasks.ts` and this file is its façade. The case
+ * below drives the same statements the other way round — through a real
+ * mailbox session — and pins the one property the split-out ops must not lose.
+ */
+describe('task ops on the mailbox session', () => {
+  const DATA_ROOT = path.join(TEST_ROOT, 'data');
+  const AG = 'ag-sched-ops';
+  const SESS = 'sess-sched-ops';
+
+  const fork = (m: unknown) => m as NanoclawMailboxSession;
+
+  const recurring = (id: string): RecurringMessage => ({
+    id,
+    kind: 'task',
+    content: JSON.stringify({ prompt: 'noop' }),
+    recurrence: '0 9 * * *',
+    process_after: new Date().toISOString(),
+    platform_id: 'slack:C1',
+    channel_type: 'slack',
+    thread_id: 'slack:C1:1.1',
+    series_id: id,
+  });
+
+  function inboundRows(): Array<{ id: string; status: string; recurrence: string | null; thread_id: string | null }> {
+    const db = openInboundDb(path.join(DATA_ROOT, 'v2-sessions', AG, SESS, 'inbound.db'));
+    try {
+      return db
+        .prepare("SELECT id, status, recurrence, thread_id FROM messages_in WHERE kind = 'task' ORDER BY seq")
+        .all() as Array<{
+        id: string;
+        status: string;
+        recurrence: string | null;
+        thread_id: string | null;
+      }>;
+    } finally {
+      db.close();
+    }
+  }
+
+  afterEach(() => {
+    if (fs.existsSync(DATA_ROOT)) fs.rmSync(DATA_ROOT, { recursive: true, force: true });
+  });
+
+  it('task ops run through the mailbox session and preserve recurrence arming atomicity', async () => {
+    await withMailboxSession(AG, SESS, (mailbox) => {
+      fork(mailbox).insertTaskRow({
+        id: 'task-1',
+        seriesId: 'task-1',
+        processAfter: new Date().toISOString(),
+        recurrence: '0 9 * * *',
+        content: JSON.stringify({ prompt: 'noop' }),
+        platformId: 'slack:C1',
+        channelType: 'slack',
+        threadId: 'slack:C1:1.1',
+      });
+    });
+    // Fork insert semantics survive the move: routing is carried, and the row
+    // lands inert so only the host's due-admission seam can wake it.
+    expect(inboundRows()).toEqual([
+      { id: 'task-1', status: 'pending', recurrence: '0 9 * * *', thread_id: 'slack:C1:1.1' },
+    ]);
+
+    // The original completes; the sweep arms the next occurrence.
+    await withMailboxSession(AG, SESS, (mailbox) => {
+      mailbox.applyProcessingAcks([
+        parseProcessingAckRecord({
+          messageId: 'task-1',
+          status: 'completed',
+          statusChanged: new Date().toISOString(),
+        }),
+      ]);
+      const completed = fork(mailbox).getCompletedRecurringRows();
+      expect(completed.map((r) => r.id)).toEqual(['task-1']);
+      fork(mailbox).armNextRecurrence('task-1', completed[0], 'task-2', new Date(Date.now() + 60_000).toISOString());
+    });
+
+    // Insert + clear are ONE durable step. The torn states this rules out are
+    // both live bugs: a successor next to a still-armed original re-clones the
+    // series every tick, and a cleared original with no successor silently
+    // kills it. Observing either would require reading between two writes of a
+    // single transaction inside a single session — there is no such point.
+    const armed = inboundRows();
+    expect(armed).toEqual([
+      { id: 'task-1', status: 'completed', recurrence: null, thread_id: 'slack:C1:1.1' },
+      { id: 'task-2', status: 'pending', recurrence: '0 9 * * *', thread_id: 'slack:C1:1.1' },
+    ]);
+
+    // And the rollback direction: a failing arm leaves the original armed, so
+    // the next tick retries rather than dropping the series.
+    await withMailboxSession(AG, SESS, (mailbox) => {
+      const source = { ...recurring('task-2'), recurrence: '0 9 * * *' };
+      expect(() => fork(mailbox).armNextRecurrence('task-2', source, 'task-1', null)).toThrow();
+    });
+    expect(inboundRows().find((r) => r.id === 'task-2')).toMatchObject({ recurrence: '0 9 * * *' });
   });
 });
