@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { createHash } from 'crypto';
-import { readFile } from 'fs/promises';
+import { readFile, stat, utimes } from 'fs/promises';
 import * as path from 'path';
 import fsSync from 'fs';
 import cpSync from 'child_process';
@@ -420,6 +420,71 @@ describe('checkAgentRunnerDepsDrift result cache', () => {
       retryDelayMs: 0,
     });
     expect(r3).toEqual(r1);
+  });
+
+  /**
+   * Regression cover for the Codex P2 finding on this PR: a
+   * caller must not be handed an in-flight check's result if
+   * package.json/bun.lock were edited after that check read its fingerprint
+   * but before it finished (e.g. while awaiting a slow docker inspect).
+   * Otherwise it could receive a pre-edit `ok: true` and launch with
+   * stale image-baked dependencies — exactly the failure mode this whole
+   * module exists to prevent.
+   */
+  it('does not join an in-flight check whose fingerprint is now stale', async () => {
+    const expected = await computeAgentRunnerDepsHash();
+    const imageRef = 'nanoclaw-agent-cache-test:fingerprint-revalidate';
+    const pkgPath = path.join(REPO_ROOT, 'container/agent-runner/package.json');
+    const original = await stat(pkgPath);
+
+    // Deferred first inspect so the test controls exactly when check #1's
+    // docker-inspect round-trip completes, opening a window to simulate a
+    // package.json edit while it's still in flight.
+    let releaseFirstInspect: () => void = () => {};
+    const firstInspectGate = new Promise<void>((resolve) => {
+      releaseFirstInspect = resolve;
+    });
+    let firstInspectCalls = 0;
+    const firstInspect = async (): Promise<string> => {
+      firstInspectCalls += 1;
+      await firstInspectGate;
+      return labeled(expected);
+    };
+
+    try {
+      const check1 = checkAgentRunnerDepsDrift(imageRef, { inspect: firstInspect, retryDelayMs: 0 });
+
+      // Let check1 read its fingerprint and register in inFlightChecks
+      // before editing the file — its only await before that point is the
+      // fs.stat pair inside currentDepsFileFingerprint.
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+
+      // Simulate an edit: bump mtime without touching content (content
+      // drives the hash; the fingerprint keys on mtime+size).
+      await utimes(pkgPath, new Date(), new Date(original.mtimeMs + 5_000));
+
+      let secondInspectCalls = 0;
+      const secondInspect = async (): Promise<string> => {
+        secondInspectCalls += 1;
+        return labeled(expected);
+      };
+      const check2 = checkAgentRunnerDepsDrift(imageRef, { inspect: secondInspect, retryDelayMs: 0 });
+
+      releaseFirstInspect();
+
+      const [r1, r2] = await Promise.all([check1, check2]);
+
+      expect(r1.ok).toBe(true);
+      expect(r2.ok).toBe(true);
+      // check2 must have run its own inspect rather than being handed
+      // check1's (pre-edit) answer.
+      expect(firstInspectCalls).toBe(1);
+      expect(secondInspectCalls).toBe(1);
+    } finally {
+      await utimes(pkgPath, original.atime, original.mtime);
+    }
   });
 });
 

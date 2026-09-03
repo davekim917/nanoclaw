@@ -295,8 +295,12 @@ function rebuildHint(imageRef: string): string {
  * failure) so the next call — including one arriving microtasks later, once
  * this one already resolved — goes through okResultCache/TTL normally rather
  * than being coalesced onto a check that isn't running anymore.
+ *
+ * Keyed alongside each in-flight promise is the deps fingerprint it started
+ * with, so a joiner can tell whether it's still safe to trust: see the
+ * revalidation in checkAgentRunnerDepsDrift below.
  */
-const inFlightChecks = new Map<string, Promise<DepsDriftCheck>>();
+const inFlightChecks = new Map<string, Promise<{ fingerprint: DepsFileFingerprint; result: DepsDriftCheck }>>();
 
 /**
  * Check the given image (defaults to CONTAINER_IMAGE — the shared base).
@@ -308,36 +312,59 @@ const inFlightChecks = new Map<string, Promise<DepsDriftCheck>>();
  * Thin coalescing wrapper around performDriftCheck — see inFlightChecks doc
  * comment for why. Concurrent callers for the same imageRef share one
  * in-flight check and its result (including the options — inspect/
- * retryDelayMs — of whichever call started it); a call that arrives after
- * the in-flight one has already settled runs its own fresh check (subject to
- * okResultCache as usual), it is never coalesced onto a finished promise.
+ * retryDelayMs — of whichever call started it), but only when the deps
+ * fingerprint hasn't moved since that check started: if package.json/
+ * bun.lock were edited after the in-flight check read its hash but while it
+ * is still awaiting the slower image inspection, a caller arriving after the
+ * edit must not be handed that check's answer — its `ok: true` was computed
+ * against inputs that are no longer current. Such a caller falls through and
+ * runs its own fresh check against the fingerprint it actually observed. A
+ * call that arrives after the in-flight one has already settled runs its own
+ * fresh check too (subject to okResultCache as usual); it is never coalesced
+ * onto a finished promise.
  */
 export async function checkAgentRunnerDepsDrift(
   imageRef: string = CONTAINER_IMAGE,
   options: DriftCheckOptions = {},
 ): Promise<DepsDriftCheck> {
+  // Read this call's own fingerprint first, before even looking at
+  // inFlightChecks, so it always reflects what's on disk right now rather
+  // than whatever an in-flight check happened to start with.
+  const fingerprint = await currentDepsFileFingerprint();
+
   const existing = inFlightChecks.get(imageRef);
   if (existing) {
-    return existing;
+    const settled = await existing;
+    if (fingerprintsMatch(settled.fingerprint, fingerprint)) {
+      return settled.result;
+    }
+    // Fingerprint moved since that check started — its result is stale for
+    // this caller. Fall through and run a fresh check below.
   }
-  const check = performDriftCheck(imageRef, options).finally(() => {
-    inFlightChecks.delete(imageRef);
-  });
+
+  const check = performDriftCheck(imageRef, options, fingerprint)
+    .then((result) => ({ fingerprint, result }))
+    .finally(() => {
+      inFlightChecks.delete(imageRef);
+    });
   inFlightChecks.set(imageRef, check);
-  return check;
+  return (await check).result;
 }
 
-async function performDriftCheck(imageRef: string, options: DriftCheckOptions): Promise<DepsDriftCheck> {
+async function performDriftCheck(
+  imageRef: string,
+  options: DriftCheckOptions,
+  fingerprint: DepsFileFingerprint,
+): Promise<DepsDriftCheck> {
   const inspect = options.inspect ?? dockerInspectLabels;
   const retryDelayMs = options.retryDelayMs ?? LABEL_RETRY_DELAY_MS;
 
-  // Cheap up front (two stat calls) so it's worth doing even on a miss: if
-  // package.json/bun.lock haven't moved since the last *passing* check for
-  // this exact imageRef, skip re-hashing the files and re-inspecting the
-  // image entirely — that's the `docker inspect` round-trip (and, on a
-  // relabel race, the LABEL_RETRY_DELAY_MS pause) most spawns pay for a
-  // question that was already answered "yes, in sync".
-  const fingerprint = await currentDepsFileFingerprint();
+  // Cheap up front (two stat calls, done by the caller) so it's worth doing
+  // even on a miss: if package.json/bun.lock haven't moved since the last
+  // *passing* check for this exact imageRef, skip re-hashing the files and
+  // re-inspecting the image entirely — that's the `docker inspect`
+  // round-trip (and, on a relabel race, the LABEL_RETRY_DELAY_MS pause) most
+  // spawns pay for a question that was already answered "yes, in sync".
   const cached = okResultCache.get(imageRef);
   if (
     cached &&
