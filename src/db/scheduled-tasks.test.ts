@@ -153,7 +153,14 @@ function setupCentralDb(): void {
       last_active TEXT, created_at TEXT NOT NULL,
       -- Migration 056: scheduleTask stamps the destination it validated onto
       -- the task session so the console can place the task in its channel.
-      task_routing_platform_id TEXT
+      task_routing_platform_id TEXT,
+      -- Migration 065: the host sweep's persisted quiet mark. Load-bearing in
+      -- this fixture, not scenery — scheduleTask ends with a
+      -- touchSessionActivity call whose whole job is to null this column, and
+      -- that helper swallows its own errors by design. Without the column the
+      -- call throws into the swallow and every assertion below stays green with
+      -- the invalidation silently gone (Codex round 2, L1).
+      sweep_quiet_until TEXT
     );
     CREATE INDEX IF NOT EXISTS idx_sessions_agent_group ON sessions(agent_group_id);
   `);
@@ -389,6 +396,44 @@ describe('test_scheduleTask_rejects_cross_workgroup_peer', () => {
 });
 
 // ── test_scheduletask_omits_script_when_absent ─────────────────────────────
+// Codex round 2, L1. `scheduleTask` inserts a task row into a session that may
+// have been quiet for days — `scheduled-move`'s re-home is the live case — and
+// due-ness lives only in the session DB where the sweep's quiet cache cannot
+// see it. The central-DB touch at the end of `scheduleTask` is what invalidates
+// the mark, including the persisted one S2-PR15 warms after a restart.
+describe('scheduleTask invalidates the target session quiet mark (S2-PR15)', () => {
+  it('clears sweep_quiet_until and advances last_active on the task session', async () => {
+    seedActiveSession();
+    seedInboundDb();
+
+    // The task session scheduleTask resolves is its own system:tasks row, not
+    // SESSION_ID, so mark every active session quiet and let it pick.
+    const stale = '2026-06-01T00:00:00.000Z';
+    getDb().prepare("UPDATE sessions SET last_active = ?, sweep_quiet_until = '2099-01-01T00:00:00.000Z'").run(stale);
+
+    await scheduleTask({
+      id: 't-quiet',
+      agentGroupId: AGENT_GROUP_ID,
+      cron: '0 3 * * *',
+      processAfter: new Date(Date.now() + 86400000).toISOString(),
+      seriesId: 's-quiet',
+      prompt: 'do thing',
+      destination: TEST_DESTINATION,
+    });
+
+    const row = getDb()
+      .prepare(
+        "SELECT last_active, sweep_quiet_until FROM sessions WHERE thread_id = 'system:tasks:s-quiet' AND status = 'active'",
+      )
+      .get() as { last_active: string | null; sweep_quiet_until: string | null } | undefined;
+
+    expect(row, 'no task session was resolved').toBeDefined();
+    expect(row!.sweep_quiet_until, 'the quiet mark outlived a new task row').toBeNull();
+    expect(row!.last_active).not.toBe(stale);
+    expect(row!.last_active).not.toBeNull();
+  });
+});
+
 describe('test_scheduletask_omits_script_when_absent', () => {
   it('content JSON has no "script" key when TaskDef.script is undefined', async () => {
     seedActiveSession();

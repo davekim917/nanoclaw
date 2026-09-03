@@ -24,7 +24,7 @@ import { getAgentGroup } from '../../db/agent-groups.js';
 import { getWorkgroupOnecliSecrets } from '../../db/agent-groups.js';
 import { getMessagingGroup } from '../../db/messaging-groups.js';
 import { getDb } from '../../db/connection.js';
-import { findSystemSession, taskThreadId } from '../../db/sessions.js';
+import { findSystemSession, taskThreadId, touchSessionActivity } from '../../db/sessions.js';
 import { readSessionInbound, type ScheduledTaskRow } from '../../modules/mailbox/index.js';
 import { withExistingMailboxSession } from '../../session-manager.js';
 import * as scheduledTasks from '../../db/scheduled-tasks.js';
@@ -676,6 +676,13 @@ export const moveExecuteHandler: AuthHandler = async (req, params, ctx) => {
         correlationId,
       });
     } else {
+      // The source was cancelled, then the target insert was AWAITED — a sweep
+      // tick can land in that await, see a source with no live task and mark it
+      // quiet. Restoring the pending row here puts due work back behind that
+      // mark, and S2-PR15 would carry it across a restart. Invalidate before
+      // purging the intent, so a crash between the two still leaves the intent
+      // for `recoverMoveIntents` to finish.
+      touchSessionActivity(source.sessionId);
       purgeIntentBody(central, correlationId);
     }
     invalidateScheduledCache();
