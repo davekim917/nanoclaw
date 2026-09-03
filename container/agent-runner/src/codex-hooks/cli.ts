@@ -13,6 +13,9 @@
  * PreToolUse (emits a deny decision) and soft-continues for PostToolUse — see
  * the catch in main().
  */
+// Module barrel — loads registration modules, including the singular mailbox slot.
+import '../modules/index.js';
+import { getAgentMailbox, readMailboxContext } from '../mailbox/index.js';
 import { runHookForCodex, type HookEvent, type CodexHookInput } from './runner.js';
 
 async function main(): Promise<void> {
@@ -38,6 +41,12 @@ async function main(): Promise<void> {
   }
 
   try {
+    // This is a separate process from the runner and the MCP server, so it
+    // registers and starts the mailbox itself. The email gate reaches
+    // getSessionRouting/writeMessageOut/awaitDeliveryAck through it, and an
+    // unregistered mailbox would throw into the fail-closed catch below —
+    // denying every gated Codex command instead of raising the approval card.
+    await getAgentMailbox().start(await readMailboxContext());
     const result = await runHookForCodex(eventArg as HookEvent, input);
     process.stdout.write(JSON.stringify(result));
   } catch (err) {
