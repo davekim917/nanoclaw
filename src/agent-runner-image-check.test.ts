@@ -10,6 +10,7 @@ import {
   classifyLabels,
   computeAgentRunnerDepsHash,
   LABEL_RETRY_DELAY_MS,
+  DEPS_DRIFT_CACHE_TTL_MS,
   resetDepsDriftCacheForTests,
 } from './agent-runner-image-check.js';
 import { CONTAINER_IMAGE, REPO_ROOT } from './config.js';
@@ -344,6 +345,44 @@ describe('checkAgentRunnerDepsDrift result cache', () => {
     const r = await checkAgentRunnerDepsDrift(imageRef, { inspect: inspect2.run, retryDelayMs: 0 });
     expect(r.ok).toBe(true);
     expect(inspect2.calls()).toBe(1); // re-ran for real, not served from the cleared cache
+  });
+
+  /**
+   * Regression cover for the Codex P1 finding on this PR: an unbounded cache
+   * keyed only on file fingerprint would serve a stale `ok: true` forever if
+   * the image were later removed or retagged out-of-band (no file edit
+   * involved) — `docker run` would then fail downstream while
+   * requestContainerRebuild, which container-runner.ts only calls on `!ok`,
+   * never fires. The TTL bounds that staleness window instead of leaving it
+   * open for the rest of the host process's life.
+   */
+  it('expires a cached result after DEPS_DRIFT_CACHE_TTL_MS, even with unchanged inputs', async () => {
+    const expected = await computeAgentRunnerDepsHash();
+    const imageRef = 'nanoclaw-agent-cache-test:ttl';
+
+    vi.useFakeTimers();
+    try {
+      const inspect1 = scriptedInspect([labeled(expected)]);
+      const r1 = await checkAgentRunnerDepsDrift(imageRef, { inspect: inspect1.run, retryDelayMs: 0 });
+      expect(r1.ok).toBe(true);
+      expect(inspect1.calls()).toBe(1);
+
+      // Well inside the TTL: still served from cache.
+      vi.advanceTimersByTime(DEPS_DRIFT_CACHE_TTL_MS - 1);
+      const inspectStillCached = scriptedInspect([labeled(expected)]);
+      const r2 = await checkAgentRunnerDepsDrift(imageRef, { inspect: inspectStillCached.run, retryDelayMs: 0 });
+      expect(r2).toEqual(r1);
+      expect(inspectStillCached.calls()).toBe(0);
+
+      // Past the TTL: must re-check for real, even though the files never changed.
+      vi.advanceTimersByTime(2);
+      const inspectAfterTtl = scriptedInspect([labeled(expected)]);
+      const r3 = await checkAgentRunnerDepsDrift(imageRef, { inspect: inspectAfterTtl.run, retryDelayMs: 0 });
+      expect(r3.ok).toBe(true);
+      expect(inspectAfterTtl.calls()).toBe(1);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 

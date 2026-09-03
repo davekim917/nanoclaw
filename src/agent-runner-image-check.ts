@@ -36,6 +36,11 @@
  * until the rebuild lands. See checkAgentRunnerDepsDrift's cache lookup below
  * for where this is enforced.
  *
+ * A passing result is also only cached for DEPS_DRIFT_CACHE_TTL_MS: the file
+ * fingerprint says nothing about the image being removed or retagged
+ * out-of-band (no file edit involved), and an unbounded cache would serve a
+ * stale "in sync" forever in that case — see the constant's doc comment.
+ *
  * The read has to be careful about one thing. `container/build.sh` re-stamps
  * the ARG-driven retention LABEL layer on every run, which means a periodic
  * `docker build` against the canonical tag; on a containerd image store that
@@ -111,7 +116,24 @@ interface DepsFileFingerprint {
 interface CachedDriftCheck {
   fingerprint: DepsFileFingerprint;
   result: DepsDriftCheck;
+  cachedAt: number;
 }
+
+/**
+ * Cache lifetime. The fingerprint (package.json/bun.lock mtime+size) only
+ * catches drift introduced by editing those files — it says nothing about
+ * the image itself being removed or retagged out-of-band (`docker rmi`, a
+ * manual `docker tag` to something else) while the files stay untouched. An
+ * unbounded cache would then serve a stale `ok: true` forever: `docker run`
+ * fails downstream, but `requestContainerRebuild` in container-runner.ts is
+ * only called when this check itself returns `!ok`, so that failure mode
+ * would never self-heal. Bounding the cache to one host-sweep cycle keeps
+ * the common-case win (a burst of near-simultaneous spawns across many
+ * sessions/agent groups shares one check) while guaranteeing every image is
+ * re-verified against reality at least this often, same order of magnitude
+ * as the sweep that already retries refused spawns.
+ */
+export const DEPS_DRIFT_CACHE_TTL_MS = 60_000;
 
 /**
  * imageRef -> last known-good (ok: true) result + the file fingerprint it was
@@ -271,7 +293,11 @@ export async function checkAgentRunnerDepsDrift(
   // question that was already answered "yes, in sync".
   const fingerprint = await currentDepsFileFingerprint();
   const cached = okResultCache.get(imageRef);
-  if (cached && fingerprintsMatch(cached.fingerprint, fingerprint)) {
+  if (
+    cached &&
+    fingerprintsMatch(cached.fingerprint, fingerprint) &&
+    Date.now() - cached.cachedAt < DEPS_DRIFT_CACHE_TTL_MS
+  ) {
     return cached.result;
   }
 
@@ -371,7 +397,7 @@ export async function checkAgentRunnerDepsDrift(
   // is the right key: if the files change between now and the next call,
   // that call's own fingerprint won't match and it re-checks for real.
   if (result.ok) {
-    okResultCache.set(imageRef, { fingerprint, result });
+    okResultCache.set(imageRef, { fingerprint, result, cachedAt: Date.now() });
   }
   return result;
 }
