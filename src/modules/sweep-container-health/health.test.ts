@@ -879,6 +879,12 @@ describe('sweepProviderHeal — bounds, actions, and accountability', () => {
     mockReadContainerConfig.mockReset().mockReturnValue({ provider: 'codex' });
     mockGetSession.mockReset().mockReturnValue(fakeSession());
     mockWakeContainer.mockReset();
+    // The park path kills the container and only then writes its notice, so
+    // "no container owns outbound" is the production precondition for that
+    // write (mailbox seam PR 5b's `writeOutboundWhenStopped`). `killContainer`
+    // is mocked here, so state it explicitly rather than inheriting whatever
+    // an earlier describe left on this shared spy.
+    mockIsContainerRunning.mockReset().mockReturnValue(false);
   });
   afterEach(() => {
     armSelfHeal(false);
