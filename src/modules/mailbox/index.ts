@@ -117,6 +117,7 @@ import {
   getDueWakePriority,
   getNextFutureProcessAfter,
   getProcessingClaims,
+  hasProcessingAck,
   syncProcessingAcks,
   type ContainerState as ForkContainerState,
   type ProcessingClaim,
@@ -284,8 +285,18 @@ export interface NanoclawMailboxSession extends MailboxSession {
   insertMessageWithContext(trigger: MessageInsert, context: MessageInsert | null): void;
   insertMessageWithContextIfNew(trigger: MessageInsert, context: MessageInsert | null): boolean;
   insertDeferredMessageWithContextIfNew(message: MessageInsert): boolean;
-  /** Withdraw an unconsumed `on_wake` row and its recall partner. */
-  withdrawUnconsumedWake(messageId: string): boolean;
+  /**
+   * Withdraw an `on_wake` row and its recall partner, but only on a proof that
+   * no container could have claimed the message.
+   *
+   * `containerOwnsOutbound` is the caller's half of that proof — the container
+   * registry is host state this module cannot see — and must be a live probe,
+   * not a value read earlier: it is invoked inside the op, immediately before
+   * the delete. The outbound `processing_ack` half is read here. See
+   * `withdrawUnconsumedWake` in `ops/ingress.ts` for why the inbound row's own
+   * `status` cannot answer this.
+   */
+  withdrawUnconsumedWake(messageId: string, containerOwnsOutbound: () => boolean): boolean;
   nextEvenSeq(): number;
   upsertSessionRouting(routing: {
     channel_type: string | null;
@@ -667,9 +678,22 @@ export function composeOutboundOps(
     },
     getProcessingClaimRows: () => readOutbound([], getProcessingClaims),
     readRepositoryMountBarrierAck: () => readOutbound(null, readRepositoryMountBarrierAck),
-    readDoneProposal: () => readDoneProposal(readableOutbound()),
-    readContinuationPresence: () => readContinuationPresence(readableOutbound()),
-    clearWorkContinuation: () => clearWorkContinuation(writableOutbound()),
+    // These three honour `outboundPresent` too, and the last one has to.
+    //
+    // They used to open the accessors directly, so on an inbound-only
+    // never-woken session the reads could throw and — the part that matters —
+    // `clearWorkContinuation` would take the WRITABLE handle and author the
+    // container-owned `outbound.db` the host must never create (I-10). Every
+    // current caller happens to guard these or reach them through the
+    // outbound-only funnel, so it was latent rather than live; a doc comment
+    // promising the degrade while three ops ignored it is exactly how it stops
+    // being latent.
+    //
+    // The empty values are the same answers a present-but-empty outbound.db
+    // gives: no proposal, no continuation record, and nothing cleared.
+    readDoneProposal: () => readOutbound(null, readDoneProposal),
+    readContinuationPresence: () => readOutbound(null, readContinuationPresence),
+    clearWorkContinuation: () => (outboundPresent ? clearWorkContinuation(writableOutbound()) : null),
   };
 }
 
@@ -753,7 +777,25 @@ function forkOps(
     insertMessageWithContext: (trigger, context) => insertMessageWithContext(inbound, trigger, context),
     insertMessageWithContextIfNew: (trigger, context) => insertMessageWithContextIfNew(inbound, trigger, context),
     insertDeferredMessageWithContextIfNew: (message) => insertDeferredMessageWithContextIfNew(inbound, message),
-    withdrawUnconsumedWake: (messageId) => withdrawUnconsumedWake(inbound, messageId),
+    withdrawUnconsumedWake: (messageId, containerOwnsOutbound) =>
+      withdrawUnconsumedWake(inbound, messageId, () => {
+        // Ownership first: it is a Map lookup, and a container that owns
+        // outbound.db can write a claim between this read and the delete, so no
+        // ack read could rule it out anyway.
+        if (containerOwnsOutbound()) return true;
+        // A session with no outbound.db has never run a container, so nothing
+        // can have claimed. `outboundPresent` is a real ENOENT/ENOTDIR — an
+        // unreadable file reaches the opener and throws below.
+        if (!outboundPresent) return false;
+        try {
+          return hasProcessingAck(readableOutbound(), messageId);
+        } catch {
+          // Unopenable, corrupt, or missing the table: consumption is
+          // unprovable, so preserve the row. Losing the message costs more than
+          // one stale restart notice.
+          return true;
+        }
+      }),
     nextEvenSeq: () => nextEvenSeq(inbound),
     upsertSessionRouting: (routing) => upsertSessionRouting(inbound, routing),
     readSessionRouting: () => readSessionRouting(inbound),

@@ -19,6 +19,10 @@ const mockWakeContainer = vi.fn();
 vi.mock('./container-runner.js', () => ({
   isContainerRunning: (...args: unknown[]) => mockIsContainerRunning(args[0] as string),
   isContainerSpawning: (...args: unknown[]) => mockIsContainerSpawning(args[0] as string),
+  // The real definition, over the same two mocks: a container "owns"
+  // outbound.db while it is running OR still spawning.
+  containerOwnsOutbound: (...args: unknown[]) =>
+    mockIsContainerRunning(args[0] as string) || mockIsContainerSpawning(args[0] as string),
   getContainerSpawnedAt: (...args: unknown[]) => mockGetContainerSpawnedAt(args[0] as string),
   killContainer: (...args: unknown[]) =>
     mockKillContainer(args[0] as string, args[1] as string, args[2] as (() => void) | undefined),
@@ -36,7 +40,12 @@ const mockWriteSessionMessage = vi.fn();
 /** Session rows that exist in the central DB but own no mailbox. */
 const missingInboundDbs = new Set<string>();
 /** Every withdrawal attempt, and whether it actually removed a row. */
-const withdrawnWakes: Array<{ sessionId: string; messageId: string; withdrew: boolean }> = [];
+const withdrawnWakes: Array<{
+  sessionId: string;
+  messageId: string;
+  withdrew: boolean;
+  containerOwned: boolean;
+}> = [];
 /** When true, the model treats the wake row as already claimed by a first poll. */
 let wakeAlreadyConsumed = false;
 // The barrier's drain probe reads OUTBOUND-owned state, so it goes through the
@@ -137,11 +146,14 @@ function modelMailbox(sessionId: string): NanoclawMailboxSession {
       processingSessions.has(sessionId) ? [{ message_id: 'late', status_changed: new Date().toISOString() }] : [],
     getContainerState: () => (toolSessions.has(sessionId) ? { current_tool: 'Bash' } : null),
     countDueMessages: () => mockCountDueMessages(sessionId),
-    // Models the guarded DELETE: it matches only a row still `pending` with
-    // `on_wake = 1`, so a row a container already claimed is a no-op.
-    withdrawUnconsumedWake: (messageId: string) => {
-      const withdrew = !wakeAlreadyConsumed;
-      withdrawnWakes.push({ sessionId, messageId, withdrew });
+    // Models the op: the claim proof runs FIRST — a container that owns
+    // outbound.db, or a `processing_ack` for this message, withdraws nothing —
+    // and only then the guarded DELETE. Invoking the probe here is what makes
+    // this model catch a caller that stops passing a live one.
+    withdrawUnconsumedWake: (messageId: string, containerOwnsOutbound: () => boolean) => {
+      const owned = containerOwnsOutbound();
+      const withdrew = !owned && !wakeAlreadyConsumed;
+      withdrawnWakes.push({ sessionId, messageId, withdrew, containerOwned: owned });
       return withdrew;
     },
   } as unknown as NanoclawMailboxSession;
@@ -693,10 +705,14 @@ describe('restartAgentGroupContainers', () => {
    */
   it('withdraws the wake message for a session it decides not to restart', async () => {
     mockGetSessionsByAgentGroup.mockReturnValue([makeSession('s1', 'g1')]);
-    mockIsContainerRunning.mockReturnValue(true);
-    // A replacement appears while the pending read is in flight, so this
-    // restart declines — the replacement is doing the work it wanted done.
-    mockGetContainerSpawnedAt.mockReturnValueOnce(1000).mockReturnValue(2000);
+    // Running at collection, gone by the time the awaited write returns — so
+    // this restart declines, and NOTHING owns outbound.db at the withdrawal.
+    // That is the decline path where consumption is provably impossible.
+    let calls = 0;
+    mockIsContainerRunning.mockImplementation(() => {
+      calls += 1;
+      return calls < 2;
+    });
 
     const count = await restartAgentGroupContainers('g1', 'test', 'Resuming.');
 
@@ -706,35 +722,43 @@ describe('restartAgentGroupContainers', () => {
     // back, because the restart it announced did not happen.
     expect(mockWriteSessionMessage.mock.calls.map((c) => c[1])).toEqual(['s1']);
     expect(withdrawnWakes).toHaveLength(1);
-    expect(withdrawnWakes[0].withdrew).toBe(true);
+    expect(withdrawnWakes[0]).toMatchObject({ withdrew: true, containerOwned: false });
     // Withdrawn by the id it was written under, so nothing else can match.
     const written = mockWriteSessionMessage.mock.calls[0][2] as { id: string };
     expect(withdrawnWakes[0].messageId).toBe(written.id);
   });
 
   /**
-   * A replacement that consumed the row on its own first poll keeps it.
+   * A live replacement keeps the row, whether or not it has claimed it yet.
    *
-   * The withdrawal is guarded on `status = 'pending' AND on_wake = 1`, so it
-   * cannot take back a message a container has already claimed — that is what
-   * makes compensating safe rather than a second race.
+   * The withdrawal used to rest on `status = 'pending' AND on_wake = 1` alone,
+   * documented as making a consumed row a no-op delete. It does not: a
+   * container claims by writing `processing_ack` in `outbound.db`, and the
+   * inbound row stays `pending` until a later sweep tick syncs it. So for one
+   * sweep interval a claimed row still looks untouched, and a replacement
+   * mid-first-poll — selected the row, not yet acked — would have it deleted
+   * out from under it.
+   *
+   * The cost of the fail-closed rule is stated rather than buried: this decline
+   * path, and the pending-read-failure one, no longer withdraw at all, so a row
+   * neither of them can prove unconsumed may still surface later as a stale
+   * "restarted to apply X". A stale notice is recoverable; a deleted restart
+   * message is not.
    */
-  it('leaves a wake message alone once a replacement has consumed it', async () => {
+  it('leaves the wake message alone when a replacement container is live', async () => {
     mockGetSessionsByAgentGroup.mockReturnValue([makeSession('s1', 'g1')]);
     mockIsContainerRunning.mockReturnValue(true);
     // A replacement appears while the pending read is in flight.
     mockGetContainerSpawnedAt.mockReturnValueOnce(1000).mockReturnValue(2000);
-    // …and it already took the row on its first poll, so the guarded delete
-    // matches nothing.
-    wakeAlreadyConsumed = true;
 
     const count = await restartAgentGroupContainers('g1', 'test', 'Resuming.');
 
     expect(count).toBe(0);
     expect(mockKillContainer).not.toHaveBeenCalled();
-    // The withdrawal was attempted and correctly removed nothing.
+    // The withdrawal was attempted and refused on the ownership proof, before
+    // the delete could run.
     expect(withdrawnWakes).toHaveLength(1);
-    expect(withdrawnWakes[0].withdrew).toBe(false);
+    expect(withdrawnWakes[0]).toMatchObject({ withdrew: false, containerOwned: true });
   });
 
   it('keeps going when the pending-work open throws, without killing that container', async () => {

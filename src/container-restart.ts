@@ -5,6 +5,7 @@
  * wakes a fresh container via the onExit callback — race-free.
  */
 import {
+  containerOwnsOutbound,
   getContainerSpawnedAt,
   isContainerRunning,
   isContainerSpawning,
@@ -549,11 +550,16 @@ export async function restartAgentGroupContainers(
     // Existing-only and best-effort: a session whose mailbox is gone has no row
     // to withdraw, and failing to withdraw must not itself abort the loop — the
     // worst case is the stale notice this exists to prevent, logged.
+    //
+    // The ownership probe is passed as a thunk, not as a value: the op invokes
+    // it immediately before its delete, so a container that came up while this
+    // decline path was being taken is still seen. Reading it here instead would
+    // reintroduce the stale precondition every other fix in this PR removes.
     const withdrawWake = async (): Promise<void> => {
       if (!wakeId) return;
       try {
         const withdrawn = await withExistingNanoclawSession(session.agent_group_id, session.id, (mailbox) =>
-          mailbox.withdrawUnconsumedWake(wakeId),
+          mailbox.withdrawUnconsumedWake(wakeId, () => containerOwnsOutbound(session.id)),
         );
         if (withdrawn)
           log.info('Restart: withdrew the wake message for a container it did not restart', {
