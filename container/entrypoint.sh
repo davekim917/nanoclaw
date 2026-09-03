@@ -80,9 +80,15 @@ if [ -n "$GITHUB_TOKEN_FILE" ] || [ -n "$GH_TOKEN" ]; then
   # only when it consumed a newline terminator — exactly the "fully written"
   # signal — so a torn read is detectable and worth a brief retry rather than
   # handing git half a credential.
+  #
+  # The `-r` test gates the retry loop on the file being READABLE. Retrying is
+  # only meaningful against a write in progress; an absent or unreadable file
+  # will still be absent 250ms later, and looping on it would print five
+  # redirection errors into git's own stderr on every single call and delay the
+  # env fallback for nothing.
   cat > /tmp/bin/nanoclaw-gh-token <<'READER'
 #!/bin/bash
-if [ -n "$GITHUB_TOKEN_FILE" ]; then
+if [ -n "$GITHUB_TOKEN_FILE" ] && [ -r "$GITHUB_TOKEN_FILE" ]; then
   for _i in 1 2 3 4 5; do
     if IFS= read -r _tok < "$GITHUB_TOKEN_FILE" 2>/dev/null && [ -n "$_tok" ]; then
       printf '%s' "$_tok"

@@ -169,8 +169,29 @@ echo "$out" | grep -q '^password=ghs_from_file$' || fail "env shadowed the file:
 pass "the mounted file is authoritative"
 
 # =========================================================================
-echo "6. no credential at all"
+echo "6. GITHUB_TOKEN_FILE set but the mount is missing"
 CASE="$ROOT/case6"
+run_block "$CASE" GITHUB_TOKEN_FILE=/nonexistent/nanoclaw/token GH_TOKEN=ghp_env_backstop \
+  || fail "block exited nonzero with a missing mount"
+
+# Rollout-window safety net: host on the new code, mount not there yet.
+out=$(GITHUB_TOKEN_FILE=/nonexistent/nanoclaw/token NANOCLAW_GH_TOKEN=ghp_env_backstop \
+  "$BIN/nanoclaw-git-creds" get 2>"$CASE/err.txt") || fail "no fallback when the mount is missing"
+echo "$out" | grep -q '^password=ghp_env_backstop$' || fail "did not fall back to the env token: $out"
+pass "falls back to the env token when the mount is absent"
+
+# A missing file will still be missing in 250ms. Retrying it spams git's own
+# stderr on every call and delays the fallback for nothing.
+[ -s "$CASE/err.txt" ] && fail "helper wrote to stderr for a missing mount: $(cat "$CASE/err.txt")"
+pass "no stderr noise and no retry delay for an absent mount"
+
+GITHUB_TOKEN_FILE=/nonexistent/nanoclaw/token "$BIN/nanoclaw-git-creds" get >/dev/null 2>&1 \
+  && fail "helper succeeded with neither a readable file nor an env token"
+pass "hard failure when neither lane has a credential"
+
+# =========================================================================
+echo "7. no credential at all"
+CASE="$ROOT/case7"
 run_block "$CASE" || fail "block exited nonzero with no credential"
 [ -e "$BIN/nanoclaw-git-creds" ] && fail "helper written with no credential configured"
 [ -e "$CASE/.gitconfig" ] && fail "git config touched with no credential configured"
