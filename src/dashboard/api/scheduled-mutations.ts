@@ -121,7 +121,20 @@ function resolveTarget(
     // Read-only seam: resolving the gate must not provision or migrate the
     // session (invariant I-4). `undefined` is "no mailbox", which the
     // existsSync guard above has already turned into a 503.
-    live = readSessionInbound(location, (mailbox) => mailbox.getLiveTaskRow(decoded.seriesId)) ?? undefined;
+    //
+    // The options restate what `openInboundDb` gave this read before the seam,
+    // because both matter on a MUTATION gate: the write path's 5s
+    // busy_timeout, so a contended session waits rather than 503-ing an
+    // operator's edit, and the hot-journal rollback, without which a session
+    // whose container was SIGKILLed answers every gate with 503 until some
+    // other subsystem recovers it. This is one named session the handler is
+    // about to write to anyway — not the console's fleet fan-out, which is
+    // what the 1s no-recovery default exists for.
+    live =
+      readSessionInbound(location, (mailbox) => mailbox.getLiveTaskRow(decoded.seriesId), {
+        busyTimeoutMs: 5000,
+        recoverJournal: true,
+      }) ?? undefined;
   } catch (err) {
     log.warn('scheduled-mutations: inbound read failed', { err: err instanceof Error ? err.message : String(err) });
     return { error: json({ error: 'session_unreadable', reason: 'session_unreadable' }, 503) };

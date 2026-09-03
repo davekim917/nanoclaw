@@ -97,6 +97,9 @@ for (const session of getActiveSessions()) {
   const srcPath = sessionMailboxPath({ agentGroupId: session.agent_group_id, sessionId: session.id }, 'inbound');
   // Read-only seam: a survey pass must never provision or migrate a session it
   // is only reading. `undefined` is "no mailbox" — nothing to consolidate.
+  // 5s busy_timeout because this is an operator-run one-shot against a LIVE
+  // fleet: a session that is briefly busy must be waited for, not silently
+  // skipped and left un-consolidated.
   const rows =
     readSessionInbound(
       { agentGroupId: session.agent_group_id, sessionId: session.id },
