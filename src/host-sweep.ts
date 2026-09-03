@@ -1626,15 +1626,25 @@ async function sweepSession(session: Session): Promise<number | null> {
       };
     });
   } catch (err) {
+    // A session that vanished under us is the ordinary steady state — counted,
+    // backed off, not logged as a fault.
     if (err instanceof SessionDbMissingError) return skipUnreadable(session.id, 'session mailbox vanished');
+    // Anything else is either an unopenable-but-present mailbox or a duty that
+    // threw, and this catch cannot tell them apart from here. Both get the
+    // backoff (a session the host cannot get through has nothing to sweep, and
+    // retrying every 60s is what produced ~4k identical errors in the
+    // hot-journal incident) AND an error-level line, so a real bug in a duty is
+    // never quietly filed as a quiet session. `sweepOnce` isolates per session
+    // either way; `last_active` moving clears the backoff.
+    log.error('Host sweep error', { err, sessionId: session.id });
     return skipUnreadable(session.id, `session mailbox unreadable: ${String(err)}`);
   }
   // The seam is the ONLY gate on "does this session have a mailbox". There is
   // deliberately no `fs.existsSync` pre-check beside it: two answers to that
-  // question drift, and the one that matters is the implementation's own.
-  // `exists()` covers BOTH mailbox files, so an inbound.db with no outbound.db
-  // beside it reads as half-provisioned — unreadable, not quiet — and a
-  // reclaimed session is never re-created by a read (invariant I-4).
+  // question drift, and the one that matters is the implementation's own. It
+  // answers on inbound.db alone, so a never-woken session with no outbound.db
+  // is swept normally (its outbound reads answer empty) — only a session with
+  // no inbound.db at all is skipped, and a read never re-creates one (I-4).
   if (!plan) return skipUnreadable(session.id, 'no session mailbox');
 
   const { admittedTasks, dueCount, wakePriority, workContinuation } = plan;
