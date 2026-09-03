@@ -30,11 +30,13 @@ import { initDb, closeDb } from '../../src/db/connection.js';
 import { getAllAgentGroups } from '../../src/db/agent-groups.js';
 import { getMessagingGroupsByAgentGroup } from '../../src/db/messaging-groups.js';
 import { runMigrations } from '../../src/db/migrations/index.js';
-import {
-  resolveSession,
-  writeSessionRouting,
-  outboundDbPath,
-} from '../../src/session-manager.js';
+import { resolveSession, writeSessionRouting } from '../../src/session-manager.js';
+// The session-directory LAYOUT only. `session-manager`'s path wrappers went
+// away with the mailbox seam's raw surface; upstream's own helper is where the
+// layout lives. Deliberately not the seam itself: this runs under `tsx` from
+// migrate-v2.sh, before any host boot, so `mailbox/compose.js` has not
+// registered an implementation and `withMailboxSession` would throw.
+import { outboundDbPath } from '../../src/mailbox/sqlite/paths.js';
 
 const SKIP_NAMES = new Set(['.DS_Store']);
 
