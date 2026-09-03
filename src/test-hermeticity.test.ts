@@ -94,12 +94,12 @@ describe('network guard', () => {
     expect(() => fetch('https://api.github.com/meta')).toThrow(/network escape — fetch/);
   });
 
-  it('records the attempt when enforcement is off', () => {
-    // Recorded synchronously, before the real fetch is ever reached — so no
-    // packet leaves the box even in warn mode's assertion path.
-    withHermeticityMode('warn', () => {
-      void fetch('https://api.github.com/meta').catch(() => undefined);
-    });
+  it('records the attempt, without a request ever leaving', () => {
+    // Deliberately NOT exercised in warn mode: warn calls through, so a probe
+    // there would put a real packet on the wire and make this suite depend on
+    // GitHub being reachable. The throw path proves the same thing, because the
+    // record is written before the throw.
+    expect(() => fetch('https://api.github.com/meta')).toThrow(/network escape/);
     expect(hermeticityAttempts()).toHaveLength(1);
     expect(hermeticityAttempts()[0]).toMatchObject({ kind: 'network', api: 'fetch' });
   });
@@ -116,21 +116,39 @@ describe('out-of-tree write guard', () => {
     expect(() => fs.writeFileSync(path.join(process.cwd(), 'data', 'probe'), 'x')).toThrow(/fs-write escape/);
   });
 
-  it('records the attempt without writing when enforcement is off', () => {
-    // `warn` calls through, so the probe must be a path whose real write fails
-    // anyway — mkdir without recursive under a directory that does not exist.
-    withHermeticityMode('warn', () => {
-      try {
-        fs.mkdirSync(path.join(os.homedir(), 'plugins', 'hermeticity-probe', 'nested'));
-      } catch (error) {
-        // The real ENOENT from mkdir without `recursive`; anything else is a
-        // genuine failure and must not be swallowed. The record asserted below
-        // is what is actually under test.
-        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
-      }
-    });
-    expect(hermeticityAttempts().length).toBeGreaterThan(0);
+  it('records the attempt without touching the protected path', () => {
+    // Deliberately NOT exercised in warn mode: warn calls through, and on a box
+    // where the parent happens to exist that would create a real directory
+    // inside the live, fail-closed plugins mount. The throw path proves the
+    // same thing, because the record is written before the throw.
+    expect(() => fs.mkdirSync(escape)).toThrow(/fs-write escape/);
+    expect(hermeticityAttempts()).toHaveLength(1);
     expect(hermeticityAttempts()[0].kind).toBe('fs-write');
+    expect(fs.existsSync(escape)).toBe(false);
+  });
+
+  it('guards a writable open, whose descriptor later writes invisibly', () => {
+    expect(() => fs.openSync(path.join(process.cwd(), 'data', 'probe'), 'w')).toThrow(/fs-write escape — fs.openSync/);
+    clearHermeticityAttempts();
+
+    // A read-only open mutates nothing and must stay out of the way.
+    const root = globalThis.uniqueTmpRoot('hermeticity-open');
+    fs.mkdirSync(root, { recursive: true });
+    const readable = path.join(root, 'r');
+    fs.writeFileSync(readable, 'x');
+    fs.closeSync(fs.openSync(readable, 'r'));
+    expect(hermeticityAttempts()).toHaveLength(0);
+  });
+
+  it('follows a symlink out of the temp dir before allowing the write', () => {
+    // A lexical check sees an innocent temp path. The symlink points at the
+    // checkout's data directory, so the write would land on live state.
+    const root = globalThis.uniqueTmpRoot('hermeticity-symlink');
+    fs.mkdirSync(root, { recursive: true });
+    const link = path.join(root, 'link');
+    fs.symlinkSync(path.join(process.cwd(), 'data'), link);
+    clearHermeticityAttempts();
+    expect(() => fs.writeFileSync(path.join(link, 'v2.db'), 'x')).toThrow(/fs-write escape/);
   });
 
   it('checks the destination of a two-path call, not the source', () => {

@@ -108,18 +108,60 @@ describe('hermeticity tripwire', () => {
     );
   });
 
-  test('records the write attempt with enforcement off', () => {
-    withHermeticityMode('warn', () => {
-      try {
-        fs.mkdirSync(path.join(os.homedir(), 'plugins', 'runner-probe', 'nested'));
-      } catch (error) {
-        // The real ENOENT from mkdir without `recursive`; the record asserted
-        // below is what is under test. Anything else is a genuine failure.
-        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
-      }
-    });
-    expect(hermeticityAttempts().length).toBeGreaterThan(0);
+  test('records the write attempt without touching the protected path', () => {
+    // Deliberately NOT exercised in warn mode: warn calls through, and on a box
+    // where the parent happens to exist that would create a real directory
+    // inside the live, fail-closed plugins mount. The throw path proves the
+    // same thing, because the record is written before the throw.
+    const probe = path.join(os.homedir(), 'plugins', 'runner-probe');
+    enforcing(() => expect(() => fs.mkdirSync(probe)).toThrow(/fs-write escape/));
+    expect(hermeticityAttempts()).toHaveLength(1);
     expect(hermeticityAttempts()[0]!.kind).toBe('fs-write');
+    expect(fs.existsSync(probe)).toBe(false);
+  });
+
+  test('guards Bun.spawn and Bun.spawnSync, which child_process does not cover', () => {
+    // The runner shells out through these directly — self-mod runs `opencode`
+    // that way — so a guard that only wrapped Node's exports would report a
+    // clean strict run while real child processes came and went.
+    enforcing(() => {
+      expect(() => Bun.spawn(['git', '--version'])).toThrow(/subprocess escape — Bun.spawn\(git\)/);
+      expect(() => Bun.spawnSync(['git', '--version'])).toThrow(/subprocess escape — Bun.spawnSync\(git\)/);
+      expect(() => Bun.spawn({ cmd: ['git', '--version'] })).toThrow(/subprocess escape — Bun.spawn\(git\)/);
+    });
+    clearHermeticityAttempts();
+
+    allowSubprocess(['git']);
+    enforcing(() => {
+      expect(Bun.spawnSync(['git', '--version']).success).toBe(true);
+    });
+    expect(hermeticityAttempts()).toHaveLength(0);
+  });
+
+  test('guards a writable open, whose descriptor later writes invisibly', () => {
+    enforcing(() =>
+      expect(() => fs.openSync(path.join(process.cwd(), 'data', 'probe'), 'w')).toThrow(
+        /fs-write escape — fs.openSync/,
+      ),
+    );
+    clearHermeticityAttempts();
+
+    // A read-only open mutates nothing and must stay out of the way.
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'runner-hermeticity-open-'));
+    const readable = path.join(root, 'r');
+    fs.writeFileSync(readable, 'x');
+    enforcing(() => fs.closeSync(fs.openSync(readable, 'r')));
+    expect(hermeticityAttempts()).toHaveLength(0);
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  test('follows a symlink out of the temp dir before allowing the write', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'runner-hermeticity-symlink-'));
+    const link = path.join(root, 'link');
+    fs.symlinkSync(path.join(process.cwd(), 'data'), link);
+    clearHermeticityAttempts();
+    enforcing(() => expect(() => fs.writeFileSync(path.join(link, 'v2.db'), 'x')).toThrow(/fs-write escape/));
+    fs.rmSync(root, { recursive: true, force: true });
   });
 
   test('leaves temp-directory fixtures alone', () => {

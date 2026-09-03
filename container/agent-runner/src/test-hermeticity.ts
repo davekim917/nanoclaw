@@ -138,6 +138,14 @@ function commandOf(api: string, args: unknown[]): string {
   return first;
 }
 
+/**
+ * True while a guarded `child_process` call is running. Bun implements Node's
+ * `child_process` on top of `Bun.spawn`, so without this a single
+ * `execFileSync` records twice — once at each layer — and doubles the tally the
+ * end-of-run message reports.
+ */
+let insideGuardedSubprocess = false;
+
 /** The guard body shared by the direct call and its promisified twin. */
 function checkSubprocess(api: string, args: unknown[]): void {
   const command = commandOf(api, args);
@@ -152,7 +160,12 @@ function guardChildProcess(real: Record<string, unknown>): Record<string, unknow
     if (typeof original !== 'function') continue;
     const wrapper = (...args: unknown[]): unknown => {
       checkSubprocess(api, args);
-      return original(...args);
+      insideGuardedSubprocess = true;
+      try {
+        return original(...args);
+      } finally {
+        insideGuardedSubprocess = false;
+      }
     };
     // `promisify(execFile)` reads this symbol off the function it is handed and
     // calls it INSTEAD of the function itself, so copying the original's
@@ -171,6 +184,37 @@ function guardChildProcess(real: Record<string, unknown>): Record<string, unknow
   guarded.default = guarded;
   return guarded;
 }
+
+/**
+ * Bun's own subprocess APIs, which `child_process` does not cover.
+ *
+ * The runner reaches for these directly — `src/mcp-tools/self-mod.ts` shells out
+ * to `opencode` through `Bun.spawn`, and several suites spawn helper processes
+ * the same way — so a guard that only wraps Node's exports would report a clean
+ * strict run while real child processes came and went. `Bun.spawn` takes either
+ * an argv array or `{ cmd: [...] }`; `Bun.$` is a tagged template, and its
+ * command text is not reliably recoverable, so it is reported by name.
+ */
+function guardBunSubprocess(): void {
+  const bun = globalThis.Bun as unknown as Record<string, unknown> | undefined;
+  if (bun === undefined) return;
+  for (const api of ['spawn', 'spawnSync']) {
+    const original = bun[api] as AnyFn | undefined;
+    if (typeof original !== 'function') continue;
+    bun[api] = (...args: unknown[]): unknown => {
+      const first = args[0];
+      const argv = Array.isArray(first)
+        ? first
+        : first && typeof first === 'object' && Array.isArray((first as { cmd?: unknown[] }).cmd)
+          ? (first as { cmd: unknown[] }).cmd
+          : [];
+      if (!insideGuardedSubprocess) checkSubprocess(`Bun.${api}`, [String(argv[0] ?? first)]);
+      return original(...args);
+    };
+  }
+}
+
+guardBunSubprocess();
 
 const realChildProcess = (await import('node:child_process')) as unknown as Record<string, unknown>;
 const guardedChildProcess = guardChildProcess(realChildProcess);
@@ -234,14 +278,75 @@ function pathOf(arg: unknown): string | null {
   return null;
 }
 
-function writeDenied(target: unknown): string | null {
-  if (state.mode === 'off') return null;
-  const raw = pathOf(target);
-  if (raw === null) return null;
-  const resolved = nodePath.resolve(raw);
-  for (const allowed of state.writePaths) {
-    if (isUnder(resolved, allowed)) return null;
+/**
+ * The unguarded path-inspection calls. None of them is a write API, so none is
+ * wrapped; `realFs` is the module captured before the mocks were installed.
+ */
+interface PathOps {
+  lstatSync: (p: string) => { isSymbolicLink(): boolean };
+  readlinkSync: (p: string) => string;
+  realpathSync: (p: string) => string;
+}
+let PATH_OPS: PathOps | null = null;
+
+/**
+ * Run a path-inspection call, or `null` if it fails.
+ *
+ * Every caller below is inspecting a path that may not exist yet, may dangle,
+ * or may not be readable. Any failure means "cannot resolve further", and the
+ * lexical path is then the safe answer — so there is nothing to rethrow.
+ */
+function attempt<T>(fn: () => T): T | null {
+  try {
+    return fn();
+    // eslint-disable-next-line no-catch-all/no-catch-all
+  } catch {
+    return null;
   }
+}
+
+/**
+ * The physical path a write lands on, following symlinks.
+ *
+ * A lexical check is not enough: a fixture under the temp dir can hold a
+ * symlink into a denied root, and a write through it would sail past the
+ * temp-directory allowance and mutate live state. Neither the target nor the
+ * link's destination is guaranteed to exist yet, so this walks to the nearest
+ * lstat-able ancestor, follows it by hand when it is a symlink — a dangling one
+ * throws out of `realpathSync`, which is exactly what a not-yet-created fixture
+ * produces — and re-appends the rest.
+ */
+function canonicalize(p: string): string {
+  const ops = PATH_OPS;
+  if (ops === null) return p;
+  let current = p;
+  const tail: string[] = [];
+  // Bounded so a symlink cycle cannot spin here.
+  for (let hop = 0; hop < 40; hop += 1) {
+    const below: string[] = [];
+    let dir = current;
+    let stat = attempt(() => ops.lstatSync(dir));
+    while (stat === null) {
+      const parent = nodePath.dirname(dir);
+      if (parent === dir) return p;
+      below.unshift(nodePath.basename(dir));
+      dir = parent;
+      stat = attempt(() => ops.lstatSync(dir));
+    }
+    if (!stat.isSymbolicLink()) {
+      const real = attempt(() => ops.realpathSync(dir));
+      return nodePath.join(real ?? dir, ...below, ...tail);
+    }
+    const target = attempt(() => ops.readlinkSync(dir));
+    if (target === null) return p;
+    current = nodePath.resolve(nodePath.dirname(dir), target);
+    tail.unshift(...below);
+  }
+  return p;
+}
+
+/** The denylist verdict for one already-resolved path. */
+function deniedFor(resolved: string): string | null {
   // Checkout-relative roots are denied even under the temp dir: a scratch
   // worktree can itself live in /tmp, and `<worktree>/data` is exactly the
   // escape worth catching.
@@ -265,7 +370,28 @@ function writeDenied(target: unknown): string | null {
   return null;
 }
 
+function writeDenied(target: unknown): string | null {
+  if (state.mode === 'off') return null;
+  const raw = pathOf(target);
+  if (raw === null) return null;
+  const resolved = nodePath.resolve(raw);
+  const physical = canonicalize(resolved);
+  for (const allowed of state.writePaths) {
+    if (isUnder(resolved, allowed) || isUnder(physical, allowed)) return null;
+  }
+  // Both the lexical and the physical path have to be clear. The lexical one
+  // catches `<checkout>/data` even when it is itself a symlink elsewhere; the
+  // physical one catches a temp path that points into a denied root.
+  for (const candidate of physical === resolved ? [resolved] : [resolved, physical]) {
+    const denied = deniedFor(candidate);
+    if (denied !== null) return denied;
+  }
+  return null;
+}
+
 const WRITE_APIS = [
+  'open',
+  'openSync',
   'writeFile',
   'writeFileSync',
   'appendFile',
@@ -296,17 +422,35 @@ const WRITE_APIS = [
 ];
 
 /**
+ * Whether an `open` call is opening for WRITING. Omitted flags mean `'r'`.
+ * Anything unrecognized is treated as a write, so the guard fails closed.
+ */
+function isWriteOpen(flags: unknown): boolean {
+  if (flags === undefined || flags === null) return false;
+  if (typeof flags === 'string') return /[wa+]/.test(flags);
+  if (typeof flags === 'number') {
+    const c = realFs.constants as Record<string, number>;
+    return (flags & (c.O_WRONLY | c.O_RDWR | c.O_CREAT | c.O_TRUNC | c.O_APPEND)) !== 0;
+  }
+  return true;
+}
+
+/**
  * Which arguments hold a path this call MUTATES.
  *
  * Most of the API mutates its first. `copyFile`, `cp`, `symlink` and `link`
  * only create their second — checking the first there flags the source, which
  * is how this guard first "caught" a container mount copying a real Snowflake
- * key it was only reading. `rename` is the one that mutates both: it removes
- * the source as well as creating the destination, so
- * `renameSync('<checkout>/data/v2.db', '/tmp/x')` would move live central state
- * out of the checkout while passing a destination-only check.
+ * key it was only reading. `rename` mutates both: it removes the source as well
+ * as creating the destination, so `renameSync('<checkout>/data/v2.db', '/tmp/x')`
+ * would move live central state out of the checkout past a destination-only
+ * check. `open` mutates its first only when the flags say so, but it has to be
+ * covered: `openSync(p, 'w')` truncates before a single byte is written, and
+ * the descriptor it hands back is a number, which this guard deliberately
+ * ignores — so an unguarded `open` makes every subsequent write invisible.
  */
-function writeArgIndices(api: string): number[] {
+function writeTargets(api: string, args: unknown[]): number[] {
+  if (/^open/.test(api)) return isWriteOpen(args[1]) ? [0] : [];
   if (/^rename/.test(api)) return [0, 1];
   if (/^(copyFile|cp|symlink|link)/.test(api)) return [1];
   return [0];
@@ -317,9 +461,10 @@ function guardWrites(module: Record<string, unknown>, prefix: string): Record<st
   for (const api of WRITE_APIS) {
     const original = module[api] as AnyFn | undefined;
     if (typeof original !== 'function') continue;
-    const targets = writeArgIndices(api);
     guarded[api] = (...args: unknown[]): unknown => {
-      const offending = targets.map((i) => [i, writeDenied(args[i])] as const).find(([, denied]) => denied !== null);
+      const offending = writeTargets(api, args)
+        .map((i) => [i, writeDenied(args[i])] as const)
+        .find(([, denied]) => denied !== null);
       if (offending !== undefined) {
         const [index, denied] = offending;
         trip(
@@ -336,6 +481,11 @@ function guardWrites(module: Record<string, unknown>, prefix: string): Record<st
 }
 
 const realFs = (await import('node:fs')) as unknown as Record<string, unknown>;
+PATH_OPS = {
+  lstatSync: realFs.lstatSync as PathOps['lstatSync'],
+  readlinkSync: realFs.readlinkSync as PathOps['readlinkSync'],
+  realpathSync: realFs.realpathSync as PathOps['realpathSync'],
+};
 const guardedFs = guardWrites(realFs, 'fs.');
 if (realFs.promises && typeof realFs.promises === 'object') {
   guardedFs.promises = guardWrites(realFs.promises as Record<string, unknown>, 'fs.promises.');

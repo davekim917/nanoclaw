@@ -307,6 +307,9 @@ vi.mock('undici', async (importOriginal) => {
 
 // ── out-of-tree writes ───────────────────────────────────────────────────────
 
+/** `fs.constants`, filled in from the real module inside the mock factory. */
+const nodeFsConstants = { O_WRONLY: 1, O_RDWR: 2, O_CREAT: 64, O_TRUNC: 512, O_APPEND: 1024 };
+
 /**
  * Roots inside the checkout that a unit test has no business writing to. In a
  * live install these hold production session state, so a test that lands here
@@ -344,17 +347,76 @@ function pathOf(arg: unknown): string | null {
   return null;
 }
 
-/** `null` when the write is fine, otherwise the reason it is not. */
-function writeDenied(target: unknown): string | null {
-  const s = state();
-  if (s.mode === 'off') return null;
-  const raw = pathOf(target);
-  if (raw === null) return null;
-  const resolved = nodePath.resolve(raw);
-  // An explicit opt-in outranks everything else.
-  for (const allowed of s.writePaths) {
-    if (isUnder(resolved, allowed)) return null;
+/**
+ * The unguarded path-inspection calls, captured inside the mock factory where
+ * `importOriginal()` still hands back the real module. None of them is a write
+ * API, so none is wrapped.
+ */
+interface PathOps {
+  lstatSync: (p: string) => { isSymbolicLink(): boolean };
+  readlinkSync: (p: string) => string;
+  realpathSync: (p: string) => string;
+}
+let PATH_OPS: PathOps | null = null;
+
+/**
+ * Run a path-inspection call, or `null` if it fails.
+ *
+ * Every caller below is inspecting a path that may not exist yet, may dangle,
+ * or may not be readable. Any failure means "cannot resolve further", and the
+ * lexical path is then the safe answer — so there is nothing to rethrow.
+ */
+function attempt<T>(fn: () => T): T | null {
+  try {
+    return fn();
+    // eslint-disable-next-line no-catch-all/no-catch-all
+  } catch {
+    return null;
   }
+}
+
+/**
+ * The physical path a write lands on, following symlinks.
+ *
+ * A lexical check is not enough: a fixture under the temp dir can hold a
+ * symlink into a denied root, and a write through it would sail past the
+ * temp-directory allowance and mutate live state. Neither the target nor the
+ * link's destination is guaranteed to exist yet, so this walks to the nearest
+ * lstat-able ancestor, follows it by hand when it is a symlink — a dangling one
+ * throws out of `realpathSync`, which is exactly what a not-yet-created fixture
+ * produces — and re-appends the rest.
+ */
+function canonicalize(p: string): string {
+  const ops = PATH_OPS;
+  if (ops === null) return p;
+  let current = p;
+  const tail: string[] = [];
+  // Bounded so a symlink cycle cannot spin here.
+  for (let hop = 0; hop < 40; hop += 1) {
+    const below: string[] = [];
+    let dir = current;
+    let stat = attempt(() => ops.lstatSync(dir));
+    while (stat === null) {
+      const parent = nodePath.dirname(dir);
+      if (parent === dir) return p;
+      below.unshift(nodePath.basename(dir));
+      dir = parent;
+      stat = attempt(() => ops.lstatSync(dir));
+    }
+    if (!stat.isSymbolicLink()) {
+      const real = attempt(() => ops.realpathSync(dir));
+      return nodePath.join(real ?? dir, ...below, ...tail);
+    }
+    const target = attempt(() => ops.readlinkSync(dir));
+    if (target === null) return p;
+    current = nodePath.resolve(nodePath.dirname(dir), target);
+    tail.unshift(...below);
+  }
+  return p;
+}
+
+/** The denylist verdict for one already-resolved path. */
+function deniedFor(resolved: string): string | null {
   // Checkout-relative roots are denied even under the temp dir: a scratch
   // worktree can itself live in /tmp, and `<worktree>/data` is exactly the
   // escape worth catching.
@@ -378,24 +440,67 @@ function writeDenied(target: unknown): string | null {
   return null;
 }
 
+/** `null` when the write is fine, otherwise the reason it is not. */
+function writeDenied(target: unknown): string | null {
+  const s = state();
+  if (s.mode === 'off') return null;
+  const raw = pathOf(target);
+  if (raw === null) return null;
+  const resolved = nodePath.resolve(raw);
+  const physical = canonicalize(resolved);
+  // An explicit opt-in outranks everything else.
+  for (const allowed of s.writePaths) {
+    if (isUnder(resolved, allowed) || isUnder(physical, allowed)) return null;
+  }
+  // Both the lexical and the physical path have to be clear. The lexical one
+  // catches `<checkout>/data` even when it is itself a symlink elsewhere; the
+  // physical one catches a temp path that points into a denied root.
+  for (const candidate of physical === resolved ? [resolved] : [resolved, physical]) {
+    const denied = deniedFor(candidate);
+    if (denied !== null) return denied;
+  }
+  return null;
+}
+
+/**
+ * Whether an `open` call is opening for WRITING. Omitted flags mean `'r'`.
+ * Anything unrecognized is treated as a write, so the guard fails closed.
+ */
+function isWriteOpen(flags: unknown): boolean {
+  if (flags === undefined || flags === null) return false;
+  if (typeof flags === 'string') return /[wa+]/.test(flags);
+  if (typeof flags === 'number') {
+    const { O_WRONLY, O_RDWR, O_CREAT, O_TRUNC, O_APPEND } = nodeFsConstants;
+    return (flags & (O_WRONLY | O_RDWR | O_CREAT | O_TRUNC | O_APPEND)) !== 0;
+  }
+  return true;
+}
+
 /**
  * Which arguments hold a path this call MUTATES.
  *
  * Most of the API mutates its first. `copyFile`, `cp`, `symlink` and `link`
  * only create their second — checking the first there flags the source, which
  * is how this guard first "caught" a container mount copying a real Snowflake
- * key it was only reading. `rename` is the one that mutates both: it removes
- * the source as well as creating the destination, so
- * `renameSync('<checkout>/data/v2.db', '/tmp/x')` would move live central state
- * out of the checkout while passing a destination-only check.
+ * key it was only reading. `rename` mutates both: it removes the source as well
+ * as creating the destination, so `renameSync('<checkout>/data/v2.db', '/tmp/x')`
+ * would move live central state out of the checkout past a destination-only
+ * check. `open` mutates its first only when the flags say so, but it has to be
+ * covered: `openSync(p, 'w')` truncates before a single byte is written, and
+ * the descriptor it hands back is a number, which this guard deliberately
+ * ignores — so an unguarded `open` makes every subsequent write invisible.
+ * `src/session-manager.ts` opens the upgrade manifest exactly that way.
  */
-function writeArgIndices(api: string): number[] {
+function writeTargets(api: string, args: unknown[]): number[] {
+  if (/^open/.test(api)) return isWriteOpen(args[1]) ? [0] : [];
   if (/^rename/.test(api)) return [0, 1];
   if (/^(copyFile|cp|symlink|link)/.test(api)) return [1];
   return [0];
 }
 
 const WRITE_APIS = [
+  'open',
+  'openSync',
   'writeFile',
   'writeFileSync',
   'appendFile',
@@ -430,9 +535,10 @@ function guardWrites(module: Record<string, unknown>, prefix: string): Record<st
   for (const api of WRITE_APIS) {
     const original = module[api] as AnyFn | undefined;
     if (typeof original !== 'function') continue;
-    const targets = writeArgIndices(api);
     guarded[api] = (...args: unknown[]): unknown => {
-      const offending = targets.map((i) => [i, writeDenied(args[i])] as const).find(([, denied]) => denied !== null);
+      const offending = writeTargets(api, args)
+        .map((i) => [i, writeDenied(args[i])] as const)
+        .find(([, denied]) => denied !== null);
       if (offending !== undefined) {
         const [index, denied] = offending;
         trip(
@@ -449,6 +555,12 @@ function guardWrites(module: Record<string, unknown>, prefix: string): Record<st
 }
 
 function guardFsModule(real: Record<string, unknown>): Record<string, unknown> {
+  PATH_OPS = {
+    lstatSync: real.lstatSync as PathOps['lstatSync'],
+    readlinkSync: real.readlinkSync as PathOps['readlinkSync'],
+    realpathSync: real.realpathSync as PathOps['realpathSync'],
+  };
+  Object.assign(nodeFsConstants, real.constants as Record<string, number>);
   const guarded = guardWrites(real, 'fs.');
   if (real.promises && typeof real.promises === 'object') {
     guarded.promises = guardWrites(real.promises as Record<string, unknown>, 'fs.promises.');
