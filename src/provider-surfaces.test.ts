@@ -266,9 +266,9 @@ describe('initGroupFilesystem agent surfaces', () => {
     expect(fs.readFileSync(path.join(groupDir, '.claude-fragments', 'standing-instructions.md'), 'utf-8')).toBe(
       'hello',
     );
-    expect(fs.readFileSync(path.join(groupDir, 'CLAUDE.md'), 'utf-8')).toContain(
-      '@./.claude-fragments/standing-instructions.md',
-    );
+    // Inlined, not `@`-imported: Claude Code drops imports that resolve
+    // outside the project directory (issue #233).
+    expect(fs.readFileSync(path.join(groupDir, 'CLAUDE.md'), 'utf-8')).toContain('hello');
   });
 
   it('reconciles the managed Bash maximum while preserving an operator-owned default', () => {
