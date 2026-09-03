@@ -185,7 +185,7 @@ vi.mock('./storage-pressure-alert.js', () => ({ handleStoragePressureAlert: () =
 vi.mock('./modules/claims/reconcile.js', () => ({ reconcileMergedClaims: async () => undefined }));
 vi.mock('./modules/claims/self-heal.js', () => ({ sweepClaimsSelfHeal: async () => undefined }));
 vi.mock('./repo-fence-recovery.js', () => ({ sweepOrphanedRepoIngressFences: async () => null }));
-vi.mock('./db/channel-ingress-receipts.js', () => ({ pruneChannelIngressReceipts: () => undefined }));
+vi.mock('./db/channel-ingress-receipts.js', () => ({ pruneChannelIngressReceipts: vi.fn(() => undefined) }));
 vi.mock('./db/usage.js', () => ({ rollupSessionUsage: () => 0, pruneOldTurnUsage: () => undefined }));
 vi.mock('./github-app-token.js', () => ({ refreshExpiringGitHubAppTokens: async () => undefined }));
 vi.mock('./modules/approvals/index.js', () => ({ sweepAwaitingReasonRejects: async () => undefined }));
@@ -237,6 +237,11 @@ import { _mailboxSessionDepthForTesting } from './modules/mailbox/session.js';
 // import — a default (builtins-restoring) `_resetSweepRegistryForTesting()`
 // replays it automatically, same as the in-file builtins.
 import './modules/sweep-idle-reap/index.js';
+// Family modules moved out of host-sweep.ts register at import — pull them in
+// here so the hermetic registry harness sees the full 39-registration set.
+// Their own duty-body mocks are already declared above (this file predates
+// the move and anticipated it).
+import './modules/sweep-central/index.js';
 
 probe.depth = _mailboxSessionDepthForTesting;
 
@@ -1342,6 +1347,48 @@ describe('sweep duty registry (S2-PR2)', () => {
     h.opens = [];
     await _sweepOnceForTesting();
     expect(h.opens).toEqual([]);
+    expect(h.spawns).toEqual([]);
+  });
+
+  // ── F-4.4 (S2-PR4 — plan.md §8) ──────────────────────────────────────────
+  // "the receipts prune is registered and therefore guarded" — T10
+  // (channel-ingress-receipt-prune) has no try/catch of its own; through the
+  // registry wrapper a throw is logged and does not abort the rest of the
+  // tick:housekeeping phase. Re-proves R-4b's tick-level isolation property
+  // (constraint 5) for the real production duty, not a synthetic probe.
+  //
+  // NOTE: depends on the tick-level duty isolation PR 2 is landing in a
+  // correction commit (runTickPhase catching per-duty, not per-phase). As
+  // built on this branch's base (a1fd2633), `runTickPhase` has no per-duty
+  // try/catch, so a throw from T10 aborts the rest of the tick:housekeeping
+  // phase for that tick instead of being isolated — this case is expected to
+  // FAIL until this branch rebases onto PR 2's corrected head.
+  it('the receipts prune is registered and therefore guarded', async () => {
+    const error = vi.spyOn(log, 'error').mockImplementation(() => {});
+    const { pruneChannelIngressReceipts } = await import('./db/channel-ingress-receipts.js');
+    vi.mocked(pruneChannelIngressReceipts).mockImplementationOnce(() => {
+      throw new Error('receipts boom');
+    });
+    // Sits strictly between T10 (order 40) and T11 (order 50) in
+    // tick:housekeeping, so its having run is direct evidence the phase
+    // continued past T10's throw.
+    let laterDutyRan = false;
+    registerSweepDuty({
+      name: 'probe-after-receipts-prune',
+      phase: 'tick:housekeeping',
+      order: 45,
+      run: () => {
+        laterDutyRan = true;
+      },
+    });
+
+    await _sweepOnceForTesting();
+
+    expect(error).toHaveBeenCalledWith(
+      'Host sweep duty failed',
+      expect.objectContaining({ duty: SWEEP_DUTY_INVENTORY.T10, window: 'tick:housekeeping' }),
+    );
+    expect(laterDutyRan).toBe(true);
     expect(h.spawns).toEqual([]);
   });
 
