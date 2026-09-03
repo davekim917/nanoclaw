@@ -124,7 +124,7 @@ describe('handleDispatchSupportIssue — new issue (purest: no ticket from polle
     seed();
     const { session: poller } = resolveSession('ag-1', 'mg-1', null, 'shared');
 
-    await handleDispatchSupportIssue(dispatchContent('gthread-A', 'depletions are off'), poller, {} as never);
+    await handleDispatchSupportIssue(dispatchContent('gthread-A', 'depletions are off'), poller);
 
     expect(postParent).toHaveBeenCalledTimes(1);
     // No ticket yet → generic Support tag, subject + sender preserved.
@@ -173,10 +173,10 @@ describe('handleDispatchSupportIssue — new issue (purest: no ticket from polle
       }),
     });
 
-    await handleDispatchSupportIssue(dispatchContent('gthread-task', 'new issue'), poller, pollerDb);
+    await handleDispatchSupportIssue(dispatchContent('gthread-task', 'new issue'), poller);
     const row = getSupportThread('gthread-task');
     expect(row).toBeTruthy();
-    await handleDispatchSupportIssue(dispatchContent('gthread-task', 'customer replied'), poller, pollerDb);
+    await handleDispatchSupportIssue(dispatchContent('gthread-task', 'customer replied'), poller);
     pollerDb.close();
     const [seedMessage, followupMessage] = inboundOf(row!.session_id!);
     expect(JSON.parse(seedMessage.content)).toMatchObject({
@@ -194,7 +194,6 @@ describe('handleDispatchSupportIssue — new issue (purest: no ticket from polle
     await handleDispatchSupportIssue(
       dispatchContent('gthread-B', 'first email', { issue: 'EXAMPLE-123', team: 'EXAMPLE' }),
       poller,
-      {} as never,
     );
 
     expect(postParent).toHaveBeenCalledWith(
@@ -214,10 +213,10 @@ describe('handleDispatchSupportIssue — follow-up + reopen', () => {
     seed();
     const { session: poller } = resolveSession('ag-1', 'mg-1', null, 'shared');
 
-    await handleDispatchSupportIssue(dispatchContent('gthread-A', 'first email'), poller, {} as never);
+    await handleDispatchSupportIssue(dispatchContent('gthread-A', 'first email'), poller);
     const sessionId = getSupportThread('gthread-A')!.session_id!;
 
-    await handleDispatchSupportIssue(dispatchContent('gthread-A', 'customer replied'), poller, {} as never);
+    await handleDispatchSupportIssue(dispatchContent('gthread-A', 'customer replied'), poller);
 
     expect(postParent).toHaveBeenCalledTimes(1);
     expect(createThread).toHaveBeenCalledTimes(1);
@@ -243,7 +242,7 @@ describe('handleDispatchSupportIssue — follow-up + reopen', () => {
       )
       .run(now(), now());
 
-    await handleDispatchSupportIssue(dispatchContent('gthread-L', 'reply on in-flight thread'), poller, {} as never);
+    await handleDispatchSupportIssue(dispatchContent('gthread-L', 'reply on in-flight thread'), poller);
 
     // Opens a thread (no live session existed)…
     expect(postParent).toHaveBeenCalledTimes(1);
@@ -268,7 +267,7 @@ describe('handleDispatchSupportIssue — archived session binding', () => {
   it('never writes to or wakes a closed session, and replaces ONLY session_id', async () => {
     seed();
     const { session: poller } = resolveSession('ag-1', 'mg-1', null, 'shared');
-    await handleDispatchSupportIssue(dispatchContent('gthread-A', 'first email'), poller, {} as never);
+    await handleDispatchSupportIssue(dispatchContent('gthread-A', 'first email'), poller);
     const before = getSupportThread('gthread-A')!;
     const archivedId = before.session_id!;
     // Reclaim closes the row and removes the dir; the row itself survives, so
@@ -277,7 +276,7 @@ describe('handleDispatchSupportIssue — archived session binding', () => {
     fs.rmSync(`${TEST_DIR}/v2-sessions/ag-1/${archivedId}`, { recursive: true, force: true });
     vi.mocked(wakeContainer).mockClear();
 
-    await handleDispatchSupportIssue(dispatchContent('gthread-A', 'customer replied'), poller, {} as never);
+    await handleDispatchSupportIssue(dispatchContent('gthread-A', 'customer replied'), poller);
 
     const after = getSupportThread('gthread-A')!;
     expect(after.session_id).not.toBe(archivedId);
@@ -302,15 +301,15 @@ describe('handleDispatchSupportIssue — archived session binding', () => {
   it('gives two concurrent follow-ups exactly one new session, and delivers both', async () => {
     seed();
     const { session: poller } = resolveSession('ag-1', 'mg-1', null, 'shared');
-    await handleDispatchSupportIssue(dispatchContent('gthread-A', 'first email'), poller, {} as never);
+    await handleDispatchSupportIssue(dispatchContent('gthread-A', 'first email'), poller);
     const archivedId = getSupportThread('gthread-A')!.session_id!;
     getDb().prepare("UPDATE sessions SET status = 'closed' WHERE id = ?").run(archivedId);
     fs.rmSync(`${TEST_DIR}/v2-sessions/ag-1/${archivedId}`, { recursive: true, force: true });
     vi.mocked(wakeContainer).mockClear();
 
     await Promise.all([
-      handleDispatchSupportIssue(dispatchContent('gthread-A', 'reply one'), poller, {} as never),
-      handleDispatchSupportIssue(dispatchContent('gthread-A', 'reply two'), poller, {} as never),
+      handleDispatchSupportIssue(dispatchContent('gthread-A', 'reply one'), poller),
+      handleDispatchSupportIssue(dispatchContent('gthread-A', 'reply two'), poller),
     ]);
 
     const after = getSupportThread('gthread-A')!;
@@ -337,8 +336,8 @@ describe('handleDispatchSupportIssue — archived session binding', () => {
     // without per-thread serialization the second dispatch reads "no such
     // thread" and announces the same issue a second time.
     await Promise.all([
-      handleDispatchSupportIssue(dispatchContent('gthread-N', 'first email'), poller, {} as never),
-      handleDispatchSupportIssue(dispatchContent('gthread-N', 'same issue again'), poller, {} as never),
+      handleDispatchSupportIssue(dispatchContent('gthread-N', 'first email'), poller),
+      handleDispatchSupportIssue(dispatchContent('gthread-N', 'same issue again'), poller),
     ]);
 
     expect(postParent).toHaveBeenCalledTimes(1);
@@ -353,10 +352,10 @@ describe('handleDispatchSupportIssue — archived session binding', () => {
   it('leaves an active binding on its original session', async () => {
     seed();
     const { session: poller } = resolveSession('ag-1', 'mg-1', null, 'shared');
-    await handleDispatchSupportIssue(dispatchContent('gthread-A', 'first email'), poller, {} as never);
+    await handleDispatchSupportIssue(dispatchContent('gthread-A', 'first email'), poller);
     const sessionId = getSupportThread('gthread-A')!.session_id!;
 
-    await handleDispatchSupportIssue(dispatchContent('gthread-A', 'customer replied'), poller, {} as never);
+    await handleDispatchSupportIssue(dispatchContent('gthread-A', 'customer replied'), poller);
 
     expect(getSupportThread('gthread-A')!.session_id).toBe(sessionId);
     expect(inboundOf(sessionId)).toHaveLength(2);
@@ -367,14 +366,13 @@ describe('handleUpdateSupportTicket', () => {
   it('records the ticket by calling-session and edits the announcement', async () => {
     seed();
     const { session: poller } = resolveSession('ag-1', 'mg-1', null, 'shared');
-    await handleDispatchSupportIssue(dispatchContent('gthread-A', 'first email'), poller, {} as never);
+    await handleDispatchSupportIssue(dispatchContent('gthread-A', 'first email'), poller);
     const row = getSupportThread('gthread-A')!;
     const issueSession = getSession(row.session_id!)!;
 
     await handleUpdateSupportTicket(
       { action: 'update_support_ticket', linearIssue: 'EXAMPLE-200', linearTeam: 'EXAMPLE' },
       issueSession,
-      {} as never,
     );
 
     const updated = getSupportThread('gthread-A')!;
@@ -397,11 +395,7 @@ describe('handleUpdateSupportTicket', () => {
     seed();
     const { session: poller } = resolveSession('ag-1', 'mg-1', null, 'shared');
 
-    await handleUpdateSupportTicket(
-      { action: 'update_support_ticket', linearIssue: 'EXAMPLE-999' },
-      poller,
-      {} as never,
-    );
+    await handleUpdateSupportTicket({ action: 'update_support_ticket', linearIssue: 'EXAMPLE-999' }, poller);
 
     expect(adapterDeliver).not.toHaveBeenCalled();
   });

@@ -85,23 +85,19 @@ async function runDestructiveGate(label: string, requestId: string, command?: st
   const session = getSession('sess-1');
   expect(handler).toBeDefined();
   expect(session).toBeDefined();
-  const inDb = openInboundDb('ag-1', 'sess-1');
-  try {
-    await handler!(
-      {
-        requestId,
-        label,
-        summary: 'The agent wants to run a destructive command.',
-        command:
-          command ??
-          'CREATE OR REPLACE PROCEDURE XZO_PLATFORM.MASTER._LONG_TEST_SP() RETURNS STRING LANGUAGE SQL AS $$ SELECT 1; $$',
-      },
-      session!,
-      inDb,
-    );
-  } finally {
-    inDb.close();
-  }
+  // Two arguments: the handler opens its own mailbox session now, and the
+  // delivery loop holds none while it runs (plan §4.5b).
+  await handler!(
+    {
+      requestId,
+      label,
+      summary: 'The agent wants to run a destructive command.',
+      command:
+        command ??
+        'CREATE OR REPLACE PROCEDURE XZO_PLATFORM.MASTER._LONG_TEST_SP() RETURNS STRING LANGUAGE SQL AS $$ SELECT 1; $$',
+    },
+    session!,
+  );
 }
 
 beforeEach(() => {

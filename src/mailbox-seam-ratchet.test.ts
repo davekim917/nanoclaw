@@ -59,12 +59,14 @@ describe('no raw session-DB access or passed session handle outside the mailbox 
     ).toEqual([]);
   });
 
-  // (e) Ratchet target: DeliveryActionHandler is still 3-argument (content, session, inDb).
-  // PR 3 removes the inDb parameter and this assertion flips from 3 to 2 — see
-  // docs/specs/upstream-mailbox-seam/plan.md §4.5b. Do not change src/delivery.ts to make
-  // this pass; it documents where the ratchet is heading, not a target for this PR.
-  it('DeliveryActionHandler is still 3-argument — PR 3 narrows it to 2 (upstream contract)', () => {
-    expectTypeOf<Parameters<DeliveryActionHandler>['length']>().toEqualTypeOf<3>();
+  // (e) PR 3 landed the two-argument contract: DeliveryActionHandler is
+  // upstream's (content, session), and no handler receives a session handle
+  // any more (docs/specs/upstream-mailbox-seam/plan.md §4.5b, invariant I-9).
+  // This is now a ratchet, not a target — a third parameter must never come
+  // back, because the delivery loop holds no session while a handler runs and
+  // a handle passed across that boundary would be closed or nesting.
+  it('DeliveryActionHandler is 2-argument (content, session) — no handler receives a session handle', () => {
+    expectTypeOf<Parameters<DeliveryActionHandler>['length']>().toEqualTypeOf<2>();
   });
 
   // The two upstream registry.test.ts files were deliberately deferred out of
