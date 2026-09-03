@@ -43,6 +43,7 @@ import {
 import {
   inboundHasMessage,
   insertDeferredMessageWithContextIfNew,
+  withdrawUnconsumedWake,
   insertMessageIfNew,
   insertMessageWithContext,
   insertMessageWithContextIfNew,
@@ -283,6 +284,8 @@ export interface NanoclawMailboxSession extends MailboxSession {
   insertMessageWithContext(trigger: MessageInsert, context: MessageInsert | null): void;
   insertMessageWithContextIfNew(trigger: MessageInsert, context: MessageInsert | null): boolean;
   insertDeferredMessageWithContextIfNew(message: MessageInsert): boolean;
+  /** Withdraw an unconsumed `on_wake` row and its recall partner. */
+  withdrawUnconsumedWake(messageId: string): boolean;
   nextEvenSeq(): number;
   upsertSessionRouting(routing: {
     channel_type: string | null;
@@ -750,6 +753,7 @@ function forkOps(
     insertMessageWithContext: (trigger, context) => insertMessageWithContext(inbound, trigger, context),
     insertMessageWithContextIfNew: (trigger, context) => insertMessageWithContextIfNew(inbound, trigger, context),
     insertDeferredMessageWithContextIfNew: (message) => insertDeferredMessageWithContextIfNew(inbound, message),
+    withdrawUnconsumedWake: (messageId) => withdrawUnconsumedWake(inbound, messageId),
     nextEvenSeq: () => nextEvenSeq(inbound),
     upsertSessionRouting: (routing) => upsertSessionRouting(inbound, routing),
     readSessionRouting: () => readSessionRouting(inbound),

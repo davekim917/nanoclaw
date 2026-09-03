@@ -141,6 +141,39 @@ export function insertDeferredMessageWithContextIfNew(db: Database.Database, mes
 }
 
 /** Strict internal-host variant: duplicate ids retain the existing constraint error contract. */
+/**
+ * Withdraw an `on_wake` trigger row that no container has consumed, plus its
+ * recall partner.
+ *
+ * This exists because `on_wake` rows are visible ONLY on a container's FIRST
+ * poll — `selection.ts` adds `AND on_wake = 0` to every subsequent one. That
+ * makes the row a promise with exactly one chance to be kept: written before a
+ * restart that then does not happen, it is not merely wasted, it waits for
+ * some unrelated future spawn and surfaces there as a stale "restarted to
+ * apply X".
+ *
+ * It cannot be fixed by writing the row later instead. The row must exist
+ * BEFORE any fresh container's first poll, or that container's one look at it
+ * misses it. So the write stays first and the paths that decline compensate
+ * here.
+ *
+ * `status = 'pending' AND on_wake = 1` is what makes a consumed row a no-op
+ * rather than an assumption: a container that has already claimed the row has
+ * moved it off `pending`, and this deletes nothing. The recall partner is
+ * removed only when the trigger actually was — a consumed trigger keeps its
+ * context. The host is the sole writer of `inbound.db`, so there is no race
+ * with the container on the delete itself.
+ *
+ * @returns true when an unconsumed row was withdrawn.
+ */
+export function withdrawUnconsumedWake(db: Database.Database, messageId: string): boolean {
+  const withdrawn =
+    db.prepare("DELETE FROM messages_in WHERE id = ? AND status = 'pending' AND on_wake = 1").run(messageId).changes >
+    0;
+  if (withdrawn) db.prepare("DELETE FROM messages_in WHERE id = ? AND kind = 'system'").run(`recall-${messageId}`);
+  return withdrawn;
+}
+
 export function insertMessageWithContext(
   db: Database.Database,
   trigger: MessageInsert,
