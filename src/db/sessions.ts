@@ -216,11 +216,16 @@ export function touchSessionActivity(id: string): void {
   }
 }
 
-/** One quiet mark to persist: the session, and the ISO instant its skip expires. */
+/** One quiet mark to persist: the session, the ISO instant its skip expires, and the basis it was computed on. */
 export interface QuietSessionMark {
   sessionId: string;
   /** ISO-8601 UTC. */
   quietUntil: string;
+  /**
+   * The row's `last_active` at the moment the mark was computed. The write
+   * guard, not decoration — see `persistQuietSessionMarks`.
+   */
+  lastActive: string | null;
 }
 
 /**
@@ -232,19 +237,30 @@ export interface QuietSessionMark {
  * cost, not a saving; the whole point of the cache is that a quiet session
  * costs nothing per tick.
  *
- * Advisory: the caller treats a throw as "no mark", which degrades to a cold
- * sweep and never to a session skipped past due work.
+ * ── The `last_active` guard is load-bearing, not belt-and-braces. ──
+ * A mark is computed against the `last_active` the driver read at the START of
+ * that session's sweep, but the batch is flushed only after the WHOLE fan-out,
+ * and the driver yields to the event loop after every session. Inbound arriving
+ * in one of those yields bumps `last_active` and clears this column (see
+ * `updateSession`) — and an unconditional write would then put the now-stale
+ * expiry straight back, so a restart before the next tick would warm it and
+ * skip a session that is genuinely due, without ever opening its inbound.db.
+ * Comparing the basis null-safely (`IS`, not `=`, because `last_active` is
+ * nullable) makes that write a no-op for exactly the rows that moved. The
+ * in-memory mark needs no equivalent: the next tick re-reads `last_active` and
+ * invalidates it there.
  */
 export function persistQuietSessionMarks(marks: readonly QuietSessionMark[]): void {
   if (marks.length === 0) return;
-  const byId: Record<string, string> = {};
-  for (const mark of marks) byId[mark.sessionId] = mark.quietUntil;
+  const byId: Record<string, { until: string; basis: string | null }> = {};
+  for (const mark of marks) byId[mark.sessionId] = { until: mark.quietUntil, basis: mark.lastActive };
   getDb()
     .prepare(
       `UPDATE sessions
-          SET sweep_quiet_until = j.value
+          SET sweep_quiet_until = json_extract(j.value, '$.until')
          FROM json_each(@marks) AS j
-        WHERE sessions.id = j.key`,
+        WHERE sessions.id = j.key
+          AND sessions.last_active IS json_extract(j.value, '$.basis')`,
     )
     .run({ marks: JSON.stringify(byId) });
 }

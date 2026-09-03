@@ -18,7 +18,7 @@ import fs from 'fs';
 
 import { DATA_DIR, TIMEZONE } from '../../config.js';
 import { getDb } from '../../db/connection.js';
-import { getSession } from '../../db/sessions.js';
+import { getSession, touchSessionActivity } from '../../db/sessions.js';
 import { openInboundDb } from '../../db/session-db.js';
 import {
   readSessionInbound,
@@ -190,6 +190,15 @@ function afterMutation(agentGroupId: string, sessionId: string): void {
     /* non-fatal */
   }
   invalidateScheduledCache();
+  // Every mutation above can change when this session next has work due — a cron
+  // edit and a resume both recompute `process_after` directly in the session DB,
+  // which the host sweep's quiet cache cannot see. This is the central-DB write
+  // that invalidates the quiet mark (`updateSession` nulls `sweep_quiet_until` in
+  // the same statement), so a quiet session cannot sleep past its new due time —
+  // and, since S2-PR15 persists that mark, cannot sleep past it across a restart
+  // either. Deliberately OUTSIDE any session/funnel callback: it touches the
+  // central `sessions` row, not session-DB rows. Advisory and self-logging.
+  touchSessionActivity(sessionId);
 }
 
 /** Next future cron occurrence (canonical parse — byte-identical to recurrence.ts:31). */

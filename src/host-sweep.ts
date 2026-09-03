@@ -911,7 +911,15 @@ async function sweepOnce(): Promise<void> {
       const quietUntil = await sweepSession(session, tick);
       if (quietUntil !== null) {
         quietSessions.set(session.id, { skipUntilMs: quietUntil, lastActive: session.last_active });
-        newQuietMarks.push({ sessionId: session.id, quietUntil: new Date(quietUntil).toISOString() });
+        // Carry the basis: the flush happens after the whole fan-out, and
+        // ingress during one of the yields below can move `last_active` (and
+        // clear the column) in between. The write compares this and no-ops on
+        // the rows that moved, so a stale expiry is never put back.
+        newQuietMarks.push({
+          sessionId: session.id,
+          quietUntil: new Date(quietUntil).toISOString(),
+          lastActive: session.last_active,
+        });
       }
       sweptSessions++;
     } catch (err) {

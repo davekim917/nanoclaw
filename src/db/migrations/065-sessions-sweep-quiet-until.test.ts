@@ -100,6 +100,7 @@ describe('the persisted quiet mark (S2-PR15)', () => {
     return row?.sweep_quiet_until ?? null;
   }
 
+  const ACTIVE = '2026-08-20T00:00:00.000Z';
   const FUTURE = '2099-01-01T00:00:00.000Z';
   const PAST = '2000-01-01T00:00:00.000Z';
 
@@ -116,13 +117,13 @@ describe('the persisted quiet mark (S2-PR15)', () => {
   });
 
   it('writes a whole tick of marks in one batch', () => {
-    createSession(session('s-1', '2026-08-20T00:00:00.000Z'));
-    createSession(session('s-2', '2026-08-20T00:00:00.000Z'));
-    createSession(session('s-3', '2026-08-20T00:00:00.000Z'));
+    createSession(session('s-1', ACTIVE));
+    createSession(session('s-2', ACTIVE));
+    createSession(session('s-3', ACTIVE));
 
     const marks: QuietSessionMark[] = [
-      { sessionId: 's-1', quietUntil: '2026-09-03T12:20:00.000Z' },
-      { sessionId: 's-3', quietUntil: '2026-09-03T12:25:00.000Z' },
+      { sessionId: 's-1', quietUntil: '2026-09-03T12:20:00.000Z', lastActive: ACTIVE },
+      { sessionId: 's-3', quietUntil: '2026-09-03T12:25:00.000Z', lastActive: ACTIVE },
     ];
     persistQuietSessionMarks(marks);
 
@@ -137,12 +138,39 @@ describe('the persisted quiet mark (S2-PR15)', () => {
     expect(markOf('s-1')).toBeNull();
   });
 
+  // Codex F1. The mark is computed against the last_active read at the START of
+  // that session's sweep, but the batch is flushed only after the WHOLE fan-out
+  // and the driver yields between sessions. Ingress in one of those yields bumps
+  // last_active and clears the column; an unconditional write would put the now
+  // stale expiry straight back, and a restart before the next tick would warm it
+  // and skip a genuinely due session without ever opening its inbound.db.
+  it('does not write back a mark whose last_active moved between the sweep and the flush', () => {
+    createSession(session('s-stable', ACTIVE));
+    createSession(session('s-moved', ACTIVE));
+    createSession(session('s-null', null));
+
+    // The ingress that lands mid-fan-out, through the real writer.
+    updateSession('s-moved', { last_active: '2026-09-03T12:00:00.000Z' });
+
+    persistQuietSessionMarks([
+      { sessionId: 's-stable', quietUntil: FUTURE, lastActive: ACTIVE },
+      { sessionId: 's-moved', quietUntil: FUTURE, lastActive: ACTIVE },
+      // A never-active session: the guard must compare NULL to NULL null-safely
+      // (`IS`, not `=`), or every brand-new session silently loses its mark.
+      { sessionId: 's-null', quietUntil: FUTURE, lastActive: null },
+    ]);
+
+    expect(markOf('s-stable')).toBe(FUTURE);
+    expect(markOf('s-moved'), 'a stale mark was written back over the clear').toBeNull();
+    expect(markOf('s-null')).toBe(FUTURE);
+  });
+
   // The invalidation contract the whole warm path rests on. Without this the
   // first tick after a restart could honour a mark taken before a newly due
   // row was written, holding that row for the rest of the backoff.
   it('updateSession clears the mark in the same statement that moves last_active', () => {
-    createSession(session('s-1', '2026-08-20T00:00:00.000Z'));
-    persistQuietSessionMarks([{ sessionId: 's-1', quietUntil: FUTURE }]);
+    createSession(session('s-1', ACTIVE));
+    persistQuietSessionMarks([{ sessionId: 's-1', quietUntil: FUTURE, lastActive: ACTIVE }]);
     expect(markOf('s-1')).toBe(FUTURE);
 
     updateSession('s-1', { last_active: '2026-09-03T12:00:00.000Z' });
@@ -154,8 +182,8 @@ describe('the persisted quiet mark (S2-PR15)', () => {
     // The mark is about when work is next DUE. A container going idle does not
     // change that, and clearing here would throw away the cache on every
     // container state transition.
-    createSession(session('s-1', '2026-08-20T00:00:00.000Z'));
-    persistQuietSessionMarks([{ sessionId: 's-1', quietUntil: FUTURE }]);
+    createSession(session('s-1', ACTIVE));
+    persistQuietSessionMarks([{ sessionId: 's-1', quietUntil: FUTURE, lastActive: ACTIVE }]);
 
     updateSession('s-1', { container_status: 'idle' });
 
@@ -163,19 +191,19 @@ describe('the persisted quiet mark (S2-PR15)', () => {
   });
 
   it('the warm read returns only active sessions whose mark is still in the future', () => {
-    createSession(session('s-future', '2026-08-20T00:00:00.000Z'));
-    createSession(session('s-expired', '2026-08-20T00:00:00.000Z'));
-    createSession(session('s-unmarked', '2026-08-20T00:00:00.000Z'));
-    createSession(session('s-closed', '2026-08-20T00:00:00.000Z'));
+    createSession(session('s-future', ACTIVE));
+    createSession(session('s-expired', ACTIVE));
+    createSession(session('s-unmarked', ACTIVE));
+    createSession(session('s-closed', ACTIVE));
     persistQuietSessionMarks([
-      { sessionId: 's-future', quietUntil: FUTURE },
-      { sessionId: 's-expired', quietUntil: PAST },
-      { sessionId: 's-closed', quietUntil: FUTURE },
+      { sessionId: 's-future', quietUntil: FUTURE, lastActive: ACTIVE },
+      { sessionId: 's-expired', quietUntil: PAST, lastActive: ACTIVE },
+      { sessionId: 's-closed', quietUntil: FUTURE, lastActive: ACTIVE },
     ]);
     updateSession('s-closed', { status: 'closed' });
 
     const warm = getWarmQuietSessionMarks('2026-09-03T12:00:00.000Z');
 
-    expect(warm).toEqual([{ id: 's-future', sweep_quiet_until: FUTURE, last_active: '2026-08-20T00:00:00.000Z' }]);
+    expect(warm).toEqual([{ id: 's-future', sweep_quiet_until: FUTURE, last_active: ACTIVE }]);
   });
 });

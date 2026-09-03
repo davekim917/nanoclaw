@@ -22,7 +22,7 @@
 import { getAgentMailbox } from '../mailbox/index.js';
 import { resolveTaskSession, withExistingMailboxSession, withMailboxSession } from '../session-manager.js';
 import type { NanoclawMailboxSession } from '../modules/mailbox/index.js';
-import { createSession, findSessionByAgentGroupAndMessagingGroup } from './sessions.js';
+import { createSession, findSessionByAgentGroupAndMessagingGroup, touchSessionActivity } from './sessions.js';
 import { getDb } from './connection.js';
 
 export interface TaskDef {
@@ -277,4 +277,14 @@ export async function scheduleTask(def: TaskDef): Promise<void> {
   if (!(await withExistingMailboxSession(def.agentGroupId, session.id, stamp))) {
     await withMailboxSession(def.agentGroupId, session.id, stamp);
   }
+  // A task row just changed when this session next has work due, and due-ness
+  // lives only in the session DB where the host sweep's quiet cache cannot see
+  // it. This is the central-DB write that invalidates the quiet mark
+  // (`updateSession` nulls `sweep_quiet_until` in the same statement), so the
+  // session is swept on the next tick rather than sleeping through its first
+  // fire — and, since S2-PR15 persists that mark, across a restart too.
+  // Here rather than at the call sites: this is the chokepoint every scheduled
+  // task insert passes through, including `scheduled-move`'s re-home into a
+  // target session that may have been quiet for days.
+  touchSessionActivity(session.id);
 }
