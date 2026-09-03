@@ -21,6 +21,15 @@ function seedDestination(name: string, displayName: string, channelType: string,
     .run(name, displayName, channelType, platformId);
 }
 
+function seedAgentDestination(name: string, displayName: string, agentGroupId: string): void {
+  getInboundDb()
+    .prepare(
+      `INSERT INTO destinations (name, display_name, type, channel_type, platform_id, agent_group_id)
+       VALUES (?, ?, 'agent', NULL, NULL, ?)`,
+    )
+    .run(name, displayName, agentGroupId);
+}
+
 describe('buildSystemPromptAddendum — multi-destination routing guidance', () => {
   it('includes default-routing nudge when there are >1 destinations', () => {
     seedDestination('casa', 'Casa', 'whatsapp', 'person17@fixture6.example.com');
@@ -73,6 +82,76 @@ describe('buildSystemPromptAddendum — multi-destination routing guidance', () 
     expect(prompt).toContain('Only notify someone when the task asks');
     expect(prompt).not.toContain('<message to=');
     expect(prompt).not.toContain('default to addressing');
+  });
+
+  it("defaults task escalation to the agent's own channel, not to a sibling agent", () => {
+    seedDestination('casa', 'Casa', 'whatsapp', 'group1@fixture6.example.com');
+    seedAgentDestination('codex-sibling', 'Casa Codex', 'ag-sibling');
+
+    const prompt = buildSystemPromptAddendum('Casa', { kind: 'task', taskId: 'weekly-report' });
+
+    // The task row carries exactly one routing stamp and the formatter renders
+    // it as `<task from="name">`. That single origin is the default, NOT the
+    // channel list — an agent wired to several channels would otherwise have
+    // several equally-endorsed recipients and only one of them is right.
+    expect(prompt).toContain('send to the destination named in this task\'s `<task from="name">` attribute');
+    expect(prompt).toContain('`codex-sibling` is an agent-type destination');
+    expect(prompt).toContain('never as your default escalation path');
+    // The fork's conversation-locality policy holds in task mode too: the
+    // chat branch's `to="here"` wording does not apply here, so the task
+    // branch has to say it in its own terms.
+    expect(prompt).toContain('Keep the whole run in one place');
+  });
+
+  it('keeps an unrouted task fail-closed instead of naming a channel to guess at', () => {
+    seedDestination('casa', 'Casa', 'whatsapp', 'group1@fixture6.example.com');
+    seedDestination('ops', 'Ops', 'slack', 'C0OPS');
+
+    const prompt = buildSystemPromptAddendum('Casa', { kind: 'task', taskId: 'weekly-report' });
+
+    // A task with no routing stamp was created `--isolated`, and that path is
+    // documented fail-closed: "unaddressed replies are discarded, only an
+    // explicit <message to=...> reaches anyone" (ncl tasks create --help).
+    // Listing the agent's channels here would hand it a menu and quietly turn
+    // an isolated task into one that posts wherever it liked the look of.
+    expect(prompt).toContain('it was created isolated on purpose');
+    expect(prompt).toContain('do not pick a destination just because one is available');
+    expect(prompt).not.toContain('`casa`, `ops`');
+    expect(prompt).not.toContain('fall back');
+  });
+
+  it('names every agent destination, plural, rather than a hardcoded example', () => {
+    seedDestination('casa', 'Casa', 'whatsapp', 'group1@fixture6.example.com');
+    seedAgentDestination('codex-sibling', 'Casa Codex', 'ag-a');
+    seedAgentDestination('opencode-sibling', 'Casa OpenCode', 'ag-b');
+
+    const prompt = buildSystemPromptAddendum('Casa', { kind: 'task', taskId: 'weekly-report' });
+
+    expect(prompt).toContain('`codex-sibling`, `opencode-sibling` are agent-type destinations');
+  });
+
+  it('says nothing about escalation defaults when the agent has no channel to escalate to', () => {
+    seedAgentDestination('codex-sibling', 'Casa Codex', 'ag-sibling');
+
+    const prompt = buildSystemPromptAddendum('Casa', { kind: 'task', taskId: 'weekly-report' });
+
+    // An agent destination alone is not an escalation path, and inventing one
+    // would be worse than the generic instruction it already gets.
+    expect(prompt).toContain('Always pass the explicit named destination.');
+    expect(prompt).not.toContain('<task from="name">');
+    expect(prompt).not.toContain('it was created isolated on purpose');
+    expect(prompt).not.toContain('Keep the whole run in one place');
+  });
+
+  it('leaves chat sessions untouched — the escalation guidance is task-only', () => {
+    seedDestination('casa', 'Casa', 'whatsapp', 'group1@fixture6.example.com');
+    seedAgentDestination('codex-sibling', 'Casa Codex', 'ag-sibling');
+
+    const prompt = buildSystemPromptAddendum('Casa');
+
+    expect(prompt).not.toContain('<task from="name">');
+    expect(prompt).not.toContain('agent-type destination');
+    expect(prompt).toContain('Keep the WHOLE conversation in the place it started');
   });
 });
 

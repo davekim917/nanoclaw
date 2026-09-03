@@ -259,6 +259,54 @@ function buildDestinationsSection(mode: SessionMode): string {
   if (mode.kind === 'task') {
     lines.push(
       'This is an isolated task run with no attached chat. Only notify someone when the task asks you to. For a user-visible message, call `send_message({ to: "name", text: "..." })`; for a file, call `send_file` with `to`. Always pass the explicit named destination.',
+    );
+
+    // A task run has no `here` — every send must name a destination, and the
+    // agent picks it from a list where a sibling agent looks as reachable as a
+    // human's channel. Left to itself it escalates INTO another agent, which
+    // reads as delivery but reaches no person: the sibling gets a message it
+    // was never asked to act on, and the operator waiting on the answer sees
+    // nothing. Point at the task's own routed origin, and say plainly what an
+    // agent destination is for.
+    const channelDestinations = all.filter((destination) => destination.type === 'channel');
+    const agentDestinations = all.filter((destination) => destination.type === 'agent');
+    if (channelDestinations.length > 0) {
+      // The task row carries ONE routing stamp, and the formatter already
+      // renders it as the `<task from="name">` attribute. Point at that, not
+      // at the destination list: an agent wired to several channels has
+      // several plausible-looking recipients here, and only one of them is the
+      // conversation this task was created in.
+      //
+      // No fallback list for an unrouted task, deliberately. A task with no
+      // stamp was created `--isolated` (or host-created with no
+      // --messaging-group), and that path is documented fail-closed:
+      // "unaddressed replies are discarded, only an explicit <message to=...>
+      // reaches anyone" (ncl tasks create --help). Offering a menu of channels
+      // there would quietly convert an isolated task into one that posts to
+      // whichever conversation it liked the look of.
+      lines.push(
+        '',
+        `For user-visible escalation — a blocker, a question you need answered, anything a person has to act on — send to the destination named in this task's \`<task from="name">\` attribute. That is the conversation the task was created in, and where whoever scheduled it is watching.`,
+        '',
+        'If the task carries no `from`, it was created isolated on purpose. Send only when the task text itself names who to tell; do not pick a destination just because one is available.',
+      );
+      // Same policy the chat branch states below: one run, one place. A task
+      // that posts interim notes to a channel and its result to a DM has split
+      // the record in half, and neither half is the whole answer.
+      lines.push(
+        '',
+        "Keep the whole run in one place. Interim notes and the final escalation go to the SAME destination — do not report progress in one channel and the outcome in someone's DM.",
+      );
+      if (agentDestinations.length > 0) {
+        const agentNames = agentDestinations.map((destination) => `\`${destination.name}\``).join(', ');
+        lines.push(
+          '',
+          `${agentNames} ${agentDestinations.length === 1 ? 'is an agent-type destination' : 'are agent-type destinations'} — another agent, not a person. Route through one ONLY when this task explicitly calls for it, never as your default escalation path.`,
+        );
+      }
+    }
+
+    lines.push(
       '',
       `Your final output is not sent to the user. End with a concise work-log summary. It is recorded automatically in \`tasks/${mode.taskId}.md\`. Read that file when you need context from earlier runs. Use \`ncl tasks append-log --msg "…"\` only for optional mid-run notes.`,
     );
