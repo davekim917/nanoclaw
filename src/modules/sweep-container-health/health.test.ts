@@ -21,11 +21,13 @@ import { getAgentMailbox } from '../../mailbox/index.js';
 import { closeDb, initTestDb, runMigrations } from '../../db/index.js';
 import {
   ABSOLUTE_CEILING_MS,
+  CHAT_IDLE_REAP_MS,
   CLAIM_STUCK_MS,
   SPAWN_GRACE_MS,
   SWEEP_DUTY_INVENTORY,
   _listSweepRegistrationsForTesting,
   _sweepSessionForTesting,
+  providerFailedTicks,
 } from '../../host-sweep.js';
 import {
   PROVIDER_HEAL_COOLDOWN_MS,
@@ -33,7 +35,6 @@ import {
   _resetProviderHealTicksForTesting,
   _sweepProviderHealForTesting,
   _reportContainerOomTelemetryForTesting,
-  clearProviderFailedTicks,
   countProviderHealAttemptsSinceRealInbound,
   decideProviderHeal,
   decideStuckAction,
@@ -336,6 +337,36 @@ function makeNotifyTestDbs(opts?: { withRouting?: boolean; recentNotice?: boolea
       .run();
   }
   return { inDb, outDb, mailbox: composeNanoclawSession(inDb, () => outDb) };
+}
+
+/**
+ * `NanoclawAgentMailbox.prepare()` (src/modules/mailbox/index.ts) creates
+ * container_state via upstream's minimal (tool-only) CREATE TABLE and then
+ * idempotently ALTERs in `provider_executing` alone — `CREATE TABLE IF NOT
+ * EXISTS` no-ops the richer columns onto an already-created table. Widens a
+ * freshly-`prepare()`d session's real outbound.db the same way the
+ * CONTAINER's own forwardColumns would, in production, on first connect —
+ * needed by every real-session (`_sweepSessionForTesting`) case below that
+ * writes provider/memory columns.
+ */
+function widenContainerStateSchema(outboundPath: string): void {
+  const raw = new Database(outboundPath);
+  raw.exec(`
+    ALTER TABLE container_state ADD COLUMN provider_status TEXT;
+    ALTER TABLE container_state ADD COLUMN provider_last_event_at TEXT;
+    ALTER TABLE container_state ADD COLUMN provider_last_probe_at TEXT;
+    ALTER TABLE container_state ADD COLUMN provider_probe_failures INTEGER;
+    ALTER TABLE container_state ADD COLUMN provider_recovery_attempts INTEGER;
+    ALTER TABLE container_state ADD COLUMN provider_failure_reason TEXT;
+    ALTER TABLE container_state ADD COLUMN memory_current_bytes INTEGER;
+    ALTER TABLE container_state ADD COLUMN memory_peak_bytes INTEGER;
+    ALTER TABLE container_state ADD COLUMN memory_max_bytes INTEGER;
+    ALTER TABLE container_state ADD COLUMN memory_oom_events INTEGER;
+    ALTER TABLE container_state ADD COLUMN memory_oom_kill_events INTEGER;
+    ALTER TABLE container_state ADD COLUMN memory_telemetry_at TEXT;
+    ALTER TABLE container_state ADD COLUMN memory_max_events INTEGER;
+  `);
+  raw.close();
 }
 
 // ── F-10.1 ───────────────────────────────────────────────────────────────────
@@ -722,14 +753,59 @@ describe('observeProviderStatus — two-tick debounce', () => {
     expect(observeProviderStatus('s1', 'failed')).toBe(2);
   });
 
-  // F-10.3
-  it('the two-tick provider debounce is cleared when the container is not alive', () => {
-    expect(observeProviderStatus('s1', 'failed')).toBe(1);
-    // The driver calls this (via a dynamic import) whenever a session comes
-    // back !alive — constraint 14. A fresh container must not inherit the
-    // dead one's half-finished count.
-    clearProviderFailedTicks('s1');
-    expect(observeProviderStatus('s1', 'failed')).toBe(1);
+  // F-10.3 — through the real driver's `!alive` path (constraint 14), not by
+  // calling a clear function directly: `providerFailedTicks` is a
+  // driver-owned export of host-sweep.ts precisely so its own `!alive`
+  // cleanup can stay synchronous (see that export's doc comment).
+  it('the two-tick provider debounce is cleared when the container is not alive', async () => {
+    const db = initTestDb();
+    runMigrations(db);
+    db.prepare(
+      `INSERT INTO agent_groups (id, name, folder, created_at)
+       VALUES ('ag-debounce', 'debounce', 'debounce-folder', ?)`,
+    ).run(new Date().toISOString());
+
+    _resetProviderHealTicksForTesting();
+    mockKillContainer.mockReset();
+    mockIsContainerRunning.mockReset().mockReturnValue(true);
+    mockHasContainerEverRun.mockReset().mockReturnValue(true);
+    mockAdmitDueTaskContexts.mockReset().mockReturnValue(0);
+
+    const session: Session = { ...fakeSession(), id: 'sess-debounce', agent_group_id: 'ag-debounce' };
+    getAgentMailbox().prepare({ agentGroupId: session.agent_group_id, sessionId: session.id });
+    const outboundPath = path.join(testDataDir.dir, 'v2-sessions', session.agent_group_id, session.id, 'outbound.db');
+    widenContainerStateSchema(outboundPath);
+    const raw = new Database(outboundPath);
+    raw
+      .prepare(
+        `INSERT INTO container_state (id, updated_at, provider_status, provider_failure_reason)
+         VALUES (1, ?, 'failed', 'gone')`,
+      )
+      .run(new Date().toISOString());
+    raw.close();
+
+    // Tick 1, alive: arms the debounce to 1.
+    await _sweepSessionForTesting(session);
+    expect(providerFailedTicks.get(session.id)).toBe(1);
+    expect(mockKillContainer).not.toHaveBeenCalled();
+
+    // Tick 2, NOT alive: session:health never runs (the driver gates it on
+    // `alive`), but the driver's own `!alive` cleanup (outside that gate)
+    // must still fire and drop the entry.
+    mockIsContainerRunning.mockReturnValue(false);
+    await _sweepSessionForTesting(session);
+    expect(providerFailedTicks.has(session.id)).toBe(false);
+    expect(mockKillContainer).not.toHaveBeenCalled();
+
+    // Tick 3, alive again: a fresh debounce starts at 1, not 3 — proof the
+    // cleanup actually ran rather than the count merely not yet reaching the
+    // kill threshold.
+    mockIsContainerRunning.mockReturnValue(true);
+    await _sweepSessionForTesting(session);
+    expect(providerFailedTicks.get(session.id)).toBe(1);
+    expect(mockKillContainer).not.toHaveBeenCalled();
+
+    closeDb();
   });
 });
 
@@ -1015,17 +1091,163 @@ describe('OOM and memory-pressure notices are written only on the SLA path, with
     expect(rows[0].trigger).toBe(0);
   });
 
-  // F-10.6's "chain claimed earlier → no row" half — F-10.2 below drives the
-  // same claim through the real registry; this is the direct-unit half: even
-  // container state that WOULD trigger an OOM notice produces nothing when
-  // read outside the SLA's own observe session (which is precisely what
-  // happens when the exclusive chain never reaches S14).
-  it('produces no row when reportContainerOomTelemetry is simply never called on the heal/reap paths', () => {
-    const { inDb } = makeNotifyTestDbs();
-    // No call at all — the heal/reap paths do not invoke this function (only
-    // the SLA branch's registered hook does, per F-10.2's registry-level
-    // proof). An empty table is the expected outcome.
-    expect(noticeRows(inDb)).toHaveLength(0);
+  // F-10.6's "chain claimed earlier by an idle reap → no row" half, for BOTH
+  // reaps, each driven through the real registry via `_sweepSessionForTesting`
+  // (S12/S13 are S2-PR3's family, registered in host-sweep.ts — this proves
+  // MY module's S14/S16 correctly yield to them, not that S12/S13 themselves
+  // are correct). Each case changes the OOM count between tick 1 (a baseline
+  // notice, SLA legitimately ran) and tick 2 (the reap wins instead) — a
+  // fixed count would let the observer's own kill-delta dedup mask a real
+  // regression where the SLA branch ran a second time and simply had nothing
+  // new to report.
+  it('the idle-task reap winning the chain suppresses the SLA branch, discriminated by a changed OOM count', async () => {
+    const db = initTestDb();
+    runMigrations(db);
+    db.prepare(
+      `INSERT INTO agent_groups (id, name, folder, created_at)
+       VALUES ('ag-task-reap', 'task-reap', 'task-reap-folder', ?)`,
+    ).run(new Date().toISOString());
+
+    armSelfHeal(false);
+    mockKillContainer.mockReset();
+    mockIsContainerRunning.mockReset().mockReturnValue(true);
+    mockHasContainerEverRun.mockReset().mockReturnValue(true);
+    mockAdmitDueTaskContexts.mockReset().mockReturnValue(0);
+
+    const session: Session = {
+      ...fakeSession(),
+      id: 'sess-task-reap',
+      agent_group_id: 'ag-task-reap',
+      thread_id: 'system:tasks:series-1',
+    };
+    getAgentMailbox().prepare({ agentGroupId: session.agent_group_id, sessionId: session.id });
+    const outboundPath = path.join(testDataDir.dir, 'v2-sessions', session.agent_group_id, session.id, 'outbound.db');
+    const inboundPath = path.join(testDataDir.dir, 'v2-sessions', session.agent_group_id, session.id, 'inbound.db');
+    widenContainerStateSchema(outboundPath);
+
+    let raw = new Database(outboundPath);
+    // A live processing claim keeps shouldReapIdleTaskContainer from
+    // claiming on tick 1 (processingClaimCount !== 0) — the chain falls
+    // through to the SLA branch, which legitimately writes a baseline OOM
+    // notice for count=3.
+    raw
+      .prepare(`INSERT INTO processing_ack (message_id, status, status_changed) VALUES ('claim-1', 'processing', ?)`)
+      .run(new Date().toISOString());
+    raw
+      .prepare(`INSERT INTO container_state (id, updated_at, memory_oom_kill_events) VALUES (1, ?, 3)`)
+      .run(new Date().toISOString());
+    raw.close();
+
+    await _sweepSessionForTesting(session);
+    expect(mockKillContainer).not.toHaveBeenCalled();
+    const idsAfterTick1 = new Set(
+      (new Database(inboundPath).prepare('SELECT id FROM messages_in').all() as Array<{ id: string }>).map((r) => r.id),
+    );
+    expect([...idsAfterTick1].some((id) => id.startsWith('oom-'))).toBe(true);
+
+    // Clear the claim (S12 can now claim) and bump the OOM count — if the
+    // SLA branch ran again this tick, THIS delta (3 -> 9) would produce a
+    // new, distinguishable notice.
+    raw = new Database(outboundPath);
+    raw.prepare('DELETE FROM processing_ack').run();
+    raw.prepare('UPDATE container_state SET memory_oom_kill_events = 9 WHERE id = 1').run();
+    raw.close();
+
+    await _sweepSessionForTesting(session);
+    expect(mockKillContainer).toHaveBeenCalledWith('sess-task-reap', 'scheduled-task-idle');
+
+    const rowsAfterTick2 = new Database(inboundPath).prepare('SELECT id FROM messages_in ORDER BY seq').all() as Array<{
+      id: string;
+    }>;
+    const newIds = rowsAfterTick2.map((r) => r.id).filter((id) => !idsAfterTick1.has(id));
+    expect(newIds.some((id) => id.startsWith('oom-') || id.startsWith('recall-oom-'))).toBe(false);
+
+    closeDb();
+  });
+
+  it('the idle-chat reap winning the chain suppresses the SLA branch, discriminated by a changed OOM count', async () => {
+    const db = initTestDb();
+    runMigrations(db);
+    db.prepare(
+      `INSERT INTO agent_groups (id, name, folder, created_at)
+       VALUES ('ag-chat-reap', 'chat-reap', 'chat-reap-folder', ?)`,
+    ).run(new Date().toISOString());
+
+    armSelfHeal(false);
+    mockKillContainer.mockReset();
+    mockIsContainerRunning.mockReset().mockReturnValue(true);
+    mockHasContainerEverRun.mockReset().mockReturnValue(true);
+    mockAdmitDueTaskContexts.mockReset().mockReturnValue(0);
+
+    const session: Session = { ...fakeSession(), id: 'sess-chat-reap', agent_group_id: 'ag-chat-reap' };
+    getAgentMailbox().prepare({ agentGroupId: session.agent_group_id, sessionId: session.id });
+    const outboundPath = path.join(testDataDir.dir, 'v2-sessions', session.agent_group_id, session.id, 'outbound.db');
+    const inboundPath = path.join(testDataDir.dir, 'v2-sessions', session.agent_group_id, session.id, 'inbound.db');
+    widenContainerStateSchema(outboundPath);
+
+    // A due message keeps shouldReapIdleChatContainer from claiming on tick 1
+    // (dueMessageCount !== 0) — the chain falls through to the SLA branch,
+    // which legitimately writes a baseline OOM notice for count=3. A recent
+    // outbound reply means the idle floor has not been reached either way.
+    const rawIn = new Database(inboundPath);
+    rawIn
+      .prepare(
+        `INSERT INTO messages_in (id, seq, kind, timestamp, status, trigger, content)
+         VALUES ('due-1', 900, 'chat', ?, 'pending', 1, ?)`,
+      )
+      .run(new Date().toISOString(), JSON.stringify({ text: 'hi', senderId: 'U1' }));
+    rawIn.close();
+
+    let raw = new Database(outboundPath);
+    raw
+      .prepare(`INSERT INTO messages_out (id, seq, timestamp, kind, content) VALUES ('out-1', 1, ?, 'chat', '{}')`)
+      .run(new Date().toISOString());
+    raw
+      .prepare(`INSERT INTO container_state (id, updated_at, memory_oom_kill_events) VALUES (1, ?, 3)`)
+      .run(new Date().toISOString());
+    raw.close();
+
+    await _sweepSessionForTesting(session);
+    expect(mockKillContainer).not.toHaveBeenCalled();
+    const idsAfterTick1 = new Set(
+      (new Database(inboundPath).prepare('SELECT id FROM messages_in').all() as Array<{ id: string }>).map((r) => r.id),
+    );
+    expect([...idsAfterTick1].some((id) => id.startsWith('oom-'))).toBe(true);
+
+    // Complete the due message (S13 can now claim) and age the last outbound
+    // reply past CHAT_IDLE_REAP_MS; bump the OOM count — if the SLA branch
+    // ran again this tick, THIS delta (3 -> 9) would produce a new,
+    // distinguishable notice.
+    // Delete rather than mark completed: `latestInboundTimestamp()` (which
+    // feeds `lastInboundAtMs`, and the idle floor is measured against
+    // whichever of inbound/outbound is more recent) has no status filter, so
+    // a merely-completed row at "just now" would still read as fresh
+    // activity and defeat the aged-outbound timestamp below. The tick-1 OOM
+    // notice itself (host-written, on the inbound side) is the same kind of
+    // confound — age it too, or it alone keeps `lastInboundAtMs` fresh.
+    const rawIn2 = new Database(inboundPath);
+    rawIn2.prepare(`DELETE FROM messages_in WHERE id = 'due-1'`).run();
+    rawIn2
+      .prepare(`UPDATE messages_in SET timestamp = ? WHERE id LIKE 'oom-%' OR id LIKE 'recall-oom-%'`)
+      .run(new Date(Date.now() - CHAT_IDLE_REAP_MS - 60_000).toISOString());
+    rawIn2.close();
+    raw = new Database(outboundPath);
+    raw
+      .prepare('UPDATE messages_out SET timestamp = ? WHERE id = ?')
+      .run(new Date(Date.now() - CHAT_IDLE_REAP_MS - 60_000).toISOString(), 'out-1');
+    raw.prepare('UPDATE container_state SET memory_oom_kill_events = 9 WHERE id = 1').run();
+    raw.close();
+
+    await _sweepSessionForTesting(session);
+    expect(mockKillContainer).toHaveBeenCalledWith('sess-chat-reap', 'chat-idle-reap');
+
+    const rowsAfterTick2 = new Database(inboundPath).prepare('SELECT id FROM messages_in ORDER BY seq').all() as Array<{
+      id: string;
+    }>;
+    const newIds = rowsAfterTick2.map((r) => r.id).filter((id) => !idsAfterTick1.has(id));
+    expect(newIds.some((id) => id.startsWith('oom-') || id.startsWith('recall-oom-'))).toBe(false);
+
+    closeDb();
   });
 });
 
@@ -1054,32 +1276,12 @@ describe('provider self-heal claims the health phase and the later branches do n
 
     getAgentMailbox().prepare({ agentGroupId: session.agent_group_id, sessionId: session.id });
 
-    // `NanoclawAgentMailbox.prepare()` (src/modules/mailbox/index.ts) creates
-    // container_state via upstream's minimal (tool-only) CREATE TABLE and
-    // then idempotently ALTERs in `provider_executing` alone — `CREATE TABLE
-    // IF NOT EXISTS` no-ops the richer columns onto an already-created table.
-    // The rest of the fork's provider/memory columns are added here the same
-    // way the CONTAINER's own forwardColumns would, in production, on first
-    // connect. This row also carries OOM telemetry that WOULD trigger a
-    // notice on the SLA path, so a row appearing in messages_in below would
-    // mean the chain did not actually stop at S11.
+    // This row also carries OOM telemetry that WOULD trigger a notice on the
+    // SLA path, so a row appearing in messages_in below would mean the chain
+    // did not actually stop at S11.
     const outboundPath = path.join(testDataDir.dir, 'v2-sessions', session.agent_group_id, session.id, 'outbound.db');
+    widenContainerStateSchema(outboundPath);
     const raw = new Database(outboundPath);
-    raw.exec(`
-      ALTER TABLE container_state ADD COLUMN provider_status TEXT;
-      ALTER TABLE container_state ADD COLUMN provider_last_event_at TEXT;
-      ALTER TABLE container_state ADD COLUMN provider_last_probe_at TEXT;
-      ALTER TABLE container_state ADD COLUMN provider_probe_failures INTEGER;
-      ALTER TABLE container_state ADD COLUMN provider_recovery_attempts INTEGER;
-      ALTER TABLE container_state ADD COLUMN provider_failure_reason TEXT;
-      ALTER TABLE container_state ADD COLUMN memory_current_bytes INTEGER;
-      ALTER TABLE container_state ADD COLUMN memory_peak_bytes INTEGER;
-      ALTER TABLE container_state ADD COLUMN memory_max_bytes INTEGER;
-      ALTER TABLE container_state ADD COLUMN memory_oom_events INTEGER;
-      ALTER TABLE container_state ADD COLUMN memory_oom_kill_events INTEGER;
-      ALTER TABLE container_state ADD COLUMN memory_telemetry_at TEXT;
-      ALTER TABLE container_state ADD COLUMN memory_max_events INTEGER;
-    `);
     raw
       .prepare(
         `INSERT INTO container_state (id, updated_at, provider_status, provider_failure_reason, memory_oom_kill_events)
@@ -1102,6 +1304,16 @@ describe('provider self-heal claims the health phase and the later branches do n
     );
     expect([...idsAfterTick1].some((id) => id.startsWith('oom-'))).toBe(true);
 
+    // Bump the OOM count before tick 2 — a FIXED count would let the
+    // observer's own kill-delta dedup mask a real regression: if the SLA
+    // branch ran a second time, it would see the same cumulative count and
+    // correctly emit nothing, indistinguishable from the chain having
+    // stopped at S11. A changed count makes "no new row" mean the SLA
+    // branch's own observation hook was never reached this tick.
+    const bump = new Database(outboundPath);
+    bump.prepare('UPDATE container_state SET memory_oom_kill_events = 9 WHERE id = 1').run();
+    bump.close();
+
     // Tick 2: two consecutive 'failed' observations — decideProviderHeal
     // returns 'heal', claims() is true, and the exclusive chain must stop.
     await _sweepSessionForTesting(session);
@@ -1120,7 +1332,8 @@ describe('provider self-heal claims the health phase and the later branches do n
     // Exactly the provider-heal accountability wake (plus its recall marker)
     // — no SECOND SLA observe session ran this tick, so no additional OOM
     // notice and no kill-ceiling notice, even though the container_state row
-    // still carries the same OOM telemetry that produced tick 1's notice.
+    // now carries a CHANGED OOM count (3 -> 9) that would have produced a new,
+    // distinguishable notice had the SLA branch run again.
     expect(newIds).toHaveLength(2);
     expect(newIds.every((id) => /^(recall-)?provider-heal-\d+$/.test(id))).toBe(true);
     expect(newIds.some((id) => id.startsWith('oom-') || id.startsWith('recall-oom-'))).toBe(false);

@@ -35,6 +35,7 @@ import {
   SPAWN_GRACE_MS,
   SWEEP_DUTY_INVENTORY,
   asSessionContext,
+  providerFailedTicks,
   registerSlaObservationHook,
   registerSweepDuty,
   registerSweepDutySource,
@@ -74,10 +75,10 @@ export const PROVIDER_HEAL_COOLDOWN_MS = 10 * 60 * 1000;
 const PROVIDER_HEAL_ID_PREFIX = 'provider-heal-';
 
 // sessionId → consecutive ticks observed with provider_status === 'failed'.
-// Mirrors the quietSessions cache in host-sweep.ts: module-level, host-lifetime,
-// cleared by any observation that is not 'failed' (including the container
-// going away, so a fresh container never inherits a half-finished debounce).
-const providerFailedTicks = new Map<string, number>();
+// The Map itself is a driver-owned export of host-sweep.ts (imported above) —
+// its storage has to live there so the driver's own `!alive` cleanup can stay
+// synchronous (see the export's doc comment). The SEMANTICS below — the
+// two-tick debounce and its reset rules — are entirely this module's.
 
 export type ProviderHealDecision = 'none' | 'wait' | 'heal' | 'park';
 
@@ -331,23 +332,9 @@ export function _sweepProviderHealForTesting(
   );
 }
 
-/** Test-only: clear the module-level two-tick debounce between cases. */
+/** Test-only: clear the debounce between cases. */
 export function _resetProviderHealTicksForTesting(): void {
   providerFailedTicks.clear();
-}
-
-/**
- * The driver's own `!alive` cleanup for the debounce map (constraint 14 —
- * "a container that is gone cannot be mid-failure"). Called from
- * `host-sweep.ts`'s `sweepSession` via a dynamic import: a static import back
- * from the driver would deadlock this module's own top-level
- * `registerSweepDutySource` call against `host-sweep.ts`'s not-yet-initialized
- * `const` registries (the driver's static imports of THIS module must resolve
- * before the driver's own module body runs, which is exactly backwards for a
- * static import in the other direction).
- */
-export function clearProviderFailedTicks(sessionId: string): void {
-  providerFailedTicks.delete(sessionId);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
