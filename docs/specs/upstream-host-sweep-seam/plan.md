@@ -326,11 +326,11 @@ The same four things every time, so review is a template rather than a fresh rea
 | Line | Callee | Owning mailbox PR | Seam-2 PR blocked |
 |---|---|---|---|
 | `:1226` | `runHostGatedTaskScripts` (`modules/scheduling/host-script.ts`) | PR 4 | S2-PR11 |
-| `:1227` | `admitDueTaskContexts` (`session-manager.ts`) | PR 4 | S2-PR11 |
+| `:1227` | `admitDueTaskContexts` (`session-manager.ts`) | **PR 7** (#297, `7d20707e`) — the original 'PR 4' attribution was wrong; still raw at PR 4's head `2d1e345d`, so S2-PR11 moves the raw call with `prepareDueWake` behind a transitional ratchet entry (§5 exception), dropped at the merge-down onto PR 7 | S2-PR11 |
 | `:1594` | `syncDoneProposalMirror` (`dashboard/thread-close.ts`) | PR 4 | S2-PR11, S2-PR13 |
 | `:1770` | `handleRecurrence` (`modules/scheduling/recurrence.ts`) | PR 4 | S2-PR11 |
 | `:1840` | `rollupSessionUsage` (`db/usage.ts`) | PR 6 (signature only; the sweep's raw outbound open is deliberate — see F-12.2) | S2-PR12 |
-| `:2416` | `deferMessageForFreshContextRetry` (`session-manager.ts`) | PR 4 | S2-PR9 |
+| `:2416` | `deferMessageForFreshContextRetry` (`session-manager.ts`) | **PR 7** (#297, `7d20707e`) — the original 'PR 4' attribution was wrong; still raw at PR 4's head `2d1e345d`, so S2-PR9 moves the raw call with S17 behind a transitional ratchet entry (§5 exception), dropped at the merge-down onto PR 7 | S2-PR9 |
 
 **These are prerequisites, not seam-2 work.** Converting the six callees off the bridge belongs to the mailbox series; seam 2 waits for them and takes none of them.
 
@@ -355,7 +355,7 @@ One sequencing note: three comments on the PR 5 branch (`:1223-1224`, `:1591`, `
 | S2-PR6 claims + storage + egress | S2-PR2 | S2-PR2 | `modules/claims/self-heal.ts` is still on the host allowlist at PR 6's head, but mailbox PR 7 changes only its internals — its exported functions take ids, not handles, and "exported signatures unchanged" is pinned as a hard constraint on PR 7 |
 | S2-PR7 scheduled-move recovery | S2-PR2 | S2-PR2 | |
 | S2-PR8 repo fence + approvals scan | S2-PR2 | S2-PR2 | |
-| S2-PR9 per-session core | S2-PR2 | **mailbox PR 4 merged** | S17's `deferMessageForFreshContextRetry` bridge |
+| S2-PR9 per-session core | S2-PR2 | **mailbox PR 4 merged** | S17's `deferMessageForFreshContextRetry` bridge — as-built: PR 4 shipped without converting it, so S2-PR9 (built on PR 4's merge `b51ef1ee`) keeps `legacyInboundHandle()` and `sweep-session-core/index.ts` joins the ratchet allowlist with the removal trigger at the import site (mailbox PR 7 converts the callee) |
 | S2-PR10 container health | S2-PR2 | S2-PR2 | fully on the seam already |
 | S2-PR11 scheduling + thread-close | S2-PR2 | **mailbox PR 4 merged** | four bridge sites owned by PR 4. `modules/scheduling/{create,live-count}.ts` are converted by PR 7 but keep their exported signatures, so this family does **not** additionally wait for PR 7 |
 | S2-PR12 usage rollup | S2-PR2 | **mailbox PR 6 merged** | `db/usage.ts`'s `rollupSessionUsage` bridge is PR 6's scope; seam 2 does not take it |
@@ -387,7 +387,7 @@ One sequencing note: three comments on the PR 5 branch (`:1223-1224`, `:1591`, `
 
 **Stacked-PR CI rule** (unchanged from seam 1): `.github/workflows/ci.yml` runs only for PRs targeting `main`, so a stacked PR gets no CI until GitHub retargets it after the PR below merges. Builders' local targeted checks are the gate until then; merge only after the retargeted run is green.
 
-**Ownership boundaries.** Each family PR may touch: its own `src/modules/sweep-<family>/**`, its slice of `src/host-sweep.test.ts`, the duty's own source files, `src/modules/index.ts` (one import line), and `src/host-sweep.ts` only to delete the moved body and its imports. It may **not** touch: the phase list, `SweepDuty`/`SweepKillFollowUp`, the shared context, the error rule, the quiet cache, another family's module, `src/delivery.ts`, `src/mailbox/**`, or `RATCHET.json` beyond removing a file its own move cleaned.
+**Ownership boundaries.** Each family PR may touch: its own `src/modules/sweep-<family>/**`, its slice of `src/host-sweep.test.ts`, the duty's own source files, `src/modules/index.ts` (one import line), and `src/host-sweep.ts` only to delete the moved body and its imports. It may **not** touch: the phase list, `SweepDuty`/`SweepKillFollowUp`, the shared context, the error rule, the quiet cache, another family's module, `src/delivery.ts`, `src/mailbox/**`, or `RATCHET.json` beyond removing a file its own move cleaned. **As-built exception (S2-PR7, PR9, PR11, PR12):** when a moved body still calls a raw-handle callee the mailbox series has not converted, the family's module joins `RATCHET.json` with the reason and the removal trigger (the callee's conversion) stated at the import site — a moved offense, not a new one, dropped at the merge-down onto the converting mailbox PR (PR 7 for both PR 9's and PR 11's); `src/host-sweep.ts` stays listed until its last raw call leaves. Each such entry is recorded in `run.md` at the PR's build.
 
 ## 6. Deploy, canary, rollback
 
@@ -509,7 +509,7 @@ Host, `vitest`. 70 cases.
 **S2-PR9 — per-session core (4)**
 - **F-9.1** `src/modules/sweep-session-core/session-core.test.ts` › "processing_ack sync and stale-pending expiry keep their windows and never expire recurring rows" — ported; 24 h default honoured.
 - **F-9.2** same file › "the orphan-claim reset runs before any due-count or wake decision" — a session with an orphan claim and a due row: the claim is cleared and the paired input deferred **before** `countDueMessages` is consulted.
-- **F-9.3** same file › "resetStuckProcessingRows keeps the dup-reply guard and the retry backoff" — an already-answered input is marked completed, not retried; failed past 5 tries.
+- **F-9.3** same file › "resetStuckProcessingRows keeps the dup-reply guard and the retry backoff" — an already-answered input is marked completed, not retried; failed past 5 tries; the retry `process_after` is pinned to the exact backoff ladder value under fake timers (not merely "later than now") and grows on the next attempt — driven through the registered S17 tail duty.
 - **F-9.4** same file › "orphan processing_ack rows are deleted so a respawn is not killed on stale evidence" — ported.
 
 **S2-PR10 — container health (6)**
