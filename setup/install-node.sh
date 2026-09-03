@@ -11,10 +11,14 @@ set -euo pipefail
 echo "=== NANOCLAW SETUP: INSTALL_NODE ==="
 
 if command -v node >/dev/null 2>&1; then
-  echo "STATUS: already-installed"
-  echo "NODE_VERSION: $(node --version)"
-  echo "=== END ==="
-  exit 0
+  EXISTING_MAJOR=$(node --version | sed 's/^v//' | cut -d. -f1)
+  if [ "$EXISTING_MAJOR" -ge 22 ] 2>/dev/null; then
+    echo "STATUS: already-installed"
+    echo "NODE_VERSION: $(node --version)"
+    echo "=== END ==="
+    exit 0
+  fi
+  echo "STEP: existing-node-too-old (found $(node --version), need >=22 — upgrading)"
 fi
 
 if command -v uvx >/dev/null 2>&1; then
