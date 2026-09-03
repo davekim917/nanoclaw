@@ -15,7 +15,12 @@
 import { isTaskThread } from '../../db/sessions.js';
 import { killContainer } from '../../container-runner.js';
 import { log } from '../../log.js';
-import { registerSweepDuty, SWEEP_DUTY_INVENTORY, type SweepSessionContext } from '../../host-sweep.js';
+import {
+  registerSweepDuty,
+  registerSweepDutySource,
+  SWEEP_DUTY_INVENTORY,
+  type SweepSessionContext,
+} from '../../host-sweep.js';
 
 const id = SWEEP_DUTY_INVENTORY;
 
@@ -101,11 +106,12 @@ export function shouldReapIdleChatContainer(
 }
 
 /**
- * Registers S12/S13. A named export (not just an import-time side effect) so
- * a test that calls host-sweep.ts's `_resetSweepRegistryForTesting()` (which
- * restores only host-sweep.ts's OWN builtins — it cannot know about a family
- * module it never imports) can re-arm this module's duties afterward. See the
- * call sites in src/host-sweep-registry.test.ts.
+ * Registers S12/S13. A named export, not just an import-time side effect, so
+ * it can be handed to `registerSweepDutySource` below — the registry replays
+ * every recorded source's registrar on a default (builtins-restoring) test
+ * reset, which is what lets this module's duties survive
+ * `_resetSweepRegistryForTesting()` in src/host-sweep-registry.test.ts instead
+ * of only host-sweep.ts's own in-file builtins coming back.
  */
 export function registerIdleReapSweepDuties(): void {
   registerSweepDuty({
@@ -153,4 +159,4 @@ export function registerIdleReapSweepDuties(): void {
   });
 }
 
-registerIdleReapSweepDuties();
+registerSweepDutySource('sweep-idle-reap', registerIdleReapSweepDuties);

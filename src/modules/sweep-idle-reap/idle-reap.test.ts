@@ -21,12 +21,7 @@ import type { MailboxSession } from '../../mailbox/types.js';
 import type { NanoclawMailboxSession } from '../mailbox/index.js';
 import type { Session } from '../../types.js';
 
-import {
-  shouldReapIdleChatContainer,
-  shouldReapIdleTaskContainer,
-  registerIdleReapSweepDuties,
-  CHAT_IDLE_REAP_MS,
-} from './index.js';
+import { shouldReapIdleChatContainer, shouldReapIdleTaskContainer, CHAT_IDLE_REAP_MS } from './index.js';
 
 // ── F-3.1: the 13 ported pure-predicate cases, assertions unchanged ─────────
 
@@ -362,12 +357,11 @@ describe('the idle reaps win over ceiling enforcement in the exclusive chain', (
   });
 
   afterEach(() => {
-    // Default (builtins-restoring) reset only re-arms host-sweep.ts's OWN
-    // duties; this module's S12/S13 are a one-time import-time side effect
-    // that the reset cannot see, so re-arm them explicitly (same reasoning as
-    // src/host-sweep-registry.test.ts's resetSweepRegistryForTesting wrapper).
+    // A default (builtins-restoring) reset replays every registered duty
+    // source in order — the in-file host-sweep.ts builtins AND this module's
+    // `registerSweepDutySource('sweep-idle-reap', ...)` — so S12/S13 come
+    // back without re-registering them by hand here.
     _resetSweepRegistryForTesting();
-    registerIdleReapSweepDuties();
     vi.restoreAllMocks();
   });
 
