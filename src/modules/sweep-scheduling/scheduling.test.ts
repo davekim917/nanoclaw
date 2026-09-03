@@ -123,8 +123,9 @@ vi.mock('../../db/sessions.js', async (importOriginal) => {
 
 /**
  * `withExistingMailboxSession` is how `thread-close.ts` reads the done-proposal
- * and force-clears the continuation. The fake session answers both; the
- * continuation clear is what records `clear` in the order F-11.4 asserts.
+ * (round 3, 6f131298, moved the continuation force-clear off this inbound-keyed
+ * funnel onto the outbound-keyed `withExistingNanoclawOutbound` below — see that
+ * mock for what records `clear` in the order F-11.4 asserts).
  */
 vi.mock('../../session-manager.js', async (importOriginal) => {
   const real = await importOriginal<typeof import('../../session-manager.js')>();
@@ -142,12 +143,41 @@ vi.mock('../../session-manager.js', async (importOriginal) => {
       action({
         readDoneProposal: () => null,
         hasOutbound: () => true,
-        clearWorkContinuation: () => {
-          calls.order.push('clear');
-          return null;
-        },
+        clearWorkContinuation: () => null,
         readContinuationPresence: () => null,
       }),
+  };
+});
+
+/**
+ * Round 3 (6f131298) moved `forceClearWorkContinuation` off the inbound-keyed
+ * `withExistingMailboxSession` onto this outbound-keyed funnel. The fake
+ * outbound handle is opaque here — `clearWorkContinuation`/
+ * `readContinuationPresence` below are what actually get called with it, and
+ * neither reads it — so `withExistingNanoclawOutbound` only needs to invoke
+ * the action; it is what records `clear` in the order F-11.4 asserts.
+ */
+vi.mock('../mailbox/session.js', async (importOriginal) => {
+  const real = await importOriginal<typeof import('../mailbox/session.js')>();
+  return {
+    ...real,
+    withExistingNanoclawOutbound: async <T>(
+      _agentGroupId: string,
+      _sessionId: string,
+      action: (outbound: unknown) => T | Promise<T>,
+    ): Promise<T> => action({}),
+  };
+});
+
+vi.mock('../mailbox/index.js', async (importOriginal) => {
+  const real = await importOriginal<typeof import('../mailbox/index.js')>();
+  return {
+    ...real,
+    clearWorkContinuation: () => {
+      calls.order.push('clear');
+      return null;
+    },
+    readContinuationPresence: () => null,
   };
 });
 
