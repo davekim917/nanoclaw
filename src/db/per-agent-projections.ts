@@ -128,7 +128,15 @@ export function buildArchiveProjection(
     }
     const src = new Database(srcPath, { readonly: true });
     try {
-      let rows: Array<Record<string, unknown>>;
+      // Streamed with `.iterate()`, not materialized with `.all()`.
+      //
+      // `.all()` built one JS array holding every matching row, `text` column
+      // included — measured at 2.26 s and a 237 MB heap spike for the largest
+      // workgroup, the single biggest component of the per-spawn cost in #315.
+      // Streaming hands each row straight to the insert instead. `src` and
+      // `dst` are separate connections to separate files, so reading one while
+      // a write transaction is open on the other is safe.
+      let rows: Iterable<Record<string, unknown>>;
       if (workgroupMemberIds && workgroupMemberIds.length > 0) {
         // ── Workgroup-widened SELECT with dedup ─────────────────────────
         // Intentional sibling sharing within a workgroup (the workgroup is
@@ -164,18 +172,21 @@ export function buildArchiveProjection(
              WHERE agent_group_id IN (${placeholders})
              GROUP BY messaging_group_id, thread_id, role, sender_id, sent_at, text`,
           )
-          .all(...workgroupMemberIds) as Array<Record<string, unknown>>;
+          .iterate(...workgroupMemberIds) as Iterable<Record<string, unknown>>;
       } else {
         // ── Legacy single-agent filter (test fixtures, fresh installs pre-migration) ─
         rows = src
           .prepare(`SELECT ${ARCHIVE_COLS.join(', ')} FROM messages_archive WHERE agent_group_id = ?`)
-          .all(agentGroupId) as Array<Record<string, unknown>>;
+          .iterate(agentGroupId) as Iterable<Record<string, unknown>>;
       }
 
       const colList = ARCHIVE_COLS.join(', ');
       const placeholders = ARCHIVE_COLS.map(() => '?').join(', ');
       const insertStmt = dst.prepare(`INSERT INTO messages_archive (${colList}) VALUES (${placeholders})`);
-      const insertMany = dst.transaction((batch: Array<Record<string, unknown>>) => {
+      // Already one transaction around one prepared statement — the shape a
+      // row-at-a-time loop needs. What changed is only where the rows come
+      // from: an iterator rather than a fully materialized array.
+      const insertMany = dst.transaction((batch: Iterable<Record<string, unknown>>) => {
         for (const row of batch) {
           // Stamp the spawning agent's id onto every deduped row (see
           // workgroup-widened SELECT comment above). Keeps the NOT NULL

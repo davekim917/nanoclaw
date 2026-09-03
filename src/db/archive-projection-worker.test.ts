@@ -478,3 +478,64 @@ describe('#315 review r1 — a TRUNCATE-mode journal must not disable reuse', ()
     expect(worker.posted).toHaveLength(1);
   });
 });
+
+describe('#315 — ground truth for the projection contents', () => {
+  /**
+   * Pinned against literal expected rows rather than against the builder, so a
+   * change to HOW the builder reads rows — the `.all()` to `.iterate()` switch
+   * that removed the 237 MB heap spike, or anything after it — cannot quietly
+   * change WHAT a container sees.
+   */
+  it('matches an explicit expected row set for a two-workgroup fixture', async () => {
+    const src = makeTwoWorkgroupSource('ground-truth');
+    useFakeWorker();
+    const dst = tmpPath('ground-truth-dst');
+    await ensureArchiveProjection(src, dst, 'ag-one-a', ['ag-one-a', 'ag-one-b']);
+
+    expect(
+      allRows(dst).map((row) => ({
+        id: row.id,
+        agent_group_id: row.agent_group_id,
+        role: row.role,
+        sender_id: row.sender_id,
+        text: row.text,
+        sent_at: row.sent_at,
+      })),
+    ).toEqual([
+      // MIN(id) wins the dedup bucket, so the sibling's copy is dropped.
+      {
+        id: 'w1-a-a',
+        agent_group_id: 'ag-one-a',
+        role: 'assistant',
+        sender_id: 'ag-one-a',
+        text: 'answer from a',
+        sent_at: '2026-01-01T10:01:00Z',
+      },
+      {
+        id: 'w1-a-b',
+        agent_group_id: 'ag-one-a',
+        role: 'assistant',
+        sender_id: 'ag-one-b',
+        text: 'answer from b',
+        sent_at: '2026-01-01T10:01:00Z',
+      },
+      {
+        id: 'w1-u-a',
+        agent_group_id: 'ag-one-a',
+        role: 'user',
+        sender_id: 'u-1',
+        text: 'shared question',
+        sent_at: '2026-01-01T10:00:00Z',
+      },
+    ]);
+  });
+
+  it('streams rather than materializing the whole result set', () => {
+    const source = fs.readFileSync(new URL('./per-agent-projections.ts', import.meta.url), 'utf-8');
+    // `.all()` on the archive read is what held every row, `text` included, in
+    // one JS array. The central projection still uses `.all()` on small tables.
+    expect(source).toContain('.iterate(...workgroupMemberIds)');
+    expect(source).toContain('.iterate(agentGroupId)');
+    expect(source).not.toMatch(/\.all\(\.\.\.workgroupMemberIds\)/);
+  });
+});
