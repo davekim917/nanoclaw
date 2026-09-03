@@ -90,6 +90,10 @@ Rejected in whole: none. Rejected in part: F3's remedy (later-window backoff), w
 - Sizing: S2-PR2 1.5 → 1.75 agent-weeks (exclusive-chain semantics, the nested driver spec, per-boundary classification, three surfaces). Series 11.65 → 11.9 before overhead, ≈ **15.5 agent-weeks** at ×1.3. Calendar unchanged at 5–7 weeks.
 - Acceptance cases 65 → **67** (R-2b and F-10.5 added; F-3.2, F-10.2, F-10.4, F-10.6, R-2, R-4, R-5, R-6, R-10, R-11 and T-2 rewritten).
 
+### Gating revision (rev 2.1, 2026-09-03)
+
+Gating table only — no design change, no acceptance-case change, no re-review. S2-PR6 and S2-PR11 now wait for mailbox **PR 7**, which empties the last host allowlist entries: `src/modules/claims/self-heal.ts` and `src/modules/scheduling/{create,live-count}.ts` are all still listed at PR 6's head (`origin/feat/mailbox-seam-pr6-operator-surfaces:src/mailbox/RATCHET.json`, 41 entries, verified), and those two families call them, so their signatures may change. Also recorded: PR 2+ must branch from mailbox PR 5's post-linearization head rather than a remembered sha (#271 is being rebased onto PR 3; `5324df6c` is not a valid base), and the `db/usage.ts` prerequisite is confirmed **complete** on PR 6 at `75c24b52` — `rollupSessionUsage` takes `Pick<NanoclawMailboxSession, 'listTurnUsageSince'>` at `src/db/usage.ts:118-124`, reading through `src/modules/mailbox/ops/reads.ts`.
+
 ### Open for the operator
 
 Nothing blocking. Plan §9 carries two awareness items: the 15-restart deploy count with a bundling alternative, and the drafted-but-unposted upstream contribution. Approval of `plan.md` revision 2 is required before `/team-build`.

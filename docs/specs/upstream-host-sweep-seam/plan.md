@@ -1,6 +1,6 @@
 # Plan: Upstream host-lifecycle seam and host-sweep duty registry (convergence seam 2 of 9)
 
-Status: draft (revision 2, after one Codex correction batch; see run.md) — approval pending
+Status: draft (revision 2.1 — gating only, on top of revision 2's Codex correction batch; see run.md) — approval pending
 Primary runtime: Claude (orchestrator: Fable 5.1; builders: worker tiers per PR)
 Program: upstream convergence, seam 2 (`groups/_ops/upstream-rebaseline-2026-09/`, memory `project_upstream_convergence_program`)
 Upstream target: `nanocoai/nanoclaw` `5c3082a1` (2.3.0, 2026-09-01). `src/host-lifecycle.ts` is byte-identical at `5c3082a1` and at `upstream/main` `0d9328d2` (sha256 `fbf37333…`, verified 2026-09-03), so the port does not age before the next sync.
@@ -315,6 +315,8 @@ The same four things every time, so review is a template rather than a fresh rea
 
 **Base branches (D7).** PR 0 and PR 1 branch from `origin/main` now. PR 2 onward branch from `feat/mailbox-seam-pr5-sweep-family`, rebased onto `main` once mailbox PR 5 lands — PR 5 rewrote `host-sweep.ts` off the raw façade and mailbox PR 4 changes `recurrence`/`host-script` signatures, so a seam-2 branch off `main` would derive `host-sweep.ts`'s shape twice (explicit collision warning, seam2-constraints.md §1).
 
+**Branch from PR 5's post-linearization head, never from a remembered sha.** The mailbox session is re-basing #271 onto PR 3, so the branch's head moves; `5324df6c` in particular is **not** a valid seam-2 base. Resolve the head at branch time (`git rev-parse origin/feat/mailbox-seam-pr5-sweep-family`) and record the sha you actually used in run.md.
+
 **The legacy-handle bridge is what gates the last three family PRs.** `host-sweep.ts` still holds six `legacy*Handle()` call sites, each a callee mailbox PR 5 was not allowed to touch:
 
 | Line | Callee | Owning mailbox PR | Seam-2 PR blocked |
@@ -326,7 +328,9 @@ The same four things every time, so review is a template rather than a fresh rea
 | `:1840` | `rollupSessionUsage` (`db/usage.ts`) | PR 6 | S2-PR12 |
 | `:2416` | `deferMessageForFreshContextRetry` (`session-manager.ts`) | PR 4 | S2-PR9 |
 
-**These are prerequisites, not seam-2 work.** Converting the six callees off the bridge belongs to the mailbox series; seam 2 waits for them and takes none of them. The `db/usage.ts` conversion in particular is mailbox PR 6's scope, confirmed by the mailbox session — the PR 5 source comment at `:1836-1838` reads as if it had no owner, and it does.
+**These are prerequisites, not seam-2 work.** Converting the six callees off the bridge belongs to the mailbox series; seam 2 waits for them and takes none of them.
+
+The `db/usage.ts` conversion is **done** on mailbox PR 6 and verified at `75c24b52`: `rollupSessionUsage` now takes `mailbox: Pick<NanoclawMailboxSession, 'listTurnUsageSince'>` (`src/db/usage.ts:118-124`) instead of a raw handle, reading through the named op in `src/modules/mailbox/ops/reads.ts`. The PR 5 source comment at `:1836-1838` reads as if the bridge had no owner; it does, and the work has landed on that branch.
 
 One sequencing note: three comments on the PR 5 branch (`:1223-1224`, `:1591`, `:1768-1769`) say those callees move in "PR 3" where the mailbox plan says PR 4. The comments are being corrected on #271. Seam 2 sequences against **PR 4** regardless of which text a builder happens to read.
 
@@ -342,12 +346,12 @@ One sequencing note: three comments on the PR 5 branch (`:1223-1224`, `:1591`, `
 | S2-PR3 idle reaps | S2-PR2 | S2-PR2 | registry must exist |
 | S2-PR4 central housekeeping | S2-PR2 | S2-PR2 | |
 | S2-PR5 orchestrator, dormant | S2-PR2 | S2-PR2 | |
-| S2-PR6 claims + storage + egress | S2-PR2 | S2-PR2 | |
+| S2-PR6 claims + storage + egress | S2-PR2 | **mailbox PR 7 merged** | PR 7 empties the last host allowlist entries, including `modules/claims/self-heal.ts` (still listed at PR 6's head), which this family calls — its signature may change |
 | S2-PR7 scheduled-move recovery | S2-PR2 | S2-PR2 | |
 | S2-PR8 repo fence + approvals scan | S2-PR2 | S2-PR2 | |
 | S2-PR9 per-session core | S2-PR2 | **mailbox PR 4 merged** | S17's `deferMessageForFreshContextRetry` bridge |
 | S2-PR10 container health | S2-PR2 | S2-PR2 | fully on the seam already |
-| S2-PR11 scheduling + thread-close | S2-PR2 | **mailbox PR 4 merged** | four bridge sites |
+| S2-PR11 scheduling + thread-close | S2-PR2 | **mailbox PR 7 merged** | four bridge sites owned by PR 4, plus `modules/scheduling/{create,live-count}.ts` — still on the allowlist at PR 6's head and converted by PR 7, so this family's callees may change signature twice |
 | S2-PR12 usage rollup | S2-PR2 | **mailbox PR 6 merged** | `db/usage.ts`'s `rollupSessionUsage` bridge is PR 6's scope; seam 2 does not take it |
 | S2-PR13 continuation + ceiling (G09) | S2-PR2 | mailbox PR 4 merged | `host-restart-warn.ts` consumes four `host-sweep.ts` exports and is a PR 4 file |
 | S2-PR14 final + contribution draft | S2-PR2 | all of the above | |
@@ -426,7 +430,7 @@ Plus the moved family's own log lines at their previous rate — each family PR 
 | 9 | Test rewrite cost exceeds the estimate (G67's unanswered >60%-delete question) | Measured per family PR and reported in run.md; PR 3 is first and smallest so the ratio is known before the expensive families |
 | 10 | spawn_task silently re-enabled by making its watchdog live again | PR 5 ports G39 dormant with the capability grant revoked; F-5.3 asserts no action when the capability is absent |
 | 11 | Two builders collide on `/tmp` fixture roots (#274) | One worktree per suite; §6 |
-| 12 | Mailbox PR 4 / PR 6 slip and block PR 9/11/12/13 | Those four are last in the order and the other seven family PRs are independent of them, so a slip costs sequence position, not throughput. Seam 2 does not route around a slip by absorbing mailbox scope |
+| 12 | Mailbox PR 4 / PR 6 / PR 7 slip and block PR 6/9/11/12/13 | Those five are last in the order and the other five family PRs are independent of them, so a slip costs sequence position, not throughput. Seam 2 does not route around a slip by absorbing mailbox scope |
 
 ## 8. Acceptance criteria (executable; `/team-build` materializes these, names verbatim)
 
@@ -563,7 +567,7 @@ Targeted files only. Never the full host suite while another builder is running,
 | D4 | PR 2 builds a fork-local sweep duty registry: a seven-phase list (`session:health` exclusive, the rest `all`) plus an SLA-observation hook list and a kill-follow-up list, encoding all 21 ordering constraints. The driver is session-major and nested, with the per-session yield preserved. One shared per-tick context, a single active-sessions scan, one mailbox open per group per window, and error classification at every opening boundary with the two distinct log strings and a `window` field. |
 | D5 | PR 3–13 move duties in families, cheapest first, with per-family rewrite-vs-delete measurement; G09 last; the `CodexItem` tolerance is a named acceptance case; G64 shims are deleted with the storage family; the scheduled-move raw-path import is a permanent KEEP-PATCH with its reason recorded at the import site; memory/curator hooks do not exist. |
 | D6 | PR 14 leaves `host-sweep.ts` as driver + registry + phase list under 300 lines, measures residue, and drafts the upstream contribution into the record directory. |
-| D7 | PR 0/1 base on `origin/main`; PR 2 onward on the mailbox PR 5 branch; PR 9/11/13 wait for mailbox PR 4 and PR 12 for mailbox PR 6. The six legacy-handle conversions are mailbox-series prerequisites; seam 2 takes none of them. Gating table in §5. |
+| D7 | PR 0/1 base on `origin/main`; PR 2 onward on the mailbox PR 5 branch at its post-linearization head. PR 9/13 wait for mailbox PR 4, PR 12 for PR 6, and PR 6/PR 11 for PR 7. The six legacy-handle conversions are mailbox-series prerequisites; seam 2 takes none of them. Gating table in §5. |
 | D8 | Deploy conventions are seam 1's verbatim: one PR per restart, quiet rule v2 re-checked at execution, QA seat first, the five-part gate, revert-build-restart rollback, no migrations. Log gates use the two distinct strings `Host sweep duty failed` and `Host sweep mailbox unopenable`, never a shared count (constraint 17). |
 | D9 | Acceptance criteria are exact named cases (§8); ownership boundaries and verification commands are per PR (§5, §10). |
 | D10 | No product decision is open. The two operator-facing items in §9 are for awareness. |
