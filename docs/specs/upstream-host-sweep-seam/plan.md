@@ -6,7 +6,7 @@ Program: upstream convergence, seam 2 (`groups/_ops/upstream-rebaseline-2026-09/
 Upstream target: `nanocoai/nanoclaw` `5c3082a1` (2.3.0, 2026-09-01). `src/host-lifecycle.ts` is byte-identical at `5c3082a1` and at `upstream/main` `0d9328d2` (sha256 `fbf37333…`, verified 2026-09-03), so the port does not age before the next sync.
 Fork base: `origin/feat/mailbox-seam-pr5-sweep-family` = `756f5d02` — a stack of mailbox PRs 1, 2 and 5, 28 commits off merge-base `167c96e6`. Every fork line number below is relative to that branch.
 Predecessor: seam 1, `docs/specs/upstream-mailbox-seam/plan.md` — §6, §8 and §10 conventions are reused verbatim.
-Executable acceptance criteria: **required** — behavior-preserving restructuring of the host's only periodic control path; every PR carries the named cases in §8 (67 total).
+Executable acceptance criteria: **required** — behavior-preserving restructuring of the host's only periodic control path; every PR carries the named cases in §8 (68 total).
 
 ## 1. Outcome
 
@@ -438,19 +438,20 @@ Plus the moved family's own log lines at their previous rate — each family PR 
 
 ## 8. Acceptance criteria (executable; `/team-build` materializes these, names verbatim)
 
-Host, `vitest`. 67 cases.
+Host, `vitest`. 68 cases.
 
 **S2-PR0 — lifecycle port (4)**
 - **L-1** `src/host-lifecycle-seam.test.ts` › "every ported upstream file matches UPSTREAM-MANIFEST.json" — manifest key set equals `UPSTREAM_FILES`; recompute sha256 for each; assert equality.
 - **L-2** `src/host-lifecycle.test.ts` (fork-owned copy of upstream's five `host module lifecycle registry` cases, verbatim — §4.1) › "start callbacks run FIFO and a throw propagates; shutdown callbacks run LIFO and a throw is swallowed" — upstream's assertions, unmodified; the two boot-order cases are kept with only the `src/index.ts` → `src/main.ts` path swapped; the approvals case is deferred.
 - **L-3** `src/main.test.ts` › "startHostModules fires after the delivery adapter and before the delivery polls; stopHostModules is the first shutdown action" — spy the boot sequence; assert relative order against `setDeliveryAdapter`, `startActiveDeliveryPoll`, `stopDeliveryPolls`.
-- **L-4** same file › "the lifecycle port registers no callbacks" — after importing the modules barrel, both getters return empty at PR 0.
+- **L-4** same file › "the lifecycle port registers no callbacks" — after importing the modules barrel, both getters return empty at PR 0. **Superseded at PR 1** (the timers register), replaced by T-5 below; the case is removed in PR 1's diff, not weakened in place.
 
-**S2-PR1 — module timers (4)**
+**S2-PR1 — module timers (5)**
 - **T-1** `src/host-sweep-registry.test.ts` › "main.ts starts no duty timer directly" — grep `src/main.ts` for the seven start/stop symbols; assert zero matches.
 - **T-2** same file › "a timer that fails to start still aborts boot, and a failing interval tick does not" — make `startWorktreeCleanup` throw; assert `startHostModules` **rejects** and the throw propagates (fail-fast preserved, matching today's unguarded `main.ts` calls and upstream's rethrow). Separately, make the recurring interval body throw; assert the process sees no unhandled rejection, the error is logged, and the next tick still fires.
 - **T-3** `src/modules/sweep-storage/storage.test.ts` › "storage maintenance start and stop are declared in one module" — `onHostShutdown` stops the worker, `startStorageMaintenanceOnce` is exported from the same module, `main.ts` references neither.
 - **T-4** `src/host-sweep-registry.test.ts` › "module intervals are unref'd and cleared on shutdown" — after `startHostModules` then `stopHostModules`, no timer keeps the loop alive and each interval had `unref` called.
+- **T-5** `src/main.test.ts` › "after PR 1 the registries hold exactly the six timer starts and seven shutdowns, regardless of env gates" — with a fresh module registry, import the modules barrel and the six timer modules; assert exactly 6 start callbacks and 7 shutdown callbacks (six timers + storage); repeat with `DAILY_SUMMARY_ENABLED=0` and `BACKLOG_CANVAS_ENABLED=0` and assert the same counts (a disabled duty registers and no-ops, §4.2). Replaces L-4 from PR 1 onward.
 
 **S2-PR2 — registry (13)**
 - **R-1** `src/host-sweep-registry.test.ts` › "duties run in SWEEP_PHASES order and by order within a phase" — probes across all eight phases with interleaved `order` values; observed sequence equals the declared one.
