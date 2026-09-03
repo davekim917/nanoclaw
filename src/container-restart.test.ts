@@ -35,6 +35,10 @@ vi.mock('./db/sessions.js', () => ({
 const mockWriteSessionMessage = vi.fn();
 /** Session rows that exist in the central DB but own no mailbox. */
 const missingInboundDbs = new Set<string>();
+// The barrier's drain probe reads OUTBOUND-owned state, so it goes through the
+// outbound-keyed funnel and its absence set is a different one — that split is
+// the point of the fix it models.
+const missingOutboundDbs = new Set<string>();
 /** Session mailboxes that exist but are unreadable (present file, no schema). */
 const unreadableInboundDbs = new Set<string>();
 /** Session ids the seam actually handed a mailbox session back for. */
@@ -150,6 +154,19 @@ vi.mock('./modules/mailbox/session.js', async (importOriginal) => {
       openedInboundDbs.push(sessionId);
       return action(modelMailbox(sessionId));
     },
+    withExistingNanoclawOutbound: async (
+      agentGroupId: string,
+      sessionId: string,
+      action: (outbound: unknown) => unknown,
+    ) => {
+      if (realMailboxSessions.has(sessionId)) {
+        return real.withExistingNanoclawOutbound(agentGroupId, sessionId, action as never);
+      }
+      // Keyed on outbound.db, deliberately independent of missingInboundDbs:
+      // a session whose inbound.db is gone still has outbound state to read.
+      if (missingOutboundDbs.has(sessionId)) return undefined;
+      return action(modelMailbox(sessionId));
+    },
     // Referenced only so the unused-import lint stays quiet if the real class
     // is needed by a future case; the engine imports it from the barrel.
     __SessionDbMissingError: SessionDbMissingError,
@@ -184,6 +201,7 @@ beforeEach(() => {
   activationFailures.clear();
   releaseFailures.clear();
   missingInboundDbs.clear();
+  missingOutboundDbs.clear();
   unreadableInboundDbs.clear();
   openedInboundDbs.length = 0;
   beforeInboundOpen = null;

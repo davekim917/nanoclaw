@@ -208,6 +208,36 @@ describe('requestThreadClose', () => {
     expect(readThreadClosures(['slack:C1:1.1']).get('slack:C1:1.1')).toMatchObject({ state: 'awaiting_confirmation' });
   });
 
+  /**
+   * The outbound-only cohort: inbound.db gone, outbound.db present and holding
+   * a live `propose_done`.
+   *
+   * The proposal read is outbound-owned, so gating it on inbound.db's
+   * existence made a standing proposal read as absent. That is not merely
+   * stricter — the operator is billed a second confirmation, and the record
+   * says the agent never proposed.
+   */
+  it('reads a done proposal from outbound.db when inbound.db is gone', async () => {
+    fs.rmSync(path.dirname(dbPathFor('ag1', 's1', 'inbound.db')), { recursive: true, force: true });
+    materializeSession('ag1', 's1');
+    const out = new Database(dbPathFor('ag1', 's1', 'outbound.db'));
+    out
+      .prepare('INSERT INTO session_state (key, value, updated_at) VALUES (?, ?, ?)')
+      .run('done_proposal', JSON.stringify({ reason: 'wrapped up', proposed_at: iso(0) }), iso(0));
+    out.close();
+    // The host-owned half is gone; the container's half is not.
+    fs.rmSync(dbPathFor('ag1', 's1', 'inbound.db'));
+
+    // ONE confirmation is enough when the agent has proposed. Through the
+    // inbound-keyed funnel this was a 409 asking for two.
+    const res = await requestThreadClose('slack:C1:1.1', { confirmations: 1 }, ctxFor('admin'));
+    expect(res.status).toBe(202);
+    expect(res.body).toMatchObject({ agent_proposed: true });
+    expect(
+      getDb().prepare('SELECT agent_proposed FROM thread_closures WHERE thread_id = ?').get('slack:C1:1.1'),
+    ).toMatchObject({ agent_proposed: 1 });
+  });
+
   it('collapses an unknown thread and an unprivileged caller into the same 404', async () => {
     expect((await requestThreadClose('slack:C1:nope', { confirmations: 2 }, ctxFor('admin'))).status).toBe(404);
     expect((await requestThreadClose('slack:C1:1.1', { confirmations: 2 }, ctxFor('nobody'))).status).toBe(404);

@@ -449,6 +449,28 @@ export interface NanoclawMailboxSession extends MailboxSession {
   legacyOutboundHandle(): Database.Database;
 }
 
+/**
+ * The outbound-owned ops, named once.
+ *
+ * Every signature is the session's own — a `Pick`, not a second declaration —
+ * so each op has one definition however it is reached (invariant I-2).
+ *
+ * Deliberately the surface PR 7's read-only `OutboundSessionRead` converges
+ * on: `getContainerState` and `getProcessingClaimRows` already match it by
+ * name and shape. It is a superset by exactly one write,
+ * `clearWorkContinuation` — the thread-close force-clear is a host write to a
+ * container-owned key, and on this head there is nowhere else for it to live.
+ */
+export type NanoclawOutboundSession = Pick<
+  NanoclawMailboxSession,
+  | 'getContainerState'
+  | 'getProcessingClaimRows'
+  | 'readRepositoryMountBarrierAck'
+  | 'readDoneProposal'
+  | 'readContinuationPresence'
+  | 'clearWorkContinuation'
+>;
+
 export type NanoclawMailboxAction<T> = (mailbox: NanoclawMailboxSession) => T | Promise<T>;
 
 /** Normalize upstream's boolean flag shape onto the fork's 0|1 columns. */
@@ -591,6 +613,44 @@ export class NanoclawAgentMailbox extends SqliteAgentMailbox {
  * reimplementing the composition — one definition of "what a Nanoclaw mailbox
  * session is", which is what invariant I-2 asks for.
  */
+/**
+ * The outbound ops, bound to handles the caller owns.
+ *
+ * One composition, two entry points: `forkOps` spreads it into the full
+ * mailbox session, and `withExistingNanoclawOutbound` hands it out on its own
+ * to a caller that has no business with inbound.db. Both accessors stay lazy,
+ * so an action that only reads never opens the writer.
+ *
+ * `outboundPresent` false degrades the READS to empty, exactly as it does
+ * inside a mailbox session. The outbound-keyed funnel always passes true — it
+ * has already established the file is there.
+ */
+export function composeOutboundOps(
+  readableOutbound: () => Database.Database,
+  writableOutbound: () => Database.Database,
+  outboundPresent: boolean,
+): NanoclawOutboundSession {
+  const readOutbound = <T>(empty: T, read: (outbound: Database.Database) => T): T =>
+    outboundPresent ? read(readableOutbound()) : empty;
+  return {
+    getContainerState: () => {
+      const row = readOutbound(null, getContainerState);
+      if (!row) return null;
+      return {
+        ...row,
+        currentTool: row.current_tool,
+        toolDeclaredTimeoutMs: row.tool_declared_timeout_ms,
+        toolStartedAt: row.tool_started_at === null ? null : parseIsoTimestamp(sqliteTimestamp(row.tool_started_at)),
+      };
+    },
+    getProcessingClaimRows: () => readOutbound([], getProcessingClaims),
+    readRepositoryMountBarrierAck: () => readOutbound(null, readRepositoryMountBarrierAck),
+    readDoneProposal: () => readDoneProposal(readableOutbound()),
+    readContinuationPresence: () => readContinuationPresence(readableOutbound()),
+    clearWorkContinuation: () => clearWorkContinuation(writableOutbound()),
+  };
+}
+
 export function composeNanoclawSession(
   inbound: Database.Database,
   readableOutbound: () => Database.Database,
@@ -648,6 +708,10 @@ function forkOps(
     outboundPresent ? read(readableOutbound()) : empty;
 
   return {
+    // The outbound-owned ops come from the one composition the outbound-keyed
+    // funnel also uses, so the two surfaces cannot drift apart.
+    ...composeOutboundOps(readableOutbound, writableOutbound, outboundPresent),
+
     hasOutbound: () => outboundPresent,
 
     setRouting: (routing) =>
@@ -659,16 +723,6 @@ function forkOps(
     countDueMessages: () => countDueMessages(inbound),
     markDelivered: (messageOutId, platformMessageId) => markDelivered(inbound, messageOutId, platformMessageId),
     markDeliveryFailed: (messageOutId, errorMessage) => markDeliveryFailed(inbound, messageOutId, errorMessage),
-    getContainerState: () => {
-      const row = readOutbound(null, getContainerState);
-      if (!row) return null;
-      return {
-        ...row,
-        currentTool: row.current_tool,
-        toolDeclaredTimeoutMs: row.tool_declared_timeout_ms,
-        toolStartedAt: row.tool_started_at === null ? null : parseIsoTimestamp(sqliteTimestamp(row.tool_started_at)),
-      };
-    },
     insertMessage: async (message) => {
       runInsertMessage(inbound, toMessageInsert(message), false);
     },
@@ -697,7 +751,6 @@ function forkOps(
     expireStalePending: (maxAgeMs) => expireStalePending(inbound, maxAgeMs),
     getDueWakePriority: () => getDueWakePriority(inbound),
     syncProcessingAcks: () => readOutbound(undefined, (outbound) => syncProcessingAcks(inbound, outbound)),
-    getProcessingClaimRows: () => readOutbound([], getProcessingClaims),
 
     insertTaskRow: (row) => insertTaskRow(inbound, row),
     resumeTask: (taskId) => resumeTask(inbound, taskId),
@@ -719,16 +772,12 @@ function forkOps(
     hasMatchingBootstrapRecall: (excludeRecallId, provider, contextEpoch) =>
       hasMatchingBootstrapRecall(inbound, excludeRecallId, provider, contextEpoch),
 
-    readContinuationPresence: () => readContinuationPresence(readableOutbound()),
-    clearWorkContinuation: () => clearWorkContinuation(writableOutbound()),
-    readDoneProposal: () => readDoneProposal(readableOutbound()),
     hasRestartNoteSince: (since) => hasRestartNoteSince(inbound, since),
 
     readRepoIngressFence: () => readRepoIngressFence(inbound),
     activateRepoIngressFence: (epoch) => activateRepoIngressFence(inbound, epoch),
     admitRepoIngressFenceMessage: (epoch, messageId) => admitRepoIngressFenceMessage(inbound, epoch, messageId),
     releaseRepoIngressFence: (epoch, generation) => releaseRepoIngressFence(inbound, epoch, generation),
-    readRepositoryMountBarrierAck: () => readOutbound(null, readRepositoryMountBarrierAck),
 
     readWorkContinuation: () => readOutbound(null, readWorkContinuation),
     readContinuationRecoveryAttemptAt: (continuation) =>

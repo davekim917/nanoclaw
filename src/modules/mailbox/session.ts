@@ -16,9 +16,9 @@ import type Database from 'better-sqlite3';
 
 import { withExistingMailboxSession, withMailboxSession } from '../../session-manager.js';
 
-import { sessionMailboxPath, SessionDbMissingError } from './index.js';
-import { openOutboundDbWritable } from './openers.js';
-import type { NanoclawMailboxSession } from './index.js';
+import { composeOutboundOps, sessionMailboxPath } from './index.js';
+import { openOutboundDb, openOutboundDbWritable, sessionDbPathIsGone } from './openers.js';
+import type { NanoclawMailboxSession, NanoclawOutboundSession } from './index.js';
 
 /** Run one operation against a session's mailbox, provisioning it if absent. */
 export function withNanoclawSession<T>(
@@ -45,39 +45,53 @@ export function withExistingNanoclawSession<T>(
 }
 
 /**
- * Run one operation against a session's OUTBOUND database alone, writable.
+ * Run one operation against a session's OUTBOUND database alone.
  *
  * Resolves `undefined` — never provisions, never throws — when `outbound.db`
- * is genuinely absent, which is the never-woken shape: the container owns that
- * file and one that never ran has not written it.
+ * is genuinely absent. That is the never-woken shape: the container owns that
+ * file, and one that never ran has not written it.
  *
  * Deliberately NOT `withExistingNanoclawSession`. That funnel's existence
  * check is keyed on `inbound.db`, so it answers `undefined` for a session
- * whose inbound.db is gone while outbound.db remains — a real cohort, named in
- * `host-sweep.ts`'s usage-rollup comment — and a caller reading outbound state
- * would then report that state as empty when it is not. An outbound-only
- * operation asks an outbound-only existence question. Same reasoning, and the
- * same module funnel, as the usage rollup.
+ * whose inbound.db is gone while outbound.db remains — a real cohort — and any
+ * caller reading outbound state through it reports that state as empty when it
+ * is not. Three separate review findings on this PR were instances of that one
+ * mistake. The rule the seam settles on: the existence question a read asks is
+ * keyed to the file the read actually touches.
  *
- * A file that is present but will not open still raises
- * `SessionDbUnopenableError` from the opener: unreadable is a fault, never an
- * empty answer.
+ * The action receives the module's TYPED outbound ops, not a raw
+ * `Database` — a handle leaving the module is the shape the seam exists to
+ * remove (invariant I-9), whether or not the ratchet's name patterns happen to
+ * catch the parameter. The ops are the same composition `forkOps` spreads, so
+ * an op cannot behave differently depending on which funnel reached it.
+ *
+ * Both handles open lazily and only if the action asks: a pure read never
+ * opens the writer, and once the writer is open the reads share it, so a
+ * clear-then-verify sees its own write on one connection. A file that is
+ * present but will not open raises `SessionDbUnopenableError` from the
+ * opener — unreadable is a fault, never an empty answer. A file that vanishes
+ * between the existence check and the first op raises `SessionDbMissingError`
+ * rather than resolving `undefined`; that race is a fault too.
  */
 export async function withExistingNanoclawOutbound<T>(
   agentGroupId: string,
   sessionId: string,
-  action: (outbound: Database.Database) => T,
+  action: (outbound: NanoclawOutboundSession) => T,
 ): Promise<T | undefined> {
-  let outbound: Database.Database;
+  const outboundPath = sessionMailboxPath({ agentGroupId, sessionId }, 'outbound');
+  if (sessionDbPathIsGone(outboundPath)) return undefined;
+  let readable: Database.Database | undefined;
+  let writable: Database.Database | undefined;
   try {
-    outbound = openOutboundDbWritable(sessionMailboxPath({ agentGroupId, sessionId }, 'outbound'));
-  } catch (err) {
-    if (err instanceof SessionDbMissingError) return undefined;
-    throw err;
-  }
-  try {
-    return action(outbound);
+    return action(
+      composeOutboundOps(
+        () => writable ?? (readable ??= openOutboundDb(outboundPath)),
+        () => (writable ??= openOutboundDbWritable(outboundPath)),
+        true,
+      ),
+    );
   } finally {
-    outbound.close();
+    writable?.close();
+    readable?.close();
   }
 }

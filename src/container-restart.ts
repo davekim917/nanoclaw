@@ -16,7 +16,7 @@ import { getSession, getSessionsByAgentGroup } from './db/sessions.js';
 import { log } from './log.js';
 import { SessionDbMissingError, sessionMailboxPath, type NanoclawMailboxSession } from './modules/mailbox/index.js';
 import { repoIngressFenceAckToken } from './modules/mailbox/ops/fence.js';
-import { withExistingNanoclawSession } from './modules/mailbox/session.js';
+import { withExistingNanoclawOutbound, withExistingNanoclawSession } from './modules/mailbox/session.js';
 import { writeSessionMessage } from './session-manager.js';
 import type { Session } from './types.js';
 import fs from 'fs';
@@ -280,19 +280,28 @@ async function activateRepositoryMountBarriers(
 async function sessionReachedRepositoryBarrier(session: Session, expectedAck: string): Promise<boolean> {
   if (!isContainerRunning(session.id) && !isContainerSpawning(session.id)) return true;
   try {
-    const drained = await withExistingNanoclawSession(
+    // OUTBOUND-keyed: all three reads are outbound-owned and nothing here
+    // touches inbound.db, so outbound.db's existence is the question to ask.
+    // The inbound-keyed funnel added a gate the pre-seam probe never had — it
+    // opened outbound.db alone — and a session whose inbound.db is reclaimed
+    // mid-transition could then never report drained, burning the full barrier
+    // timeout and turning a survivable transition into a quiescence failure
+    // that kills every affected container.
+    const drained = await withExistingNanoclawOutbound(
       session.agent_group_id,
       session.id,
-      (mailbox) =>
+      (outbound) =>
         // The EXACT activation token, never merely "some ack": a stale
         // generation from a previous barrier on this session would otherwise
         // read as drained.
-        mailbox.readRepositoryMountBarrierAck() === expectedAck &&
-        mailbox.getProcessingClaimRows().length === 0 &&
-        !mailbox.getContainerState()?.current_tool,
+        outbound.readRepositoryMountBarrierAck() === expectedAck &&
+        outbound.getProcessingClaimRows().length === 0 &&
+        !outbound.getContainerState()?.current_tool,
     );
-    // undefined = no mailbox for a session the host believes is running.
-    // Unknown acknowledgement or work state is never safe to stop.
+    // undefined = no outbound.db at all for a session the host believes is
+    // running. Unknown acknowledgement or work state is never safe to stop,
+    // and neither is a present-but-unreadable file, which raises into the
+    // catch below.
     return drained ?? false;
   } catch {
     return false;

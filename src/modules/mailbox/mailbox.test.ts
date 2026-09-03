@@ -43,8 +43,9 @@ vi.mock('../../log.js', async (importOriginal) => ({
 import { getAgentMailbox } from '../../mailbox/index.js';
 import type { InboundMessage, MailboxSessionKey } from '../../mailbox/types.js';
 import { SessionDbMissingError } from './openers.js';
-import { withMailboxSession } from '../../session-manager.js';
+import { withExistingMailboxSession, withMailboxSession } from '../../session-manager.js';
 import { shouldReapIdleTaskContainer } from '../sweep-idle-reap/index.js';
+import { withExistingNanoclawOutbound } from './session.js';
 import { sessionOutboundStorageStat, type NanoclawMailboxSession } from './index.js';
 
 const DATA_DIR = path.join(TEST_ROOT, 'data');
@@ -387,6 +388,56 @@ describe('NanoclawAgentMailbox', () => {
     } finally {
       fs.chmodSync(sessionDir, 0o700);
     }
+  });
+
+  /**
+   * The mirror cohort, and the invariant three review findings on this PR were
+   * circling: an outbound-only session — inbound.db gone, outbound.db present.
+   *
+   * `exists()` is inbound-keyed, so the mailbox-session funnel cannot see this
+   * session at all and answers `undefined`. Every caller that read
+   * outbound-owned state through it therefore reported that state as EMPTY
+   * when it was not. The outbound-keyed funnel asks the question that matches
+   * the file it touches, and reads the row.
+   */
+  it('the outbound funnel reads an outbound-only session the mailbox funnel cannot see', async () => {
+    const key = freshKey();
+    getAgentMailbox().prepare(key);
+    raw(dbPath(key, 'outbound'), (db) =>
+      db
+        .prepare('INSERT INTO session_state (key, value, updated_at) VALUES (?, ?, ?)')
+        .run(
+          'done_proposal',
+          JSON.stringify({ reason: 'done here', proposed_at: new Date().toISOString() }),
+          new Date().toISOString(),
+        ),
+    );
+    // The host-owned half goes; the container's half stays.
+    fs.rmSync(dbPath(key, 'inbound'));
+
+    // The inbound-keyed funnel is blind to it.
+    expect(await getAgentMailbox().exists(key)).toBe(false);
+    expect(
+      await withExistingMailboxSession(key.agentGroupId, key.sessionId, (m) => fork(m).readDoneProposal()),
+    ).toBeUndefined();
+
+    // The outbound-keyed one reads the record that is really there.
+    const proposal = await withExistingNanoclawOutbound(key.agentGroupId, key.sessionId, (outbound) =>
+      outbound.readDoneProposal(),
+    );
+    expect(proposal).toMatchObject({ reason: 'done here' });
+  });
+
+  it('the outbound funnel answers undefined only when outbound.db is genuinely absent', async () => {
+    const key = freshKey();
+    getAgentMailbox().prepare(key);
+    fs.rmSync(dbPath(key, 'outbound'));
+
+    expect(
+      await withExistingNanoclawOutbound(key.agentGroupId, key.sessionId, (outbound) => outbound.readDoneProposal()),
+    ).toBeUndefined();
+    // A read never provisions the file the container owns.
+    expect(fs.existsSync(dbPath(key, 'outbound'))).toBe(false);
   });
 
   it('a session with only inbound.db exists, and its outbound reads degrade instead of failing', async () => {

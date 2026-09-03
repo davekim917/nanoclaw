@@ -58,12 +58,7 @@ import { getDb } from '../db/index.js';
 import { archiveSessionById } from '../db/sessions.js';
 import { guard } from '../guard/index.js';
 import { log } from '../log.js';
-import {
-  clearWorkContinuation,
-  readContinuationPresence,
-  CLOSE_REASON_MAX_CHARS,
-  type DoneProposal,
-} from '../modules/mailbox/index.js';
+import { CLOSE_REASON_MAX_CHARS, type DoneProposal } from '../modules/mailbox/index.js';
 import { withExistingNanoclawOutbound } from '../modules/mailbox/session.js';
 import { hasAdminPrivilege } from '../modules/permissions/db/user-roles.js';
 import { withExistingMailboxSession } from '../session-manager.js';
@@ -126,12 +121,24 @@ export function syncDoneProposalMirror(sessionId: string, proposal: DoneProposal
 /** Read a session's proposal from its own outbound.db — exact, never the mirror. */
 async function readSessionProposal(agentGroupId: string, sessionId: string): Promise<DoneProposal | null> {
   try {
-    // Existing-only. No mailbox yet (a session whose container never started)
-    // is not a proposal, and a read must never author the outbound.db the host
-    // is not allowed to create.
-    return (await withExistingMailboxSession(agentGroupId, sessionId, (mailbox) => mailbox.readDoneProposal())) ?? null;
+    // OUTBOUND-keyed. `propose_done` is a container-owned key in outbound.db
+    // and this read touches nothing else, so outbound.db's existence is the
+    // only question it may ask.
+    //
+    // Through the inbound-keyed funnel it asked the wrong one: a session whose
+    // inbound.db is gone while outbound.db remains never ran the action, so a
+    // standing proposal read as absent. That is not merely stricter — it costs
+    // the operator a second confirmation AND makes a fresh agent confirmation
+    // invisible, so the close waits out the forced-close window instead of
+    // completing when the agent answers.
+    //
+    // Existing-only either way: a read must never author the outbound.db the
+    // host is not allowed to create.
+    return (
+      (await withExistingNanoclawOutbound(agentGroupId, sessionId, (outbound) => outbound.readDoneProposal())) ?? null
+    );
   } catch {
-    // Absent is honest.
+    // Unreadable is absent here, as it was pre-seam.
     return null;
   }
 }
@@ -459,7 +466,7 @@ async function forceClearWorkContinuation(session: CloseSession, threadId: strin
   // present but will not open raises from the opener instead, and
   // `ensureContinuationCleared` counts that as not-cleared.
   const cleared = await withExistingNanoclawOutbound(session.agent_group_id, session.id, (outbound) => {
-    const held = clearWorkContinuation(outbound);
+    const held = outbound.clearWorkContinuation();
     if (held) {
       log.info('thread-close: force-cleared a work_continuation the container still held', {
         threadId,
@@ -471,7 +478,7 @@ async function forceClearWorkContinuation(session: CloseSession, threadId: strin
     }
     // Presence, not validity: a record that will not parse is still a record,
     // and "we could not read it" is not a state this path may call cleared.
-    return readContinuationPresence(outbound) === null;
+    return outbound.readContinuationPresence() === null;
   });
   return cleared ?? true;
 }
