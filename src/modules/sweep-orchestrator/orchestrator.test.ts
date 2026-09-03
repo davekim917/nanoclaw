@@ -21,6 +21,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { closeDb, getDb, initTestDb, runMigrations } from '../../db/index.js';
+import { log } from '../../log.js';
 
 // Hermeticity tripwire (brief-common.md HARD RULE): every case below runs a
 // real duty body (sweepTaskWatchdog, autoArchiveOldCompleted,
@@ -79,6 +80,11 @@ vi.mock('../orchestrator-dispatch/db/tasks.js', async (importOriginal) => {
     getActiveTasks: (...args: unknown[]) => mockGetActiveTasks(...args),
     transitionToTerminal: (...args: unknown[]) => mockTransitionToTerminal(...args),
     getOrphanedTasks: (...args: unknown[]) => mockGetOrphanedTasks(...args),
+    // Wrapped, not replaced — calls the real DB-backed function by default so
+    // F-5.2 (which needs the real implementation against a real test DB) is
+    // unaffected. Only the registered-duty-wrapper throwing-path case below
+    // overrides it, once, via mockImplementationOnce.
+    autoArchiveCompletedBefore: vi.fn(real.autoArchiveCompletedBefore),
   };
 });
 
@@ -120,9 +126,39 @@ vi.mock('../../db/sessions.js', async (importOriginal) => {
   };
 });
 
+// Wrap (not replace) the three duty bodies: `vi.fn(real)` still calls the real
+// implementation by default, so every case below and above keeps its existing
+// behavior. The wrapping only exists so the registered-duty-wrapper cases
+// further down (added pre-review, per plan.md §4.3's registry contract) can
+// assert the registry's `run(ctx)` actually calls through, and can swap in a
+// throwing implementation for one test at a time via mockImplementationOnce.
+vi.mock('./auto-archive.js', async (importOriginal) => {
+  const real = await importOriginal<typeof import('./auto-archive.js')>();
+  return { ...real, autoArchiveOldCompleted: vi.fn(real.autoArchiveOldCompleted) };
+});
+vi.mock('./task-watchdog.js', async (importOriginal) => {
+  const real = await importOriginal<typeof import('./task-watchdog.js')>();
+  return { ...real, sweepTaskWatchdog: vi.fn(real.sweepTaskWatchdog) };
+});
+vi.mock('../orchestrator-dispatch/reconciler.js', async (importOriginal) => {
+  const real = await importOriginal<typeof import('../orchestrator-dispatch/reconciler.js')>();
+  return { ...real, runReconcilerSweep: vi.fn(real.runReconcilerSweep) };
+});
+
 import { autoArchiveOldCompleted } from './auto-archive.js';
 import { sweepTaskWatchdog } from './task-watchdog.js';
 import { runReconcilerSweep } from '../orchestrator-dispatch/reconciler.js';
+import { autoArchiveCompletedBefore } from '../orchestrator-dispatch/db/tasks.js';
+// Registers T6/T14/T18 into host-sweep.ts's live registry — needed so the
+// registered-duty-wrapper cases below can obtain them by name, the same
+// accessor R-7 uses in src/host-sweep-registry.test.ts. Safe to import
+// unmocked here: registration only pushes duty objects into an array (no
+// body executes) and host-sweep.ts's own import graph is inert at import
+// time (src/host-sweep.test.ts already imports it directly with a small
+// mock subset — none of its other duties' bodies run unless a full tick
+// does, which none of these cases trigger).
+import './index.js';
+import { _listSweepRegistrationsForTesting, type SweepTickContext } from '../../host-sweep.js';
 
 // ── F-5.1 — the task watchdog transitions and parent notifications are unchanged ──
 
@@ -556,5 +592,118 @@ describe('the dormant module takes no action when the spawn_task capability is r
     // completeSpawnSideEffects/setImmediate.
     expect(() => runReconcilerSweep()).not.toThrow();
     expect(mockGetOrphanedTasks).toHaveBeenCalled();
+  });
+});
+
+// ── registered duty wrappers drive their underlying functions ────────────────
+//
+// F-5.1..F-5.3 above exercise the duty BODIES directly. These cases exercise
+// the registered wrapper each body sits behind — obtained from the registry
+// by name, the same accessor R-7 uses in src/host-sweep-registry.test.ts —
+// proving the move preserved both the call-through and the failure contract
+// each wrapper relied on before it left host-sweep.ts. `run(ctx)` never reads
+// `ctx` for any of the three, so a minimal fake tick context stands in.
+
+function fakeTickContext(): SweepTickContext {
+  return { now: Date.now(), sessions: [], activeContainerSessionIds: new Set() } as unknown as SweepTickContext;
+}
+
+function getDuty(name: string) {
+  const duty = _listSweepRegistrationsForTesting().duties.find((d) => d.name === name);
+  if (!duty) throw new Error(`duty ${name} not registered`);
+  return duty;
+}
+
+describe('the registered orchestrator-reconciler wrapper calls runReconcilerSweep', () => {
+  beforeEach(() => {
+    vi.mocked(runReconcilerSweep).mockClear();
+  });
+
+  it('run(ctx) calls runReconcilerSweep with no arguments', () => {
+    const duty = getDuty('orchestrator-reconciler');
+
+    duty.run(fakeTickContext());
+
+    expect(runReconcilerSweep).toHaveBeenCalledTimes(1);
+    expect(runReconcilerSweep).toHaveBeenCalledWith();
+  });
+
+  it('a throw from runReconcilerSweep propagates out of run(ctx) uncaught', () => {
+    // T6 "carries no guard of its own" (index.ts's own comment) — the phase
+    // runner (src/host-sweep.ts's runTickPhase) is the only thing that
+    // catches it and logs 'Host sweep duty failed'. This wrapper must not
+    // have grown a try/catch of its own during the move.
+    const duty = getDuty('orchestrator-reconciler');
+    vi.mocked(runReconcilerSweep).mockImplementationOnce(() => {
+      throw new Error('reconciler boom');
+    });
+
+    expect(() => duty.run(fakeTickContext())).toThrow('reconciler boom');
+  });
+});
+
+describe('the registered task-watchdog wrapper calls sweepTaskWatchdog', () => {
+  beforeEach(() => {
+    vi.mocked(sweepTaskWatchdog).mockClear();
+    mockGetActiveTasks.mockReturnValue([]);
+  });
+
+  it('run(ctx) calls sweepTaskWatchdog with no arguments', async () => {
+    const duty = getDuty('task-watchdog');
+
+    await duty.run(fakeTickContext());
+
+    expect(sweepTaskWatchdog).toHaveBeenCalledTimes(1);
+    expect(sweepTaskWatchdog).toHaveBeenCalledWith();
+  });
+
+  it('a failure inside sweepTaskWatchdog logs the preserved string and does not reject', async () => {
+    // sweepTaskWatchdog's own top-level try/catch (task-watchdog.ts) is what
+    // the pre-move body relied on — this proves the move kept it: a failure
+    // this deep still produces 'Task watchdog: failed to load active tasks'
+    // and the wrapper still resolves, exactly as it did inside host-sweep.ts.
+    const duty = getDuty('task-watchdog');
+    const error = vi.spyOn(log, 'error').mockImplementation(() => undefined);
+    mockGetActiveTasks.mockImplementationOnce(() => {
+      throw new Error('db boom');
+    });
+
+    await expect(duty.run(fakeTickContext())).resolves.toBeUndefined();
+
+    expect(error).toHaveBeenCalledWith('Task watchdog: failed to load active tasks', expect.objectContaining({}));
+    error.mockRestore();
+  });
+});
+
+describe('the registered completed-task-auto-archive wrapper calls autoArchiveOldCompleted', () => {
+  beforeEach(() => {
+    vi.mocked(autoArchiveOldCompleted).mockClear();
+  });
+
+  it('run(ctx) calls autoArchiveOldCompleted with no arguments', () => {
+    const duty = getDuty('completed-task-auto-archive');
+
+    duty.run(fakeTickContext());
+
+    expect(autoArchiveOldCompleted).toHaveBeenCalledTimes(1);
+    expect(autoArchiveOldCompleted).toHaveBeenCalledWith();
+  });
+
+  it('a failure inside autoArchiveOldCompleted logs the preserved string and does not reject', () => {
+    // autoArchiveOldCompleted's own try/catch (auto-archive.ts) is what the
+    // pre-move body relied on — this proves the move kept it: breaking its
+    // real dependency (not replacing autoArchiveOldCompleted itself, which
+    // stays real here) still produces 'autoArchiveOldCompleted: failed' and
+    // the wrapper still resolves, exactly as it did inside host-sweep.ts.
+    const duty = getDuty('completed-task-auto-archive');
+    const warn = vi.spyOn(log, 'warn').mockImplementation(() => undefined);
+    vi.mocked(autoArchiveCompletedBefore).mockImplementationOnce(() => {
+      throw new Error('db boom');
+    });
+
+    expect(() => duty.run(fakeTickContext())).not.toThrow();
+
+    expect(warn).toHaveBeenCalledWith('autoArchiveOldCompleted: failed', expect.objectContaining({}));
+    warn.mockRestore();
   });
 });
