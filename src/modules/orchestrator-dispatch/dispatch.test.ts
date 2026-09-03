@@ -15,6 +15,8 @@ import { computeRequestHash } from './derive-task-id.js';
 import { applySpawnTask, completeSpawnSideEffects } from './dispatch.js';
 import type { Session } from '../../types.js';
 
+const hostSpawnStampMock = vi.hoisted(() => vi.fn());
+
 // ── Mock side-effecting modules ──────────────────────────────────────────────
 vi.mock('../../session-manager.js', async (importOriginal) => {
   const real = await importOriginal<typeof import('../../session-manager.js')>();
@@ -38,10 +40,18 @@ vi.mock('../../session-manager.js', async (importOriginal) => {
         created: true,
       })),
     writeSessionRouting: vi.fn(),
-    // No raw-opener overrides: the dispatcher writes the spawn_task_id stamp
-    // through `withExistingMailboxSession` (mailbox seam, PR 6), and the real
-    // one resolves `undefined` for these fixtures' non-existent mailboxes,
-    // which is the skip the stamp is supposed to take.
+    // The dispatcher stamps `spawn_task_id` through the PROVISIONING
+    // `withMailboxSession` (mailbox seam, PR 6), so the real one would CREATE
+    // `<DATA_DIR>/v2-sessions/<ag>/<session>/` on disk for every fixture
+    // session these tests invent — in an existing install, that is a real
+    // mailbox directory this suite has no business writing to, and nothing
+    // here would clean it up. Stubbed to run the action against a recording
+    // session instead: the stamp is still exercised, on nothing.
+    withMailboxSession: vi
+      .fn()
+      .mockImplementation(async (_agentGroupId: string, _sessionId: string, action: (m: unknown) => unknown) =>
+        action({ setSessionRoutingSpawnTaskId: hostSpawnStampMock }),
+      ),
   };
 });
 
