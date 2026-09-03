@@ -232,6 +232,11 @@ import {
 import { log } from './log.js';
 import { SessionDbMissingError, SessionDbUnopenableError } from './modules/mailbox/index.js';
 import { _mailboxSessionDepthForTesting } from './modules/mailbox/session.js';
+// S2-PR3 moved S12/S13 (idle-task-reap, idle-chat-reap) out of host-sweep.ts
+// into this module, which registers itself via `registerSweepDutySource` at
+// import — a default (builtins-restoring) `_resetSweepRegistryForTesting()`
+// replays it automatically, same as the in-file builtins.
+import './modules/sweep-idle-reap/index.js';
 
 probe.depth = _mailboxSessionDepthForTesting;
 
