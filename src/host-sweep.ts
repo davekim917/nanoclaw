@@ -98,7 +98,6 @@ import { decideTaskAction, pendingTerminalSpawnOutboundSeenAt } from './modules/
 import { OomKillObserver } from './resource-oom-observer.js';
 import { reconcileMergedClaims } from './modules/claims/reconcile.js';
 import { sweepClaimsSelfHeal } from './modules/claims/self-heal.js';
-import { sweepOrphanedRepoIngressFences } from './repo-fence-recovery.js';
 
 const oomKillObserver = new OomKillObserver();
 
@@ -3080,46 +3079,16 @@ function registerBuiltInSweepDuties(): void {
     },
   });
 
-  registerSweepDuty({
-    name: id.T22,
-    phase: 'tick:post-session',
-    order: 50,
-    // Incident 2026-09-01: a failed repository publication left 1401 session
-    // inbound DBs fenced (`repo_ingress_fence.state = 'active'`) with no
-    // publication left to release them. Every inbound row since was held with
-    // trigger=0 and every spawn refused, so the workgroup went silently deaf for
-    // hours. Nothing else in the host releases a fence whose publication is gone.
-    // Reuses the session list the per-session loop already loaded — no extra
-    // query — and throttles its own full pass internally.
-    run: async (ctx) => {
-      try {
-        await sweepOrphanedRepoIngressFences(ctx.sessions as Session[]);
-      } catch (err) {
-        log.warn('Orphaned repository fence sweep step failed', { err });
-      }
-    },
-  });
+  // T22 (orphaned-repo-fence-release) moved to src/modules/sweep-repo-fence/
+  // (seam 2, PR 8 — G08). The wrapper moved; `repo-fence-recovery.ts` itself
+  // did not (src/main.ts and src/delivery.ts / job-runner.ts import it
+  // directly, both outside that family PR's ownership boundary).
 
   // ── tick:housekeeping — order-free central work ────────────────────────────
 
-  registerSweepDuty({
-    name: id.T5,
-    phase: 'tick:housekeeping',
-    order: 10,
-    // Finalize any "Reject with reason…" holds whose reply window elapsed (admin
-    // ghosted, or the host restarted mid-capture). Central-DB scan, once per
-    // tick — not per session.
-    // MODULE-HOOK:approvals-reason-sweep:start
-    run: async () => {
-      try {
-        const { sweepAwaitingReasonRejects } = await import('./modules/approvals/index.js');
-        await sweepAwaitingReasonRejects();
-      } catch (err) {
-        log.error('Reject-with-reason sweep failed', { err });
-      }
-    },
-    // MODULE-HOOK:approvals-reason-sweep:end
-  });
+  // T5 (approvals-reason-sweep) moved to src/modules/sweep-repo-fence/
+  // (seam 2, PR 8 — G08). The wrapper moved; modules/approvals/index.ts did
+  // not.
 
   registerSweepDuty({
     name: id.T11,

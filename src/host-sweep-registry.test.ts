@@ -209,6 +209,12 @@ vi.mock('./db/connection.js', () => ({
   }),
 }));
 
+// Family modules self-register their duties at import via
+// `registerSweepDutySource` (plan.md §4.7 step 1) — the underlying bodies
+// stay mocked above (`./repo-fence-recovery.js`, `./modules/approvals/index.js`).
+// `_resetSweepRegistryForTesting()`'s default reset replays every recorded
+// source's registrar, so no per-call-site restoration is needed here.
+import './modules/sweep-repo-fence/index.js';
 import { registerAgentMailbox, resetAgentMailboxForTesting } from './mailbox/index.js';
 import {
   SWEEP_DUTY_INVENTORY,
