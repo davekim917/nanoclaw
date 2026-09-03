@@ -23,6 +23,7 @@ import Database from 'better-sqlite3';
 import { CronExpressionParser } from 'cron-parser';
 
 import { DATA_DIR, TIMEZONE } from '../../config.js';
+import { resolveGroupTimezone } from '../../container-config.js';
 import { getDb } from '../../db/connection.js';
 import { log } from '../../log.js';
 import { availableVerbs, type HealthState, type SeriesKind, type Verb } from './scheduled-board-matrix.js';
@@ -146,6 +147,14 @@ export interface HealthCtx {
   outboundReadable: boolean;
   nowMs: number;
   isOneOff: boolean;
+  /**
+   * The owning group's effective timezone. The cadence interval is derived
+   * from the cron grid, and around a DST transition that interval is 23 or 25
+   * hours — so a group whose override transitions on a different date than the
+   * install would be measured against the wrong cadence and flip between
+   * `late` and `stalled` at the wrong moment. Absent = the install timezone.
+   */
+  timezone?: string;
 }
 
 const TERMINAL_STATUSES = new Set(['completed', 'failed', 'expired']);
@@ -157,10 +166,10 @@ const TWENTY_FOUR_H_MS = 24 * 60 * 60 * 1000;
  * to the firing path (recurrence.ts:31). Returns null on parse failure or for
  * one-offs (no cron).
  */
-function cronIntervalMs(cron: string | null): number | null {
+function cronIntervalMs(cron: string | null, tz: string = TIMEZONE): number | null {
   if (!cron) return null;
   try {
-    const it = CronExpressionParser.parse(cron, { tz: TIMEZONE });
+    const it = CronExpressionParser.parse(cron, { tz });
     const a = it.next().getTime();
     const b = it.next().getTime();
     return b - a;
@@ -206,7 +215,7 @@ export function deriveHealth(ctx: HealthCtx): HealthState {
   // Overdue: late (immediately visible) until it crosses the stall grace.
   // Grace scales with cadence but is capped at an absolute 24h so a weekly/
   // monthly series can't be silently dead for days (S11).
-  const interval = ctx.isOneOff ? 2 * SWEEP_INTERVAL_MS : cronIntervalMs(ctx.recurrence);
+  const interval = ctx.isOneOff ? 2 * SWEEP_INTERVAL_MS : cronIntervalMs(ctx.recurrence, ctx.timezone);
   const cadenceGrace = interval !== null ? Math.max(interval * 0.5, 2 * SWEEP_INTERVAL_MS) : 2 * SWEEP_INTERVAL_MS;
   const stallGrace = Math.min(cadenceGrace, TWENTY_FOUR_H_MS);
 
@@ -414,6 +423,7 @@ function rawToRow(
     outboundReadable: outbound.readable,
     nowMs,
     isOneOff,
+    timezone: resolveGroupTimezone(desc.agentGroupId),
   });
   // Duplicate-successor rows are always flagged (the MAX(seq) read would hide
   // the second fireable row — §4.1). Surface them as stalled.

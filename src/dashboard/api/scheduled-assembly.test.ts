@@ -48,6 +48,8 @@ function setupCentralDb(): void {
       id TEXT PRIMARY KEY, agent_group_id TEXT NOT NULL, messaging_group_id TEXT,
       thread_id TEXT, status TEXT DEFAULT 'active', created_at TEXT NOT NULL
     );
+    -- Health derivation resolves the owning group's timezone override.
+    CREATE TABLE container_configs (agent_group_id TEXT PRIMARY KEY, timezone TEXT, updated_at TEXT);
   `);
 }
 
@@ -382,6 +384,27 @@ describe('deriveHealth', () => {
       ...over,
     };
   }
+
+  it('measures cadence on the owning group timezone, so a DST change is not read as a stall', () => {
+    // stallGrace is half the cadence interval. A daily 09:00 cron across
+    // Europe/Lisbon's 2026-03-29 spring-forward measures 23 hours, not 24, so
+    // the grace is 11.5h there and 12h in a zone with no transition. An
+    // 11.75h-overdue row therefore lands on opposite sides of the line, and
+    // reading both in the install zone would silently pick one answer for
+    // both groups.
+    vi.useFakeTimers();
+    // Pinned so cron-parser's default `currentDate` straddles the transition:
+    // Lisbon is 08:00 WET, so the next two 09:00 fires are Sat WET and Sun WEST.
+    vi.setSystemTime(new Date('2026-03-28T08:00:00.000Z'));
+    try {
+      const nowMs = Date.parse('2026-03-28T08:00:00.000Z');
+      const overdue = { nowMs, recurrence: '0 9 * * *', processAfterMs: nowMs - 11.75 * 3600_000 };
+      expect(deriveHealth(ctx({ ...overdue, timezone: 'Europe/Lisbon' }))).toBe('stalled');
+      expect(deriveHealth(ctx({ ...overdue, timezone: 'Asia/Tokyo' }))).toBe('late');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 
   it('paused status → paused', () => {
     expect(deriveHealth(ctx({ status: 'paused' }))).toBe('paused');
