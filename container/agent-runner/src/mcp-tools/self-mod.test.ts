@@ -96,6 +96,15 @@ describe('add_mcp_server remote Streamable HTTP', () => {
     });
     expect(bad.error).toContain('onecli-managed');
 
+    // A substring test accepted this, persisting the real secret alongside
+    // the sentinel.
+    const smuggled = await submit({
+      name: 'smuggle',
+      url: 'https://example.com/mcp',
+      headers: { Authorization: 'Bearer actual-secret onecli-managed' },
+    });
+    expect(smuggled.error).toContain('must be exactly');
+
     const raw = await submit({ name: 'leaky', url: 'https://example.com/mcp', headers: { 'X-A': 'ghp_deadbeef1234' } });
     expect(raw.error).toContain('raw credential');
   });

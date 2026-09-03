@@ -388,12 +388,42 @@ describe('add_mcp_server remote Streamable HTTP servers', () => {
     expect(expectRejected()).toMatch(/carries a raw credential/);
   });
 
-  it('shows the remote url unredacted on the card — it is credential-free by construction', async () => {
-    const url = 'https://hooks.example.com/s/abc123/mcp';
-    await submitAddMcpServer({ name: 'zapier', url }, session);
-    expect(lastQuestion()).toContain(`url: ${JSON.stringify(url)}`);
+  it('shows the remote url unredacted on the card — recognizable credentials are already rejected', async () => {
+    const url = 'https://mcp.deepwiki.com/mcp';
+    await submitAddMcpServer({ name: 'deepwiki2', url }, session);
+    const question = lastQuestion();
+    expect(question).toContain(`url: ${JSON.stringify(url)}`);
+    // An ordinary endpoint carries no warning.
+    expect(question).not.toContain('opaque');
     const [row] = getPendingApprovalsByAction('add_mcp_server');
     expect(JSON.parse(row.payload as string).url).toBe(url);
+  });
+
+  it('warns the approver about an opaque path segment instead of guessing at it', async () => {
+    // Token-shaped and tenant-id-shaped are the same string. The human already
+    // approving this is the only one who can tell, so name the segment.
+    const url = 'https://hooks.example.com/s/aB3xY9kLmN2pQ7rS/mcp';
+    await submitAddMcpServer({ name: 'zapier', url }, session);
+    const question = lastQuestion();
+    expect(question).toContain('opaque value');
+    expect(question).toContain('aB3xY9kLmN2pQ7rS');
+    expect(question).toContain('onecli-managed');
+    // Still approved, still persisted verbatim — the warning informs, it does
+    // not block.
+    const [row] = getPendingApprovalsByAction('add_mcp_server');
+    expect(JSON.parse(row.payload as string).url).toBe(url);
+  });
+
+  it('rejects a credential header that smuggles a real secret past the placeholder', async () => {
+    await submitAddMcpServer(
+      {
+        name: 'smuggle',
+        url: 'https://example.com/mcp',
+        headers: { Authorization: 'Bearer actual-secret onecli-managed' },
+      },
+      session,
+    );
+    expect(expectRejected()).toMatch(/must be exactly/);
   });
 
   it('carries OneCLI placeholder headers through to the payload and the card', async () => {

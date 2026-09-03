@@ -111,6 +111,12 @@ const HEADER_NAME_RE = /^[A-Za-z0-9!#$%&'*+.^_`|~-]{1,64}$/;
 /** Header names that carry a credential; these must use the OneCLI placeholder. */
 const CREDENTIAL_HEADER_RE = /(authorization|auth|token|secret|api[-_]?key|cookie|credential|bearer)/i;
 const ONECLI_PLACEHOLDER = 'onecli-managed';
+/**
+ * The ONLY accepted forms for a credential header: the bare placeholder, or a
+ * single auth-scheme token in front of it. A substring test accepted
+ * `Bearer real-secret onecli-managed`, persisting the real secret.
+ */
+const ONECLI_HEADER_VALUE_RE = new RegExp(`^(?:[A-Za-z][A-Za-z0-9-]* )?${ONECLI_PLACEHOLDER}$`);
 /** Shapes of real credentials that must never be written into container.json. */
 const RAW_SECRET_VALUE_RE = /(^|\s)(sk-|ghp_|github_pat_|xox[a-z]-|AKIA|-----BEGIN )/;
 
@@ -183,9 +189,9 @@ function parseMcpServerInput(args: Record<string, unknown>): { config: ParsedMcp
           error: `header "${key}" carries a raw credential; declare it as "${ONECLI_PLACEHOLDER}" and let the OneCLI gateway inject the real value`,
         };
       }
-      if (CREDENTIAL_HEADER_RE.test(key) && !value.includes(ONECLI_PLACEHOLDER)) {
+      if (CREDENTIAL_HEADER_RE.test(key) && !ONECLI_HEADER_VALUE_RE.test(value)) {
         return {
-          error: `header "${key}" is a credential header, so its value must contain "${ONECLI_PLACEHOLDER}" (e.g. "Bearer ${ONECLI_PLACEHOLDER}")`,
+          error: `header "${key}" is a credential header, so its value must be exactly "${ONECLI_PLACEHOLDER}" or an auth scheme followed by it (e.g. "Bearer ${ONECLI_PLACEHOLDER}")`,
         };
       }
       headers[key] = value;

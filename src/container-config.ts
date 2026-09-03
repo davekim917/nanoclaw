@@ -100,8 +100,43 @@ const HEADER_NAME_RE = /^[A-Za-z0-9!#$%&'*+.^_`|~-]{1,64}$/;
 const CREDENTIAL_HEADER_RE = /(authorization|auth|token|secret|api[-_]?key|cookie|credential|bearer)/i;
 /** The value the OneCLI gateway replaces at the proxy boundary. */
 const ONECLI_PLACEHOLDER = 'onecli-managed';
+/**
+ * The ONLY accepted forms for a credential header: the bare placeholder, or a
+ * single auth-scheme token in front of it (`Bearer onecli-managed`,
+ * `Key onecli-managed`). A substring test accepted
+ * `Bearer real-secret onecli-managed`, which persists the real secret while
+ * passing the rule that exists to stop exactly that.
+ */
+const ONECLI_HEADER_VALUE_RE = new RegExp(`^(?:[A-Za-z][A-Za-z0-9-]* )?${ONECLI_PLACEHOLDER}$`);
 /** Shapes of real credentials that must never be written into container.json. */
 const RAW_SECRET_VALUE_RE = /(^|\s)(sk-|ghp_|github_pat_|xox[a-z]-|AKIA|-----BEGIN )/;
+
+/**
+ * A path segment or query value long and mixed enough that it could be a
+ * bearer token — or could equally be a tenant id, workspace slug, or build
+ * hash. Nothing in the string distinguishes those, which is why this is NOT a
+ * rejection rule: a threshold strict enough to catch `/s/<token>/mcp` rejects
+ * hosted endpoints that carry a workspace id in the path, and one loose enough
+ * to admit those misses short tokens. It drives an explicit warning on the
+ * approval card instead, so the human already in the loop is told which
+ * segment to look at. The hard rejection stays on shapes we can actually
+ * recognize (`RAW_SECRET_VALUE_RE`) and on credential-named headers and query
+ * keys.
+ */
+export function looksOpaque(value: string): boolean {
+  if (value.length < 16) return false;
+  const classes = [/[a-z]/, /[A-Z]/, /[0-9]/].filter((re) => re.test(value)).length;
+  return classes >= 2 && !/[\s.]/.test(value);
+}
+
+/** Path segments and query values of `url` that a human should eyeball. */
+export function opaqueUrlParts(url: string): string[] {
+  const parsed = new URL(url);
+  return [
+    ...parsed.pathname.split('/').filter((seg) => looksOpaque(decodeURIComponent(seg))),
+    ...[...parsed.searchParams.values()].filter(looksOpaque),
+  ];
+}
 
 /** Throws unless `name` is a safe MCP server name (1-64 chars of [A-Za-z0-9_-]). */
 export function validateMcpServerName(name: string): void {
@@ -126,9 +161,9 @@ function parseMcpHeaders(raw: unknown): Record<string, string> {
         `header "${key}" carries a raw credential; declare it as "${ONECLI_PLACEHOLDER}" and let the OneCLI gateway inject the real value`,
       );
     }
-    if (CREDENTIAL_HEADER_RE.test(key) && !value.includes(ONECLI_PLACEHOLDER)) {
+    if (CREDENTIAL_HEADER_RE.test(key) && !ONECLI_HEADER_VALUE_RE.test(value)) {
       throw new Error(
-        `header "${key}" is a credential header, so its value must contain "${ONECLI_PLACEHOLDER}" (e.g. "Bearer ${ONECLI_PLACEHOLDER}") — the gateway substitutes the real secret at the proxy boundary`,
+        `header "${key}" is a credential header, so its value must be exactly "${ONECLI_PLACEHOLDER}" or an auth scheme followed by it (e.g. "Bearer ${ONECLI_PLACEHOLDER}") — the gateway substitutes the real secret at the proxy boundary`,
       );
     }
     headers[key] = value;

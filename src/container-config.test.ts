@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import {
   configFromDb,
+  opaqueUrlParts,
   parseMcpServerConfig,
   validateMcpServerName,
   readContainerConfig,
@@ -408,10 +409,27 @@ describe('parseMcpServerConfig', () => {
     });
   });
 
-  it('forces credential headers through the OneCLI placeholder', () => {
+  it('forces credential headers through the OneCLI placeholder, in an exact form', () => {
     expect(() =>
       parseMcpServerConfig({ url: 'https://example.com/mcp', headers: { Authorization: 'Bearer real' } }),
     ).toThrow(/onecli-managed/);
+    // A substring test accepted this: the real secret rides along and is
+    // persisted, while the rule that exists to stop it passes.
+    expect(() =>
+      parseMcpServerConfig({
+        url: 'https://example.com/mcp',
+        headers: { Authorization: 'Bearer actual-secret onecli-managed' },
+      }),
+    ).toThrow(/must be exactly/);
+    expect(() =>
+      parseMcpServerConfig({ url: 'https://example.com/mcp', headers: { Authorization: 'onecli-managed extra' } }),
+    ).toThrow(/must be exactly/);
+    // The two legal shapes.
+    for (const value of ['onecli-managed', 'Bearer onecli-managed', 'Key onecli-managed']) {
+      expect(parseMcpServerConfig({ url: 'https://example.com/mcp', headers: { Authorization: value } })).toMatchObject(
+        { headers: { Authorization: value } },
+      );
+    }
     expect(() =>
       parseMcpServerConfig({ url: 'https://example.com/mcp', headers: { 'X-Thing': 'ghp_deadbeef1234' } }),
     ).toThrow(/raw credential/);
@@ -430,6 +448,27 @@ describe('parseMcpServerConfig', () => {
     expect(() => validateMcpServerName('ok_name-1')).not.toThrow();
     for (const bad of ['', 'has space', 'dot.name', 'a'.repeat(65)]) {
       expect(() => validateMcpServerName(bad)).toThrow(/1-64 characters/);
+    }
+  });
+});
+
+describe('opaqueUrlParts', () => {
+  it('names path segments and query values a human should eyeball', () => {
+    // These are token-shaped, but equally tenant-id-shaped — nothing in the
+    // string separates the two, which is why they warn rather than reject.
+    expect(opaqueUrlParts('https://hooks.example.com/s/aB3xY9kLmN2pQ7rS/mcp')).toEqual(['aB3xY9kLmN2pQ7rS']);
+    expect(opaqueUrlParts('https://example.com/mcp?workspace=aB3xY9kLmN2pQ7rS')).toEqual(['aB3xY9kLmN2pQ7rS']);
+  });
+
+  it('stays quiet on ordinary endpoints, including the ones this install already wires', () => {
+    for (const url of [
+      'https://mcp.deepwiki.com/mcp',
+      'https://app.datafold.com/mcp/',
+      'https://mcp.linear.app/mcp',
+      'https://mcp.exa.ai/mcp?tools=web_search_exa,web_fetch_exa',
+      'https://example.com/v1/acme-engineering/mcp',
+    ]) {
+      expect(opaqueUrlParts(url)).toEqual([]);
     }
   });
 });

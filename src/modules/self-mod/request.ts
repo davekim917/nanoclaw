@@ -14,7 +14,12 @@
  */
 import { createHash } from 'node:crypto';
 
-import { parseMcpServerConfig, validateMcpServerName, type ParsedMcpServerConfig } from '../../container-config.js';
+import {
+  opaqueUrlParts,
+  parseMcpServerConfig,
+  validateMcpServerName,
+  type ParsedMcpServerConfig,
+} from '../../container-config.js';
 import { getAgentGroup } from '../../db/agent-groups.js';
 import { log } from '../../log.js';
 import type { Session } from '../../types.js';
@@ -167,6 +172,7 @@ export async function requestAddMcpServerHold(content: Record<string, unknown>, 
   const serverConfig = parseMcpServerConfig(content);
 
   let fields: string[];
+  let opaqueWarning = '';
   if (serverConfig.type === 'http') {
     // No redaction on the URL: `parseMcpServerConfig` rejects a credential in
     // the path, the query, or a header before we get here, so the card shows
@@ -180,6 +186,19 @@ export async function requestAddMcpServerHold(content: Record<string, unknown>, 
     ];
     if (serverConfig.headers !== undefined) {
       fields.push(`headers: ${escapeInvisibles(JSON.stringify(serverConfig.headers))}`);
+    }
+    // Recognizable credential shapes are already rejected at parse. What is
+    // left is the unclassifiable case: an opaque path segment or query value
+    // that is either a tenant id or a bearer token, with nothing in the string
+    // to tell them apart. Name it for the human who is already approving this,
+    // rather than guessing in a regex — the URL is persisted verbatim.
+    const opaque = opaqueUrlParts(serverConfig.url);
+    if (opaque.length > 0) {
+      opaqueWarning =
+        `\n⚠️ This URL carries ${opaque.length === 1 ? 'an opaque value' : 'opaque values'} ` +
+        `(${opaque.map((v) => escapeInvisibles(JSON.stringify(v))).join(', ')}). ` +
+        'If any of those is a credential, reject this and have the server use a header with the "onecli-managed" ' +
+        'placeholder instead — the URL is stored verbatim in container.json.';
     }
   } else {
     const args = serverConfig.args ?? [];
@@ -209,7 +228,11 @@ export async function requestAddMcpServerHold(content: Record<string, unknown>, 
   // in a code fence — no payload content can add lines to the card, spoof
   // another field, or break out of the fence.
   const question =
-    `Agent "${agentGroup.name}" is attempting to add a new MCP server:\n` + '```\n' + fields.join('\n') + '\n```';
+    `Agent "${agentGroup.name}" is attempting to add a new MCP server:\n` +
+    '```\n' +
+    fields.join('\n') +
+    '\n```' +
+    opaqueWarning;
   if (Buffer.byteLength(question, 'utf8') > MCP_APPROVAL_CARD_MAX_BYTES) {
     await notifyAgent(
       session,
