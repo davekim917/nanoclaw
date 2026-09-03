@@ -83,7 +83,57 @@ describe('extractSlackRawText', () => {
     expect(extractSlackRawText({ attachments: [{ blocks: [{ type: 'table', rows: 'bad' }] }] })).toBeNull();
   });
 
+  const cellRaw = (elements: unknown[]) => ({
+    attachments: [
+      {
+        blocks: [
+          {
+            type: 'table',
+            rows: [[{ type: 'rich_text', elements: [{ type: 'rich_text_section', elements }] }]],
+          },
+        ],
+      },
+    ],
+  });
+
   it('renders rich_text elements that carry no `text` field', () => {
+    // Slack's own spacing lives in the text runs between the elements.
+    const raw = cellRaw([
+      { type: 'user', user_id: 'U9' },
+      { type: 'text', text: ' shipped ' },
+      { type: 'emoji', name: 'tada', unicode: '1f389' },
+      { type: 'text', text: ' to ' },
+      { type: 'channel', channel_id: 'C7' },
+      { type: 'text', text: ', cc ' },
+      { type: 'usergroup', usergroup_id: 'S3' },
+      { type: 'text', text: ' ' },
+      { type: 'broadcast', range: 'here' },
+      { type: 'text', text: ' — see ' },
+      { type: 'link', url: 'https://example.com/report' },
+      { type: 'text', text: ' and ' },
+      { type: 'link', url: 'https://example.com/x', text: 'the labeled one' },
+    ]);
+
+    expect(extractSlackRawText(raw)).toBe(
+      '<@U9> shipped \u{1F389} to <#C7>, cc <!subteam^S3> @here \u2014 see https://example.com/report and the labeled one',
+    );
+  });
+
+  it('falls back to :name: when an emoji carries no unicode codepoints', () => {
+    expect(extractSlackRawText(cellRaw([{ type: 'emoji', name: 'shipit' }]))).toBe(':shipit:');
+  });
+
+  it('does not invent whitespace between adjacent runs of one word', () => {
+    // `**AC**ME` reaches us as two adjacent text runs. Joining on a space
+    // would recover it as "AC ME".
+    const raw = cellRaw([
+      { type: 'text', text: 'AC', style: { bold: true } },
+      { type: 'text', text: 'ME' },
+    ]);
+    expect(extractSlackRawText(raw)).toBe('ACME');
+  });
+
+  it('separates structural sections, and keeps a cell to one line', () => {
     const raw = {
       attachments: [
         {
@@ -95,19 +145,9 @@ describe('extractSlackRawText', () => {
                   {
                     type: 'rich_text',
                     elements: [
-                      {
-                        type: 'rich_text_section',
-                        elements: [
-                          { type: 'user', user_id: 'U9' },
-                          { type: 'emoji', name: 'tada', unicode: '1f389' },
-                          { type: 'emoji', name: 'shipit' },
-                          { type: 'channel', channel_id: 'C7' },
-                          { type: 'usergroup', usergroup_id: 'S3' },
-                          { type: 'broadcast', range: 'here' },
-                          { type: 'link', url: 'https://example.com/report' },
-                          { type: 'link', url: 'https://example.com/x', text: 'labeled' },
-                        ],
-                      },
+                      { type: 'rich_text_section', elements: [{ type: 'text', text: 'first' }] },
+                      { type: 'rich_text_section', elements: [{ type: 'text', text: 'second' }] },
+                      { type: 'rich_text_preformatted', elements: [{ type: 'text', text: 'a\nb' }] },
                     ],
                   },
                 ],
@@ -117,10 +157,7 @@ describe('extractSlackRawText', () => {
         },
       ],
     };
-
-    expect(extractSlackRawText(raw)).toBe(
-      '<@U9> \u{1F389} :shipit: <#C7> <!subteam^S3> @here https://example.com/report labeled',
-    );
+    expect(extractSlackRawText(raw)).toBe('first second a b');
   });
 
   it('returns null for a table whose cells are all empty', () => {

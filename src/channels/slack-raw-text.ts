@@ -64,21 +64,45 @@ function elementText(node: Record<string, unknown>): string | null {
   }
 }
 
+/**
+ * Structural containers inside a rich_text tree. Slack's TEXT runs already
+ * carry their own spacing — `**AC**ME` is two adjacent runs "AC" and "ME" —
+ * so leaves are concatenated with nothing between them, and a separator is
+ * inserted only when a new section, list item or quote begins.
+ */
+const RICH_TEXT_SECTIONS = new Set([
+  'rich_text_section',
+  'rich_text_list',
+  'rich_text_quote',
+  'rich_text_preformatted',
+]);
+
 /** Collect the readable leaves in a Slack cell's raw_text/rich_text subtree. */
 function cellText(value: unknown): string {
-  const parts: string[] = [];
+  let out = '';
   const visit = (node: unknown): void => {
     if (Array.isArray(node)) {
       node.forEach(visit);
       return;
     }
     if (!isRecord(node)) return;
+    if (typeof node.type === 'string' && RICH_TEXT_SECTIONS.has(node.type) && out !== '' && !/\s$/.test(out)) {
+      out += ' ';
+    }
     const rendered = elementText(node);
-    if (rendered) parts.push(rendered);
+    if (rendered !== null) {
+      // A rendered node is a leaf in Slack's schema (`text` and the id-bearing
+      // fields only ever appear on leaves), so its own values carry nothing
+      // further to collect.
+      out += rendered;
+      return;
+    }
     Object.values(node).forEach(visit);
   };
   visit(value);
-  return parts.join(' ').trim();
+  // One line per cell: a cell built from a list or a preformatted block can
+  // carry newlines, which would break the `a | b` row projection.
+  return out.replace(/\s+/g, ' ').trim();
 }
 
 export function extractSlackRawText(raw: Record<string, unknown>): string | null {
