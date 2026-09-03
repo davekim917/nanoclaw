@@ -28,6 +28,18 @@ export interface HostWorkContinuation {
   recovery_episode: number;
 }
 
+/**
+ * Is a `work_continuation` row present at all?
+ *
+ * Deliberately NOT `readWorkContinuation() !== null`: that one validates the
+ * record and answers null for a malformed one. The reclaim/GC gate wants the
+ * conservative question — anything written there is work someone promised —
+ * so a record this module would reject still retains the session's storage.
+ */
+export function hasWorkContinuationRow(outDb: Database.Database): boolean {
+  return outDb.prepare("SELECT 1 FROM session_state WHERE key = 'work_continuation'").get() !== undefined;
+}
+
 export function canAttemptContinuationRecovery(continuation: HostWorkContinuation): boolean {
   return continuation.resume_attempts < WORK_CONTINUATION_RESUME_MAX_ATTEMPTS;
 }

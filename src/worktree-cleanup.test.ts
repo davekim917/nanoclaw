@@ -16,7 +16,8 @@ const state = vi.hoisted(() => ({
   unreadable: new Set<string>(),
 }));
 
-vi.mock('./config.js', () => ({
+vi.mock('./config.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./config.js')>()),
   get DATA_DIR() {
     return state.dataDir;
   },
@@ -28,26 +29,30 @@ vi.mock('./container-runner.js', () => ({
 vi.mock('./db/connection.js', () => ({
   getDb: () => ({ prepare: () => ({ all: () => state.rows }) }),
 }));
-vi.mock('./session-manager.js', () => ({
-  inboundDbPath: (agentGroupId: string, sessionId: string) =>
-    path.join(state.dataDir, 'v2-sessions', agentGroupId, sessionId, 'inbound.db'),
-  openOutboundDb: (_agentGroupId: string, sessionId: string) => {
+// The GC's reclaim gate reads outbound state through the mailbox module's own
+// open funnel (it is synchronous; the seam's session() is not), so the funnel
+// and the module ops are what this suite substitutes.
+vi.mock('./modules/mailbox/openers.js', () => ({
+  openOutboundDb: (dbPath: string) => {
+    const sessionId = String(dbPath).split('/').at(-2)!;
     if (state.unreadable.has(sessionId)) throw new Error('persisted state unavailable');
-    return {
-      sessionId,
-      prepare: () => ({ get: () => (state.continuations.has(sessionId) ? { value: '1' } : undefined) }),
-      close: () => undefined,
-    };
+    return { sessionId, close: () => undefined };
   },
 }));
-vi.mock('./db/session-db.js', () => ({
+vi.mock('./modules/mailbox/ops/sweep.js', () => ({
   getProcessingClaims: (db: { sessionId: string }) => (state.processing.has(db.sessionId) ? [{}] : []),
   getContainerState: (db: { sessionId: string }) => ({
     current_tool: state.tools.has(db.sessionId) ? 'git' : null,
   }),
 }));
-vi.mock('./log.js', () => ({
-  log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
+vi.mock('./modules/mailbox/ops/continuation.js', () => ({
+  hasWorkContinuationRow: (db: { sessionId: string }) => state.continuations.has(db.sessionId),
+}));
+// Spread the real module: the mailbox module barrel (imported for the session
+// path helper) pulls in code that uses more of log.js than these four levels.
+vi.mock('./log.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./log.js')>()),
+  log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn(), fatal: vi.fn() },
 }));
 
 import { log } from './log.js';
