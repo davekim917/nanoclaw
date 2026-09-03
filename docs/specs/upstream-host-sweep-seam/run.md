@@ -90,7 +90,11 @@ Rejected in whole: none. Rejected in part: F3's remedy (later-window backoff), w
 - Sizing: S2-PR2 1.5 → 1.75 agent-weeks (exclusive-chain semantics, the nested driver spec, per-boundary classification, three surfaces). Series 11.65 → 11.9 before overhead, ≈ **15.5 agent-weeks** at ×1.3. Calendar unchanged at 5–7 weeks.
 - Acceptance cases 65 → **67** (R-2b and F-10.5 added; F-3.2, F-10.2, F-10.4, F-10.6, R-2, R-4, R-5, R-6, R-10, R-11 and T-2 rewritten).
 
-### Gating revision (rev 2.1, 2026-09-03)
+### Gating revision (rev 2.2, 2026-09-03)
+
+Reverses rev 2.1's PR 7 gate. The mailbox session confirmed that PR 7 changes only the internals of `modules/claims/self-heal.ts` and `modules/scheduling/{create,live-count}.ts` — their exported functions take ids, not handles, and *exported signatures unchanged* is pinned as a hard constraint on PR 7, with a builder who must break one required to stop and report. S2-PR6 therefore returns to gating on S2-PR2 (mailbox PR 5 via the base branch) and S2-PR11 to gating on **mailbox PR 4**, which is what rev 2 had: PR 11's gate was never PR 5, it is the four legacy-handle bridge sites (`host-script`, `admitDueTaskContexts`, `thread-close`, `recurrence`) that PR 4 owns. Nothing in the series waits for PR 7. The rev 2.1 branch-point note and the PR 6 `db/usage.ts` confirmation are unchanged.
+
+### Gating revision (rev 2.1, 2026-09-03, superseded above)
 
 Gating table only — no design change, no acceptance-case change, no re-review. S2-PR6 and S2-PR11 now wait for mailbox **PR 7**, which empties the last host allowlist entries: `src/modules/claims/self-heal.ts` and `src/modules/scheduling/{create,live-count}.ts` are all still listed at PR 6's head (`origin/feat/mailbox-seam-pr6-operator-surfaces:src/mailbox/RATCHET.json`, 41 entries, verified), and those two families call them, so their signatures may change. Also recorded: PR 2+ must branch from mailbox PR 5's post-linearization head rather than a remembered sha (#271 is being rebased onto PR 3; `5324df6c` is not a valid base), and the `db/usage.ts` prerequisite is confirmed **complete** on PR 6 at `75c24b52` — `rollupSessionUsage` takes `Pick<NanoclawMailboxSession, 'listTurnUsageSince'>` at `src/db/usage.ts:118-124`, reading through `src/modules/mailbox/ops/reads.ts`.
 
