@@ -366,6 +366,54 @@ describe('NanoclawAgentMailbox', () => {
     }
   });
 
+  it('a session with only inbound.db exists, and its outbound reads degrade instead of failing', async () => {
+    const key = freshKey();
+    const mailbox = getAgentMailbox();
+    mailbox.prepare(key);
+    // The never-woken cohort: outbound.db is the CONTAINER's file, and a
+    // session that never spawned one has only ever had inbound.db. Requiring
+    // both files made every read path skip these sessions entirely — their
+    // task admission and due-message handling stopped, and a repository
+    // transition left their ingress unfenced while it still took host writes.
+    fs.rmSync(dbPath(key, 'outbound'));
+
+    expect(await mailbox.exists(key)).toBe(true);
+
+    const observed = await mailbox.session(key, async (m) => {
+      const session = fork(m);
+      await m.insertMessage(message('m-inbound-only'));
+      // Inbound work is unaffected.
+      expect(m.countDueMessages()).toBe(1);
+      // Nothing outbound blows up; every read answers empty.
+      session.syncProcessingAcks();
+      return {
+        hasOutbound: session.hasOutbound(),
+        claims: session.getProcessingClaimRows(),
+        containerState: session.getContainerState(),
+        continuation: session.readWorkContinuation(),
+        barrierAck: session.readRepositoryMountBarrierAck(),
+        lastOutboundAt: session.latestOutboundTimestamp(),
+        due: session.getDueOutboundMessages(),
+        noticed: session.outboundHasContentLike('anything'),
+        answered: session.hasNonStatusReplyTo('m-inbound-only'),
+      };
+    });
+
+    expect(observed).toEqual({
+      hasOutbound: false,
+      claims: [],
+      containerState: null,
+      continuation: null,
+      barrierAck: null,
+      lastOutboundAt: null,
+      due: [],
+      noticed: false,
+      answered: false,
+    });
+    // The read path did not provision the file it found missing (invariant I-4).
+    expect(fs.existsSync(dbPath(key, 'outbound'))).toBe(false);
+  });
+
   it('syncProcessingAcks applies terminal acks from outbound to inbound in one session', async () => {
     const key = freshKey();
     const mailbox = getAgentMailbox();

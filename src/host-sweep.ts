@@ -1520,6 +1520,8 @@ async function sweepSession(session: Session): Promise<number | null> {
     admittedTasks: number;
     workContinuation: HostWorkContinuation | null;
     continuationWakeEligible: boolean;
+    /** False for a never-woken session that has only ever had an inbound.db. */
+    hasOutbound: boolean;
   }
 
   let plan: WakePlan | undefined;
@@ -1577,11 +1579,14 @@ async function sweepSession(session: Session): Promise<number | null> {
       //
       // Still a raw-handle callee: `dashboard/thread-close.ts` moves behind the
       // seam in PR 3, and this line becomes `syncDoneProposalMirror(session.id)`
-      // then. It only reads.
-      try {
-        syncDoneProposalMirror(session.id, mailbox.legacyOutboundHandle());
-      } catch (err) {
-        log.warn('done_proposal mirror failed', { sessionId: session.id, err });
+      // then. It only reads. Guarded on `hasOutbound` because a raw handle is
+      // the one thing the module cannot degrade for a never-woken session.
+      if (mailbox.hasOutbound()) {
+        try {
+          syncDoneProposalMirror(session.id, mailbox.legacyOutboundHandle());
+        } catch (err) {
+          log.warn('done_proposal mirror failed', { sessionId: session.id, err });
+        }
       }
 
       if (
@@ -1611,7 +1616,14 @@ async function sweepSession(session: Session): Promise<number | null> {
           lastRecoveryAttemptAtMs: mailbox.readContinuationRecoveryAttemptAt(workContinuation),
         });
 
-      return { dueCount, wakePriority, admittedTasks, workContinuation, continuationWakeEligible };
+      return {
+        dueCount,
+        wakePriority,
+        admittedTasks,
+        workContinuation,
+        continuationWakeEligible,
+        hasOutbound: mailbox.hasOutbound(),
+      };
     });
   } catch (err) {
     if (err instanceof SessionDbMissingError) return skipUnreadable(session.id, 'session mailbox vanished');
@@ -1661,7 +1673,10 @@ async function sweepSession(session: Session): Promise<number | null> {
   // had a chance to clear stale processing_ack rows from a previous crash
   // yet. Without this grace period, stale claims cause an immediate
   // spawn-kill loop.
-  if (alive && !justWoke) {
+  // `hasOutbound` reproduces the pre-seam `outDb !== null` guard exactly: a
+  // session with no outbound.db has no container state, no claims and no
+  // telemetry to enforce an SLA against, and the reap decisions all read it.
+  if (alive && !justWoke && plan.hasOutbound) {
     const observed = await run((mailbox) => ({
       containerState: mailbox.getContainerState(),
       processingClaimCount: mailbox.getProcessingClaimRows().length,
@@ -1720,7 +1735,7 @@ async function sweepSession(session: Session): Promise<number | null> {
     // 7. Retry cleanup if the pre-wake orphan-claim clear could not finish.
     // resetStuckProcessingRows is idempotent: future retries are not bumped
     // again, and already-cleared claim sets are a no-op.
-    if (!alive) resetStuckProcessingRows(mailbox, session, 'container not running');
+    if (!alive && plan.hasOutbound) resetStuckProcessingRows(mailbox, session, 'container not running');
 
     // 8. Recurrence fanout for completed recurring tasks.
     // MODULE-HOOK:scheduling-recurrence:start
