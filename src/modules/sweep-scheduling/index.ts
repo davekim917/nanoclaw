@@ -71,6 +71,12 @@ async function prepareDueWake(
   // and moves behind the seam in PR 7. `legacyInboundHandle` survives here for
   // that one call and nothing else — which is why this file, and not
   // `host-sweep.ts`, is what carries the entry on the mailbox-seam ratchet.
+  //
+  // REMOVAL TRIGGER: drop this file from `src/mailbox/RATCHET.json` at the
+  // rebase onto the mailbox PR that converts `admitDueTaskContexts` (PR 7, per
+  // the bridge table in docs/specs/upstream-host-sweep-seam/plan.md §5). After
+  // that, nothing in this file may touch a raw handle — the allowlist entry
+  // exists for this one call site and expires with it.
   await runHostGatedTaskScripts(mailbox, sessionId);
   const admittedTasks = admitDueTaskContexts(mailbox.legacyInboundHandle(), agentGroupId, sessionId);
   const dueCount = mailbox.countDueMessages();
