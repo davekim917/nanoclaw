@@ -16,7 +16,7 @@ import { createHash } from 'crypto';
 import { registerDeliveryAction, type DeliveryActionResult } from '../../delivery.js';
 import { unguarded } from '../../guard/index.js';
 import { log } from '../../log.js';
-import { withMailboxSession } from '../../session-manager.js';
+import { withExistingMailboxSession } from '../../session-manager.js';
 import type { Session } from '../../types.js';
 
 const MAX_PROMPT_CHARS = 2000;
@@ -62,14 +62,19 @@ export async function applyScheduleWake(
   // lookup, the routing fallback and the deferred insert are one logical step
   // against the caller's own inbound queue, and delivery holds no session
   // while a handler runs (plan §4.5b). The rejection throws from inside the
-  // action so the anchor check still precedes the insert; `withMailboxSession`
-  // closes its handles on the way out.
+  // action so the anchor check still precedes the insert; the helper closes
+  // its handles on the way out.
+  //
+  // Existing-only, never provisioning: `prepare()` would open the
+  // container-owned outbound.db read-write to apply its schema, and this
+  // request was read out of that very mailbox, so it exists. A session that
+  // has vanished has nothing left to wake.
   const effectiveWakeId =
     wakeId ||
     `legacy-${createHash('sha256').update(`${session.id}\0${processAfterRaw}\0${prompt}`).digest('hex').slice(0, 32)}`;
   const processAfter = new Date(Math.max(fireAtMs, now)).toISOString();
 
-  const inserted = await withMailboxSession(session.agent_group_id, session.id, (mailbox) => {
+  const inserted = await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) => {
     const anchoredRouting = inReplyTo ? mailbox.getInboundRoutingAnchor(inReplyTo) : null;
     if (inReplyTo && !anchoredRouting) {
       log.warn('schedule_wake rejected: reply anchor is not in the caller session', {
@@ -101,6 +106,11 @@ export async function applyScheduleWake(
       recurrence: null,
     });
   });
+
+  if (inserted === undefined) {
+    log.warn('schedule_wake rejected: session mailbox is gone', { sessionId: session.id });
+    throw new Error('schedule_wake rejected: session mailbox is gone');
+  }
 
   log.info(inserted ? 'schedule_wake queued' : 'schedule_wake replay ignored', {
     sessionId: session.id,

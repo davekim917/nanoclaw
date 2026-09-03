@@ -36,7 +36,12 @@ import {
   type RepositoryWorkUnit,
 } from '../../repository-workspaces.js';
 import { observedOriginsSha256 } from '../../repository-migration-recovery.js';
-import { openOutboundDb, sessionDir, withMailboxSession, writeSessionMessageIfNew } from '../../session-manager.js';
+import {
+  openOutboundDb,
+  sessionDir,
+  withExistingMailboxSession,
+  writeSessionMessageIfNew,
+} from '../../session-manager.js';
 import { safeGitArgs, safeGitConfigGet, safeGitEnv } from '../../safe-git.js';
 import type { Session } from '../../types.js';
 
@@ -481,11 +486,16 @@ export async function transferRepositoryWorktree(
  * Opens its own short mailbox session. This runs on the detached job chain,
  * by which time the drain that dispatched the action has long returned, and
  * delivery holds no session while a handler runs (plan §4.5b).
+ *
+ * Existing-only, never provisioning: `prepare()` would open the
+ * container-owned outbound.db read-write to apply its schema, and the request
+ * this answers was read out of that very mailbox, so it exists. A session that
+ * has vanished has no container left to read the answer.
  */
 async function response(session: Session, requestId: string, ok: boolean, message: string): Promise<void> {
   const id = `repository-action-response-${requestId}`;
-  await withMailboxSession(session.agent_group_id, session.id, async (mailbox) => {
-    if (mailbox.inboundHasMessage(id)) return;
+  const written = await withExistingMailboxSession(session.agent_group_id, session.id, async (mailbox) => {
+    if (mailbox.inboundHasMessage(id)) return true;
     await mailbox.insertMessage({
       id,
       kind: 'system',
@@ -498,7 +508,11 @@ async function response(session: Session, requestId: string, ok: boolean, messag
       recurrence: null,
       trigger: 0,
     });
+    return true;
   });
+  if (written === undefined) {
+    log.warn('Repository action response dropped — session mailbox is gone', { requestId, sessionId: session.id });
+  }
 }
 
 function assertRepositoryRequestId(requestId: string): void {

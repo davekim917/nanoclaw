@@ -15,7 +15,7 @@ import type { PendingApproval, Session } from './types.js';
  *
  * Same two-argument contract as `DeliveryActionHandler` since the mailbox
  * seam removed the session handle (plan §4.5b): a handler that needs session
- * state opens its own `withMailboxSession`. That is what makes an approved
+ * state opens its own mailbox session. That is what makes an approved
  * replay identical to a fresh dispatch — the replay runs long after the drain
  * that raised the hold, and there was never a handle it could have carried.
  */
