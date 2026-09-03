@@ -362,6 +362,10 @@ describe('resolveSlackConversation', () => {
   const bob = { ok: true, user: { name: 'bob', real_name: 'Bob Bobson' } };
   const botMember = { ok: true, user: { name: 'nano', is_bot: true } };
   const deactivated = { ok: true, user: { name: 'ghost', deleted: true } };
+  // A Slack app identity sets is_app_user, NOT is_bot — the shape the mention
+  // directory already filters on.
+  const appUser = { ok: true, user: { name: 'zapier', is_app_user: true } };
+  const slackbot = { ok: true, user: { name: 'slackbot' } };
 
   function client(
     channel: Record<string, unknown> | undefined,
@@ -391,12 +395,19 @@ describe('resolveSlackConversation', () => {
     await expect(resolveSlackConversation(c, 'slack:D1')).resolves.toEqual({ type: 'direct', name: 'Alice' });
   });
 
-  it('names the human participants of a group DM, excluding bots and deactivated members', async () => {
+  it('names the human participants of a group DM, excluding bots, app users and deactivated members', async () => {
     const c = client(
       { is_mpim: true, name: 'mpdm-alice--bob--nano-1' },
       {
-        members: ['U-alice', 'U-bob', 'U-bot', 'U-ghost'],
-        users: { 'U-alice': alice, 'U-bob': bob, 'U-bot': botMember, 'U-ghost': deactivated },
+        members: ['U-alice', 'U-bob', 'U-bot', 'U-ghost', 'U-appuser', 'USLACKBOT'],
+        users: {
+          'U-alice': alice,
+          'U-bob': bob,
+          'U-bot': botMember,
+          'U-ghost': deactivated,
+          'U-appuser': appUser,
+          USLACKBOT: slackbot,
+        },
       },
     );
     await expect(resolveSlackConversation(c, 'slack:G1')).resolves.toEqual({

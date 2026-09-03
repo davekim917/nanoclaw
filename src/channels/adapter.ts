@@ -190,6 +190,21 @@ export function formatParticipantList(names: string[]): string {
   return extra > 0 ? `${joined} +${extra} more` : joined;
 }
 
+/**
+ * The one name to show for a classified conversation. A group DM has no name
+ * a human recognizes, so it is named by who is in it; everything else keeps
+ * the name the platform gave it. Null when nothing nameable came back.
+ *
+ * Lives beside the interface for the same reason as formatParticipantList:
+ * the adapter that produces the classification and the core surfaces that
+ * persist or render it must not each grow their own version.
+ */
+export function conversationDisplayName(conversation: ChannelConversation): string | null {
+  if (conversation.type !== 'group_dm') return conversation.name;
+  const names = conversation.participantNames;
+  return names && names.length > 0 ? `Group DM: ${formatParticipantList(names)}` : null;
+}
+
 /** Wiring/mg defaults for one conversation context (DM vs group/channel). */
 export interface ChannelContextDefaults {
   /** Default engage_mode for wirings created in this context. */

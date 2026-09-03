@@ -32,7 +32,7 @@ import { readEnvFileMatching } from '../env.js';
 import { log } from '../log.js';
 import { markdownHeadingsToBold } from '../text-styles.js';
 import { createChatSdkBridge } from './chat-sdk-bridge.js';
-import { formatParticipantList } from './adapter.js';
+import { conversationDisplayName } from './adapter.js';
 import type {
   ChannelConversation,
   ChannelDefaults,
@@ -152,6 +152,22 @@ export function slackHopInboundFilter(
 }
 
 /**
+ * Is this workspace member a human we would name to another human?
+ *
+ * Bots, Slack app users, Slackbot and deactivated accounts are not. Shared by
+ * the mention directory (syncSlackWorkspaceHumans) and the group-DM roster so
+ * the two cannot drift — `is_app_user` without `is_bot` is a real Slack shape,
+ * and an app identity listed as a participant on an approval card reads as a
+ * person who is not there.
+ */
+export function isSlackHumanMember(
+  userId: string,
+  member: { is_bot?: boolean; is_app_user?: boolean; deleted?: boolean },
+): boolean {
+  return !member.is_bot && !member.is_app_user && !member.deleted && userId !== 'USLACKBOT';
+}
+
+/**
  * Fetch the workspace's human members and register them for outbound
  * mention resolution. Bots/apps/deleted users are excluded — bot mentions
  * resolve through the sibling-bot registry, and Slackbot is never a target.
@@ -165,7 +181,7 @@ async function syncSlackWorkspaceHumans(client: WebClient, teamId: string, chann
     do {
       const res = await client.users.list({ limit: 200, cursor });
       for (const m of res.members ?? []) {
-        if (!m.id || m.deleted || m.is_bot || m.is_app_user || m.id === 'USLACKBOT') continue;
+        if (!m.id || !isSlackHumanMember(m.id, m)) continue;
         humans.push({
           userId: m.id,
           username: m.name ?? '',
@@ -432,14 +448,18 @@ async function resolveMpdmParticipants(client: SlackConversationClient, channelI
     members.map((userId) => client.users!.info({ user: userId }).catch(() => ({ ok: false }) as { ok?: boolean })),
   );
   const names: string[] = [];
-  for (const res of users) {
+  for (const [index, res] of users.entries()) {
     const u = (
       res as {
         ok?: boolean;
-        user?: Parameters<typeof slackUserDisplayName>[0] & { is_bot?: boolean; deleted?: boolean };
+        user?: Parameters<typeof slackUserDisplayName>[0] & {
+          is_bot?: boolean;
+          is_app_user?: boolean;
+          deleted?: boolean;
+        };
       }
     ).user;
-    if (!res.ok || !u || u.is_bot || u.deleted) continue;
+    if (!res.ok || !u || !isSlackHumanMember(members[index]!, u)) continue;
     const name = slackUserDisplayName(u);
     if (name) names.push(name);
   }
@@ -464,10 +484,7 @@ export async function slackChannelDisplayName(
   platformId: string,
 ): Promise<string | null> {
   const conversation = await resolveSlackConversation(client, platformId);
-  if (!conversation) return null;
-  if (conversation.type !== 'group_dm') return conversation.name;
-  const names = conversation.participantNames;
-  return names && names.length > 0 ? `Group DM: ${formatParticipantList(names)}` : null;
+  return conversation ? conversationDisplayName(conversation) : null;
 }
 
 export function parseSlackWorkspaces(env: Record<string, string>): SlackWorkspace[] {

@@ -53,7 +53,7 @@ import { getMessagingGroup, updateMessagingGroup } from '../../db/messaging-grou
 import { getDeliveryAdapter } from '../../delivery.js';
 import { initGroupFilesystem } from '../../group-init.js';
 import { log } from '../../log.js';
-import { formatParticipantList } from '../../channels/adapter.js';
+import { conversationDisplayName, formatParticipantList } from '../../channels/adapter.js';
 import type { ChannelConversation, InboundEvent } from '../../channels/adapter.js';
 import type { AgentGroup } from '../../types.js';
 import { pickApprovalDelivery, pickApprover } from '../approvals/primitive.js';
@@ -264,15 +264,23 @@ export async function requestChannelApproval(input: RequestChannelApprovalInput)
         /* non-critical — the card falls back to generic rendering */
       }
     }
-    if (!originMg.name && channelAdapter?.resolveChannelName) {
-      try {
-        const name = await channelAdapter.resolveChannelName(originMg.platform_id);
-        if (name) {
-          updateMessagingGroup(originMg.id, { name });
-          originMg.name = name;
+    if (!originMg.name) {
+      // The classification above already carries the name — deriving it here
+      // is what keeps this to ONE round trip. `resolveChannelName` is the
+      // fallback for an adapter without the rich seam, or one whose lookup
+      // failed; for Slack it would repeat conversations.info, conversations.
+      // members and every users.info call.
+      let name = conversation ? conversationDisplayName(conversation) : null;
+      if (!conversation && channelAdapter?.resolveChannelName) {
+        try {
+          name = await channelAdapter.resolveChannelName(originMg.platform_id);
+        } catch {
+          /* non-critical */
         }
-      } catch {
-        /* non-critical */
+      }
+      if (name) {
+        updateMessagingGroup(originMg.id, { name });
+        originMg.name = name;
       }
     }
   }

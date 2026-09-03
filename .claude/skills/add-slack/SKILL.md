@@ -92,11 +92,11 @@ receive a message until this is done. For Socket Mode, tell the user:
 ```nc:operator when:connection=socket
 Create the Slack app (Socket Mode):
 1. Go to api.slack.com/apps → Create New App → From scratch. Name it (e.g. "NanoClaw") and pick your workspace.
-2. OAuth & Permissions → add these Bot Token Scopes: chat:write, im:write, channels:history, groups:history, im:history, channels:read, groups:read, users:read, reactions:write, files:read, files:write.
+2. OAuth & Permissions → add these Bot Token Scopes: chat:write, im:write, channels:history, groups:history, im:history, mpim:history, channels:read, groups:read, mpim:read, users:read, reactions:write, files:read, files:write. (The `mpim:*` pair is what lets the bot see and name group DMs; without them a group DM never reaches it.)
 3. App Home → enable the Messages Tab, and check "Allow users to send Slash commands and messages from the messages tab."
 4. Basic Information → App-Level Tokens → "Generate Token and Scopes" → add the connections:write scope → copy the token (starts with xapp-).
 5. Socket Mode → toggle "Enable Socket Mode" on.
-6. Event Subscriptions → toggle "Enable Events" on, then under "Subscribe to bot events" add: message.channels, message.groups, message.im, app_mention. Save Changes. (No Request URL is needed in Socket Mode.)
+6. Event Subscriptions → toggle "Enable Events" on, then under "Subscribe to bot events" add: message.channels, message.groups, message.im, message.mpim, app_mention. Save Changes. (No Request URL is needed in Socket Mode.)
 7. Install to Workspace, then copy the Bot User OAuth Token (starts with xoxb-).
 ```
 
@@ -105,7 +105,7 @@ For webhook delivery, tell the user:
 ```nc:operator when:connection=webhook
 Create the Slack app (webhook delivery):
 1. Go to api.slack.com/apps → Create New App → From scratch. Name it (e.g. "NanoClaw") and pick your workspace.
-2. OAuth & Permissions → add these Bot Token Scopes: chat:write, im:write, channels:history, groups:history, im:history, channels:read, groups:read, users:read, reactions:write, files:read, files:write.
+2. OAuth & Permissions → add these Bot Token Scopes: chat:write, im:write, channels:history, groups:history, im:history, mpim:history, channels:read, groups:read, mpim:read, users:read, reactions:write, files:read, files:write. (The `mpim:*` pair is what lets the bot see and name group DMs; without them a group DM never reaches it.)
 3. App Home → enable the Messages Tab, and check "Allow users to send Slash commands and messages from the messages tab."
 4. Install to Workspace, then copy the Bot User OAuth Token (starts with xoxb-).
 5. Basic Information → copy the Signing Secret.
@@ -143,7 +143,7 @@ the service restarts). Tell the user:
 ```nc:operator when:connection=webhook
 Set up event delivery (needs a public HTTPS URL for port 3000 — ngrok, a Cloudflare Tunnel, or a reverse proxy on a VPS):
 1. Event Subscriptions → Enable Events. Set the Request URL to https://<your-public-host>/webhook/slack and wait for the challenge to pass.
-2. Subscribe to bot events: message.channels, message.groups, message.im, app_mention. Save Changes.
+2. Subscribe to bot events: message.channels, message.groups, message.im, message.mpim, app_mention. Save Changes.
 3. Interactivity & Shortcuts → toggle Interactivity on, set the same Request URL, Save Changes, then reinstall the app when Slack prompts.
 ```
 
@@ -223,7 +223,9 @@ SLACK_MAX_BOT_HOPS=24
 
 **`auth.test` fails, or `conversations.open` returns no channel.** A failing `auth.test` means the bot token is wrong or the app was never installed to the workspace. `conversations.open` coming back empty means the `im:write` scope is missing — add it under OAuth & Permissions and **reinstall the app**; scope changes only take effect after reinstall, which also mints a new `xoxb-` token to store.
 
-**The greeting arrives but your replies vanish.** Sending works with just the bot token; *receiving* needs the event path. Socket Mode: the toggle on, `SLACK_APP_TOKEN` set with `connections:write`, and the bot events (`message.im`, `message.channels`, `message.groups`, `app_mention`) subscribed. Webhook: the Request URL must have passed Slack's challenge and the same events subscribed. Either way, App Home's Messages Tab must be enabled or Slack refuses DMs to the app.
+**The greeting arrives but your replies vanish.** Sending works with just the bot token; *receiving* needs the event path. Socket Mode: the toggle on, `SLACK_APP_TOKEN` set with `connections:write`, and the bot events (`message.im`, `message.channels`, `message.groups`, `message.mpim`, `app_mention`) subscribed. Webhook: the Request URL must have passed Slack's challenge and the same events subscribed. Either way, App Home's Messages Tab must be enabled or Slack refuses DMs to the app.
+
+**Group DMs never reach the bot.** A multi-person DM is its own conversation type. It needs the `mpim:read` and `mpim:history` scopes and the `message.mpim` event, all three added above. An app installed before those were listed has none of them: add the scopes under OAuth & Permissions, **reinstall the app** (which mints a new `xoxb-` token to store), and subscribe the event. Without `mpim:read` the bot also cannot read the roster, so an approval card falls back to describing it as "a group DM" with no names.
 
 **Adapter registered but Slack never connects.** Run `pnpm exec vitest run src/channels/slack-registration.test.ts` — red means the barrel import or the `@chat-adapter/slack` install drifted, so re-run the Apply steps. If green, restart the service (`bash setup/lib/restart.sh`) so it picks up the adapter and tokens, then check `logs/nanoclaw.error.log`.
 

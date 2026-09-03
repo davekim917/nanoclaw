@@ -788,11 +788,14 @@ describe('no-owner / no-agent failure modes', () => {
  * Slack's own label is a slug like `mpdm-alice--bob--carol-1` — so the card
  * has to describe it by who is in it.
  */
+const resolveChannelNameSpy = vi.fn();
+
 async function liveAdapterWithConversation(
   channelType: string,
   resolveConversation?: (platformId: string) => Promise<ChannelConversation | null>,
   channelName = '#mpdm-alice--bob--carol-1',
 ): Promise<void> {
+  resolveChannelNameSpy.mockClear();
   const adapter = {
     name: channelType,
     channelType,
@@ -805,6 +808,7 @@ async function liveAdapterWithConversation(
       return undefined;
     },
     async resolveChannelName() {
+      resolveChannelNameSpy();
       return channelName;
     },
     ...(resolveConversation ? { resolveConversation } : {}),
@@ -864,5 +868,49 @@ describe('approval card names a group DM by its participants', () => {
     await routeInbound(groupMention('chan-2'));
 
     expect(await cardQuestion()).toContain('#general on telegram');
+  });
+});
+
+describe('the conversation is classified once, not twice', () => {
+  async function persistedName(platformId: string): Promise<string | null> {
+    const { getDb } = await import('../../db/connection.js');
+    const row = getDb().prepare('SELECT name FROM messaging_groups WHERE platform_id = ?').get(platformId) as
+      | { name: string | null }
+      | undefined;
+    return row?.name ?? null;
+  }
+
+  it('derives the persisted name from the classification and never calls the legacy resolver', async () => {
+    await liveAdapterWithConversation('telegram', async () => ({
+      type: 'group_dm',
+      name: null,
+      participantNames: ['Alice', 'Bob'],
+    }));
+    const { routeInbound } = await import('../../router.js');
+    await routeInbound(groupMention('mpdm-once'));
+    await cardQuestion();
+
+    expect(resolveChannelNameSpy).not.toHaveBeenCalled();
+    expect(await persistedName('mpdm-once')).toBe('Group DM: Alice and Bob');
+  });
+
+  it('falls back to the legacy resolver when the rich seam is absent', async () => {
+    await liveAdapterWithConversation('telegram', undefined, '#general');
+    const { routeInbound } = await import('../../router.js');
+    await routeInbound(groupMention('chan-legacy'));
+    await cardQuestion();
+
+    expect(resolveChannelNameSpy).toHaveBeenCalledTimes(1);
+    expect(await persistedName('chan-legacy')).toBe('#general');
+  });
+
+  it('falls back when the rich lookup fails outright', async () => {
+    await liveAdapterWithConversation('telegram', async () => null, '#general');
+    const { routeInbound } = await import('../../router.js');
+    await routeInbound(groupMention('chan-failed'));
+    await cardQuestion();
+
+    expect(resolveChannelNameSpy).toHaveBeenCalledTimes(1);
+    expect(await persistedName('chan-failed')).toBe('#general');
   });
 });
