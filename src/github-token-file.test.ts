@@ -218,7 +218,7 @@ describe('path safety', () => {
   });
 
   it('locks down the shared gh-token parent directory too', () => {
-    writeGroupGitHubTokenFile('ag-1776377699463-2axxhg', 'ghs_x', dataDir);
+    writeGroupGitHubTokenFile('ag-000000000000-example', 'ghs_x', dataDir);
     expect(fs.statSync(path.join(dataDir, 'gh-token')).mode & 0o777).toBe(0o700);
   });
 });
