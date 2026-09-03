@@ -33,6 +33,43 @@ export class SessionDbMissingError extends Error {
 }
 
 /**
+ * A host open found the database file PRESENT but could not open it.
+ *
+ * The counterpart to `SessionDbMissingError`, and the reason it exists as a
+ * type: "the mailbox would not open" and "a caller's own work threw" are
+ * different failures with different recoveries, and once the outbound handle
+ * opens LAZILY — partway through a caller's action — position in the code can
+ * no longer tell them apart. Only the funnel knows, so the funnel says so.
+ *
+ * Callers that already branch on `SessionDbMissingError` are unaffected: this
+ * is a distinct class, and a vanished file still reports as missing.
+ */
+export class SessionDbUnopenableError extends Error {
+  /**
+   * The driver's own error code, carried up from the cause.
+   *
+   * `src/db/session-db.test.ts` pins `code === 'SQLITE_CANTOPEN'` on a
+   * present-but-unreadable open, and callers may branch on it. Adding a
+   * classification must not cost an observable that already had a contract, so
+   * the wrapper keeps it (and the original error stays reachable as `cause`).
+   */
+  readonly code?: string;
+
+  constructor(
+    readonly dbPath: string,
+    cause: unknown,
+  ) {
+    super(
+      `session database exists but could not be opened: ${dbPath}: ${cause instanceof Error ? cause.message : String(cause)}`,
+      { cause },
+    );
+    this.name = 'SessionDbUnopenableError';
+    const code = (cause as { code?: unknown } | null | undefined)?.code;
+    if (typeof code === 'string') this.code = code;
+  }
+}
+
+/**
  * Is this path genuinely gone, as opposed to unanswerable?
  *
  * `fs.existsSync` cannot tell those apart: it returns false for ANY stat
@@ -73,12 +110,43 @@ export function sessionDbPathIsGone(dbPath: string): boolean {
  * unreadable parent directory as absence.
  *
  * It settles a post-constructor failure too, without a second try block: a
- * pragma that throws while the file is still there rethrows untouched, and one
- * that throws on a file that vanished underneath the handle is a vanished
- * session by any honest reading.
+ * pragma that throws while the file is still there rethrows untouched (as
+ * `SessionDbUnopenableError`), and one that throws on a file that vanished
+ * underneath the handle is a vanished session by any honest reading.
+ *
+ * A present-but-unopenable file is wrapped rather than passed through, so the
+ * class survives the trip out through a lazy accessor inside someone's action.
+ * The original error is the `cause`.
  */
+/**
+ * Prove the handle can actually be queried, before it leaves the funnel.
+ *
+ * SQLite opens lazily: `new Database()` on a truncated, corrupt or
+ * not-a-database file SUCCEEDS, and the failure only surfaces on the first
+ * statement — which, for the outbound side, runs deep inside a caller's own
+ * action. A funnel that returns such a handle has classified nothing, and the
+ * caller is left guessing whether its own work threw. One header read closes
+ * that: after this, a handle out of these openers is one you can query, or you
+ * got a classified error instead.
+ *
+ * Deliberately a STATEMENT, not a pragma: acceptance case H-3 pins the exact
+ * cross-mount pragma sequence on both handles (invariant I-5), and a probe
+ * appended there would change a contract this PR has no business touching.
+ * Reading one row of `sqlite_master` touches the same header, and it is closer
+ * to what callers actually do with the handle anyway.
+ */
+function assertQueryable(db: Database.Database, dbPath: string): void {
+  try {
+    db.prepare('SELECT 1 FROM sqlite_master LIMIT 1').get();
+  } catch (err) {
+    db.close();
+    throw asMissingDbError(err, dbPath);
+  }
+}
+
 export function asMissingDbError(err: unknown, dbPath: string): unknown {
-  return sessionDbPathIsGone(dbPath) ? new SessionDbMissingError(dbPath) : err;
+  if (sessionDbPathIsGone(dbPath)) return new SessionDbMissingError(dbPath);
+  return err instanceof SessionDbUnopenableError ? err : new SessionDbUnopenableError(dbPath, err);
 }
 
 /**
@@ -130,6 +198,7 @@ export function openInboundDb(dbPath: string): Database.Database {
     // DB is a real fault, and callers must not mistake it for a gone session.
     throw asMissingDbError(err, dbPath);
   }
+  assertQueryable(db, dbPath);
   // ponytail: patching close() beats a wrapper type — every existing caller
   // already closes, and a new return type would touch all ~20 of them. Known
   // ceiling: better-sqlite3 refuses close() while an iterator is open, which
@@ -196,11 +265,14 @@ export function recoverHotJournal(dbPath: string): boolean {
 export function openOutboundDb(dbPath: string): Database.Database {
   // Cheap existsSync guard — no cost on the normal path, where no journal exists.
   recoverHotJournal(dbPath);
+  let db: Database.Database;
   try {
-    return upstreamOpenOutboundDb(dbPath);
+    db = upstreamOpenOutboundDb(dbPath);
   } catch (err) {
     throw asMissingDbError(err, dbPath);
   }
+  assertQueryable(db, dbPath);
+  return db;
 }
 
 /**
@@ -222,11 +294,15 @@ export function openOutboundDbWritable(dbPath: string): Database.Database {
   let db: Database.Database;
   try {
     db = new Database(dbPath, { fileMustExist: true });
+    db.pragma('journal_mode = DELETE');
+    db.pragma('busy_timeout = 5000');
   } catch (err) {
+    // Inside the try with the constructor: a pragma that throws leaves the
+    // same "present but unopenable" state, and it must carry the same class or
+    // a lazy writable open would still be misread as a caller's own failure.
     throw asMissingDbError(err, dbPath);
   }
-  db.pragma('journal_mode = DELETE');
-  db.pragma('busy_timeout = 5000');
+  assertQueryable(db, dbPath);
   return db;
 }
 
