@@ -14,6 +14,27 @@ vi.mock('../config.js', async (importOriginal) => ({
   DATA_DIR: TEST_DIR,
 }));
 
+// Models the ONE interleave that matters: the sweep closing a spent-but-active
+// task session inside the mailbox funnel's await, between `resolveTaskSession`
+// and the write. Inert unless a test arms it, so the rest of this file runs
+// against the real session-manager.
+const raceCloses = vi.hoisted(() => ({ sessionId: null as string | null }));
+
+vi.mock('../session-manager.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../session-manager.js')>();
+  return {
+    ...actual,
+    withExistingMailboxSession: async (agentGroupId: string, sessionId: string, action: never) => {
+      if (raceCloses.sessionId === sessionId) {
+        raceCloses.sessionId = null;
+        const { getDb: centralDb } = await import('./connection.js');
+        centralDb().prepare("UPDATE sessions SET status = 'closed' WHERE id = ?").run(sessionId);
+      }
+      return actual.withExistingMailboxSession(agentGroupId, sessionId, action);
+    },
+  };
+});
+
 import { initTestDb, closeDb, getDb } from './connection.js';
 import { ensureSchema, openInboundDb } from './session-db.js';
 import { scheduleTask, resolveActiveSession } from './scheduled-tasks.js';
@@ -48,6 +69,17 @@ function taskInboundPath(seriesId: string): string {
     .get(AGENT_GROUP_ID, taskThreadId(seriesId)) as { id: string } | undefined;
   if (!row) throw new Error(`missing task session for ${seriesId}`);
   return inboundPath(row.id);
+}
+
+/** The ACTIVE task session for a series — the lookup filters closed rows out. */
+function taskSessionIdFor(seriesId: string): string {
+  const row = getDb()
+    .prepare(
+      "SELECT id FROM sessions WHERE agent_group_id = ? AND messaging_group_id IS NULL AND thread_id = ? AND status = 'active' ORDER BY created_at DESC LIMIT 1",
+    )
+    .get(AGENT_GROUP_ID, taskThreadId(seriesId)) as { id: string } | undefined;
+  if (!row) throw new Error(`no active task session for ${seriesId}`);
+  return row.id;
 }
 
 function setupCentralDb(): void {
@@ -713,6 +745,55 @@ describe('test_scheduleTask_leaves_the_container_owned_outbound_alone', () => {
     db.close();
     expect(rows).toHaveLength(1);
     expect(JSON.parse(rows[0]!.content).prompt).toBe('second');
+  });
+});
+
+// ── test_scheduleTask_revalidates_the_session_after_the_await ──────────────
+describe('test_scheduleTask_revalidates_the_session_after_the_await', () => {
+  /**
+   * `resolveTaskSession` runs before the mailbox funnel's await and can only
+   * return an ACTIVE session. In that gap the sweep can observe
+   * `countLiveTasks() === 0` on a spent-but-active task session and close it.
+   *
+   * Writing anyway produced a successful-looking schedule whose row sat in a
+   * closed session — `getActiveSessions()` excludes it, so the task never
+   * fired. Pre-seam, resolution and the write were one synchronous turn.
+   *
+   * The re-validation happens inside the session with no await before the
+   * write, and a lost race re-resolves once. That terminates because the
+   * lookups filter `status = 'active'`: the closed row can never come back.
+   */
+  it('writes into a fresh session when the old one is closed during the open', async () => {
+    const processAfter = new Date(Date.now() + 86400000).toISOString();
+    const base = {
+      agentGroupId: AGENT_GROUP_ID,
+      cron: '0 5 * * *',
+      processAfter,
+      seriesId: 's-race',
+      destination: TEST_DESTINATION,
+    };
+    await scheduleTask({ ...base, id: 't-race-1', prompt: 'first' });
+    const firstId = taskSessionIdFor('s-race');
+
+    // Arm the interleave: this session is closed inside the next funnel open.
+    raceCloses.sessionId = firstId;
+    await scheduleTask({ ...base, id: 't-race-2', prompt: 'second' });
+
+    // The old session really was closed, and it is NOT where the row went.
+    expect(getDb().prepare('SELECT status FROM sessions WHERE id = ?').get(firstId)).toMatchObject({
+      status: 'closed',
+    });
+    const secondId = taskSessionIdFor('s-race');
+    expect(secondId).not.toBe(firstId);
+
+    // The task landed in the fresh ACTIVE session, so the sweep can still fire it.
+    expect(getDb().prepare('SELECT status FROM sessions WHERE id = ?').get(secondId)).toMatchObject({
+      status: 'active',
+    });
+    const db = openInboundDb(inboundPath(secondId));
+    const rows = db.prepare("SELECT id FROM messages_in WHERE series_id = 's-race'").all() as Array<{ id: string }>;
+    db.close();
+    expect(rows.map((r) => r.id)).toEqual(['t-race-2']);
   });
 });
 

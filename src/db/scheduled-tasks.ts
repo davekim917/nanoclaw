@@ -22,8 +22,11 @@
 import { getAgentMailbox } from '../mailbox/index.js';
 import { resolveTaskSession, withExistingMailboxSession, withMailboxSession } from '../session-manager.js';
 import type { NanoclawMailboxSession } from '../modules/mailbox/index.js';
-import { createSession, findSessionByAgentGroupAndMessagingGroup } from './sessions.js';
+import { createSession, findSessionByAgentGroupAndMessagingGroup, getSession } from './sessions.js';
 import { getDb } from './connection.js';
+
+/** Did the row land, or was the session closed under us before the write? */
+type StampOutcome = 'written' | 'session-closed';
 
 export interface TaskDef {
   id: string;
@@ -261,20 +264,56 @@ export async function scheduleTask(def: TaskDef): Promise<void> {
   // from unlinking the file between the open and the insert. And `session()`
   // runs the inbound legacy migrations on both, so nothing a new task row
   // needs is skipped by not provisioning.
-  const stamp = (mailbox: NanoclawMailboxSession): boolean => {
-    mailbox.upsertTaskSeries({
-      id: def.id,
-      seriesId: def.seriesId,
-      processAfter: def.processAfter,
-      recurrence: def.cron,
-      content,
-      platformId: def.destination.platformId,
-      channelType: def.destination.channelType,
-      threadId: def.destination.threadId,
-    });
-    return true;
+  const stamp =
+    (sessionId: string) =>
+    (mailbox: NanoclawMailboxSession): StampOutcome => {
+      // Re-read the session's status INSIDE the session, immediately before the
+      // write, with no await in between — that ordering is the whole point.
+      //
+      // `resolveTaskSession` above ran before this funnel's await, and it can
+      // only return an ACTIVE session. In the gap, the sweep can observe
+      // `countLiveTasks() === 0` on a spent-but-still-active task session and
+      // close it (`host-sweep.ts`, `shouldCloseTaskSession`). The row would
+      // then land in a closed session's inbound.db — a successful write that
+      // `getActiveSessions()` excludes, so the task never fires while this
+      // function reports success. Pre-seam, resolution and the write were one
+      // synchronous turn and no such gap existed.
+      //
+      // Same shape as `withStoppedContainerSession` one layer down: restore the
+      // check-then-write adjacency the seam's await broke, at the seam rather
+      // than at each call site.
+      if (getSession(sessionId)?.status !== 'active') return 'session-closed';
+      mailbox.upsertTaskSeries({
+        id: def.id,
+        seriesId: def.seriesId,
+        processAfter: def.processAfter,
+        recurrence: def.cron,
+        content,
+        platformId: def.destination.platformId,
+        channelType: def.destination.channelType,
+        threadId: def.destination.threadId,
+      });
+      return 'written';
+    };
+
+  // `undefined` still means "no mailbox" and still falls through to the
+  // provisioning funnel; 'session-closed' is the new, separate outcome.
+  const write = async (sessionId: string): Promise<StampOutcome> => {
+    const action = stamp(sessionId);
+    return (
+      (await withExistingMailboxSession(def.agentGroupId, sessionId, action)) ??
+      (await withMailboxSession(def.agentGroupId, sessionId, action))
+    );
   };
-  if (!(await withExistingMailboxSession(def.agentGroupId, session.id, stamp))) {
-    await withMailboxSession(def.agentGroupId, session.id, stamp);
-  }
+
+  if ((await write(session.id)) === 'written') return;
+
+  // Lost the race. Re-resolve and try once more. This terminates: the lookups
+  // behind `resolveTaskSession` filter `status = 'active'`, so the closed row
+  // can never come back — a fresh active task session is minted instead.
+  const retry = resolveTaskSession(def.agentGroupId, def.seriesId, def.destination.platformId);
+  if ((await write(retry.session.id)) === 'written') return;
+  throw new Error(
+    `scheduleTask: task session for series ${def.seriesId} was closed twice while scheduling; not retrying again`,
+  );
 }
