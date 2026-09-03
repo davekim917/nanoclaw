@@ -112,10 +112,16 @@ function matchesPatternB(src: string): boolean {
 }
 
 function matchesPatternC(src: string): boolean {
-  // (c) new Database( where the same statement or the preceding 3 lines mention inbound.db/outbound.db
+  // (c) new Database( where either (c1) the constructor argument expression
+  // itself names an inbound/outbound path — `new Database(inboundDbPath, ...)`,
+  // `new Database(outboundPath, ...)` — regardless of where that variable was
+  // built, or (c2) the same statement or the preceding 3 lines mention the
+  // inbound.db/outbound.db literal directly.
   const lines = src.split('\n');
   for (let i = 0; i < lines.length; i++) {
-    if (!/new\s+Database\s*\(/.test(lines[i])) continue;
+    const dbCall = lines[i].match(/new\s+Database\s*\(\s*([^,)]*)/);
+    if (!dbCall) continue;
+    if (/inbound|outbound/i.test(dbCall[1])) return true;
     const windowStart = Math.max(0, i - 3);
     const window = lines.slice(windowStart, i + 1).join('\n');
     if (window.includes('inbound.db') || window.includes('outbound.db')) return true;
