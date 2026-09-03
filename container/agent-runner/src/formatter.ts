@@ -272,14 +272,16 @@ export function extractRouting(messages: MessageInRow[]): RoutingContext {
         return false;
       }
     });
-  const quietStatus = taskOnly && substantiveMessages.every((m) => {
-    try {
-      const c = JSON.parse(m.content);
-      return c?.quietStatus === true;
-    } catch {
-      return false;
-    }
-  });
+  const quietStatus =
+    taskOnly &&
+    substantiveMessages.every((m) => {
+      try {
+        const c = JSON.parse(m.content);
+        return c?.quietStatus === true;
+      } catch {
+        return false;
+      }
+    });
   // Treat (platform_id, channel_type, thread_id) as a unit. `platform_id`
   // is the discriminator — when set, the message itself specifies WHERE
   // to go and we respect even an explicit null thread_id (= channel root).
