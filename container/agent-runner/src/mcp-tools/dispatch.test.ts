@@ -2,7 +2,8 @@
  * Tests for orchestrator-only MCP tools: spawn_task, list_spawned_tasks, spawn_cancel.
  */
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
-import { initTestSessionDb, closeSessionDb, getInboundDb, getOutboundDb } from '../db/connection.js';
+import { getInboundDb, getOutboundDb } from '../mailbox/sqlite/connection.js';
+import { closeSessionDb, initTestSessionDb } from '../modules/mailbox/testing.js';
 import { deriveSpawnTaskId } from '../dispatch/derive-task-id.js';
 import { spawnTask, listSpawnedTasks, spawnCancel } from './dispatch.js';
 

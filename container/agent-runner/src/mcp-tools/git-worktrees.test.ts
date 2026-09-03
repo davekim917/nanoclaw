@@ -5,8 +5,7 @@ import { tmpdir } from 'os';
 import { join } from 'path';
 
 import { cloneRepoTool, createWorktreeTool, gitCommitTool, gitPushTool } from './git-worktrees';
-import { closeSessionDb, initTestSessionDb } from '../db/connection';
-
+import { closeSessionDb, initTestSessionDb } from '../modules/mailbox/testing.js';
 describe('topic-linked worktree topology', () => {
   let root: string;
   let dataDir: string;

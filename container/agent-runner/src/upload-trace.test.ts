@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
 
-import { initTestSessionDb, closeSessionDb, getInboundDb } from './db/connection.js';
+import { getInboundDb } from './mailbox/sqlite/connection.js';
+import { closeSessionDb, initTestSessionDb } from './modules/mailbox/testing.js';
 import { getUndeliveredMessages } from './db/messages-out.js';
 import { getPendingMessages } from './db/messages-in.js';
 import type { MessageInRow } from './db/messages-in.js';
@@ -48,7 +49,10 @@ describe('poll loop — /upload-trace command', () => {
     const controller = new AbortController();
     const loopPromise = runPollLoopWithTimeout(provider, controller.signal, 5000);
 
-    await waitFor(() => getUndeliveredMessages().length > 0, 5000);
+    // Wait for the ack, not just the status row: writeMessageOut is awaited
+    // now (upstream's mailbox contract), so the outbound row lands one tick
+    // before markCompleted rather than in the same synchronous block.
+    await waitFor(() => getUndeliveredMessages().length > 0 && getPendingMessages().length === 0, 5000);
     controller.abort();
 
     const out = getUndeliveredMessages();

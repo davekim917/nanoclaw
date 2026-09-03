@@ -31,9 +31,9 @@ function genId(prefix: string): string {
   return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
-function emit(action: string, extra: Record<string, unknown> = {}): void {
+async function emit(action: string, extra: Record<string, unknown> = {}): Promise<void> {
   const r = getSessionRouting();
-  writeMessageOut({
+  await writeMessageOut({
     id: genId('perm'),
     kind: 'system',
     platform_id: r.platform_id,
@@ -58,7 +58,7 @@ export const grantAccessTool: McpToolDefinition = {
         user: {
           type: 'string',
           description:
-            'Target user. Accepts a namespaced id (`slack-example-labs:U123`), a platform mention (`<@U123>`), or a bare platform id. Mentions and bare ids are resolved against the current session\'s channel_type.',
+            "Target user. Accepts a namespaced id (`slack-example-labs:U123`), a platform mention (`<@U123>`), or a bare platform id. Mentions and bare ids are resolved against the current session's channel_type.",
         },
         role: {
           type: 'string',
@@ -67,7 +67,7 @@ export const grantAccessTool: McpToolDefinition = {
         },
         agentGroupId: {
           type: 'string',
-          description: 'Target agent group id. Defaults to the current session\'s agent group.',
+          description: "Target agent group id. Defaults to the current session's agent group.",
         },
       },
       required: ['user'],
@@ -78,8 +78,10 @@ export const grantAccessTool: McpToolDefinition = {
     if (!user) return ok('Error: `user` is required.');
     const role = typeof args.role === 'string' ? args.role.trim().toLowerCase() : 'member';
     const agentGroupId = typeof args.agentGroupId === 'string' ? args.agentGroupId.trim() : undefined;
-    emit('grant_access', { user, role, agentGroupId });
-    return ok(`grant_access requested (user=${user}, role=${role}${agentGroupId ? `, agentGroup=${agentGroupId}` : ''}). Host will reply with the outcome.`);
+    await emit('grant_access', { user, role, agentGroupId });
+    return ok(
+      `grant_access requested (user=${user}, role=${role}${agentGroupId ? `, agentGroup=${agentGroupId}` : ''}). Host will reply with the outcome.`,
+    );
   },
 };
 
@@ -87,7 +89,7 @@ export const revokeAccessTool: McpToolDefinition = {
   tool: {
     name: 'revoke_access',
     description:
-      'Revoke a user\'s access to this agent group (membership + any scoped admin role). Host verifies the caller has authority before executing. Does not affect owner or global-admin roles — those must be revoked by direct edit.',
+      "Revoke a user's access to this agent group (membership + any scoped admin role). Host verifies the caller has authority before executing. Does not affect owner or global-admin roles — those must be revoked by direct edit.",
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -97,7 +99,7 @@ export const revokeAccessTool: McpToolDefinition = {
         },
         agentGroupId: {
           type: 'string',
-          description: 'Target agent group id. Defaults to the current session\'s agent group.',
+          description: "Target agent group id. Defaults to the current session's agent group.",
         },
       },
       required: ['user'],
@@ -107,8 +109,10 @@ export const revokeAccessTool: McpToolDefinition = {
     const user = typeof args.user === 'string' ? args.user.trim() : '';
     if (!user) return ok('Error: `user` is required.');
     const agentGroupId = typeof args.agentGroupId === 'string' ? args.agentGroupId.trim() : undefined;
-    emit('revoke_access', { user, agentGroupId });
-    return ok(`revoke_access requested (user=${user}${agentGroupId ? `, agentGroup=${agentGroupId}` : ''}). Host will reply with the outcome.`);
+    await emit('revoke_access', { user, agentGroupId });
+    return ok(
+      `revoke_access requested (user=${user}${agentGroupId ? `, agentGroup=${agentGroupId}` : ''}). Host will reply with the outcome.`,
+    );
   },
 };
 
@@ -116,13 +120,13 @@ export const listAccessTool: McpToolDefinition = {
   tool: {
     name: 'list_access',
     description:
-      'List who has access to an agent group — owners, admins, and members. Defaults to the current session\'s agent group. Any session participant can call this (read-only).',
+      "List who has access to an agent group — owners, admins, and members. Defaults to the current session's agent group. Any session participant can call this (read-only).",
     inputSchema: {
       type: 'object' as const,
       properties: {
         agentGroupId: {
           type: 'string',
-          description: 'Target agent group id. Defaults to the current session\'s agent group.',
+          description: "Target agent group id. Defaults to the current session's agent group.",
         },
       },
       required: [],
@@ -130,8 +134,10 @@ export const listAccessTool: McpToolDefinition = {
   },
   handler: async (args: Record<string, unknown>) => {
     const agentGroupId = typeof args.agentGroupId === 'string' ? args.agentGroupId.trim() : undefined;
-    emit('list_access', { agentGroupId });
-    return ok(`list_access requested${agentGroupId ? ` (agentGroup=${agentGroupId})` : ''}. Host will reply with the roster.`);
+    await emit('list_access', { agentGroupId });
+    return ok(
+      `list_access requested${agentGroupId ? ` (agentGroup=${agentGroupId})` : ''}. Host will reply with the roster.`,
+    );
   },
 };
 

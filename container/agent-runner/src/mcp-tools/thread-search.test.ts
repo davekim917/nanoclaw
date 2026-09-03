@@ -30,7 +30,7 @@ mock.module('bun:sqlite', () => ({
         // Intercept archive.db open — return injected test DB
         this._real = _injectedDb;
       } else {
-        // Any other DB (e.g. :memory: in connection.ts) — open normally
+        // Any other DB (e.g. :memory: in the mailbox connection) — open normally
         this._real = new RealDatabase(path as string, options);
       }
     }
@@ -39,7 +39,7 @@ mock.module('bun:sqlite', () => ({
     close() { /* keep singleton alive across calls in same test */ }
     run(sql: string, ...params: unknown[]) { return this._real.run(sql, ...params as Parameters<Database['run']>); }
     query(sql: string) { return this._real.query(sql); }
-    // bun's mock.module is process-global: later test files' connection.ts
+    // bun's mock.module is process-global: later test files' mailbox connection
     // singletons are built from THIS class. Forward transaction so code like
     // markScriptSkipped (db.transaction(...)()) keeps working cross-file.
     transaction(fn: (...args: unknown[]) => unknown) { return this._real.transaction(fn); }
@@ -47,7 +47,8 @@ mock.module('bun:sqlite', () => ({
   },
 }));
 
-const { initTestSessionDb, closeSessionDb, getInboundDb } = await import("../db/connection.js");
+const { initTestSessionDb, closeSessionDb } = await import("../modules/mailbox/testing.js");
+const { getInboundDb } = await import("../mailbox/sqlite/connection.js");
 
 function seedSessionRouting(): void {
   const db = getInboundDb();

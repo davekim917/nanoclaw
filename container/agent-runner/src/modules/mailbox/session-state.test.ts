@@ -1,23 +1,26 @@
 import { beforeEach, describe, expect, test } from 'bun:test';
 
-import { getOutboundDb, initTestSessionDb } from './connection.js';
+import { getOutboundDb } from '../../mailbox/sqlite/connection.js';
+import { initTestSessionDb } from './testing.js';
+import {
+  clearContinuation,
+  getContinuation,
+  migrateLegacyContinuation,
+  setContinuation,
+} from '../../db/session-state.js';
 import {
   WORK_CONTINUATION_RESUME_MAX_ATTEMPTS,
   advanceMemoryContextEpoch,
-  clearContinuation,
-  getContinuation,
   getMemoryContextEpoch,
   getWorkContinuation,
   isWorkContinuationRunnable,
   markWorkContinuationRunning,
   getStickyFast,
-  migrateLegacyContinuation,
   queueWorkContinuation,
   requeueWorkContinuationIfMatches,
   resetWorkContinuationForRealInbound,
   clearWorkContinuationIfMatches,
   cancelWorkContinuation,
-  setContinuation,
   setStickyFast,
   shouldPostInfraWarning,
   INFRA_WARNING_COOLDOWN_MS,

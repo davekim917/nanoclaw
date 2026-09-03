@@ -12,9 +12,9 @@
  * Package names are sanitized here at the tool boundary AND re-validated on
  * the host side (defense in depth).
  */
-import { getCentralDb } from '../db/connection.js';
+import { getCentralDb } from '../central-db.js';
 import { writeMessageOut } from '../db/messages-out.js';
-import { setStickyModel, setStickyEffort } from '../db/session-state.js';
+import { setStickyModel, setStickyEffort } from '../modules/mailbox/index.js';
 import { getConfig } from '../config.js';
 import { registerTools } from './server.js';
 import type { McpToolDefinition } from './types.js';
@@ -70,7 +70,7 @@ export const installPackages: McpToolDefinition = {
     if (invalidNpm) return err(`Invalid npm package name: "${invalidNpm}". No version specs or shell characters.`);
 
     const requestId = generateId();
-    writeMessageOut({
+    await writeMessageOut({
       id: requestId,
       kind: 'system',
       content: JSON.stringify({
@@ -108,7 +108,7 @@ export const addMcpServer: McpToolDefinition = {
     if (!name || !command) return err('name and command are required');
 
     const requestId = generateId();
-    writeMessageOut({
+    await writeMessageOut({
       id: requestId,
       kind: 'system',
       content: JSON.stringify({

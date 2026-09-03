@@ -24,7 +24,7 @@ const { MEMORY_SESSION_HOOK } = await import('../memory/session-hook.js');
 // rate_limit_event is now ALSO persisted to outbound.db's rate_limit_samples
 // (claude.rate-limit-samples.test.ts owns that assertion). The write swallows
 // its own errors, so this is only to keep the log clean here.
-const { initTestSessionDb } = await import('../db/connection.js');
+const { initTestSessionDb } = await import('../modules/mailbox/testing.js');
 
 let tmp: string;
 let prevHome: string | undefined;

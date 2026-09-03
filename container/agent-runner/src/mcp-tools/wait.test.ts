@@ -3,7 +3,8 @@
  * schedule_wake system action.
  */
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
-import { initTestSessionDb, closeSessionDb, getInboundDb, getOutboundDb } from '../db/connection.js';
+import { getInboundDb, getOutboundDb } from '../mailbox/sqlite/connection.js';
+import { closeSessionDb, initTestSessionDb } from '../modules/mailbox/testing.js';
 import { setCurrentInReplyTo } from '../db/session-state.js';
 import { wait } from './wait.js';
 

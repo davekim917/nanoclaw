@@ -1,10 +1,14 @@
+/**
+ * Outbound-file initialization. Moved from db/connection.test.ts when the fork's
+ * raw connection layer was replaced by upstream's seam + this module.
+ */
 import { afterEach, describe, expect, it } from 'bun:test';
 import { Database } from 'bun:sqlite';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-import { configureOutboundDb, openOutboundDb } from './connection.js';
+import { ensureNanoclawOutboundSchema, prepareOutboundFile } from './schema.js';
 
 const tempDirs: string[] = [];
 
@@ -46,12 +50,12 @@ describe('outbound DB initialization', () => {
     expect(new TextDecoder().decode(firstChunk.value)).toContain('locked');
 
     const started = Date.now();
-    const db = openOutboundDb(() => new Database(dbPath));
+    prepareOutboundFile(() => new Database(dbPath));
     const elapsedMs = Date.now() - started;
 
     expect(elapsedMs).toBeGreaterThanOrEqual(100);
+    const db = new Database(dbPath);
     expect(db.prepare('PRAGMA journal_mode').get()).toEqual({ journal_mode: 'delete' });
-    expect(db.prepare('PRAGMA busy_timeout').get()).toEqual({ timeout: 5000 });
     db.close();
     expect(await holder.exited).toBe(0);
   });
@@ -69,7 +73,7 @@ describe('outbound DB initialization', () => {
       },
     } as unknown as Database;
 
-    expect(() => openOutboundDb(() => candidate)).toThrow('database is locked');
+    expect(() => prepareOutboundFile(() => candidate)).toThrow('database is locked');
     expect(calls[0]).toBe('PRAGMA busy_timeout = 5000');
     expect(closed).toBe(true);
   });
@@ -80,18 +84,12 @@ describe('outbound DB initialization', () => {
       exec(sql: string) {
         calls.push(sql.trim());
       },
-      prepare() {
-        return { all: () => [] };
-      },
+      close() {},
     } as unknown as Database;
 
-    configureOutboundDb(candidate);
+    prepareOutboundFile(() => candidate);
 
-    expect(calls.slice(0, 3)).toEqual([
-      'PRAGMA busy_timeout = 5000',
-      'PRAGMA journal_mode = DELETE',
-      'PRAGMA foreign_keys = ON',
-    ]);
+    expect(calls).toEqual(['PRAGMA busy_timeout = 5000', 'PRAGMA journal_mode = DELETE']);
   });
 
   it('test_container_state_forward_compat_adds_resource_telemetry_columns', () => {
@@ -106,7 +104,7 @@ describe('outbound DB initialization', () => {
       )
     `);
 
-    configureOutboundDb(db);
+    ensureNanoclawOutboundSchema(db);
 
     const columns = new Set(
       (db.prepare("PRAGMA table_info('container_state')").all() as Array<{ name: string }>).map((row) => row.name),

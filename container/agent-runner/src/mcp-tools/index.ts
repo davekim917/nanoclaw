@@ -6,6 +6,9 @@
  * at module scope, and append the import here. No central list.
  */
 import { loadConfig } from '../config.js';
+// Module barrel — loads registration modules, including the singular mailbox slot.
+import '../modules/index.js';
+import { getAgentMailbox, readMailboxContext } from '../mailbox/index.js';
 import './core.js';
 import './interactive.js';
 import './agents.js';
@@ -38,10 +41,19 @@ function log(msg: string): void {
 loadConfig();
 registerProviderSpecificSelfModTools();
 
-// Mount spawn tools bifurcated (orchestrator vs child) then start the server.
-mountSpawnTools()
-  .then(() => startMcpServer())
-  .catch((err: unknown) => {
-    log(`MCP server error: ${err instanceof Error ? err.message : String(err)}`);
-    process.exit(1);
-  });
+// Boot the mailbox, then mount spawn tools bifurcated (orchestrator vs child)
+// and start the server. This process is spawned by the provider over stdio and
+// shares nothing with the runner's process, so it registers and starts the
+// mailbox itself.
+async function main(): Promise<void> {
+  await getAgentMailbox().start(await readMailboxContext());
+  await mountSpawnTools();
+  await startMcpServer();
+  // No stop(): startMcpServer resolves once the stdio transport is connected,
+  // and the process then serves tool calls for the rest of the turn.
+}
+
+main().catch((err: unknown) => {
+  log(`MCP server error: ${err instanceof Error ? err.message : String(err)}`);
+  process.exit(1);
+});

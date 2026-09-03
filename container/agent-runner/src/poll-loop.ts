@@ -5,50 +5,55 @@ import { randomUUID } from 'node:crypto';
 import { findByName, findByRouting, findPeerName, getAllDestinations, type DestinationEntry } from './destinations.js';
 import {
   getPendingMessages,
-  getActiveRepositoryMountBarrier,
   getMessageIn,
   markProcessing,
-  releaseProcessingClaims,
   markCompleted,
   markScriptSkipped,
-  retainCompleteRecallUnits,
-  classifyTrigger,
   type MessageInRow,
-  type TurnTrigger,
 } from './db/messages-in.js';
 import { getConfig } from './config.js';
-import { setChatLimit, writeMessageOut } from './db/messages-out.js';
+import { writeMessageOut } from './db/messages-out.js';
 import { recordTurnUsage } from './db/turn-usage.js';
-import { getSessionSpawnTaskId } from './db/session-routing.js';
-import { getInboundDb, touchHeartbeat, clearStaleProcessingAcks } from './db/connection.js';
+import { getInboundDb } from './mailbox/sqlite/connection.js';
+import { touchHeartbeat } from './heartbeat.js';
+import { clearStaleProcessingAcks } from './db/container-state.js';
 import {
-  advanceMemoryContextEpoch,
   clearContinuation,
   clearCurrentInReplyTo,
+  migrateLegacyContinuation,
+  setContinuation,
+  setCurrentInReplyTo,
+} from './db/session-state.js';
+import {
+  acknowledgeRepositoryMountBarrier,
+  advanceMemoryContextEpoch,
+  classifyTrigger,
+  clearDoneProposal,
+  clearStickyEffort,
+  clearStickyModel,
+  clearStickyUltracode,
   clearWorkContinuationIfMatches,
+  getActiveRepositoryMountBarrier,
+  getSessionSpawnTaskId,
+  getStickyEffort,
+  getStickyFast,
+  getStickyModel,
+  getStickyUltracode,
   getWorkContinuation,
   isWorkContinuationRunnable,
   markWorkContinuationRunning,
-  migrateLegacyContinuation,
+  releaseProcessingClaims,
   requeueWorkContinuationIfMatches,
   resetWorkContinuationForRealInbound,
-  clearDoneProposal,
-  setContinuation,
-  setCurrentInReplyTo,
-  getStickyModel,
-  setStickyModel,
-  clearStickyModel,
-  getStickyEffort,
+  retainCompleteRecallUnits,
+  setChatLimit,
   setStickyEffort,
-  clearStickyEffort,
-  getStickyUltracode,
-  setStickyUltracode,
-  clearStickyUltracode,
-  getStickyFast,
   setStickyFast,
+  setStickyModel,
+  setStickyUltracode,
   shouldPostInfraWarning,
-  acknowledgeRepositoryMountBarrier,
-} from './db/session-state.js';
+  type TurnTrigger,
+} from './modules/mailbox/index.js';
 import { clearBatchAnchors, getBatchAnchor, setCurrentBatchAnchors } from './current-batch.js';
 import {
   formatMessages,
@@ -185,7 +190,11 @@ function isProviderQuotaExhausted(err: unknown): boolean {
  * genuine bug that breaks both providers still surfaces — one turn later,
  * having been tried on two runtimes instead of one.
  */
-function reportProviderUnavailable(providerName: string | null, message: string, recognizedQuota: boolean): boolean {
+async function reportProviderUnavailable(
+  providerName: string | null,
+  message: string,
+  recognizedQuota: boolean,
+): Promise<boolean> {
   let runnerConfig: ReturnType<typeof getConfig>;
   try {
     runnerConfig = getConfig();
@@ -206,7 +215,7 @@ function reportProviderUnavailable(providerName: string | null, message: string,
     typeof process !== 'undefined' ? process.env?.NANOCLAW_PROVIDER_OVERRIDE : undefined,
   );
   try {
-    writeMessageOut({
+    await writeMessageOut({
       id: generateId(),
       kind: 'system',
       content: JSON.stringify({
@@ -469,7 +478,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
             clearCurrentInReplyTo();
             clearBatchAnchors();
           }
-          emitTurnEnd();
+          await emitTurnEnd();
           await checkpointTurnEnd(autosaveWorktrees);
           continue;
         }
@@ -528,7 +537,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
         continuation = undefined;
         resetProviderContext(config.providerName);
         freshContextBootstrapRequired = true;
-        writeMessageOut({
+        await writeMessageOut({
           id: generateId(),
           kind: 'chat',
           platform_id: routing.platformId,
@@ -541,7 +550,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       }
       if ((msg.kind === 'chat' || msg.kind === 'chat-sdk') && isUploadTraceCommand(msg)) {
         log('Uploading session trace to Hugging Face');
-        writeMessageOut({
+        await writeMessageOut({
           id: generateId(),
           kind: 'chat',
           platform_id: routing.platformId,
@@ -1149,11 +1158,11 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       const quotaHandled =
         !recovered &&
         !deferredForRepositoryBarrier &&
-        reportProviderUnavailable(
+        (await reportProviderUnavailable(
           config.providerName,
           err instanceof Error ? err.message : String(err),
           quotaExhausted,
-        );
+        ));
       deferredToFallback = quotaHandled;
 
       // Only surface the error to the user if we couldn't recover inline.
@@ -1173,7 +1182,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
         // logging for this whole branch — the dedupe below only gates the
         // channel post, and only for the classified infra/provider notices.
         if (!isInfraWarning || shouldPostInfraWarning(chatText)) {
-          writeMessageOut({
+          await writeMessageOut({
             id: generateId(),
             kind: 'chat',
             platform_id: routing.platformId,
@@ -1191,7 +1200,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       clearBatchAnchors();
     }
 
-    emitTurnEnd();
+    await emitTurnEnd();
 
     // Compatibility callback is intentionally non-mutating in production.
     // Sibling agents share this topic checkout, so turn-end code must never
@@ -1750,7 +1759,7 @@ export async function processQuery(
         throw err;
       }
 
-      handleEvent(event, routing);
+      await handleEvent(event, routing);
       touchHeartbeat();
 
       if (event.type === 'init') {
@@ -1838,7 +1847,7 @@ export async function processQuery(
             const taskId = getSessionSpawnTaskId();
             if (taskId !== null) {
               log(`AUP refusal detected — emitting spawn_failed for ${taskId}`);
-              writeMessageOut({
+              await writeMessageOut({
                 id: generateId(),
                 kind: 'system',
                 content: JSON.stringify({
@@ -1853,15 +1862,15 @@ export async function processQuery(
               });
             }
           }
-          const { sent, hasUnwrapped, taskBlocks } = dispatchResultText(event.text, routing);
+          const { sent, hasUnwrapped, taskBlocks } = await dispatchResultText(event.text, routing);
           const willRetryTaskBlocks = shouldNudgeTaskBlocks(routing.taskRun, taskBlocks, taskBlockNudged);
-          if (routing.taskRun && !taskBlockNudged) autoAppendTaskLog(event.text);
+          if (routing.taskRun && !taskBlockNudged) await autoAppendTaskLog(event.text);
           if ((event.isError === true || aupRefusal) && !routing.taskRun) {
             // Non-retryable error turn (e.g. a 403 billing_error) with no
             // <message> envelope: deliver the notice instead of dropping it as
             // scratchpad, and skip the re-wrap nudge — it would just re-hammer
             // the failing gateway turn after turn.
-            if (sent === 0) deliverErrorResult(event.text, routing);
+            if (sent === 0) await deliverErrorResult(event.text, routing);
             notifyExchangeComplete(onExchangeComplete, {
               prompt: archivePrompts[0]?.prompt ?? initialPrompt,
               result: event.text,
@@ -1923,7 +1932,7 @@ export async function processQuery(
         }
         pushToQuery(ensureFreshContextBootstrap(reminder));
       } else if (event.type === 'file') {
-        dispatchFileAttachment(event, routing);
+        await dispatchFileAttachment(event, routing);
       }
     }
     // Stream ended with only retryable (api_retry) events and no result → the
@@ -1961,7 +1970,7 @@ function notifyExchangeComplete(
   }
 }
 
-export function handleEvent(event: ProviderEvent, routing: RoutingContext): void {
+export async function handleEvent(event: ProviderEvent, routing: RoutingContext): Promise<void> {
   switch (event.type) {
     case 'init':
       log(`Session: ${event.continuation}`);
@@ -1986,14 +1995,14 @@ export function handleEvent(event: ProviderEvent, routing: RoutingContext): void
       // instead of shown: the session respawns on the fallback provider.
       // See the thrown-error sibling branch for the same decision.
       if (event.retryable === false && event.classification === 'quota') {
-        if (reportProviderUnavailable(null, event.message, true)) break;
+        if (await reportProviderUnavailable(null, event.message, true)) break;
       }
       if (event.retryable === false) {
         // `log()` above already covers unconditional logging for this
         // branch — dedupe below only gates the repeated channel post.
         const chatText = `⚠️ Turn ended with an error: ${event.message}. I'll pick up from your next message.`;
         if (shouldPostInfraWarning(chatText)) {
-          writeMessageOut({
+          await writeMessageOut({
             id: generateId(),
             kind: 'chat',
             platform_id: routing.platformId,
@@ -2029,7 +2038,7 @@ export function handleEvent(event: ProviderEvent, routing: RoutingContext): void
         routing.channelType && routing.platformId
           ? (getBatchAnchor(routing.channelType, routing.platformId) ?? routing.inReplyTo)
           : routing.inReplyTo;
-      writeMessageOut({
+      await writeMessageOut({
         id: generateId(),
         in_reply_to: statusAnchor,
         kind: 'status',
@@ -2045,11 +2054,11 @@ export function handleEvent(event: ProviderEvent, routing: RoutingContext): void
   }
 }
 
-export function dispatchFileAttachment(
+export async function dispatchFileAttachment(
   file: { path: string; filename?: string; text?: string },
   routing: RoutingContext,
   outboxRoot = '/workspace/outbox',
-): boolean {
+): Promise<boolean> {
   let realPath: string;
   try {
     realPath = fs.realpathSync(file.path);
@@ -2092,7 +2101,7 @@ export function dispatchFileAttachment(
   fs.mkdirSync(outboxDir, { recursive: true });
   fs.copyFileSync(realPath, path.join(outboxDir, filename));
 
-  writeMessageOut({
+  await writeMessageOut({
     id,
     // in_reply_to anchors to the CLAIMED BATCH: this destination's message
     // from the batch if present, else the batch's triggering message. Never
@@ -2116,9 +2125,9 @@ export function dispatchFileAttachment(
  * This is the same user-facing write the outer catch block does, minus the
  * `Error:` prefix — the provider's text is already a user-facing message.
  */
-function deliverErrorResult(text: string, routing: RoutingContext): void {
+async function deliverErrorResult(text: string, routing: RoutingContext): Promise<void> {
   log('Error result with no <message> envelope — delivering to channel');
-  writeMessageOut({
+  await writeMessageOut({
     id: generateId(),
     in_reply_to: routing.inReplyTo,
     kind: 'chat',
@@ -2187,14 +2196,14 @@ export interface TaskMessageBlock {
  * there is no reason to leave a stale 💭 on screen for it. Callers must not
  * assume inbound rows are already marked completed when this row lands.
  */
-function emitTurnEnd(): void {
-  writeMessageOut({ id: generateId(), kind: 'system', content: JSON.stringify({ action: 'turn_end' }) });
+async function emitTurnEnd(): Promise<void> {
+  await writeMessageOut({ id: generateId(), kind: 'system', content: JSON.stringify({ action: 'turn_end' }) });
 }
 
-export function dispatchResultText(
+export async function dispatchResultText(
   text: string,
   routing: RoutingContext,
-): { sent: number; hasUnwrapped: boolean; taskBlocks: TaskMessageBlock[] } {
+): Promise<{ sent: number; hasUnwrapped: boolean; taskBlocks: TaskMessageBlock[] }> {
   type Opener = { index: number; endIndex: number; toName: string };
   const openers: Opener[] = [];
   MESSAGE_OPENER_RE.lastIndex = 0;
@@ -2248,7 +2257,7 @@ export function dispatchResultText(
         const origin = findByRouting(routing.channelType, routing.platformId);
         if (origin) {
           log(`to="here" resolved to origin "${origin.name}"`);
-          sendToDestination(origin, body, routing);
+          await sendToDestination(origin, body, routing);
           sent++;
           continue;
         }
@@ -2267,7 +2276,7 @@ export function dispatchResultText(
         const mention = `@${peerName}`;
         const recoveredBody = body.toLowerCase().includes(mention.toLowerCase()) ? body : `${mention} ${body}`.trim();
         log(`Recovered peer-as-destination <message to="${toName}"> → channel "${originDest.name}" with ${mention}`);
-        sendToDestination(originDest, recoveredBody, routing);
+        await sendToDestination(originDest, recoveredBody, routing);
         sent++;
         continue;
       }
@@ -2279,7 +2288,7 @@ export function dispatchResultText(
     if (origin && dest.name !== origin.name) {
       log(`Cross-destination final block: to="${toName}" from origin "${origin.name}"`);
     }
-    sendToDestination(dest, body, routing);
+    await sendToDestination(dest, body, routing);
     sent++;
   }
   if (cursor < text.length) {
@@ -2323,13 +2332,13 @@ export function dispatchResultText(
   if (!routing.taskRun && !routing.selfWake && sent === 0 && scratchpad) {
     const origin = findByRouting(routing.channelType, routing.platformId);
     if (origin) {
-      sendToDestination(origin, scratchpad, routing);
+      await sendToDestination(origin, scratchpad, routing);
       log(`Origin-fallback: unwrapped text routed to "${origin.name}" (${scratchpad.length} chars)`);
       return { sent: 1, hasUnwrapped: false, taskBlocks };
     }
     const all = getAllDestinations();
     if (all.length === 1) {
-      sendToDestination(all[0], scratchpad, routing);
+      await sendToDestination(all[0], scratchpad, routing);
       log(`Single-destination fallback: bare text routed to "${all[0].name}" (${scratchpad.length} chars)`);
       return { sent: 1, hasUnwrapped: false, taskBlocks };
     }
@@ -2388,7 +2397,7 @@ function escapePromptXml(value: string): string {
  * `task_log` outbound row; the host appends it to the series' tasks/<id>.md
  * with its usual timestamp stamp. Never delivered to anyone.
  */
-export function autoAppendTaskLog(text: string): void {
+export async function autoAppendTaskLog(text: string): Promise<void> {
   // Run-log hygiene: an inert <message to> block never belongs in the log as
   // raw XML — replace each with its inner text, marked undelivered, so the
   // log stays readable prose.
@@ -2398,7 +2407,7 @@ export function autoAppendTaskLog(text: string): void {
   );
   const line = stripInternalTags(prose).replace(/\s+/g, ' ').trim().slice(0, 500);
   if (!line) return;
-  writeMessageOut({
+  await writeMessageOut({
     id: generateId(),
     kind: 'task_log',
     content: JSON.stringify({ text: line }),
@@ -2406,7 +2415,7 @@ export function autoAppendTaskLog(text: string): void {
   log('Task run log auto-appended from final text');
 }
 
-function sendToDestination(dest: DestinationEntry, body: string, routing: RoutingContext): void {
+async function sendToDestination(dest: DestinationEntry, body: string, routing: RoutingContext): Promise<void> {
   const platformId = dest.type === 'channel' ? dest.platformId! : dest.agentGroupId!;
   const channelType = dest.type === 'channel' ? dest.channelType! : 'agent';
   // Resolve thread_id per-destination from the most recent inbound message
@@ -2414,7 +2423,7 @@ function sendToDestination(dest: DestinationEntry, body: string, routing: Routin
   // different destinations have different thread contexts — using a single
   // routing.threadId would stamp one channel's thread onto another.
   const destRouting = resolveDestinationThread(channelType, platformId);
-  writeMessageOut({
+  await writeMessageOut({
     id: generateId(),
     // Batch anchor, not the channel's latest inbound row — see the poison
     // note in dispatchFileAttachment / getPendingMessages.

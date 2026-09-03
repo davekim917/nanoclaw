@@ -17,9 +17,9 @@ function genId(prefix: string): string {
   return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
-function emit(action: string, extra: Record<string, unknown> = {}): void {
+async function emit(action: string, extra: Record<string, unknown> = {}): Promise<void> {
   const r = getSessionRouting();
-  writeMessageOut({
+  await writeMessageOut({
     id: genId('rc'),
     kind: 'system',
     platform_id: r.platform_id,
@@ -49,7 +49,7 @@ export const startRemoteControlTool: McpToolDefinition = {
   async handler(args) {
     const sender = (args.sender as string) || 'agent';
     const chatJid = (args.chatJid as string) || '';
-    emit('start_remote_control', { sender, chatJid });
+    await emit('start_remote_control', { sender, chatJid });
     return ok('Starting Remote Control on the host. URL will arrive as a follow-up message in this chat.');
   },
 };
@@ -61,7 +61,7 @@ export const stopRemoteControlTool: McpToolDefinition = {
     inputSchema: { type: 'object' as const, properties: {} },
   },
   async handler() {
-    emit('stop_remote_control');
+    await emit('stop_remote_control');
     return ok('Requested Remote Control stop. Confirmation will arrive as a follow-up message.');
   },
 };
@@ -73,7 +73,7 @@ export const getRemoteControlStatusTool: McpToolDefinition = {
     inputSchema: { type: 'object' as const, properties: {} },
   },
   async handler() {
-    emit('get_remote_control_status');
+    await emit('get_remote_control_status');
     return ok('Asked host for Remote Control status. Response will arrive as a follow-up message.');
   },
 };

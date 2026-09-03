@@ -4,7 +4,9 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-import { configureOutboundDb, getOutboundDb, initTestSessionDb, openOutboundDb } from './connection.js';
+import { getOutboundDb } from '../mailbox/sqlite/connection.js';
+import { ensureNanoclawOutboundSchema, prepareOutboundFile } from '../modules/mailbox/index.js';
+import { initTestSessionDb } from '../modules/mailbox/testing.js';
 import { getTurnUsageRows, recordTurnUsage, _resetCumulativeTrackingForTesting } from './turn-usage.js';
 
 const tempDirs: string[] = [];
@@ -368,7 +370,9 @@ describe('turn_usage — phantom "listed but unused" model rows', () => {
 describe('turn_usage — table creation (real files, not the in-memory test mode)', () => {
   it('exists after connection init on a brand-new outbound.db', () => {
     const dbPath = tempDbPath();
-    const db = openOutboundDb(() => new Database(dbPath));
+    prepareOutboundFile(() => new Database(dbPath));
+    const db = new Database(dbPath);
+    ensureNanoclawOutboundSchema(db);
     expect(tableExists(db, 'turn_usage')).toBe(true);
     db.close();
   });
@@ -383,7 +387,7 @@ describe('turn_usage — table creation (real files, not the in-memory test mode
 
     const reopened = new Database(dbPath);
     expect(tableExists(reopened, 'turn_usage')).toBe(false);
-    configureOutboundDb(reopened);
+    ensureNanoclawOutboundSchema(reopened);
     expect(tableExists(reopened, 'turn_usage')).toBe(true);
 
     // And it's actually usable, not just present.
@@ -434,7 +438,7 @@ describe('turn_usage — table creation (real files, not the in-memory test mode
     expect(colsBefore.has('steps')).toBe(false);
     expect(colsBefore.has('rate_limit_type')).toBe(false);
 
-    configureOutboundDb(reopened);
+    ensureNanoclawOutboundSchema(reopened);
 
     const colsAfter = new Set(
       (reopened.prepare("PRAGMA table_info('turn_usage')").all() as Array<{ name: string }>).map((c) => c.name),

@@ -92,7 +92,7 @@ export const wait: McpToolDefinition = {
     const fireAtIso = new Date(fireAtMs).toISOString();
     const wakeId = randomUUID();
     const inReplyTo = getCurrentInReplyTo();
-    writeMessageOut({
+    await writeMessageOut({
       id: `wait-sys-${wakeId}`,
       in_reply_to: inReplyTo,
       kind: 'system',

@@ -290,10 +290,10 @@ function branchOwner(gitDir: string, branch: string): string | null {
   return null;
 }
 
-function queueHostAction(action: string, payload: Record<string, unknown>): string {
+async function queueHostAction(action: string, payload: Record<string, unknown>): Promise<string> {
   const requestId = `repo-${Date.now()}-${randomBytes(8).toString('hex')}`;
   if (process.env.NANOCLAW_REPOSITORY_ACTION_TRANSPORT === 'disabled') return requestId;
-  writeMessageOut({
+  await writeMessageOut({
     id: requestId,
     kind: 'system',
     content: JSON.stringify({ action, requestId, ...payload }),
@@ -301,11 +301,11 @@ function queueHostAction(action: string, payload: Record<string, unknown>): stri
   return requestId;
 }
 
-function emitRefresh(context: RepositoryContext): void {
-  queueHostAction('repository_refresh', { repo: context.repo, workUnitKey: context.workUnitKey });
+async function emitRefresh(context: RepositoryContext): Promise<void> {
+  await queueHostAction('repository_refresh', { repo: context.repo, workUnitKey: context.workUnitKey });
 }
 
-function createLinkedWorktree(context: RepositoryContext, branchArg: string | undefined): ToolResult {
+async function createLinkedWorktree(context: RepositoryContext, branchArg: string | undefined): Promise<ToolResult> {
   const branch = branchArg ?? defaultBranch(context);
   if (tryGitDir(context.gitDir, ['check-ref-format', '--branch', branch], 10_000) === null) {
     return err(`Invalid branch name: ${branch}`);
@@ -325,7 +325,7 @@ function createLinkedWorktree(context: RepositoryContext, branchArg: string | un
   }
   const existing = validateExistingWorktree(context, branchArg);
   if (existing) {
-    if (context.pin.kind !== 'local-only') emitRefresh(context);
+    if (context.pin.kind !== 'local-only') await emitRefresh(context);
     return existing;
   }
 
@@ -353,7 +353,7 @@ function createLinkedWorktree(context: RepositoryContext, branchArg: string | un
   }
 
   if (context.pin.kind !== 'local-only') {
-    emitRefresh(context);
+    await emitRefresh(context);
     return ok(`Worktree created at ${context.worktree} on branch ${branch}; host canonical refresh queued`);
   }
   return ok(
@@ -424,7 +424,7 @@ export const cloneRepoTool: McpToolDefinition = {
     if (process.env.NANOCLAW_REPOSITORY_ACTION_TRANSPORT === 'disabled') {
       return ok(`Repository staged at ${stageRepo} (test transport)`);
     }
-    writeMessageOut({
+    await writeMessageOut({
       id: requestId,
       kind: 'system',
       content: JSON.stringify({
@@ -480,7 +480,7 @@ export const createWorktreeTool: McpToolDefinition = {
       if (validateSegment(workgroupId, 'workgroup id') || !workUnitKey) {
         return err('repository work-unit context is unavailable');
       }
-      queueHostAction('repository_transfer', {
+      await queueHostAction('repository_transfer', {
         repo,
         sourceThreadId: continueFromThreadId,
         destinationWorkUnitKey: workUnitKey,
@@ -579,7 +579,7 @@ export const gitPushTool: McpToolDefinition = {
     const resolved = worktreeForTool(repo);
     if ('error' in resolved) return resolved.error;
     try {
-      return await withRepositoryLock(resolved.context, () => {
+      return await withRepositoryLock(resolved.context, async () => {
         const branch = runGitAt(resolved.context.worktree, ['branch', '--show-current']);
         if (!branch) return err('Cannot push a detached HEAD; create or switch to a branch explicitly');
         const push =
@@ -587,7 +587,7 @@ export const gitPushTool: McpToolDefinition = {
             ? ['push', '--force-with-lease', '-u', 'origin', branch]
             : ['push', '-u', 'origin', branch];
         runGitAt(resolved.context.worktree, push, 300_000);
-        emitRefresh(resolved.context);
+        await emitRefresh(resolved.context);
         return ok(`Pushed ${branch} to origin${args.force === true ? ' (force-with-lease)' : ''}`);
       });
     } catch (error) {

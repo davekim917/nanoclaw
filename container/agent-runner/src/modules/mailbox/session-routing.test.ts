@@ -2,8 +2,9 @@
  * Tests for session-routing DB helpers.
  */
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
-import { initTestSessionDb, closeSessionDb, getInboundDb } from './connection.js';
-import { getSessionSpawnTaskId, getSessionId } from './session-routing.js';
+import { getInboundDb } from '../../mailbox/sqlite/connection.js';
+import { closeSessionDb, initTestSessionDb } from './testing.js';
+import { getSessionSpawnTaskId, getSessionId } from './routing.js';
 
 function createSessionRoutingTable(withSpawnTaskId = true, withSessionId = true): void {
   const db = getInboundDb();

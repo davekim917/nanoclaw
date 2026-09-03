@@ -1,15 +1,11 @@
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
 
-import { initTestSessionDb, closeSessionDb, getInboundDb, getOutboundDb } from './db/connection.js';
+import { getInboundDb, getOutboundDb } from './mailbox/sqlite/connection.js';
+import { closeSessionDb, initTestSessionDb } from './modules/mailbox/testing.js';
 import { getUndeliveredMessages } from './db/messages-out.js';
 import { getPendingMessages } from './db/messages-in.js';
-import {
-  cancelWorkContinuation,
-  getContinuation,
-  getWorkContinuation,
-  queueWorkContinuation,
-  setContinuation,
-} from './db/session-state.js';
+import { getContinuation, setContinuation } from './db/session-state.js';
+import { cancelWorkContinuation, getWorkContinuation, queueWorkContinuation } from './modules/mailbox/index.js';
 import { MockProvider } from './providers/mock.js';
 import type { ProviderExchange } from './providers/types.js';
 import { runPollLoop, type PollLoopConfig } from './poll-loop.js';
@@ -951,7 +947,10 @@ describe('poll loop — /clear command', () => {
     const controller = new AbortController();
     const loopPromise = runPollLoopWithTimeout(provider, controller.signal, 2000);
 
-    await waitFor(() => deliverableOut().length > 0, 2000);
+    // Wait for the ack, not just the confirmation row: writeMessageOut is
+    // awaited now (upstream's mailbox contract), so the outbound row lands one
+    // tick before markCompleted rather than in the same synchronous block.
+    await waitFor(() => deliverableOut().length > 0 && getPendingMessages().length === 0, 2000);
     controller.abort();
 
     const out = deliverableOut();

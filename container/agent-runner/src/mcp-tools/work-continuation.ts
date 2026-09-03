@@ -1,12 +1,12 @@
+import { getCurrentInReplyTo } from '../db/session-state.js';
 import {
   cancelWorkContinuation,
   DONE_PROPOSAL_REASON_MAX_CHARS,
-  getCurrentInReplyTo,
   proposeDone as recordDoneProposal,
   queueWorkContinuation,
   WORK_CONTINUATION_CHAIN_MAX,
   WORK_CONTINUATION_TASK_MAX_CHARS,
-} from '../db/session-state.js';
+} from '../modules/mailbox/index.js';
 import { registerTools } from './server.js';
 import type { McpToolDefinition } from './types.js';
 

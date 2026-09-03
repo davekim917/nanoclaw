@@ -13,7 +13,7 @@
  *
  * Claude-only. Nothing here covers Codex or OpenCode.
  */
-import { getOutboundDb } from './connection.js';
+import { getOutboundDb } from '../mailbox/sqlite/connection.js';
 
 /** Which capture path produced the row. Both are kept; the pull is primary. */
 export type RateLimitSampleSource = 'usage_pull' | 'rate_limit_event';

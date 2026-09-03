@@ -14,9 +14,9 @@
  * cross-group dispatch primitive — group is the trust boundary, session is
  * the work-unit boundary.
  */
-import { getCentralDb } from '../db/connection.js';
+import { getCentralDb } from '../central-db.js';
 import { writeMessageOut } from '../db/messages-out.js';
-import { getSessionId } from '../db/session-routing.js';
+import { getSessionId } from '../modules/mailbox/index.js';
 import { deriveSpawnTaskId } from '../dispatch/derive-task-id.js';
 import type { McpToolDefinition } from './types.js';
 
@@ -85,7 +85,7 @@ export const spawnTask: McpToolDefinition = {
     }
     const taskId = deriveSpawnTaskId(parentSessionId, idempotencyKey);
 
-    writeMessageOut({
+    await writeMessageOut({
       id: sysId(),
       kind: 'system',
       content: JSON.stringify({
@@ -211,7 +211,7 @@ export const spawnCancel: McpToolDefinition = {
     const content: Record<string, unknown> = { action: 'spawn_cancel', task_id: taskId };
     if (reason !== undefined) content.reason = reason;
 
-    writeMessageOut({
+    await writeMessageOut({
       id: sysId(),
       kind: 'system',
       content: JSON.stringify(content),

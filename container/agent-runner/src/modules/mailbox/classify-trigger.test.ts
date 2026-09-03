@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'bun:test';
 
-import { classifyTrigger, type MessageInRow } from './messages-in.js';
+import { classifyTrigger } from './selection.js';
+import type { MessageInRow } from '../../db/messages-in.js';
 
 function row(overrides: Partial<MessageInRow> & { content?: unknown } = {}): MessageInRow {
   const { content, ...rest } = overrides;

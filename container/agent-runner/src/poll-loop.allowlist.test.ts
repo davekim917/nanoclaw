@@ -6,7 +6,7 @@
  * collaborative artifacts live under /workspace/workgroup, so that prefix must
  * be allowed too. isAllowedFileEventPath is the boundary; assert it directly.
  *
- * Importing poll-loop.ts pulls in the db/connection module (bun:sqlite), which
+ * Importing poll-loop.ts pulls in the mailbox connection module (bun:sqlite), which
  * is fine under bun:test — these assertions are pure and touch no DB.
  */
 import { describe, test, expect } from 'bun:test';

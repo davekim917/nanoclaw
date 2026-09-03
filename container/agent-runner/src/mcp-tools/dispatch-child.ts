@@ -10,7 +10,7 @@
  * to pass it explicitly — the tool injection layer fills it in.
  */
 import { writeMessageOut, type WriteMessageOut } from '../db/messages-out.js';
-import { getSessionSpawnTaskId } from '../db/session-routing.js';
+import { getSessionSpawnTaskId } from '../modules/mailbox/index.js';
 import type { McpToolDefinition } from './types.js';
 
 function log(msg: string): void {
@@ -31,7 +31,7 @@ function sysId(): string {
 
 export interface SpawnChildDependencies {
   getSessionSpawnTaskId: () => string | null;
-  writeMessageOut: (message: WriteMessageOut) => number;
+  writeMessageOut: (message: WriteMessageOut) => Promise<number>;
   makeSystemId: () => string;
   log: (message: string) => void;
 }
@@ -49,7 +49,7 @@ const DEFAULT_DEPENDENCIES: SpawnChildDependencies = {
  * attach action-specific fields (message / summary / fail_reason / question)
  * to the envelope. `logSuffix` is appended to the log line for grep-ability.
  */
-function emitSpawnAction(
+async function emitSpawnAction(
   dependencies: SpawnChildDependencies,
   action: 'spawn_progress' | 'spawn_complete' | 'spawn_failed' | 'spawn_request_steer',
   args: Record<string, unknown>,
@@ -60,7 +60,7 @@ function emitSpawnAction(
   const taskId = (args.task_id as string | undefined) ?? dependencies.getSessionSpawnTaskId();
   if (!taskId) return err('task_id could not be determined — not running as a spawned child');
 
-  dependencies.writeMessageOut({
+  await dependencies.writeMessageOut({
     id: dependencies.makeSystemId(),
     kind: 'system',
     content: JSON.stringify({ action, task_id: taskId, ...extra }),

@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it } from 'bun:test';
 
-import { closeSessionDb, getInboundDb, initTestSessionDb } from './db/connection.js';
+import { getInboundDb } from './mailbox/sqlite/connection.js';
+import { closeSessionDb, initTestSessionDb } from './modules/mailbox/testing.js';
 import { buildSystemPromptAddendum } from './destinations.js';
 
 beforeEach(() => {

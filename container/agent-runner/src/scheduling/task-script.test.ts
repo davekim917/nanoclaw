@@ -14,7 +14,8 @@
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
 import fs from 'node:fs';
 
-import { initTestSessionDb, closeSessionDb, getInboundDb, getOutboundDb } from '../db/connection.js';
+import { getInboundDb, getOutboundDb } from '../mailbox/sqlite/connection.js';
+import { closeSessionDb, initTestSessionDb } from '../modules/mailbox/testing.js';
 import { getPendingMessages, markScriptSkipped } from '../db/messages-in.js';
 import { applyPreTaskScripts } from './task-script.js';
 

@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, mock } from 'bun:test';
 
-import { getInboundDb, getOutboundDb, initTestSessionDb } from '../db/connection.js';
+import { getInboundDb, getOutboundDb } from '../mailbox/sqlite/connection.js';
+import { initTestSessionDb } from '../modules/mailbox/testing.js';
 import { setCurrentInReplyTo } from '../db/session-state.js';
 
 mock.module('./server.js', () => ({ registerTools: (_tools: unknown) => {} }));

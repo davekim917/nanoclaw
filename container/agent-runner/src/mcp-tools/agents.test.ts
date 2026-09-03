@@ -1,7 +1,7 @@
 import { describe, it, expect, mock, beforeEach, afterEach } from 'bun:test';
 
-import { initTestSessionDb, closeSessionDb, getOutboundDb } from '../db/connection.js';
-
+import { getOutboundDb } from '../mailbox/sqlite/connection.js';
+import { closeSessionDb, initTestSessionDb } from '../modules/mailbox/testing.js';
 // NOTE: do NOT mock.module('../db/messages-out.js') here. bun runs every test
 // file sequentially in ONE process and mock.module is process-global and
 // permanent (mock.restore does not undo it), so stubbing writeMessageOut left
