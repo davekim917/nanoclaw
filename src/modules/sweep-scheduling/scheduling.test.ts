@@ -633,8 +633,17 @@ describe('S2-PR11 scheduling + thread-close', () => {
 
     await duty(SWEEP_DUTY_INVENTORY.S5).run(ctx);
 
-    // The window's OWN session, never a second open on the same key.
-    expect(calls.hostScripts).toEqual([[mailbox, 'sess-due']]);
+    // The window's OWN session, never a second open on the same key — and the
+    // GROUP id between it and the session id. `runHostGatedTaskScripts` grew
+    // that middle argument with product #251 (per-group timezone): it resolves
+    // the owning group's zone for its local-time gate, and a session parameter
+    // names the mailbox, not the group whose override applies. This case still
+    // pinned the two-argument call, which is precisely why the family move
+    // could drop the argument and stay green here — the driver's own body had
+    // it, the moved copy did not.
+    expect(calls.hostScripts).toHaveLength(1);
+    expect(calls.hostScripts[0]![0]).toBe(mailbox);
+    expect(calls.hostScripts[0]!.slice(1)).toEqual(['ag-test', 'sess-due']);
     // The admission seam takes the window's own session (mailbox PR 7).
     expect(calls.admissions).toHaveLength(1);
     expect(calls.admissions[0]![0]).toBe(mailbox);
