@@ -21,7 +21,8 @@
  *   NANOCLAW_DEFAULT_SESSION_MODE_<CHANNEL_TYPE>    per-thread | shared |
  *                                                   agent-shared (default: per-thread)
  *   NANOCLAW_DEFAULT_SENDER_POLICY_<CHANNEL_TYPE>   strict | request_approval |
- *                                                   public (default: strict — the
+ *                                                   decline_notify | public
+ *                                                   (default: strict — the
  *                                                   safe v2 upstream default)
  *   NANOCLAW_DEFAULT_IGNORED_POLICY_<CHANNEL_TYPE>  accumulate | drop
  *                                                   (default: accumulate)

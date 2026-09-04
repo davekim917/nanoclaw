@@ -90,7 +90,7 @@ agent_group_members (user_id, agent_group_id) -- unprivileged access gate
 user_dms (user_id, channel_type, messaging_group_id)  -- cold-DM cache
 ```
 
-Privilege is a user-level concept — there is no "main" agent group or "admin" messaging group. `user_roles` carries `owner` (global only, first pairing sets it) and `admin` (global or scoped to an `agent_group_id`). Unknown-sender gating is per-messaging-group via `messaging_groups.unknown_sender_policy` (`strict | request_approval | public`).
+Privilege is a user-level concept — there is no "main" agent group or "admin" messaging group. `user_roles` carries `owner` (global only, first pairing sets it) and `admin` (global or scoped to an `agent_group_id`). Unknown-sender gating is per-messaging-group via `messaging_groups.unknown_sender_policy` (`strict | request_approval | decline_notify | public`).
 
 ### Message Flow
 ```

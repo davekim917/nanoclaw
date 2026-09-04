@@ -261,6 +261,20 @@ describe('unknown-sender decline_notify flow', () => {
     expect(channelRows.c).toBe(0);
   });
 
+  it('threads the decline under the message it answers, and keeps the FYI unthreaded', async () => {
+    const { routeInbound } = await import('../../router.js');
+    // A Slack-shaped DM: the bridge gives every root DM message its own
+    // thread, and dm.threads is on by default, so a hard-null threadId would
+    // post the decline at the channel root instead of under the stranger.
+    await routeInbound({ ...strangerDm('hi'), threadId: 'slack:D123:1699999999.000100' });
+    await waitForDeliveries(2);
+
+    expect(deliverMock.mock.calls[0][2]).toBe('slack:D123:1699999999.000100');
+    // The owner FYI opens a fresh line in the owner's own DM — it is not a
+    // reply to the stranger, so it must not inherit their thread.
+    expect(deliverMock.mock.calls[1][2]).toBeNull();
+  });
+
   it('dedupes: a second message within 24h sends no further decline or FYI', async () => {
     const { routeInbound } = await import('../../router.js');
     await routeInbound(strangerDm('hello'));

@@ -321,6 +321,15 @@ export async function declineAndNotify(input: DeclineAndNotifyInput): Promise<vo
   // (a) Polite decline in the sender's DM, as the bot. Instance-addressed so
   // a per-agent bot identity registered as its own adapter instance answers
   // as itself.
+  //
+  // Threaded on the originating message, not hard-null: this is a reply TO
+  // the stranger, so it belongs where they wrote. Slack DMs make that load
+  // bearing — the bridge turns each root DM message into its own thread
+  // (chat-sdk-bridge.ts, the DM auto-threading block) and dm.threads is on
+  // by default (slack.ts SLACK_DEFAULTS), so a null here posts the decline
+  // at the channel root, detached from the message it answers. Adapters
+  // without DM threading (Telegram et al.) carry a null threadId on the
+  // event anyway, so this is a no-op there.
   const owner = ownerDisplayName();
   const declineText = input.declineText ?? `I'm ${owner ?? 'my owner'}'s personal agent — I can't help you directly.`;
   let declined = true;
@@ -328,7 +337,7 @@ export async function declineAndNotify(input: DeclineAndNotifyInput): Promise<vo
     await adapter.deliver(
       event.channelType,
       event.platformId,
-      null,
+      event.threadId ?? null,
       'chat-sdk',
       JSON.stringify({ text: declineText }),
       undefined,
