@@ -1,0 +1,76 @@
+{
+  "_comment": "A race class and a durability class, three rounds each, both at the same write primitive. One trailer naming only the primitive must not clear both \u2014 it has to name the invariant it fixed.",
+  "findings": [
+    {
+      "threadId": "T1",
+      "commentId": 301,
+      "reviewId": "PRR_R0",
+      "createdAt": "2026-09-01T01:00:00Z",
+      "path": "src/router.ts",
+      "line": 10,
+      "isResolved": false,
+      "isOutdated": false,
+      "body": "**<sub><sub>![P1 Badge](https://img.shields.io/badge/P1-orange?style=flat)</sub></sub>  Revalidate the session after the await**\n\nThe row is read before the await and `writeSessionMessage` runs after it, so a concurrent archive wins the race and nothing revalidates the row in between."
+    },
+    {
+      "threadId": "T2",
+      "commentId": 302,
+      "reviewId": "PRR_R1",
+      "createdAt": "2026-09-01T02:00:00Z",
+      "path": "src/delivery.ts",
+      "line": 20,
+      "isResolved": false,
+      "isOutdated": false,
+      "body": "**<sub><sub>![P1 Badge](https://img.shields.io/badge/P1-orange?style=flat)</sub></sub>  Revalidate the session after the await**\n\nThe row is read before the await and `writeSessionMessage` runs after it, so a concurrent archive wins the race and nothing revalidates the row in between."
+    },
+    {
+      "threadId": "T3",
+      "commentId": 303,
+      "reviewId": "PRR_R2",
+      "createdAt": "2026-09-01T03:00:00Z",
+      "path": "src/tasks.ts",
+      "line": 30,
+      "isResolved": false,
+      "isOutdated": false,
+      "body": "**<sub><sub>![P1 Badge](https://img.shields.io/badge/P1-orange?style=flat)</sub></sub>  Revalidate the session after the await**\n\nThe row is read before the await and `writeSessionMessage` runs after it, so a concurrent archive wins the race and nothing revalidates the row in between."
+    },
+    {
+      "threadId": "T4",
+      "commentId": 304,
+      "reviewId": "PRR_D0",
+      "createdAt": "2026-09-01T10:00:00Z",
+      "path": "src/router.ts",
+      "line": 40,
+      "isResolved": false,
+      "isOutdated": false,
+      "body": "**<sub><sub>![P2 Badge](https://img.shields.io/badge/P2-yellow?style=flat)</sub></sub>  Roll back the stamp when the write throws**\n\nThe stamp is persisted before `writeSessionMessage` runs and never rolled back when it throws, so a failed write leaves the stamp behind and the next caller overwrites it."
+    },
+    {
+      "threadId": "T5",
+      "commentId": 305,
+      "reviewId": "PRR_D1",
+      "createdAt": "2026-09-01T11:00:00Z",
+      "path": "src/delivery.ts",
+      "line": 50,
+      "isResolved": false,
+      "isOutdated": false,
+      "body": "**<sub><sub>![P2 Badge](https://img.shields.io/badge/P2-yellow?style=flat)</sub></sub>  Roll back the stamp when the write throws**\n\nThe stamp is persisted before `writeSessionMessage` runs and never rolled back when it throws, so a failed write leaves the stamp behind and the next caller overwrites it."
+    },
+    {
+      "threadId": "T6",
+      "commentId": 306,
+      "reviewId": "PRR_D2",
+      "createdAt": "2026-09-01T12:00:00Z",
+      "path": "src/tasks.ts",
+      "line": 60,
+      "isResolved": false,
+      "isOutdated": false,
+      "body": "**<sub><sub>![P2 Badge](https://img.shields.io/badge/P2-yellow?style=flat)</sub></sub>  Roll back the stamp when the write throws**\n\nThe stamp is persisted before `writeSessionMessage` runs and never rolled back when it throws, so a failed write leaves the stamp behind and the next caller overwrites it."
+    }
+  ],
+  "sources": {
+    "src/router.ts": "import { writeSessionMessage } from './mailbox/write.js';\n",
+    "src/delivery.ts": "import { writeSessionMessage } from './mailbox/write.js';\n",
+    "src/tasks.ts": "import { writeSessionMessage } from './mailbox/write.js';\n"
+  }
+}

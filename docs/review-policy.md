@@ -53,6 +53,21 @@ There is no round number that forbids a push. A high round count with
 severity falling is convergence; severity flat or rising across rounds means
 stop and diagnose out loud before touching code.
 
+A class that survives three rounds is a design defect at a seam, and the fix
+is the primitive, not the next call site: the loop refuses site patches until
+it lands. A finding class is the invariant a finding cites plus the seam its
+flagged sites share, so one missing guard reported at four call sites is one
+class with four rounds, not four files with one round each — the shape a
+file-level detector cannot see, and the shape that ran PR #291 to fourteen
+rounds. `pr-review-loop`'s gate (`codex-review.sh gate`, run by
+`codex-review.sh push`) makes this deterministic: three rounds on one class, or
+on one seam with severity not falling, exits non-zero naming the class, the
+sites and the candidate primitive, and lifts only on a commit that touches that
+primitive or carries `Reframe: <invariant> enforced in <primitive>`. A class
+whose sites share no seam is reported and not gated — there is no primitive to
+lift it with. `REVIEW_LOOP_ALLOW_SITE_PATCH=1` overrides the gate loudly and
+records the override in the PR body.
+
 ## Fix discipline
 
 Accepting a finding authorizes the finding, not any fix. Two rules bind
@@ -69,6 +84,15 @@ whoever writes the fix — a review loop, an auto-fix pass, a worker:
   an existing guard, hoist the check to the seam every caller shares, delete
   the path the finding lives on. If no simplifying fix exists, that is a
   design signal — escalate it, don't build around it.
+
+## Reporting shape
+
+For reviewers whose prompt we compose (the bot's is OpenAI's — see above):
+for any race, TOCTOU, or ownership finding, report the CLASS once — enumerate
+every site in the PR that has it in one pass, and name the primitive where the
+invariant belongs. Do not report the same class at one site per round. One
+site per round is what turns a single missing guard into a fourteen-round PR,
+and it is the reviewer half of the escalation rule above.
 
 ## Do not report
 

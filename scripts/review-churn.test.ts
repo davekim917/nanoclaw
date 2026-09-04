@@ -1,0 +1,415 @@
+// The pr-review-loop churn gate: does a finding CLASS that has survived three
+// rounds actually stop the next site patch?
+//
+// The classifier ships with the skill as dependency-free ESM
+// (`.claude/skills/pr-review-loop/scripts/review-churn.mjs`) because it also
+// runs inside an agent container, where nothing is installed. So this suite
+// drives it the way the loop does: as a subprocess, payload on stdin, decision
+// on stderr and `--json` on stdout, and the exit code as the gate itself.
+// Every fixture carries its own `sources`, so no case reads the checkout.
+import { spawnSync } from 'node:child_process';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+
+import { describe, expect, it } from 'vitest';
+
+import { allowSubprocess, enforceHermeticity } from '../src/test-hermeticity.js';
+
+allowSubprocess(['node', 'git']);
+enforceHermeticity();
+
+const SCRIPT = path.resolve('.claude/skills/pr-review-loop/scripts/review-churn.mjs');
+const CONTAINER_SCRIPT = path.resolve('container/skills/pr-review-loop/scripts/review-churn.mjs');
+const FIXTURES = path.resolve('scripts/__fixtures__/review-churn');
+
+interface Site {
+  file: string;
+  line: number | null;
+  title?: string;
+}
+interface ClassRow {
+  key: string;
+  signature: string;
+  seam: string | null;
+  primitives: string[];
+  rounds: number;
+  findings: number;
+  sites: Site[];
+}
+interface SeamRow {
+  seam: string;
+  rounds: number;
+  severityFalling: boolean;
+}
+interface Report {
+  classes: ClassRow[];
+  seams: SeamRow[];
+  totalRounds: number;
+  totalFindings: number;
+}
+interface Decision {
+  status: 'pass' | 'refuse' | 'override';
+  flagged: (ClassRow & { lifted: boolean; liftedBy: string | null; reason: string })[];
+  unlifted: ClassRow[];
+  report: Report;
+}
+
+interface Payload {
+  findings: unknown[];
+  sources?: Record<string, string>;
+  repoRoot?: string;
+  commits?: { sha: string; date: string; message: string; files: string[] }[];
+  worktree?: string[];
+}
+
+function fixture(name: string): Payload {
+  return JSON.parse(fs.readFileSync(path.join(FIXTURES, `${name}.json`), 'utf8')) as Payload;
+}
+
+function spawn(args: string[], payload: Payload, env: Record<string, string> = {}) {
+  // REVIEW_LOOP_ALLOW_SITE_PATCH must never leak in from the caller's shell:
+  // the override case has to be the one that sets it.
+  const base = { ...process.env };
+  delete base.REVIEW_LOOP_ALLOW_SITE_PATCH;
+  const res = spawnSync('node', [SCRIPT, ...args], {
+    input: JSON.stringify(payload),
+    encoding: 'utf8',
+    env: { ...base, ...env },
+  });
+  if (res.error) throw res.error;
+  return { status: res.status ?? -1, stdout: res.stdout, stderr: res.stderr };
+}
+
+function classify(payload: Payload): Report {
+  const out = spawn(['classify', '--json'], payload);
+  expect(out.status).toBe(0);
+  return JSON.parse(out.stdout) as Report;
+}
+
+/** The gate as the loop sees it: exit status, machine decision, human text. */
+function gate(payload: Payload, env: Record<string, string> = {}) {
+  const out = spawn(['gate', '--json'], payload, env);
+  return { status: out.status, decision: JSON.parse(out.stdout) as Decision, text: out.stderr };
+}
+
+const AFTER = '2026-09-02T00:00:00Z'; // later than every finding in toctou-class
+const BEFORE = '2026-08-30T00:00:00Z'; // earlier than every finding in toctou-class
+
+describe('review-churn classifier', () => {
+  it('collapses one invariant reported at four call sites into one class', () => {
+    const report = classify(fixture('toctou-class'));
+
+    const churning = report.classes.filter((c) => c.rounds >= 3);
+    expect(churning).toHaveLength(1);
+    expect(churning[0].signature).toBe('inv:race');
+    expect(churning[0].rounds).toBe(4);
+    expect(churning[0].findings).toBe(4);
+    expect(new Set(churning[0].sites.map((s) => s.file))).toEqual(
+      new Set(['src/router.ts', 'src/delivery.ts', 'src/tasks.ts', 'src/dashboard/close.ts']),
+    );
+  });
+
+  it('names the seam those sites share and the primitives they call', () => {
+    const churning = classify(fixture('toctou-class')).classes.find((c) => c.rounds >= 3)!;
+    expect(churning.seam).toBe('src/mailbox/write.ts');
+    expect(churning.primitives).toContain('writeSessionMessage');
+    expect(churning.primitives).toContain('wakeContainer');
+  });
+
+  it('sees churn the file-level detector cannot: no file reaches three rounds', () => {
+    const payload = fixture('toctou-class');
+    const roundsPerFile = new Map<string, Set<string>>();
+    for (const f of payload.findings as { path: string; reviewId: string }[]) {
+      if (!roundsPerFile.has(f.path)) roundsPerFile.set(f.path, new Set());
+      roundsPerFile.get(f.path)!.add(f.reviewId);
+    }
+    expect(Math.max(...[...roundsPerFile.values()].map((s) => s.size))).toBeLessThan(3);
+
+    expect(classify(payload).classes.some((c) => c.rounds >= 3)).toBe(true);
+  });
+
+  it('keeps an unrelated finding out of the churning class', () => {
+    const report = classify(fixture('toctou-class'));
+    const nullability = report.classes.find((c) => c.signature === 'inv:nullability');
+    expect(nullability?.rounds).toBe(1);
+    expect(report.classes.find((c) => c.rounds >= 3)!.sites.map((s) => s.title)).not.toContain(
+      'Treat an absent config value as empty',
+    );
+  });
+
+  it('splits one invariant at two unrelated seams into two classes', () => {
+    const churning = classify(fixture('two-seams')).classes.filter((c) => c.rounds >= 3);
+    expect(churning).toHaveLength(2);
+    expect(new Set(churning.map((c) => c.seam))).toEqual(new Set(['src/mailbox/write.ts', 'src/db/tasks.ts']));
+    for (const c of churning) {
+      expect(c.findings).toBe(3);
+      expect(c.primitives).toHaveLength(1);
+    }
+  });
+
+  it('reports a class whose sites share no seam, with no seam to name', () => {
+    const churning = classify(fixture('seamless-class')).classes.filter((c) => c.rounds >= 3);
+    expect(churning).toHaveLength(1);
+    expect(churning[0].seam).toBeNull();
+    expect(churning[0].primitives).toEqual([]);
+  });
+
+  it('reads severity direction per seam, not per finding', () => {
+    const falling = classify(fixture('seam-drift-falling'));
+    const flat = classify(fixture('seam-drift-flat'));
+    expect(falling.seams[0].seam).toBe('src/mailbox/write.ts');
+    expect(falling.seams[0].rounds).toBe(3);
+    expect(falling.seams[0].severityFalling).toBe(true);
+    expect(flat.seams[0].severityFalling).toBe(false);
+  });
+});
+
+describe('review-churn gate', () => {
+  it('refuses a site patch once a class has run three rounds', () => {
+    const { status, decision, text } = gate(fixture('toctou-class'));
+    expect(status).toBe(3);
+    expect(decision.status).toBe('refuse');
+    expect(decision.unlifted).toHaveLength(1);
+    expect(text).toContain('REFRAME REQUIRED');
+    expect(text).toContain('inv:race @ src/mailbox/write.ts');
+    expect(text).toContain('src/mailbox/write.ts');
+    expect(text).toContain('writeSessionMessage');
+    expect(text).toContain('src/dashboard/close.ts');
+    expect(text).toContain('Reframe: <invariant> enforced in <primitive>');
+  });
+
+  it('lifts when a commit after the last finding touches the primitive', () => {
+    const payload = fixture('toctou-class');
+    payload.commits = [
+      { sha: 'aaa1111', date: AFTER, message: 'fix(mailbox): guard the write', files: ['src/mailbox/write.ts'] },
+    ];
+    const { status, decision } = gate(payload);
+    expect(status).toBe(0);
+    expect(decision.status).toBe('pass');
+    expect(decision.flagged[0].liftedBy).toBe('diff touches the primitive');
+  });
+
+  it('lifts on the reframe trailer even when the diff is elsewhere', () => {
+    const payload = fixture('toctou-class');
+    payload.commits = [
+      {
+        sha: 'bbb2222',
+        date: AFTER,
+        message:
+          'fix(mailbox): one guard for every caller\n\nReframe: session revalidation enforced in writeSessionMessage\n',
+        files: ['src/somewhere-else.ts'],
+      },
+    ];
+    const { status, decision } = gate(payload);
+    expect(status).toBe(0);
+    expect(decision.flagged[0].liftedBy).toBe('reframe trailer');
+  });
+
+  it('lifts on uncommitted work at the primitive, so the gate is runnable before committing', () => {
+    const payload = fixture('toctou-class');
+    payload.worktree = ['src/mailbox/write.ts'];
+    expect(gate(payload).status).toBe(0);
+  });
+
+  it('does not accept a seam commit that predates the finding as the reframe', () => {
+    const payload = fixture('toctou-class');
+    payload.commits = [
+      { sha: 'ccc3333', date: BEFORE, message: 'chore: earlier work', files: ['src/mailbox/write.ts'] },
+    ];
+    const { status, decision } = gate(payload);
+    expect(status).toBe(3);
+    expect(decision.status).toBe('refuse');
+  });
+
+  it('does not accept a patch at another site as the reframe', () => {
+    const payload = fixture('toctou-class');
+    payload.commits = [
+      { sha: 'ddd4444', date: AFTER, message: 'fix: revalidate in the task path', files: ['src/tasks.ts'] },
+    ];
+    expect(gate(payload).status).toBe(3);
+  });
+
+  it('lets the override through, loudly, still naming the class', () => {
+    const { status, decision, text } = gate(fixture('toctou-class'), { REVIEW_LOOP_ALLOW_SITE_PATCH: '1' });
+    expect(status).toBe(0);
+    expect(decision.status).toBe('override');
+    expect(decision.unlifted).toHaveLength(1);
+    expect(text).toContain('SITE PATCH OVERRIDE');
+    expect(text).toContain('REVIEW_LOOP_ALLOW_SITE_PATCH=1');
+    expect(text).toContain('inv:race @ src/mailbox/write.ts');
+  });
+
+  it('refuses three flat-severity rounds on one seam even when no class repeats', () => {
+    const flat = gate(fixture('seam-drift-flat'));
+    expect(flat.status).toBe(3);
+    expect(flat.decision.unlifted[0].key).toBe('seam src/mailbox/write.ts');
+    expect(flat.text).toContain('severity not falling');
+  });
+
+  it('passes three rounds on one seam when severity is falling', () => {
+    const falling = gate(fixture('seam-drift-falling'));
+    expect(falling.status).toBe(0);
+    expect(falling.decision.status).toBe('pass');
+    expect(falling.decision.flagged).toHaveLength(0);
+  });
+
+  it('passes a PR whose worst class has run two rounds', () => {
+    const payload = fixture('toctou-class');
+    payload.findings = (payload.findings as { reviewId: string }[]).filter(
+      (f) => f.reviewId === 'PRR_1' || f.reviewId === 'PRR_2',
+    );
+    const { status, decision } = gate(payload);
+    expect(status).toBe(0);
+    expect(decision.status).toBe('pass');
+    expect(decision.report.classes.every((c) => c.rounds < 3)).toBe(true);
+  });
+
+  it('gates each seam separately when one invariant runs at two of them', () => {
+    const payload = fixture('two-seams');
+    const refused = gate(payload);
+    expect(refused.status).toBe(3);
+    expect(refused.decision.unlifted).toHaveLength(2);
+
+    payload.commits = [
+      { sha: 'eee5555', date: AFTER, message: 'fix: guard the mailbox write', files: ['src/mailbox/write.ts'] },
+    ];
+    const partial = gate(payload);
+    expect(partial.status).toBe(3);
+    expect(partial.decision.unlifted).toHaveLength(1);
+    expect(partial.decision.unlifted[0].seam).toBe('src/db/tasks.ts');
+  });
+
+  it('never gates a class with no seam, because nothing could lift it', () => {
+    const { status, decision } = gate(fixture('seamless-class'));
+    expect(status).toBe(0);
+    expect(decision.status).toBe('pass');
+    expect(decision.flagged).toHaveLength(0);
+    expect(decision.report.classes[0].rounds).toBe(3);
+  });
+
+  it('compares commit dates as instants, not strings, across UTC offsets', () => {
+    // The last finding is 15:00Z. 09:00-07:00 is 16:00Z — later, though it
+    // sorts earlier as a string.
+    const later = fixture('toctou-class');
+    later.commits = [
+      {
+        sha: 'fff6666',
+        date: '2026-09-01T09:00:00-07:00',
+        message: 'fix(mailbox): guard the write',
+        files: ['src/mailbox/write.ts'],
+      },
+    ];
+    expect(gate(later).status).toBe(0);
+
+    // 23:00+09:00 is 14:00Z — earlier, though it sorts later.
+    const earlier = fixture('toctou-class');
+    earlier.commits = [
+      {
+        sha: 'ggg7777',
+        date: '2026-09-01T23:00:00+09:00',
+        message: 'chore: earlier work',
+        files: ['src/mailbox/write.ts'],
+      },
+    ];
+    expect(gate(earlier).status).toBe(3);
+  });
+
+  it('requires the invariant in the trailer when two classes share a primitive', () => {
+    const named = fixture('shared-primitive');
+    named.commits = [
+      {
+        sha: 'hhh8888',
+        date: AFTER,
+        message: 'fix: one guard\n\nReframe: race enforced in writeSessionMessage\n',
+        files: ['src/elsewhere.ts'],
+      },
+    ];
+    const one = gate(named);
+    expect(one.status).toBe(3);
+    expect(one.decision.unlifted).toHaveLength(1);
+    expect(one.decision.unlifted[0].signature).toBe('inv:durability');
+
+    const vague = fixture('shared-primitive');
+    vague.commits = [
+      {
+        sha: 'iii9999',
+        date: AFTER,
+        message: 'fix: one guard\n\nReframe: the write path enforced in writeSessionMessage\n',
+        files: ['src/elsewhere.ts'],
+      },
+    ];
+    expect(gate(vague).decision.unlifted).toHaveLength(2);
+  });
+
+  it('reads commits back to the oldest finding, not a fixed history cap', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'review-churn-git-'));
+    const git = (...args: string[]) => {
+      const res = spawnSync('git', args, {
+        cwd: root,
+        encoding: 'utf8',
+        env: {
+          ...process.env,
+          GIT_AUTHOR_DATE: '2026-09-01T16:00:00Z',
+          GIT_COMMITTER_DATE: '2026-09-01T16:00:00Z',
+          GIT_AUTHOR_NAME: 'test',
+          GIT_AUTHOR_EMAIL: 'test@example.com',
+          GIT_COMMITTER_NAME: 'test',
+          GIT_COMMITTER_EMAIL: 'test@example.com',
+        },
+      });
+      if (res.status !== 0) throw new Error(`git ${args.join(' ')}: ${res.stderr}`);
+    };
+    try {
+      git('init', '-q', '-b', 'main');
+      fs.mkdirSync(path.join(root, 'src/mailbox'), { recursive: true });
+      fs.writeFileSync(path.join(root, 'src/mailbox/write.ts'), 'export function writeSessionMessage() {}\n');
+      git('add', '-A');
+      git('commit', '-qm', 'fix(mailbox): guard the write');
+      // 34 later commits, so the reframe above falls outside any `-n 30` cap.
+      for (let i = 0; i < 34; i += 1) git('commit', '-q', '--allow-empty', '-m', `filler ${i}`);
+
+      const payload = fixture('toctou-class');
+      payload.repoRoot = root;
+      const { status, decision } = gate(payload);
+      expect(status).toBe(0);
+      expect(decision.flagged[0].liftedBy).toBe('diff touches the primitive');
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('skill wiring', () => {
+  // The loop runs on the host AND inside agent containers, which mount
+  // container/skills/. There is exactly one copy — the host path is a symlink
+  // into the container tree — and a gate that exists in only one of them is a
+  // gate half the fleet does not have. This asserts the link, because turning
+  // it into a real directory is how the two would silently drift.
+  it('serves one copy to the host and the container', () => {
+    const host = path.resolve('.claude/skills/pr-review-loop');
+    expect(fs.lstatSync(host).isSymbolicLink()).toBe(true);
+    expect(fs.readlinkSync(host)).toBe('../../container/skills/pr-review-loop');
+    expect(fs.realpathSync(SCRIPT)).toBe(fs.realpathSync(CONTAINER_SCRIPT));
+  });
+
+  it('ships the classifier executable next to the helper', () => {
+    expect(fs.existsSync(CONTAINER_SCRIPT)).toBe(true);
+    expect(fs.statSync(CONTAINER_SCRIPT).mode & 0o111).toBeGreaterThan(0);
+  });
+
+  it('routes the push subcommand through the gate, and records the override only after the push', () => {
+    const helper = fs.readFileSync(path.resolve('container/skills/pr-review-loop/scripts/codex-review.sh'), 'utf8');
+    // gate → push → record, in that order. Recording is a claim that a site
+    // patch was pushed, so a refused push must not leave it in the PR body.
+    expect(helper).toMatch(
+      /push\)\n[\s\S]*?run_gate\n\s+shift\n\s+git push "\$@"\n\s+if \[ -n "\$GATE_OVERRIDE_LINE" \]; then\n\s+record_site_patch_override/,
+    );
+    // Evaluating the gate writes nothing at all.
+    const gateBranch = helper.slice(helper.indexOf('  gate)'), helper.indexOf('  push)'));
+    expect(gateBranch).not.toContain('record_site_patch_override');
+    expect(helper.slice(helper.indexOf('run_gate() {'), helper.indexOf('case "${1'))).not.toContain(
+      'record_site_patch_override',
+    );
+  });
+});

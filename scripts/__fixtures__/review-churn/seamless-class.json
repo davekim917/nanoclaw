@@ -1,0 +1,43 @@
+{
+  "_comment": "Three race findings across three rounds whose files import nothing in common. There is no primitive to move the check into, so the class is reported and never gated \u2014 a gate no diff and no trailer could lift would leave the override as the only way out.",
+  "findings": [
+    {
+      "threadId": "T1",
+      "commentId": 301,
+      "reviewId": "PRR_S0",
+      "createdAt": "2026-09-01T01:00:00Z",
+      "path": "src/one.ts",
+      "line": 10,
+      "isResolved": false,
+      "isOutdated": false,
+      "body": "**<sub><sub>![P1 Badge](https://img.shields.io/badge/P1-orange?style=flat)</sub></sub>  Revalidate the row after the await**\n\nThe row is read before the await and `doThing` runs after it, so a concurrent archive wins the race and nothing revalidates the row in between."
+    },
+    {
+      "threadId": "T2",
+      "commentId": 302,
+      "reviewId": "PRR_S1",
+      "createdAt": "2026-09-01T02:00:00Z",
+      "path": "src/two.ts",
+      "line": 20,
+      "isResolved": false,
+      "isOutdated": false,
+      "body": "**<sub><sub>![P1 Badge](https://img.shields.io/badge/P1-orange?style=flat)</sub></sub>  Revalidate the row after the await**\n\nThe row is read before the await and `doThing` runs after it, so a concurrent archive wins the race and nothing revalidates the row in between."
+    },
+    {
+      "threadId": "T3",
+      "commentId": 303,
+      "reviewId": "PRR_S2",
+      "createdAt": "2026-09-01T03:00:00Z",
+      "path": "src/three.ts",
+      "line": 30,
+      "isResolved": false,
+      "isOutdated": false,
+      "body": "**<sub><sub>![P1 Badge](https://img.shields.io/badge/P1-orange?style=flat)</sub></sub>  Revalidate the row after the await**\n\nThe row is read before the await and `doThing` runs after it, so a concurrent archive wins the race and nothing revalidates the row in between."
+    }
+  ],
+  "sources": {
+    "src/one.ts": "import { helper0 } from './helper0.js';\n",
+    "src/two.ts": "import { helper1 } from './helper1.js';\n",
+    "src/three.ts": "import { helper2 } from './helper2.js';\n"
+  }
+}
