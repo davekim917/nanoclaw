@@ -7,11 +7,9 @@ import { migration068 } from './068-sessions-sweep-quiet-until.js';
 import {
   createSession,
   getWarmQuietSessionMarks,
-  invalidateSessionQuiet,
   persistQuietSessionMarks,
   QuietInvalidationError,
   updateSession,
-  withQuietInvalidation,
   withQuietInvalidationSync,
   type QuietSessionMark,
 } from '../sessions.js';
@@ -189,55 +187,62 @@ describe('the persisted quiet mark (S2-PR15)', () => {
     expect(markOf('s-1')).toBeNull();
   });
 
-  // ── The invalidation primitive and its bracket (Codex round 2, H1) ────────
+  // ── The invalidation helper (Codex round 2 H1, round 3 H1/H2) ─────────────
   //
-  // Every due-ness writer goes through these two: `invalidateSessionQuiet`
-  // fail-closed before its session-DB write, `withQuietInvalidation` wrapping
-  // the write so the second, swallowing call lands after it. Tested here, on
-  // real SQLite, so the call-site suites can mock the seam and still be
-  // testing something real.
-  it('invalidateSessionQuiet clears the mark and moves last_active', () => {
+  // `withQuietInvalidationSync` is the ONE shape every due-ness write has: it
+  // invalidates the mark, fail-closed, in the same synchronous turn as the
+  // SQLite mutation it protects. These cases are its whole contract, on real
+  // SQLite, so the call-site suites can mock the seam and still be testing
+  // something real.
+  it('clears the mark and moves last_active, then runs the write', () => {
     createSession(session('s-1', ACTIVE));
     persistQuietSessionMarks([{ sessionId: 's-1', quietUntil: FUTURE, lastActive: ACTIVE }]);
+    let ran = false;
 
-    invalidateSessionQuiet('s-1');
+    const out = withQuietInvalidationSync('s-1', () => {
+      ran = true;
+      return 'written';
+    });
 
+    expect(out).toBe('written');
+    expect(ran).toBe(true);
     expect(markOf('s-1')).toBeNull();
     expect(lastActiveOf('s-1')).not.toBe(ACTIVE);
   });
 
   // The reason the flush guard is EXACT rather than near-exact. `toISOString()`
-  // is millisecond resolution, so a pre/post pair around a sub-millisecond
-  // write would otherwise publish the same basis twice and leave a flush
-  // landing between them satisfied — re-marking a session that has just become
-  // due. Advancing by 1 ms when the clock has not moved removes that case.
-  it('invalidateSessionQuiet always advances last_active, even inside one millisecond', () => {
+  // is millisecond resolution, so two invalidations inside one millisecond would
+  // otherwise publish the same basis twice and leave a flush computed on it
+  // satisfied — re-marking a session that has just become due.
+  it('always advances last_active, even inside one millisecond', () => {
     createSession(session('s-1', null));
-    const seen = new Set<string>();
+    const seen: string[] = [];
     for (let i = 0; i < 50; i++) {
-      invalidateSessionQuiet('s-1');
-      seen.add(lastActiveOf('s-1')!);
+      withQuietInvalidationSync('s-1', () => undefined);
+      seen.push(lastActiveOf('s-1')!);
     }
-    expect(seen.size, 'two invalidations published the same last_active').toBe(50);
-    // Strictly increasing, not merely distinct.
-    const ordered = [...seen];
-    expect([...ordered].sort()).toEqual(ordered);
+    expect(new Set(seen).size, 'two invalidations published the same last_active').toBe(50);
+    expect([...seen].sort()).toEqual(seen);
   });
 
-  it('a flush that lands between the two calls of a bracket does not survive it', async () => {
+  // Codex round 2, H1 (a), in its final form. A sweep's flush either computed
+  // its basis BEFORE the invalidation — this case, where the `IS` guard rejects
+  // it — or after the write it protects was already committed, which is a
+  // correct mark rather than a stale one. There is no third ordering: `write`
+  // is synchronous better-sqlite3 code with no await before it.
+  it('rejects a flush whose basis predates the invalidation', () => {
     createSession(session('s-1', ACTIVE));
+    // The sweep read `last_active` at the start of the tick: ACTIVE.
+    const basis = lastActiveOf('s-1');
 
-    await withQuietInvalidation('s-1', async () => {
-      // The sweep tick that runs inside the awaited write: it reads the
-      // last_active the pre-write call just published and marks on that basis.
-      persistQuietSessionMarks([{ sessionId: 's-1', quietUntil: FUTURE, lastActive: lastActiveOf('s-1') }]);
-      expect(markOf('s-1'), 'the simulated flush never landed').toBe(FUTURE);
-    });
+    withQuietInvalidationSync('s-1', () => undefined);
+    // The flush lands afterwards, still carrying the basis it computed on.
+    persistQuietSessionMarks([{ sessionId: 's-1', quietUntil: FUTURE, lastActive: basis }]);
 
-    expect(markOf('s-1'), 'a mark flushed mid-write outlived the bracket').toBeNull();
+    expect(markOf('s-1'), 'a mark computed before the invalidation was written anyway').toBeNull();
   });
 
-  it('a bracket whose invalidation fails runs no write and throws', () => {
+  it('throws and runs no write when the central DB refuses the invalidation', () => {
     createSession(session('s-1', ACTIVE));
     getDb().exec('DROP TABLE sessions');
     let ran = false;
@@ -248,6 +253,43 @@ describe('the persisted quiet mark (S2-PR15)', () => {
       }),
     ).toThrow(QuietInvalidationError);
     expect(ran, 'the write ran behind a mark that could not be cleared').toBe(false);
+  });
+
+  // Codex round 3, H2. `updateSession` discarded the affected-row count, so a
+  // session row deleted (or closed) between the caller's discovery and this
+  // callback looked like a successful invalidation and the due row landed in a
+  // mailbox the sweep never enumerates.
+  it('throws and runs no write when no ACTIVE session row matched', () => {
+    createSession(session('s-gone', ACTIVE));
+    createSession(session('s-closed', ACTIVE));
+    updateSession('s-closed', { status: 'closed' });
+    getDb().prepare('DELETE FROM sessions WHERE id = ?').run('s-gone');
+    const ran: string[] = [];
+
+    expect(() => withQuietInvalidationSync('s-gone', () => ran.push('gone'))).toThrow(QuietInvalidationError);
+    expect(() => withQuietInvalidationSync('s-closed', () => ran.push('closed'))).toThrow(QuietInvalidationError);
+    expect(() => withQuietInvalidationSync('s-never-existed', () => ran.push('never'))).toThrow(QuietInvalidationError);
+    expect(ran, 'a due row was written into a session the sweep will never enumerate').toEqual([]);
+  });
+
+  // Codex round 3, MEDIUM. The earlier shape re-invalidated from a `finally`,
+  // so a write that threw still recorded activity. There is no second write
+  // now: the failure propagates with `last_active` exactly where the
+  // invalidation left it.
+  it('leaves last_active at the invalidated value when the write throws', () => {
+    createSession(session('s-1', ACTIVE));
+
+    expect(() =>
+      withQuietInvalidationSync('s-1', () => {
+        throw new Error('mailbox write failed');
+      }),
+    ).toThrow(/mailbox write failed/);
+    const afterFailure = lastActiveOf('s-1');
+
+    expect(afterFailure).not.toBe(ACTIVE);
+    expect(markOf('s-1')).toBeNull();
+    // No second bump: the value is the one the invalidation wrote.
+    expect(lastActiveOf('s-1')).toBe(afterFailure);
   });
 
   it('an update that does not touch last_active leaves the mark alone', () => {

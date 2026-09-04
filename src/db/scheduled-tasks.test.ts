@@ -484,30 +484,25 @@ function taskRowVisible(sessionId: string, seriesId: string): boolean {
   return row !== undefined;
 }
 
-describe('scheduleTask brackets the task-row write with quiet-mark invalidations', () => {
-  it('routes the write through the bracket, entering it before the row exists', async () => {
+describe('scheduleTask invalidates the quiet mark in the same turn as the task-row write', () => {
+  it('invalidates with the row not yet written, inside the mailbox callback', async () => {
     seedActiveSession();
     seedInboundDb();
 
     const sessionsModule = await import('./sessions.js');
-    const original = sessionsModule.withQuietInvalidation;
-    // Each entry: which side of the bracketed write, and whether the task row
-    // was already there. What the bracket DOES on each side (invalidate
-    // fail-closed, then re-invalidate) is asserted against real SQLite in
-    // src/db/migrations/065-sessions-sweep-quiet-until.test.ts; what this case
-    // owns is that scheduleTask's write is inside it, and enters it with
-    // nothing written yet.
+    const original = sessionsModule.withQuietInvalidationSync;
+    // Each entry: the session invalidated, and whether the task row was already
+    // there at that instant. What the helper DOES (clear the mark, advance
+    // last_active, refuse when no active row matched) is asserted against real
+    // SQLite in src/db/migrations/065-sessions-sweep-quiet-until.test.ts; what
+    // this case owns is that scheduleTask's write is the thing it wraps.
     const observed: Array<[string, boolean]> = [];
     const spy = vi
-      .spyOn(sessionsModule, 'withQuietInvalidation')
-      .mockImplementation(<T>(id: string, write: () => Promise<T>) =>
-        original(id, async () => {
-          observed.push(['enter', taskRowVisible(id, 's-order')]);
-          const out = await write();
-          observed.push(['exit', taskRowVisible(id, 's-order')]);
-          return out;
-        }),
-      );
+      .spyOn(sessionsModule, 'withQuietInvalidationSync')
+      .mockImplementation(<T>(id: string, write: () => T) => {
+        observed.push([id, taskRowVisible(id, 's-order')]);
+        return original(id, write);
+      });
 
     await scheduleTask({
       id: 't-order',
@@ -520,50 +515,39 @@ describe('scheduleTask brackets the task-row write with quiet-mark invalidations
     });
     spy.mockRestore();
 
-    // One bracket (the happy path never retries): entered with no row, left
-    // with the row in place. The second entry is the positive control — it
-    // proves the absence in the first was ordering, not a write that silently
-    // never happened.
-    expect(observed).toEqual([
-      ['enter', false],
-      ['exit', true],
-    ]);
+    const sessionId = taskSessionIdFor('s-order');
+    // Once (the happy path never retries), for this session, with nothing
+    // written yet.
+    expect(observed).toEqual([[sessionId, false]]);
+    // Positive control: the row IS there once scheduleTask returns, so the
+    // absence above was ordering rather than a write that never happened.
+    expect(taskRowVisible(sessionId, 's-order')).toBe(true);
   });
 
-  // Codex round 2, H1 (a). The interleave the post-write half exists for.
-  it('a quiet mark flushed inside the write does not outlive the task row', async () => {
+  // Codex round 2 H1 (a), in its final form. In-process there is no longer a
+  // window between the invalidation and the write, so the interleave that
+  // remains is a flush whose basis was computed BEFORE the invalidation — the
+  // `WHERE last_active IS <basis>` guard is what rejects it.
+  it('a quiet mark computed before the write is rejected by the flush guard', async () => {
     seedActiveSession();
     seedInboundDb();
 
     const sessionsModule = await import('./sessions.js');
-    const original = sessionsModule.withQuietInvalidation;
-    const markLanded: boolean[] = [];
-    // Stand in for a whole sweep tick landing in the mailbox funnel's await:
-    // it runs after the bracket's fail-closed invalidation, reads the
-    // `last_active` that call published, sees a session with nothing due (the
-    // upsert has not happened), and flushes a mark on that basis. This is
-    // `persistQuietSessionMarks` itself, so the `WHERE last_active IS <basis>`
-    // guard is the real one.
+    const original = sessionsModule.withQuietInvalidationSync;
+    const basis: Array<string | null> = [];
+    // Stand in for a sweep tick that read this session at the top of the tick,
+    // found nothing due, and flushed its mark after the write landed. The basis
+    // it carries is the pre-invalidation `last_active`; the flush itself is the
+    // real `persistQuietSessionMarks`, so the guard under test is production's.
     const spy = vi
-      .spyOn(sessionsModule, 'withQuietInvalidation')
-      .mockImplementation(<T>(id: string, write: () => Promise<T>) =>
-        original(id, () => {
-          const basis = (
-            getDb().prepare('SELECT last_active FROM sessions WHERE id = ?').get(id) as { last_active: string | null }
-          ).last_active;
-          sessionsModule.persistQuietSessionMarks([
-            { sessionId: id, quietUntil: '2099-01-01T00:00:00.000Z', lastActive: basis },
-          ]);
-          markLanded.push(
-            (
-              getDb().prepare('SELECT sweep_quiet_until FROM sessions WHERE id = ?').get(id) as {
-                sweep_quiet_until: string | null;
-              }
-            ).sweep_quiet_until !== null,
-          );
-          return write();
-        }),
-      );
+      .spyOn(sessionsModule, 'withQuietInvalidationSync')
+      .mockImplementation(<T>(id: string, write: () => T) => {
+        basis.push(
+          (getDb().prepare('SELECT last_active FROM sessions WHERE id = ?').get(id) as { last_active: string | null })
+            .last_active,
+        );
+        return original(id, write);
+      });
 
     await scheduleTask({
       id: 't-interleave',
@@ -576,26 +560,29 @@ describe('scheduleTask brackets the task-row write with quiet-mark invalidations
     });
     spy.mockRestore();
 
-    expect(markLanded, 'the simulated sweep never established a mark to clear').toEqual([true]);
-
     const sessionId = taskSessionIdFor('s-interleave');
+    expect(basis, 'the invalidation never ran, so the flush below proves nothing').toHaveLength(1);
+    sessionsModule.persistQuietSessionMarks([
+      { sessionId, quietUntil: '2099-01-01T00:00:00.000Z', lastActive: basis[0]! },
+    ]);
+
     const after = getDb().prepare('SELECT sweep_quiet_until FROM sessions WHERE id = ?').get(sessionId) as {
       sweep_quiet_until: string | null;
     };
-    expect(after.sweep_quiet_until, 'a mark flushed mid-write outlived the task row it hides').toBeNull();
+    expect(after.sweep_quiet_until, 'a mark computed before the write hid the task row').toBeNull();
     expect(taskRowVisible(sessionId, 's-interleave'), 'no task row was written at all').toBe(true);
   });
 
   // Codex round 2, H1 (b). Fail-closed: a refused invalidation must not let the
-  // session-DB row land behind a live mark. (That the bracket itself refuses on
-  // a central-DB failure is the 065 suite's case; this one owns the call site
-  // not swallowing that refusal.)
+  // session-DB row land behind a live mark. (That the helper refuses on a
+  // central-DB failure AND on a missing or non-active session row is the 065
+  // suite's business; this case owns the call site not swallowing that refusal.)
   it('a failed invalidation aborts the schedule before any task row is written', async () => {
     seedActiveSession();
     seedInboundDb();
 
     const sessionsModule = await import('./sessions.js');
-    const spy = vi.spyOn(sessionsModule, 'withQuietInvalidation').mockImplementation((id: string) => {
+    const spy = vi.spyOn(sessionsModule, 'withQuietInvalidationSync').mockImplementation((id: string) => {
       throw new sessionsModule.QuietInvalidationError(id, new Error('central DB is read-only'));
     });
 
@@ -613,7 +600,7 @@ describe('scheduleTask brackets the task-row write with quiet-mark invalidations
     spy.mockRestore();
 
     // The task session was resolved (and its inbound.db provisioned) before the
-    // bracket, so the row's absence is the abort, not a missing session.
+    // write, so the row's absence is the abort, not a missing session.
     expect(taskRowVisible(taskSessionIdFor('s-faulted'), 's-faulted')).toBe(false);
   });
 });

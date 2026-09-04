@@ -68,21 +68,19 @@ afterEach(() => {
 });
 
 describe('createScheduledTask', () => {
-  it('routes the insert through the quiet-mark bracket, entering it before the row exists', async () => {
+  it('invalidates in the same turn as the insert, with the row not yet written', async () => {
     const sessionsModule = await import('../../db/sessions.js');
-    const original = sessionsModule.withQuietInvalidation;
-    // Each entry: the session the bracket was opened for, and the task-row
-    // count at that moment. A per-series id is random, so every create mints a
-    // fresh session whose mark starts NULL — asserting the mark after the fact
-    // would be vacuous. What is not vacuous is that the insert happens INSIDE
-    // the bracket, which is what makes the invalidation cover it.
+    const original = sessionsModule.withQuietInvalidationSync;
+    // Each entry: the session invalidated, and the task-row count at that
+    // moment. A per-series id is random, so every create mints a fresh session
+    // whose mark starts NULL — asserting the mark after the fact would be
+    // vacuous. What is not vacuous is that the insert is the statement the
+    // invalidation wraps, inside the mailbox callback.
     const entered: Array<[string, number]> = [];
-    vi.spyOn(sessionsModule, 'withQuietInvalidation').mockImplementation(<T>(id: string, write: () => Promise<T>) =>
-      original(id, () => {
-        entered.push([id, taskRowCount(id)]);
-        return write();
-      }),
-    );
+    vi.spyOn(sessionsModule, 'withQuietInvalidationSync').mockImplementation(<T>(id: string, write: () => T) => {
+      entered.push([id, taskRowCount(id)]);
+      return original(id, write);
+    });
 
     const { session } = await createScheduledTask(AG, TASK, { status: 'paused' });
 
@@ -92,7 +90,7 @@ describe('createScheduledTask', () => {
 
   it('writes nothing when the quiet-mark invalidation fails', async () => {
     const sessionsModule = await import('../../db/sessions.js');
-    const spy = vi.spyOn(sessionsModule, 'withQuietInvalidation').mockImplementation((id: string) => {
+    const spy = vi.spyOn(sessionsModule, 'withQuietInvalidationSync').mockImplementation((id: string) => {
       throw new sessionsModule.QuietInvalidationError(id, new Error('central DB is read-only'));
     });
 

@@ -1,5 +1,5 @@
 import { randomUUID } from 'crypto';
-import { withQuietInvalidation } from '../../db/sessions.js';
+import { withQuietInvalidationSync } from '../../db/sessions.js';
 
 import { CronExpressionParser } from 'cron-parser';
 
@@ -159,14 +159,16 @@ export async function createScheduledTask(
   const id = makeTaskId(task.name);
   const { session } = resolveTaskSession(agentGroupId, id);
 
-  // Bracketed by `withQuietInvalidation`: the insert changes when this session
-  // next has work due, and due-ness lives only in the session DB where the host
-  // sweep's quiet cache cannot see it. Fail-closed before the write (a refused
-  // central-DB invalidation aborts the create rather than landing a row behind a
-  // mark nothing clears), re-invalidated after it — the mailbox funnel is
-  // awaited, so a sweep tick can flush a mark inside that window.
-  const row = await withQuietInvalidation(session.id, () =>
-    withExistingMailboxSession(agentGroupId, session.id, (mailbox) => {
+  // The insert changes when this session next has work due, and due-ness lives
+  // only in the session DB where the host sweep's quiet cache cannot see it.
+  // `withQuietInvalidationSync` clears the mark in the same synchronous turn as
+  // the insert, INSIDE the mailbox callback: `withExistingMailboxSession` awaits
+  // the mailbox's existence before it calls back, so invalidating outside would
+  // leave that await between the two (Codex round 3, H1). Fail-closed — a
+  // refused invalidation aborts the create rather than landing a row behind a
+  // mark nothing will clear.
+  const row = await withExistingMailboxSession(agentGroupId, session.id, (mailbox) =>
+    withQuietInvalidationSync(session.id, () => {
       mailbox.insertTaskRow({
         id,
         seriesId: id,

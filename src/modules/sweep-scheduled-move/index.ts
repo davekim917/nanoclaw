@@ -243,25 +243,26 @@ export async function recoverMoveIntents(centralDb: Database.Database, options: 
           // task (that is the crash state this recovery exists for) and may have
           // just marked it quiet, so the row about to be restored is a DUE task
           // hiding behind a mark taken seconds ago, and S2-PR15 would carry that
-          // mark across a restart. The central-DB touch is what invalidates it.
+          // mark across a restart. The central-DB invalidation clears it.
           //
-          // Touched BEFORE the restore, not after (Codex pre-pass,
-          // review/b3/review.json Part C): inbound.db and the central DB are two
+          // Invalidate BEFORE the restore, in the same synchronous turn (Codex
+          // pre-pass Part C, round 3 H1): inbound.db and the central DB are two
           // separate files with no shared transaction, so a crash between the
-          // two statements is possible even with no `await` between them —
-          // touch-then-restore means the worst case is one wasted sweep of a
+          // two statements is possible even with no `await` between them.
+          // Invalidate-then-restore's worst case is one wasted sweep of a
           // session that then finds nothing new to restore (the idempotency
-          // re-check above already tolerates a repeated call); restore-then-touch
-          // means the worst case is the restored row landing durably while the
-          // persisted quiet mark survives the crash, hiding the just-restored due
-          // task for up to `QUIET_SESSION_BACKOFF_MS` after a warmed restart.
+          // re-check above already tolerates a repeated call); the reverse
+          // leaves the restored row durable while the persisted quiet mark
+          // survives the crash, hiding a due task for up to
+          // `QUIET_SESSION_BACKOFF_MS` after a warmed restart.
           //
-          // FAIL-CLOSED (Codex round 2, H1): the pre-restore invalidation inside
-          // `withQuietInvalidationSync` throws, and the throw escapes the mailbox
-          // action into this loop's catch, which logs and leaves the intent
-          // UNRESOLVED for the next recovery pass. A swallowed failure would
-          // instead restore the row behind a mark nothing clears and then stamp
-          // the intent resolved — the one outcome no later pass can repair.
+          // FAIL-CLOSED (Codex round 2, H1; round 3, H2): the invalidation
+          // throws — on a central-DB error AND on a session row that is gone or
+          // no longer active — and the throw escapes the mailbox action into
+          // this loop's catch, which logs and leaves the intent UNRESOLVED for
+          // the next recovery pass. A swallowed failure would instead restore
+          // the row behind a mark nothing clears and then stamp the intent
+          // resolved — the one outcome no later pass can repair.
           withQuietInvalidationSync(intent.session_id, () =>
             mailbox.restoreTaskRow({
               // Fresh id — the cancelled source row may still hold the snapshot id.

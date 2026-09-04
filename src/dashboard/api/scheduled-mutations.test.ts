@@ -350,14 +350,11 @@ describe('scheduled mutations invalidate the quiet mark (S2-PR15 / F2)', () => {
     expect(row.last_active).not.toBe('2026-06-01T00:00:00.000Z');
   });
 
-  // Codex round 2, H1 (a). The mutation's write is awaited through the mailbox
-  // funnel, so a whole sweep tick can run inside the bracket: it reads the
-  // `last_active` the fail-closed half just published, sees a session with
-  // nothing newly due, and flushes a quiet mark on that basis. The bracket's
-  // second half is what stops that mark hiding the edit. (What the bracket does
-  // on each side is asserted on real SQLite in
-  // src/db/migrations/065-sessions-sweep-quiet-until.test.ts.)
-  it('a quiet mark flushed inside the mutation does not outlive the due-time change', async () => {
+  // Codex round 2 H1 (a), in its final form. The invalidation now runs inside
+  // the mailbox callback, in the same synchronous turn as the statement, so the
+  // only interleave left is a flush whose basis was computed BEFORE it — which
+  // the real `persistQuietSessionMarks` guard must reject.
+  it('a quiet mark computed before the mutation is rejected by the flush guard', async () => {
     insertRow(seedSession().inbound, {
       id: 'r1',
       series_id: 'ser-1',
@@ -365,21 +362,7 @@ describe('scheduled mutations invalidate the quiet mark (S2-PR15 / F2)', () => {
       process_after: isoIn(3600_000),
     });
     markSessionQuiet();
-
-    const sessionsModule = await import('../../db/sessions.js');
-    const original = sessionsModule.withQuietInvalidation;
-    const markLanded: boolean[] = [];
-    // The real `persistQuietSessionMarks`, so the `WHERE last_active IS <basis>`
-    // guard under test is production's, not a hand-written UPDATE.
-    vi.spyOn(sessionsModule, 'withQuietInvalidation').mockImplementation(<T>(id: string, write: () => Promise<T>) =>
-      original(id, () => {
-        sessionsModule.persistQuietSessionMarks([
-          { sessionId: id, quietUntil: '2099-01-01T00:00:00.000Z', lastActive: sessionRow().last_active },
-        ]);
-        markLanded.push(sessionRow().sweep_quiet_until !== null);
-        return write();
-      }),
-    );
+    const basis = sessionRow().last_active;
 
     const res = (await editHandler(
       putReq({ cron: '0 6 * * *' }),
@@ -387,9 +370,14 @@ describe('scheduled mutations invalidate the quiet mark (S2-PR15 / F2)', () => {
       ctxFor('owner', OWNER_SCOPES),
     ))!;
     expect(res.status).toBe(200);
-    expect(markLanded, 'the simulated sweep never established a mark to clear').toEqual([true]);
-    expect(sessionRow().sweep_quiet_until, 'a mark flushed mid-mutation outlived the edit it hides').toBeNull();
     expect(liveRow('ser-1')?.recurrence, 'the edit itself never landed').toBe('0 6 * * *');
+
+    // The sweep's flush lands after the edit, carrying the basis it read before.
+    const sessionsModule = await import('../../db/sessions.js');
+    sessionsModule.persistQuietSessionMarks([
+      { sessionId: SESS, quietUntil: '2099-01-01T00:00:00.000Z', lastActive: basis },
+    ]);
+    expect(sessionRow().sweep_quiet_until, 'a mark computed before the edit hid it').toBeNull();
   });
 
   // Codex round 2, H1 (b). Fail-closed: a refused invalidation must abort the
@@ -405,7 +393,7 @@ describe('scheduled mutations invalidate the quiet mark (S2-PR15 / F2)', () => {
     markSessionQuiet();
 
     const sessionsModule = await import('../../db/sessions.js');
-    vi.spyOn(sessionsModule, 'withQuietInvalidation').mockImplementation((id: string) => {
+    vi.spyOn(sessionsModule, 'withQuietInvalidationSync').mockImplementation((id: string) => {
       throw new sessionsModule.QuietInvalidationError(id, new Error('central DB is read-only'));
     });
 
@@ -420,6 +408,27 @@ describe('scheduled mutations invalidate the quiet mark (S2-PR15 / F2)', () => {
     // still-live mark.
     expect(liveRow('ser-1')?.recurrence).toBe('0 9 * * *');
     expect(sessionRow().sweep_quiet_until).toBe('2099-01-01T00:00:00.000Z');
+  });
+
+  // Codex round 3, H2. A session row closed under the mutation must refuse, not
+  // write into a session the sweep will never enumerate.
+  it('refuses when the session row is no longer active', async () => {
+    insertRow(seedSession().inbound, {
+      id: 'r1',
+      series_id: 'ser-1',
+      recurrence: '0 9 * * *',
+      process_after: isoIn(3600_000),
+    });
+    getDb().prepare("UPDATE sessions SET status = 'closed' WHERE id = ?").run(SESS);
+
+    const res = (await editHandler(
+      putReq({ cron: '0 6 * * *' }),
+      { key: keyFor('ser-1') },
+      ctxFor('owner', OWNER_SCOPES),
+    ))!;
+    expect(res.status).toBe(503);
+    expect((await readJson(res)).reason).toBe('invalidation_failed');
+    expect(liveRow('ser-1')?.recurrence, 'a due-time change landed in a closed session').toBe('0 9 * * *');
   });
 });
 

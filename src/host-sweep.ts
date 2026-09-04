@@ -126,10 +126,11 @@ export function _resetQuietSessionCacheForTesting(): void {
  * Safe by construction rather than by re-derivation, on three counts:
  *  - the persisted value was computed as `min(getNextFutureProcessAfter(),
  *    jittered cap)`, so it can never cross a due row that existed at mark time;
- *  - a row whose `last_active` has moved since is not returned at all —
- *    `updateSession` nulls the column in the same statement, and
- *    `touchSessionActivity` is REQUIRED after any write that changes when work
- *    is next due, so a newly due row always clears the mark;
+ *  - a row whose `last_active` has moved since is not returned at all — every
+ *    write that changes when work is next due goes through
+ *    `withQuietInvalidationSync`, which nulls the column and advances
+ *    `last_active` in one statement immediately BEFORE the row lands, so a
+ *    newly due row always clears the mark;
  *  - a session whose container is alive is never quiet, whatever the row says.
  * Due-ness itself lives only in the session's own `inbound.db`, which this path
  * deliberately does not open; the jittered cap is the outer bound, so the worst

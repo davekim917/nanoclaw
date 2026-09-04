@@ -56,30 +56,23 @@ function childProcessTripwire(record: string[]): Record<string, (...args: unknow
   };
 }
 
-// Codex round 2, H1: both quiet-mark invalidations write the central `sessions`
+// Codex round 2, H1: the quiet-mark invalidation writes the central `sessions`
 // row through the module singleton, which this file's self-contained describe
-// deliberately never initializes. Record the calls instead — their real
-// behavior (nulling `sweep_quiet_until` in the same statement that writes
-// `last_active`) is asserted against real SQLite in
-// src/db/migrations/065-sessions-sweep-quiet-until.test.ts.
+// deliberately never initializes. Record the call instead — the helper's real
+// behavior (nulling `sweep_quiet_until` and advancing `last_active` in one
+// statement, refusing when no ACTIVE row matched) is asserted against real
+// SQLite in src/db/migrations/065-sessions-sweep-quiet-until.test.ts.
 //
-// Each entry is `<phase>:<session id>`: the restore goes through
-// `withQuietInvalidationSync`, which invalidates fail-closed before the row
-// lands and again after it, so both sides are observable here. What the real
-// bracket does on each side is asserted on real SQLite in
-// src/db/migrations/065-sessions-sweep-quiet-until.test.ts.
+// One entry per invalidated session, and the write runs inside it, so this
+// records the ordering the restore depends on.
 const touched = vi.hoisted(() => [] as string[]);
 vi.mock('../../db/sessions.js', async (importOriginal) => {
   const real = await importOriginal<typeof import('../../db/sessions.js')>();
   return {
     ...real,
     withQuietInvalidationSync: <T>(id: string, write: () => T): T => {
-      touched.push(`pre:${id}`);
-      try {
-        return write();
-      } finally {
-        touched.push(`post:${id}`);
-      }
+      touched.push(id);
+      return write();
     },
   };
 });
@@ -460,10 +453,7 @@ describe('recoverMoveIntents (D3) + pruneAuditBodies (D4)', () => {
       .prepare("SELECT COUNT(*) AS c FROM messages_in WHERE series_id='ser-touch'")
       .get() as { c: number };
     expect(live.c, 'the restore did not happen, so the touch proves nothing').toBe(1);
-    expect(touched, 'a restored task row left the source session quiet-marked').toEqual([
-      'pre:src-sess',
-      'post:src-sess',
-    ]);
+    expect(touched, 'a restored task row left the source session quiet-marked').toEqual(['src-sess']);
     expect(h.spawns).toEqual([]);
     db.close();
   });

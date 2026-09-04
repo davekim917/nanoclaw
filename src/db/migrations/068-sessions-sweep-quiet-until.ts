@@ -25,12 +25,14 @@ import type { Migration } from './index.js';
  *
  * ── The invalidation contract this column depends on ──
  * A mark must never outlive a change to when the session next has work due.
- * `updateSession` (src/db/sessions.ts) therefore clears this column in the
- * same statement that writes `last_active`, and `touchSessionActivity` is
- * already REQUIRED after any write that changes due-ness (task insert,
- * `process_after` edit, recurrence re-arm). A future writer that sets
- * `last_active` with raw SQL instead would silently reintroduce the defect;
- * `updateSession` is the only writer today and must stay so.
+ * Two writers clear it, and only two: `updateSession` (src/db/sessions.ts)
+ * nulls it in the same statement that writes `last_active`, and
+ * `withQuietInvalidationSync` — REQUIRED immediately before any write that
+ * changes due-ness (task insert, `process_after` edit, recurrence re-arm), in
+ * the same synchronous turn as that write — does the same and additionally
+ * refuses when no ACTIVE session row matched. A future writer that sets
+ * `last_active` with raw SQL somewhere else would silently reintroduce the
+ * defect.
  */
 export const migration068: Migration = {
   version: 68,

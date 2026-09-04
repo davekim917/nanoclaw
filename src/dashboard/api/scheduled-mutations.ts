@@ -19,7 +19,7 @@ import fs from 'fs';
 import { DATA_DIR, TIMEZONE } from '../../config.js';
 import { resolveGroupTimezone } from '../../container-config.js';
 import { getDb } from '../../db/connection.js';
-import { getSession, QuietInvalidationError, withQuietInvalidation } from '../../db/sessions.js';
+import { getSession, QuietInvalidationError, withQuietInvalidationSync } from '../../db/sessions.js';
 import {
   readSessionInbound,
   readSessionOutbound,
@@ -329,25 +329,30 @@ function afterMutation(agentGroupId: string, sessionId: string): void {
 /**
  * Run one mutation with its quiet-mark invalidation on both sides.
  *
- * The single bracketed-write entry for this module: `withQuietInvalidation`
- * invalidates fail-closed before the session-DB write and again after it, and
- * the refusal is mapped to the HTTP answer this surface owes rather than
- * thrown at the router. A cron edit or a resume recomputes `process_after`
- * straight in the session DB, which the host sweep's quiet cache cannot see;
- * without the invalidation a quiet session sleeps past its new due time, and
- * since S2-PR15 persists that mark, across a restart too.
+ * The single due-ness-write entry for this module. `withQuietInvalidationSync`
+ * runs INSIDE the mailbox callback, in the same synchronous turn as the
+ * statement it protects — outside it, `withMutationSession`'s await would sit
+ * between the invalidation and the row (Codex round 3, H1). The refusal is
+ * mapped to the HTTP answer this surface owes rather than thrown at the router.
  *
- * FAIL-CLOSED (Codex round 2, H1): a central DB that refuses the invalidation
- * gets a 503 and NO write, not a silent success whose due-time change stays
- * hidden behind a mark nothing will clear. A 503 is retryable and visible;
- * missed work is neither.
+ * A cron edit or a resume recomputes `process_after` straight in the session
+ * DB, which the host sweep's quiet cache cannot see; without the invalidation a
+ * quiet session sleeps past its new due time, and since S2-PR15 persists that
+ * mark, across a restart too.
+ *
+ * FAIL-CLOSED (Codex round 2, H1): a central DB that refuses the invalidation —
+ * including because no ACTIVE session row is there any more — gets a 503 and NO
+ * write, not a silent success whose due-time change stays hidden behind a mark
+ * nothing will clear. A 503 is retryable and visible; missed work is neither.
  */
 async function mutateWithInvalidation(
   t: ResolvedTarget,
   action: (mailbox: NanoclawMailboxSession) => number,
 ): Promise<{ touched: number } | { refused: Response }> {
   try {
-    return { touched: await withQuietInvalidation(t.sessionId, () => withMutationSession(t, action)) };
+    return {
+      touched: await withMutationSession(t, (mailbox) => withQuietInvalidationSync(t.sessionId, () => action(mailbox))),
+    };
   } catch (err) {
     const refused = quietRefusal(t.sessionId, err);
     if (refused) return { refused };
@@ -666,17 +671,14 @@ export const cancelHandler: AuthHandler = async (_req, params, ctx) => {
   if (!inboundPath) return json({ error: 'not_found' }, 404);
   if (!fs.existsSync(inboundPath)) return json({ error: 'session_unreadable', reason: 'session_unreadable' }, 503);
 
-  // Cancel has no ResolvedTarget, so it brackets its own open with the same
-  // helper and maps the same refusal.
+  // Cancel has no ResolvedTarget, so it opens the mailbox itself and calls the
+  // same helper from inside the callback, mapping the same refusal.
   let touched: number;
   try {
-    touched = await withQuietInvalidation(
-      decoded.sessionId,
-      async () =>
-        (await withExistingMailboxSession(decoded.agentGroupId, decoded.sessionId, (mailbox) =>
-          mailbox.cancelSeriesWithStrandClear(decoded.seriesId),
-        )) ?? 0,
-    );
+    touched =
+      (await withExistingMailboxSession(decoded.agentGroupId, decoded.sessionId, (mailbox) =>
+        withQuietInvalidationSync(decoded.sessionId, () => mailbox.cancelSeriesWithStrandClear(decoded.seriesId)),
+      )) ?? 0;
   } catch (err) {
     const refused = quietRefusal(decoded.sessionId, err);
     if (refused) return refused;

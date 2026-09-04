@@ -208,124 +208,80 @@ export class QuietInvalidationError extends Error {
 }
 
 /**
- * The `last_active` this invalidation must write so the write is an
- * OBSERVABLE advance. `updateSession` nulls `sweep_quiet_until` in the same
- * statement, but nulling is only half the job: `persistQuietSessionMarks`
- * writes a mark under `WHERE last_active IS <basis>`, so a flush still in
- * flight when this lands re-establishes the mark unless `last_active` has
- * moved off the basis it was computed on. `toISOString()` is millisecond
- * resolution, so two invalidations inside one millisecond would write the
- * SAME string and leave that guard satisfied — the pre-write/post-write pair
- * around a fast mailbox write is exactly that case. Advancing by 1 ms when
- * the clock has not moved keeps the column strictly increasing per session
- * (the host is its only writer, and this read + `updateSession` run with no
- * `await` between them, so no other host code can interleave).
- */
-function advancedLastActive(current: string | null, now: string): string {
-  if (current === null || current < now) return now;
-  const parsed = Date.parse(current);
-  return Number.isNaN(parsed) ? now : new Date(parsed + 1).toISOString();
-}
-
-/**
- * Invalidate a session's quiet mark, FAIL-CLOSED: bumps central `last_active`
- * (which nulls `sweep_quiet_until` in the same statement — see
- * `updateSession`) and THROWS `QuietInvalidationError` if the central DB
- * refuses the write.
+ * Run a due-ness write with its quiet mark invalidated first, or not at all.
  *
- * This is the variant every due-ness writer calls BEFORE its session-DB
- * write. A swallowed failure there is not "advisory": the session-DB row
- * still lands, the persisted mark (migration 065) still hides it, and a
- * warmed restart sleeps through the task's first fire for up to
- * `QUIET_SESSION_BACKOFF_MS`. Aborting the mutation instead leaves the
- * caller's own failure path (a 503, an unresolved move intent, a thrown
- * `scheduleTask`) to be retried — a loud non-write beats a silent
- * never-fires.
- */
-export function invalidateSessionQuiet(id: string): void {
-  try {
-    const now = new Date().toISOString();
-    updateSession(id, { last_active: advancedLastActive(getSession(id)?.last_active ?? null, now) });
-  } catch (err) {
-    throw new QuietInvalidationError(id, err);
-  }
-}
-
-/**
- * Bump a session's central last_active to now. REQUIRED after any write that
- * changes when the session next has due work (task insert, process_after
- * edit, recurrence re-arm): the host-sweep quiet cache and the delivery
- * sweep's activity horizon both key on last_active, so a task written into a
- * quiet/dormant session without this bump sits unseen until the cache
- * expires — or, past the 7-day delivery horizon, indefinitely.
+ * This is the ONLY shape a due-ness write may have. `write` must be the
+ * synchronous better-sqlite3 mutation itself, called from inside an
+ * already-open mailbox callback — never a promise, never a mailbox open.
  *
- * The SWALLOWING variant of `invalidateSessionQuiet`, and correct in exactly
- * one position: AFTER a due-ness write that has already landed. There the
- * mutation cannot be aborted any more, so a failure has nowhere to go but the
- * log — and the pre-write fail-closed invalidation has already run, so the
- * durable state is no worse than before this call was attempted.
- */
-export function touchSessionActivity(id: string): void {
-  try {
-    invalidateSessionQuiet(id);
-  } catch (err) {
-    // Advisory freshness hint — a failed bump must never abort the task
-    // write it rides on. Worst case is the old behavior (cache skips until
-    // expiry), loudly.
-    log.warn('touchSessionActivity failed', { sessionId: id, err });
-  }
-}
-
-/**
- * Run a due-ness write with its quiet-mark invalidation on BOTH sides. This is
- * the only shape any due-ness writer should have — one call, not a hand-rolled
- * pair per site.
+ * ── Why synchronous-only, and why there is no second invalidation ──
+ * The mark this clears is written by `persistQuietSessionMarks`, guarded by
+ * `WHERE sessions.last_active IS <basis>`. Order a sweep's flush against this
+ * helper and there are exactly two cases, both safe:
  *
- * - Before: `invalidateSessionQuiet`, fail-closed. It throws, `write` never
- *   runs, and the caller's own failure path (a 503, a rejected `scheduleTask`,
- *   an unresolved move intent, an un-armed recurrence the next tick retries)
- *   takes over. The session DB and the central DB are two separate files with
- *   no shared transaction, so this ordering is also what makes a crash between
- *   them survivable: a spurious invalidation costs one wasted sweep, an
- *   un-invalidated mark hides due work for up to `QUIET_SESSION_BACKOFF_MS`
- *   after a warmed restart.
- * - After: `touchSessionActivity`, swallowing, in a `finally`. Any `await`
- *   inside `write` is a window a whole sweep tick can run in — reading the
- *   `last_active` the first call published, finding nothing due yet, and
- *   flushing a mark on that basis. The second call advances `last_active`
- *   again and nulls the column, which clears a mark already flushed and
- *   disarms one still in flight (`persistQuietSessionMarks` writes only
- *   `WHERE last_active IS <basis>`). It runs on the throwing path too: a write
- *   that failed midway may still have landed.
+ *   - The flush computed its basis BEFORE this UPDATE. The UPDATE moves
+ *     `last_active` off that basis, so the flush's guard fails and the mark is
+ *     never (re-)established. The value is always strictly greater, even inside
+ *     one millisecond: `toISOString()` is millisecond resolution, so a
+ *     same-millisecond write would otherwise republish the identical basis and
+ *     leave the guard satisfied.
+ *   - The flush computed its basis AFTER this UPDATE. Then it read a session
+ *     whose due row is already committed — `write()` runs with no `await`
+ *     between it and this statement, and better-sqlite3 is synchronous on the
+ *     single host thread, so no sweep tick can observe the gap — and a mark
+ *     taken over work it can see is a correct mark, not a stale one.
  *
- * Over-invalidating is the safe direction — a writer cannot know whether its
- * write will match a row before attempting it, and the cost of invalidating a
- * session that turned out to need nothing is one sweep of a session that has
- * nothing to do.
- */
-export async function withQuietInvalidation<T>(sessionId: string, write: () => Promise<T>): Promise<T> {
-  invalidateSessionQuiet(sessionId);
-  try {
-    return await write();
-  } finally {
-    touchSessionActivity(sessionId);
-  }
-}
-
-/**
- * `withQuietInvalidation` for a synchronous write — a statement inside a
- * mailbox action, or a sweep duty body that must not gain an `await`. Same
- * contract; there is no interleave window inside `write`, but the post-write
- * call still disarms a mark flushed between the two by the tick this write
- * runs inside.
+ * An earlier revision bracketed the write with a second, swallowed
+ * invalidation to cover an `await` in between (Codex round 2, H1). That is what
+ * this shape removes: a best-effort second write is not a guarantee, and its
+ * failure reproduced the very outcome it was added to prevent (round 3, H1).
+ * No await, no window, no second write.
+ *
+ * ── Fail-closed, including on zero rows ──
+ * The statement is written here rather than delegated to `updateSession`
+ * because the affected-row count is the point (round 3, H2). `changes !== 1`
+ * means no ACTIVE session row was there to invalidate — closed, archiving, or
+ * deleted between the caller's discovery and this callback — and the mailbox
+ * write is then abandoned rather than committed into a session the sweep will
+ * never enumerate. `status = 'active'` is exactly the sweep's own enumeration
+ * predicate (`getActiveSessions`) and `getWarmQuietSessionMarks`'.
+ *
+ * `archived_at` is deliberately NOT in the predicate, even though the column
+ * exists on this table (migration 031). Archiving is an operator-side display
+ * flag — an archived session still processes inbound traffic, still runs its
+ * container, and is still enumerated by `getActiveSessions` — so refusing its
+ * due-ness writes would break live sessions merely dismissed from the inbox
+ * view. The predicate has to match what the sweep enumerates, and that is
+ * `status` alone.
  */
 export function withQuietInvalidationSync<T>(sessionId: string, write: () => T): T {
-  invalidateSessionQuiet(sessionId);
+  const now = new Date().toISOString();
+  let changes: number;
   try {
-    return write();
-  } finally {
-    touchSessionActivity(sessionId);
+    changes = getDb()
+      .prepare(
+        `UPDATE sessions
+            SET last_active = CASE
+                  WHEN last_active IS NULL OR last_active < @now THEN @now
+                  -- Strictly increasing even when the clock has not moved: see
+                  -- the first ordering case above.
+                  ELSE strftime('%Y-%m-%dT%H:%M:%fZ', last_active, '+0.001 seconds')
+                END,
+                sweep_quiet_until = NULL
+          WHERE id = @id
+            AND status = 'active'`,
+      )
+      .run({ id: sessionId, now }).changes;
+  } catch (err) {
+    throw new QuietInvalidationError(sessionId, err);
   }
+  if (changes !== 1) {
+    throw new QuietInvalidationError(
+      sessionId,
+      new Error(`no active session row to invalidate (${changes} rows matched)`),
+    );
+  }
+  return write();
 }
 
 /** One quiet mark to persist: the session, the ISO instant its skip expires, and the basis it was computed on. */
