@@ -11,9 +11,22 @@
  * Host-side sanitization for install_packages is defense-in-depth — the MCP
  * tool validates first. Both layers matter: the DB row carries the payload
  * verbatim through to shell exec on apply.
+ *
+ * `parseMcpServerConfig` below is where a bad remote-MCP config fails
+ * closed: it calls `isKnownRawSecret` (../../container-config.js) on every
+ * header value, URL query value, and URL path segment, so a credential
+ * never reaches the DB row this validator builds — durability of that
+ * rejection lives entirely in that one function, not in this file's own
+ * DB/hold-request plumbing.
  */
 import { createHash } from 'node:crypto';
 
+import {
+  opaqueUrlParts,
+  parseMcpServerConfig,
+  validateMcpServerName,
+  type ParsedMcpServerConfig,
+} from '../../container-config.js';
 import { getAgentGroup } from '../../db/agent-groups.js';
 import { log } from '../../log.js';
 import type { Session } from '../../types.js';
@@ -73,19 +86,9 @@ export async function requestInstallPackagesHold(content: Record<string, unknown
   });
 }
 
-/** True if `value` is an array of strings. */
-function isStringArray(value: unknown): value is string[] {
-  return Array.isArray(value) && value.every((v) => typeof v === 'string');
-}
-
-/** True if `value` is a plain object mapping string keys to string values. */
-function isStringRecord(value: unknown): value is Record<string, string> {
-  if (typeof value !== 'object' || value === null || Array.isArray(value)) return false;
-  return Object.values(value).every((v) => typeof v === 'string');
-}
-
 const MAX_MCP_ARGS = 32;
 const MAX_MCP_ENV_VARS = 32;
+const MAX_MCP_HEADERS = 16;
 /** Byte cap on the rendered approval card body (precedent: GATE_CARD_BODY_MAX in agent-route.ts). */
 const MCP_APPROVAL_CARD_MAX_BYTES = 1500;
 /**
@@ -131,23 +134,24 @@ export async function validateAddMcpServer(content: Record<string, unknown>, ses
     await notifyAgent(session, 'add_mcp_server failed: agent group not found.');
     return false;
   }
-  const serverName = content.name as string;
-  const command = content.command as string;
-  if (typeof serverName !== 'string' || !serverName || typeof command !== 'string' || !command) {
-    await notifyAgent(session, 'add_mcp_server failed: name and command are required.');
+  const serverName = typeof content.name === 'string' ? content.name : '';
+  if (!serverName) {
+    await notifyAgent(session, 'add_mcp_server failed: name is required.');
     return false;
   }
-  if (content.args !== undefined && !isStringArray(content.args)) {
-    await notifyAgent(session, 'add_mcp_server failed: args must be an array of strings.');
-    return false;
-  }
-  if (content.env !== undefined && !isStringRecord(content.env)) {
-    await notifyAgent(session, 'add_mcp_server failed: env must be a map of string keys to string values.');
+  let serverConfig: ParsedMcpServerConfig;
+  try {
+    validateMcpServerName(serverName);
+    serverConfig = parseMcpServerConfig(content);
+    // eslint-disable-next-line no-catch-all/no-catch-all -- parse failures are expected agent input errors
+  } catch (err) {
+    await notifyAgent(session, `add_mcp_server failed: ${err instanceof Error ? err.message : String(err)}.`);
     return false;
   }
 
-  const args = (content.args as string[] | undefined) || [];
-  const env = (content.env as Record<string, string> | undefined) || {};
+  const args = serverConfig.type === 'http' ? [] : (serverConfig.args ?? []);
+  const env = serverConfig.type === 'http' ? {} : (serverConfig.env ?? {});
+  const headers = serverConfig.type === 'http' ? (serverConfig.headers ?? {}) : {};
 
   if (args.length > MAX_MCP_ARGS) {
     await notifyAgent(session, `add_mcp_server failed: max ${MAX_MCP_ARGS} args per server.`);
@@ -157,7 +161,11 @@ export async function validateAddMcpServer(content: Record<string, unknown>, ses
     await notifyAgent(session, `add_mcp_server failed: max ${MAX_MCP_ENV_VARS} env vars per server.`);
     return false;
   }
-  if (Buffer.byteLength(JSON.stringify({ name: serverName, command, args, env }), 'utf8') > MCP_PAYLOAD_MAX_BYTES) {
+  if (Object.keys(headers).length > MAX_MCP_HEADERS) {
+    await notifyAgent(session, `add_mcp_server failed: max ${MAX_MCP_HEADERS} headers per server.`);
+    return false;
+  }
+  if (Buffer.byteLength(JSON.stringify({ name: serverName, ...serverConfig }), 'utf8') > MCP_PAYLOAD_MAX_BYTES) {
     await notifyAgent(session, `add_mcp_server failed: payload exceeds ${MCP_PAYLOAD_MAX_BYTES} bytes.`);
     return false;
   }
@@ -168,19 +176,59 @@ export async function requestAddMcpServerHold(content: Record<string, unknown>, 
   const agentGroup = getAgentGroup(session.agent_group_id);
   if (!agentGroup) return; // precheck already answered the requester
   const serverName = content.name as string;
-  const command = content.command as string;
-  const args = (content.args as string[] | undefined) || [];
-  const env = (content.env as Record<string, string> | undefined) || {};
+  const serverConfig = parseMcpServerConfig(content);
 
-  // Card-only view: secret-shaped values render as redaction placeholders;
-  // the payload below keeps the verbatim values.
-  const displayArgs = args.map((a) => (SECRET_VALUE_RE.test(a) ? redactSecret(a) : a));
-  const displayEnv = Object.fromEntries(
-    Object.entries(env).map(([k, v]) => [
-      k,
-      SECRET_ENV_KEY_RE.test(k) || SECRET_VALUE_RE.test(v) ? redactSecret(v) : v,
-    ]),
-  );
+  let fields: string[];
+  let opaqueWarning = '';
+  if (serverConfig.type === 'http') {
+    // No redaction on the URL: `parseMcpServerConfig` rejects a credential in
+    // the path, the query, or a header before we get here, so the card shows
+    // exactly the destination that will be persisted — which is the thing an
+    // admin has to judge. Redacting here instead would have meant approving a
+    // secret we then wrote to container.json unredacted.
+    fields = [
+      `name: ${escapeInvisibles(JSON.stringify(serverName))}`,
+      `type: ${escapeInvisibles(JSON.stringify(serverConfig.type))}`,
+      `url: ${escapeInvisibles(JSON.stringify(serverConfig.url))}`,
+    ];
+    if (serverConfig.headers !== undefined) {
+      fields.push(`headers: ${escapeInvisibles(JSON.stringify(serverConfig.headers))}`);
+    }
+    // Recognizable credential shapes are already rejected at parse. What is
+    // left is the unclassifiable case: an opaque path segment or query value
+    // that is either a tenant id or a bearer token, with nothing in the string
+    // to tell them apart. Name it for the human who is already approving this,
+    // rather than guessing in a regex — the URL is persisted verbatim.
+    const opaque = opaqueUrlParts(serverConfig.url);
+    if (opaque.length > 0) {
+      opaqueWarning =
+        `\n⚠️ This URL carries ${opaque.length === 1 ? 'an opaque value' : 'opaque values'} ` +
+        `(${opaque.map((v) => escapeInvisibles(JSON.stringify(v))).join(', ')}). ` +
+        'If any of those is a credential, reject this and have the server use a header with the "onecli-managed" ' +
+        'placeholder instead — the URL is stored verbatim in container.json.';
+    }
+  } else {
+    const args = serverConfig.args ?? [];
+    const env = serverConfig.env ?? {};
+    // Card-only view: secret-shaped values render as redaction placeholders;
+    // the payload below keeps the verbatim values.
+    const displayArgs = args.map((a) => (SECRET_VALUE_RE.test(a) ? redactSecret(a) : a));
+    const displayEnv = Object.fromEntries(
+      Object.entries(env).map(([k, v]) => [
+        k,
+        SECRET_ENV_KEY_RE.test(k) || SECRET_VALUE_RE.test(v) ? redactSecret(v) : v,
+      ]),
+    );
+    fields = [
+      `name: ${escapeInvisibles(JSON.stringify(serverName))}`,
+      `command: ${escapeInvisibles(JSON.stringify(serverConfig.command))}`,
+      `args: ${escapeInvisibles(JSON.stringify(displayArgs))}`,
+      `env: ${escapeInvisibles(JSON.stringify(displayEnv))}`,
+    ];
+  }
+  if (serverConfig.instructions !== undefined) {
+    fields.push(`instructions: ${escapeInvisibles(JSON.stringify(serverConfig.instructions))}`);
+  }
 
   // JSON-encode each field (exact boundaries, embedded newlines render as
   // visible \n escapes), escape invisibles/backticks, and wrap the payload
@@ -189,15 +237,13 @@ export async function requestAddMcpServerHold(content: Record<string, unknown>, 
   const question =
     `Agent "${agentGroup.name}" is attempting to add a new MCP server:\n` +
     '```\n' +
-    `name: ${escapeInvisibles(JSON.stringify(serverName))}\n` +
-    `command: ${escapeInvisibles(JSON.stringify(command))}\n` +
-    `args: ${escapeInvisibles(JSON.stringify(displayArgs))}\n` +
-    `env: ${escapeInvisibles(JSON.stringify(displayEnv))}\n` +
-    '```';
+    fields.join('\n') +
+    '\n```' +
+    opaqueWarning;
   if (Buffer.byteLength(question, 'utf8') > MCP_APPROVAL_CARD_MAX_BYTES) {
     await notifyAgent(
       session,
-      `add_mcp_server failed: rendered approval card exceeds ${MCP_APPROVAL_CARD_MAX_BYTES} bytes — trim args/env.`,
+      `add_mcp_server failed: rendered approval card exceeds ${MCP_APPROVAL_CARD_MAX_BYTES} bytes — trim the MCP configuration.`,
     );
     return;
   }
@@ -206,7 +252,7 @@ export async function requestAddMcpServerHold(content: Record<string, unknown>, 
     session,
     agentName: agentGroup.name,
     action: 'add_mcp_server',
-    payload: { name: serverName, command, args, env },
+    payload: { name: serverName, ...serverConfig },
     title: 'Add MCP Request',
     question,
   });

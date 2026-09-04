@@ -2,9 +2,11 @@ import fs from 'fs';
 import path from 'path';
 import { parse } from 'yaml';
 
+import { parseMcpServerConfig, validateMcpServerName, type ParsedMcpServerConfig } from '../container-config.js';
+
 /** A parsed template folder. Pure data — no DB, no side effects. */
 export interface Template {
-  mcpServers: Record<string, unknown>; // .mcp.json .mcpServers — name -> launch config
+  mcpServers: Record<string, ParsedMcpServerConfig>; // .mcp.json .mcpServers — name -> validated launch config
   instructions: string; // context/instructions.md (required)
   contextExtras: { name: string; content: string }[]; // context/**/*.md except instructions.md; name relative to context/
   skills: { name: string; srcDir: string }[]; // skills/<name>/ real folders
@@ -27,6 +29,35 @@ function asRecord(value: unknown): Record<string, unknown> {
   return value && typeof value === 'object' && !Array.isArray(value) ? (value as Record<string, unknown>) : {};
 }
 
+/** Every field a template `.mcp.json` server entry may carry. */
+const MCP_TEMPLATE_FIELDS = ['type', 'command', 'args', 'env', 'url', 'headers', 'instructions'];
+
+/**
+ * Validate a template's `.mcp.json` through the same parser the ncl and
+ * approval paths use, so a template cannot stamp a config those paths would
+ * reject. Unknown fields are an error rather than a silent drop: an author
+ * pasting a vendor snippet must hear about the part that will not apply.
+ */
+function parseTemplateMcpServers(raw: Record<string, unknown>): Record<string, ParsedMcpServerConfig> {
+  const mcpServers: Record<string, ParsedMcpServerConfig> = {};
+  for (const [name, config] of Object.entries(raw)) {
+    try {
+      validateMcpServerName(name);
+      const input = asRecord(config);
+      const unknownField = Object.keys(input).find((key) => !MCP_TEMPLATE_FIELDS.includes(key));
+      if (unknownField !== undefined) {
+        throw new Error(`unknown field "${unknownField}" (allowed: ${MCP_TEMPLATE_FIELDS.join(', ')})`);
+      }
+      mcpServers[name] = parseMcpServerConfig(input);
+      // eslint-disable-next-line no-catch-all/no-catch-all -- template authoring errors are expected input errors
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      throw new Error(`Invalid .mcp.json server ${JSON.stringify(name)}: ${message}`, { cause: err });
+    }
+  }
+  return mcpServers;
+}
+
 /**
  * Read and validate a template folder into a typed object. The folder and
  * context/instructions.md are required; optional task files are strict so a
@@ -35,7 +66,7 @@ function asRecord(value: unknown): Record<string, unknown> {
 export function parseTemplate(dir: string): Template {
   if (!fs.existsSync(dir)) throw new Error(`Template folder not found: ${dir}`);
 
-  const mcpServers = asRecord(asRecord(readJson(path.join(dir, '.mcp.json'))).mcpServers);
+  const mcpServers = parseTemplateMcpServers(asRecord(asRecord(readJson(path.join(dir, '.mcp.json'))).mcpServers));
 
   const instructionsFile = path.join(dir, 'context', 'instructions.md');
   if (!fs.existsSync(instructionsFile)) {

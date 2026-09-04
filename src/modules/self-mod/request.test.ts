@@ -351,6 +351,172 @@ describe('add_mcp_server validation', () => {
   });
 });
 
+describe('add_mcp_server remote Streamable HTTP servers', () => {
+  it('accepts a remote https url and renders it on the card', async () => {
+    await submitAddMcpServer({ name: 'deepwiki', url: 'https://mcp.deepwiki.com/mcp' }, session);
+    expect(delivered).toHaveLength(1);
+    const question = lastQuestion();
+    expect(question).toContain('type: "http"');
+    expect(question).toContain('url: "https://mcp.deepwiki.com/mcp"');
+    // The stdio-only fields must not appear on a remote card.
+    expect(question).not.toContain('command:');
+
+    const [row] = getPendingApprovalsByAction('add_mcp_server');
+    expect(JSON.parse(row.payload as string)).toEqual({
+      name: 'deepwiki',
+      type: 'http',
+      url: 'https://mcp.deepwiki.com/mcp',
+    });
+  });
+
+  it('keeps a non-secret query string byte-faithful on the card', async () => {
+    const url = 'https://mcp.exa.ai/mcp?tools=web_search_exa,web_fetch_exa';
+    await submitAddMcpServer({ name: 'exa', url }, session);
+    expect(lastQuestion()).toContain(`url: ${JSON.stringify(url)}`);
+  });
+
+  it('rejects a credential embedded in the url path before anything is persisted', async () => {
+    // A Zapier-style https://host/s/<token>/mcp. The URL is written verbatim
+    // to container.json and to the approval row, so redacting it for display
+    // would still leave the secret on disk — reject at intake instead.
+    await submitAddMcpServer(
+      { name: 'zapier', url: 'https://hooks.example.com/s/sk-ant-api03-J8sK2mN9pQ4rT6vX1zA3/mcp' },
+      session,
+    );
+    expect(expectRejected()).toMatch(/url path carries a raw credential/);
+  });
+
+  it('rejects a raw credential in a query value', async () => {
+    await submitAddMcpServer({ name: 'q', url: 'https://example.com/mcp?tools=ghp_deadbeefcafe1234' }, session);
+    expect(expectRejected()).toMatch(/carries a raw credential/);
+  });
+
+  it('shows the remote url unredacted on the card — recognizable credentials are already rejected', async () => {
+    const url = 'https://mcp.deepwiki.com/mcp';
+    await submitAddMcpServer({ name: 'deepwiki2', url }, session);
+    const question = lastQuestion();
+    expect(question).toContain(`url: ${JSON.stringify(url)}`);
+    // An ordinary endpoint carries no warning.
+    expect(question).not.toContain('opaque');
+    const [row] = getPendingApprovalsByAction('add_mcp_server');
+    expect(JSON.parse(row.payload as string).url).toBe(url);
+  });
+
+  it('warns the approver about an opaque path segment instead of guessing at it', async () => {
+    // Token-shaped and tenant-id-shaped are the same string. The human already
+    // approving this is the only one who can tell, so name the segment.
+    const url = 'https://hooks.example.com/s/aB3xY9kLmN2pQ7rS/mcp';
+    await submitAddMcpServer({ name: 'zapier', url }, session);
+    const question = lastQuestion();
+    expect(question).toContain('opaque value');
+    expect(question).toContain('aB3xY9kLmN2pQ7rS');
+    expect(question).toContain('onecli-managed');
+    // Still approved, still persisted verbatim — the warning informs, it does
+    // not block.
+    const [row] = getPendingApprovalsByAction('add_mcp_server');
+    expect(JSON.parse(row.payload as string).url).toBe(url);
+  });
+
+  it('rejects a credential header that smuggles a real secret past the placeholder', async () => {
+    await submitAddMcpServer(
+      {
+        name: 'smuggle',
+        url: 'https://example.com/mcp',
+        headers: { Authorization: 'Bearer actual-secret onecli-managed' },
+      },
+      session,
+    );
+    expect(expectRejected()).toMatch(/must be exactly/);
+  });
+
+  it('carries OneCLI placeholder headers through to the payload and the card', async () => {
+    await submitAddMcpServer(
+      { name: 'datafold', url: 'https://app.datafold.com/mcp/', headers: { Authorization: 'Key onecli-managed' } },
+      session,
+    );
+    expect(lastQuestion()).toContain('headers: {"Authorization":"Key onecli-managed"}');
+    const [row] = getPendingApprovalsByAction('add_mcp_server');
+    expect(JSON.parse(row.payload as string).headers).toEqual({ Authorization: 'Key onecli-managed' });
+  });
+
+  it('rejects a credential header that is not the OneCLI placeholder', async () => {
+    await submitAddMcpServer(
+      { name: 'leaky', url: 'https://example.com/mcp', headers: { Authorization: 'Bearer real-token-here' } },
+      session,
+    );
+    expect(expectRejected()).toMatch(/onecli-managed/);
+  });
+
+  it('rejects a literal on any header outside the configuration allowlist', async () => {
+    // Whatever the value looks like: `abc123` is a perfectly good API key.
+    for (const value of ['ghp_deadbeefcafe1234', 'abc123']) {
+      delivered = [];
+      await submitAddMcpServer(
+        { name: 'leaky', url: 'https://example.com/mcp', headers: { 'X-Functions-Key': value } },
+        session,
+      );
+      expect(expectRejected()).toMatch(/not a known configuration header/);
+    }
+  });
+
+  it('still refuses a recognizable credential inside an allowlisted header', async () => {
+    await submitAddMcpServer(
+      { name: 'leaky', url: 'https://example.com/mcp', headers: { 'User-Agent': 'ghp_deadbeefcafe1234' } },
+      session,
+    );
+    expect(expectRejected()).toMatch(/raw credential/);
+  });
+
+  it('rejects plain http except for localhost and host.docker.internal', async () => {
+    await submitAddMcpServer({ name: 'insecure', url: 'http://example.com/mcp' }, session);
+    expect(expectRejected()).toMatch(/must use HTTPS/);
+
+    delivered = [];
+    await submitAddMcpServer({ name: 'local', url: 'http://localhost:8080/mcp' }, session);
+    expect(delivered).toHaveLength(1);
+
+    delivered = [];
+    await submitAddMcpServer({ name: 'hostgw', url: 'http://host.docker.internal:8080/mcp' }, session);
+    expect(delivered).toHaveLength(1);
+  });
+
+  it('rejects credentials, fragments, and credential-shaped query keys in the url', async () => {
+    for (const url of [
+      'https://user:pass@example.com/mcp',
+      'https://example.com/mcp#frag',
+      'https://example.com/mcp?authToken=abc',
+      'https://example.com/mcp?api_key=abc',
+    ]) {
+      delivered = [];
+      await submitAddMcpServer({ name: 'bad', url }, session);
+      expectRejected();
+    }
+  });
+
+  it('rejects command and url together, and stdio-only fields on a remote server', async () => {
+    await submitAddMcpServer({ name: 'both', command: 'node', url: 'https://example.com/mcp' }, session);
+    expect(expectRejected()).toMatch(/exactly one of command or url/);
+
+    delivered = [];
+    await submitAddMcpServer({ name: 'mixed', url: 'https://example.com/mcp', env: { K: 'v' } }, session);
+    expect(expectRejected()).toMatch(/only valid with command/);
+
+    delivered = [];
+    await submitAddMcpServer({ name: 'mixed', command: 'node', headers: { 'X-A': 'b' } }, session);
+    expect(expectRejected()).toMatch(/headers are only valid with url/);
+  });
+
+  it('rejects a server name outside the [A-Za-z0-9_-] charset', async () => {
+    await submitAddMcpServer({ name: 'bad name!', url: 'https://example.com/mcp' }, session);
+    expect(expectRejected()).toMatch(/1-64 characters/);
+  });
+
+  it('rejects an env key that is not a valid environment variable name', async () => {
+    await submitAddMcpServer({ name: 'ok', command: 'node', env: { 'not-an-env-key': 'v' } }, session);
+    expect(expectRejected()).toMatch(/environment variable name/);
+  });
+});
+
 describe('add_mcp_server secret redaction', () => {
   function redactedForm(value: string): string {
     const digest = createHash('sha256').update(value).digest('hex').slice(0, 8);

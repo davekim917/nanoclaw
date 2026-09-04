@@ -10,6 +10,21 @@
  *
  * install_packages: update DB + rebuild image + kill container + on_wake.
  * add_mcp_server: update DB + kill container + on_wake.
+ *
+ * getContainerConfig/updateContainerConfigJson/updateContainerConfigScalars
+ * (../../db/container-configs.js) below are generic DB persistence CRUD,
+ * shared by every operationally-mutated container-config field (provider,
+ * model, packages, mcp_servers, timezone, …) — they hold no MCP-specific
+ * validation. The credential/URL/header/name invariants for a remote MCP
+ * server all live one layer down, in `parseMcpServerConfig`,
+ * `validateMcpServerName`, `isKnownRawSecret`, and `normalizeMcpHeaders`
+ * (../../container-config.js) — the single primitive every one of those
+ * rules is enforced in, called before any of the DB writes below ever run.
+ * A server that reaches these DB writes has already had every header
+ * validated as ByteString, deduplicated case-insensitively, and checked
+ * against the OneCLI placeholder — this file only persists what
+ * normalizeMcpHeaders already approved, and claims nothing about whether the
+ * placeholder's underlying secret is actually assigned to this group.
  */
 import { buildAgentGroupImage, killContainer, wakeContainer } from '../../container-runner.js';
 import { getAgentGroup } from '../../db/agent-groups.js';
@@ -21,7 +36,13 @@ import {
 import { getDeniedModel } from '../../db/denied-models.js';
 import { getSession } from '../../db/sessions.js';
 import { isOpenCodeModelSlug } from '../../flag-parser.js';
-import { validateMcpServers, type McpServerConfig } from '../../container-config.js';
+import {
+  isOneCliPlaceholder,
+  parseMcpServerConfig,
+  updateContainerConfig,
+  validateMcpServerName,
+  type ParsedMcpServerConfig,
+} from '../../container-config.js';
 import { log } from '../../log.js';
 import { writeSessionMessage } from '../../session-manager.js';
 import type { Session } from '../../types.js';
@@ -99,7 +120,9 @@ export async function applyInstallPackages(payload: Record<string, unknown>, ses
         session,
         `Packages added to config (${pkgs}) but rebuild failed: ${e instanceof Error ? e.message : String(e)}. Tell the user — an admin will need to retry the install_packages request or inspect the build logs.`,
       ),
-    ).catch((err) => log.warn('install_packages failure notification failed', { err, agentGroupId: session.agent_group_id }));
+    ).catch((err) =>
+      log.warn('install_packages failure notification failed', { err, agentGroupId: session.agent_group_id }),
+    );
     log.error('Bundled rebuild failed after install approval', { agentGroupId: session.agent_group_id, err: e });
   }
 }
@@ -117,14 +140,45 @@ export async function applyAddMcpServer(payload: Record<string, unknown>, sessio
     return;
   }
 
-  // Add the new MCP server to the existing map in the DB
-  const servers = JSON.parse(configRow.mcp_servers) as Record<string, McpServerConfig>;
-  servers[payload.name as string] = {
-    command: payload.command as string,
-    args: (payload.args as string[]) || [],
-    env: (payload.env as Record<string, string>) || {},
-  };
-  updateContainerConfigJson(agentGroup.id, 'mcp_servers', validateMcpServers(servers));
+  // Re-validate the approved payload before it reaches container.json. The
+  // request path already parsed it, but this is the last gate before a config
+  // the container will actually load, so it fails closed on its own.
+  const name = typeof payload.name === 'string' ? payload.name : '';
+  if (!name) {
+    notifyAgent(session, 'add_mcp_server approved but server name is missing.');
+    return;
+  }
+  let serverConfig: ParsedMcpServerConfig;
+  try {
+    validateMcpServerName(name);
+    serverConfig = parseMcpServerConfig(payload);
+    // eslint-disable-next-line no-catch-all/no-catch-all -- approval payload validation must fail closed
+  } catch (err) {
+    notifyAgent(
+      session,
+      `add_mcp_server approved but config is invalid: ${err instanceof Error ? err.message : String(err)}.`,
+    );
+    return;
+  }
+
+  // Dual-write, exactly as `ncl groups config add-mcp-server` does: the FILE
+  // is what the spawn path reads (`readContainerConfig`), the DB column is the
+  // projection `groups config get` reports and the next file-to-DB backfill
+  // would otherwise overwrite. Writing only the DB restarted the container
+  // without the server the admin just approved.
+  const fileConfig = updateContainerConfig(agentGroup.folder, (config) => {
+    if (!config.mcpServers) config.mcpServers = {};
+    config.mcpServers[name] = serverConfig;
+  });
+  updateContainerConfigJson(agentGroup.id, 'mcp_servers', fileConfig.mcpServers ?? {});
+
+  // Declaring the placeholder wires the header; it does not grant the secret.
+  // Keyed on the placeholder VALUE, not on headers being present at all — a
+  // server carrying only `Content-Type` authenticates with nothing, and
+  // telling its operator to go assign a vault secret would send them after a
+  // credential that does not exist.
+  const needsCredential =
+    serverConfig.type === 'http' && Object.values(serverConfig.headers ?? {}).some(isOneCliPlaceholder);
 
   await writeSessionMessage(session.agent_group_id, session.id, {
     id: `appr-note-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
@@ -134,7 +188,17 @@ export async function applyAddMcpServer(payload: Record<string, unknown>, sessio
     channelType: 'agent',
     threadId: null,
     content: JSON.stringify({
-      text: `MCP server "${payload.name}" added. Verify it's available (e.g. list your tools) and report the result to the user.`,
+      // A remote server declared with a placeholder header still needs the
+      // matching vault secret ASSIGNED to this group before the gateway can
+      // substitute it. Auto-created agents default to `selective` mode with
+      // nothing assigned, so the symptom is a 401 from an API whose
+      // credential is in the vault — name the remedy here rather than leave
+      // the agent to rediscover it (CLAUDE.md, Secrets / Credentials / OneCLI).
+      text:
+        `MCP server "${name}" added. Verify it's available (e.g. list your tools) and report the result to the user.` +
+        (needsCredential
+          ? " It authenticates through the OneCLI gateway: if calls come back 401, one likely cause is that the credential exists but is not assigned to this agent group — an operator adds it to `onecliSecrets` in the group's container.json, or runs `onecli agents set-secrets`. A 401 can also mean an expired or incorrect secret, a missing gateway rule, or an authentication scheme the server doesn't accept."
+          : ''),
       sender: 'system',
       senderId: 'system',
     }),

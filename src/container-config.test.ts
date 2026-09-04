@@ -5,6 +5,9 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import {
   configFromDb,
+  opaqueUrlParts,
+  parseMcpServerConfig,
+  validateMcpServerName,
   readContainerConfig,
   readContainerConfigForSpawn,
   readContainerConfigStrict,
@@ -19,6 +22,7 @@ import { closeDb, initTestDb } from './db/connection.js';
 import { ensureContainerConfig, getContainerConfig, updateContainerConfigScalars } from './db/container-configs.js';
 import { runMigrations } from './db/migrations/index.js';
 import type { AgentGroup } from './types.js';
+import knownSecretShapes from '../tests/fixtures/mcp-known-secret-shapes.json' with { type: 'json' };
 
 let tmpDir: string;
 
@@ -314,5 +318,252 @@ describe('resolveGroupTimezone', () => {
       timezone: 'Asia/Tokyo',
     });
     expect(readContainerConfig('tz-file').timezone).toBe('Asia/Tokyo');
+  });
+});
+
+/**
+ * `parseMcpServerConfig` is the single validator behind the ncl flag path, the
+ * approval payload path, and template `.mcp.json` — and it is mirrored by
+ * hand in container/agent-runner/src/mcp-tools/self-mod.ts. These pin the
+ * rules that mirror has to match.
+ */
+describe('parseMcpServerConfig', () => {
+  it('normalizes a local stdio server and leaves `type` implicit', () => {
+    expect(parseMcpServerConfig({ command: 'mcp-fs', args: ['/data'] })).toEqual({
+      command: 'mcp-fs',
+      args: ['/data'],
+      env: {},
+    });
+  });
+
+  it('parses a remote Streamable HTTP server, with and without headers', () => {
+    expect(parseMcpServerConfig({ url: 'https://mcp.deepwiki.com/mcp' })).toEqual({
+      type: 'http',
+      url: 'https://mcp.deepwiki.com/mcp',
+    });
+    expect(
+      parseMcpServerConfig({
+        url: 'https://app.datafold.com/mcp/',
+        headers: { Authorization: 'Key onecli-managed' },
+      }),
+    ).toEqual({
+      type: 'http',
+      url: 'https://app.datafold.com/mcp/',
+      headers: { Authorization: 'Key onecli-managed' },
+    });
+  });
+
+  it('accepts the "streamable-http" type alias and rejects any other transport', () => {
+    expect(parseMcpServerConfig({ type: 'streamable-http', url: 'https://example.com/mcp' })).toEqual({
+      type: 'http',
+      url: 'https://example.com/mcp',
+    });
+    expect(() => parseMcpServerConfig({ type: 'sse', url: 'https://example.com/sse' })).toThrow(
+      /unsupported MCP transport/,
+    );
+  });
+
+  it('requires exactly one transport and keeps their fields apart', () => {
+    expect(() => parseMcpServerConfig({})).toThrow(/exactly one of command or url/);
+    expect(() => parseMcpServerConfig({ command: 'node', url: 'https://example.com/mcp' })).toThrow(
+      /exactly one of command or url/,
+    );
+    expect(() => parseMcpServerConfig({ url: 'https://example.com/mcp', args: ['x'] })).toThrow(
+      /only valid with command/,
+    );
+    expect(() => parseMcpServerConfig({ command: 'node', headers: { 'X-A': 'b' } })).toThrow(
+      /headers are only valid with url/,
+    );
+  });
+
+  it('requires HTTPS except on loopback and the docker host gateway', () => {
+    expect(() => parseMcpServerConfig({ url: 'http://example.com/mcp' })).toThrow(/must use HTTPS/);
+    for (const host of ['localhost', '127.0.0.1', '[::1]', 'host.docker.internal']) {
+      expect(parseMcpServerConfig({ url: `http://${host}:8080/mcp` })).toMatchObject({ type: 'http' });
+    }
+  });
+
+  it('rejects credentials in the URL and credential-shaped query keys, but keeps ordinary ones', () => {
+    expect(() => parseMcpServerConfig({ url: 'https://u:p@example.com/mcp' })).toThrow(/must not contain credentials/);
+    expect(() => parseMcpServerConfig({ url: 'https://example.com/mcp#f' })).toThrow(/must not contain credentials/);
+    for (const key of ['authToken', 'api_key', 'clientSecret', 'x-auth', 'jwt']) {
+      expect(() => parseMcpServerConfig({ url: `https://example.com/mcp?${key}=v` })).toThrow(
+        /looks like a credential/,
+      );
+    }
+    // `author` must not trip the `auth` word — the match is word-bounded.
+    expect(parseMcpServerConfig({ url: 'https://example.com/mcp?author=me&tools=a,b' })).toMatchObject({
+      url: 'https://example.com/mcp?author=me&tools=a,b',
+    });
+  });
+
+  it('rejects a raw credential in the path or a query value, not just in a key', () => {
+    // The URL is persisted verbatim to container.json and to the approval row,
+    // so a Zapier-style token in the path is an on-disk secret.
+    expect(() =>
+      parseMcpServerConfig({ url: 'https://hooks.example.com/s/sk-ant-api03-J8sK2mN9pQ4rT6vX1zA3/mcp' }),
+    ).toThrow(/url path carries a raw credential/);
+    expect(() => parseMcpServerConfig({ url: 'https://example.com/mcp?tools=ghp_deadbeef1234' })).toThrow(
+      /carries a raw credential/,
+    );
+    // Percent-encoding must not smuggle one past the check.
+    expect(() => parseMcpServerConfig({ url: 'https://example.com/s/ghp_deadbeef1234/mcp' })).toThrow(/raw credential/);
+    // A JWT in a neutral-named query param (no credential-shaped KEY, so the
+    // key check misses it) or the path — same shape src/secret-scrubber.ts
+    // already redacts. Dotted values are excluded from `looksOpaque`, so this
+    // regex is the only net that catches it.
+    const jwt = 'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U';
+    expect(() => parseMcpServerConfig({ url: `https://example.com/mcp?code=${jwt}` })).toThrow(/raw credential/);
+    expect(() => parseMcpServerConfig({ url: `https://example.com/callback/${jwt}` })).toThrow(/raw credential/);
+    // An opaque path segment that matches no known credential shape is fine.
+    expect(parseMcpServerConfig({ url: 'https://hooks.example.com/s/abc123/mcp' })).toMatchObject({
+      url: 'https://hooks.example.com/s/abc123/mcp',
+    });
+  });
+
+  it('rejects every credential shape TOKEN_SHAPE_PATTERNS recognizes, as a header value', () => {
+    // TOKEN_SHAPE_PATTERNS (src/secret-scrubber.ts) is imported rather than
+    // hand-copied precisely so this file never falls a round behind it — this
+    // pins that promise against a shared fixture instead of trusting it by
+    // inspection. tests/fixtures/mcp-known-secret-shapes.json is read by the
+    // container-side mirror's own test too, so the two suites fail together
+    // if either side drifts from the same list.
+    for (const { name, value } of knownSecretShapes as { name: string; value: string }[]) {
+      // An allowlisted header, same as the existing `User-Agent` case below —
+      // otherwise the "not a known configuration header" check fires first
+      // and the raw-credential check under test is never reached.
+      expect(
+        () => parseMcpServerConfig({ url: 'https://example.com/mcp', headers: { 'User-Agent': value } }),
+        `${name} (${JSON.stringify(value)}) should be rejected as a raw credential`,
+      ).toThrow(/raw credential/);
+    }
+  });
+
+  it('forces credential headers through the OneCLI placeholder, in an exact form', () => {
+    expect(() =>
+      parseMcpServerConfig({ url: 'https://example.com/mcp', headers: { Authorization: 'Bearer real' } }),
+    ).toThrow(/onecli-managed/);
+    // A substring test accepted this: the real secret rides along and is
+    // persisted, while the rule that exists to stop it passes.
+    expect(() =>
+      parseMcpServerConfig({
+        url: 'https://example.com/mcp',
+        headers: { Authorization: 'Bearer actual-secret onecli-managed' },
+      }),
+    ).toThrow(/must be exactly/);
+    expect(() =>
+      parseMcpServerConfig({ url: 'https://example.com/mcp', headers: { Authorization: 'onecli-managed extra' } }),
+    ).toThrow(/must be exactly/);
+    // The two legal shapes.
+    for (const value of ['onecli-managed', 'Bearer onecli-managed', 'Key onecli-managed']) {
+      expect(parseMcpServerConfig({ url: 'https://example.com/mcp', headers: { Authorization: value } })).toMatchObject(
+        { headers: { Authorization: value } },
+      );
+    }
+    // On an allowlisted configuration header, a literal is legal in general —
+    // but a recognizable credential in it is still refused.
+    expect(() =>
+      parseMcpServerConfig({ url: 'https://example.com/mcp', headers: { 'User-Agent': 'ghp_deadbeef1234' } }),
+    ).toThrow(/raw credential/);
+    expect(() => parseMcpServerConfig({ url: 'https://example.com/mcp', headers: { 'bad header': 'v' } })).toThrow(
+      /valid HTTP header field name/,
+    );
+  });
+
+  it('rejects control characters in a header value, allowlisted or not', () => {
+    // CRLF injection: a standard HTTP client rejects this at connect time, so
+    // the server would be approved and restarted, then unusable.
+    expect(() =>
+      parseMcpServerConfig({
+        url: 'https://example.com/mcp',
+        headers: { 'Content-Type': 'application/json\r\nX-Injected: yes' },
+      }),
+    ).toThrow(/control character/);
+    expect(() =>
+      parseMcpServerConfig({ url: 'https://example.com/mcp', headers: { Authorization: 'onecli-managed ' } }),
+    ).toThrow(/control character/);
+    // A plain tab is not rejected — only CR/LF/NUL and other C0 controls are.
+    expect(parseMcpServerConfig({ url: 'https://example.com/mcp', headers: { 'User-Agent': 'a\tb' } })).toMatchObject({
+      headers: { 'User-Agent': 'a\tb' },
+    });
+  });
+
+  it('rejects a header value above U+00FF — Bun/Node Headers is Latin-1, not arbitrary Unicode', () => {
+    // Passed a control-character-only check before; the actual MCP transport
+    // rejects it at connect time, so the server was approved and restarted,
+    // then unusable.
+    expect(() => parseMcpServerConfig({ url: 'https://example.com/mcp', headers: { 'User-Agent': '测试' } })).toThrow(
+      /above U\+00FF/,
+    );
+    // Latin-1 (up to U+00FF) is fine, even outside plain ASCII.
+    expect(parseMcpServerConfig({ url: 'https://example.com/mcp', headers: { 'User-Agent': 'café' } })).toMatchObject({
+      headers: { 'User-Agent': 'café' },
+    });
+  });
+
+  it('rejects a case-variant duplicate header name', () => {
+    // HTTP header names are case-insensitive; Headers combines "Authorization"
+    // and "authorization" into one comma-joined value on the wire, which no
+    // longer matches the placeholder form already validated and can leave
+    // the server unauthenticated.
+    expect(() =>
+      parseMcpServerConfig({
+        url: 'https://example.com/mcp',
+        headers: { Authorization: 'onecli-managed', authorization: 'Bearer onecli-managed' },
+      }),
+    ).toThrow(/case-insensitive/);
+  });
+
+  it('rejects an env key that is not a valid environment variable name', () => {
+    expect(() => parseMcpServerConfig({ command: 'node', env: { 'not-an-env-key': 'v' } })).toThrow(
+      /environment variable name/,
+    );
+  });
+
+  it('validateMcpServerName allows the [A-Za-z0-9_-] charset only', () => {
+    expect(() => validateMcpServerName('ok_name-1')).not.toThrow();
+    for (const bad of ['', 'has space', 'dot.name', 'a'.repeat(65)]) {
+      expect(() => validateMcpServerName(bad)).toThrow(/1-64 characters/);
+    }
+  });
+
+  it('validateMcpServerName rejects names that hit Object.prototype on plain assignment', () => {
+    // Every write site does `mcpServers[name] = config` on a plain object.
+    // These three names all pass the charset check but resolve to an
+    // inherited prototype setter/property instead of an own enumerable key,
+    // so the server silently vanishes from JSON.stringify while the caller
+    // reports success.
+    for (const reserved of ['__proto__', 'constructor', 'prototype']) {
+      expect(() => validateMcpServerName(reserved)).toThrow(/reserved/);
+    }
+  });
+
+  it('validateMcpServerName rejects "nanoclaw" — the built-in server the runner seeds', () => {
+    // container/agent-runner/src/index.ts seeds mcpServers.nanoclaw, then
+    // layers every container.json entry on top with the same plain
+    // assignment. A static entry named "nanoclaw" would silently replace
+    // the built-in.
+    expect(() => validateMcpServerName('nanoclaw')).toThrow(/reserved/);
+  });
+});
+
+describe('opaqueUrlParts', () => {
+  it('names path segments and query values a human should eyeball', () => {
+    // These are token-shaped, but equally tenant-id-shaped — nothing in the
+    // string separates the two, which is why they warn rather than reject.
+    expect(opaqueUrlParts('https://hooks.example.com/s/aB3xY9kLmN2pQ7rS/mcp')).toEqual(['aB3xY9kLmN2pQ7rS']);
+    expect(opaqueUrlParts('https://example.com/mcp?workspace=aB3xY9kLmN2pQ7rS')).toEqual(['aB3xY9kLmN2pQ7rS']);
+  });
+
+  it('stays quiet on ordinary endpoints, including the ones this install already wires', () => {
+    for (const url of [
+      'https://mcp.deepwiki.com/mcp',
+      'https://app.datafold.com/mcp/',
+      'https://mcp.linear.app/mcp',
+      'https://mcp.exa.ai/mcp?tools=web_search_exa,web_fetch_exa',
+      'https://example.com/v1/acme-engineering/mcp',
+    ]) {
+      expect(opaqueUrlParts(url)).toEqual([]);
+    }
   });
 });

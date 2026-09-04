@@ -505,6 +505,80 @@ describe('groups CLI resource config', () => {
     expect(readContainerConfig(folder).assistantName).toBe('Renamed');
   });
 
+  it('test_groups_config_add_mcp_server_accepts_a_remote_http_url', async () => {
+    const id = 'ag-remote-mcp';
+    const folder = 'remote-mcp';
+    createAgentGroup({ id, name: folder, folder, agent_provider: null, created_at: now() });
+    ensureContainerConfig(id);
+    const groupDir = `${TEST_DIR}/groups/${folder}`;
+    fs.mkdirSync(groupDir, { recursive: true });
+    fs.writeFileSync(
+      `${groupDir}/container.json`,
+      JSON.stringify({ mcpServers: {}, packages: { apt: [], npm: [] }, skills: 'all' }) + '\n',
+    );
+
+    const response = await dispatch(
+      {
+        id: 'req-remote-mcp',
+        command: 'groups-config-add-mcp-server',
+        args: {
+          id,
+          name: 'datafold',
+          url: 'https://app.datafold.com/mcp/',
+          headers: JSON.stringify({ Authorization: 'Key onecli-managed' }),
+        },
+      },
+      { caller: 'host' },
+    );
+    expect(response.ok).toBe(true);
+
+    // Dual-write: container.json is what the spawn reads, the DB row is the
+    // projection `groups config get` reports.
+    expect(readContainerConfig(folder).mcpServers.datafold).toEqual({
+      type: 'http',
+      url: 'https://app.datafold.com/mcp/',
+      headers: { Authorization: 'Key onecli-managed' },
+    });
+    expect(JSON.parse(getContainerConfig(id)!.mcp_servers).datafold).toMatchObject({ type: 'http' });
+  });
+
+  it('test_groups_config_add_mcp_server_rejects_an_unsafe_remote_url', async () => {
+    const id = 'ag-remote-mcp-bad';
+    const folder = 'remote-mcp-bad';
+    createAgentGroup({ id, name: folder, folder, agent_provider: null, created_at: now() });
+    ensureContainerConfig(id);
+
+    const insecure = await dispatch(
+      {
+        id: 'req-remote-mcp-http',
+        command: 'groups-config-add-mcp-server',
+        args: { id, name: 'insecure', url: 'http://example.com/mcp' },
+      },
+      { caller: 'host' },
+    );
+    expect(insecure.ok).toBe(false);
+    expect(JSON.stringify(insecure)).toMatch(/must use HTTPS/);
+
+    const leaky = await dispatch(
+      {
+        id: 'req-remote-mcp-header',
+        command: 'groups-config-add-mcp-server',
+        args: {
+          id,
+          name: 'leaky',
+          url: 'https://example.com/mcp',
+          headers: JSON.stringify({ Authorization: 'Bearer real-token' }),
+        },
+      },
+      { caller: 'host' },
+    );
+    expect(leaky.ok).toBe(false);
+    expect(JSON.stringify(leaky)).toMatch(/onecli-managed/);
+
+    // Nothing was written on either rejection.
+    expect(JSON.parse(getContainerConfig(id)!.mcp_servers)).toEqual({});
+  });
+
   it('test_groups_create_timezone_lands_in_the_db_row_not_only_container_json', async () => {
     // initGroupFilesystem deliberately skips the container_configs insert, so
     // without an explicit stamp the scalar write here updates zero rows — the

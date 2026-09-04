@@ -188,7 +188,57 @@ describe('createProvider (codex)', () => {
       expect(p.mcpServers.exa.command).toBe('bun');
       expect(p.mcpServers.exa.args).toEqual(['/app/src/remote-mcp-bridge.ts', 'https://mcp.exa.ai/mcp']);
       expect(p.mcpServers.exa.env?.REMOTE_MCP_NAME).toBe('exa');
-      expect(p.mcpServers.custom.env?.REMOTE_MCP_AUTHORIZATION).toBe('Bearer placeholder');
+      expect(JSON.parse(p.mcpServers.custom.env?.REMOTE_MCP_HEADERS ?? '{}')).toEqual({
+        Authorization: 'Bearer placeholder',
+      });
+    } finally {
+      if (previous === undefined) delete process.env.NANOCLAW_CODEX_MCP_HTTP_BRIDGE_FALLBACK;
+      else process.env.NANOCLAW_CODEX_MCP_HTTP_BRIDGE_FALLBACK = previous;
+    }
+  });
+
+  it('forwards every declared header through the bridge, not just Authorization', () => {
+    // Round 5 finding: the CLI/template/approval flow validates and reports
+    // success on the full header map, but the bridge used to extract only
+    // Authorization — X-Api-Version and a placeholder custom header were
+    // silently dropped, and the fallback connection ran unauthenticated or
+    // misconfigured with no error anywhere in the chain.
+    const previous = process.env.NANOCLAW_CODEX_MCP_HTTP_BRIDGE_FALLBACK;
+    try {
+      process.env.NANOCLAW_CODEX_MCP_HTTP_BRIDGE_FALLBACK = '1';
+      const p = new CodexProvider({
+        mcpServers: {
+          custom: {
+            type: 'http',
+            url: 'https://example.test/mcp',
+            headers: {
+              Authorization: 'Bearer onecli-managed',
+              'X-Api-Version': '2024-01-01',
+              'X-Custom': 'onecli-managed',
+            },
+          },
+        },
+      }) as unknown as { mcpServers: Record<string, { env?: Record<string, string> }> };
+
+      expect(JSON.parse(p.mcpServers.custom.env?.REMOTE_MCP_HEADERS ?? '{}')).toEqual({
+        Authorization: 'Bearer onecli-managed',
+        'X-Api-Version': '2024-01-01',
+        'X-Custom': 'onecli-managed',
+      });
+    } finally {
+      if (previous === undefined) delete process.env.NANOCLAW_CODEX_MCP_HTTP_BRIDGE_FALLBACK;
+      else process.env.NANOCLAW_CODEX_MCP_HTTP_BRIDGE_FALLBACK = previous;
+    }
+  });
+
+  it('omits REMOTE_MCP_HEADERS entirely when the server declares no headers', () => {
+    const previous = process.env.NANOCLAW_CODEX_MCP_HTTP_BRIDGE_FALLBACK;
+    try {
+      process.env.NANOCLAW_CODEX_MCP_HTTP_BRIDGE_FALLBACK = '1';
+      const p = new CodexProvider({
+        mcpServers: { exa: { type: 'http', url: 'https://mcp.exa.ai/mcp' } },
+      }) as unknown as { mcpServers: Record<string, { env?: Record<string, string> }> };
+      expect(p.mcpServers.exa.env?.REMOTE_MCP_HEADERS).toBeUndefined();
     } finally {
       if (previous === undefined) delete process.env.NANOCLAW_CODEX_MCP_HTTP_BRIDGE_FALLBACK;
       else process.env.NANOCLAW_CODEX_MCP_HTTP_BRIDGE_FALLBACK = previous;
@@ -264,8 +314,8 @@ describe('createProvider (codex)', () => {
             },
           },
         }) as unknown as { mcpServers: Record<string, { env?: Record<string, string> }> };
-        // Env starts with REMOTE_MCP_NAME + REMOTE_MCP_AUTHORIZATION (set by
-        // the provider, not by augment). Host HTTPS_PROXY then fills in.
+        // Env starts with REMOTE_MCP_NAME + REMOTE_MCP_HEADERS (set by the
+        // provider, not by augment). Host HTTPS_PROXY then fills in.
         expect(p.mcpServers.custom.env?.HTTPS_PROXY).toBe('http://host-default:10255');
       });
     });

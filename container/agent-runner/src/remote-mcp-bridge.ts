@@ -41,11 +41,27 @@ function remoteUrl(): string {
   return url;
 }
 
-function requestHeaders(): HeadersInit | undefined {
-  const headers: Record<string, string> = {};
-  const authorization = process.env.REMOTE_MCP_AUTHORIZATION;
-  if (authorization) headers.Authorization = authorization;
-  return Object.keys(headers).length > 0 ? headers : undefined;
+/**
+ * The full header map the host/container parser already validated
+ * (src/container-config.ts / self-mod.ts's `normalizeMcpHeaders`), passed
+ * through as JSON — not just Authorization. A server declared with
+ * X-Api-Version or a custom OneCLI-managed placeholder header had every
+ * header past Authorization silently dropped here, a narrower set than the
+ * one the CLI/template/approval flow validated and reported success on.
+ */
+export function requestHeaders(): HeadersInit | undefined {
+  const raw = process.env.REMOTE_MCP_HEADERS;
+  if (!raw) return undefined;
+  let headers: unknown;
+  try {
+    headers = JSON.parse(raw);
+  } catch (err) {
+    throw new Error(`REMOTE_MCP_HEADERS is not valid JSON: ${errorText(err)}`);
+  }
+  if (typeof headers !== 'object' || headers === null || Array.isArray(headers)) {
+    throw new Error('REMOTE_MCP_HEADERS must be a JSON object with string values');
+  }
+  return Object.keys(headers).length > 0 ? (headers as Record<string, string>) : undefined;
 }
 
 function errorText(err: unknown): string {
@@ -126,7 +142,9 @@ async function main(): Promise<void> {
   log(`${name} bridge ready (${url})`);
 }
 
-main().catch((err) => {
-  log(`fatal: ${err instanceof Error ? (err.stack ?? err.message) : String(err)}`);
-  process.exit(1);
-});
+if (import.meta.main) {
+  main().catch((err) => {
+    log(`fatal: ${err instanceof Error ? (err.stack ?? err.message) : String(err)}`);
+    process.exit(1);
+  });
+}

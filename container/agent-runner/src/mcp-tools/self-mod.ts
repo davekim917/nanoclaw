@@ -52,8 +52,16 @@ export const installPackages: McpToolDefinition = {
     inputSchema: {
       type: 'object' as const,
       properties: {
-        apt: { type: 'array', items: { type: 'string' }, description: 'apt packages to install (names only, no version specs or flags)' },
-        npm: { type: 'array', items: { type: 'string' }, description: 'npm packages to install globally (names only, no version specs)' },
+        apt: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'apt packages to install (names only, no version specs or flags)',
+        },
+        npm: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'npm packages to install globally (names only, no version specs)',
+        },
         reason: { type: 'string', description: 'Why these packages are needed' },
       },
     },
@@ -65,7 +73,8 @@ export const installPackages: McpToolDefinition = {
     if (apt.length + npm.length > MAX_PACKAGES) return err(`Maximum ${MAX_PACKAGES} packages per request`);
 
     const invalidApt = apt.find((p) => !APT_RE.test(p));
-    if (invalidApt) return err(`Invalid apt package name: "${invalidApt}". Only lowercase letters, digits, and ._+- allowed.`);
+    if (invalidApt)
+      return err(`Invalid apt package name: "${invalidApt}". Only lowercase letters, digits, and ._+- allowed.`);
     const invalidNpm = npm.find((p) => !NPM_RE.test(p));
     if (invalidNpm) return err(`Invalid npm package name: "${invalidNpm}". No version specs or shell characters.`);
 
@@ -86,26 +95,275 @@ export const installPackages: McpToolDefinition = {
   },
 };
 
+/**
+ * Query keys that name a credential. Mirrors the host's `isCredentialQueryKey`
+ * (src/container-config.ts).
+ *
+ * Two passes: word-bounded after camelCase splitting catches `authToken` and
+ * `api_key`, and a SUFFIX pass catches the all-lowercase compounds `apikey`,
+ * `accesskey`, `authtoken` that have no boundary to find. `monkey` and
+ * `turnkey` are refused as a deliberate cost — nobody passes those to an MCP
+ * endpoint, while `?apikey=` is how half the internet spells auth.
+ */
+const CREDENTIAL_NOUNS = 'o?auth(orization)?|token|key|secret|passw(or)?d|pwd|credentials?|bearer|jwt|sig(nature)?';
+const SECRET_QUERY_WORD_RE = new RegExp(`(^|[_.-])(${CREDENTIAL_NOUNS})([_.-]|$)`, 'i');
+const SECRET_QUERY_SUFFIX_RE = new RegExp(`(${CREDENTIAL_NOUNS})$`, 'i');
+
+/** camelCase → snake_case before matching, so `authToken` hits the word list. */
+const CAMEL_SPLIT_RE = /([a-z0-9])([A-Z])/g;
+
+function isCredentialQueryKey(key: string): boolean {
+  const normalized = key.replace(CAMEL_SPLIT_RE, '$1_$2');
+  return SECRET_QUERY_WORD_RE.test(normalized) || SECRET_QUERY_SUFFIX_RE.test(normalized);
+}
+
+/**
+ * Names and env keys reach provider config writers with structural syntax —
+ * the codex writer emits TOML table headers, and `mcpAllowPattern` in the
+ * Claude provider collapses non-[A-Za-z0-9_-] to `_`, so unvalidated names
+ * can collide. Hence a charset allowlist at every entry point.
+ */
+const MCP_SERVER_NAME_RE = /^[A-Za-z0-9_-]{1,64}$/;
+/**
+ * Mirrors the host's RESERVED_MCP_SERVER_NAMES (src/container-config.ts): a
+ * plain-object `mcpServers[name] = config` assignment hits an inherited
+ * Object.prototype setter/property for the first three, dropping the server
+ * silently; `nanoclaw` would instead silently replace the built-in nanoclaw
+ * MCP server that src/index.ts seeds before layering container.json on top.
+ */
+const RESERVED_MCP_SERVER_NAMES = new Set(['__proto__', 'constructor', 'prototype', 'nanoclaw']);
+const ENV_KEY_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
+/** RFC 7230 token charset — what a header field-name may contain. */
+const HEADER_NAME_RE = /^[A-Za-z0-9!#$%&'*+.^_`|~-]{1,64}$/;
+/**
+ * The ONLY header names a remote MCP server may set to a literal value.
+ * Mirrors the host's `LITERAL_HEADER_ALLOWLIST` (src/container-config.ts).
+ *
+ * An allowlist of configuration, not a denylist of credentials: credential
+ * header names are an open set and so are credential values (`abc123` is a
+ * fine API key and looks like nothing), so neither can gate. Configuration
+ * headers are a small closed set, so that is what gets enumerated.
+ */
+const LITERAL_HEADER_ALLOWLIST = new Set([
+  'accept',
+  'accept-encoding',
+  'accept-language',
+  'content-type',
+  'user-agent',
+  'mcp-protocol-version',
+  'x-api-version',
+  'x-request-id',
+]);
+/** The value the OneCLI gateway replaces at the proxy boundary. */
+const ONECLI_PLACEHOLDER = 'onecli-managed';
+/**
+ * The ONLY accepted forms for a non-allowlisted header: the bare placeholder,
+ * or a single auth-scheme token in front of it.
+ */
+const ONECLI_HEADER_VALUE_RE = new RegExp(`^(?:[A-Za-z][A-Za-z0-9-]* )?${ONECLI_PLACEHOLDER}$`);
+/**
+ * Shapes of real credentials that must never be written into container.json.
+ *
+ * Mirrors the host's `isKnownRawSecret` (src/container-config.ts) — this
+ * container is Bun and can't import host code, so unlike the host (which
+ * imports TOKEN_SHAPE_PATTERNS from src/secret-scrubber.ts), this file hand-
+ * copies the same shapes. That copy is what
+ * tests/fixtures/mcp-known-secret-shapes.json exists to keep honest: both
+ * this file's test and the host's run the identical fixture list, so a
+ * shape one side gains and the other doesn't fails on THIS side's test
+ * immediately rather than waiting for the next review round to notice.
+ */
+const RAW_SECRET_VALUE_RE =
+  /(^|\s)(github_pat_|AKIA|-----BEGIN )|\bsk-(?:ant-)?[A-Za-z0-9_-]{20,}\b|\b(?:sk|rk)_(?:live|test)_[A-Za-z0-9_-]{12,}\b|\bxox[abpr]-[A-Za-z0-9-]+\b|\bghp_[A-Za-z0-9]+\b|\bglpat-[A-Za-z0-9_-]+\b|\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/;
+type ParsedMcpServer =
+  | { type: 'http'; url: string; headers?: Record<string, string> }
+  | { command: string; args: string[]; env: Record<string, string> };
+
+/**
+ * Mirrors the host's `normalizeMcpHeaders` (src/container-config.ts).
+ *
+ * - Duplicate names, after lowercasing: HTTP header names are
+ *   case-insensitive, so `{ Authorization, authorization }` looks like two
+ *   headers to this plain-object copy but is one header on the wire —
+ *   `Headers` combines them with a comma, which no longer matches the
+ *   placeholder form already validated and can leave the server
+ *   unauthenticated.
+ * - Value validity, by constructing `new Headers({ [key]: value })` — the
+ *   same constructor the runtime hands the request to. It throws on control
+ *   characters AND on any code point above U+00FF: header values are Latin-1
+ *   bytes on the wire, not arbitrary Unicode, so `User-Agent: "测试"` used to
+ *   pass a control-character-only check and then fail when the actual MCP
+ *   connection tried to send it.
+ */
+function normalizeMcpHeaders(rawHeaders: unknown): { headers: Record<string, string> } | { error: string } {
+  if (typeof rawHeaders !== 'object' || rawHeaders === null || Array.isArray(rawHeaders)) {
+    return { error: 'headers must be an object with string values' };
+  }
+  const seenNames = new Set<string>();
+  const headers: Record<string, string> = {};
+  for (const [key, value] of Object.entries(rawHeaders)) {
+    if (typeof value !== 'string') return { error: 'headers must be an object with string values' };
+    if (!HEADER_NAME_RE.test(key)) {
+      return { error: `header name ${JSON.stringify(key)} is not a valid HTTP header field name` };
+    }
+    const lowerName = key.toLowerCase();
+    if (seenNames.has(lowerName)) {
+      return {
+        error: `header "${key}" duplicates an already-declared header of the same name (HTTP header names are case-insensitive) — Headers combines them into one value on the wire, which can silently break authentication`,
+      };
+    }
+    seenNames.add(lowerName);
+    try {
+      new Headers({ [key]: value });
+    } catch {
+      return {
+        error: `header "${key}" value is not valid for an HTTP header (control characters and any character above U+00FF are rejected by the transport)`,
+      };
+    }
+    if (RAW_SECRET_VALUE_RE.test(value)) {
+      return {
+        error: `header "${key}" carries a raw credential; declare it as "${ONECLI_PLACEHOLDER}" and let the OneCLI gateway inject the real value`,
+      };
+    }
+    if (!LITERAL_HEADER_ALLOWLIST.has(lowerName) && !ONECLI_HEADER_VALUE_RE.test(value)) {
+      return {
+        error: `header "${key}" is not a known configuration header, so its value must be exactly "${ONECLI_PLACEHOLDER}" or an auth scheme followed by it (e.g. "Bearer ${ONECLI_PLACEHOLDER}"). Configuration headers that carry no credential: ${[...LITERAL_HEADER_ALLOWLIST].join(', ')}`,
+      };
+    }
+    headers[key] = value;
+  }
+  return { headers };
+}
+
+/**
+ * Mirrors the host's `parseMcpServerConfig` (src/container-config.ts) — the
+ * host re-validates on receipt and again on apply, but this copy answers the
+ * agent instantly instead of after an approval round-trip. There are no
+ * shared modules across the host/container boundary; keep the two in sync.
+ */
+function parseMcpServerInput(args: Record<string, unknown>): { config: ParsedMcpServer } | { error: string } {
+  const declaredType = args.type === undefined ? undefined : String(args.type);
+  if (declaredType !== undefined && !['stdio', 'http', 'streamable-http'].includes(declaredType)) {
+    return { error: `unsupported MCP transport ${JSON.stringify(args.type)}; use "stdio" or "http"` };
+  }
+  const command = typeof args.command === 'string' && args.command.trim() ? args.command : undefined;
+  const url = typeof args.url === 'string' && args.url.trim() ? args.url.trim() : undefined;
+
+  if (url !== undefined) {
+    if (command !== undefined) return { error: 'Provide exactly one of command or url' };
+    // A declared type that contradicts the fields is a mistake, not something
+    // to silently rewrite.
+    if (declaredType === 'stdio') return { error: 'type "stdio" cannot be used with url; use "http"' };
+    if (args.args !== undefined || args.env !== undefined) return { error: 'args and env are only valid with command' };
+    let parsed: URL;
+    try {
+      parsed = new URL(url);
+    } catch {
+      return { error: 'url must be a valid HTTP(S) URL' };
+    }
+    const loopback = ['localhost', '127.0.0.1', '[::1]', 'host.docker.internal'].includes(parsed.hostname);
+    if (parsed.protocol !== 'https:' && !(parsed.protocol === 'http:' && loopback)) {
+      return { error: 'url must use HTTPS (plain HTTP is allowed only for localhost and host.docker.internal)' };
+    }
+    if (parsed.username || parsed.password || parsed.hash) {
+      return { error: 'url must not contain credentials or fragments; use the OneCLI gateway for authentication' };
+    }
+    for (const [key, value] of parsed.searchParams) {
+      if (isCredentialQueryKey(key)) {
+        return {
+          error: `url query parameter "${key}" looks like a credential; use the OneCLI gateway for authentication`,
+        };
+      }
+      if (RAW_SECRET_VALUE_RE.test(value)) {
+        return {
+          error: `url query parameter "${key}" carries a raw credential; use the OneCLI gateway for authentication`,
+        };
+      }
+    }
+    // Some vendors put the token in the PATH (a Zapier-style
+    // https://host/s/<token>/mcp). The URL is persisted verbatim, so reject
+    // a credential there at intake rather than redacting it for display.
+    for (const segment of parsed.pathname.split('/')) {
+      if (RAW_SECRET_VALUE_RE.test(decodeURIComponent(segment))) {
+        return {
+          error:
+            'url path carries a raw credential; use the OneCLI gateway for authentication rather than a secret in the URL',
+        };
+      }
+    }
+    if (args.headers === undefined) return { config: { type: 'http', url } };
+    const normalized = normalizeMcpHeaders(args.headers);
+    if ('error' in normalized) return normalized;
+    return {
+      config: {
+        type: 'http',
+        url,
+        ...(Object.keys(normalized.headers).length === 0 ? {} : { headers: normalized.headers }),
+      },
+    };
+  }
+  if (command === undefined) return { error: 'Provide exactly one of command or url' };
+  if (declaredType !== undefined && declaredType !== 'stdio') {
+    return { error: `type ${JSON.stringify(declaredType)} cannot be used with command; use "stdio" or omit it` };
+  }
+  if (args.headers !== undefined) return { error: 'headers are only valid with url' };
+
+  const commandArgs = args.args ?? [];
+  if (!Array.isArray(commandArgs) || !commandArgs.every((arg) => typeof arg === 'string')) {
+    return { error: 'args must be an array of strings' };
+  }
+  const rawEnv = args.env ?? {};
+  if (typeof rawEnv !== 'object' || rawEnv === null || Array.isArray(rawEnv)) {
+    return { error: 'env must be an object with string values' };
+  }
+  const env: Record<string, string> = {};
+  for (const [key, value] of Object.entries(rawEnv)) {
+    if (typeof value !== 'string') return { error: 'env must be an object with string values' };
+    if (!ENV_KEY_RE.test(key)) {
+      return { error: `env key ${JSON.stringify(key)} must be a valid environment variable name` };
+    }
+    env[key] = value;
+  }
+  return { config: { command, args: commandArgs, env } };
+}
+
 export const addMcpServer: McpToolDefinition = {
   tool: {
     name: 'add_mcp_server',
     description:
-      'Wire an EXISTING third-party MCP server into YOUR per-agent runtime config — you must already know the exact `command` + `args` to invoke it (e.g. `npx @modelcontextprotocol/server-github`; browse options at https://mcp.so). Requires admin approval; fire-and-forget. Never ask the user for credentials or fabricate credential-setup instructions — OneCLI handles them: use `"onecli-managed"` as the placeholder value for any credential env var or config field the server needs. After the server is installed and the container restarts, load the `onecli-gateway` skill for the full credential-handling flow (connect URLs, stubs, error recovery).',
+      'Wire an EXISTING third-party MCP server into YOUR per-agent runtime config. Provide EITHER the local `command` + optional `args`/`env` (e.g. `npx @modelcontextprotocol/server-github`; browse options at https://mcp.so), OR the remote Streamable HTTP `url` of a hosted server (HTTPS; plain HTTP only for localhost / host.docker.internal). Requires admin approval; fire-and-forget. Never ask the user for credentials or fabricate credential-setup instructions — OneCLI handles them: use `"onecli-managed"` as the placeholder value for any credential env var, header, or config field the server needs (e.g. `headers: { "Authorization": "Bearer onecli-managed" }`). After the server is installed and the container restarts, load the `onecli-gateway` skill for the full credential-handling flow (connect URLs, stubs, error recovery).',
     inputSchema: {
       type: 'object' as const,
       properties: {
         name: { type: 'string', description: 'MCP server name (unique identifier)' },
-        command: { type: 'string', description: 'Command to run the MCP server' },
-        args: { type: 'array', items: { type: 'string' }, description: 'Command arguments' },
-        env: { type: 'object', description: 'Environment variables for the server' },
+        command: { type: 'string', description: 'Command to run a local stdio MCP server' },
+        url: {
+          type: 'string',
+          description:
+            'Streamable HTTP MCP endpoint (HTTPS; plain HTTP only for localhost / host.docker.internal). Mutually exclusive with command.',
+        },
+        args: { type: 'array', items: { type: 'string' }, description: 'Command arguments (command only)' },
+        env: { type: 'object', description: 'Environment variables for the server (command only)' },
+        headers: {
+          type: 'object',
+          description:
+            'HTTP headers for a remote server (url only). Credential headers must use the "onecli-managed" placeholder — the gateway substitutes the real secret at the proxy boundary.',
+        },
       },
-      required: ['name', 'command'],
+      required: ['name'],
     },
   },
   async handler(args) {
-    const name = args.name as string;
-    const command = args.command as string;
-    if (!name || !command) return err('name and command are required');
+    const name = typeof args.name === 'string' ? args.name : '';
+    if (!name) return err('name is required');
+    if (!MCP_SERVER_NAME_RE.test(name)) {
+      return err('server name must be 1-64 characters of letters, digits, "_" or "-"');
+    }
+    if (RESERVED_MCP_SERVER_NAMES.has(name)) {
+      return err(`server name ${JSON.stringify(name)} is reserved`);
+    }
+    const parsed = parseMcpServerInput(args);
+    if ('error' in parsed) return err(parsed.error);
 
     const requestId = generateId();
     await writeMessageOut({
@@ -114,13 +372,11 @@ export const addMcpServer: McpToolDefinition = {
       content: JSON.stringify({
         action: 'add_mcp_server',
         name,
-        command,
-        args: (args.args as string[]) || [],
-        env: (args.env as Record<string, string>) || {},
+        ...parsed.config,
       }),
     });
 
-    log(`add_mcp_server: ${requestId} → "${name}" (${command})`);
+    log(`add_mcp_server: ${requestId} → "${name}" (${'url' in parsed.config ? 'HTTP' : parsed.config.command})`);
     return ok(`MCP server request submitted. You will be notified when admin approves or rejects.`);
   },
 };
@@ -241,7 +497,8 @@ export const changeModel: McpToolDefinition = {
         effort: {
           type: 'string',
           enum: ['low', 'medium', 'high', 'max'],
-          description: 'Optional effort level (max is supported by some models, e.g. DeepSeek V4). Omit to keep current.',
+          description:
+            'Optional effort level (max is supported by some models, e.g. DeepSeek V4). Omit to keep current.',
         },
       },
       required: ['slug'],
@@ -278,7 +535,9 @@ export const changeModel: McpToolDefinition = {
           .prepare('SELECT reason FROM denied_models WHERE provider = ? AND slug = ?')
           .get(provider, slug) as { reason?: string } | undefined;
         if (denied) {
-          return err(`"${slug}" is on the operator deny list${denied.reason ? ` (${denied.reason})` : ''} — cannot switch to it.`);
+          return err(
+            `"${slug}" is on the operator deny list${denied.reason ? ` (${denied.reason})` : ''} — cannot switch to it.`,
+          );
         }
       } catch {
         // denied_models absent on an older session projection — skip the check.

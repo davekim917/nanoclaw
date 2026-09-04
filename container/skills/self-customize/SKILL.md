@@ -64,7 +64,7 @@ The limits are **per builder task**, not per session. A 500-line feature is fine
 User: "Can you add a tool for reading RSS feeds?"
 
 1. Check [mcp.so](https://mcp.so) for an existing RSS MCP server
-2. If one exists → `add_mcp_server({ name: "rss", command: "npx", args: ["some-rss-mcp"] })` → admin approves → container restarts with the new server → done
+2. If one exists → `add_mcp_server({ name: "rss", command: "npx", args: ["some-rss-mcp"] })` — or, for a hosted server, `add_mcp_server({ name: "rss", url: "https://example.com/mcp" })` — → admin approves → container restarts with the new server → done
 3. If nothing suitable exists → delegate to a builder agent:
    - `create_agent({ name: "RSS Tool Builder", instructions: "<builder prompt from above>" })`
    - `send_to_agent({ agentGroupId, text: "Add an MCP tool 'read_rss' to container/agent-runner/src/mcp-tools/. It should fetch an RSS URL and return the latest N items. Register it in mcp-tools/index.ts. Target: <200 new lines." })`

@@ -53,19 +53,19 @@ is optional and defaults sensibly:
 │   ├── instructions.md        # REQUIRED: the agent's standing persona; marks the folder as a template
 │   └── additional_context/    # optional: extra .md files, referenced from instructions.md by relative path
 │       └── *.md
-├── .mcp.json             # optional: MCP servers (command + args), NO secrets
+├── .mcp.json             # optional: MCP servers (command + args, or url), NO secrets
 ├── skills/<name>/        # optional: one folder per skill (SKILL.md + any references/), copied whole
 ├── tasks/*.md             # optional: recurring tasks, created paused
 └── README.md             # recommended: per-template docs
 ```
 
-| Path | Loaded as | Required |
-|------|-----------|----------|
-| `context/instructions.md` | The agent's persona, prepended to its `CLAUDE.md`/`AGENTS.md` every spawn (system-prompt tier, any provider) | **Yes** |
-| `context/**/*.md` (others) | Extra context, copied into the agent's workspace with the same layout relative to `instructions.md` | No |
-| `.mcp.json` → `mcpServers` | MCP tool servers (written verbatim to container config) | No |
-| `skills/<name>/` | A skill, auto-triggered by its `description` | No |
-| `tasks/*.md` | Recurring scheduled tasks, created paused pending user activation | No |
+| Path                       | Loaded as                                                                                                    | Required |
+| -------------------------- | ------------------------------------------------------------------------------------------------------------ | -------- |
+| `context/instructions.md`  | The agent's persona, prepended to its `CLAUDE.md`/`AGENTS.md` every spawn (system-prompt tier, any provider) | **Yes**  |
+| `context/**/*.md` (others) | Extra context, copied into the agent's workspace with the same layout relative to `instructions.md`          | No       |
+| `.mcp.json` → `mcpServers` | MCP tool servers (written verbatim to container config)                                                      | No       |
+| `skills/<name>/`           | A skill, auto-triggered by its `description`                                                                 | No       |
+| `tasks/*.md`               | Recurring scheduled tasks, created paused pending user activation                                            | No       |
 
 Notes:
 
@@ -87,7 +87,7 @@ is the prompt:
 
 ```markdown
 ---
-schedule: "*/15 * * * *"
+schedule: '*/15 * * * *'
 script: |
   if [ -f /workspace/agent/wake-next-task ]; then
     echo '{"wakeAgent": true}'
@@ -148,17 +148,44 @@ won't reach an already-created agent. Re-stamp the same name to update it.
 
 ## MCP servers and credentials
 
-**Templates declare MCP servers, not secrets.** `.mcp.json` carries `command` +
-`args` only:
+**Templates declare MCP servers, not secrets.** Each entry is either a local
+stdio server (`command` + optional `args`/`env`) or a remote Streamable HTTP
+server (`url` + optional `headers`):
 
 ```json
 {
   "mcpServers": {
     "hubspot": { "command": "npx", "args": ["-y", "@hubspot/mcp-server"] },
-    "exa":     { "command": "npx", "args": ["-y", "exa-mcp-server"] }
+    "exa": { "command": "npx", "args": ["-y", "exa-mcp-server"] },
+    "datafold": {
+      "type": "http",
+      "url": "https://app.datafold.com/mcp/",
+      "headers": { "Authorization": "Key onecli-managed" }
+    }
   }
 }
 ```
+
+Entries are validated at parse time by the same parser the `ncl` and approval
+paths use, so a template cannot stamp a config those paths would reject:
+server names are `[A-Za-z0-9_-]{1,64}`, exactly one of `command` or `url` is
+required, remote URLs must be HTTPS (plain HTTP only for `localhost` /
+`host.docker.internal`) with no credentials, fragment, credential-looking
+query parameter, or recognizable credential shape anywhere in the path or a
+query value. A declared `type` must agree with the fields (`stdio` with
+`command`, `http`/`streamable-http` with `url`). Only known configuration
+headers may hold a literal value — `Accept`, `Accept-Encoding`,
+`Accept-Language`, `Content-Type`, `User-Agent`, `MCP-Protocol-Version`,
+`X-Api-Version`, `X-Request-Id` — and every other header must be exactly
+`onecli-managed` or an auth scheme followed by it. That is an allowlist of
+configuration rather than a denylist of credentials, because credential header
+names and credential values are both open sets while configuration headers are
+not. An unknown field is an error rather than a silent
+drop.
+
+The URL is stored verbatim, and an opaque path segment is indistinguishable
+from a tenant id, so recognition is a backstop rather than a guarantee: keep
+credentials out of the URL and put them in a header with the placeholder.
 
 Credentials are held by the **credentials proxy** and injected into outbound
 HTTPS calls at the proxy boundary, matched by API host, at request time. The key
@@ -179,7 +206,7 @@ Two ways a credential gets connected:
 
 ### MCP servers that require an env var to boot
 
-Some MCP servers refuse to start unless an env var is *present*, even though the
+Some MCP servers refuse to start unless an env var is _present_, even though the
 real credential should come from the credentials proxy, not the env. Because `.mcp.json`'s `env`
 block passes through verbatim to the agent's container config, put a **placeholder
 value** there to satisfy the boot check:
@@ -202,7 +229,7 @@ the server won't boot without one.
 
 ### Approval-gating sensitive actions
 
-The credentials proxy can *hold* a credentialed outbound request and require a
+The credentials proxy can _hold_ a credentialed outbound request and require a
 human to approve it before it leaves the proxy: enforcement the agent can't talk
 around. This is matched on the outbound HTTP request (host + method + path),
 configured on the credentials proxy, and answered by NanoClaw (it DMs an approver). The host side is
