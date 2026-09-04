@@ -1144,6 +1144,10 @@ describe('skill wiring', () => {
     // A dry run updates no remote, so it must not write a claim that a site
     // patch was pushed into any PR body.
     expect(push).toContain('PUSH_DRY_RUN=1');
+    // PR resolution describes one repository, so a second remote is refused
+    // rather than resolved for: a push to `other` would otherwise be judged by
+    // the checkout repository's PRs.
+    expect(push).toContain('is not origin; the churn gate resolves PRs for one repository');
     expect(push).toMatch(/PUSH_DRY_RUN" -eq 1 \]; then\n[\s\S]*?was NOT recorded/);
     // And every PR the branch resolves to, not the first: one branch can have
     // open PRs into two bases, a push updates both, and a verdict from one

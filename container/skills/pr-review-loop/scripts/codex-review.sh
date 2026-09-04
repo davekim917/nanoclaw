@@ -348,8 +348,18 @@ case "${1:?usage: open|churn|classes|gate|push|body|reply|resolve|status}" in
       esac
       push_positional=$((push_positional + 1))
       # `git push [<repository> [<refspec>...]]` — the first bare word is the
-      # remote, never a ref.
-      if [ "$push_positional" -eq 1 ]; then continue; fi
+      # remote, never a ref. It must be `origin`: PR resolution describes one
+      # repository, and a push to a second remote would be judged by the first
+      # one's PRs. A container in this fork has exactly one remote, so refusing
+      # is the whole answer — binding the resolution to an arbitrary remote
+      # would be machinery for a target that does not exist.
+      if [ "$push_positional" -eq 1 ]; then
+        if [ "$arg" != "origin" ]; then
+          echo "push remote '$arg' is not origin; the churn gate resolves PRs for one repository and does not judge a second remote" >&2
+          exit 2
+        fi
+        continue
+      fi
       push_refspecs=$((push_refspecs + 1))
       # A positive grammar, matching the option allowlist above: one literal
       # commit, one literal branch, and nothing that git will expand. Counting
