@@ -82,18 +82,41 @@ function freshProcessingClaimKey(mailbox: NanoclawMailboxSession, now: number): 
 }
 
 /**
- * Heartbeat mtime, or null when there is no usable one. A missing file (never
- * woken, or cleared at spawn) and a future mtime both read as "no signal"
- * rather than as evidence.
+ * How far ahead of a clock sampled AFTER the read an mtime may sit and still be
+ * believed.
+ *
+ * A stamp slightly in the future is the normal case here, not an anomaly: the
+ * graceful-shutdown warn runs BEFORE `stopAllContainers`, so the container is
+ * still alive and still touching this file while we stat it. Comparing against
+ * the caller's entry clock and rejecting anything newer would therefore discard
+ * the single freshest, most conclusive heartbeat there is — the busiest
+ * container, mid-turn, would be the one session left with no note. That is the
+ * exact stranding this module was changed to prevent.
+ *
+ * The bound still has to exist, because a genuinely bad stamp (a clock step, a
+ * file restored from elsewhere) would otherwise read as permanently fresh and
+ * warn this session on every restart forever. Container and host share one
+ * kernel clock and one filesystem, so a few seconds past a post-read sample is
+ * already far more than a concurrent touch can explain.
  */
-function heartbeatMtimeMs(session: Session, now: number): number | null {
+const HEARTBEAT_MAX_SKEW_MS = 5_000;
+
+/**
+ * Heartbeat mtime, or null when there is no usable one. A missing file (never
+ * woken, or cleared at spawn) reads as "no signal" rather than as evidence, and
+ * so does a stamp beyond {@link HEARTBEAT_MAX_SKEW_MS} in the future.
+ */
+function heartbeatMtimeMs(session: Session): number | null {
   let mtimeMs: number;
   try {
     mtimeMs = fs.statSync(heartbeatPath(session.agent_group_id, session.id)).mtimeMs;
   } catch {
     return null;
   }
-  return Number.isFinite(mtimeMs) && mtimeMs <= now ? mtimeMs : null;
+  if (!Number.isFinite(mtimeMs)) return null;
+  // Re-sample AFTER the stat: everything between the caller's `now` and this
+  // point is time a live container had to write the file.
+  return mtimeMs <= Date.now() + HEARTBEAT_MAX_SKEW_MS ? mtimeMs : null;
 }
 
 
@@ -148,8 +171,11 @@ export function warnSessionIfWorkInFlight(mailbox: NanoclawMailboxSession, sessi
   // DB without the column drops to the tool-only tier in getContainerState and
   // reads back undefined, and there the heartbeat alone is still better
   // evidence than nothing.
-  const heartbeatMs = heartbeatMtimeMs(session, now);
-  const heartbeatAgeMs = heartbeatMs === null ? null : now - heartbeatMs;
+  const heartbeatMs = heartbeatMtimeMs(session);
+  // Clamped: a live container writing the file while we read it legitimately
+  // produces a stamp newer than `now`, and that is maximally fresh, not
+  // negative age. See HEARTBEAT_MAX_SKEW_MS.
+  const heartbeatAgeMs = heartbeatMs === null ? null : Math.max(0, now - heartbeatMs);
   const providerIdle = state?.provider_executing === 0;
   const freshHeartbeat =
     !providerIdle && heartbeatAgeMs !== null && heartbeatAgeMs <= RESTART_WARN_HEARTBEAT_FRESH_MS;

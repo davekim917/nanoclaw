@@ -378,13 +378,31 @@ describe('a long autonomous turn interrupted by a restart', () => {
     expect(noteRows(inDb)).toHaveLength(0);
   });
 
-  it('ignores a heartbeat stamped in the future rather than trusting it', () => {
+  it('trusts a heartbeat touched while we were reading it', () => {
+    // The graceful-shutdown warn runs BEFORE stopAllContainers, so the
+    // container is alive and still touching this file. A stamp a little newer
+    // than the caller's entry clock is the normal case and the single most
+    // conclusive evidence there is; rejecting it would leave the busiest
+    // mid-turn container as the one session with no note.
+    const { inDb, outDb } = makeDbs();
+    const session = fakeSession();
+    touchHeartbeat(session, -2_000);
+
+    expect(warnSessionIfWorkInFlight(mailboxOver(inDb, outDb), session, 'graceful host shutdown')).toBe(true);
+    expect(noteRows(inDb)).toHaveLength(1);
+  });
+
+  it('ignores a stamp too far ahead to be a concurrent touch', () => {
+    // Container and host share one clock and one filesystem, so a minute into
+    // the future is a bad timestamp, not a write that raced our stat. Believing
+    // it would warn this session on every restart forever.
     const { inDb, outDb } = makeDbs();
     const session = fakeSession();
     touchHeartbeat(session, -60_000);
 
     expect(warnSessionIfWorkInFlight(mailboxOver(inDb, outDb), session, 'graceful host shutdown')).toBe(false);
     expect(noteRows(inDb)).toHaveLength(0);
+    expect((noSignalLogCalls()[0][1] as { heartbeatAgeMs: number | null }).heartbeatAgeMs).toBeNull();
   });
 });
 
