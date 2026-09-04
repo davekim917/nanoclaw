@@ -10,12 +10,17 @@ export function runReconcilerSweep(): void {
   for (const task of orphans) {
     // Lease + completionInFlight in completeSpawnSideEffects dedupes against
     // any in-flight setImmediate from the original admit. Self-orchestration:
-    // child agent group is always the parent's agent group.
-    // completeSpawnSideEffects internally .catch()es its own work, so the
-    // promise it returns never rejects — void is safe here.
-    setImmediate(() => {
-      void completeSpawnSideEffects(task.task_id, task.parent_agent_group_id);
-    });
+    // child agent group is always the parent's agent group. Args stay on
+    // setImmediate's own (fn, ...args) forwarding — tests assert on that
+    // exact call shape. completeSpawnSideEffects internally .catch()es its
+    // own work, so the promise it returns never rejects — void is safe here.
+    setImmediate(
+      (taskId: string, groupId: string) => {
+        void completeSpawnSideEffects(taskId, groupId);
+      },
+      task.task_id,
+      task.parent_agent_group_id,
+    );
   }
 }
 

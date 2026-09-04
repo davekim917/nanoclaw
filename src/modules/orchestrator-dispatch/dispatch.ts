@@ -217,12 +217,14 @@ export async function applySpawnTask(content: Record<string, unknown>, callerSes
   });
 
   // Schedule side-effect completion. Pass the resolved child agent group id
-  // so the side-effect path doesn't need to re-derive it.
-  // completeSpawnSideEffects internally .catch()es _runCompletionSideEffects,
-  // so the promise it returns never rejects — void is safe here.
-  setImmediate(() => {
-    void completeSpawnSideEffects(admittedTask.task_id, childAgentGroupId);
-  });
+  // so the side-effect path doesn't need to re-derive it. Args stay on
+  // setImmediate's own (fn, ...args) forwarding — a test asserts on that
+  // exact call shape. completeSpawnSideEffects internally .catch()es
+  // _runCompletionSideEffects, so the promise it returns never rejects —
+  // void is safe here.
+  setImmediate((taskId: string, groupId: string) => {
+    void completeSpawnSideEffects(taskId, groupId);
+  }, admittedTask.task_id, childAgentGroupId);
 }
 
 /**
