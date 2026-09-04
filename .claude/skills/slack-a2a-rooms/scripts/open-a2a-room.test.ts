@@ -42,6 +42,11 @@ const CASES: Array<{ instance: string; channelType: string }> = [
   { instance: 'example-labs-codex', channelType: 'slack-example-labs-codex' },
   { instance: 'slack-example-labs-codex', channelType: 'slack-example-labs-codex' },
   { instance: 'Example-Labs', channelType: 'slack-example-labs' },
+  // The environment-form suffix, which is what an operator reads off the
+  // `.env` line. The adapter maps `_` to `-`, so both spellings name the
+  // instance the adapter actually registered.
+  { instance: 'EXAMPLE_LABS_CODEX', channelType: 'slack-example-labs-codex' },
+  { instance: 'SLACK_EXAMPLE_LABS_CODEX', channelType: 'slack-example-labs-codex' },
 ];
 
 describe('open-a2a-room instance naming matches the Slack adapter', () => {

@@ -92,7 +92,15 @@ export function normalizeInstance(name: string): string {
   // Lowercased first: the adapter derives its channelType from a lowercased
   // suffix, so anything that keeps the operator's capitalization here would
   // produce a channelType no registration ever used.
-  const trimmed = name.trim().toLowerCase();
+  //
+  // Underscores map to dashes for the same reason, and it is the spelling an
+  // operator is most likely to paste: `parseSlackWorkspaces` maps `_` to `-`
+  // when it derives the channelType, so the environment-form suffix
+  // (`EXAMPLE_LABS_CODEX`) and the channelType form name the same instance.
+  // Keeping the underscores found the token but printed
+  // `slack-example_labs_codex`, a channelType no row carries, so the wiring
+  // commands this script emits looked up a messaging group that never existed.
+  const trimmed = name.trim().toLowerCase().replace(/_/g, '-');
   if (trimmed === 'slack' || trimmed === 'default') return '';
   return trimmed.startsWith('slack-') ? trimmed.slice('slack-'.length) : trimmed;
 }

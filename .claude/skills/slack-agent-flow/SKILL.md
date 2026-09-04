@@ -13,10 +13,10 @@ This is an operational skill — it installs no code. Everything it does is
 `ncl` work, `/add-slack`'s app install repeated per agent, and one run of the
 `/slack-a2a-rooms` opener.
 
-Install each Slack app by hand: this install runs one app per agent as a
-suffix token and has no managed provisioning, so there is no broker to ask for
-an app and no `/migrate-slack-agents` to run against it. An agent that asks for
-a room gets one from the opener script in step 6, run by an operator.
+Each agent gets its own Slack app, installed by hand and held in `.env` as a
+suffix token (`SLACK_BOT_TOKEN_<SUFFIX>`). Step 3 walks that install, once per
+agent. An agent that asks for a room gets one from the opener script in step 6,
+run by an operator.
 
 ## Prerequisites
 
@@ -66,8 +66,23 @@ ncl destinations add --agent-group-id <sibling group id> --local-name <new name>
   --target-type agent --target-id <new group id>
 ```
 
-Either path is idempotent on the folder, so a re-run after a partial setup is
-safe. At this point each agent exists. It has no Slack presence yet — that is
+The two paths behave differently on a re-run, which matters when step 2 half
+finishes. `ncl groups create` is idempotent on `--folder`: it returns the
+existing group and repairs its filesystem. `create_agent` is not. It picks a
+fresh folder rather than reusing one (`designer` becomes `designer-2`), and the
+scoped-env token guard then refuses that folder because `DESIGNER_2` overlaps
+`DESIGNER`'s variable prefix. So a `create_agent` re-run stops with a folder
+collision error naming the group it just tried to work around.
+
+Resume by hand instead. Find the group that already exists, then run the
+`standing-instructions.md` edit and the two `ncl destinations add` commands
+above against its id:
+
+```bash
+ncl groups list --json
+```
+
+At this point each agent exists. It has no Slack presence yet — that is
 step 3, and it is the one an agent cannot do for itself.
 
 Put the whole team in **one workgroup** before any of them spawns. The
