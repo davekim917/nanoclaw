@@ -366,8 +366,33 @@ export async function declineAndNotify(input: DeclineAndNotifyInput): Promise<vo
   // agent's own replies. It is only absent for callers outside router
   // fanout, which have no wiring to honor and fall back to the event.
   const declineThreadId = input.threadId !== undefined ? input.threadId : (event.threadId ?? null);
-  const owner = ownerDisplayName();
-  const declineText = input.declineText ?? `I'm ${owner ?? 'my owner'}'s personal agent — I can't help you directly.`;
+
+  // Resolve the FYI recipient BEFORE composing the decline. `ownerDisplayName`
+  // picks the first owner carrying a name with no regard for reachability,
+  // while `pickApprovalDelivery` picks the first owner reachable on the origin
+  // channel. On an install with several owners those are different people, so
+  // composing first told the stranger they had reached one owner's agent while
+  // a different owner got the notice — the wrong name disclosed to someone we
+  // are in the middle of refusing.
+  const approvers = fyiRecipients(agentGroupId);
+  const target =
+    approvers.length > 0
+      ? // Same-channel-type only: the FYI names a sender identity originating
+        // in THIS workspace, so it must not fall back to a different surface
+        // where the same owner happens to be registered (cross-tenant audit
+        // 2026-05-03).
+        await pickApprovalDelivery(approvers, event.channelType, { sameChannelTypeOnly: true })
+      : null;
+
+  // Name the recipient only when they are an owner. `fyiRecipients` falls back
+  // to admins for reachability, and an admin is not whose personal agent this
+  // is — in that case the honest name is still an owner's, even an unreachable
+  // one.
+  const ownerIds = new Set(getOwners().map((r) => r.user_id));
+  const namedOwner =
+    (target && ownerIds.has(target.userId) ? getUser(target.userId)?.display_name : null) || ownerDisplayName();
+  const declineText =
+    input.declineText ?? `I'm ${namedOwner ?? 'my owner'}'s personal agent — I can't help you directly.`;
   let declined = true;
   try {
     await adapter.deliver(
@@ -384,17 +409,13 @@ export async function declineAndNotify(input: DeclineAndNotifyInput): Promise<vo
     log.warn('decline_notify: decline delivery failed', { messagingGroupId, err });
   }
 
-  // (b) Owner FYI — owners first (see fyiRecipients), delivered through the
-  // card flow's same-channel-type restriction: the FYI names a sender
-  // identity originating in THIS workspace, so it must not fall back to a
-  // different surface where the same owner happens to be registered
-  // (cross-tenant audit 2026-05-03).
-  const approvers = fyiRecipients(agentGroupId);
+  // (b) Owner FYI — owners first (see fyiRecipients). Recipient was resolved
+  // above so the decline could name them; the decline still goes out when
+  // nobody is reachable, only the notice is skipped.
   if (approvers.length === 0) {
     log.warn('decline_notify FYI skipped — no owner or admin configured', { messagingGroupId, senderIdentity });
     return;
   }
-  const target = await pickApprovalDelivery(approvers, event.channelType, { sameChannelTypeOnly: true });
   if (!target) {
     log.warn('decline_notify FYI skipped — no in-workspace approver reachable on the origin channel_type', {
       messagingGroupId,

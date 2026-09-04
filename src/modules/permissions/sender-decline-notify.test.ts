@@ -490,6 +490,50 @@ describe('unknown-sender decline_notify flow', () => {
     expect(drop).toBeDefined();
   });
 
+  it('names the owner who actually gets the FYI, not the first owner on the books', async () => {
+    // A second owner, granted later, whose DM is the only one reachable on
+    // this channel — the beforeEach owner ('Owner') keeps their user_dms row,
+    // so make them unreachable by pointing it at a different channel_type.
+    (await db()).prepare('DELETE FROM user_dms WHERE user_id = ?').run('telegram:owner');
+    upsertUser({ id: 'telegram:second', kind: 'telegram', display_name: 'Second', created_at: now() });
+    grantRole({
+      user_id: 'telegram:second',
+      role: 'owner',
+      agent_group_id: null,
+      granted_by: 'telegram:owner',
+      granted_at: now(),
+    });
+    createMessagingGroup({
+      id: 'mg-dm-second',
+      channel_type: 'telegram',
+      instance: 'telegram-owner-bot',
+      platform_id: 'dm-second',
+      name: 'Second DM',
+      is_group: 0,
+      unknown_sender_policy: 'public',
+      created_at: now(),
+    });
+    (await db())
+      .prepare(
+        `INSERT INTO user_dms (user_id, channel_type, messaging_group_id, resolved_at)
+         VALUES (?, ?, ?, ?)`,
+      )
+      .run('telegram:second', 'telegram', 'mg-dm-second', now());
+
+    const { routeInbound } = await import('../../router.js');
+    await routeInbound(strangerDm('hello'));
+    await waitForDeliveries(2);
+
+    // The notice goes to the reachable owner...
+    expect(deliverMock.mock.calls[1][1]).toBe('dm-second');
+    // ...so the stranger must be told THAT owner's name. Naming the first
+    // owner on the books would disclose the wrong person to someone we are
+    // refusing, and contradict who was actually notified.
+    expect(JSON.parse(deliverMock.mock.calls[0][4] as string).text).toBe(
+      "I'm Second's personal agent — I can't help you directly.",
+    );
+  });
+
   it('sends the FYI to the owner, not to the admin the approval card would go to', async () => {
     // A scoped admin of ag-1 with a reachable DM. pickApprover puts this
     // user FIRST (scoped admins → global admins → owners), so a card would
