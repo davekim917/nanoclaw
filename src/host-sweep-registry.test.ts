@@ -340,7 +340,9 @@ import './modules/sweep-scheduled-move/index.js';
 import { SessionDbMissingError, SessionDbUnopenableError } from './modules/mailbox/index.js';
 import { _mailboxSessionDepthForTesting } from './host-sweep-depth-probe.js';
 // Family modules moved out of host-sweep.ts register at import — pull them in
-// here so the hermetic registry harness sees the full 39-registration set.
+// here so the hermetic registry harness sees the full 41-registration set —
+// the seam-2 port's 39 (38 names, S17 twice) plus the two fork duties
+// sweep-central owns, T23 (#285) and FORK1 (#247).
 // Each registers itself via `registerSweepDutySource`, so a default
 // (builtins-restoring) `_resetSweepRegistryForTesting()` replays it
 // automatically, same as the in-file builtins.
@@ -1441,12 +1443,20 @@ describe('sweep duty registry (S2-PR2)', () => {
     ];
 
     expect(actual).toEqual(EXPECTED_REGISTRATIONS);
-    expect(actual).toHaveLength(39);
+    // 41 registrations over 40 names. The seam-2 port is 38 duties in 39
+    // registrations — S17 is the only one registered twice, once as a
+    // session:health duty and once as the post-kill follow-up — plus the two
+    // fork duties the upstream seam does not have: T23
+    // `cli-request-execution-prune` (#285) and FORK1
+    // `github-token-file-refresh` (#247), both from `sweep-central`. The
+    // numbers here said 39/38/38 from before those two landed; the tuple
+    // comparison above was already right, which is why it never failed.
+    expect(actual).toHaveLength(41);
     const names = new Set(actual.map((r) => r[1]));
-    expect(names.size).toBe(38);
+    expect(names.size).toBe(40);
     // The inventory comes from the same fresh instance, not this file's binding.
     expect(names).toEqual(new Set(Object.values(hs.SWEEP_DUTY_INVENTORY)));
-    expect(Object.keys(hs.SWEEP_DUTY_INVENTORY)).toHaveLength(38);
+    expect(Object.keys(hs.SWEEP_DUTY_INVENTORY)).toHaveLength(40);
     expect(actual.filter((r) => r[1] === hs.SWEEP_DUTY_INVENTORY.S17)).toHaveLength(2);
     expect(h.spawns).toEqual([]);
   });
