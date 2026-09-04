@@ -473,21 +473,21 @@ describe('scheduleTask invalidates the quiet mark before writing the task row, n
 
     const sessionsModule = await import('./sessions.js');
     const originalTouch = sessionsModule.touchSessionActivity;
-    const readsAtTouchTime: Array<{ existed: boolean; rowPresent: boolean }> = [];
+    const rowPresentAtTouchTime: boolean[] = [];
     const touchSpy = vi.spyOn(sessionsModule, 'touchSessionActivity').mockImplementation((id: string) => {
       // Read the SAME session's inbound.db, at the instant the quiet mark is
-      // invalidated, before calling through to the real touch. If the write
-      // already landed, this proves the ordering the fix removed; if it has
-      // not (file absent, or present with no row for this series yet), this
-      // proves the touch precedes it.
+      // invalidated, before calling through to the real touch. `resolveTaskSession`
+      // may already have provisioned a brand-new task session's inbound.db (schema
+      // only), so the file's existence proves nothing on its own — whether the
+      // task ROW is there yet is the actual write this ordering protects.
       const dbPath = inboundPath(id);
       if (!fs.existsSync(dbPath)) {
-        readsAtTouchTime.push({ existed: false, rowPresent: false });
+        rowPresentAtTouchTime.push(false);
       } else {
         const db = openInboundDb(dbPath);
         const row = db.prepare("SELECT 1 FROM messages_in WHERE series_id = 's-order' LIMIT 1").get();
         db.close();
-        readsAtTouchTime.push({ existed: true, rowPresent: row !== undefined });
+        rowPresentAtTouchTime.push(row !== undefined);
       }
       return originalTouch(id);
     });
@@ -505,10 +505,8 @@ describe('scheduleTask invalidates the quiet mark before writing the task row, n
 
     // touchSessionActivity ran exactly once (the happy path never retries) and
     // saw no row for this series at that instant — the write had not happened
-    // yet. A read of an existing file with the row already present, or of a
-    // file that does not exist because the write already provisioned and
-    // filled it, would both fail this.
-    expect(readsAtTouchTime).toEqual([{ existed: false, rowPresent: false }]);
+    // yet.
+    expect(rowPresentAtTouchTime).toEqual([false]);
 
     // Positive control: the row IS there once scheduleTask returns — proves
     // the absence above was ordering, not a write that silently never happened.
