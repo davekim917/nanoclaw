@@ -50,7 +50,14 @@ vi.mock('../../delivery.js', () => ({
 
 // Mock ensureUserDm to return the approver's existing messaging group
 // instead of hitting a real openDM RPC.
-vi.mock('./user-dm.js', () => ({
+//
+// importOriginal, not a bare factory: only `ensureUserDm` needs stubbing
+// (this suite pre-seeds user_dms and must not hit a platform openDM).
+// `resolveUserChannelType` stays real — pickApprovalDelivery calls it to
+// screen approvers by channel kind, so a factory that omitted it would make
+// the FYI half of the flow throw and silently deliver only the decline.
+vi.mock('./user-dm.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./user-dm.js')>()),
   ensureUserDm: vi.fn(async (userId: string) => {
     const { getDb } = await import('../../db/connection.js');
     return getDb()
