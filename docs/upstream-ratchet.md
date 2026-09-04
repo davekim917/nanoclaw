@@ -227,7 +227,20 @@ Either section failing exits 1. Exit codes are otherwise unchanged: **2** means 
 does not resolve to a commit in this clone, `<ref>` carries no manifest at `src/upstream-ratchet.json`, or
 its pinned upstream commit is not in this clone (with the `git fetch upstream <sha>` to run, same as the
 default report). `--json` works. `--check` is incompatible with `--write`, `--accept`, `--accept-all` and
-`--upstream` — a ref that is not this checkout's HEAD is nothing any of them could act on.
+`--upstream` — a ref that is not this checkout's HEAD is nothing any of them could act on. `--check`
+requires **git 2.40 or newer** (for the global `--attr-source` flag — see below) and refuses outright, with
+a clear message, on anything older; every other mode of this script has no such requirement.
+
+Every git call `--check` makes about `<ref>`'s own content passes `--attr-source=<ref>`, so `.gitattributes`
+resolution comes from `<ref>`'s OWN tree rather than the running checkout's — git otherwise always resolves
+attributes from whatever is currently checked out, regardless of which commit's content is being asked
+about. This is not just about file *bytes* (see "Checkout filters" below): `git diff --numstat`'s decision
+that a path is BINARY (`-diff`, `binary`, or a `diff=<driver>` rule) is *also* an attribute lookup, and
+without `--attr-source` it would silently use the WRONG tree's rule — a `-diff` marker added only in
+`<ref>` would be invisible, and `<ref>`'s divergence from a file the running checkout still treats as text
+would be measured as a text diff instead of the binary marker a real checkout of `<ref>` implies. The
+default (working-tree) report is deliberately unaffected: reading the WORKING TREE's own attributes is
+exactly right there, because a real checkout is what it is measuring.
 
 What does not apply to a bare commit, and is skipped rather than approximated: `git check-ignore` needs a
 live index and working tree, so an upstream path the fork deleted and gitignored just reads as plain

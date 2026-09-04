@@ -236,6 +236,33 @@ function resolveCommit(root: string, rev: string): string {
 }
 
 /**
+ * Refuses `--check` outright on a git older than 2.40 — the release that added
+ * the global `--attr-source=<tree-ish>` flag every `<ref>`-scoped git call in
+ * `computeFromRef` relies on to resolve `.gitattributes` from `<ref>`'s own
+ * tree rather than the running checkout's (git otherwise always resolves
+ * attributes from the CURRENT working tree/index, regardless of which commit's
+ * content is being asked about — verified by hand for both `cat-file
+ * --filters` and `git diff --numstat`'s binary/`-diff` detection). Without
+ * this flag `--check` would silently measure with the wrong tree's attributes
+ * rather than fail, which is worse than refusing up front. Checked lazily,
+ * only for `--check` — every other mode of this script has no attribute
+ * dependency and works on whatever git this fork already requires.
+ */
+function requireAttrSourceSupport(root: string): void {
+  const raw = git(root, ['--version'], true).trim();
+  const match = /git version (\d+)\.(\d+)/.exec(raw);
+  if (match === null) fail(`--check could not parse a git version from ${JSON.stringify(raw)}`);
+  const major = Number(match[1]);
+  const minor = Number(match[2]);
+  if (major < 2 || (major === 2 && minor < 40)) {
+    fail(
+      `--check requires git 2.40 or newer for --attr-source (installed: ${raw}). Upgrade git, or use the ` +
+        `default report against a real checkout of the ref instead.`,
+    );
+  }
+}
+
+/**
  * Which of `paths` the fork's `.gitignore` covers.
  *
  * `git check-ignore` is INDEX-AWARE by default: it never reports a tracked path,
@@ -333,9 +360,13 @@ export function computeFromGit(root: string, sha: string): UpstreamRatchetManife
  * for why `--batch --filters` cannot be trusted, which is what forces a
  * one-object-at-a-time call for every regular file instead of a batch.
  */
-function catFileBatch(root: string, ids: readonly string[]): Buffer {
+function catFileBatch(root: string, ref: string, ids: readonly string[]): Buffer {
   if (ids.length === 0) return Buffer.alloc(0);
-  return execFileSync('git', ['-C', root, 'cat-file', '--batch'], {
+  // Raw (unfiltered) content never actually consults attributes — `ref` is
+  // threaded through for the "every <ref>-scoped call is attr-sourced"
+  // invariant (see computeFromRef's comment), not because this call's
+  // result would otherwise be wrong.
+  return execFileSync('git', ['-C', root, `--attr-source=${ref}`, 'cat-file', '--batch'], {
     input: ids.join('\n') + '\n',
     // Bounded by construction: only ever called with upstream-owned symlink
     // blob ids (a target string, never large) — see computeFromRef.
@@ -451,7 +482,14 @@ function computeFromRef(
   ref: string,
 ): { manifest: UpstreamRatchetManifest; reader: TreeReader } {
   const upstreamModes = parseLsTree(git(root, ['ls-tree', '-r', '-z', sha]));
-  const refEntries = parseLsTreeEntries(git(root, ['ls-tree', '-r', '-z', ref]));
+  // `--attr-source=<ref>` on every call below that is about `<ref>`'s OWN
+  // content: `ls-tree` and the raw symlink `cat-file --batch` are no-ops for
+  // it today (neither consults attributes), but `diff --numstat` is NOT — see
+  // the comment on that call below. Applying it uniformly makes "every
+  // <ref>-scoped git call in --check is attr-sourced to <ref>" a checkable
+  // invariant rather than a per-call judgment call that could silently regress
+  // if git ever starts consulting attributes somewhere it doesn't today.
+  const refEntries = parseLsTreeEntries(git(root, [`--attr-source=${ref}`, 'ls-tree', '-r', '-z', ref]));
 
   // Symlinks only: never filtered on checkout, so the plain blob is already
   // checkout-equivalent, and a batch call is safe for these because raw
@@ -464,7 +502,7 @@ function computeFromRef(
         .map(([, entry]) => entry.blob),
     ),
   ];
-  const symlinkHashes = hashCatFileBatch(catFileBatch(root, symlinkBlobIds), symlinkBlobIds);
+  const symlinkHashes = hashCatFileBatch(catFileBatch(root, ref, symlinkBlobIds), symlinkBlobIds);
 
   // Every regular upstream-owned file, unconditionally — see
   // hashFilteredBlob's comment for why there is no cheaper, safe selection.
@@ -486,7 +524,20 @@ function computeFromRef(
     return entry === undefined ? null : (symlinkHashes.get(entry.blob) ?? null);
   };
   const forkIndex = new Map([...refEntries].map(([p, e]) => [p, e.mode]));
-  const numstat = parseNumstat(git(root, ['diff', '--numstat', '--no-renames', '-z', sha, ref]));
+  // `--attr-source=<ref>` here is NOT a no-op like the calls above: `git diff
+  // --numstat` decides whether a path is BINARY (the `-\t-` numstat marker
+  // that flags a divergent entry `binary: true`) using `-diff`/`binary`/a
+  // `diff=<driver>` gitattributes rule, and WITHOUT this flag that decision is
+  // made from the RUNNING CHECKOUT's attributes, not `<ref>`'s own — verified
+  // by hand: a `-diff` rule added only in `<ref>` was invisible to `numstat`
+  // until `--attr-source=<ref>` was added, at which point the same file
+  // correctly reported as binary. The default (working-tree) report is
+  // DELIBERATELY left as it was: reading the WORKING TREE's own attributes is
+  // exactly right there, because a real checkout is what a person or CI is
+  // looking at.
+  const numstat = parseNumstat(
+    git(root, [`--attr-source=${ref}`, 'diff', '--numstat', '--no-renames', '-z', sha, ref]),
+  );
 
   const manifest = sealManifest(
     buildManifest({ upstream: sha, upstreamModes, forkIndex, numstat, modeOf, hashOf, ignored: new Set<string>() }),
@@ -572,6 +623,7 @@ function renderCurrencyFinding(f: Finding): string {
 function runCheck(options: Options): never {
   const root = options.root;
   const ref = options.check as string;
+  requireAttrSourceSupport(root);
   const started = Date.now();
 
   let resolvedRef: string;
