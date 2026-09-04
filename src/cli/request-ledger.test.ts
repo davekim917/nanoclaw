@@ -276,6 +276,29 @@ describe('ledger mechanics', () => {
     expect(requestIds()).toEqual(['req-10']);
   });
 
+  it('supersession survives a backward clock step — insertion order wins, not claimed_at', () => {
+    // Codex review round 11: a host restart followed by an NTP correction can
+    // hand a chronologically LATER claim an EARLIER `claimed_at` than the row
+    // before it. req-10 is inserted (and completed) strictly after req-9, but
+    // its clock-stepped timestamp reads as centuries older. If the prune's
+    // "newer" test used claimed_at, req-9 would incorrectly survive as
+    // unsuperseded — reopening the at-most-once hole this table exists to
+    // close. It must use insertion order (rowid) instead.
+    completeCliRequest(SESSION_ID, 'req-9', { id: 'req-9', ok: true, data: 1 });
+    age('req-9', '2026-09-01T00:00:00.000Z');
+    claimCliRequest(SESSION_ID, 'req-10', 'groups-list');
+    completeCliRequest(SESSION_ID, 'req-10', { id: 'req-10', ok: true, data: 2 });
+    age('req-10', '1970-01-01T00:00:00.000Z'); // clock stepped backward after req-9
+
+    pruneCliRequestExecutions();
+
+    // req-9 is superseded (req-10 exists, completed, inserted after it) and
+    // past the floor — pruned despite its claimed_at looking "newer" than
+    // req-10's. req-10 is the session's tail — nothing is newer than it — so
+    // it survives even though its own claimed_at is ancient.
+    expect(requestIds()).toEqual(['req-10']);
+  });
+
   it("prune never drops another session's claim, however new this session's requests are", () => {
     completeCliRequest(SESSION_ID, 'req-9', { id: 'req-9', ok: true, data: 1 });
     age('req-9', '2026-09-01T00:00:00.000Z');

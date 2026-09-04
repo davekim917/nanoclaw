@@ -132,6 +132,17 @@ const PAYLOAD_RETENTION_DAYS = 7;
  * state — delivered, or dropped by `markDeliveryFailed` after three attempts.
  * Either way nothing will dispatch it again.
  *
+ * "Newer" is the table's implicit `rowid` (insertion order), not `claimed_at`.
+ * The primary key is a composite (session_id, request_id), so SQLite still
+ * assigns every row a monotonically increasing rowid; wall-clock time does
+ * not have that guarantee — a host restart followed by an NTP step backward
+ * can hand a chronologically later claim an earlier `claimed_at` than one
+ * that preceded it, which would let this query prune a still-retryable claim
+ * out from under an in-flight retry and reopen the exact hole this table
+ * exists to close. `claimed_at` is still the PRUNE_FLOOR_SECONDS gate below —
+ * that's a conservative floor, not a correctness proof, so wall-clock slop
+ * there only ever makes pruning more cautious, never less.
+ *
  * That leaves the newest claim per session, plus any claim from a session that
  * never spoke again. Those keep their row and lose only their cached response
  * after a week, which costs a replay its stored frame but not the at-most-once
@@ -151,7 +162,7 @@ export function pruneCliRequestExecutions(): void {
                   FROM cli_request_executions newer
                  WHERE newer.session_id = cli_request_executions.session_id
                    AND newer.completed_at IS NOT NULL
-                   AND newer.claimed_at > cli_request_executions.claimed_at
+                   AND newer.rowid > cli_request_executions.rowid
               )`,
     ).run();
 

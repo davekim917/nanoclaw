@@ -30,9 +30,11 @@ import type { Migration } from './index.js';
  *
  * Rows are pruned by the host sweep, but never on a wall clock alone: an aged
  * claim that the delivery loop can still retry would re-open the exact hole
- * this table closes. The prune's index is (session_id, claimed_at) because the
- * terminal test is "does this session have a NEWER completed request" — see
- * `pruneCliRequestExecutions`.
+ * this table closes. The terminal test is "does this session have a NEWER
+ * completed request", where "newer" is the table's implicit rowid (insertion
+ * order), not `claimed_at` — wall-clock time is not guaranteed monotonic
+ * across a host restart + NTP step, and the index below still serves that
+ * query as a (session_id, *) prefix. See `pruneCliRequestExecutions`.
  */
 export const migration067: Migration = {
   version: 67,
