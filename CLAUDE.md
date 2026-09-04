@@ -95,6 +95,8 @@ Four types — channel/provider installers, utility skills that ship code, instr
 
 Before a PR, a skill, or any contribution, you MUST read [CONTRIBUTING.md](CONTRIBUTING.md) (change types, skill guidelines, `SKILL.md` format, pre-submission checklist). Before a PR: run `git diff upstream/main --stat HEAD` and `git log upstream/main..HEAD --oneline`, show the output, wait for approval. Installation-specific files (group files, `.claude/settings.json`, local configs) should not be included.
 
+Any change to an upstream-owned file must regenerate `src/upstream-ratchet.json` (`pnpm run ratchet:report -- --write`); growth needs `--accept` and a reason in the PR body.
+
 ## Development
 
 Run commands directly — don't tell the user to run them.
@@ -173,6 +175,7 @@ Tracks latest stable, including majors; prerelease/beta/RC/dev/nightly/draft/yan
 | CJK fonts | `cjk-fonts.md` |
 | Directive audit | `always-on-directive-classification.md`, `always-on-directive-baseline.md` |
 | Agent mailbox seam | `docs/specs/upstream-mailbox-seam/plan.md` §5 (upstream doc = end state) |
+| Upstream divergence ratchet | `upstream-ratchet.md` |
 
 ## Container Runtime (Bun)
 
