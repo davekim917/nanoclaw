@@ -17,9 +17,14 @@
  * model, packages, mcp_servers, timezone, …) — they hold no MCP-specific
  * validation. The credential/URL/header/name invariants for a remote MCP
  * server all live one layer down, in `parseMcpServerConfig`,
- * `validateMcpServerName`, and `isKnownRawSecret` (../../container-config.js)
- * — the single primitive every one of those rules is enforced in, called
- * before any of the DB writes below ever run.
+ * `validateMcpServerName`, `isKnownRawSecret`, and `normalizeMcpHeaders`
+ * (../../container-config.js) — the single primitive every one of those
+ * rules is enforced in, called before any of the DB writes below ever run.
+ * A server that reaches these DB writes has already had every header
+ * validated as ByteString, deduplicated case-insensitively, and checked
+ * against the OneCLI placeholder — this file only persists what
+ * normalizeMcpHeaders already approved, and claims nothing about whether the
+ * placeholder's underlying secret is actually assigned to this group.
  */
 import { buildAgentGroupImage, killContainer, wakeContainer } from '../../container-runner.js';
 import { getAgentGroup } from '../../db/agent-groups.js';
@@ -115,7 +120,9 @@ export async function applyInstallPackages(payload: Record<string, unknown>, ses
         session,
         `Packages added to config (${pkgs}) but rebuild failed: ${e instanceof Error ? e.message : String(e)}. Tell the user — an admin will need to retry the install_packages request or inspect the build logs.`,
       ),
-    ).catch((err) => log.warn('install_packages failure notification failed', { err, agentGroupId: session.agent_group_id }));
+    ).catch((err) =>
+      log.warn('install_packages failure notification failed', { err, agentGroupId: session.agent_group_id }),
+    );
     log.error('Bundled rebuild failed after install approval', { agentGroupId: session.agent_group_id, err: e });
   }
 }
