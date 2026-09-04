@@ -1,4 +1,5 @@
-export { initDb, initTestDb, getDb, closeDb } from './connection.js';
+export { initDb, initTestDb, getDb, getRawDb, closeDb, hasTable, hasTableRaw } from './connection.js';
+export type { DbConfig, DbDriver, DbInitOptions, RunResult } from './driver.js';
 export { runMigrations } from './migrations/index.js';
 export {
   createAgentGroup,
