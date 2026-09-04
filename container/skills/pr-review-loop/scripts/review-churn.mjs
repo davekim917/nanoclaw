@@ -624,11 +624,30 @@ function fileAtCommit(commit, file, side, ctx) {
   if (!ctx.blobCache) ctx.blobCache = new Map();
   const key = `${commit.sha}:${side}:${file}`;
   if (ctx.blobCache.has(key)) return ctx.blobCache.get(key);
+  // A renamed file has no pre-image at its NEW path, and treating that absence
+  // as "everything here is new" would let a commit that merely moved a file
+  // claim every declaration in it. The rename map gives the old path.
+  const path_ = side === 'after' ? file : (renamedFrom(commit, ctx).get(file) ?? file);
   const ref = side === 'after' ? commit.sha : `${commit.sha}^`;
-  const text = git(ctx.repoRoot, ['show', `${ref}:${file}`]);
+  const text = git(ctx.repoRoot, ['show', `${ref}:${path_}`]);
   const value = text === '' ? null : text;
   ctx.blobCache.set(key, value);
   return value;
+}
+
+/** New path → old path, for the files this commit renamed. */
+function renamedFrom(commit, ctx) {
+  if (!ctx.renameCache) ctx.renameCache = new Map();
+  const cached = ctx.renameCache.get(commit.sha);
+  if (cached) return cached;
+  const map = new Map();
+  const raw = git(ctx.repoRoot, ['diff', '--name-status', '--find-renames', `${commit.sha}^`, commit.sha]);
+  for (const line of raw.split('\n')) {
+    const parts = line.split('\t');
+    if (parts.length === 3 && /^R\d*$/.test(parts[0])) map.set(parts[2], parts[1]);
+  }
+  ctx.renameCache.set(commit.sha, map);
+  return map;
 }
 
 /**

@@ -703,16 +703,57 @@ describe('review-churn gate', () => {
 
   it('reads the file either side of a real commit to judge a reframe trailer', () => {
     // The payload can supply both images, so the tests above are hermetic; this
-    // one exercises the `git show` path they stand in for.
+    // one exercises the `git show` path they stand in for, including the rename
+    // case, where the pre-image lives at the OLD path and reading the new one
+    // would make every line in the file look newly introduced.
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'review-churn-blob-'));
-    const git = (...args: string[]) => {
+    const git = (date: string, ...args: string[]) => {
       const res = spawnSync('git', args, {
         cwd: root,
         encoding: 'utf8',
         env: {
           ...process.env,
-          GIT_AUTHOR_DATE: '2026-09-01T16:00:00Z',
-          GIT_COMMITTER_DATE: '2026-09-01T16:00:00Z',
+          GIT_AUTHOR_DATE: date,
+          GIT_COMMITTER_DATE: date,
+          GIT_AUTHOR_NAME: 'test',
+          GIT_AUTHOR_EMAIL: 'test@example.com',
+          GIT_COMMITTER_NAME: 'test',
+          GIT_COMMITTER_EMAIL: 'test@example.com',
+        },
+      });
+      if (res.status !== 0) throw new Error(`git ${args.join(' ')}: ${res.stderr}`);
+      return res.stdout.trim();
+    };
+    const BEFORE_FINDINGS = '2026-08-01T10:00:00Z';
+    const AFTER_FINDINGS = '2026-09-01T16:00:00Z';
+    try {
+      git(BEFORE_FINDINGS, 'init', '-q', '-b', 'main');
+      fs.writeFileSync(path.join(root, 'guard.ts'), '// nothing yet\n');
+      git(BEFORE_FINDINGS, 'add', '-A');
+      git(BEFORE_FINDINGS, 'commit', '-qm', 'base');
+
+      // The real introduction, after the findings: it lifts.
+      fs.writeFileSync(path.join(root, 'guard.ts'), 'export function guardEveryWrite() {}\n');
+      git(AFTER_FINDINGS, 'add', '-A');
+      git(AFTER_FINDINGS, 'commit', '-qm', 'fix\n\nReframe: race enforced in guardEveryWrite\n');
+      const payload = fixture('toctou-class');
+      payload.repoRoot = root;
+      expect(spawn(['gate', '--json'], payload).status).toBe(0);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+
+    // A commit that only renames the file claims nothing. Its own repository,
+    // so the introduction is outside the window and the rename stands alone.
+    const moved = fs.mkdtempSync(path.join(os.tmpdir(), 'review-churn-rename-'));
+    const gitMoved = (date: string, ...args: string[]) => {
+      const res = spawnSync('git', args, {
+        cwd: moved,
+        encoding: 'utf8',
+        env: {
+          ...process.env,
+          GIT_AUTHOR_DATE: date,
+          GIT_COMMITTER_DATE: date,
           GIT_AUTHOR_NAME: 'test',
           GIT_AUTHOR_EMAIL: 'test@example.com',
           GIT_COMMITTER_NAME: 'test',
@@ -723,19 +764,19 @@ describe('review-churn gate', () => {
       return res.stdout.trim();
     };
     try {
-      git('init', '-q', '-b', 'main');
-      fs.writeFileSync(path.join(root, 'guard.ts'), '// nothing yet\n');
-      git('add', '-A');
-      git('commit', '-qm', 'base');
-      fs.writeFileSync(path.join(root, 'guard.ts'), 'export function guardEveryWrite() {}\n');
-      git('add', '-A');
-      git('commit', '-qm', 'fix\n\nReframe: race enforced in guardEveryWrite\n');
+      gitMoved(BEFORE_FINDINGS, 'init', '-q', '-b', 'main');
+      fs.writeFileSync(path.join(moved, 'guard.ts'), 'export function guardEveryWrite() {}\n');
+      gitMoved(BEFORE_FINDINGS, 'add', '-A');
+      gitMoved(BEFORE_FINDINGS, 'commit', '-qm', 'the primitive, long before these findings');
+
+      gitMoved(AFTER_FINDINGS, 'mv', 'guard.ts', 'guard-renamed.ts');
+      gitMoved(AFTER_FINDINGS, 'commit', '-qm', 'chore: move it\n\nReframe: race enforced in guardEveryWrite\n');
 
       const payload = fixture('toctou-class');
-      payload.repoRoot = root;
-      expect(spawn(['gate', '--json'], payload).status).toBe(0);
+      payload.repoRoot = moved;
+      expect(spawn(['gate', '--json'], payload).status).toBe(3);
     } finally {
-      fs.rmSync(root, { recursive: true, force: true });
+      fs.rmSync(moved, { recursive: true, force: true });
     }
   });
 
