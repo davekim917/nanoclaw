@@ -74,12 +74,20 @@ rather than left implicit.
 and those bytes can change again later, and neither the test nor the report says a word. Resurrection checks
 exist precisely to catch a deleted upstream file coming back.
 
-*Why it does not apply:* **a gitignored path cannot be committed.** Whatever sits there is not, and cannot
-become, fork source without someone first editing `.gitignore` — and that file is upstream-owned with its
-own entry, so the edit moves a diff and goes through the ratchet like any other change. This tool measures
-the divergence of the fork's *source*. Untracked bytes are not source; they are whatever the machine
-happened to be doing. For the one real instance, "did it come back?" answers "is the system running?", which
-is not a question about divergence, and answering it turned the host suite red on a production checkout.
+*Why it does not apply:* **ordinary git operations leave an ignored path untracked**, so whatever sits there
+is not fork source. This tool measures the divergence of the fork's *source*; untracked bytes are whatever
+the machine happened to be doing. For the one real instance, "did it come back?" answers "is the system
+running?", which is not a question about divergence, and answering it turned the host suite red on a
+production checkout.
+
+*And the case where it is tracked anyway:* `git add -f` **can** track an ignored path. That is caught, not
+missed. Once tracked, `git check-ignore` stops reporting it — it is index-aware — so the entry loses
+`ignored` on the next regeneration, and the deleted → present transition classifies as **GROWTH** requiring
+an explicit `--accept`. Verified end to end: `git add -f .claude/scheduled_tasks.lock` makes the report print
+`GROWTH .claude/scheduled_tasks.lock 1 → 2 (+1) (restored in fork)` and exit 1. Taking an ignored upstream
+path back into the fork is a reviewed act, exactly like any other new divergence. Making it source
+deliberately — by editing `.gitignore` — goes through the ratchet too, since `.gitignore` is itself
+upstream-owned with its own entry.
 
 *What is not claimed:* that the tree is clean, or that nothing is sitting there. Only that the fork's
 committed content is unchanged — the property the manifest exists to check.

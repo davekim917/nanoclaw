@@ -42,16 +42,22 @@
  * neither the test nor the report says a word. Resurrection checks exist
  * precisely to catch a deleted upstream file coming back.
  *
- * **Why it does not apply.** A gitignored path cannot be committed. Whatever is
- * sitting there is not, and cannot become, fork source without someone first
- * editing `.gitignore` — and `.gitignore` is itself an upstream-owned file with
- * its own entry, so that edit moves a diff and goes through the ratchet like any
- * other change. This tool measures the divergence of the fork's SOURCE from
- * upstream's. Untracked bytes are not source; they are whatever the machine
- * happened to be doing. The one real instance is a runtime lock file that a
- * running system recreates on its own checkout, so "did it come back?" answers
- * "is the system up?" — which is not a question about divergence, and answering
- * it made the host suite red on a production checkout.
+ * **Why it does not apply.** Ordinary git operations leave an ignored path
+ * untracked, so whatever is sitting there is not fork source. This tool measures
+ * the divergence of the fork's SOURCE from upstream's; untracked bytes are
+ * whatever the machine happened to be doing. The one real instance is a runtime
+ * lock file that a running system recreates on its own checkout, so "did it come
+ * back?" answers "is the system up?" — which is not a question about divergence,
+ * and answering it made the host suite red on a production checkout.
+ *
+ * `git add -f` CAN track an ignored path, and that is not a hole. Once it is
+ * tracked, `git check-ignore` stops reporting it (it is index-aware), so the
+ * entry loses `ignored` on the next regeneration and the deleted → present
+ * transition classifies as GROWTH, which needs an explicit `--accept`. Taking an
+ * ignored upstream path back into the fork is therefore a reviewed act, exactly
+ * like any other new divergence. Making the path source deliberately — by
+ * editing `.gitignore` — goes through the ratchet too: `.gitignore` is itself an
+ * upstream-owned file with its own entry, so that edit moves a diff.
  *
  * **What is NOT claimed.** That the tree is clean, or that nothing is sitting
  * there. Only that the fork's committed content is unchanged, which is the
