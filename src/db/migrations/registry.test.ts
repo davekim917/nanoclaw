@@ -121,7 +121,11 @@ describe('central migration registry', () => {
       newlyApplied,
       'the adopted files (019/020/023) must match live rows by name and be skipped; only the net-new ones run',
     ).toEqual(['messaging-group-detached-at', 'host-coordination']);
-    expect(schemaObjects(live)).toEqual(schemaObjects(fresh));
+    const liveSchema = schemaObjects(live);
+    // Canary: two empty snapshots compare equal, so assert the query actually
+    // saw the schema before trusting the comparison below.
+    expect(liveSchema.length, 'schema snapshot is empty — the sqlite_master query is broken').toBeGreaterThan(50);
+    expect(liveSchema).toEqual(schemaObjects(fresh));
     expect(tableInfo(live)).toEqual(tableInfo(fresh));
   });
 });

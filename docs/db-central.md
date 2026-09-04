@@ -463,6 +463,16 @@ Migrations live in `src/db/migrations/`, one file per migration. Runner: `runMig
 3. Runs each pending migration's `up(db)` inside a transaction, in the barrel array's literal order (which is *not* sorted by `version`), then inserts a `schema_version` row.
 4. The `version` column stored in `schema_version` is **not** the migration's own `version` field — it's `COALESCE(MAX(version), 0) + 1`, i.e. an auto-assigned applied-order number computed at insert time. The `version` field on the `Migration` object is just an ordering hint for humans reading the barrel file; it lets module migrations (installed later by skills) pick arbitrary numbers without coordinating with trunk.
 
+### The ledger rule (name, not file number)
+
+`name` is the ledger's only identity — `schema_version` carries a UNIQUE index on it, and the `NNN-` prefix on a file is cosmetic. Two consequences run the whole ledger. A migration may be **adopted from upstream under upstream's file name** while every live install skips it, because the install already holds a row with that `name`: seam 3 did exactly this for `wiring-threads-override` (019), `container-config-timezone` (020, was fork 065) and `approvals-instance` (023, was fork 066), each verified SQL-identical to the fork file it replaced. And two array entries may never share a `name`: `pending` is computed once before the loop, so on a fresh database both entries run and the second dies on the UNIQUE index after its DDL has already committed — a break a live install cannot see. `src/db/migrations/registry.test.ts` pins both properties, including a live-upgrade-vs-fresh-install schema diff.
+
+Upstream's `021-approval-question` is deliberately **not** imported. Fork `045-approval-question-render-metadata.ts` carries the same `name` and is a strict superset of it: it adds `question` to `pending_questions` as well as to the three approval tables.
+
+Fork files `070-messaging-group-detached-at.ts` and `071-host-coordination.ts` are upstream's 022 and 024 at fork numbers. `071` creates `host_instances`, `session_claims`, `delivery_attempts` and `wake_signals` as **shadow schema** — the fork has no reader and no writer for them today; the durable-host-coordination theme that follows seam 3 is what wires them up.
+
+The `sqliteOnly` flag on a `Migration` is inert here. Upstream's async runner uses it to refuse a SQLite-specific migration on another dialect; the fork's runner is synchronous and SQLite-only and never reads it. The field exists so upstream's migration files can land byte-identical.
+
 A few migrations also set `disableForeignKeys: true` (needed for table recreates — SQLite can't relax a table-level `UNIQUE` without DROP+RENAME, which fails FK integrity checks with live child rows). The runner toggles `PRAGMA foreign_keys` around the transaction and runs `PRAGMA foreign_key_check` inside it, snapshotting pre-existing violations so it only fails on violations the migration itself introduced.
 
 Several early migrations were later renamed/retired and replaced by "module" files (their original `name` is retained on the new file so already-migrated DBs don't re-run them):
