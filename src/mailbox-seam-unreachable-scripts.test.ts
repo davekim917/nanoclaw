@@ -119,6 +119,19 @@ function literalSpecifierText(node: ts.Expression): string | null {
 }
 
 /**
+ * Throws `"<kind> in a manifest-pinned file: <file>:<line>"`, naming the
+ * exact line `node` starts on in `sourceFile`. Shared by
+ * `collectModuleBindings` and `discoverRelativeModules` so a specifier or
+ * clause shape either can't statically resolve is a loud failure, not a
+ * silently dropped edge — the manifest's completeness guarantee is that
+ * every edge is either pinned or rejected, never skipped.
+ */
+function failClosed(sourceFile: ts.SourceFile, filePath: string, kind: string, node: ts.Node): never {
+  const { line } = sourceFile.getLineAndCharacterOfPosition(node.getStart(sourceFile));
+  throw new Error(`${kind} in a manifest-pinned file: ${filePath}:${line + 1}`);
+}
+
+/**
  * Every distinct binding `filePath` (repo-root-relative, e.g.
  * `src/storage-manager.ts`) declares against `modulePath` (same form, e.g.
  * `src/mailbox/index.ts`) — across ALL matching declarations in the file,
@@ -132,13 +145,32 @@ function literalSpecifierText(node: ts.Expression): string | null {
  *     alias can't hide the real bound name
  *   - `import * as ns from '<module>'` — recorded as `*`
  *   - a bare default import — recorded as `default`
- *   - `export { x } from '<module>'` / `export * from '<module>'` re-exports
+ *   - `export { x } from '<module>'` / `export * from '<module>'` /
+ *     `export * as ns from '<module>'` re-exports (the last two both
+ *     recorded as `*` — a namespace re-export exposes every export, same
+ *     reachability as an unqualified `export *`)
  *   - `import('<module>')` anywhere in the file, not just at module top
  *     level (inside a function body, for instance) — recorded as `dynamic`
  *
  * `import type { … }` / `export type { … } from` declarations and per-specifier
  * `type` imports/exports are excluded — erased at compile time, no runtime
  * binding, so they cannot reach the seam.
+ *
+ * FAILS CLOSED (via the shared `failClosed`) on an import or export clause
+ * shape this function doesn't recognize, rather than silently contributing
+ * no bindings for it — the concrete bug this closed the: `export * as ns
+ * from '<module>'` is a `NamespaceExport`, neither the `undefined`
+ * `exportClause` case (`export * from`) nor a `NamedExports` case, and fell
+ * through both existing branches with zero bindings recorded even though a
+ * real re-export edge exists. Both fallbacks are structurally unreachable
+ * via real TypeScript syntax today (an `ImportClause`'s `namedBindings` is
+ * the closed union `NamespaceImport | NamedImports`, and an
+ * `ExportDeclaration`'s `exportClause` is the closed union `NamespaceExport
+ * | NamedExports` — both now fully handled); kept anyway as defense against
+ * a future TypeScript syntax addition changing either union, verified by
+ * temporarily stubbing an unrecognized clause value (see the test file's
+ * verification notes) rather than by real syntax, since none currently
+ * exists to construct one with.
  */
 function collectModuleBindings(filePath: string, modulePath: string, root: string = REPO_ROOT): string[] {
   const src = fs.readFileSync(path.join(root, filePath), 'utf8');
@@ -180,11 +212,13 @@ function collectModuleBindings(filePath: string, modulePath: string, root: strin
           if (clause.namedBindings) {
             if (ts.isNamespaceImport(clause.namedBindings)) {
               bindings.push('*');
-            } else {
+            } else if (ts.isNamedImports(clause.namedBindings)) {
               for (const el of clause.namedBindings.elements) {
                 const text = namedElementText(el);
                 if (text) bindings.push(text);
               }
+            } else {
+              failClosed(sourceFile, filePath, 'unrecognized import clause', node);
             }
           }
         }
@@ -194,11 +228,15 @@ function collectModuleBindings(filePath: string, modulePath: string, root: strin
       if (specifierText !== null && specifierMatchesTarget(specifierText) && !node.isTypeOnly) {
         if (!node.exportClause) {
           bindings.push('*'); // `export * from '<module>'`
+        } else if (ts.isNamespaceExport(node.exportClause)) {
+          bindings.push('*'); // `export * as ns from '<module>'` — exposes every export, same as `export *`
         } else if (ts.isNamedExports(node.exportClause)) {
           for (const el of node.exportClause.elements) {
             const text = namedElementText(el);
             if (text) bindings.push(text);
           }
+        } else {
+          failClosed(sourceFile, filePath, 'unrecognized export clause', node);
         }
       }
     } else if (
@@ -263,11 +301,6 @@ function discoverRelativeModules(filePath: string): string[] {
     return undefined;
   }
 
-  function failClosed(kind: string, node: ts.Node): never {
-    const { line } = sourceFile.getLineAndCharacterOfPosition(node.getStart(sourceFile));
-    throw new Error(`${kind} in a manifest-pinned file: ${filePath}:${line + 1}`);
-  }
-
   function visit(node: ts.Node): void {
     if (ts.isImportDeclaration(node)) {
       const specifierText = literalSpecifierText(node.moduleSpecifier);
@@ -286,13 +319,13 @@ function discoverRelativeModules(filePath: string): string[] {
     } else if (ts.isCallExpression(node) && node.expression.kind === ts.SyntaxKind.ImportKeyword) {
       const arg = node.arguments[0];
       const specifierText = arg ? literalSpecifierText(arg) : null;
-      if (specifierText === null) failClosed('computed dynamic import', node);
+      if (specifierText === null) failClosed(sourceFile, filePath, 'computed dynamic import', node);
       const resolved = resolveModule(specifierText);
       if (resolved) modules.add(resolved);
       // An unresolvable-but-LITERAL specifier (a package import()) is fine —
       // package imports aren't part of this repo-relative manifest at all.
     } else if (ts.isCallExpression(node) && ts.isIdentifier(node.expression) && node.expression.text === 'require') {
-      failClosed('unexpected require() call', node);
+      failClosed(sourceFile, filePath, 'unexpected require() call', node);
     }
     ts.forEachChild(node, visit);
   }
