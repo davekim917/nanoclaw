@@ -286,7 +286,7 @@ vi.mock('../../db/channel-ingress-receipts.js', async (importOriginal) => ({
 vi.mock('../../db/usage.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../db/usage.js')>()),
   rollupSessionUsage: () => 0,
-  pruneOldTurnUsage: () => undefined,
+  pruneOldTurnUsage: async () => undefined,
 }));
 vi.mock('../../github-app-token.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../github-app-token.js')>()),

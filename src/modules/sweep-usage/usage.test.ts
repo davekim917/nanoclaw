@@ -265,7 +265,7 @@ vi.mock('../../db/usage.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../db/usage.js')>()),
   rollupSessionUsage: (mailbox: unknown, agentGroupId: string, sessionDirKey: string) =>
     h.mockRollupSessionUsage(mailbox, agentGroupId, sessionDirKey),
-  pruneOldTurnUsage: () => h.mockPruneOldTurnUsage(),
+  pruneOldTurnUsage: async () => h.mockPruneOldTurnUsage(),
 }));
 
 // ── imports (after every mock above) ─────────────────────────────────────────
