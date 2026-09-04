@@ -130,6 +130,15 @@ describe('#360 — the archive has one write path', () => {
     expect(source).toMatch(/AFTER UPDATE ON messages_archive\s*\n\s*WHEN old\.text IS NOT new\.text/);
   });
 
+  it('walks scripts/ as well as src/', () => {
+    // Stated as its own assertion because the reviewer could not verify it by
+    // reading: a migration or backfill script writing messages_archive outside
+    // the upsert would bypass the marks triggers just as surely as host code.
+    const scanned = [...listTsFiles('src'), ...listTsFiles('scripts')];
+    expect(scanned.some((f) => f.startsWith('src/'))).toBe(true);
+    expect(scanned.some((f) => f.startsWith('scripts/')), 'scripts/ was not scanned').toBe(true);
+  });
+
   it('keeps the marks table out of the projection schema the container mounts', () => {
     // Containers read the projection and never write it, so counters there
     // would be dead weight and a new surface. The projection's schema is

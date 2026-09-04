@@ -243,6 +243,44 @@ function ensureArchiveRowMarks(db: Database.Database): void {
   log.info('Archive row-marks schema created', { ms: Date.now() - startedAt });
 }
 
+/**
+ * Open the archive once at host startup so its schema exists before anything
+ * reads it.
+ *
+ * `initSchema` is otherwise reached only through the lazy `openDb()`, which
+ * runs on the first archive WRITE. On a host upgrading into #360 that means
+ * `archive_row_marks` would not exist until some unrelated chat traffic
+ * happened to arrive — and until it does, every archive projection stamp
+ * reports an unknown mutation count and fails closed, so every spawn keeps
+ * doing the full 19 s rebuild this release exists to remove. A boot that
+ * spawns before anyone speaks would get none of the benefit.
+ *
+ * Idempotent and cheap: on every later boot the schema is already there and
+ * this is a file open plus a `sqlite_master` lookup.
+ */
+export function ensureArchiveSchema(): void {
+  openDb();
+}
+
+/**
+ * Test hook — drop the cached connection so the next open behaves like a fresh
+ * host boot against an archive that already exists on disk.
+ *
+ * Needed because that is the ONLY way to exercise the `sqlite_master` gate in
+ * `ensureArchiveRowMarks`: the connection cache otherwise short-circuits every
+ * call after the first within one process.
+ */
+export function __resetArchiveConnectionForTest(): void {
+  if (!_db) return;
+  try {
+    _db.close();
+  } catch {
+    // stale handle
+  }
+  _db = null;
+  _dbPath = null;
+}
+
 export interface ArchiveMessage {
   id: string;
   agentGroupId: string;

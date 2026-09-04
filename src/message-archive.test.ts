@@ -1,7 +1,5 @@
 import fs from 'fs';
-import { execSync, spawnSync } from 'child_process';
 import path from 'path';
-import { pathToFileURL } from 'url';
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -12,8 +10,17 @@ vi.mock('./config.js', async (importOriginal) => ({
   DATA_DIR: TEST_ROOT,
 }));
 
+const { logMock } = vi.hoisted(() => ({
+  logMock: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
+}));
+vi.mock('./log.js', () => ({ log: logMock }));
+
+import Database from 'better-sqlite3';
+
 import {
+  __resetArchiveConnectionForTest,
   archiveMessage,
+  ensureArchiveSchema,
   parseArchivePermalinks,
   queryArchiveExactLinks,
   recentConversationSenders,
@@ -401,4 +408,82 @@ describe('archiveMessage', () => {
   it('throws on a write failure rather than reporting success', () => {
     expect(() => archiveMessage({ ...message('a-3', 'text'), sentAt: null as unknown as string })).toThrow();
   });
+});
+
+
+describe('#360 — the archive schema is materialized at startup', () => {
+  function schemaObjects(): string[] {
+    const db = new Database(path.join(TEST_ROOT, 'archive.db'), { readonly: true });
+    try {
+      return (
+        db
+          .prepare(
+            `SELECT name FROM sqlite_master
+              WHERE name IN ('archive_row_marks', 'messages_archive_mark_update', 'messages_archive_mark_delete')
+              ORDER BY name`,
+          )
+          .all() as Array<{ name: string }>
+      ).map((row) => row.name);
+    } finally {
+      db.close();
+    }
+  }
+
+  it('creates the marks table and both triggers, and says so exactly once', () => {
+    logMock.info.mockClear();
+
+    // First call on a host that has never opened the archive: the whole point
+    // of the eager call is that this happens at boot rather than on the first
+    // chat message, because until it does every projection stamp fails closed
+    // and every spawn does the full rebuild.
+    ensureArchiveSchema();
+    expect(schemaObjects()).toEqual([
+      'archive_row_marks',
+      'messages_archive_mark_delete',
+      'messages_archive_mark_update',
+    ]);
+
+    const created = logMock.info.mock.calls.filter((call) => call[0] === 'Archive row-marks schema created');
+    expect(created).toHaveLength(1);
+    expect(created[0][1]).toHaveProperty('ms');
+    expect(typeof (created[0][1] as { ms: unknown }).ms).toBe('number');
+  });
+
+  it('is a no-op on every later boot', () => {
+    ensureArchiveSchema();
+    logMock.info.mockClear();
+
+    // A fresh connection, as a restarted host would open — not the cached one.
+    __resetArchiveConnectionForTest();
+    ensureArchiveSchema();
+
+    expect(schemaObjects()).toHaveLength(3);
+    expect(logMock.info.mock.calls.filter((call) => call[0] === 'Archive row-marks schema created')).toEqual([]);
+  });
+
+  it('counts an edit but not an idempotent re-archive', () => {
+    ensureArchiveSchema();
+    add('marks-1', 'ag-test-a', 'original text');
+    expect(markCount('ag-test-a')).toBe(0);
+
+    // Same content again: the trigger is guarded, so nothing moves.
+    add('marks-1', 'ag-test-a', 'original text');
+    expect(markCount('ag-test-a')).toBe(0);
+
+    // Changed text: counted.
+    add('marks-1', 'ag-test-a', 'edited text');
+    expect(markCount('ag-test-a')).toBe(1);
+  });
+
+  function markCount(agentGroupId: string): number {
+    const db = new Database(path.join(TEST_ROOT, 'archive.db'), { readonly: true });
+    try {
+      const row = db
+        .prepare('SELECT COALESCE(SUM(mutations), 0) AS n FROM archive_row_marks WHERE agent_group_id = ?')
+        .get(agentGroupId) as { n: number };
+      return row.n;
+    } finally {
+      db.close();
+    }
+  }
 });

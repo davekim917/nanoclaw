@@ -119,6 +119,7 @@ class ArchiveProjectionWorker {
         pending.resolve({
           mode: message.mode ?? 'rebuilt',
           rows: message.rows ?? 0,
+          merged: message.merged ?? 0,
           bytes: message.bytes ?? 0,
           ms: message.ms ?? 0,
           sinceRowid: message.sinceRowid ?? null,
@@ -199,6 +200,7 @@ export async function ensureArchiveProjection(
       agentGroupId,
       dstPath,
       rows: result.rows,
+      merged: result.merged,
       ms: result.ms,
       bytes: result.bytes,
       sinceRowid: result.sinceRowid,

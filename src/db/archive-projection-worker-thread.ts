@@ -37,6 +37,7 @@ export interface ArchiveProjectionResponse {
   ok: boolean;
   mode?: ArchiveProjectionMode;
   rows?: number;
+  merged?: number;
   bytes?: number;
   ms?: number;
   sinceRowid?: number | null;
@@ -59,6 +60,7 @@ port.on('message', (message: ArchiveProjectionRequest) => {
       ok: true,
       mode: result.mode,
       rows: result.rows,
+      merged: result.merged,
       bytes: result.bytes,
       ms: result.ms,
       sinceRowid: result.sinceRowid,

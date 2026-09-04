@@ -33,6 +33,7 @@ import { stopAllContainers } from './container-runner.js';
 import { writeUpstreamPolicySnapshot } from './container-updates.js';
 import { setDeliveryAdapter, startActiveDeliveryPoll, startSweepDeliveryPoll, stopDeliveryPolls } from './delivery.js';
 import { startHostSweep, stopHostSweep } from './host-sweep.js';
+import { ensureArchiveSchema } from './message-archive.js';
 import { startHostModules, stopHostModules } from './host-lifecycle.js';
 import { runOnecliBootPreflight } from './onecli-preflight.js';
 import { resetStorageActivityState } from './storage-activity.js';
@@ -546,6 +547,18 @@ export async function main(): Promise<void> {
   // work actually begins (docs/specs/upstream-host-sweep-seam/plan.md §4.1).
   // PR 0 registers nothing, so this is inert by construction.
   await startHostModules({ db, signal: hostAbortController.signal });
+
+  // 4c. Materialize the archive schema before anything can read it.
+  //
+  // `archive_row_marks` and its triggers are created by the archive's lazy
+  // open, which fires on the first WRITE. Without this call an upgraded host
+  // has no marks table until chat traffic happens to arrive, and until then
+  // every archive projection stamp fails closed and every spawn does the full
+  // rebuild #360 exists to avoid. Placed ahead of channel recovery as well as
+  // the sweep: recovery archives messages, so leaving it later would make the
+  // one-time "Archive row-marks schema created" line land from a recovery
+  // thread on some boots and from here on others.
+  ensureArchiveSchema();
 
   // Start recovery only after permissions and delivery are fully wired. A
   // replay can immediately exercise either surface (sibling bots, unknown

@@ -129,7 +129,7 @@ When sibling agents are wired to the same chat channel, each agent's adapter wri
 
 `MIN(id)` picks the surviving row deterministically (stabilizes the FTS index across spawns).
 
-One deliberate exception: when a projection is extended in place rather than rebuilt (`appendArchiveProjection`, #360), a sibling's duplicate that arrives in a later batch keeps the id of the copy projected FIRST instead of `MIN(id)` across all copies. Both are arbitrary tie-breaks between rows with identical content, and keeping the already-written one is what makes the append idempotent.
+A projection extended in place rather than rebuilt (`appendArchiveProjection`, #360) reproduces this exactly. A sibling's duplicate arriving in a later batch is merged into the row already projected, not discarded: `id` and `created_at` take the lower value, `channel_type`, `channel_name`, `platform_id` and `sender_name` the higher, so the result matches a full build including ids. The merge uses NULL-safe comparisons, because SQLite's two-argument scalar `min()`/`max()` return NULL if either argument is NULL while the aggregates used by the full build skip NULLs.
 
 ---
 

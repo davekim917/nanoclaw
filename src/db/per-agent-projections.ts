@@ -130,7 +130,7 @@ export function buildArchiveProjection(
       // succeed and queries return no rows.
       return 0;
     }
-    const src = new Database(srcPath, { readonly: true });
+    const src = openArchiveSourceForRead(srcPath);
     try {
       // Materialized with `.all()`, deliberately, NOT streamed with
       // `.iterate()`.
@@ -294,7 +294,63 @@ export function readArchiveScopeSignature(
   workgroupMemberIds?: string[],
 ): { count: number; maxRowid: number; mutations: number | null } {
   if (!fs.existsSync(srcPath)) return { count: 0, maxRowid: 0, mutations: 0 };
-  const src = new Database(srcPath, { readonly: true });
+  try {
+    return readArchiveScopeSignatureOnce(srcPath, agentGroupId, workgroupMemberIds);
+  } catch (err) {
+    // v1 touched the source only when it was already going to rebuild; v2 reads
+    // it on EVERY spawn, so a lock held by the host's synchronous archive writer
+    // is now on the hot path. One retry after a short pause covers the case
+    // where the busy timeout expired against a burst of writes. A second
+    // failure is left to throw: that aborts the spawn and the sweep retries it,
+    // exactly as a failed rebuild does today.
+    if (!isSqliteBusy(err)) throw err;
+    log.warn('Archive scope signature read was busy — retrying once', { srcPath, agentGroupId });
+    sleepSync(ARCHIVE_BUSY_RETRY_DELAY_MS);
+    return readArchiveScopeSignatureOnce(srcPath, agentGroupId, workgroupMemberIds);
+  }
+}
+
+/**
+ * How long a read of the canonical archive waits on a lock before giving up.
+ *
+ * Stated explicitly rather than inherited: better-sqlite3 currently defaults
+ * `timeout` to 5000 ms, so this pins today's behavior rather than changing it,
+ * and a future change to that default cannot silently shorten the wait on the
+ * spawn path.
+ */
+export const ARCHIVE_READ_BUSY_TIMEOUT_MS = 5000;
+
+/** Pause before the single retry of a busy signature read. */
+const ARCHIVE_BUSY_RETRY_DELAY_MS = 250;
+
+/** Every read-only open of the canonical archive, with one busy policy. */
+function openArchiveSourceForRead(srcPath: string): Database.Database {
+  return new Database(srcPath, { readonly: true, timeout: ARCHIVE_READ_BUSY_TIMEOUT_MS });
+}
+
+function isSqliteBusy(err: unknown): boolean {
+  const code = (err as { code?: unknown } | null)?.code;
+  return typeof code === 'string' && (code === 'SQLITE_BUSY' || code.startsWith('SQLITE_BUSY_'));
+}
+
+/**
+ * Block this thread briefly.
+ *
+ * Everything on this path is already synchronous better-sqlite3 work on a
+ * worker thread (or, in the fallback, a host thread that has accepted the
+ * blocking cost), so a real sleep is honest here and an async retry would
+ * change the shape of every caller.
+ */
+function sleepSync(ms: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+function readArchiveScopeSignatureOnce(
+  srcPath: string,
+  agentGroupId: string,
+  workgroupMemberIds?: string[],
+): { count: number; maxRowid: number; mutations: number | null } {
+  const src = openArchiveSourceForRead(srcPath);
   try {
     const scope = archiveScopeFilter(agentGroupId, workgroupMemberIds);
     const rows = src
@@ -448,6 +504,12 @@ export interface ArchiveProjectionResult {
   mode: ArchiveProjectionMode;
   /** Rows written. 0 for a reuse; for an append, only the ones that survived dedup. */
   rows: number;
+  /**
+   * Append only: cross-batch duplicates that carried metadata the projected
+   * row was missing and were folded into it. A duplicate identical to what is
+   * already there counts as neither a write nor a merge.
+   */
+  merged: number;
   bytes: number;
   ms: number;
   /** The rowid the append started after. Null for the other two modes. */
@@ -522,16 +584,29 @@ export function archiveProjectionIsFresh(dstPath: string, stamp: ArchiveProjecti
  * is constant across the projection and is in the predicate only to open that
  * index.
  *
- * DELIBERATE DEVIATION from the full build: on a cross-batch duplicate the full
- * build keeps `MIN(id)` over every copy, while this keeps the id of whichever
- * copy was projected FIRST. Both are arbitrary tie-breaks over rows with
- * identical content — the container reads content, not archive ids — and
- * choosing the already-written one is what makes the append idempotent. Every
- * other column, and the row set itself, is identical.
+ * A dedup hit is a MERGE, not a discard. The dedup key covers only the six
+ * content columns; the full build also folds the rest of the bucket with
+ * `MIN(id)`, `MIN(created_at)` and `MAX(channel_type/channel_name/platform_id/
+ * sender_name)`. Dropping a late duplicate on the floor would therefore leave
+ * the projection holding whichever metadata arrived first — a NULL
+ * `sender_name`, a missing `channel_name` — permanently, because the stamp
+ * advances either way and `thread-search.ts` reads exactly those columns. So
+ * when the guarded INSERT writes no row, the existing row is updated with the
+ * same aggregate semantics, which is correct precisely because MIN and MAX are
+ * associative: folding a partial aggregate into another partial aggregate
+ * reproduces the aggregate over the union, and the row set matches a full
+ * build exactly, ids included.
+ *
+ * The merge must use NULL-SAFE forms. SQLite's SCALAR `min(a,b)`/`max(a,b)`
+ * return NULL if ANY argument is NULL, the opposite of the aggregate `MIN()`/
+ * `MAX()` the full build uses, which skip NULLs. A bare `max(sender_name,
+ * @sender_name)` would therefore erase a known name the moment a copy without
+ * one arrived.
  *
  * Legacy single-agent mode has no dedup in the full build either, so it guards
- * on the primary key instead. Guarding on content there would wrongly drop a
- * genuinely distinct row that happened to repeat a message verbatim.
+ * on the primary key instead and never merges. Guarding on content there would
+ * wrongly drop a genuinely distinct row that happened to repeat a message
+ * verbatim.
  *
  * The source read is materialized and the source closed BEFORE the projection
  * is opened for writing, for the same reason the full build does it: under
@@ -544,9 +619,9 @@ export function appendArchiveProjection(
   agentGroupId: string,
   sinceRowid: number,
   workgroupMemberIds?: string[],
-): number {
+): { written: number; merged: number } {
   const widened = Boolean(workgroupMemberIds && workgroupMemberIds.length > 0);
-  const src = new Database(srcPath, { readonly: true });
+  const src = openArchiveSourceForRead(srcPath);
   let rows: Array<Record<string, unknown>>;
   try {
     if (widened) {
@@ -588,36 +663,93 @@ export function appendArchiveProjection(
     const colList = ARCHIVE_COLS.join(', ');
     const valueList = ARCHIVE_COLS.map((c) => `@${c}`).join(', ');
     const guard = widened
-      ? `NOT EXISTS (
-           SELECT 1 FROM messages_archive
-            WHERE agent_group_id     =  @agent_group_id
-              AND thread_id          IS @thread_id
-              AND sent_at            =  @sent_at
-              AND messaging_group_id IS @messaging_group_id
-              AND role               =  @role
-              AND sender_id          IS @sender_id
-              AND text               =  @text
-         )`
+      ? `NOT EXISTS (${ARCHIVE_DEDUP_MATCH_SQL})`
       : `NOT EXISTS (SELECT 1 FROM messages_archive WHERE id = @id)`;
     // INSERT ... SELECT ... WHERE, not VALUES: the guard has to be evaluated
     // per row inside SQLite. The AFTER INSERT trigger in ARCHIVE_SCHEMA_SQL
     // populates `messages_archive_fts` for whatever actually lands, exactly as
     // it does for a full build.
     const insertStmt = dst.prepare(`INSERT INTO messages_archive (${colList}) SELECT ${valueList} WHERE ${guard}`);
+    // Only the widened path can produce a dedup hit worth merging.
+    const merges: Array<[string, 'MIN' | 'MAX']> = [
+      ['id', 'MIN'],
+      ['created_at', 'MIN'],
+      ['channel_type', 'MAX'],
+      ['channel_name', 'MAX'],
+      ['platform_id', 'MAX'],
+      ['sender_name', 'MAX'],
+    ];
+    const mergeStmt = widened
+      ? dst.prepare(
+          `UPDATE messages_archive
+              SET ${merges.map(([col, fn]) => `${col} = ${nullSafeFold(fn, col)}`).join(',\n                  ')}
+            WHERE ${ARCHIVE_DEDUP_KEY_SQL}
+              -- Only when the fold would actually move something. Without this
+              -- every late duplicate rewrites an identical row and fires the
+              -- FTS update trigger for nothing, and the merged count would
+              -- report no-ops. IS NOT is the NULL-safe inequality.
+              AND (${merges.map(([col, fn]) => `${col} IS NOT ${nullSafeFold(fn, col)}`).join(' OR ')})`,
+        )
+      : null;
     const insertMany = dst.transaction((batch: Array<Record<string, unknown>>) => {
       let written = 0;
+      let merged = 0;
       for (const row of batch) {
         const params: Record<string, unknown> = {};
         // Stamp the spawning agent's id onto every row, as the full build does.
         for (const col of ARCHIVE_COLS) params[col] = col === 'agent_group_id' ? agentGroupId : (row[col] ?? null);
-        written += insertStmt.run(params).changes;
+        const inserted = insertStmt.run(params).changes;
+        if (inserted > 0) {
+          written += inserted;
+        } else if (mergeStmt) {
+          // The guard matched, so this is a cross-batch duplicate. Fold it into
+          // the row already there rather than losing its metadata.
+          merged += mergeStmt.run(params).changes > 0 ? 1 : 0;
+        }
       }
-      return written;
+      return { written, merged };
     });
     return insertMany(rows);
   } finally {
     dst.close();
   }
+}
+
+/**
+ * The dedup identity, as one string, used by BOTH the append's `NOT EXISTS`
+ * guard and its merge `UPDATE`.
+ *
+ * Column order is chosen so `idx_archive_thread(agent_group_id, thread_id,
+ * sent_at)` serves the lookup with three equality constraints rather than
+ * scanning a 240 MB projection per candidate row. `agent_group_id` is constant
+ * across the projection and is in the predicate only to open that index.
+ *
+ * Exported so the query-plan test runs `EXPLAIN QUERY PLAN` on THIS string
+ * rather than a hand-retyped copy: a future edit to the real predicate that
+ * loses the index must fail that test, which it cannot do if the test carries
+ * its own duplicate of the SQL.
+ */
+export const ARCHIVE_DEDUP_KEY_SQL = `agent_group_id     =  @agent_group_id
+              AND thread_id          IS @thread_id
+              AND sent_at            =  @sent_at
+              AND messaging_group_id IS @messaging_group_id
+              AND role               =  @role
+              AND sender_id          IS @sender_id
+              AND text               =  @text`;
+
+export const ARCHIVE_DEDUP_MATCH_SQL = `SELECT 1 FROM messages_archive
+            WHERE ${ARCHIVE_DEDUP_KEY_SQL}`;
+
+/**
+ * `MIN`/`MAX` of the stored column and the incoming parameter, skipping NULLs
+ * the way the full build's AGGREGATE MIN/MAX do.
+ *
+ * SQLite's two-argument scalar `min()`/`max()` return NULL if either argument
+ * is NULL, so the bare form would erase known metadata. In an UPDATE's SET, the
+ * bare column name on the right-hand side reads the row's ORIGINAL value.
+ */
+function nullSafeFold(fn: 'MIN' | 'MAX', column: string): string {
+  return `CASE WHEN ${column} IS NULL THEN @${column} WHEN @${column} IS NULL THEN ${column} ELSE ${fn}(${column}, @${column}) END`;
 }
 
 /**
@@ -649,17 +781,31 @@ export function materializeArchiveProjection(
   const decision = decideArchiveProjectionMode(dstPath, readArchiveProjectionStamp(dstPath), stamp);
 
   if (decision.mode === 'reused') {
-    return { mode: 'reused', rows: 0, bytes: projectionBytes(dstPath), ms: Date.now() - startedAt, sinceRowid: null };
+    return {
+      mode: 'reused',
+      rows: 0,
+      merged: 0,
+      bytes: projectionBytes(dstPath),
+      ms: Date.now() - startedAt,
+      sinceRowid: null,
+    };
   }
 
   if (decision.mode === 'appended' && decision.sinceRowid !== null) {
     removeArchiveProjectionStamp(dstPath);
     try {
-      const rows = appendArchiveProjection(srcPath, dstPath, agentGroupId, decision.sinceRowid, workgroupMemberIds);
+      const { written, merged } = appendArchiveProjection(
+        srcPath,
+        dstPath,
+        agentGroupId,
+        decision.sinceRowid,
+        workgroupMemberIds,
+      );
       writeArchiveProjectionStamp(dstPath, stamp);
       return {
         mode: 'appended',
-        rows,
+        rows: written,
+        merged,
         bytes: projectionBytes(dstPath),
         ms: Date.now() - startedAt,
         sinceRowid: decision.sinceRowid,
@@ -680,7 +826,14 @@ export function materializeArchiveProjection(
   removeArchiveProjectionStamp(dstPath);
   const rows = buildArchiveProjection(srcPath, dstPath, agentGroupId, workgroupMemberIds);
   writeArchiveProjectionStamp(dstPath, stamp);
-  return { mode: 'rebuilt', rows, bytes: projectionBytes(dstPath), ms: Date.now() - startedAt, sinceRowid: null };
+  return {
+    mode: 'rebuilt',
+    rows,
+    merged: 0,
+    bytes: projectionBytes(dstPath),
+    ms: Date.now() - startedAt,
+    sinceRowid: null,
+  };
 }
 
 function projectionBytes(filePath: string): number {

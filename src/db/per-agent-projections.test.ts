@@ -9,6 +9,7 @@ import {
   appendArchiveProjection,
   decideArchiveProjectionMode,
   readArchiveScopeSignature,
+  ARCHIVE_DEDUP_KEY_SQL,
   ARCHIVE_PROJECTION_STAMP_VERSION,
   type ArchiveProjectionStamp,
 } from './per-agent-projections.js';
@@ -874,9 +875,10 @@ describe('appendArchiveProjection — #360', () => {
       sent_at: '2026-01-01T11:01:00Z',
     });
 
-    const written = appendArchiveProjection(src, dst, 'ag-test-a', watermark, scope);
+    const { written, merged } = appendArchiveProjection(src, dst, 'ag-test-a', watermark, scope);
     // The sibling pair collapses to one row, so three new source rows land as two.
     expect(written).toBe(2);
+    expect(merged).toBe(0);
 
     const expected = tmpPath('append-equiv-expected');
     buildArchiveProjection(src, expected, 'ag-test-a', scope);
@@ -902,7 +904,9 @@ describe('appendArchiveProjection — #360', () => {
       sent_at: '2026-01-01T10:00:00Z',
     });
 
-    expect(appendArchiveProjection(src, dst, 'ag-test-a', watermark, scope)).toBe(0);
+    // Nothing new is inserted, and the merge is a no-op because the late copy
+    // carries no metadata the projected row is missing.
+    expect(appendArchiveProjection(src, dst, 'ag-test-a', watermark, scope)).toEqual({ written: 0, merged: 0 });
     expect(getAllArchiveRows(dst)).toEqual(before);
   });
 
@@ -921,7 +925,7 @@ describe('appendArchiveProjection — #360', () => {
       text: 'the zarquon question',
       sent_at: '2026-01-01T12:00:00Z',
     });
-    expect(appendArchiveProjection(src, dst, 'ag-test-a', watermark, scope)).toBe(1);
+    expect(appendArchiveProjection(src, dst, 'ag-test-a', watermark, scope).written).toBe(1);
     expect(ftsHits(dst, 'zarquon')).toBe(1);
   });
 
@@ -938,17 +942,21 @@ describe('appendArchiveProjection — #360', () => {
 
     const db = new Database(dst, { readonly: true });
     try {
+      // The REAL predicate, imported, not retyped: a future edit to
+      // ARCHIVE_DEDUP_KEY_SQL that loses the index has to fail here, which it
+      // could not do if this test carried its own copy of the SQL.
       const plan = (
         db
-          .prepare(
-            `EXPLAIN QUERY PLAN
-             SELECT 1 FROM messages_archive
-              WHERE agent_group_id = ? AND thread_id IS ? AND sent_at = ?
-                AND messaging_group_id IS ? AND role = ? AND sender_id IS ? AND text = ?`,
-          )
-          .all('ag-test-a', 'thread-1', '2026-01-01T10:00:00Z', 'mg-1', 'user', 'u-1', 'first question') as Array<{
-          detail: string;
-        }>
+          .prepare(`EXPLAIN QUERY PLAN SELECT 1 FROM messages_archive WHERE ${ARCHIVE_DEDUP_KEY_SQL}`)
+          .all({
+            agent_group_id: 'ag-test-a',
+            thread_id: 'thread-1',
+            sent_at: '2026-01-01T10:00:00Z',
+            messaging_group_id: 'mg-1',
+            role: 'user',
+            sender_id: 'u-1',
+            text: 'first question',
+          }) as Array<{ detail: string }>
       )
         .map((r) => r.detail)
         .join(' | ');
@@ -957,6 +965,76 @@ describe('appendArchiveProjection — #360', () => {
     } finally {
       db.close();
     }
+  });
+
+  it('merges a late duplicate into the projected row instead of discarding it', () => {
+    const src = twoSiblingSource('append-merge-src');
+    const dst = tmpPath('append-merge-dst');
+    buildArchiveProjection(src, dst, 'ag-test-a', scope);
+    const watermark = maxRowid(src, scope);
+
+    // The projected copy of 'first question' came from a row with no
+    // sender_name and no channel_name. The sibling's copy arrives later WITH
+    // both. The full build would fold them in with MAX(); an append that just
+    // dropped the duplicate would leave the projection permanently missing
+    // them, since the stamp advances either way and thread-search reads them.
+    withDb(src, (db) => {
+      db.prepare(
+        `INSERT INTO messages_archive
+           (id, agent_group_id, messaging_group_id, channel_type, thread_id, role,
+            sender_id, sender_name, text, sent_at, created_at, channel_name)
+         VALUES ('m1-b-late', 'ag-test-b', 'mg-1', 'slack', 'thread-1', 'user',
+                 'u-1', 'Real Name', 'first question', '2026-01-01T10:00:00Z',
+                 '2026-01-01T00:00:00Z', 'general')`,
+      ).run();
+    });
+
+    expect(appendArchiveProjection(src, dst, 'ag-test-a', watermark, scope)).toEqual({ written: 0, merged: 1 });
+
+    const mergedRow = getAllArchiveRows(dst).find((r) => r.text === 'first question');
+    expect(mergedRow?.sender_name).toBe('Real Name');
+    expect(mergedRow?.channel_name).toBe('general');
+
+    // Full parity with a fresh full build, ids included.
+    const expected = tmpPath('append-merge-expected');
+    buildArchiveProjection(src, expected, 'ag-test-a', scope);
+    expect(getAllArchiveRows(dst)).toEqual(getAllArchiveRows(expected));
+  });
+
+  it('never lets a NULL in the late copy erase metadata already projected', () => {
+    const src = twoSiblingSource('append-nullsafe-src');
+    // Give the FIRST copy the metadata, so the late one has NULLs where the
+    // projected row has values. SQLite's scalar max() returns NULL if either
+    // argument is NULL, so a bare max() here would wipe the projected name.
+    withDb(src, (db) => {
+      db.prepare("UPDATE messages_archive SET sender_name = 'Real Name' WHERE id = 'm1-a'").run();
+    });
+    const dst = tmpPath('append-nullsafe-dst');
+    buildArchiveProjection(src, dst, 'ag-test-a', scope);
+    const watermark = maxRowid(src, scope);
+
+    withDb(src, (db) => {
+      db.prepare(
+        `INSERT INTO messages_archive
+           (id, agent_group_id, messaging_group_id, channel_type, thread_id, role,
+            sender_id, sender_name, text, sent_at, created_at, channel_name)
+         VALUES ('m1-b-null', 'ag-test-b', 'mg-1', 'slack', 'thread-1', 'user',
+                 'u-1', NULL, 'first question', '2026-01-01T10:00:00Z',
+                 '2026-01-01T00:00:00Z', NULL)`,
+      ).run();
+    });
+
+    // merged 0 is the assertion, not an accident: the NULL-safe fold produces
+    // exactly what is already stored, so nothing is rewritten. A bare
+    // max(sender_name, @sender_name) would instead have written NULL over the
+    // name and reported a merge.
+    expect(appendArchiveProjection(src, dst, 'ag-test-a', watermark, scope)).toEqual({ written: 0, merged: 0 });
+    const mergedRow = getAllArchiveRows(dst).find((r) => r.text === 'first question');
+    expect(mergedRow?.sender_name).toBe('Real Name');
+
+    const expected = tmpPath('append-nullsafe-expected');
+    buildArchiveProjection(src, expected, 'ag-test-a', scope);
+    expect(getAllArchiveRows(dst)).toEqual(getAllArchiveRows(expected));
   });
 
   it('appends in legacy single-agent mode, guarding on the primary key', () => {
@@ -983,14 +1061,15 @@ describe('appendArchiveProjection — #360', () => {
       text: 'legacy addition',
       sent_at: '2026-01-01T13:00:00Z',
     });
-    expect(appendArchiveProjection(src, dst, 'ag-test-a', watermark)).toBe(2);
+    expect(appendArchiveProjection(src, dst, 'ag-test-a', watermark)).toEqual({ written: 2, merged: 0 });
 
     const expected = tmpPath('append-legacy-expected');
     buildArchiveProjection(src, expected, 'ag-test-a');
     expect(getAllArchiveRows(dst)).toEqual(getAllArchiveRows(expected));
 
-    // Re-running the same append is a no-op: every id is already present.
-    expect(appendArchiveProjection(src, dst, 'ag-test-a', watermark)).toBe(0);
+    // Re-running the same append is a no-op: every id is already present, and
+    // legacy mode never merges.
+    expect(appendArchiveProjection(src, dst, 'ag-test-a', watermark)).toEqual({ written: 0, merged: 0 });
   });
 });
 
@@ -1040,6 +1119,33 @@ describe('readArchiveScopeSignature — #360', () => {
     db.close();
     expect(readArchiveScopeSignature(src, 'ag-test-a', ['ag-test-a']).mutations).toBeNull();
   });
+
+  it('waits on a writer holding the source lock rather than failing instantly', () => {
+    const src = twoSiblingSource('signature-busy');
+    // An EXCLUSIVE transaction left open on the source is what the host's
+    // synchronous archive writer looks like mid-commit. v1 touched the source
+    // only when it was already rebuilding; v2 reads it on every spawn, so this
+    // is now on the hot path and must wait rather than abort the spawn.
+    const writer = new Database(src);
+    writer.exec('BEGIN EXCLUSIVE');
+    try {
+      const startedAt = Date.now();
+      let threw: unknown = null;
+      try {
+        readArchiveScopeSignature(src, 'ag-test-a', ['ag-test-a', 'ag-test-b']);
+      } catch (err) {
+        threw = err;
+      }
+      const elapsed = Date.now() - startedAt;
+      // Whether it eventually wins or eventually gives up, it must have WAITED
+      // — an unset busy timeout returns SQLITE_BUSY in microseconds.
+      expect(elapsed, `gave up after ${elapsed}ms, so no busy timeout was in effect`).toBeGreaterThan(500);
+      if (threw) expect(String((threw as { code?: string }).code)).toMatch(/SQLITE_BUSY/);
+    } finally {
+      writer.exec('ROLLBACK');
+      writer.close();
+    }
+  }, 30_000);
 
   it('reads a missing source as an empty, unedited scope', () => {
     expect(readArchiveScopeSignature(path.join(os.tmpdir(), 'ncproj-absent.db'), 'ag-test-a')).toEqual({
