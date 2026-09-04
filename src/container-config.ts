@@ -284,9 +284,10 @@ function normalizeMcpHeaders(raw: unknown): Record<string, string> {
     seenNames.add(lowerName);
     try {
       new Headers({ [key]: value });
-    } catch {
+    } catch (err) {
       throw new Error(
         `header "${key}" value is not valid for an HTTP header (control characters and any character above U+00FF are rejected by the transport)`,
+        { cause: err },
       );
     }
     // Allowlisted configuration headers may hold a literal; everything else

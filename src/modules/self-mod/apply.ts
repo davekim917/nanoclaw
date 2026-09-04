@@ -145,7 +145,7 @@ export async function applyAddMcpServer(payload: Record<string, unknown>, sessio
   // the container will actually load, so it fails closed on its own.
   const name = typeof payload.name === 'string' ? payload.name : '';
   if (!name) {
-    notifyAgent(session, 'add_mcp_server approved but server name is missing.');
+    void notifyAgent(session, 'add_mcp_server approved but server name is missing.');
     return;
   }
   let serverConfig: ParsedMcpServerConfig;
@@ -154,7 +154,7 @@ export async function applyAddMcpServer(payload: Record<string, unknown>, sessio
     serverConfig = parseMcpServerConfig(payload);
     // eslint-disable-next-line no-catch-all/no-catch-all -- approval payload validation must fail closed
   } catch (err) {
-    notifyAgent(
+    void notifyAgent(
       session,
       `add_mcp_server approved but config is invalid: ${err instanceof Error ? err.message : String(err)}.`,
     );
