@@ -129,6 +129,8 @@ When sibling agents are wired to the same chat channel, each agent's adapter wri
 
 `MIN(id)` picks the surviving row deterministically (stabilizes the FTS index across spawns).
 
+One deliberate exception: when a projection is extended in place rather than rebuilt (`appendArchiveProjection`, #360), a sibling's duplicate that arrives in a later batch keeps the id of the copy projected FIRST instead of `MIN(id)` across all copies. Both are arbitrary tie-breaks between rows with identical content, and keeping the already-written one is what makes the append idempotent.
+
 ---
 
 ## Canonical repositories and topic worktrees
