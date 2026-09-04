@@ -52,8 +52,16 @@ export const installPackages: McpToolDefinition = {
     inputSchema: {
       type: 'object' as const,
       properties: {
-        apt: { type: 'array', items: { type: 'string' }, description: 'apt packages to install (names only, no version specs or flags)' },
-        npm: { type: 'array', items: { type: 'string' }, description: 'npm packages to install globally (names only, no version specs)' },
+        apt: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'apt packages to install (names only, no version specs or flags)',
+        },
+        npm: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'npm packages to install globally (names only, no version specs)',
+        },
         reason: { type: 'string', description: 'Why these packages are needed' },
       },
     },
@@ -65,7 +73,8 @@ export const installPackages: McpToolDefinition = {
     if (apt.length + npm.length > MAX_PACKAGES) return err(`Maximum ${MAX_PACKAGES} packages per request`);
 
     const invalidApt = apt.find((p) => !APT_RE.test(p));
-    if (invalidApt) return err(`Invalid apt package name: "${invalidApt}". Only lowercase letters, digits, and ._+- allowed.`);
+    if (invalidApt)
+      return err(`Invalid apt package name: "${invalidApt}". Only lowercase letters, digits, and ._+- allowed.`);
     const invalidNpm = npm.find((p) => !NPM_RE.test(p));
     if (invalidNpm) return err(`Invalid npm package name: "${invalidNpm}". No version specs or shell characters.`);
 
@@ -186,10 +195,14 @@ function parseMcpServerInput(args: Record<string, unknown>): { config: ParsedMcp
     }
     for (const [key, value] of parsed.searchParams) {
       if (isCredentialQueryKey(key)) {
-        return { error: `url query parameter "${key}" looks like a credential; use the OneCLI gateway for authentication` };
+        return {
+          error: `url query parameter "${key}" looks like a credential; use the OneCLI gateway for authentication`,
+        };
       }
       if (RAW_SECRET_VALUE_RE.test(value)) {
-        return { error: `url query parameter "${key}" carries a raw credential; use the OneCLI gateway for authentication` };
+        return {
+          error: `url query parameter "${key}" carries a raw credential; use the OneCLI gateway for authentication`,
+        };
       }
     }
     // Some vendors put the token in the PATH (a Zapier-style
@@ -422,7 +435,8 @@ export const changeModel: McpToolDefinition = {
         effort: {
           type: 'string',
           enum: ['low', 'medium', 'high', 'max'],
-          description: 'Optional effort level (max is supported by some models, e.g. DeepSeek V4). Omit to keep current.',
+          description:
+            'Optional effort level (max is supported by some models, e.g. DeepSeek V4). Omit to keep current.',
         },
       },
       required: ['slug'],
@@ -459,7 +473,9 @@ export const changeModel: McpToolDefinition = {
           .prepare('SELECT reason FROM denied_models WHERE provider = ? AND slug = ?')
           .get(provider, slug) as { reason?: string } | undefined;
         if (denied) {
-          return err(`"${slug}" is on the operator deny list${denied.reason ? ` (${denied.reason})` : ''} — cannot switch to it.`);
+          return err(
+            `"${slug}" is on the operator deny list${denied.reason ? ` (${denied.reason})` : ''} — cannot switch to it.`,
+          );
         }
       } catch {
         // denied_models absent on an older session projection — skip the check.
