@@ -19,13 +19,15 @@ back toward upstream freely, and may only move further away as a named, justifie
 }}
 ```
 
-**One line per file entry, sorted by path, and nothing but `upstream` and `files`.** That layout is the
+**One line per file entry, sorted by path, and nothing but `upstream`, `paths` and `files`.** That layout is the
 point, not a quirk: pretty-printed JSON spreads each entry over four to six indented lines, so two PRs that
 each regenerate the manifest after touching unrelated upstream-owned files collide on the braces between
 their entries. One line per path lets git merge them, and two regenerations conflict only on the paths they
-**both** touched. No totals, no counts, no timestamps — an aggregate would change on every regeneration
+**both** touched. The three top-level fields are `upstream` (the pinned commit), `paths` (the coverage
+seal) and `files`. No totals, no counts, no timestamps — an aggregate would change on every regeneration
 whatever moved, so every PR would conflict on it, and the report derives those numbers from the entries
-anyway.
+anyway. The seal is not an aggregate in that sense: it covers the key SET, not the entries' contents, so it
+moves only on a re-pin.
 
 The file is written by `serializeManifest` (`src/upstream-ratchet.ts`) and is in `.prettierignore`, because
 prettier would reflow it straight back into the indented shape. It is still ordinary JSON — `readManifest` is
@@ -62,6 +64,35 @@ what the fork decided. The divergence that IS real is the `.gitignore` rule, and
 `ignored` always implies `deleted`, and that is a consequence rather than a convention: `git check-ignore` is
 index-aware and never reports a tracked path, so an ignored upstream path is by definition one the fork does
 not track. The manifest is rejected if the two ever come apart.
+
+#### The objection, and why it does not land
+
+Skipping those checks looks like a hole, and a reviewer read it as one, so the argument is written down
+rather than left implicit.
+
+*The objection:* a deleted upstream path matched by an ignore rule can be recreated with arbitrary bytes,
+and those bytes can change again later, and neither the test nor the report says a word. Resurrection checks
+exist precisely to catch a deleted upstream file coming back.
+
+*Why it does not apply:* **a gitignored path cannot be committed.** Whatever sits there is not, and cannot
+become, fork source without someone first editing `.gitignore` — and that file is upstream-owned with its
+own entry, so the edit moves a diff and goes through the ratchet like any other change. This tool measures
+the divergence of the fork's *source*. Untracked bytes are not source; they are whatever the machine
+happened to be doing. For the one real instance, "did it come back?" answers "is the system running?", which
+is not a question about divergence, and answering it turned the host suite red on a production checkout.
+
+*What is not claimed:* that the tree is clean, or that nothing is sitting there. Only that the fork's
+committed content is unchanged — the property the manifest exists to check.
+
+*What holds it up:* the exemption is load-bearing only while `ignored` really means untracked, so that is
+asserted rather than assumed. `buildManifest` refuses at write time if an ignored path is in the fork index
+(an ignore rule over a tracked file is a misconfiguration — git honours the index over the rule), `checkTree`
+rejects an `ignored` entry that is not also `deleted`, and the hermetic suite asserts that pairing across the
+real manifest. A per-file exception list was considered and rejected: it needs a human to maintain and says
+nothing about why.
+
+If a runtime artefact can be moved out of the source tree instead, that is strictly better and this
+exemption stops applying to it.
 
 ## Three parts, and why
 
@@ -115,17 +146,27 @@ UNCHANGED 958   (measured in 269 ms)
 
 A GROWTH row that carries a parenthesised reason (`mode 100644 → 100755`, `binary bytes changed`,
 `restored in fork`) is one where the line count alone did not move — those are the cases where added+deleted
-is not a measurement.
+is not a measurement. `binary bytes changed` fires when **either** side of the comparison is binary, not just
+the current one: a divergent binary at diff 1 turning into divergent text at diff 1 changes the bytes while
+every number stays put.
 
 The pinned commit has to be in the local clone. If it is not, the script exits **2** — "cannot measure",
 which is deliberately a different code from "the ratchet failed" — and prints the `git fetch upstream <sha>`
 to run. `--upstream <rev>` accepts anything `git rev-parse` understands and persists the **resolved** 40-hex
 commit, so a tag or a branch name can never end up in the manifest as a moving pin.
 
+Manifest keys are validated before anything is read: lexically (absolute paths, `..`, empty segments, NULs,
+backslashes) and then physically — the entry's nearest existing ancestor **directory** is resolved through
+symlinks and must land inside the repo. The lexical rules alone are not enough, because an ancestor directory
+can be a symlink pointing anywhere; this checkout's own `node_modules` is exactly that shape. The final
+component is deliberately never followed, since a symlink entry is hashed by its target string.
+
 Two things make the script refuse outright rather than measure something misleading: an upstream-owned path
 that exists on disk but is **untracked and not ignored** (git would report it as deleted while its bytes are
-read for the hash — this covers paths that have become directories), and a **submodule** on either side. An
-*ignored* path is exempt: see "Ignored upstream paths" above.
+read for the hash — this covers paths that have become directories), and a **submodule** on either side — including one that merely
+stands *above* upstream-owned files, since a fork submodule replacing `vendor/` hides everything upstream
+owns under it just as completely as one replacing a single file. An *ignored* path is exempt: see "Ignored
+upstream paths" above.
 
 ## Reading the verdicts
 

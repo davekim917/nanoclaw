@@ -22,6 +22,7 @@ import { beforeAll, describe, expect, it } from 'vitest';
 
 import { enforceHermeticity, hermeticityAttempts } from './test-hermeticity.js';
 import {
+  ancestorEscape,
   checkTree,
   fileModeOf,
   formatFindings,
@@ -361,6 +362,46 @@ describe('upstream-ownership ratchet', () => {
     expect(validateRelPath('..', root)).not.toBeNull();
   });
 
+  it('rejects a path whose ancestor directory symlinks out of the repository', () => {
+    // `validateRelPath` is lexical and `path.resolve` never touches the disk, so
+    // every traversal rule can pass while an ancestor DIRECTORY is a symlink
+    // pointing anywhere. This checkout's own `node_modules` is exactly that
+    // shape. Reads are not covered by the hermeticity tripwire, so nothing else
+    // would notice.
+    const root = uniqueTmpRoot('upstream-ratchet-escape');
+    const outside = uniqueTmpRoot('upstream-ratchet-outside');
+    fs.mkdirSync(path.join(outside, 'nested'), { recursive: true });
+    fs.mkdirSync(root, { recursive: true });
+    fs.writeFileSync(path.join(outside, 'nested/secret.md'), 'content outside the repository\n');
+    fs.symlinkSync(outside, path.join(root, 'escape'));
+
+    // The sha256 is the REAL hash of the out-of-tree file. Without the guard
+    // checkTree reads it, the hash matches, and the entry passes clean — the
+    // escape is silent. With the guard it never gets that far.
+    const realHash = hashFile(path.join(outside, 'nested/secret.md'));
+    expect(realHash, 'the fixture target really is readable').toMatch(/^[0-9a-f]{64}$/);
+
+    const findings = checkTree(
+      sealed({ 'escape/nested/secret.md': { diff: 2, mode: '100644', sha256: realHash } }),
+      root,
+    );
+    expect(findings.map((f) => f.kind)).toEqual(['malformed']);
+    expect(findings[0].detail).toContain('ancestor directory resolves outside the repository');
+
+    // The unit rule, directly.
+    expect(ancestorEscape('escape/nested/secret.md', root)).toContain('outside the repository');
+    expect(ancestorEscape('escape/anything/at/all.md', root)).toContain('outside the repository');
+    // A real path inside the root, and one whose ancestors do not exist yet, are
+    // both fine — a segment that does not exist cannot be a symlink.
+    fs.mkdirSync(path.join(root, 'src'), { recursive: true });
+    expect(ancestorEscape('src/router.ts', root)).toBeNull();
+    expect(ancestorEscape('not/created/yet.md', root)).toBeNull();
+    // A symlink at the FINAL component is not followed: hashFile hashes the link
+    // target string, which is what git stores, so this must stay allowed.
+    fs.symlinkSync('router.ts', path.join(root, 'src/alias.ts'));
+    expect(ancestorEscape('src/alias.ts', root)).toBeNull();
+  });
+
   it('the manifest carries no unaudited headroom', () => {
     // HONEST LIMIT: this case cannot recompute a diff. It has no git, and the
     // CI clone has no upstream objects until the ratchet's CI step fetches them.
@@ -389,7 +430,10 @@ describe('upstream-ownership ratchet', () => {
       }
       // An ignored path is one git does not track, which this manifest records
       // as deleted; check-ignore never reports a tracked path, so the pair is
-      // not a convention but a consequence.
+      // not a convention but a consequence. This assertion is load-bearing: the
+      // `ignored` flag switches off the presence, mode and hash checks, and it
+      // is only defensible while it really does mean "not fork source". See the
+      // reasoning block at the top of src/upstream-ratchet.ts.
       if (entry.ignored === true && entry.deleted !== true) violations.push(`${relPath}: ignored but not deleted`);
       // Only `true` is ever written for the three optional flags — `false` would
       // read as an audited "no" that nothing produced.

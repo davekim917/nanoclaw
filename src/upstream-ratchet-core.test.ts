@@ -65,6 +65,58 @@ describe('parsing git output', () => {
     ]);
   });
 
+  it('refuses a fork submodule standing where upstream owns files', () => {
+    // The shape that actually happens: upstream owns vendor/a.ts, the fork
+    // replaces the whole vendor/ directory with a submodule. Nothing in the
+    // index matches vendor/a.ts, so an exact-path check sees nothing and every
+    // path under the gitlink records as cleanly deleted — after which moving the
+    // submodule pointer changes no number in the manifest at all.
+    const build = (forkIndex: Array<[string, string]>): unknown =>
+      buildManifest({
+        upstream: 'a'.repeat(40),
+        upstreamModes: new Map<string, GitMode>([
+          ['vendor/a.ts', '100644'],
+          ['vendor/deep/b.ts', '100644'],
+          ['src/router.ts', '100644'],
+        ]),
+        forkIndex: new Map(forkIndex),
+        numstat: new Map(),
+        modeOf: () => null,
+        hashOf: () => null,
+        ignored: new Set<string>(),
+      });
+
+    expect(() => build([['vendor', '160000']])).toThrow(RatchetError);
+    expect(() => build([['vendor', '160000']])).toThrow(/vendor is a gitlink in the fork/);
+    // The message names a shadowed path, so the reader knows what was hidden.
+    expect(() => build([['vendor', '160000']])).toThrow(/stands where upstream owns vendor\/(a\.ts|deep\/b\.ts)/);
+    // A deeper ancestor counts too.
+    expect(() => build([['vendor/deep', '160000']])).toThrow(/stands where upstream owns vendor\/deep\/b\.ts/);
+    // A gitlink that shadows nothing upstream owns is not this tool's business.
+    expect(() => build([['unrelated/thing', '160000']])).not.toThrow();
+    // And a prefix that is not a DIRECTORY ancestor must not false-positive.
+    expect(() => build([['vend', '160000']])).not.toThrow();
+  });
+
+  it('refuses an ignored path that is also tracked', () => {
+    // The `ignored` flag waives the presence, mode and hash checks, and the only
+    // thing that makes that defensible is that untracked bytes are not fork
+    // source. check-ignore is index-aware and should never hand over a tracked
+    // path, so this never fires in practice — which is the point: the exemption
+    // must not rest on one flag's default behaviour.
+    expect(() =>
+      buildManifest({
+        upstream: 'a'.repeat(40),
+        upstreamModes: new Map<string, GitMode>([['src/router.ts', '100644']]),
+        forkIndex: new Map([['src/router.ts', '100644']]),
+        numstat: new Map(),
+        modeOf: () => '100644',
+        hashOf: () => hash('1'),
+        ignored: new Set(['src/router.ts']),
+      }),
+    ).toThrow(/matched by a .gitignore rule but is TRACKED/);
+  });
+
   it('refuses a submodule on either side rather than recording it as something else', () => {
     // A gitlink has no bytes to hash and no lines to count, so every check the
     // ratchet makes would be vacuously true for it.
@@ -174,7 +226,11 @@ describe('building entries from the working tree', () => {
     return buildManifest({
       upstream: base.upstream,
       upstreamModes: new Map(upstreamModes),
-      forkIndex: new Map(upstreamModes.map(([p]) => [p, '100644'])),
+      // An ignored path is by construction NOT in the index — check-ignore is
+      // index-aware and never reports a tracked one, and buildManifest refuses
+      // the pair. The fixture has to reflect that or it is testing a shape that
+      // cannot occur.
+      forkIndex: new Map(upstreamModes.filter(([p]) => !ignored.includes(p)).map(([p]) => [p, '100644'])),
       numstat: new Map(numstat),
       modeOf,
       hashOf,
@@ -351,6 +407,46 @@ describe('classification boundary matrix', () => {
     // Same bytes, same diff: nothing happened.
     const idle = classify(manifestOf({ 'logo.png': bin(hash('1')) }), manifestOf({ 'logo.png': bin(hash('1')) }));
     expect(verdictOf(idle, 'logo.png')).toBe('UNCHANGED');
+  });
+
+  it('blocks a binary-to-text transition and a text-to-binary one', () => {
+    // A divergent binary recorded at diff 1 can become divergent TEXT whose
+    // numstat is also 1: the bytes changed, the binary flag went away, and every
+    // number stayed put. Keying the fingerprint check on the CURRENT entry alone
+    // let that through as UNCHANGED.
+    const bin = (sha: string): UpstreamRatchetEntry => ({ diff: 1, mode: '100644', sha256: sha, binary: true });
+    const text = (sha: string, diff = 1): UpstreamRatchetEntry => ({ diff, mode: '100644', sha256: sha });
+
+    const toText = classify(manifestOf({ f: bin(hash('1')) }), manifestOf({ f: text(hash('2')) }));
+    expect(verdictOf(toText, 'f')).toBe('GROWTH');
+    expect(toText[0].reason).toBe('binary bytes changed');
+
+    const toBinary = classify(manifestOf({ f: text(hash('1')) }), manifestOf({ f: bin(hash('2')) }));
+    expect(verdictOf(toBinary, 'f')).toBe('GROWTH');
+
+    // Binary → binary with changed bytes, at the same diff: still blocked.
+    expect(verdictOf(classify(manifestOf({ f: bin(hash('1')) }), manifestOf({ f: bin(hash('3')) })), 'f')).toBe(
+      'GROWTH',
+    );
+
+    // Binary → identical to upstream: never blocked. The verdict is STALE — the
+    // manifest owes a regeneration — and what matters is that it lets through.
+    const gone = classify(manifestOf({ f: bin(hash('1')) }), manifestOf({ f: text(hash('4'), 0) }));
+    expect(verdictOf(gone, 'f')).toBe('STALE');
+    expect(gone.filter((r) => isBlocking(r.verdict))).toEqual([]);
+
+    // A binary shrinking but still divergent, with changed bytes, is blocked:
+    // the number went down but the line count was never the measurement.
+    const shrankBytes = classify(
+      manifestOf({ f: { diff: 2, mode: '100644', sha256: hash('1'), binary: true } }),
+      manifestOf({ f: bin(hash('5')) }),
+    );
+    expect(verdictOf(shrankBytes, 'f')).toBe('GROWTH');
+
+    // Same bytes on both sides: nothing happened, whatever the flags say.
+    expect(verdictOf(classify(manifestOf({ f: bin(hash('1')) }), manifestOf({ f: bin(hash('1')) })), 'f')).toBe(
+      'UNCHANGED',
+    );
   });
 
   it('blocks a mode change even when the diff total does not move', () => {

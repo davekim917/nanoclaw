@@ -183,6 +183,63 @@ export interface BuildInput {
 }
 
 /**
+ * Refuse a fork submodule that stands where upstream owns files.
+ *
+ * Checking only for an EXACT path match misses the shape that actually happens:
+ * upstream owns `vendor/a.ts`, the fork replaces the whole `vendor/` directory
+ * with a submodule. Nothing in the index then matches `vendor/a.ts`, so every
+ * path under the gitlink records as cleanly deleted, and moving the submodule
+ * pointer afterwards changes no number in the manifest at all. A gitlink that is
+ * a directory ANCESTOR of an upstream-owned path shadows it exactly as
+ * completely as one that replaces it.
+ *
+ * Refused rather than modelled: a gitlink has no bytes to hash and no lines to
+ * count, so every check the ratchet makes would be vacuously true for it.
+ */
+function assertNoGitlinkShadows(
+  upstreamModes: ReadonlyMap<string, GitMode>,
+  forkIndex: ReadonlyMap<string, string>,
+): void {
+  for (const [gitlink, mode] of forkIndex) {
+    if (mode !== GITLINK_MODE) continue;
+    const prefix = gitlink + '/';
+    for (const relPath of upstreamModes.keys()) {
+      if (relPath !== gitlink && !relPath.startsWith(prefix)) continue;
+      fail(
+        `submodules are not supported by the ratchet: ${gitlink} is a gitlink in the fork` +
+          (relPath === gitlink ? '' : `, and it stands where upstream owns ${relPath}`),
+      );
+    }
+  }
+}
+
+/**
+ * Refuse an ignored path that is ALSO tracked.
+ *
+ * The `ignored` flag switches off the presence, mode and hash checks for an
+ * entry (see the reasoning block at the top of src/upstream-ratchet.ts), and the
+ * whole justification for that is that untracked bytes are not fork source. So
+ * the premise is asserted here rather than assumed.
+ *
+ * `git check-ignore` is index-aware and does not report tracked paths, so this
+ * should never fire — which is the point. It stops the exemption from resting on
+ * one flag's default behaviour: if a future git, a `--no-index`, or a caller
+ * supplying its own set ever hands over a tracked path, the tool refuses instead
+ * of quietly waiving the checks on real committed content. An ignore rule over a
+ * tracked file is a misconfiguration in the fork, not divergence to record.
+ */
+function assertIgnoredAreUntracked(ignored: ReadonlySet<string>, forkIndex: ReadonlyMap<string, string>): void {
+  for (const relPath of ignored) {
+    if (!forkIndex.has(relPath)) continue;
+    fail(
+      `${relPath} is matched by a .gitignore rule but is TRACKED in the fork. An ignore rule over a tracked ` +
+        `file is a misconfiguration (git honours the index over the rule), and the ratchet will not waive its ` +
+        `content checks for a file the fork really owns. Remove the rule or untrack the file.`,
+    );
+  }
+}
+
+/**
  * The manifest the fork's working tree implies right now.
  *
  * `diff` folds two things into one number: the line delta git measured, and one
@@ -193,14 +250,13 @@ export interface BuildInput {
  * in the totals; the entry's `mode` field says which it actually was.
  */
 export function buildManifest(input: BuildInput): UpstreamRatchetManifest {
+  assertNoGitlinkShadows(input.upstreamModes, input.forkIndex);
+  assertIgnoredAreUntracked(input.ignored, input.forkIndex);
   const files: Record<string, UpstreamRatchetEntry> = {};
   for (const [relPath, upstreamMode] of input.upstreamModes) {
     const invalid = validateRelPath(relPath);
     if (invalid !== null)
       fail(`the pinned upstream tree contains an unusable path ${JSON.stringify(relPath)}: ${invalid}`);
-    if (input.forkIndex.get(relPath) === GITLINK_MODE) {
-      fail(`submodules are not supported by the ratchet: ${relPath} is a gitlink in the fork`);
-    }
     const stat = input.numstat.get(relPath);
 
     if (input.ignored.has(relPath)) {
@@ -286,7 +342,9 @@ export function isBlocking(verdict: Verdict): boolean {
  *    as GROWTH on its own; this clause catches the case where a mode change and
  *    a one-line shrink cancel out.
  *  - **binary bytes changed** — every differing binary scores 1 forever, so
- *    swapping it for arbitrary new bytes moves no number at all.
+ *    swapping it for arbitrary new bytes moves no number at all. Checked when
+ *    EITHER side is binary, because a binary at diff 1 turning into text at
+ *    diff 1 is the same escape wearing a different flag.
  *  - **deleted → present or present → deleted** — a presence flip, not a size
  *    change.
  *
@@ -313,7 +371,13 @@ export function classify(committed: UpstreamRatchetManifest, current: UpstreamRa
     let reason: string | null = null;
     if (before !== undefined && !isNew) {
       if (before.mode !== after.mode) reason = `mode ${before.mode} → ${after.mode}`;
-      else if (after.binary === true && after.diff > 0 && after.diff === beforeDiff && before.sha256 !== after.sha256) {
+      // Binary on EITHER side, not just the current one. A divergent binary
+      // recorded at diff 1 can become divergent TEXT whose numstat is also 1:
+      // the bytes changed, the binary flag went away, and every number stayed
+      // put. Keying on `after.binary` alone let that through as UNCHANGED. The
+      // rule is: while a path is divergent and its line count is not a
+      // measurement on at least one of the two sides, the fingerprint is.
+      else if (after.diff > 0 && (before.binary === true || after.binary === true) && before.sha256 !== after.sha256) {
         reason = 'binary bytes changed';
       } else if (deletedBefore && !deletedAfter) reason = 'restored in fork';
     }

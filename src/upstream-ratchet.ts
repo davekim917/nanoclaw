@@ -31,6 +31,41 @@
  * `git ls-tree -r <pinned sha>` get an entry, and every one of them does: no
  * exclusions, and the `paths` seal below makes an omission fail rather than pass.
  *
+ * ── Why an ignored path is recorded rather than checked ────────────────────
+ *
+ * An entry carrying `ignored: true` skips the presence, mode and hash checks.
+ * That looks like a hole, and a reviewer read it as one, so the reasoning is
+ * here rather than in a commit message.
+ *
+ * **The objection.** A deleted upstream path matched by an ignore rule can be
+ * recreated with arbitrary bytes, and those bytes can change again later, and
+ * neither the test nor the report says a word. Resurrection checks exist
+ * precisely to catch a deleted upstream file coming back.
+ *
+ * **Why it does not apply.** A gitignored path cannot be committed. Whatever is
+ * sitting there is not, and cannot become, fork source without someone first
+ * editing `.gitignore` — and `.gitignore` is itself an upstream-owned file with
+ * its own entry, so that edit moves a diff and goes through the ratchet like any
+ * other change. This tool measures the divergence of the fork's SOURCE from
+ * upstream's. Untracked bytes are not source; they are whatever the machine
+ * happened to be doing. The one real instance is a runtime lock file that a
+ * running system recreates on its own checkout, so "did it come back?" answers
+ * "is the system up?" — which is not a question about divergence, and answering
+ * it made the host suite red on a production checkout.
+ *
+ * **What is NOT claimed.** That the tree is clean, or that nothing is sitting
+ * there. Only that the fork's committed content is unchanged, which is the
+ * property this whole file exists to check.
+ *
+ * **What holds it up.** The exemption is load-bearing only while `ignored`
+ * really does mean untracked, so that is asserted rather than assumed:
+ * `buildManifest` refuses at write time if an ignored path is in the fork index
+ * (an ignore rule over a tracked file is a misconfiguration, and git honours the
+ * index over the rule), `checkEntry` rejects an `ignored` entry that is not also
+ * `deleted`, and the hermetic suite asserts that pairing over the real manifest.
+ * A per-file exception list was considered and rejected: it would need a human
+ * to maintain, and it would say nothing about why.
+ *
  * Pure `fs` + `crypto` by construction. Do not import `child_process` here.
  */
 import { createHash } from 'node:crypto';
@@ -257,6 +292,57 @@ export function validateRelPath(relPath: string, repoRoot: string = REPO_ROOT): 
 }
 
 /**
+ * Why the entry's PHYSICAL location is outside the repo, or `null`.
+ *
+ * `validateRelPath` is lexical, and `path.resolve` never touches the disk. That
+ * is not enough on its own: an ancestor DIRECTORY can be a symlink pointing
+ * anywhere. In this very checkout `node_modules` is a symlink to another tree,
+ * so a hand-written key like `node_modules/<file>` passes every lexical rule and
+ * is then read from outside the repository. The hermeticity tripwire guards
+ * writes, not reads, so nothing else would catch it.
+ *
+ * Resolves the entry's PARENT and walks up to the nearest ancestor that exists,
+ * deliberately never following the final component — the entry itself may well
+ * be a symlink, and hashing the link target string rather than the pointee is
+ * the whole point of `hashFile`. Segments that do not exist cannot be symlinks,
+ * so re-joining them lexically is safe.
+ */
+export function ancestorEscape(relPath: string, repoRoot: string = REPO_ROOT): string | null {
+  const root = realpath(repoRoot) ?? path.resolve(repoRoot);
+  let dir = path.dirname(path.resolve(repoRoot, relPath));
+  const below: string[] = [];
+  // Bounded: one hop per path segment, and `dirname` is a fixed point at the
+  // filesystem root, so this cannot spin.
+  for (let hop = 0; hop < 4096; hop += 1) {
+    const real = realpath(dir);
+    if (real !== null) {
+      const resolved = path.join(real, ...below);
+      if (resolved !== root && !resolved.startsWith(root + path.sep)) {
+        return `an ancestor directory resolves outside the repository (${resolved})`;
+      }
+      return null;
+    }
+    const parent = path.dirname(dir);
+    // Nothing along the path exists, so nothing can be a symlink and the lexical
+    // check already settled it.
+    if (parent === dir) return null;
+    below.unshift(path.basename(dir));
+    dir = parent;
+  }
+  return 'the path has too many segments to resolve';
+}
+
+function realpath(abs: string): string | null {
+  try {
+    return fs.realpathSync(abs);
+    // eslint-disable-next-line no-catch-all/no-catch-all
+  } catch (error) {
+    void error; // Does not exist (yet) — the caller walks further up.
+    return null;
+  }
+}
+
+/**
  * sha256 of one path's content, or `null` when it does not exist.
  *
  * Symlink-aware: `lstat` first, and for a symlink hash the TARGET STRING rather
@@ -388,10 +474,17 @@ function checkEntry(relPath: string, entry: UpstreamRatchetEntry, repoRoot: stri
     findings.push({ kind: 'malformed', path: relPath, detail, hint: `regenerate: ${REGENERATE_HINT}` });
   };
 
-  // BEFORE any filesystem access.
+  // BEFORE any filesystem access. Lexical rules first, then the physical check:
+  // an ancestor directory can be a symlink out of the tree even when every
+  // lexical rule passes.
   const invalidPath = validateRelPath(relPath, repoRoot);
   if (invalidPath !== null) {
     malformed(`not a usable repo-relative path: ${invalidPath}`);
+    return findings;
+  }
+  const escape = ancestorEscape(relPath, repoRoot);
+  if (escape !== null) {
+    malformed(`not a usable repo-relative path: ${escape}`);
     return findings;
   }
 

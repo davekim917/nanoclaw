@@ -61,7 +61,6 @@ import {
   acceptFlag,
   divergentEntries,
   fileModeOf,
-  GITLINK_MODE,
   hashFile,
   manifestPath,
   pathExists,
@@ -236,12 +235,10 @@ export function computeFromGit(root: string, sha: string): UpstreamRatchetManife
   const numstat = parseNumstat(git(root, ['diff', '--numstat', '--no-renames', '-z', sha]));
   const paths = [...upstreamModes.keys()];
 
-  for (const [relPath, mode] of forkIndex) {
-    if (mode === GITLINK_MODE && upstreamModes.has(relPath)) {
-      fail(`submodules are not supported by the ratchet: ${relPath} is a gitlink in the fork`);
-    }
-  }
-
+  // Gitlink and ignored/tracked refusals live in buildManifest, so they are one
+  // rule with unit tests rather than a lexical copy here that could drift. Its
+  // exact-path check was also the weaker one: it missed a submodule standing
+  // ABOVE upstream-owned files.
   const ignored = gitIgnored(root, paths);
   const shadowed = findUntrackedShadows(
     paths,
