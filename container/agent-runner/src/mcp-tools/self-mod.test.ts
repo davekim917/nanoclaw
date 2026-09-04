@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, mock } from 'bun:test';
 
 import { getOutboundDb } from '../mailbox/sqlite/connection.js';
 import { closeSessionDb, initTestSessionDb } from '../modules/mailbox/testing.js';
+import knownSecretShapes from '../../../../tests/fixtures/mcp-known-secret-shapes.json';
 
 const registeredToolNames: string[][] = [];
 mock.module('./server.js', () => ({
@@ -158,9 +159,10 @@ describe('add_mcp_server remote Streamable HTTP', () => {
   });
 
   it('rejects a raw credential in the url path or a query value', async () => {
-    expect((await submit({ name: 'zapier', url: 'https://hooks.example.com/s/sk-abc123/mcp' })).error).toContain(
-      'url path carries a raw credential',
-    );
+    expect(
+      (await submit({ name: 'zapier', url: 'https://hooks.example.com/s/sk-ant-api03-J8sK2mN9pQ4rT6vX1zA3/mcp' }))
+        .error,
+    ).toContain('url path carries a raw credential');
     expect((await submit({ name: 'q', url: 'https://example.com/mcp?tools=ghp_deadbeef1234' })).error).toContain(
       'carries a raw credential',
     );
@@ -172,6 +174,23 @@ describe('add_mcp_server remote Streamable HTTP', () => {
     const jwt = 'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U';
     expect((await submit({ name: 'q', url: `https://example.com/mcp?code=${jwt}` })).error).toContain('raw credential');
     expect((await submit({ name: 'q', url: `https://example.com/callback/${jwt}` })).error).toContain('raw credential');
+  });
+
+  it('rejects every credential shape in the shared fixture, as a header value', async () => {
+    // tests/fixtures/mcp-known-secret-shapes.json is the same list the host
+    // side's container-config.test.ts runs against parseMcpServerConfig — a
+    // shape one side catches and the other doesn't fails THIS test directly
+    // instead of costing this file its own review round to notice the drift.
+    for (const { name, value } of knownSecretShapes as { name: string; value: string }[]) {
+      const result = await submit({
+        name: 'shape-check',
+        url: 'https://example.com/mcp',
+        headers: { 'User-Agent': value },
+      });
+      expect(result.error, `${name} (${JSON.stringify(value)}) should be rejected as a raw credential`).toContain(
+        'raw credential',
+      );
+    }
   });
 
   it('rejects a declared transport that contradicts the fields', async () => {

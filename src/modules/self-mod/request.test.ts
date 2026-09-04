@@ -379,7 +379,10 @@ describe('add_mcp_server remote Streamable HTTP servers', () => {
     // A Zapier-style https://host/s/<token>/mcp. The URL is written verbatim
     // to container.json and to the approval row, so redacting it for display
     // would still leave the secret on disk — reject at intake instead.
-    await submitAddMcpServer({ name: 'zapier', url: 'https://hooks.example.com/s/sk-abc123def456/mcp' }, session);
+    await submitAddMcpServer(
+      { name: 'zapier', url: 'https://hooks.example.com/s/sk-ant-api03-J8sK2mN9pQ4rT6vX1zA3/mcp' },
+      session,
+    );
     expect(expectRejected()).toMatch(/url path carries a raw credential/);
   });
 

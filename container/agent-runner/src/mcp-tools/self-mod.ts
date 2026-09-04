@@ -163,11 +163,18 @@ const ONECLI_PLACEHOLDER = 'onecli-managed';
 const ONECLI_HEADER_VALUE_RE = new RegExp(`^(?:[A-Za-z][A-Za-z0-9-]* )?${ONECLI_PLACEHOLDER}$`);
 /**
  * Shapes of real credentials that must never be written into container.json.
- * Mirrors the host's RAW_SECRET_VALUE_RE (src/container-config.ts), which
- * mirrors SECRET_SHAPE_PATTERNS in src/secret-scrubber.ts for the JWT shape.
+ *
+ * Mirrors the host's `isKnownRawSecret` (src/container-config.ts) — this
+ * container is Bun and can't import host code, so unlike the host (which
+ * imports TOKEN_SHAPE_PATTERNS from src/secret-scrubber.ts), this file hand-
+ * copies the same shapes. That copy is what
+ * tests/fixtures/mcp-known-secret-shapes.json exists to keep honest: both
+ * this file's test and the host's run the identical fixture list, so a
+ * shape one side gains and the other doesn't fails on THIS side's test
+ * immediately rather than waiting for the next review round to notice.
  */
 const RAW_SECRET_VALUE_RE =
-  /(^|\s)(sk-|ghp_|github_pat_|xox[a-z]-|AKIA|-----BEGIN )|\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/;
+  /(^|\s)(github_pat_|AKIA|-----BEGIN )|\bsk-(?:ant-)?[A-Za-z0-9_-]{20,}\b|\b(?:sk|rk)_(?:live|test)_[A-Za-z0-9_-]{12,}\b|\bxox[abpr]-[A-Za-z0-9-]+\b|\bghp_[A-Za-z0-9]+\b|\bglpat-[A-Za-z0-9_-]+\b|\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/;
 /** C0 control characters other than horizontal tab, plus DEL — mirrors the host's check. */
 const HEADER_VALUE_CONTROL_CHAR_RE = /[\x00-\x08\x0A-\x1F\x7F]/;
 

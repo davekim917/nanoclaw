@@ -22,6 +22,7 @@ import path from 'path';
 import { GROUPS_DIR, TIMEZONE } from './config.js';
 import { validateContainerResources, type ContainerResources } from './container-resources.js';
 import { getContainerConfig } from './db/container-configs.js';
+import { TOKEN_SHAPE_PATTERNS } from './secret-scrubber.js';
 import { isIanaTimezone } from './timezone.js';
 import type { AgentGroup, ContainerConfigRow } from './types.js';
 
@@ -158,14 +159,42 @@ const ONECLI_PLACEHOLDER = 'onecli-managed';
  */
 const ONECLI_HEADER_VALUE_RE = new RegExp(`^(?:[A-Za-z][A-Za-z0-9-]* )?${ONECLI_PLACEHOLDER}$`);
 /**
- * Shapes of real credentials that must never be written into container.json.
- * The JWT alternative mirrors `SECRET_SHAPE_PATTERNS` in src/secret-scrubber.ts
- * — same shape, same reasoning: `?code=eyJ...` in a neutral-named query
- * parameter has no credential-shaped NAME to catch it, and `looksOpaque`
- * excludes dotted values, so this is the only net that catches it.
+ * Prefixes of real credentials that TOKEN_SHAPE_PATTERNS doesn't carry —
+ * that list is scoped to shapes worth scrubbing from agent-echoed text
+ * (SDK/vendor API keys, bearer tokens, JWTs), not to every credential shape
+ * that could reach a URL or header here. A GitHub fine-grained PAT, an AWS
+ * access key id, and a PEM key block are exactly as real a leak in a remote
+ * MCP URL or header, so they're kept as a small local addition rather than
+ * folded into the scrubber (which has no outbound-text reason to carry them).
  */
-const RAW_SECRET_VALUE_RE =
-  /(^|\s)(sk-|ghp_|github_pat_|xox[a-z]-|AKIA|-----BEGIN )|\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/;
+const MCP_ONLY_SECRET_PREFIX_RE = /(^|\s)(github_pat_|AKIA|-----BEGIN )/;
+
+/**
+ * Whether `value` contains a recognizable raw-credential shape that must
+ * never be written into container.json — a header value, a URL path
+ * segment, or a URL query value, all tested as an isolated string with no
+ * surrounding context.
+ *
+ * TOKEN_SHAPE_PATTERNS (src/secret-scrubber.ts) is imported rather than
+ * hand-copied: earlier rounds of review each caught one more prefix missing
+ * from a hand-maintained list here (a JWT, then GitLab/Stripe tokens) — the
+ * scrubber already carries these shapes for outbound-text redaction, so a
+ * future addition there is inherited here automatically instead of costing
+ * this file its own review round. Each pattern is rebuilt without the `g`
+ * flag before testing: the scrubber's copies are `.replace()`d in a loop and
+ * so carry global regexes, and `.test()` on a shared global-flag instance
+ * would silently start each check from wherever the previous call's
+ * `lastIndex` left off.
+ *
+ * `?code=eyJ...` in a neutral-named query parameter has no credential-shaped
+ * NAME to catch it via `isCredentialQueryKey`, and `looksOpaque` excludes
+ * dotted values on purpose, so this is the only net that catches a JWT (or
+ * any of these shapes) there.
+ */
+function isKnownRawSecret(value: string): boolean {
+  if (MCP_ONLY_SECRET_PREFIX_RE.test(value)) return true;
+  return TOKEN_SHAPE_PATTERNS.some(([re]) => new RegExp(re.source, re.flags.replace('g', '')).test(value));
+}
 /**
  * C0 control characters other than horizontal tab, plus DEL. A header value
  * containing CR/LF/NUL is accepted here (it's just a JS string) but rejected
@@ -183,7 +212,7 @@ const HEADER_VALUE_CONTROL_CHAR_RE = /[\x00-\x08\x0A-\x1F\x7F]/;
  * to admit those misses short tokens. It drives an explicit warning on the
  * approval card instead, so the human already in the loop is told which
  * segment to look at. The hard rejection stays on shapes we can actually
- * recognize (`RAW_SECRET_VALUE_RE`) and on credential-named headers and query
+ * recognize (`isKnownRawSecret`) and on credential-named headers and query
  * keys.
  */
 export function looksOpaque(value: string): boolean {
@@ -241,7 +270,7 @@ function parseMcpHeaders(raw: unknown): Record<string, string> {
         `header "${key}" is not a known configuration header, so its value must be exactly "${ONECLI_PLACEHOLDER}" or an auth scheme followed by it (e.g. "Bearer ${ONECLI_PLACEHOLDER}") — the gateway substitutes the real secret at the proxy boundary. Configuration headers that carry no credential: ${[...LITERAL_HEADER_ALLOWLIST].join(', ')}`,
       );
     }
-    if (RAW_SECRET_VALUE_RE.test(value)) {
+    if (isKnownRawSecret(value)) {
       throw new Error(
         `header "${key}" carries a raw credential; declare it as "${ONECLI_PLACEHOLDER}" and let the OneCLI gateway inject the real value`,
       );
@@ -301,7 +330,7 @@ export function parseMcpServerConfig(input: Record<string, unknown>): ParsedMcpS
           `url query parameter "${key}" looks like a credential; use the OneCLI gateway for authentication`,
         );
       }
-      if (RAW_SECRET_VALUE_RE.test(value)) {
+      if (isKnownRawSecret(value)) {
         throw new Error(
           `url query parameter "${key}" carries a raw credential; use the OneCLI gateway for authentication`,
         );
@@ -312,7 +341,7 @@ export function parseMcpServerConfig(input: Record<string, unknown>): ParsedMcpS
     // container.json and to the approval row, so a credential there is an
     // on-disk secret no amount of card redaction undoes — reject at intake.
     for (const segment of parsed.pathname.split('/')) {
-      if (RAW_SECRET_VALUE_RE.test(decodeURIComponent(segment))) {
+      if (isKnownRawSecret(decodeURIComponent(segment))) {
         throw new Error(
           'url path carries a raw credential; use the OneCLI gateway for authentication rather than a secret in the URL',
         );

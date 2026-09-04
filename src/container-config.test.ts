@@ -22,6 +22,7 @@ import { closeDb, initTestDb } from './db/connection.js';
 import { ensureContainerConfig, getContainerConfig, updateContainerConfigScalars } from './db/container-configs.js';
 import { runMigrations } from './db/migrations/index.js';
 import type { AgentGroup } from './types.js';
+import knownSecretShapes from '../tests/fixtures/mcp-known-secret-shapes.json' with { type: 'json' };
 
 let tmpDir: string;
 
@@ -399,9 +400,9 @@ describe('parseMcpServerConfig', () => {
   it('rejects a raw credential in the path or a query value, not just in a key', () => {
     // The URL is persisted verbatim to container.json and to the approval row,
     // so a Zapier-style token in the path is an on-disk secret.
-    expect(() => parseMcpServerConfig({ url: 'https://hooks.example.com/s/sk-abc123/mcp' })).toThrow(
-      /url path carries a raw credential/,
-    );
+    expect(() =>
+      parseMcpServerConfig({ url: 'https://hooks.example.com/s/sk-ant-api03-J8sK2mN9pQ4rT6vX1zA3/mcp' }),
+    ).toThrow(/url path carries a raw credential/);
     expect(() => parseMcpServerConfig({ url: 'https://example.com/mcp?tools=ghp_deadbeef1234' })).toThrow(
       /carries a raw credential/,
     );
@@ -418,6 +419,24 @@ describe('parseMcpServerConfig', () => {
     expect(parseMcpServerConfig({ url: 'https://hooks.example.com/s/abc123/mcp' })).toMatchObject({
       url: 'https://hooks.example.com/s/abc123/mcp',
     });
+  });
+
+  it('rejects every credential shape TOKEN_SHAPE_PATTERNS recognizes, as a header value', () => {
+    // TOKEN_SHAPE_PATTERNS (src/secret-scrubber.ts) is imported rather than
+    // hand-copied precisely so this file never falls a round behind it — this
+    // pins that promise against a shared fixture instead of trusting it by
+    // inspection. tests/fixtures/mcp-known-secret-shapes.json is read by the
+    // container-side mirror's own test too, so the two suites fail together
+    // if either side drifts from the same list.
+    for (const { name, value } of knownSecretShapes as { name: string; value: string }[]) {
+      // An allowlisted header, same as the existing `User-Agent` case below —
+      // otherwise the "not a known configuration header" check fires first
+      // and the raw-credential check under test is never reached.
+      expect(
+        () => parseMcpServerConfig({ url: 'https://example.com/mcp', headers: { 'User-Agent': value } }),
+        `${name} (${JSON.stringify(value)}) should be rejected as a raw credential`,
+      ).toThrow(/raw credential/);
+    }
   });
 
   it('forces credential headers through the OneCLI placeholder, in an exact form', () => {

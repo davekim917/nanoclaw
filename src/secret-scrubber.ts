@@ -101,22 +101,31 @@ export function registerSecretsFromEnv(envPath?: string): number {
 }
 
 /**
- * Secret-shape patterns. Catches tokens that aren't in `.env`:
- * OneCLI-injected API tokens (never touch disk), runtime-fetched OAuth,
- * bearer tokens appearing in response bodies that an agent echoes back,
- * literal secrets inlined into SQL/URL strings.
- *
- * Mirrored in container/agent-runner/src/providers/bash-label.ts
- * (the container is Bun and can't import host code). When updating one
- * list, update the other — the two form the label-vs-outbound defense
- * pair: bash-label sanitizes at the source, scrubSecrets backstops at
- * delivery.
+ * Contextual secret patterns: a credential recognizable only alongside the
+ * surrounding text that names it (a header line, a CLI flag, a query-string
+ * key=value pair) — meaningless applied to an isolated value with that
+ * context already stripped off.
  */
-const SECRET_SHAPE_PATTERNS: ReadonlyArray<[RegExp, string]> = [
+const CONTEXTUAL_SECRET_PATTERNS: ReadonlyArray<[RegExp, string]> = [
   [/Authorization:\s*(?:Bearer|Basic|Digest)\s+[^\s'"]+/gi, 'Authorization: [REDACTED]'],
   [/-H\s+['"]?(?:X-API-Key|X-Auth-Token|X-Access-Token|Api-Key|X-Token)[:=]\s*[^'"\s]+['"]?/gi, '-H [REDACTED]'],
   [/(?:-u|--user)\s+[^:\s]+:[^\s]+/g, '-u [REDACTED]'],
   [/([?&])(api[_-]?key|token|access[_-]?token|password|passwd|pwd|auth|sig|signature)=[^&\s"'`]+/gi, '$1$2=[REDACTED]'],
+];
+
+/**
+ * Bare token shapes: recognizable from the value alone, with no surrounding
+ * context needed — safe to test against an isolated string (a header value,
+ * a URL path segment, a query parameter value already pulled out of its
+ * key=value pair).
+ *
+ * Exported so a hard-rejection check elsewhere (src/container-config.ts, MCP
+ * server config intake) can test against these same shapes instead of
+ * hand-copying a subset — a shape added here for outbound scrubbing is then
+ * inherited there automatically, rather than costing that caller a separate
+ * review round to notice the gap.
+ */
+export const TOKEN_SHAPE_PATTERNS: ReadonlyArray<[RegExp, string]> = [
   [/\bsk-(?:ant-)?[A-Za-z0-9_-]{20,}\b/g, '[REDACTED]'],
   [/\b(?:sk|rk)_(?:live|test)_[A-Za-z0-9_-]{12,}\b/g, '[REDACTED]'],
   [/\bxox[abpr]-[A-Za-z0-9-]+\b/g, '[REDACTED]'],
@@ -124,6 +133,20 @@ const SECRET_SHAPE_PATTERNS: ReadonlyArray<[RegExp, string]> = [
   [/\bglpat-[A-Za-z0-9_-]+\b/g, '[REDACTED]'],
   [/\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/g, '[REDACTED]'],
 ];
+
+/**
+ * Catches tokens that aren't in `.env`: OneCLI-injected API tokens (never
+ * touch disk), runtime-fetched OAuth, bearer tokens appearing in response
+ * bodies that an agent echoes back, literal secrets inlined into SQL/URL
+ * strings.
+ *
+ * Mirrored in container/agent-runner/src/providers/bash-label.ts
+ * (the container is Bun and can't import host code). When updating one
+ * list, update the other — the two form the label-vs-outbound defense
+ * pair: bash-label sanitizes at the source, scrubSecrets backstops at
+ * delivery.
+ */
+const SECRET_SHAPE_PATTERNS: ReadonlyArray<[RegExp, string]> = [...CONTEXTUAL_SECRET_PATTERNS, ...TOKEN_SHAPE_PATTERNS];
 
 /**
  * No high-entropy catch-all — every iteration of length/composition
