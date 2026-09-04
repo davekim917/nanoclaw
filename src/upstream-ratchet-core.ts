@@ -129,18 +129,31 @@ export function parseNumstat(stdout: string): Map<string, NumstatRecord> {
  * file and hashing another.
  *
  * Derived from the TRACKED set rather than from `git ls-files -o
- * --exclude-standard`: an enumeration of untracked files omits ignored ones by
- * default, and a fork-deleted upstream path recreated as an ignored file is
- * exactly the case worth catching. Asking "is this path tracked?" has no such
- * hole, and it catches a path that is now a DIRECTORY too — a directory is not
- * a tracked path, and it lstat-exists.
+ * --exclude-standard`, which omits ignored files by default and so cannot see
+ * this at all. Asking "is this path tracked?" has no such hole, and it catches a
+ * path that is now a DIRECTORY too — a directory is not a tracked path, and it
+ * lstat-exists.
+ *
+ * Being IGNORED is the one exemption, and it is a different thing entirely from
+ * being invisible: an ignore rule over an upstream path is divergence the fork
+ * DECLARED, the manifest records it on the entry, and `.gitignore` is itself
+ * upstream-owned so the rule is counted in its own diff. See the body.
  */
 export function findUntrackedShadows(
   upstreamPaths: readonly string[],
   tracked: ReadonlySet<string>,
   exists: (relPath: string) => boolean,
+  ignored: ReadonlySet<string> = new Set(),
 ): string[] {
-  return upstreamPaths.filter((relPath) => !tracked.has(relPath) && exists(relPath));
+  // An IGNORED path is exempt, and not as a special case bolted on: the fork
+  // deleted it and then told git to ignore it, so something recreating it is
+  // the runtime doing its job, not content sneaking past the measurement.
+  // `.claude/scheduled_tasks.lock` is the live example — a lock file that
+  // appears on the production checkout whenever the system is running. Refusing
+  // there would make the whole tool unusable on a live install, and the
+  // divergence that matters (the .gitignore rule) is counted in `.gitignore`'s
+  // own entry.
+  return upstreamPaths.filter((relPath) => !tracked.has(relPath) && !ignored.has(relPath) && exists(relPath));
 }
 
 // ── building the current manifest ────────────────────────────────────────────
@@ -158,6 +171,15 @@ export interface BuildInput {
   modeOf: (relPath: string) => GitMode | null;
   /** sha256 of the fork's current bytes, or `null` when the path is absent. */
   hashOf: (relPath: string) => string | null;
+  /**
+   * Upstream paths the fork's `.gitignore` covers, from `git check-ignore`.
+   *
+   * check-ignore is index-aware and never reports a tracked path, so every
+   * member of this set is one the fork does not track — i.e. deleted, as far as
+   * the manifest is concerned. The entry records that fact and the working tree
+   * is never consulted for it; see `checkTree` in src/upstream-ratchet.ts.
+   */
+  ignored: ReadonlySet<string>;
 }
 
 /**
@@ -179,8 +201,26 @@ export function buildManifest(input: BuildInput): UpstreamRatchetManifest {
     if (input.forkIndex.get(relPath) === GITLINK_MODE) {
       fail(`submodules are not supported by the ratchet: ${relPath} is a gitlink in the fork`);
     }
-    const forkMode = input.modeOf(relPath);
     const stat = input.numstat.get(relPath);
+
+    if (input.ignored.has(relPath)) {
+      // Deleted-and-ignored. `git diff` measures it as deleted (it is untracked),
+      // so the line count is upstream's own, and the mode recorded is upstream's.
+      // The working tree is deliberately not consulted: whatever is or is not
+      // sitting at that path is runtime state, not fork content.
+      const entry: UpstreamRatchetEntry = {
+        diff: stat === undefined ? 0 : (stat.lines ?? 1),
+        mode: upstreamMode,
+        sha256: null,
+        deleted: true,
+        ignored: true,
+      };
+      if (stat !== undefined && stat.lines === null) entry.binary = true;
+      files[relPath] = entry;
+      continue;
+    }
+
+    const forkMode = input.modeOf(relPath);
 
     if (forkMode === null) {
       // Deleted in the fork. Its divergence is upstream's own line count, and

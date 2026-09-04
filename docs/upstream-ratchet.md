@@ -13,6 +13,7 @@ back toward upstream freely, and may only move further away as a named, justifie
 ```
 {"upstream":"b76fcb3db0236b36a4d50bed02e89eff472d0e67","paths":"04812c26…","files":{
 "assets/logo.png":{"diff":1,"mode":"100644","sha256":"…","binary":true},
+".claude/scheduled_tasks.lock":{"diff":1,"mode":"100644","sha256":null,"deleted":true,"ignored":true},
 "docs/gone.md":{"diff":40,"mode":"100644","sha256":null,"deleted":true},
 "src/host-sweep.ts":{"diff":1504,"mode":"100644","sha256":"…"}
 }}
@@ -41,10 +42,26 @@ the serializer would emit.
 | `mode` | the **fork's** working-tree mode (`100644`, `100755` or `120000`), or upstream's when the fork deleted the path. A `chmod -x` changes no bytes and no lines, so without this field it is invisible to every other check. Taken from `lstat`, not from the index, so an unstaged chmod is caught rather than hidden until it is committed. |
 | `sha256` | sha256 of the **fork's** current bytes, `null` when the fork deleted the path. For a symlink it is the hash of the link *target string*, which is what git stores for a mode-120000 blob. |
 | `deleted` | present only when the fork deleted the path. |
+| `ignored` | present only when the fork's `.gitignore` covers the path. Always alongside `deleted`. |
 | `binary` | present only when git reported the path as binary. |
 
 **Submodules are not supported.** A gitlink has no bytes to hash and no lines to count, so every check would
 be vacuously true for it. One on either side is refused loudly rather than recorded as something it is not.
+
+### Ignored upstream paths
+
+An upstream-owned path the fork **deleted and then gitignored** is recorded with `ignored: true`, and neither
+the test nor the report looks at the working tree for it. There is exactly one today:
+`.claude/scheduled_tasks.lock`, a runtime lock file that a running system recreates on its own checkout.
+
+Checking it would be worse than useless. Present, it reads as `resurrected` and turns the host suite red on
+a file that is not source; absent, it reads as deleted. Both answers describe what the runtime last did, not
+what the fork decided. The divergence that IS real is the `.gitignore` rule, and that is already counted —
+`.gitignore` is an upstream-owned file with its own entry, so adding or removing the rule moves a diff there.
+
+`ignored` always implies `deleted`, and that is a consequence rather than a convention: `git check-ignore` is
+index-aware and never reports a tracked path, so an ignored upstream path is by definition one the fork does
+not track. The manifest is rejected if the two ever come apart.
 
 ## Three parts, and why
 
@@ -61,8 +78,9 @@ hermetic tests (`src/upstream-ratchet-core.test.ts`) — a test can never drive 
 `child_process` is mocked.
 
 `scripts/upstream-ratchet-report.ts` runs git and picks an exit code, and holds no decisions of its own. It
-recomputes every entry against the pinned commit with four whole-tree git calls (about a quarter of a second
-warm) and classifies each path.
+recomputes every entry against the pinned commit with five whole-tree git calls (`rev-parse`, `ls-tree`,
+`ls-files`, `diff --numstat`, `check-ignore --stdin` — about a third of a second warm) and classifies each
+path.
 
 **The numbers are checked in CI, not self-reported.** `.github/workflows/ci.yml` has an
 `Upstream divergence ratchet` step that fetches the pinned commit by sha (`git fetch --depth=1 <url> <sha>`,
@@ -105,9 +123,9 @@ to run. `--upstream <rev>` accepts anything `git rev-parse` understands and pers
 commit, so a tag or a branch name can never end up in the manifest as a moving pin.
 
 Two things make the script refuse outright rather than measure something misleading: an upstream-owned path
-that exists on disk but is **untracked** (git would report it as deleted while its bytes are read for the
-hash — this covers ignored files and paths that have become directories), and a **submodule** on either
-side.
+that exists on disk but is **untracked and not ignored** (git would report it as deleted while its bytes are
+read for the hash — this covers paths that have become directories), and a **submodule** on either side. An
+*ignored* path is exempt: see "Ignored upstream paths" above.
 
 ## Reading the verdicts
 

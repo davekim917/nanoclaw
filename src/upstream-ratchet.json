@@ -1,6 +1,6 @@
 {"upstream":"b76fcb3db0236b36a4d50bed02e89eff472d0e67","paths":"04812c26e41880ee7b24ec6482dd2a7a5df20e18c8a278ca13aa359000198fa9","files":{
 ".agents/skills":{"diff":0,"mode":"120000","sha256":"722a918d6dee037f575ef1bf214371f14f77047e71bd75cff39f182b2ba9f6b0"},
-".claude/scheduled_tasks.lock":{"diff":1,"mode":"100644","sha256":null,"deleted":true},
+".claude/scheduled_tasks.lock":{"diff":1,"mode":"100644","sha256":null,"deleted":true,"ignored":true},
 ".claude/settings.json":{"diff":4,"mode":"100644","sha256":"378cd9429af37aca728e5756b6d6c10996fa5c25c6513656c12ba2ced72e2360"},
 ".claude/skills/add-anydoc/REMOVE.md":{"diff":108,"mode":"100644","sha256":null,"deleted":true},
 ".claude/skills/add-anydoc/SKILL.md":{"diff":154,"mode":"100644","sha256":null,"deleted":true},

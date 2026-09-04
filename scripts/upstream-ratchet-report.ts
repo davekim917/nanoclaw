@@ -38,8 +38,8 @@
  * without a subprocess; what is left here is git invocation, filesystem access,
  * rendering and the exit code.
  *
- * Cost: four whole-tree git calls (`rev-parse`, `ls-tree`, `ls-files`,
- * `diff --numstat`), never a per-file one.
+ * Cost: five whole-tree git calls (`rev-parse`, `ls-tree`, `ls-files`,
+ * `diff --numstat`, `check-ignore --stdin`), never a per-file one.
  */
 import { execFileSync } from 'node:child_process';
 import path from 'node:path';
@@ -192,6 +192,37 @@ function resolveCommit(root: string, rev: string): string {
 }
 
 /**
+ * Which of `paths` the fork's `.gitignore` covers.
+ *
+ * `git check-ignore` is INDEX-AWARE by default: it never reports a tracked path,
+ * so every path this returns is one the fork does not track. That is what makes
+ * `ignored` safe to imply `deleted` on the entry.
+ *
+ * One `--stdin` call for the whole set (53 ms for 959 paths), not one call per
+ * path. It exits 1 when nothing matches, which is a normal answer and not a
+ * failure — hence the catch.
+ */
+function gitIgnored(root: string, paths: readonly string[]): Set<string> {
+  if (paths.length === 0) return new Set();
+  let stdout: string;
+  try {
+    stdout = execFileSync('git', ['-C', root, 'check-ignore', '-z', '--stdin'], {
+      input: paths.join('\0'),
+      maxBuffer: 512 * 1024 * 1024,
+      encoding: 'utf8',
+      stdio: ['pipe', 'pipe', 'ignore'],
+    });
+  } catch (error) {
+    // Exit 1 means "none of them are ignored", and the child still wrote its
+    // (empty) stdout. Anything without stdout is a real failure.
+    const output = (error as { stdout?: string }).stdout;
+    if (typeof output !== 'string') throw error;
+    stdout = output;
+  }
+  return new Set(stdout.split('\0').filter(Boolean));
+}
+
+/**
  * The manifest the working tree implies right now, measured against `sha`.
  *
  * `git diff <commit>` compares the commit to the WORKING TREE, so an uncommitted
@@ -211,7 +242,13 @@ export function computeFromGit(root: string, sha: string): UpstreamRatchetManife
     }
   }
 
-  const shadowed = findUntrackedShadows(paths, new Set(forkIndex.keys()), (rel) => pathExists(path.join(root, rel)));
+  const ignored = gitIgnored(root, paths);
+  const shadowed = findUntrackedShadows(
+    paths,
+    new Set(forkIndex.keys()),
+    (rel) => pathExists(path.join(root, rel)),
+    ignored,
+  );
   if (shadowed.length > 0) {
     fail(
       `${shadowed.length} upstream-owned path(s) exist on disk but are not tracked, so their divergence cannot ` +
@@ -232,6 +269,7 @@ export function computeFromGit(root: string, sha: string): UpstreamRatchetManife
       numstat,
       modeOf: (rel) => fileModeOf(path.join(root, rel)),
       hashOf: (rel) => hashFile(path.join(root, rel)),
+      ignored,
     }),
   );
 }

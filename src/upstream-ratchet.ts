@@ -85,6 +85,9 @@ export const REGENERATE_HINT = 'pnpm run ratchet:report -- --write';
  *             deleted the path. For a symlink it is the sha256 of the link
  *             TARGET STRING, which is what git stores for a mode-120000 blob.
  *  - `deleted` present only when the fork deleted the path.
+ *  - `ignored` present only when the fork's `.gitignore` covers the path. Always
+ *             together with `deleted`, because `git check-ignore` is index-aware
+ *             and never reports a tracked path. See the note below.
  *  - `binary`  present only when git reported the path as binary (`-` numstat).
  */
 export interface UpstreamRatchetEntry {
@@ -92,6 +95,7 @@ export interface UpstreamRatchetEntry {
   mode: GitMode;
   sha256: string | null;
   deleted?: true;
+  ignored?: true;
   binary?: true;
 }
 
@@ -207,6 +211,7 @@ export function serializeManifest(manifest: UpstreamRatchetManifest): string {
       `"sha256":${JSON.stringify(entry.sha256)}`,
     ];
     if (entry.deleted === true) fields.push('"deleted":true');
+    if (entry.ignored === true) fields.push('"ignored":true');
     if (entry.binary === true) fields.push('"binary":true');
     const comma = index === paths.length - 1 ? '' : ',';
     lines.push(`${JSON.stringify(relPath)}:{${fields.join(',')}}${comma}`);
@@ -406,8 +411,19 @@ function checkEntry(relPath: string, entry: UpstreamRatchetEntry, repoRoot: stri
   if (entry.deleted !== undefined && entry.deleted !== true) {
     malformed(`"deleted" may only be present as true, got ${JSON.stringify(entry.deleted)}`);
   }
+  if (entry.ignored !== undefined && entry.ignored !== true) {
+    malformed(`"ignored" may only be present as true, got ${JSON.stringify(entry.ignored)}`);
+  }
   if (entry.binary !== undefined && entry.binary !== true) {
     malformed(`"binary" may only be present as true, got ${JSON.stringify(entry.binary)}`);
+  }
+  // `git check-ignore` is index-aware: it never reports a tracked path, so an
+  // ignored upstream path is always one the fork does not track — which this
+  // manifest records as deleted. An `ignored` entry without `deleted` therefore
+  // could not have been generated, and would switch off the presence and hash
+  // checks for a file the tree really does own.
+  if (entry.ignored === true && entry.deleted !== true) {
+    malformed('an "ignored" entry must also be "deleted" — check-ignore never reports a tracked path');
   }
   // A deleted path has no fork bytes to hash, and a present one always does.
   // These two are what let a reader trust `deleted` without stat-ing the tree.
@@ -418,6 +434,18 @@ function checkEntry(relPath: string, entry: UpstreamRatchetEntry, repoRoot: stri
     malformed("a non-deleted entry must carry a sha256 of the fork's bytes");
   }
   if (findings.length > 0) return findings;
+
+  // An IGNORED upstream path is one the fork deleted and then told git to
+  // ignore — `.claude/scheduled_tasks.lock` is the live example: a runtime lock
+  // file some process recreates on a production checkout whenever the system is
+  // running. Nothing about the tree can prove anything here, and asking would
+  // make the host suite go red on a file that is not source: present, it reads
+  // as `resurrected`; absent, it reads as deleted; both are just "whatever the
+  // runtime last did". The DIVERGENCE is the .gitignore rule itself, and that is
+  // already counted — `.gitignore` is an upstream-owned file with its own entry,
+  // so adding or removing the rule moves a diff there. So: record the fact and
+  // check nothing else about it.
+  if (entry.ignored === true) return findings;
 
   const abs = path.join(repoRoot, relPath);
   const present = pathExists(abs);

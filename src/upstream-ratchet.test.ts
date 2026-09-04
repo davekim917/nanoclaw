@@ -121,6 +121,9 @@ describe('upstream-ownership ratchet', () => {
         void error;
         present = false;
       }
+      // An ignored entry is runtime state, not fork content — see the
+      // dedicated case below.
+      if (entry.ignored === true) continue;
       if (entry.deleted === true && present) resurrected.push(relPath);
       if (entry.deleted !== true && !present) missing.push(relPath);
     }
@@ -266,6 +269,63 @@ describe('upstream-ownership ratchet', () => {
     expect(checkTree(fixture, root).find((f) => f.path === 'note.md')?.detail).toContain('no git blob mode');
   });
 
+  it('an ignored upstream path is recorded, not checked against the tree', () => {
+    // `.claude/scheduled_tasks.lock` is upstream-tracked, deleted in this fork,
+    // AND gitignored here — it is a RUNTIME LOCK FILE. On the production
+    // checkout some process recreates it whenever the system is running, so a
+    // presence check turns the host suite red on a file that is not source, and
+    // the report refuses the whole tree as a shadow. Neither is a real finding.
+    //
+    // The divergence that IS real is the .gitignore rule, and that is already
+    // counted: .gitignore is an upstream-owned file with its own entry, so
+    // adding or removing the rule moves a diff there. So the manifest records
+    // `ignored` and checks nothing else about the path.
+    const root = uniqueTmpRoot('upstream-ratchet-ignored');
+    fs.mkdirSync(path.join(root, '.claude'), { recursive: true });
+
+    const fixture = sealed({
+      '.claude/scheduled_tasks.lock': { diff: 1, mode: '100644', sha256: null, deleted: true, ignored: true },
+    });
+
+    // Absent: no finding.
+    expect(checkTree(fixture, root)).toEqual([]);
+
+    // Present, with arbitrary runtime content: still no finding. Without the
+    // flag this is exactly the `resurrected` red that would fire on every
+    // production checkout with the system running.
+    fs.writeFileSync(path.join(root, '.claude/scheduled_tasks.lock'), 'pid 4242\n');
+    expect(checkTree(fixture, root)).toEqual([]);
+
+    // A plain deleted entry at the same path DOES fire, so the exemption comes
+    // from the flag and not from something else being lenient.
+    const unflagged = sealed({
+      '.claude/scheduled_tasks.lock': { diff: 1, mode: '100644', sha256: null, deleted: true },
+    });
+    expect(checkTree(unflagged, root).map((f) => f.kind)).toEqual(['resurrected']);
+
+    // The flag is only ever `true`, and only ever alongside `deleted`:
+    // check-ignore is index-aware and never reports a tracked path, so an
+    // `ignored` entry without `deleted` could not have been generated — and it
+    // would switch off the presence and hash checks for a file the tree owns.
+    const notDeleted = sealed({
+      'src/router.ts': { diff: 1, mode: '100644', sha256: 'a'.repeat(64), ignored: true },
+    });
+    expect(checkTree(notDeleted, root).find((f) => f.path === 'src/router.ts')?.detail).toContain(
+      'must also be "deleted"',
+    );
+    const notTrue = sealed({
+      'x.md': { diff: 1, mode: '100644', sha256: null, deleted: true, ignored: false as unknown as true },
+    });
+    expect(checkTree(notTrue, root).find((f) => f.path === 'x.md')?.detail).toContain(
+      '"ignored" may only be present as true',
+    );
+
+    // And it round-trips through the serializer in a fixed position.
+    expect(serializeManifest(fixture)).toContain(
+      '".claude/scheduled_tasks.lock":{"diff":1,"mode":"100644","sha256":null,"deleted":true,"ignored":true}',
+    );
+  });
+
   it('checkTree rejects unusable manifest paths before touching the filesystem', () => {
     const root = uniqueTmpRoot('upstream-ratchet-paths');
     fs.mkdirSync(root, { recursive: true });
@@ -327,9 +387,14 @@ describe('upstream-ownership ratchet', () => {
       if (entry.binary === true && (entry.diff < 1 || entry.diff > 2)) {
         violations.push(`${relPath}: binary but diff is ${entry.diff}, not 1 or 2`);
       }
-      // Only `true` is ever written for the two optional flags — `false` would
+      // An ignored path is one git does not track, which this manifest records
+      // as deleted; check-ignore never reports a tracked path, so the pair is
+      // not a convention but a consequence.
+      if (entry.ignored === true && entry.deleted !== true) violations.push(`${relPath}: ignored but not deleted`);
+      // Only `true` is ever written for the three optional flags — `false` would
       // read as an audited "no" that nothing produced.
       if ('deleted' in entry && entry.deleted !== true) violations.push(`${relPath}: "deleted" present but not true`);
+      if ('ignored' in entry && entry.ignored !== true) violations.push(`${relPath}: "ignored" present but not true`);
       if ('binary' in entry && entry.binary !== true) violations.push(`${relPath}: "binary" present but not true`);
     }
     expect(violations, `regenerate the manifest: ${REGENERATE_HINT}`).toEqual([]);

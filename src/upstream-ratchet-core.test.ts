@@ -78,6 +78,7 @@ describe('parsing git output', () => {
         numstat: new Map(),
         modeOf: () => '100644',
         hashOf: () => hash('1'),
+        ignored: new Set<string>(),
       }),
     ).toThrow(/gitlink in the fork/);
   });
@@ -138,6 +139,18 @@ describe('untracked shadows', () => {
     ]);
   });
 
+  it('exempts an IGNORED path, which is declared divergence rather than a shadow', () => {
+    // The fork deleted it and told git to ignore it; something recreating it is
+    // the runtime doing its job. Refusing here would make the tool unusable on a
+    // live install — .claude/scheduled_tasks.lock reappears whenever the system
+    // runs. The rule itself is counted in .gitignore's own entry.
+    const lock = '.claude/scheduled_tasks.lock';
+    expect(findUntrackedShadows([lock], new Set(), () => true)).toEqual([lock]);
+    expect(findUntrackedShadows([lock], new Set(), () => true, new Set([lock]))).toEqual([]);
+    // And the exemption is per-path, not a blanket switch.
+    expect(findUntrackedShadows([lock, 'other.md'], new Set(), () => true, new Set([lock]))).toEqual(['other.md']);
+  });
+
   it('is silent on a genuinely deleted path and on a tracked one', () => {
     expect(findUntrackedShadows(upstream, new Set(upstream), () => true)).toEqual([]);
     expect(findUntrackedShadows(upstream, new Set(), () => false)).toEqual([]);
@@ -156,6 +169,7 @@ describe('building entries from the working tree', () => {
     numstat: Array<[string, NumstatRecord]>,
     modeOf: (p: string) => GitMode | null,
     hashOf: (p: string) => string | null = base.hashOf,
+    ignored: string[] = [],
   ): Record<string, UpstreamRatchetEntry> {
     return buildManifest({
       upstream: base.upstream,
@@ -164,6 +178,7 @@ describe('building entries from the working tree', () => {
       numstat: new Map(numstat),
       modeOf,
       hashOf,
+      ignored: new Set(ignored),
     }).files;
   }
 
@@ -214,6 +229,46 @@ describe('building entries from the working tree', () => {
     });
     // Plus the mode unit when that moved too.
     expect(build([['logo.png', '100755']], [['logo.png', { lines: null }]], () => '100644')['logo.png'].diff).toBe(2);
+  });
+
+  it('records an ignored path without ever consulting the tree', () => {
+    // `.gitignore` covering an upstream path is divergence the fork DECLARED.
+    // Whatever is or is not sitting there is runtime state — the live case is
+    // .claude/scheduled_tasks.lock, a lock file the running system recreates —
+    // so neither `modeOf` nor `hashOf` may be called for it.
+    let consulted = 0;
+    const files = build(
+      [['.claude/scheduled_tasks.lock', '100644']],
+      [['.claude/scheduled_tasks.lock', { lines: 1 }]],
+      () => {
+        consulted += 1;
+        return '100644';
+      },
+      () => {
+        consulted += 1;
+        return hash('1');
+      },
+      ['.claude/scheduled_tasks.lock'],
+    );
+    expect(files['.claude/scheduled_tasks.lock']).toEqual({
+      diff: 1,
+      mode: '100644',
+      sha256: null,
+      deleted: true,
+      ignored: true,
+    });
+    expect(consulted, 'the working tree must not be consulted for an ignored path').toBe(0);
+  });
+
+  it('keeps upstream mode and line count on an ignored path', () => {
+    const files = build(
+      [['bin/gen', '100755']],
+      [['bin/gen', { lines: 40 }]],
+      () => null,
+      () => null,
+      ['bin/gen'],
+    );
+    expect(files['bin/gen']).toEqual({ diff: 40, mode: '100755', sha256: null, deleted: true, ignored: true });
   });
 
   it('refuses a path the manifest could not safely address', () => {
