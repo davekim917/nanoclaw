@@ -48,8 +48,22 @@ import { getUserDm, upsertUserDm } from './db/user-dms.js';
  *   - openDM throws (platform error, user blocked bot, etc.)
  *
  * Callers should treat null as "this user is unreachable on this channel".
+ *
+ * `instance` names the adapter instance the DM should belong to — normally
+ * the instance of the conversation that prompted it. It matters only when the
+ * row has to be created: `createMessagingGroup` stamps `instance =
+ * channel_type` for an unset value, and on an install whose bots are all
+ * NAMED instances nothing is registered under the bare channel type, so a row
+ * created without it is undeliverable by any caller that dispatches on the
+ * exact instance key (`getChannelAdapterExact`). Omit it and the previous
+ * behavior is unchanged.
+ *
+ * Known limitation, unchanged here: `user_dms` is keyed
+ * (user_id, channel_type), not instance, so a user already cached from one
+ * instance keeps that row even when a different instance asks. Widening the
+ * cache key is a schema change and out of scope for this fix.
  */
-export async function ensureUserDm(userId: string): Promise<MessagingGroup | null> {
+export async function ensureUserDm(userId: string, instance?: string): Promise<MessagingGroup | null> {
   const user = getUser(userId);
   if (!user) {
     log.warn('ensureUserDm: user not found', { userId });
@@ -75,18 +89,34 @@ export async function ensureUserDm(userId: string): Promise<MessagingGroup | nul
   }
 
   // Cache miss: resolve the DM platform_id either via openDM or directly.
-  const dmPlatformId = await resolveDmPlatformId(channelType, handle);
+  // Resolved through the requested instance when there is one: on Slack the
+  // DM channel a bot opens is per-bot, so asking the wrong sibling would
+  // return a channel the intended bot cannot post in.
+  const dmPlatformId = await resolveDmPlatformId(channelType, handle, instance);
   if (!dmPlatformId) return null;
 
   // Find-or-create the underlying messaging_group. A DM we received
   // earlier may already have a row matching (channel_type, platform_id).
+  //
+  // Scoped to the requested instance. Without it this lookup resolves
+  // default-instance-first and then the lexically-first NAMED instance, so on
+  // a multi-bot direct-addressable channel — where platform_id is the user's
+  // handle and therefore identical across bots — it returns a sibling's row
+  // and the instance we were asked for is silently discarded. The caller then
+  // dispatches on that row's exact instance and reaches the wrong bot. The
+  // table is UNIQUE(channel_type, platform_id, instance), so a per-instance
+  // row is the intended shape; exact-only here means a miss creates one.
   const now = new Date().toISOString();
-  let mg = getMessagingGroupByPlatform(channelType, dmPlatformId);
+  let mg = getMessagingGroupByPlatform(channelType, dmPlatformId, instance);
   if (!mg) {
     const mgId = `mg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     mg = {
       id: mgId,
       channel_type: channelType,
+      // Unset falls back to `instance = channel_type` in createMessagingGroup,
+      // which is right for a single-instance install and undeliverable on a
+      // named-instance one — see the doc comment.
+      instance,
       platform_id: dmPlatformId,
       name: user.display_name,
       is_group: 0,
@@ -101,6 +131,7 @@ export async function ensureUserDm(userId: string): Promise<MessagingGroup | nul
     log.info('ensureUserDm: created DM messaging_group', {
       userId,
       channelType,
+      instance: mg.instance ?? channelType,
       messagingGroupId: mgId,
     });
   }
@@ -119,10 +150,13 @@ export async function ensureUserDm(userId: string): Promise<MessagingGroup | nul
  * Call the adapter's openDM if it has one; otherwise fall through to using
  * the handle directly. Returns null if the adapter is missing entirely.
  */
-async function resolveDmPlatformId(channelType: string, handle: string): Promise<string | null> {
-  const adapter = getChannelAdapter(channelType);
+async function resolveDmPlatformId(channelType: string, handle: string, instance?: string): Promise<string | null> {
+  // getChannelAdapter, not the exact variant: this is one of the
+  // channelType-only call sites the fallback exists for, so an unnamed or
+  // offline instance still resolves through a sibling rather than failing.
+  const adapter = getChannelAdapter(instance ?? channelType);
   if (!adapter) {
-    log.warn('ensureUserDm: no adapter for channel', { channelType });
+    log.warn('ensureUserDm: no adapter for channel', { channelType, instance });
     return null;
   }
   if (!adapter.openDM) {

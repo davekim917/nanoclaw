@@ -182,7 +182,14 @@ export function pickApprover(agentGroupId: string | null): string[] {
 export async function pickApprovalDelivery(
   approvers: string[],
   originChannelType: string,
-  options: { sameChannelTypeOnly?: boolean } = {},
+  /**
+   * `instance` is the origin conversation's adapter instance, used only when a
+   * cold DM row has to be created. Callers that later dispatch on the returned
+   * row's exact instance key must pass it: without it the new row is stamped
+   * with the bare channel type, which resolves no adapter on an install whose
+   * bots are all named instances. See `ensureUserDm`.
+   */
+  options: { sameChannelTypeOnly?: boolean; instance?: string } = {},
 ): Promise<{ userId: string; messagingGroup: MessagingGroup } | null> {
   if (originChannelType) {
     for (const userId of approvers) {
@@ -194,11 +201,13 @@ export async function pickApprovalDelivery(
       // this (parseUserId falls back to user.kind); asking it is what keeps
       // the two sides from disagreeing.
       if (resolveUserChannelType(userId) !== originChannelType) continue;
-      const mg = await ensureUserDm(userId);
+      const mg = await ensureUserDm(userId, options.instance);
       if (mg) return { userId, messagingGroup: mg };
     }
   }
   if (options.sameChannelTypeOnly) return null;
+  // Cross-channel fallback: the origin instance belongs to a different
+  // platform here, so it must not be stamped on this user's DM row.
   for (const userId of approvers) {
     const mg = await ensureUserDm(userId);
     if (mg) return { userId, messagingGroup: mg };

@@ -50,6 +50,12 @@ vi.mock('../../delivery.js', () => ({
   registerDeliveryAction: vi.fn(),
 }));
 
+// Records what pickApprovalDelivery passed down to cold-DM resolution, so the
+// instance handoff can be asserted without a live adapter registry.
+const { ensureUserDmCalls } = vi.hoisted(() => ({
+  ensureUserDmCalls: [] as Array<{ userId: string; instance?: string }>,
+}));
+
 // Mock ensureUserDm to return the approver's existing messaging group
 // instead of hitting a real openDM RPC.
 //
@@ -60,7 +66,8 @@ vi.mock('../../delivery.js', () => ({
 // the FYI half of the flow throw and silently deliver only the decline.
 vi.mock('./user-dm.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('./user-dm.js')>()),
-  ensureUserDm: vi.fn(async (userId: string) => {
+  ensureUserDm: vi.fn(async (userId: string, instance?: string) => {
+    ensureUserDmCalls.push({ userId, instance });
     const { getDb } = await import('../../db/connection.js');
     return getDb()
       .prepare(
@@ -156,6 +163,7 @@ beforeEach(async () => {
     .run('telegram:owner', 'telegram', 'mg-dm-owner', now());
 
   deliverMock.mockClear();
+  ensureUserDmCalls.length = 0;
 });
 
 afterEach(() => {
@@ -532,6 +540,91 @@ describe('unknown-sender decline_notify flow', () => {
     expect(JSON.parse(deliverMock.mock.calls[0][4] as string).text).toBe(
       "I'm Second's personal agent — I can't help you directly.",
     );
+  });
+
+  it('resolves the owner DM on the origin adapter instance', async () => {
+    // The FYI dispatches on the resolved row's exact instance key. If the row
+    // has to be cold-created it must be stamped with the origin's instance,
+    // or on a named-instance install it names an adapter that does not exist
+    // and the owner silently misses the notice for 24h.
+    // A stranger DM arriving on a NAMED adapter instance. Built as its own
+    // row rather than mutated onto the shared fixture: `instance` is fixed at
+    // creation, and inbound lookup is exact-on-instance, so the row and the
+    // event have to agree or the router auto-creates a separate default row.
+    createMessagingGroup({
+      id: 'mg-dm-named',
+      channel_type: 'telegram',
+      instance: 'telegram-owner-bot',
+      platform_id: 'dm-named',
+      name: null,
+      is_group: 0,
+      unknown_sender_policy: 'decline_notify',
+      created_at: now(),
+    });
+    createMessagingGroupAgent({
+      id: 'mga-named',
+      messaging_group_id: 'mg-dm-named',
+      agent_group_id: 'ag-1',
+      engage_mode: 'pattern',
+      engage_pattern: '.',
+      sender_scope: 'all',
+      ignored_message_policy: 'drop',
+      session_mode: 'shared',
+      priority: 0,
+      default_model: null,
+      default_effort: null,
+      default_tone: null,
+      instructions_profile: null,
+      created_at: now(),
+    });
+
+    const { routeInbound } = await import('../../router.js');
+    await routeInbound({ ...strangerDm('hello'), platformId: 'dm-named', instance: 'telegram-owner-bot' });
+    await waitForDeliveries(2);
+
+    expect(ensureUserDmCalls).toContainEqual({ userId: 'telegram:owner', instance: 'telegram-owner-bot' });
+  });
+
+  it('uses the generic label when the reachable owner has no display name', async () => {
+    // The named owner must come from the person actually notified. When that
+    // owner has no display_name, falling back to another owner's name would
+    // reintroduce the mismatch — say "my owner" instead.
+    (await db()).prepare('DELETE FROM user_dms WHERE user_id = ?').run('telegram:owner');
+    upsertUser({ id: 'telegram:nameless', kind: 'telegram', display_name: null, created_at: now() });
+    grantRole({
+      user_id: 'telegram:nameless',
+      role: 'owner',
+      agent_group_id: null,
+      granted_by: 'telegram:owner',
+      granted_at: now(),
+    });
+    createMessagingGroup({
+      id: 'mg-dm-nameless',
+      channel_type: 'telegram',
+      instance: 'telegram-owner-bot',
+      platform_id: 'dm-nameless',
+      name: 'Nameless DM',
+      is_group: 0,
+      unknown_sender_policy: 'public',
+      created_at: now(),
+    });
+    (await db())
+      .prepare(
+        `INSERT INTO user_dms (user_id, channel_type, messaging_group_id, resolved_at)
+         VALUES (?, ?, ?, ?)`,
+      )
+      .run('telegram:nameless', 'telegram', 'mg-dm-nameless', now());
+
+    const { routeInbound } = await import('../../router.js');
+    await routeInbound(strangerDm('hello'));
+    await waitForDeliveries(2);
+
+    // The notice goes to the nameless owner...
+    expect(deliverMock.mock.calls[1][1]).toBe('dm-nameless');
+    // ...so the decline must not name the other owner ('Owner').
+    const declineText = JSON.parse(deliverMock.mock.calls[0][4] as string).text;
+    expect(declineText).toBe("I'm my owner's personal agent — I can't help you directly.");
+    expect(declineText).not.toContain('Owner');
   });
 
   it('sends the FYI to the owner, not to the admin the approval card would go to', async () => {

@@ -17,6 +17,7 @@ import { canAccessAgentGroup, isSiblingBotSender } from './access.js';
 import { addMember, isMember } from './db/agent-group-members.js';
 import { createUser } from './db/users.js';
 import { grantRole, hasAnyOwner, isOwner } from './db/user-roles.js';
+import { getMessagingGroup } from '../../db/messaging-groups.js';
 import { getUserDm } from './db/user-dms.js';
 import { ensureUserDm } from './user-dm.js';
 
@@ -37,12 +38,23 @@ afterEach(async () => {
 async function mountMockAdapter(
   channelType: string,
   openDM?: (handle: string) => Promise<string>,
+  /**
+   * Registry key, when it differs from the channel type — that is what a
+   * NAMED adapter instance looks like (`slack-labs` carrying channelType
+   * `slack`). On such an install nothing is registered under the bare
+   * channel type.
+   */
+  registryKey?: string,
 ): Promise<{ delivered: OutboundMessage[]; openDMCalls: string[] }> {
   const delivered: OutboundMessage[] = [];
   const openDMCalls: string[] = [];
   const adapter: ChannelAdapter = {
-    name: channelType,
+    name: registryKey ?? channelType,
     channelType,
+    // The registry keys active adapters by `instance ?? channelType`, so this
+    // is what actually makes it a named instance — with it set, nothing is
+    // reachable under the bare channel type by exact key.
+    ...(registryKey ? { instance: registryKey } : {}),
     supportsThreads: false,
     async setup() {},
     async teardown() {},
@@ -61,7 +73,7 @@ async function mountMockAdapter(
       return openDM(handle);
     };
   }
-  registerChannelAdapter(channelType, { factory: () => adapter });
+  registerChannelAdapter(registryKey ?? channelType, { factory: () => adapter });
   await initChannelAdapters(() => ({
     conversations: [],
     onInbound: () => {},
@@ -268,6 +280,55 @@ describe('ensureUserDm', () => {
     const mg2 = await ensureUserDm('discord:user-1');
     expect(mg2!.id).toBe(mg!.id);
     expect(mock.openDMCalls).toEqual(['user-1']);
+  });
+
+  it('stamps the requested instance on a cold DM row', async () => {
+    // A named-instance install: the adapter is registered as 'slack-labs',
+    // so nothing answers to the bare channel type 'slack'.
+    await mountMockAdapter('slack', async (handle) => `dm-${handle}`, 'slack-labs');
+    seedUser('slack:U-owner', 'slack');
+
+    const mg = await ensureUserDm('slack:U-owner', 'slack-labs');
+    expect(mg).toBeDefined();
+    // Read the row back: createMessagingGroup defaults an unset instance to
+    // the channel type, so the persisted value is what matters.
+    const row = getMessagingGroup(mg!.id);
+    expect(row?.instance).toBe('slack-labs');
+  });
+
+  it('without an instance a cold DM row falls back to the bare channel type', async () => {
+    // Pins the default the fix relies on: callers that dispatch on the exact
+    // instance key must pass one, because this row names an adapter that does
+    // not exist on a named-instance install.
+    await mountMockAdapter('slack', async (handle) => `dm-${handle}`, 'slack-labs');
+    seedUser('slack:U-owner', 'slack');
+
+    const mg = await ensureUserDm('slack:U-owner');
+    expect(getMessagingGroup(mg!.id)?.instance).toBe('slack');
+  });
+
+  it('does not reuse a sibling instance row for the same platform_id', async () => {
+    // Direct-addressable channels make platform_id the user's own handle, so
+    // it is identical across bots. An existing row under a sibling instance
+    // must not be adopted: dispatching on its exact instance would reach the
+    // wrong bot with the wrong token.
+    await mountMockAdapter('telegram', undefined, 'telegram-bot-a');
+    seedUser('telegram:U-owner', 'telegram');
+
+    createMessagingGroup({
+      id: 'mg-sibling',
+      channel_type: 'telegram',
+      instance: 'telegram-bot-b',
+      platform_id: 'U-owner',
+      name: 'Sibling bot DM',
+      is_group: 0,
+      unknown_sender_policy: 'strict',
+      created_at: now(),
+    });
+
+    const mg = await ensureUserDm('telegram:U-owner', 'telegram-bot-a');
+    expect(mg!.id).not.toBe('mg-sibling');
+    expect(getMessagingGroup(mg!.id)?.instance).toBe('telegram-bot-a');
   });
 
   it('returns null when the adapter is not registered', async () => {
