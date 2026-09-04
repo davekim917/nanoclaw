@@ -87,12 +87,12 @@ const REPO_ROOT = path.resolve(__dirname, '..');
  * rather than shared, because that walk's target set is a different,
  * independent decision from this one.
  *
- * `pinnedImportsFrom` asserts the EXACT set of named bindings a file imports
- * from each of these — including the empty set for a module it currently
- * does NOT import from — so a future import from ANY of them (renamed,
- * aliased, or otherwise) fails this test instead of silently widening
- * reachability. An aliased `getAgentMailbox as foo` shows up in the captured
- * specifier text verbatim and cannot hide behind the alias.
+ * `collectModuleBindings` asserts the EXACT set of bindings a file declares
+ * against each of these — including the empty set for a module it currently
+ * has no such declaration for — so a future declaration against ANY of them
+ * (renamed, aliased, a second declaration further down the file, a namespace
+ * import, or a dynamic `import()`) fails this test instead of silently
+ * widening reachability.
  */
 const SEAM_ADJACENT_MODULES = [
   'src/session-manager.ts',
@@ -103,25 +103,95 @@ const SEAM_ADJACENT_MODULES = [
 ] as const;
 
 /**
- * The exact set of named bindings `filePath` (repo-root-relative, e.g.
- * `src/storage-manager.ts`) imports from `modulePath` (same form, e.g.
- * `src/mailbox/index.ts`) via a static `import { ... } from` — `[]` when
- * there is no such import at all. Resolves the expected relative specifier
- * from the two paths rather than hard-coding one, so the same helper works
- * regardless of how deep either file sits in the tree.
+ * Every distinct binding `filePath` (repo-root-relative, e.g.
+ * `src/storage-manager.ts`) declares against `modulePath` (same form, e.g.
+ * `src/mailbox/index.ts`) — across ALL matching declarations in the file,
+ * not just the first. Walks the real TypeScript AST (`ts.createSourceFile`,
+ * the same `ts` import the transitive walk below uses for module
+ * specifiers) rather than a text regex, so none of these evade detection:
+ *
+ *   - a SECOND `import { x } from '<module>'` declaration further down the
+ *     file (a regex `.exec()` only ever finds the first)
+ *   - `import { x as y } from '<module>'` — recorded as `x as y`, so an
+ *     alias can't hide the real bound name
+ *   - `import * as ns from '<module>'` — recorded as `*`
+ *   - a bare default import — recorded as `default`
+ *   - `export { x } from '<module>'` / `export * from '<module>'` re-exports
+ *   - `import('<module>')` anywhere in the file, not just at module top
+ *     level (inside a function body, for instance) — recorded as `dynamic`
+ *
+ * `import type { … }` / `export type { … } from` declarations and per-specifier
+ * `type` imports/exports are excluded — erased at compile time, no runtime
+ * binding, so they cannot reach the seam.
  */
-function pinnedImportsFrom(filePath: string, modulePath: string): string[] {
+function collectModuleBindings(filePath: string, modulePath: string): string[] {
   const src = fs.readFileSync(path.join(REPO_ROOT, filePath), 'utf8');
-  const fromDir = path.posix.dirname(filePath);
-  let specifier = path.posix.relative(fromDir, modulePath).replace(/\.ts$/, '.js');
-  if (!specifier.startsWith('.')) specifier = './' + specifier;
-  const escaped = specifier.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  const match = new RegExp(`import\\s*\\{([^}]*)\\}\\s*from\\s*['"]${escaped}['"]`).exec(src);
-  if (!match) return [];
-  return match[1]
-    .split(',')
-    .map((n) => n.trim())
-    .filter(Boolean);
+  const sourceFile = ts.createSourceFile(filePath, src, ts.ScriptTarget.Latest, /* setParentNodes */ true);
+  const fileDir = path.posix.dirname(filePath);
+  const targetNoExt = modulePath.replace(/\.ts$/, '');
+
+  function specifierMatchesTarget(specifierText: string): boolean {
+    if (!specifierText.startsWith('.')) return false; // package import — no repo-relative edge
+    const resolved = path.posix.normalize(path.posix.join(fileDir, specifierText)).replace(/\.js$/, '');
+    return resolved === targetNoExt || `${resolved}/index` === targetNoExt;
+  }
+
+  function namedElementText(el: ts.ImportSpecifier | ts.ExportSpecifier): string | null {
+    if (el.isTypeOnly) return null;
+    const original = (el.propertyName ?? el.name).text;
+    return el.propertyName ? `${original} as ${el.name.text}` : original;
+  }
+
+  const bindings: string[] = [];
+
+  function visit(node: ts.Node): void {
+    if (ts.isImportDeclaration(node) && ts.isStringLiteral(node.moduleSpecifier)) {
+      if (specifierMatchesTarget(node.moduleSpecifier.text) && !node.importClause?.isTypeOnly) {
+        const clause = node.importClause;
+        if (!clause) {
+          bindings.push('(side-effect)'); // bare `import '<module>'`
+        } else {
+          if (clause.name) bindings.push('default');
+          if (clause.namedBindings) {
+            if (ts.isNamespaceImport(clause.namedBindings)) {
+              bindings.push('*');
+            } else {
+              for (const el of clause.namedBindings.elements) {
+                const text = namedElementText(el);
+                if (text) bindings.push(text);
+              }
+            }
+          }
+        }
+      }
+    } else if (ts.isExportDeclaration(node) && node.moduleSpecifier && ts.isStringLiteral(node.moduleSpecifier)) {
+      if (specifierMatchesTarget(node.moduleSpecifier.text) && !node.isTypeOnly) {
+        if (!node.exportClause) {
+          bindings.push('*'); // `export * from '<module>'`
+        } else if (ts.isNamedExports(node.exportClause)) {
+          for (const el of node.exportClause.elements) {
+            const text = namedElementText(el);
+            if (text) bindings.push(text);
+          }
+        }
+      }
+    } else if (
+      // `ts.isImportCall` exists at runtime but isn't in the public .d.ts, so
+      // detect a dynamic `import(...)` call the same way the compiler's own
+      // (unexported) implementation does: a CallExpression whose callee is
+      // the bare `import` keyword.
+      ts.isCallExpression(node) &&
+      node.expression.kind === ts.SyntaxKind.ImportKeyword &&
+      node.arguments.length > 0 &&
+      ts.isStringLiteral(node.arguments[0])
+    ) {
+      if (specifierMatchesTarget(node.arguments[0].text)) bindings.push('dynamic');
+    }
+    ts.forEachChild(node, visit);
+  }
+
+  visit(sourceFile);
+  return bindings;
 }
 
 const cleanupDirs: string[] = [];
@@ -264,7 +334,7 @@ describe('storage-manager.ts / storage-activity.ts contain no literal seam call'
       'src/modules/mailbox/index.ts': ['sessionMailboxPath'],
     };
     for (const seamModule of SEAM_ADJACENT_MODULES) {
-      expect(pinnedImportsFrom('src/storage-manager.ts', seamModule).sort(), seamModule).toEqual(
+      expect(collectModuleBindings('src/storage-manager.ts', seamModule).sort(), seamModule).toEqual(
         expected[seamModule].sort(),
       );
     }
@@ -334,7 +404,7 @@ describe('worktree-cleanup.ts contains no literal seam call, and the only contai
       'src/modules/mailbox/index.ts': ['sessionMailboxPath'],
     };
     for (const seamModule of SEAM_ADJACENT_MODULES) {
-      expect(pinnedImportsFrom('src/worktree-cleanup.ts', seamModule).sort(), seamModule).toEqual(
+      expect(collectModuleBindings('src/worktree-cleanup.ts', seamModule).sort(), seamModule).toEqual(
         expected[seamModule].sort(),
       );
     }
@@ -346,7 +416,7 @@ describe('worktree-cleanup.ts contains no literal seam call, and the only contai
   // getAgentMailbox), so it sits outside the sweep above. Pinned separately
   // for the same "future import re-triggers this review" reason.
   it("worktree-cleanup.ts's only modules/mailbox/openers.js import is openOutboundDb", () => {
-    expect(pinnedImportsFrom('src/worktree-cleanup.ts', 'src/modules/mailbox/openers.ts').sort()).toEqual(
+    expect(collectModuleBindings('src/worktree-cleanup.ts', 'src/modules/mailbox/openers.ts').sort()).toEqual(
       ['openOutboundDb'].sort(),
     );
   });
