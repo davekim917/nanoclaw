@@ -366,7 +366,23 @@ describe('topic-linked worktree topology', () => {
     const source = readFileSync(fileURLToPath(new URL('./git-worktrees.ts', import.meta.url)), 'utf8');
     const openPr = source.slice(source.indexOf("name: 'open_pr'"));
     expect(openPr).toContain('capturedIdentity(resolved.context)');
-    expect(openPr).toContain("'--head', identity.branch");
+    expect(openPr).toContain("'--head', head");
+    // Never the raw checkout: --head comes from a named branch or from a
+    // capture, and there is no path that lets `gh` pick it.
+    expect(openPr).not.toContain("'--head', identity.branch");
+  });
+
+  test('opens the PR for a named branch when one is given', async () => {
+    // The window between git_push returning and open_pr being called is
+    // between two tool calls, so no locking inside either one reaches it. The
+    // branch git_push reported is passed back, and this call describes that
+    // push rather than the checkout as it now stands.
+    const source = readFileSync(fileURLToPath(new URL('./git-worktrees.ts', import.meta.url)), 'utf8');
+    const openPr = source.slice(source.indexOf("name: 'open_pr'"));
+    expect(openPr).toContain("typeof args.branch === 'string'");
+    // And git_push tells the caller what to pass.
+    const push = source.slice(source.indexOf("name: 'git_push'"), source.indexOf("name: 'open_pr'"));
+    expect(push).toContain('Pass branch=');
   });
 
   test('still refuses a detached HEAD', async () => {

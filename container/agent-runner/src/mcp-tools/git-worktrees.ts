@@ -670,7 +670,8 @@ export const gitPushTool: McpToolDefinition = {
         tryGitAt(worktree, ['branch', `--set-upstream-to=origin/${branch}`, branch]);
         await emitRefresh(resolved.context);
         return ok(
-          `Pushed ${branch} at ${head.slice(0, 8)} to origin${args.force === true ? ' (force-with-lease)' : ''}`,
+          `Pushed ${branch} at ${head.slice(0, 8)} to origin${args.force === true ? ' (force-with-lease)' : ''}. ` +
+            `Pass branch=${branch} to open_pr so the PR is opened for this push, not for the checkout.`,
         );
       });
     } catch (error) {
@@ -691,6 +692,12 @@ export const openPrTool: McpToolDefinition = {
         repo: { type: 'string', description: 'Repository name.' },
         title: { type: 'string', description: 'Pull request title.' },
         body: { type: 'string', description: 'Optional pull request body.' },
+        branch: {
+          type: 'string',
+          description:
+            'Branch to open the PR for. Pass the branch git_push reported; without it the current checkout is used, ' +
+            'which a same-topic sibling can have switched since the push.',
+        },
       },
       required: ['repo', 'title'],
     },
@@ -703,13 +710,24 @@ export const openPrTool: McpToolDefinition = {
     const resolved = worktreeForTool(repo);
     if ('error' in resolved) return resolved.error;
     try {
-      // Bound to the branch this call captured, not to whatever is checked out
-      // when `gh` runs: same-topic siblings share the worktree, and `gh pr
-      // create` defaults `--head` to the current branch, so a switch mid-call
-      // would open the PR for the sibling's branch — or push theirs to open it.
-      const identity = await capturedIdentity(resolved.context);
-      if (!identity) return err('Cannot open a PR from a detached HEAD; create or switch to a branch explicitly');
-      const url = execFileSync('gh', ['pr', 'create', '--head', identity.branch, '--title', title, '--body', body], {
+      // Bound to a named branch, never to whatever is checked out when `gh`
+      // runs: same-topic siblings share the worktree, and `gh pr create`
+      // defaults `--head` to the current branch, so a switch mid-call would
+      // open the PR for the sibling's branch — or push theirs to open it.
+      //
+      // `branch` is what closes the window between a push and this call, which
+      // no locking here can reach: git_push names the branch it pushed, and
+      // passing that name back makes this call describe that push rather than
+      // the checkout as it now stands. Absent it, the branch is captured under
+      // the lock, which is correct whenever the checkout has not moved.
+      const named = typeof args.branch === 'string' ? args.branch.trim() : '';
+      let head = named;
+      if (!head) {
+        const identity = await capturedIdentity(resolved.context);
+        if (!identity) return err('Cannot open a PR from a detached HEAD; create or switch to a branch explicitly');
+        head = identity.branch;
+      }
+      const url = execFileSync('gh', ['pr', 'create', '--head', head, '--title', title, '--body', body], {
         cwd: resolved.context.worktree,
         encoding: 'utf8',
         stdio: ['ignore', 'pipe', 'pipe'],

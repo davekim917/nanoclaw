@@ -1137,6 +1137,10 @@ describe('skill wiring', () => {
       expect(push).toContain(shape);
     expect(push).toContain('is not known to the churn gate to leave the ref set alone');
     expect(push).toContain('--push-option=*');
+    // `--repo=<remote>` supplies the repository itself, which makes the first
+    // bare word the refspec — a different positional grammar, so it is refused
+    // rather than special-cased.
+    expect(push).not.toContain('--repo=*');
     expect(push).toContain('is not <sha>:refs/heads/<branch>');
     expect(push).toMatch(/push_refspecs" -gt 1/);
     // Evaluating the gate writes nothing at all.

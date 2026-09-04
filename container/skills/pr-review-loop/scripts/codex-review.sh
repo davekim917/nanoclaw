@@ -256,16 +256,21 @@ case "${1:?usage: open|churn|classes|gate|push|body|reply|resolve|status}" in
           echo "push $arg sends or removes refs the churn gate cannot name; push <sha>:refs/heads/<branch> instead" >&2
           exit 2
           ;;
-        # Options known not to change WHICH refs are sent, and known to be
+        # Options known not to change WHICH refs are sent, known to be
         # self-contained — no separate value argument, which would otherwise be
-        # counted below as the remote or a refspec and mis-gate the push. An
+        # counted below as the remote or a refspec — and known not to move the
+        # repository out of the positional grammar. `--repo=<remote>` fails
+        # that last test: it supplies the repository itself, so the first bare
+        # word becomes the refspec rather than the remote, and the count below
+        # would read a refspec as a remote and gate the checkout instead. It is
+        # refused rather than special-cased, because one grammar is the point. An
         # option that is not on this list is refused rather than assumed
         # harmless: the gate's whole claim is that what reaches the remote is
         # what it judged, and an unrecognised option can break that claim.
         -f|--force|--force-with-lease|--force-with-lease=*|--force-if-includes|\
         -u|--set-upstream|-n|--dry-run|-q|--quiet|-v|--verbose|--porcelain|\
         --atomic|--no-atomic|--verify|--no-verify|--progress|--no-progress|\
-        --thin|--no-thin|-4|--ipv4|-6|--ipv6|--push-option=*|--repo=*)
+        --thin|--no-thin|-4|--ipv4|-6|--ipv6|--push-option=*)
           continue
           ;;
         -*)
