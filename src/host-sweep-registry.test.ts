@@ -1328,13 +1328,19 @@ describe('sweep duty registry (S2-PR2)', () => {
     // count). The +149-line delta is NOT a duty coming home — measured with
     // `git diff --stat dc440893 HEAD -- src/host-sweep.ts` (219 insertions, 70
     // deletions, net +149) and read hunk by hunk, the two largest pieces are:
-    //  - ~90 lines: S2-PR15's quiet-session backoff jitter + boot-time cache
-    //    warm (`quietSessionJitter`/`quietSessionBackoffMs`/
+    //  - +152 net lines: S2-PR15's quiet-session backoff jitter + boot-time
+    //    cache warm (`quietSessionJitter`/`quietSessionBackoffMs`/
     //    `warmQuietSessionCache`, issue #320), plus its per-tick flush further
     //    down (`newQuietMarks`/`persistQuietSessionMarks`) and
     //    `_lastSweepTickStatsForTesting` — real driver code, not comment, but
     //    not a registrable duty body either: it is the sweep loop's own cache,
-    //    same status as `sweepDuties`/`sweepKillFollowUps` above.
+    //    same status as `sweepDuties`/`sweepKillFollowUps` above. Per-commit,
+    //    `git show --numstat <sha> -- src/host-sweep.ts`: f84d43d0 (jitter)
+    //    +53/-3, d2a0cd34 (persist + warm) +95/-1 — the +144 feature pair —
+    //    and its follow-up b6e0bc2e (guard the mark write) +9/-1. The earlier
+    //    "~90 lines" here was an eyeballed hunk read, not a measurement
+    //    (Codex round 2, minor finding 4); the ratchet below is unaffected,
+    //    since the total +149 it was reconciling against was always measured.
     //  - a near-wash (-59/+58 across two hunks): `containerOwnsOutbound`/
     //    `writeOutboundWhenStopped`/`withStoppedContainerSession` moved from a
     //    local PR14 definition to an import from `container-runner.js`
