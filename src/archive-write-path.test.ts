@@ -156,16 +156,16 @@ describe('#360 — the archive has one write path', () => {
     // name. Asserted directly rather than by planting code, so the coverage
     // cannot rot: if a reader tightens ARCHIVE_TABLE_REF, this fails.
     for (const statement of [
-      "UPDATE messages_archive SET sent_at = ?",
+      'UPDATE messages_archive SET sent_at = ?',
       'UPDATE "messages_archive" SET sent_at = ?',
       'UPDATE [messages_archive] SET sent_at = ?',
       'UPDATE `messages_archive` SET sent_at = ?',
       'UPDATE main.messages_archive SET sent_at = ?',
       'UPDATE main . "messages_archive" SET sent_at = ?',
-      "delete   from   messages_archive where id = ?",
-      "REPLACE INTO messages_archive (id) VALUES (?)",
-      "INSERT OR REPLACE INTO messages_archive (id) VALUES (?)",
-      "DROP TABLE IF EXISTS messages_archive",
+      'delete   from   messages_archive where id = ?',
+      'REPLACE INTO messages_archive (id) VALUES (?)',
+      'INSERT OR REPLACE INTO messages_archive (id) VALUES (?)',
+      'DROP TABLE IF EXISTS messages_archive',
     ]) {
       expect(writeFormsIn(statement), `not recognised as a write: ${statement}`).not.toEqual([]);
     }
@@ -173,13 +173,13 @@ describe('#360 — the archive has one write path', () => {
     // The FTS shadow table and the marks table are different tables, and the
     // trigger DDL names the base table after ON rather than after the verb.
     for (const statement of [
-      "INSERT INTO messages_archive_fts(rowid, text) VALUES (?, ?)",
+      'INSERT INTO messages_archive_fts(rowid, text) VALUES (?, ?)',
       "INSERT INTO messages_archive_fts(messages_archive_fts, rowid) VALUES ('delete', ?)",
       'INSERT INTO "messages_archive_fts" (rowid) VALUES (?)',
-      "INSERT INTO archive_row_marks (agent_group_id, mutations) VALUES (?, 1)",
-      "CREATE TRIGGER x AFTER UPDATE ON messages_archive BEGIN SELECT 1; END",
-      "CREATE TRIGGER y AFTER DELETE ON messages_archive BEGIN SELECT 1; END",
-      "SELECT * FROM messages_archive WHERE id = ?",
+      'INSERT INTO archive_row_marks (agent_group_id, mutations) VALUES (?, 1)',
+      'CREATE TRIGGER x AFTER UPDATE ON messages_archive BEGIN SELECT 1; END',
+      'CREATE TRIGGER y AFTER DELETE ON messages_archive BEGIN SELECT 1; END',
+      'SELECT * FROM messages_archive WHERE id = ?',
     ]) {
       expect(writeFormsIn(statement), `wrongly flagged as a write: ${statement}`).toEqual([]);
     }
@@ -236,7 +236,10 @@ describe('#360 — the archive has one write path', () => {
     // the upsert would bypass the marks triggers just as surely as host code.
     const scanned = [...listTsFiles('src'), ...listTsFiles('scripts')];
     expect(scanned.some((f) => f.startsWith('src/'))).toBe(true);
-    expect(scanned.some((f) => f.startsWith('scripts/')), 'scripts/ was not scanned').toBe(true);
+    expect(
+      scanned.some((f) => f.startsWith('scripts/')),
+      'scripts/ was not scanned',
+    ).toBe(true);
   });
 
   it('materializes the archive schema before anything that can spawn', () => {
