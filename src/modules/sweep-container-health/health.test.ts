@@ -43,6 +43,8 @@ import {
   decideStuckAction,
   notifyProviderHealParked,
   observeProviderStatus,
+  _resetPostKillForTesting,
+  _settlePostKillForTesting,
 } from './index.js';
 // Importing the module registers S11/S14/S16 as a duty source — needed so
 // `_sweepSessionForTesting` (F-10.2) sees the real exclusive chain rather
@@ -1602,7 +1604,9 @@ describe('registered S11/S14/S16 entries reach their bodies', () => {
     await s14.run(ctx);
 
     expect(windowsSeen).toContain('session:health:sla-observe');
-    expect(mockKillContainer).toHaveBeenCalledWith('sess-test', 'claim-stuck');
+    // The kill now carries the post-kill chain as its `onExit` (Codex final):
+    // the container is running here, so a callback is what it must be handed.
+    expect(mockKillContainer).toHaveBeenCalledWith('sess-test', 'claim-stuck', expect.any(Function));
   });
 
   it('S16: the registered SLA-observation hook calls reportContainerOomTelemetry with the observed snapshot', () => {
@@ -1682,13 +1686,25 @@ describe('post-kill writes yield to a replacement container', () => {
     return { session, state };
   }
 
+  /** The chain the kill handed back, invoked when the case says the child went. */
+  let postKillExit: (() => void) | undefined;
+
   beforeEach(() => {
     const db = initTestDb();
     runMigrations(db);
     db.prepare(`INSERT INTO agent_groups (id, name, folder, created_at) VALUES ('ag-sla', 'sla', 'sla-folder', ?)`).run(
       new Date().toISOString(),
     );
-    mockKillContainer.mockReset();
+    _resetPostKillForTesting();
+    postKillExit = undefined;
+    // Production's shape: `killContainer` only REQUESTS the stop and returns.
+    // The container is still there — `activeContainers` is cleared by the spawn
+    // path's own `close` handler — so the follow-up chain arrives as `onExit`
+    // and runs only when that fires. Capturing it rather than invoking it is
+    // what lets each case below assert the gap.
+    mockKillContainer.mockReset().mockImplementation((_id: string, _reason: string, onExit?: () => void) => {
+      postKillExit = onExit;
+    });
     mockHasContainerEverRun.mockReset().mockReturnValue(true);
     mockAdmitDueTaskContexts.mockReset().mockReturnValue(0);
     // Live all the way through: alive so the SLA branch runs at all, and STILL
@@ -1699,14 +1715,32 @@ describe('post-kill writes yield to a replacement container', () => {
   });
   afterEach(() => closeDb());
 
+  /** The child closes: ownership drops (or does not), then `onExit` runs. */
+  async function containerExits(stillOwned: boolean): Promise<void> {
+    expect(postKillExit, 'no post-kill chain was registered, so it could never run').toBeDefined();
+    mockIsContainerRunning.mockReturnValue(stillOwned);
+    postKillExit!();
+    await _settlePostKillForTesting();
+  }
+
   it('a replacement container that wakes during the post-kill open keeps its claim (ceiling)', async () => {
     const f = slaFixture('sess-sla-ceiling', ABSOLUTE_CEILING_MS + 60_000, 10_000);
     const before = f.state();
 
     await _sweepSessionForTesting(f.session);
 
-    expect(mockKillContainer).toHaveBeenCalledWith('sess-sla-ceiling', 'absolute-ceiling');
-    // Claim intact and no restart notice written: both writes were skipped.
+    expect(mockKillContainer).toHaveBeenCalledWith('sess-sla-ceiling', 'absolute-ceiling', expect.any(Function));
+    // Nothing yet, and nothing may be: the kill has only been REQUESTED, so the
+    // container still owns outbound.db. This is where the pre-fix code ran the
+    // chain.
+    await _settlePostKillForTesting();
+    expect(f.state(), 'the chain ran while the container still owned outbound.db').toBe(before);
+
+    // The old container goes but a replacement already owns the session, so the
+    // chain runs and is refused. Invoking it is what stops this case being
+    // vacuous — without it "nothing was written" would also hold for a chain
+    // that never started.
+    await containerExits(true);
     expect(f.state()).toBe(before);
   });
 
@@ -1717,7 +1751,11 @@ describe('post-kill writes yield to a replacement container', () => {
 
     await _sweepSessionForTesting(f.session);
 
-    expect(mockKillContainer).toHaveBeenCalledWith('sess-sla-claim', 'claim-stuck');
+    expect(mockKillContainer).toHaveBeenCalledWith('sess-sla-claim', 'claim-stuck', expect.any(Function));
+    await _settlePostKillForTesting();
+    expect(f.state(), 'the chain ran while the container still owned outbound.db').toBe(before);
+
+    await containerExits(true);
     expect(f.state()).toBe(before);
   });
 
@@ -1725,12 +1763,18 @@ describe('post-kill writes yield to a replacement container', () => {
     // The mirror of the two cases above: with no replacement in the gap the
     // guard must not fire, so this proves it gates on ownership rather than
     // silencing the post-kill writes outright.
-    mockKillContainer.mockImplementation(() => mockIsContainerRunning.mockReturnValue(false));
     const f = slaFixture('sess-sla-gone', ABSOLUTE_CEILING_MS + 60_000, 10_000);
+    const before = f.state();
 
     await _sweepSessionForTesting(f.session);
 
-    expect(mockKillContainer).toHaveBeenCalledWith('sess-sla-gone', 'absolute-ceiling');
+    expect(mockKillContainer).toHaveBeenCalledWith('sess-sla-gone', 'absolute-ceiling', expect.any(Function));
+    // Same gap as the two cases above, and it must be empty here too.
+    await _settlePostKillForTesting();
+    expect(f.state()).toBe(before);
+
+    // Now the child really closes and nothing replaced it.
+    await containerExits(false);
     expect(f.state()).toBe('claims=0 notices=1');
   });
 });

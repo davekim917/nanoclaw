@@ -573,7 +573,7 @@ describe('sweepSession on a session with no mailbox', () => {
     // `killContainer` now takes an `onExit` third argument (Codex final), which is
     // a function when a container was there to kill and `undefined` when it had
     // already gone. The identity assertion is the first two arguments.
-    expect(mockKillContainer.mock.calls[0]?.slice(0, 2)).toEqual(['sess-sla-ceiling', 'absolute-ceiling']);
+    expect(mockKillContainer).toHaveBeenCalledWith('sess-sla-ceiling', 'absolute-ceiling', expect.any(Function));
     // Claim intact and no restart notice written: both writes were skipped.
     expect(f.claims()).toBe(before);
     closeDb();
@@ -669,7 +669,7 @@ describe('sweepSession on a session with no mailbox', () => {
     // `killContainer` now takes an `onExit` third argument (Codex final), which is
     // a function when a container was there to kill and `undefined` when it had
     // already gone. The identity assertion is the first two arguments.
-    expect(mockKillContainer.mock.calls[0]?.slice(0, 2)).toEqual(['sess-sla-claim', 'claim-stuck']);
+    expect(mockKillContainer).toHaveBeenCalledWith('sess-sla-claim', 'claim-stuck', expect.any(Function));
     expect(f.claims()).toBe(before);
     closeDb();
   });
@@ -827,7 +827,11 @@ describe('sweepSession on a session with no mailbox', () => {
     // `killContainer` now takes an `onExit` third argument (Codex final), which is
     // a function when a container was there to kill and `undefined` when it had
     // already gone. The identity assertion is the first two arguments.
-    expect(mockKillContainer.mock.calls[0]?.slice(0, 2)).toEqual(['sess-followups-control', 'absolute-ceiling']);
+    // No container to kill (`isContainerRunning` is false before the SLA runs),
+    // so there is no `close` to hang the chain off and it runs inline —
+    // ownership is already gone. Asserted rather than left implicit: the
+    // callback's presence is what the whole fix turns on.
+    expect(mockKillContainer).toHaveBeenCalledWith('sess-followups-control', 'absolute-ceiling', undefined);
     expect(control.claims()).toBe(0); // S17 cleared the orphan claim
     expect(respawnWakes(control.session)).toBe(1); // S10 queued the accountability wake
 
@@ -858,10 +862,10 @@ describe('sweepSession on a session with no mailbox', () => {
       await _enforceRunningContainerSlaForTesting(guarded.run, guarded.session, 'ag-sla', 'sla');
       await _settlePostKillForTesting();
 
-      // `killContainer` now takes an `onExit` third argument (Codex final), which is
-      // a function when a container was there to kill and `undefined` when it had
-      // already gone. The identity assertion is the first two arguments.
-      expect(mockKillContainer.mock.calls[0]?.slice(0, 2)).toEqual(['sess-followups-guarded', 'absolute-ceiling']);
+      // `killContainer` now takes an `onExit` third argument (Codex final): a
+      // function when a container was there to kill, `undefined` when it had
+      // already gone and the chain runs inline.
+      expect(mockKillContainer).toHaveBeenCalledWith('sess-followups-guarded', 'absolute-ceiling', undefined);
       // Both later follow-ups skipped: the fresh runner keeps its claim and no
       // stale accountability wake was queued against its recovery cap.
       expect(guarded.claims()).toBe(claimsBefore);
