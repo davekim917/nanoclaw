@@ -15,6 +15,9 @@ import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 
+import { TIMEZONE } from './config.js';
+import { formatLocalTime } from './timezone.js';
+
 export type ConflictArea =
   | 'agent-runner/src'
   | `src/modules/${string}`
@@ -63,10 +66,16 @@ export function classifyArea(filePath: string): ConflictArea {
 
 /**
  * One `git merge-tree --write-tree --name-only <ours> <theirs>` line ->
- * the path(s) it concerns. Handles the three CONFLICT phrasings git emits:
+ * the path(s) it concerns. Handles the four CONFLICT phrasings git emits:
  *   - "CONFLICT (content|add/add): Merge conflict in <path>"
  *   - "CONFLICT (modify/delete): <path> deleted in ... and modified in ..."
  *   - "CONFLICT (rename involved in collision): rename of <a> -> <b> has ..."
+ *   - "CONFLICT (rename/delete): <a> renamed to <b> in <ref>, but deleted in <ref>."
+ * The last two each name two paths; the destination (post-rename) path is
+ * used, since that's where the conflict lands in the resulting tree and
+ * therefore what area triage should attribute it to (verified against a
+ * real `git merge-tree` run: git substitutes the actual ref names passed
+ * as arguments in place of the literal words "ours"/"theirs").
  * Returns null for a line that isn't a CONFLICT line at all.
  */
 export function extractConflictPath(line: string): string | null {
@@ -82,6 +91,11 @@ export function extractConflictPath(line: string): string | null {
   // the conflict actually lands in the resulting tree.
   const renameCollision = line.match(/rename of \S+ -> (\S+) has content conflicts/);
   if (renameCollision) return renameCollision[1];
+
+  // Rename/delete: one side renamed the file, the other deleted the
+  // original — attribute to the renamed (destination) path.
+  const renameDelete = line.match(/^CONFLICT \(rename\/delete\): \S+ renamed to (\S+) in \S+, but deleted in \S+\.$/);
+  if (renameDelete) return renameDelete[1];
 
   return null;
 }
@@ -202,7 +216,10 @@ export interface DryRunReportData {
   forkNextFreeOrdinal: number;
   breakingLines: string[];
   ratchetSummary: string | null;
+  /** ISO-8601 UTC — storage form. Rendered in `timezone` for the heading; never shown raw. */
   generatedAt: string;
+  /** IANA timezone the report heading is displayed in (the install timezone). */
+  timezone: string;
 }
 
 const AREA_ORDER: string[] = ['agent-runner/src', 'setup', '.claude', 'docs', 'src/cli', 'other'];
@@ -226,7 +243,7 @@ function orderedAreaEntries(byArea: Map<string, number>): [string, number][] {
 /** Assemble the final markdown report block from parsed data. */
 export function buildReportMarkdown(data: DryRunReportData): string {
   const lines: string[] = [];
-  lines.push(`## Upstream dry-run report — ${data.generatedAt}`);
+  lines.push(`## Upstream dry-run report — ${formatLocalTime(data.generatedAt, data.timezone)}`);
   lines.push('');
   lines.push(
     `Base: \`${data.base.slice(0, 12)}\` — ${data.commitsBehind} commits behind upstream/main, ${data.commitsAhead} ahead.`,
@@ -310,7 +327,7 @@ function forkNextFreeOrdinal(forkFiles: string[]): number {
 
 export interface GenerateOptions {
   repoRoot: string;
-  ours?: string; // defaults to HEAD
+  ours?: string; // defaults to origin/main — the fork's stable trunk, not whatever HEAD happens to be checked out
   theirs?: string; // defaults to upstream/main
 }
 
@@ -319,10 +336,14 @@ export interface GenerateOptions {
  * report. Read-only — `git fetch` and `git merge-tree` are the only
  * mutating-looking calls, and merge-tree is explicitly in-memory (never
  * touches the working tree or index).
+ *
+ * `ours` defaults to `origin/main`, not `HEAD`: this script is documented
+ * as safe to run from any worktree, and a feature-branch HEAD would report
+ * that branch's ahead/behind and conflicts instead of the fork trunk's.
  */
 export function generateDryRunReport(opts: GenerateOptions): string {
   const { repoRoot } = opts;
-  const ours = opts.ours ?? 'HEAD';
+  const ours = opts.ours ?? 'origin/main';
   const theirs = opts.theirs ?? 'upstream/main';
 
   git(['fetch', 'upstream', '--prune'], repoRoot);
@@ -387,5 +408,6 @@ export function generateDryRunReport(opts: GenerateOptions): string {
     breakingLines,
     ratchetSummary,
     generatedAt: new Date().toISOString(),
+    timezone: TIMEZONE,
   });
 }

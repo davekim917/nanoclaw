@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
+import { formatLocalTime } from './timezone.js';
 import {
   buildReportMarkdown,
   classifyArea,
@@ -17,7 +18,10 @@ import {
 // `git merge-tree --write-tree --name-only origin/main upstream/main`
 // run against this fork on 2026-09-04, trimmed to a representative slice
 // that exercises every CONFLICT phrasing git emits: content, modify/delete,
-// add/add, and rename-into-collision (which names two paths).
+// add/add, rename-into-collision (which names two paths), and rename/delete
+// (also two paths — reproduced against a throwaway repo to confirm git
+// substitutes the actual ref names passed as arguments, not literal
+// "ours"/"theirs").
 const MERGE_TREE_FIXTURE = `202f8a8359ab19db7a8ed40a4c42f5313f09d033
 .claude/skills/add-codex/SKILL.md
 container/agent-runner/src/formatter.ts
@@ -26,6 +30,7 @@ docs/architecture.md
 src/cli/resources/tasks.ts
 src/modules/permissions/guard.ts
 src/modules/scheduling/create.ts
+src/modules/scheduling/runner.ts
 src/router.ts
 src/db/migrations/index.ts
 
@@ -40,6 +45,7 @@ CONFLICT (add/add): Merge conflict in src/db/migrations/index.ts
 CONFLICT (content): Merge conflict in src/router.ts
 CONFLICT (rename involved in collision): rename of src/modules/scheduling/db.test.ts -> src/mailbox/sqlite/tasks.test.ts has content conflicts AND collides with another path; this may result in nested conflict markers.
 CONFLICT (rename involved in collision): rename of src/modules/scheduling/db.ts -> src/mailbox/sqlite/tasks.ts has content conflicts AND collides with another path; this may result in nested conflict markers.
+CONFLICT (rename/delete): src/modules/scheduling/old-runner.ts renamed to src/modules/scheduling/runner.ts in origin/main, but deleted in upstream/main.
 `;
 
 const CLEAN_MERGE_TREE_FIXTURE = `9a1b2c3d
@@ -104,20 +110,32 @@ describe('extractConflictPath', () => {
       ),
     ).toBe('src/mailbox/sqlite/tasks.ts');
   });
+
+  it('parses a rename/delete conflict as the destination (renamed-to) path', () => {
+    expect(
+      extractConflictPath(
+        'CONFLICT (rename/delete): src/modules/scheduling/old-runner.ts renamed to src/modules/scheduling/runner.ts in origin/main, but deleted in upstream/main.',
+      ),
+    ).toBe('src/modules/scheduling/runner.ts');
+  });
 });
 
 describe('parseMergeTreeConflicts', () => {
   it('counts every CONFLICT line by area and matches grep -c total', () => {
     const result = parseMergeTreeConflicts(MERGE_TREE_FIXTURE);
-    // 10 CONFLICT lines in the fixture above (including the two
-    // rename-into-collision lines, which are each their own CONFLICT line).
-    expect(result.total).toBe(10);
+    // 11 CONFLICT lines in the fixture above (including the two
+    // rename-into-collision lines and the one rename/delete line, each
+    // their own CONFLICT line).
+    expect(result.total).toBe(11);
     expect(result.byArea.get('.claude')).toBe(1);
     expect(result.byArea.get('agent-runner/src')).toBe(1);
     expect(result.byArea.get('setup')).toBe(1);
     expect(result.byArea.get('docs')).toBe(1);
     expect(result.byArea.get('src/cli')).toBe(1);
     expect(result.byArea.get('src/modules/permissions')).toBe(1);
+    // The rename/delete conflict lands on its destination path, correctly
+    // triaged into the module it renames within rather than "other".
+    expect(result.byArea.get('src/modules/scheduling')).toBe(1);
     // other: src/db/migrations/index.ts, src/router.ts, and both
     // rename-into-collision destination paths.
     expect(result.byArea.get('other')).toBe(4);
@@ -258,10 +276,17 @@ describe('buildReportMarkdown', () => {
       breakingLines: ['- [BREAKING] Something changed'],
       ratchetSummary: null,
       generatedAt: '2026-09-08T09:00:00.000Z',
+      timezone: 'America/New_York',
     });
 
+    // Heading renders in the given install timezone, not the raw UTC ISO
+    // stamp (Codex P1: agent/user-facing timestamps must be localized).
+    expect(md).toContain(
+      `## Upstream dry-run report — ${formatLocalTime('2026-09-08T09:00:00.000Z', 'America/New_York')}`,
+    );
+    expect(md).not.toContain('2026-09-08T09:00:00.000Z');
     expect(md).toContain('490 commits behind upstream/main, 3046 ahead');
-    expect(md).toContain('Merge-tree conflicts (10 total)');
+    expect(md).toContain('Merge-tree conflicts (11 total)');
     expect(md).toContain('| agent-runner/src | 1 |');
     expect(md).toContain('New upstream migrations (1)');
     expect(md).toContain('**COLLISION** with src/db/migrations/068-sessions-sweep-quiet-until.ts');
@@ -282,6 +307,7 @@ describe('buildReportMarkdown', () => {
       breakingLines: [],
       ratchetSummary: 'ratchet: 3 offenders (down from 5)',
       generatedAt: '2026-09-08T09:00:00.000Z',
+      timezone: 'UTC',
     });
 
     expect(md).toContain('### Ratchet report');
