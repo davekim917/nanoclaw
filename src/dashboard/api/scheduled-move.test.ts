@@ -77,7 +77,7 @@ function setupCentralDb(): void {
       -- Migration 056: a move re-schedules into the target, which re-stamps
       -- the series' routing through resolveTaskSession.
       task_routing_platform_id TEXT,
-      -- Migration 065: the host sweep's persisted quiet mark. Load-bearing —
+      -- Migration 068: the host sweep's persisted quiet mark. Load-bearing —
       -- both the compensation restore and scheduleTask end with a
       -- touchSessionActivity call whose job is to null this column, and that
       -- helper swallows its own errors, so without the column the invalidation

@@ -61,7 +61,7 @@ function childProcessTripwire(record: string[]): Record<string, (...args: unknow
 // deliberately never initializes. Record the call instead — the helper's real
 // behavior (nulling `sweep_quiet_until` and advancing `last_active` in one
 // statement, refusing when no ACTIVE row matched) is asserted against real
-// SQLite in src/db/migrations/065-sessions-sweep-quiet-until.test.ts.
+// SQLite in src/db/migrations/068-sessions-sweep-quiet-until.test.ts.
 //
 // One entry per invalidated session, and the write runs inside it, so this
 // records the ordering the restore depends on.

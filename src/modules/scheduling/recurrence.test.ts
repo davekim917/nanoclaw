@@ -38,7 +38,7 @@ vi.mock('../../db/agent-groups.js', () => ({
 // — a central-DB write, and this file's fixture deliberately never initializes
 // that singleton. Record the call and pass through; what the real bracket does
 // on each side is asserted against real SQLite in
-// src/db/migrations/065-sessions-sweep-quiet-until.test.ts.
+// src/db/migrations/068-sessions-sweep-quiet-until.test.ts.
 const invalidated = vi.hoisted(() => [] as string[]);
 vi.mock('../../db/sessions.js', async (importOriginal) => {
   const real = await importOriginal<typeof import('../../db/sessions.js')>();

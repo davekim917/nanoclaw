@@ -154,7 +154,7 @@ function setupCentralDb(): void {
       -- Migration 056: scheduleTask stamps the destination it validated onto
       -- the task session so the console can place the task in its channel.
       task_routing_platform_id TEXT,
-      -- Migration 065: the host sweep's persisted quiet mark. Load-bearing in
+      -- Migration 068: the host sweep's persisted quiet mark. Load-bearing in
       -- this fixture, not scenery — scheduleTask ends with a
       -- touchSessionActivity call whose whole job is to null this column, and
       -- that helper swallows its own errors by design. Without the column the
@@ -494,7 +494,7 @@ describe('scheduleTask invalidates the quiet mark in the same turn as the task-r
     // Each entry: the session invalidated, and whether the task row was already
     // there at that instant. What the helper DOES (clear the mark, advance
     // last_active, refuse when no active row matched) is asserted against real
-    // SQLite in src/db/migrations/065-sessions-sweep-quiet-until.test.ts; what
+    // SQLite in src/db/migrations/068-sessions-sweep-quiet-until.test.ts; what
     // this case owns is that scheduleTask's write is the thing it wraps.
     const observed: Array<[string, boolean]> = [];
     const spy = vi
@@ -575,7 +575,7 @@ describe('scheduleTask invalidates the quiet mark in the same turn as the task-r
 
   // Codex round 2, H1 (b). Fail-closed: a refused invalidation must not let the
   // session-DB row land behind a live mark. (That the helper refuses on a
-  // central-DB failure AND on a missing or non-active session row is the 065
+  // central-DB failure AND on a missing or non-active session row is the 068
   // suite's business; this case owns the call site not swallowing that refusal.)
   it('a failed invalidation aborts the schedule before any task row is written', async () => {
     seedActiveSession();

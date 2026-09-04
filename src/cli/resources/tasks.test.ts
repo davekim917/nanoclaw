@@ -361,7 +361,7 @@ describe('tasks CLI resource', () => {
   // Fail-closed: a central DB that refuses the invalidation must refuse the
   // command, not land a task row behind a mark nothing will clear. (What the
   // bracket does on each side is asserted on real SQLite in
-  // src/db/migrations/065-sessions-sweep-quiet-until.test.ts.)
+  // src/db/migrations/068-sessions-sweep-quiet-until.test.ts.)
   it('create writes nothing when the quiet-mark invalidation fails', async () => {
     const sessionsModule = await import('../../db/sessions.js');
     const spy = vi.spyOn(sessionsModule, 'withQuietInvalidationSync').mockImplementation((id: string) => {

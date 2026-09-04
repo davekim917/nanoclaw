@@ -301,7 +301,7 @@ export interface Session {
    * quiet and may be skipped until then. NULL means no mark — sweep it. Kept
    * in central so the cache survives a host restart instead of the first tick
    * after every boot sweeping every active session. Cleared by `updateSession`
-   * in the same statement that moves `last_active`. See migration 065.
+   * in the same statement that moves `last_active`. See migration 068.
    */
   sweep_quiet_until?: string | null;
   created_at: string;

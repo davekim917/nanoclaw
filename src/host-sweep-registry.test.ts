@@ -127,7 +127,7 @@ vi.mock('./db/sessions.js', async (importOriginal) => {
         // The real statement's `AND sessions.last_active IS json_extract(...,'$.basis')`
         // guard: a row whose last_active moved between the sweep and the flush
         // is not written. Asserted against real SQLite in
-        // src/db/migrations/065-sessions-sweep-quiet-until.test.ts.
+        // src/db/migrations/068-sessions-sweep-quiet-until.test.ts.
         if ((row?.last_active ?? null) !== m.lastActive) continue;
         h.persistedQuiet.set(m.sessionId, { quietUntil: m.quietUntil, lastActiveAtWrite: m.lastActive });
       }
@@ -1217,21 +1217,21 @@ describe('sweep duty registry (S2-PR2)', () => {
   //
   // Structural, not a line budget. The plan's original "under 300 lines" was an
   // estimate written before the build. Re-measured on the B3 integration
-  // lineage (`sed -n '<start>,<end>p' src/host-sweep.ts | wc -l` per section,
-  // summing exactly to `wc -l`'s 1,347 — 1,348 by the `split('\n')` count the
-  // assertion below uses, one more for the trailing newline). Section
-  // breakdown, in `split('\n')` elements:
-  // sweepSession + helpers 273, driver start/stop/sweep/sweepOnce 214, registry
-  // 170, error rule + SLA hooks + kill follow-ups + windowedRunner 155, tick
-  // constants + quiet cache 137, re-exports + writeSystemWake +
-  // providerFailedTicks + the outbound-ownership guard docs 140, shared context
-  // + duty types 98, phase list 55, duty inventory 47, imports 28, file header
-  // 27, tail re-exports + the empty built-in source 3. (S2-PR14's own head,
-  // dc440893, measured 1,198 lines by the same count — see the ratchet comment
-  // below for the +149 delta's real cause.) The three assertions below are what
-  // the criterion actually means; the ceiling at the end is a REGROWTH ratchet,
-  // not a target — it catches a duty body creeping back into the driver, which
-  // is the failure this case exists to prevent.
+  // lineage re-based onto mailbox seam PR 7's head: `wc -l` 1,354, which is
+  // 1,355 by the `split('\n')` count the assertion below uses, one more for the
+  // trailing newline. Section breakdown, in `split('\n')` elements, contiguous
+  // and summing exactly to 1,355:
+  // sweepSession + helpers 257, driver start/stop/sweep/sweepOnce 214, error
+  // rule + SLA hooks + kill follow-ups + windowedRunner 182, registry 143,
+  // re-exports + writeSystemWake + providerFailedTicks + the outbound-ownership
+  // guard docs 140, tick constants + quiet cache 123, shared context + duty
+  // types 98, phase list 73, duty inventory 53, file header 26, imports 26,
+  // tail re-exports + the empty built-in source 20. (S2-PR14's own head,
+  // dc440893, measured 1,198 by the same count — see the ratchet comment below
+  // for the delta's real cause.) The three assertions below are what the
+  // criterion actually means; the ceiling at the end is a REGROWTH ratchet, not
+  // a target — it catches a duty body creeping back into the driver, which is
+  // the failure this case exists to prevent.
   it('host-sweep.ts contains no inline duty bodies', async () => {
     const source = fs.readFileSync(path.join(REPO_ROOT, 'src/host-sweep.ts'), 'utf8');
 
@@ -1323,11 +1323,16 @@ describe('sweep duty registry (S2-PR2)', () => {
       expect(actualExports, `host-sweep.ts no longer exports ${core}`).toContain(core);
     }
 
-    // Regrowth ratchet. 1,348 by this measure on the B3 integration lineage
-    // (1,347 by `wc -l`), against 1,198 on S2-PR14's own head (dc440893, same
-    // count). The +149-line delta is NOT a duty coming home — measured with
-    // `git diff --stat dc440893 HEAD -- src/host-sweep.ts` (219 insertions, 70
-    // deletions, net +149) and read hunk by hunk, the two largest pieces are:
+    // Regrowth ratchet. 1,355 by this measure on the B3 integration lineage
+    // re-based onto mailbox seam PR 7's head (1,354 by `wc -l`), against 1,198
+    // on S2-PR14's own head (dc440893, same count). Of the +157, six lines are
+    // the base's own two fork duties in `SWEEP_DUTY_INVENTORY` (T23
+    // `cli-request-execution-prune` from #285 and FORK1
+    // `github-token-file-refresh` from #247) — inventory entries, not bodies;
+    // both duties register from `src/modules/sweep-central/`. The remaining
+    // +151 is NOT a duty coming home either — measured with
+    // `git diff --stat dc440893 HEAD -- src/host-sweep.ts` and read hunk by
+    // hunk, the two largest pieces are:
     //  - +152 net lines: S2-PR15's quiet-session backoff jitter + boot-time
     //    cache warm (`quietSessionJitter`/`quietSessionBackoffMs`/
     //    `warmQuietSessionCache`, issue #320), plus its per-tick flush further
@@ -1351,7 +1356,7 @@ describe('sweep duty registry (S2-PR2)', () => {
     // a duty body: no duty originates here, no registration surface is called
     // inline, and the export allowlist is unchanged (the three structural
     // assertions above, which is what the F-14.1 criterion actually means).
-    // Ratchet raised from 1,300 to 1,400 — measured (1,348) + ~50 — for the
+    // Ratchet raised from 1,300 to 1,400 — measured (1,355) + ~45 — for the
     // same reason plan.md's own estimate was always going to be wrong:
     // `warmQuietSessionCache` and its persistence path are legitimate
     // driver-owned functionality that arrived after the plan's line budget was
@@ -1608,7 +1613,7 @@ describe('sweep duty registry (S2-PR2)', () => {
   // The cache was process-local, so every boot threw it away and the first tick
   // after one swept every active session — ~850 of them, a 457 s tick, nine
   // times in the 22 hours of log #320 was filed against. The mark now lives on
-  // the session row (migration 065) and `startHostSweep` warms the map from it.
+  // the session row (migration 068) and `startHostSweep` warms the map from it.
   describe('quiet-cache durability (S2-PR15)', () => {
     const MINUTE = 60_000;
 
@@ -1817,7 +1822,7 @@ describe('sweep duty registry (S2-PR2)', () => {
     // guard leaves this case green. The statement's own guard — including the
     // NULL-basis arm that a `=` comparison silently drops — is owned by
     // "does not write back a mark whose last_active moved between the sweep and
-    // the flush" in src/db/migrations/065-sessions-sweep-quiet-until.test.ts,
+    // the flush" in src/db/migrations/068-sessions-sweep-quiet-until.test.ts,
     // against real SQLite. Omitting the field from the driver is a compile
     // error, so the two together close the path.
     it('a mark invalidated during the fan-out is not written back, and that session is swept after a restart', async () => {

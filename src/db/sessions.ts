@@ -195,7 +195,7 @@ export function updateSession(
     }
     values[key] = value;
   }
-  // The host sweep's persisted quiet mark (migration 065) is a prediction of
+  // The host sweep's persisted quiet mark (migration 068) is a prediction of
   // when this session next has work — taken while `last_active` held some
   // earlier value. Moving `last_active` is precisely the event that says the
   // prediction is stale, so the mark dies in the SAME statement, never in a

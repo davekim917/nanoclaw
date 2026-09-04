@@ -6,7 +6,7 @@
  * quiet-mark invalidation, and a refused invalidation must abort the create
  * rather than land a row the host sweep's quiet cache will hide (Codex round 2,
  * H1). What the bracket does on each side is asserted against real SQLite in
- * src/db/migrations/065-sessions-sweep-quiet-until.test.ts.
+ * src/db/migrations/068-sessions-sweep-quiet-until.test.ts.
  */
 import fs from 'fs';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';

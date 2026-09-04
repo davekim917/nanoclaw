@@ -16,7 +16,7 @@ import {
 import type { Session } from '../../types.js';
 
 /**
- * A pre-065 `sessions` table, hand-rolled so rows can exist BEFORE the
+ * A pre-068 `sessions` table, hand-rolled so rows can exist BEFORE the
  * migration runs — the only way to prove it adds no backfill.
  */
 function preMigrationDb(): Database.Database {
