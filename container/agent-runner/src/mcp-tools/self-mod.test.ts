@@ -1,10 +1,12 @@
 import { afterEach, beforeEach, describe, expect, it, mock } from 'bun:test';
 
-import { initTestSessionDb, closeSessionDb, getOutboundDb } from '../db/connection.js';
+import { getOutboundDb } from '../mailbox/sqlite/connection.js';
+import { closeSessionDb, initTestSessionDb } from '../modules/mailbox/testing.js';
 
 const registeredToolNames: string[][] = [];
 mock.module('./server.js', () => ({
-  registerTools: (tools: Array<{ tool: { name: string } }>) => registeredToolNames.push(tools.map((tool) => tool.tool.name)),
+  registerTools: (tools: Array<{ tool: { name: string } }>) =>
+    registeredToolNames.push(tools.map((tool) => tool.tool.name)),
 }));
 
 // NOTE: do NOT mock.module('../db/messages-out.js') here. bun runs every test
@@ -12,9 +14,7 @@ mock.module('./server.js', () => ({
 // permanent, so stubbing writeMessageOut sends every later file's outbound
 // writes nowhere — see the same warning at the top of agents.test.ts. Assert
 // against the real in-memory session DB instead.
-const { unavailableModelInventory, registerProviderSpecificSelfModTools, addMcpServer } = await import(
-  './self-mod.js'
-);
+const { unavailableModelInventory, registerProviderSpecificSelfModTools, addMcpServer } = await import('./self-mod.js');
 
 /** The most recent system action add_mcp_server wrote to the outbound DB. */
 function lastSystemAction(): Record<string, unknown> | undefined {
@@ -174,7 +174,9 @@ describe('add_mcp_server remote Streamable HTTP', () => {
     );
     expect((await submit({ name: 'x', type: 'http', command: 'node' })).error).toContain('cannot be used with command');
     // The alias still works where it agrees with the fields.
-    expect((await submit({ name: 'x', type: 'streamable-http', url: 'https://example.com/mcp' })).payload).toBeDefined();
+    expect(
+      (await submit({ name: 'x', type: 'streamable-http', url: 'https://example.com/mcp' })).payload,
+    ).toBeDefined();
   });
 
   it('rejects a bad server name, both transports at once, and cross-transport fields', async () => {

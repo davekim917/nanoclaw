@@ -317,6 +317,10 @@ describe('resolveGroupTimezone', () => {
       timezone: 'Asia/Tokyo',
     });
     expect(readContainerConfig('tz-file').timezone).toBe('Asia/Tokyo');
+  });
+});
+
+/**
  * `parseMcpServerConfig` is the single validator behind the ncl flag path, the
  * approval payload path, and template `.mcp.json` — and it is mirrored by
  * hand in container/agent-runner/src/mcp-tools/self-mod.ts. These pin the
