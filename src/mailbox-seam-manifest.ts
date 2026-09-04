@@ -66,7 +66,6 @@ export const UPSTREAM_FILES: readonly string[] = [
   'container/agent-runner/src/heartbeat.ts',
   'container/agent-runner/src/db/container-state.ts',
   'container/agent-runner/src/db/index.ts',
-  'container/agent-runner/src/db/messages-in.ts',
   'container/agent-runner/src/db/messages-out.ts',
   'container/agent-runner/src/db/session-routing.ts',
   'container/agent-runner/src/db/session-state.ts',
@@ -86,6 +85,24 @@ export const DEFERRED_UPSTREAM_FILES: readonly string[] = [
   // The runner half was ported in R3 (its allowlist reached zero). The host
   // half lands in PR 7, when the host allowlist does.
   'src/mailbox/registry.test.ts',
+] as const;
+
+/**
+ * Files that WERE ported byte-for-byte from upstream but have since been
+ * hand-edited for a fork-only feature. Unlike DEFERRED_UPSTREAM_FILES (not
+ * yet ported, will become byte-identical later), these are never expected to
+ * match upstream's hash again — the fork's own logic now lives in them. They
+ * are tracked by name, not by hash, so a future re-port from a newer upstream
+ * sha is a deliberate, reviewed act (diff against the sha in `upstream`
+ * below) rather than a silent overwrite via --update.
+ *
+ * container/agent-runner/src/db/messages-in.ts: diverged in 1dfd2857
+ * ("give a task occurrence its own scheduled_for") to add the fork-only
+ * `scheduled_for` column so a retry backoff can't rewrite a task
+ * occurrence's original slot. See docs/specs/upstream-mailbox-seam/plan.md.
+ */
+export const FORK_DIVERGED_UPSTREAM_FILES: readonly string[] = [
+  'container/agent-runner/src/db/messages-in.ts',
 ] as const;
 
 export interface MailboxSeamManifest {
