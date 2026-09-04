@@ -70,6 +70,7 @@ import { migration064 } from './064-container-config-security-json.js';
 import { migration065 } from './065-container-config-timezone.js';
 import { migration066 } from './066-approvals-instance.js';
 import { migration067 } from './067-cli-request-executions.js';
+import { migration069 } from './069-messaging-group-name-source.js';
 // Upstream's 014/015 — file numbers clash with local but uniqueness is by `name`.
 // Aliased to avoid JS identifier collisions with the local 014/015 above.
 import { migration014 as containerConfigs } from './014-container-configs.js';
@@ -180,6 +181,11 @@ export const migrations: Migration[] = [
   migration067,
   messagingGroupInstance,
   migration019,
+  // After messagingGroupInstance: upstream's 016 RECREATES messaging_groups
+  // (DROP + RENAME) to add the instance dimension, and its column list is
+  // fixed — a name_source added before it would be silently dropped on a
+  // fresh DB. Execution order, not file number.
+  migration069,
   // Last on purpose: normalizes whatever naive timestamps every migration
   // above has left behind (016's messaging_groups recreate copies created_at
   // through as-is).

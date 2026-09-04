@@ -49,11 +49,12 @@ import { normalizeOptions, type NormalizedOption, type RawOption } from '../../c
 import { resolveWiringDefaults } from '../../channels/channel-defaults.js';
 import { createAgentGroup, getAgentGroup, getAgentGroupByFolder, getAllAgentGroups } from '../../db/agent-groups.js';
 import { getChannelAdapter } from '../../channels/channel-registry.js';
-import { getMessagingGroup, updateMessagingGroup } from '../../db/messaging-groups.js';
+import { channelNameProvenance, getMessagingGroup, updateMessagingGroup } from '../../db/messaging-groups.js';
 import { getDeliveryAdapter } from '../../delivery.js';
 import { initGroupFilesystem } from '../../group-init.js';
 import { log } from '../../log.js';
-import type { InboundEvent } from '../../channels/adapter.js';
+import { conversationDisplayName, formatParticipantList } from '../../channels/adapter.js';
+import type { ChannelConversation, InboundEvent } from '../../channels/adapter.js';
 import type { AgentGroup } from '../../types.js';
 import { pickApprovalDelivery, pickApprover } from '../approvals/primitive.js';
 import {
@@ -140,14 +141,35 @@ function buildQuestionText(
   channelName: string | null,
   channelType: string,
   ruleNote: string | null,
+  conversation?: ChannelConversation | null,
 ): string {
   const who = senderName ?? 'Someone';
   const note = ruleNote ? ` If connected, the agent ${ruleNote}.` : '';
   if (isGroup) {
-    const where = channelName ? `${channelName} on ${channelType}` : `a ${channelType} channel`;
+    const where = describeWhere(channelName, channelType, conversation);
     return `${who} mentioned your bot in ${where}.${note} ${AGENT_ACCESS_SCOPE_WARNING} How would you like to handle this channel?`;
   }
   return `${who} sent your bot a DM on ${channelType}.${note} ${AGENT_ACCESS_SCOPE_WARNING} How would you like to handle it?`;
+}
+
+/**
+ * Where the mention happened, in the most specific form the adapter could
+ * give us. A group DM has no name a human recognizes — the platform's own
+ * label is a slug like `mpdm-alice--bob--carol-1` — so it is described by who
+ * is in it. Everything else keeps the existing channel-name rendering.
+ */
+function describeWhere(
+  channelName: string | null,
+  channelType: string,
+  conversation?: ChannelConversation | null,
+): string {
+  if (conversation?.type === 'group_dm') {
+    const names = conversation.participantNames;
+    return names && names.length > 0
+      ? `a group DM with ${formatParticipantList(names)} on ${channelType}`
+      : `a group DM on ${channelType}`;
+  }
+  return channelName ? `${channelName} on ${channelType}` : `a ${channelType} channel`;
 }
 
 /**
@@ -228,16 +250,60 @@ export async function requestChannelApproval(input: RequestChannelApprovalInput)
   const originMg = getMessagingGroup(messagingGroupId);
   const originChannelType = originMg?.channel_type ?? '';
 
-  // Resolve channel name if not yet persisted. Key by instance so a named
-  // instance's own adapter (and bot identity) does the lookup.
-  if (originMg && !originMg.name) {
+  // Classify the conversation once, and reuse it for both the persisted name
+  // and the card text — a second lookup would be a second API round trip for
+  // the same answer. Key by instance so a named instance's own adapter (and
+  // bot identity) does the lookup.
+  let conversation: ChannelConversation | null = null;
+  if (originMg) {
     const channelAdapter = getChannelAdapter(originMg.instance ?? originMg.channel_type);
-    if (channelAdapter?.resolveChannelName) {
+    if (channelAdapter?.resolveConversation) {
+      try {
+        conversation = await channelAdapter.resolveConversation(originMg.platform_id);
+      } catch {
+        /* non-critical — the card falls back to generic rendering */
+      }
+    }
+    if (conversation) {
+      // The classification above already carries the name — deriving it
+      // here is what keeps this to ONE round trip.
+      //
+      // Written unconditionally (not gated on `!originMg.name`): this is the
+      // first inbound event for a fresh, unwired mg, and `reportChannelMetadata`
+      // (chat-sdk-bridge.ts, one-shot per channel per process) races this same
+      // event with its own, cruder name lookup. The `classified` stamp is what
+      // settles that race in one direction: it outranks the raw fetch's
+      // `adapter` stamp, so this answer wins whether it lands first or second,
+      // and the raw fetch cannot take it back on a later restart either.
+      //
+      // Rewritten when the NAME is new or when its PROVENANCE is: a name the
+      // raw fetch happened to get right still carries an `adapter` stamp, and
+      // leaving it there would let a later raw fetch overwrite an answer the
+      // classifier has since confirmed.
+      const name = conversationDisplayName(conversation);
+      const nameSource = channelNameProvenance(originMg.channel_type, 'classified');
+      if (name && (name !== originMg.name || originMg.name_source !== nameSource)) {
+        updateMessagingGroup(originMg.id, { name, name_source: nameSource });
+        originMg.name = name;
+        originMg.name_source = nameSource;
+      }
+    } else if (!originMg.name && channelAdapter?.resolveChannelName) {
+      // No rich classification available (adapter lacks the seam, or the
+      // lookup failed) — fall back to the plain resolver. Set-once: an
+      // adapter without the seam can't tell a stale legacy name from a good
+      // one, so an already-set name is left alone here as before.
+      //
+      // Still stamped `classified`: `resolveChannelName` is the classification
+      // seam's other face (on Slack it is a projection of the same
+      // `resolveConversation`), so its answer must outrank the raw fetch for
+      // the same reason the branch above does.
       try {
         const name = await channelAdapter.resolveChannelName(originMg.platform_id);
         if (name) {
-          updateMessagingGroup(originMg.id, { name });
+          const nameSource = channelNameProvenance(originMg.channel_type, 'classified');
+          updateMessagingGroup(originMg.id, { name, name_source: nameSource });
           originMg.name = name;
+          originMg.name_source = nameSource;
         }
       } catch {
         /* non-critical */
@@ -283,7 +349,7 @@ export async function requestChannelApproval(input: RequestChannelApprovalInput)
     referenceGroup.name,
     originChannelType,
   );
-  const question = buildQuestionText(isGroup, senderName, channelName, originChannelType, ruleNote);
+  const question = buildQuestionText(isGroup, senderName, channelName, originChannelType, ruleNote, conversation);
   const options = normalizeOptions(buildApprovalOptions(agentGroups, delivery.userId));
 
   const created = createPendingChannelApproval({

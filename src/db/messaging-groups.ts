@@ -114,10 +114,84 @@ export function getMessagingGroupsByChannel(channelType: string): MessagingGroup
   return getDb().prepare('SELECT * FROM messaging_groups WHERE channel_type = ?').all(channelType) as MessagingGroup[];
 }
 
-export function updateMessagingGroup(
-  id: string,
-  updates: Partial<Pick<MessagingGroup, 'name' | 'is_group' | 'unknown_sender_policy'>>,
-): void {
+/**
+ * How a channel name was derived.
+ *
+ *  - `adapter`    — the raw string the platform puts on the conversation,
+ *                   read by the generic per-channel metadata fetch
+ *                   (`reportChannelMetadata`, chat-sdk-bridge.ts).
+ *  - `classified` — the answer the classification seam produced
+ *                   (`resolveConversation` / `resolveChannelName`), which can
+ *                   enrich what the platform returned: a Slack MPDM has no
+ *                   name a human recognizes, so it is named by its participant
+ *                   roster instead of by Slack's internal `mpdm-a--b--c-1` slug.
+ *
+ * `classified` outranks `adapter`; see `channelNameProvenanceAccepts`.
+ */
+export type ChannelNameSource = 'adapter' | 'classified';
+
+/** Higher rank = better informed. Only ordering matters, not the numbers. */
+const CHANNEL_NAME_SOURCE_RANK: Record<ChannelNameSource, number> = { adapter: 0, classified: 1 };
+
+/** The stored `messaging_groups.name_source` token for one derivation. */
+export function channelNameProvenance(platform: string, source: ChannelNameSource): string {
+  return `${platform}:${source}`;
+}
+
+/**
+ * Read a stored token back. A row written before migration 069, or one whose
+ * token is unparseable, is read as an adapter-sourced name on the row's own
+ * platform — the pre-069 behavior, where a raw fetch always overwrote.
+ */
+export function parseChannelNameProvenance(
+  raw: string | null | undefined,
+  fallbackPlatform: string,
+): { platform: string; source: ChannelNameSource } {
+  const sep = raw ? raw.lastIndexOf(':') : -1;
+  if (!raw || sep <= 0) return { platform: fallbackPlatform, source: 'adapter' };
+  const source = raw.slice(sep + 1);
+  if (source !== 'adapter' && source !== 'classified') return { platform: fallbackPlatform, source: 'adapter' };
+  return { platform: raw.slice(0, sep), source };
+}
+
+/**
+ * THE channel-name invariant, in one place:
+ *
+ *   a persisted channel name is only overwritten by a refresh that comes from
+ *   the same platform and a name source at least as well informed as the one
+ *   that produced the value being replaced — or when the name slot is empty.
+ *
+ * That is what keeps the generic metadata fetch from undoing the classifier.
+ * Nothing here knows the shape of any platform's names: no slug patterns, no
+ * per-platform exceptions. A refresh loses because of where it came from, not
+ * because of what it says.
+ *
+ * Consequence worth knowing: a platform-side rename of a channel whose stored
+ * name was classified is NOT picked up by the raw metadata fetch, because that
+ * fetch cannot tell a rename from the un-enriched view of the same room. Only
+ * a classified refresh renames such a channel. Renames of adapter-sourced names
+ * refresh exactly as before.
+ */
+export function channelNameProvenanceAccepts(
+  current: { name: string | null; name_source?: string | null; channel_type: string },
+  incoming: { platform: string; source: ChannelNameSource },
+): boolean {
+  if (!current.name) return true; // empty slot — nothing to protect
+  const held = parseChannelNameProvenance(current.name_source, current.channel_type);
+  if (held.platform !== incoming.platform) return false;
+  return CHANNEL_NAME_SOURCE_RANK[incoming.source] >= CHANNEL_NAME_SOURCE_RANK[held.source];
+}
+
+/**
+ * `name` and `name_source` move together, enforced by the parameter type: a
+ * name written without its provenance is indistinguishable from a pre-069 row
+ * and would silently reopen the clobber the column exists to close. The union
+ * makes `{ name }` alone a compile error rather than a runtime surprise.
+ */
+export type MessagingGroupUpdates = Partial<Pick<MessagingGroup, 'is_group' | 'unknown_sender_policy'>> &
+  ({ name: string; name_source: string } | { name?: never; name_source?: never });
+
+export function updateMessagingGroup(id: string, updates: MessagingGroupUpdates): void {
   const fields: string[] = [];
   const values: Record<string, unknown> = { id };
 

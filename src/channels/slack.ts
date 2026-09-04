@@ -32,7 +32,8 @@ import { readEnvFileMatching } from '../env.js';
 import { log } from '../log.js';
 import { markdownHeadingsToBold } from '../text-styles.js';
 import { createChatSdkBridge } from './chat-sdk-bridge.js';
-import type { ChannelDefaults, ChannelRecoveryRequest, ChannelRecoveryTarget } from './adapter.js';
+import { conversationDisplayName } from './adapter.js';
+import type { ChannelConversation, ChannelDefaults, ChannelRecoveryRequest, ChannelRecoveryTarget } from './adapter.js';
 import { registerChannelAdapter } from './channel-registry.js';
 import { extractSlackRawText } from './slack-raw-text.js';
 import { createSlackHopGovernor, type SlackHopGovernor } from './slack-hop-limit.js';
@@ -146,6 +147,22 @@ export function slackHopInboundFilter(
 }
 
 /**
+ * Is this workspace member a human we would name to another human?
+ *
+ * Bots, Slack app users, Slackbot and deactivated accounts are not. Shared by
+ * the mention directory (syncSlackWorkspaceHumans) and the group-DM roster so
+ * the two cannot drift — `is_app_user` without `is_bot` is a real Slack shape,
+ * and an app identity listed as a participant on an approval card reads as a
+ * person who is not there.
+ */
+export function isSlackHumanMember(
+  userId: string,
+  member: { is_bot?: boolean; is_app_user?: boolean; deleted?: boolean },
+): boolean {
+  return !member.is_bot && !member.is_app_user && !member.deleted && userId !== 'USLACKBOT';
+}
+
+/**
  * Fetch the workspace's human members and register them for outbound
  * mention resolution. Bots/apps/deleted users are excluded — bot mentions
  * resolve through the sibling-bot registry, and Slackbot is never a target.
@@ -159,7 +176,7 @@ async function syncSlackWorkspaceHumans(client: WebClient, teamId: string, chann
     do {
       const res = await client.users.list({ limit: 200, cursor });
       for (const m of res.members ?? []) {
-        if (!m.id || m.deleted || m.is_bot || m.is_app_user || m.id === 'USLACKBOT') continue;
+        if (!m.id || !isSlackHumanMember(m.id, m)) continue;
         humans.push({
           userId: m.id,
           username: m.name ?? '',
@@ -336,50 +353,149 @@ export async function discoverSlackRecoveryTargets(
  * `-` → `_` when building env-var lookups, so the round-trip is stable.
  */
 
+/** The slice of the Slack Web API these two helpers need. Structural so tests
+ *  can pass a two-method stub instead of a WebClient. */
+export interface SlackConversationClient {
+  conversations: {
+    info(args: { channel: string }): Promise<{
+      ok?: boolean;
+      channel?: { name?: string; is_im?: boolean; is_mpim?: boolean; user?: string };
+    }>;
+    members?(args: { channel: string; limit?: number }): Promise<{ ok?: boolean; members?: string[] }>;
+  };
+  users?: {
+    info(args: { user: string }): Promise<{
+      ok?: boolean;
+      user?: {
+        name?: string;
+        real_name?: string;
+        is_bot?: boolean;
+        deleted?: boolean;
+        profile?: { display_name?: string; real_name?: string };
+      };
+    }>;
+  };
+}
+
+function slackUserDisplayName(u: {
+  name?: string;
+  real_name?: string;
+  profile?: { display_name?: string; real_name?: string };
+}): string | null {
+  return u.profile?.display_name || u.profile?.real_name || u.real_name || u.name || null;
+}
+
 /**
- * Human-facing name for a Slack conversation, for `messaging_groups.name`:
- * `#name` for channels and group DMs, the counterpart's profile name for a
- * 1:1 DM. Null whenever the API cannot say — callers keep the wiring and fall
- * back to the platform id, so a lookup failure must never throw.
+ * Classify a Slack conversation for surfaces that render it to a human: a 1:1
+ * DM, a group DM (MPDM), or a channel.
  *
- * This is the fleet's only implementation of the adapter's optional
- * `resolveChannelName`: the router names every auto-wired conversation
- * through it, and until it existed every auto-wired Slack DM stayed nameless
- * forever and rendered as a raw `slack:D…` id on human surfaces.
+ * Ported from upstream/channels `resolveSlackConversation`, with two fork
+ * deviations:
+ *  - a 1:1 DM resolves the counterpart's profile name rather than returning
+ *    `name: null`. `resolveChannelName` is built on this function and has
+ *    named Slack DMs since 04f9a5f9; losing that would rename every DM
+ *    messaging group back to a raw `slack:D…` id.
+ *  - it runs on this fork's `WebClient` rather than upstream's adapter
+ *    wrapper, which does not exist here.
+ *
+ * Returns null when the API cannot classify the conversation (network
+ * failure, missing scope) so callers fall back to generic rendering. Never
+ * throws — a naming lookup must not take down an approval card.
  */
-export async function slackChannelDisplayName(
-  client: {
-    conversations: {
-      info(args: { channel: string }): Promise<{
-        ok?: boolean;
-        channel?: { name?: string; is_im?: boolean; user?: string };
-      }>;
-    };
-    users?: {
-      info(args: { user: string }): Promise<{
-        ok?: boolean;
-        user?: { name?: string; real_name?: string; profile?: { display_name?: string; real_name?: string } };
-      }>;
-    };
-  },
+export async function resolveSlackConversation(
+  client: SlackConversationClient,
   platformId: string,
-): Promise<string | null> {
+): Promise<ChannelConversation | null> {
   try {
     const id = extractSlackChannelId(platformId);
     const info = await client.conversations.info({ channel: id });
     if (!info.ok || !info.channel) return null;
     const ch = info.channel;
 
-    if (ch.is_im && ch.user && client.users) {
+    if (ch.is_im) {
+      if (!ch.user || !client.users) return { type: 'direct', name: null };
       const res = await client.users.info({ user: ch.user });
-      if (!res.ok || !res.user) return null;
-      const u = res.user;
-      return u.profile?.display_name || u.profile?.real_name || u.real_name || u.name || null;
+      return { type: 'direct', name: res.ok && res.user ? slackUserDisplayName(res.user) : null };
     }
-    return ch.name ? `#${ch.name}` : null;
+
+    // A channel keeps its `#name`. Only an MPDM pays for the roster lookup.
+    if (!ch.is_mpim) return { type: 'channel', name: ch.name ? `#${ch.name}` : null };
+
+    const participantNames = await resolveMpdmParticipants(client, id);
+    return participantNames
+      ? { type: 'group_dm', name: null, participantNames }
+      : // The roster is unresolvable (no members scope, no users.info) but the
+        // conversation IS a group DM — say so rather than falling back to the
+        // `mpdm-a--b--c-1` slug Slack puts in `name`.
+        { type: 'group_dm', name: null };
   } catch {
     return null;
   }
+}
+
+/** Human members of an MPDM, or null when the roster can't be resolved.
+ *  Bots (including our own) and deactivated accounts are excluded. */
+async function resolveMpdmParticipants(client: SlackConversationClient, channelId: string): Promise<string[] | null> {
+  if (!client.conversations.members || !client.users) return null;
+  // Same `.catch()` the per-member `users.info` calls carry below: a transient
+  // roster failure must degrade to "group DM, no names", not escape to
+  // `resolveSlackConversation`'s catch — that returns null for the whole
+  // conversation, which loses the one fact we already know for certain (this
+  // IS a group DM) and drops the card back to generic rendering.
+  const { ok, members } = await client.conversations
+    .members({ channel: channelId, limit: 100 })
+    .catch(() => ({ ok: false }) as { ok?: boolean; members?: string[] });
+  if (ok === false || !members || members.length === 0) return null;
+  const users = await Promise.all(
+    members.map((userId) => client.users!.info({ user: userId }).catch(() => ({ ok: false }) as { ok?: boolean })),
+  );
+  const names: string[] = [];
+  for (const [index, res] of users.entries()) {
+    const u = (
+      res as {
+        ok?: boolean;
+        user?: Parameters<typeof slackUserDisplayName>[0] & {
+          is_bot?: boolean;
+          is_app_user?: boolean;
+          deleted?: boolean;
+        };
+      }
+    ).user;
+    // A LOOKUP FAILURE is not a filtered member. Skipping it would present a
+    // truncated roster as complete — "a group DM with Alice" when Bob's
+    // profile call merely failed — and that label is then persisted as the
+    // messaging group's name. All-or-nothing: an unresolved roster degrades
+    // the card to "a group DM", which is true.
+    if (!res.ok || !u) return null;
+    if (!isSlackHumanMember(members[index]!, u)) continue;
+    const name = slackUserDisplayName(u);
+    // A resolvable human with no usable name is the same problem: naming the
+    // rest would claim a completeness we do not have.
+    if (!name) return null;
+    names.push(name);
+  }
+  return names.length > 0 ? names : null;
+}
+
+/**
+ * Human-facing name for a Slack conversation, for `messaging_groups.name`:
+ * `#name` for channels, the counterpart's profile name for a 1:1 DM, and the
+ * participant list for a group DM. Null whenever the API cannot say — callers
+ * keep the wiring and fall back to the platform id, so a lookup failure must
+ * never throw.
+ *
+ * This is the fleet's only implementation of the adapter's optional
+ * `resolveChannelName`: the router names every auto-wired conversation
+ * through it, and until it existed every auto-wired Slack DM stayed nameless
+ * forever and rendered as a raw `slack:D…` id on human surfaces. It is now a
+ * projection of `resolveSlackConversation` so the two seams cannot disagree.
+ */
+export async function slackChannelDisplayName(
+  client: SlackConversationClient,
+  platformId: string,
+): Promise<string | null> {
+  const conversation = await resolveSlackConversation(client, platformId);
+  return conversation ? conversationDisplayName(conversation) : null;
 }
 
 export function parseSlackWorkspaces(env: Record<string, string>): SlackWorkspace[] {
@@ -729,6 +845,7 @@ for (const ws of workspaces) {
         classifyRecoveryError: classifySlackRecoveryError,
       });
       bridge.resolveChannelName = (platformId) => slackChannelDisplayName(client, platformId);
+      bridge.resolveConversation = (platformId) => resolveSlackConversation(client, platformId);
       bridge.permalink = (platformId, threadId) => slackPermalink(ws.channelType, platformId, threadId);
       bridge.channelPermalink = (platformId) => slackChannelPermalink(ws.channelType, platformId);
       bridge.postParent = (platformId, text) => slackPostParent(client, platformId, text);

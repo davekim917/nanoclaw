@@ -161,8 +161,12 @@ describe('messaging groups', () => {
 
   it('should update', () => {
     createMessagingGroup(mg());
-    updateMessagingGroup('mg-1', { name: 'Updated' });
-    expect(getMessagingGroup('mg-1')!.name).toBe('Updated');
+    updateMessagingGroup('mg-1', { name: 'Updated', name_source: 'slack:classified' });
+    const updated = getMessagingGroup('mg-1')!;
+    expect(updated.name).toBe('Updated');
+    // A name write carries its provenance (migration 069) — the pair is what
+    // a later metadata refresh consults before overwriting.
+    expect(updated.name_source).toBe('slack:classified');
   });
 
   it('should delete', () => {

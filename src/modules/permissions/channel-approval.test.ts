@@ -20,8 +20,8 @@ import { initTestDb, closeDb, runMigrations } from '../../db/index.js';
 import { createAgentGroup } from '../../db/agent-groups.js';
 import { AGENT_ACCESS_SCOPE_WARNING } from './channel-approval.js';
 import { createMessagingGroup, getMessagingGroupByPlatform } from '../../db/messaging-groups.js';
-import { registerChannelAdapter } from '../../channels/channel-registry.js';
-import type { ChannelDefaults } from '../../channels/adapter.js';
+import { initChannelAdapters, registerChannelAdapter } from '../../channels/channel-registry.js';
+import type { ChannelAdapter, ChannelConversation, ChannelDefaults } from '../../channels/adapter.js';
 import { upsertUser } from './db/users.js';
 import { grantRole } from './db/user-roles.js';
 
@@ -776,5 +776,187 @@ describe('no-owner / no-agent failure modes', () => {
     expect(deliverMock).not.toHaveBeenCalled();
     const count = (getDb().prepare('SELECT COUNT(*) AS c FROM pending_channel_approvals').get() as { c: number }).c;
     expect(count).toBe(0);
+  });
+});
+
+/**
+ * MPDM-aware card text.
+ *
+ * Drives the real registration flow end to end (routeInbound → the card the
+ * approver is delivered), with a LIVE adapter that implements the optional
+ * `resolveConversation` seam. A group DM has no name a human recognizes —
+ * Slack's own label is a slug like `mpdm-alice--bob--carol-1` — so the card
+ * has to describe it by who is in it.
+ */
+const resolveChannelNameSpy = vi.fn();
+
+async function liveAdapterWithConversation(
+  channelType: string,
+  resolveConversation?: (platformId: string) => Promise<ChannelConversation | null>,
+  channelName = '#mpdm-alice--bob--carol-1',
+): Promise<void> {
+  resolveChannelNameSpy.mockClear();
+  const adapter = {
+    name: channelType,
+    channelType,
+    supportsThreads: true,
+    defaults: telegramDefaults,
+    async setup() {},
+    async teardown() {},
+    isConnected: () => true,
+    async deliver() {
+      return undefined;
+    },
+    async resolveChannelName() {
+      resolveChannelNameSpy();
+      return channelName;
+    },
+    ...(resolveConversation ? { resolveConversation } : {}),
+  } as unknown as ChannelAdapter;
+  registerChannelAdapter(channelType, { factory: () => adapter, defaults: telegramDefaults });
+  await initChannelAdapters(
+    () =>
+      ({
+        onInbound: () => {},
+        onInboundEvent: () => {},
+        onMetadata: () => {},
+        onAction: () => {},
+      }) as never,
+  );
+}
+
+async function cardQuestion(): Promise<string> {
+  await new Promise((r) => setTimeout(r, 10));
+  expect(deliverMock).toHaveBeenCalledTimes(1);
+  return (JSON.parse(deliverMock.mock.calls[0][4] as string) as { question: string }).question;
+}
+
+describe('approval card names a group DM by its participants', () => {
+  it('describes the people instead of the platform slug', async () => {
+    await liveAdapterWithConversation('telegram', async () => ({
+      type: 'group_dm',
+      name: null,
+      participantNames: ['Alice', 'Bob', 'Carol'],
+    }));
+    const { routeInbound } = await import('../../router.js');
+    await routeInbound(groupMention('mpdm-1'));
+
+    const question = await cardQuestion();
+    expect(question).toContain('in a group DM with Alice, Bob and Carol on telegram');
+    expect(question).not.toContain('mpdm-alice--bob--carol-1');
+  });
+
+  it('still says "a group DM" when the roster cannot be resolved', async () => {
+    await liveAdapterWithConversation('telegram', async () => ({ type: 'group_dm', name: null }));
+    const { routeInbound } = await import('../../router.js');
+    await routeInbound(groupMention('mpdm-2'));
+
+    expect(await cardQuestion()).toContain('in a group DM on telegram');
+  });
+
+  it('keeps the channel-name rendering for an ordinary channel', async () => {
+    await liveAdapterWithConversation('telegram', async () => ({ type: 'channel', name: '#general' }), '#general');
+    const { routeInbound } = await import('../../router.js');
+    await routeInbound(groupMention('chan-1'));
+
+    expect(await cardQuestion()).toContain('#general on telegram');
+  });
+
+  it('falls back to the generic rendering for an adapter without the seam', async () => {
+    await liveAdapterWithConversation('telegram', undefined, '#general');
+    const { routeInbound } = await import('../../router.js');
+    await routeInbound(groupMention('chan-2'));
+
+    expect(await cardQuestion()).toContain('#general on telegram');
+  });
+});
+
+describe('the conversation is classified once, not twice', () => {
+  async function persistedName(platformId: string): Promise<string | null> {
+    const { getDb } = await import('../../db/connection.js');
+    const row = getDb().prepare('SELECT name FROM messaging_groups WHERE platform_id = ?').get(platformId) as
+      | { name: string | null }
+      | undefined;
+    return row?.name ?? null;
+  }
+
+  it('derives the persisted name from the classification and never calls the legacy resolver', async () => {
+    await liveAdapterWithConversation('telegram', async () => ({
+      type: 'group_dm',
+      name: null,
+      participantNames: ['Alice', 'Bob'],
+    }));
+    const { routeInbound } = await import('../../router.js');
+    await routeInbound(groupMention('mpdm-once'));
+    await cardQuestion();
+
+    expect(resolveChannelNameSpy).not.toHaveBeenCalled();
+    expect(await persistedName('mpdm-once')).toBe('Group DM: Alice and Bob');
+  });
+
+  it('falls back to the legacy resolver when the rich seam is absent', async () => {
+    await liveAdapterWithConversation('telegram', undefined, '#general');
+    const { routeInbound } = await import('../../router.js');
+    await routeInbound(groupMention('chan-legacy'));
+    await cardQuestion();
+
+    expect(resolveChannelNameSpy).toHaveBeenCalledTimes(1);
+    expect(await persistedName('chan-legacy')).toBe('#general');
+  });
+
+  it('falls back when the rich lookup fails outright', async () => {
+    await liveAdapterWithConversation('telegram', async () => null, '#general');
+    const { routeInbound } = await import('../../router.js');
+    await routeInbound(groupMention('chan-failed'));
+    await cardQuestion();
+
+    expect(resolveChannelNameSpy).toHaveBeenCalledTimes(1);
+    expect(await persistedName('chan-failed')).toBe('#general');
+  });
+
+  // Codex review (PR #251): reportChannelMetadata's one-shot legacy name
+  // lookup (chat-sdk-bridge.ts) races this exact classification on the same
+  // first inbound event, with no ordering guarantee between the two writers.
+  // Simulate the race having already gone the "wrong" way — the raw platform
+  // slug landed in messaging_groups.name before this classification ran —
+  // and confirm the richer classified name still wins.
+  it('overwrites a name a racing legacy metadata lookup already set', async () => {
+    createMessagingGroup({
+      id: 'mg-mpdm-raced',
+      channel_type: 'telegram',
+      platform_id: 'mpdm-raced',
+      name: 'mpdm-alice--bob-1',
+      is_group: 1,
+      unknown_sender_policy: 'request_approval',
+      created_at: new Date().toISOString(),
+    });
+    await liveAdapterWithConversation('telegram', async () => ({
+      type: 'group_dm',
+      name: null,
+      participantNames: ['Alice', 'Bob'],
+    }));
+    const { routeInbound } = await import('../../router.js');
+    await routeInbound(groupMention('mpdm-raced'));
+    await cardQuestion();
+
+    expect(await persistedName('mpdm-raced')).toBe('Group DM: Alice and Bob');
+  });
+
+  it('leaves an existing name alone when the classified name is unavailable', async () => {
+    createMessagingGroup({
+      id: 'mg-mpdm-noroster',
+      channel_type: 'telegram',
+      platform_id: 'mpdm-noroster',
+      name: 'mpdm-alice--bob-1',
+      is_group: 1,
+      unknown_sender_policy: 'request_approval',
+      created_at: new Date().toISOString(),
+    });
+    await liveAdapterWithConversation('telegram', async () => ({ type: 'group_dm', name: null }));
+    const { routeInbound } = await import('../../router.js');
+    await routeInbound(groupMention('mpdm-noroster'));
+    await cardQuestion();
+
+    expect(await persistedName('mpdm-noroster')).toBe('mpdm-alice--bob-1');
   });
 });
