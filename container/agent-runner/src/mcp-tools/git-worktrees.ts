@@ -13,6 +13,7 @@ import fs from 'fs';
 import path from 'path';
 
 import { writeMessageOut } from '../db/messages-out.js';
+import { evaluateReviewChurnGate } from '../review-churn-gate.js';
 import { registerTools } from './server.js';
 import type { McpToolDefinition } from './types.js';
 
@@ -564,7 +565,10 @@ export const gitCommitTool: McpToolDefinition = {
 export const gitPushTool: McpToolDefinition = {
   tool: {
     name: 'git_push',
-    description: 'Push this topic worktree branch through the container-scoped origin identity.',
+    description:
+      'Push this topic worktree branch through the container-scoped origin identity. Refused while the ' +
+      'pr-review-loop churn gate is holding: three review rounds on one finding class means the fix belongs in the ' +
+      'primitive every flagged site calls, not at one more site.',
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -578,6 +582,12 @@ export const gitPushTool: McpToolDefinition = {
     const repo = typeof args.repo === 'string' ? args.repo : '';
     const resolved = worktreeForTool(repo);
     if ('error' in resolved) return resolved.error;
+    // Before the lock and before the network: a container agent's push path is
+    // this tool, not the skill's `codex-review.sh push`, so the gate has to sit
+    // here or it does not exist for container review loops. It fails open —
+    // only an explicit refusal stops the push.
+    const gate = evaluateReviewChurnGate({ worktree: resolved.context.worktree });
+    if (gate.status === 'refused') return err(gate.message);
     try {
       return await withRepositoryLock(resolved.context, async () => {
         const branch = runGitAt(resolved.context.worktree, ['branch', '--show-current']);

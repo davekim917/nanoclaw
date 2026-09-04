@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import { execFileSync } from 'child_process';
-import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'fs';
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 
@@ -20,6 +20,7 @@ describe('topic-linked worktree topology', () => {
     'NANOCLAW_WORK_UNIT_KEY',
     'NANOCLAW_REPOSITORY_ALLOW_LOCAL_ORIGIN',
     'NANOCLAW_REPOSITORY_ACTION_TRANSPORT',
+    'NANOCLAW_REVIEW_CHURN_GATE_SCRIPT',
   ] as const;
   let savedEnv: Record<string, string | undefined>;
 
@@ -247,6 +248,42 @@ describe('topic-linked worktree topology', () => {
     expect((await gitCommitTool.handler({ repo: 'proj', message: 'feature' })).isError).toBeFalsy();
     expect((await gitPushTool.handler({ repo: 'proj' })).isError).toBeFalsy();
     const branch = git(worktree, ['branch', '--show-current']);
+    expect(git(remote, ['show-ref', '--verify', `refs/heads/${branch}`])).toContain(branch);
+  });
+
+  test('push-is-refused-while-the-review-churn-gate-holds', async () => {
+    // A container agent's push path is this tool, not `codex-review.sh push`,
+    // so the gate has to hold here or container review loops never see it.
+    expect((await createWorktreeTool.handler({ repo: 'proj' })).isError).toBeFalsy();
+    const worktree = join(firstTopic, 'proj');
+    writeFileSync(join(worktree, 'site.txt'), 'one more call site\n');
+    expect((await gitCommitTool.handler({ repo: 'proj', message: 'patch another site' })).isError).toBeFalsy();
+    const branch = git(worktree, ['branch', '--show-current']);
+
+    const gateScript = join(root, 'refusing-gate.sh');
+    writeFileSync(
+      gateScript,
+      '#!/usr/bin/env bash\necho "REFRAME REQUIRED: inv:race @ src/mailbox/write.ts" >&2\nexit 3\n',
+    );
+    chmodSync(gateScript, 0o755);
+    process.env.NANOCLAW_REVIEW_CHURN_GATE_SCRIPT = gateScript;
+
+    const refused = await gitPushTool.handler({ repo: 'proj' });
+    expect(refused.isError).toBe(true);
+    expect(refused.content[0].text).toContain('REFRAME REQUIRED');
+    expect(refused.content[0].text).toContain('not patch another call site');
+    expect(() => git(remote, ['show-ref', '--verify', `refs/heads/${branch}`])).toThrow();
+
+    // The commit is untouched: the gate refuses the push, it does not rewrite
+    // the agent's work.
+    expect(git(worktree, ['log', '-1', '--format=%s'])).toBe('patch another site');
+
+    // And the same push goes through once the gate stops holding.
+    const cleanGate = join(root, 'clean-gate.sh');
+    writeFileSync(cleanGate, '#!/usr/bin/env bash\nexit 0\n');
+    chmodSync(cleanGate, 0o755);
+    process.env.NANOCLAW_REVIEW_CHURN_GATE_SCRIPT = cleanGate;
+    expect((await gitPushTool.handler({ repo: 'proj' })).isError).toBeFalsy();
     expect(git(remote, ['show-ref', '--verify', `refs/heads/${branch}`])).toContain(branch);
   });
 

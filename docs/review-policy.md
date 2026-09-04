@@ -70,7 +70,9 @@ not gated, because the refusal would name a primitive the fix has no reason to
 touch and the override would be the only way out. The reframe trailer may name
 any primitive the commit itself introduces, not only the classifier's
 candidates. `REVIEW_LOOP_ALLOW_SITE_PATCH=1` overrides the gate loudly and
-records the override in the PR body.
+records the override in the PR body. Agent containers get the same gate at
+their own push primitive — the `git_push` tool runs it before pushing — so the
+rule does not depend on which surface is working the loop.
 
 ## Fix discipline
 
