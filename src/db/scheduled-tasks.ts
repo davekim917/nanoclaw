@@ -19,6 +19,7 @@
  * duplicate.
  */
 
+import { log } from '../log.js';
 import { getAgentMailbox } from '../mailbox/index.js';
 import { resolveTaskSession, withExistingMailboxSession, withMailboxSession } from '../session-manager.js';
 import type { NanoclawMailboxSession } from '../modules/mailbox/index.js';
@@ -312,6 +313,26 @@ export async function scheduleTask(def: TaskDef): Promise<void> {
       // task anyway. Applying it only once the destination has been re-proved,
       // in the same synchronous step as the write it describes, removes that
       // partial state instead of compensating for it afterwards.
+      //
+      // TWO DATABASES, NO SHARED TRANSACTION. The task row lands in this
+      // session's `inbound.db` and the stamp lands in the central DB, so
+      // statement order cannot make the pair atomic — it only chooses which
+      // side is left ahead when the other fails. Ordering alone was the round-12
+      // answer and it was half of one: it closed "the display moved but the
+      // route did not" and opened "the route moved but the display did not",
+      // where the caller sees a rejection over a task that is committed at its
+      // new destination.
+      //
+      // So the pair is compensated. Capture what the upsert is about to
+      // overwrite (or `null`, meaning it is about to create the series), write
+      // the task row, then stamp; if the stamp throws, put the task row back and
+      // rethrow. The caller's contract is unchanged — a rejection still means
+      // nothing moved — and now the inbound side agrees with the central side
+      // the caller and the dashboard will read.
+      //
+      // Nothing awaits between any of these, so no concurrent `scheduleTask`
+      // for this series can interleave with the capture-write-restore triple.
+      const prior = mailbox.readLiveTaskSeriesRow(def.seriesId);
       mailbox.upsertTaskSeries({
         id: def.id,
         seriesId: def.seriesId,
@@ -322,14 +343,24 @@ export async function scheduleTask(def: TaskDef): Promise<void> {
         channelType: def.destination.channelType,
         threadId: def.destination.threadId,
       });
-      // AFTER the guarded write, not before it. `upsertTaskSeries` can still
-      // throw — a busy or corrupt session DB — and a stamp committed first
-      // would then advertise a destination no task row carries, which is the
-      // same partial state read from the other side. Both statements are
-      // synchronous and nothing awaits between them, so the only way to see
-      // one without the other is that throw; ordering it last makes the
-      // failure mode "the route did not move" instead of "the display did".
-      setTaskRoutingPlatformId(sessionId, def.destination.platformId);
+      try {
+        setTaskRoutingPlatformId(sessionId, def.destination.platformId);
+      } catch (err) {
+        try {
+          mailbox.restoreTaskSeries(def.seriesId, prior);
+        } catch (restoreErr) {
+          // Both databases are now unhappy and the series is genuinely
+          // inconsistent. Say so loudly; the caller still gets the original
+          // failure, because that is the one that describes what it asked for.
+          log.error('scheduleTask: the routing stamp failed AND the task row could not be restored', {
+            seriesId: def.seriesId,
+            sessionId,
+            err,
+            restoreErr,
+          });
+        }
+        throw err;
+      }
       return 'written';
     };
 

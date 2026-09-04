@@ -31,6 +31,25 @@ const raceRevokes = vi.hoisted(() => ({ sessionId: null as string | null }));
 // unless a test arms it.
 const failsTaskWrite = vi.hoisted(() => ({ sessionId: null as string | null }));
 
+// Makes the CENTRAL routing stamp fail — v2.db busy — while the session's
+// inbound.db write succeeds. The two have no transaction between them, so this
+// is the only way to observe which side is left ahead. Inert unless armed.
+const failsRoutingStamp = vi.hoisted(() => ({ sessionId: null as string | null }));
+
+vi.mock('./sessions.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./sessions.js')>();
+  return {
+    ...actual,
+    setTaskRoutingPlatformId: (id: string, platformId: string) => {
+      if (failsRoutingStamp.sessionId === id) {
+        failsRoutingStamp.sessionId = null;
+        throw new Error('database is locked');
+      }
+      return actual.setTaskRoutingPlatformId(id, platformId);
+    },
+  };
+});
+
 vi.mock('../session-manager.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../session-manager.js')>();
   return {
@@ -954,6 +973,133 @@ describe('test_scheduleTask_revalidates_the_session_after_the_await', () => {
     }>;
     db.close();
     expect(rows.map((r) => r.id)).toEqual(['t-wf-1']);
+  });
+
+  /**
+   * The other side of the same non-atomicity: the CENTRAL stamp fails.
+   *
+   * `scheduleTask` writes to two databases with no transaction spanning them.
+   * Ordering the task row first closed "the display moved but the route did
+   * not" and opened its mirror image — the task committed at its new
+   * destination while the stamp keeps the old one and the caller sees a
+   * rejection. Order cannot fix that in either direction, so the pair is
+   * compensated: the task row goes back to what it was and the original failure
+   * is rethrown.
+   *
+   * Reverting the compensation fails this test: the row carries the new route
+   * over a rejected request.
+   */
+  it('restores the previous task row when the central routing stamp fails', async () => {
+    const processAfter = new Date(Date.now() + 86400000).toISOString();
+    const base = {
+      agentGroupId: AGENT_GROUP_ID,
+      cron: '0 5 * * *',
+      processAfter,
+      seriesId: 's-stamp-fail',
+    };
+    await scheduleTask({ ...base, id: 't-sf-1', prompt: 'first', destination: TEST_DESTINATION });
+    const sessionId = taskSessionIdFor('s-stamp-fail');
+
+    const liveRow = (): Record<string, unknown> | undefined => {
+      const db = openInboundDb(inboundPath(sessionId));
+      const row = db
+        .prepare(
+          `SELECT id, series_id, status, process_after, recurrence, content,
+                  platform_id, channel_type, thread_id, kind, timestamp
+             FROM messages_in
+            WHERE series_id = 's-stamp-fail' AND status IN ('pending', 'paused')`,
+        )
+        .get() as Record<string, unknown> | undefined;
+      db.close();
+      return row;
+    };
+    const stampOf = (): string | null =>
+      (
+        getDb().prepare('SELECT task_routing_platform_id AS p FROM sessions WHERE id = ?').get(sessionId) as {
+          p: string | null;
+        }
+      ).p;
+    const before = liveRow();
+    expect(before).toBeDefined();
+    expect(stampOf()).toBe(TEST_PLATFORM_ID);
+
+    // A second wired group, so the redirect is legitimate throughout and only
+    // the central write fails.
+    const OTHER_PLATFORM = 'discord:test:c1-sf';
+    getDb()
+      .prepare(
+        `INSERT INTO messaging_groups (id, channel_type, platform_id, name, is_group, unknown_sender_policy, created_at)
+         VALUES ('mg-sf-c1', ?, ?, 'Other', 1, 'public', ?)`,
+      )
+      .run(TEST_CHANNEL_TYPE, OTHER_PLATFORM, new Date().toISOString());
+    getDb()
+      .prepare(
+        `INSERT INTO messaging_group_agents (id, messaging_group_id, agent_group_id, created_at)
+         VALUES ('mga-sf-c1', 'mg-sf-c1', ?, ?)`,
+      )
+      .run(AGENT_GROUP_ID, new Date().toISOString());
+
+    failsRoutingStamp.sessionId = sessionId;
+    await expect(
+      scheduleTask({
+        ...base,
+        id: 't-sf-2',
+        prompt: 'second',
+        destination: { platformId: OTHER_PLATFORM, channelType: TEST_CHANNEL_TYPE, threadId: null },
+      }),
+    ).rejects.toThrow(/database is locked/);
+
+    // Both sides agree again, on the OLD destination — which is what a
+    // rejection means. `seq` is excluded: the compensation re-inserts, and a
+    // successful re-schedule re-seqs too, so the series reaches this normally.
+    expect(liveRow()).toEqual(before);
+    expect(stampOf()).toBe(TEST_PLATFORM_ID);
+  });
+
+  /**
+   * And when there was no prior row, the compensation is a removal.
+   *
+   * A series whose only row is terminal is treated as absent by the upsert, so
+   * it INSERTS. Compensating that by "restoring the previous row" would restore
+   * nothing and leave the insert standing, which is why the absent case is
+   * carried explicitly rather than falling out of the restore.
+   */
+  it('removes a series the failed schedule created, when there was no prior row', async () => {
+    const processAfter = new Date(Date.now() + 86400000).toISOString();
+    const base = {
+      agentGroupId: AGENT_GROUP_ID,
+      cron: '0 5 * * *',
+      processAfter,
+      seriesId: 's-create-fail',
+    };
+    // Schedule once so the task SESSION exists (its id is what arms the mock),
+    // then make its row terminal so the next schedule takes the insert branch.
+    await scheduleTask({ ...base, id: 't-cf-1', prompt: 'first', destination: TEST_DESTINATION });
+    const sessionId = taskSessionIdFor('s-create-fail');
+    {
+      const db = openInboundDb(inboundPath(sessionId));
+      db.prepare("UPDATE messages_in SET status = 'completed' WHERE id = 't-cf-1'").run();
+      db.close();
+    }
+
+    const rowsFor = (): Array<{ id: string; status: string }> => {
+      const db = openInboundDb(inboundPath(sessionId));
+      const rows = db
+        .prepare("SELECT id, status FROM messages_in WHERE series_id = 's-create-fail' ORDER BY id")
+        .all() as Array<{ id: string; status: string }>;
+      db.close();
+      return rows;
+    };
+    expect(rowsFor()).toEqual([{ id: 't-cf-1', status: 'completed' }]);
+
+    failsRoutingStamp.sessionId = sessionId;
+    await expect(
+      scheduleTask({ ...base, id: 't-cf-2', prompt: 'second', destination: TEST_DESTINATION }),
+    ).rejects.toThrow(/database is locked/);
+
+    // The insert is gone and the terminal row it was scheduled alongside is
+    // untouched — the compensation removes only what the upsert added.
+    expect(rowsFor()).toEqual([{ id: 't-cf-1', status: 'completed' }]);
   });
 
   /**

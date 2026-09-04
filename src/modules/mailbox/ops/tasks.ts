@@ -434,6 +434,86 @@ export function cancelSeriesWithStrandClear(db: Database.Database, taskId: strin
 }
 
 /**
+ * A live series row plus its `timestamp`, which `TaskRowSnapshot` omits.
+ *
+ * The board-move flow that owns `TaskRowSnapshot` re-inserts into a DIFFERENT
+ * session, where a fresh timestamp is correct. A compensation puts a row back
+ * where it was, so it has to carry the original.
+ */
+export interface TaskSeriesSnapshot extends TaskRowSnapshot {
+  timestamp: string;
+}
+
+/**
+ * The row `upsertTaskSeries` would UPDATE, captured so it can be put back.
+ *
+ * Deliberately the SAME predicate the upsert uses to decide UPDATE-vs-INSERT
+ * (`status IN ('pending','paused')`, terminal rows treated as absent). If these
+ * two ever disagreed, a compensation would restore a row the upsert did not
+ * touch, or miss the one it did.
+ */
+export function readLiveTaskSeriesRow(db: Database.Database, seriesId: string): TaskSeriesSnapshot | null {
+  return (
+    (db
+      .prepare(
+        `SELECT id, series_id, status, process_after, recurrence, content,
+                platform_id, channel_type, thread_id, kind, timestamp
+           FROM messages_in
+          WHERE series_id = ? AND status IN ('pending', 'paused')`,
+      )
+      .get(seriesId) as TaskSeriesSnapshot | undefined) ?? null
+  );
+}
+
+/**
+ * Put a series back the way `readLiveTaskSeriesRow` found it.
+ *
+ * `scheduleTask` writes to TWO databases with no transaction spanning them: the
+ * task row in the session's `inbound.db`, and `sessions.task_routing_platform_id`
+ * in the central DB, which is what the Observatory renders the series' channel
+ * from. Statement order cannot make that atomic in either direction — it only
+ * chooses which side is left ahead when the other fails. So the second write
+ * failing is compensated rather than ordered around.
+ *
+ * `prior === null` means the upsert INSERTED a series that did not exist, and
+ * the compensation is to remove it. A non-null `prior` means the upsert UPDATED
+ * in place, and the compensation is to put the captured values back.
+ *
+ * Both cases clear whatever is live first, so one path covers them: the upsert's
+ * update branch keeps the row id, its insert branch mints one, and deleting by
+ * the live predicate does not have to know which happened.
+ *
+ * Two fields do NOT come back byte-identical, both deliberately:
+ *   - `seq` is freshly allocated, because the row is re-inserted. A successful
+ *     re-schedule re-seqs too, so this is a state the series reaches normally.
+ *   - the recall partner stays deleted. The upsert removes it precisely so a
+ *     stale context cannot ride along, and the next due sweep rebuilds it. A
+ *     compensated row therefore sits inert with no recall, which is exactly
+ *     where a normal re-schedule leaves it.
+ *
+ * What DOES come back exactly is everything a caller or the dashboard reads:
+ * the row id, series identity, status, due time, recurrence, content and route.
+ */
+export function restoreTaskSeries(db: Database.Database, seriesId: string, prior: TaskSeriesSnapshot | null): void {
+  db.transaction(() => {
+    const live = db
+      .prepare("SELECT id FROM messages_in WHERE series_id = ? AND status IN ('pending', 'paused')")
+      .all(seriesId) as Array<{ id: string }>;
+    for (const row of live) {
+      db.prepare("DELETE FROM messages_in WHERE id = ? AND kind = 'system'").run(`recall-${row.id}`);
+      db.prepare('DELETE FROM messages_in WHERE id = ?').run(row.id);
+    }
+    if (!prior) return;
+    restoreTaskRow(db, prior);
+    // `restoreTaskRow` stamps `new Date()`, which is right for its board-move
+    // caller (a row arriving in a new session) and wrong here (a row going back
+    // to what it was). The upsert's update branch never touches `timestamp`, so
+    // a successful re-schedule preserves it and this must too.
+    db.prepare('UPDATE messages_in SET timestamp = ? WHERE id = ?').run(prior.timestamp, prior.id);
+  })();
+}
+
+/**
  * Idempotent series upsert used by `scheduleTask`.
  *
  * Active series (pending/paused) → UPDATE in place; terminal rows

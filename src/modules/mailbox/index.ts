@@ -84,8 +84,10 @@ import {
   insertRecurrence,
   insertTaskRow,
   listDueTaskRows,
+  readLiveTaskSeriesRow,
   resolvePendingTask,
   restoreTaskRow,
+  restoreTaskSeries,
   resumeTask,
   setPendingTaskContent,
   updateTask,
@@ -94,6 +96,7 @@ import {
   type RecurringMessage as ForkRecurringMessage,
   type TaskRowInsert,
   type TaskRowSnapshot,
+  type TaskSeriesSnapshot,
   type TaskUpdate as ForkTaskUpdate,
 } from './ops/tasks.js';
 import {
@@ -190,6 +193,7 @@ export {
   type RecurringMessage,
   type TaskRowInsert,
   type TaskRowSnapshot,
+  type TaskSeriesSnapshot,
   type TaskUpdate,
 } from './ops/tasks.js';
 export {
@@ -377,6 +381,13 @@ export interface NanoclawMailboxSession extends MailboxSession {
     status?: 'pending' | 'paused',
   ): void;
   restoreTaskRow(snapshot: TaskRowSnapshot): void;
+  /**
+   * The live row `upsertTaskSeries` would UPDATE, captured so a caller whose
+   * SECOND write (in another database) fails can put this one back.
+   */
+  readLiveTaskSeriesRow(seriesId: string): TaskSeriesSnapshot | null;
+  /** Undo an `upsertTaskSeries`: restore `prior`, or remove the series it created. */
+  restoreTaskSeries(seriesId: string, prior: TaskSeriesSnapshot | null): void;
   cancelSeriesWithStrandClear(taskId: string): number;
   upsertTaskSeries(row: {
     id: string;
@@ -825,6 +836,8 @@ function forkOps(
     armNextRecurrence: (originalId, msg, newId, nextRun, status) =>
       armNextTask(inbound, originalId, msg, newId, nextRun, status),
     restoreTaskRow: (snapshot) => restoreTaskRow(inbound, snapshot),
+    readLiveTaskSeriesRow: (seriesId) => readLiveTaskSeriesRow(inbound, seriesId),
+    restoreTaskSeries: (seriesId, prior) => restoreTaskSeries(inbound, seriesId, prior),
     cancelSeriesWithStrandClear: (taskId) => cancelSeriesWithStrandClear(inbound, taskId),
     upsertTaskSeries: (row) => upsertTaskSeries(inbound, row),
     listDueTaskRows: () => listDueTaskRows(inbound),
