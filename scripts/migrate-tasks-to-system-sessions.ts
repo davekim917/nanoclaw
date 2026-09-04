@@ -87,8 +87,23 @@ function backupOnce(dbPath: string): void {
   console.log(`  [backup] ${dest}`);
 }
 
+/**
+ * `listLiveTaskRows` only SELECTs `status IN ('pending', 'paused')`, so this
+ * should never trip in practice — but `ScheduledTaskRow.status` (shared with
+ * every other board surface, some of which read rows in every status) is a
+ * raw `string`, and `insertTaskRow`'s `TaskRowInsert.status` takes the
+ * narrower union. Fail closed rather than cast past the mismatch: an
+ * unexpected value here means the SQL filter and this script's assumption
+ * have drifted, and writing it into the target session unnarrowed would
+ * silently corrupt the migrated row's status instead of surfacing the drift.
+ */
+function narrowLiveTaskStatus(status: string): 'pending' | 'paused' | null {
+  return status === 'pending' || status === 'paused' ? status : null;
+}
+
 let migrated = 0;
 let skippedDue = 0;
+let skippedBadStatus = 0;
 let junk = 0;
 let duplicates = 0;
 
@@ -136,8 +151,19 @@ for (const session of getActiveSessions()) {
       continue;
     }
 
+    // Fail closed on a status `listLiveTaskRows`'s own SQL filter should have
+    // ruled out. See `narrowLiveTaskStatus` above.
+    const liveStatus = narrowLiveTaskStatus(row.status);
+    if (liveStatus === null) {
+      skippedBadStatus++;
+      console.log(
+        `SKIP-STATUS ${label} — live row has unexpected status '${row.status}' (expected pending|paused); investigate before rerunning`,
+      );
+      continue;
+    }
+
     // Don't race an imminent/claimed fire — the host may be mid-delivery.
-    if (row.status === 'pending' && row.process_after && new Date(row.process_after).getTime() <= Date.now()) {
+    if (liveStatus === 'pending' && row.process_after && new Date(row.process_after).getTime() <= Date.now()) {
       skippedDue++;
       console.log(`SKIP-DUE  ${label} — live row is due/claimed (process_after=${row.process_after}); rerun later`);
       continue;
@@ -145,7 +171,7 @@ for (const session of getActiveSessions()) {
 
     const route = row.platform_id ? `${row.channel_type}:${row.platform_id}${row.thread_id ? ' thread' : ''}` : 'none';
     console.log(
-      `MIGRATE   ${label} — ${row.status}, next=${row.process_after ?? '-'}, cron=${row.recurrence ?? 'once'}, route=${route}`,
+      `MIGRATE   ${label} — ${liveStatus}, next=${row.process_after ?? '-'}, cron=${row.recurrence ?? 'once'}, route=${route}`,
     );
     if (!APPLY) {
       migrated++;
@@ -169,7 +195,7 @@ for (const session of getActiveSessions()) {
           processAfter: row.process_after,
           recurrence: row.recurrence,
           content: row.content,
-          status: row.status,
+          status: liveStatus,
           platformId: row.platform_id,
           channelType: row.channel_type,
           threadId: row.thread_id,
@@ -192,5 +218,5 @@ for (const session of getActiveSessions()) {
 }
 
 console.log(
-  `\n${APPLY ? 'APPLIED' : 'DRY-RUN'}: ${migrated} migrated, ${duplicates} duplicate-target, ${skippedDue} skipped-due, ${junk} junk${APPLY ? '' : ' (no changes made)'}`,
+  `\n${APPLY ? 'APPLIED' : 'DRY-RUN'}: ${migrated} migrated, ${duplicates} duplicate-target, ${skippedDue} skipped-due, ${skippedBadStatus} skipped-bad-status, ${junk} junk${APPLY ? '' : ' (no changes made)'}`,
 );
