@@ -32,6 +32,14 @@ worktree_root=$(git rev-parse --show-toplevel)
 # projectService and friends to actually gate anything, `pnpm run lint` itself
 # must be green and enforced (see docs/specs for the seam plan).
 #
+# Known gap, pre-existing pattern (same class as the boundary check's own
+# comment above): this lints the WORKTREE's on-disk files, not the object
+# content of the commit(s) actually being pushed — a commit with a lint error
+# that the working tree has since fixed only in unstaged content would pass.
+# Closing it means linting the pushed SHA's tree (e.g. a `git archive`/export
+# to a throwaway directory per ref on stdin), which the boundary check would
+# need too for the same reason; out of scope for this PR (Codex review, #380).
+#
 # Unlike prettier's compiled binary, eslint.config.js is a plain ES module:
 # its own `import globals from 'globals'` (and typescript-eslint, the
 # no-catch-all plugin, ...) is resolved by Node relative to the CONFIG FILE's
