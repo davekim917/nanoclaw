@@ -92,9 +92,14 @@ describe('buildOpenCodeConfig — fail-closed guard (F1)', () => {
     // Ground truth is opencode 1.18.x's own built-in documentation:
     // "Known permission keys: read, edit, glob, grep, list, bash, task,
     //  external_directory, todowrite, question, webfetch, websearch, lsp,
-    //  doom_loop, skill". An undeclared key is a config change with no known
-    //  meaning, and OpenCode rejects a config it cannot parse — which would take
-    //  the whole spawn down, guard included.
+    //  doom_loop, skill". Verified live against opencode 1.18.18: an UNKNOWN
+    //  permission key is tolerated (a config carrying `codesearch` loads fine),
+    //  so upstream's extra key is inert here rather than dangerous — but an
+    //  invalid ACTION is rejected outright ("Expected PermissionActionConfig,
+    //  got \"maybe\"") and takes the whole spawn down, guard included. So the
+    //  list is kept to keys with documented meaning in this version: declaring
+    //  one OpenCode does not know buys nothing and pre-commits us to whatever
+    //  semantics a later version gives it.
     const known = [
       'read',
       'edit',

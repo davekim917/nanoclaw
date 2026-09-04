@@ -74,7 +74,9 @@ describe('resolveModelLimit', () => {
     // opencode 1.18.x's config schema is
     // `limit: optional(Struct({context: Finite, input: optional(Finite), output: Finite}))`
     // — a `limit` carrying only `context` fails validation and takes the WHOLE
-    // config down, MCP servers and guard plugin included.
+    // config down, MCP servers and guard plugin included. Verified live against
+    // opencode 1.18.18: a context-only limit exits 1 with "Missing key
+    // provider.<p>.models.<m>.limit.output"; adding the output limit loads.
     expect(resolveModelLimit({ OPENCODE_MODEL_CONTEXT_LIMIT: '128000' })).toBeUndefined();
     expect(resolveModelLimit({ OPENCODE_MODEL_OUTPUT_LIMIT: '8192' })).toBeUndefined();
     expect(

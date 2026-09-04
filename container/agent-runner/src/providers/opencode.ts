@@ -124,10 +124,16 @@ export function buildPromptParts(
  * "allow everything" behavior the string shorthand produced, so the
  * fail-closed destructive-action plugin below is still the ONLY thing standing
  * between the agent and a destructive command — the same contract, the same
- * classifier, the same `tool.execute.before` throw. This list deliberately does
- * NOT include a category OpenCode does not document (upstream's `codesearch`,
- * absent from 1.18.x's key list): an unknown key would be a config change with
- * no known meaning here. A category OpenCode adds later is likewise absent, and
+ * classifier, the same `tool.execute.before` throw.
+ *
+ * The list deliberately omits a category OpenCode does not document (upstream's
+ * `codesearch`, absent from 1.18.x's key list). Verified live against 1.18.18:
+ * an unknown KEY is tolerated rather than rejected, so upstream's extra one is
+ * inert here — but it also buys nothing, and declaring it pre-commits us to
+ * whatever semantics a later version gives it. An invalid ACTION, by contrast,
+ * IS rejected ("Expected PermissionActionConfig") and takes the whole spawn
+ * down, which is why every value here is only ever `allow` or `deny`. A
+ * category OpenCode adds after this list was written is likewise absent, and
  * resolves to OpenCode's own default rather than to `allow`.
  */
 export const OPENCODE_PERMISSIONS: Record<string, string> = {
