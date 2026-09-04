@@ -302,6 +302,13 @@ export function sessionStillActive(sessionId: string): WakeGuard {
     const fresh = getSession(sessionId);
     if (!fresh) return { ok: false, reason: 'session no longer exists' };
     if (fresh.status !== 'active') return { ok: false, reason: `session is ${fresh.status}` };
+    // `archived_at` is a SECOND axis, not a shade of `status`.
+    // `archiveSessionById` stamps it and leaves `status` alone, so a
+    // thread-close that archives without closing leaves a row reading `active`
+    // — and a guard that only asked about `status` would wave a wake straight
+    // into a thread the operator was told was finished. The archive-only close
+    // is the ordinary case, not an edge one.
+    if (fresh.archived_at != null) return { ok: false, reason: 'session is archived' };
     return true;
   };
 }

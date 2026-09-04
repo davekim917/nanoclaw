@@ -144,6 +144,7 @@ import {
   stripEnvEntry,
   wakeContainer,
   killContainer,
+  sessionStillActive,
   isContainerRunning,
   isContainerSpawning,
 } from './container-runner.js';
@@ -1712,7 +1713,8 @@ describe('killContainer against a session that is still spawning', () => {
     getDb().exec(`
       CREATE TABLE sessions (
         id TEXT PRIMARY KEY, agent_group_id TEXT, messaging_group_id TEXT, thread_id TEXT,
-        agent_provider TEXT, status TEXT, container_status TEXT, last_active TEXT, created_at TEXT
+        agent_provider TEXT, status TEXT, container_status TEXT, last_active TEXT, created_at TEXT,
+        archived_at TEXT
       );
       CREATE TABLE agent_groups (
         id TEXT PRIMARY KEY, name TEXT, folder TEXT, agent_provider TEXT, workgroup_id TEXT
@@ -1895,6 +1897,35 @@ describe('killContainer against a session that is still spawning', () => {
     expect(exits).toEqual(['exit']);
     expect(memoryStub.cancelledIds).toContain('sess-queued-kill');
     expect(memoryStub.queuedPayloads).toEqual([]);
+  });
+
+  /**
+   * `archived_at` is a second axis, not a shade of `status`.
+   *
+   * `archiveSessionById` stamps `archived_at` and leaves `status` alone, so a
+   * thread-close that archives without closing leaves a row still reading
+   * `active`. A guard that asked only about `status` waved a wake straight into
+   * a thread the operator had been told was finished — and the archive-only
+   * close is the ordinary case, not an edge one.
+   */
+  it('refuses a session that is archived even though its status is still active', () => {
+    seedSession('sess-archived');
+    getDb()
+      .prepare('UPDATE sessions SET archived_at = ? WHERE id = ?')
+      .run('2026-09-04T00:00:00.000Z', 'sess-archived');
+
+    // The precondition that makes this case worth having: the row still says
+    // `active`, so `status` alone cannot answer.
+    expect(
+      (getDb().prepare('SELECT status FROM sessions WHERE id = ?').get('sess-archived') as { status: string }).status,
+    ).toBe('active');
+
+    expect(sessionStillActive('sess-archived')()).toEqual({ ok: false, reason: 'session is archived' });
+  });
+
+  it('admits a live session that has never been archived', () => {
+    seedSession('sess-live');
+    expect(sessionStillActive('sess-live')()).toBe(true);
   });
 
   it('still does nothing for a session that is neither running nor spawning', async () => {

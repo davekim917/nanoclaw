@@ -256,6 +256,15 @@ export interface Session {
    * lookup (routing, the sweep, the unique active-triple index) skips it.
    */
   status: 'active' | 'closed' | 'archiving';
+  /**
+   * Set when the session has been archived — thread-close's terminal marker.
+   *
+   * A distinct axis from `status`: `archiveSessionById` stamps this and leaves
+   * `status` alone, so an archived session normally still reads `active`. Any
+   * check that means "is this session still live" has to read BOTH, which is
+   * why the column is on the type rather than only in the table.
+   */
+  archived_at?: string | null;
   container_status: 'running' | 'idle' | 'stopped';
   last_active: string | null;
   last_outbound_at?: string | null;
