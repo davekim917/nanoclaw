@@ -485,7 +485,7 @@ describe('recoverMoveIntents (D3) + pruneAuditBodies (D4)', () => {
       .get() as { c: number };
     expect(live.c, 'the restore landed behind a mark nothing will clear').toBe(0);
     const row = db
-      .prepare("SELECT resolved_at, detail_json FROM move_intents WHERE series_id = 'ser-faulted'")
+      .prepare("SELECT resolved_at, detail_json FROM scheduled_audit WHERE correlation_id = 'corr-ser-faulted'")
       .get() as { resolved_at: string | null; detail_json: string | null };
     expect(row.resolved_at, 'the intent was stamped resolved with nothing restored').toBeNull();
     expect(row.detail_json, 'the snapshot the next pass needs was purged').not.toBeNull();
