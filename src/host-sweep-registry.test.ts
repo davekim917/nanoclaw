@@ -322,6 +322,11 @@ import './modules/sweep-continuation/index.js';
 // attempt restore hangs off the spawn's promise, so a case that counts opens
 // or reads continuation state has to wait for it explicitly.
 import { _resetDetachedWakesForTesting, _settleDetachedWakesForTesting } from './modules/sweep-continuation/index.js';
+// The post-kill follow-up chain now starts from the container's own exit
+// (Codex final), so it is asynchronous with respect to the tick that ordered
+// the kill. Settling after every tick is a no-op when nothing is in flight and
+// restores exactly the accounting the previous in-tick `await` gave.
+import { _resetPostKillForTesting, _settlePostKillForTesting } from './modules/sweep-container-health/index.js';
 // Registers the scheduling family's duty source (S2-PR11: T8, S5, S18, S19) —
 // without it R-7's inventory is four registrations short and R-10's W2 branch
 // has nothing to make a session due.
@@ -460,6 +465,7 @@ describe('sweep duty registry (S2-PR2)', () => {
     // reuse session ids, so an entry left in flight by one would suppress the
     // next one's wake and the case would pass for the wrong reason.
     _resetDetachedWakesForTesting();
+    _resetPostKillForTesting();
     resetAgentMailboxForTesting();
     registerAgentMailbox(() => fakeStore);
     h.selfHeal = false;
@@ -528,6 +534,7 @@ describe('sweep duty registry (S2-PR2)', () => {
     registerSweepDuty(probeDuty('house-5', 'tick:housekeeping', 5, seen));
 
     await _sweepOnceForTesting();
+    await _settlePostKillForTesting();
 
     expect(seen).toEqual([
       'pre-10',
@@ -622,6 +629,7 @@ describe('sweep duty registry (S2-PR2)', () => {
     });
 
     await _sweepOnceForTesting();
+    await _settlePostKillForTesting();
 
     expect(seen).toEqual([
       'tick-pre',
@@ -662,6 +670,7 @@ describe('sweep duty registry (S2-PR2)', () => {
     registerSweepDuty({ name: 'c', phase: 'tick:housekeeping', order: 10, run: capture });
 
     await _sweepOnceForTesting();
+    await _settlePostKillForTesting();
 
     expect(scan).toHaveBeenCalledTimes(1);
     // Four reads (two sessions × the plan duty, plus the two tick duties), one array.
@@ -737,6 +746,7 @@ describe('sweep duty registry (S2-PR2)', () => {
         });
 
         await _sweepOnceForTesting();
+        await _settlePostKillForTesting();
 
         expect(error).toHaveBeenCalledWith(
           'Host sweep duty failed',
@@ -747,6 +757,7 @@ describe('sweep duty registry (S2-PR2)', () => {
         // the very next tick sweeps it again.
         h.opens = [];
         await _sweepOnceForTesting();
+        await _settlePostKillForTesting();
         expect(h.opens.length).toBeGreaterThan(0);
         expect(h.spawns).toEqual([]);
       });
@@ -765,6 +776,7 @@ describe('sweep duty registry (S2-PR2)', () => {
       });
 
       await _sweepOnceForTesting();
+      await _settlePostKillForTesting();
 
       expect(h.kills.map((k) => k.reason)).toContain('absolute-ceiling');
       expect(error).toHaveBeenCalledWith(
@@ -852,6 +864,7 @@ describe('sweep duty registry (S2-PR2)', () => {
     });
 
     await _sweepOnceForTesting();
+    await _settlePostKillForTesting();
 
     // Registration IS the guard. Before the seam an unguarded throw here
     // silently skipped every duty ordered behind it for the rest of the tick.
@@ -906,6 +919,7 @@ describe('sweep duty registry (S2-PR2)', () => {
       h.failNextOpen = new SessionDbUnopenableError('/tmp/inbound.db', new Error('boom'));
 
       await _sweepOnceForTesting();
+      await _settlePostKillForTesting();
 
       expect(error).toHaveBeenCalledWith(
         'Host sweep mailbox unopenable',
@@ -915,6 +929,7 @@ describe('sweep duty registry (S2-PR2)', () => {
       // Backed off: the next tick skips the session entirely.
       h.opens = [];
       await _sweepOnceForTesting();
+      await _settlePostKillForTesting();
       expect(h.opens).toEqual([]);
       expect(h.spawns).toEqual([]);
     });
@@ -1000,6 +1015,7 @@ describe('sweep duty registry (S2-PR2)', () => {
         const session = arm();
 
         await _sweepOnceForTesting();
+        await _settlePostKillForTesting();
 
         then?.();
 
@@ -1013,6 +1029,7 @@ describe('sweep duty registry (S2-PR2)', () => {
         h.opens = [];
         h.failNextOpen = null;
         await _sweepOnceForTesting();
+        await _settlePostKillForTesting();
         expect(h.opens.length).toBeGreaterThan(0);
         expect(h.spawns).toEqual([]);
       });
@@ -1027,11 +1044,13 @@ describe('sweep duty registry (S2-PR2)', () => {
       h.failNextOpen = new SessionDbMissingError('/gone/inbound.db');
 
       await _sweepOnceForTesting();
+      await _settlePostKillForTesting();
 
       expect(error).not.toHaveBeenCalledWith('Host sweep mailbox unopenable', expect.anything());
       expect(error).not.toHaveBeenCalledWith('Host sweep duty failed', expect.anything());
       h.opens = [];
       await _sweepOnceForTesting();
+      await _settlePostKillForTesting();
       expect(h.opens).toEqual([]);
       expect(h.spawns).toEqual([]);
     });
@@ -1044,6 +1063,7 @@ describe('sweep duty registry (S2-PR2)', () => {
       continuationWakeSession(new SessionDbMissingError('/gone/inbound.db'));
 
       await _sweepOnceForTesting();
+      await _settlePostKillForTesting();
 
       expect(error).not.toHaveBeenCalledWith('Host sweep mailbox unopenable', expect.anything());
       expect(error).not.toHaveBeenCalledWith('Host sweep duty failed', expect.anything());
@@ -1056,6 +1076,7 @@ describe('sweep duty registry (S2-PR2)', () => {
       h.opens = [];
       h.failNextOpen = null;
       await _sweepOnceForTesting();
+      await _settlePostKillForTesting();
       expect(h.opens.length).toBeGreaterThan(0);
       expect(h.spawns).toEqual([]);
     });
@@ -1202,6 +1223,7 @@ describe('sweep duty registry (S2-PR2)', () => {
     expect(reconcile?.order).toBeLessThan(selfHeal?.order ?? Infinity);
 
     await _sweepOnceForTesting();
+    await _settlePostKillForTesting();
 
     // Order, and NOT merely declared order — the probe proves reconcile's
     // deletion of 'claim-merged' is visible to self-heal in the SAME tick.
@@ -1496,11 +1518,13 @@ describe('sweep duty registry (S2-PR2)', () => {
       h.mailbox = fakeMailbox({ getNextFutureProcessAfter: () => null });
 
       await _sweepOnceForTesting();
+      await _settlePostKillForTesting();
       expect(h.opens.length).toBeGreaterThan(0);
 
       // Second tick: skipped entirely, no mailbox opened.
       h.opens = [];
       await _sweepOnceForTesting();
+      await _settlePostKillForTesting();
       expect(h.opens).toEqual([]);
 
       // A due row sooner than the cap shortens the skip.
@@ -1511,12 +1535,14 @@ describe('sweep duty registry (S2-PR2)', () => {
       h.sessions = [nudged];
       h.opens = [];
       await _sweepOnceForTesting();
+      await _settlePostKillForTesting();
       expect(h.opens).toContain(nudged.id);
       // Past its next due row but well inside the 30-minute cap: swept again.
       h.opens = [];
       vi.useFakeTimers({ shouldAdvanceTime: true });
       vi.setSystemTime(Date.now() + 10_000);
       await _sweepOnceForTesting();
+      await _settlePostKillForTesting();
       vi.useRealTimers();
       expect(h.opens).toContain(nudged.id);
       expect(h.spawns).toEqual([]);
@@ -1527,12 +1553,15 @@ describe('sweep duty registry (S2-PR2)', () => {
       h.sessions = [session];
 
       await _sweepOnceForTesting();
+      await _settlePostKillForTesting();
       h.opens = [];
       await _sweepOnceForTesting();
+      await _settlePostKillForTesting();
       expect(h.opens).toEqual([]);
 
       h.sessions = [fakeSession('sess-invalidate', { last_active: '2026-04-20T13:30:00.000Z' })];
       await _sweepOnceForTesting();
+      await _settlePostKillForTesting();
       expect(h.opens).toContain('sess-invalidate');
       expect(h.spawns).toEqual([]);
     });
@@ -1570,6 +1599,7 @@ describe('sweep duty registry (S2-PR2)', () => {
       vi.setSystemTime(startMs);
       h.opens = [];
       await _sweepOnceForTesting();
+      await _settlePostKillForTesting();
       // A swept session opens twice (W1 and W5); a skipped one opens not at all.
       expect(new Set(h.opens).size).toBe(HERD);
 
@@ -1578,6 +1608,7 @@ describe('sweep duty registry (S2-PR2)', () => {
         vi.setSystemTime(startMs + minute * MINUTE);
         h.opens = [];
         await _sweepOnceForTesting();
+        await _settlePostKillForTesting();
         for (const id of new Set(h.opens)) if (!firstSweptAt.has(id)) firstSweptAt.set(id, minute);
       }
       return firstSweptAt;
@@ -1681,6 +1712,7 @@ describe('sweep duty registry (S2-PR2)', () => {
       coldDriver([fakeSession('sess-warm-a'), fakeSession('sess-warm-b')]);
 
       await _sweepOnceForTesting();
+      await _settlePostKillForTesting();
       expect(h.quietWrites).toHaveLength(1);
       expect(h.quietWrites[0]!.map((m) => m.sessionId).sort()).toEqual(['sess-warm-a', 'sess-warm-b']);
 
@@ -1700,6 +1732,7 @@ describe('sweep duty registry (S2-PR2)', () => {
       coldDriver(ids.map((id) => fakeSession(id)));
 
       await _sweepOnceForTesting();
+      await _settlePostKillForTesting();
       _resetQuietSessionCacheForTesting();
       h.opens = [];
       await firstTickAfterRestart();
@@ -1713,6 +1746,7 @@ describe('sweep duty registry (S2-PR2)', () => {
     it('a warmed mark whose last_active moved is dropped, and that session is swept on the first tick after the restart', async () => {
       coldDriver([fakeSession('sess-moved')]);
       await _sweepOnceForTesting();
+      await _settlePostKillForTesting();
       expect(h.quietWrites).toHaveLength(1);
 
       // Production nulls the column in the same statement that writes
@@ -1731,6 +1765,7 @@ describe('sweep duty registry (S2-PR2)', () => {
     it('a persisted quiet mark is ignored when last_active moved after it', async () => {
       coldDriver([fakeSession('sess-ignored')]);
       await _sweepOnceForTesting();
+      await _settlePostKillForTesting();
       const persisted = h.quietWrites[0]![0]!;
       // The mark itself is still in the future — only the moved last_active
       // disqualifies it, so this is not an expiry test in disguise.
@@ -1760,6 +1795,7 @@ describe('sweep duty registry (S2-PR2)', () => {
         });
 
         await _sweepOnceForTesting();
+        await _settlePostKillForTesting();
         // The persisted value IS the due row, not the backoff cap — which is
         // why a warm can never cross one that already existed at mark time.
         expect(h.quietWrites[0]![0]!.quietUntil).toBe(new Date(startMs + 5 * MINUTE).toISOString());
@@ -1781,6 +1817,7 @@ describe('sweep duty registry (S2-PR2)', () => {
     it('a session with a live container is never warmed as quiet', async () => {
       coldDriver([fakeSession('sess-live')]);
       await _sweepOnceForTesting();
+      await _settlePostKillForTesting();
       expect(h.quietWrites).toHaveLength(1);
 
       // The container came back between the mark and the boot. A live session
@@ -1800,8 +1837,11 @@ describe('sweep duty registry (S2-PR2)', () => {
       coldDriver([fakeSession('sess-once')]);
 
       await _sweepOnceForTesting();
+      await _settlePostKillForTesting();
       await _sweepOnceForTesting();
+      await _settlePostKillForTesting();
       await _sweepOnceForTesting();
+      await _settlePostKillForTesting();
 
       // Three ticks, one write. A per-tick write of the ~840 rows the cache
       // holds would be a new cost, not a saving.
@@ -1821,11 +1861,13 @@ describe('sweep duty registry (S2-PR2)', () => {
       h.exists = false; // the mailbox store answers "gone" — the read-path contract
 
       await _sweepOnceForTesting();
+      await _settlePostKillForTesting();
       expect(h.quietWrites, 'an unreadable session must not persist a mark').toEqual([]);
 
       // In-process it is still backed off, exactly as before this PR.
       h.opens = [];
       await _sweepOnceForTesting();
+      await _settlePostKillForTesting();
       expect(h.opens).toEqual([]);
       expect(h.spawns).toEqual([]);
     });
@@ -1860,6 +1902,7 @@ describe('sweep duty registry (S2-PR2)', () => {
       });
 
       await _sweepOnceForTesting();
+      await _settlePostKillForTesting();
 
       // Both were queued — the driver cannot know — but only the untouched one
       // is actually persisted.
@@ -1905,6 +1948,7 @@ describe('sweep duty registry (S2-PR2)', () => {
       });
 
       await _sweepOnceForTesting();
+      await _settlePostKillForTesting();
       expect(h.quietWrites[0]!.map((m) => m.sessionId)).toEqual(['sess-restored']);
       expect([...h.persistedQuiet.keys()], 'the flush wrote a mark the restore had already cleared').toEqual([]);
 
@@ -1938,6 +1982,7 @@ describe('sweep duty registry (S2-PR2)', () => {
       // skipping it on a mark no restart could ever recover.
       h.opens = [];
       await _sweepOnceForTesting();
+      await _settlePostKillForTesting();
       expect(h.opens).toContain('sess-writefail');
       expect(h.spawns).toEqual([]);
     });
@@ -1969,6 +2014,7 @@ describe('sweep duty registry (S2-PR2)', () => {
       });
 
       await _sweepOnceForTesting();
+      await _settlePostKillForTesting();
 
       expect(depths).toEqual([1, 0]);
       expect(h.spawns).toEqual([]);
@@ -1980,6 +2026,7 @@ describe('sweep duty registry (S2-PR2)', () => {
       h.mailbox = fakeMailbox({ countDueMessages: () => 1 });
 
       await _sweepOnceForTesting();
+      await _settlePostKillForTesting();
 
       expect(h.wakes).toEqual([{ sessionId: 'sess-wake', depth: 0 }]);
       expect(h.spawns).toEqual([]);
@@ -1999,6 +2046,7 @@ describe('sweep duty registry (S2-PR2)', () => {
       h.mailbox = fakeMailbox({ countDueMessages: () => 1 });
 
       await _sweepOnceForTesting();
+      await _settlePostKillForTesting();
       await _settleDetachedWakesForTesting();
 
       expect(h.wakes).toEqual([{ sessionId: 'sess-counted', depth: 0 }]);
@@ -2027,6 +2075,7 @@ describe('sweep duty registry (S2-PR2)', () => {
         });
 
         await _sweepOnceForTesting();
+        await _settlePostKillForTesting();
         await _settleDetachedWakesForTesting();
 
         const line = info.mock.calls.find((c) => c[0] === 'Host sweep tick timing');
@@ -2082,9 +2131,11 @@ describe('sweep duty registry (S2-PR2)', () => {
 
       // Two consecutive 'failed' observations are required before it acts.
       await _sweepOnceForTesting();
+      await _settlePostKillForTesting();
       expect(h.kills).toEqual([]);
       h.running.add('sess-heal');
       await _sweepOnceForTesting();
+      await _settlePostKillForTesting();
 
       expect(h.kills).toEqual([{ sessionId: 'sess-heal', reason: 'provider-failed-selfheal', depth: 0 }]);
       // killForProviderHeal's onExit respawn, still at depth zero.
@@ -2099,7 +2150,9 @@ describe('sweep duty registry (S2-PR2)', () => {
         countRecoveryAttemptsSinceRealInbound: () => 2,
       });
       await _sweepOnceForTesting();
+      await _settlePostKillForTesting();
       await _sweepOnceForTesting();
+      await _settlePostKillForTesting();
       expect(h.kills).toEqual([{ sessionId: 'sess-heal', reason: 'provider-failed-selfheal-parked', depth: 0 }]);
       expect(h.wakes).toEqual([]);
       expect(h.spawns).toEqual([]);
@@ -2111,6 +2164,7 @@ describe('sweep duty registry (S2-PR2)', () => {
       h.running.add(task.id);
       h.mailbox = fakeMailbox({ getContainerState: () => ({ provider_executing: 0 }) });
       await _sweepOnceForTesting();
+      await _settlePostKillForTesting();
       expect(h.kills).toEqual([{ sessionId: 'sess-task', reason: 'scheduled-task-idle', depth: 0 }]);
 
       h.kills = [];
@@ -2123,6 +2177,7 @@ describe('sweep duty registry (S2-PR2)', () => {
         latestInboundTimestamp: () => new Date(Date.now() - 60 * 60_000).toISOString(),
       });
       await _sweepOnceForTesting();
+      await _settlePostKillForTesting();
       expect(h.kills).toEqual([{ sessionId: 'sess-chat', reason: 'chat-idle-reap', depth: 0 }]);
       expect(h.spawns).toEqual([]);
     });
@@ -2131,6 +2186,7 @@ describe('sweep duty registry (S2-PR2)', () => {
       aliveSession('sess-ceiling');
       armCeilingKill();
       await _sweepOnceForTesting();
+      await _settlePostKillForTesting();
       expect(h.kills).toEqual([{ sessionId: 'sess-ceiling', reason: 'absolute-ceiling', depth: 0 }]);
 
       h.kills = [];
@@ -2143,6 +2199,7 @@ describe('sweep duty registry (S2-PR2)', () => {
         getProcessingClaimRows: () => [{ message_id: 'm1', status_changed: claimedAt }],
       });
       await _sweepOnceForTesting();
+      await _settlePostKillForTesting();
       expect(h.kills).toEqual([{ sessionId: 'sess-stuck', reason: 'claim-stuck', depth: 0 }]);
       expect(h.spawns).toEqual([]);
     });
@@ -2166,6 +2223,7 @@ describe('sweep duty registry (S2-PR2)', () => {
     }
 
     await _sweepOnceForTesting();
+    await _settlePostKillForTesting();
 
     expect(h.kills.map((k) => k.reason)).toEqual(['absolute-ceiling']);
     // Registered 230, 210, 220 — run 210, 220, 230, after the three built-in
@@ -2197,6 +2255,7 @@ describe('sweep duty registry (S2-PR2)', () => {
     });
 
     await _sweepOnceForTesting();
+    await _settlePostKillForTesting();
     // The wake is detached (#359), so the attempt restore's open — the eighth
     // on this path — can land after the tick returns. Settle before counting.
     await _settleDetachedWakesForTesting();
@@ -2213,8 +2272,10 @@ describe('sweep duty registry (S2-PR2)', () => {
     h.sessions = [quiet];
     h.running.delete(quiet.id);
     await _sweepOnceForTesting();
+    await _settlePostKillForTesting();
     h.opens = [];
     await _sweepOnceForTesting();
+    await _settlePostKillForTesting();
     expect(h.opens).toEqual([]);
     expect(h.spawns).toEqual([]);
   });
@@ -2252,6 +2313,7 @@ describe('sweep duty registry (S2-PR2)', () => {
     });
 
     await _sweepOnceForTesting();
+    await _settlePostKillForTesting();
 
     expect(error).toHaveBeenCalledWith(
       'Host sweep duty failed',

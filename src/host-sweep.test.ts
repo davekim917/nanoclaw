@@ -31,7 +31,11 @@ import {
 // container-health family in S2-PR10; its test-only entry point moved with the
 // body. These SLA cases are mailbox seam PR 5b's and B1's, and they still drive
 // the same duty through the same registry.
-import { _enforceRunningContainerSlaForTesting } from './modules/sweep-container-health/index.js';
+import {
+  _enforceRunningContainerSlaForTesting,
+  _resetPostKillForTesting,
+  _settlePostKillForTesting,
+} from './modules/sweep-container-health/index.js';
 // T19 (the usage rollup) moved to the sweep-usage family in S2-PR12, and the
 // module exports its body directly. The two cases below are mailbox seam
 // PR 6's (Codex P2, the hot-journal durability options): they exercise the
@@ -547,7 +551,15 @@ describe('sweepSession on a session with no mailbox', () => {
     db.prepare(`INSERT INTO agent_groups (id, name, folder, created_at) VALUES ('ag-sla', 'sla', 'sla', ?)`).run(
       new Date().toISOString(),
     );
-    mockKillContainer.mockReset();
+    // Production's shape, which the old bare mock did not model: the kill only
+    // REQUESTS the stop, and the post-kill chain runs from the container's own
+    // `close` — so invoke `onExit` rather than letting the chain vanish.
+    // `isContainerRunning` stays under each case's control, which is how they
+    // express "a replacement took the session" versus "it stayed dead".
+    _resetPostKillForTesting();
+    mockKillContainer.mockReset().mockImplementation((_id: string, _reason: string, onExit?: () => void) => {
+      onExit?.();
+    });
     // Live all the way through: the container is alive so the SLA runs, and it
     // is STILL alive after the kill because a wake replaced it in the gap.
     mockIsContainerRunning.mockReset().mockReturnValue(true);
@@ -556,8 +568,12 @@ describe('sweepSession on a session with no mailbox', () => {
     const f = slaFixture('sess-sla-ceiling', ABSOLUTE_CEILING_MS + 60_000, 10_000);
     const before = f.claims();
     await _enforceRunningContainerSlaForTesting(f.run, f.session, 'ag-sla', 'sla');
+    await _settlePostKillForTesting();
 
-    expect(mockKillContainer).toHaveBeenCalledWith('sess-sla-ceiling', 'absolute-ceiling');
+    // `killContainer` now takes an `onExit` third argument (Codex final), which is
+    // a function when a container was there to kill and `undefined` when it had
+    // already gone. The identity assertion is the first two arguments.
+    expect(mockKillContainer.mock.calls[0]?.slice(0, 2)).toEqual(['sess-sla-ceiling', 'absolute-ceiling']);
     // Claim intact and no restart notice written: both writes were skipped.
     expect(f.claims()).toBe(before);
     closeDb();
@@ -569,7 +585,15 @@ describe('sweepSession on a session with no mailbox', () => {
     db.prepare(`INSERT INTO agent_groups (id, name, folder, created_at) VALUES ('ag-sla', 'sla', 'sla', ?)`).run(
       new Date().toISOString(),
     );
-    mockKillContainer.mockReset();
+    // Production's shape, which the old bare mock did not model: the kill only
+    // REQUESTS the stop, and the post-kill chain runs from the container's own
+    // `close` — so invoke `onExit` rather than letting the chain vanish.
+    // `isContainerRunning` stays under each case's control, which is how they
+    // express "a replacement took the session" versus "it stayed dead".
+    _resetPostKillForTesting();
+    mockKillContainer.mockReset().mockImplementation((_id: string, _reason: string, onExit?: () => void) => {
+      onExit?.();
+    });
     mockIsContainerRunning.mockReset().mockReturnValue(true);
     mockReadContainerConfig.mockReset().mockReturnValue({ provider: 'claude' });
 
@@ -598,6 +622,7 @@ describe('sweepSession on a session with no mailbox', () => {
     plant.close();
 
     await _enforceRunningContainerSlaForTesting(f.run, f.session, 'ag-sla', 'sla');
+    await _settlePostKillForTesting();
 
     // The accountability row is inbound, so no single-writer hazard — but it is
     // `on_wake = 1`, which the live replacement never consumes. Writing it here
@@ -623,7 +648,15 @@ describe('sweepSession on a session with no mailbox', () => {
     db.prepare(`INSERT INTO agent_groups (id, name, folder, created_at) VALUES ('ag-sla', 'sla', 'sla', ?)`).run(
       new Date().toISOString(),
     );
-    mockKillContainer.mockReset();
+    // Production's shape, which the old bare mock did not model: the kill only
+    // REQUESTS the stop, and the post-kill chain runs from the container's own
+    // `close` — so invoke `onExit` rather than letting the chain vanish.
+    // `isContainerRunning` stays under each case's control, which is how they
+    // express "a replacement took the session" versus "it stayed dead".
+    _resetPostKillForTesting();
+    mockKillContainer.mockReset().mockImplementation((_id: string, _reason: string, onExit?: () => void) => {
+      onExit?.();
+    });
     mockIsContainerRunning.mockReset().mockReturnValue(true);
     mockReadContainerConfig.mockReset().mockReturnValue({ provider: 'claude' });
 
@@ -631,10 +664,130 @@ describe('sweepSession on a session with no mailbox', () => {
     const f = slaFixture('sess-sla-claim', 10 * 60_000, 5 * 60_000);
     const before = f.claims();
     await _enforceRunningContainerSlaForTesting(f.run, f.session, 'ag-sla', 'sla');
+    await _settlePostKillForTesting();
 
-    expect(mockKillContainer).toHaveBeenCalledWith('sess-sla-claim', 'claim-stuck');
+    // `killContainer` now takes an `onExit` third argument (Codex final), which is
+    // a function when a container was there to kill and `undefined` when it had
+    // already gone. The identity assertion is the first two arguments.
+    expect(mockKillContainer.mock.calls[0]?.slice(0, 2)).toEqual(['sess-sla-claim', 'claim-stuck']);
     expect(f.claims()).toBe(before);
     closeDb();
+  });
+
+  // Shared by the post-kill cases below. Pure file readers — no dependency on
+  // which central DB is installed, so they are safe at describe scope.
+  const sessionDir = (session: Session): string =>
+    path.join(testDataDir.dir, 'v2-sessions', session.agent_group_id, session.id);
+  // A live continuation is what makes S10 (the accountability wake) write at
+  // all — without one `decideCeilingFollowUp` returns 'none' and the S10 half
+  // of the assertion would pass for the wrong reason.
+  const plantContinuation = (session: Session): void => {
+    const out = new Database(path.join(sessionDir(session), 'outbound.db'));
+    out
+      .prepare(
+        `INSERT INTO session_state (key, value, updated_at) VALUES ('work_continuation', ?, ?)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`,
+      )
+      .run(
+        JSON.stringify({
+          id: 'cont-followups',
+          task: 'finish the migration',
+          phase: 'running',
+          chain: 0,
+          runner_id: 'runner-old',
+          resume_attempts: 0,
+          recovery_episode: 0,
+        }),
+        new Date().toISOString(),
+      );
+    out.close();
+  };
+  const respawnWakes = (session: Session): number => {
+    const inbound = new Database(path.join(sessionDir(session), 'inbound.db'));
+    const n = (
+      inbound.prepare("SELECT COUNT(*) AS c FROM messages_in WHERE id LIKE 'ceiling-respawn-%'").get() as {
+        c: number;
+      }
+    ).c;
+    inbound.close();
+    return n;
+  };
+
+  // ── Codex final, HIGH ─────────────────────────────────────────────────────
+  //
+  // `killContainer` only REQUESTS the stop: it calls `stopContainer` and
+  // returns, and `activeContainers` is cleared by the spawn path's own `close`
+  // handler when the child actually goes. Running the follow-up chain on the
+  // next line therefore raced the exit — `containerOwnsOutbound` was still
+  // true, the early-out fired, and the ceiling notice, the orphan-claim reset
+  // and the accountability wake were skipped with nothing to retry them. The
+  // chain now hangs off `onExit`, which fires after that finalizer.
+  //
+  // The fixture is the point: ownership stays TRUE after `killContainer`
+  // returns and flips false only when `onExit` runs, which is production's
+  // ordering and the one the old mocks did not have.
+  it('the post-kill chain runs after the container actually exits, not when the kill is requested', async () => {
+    const db = initTestDb();
+    runMigrations(db);
+    db.prepare(`INSERT INTO agent_groups (id, name, folder, created_at) VALUES ('ag-sla', 'sla', 'sla', ?)`).run(
+      new Date().toISOString(),
+    );
+    _resetPostKillForTesting();
+    mockIsContainerRunning.mockReset().mockReturnValue(true);
+    mockReadContainerConfig.mockReset().mockReturnValue({ provider: 'claude' });
+
+    let exit: (() => void) | undefined;
+    mockKillContainer.mockReset().mockImplementation((_id: string, _reason: string, onExit?: () => void) => {
+      // Requested, not done: the container still owns outbound.db here.
+      exit = onExit;
+    });
+
+    const f = slaFixture('sess-postkill-onexit', ABSOLUTE_CEILING_MS + 60_000, 10_000);
+    plantContinuation(f.session);
+    const before = f.claims();
+    await _enforceRunningContainerSlaForTesting(f.run, f.session, 'ag-sla', 'sla');
+
+    // Nothing yet — and this is exactly where the old code ran the chain.
+    await _settlePostKillForTesting();
+    expect(f.claims(), 'the chain ran while the container still owned outbound.db').toBe(before);
+    expect(respawnWakes(f.session)).toBe(0);
+
+    // The child closes: ownership drops, then `onExit` fires.
+    expect(exit, 'no onExit was registered, so the chain could never run').toBeDefined();
+    mockIsContainerRunning.mockReturnValue(false);
+    exit!();
+    await _settlePostKillForTesting();
+
+    expect(f.claims(), 'S17 did not reset the orphan claim').toBe(0);
+    expect(respawnWakes(f.session), 'S10 did not queue the accountability wake').toBe(1);
+  });
+
+  it('a replacement container that takes the session before the exit still refuses the chain', async () => {
+    const db = initTestDb();
+    runMigrations(db);
+    db.prepare(`INSERT INTO agent_groups (id, name, folder, created_at) VALUES ('ag-sla', 'sla', 'sla', ?)`).run(
+      new Date().toISOString(),
+    );
+    _resetPostKillForTesting();
+    mockIsContainerRunning.mockReset().mockReturnValue(true);
+    mockReadContainerConfig.mockReset().mockReturnValue({ provider: 'claude' });
+
+    let exit: (() => void) | undefined;
+    mockKillContainer.mockReset().mockImplementation((_id: string, _reason: string, onExit?: () => void) => {
+      exit = onExit;
+    });
+
+    const f = slaFixture('sess-postkill-replaced', ABSOLUTE_CEILING_MS + 60_000, 10_000);
+    plantContinuation(f.session);
+    const before = f.claims();
+    await _enforceRunningContainerSlaForTesting(f.run, f.session, 'ag-sla', 'sla');
+
+    // The old container goes, a fresh one is already up: ownership never drops.
+    exit!();
+    await _settlePostKillForTesting();
+
+    expect(f.claims(), 'the fresh runner lost its claim').toBe(before);
+    expect(respawnWakes(f.session), 'a stale accountability wake greeted the replacement').toBe(0);
   });
 
   // Codex round 9, on the seam-2 duty registry. Upstream guards the post-kill
@@ -655,58 +808,41 @@ describe('sweepSession on a session with no mailbox', () => {
     );
     mockReadContainerConfig.mockReset().mockReturnValue({ provider: 'claude' });
 
-    const sessionDir = (session: Session): string =>
-      path.join(testDataDir.dir, 'v2-sessions', session.agent_group_id, session.id);
-    // A live continuation is what makes S10 (the accountability wake) write at
-    // all — without one `decideCeilingFollowUp` returns 'none' and the S10 half
-    // of the assertion would pass for the wrong reason.
-    const plantContinuation = (session: Session): void => {
-      const out = new Database(path.join(sessionDir(session), 'outbound.db'));
-      out
-        .prepare(
-          `INSERT INTO session_state (key, value, updated_at) VALUES ('work_continuation', ?, ?)
-           ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`,
-        )
-        .run(
-          JSON.stringify({
-            id: 'cont-followups',
-            task: 'finish the migration',
-            phase: 'running',
-            chain: 0,
-            runner_id: 'runner-old',
-            resume_attempts: 0,
-            recovery_episode: 0,
-          }),
-          new Date().toISOString(),
-        );
-      out.close();
-    };
-    const respawnWakes = (session: Session): number => {
-      const inbound = new Database(path.join(sessionDir(session), 'inbound.db'));
-      const n = (
-        inbound.prepare("SELECT COUNT(*) AS c FROM messages_in WHERE id LIKE 'ceiling-respawn-%'").get() as {
-          c: number;
-        }
-      ).c;
-      inbound.close();
-      return n;
-    };
-
     // Control: ownership never flips, so every follow-up writes.
-    mockKillContainer.mockReset();
+    // Production's shape, which the old bare mock did not model: the kill only
+    // REQUESTS the stop, and the post-kill chain runs from the container's own
+    // `close` — so invoke `onExit` rather than letting the chain vanish.
+    // `isContainerRunning` stays under each case's control, which is how they
+    // express "a replacement took the session" versus "it stayed dead".
+    _resetPostKillForTesting();
+    mockKillContainer.mockReset().mockImplementation((_id: string, _reason: string, onExit?: () => void) => {
+      onExit?.();
+    });
     mockIsContainerRunning.mockReset().mockReturnValue(false);
     const control = slaFixture('sess-followups-control', ABSOLUTE_CEILING_MS + 60_000, 10_000);
     plantContinuation(control.session);
     await _enforceRunningContainerSlaForTesting(control.run, control.session, 'ag-sla', 'sla');
+    await _settlePostKillForTesting();
 
-    expect(mockKillContainer).toHaveBeenCalledWith('sess-followups-control', 'absolute-ceiling');
+    // `killContainer` now takes an `onExit` third argument (Codex final), which is
+    // a function when a container was there to kill and `undefined` when it had
+    // already gone. The identity assertion is the first two arguments.
+    expect(mockKillContainer.mock.calls[0]?.slice(0, 2)).toEqual(['sess-followups-control', 'absolute-ceiling']);
     expect(control.claims()).toBe(0); // S17 cleared the orphan claim
     expect(respawnWakes(control.session)).toBe(1); // S10 queued the accountability wake
 
     // Guarded: a wake takes the session between S15 (order 10) and S17 (order
     // 20) — registered as a follow-up at order 15, which is exactly the yield
     // boundary the loop's `await` creates.
-    mockKillContainer.mockReset();
+    // Production's shape, which the old bare mock did not model: the kill only
+    // REQUESTS the stop, and the post-kill chain runs from the container's own
+    // `close` — so invoke `onExit` rather than letting the chain vanish.
+    // `isContainerRunning` stays under each case's control, which is how they
+    // express "a replacement took the session" versus "it stayed dead".
+    _resetPostKillForTesting();
+    mockKillContainer.mockReset().mockImplementation((_id: string, _reason: string, onExit?: () => void) => {
+      onExit?.();
+    });
     mockIsContainerRunning.mockReset().mockReturnValue(false);
     registerSweepKillFollowUp({
       name: 'test:wake-between-post-kill-follow-ups',
@@ -720,8 +856,12 @@ describe('sweepSession on a session with no mailbox', () => {
       plantContinuation(guarded.session);
       const claimsBefore = guarded.claims();
       await _enforceRunningContainerSlaForTesting(guarded.run, guarded.session, 'ag-sla', 'sla');
+      await _settlePostKillForTesting();
 
-      expect(mockKillContainer).toHaveBeenCalledWith('sess-followups-guarded', 'absolute-ceiling');
+      // `killContainer` now takes an `onExit` third argument (Codex final), which is
+      // a function when a container was there to kill and `undefined` when it had
+      // already gone. The identity assertion is the first two arguments.
+      expect(mockKillContainer.mock.calls[0]?.slice(0, 2)).toEqual(['sess-followups-guarded', 'absolute-ceiling']);
       // Both later follow-ups skipped: the fresh runner keeps its claim and no
       // stale accountability wake was queued against its recovery cap.
       expect(guarded.claims()).toBe(claimsBefore);
