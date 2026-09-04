@@ -39,7 +39,6 @@ import {
   registerSweepKillFollowUp,
   _incrementStoppedContinuationAttemptForTesting,
   _sweepSessionForTesting,
-  _sweepUsageRollupForTesting,
   canAttemptContinuationRecovery,
   countToolRecoveryAttemptsSinceRealInbound,
   decideCeilingFollowUp,
@@ -60,6 +59,15 @@ import {
 // body. These SLA cases are mailbox seam PR 5b's and B1's, and they still drive
 // the same duty through the same registry.
 import { _enforceRunningContainerSlaForTesting } from './modules/sweep-container-health/index.js';
+// T19 (the usage rollup) moved to the sweep-usage family in S2-PR12, and the
+// module exports its body directly. The two cases below are mailbox seam
+// PR 6's (Codex P2, the hot-journal durability options): they exercise the
+// REAL read funnel against real SQLite files and create a genuine hot journal
+// with a killed child process, neither of which the family's own suite can do
+// — it mocks `readSessionOutbound` and arms a `child_process` tripwire. So the
+// cases stay on this file's fixture and reach across for the moved body, the
+// same way the SLA cases above do.
+import { sweepUsageRollup as _sweepUsageRollupForTesting } from './modules/sweep-usage/index.js';
 import { getDb } from './db/connection.js';
 import type { Session } from './types.js';
 
