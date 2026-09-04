@@ -530,7 +530,7 @@ describe('acquireStorageActivityLease is observable and bounded', () => {
 });
 
 describe('the marker mkdir itself loses the release race', () => {
-  // The incident (2026-09-04, sess-1788440696563-ae2rvy). The retry above only
+  // The incident (2026-09-04, the stranded session). The retry above only
   // ever covered writeFile, because the mkdir sat OUTSIDE the try. But a
   // recursive mkdir is not one atomic syscall — Node walks the path — so a
   // releasing holder's rmdir of the same leaf can surface as ENOENT out of the

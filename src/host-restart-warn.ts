@@ -125,7 +125,6 @@ function heartbeatMtimeMs(session: Session): number | null {
   return mtimeMs <= Date.now() + HEARTBEAT_MAX_SKEW_MS ? mtimeMs : null;
 }
 
-
 function hasRecentRestartNote(mailbox: NanoclawMailboxSession, now: number): boolean {
   return mailbox.hasRestartNoteSince(new Date(now - RESTART_NOTE_DEDUPE_MS).toISOString());
 }
@@ -164,7 +163,7 @@ export function warnSessionIfWorkInFlight(
   // autonomous turn has NO processing claim after its first few seconds, and
   // between two tool calls it has no `current_tool` either. All three of the
   // signals above are absent while the agent is demonstrably mid-turn, which
-  // is exactly the state sess-1788440696563-ae2rvy was in: status edits until
+  // is exactly the state the stranded session was in: status edits until
   // 11:02:52Z, heartbeat 11:02:51Z, container SIGTERMed at 11:02:56Z, its
   // newest trigger row four minutes old — and no note, while two sibling
   // sessions got one.
@@ -195,8 +194,7 @@ export function warnSessionIfWorkInFlight(
   // negative age. See HEARTBEAT_MAX_SKEW_MS.
   const heartbeatAgeMs = heartbeatMs === null ? null : Math.max(0, now - heartbeatMs);
   const providerIdle = state?.provider_executing === 0;
-  const freshHeartbeat =
-    !providerIdle && heartbeatAgeMs !== null && heartbeatAgeMs <= RESTART_WARN_HEARTBEAT_FRESH_MS;
+  const freshHeartbeat = !providerIdle && heartbeatAgeMs !== null && heartbeatAgeMs <= RESTART_WARN_HEARTBEAT_FRESH_MS;
   // A turn that is executing RIGHT NOW needs no heartbeat corroboration, but
   // only when we know the container is alive — which is exactly the
   // graceful-shutdown path, where this runs against the live registry before

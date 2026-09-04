@@ -157,7 +157,7 @@ function delay(ms: number): Promise<void> {
  * caller. On the inbound path that caller is `writeSessionMessage`, and the
  * throw aborted the route BEFORE the row was written — an accepted platform
  * message dropped on the floor. This is what stranded
- * sess-1788440696563-ae2rvy on 2026-09-04.
+ * the stranded session on 2026-09-04.
  *
  * A retry is only ever losing a race with a rmdir that has already been
  * issued, so a small bound is enough; three attempts covers a burst of

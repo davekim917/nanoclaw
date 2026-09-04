@@ -305,7 +305,7 @@ describe('warnSessionIfWorkInFlight', () => {
 
 describe('a long autonomous turn interrupted by a restart', () => {
   /**
-   * The 2026-09-04 incident, reproduced exactly. sess-1788440696563-ae2rvy was
+   * The 2026-09-04 incident, reproduced exactly. the stranded session was
    * four minutes into one open query when the host went down:
    *
    *   - its triggering row was claimed and then marked `completed` seconds
@@ -351,11 +351,14 @@ describe('a long autonomous turn interrupted by a restart', () => {
     touchHeartbeat(session, 5_000);
 
     expect(warnSessionIfWorkInFlight(mailboxOver(inDb, outDb), session, 'graceful host shutdown')).toBe(true);
-    const pair = inDb.prepare('SELECT id, trigger, on_wake FROM messages_in WHERE id != ? ORDER BY seq').all(
-      'm-trigger',
-    ) as Array<{ id: string; trigger: number; on_wake: number }>;
+    const pair = inDb
+      .prepare('SELECT id, trigger, on_wake FROM messages_in WHERE id != ? ORDER BY seq')
+      .all('m-trigger') as Array<{ id: string; trigger: number; on_wake: number }>;
     expect(pair).toHaveLength(2);
-    expect(pair.map((row) => row.on_wake), 'the note must be on_wake so the NEXT container sees it').toEqual([1, 1]);
+    expect(
+      pair.map((row) => row.on_wake),
+      'the note must be on_wake so the NEXT container sees it',
+    ).toEqual([1, 1]);
     expect(noteRows(inDb)).toHaveLength(1);
   });
 
