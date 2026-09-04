@@ -11,9 +11,9 @@ import os from 'os';
 import path from 'path';
 
 import Database from 'better-sqlite3';
-import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
-import { countDueMessages, type ContainerState } from './modules/mailbox/ops/sweep.js';
+import { countDueMessages } from './modules/mailbox/ops/sweep.js';
 import { composeNanoclawSession, type NanoclawMailboxSession } from './modules/mailbox/index.js';
 import { getAgentMailbox } from './mailbox/index.js';
 import { withExistingMailboxSession } from './session-manager.js';
