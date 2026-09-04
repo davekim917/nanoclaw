@@ -5,7 +5,8 @@
 #   codex-review.sh body <comment_id>         # full comment body for one finding
 #   codex-review.sh churn                     # findings by file AND by class across rounds — the churn detector
 #   codex-review.sh classes [--json]          # the class table alone (invariant signature @ seam)
-#   codex-review.sh gate [--committed-only]   # REFRAME gate: exit 3 when a class has run 3 rounds unfixed
+#   codex-review.sh gate [--committed-only] [--head <sha>]
+#                                             # REFRAME gate: exit 3 when a class has run 3 rounds unfixed
 #   codex-review.sh push [git push args…]     # gate, then push — the loop's only push path
 #   codex-review.sh reply <comment_id> <text> # reply on that thread
 #   codex-review.sh resolve <thread_id>       # mark the thread resolved
@@ -29,6 +30,15 @@
 set -euo pipefail
 
 REPO="${REPO:-$(gh repo view --json nameWithOwner -q .nameWithOwner)}"
+# BRANCH resolves the PR from a named ref instead of the checkout. A caller that
+# has pinned which branch it is about to push must get a verdict about THAT
+# branch — `gh pr view` follows whatever is checked out at the moment it runs,
+# which a sibling sharing the worktree can change underneath it. No open PR for
+# the branch exits non-zero, which callers read as "no verdict", never as pass.
+if [ -z "${PR:-}" ] && [ -n "${BRANCH:-}" ]; then
+  PR=$(gh pr list --repo "$REPO" --head "$BRANCH" --state open --json number -q '.[0].number')
+  [ -n "$PR" ] || { echo "no open PR for branch $BRANCH" >&2; exit 1; }
+fi
 PR="${PR:-$(gh pr view --json number -q .number)}"
 OWNER="${REPO%/*}"
 NAME="${REPO#*/}"

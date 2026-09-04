@@ -857,6 +857,58 @@ describe('review-churn gate', () => {
     expect(gate(vague).decision.unlifted).toHaveLength(2);
   });
 
+  it('reads the history of the commit it is given, not of whatever HEAD points at', () => {
+    // A caller that has pinned which commit it is about to push passes --head.
+    // Without it the verdict is about the checkout, which a sibling can move:
+    // their newer commit at the primitive would lift a gate for a push that
+    // leaves it behind.
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'review-churn-head-'));
+    const git = (...args: string[]) => {
+      const res = spawnSync('git', args, {
+        cwd: root,
+        encoding: 'utf8',
+        env: {
+          ...process.env,
+          GIT_AUTHOR_DATE: '2026-09-01T16:00:00Z',
+          GIT_COMMITTER_DATE: '2026-09-01T16:00:00Z',
+          GIT_AUTHOR_NAME: 'test',
+          GIT_AUTHOR_EMAIL: 'test@example.com',
+          GIT_COMMITTER_NAME: 'test',
+          GIT_COMMITTER_EMAIL: 'test@example.com',
+        },
+      });
+      if (res.status !== 0) throw new Error(`git ${args.join(' ')}: ${res.stderr}`);
+      return res.stdout.trim();
+    };
+    try {
+      git('init', '-q', '-b', 'main');
+      fs.writeFileSync(path.join(root, 'unrelated.txt'), 'base\n');
+      git('add', '-A');
+      git('commit', '-qm', 'base');
+      const pinned = git('rev-parse', 'HEAD');
+
+      // The reframe lands only on a side branch — reachable from that commit,
+      // not from the one the caller pinned.
+      git('checkout', '-q', '-b', 'sibling');
+      fs.mkdirSync(path.join(root, 'src/mailbox'), { recursive: true });
+      fs.writeFileSync(path.join(root, 'src/mailbox/write.ts'), 'export function writeSessionMessage() {}\n');
+      git('add', '-A');
+      git('commit', '-qm', 'fix(mailbox): guard the write');
+      const sibling = git('rev-parse', 'HEAD');
+
+      const payload = fixture('toctou-class');
+      payload.repoRoot = root;
+      // HEAD is the sibling's branch, so an unpinned gate lifts on their work.
+      expect(spawn(['gate', '--json', '--committed-only'], payload).status).toBe(0);
+      // Pinned to what the push would send, the reframe is not there.
+      expect(spawn(['gate', '--json', '--committed-only', '--head', pinned], payload).status).toBe(3);
+      // Pinned to the commit that does carry it, it lifts.
+      expect(spawn(['gate', '--json', '--committed-only', '--head', sibling], payload).status).toBe(0);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it('reads the file either side of a real commit to judge a reframe trailer', () => {
     // The payload can supply both images, so the tests above are hermetic; this
     // one exercises the `git show` path they stand in for, including the rename
@@ -999,6 +1051,8 @@ describe('skill wiring', () => {
     expect(helper).toMatch(
       /push\)\n[\s\S]*?run_gate --committed-only\n\s+shift\n\s+git push "\$@"\n\s+if \[ -n "\$GATE_OVERRIDE_LINE" \]; then\n\s+record_site_patch_override/,
     );
+    // A named BRANCH resolves the PR, never the mutable checkout.
+    expect(helper).toMatch(/BRANCH:-\}" \]; then\n\s+PR=\$\(gh pr list --repo "\$REPO" --head "\$BRANCH"/);
     // Evaluating the gate writes nothing at all.
     const gateBranch = helper.slice(helper.indexOf('  gate)'), helper.indexOf('  push)'));
     expect(gateBranch).not.toContain('record_site_patch_override');

@@ -261,11 +261,15 @@ describe('topic-linked worktree topology', () => {
     const branch = git(worktree, ['branch', '--show-current']);
 
     const gateScript = join(root, 'refusing-gate.sh');
-    // Exits 3 only when invoked with --committed-only, so this also proves the
-    // push gate judges committed history rather than the working tree.
+    // Exits 3 only when it is handed the pinned identity: --committed-only
+    // (a push sends commits, not the working tree), --head <sha> and BRANCH.
+    // So this also proves the gate is asked about what the push will send.
     writeFileSync(
       gateScript,
-      '#!/usr/bin/env bash\ncase "$*" in *--committed-only*) ;; *) exit 0 ;; esac\n' +
+      '#!/usr/bin/env bash\n' +
+        'case "$*" in *--committed-only*) ;; *) exit 0 ;; esac\n' +
+        `case "$*" in *--head\\ ${'$'}(git rev-parse HEAD)*) ;; *) exit 0 ;; esac\n` +
+        'test -n "$BRANCH" || exit 0\n' +
         'echo "REFRAME REQUIRED: inv:race @ src/mailbox/write.ts" >&2\nexit 3\n',
     );
     chmodSync(gateScript, 0o755);

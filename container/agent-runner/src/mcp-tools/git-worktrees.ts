@@ -595,16 +595,18 @@ export const gitPushTool: McpToolDefinition = {
       // sibling topic on this repo. Same-topic siblings share this worktree,
       // so the checkout can change underneath the verdict — a commit, a
       // rewrite, a checkout of another branch at the same commit. Rather than
-      // detect each of those, the push NAMES what was judged: the branch and
-      // commit are captured before the gate runs and pushed as an explicit
-      // refspec, so what reaches the remote is what the gate looked at, or
-      // nothing. Work a sibling adds in the window is simply not pushed here;
-      // it gets its own verdict on its own push.
+      // detect each of those, the branch and commit are captured once, up
+      // front, and everything downstream NAMES them: the gate is asked about
+      // that branch and that commit, and the push sends them as an explicit
+      // refspec. Nothing downstream reads the checkout again, so what reaches
+      // the remote is what the gate looked at, or nothing. Work a sibling adds
+      // in the window is simply not pushed here; it gets its own verdict on
+      // its own push.
       const branch = runGitAt(worktree, ['branch', '--show-current']);
       if (!branch) return err('Cannot push a detached HEAD; create or switch to a branch explicitly');
       const head = runGitAt(worktree, ['rev-parse', 'HEAD']);
 
-      const gate = evaluateReviewChurnGate({ worktree });
+      const gate = evaluateReviewChurnGate({ worktree, branch, head });
       if (gate.status === 'refused') return err(gate.message);
 
       return await withRepositoryLock(resolved.context, async () => {

@@ -39,6 +39,12 @@
  * run in front of a PUSH must not, because a push sends committed history and
  * an edit sitting in the working tree is not a reframe that reaches the PR.
  *
+ * `--head <sha>` reads the history of THAT commit instead of whatever the
+ * checkout points at now. A caller that has pinned which commit it is about to
+ * push passes it, so the verdict cannot be about a revision the push will not
+ * send — a sibling's newer commit at the primitive must not lift a gate for a
+ * push that leaves it behind.
+ *
  * Payload (stdin, JSON):
  *   {
  *     "findings": [ { threadId, commentId, reviewId, path, line, body,
@@ -1039,7 +1045,7 @@ function git(repoRoot, args) {
 const RECORD_SEP = '\x1e';
 const FIELD_SEP = '\x1f';
 
-function gitContext(payload) {
+function gitContext(payload, head) {
   const root = payload.repoRoot;
   if (!root) return payload;
   const out = { ...payload };
@@ -1055,6 +1061,7 @@ function gitContext(payload) {
     const raw = git(root, [
       'log',
       ...window,
+      ...(head ? [head] : []),
       `--format=${RECORD_SEP}%H${FIELD_SEP}%cI${FIELD_SEP}%B${FIELD_SEP}`,
       '--name-only',
     ]);
@@ -1112,7 +1119,9 @@ export async function main(argv) {
     process.stdout.write(json ? `${JSON.stringify(report, null, 2)}\n` : `${renderClasses(report)}\n`);
     return 0;
   }
-  const context = gitContext(payload);
+  const headFlag = argv.indexOf('--head');
+  const head = headFlag >= 0 ? argv[headFlag + 1] : undefined;
+  const context = gitContext(payload, head);
   if (argv.includes('--committed-only')) context.worktree = [];
   const decision = decideGate(context, {
     allowSitePatch: argv.includes('--allow-site-patch') ? true : undefined,

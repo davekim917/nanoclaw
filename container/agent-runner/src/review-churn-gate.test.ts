@@ -10,9 +10,9 @@ import { tmpdir } from 'os';
 import { join } from 'path';
 
 import {
-  CHURN_GATE_ARGS,
   CHURN_GATE_SCRIPT_ENV,
   CHURN_GATE_SCRIPT_PATHS,
+  churnGateArgs,
   evaluateReviewChurnGate,
   type ChurnGateRun,
 } from './review-churn-gate.js';
@@ -28,11 +28,17 @@ const REFRAME_TEXT = [
 
 function stub(
   result: Partial<ChurnGateRun>,
-): (script: string, args: string[], worktree: string, timeoutMs: number) => ChurnGateRun {
+): (script: string, args: string[], worktree: string, timeoutMs: number, env: NodeJS.ProcessEnv) => ChurnGateRun {
   return () => ({ status: 0, stdout: '', stderr: '', ...result });
 }
 
-const present = { exists: () => true, scriptPaths: ['/skill/codex-review.sh'], worktree: '/w' };
+const present = {
+  exists: () => true,
+  scriptPaths: ['/skill/codex-review.sh'],
+  worktree: '/w',
+  branch: 'topic/thing',
+  head: 'abc1234def',
+};
 
 describe('review churn gate at git_push', () => {
   test('refuses the push on the gate exit status, carrying its decision', () => {
@@ -52,8 +58,24 @@ describe('review churn gate at git_push', () => {
   });
 
   test('fails open when the skill is not mounted', () => {
-    const result = evaluateReviewChurnGate({ worktree: '/w', exists: () => false });
+    const result = evaluateReviewChurnGate({ ...present, exists: () => false });
     expect(result.status).toBe('skipped');
+  });
+
+  test('names the script it actually selected in the refusal', () => {
+    // The refusal tells the agent how to take the recorded override. Printing
+    // the first hard-coded path when the /app fallback or an override was used
+    // hands them a command that just fails.
+    const fallback = evaluateReviewChurnGate({
+      ...present,
+      scriptPaths: CHURN_GATE_SCRIPT_PATHS,
+      exists: (p) => p === CHURN_GATE_SCRIPT_PATHS[1],
+      run: stub({ status: 3, stderr: REFRAME_TEXT }),
+    });
+    expect(fallback.status).toBe('refused');
+    if (fallback.status !== 'refused') return;
+    expect(fallback.message).toContain(`REVIEW_LOOP_ALLOW_SITE_PATCH=1 ${CHURN_GATE_SCRIPT_PATHS[1]} push`);
+    expect(fallback.message).not.toContain(CHURN_GATE_SCRIPT_PATHS[0]);
   });
 
   test('fails open when the branch has no PR, gh is unauthenticated, or bash errors', () => {
@@ -82,20 +104,25 @@ describe('review churn gate at git_push', () => {
     expect(threw.reason).toContain('no bash on PATH');
   });
 
-  test('judges only what the push will send', () => {
-    // A push carries committed history. Uncommitted work at the primitive is
-    // evidence for a pre-commit check, not for a push, so the gate is always
-    // invoked with --committed-only here.
-    expect(CHURN_GATE_ARGS).toEqual(['gate', '--committed-only']);
-    let seen: string[] = [];
+  test('asks about the identity the caller pinned, not the checkout', () => {
+    // A push carries committed history, and the caller has already decided
+    // which branch and commit it is sending. The gate is told both, so its
+    // verdict cannot describe a revision a sibling checked out meanwhile.
+    expect(churnGateArgs('abc1234def')).toEqual(['gate', '--committed-only', '--head', 'abc1234def']);
+    let seenArgs: string[] = [];
+    let seenEnv: NodeJS.ProcessEnv = {};
     evaluateReviewChurnGate({
       ...present,
-      run: (_script, args) => {
-        seen = args;
+      env: { PATH: '/usr/bin' },
+      run: (_script, args, _worktree, _timeout, env) => {
+        seenArgs = args;
+        seenEnv = env;
         return { status: 0, stdout: '', stderr: '' };
       },
     });
-    expect(seen).toEqual(['gate', '--committed-only']);
+    expect(seenArgs).toEqual(['gate', '--committed-only', '--head', 'abc1234def']);
+    expect(seenEnv.BRANCH).toBe('topic/thing');
+    expect(seenEnv.PATH).toBe('/usr/bin');
   });
 
   test('reads the mounted skill from both provider paths', () => {
@@ -107,7 +134,8 @@ describe('review churn gate at git_push', () => {
     ]);
     const seen: string[] = [];
     evaluateReviewChurnGate({
-      worktree: '/w',
+      ...present,
+      scriptPaths: undefined,
       exists: (p) => {
         seen.push(p);
         return false;
@@ -122,7 +150,12 @@ describe('review churn gate at git_push', () => {
       const script = join(root, 'codex-review.sh');
       writeFileSync(script, '#!/usr/bin/env bash\necho "REFRAME REQUIRED: inv:race @ seam" >&2\nexit 3\n');
       chmodSync(script, 0o755);
-      const result = evaluateReviewChurnGate({ worktree: root, env: { [CHURN_GATE_SCRIPT_ENV]: script } });
+      const result = evaluateReviewChurnGate({
+        ...present,
+        scriptPaths: undefined,
+        worktree: root,
+        env: { [CHURN_GATE_SCRIPT_ENV]: script },
+      });
       expect(result.status).toBe('refused');
       if (result.status !== 'refused') return;
       expect(result.message).toContain('inv:race @ seam');
@@ -130,7 +163,14 @@ describe('review churn gate at git_push', () => {
       const clean = join(root, 'clean.sh');
       writeFileSync(clean, '#!/usr/bin/env bash\nexit 0\n');
       chmodSync(clean, 0o755);
-      expect(evaluateReviewChurnGate({ worktree: root, env: { [CHURN_GATE_SCRIPT_ENV]: clean } }).status).toBe('pass');
+      expect(
+        evaluateReviewChurnGate({
+          ...present,
+          scriptPaths: undefined,
+          worktree: root,
+          env: { [CHURN_GATE_SCRIPT_ENV]: clean },
+        }).status,
+      ).toBe('pass');
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
