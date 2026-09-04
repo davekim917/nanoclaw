@@ -369,6 +369,12 @@ describe('parseMcpServerConfig', () => {
     expect(() => parseMcpServerConfig({ command: 'node', url: 'https://example.com/mcp' })).toThrow(
       /exactly one of command or url/,
     );
+    for (const secondary of ['', ' ', 1, null]) {
+      expect(() => parseMcpServerConfig({ command: 'node', url: secondary })).toThrow(/exactly one of command or url/);
+      expect(() => parseMcpServerConfig({ url: 'https://example.com/mcp', command: secondary })).toThrow(
+        /exactly one of command or url/,
+      );
+    }
     expect(() => parseMcpServerConfig({ url: 'https://example.com/mcp', args: ['x'] })).toThrow(
       /only valid with command/,
     );
@@ -382,6 +388,25 @@ describe('parseMcpServerConfig', () => {
     for (const host of ['localhost', '127.0.0.1', '[::1]', 'host.docker.internal']) {
       expect(parseMcpServerConfig({ url: `http://${host}:8080/mcp` })).toMatchObject({ type: 'http' });
     }
+  });
+
+  it('rejects placeholder credentials on URLs that bypass the OneCLI gateway', () => {
+    for (const scheme of ['https', 'http']) {
+      for (const host of ['localhost', '127.0.0.1', '[::1]', 'host.docker.internal']) {
+        expect(() =>
+          parseMcpServerConfig({
+            url: `${scheme}://${host}:8080/mcp`,
+            headers: { Authorization: 'Bearer onecli-managed' },
+          }),
+        ).toThrow(/placeholder headers are not allowed/);
+      }
+    }
+    expect(
+      parseMcpServerConfig({
+        url: 'http://localhost:8080/mcp',
+        headers: { 'Content-Type': 'application/json' },
+      }),
+    ).toMatchObject({ headers: { 'Content-Type': 'application/json' } });
   });
 
   it('rejects credentials in the URL and credential-shaped query keys, but keeps ordinary ones', () => {
