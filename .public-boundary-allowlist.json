@@ -1,14 +1,84 @@
 {
   "entries": [
     {
+      "path": ".claude/skills/slack-a2a-rooms/SKILL.md",
+      "value": "G0AAAAAAA",
+      "reason": "Upstream skill document's placeholder MPIM id in prose"
+    },
+    {
+      "path": ".claude/skills/slack-a2a-rooms/SKILL.md",
+      "value": "U0AAAAAAA",
+      "reason": "Upstream skill document's placeholder Slack user id in an example command"
+    },
+    {
+      "path": ".claude/skills/slack-agent-flow/src/modules/slack-agent-flow/orchestrate.test.ts",
+      "value": "U0OPERATOR",
+      "reason": "Upstream test fixture: the approver-chain operator"
+    },
+    {
+      "path": ".claude/skills/slack-agent-flow/src/modules/slack-agent-flow/orchestrate.test.ts",
+      "value": "U0ORIGINBOT",
+      "reason": "Upstream test fixture: the originating bot"
+    },
+    {
+      "path": ".claude/skills/slack-agent-flow/src/modules/slack-agent-flow/room-actions.test.ts",
+      "value": "U0ANDYBOT",
+      "reason": "Upstream test fixture: a named room participant bot"
+    },
+    {
+      "path": ".claude/skills/slack-agent-flow/src/modules/slack-agent-flow/room-actions.test.ts",
+      "value": "U0COLLEAGUE",
+      "reason": "Upstream test fixture: a human room member"
+    },
+    {
+      "path": ".claude/skills/slack-agent-flow/src/modules/slack-agent-flow/room-actions.test.ts",
+      "value": "U0DEVINBOT",
+      "reason": "Upstream test fixture: a named room participant bot"
+    },
+    {
+      "path": ".claude/skills/slack-agent-flow/src/modules/slack-agent-flow/room-actions.test.ts",
+      "value": "U0OPERATOR",
+      "reason": "Upstream test fixture: the approver-chain operator"
+    },
+    {
+      "path": ".claude/skills/slack-agent-flow/src/modules/slack-agent-flow/room-actions.test.ts",
+      "value": "U0PIXELBOT",
+      "reason": "Upstream test fixture: a named room participant bot"
+    },
+    {
+      "path": ".claude/skills/slack-agent-flow/src/modules/slack-agent-flow/room-canvas.test.ts",
+      "value": "C0BME4DL401",
+      "reason": "Upstream's own doc comment and its test: the worked example of the canvas-to-shadow-channel id derivation (F0BME4DL401 becomes C0BME4DL401). Public in nanocoai/nanoclaw since 5327a5bcc; identifies no operator, client or workspace of this install."
+    },
+    {
+      "path": ".claude/skills/slack-agent-flow/src/modules/slack-agent-flow/room-canvas.test.ts",
+      "value": "C0CANVAS1",
+      "reason": "Upstream test fixture: a canvas shadow-channel id"
+    },
+    {
+      "path": ".claude/skills/slack-agent-flow/src/modules/slack-agent-flow/room-canvas.test.ts",
+      "value": "U0CREATOR",
+      "reason": "Upstream test fixture: the canvas creator"
+    },
+    {
+      "path": ".claude/skills/slack-agent-flow/src/modules/slack-agent-flow/room-canvas.ts",
+      "value": "C0BME4DL401",
+      "reason": "Upstream's own doc comment and its test: the worked example of the canvas-to-shadow-channel id derivation (F0BME4DL401 becomes C0BME4DL401). Public in nanocoai/nanoclaw since 5327a5bcc; identifies no operator, client or workspace of this install."
+    },
+    {
+      "path": ".public-boundary-allowlist.json",
+      "value": "sunday",
+      "reason": "This file's own entry above for cron-format.ts serializes the same generic word literally, which the private-identifier scan also runs against this file"
+    },
+    {
       "path": "CODE_OF_CONDUCT.md",
       "value": "community@nanoclaw.dev",
       "reason": "Published project code of conduct contact"
     },
     {
-      "path": "README.md",
-      "value": "1470188214710046894",
-      "reason": "Published NanoClaw community Discord server identifier"
+      "path": "dashboard/src/lib/cron-format.ts",
+      "value": "sunday",
+      "reason": "Generic day-of-week word in the cron-to-English weekday table; coincidentally matches an unrelated install-private identifier in this install's registry"
     },
     {
       "path": "README_ja.md",
@@ -26,14 +96,9 @@
       "reason": "Published NanoClaw community Discord server identifier"
     },
     {
-      "path": "dashboard/src/lib/cron-format.ts",
-      "value": "sunday",
-      "reason": "Generic day-of-week word in the cron-to-English weekday table; coincidentally matches an unrelated install-private identifier in this install's registry"
-    },
-    {
-      "path": ".public-boundary-allowlist.json",
-      "value": "sunday",
-      "reason": "This file's own entry above for cron-format.ts serializes the same generic word literally, which the private-identifier scan also runs against this file"
+      "path": "README.md",
+      "value": "1470188214710046894",
+      "reason": "Published NanoClaw community Discord server identifier"
     }
   ]
 }
