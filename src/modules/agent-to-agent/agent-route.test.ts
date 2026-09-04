@@ -13,12 +13,26 @@ import { getDb } from '../../db/connection.js';
 import { SessionDbMissingError } from '../mailbox/index.js';
 import type { Session } from '../../types.js';
 
-vi.mock('../../container-runner.js', () => ({
-  wakeContainer: vi.fn().mockResolvedValue(undefined),
-  isContainerRunning: vi.fn().mockReturnValue(false),
-  getActiveContainerCount: vi.fn().mockReturnValue(0),
-  killContainer: vi.fn(),
-}));
+vi.mock('../../container-runner.js', async () => {
+  // Reads through this file's real `db/sessions`, so the guard answers what a
+  // case has actually set up.
+  const { getSession } = await import('../../db/sessions.js');
+  return {
+    wakeContainer: vi.fn().mockResolvedValue(undefined),
+    isContainerRunning: vi.fn().mockReturnValue(false),
+    getActiveContainerCount: vi.fn().mockReturnValue(0),
+    killContainer: vi.fn(),
+    // The real definition. The route hands its liveness proof to the wake path
+    // rather than proving it before the call; it only builds the guard here.
+    sessionStillActive: (sessionId: string) => () => {
+      const fresh = getSession(sessionId);
+      if (!fresh) return { ok: false, reason: 'session no longer exists' };
+      if (fresh.status !== 'active') return { ok: false, reason: `session is ${fresh.status}` };
+      if (fresh.archived_at != null) return { ok: false, reason: 'session is archived' };
+      return true;
+    },
+  };
+});
 
 vi.mock('../../config.js', async () => {
   const actual = await vi.importActual('../../config.js');

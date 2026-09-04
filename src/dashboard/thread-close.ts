@@ -118,31 +118,6 @@ export function syncDoneProposalMirror(sessionId: string, proposal: DoneProposal
   return proposal;
 }
 
-/** Read a session's proposal from its own outbound.db — exact, never the mirror. */
-async function readSessionProposal(agentGroupId: string, sessionId: string): Promise<DoneProposal | null> {
-  try {
-    // OUTBOUND-keyed. `propose_done` is a container-owned key in outbound.db
-    // and this read touches nothing else, so outbound.db's existence is the
-    // only question it may ask.
-    //
-    // Through the inbound-keyed funnel it asked the wrong one: a session whose
-    // inbound.db is gone while outbound.db remains never ran the action, so a
-    // standing proposal read as absent. That is not merely stricter — it costs
-    // the operator a second confirmation AND makes a fresh agent confirmation
-    // invisible, so the close waits out the forced-close window instead of
-    // completing when the agent answers.
-    //
-    // Existing-only either way: a read must never author the outbound.db the
-    // host is not allowed to create.
-    return (
-      (await withExistingNanoclawOutbound(agentGroupId, sessionId, (outbound) => outbound.readDoneProposal())) ?? null
-    );
-  } catch {
-    // Unreadable is absent here, as it was pre-seam.
-    return null;
-  }
-}
-
 /**
  * Every session's proposal, read SYNCHRONOUSLY, as of one instant.
  *
@@ -463,14 +438,12 @@ export async function requestThreadClose(
   // against the close. Both samples finish BEFORE the synchronous block, so
   // this adds no await between the membership read and the decision.
   //
-  // The cost is one extra outbound open per session on this thread, on an
-  // operator action that already opens them once.
-  // The fan-out is a CANDIDATE read and nothing more. It exists so a session
-  // whose outbound.db is slow to open does not stall the decision, and so the
-  // mirror stays warm; its values never decide anything, because each one
-  // resolves at its own moment and the earliest is stale by the time the last
-  // lands.
-  await Promise.all(visible.map((s) => readSessionProposal(s.agent_group_id, s.id)));
+  // Sampled over the set as it stood at entry, and sampled SYNCHRONOUSLY, so
+  // the reads and the decision below are one uninterrupted block. Membership is
+  // re-read after this and the decision is made on THAT set: a session present
+  // now but absent from the sample counts as not proposing, which can only
+  // raise the confirmation bar, never lower it.
+  const sampled = sampleProposalsSync(visible, readSessionProposalSync);
 
   // ── One synchronous decision. No await from here to the reservation. ──────
   //
@@ -492,15 +465,7 @@ export async function requestThreadClose(
     };
   }
 
-  // Sampled HERE, synchronously, over the fresh membership — after the last
-  // await and with nothing awaited between these reads and the decision they
-  // feed. This is the whole point of the restructure: the set that decides is
-  // read at one instant, not assembled from N moments.
-  const proposalsBySession = new Map(
-    [...sampleProposalsSync(freshVisible, readSessionProposalSync)].map(
-      ([sessionId, proposal]) => [sessionId, proposal !== null] as const,
-    ),
-  );
+  const proposalsBySession = new Map(freshVisible.map((s) => [s.id, sampled.get(s.id) != null] as const));
 
   const decision = decideClosure(freshVisible, proposalsBySession, confirmations, {
     userId: ctx.user.id,
@@ -955,15 +920,6 @@ async function advanceOneClosure(row: ThreadClosureRow, now: number, deps: Threa
     if (Number.isNaN(requestedAtMs)) {
       log.warn('thread-close: unparseable requested_at — finalizing', { threadId: row.thread_id });
     }
-    // A CANDIDATE pass, and only that. Its job is to warm the outbound opens
-    // and the proposal mirror; its values decide nothing, because each resolves
-    // at its own moment and the first is already history when the last lands.
-    // Sampling twice did not help — a second set assembled the same way is
-    // stale the same way, which is what the previous round got wrong.
-    if (!deps.readProposal) {
-      await Promise.all(live.map((s) => readSessionProposal(s.agent_group_id, s.id)));
-    }
-
     // THE DECISION SET, read synchronously, all of it, with nothing awaited
     // between these reads and `decideCloseFinalization` below.
     const proposalAtMs = [...sampleProposalsSync(live, deps.readProposal ?? readSessionProposalSync).values()].map(

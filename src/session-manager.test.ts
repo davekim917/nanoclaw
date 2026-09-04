@@ -2058,6 +2058,78 @@ describe('writeSessionMessage evaluates its caller guard at the insert', () => {
     content: JSON.stringify({ text: 'hello' }),
   });
 
+  /** Every file under the session's inbox tree, relative to it. */
+  function inboxFiles(): string[] {
+    const root = path.join(sessionDir(AG, GUARD_SESS), 'inbox');
+    if (!fs.existsSync(root)) return [];
+    const out: string[] = [];
+    const walk = (dir: string, prefix: string): void => {
+      for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+        const rel = prefix ? `${prefix}/${entry.name}` : entry.name;
+        if (entry.isDirectory()) walk(path.join(dir, entry.name), rel);
+        else out.push(rel);
+      }
+    };
+    walk(root, '');
+    return out.sort();
+  }
+
+  const withAttachment = (id: string) => ({
+    ...message(id),
+    content: JSON.stringify({
+      text: 'see attached',
+      attachments: [{ name: 'payload.txt', data: Buffer.from('secret-bytes').toString('base64') }],
+    }),
+  });
+
+  /**
+   * A guard already false must not let the BYTES land either.
+   *
+   * `extractAttachmentFiles` decodes inline base64 into the target session's
+   * mounted `inbox`, which its container reads — so extraction is a delivery in
+   * its own right, and it happens before the mailbox action where the guard
+   * first ran. A precondition already false on entry should write nothing at
+   * all.
+   */
+  it('writes no attachment bytes when the guard is already false on entry', async () => {
+    await expect(
+      writeSessionMessage(AG, GUARD_SESS, withAttachment('att-pre'), {
+        guard: () => ({ ok: false, reason: 'destination revoked' }),
+      }),
+    ).rejects.toThrow(SessionWriteRefusedError);
+
+    expect(inboxFiles()).toEqual([]);
+    expect(rowIds()).not.toContain('att-pre');
+  });
+
+  /**
+   * And bytes already written are taken back when the guard refuses at the insert.
+   *
+   * This is the window the entry check cannot cover: the grant holds on entry,
+   * the extraction runs, and the revocation lands during the writer's own
+   * awaits. The caller's cleanup cannot reach these files — it knows only what
+   * IT forwarded, not what the writer decoded from inline `data`.
+   */
+  it('removes the attachment bytes it wrote when the guard refuses at the insert', async () => {
+    let authorized = true;
+    const write = writeSessionMessage(AG, GUARD_SESS, withAttachment('att-mid'), {
+      guard: () => (authorized ? true : { ok: false, reason: 'destination revoked' }),
+    });
+    // Revoked after the entry check and the extraction, before the insert.
+    authorized = false;
+
+    await expect(write).rejects.toThrow(SessionWriteRefusedError);
+
+    expect(inboxFiles()).toEqual([]);
+    expect(rowIds()).not.toContain('att-mid');
+  });
+
+  it('keeps the attachment bytes when the write is allowed', async () => {
+    await writeSessionMessage(AG, GUARD_SESS, withAttachment('att-ok'), { guard: () => true });
+    expect(inboxFiles()).toEqual(['att-ok/payload.txt']);
+    expect(rowIds()).toContain('att-ok');
+  });
+
   it('writes when the guard still holds', async () => {
     await writeSessionMessage(AG, GUARD_SESS, message('guard-ok'), { guard: () => true });
     expect(rowIds()).toContain('guard-ok');

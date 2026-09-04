@@ -16,12 +16,24 @@ import { describe, expect, it, beforeEach, afterEach, vi } from 'vitest';
 
 const TEST_DIR = uniqueTmpRoot('test-a2a-parity');
 
-vi.mock('../../container-runner.js', () => ({
-  wakeContainer: vi.fn().mockResolvedValue(true),
-  isContainerRunning: vi.fn().mockReturnValue(false),
-  getActiveContainerCount: vi.fn().mockReturnValue(0),
-  killContainer: vi.fn(),
-}));
+vi.mock('../../container-runner.js', async () => {
+  const { getSession } = await import('../../db/sessions.js');
+  return {
+    wakeContainer: vi.fn().mockResolvedValue(true),
+    isContainerRunning: vi.fn().mockReturnValue(false),
+    getActiveContainerCount: vi.fn().mockReturnValue(0),
+    killContainer: vi.fn(),
+    // The real definition: the route builds this guard and the wake path is
+    // what evaluates it, next to `spawn()`.
+    sessionStillActive: (sessionId: string) => () => {
+      const fresh = getSession(sessionId);
+      if (!fresh) return { ok: false, reason: 'session no longer exists' };
+      if (fresh.status !== 'active') return { ok: false, reason: `session is ${fresh.status}` };
+      if (fresh.archived_at != null) return { ok: false, reason: 'session is archived' };
+      return true;
+    },
+  };
+});
 
 const getChannelAdapter = vi.fn();
 vi.mock('../../channels/channel-registry.js', () => ({

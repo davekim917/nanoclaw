@@ -316,7 +316,25 @@ export function sessionStillActive(sessionId: string): WakeGuard {
 /** Evaluate a wake guard and normalize its answer. */
 function wakeRefusalFrom(guard: WakeGuard | undefined): string | null {
   if (!guard) return null;
-  const verdict = guard();
+  let verdict: WakeGuardResult;
+  try {
+    verdict = guard();
+  } catch (err) {
+    // A THROWN guard is a refusal, not an exception to propagate.
+    //
+    // `sessionStillActive` reads the central DB, and a DB read can throw —
+    // transient I/O, corruption, a closed handle. Propagating that from the
+    // dequeue took it out through `trackWake`'s generic catch, which resolves
+    // `false` and never releases the memory reservation the dequeue is holding:
+    // every RETURNED refusal on that path releases, a thrown one leaked a slot
+    // off the admission budget permanently. Normalizing here means there is one
+    // refusal shape and one set of cleanup paths, rather than a second exit
+    // nobody wired.
+    //
+    // Refusing is also the right answer on its own terms: a guard that cannot
+    // answer has not said yes.
+    return `guard threw: ${err instanceof Error ? err.message : String(err)}`;
+  }
   if (verdict === true) return null;
   if (verdict === false) return 'guard refused';
   return verdict.reason;

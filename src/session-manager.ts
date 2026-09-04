@@ -946,7 +946,18 @@ export class SessionWriteRefusedError extends Error {
  */
 function refusalFrom(guard: WriteGuard | undefined): string | null {
   if (!guard) return null;
-  const verdict = guard();
+  let verdict: WriteGuardResult;
+  try {
+    verdict = guard();
+  } catch (err) {
+    // A THROWN guard is a refusal. Letting it propagate out of the mailbox
+    // action would surface as the funnel's own error rather than a refusal,
+    // and the caller's contract — `SessionWriteRefusedError` means nothing was
+    // written — would be silently unavailable for the one case where the
+    // precondition could not even be evaluated. A guard that cannot answer has
+    // not said yes.
+    return `guard threw: ${err instanceof Error ? err.message : String(err)}`;
+  }
   if (verdict === true) return null;
   if (verdict === false) return 'guard refused';
   return verdict.reason;
@@ -1082,8 +1093,30 @@ async function writeSessionMessageLocked(
     initSessionFolder(agentGroupId, sessionId);
   }
 
+  // THE GUARD, ASKED BEFORE THE BYTES LAND TOO.
+  //
+  // `extractAttachmentFiles` below decodes inline base64 into the target
+  // session's mounted `inbox`, which its container reads — so the extraction is
+  // itself a delivery, and it happens before the mailbox action where the guard
+  // used to run for the first time. A precondition already false here should
+  // never write those bytes at all.
+  //
+  // Cheap to ask twice: the guard is synchronous by contract, and the second
+  // ask inside the insert is the one that closes the window this function's own
+  // awaits open.
+  const refusedBeforeExtract = refusalFrom(guard);
+  if (refusedBeforeExtract !== null) {
+    log.warn('Session write refused by its guard before extracting attachments', {
+      agentGroupId,
+      sessionId,
+      messageId: message.id,
+      reason: refusedBeforeExtract,
+    });
+    throw new SessionWriteRefusedError(refusedBeforeExtract);
+  }
+
   // Extract base64 attachment data, save to inbox, replace with file paths
-  const content = extractAttachmentFiles(agentGroupId, sessionId, message.id, message.content);
+  const { content, writtenPaths } = extractAttachmentFiles(agentGroupId, sessionId, message.id, message.content);
 
   // Scheduled occurrences are always inert until the due-time admission seam
   // builds current recall and flips them wakeable. Keep this invariant even if
@@ -1156,6 +1189,10 @@ async function writeSessionMessageLocked(
   // default. Every existing caller already treats a failed write as an
   // exception, so this composes with what they do today.
   if (refusedReason !== null) {
+    // The bytes went in before this point, so the refusal has something to
+    // undo. The caller's own cleanup cannot reach these — it knows only the
+    // files it forwarded, not the ones decoded from inline `data` here.
+    removeExtractedAttachments(writtenPaths);
     log.warn('Session write refused by its guard at the insert', {
       agentGroupId,
       sessionId,
@@ -1761,25 +1798,31 @@ export function admitDueTaskContexts(db: Database.Database, agentGroupId: string
  *   4. `wx` flag on writeFileSync to refuse following a pre-existing symlink
  *      at the target file path or overwriting any existing file.
  */
+interface ExtractedAttachments {
+  content: string;
+  /** Absolute paths this call created, so a refused write can take them back. */
+  writtenPaths: string[];
+}
+
 function extractAttachmentFiles(
   agentGroupId: string,
   sessionId: string,
   messageId: string,
   contentStr: string,
-): string {
+): ExtractedAttachments {
   let parsed: Record<string, unknown>;
   try {
     parsed = JSON.parse(contentStr);
   } catch {
-    return contentStr;
+    return { content: contentStr, writtenPaths: [] };
   }
 
   const attachments = parsed.attachments as Array<Record<string, unknown>> | undefined;
-  if (!Array.isArray(attachments)) return contentStr;
+  if (!Array.isArray(attachments)) return { content: contentStr, writtenPaths: [] };
 
   if (!isSafeAttachmentName(messageId)) {
     log.warn('Rejecting unsafe inbound message id', { messageId });
-    return contentStr;
+    return { content: contentStr, writtenPaths: [] };
   }
 
   const inboxRoot = path.join(sessionDir(agentGroupId, sessionId), 'inbox');
@@ -1791,6 +1834,7 @@ function extractAttachmentFiles(
   let inboxResolved = false;
 
   let changed = false;
+  const writtenPaths: string[] = [];
   for (const att of attachments) {
     if (typeof att.data !== 'string') continue;
 
@@ -1861,10 +1905,43 @@ function extractAttachmentFiles(
     att.localPath = `inbox/${messageId}/${filename}`;
     delete att.data;
     changed = true;
+    writtenPaths.push(filePath);
     log.debug('Saved attachment to inbox', { messageId, filename, size: att.size });
   }
 
-  return changed ? JSON.stringify(parsed) : contentStr;
+  return { content: changed ? JSON.stringify(parsed) : contentStr, writtenPaths };
+}
+
+/**
+ * Take back attachment bytes this writer wrote for a message it then refused.
+ *
+ * The bytes are the side effect a refusal cannot otherwise undo: they land in
+ * the target session's mounted `inbox`, which its container reads, with or
+ * without a row pointing at them. The caller's own cleanup cannot cover these —
+ * it only knows about files IT forwarded, not the ones this function decoded
+ * out of inline `data`.
+ *
+ * Best-effort, and the refusal stands either way: failing to tidy up must never
+ * turn a refused write into a successful one. The message directory goes only
+ * if it is actually empty, so a concurrent writer's file is never taken with it.
+ */
+function removeExtractedAttachments(writtenPaths: string[]): void {
+  const dirs = new Set<string>();
+  for (const file of writtenPaths) {
+    try {
+      fs.rmSync(file, { force: true });
+      dirs.add(path.dirname(file));
+    } catch (err) {
+      log.warn('Could not remove an inbox attachment after the write was refused', { file, err });
+    }
+  }
+  for (const dir of dirs) {
+    try {
+      fs.rmdirSync(dir);
+    } catch {
+      // Non-empty or already gone; tidying, not the guarantee.
+    }
+  }
 }
 
 /** Open the inbound DB for a session (host reads/writes). */

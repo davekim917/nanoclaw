@@ -30,7 +30,7 @@ import { getAgentGroup } from '../../db/agent-groups.js';
 import { getDb } from '../../db/connection.js';
 import { getMessagingGroup } from '../../db/messaging-groups.js';
 import { getSession, markSessionEngaged } from '../../db/sessions.js';
-import { wakeContainer } from '../../container-runner.js';
+import { sessionStillActive, wakeContainer } from '../../container-runner.js';
 import { GuardDenyError, guard } from '../../guard/index.js';
 import { log } from '../../log.js';
 import { upsertArchiveMessage } from '../../message-archive.js';
@@ -699,14 +699,11 @@ async function performAgentRoute(
   // pre-wake `getSession` here proved the target was live before `wakeContainer`
   // was called; that function then awaits admission, an unbounded memory-queue
   // wait and all of `spawnContainer`'s preparation before a process exists.
-  await wakeContainer(targetSession, 'interactive', {
-    guard: () => {
-      const fresh = getSession(targetSession.id);
-      if (!fresh) return { ok: false as const, reason: 'target session no longer exists' };
-      if (fresh.status !== 'active') return { ok: false as const, reason: `target session is ${fresh.status}` };
-      return true;
-    },
-  });
+  // The shared guard, not a hand-rolled copy: this one asked only about
+  // `status`, and `archiveSessionById` stamps `archived_at` while leaving
+  // `status` alone — so an archived target still read `active` here. One
+  // definition of "still live" cannot drift from itself.
+  await wakeContainer(targetSession, 'interactive', { guard: sessionStillActive(targetSession.id) });
 }
 
 /**

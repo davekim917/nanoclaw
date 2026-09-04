@@ -1928,6 +1928,53 @@ describe('killContainer against a session that is still spawning', () => {
     expect(sessionStillActive('sess-live')()).toBe(true);
   });
 
+  /**
+   * A guard that THROWS is a refusal, and must release like one.
+   *
+   * `sessionStillActive` reads the central DB, and a DB read can throw —
+   * transient I/O, corruption, a closed handle. Propagating that from the
+   * dequeue took it out through `trackWake`'s generic catch, which resolves
+   * `false` and never releases the reservation the dequeue is holding: every
+   * RETURNED refusal on that path released, a thrown one leaked a slot off the
+   * admission budget permanently.
+   */
+  it('treats a guard that throws at the dequeue as a refusal, and returns the slot', async () => {
+    seedSession('sess-throw-queued');
+    seedSession('sess-throw-releaser');
+
+    let explode = false;
+    memoryStub.queueNext.add('sess-throw-queued');
+    await expect(
+      wakeContainer(callerSnapshot('sess-throw-queued'), 'interactive', {
+        guard: () => {
+          if (explode) throw new Error('database is locked');
+          return true;
+        },
+      }),
+    ).resolves.toBe(false);
+    expect(memoryStub.queuedPayloads).toHaveLength(1);
+
+    // The central DB starts failing while the wake sits in the queue.
+    explode = true;
+    vi.mocked(log.warn).mockClear();
+
+    // Any release drains the queue and resumes the queued wake, whose guard
+    // now throws instead of answering.
+    await expect(wakeContainer(callerSnapshot('sess-throw-releaser'))).resolves.toBe(false);
+    await Promise.resolve();
+
+    // Refused with the throw as its reason, and — the part that leaked — the
+    // reservation handed back rather than stranded.
+    expect(
+      vi
+        .mocked(log.warn)
+        .mock.calls.filter((call) => String(call[0]).startsWith('Queued container wake refused'))
+        .map((call) => (call[1] as { reason: string }).reason),
+    ).toEqual(['guard threw: database is locked']);
+    expect(memoryStub.releasedIds).toContain('sess-throw-queued');
+    expect(isContainerRunning('sess-throw-queued')).toBe(false);
+  });
+
   it('still does nothing for a session that is neither running nor spawning', async () => {
     seedSession('sess-idle');
     const exits: string[] = [];

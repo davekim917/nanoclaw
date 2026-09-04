@@ -32,7 +32,13 @@ vi.mock('../modules/mailbox/session.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../modules/mailbox/session.js')>();
   return {
     ...actual,
-    withExistingNanoclawOutbound: async (agentGroupId: string, sessionId: string, action: never) => {
+    // The SYNC funnel is what the decision path reads through now: the async
+    // candidate pass was dead work whose only effect was an await window, and
+    // removing it left this file's hooks firing on a pass that decided nothing.
+    // Hooking here fires the mutation BETWEEN two per-session reads, which is
+    // the window that genuinely remains — an independent container process
+    // writing its own outbound.db while the host walks the set.
+    withExistingNanoclawOutboundSync: (agentGroupId: string, sessionId: string, action: never) => {
       if (duringProposalRead.skip > 0) {
         duringProposalRead.skip -= 1;
       } else {
@@ -40,7 +46,7 @@ vi.mock('../modules/mailbox/session.js', async (importOriginal) => {
         duringProposalRead.run = null;
         hook?.();
       }
-      return actual.withExistingNanoclawOutbound(agentGroupId, sessionId, action);
+      return actual.withExistingNanoclawOutboundSync(agentGroupId, sessionId, action);
     },
   };
 });
@@ -307,20 +313,20 @@ describe('requestThreadClose', () => {
   });
 
   /**
-   * A proposal retracted DURING the candidate fan-out must not buy the close.
+   * A proposal retracted before the decision's read must not buy the close.
    *
-   * The fan-out resolves one session at a time, so A's read can land, A can
-   * then take new work and clear its `done_proposal`, and B's read can still be
-   * outstanding. Two complete samples did not fix that: a second set assembled
-   * the same way goes stale the same way, and the previous round's test could
-   * only express a retraction BETWEEN whole samples.
+   * The sampling is now one synchronous sweep with nothing awaited between it
+   * and the decision, so any retraction that lands before a session's own read
+   * is seen. That is the guarantee a host process can actually make.
    *
-   * The decision now comes from one synchronous sweep of the fresh membership,
-   * taken after the fan-out with nothing awaited before the decision — so a
-   * retraction at any point before that instant is seen, and one after it
-   * cannot have raced the kill.
+   * What it deliberately does NOT claim: a container clearing `done_proposal`
+   * AFTER the host has read that session's file but before it reads a sibling's
+   * is not caught, and cannot be. The container is an independent OS process
+   * writing its own `outbound.db`; no host-side read is atomic with respect to
+   * it. That residual window is the runner's admission gate to close, not this
+   * function's — see the round-14 disposition.
    */
-  it('does not count a proposal retracted while a sibling read is still outstanding', async () => {
+  it('does not count a proposal retracted before the decision reads it', async () => {
     const THREAD_RETRACT = 'slack:C1:retract';
     // Two agent groups, because one thread may hold only one active session per
     // group. Two sessions is the whole point: the fan-out has to have a sibling
@@ -344,10 +350,9 @@ describe('requestThreadClose', () => {
       out.close();
     }
 
-    // The retractor's own read has already resolved; the sibling's has not.
-    // With a fan-out deciding, the retractor's resolved `true` is what counts
-    // and the close is bought over an agent that is mid-turn.
-    duringProposalRead.skip = 1;
+    // Fires as the retractor's own read is taken, so the cleared proposal is
+    // what the decision sees. A cached value from an earlier pass would buy the
+    // cheap bar here over an agent that is back at work.
     duringProposalRead.run = () => {
       const db = new Database(dbPathFor('ag1', 's-retractor', 'outbound.db'));
       db.prepare("DELETE FROM session_state WHERE key = 'done_proposal'").run();
@@ -889,23 +894,18 @@ describe('the close sequence order', () => {
   });
 
   /**
-   * A confirmation retracted during the candidate fan-out must not buy the kill.
+   * A confirmation retracted before the decision's read must not buy the kill.
    *
-   * The finalizer sampled one proposal per live session behind its own await,
-   * then decided. A container clears `done_proposal` the moment it takes on new
-   * work, so A's read could resolve present, A could go back to work, and B's
-   * read could still be outstanding — and A's resolved value still finalized,
-   * killing a container mid-turn before the deadline the operator was promised.
+   * The finalizer reads every live session synchronously, with nothing awaited
+   * before `decideCloseFinalization`, so a retraction landing before a
+   * session's own read is seen and the kill is declined. Declining costs
+   * nothing durable: the row stays `awaiting_confirmation`, the next tick asks
+   * again, and the forced path is time-based and untouched.
    *
-   * Sampling twice did not fix it; a second fan-out is stale the same way. The
-   * decision now reads every live session SYNCHRONOUSLY, after the fan-out and
-   * with nothing awaited before `decideCloseFinalization`, so a retraction at
-   * any point before that instant is seen.
-   *
-   * Declining costs nothing durable: the row stays `awaiting_confirmation`, the
-   * next tick asks again, and the forced path is time-based and untouched.
+   * The cross-process window above applies here too and is out of scope for any
+   * host-side change.
    */
-  it('does not finalize on a confirmation retracted during the candidate reads', async () => {
+  it('does not finalize on a confirmation retracted before the decision reads it', async () => {
     const THREAD_F = 'slack:C1:finalize-retract';
     for (const [group, id] of [
       ['ag1', 'f-retractor'],
@@ -928,9 +928,7 @@ describe('the close sequence order', () => {
       )
       .run(THREAD_F, iso(30_000), JSON.stringify(['f-retractor', 'f-sibling']));
 
-    // Fires after the retractor's read has resolved, while the sibling's is
-    // still outstanding — the interleave two whole samples could not express.
-    duringProposalRead.skip = 1;
+    // Fires as the retractor's own read is taken.
     duringProposalRead.run = () => {
       const db = new Database(dbPathFor('ag1', 'f-retractor', 'outbound.db'));
       db.prepare("DELETE FROM session_state WHERE key = 'done_proposal'").run();
