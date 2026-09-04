@@ -342,6 +342,35 @@ async function handleSenderApprovalResponse(payload: ResponsePayload): Promise<b
     });
     return true; // claim the response so it's not unclaimed-logged, but do nothing
   }
+  // The card is only actionable while the group still runs the flow that
+  // issued it. `decline_notify` promises the opposite of a card — no buttons,
+  // no approval path, grants stay explicit (`ncl members add`) — so a button
+  // delivered before the flip must not still grant membership afterwards.
+  //
+  // Checked here rather than by deleting rows inside the policy update: the
+  // click is the decision seam, so this holds no matter how the policy
+  // changed (ncl, dashboard, auto-wire, a direct DB edit), and it covers the
+  // window before the sender's next message converts the card into a stamp.
+  // Only decline_notify voids the card. `strict` and `public` do not: neither
+  // promises there is no approval path, so an admin approving an outstanding
+  // card there is a legitimate explicit grant, and that behavior predates
+  // this policy.
+  const currentMg = getMessagingGroup(row.messaging_group_id);
+  if (currentMg?.unknown_sender_policy === 'decline_notify') {
+    log.warn('Unknown-sender approval click rejected — group switched to decline_notify', {
+      approvalId: row.id,
+      senderIdentity: row.sender_identity,
+      messagingGroupId: row.messaging_group_id,
+      clickerId,
+    });
+    // Void the card the same way a deny does: drop the row (and with it the
+    // retained message body) and close out the deferred inbound so it does
+    // not sit unresolved.
+    deletePendingSenderApproval(row.id);
+    completeStoredDeferredInbound(row.original_message);
+    return true;
+  }
+
   const approverId = clickerId;
   const approved = payload.value === 'approve';
 

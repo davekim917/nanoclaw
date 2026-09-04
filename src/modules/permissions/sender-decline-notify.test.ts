@@ -11,9 +11,11 @@
  *    sends a polite decline into the origin DM, the owner gets a one-line
  *    FYI (plain text, not a card), and the drop is recorded
  *  - No approval card / pending card row — only the decline stamp
+ *  - The decline threads under the message it answers; the FYI does not
  *  - Dedupe: a second message within 24h sends nothing further
  *  - An expired (>24h) stamp declines again
  *  - Policy flips in both directions across the shared UNIQUE key
+ *  - A card issued before a flip to decline_notify stops granting on click
  *  - A group messaging group degrades to strict (no public decline)
  *  - An adapter that reports no DM/group context degrades to strict too
  *  - The FYI goes to an owner, not to the first admin pickApprover would card
@@ -334,6 +336,46 @@ describe('unknown-sender decline_notify flow', () => {
     await routeInbound(strangerDm('hello??'));
     await settle();
     expect(deliverMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('a card issued before the flip stops granting once the group is decline_notify', async () => {
+    // The conversion in declineAndNotify only runs on the sender's NEXT
+    // message. Until then the already-delivered buttons stay live, so the
+    // click itself has to honor the new policy — otherwise decline_notify
+    // ("no approval path, grants stay explicit") is bypassable by clicking a
+    // stale card.
+    updateMessagingGroup('mg-dm-stranger', { unknown_sender_policy: 'request_approval' });
+    const { routeInbound } = await import('../../router.js');
+    await routeInbound(strangerDm('let me in'));
+    await waitForDeliveries(1);
+
+    const card = (await db()).prepare(`SELECT id FROM pending_sender_approvals WHERE id LIKE 'nsa-%'`).get() as {
+      id: string;
+    };
+
+    updateMessagingGroup('mg-dm-stranger', { unknown_sender_policy: 'decline_notify' });
+
+    // The owner clicks Allow on the card they were sent before the flip.
+    const { getResponseHandlers } = await import('../../response-registry.js');
+    for (const handler of getResponseHandlers()) {
+      await handler({
+        questionId: card.id,
+        value: 'approve',
+        userId: 'owner', // raw platform id; the handler namespaces it
+        channelType: 'telegram',
+        platformId: 'dm-owner',
+        threadId: null,
+      });
+    }
+
+    // No membership granted, and the void card is gone rather than left
+    // clickable.
+    const member = (await db())
+      .prepare('SELECT user_id FROM agent_group_members WHERE user_id = ?')
+      .get('tg:stranger') as { user_id: string } | undefined;
+    expect(member).toBeUndefined();
+    const rows = (await db()).prepare('SELECT id FROM pending_sender_approvals').all() as Array<{ id: string }>;
+    expect(rows).toHaveLength(0);
   });
 
   it('policy flip back to request_approval clears the stale stamp and cards normally', async () => {
