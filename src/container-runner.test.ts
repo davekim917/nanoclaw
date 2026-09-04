@@ -1512,6 +1512,15 @@ describe('wakeContainer session-status admission', () => {
     expect(refusals()).toEqual(['archiving']);
   });
 
+  // Explicit timeout, unlike its siblings. Every other case in this block is
+  // refused AT the guard and returns in microseconds; this one is the only
+  // case that goes through it, so it runs the real admission path until
+  // something downstream refuses it for want of a host DB. That path is
+  // ~100ms on an idle machine and occasionally blew past the 5s default on a
+  // loaded Actions runner, producing a red CI on unrelated PRs — observed on
+  // `main` as well as on feature branches, always as a timeout and never as a
+  // failed assertion. The generous budget keeps a genuine hang detectable
+  // while removing the contention flake.
   it('lets an active session through the guard to the normal admission path', async () => {
     // Keep this guard test independent of the host's current disk pressure;
     // otherwise a full filesystem sends it into the real cleanup worker.
@@ -1523,7 +1532,7 @@ describe('wakeContainer session-status admission', () => {
     } finally {
       vi.unstubAllEnvs();
     }
-  });
+  }, 30_000);
 });
 
 // The guard above runs on the object the CALLER handed us, and the wake path
