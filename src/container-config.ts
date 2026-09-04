@@ -146,6 +146,13 @@ const ONECLI_PLACEHOLDER = 'onecli-managed';
 const ONECLI_HEADER_VALUE_RE = new RegExp(`^(?:[A-Za-z][A-Za-z0-9-]* )?${ONECLI_PLACEHOLDER}$`);
 /** Shapes of real credentials that must never be written into container.json. */
 const RAW_SECRET_VALUE_RE = /(^|\s)(sk-|ghp_|github_pat_|xox[a-z]-|AKIA|-----BEGIN )/;
+/**
+ * C0 control characters other than horizontal tab, plus DEL. A header value
+ * containing CR/LF/NUL is accepted here (it's just a JS string) but rejected
+ * by every standard HTTP client when the remote MCP connects — the server
+ * gets approved and restarted, then is unusable. Reject it here instead.
+ */
+const HEADER_VALUE_CONTROL_CHAR_RE = /[\x00-\x08\x0A-\x1F\x7F]/;
 
 /**
  * A path segment or query value long and mixed enough that it could be a
@@ -196,6 +203,11 @@ function parseMcpHeaders(raw: unknown): Record<string, string> {
     if (typeof value !== 'string') throw new Error('headers must be a JSON object with string values');
     if (!HEADER_NAME_RE.test(key)) {
       throw new Error(`header name ${JSON.stringify(key)} is not a valid HTTP header field name`);
+    }
+    if (HEADER_VALUE_CONTROL_CHAR_RE.test(value)) {
+      throw new Error(
+        `header "${key}" value contains a control character (CR, LF, or NUL are not valid in an HTTP header)`,
+      );
     }
     // Allowlisted configuration headers may hold a literal; everything else
     // must be the placeholder, whatever it is named and however short its

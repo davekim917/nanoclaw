@@ -32,9 +32,11 @@ only with admin approval.
   (`"Bearer onecli-managed"`), whatever its name and however short its value.
   The OneCLI gateway substitutes the real secret at the proxy boundary, but
   only for a secret ASSIGNED to your group: a 401 from a newly added remote
-  server means the credential is in the vault and not assigned, which an
+  server can mean the credential is in the vault but not assigned, which an
   operator fixes via `onecliSecrets` in container.json or
-  `onecli agents set-secrets`. A declared `type` must agree with the fields —
+  `onecli agents set-secrets` — but a 401 can also mean an expired or
+  incorrect secret, a missing gateway rule, or an unsupported auth scheme, so
+  say it as one possibility, not the diagnosis. A declared `type` must agree with the fields —
   `stdio` with `command`, `http` with `url`. A remote URL is stored verbatim, so
   never put a secret in it — recognizable credential shapes are rejected, but
   an opaque path segment cannot be told apart from a tenant id and is only

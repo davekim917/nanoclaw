@@ -180,7 +180,7 @@ export async function applyAddMcpServer(payload: Record<string, unknown>, sessio
       text:
         `MCP server "${name}" added. Verify it's available (e.g. list your tools) and report the result to the user.` +
         (needsCredential
-          ? " It authenticates through the OneCLI gateway: if calls come back 401, the credential exists but is not assigned to this agent group — an operator adds it to `onecliSecrets` in the group's container.json, or runs `onecli agents set-secrets`."
+          ? " It authenticates through the OneCLI gateway: if calls come back 401, one likely cause is that the credential exists but is not assigned to this agent group — an operator adds it to `onecliSecrets` in the group's container.json, or runs `onecli agents set-secrets`. A 401 can also mean an expired or incorrect secret, a missing gateway rule, or an authentication scheme the server doesn't accept."
           : ''),
       sender: 'system',
       senderId: 'system',

@@ -192,4 +192,20 @@ describe('add_mcp_server remote Streamable HTTP', () => {
     );
     expect((await submit({ name: 'neither' })).error).toContain('exactly one of command or url');
   });
+
+  it('rejects control characters in a header value, allowlisted or not', async () => {
+    expect(
+      (
+        await submit({
+          name: 'inject',
+          url: 'https://example.com/mcp',
+          headers: { 'Content-Type': 'application/json\r\nX-Injected: yes' },
+        })
+      ).error,
+    ).toContain('control character');
+    expect(
+      (await submit({ name: 'auth', url: 'https://example.com/mcp', headers: { Authorization: 'onecli-managed\0' } }))
+        .error,
+    ).toContain('control character');
+  });
 });

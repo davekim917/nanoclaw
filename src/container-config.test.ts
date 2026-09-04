@@ -444,6 +444,24 @@ describe('parseMcpServerConfig', () => {
     );
   });
 
+  it('rejects control characters in a header value, allowlisted or not', () => {
+    // CRLF injection: a standard HTTP client rejects this at connect time, so
+    // the server would be approved and restarted, then unusable.
+    expect(() =>
+      parseMcpServerConfig({
+        url: 'https://example.com/mcp',
+        headers: { 'Content-Type': 'application/json\r\nX-Injected: yes' },
+      }),
+    ).toThrow(/control character/);
+    expect(() =>
+      parseMcpServerConfig({ url: 'https://example.com/mcp', headers: { Authorization: 'onecli-managed ' } }),
+    ).toThrow(/control character/);
+    // A plain tab is not rejected — only CR/LF/NUL and other C0 controls are.
+    expect(parseMcpServerConfig({ url: 'https://example.com/mcp', headers: { 'User-Agent': 'a\tb' } })).toMatchObject({
+      headers: { 'User-Agent': 'a\tb' },
+    });
+  });
+
   it('rejects an env key that is not a valid environment variable name', () => {
     expect(() => parseMcpServerConfig({ command: 'node', env: { 'not-an-env-key': 'v' } })).toThrow(
       /environment variable name/,

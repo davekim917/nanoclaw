@@ -155,6 +155,8 @@ const ONECLI_PLACEHOLDER = 'onecli-managed';
 const ONECLI_HEADER_VALUE_RE = new RegExp(`^(?:[A-Za-z][A-Za-z0-9-]* )?${ONECLI_PLACEHOLDER}$`);
 /** Shapes of real credentials that must never be written into container.json. */
 const RAW_SECRET_VALUE_RE = /(^|\s)(sk-|ghp_|github_pat_|xox[a-z]-|AKIA|-----BEGIN )/;
+/** C0 control characters other than horizontal tab, plus DEL — mirrors the host's check. */
+const HEADER_VALUE_CONTROL_CHAR_RE = /[\x00-\x08\x0A-\x1F\x7F]/;
 
 type ParsedMcpServer =
   | { type: 'http'; url: string; headers?: Record<string, string> }
@@ -226,6 +228,11 @@ function parseMcpServerInput(args: Record<string, unknown>): { config: ParsedMcp
       if (typeof value !== 'string') return { error: 'headers must be an object with string values' };
       if (!HEADER_NAME_RE.test(key)) {
         return { error: `header name ${JSON.stringify(key)} is not a valid HTTP header field name` };
+      }
+      if (HEADER_VALUE_CONTROL_CHAR_RE.test(value)) {
+        return {
+          error: `header "${key}" value contains a control character (CR, LF, or NUL are not valid in an HTTP header)`,
+        };
       }
       if (RAW_SECRET_VALUE_RE.test(value)) {
         return {
