@@ -667,6 +667,11 @@ export const SWEEP_DUTY_INVENTORY: Readonly<Record<string, string>> = {
   T21: 'claims-self-heal',
   T22: 'orphaned-repo-fence-release',
   T23: 'cli-request-execution-prune',
+  // Fork addition, not part of the upstream seam-2 port: by-reference GitHub
+  // credential delivery (src/github-token-file.ts). Kept in this inventory
+  // so the registration drift guard in host-sweep-registry.test.ts stays an
+  // exact accounting of every registered duty.
+  FORK1: 'github-token-file-refresh',
   S2: 'processing-ack-sync',
   S3: 'stale-pending-expiry',
   S4: 'pre-wake-orphan-claim-reset',

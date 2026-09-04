@@ -27,6 +27,7 @@ import { getDb } from './db/connection.js';
 import { getAllAgentGroups, getAgentGroup, getWorkgroupOnecliSecrets } from './db/agent-groups.js';
 import { mergeWorkgroupAndGroupSecrets, slackUserTokenSecrets } from './onecli-secrets.js';
 import { GITHUB_APP_SENTINEL, peekGitHubAppTokenExpiry } from './github-app-token.js';
+import { GH_TOKEN_CONTAINER_PATH, githubTokenDeliveredAsEnv } from './github-token-file.js';
 import { isOwnerSafeSlackSession } from './modules/permissions/slack-user-token-gate.js';
 import { getAllMessagingGroups } from './db/messaging-groups.js';
 import { extractToolScopes } from './scoped-env.js';
@@ -446,9 +447,9 @@ export function buildSessionServicesSnapshot(
         scopes: scopeList,
         credentialPaths: [],
         activation: resolved.set
-          ? `\`gh\` and \`git\` both pre-authenticated via \`GITHUB_TOKEN\` (resolved from host env \`${resolved.name}\`)${
+          ? `\`gh\` and \`git\` both pre-authenticated from host env \`${resolved.name}\`${githubTokenDeliveredAsEnv() ? `, forwarded to you as \`GITHUB_TOKEN\`` : ` and delivered as a read-only file at \`${GH_TOKEN_CONTAINER_PATH}\` — the git credential helper and the \`gh\` shim read it per invocation, so the host's hourly re-mint reaches you without a restart, and there is deliberately no \`GITHUB_TOKEN\` in your env`}${
               allowedOrgs.set ? `, restricted to orgs: \`${process.env[allowedOrgs.name]}\`` : ''
-            }. \`gh repo view\`, \`gh pr create\`, \`git push\` all work directly. **CI/Actions is included, not a separate integration** — you CAN check build and test status yourself, and must never tell the user you lack access to CI. \`gh pr checks <pr>\` for a PR's check rollup (GraphQL statusCheckRollup under the hood), \`gh run list --branch <branch>\`, \`gh run view <run-id> --log-failed\` for the failing step's output, \`gh run watch <run-id>\` to block until it settles.${tokenShapeNote} A 403 on one endpoint can be a permissions shape rather than a dead credential — before reporting lost access, retry the same read through a different GitHub surface (\`gh api\` covers every endpoint with this same token). To poll a run without burning a turn, use the \`wait\` tool rather than sleeping. DO NOT run \`gh auth login\`. DO NOT ask the user for a token — it's already in your env.`
+            }. \`gh repo view\`, \`gh pr create\`, \`git push\` all work directly. **CI/Actions is included, not a separate integration** — you CAN check build and test status yourself, and must never tell the user you lack access to CI. \`gh pr checks <pr>\` for a PR's check rollup (GraphQL statusCheckRollup under the hood), \`gh run list --branch <branch>\`, \`gh run view <run-id> --log-failed\` for the failing step's output, \`gh run watch <run-id>\` to block until it settles.${tokenShapeNote} A 403 on one endpoint can be a permissions shape rather than a dead credential — before reporting lost access, retry the same read through a different GitHub surface (\`gh api\` covers every endpoint with this same token). To poll a run without burning a turn, use the \`wait\` tool rather than sleeping. DO NOT run \`gh auth login\`. DO NOT ask the user for a token — the credential is already wired up for you.`
           : `GitHub tool declared but no token set at host env ${tokenEnvName ?? 'GITHUB_TOKEN_<folder>'} or fallback GITHUB_TOKEN — ask Operator.`,
         ...(resolved.set && githubTokenExpiresAt ? { expiresAt: githubTokenExpiresAt } : {}),
       });

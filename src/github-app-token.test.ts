@@ -15,6 +15,7 @@ import { resolveGitHubToken } from './container-runner.js';
 import {
   GITHUB_APP_SENTINEL,
   clearGitHubAppTokenCache,
+  isGitHubAppMintBackedOff,
   mintOrReuseGitHubAppToken,
   peekGitHubAppTokenExpiry,
   refreshExpiringGitHubAppTokens,
@@ -255,6 +256,55 @@ describe('mintOrReuseGitHubAppToken / peek / proactive refresh', () => {
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response('nope', { status: 500 })));
     await expect(refreshExpiringGitHubAppTokens(appEnv())).resolves.toBe(0);
     await expect(mintOrReuseGitHubAppToken(appEnv())).resolves.toMatchObject({ token: 'ghs_soon2' });
+  });
+
+  it('mintOrReuseGitHubAppToken honors the proactive backoff — no fresh mint attempt', async () => {
+    // Seed a token already inside the refresh margin, then let the proactive
+    // sweep fail against it once — this is what sets the backoff.
+    clearGitHubAppTokenCache();
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(mintResponse('ghs_stale', 5 * 60 * 1000)));
+    await mintOrReuseGitHubAppToken(appEnv());
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response('nope', { status: 500 })));
+    await expect(refreshExpiringGitHubAppTokens(appEnv())).resolves.toBe(0);
+    expect(isGitHubAppMintBackedOff(INSTALLATION_ID)).toBe(true);
+
+    // Round-1's fix already caps concurrent App-sentinel groups to one mint
+    // timeout per tick via in-flight dedup — this asserts the DIFFERENT
+    // problem: without the backoff check, the token-file refresh sweep still
+    // fires a brand new attempt on every subsequent tick. A fresh, captured
+    // fetch mock proves whether this call reaches the network at all. Only
+    // Date.now is mocked (not fake timers), so AbortSignal.timeout inside the
+    // real mint path — unreached here — is never at risk of hanging the test.
+    const realNow = Date.now();
+    const freshAttempt = vi.fn();
+    vi.stubGlobal('fetch', freshAttempt);
+    await expect(mintOrReuseGitHubAppToken(appEnv())).resolves.toMatchObject({ token: 'ghs_stale' });
+    expect(freshAttempt).not.toHaveBeenCalled();
+
+    // Once the unexpired-but-in-margin token itself actually expires while
+    // still backed off, there is nothing to fall back to — FAIL-SAFE
+    // `undefined`, still no network attempt.
+    const nowSpy = vi.spyOn(Date, 'now').mockReturnValue(realNow + 6 * 60 * 1000);
+    await expect(mintOrReuseGitHubAppToken(appEnv())).resolves.toBeUndefined();
+    expect(freshAttempt).not.toHaveBeenCalled();
+    nowSpy.mockRestore();
+  });
+
+  it('mintOrReuseGitHubAppToken retries once the backoff window elapses', async () => {
+    clearGitHubAppTokenCache();
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(mintResponse('ghs_stale2', 5 * 60 * 1000)));
+    await mintOrReuseGitHubAppToken(appEnv());
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response('nope', { status: 500 })));
+    await expect(refreshExpiringGitHubAppTokens(appEnv())).resolves.toBe(0);
+
+    const realNow = Date.now();
+    const nowSpy = vi.spyOn(Date, 'now').mockReturnValue(realNow + 10 * 60 * 1000 + 1);
+    expect(isGitHubAppMintBackedOff(INSTALLATION_ID)).toBe(false);
+    const retried = vi.fn().mockResolvedValue(mintResponse('ghs_recovered', 60 * 60 * 1000));
+    vi.stubGlobal('fetch', retried);
+    await expect(mintOrReuseGitHubAppToken(appEnv())).resolves.toMatchObject({ token: 'ghs_recovered' });
+    expect(retried).toHaveBeenCalledTimes(1);
+    nowSpy.mockRestore();
   });
 });
 

@@ -121,6 +121,25 @@ export async function mintOrReuseGitHubAppToken(
     return { token: cached.token, expiresAtMs: cached.expiresAtMs };
   }
 
+  // Backoff: skip a FRESH mint attempt while the proactive sweep's own
+  // recent attempt for this installation is still in its 10-minute
+  // stand-down (review finding, 2026-09-03). An in-flight mint is always
+  // worth awaiting — dedup only saves a network call, it never skips a real
+  // attempt — so backoff only guards starting a NEW one. This applies to
+  // every caller of this shared mint path, not just the proactive sweep:
+  // during a real GitHub outage a spawn's own attempt would fail identically,
+  // and skipping it returns the FAIL-SAFE `undefined`/stale-cache result
+  // immediately instead of blocking the spawn for the full mint timeout. The
+  // narrow cost is a spawn landing in the few minutes GitHub recovers but
+  // before the next proactive tick clears the backoff — strictly better than
+  // the alternative of re-attempting a doomed mint on every call.
+  if (!mintsInFlight.has(installationId) && isGitHubAppMintBackedOff(installationId)) {
+    if (cached && cached.expiresAtMs > Date.now()) {
+      return { token: cached.token, expiresAtMs: cached.expiresAtMs };
+    }
+    return undefined;
+  }
+
   // In-flight dedup: a sweep refresh and a spawn mint can race on the same
   // installation. Sharing one promise means one network mint, and whichever
   // caller started first wins the cache write — no stale-over-fresh overwrite.
@@ -161,6 +180,18 @@ const refreshFailures = new Map<string, number>();
 /** Per-installation in-flight mint promises — dedupes concurrent spawn/refresh mints. */
 const mintsInFlight = new Map<string, Promise<CachedToken>>();
 
+/**
+ * Is a fresh mint for this installation currently backed off after a recent
+ * failure? The one definition of "backed off", shared by the proactive
+ * sweep step below and the on-demand mint path in `mintOrReuseGitHubAppToken`
+ * — exported so both cannot drift, and so a test (or a caller that just wants
+ * to know without minting) can ask directly.
+ */
+export function isGitHubAppMintBackedOff(installationId: string, now: number = Date.now()): boolean {
+  const lastFail = refreshFailures.get(installationId);
+  return lastFail !== undefined && now - lastFail < REFRESH_FAILURE_BACKOFF_MS;
+}
+
 export async function refreshExpiringGitHubAppTokens(env: NodeJS.ProcessEnv = process.env): Promise<number> {
   if (tokenCache.size === 0) return 0;
   const now = Date.now();
@@ -171,8 +202,7 @@ export async function refreshExpiringGitHubAppTokens(env: NodeJS.ProcessEnv = pr
     // Backoff: a failed refresh leaves the old (still-unexpired) token in
     // place; retrying every 60s tick adds nothing until GitHub or the config
     // changes, so stand down for ten minutes after each failure.
-    const lastFail = refreshFailures.get(installationId);
-    if (lastFail !== undefined && now - lastFail < REFRESH_FAILURE_BACKOFF_MS) continue;
+    if (isGitHubAppMintBackedOff(installationId, now)) continue;
     try {
       // Same deduped path as spawn-time mints — one network mint even when
       // the sweep and a spawn race on the same installation.

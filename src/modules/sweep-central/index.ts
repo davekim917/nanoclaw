@@ -8,6 +8,17 @@
  * and order are unchanged from the PR 5 baseline — those coordinates encode
  * ordering constraints (plan.md §4.3 table) and must never move.
  *
+ * github-token-file-refresh (25) is NOT part of that seam-2 port — it is a
+ * fork addition (by-reference GitHub credential delivery) registered
+ * directly at the order-free `tick:housekeeping` phase. It sits right after
+ * T7 (github-app-token-refresh) on purpose: it pushes the token T7 may have
+ * just re-minted down to every group's mounted file, so a running container
+ * picks up the fresh credential on its next git/gh call without a respawn.
+ * See src/github-token-file.ts. Like T23 below, it is still tracked in
+ * SWEEP_DUTY_INVENTORY (as FORK1) so the drift guard in
+ * host-sweep-registry.test.ts stays an exact accounting of every registered
+ * duty, ported or fork-only.
+ *
  * T23 cli-request-execution-prune (42) was added later (issue #273's
  * at-most-once ncl ledger): slotted right after T10 since both are
  * order-free receipt/ledger prunes with no dependency on one another (42, not
@@ -46,6 +57,26 @@ function registerCentralSweepDuties(): void {
         await refreshExpiringGitHubAppTokens();
       } catch (err) {
         log.warn('GitHub App token refresh sweep step failed', { err });
+      }
+    },
+  });
+
+  registerSweepDuty({
+    name: id.FORK1,
+    phase: 'tick:housekeeping',
+    order: 25,
+    // Push the current token down to every group's mounted token file. This is
+    // what the re-mint above could never reach before: a running container's env
+    // is frozen at spawn, but the read-only file mount is live, so rewriting the
+    // file in place hands an already-running container the fresh credential on
+    // its next git/gh call. Ordered right after the re-mint so the value written
+    // here is the one that was just minted. See github-token-file.ts.
+    run: async () => {
+      try {
+        const { refreshGroupGitHubTokenFiles } = await import('../../github-token-file.js');
+        await refreshGroupGitHubTokenFiles();
+      } catch (err) {
+        log.warn('GitHub token file refresh sweep step failed', { err });
       }
     },
   });

@@ -949,6 +949,16 @@ describe('sweep duty registry (S2-PR2)', () => {
    * reconcile lands after self-heal — and both of those are cited ordering
    * constraints (13 and 3). The tuple is (surface, name, phase, order), in the
    * order the driver runs them.
+   *
+   * `github-token-file-refresh` (tick:housekeeping, 25) is a fork addition,
+   * not part of the seam-2 port: by-reference GitHub credential delivery
+   * (src/github-token-file.ts), registered directly at the order-free
+   * housekeeping phase, right after the App-token re-mint it depends on.
+   * `cli-request-execution-prune` (tick:housekeeping, 42) is likewise later
+   * work (issue #273's at-most-once ncl ledger). Both are tracked in
+   * SWEEP_DUTY_INVENTORY (as FORK1 and T23) alongside the 38 seam-2-ported
+   * duties, so the set below stays an exact accounting of every registered
+   * duty — ported or not.
    */
   const EXPECTED_REGISTRATIONS: Array<[string, string, string, number]> = [
     ['duty', 'egress-network-reheal', 'tick:pre-session', 10],
@@ -976,6 +986,7 @@ describe('sweep duty registry (S2-PR2)', () => {
     ['duty', 'orphaned-repo-fence-release', 'tick:post-session', 50],
     ['duty', 'approvals-reason-sweep', 'tick:housekeeping', 10],
     ['duty', 'github-app-token-refresh', 'tick:housekeeping', 20],
+    ['duty', 'github-token-file-refresh', 'tick:housekeeping', 25],
     ['duty', 'steer-idempotency-prune', 'tick:housekeeping', 30],
     ['duty', 'channel-ingress-receipt-prune', 'tick:housekeeping', 40],
     ['duty', 'cli-request-execution-prune', 'tick:housekeeping', 42],
@@ -1014,11 +1025,14 @@ describe('sweep duty registry (S2-PR2)', () => {
     // Surface, name, phase AND order, in run order — a swap anywhere fails.
     expect(actual).toEqual(EXPECTED_REGISTRATIONS);
 
-    expect(actual).toHaveLength(40);
+    // 41 registrations: the 39 from the seam-2 port (38 unique names, one
+    // registered twice — see below) plus two fork additions,
+    // github-token-file-refresh and cli-request-execution-prune.
+    expect(actual).toHaveLength(41);
     const names = new Set(actual.map((r) => r[1]));
-    expect(names.size).toBe(39);
+    expect(names.size).toBe(40);
     expect(names).toEqual(new Set(Object.values(SWEEP_DUTY_INVENTORY)));
-    expect(Object.keys(SWEEP_DUTY_INVENTORY)).toHaveLength(39);
+    expect(Object.keys(SWEEP_DUTY_INVENTORY)).toHaveLength(40);
     // The one duty registered twice is the orphan-claim reset: once in the tail
     // window, once as the post-kill follow-up (rev-3 grounding §2, S17).
     expect(actual.filter((r) => r[1] === SWEEP_DUTY_INVENTORY.S17)).toHaveLength(2);
