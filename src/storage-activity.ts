@@ -74,6 +74,63 @@ function dropLease(key: string): void {
   else heldLeases.delete(key);
 }
 
+/**
+ * Roots with a marker plant IN PROGRESS — mkdir issued, marker not yet on
+ * disk. Deliberately NOT folded into `heldLeases`: that map answers "this
+ * process already has a marker protecting this root", which is what lets
+ * plantStorageActivityMarker skip its own plant and its claim re-check. A
+ * plant in flight has no marker yet, so answering that question "yes" would
+ * let a sync writer proceed with nothing on disk protecting it.
+ *
+ * This map answers the narrower question the releasers need: "would removing
+ * the active directory right now pull it out from under somebody". Without
+ * it, a release whose refcount just hit zero rmdir'd the directory a
+ * concurrent acquisition was in the middle of creating — measured at ~2 lost
+ * acquisitions per 4 000 under 8-way contention even with the ENOENT retry.
+ */
+const plantsInFlight = new Map<string, number>();
+
+function beginPlant(key: string): void {
+  plantsInFlight.set(key, (plantsInFlight.get(key) ?? 0) + 1);
+}
+
+function endPlant(key: string): void {
+  const next = (plantsInFlight.get(key) ?? 1) - 1;
+  if (next > 0) plantsInFlight.set(key, next);
+  else plantsInFlight.delete(key);
+}
+
+/**
+ * True when some holder or in-flight plant in this process still needs the
+ * directory. `ownPlants` discounts the caller's OWN registration: a planter's
+ * discard runs while it is still registered, and it must still be able to
+ * clean up after itself when nobody else is around.
+ */
+function activeDirInUse(key: string, ownPlants = 0): boolean {
+  return heldLeases.has(key) || (plantsInFlight.get(key) ?? 0) > ownPlants;
+}
+
+/**
+ * Tidy the active directory away, but only when nothing in this process still
+ * needs it. Removing it is never REQUIRED for correctness — a reclaim gates on
+ * marker count, not on the directory existing (see tryRunWithStorageCleanupClaim)
+ * — while removing it at the wrong moment is exactly what breaks a concurrent
+ * plant. So "in use" always wins.
+ */
+async function removeActiveDirIfUnused(key: string, activeDir: string, ownPlants = 0): Promise<void> {
+  if (activeDirInUse(key, ownPlants)) return;
+  await fs.promises.rmdir(activeDir).catch(() => undefined);
+}
+
+function removeActiveDirIfUnusedSync(key: string, activeDir: string, ownPlants = 0): void {
+  if (activeDirInUse(key, ownPlants)) return;
+  try {
+    fs.rmdirSync(activeDir);
+  } catch {
+    // Another live holder, or a concurrent acquisition that already re-planted.
+  }
+}
+
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -170,6 +227,7 @@ export async function acquireStorageActivityLease(
   // for the same session must remain independent or the first release could
   // remove the only marker protecting the second.
   const marker = path.join(activeDir, markerName(`${holderId}-${process.pid}-${randomUUID()}`));
+  const key = leaseKey(resourceRoot);
   const startedAt = Date.now();
   let nextReportAt = CLAIM_WAIT_WARN_MS;
   const waited = (): number => Date.now() - startedAt;
@@ -186,30 +244,38 @@ export async function acquireStorageActivityLease(
       continue;
     }
 
-    // Plant, retrying on ENOENT — see plantStorageActivityMarker below, which
-    // this mirrors. The mkdir is INSIDE the try on purpose: a recursive mkdir
-    // is not atomic, so a releasing holder's rmdir of this same directory can
-    // make the mkdir itself fail ENOENT, not just the writeFile after it.
-    await plantWithEnoentRetry(
-      async () => {
-        await fs.promises.mkdir(activeDir, { recursive: true });
-        await fs.promises.writeFile(marker, `${process.pid}\n`, { flag: 'w' });
-      },
-      async () => {
-        await fs.promises.rm(marker, { force: true }).catch(() => undefined);
-        await fs.promises.rmdir(activeDir).catch(() => undefined);
-      },
-    );
+    // Announce the plant BEFORE the first syscall and keep it announced until
+    // either holdLease takes over or we have withdrawn — the directory is
+    // then continuously spoken for, so no in-process releaser can remove it
+    // mid-plant.
+    beginPlant(key);
+    try {
+      // Plant, retrying on ENOENT — see plantStorageActivityMarker below,
+      // which this mirrors. The mkdir is INSIDE the try on purpose: a
+      // recursive mkdir is not atomic, so a rmdir of this same directory can
+      // make the mkdir itself fail ENOENT, not just the writeFile after it.
+      await plantWithEnoentRetry(
+        async () => {
+          await fs.promises.mkdir(activeDir, { recursive: true });
+          await fs.promises.writeFile(marker, `${process.pid}\n`, { flag: 'w' });
+        },
+        async () => {
+          await fs.promises.rm(marker, { force: true }).catch(() => undefined);
+          await removeActiveDirIfUnused(key, activeDir, 1);
+        },
+      );
 
-    if (await claimExists(resourceRoot)) {
-      await fs.promises.rm(marker, { force: true });
-      await delay(CLAIM_WAIT_MS);
-      noteWait();
-      continue;
+      if (await claimExists(resourceRoot)) {
+        await fs.promises.rm(marker, { force: true });
+        await delay(CLAIM_WAIT_MS);
+        noteWait();
+        continue;
+      }
+
+      holdLease(key);
+    } finally {
+      endPlant(key);
     }
-
-    const key = leaseKey(resourceRoot);
-    holdLease(key);
     let released = false;
     return {
       async release() {
@@ -217,11 +283,15 @@ export async function acquireStorageActivityLease(
         released = true;
         dropLease(key);
         await fs.promises.rm(marker, { force: true });
-        try {
-          await fs.promises.rmdir(activeDir);
-        } catch {
-          // Other live holders (or a concurrent acquisition) still own it.
-        }
+        // Only the last in-process user removes the directory. Relying on
+        // ENOTEMPTY to make this a no-op does not work: it succeeds whenever
+        // the other users happen to be between their own rm and rmdir, or are
+        // mid-plant with no marker on disk yet, and their plant then loses its
+        // mkdir or its writeFile. Same-process overlap is what the incident
+        // was — two concurrent deliverToAgent calls on one session — so this
+        // removes the dominant window. Cross-process rmdirs remain, and the
+        // bounded ENOENT retry above still covers those.
+        await removeActiveDirIfUnused(key, activeDir);
       },
     };
   }
@@ -259,13 +329,12 @@ export function plantStorageActivityMarker(resourceRoot: string, holderId: strin
 
   const activeDir = activeDirPath(resourceRoot);
   const marker = path.join(activeDir, markerName(`${holderId}-${process.pid}-${randomUUID()}`));
+  const key = leaseKey(resourceRoot);
   const discard = (): void => {
     fs.rmSync(marker, { force: true });
-    try {
-      fs.rmdirSync(activeDir);
-    } catch {
-      // Another live holder still owns it.
-    }
+    // An async lease or plant started on this root AFTER the early return
+    // above must not lose its directory here — same rule as release().
+    removeActiveDirIfUnusedSync(key, activeDir, plantsInFlight.has(key) ? 1 : 0);
   };
   // Plant under the bounded ENOENT retry. A releasing holder's
   // `fs.promises.rmdir` runs its syscall on the libuv threadpool, so it can
@@ -277,10 +346,19 @@ export function plantStorageActivityMarker(resourceRoot: string, holderId: strin
   // partial marker) is real: discard so we neither proceed unprotected nor
   // strand a file that blocks this root's reclaim forever, and let the caller
   // see it. acquireStorageActivityLease above mirrors this same handling.
-  plantWithEnoentRetrySync(() => {
-    fs.mkdirSync(activeDir, { recursive: true });
-    fs.writeFileSync(marker, `${process.pid}\n`, { flag: 'w' });
-  }, discard);
+  //
+  // Announced as in-flight for the same reason the async path announces it:
+  // a release on another turn of the event loop must not rmdir the directory
+  // between this mkdir and this writeFile.
+  beginPlant(key);
+  try {
+    plantWithEnoentRetrySync(() => {
+      fs.mkdirSync(activeDir, { recursive: true });
+      fs.writeFileSync(marker, `${process.pid}\n`, { flag: 'w' });
+    }, discard);
+  } finally {
+    endPlant(key);
+  }
   if (fs.existsSync(cleanupClaimPath(resourceRoot))) {
     discard();
     throw new Error(`session storage is being reclaimed, retry: ${resourceRoot}`);
