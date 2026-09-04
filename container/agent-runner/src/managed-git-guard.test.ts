@@ -122,6 +122,12 @@ describe('managed repository Git maintenance guard', () => {
     for (const command of denied) {
       expect(evaluateManagedGitCommand(command, managedEnv)).toMatchObject({ action: 'deny' });
     }
+    const guidance = evaluateManagedGitCommand('git worktree prune', managedEnv);
+    expect(guidance.action).toBe('deny');
+    if (guidance.action === 'deny') {
+      expect(guidance.reason).toContain('continueFromThreadId');
+      expect(guidance.reason).not.toContain('ask the host operator');
+    }
   });
 
   it('allows ordinary topic work and does not activate outside a managed repository container', () => {
