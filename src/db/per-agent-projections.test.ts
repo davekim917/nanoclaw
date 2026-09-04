@@ -1087,6 +1087,21 @@ describe('decideArchiveProjectionMode — #360', () => {
     expect(decideArchiveProjectionMode(dst, stamp(), next).mode).toBe('rebuilt');
   });
 
+  it('rebuilds when maxRowid went DOWN at an unchanged count', () => {
+    // A restore from backup can land a file with the same number of rows and a
+    // lower high-water mark. Reuse would serve rows the source no longer has,
+    // and append would start from a watermark above everything present.
+    const next = stamp({ rows: { count: 10, maxRowid: 60 } });
+    expect(decideArchiveProjectionMode(dst, stamp(), next).mode).toBe('rebuilt');
+  });
+
+  it('rebuilds on any maxRowid decrease, whatever the count did', () => {
+    for (const count of [8, 10, 12]) {
+      const next = stamp({ rows: { count, maxRowid: 60 } });
+      expect(decideArchiveProjectionMode(dst, stamp(), next).mode, `count ${count}`).toBe('rebuilt');
+    }
+  });
+
   it('rebuilds on an in-place edit, which no watermark can see', () => {
     const next = stamp({ rows: { count: 10, maxRowid: 100 }, mutations: 1 });
     expect(decideArchiveProjectionMode(dst, stamp(), next).mode).toBe('rebuilt');

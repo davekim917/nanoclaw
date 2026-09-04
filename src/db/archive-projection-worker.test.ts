@@ -31,7 +31,7 @@ import {
   readArchiveProjectionStamp,
   removeArchiveProjectionStamp,
 } from './per-agent-projections.js';
-import { ARCHIVE_MUTATION_MARKS_SQL } from '../message-archive.js';
+import { ARCHIVE_MUTATION_MARKS_SQL, ARCHIVE_UPSERT_SQL } from '../message-archive.js';
 
 // The stamp path (per-agent-projections.js) is always `DATA_DIR/projection-
 // stamps/<digest>.json`, regardless of where the projection db itself lives —
@@ -101,10 +101,14 @@ function makeTwoWorkgroupSource(label: string): string {
       sender_name         TEXT,
       text                TEXT NOT NULL,
       sent_at             TEXT NOT NULL,
-      created_at          TEXT NOT NULL,
+      -- Same DEFAULT as the real schema in message-archive.ts. Load-bearing:
+      -- the host's upsert does not supply created_at, so a fixture without it
+      -- fails NOT NULL on any write driven through ARCHIVE_UPSERT_SQL.
+      created_at          TEXT NOT NULL DEFAULT (datetime('now')),
       channel_name        TEXT
     );
     CREATE INDEX idx_archive_ag_sent ON messages_archive(agent_group_id, sent_at);
+    CREATE INDEX idx_archive_thread ON messages_archive(agent_group_id, thread_id, sent_at);
   `);
   // The mutation counters the freshness stamp reads, taken from the writer that
   // owns them so the fixture cannot drift from what `initSchema` creates.
@@ -205,6 +209,51 @@ function archiveInto(file: string, row: Msg): void {
   } finally {
     db.close();
   }
+}
+
+/**
+ * Archive a message through the host's REAL write statement.
+ *
+ * Not a hand-copied lookalike: `ARCHIVE_UPSERT_SQL` is the one statement
+ * `archiveMessage`/`upsertArchiveMessage` run, so an "edit" here is exactly the
+ * `ON CONFLICT(id) DO UPDATE` an edited chat message or a redelivered outbound
+ * row produces on the live host — the case the whole marks mechanism exists for.
+ */
+function upsertThroughHostStatement(file: string, msg: Partial<ArchiveUpsert> & { id: string }): void {
+  const db = new Database(file);
+  try {
+    db.prepare(ARCHIVE_UPSERT_SQL).run({
+      id: msg.id,
+      agentGroupId: msg.agentGroupId ?? 'ag-one-a',
+      messagingGroupId: msg.messagingGroupId ?? 'mg-1',
+      channelType: msg.channelType ?? 'slack',
+      channelName: msg.channelName ?? 'general',
+      platformId: msg.platformId ?? 'p1',
+      threadId: msg.threadId ?? 'thread-1',
+      role: msg.role ?? 'assistant',
+      senderId: msg.senderId ?? 'ag-one-a',
+      senderName: msg.senderName ?? 'Someone',
+      text: msg.text ?? 'text',
+      sentAt: msg.sentAt ?? '2026-01-01T10:01:00Z',
+    });
+  } finally {
+    db.close();
+  }
+}
+
+interface ArchiveUpsert {
+  id: string;
+  agentGroupId: string;
+  messagingGroupId: string | null;
+  channelType: string;
+  channelName: string | null;
+  platformId: string | null;
+  threadId: string | null;
+  role: string;
+  senderId: string | null;
+  senderName: string | null;
+  text: string;
+  sentAt: string;
 }
 
 function allRows(file: string): Array<Record<string, unknown>> {
@@ -360,18 +409,40 @@ describe('#315 — an unchanged source is not rebuilt', () => {
 
     await ensureArchiveProjection(src, dst, 'ag-one-a', ['ag-one-a', 'ag-one-b']);
 
-    // An EDIT, not an append. `messages_archive` is upserted with
-    // `ON CONFLICT(id) DO UPDATE SET text = ...`, so this moves neither the row
-    // count nor MAX(rowid), and an append would carry the stale text past the
-    // container forever. The source's mutation counters exist for exactly this
-    // case and must force a FULL rebuild, not an append.
-    const db = new Database(src);
-    db.prepare("UPDATE messages_archive SET text = 'edited in place' WHERE id = 'w1-a-a'").run();
-    db.close();
+    // An EDIT, not an append, driven through the host's REAL write statement:
+    // `messages_archive` is upserted with `ON CONFLICT(id) DO UPDATE SET
+    // text = ...`, so this moves neither the row count nor MAX(rowid), and an
+    // append would carry the stale text past the container forever. The
+    // source's mutation counters exist for exactly this case and must force a
+    // FULL rebuild, not an append.
+    upsertThroughHostStatement(src, { id: 'w1-a-a', text: 'edited in place' });
 
     expect((await ensureArchiveProjection(src, dst, 'ag-one-a', ['ag-one-a', 'ag-one-b'])).mode).toBe('rebuilt');
     expect(allRows(dst).map((row) => row.text)).toContain('edited in place');
     expect(allRows(dst).map((row) => row.text)).not.toContain('answer from a');
+  });
+
+  it('reuses when the same message is re-archived with identical content', async () => {
+    const src = makeTwoWorkgroupSource('idempotent-upsert');
+    useFakeWorker();
+    const dst = tmpPath('idempotent-upsert-dst');
+
+    await ensureArchiveProjection(src, dst, 'ag-one-a', ['ag-one-a', 'ag-one-b']);
+    const mtime = fs.statSync(dst).mtimeMs;
+
+    // A redelivery that carries the same text, sender_name and channel_name.
+    // The row is rewritten, but nothing the projection reads has moved, so the
+    // marks triggers must NOT fire and this must stay a reuse — otherwise every
+    // retry on the live host would cost a full rebuild.
+    upsertThroughHostStatement(src, {
+      id: 'w1-a-a',
+      text: 'answer from a',
+      senderName: 'Someone',
+      channelName: 'general',
+    });
+
+    expect((await ensureArchiveProjection(src, dst, 'ag-one-a', ['ag-one-a', 'ag-one-b'])).mode).toBe('reused');
+    expect(fs.statSync(dst).mtimeMs).toBe(mtime);
   });
 
   it('rebuilds when the workgroup membership changes', async () => {
@@ -758,6 +829,27 @@ describe('#360 — a message elsewhere does not rebuild this projection', () => 
     expect(result.rows).toBe(0);
     expect(fs.statSync(dst).mtimeMs).toBe(mtime);
     expect(allRows(dst).map((row) => row.text)).not.toContain('other tenant follow-up');
+  });
+
+  it('reuses when the OTHER workgroup EDITS a message', async () => {
+    const src = makeTwoWorkgroupSource('cross-wg-edit');
+    useFakeWorker();
+    const dst = tmpPath('cross-wg-edit-dst');
+
+    await ensureArchiveProjection(src, dst, 'ag-one-a', scope);
+    const mtime = fs.statSync(dst).mtimeMs;
+
+    // Workgroup two edits one of its own rows. Its mark moves; ours does not.
+    upsertThroughHostStatement(src, {
+      id: 'w2-a-a',
+      agentGroupId: 'ag-two-a',
+      senderId: 'ag-two-a',
+      text: 'other tenant reply, edited',
+      sentAt: '2026-01-01T11:01:00Z',
+    });
+
+    expect((await ensureArchiveProjection(src, dst, 'ag-one-a', scope)).mode).toBe('reused');
+    expect(fs.statSync(dst).mtimeMs).toBe(mtime);
   });
 
   it('appends this workgroup\'s new rows and lands what a full rebuild would', async () => {
