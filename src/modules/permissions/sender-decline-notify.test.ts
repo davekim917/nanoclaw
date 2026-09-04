@@ -220,7 +220,7 @@ describe('unknown-sender decline_notify flow', () => {
     expect(dKind).toBe('chat-sdk');
     expect(dInstance).toBe('telegram');
     const decline = JSON.parse(dContent as string);
-    expect(decline.text).toBe("I'm Dave's personal agent — I can't help you directly.");
+    expect(decline.text).toBe("I'm Owner's personal agent — I can't help you directly.");
     expect(decline.type).toBeUndefined(); // plain text, not ask_question
     expect(decline.options).toBeUndefined(); // no buttons
 
