@@ -26,11 +26,11 @@
  * which needs at least three instances (Slack turns a two-party open into a
  * 1:1 IM).
  *
- * Unlike upstream's version this writes nothing to `.env`. This fork has no
- * `SLACK_A2A_ROOMS` allowlist: sibling-bot inbound is admitted everywhere by
- * `isSiblingBotSender` (src/modules/permissions/access.ts) and runaway loops
- * are bounded per thread by `SLACK_MAX_BOT_HOPS`
- * (src/channels/slack-hop-limit.ts), so a new room needs no registration.
+ * Opening the room is the whole side effect: this reads `.env` and writes
+ * nothing back, because a room carries no host-side registration. Sibling-bot
+ * inbound reaches the router in every conversation via `isSiblingBotSender`
+ * (src/modules/permissions/access.ts), and runaway loops are bounded per
+ * thread by `SLACK_MAX_BOT_HOPS` (src/channels/slack-hop-limit.ts).
  *
  * Token values are never printed.
  */
