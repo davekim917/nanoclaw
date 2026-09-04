@@ -24,7 +24,7 @@ import { getAgentGroup } from '../../db/agent-groups.js';
 import { getWorkgroupOnecliSecrets } from '../../db/agent-groups.js';
 import { getMessagingGroup } from '../../db/messaging-groups.js';
 import { getDb } from '../../db/connection.js';
-import { findSystemSession, taskThreadId, touchSessionActivity } from '../../db/sessions.js';
+import { findSystemSession, invalidateSessionQuiet, taskThreadId, touchSessionActivity } from '../../db/sessions.js';
 import { readSessionInbound, type ScheduledTaskRow } from '../../modules/mailbox/index.js';
 import { withExistingMailboxSession } from '../../session-manager.js';
 import * as scheduledTasks from '../../db/scheduled-tasks.js';
@@ -673,8 +673,23 @@ export const moveExecuteHandler: AuthHandler = async (req, params, ctx) => {
             // means the touch lands before `purgeIntentBody` below, same as
             // before: a crash between the two still leaves the intent for
             // `recoverMoveIntents` to finish.
-            touchSessionActivity(source.sessionId);
+            //
+            // FAIL-CLOSED (Codex round 2, H1): `invalidateSessionQuiet` throws,
+            // and the throw escapes into the `restoreErr` catch below —
+            // `restored` stays false, the `move_restore_failed` audit row is
+            // written and `purgeIntentBody` is SKIPPED, so `recoverMoveIntents`
+            // still owns the repair. A swallowed failure would restore the row
+            // behind a mark nothing clears and then purge the intent that is the
+            // only record of the work.
+            invalidateSessionQuiet(source.sessionId);
             mailbox.restoreTaskRow(restoreSnapshot);
+            // Re-invalidate after the restore: a sweep tick inside the awaited
+            // target insert above can have flushed a quiet mark computed on the
+            // `last_active` written a line ago, and `persistQuietSessionMarks`
+            // writes only `WHERE last_active IS <basis>` — advancing the column
+            // again clears a flushed mark and disarms an in-flight one.
+            // Swallowing is right here: the row has landed.
+            touchSessionActivity(source.sessionId);
             return true;
           })) ?? false;
       }

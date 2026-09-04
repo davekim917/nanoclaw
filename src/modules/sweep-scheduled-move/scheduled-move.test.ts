@@ -56,19 +56,26 @@ function childProcessTripwire(record: string[]): Record<string, (...args: unknow
   };
 }
 
-// Codex round 2, H1: `touchSessionActivity` writes the central `sessions` row
-// through the module singleton, which this file's self-contained describe
-// deliberately never initializes. Record the call instead — the helper's real
+// Codex round 2, H1: both quiet-mark invalidations write the central `sessions`
+// row through the module singleton, which this file's self-contained describe
+// deliberately never initializes. Record the calls instead — their real
 // behavior (nulling `sweep_quiet_until` in the same statement that writes
 // `last_active`) is asserted against real SQLite in
 // src/db/migrations/065-sessions-sweep-quiet-until.test.ts.
+//
+// Each entry is `<phase>:<session id>`: the restore is BRACKETED by a
+// fail-closed `invalidateSessionQuiet` before the row lands and an advisory
+// `touchSessionActivity` after it, so the ordering is observable here.
 const touched = vi.hoisted(() => [] as string[]);
 vi.mock('../../db/sessions.js', async (importOriginal) => {
   const real = await importOriginal<typeof import('../../db/sessions.js')>();
   return {
     ...real,
+    invalidateSessionQuiet: (id: string) => {
+      touched.push(`pre:${id}`);
+    },
     touchSessionActivity: (id: string) => {
-      touched.push(id);
+      touched.push(`post:${id}`);
     },
   };
 });
@@ -449,7 +456,39 @@ describe('recoverMoveIntents (D3) + pruneAuditBodies (D4)', () => {
       .prepare("SELECT COUNT(*) AS c FROM messages_in WHERE series_id='ser-touch'")
       .get() as { c: number };
     expect(live.c, 'the restore did not happen, so the touch proves nothing').toBe(1);
-    expect(touched, 'a restored task row left the source session quiet-marked').toEqual(['src-sess']);
+    expect(touched, 'a restored task row left the source session quiet-marked').toEqual([
+      'pre:src-sess',
+      'post:src-sess',
+    ]);
+    expect(h.spawns).toEqual([]);
+    db.close();
+  });
+
+  // Codex round 2, H1 (b). Fail-closed: a central DB that refuses the
+  // pre-restore invalidation must leave the intent UNRESOLVED for the next
+  // pass rather than restore a due row behind a mark nothing will clear.
+  it('leaves the intent unresolved when the pre-restore invalidation fails', async () => {
+    touched.length = 0;
+    const db = centralDb();
+    const inbound = seedInbound('src-ag', 'src-sess');
+    writeIntent(db, { seriesId: 'ser-faulted', ag: 'src-ag', sess: 'src-sess', tsMs: NOW - 2 * SWEEP_MS });
+
+    const sessionsModule = await import('../../db/sessions.js');
+    const spy = vi.spyOn(sessionsModule, 'invalidateSessionQuiet').mockImplementation((id: string) => {
+      throw new sessionsModule.QuietInvalidationError(id, new Error('central DB is read-only'));
+    });
+    await recoverMoveIntents(db, { nowMs: NOW });
+    spy.mockRestore();
+
+    const live = openInboundDb(inbound)
+      .prepare("SELECT COUNT(*) AS c FROM messages_in WHERE series_id='ser-faulted'")
+      .get() as { c: number };
+    expect(live.c, 'the restore landed behind a mark nothing will clear').toBe(0);
+    const row = db
+      .prepare("SELECT resolved_at, detail_json FROM move_intents WHERE series_id = 'ser-faulted'")
+      .get() as { resolved_at: string | null; detail_json: string | null };
+    expect(row.resolved_at, 'the intent was stamped resolved with nothing restored').toBeNull();
+    expect(row.detail_json, 'the snapshot the next pass needs was purged').not.toBeNull();
     expect(h.spawns).toEqual([]);
     db.close();
   });

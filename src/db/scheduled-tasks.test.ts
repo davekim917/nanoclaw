@@ -461,34 +461,45 @@ describe('scheduleTask invalidates the target session quiet mark (S2-PR15)', () 
 
 // ── Crash-safety ordering (Codex pre-pass, review/b3/review.json Part C) ────
 //
-// The quiet-mark touch and the task-row write are two separate DB files with
-// no shared transaction. A crash between them is survivable only if the touch
-// (central DB, advisory, harmless if spurious) happens BEFORE the write
+// The quiet-mark invalidation and the task-row write are two separate DB files
+// with no shared transaction. A crash between them is survivable only if the
+// invalidation (central DB, harmless if spurious) happens BEFORE the write
 // (session DB, the thing that actually needs the mark gone) — the reverse
 // lets a persisted quiet mark outlive a task row a warmed restart cannot see.
-describe('scheduleTask invalidates the quiet mark before writing the task row, not after', () => {
-  it('touchSessionActivity fires before the task row exists in the session DB', async () => {
+//
+// Codex round 2 (H1) added the second half: `write` awaits the mailbox funnel,
+// so a sweep tick can flush a mark INSIDE that await, based on the
+// `last_active` the pre-write invalidation just published. `scheduleTask`
+// therefore brackets the write — fail-closed before, advisory after.
+/** Does a live task row for `seriesId` exist in this session's inbound.db right now? */
+function taskRowVisible(sessionId: string, seriesId: string): boolean {
+  const dbPath = inboundPath(sessionId);
+  // `resolveTaskSession` provisions a brand-new task session's inbound.db
+  // (schema only) synchronously, so the file's existence proves nothing on its
+  // own — whether the task ROW is there yet is the write this ordering protects.
+  if (!fs.existsSync(dbPath)) return false;
+  const db = openInboundDb(dbPath);
+  const row = db.prepare('SELECT 1 FROM messages_in WHERE series_id = ? LIMIT 1').get(seriesId);
+  db.close();
+  return row !== undefined;
+}
+
+describe('scheduleTask brackets the task-row write with quiet-mark invalidations', () => {
+  it('invalidates before the row exists and re-invalidates once it does', async () => {
     seedActiveSession();
     seedInboundDb();
 
     const sessionsModule = await import('./sessions.js');
+    const originalInvalidate = sessionsModule.invalidateSessionQuiet;
     const originalTouch = sessionsModule.touchSessionActivity;
-    const rowPresentAtTouchTime: boolean[] = [];
-    const touchSpy = vi.spyOn(sessionsModule, 'touchSessionActivity').mockImplementation((id: string) => {
-      // Read the SAME session's inbound.db, at the instant the quiet mark is
-      // invalidated, before calling through to the real touch. `resolveTaskSession`
-      // may already have provisioned a brand-new task session's inbound.db (schema
-      // only), so the file's existence proves nothing on its own — whether the
-      // task ROW is there yet is the actual write this ordering protects.
-      const dbPath = inboundPath(id);
-      if (!fs.existsSync(dbPath)) {
-        rowPresentAtTouchTime.push(false);
-      } else {
-        const db = openInboundDb(dbPath);
-        const row = db.prepare("SELECT 1 FROM messages_in WHERE series_id = 's-order' LIMIT 1").get();
-        db.close();
-        rowPresentAtTouchTime.push(row !== undefined);
-      }
+    // Each entry: which call fired, and whether the task row was already there.
+    const observed: Array<[string, boolean]> = [];
+    const preSpy = vi.spyOn(sessionsModule, 'invalidateSessionQuiet').mockImplementation((id: string) => {
+      observed.push(['pre', taskRowVisible(id, 's-order')]);
+      return originalInvalidate(id);
+    });
+    const postSpy = vi.spyOn(sessionsModule, 'touchSessionActivity').mockImplementation((id: string) => {
+      observed.push(['post', taskRowVisible(id, 's-order')]);
       return originalTouch(id);
     });
 
@@ -501,19 +512,99 @@ describe('scheduleTask invalidates the quiet mark before writing the task row, n
       prompt: 'do thing',
       destination: TEST_DESTINATION,
     });
-    touchSpy.mockRestore();
+    preSpy.mockRestore();
+    postSpy.mockRestore();
 
-    // touchSessionActivity ran exactly once (the happy path never retries) and
-    // saw no row for this series at that instant — the write had not happened
-    // yet.
-    expect(rowPresentAtTouchTime).toEqual([false]);
+    // Exactly one of each (the happy path never retries): the fail-closed call
+    // ran with no row yet, the advisory one ran with the row in place. The
+    // second entry is also the positive control — it proves the absence in the
+    // first was ordering, not a write that silently never happened.
+    expect(observed).toEqual([
+      ['pre', false],
+      ['post', true],
+    ]);
+  });
 
-    // Positive control: the row IS there once scheduleTask returns — proves
-    // the absence above was ordering, not a write that silently never happened.
-    const db = openInboundDb(taskInboundPath('s-order'));
-    const row = db.prepare("SELECT 1 FROM messages_in WHERE series_id = 's-order' LIMIT 1").get();
-    db.close();
-    expect(row).toBeTruthy();
+  // Codex round 2, H1 (a). The interleave the post-write call exists for.
+  it('a quiet mark flushed inside the write does not outlive the task row', async () => {
+    seedActiveSession();
+    seedInboundDb();
+
+    const sessionsModule = await import('./sessions.js');
+    const originalInvalidate = sessionsModule.invalidateSessionQuiet;
+    const markLanded: boolean[] = [];
+    // Stand in for a whole sweep tick landing in the mailbox funnel's await:
+    // it reads `last_active` AFTER the pre-write invalidation, sees a session
+    // with nothing due (the upsert has not happened), and flushes a mark on
+    // that basis. This is `persistQuietSessionMarks` itself, not a hand-written
+    // UPDATE, so the `WHERE last_active IS <basis>` guard is the real one.
+    const preSpy = vi.spyOn(sessionsModule, 'invalidateSessionQuiet').mockImplementation((id: string) => {
+      originalInvalidate(id);
+      const basis = (
+        getDb().prepare('SELECT last_active FROM sessions WHERE id = ?').get(id) as { last_active: string | null }
+      ).last_active;
+      sessionsModule.persistQuietSessionMarks([
+        { sessionId: id, quietUntil: '2099-01-01T00:00:00.000Z', lastActive: basis },
+      ]);
+      // Control: the flush actually took (its basis guard matched), so the
+      // assertion below is about the mark being cleared, not never written.
+      markLanded.push(
+        (
+          getDb().prepare('SELECT sweep_quiet_until FROM sessions WHERE id = ?').get(id) as {
+            sweep_quiet_until: string | null;
+          }
+        ).sweep_quiet_until !== null,
+      );
+    });
+
+    await scheduleTask({
+      id: 't-interleave',
+      agentGroupId: AGENT_GROUP_ID,
+      cron: '0 3 * * *',
+      processAfter: new Date(Date.now() + 86400000).toISOString(),
+      seriesId: 's-interleave',
+      prompt: 'do thing',
+      destination: TEST_DESTINATION,
+    });
+    preSpy.mockRestore();
+
+    expect(markLanded, 'the simulated sweep never established a mark to clear').toEqual([true]);
+
+    const sessionId = taskSessionIdFor('s-interleave');
+    const after = getDb().prepare('SELECT sweep_quiet_until FROM sessions WHERE id = ?').get(sessionId) as {
+      sweep_quiet_until: string | null;
+    };
+    expect(after.sweep_quiet_until, 'a mark flushed mid-write outlived the task row it hides').toBeNull();
+    expect(taskRowVisible(sessionId, 's-interleave'), 'no task row was written at all').toBe(true);
+  });
+
+  // Codex round 2, H1 (b). Fail-closed: a central DB that refuses the
+  // invalidation must not let the session-DB row land behind a live mark.
+  it('a failed invalidation aborts the schedule before any task row is written', async () => {
+    seedActiveSession();
+    seedInboundDb();
+
+    const sessionsModule = await import('./sessions.js');
+    const preSpy = vi.spyOn(sessionsModule, 'invalidateSessionQuiet').mockImplementation((id: string) => {
+      throw new sessionsModule.QuietInvalidationError(id, new Error('central DB is read-only'));
+    });
+
+    await expect(
+      scheduleTask({
+        id: 't-faulted',
+        agentGroupId: AGENT_GROUP_ID,
+        cron: '0 3 * * *',
+        processAfter: new Date(Date.now() + 86400000).toISOString(),
+        seriesId: 's-faulted',
+        prompt: 'do thing',
+        destination: TEST_DESTINATION,
+      }),
+    ).rejects.toThrow(/quiet-mark invalidation failed/);
+    preSpy.mockRestore();
+
+    // The task session was resolved (and its inbound.db provisioned) before the
+    // invalidation, so the row's absence is the abort, not a missing session.
+    expect(taskRowVisible(taskSessionIdFor('s-faulted'), 's-faulted')).toBe(false);
   });
 });
 

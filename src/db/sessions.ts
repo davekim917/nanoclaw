@@ -197,6 +197,60 @@ export function updateSession(
     .run(values);
 }
 
+/** A central-DB quiet-mark invalidation that did not land. Thrown, never swallowed. */
+export class QuietInvalidationError extends Error {
+  readonly sessionId: string;
+  constructor(sessionId: string, cause: unknown) {
+    super(`quiet-mark invalidation failed for session ${sessionId}`, { cause });
+    this.name = 'QuietInvalidationError';
+    this.sessionId = sessionId;
+  }
+}
+
+/**
+ * The `last_active` this invalidation must write so the write is an
+ * OBSERVABLE advance. `updateSession` nulls `sweep_quiet_until` in the same
+ * statement, but nulling is only half the job: `persistQuietSessionMarks`
+ * writes a mark under `WHERE last_active IS <basis>`, so a flush still in
+ * flight when this lands re-establishes the mark unless `last_active` has
+ * moved off the basis it was computed on. `toISOString()` is millisecond
+ * resolution, so two invalidations inside one millisecond would write the
+ * SAME string and leave that guard satisfied — the pre-write/post-write pair
+ * around a fast mailbox write is exactly that case. Advancing by 1 ms when
+ * the clock has not moved keeps the column strictly increasing per session
+ * (the host is its only writer, and this read + `updateSession` run with no
+ * `await` between them, so no other host code can interleave).
+ */
+function advancedLastActive(current: string | null, now: string): string {
+  if (current === null || current < now) return now;
+  const parsed = Date.parse(current);
+  return Number.isNaN(parsed) ? now : new Date(parsed + 1).toISOString();
+}
+
+/**
+ * Invalidate a session's quiet mark, FAIL-CLOSED: bumps central `last_active`
+ * (which nulls `sweep_quiet_until` in the same statement — see
+ * `updateSession`) and THROWS `QuietInvalidationError` if the central DB
+ * refuses the write.
+ *
+ * This is the variant every due-ness writer calls BEFORE its session-DB
+ * write. A swallowed failure there is not "advisory": the session-DB row
+ * still lands, the persisted mark (migration 065) still hides it, and a
+ * warmed restart sleeps through the task's first fire for up to
+ * `QUIET_SESSION_BACKOFF_MS`. Aborting the mutation instead leaves the
+ * caller's own failure path (a 503, an unresolved move intent, a thrown
+ * `scheduleTask`) to be retried — a loud non-write beats a silent
+ * never-fires.
+ */
+export function invalidateSessionQuiet(id: string): void {
+  try {
+    const now = new Date().toISOString();
+    updateSession(id, { last_active: advancedLastActive(getSession(id)?.last_active ?? null, now) });
+  } catch (err) {
+    throw new QuietInvalidationError(id, err);
+  }
+}
+
 /**
  * Bump a session's central last_active to now. REQUIRED after any write that
  * changes when the session next has due work (task insert, process_after
@@ -204,10 +258,16 @@ export function updateSession(
  * sweep's activity horizon both key on last_active, so a task written into a
  * quiet/dormant session without this bump sits unseen until the cache
  * expires — or, past the 7-day delivery horizon, indefinitely.
+ *
+ * The SWALLOWING variant of `invalidateSessionQuiet`, and correct in exactly
+ * one position: AFTER a due-ness write that has already landed. There the
+ * mutation cannot be aborted any more, so a failure has nowhere to go but the
+ * log — and the pre-write fail-closed invalidation has already run, so the
+ * durable state is no worse than before this call was attempted.
  */
 export function touchSessionActivity(id: string): void {
   try {
-    updateSession(id, { last_active: new Date().toISOString() });
+    invalidateSessionQuiet(id);
   } catch (err) {
     // Advisory freshness hint — a failed bump must never abort the task
     // write it rides on. Worst case is the old behavior (cache skips until
