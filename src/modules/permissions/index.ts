@@ -177,7 +177,7 @@ async function handleUnknownSender(
       accessReason,
     },
   );
-  recordDroppedMessage(dropRecord);
+  await recordDroppedMessage(dropRecord);
 
   // decline_notify: polite in-DM decline + one-line owner FYI, no card.
   // Fire-and-forget like the hold path — declineAndNotify dedupes itself

@@ -1187,7 +1187,7 @@ async function spawnContainer(
     // go: close out that outage episode. Without this the failure streak
     // grows monotonically forever, so a provider healthy for weeks would
     // still open its next outage at the 6h backoff cap instead of 15m.
-    markProviderAvailable(agentGroup.id, providerDecision.primaryProvider);
+    await markProviderAvailable(agentGroup.id, providerDecision.primaryProvider);
   }
   // Local shadow: the fallback must beat a stamped session row for THIS spawn
   // without persisting a provider change to the session.

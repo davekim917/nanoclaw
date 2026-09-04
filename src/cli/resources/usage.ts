@@ -56,7 +56,7 @@ registerResource({
         { name: 'days', type: 'number', description: 'Only rows from the last N days.' },
       ],
       handler: async (args) =>
-        listUsageDaily({
+        await listUsageDaily({
           agentGroupId: args.group as string | undefined,
           sinceDate: args.since as string | undefined,
           days: args.days as number | undefined,
@@ -93,7 +93,7 @@ registerResource({
         'ncl usage summary --by session --group <agent-group-id> --days 7',
       ],
       handler: async (args) =>
-        summarizeTurnUsage({
+        await summarizeTurnUsage({
           dimensions: parseDimensions(args.by as string | undefined),
           agentGroupId: args.group as string | undefined,
           sinceDate: args.since as string | undefined,

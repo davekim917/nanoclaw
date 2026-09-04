@@ -122,7 +122,7 @@ export function registerUsageSweepDuties(): void {
       } catch (err) {
         log.warn('Usage rollup sweep step failed', { err });
       }
-      pruneOldTurnUsage();
+      await pruneOldTurnUsage();
     },
   });
 }
