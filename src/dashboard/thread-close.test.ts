@@ -77,13 +77,21 @@ vi.mock('../session-manager.js', async (importOriginal) => {
   };
 });
 
-vi.mock('../container-runner.js', () => ({
-  isContainerRunning: () => false,
-  containerOwnsOutbound: () => (containerOwns.queue.length > 0 ? containerOwns.queue.shift()! : containerOwns.value),
-  killContainer: () => {},
-  getActiveContainerSessionIds: () => [],
-  resolveAssistantName: (group: { name: string }) => Promise.resolve(group.name),
-}));
+// Spread the real module so exports this suite doesn't assert on —
+// `sessionStillActive` isn't reached today, but staying wired means a future
+// caller that reaches for it doesn't throw "no such export" the way #291's
+// guard conversion did to four other suites.
+vi.mock('../container-runner.js', async (importOriginal) => {
+  const real = await importOriginal<typeof import('../container-runner.js')>();
+  return {
+    ...real,
+    isContainerRunning: () => false,
+    containerOwnsOutbound: () => (containerOwns.queue.length > 0 ? containerOwns.queue.shift()! : containerOwns.value),
+    killContainer: () => {},
+    getActiveContainerSessionIds: () => [],
+    resolveAssistantName: (group: { name: string }) => Promise.resolve(group.name),
+  };
+});
 
 // Point DATA_DIR at a scratch tree so the wrap-up write and the REAL
 // force-clear run against real SQLite files through the mailbox seam, not

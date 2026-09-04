@@ -17,12 +17,20 @@ import fs from 'fs';
 import Database from 'better-sqlite3';
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 
-vi.mock('./container-runner.js', () => ({
-  wakeContainer: vi.fn().mockResolvedValue(true),
-  isContainerRunning: vi.fn().mockReturnValue(false),
-  getActiveContainerCount: vi.fn().mockReturnValue(0),
-  killContainer: vi.fn(),
-}));
+// Spread the real module so exports the router path touches but this suite
+// doesn't assert on — `sessionStillActive` is built from a real `getSession`
+// read against the suite's own DB, not stubbed — stay wired instead of
+// throwing "no such export" the next time router.ts reaches for one.
+vi.mock('./container-runner.js', async (importOriginal) => {
+  const real = await importOriginal<typeof import('./container-runner.js')>();
+  return {
+    ...real,
+    wakeContainer: vi.fn().mockResolvedValue(true),
+    isContainerRunning: vi.fn().mockReturnValue(false),
+    getActiveContainerCount: vi.fn().mockReturnValue(0),
+    killContainer: vi.fn(),
+  };
+});
 
 vi.mock('./config.js', async () => {
   const actual = await vi.importActual('./config.js');

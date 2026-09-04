@@ -40,11 +40,19 @@ vi.mock('./steer.js', async (orig) => ({
 }));
 
 // container-runner drags in the whole spawn path; `threads.ts` needs two
-// functions off it and neither matters here.
-vi.mock('../container-runner.js', () => ({
-  getActiveContainerSessionIds: () => [],
-  resolveAssistantName: (group: { name: string }) => Promise.resolve(`persona:${group.name}`),
-}));
+// functions off it and neither matters here. Spread the real module so
+// exports this suite doesn't assert on — `sessionStillActive` isn't reached
+// today, but staying wired means a future caller that reaches for it doesn't
+// throw "no such export" the way #291's guard conversion did to four other
+// suites.
+vi.mock('../container-runner.js', async (importOriginal) => {
+  const real = await importOriginal<typeof import('../container-runner.js')>();
+  return {
+    ...real,
+    getActiveContainerSessionIds: () => [],
+    resolveAssistantName: (group: { name: string }) => Promise.resolve(`persona:${group.name}`),
+  };
+});
 
 const { sendThreadMessage, composeReleaseNote, composeClaimContext, composeOperatorMessage, MAX_OPERATOR_TEXT } =
   await import('./thread-message.js');

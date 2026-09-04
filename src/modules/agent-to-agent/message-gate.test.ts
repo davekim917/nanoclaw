@@ -14,12 +14,20 @@ import { requestApproval } from '../approvals/index.js';
 import { initSessionFolder, inboundDbPath } from '../../session-manager.js';
 import type { PendingApproval, Session } from '../../types.js';
 
-vi.mock('../../container-runner.js', () => ({
-  wakeContainer: vi.fn().mockResolvedValue(undefined),
-  isContainerRunning: vi.fn().mockReturnValue(false),
-  getActiveContainerCount: vi.fn().mockReturnValue(0),
-  killContainer: vi.fn(),
-}));
+// Spread the real module so exports the agent-route path touches but this
+// suite doesn't assert on — `sessionStillActive` is built from a real
+// `getSession` read against the suite's own DB, not stubbed — stay wired
+// instead of throwing "no such export" the next time a caller reaches for it.
+vi.mock('../../container-runner.js', async (importOriginal) => {
+  const real = await importOriginal<typeof import('../../container-runner.js')>();
+  return {
+    ...real,
+    wakeContainer: vi.fn().mockResolvedValue(undefined),
+    isContainerRunning: vi.fn().mockReturnValue(false),
+    getActiveContainerCount: vi.fn().mockReturnValue(0),
+    killContainer: vi.fn(),
+  };
+});
 
 vi.mock('../approvals/index.js', async (importActual) => {
   const actual = await importActual<typeof import('../approvals/index.js')>();

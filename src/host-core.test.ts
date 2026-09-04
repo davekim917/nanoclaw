@@ -32,12 +32,20 @@ import { getSession, findSession } from './db/sessions.js';
 import type { InboundEvent } from './channels/adapter.js';
 
 // Mock container runner to prevent actual Docker spawning
-vi.mock('./container-runner.js', () => ({
-  wakeContainer: vi.fn().mockResolvedValue(undefined),
-  isContainerRunning: vi.fn().mockReturnValue(false),
-  getActiveContainerCount: vi.fn().mockReturnValue(0),
-  killContainer: vi.fn(),
-}));
+// Spread the real module so exports the router/agent-route path touches but
+// this suite doesn't assert on — `sessionStillActive` is built from a real
+// `getSession` read against the suite's own DB, not stubbed — stay wired
+// instead of throwing "no such export" the next time a caller reaches for it.
+vi.mock('./container-runner.js', async (importOriginal) => {
+  const real = await importOriginal<typeof import('./container-runner.js')>();
+  return {
+    ...real,
+    wakeContainer: vi.fn().mockResolvedValue(undefined),
+    isContainerRunning: vi.fn().mockReturnValue(false),
+    getActiveContainerCount: vi.fn().mockReturnValue(0),
+    killContainer: vi.fn(),
+  };
+});
 
 // Models the ONE interleave that matters for `writeSessionRouting`: the
 // session being rewired inside the mailbox funnel's await, between the route
@@ -1650,6 +1658,29 @@ describe('agent-to-agent routing', () => {
     // routes back to the Slack session (originator) not Discord (newest).
     const { routeAgentMessage } = await import('./modules/agent-to-agent/agent-route.js');
 
+    // Return-path candidates are only honored while the target is actually
+    // wired to the candidate's messaging group (`targetWiredToMessagingGroup`
+    // in agent-route.ts, added by b3897d7d to close a cross-tenant delivery
+    // bypass). `resolveSession` alone creates an mg-bound session without
+    // registering that wiring, so both of PA's chats need an explicit
+    // `messaging_group_agents` row — mirroring the real /manage-channels
+    // wiring step this scenario is modeling.
+    createMessagingGroupAgent({
+      id: 'mga-pa-slack',
+      messaging_group_id: 'mg-slack',
+      agent_group_id: 'ag-pa',
+      engage_mode: 'pattern',
+      engage_pattern: '.',
+      sender_scope: 'all',
+      ignored_message_policy: 'drop',
+      session_mode: 'shared',
+      priority: 0,
+      default_model: null,
+      default_effort: null,
+      default_tone: null,
+      instructions_profile: null,
+      created_at: now(),
+    });
     const { session: paSlackSession } = resolveSession('ag-pa', 'mg-slack', null, 'shared');
 
     createMessagingGroup({
@@ -1659,6 +1690,22 @@ describe('agent-to-agent routing', () => {
       name: 'Discord',
       is_group: 0,
       unknown_sender_policy: 'public',
+      created_at: now(),
+    });
+    createMessagingGroupAgent({
+      id: 'mga-pa-discord',
+      messaging_group_id: 'mg-discord',
+      agent_group_id: 'ag-pa',
+      engage_mode: 'pattern',
+      engage_pattern: '.',
+      sender_scope: 'all',
+      ignored_message_policy: 'drop',
+      session_mode: 'shared',
+      priority: 0,
+      default_model: null,
+      default_effort: null,
+      default_tone: null,
+      instructions_profile: null,
       created_at: now(),
     });
     const { session: paDiscordSession } = resolveSession('ag-pa', 'mg-discord', null, 'shared');

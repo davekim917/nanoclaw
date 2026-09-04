@@ -52,12 +52,21 @@ vi.mock('../db/session-db.js', () => ({
   retryWithBackoff: vi.fn(),
 }));
 
-vi.mock('../container-runner.js', () => ({
-  wakeContainer: vi.fn().mockResolvedValue(true),
-  killContainer: vi.fn(),
-  isContainerRunning: vi.fn().mockReturnValue(false),
-  getContainerSpawnedAt: vi.fn().mockReturnValue(0),
-}));
+// Spread the real module so exports steer.ts's import path touches but this
+// suite doesn't assert on — `sessionStillActive` is never reached today (this
+// mock replaces `wakeContainer` itself), but staying wired means a future
+// caller that reaches for it doesn't throw "no such export" the way #291's
+// guard conversion did to four other suites.
+vi.mock('../container-runner.js', async (importOriginal) => {
+  const real = await importOriginal<typeof import('../container-runner.js')>();
+  return {
+    ...real,
+    wakeContainer: vi.fn().mockResolvedValue(true),
+    killContainer: vi.fn(),
+    isContainerRunning: vi.fn().mockReturnValue(false),
+    getContainerSpawnedAt: vi.fn().mockReturnValue(0),
+  };
+});
 
 vi.mock('../channels/channel-registry.js', () => ({
   getChannelAdapter: vi.fn().mockReturnValue(undefined),

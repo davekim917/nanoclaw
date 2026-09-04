@@ -1048,7 +1048,7 @@ describe('runner session context file', () => {
     // Nothing to configure for a bind-mounted SQLite mailbox.
     expect(await mailbox.runnerEnvironment(key)).toEqual({});
 
-    const mounts = buildMounts(ag, sess, containerConfig(), 'claude', {});
+    const mounts = await buildMounts(ag, sess, containerConfig(), 'claude', {});
     expect(mounts).toContainEqual({
       hostPath: contextPath,
       containerPath: '/app/.nanoclaw-session.json',

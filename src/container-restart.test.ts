@@ -16,28 +16,29 @@ const mockIsContainerSpawning = vi.fn<(id: string) => boolean>();
 const mockGetContainerSpawnedAt = vi.fn<(id: string) => number>(() => 1000);
 const mockKillContainer = vi.fn<(id: string, reason: string, onExit?: () => void) => void>();
 const mockWakeContainer = vi.fn();
-vi.mock('./container-runner.js', () => ({
-  isContainerRunning: (...args: unknown[]) => mockIsContainerRunning(args[0] as string),
-  isContainerSpawning: (...args: unknown[]) => mockIsContainerSpawning(args[0] as string),
-  // The real definition, over the same two mocks: a container "owns"
-  // outbound.db while it is running OR still spawning.
-  containerOwnsOutbound: (...args: unknown[]) =>
-    mockIsContainerRunning(args[0] as string) || mockIsContainerSpawning(args[0] as string),
-  // The real definition, over the same session mock: a guard the WAKE PATH
-  // evaluates at the spawn, not a check the caller makes before calling.
-  sessionStillActive:
-    (...args: unknown[]) =>
-    () => {
-      const fresh = mockGetSession(args[0] as string);
-      if (!fresh) return { ok: false, reason: 'session no longer exists' };
-      if (fresh.status !== 'active') return { ok: false, reason: `session is ${fresh.status}` };
-      return true;
-    },
-  getContainerSpawnedAt: (...args: unknown[]) => mockGetContainerSpawnedAt(args[0] as string),
-  killContainer: (...args: unknown[]) =>
-    mockKillContainer(args[0] as string, args[1] as string, args[2] as (() => void) | undefined),
-  wakeContainer: (...args: unknown[]) => mockWakeContainer(...args),
-}));
+vi.mock('./container-runner.js', async (importOriginal) => {
+  const real = await importOriginal<typeof import('./container-runner.js')>();
+  return {
+    isContainerRunning: (...args: unknown[]) => mockIsContainerRunning(args[0] as string),
+    isContainerSpawning: (...args: unknown[]) => mockIsContainerSpawning(args[0] as string),
+    // The real definition, over the same two mocks: a container "owns"
+    // outbound.db while it is running OR still spawning.
+    containerOwnsOutbound: (...args: unknown[]) =>
+      mockIsContainerRunning(args[0] as string) || mockIsContainerSpawning(args[0] as string),
+    // The REAL predicate, not a hand-rolled copy — it closes over `getSession`
+    // from `./db/sessions.js`, which this file mocks separately (below) to
+    // `mockGetSession`, so it answers what a test has set up rather than what
+    // the real DB happens to hold. Reusing it (rather than re-deriving its
+    // three axes here) is what keeps this suite from drifting the way the
+    // hand-rolled copy already had: it was missing the `archived_at` axis
+    // `unwakeableReason` checks alongside existence and `status`.
+    sessionStillActive: real.sessionStillActive,
+    getContainerSpawnedAt: (...args: unknown[]) => mockGetContainerSpawnedAt(args[0] as string),
+    killContainer: (...args: unknown[]) =>
+      mockKillContainer(args[0] as string, args[1] as string, args[2] as (() => void) | undefined),
+    wakeContainer: (...args: unknown[]) => mockWakeContainer(...args),
+  };
+});
 
 const mockGetSessionsByAgentGroup = vi.fn();
 const mockGetSession = vi.fn();

@@ -107,18 +107,26 @@ vi.mock('../../session-manager.js', async (importOriginal) => {
   };
 });
 
-vi.mock('../../container-runner.js', () => ({
-  wakeContainer: vi.fn().mockResolvedValue(true),
-  killContainer: vi.fn(),
-  isContainerRunning: vi.fn().mockReturnValue(false),
-  // Sticky-flag: when isContainerRunning is false, this tells the watchdog
-  // whether the container ever ran. In this integration test the no-progress
-  // case wants `fail-no-progress` to fire — that requires the container to
-  // have been observed running (otherwise childContainerStatus is null and
-  // container-exit reap is suppressed, leaving only the no-progress timer).
-  hasContainerEverRun: vi.fn().mockReturnValue(true),
-  getContainerSpawnedAt: vi.fn().mockReturnValue(null),
-}));
+// Spread the real module so exports this suite doesn't assert on —
+// `sessionStillActive` isn't reached today, but staying wired means a future
+// caller that reaches for it doesn't throw "no such export" the way #291's
+// guard conversion did to four other suites.
+vi.mock('../../container-runner.js', async (importOriginal) => {
+  const real = await importOriginal<typeof import('../../container-runner.js')>();
+  return {
+    ...real,
+    wakeContainer: vi.fn().mockResolvedValue(true),
+    killContainer: vi.fn(),
+    isContainerRunning: vi.fn().mockReturnValue(false),
+    // Sticky-flag: when isContainerRunning is false, this tells the watchdog
+    // whether the container ever ran. In this integration test the no-progress
+    // case wants `fail-no-progress` to fire — that requires the container to
+    // have been observed running (otherwise childContainerStatus is null and
+    // container-exit reap is suppressed, leaving only the no-progress timer).
+    hasContainerEverRun: vi.fn().mockReturnValue(true),
+    getContainerSpawnedAt: vi.fn().mockReturnValue(null),
+  };
+});
 
 const sessionMap = new Map<string, Session>();
 
