@@ -114,7 +114,7 @@ function defaultRun(
  * seam, candidate primitives — plus the two ways out, one of which is not
  * "push anyway".
  */
-export function refusalMessage(gateText: string, script: string): string {
+export function refusalMessage(gateText: string, script: string, identity: { branch: string; head: string }): string {
   return [
     gateText.trim(),
     '',
@@ -124,10 +124,17 @@ export function refusalMessage(gateText: string, script: string): string {
     'If the reframe honestly belongs to a different PR, take the override through the',
     'skill so it is recorded on the PR body rather than made silently:',
     '',
-    // The script that was actually selected: the Claude mount, the /app
-    // fallback, or an override. Printing a path the agent cannot run turns the
-    // documented, PR-recorded override into a command that just fails.
-    `    REVIEW_LOOP_ALLOW_SITE_PATCH=1 ${script} push`,
+    // Bound to the identity that was refused, not to the checkout. The script
+    // resolves its PR from `BRANCH` when given and passes trailing arguments
+    // to `git push`, so the explicit refspec sends the commit that was judged.
+    // An unbound override would follow git's checkout-dependent default and
+    // could push a sibling's branch, recording the override on their PR.
+    //
+    // The path is the one actually selected — the Claude mount, the /app
+    // fallback, or an override — since printing a path the agent cannot run
+    // turns the documented, PR-recorded override into a command that fails.
+    `    REVIEW_LOOP_ALLOW_SITE_PATCH=1 BRANCH=${identity.branch} ${script} push \\`,
+    `        ${identity.head}:refs/heads/${identity.branch}`,
   ].join('\n');
 }
 
@@ -170,7 +177,10 @@ export function evaluateReviewChurnGate(options: ChurnGateOptions): ChurnGateRes
   if (result.status === REFRAME_REQUIRED_EXIT) {
     // The skill prints the human-readable decision on stderr and the JSON on
     // stdout; only `gate` (no --json) is run here, so stderr is the decision.
-    return { status: 'refused', message: refusalMessage(result.stderr || result.stdout, script) };
+    return {
+      status: 'refused',
+      message: refusalMessage(result.stderr || result.stdout, script, { branch: options.branch, head: options.head }),
+    };
   }
   if (result.status === 0) return { status: 'pass' };
   // Every other status is the gate declining to answer — no PR for this

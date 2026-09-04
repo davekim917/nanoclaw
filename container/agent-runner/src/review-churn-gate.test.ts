@@ -4,7 +4,7 @@
 // must stop the push, and everything else must not. A gate that blocks a push
 // because GitHub was slow would be worked around within a day, which is how
 // the advisory detector this replaces ended up ignored.
-import { afterEach, describe, expect, test } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import { chmodSync, mkdtempSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
@@ -20,13 +20,18 @@ import { allowSubprocess, clearHermeticityAttempts, resetHermeticityAllowances }
 
 // One case drives a real script through the real spawn, which is the seam the
 // stubs above stand in for, so `bash` is opted in by name rather than left as
-// an undeclared escape under `NANOCLAW_TEST_HERMETICITY=enforce`. The allowance
-// is file-scoped and cleared after each test.
-allowSubprocess(['bash']);
+// an undeclared escape under `NANOCLAW_TEST_HERMETICITY=enforce`.
+//
+// Granted per test and never re-granted in teardown: bun runs a file's tests in
+// one process, so an allowance re-established after the last test would still
+// be live for whichever suite runs next, and that suite's undeclared bash would
+// pass the tripwire silently.
+beforeEach(() => {
+  allowSubprocess(['bash']);
+});
 afterEach(() => {
   clearHermeticityAttempts();
   resetHermeticityAllowances();
-  allowSubprocess(['bash']);
 });
 
 const REFRAME_TEXT = [
@@ -74,6 +79,18 @@ describe('review churn gate at git_push', () => {
     expect(result.status).toBe('skipped');
   });
 
+  test('binds the override command to the identity that was refused', () => {
+    // The escape hatch is the last consumer of the pinned identity. Unbound, it
+    // would resolve the PR from the checkout and let git pick the refspec, so
+    // following a refusal could push a sibling's branch and record the override
+    // on their PR.
+    const result = evaluateReviewChurnGate({ ...present, run: stub({ status: 3, stderr: REFRAME_TEXT }) });
+    expect(result.status).toBe('refused');
+    if (result.status !== 'refused') return;
+    expect(result.message).toContain('BRANCH=topic/thing');
+    expect(result.message).toContain('abc1234def:refs/heads/topic/thing');
+  });
+
   test('names the script it actually selected in the refusal', () => {
     // The refusal tells the agent how to take the recorded override. Printing
     // the first hard-coded path when the /app fallback or an override was used
@@ -86,7 +103,7 @@ describe('review churn gate at git_push', () => {
     });
     expect(fallback.status).toBe('refused');
     if (fallback.status !== 'refused') return;
-    expect(fallback.message).toContain(`REVIEW_LOOP_ALLOW_SITE_PATCH=1 ${CHURN_GATE_SCRIPT_PATHS[1]} push`);
+    expect(fallback.message).toContain(`${CHURN_GATE_SCRIPT_PATHS[1]} push`);
     expect(fallback.message).not.toContain(CHURN_GATE_SCRIPT_PATHS[0]);
   });
 
