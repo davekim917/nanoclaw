@@ -1,0 +1,66 @@
+{
+  "_comment": "Four rounds of the same TOCTOU class at four different call sites, plus one unrelated finding. Modelled on PR #291: no single FILE reaches three rounds, so the file-level detector never fires; the class does. `sources` keeps the classifier off the disk.",
+  "findings": [
+    {
+      "threadId": "T1",
+      "commentId": 101,
+      "reviewId": "PRR_1",
+      "createdAt": "2026-09-01T09:00:00Z",
+      "path": "src/router.ts",
+      "line": 40,
+      "isResolved": true,
+      "isOutdated": false,
+      "body": "**<sub><sub>![P1 Badge](https://img.shields.io/badge/P1-orange?style=flat)</sub></sub>  Revalidate the session after the await**\n\nThe session row is read, then `writeSessionMessage` is called after an await, so a container that exits in between wins the race and the write lands on a session that no longer accepts it."
+    },
+    {
+      "threadId": "T2",
+      "commentId": 102,
+      "reviewId": "PRR_2",
+      "createdAt": "2026-09-01T11:00:00Z",
+      "path": "src/delivery.ts",
+      "line": 88,
+      "isResolved": true,
+      "isOutdated": false,
+      "body": "**<sub><sub>![P1 Badge](https://img.shields.io/badge/P1-orange?style=flat)</sub></sub>  Recheck the session after awaiting the read**\n\nSame race as the routing path: the state is read before the await and `writeSessionMessage` runs after it, with nothing revalidating the row in between."
+    },
+    {
+      "threadId": "T3",
+      "commentId": 103,
+      "reviewId": "PRR_3",
+      "createdAt": "2026-09-01T13:00:00Z",
+      "path": "src/tasks.ts",
+      "line": 12,
+      "isResolved": false,
+      "isOutdated": false,
+      "body": "**<sub><sub>![P1 Badge](https://img.shields.io/badge/P1-orange?style=flat)</sub></sub>  Revalidate the destination after the mailbox await**\n\n`wakeContainer` is invoked after an await on a destination read, so a concurrent archive is not seen and the wake row is written against a dead container."
+    },
+    {
+      "threadId": "T4",
+      "commentId": 104,
+      "reviewId": "PRR_4",
+      "createdAt": "2026-09-01T15:00:00Z",
+      "path": "src/dashboard/close.ts",
+      "line": 220,
+      "isResolved": false,
+      "isOutdated": true,
+      "body": "**<sub><sub>![P2 Badge](https://img.shields.io/badge/P2-yellow?style=flat)</sub></sub>  Recheck the closure set after the asynchronous clear**\n\nThe closure set is captured before the await and `writeSessionMessage` runs against it afterwards; a session archived during the clear is still written to, which is the same race again."
+    },
+    {
+      "threadId": "T5",
+      "commentId": 105,
+      "reviewId": "PRR_2",
+      "createdAt": "2026-09-01T11:05:00Z",
+      "path": "src/router.ts",
+      "line": 9,
+      "isResolved": true,
+      "isOutdated": false,
+      "body": "**<sub><sub>![P3 Badge](https://img.shields.io/badge/P3-blue?style=flat)</sub></sub>  Treat an absent config value as empty**\n\nA missing entry is currently undefined here and reads as a null downstream; default it to an empty list instead."
+    }
+  ],
+  "sources": {
+    "src/router.ts": "import { writeSessionMessage, wakeContainer } from './mailbox/write.js';\nimport { log } from './log.js';\n",
+    "src/delivery.ts": "import { writeSessionMessage } from './mailbox/write.js';\nimport { log } from './log.js';\n",
+    "src/tasks.ts": "import { wakeContainer } from './mailbox/write.js';\n",
+    "src/dashboard/close.ts": "import {\n  writeSessionMessage,\n} from '../mailbox/write.js';\n"
+  }
+}

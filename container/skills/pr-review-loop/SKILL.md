@@ -76,7 +76,10 @@ Run the detector before you diagnose — it turns a hunch into a number:
 codex-review.sh churn
 ```
 
-It groups every finding on the PR by file and counts how many **distinct reviews** touched each one. Any file flagged `CHURN` (3+ separate rounds) is where your patches are chasing each other. A real example of the pattern: two files drew findings in five separate rounds each and accounted for ten of twelve total rounds, three of them consecutive on the same file. Round 1 on that PR was a normal haul — 8 findings, 3×P1, across 4 files. Everything after it was the same two seams coming back.
+It groups every finding on the PR two ways and counts how many **distinct reviews** touched each group.
+
+- **By file.** Any file flagged `CHURN` (3+ separate rounds) is where your patches are chasing each other. A real example: two files drew findings in five separate rounds each and accounted for ten of twelve total rounds, three of them consecutive on the same file. Round 1 there was a normal haul — 8 findings, 3×P1, across 4 files. Everything after it was the same two seams coming back.
+- **By class.** A file is the wrong unit when one invariant is missing from a seam: the reviewer finds it at a new call site each round, so the findings hop between files and no single file ever reaches three. A class is keyed on the invariant the finding cites — race, ownership, ordering, staleness, lifetime, idempotence, durability, nullability, bounds — plus the seam the flagged sites import their shared callee from. PR #291 ran 14 rounds that way: "revalidate after the await", "recheck ownership before archiving", "reject archived sessions in the wake recheck" — eight files, one invariant, and no file with three rounds until late. Run over that PR's threads, the class table collapses them into one row with twelve rounds and names the shared write primitive its sites all call, which is the shape the fix that ended it took.
 
 The recurrence is the diagnosis. A finding on a fix means the fix was incomplete; a *third* finding in the same place means the fix is in the wrong place, and no number of further patches will end it — each one moves the hole rather than closing it.
 
@@ -91,6 +94,34 @@ The recurrence is the diagnosis. A finding on a fix means the fix was incomplete
 
 Then resume the loop at step 1 as a normal batched round. If the same file draws findings again after a re-implementation, that is the "real defects" case — stop and split the PR.
 
+### The gate: three rounds on one class refuses the next site patch
+
+Everything above was advisory, and on #291 it was overridden round after
+round — each round's patch was individually correct, which is exactly why
+nobody stopped. So it is now a gate. `codex-review.sh push` is the
+loop's push path, and it runs `codex-review.sh gate` first, which exits 3 when
+either holds:
+
+- one finding **class** has drawn findings in 3+ rounds, or
+- one **seam** has, with severity not falling (`docs/review-policy.md`:
+  escalation is severity direction, not round count).
+
+The refusal names the class, every site, the seam, and the candidate
+primitive(s) — the shared callee those sites all route through. **The next
+commit must be that reframe, not another site patch.** The gate lifts on
+either:
+
+- a commit, or uncommitted work, whose diff touches that primitive and is dated
+  after the class's last finding; or
+- a commit message carrying `Reframe: <invariant> enforced in <primitive>`.
+
+A commit that touches one more call site lifts nothing, which is the point.
+
+`REVIEW_LOOP_ALLOW_SITE_PATCH=1` overrides the refusal. It prints the override
+banner and writes a line into the PR body naming the class that is still
+unfixed, so whoever merges sees the call that was made. Use it when the reframe
+honestly belongs to a different PR — then open that PR.
+
 ## The helper
 
 `scripts/codex-review.sh` wraps the fiddly parts so you don't rewrite them each round. Run it from inside the worktree, or set `REPO` / `PR`:
@@ -98,7 +129,10 @@ Then resume the loop at step 1 as a normal batched round. If the same file draws
 ```
 codex-review.sh open                      # unresolved Codex threads, TSV: thread_id, comment_id, file:line, outdated?, severity, title
 codex-review.sh body <comment_id>         # the full finding
-codex-review.sh churn                     # files drawing findings across 3+ rounds — the churn detector
+codex-review.sh churn                     # findings by file AND by class across rounds — the churn detector
+codex-review.sh classes                   # the class table alone: invariant signature @ seam, sites, primitives
+codex-review.sh gate                      # the reframe gate — exit 3 when a class has run 3 rounds unfixed
+codex-review.sh push [git push args…]     # gate, then push — the loop's only push path
 codex-review.sh reply <comment_id> <text> # reply on that thread
 codex-review.sh resolve <thread_id>       # mark it resolved
 codex-review.sh status <sha> <since_iso>  # codex=<pending|clean|findings> open=<n> review=<n> reaction=<n> rounds=<n>
@@ -141,7 +175,16 @@ Apply every accepted fix, run the tests that cover them, then commit **once**:
 **Prefer the fix that subtracts.** For each accepted finding, reach for simplification first: tighten a guard that already exists, hoist the check to the seam every caller shares, delete the path the finding lives on. Adding machinery to satisfy a comment is the churn generator from the diagnosis section — this round's new wrapper is next round's findings. If no simplifying fix exists, that is a design signal, not a license to build: move the finding to the scope-expansion path in step 2 instead of coding around it.
 
 Run whatever suite and typecheck the touched tree owns — the repo's own commands, not a remembered one.
-Commit and push once — `git_commit` / `git_push` if you have those MCP tools, plain `git commit` / `git push` otherwise.
+Commit once, then push through the gate:
+
+```bash
+codex-review.sh push          # runs the reframe gate, then git push
+```
+
+`codex-review.sh push` is the push path for this loop — not `git push`, and not
+`git_push` if you have the MCP tools. Both skip the gate, and a site patch that
+reaches the remote has already generated the next round. An exit of 3 is the
+gate refusing: read it, and make the next commit the reframe it names.
 
 One commit per round, not per comment. If a finding needs a design decision from the user, leave it out of the batch and say so — keep that thread open rather than stalling the other fixes on it. `codex-review.sh status` reports it in `open=`, so it can't be forgotten at merge time.
 
@@ -220,6 +263,18 @@ Squash is the default. Use `--merge` when the PR's topology matters — an upstr
 
 Then run whatever post-PR bookkeeping your environment expects — e.g. `add_ship_log`, plus `update_backlog_item` if the PR closes a backlog entry.
 
+## When you compose the review prompt yourself
+
+The GitHub reviewer's prompt is OpenAI's, not ours — `docs/review-policy.md`
+says so and cannot bind it. Every review prompt this fleet *does* compose (a
+`codex exec` cross-model round, an ad-hoc reviewer brief, a `/code-review`
+invocation) carries this clause, and it is what keeps the gate above rare
+rather than routine:
+
+> For any race, TOCTOU, or ownership finding, report the CLASS once: enumerate
+> every site in this PR that has it in one pass, and name the primitive where
+> the invariant belongs. Do not report the same class at one site per round.
+
 ## Anti-patterns
 
 - **One comment, one commit, one push.** The loop that never ends. Batch or don't push.
@@ -229,4 +284,5 @@ Then run whatever post-PR bookkeeping your environment expects — e.g. `add_shi
 - **Replying without resolving.** Next round you re-triage threads you already answered.
 - **Rejecting to save a round.** A rejection without a traced `file:line` is an accept you skipped.
 - **Editing a test so a review comment passes.** The test is the contract; change it only when the user changes the contract.
+- **Patching one more call site after the gate refused.** The refusal already named the primitive. A commit at a fifth site is the same round again with a different line number.
 - **Merging on the 👍 alone.** Check `open=0` too — a fresh 👍 says nothing about threads left over from round 1.

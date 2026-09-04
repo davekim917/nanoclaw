@@ -1,0 +1,42 @@
+{
+  "_comment": "The same three-rounds-on-one-seam shape as seam-drift-falling.json with severity FLAT at P2. Flat severity across three rounds on one seam is the churn signature, so the gate must refuse here even though no single class reached three rounds.",
+  "findings": [
+    {
+      "threadId": "S1",
+      "commentId": 201,
+      "reviewId": "PRR_1",
+      "createdAt": "2026-09-02T09:00:00Z",
+      "path": "src/router.ts",
+      "line": 40,
+      "isResolved": true,
+      "isOutdated": false,
+      "body": "**<sub><sub>![P2 Badge](https://img.shields.io/badge/P2-yellow?style=flat)</sub></sub>  Revalidate the session after the await**\n\nThe row is read before the await and `writeSessionMessage` runs after it, so a concurrent archive wins the race."
+    },
+    {
+      "threadId": "S2",
+      "commentId": 202,
+      "reviewId": "PRR_2",
+      "createdAt": "2026-09-02T11:00:00Z",
+      "path": "src/delivery.ts",
+      "line": 88,
+      "isResolved": true,
+      "isOutdated": false,
+      "body": "**<sub><sub>![P2 Badge](https://img.shields.io/badge/P2-yellow?style=flat)</sub></sub>  Treat an absent outbound file as empty**\n\nWhen the file is missing this returns undefined and the caller reads a null field; return an empty list instead."
+    },
+    {
+      "threadId": "S3",
+      "commentId": 203,
+      "reviewId": "PRR_3",
+      "createdAt": "2026-09-02T13:00:00Z",
+      "path": "src/delivery.ts",
+      "line": 120,
+      "isResolved": false,
+      "isOutdated": false,
+      "body": "**<sub><sub>![P2 Badge](https://img.shields.io/badge/P2-yellow?style=flat)</sub></sub>  Roll back the stamp when the write throws**\n\nThe row is persisted before the write and never rolled back on failure, so a partial rollback leaves the stamp behind."
+    }
+  ],
+  "sources": {
+    "src/router.ts": "import { writeSessionMessage } from './mailbox/write.js';\n",
+    "src/delivery.ts": "import { writeSessionMessage } from './mailbox/write.js';\n"
+  }
+}
