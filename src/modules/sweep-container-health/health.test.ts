@@ -1604,9 +1604,13 @@ describe('registered S11/S14/S16 entries reach their bodies', () => {
     await s14.run(ctx);
 
     expect(windowsSeen).toContain('session:health:sla-observe');
-    // The kill now carries the post-kill chain as its `onExit` (Codex final):
-    // the container is running here, so a callback is what it must be handed.
-    expect(mockKillContainer).toHaveBeenCalledWith('sess-test', 'claim-stuck', expect.any(Function));
+    // The kill now carries the post-kill chain as its third argument (Codex
+    // final) — and `undefined` is the right value HERE, measured rather than
+    // assumed: this describe never starts a container, so `isContainerRunning`
+    // and `isContainerSpawning` are both false, there is no `close` event to
+    // hang the chain off, and it runs inline instead. The cases that DO have a
+    // running container assert `expect.any(Function)`.
+    expect(mockKillContainer).toHaveBeenCalledWith('sess-test', 'claim-stuck', undefined);
   });
 
   it('S16: the registered SLA-observation hook calls reportContainerOomTelemetry with the observed snapshot', () => {

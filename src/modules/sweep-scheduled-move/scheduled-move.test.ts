@@ -202,7 +202,14 @@ import { log } from '../../log.js';
 // The integration case below needs a FULLY MIGRATED central DB: it drives the
 // real `updateSession` and the real `withQuietInvalidationSync`, both of which
 // write columns a hand-rolled `sessions` table does not have.
-import { closeDb, initTestDb, runMigrations } from '../../db/index.js';
+//
+// `runMigrations` comes from the migrations module, NOT from `db/index.js`:
+// this suite mocks `db/connection.js` down to a single `getDb`, and
+// `db/index.js` re-exports `initTestDb`/`closeDb` from it — so through the
+// barrel they are `undefined`. The DB is built here instead and handed to
+// `mockGetDb` directly, which is the same wiring every other case in this
+// describe uses.
+import { runMigrations } from '../../db/migrations/index.js';
 import { taskThreadId } from '../../db/sessions.js';
 // Side-effect import: registers 'sweep-scheduled-move' as a duty source
 // (registerSweepDutySource calls the registrar immediately, and records it
@@ -471,7 +478,8 @@ describe('recoverMoveIntents (D3) + pruneAuditBodies (D4)', () => {
   // is fully migrated, and `withQuietInvalidationSync` is the real one — which
   // together is the only arrangement in which the bug could have been seen.
   it('S19 leaves the source open and T11 then restores the move', async () => {
-    const db = initTestDb();
+    const db = new Database(':memory:');
+    db.pragma('foreign_keys = ON');
     runMigrations(db);
     mockGetDb.mockImplementation(() => db);
     useRealQuietInvalidation.on = true;
@@ -535,7 +543,7 @@ describe('recoverMoveIntents (D3) + pruneAuditBodies (D4)', () => {
     } finally {
       useRealQuietInvalidation.on = false;
       mockGetDb.mockImplementation(() => h.centralDb);
-      closeDb();
+      db.close();
     }
   });
 

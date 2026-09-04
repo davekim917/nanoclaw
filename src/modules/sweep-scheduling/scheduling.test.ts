@@ -611,9 +611,13 @@ describe('S2-PR11 scheduling + thread-close', () => {
     calls.running = false;
     calls.order.push('exit');
     calls.killExit!();
-    // The finalizer's own work is async and floats off the callback, so give it
-    // macrotasks to land before reading the order.
-    for (let i = 0; i < 5; i++) await new Promise((resolve) => setImmediate(resolve));
+    // The finalizer's work floats off the callback and nothing here returns a
+    // promise to await, so wait for its last observable effect — the archive —
+    // bounded, so a finalizer that never runs fails an assertion below rather
+    // than hanging.
+    for (let i = 0; i < 200 && !calls.order.includes('archive'); i++) {
+      await new Promise((resolve) => setImmediate(resolve));
+    }
 
     // Mirrors src/dashboard/thread-close.test.ts's "kills first, then clears
     // once the process is gone, then archives" (the `recordingDeps()` default:
@@ -637,6 +641,23 @@ describe('S2-PR11 scheduling + thread-close', () => {
     ).toEqual(['clear']);
     expect(calls.kills).toEqual([{ sessionId: 's1', reason: `thread close ${thread}` }]);
     expect(calls.archives).toEqual(['s1']);
+
+    // …and the closure is still `finalizing`, which is the documented outcome
+    // of a REAL deferred exit and the half the old inline-callback fixture hid.
+    // `advanceThreadClosures` marks a closure closed only when its sessions are
+    // already archived by the time its loop ends, and the archive happens
+    // inside `onExit` — which the real `killContainer` fires on a later tick.
+    // Its own comment says so: "a session stopping right now is still open and
+    // this closure simply advances on the next tick".
+    expect(
+      (getDb().prepare(`SELECT state FROM thread_closures WHERE thread_id = ?`).get(thread) as { state: string }).state,
+    ).toBe('finalizing');
+
+    // The next tick: the session is archived now, so the duty skips it and
+    // closes the row. No second kill — `calls.kills` above is still the one.
+    await duty(SWEEP_DUTY_INVENTORY.T8).run(makeCtx());
+
+    expect(calls.kills).toHaveLength(1);
     expect(
       (getDb().prepare(`SELECT state FROM thread_closures WHERE thread_id = ?`).get(thread) as { state: string }).state,
     ).toBe('closed');
