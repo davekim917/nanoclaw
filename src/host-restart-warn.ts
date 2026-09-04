@@ -18,9 +18,13 @@
  *
  * Spam guard: only sessions with explicit evidence of work in flight are
  * warned — a resumable work continuation, a fresh tool start, a fresh
- * processing claim, or a live heartbeat. Narration/status output is
- * deliberately not evidence. Quiet sessions get no note, so a restart does
- * not wake every idle container into a public "nothing happened".
+ * processing claim, or a fresh heartbeat. Narration/status output is
+ * deliberately not evidence. The heartbeat is not narration and does count:
+ * the runner touches it once per streamed provider event and never on an idle
+ * poll, so a fresh mtime is direct evidence that an SDK stream was open, which
+ * is the same authority the sweep's ceiling kill already reads it as. Quiet
+ * sessions get no note, so a restart does not wake every idle container into
+ * a public "nothing happened".
  */
 import { createHash } from 'crypto';
 import fs from 'node:fs';
@@ -46,18 +50,21 @@ const RESTART_NOTE_DEDUPE_MS = 10 * 60 * 1000;
  * as streaming right now.
  *
  * The heartbeat is NOT a general liveness ping. `touchHeartbeat` is called
- * once per streamed provider event (`poll-loop.ts`, in the event loop of an
- * open query), across a transient-overload backoff sleep, and around a task
- * script — and nowhere else. An idle container waiting on its poll interval
- * never touches it, which is exactly why the 30-minute idle ceiling works.
- * So a heartbeat this fresh means one thing: a turn was mid-stream when the
- * host went down. It cannot reintroduce the "wake every idle container into
- * a public nothing happened" spam this guard exists to prevent.
+ * once per streamed provider event (`container/agent-runner/src/poll-loop.ts`,
+ * immediately after `handleEvent` in the event loop of an open query), across
+ * a transient-overload backoff sleep, and around a task script — and nowhere
+ * else. An idle container waiting on its poll interval never touches it, which
+ * is exactly why the 30-minute idle ceiling works. So a heartbeat this fresh
+ * means one thing: a turn was mid-stream when the host went down.
  *
- * Two minutes, not seconds: events can be sparse inside one long tool call,
- * and this is asked once, at shutdown, against live state.
+ * Two minutes, and deliberately NOT the ceiling's thirty. This window has to
+ * bridge the gaps between events during long model thinking or one slow tool
+ * call, which are seconds to a minute or so. Reusing ABSOLUTE_CEILING_MS would
+ * over-warn instead: it would call every container whose last turn merely
+ * ENDED within the last half hour "mid-work", which is the idle-container
+ * spam this guard exists to prevent.
  */
-const LIVE_HEARTBEAT_MS = 2 * 60 * 1000;
+export const RESTART_WARN_HEARTBEAT_FRESH_MS = 120_000;
 
 function freshProcessingClaimKey(mailbox: NanoclawMailboxSession, now: number): string | null {
   try {
@@ -88,18 +95,6 @@ function heartbeatMtimeMs(session: Session, now: number): number | null {
   return Number.isFinite(mtimeMs) && mtimeMs <= now ? mtimeMs : null;
 }
 
-/** Mtime when a turn was streaming within {@link LIVE_HEARTBEAT_MS}, else null. */
-function liveHeartbeatAtMs(session: Session, now: number): number | null {
-  const mtimeMs = heartbeatMtimeMs(session, now);
-  if (mtimeMs === null) return null;
-  return now - mtimeMs <= LIVE_HEARTBEAT_MS ? mtimeMs : null;
-}
-
-/** Heartbeat age for the diagnostic line — null when there is no usable mtime. */
-function heartbeatAgeMsFor(session: Session, now: number): number | null {
-  const mtimeMs = heartbeatMtimeMs(session, now);
-  return mtimeMs === null ? null : now - mtimeMs;
-}
 
 function hasRecentRestartNote(mailbox: NanoclawMailboxSession, now: number): boolean {
   return mailbox.hasRestartNoteSince(new Date(now - RESTART_NOTE_DEDUPE_MS).toISOString());
@@ -133,12 +128,15 @@ export function warnSessionIfWorkInFlight(mailbox: NanoclawMailboxSession, sessi
   // sessions got one.
   //
   // The heartbeat is what survives that, because the runner touches it per
-  // streamed provider event and never on an idle poll. See LIVE_HEARTBEAT_MS.
-  const liveHeartbeatMs = liveHeartbeatAtMs(session, now);
+  // streamed provider event and never on an idle poll. See
+  // RESTART_WARN_HEARTBEAT_FRESH_MS.
+  const heartbeatMs = heartbeatMtimeMs(session, now);
+  const heartbeatAgeMs = heartbeatMs === null ? null : now - heartbeatMs;
+  const freshHeartbeat = heartbeatAgeMs !== null && heartbeatAgeMs <= RESTART_WARN_HEARTBEAT_FRESH_MS;
   const midWork =
     resumableContinuation ||
     processingClaimKey !== null ||
-    liveHeartbeatMs !== null ||
+    freshHeartbeat ||
     decideCeilingFollowUp({
       hasContinuation: false,
       currentTool: state?.current_tool ?? null,
@@ -163,17 +161,20 @@ export function warnSessionIfWorkInFlight(mailbox: NanoclawMailboxSession, sessi
       hasProcessingClaim: processingClaimKey !== null,
       currentTool: state?.current_tool ?? null,
       toolStartedAt: state?.tool_started_at ?? null,
-      heartbeatAgeMs: heartbeatAgeMsFor(session, now),
+      heartbeatAgeMs,
     });
     return false;
   }
 
   const recoveryKey = continuation
     ? `${continuation.id}-${continuation.recovery_episode}-${continuation.resume_attempts}`
-    : // midWork is true, so at least one of these is set. Heartbeat mtime is
+    : // midWork is true, so at least one of these is set. The heartbeat is
       // last because it is the coarsest: it identifies the interruption, not
-      // the work, which is all the dedupe id needs.
-      (state?.tool_started_at ?? processingClaimKey ?? `heartbeat-${liveHeartbeatMs}`);
+      // the work, which is all the dedupe id needs. Rounded to the minute so
+      // the graceful-shutdown warn and the startup backstop — which run
+      // seconds apart, on either side of the same interruption — derive the
+      // SAME id and the second one is a no-op rather than a duplicate note.
+      (state?.tool_started_at ?? processingClaimKey ?? `heartbeat-${Math.floor(heartbeatMs! / 60_000)}`);
   const episodeBucket = Math.floor(now / RESTART_NOTE_DEDUPE_MS);
   const recoveryHash = createHash('sha256').update(recoveryKey).digest('hex').slice(0, 16);
   const inserted = mailbox.insertDeferredMessageWithContextIfNew({

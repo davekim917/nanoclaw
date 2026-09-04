@@ -19,7 +19,22 @@ vi.mock('./session-manager.js', async (importOriginal) => ({
     path.join(heartbeatRoot, `${agentGroupId}__${sessionId}.heartbeat`),
 }));
 
-import { warnSessionIfWorkInFlight } from './host-restart-warn.js';
+/**
+ * Partial, not wholesale: `log.js` also exports `setLogScrubber`, which
+ * `secret-scrubber.ts` reaches for at import time through this module's own
+ * dependency graph. Replacing the module outright makes that import throw
+ * before a single case runs.
+ */
+vi.mock('./log.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./log.js')>();
+  return {
+    ...actual,
+    log: { ...actual.log, info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
+  };
+});
+
+import { log } from './log.js';
+import { RESTART_WARN_HEARTBEAT_FRESH_MS, warnSessionIfWorkInFlight } from './host-restart-warn.js';
 import { hasRestartNoteSince } from './modules/mailbox/ops/lookups.js';
 import { getContainerState, getProcessingClaims } from './modules/mailbox/ops/sweep.js';
 import { insertDeferredMessageWithContextIfNew } from './modules/mailbox/ops/ingress.js';
@@ -140,7 +155,15 @@ function touchHeartbeat(session: Session, agoMs: number): void {
 
 afterEach(() => {
   for (const entry of fs.readdirSync(heartbeatRoot)) fs.rmSync(path.join(heartbeatRoot, entry), { force: true });
+  vi.clearAllMocks();
 });
+
+/** The one line that says a session was considered and found to have no signal. */
+function noSignalLogCalls(): unknown[][] {
+  return vi
+    .mocked(log.info)
+    .mock.calls.filter(([message]) => message === 'host-restart: no accountability note, no work-in-flight signal');
+}
 
 function noteRows(inDb: Database.Database) {
   return inDb.prepare("SELECT * FROM messages_in WHERE content LIKE '%agent_host_restart%'").all() as Array<
@@ -346,5 +369,49 @@ describe('a long autonomous turn interrupted by a restart', () => {
 
     expect(warnSessionIfWorkInFlight(mailboxOver(inDb, outDb), session, 'graceful host shutdown')).toBe(false);
     expect(noteRows(inDb)).toHaveLength(0);
+  });
+});
+
+describe('the heartbeat freshness boundary', () => {
+  // No fake timers here: the signal IS a real file mtime, so faking the clock
+  // over real I/O would test the mock rather than the read.
+  it('a heartbeat one second past the window is not work in flight, and says so', () => {
+    const { inDb, outDb } = makeDbs();
+    const session = fakeSession();
+    touchHeartbeat(session, RESTART_WARN_HEARTBEAT_FRESH_MS + 1_000);
+
+    expect(warnSessionIfWorkInFlight(mailboxOver(inDb, outDb), session, 'graceful host shutdown')).toBe(false);
+    expect(noteRows(inDb)).toHaveLength(0);
+    const calls = noSignalLogCalls();
+    expect(calls, 'the reason line is the only trace a skipped session leaves').toHaveLength(1);
+    const fields = calls[0][1] as { heartbeatAgeMs: number | null; hasProcessingClaim: boolean };
+    expect(fields.heartbeatAgeMs).toBeGreaterThan(RESTART_WARN_HEARTBEAT_FRESH_MS);
+    expect(fields.hasProcessingClaim).toBe(false);
+  });
+
+  it('a missing heartbeat is not work in flight, and reports a null age', () => {
+    const { inDb, outDb } = makeDbs();
+
+    expect(warnSessionIfWorkInFlight(mailboxOver(inDb, outDb), fakeSession(), 'graceful host shutdown')).toBe(false);
+    expect(noteRows(inDb)).toHaveLength(0);
+    const calls = noSignalLogCalls();
+    expect(calls).toHaveLength(1);
+    expect((calls[0][1] as { heartbeatAgeMs: number | null }).heartbeatAgeMs).toBeNull();
+  });
+
+  it('the shutdown warn and the startup backstop agree on one note per interruption', () => {
+    // Both paths run seconds apart against the same dead container, so the
+    // heartbeat-derived recovery key must round to the same value and the
+    // second call must find the note already there.
+    const { inDb, outDb } = makeDbs();
+    const session = fakeSession();
+    touchHeartbeat(session, 5_000);
+
+    expect(warnSessionIfWorkInFlight(mailboxOver(inDb, outDb), session, 'graceful host shutdown')).toBe(true);
+    expect(
+      warnSessionIfWorkInFlight(mailboxOver(inDb, outDb), session, 'host startup after an unclean stop'),
+      'the dedupe must hold across both restart paths',
+    ).toBe(false);
+    expect(noteRows(inDb)).toHaveLength(1);
   });
 });
