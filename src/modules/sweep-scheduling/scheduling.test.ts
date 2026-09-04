@@ -528,7 +528,7 @@ describe('S2-PR11 scheduling + thread-close', () => {
 
   // ─── F-11.4 ────────────────────────────────────────────────────────────────
 
-  it('thread-close advance clears saved work, stops the container and archives, in that order', async () => {
+  it('thread-close advance stops the container, then clears saved work and archives, in that order', async () => {
     const thread = 'slack:C1:1.1';
     getDb()
       .prepare(
