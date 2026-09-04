@@ -168,6 +168,12 @@ describe('add_mcp_server remote Streamable HTTP', () => {
     expect((await submit({ name: 'ok', url: 'https://hooks.example.com/s/abc123/mcp' })).payload).toBeDefined();
   });
 
+  it('rejects a JWT in a neutral-named query param or the url path', async () => {
+    const jwt = 'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U';
+    expect((await submit({ name: 'q', url: `https://example.com/mcp?code=${jwt}` })).error).toContain('raw credential');
+    expect((await submit({ name: 'q', url: `https://example.com/callback/${jwt}` })).error).toContain('raw credential');
+  });
+
   it('rejects a declared transport that contradicts the fields', async () => {
     expect((await submit({ name: 'x', type: 'stdio', url: 'https://example.com/mcp' })).error).toContain(
       'cannot be used with url',
@@ -191,6 +197,12 @@ describe('add_mcp_server remote Streamable HTTP', () => {
       'headers are only valid with url',
     );
     expect((await submit({ name: 'neither' })).error).toContain('exactly one of command or url');
+  });
+
+  it('rejects a server name that would hit Object.prototype on plain assignment', async () => {
+    for (const reserved of ['__proto__', 'constructor', 'prototype']) {
+      expect((await submit({ name: reserved, url: 'https://example.com/mcp' })).error).toContain('reserved');
+    }
   });
 
   it('rejects control characters in a header value, allowlisted or not', async () => {

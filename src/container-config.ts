@@ -106,6 +106,14 @@ export function isCredentialQueryKey(key: string): boolean {
  * `container/agent-runner/src/mcp-tools/self-mod.ts`; keep the two in sync.
  */
 const MCP_SERVER_NAME_RE = /^[A-Za-z0-9_-]{1,64}$/;
+/**
+ * `mcpServers[name] = config` at every write site (CLI, `applyAddMcpServer`,
+ * `parseTemplateMcpServers`) is a plain-object assignment. These three names
+ * all pass MCP_SERVER_NAME_RE's charset but hit an inherited Object.prototype
+ * setter/property instead of creating an own enumerable entry — the server
+ * silently vanishes from JSON.stringify while every caller reports success.
+ */
+const RESERVED_MCP_SERVER_NAMES = new Set(['__proto__', 'constructor', 'prototype']);
 const ENV_KEY_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
 /** RFC 7230 token charset — what a header field-name may contain. */
 const HEADER_NAME_RE = /^[A-Za-z0-9!#$%&'*+.^_`|~-]{1,64}$/;
@@ -144,8 +152,15 @@ const ONECLI_PLACEHOLDER = 'onecli-managed';
  * passing the rule that exists to stop exactly that.
  */
 const ONECLI_HEADER_VALUE_RE = new RegExp(`^(?:[A-Za-z][A-Za-z0-9-]* )?${ONECLI_PLACEHOLDER}$`);
-/** Shapes of real credentials that must never be written into container.json. */
-const RAW_SECRET_VALUE_RE = /(^|\s)(sk-|ghp_|github_pat_|xox[a-z]-|AKIA|-----BEGIN )/;
+/**
+ * Shapes of real credentials that must never be written into container.json.
+ * The JWT alternative mirrors `SECRET_SHAPE_PATTERNS` in src/secret-scrubber.ts
+ * — same shape, same reasoning: `?code=eyJ...` in a neutral-named query
+ * parameter has no credential-shaped NAME to catch it, and `looksOpaque`
+ * excludes dotted values, so this is the only net that catches it.
+ */
+const RAW_SECRET_VALUE_RE =
+  /(^|\s)(sk-|ghp_|github_pat_|xox[a-z]-|AKIA|-----BEGIN )|\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/;
 /**
  * C0 control characters other than horizontal tab, plus DEL. A header value
  * containing CR/LF/NUL is accepted here (it's just a JS string) but rejected
@@ -190,6 +205,9 @@ export function isOneCliPlaceholder(value: string): boolean {
 export function validateMcpServerName(name: string): void {
   if (!MCP_SERVER_NAME_RE.test(name)) {
     throw new Error('server name must be 1-64 characters of letters, digits, "_" or "-"');
+  }
+  if (RESERVED_MCP_SERVER_NAMES.has(name)) {
+    throw new Error(`server name ${JSON.stringify(name)} is reserved`);
   }
 }
 

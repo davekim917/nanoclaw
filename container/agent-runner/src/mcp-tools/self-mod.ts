@@ -124,6 +124,12 @@ function isCredentialQueryKey(key: string): boolean {
  * can collide. Hence a charset allowlist at every entry point.
  */
 const MCP_SERVER_NAME_RE = /^[A-Za-z0-9_-]{1,64}$/;
+/**
+ * Mirrors the host's RESERVED_MCP_SERVER_NAMES (src/container-config.ts): a
+ * plain-object `mcpServers[name] = config` assignment hits an inherited
+ * Object.prototype setter/property for these, dropping the server silently.
+ */
+const RESERVED_MCP_SERVER_NAMES = new Set(['__proto__', 'constructor', 'prototype']);
 const ENV_KEY_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
 /** RFC 7230 token charset — what a header field-name may contain. */
 const HEADER_NAME_RE = /^[A-Za-z0-9!#$%&'*+.^_`|~-]{1,64}$/;
@@ -153,8 +159,13 @@ const ONECLI_PLACEHOLDER = 'onecli-managed';
  * or a single auth-scheme token in front of it.
  */
 const ONECLI_HEADER_VALUE_RE = new RegExp(`^(?:[A-Za-z][A-Za-z0-9-]* )?${ONECLI_PLACEHOLDER}$`);
-/** Shapes of real credentials that must never be written into container.json. */
-const RAW_SECRET_VALUE_RE = /(^|\s)(sk-|ghp_|github_pat_|xox[a-z]-|AKIA|-----BEGIN )/;
+/**
+ * Shapes of real credentials that must never be written into container.json.
+ * Mirrors the host's RAW_SECRET_VALUE_RE (src/container-config.ts), which
+ * mirrors SECRET_SHAPE_PATTERNS in src/secret-scrubber.ts for the JWT shape.
+ */
+const RAW_SECRET_VALUE_RE =
+  /(^|\s)(sk-|ghp_|github_pat_|xox[a-z]-|AKIA|-----BEGIN )|\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/;
 /** C0 control characters other than horizontal tab, plus DEL — mirrors the host's check. */
 const HEADER_VALUE_CONTROL_CHAR_RE = /[\x00-\x08\x0A-\x1F\x7F]/;
 
@@ -306,6 +317,9 @@ export const addMcpServer: McpToolDefinition = {
     if (!name) return err('name is required');
     if (!MCP_SERVER_NAME_RE.test(name)) {
       return err('server name must be 1-64 characters of letters, digits, "_" or "-"');
+    }
+    if (RESERVED_MCP_SERVER_NAMES.has(name)) {
+      return err(`server name ${JSON.stringify(name)} is reserved`);
     }
     const parsed = parseMcpServerInput(args);
     if ('error' in parsed) return err(parsed.error);

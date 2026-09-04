@@ -407,6 +407,13 @@ describe('parseMcpServerConfig', () => {
     );
     // Percent-encoding must not smuggle one past the check.
     expect(() => parseMcpServerConfig({ url: 'https://example.com/s/ghp_deadbeef1234/mcp' })).toThrow(/raw credential/);
+    // A JWT in a neutral-named query param (no credential-shaped KEY, so the
+    // key check misses it) or the path — same shape src/secret-scrubber.ts
+    // already redacts. Dotted values are excluded from `looksOpaque`, so this
+    // regex is the only net that catches it.
+    const jwt = 'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U';
+    expect(() => parseMcpServerConfig({ url: `https://example.com/mcp?code=${jwt}` })).toThrow(/raw credential/);
+    expect(() => parseMcpServerConfig({ url: `https://example.com/callback/${jwt}` })).toThrow(/raw credential/);
     // An opaque path segment that matches no known credential shape is fine.
     expect(parseMcpServerConfig({ url: 'https://hooks.example.com/s/abc123/mcp' })).toMatchObject({
       url: 'https://hooks.example.com/s/abc123/mcp',
@@ -472,6 +479,17 @@ describe('parseMcpServerConfig', () => {
     expect(() => validateMcpServerName('ok_name-1')).not.toThrow();
     for (const bad of ['', 'has space', 'dot.name', 'a'.repeat(65)]) {
       expect(() => validateMcpServerName(bad)).toThrow(/1-64 characters/);
+    }
+  });
+
+  it('validateMcpServerName rejects names that hit Object.prototype on plain assignment', () => {
+    // Every write site does `mcpServers[name] = config` on a plain object.
+    // These three names all pass the charset check but resolve to an
+    // inherited prototype setter/property instead of an own enumerable key,
+    // so the server silently vanishes from JSON.stringify while the caller
+    // reports success.
+    for (const reserved of ['__proto__', 'constructor', 'prototype']) {
+      expect(() => validateMcpServerName(reserved)).toThrow(/reserved/);
     }
   });
 });
