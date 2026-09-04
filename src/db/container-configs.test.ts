@@ -9,7 +9,7 @@
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 
-import { initTestDb, closeDb } from './connection.js';
+import { initTestDb, closeDb, getRawDb } from './connection.js';
 import { runMigrations } from './migrations/index.js';
 import { createAgentGroup } from './agent-groups.js';
 import { ensureContainerConfig, getContainerConfig, updateContainerConfigScalars } from './container-configs.js';
@@ -19,12 +19,13 @@ function makeGroup(id: string): void {
 }
 
 describe('ensureContainerConfig provider stamping', () => {
-  beforeEach(() => {
-    const db = initTestDb();
+  beforeEach(async () => {
+    await initTestDb();
+    const db = getRawDb();
     runMigrations(db);
   });
-  afterEach(() => {
-    closeDb();
+  afterEach(async () => {
+    await closeDb();
   });
 
   it('stamps a non-default provider on a fresh row; claude is stored as NULL', () => {

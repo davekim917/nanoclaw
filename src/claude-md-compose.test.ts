@@ -26,7 +26,7 @@ import {
   updateContainerConfigJson,
   updateContainerConfigScalars,
 } from './db/container-configs.js';
-import { closeDb, createAgentGroup, initTestDb, runMigrations } from './db/index.js';
+import { closeDb, createAgentGroup, initTestDb, runMigrations, getRawDb } from './db/index.js';
 import { STANDING_INSTRUCTIONS_FILE } from './group-persona.js';
 import type { AgentGroup } from './types.js';
 
@@ -74,15 +74,16 @@ function seedInstructionSources(): void {
   fs.writeFileSync(path.join(mcpTools, 'cli.instructions.md'), `# ncl\n\n${MODULE_CLI_SENTINEL}\n`);
 }
 
-beforeEach(() => {
+beforeEach(async () => {
   fs.rmSync(TEST_ROOT, { recursive: true, force: true });
   fs.mkdirSync(TEST_ROOT, { recursive: true });
   seedInstructionSources();
-  runMigrations(initTestDb());
+  await initTestDb();
+  runMigrations(getRawDb());
 });
 
-afterEach(() => {
-  closeDb();
+afterEach(async () => {
+  await closeDb();
   fs.rmSync(TEST_ROOT, { recursive: true, force: true });
 });
 

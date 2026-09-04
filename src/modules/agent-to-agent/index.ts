@@ -12,7 +12,7 @@
  *
  * Host integration points:
  *   - `src/container-runner.ts::spawnContainer` dynamically imports
- *     `./write-destinations.js` on every wake (guarded by `hasTable('agent_destinations')`).
+ *     `./write-destinations.js` on every wake (guarded by `hasTableRaw('agent_destinations')`).
  *   - `src/delivery.ts::deliverMessage` dynamically imports `./agent-route.js`
  *     when `msg.channel_type === 'agent'`.
  *

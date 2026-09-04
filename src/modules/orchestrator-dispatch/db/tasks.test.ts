@@ -11,25 +11,26 @@ import {
   type Task,
 } from './tasks.js';
 import { initTestDb, closeDb, runMigrations, createAgentGroup } from '../../../db/index.js';
-import { getDb } from '../../../db/connection.js';
+import { getRawDb } from '../../../db/connection.js';
 
 function now(): string {
   return new Date().toISOString();
 }
 
-afterEach(() => {
-  closeDb();
+afterEach(async () => {
+  await closeDb();
 });
 
-function setupDb(): void {
-  const db = initTestDb();
+async function setupDb(): Promise<void> {
+  await initTestDb();
+  const db = getRawDb();
   db.pragma('foreign_keys = ON');
   runMigrations(db);
 }
 
 function seedAgentAndSession(agId: string, sessId: string): void {
   createAgentGroup({ id: agId, name: agId, folder: agId, agent_provider: null, created_at: now() });
-  getDb().prepare(`INSERT INTO sessions (id, agent_group_id, created_at) VALUES (?, ?, ?)`).run(sessId, agId, now());
+  getRawDb().prepare(`INSERT INTO sessions (id, agent_group_id, created_at) VALUES (?, ?, ?)`).run(sessId, agId, now());
 }
 
 function makeTask(overrides: Partial<Omit<Task, 'created_at'>> = {}): Omit<Task, 'created_at'> {
@@ -67,8 +68,8 @@ function makeTask(overrides: Partial<Omit<Task, 'created_at'>> = {}): Omit<Task,
 }
 
 describe('tasks CRUD', () => {
-  it('test_insert_atomic_idempotent_collision', () => {
-    setupDb();
+  it('test_insert_atomic_idempotent_collision', async () => {
+    await setupDb();
     seedAgentAndSession('ag-parent', 'sess-parent');
     seedAgentAndSession('ag-target', 'sess-target');
 
@@ -81,8 +82,8 @@ describe('tasks CRUD', () => {
     expect(second).toBeNull();
   });
 
-  it('test_get_by_id', () => {
-    setupDb();
+  it('test_get_by_id', async () => {
+    await setupDb();
     seedAgentAndSession('ag-parent', 'sess-parent');
     seedAgentAndSession('ag-target', 'sess-target');
 
@@ -93,8 +94,8 @@ describe('tasks CRUD', () => {
     expect(found!.idempotency_key).toBe('ik-1');
   });
 
-  it('test_get_by_parent_and_idempotency', () => {
-    setupDb();
+  it('test_get_by_parent_and_idempotency', async () => {
+    await setupDb();
     seedAgentAndSession('ag-parent', 'sess-parent');
     seedAgentAndSession('ag-target', 'sess-target');
 
@@ -107,8 +108,8 @@ describe('tasks CRUD', () => {
     expect(notFound).toBeNull();
   });
 
-  it('test_acquire_lease_blocks_concurrent', () => {
-    setupDb();
+  it('test_acquire_lease_blocks_concurrent', async () => {
+    await setupDb();
     seedAgentAndSession('ag-parent', 'sess-parent');
     seedAgentAndSession('ag-target', 'sess-target');
 
@@ -121,14 +122,14 @@ describe('tasks CRUD', () => {
     expect(second).toBeNull();
   });
 
-  it('test_update_artifact_status_guard', () => {
-    setupDb();
+  it('test_update_artifact_status_guard', async () => {
+    await setupDb();
     seedAgentAndSession('ag-parent', 'sess-parent');
     seedAgentAndSession('ag-target', 'sess-target');
 
     // Insert in cancelled status by inserting then directly updating
     insertTaskAtomic(makeTask());
-    getDb().prepare(`UPDATE tasks SET status='cancelled', cancelled_at=? WHERE task_id='task-1'`).run(now());
+    getRawDb().prepare(`UPDATE tasks SET status='cancelled', cancelled_at=? WHERE task_id='task-1'`).run(now());
 
     const updated = updateArtifactColumn('task-1', 'parent_platform_message_id', 'msg-1');
     expect(updated).toBe(false);
@@ -137,8 +138,8 @@ describe('tasks CRUD', () => {
     expect(row!.parent_platform_message_id).toBeNull();
   });
 
-  it('test_update_artifact_succeeds_for_pending', () => {
-    setupDb();
+  it('test_update_artifact_succeeds_for_pending', async () => {
+    await setupDb();
     seedAgentAndSession('ag-parent', 'sess-parent');
     seedAgentAndSession('ag-target', 'sess-target');
 
@@ -150,8 +151,8 @@ describe('tasks CRUD', () => {
     expect(row!.parent_platform_message_id).toBe('msg-1');
   });
 
-  it('test_transition_terminal_only_from_active', () => {
-    setupDb();
+  it('test_transition_terminal_only_from_active', async () => {
+    await setupDb();
     seedAgentAndSession('ag-parent', 'sess-parent');
     seedAgentAndSession('ag-target', 'sess-target');
 
@@ -168,8 +169,8 @@ describe('tasks CRUD', () => {
     expect(row!.status).toBe('completed');
   });
 
-  it('test_transition_to_cancelled', () => {
-    setupDb();
+  it('test_transition_to_cancelled', async () => {
+    await setupDb();
     seedAgentAndSession('ag-parent', 'sess-parent');
     seedAgentAndSession('ag-target', 'sess-target');
 
@@ -181,8 +182,8 @@ describe('tasks CRUD', () => {
     expect(row!.status).toBe('cancelled');
   });
 
-  it('test_increment_completion_attempts', () => {
-    setupDb();
+  it('test_increment_completion_attempts', async () => {
+    await setupDb();
     seedAgentAndSession('ag-parent', 'sess-parent');
     seedAgentAndSession('ag-target', 'sess-target');
 
@@ -194,8 +195,8 @@ describe('tasks CRUD', () => {
     expect(count2).toBe(2);
   });
 
-  it('test_get_orphaned_tasks', () => {
-    setupDb();
+  it('test_get_orphaned_tasks', async () => {
+    await setupDb();
     seedAgentAndSession('ag-parent', 'sess-parent');
     seedAgentAndSession('ag-target', 'sess-target');
 
@@ -207,8 +208,8 @@ describe('tasks CRUD', () => {
     expect(orphans[0]!.task_id).toBe('task-1');
   });
 
-  it('test_get_orphaned_tasks_excludes_leased', () => {
-    setupDb();
+  it('test_get_orphaned_tasks_excludes_leased', async () => {
+    await setupDb();
     seedAgentAndSession('ag-parent', 'sess-parent');
     seedAgentAndSession('ag-target', 'sess-target');
 

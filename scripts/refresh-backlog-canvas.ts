@@ -18,7 +18,7 @@ import { readContainerConfig } from '../src/container-config.js';
 import { getAllAgentGroups } from '../src/db/agent-groups.js';
 import { initDb } from '../src/db/connection.js';
 
-initDb(path.join(DATA_DIR, 'v2.db'));
+await initDb(path.join(DATA_DIR, 'v2.db'));
 
 const preview = process.argv.includes('--preview');
 const team = process.argv.find((a) => !a.startsWith('-') && a !== process.argv[0] && a !== process.argv[1]) || 'XZO';

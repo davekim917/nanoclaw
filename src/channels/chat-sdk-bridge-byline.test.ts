@@ -22,7 +22,7 @@ vi.mock('../webhook-server.js', async (importOriginal) => ({
   }),
 }));
 
-import { closeDb, createAgentGroup, createSession, initTestDb, runMigrations } from '../db/index.js';
+import { closeDb, createAgentGroup, createSession, initTestDb, runMigrations, getRawDb } from '../db/index.js';
 import { createPendingApproval, createPendingQuestion } from '../db/sessions.js';
 import type { ChannelSetup } from './adapter.js';
 import { createChatSdkBridge } from './chat-sdk-bridge.js';
@@ -137,14 +137,15 @@ function seedInteractiveQuestion(id: string, title: string, question: string): v
   });
 }
 
-beforeEach(() => {
+beforeEach(async () => {
   captured.chat = null;
-  const db = initTestDb();
+  await initTestDb();
+  const db = getRawDb();
   runMigrations(db);
 });
 
-afterEach(() => {
-  closeDb();
+afterEach(async () => {
+  await closeDb();
 });
 
 describe('chat-sdk-bridge approval-card byline', () => {

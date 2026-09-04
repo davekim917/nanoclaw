@@ -19,7 +19,7 @@
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { closeDb, initTestDb, runMigrations } from '../../db/index.js';
+import { closeDb, initTestDb, runMigrations, getRawDb } from '../../db/index.js';
 import { insertThreadTitleClaim, recordThreadTitleAttemptFailure } from '../../db/thread-titles.js';
 import { _listSweepRegistrationsForTesting, SWEEP_DUTY_INVENTORY, type SweepTickContext } from '../../host-sweep.js';
 import { log } from '../../log.js';
@@ -78,10 +78,11 @@ const NOW = '2026-08-31T12:00:00.000Z';
 // shell) and stub fetch so a missing clear can't silently reach the network.
 let originalToken: string | undefined;
 
-beforeEach(() => {
+beforeEach(async () => {
   // Truncate, never reassign: the tripwire factory closed over THIS array.
   h.spawns.length = 0;
-  runMigrations(initTestDb());
+  await initTestDb();
+  runMigrations(getRawDb());
   originalToken = process.env.DISCORD_BOT_TOKEN;
   delete process.env.DISCORD_BOT_TOKEN;
   vi.stubGlobal(
@@ -92,8 +93,8 @@ beforeEach(() => {
   );
 });
 
-afterEach(() => {
-  closeDb();
+afterEach(async () => {
+  await closeDb();
   // NOT vi.restoreAllMocks(): the `vi.mock('../../topic-title.js',
   // importOriginal)` above wraps the real `retryPendingThreadTitles` as
   // `vi.fn(real.impl)`, not a `vi.spyOn` — restoreAllMocks() would clear that

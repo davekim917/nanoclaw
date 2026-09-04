@@ -5,7 +5,7 @@ import { CronExpressionParser } from 'cron-parser';
 import { GROUPS_DIR, TIMEZONE } from '../../config.js';
 import { resolveGroupTimezone } from '../../container-config.js';
 import { getAgentGroup } from '../../db/agent-groups.js';
-import { getDb } from '../../db/connection.js';
+import { getRawDb } from '../../db/connection.js';
 import { getMessagingGroup } from '../../db/messaging-groups.js';
 import {
   findTaskSessions,
@@ -352,7 +352,7 @@ async function createTask(args: Record<string, unknown>, ctx: CallerContext) {
     }),
   );
   if (!created) throw new Error('task system session inbound.db not found');
-  writeAudit(getDb(), {
+  writeAudit(getRawDb(), {
     actor: actorFor(ctx),
     action: 'create',
     agentGroupId: session.agent_group_id,
@@ -502,7 +502,7 @@ async function mutateTask(
       // No before/after body: pause/resume/delete/cancel don't touch the
       // prompt, matching the dashboard's own pause/resume/cancel audit rows
       // (scheduled-mutations.ts) — a status-only change is the "after" here.
-      writeAudit(getDb(), {
+      writeAudit(getRawDb(), {
         actor: actorFor(ctx),
         action,
         agentGroupId: session.agent_group_id,
@@ -685,7 +685,7 @@ async function updateTaskCommand(args: Record<string, unknown>, ctx: CallerConte
     if (!result) continue;
     const { before, n } = result;
     if (n > 0) {
-      writeAudit(getDb(), {
+      writeAudit(getRawDb(), {
         actor: actorFor(ctx),
         action: 'update',
         agentGroupId: session.agent_group_id,
@@ -727,7 +727,7 @@ async function cancelTaskCommand(args: Record<string, unknown>, ctx: CallerConte
     if (!result) continue;
     if (result.n > 0) {
       for (const seriesId of result.seriesIds) {
-        writeAudit(getDb(), {
+        writeAudit(getRawDb(), {
           actor: actorFor(ctx),
           action: 'cancel',
           agentGroupId: session.agent_group_id,
@@ -777,7 +777,7 @@ async function runTaskCommand(args: Record<string, unknown>, ctx: CallerContext)
       return { series_id: seriesKey, row_id: rowId, status: 'pending' };
     });
     if (fired) {
-      writeAudit(getDb(), {
+      writeAudit(getRawDb(), {
         actor: actorFor(ctx),
         action: 'run_now',
         agentGroupId: session.agent_group_id,

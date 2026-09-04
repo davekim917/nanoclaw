@@ -33,7 +33,7 @@ import { resolveSession, resolveTaskSession, withMailboxSession, writeSessionMes
 import { openInboundDb as openInboundDbAt } from './modules/mailbox/openers.js';
 import { inboundDbPath, outboundDbPath } from './mailbox/sqlite/paths.js';
 import { getTaskThreadAnchor, setTaskThreadAnchor } from './db/task-thread-anchors.js';
-import { getDb } from './db/connection.js';
+import { getRawDb } from './db/connection.js';
 import {
   clearSessionStatusOnKill,
   deliverSessionMessages,
@@ -96,15 +96,16 @@ function insertOutboundKind(
   db.close();
 }
 
-beforeEach(() => {
+beforeEach(async () => {
   if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
   fs.mkdirSync(TEST_DIR, { recursive: true });
-  const db = initTestDb();
+  await initTestDb();
+  const db = getRawDb();
   runMigrations(db);
 });
 
-afterEach(() => {
-  closeDb();
+afterEach(async () => {
+  await closeDb();
   if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
 });
 
@@ -651,8 +652,8 @@ describe('deliverSessionMessages — concurrent invocations', () => {
     // Mark this session as a spawn-child by inserting a task row with
     // child_session_id = session.id. `isSpawnChildSession` queries the
     // central tasks table and caches per-process.
-    const { getDb } = await import('./db/connection.js');
-    getDb()
+    const { getRawDb } = await import('./db/connection.js');
+    getRawDb()
       .prepare(
         `INSERT INTO tasks
            (task_id, idempotency_key, parent_session_id, parent_agent_group_id,
@@ -1142,7 +1143,7 @@ describe('rolling task-thread anchor (fleet-hardening 1.4)', () => {
   // permission doesn't apply — grant the explicit agent_destinations row the
   // permission check requires instead.
   function grantChannelDestination(agentGroupId: string, messagingGroupId: string): void {
-    getDb()
+    getRawDb()
       .prepare(
         `INSERT INTO agent_destinations (agent_group_id, local_name, target_type, target_id, created_at)
          VALUES (?, 'main', 'channel', ?, ?)`,
@@ -1208,7 +1209,7 @@ describe('rolling task-thread anchor (fleet-hardening 1.4)', () => {
 
     // The stamp landed on its own column, and the discriminator column did not
     // move — read straight from the DB, not from the in-memory object.
-    const row = getDb()
+    const row = getRawDb()
       .prepare('SELECT messaging_group_id, task_routing_platform_id FROM sessions WHERE id = ?')
       .get(session.id) as { messaging_group_id: string | null; task_routing_platform_id: string | null };
     expect(row.messaging_group_id).toBeNull();

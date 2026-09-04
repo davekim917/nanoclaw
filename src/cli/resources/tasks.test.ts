@@ -38,7 +38,7 @@ vi.mock('../../container-runner.js', async (importOriginal) => ({
 
 const { TEST_DIR } = vi.hoisted(() => ({ TEST_DIR: uniqueTmpRoot('test-cli-tasks') }));
 
-import { initTestDb, closeDb, runMigrations, createAgentGroup, getDb } from '../../db/index.js';
+import { initTestDb, closeDb, runMigrations, createAgentGroup, getRawDb } from '../../db/index.js';
 import { createMessagingGroup } from '../../db/messaging-groups.js';
 import { ensureContainerConfig, updateContainerConfigScalars } from '../../db/container-configs.js';
 import { createSession, findSessionByAgentGroup, getSessionsByAgentGroup, taskThreadId } from '../../db/sessions.js';
@@ -119,10 +119,11 @@ async function admitDueTaskContexts(agentGroupId: string, sessionId: string): Pr
 }
 
 describe('tasks CLI resource', () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
     fs.mkdirSync(TEST_DIR, { recursive: true });
-    const db = initTestDb();
+    await initTestDb();
+    const db = getRawDb();
     runMigrations(db);
     createGroup('ag-1');
     createGroup('ag-2');
@@ -130,8 +131,8 @@ describe('tasks CLI resource', () => {
     createChatSession('ag-2', 'chat-2');
   });
 
-  afterEach(() => {
-    closeDb();
+  afterEach(async () => {
+    await closeDb();
     if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
   });
 
@@ -1233,7 +1234,7 @@ describe('tasks CLI resource', () => {
       // the task row, so the console can place the task in the channel it is
       // routed to. `messaging_group_id` must stay NULL — it is delivery.ts's
       // task-session discriminator (`task_log` appends, `isTaskSessionPost`).
-      const session = getDb()
+      const session = getRawDb()
         .prepare(
           `SELECT messaging_group_id, task_routing_platform_id FROM sessions
             WHERE agent_group_id = 'ag-1' AND thread_id LIKE 'system:tasks:%'`,
@@ -1258,7 +1259,7 @@ describe('tasks CLI resource', () => {
       );
       expect(r.ok).toBe(true);
       if (!r.ok) return;
-      const session = getDb()
+      const session = getRawDb()
         .prepare(
           `SELECT messaging_group_id, task_routing_platform_id FROM sessions
             WHERE agent_group_id = 'ag-1' AND thread_id LIKE 'system:tasks:%'`,
@@ -1489,7 +1490,7 @@ describe('tasks CLI resource', () => {
 
   describe('scheduled_audit trail (fleet-hardening Phase 0.2)', () => {
     function auditRows(seriesId: string) {
-      return getDb()
+      return getRawDb()
         .prepare(
           'SELECT actor, action, agent_group_id, session_id, series_id, before_hash, after_hash, ts ' +
             'FROM scheduled_audit WHERE series_id = ? ORDER BY id ASC',
@@ -1572,7 +1573,7 @@ describe('tasks CLI resource', () => {
       expect((updated.data as { fields: string[] }).fields).toContain('processAfter');
 
       const details = (
-        getDb()
+        getRawDb()
           .prepare("SELECT agent_group_id, detail_json FROM scheduled_audit WHERE series_id = ? AND action = 'update'")
           .all(sharedId) as Array<{ agent_group_id: string; detail_json: string | null }>
       ).map((r) => ({ group: r.agent_group_id, processAfter: JSON.parse(r.detail_json ?? '{}').processAfter }));

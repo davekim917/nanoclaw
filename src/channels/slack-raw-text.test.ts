@@ -23,7 +23,7 @@ vi.mock('../webhook-server.js', async (importOriginal) => ({
   }),
 }));
 
-import { closeDb, initTestDb, runMigrations } from '../db/index.js';
+import { closeDb, initTestDb, runMigrations, getRawDb } from '../db/index.js';
 import type { ChannelSetup, InboundMessage } from './adapter.js';
 import { appendRawText, createChatSdkBridge } from './chat-sdk-bridge.js';
 import { extractSlackRawText } from './slack-raw-text.js';
@@ -505,13 +505,14 @@ describe('Slack pasted tables in replayed thread context', () => {
 });
 
 describe('Slack pasted tables through the chat-sdk bridge', () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     captured.chat = null;
-    runMigrations(initTestDb());
+    await initTestDb();
+    runMigrations(getRawDb());
   });
 
-  afterEach(() => {
-    closeDb();
+  afterEach(async () => {
+    await closeDb();
   });
 
   it('persists the rescued table AFTER the mdast rebuild, and still drops raw', async () => {

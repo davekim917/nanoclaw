@@ -1,7 +1,7 @@
 import { randomUUID } from 'crypto';
 
 import { getChannelAdapter } from '../../channels/channel-registry.js';
-import { getDb } from '../../db/connection.js';
+import { getRawDb } from '../../db/connection.js';
 // Lazy import to avoid module-init cycle (events.ts imports nothing from dispatch.ts).
 // The import() call is memoized by Node's module cache after the first resolution.
 //
@@ -92,7 +92,7 @@ export async function applySpawnTask(content: Record<string, unknown>, callerSes
   // delivery drains from the same orchestrator both reading the same count, both
   // passing the cap check, and both succeeding INSERT (cap exceeded). Cycle-3
   // S3-C / Concurrency-reviewer #5.
-  const db = getDb();
+  const db = getRawDb();
   let taskRow: Task | null = null;
   let replayResult: { message: string } | null = null;
 
@@ -222,9 +222,13 @@ export async function applySpawnTask(content: Record<string, unknown>, callerSes
   // exact call shape. completeSpawnSideEffects internally .catch()es
   // _runCompletionSideEffects, so the promise it returns never rejects —
   // void is safe here.
-  setImmediate((taskId: string, groupId: string) => {
-    void completeSpawnSideEffects(taskId, groupId);
-  }, admittedTask.task_id, childAgentGroupId);
+  setImmediate(
+    (taskId: string, groupId: string) => {
+      void completeSpawnSideEffects(taskId, groupId);
+    },
+    admittedTask.task_id,
+    childAgentGroupId,
+  );
 }
 
 /**
@@ -258,7 +262,7 @@ async function _runCompletionSideEffects(taskId: string, childAgentGroupId: stri
 
   const releaseLeaseAndFinish = () => {
     try {
-      getDb().prepare(`UPDATE tasks SET completion_lease_at = NULL WHERE task_id = ?`).run(taskId);
+      getRawDb().prepare(`UPDATE tasks SET completion_lease_at = NULL WHERE task_id = ?`).run(taskId);
     } catch (err) {
       log.warn('completeSpawnSideEffects: failed to release lease', { taskId, err });
     }
@@ -376,7 +380,7 @@ async function _runThreadedPath(task: Task, childAgentGroupId: string): Promise<
 
       // a. UPDATE tasks first (cycle-3 M21)
       const now = new Date().toISOString();
-      const updated = getDb()
+      const updated = getRawDb()
         .prepare(
           `UPDATE tasks SET child_session_id = ?, started_at = ?, last_progress_at = ?, status = 'running'
              WHERE task_id = ? AND status = 'pending' AND child_session_id IS NULL`,
@@ -443,7 +447,7 @@ async function _runHeadlessPath(task: Task, childAgentGroupId: string): Promise<
 
     // a. UPDATE tasks first (cycle-3 M21)
     const now = new Date().toISOString();
-    const updated = getDb()
+    const updated = getRawDb()
       .prepare(
         `UPDATE tasks SET child_session_id = ?, started_at = ?, last_progress_at = ?, status = 'running'
            WHERE task_id = ? AND status = 'pending' AND child_session_id IS NULL`,

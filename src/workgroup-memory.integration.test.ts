@@ -54,7 +54,7 @@ vi.mock('../container/agent-runner/src/destinations.js', () => ({
   findByRouting: () => undefined,
 }));
 
-import { closeDb, getDb, initTestDb, runMigrations } from './db/index.js';
+import { closeDb, getRawDb, initTestDb, runMigrations } from './db/index.js';
 import { upsertArchiveMessage } from './message-archive.js';
 import { writeSessionMessageIfNew } from './session-manager.js';
 import { openInboundDb as openInboundDbAt } from './modules/mailbox/openers.js';
@@ -107,7 +107,7 @@ interface Turn {
 }
 
 function seedCentralScope(): void {
-  const db = getDb();
+  const db = getRawDb();
   const insertWorkgroup = db.prepare(`INSERT INTO workgroups (id,display_name,created_at) VALUES (?,?,?)`);
   insertWorkgroup.run('house-a', 'House A', NOW);
   insertWorkgroup.run('house-b', 'House B', NOW);
@@ -276,11 +276,12 @@ async function writeTurn(
   }
 }
 
-beforeEach(() => {
+beforeEach(async () => {
   FAILURES.archive = false;
   fs.rmSync(TEST_ROOT, { recursive: true, force: true });
   fs.mkdirSync(TEST_ROOT, { recursive: true });
-  runMigrations(initTestDb());
+  await initTestDb();
+  runMigrations(getRawDb());
   seedCentralScope();
   writeMemory(
     'house-a',
@@ -333,8 +334,8 @@ beforeEach(() => {
   });
 });
 
-afterEach(() => {
-  closeDb();
+afterEach(async () => {
+  await closeDb();
   fs.rmSync(TEST_ROOT, { recursive: true, force: true });
 });
 

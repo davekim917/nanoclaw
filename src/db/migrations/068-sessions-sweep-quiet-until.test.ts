@@ -1,7 +1,7 @@
 import Database from 'better-sqlite3';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
-import { closeDb, getDb, initTestDb } from '../connection.js';
+import { closeDb, getRawDb, initTestDb } from '../connection.js';
 import { runMigrations } from './index.js';
 import { migration068 } from './068-sessions-sweep-quiet-until.js';
 import {
@@ -96,14 +96,14 @@ describe('the persisted quiet mark (S2-PR15)', () => {
   }
 
   function markOf(id: string): string | null {
-    const row = getDb().prepare('SELECT sweep_quiet_until FROM sessions WHERE id = ?').get(id) as
+    const row = getRawDb().prepare('SELECT sweep_quiet_until FROM sessions WHERE id = ?').get(id) as
       | { sweep_quiet_until: string | null }
       | undefined;
     return row?.sweep_quiet_until ?? null;
   }
 
   function lastActiveOf(id: string): string | null {
-    const row = getDb().prepare('SELECT last_active FROM sessions WHERE id = ?').get(id) as
+    const row = getRawDb().prepare('SELECT last_active FROM sessions WHERE id = ?').get(id) as
       | { last_active: string | null }
       | undefined;
     return row?.last_active ?? null;
@@ -113,16 +113,17 @@ describe('the persisted quiet mark (S2-PR15)', () => {
   const FUTURE = '2099-01-01T00:00:00.000Z';
   const PAST = '2000-01-01T00:00:00.000Z';
 
-  beforeEach(() => {
-    const db = initTestDb();
+  beforeEach(async () => {
+    await initTestDb();
+    const db = getRawDb();
     runMigrations(db);
     db.prepare(
       `INSERT INTO agent_groups (id, name, folder, created_at) VALUES ('ag-1', 'ag', 'ag', '2026-08-01T00:00:00.000Z')`,
     ).run();
   });
 
-  afterEach(() => {
-    closeDb();
+  afterEach(async () => {
+    await closeDb();
   });
 
   it('writes a whole tick of marks in one batch', () => {
@@ -244,7 +245,7 @@ describe('the persisted quiet mark (S2-PR15)', () => {
 
   it('throws and runs no write when the central DB refuses the invalidation', () => {
     createSession(session('s-1', ACTIVE));
-    getDb().exec('DROP TABLE sessions');
+    getRawDb().exec('DROP TABLE sessions');
     let ran = false;
 
     expect(() =>
@@ -263,7 +264,7 @@ describe('the persisted quiet mark (S2-PR15)', () => {
     createSession(session('s-gone', ACTIVE));
     createSession(session('s-closed', ACTIVE));
     updateSession('s-closed', { status: 'closed' });
-    getDb().prepare('DELETE FROM sessions WHERE id = ?').run('s-gone');
+    getRawDb().prepare('DELETE FROM sessions WHERE id = ?').run('s-gone');
     const ran: string[] = [];
 
     expect(() => withQuietInvalidationSync('s-gone', () => ran.push('gone'))).toThrow(QuietInvalidationError);

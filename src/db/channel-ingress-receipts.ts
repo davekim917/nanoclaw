@@ -1,4 +1,4 @@
-import { getDb } from './connection.js';
+import { getRawDb } from './connection.js';
 
 export interface ChannelIngressReceiptKey {
   channelType: string;
@@ -18,7 +18,7 @@ function params(key: ChannelIngressReceiptKey): Record<string, string> {
 
 /** Atomically reserve all router side effects for one platform event. */
 export function claimChannelIngress(key: ChannelIngressReceiptKey): boolean {
-  const result = getDb()
+  const result = getRawDb()
     .prepare(
       `INSERT INTO channel_ingress_receipts
          (channel_type, instance, platform_id, message_id, status, claimed_at, completed_at)
@@ -30,7 +30,7 @@ export function claimChannelIngress(key: ChannelIngressReceiptKey): boolean {
 }
 
 export function completeChannelIngress(key: ChannelIngressReceiptKey): void {
-  getDb()
+  getRawDb()
     .prepare(
       `UPDATE channel_ingress_receipts
           SET status = 'completed', completed_at = @completed_at
@@ -48,7 +48,7 @@ export function completeChannelIngress(key: ChannelIngressReceiptKey): void {
  * claims the deferred receipt for replay.
  */
 export function deferChannelIngress(key: ChannelIngressReceiptKey): void {
-  getDb()
+  getRawDb()
     .prepare(
       `UPDATE channel_ingress_receipts
           SET status = 'deferred'
@@ -67,7 +67,7 @@ export function deferChannelIngress(key: ChannelIngressReceiptKey): void {
  * to replay.
  */
 export function claimDeferredChannelIngress(key: ChannelIngressReceiptKey): boolean {
-  const db = getDb();
+  const db = getRawDb();
   const updated = db
     .prepare(
       `UPDATE channel_ingress_receipts
@@ -85,7 +85,7 @@ export function claimDeferredChannelIngress(key: ChannelIngressReceiptKey): bool
 
 /** Resolve a denied/abandoned deferred event without routing it. */
 export function completeDeferredChannelIngress(key: ChannelIngressReceiptKey): void {
-  getDb()
+  getRawDb()
     .prepare(
       `UPDATE channel_ingress_receipts
           SET status = 'completed', completed_at = @completed_at
@@ -100,7 +100,7 @@ export function completeDeferredChannelIngress(key: ChannelIngressReceiptKey): v
 
 /** Release a failed route so recovery can retry the event. */
 export function releaseChannelIngress(key: ChannelIngressReceiptKey): void {
-  getDb()
+  getRawDb()
     .prepare(
       `DELETE FROM channel_ingress_receipts
         WHERE channel_type = @channel_type
@@ -114,12 +114,12 @@ export function releaseChannelIngress(key: ChannelIngressReceiptKey): void {
 
 /** Processing claims cannot survive the host process that owned their side effects. */
 export function resetProcessingChannelIngress(): number {
-  return getDb().prepare("DELETE FROM channel_ingress_receipts WHERE status = 'processing'").run().changes;
+  return getRawDb().prepare("DELETE FROM channel_ingress_receipts WHERE status = 'processing'").run().changes;
 }
 
 export function pruneChannelIngressReceipts(nowMs = Date.now(), retentionMs = 7 * 24 * 60 * 60 * 1000): number {
   const cutoff = new Date(nowMs - retentionMs).toISOString();
-  return getDb()
+  return getRawDb()
     .prepare(
       `DELETE FROM channel_ingress_receipts
         WHERE (status = 'completed' AND datetime(completed_at) < datetime(@cutoff))

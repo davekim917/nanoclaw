@@ -16,7 +16,7 @@ import { resolveContainerResources, type ContainerResources } from '../../contai
 import { buildAgentGroupImage, killContainer, wakeContainer } from '../../container-runner.js';
 import { restartAgentGroupContainers } from '../../container-restart.js';
 import { createAgentGroup, getAgentGroup, getAgentGroupByFolder } from '../../db/agent-groups.js';
-import { getDb, hasTable } from '../../db/connection.js';
+import { getRawDb, hasTableRaw } from '../../db/connection.js';
 import { getSession } from '../../db/sessions.js';
 import { writeSessionMessage } from '../../session-manager.js';
 import {
@@ -199,16 +199,16 @@ registerResource({
       handler: async (args) => {
         const id = args.id as string;
         if (!id) throw new Error('--id is required');
-        const db = getDb();
+        const db = getRawDb();
 
         // Verify the group exists before doing anything — preserves the
         // genericDelete behaviour of throwing "not found" for unknown IDs.
         const exists = db.prepare('SELECT 1 FROM agent_groups WHERE id = ? LIMIT 1').get(id);
         if (!exists) throw new Error(`group not found: ${id}`);
 
-        const hasAgentDestinations = hasTable(db, 'agent_destinations');
-        const hasPendingApprovals = hasTable(db, 'pending_approvals');
-        const hasWorkgroups = hasTable(db, 'workgroups');
+        const hasAgentDestinations = hasTableRaw(db, 'agent_destinations');
+        const hasPendingApprovals = hasTableRaw(db, 'pending_approvals');
+        const hasWorkgroups = hasTableRaw(db, 'workgroups');
 
         // FK-ordered cascade. Single sync IMMEDIATE transaction — better-sqlite3
         // rolls back the whole thing if any statement throws (e.g. an FK

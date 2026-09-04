@@ -71,7 +71,7 @@ import {
   getWorkgroupOnecliSecrets,
   getWorkgroupOnecliSecretsById,
 } from './db/agent-groups.js';
-import { getDb, hasTable } from './db/connection.js';
+import { getRawDb, hasTableRaw } from './db/connection.js';
 import { getMessagingGroup } from './db/messaging-groups.js';
 import { getSession } from './db/sessions.js';
 import { buildCentralProjection } from './db/per-agent-projections.js';
@@ -841,7 +841,7 @@ async function spawnReservedContainer(caller: Session, guard?: WakeGuard): Promi
       spawnAgentGroup.folder,
       process.env.NANOCLAW_CONTAINER_SPAWN_WORKGROUP_ALLOWLIST !== undefined,
     );
-    spawnWorkgroupId = resolveWorkgroupIdAtSpawn(getDb(), spawnAgentGroup, spawnContainerConfig);
+    spawnWorkgroupId = resolveWorkgroupIdAtSpawn(getRawDb(), spawnAgentGroup, spawnContainerConfig);
   } catch (err) {
     log.warn('Container wake rejected — unable to resolve authoritative spawn configuration', {
       sessionId: session.id,
@@ -1029,7 +1029,7 @@ async function spawnContainer(
   // changes take effect on wake. Destinations come from the agent-to-agent
   // module — skip when the module isn't installed (table absent).
   const routingWritesStartedAt = Date.now();
-  if (hasTable(getDb(), 'agent_destinations')) {
+  if (hasTableRaw(getRawDb(), 'agent_destinations')) {
     const { writeDestinations } = await import('./modules/agent-to-agent/write-destinations.js');
     await writeDestinations(agentGroup.id, session.id);
   }
@@ -1099,7 +1099,7 @@ async function spawnContainer(
   // downstream subsystems so they don't each re-derive from agentGroups,
   // which would race against any concurrent reconcile.
   const workgroupPersistStartedAt = Date.now();
-  const { workgroupId: resolvedWgId } = persistResolvedWorkgroupAtSpawn(getDb(), agentGroup, admittedWorkgroupId);
+  const { workgroupId: resolvedWgId } = persistResolvedWorkgroupAtSpawn(getRawDb(), agentGroup, admittedWorkgroupId);
   logSpawnStage('workgroup-persist', workgroupPersistStartedAt);
   const repositoryFenceStartedAt = Date.now();
   const repositoryWorkUnit = resolveSessionRepositoryWorkUnit(session, resolvedWgId);
@@ -1139,7 +1139,7 @@ async function spawnContainer(
     );
   }
 
-  const [memoryReport] = reconcileWorkgroupMemory(getDb(), { workgroupIds: [resolvedWgId] });
+  const [memoryReport] = reconcileWorkgroupMemory(getRawDb(), { workgroupIds: [resolvedWgId] });
   if (!memoryReport || memoryReport.state.status === 'migration-required') {
     throw new Error(
       `Workgroup memory migration-required for ${resolvedWgId}; refusing container spawn before operator migration`,
@@ -2561,7 +2561,7 @@ export async function buildMounts(
   let workgroupMemberIds: string[] | undefined;
   try {
     if (resolvedWgId) {
-      const memberRows = getDb()
+      const memberRows = getRawDb()
         .prepare(`SELECT id FROM agent_groups WHERE workgroup_id = ?`)
         .all(resolvedWgId) as Array<{ id: string }>;
       // W3 fail-closed: if the spawning agent is no longer a member of the
@@ -2578,9 +2578,9 @@ export async function buildMounts(
       }
       workgroupMemberIds = memberRows.map((r) => r.id);
     } else {
-      const centralCheck = getDb().prepare(`PRAGMA table_info(agent_groups)`).all() as Array<{ name: string }>;
+      const centralCheck = getRawDb().prepare(`PRAGMA table_info(agent_groups)`).all() as Array<{ name: string }>;
       if (centralCheck.some((c) => c.name === 'workgroup_id')) {
-        const agRow = getDb().prepare(`SELECT workgroup_id FROM agent_groups WHERE id = ?`).get(agentGroup.id) as
+        const agRow = getRawDb().prepare(`SELECT workgroup_id FROM agent_groups WHERE id = ?`).get(agentGroup.id) as
           | { workgroup_id: string | null }
           | undefined;
         if (agRow && agRow.workgroup_id === null) {
@@ -2589,7 +2589,7 @@ export async function buildMounts(
           );
         }
         if (agRow && agRow.workgroup_id) {
-          const memberRows = getDb()
+          const memberRows = getRawDb()
             .prepare(`SELECT id FROM agent_groups WHERE workgroup_id = ?`)
             .all(agRow.workgroup_id) as Array<{ id: string }>;
           workgroupMemberIds = memberRows.map((r) => r.id);
@@ -3896,7 +3896,7 @@ async function buildContainerArgs(
     const wgId =
       resolvedWgId ??
       (
-        getDb().prepare(`SELECT workgroup_id FROM agent_groups WHERE id = ?`).get(agentGroup.id) as
+        getRawDb().prepare(`SELECT workgroup_id FROM agent_groups WHERE id = ?`).get(agentGroup.id) as
           | { workgroup_id: string | null }
           | undefined
       )?.workgroup_id;
@@ -4287,7 +4287,7 @@ async function buildContainerArgs(
       if (slackSecrets.length > 0) {
         const { isOwnerSafeSlackSession } = await import('./modules/permissions/slack-user-token-gate.js');
         const ownerSafe = isOwnerSafeSlackSession(
-          getDb(),
+          getRawDb(),
           agentGroup.id,
           slackSafetyMessagingGroupId ?? null,
           containerConfig.slack_user_token?.also_allowed_in,
@@ -4753,7 +4753,7 @@ async function buildContainerArgs(
   if (containerConfig.slack_user_token?.enabled) {
     const { canUseSlackUserToken } = await import('./modules/permissions/slack-user-token-gate.js');
     slackUserTokenAllowed = canUseSlackUserToken(
-      getDb(),
+      getRawDb(),
       agentGroup.id,
       slackSafetyMessagingGroupId ?? null,
       containerConfig.slack_user_token,

@@ -17,7 +17,7 @@ import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
 import { type ContainerState } from '../mailbox/ops/sweep.js';
 import { composeNanoclawSession, type NanoclawMailboxSession } from '../mailbox/index.js';
 import { getAgentMailbox } from '../../mailbox/index.js';
-import { closeDb, initTestDb, runMigrations } from '../../db/index.js';
+import { closeDb, initTestDb, runMigrations, getRawDb } from '../../db/index.js';
 import {
   ABSOLUTE_CEILING_MS,
   CLAIM_STUCK_MS,
@@ -781,7 +781,8 @@ describe('observeProviderStatus — two-tick debounce', () => {
   // driver-owned export of host-sweep.ts precisely so its own `!alive`
   // cleanup can stay synchronous (see that export's doc comment).
   it('the two-tick provider debounce is cleared when the container is not alive', async () => {
-    const db = initTestDb();
+    await initTestDb();
+    const db = getRawDb();
     runMigrations(db);
     db.prepare(
       `INSERT INTO agent_groups (id, name, folder, created_at)
@@ -828,7 +829,7 @@ describe('observeProviderStatus — two-tick debounce', () => {
     expect(providerFailedTicks.get(session.id)).toBe(1);
     expect(mockKillContainer).not.toHaveBeenCalled();
 
-    closeDb();
+    await closeDb();
   });
 });
 
@@ -880,8 +881,9 @@ describe('sweepProviderHeal — bounds, actions, and accountability', () => {
     return _sweepProviderHealForTesting(mailbox, fakeSession(), 'group-folder', state, intoOutDb(outDb));
   }
 
-  beforeEach(() => {
-    const db = initTestDb();
+  beforeEach(async () => {
+    await initTestDb();
+    const db = getRawDb();
     runMigrations(db);
     armSelfHeal(true);
     _resetProviderHealTicksForTesting();
@@ -913,9 +915,9 @@ describe('sweepProviderHeal — bounds, actions, and accountability', () => {
       mockIsContainerRunning.mockReturnValue(Boolean(onExit));
     });
   });
-  afterEach(() => {
+  afterEach(async () => {
     armSelfHeal(false);
-    closeDb();
+    await closeDb();
   });
 
   it('does nothing on the first failed tick, heals on the second', async () => {
@@ -1198,7 +1200,8 @@ describe('OOM and memory-pressure notices are written only on the SLA path, with
   // regression where the SLA branch ran a second time and simply had nothing
   // new to report.
   it('the idle-task reap winning the chain suppresses the SLA branch, discriminated by a changed OOM count', async () => {
-    const db = initTestDb();
+    await initTestDb();
+    const db = getRawDb();
     runMigrations(db);
     db.prepare(
       `INSERT INTO agent_groups (id, name, folder, created_at)
@@ -1259,11 +1262,12 @@ describe('OOM and memory-pressure notices are written only on the SLA path, with
     const newIds = rowsAfterTick2.map((r) => r.id).filter((id) => !idsAfterTick1.has(id));
     expect(newIds.some((id) => id.startsWith('oom-') || id.startsWith('recall-oom-'))).toBe(false);
 
-    closeDb();
+    await closeDb();
   });
 
   it('the idle-chat reap winning the chain suppresses the SLA branch, discriminated by a changed OOM count', async () => {
-    const db = initTestDb();
+    await initTestDb();
+    const db = getRawDb();
     runMigrations(db);
     db.prepare(
       `INSERT INTO agent_groups (id, name, folder, created_at)
@@ -1344,14 +1348,15 @@ describe('OOM and memory-pressure notices are written only on the SLA path, with
     const newIds = rowsAfterTick2.map((r) => r.id).filter((id) => !idsAfterTick1.has(id));
     expect(newIds.some((id) => id.startsWith('oom-') || id.startsWith('recall-oom-'))).toBe(false);
 
-    closeDb();
+    await closeDb();
   });
 });
 
 // ── F-10.2 ───────────────────────────────────────────────────────────────────
 describe('provider self-heal claims the health phase and the later branches do not run', () => {
   it('a heal that kills stops the exclusive chain: no idle reap, no SLA branch, no OOM row', async () => {
-    const db = initTestDb();
+    await initTestDb();
+    const db = getRawDb();
     runMigrations(db);
     db.prepare(
       `INSERT INTO agent_groups (id, name, folder, created_at)
@@ -1436,7 +1441,7 @@ describe('provider self-heal claims the health phase and the later branches do n
     expect(newIds.some((id) => id.startsWith('oom-') || id.startsWith('recall-oom-'))).toBe(false);
     expect(newIds.some((id) => id.startsWith('sys-kill-ceiling-'))).toBe(false);
 
-    closeDb();
+    await closeDb();
     armSelfHeal(false);
   });
 });
@@ -1694,8 +1699,9 @@ describe('post-kill writes yield to a replacement container', () => {
   /** The chain the kill handed back, invoked when the case says the child went. */
   let postKillExit: (() => void) | undefined;
 
-  beforeEach(() => {
-    const db = initTestDb();
+  beforeEach(async () => {
+    await initTestDb();
+    const db = getRawDb();
     runMigrations(db);
     db.prepare(`INSERT INTO agent_groups (id, name, folder, created_at) VALUES ('ag-sla', 'sla', 'sla-folder', ?)`).run(
       new Date().toISOString(),

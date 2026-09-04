@@ -81,7 +81,7 @@ import {
 } from '../../repository-workspaces.js';
 import { REPOSITORY_MOUNT_QUIESCENCE_TIMEOUT_MS } from '../../config.js';
 import { sessionDir } from '../../session-manager.js';
-import { closeDb, initTestDb } from '../../db/connection.js';
+import { closeDb, initTestDb, getRawDb } from '../../db/connection.js';
 import { runMigrations } from '../../db/migrations/index.js';
 import type { Session } from '../../types.js';
 import {
@@ -148,8 +148,8 @@ beforeEach(() => {
   );
 });
 
-afterEach(() => {
-  closeDb();
+afterEach(async () => {
+  await closeDb();
   delete process.env.NANOCLAW_REPOSITORY_ALLOW_LOCAL_ORIGIN;
   fs.rmSync(root, { recursive: true, force: true });
   fs.rmSync(hostActionDataDir, { recursive: true, force: true });
@@ -1001,7 +1001,8 @@ describe('exact topic transfer', () => {
   });
 
   it('replays a moved transfer with the same barrier epoch and releases queued destination ingress exactly once', async () => {
-    const db = initTestDb();
+    await initTestDb();
+    const db = getRawDb();
     runMigrations(db);
     const now = new Date().toISOString();
     db.prepare("INSERT INTO workgroups (id, onecli_secrets, created_at) VALUES ('wg-a', '[]', ?)").run(now);
@@ -1141,7 +1142,8 @@ describe('exact topic transfer', () => {
   });
 
   it('delivers pre-quiescence failures and ignores stale mailbox residue once the source task closes', async () => {
-    const db = initTestDb();
+    await initTestDb();
+    const db = getRawDb();
     runMigrations(db);
     const now = new Date().toISOString();
     db.prepare("INSERT INTO workgroups (id, onecli_secrets, created_at) VALUES ('wg-a', '[]', ?)").run(now);
@@ -1285,7 +1287,8 @@ describe('exact topic transfer', () => {
   });
 
   it('writes and wakes a durable failure when source resolution rejects before any Git mutation', async () => {
-    const db = initTestDb();
+    await initTestDb();
+    const db = getRawDb();
     runMigrations(db);
     const now = new Date().toISOString();
     db.prepare("INSERT INTO workgroups (id, onecli_secrets, created_at) VALUES ('wg-a', '[]', ?)").run(now);

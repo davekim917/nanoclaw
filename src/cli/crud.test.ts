@@ -37,7 +37,7 @@ vi.mock('../modules/agent-to-agent/write-destinations.js', async (importOriginal
   writeDestinations: (...args: unknown[]) => writeDestinationsSpy(...args),
 }));
 
-import { initTestDb, closeDb, getDb, runMigrations, createAgentGroup, createMessagingGroup } from '../db/index.js';
+import { initTestDb, closeDb, getRawDb, runMigrations, createAgentGroup, createMessagingGroup } from '../db/index.js';
 import { createSession } from '../db/sessions.js';
 import { getContainerConfig } from '../db/container-configs.js';
 import { getDestinations } from '../modules/agent-to-agent/db/agent-destinations.js';
@@ -77,15 +77,16 @@ registerResource({
   },
 });
 
-beforeEach(() => {
-  const db = initTestDb();
+beforeEach(async () => {
+  await initTestDb();
+  const db = getRawDb();
   runMigrations(db);
   ensureContainerConfigSpy.mockClear();
   writeDestinationsSpy.mockClear();
 });
 
-afterEach(() => {
-  closeDb();
+afterEach(async () => {
+  await closeDb();
 });
 
 describe('genericCreate postCreate hook', () => {
@@ -211,7 +212,7 @@ describe('genericCreate postCommit hook', () => {
 
 describe('genericCreate resolveDefaults hook (two-pass create)', () => {
   beforeEach(() => {
-    getDb().exec(
+    getRawDb().exec(
       `CREATE TABLE hooktest_rows (id TEXT PRIMARY KEY, kind TEXT NOT NULL, mode TEXT, created_at TEXT NOT NULL)`,
     );
     hookCalls.length = 0;
@@ -240,7 +241,7 @@ describe('genericCreate resolveDefaults hook (two-pass create)', () => {
 
   it('a hook throw rejects the create and nothing is inserted', async () => {
     await expect(lookup('hooktests-create')!.handler({ kind: 'boom' }, hostCtx)).rejects.toThrow('hook rejected');
-    const count = getDb().prepare('SELECT COUNT(*) AS n FROM hooktest_rows').get() as { n: number };
+    const count = getRawDb().prepare('SELECT COUNT(*) AS n FROM hooktest_rows').get() as { n: number };
     expect(count.n).toBe(0);
   });
 });

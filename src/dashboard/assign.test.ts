@@ -4,7 +4,7 @@ import path from 'path';
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { closeDb, initTestDb, getDb } from '../db/connection.js';
+import { closeDb, initTestDb, getRawDb } from '../db/connection.js';
 import { runMigrations } from '../db/migrations/index.js';
 import { clearAttentionMemo } from '../attention-sources.js';
 import { assignAttentionItem, ASSIGN_DEDUPE_MS } from './assign.js';
@@ -85,10 +85,11 @@ function ctxFor(userId: string, scopes: Partial<AuthedRequestContext['scopes']> 
   } as AuthedRequestContext;
 }
 
-beforeEach(() => {
+beforeEach(async () => {
   vi.clearAllMocks();
   clearAttentionMemo();
-  const db = initTestDb();
+  await initTestDb();
+  const db = getRawDb();
   runMigrations(db);
   db.exec(`
     INSERT INTO workgroups (id, created_at) VALUES ('${WG}', '2026-08-01T00:00:00.000Z');
@@ -122,8 +123,8 @@ beforeEach(() => {
   mockDispatch.mockResolvedValue({ id: 'x', ok: true, data: { series_id: 'assign-example-app-817-ab12' } });
 });
 
-afterEach(() => {
-  closeDb();
+afterEach(async () => {
+  await closeDb();
   while (tmpdirs.length) fs.rmSync(tmpdirs.pop()!, { recursive: true, force: true });
 });
 
@@ -264,7 +265,7 @@ describe('assignAttentionItem', () => {
       path.join(dir, 'release-state.json'),
       JSON.stringify({ asOf: '2026-08-20T11:30:00.000Z', items: [readyPr({ id: 'OTHER-APP#42' })] }),
     );
-    getDb()
+    getRawDb()
       .prepare(`INSERT INTO workgroups (id, attention_sources, created_at) VALUES (?, ?, ?)`)
       .run(
         'wg-other-example',
@@ -356,7 +357,7 @@ describe('assignAttentionItem', () => {
   });
 
   it('a second agent cannot be handed the same item while the first assignment is fresh', async () => {
-    getDb()
+    getRawDb()
       .prepare(
         `INSERT INTO messaging_group_agents (id, messaging_group_id, agent_group_id, session_mode, created_at)
          VALUES ('w3', 'mg-room', 'ag-elsewhere', 'per-thread', '2026-08-01T00:00:00.000Z')`,
@@ -370,7 +371,7 @@ describe('assignAttentionItem', () => {
 
   it('an assignment older than the window releases the item — an agent that never took it must not strand it', async () => {
     await assign();
-    getDb()
+    getRawDb()
       .prepare(`UPDATE observatory_item_assignments SET assigned_at = ? WHERE item_id = ?`)
       .run(new Date(Date.now() - ASSIGN_DEDUPE_MS - 1000).toISOString(), ITEM_ID);
     expect((await assign()).status).toBe(200);

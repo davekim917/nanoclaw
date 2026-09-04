@@ -50,7 +50,7 @@ import path from 'path';
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { closeDb, getDb, initTestDb, runMigrations } from '../../db/index.js';
+import { closeDb, getRawDb, initTestDb, runMigrations } from '../../db/index.js';
 import {
   claimChannelIngress,
   completeChannelIngress,
@@ -118,32 +118,33 @@ vi.mock('node:child_process', () => childProcessTripwire(spawnState.spawns));
 // ── F-4.1a — steer idempotency (moved unchanged from host-sweep.test.ts D7) ──
 
 describe('pruneSteerIdempotency — D7', () => {
-  beforeEach(() => {
-    const db = initTestDb();
+  beforeEach(async () => {
+    await initTestDb();
+    const db = getRawDb();
     db.pragma('foreign_keys = ON');
     runMigrations(db);
     // Seed a user required by FK
-    getDb()
+    getRawDb()
       .prepare(
         "INSERT OR IGNORE INTO users (id, kind, display_name, created_at) VALUES ('u1', 'test', NULL, datetime('now'))",
       )
       .run();
   });
 
-  afterEach(() => {
-    closeDb();
+  afterEach(async () => {
+    await closeDb();
   });
 
   it('test_prune_removes_old_applied', () => {
     // applied row 2 min ago — should be deleted
-    getDb()
+    getRawDb()
       .prepare(
         `INSERT INTO steer_idempotency (user_id, idempotency_key, target_type, target_id, message_id, text, request_hash, reserved_at, status, echo_attempted, applied_at)
        VALUES ('u1', 'key-old', 'task', 'task-1', 'msg-1', 'hi', 'h1', datetime('now', '-3 minutes'), 'applied', 1, datetime('now', '-2 minutes'))`,
       )
       .run();
     // applied row 30 sec ago — should remain
-    getDb()
+    getRawDb()
       .prepare(
         `INSERT INTO steer_idempotency (user_id, idempotency_key, target_type, target_id, message_id, text, request_hash, reserved_at, status, echo_attempted, applied_at)
        VALUES ('u1', 'key-fresh', 'task', 'task-1', 'msg-2', 'hi', 'h2', datetime('now', '-31 seconds'), 'applied', 1, datetime('now', '-30 seconds'))`,
@@ -152,7 +153,7 @@ describe('pruneSteerIdempotency — D7', () => {
 
     pruneSteerIdempotency();
 
-    const rows = getDb().prepare("SELECT idempotency_key FROM steer_idempotency WHERE status = 'applied'").all() as {
+    const rows = getRawDb().prepare("SELECT idempotency_key FROM steer_idempotency WHERE status = 'applied'").all() as {
       idempotency_key: string;
     }[];
     expect(rows.map((r) => r.idempotency_key)).not.toContain('key-old');
@@ -160,7 +161,7 @@ describe('pruneSteerIdempotency — D7', () => {
   });
 
   it('test_prune_removes_old_pending', () => {
-    getDb()
+    getRawDb()
       .prepare(
         `INSERT INTO steer_idempotency (user_id, idempotency_key, target_type, target_id, message_id, text, request_hash, reserved_at, status, echo_attempted)
        VALUES ('u1', 'pend-old', 'task', 'task-2', 'msg-3', 'hi', 'h3', datetime('now', '-10 minutes'), 'pending', 0)`,
@@ -169,12 +170,12 @@ describe('pruneSteerIdempotency — D7', () => {
 
     pruneSteerIdempotency();
 
-    const rows = getDb().prepare("SELECT idempotency_key FROM steer_idempotency WHERE status = 'pending'").all();
+    const rows = getRawDb().prepare("SELECT idempotency_key FROM steer_idempotency WHERE status = 'pending'").all();
     expect(rows.length).toBe(0);
   });
 
   it('test_prune_preserves_recent_pending', () => {
-    getDb()
+    getRawDb()
       .prepare(
         `INSERT INTO steer_idempotency (user_id, idempotency_key, target_type, target_id, message_id, text, request_hash, reserved_at, status, echo_attempted)
        VALUES ('u1', 'pend-new', 'task', 'task-3', 'msg-4', 'hi', 'h4', datetime('now', '-1 minute'), 'pending', 0)`,
@@ -183,7 +184,7 @@ describe('pruneSteerIdempotency — D7', () => {
 
     pruneSteerIdempotency();
 
-    const rows = getDb()
+    const rows = getRawDb()
       .prepare("SELECT idempotency_key FROM steer_idempotency WHERE idempotency_key = 'pend-new'")
       .all();
     expect(rows.length).toBe(1);
@@ -208,8 +209,9 @@ describe('F-4.1 — each prune duty deletes exactly the rows its retention windo
     messageId: 'm1',
   };
 
-  beforeEach(() => {
-    runMigrations(initTestDb());
+  beforeEach(async () => {
+    await initTestDb();
+    runMigrations(getRawDb());
   });
 
   afterEach(() => closeDb());
@@ -228,25 +230,25 @@ describe('F-4.1 — each prune duty deletes exactly the rows its retention windo
 
   it('dashboard-token prune: deletes rows past expiry + 1-day grace, keeps rows inside the grace and unexpired rows', async () => {
     const { pruneDashboardTokens } = await import('../../dashboard/db/dashboard-tokens.js');
-    getDb()
+    getRawDb()
       .prepare("INSERT INTO users (id, kind, display_name, created_at) VALUES ('u1', 'test', NULL, datetime('now'))")
       .run();
     // Expired 2 days ago — past the 1-day grace, must be deleted.
-    getDb()
+    getRawDb()
       .prepare(
         `INSERT INTO dashboard_tokens (user_id, token_hmac, issued_at, expires_at)
          VALUES ('u1', 'hmac-old', datetime('now', '-3 days'), datetime('now', '-2 days'))`,
       )
       .run();
     // Expired 12 hours ago — inside the 1-day grace, must survive.
-    getDb()
+    getRawDb()
       .prepare(
         `INSERT INTO dashboard_tokens (user_id, token_hmac, issued_at, expires_at)
          VALUES ('u1', 'hmac-grace', datetime('now', '-1 day'), datetime('now', '-12 hours'))`,
       )
       .run();
     // Not yet expired — must survive.
-    getDb()
+    getRawDb()
       .prepare(
         `INSERT INTO dashboard_tokens (user_id, token_hmac, issued_at, expires_at)
          VALUES ('u1', 'hmac-live', datetime('now'), datetime('now', '+1 hour'))`,
@@ -255,7 +257,7 @@ describe('F-4.1 — each prune duty deletes exactly the rows its retention windo
 
     pruneDashboardTokens();
 
-    const remaining = getDb().prepare('SELECT token_hmac FROM dashboard_tokens ORDER BY token_hmac').all() as {
+    const remaining = getRawDb().prepare('SELECT token_hmac FROM dashboard_tokens ORDER BY token_hmac').all() as {
       token_hmac: string;
     }[];
     expect(remaining.map((r) => r.token_hmac)).toEqual(['hmac-grace', 'hmac-live']);
@@ -341,21 +343,22 @@ describe('the registered central-housekeeping duties call their expected depende
     return duty;
   }
 
-  beforeEach(() => {
+  beforeEach(async () => {
     // Truncate, never reassign: the tripwire factory closed over THIS array.
     spawnState.spawns.length = 0;
-    const db = initTestDb();
+    await initTestDb();
+    const db = getRawDb();
     db.pragma('foreign_keys = ON');
     runMigrations(db);
-    getDb()
+    getRawDb()
       .prepare(
         "INSERT OR IGNORE INTO users (id, kind, display_name, created_at) VALUES ('u1', 'test', NULL, datetime('now'))",
       )
       .run();
   });
 
-  afterEach(() => {
-    closeDb();
+  afterEach(async () => {
+    await closeDb();
     // NOT vi.restoreAllMocks(): the module-level `vi.mock(..., importOriginal)`
     // factories above wrap each real function as `vi.fn(real.impl)`, not a
     // `vi.spyOn` — restoreAllMocks() would clear that wrapping's implementation
@@ -392,7 +395,7 @@ describe('the registered central-housekeeping duties call their expected depende
   it('steer-idempotency-prune calls pruneSteerIdempotency and its real DB effect fires', async () => {
     const spy = vi.mocked(pruneSteerIdempotency);
     spy.mockClear();
-    getDb()
+    getRawDb()
       .prepare(
         `INSERT INTO steer_idempotency (user_id, idempotency_key, target_type, target_id, message_id, text, request_hash, reserved_at, status, echo_attempted, applied_at)
        VALUES ('u1', 'via-registry', 'task', 'task-1', 'msg-1', 'hi', 'h1', datetime('now', '-3 minutes'), 'applied', 1, datetime('now', '-2 minutes'))`,
@@ -402,7 +405,7 @@ describe('the registered central-housekeeping duties call their expected depende
     await registeredDuty(SWEEP_DUTY_INVENTORY.T9).run(fakeTickCtx);
 
     expect(spy).toHaveBeenCalledTimes(1);
-    const rows = getDb().prepare("SELECT idempotency_key FROM steer_idempotency WHERE status = 'applied'").all();
+    const rows = getRawDb().prepare("SELECT idempotency_key FROM steer_idempotency WHERE status = 'applied'").all();
     expect(rows).toEqual([]);
     expect(spawnState.spawns).toEqual([]);
   });
@@ -418,7 +421,7 @@ describe('the registered central-housekeeping duties call their expected depende
     };
     expect(claimChannelIngress(key)).toBe(true);
     completeChannelIngress(key);
-    getDb()
+    getRawDb()
       .prepare(
         `UPDATE channel_ingress_receipts SET completed_at = datetime('now', '-8 days') WHERE message_id = 'via-registry'`,
       )
@@ -436,7 +439,7 @@ describe('the registered central-housekeeping duties call their expected depende
     const { pruneDashboardTokens } = await import('../../dashboard/db/dashboard-tokens.js');
     const spy = vi.mocked(pruneDashboardTokens);
     spy.mockClear();
-    getDb()
+    getRawDb()
       .prepare(
         `INSERT INTO dashboard_tokens (user_id, token_hmac, issued_at, expires_at)
          VALUES ('u1', 'hmac-via-registry', datetime('now', '-3 days'), datetime('now', '-2 days'))`,
@@ -456,7 +459,7 @@ describe('the registered central-housekeeping duties call their expected depende
     }
 
     expect(spy).toHaveBeenCalledTimes(1);
-    const remaining = getDb().prepare('SELECT token_hmac FROM dashboard_tokens').all();
+    const remaining = getRawDb().prepare('SELECT token_hmac FROM dashboard_tokens').all();
     expect(remaining).toEqual([]);
     expect(spawnState.spawns).toEqual([]);
   });

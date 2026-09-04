@@ -6,6 +6,7 @@ import Database from 'better-sqlite3';
 import fs from 'fs';
 
 import type { ChannelAdapter, ChannelSetup, InboundMessage, OutboundMessage } from './adapter.js';
+import { getRawDb } from '../db/connection.js';
 
 // Mock container runner. Spread the real module so exports the router path
 // touches but this suite doesn't assert on — `sessionStillActive` is built
@@ -283,7 +284,8 @@ describe('channel + router integration', () => {
 
     const { initTestDb, runMigrations, createAgentGroup, createMessagingGroup, createMessagingGroupAgent } =
       await import('../db/index.js');
-    const db = initTestDb();
+    await initTestDb();
+    const db = getRawDb();
     runMigrations(db);
 
     createAgentGroup({
@@ -322,7 +324,7 @@ describe('channel + router integration', () => {
 
   afterEach(async () => {
     const { closeDb } = await import('../db/index.js');
-    closeDb();
+    await closeDb();
     if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
   });
 

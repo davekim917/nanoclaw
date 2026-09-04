@@ -702,7 +702,7 @@ for (const ws of workspaces) {
       // Multi-workspace dedup isolation. The @chat library's message dedup
       // key is `dedupe:${adapter.name}:${message.id}`. SlackAdapter defaults
       // `name = "slack"` for all instances; combined with a shared SqliteState
-      // adapter (state-sqlite.ts uses getDb()), two slack adapters processing
+      // adapter (state-sqlite.ts uses getRawDb()), two slack adapters processing
       // the same Slack event (same `ts`) collide on the dedup key and the
       // second one silently drops the message. This bites the two-bots-in-
       // same-workspace case (e.g. helper + helper-codex both seeing user

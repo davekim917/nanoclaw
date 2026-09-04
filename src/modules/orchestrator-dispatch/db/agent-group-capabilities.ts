@@ -1,4 +1,4 @@
-import { getDb } from '../../../db/connection.js';
+import { getRawDb } from '../../../db/connection.js';
 
 export interface CapabilityConfig {
   concurrencyCap: number;
@@ -9,7 +9,7 @@ export interface CapabilityConfig {
 }
 
 export function hasOrchestratorCapability(agentGroupId: string): boolean {
-  const row = getDb()
+  const row = getRawDb()
     .prepare(`SELECT 1 FROM agent_group_capabilities WHERE agent_group_id = ? AND role = 'orchestrator' LIMIT 1`)
     .get(agentGroupId);
   return row !== undefined;
@@ -23,7 +23,7 @@ export function grantCapability(
 ): void {
   const configJson = JSON.stringify(config);
   const grantedAt = new Date().toISOString();
-  getDb()
+  getRawDb()
     .prepare(
       `INSERT INTO agent_group_capabilities (agent_group_id, role, config_json, granted_by, granted_at)
        VALUES (?, ?, ?, ?, ?)
@@ -36,7 +36,7 @@ export function grantCapability(
 }
 
 export function revokeCapability(agentGroupId: string, role: 'orchestrator'): { success: boolean; reason?: string } {
-  const inFlight = getDb()
+  const inFlight = getRawDb()
     .prepare(
       `SELECT 1 FROM tasks
         WHERE parent_agent_group_id = ? AND status IN ('pending', 'running')
@@ -48,13 +48,15 @@ export function revokeCapability(agentGroupId: string, role: 'orchestrator'): { 
     return { success: false, reason: 'tasks_in_flight' };
   }
 
-  getDb().prepare(`DELETE FROM agent_group_capabilities WHERE agent_group_id = ? AND role = ?`).run(agentGroupId, role);
+  getRawDb()
+    .prepare(`DELETE FROM agent_group_capabilities WHERE agent_group_id = ? AND role = ?`)
+    .run(agentGroupId, role);
 
   return { success: true };
 }
 
 export function getCapabilityConfig(agentGroupId: string, role: string): CapabilityConfig | null {
-  const row = getDb()
+  const row = getRawDb()
     .prepare(`SELECT config_json FROM agent_group_capabilities WHERE agent_group_id = ? AND role = ?`)
     .get(agentGroupId, role) as { config_json: string | null } | undefined;
 

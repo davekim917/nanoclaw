@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import http from 'http';
 
-import { closeDb, initTestDb, runMigrations, createAgentGroup, getDb } from '../db/index.js';
+import { closeDb, initTestDb, runMigrations, createAgentGroup, getRawDb } from '../db/index.js';
 import { applySessionSteer, _resetRateLimitForTesting } from './steer.js';
 import type { AuthedRequestContext } from './router.js';
 
@@ -101,8 +101,9 @@ function now(): string {
   return new Date().toISOString();
 }
 
-function setupDb(): void {
-  const db = initTestDb();
+async function setupDb(): Promise<void> {
+  await initTestDb();
+  const db = getRawDb();
   db.pragma('foreign_keys = ON');
   runMigrations(db);
 }
@@ -112,13 +113,13 @@ function seedAgentGroup(id: string): void {
 }
 
 function seedUser(id: string): void {
-  getDb()
+  getRawDb()
     .prepare("INSERT OR IGNORE INTO users (id, kind, display_name, created_at) VALUES (?, 'dashboard', ?, ?)")
     .run(id, id, now());
 }
 
 function grantOwner(userId: string): void {
-  getDb()
+  getRawDb()
     .prepare(
       "INSERT OR IGNORE INTO user_roles (user_id, role, agent_group_id, granted_by, granted_at) VALUES (?, 'owner', NULL, NULL, ?)",
     )
@@ -126,7 +127,7 @@ function grantOwner(userId: string): void {
 }
 
 function grantAdmin(userId: string, agId: string): void {
-  getDb()
+  getRawDb()
     .prepare(
       "INSERT OR IGNORE INTO user_roles (user_id, role, agent_group_id, granted_by, granted_at) VALUES (?, 'admin', ?, NULL, ?)",
     )
@@ -134,7 +135,7 @@ function grantAdmin(userId: string, agId: string): void {
 }
 
 function grantMember(userId: string, agId: string): void {
-  getDb()
+  getRawDb()
     .prepare(
       'INSERT OR IGNORE INTO agent_group_members (user_id, agent_group_id, added_by, added_at) VALUES (?, ?, NULL, ?)',
     )
@@ -144,7 +145,7 @@ function grantMember(userId: string, agId: string): void {
 function seedSession(sessId: string, agId: string, threadId: string | null = null): void {
   // Use sessId as thread_id to avoid the UNIQUE(agent_group_id, messaging_group_id, thread_id) conflict
   // when multiple sessions share the same agent_group and no messaging_group
-  getDb()
+  getRawDb()
     .prepare(
       "INSERT OR IGNORE INTO sessions (id, agent_group_id, messaging_group_id, thread_id, status, created_at) VALUES (?, ?, NULL, ?, 'active', ?)",
     )
@@ -172,7 +173,7 @@ const VALID_IKEY = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 describe('applySessionSteer — C5', () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     _resetRateLimitForTesting();
     mockWriteSessionMessage.mockReset();
     mockWriteSessionMessage.mockResolvedValue(undefined);
@@ -185,7 +186,7 @@ describe('applySessionSteer — C5', () => {
     mockGetMessagingGroup.mockReset();
     mockGetMessagingGroup.mockReturnValue(undefined);
     mockEmitDashboardEvent.mockReset();
-    setupDb();
+    await setupDb();
     seedAgentGroup('ag-1');
     seedAgentGroup('ag-2');
     seedSession('sess-direct', 'ag-1'); // direct conversation session, no MG
@@ -197,8 +198,8 @@ describe('applySessionSteer — C5', () => {
     grantAdmin('admin-s', 'ag-1');
   });
 
-  afterEach(() => {
-    closeDb();
+  afterEach(async () => {
+    await closeDb();
     vi.clearAllMocks();
   });
 
@@ -244,14 +245,14 @@ describe('applySessionSteer — C5', () => {
   it('echoes to the session messaging group + thread when present', async () => {
     // Re-seed the session WITH a messaging_group + thread_id so the echo
     // picks up the thread-mode branch.
-    getDb()
+    getRawDb()
       .prepare(
         `INSERT OR IGNORE INTO messaging_groups
            (id, channel_type, platform_id, instance, name, is_group, unknown_sender_policy, created_at)
          VALUES ('mg-s', 'slack', 'C-s', 'slack', 'echo-ch', 1, 'public', datetime('now'))`,
       )
       .run();
-    getDb()
+    getRawDb()
       .prepare(
         `INSERT OR REPLACE INTO sessions
            (id, agent_group_id, messaging_group_id, thread_id, status, created_at)

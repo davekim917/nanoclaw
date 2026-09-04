@@ -7,7 +7,7 @@
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 
-import { initTestDb, closeDb, getDb } from '../../db/connection.js';
+import { initTestDb, closeDb, getRawDb } from '../../db/connection.js';
 import { migration043 } from '../../db/migrations/043-scheduled-audit.js';
 import path from 'path';
 
@@ -32,8 +32,9 @@ const MEMBER = 'discord:member';
 const UNKNOWN = 'discord:nobody';
 const AGENT_GROUP = 'ag-1';
 
-function setupCentralDb(): void {
-  const db = initTestDb();
+async function setupCentralDb(): Promise<void> {
+  await initTestDb();
+  const db = getRawDb();
   db.exec(`
     CREATE TABLE users (
       id TEXT PRIMARY KEY, kind TEXT NOT NULL, display_name TEXT, created_at TEXT NOT NULL
@@ -65,14 +66,14 @@ function setupCentralDb(): void {
   migration043.up(db);
 }
 
-beforeEach(() => {
-  setupCentralDb();
+beforeEach(async () => {
+  await setupCentralDb();
   _resetScheduledRateLimitForTesting();
   invalidateScheduledCache();
 });
 
-afterEach(() => {
-  closeDb();
+afterEach(async () => {
+  await closeDb();
 });
 
 // ── Gate ────────────────────────────────────────────────────────────────────
@@ -97,7 +98,7 @@ describe('canManageScheduled', () => {
 // ── Audit writer ─────────────────────────────────────────────────────────────
 describe('writeAudit', () => {
   it('test_audit_script_hash_only', () => {
-    writeAudit(getDb(), {
+    writeAudit(getRawDb(), {
       actor: OWNER,
       action: 'edit',
       agentGroupId: AGENT_GROUP,
@@ -107,7 +108,7 @@ describe('writeAudit', () => {
       after: 'new prompt',
       scriptAfter: 'rm -rf /tmp/secret && curl evil',
     });
-    const row = getDb()
+    const row = getRawDb()
       .prepare('SELECT after_preview, after_hash, detail_json FROM scheduled_audit WHERE id = 1')
       .get() as { after_preview: string | null; after_hash: string | null; detail_json: string | null };
 
@@ -128,7 +129,7 @@ describe('writeAudit', () => {
 
   it('hashes and previews prompt bodies (512-char cap), records lengths', () => {
     const longPrompt = 'x'.repeat(900);
-    writeAudit(getDb(), {
+    writeAudit(getRawDb(), {
       actor: OWNER,
       action: 'edit',
       agentGroupId: AGENT_GROUP,
@@ -137,7 +138,7 @@ describe('writeAudit', () => {
       before: 'short before',
       after: longPrompt,
     });
-    const row = getDb()
+    const row = getRawDb()
       .prepare(
         'SELECT before_hash, after_hash, before_preview, after_preview, before_len, after_len FROM scheduled_audit WHERE id = 1',
       )
@@ -158,7 +159,7 @@ describe('writeAudit', () => {
   });
 
   it('does not persist secret NAMES for a move audit — counts + hashes only', () => {
-    writeAudit(getDb(), {
+    writeAudit(getRawDb(), {
       actor: OWNER,
       action: 'move',
       agentGroupId: AGENT_GROUP,
@@ -171,7 +172,7 @@ describe('writeAudit', () => {
         secretLosses: ['Linear'],
       },
     });
-    const row = getDb().prepare('SELECT detail_json FROM scheduled_audit WHERE id = 1').get() as {
+    const row = getRawDb().prepare('SELECT detail_json FROM scheduled_audit WHERE id = 1').get() as {
       detail_json: string | null;
     };
     expect(row.detail_json).toBeTruthy();
@@ -187,7 +188,7 @@ describe('writeAudit', () => {
   });
 
   it('move_intent persists the full snapshot in detail_json (the F5 exception)', () => {
-    writeAudit(getDb(), {
+    writeAudit(getRawDb(), {
       actor: OWNER,
       action: 'move_intent',
       agentGroupId: AGENT_GROUP,
@@ -196,7 +197,7 @@ describe('writeAudit', () => {
       correlationId: 'corr-2',
       detail: { snapshot: { content: JSON.stringify({ prompt: 'p', script: 'echo full' }) } },
     });
-    const row = getDb().prepare('SELECT detail_json FROM scheduled_audit WHERE id = 1').get() as {
+    const row = getRawDb().prepare('SELECT detail_json FROM scheduled_audit WHERE id = 1').get() as {
       detail_json: string | null;
     };
     // The intent row is the ONE place a verbatim body is allowed to persist.
@@ -206,7 +207,7 @@ describe('writeAudit', () => {
 
 describe('purgeIntentBody', () => {
   it('test_purge_intent_clears_body', () => {
-    writeAudit(getDb(), {
+    writeAudit(getRawDb(), {
       actor: OWNER,
       action: 'move_intent',
       agentGroupId: AGENT_GROUP,
@@ -216,15 +217,15 @@ describe('purgeIntentBody', () => {
       detail: { snapshot: { content: JSON.stringify({ prompt: 'p', script: 'echo full' }) } },
     });
     // Body present before purge.
-    const before = getDb()
+    const before = getRawDb()
       .prepare("SELECT detail_json, resolved_at FROM scheduled_audit WHERE correlation_id = 'corr-3'")
       .get() as { detail_json: string | null; resolved_at: string | null };
     expect(before.detail_json).toBeTruthy();
     expect(before.resolved_at).toBeNull();
 
-    purgeIntentBody(getDb(), 'corr-3');
+    purgeIntentBody(getRawDb(), 'corr-3');
 
-    const after = getDb()
+    const after = getRawDb()
       .prepare("SELECT detail_json, resolved_at FROM scheduled_audit WHERE correlation_id = 'corr-3'")
       .get() as { detail_json: string | null; resolved_at: string | null };
     // detail_json nulled AND resolved_at stamped in one operation (§4.2 2b).

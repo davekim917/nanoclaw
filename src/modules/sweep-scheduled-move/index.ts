@@ -17,7 +17,7 @@ import fs from 'fs';
 import path from 'path';
 
 import { log } from '../../log.js';
-import { getDb } from '../../db/connection.js';
+import { getRawDb } from '../../db/connection.js';
 import { withQuietInvalidationSync } from '../../db/sessions.js';
 import { sessionsBaseDir } from '../../session-manager.js';
 import { parseSqliteUtc } from '../mailbox/sqlite-utc.js';
@@ -359,7 +359,7 @@ export function registerScheduledMoveSweepDuties(): void {
     // firing-path change (C1).
     run: async () => {
       try {
-        await recoverMoveIntents(getDb(), {});
+        await recoverMoveIntents(getRawDb(), {});
       } catch (err) {
         log.warn('scheduled-move-recovery: sweep hook failed', { err });
       }
@@ -373,7 +373,7 @@ export function registerScheduledMoveSweepDuties(): void {
     // 90d audit-body prune, the companion of the move recovery above.
     run: () => {
       try {
-        pruneAuditBodies(getDb(), {});
+        pruneAuditBodies(getRawDb(), {});
       } catch (err) {
         log.warn('scheduled-move-recovery: sweep hook failed', { err });
       }

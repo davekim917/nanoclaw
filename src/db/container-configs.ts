@@ -1,6 +1,6 @@
 import { DEFAULT_AGENT_PROVIDER } from '../config.js';
 import type { ContainerConfigRow } from '../types.js';
-import { getDb } from './connection.js';
+import { getRawDb } from './connection.js';
 
 const SCALAR_COLUMNS = new Set([
   'provider',
@@ -42,18 +42,18 @@ export function resolveProviderName(
 }
 
 export function getContainerConfig(agentGroupId: string): ContainerConfigRow | undefined {
-  return getDb().prepare('SELECT * FROM container_configs WHERE agent_group_id = ?').get(agentGroupId) as
+  return getRawDb().prepare('SELECT * FROM container_configs WHERE agent_group_id = ?').get(agentGroupId) as
     | ContainerConfigRow
     | undefined;
 }
 
 export function getAllContainerConfigs(): ContainerConfigRow[] {
-  return getDb().prepare('SELECT * FROM container_configs').all() as ContainerConfigRow[];
+  return getRawDb().prepare('SELECT * FROM container_configs').all() as ContainerConfigRow[];
 }
 
 /** Insert a new config row. Caller must supply all JSON fields (use defaults for empty). */
 export function createContainerConfig(config: ContainerConfigRow): void {
-  getDb()
+  getRawDb()
     .prepare(
       `INSERT INTO container_configs (
         agent_group_id, provider, model, effort, image_tag, assistant_name,
@@ -92,7 +92,7 @@ export function ensureContainerConfig(agentGroupId: string, provider?: string | 
   // column matches what resolution lowercases to.
   const normalized = (provider ?? DEFAULT_AGENT_PROVIDER).toLowerCase();
   const stamped = normalized && normalized !== 'claude' ? normalized : null;
-  getDb()
+  getRawDb()
     .prepare(
       `INSERT OR IGNORE INTO container_configs (agent_group_id, provider, updated_at)
        VALUES (?, ?, ?)`,
@@ -132,7 +132,7 @@ export function updateContainerConfigScalars(
   fields.push('updated_at = @updated_at');
   values.updated_at = new Date().toISOString();
 
-  getDb()
+  getRawDb()
     .prepare(`UPDATE container_configs SET ${fields.join(', ')} WHERE agent_group_id = @agent_group_id`)
     .run(values);
 }
@@ -145,11 +145,11 @@ export function updateContainerConfigJson(
 ): void {
   if (!JSON_COLUMNS.has(column)) throw new Error(`Invalid JSON column: ${column}`);
   const now = new Date().toISOString();
-  getDb()
+  getRawDb()
     .prepare(`UPDATE container_configs SET ${column} = ?, updated_at = ? WHERE agent_group_id = ?`)
     .run(JSON.stringify(value), now, agentGroupId);
 }
 
 export function deleteContainerConfig(agentGroupId: string): void {
-  getDb().prepare('DELETE FROM container_configs WHERE agent_group_id = ?').run(agentGroupId);
+  getRawDb().prepare('DELETE FROM container_configs WHERE agent_group_id = ?').run(agentGroupId);
 }

@@ -74,35 +74,16 @@ describe('unportable upstream files are replaced, not carried verbatim', () => {
   }
 });
 
-describe('the DbDriver shim has exactly one importer', () => {
-  it('only src/host-lifecycle.ts imports src/db/driver.ts', () => {
-    const SRC_ROOT = path.join(REPO_ROOT, 'src');
-    const DRIVER_ABS = path.join(SRC_ROOT, 'db', 'driver.ts');
-    const IMPORT_RE = /(?:import|export)[^;]*?from\s+['"](\.[^'"]+)['"]/g;
-
-    const files = fs
-      .readdirSync(SRC_ROOT, { recursive: true, withFileTypes: true })
-      .filter((e) => e.isFile() && e.name.endsWith('.ts'))
-      .map((e) => path.join(e.parentPath, e.name))
-      .filter((f) => !f.includes(`${path.sep}node_modules${path.sep}`) && !f.includes(`${path.sep}dist${path.sep}`));
-
-    const importers = new Set<string>();
-    for (const file of files) {
-      const content = fs.readFileSync(file, 'utf8');
-      for (const match of content.matchAll(IMPORT_RE)) {
-        const specifier = match[1];
-        if (!specifier.endsWith('.js')) continue;
-        const resolved = path.resolve(path.dirname(file), specifier.replace(/\.js$/, '.ts'));
-        if (resolved === DRIVER_ABS) {
-          importers.add(path.relative(REPO_ROOT, file));
-        }
-      }
-    }
-
-    expect(
-      importers,
-      "src/db/driver.ts is a type-only stand-in for upstream's async DbDriver, replaced (not extended) " +
-        'when the DbDriver seam lands — nobody but src/host-lifecycle.ts may depend on it',
-    ).toEqual(new Set(['src/host-lifecycle.ts']));
-  });
-});
+// RETIRED (seam 3 PR 1): "the DbDriver shim has exactly one importer".
+//
+// That case existed because src/db/driver.ts was a fork-local TYPE-ONLY
+// stand-in for upstream's async DbDriver, and a stand-in's only safe blast
+// radius is the one file that forced it into existence. PR 1 replaced it with
+// upstream's real driver interface, so the invariant that matters flipped from
+// "nobody may import this" to "these bytes are upstream's" — src/db/driver.ts
+// is in UPSTREAM_FILES above and is checked against the manifest hash by the
+// byte-equality loop, exactly like src/host-lifecycle.ts.
+//
+// HostStartContext.db now carries the real driver (src/main.ts passes getDb()).
+// No sweep duty read ctx.db when the shim existed and none does now, so nothing
+// depended on the alias resolving to better-sqlite3's synchronous handle.

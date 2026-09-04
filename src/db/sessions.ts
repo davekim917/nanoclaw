@@ -1,12 +1,12 @@
 import type { PendingApproval, PendingQuestion, Session } from '../types.js';
-import { getDb, hasTable } from './connection.js';
+import { getRawDb, hasTableRaw } from './connection.js';
 
 // ── Sessions ──
 
 export const TASKS_SYSTEM_THREAD_ID = 'system:tasks';
 
 export function createSession(session: Session): void {
-  getDb()
+  getRawDb()
     .prepare(
       `INSERT INTO sessions (id, agent_group_id, messaging_group_id, thread_id, agent_provider, status, container_status, last_active, created_at)
        VALUES (@id, @agent_group_id, @messaging_group_id, @thread_id, @agent_provider, @status, @container_status, @last_active, @created_at)`,
@@ -15,16 +15,16 @@ export function createSession(session: Session): void {
 }
 
 export function getSession(id: string): Session | undefined {
-  return getDb().prepare('SELECT * FROM sessions WHERE id = ?').get(id) as Session | undefined;
+  return getRawDb().prepare('SELECT * FROM sessions WHERE id = ?').get(id) as Session | undefined;
 }
 
 export function findSession(messagingGroupId: string, threadId: string | null): Session | undefined {
   if (threadId) {
-    return getDb()
+    return getRawDb()
       .prepare('SELECT * FROM sessions WHERE messaging_group_id = ? AND thread_id = ? AND status = ?')
       .get(messagingGroupId, threadId, 'active') as Session | undefined;
   }
-  return getDb()
+  return getRawDb()
     .prepare('SELECT * FROM sessions WHERE messaging_group_id = ? AND thread_id IS NULL AND status = ?')
     .get(messagingGroupId, 'active') as Session | undefined;
 }
@@ -41,13 +41,13 @@ export function findSessionForAgent(
   threadId: string | null,
 ): Session | undefined {
   if (threadId) {
-    return getDb()
+    return getRawDb()
       .prepare(
         "SELECT * FROM sessions WHERE agent_group_id = ? AND messaging_group_id = ? AND thread_id = ? AND status = 'active'",
       )
       .get(agentGroupId, messagingGroupId, threadId) as Session | undefined;
   }
-  return getDb()
+  return getRawDb()
     .prepare(
       "SELECT * FROM sessions WHERE agent_group_id = ? AND messaging_group_id = ? AND thread_id IS NULL AND status = 'active'",
     )
@@ -62,7 +62,7 @@ export function findSessionForAgent(
  * session of the same agent group.
  */
 export function findSessionByAgentGroup(agentGroupId: string): Session | undefined {
-  return getDb()
+  return getRawDb()
     .prepare(
       `SELECT * FROM sessions
        WHERE agent_group_id = ?
@@ -91,7 +91,7 @@ export function findSessionByAgentGroupAndMessagingGroup(
   agentGroupId: string,
   messagingGroupId: string,
 ): Session | undefined {
-  return getDb()
+  return getRawDb()
     .prepare(
       "SELECT * FROM sessions WHERE agent_group_id = ? AND messaging_group_id = ? AND thread_id IS NULL AND status = 'active' ORDER BY created_at DESC LIMIT 1",
     )
@@ -99,11 +99,11 @@ export function findSessionByAgentGroupAndMessagingGroup(
 }
 
 export function getSessionsByAgentGroup(agentGroupId: string): Session[] {
-  return getDb().prepare('SELECT * FROM sessions WHERE agent_group_id = ?').all(agentGroupId) as Session[];
+  return getRawDb().prepare('SELECT * FROM sessions WHERE agent_group_id = ?').all(agentGroupId) as Session[];
 }
 
 export function findSystemSession(agentGroupId: string, threadId: string): Session | undefined {
-  return getDb()
+  return getRawDb()
     .prepare(
       `SELECT * FROM sessions
        WHERE agent_group_id = ?
@@ -128,7 +128,7 @@ export function isTaskThread(threadId: string | null): boolean {
 
 /** All active task sessions for a group — one per live series, plus any legacy shared one. */
 export function findTaskSessions(agentGroupId: string): Session[] {
-  return getDb()
+  return getRawDb()
     .prepare(
       `SELECT * FROM sessions
        WHERE agent_group_id = ?
@@ -141,7 +141,7 @@ export function findTaskSessions(agentGroupId: string): Session[] {
 }
 
 export function getActiveSessions(): Session[] {
-  return getDb().prepare("SELECT * FROM sessions WHERE status = 'active'").all() as Session[];
+  return getRawDb().prepare("SELECT * FROM sessions WHERE status = 'active'").all() as Session[];
 }
 
 /**
@@ -152,7 +152,7 @@ export function getActiveSessions(): Session[] {
  * ack traffic; anything scheduled in it is the host sweep's quiet-cache job.
  */
 export function getSessionsActiveSince(sinceIso: string): Session[] {
-  return getDb()
+  return getRawDb()
     .prepare(
       `SELECT * FROM sessions
        WHERE status = 'active'
@@ -163,7 +163,7 @@ export function getSessionsActiveSince(sinceIso: string): Session[] {
 }
 
 export function getRunningSessions(): Session[] {
-  return getDb().prepare("SELECT * FROM sessions WHERE container_status IN ('running', 'idle')").all() as Session[];
+  return getRawDb().prepare("SELECT * FROM sessions WHERE container_status IN ('running', 'idle')").all() as Session[];
 }
 
 export function updateSession(
@@ -210,7 +210,7 @@ export function updateSession(
   if (updates.last_active !== undefined) fields.push('sweep_quiet_until = NULL');
   if (fields.length === 0) return;
 
-  getDb()
+  getRawDb()
     .prepare(`UPDATE sessions SET ${fields.join(', ')} WHERE id = @id`)
     .run(values);
 }
@@ -276,7 +276,7 @@ export function withQuietInvalidationSync<T>(sessionId: string, write: () => T):
   const now = new Date().toISOString();
   let changes: number;
   try {
-    changes = getDb()
+    changes = getRawDb()
       .prepare(
         `UPDATE sessions
             SET last_active = CASE
@@ -340,7 +340,7 @@ export function persistQuietSessionMarks(marks: readonly QuietSessionMark[]): vo
   if (marks.length === 0) return;
   const byId: Record<string, { until: string; basis: string | null }> = {};
   for (const mark of marks) byId[mark.sessionId] = { until: mark.quietUntil, basis: mark.lastActive };
-  getDb()
+  getRawDb()
     .prepare(
       `UPDATE sessions
           SET sweep_quiet_until = json_extract(j.value, '$.until')
@@ -368,7 +368,7 @@ export interface WarmQuietSessionMark {
  * An expired mark is filtered here rather than cleared, so this is a pure read.
  */
 export function getWarmQuietSessionMarks(nowIso: string): WarmQuietSessionMark[] {
-  return getDb()
+  return getRawDb()
     .prepare(
       `SELECT id, sweep_quiet_until, last_active
          FROM sessions
@@ -389,7 +389,7 @@ export function getWarmQuietSessionMarks(nowIso: string): WarmQuietSessionMark[]
  * left that could replay or re-execute the request the claim guarded.
  */
 export function deleteSession(id: string): void {
-  const db = getDb();
+  const db = getRawDb();
   db.transaction(() => {
     db.prepare('DELETE FROM cli_request_executions WHERE session_id = ?').run(id);
     db.prepare('DELETE FROM sessions WHERE id = ?').run(id);
@@ -409,7 +409,7 @@ export function deleteSession(id: string): void {
  * "thinks it's alive, try to kill, no-op" path. Returns the row count.
  */
 export function resetPhantomContainerStatus(): number {
-  const result = getDb()
+  const result = getRawDb()
     .prepare("UPDATE sessions SET container_status = 'stopped' WHERE container_status IN ('running', 'idle')")
     .run();
   return result.changes;
@@ -423,14 +423,14 @@ export function resetPhantomContainerStatus(): number {
  * their containers; archiving is purely an operator-side display flag.
  */
 export function archiveSessionById(id: string, archivedAt: string = new Date().toISOString()): boolean {
-  const result = getDb()
+  const result = getRawDb()
     .prepare(`UPDATE sessions SET archived_at = ? WHERE id = ? AND archived_at IS NULL`)
     .run(archivedAt, id);
   return result.changes > 0;
 }
 
 export function unarchiveSessionById(id: string): void {
-  getDb().prepare(`UPDATE sessions SET archived_at = NULL WHERE id = ?`).run(id);
+  getRawDb().prepare(`UPDATE sessions SET archived_at = NULL WHERE id = ?`).run(id);
 }
 
 /**
@@ -448,7 +448,7 @@ export function bumpLastOutbound(id: string, kind: string): void {
   // TEXT — at index 10 'T' (0x54) beats ' ' (0x20), so a naive 11pm row sorts
   // BELOW an ISO 7am one from the same day and `MAX(last_outbound_at)` (the
   // observatory's most-recent-activity read) picks the wrong session.
-  getDb()
+  getRawDb()
     .prepare(
       `UPDATE sessions
           SET last_outbound_at = ?,
@@ -475,7 +475,7 @@ export function bumpLastOutbound(id: string, kind: string): void {
  * engagement.
  */
 export function markSessionEngaged(id: string): void {
-  getDb()
+  getRawDb()
     .prepare(`UPDATE sessions SET engaged_at = ? WHERE id = ? AND engaged_at IS NULL`)
     .run(new Date().toISOString(), id);
 }
@@ -497,7 +497,7 @@ export function markSessionEngaged(id: string): void {
  * sessions ever use.
  */
 export function setTaskRoutingPlatformId(id: string, platformId: string): void {
-  getDb().prepare('UPDATE sessions SET task_routing_platform_id = ? WHERE id = ?').run(platformId, id);
+  getRawDb().prepare('UPDATE sessions SET task_routing_platform_id = ? WHERE id = ?').run(platformId, id);
 }
 
 // ── Pending Questions ──
@@ -509,7 +509,7 @@ export function setTaskRoutingPlatformId(id: string, platformId: string): void {
  * actual send step. Returns true if a new row was inserted.
  */
 export function createPendingQuestion(pq: PendingQuestion): boolean {
-  const result = getDb()
+  const result = getRawDb()
     .prepare(
       `INSERT OR IGNORE INTO pending_questions (question_id, session_id, message_out_id, platform_id, channel_type, thread_id, title, question, options_json, created_at)
        VALUES (@question_id, @session_id, @message_out_id, @platform_id, @channel_type, @thread_id, @title, @question, @options_json, @created_at)`,
@@ -530,7 +530,7 @@ export function createPendingQuestion(pq: PendingQuestion): boolean {
 }
 
 export function getPendingQuestion(questionId: string): PendingQuestion | undefined {
-  const row = getDb().prepare('SELECT * FROM pending_questions WHERE question_id = ?').get(questionId) as
+  const row = getRawDb().prepare('SELECT * FROM pending_questions WHERE question_id = ?').get(questionId) as
     | (Omit<PendingQuestion, 'options'> & { options_json: string })
     | undefined;
   if (!row) return undefined;
@@ -539,7 +539,7 @@ export function getPendingQuestion(questionId: string): PendingQuestion | undefi
 }
 
 export function deletePendingQuestion(questionId: string): void {
-  getDb().prepare('DELETE FROM pending_questions WHERE question_id = ?').run(questionId);
+  getRawDb().prepare('DELETE FROM pending_questions WHERE question_id = ?').run(questionId);
 }
 
 // ── Pending Approvals ──
@@ -556,7 +556,7 @@ export function createPendingApproval(
       'approval_id' | 'request_id' | 'action' | 'payload' | 'created_at' | 'title' | 'options_json'
     >,
 ): boolean {
-  const result = getDb()
+  const result = getRawDb()
     .prepare(
       `INSERT OR IGNORE INTO pending_approvals
          (approval_id, session_id, request_id, action, payload, created_at,
@@ -585,31 +585,31 @@ export function createPendingApproval(
 }
 
 export function getPendingApprovalsBySession(sessionId: string): PendingApproval[] {
-  return getDb()
+  return getRawDb()
     .prepare('SELECT * FROM pending_approvals WHERE session_id = ? AND status = ?')
     .all(sessionId, 'pending') as PendingApproval[];
 }
 
 export function getPendingApprovalByRequestId(requestId: string): PendingApproval | undefined {
-  return getDb()
+  return getRawDb()
     .prepare('SELECT * FROM pending_approvals WHERE request_id = ? AND status = ?')
     .get(requestId, 'pending') as PendingApproval | undefined;
 }
 
 export function updatePendingApprovalMessageId(approvalId: string, platformMessageId: string | null): void {
-  getDb()
+  getRawDb()
     .prepare('UPDATE pending_approvals SET platform_message_id = ? WHERE approval_id = ?')
     .run(platformMessageId, approvalId);
 }
 
 export function getPendingApproval(approvalId: string): PendingApproval | undefined {
-  return getDb().prepare('SELECT * FROM pending_approvals WHERE approval_id = ?').get(approvalId) as
+  return getRawDb().prepare('SELECT * FROM pending_approvals WHERE approval_id = ?').get(approvalId) as
     | PendingApproval
     | undefined;
 }
 
 export function updatePendingApprovalStatus(approvalId: string, status: PendingApproval['status']): void {
-  getDb().prepare('UPDATE pending_approvals SET status = ? WHERE approval_id = ?').run(status, approvalId);
+  getRawDb().prepare('UPDATE pending_approvals SET status = ? WHERE approval_id = ?').run(status, approvalId);
 }
 
 /**
@@ -628,7 +628,7 @@ export function transitionPendingApprovalStatus(
   from: PendingApproval['status'],
   to: PendingApproval['status'],
 ): boolean {
-  const result = getDb()
+  const result = getRawDb()
     .prepare('UPDATE pending_approvals SET status = ? WHERE approval_id = ? AND status = ?')
     .run(to, approvalId, from);
   return result.changes > 0;
@@ -642,14 +642,14 @@ export function transitionPendingApprovalStatus(
  * `expires_at` column on module-initiated rows.
  */
 export function markApprovalAwaitingReason(approvalId: string, expiresAt: string): void {
-  getDb()
+  getRawDb()
     .prepare("UPDATE pending_approvals SET status = 'awaiting_reason', expires_at = ? WHERE approval_id = ?")
     .run(expiresAt, approvalId);
 }
 
 /** Awaiting-reason approvals whose reply window has elapsed — the sweep's ghost set. */
 export function getExpiredAwaitingReasonApprovals(nowIso: string): PendingApproval[] {
-  return getDb()
+  return getRawDb()
     .prepare(
       "SELECT * FROM pending_approvals WHERE status = 'awaiting_reason' AND expires_at IS NOT NULL AND expires_at <= ?",
     )
@@ -657,11 +657,11 @@ export function getExpiredAwaitingReasonApprovals(nowIso: string): PendingApprov
 }
 
 export function deletePendingApproval(approvalId: string): void {
-  getDb().prepare('DELETE FROM pending_approvals WHERE approval_id = ?').run(approvalId);
+  getRawDb().prepare('DELETE FROM pending_approvals WHERE approval_id = ?').run(approvalId);
 }
 
 export function getPendingApprovalsByAction(action: string): PendingApproval[] {
-  return getDb().prepare('SELECT * FROM pending_approvals WHERE action = ?').all(action) as PendingApproval[];
+  return getRawDb().prepare('SELECT * FROM pending_approvals WHERE action = ?').all(action) as PendingApproval[];
 }
 
 /**
@@ -698,7 +698,7 @@ export function getAskQuestionRender(
     }
   };
 
-  const a = getDb()
+  const a = getRawDb()
     .prepare('SELECT title, question, options_json FROM pending_approvals WHERE approval_id = ?')
     .get(id) as { title: string; question: string; options_json: string } | undefined;
   const approvalRender = parseRender(a);
@@ -706,16 +706,16 @@ export function getAskQuestionRender(
 
   // Channel-registration + unknown-sender approvals persist title/options_json
   // the same way pending_approvals does — just SELECT and return.
-  if (hasTable(getDb(), 'pending_channel_approvals')) {
-    const c = getDb()
+  if (hasTableRaw(getRawDb(), 'pending_channel_approvals')) {
+    const c = getRawDb()
       .prepare('SELECT title, question, options_json FROM pending_channel_approvals WHERE messaging_group_id = ?')
       .get(id) as { title: string; question: string; options_json: string } | undefined;
     const channelRender = parseRender(c);
     if (channelRender) return channelRender;
   }
 
-  if (hasTable(getDb(), 'pending_sender_approvals')) {
-    const s = getDb()
+  if (hasTableRaw(getRawDb(), 'pending_sender_approvals')) {
+    const s = getRawDb()
       .prepare('SELECT title, question, options_json FROM pending_sender_approvals WHERE id = ?')
       .get(id) as { title: string; question: string; options_json: string } | undefined;
     const senderRender = parseRender(s);

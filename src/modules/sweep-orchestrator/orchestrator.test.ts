@@ -20,7 +20,7 @@
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { closeDb, getDb, initTestDb, runMigrations } from '../../db/index.js';
+import { closeDb, getRawDb, initTestDb, runMigrations } from '../../db/index.js';
 import { log } from '../../log.js';
 
 // Hermeticity tripwire (brief-common.md HARD RULE): every case below runs a
@@ -541,26 +541,27 @@ describe('the task watchdog transitions and parent notifications are unchanged',
 // ── F-5.2 — auto-archive covers completed tasks older than 24h and never failed tasks ──
 
 describe('auto-archive covers completed tasks older than 24h and never failed tasks', () => {
-  beforeEach(() => {
-    const db = initTestDb();
+  beforeEach(async () => {
+    await initTestDb();
+    const db = getRawDb();
     db.pragma('foreign_keys = ON');
     runMigrations(db);
     // Seed agent_group + session so task FKs hold
-    getDb()
+    getRawDb()
       .prepare(
         "INSERT INTO agent_groups (id, name, folder, agent_provider, created_at) VALUES ('ag-1', 'ag-1', 'ag-1', NULL, datetime('now'))",
       )
       .run();
-    getDb()
+    getRawDb()
       .prepare("INSERT INTO sessions (id, agent_group_id, created_at) VALUES ('sess-1', 'ag-1', datetime('now'))")
       .run();
   });
-  afterEach(() => {
-    closeDb();
+  afterEach(async () => {
+    await closeDb();
   });
 
   function insertCompletedTask(taskId: string, completedAt: string): void {
-    getDb()
+    getRawDb()
       .prepare(
         `INSERT INTO tasks (
           task_id, idempotency_key, parent_session_id, parent_agent_group_id,
@@ -577,7 +578,7 @@ describe('auto-archive covers completed tasks older than 24h and never failed ta
 
     autoArchiveOldCompleted();
 
-    const rows = getDb().prepare('SELECT task_id, archived_at FROM tasks ORDER BY task_id').all() as Array<{
+    const rows = getRawDb().prepare('SELECT task_id, archived_at FROM tasks ORDER BY task_id').all() as Array<{
       task_id: string;
       archived_at: string | null;
     }>;
@@ -589,16 +590,18 @@ describe('auto-archive covers completed tasks older than 24h and never failed ta
   it('does not re-archive already-archived rows', () => {
     const original = '2026-05-01T00:00:00.000Z';
     insertCompletedTask('t1', new Date(Date.now() - 48 * 60 * 60 * 1000).toISOString());
-    getDb().prepare(`UPDATE tasks SET archived_at = ? WHERE task_id = 't1'`).run(original);
+    getRawDb().prepare(`UPDATE tasks SET archived_at = ? WHERE task_id = 't1'`).run(original);
 
     autoArchiveOldCompleted();
 
-    const row = getDb().prepare('SELECT archived_at FROM tasks WHERE task_id = ?').get('t1') as { archived_at: string };
+    const row = getRawDb().prepare('SELECT archived_at FROM tasks WHERE task_id = ?').get('t1') as {
+      archived_at: string;
+    };
     expect(row.archived_at).toBe(original);
   });
 
   it('leaves failed tasks alone regardless of age', () => {
-    getDb()
+    getRawDb()
       .prepare(
         `INSERT INTO tasks (
           task_id, idempotency_key, parent_session_id, parent_agent_group_id,
@@ -614,7 +617,7 @@ describe('auto-archive covers completed tasks older than 24h and never failed ta
 
     autoArchiveOldCompleted();
 
-    const row = getDb().prepare('SELECT archived_at FROM tasks WHERE task_id = ?').get('f1') as {
+    const row = getRawDb().prepare('SELECT archived_at FROM tasks WHERE task_id = ?').get('f1') as {
       archived_at: string | null;
     };
     expect(row.archived_at).toBeNull();

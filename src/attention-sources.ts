@@ -84,7 +84,7 @@
  */
 import path from 'path';
 
-import { getDb } from './db/connection.js';
+import { getRawDb } from './db/connection.js';
 import { log } from './log.js';
 import { readReleaseBoardSource } from './dashboard/api/board-attention.js';
 import {
@@ -534,7 +534,7 @@ function parseOneDecl(
 export function readAttentionSourceDecls(workgroupId: string): AttentionSourceParse {
   let row: { attention_sources: string | null } | undefined;
   try {
-    row = getDb().prepare(`SELECT attention_sources FROM workgroups WHERE id = ?`).get(workgroupId) as
+    row = getRawDb().prepare(`SELECT attention_sources FROM workgroups WHERE id = ?`).get(workgroupId) as
       | { attention_sources: string | null }
       | undefined;
   } catch (err) {
@@ -893,7 +893,7 @@ export function workgroupIdsForAgentGroups(agentGroupIds: string[]): string[] {
   if (agentGroupIds.length === 0) return [];
   try {
     return (
-      getDb()
+      getRawDb()
         .prepare(
           `SELECT DISTINCT workgroup_id FROM agent_groups
             WHERE workgroup_id IS NOT NULL AND id IN (${agentGroupIds.map(() => '?').join(', ')})`,
@@ -910,7 +910,7 @@ export function workgroupIdsForAgentGroups(agentGroupIds: string[]): string[] {
 export function workgroupIdsWithAttentionSources(): string[] {
   try {
     return (
-      getDb().prepare(`SELECT id FROM workgroups WHERE attention_sources IS NOT NULL`).all() as { id: string }[]
+      getRawDb().prepare(`SELECT id FROM workgroups WHERE attention_sources IS NOT NULL`).all() as { id: string }[]
     ).map((r) => r.id);
   } catch (err) {
     log.warn('Attention sources: workgroup scan failed', { err });

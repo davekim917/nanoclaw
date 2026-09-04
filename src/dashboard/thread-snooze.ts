@@ -29,7 +29,7 @@
  * §2a still applies on top: out-of-scope, unprivileged and nonexistent all
  * collapse to one 404, so the gate never discloses that a thread exists.
  */
-import { getDb } from '../db/index.js';
+import { getRawDb } from '../db/index.js';
 import { log } from '../log.js';
 import { hasAdminPrivilege } from '../modules/permissions/db/user-roles.js';
 import { parseUtcTimestampMs } from '../thread-context.js';
@@ -68,7 +68,7 @@ export function readThreadSnoozes(userId: string, threadIds: string[]): Map<stri
   const out = new Map<string, string | null>();
   if (threadIds.length === 0) return out;
   try {
-    const rows = getDb()
+    const rows = getRawDb()
       .prepare(
         `SELECT thread_id, snoozed_at_activity
            FROM thread_snoozes
@@ -90,7 +90,7 @@ export function readThreadSnoozes(userId: string, threadIds: string[]): Map<stri
  * thread here.
  */
 function loadThreadForSnooze(threadId: string, ctx: AuthedRequestContext): { lastActivityAt: string | null } | null {
-  const rows = getDb()
+  const rows = getRawDb()
     .prepare(
       `SELECT agent_group_id, last_outbound_at, last_active, created_at
          FROM sessions
@@ -148,7 +148,7 @@ export const threadSnoozeHandler: AuthHandler = async (_req, params, ctx) => {
   if (!thread) return NOT_FOUND();
 
   try {
-    getDb()
+    getRawDb()
       .prepare(
         `INSERT INTO thread_snoozes (thread_id, user_id, snoozed_at_activity, created_at)
          VALUES (?, ?, ?, ?)
@@ -170,7 +170,7 @@ export const threadUnsnoozeHandler: AuthHandler = async (_req, params, ctx) => {
   if (!loadThreadForSnooze(threadId, ctx)) return NOT_FOUND();
 
   try {
-    getDb().prepare(`DELETE FROM thread_snoozes WHERE thread_id = ? AND user_id = ?`).run(threadId, ctx.user.id);
+    getRawDb().prepare(`DELETE FROM thread_snoozes WHERE thread_id = ? AND user_id = ?`).run(threadId, ctx.user.id);
   } catch (err) {
     log.warn('threadUnsnoozeHandler: DB error', { threadId, err });
     return json(500, { error: 'internal_error' });

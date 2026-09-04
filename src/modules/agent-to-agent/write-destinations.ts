@@ -4,7 +4,7 @@
  * every container wake and after admin-time destination edits (e.g. create_agent).
  *
  * Core container-runner calls this via a dynamic import guarded by a
- * `hasTable('agent_destinations')` check — without the agent-to-agent module
+ * `hasTableRaw('agent_destinations')` check — without the agent-to-agent module
  * installed, the central table doesn't exist and the projection is skipped.
  */
 import { getAgentGroup } from '../../db/agent-groups.js';

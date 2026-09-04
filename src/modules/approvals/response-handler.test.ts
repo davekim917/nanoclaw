@@ -8,7 +8,7 @@
 import * as fs from 'fs';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { initTestDb, closeDb, runMigrations } from '../../db/index.js';
+import { initTestDb, closeDb, runMigrations, getRawDb } from '../../db/index.js';
 import { createAgentGroup } from '../../db/agent-groups.js';
 import { createSession, createPendingApproval, getPendingApproval } from '../../db/sessions.js';
 import { upsertUser } from '../permissions/db/users.js';
@@ -30,10 +30,11 @@ function now() {
   return new Date().toISOString();
 }
 
-beforeEach(() => {
+beforeEach(async () => {
   if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true, force: true });
   fs.mkdirSync(TEST_DIR, { recursive: true });
-  const db = initTestDb();
+  await initTestDb();
+  const db = getRawDb();
   runMigrations(db);
 
   createAgentGroup({ id: 'ag-1', name: 'Agent', folder: 'agent', agent_provider: null, created_at: now() });
@@ -50,8 +51,8 @@ beforeEach(() => {
   });
 });
 
-afterEach(() => {
-  closeDb();
+afterEach(async () => {
+  await closeDb();
   if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true, force: true });
 });
 

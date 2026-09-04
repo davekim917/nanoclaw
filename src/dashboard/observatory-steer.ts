@@ -41,7 +41,7 @@ import { createHash, randomUUID } from 'crypto';
 import { readClaims } from '../claims-board.js';
 import { getChannelAdapter } from '../channels/channel-registry.js';
 import { dispatch } from '../cli/dispatch.js';
-import { getDb } from '../db/index.js';
+import { getRawDb } from '../db/index.js';
 import { log } from '../log.js';
 import { claimsBaseDir } from '../modules/claims/escalation.js';
 import { canAssign } from './assign.js';
@@ -104,7 +104,7 @@ async function withItemThreadLock<T>(key: string, fn: () => Promise<T>): Promise
 /** The thread an item's work already lives in, or null when nobody has opened one. */
 export function readItemThread(workgroupId: string, itemId: string): ItemThreadRow | null {
   return (
-    (getDb()
+    (getRawDb()
       .prepare(
         `SELECT thread_id, created_at, created_by
            FROM observatory_item_threads
@@ -126,7 +126,7 @@ export interface ItemThreadRow {
  * somewhere real to post and never a second thread to apologise for.
  */
 function claimItemThread(workgroupId: string, itemId: string, threadId: string, userId: string): string {
-  const res = getDb()
+  const res = getRawDb()
     .prepare(
       `INSERT INTO observatory_item_threads (workgroup_id, item_id, thread_id, created_at, created_by)
        VALUES (?, ?, ?, ?, ?)
@@ -142,7 +142,7 @@ function claimItemThread(workgroupId: string, itemId: string, threadId: string, 
  * made to speak where it belongs" check the claim-with-a-thread branch runs.
  */
 function wiredGroupForThread(agentGroupId: string, threadId: string): { id: string; name: string } | undefined {
-  return getDb()
+  return getRawDb()
     .prepare(
       `SELECT mg.id, mg.name
          FROM messaging_group_agents mga
@@ -203,7 +203,7 @@ async function openThreadFor(
   title: string,
   firstMessage: string,
 ): Promise<{ threadId: string; messagingGroupId: string } | { error: Response }> {
-  const wired = getDb()
+  const wired = getRawDb()
     .prepare(
       `SELECT mg.id, mg.name, mg.platform_id, mg.channel_type
          FROM messaging_group_agents mga
@@ -266,7 +266,7 @@ export const observatorySteerHandler: AuthHandler = async (req, _params, ctx) =>
   const role = canAssign(ctx.user.id, agentGroupId);
   if (!role.ok) return json(role.reason === 'not_found' ? 404 : 403, { error: role.reason });
 
-  const agent = getDb()
+  const agent = getRawDb()
     .prepare(`SELECT * FROM agent_groups WHERE id = ? AND workgroup_id = ?`)
     .get(agentGroupId, workgroupId) as AgentGroup | undefined;
   if (!agent) return json(404, { error: 'agent_group_not_in_workgroup' });
@@ -349,7 +349,7 @@ export const observatorySteerHandler: AuthHandler = async (req, _params, ctx) =>
 
     if (claim.threadId) {
       // Same rule as nudge: an agent can only be made to speak where it belongs.
-      const target = getDb()
+      const target = getRawDb()
         .prepare(
           `SELECT mg.id, mg.name
            FROM messaging_group_agents mga

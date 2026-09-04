@@ -27,7 +27,7 @@ import { ensureContainedInboxDir, isPathInside } from '../../inbox-safety.js';
 import { getChannelAdapter } from '../../channels/channel-registry.js';
 import { gateCommand } from '../../command-gate.js';
 import { getAgentGroup } from '../../db/agent-groups.js';
-import { getDb } from '../../db/connection.js';
+import { getRawDb } from '../../db/connection.js';
 import { getMessagingGroup } from '../../db/messaging-groups.js';
 import { getSession, markSessionEngaged } from '../../db/sessions.js';
 import { sessionStillActive, wakeContainer } from '../../container-runner.js';
@@ -362,7 +362,7 @@ async function resolveTargetSession(
  */
 function targetWiredToMessagingGroup(agentGroupId: string, messagingGroupId: string): boolean {
   return (
-    getDb()
+    getRawDb()
       .prepare('SELECT 1 AS ok FROM messaging_group_agents WHERE agent_group_id = ? AND messaging_group_id = ?')
       .get(agentGroupId, messagingGroupId) !== undefined
   );

@@ -41,7 +41,14 @@ vi.mock('../approvals/index.js', async (importOriginal) => ({
   },
 }));
 
-import { closeDb, createAgentGroup, createMessagingGroup, initTestDb, runMigrations } from '../../db/index.js';
+import {
+  closeDb,
+  createAgentGroup,
+  createMessagingGroup,
+  initTestDb,
+  runMigrations,
+  getRawDb,
+} from '../../db/index.js';
 import { initSessionFolder } from '../../session-manager.js';
 import { inboundDbPath } from '../../mailbox/sqlite/paths.js';
 import type { AgentGroup, MessagingGroup, Session } from '../../types.js';
@@ -121,10 +128,11 @@ function insertRawInbound(id: string, content: string): void {
   }
 }
 
-beforeEach(() => {
+beforeEach(async () => {
   if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true, force: true });
   fs.mkdirSync(TEST_DIR, { recursive: true });
-  const db = initTestDb();
+  await initTestDb();
+  const db = getRawDb();
   runMigrations(db);
   notifyCalls.length = 0;
   initSessionFolder('ag-helper', 'sess-test');
@@ -180,8 +188,8 @@ beforeEach(() => {
   });
 });
 
-afterEach(() => {
-  closeDb();
+afterEach(async () => {
+  await closeDb();
   if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true, force: true });
 });
 

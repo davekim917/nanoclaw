@@ -3,7 +3,7 @@
  * (fleet-hardening Phase 1.4). See migration 048 for the "why" — this module
  * is just get/set/delete plus the rotation predicate delivery.ts consults.
  */
-import { getDb } from './connection.js';
+import { getRawDb } from './connection.js';
 
 export interface TaskThreadAnchor {
   threadPlatformId: string;
@@ -15,7 +15,7 @@ export function getTaskThreadAnchor(
   channelType: string,
   platformId: string,
 ): TaskThreadAnchor | null {
-  const row = getDb()
+  const row = getRawDb()
     .prepare(
       'SELECT thread_platform_id, created_at FROM task_thread_anchors WHERE session_id = ? AND channel_type = ? AND platform_id = ?',
     )
@@ -30,7 +30,7 @@ export function setTaskThreadAnchor(
   threadPlatformId: string,
   createdAt: string,
 ): void {
-  getDb()
+  getRawDb()
     .prepare(
       `INSERT INTO task_thread_anchors (session_id, channel_type, platform_id, thread_platform_id, created_at)
        VALUES (?, ?, ?, ?, ?)
@@ -42,7 +42,7 @@ export function setTaskThreadAnchor(
 }
 
 export function deleteTaskThreadAnchor(sessionId: string, channelType: string, platformId: string): void {
-  getDb()
+  getRawDb()
     .prepare('DELETE FROM task_thread_anchors WHERE session_id = ? AND channel_type = ? AND platform_id = ?')
     .run(sessionId, channelType, platformId);
 }

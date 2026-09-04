@@ -7,7 +7,7 @@ import {
 } from '../../channels/channel-defaults.js';
 import { hasDeclaredChannelDefaults } from '../../channels/channel-registry.js';
 import { getAgentGroup, getAgentGroupByFolder } from '../../db/agent-groups.js';
-import { getDb } from '../../db/connection.js';
+import { getRawDb } from '../../db/connection.js';
 import {
   assertSameWorkgroupWiring,
   ensureAgentDestinationForWiring,
@@ -327,7 +327,7 @@ registerResource({
         // See issue #2389.
         const colNames = Object.keys(values);
         const placeholders = colNames.map((c) => `@${c}`);
-        const db = getDb();
+        const db = getRawDb();
         // Guard inside an IMMEDIATE transaction so check + insert are atomic
         // against a concurrent wiring from another process.
         db.transaction(() => {

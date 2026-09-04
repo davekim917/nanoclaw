@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import http from 'http';
 
-import { closeDb, initTestDb, runMigrations, createAgentGroup, getDb } from '../../db/index.js';
+import { closeDb, initTestDb, runMigrations, createAgentGroup, getRawDb } from '../../db/index.js';
 import { sessionsHandler, sessionsDetailHandler, resolveTranscriptAuthor } from './sessions.js';
 import type { AuthedRequestContext } from '../router.js';
 
@@ -54,8 +54,9 @@ function makeReq(url = 'http://localhost/dashboard/api/sessions'): Request {
   return new Request(url);
 }
 
-function setupDb(): void {
-  const db = initTestDb();
+async function setupDb(): Promise<void> {
+  await initTestDb();
+  const db = getRawDb();
   db.pragma('foreign_keys = ON');
   runMigrations(db);
 }
@@ -65,7 +66,7 @@ function seedAgentGroup(id: string): void {
 }
 
 function insertSession(sessId: string, agId: string, mgId: string | null = null): void {
-  getDb()
+  getRawDb()
     .prepare(
       // Distinct thread per session, mirroring real task sessions
       // (`system:tasks:<seriesId>`) — migration 049 folds NULLs, so two
@@ -89,7 +90,7 @@ function setSessionFields(
     .map((k) => `${k} = ?`)
     .join(', ');
   const values = Object.values(fields);
-  getDb()
+  getRawDb()
     .prepare(`UPDATE sessions SET ${pairs} WHERE id = ?`)
     .run(...values, sessId);
 }
@@ -102,7 +103,7 @@ function insertAttachedTask(opts: {
   status: 'pending' | 'running' | 'completed' | 'failed';
   needsInput?: 0 | 1;
 }): void {
-  getDb()
+  getRawDb()
     .prepare(
       `INSERT INTO tasks
          (task_id, idempotency_key, parent_session_id, parent_agent_group_id, child_session_id,
@@ -125,18 +126,18 @@ function insertAttachedTask(opts: {
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 describe('sessionsHandler — D4', () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     vi.mocked(fs.statSync).mockReset();
     vi.mocked(fs.statSync).mockImplementation(() => {
       throw new Error('ENOENT');
     });
-    setupDb();
+    await setupDb();
     seedAgentGroup('ag-1');
     seedAgentGroup('ag-2');
   });
 
-  afterEach(() => {
-    closeDb();
+  afterEach(async () => {
+    await closeDb();
     vi.clearAllMocks();
   });
 
@@ -492,18 +493,18 @@ describe('sessionsHandler — D4', () => {
 });
 
 describe('sessionsDetailHandler', () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     vi.mocked(fs.statSync).mockReset();
     vi.mocked(fs.statSync).mockImplementation(() => {
       throw new Error('ENOENT');
     });
-    setupDb();
+    await setupDb();
     seedAgentGroup('ag-1');
     seedAgentGroup('ag-2');
   });
 
-  afterEach(() => {
-    closeDb();
+  afterEach(async () => {
+    await closeDb();
     vi.clearAllMocks();
   });
 

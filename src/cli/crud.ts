@@ -8,7 +8,7 @@
  */
 import { randomUUID } from 'crypto';
 
-import { getDb } from '../db/connection.js';
+import { getRawDb } from '../db/connection.js';
 import { renderVerbHelp } from './help-render.js';
 import { register } from './registry.js';
 import type { Access } from './registry.js';
@@ -188,7 +188,7 @@ function genericList(def: ResourceDef) {
     // Newest first: without an ORDER BY the LIMIT silently hides the most
     // recently inserted rows once a table outgrows it (bit `sessions list`
     // past 200 sessions — a just-created session was invisible).
-    return getDb()
+    return getRawDb()
       .prepare(`SELECT ${cols} FROM ${def.table}${where} ORDER BY rowid DESC LIMIT ?`)
       .all(...params);
   };
@@ -199,7 +199,7 @@ function genericGet(def: ResourceDef) {
   return async (args: Record<string, unknown>) => {
     const id = args.id as string;
     if (!id) throw new Error(`${def.name} id is required`);
-    const row = getDb().prepare(`SELECT ${cols} FROM ${def.table} WHERE ${def.idColumn} = ?`).get(id);
+    const row = getRawDb().prepare(`SELECT ${cols} FROM ${def.table} WHERE ${def.idColumn} = ?`).get(id);
     if (!row) throw new Error(`${def.name} not found: ${id}`);
     return row;
   };
@@ -255,7 +255,7 @@ function genericCreate(def: ResourceDef) {
     if (def.naturalKey && def.naturalKey.length > 0) {
       const where = def.naturalKey.map((c) => `${c} = ?`).join(' AND ');
       const params = def.naturalKey.map((c) => values[c]);
-      const existing = getDb()
+      const existing = getRawDb()
         .prepare(`SELECT ${visibleColumns(def).join(', ')} FROM ${def.table} WHERE ${where}`)
         .get(...params);
       if (existing) return existing;
@@ -269,7 +269,7 @@ function genericCreate(def: ResourceDef) {
     // must only touch the central DB (it's the atomic companion-row write).
     // Anything async or outside the central DB — filesystem, session-DB
     // projection — belongs in `postCommit`, which runs after commit below.
-    const db = getDb();
+    const db = getRawDb();
     db.transaction(() => {
       db.prepare(`INSERT INTO ${def.table} (${colNames.join(', ')}) VALUES (${placeholders.join(', ')})`).run(values);
       if (def.postCreate) def.postCreate(values);
@@ -310,7 +310,7 @@ function genericUpdate(def: ResourceDef) {
     }
 
     if (def.preUpdate) {
-      const current = getDb().prepare(`SELECT ${cols} FROM ${def.table} WHERE ${def.idColumn} = ?`).get(id) as
+      const current = getRawDb().prepare(`SELECT ${cols} FROM ${def.table} WHERE ${def.idColumn} = ?`).get(id) as
         | Record<string, unknown>
         | undefined;
       if (!current) throw new Error(`${def.name} not found: ${id}`);
@@ -320,12 +320,12 @@ function genericUpdate(def: ResourceDef) {
     const setClause = Object.keys(updates)
       .map((k) => `${k} = @${k}`)
       .join(', ');
-    const result = getDb()
+    const result = getRawDb()
       .prepare(`UPDATE ${def.table} SET ${setClause} WHERE ${def.idColumn} = @_id`)
       .run({ ...updates, _id: id });
     if (result.changes === 0) throw new Error(`${def.name} not found: ${id}`);
 
-    return getDb().prepare(`SELECT ${cols} FROM ${def.table} WHERE ${def.idColumn} = ?`).get(id);
+    return getRawDb().prepare(`SELECT ${cols} FROM ${def.table} WHERE ${def.idColumn} = ?`).get(id);
   };
 }
 
@@ -333,7 +333,7 @@ function genericDelete(def: ResourceDef) {
   return async (args: Record<string, unknown>) => {
     const id = args.id as string;
     if (!id) throw new Error(`${def.name} id is required`);
-    const result = getDb().prepare(`DELETE FROM ${def.table} WHERE ${def.idColumn} = ?`).run(id);
+    const result = getRawDb().prepare(`DELETE FROM ${def.table} WHERE ${def.idColumn} = ?`).run(id);
     if (result.changes === 0) throw new Error(`${def.name} not found: ${id}`);
     return { deleted: id };
   };

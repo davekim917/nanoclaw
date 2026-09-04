@@ -11,7 +11,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import {
   initTestDb,
   closeDb,
-  getDb,
+  getRawDb,
   runMigrations,
   createAgentGroup,
   createMessagingGroup,
@@ -91,13 +91,13 @@ vi.mock('./config.js', async () => {
 });
 
 function sameWorkgroup(wgId: string, agentGroupIds: string[]): void {
-  getDb()
+  getRawDb()
     .prepare(
       `INSERT OR IGNORE INTO workgroups (id, display_name, onecli_secrets, mnemon_store_id, created_at)
        VALUES (?, ?, '[]', ?, datetime('now'))`,
     )
     .run(wgId, wgId, agentGroupIds[0]);
-  getDb()
+  getRawDb()
     .prepare(`UPDATE agent_groups SET workgroup_id = ? WHERE id IN (${agentGroupIds.map(() => '?').join(',')})`)
     .run(wgId, ...agentGroupIds);
 }
@@ -142,19 +142,20 @@ function readPairedInboundTriggers(db: Database.Database): TestInboundRow[] {
   return triggers;
 }
 
-beforeEach(() => {
+beforeEach(async () => {
   raceRewires.sessionId = null;
   raceRewires.run = null;
   // Clean test directory
   if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
   fs.mkdirSync(TEST_DIR, { recursive: true });
 
-  const db = initTestDb();
+  await initTestDb();
+  const db = getRawDb();
   runMigrations(db);
 });
 
-afterEach(() => {
-  closeDb();
+afterEach(async () => {
+  await closeDb();
   if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
 });
 
@@ -987,7 +988,7 @@ describe('router — per-wiring thread policy', () => {
   });
 
   it('wiring threads=0 nulls the event-derived thread for session and delivery', async () => {
-    getDb().prepare("UPDATE messaging_group_agents SET threads = 0 WHERE id = 'mga-tp'").run();
+    getRawDb().prepare("UPDATE messaging_group_agents SET threads = 0 WHERE id = 'mga-tp'").run();
 
     await withThreadedAdapter(async () => {
       const { routeInbound } = await import('./router.js');
@@ -1009,7 +1010,7 @@ describe('router — per-wiring thread policy', () => {
   });
 
   it('wiring threads=0 never strips replyTo (operator intent)', async () => {
-    getDb().prepare("UPDATE messaging_group_agents SET threads = 0 WHERE id = 'mga-tp'").run();
+    getRawDb().prepare("UPDATE messaging_group_agents SET threads = 0 WHERE id = 'mga-tp'").run();
 
     await withThreadedAdapter(async () => {
       const { routeInbound } = await import('./router.js');
@@ -1468,7 +1469,7 @@ describe('writeSessionRouting', () => {
     // read once and before the row is written.
     raceRewires.sessionId = session.id;
     raceRewires.run = () => {
-      getDb().prepare('UPDATE sessions SET messaging_group_id = ? WHERE id = ?').run('mg-after', session.id);
+      getRawDb().prepare('UPDATE sessions SET messaging_group_id = ? WHERE id = ?').run('mg-after', session.id);
     };
 
     await writeSessionRouting('ag-1', session.id);
@@ -1611,7 +1612,7 @@ describe('agent-to-agent routing', () => {
     });
 
     // Wire bidirectional A2A destinations (table created by runMigrations)
-    const db = getDb();
+    const db = getRawDb();
     db.prepare(
       `INSERT OR IGNORE INTO agent_destinations (agent_group_id, local_name, target_type, target_id, created_at)
        VALUES ('ag-pa', 'researcher', 'agent', 'ag-researcher', ?)`,

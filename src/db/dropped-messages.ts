@@ -1,4 +1,4 @@
-import { getDb } from './connection.js';
+import { getRawDb } from './connection.js';
 
 export interface UnregisteredSender {
   channel_type: string;
@@ -23,7 +23,7 @@ export function recordDroppedMessage(msg: {
   agent_group_id: string | null;
 }): void {
   const now = new Date().toISOString();
-  getDb()
+  getRawDb()
     .prepare(
       `INSERT INTO unregistered_senders (channel_type, platform_id, user_id, sender_name, reason, messaging_group_id, agent_group_id, message_count, first_seen, last_seen)
        VALUES (@channel_type, @platform_id, @user_id, @sender_name, @reason, @messaging_group_id, @agent_group_id, 1, @now, @now)
@@ -38,7 +38,7 @@ export function recordDroppedMessage(msg: {
 }
 
 export function getUnregisteredSenders(limit = 50): UnregisteredSender[] {
-  return getDb()
+  return getRawDb()
     .prepare('SELECT * FROM unregistered_senders ORDER BY last_seen DESC LIMIT ?')
     .all(limit) as UnregisteredSender[];
 }

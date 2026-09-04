@@ -7,7 +7,7 @@
  * attention feed out of `api/threads.ts`, and `api/threads.ts` decorates its
  * rows with the assignment. See migration 058 for why the table exists at all.
  */
-import { getDb } from '../../db/connection.js';
+import { getRawDb } from '../../db/connection.js';
 import { log } from '../../log.js';
 
 /**
@@ -72,7 +72,7 @@ export function reserveItemAssignment(
   windowMs: number,
 ): boolean {
   const staleBefore = new Date(now - windowMs).toISOString();
-  const res = getDb()
+  const res = getRawDb()
     .prepare(
       `INSERT INTO observatory_item_assignments
          (workgroup_id, item_id, agent_group_id, assigned_at, assigned_by)
@@ -111,7 +111,7 @@ export function reserveItemAssignment(
  */
 export function releaseItemAssignment(workgroupId: string, itemId: string): void {
   try {
-    getDb()
+    getRawDb()
       .prepare(`DELETE FROM observatory_item_assignments WHERE workgroup_id = ? AND item_id = ?`)
       .run(workgroupId, itemId);
   } catch (err) {
@@ -122,7 +122,7 @@ export function releaseItemAssignment(workgroupId: string, itemId: string): void
 /** The standing assignment for one item, or null. */
 export function readItemAssignment(workgroupId: string, itemId: string): ItemAssignment | null {
   try {
-    const row = getDb()
+    const row = getRawDb()
       .prepare(
         `SELECT agent_group_id, assigned_at, assigned_by
            FROM observatory_item_assignments
@@ -152,7 +152,7 @@ export function readItemAssignments(workgroupIds: string[]): Map<string, ItemAss
   const out = new Map<string, ItemAssignmentRow>();
   if (workgroupIds.length === 0) return out;
   try {
-    const rows = getDb()
+    const rows = getRawDb()
       .prepare(
         `SELECT workgroup_id, item_id, agent_group_id, assigned_at, assigned_by
            FROM observatory_item_assignments
@@ -197,7 +197,7 @@ export function readUserDisplayNames(userIds: string[]): Map<string, string> {
   const out = new Map<string, string>();
   if (userIds.length === 0) return out;
   try {
-    const rows = getDb()
+    const rows = getRawDb()
       .prepare(`SELECT id, display_name FROM users WHERE id IN (${userIds.map(() => '?').join(', ')})`)
       .all(...userIds) as { id: string; display_name: string | null }[];
     for (const r of rows) if (r.display_name) out.set(r.id, r.display_name);

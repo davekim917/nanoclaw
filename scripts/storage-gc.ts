@@ -18,7 +18,7 @@ import { DATA_DIR } from '../src/config.js';
 import { initDb } from '../src/db/connection.js';
 import { runStorageGcOnce, type GcCategory } from '../src/worktree-cleanup.js';
 
-initDb(path.join(DATA_DIR, 'v2.db'));
+await initDb(path.join(DATA_DIR, 'v2.db'));
 
 const report = runStorageGcOnce();
 const gb = (bytes: number): string => `${(bytes / 1024 ** 3).toFixed(2)} GB`;

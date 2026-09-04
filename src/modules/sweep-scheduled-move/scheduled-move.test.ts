@@ -232,13 +232,13 @@ vi.mock('../../db/provider-health.js', async (importOriginal) => {
   return { ...real, markProviderUnavailable: () => undefined };
 });
 
-// getDb is THE dependency this family's two duties consume — a spy, not a
+// getRawDb is THE dependency this family's two duties consume — a spy, not a
 // stub, so the registered-duty cases below can assert on it directly (F-7's
 // "acceptance tests must drive the REGISTERED duty" rule).
 const mockGetDb = vi.fn(() => h.centralDb);
 vi.mock('../../db/connection.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../db/connection.js')>()),
-  getDb: () => mockGetDb(),
+  getRawDb: () => mockGetDb(),
 }));
 
 // ── imports (after every mock above) ─────────────────────────────────────────
@@ -254,7 +254,7 @@ import { log } from '../../log.js';
 // write columns a hand-rolled `sessions` table does not have.
 //
 // `runMigrations` comes from the migrations module, NOT from `db/index.js`:
-// this suite mocks `db/connection.js` down to a single `getDb`, and
+// this suite mocks `db/connection.js` down to a single `getRawDb`, and
 // `db/index.js` re-exports `initTestDb`/`closeDb` from it — so through the
 // barrel they are `undefined`. The DB is built here instead and handed to
 // `mockGetDb` directly, which is the same wiring every other case in this
@@ -309,9 +309,9 @@ describe('registered scheduled-move-recovery / audit-body-prune duties', () => {
     expect(h.spawns).toEqual([]);
   });
 
-  it('scheduled-move-recovery forwards the exact getDb() handle to recoverMoveIntents', async () => {
+  it('scheduled-move-recovery forwards the exact getRawDb() handle to recoverMoveIntents', async () => {
     // A sentinel central-db stub — proves recoverMoveIntents ran against the
-    // SAME object getDb() returned (forwarding), not a re-derived handle.
+    // SAME object getRawDb() returned (forwarding), not a re-derived handle.
     const prepare = vi.fn(() => ({ all: () => [] }));
     h.centralDb = { prepare };
     const duty = getDuty(SWEEP_DUTY_INVENTORY.T11);
@@ -324,7 +324,7 @@ describe('registered scheduled-move-recovery / audit-body-prune duties', () => {
     expect(h.spawns).toEqual([]);
   });
 
-  it('audit-body-prune forwards the exact getDb() handle to pruneAuditBodies', async () => {
+  it('audit-body-prune forwards the exact getRawDb() handle to pruneAuditBodies', async () => {
     const run = vi.fn(() => ({ changes: 0 }));
     const prepare = vi.fn(() => ({ run }));
     h.centralDb = { prepare };
@@ -338,7 +338,7 @@ describe('registered scheduled-move-recovery / audit-body-prune duties', () => {
     expect(h.spawns).toEqual([]);
   });
 
-  it('scheduled-move-recovery logs the preserved failure string when getDb() throws', async () => {
+  it('scheduled-move-recovery logs the preserved failure string when getRawDb() throws', async () => {
     const warnSpy = vi.spyOn(log, 'warn').mockImplementation(() => undefined);
     mockGetDb.mockImplementationOnce(() => {
       throw new Error('central db unopenable');
@@ -352,7 +352,7 @@ describe('registered scheduled-move-recovery / audit-body-prune duties', () => {
     expect(h.spawns).toEqual([]);
   });
 
-  it('audit-body-prune logs the SAME preserved failure string when getDb() throws', async () => {
+  it('audit-body-prune logs the SAME preserved failure string when getRawDb() throws', async () => {
     // PR 2 split the formerly shared try/catch into two guarded
     // registrations but kept the identical warn string on both, so a log
     // search for it still finds every failure it used to.
@@ -607,7 +607,7 @@ describe('recoverMoveIntents (D3) + pruneAuditBodies (D4)', () => {
   // really is unrecoverable.
   it('the recovery restores into an ACTIVE source and is refused by a closed one', async () => {
     const db = centralDb();
-    // The real helper reads `getDb()`, not the handle passed to the duty, so
+    // The real helper reads `getRawDb()`, not the handle passed to the duty, so
     // both have to be the same database for the refusal to be the real one.
     mockGetDb.mockImplementation(() => db);
     useRealQuietInvalidation.on = true;
@@ -1041,7 +1041,7 @@ describe('recoverMoveIntents (D3) + pruneAuditBodies (D4)', () => {
     // F-7.3, rewritten. The old contract was the opposite — recovery walked an
     // INJECTED sessions root by path and was exempt from the seam — and it
     // protected test scaffolding, not behaviour: the sole production caller is
-    // `recoverMoveIntents(getDb(), {})`, on this branch and on origin/main, and
+    // `recoverMoveIntents(getRawDb(), {})`, on this branch and on origin/main, and
     // all eight other call sites are tests.
     //
     // Keeping the option would have been actively unsafe once the restore moved

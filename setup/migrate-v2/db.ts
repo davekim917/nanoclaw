@@ -17,7 +17,7 @@ import Database from 'better-sqlite3';
 
 import { DATA_DIR } from '../../src/config.js';
 import { createAgentGroup, getAgentGroupByFolder } from '../../src/db/agent-groups.js';
-import { initDb } from '../../src/db/connection.js';
+import { initDb, getRawDb } from '../../src/db/connection.js';
 import {
   createMessagingGroup,
   createMessagingGroupAgent,
@@ -75,7 +75,8 @@ async function main(): Promise<void> {
 
   // Init v2 DB
   fs.mkdirSync(path.join(process.cwd(), 'data'), { recursive: true });
-  const v2Db = initDb(path.join(DATA_DIR, 'v2.db'));
+  await initDb(path.join(DATA_DIR, 'v2.db'));
+  const v2Db = getRawDb();
   runMigrations(v2Db);
 
   let created = 0;

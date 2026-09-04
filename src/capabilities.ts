@@ -23,7 +23,7 @@ import path from 'path';
 import { GROUPS_DIR } from './config.js';
 import { getRegisteredChannelNames } from './channels/channel-registry.js';
 import { readContainerConfig } from './container-config.js';
-import { getDb } from './db/connection.js';
+import { getRawDb } from './db/connection.js';
 import { getAllAgentGroups, getAgentGroup, getWorkgroupOnecliSecrets } from './db/agent-groups.js';
 import { mergeWorkgroupAndGroupSecrets, slackUserTokenSecrets } from './onecli-secrets.js';
 import { GITHUB_APP_SENTINEL, peekGitHubAppTokenExpiry } from './github-app-token.js';
@@ -707,7 +707,7 @@ export function buildSessionServicesSnapshot(
     const ownerSafe =
       sessionKnown &&
       isOwnerSafeSlackSession(
-        getDb(),
+        getRawDb(),
         agentGroupId,
         sessionMessagingGroupId ?? null,
         cfg?.slack_user_token?.also_allowed_in,

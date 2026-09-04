@@ -12,7 +12,7 @@
 import fs from 'fs';
 import path from 'path';
 
-import { getDb } from '../../db/connection.js';
+import { getRawDb } from '../../db/connection.js';
 import { getContainerConfig } from '../../db/container-configs.js';
 import { getMessagingGroup } from '../../db/messaging-groups.js';
 import { getSessionsByAgentGroup } from '../../db/sessions.js';
@@ -187,7 +187,7 @@ export interface ReleaseState {
  * desk" rather than inventing one.
  */
 export function readReleaseState(workgroupId: string, groupsDir: string = GROUPS_DIR): ReleaseState | null {
-  const members = getDb().prepare('SELECT folder FROM agent_groups WHERE workgroup_id = ?').all(workgroupId) as {
+  const members = getRawDb().prepare('SELECT folder FROM agent_groups WHERE workgroup_id = ?').all(workgroupId) as {
     folder: string;
   }[];
 
@@ -226,7 +226,7 @@ export function decorateSteeredThreads(
   if (!state || state.items.length === 0) return state;
   let rows: { item_id: string; thread_id: string; created_at: string; by: string | null }[];
   try {
-    rows = getDb()
+    rows = getRawDb()
       .prepare(
         `SELECT t.item_id, t.thread_id, t.created_at, u.display_name AS by
            FROM observatory_item_threads t
@@ -550,7 +550,7 @@ function hasWorkgroupAccess(workgroupId: string, ctx: AuthedRequestContext): boo
   if (ctx.scopes.no_filter) return true;
   if (ctx.scopes.allowed_group_ids.length === 0) return false;
   const placeholders = ctx.scopes.allowed_group_ids.map(() => '?').join(', ');
-  const hit = getDb()
+  const hit = getRawDb()
     .prepare(`SELECT 1 FROM agent_groups WHERE workgroup_id = ? AND id IN (${placeholders}) LIMIT 1`)
     .get(workgroupId, ...ctx.scopes.allowed_group_ids);
   return !!hit;
@@ -603,7 +603,7 @@ interface WiringRow {
  * every platform shows.
  */
 export function observatoryHiddenRooms(workgroupId: string): string[] {
-  const members = getDb().prepare('SELECT folder FROM agent_groups WHERE workgroup_id = ?').all(workgroupId) as {
+  const members = getRawDb().prepare('SELECT folder FROM agent_groups WHERE workgroup_id = ?').all(workgroupId) as {
     folder: string;
   }[];
   for (const { folder } of members) {
@@ -618,7 +618,7 @@ export function observatoryHiddenRooms(workgroupId: string): string[] {
 }
 
 export function observatoryPlatforms(workgroupId: string): string[] | null {
-  const members = getDb().prepare('SELECT folder FROM agent_groups WHERE workgroup_id = ?').all(workgroupId) as {
+  const members = getRawDb().prepare('SELECT folder FROM agent_groups WHERE workgroup_id = ?').all(workgroupId) as {
     folder: string;
   }[];
   for (const { folder } of members) {
@@ -688,7 +688,7 @@ export function roomPermalink(platform: string, platformId: string): string | nu
 function threadChannelTypes(threadId: string): string[] {
   const prefix = threadId.split(':')[0] ?? '';
   try {
-    const rows = getDb()
+    const rows = getRawDb()
       .prepare(`SELECT DISTINCT channel_type FROM messaging_groups WHERE platform_id = ? ORDER BY channel_type`)
       .all(threadPlatformId(threadId)) as { channel_type: string }[];
     return [...rows.map((r) => r.channel_type), prefix];
@@ -736,7 +736,7 @@ export function threadPermalink(threadId: string): string | null {
 export function threadPlatformId(threadId: string): string {
   let known: Set<string> | undefined;
   try {
-    const rows = getDb().prepare('SELECT DISTINCT platform_id FROM messaging_groups').all() as {
+    const rows = getRawDb().prepare('SELECT DISTINCT platform_id FROM messaging_groups').all() as {
       platform_id: string;
     }[];
     known = new Set(rows.map((r) => r.platform_id));
@@ -747,7 +747,7 @@ export function threadPlatformId(threadId: string): string {
 }
 
 function buildRooms(workgroupId: string, allowed: string[] | null, hidden: string[] = []): ObservatoryRoom[] {
-  const wiringRows = getDb()
+  const wiringRows = getRawDb()
     .prepare(
       `SELECT mg.id AS messaging_group_id, mg.platform_id AS platform_id, mg.channel_type AS channel_type,
               mg.name AS name, ag.id AS agent_group_id
@@ -794,7 +794,7 @@ function buildRooms(workgroupId: string, allowed: string[] | null, hidden: strin
     // one shape, which is luck rather than a guarantee: any writer using
     // `datetime('now')` reintroduces the naive form and silently re-breaks this.
     // `datetime()` parses both shapes, so this stays correct by construction.
-    const activityRow = getDb()
+    const activityRow = getRawDb()
       .prepare(
         `SELECT last_outbound_at AS last FROM sessions
           WHERE messaging_group_id IN (${placeholders})
@@ -853,7 +853,7 @@ async function buildAgents(
   claims: ObservatoryClaim[],
   deps: ObservatoryDeps,
 ): Promise<ObservatoryAgent[]> {
-  const agentRows = getDb()
+  const agentRows = getRawDb()
     .prepare('SELECT * FROM agent_groups WHERE workgroup_id = ?')
     .all(workgroupId) as AgentGroup[];
 
@@ -922,7 +922,7 @@ async function buildAgents(
       // The agent's face: its own bot's Slack avatar, found via whichever of
       // its wired channel types carries a registered identity with an image.
       const lookup = deps.avatarByChannelType ?? ((ct: string) => getKnownSlackBots().get(ct)?.imageUrl ?? null);
-      const channelTypes = getDb()
+      const channelTypes = getRawDb()
         .prepare(
           `SELECT DISTINCT mg.channel_type FROM messaging_group_agents mga
              JOIN messaging_groups mg ON mg.id = mga.messaging_group_id
@@ -972,7 +972,7 @@ async function buildAgents(
  */
 function attachClaimSessions(workgroupId: string, claims: ObservatoryClaim[], agents: ObservatoryAgent[]): void {
   if (!claims.some((c) => c.threadId)) return;
-  const rows = getDb()
+  const rows = getRawDb()
     .prepare(
       `SELECT s.id, s.agent_group_id, s.thread_id, s.last_outbound_at
          FROM sessions s

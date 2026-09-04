@@ -35,7 +35,7 @@ vi.mock('../../session-manager.js', async (importOriginal) => {
   };
 });
 
-import { initTestDb, closeDb, getDb } from '../../db/connection.js';
+import { initTestDb, closeDb, getRawDb } from '../../db/connection.js';
 import { openInboundDb, openOutboundDbWritable } from '../../modules/mailbox/openers.js';
 import { ensureSchema } from '../../modules/mailbox/schema.js';
 import { taskThreadId } from '../../db/sessions.js';
@@ -53,8 +53,9 @@ function isoIn(ms: number): string {
   return new Date(NOW + ms).toISOString();
 }
 
-function setupCentralDb(): void {
-  const db = initTestDb();
+async function setupCentralDb(): Promise<void> {
+  await initTestDb();
+  const db = getRawDb();
   db.exec(`
     CREATE TABLE agent_groups (
       id TEXT PRIMARY KEY, name TEXT NOT NULL, folder TEXT NOT NULL UNIQUE,
@@ -96,43 +97,43 @@ function setupCentralDb(): void {
 }
 
 function addGroup(id: string, folder: string, workgroupId: string | null = null): void {
-  getDb()
+  getRawDb()
     .prepare(
       "INSERT INTO agent_groups (id, name, folder, agent_provider, created_at, workgroup_id) VALUES (?, ?, ?, 'claude', datetime('now'), ?)",
     )
     .run(id, id, folder, workgroupId);
 }
 function addWorkgroup(id: string, secrets: string[]): void {
-  getDb()
+  getRawDb()
     .prepare('INSERT INTO workgroups (id, display_name, onecli_secrets) VALUES (?, ?, ?)')
     .run(id, id, JSON.stringify(secrets));
 }
 function addMg(id: string, channelType: string, platformId: string, name: string): void {
-  getDb()
+  getRawDb()
     .prepare(
       "INSERT INTO messaging_groups (id, channel_type, platform_id, name, created_at) VALUES (?, ?, ?, ?, datetime('now'))",
     )
     .run(id, channelType, platformId, name);
 }
 function wire(mgId: string, agId: string): void {
-  getDb()
+  getRawDb()
     .prepare(
       "INSERT INTO messaging_group_agents (id, messaging_group_id, agent_group_id, created_at) VALUES (?, ?, ?, datetime('now'))",
     )
     .run(`mga-${mgId}-${agId}`, mgId, agId);
 }
 function addTaskSession(id: string, agentGroupId: string, seriesId = 'ser-1'): void {
-  getDb()
+  getRawDb()
     .prepare(
       "INSERT INTO sessions (id, agent_group_id, messaging_group_id, thread_id, status, container_status, created_at) VALUES (?, ?, NULL, ?, 'active', 'stopped', datetime('now'))",
     )
     .run(id, agentGroupId, taskThreadId(seriesId));
 }
 function addUser(id: string): void {
-  getDb().prepare("INSERT INTO users (id, kind, created_at) VALUES (?, 'phone', datetime('now'))").run(id);
+  getRawDb().prepare("INSERT INTO users (id, kind, created_at) VALUES (?, 'phone', datetime('now'))").run(id);
 }
 function grant(uid: string, role: string, ag: string | null): void {
-  getDb()
+  getRawDb()
     .prepare("INSERT INTO user_roles (user_id, role, agent_group_id, granted_at) VALUES (?, ?, ?, datetime('now'))")
     .run(uid, role, ag);
 }
@@ -221,18 +222,18 @@ async function readJson(res: Response): Promise<Record<string, unknown>> {
   return (await res.json()) as Record<string, unknown>;
 }
 
-beforeEach(() => {
+beforeEach(async () => {
   if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
   fs.mkdirSync(TEST_DIR, { recursive: true });
-  setupCentralDb();
+  await setupCentralDb();
   invalidateScheduledCache();
   _resetScheduledRateLimitForTesting();
   _setMoveTestOptions({ dataDir: TEST_DIR, nowMs: NOW });
 });
 
-afterEach(() => {
+afterEach(async () => {
   _setMoveTestOptions(null);
-  closeDb();
+  await closeDb();
   vi.restoreAllMocks();
   if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
 });
@@ -334,7 +335,7 @@ describe('movePreviewHandler', () => {
   it('test_preview_unwired_target', async () => {
     const { key } = seedMoveFixture();
     // Remove the target wiring.
-    getDb().prepare("DELETE FROM messaging_group_agents WHERE agent_group_id = 'tgt-ag'").run();
+    getRawDb().prepare("DELETE FROM messaging_group_agents WHERE agent_group_id = 'tgt-ag'").run();
     const res = (await movePreviewHandler(
       req({ targetAgentGroupId: 'tgt-ag', targetMessagingGroupId: 'tgt-mg' }),
       { key },
@@ -433,7 +434,7 @@ function liveRowsForSeries(
 
 /** Target session id for (tgt-ag, ser-1) — scheduleTask creates a per-series system session. */
 function targetSessionId(): string | null {
-  const row = getDb()
+  const row = getRawDb()
     .prepare(
       "SELECT id FROM sessions WHERE agent_group_id = 'tgt-ag' AND messaging_group_id IS NULL AND thread_id = ? AND status='active' LIMIT 1",
     )
@@ -666,7 +667,7 @@ describe('moveExecuteHandler', () => {
     const { key } = seedMoveFixture({ sourceProcessAfter: isoIn(10 * 3600_000) });
     await moveExecuteHandler(req(moveBody()), { key }, ctxFor('owner', OWNER_SCOPES));
     // A move_intent audit row was written, then resolved (resolved_at set, body purged).
-    const intent = getDb()
+    const intent = getRawDb()
       .prepare("SELECT detail_json, resolved_at FROM scheduled_audit WHERE action = 'move_intent'")
       .get() as { detail_json: string | null; resolved_at: string | null } | undefined;
     expect(intent).toBeDefined();
@@ -677,7 +678,7 @@ describe('moveExecuteHandler', () => {
   it('writes TWO-sided move audit sharing a correlation_id', async () => {
     const { key } = seedMoveFixture({ sourceProcessAfter: isoIn(10 * 3600_000) });
     await moveExecuteHandler(req(moveBody()), { key }, ctxFor('owner', OWNER_SCOPES));
-    const moveRows = getDb()
+    const moveRows = getRawDb()
       .prepare("SELECT agent_group_id, correlation_id FROM scheduled_audit WHERE action = 'move'")
       .all() as Array<{ agent_group_id: string; correlation_id: string }>;
     expect(moveRows).toHaveLength(2);
@@ -720,7 +721,7 @@ describe('moveExecuteHandler', () => {
     // cancel have committed. This exercises the genuine compensation path
     // (restoreTaskRow) rather than mocking — ESM namespace bindings are frozen,
     // so vi.spyOn can't replace scheduleTask anyway.
-    getDb().prepare("DELETE FROM messaging_group_agents WHERE agent_group_id = 'tgt-ag'").run();
+    getRawDb().prepare("DELETE FROM messaging_group_agents WHERE agent_group_id = 'tgt-ag'").run();
 
     const res = (await moveExecuteHandler(req(moveBody()), { key }, ctxFor('owner', OWNER_SCOPES)))!;
 
@@ -771,7 +772,9 @@ describe('moveExecuteHandler', () => {
 
     // Pre-cancel guard: NO side effect occurred — no move_intent audit row was
     // written, and no target session/row was created.
-    const auditRows = getDb().prepare("SELECT COUNT(*) AS c FROM scheduled_audit WHERE series_id = 'ser-1'").get() as {
+    const auditRows = getRawDb()
+      .prepare("SELECT COUNT(*) AS c FROM scheduled_audit WHERE series_id = 'ser-1'")
+      .get() as {
       c: number;
     };
     expect(auditRows.c).toBe(0);
@@ -794,7 +797,7 @@ describe('moveExecuteHandler', () => {
     const res = (await moveExecuteHandler(req(moveBody()), { key }, ctxFor('owner', OWNER_SCOPES)))!;
     // Invariant violated (2 live rows post-move) → 500, intent left unresolved.
     expect(res.status).toBe(500);
-    const intent = getDb()
+    const intent = getRawDb()
       .prepare("SELECT detail_json, resolved_at FROM scheduled_audit WHERE action = 'move_intent'")
       .get() as { detail_json: string | null; resolved_at: string | null };
     expect(intent.resolved_at).toBeNull(); // E-2: NOT purged → recoverable
@@ -817,12 +820,12 @@ describe('moveExecuteHandler', () => {
     expect(res.status).toBe(500);
     expect((await readJson(res)).error).toBe('move_failed');
     // Intent left unresolved so the recovery sweep can repair it.
-    const intent = getDb().prepare("SELECT resolved_at FROM scheduled_audit WHERE action = 'move_intent'").get() as {
+    const intent = getRawDb().prepare("SELECT resolved_at FROM scheduled_audit WHERE action = 'move_intent'").get() as {
       resolved_at: string | null;
     };
     expect(intent.resolved_at).toBeNull();
     // No two-sided 'move' success audit was written.
-    const moveRows = getDb().prepare("SELECT COUNT(*) AS c FROM scheduled_audit WHERE action = 'move'").get() as {
+    const moveRows = getRawDb().prepare("SELECT COUNT(*) AS c FROM scheduled_audit WHERE action = 'move'").get() as {
       c: number;
     };
     expect(moveRows.c).toBe(0);
@@ -835,11 +838,11 @@ describe('moveExecuteHandler', () => {
   // restart. Asserted on the central sessions row, not the funnel.
   it('the compensation restore clears the source session quiet mark', async () => {
     const { key } = seedMoveFixture({ sourceProcessAfter: isoIn(10 * 3600_000) });
-    getDb().prepare("DELETE FROM messaging_group_agents WHERE agent_group_id = 'tgt-ag'").run();
+    getRawDb().prepare("DELETE FROM messaging_group_agents WHERE agent_group_id = 'tgt-ag'").run();
 
     // The mark a sweep took while the target insert was in flight.
     const stale = '2026-06-01T00:00:00.000Z';
-    getDb()
+    getRawDb()
       .prepare("UPDATE sessions SET last_active = ?, sweep_quiet_until = '2099-01-01T00:00:00.000Z' WHERE id = ?")
       .run(stale, 'src-sess');
 
@@ -848,7 +851,9 @@ describe('moveExecuteHandler', () => {
     // The restore must actually have happened, or the assertion below is vacuous.
     expect(liveRowsForSeries('src-ag', 'src-sess', 'ser-1')).toHaveLength(1);
 
-    const row = getDb().prepare('SELECT last_active, sweep_quiet_until FROM sessions WHERE id = ?').get('src-sess') as {
+    const row = getRawDb()
+      .prepare('SELECT last_active, sweep_quiet_until FROM sessions WHERE id = ?')
+      .get('src-sess') as {
       last_active: string | null;
       sweep_quiet_until: string | null;
     };
@@ -866,7 +871,7 @@ describe('moveExecuteHandler', () => {
     // mid-handler, so instead: pre-seed a corrupt SECOND target session row that
     // the {source,target} count would read. Simpler + deterministic: unwire +
     // corrupt the target's would-be session dir so the count read throws.
-    getDb().prepare("DELETE FROM messaging_group_agents WHERE agent_group_id = 'tgt-ag'").run();
+    getRawDb().prepare("DELETE FROM messaging_group_agents WHERE agent_group_id = 'tgt-ag'").run();
     // Pre-create the target system-session pointer + a CORRUPT inbound.db so
     // the post-cancel compensation count read throws → unreadable.
     addTaskSession('tgt-sess', 'tgt-ag');
@@ -879,7 +884,7 @@ describe('moveExecuteHandler', () => {
     // Unreadable count → NO restore → source stays terminal (cancelled), and the
     // move_restore_failed audit is written (recoverable, not silently healed).
     expect(liveRowsForSeries('src-ag', 'src-sess', 'ser-1')).toHaveLength(0);
-    const failRow = getDb()
+    const failRow = getRawDb()
       .prepare("SELECT COUNT(*) AS c FROM scheduled_audit WHERE action = 'move_restore_failed'")
       .get() as { c: number };
     expect(failRow.c).toBe(1);
@@ -920,8 +925,8 @@ describe('moveExecuteHandler', () => {
 
 // ── isCrossWorkgroup unit tests ───────────────────────────────────────────────
 describe('isCrossWorkgroup', () => {
-  beforeEach(() => {
-    setupCentralDb();
+  beforeEach(async () => {
+    await setupCentralDb();
     addWorkgroup('wg-alpha', []);
     addWorkgroup('wg-beta', []);
   });

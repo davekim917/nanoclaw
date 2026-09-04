@@ -1,6 +1,15 @@
 {
-  "upstream": "5c3082a1",
+  "upstream": "b76fcb3d",
   "files": {
+    "src/db/compose.ts": "9a3759ea37c30edb19789ddec35b377483156361d8bf32500710eb82f33314e6",
+    "src/db/driver-registry.test.ts": "455692c62d37316925b2ecb6ec35e9ef8fe75264af70c44f9a10d977df452d17",
+    "src/db/driver-registry.ts": "8e411599bd139d24c260c70919daa7873150dc8fe7414b1abe880f932e74e901",
+    "src/db/driver.ts": "c428d6bb6f8d0bcc2f3ad86791a8ca603f1508c0a0b03aac03d433d627ab34d7",
+    "src/db/drivers/shared.ts": "ab2ddde082fe0694caff63ece28a9736f64b005b0d8d3e0edb2e700ee371b96a",
+    "src/db/drivers/sqlite.conformance.test.ts": "125bf41ad6fb334f4311978808f49496d099697b2f8d0c3547d3593732a12cb7",
+    "src/db/drivers/sqlite.test.ts": "8a13be6f81e07101f78afcd24b26860d439b255d217d40eff88b2c12cef4b199",
+    "src/db/drivers/sqlite.ts": "9e6d25f73656665474d030070eb785053b3907cb668d00f56539bdbfe53852bc",
+    "src/db/testing/driver-conformance.ts": "772e60b40160d532f4a51cb4169ba18b4453f414110311092d1a03bd56f61d37",
     "src/host-lifecycle.ts": "fbf37333e51a27663e45402f1a20bfd1a837a7b0bcc9c30c3874d06268b8db3b"
   }
 }

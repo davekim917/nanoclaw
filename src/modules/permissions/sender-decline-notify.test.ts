@@ -26,7 +26,7 @@
 import fs from 'fs';
 import { beforeEach, afterEach, describe, expect, it, vi } from 'vitest';
 
-import { initTestDb, closeDb, runMigrations } from '../../db/index.js';
+import { initTestDb, closeDb, runMigrations, getRawDb } from '../../db/index.js';
 import { createAgentGroup } from '../../db/agent-groups.js';
 import { createMessagingGroup, createMessagingGroupAgent, updateMessagingGroup } from '../../db/messaging-groups.js';
 import { upsertUser } from './db/users.js';
@@ -70,8 +70,8 @@ vi.mock('./user-dm.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('./user-dm.js')>()),
   ensureUserDm: vi.fn(async (userId: string, instance?: string) => {
     ensureUserDmCalls.push({ userId, instance });
-    const { getDb } = await import('../../db/connection.js');
-    return getDb()
+    const { getRawDb } = await import('../../db/connection.js');
+    return getRawDb()
       .prepare(
         `SELECT mg.* FROM messaging_groups mg
            JOIN user_dms ud ON ud.messaging_group_id = mg.id
@@ -93,14 +93,15 @@ function now() {
 }
 
 async function db() {
-  const { getDb } = await import('../../db/connection.js');
-  return getDb();
+  const { getRawDb } = await import('../../db/connection.js');
+  return getRawDb();
 }
 
 beforeEach(async () => {
   if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
   fs.mkdirSync(TEST_DIR, { recursive: true });
-  const handle = initTestDb();
+  await initTestDb();
+  const handle = getRawDb();
   runMigrations(handle);
 
   // Side-effect import: registers the access gate AFTER the mocks are in
@@ -168,8 +169,8 @@ beforeEach(async () => {
   ensureUserDmCalls.length = 0;
 });
 
-afterEach(() => {
-  closeDb();
+afterEach(async () => {
+  await closeDb();
   if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
 });
 

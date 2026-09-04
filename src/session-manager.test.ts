@@ -62,7 +62,7 @@ import {
   reconcilePendingUpgradeContexts,
 } from './session-manager.js';
 import { inboundDbPath, outboundDbPath } from './mailbox/sqlite/paths.js';
-import { initTestDb, closeDb, runMigrations, createAgentGroup, getDb } from './db/index.js';
+import { initTestDb, closeDb, runMigrations, createAgentGroup, getRawDb } from './db/index.js';
 import { createSession } from './db/sessions.js';
 import { insertDeferredMessageWithContextIfNew } from './modules/mailbox/ops/ingress.js';
 import { insertRecurrence, insertTaskRow, type RecurringMessage } from './modules/scheduling/db.js';
@@ -262,9 +262,10 @@ describe('writeOutboundDirect', () => {
  * message is logged-and-dropped forever — the reset silently kills the chat.
  */
 describe('writeSessionMessage re-provisions a deleted session folder', () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     fs.rmSync(sessionDir(AG, SESS), { recursive: true, force: true });
-    const db = initTestDb();
+    await initTestDb();
+    const db = getRawDb();
     runMigrations(db);
     createAgentGroup({
       id: AG,
@@ -273,10 +274,10 @@ describe('writeSessionMessage re-provisions a deleted session folder', () => {
       agent_provider: null,
       created_at: new Date().toISOString(),
     });
-    getDb()
+    getRawDb()
       .prepare(`INSERT INTO workgroups (id, display_name, created_at) VALUES ('reset','Reset',?)`)
       .run(new Date().toISOString());
-    getDb().prepare(`UPDATE agent_groups SET workgroup_id = 'reset' WHERE id = ?`).run(AG);
+    getRawDb().prepare(`UPDATE agent_groups SET workgroup_id = 'reset' WHERE id = ?`).run(AG);
     const sess: Session = {
       id: SESS,
       agent_group_id: AG,
@@ -291,8 +292,8 @@ describe('writeSessionMessage re-provisions a deleted session folder', () => {
     createSession(sess);
   });
 
-  afterEach(() => {
-    closeDb();
+  afterEach(async () => {
+    await closeDb();
   });
 
   it('re-creates the folder + inbound.db and does not throw when the row still exists', async () => {
@@ -906,7 +907,7 @@ describe('writeSessionMessage re-provisions a deleted session folder', () => {
     fs.writeFileSync(path.join(memoryRoot, 'index.md'), '# Current canon\nlegacy upgrade context');
     fs.writeFileSync(path.join(memoryRoot, 'system', 'definition.md'), '# Definition\nfresh legacy context');
 
-    expect(await reconcilePendingUpgradeContexts(getDb(), ['reset'])).toEqual({
+    expect(await reconcilePendingUpgradeContexts(getRawDb(), ['reset'])).toEqual({
       sessions: 1,
       admitted: 1,
       mtimesRestored: 0,
@@ -1393,10 +1394,11 @@ describe('session migration pass preserves the idle clock', () => {
   const DATA_DIR = TEST_DATA_DIR;
   const OLD_SECONDS = Date.parse('2026-04-01T00:00:00.000Z') / 1000;
 
-  beforeEach(() => {
+  beforeEach(async () => {
     fs.rmSync(path.join(DATA_DIR, 'v2-sessions', MIGRATION_AG), { recursive: true, force: true });
     fs.rmSync(path.join(DATA_DIR, 'pending-upgrade-mtimes.json'), { force: true });
-    const db = initTestDb();
+    await initTestDb();
+    const db = getRawDb();
     runMigrations(db);
     createAgentGroup({
       id: MIGRATION_AG,
@@ -1405,14 +1407,14 @@ describe('session migration pass preserves the idle clock', () => {
       agent_provider: null,
       created_at: new Date().toISOString(),
     });
-    getDb()
+    getRawDb()
       .prepare(`INSERT INTO workgroups (id, display_name, created_at) VALUES ('mtime','Mtime',?)`)
       .run(new Date().toISOString());
-    getDb().prepare(`UPDATE agent_groups SET workgroup_id = 'mtime' WHERE id = ?`).run(MIGRATION_AG);
+    getRawDb().prepare(`UPDATE agent_groups SET workgroup_id = 'mtime' WHERE id = ?`).run(MIGRATION_AG);
   });
 
-  afterEach(() => {
-    closeDb();
+  afterEach(async () => {
+    await closeDb();
   });
 
   function seedSession(sessionId: string): void {
@@ -1441,7 +1443,10 @@ describe('session migration pass preserves the idle clock', () => {
     initSessionFolder(MIGRATION_AG, sessionId);
     const before = ageInbound(sessionId);
 
-    expect(await reconcilePendingUpgradeContexts(getDb(), ['mtime'])).toMatchObject({ sessions: 1, mtimesRestored: 0 });
+    expect(await reconcilePendingUpgradeContexts(getRawDb(), ['mtime'])).toMatchObject({
+      sessions: 1,
+      mtimesRestored: 0,
+    });
     expect(fs.statSync(inboundDbPath(MIGRATION_AG, sessionId)).mtimeMs).toBe(before);
   });
 
@@ -1469,7 +1474,7 @@ describe('session migration pass preserves the idle clock', () => {
     legacy.close();
     const before = ageInbound(sessionId);
 
-    expect(await reconcilePendingUpgradeContexts(getDb(), ['mtime'])).toMatchObject({
+    expect(await reconcilePendingUpgradeContexts(getRawDb(), ['mtime'])).toMatchObject({
       sessions: 1,
       admitted: 0,
       mtimesRestored: 1,
@@ -1490,7 +1495,7 @@ describe('session migration pass preserves the idle clock', () => {
     seedSession(sessionId);
     initSessionFolder(MIGRATION_AG, sessionId);
 
-    await reconcilePendingUpgradeContexts(getDb(), ['mtime']);
+    await reconcilePendingUpgradeContexts(getRawDb(), ['mtime']);
 
     expect(fs.existsSync(path.join(DATA_DIR, 'pending-upgrade-mtimes.json'))).toBe(false);
   });
@@ -1514,7 +1519,7 @@ describe('session migration pass preserves the idle clock', () => {
     fs.utimesSync(target, bumped, bumped);
 
     const { replayUpgradeMtimeManifest } = await import('./session-manager.js');
-    expect(replayUpgradeMtimeManifest(DATA_DIR, getDb())).toBe(1);
+    expect(replayUpgradeMtimeManifest(DATA_DIR, getRawDb())).toBe(1);
     expect(fs.statSync(target).mtimeMs).toBe(OLD_SECONDS * 1000);
     expect(fs.existsSync(path.join(DATA_DIR, 'pending-upgrade-mtimes.json'))).toBe(false);
     expect(stat.mtimeMs).toBeGreaterThan(0);
@@ -1561,7 +1566,7 @@ describe('session migration pass preserves the idle clock', () => {
     expect(Math.floor(outboundMtime)).toBe(writtenAtMs);
 
     const { replayUpgradeMtimeManifest } = await import('./session-manager.js');
-    expect(replayUpgradeMtimeManifest(DATA_DIR, getDb())).toBe(1);
+    expect(replayUpgradeMtimeManifest(DATA_DIR, getRawDb())).toBe(1);
     expect(fs.statSync(target).mtimeMs).toBe(OLD_SECONDS * 1000);
   });
 
@@ -1582,7 +1587,7 @@ describe('session migration pass preserves the idle clock', () => {
     fs.utimesSync(target, recent, recent);
 
     const { replayUpgradeMtimeManifest } = await import('./session-manager.js');
-    expect(replayUpgradeMtimeManifest(DATA_DIR, getDb())).toBe(0);
+    expect(replayUpgradeMtimeManifest(DATA_DIR, getRawDb())).toBe(0);
     expect(fs.statSync(target).mtimeMs).toBeGreaterThan(OLD_SECONDS * 1000);
   });
 
@@ -1611,7 +1616,7 @@ describe('session migration pass preserves the idle clock', () => {
     broken.exec('CREATE TABLE x (a)');
     broken.close();
 
-    const result = await reconcilePendingUpgradeContexts(getDb(), ['mtime']);
+    const result = await reconcilePendingUpgradeContexts(getRawDb(), ['mtime']);
     expect(result).toMatchObject({ sessions: 1, admitted: 0, skipped: 1, stubsRemoved: 1 });
 
     // The healthy session was migrated, not merely counted.
@@ -1689,7 +1694,7 @@ describe('session migration pass preserves the idle clock', () => {
     fs.writeFileSync(path.join(memoryRoot, 'system', 'definition.md'), '# Definition\nfresh context');
     const before = ageInbound(sessionId);
 
-    expect(await reconcilePendingUpgradeContexts(getDb(), ['mtime'])).toEqual({
+    expect(await reconcilePendingUpgradeContexts(getRawDb(), ['mtime'])).toEqual({
       sessions: 1,
       admitted: 0,
       mtimesRestored: 0,
@@ -1757,7 +1762,7 @@ describe('session migration pass preserves the idle clock', () => {
     fs.writeFileSync(path.join(memoryRoot, 'system', 'definition.md'), '# Definition\nfresh context');
     const before = ageInbound(sessionId);
 
-    expect(await reconcilePendingUpgradeContexts(getDb(), ['mtime'])).toEqual({
+    expect(await reconcilePendingUpgradeContexts(getRawDb(), ['mtime'])).toEqual({
       sessions: 1,
       // The committed admission is invisible to the counter — which is exactly
       // why the counter must not be what authorizes a clock rewind.
@@ -1798,7 +1803,7 @@ describe('session migration pass preserves the idle clock', () => {
     fs.utimesSync(outbound, bumped, bumped);
 
     const { replayUpgradeMtimeManifest } = await import('./session-manager.js');
-    expect(replayUpgradeMtimeManifest(DATA_DIR, getDb())).toBe(0);
+    expect(replayUpgradeMtimeManifest(DATA_DIR, getRawDb())).toBe(0);
     // Not rewound. Compared against the pre-pass clock rather than the exact
     // bumped value: utimes takes float seconds and ms -> s -> ns -> ms does not
     // always round-trip.
@@ -1834,7 +1839,7 @@ describe('session migration pass preserves the idle clock', () => {
     expect(writtenAtMs - fs.statSync(target).mtimeMs).toBeLessThan(2000);
 
     const { replayUpgradeMtimeManifest } = await import('./session-manager.js');
-    expect(replayUpgradeMtimeManifest(DATA_DIR, getDb())).toBe(1);
+    expect(replayUpgradeMtimeManifest(DATA_DIR, getRawDb())).toBe(1);
     expect(fs.statSync(target).mtimeMs).toBe(OLD_SECONDS * 1000);
   });
 
@@ -1882,7 +1887,7 @@ describe('session migration pass preserves the idle clock', () => {
     fs.writeFileSync(path.join(memoryRoot, 'system', 'definition.md'), '# Definition\nfresh context');
     const before = ageInbound(sessionId);
 
-    expect(await reconcilePendingUpgradeContexts(getDb(), ['mtime'])).toEqual({
+    expect(await reconcilePendingUpgradeContexts(getRawDb(), ['mtime'])).toEqual({
       sessions: 1,
       admitted: 1,
       mtimesRestored: 0,
@@ -2034,9 +2039,10 @@ describe('the shared-transcript migration is gone', () => {
 describe('writeSessionMessage evaluates its caller guard at the insert', () => {
   const GUARD_SESS = 'sess-guard';
 
-  beforeEach(() => {
+  beforeEach(async () => {
     fs.rmSync(sessionDir(AG, GUARD_SESS), { recursive: true, force: true });
-    const db = initTestDb();
+    await initTestDb();
+    const db = getRawDb();
     runMigrations(db);
     createAgentGroup({
       id: AG,
@@ -2059,9 +2065,9 @@ describe('writeSessionMessage evaluates its caller guard at the insert', () => {
     initSessionFolder(AG, GUARD_SESS);
   });
 
-  afterEach(() => {
+  afterEach(async () => {
     fs.rmSync(sessionDir(AG, GUARD_SESS), { recursive: true, force: true });
-    closeDb();
+    await closeDb();
   });
 
   function rowIds(): string[] {
@@ -2241,10 +2247,11 @@ describe('writeSessionMessage does not race an in-flight session archival', () =
     }
   }
 
-  beforeEach(() => {
+  beforeEach(async () => {
     fs.rmSync(sessionDir(AG, SESS), { recursive: true, force: true });
     fs.rmSync(journalPath(), { force: true });
-    const db = initTestDb();
+    await initTestDb();
+    const db = getRawDb();
     runMigrations(db);
     createAgentGroup({
       id: AG,
@@ -2253,10 +2260,10 @@ describe('writeSessionMessage does not race an in-flight session archival', () =
       agent_provider: null,
       created_at: new Date().toISOString(),
     });
-    getDb()
+    getRawDb()
       .prepare(`INSERT INTO workgroups (id, display_name, created_at) VALUES ('race','Race',?)`)
       .run(new Date().toISOString());
-    getDb().prepare(`UPDATE agent_groups SET workgroup_id = 'race' WHERE id = ?`).run(AG);
+    getRawDb().prepare(`UPDATE agent_groups SET workgroup_id = 'race' WHERE id = ?`).run(AG);
     createSession({
       id: SESS,
       agent_group_id: AG,
@@ -2271,10 +2278,10 @@ describe('writeSessionMessage does not race an in-flight session archival', () =
     initSessionFolder(AG, SESS);
   });
 
-  afterEach(() => {
+  afterEach(async () => {
     fs.rmSync(claimPath(), { force: true });
     fs.rmSync(journalPath(), { force: true });
-    closeDb();
+    await closeDb();
   });
 
   const message = (id: string) => ({
@@ -2315,7 +2322,7 @@ describe('writeSessionMessage does not race an in-flight session archival', () =
     // The reclaim finishes: line journalled, row closed, directory gone.
     // Releasing the claim lets the queued writer through.
     journalReclaim(SESS, 'active');
-    getDb().prepare("UPDATE sessions SET status = 'closed' WHERE id = ?").run(SESS);
+    getRawDb().prepare("UPDATE sessions SET status = 'closed' WHERE id = ?").run(SESS);
     reclaimDirectory();
     fs.mkdirSync(sessionDir(AG, SESS), { recursive: true });
     fs.rmSync(claimPath(), { force: true });
@@ -2332,7 +2339,7 @@ describe('writeSessionMessage does not race an in-flight session archival', () =
   // at src/modules/approvals/response-handler.ts:115.
   it('refuses a write to a session the reclaim finished with before it arrived', async () => {
     journalReclaim(SESS, 'active');
-    getDb().prepare("UPDATE sessions SET status = 'closed' WHERE id = ?").run(SESS);
+    getRawDb().prepare("UPDATE sessions SET status = 'closed' WHERE id = ?").run(SESS);
     reclaimDirectory();
     expect(fs.existsSync(inboundDbPath(AG, SESS)), 'nothing to observe changing').toBe(false);
 
@@ -2346,7 +2353,7 @@ describe('writeSessionMessage does not race an in-flight session archival', () =
   // predicate can reach: there is no row to read a status from.
   it('refuses a write to an orphan session the reclaim already took', async () => {
     journalReclaim(SESS, 'orphan');
-    getDb().prepare('DELETE FROM sessions WHERE id = ?').run(SESS);
+    getRawDb().prepare('DELETE FROM sessions WHERE id = ?').run(SESS);
     reclaimDirectory();
 
     await expect(writeSessionMessage(AG, SESS, message('orphan-late'))).rejects.toThrow(/has been reclaimed/);
@@ -2391,7 +2398,7 @@ describe('writeSessionMessage does not race an in-flight session archival', () =
   // refused. workgroup-memory.integration.test.ts writes to exactly such a
   // session and broke. `closed` is therefore NOT a reclaim signal.
   it('provisions a closed session that never had a directory', async () => {
-    getDb().prepare("UPDATE sessions SET status = 'closed' WHERE id = ?").run(SESS);
+    getRawDb().prepare("UPDATE sessions SET status = 'closed' WHERE id = ?").run(SESS);
     fs.rmSync(sessionDir(AG, SESS), { recursive: true, force: true });
 
     await expect(writeSessionMessage(AG, SESS, message('superseded-lineage'))).resolves.toBeUndefined();
@@ -2456,9 +2463,10 @@ describe('mailbox seam: ingress writes', () => {
     content: JSON.stringify({ text: 'through the seam' }),
   });
 
-  beforeEach(() => {
+  beforeEach(async () => {
     fs.rmSync(sessionDir(AG_ING, SESS_ING), { recursive: true, force: true });
-    const db = initTestDb();
+    await initTestDb();
+    const db = getRawDb();
     runMigrations(db);
     createAgentGroup({
       id: AG_ING,
@@ -2482,10 +2490,10 @@ describe('mailbox seam: ingress writes', () => {
     }
   });
 
-  afterEach(() => {
+  afterEach(async () => {
     fs.rmSync(sessionDir(AG_ING, SESS_ING), { recursive: true, force: true });
     fs.rmSync(sessionDir(AG_ING, 'sess-ingress-other'), { recursive: true, force: true });
-    closeDb();
+    await closeDb();
   });
 
   it('writeSessionMessage provisions through prepare() and never nests a same-key session', async () => {

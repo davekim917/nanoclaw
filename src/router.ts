@@ -33,7 +33,7 @@ import {
   getMessagingGroupWithAgentCount,
   updateMessagingGroup,
 } from './db/messaging-groups.js';
-import { getDb } from './db/connection.js';
+import { getRawDb } from './db/connection.js';
 import {
   claimChannelIngress,
   claimDeferredChannelIngress,
@@ -102,7 +102,7 @@ function adapterHasWorkspaceIdentity(channelType: string): boolean {
  * default rather than adopting an arbitrary channel's override.
  */
 function unanimousToneFor(agentGroupId: string, channelType: string): string | null {
-  const rows = getDb()
+  const rows = getRawDb()
     .prepare(
       `SELECT DISTINCT mga.default_tone AS tone
          FROM messaging_group_agents mga
@@ -114,7 +114,7 @@ function unanimousToneFor(agentGroupId: string, channelType: string): string | n
 }
 
 function inheritedAgentGroupFor(mg: MessagingGroup): { id: string; sourceMessagingGroupId: string } | null {
-  const db = getDb();
+  const db = getRawDb();
   let rows: Array<{ agent_group_id: string; messaging_group_id: string; cnt: number }>;
 
   if (isDiscordChannelType(mg.channel_type) && mg.platform_id.startsWith('discord:')) {
@@ -198,7 +198,7 @@ function isSoleInterceptResponder(mg: MessagingGroup, isMention: boolean, leadin
   if (isMention || mg.is_group === 0) return true;
   if (leadingMention) return false;
 
-  const winner = getDb()
+  const winner = getRawDb()
     .prepare(
       `WITH my_wg AS (
          SELECT DISTINCT COALESCE(ag.workgroup_id, ag.folder) AS wg

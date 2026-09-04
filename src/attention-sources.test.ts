@@ -16,7 +16,7 @@ import {
   type AttentionItem,
 } from './attention-sources.js';
 import { deriveThreadState, threadChannelKey, UNKNOWN_CHANNEL_KEY } from './dashboard/api/threads.js';
-import { closeDb, getDb, initTestDb } from './db/connection.js';
+import { closeDb, getRawDb, initTestDb } from './db/connection.js';
 import { runMigrations } from './db/migrations/index.js';
 
 /**
@@ -93,12 +93,13 @@ function itemsByKind(groupsRoot: string): Map<string, AttentionItem[]> {
 }
 
 function declare(value: string | null): void {
-  getDb().prepare(`UPDATE workgroups SET attention_sources = ? WHERE id = ?`).run(value, WORKGROUP);
+  getRawDb().prepare(`UPDATE workgroups SET attention_sources = ? WHERE id = ?`).run(value, WORKGROUP);
 }
 
-beforeEach(() => {
+beforeEach(async () => {
   clearAttentionMemo();
-  const db = initTestDb();
+  await initTestDb();
+  const db = getRawDb();
   runMigrations(db);
   db.prepare(
     `INSERT OR IGNORE INTO workgroups (id, display_name, onecli_secrets, created_at)
@@ -106,10 +107,10 @@ beforeEach(() => {
   ).run(WORKGROUP, 'Example Labs');
 });
 
-afterEach(() => {
+afterEach(async () => {
   vi.restoreAllMocks();
   clearAttentionMemo();
-  closeDb();
+  await closeDb();
   while (tmpdirs.length) fs.rmSync(tmpdirs.pop()!, { recursive: true, force: true });
 });
 

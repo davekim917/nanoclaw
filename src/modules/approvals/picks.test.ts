@@ -11,7 +11,7 @@ import {
   registerChannelAdapter,
   teardownChannelAdapters,
 } from '../../channels/channel-registry.js';
-import { closeDb, createAgentGroup, initTestDb, runMigrations } from '../../db/index.js';
+import { closeDb, createAgentGroup, initTestDb, runMigrations, getRawDb } from '../../db/index.js';
 import { createUser } from '../permissions/db/users.js';
 import { grantRole } from '../permissions/db/user-roles.js';
 import { pickApprovalDelivery, pickApprover } from './primitive.js';
@@ -20,14 +20,15 @@ function now(): string {
   return new Date().toISOString();
 }
 
-beforeEach(() => {
-  const db = initTestDb();
+beforeEach(async () => {
+  await initTestDb();
+  const db = getRawDb();
   runMigrations(db);
 });
 
 afterEach(async () => {
   await teardownChannelAdapters();
-  closeDb();
+  await closeDb();
 });
 
 async function mountMockAdapter(

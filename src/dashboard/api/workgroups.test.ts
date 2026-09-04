@@ -22,7 +22,7 @@ vi.mock('../../config.js', async (importOriginal) => ({
 
 const { TEST_DIR } = vi.hoisted(() => ({ TEST_DIR: uniqueTmpRoot('workgroups-api-test') }));
 
-import { initTestDb, closeDb, getDb } from '../../db/connection.js';
+import { initTestDb, closeDb, getRawDb } from '../../db/connection.js';
 import { openInboundDb } from '../../modules/mailbox/openers.js';
 import { ensureSchema } from '../../modules/mailbox/schema.js';
 import { invalidateScheduledCache } from './scheduled-shared.js';
@@ -56,8 +56,9 @@ function makeReq(url: string): Request {
   return new Request(url);
 }
 
-function setupDb(): void {
-  const db = initTestDb();
+async function setupDb(): Promise<void> {
+  await initTestDb();
+  const db = getRawDb();
   db.exec(`
     CREATE TABLE agent_groups (
       id TEXT PRIMARY KEY, name TEXT NOT NULL, folder TEXT NOT NULL UNIQUE,
@@ -89,13 +90,13 @@ function setupDb(): void {
 }
 
 function addWorkgroup(id: string, displayName: string | null = null): void {
-  getDb()
+  getRawDb()
     .prepare("INSERT INTO workgroups (id, display_name, created_at) VALUES (?, ?, datetime('now'))")
     .run(id, displayName);
 }
 
 function addGroup(id: string, workgroupId: string, name = id): void {
-  getDb()
+  getRawDb()
     .prepare(
       "INSERT INTO agent_groups (id, name, folder, agent_provider, workgroup_id, created_at) VALUES (?, ?, ?, 'claude', ?, datetime('now'))",
     )
@@ -103,7 +104,7 @@ function addGroup(id: string, workgroupId: string, name = id): void {
 }
 
 function addSession(id: string, agentGroupId: string): void {
-  getDb()
+  getRawDb()
     .prepare("INSERT INTO sessions (id, agent_group_id, status, created_at) VALUES (?, ?, 'active', datetime('now'))")
     .run(id, agentGroupId);
 }
@@ -122,7 +123,7 @@ function addUsage(
     cost_usd: number;
   }> & { date: string; agent_group_id: string },
 ): void {
-  getDb()
+  getRawDb()
     .prepare(
       `INSERT INTO usage_daily (date, agent_group_id, provider, model, turns, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cost_usd)
        VALUES (@date, @agent_group_id, @provider, @model, @turns, @input_tokens, @output_tokens, @cache_read_tokens, @cache_write_tokens, @cost_usd)`,
@@ -187,15 +188,15 @@ function releasesDir(workgroupId: string): string {
   return path.join(TEST_DIR, 'groups', workgroupId, 'releases');
 }
 
-beforeEach(() => {
-  setupDb();
+beforeEach(async () => {
+  await setupDb();
   invalidateScheduledCache();
   _resetAssemblyInFlightForTesting();
   fs.rmSync(TEST_DIR, { recursive: true, force: true });
 });
 
-afterEach(() => {
-  closeDb();
+afterEach(async () => {
+  await closeDb();
   fs.rmSync(TEST_DIR, { recursive: true, force: true });
   vi.clearAllMocks();
 });

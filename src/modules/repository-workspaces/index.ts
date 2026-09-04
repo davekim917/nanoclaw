@@ -12,7 +12,7 @@ import {
 } from '../../container-restart.js';
 import { REPOSITORY_MOUNT_QUIESCENCE_TIMEOUT_MS } from '../../config.js';
 import { getAgentGroup, getAllAgentGroups } from '../../db/agent-groups.js';
-import { getDb } from '../../db/connection.js';
+import { getRawDb } from '../../db/connection.js';
 import { getMessagingGroup } from '../../db/messaging-groups.js';
 import { getSessionsByAgentGroup } from '../../db/sessions.js';
 import { registerDeliveryAction } from '../../delivery.js';
@@ -723,7 +723,7 @@ export async function applyRepositoryRefreshAction(content: Record<string, unkno
 }
 
 function sessionsForWorkUnit(workUnit: RepositoryWorkUnit): Array<Session & { platform_id: string | null }> {
-  const rows = getDb()
+  const rows = getRawDb()
     .prepare(
       `SELECT s.*, mg.platform_id
          FROM sessions s
@@ -908,7 +908,7 @@ export async function applyRepositoryTransferAction(content: Record<string, unkn
     const workgroupId = workgroupForSession(session);
     const destination = workUnitForSession(session, workgroupId);
     if (destination.key !== destinationWorkUnitKey) throw new Error('destination repository work-unit changed');
-    const sourceRows = getDb()
+    const sourceRows = getRawDb()
       .prepare(
         `SELECT s.id, s.messaging_group_id, s.thread_id, mg.platform_id
            FROM sessions s

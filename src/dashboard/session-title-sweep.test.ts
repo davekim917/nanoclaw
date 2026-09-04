@@ -3,7 +3,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 
-import { closeDb, initTestDb, runMigrations, createAgentGroup, getDb } from '../db/index.js';
+import { closeDb, initTestDb, runMigrations, createAgentGroup, getRawDb } from '../db/index.js';
 import { log } from '../log.js';
 
 // The sweep reads inbound/outbound DBs from `${DATA_DIR}/v2-sessions/...`.
@@ -86,8 +86,9 @@ const CREDENTIAL_ENV_KEYS = [
 
 let originalCredentialEnv: Partial<Record<(typeof CREDENTIAL_ENV_KEYS)[number], string>>;
 
-function setupDb(): void {
-  const db = initTestDb();
+async function setupDb(): Promise<void> {
+  await initTestDb();
+  const db = getRawDb();
   db.pragma('foreign_keys = ON');
   runMigrations(db);
 }
@@ -101,7 +102,7 @@ function seedSession(
   agentGroupId: string,
   opts: { title?: string | null; title_generated_at?: string | null; title_basis_seq?: number | null } = {},
 ): void {
-  getDb()
+  getRawDb()
     .prepare(
       // Distinct thread per session, mirroring real task sessions
       // (`system:tasks:<seriesId>`) — migration 049 folds NULLs, so two
@@ -110,7 +111,7 @@ function seedSession(
     )
     .run(id, agentGroupId, `system:tasks:${id}`, now());
   if (opts.title !== undefined || opts.title_generated_at !== undefined || opts.title_basis_seq !== undefined) {
-    getDb()
+    getRawDb()
       .prepare(`UPDATE sessions SET title = ?, title_generated_at = ?, title_basis_seq = ? WHERE id = ?`)
       .run(opts.title ?? null, opts.title_generated_at ?? null, opts.title_basis_seq ?? null, id);
   }
@@ -160,9 +161,9 @@ function writeInboundMessages(
   return seq;
 }
 
-beforeEach(() => {
+beforeEach(async () => {
   TMP_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'session-title-'));
-  setupDb();
+  await setupDb();
   seedAgentGroup('ag-1');
 
   originalCredentialEnv = {};
@@ -185,8 +186,8 @@ beforeEach(() => {
   __setCredentialRotationGateMinIntervalForTest(0);
 });
 
-afterEach(() => {
-  closeDb();
+afterEach(async () => {
+  await closeDb();
   _resetTitleBackendForTest();
   // The cooldown tests below deliberately trip the breaker, which engages a
   // real cooldown in this module-level singleton state. Without a reset,
@@ -228,7 +229,7 @@ describe('runSessionTitleSweep', () => {
     const result = await runSessionTitleSweep();
     expect(result.generated).toBe(1);
 
-    const row = getDb()
+    const row = getRawDb()
       .prepare('SELECT title, title_basis_seq, title_generated_at FROM sessions WHERE id = ?')
       .get('sess-fresh') as { title: string; title_basis_seq: number; title_generated_at: string };
     expect(row.title).toBe('EXAMPLE-71 rollout fix');
@@ -305,7 +306,7 @@ describe('runSessionTitleSweep', () => {
     const result = await runSessionTitleSweep();
     expect(result.generated).toBe(1);
 
-    const row = getDb().prepare('SELECT title FROM sessions WHERE id = ?').get('sess-busy') as { title: string };
+    const row = getRawDb().prepare('SELECT title FROM sessions WHERE id = ?').get('sess-busy') as { title: string };
     expect(row.title).toBe('refreshed title');
   });
 
@@ -346,8 +347,8 @@ describe('runSessionTitleSweep', () => {
     expect(result.generated).toBe(1);
     expect(result.skipped).toBe(1);
 
-    const ok = getDb().prepare('SELECT title FROM sessions WHERE id = ?').get('sess-ok') as { title: string | null };
-    const fail = getDb().prepare('SELECT title FROM sessions WHERE id = ?').get('sess-fail') as {
+    const ok = getRawDb().prepare('SELECT title FROM sessions WHERE id = ?').get('sess-ok') as { title: string | null };
+    const fail = getRawDb().prepare('SELECT title FROM sessions WHERE id = ?').get('sess-fail') as {
       title: string | null;
     };
     expect(ok.title).toBe('all good');
@@ -391,7 +392,7 @@ describe('runSessionTitleSweep', () => {
     // Every failed candidate is still stamped so it doesn't clog next tick —
     // the breaker changes LOGGING, not the existing backoff/retry semantics.
     for (let i = 1; i <= 3; i++) {
-      const row = getDb()
+      const row = getRawDb()
         .prepare('SELECT title, title_generated_at FROM sessions WHERE id = ?')
         .get(`sess-429-${i}`) as { title: string | null; title_generated_at: string | null };
       expect(row.title).toBeNull();
@@ -480,7 +481,7 @@ describe('runSessionTitleSweep', () => {
       expect(breakerWarns.length).toBe(0);
       expect(cooldownWarns.length).toBe(0);
 
-      const row = getDb().prepare('SELECT title FROM sessions WHERE id = ?').get('sess-rotate') as {
+      const row = getRawDb().prepare('SELECT title FROM sessions WHERE id = ?').get('sess-rotate') as {
         title: string | null;
       };
       expect(row.title).toBe('EXAMPLE-71 rollout fix');
@@ -626,7 +627,7 @@ describe('runSessionTitleSweep', () => {
       const result = await runSessionTitleSweep();
       expect(result).toEqual({ generated: 0, skipped: 0 });
       // No row should be stamped — gate runs BEFORE pickCandidates.
-      const row = getDb()
+      const row = getRawDb()
         .prepare('SELECT title, title_generated_at FROM sessions WHERE id = ?')
         .get('sess-no-backend') as { title: string | null; title_generated_at: string | null };
       expect(row.title).toBeNull();
@@ -671,7 +672,7 @@ describe('runSessionTitleSweep', () => {
     // The failure stamps a recent `title_generated_at`; the candidate
     // query filters out rows with title_generated_at within the cooldown
     // window. Next sweep tick should not pick this session.
-    const row = getDb().prepare('SELECT title_generated_at FROM sessions WHERE id = ?').get('sess-fail') as {
+    const row = getRawDb().prepare('SELECT title_generated_at FROM sessions WHERE id = ?').get('sess-fail') as {
       title_generated_at: string | null;
     };
     expect(row.title_generated_at).toBeTruthy();
@@ -695,7 +696,7 @@ describe('runSessionTitleSweep', () => {
     const result = await runSessionTitleSweep();
     expect(result.generated).toBe(0);
     expect(backend).not.toHaveBeenCalled();
-    const row = getDb().prepare('SELECT title, title_generated_at FROM sessions WHERE id = ?').get('sess-empty') as {
+    const row = getRawDb().prepare('SELECT title, title_generated_at FROM sessions WHERE id = ?').get('sess-empty') as {
       title: string | null;
       title_generated_at: string | null;
     };
@@ -727,7 +728,9 @@ describe('runSessionTitleSweep', () => {
     const result = await runSessionTitleSweep();
     expect(result.generated).toBe(0);
     expect(backend).not.toHaveBeenCalled();
-    const row = getDb().prepare('SELECT title, title_generated_at FROM sessions WHERE id = ?').get('sess-unwoken') as {
+    const row = getRawDb()
+      .prepare('SELECT title, title_generated_at FROM sessions WHERE id = ?')
+      .get('sess-unwoken') as {
       title: string | null;
       title_generated_at: string | null;
     };
@@ -756,7 +759,7 @@ describe('runSessionTitleSweep', () => {
     setTitleBackendForTest(async () => 'Snowflake failure triage');
     const result = await runSessionTitleSweep();
     expect(result.generated).toBe(1);
-    const row = getDb().prepare('SELECT title FROM sessions WHERE id = ?').get('sess-later-woken') as {
+    const row = getRawDb().prepare('SELECT title FROM sessions WHERE id = ?').get('sess-later-woken') as {
       title: string | null;
     };
     expect(row.title).toBe('Snowflake failure triage');
@@ -771,18 +774,20 @@ describe('runSessionTitleSweep', () => {
     for (let i = 1; i <= 15; i++) {
       seedSession(`sess-empty-${i}`, 'ag-1');
       writeInboundMessages('ag-1', `sess-empty-${i}`, []);
-      getDb().prepare("UPDATE sessions SET last_active = '2026-01-01T00:00:00Z' WHERE id = ?").run(`sess-empty-${i}`);
+      getRawDb()
+        .prepare("UPDATE sessions SET last_active = '2026-01-01T00:00:00Z' WHERE id = ?")
+        .run(`sess-empty-${i}`);
     }
     seedSession('sess-real', 'ag-1');
     writeInboundMessages('ag-1', 'sess-real', [
       { kind: 'chat', content: JSON.stringify({ text: 'deploy the EXAMPLE-99 hotfix' }) },
     ]);
-    getDb().prepare('UPDATE sessions SET last_active = ? WHERE id = ?').run(now(), 'sess-real');
+    getRawDb().prepare('UPDATE sessions SET last_active = ? WHERE id = ?').run(now(), 'sess-real');
 
     setTitleBackendForTest(async () => 'EXAMPLE-99 hotfix deploy');
     const result = await runSessionTitleSweep();
 
-    const real = getDb().prepare('SELECT title FROM sessions WHERE id = ?').get('sess-real') as {
+    const real = getRawDb().prepare('SELECT title FROM sessions WHERE id = ?').get('sess-real') as {
       title: string | null;
     };
     expect(real.title).toBe('EXAMPLE-99 hotfix deploy'); // not starved

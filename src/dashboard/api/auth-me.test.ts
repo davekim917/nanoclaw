@@ -16,7 +16,7 @@ vi.mock('../router.js', async (importOriginal) => {
 });
 
 import http from 'http';
-import { closeDb, initTestDb, runMigrations, getDb } from '../../db/index.js';
+import { closeDb, initTestDb, runMigrations, getRawDb } from '../../db/index.js';
 import { authMeHandler } from './auth-me.js';
 import { requireAuth, registerCookieVerifier, clearCookieVerifier } from '../router.js';
 import * as accessMod from '../../modules/permissions/access.js';
@@ -26,26 +26,26 @@ function now(): string {
 }
 
 function insertUser(id: string): void {
-  getDb()
+  getRawDb()
     .prepare("INSERT OR IGNORE INTO users (id, kind, display_name, created_at) VALUES (?, 'dashboard', NULL, ?)")
     .run(id, now());
 }
 
 function insertAgentGroup(id: string): void {
-  getDb()
+  getRawDb()
     .prepare('INSERT OR IGNORE INTO agent_groups (id, name, folder, created_at) VALUES (?, ?, ?, ?)')
     .run(id, id, id, now());
 }
 
 function insertRole(userId: string, role: string, agentGroupId: string | null): void {
   if (agentGroupId !== null) {
-    getDb()
+    getRawDb()
       .prepare(
         'INSERT INTO user_roles (user_id, role, agent_group_id, granted_by, granted_at) VALUES (?, ?, ?, NULL, ?)',
       )
       .run(userId, role, agentGroupId, now());
   } else {
-    getDb()
+    getRawDb()
       .prepare(
         'INSERT INTO user_roles (user_id, role, agent_group_id, granted_by, granted_at) VALUES (?, ?, NULL, NULL, ?)',
       )
@@ -65,14 +65,15 @@ function makeReq(cookieHeader?: string): Request {
   return new Request('http://localhost:3000/dashboard/api/auth/me', { headers });
 }
 
-beforeEach(() => {
-  const db = initTestDb();
+beforeEach(async () => {
+  await initTestDb();
+  const db = getRawDb();
   runMigrations(db);
   vi.mocked(accessMod.canAccessAgentGroup).mockReturnValue({ allowed: true, reason: 'owner' });
 });
 
-afterEach(() => {
-  closeDb();
+afterEach(async () => {
+  await closeDb();
   clearCookieVerifier();
   vi.clearAllMocks();
 });
@@ -130,7 +131,7 @@ describe('authMeHandler', () => {
     insertUser('u1');
     insertAgentGroup('ag-1');
     // 'member' is not a valid UserRoleKind but we insert directly to test the handler
-    getDb()
+    getRawDb()
       .prepare(
         'INSERT INTO user_roles (user_id, role, agent_group_id, granted_by, granted_at) VALUES (?, ?, ?, NULL, ?)',
       )

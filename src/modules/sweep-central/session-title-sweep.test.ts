@@ -26,7 +26,7 @@ import path from 'path';
 import Database from 'better-sqlite3';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { closeDb, createAgentGroup, getDb, initTestDb, runMigrations } from '../../db/index.js';
+import { closeDb, createAgentGroup, getRawDb, initTestDb, runMigrations } from '../../db/index.js';
 import { _listSweepRegistrationsForTesting, SWEEP_DUTY_INVENTORY, type SweepTickContext } from '../../host-sweep.js';
 import {
   __resetCallHaikuSlotCacheForTest,
@@ -130,13 +130,13 @@ function seedSession(
   agentGroupId: string,
   opts: { title?: string | null; title_generated_at?: string | null; title_basis_seq?: number | null } = {},
 ): void {
-  getDb()
+  getRawDb()
     .prepare(
       "INSERT OR IGNORE INTO sessions (id, agent_group_id, messaging_group_id, thread_id, status, created_at) VALUES (?, ?, NULL, ?, 'active', ?)",
     )
     .run(id, agentGroupId, `system:tasks:${id}`, now());
   if (opts.title !== undefined || opts.title_generated_at !== undefined || opts.title_basis_seq !== undefined) {
-    getDb()
+    getRawDb()
       .prepare(`UPDATE sessions SET title = ?, title_generated_at = ?, title_basis_seq = ? WHERE id = ?`)
       .run(opts.title ?? null, opts.title_generated_at ?? null, opts.title_basis_seq ?? null, id);
   }
@@ -155,11 +155,12 @@ function writeInboundMessages(agentGroupId: string, sessionId: string, seqAndCon
   db.close();
 }
 
-beforeEach(() => {
+beforeEach(async () => {
   h.tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'session-title-central-'));
   // Truncate, never reassign: the tripwire factory closed over THIS array.
   h.spawns.length = 0;
-  const db = initTestDb();
+  await initTestDb();
+  const db = getRawDb();
   db.pragma('foreign_keys = ON');
   runMigrations(db);
   createAgentGroup({ id: 'ag-1', name: 'ag-1', folder: 'ag-1', agent_provider: null, created_at: now() });
@@ -168,8 +169,8 @@ beforeEach(() => {
   __setCredentialRotationGateMinIntervalForTest(0);
 });
 
-afterEach(() => {
-  closeDb();
+afterEach(async () => {
+  await closeDb();
   _resetTitleBackendForTest();
   _resetCooldownForTest();
   fs.rmSync(h.tmpDir, { recursive: true, force: true });
@@ -232,7 +233,7 @@ describe('F-4.3a — session-title sweep keeps its cap, cooldown and new-message
     setTitleBackendForTest(async () => 'refreshed title');
     const busyResult = await runSessionTitleSweep();
     expect(busyResult.generated).toBe(1);
-    const row = getDb().prepare('SELECT title FROM sessions WHERE id = ?').get('sess-busy') as { title: string };
+    const row = getRawDb().prepare('SELECT title FROM sessions WHERE id = ?').get('sess-busy') as { title: string };
     expect(row.title).toBe('refreshed title');
   });
 
@@ -267,7 +268,7 @@ describe('F-4.3a — session-title sweep keeps its cap, cooldown and new-message
     expect(first.generated).toBe(0);
     expect(first.skipped).toBe(1);
 
-    const row = getDb().prepare('SELECT title_generated_at FROM sessions WHERE id = ?').get('sess-fail') as {
+    const row = getRawDb().prepare('SELECT title_generated_at FROM sessions WHERE id = ?').get('sess-fail') as {
       title_generated_at: string | null;
     };
     expect(row.title_generated_at).toBeTruthy();

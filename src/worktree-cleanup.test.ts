@@ -29,7 +29,7 @@ vi.mock('./container-runner.js', async (importOriginal) => ({
 }));
 vi.mock('./db/connection.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('./db/connection.js')>()),
-  getDb: () => ({ prepare: () => ({ all: () => state.rows }) }),
+  getRawDb: () => ({ prepare: () => ({ all: () => state.rows }) }),
 }));
 // The GC's reclaim gate reads outbound state through the mailbox module's
 // read-only session (it is synchronous; the seam's session() is not), so that

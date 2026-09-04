@@ -18,7 +18,7 @@ import Database from 'better-sqlite3';
 
 import type { NanoclawMailboxSession } from '../../modules/mailbox/index.js';
 
-import { initTestDb, closeDb, getDb } from '../../db/connection.js';
+import { initTestDb, closeDb, getRawDb } from '../../db/connection.js';
 import { openInboundDb } from '../../modules/mailbox/openers.js';
 import { ensureSchema } from '../../modules/mailbox/schema.js';
 import { migration043 } from '../../db/migrations/043-scheduled-audit.js';
@@ -89,8 +89,9 @@ function isoIn(ms: number): string {
   return new Date(NOW + ms).toISOString();
 }
 
-function setupCentralDb(): void {
-  const db = initTestDb();
+async function setupCentralDb(): Promise<void> {
+  await initTestDb();
+  const db = getRawDb();
   db.exec(`
     CREATE TABLE agent_groups (id TEXT PRIMARY KEY, name TEXT NOT NULL, folder TEXT NOT NULL UNIQUE, agent_provider TEXT, created_at TEXT NOT NULL);
     CREATE TABLE messaging_groups (id TEXT PRIMARY KEY, channel_type TEXT NOT NULL, platform_id TEXT NOT NULL, name TEXT, created_at TEXT NOT NULL, UNIQUE(channel_type, platform_id));
@@ -115,10 +116,10 @@ function setupCentralDb(): void {
 }
 
 function addUser(id: string): void {
-  getDb().prepare("INSERT INTO users (id, kind, created_at) VALUES (?, 'phone', datetime('now'))").run(id);
+  getRawDb().prepare("INSERT INTO users (id, kind, created_at) VALUES (?, 'phone', datetime('now'))").run(id);
 }
 function grant(uid: string, role: string, ag: string | null): void {
-  getDb()
+  getRawDb()
     .prepare("INSERT INTO user_roles (user_id, role, agent_group_id, granted_at) VALUES (?, ?, ?, datetime('now'))")
     .run(uid, role, ag);
 }
@@ -239,10 +240,10 @@ function keyFor(seriesId: string): string {
   return encodeKey(AG, SESS, seriesId);
 }
 
-beforeEach(() => {
+beforeEach(async () => {
   if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
   fs.mkdirSync(TEST_DIR, { recursive: true });
-  setupCentralDb();
+  await setupCentralDb();
   invalidateScheduledCache();
   _resetScheduledRateLimitForTesting();
   mockWakeContainer.mockClear();
@@ -279,9 +280,9 @@ beforeEach(() => {
   grant('owner', 'owner', null);
 });
 
-afterEach(() => {
+afterEach(async () => {
   _setMutationsTestOptions(null);
-  closeDb();
+  await closeDb();
   vi.restoreAllMocks();
   if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
 });
@@ -299,12 +300,12 @@ afterEach(() => {
 // survive that rewrite unchanged.
 describe('scheduled mutations invalidate the quiet mark (S2-PR15 / F2)', () => {
   function markSessionQuiet(): void {
-    getDb()
+    getRawDb()
       .prepare("UPDATE sessions SET last_active = ?, sweep_quiet_until = '2099-01-01T00:00:00.000Z' WHERE id = ?")
       .run('2026-06-01T00:00:00.000Z', SESS);
   }
   function sessionRow(): { last_active: string | null; sweep_quiet_until: string | null } {
-    return getDb().prepare('SELECT last_active, sweep_quiet_until FROM sessions WHERE id = ?').get(SESS) as {
+    return getRawDb().prepare('SELECT last_active, sweep_quiet_until FROM sessions WHERE id = ?').get(SESS) as {
       last_active: string | null;
       sweep_quiet_until: string | null;
     };
@@ -418,7 +419,7 @@ describe('scheduled mutations invalidate the quiet mark (S2-PR15 / F2)', () => {
       recurrence: '0 9 * * *',
       process_after: isoIn(3600_000),
     });
-    getDb().prepare("UPDATE sessions SET status = 'closed' WHERE id = ?").run(SESS);
+    getRawDb().prepare("UPDATE sessions SET status = 'closed' WHERE id = ?").run(SESS);
 
     const res = (await editHandler(
       putReq({ cron: '0 6 * * *' }),
@@ -560,7 +561,7 @@ describe('editHandler', () => {
     // The live row's content is UNCHANGED.
     expect(liveRow('ser-1')!.content).toBe(original);
     // No audit row was written.
-    const audit = getDb().prepare("SELECT COUNT(*) AS c FROM scheduled_audit WHERE series_id = 'ser-1'").get() as {
+    const audit = getRawDb().prepare("SELECT COUNT(*) AS c FROM scheduled_audit WHERE series_id = 'ser-1'").get() as {
       c: number;
     };
     expect(audit.c).toBe(0);
@@ -607,7 +608,7 @@ describe('editHandler', () => {
     expect(res.status).toBe(400);
     // recurrence is UNCHANGED (never '' — '' is IS NOT NULL → firing-path runaway).
     expect(liveRow('ser-1')!.recurrence).toBe(original);
-    const audit = getDb().prepare("SELECT COUNT(*) AS c FROM scheduled_audit WHERE series_id = 'ser-1'").get() as {
+    const audit = getRawDb().prepare("SELECT COUNT(*) AS c FROM scheduled_audit WHERE series_id = 'ser-1'").get() as {
       c: number;
     };
     expect(audit.c).toBe(0);
@@ -811,7 +812,7 @@ describe('cancelHandler', () => {
     const res = (await cancelHandler(postReq(), { key: keyFor('ser-1') }, ctxFor('owner', OWNER_SCOPES)))!;
     expect(res.status).toBe(200);
     expect((await readJson(res)).cancelled).toBe(true);
-    const audit = getDb()
+    const audit = getRawDb()
       .prepare("SELECT 1 AS ok FROM scheduled_audit WHERE series_id = 'ser-1' AND action = 'cancel'")
       .get() as { ok: number } | undefined;
     expect(audit).toBeDefined();

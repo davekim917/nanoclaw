@@ -27,7 +27,7 @@ const { TEST_DIR } = vi.hoisted(() => ({ TEST_DIR: uniqueTmpRoot('test-cli-msggr
 
 import type { ChannelDefaults } from '../../channels/adapter.js';
 import { registerChannelAdapter } from '../../channels/channel-registry.js';
-import { initTestDb, closeDb, runMigrations } from '../../db/index.js';
+import { initTestDb, closeDb, runMigrations, getRawDb } from '../../db/index.js';
 import { getMessagingGroupByPlatform } from '../../db/messaging-groups.js';
 import { dispatch } from '../dispatch.js';
 // Side-effect import: registers the `messaging-groups-create` command.
@@ -43,14 +43,15 @@ const declared: ChannelDefaults = {
 registerChannelAdapter('declchan-mg', { factory: () => null, defaults: declared });
 
 describe('messaging-groups CLI create defaults instance to channel_type', () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
     fs.mkdirSync(TEST_DIR, { recursive: true });
-    runMigrations(initTestDb());
+    await initTestDb();
+    runMigrations(getRawDb());
   });
 
-  afterEach(() => {
-    closeDb();
+  afterEach(async () => {
+    await closeDb();
     if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
   });
 
@@ -87,14 +88,15 @@ describe('messaging-groups CLI create defaults instance to channel_type', () => 
 });
 
 describe('messaging-groups CLI create resolves unknown_sender_policy from the channel declaration', () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
     fs.mkdirSync(TEST_DIR, { recursive: true });
-    runMigrations(initTestDb());
+    await initTestDb();
+    runMigrations(getRawDb());
   });
 
-  afterEach(() => {
-    closeDb();
+  afterEach(async () => {
+    await closeDb();
     if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
   });
 

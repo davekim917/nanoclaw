@@ -723,7 +723,7 @@ describe('storage-manager.ts / storage-activity.ts contain no literal seam call'
       'src/config.ts': ['CONTAINER_IMAGE', 'CONTAINER_IMAGE_BASE', 'CONTAINER_INSTALL_LABEL', 'DATA_DIR'],
       'src/container-mounts.ts': ['runningContainerMounts as inspectRunningContainerMounts'],
       'src/container-runtime.ts': ['CONTAINER_RUNTIME_BIN'],
-      'src/db/connection.ts': ['getDb'],
+      'src/db/connection.ts': ['getRawDb'],
       'src/db/container-configs.ts': ['getAllContainerConfigs'],
       'src/log.ts': ['log'],
       'src/modules/mailbox/index.ts': ['sessionMailboxPath'],
@@ -788,7 +788,7 @@ describe('worktree-cleanup.ts contains no literal seam call, and the only contai
       'src/config.ts': ['DATA_DIR', 'GROUPS_DIR'],
       'src/container-mounts.ts': ['runningContainerMounts'],
       'src/container-runner.ts': ['isContainerRunning', 'isContainerSpawning'],
-      'src/db/connection.ts': ['getDb'],
+      'src/db/connection.ts': ['getRawDb'],
       'src/host-lifecycle.ts': ['onHostShutdown', 'onHostStart'],
       'src/log.ts': ['log'],
       // PR 7 moved this file's outbound read onto the seam, and the manifest

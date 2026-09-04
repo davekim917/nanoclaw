@@ -8,7 +8,7 @@
  * a retry / second message from the same unknown sender while a card is
  * still pending is silently dropped instead of spamming the admin.
  */
-import { getDb } from '../../../db/connection.js';
+import { getRawDb } from '../../../db/connection.js';
 
 export interface PendingSenderApproval {
   id: string;
@@ -27,7 +27,7 @@ export interface PendingSenderApproval {
 }
 
 export function createPendingSenderApproval(row: PendingSenderApproval): boolean {
-  const result = getDb()
+  const result = getRawDb()
     .prepare(
       `INSERT OR IGNORE INTO pending_sender_approvals (
          id, messaging_group_id, agent_group_id, sender_identity,
@@ -45,7 +45,7 @@ export function createPendingSenderApproval(row: PendingSenderApproval): boolean
 }
 
 export function getPendingSenderApproval(id: string): PendingSenderApproval | undefined {
-  return getDb().prepare('SELECT * FROM pending_sender_approvals WHERE id = ?').get(id) as
+  return getRawDb().prepare('SELECT * FROM pending_sender_approvals WHERE id = ?').get(id) as
     | PendingSenderApproval
     | undefined;
 }
@@ -58,13 +58,13 @@ export function getInFlightSenderApproval(
   messagingGroupId: string,
   senderIdentity: string,
 ): PendingSenderApproval | undefined {
-  return getDb()
+  return getRawDb()
     .prepare('SELECT * FROM pending_sender_approvals WHERE messaging_group_id = ? AND sender_identity = ?')
     .get(messagingGroupId, senderIdentity) as PendingSenderApproval | undefined;
 }
 
 export function deletePendingSenderApproval(id: string): void {
-  getDb().prepare('DELETE FROM pending_sender_approvals WHERE id = ?').run(id);
+  getRawDb().prepare('DELETE FROM pending_sender_approvals WHERE id = ?').run(id);
 }
 
 // ── Decline stamps (decline_notify dedupe) ──
@@ -108,7 +108,7 @@ export function isDeclineStampId(id: string): boolean {
 }
 
 export function getDeclineStampAt(messagingGroupId: string, senderIdentity: string): string | undefined {
-  const row = getDb()
+  const row = getRawDb()
     .prepare(
       `SELECT created_at FROM pending_sender_approvals
         WHERE messaging_group_id = ? AND sender_identity = ? AND id LIKE '${DECLINE_STAMP_ID_PREFIX}%'`,
@@ -129,7 +129,7 @@ export function upsertDeclineStamp(stamp: {
   agent_group_id: string;
   sender_identity: string;
 }): void {
-  getDb()
+  getRawDb()
     .prepare(
       `INSERT INTO pending_sender_approvals (
          id, messaging_group_id, agent_group_id, sender_identity,
@@ -161,7 +161,7 @@ export function upsertDeclineStamp(stamp: {
 
 /** Remove any decline stamp for this pair — real card rows are untouched. */
 export function clearDeclineStamp(messagingGroupId: string, senderIdentity: string): void {
-  getDb()
+  getRawDb()
     .prepare(
       `DELETE FROM pending_sender_approvals
         WHERE messaging_group_id = ? AND sender_identity = ? AND id LIKE '${DECLINE_STAMP_ID_PREFIX}%'`,

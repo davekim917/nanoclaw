@@ -35,7 +35,7 @@
  *     — iterates over `getSessionsByAgentGroup(agentGroupId)`)
  */
 import type { AgentDestination } from '../../../types.js';
-import { getDb } from '../../../db/connection.js';
+import { getRawDb } from '../../../db/connection.js';
 import { deletePoliciesTouching, removeMessagePolicy } from './agent-message-policies.js';
 
 /**
@@ -45,7 +45,7 @@ import { deletePoliciesTouching, removeMessagePolicy } from './agent-message-pol
  * container's inbound.db. See the top-of-file invariant.
  */
 export function createDestination(row: AgentDestination): void {
-  getDb()
+  getRawDb()
     .prepare(
       `INSERT INTO agent_destinations (agent_group_id, local_name, target_type, target_id, created_at)
        VALUES (@agent_group_id, @local_name, @target_type, @target_id, @created_at)`,
@@ -54,13 +54,13 @@ export function createDestination(row: AgentDestination): void {
 }
 
 export function getDestinations(agentGroupId: string): AgentDestination[] {
-  return getDb()
+  return getRawDb()
     .prepare('SELECT * FROM agent_destinations WHERE agent_group_id = ?')
     .all(agentGroupId) as AgentDestination[];
 }
 
 export function getDestinationByName(agentGroupId: string, localName: string): AgentDestination | undefined {
-  return getDb()
+  return getRawDb()
     .prepare('SELECT * FROM agent_destinations WHERE agent_group_id = ? AND local_name = ?')
     .get(agentGroupId, localName) as AgentDestination | undefined;
 }
@@ -71,14 +71,14 @@ export function getDestinationByTarget(
   targetType: 'channel' | 'agent',
   targetId: string,
 ): AgentDestination | undefined {
-  return getDb()
+  return getRawDb()
     .prepare('SELECT * FROM agent_destinations WHERE agent_group_id = ? AND target_type = ? AND target_id = ?')
     .get(agentGroupId, targetType, targetId) as AgentDestination | undefined;
 }
 
 /** Permission check: can this agent send to this target? */
 export function hasDestination(agentGroupId: string, targetType: 'channel' | 'agent', targetId: string): boolean {
-  const row = getDb()
+  const row = getRawDb()
     .prepare('SELECT 1 FROM agent_destinations WHERE agent_group_id = ? AND target_type = ? AND target_id = ? LIMIT 1')
     .get(agentGroupId, targetType, targetId);
   return !!row;
@@ -91,10 +91,10 @@ export function hasDestination(agentGroupId: string, targetType: 'channel' | 'ag
  */
 export function deleteDestination(agentGroupId: string, localName: string): void {
   // Resolve the target first so we can drop a matching policy for this edge (no ghost gate on re-wire).
-  const row = getDb()
+  const row = getRawDb()
     .prepare('SELECT target_type, target_id FROM agent_destinations WHERE agent_group_id = ? AND local_name = ?')
     .get(agentGroupId, localName) as { target_type: string; target_id: string } | undefined;
-  getDb()
+  getRawDb()
     .prepare('DELETE FROM agent_destinations WHERE agent_group_id = ? AND local_name = ?')
     .run(agentGroupId, localName);
   if (row?.target_type === 'agent') {
@@ -113,7 +113,7 @@ export function deleteDestination(agentGroupId: string, localName: string): void
  * below to find them BEFORE calling this (the rows are gone afterwards).
  */
 export function deleteAllDestinationsTouching(agentGroupId: string): void {
-  getDb()
+  getRawDb()
     .prepare('DELETE FROM agent_destinations WHERE agent_group_id = ? OR (target_type = ? AND target_id = ?)')
     .run(agentGroupId, 'agent', agentGroupId);
   deletePoliciesTouching(agentGroupId);
@@ -127,7 +127,7 @@ export function deleteAllDestinationsTouching(agentGroupId: string): void {
  * delete runs.
  */
 export function getDestinationReferencers(targetAgentGroupId: string): string[] {
-  const rows = getDb()
+  const rows = getRawDb()
     .prepare(
       "SELECT DISTINCT agent_group_id FROM agent_destinations WHERE target_type = 'agent' AND target_id = ? AND agent_group_id != ?",
     )

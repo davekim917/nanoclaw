@@ -7,22 +7,25 @@ import {
   type CapabilityConfig,
 } from './agent-group-capabilities.js';
 import { initTestDb, closeDb, runMigrations, createAgentGroup } from '../../../db/index.js';
-import { getDb } from '../../../db/connection.js';
+import { getRawDb } from '../../../db/connection.js';
 
 function createUser(id: string): void {
-  getDb().prepare(`INSERT INTO users (id, kind, created_at) VALUES (?, 'system', ?)`).run(id, new Date().toISOString());
+  getRawDb()
+    .prepare(`INSERT INTO users (id, kind, created_at) VALUES (?, 'system', ?)`)
+    .run(id, new Date().toISOString());
 }
 
 function now(): string {
   return new Date().toISOString();
 }
 
-afterEach(() => {
-  closeDb();
+afterEach(async () => {
+  await closeDb();
 });
 
-function setupDb(): void {
-  const db = initTestDb();
+async function setupDb(): Promise<void> {
+  await initTestDb();
+  const db = getRawDb();
   db.pragma('foreign_keys = ON');
   runMigrations(db);
 }
@@ -35,8 +38,8 @@ const defaultConfig: CapabilityConfig = {
 };
 
 describe('agent-group-capabilities CRUD', () => {
-  it('test_grant_then_has_capability', () => {
-    setupDb();
+  it('test_grant_then_has_capability', async () => {
+    await setupDb();
     createUser('user-system');
     createAgentGroup({ id: 'ag-x', name: 'X', folder: 'x', agent_provider: null, created_at: now() });
 
@@ -44,20 +47,20 @@ describe('agent-group-capabilities CRUD', () => {
     expect(hasOrchestratorCapability('ag-x')).toBe(true);
   });
 
-  it('test_has_capability_false_when_absent', () => {
-    setupDb();
+  it('test_has_capability_false_when_absent', async () => {
+    await setupDb();
     createAgentGroup({ id: 'ag-y', name: 'Y', folder: 'y', agent_provider: null, created_at: now() });
 
     expect(hasOrchestratorCapability('ag-y')).toBe(false);
   });
 
-  it('test_revoke_blocks_when_tasks_in_flight', () => {
-    setupDb();
+  it('test_revoke_blocks_when_tasks_in_flight', async () => {
+    await setupDb();
     createUser('user-system');
     createAgentGroup({ id: 'ag-x', name: 'X', folder: 'x', agent_provider: null, created_at: now() });
     grantCapability('ag-x', 'orchestrator', defaultConfig, 'user-system');
 
-    const db = getDb();
+    const db = getRawDb();
     db.exec(`INSERT INTO sessions (id, agent_group_id, created_at) VALUES ('sess-x', 'ag-x', '${now()}')`);
     db.exec(`
       INSERT INTO tasks (
@@ -71,8 +74,8 @@ describe('agent-group-capabilities CRUD', () => {
     expect(hasOrchestratorCapability('ag-x')).toBe(true);
   });
 
-  it('test_revoke_succeeds_when_no_tasks_in_flight', () => {
-    setupDb();
+  it('test_revoke_succeeds_when_no_tasks_in_flight', async () => {
+    await setupDb();
     createUser('user-system');
     createAgentGroup({ id: 'ag-x', name: 'X', folder: 'x', agent_provider: null, created_at: now() });
     grantCapability('ag-x', 'orchestrator', defaultConfig, 'user-system');
@@ -82,8 +85,8 @@ describe('agent-group-capabilities CRUD', () => {
     expect(hasOrchestratorCapability('ag-x')).toBe(false);
   });
 
-  it('test_get_config_returns_parsed', () => {
-    setupDb();
+  it('test_get_config_returns_parsed', async () => {
+    await setupDb();
     createUser('user-system');
     createAgentGroup({ id: 'ag-x', name: 'X', folder: 'x', agent_provider: null, created_at: now() });
 
@@ -101,8 +104,8 @@ describe('agent-group-capabilities CRUD', () => {
     expect(returned!.noProgressTimeoutSec).toBe(900);
   });
 
-  it('test_grant_is_idempotent', () => {
-    setupDb();
+  it('test_grant_is_idempotent', async () => {
+    await setupDb();
     createUser('user-system');
     createAgentGroup({ id: 'ag-x', name: 'X', folder: 'x', agent_provider: null, created_at: now() });
 

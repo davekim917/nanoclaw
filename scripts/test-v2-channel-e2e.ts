@@ -24,12 +24,13 @@ fs.mkdirSync(TEST_DIR, { recursive: true });
 // --- Step 1: Init central DB ---
 console.log('\n=== Step 1: Init central DB ===');
 
-import { initDb } from '../src/db/connection.js';
+import { initDb, getRawDb } from '../src/db/connection.js';
 import { runMigrations } from '../src/db/migrations/index.js';
 import { createAgentGroup } from '../src/db/agent-groups.js';
 import { createMessagingGroup, createMessagingGroupAgent } from '../src/db/messaging-groups.js';
 
-const centralDb = initDb(path.join(TEST_DIR, 'v2.db'));
+await initDb(path.join(TEST_DIR, 'v2.db'));
+const centralDb = getRawDb();
 runMigrations(centralDb);
 
 // Create groups dir for agent folder mount

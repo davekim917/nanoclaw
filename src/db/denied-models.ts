@@ -1,4 +1,4 @@
-import { getDb } from './connection.js';
+import { getRawDb } from './connection.js';
 
 /**
  * Operator-curated blocklist of forbidden (provider, slug) pairs.
@@ -21,15 +21,15 @@ export interface DeniedModel {
 
 export function listDeniedModels(provider?: string): DeniedModel[] {
   if (provider) {
-    return getDb()
+    return getRawDb()
       .prepare('SELECT * FROM denied_models WHERE provider = ? ORDER BY slug ASC')
       .all(provider) as DeniedModel[];
   }
-  return getDb().prepare('SELECT * FROM denied_models ORDER BY provider ASC, slug ASC').all() as DeniedModel[];
+  return getRawDb().prepare('SELECT * FROM denied_models ORDER BY provider ASC, slug ASC').all() as DeniedModel[];
 }
 
 export function getDeniedModel(provider: string, slug: string): DeniedModel | undefined {
-  return getDb().prepare('SELECT * FROM denied_models WHERE provider = ? AND slug = ?').get(provider, slug) as
+  return getRawDb().prepare('SELECT * FROM denied_models WHERE provider = ? AND slug = ?').get(provider, slug) as
     | DeniedModel
     | undefined;
 }
@@ -40,7 +40,7 @@ export function isDeniedModel(provider: string, slug: string): boolean {
 }
 
 export function addDeniedModel(provider: string, slug: string, reason: string | null): void {
-  getDb()
+  getRawDb()
     .prepare(
       `INSERT INTO denied_models (provider, slug, reason, created_at)
        VALUES (?, ?, ?, ?)`,
@@ -49,5 +49,5 @@ export function addDeniedModel(provider: string, slug: string, reason: string | 
 }
 
 export function removeDeniedModel(provider: string, slug: string): void {
-  getDb().prepare('DELETE FROM denied_models WHERE provider = ? AND slug = ?').run(provider, slug);
+  getRawDb().prepare('DELETE FROM denied_models WHERE provider = ? AND slug = ?').run(provider, slug);
 }

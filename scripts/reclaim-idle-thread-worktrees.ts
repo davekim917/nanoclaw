@@ -18,14 +18,14 @@
 import path from 'path';
 
 import { DATA_DIR } from '../src/config.js';
-import { getDb, initDb } from '../src/db/connection.js';
+import { getRawDb, initDb } from '../src/db/connection.js';
 import { getStorageReport } from '../src/storage-manager.js';
 
 const dryRun = process.argv.includes('--dry-run');
 
-initDb(path.join(DATA_DIR, 'v2.db'));
+await initDb(path.join(DATA_DIR, 'v2.db'));
 const running = new Set(
-  (getDb().prepare("SELECT id FROM sessions WHERE container_status = 'running'").all() as Array<{ id: string }>).map(
+  (getRawDb().prepare("SELECT id FROM sessions WHERE container_status = 'running'").all() as Array<{ id: string }>).map(
     (r) => r.id,
   ),
 );

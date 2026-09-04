@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
-import { closeDb, initTestDb } from '../db/connection.js';
+import { closeDb, initTestDb, getRawDb } from '../db/connection.js';
 import { runMigrations } from '../db/migrations/index.js';
 import { ALLOW, guard } from '../guard/index.js';
 import { observatoryAssign, type ObservatoryAssignPayload } from './observatory-assign-guard.js';
@@ -25,8 +25,9 @@ function decide(userId: string, payload: Partial<ObservatoryAssignPayload>, acto
 
 const wired = { agentGroupId: 'ag-wired', channelKey: 'slack:CEXAMPLE001', wiredToItemChannel: true };
 
-beforeEach(() => {
-  const db = initTestDb();
+beforeEach(async () => {
+  await initTestDb();
+  const db = getRawDb();
   runMigrations(db);
   db.exec(`
     INSERT INTO workgroups (id, created_at) VALUES ('wg-example', '2026-08-01T00:00:00.000Z');

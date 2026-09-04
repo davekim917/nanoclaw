@@ -36,7 +36,7 @@ vi.mock('../log.js', () => ({
 
 const TEST_DIR = '/tmp/nanoclaw-test-cli-delivery-action';
 
-import { closeDb, initTestDb, runMigrations } from '../db/index.js';
+import { closeDb, initTestDb, runMigrations, getRawDb } from '../db/index.js';
 import { getDeliveryAction } from '../delivery.js';
 import { log } from '../log.js';
 import { initSessionFolder } from '../session-manager.js';
@@ -77,22 +77,23 @@ function warnings(): string {
     .join('\n');
 }
 
-beforeEach(() => {
+beforeEach(async () => {
   fs.rmSync(TEST_DIR, { recursive: true, force: true });
   fs.mkdirSync(TEST_DIR, { recursive: true });
   // executeOnce (delivery-action.ts) unconditionally claims the request
   // against the central-DB execution ledger (request-ledger.ts) before
   // dispatching — the central DB must exist for the handler to reach dispatch
   // at all, let alone the response write these tests actually pin.
-  runMigrations(initTestDb());
+  await initTestDb();
+  runMigrations(getRawDb());
   vi.mocked(log.warn).mockClear();
   vi.mocked(log.info).mockClear();
   dispatch.mockReset();
   dispatch.mockResolvedValue({ id: 'req-1', ok: true, data: { groups: [] } });
 });
 
-afterEach(() => {
-  closeDb();
+afterEach(async () => {
+  await closeDb();
   fs.rmSync(TEST_DIR, { recursive: true, force: true });
 });
 

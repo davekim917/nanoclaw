@@ -33,7 +33,7 @@ vi.mock('../../session-manager.js', async (importOriginal) => {
         const localName = raceRevokes.localName;
         raceRevokes.sessionId = null;
         raceRevokes.localName = null;
-        const { getDb: centralDb } = await import('../../db/connection.js');
+        const { getRawDb: centralDb } = await import('../../db/connection.js');
         centralDb()
           .prepare('DELETE FROM agent_destinations WHERE agent_group_id = ? AND local_name = ?')
           .run(agentGroupId, localName);
@@ -43,7 +43,14 @@ vi.mock('../../session-manager.js', async (importOriginal) => {
   };
 });
 
-import { closeDb, createAgentGroup, createMessagingGroup, getDb, initTestDb, runMigrations } from '../../db/index.js';
+import {
+  closeDb,
+  createAgentGroup,
+  createMessagingGroup,
+  getRawDb,
+  initTestDb,
+  runMigrations,
+} from '../../db/index.js';
 import { ensureSchema } from '../mailbox/schema.js';
 import { createDestination } from './db/agent-destinations.js';
 import { writeDestinations } from './write-destinations.js';
@@ -69,9 +76,10 @@ function projectedNames(): string[] {
   return rows.map((r) => r.name);
 }
 
-beforeEach(() => {
+beforeEach(async () => {
   fs.mkdirSync(TEST_DIR, { recursive: true });
-  const db = initTestDb();
+  await initTestDb();
+  const db = getRawDb();
   runMigrations(db);
 
   createAgentGroup({
@@ -119,8 +127,8 @@ beforeEach(() => {
   raceRevokes.localName = null;
 });
 
-afterEach(() => {
-  closeDb();
+afterEach(async () => {
+  await closeDb();
   fs.rmSync(TEST_DIR, { recursive: true, force: true });
 });
 
@@ -149,7 +157,7 @@ describe('writeDestinations', () => {
 
     // The revocation is real in the central DB...
     expect(
-      getDb().prepare('SELECT local_name FROM agent_destinations WHERE agent_group_id = ?').all(AGENT_GROUP_ID),
+      getRawDb().prepare('SELECT local_name FROM agent_destinations WHERE agent_group_id = ?').all(AGENT_GROUP_ID),
     ).toEqual([{ local_name: 'keep' }]);
     // ...and the projection the container reads agrees with it. Resolved before
     // the funnel, this was ['keep', 'revoked'].

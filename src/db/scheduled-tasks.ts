@@ -30,7 +30,7 @@ import {
   setTaskRoutingPlatformId,
   withQuietInvalidationSync,
 } from './sessions.js';
-import { getDb } from './connection.js';
+import { getRawDb } from './connection.js';
 
 /** Did the row land, or was the session closed under us before the write? */
 type StampOutcome = 'written' | 'session-closed';
@@ -187,7 +187,7 @@ function resolveAndValidateDestination(def: TaskDef): { messagingGroupId: string
   // peer in between the wiring check and the peer SELECT. The inbound.db
   // INSERT happens later against a different DB file, but by then the
   // central wiring has been serialized under our writer lock.
-  const db = getDb();
+  const db = getRawDb();
   const validate = db.transaction((): { messagingGroupId: string } => {
     const mg = db
       .prepare('SELECT id FROM messaging_groups WHERE platform_id = ? AND channel_type = ?')

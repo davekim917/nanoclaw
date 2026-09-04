@@ -57,12 +57,12 @@ vi.mock('../session-manager.js', async (importOriginal) => {
     withExistingMailboxSession: async (agentGroupId: string, sessionId: string, action: never) => {
       if (raceCloses.sessionId === sessionId) {
         raceCloses.sessionId = null;
-        const { getDb: centralDb } = await import('./connection.js');
+        const { getRawDb: centralDb } = await import('./connection.js');
         centralDb().prepare("UPDATE sessions SET status = 'closed' WHERE id = ?").run(sessionId);
       }
       if (raceRevokes.sessionId === sessionId) {
         raceRevokes.sessionId = null;
-        const { getDb: centralDb } = await import('./connection.js');
+        const { getRawDb: centralDb } = await import('./connection.js');
         centralDb().prepare('DELETE FROM messaging_group_agents WHERE agent_group_id = ?').run(agentGroupId);
       }
       if (failsTaskWrite.sessionId === sessionId) {
@@ -81,7 +81,7 @@ vi.mock('../session-manager.js', async (importOriginal) => {
   };
 });
 
-import { initTestDb, closeDb, getDb } from './connection.js';
+import { initTestDb, closeDb, getRawDb } from './connection.js';
 import { ensureSchema } from '../modules/mailbox/schema.js';
 import { openInboundDb } from '../modules/mailbox/openers.js';
 import { scheduleTask, resolveActiveSession } from './scheduled-tasks.js';
@@ -109,7 +109,7 @@ function inboundPath(sessionId = SESSION_ID): string {
 }
 
 function taskInboundPath(seriesId: string): string {
-  const row = getDb()
+  const row = getRawDb()
     .prepare(
       "SELECT id FROM sessions WHERE agent_group_id = ? AND messaging_group_id IS NULL AND thread_id = ? AND status = 'active' LIMIT 1",
     )
@@ -120,7 +120,7 @@ function taskInboundPath(seriesId: string): string {
 
 /** The ACTIVE task session for a series — the lookup filters closed rows out. */
 function taskSessionIdFor(seriesId: string): string {
-  const row = getDb()
+  const row = getRawDb()
     .prepare(
       "SELECT id FROM sessions WHERE agent_group_id = ? AND messaging_group_id IS NULL AND thread_id = ? AND status = 'active' ORDER BY created_at DESC LIMIT 1",
     )
@@ -129,8 +129,9 @@ function taskSessionIdFor(seriesId: string): string {
   return row.id;
 }
 
-function setupCentralDb(): void {
-  const db = initTestDb();
+async function setupCentralDb(): Promise<void> {
+  await initTestDb();
+  const db = getRawDb();
   db.exec(`
     CREATE TABLE IF NOT EXISTS agent_groups (
       id TEXT PRIMARY KEY, name TEXT NOT NULL, folder TEXT NOT NULL UNIQUE,
@@ -178,7 +179,7 @@ function setupCentralDb(): void {
 }
 
 function seedActiveSession(sessionId = SESSION_ID): void {
-  const db = getDb();
+  const db = getRawDb();
   db.prepare(
     `INSERT OR IGNORE INTO sessions (id, agent_group_id, messaging_group_id, thread_id, agent_provider, status, container_status, last_active, created_at)
      VALUES (?, ?, ?, NULL, NULL, 'active', 'stopped', NULL, datetime('now'))`,
@@ -191,13 +192,13 @@ function seedInboundDb(sessionId = SESSION_ID): void {
   ensureSchema(inboundPath(sessionId), 'inbound');
 }
 
-beforeEach(() => {
+beforeEach(async () => {
   fs.mkdirSync(TEST_DIR, { recursive: true });
-  setupCentralDb();
+  await setupCentralDb();
 });
 
-afterEach(() => {
-  closeDb();
+afterEach(async () => {
+  await closeDb();
   if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
 });
 
@@ -210,7 +211,7 @@ describe('test_scheduleTask_rejects_unwired_destination', () => {
     // Seed a messaging group that exists but is NOT wired to AGENT_GROUP_ID.
     // This simulates the 2026-05-02 cross-tenant leak: a typo in agentGroupId
     // would route the task into a chat the agent isn't authorized for.
-    const db = getDb();
+    const db = getRawDb();
     db.prepare(
       `INSERT INTO messaging_groups (id, channel_type, platform_id, name, created_at)
        VALUES ('mg-unwired', 'discord', 'discord:test:unwired', 'unwired', datetime('now'))`,
@@ -261,7 +262,7 @@ describe('test_scheduleTask_rejects_cross_workgroup_peer', () => {
     seedActiveSession();
     seedInboundDb();
 
-    const db = getDb();
+    const db = getRawDb();
     // Seed AGENT_GROUP_ID with workgroup_id='wg-A' so the test exercises the
     // wg-A-vs-wg-other branch (not the scheduler-null branch).
     db.prepare(
@@ -296,7 +297,7 @@ describe('test_scheduleTask_rejects_cross_workgroup_peer', () => {
     seedActiveSession();
     seedInboundDb();
 
-    const db = getDb();
+    const db = getRawDb();
     // Scheduler has a real workgroup; peer has NULL → defensive boundary.
     db.prepare(
       `INSERT INTO agent_groups (id, name, folder, agent_provider, created_at, workgroup_id)
@@ -329,7 +330,7 @@ describe('test_scheduleTask_rejects_cross_workgroup_peer', () => {
     seedActiveSession();
     seedInboundDb();
 
-    const db = getDb();
+    const db = getRawDb();
     // Insert AGENT_GROUP_ID + give it a workgroup_id, then add a sibling in the same workgroup.
     db.prepare(
       `INSERT INTO agent_groups (id, name, folder, agent_provider, created_at, workgroup_id)
@@ -362,7 +363,7 @@ describe('test_scheduleTask_rejects_cross_workgroup_peer', () => {
     seedActiveSession();
     seedInboundDb();
 
-    const db = getDb();
+    const db = getRawDb();
     // AGENT_GROUP_ID gets an explicit NULL workgroup_id (the test fixture
     // doesn't insert it into agent_groups, so the row doesn't exist; we
     // insert with NULL to exercise the boundary).
@@ -417,7 +418,7 @@ describe('scheduleTask invalidates the target session quiet mark (S2-PR15)', () 
     const TASK_SESSION_ID = 'sess-task-quiet';
     const STALE = '2026-06-01T00:00:00.000Z';
     const MARK = '2099-01-01T00:00:00.000Z';
-    getDb()
+    getRawDb()
       .prepare(
         `INSERT INTO sessions (id, agent_group_id, messaging_group_id, thread_id, agent_provider, status,
                                container_status, last_active, sweep_quiet_until, created_at)
@@ -427,7 +428,7 @@ describe('scheduleTask invalidates the target session quiet mark (S2-PR15)', () 
     seedInboundDb(TASK_SESSION_ID);
 
     const read = (): { last_active: string | null; sweep_quiet_until: string | null } =>
-      getDb().prepare('SELECT last_active, sweep_quiet_until FROM sessions WHERE id = ?').get(TASK_SESSION_ID) as {
+      getRawDb().prepare('SELECT last_active, sweep_quiet_until FROM sessions WHERE id = ?').get(TASK_SESSION_ID) as {
         last_active: string | null;
         sweep_quiet_until: string | null;
       };
@@ -448,7 +449,7 @@ describe('scheduleTask invalidates the target session quiet mark (S2-PR15)', () 
 
     // The pre-created row is the one that was used — no fresh sibling was made,
     // which would put the marked row back out of the assertion's reach.
-    const sessions = getDb()
+    const sessions = getRawDb()
       .prepare("SELECT id FROM sessions WHERE agent_group_id = ? AND thread_id = ? AND status = 'active'")
       .all(AGENT_GROUP_ID, taskThreadId('s-quiet')) as Array<{ id: string }>;
     expect(sessions.map((r) => r.id)).toEqual([TASK_SESSION_ID]);
@@ -544,8 +545,11 @@ describe('scheduleTask invalidates the quiet mark in the same turn as the task-r
       .spyOn(sessionsModule, 'withQuietInvalidationSync')
       .mockImplementation(<T>(id: string, write: () => T) => {
         basis.push(
-          (getDb().prepare('SELECT last_active FROM sessions WHERE id = ?').get(id) as { last_active: string | null })
-            .last_active,
+          (
+            getRawDb().prepare('SELECT last_active FROM sessions WHERE id = ?').get(id) as {
+              last_active: string | null;
+            }
+          ).last_active,
         );
         return original(id, write);
       });
@@ -567,7 +571,7 @@ describe('scheduleTask invalidates the quiet mark in the same turn as the task-r
       { sessionId, quietUntil: '2099-01-01T00:00:00.000Z', lastActive: basis[0]! },
     ]);
 
-    const after = getDb().prepare('SELECT sweep_quiet_until FROM sessions WHERE id = ?').get(sessionId) as {
+    const after = getRawDb().prepare('SELECT sweep_quiet_until FROM sessions WHERE id = ?').get(sessionId) as {
       sweep_quiet_until: string | null;
     };
     expect(after.sweep_quiet_until, 'a mark computed before the write hid the task row').toBeNull();
@@ -698,7 +702,7 @@ describe('test_scheduleTask_inserts_new', () => {
     // SESSION too, so the console can show the task in the channel it is
     // routed to instead of an "Unrouted tasks" bucket. `messaging_group_id`
     // stays NULL — it is delivery.ts's task-session discriminator.
-    const session = getDb()
+    const session = getRawDb()
       .prepare("SELECT messaging_group_id, task_routing_platform_id FROM sessions WHERE thread_id = 'system:tasks:s1'")
       .get() as { messaging_group_id: string | null; task_routing_platform_id: string | null };
     expect(session.task_routing_platform_id).toBe(TEST_PLATFORM_ID);
@@ -938,7 +942,7 @@ describe('test_scheduleTask_resolves_session_when_missing', () => {
     });
 
     // A per-series system session row should now exist in the central DB.
-    const centralDb = getDb();
+    const centralDb = getRawDb();
     const sessionRow = centralDb
       .prepare(
         "SELECT id FROM sessions WHERE agent_group_id = ? AND messaging_group_id IS NULL AND thread_id = ? AND status = 'active' LIMIT 1",
@@ -986,7 +990,7 @@ describe('test_scheduleTask_leaves_the_container_owned_outbound_alone', () => {
 
     // First call creates the session and provisions both DBs.
     await scheduleTask({ ...base, id: 't-outbound-1', prompt: 'first' });
-    const sessionRow = getDb()
+    const sessionRow = getRawDb()
       .prepare(
         "SELECT id FROM sessions WHERE agent_group_id = ? AND messaging_group_id IS NULL AND thread_id = ? AND status = 'active' LIMIT 1",
       )
@@ -1044,14 +1048,14 @@ describe('test_scheduleTask_revalidates_the_session_after_the_await', () => {
     await scheduleTask({ ...base, id: 't-race-2', prompt: 'second' });
 
     // The old session really was closed, and it is NOT where the row went.
-    expect(getDb().prepare('SELECT status FROM sessions WHERE id = ?').get(firstId)).toMatchObject({
+    expect(getRawDb().prepare('SELECT status FROM sessions WHERE id = ?').get(firstId)).toMatchObject({
       status: 'closed',
     });
     const secondId = taskSessionIdFor('s-race');
     expect(secondId).not.toBe(firstId);
 
     // The task landed in the fresh ACTIVE session, so the sweep can still fire it.
-    expect(getDb().prepare('SELECT status FROM sessions WHERE id = ?').get(secondId)).toMatchObject({
+    expect(getRawDb().prepare('SELECT status FROM sessions WHERE id = ?').get(secondId)).toMatchObject({
       status: 'active',
     });
     const db = openInboundDb(inboundPath(secondId));
@@ -1084,7 +1088,7 @@ describe('test_scheduleTask_revalidates_the_session_after_the_await', () => {
     const sessionId = taskSessionIdFor('s-stamp');
     const stampOf = (): string | null =>
       (
-        getDb().prepare('SELECT task_routing_platform_id AS p FROM sessions WHERE id = ?').get(sessionId) as {
+        getRawDb().prepare('SELECT task_routing_platform_id AS p FROM sessions WHERE id = ?').get(sessionId) as {
           p: string | null;
         }
       ).p;
@@ -1093,13 +1097,13 @@ describe('test_scheduleTask_revalidates_the_session_after_the_await', () => {
     // A second messaging group the agent IS wired to, so the redirect is
     // legitimate at request time and only fails mid-flight.
     const OTHER_PLATFORM = 'discord:test:c1-other';
-    getDb()
+    getRawDb()
       .prepare(
         `INSERT INTO messaging_groups (id, channel_type, platform_id, name, is_group, unknown_sender_policy, created_at)
          VALUES ('mg-other-c1', ?, ?, 'Other', 1, 'public', ?)`,
       )
       .run(TEST_CHANNEL_TYPE, OTHER_PLATFORM, new Date().toISOString());
-    getDb()
+    getRawDb()
       .prepare(
         `INSERT INTO messaging_group_agents (id, messaging_group_id, agent_group_id, created_at)
          VALUES ('mga-other-c1', 'mg-other-c1', ?, ?)`,
@@ -1151,7 +1155,7 @@ describe('test_scheduleTask_revalidates_the_session_after_the_await', () => {
     const sessionId = taskSessionIdFor('s-write-fail');
     const stampOf = (): string | null =>
       (
-        getDb().prepare('SELECT task_routing_platform_id AS p FROM sessions WHERE id = ?').get(sessionId) as {
+        getRawDb().prepare('SELECT task_routing_platform_id AS p FROM sessions WHERE id = ?').get(sessionId) as {
           p: string | null;
         }
       ).p;
@@ -1160,13 +1164,13 @@ describe('test_scheduleTask_revalidates_the_session_after_the_await', () => {
     // A second wired messaging group, so the redirect is legitimate throughout
     // and only the write fails.
     const OTHER_PLATFORM = 'discord:test:c1-wf';
-    getDb()
+    getRawDb()
       .prepare(
         `INSERT INTO messaging_groups (id, channel_type, platform_id, name, is_group, unknown_sender_policy, created_at)
          VALUES ('mg-wf-c1', ?, ?, 'Other', 1, 'public', ?)`,
       )
       .run(TEST_CHANNEL_TYPE, OTHER_PLATFORM, new Date().toISOString());
-    getDb()
+    getRawDb()
       .prepare(
         `INSERT INTO messaging_group_agents (id, messaging_group_id, agent_group_id, created_at)
          VALUES ('mga-wf-c1', 'mg-wf-c1', ?, ?)`,
@@ -1233,7 +1237,7 @@ describe('test_scheduleTask_revalidates_the_session_after_the_await', () => {
     };
     const stampOf = (): string | null =>
       (
-        getDb().prepare('SELECT task_routing_platform_id AS p FROM sessions WHERE id = ?').get(sessionId) as {
+        getRawDb().prepare('SELECT task_routing_platform_id AS p FROM sessions WHERE id = ?').get(sessionId) as {
           p: string | null;
         }
       ).p;
@@ -1244,13 +1248,13 @@ describe('test_scheduleTask_revalidates_the_session_after_the_await', () => {
     // A second wired group, so the redirect is legitimate throughout and only
     // the central write fails.
     const OTHER_PLATFORM = 'discord:test:c1-sf';
-    getDb()
+    getRawDb()
       .prepare(
         `INSERT INTO messaging_groups (id, channel_type, platform_id, name, is_group, unknown_sender_policy, created_at)
          VALUES ('mg-sf-c1', ?, ?, 'Other', 1, 'public', ?)`,
       )
       .run(TEST_CHANNEL_TYPE, OTHER_PLATFORM, new Date().toISOString());
-    getDb()
+    getRawDb()
       .prepare(
         `INSERT INTO messaging_group_agents (id, messaging_group_id, agent_group_id, created_at)
          VALUES ('mga-sf-c1', 'mg-sf-c1', ?, ?)`,
@@ -1597,12 +1601,12 @@ describe('test_scheduleTask_revalidates_the_session_after_the_await', () => {
 describe('test_resolveActiveSession_unique_index_handles_race', () => {
   it('returns the existing session when UNIQUE constraint blocks a concurrent INSERT', async () => {
     // Apply the partial unique index that production runs in migration 024.
-    migration024.up(getDb());
+    migration024.up(getRawDb());
 
     // Seed an existing channel-root session — this is the row a "concurrent
     // winner" would have inserted just before this caller's INSERT runs.
     const winnerId = 'sess-winner';
-    getDb()
+    getRawDb()
       .prepare(
         `INSERT INTO sessions (id, agent_group_id, messaging_group_id, thread_id, agent_provider, status, container_status, last_active, created_at)
          VALUES (?, ?, ?, NULL, NULL, 'active', 'stopped', NULL, datetime('now'))`,
@@ -1647,9 +1651,9 @@ describe('test_resolveActiveSession_unique_index_handles_race', () => {
   });
 
   it('rejects a duplicate channel-root INSERT once the unique index is applied', () => {
-    migration024.up(getDb());
+    migration024.up(getRawDb());
 
-    getDb()
+    getRawDb()
       .prepare(
         `INSERT INTO sessions (id, agent_group_id, messaging_group_id, thread_id, agent_provider, status, container_status, last_active, created_at)
          VALUES ('sess-a', ?, ?, NULL, NULL, 'active', 'stopped', NULL, datetime('now'))`,
@@ -1658,7 +1662,7 @@ describe('test_resolveActiveSession_unique_index_handles_race', () => {
 
     // Second active channel-root row for same (agent, MG) pair must throw.
     expect(() =>
-      getDb()
+      getRawDb()
         .prepare(
           `INSERT INTO sessions (id, agent_group_id, messaging_group_id, thread_id, agent_provider, status, container_status, last_active, created_at)
            VALUES ('sess-b', ?, ?, NULL, NULL, 'active', 'stopped', NULL, datetime('now'))`,
@@ -1669,7 +1673,7 @@ describe('test_resolveActiveSession_unique_index_handles_race', () => {
 
   it('migration 024 dedupes existing duplicates by archiving the older rows', () => {
     // Pre-existing duplicates (legitimate state before the index was added).
-    getDb()
+    getRawDb()
       .prepare(
         `INSERT INTO sessions (id, agent_group_id, messaging_group_id, thread_id, agent_provider, status, container_status, last_active, created_at)
          VALUES ('sess-old', ?, ?, NULL, NULL, 'active', 'stopped', '2026-04-21T00:00:00Z', '2026-04-21T00:00:00Z'),
@@ -1677,9 +1681,9 @@ describe('test_resolveActiveSession_unique_index_handles_race', () => {
       )
       .run(AGENT_GROUP_ID, MESSAGING_GROUP_ID, AGENT_GROUP_ID, MESSAGING_GROUP_ID);
 
-    migration024.up(getDb());
+    migration024.up(getRawDb());
 
-    const rows = getDb()
+    const rows = getRawDb()
       .prepare('SELECT id, status FROM sessions WHERE agent_group_id = ? AND messaging_group_id = ? ORDER BY id')
       .all(AGENT_GROUP_ID, MESSAGING_GROUP_ID) as Array<{ id: string; status: string }>;
     const active = rows.filter((r) => r.status === 'active');

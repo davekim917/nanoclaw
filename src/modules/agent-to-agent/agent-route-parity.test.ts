@@ -118,10 +118,11 @@ describe('a2a parity with a normally-engaged session', () => {
 
     const { initTestDb, runMigrations, createAgentGroup } = await import('../../db/index.js');
     const { createMessagingGroup } = await import('../../db/messaging-groups.js');
-    const { getDb } = await import('../../db/connection.js');
+    const { getRawDb } = await import('../../db/connection.js');
     const { resolveSession } = await import('../../session-manager.js');
 
-    const db = initTestDb();
+    await initTestDb();
+    const db = getRawDb();
     runMigrations(db);
 
     createAgentGroup({ id: A, name: 'Source Agent', folder: 'src-agent', agent_provider: null, created_at: now() });
@@ -137,14 +138,14 @@ describe('a2a parity with a normally-engaged session', () => {
     });
     // Target wired to the same chat — without this the route falls back to an
     // agent-shared session with no chat surface (the cross-tenant gate).
-    getDb()
+    getRawDb()
       .prepare(
         `INSERT INTO messaging_group_agents (id, messaging_group_id, agent_group_id, engage_mode, sender_scope,
            ignored_message_policy, session_mode, priority, created_at)
          VALUES ('mga-1', ?, ?, 'mention', 'all', 'drop', 'per-thread', 0, ?)`,
       )
       .run(MG, B, now());
-    getDb()
+    getRawDb()
       .prepare(
         `INSERT INTO agent_destinations (agent_group_id, local_name, target_type, target_id, created_at)
          VALUES (?, 'target', 'agent', ?, ?)`,
@@ -156,7 +157,7 @@ describe('a2a parity with a normally-engaged session', () => {
 
   afterEach(async () => {
     const { closeDb } = await import('../../db/index.js');
-    closeDb();
+    await closeDb();
     if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true, force: true });
   });
 
@@ -179,8 +180,8 @@ describe('a2a parity with a normally-engaged session', () => {
   });
 
   it('does not backfill for an agent-shared target (no chat surface to read)', async () => {
-    const { getDb } = await import('../../db/connection.js');
-    getDb().prepare('DELETE FROM messaging_group_agents WHERE agent_group_id = ?').run(B);
+    const { getRawDb } = await import('../../db/connection.js');
+    getRawDb().prepare('DELETE FROM messaging_group_agents WHERE agent_group_id = ?').run(B);
     const fetchThreadHistory = vi.fn().mockResolvedValue([{ sender: 'Operator', text: 'hi', timestamp: now() }]);
     getChannelAdapter.mockReturnValue({ fetchThreadHistory });
 
@@ -204,13 +205,13 @@ describe('a2a parity with a normally-engaged session', () => {
    * gate to stop.
    */
   it('does not inherit the caller chat when the wiring is revoked during the return-path lookup', async () => {
-    const { getDb } = await import('../../db/connection.js');
+    const { getRawDb } = await import('../../db/connection.js');
     const fetchThreadHistory = vi.fn().mockResolvedValue([{ sender: 'Operator', text: 'hi', timestamp: now() }]);
     getChannelAdapter.mockReturnValue({ fetchThreadHistory });
 
     // Revoked inside the lookup, after the pre-check proved it.
     duringReturnPathLookup.run = () => {
-      getDb().prepare('DELETE FROM messaging_group_agents WHERE agent_group_id = ?').run(B);
+      getRawDb().prepare('DELETE FROM messaging_group_agents WHERE agent_group_id = ?').run(B);
     };
 
     await route(JSON.stringify({ text: 'do the thing' }), sourceSessionId);

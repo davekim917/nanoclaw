@@ -55,7 +55,7 @@
  * target to be indistinguishable from a missing one and a guard can only ever
  * answer "denied".
  */
-import { getDb } from '../db/index.js';
+import { getRawDb } from '../db/index.js';
 import { log } from '../log.js';
 import { ATTENTION_ITEM_PREFIX, type AttentionSourceEnv } from '../attention-sources.js';
 import { dispatch } from '../cli/dispatch.js';
@@ -203,7 +203,9 @@ export async function assignAttentionItem(
     return json(404, { error: 'not_found' });
   }
 
-  const agent = getDb().prepare(`SELECT * FROM agent_groups WHERE id = ?`).get(agentGroupId) as AgentGroup | undefined;
+  const agent = getRawDb().prepare(`SELECT * FROM agent_groups WHERE id = ?`).get(agentGroupId) as
+    | AgentGroup
+    | undefined;
   if (!agent) return json(404, { error: 'not_found' });
 
   // RESERVE BEFORE DISPATCH. A losing double-click fails here, having queued
@@ -252,7 +254,7 @@ export async function assignAttentionItem(
     return json(502, { error: 'task_create_failed' });
   }
 
-  const room = getDb()
+  const room = getRawDb()
     .prepare(`SELECT name, channel_type, platform_id FROM messaging_groups WHERE id = ?`)
     .get(target!.messaging_group_id) as { name: string; channel_type: string; platform_id: string } | undefined;
   const seriesId = (res.data as { series_id?: string } | null | undefined)?.series_id ?? null;

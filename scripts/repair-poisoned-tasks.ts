@@ -38,7 +38,7 @@ const APPLY = process.argv.includes('--apply');
 // `TIMEZONE` put every override group's repaired series one slot off until its
 // next normal re-arm. Opening the central DB is what `resolveGroupTimezone`
 // needs; the script only ever reads from it.
-initDb(path.join(DATA_DIR, 'v2.db'));
+await initDb(path.join(DATA_DIR, 'v2.db'));
 
 interface PendingRecurring {
   id: string;

@@ -555,8 +555,8 @@ interface WiredCandidate {
  * agent group actually belongs to.
  */
 async function taskSeriesCandidates(workgroupId: string, threadId: string): Promise<WiredCandidate[]> {
-  const { getDb } = await import('../../db/index.js');
-  const db = getDb();
+  const { getRawDb } = await import('../../db/index.js');
+  const db = getRawDb();
   const owner = db
     .prepare(
       `SELECT s.id AS sessionId, ag.id AS agentGroupId, ag.name AS name, ag.folder AS folder
@@ -670,13 +670,13 @@ async function seriesRoutingStamp(
  * one place the "which room can we actually reach?" question is answered.
  */
 export async function wiredCandidates(workgroupId: string, threadId: string): Promise<WiredCandidate[]> {
-  const [{ getDb }, { threadPlatformId }, { isTaskThread }] = await Promise.all([
+  const [{ getRawDb }, { threadPlatformId }, { isTaskThread }] = await Promise.all([
     import('../../db/index.js'),
     import('../../dashboard/api/observatory.js'),
     import('../../db/sessions.js'),
   ]);
   if (isTaskThread(threadId)) return taskSeriesCandidates(workgroupId, threadId);
-  return getDb()
+  return getRawDb()
     .prepare(
       `SELECT ag.id AS agentGroupId, ag.name AS name, ag.folder AS folder, mg.id AS messagingGroupId
          FROM messaging_group_agents mga

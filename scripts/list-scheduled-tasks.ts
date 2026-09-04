@@ -94,7 +94,7 @@ central.close();
 // Reopened through the shared connection so this report resolves a group's
 // timezone the same way the firing path does, instead of re-reading
 // container_configs itself. Read-only use.
-initDb(path.join(DATA_DIR, 'v2.db'));
+await initDb(path.join(DATA_DIR, 'v2.db'));
 
 function fmtWhen(iso: string | null, tz: string): string {
   if (!iso) return '-';

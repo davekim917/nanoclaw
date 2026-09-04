@@ -26,7 +26,7 @@ import '../src/channels/index.js';
 import { resolveUnknownSenderPolicy, resolveWiringDefaults } from '../src/channels/channel-defaults.js';
 import { DATA_DIR } from '../src/config.js';
 import { createAgentGroup, getAgentGroupByFolder } from '../src/db/agent-groups.js';
-import { initDb } from '../src/db/connection.js';
+import { initDb, getRawDb } from '../src/db/connection.js';
 import {
   createMessagingGroup,
   createMessagingGroupAgent,
@@ -88,7 +88,8 @@ function generateId(prefix: string): string {
 async function main(): Promise<void> {
   const args = parseArgs(process.argv.slice(2));
 
-  const db = initDb(path.join(DATA_DIR, 'v2.db'));
+  await initDb(path.join(DATA_DIR, 'v2.db'));
+  const db = getRawDb();
   runMigrations(db);
 
   const now = new Date().toISOString();

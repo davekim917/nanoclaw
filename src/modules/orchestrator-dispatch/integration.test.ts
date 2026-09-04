@@ -22,7 +22,7 @@ import {
   initTestDb,
   runMigrations,
 } from '../../db/index.js';
-import { getDb } from '../../db/connection.js';
+import { getRawDb } from '../../db/connection.js';
 import { getTaskById, insertTaskAtomic } from './db/tasks.js';
 import { computeRequestHash, deriveSpawnTaskId } from './derive-task-id.js';
 import { applySpawnTask } from './dispatch.js';
@@ -48,7 +48,7 @@ function insertChildSession(
   createdAt: string,
 ): void {
   try {
-    getDb()
+    getRawDb()
       .prepare(
         `INSERT OR IGNORE INTO sessions (id, agent_group_id, messaging_group_id, thread_id, created_at)
          VALUES (?, ?, ?, ?, ?)`,
@@ -169,8 +169,9 @@ function ts(): string {
   return new Date().toISOString();
 }
 
-function setupDb(): void {
-  const db = initTestDb();
+async function setupDb(): Promise<void> {
+  await initTestDb();
+  const db = getRawDb();
   db.pragma('foreign_keys = ON');
   runMigrations(db);
 }
@@ -186,7 +187,7 @@ function seedGroups({ withMg = false }: { withMg?: boolean } = {}): { orchSessio
     spawnDeadlineSec: 300,
     drainGraceSec: 120,
   });
-  getDb()
+  getRawDb()
     .prepare(
       `INSERT INTO agent_group_capabilities (agent_group_id, role, config_json, granted_by, granted_at) VALUES (?, 'orchestrator', ?, NULL, ?)`,
     )
@@ -220,13 +221,13 @@ function seedGroups({ withMg = false }: { withMg?: boolean } = {}): { orchSessio
       instructions_profile: null,
       created_at: ts(),
     });
-    getDb()
+    getRawDb()
       .prepare(
         `INSERT OR IGNORE INTO sessions (id, agent_group_id, messaging_group_id, created_at) VALUES (?, ?, ?, ?)`,
       )
       .run('sess-orch', 'ag-orch', mgId, ts());
   } else {
-    getDb()
+    getRawDb()
       .prepare(`INSERT OR IGNORE INTO sessions (id, agent_group_id, created_at) VALUES (?, ?, ?)`)
       .run('sess-orch', 'ag-orch', ts());
   }
@@ -271,8 +272,8 @@ beforeEach(async () => {
   );
 });
 
-afterEach(() => {
-  closeDb();
+afterEach(async () => {
+  await closeDb();
   vi.clearAllMocks();
 });
 
@@ -280,7 +281,7 @@ afterEach(() => {
 
 describe('F1: e2e threaded happy path', () => {
   it('test_e2e_threaded_happy_path: full admit → thread → child complete → parent notified', async () => {
-    setupDb();
+    await setupDb();
     const { orchSession } = seedGroups({ withMg: true });
 
     const { getChannelAdapter } = await import('../../channels/channel-registry.js');
@@ -364,7 +365,7 @@ describe('F1: e2e threaded happy path', () => {
 
 describe('F1: e2e headless happy path', () => {
   it('test_e2e_headless_happy_path: no createThread → headless surface_mode', async () => {
-    setupDb();
+    await setupDb();
     const { orchSession } = seedGroups({ withMg: false }); // no messaging group
 
     const { getChannelAdapter } = await import('../../channels/channel-registry.js');
@@ -424,7 +425,7 @@ describe('F1: e2e headless happy path', () => {
 
 describe('F1: e2e idempotency replay', () => {
   it('test_e2e_idempotent_replay: same idempotency_key does not insert new task row', async () => {
-    setupDb();
+    await setupDb();
     const { orchSession } = seedGroups({ withMg: false });
 
     const { getChannelAdapter } = await import('../../channels/channel-registry.js');
@@ -437,7 +438,7 @@ describe('F1: e2e idempotency replay', () => {
     await applySpawnTask({ content: 'Do X', idempotency_key: 'k-replay' }, orchSession);
 
     // Only one row should exist
-    const allTasks = getDb().prepare(`SELECT * FROM tasks WHERE parent_session_id = 'sess-orch'`).all();
+    const allTasks = getRawDb().prepare(`SELECT * FROM tasks WHERE parent_session_id = 'sess-orch'`).all();
     expect(allTasks).toHaveLength(1);
 
     // Replay notification includes existing task_id
@@ -446,7 +447,7 @@ describe('F1: e2e idempotency replay', () => {
   });
 
   it('test_e2e_idempotent_replay_at_concurrency_cap: replay succeeds even when cap is reached', async () => {
-    setupDb();
+    await setupDb();
     const { orchSession } = seedGroups({ withMg: false });
 
     // Set cap to 1
@@ -456,7 +457,7 @@ describe('F1: e2e idempotency replay', () => {
       spawnDeadlineSec: 300,
       drainGraceSec: 120,
     });
-    getDb()
+    getRawDb()
       .prepare(
         `UPDATE agent_group_capabilities SET config_json = ? WHERE agent_group_id = 'ag-orch' AND role = 'orchestrator'`,
       )
@@ -469,7 +470,7 @@ describe('F1: e2e idempotency replay', () => {
     // in same group). Distinct thread: migration 049 folds NULLs, so a second
     // active NULL/NULL row on ag-orch would be OR-IGNOREd away and the task
     // insert below would FK-fail against the missing session.
-    getDb()
+    getRawDb()
       .prepare(`INSERT OR IGNORE INTO sessions (id, agent_group_id, thread_id, created_at) VALUES (?, ?, ?, ?)`)
       .run('some-child-sess', 'ag-orch', 'system:tasks:some-child', ts());
 
@@ -542,7 +543,7 @@ describe('F1: e2e idempotency replay', () => {
 
 describe('F1: e2e cancel during running', () => {
   it('test_e2e_cancel_during_running: cancel writes _spawn_cancel and arms kill timer', async () => {
-    setupDb();
+    await setupDb();
     const { orchSession } = seedGroups({ withMg: false });
 
     const { getChannelAdapter } = await import('../../channels/channel-registry.js');
@@ -607,7 +608,7 @@ describe('F1: e2e cancel during running', () => {
   }, 15_000);
 
   it('test_e2e_complete_after_cancel_is_no_op: CAS prevents overwriting cancelled status', async () => {
-    setupDb();
+    await setupDb();
     const { orchSession } = seedGroups({ withMg: false });
 
     const { getChannelAdapter } = await import('../../channels/channel-registry.js');
@@ -656,7 +657,7 @@ describe('F1: e2e cancel during running', () => {
 
 describe('F1: e2e watchdog terminates no-progress task', () => {
   it('test_e2e_watchdog_terminates_no_progress: sweep reaps task with stale last_progress_at', async () => {
-    setupDb();
+    await setupDb();
     const { orchSession } = seedGroups({ withMg: false });
 
     const { getChannelAdapter } = await import('../../channels/channel-registry.js');
@@ -673,7 +674,7 @@ describe('F1: e2e watchdog terminates no-progress task', () => {
 
     // Set last_progress_at to 2 hours ago to trigger no-progress timeout
     const twoHoursAgo = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString();
-    getDb()
+    getRawDb()
       .prepare(`UPDATE tasks SET last_progress_at = ?, started_at = ? WHERE task_id = ?`)
       .run(twoHoursAgo, twoHoursAgo, taskId);
 
@@ -698,7 +699,7 @@ describe('F1: e2e watchdog terminates no-progress task', () => {
 
 describe('F1: e2e orphan recovery', () => {
   it('test_e2e_orphan_recovery: reconciler picks up admitted-but-incomplete task', async () => {
-    setupDb();
+    await setupDb();
     seedGroups({ withMg: false });
 
     const { getChannelAdapter } = await import('../../channels/channel-registry.js');

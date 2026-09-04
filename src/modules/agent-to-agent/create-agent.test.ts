@@ -89,7 +89,7 @@ vi.mock('../approvals/index.js', async (importOriginal) => ({
 }));
 
 // ── Imports after mocks ───────────────────────────────────────────────────────
-import { initTestDb, closeDb, runMigrations, createAgentGroup } from '../../db/index.js';
+import { initTestDb, closeDb, runMigrations, createAgentGroup, getRawDb } from '../../db/index.js';
 import { getAgentGroupByFolder } from '../../db/agent-groups.js';
 import { STANDING_INSTRUCTIONS_FILE } from '../../group-persona.js';
 import { applyCreateAgent, handleCreateAgent } from './create-agent.js';
@@ -152,12 +152,13 @@ function makeSession(agentGroupId = 'ag-parent'): Session {
   };
 }
 
-beforeEach(() => {
+beforeEach(async () => {
   if (fs.existsSync(TEST_ROOT)) fs.rmSync(TEST_ROOT, { recursive: true });
   fs.mkdirSync(TEST_GROUPS_DIR, { recursive: true });
   fs.mkdirSync(TEST_DATA_DIR, { recursive: true });
 
-  const db = initTestDb();
+  await initTestDb();
+  const db = getRawDb();
   runMigrations(db);
 
   // Insert the parent agent group
@@ -170,8 +171,8 @@ beforeEach(() => {
   });
 });
 
-afterEach(() => {
-  closeDb();
+afterEach(async () => {
+  await closeDb();
   vi.clearAllMocks();
   if (fs.existsSync(TEST_ROOT)) fs.rmSync(TEST_ROOT, { recursive: true });
 });

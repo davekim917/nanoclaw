@@ -52,7 +52,7 @@ vi.mock('./topic-title.js', async (importOriginal) => ({
 import {
   initTestDb,
   closeDb,
-  getDb,
+  getRawDb,
   runMigrations,
   createAgentGroup,
   createMessagingGroup,
@@ -157,7 +157,7 @@ function wire(
     created_at: now(),
   });
   if (opts.threads !== undefined && opts.threads !== null) {
-    getDb().prepare('UPDATE messaging_group_agents SET threads = ? WHERE id = ?').run(opts.threads, 'mga-fixture');
+    getRawDb().prepare('UPDATE messaging_group_agents SET threads = ? WHERE id = ?').run(opts.threads, 'mga-fixture');
   }
 }
 
@@ -212,11 +212,12 @@ function inboundRowCount(sessionId: string): number {
   }
 }
 
-beforeEach(() => {
+beforeEach(async () => {
   if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
   fs.mkdirSync(TEST_DIR, { recursive: true });
   vi.clearAllMocks();
-  runMigrations(initTestDb());
+  await initTestDb();
+  runMigrations(getRawDb());
   threadHistory = [];
   historyCalls = [];
   historyThrows = false;
@@ -224,8 +225,8 @@ beforeEach(() => {
   vi.mocked(archiveMessage).mockReset();
 });
 
-afterEach(() => {
-  closeDb();
+afterEach(async () => {
+  await closeDb();
   if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
 });
 
@@ -513,7 +514,7 @@ describe('buildThreadContextBlock is caller-agnostic', () => {
         last_active: '2026-08-05T00:00:00.000Z',
         created_at: '2026-08-01T00:00:00.000Z',
       });
-      getDb()
+      getRawDb()
         .prepare('UPDATE sessions SET engaged_at = ?, last_outbound_at = ? WHERE id = ?')
         .run('2026-08-02T00:00:00.000Z', '2026-08-03T00:00:00.000Z', 'sess-engaged');
       threadHistory.push(

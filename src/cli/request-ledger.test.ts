@@ -39,7 +39,7 @@ vi.mock('../log.js', () => ({
   isSurvivableIoError: vi.fn(() => false),
 }));
 
-import { closeDb, deleteSession, getDb, initTestDb, runMigrations } from '../db/index.js';
+import { closeDb, deleteSession, getRawDb, initTestDb, runMigrations } from '../db/index.js';
 import { getDeliveryAction, type DeliveryActionHandler } from '../delivery.js';
 import { inboundDbPath } from '../mailbox/sqlite/paths.js';
 import { initSessionFolder } from '../session-manager.js';
@@ -121,34 +121,35 @@ function responseRows(): Array<{ id: string; content: string }> {
 }
 
 function ledgerRows(): Array<{ status: string; response: string | null }> {
-  return getDb().prepare('SELECT status, response FROM cli_request_executions').all() as Array<{
+  return getRawDb().prepare('SELECT status, response FROM cli_request_executions').all() as Array<{
     status: string;
     response: string | null;
   }>;
 }
 
 function requestIds(): string[] {
-  return (getDb().prepare('SELECT request_id FROM cli_request_executions').all() as Array<{ request_id: string }>).map(
-    (r) => r.request_id,
-  );
+  return (
+    getRawDb().prepare('SELECT request_id FROM cli_request_executions').all() as Array<{ request_id: string }>
+  ).map((r) => r.request_id);
 }
 
 /** Backdate a claim so the prune's floor and retention windows are in play. */
 function age(requestId: string, claimedAt: string): void {
-  getDb().prepare('UPDATE cli_request_executions SET claimed_at = ? WHERE request_id = ?').run(claimedAt, requestId);
+  getRawDb().prepare('UPDATE cli_request_executions SET claimed_at = ? WHERE request_id = ?').run(claimedAt, requestId);
 }
 
-beforeEach(() => {
+beforeEach(async () => {
   fs.rmSync(TEST_DIR, { recursive: true, force: true });
   fs.mkdirSync(TEST_DIR, { recursive: true });
-  runMigrations(initTestDb());
+  await initTestDb();
+  runMigrations(getRawDb());
   initSessionFolder(AG, SESSION_ID);
   dispatch.mockReset();
   dispatch.mockResolvedValue({ id: 'req-1', ok: true, data: { id: 'task-created-once' } });
 });
 
-afterEach(() => {
-  closeDb();
+afterEach(async () => {
+  await closeDb();
   fs.rmSync(TEST_DIR, { recursive: true, force: true });
 });
 
@@ -254,7 +255,7 @@ describe('ledger mechanics', () => {
   });
 
   it('an unparseable stored frame reports ambiguity rather than re-running the command', () => {
-    getDb()
+    getRawDb()
       .prepare(`UPDATE cli_request_executions SET status = 'done', response = 'not json' WHERE request_id = 'req-9'`)
       .run();
     expect(claimCliRequest(SESSION_ID, 'req-9', 'groups-list').state).toBe('executing');

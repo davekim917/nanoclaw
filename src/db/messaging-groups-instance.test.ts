@@ -17,7 +17,7 @@
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 
-import { initTestDb, closeDb, getDb } from './connection.js';
+import { initTestDb, closeDb, getRawDb } from './connection.js';
 import { runMigrations, migrations, type Migration } from './migrations/index.js';
 import {
   createMessagingGroup,
@@ -42,18 +42,19 @@ function mg(overrides: Partial<MessagingGroup> & { id: string }): MessagingGroup
   };
 }
 
-afterEach(() => {
-  closeDb();
+afterEach(async () => {
+  await closeDb();
 });
 
 describe('migration 016 — fresh DB', () => {
-  beforeEach(() => {
-    const db = initTestDb();
+  beforeEach(async () => {
+    await initTestDb();
+    const db = getRawDb();
     runMigrations(db);
   });
 
   it('adds a NOT NULL instance column', () => {
-    const cols = getDb().prepare("PRAGMA table_info('messaging_groups')").all() as Array<{
+    const cols = getRawDb().prepare("PRAGMA table_info('messaging_groups')").all() as Array<{
       name: string;
       notnull: number;
     }>;
@@ -64,7 +65,7 @@ describe('migration 016 — fresh DB', () => {
 
   it('createMessagingGroup without instance stamps instance = channel_type', () => {
     createMessagingGroup(mg({ id: 'mg-default' }));
-    const row = getDb().prepare("SELECT instance FROM messaging_groups WHERE id = 'mg-default'").get() as {
+    const row = getRawDb().prepare("SELECT instance FROM messaging_groups WHERE id = 'mg-default'").get() as {
       instance: string;
     };
     expect(row.instance).toBe('slack');
@@ -73,7 +74,7 @@ describe('migration 016 — fresh DB', () => {
   it('allows sibling instances on the same (channel_type, platform_id)', () => {
     createMessagingGroup(mg({ id: 'mg-default' }));
     createMessagingGroup(mg({ id: 'mg-tester', instance: 'slack-tester' }));
-    const count = getDb().prepare('SELECT COUNT(*) AS c FROM messaging_groups').get() as { c: number };
+    const count = getRawDb().prepare('SELECT COUNT(*) AS c FROM messaging_groups').get() as { c: number };
     expect(count.c).toBe(2);
   });
 
@@ -89,8 +90,9 @@ describe('migration 016 — fresh DB', () => {
 });
 
 describe('migration 016 — wired legacy DB upgrade (the FK recreate arm)', () => {
-  it('recreates messaging_groups under FK children without violations and backfills instance', () => {
-    const db = initTestDb();
+  it('recreates messaging_groups under FK children without violations and backfills instance', async () => {
+    await initTestDb();
+    const db = getRawDb();
     // Bring the DB to the pre-016 schema.
     runMigrations(
       db,
@@ -135,8 +137,9 @@ describe('migration 016 — wired legacy DB upgrade (the FK recreate arm)', () =
     expect(db.pragma('foreign_keys', { simple: true })).toBe(1);
   });
 
-  it('tolerates pre-existing FK orphans: the migration still applies (no boot crash-loop)', () => {
-    const db = initTestDb();
+  it('tolerates pre-existing FK orphans: the migration still applies (no boot crash-loop)', async () => {
+    await initTestDb();
+    const db = getRawDb();
     runMigrations(
       db,
       migrations.filter((m) => m.name !== 'messaging-group-instance'),
@@ -167,8 +170,9 @@ describe('migration 016 — wired legacy DB upgrade (the FK recreate arm)', () =
     expect(db.pragma('foreign_key_check')).toHaveLength(1);
   });
 
-  it('still rejects a migration that ITSELF introduces FK violations', () => {
-    const db = initTestDb();
+  it('still rejects a migration that ITSELF introduces FK violations', async () => {
+    await initTestDb();
+    const db = getRawDb();
     runMigrations(db);
 
     const rogue: Migration = {
@@ -191,8 +195,9 @@ describe('migration 016 — wired legacy DB upgrade (the FK recreate arm)', () =
     expect(db.pragma('foreign_key_check')).toEqual([]);
   });
 
-  it('is idempotent — re-running the full barrel is a no-op', () => {
-    const db = initTestDb();
+  it('is idempotent — re-running the full barrel is a no-op', async () => {
+    await initTestDb();
+    const db = getRawDb();
     runMigrations(db);
     createMessagingGroup(mg({ id: 'mg-keep', instance: 'slack-tester' }));
     expect(() => runMigrations(db)).not.toThrow();
@@ -204,8 +209,9 @@ describe('migration 016 — wired legacy DB upgrade (the FK recreate arm)', () =
 });
 
 describe('lookup asymmetry — inbound exact-only vs outbound default-first', () => {
-  beforeEach(() => {
-    const db = initTestDb();
+  beforeEach(async () => {
+    await initTestDb();
+    const db = getRawDb();
     runMigrations(db);
     // The named instance ('alpha-tester') sorts lexically BEFORE the
     // channel type ('slack') and is inserted first — so both rowid order
@@ -245,7 +251,7 @@ describe('lookup asymmetry — inbound exact-only vs outbound default-first', ()
   });
 
   it('getMessagingGroupByPlatform falls back deterministically when only named instances exist', () => {
-    const db = getDb();
+    const db = getRawDb();
     db.prepare("DELETE FROM messaging_groups WHERE id = 'mg-default'").run();
     createMessagingGroup(mg({ id: 'mg-zeta', instance: 'zeta' }));
     const found = getMessagingGroupByPlatform('slack', 'slack:C1');

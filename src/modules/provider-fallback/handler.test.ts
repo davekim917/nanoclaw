@@ -21,7 +21,7 @@ vi.mock('../../config.js', async () => {
 
 const { TEST_DIR } = vi.hoisted(() => ({ TEST_DIR: uniqueTmpRoot('test-provider-fallback') }));
 
-import { initTestDb, closeDb, runMigrations, createAgentGroup } from '../../db/index.js';
+import { initTestDb, closeDb, runMigrations, createAgentGroup, getRawDb } from '../../db/index.js';
 import { getProviderHealth, isProviderUnavailable, markProviderUnavailable } from '../../db/provider-health.js';
 import type { Session } from '../../types.js';
 import { handleProviderUnavailable } from './handler.js';
@@ -40,11 +40,12 @@ function writeConfig(config: Record<string, unknown>): void {
 }
 
 describe('provider_unavailable handler', () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     killed.length = 0;
     if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
     fs.mkdirSync(TEST_DIR, { recursive: true });
-    const db = initTestDb();
+    await initTestDb();
+    const db = getRawDb();
     runMigrations(db);
     createAgentGroup({
       id: GID,
@@ -54,8 +55,8 @@ describe('provider_unavailable handler', () => {
       created_at: new Date().toISOString(),
     });
   });
-  afterEach(() => {
-    closeDb();
+  afterEach(async () => {
+    await closeDb();
     if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
   });
 

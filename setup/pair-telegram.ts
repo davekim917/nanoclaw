@@ -28,7 +28,7 @@ import {
   type PairingIntent,
 } from '../src/channels/telegram-pairing.js';
 import { DATA_DIR } from '../src/config.js';
-import { initDb } from '../src/db/connection.js';
+import { initDb, getRawDb } from '../src/db/connection.js';
 import { runMigrations } from '../src/db/migrations/index.js';
 
 import { emitStatus } from './status.js';
@@ -87,7 +87,8 @@ export async function run(args: string[]): Promise<void> {
   // pairing primitive itself, but the inbound interceptor running inside the
   // live service needs migrations applied. Touch it here so a fresh install
   // doesn't fail on the first code match.
-  const db = initDb(path.join(DATA_DIR, 'v2.db'));
+  await initDb(path.join(DATA_DIR, 'v2.db'));
+  const db = getRawDb();
   runMigrations(db);
 
   const MAX_REGENERATIONS = 5;

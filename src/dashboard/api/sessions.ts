@@ -52,7 +52,7 @@
 import fs from 'fs';
 
 import { DATA_DIR } from '../../config.js';
-import { getDb } from '../../db/connection.js';
+import { getRawDb } from '../../db/connection.js';
 import { readSessionInbound, readSessionOutbound, type MessageTailRow } from '../../modules/mailbox/index.js';
 import { heartbeatPath } from '../../session-manager.js';
 import { log } from '../../log.js';
@@ -278,9 +278,9 @@ export const sessionsHandler: AuthHandler = async (req, _params, ctx) => {
 
   let rows: SessionJoinRow[];
   try {
-    rows = getDb()
+    rows = getRawDb()
       .prepare(sql)
-      .all(...(values as Parameters<ReturnType<ReturnType<typeof getDb>['prepare']>['all']>)) as SessionJoinRow[];
+      .all(...(values as Parameters<ReturnType<ReturnType<typeof getRawDb>['prepare']>['all']>)) as SessionJoinRow[];
   } catch (err) {
     log.warn('sessionsHandler: DB error', { err });
     return new Response(JSON.stringify({ error: 'internal_error' }), {
@@ -502,7 +502,7 @@ export const sessionsDetailHandler: AuthHandler = async (_req, params, ctx) => {
   // Re-use the same SELECT shape from the list handler so the detail row
   // carries every field the inbox card already shows — saves the SPA from
   // round-tripping through the list endpoint just to render the header.
-  const row = getDb()
+  const row = getRawDb()
     .prepare(
       `SELECT s.id, s.agent_group_id, s.messaging_group_id, s.thread_id,
               s.last_active, s.last_outbound_at, s.last_outbound_kind,

@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { closeDb, createAgentGroup, initTestDb, runMigrations } from '../../db/index.js';
-import { getDb } from '../../db/connection.js';
+import { getRawDb } from '../../db/connection.js';
 import { getTaskById, insertTaskAtomic } from './db/tasks.js';
 import type { Task } from './db/tasks.js';
 import { applySpawnComplete, applySpawnFailed } from './completion.js';
@@ -29,8 +29,9 @@ function now(): string {
   return new Date().toISOString();
 }
 
-function setupDb(): void {
-  const db = initTestDb();
+async function setupDb(): Promise<void> {
+  await initTestDb();
+  const db = getRawDb();
   db.pragma('foreign_keys = ON');
   runMigrations(db);
 }
@@ -44,10 +45,10 @@ function seedGroups(): void {
     created_at: now(),
   });
   createAgentGroup({ id: 'ag-child', name: 'ag-child', folder: 'ag-child', agent_provider: null, created_at: now() });
-  getDb()
+  getRawDb()
     .prepare(`INSERT INTO sessions (id, agent_group_id, created_at) VALUES (?, ?, ?)`)
     .run('sess-parent', 'ag-parent', now());
-  getDb()
+  getRawDb()
     .prepare(`INSERT INTO sessions (id, agent_group_id, created_at) VALUES (?, ?, ?)`)
     .run('sess-child', 'ag-child', now());
 }
@@ -124,14 +125,14 @@ function makeParentSession(): Session {
   };
 }
 
-afterEach(() => {
-  closeDb();
+afterEach(async () => {
+  await closeDb();
   vi.clearAllMocks();
 });
 
 describe('applySpawnComplete', () => {
   it('test_complete_happy_path: transitions to completed and notifies parent', async () => {
-    setupDb();
+    await setupDb();
     seedGroups();
     makeRunningTask();
 
@@ -154,7 +155,7 @@ describe('applySpawnComplete', () => {
   });
 
   it('ASSERT: rejects when content lacks task_id', async () => {
-    setupDb();
+    await setupDb();
     seedGroups();
     makeRunningTask();
 
@@ -165,7 +166,7 @@ describe('applySpawnComplete', () => {
   });
 
   it('test_auth_rejects_wrong_session: does not transition when child_session_id mismatch', async () => {
-    setupDb();
+    await setupDb();
     seedGroups();
     makeRunningTask();
 
@@ -179,12 +180,12 @@ describe('applySpawnComplete', () => {
   });
 
   it('test_complete_after_cancel_skips_notify: skips parent notify when already terminal', async () => {
-    setupDb();
+    await setupDb();
     seedGroups();
     const task = makeRunningTask();
 
     // Pre-cancel the task
-    getDb()
+    getRawDb()
       .prepare(`UPDATE tasks SET status = 'cancelled', cancelled_at = ? WHERE task_id = ?`)
       .run(now(), task.task_id);
 
@@ -199,7 +200,7 @@ describe('applySpawnComplete', () => {
 
 describe('applySpawnFailed', () => {
   it('test_failed_includes_reason: stores fail_reason and transitions to failed', async () => {
-    setupDb();
+    await setupDb();
     seedGroups();
     makeRunningTask();
 
@@ -218,7 +219,7 @@ describe('applySpawnFailed', () => {
   });
 
   it('ASSERT: two-column auth enforced for failed', async () => {
-    setupDb();
+    await setupDb();
     seedGroups();
     makeRunningTask();
 
@@ -229,12 +230,14 @@ describe('applySpawnFailed', () => {
   });
 
   it('ASSERT: skips parent notify when transition returns false', async () => {
-    setupDb();
+    await setupDb();
     seedGroups();
     makeRunningTask();
 
     // Pre-complete the task
-    getDb().prepare(`UPDATE tasks SET status = 'completed', completed_at = ? WHERE task_id = ?`).run(now(), 'task-1');
+    getRawDb()
+      .prepare(`UPDATE tasks SET status = 'completed', completed_at = ? WHERE task_id = ?`)
+      .run(now(), 'task-1');
 
     const { writeSessionMessage } = await import('../../session-manager.js');
     await applySpawnFailed({ task_id: 'task-1', summary: 'X' }, makeChildSession());

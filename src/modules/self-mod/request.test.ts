@@ -21,7 +21,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Adapter, AdapterPostableMessage, RawMessage } from 'chat';
 
 import { createChatSdkBridge } from '../../channels/chat-sdk-bridge.js';
-import { initTestDb, closeDb, runMigrations } from '../../db/index.js';
+import { initTestDb, closeDb, runMigrations, getRawDb } from '../../db/index.js';
 import { createAgentGroup } from '../../db/agent-groups.js';
 import { createMessagingGroup } from '../../db/messaging-groups.js';
 import { createSession, getPendingApprovalsByAction } from '../../db/sessions.js';
@@ -92,11 +92,12 @@ const fakeAdapter: ChannelDeliveryAdapter = {
 
 let session: Session;
 
-beforeEach(() => {
+beforeEach(async () => {
   vi.clearAllMocks();
   if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true, force: true });
   fs.mkdirSync(TEST_DIR, { recursive: true });
-  const db = initTestDb();
+  await initTestDb();
+  const db = getRawDb();
   runMigrations(db);
   delivered = [];
 
@@ -137,8 +138,8 @@ beforeEach(() => {
   setDeliveryAdapter(fakeAdapter);
 });
 
-afterEach(() => {
-  closeDb();
+afterEach(async () => {
+  await closeDb();
   if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true, force: true });
 });
 

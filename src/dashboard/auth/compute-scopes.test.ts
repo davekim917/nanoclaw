@@ -5,7 +5,7 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import { computeScopes } from './compute-scopes.js';
-import { closeDb, createAgentGroup, getDb, initTestDb, runMigrations } from '../../db/index.js';
+import { closeDb, createAgentGroup, getRawDb, initTestDb, runMigrations } from '../../db/index.js';
 import { createUser } from '../../modules/permissions/db/users.js';
 import { grantRole } from '../../modules/permissions/db/user-roles.js';
 import { addMember } from '../../modules/permissions/db/agent-group-members.js';
@@ -22,15 +22,16 @@ function seedUser(id: string): void {
   createUser({ id, kind: 'telegram', display_name: null, created_at: now() });
 }
 
-beforeEach(() => {
-  const db = initTestDb();
+beforeEach(async () => {
+  await initTestDb();
+  const db = getRawDb();
   runMigrations(db);
   seedAgentGroup('ag-1');
   seedAgentGroup('ag-2');
 });
 
-afterEach(() => {
-  closeDb();
+afterEach(async () => {
+  await closeDb();
 });
 
 describe('computeScopes', () => {
@@ -83,7 +84,7 @@ describe('computeScopes', () => {
   it('test_computeScopes_member_unions_legacy_role_rows_and_agent_group_members', () => {
     seedUser('telegram:member');
     // Legacy path: a 'member' row directly in user_roles (dead-write path, kept for compat).
-    getDb()
+    getRawDb()
       .prepare(
         'INSERT INTO user_roles (user_id, role, agent_group_id, granted_by, granted_at) VALUES (?, ?, ?, NULL, ?)',
       )

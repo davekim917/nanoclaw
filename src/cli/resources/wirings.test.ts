@@ -27,7 +27,7 @@ vi.mock('../../modules/agent-to-agent/write-destinations.js', async (importOrigi
 import type { ChannelDefaults } from '../../channels/adapter.js';
 import { registerChannelAdapter } from '../../channels/channel-registry.js';
 import { initTestDb, closeDb, runMigrations, createAgentGroup, createMessagingGroup } from '../../db/index.js';
-import { getDb } from '../../db/connection.js';
+import { getRawDb } from '../../db/connection.js';
 import { createMessagingGroupAgent, getMessagingGroupAgent } from '../../db/messaging-groups.js';
 import { lookup } from '../registry.js';
 // Side-effect import: registers wirings-create / wirings-update.
@@ -72,8 +72,9 @@ async function update(args: Record<string, unknown>) {
   return (await lookup('wirings-update')!.handler(args, hostCtx)) as Record<string, unknown>;
 }
 
-beforeEach(() => {
-  runMigrations(initTestDb());
+beforeEach(async () => {
+  await initTestDb();
+  runMigrations(getRawDb());
   createAgentGroup({
     id: 'ag-1',
     name: 'Helper Bot',
@@ -87,8 +88,8 @@ beforeEach(() => {
   mg('mg-stale', 'stalechan', 1); // no declaration anywhere
 });
 
-afterEach(() => {
-  closeDb();
+afterEach(async () => {
+  await closeDb();
 });
 
 describe('wirings-create — declaration-derived defaults', () => {
@@ -396,7 +397,7 @@ describe('wirings — per-channel instructions profile', () => {
     await expect(
       create({ messaging_group_id: 'mg-dm', agent_group_id: 'ag-1', instructions_profile: 'BAD' }),
     ).rejects.toThrow();
-    const rows = getDb()
+    const rows = getRawDb()
       .prepare(`SELECT id FROM messaging_group_agents WHERE messaging_group_id = 'mg-dm'`)
       .all() as Array<{ id: string }>;
     expect(rows).toHaveLength(0);

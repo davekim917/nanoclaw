@@ -232,7 +232,7 @@ vi.mock('../../db/provider-health.js', async (importOriginal) => {
 });
 vi.mock('../../db/connection.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../db/connection.js')>()),
-  getDb: () => ({
+  getRawDb: () => ({
     prepare: () => ({ run: () => undefined, get: () => undefined, all: () => [] }),
   }),
 }));

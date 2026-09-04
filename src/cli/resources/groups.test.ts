@@ -35,7 +35,7 @@ vi.mock('../../config.js', async () => {
 
 const { TEST_DIR } = vi.hoisted(() => ({ TEST_DIR: uniqueTmpRoot('test-cli-groups') }));
 
-import { initTestDb, closeDb, runMigrations, createAgentGroup, getDb } from '../../db/index.js';
+import { initTestDb, closeDb, runMigrations, createAgentGroup, getRawDb } from '../../db/index.js';
 import { createSession } from '../../db/sessions.js';
 import { dispatch } from '../dispatch.js';
 import { readContainerConfig } from '../../container-config.js';
@@ -50,23 +50,24 @@ function now(): string {
 
 function count(sql: string, ...params: unknown[]): number {
   return (
-    getDb()
+    getRawDb()
       .prepare(sql)
       .get(...params) as { c: number }
   ).c;
 }
 
 describe('groups CLI delete cascades dependent rows (#2525)', () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
     fs.mkdirSync(TEST_DIR, { recursive: true });
 
-    const db = initTestDb();
+    await initTestDb();
+    const db = getRawDb();
     runMigrations(db);
   });
 
-  afterEach(() => {
-    closeDb();
+  afterEach(async () => {
+    await closeDb();
     if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
   });
 
@@ -89,7 +90,7 @@ describe('groups CLI delete cascades dependent rows (#2525)', () => {
       created_at: now(),
     });
 
-    const db = getDb();
+    const db = getRawDb();
 
     // Direct inserts for the dependent tables. Keeps the fixture minimal —
     // we only need rows that establish FK relationships, not full domain
@@ -203,7 +204,7 @@ describe('groups CLI delete cascades dependent rows (#2525)', () => {
     createAgentGroup({ id: A, name: 'a', folder: 'a', agent_provider: null, created_at: now() });
     createAgentGroup({ id: B, name: 'b', folder: 'b', agent_provider: null, created_at: now() });
 
-    const db = getDb();
+    const db = getRawDb();
 
     // B has a destination pointing at A. target_id is polymorphic — no FK
     // constraint enforces it, so without explicit cleanup the row would
@@ -240,7 +241,7 @@ describe('groups CLI delete cascades dependent rows (#2525)', () => {
     const SEED = 'ag-seed';
     const TWIN = 'ag-seed-codex';
     const WG = 'example-retail';
-    const db = getDb();
+    const db = getRawDb();
     createAgentGroup({ id: SEED, name: 'seed', folder: 'seed', agent_provider: null, created_at: now() });
     createAgentGroup({ id: TWIN, name: 'seed-codex', folder: 'seed-codex', agent_provider: null, created_at: now() });
     // Workgroups row must exist before workgroup_id FK can be set.
@@ -270,7 +271,7 @@ describe('groups CLI delete cascades dependent rows (#2525)', () => {
   it('cleans up the orphan workgroups row when deleting an unpaired agent', async () => {
     const SOLO = 'ag-solo';
     const WG = 'solo';
-    const db = getDb();
+    const db = getRawDb();
     createAgentGroup({ id: SOLO, name: 'solo', folder: 'solo', agent_provider: null, created_at: now() });
     // Seed the workgroups row as migration-036 would for a solo agent.
     db.prepare(`INSERT INTO workgroups (id, onecli_secrets, created_at) VALUES (?, '[]', ?)`).run(WG, now());
@@ -290,15 +291,16 @@ describe('groups CLI delete cascades dependent rows (#2525)', () => {
 });
 
 describe('groups CLI resource config', () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
     fs.mkdirSync(TEST_DIR, { recursive: true });
-    const db = initTestDb();
+    await initTestDb();
+    const db = getRawDb();
     runMigrations(db);
   });
 
-  afterEach(() => {
-    closeDb();
+  afterEach(async () => {
+    await closeDb();
     if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
   });
 
@@ -306,7 +308,7 @@ describe('groups CLI resource config', () => {
     const id = 'ag-resource-test';
     const folder = 'resource-test';
     createAgentGroup({ id, name: folder, folder, agent_provider: null, created_at: now() });
-    getDb()
+    getRawDb()
       .prepare(
         `INSERT INTO container_configs
            (agent_group_id, provider, model, effort, image_tag, assistant_name, max_messages_per_prompt,
@@ -358,7 +360,7 @@ describe('groups CLI resource config', () => {
     const id = 'ag-security-audit';
     const folder = 'security-audit';
     createAgentGroup({ id, name: folder, folder, agent_provider: null, created_at: now() });
-    getDb()
+    getRawDb()
       .prepare(
         `INSERT INTO container_configs
            (agent_group_id, provider, model, effort, image_tag, assistant_name, max_messages_per_prompt,
@@ -398,7 +400,7 @@ describe('groups CLI resource config', () => {
     const id = 'ag-security-default';
     const folder = 'security-default';
     createAgentGroup({ id, name: folder, folder, agent_provider: null, created_at: now() });
-    getDb()
+    getRawDb()
       .prepare(
         `INSERT INTO container_configs
            (agent_group_id, provider, model, effort, image_tag, assistant_name, max_messages_per_prompt,
@@ -433,7 +435,7 @@ describe('groups CLI resource config', () => {
     const id = 'ag-provider-mirror';
     const folder = 'provider-mirror';
     createAgentGroup({ id, name: folder, folder, agent_provider: null, created_at: now() });
-    getDb()
+    getRawDb()
       .prepare(
         `INSERT INTO container_configs
            (agent_group_id, provider, model, effort, image_tag, assistant_name, max_messages_per_prompt,
@@ -479,7 +481,7 @@ describe('groups CLI resource config', () => {
     const id = 'ag-no-mirror';
     const folder = 'no-mirror';
     createAgentGroup({ id, name: folder, folder, agent_provider: null, created_at: now() });
-    getDb()
+    getRawDb()
       .prepare(
         `INSERT INTO container_configs
            (agent_group_id, provider, model, effort, image_tag, assistant_name, max_messages_per_prompt,
@@ -719,13 +721,14 @@ describe('groups CLI resource config', () => {
 });
 
 describe('groups config add-mount / remove-mount (host-only)', () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
     fs.mkdirSync(TEST_DIR, { recursive: true });
-    runMigrations(initTestDb());
+    await initTestDb();
+    runMigrations(getRawDb());
   });
-  afterEach(() => {
-    closeDb();
+  afterEach(async () => {
+    await closeDb();
     if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
   });
 

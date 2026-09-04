@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import http from 'http';
 
-import { closeDb, createMessagingGroup, initTestDb, runMigrations } from '../../db/index.js';
+import { closeDb, createMessagingGroup, initTestDb, runMigrations, getRawDb } from '../../db/index.js';
 import { messagingGroupsListHandler } from './messaging-groups.js';
 import type { AuthedRequestContext } from '../router.js';
 
@@ -22,15 +22,16 @@ function makeReq(): Request {
   return new Request('http://localhost/dashboard/api/messaging-groups');
 }
 
-function setupDb(): void {
-  const db = initTestDb();
+async function setupDb(): Promise<void> {
+  await initTestDb();
+  const db = getRawDb();
   db.pragma('foreign_keys = ON');
   runMigrations(db);
 }
 
 describe('messagingGroupsListHandler', () => {
-  beforeEach(() => {
-    setupDb();
+  beforeEach(async () => {
+    await setupDb();
     createMessagingGroup({
       id: 'mg-1',
       channel_type: 'discord',
@@ -50,8 +51,8 @@ describe('messagingGroupsListHandler', () => {
       created_at: now(),
     });
   });
-  afterEach(() => {
-    closeDb();
+  afterEach(async () => {
+    await closeDb();
     vi.clearAllMocks();
   });
 

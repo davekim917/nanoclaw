@@ -13,7 +13,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 
 import Database from 'better-sqlite3';
 
-import { initTestDb, closeDb, getDb } from '../../db/connection.js';
+import { initTestDb, closeDb, getRawDb } from '../../db/connection.js';
 import { openInboundDb } from '../../modules/mailbox/openers.js';
 import { ensureSchema } from '../../modules/mailbox/schema.js';
 import { migration043 } from '../../db/migrations/043-scheduled-audit.js';
@@ -38,8 +38,9 @@ function isoIn(ms: number): string {
   return new Date(NOW + ms).toISOString();
 }
 
-function setupCentralDb(): void {
-  const db = initTestDb();
+async function setupCentralDb(): Promise<void> {
+  await initTestDb();
+  const db = getRawDb();
   db.exec(`
     CREATE TABLE agent_groups (
       id TEXT PRIMARY KEY, name TEXT NOT NULL, folder TEXT NOT NULL UNIQUE,
@@ -62,31 +63,31 @@ function setupCentralDb(): void {
 }
 
 function addGroup(id: string, name: string): void {
-  getDb()
+  getRawDb()
     .prepare(
       "INSERT INTO agent_groups (id, name, folder, agent_provider, created_at) VALUES (?, ?, ?, 'claude', datetime('now'))",
     )
     .run(id, name, id);
 }
 function addMg(id: string, channelType: string, platformId: string, name: string): void {
-  getDb()
+  getRawDb()
     .prepare(
       "INSERT INTO messaging_groups (id, channel_type, platform_id, name, created_at) VALUES (?, ?, ?, ?, datetime('now'))",
     )
     .run(id, channelType, platformId, name);
 }
 function addSession(id: string, agentGroupId: string, mgId: string | null, threadId: string | null = null): void {
-  getDb()
+  getRawDb()
     .prepare(
       "INSERT INTO sessions (id, agent_group_id, messaging_group_id, thread_id, status, created_at) VALUES (?, ?, ?, ?, 'active', datetime('now'))",
     )
     .run(id, agentGroupId, mgId, threadId);
 }
 function addUser(id: string): void {
-  getDb().prepare("INSERT INTO users (id, kind, created_at) VALUES (?, 'phone', datetime('now'))").run(id);
+  getRawDb().prepare("INSERT INTO users (id, kind, created_at) VALUES (?, 'phone', datetime('now'))").run(id);
 }
 function grant(uid: string, role: string, ag: string | null): void {
-  getDb()
+  getRawDb()
     .prepare("INSERT INTO user_roles (user_id, role, agent_group_id, granted_at) VALUES (?, ?, ?, datetime('now'))")
     .run(uid, role, ag);
 }
@@ -164,17 +165,17 @@ async function readJson(res: Response): Promise<Record<string, unknown>> {
   return (await res.json()) as Record<string, unknown>;
 }
 
-beforeEach(() => {
+beforeEach(async () => {
   if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
   fs.mkdirSync(TEST_DIR, { recursive: true });
-  setupCentralDb();
+  await setupCentralDb();
   invalidateScheduledCache();
   _resetAssemblyInFlightForTesting();
   // Point the read handlers' assembly at the fixture dir + fixed now.
   readMod._setReadTestOptions({ dataDir: TEST_DIR, nowMs: NOW });
 });
 
-afterEach(() => {
+afterEach(async () => {
   // Reset EVERY shared singleton this file's handlers touch on the way OUT too,
   // so a sibling file never inherits a populated cache / in-flight assembly /
   // stale read-options pointing at this file's (now-deleted) dataDir. Hermetic
@@ -182,7 +183,7 @@ afterEach(() => {
   readMod._setReadTestOptions(null);
   invalidateScheduledCache();
   _resetAssemblyInFlightForTesting();
-  closeDb();
+  await closeDb();
   vi.restoreAllMocks();
   if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
 });
@@ -312,7 +313,7 @@ describe('scheduledListHandler', () => {
     grant('owner', 'owner', null);
 
     // An unresolved move_restore_failed audit row for a series with no live row.
-    writeAudit(getDb(), {
+    writeAudit(getRawDb(), {
       actor: 'owner',
       action: 'move_restore_failed',
       agentGroupId: 'ag-1',
@@ -409,7 +410,7 @@ describe('scheduledDetailHandler', () => {
     addSession('s1', 'ag-1', 'mg-1');
     insertRow(seedSession('ag-1', 's1').inbound, { id: 'r1', series_id: 'ser-1' });
     // An audit row exists for the series.
-    writeAudit(getDb(), {
+    writeAudit(getRawDb(), {
       actor: 'owner',
       action: 'edit',
       agentGroupId: 'ag-1',
@@ -490,7 +491,7 @@ describe('scheduledDetailHandler', () => {
       timestamp: isoIn(-1800_000),
     });
     // Board cancel audit stamped at NOW (the cancel ts) — controlled, not datetime('now').
-    getDb()
+    getRawDb()
       .prepare(
         "INSERT INTO scheduled_audit (ts, actor, action, agent_group_id, session_id, series_id) VALUES (?, 'owner', 'cancel', 'ag-1', 's1', 'ser-1')",
       )

@@ -109,9 +109,9 @@ interface Boot {
 async function boot(seed?: boolean): Promise<Boot> {
   vi.resetModules();
   const dbIndex = await import('../../db/index.js');
-  dbIndex.initDb(DB_PATH);
+  await dbIndex.initDb(DB_PATH);
   if (seed) {
-    dbIndex.runMigrations(dbIndex.getDb());
+    dbIndex.runMigrations(dbIndex.getRawDb());
     const agentGroups = await import('../../db/agent-groups.js');
     const users = await import('../permissions/db/users.js');
     const roles = await import('../permissions/db/user-roles.js');
@@ -488,7 +488,7 @@ describe('approver-set authorization', () => {
     first.approvals.stopOneCLIApprovalHandler();
     const second = await boot();
     const dbIndex = await import('../../db/index.js');
-    dbIndex.getDb().prepare('DELETE FROM user_roles').run();
+    dbIndex.getRawDb().prepare('DELETE FROM user_roles').run();
 
     const adapter2 = makeAdapter();
     second.approvals.startOneCLIApprovalHandler(adapter2);

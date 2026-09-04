@@ -16,7 +16,7 @@ import path from 'path';
 import { DATA_DIR, GROUPS_DIR } from './config.js';
 import { runningContainerMounts } from './container-mounts.js';
 import { isContainerRunning, isContainerSpawning } from './container-runner.js';
-import { getDb } from './db/connection.js';
+import { getRawDb } from './db/connection.js';
 // The GC's reclaim gate is synchronous all the way up through
 // `runStorageGcOnce`, and the mailbox session is async, so the busy probe below
 // uses `readSessionOutbound` — the module's SYNCHRONOUS read funnel — rather
@@ -171,7 +171,7 @@ function statMtimeMs(filePath: string): number | null {
 
 function sessionInventory(): SessionRow[] | null {
   try {
-    return getDb()
+    return getRawDb()
       .prepare(
         `SELECT s.id AS session_id, s.agent_group_id, s.status, s.thread_id,
                 s.messaging_group_id, mg.platform_id, ag.folder,

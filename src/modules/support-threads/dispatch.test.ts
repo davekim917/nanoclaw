@@ -41,7 +41,14 @@ vi.mock('../../channels/channel-registry.js', async (importOriginal) => ({
 
 const { TEST_DIR } = vi.hoisted(() => ({ TEST_DIR: uniqueTmpRoot('test-support-dispatch') }));
 
-import { initTestDb, closeDb, runMigrations, createAgentGroup, createMessagingGroup, getDb } from '../../db/index.js';
+import {
+  initTestDb,
+  closeDb,
+  runMigrations,
+  createAgentGroup,
+  createMessagingGroup,
+  getRawDb,
+} from '../../db/index.js';
 import { getSession } from '../../db/sessions.js';
 import { getSupportThread } from '../../db/support-threads.js';
 import { resolveSession, resolveTaskSession } from '../../session-manager.js';
@@ -112,10 +119,11 @@ function dispatchContent(
   };
 }
 
-beforeEach(() => {
+beforeEach(async () => {
   if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
   fs.mkdirSync(TEST_DIR, { recursive: true });
-  const db = initTestDb();
+  await initTestDb();
+  const db = getRawDb();
   runMigrations(db);
   postParent.mockReset().mockResolvedValue({ messageId: 'parent-ts-1' });
   createThread.mockReset().mockResolvedValue({ threadId: 'thread-ts-1' });
@@ -125,9 +133,9 @@ beforeEach(() => {
     'Use team EXAMPLE for product incidents and team HELP for all other requests, then call update_support_ticket.';
 });
 
-afterEach(() => {
+afterEach(async () => {
   delete process.env.NANOCLAW_SUPPORT_TICKET_POLICY_SUPPORT_AGENT;
-  closeDb();
+  await closeDb();
   if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
 });
 
@@ -247,7 +255,7 @@ describe('handleDispatchSupportIssue — follow-up + reopen', () => {
     seed();
     const { session: poller } = resolveSession('ag-1', 'mg-1', null, 'shared');
     // Simulate the host-side seeding of the legacy ticket map.
-    getDb()
+    getRawDb()
       .prepare(
         `INSERT INTO support_threads (gmail_thread_id, agent_group_id, messaging_group_id, linear_team, linear_issue, status, created_at, last_activity_at)
          VALUES ('gthread-L', 'ag-1', 'mg-1', 'EXAMPLE', 'EXAMPLE-86', 'open', ?, ?)`,
@@ -284,7 +292,7 @@ describe('handleDispatchSupportIssue — archived session binding', () => {
     const archivedId = before.session_id!;
     // Reclaim closes the row and removes the dir; the row itself survives, so
     // a bare getSession still answers for it.
-    getDb().prepare("UPDATE sessions SET status = 'closed' WHERE id = ?").run(archivedId);
+    getRawDb().prepare("UPDATE sessions SET status = 'closed' WHERE id = ?").run(archivedId);
     fs.rmSync(`${TEST_DIR}/v2-sessions/ag-1/${archivedId}`, { recursive: true, force: true });
     vi.mocked(wakeContainer).mockClear();
 
@@ -315,7 +323,7 @@ describe('handleDispatchSupportIssue — archived session binding', () => {
     const { session: poller } = resolveSession('ag-1', 'mg-1', null, 'shared');
     await handleDispatchSupportIssue(dispatchContent('gthread-A', 'first email'), poller);
     const archivedId = getSupportThread('gthread-A')!.session_id!;
-    getDb().prepare("UPDATE sessions SET status = 'closed' WHERE id = ?").run(archivedId);
+    getRawDb().prepare("UPDATE sessions SET status = 'closed' WHERE id = ?").run(archivedId);
     fs.rmSync(`${TEST_DIR}/v2-sessions/ag-1/${archivedId}`, { recursive: true, force: true });
     vi.mocked(wakeContainer).mockClear();
 
@@ -326,7 +334,7 @@ describe('handleDispatchSupportIssue — archived session binding', () => {
 
     const after = getSupportThread('gthread-A')!;
     const activeIds = (
-      getDb().prepare("SELECT id FROM sessions WHERE status = 'active'").all() as Array<{ id: string }>
+      getRawDb().prepare("SELECT id FROM sessions WHERE status = 'active'").all() as Array<{ id: string }>
     ).map((r) => r.id);
     // poller + exactly one replacement issue session.
     expect(activeIds.sort()).toEqual([poller.id, after.session_id].sort());

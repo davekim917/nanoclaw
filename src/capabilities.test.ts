@@ -15,7 +15,7 @@ vi.mock('./config.js', async (importOriginal) => ({
 }));
 
 import { buildSessionServicesSnapshot, getHostCapabilities, renderSessionCapabilities } from './capabilities.js';
-import { closeDb, createAgentGroup, getDb, initTestDb, runMigrations } from './db/index.js';
+import { closeDb, createAgentGroup, getRawDb, initTestDb, runMigrations } from './db/index.js';
 import { writeContainerConfig } from './container-config.js';
 import { SIBLING_BOUND_FIELDS } from './sibling-parity.js';
 import { PRE_TURN_BOUNDS } from './modules/memory/pre-turn-context.js';
@@ -26,7 +26,7 @@ function group(id: string, folder: string): AgentGroup {
 }
 
 function insertWorkgroup(id: string, onecliSecrets: string[]): void {
-  getDb()
+  getRawDb()
     .prepare(
       `INSERT INTO workgroups (id, display_name, onecli_secrets, mnemon_store_id, created_at)
        VALUES (?, ?, ?, ?, datetime('now'))`,
@@ -36,7 +36,7 @@ function insertWorkgroup(id: string, onecliSecrets: string[]): void {
 
 function createGroupInWorkgroup(agentGroup: AgentGroup, workgroupId: string): void {
   createAgentGroup(agentGroup);
-  getDb().prepare('UPDATE agent_groups SET workgroup_id = ? WHERE id = ?').run(workgroupId, agentGroup.id);
+  getRawDb().prepare('UPDATE agent_groups SET workgroup_id = ? WHERE id = ?').run(workgroupId, agentGroup.id);
   writeContainerConfig(agentGroup.folder, {
     mcpServers: {},
     packages: { apt: [], npm: [] },
@@ -46,14 +46,15 @@ function createGroupInWorkgroup(agentGroup: AgentGroup, workgroupId: string): vo
   });
 }
 
-beforeEach(() => {
+beforeEach(async () => {
   fs.rmSync(dirs.TEST_ROOT, { recursive: true, force: true });
   fs.mkdirSync(dirs.GROUPS_DIR, { recursive: true });
-  runMigrations(initTestDb());
+  await initTestDb();
+  runMigrations(getRawDb());
 });
 
-afterEach(() => {
-  closeDb();
+afterEach(async () => {
+  await closeDb();
   fs.rmSync(dirs.TEST_ROOT, { recursive: true, force: true });
   // vitest.config.ts sets no `unstubEnvs`, so it defaults to false and
   // vi.stubEnv survives the test — leaking into later tests in this file and,

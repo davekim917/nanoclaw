@@ -22,7 +22,7 @@ vi.mock('../../config.js', async (importOriginal) => ({
   TIMEZONE: 'UTC',
 }));
 
-import { initTestDb, closeDb } from '../../db/connection.js';
+import { initTestDb, closeDb, getRawDb } from '../../db/connection.js';
 import { runMigrations } from '../../db/migrations/index.js';
 import { createAgentGroup } from '../../db/agent-groups.js';
 import { getSessionsByAgentGroup } from '../../db/sessions.js';
@@ -53,17 +53,18 @@ const TASK = prepareScheduledTask({
   recurrence: '0 9 * * *',
 });
 
-beforeEach(() => {
+beforeEach(async () => {
   if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
   fs.mkdirSync(TEST_DIR, { recursive: true });
-  const db = initTestDb();
+  await initTestDb();
+  const db = getRawDb();
   runMigrations(db);
   createAgentGroup({ id: AG, name: AG, folder: AG, agent_provider: null, created_at: new Date().toISOString() });
 });
 
-afterEach(() => {
+afterEach(async () => {
   vi.restoreAllMocks();
-  closeDb();
+  await closeDb();
   if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
 });
 

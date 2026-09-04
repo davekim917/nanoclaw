@@ -6,7 +6,7 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import { preFanoutGate, gateCommand, clearInterceptHandlers } from './command-gate.js';
-import { closeDb, createAgentGroup, getDb, initTestDb, runMigrations } from './db/index.js';
+import { closeDb, createAgentGroup, getRawDb, initTestDb, runMigrations } from './db/index.js';
 import { createUser } from './modules/permissions/db/users.js';
 import { grantRole } from './modules/permissions/db/user-roles.js';
 import { addMember } from './modules/permissions/db/agent-group-members.js';
@@ -16,20 +16,20 @@ function now(): string {
 }
 
 function insertUser(id: string): void {
-  getDb()
+  getRawDb()
     .prepare("INSERT OR IGNORE INTO users (id, kind, display_name, created_at) VALUES (?, 'test', NULL, ?)")
     .run(id, now());
 }
 
 function insertRole(userId: string, role: 'owner' | 'admin', agentGroupId: string | null): void {
   if (agentGroupId !== null) {
-    getDb()
+    getRawDb()
       .prepare(
         'INSERT INTO user_roles (user_id, role, agent_group_id, granted_by, granted_at) VALUES (?, ?, ?, NULL, ?)',
       )
       .run(userId, role, agentGroupId, now());
   } else {
-    getDb()
+    getRawDb()
       .prepare(
         'INSERT INTO user_roles (user_id, role, agent_group_id, granted_by, granted_at) VALUES (?, ?, NULL, NULL, ?)',
       )
@@ -45,16 +45,17 @@ function seedUser(id: string): void {
   createUser({ id, kind: 'telegram', display_name: null, created_at: now() });
 }
 
-beforeEach(() => {
-  const db = initTestDb();
+beforeEach(async () => {
+  await initTestDb();
+  const db = getRawDb();
   runMigrations(db);
   seedAgentGroup('ag-1');
   seedAgentGroup('ag-2');
 });
 
-afterEach(() => {
+afterEach(async () => {
   clearInterceptHandlers();
-  closeDb();
+  await closeDb();
 });
 
 describe('preFanoutGate', () => {

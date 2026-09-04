@@ -41,7 +41,7 @@
  * (usage_daily is an additive upsert over a watermark, so it never sees a
  * turn's rows together) and would silently redefine an existing column.
  */
-import { getDb } from './connection.js';
+import { getRawDb } from './connection.js';
 import { log } from '../log.js';
 import type { NanoclawMailboxSession } from '../modules/mailbox/index.js';
 
@@ -93,7 +93,7 @@ export function isCostApplicable(provider: string): boolean {
 }
 
 function getWatermark(sessionDirKey: string): number {
-  const row = getDb()
+  const row = getRawDb()
     .prepare('SELECT last_turn_usage_id FROM usage_rollup_state WHERE session_dir = ?')
     .get(sessionDirKey) as { last_turn_usage_id: number } | undefined;
   return row?.last_turn_usage_id ?? 0;
@@ -132,7 +132,7 @@ export function rollupSessionUsage(
     ? sessionDirKey.slice(agentGroupId.length + 1)
     : sessionDirKey;
 
-  const db = getDb();
+  const db = getRawDb();
   let maxId = watermark;
   db.transaction(() => {
     const upsert = db.prepare(`
@@ -223,7 +223,7 @@ export function listUsageDaily(
     params.push(new Date(Date.now() - filters.days * 86_400_000).toISOString().slice(0, 10));
   }
   const clause = where.length > 0 ? ` WHERE ${where.join(' AND ')}` : '';
-  const rows = getDb()
+  const rows = getRawDb()
     .prepare(`SELECT * FROM usage_daily${clause} ORDER BY date DESC, agent_group_id, provider, model LIMIT 1000`)
     .all(...params) as Omit<UsageDailyRow, 'cost_applicable'>[];
   return rows.map((row) => ({ ...row, cost_applicable: isCostApplicable(row.provider) }));
@@ -306,7 +306,7 @@ export function summarizeTurnUsage(
     COALESCE(SUM(output_tokens), 0) AS output_tokens,
     COALESCE(SUM(cost_usd), 0) AS cost_usd`;
 
-  const db = getDb();
+  const db = getRawDb();
   const selectDims = dims.map((d) => `${USAGE_DIMENSIONS[d]} AS "${d}"`).join(', ');
   const order = dims.includes('day') ? '"day" DESC' : 'cache_read_tokens DESC';
   const buckets = db
@@ -357,7 +357,7 @@ const TURN_USAGE_RETENTION_DAYS = 30;
  */
 export function pruneOldTurnUsage(): number {
   try {
-    return getDb()
+    return getRawDb()
       .prepare(`DELETE FROM turn_usage WHERE datetime(ts) < datetime('now', '-${TURN_USAGE_RETENTION_DAYS} days')`)
       .run().changes;
   } catch (err) {

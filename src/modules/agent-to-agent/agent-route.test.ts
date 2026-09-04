@@ -10,7 +10,7 @@ import { initTestDb, closeDb, runMigrations, createAgentGroup } from '../../db/i
 import { createSession, updateSession } from '../../db/sessions.js';
 import { initSessionFolder, sessionDir, writeSessionMessage } from '../../session-manager.js';
 import { inboundDbPath } from '../../mailbox/sqlite/paths.js';
-import { getDb } from '../../db/connection.js';
+import { getRawDb } from '../../db/connection.js';
 import { SessionDbMissingError } from '../mailbox/index.js';
 import type { Session } from '../../types.js';
 
@@ -165,11 +165,12 @@ describe('routeAgentMessage return-path', () => {
   let S2: Session;
   let SB: Session;
 
-  beforeEach(() => {
+  beforeEach(async () => {
     if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
     fs.mkdirSync(TEST_DIR, { recursive: true });
 
-    const db = initTestDb();
+    await initTestDb();
+    const db = getRawDb();
     runMigrations(db);
 
     createAgentGroup({ id: A, name: 'A', folder: 'a', agent_provider: null, created_at: now() });
@@ -236,7 +237,7 @@ describe('routeAgentMessage return-path', () => {
     });
   });
 
-  afterEach(() => {
+  afterEach(async () => {
     duringSourceLookup.run = null;
     duringFileCopy.run = null;
     // A `vi.spyOn(log, 'warn')` inside a case is NOT restored by that case when
@@ -245,7 +246,7 @@ describe('routeAgentMessage return-path', () => {
     // turns one real failure into two, and the second is a lie. Restoring here
     // is unconditional; module factory mocks are untouched by it.
     vi.restoreAllMocks();
-    closeDb();
+    await closeDb();
     if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
   });
 
@@ -478,7 +479,7 @@ describe('routeAgentMessage return-path', () => {
 
     // The admin revokes B→A while the lookup is in flight.
     duringSourceLookup.run = () => {
-      getDb().prepare('DELETE FROM agent_destinations WHERE agent_group_id = ? AND target_id = ?').run(B, A);
+      getRawDb().prepare('DELETE FROM agent_destinations WHERE agent_group_id = ? AND target_id = ?').run(B, A);
     };
 
     await expect(
@@ -564,13 +565,13 @@ describe('routeAgentMessage return-path', () => {
     // A chat A belongs to. The forward runs BEFORE S1 is bound to it, so it
     // lands in SB the ordinary way; binding S1 afterwards is what makes the
     // return-path candidate mg-BOUND, which is the only shape at issue here.
-    getDb()
+    getRawDb()
       .prepare(
         `INSERT INTO messaging_groups (id, channel_type, instance, platform_id, name, is_group, unknown_sender_policy, created_at)
          VALUES ('mg-shared', 'slack', 'slack', 'slack:C-shared', 'Shared', 1, 'public', ?)`,
       )
       .run(now());
-    getDb()
+    getRawDb()
       .prepare(
         `INSERT INTO messaging_group_agents (id, messaging_group_id, agent_group_id, created_at)
          VALUES ('mga-a', 'mg-shared', ?, ?)`,
@@ -584,11 +585,11 @@ describe('routeAgentMessage return-path', () => {
     const inboundId = readPairedInboundTriggers(B, SB.id)[0].id;
     // Bound directly: `updateSession` deliberately does not expose the mg
     // column, and this is planting a prior exchange's shape, not a route.
-    getDb().prepare("UPDATE sessions SET messaging_group_id = 'mg-shared' WHERE id = ?").run(S1.id);
+    getRawDb().prepare("UPDATE sessions SET messaging_group_id = 'mg-shared' WHERE id = ?").run(S1.id);
 
     // The admin unwires A from that chat while B's reply is mid-lookup.
     duringSourceLookup.run = () => {
-      getDb()
+      getRawDb()
         .prepare("DELETE FROM messaging_group_agents WHERE agent_group_id = ? AND messaging_group_id = 'mg-shared'")
         .run(A);
     };
@@ -761,7 +762,7 @@ describe('routeAgentMessage return-path', () => {
 
     const warn = vi.spyOn(log, 'warn');
     duringSourceLookup.run = () => {
-      getDb().prepare('DELETE FROM agent_destinations WHERE agent_group_id = ? AND target_id = ?').run(B, A);
+      getRawDb().prepare('DELETE FROM agent_destinations WHERE agent_group_id = ? AND target_id = ?').run(B, A);
     };
 
     await expect(
@@ -800,7 +801,7 @@ describe('routeAgentMessage return-path', () => {
     // Fires inside the copy: the first proof has already allowed, and the bytes
     // land before the second one is asked.
     duringFileCopy.run = () => {
-      getDb().prepare('DELETE FROM agent_destinations WHERE agent_group_id = ? AND target_id = ?').run(A, B);
+      getRawDb().prepare('DELETE FROM agent_destinations WHERE agent_group_id = ? AND target_id = ?').run(A, B);
     };
 
     await expect(

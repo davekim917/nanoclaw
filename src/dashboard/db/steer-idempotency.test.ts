@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, it, expect } from 'vitest';
 
-import { closeDb, getDb, initTestDb, runMigrations } from '../../db/index.js';
+import { closeDb, getRawDb, initTestDb, runMigrations } from '../../db/index.js';
 import { IdempotencyConflict, applyIdempotency, markEchoAttempted, reserveIdempotency } from './steer-idempotency.js';
 import type { SteerResponse, SteerTarget } from './steer-idempotency.js';
 
@@ -9,19 +9,22 @@ function now(): string {
 }
 
 function seedUser(id: string): void {
-  getDb().prepare("INSERT INTO users (id, kind, display_name, created_at) VALUES (?, 'test', NULL, ?)").run(id, now());
+  getRawDb()
+    .prepare("INSERT INTO users (id, kind, display_name, created_at) VALUES (?, 'test', NULL, ?)")
+    .run(id, now());
 }
 
-beforeEach(() => {
+beforeEach(async () => {
   // Reset column-check flag between tests so ensureColumn runs fresh each time
   // (the module-level flag persists across tests in the same process)
-  const db = initTestDb();
+  await initTestDb();
+  const db = getRawDb();
   runMigrations(db);
   seedUser('u1');
 });
 
-afterEach(() => {
-  closeDb();
+afterEach(async () => {
+  await closeDb();
 });
 
 const TASK: SteerTarget = { type: 'task', id: 'spawn-abc' };
@@ -85,7 +88,7 @@ describe('steer_idempotency DAO', () => {
     reserveIdempotency('u1', 'key-1', TASK, 'msg-1', 'hello', 'hash-h');
     applyIdempotency('u1', 'key-1', makeResponse());
 
-    const row = getDb()
+    const row = getRawDb()
       .prepare(
         "SELECT status, applied_at, cached_response FROM steer_idempotency WHERE user_id = 'u1' AND idempotency_key = 'key-1'",
       )
@@ -101,7 +104,7 @@ describe('steer_idempotency DAO', () => {
     applyIdempotency('u1', 'key-1', makeResponse());
     expect(() => applyIdempotency('u1', 'key-1', makeResponse())).not.toThrow();
 
-    const row = getDb()
+    const row = getRawDb()
       .prepare("SELECT status FROM steer_idempotency WHERE user_id = 'u1' AND idempotency_key = 'key-1'")
       .get() as { status: string } | undefined;
     expect(row?.status).toBe('applied');
@@ -111,7 +114,7 @@ describe('steer_idempotency DAO', () => {
     const reserved = reserveIdempotency('u1', 'key-1', TASK, 'msg-1', 'hello', 'hash-h');
     markEchoAttempted(reserved.id);
 
-    const row = getDb().prepare('SELECT echo_attempted FROM steer_idempotency WHERE id = ?').get(reserved.id) as
+    const row = getRawDb().prepare('SELECT echo_attempted FROM steer_idempotency WHERE id = ?').get(reserved.id) as
       | { echo_attempted: number }
       | undefined;
     expect(row?.echo_attempted).toBe(1);
@@ -119,7 +122,7 @@ describe('steer_idempotency DAO', () => {
 
   it('session-targeted reservation persists target_type=session', () => {
     reserveIdempotency('u1', 'key-2', SESSION, 'msg-1', 'hi', 'hash-h');
-    const row = getDb()
+    const row = getRawDb()
       .prepare("SELECT target_type, target_id FROM steer_idempotency WHERE idempotency_key = 'key-2'")
       .get() as { target_type: string; target_id: string };
     expect(row.target_type).toBe('session');
