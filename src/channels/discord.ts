@@ -193,6 +193,63 @@ export async function discoverDiscordRecoveryTargets(
   return { targets, complete, failed };
 }
 
+/**
+ * Discord message FORWARDS carry their text and attachments in
+ * `message_snapshots`, with a top-level `content` that is empty
+ * (`message_reference.type === 1` is FORWARD; 0 is an ordinary reply, which
+ * the adapter already handles via `referenced_message`). The chat-adapter
+ * reads only `content`/`attachments`, so a forward reached the agent as an
+ * empty message. Unwrap the snapshot back into the payload before the adapter
+ * builds its Message, so text, attachment download and formatting all ride the
+ * existing path.
+ *
+ * Snapshots carry no author, so the original sender is unavailable and the
+ * content is labeled `[Forwarded message]`.
+ *
+ * Ported from upstream 437a5f064; re-homed onto this fork's per-workspace
+ * adapter registration loop.
+ */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+export function unwrapForwardedSnapshot(data: Record<string, any>): void {
+  if (data.message_reference?.type !== 1) return;
+  const snaps = (data.message_snapshots ?? [])
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    .map((snapshot: any) => snapshot?.message)
+    .filter(Boolean);
+  if (snaps.length === 0) return;
+  const text = snaps
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    .map((message: any) => message.content)
+    .filter(Boolean)
+    .join('\n');
+  const label = '[Forwarded message]';
+  data.content = text ? `${label}\n${text}` : data.content || label;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const forwardedAttachments = snaps.flatMap((message: any) => message.attachments ?? []);
+  if (forwardedAttachments.length > 0) {
+    data.attachments = [...(data.attachments ?? []), ...forwardedAttachments];
+  }
+}
+
+/**
+ * Install the forward unwrap on one adapter instance.
+ *
+ * `handleForwardedMessage` is the live inbound seam for this install: the
+ * Gateway listener runs in webhook-forwarding mode (chat-sdk-bridge passes a
+ * `webhookUrl`), so every MESSAGE_CREATE arrives as raw Discord JSON through
+ * `handleWebhook` → `handleForwardedGatewayEvent` → `handleForwardedMessage`.
+ */
+export function installForwardUnwrap(adapter: ReturnType<typeof createDiscordAdapter>): void {
+  const target = adapter as unknown as {
+    handleForwardedMessage: (data: Record<string, unknown>, options?: unknown) => Promise<void>;
+  };
+  const original = target.handleForwardedMessage.bind(adapter);
+  target.handleForwardedMessage = async (data, options) => {
+    unwrapForwardedSnapshot(data);
+    return original(data, options);
+  };
+}
+
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 function extractReplyContext(raw: Record<string, any>): ReplyContext | null {
   if (!raw.referenced_message) return null;
@@ -738,6 +795,7 @@ for (const ws of workspaces) {
         publicKey: ws.publicKey,
         applicationId: ws.applicationId,
       });
+      installForwardUnwrap(discordAdapter);
       // Multi-bot dedup isolation. The chat-adapter's message-dedup key is
       // `dedupe:${adapter.name}:${message.id}`. createDiscordAdapter defaults
       // `name = "discord"` for every instance (verified at

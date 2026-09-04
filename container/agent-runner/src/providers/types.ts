@@ -215,6 +215,12 @@ export interface StdioMcpServerConfig {
   command: string;
   args?: string[];
   env?: Record<string, string>;
+  /**
+   * Working directory for the server process, as an absolute container path.
+   * A provider whose runtime cannot set a spawn directory must shim it — never
+   * silently launch in the wrong directory. (upstream 5e15069da)
+   */
+  cwd?: string;
 }
 
 /**
