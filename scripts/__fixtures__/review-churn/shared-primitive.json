@@ -71,6 +71,7 @@
   "sources": {
     "src/router.ts": "import { writeSessionMessage } from './mailbox/write.js';\n",
     "src/delivery.ts": "import { writeSessionMessage } from './mailbox/write.js';\n",
-    "src/tasks.ts": "import { writeSessionMessage } from './mailbox/write.js';\n"
+    "src/tasks.ts": "import { writeSessionMessage } from './mailbox/write.js';\n",
+    "src/mailbox/write.ts": "export function writeSessionMessage() {}\n"
   }
 }

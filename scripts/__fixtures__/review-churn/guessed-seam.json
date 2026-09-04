@@ -1,0 +1,43 @@
+{
+  "_comment": "Three rounds of one class, all on ONE file, and the findings name nothing that file's imports export. With a single flagged file there is no shared import to measure, so the seam is whichever import ranks first \u2014 a guess. Modelled on a real case where the guess landed on a logging-adjacent module while the invariant lived in another import entirely. It must be reported and not gated: no diff the fix makes would touch the guess.",
+  "findings": [
+    {
+      "threadId": "G1",
+      "commentId": 700,
+      "reviewId": "PRR_G0",
+      "createdAt": "2026-09-01T01:00:00Z",
+      "path": "src/tool.ts",
+      "line": 100,
+      "isResolved": false,
+      "isOutdated": false,
+      "body": "**<sub><sub>![P2 Badge](https://img.shields.io/badge/P2-yellow?style=flat)</sub></sub>  Keep the decision atomic with what is pushed**\n\nThe verdict is taken before the lock is held, so a concurrent writer can change what the call sends after it was judged. Nothing revalidates it, so the race stands."
+    },
+    {
+      "threadId": "G2",
+      "commentId": 701,
+      "reviewId": "PRR_G1",
+      "createdAt": "2026-09-01T02:00:00Z",
+      "path": "src/tool.ts",
+      "line": 101,
+      "isResolved": false,
+      "isOutdated": false,
+      "body": "**<sub><sub>![P2 Badge](https://img.shields.io/badge/P2-yellow?style=flat)</sub></sub>  Revalidate the ref along with the revision**\n\nThe revision is compared but the ref is not, so a concurrent writer pointing another ref at the same revision passes this check unchanged. Nothing revalidates it, so the race stands."
+    },
+    {
+      "threadId": "G3",
+      "commentId": 702,
+      "reviewId": "PRR_G2",
+      "createdAt": "2026-09-01T03:00:00Z",
+      "path": "src/tool.ts",
+      "line": 102,
+      "isResolved": false,
+      "isOutdated": false,
+      "body": "**<sub><sub>![P2 Badge](https://img.shields.io/badge/P2-yellow?style=flat)</sub></sub>  Judge the identity that was captured**\n\nThe reads still follow ambient state rather than the identity captured up front, so the verdict can describe something the call will not send. A concurrent writer wins the race unless this is revalidated."
+    }
+  ],
+  "sources": {
+    "src/tool.ts": "import { writeMessageOut } from './db/messages-out.js';\nimport { evaluateGate } from './gate.js';\n",
+    "src/db/messages-out.ts": "export function writeMessageOut() {}\n",
+    "src/gate.ts": "export function evaluateGate() {}\n"
+  }
+}

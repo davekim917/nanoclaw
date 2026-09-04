@@ -257,7 +257,51 @@ export function signatureOf(finding) {
  * statement is the one construct regex reads reliably. `[^;'"]*?` spans
  * newlines so multi-line `import { a, b } from '…'` blocks are read whole.
  */
+/**
+ * Which lines sit inside a block comment.
+ *
+ * Comment delimiters are located AFTER blanking single-line quoted spans, so
+ * `const marker = "/*"` does not open a comment and a doc example inside
+ * `/* … *\/` does not read as code. Both of those arrived as review findings,
+ * and they cannot both be satisfied by "detect the prose better" without a
+ * lexer — so the delimiters get just enough string awareness to be right on
+ * one line at a time, and every remaining ambiguity drops the candidate rather
+ * than keeping it. A dropped import makes the gate quiet; a kept one makes it
+ * refuse honest work.
+ */
+function commentedLines(lines) {
+  let inBlock = false;
+  return lines.map((raw) => {
+    const masked = raw
+      .replace(/`[^`]*`/g, ' ')
+      .replace(/'[^']*'/g, ' ')
+      .replace(/"[^"]*"/g, ' ');
+    const wasInBlock = inBlock;
+    let rest = masked;
+    let commented = wasInBlock;
+    for (;;) {
+      if (inBlock) {
+        const close = rest.indexOf('*/');
+        if (close === -1) break;
+        rest = rest.slice(close + 2);
+        inBlock = false;
+        continue;
+      }
+      const open = rest.indexOf('/*');
+      if (open === -1) break;
+      rest = rest.slice(open + 2);
+      inBlock = true;
+      commented = true;
+    }
+    const trimmed = raw.trim();
+    return commented || trimmed.startsWith('//') || trimmed.startsWith('*');
+  });
+}
+
 export function importsOf(source) {
+  const lines = source.split('\n');
+  const commented = commentedLines(lines);
+  source = lines.map((line, i) => (commented[i] ? '' : line)).join('\n');
   const out = [];
   const push = (spec, clause) => {
     if (!spec) return;
@@ -266,19 +310,51 @@ export function importsOf(source) {
       .split(',')
       .map((part) => part.trim())
       .filter(Boolean)
-      .map((part) => {
-        const m = /^(?:\*\s+as\s+|type\s+)?([A-Za-z_$][\w$]*)(?:\s+as\s+[A-Za-z_$][\w$]*)?$/.exec(part);
-        return m ? m[1] : null;
-      })
-      .filter(Boolean);
+      // Both sides of an alias: `import { evaluateGate as gate }` binds `gate`,
+      // and a finding will say `gate`, but the module exports `evaluateGate`.
+      // Substantiation asks whether the findings name something this module
+      // provides, so both spellings have to count.
+      .flatMap((part) => {
+        const m = /^(?:\*\s+as\s+|type\s+)?([A-Za-z_$][\w$]*)(?:\s+as\s+([A-Za-z_$][\w$]*))?$/.exec(part);
+        if (!m) return [];
+        return m[2] ? [m[1], m[2]] : [m[1]];
+      });
     out.push({ spec, names });
   };
-  for (const m of source.matchAll(/\b(?:import|export)\s+(?:type\s+)?([^;'"]*?)\s*from\s*['"]([^'"]+)['"]/g)) {
+  // Anchored to the start of a line, which is where a real import statement
+  // lives and where a doc-comment example does not: this file's own header
+  // shows ` *   import { a, b } from '…'`, and reading that as an import made
+  // the classifier seam findings on a module called `…`. An anchor rather than
+  // comment-stripping, because stripping comments correctly means knowing what
+  // is a string, which means a lexer.
+  for (const m of source.matchAll(/^[ \t]*(?:import|export)\s+(?:type\s+)?([^;'"]*?)\s*from\s*['"]([^'"]+)['"]/gm)) {
     push(m[2], m[1]);
   }
-  for (const m of source.matchAll(/\bimport\s*\(\s*['"]([^'"]+)['"]\s*\)/g)) push(m[1], '');
-  for (const m of source.matchAll(/\brequire\s*\(\s*['"]([^'"]+)['"]\s*\)/g)) push(m[1], '');
+  // `const { a, b } = await import('x')` binds names exactly like a static
+  // import, and this tree prescribes that form for circular imports on the
+  // host — so the seam a finding names most often arrives this way.
+  for (const m of source.matchAll(
+    /^[ \t]*(?:const|let|var)\s*(\{[^}]*\}|[A-Za-z_$][\w$]*)\s*=\s*(?:await\s+)?(?:import|require)\s*\(\s*['"]([^'"]+)['"]\s*\)/gm,
+  )) {
+    push(m[2], m[1]);
+  }
+  for (const m of source.matchAll(/^[^'"\n]*\bimport\s*\(\s*['"]([^'"]+)['"]\s*\)/gm)) push(m[1], '');
+  for (const m of source.matchAll(/^[^'"\n]*\brequire\s*\(\s*['"]([^'"]+)['"]\s*\)/gm)) push(m[1], '');
   return out;
+}
+
+/**
+ * Matches a bound name as a whole JavaScript identifier.
+ *
+ * `\b` is the wrong boundary here: it sits between a word and a non-word
+ * character, and `$` is a non-word character, so `\b$guard\b` neither anchors
+ * where it looks like it does nor survives being interpolated — `$` is a regex
+ * metacharacter. The name is escaped and the boundaries are explicit: no
+ * identifier character on either side.
+ */
+export function identifierMatcher(name) {
+  const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return new RegExp(`(?<![A-Za-z0-9_$])${escaped}(?![A-Za-z0-9_$])`);
 }
 
 /** Relative specifiers resolve to repo-relative paths; `.js` → `.ts` (ESM TS). */
@@ -321,11 +397,23 @@ export function seamFor(files, findingText, ctx) {
       for (const n of names) entry.names.set(n, (entry.names.get(n) ?? 0) + 1);
     }
   }
+  // A seam that does not exist is not a seam. An import scan reading text will
+  // eventually read prose as an import — a doc-comment example inside a block
+  // comment is the case that keeps arriving — and no amount of comment
+  // detection settles it, because comment detection needs a lexer. Existence
+  // does settle it: `./fake.js` from an example resolves to no file, so it
+  // cannot be a candidate however convincingly it was written. Package
+  // specifiers are taken as given; they are not liftable by a diff anyway.
+  for (const [spec, entry] of [...bySpec]) {
+    if (entry.relative && !moduleExists(spec, ctx)) bySpec.delete(spec);
+  }
   const scored = [...bySpec.values()].map((e) => ({
     spec: e.spec,
     inRepo: e.relative,
     fileCount: e.files.size,
-    mentioned: [...e.names.keys()].filter((n) => findingText.includes(n)),
+    // Whole identifiers: `get` must not count because a finding said "target",
+    // and `$guard` must count when a finding names it.
+    mentioned: [...e.names.keys()].filter((n) => identifierMatcher(n).test(findingText)),
     names: [...e.names.keys()],
   }));
   scored.sort(
@@ -338,9 +426,15 @@ export function seamFor(files, findingText, ctx) {
   // A module nothing shares is not a seam. One flagged file is the exception:
   // its own imports are the only candidates there are.
   const top = scored.find((s) => s.fileCount >= 2 || files.length === 1);
-  if (!top) return { seam: null, seamInRepo: false, primitives: [] };
+  if (!top) return { seam: null, seamInRepo: false, substantiated: false, primitives: [] };
   const primitives = (top.mentioned.length > 0 ? top.mentioned : top.names).slice(0, 3);
-  return { seam: top.spec, seamInRepo: top.inRepo, primitives };
+  // Whether the ranking actually had evidence, as opposed to picking the
+  // best-ranked import of a single file. Two or more flagged files sharing the
+  // module IS the evidence; with one file the only evidence left is that the
+  // findings name something the module exports. Neither, and the seam is a
+  // guess — reported, never gated. See decideGate.
+  const substantiated = top.fileCount >= 2 || top.mentioned.length > 0;
+  return { seam: top.spec, seamInRepo: top.inRepo, substantiated, primitives };
 }
 
 // ── classification ──────────────────────────────────────────────────────────
@@ -389,6 +483,39 @@ export function severityFalling(findings) {
   return byRound.get(order[order.length - 1]) > byRound.get(order[0]);
 }
 
+/**
+ * Is there a file behind this resolved specifier? Extensions are tried the way
+ * a resolver would, and the sources map answers first so tests stay hermetic.
+ */
+function moduleExists(spec, ctx) {
+  // `from './gate'` is valid and used in this tree, so an extensionless
+  // specifier gets the extensions a resolver would try; `.js` in an ESM
+  // specifier already became `.ts` upstream, and the sibling extensions cover
+  // the rest.
+  const bare = /\.[a-z]+$/i.test(spec) ? [] : ['.ts', '.tsx', '.js', '.mjs', '/index.ts', '/index.js'];
+  const candidates = [
+    spec,
+    spec.replace(/\.ts$/, '.tsx'),
+    spec.replace(/\.ts$/, '.js'),
+    spec.replace(/\.ts$/, '.mjs'),
+    ...bare.map((ext) => `${spec}${ext}`),
+  ];
+  if (ctx.sources) {
+    if (candidates.some((c) => Object.prototype.hasOwnProperty.call(ctx.sources, c))) return true;
+    // A payload that carries sources at all is authoritative about them: this
+    // keeps a fixture from reaching the disk for a module it never described.
+    if (!ctx.repoRoot) return false;
+  }
+  if (!ctx.repoRoot) return false;
+  return candidates.some((c) => {
+    try {
+      return fs.existsSync(path.join(ctx.repoRoot, c));
+    } catch {
+      return false;
+    }
+  });
+}
+
 /** Does this file import the module the class settled on as its seam? */
 function fileImports(file, seam, ctx) {
   if (!file) return false;
@@ -404,6 +531,7 @@ function buildClass(signature, group, derived) {
     signature,
     seam: derived.seam,
     seamInRepo: derived.seamInRepo,
+    seamSubstantiated: derived.substantiated,
     primitives: derived.primitives,
     rounds: rounds.length,
     roundIds: rounds,
@@ -453,7 +581,12 @@ export function classify(payload) {
         // Nothing shared: one seamless class holding the rest. It is reported
         // and never gated — see decideGate.
         built.push({
-          cls: buildClass(signature, remaining, { seam: null, seamInRepo: false, primitives: [] }),
+          cls: buildClass(signature, remaining, {
+            seam: null,
+            seamInRepo: false,
+            substantiated: false,
+            primitives: [],
+          }),
           group: remaining,
         });
         break;
@@ -480,9 +613,24 @@ export function classify(payload) {
     .map(([seam, entries]) => {
       const group = entries.flatMap((e) => e.group);
       const rounds = roundsOf(group);
+      // The rollup carries its OWN evidence, measured over its own files: two
+      // or more flagged files importing the module is the same standard the
+      // class-level rule uses, and it is what the rollup exists to see —
+      // signature drift across files that share a callee, where no single
+      // class can substantiate the seam alone. What it must never do is take
+      // one class's naming as evidence for another class's guess, so naming
+      // counts only for the class that did the naming.
+      const filesOnSeam = new Set(
+        [...new Set(group.map((f) => f.path).filter(Boolean))].filter((file) => fileImports(file, seam, ctx)),
+      );
       return {
         seam,
         seamInRepo: entries[0].cls.seamInRepo,
+        // Its own files, with no `||` borrowing a class's naming: a class that
+        // named the module substantiates ITSELF and gates at the class level.
+        // Letting it also vouch for the rollup put a guessed class's rounds
+        // behind evidence that was never about them.
+        seamSubstantiated: filesOnSeam.size >= 2,
         rounds: rounds.length,
         findings: group.length,
         lastAt: lastAt(group),
@@ -514,10 +662,58 @@ export const CLASS_ROUND_LIMIT = 3;
  */
 const REFRAME_TRAILER = /^\s*Reframe:\s*(.+?)\s+enforced in\s+(.+?)\s*$/gim;
 
-/** Does the trailer name this entry's primitive (or its seam module)? */
+/**
+ * The one identifier a trailer names, or null.
+ *
+ * `Reframe: <invariant> enforced in <primitive>` gives a free-text phrase, and
+ * every consumer of it used to re-interpret that text its own way: one matched
+ * candidates as substrings, the other treated every word as an independent
+ * name to look for — so `enforced in nonexistent guard function` was satisfied
+ * by a commit that added the word `function`. Parsed once, here, and both
+ * consumers take the result.
+ *
+ * A phrase that leaves more than one candidate after dropping language words
+ * names nothing usable: "the write path" and "nonexistent guard" are prose,
+ * not primitives, and a trailer that cannot name its primitive does not lift
+ * the gate.
+ */
+const TRAILER_NOISE = new Set([
+  'a',
+  'an',
+  'and',
+  'async',
+  'class',
+  'const',
+  'enum',
+  'export',
+  'for',
+  'function',
+  'in',
+  'interface',
+  'let',
+  'method',
+  'new',
+  'of',
+  'the',
+  'this',
+  'to',
+  'type',
+  'var',
+]);
+
+export function trailerPrimitive(primitive) {
+  const tokens = (primitive.match(/[A-Za-z_$][\w$]*/g) ?? []).filter(
+    (token) => !TRAILER_NOISE.has(token.toLowerCase()),
+  );
+  return tokens.length === 1 ? tokens[0] : null;
+}
+
+/** Does the trailer name one of the classifier's candidates for this entry? */
 function primitiveNamed(entry, trailer) {
-  if (entry.primitives.some((p) => trailer.primitive.includes(p))) return true;
-  return Boolean(entry.seam) && trailer.primitive.includes(path.posix.basename(entry.seam).replace(/\.[jt]sx?$/, ''));
+  const named = trailerPrimitive(trailer.primitive);
+  if (!named) return false;
+  if (entry.primitives.some((p) => p === named)) return true;
+  return Boolean(entry.seam) && path.posix.basename(entry.seam).replace(/\.[jt]sx?$/, '') === named;
 }
 
 /** Does the trailer name this entry's invariant? */
@@ -529,6 +725,76 @@ function invariantNamed(entry, trailer) {
   ].filter((t) => t && t.length > 3);
   if (tokens.length === 0) return true;
   return tokens.some((t) => said.includes(t.toLowerCase()));
+}
+
+/**
+ * Did this commit INTRODUCE something the trailer names?
+ *
+ * The question is deliberately NOT "is there a declaration here, as code".
+ * Rounds 2, 3, 4 and 6 of this review all landed on that one — comments,
+ * strings, block state, delimiters outside the hunk, template literals, method
+ * syntax — because answering it with regexes means re-deriving a JavaScript
+ * lexer one counterexample at a time, and the next counterexample always
+ * exists.
+ *
+ * What the check has to stop is a trailer pointing at something the commit did
+ * not bring: a pre-existing helper, or a name from nowhere. Present in the
+ * post-image as a whole identifier and absent from the pre-image says exactly
+ * that, and identifier boundaries answer it completely. It is weaker evidence
+ * than a parsed declaration — a name introduced in a comment would pass — and
+ * that is the trade: the trailer is already an explicit claim by the author on
+ * a file the commit changed, and the classifier's own candidates remain the
+ * primary path. This is the fallback for when the ranking guessed wrong.
+ */
+function declaredByCommit(named, commit, ctx) {
+  const identifier = trailerPrimitive(named);
+  if (!identifier) return false;
+  const matcher = identifierMatcher(identifier);
+  for (const file of commit.files ?? []) {
+    const after = fileAtCommit(commit, file, 'after', ctx);
+    if (after == null) continue;
+    const before = fileAtCommit(commit, file, 'before', ctx) ?? '';
+    if (matcher.test(after) && !matcher.test(before)) return true;
+  }
+  return false;
+}
+
+/**
+ * One file as it stood before or after a commit. Supplied by the payload in
+ * tests; read with `git show` otherwise, and cached, since a trailer usually
+ * points at one commit and a handful of files.
+ */
+function fileAtCommit(commit, file, side, ctx) {
+  const supplied = side === 'after' ? commit.after : commit.before;
+  if (supplied && Object.prototype.hasOwnProperty.call(supplied, file)) return supplied[file];
+  if (!ctx.repoRoot || !commit.sha) return null;
+  if (!ctx.blobCache) ctx.blobCache = new Map();
+  const key = `${commit.sha}:${side}:${file}`;
+  if (ctx.blobCache.has(key)) return ctx.blobCache.get(key);
+  // A renamed file has no pre-image at its NEW path, and treating that absence
+  // as "everything here is new" would let a commit that merely moved a file
+  // claim every declaration in it. The rename map gives the old path.
+  const path_ = side === 'after' ? file : (renamedFrom(commit, ctx).get(file) ?? file);
+  const ref = side === 'after' ? commit.sha : `${commit.sha}^`;
+  const text = git(ctx.repoRoot, ['show', `${ref}:${path_}`]);
+  const value = text === '' ? null : text;
+  ctx.blobCache.set(key, value);
+  return value;
+}
+
+/** New path → old path, for the files this commit renamed. */
+function renamedFrom(commit, ctx) {
+  if (!ctx.renameCache) ctx.renameCache = new Map();
+  const cached = ctx.renameCache.get(commit.sha);
+  if (cached) return cached;
+  const map = new Map();
+  const raw = git(ctx.repoRoot, ['diff', '--name-status', '--find-renames', `${commit.sha}^`, commit.sha]);
+  for (const line of raw.split('\n')) {
+    const parts = line.split('\t');
+    if (parts.length === 3 && /^R\d*$/.test(parts[0])) map.set(parts[2], parts[1]);
+  }
+  ctx.renameCache.set(commit.sha, map);
+  return map;
 }
 
 function touches(changedFiles, seam, seamInRepo) {
@@ -552,10 +818,12 @@ function instant(value) {
   return Number.isNaN(t) ? null : t;
 }
 
-function reframeTrailers(messages) {
+function reframeTrailers(commits) {
   const out = [];
-  for (const msg of messages) {
-    for (const m of (msg ?? '').matchAll(REFRAME_TRAILER)) out.push({ invariant: m[1], primitive: m[2] });
+  for (const commit of commits) {
+    for (const m of (commit.message ?? '').matchAll(REFRAME_TRAILER)) {
+      out.push({ invariant: m[1], primitive: m[2], commit });
+    }
   }
   return out;
 }
@@ -570,26 +838,36 @@ function reframeTrailers(messages) {
  */
 export function decideGate(payload, options = {}) {
   const report = classify(payload);
+  const ctx = { repoRoot: payload.repoRoot, sources: payload.sources };
   const commits = payload.commits ?? [];
   const worktree = payload.worktree ?? [];
 
   const flagged = [];
   for (const c of report.classes) {
-    // A class whose sites share no seam is reported, never gated: there is no
-    // primitive to move the check into, so neither a diff nor a trailer could
-    // lift it and the override would be the only way past. That is a worse
-    // failure than missing it — the class table still shows the row.
-    if (c.rounds >= CLASS_ROUND_LIMIT && c.seam) {
+    // A class whose seam the classifier cannot substantiate is reported, never
+    // gated. With no seam there is no primitive to move the check into; with a
+    // GUESSED seam — one flagged file, and nothing in the findings naming what
+    // that module exports — the refusal names a primitive the fix has no reason
+    // to touch, so the only way past is the override. A gate that fires on an
+    // unfalsifiable seam drives people to the override, which is the failure it
+    // exists to prevent. The class table still shows the row either way.
+    if (c.rounds >= CLASS_ROUND_LIMIT && c.seam && c.seamSubstantiated) {
       flagged.push({ kind: 'class', ...c, reason: `${c.rounds} rounds on one finding class` });
     }
   }
   for (const s of report.seams) {
-    if (s.rounds >= CLASS_ROUND_LIMIT && !s.severityFalling && !flagged.some((f) => f.seam === s.seam)) {
+    if (
+      s.rounds >= CLASS_ROUND_LIMIT &&
+      s.seamSubstantiated &&
+      !s.severityFalling &&
+      !flagged.some((f) => f.seam === s.seam)
+    ) {
       flagged.push({
         kind: 'seam',
         key: `seam ${s.seam}`,
         seam: s.seam,
         seamInRepo: s.seamInRepo,
+        seamSubstantiated: s.seamSubstantiated,
         primitives: s.primitives,
         rounds: s.rounds,
         findings: s.findings,
@@ -608,7 +886,7 @@ export function decideGate(payload, options = {}) {
       return since === null || at === null || at >= since;
     });
     const changed = [...worktree, ...recent.flatMap((c) => c.files ?? [])];
-    const trailers = reframeTrailers(recent.map((c) => c.message ?? ''));
+    const trailers = reframeTrailers(recent);
     // A trailer naming only the primitive is enough while that primitive
     // belongs to one flagged class. When two flagged classes share it —
     // a race AND a durability defect at the same write — one trailer would
@@ -618,7 +896,18 @@ export function decideGate(payload, options = {}) {
         other !== entry &&
         ((entry.seam && other.seam === entry.seam) || other.primitives.some((p) => entry.primitives.includes(p))),
     );
-    const named = trailers.filter((t) => primitiveNamed(entry, t) && (!shared || invariantNamed(entry, t)));
+    const named = trailers.filter((t) => {
+      const byCandidate = primitiveNamed(entry, t);
+      // The classifier's candidates are a ranking, not a fact, so a trailer
+      // also counts when its commit DECLARES the primitive it names. That is
+      // the stronger claim — the author overruling the classifier — so it
+      // always names the invariant too: without that, one trailer naming a
+      // newly declared primitive would clear every flagged class at once,
+      // whatever the classifier had guessed their seams to be.
+      const byDeclaration = !byCandidate && declaredByCommit(t.primitive, t.commit, ctx);
+      if (byDeclaration) return invariantNamed(entry, t);
+      return byCandidate && (!shared || invariantNamed(entry, t));
+    });
     const touched = touches(changed, entry.seam, entry.seamInRepo);
     return {
       ...entry,
@@ -627,11 +916,35 @@ export function decideGate(payload, options = {}) {
     };
   });
 
+  // Classes at the limit that are NOT gated, because their seam is a guess.
+  // They are the "reported" half of the rule and must appear in the output: a
+  // gate that prints "no finding class has reached 3 rounds" while the table
+  // holds one is telling the operator something false.
+  const gatedSeams = new Set(flagged.map((f) => f.seam).filter(Boolean));
+  const reported = report.classes
+    .filter(
+      (c) =>
+        c.rounds >= CLASS_ROUND_LIMIT &&
+        !(c.seam && c.seamSubstantiated) &&
+        // Its seam may still be gated by the rollup, on evidence the rollup
+        // carries. Saying "not gated" beside a refusal naming the same seam
+        // would be two answers to one question.
+        !(c.seam && gatedSeams.has(c.seam)),
+    )
+    .map((c) => ({
+      key: c.key,
+      rounds: c.rounds,
+      seam: c.seam,
+      reason: c.seam
+        ? 'the seam is a guess: one flagged file, and the findings name nothing it exports'
+        : 'the sites share no seam',
+    }));
+
   const unlifted = decided.filter((e) => !e.lifted);
   const allow =
     options.allowSitePatch ?? (Boolean(payload.allowSitePatch) || process.env.REVIEW_LOOP_ALLOW_SITE_PATCH === '1');
   const status = unlifted.length === 0 ? 'pass' : allow ? 'override' : 'refuse';
-  return { status, flagged: decided, unlifted, report };
+  return { status, flagged: decided, unlifted, reported, report };
 }
 
 // ── rendering ───────────────────────────────────────────────────────────────
@@ -664,11 +977,16 @@ function renderClasses(report) {
 
 function renderGate(decision) {
   const bar = '='.repeat(70);
+  const reportedLines = (decision.reported ?? []).map(
+    (r) => `  reported, not gated: ${r.key} — ${r.rounds} rounds; ${r.reason}`,
+  );
   if (decision.status === 'pass') {
     const n = decision.flagged.length;
-    return n === 0
-      ? 'review-loop gate: ok — no finding class has reached 3 rounds.'
-      : `review-loop gate: ok — ${n} flagged class(es), each already reframed at the primitive.`;
+    const head =
+      n === 0
+        ? 'review-loop gate: ok — no finding class is gated.'
+        : `review-loop gate: ok — ${n} flagged class(es), each already reframed at the primitive.`;
+    return [head, ...reportedLines].join('\n');
   }
   const lines = [
     bar,
@@ -697,6 +1015,7 @@ function renderGate(decision) {
     lines.push('');
     lines.push('Escape hatch (loud, recorded in the PR body): REVIEW_LOOP_ALLOW_SITE_PATCH=1');
   }
+  lines.push(...reportedLines);
   lines.push(bar);
   return lines.join('\n');
 }

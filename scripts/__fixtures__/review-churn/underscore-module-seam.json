@@ -38,6 +38,7 @@
   "sources": {
     "src/one.ts": "import { writeThing } from './_shared.js';\n",
     "src/two.ts": "import { writeThing } from './_shared.js';\n",
-    "src/three.ts": "import { writeThing } from './_shared.js';\n"
+    "src/three.ts": "import { writeThing } from './_shared.js';\n",
+    "src/_shared.ts": "export function writeThing() {}\n"
   }
 }

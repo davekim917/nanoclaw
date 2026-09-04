@@ -64,8 +64,12 @@ rounds. `pr-review-loop`'s gate (`codex-review.sh gate`, run by
 on one seam with severity not falling, exits non-zero naming the class, the
 sites and the candidate primitive, and lifts only on a commit that touches that
 primitive or carries `Reframe: <invariant> enforced in <primitive>`. A class
-whose sites share no seam is reported and not gated — there is no primitive to
-lift it with. `REVIEW_LOOP_ALLOW_SITE_PATCH=1` overrides the gate loudly and
+whose seam the classifier cannot substantiate — no shared import, or a single
+flagged file whose findings name nothing that module exports — is reported and
+not gated, because the refusal would name a primitive the fix has no reason to
+touch and the override would be the only way out. The reframe trailer may name
+any primitive the commit itself introduces, not only the classifier's
+candidates. `REVIEW_LOOP_ALLOW_SITE_PATCH=1` overrides the gate loudly and
 records the override in the PR body.
 
 ## Fix discipline

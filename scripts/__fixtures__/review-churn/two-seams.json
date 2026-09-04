@@ -74,6 +74,8 @@
     "src/dashboard/close.ts": "import { writeSessionMessage } from '../mailbox/write.js';\n",
     "src/schedule.ts": "import { stampTaskRoute } from './db/tasks.js';\n",
     "src/recur.ts": "import { stampTaskRoute } from './db/tasks.js';\n",
-    "src/backfill.ts": "import { stampTaskRoute } from './db/tasks.js';\n"
+    "src/backfill.ts": "import { stampTaskRoute } from './db/tasks.js';\n",
+    "src/mailbox/write.ts": "export function writeSessionMessage() {}\n",
+    "src/db/tasks.ts": "export function stampTaskRoute() {}\n"
   }
 }

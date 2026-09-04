@@ -1,5 +1,5 @@
 {
-  "_comment": "Three rounds landing on ONE seam, but each a different invariant family and severity falling P1 → P2 → P3. No class reaches three rounds, and per docs/review-policy.md falling severity is convergence, so the gate must let this through.",
+  "_comment": "Three rounds landing on ONE seam, but each a different invariant family and severity falling P1 \u2192 P2 \u2192 P3. No class reaches three rounds, and per docs/review-policy.md falling severity is convergence, so the gate must let this through.",
   "findings": [
     {
       "threadId": "S1",
@@ -37,6 +37,7 @@
   ],
   "sources": {
     "src/router.ts": "import { writeSessionMessage } from './mailbox/write.js';\n",
-    "src/delivery.ts": "import { writeSessionMessage } from './mailbox/write.js';\n"
+    "src/delivery.ts": "import { writeSessionMessage } from './mailbox/write.js';\n",
+    "src/mailbox/write.ts": "export function writeSessionMessage() {}\n"
   }
 }

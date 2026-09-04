@@ -1,0 +1,43 @@
+{
+  "_comment": "A block comment carrying an unprefixed example import, in two shapes that must both fail: a module that does not exist (`./fake.js`) and a REAL one the findings name (`./gate.js`, whose `evaluateGate` every finding cites). Existence cannot tell the second from code, so comment context decides \u2014 with the delimiters located after single-line quoted spans are blanked, which is what keeps `const marker = \"/*\"` from opening a comment.",
+  "findings": [
+    {
+      "threadId": "FKG1",
+      "commentId": 700,
+      "reviewId": "PRR_FK0",
+      "createdAt": "2026-09-01T01:00:00Z",
+      "path": "src/tool.ts",
+      "line": 100,
+      "isResolved": false,
+      "isOutdated": false,
+      "body": "**<sub><sub>![P2 Badge](https://img.shields.io/badge/P2-yellow?style=flat)</sub></sub>  Keep the decision atomic with what is pushed**\n\nThe verdict is taken before the lock is held, so a concurrent writer can change what the call sends after it was judged.\n\nThe call into `evaluateGate` is where this has to hold. Nothing revalidates it, so the race stands."
+    },
+    {
+      "threadId": "FKG2",
+      "commentId": 701,
+      "reviewId": "PRR_FK1",
+      "createdAt": "2026-09-01T02:00:00Z",
+      "path": "src/tool.ts",
+      "line": 101,
+      "isResolved": false,
+      "isOutdated": false,
+      "body": "**<sub><sub>![P2 Badge](https://img.shields.io/badge/P2-yellow?style=flat)</sub></sub>  Revalidate the ref along with the revision**\n\nThe revision is compared but the ref is not, so a concurrent writer pointing another ref at the same revision passes `evaluateGate` unchanged. Nothing revalidates it, so the race stands."
+    },
+    {
+      "threadId": "FKG3",
+      "commentId": 702,
+      "reviewId": "PRR_FK2",
+      "createdAt": "2026-09-01T03:00:00Z",
+      "path": "src/tool.ts",
+      "line": 102,
+      "isResolved": false,
+      "isOutdated": false,
+      "body": "**<sub><sub>![P2 Badge](https://img.shields.io/badge/P2-yellow?style=flat)</sub></sub>  Judge the identity that was captured**\n\nThe reads still follow ambient state rather than the identity captured up front, so the verdict can describe something the call will not send.\n\nThe call into `evaluateGate` is where this has to hold. A concurrent writer wins the race unless this is revalidated."
+    }
+  ],
+  "sources": {
+    "src/tool.ts": "/*\nimport { evaluateGate } from './gate.js';\nimport { evaluateGate } from './fake.js';\n*/\nconst marker = \"/*\";\nimport { writeMessageOut } from './db/messages-out.js';\n",
+    "src/gate.ts": "export function evaluateGate() {}\n",
+    "src/db/messages-out.ts": "export function writeMessageOut() {}\n"
+  }
+}
