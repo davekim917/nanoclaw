@@ -857,6 +857,73 @@ describe('review-churn gate', () => {
     expect(gate(vague).decision.unlifted).toHaveLength(2);
   });
 
+  it('reads seam sources from the pinned commit, not from the checkout', () => {
+    // Same-topic siblings share a worktree, so the checkout can change while
+    // the gate runs. With a commit pinned, the classifier must derive its seams
+    // from that commit's files — otherwise a sibling switching branches
+    // mid-verdict decides what the push is judged against.
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'review-churn-src-'));
+    const git = (...args: string[]) => {
+      const res = spawnSync('git', args, {
+        cwd: root,
+        encoding: 'utf8',
+        env: {
+          ...process.env,
+          GIT_AUTHOR_DATE: '2026-09-01T16:00:00Z',
+          GIT_COMMITTER_DATE: '2026-09-01T16:00:00Z',
+          GIT_AUTHOR_NAME: 'test',
+          GIT_AUTHOR_EMAIL: 'test@example.com',
+          GIT_COMMITTER_NAME: 'test',
+          GIT_COMMITTER_EMAIL: 'test@example.com',
+        },
+      });
+      if (res.status !== 0) throw new Error(`git ${args.join(' ')}: ${res.stderr}`);
+      return res.stdout.trim();
+    };
+    const write = (file: string, body: string) => {
+      fs.mkdirSync(path.dirname(path.join(root, file)), { recursive: true });
+      fs.writeFileSync(path.join(root, file), body);
+    };
+    try {
+      git('init', '-q', '-b', 'main');
+      write('src/mailbox/write.ts', 'export function writeSessionMessage() {}\nexport function wakeContainer() {}\n');
+      for (const site of ['src/router.ts', 'src/delivery.ts', 'src/tasks.ts', 'src/dashboard/close.ts']) {
+        write(site, "import { writeSessionMessage, wakeContainer } from '../mailbox/write.js';\n");
+      }
+      // The sites' real imports, as the pinned commit has them.
+      write('src/router.ts', "import { writeSessionMessage, wakeContainer } from './mailbox/write.js';\n");
+      write('src/delivery.ts', "import { writeSessionMessage } from './mailbox/write.js';\n");
+      write('src/tasks.ts', "import { wakeContainer } from './mailbox/write.js';\n");
+      write('src/dashboard/close.ts', "import { writeSessionMessage } from '../mailbox/write.js';\n");
+      git('add', '-A');
+      git('commit', '-qm', 'the sites as the push will send them');
+      const pinned = git('rev-parse', 'HEAD');
+
+      // A sibling now empties every site in the CHECKOUT, which would leave the
+      // classifier with no imports to find and no seam to gate on.
+      for (const site of ['src/router.ts', 'src/delivery.ts', 'src/tasks.ts', 'src/dashboard/close.ts']) {
+        write(site, '// a sibling switched branches\n');
+      }
+
+      const payload = fixture('toctou-class');
+      delete payload.sources;
+      payload.repoRoot = root;
+      payload.commits = [];
+      payload.worktree = [];
+
+      // Unpinned, the checkout decides and the class has no seam to gate on.
+      const unpinned = JSON.parse(spawn(['classify', '--json'], payload).stdout) as Report;
+      expect(unpinned.classes.find((c) => c.rounds >= 3)!.seam).toBeNull();
+
+      // Pinned to the commit being pushed, the seam is the one that commit has.
+      const pinnedReport = JSON.parse(spawn(['classify', '--json', '--head', pinned], payload).stdout) as Report;
+      expect(pinnedReport.classes.find((c) => c.rounds >= 3)!.seam).toBe('src/mailbox/write.ts');
+      expect(spawn(['gate', '--json', '--committed-only', '--head', pinned], payload).status).toBe(3);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it('reads the history of the commit it is given, not of whatever HEAD points at', () => {
     // A caller that has pinned which commit it is about to push passes --head.
     // Without it the verdict is about the checkout, which a sibling can move:

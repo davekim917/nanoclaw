@@ -376,14 +376,40 @@ export function resolveSpec(fromFile, spec) {
   return joined.replace(/\.js$/, '.ts');
 }
 
+/**
+ * One file, as the gate is entitled to see it.
+ *
+ * When the caller has pinned a commit — `--head`, set by anything about to
+ * push that commit — every read comes from THAT commit, not from the checkout.
+ * Same-topic siblings share a worktree, so the checkout can change while the
+ * gate runs: a sibling switching branches mid-verdict would otherwise have the
+ * classifier deriving seams from files the push will not send.
+ *
+ * This is the one place source text enters the classifier, which is why the
+ * pinning lives here. Binding the reads one kind at a time — the history, then
+ * the PR lookup, then the sources — is what produced four rounds of this
+ * finding, each at a different read.
+ */
 function readSource(file, ctx) {
   if (ctx.sources && Object.prototype.hasOwnProperty.call(ctx.sources, file)) return ctx.sources[file];
   if (!ctx.repoRoot) return null;
+  if (ctx.head) return blobAt(ctx.head, file, ctx);
   try {
     return fs.readFileSync(path.join(ctx.repoRoot, file), 'utf8');
   } catch {
     return null;
   }
+}
+
+/** A file's contents at one commit, cached. Null when it is not there. */
+function blobAt(ref, file, ctx) {
+  if (!ctx.blobCache) ctx.blobCache = new Map();
+  const key = `${ref}:${file}`;
+  if (ctx.blobCache.has(key)) return ctx.blobCache.get(key);
+  const text = git(ctx.repoRoot, ['show', `${ref}:${file}`]);
+  const value = text === '' ? null : text;
+  ctx.blobCache.set(key, value);
+  return value;
 }
 
 /**
@@ -519,6 +545,7 @@ function moduleExists(spec, ctx) {
     if (!ctx.repoRoot) return false;
   }
   if (!ctx.repoRoot) return false;
+  if (ctx.head) return candidates.some((c) => blobAt(ctx.head, c, ctx) != null);
   return candidates.some((c) => {
     try {
       return fs.existsSync(path.join(ctx.repoRoot, c));
@@ -564,7 +591,7 @@ function buildClass(signature, group, derived) {
 }
 
 export function classify(payload) {
-  const ctx = { repoRoot: payload.repoRoot, sources: payload.sources };
+  const ctx = { repoRoot: payload.repoRoot, sources: payload.sources, head: payload.head };
   const findings = (payload.findings ?? []).filter((f) => f && f.body);
 
   // Pass 1 — group by invariant signature.
@@ -850,7 +877,7 @@ function reframeTrailers(commits) {
  */
 export function decideGate(payload, options = {}) {
   const report = classify(payload);
-  const ctx = { repoRoot: payload.repoRoot, sources: payload.sources };
+  const ctx = { repoRoot: payload.repoRoot, sources: payload.sources, head: payload.head };
   const commits = payload.commits ?? [];
   const worktree = payload.worktree ?? [];
 
@@ -1114,14 +1141,16 @@ export async function main(argv) {
     process.stderr.write(`review-churn: payload is not JSON (${err.message})\n`);
     return 2;
   }
+  // `--head` binds every read the classifier makes, so it is parsed before
+  // either command rather than only on the gate path.
+  const headFlag = argv.indexOf('--head');
+  const head = headFlag >= 0 ? argv[headFlag + 1] : undefined;
   if (cmd === 'classify') {
-    const report = classify(payload);
+    const report = classify({ ...payload, head });
     process.stdout.write(json ? `${JSON.stringify(report, null, 2)}\n` : `${renderClasses(report)}\n`);
     return 0;
   }
-  const headFlag = argv.indexOf('--head');
-  const head = headFlag >= 0 ? argv[headFlag + 1] : undefined;
-  const context = gitContext(payload, head);
+  const context = gitContext({ ...payload, head }, head);
   if (argv.includes('--committed-only')) context.worktree = [];
   const decision = decideGate(context, {
     allowSitePatch: argv.includes('--allow-site-patch') ? true : undefined,
