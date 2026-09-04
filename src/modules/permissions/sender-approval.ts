@@ -246,7 +246,15 @@ function fyiRecipients(agentGroupId: string | null): string[] {
   return ordered;
 }
 
-/** First owner with a display_name, for the decline copy. */
+/** A usable display name, or null — an empty string is not a name. */
+function nonEmpty(name: string | null | undefined): string | null {
+  return name && name.length > 0 ? name : null;
+}
+
+/**
+ * First owner with a display_name, for the decline copy. Used only when the
+ * FYI recipient is not itself an owner we can name — see declineAndNotify.
+ */
 function ownerDisplayName(): string | null {
   for (const owner of getOwners()) {
     const name = getUser(owner.user_id)?.display_name;
@@ -381,16 +389,30 @@ export async function declineAndNotify(input: DeclineAndNotifyInput): Promise<vo
         // in THIS workspace, so it must not fall back to a different surface
         // where the same owner happens to be registered (cross-tenant audit
         // 2026-05-03).
-        await pickApprovalDelivery(approvers, event.channelType, { sameChannelTypeOnly: true })
+        //
+        // `instance` so a cold DM row is created on the origin's adapter
+        // instance. The FYI below dispatches on the row's exact instance key,
+        // and a row stamped with the bare channel type resolves no adapter on
+        // an install whose bots are all named instances — the owner would
+        // silently miss the notice while the 24h stamp suppressed a retry.
+        await pickApprovalDelivery(approvers, event.channelType, {
+          sameChannelTypeOnly: true,
+          instance: originMg?.instance ?? event.instance,
+        })
       : null;
 
   // Name the recipient only when they are an owner. `fyiRecipients` falls back
   // to admins for reachability, and an admin is not whose personal agent this
   // is — in that case the honest name is still an owner's, even an unreachable
   // one.
+  //
+  // An owner recipient with no display_name gets the generic label, NOT
+  // another owner's name: falling through to `ownerDisplayName()` there would
+  // reintroduce exactly the mismatch this ordering exists to prevent, telling
+  // the stranger they reached one owner while a different one is notified.
   const ownerIds = new Set(getOwners().map((r) => r.user_id));
-  const namedOwner =
-    (target && ownerIds.has(target.userId) ? getUser(target.userId)?.display_name : null) || ownerDisplayName();
+  const targetIsOwner = target !== null && ownerIds.has(target.userId);
+  const namedOwner = targetIsOwner ? nonEmpty(getUser(target.userId)?.display_name) : ownerDisplayName();
   const declineText =
     input.declineText ?? `I'm ${namedOwner ?? 'my owner'}'s personal agent — I can't help you directly.`;
   let declined = true;
