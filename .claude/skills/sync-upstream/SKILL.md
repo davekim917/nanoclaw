@@ -87,7 +87,7 @@ Port rules that have already bitten:
 - **Every git command in a port worker's brief is `git -C /abs/path ...`**, never a bare `cd && git`; a fallen-through `cd` chain has landed a `git checkout <sha> -- .` in the live checkout before.
 - **Never `git stash`, `-u` or otherwise**, in the live checkout or a worktree a peer might touch — live sessions write untracked files a stash would sweep up.
 - **Synthetic ids only** in anything committed — source, tests, comments. A real `sess-…`/`ag-…`/`mg-…` id or an operator/client name in a comment blocks the next push from the live checkout (the boundary hook is blind in a worktree, and a GitHub merge runs no hook at all).
-- **Before any push from a worktree**, run the boundary check with `--root` pointing at the *worktree* (that's the content it scans — `--index` reads each tracked file via `git show :<file>` under `--root`), executed from the live checkout so `pnpm`/`tsx` resolve — the same split the repo's own pre-push hook uses: `(cd /home/ubuntu/nanoclaw-v2 && pnpm run check:public-boundary -- --root "$W" --index)`. Pointing `--root` at the live checkout instead scans the live checkout's own (usually empty) index and proves nothing about the worktree's commits.
+- **Before any push from a worktree**, run the boundary check with `--root` pointing at the *worktree* (that's the content it scans — `--index` reads each tracked file via `git show :<file>` under `--root`), executed from the live checkout so `pnpm`/`tsx` resolve — the same split the repo's own pre-push hook uses: `(cd /home/ubuntu/nanoclaw-v2 && pnpm run check:public-boundary -- --root "$W" --index)`. Pointing `--root` at the live checkout instead scans the live checkout's own (usually empty) index and proves nothing about the worktree's commits. **Read the message, not just the exit code**: if it says `structural patterns only — no identifier registry found` instead of `identifiers from main checkout`/`identifiers from local install`, the check was blind to real names and ids — it still exits 0, so a green run is not proof — do not push until the registry resolves (fork issue #374 tracks making this fail closed).
 - **Targeted vitest only**, never a full suite concurrently with another session: `ionice -c3 nice -n 10 node_modules/.bin/vitest run --pool=forks --maxWorkers=2 <files>` at load < 8.
 - **A bare `vi.mock` factory of a project module must spread `importOriginal`** (`vi.mock('../foo.js', async (importOriginal) => ({ ...(await importOriginal()), ... }))`) so a batch that adds an export doesn't silently undefine it for every mocking suite — except `./log.js`, which is intentionally a full stub (mocking the logger's real implementation is never wanted).
 - **Codex thread counts come from the GraphQL `reviewThreads` API only** — the REST login filter silently returns 0 and reads as a clean review that never happened.
@@ -125,27 +125,29 @@ node -p "require('./dist/BUILD_INFO.json').sha" && git rev-parse HEAD && git rev
 grep -c <a-symbol-the-PR-introduced> dist/<file>.js   # content proof — a sha match alone is not proof the PR is in dist
 ```
 
-Restart only at a moment with **zero `Status delivered` lines in the previous 120 s** — a short waiter loop checking that is fine — then:
+Restart only at a moment with **zero `Status delivered` lines in the previous 120 s** — a short waiter loop checking that is fine — then checkpoint the logs (they're append-only across restarts; logrotate is daily via `copytruncate`, not per-restart, so a whole-file grep after the first successful boot ever is permanently non-zero and proves nothing about *this* restart) before restarting:
 
 ```bash
+LOG0=$(wc -l < logs/nanoclaw.log 2>/dev/null || echo 0)
+ERR0=$(wc -l < logs/nanoclaw.error.log 2>/dev/null || echo 0)
 sudo systemctl restart nanoclaw-v2
 ```
 
-**Post-restart gate, read at +2.5 minutes with ANSI codes stripped from the log — all of it, or it is not deployed:**
+**Post-restart gate, read at +2.5 minutes with ANSI codes stripped, scoped to `tail -n +$((LOG0+1)) logs/nanoclaw.log` / `tail -n +$((ERR0+1)) logs/nanoclaw.error.log` — all required rows, or it is not deployed:**
 
 | Check | What passes |
 |---|---|
-| Preflight | `OneCLI preflight ok` present |
-| OneCLI gateway | `grep -c 'OneCLI gateway applied' logs/nanoclaw.log` > 0 within 2 min — the spawn-success signal |
-| Channel adapters | 12 `Channel adapter started` lines |
-| Errors | 0 `ERROR` lines |
-| Warnings | every WARN class present is compared against the previous few hours in `logs/nanoclaw.error.log`; a class never seen before is investigated before calling the deploy green, a familiar recurring one is not |
+| Preflight | `OneCLI preflight ok` present in the scoped tail |
+| OneCLI gateway | `OneCLI gateway applied` count > 0 in the scoped tail within 2 min — the spawn-success signal |
+| Channel adapters | 12 `Channel adapter started` lines in the scoped tail |
+| Errors | 0 `ERROR` lines in the scoped tail |
+| Warnings | every WARN class present in the scoped error-log tail is compared against the previous few hours; a class never seen before is investigated before calling the deploy green, a familiar recurring one is not |
 | Restarts | `NRestarts` 0 (no crash loop) |
 | Env proxy | `NODE_USE_ENV_PROXY` absent from the daemon environ |
-| Seam counters | `Host sweep duty failed` = 0; `Host sweep mailbox unopenable` = 0; `tick threw` = 0 |
-| Quiet cache | `Host sweep quiet cache warmed warmed=N` present, N roughly the fleet size after the first post-boot tick |
-| First tick timing | a `Host sweep tick timing` line within 2 min of restart, with `spawnWaitMs` near 0 |
-| Independent read | a second session re-reads the same six checks at +6 minutes when one is available — a single reader's clean read is not the same guarantee |
+| Seam counters | in the scoped tail: `Host sweep duty failed` = 0; `Host sweep mailbox unopenable` = 0; `tick threw` = 0 |
+| Quiet cache | `Host sweep quiet cache warmed warmed=N` present in the scoped tail, N roughly the fleet size after the first post-boot tick |
+| First tick timing | *conditional, not required*: `src/host-sweep.ts` only emits `Host sweep tick timing` when that sweep took ≥1 s, so its absence on a fast, healthy first sweep is not a failure — if the line does appear in the scoped tail, `spawnWaitMs` must be near 0 |
+| Independent read | a second session re-reads the same checks at +6 minutes when one is available — a single reader's clean read is not the same guarantee |
 
 Record every restart — time, PRs riding it, gate result — in `groups/_ops/upstream-rebaseline-2026-09/deploy-schedule.md` (private groups repo, not this one).
 
@@ -168,7 +170,7 @@ Rollback: restore the apt source backup, `apt-get install --allow-downgrades nod
 The upstream sync runs with several sessions up at once, sharing the fork and the live checkout. Roles (adjust names to whoever is actually running each): an **orchestrator/deployer**, who is the live checkout's single writer and owns the triage pass, the deploy schedule, and the process/docs conflict themes (this skill included); a **mailbox/runner owner**, who takes the `agent-runner/src` and mailbox-adjacent conflict themes; a **seam-2 owner**, who takes the host-sweep/scheduling/permissions/agent-to-agent/cli-resources themes and any seam-2 follow-up work (such as the ownership ratchet in §1).
 
 - **Fences during a gate window.** While a deploy gate is running, no other session runs vitest against the live checkout's tree — host suites already collide across concurrent worktrees on shared fixture paths, and a gate read competing with a builder's I/O is not a clean read.
-- **Patch inbox, not direct writes.** A session that isn't the deployer never commits to the live checkout. It produces `git format-patch` files into the deployer's scratchpad inbox and messages the filenames; the deployer applies them (`git am`) between deploy windows.
+- **Patch inbox, not direct writes.** A session that isn't the deployer never commits to the live checkout. It produces `git format-patch` files into the deployer's scratchpad inbox and messages the filenames; the deployer applies them with `git am` in a **scratch worktree**, never directly onto the live checkout. The live checkout is checked out on `main`; a `git am` run there commits straight onto local `main` ahead of `origin/main`, which `check-build-clean`'s freshness gate then refuses to build from, and it skips the PR/review step every other change goes through. Apply the patch in a worktree, push the branch, and land it through the normal §3 PR flow before it ever reaches the live checkout via `git pull --ff-only`.
 - **Check "is this mine?" before touching any dirt in the live checkout.** `git status --porcelain` plus `/proc/*/cwd` for every process rooted there — a change you didn't make is not automatically a peer's mistake to clean up; it may be an operator-side tool.
 - **Operator-side tools may edit the live checkout directly** — an interactive editor, an interactive Codex TUI launched in that directory. That's expected, not a collision to fix. If you find dirt you didn't create and can't attribute to a known peer session, rescue it to a patch file before doing anything destructive; never `reset`/`checkout -- .`/`clean` without first knowing whose work it is.
 - **If the operator's tool needs to move its work off the live checkout** (because it's mid-edit, still on `main`, when a deploy window needs the tree clean), give the exact commands — "commit to a branch" alone reads as switching the shared checkout, which breaks every other session's assumption that it's on `main`. Branch **before** committing (a commit made first lands on shared `main`, not on a branch that doesn't exist yet), and stage only the paths that are actually the operator's WIP (`git add -A` sweeps up any other session's or operator-side tool's untracked dirt too):
