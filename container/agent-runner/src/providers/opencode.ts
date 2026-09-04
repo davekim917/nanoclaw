@@ -343,6 +343,30 @@ function mergeNoProxy(current: string | undefined, addition: string): string {
 
 const SESSION_STATUS_RETRY_ERROR_AFTER = 3;
 
+/**
+ * Should this turn be replayed on a brand-new session?
+ *
+ * Codex's `startOrResumeCodexThread` starts a fresh thread when `thread/resume`
+ * reports the id gone. OpenCode's equivalent failure is quieter: a poisoned
+ * session accepts `promptAsync`, emits `session.idle` at step 0 having produced
+ * no assistant work, and the runner treats that as a finished turn — silence,
+ * every turn, forever.
+ *
+ * Only a RESUME that produced no assistant work falls back, and only once per
+ * query. A brand-new session that stays dry is a model or tools miss, not a
+ * dead continuation, and replaying it would double the spend for the same
+ * silence. "Work" is deliberately wide (a part of any type, a provider error on
+ * the assistant record, a permission, a question, a compaction) so a turn that
+ * did something and merely said nothing is never discarded.
+ */
+export function isEmptyOpenCodeResume(opts: {
+  resumedExistingSession: boolean;
+  alreadyFellBack: boolean;
+  sawAssistantWork: boolean;
+}): boolean {
+  return opts.resumedExistingSession && !opts.alreadyFellBack && !opts.sawAssistantWork;
+}
+
 /** Stale / dead OpenCode session heuristics (complement Claude-centric host patterns). */
 const STALE_SESSION_RE =
   /no conversation found|ENOENT.*\.jsonl|session.*not found|NotFoundError|connection reset|ECONNRESET|404|event timeout/i;
@@ -1034,15 +1058,49 @@ function sessionErrorMessage(props: { error?: unknown }): string {
   return JSON.stringify(props.error) || 'OpenCode session error';
 }
 
+/**
+ * Narrow runtime surface so a test can drive `query()` without spawning
+ * `opencode serve`. Production passes nothing and goes through
+ * `ensureSharedRuntime`; only the shape this module actually calls is declared.
+ */
+export interface OpenCodeRuntimeHandle {
+  client: {
+    session: {
+      create(): Promise<{ data?: { id?: string }; error?: unknown }>;
+      promptAsync(params: {
+        path: { id: string };
+        body: {
+          parts: Array<{ type: 'text'; text: string } | FilePartInput>;
+          model?: { providerID: string; modelID: string };
+        };
+      }): Promise<{ error?: unknown }>;
+    };
+    postSessionIdPermissionsPermissionId(params: {
+      path: { id: string; permissionID: string };
+      body: { response: 'once' | 'always' | 'reject' };
+    }): Promise<unknown>;
+  };
+  stream: AsyncGenerator<{ type: string; properties: Record<string, unknown> }, void, void>;
+  questionClient: QuestionClient;
+}
+
+export interface OpenCodeRuntimeDeps {
+  getRuntime(options: ProviderOptions, cwd: string | undefined, turn: OpenCodeTurnOverrides): Promise<OpenCodeRuntimeHandle>;
+}
+
 export class OpenCodeProvider implements AgentProvider {
   readonly supportsNativeSlashCommands = false;
 
   private readonly options: ProviderOptions;
+  private readonly runtime?: OpenCodeRuntimeDeps;
   private activeSessionId: string | undefined;
   private memorySessionHook?: MemorySessionHookRegistration;
 
-  constructor(options: ProviderOptions = {}) {
+  // `runtime` is a test seam only. The registration below passes nothing, so
+  // every production spawn goes through ensureSharedRuntime unchanged.
+  constructor(options: ProviderOptions = {}, runtime?: OpenCodeRuntimeDeps) {
     this.options = options;
+    this.runtime = runtime;
   }
 
   isSessionInvalid(err: unknown): boolean {
@@ -1064,7 +1122,18 @@ export class OpenCodeProvider implements AgentProvider {
 
     // Each queued turn carries its own media, so a photo sent as a follow-up
     // reaches the model as a file part rather than only as prose.
-    const pending: Array<{ text: string; attachments?: PromptAttachment[] }> = [];
+    const pending: Array<{
+      text: string;
+      attachments?: PromptAttachment[];
+      /**
+       * The UNWRAPPED prompt, set only on an opening turn that resumed a
+       * persisted continuation. Its presence is what licenses the empty-resume
+       * fallback; its value is what the replay re-composes from, so the
+       * replacement session gets the prompt shape a first-time session would
+       * have got instead of a second <system> block stacked on the first.
+       */
+      replayPrompt?: string;
+    }> = [];
     let waiting: (() => void) | null = null;
     let ended = false;
     let aborted = false;
@@ -1088,6 +1157,7 @@ export class OpenCodeProvider implements AgentProvider {
     pending.push({
       text: wrapPromptWithContext(input.prompt, systemInstructions, effectiveModel),
       attachments: input.attachments,
+      replayPrompt: input.continuation ? input.prompt : undefined,
     });
 
     const kick = (): void => {
@@ -1097,10 +1167,14 @@ export class OpenCodeProvider implements AgentProvider {
     const self = this;
     const queryCwd = input.cwd;
     const IDLE_TIMEOUT_MS = 90_000;
+    // At most one empty-resume fallback per query() — see isEmptyOpenCodeResume.
+    let emptyResumeFellBack = false;
 
     async function* gen(): AsyncGenerator<ProviderEvent> {
       let initYielded = false;
-      const rt = await ensureSharedRuntime(self.options, queryCwd, turn);
+      const rt: OpenCodeRuntimeHandle = self.runtime
+        ? await self.runtime.getRuntime(self.options, queryCwd, turn)
+        : await ensureSharedRuntime(self.options, queryCwd, turn);
       const { client, stream, questionClient } = rt;
 
       while (!aborted) {
@@ -1114,7 +1188,7 @@ export class OpenCodeProvider implements AgentProvider {
         if (aborted) return;
         if (pending.length === 0 && ended) return;
 
-        const { text, attachments } = pending.shift()!;
+        const { text, attachments, replayPrompt } = pending.shift()!;
         let sessionId = self.activeSessionId;
 
         if (!sessionId) {
@@ -1132,185 +1206,314 @@ export class OpenCodeProvider implements AgentProvider {
           initYielded = true;
         }
 
-        const promptRes = await client.session.promptAsync({
-          path: { id: sessionId },
-          // body.model carries the per-turn `-m` model (provider/id split). When
-          // unset (no override + no env default) opencode uses the session/server
-          // default. Switching models mid-session is just a different body.model
-          // on the next prompt — no server respawn.
-          body: { parts: buildPromptParts(text, attachments), ...(promptModel ? { model: promptModel } : {}) },
-        });
-        if (promptRes.error) {
-          self.activeSessionId = undefined;
-          throw new Error(`OpenCode promptAsync: ${JSON.stringify(promptRes.error)}`);
-        }
-
-        // Key by part.id (TextPart.id is unique per part, per SDK types).
-        // Multiple text parts can share a single messageID — prose before /
-        // after tool use are two parts of the same assistant message — and
-        // previously keying by messageID overwrote earlier parts.
-        const partTextById = new Map<string, { messageID: string; text: string }>();
-        const roleByMessageId = new Map<string, string>();
-        // Fleet Hardening Phase 0.1 (see TurnUsageInfo). One AssistantMessage
-        // = one LLM response, and its tokens/cost are ITS OWN, not a running
-        // total across the turn's messages. `message.updated` fires
-        // repeatedly as a single message streams, so the last write for a
-        // given id wins and is that message's final figure by the time
-        // session.idle ends the turn — but the turn's usage is the SUM over
-        // every id in this map, which is what the result event reports.
-        const assistantUsageById = new Map<string, OpenCodeAssistantUsage>();
-        let lastEventAt = Date.now();
-        let eventTimedOut = false;
-        const timeoutCheck = setInterval(() => {
-          if (Date.now() - lastEventAt > IDLE_TIMEOUT_MS) {
-            log(`OpenCode event timeout (${IDLE_TIMEOUT_MS}ms) — clearing session ${sessionId}`);
-            eventTimedOut = true;
+        /**
+         * Run one prompt to `session.idle` on `turnSessionId`, yielding the
+         * turn's provider events and returning what the turn produced.
+         *
+         * Extracted so the empty-resume fallback below can run a SECOND turn on
+         * a fresh session with the same machinery. Everything inside is the
+         * turn body as it stood before, plus the `sawAssistantWork` tracking
+         * that fallback needs.
+         */
+        async function* runTurn(
+          turnSessionId: string,
+          turnText: string,
+          turnAttachments: typeof attachments,
+        ): AsyncGenerator<
+          ProviderEvent,
+          {
+            resultText: string;
+            sawAssistantWork: boolean;
+            stepCount: number;
+            usage: ReturnType<typeof sumOpenCodeTurnUsage>;
+          }
+        > {
+          const promptRes = await client.session.promptAsync({
+            path: { id: turnSessionId },
+            // body.model carries the per-turn `-m` model (provider/id split). When
+            // unset (no override + no env default) opencode uses the session/server
+            // default. Switching models mid-session is just a different body.model
+            // on the next prompt — no server respawn.
+            body: {
+              parts: buildPromptParts(turnText, turnAttachments),
+              ...(promptModel ? { model: promptModel } : {}),
+            },
+          });
+          if (promptRes.error) {
             self.activeSessionId = undefined;
-            destroySharedRuntime();
-            kick();
+            throw new Error(`OpenCode promptAsync: ${JSON.stringify(promptRes.error)}`);
           }
-        }, 5000);
 
-        try {
-          turn: while (true) {
-            if (aborted) return;
-            if (eventTimedOut) {
-              throw new Error(`OpenCode event timeout (${IDLE_TIMEOUT_MS}ms)`);
+          // Key by part.id (TextPart.id is unique per part, per SDK types).
+          // Multiple text parts can share a single messageID — prose before /
+          // after tool use are two parts of the same assistant message — and
+          // previously keying by messageID overwrote earlier parts.
+          const partTextById = new Map<string, { messageID: string; text: string }>();
+          const roleByMessageId = new Map<string, string>();
+          // Every message that produced at least one part of ANY type. A tool
+          // call is work even though it carries no text, so this is wider than
+          // partTextById on purpose — it is what separates a live session from a
+          // poisoned one below.
+          const partMessageIds = new Set<string>();
+          // `message.updated` fires repeatedly for the same record, so latch the
+          // error rather than reading only the last event.
+          const erroredMessageIds = new Set<string>();
+          // Set only by signals that have no message record of their own
+          // (permissions, questions, compaction). Message-derived work is
+          // decided once, after the turn, in the loop below.
+          let sawAssistantWork = false;
+          // Fleet Hardening Phase 0.1 (see TurnUsageInfo). One AssistantMessage
+          // = one LLM response, and its tokens/cost are ITS OWN, not a running
+          // total across the turn's messages. `message.updated` fires
+          // repeatedly as a single message streams, so the last write for a
+          // given id wins and is that message's final figure by the time
+          // session.idle ends the turn — but the turn's usage is the SUM over
+          // every id in this map, which is what the result event reports.
+          const assistantUsageById = new Map<string, OpenCodeAssistantUsage>();
+          let lastEventAt = Date.now();
+          let eventTimedOut = false;
+          const timeoutCheck = setInterval(() => {
+            if (Date.now() - lastEventAt > IDLE_TIMEOUT_MS) {
+              log(`OpenCode event timeout (${IDLE_TIMEOUT_MS}ms) — clearing session ${turnSessionId}`);
+              eventTimedOut = true;
+              self.activeSessionId = undefined;
+              destroySharedRuntime();
+              kick();
             }
+          }, 5000);
 
-            const { value: ev, done } = await stream.next();
-            if (done) {
-              throw new Error('OpenCode SSE stream ended unexpectedly');
-            }
+          try {
+            turn: while (true) {
+              if (aborted) return { resultText: '', sawAssistantWork, stepCount: 0, usage: undefined };
+              if (eventTimedOut) {
+                throw new Error(`OpenCode event timeout (${IDLE_TIMEOUT_MS}ms)`);
+              }
 
-            // Heartbeats prove the SSE connection is alive but carry no content.
-            // Reset the idle timer so a long-thinking subagent (verified
-            // empirically: Kimi K2.6 can think silently for 5-7min mid-turn
-            // while dispatching parallel subagents) doesn't trip the 90s
-            // false-positive timeout. Skip the `activity` yield to avoid
-            // flooding the consumer with no-op events.
-            if (!ev?.type || ev.type === 'server.connected') continue;
-            if (ev.type === 'server.heartbeat') {
+              const { value: ev, done } = await stream.next();
+              if (done) {
+                throw new Error('OpenCode SSE stream ended unexpectedly');
+              }
+
+              // Heartbeats prove the SSE connection is alive but carry no content.
+              // Reset the idle timer so a long-thinking subagent (verified
+              // empirically: Kimi K2.6 can think silently for 5-7min mid-turn
+              // while dispatching parallel subagents) doesn't trip the 90s
+              // false-positive timeout. Skip the `activity` yield to avoid
+              // flooding the consumer with no-op events.
+              if (!ev?.type || ev.type === 'server.connected') continue;
+              if (ev.type === 'server.heartbeat') {
+                lastEventAt = Date.now();
+                continue;
+              }
+
               lastEventAt = Date.now();
-              continue;
-            }
+              yield { type: 'activity' };
 
-            lastEventAt = Date.now();
-            yield { type: 'activity' };
-
-            switch (ev.type) {
-              case 'message.updated': {
-                const info = ev.properties.info as
-                  | {
-                      id?: string;
-                      role?: string;
-                      modelID?: string;
-                      providerID?: string;
-                      cost?: number;
-                      tokens?: { input?: number; output?: number; cache?: { read?: number; write?: number } };
-                    }
-                  | undefined;
-                if (info?.id && info?.role) {
-                  roleByMessageId.set(info.id, info.role);
-                  if (info.role === 'assistant') assistantUsageById.set(info.id, info);
-                }
-                break;
-              }
-              case 'message.part.updated': {
-                const part = ev.properties.part as
-                  | { id?: string; type?: string; messageID?: string; text?: string }
-                  | undefined;
-                if (part?.type === 'text' && part.id && part.messageID && part.text) {
-                  partTextById.set(part.id, { messageID: part.messageID, text: part.text });
-                }
-                break;
-              }
-              case 'permission.updated': {
-                const perm = ev.properties as { id?: string; sessionID?: string };
-                if (perm.sessionID === sessionId && perm.id) {
-                  try {
-                    await client.postSessionIdPermissionsPermissionId({
-                      path: { id: sessionId, permissionID: perm.id },
-                      body: { response: 'always' },
-                    });
-                  } catch (err) {
-                    log(`Failed to auto-reply permission: ${err instanceof Error ? err.message : String(err)}`);
+              switch (ev.type) {
+                case 'message.updated': {
+                  const info = ev.properties.info as
+                    | {
+                        id?: string;
+                        role?: string;
+                        sessionID?: string;
+                        error?: unknown;
+                        modelID?: string;
+                        providerID?: string;
+                        cost?: number;
+                        tokens?: { input?: number; output?: number; cache?: { read?: number; write?: number } };
+                      }
+                    | undefined;
+                  if (info?.sessionID && info.sessionID !== turnSessionId) break;
+                  if (info?.id && info?.role) {
+                    roleByMessageId.set(info.id, info.role);
+                    if (info.error) erroredMessageIds.add(info.id);
+                    if (info.role === 'assistant') assistantUsageById.set(info.id, info);
                   }
+                  break;
                 }
-                break;
-              }
-              case 'question.asked': {
-                // Answered regardless of sessionID: the OpenCode server is
-                // shared across sessions and ONE unanswered question wedges the
-                // whole server, so this must not filter by turn.
-                const req = ev.properties as { id?: string; sessionID?: string; questions?: unknown[] };
-                await handleQuestionAsked(questionClient, req);
-                break;
-              }
-              case 'session.status': {
-                const props = ev.properties as {
-                  sessionID?: string;
-                  status?: { type?: string; attempt?: number; message?: string };
-                };
-                if (props.sessionID !== sessionId) break;
-                const st = props.status;
-                if (
-                  st?.type === 'retry' &&
-                  typeof st.attempt === 'number' &&
-                  st.attempt >= SESSION_STATUS_RETRY_ERROR_AFTER &&
-                  st.message
-                ) {
-                  self.activeSessionId = undefined;
-                  throw new Error(`OpenCode retry limit (${st.attempt}): ${st.message}`);
+                case 'message.part.updated': {
+                  const part = ev.properties.part as
+                    | { id?: string; type?: string; messageID?: string; sessionID?: string; text?: string }
+                    | undefined;
+                  if (part?.sessionID && part.sessionID !== turnSessionId) break;
+                  if (part?.messageID) partMessageIds.add(part.messageID);
+                  if (part?.type === 'text' && part.id && part.messageID && part.text) {
+                    partTextById.set(part.id, { messageID: part.messageID, text: part.text });
+                  }
+                  break;
                 }
-                break;
-              }
-              case 'session.error': {
-                const props = ev.properties as { sessionID?: string; error?: unknown };
-                if (props.sessionID === sessionId || props.sessionID === undefined) {
-                  self.activeSessionId = undefined;
-                  throw new Error(sessionErrorMessage(props));
+                case 'permission.updated': {
+                  const perm = ev.properties as { id?: string; sessionID?: string };
+                  if (perm.sessionID === turnSessionId && perm.id) {
+                    sawAssistantWork = true;
+                    try {
+                      await client.postSessionIdPermissionsPermissionId({
+                        path: { id: turnSessionId, permissionID: perm.id },
+                        body: { response: 'always' },
+                      });
+                    } catch (err) {
+                      log(`Failed to auto-reply permission: ${err instanceof Error ? err.message : String(err)}`);
+                    }
+                  }
+                  break;
                 }
-                break;
-              }
-              case 'session.idle': {
-                const sid = (ev.properties as { sessionID?: string }).sessionID;
-                if (sid === sessionId) {
-                  break turn;
+                case 'question.asked': {
+                  // Answered regardless of sessionID: the OpenCode server is
+                  // shared across sessions and ONE unanswered question wedges the
+                  // whole server, so this must not filter by turn.
+                  const req = ev.properties as { id?: string; sessionID?: string; questions?: unknown[] };
+                  if (req.sessionID === turnSessionId) sawAssistantWork = true;
+                  await handleQuestionAsked(questionClient, req);
+                  break;
                 }
-                break;
+                case 'session.compacted': {
+                  // Not surfaced as a provider event (the poll-loop's compaction
+                  // reminder is Claude/Codex-side), but a compaction on THIS
+                  // session is real work — counting it stops a
+                  // compaction-only turn from reading as a dead continuation.
+                  if ((ev.properties as { sessionID?: string }).sessionID === turnSessionId) sawAssistantWork = true;
+                  break;
+                }
+                case 'session.status': {
+                  const props = ev.properties as {
+                    sessionID?: string;
+                    status?: { type?: string; attempt?: number; message?: string };
+                  };
+                  if (props.sessionID !== turnSessionId) break;
+                  const st = props.status;
+                  if (
+                    st?.type === 'retry' &&
+                    typeof st.attempt === 'number' &&
+                    st.attempt >= SESSION_STATUS_RETRY_ERROR_AFTER &&
+                    st.message
+                  ) {
+                    self.activeSessionId = undefined;
+                    throw new Error(`OpenCode retry limit (${st.attempt}): ${st.message}`);
+                  }
+                  break;
+                }
+                case 'session.error': {
+                  const props = ev.properties as { sessionID?: string; error?: unknown };
+                  if (props.sessionID === turnSessionId || props.sessionID === undefined) {
+                    self.activeSessionId = undefined;
+                    throw new Error(sessionErrorMessage(props));
+                  }
+                  break;
+                }
+                case 'session.idle': {
+                  const sid = (ev.properties as { sessionID?: string }).sessionID;
+                  if (sid === turnSessionId) {
+                    break turn;
+                  }
+                  break;
+                }
+                default:
+                  break;
               }
-              default:
-                break;
             }
+          } finally {
+            clearInterval(timeoutCheck);
           }
-        } finally {
-          clearInterval(timeoutCheck);
+
+          // Collect all text parts for the LAST assistant message in arrival order
+          // and concatenate. Single-message responses with tool use emit multiple
+          // text parts (prose before tool call, prose after tool call) that share
+          // the same messageID; we want the full assistant response, not just the
+          // last part. Map iteration preserves insertion order, so iterating
+          // partTextById.values() gives parts in the order OpenCode emitted them.
+          let lastAssistantMessageId: string | undefined;
+          for (const [msgId, role] of roleByMessageId) {
+            if (role !== 'assistant') continue;
+            lastAssistantMessageId = msgId;
+            // The bare envelope is the quiet-idle signature. OpenCode opens the
+            // assistant record when the turn starts, so the record existing
+            // proves nothing on its own. Work means it produced at least one
+            // part — or that it carries a provider error, which marks a LIVE
+            // session whose turn failed: replaying that on a fresh session would
+            // discard the history and bury the error.
+            if (partMessageIds.has(msgId) || erroredMessageIds.has(msgId)) sawAssistantWork = true;
+          }
+          let resultText = '';
+          if (lastAssistantMessageId) {
+            const texts: string[] = [];
+            for (const { messageID, text } of partTextById.values()) {
+              if (messageID === lastAssistantMessageId) texts.push(text);
+            }
+            resultText = texts.join('');
+          }
+          // Per-turn cost attribution (Fleet Hardening Phase 0.1 follow-up):
+          // OpenCode's SSE stream has no round-trip counter either. Each
+          // distinct assistant message id is one LLM response (a tool call
+          // triggers a fresh assistant message for the follow-up), so counting
+          // them is the closest available proxy — not a literal HTTP request
+          // count, but the best signal this protocol exposes.
+          //
+          // Counted off assistantUsageById, the SAME map the usage sum below
+          // reads, so the two can never disagree — steps=N and a sum over some
+          // other N' messages is exactly the inconsistency this whole fix is
+          // about. (It's populated under the identical `role === 'assistant'`
+          // condition as roleByMessageId, so this is the same number, sourced
+          // where it can't drift.)
+          const stepCount = assistantUsageById.size;
+          // Summed over that same per-turn map — see sumOpenCodeTurnUsage for
+          // why (and for the evidence that these are per-response, not
+          // cumulative). Subagent responses are included in both, since those
+          // are real spend.
+          const usage = sumOpenCodeTurnUsage(
+            [...assistantUsageById.values()],
+            lastAssistantMessageId ? assistantUsageById.get(lastAssistantMessageId) : undefined,
+          );
+          return { resultText, sawAssistantWork, stepCount, usage };
         }
 
-        // Collect all text parts for the LAST assistant message in arrival order
-        // and concatenate. Single-message responses with tool use emit multiple
-        // text parts (prose before tool call, prose after tool call) that share
-        // the same messageID; we want the full assistant response, not just the
-        // last part. Map iteration preserves insertion order, so iterating
-        // partTextById.values() gives parts in the order OpenCode emitted them.
-        let lastAssistantMessageId: string | undefined;
-        for (const [msgId, role] of roleByMessageId) {
-          if (role === 'assistant') lastAssistantMessageId = msgId;
-        }
-        let resultText = '';
-        if (lastAssistantMessageId) {
-          const texts: string[] = [];
-          for (const { messageID, text } of partTextById.values()) {
-            if (messageID === lastAssistantMessageId) texts.push(text);
+        let outcome = yield* runTurn(sessionId, text, attachments);
+        if (aborted) return;
+
+        // Empty-resume recovery. A poisoned continuation accepts promptAsync,
+        // emits session.idle having produced nothing, and would otherwise be
+        // reported as a finished, silent turn — every turn, forever. Only a
+        // RESUME that produced no assistant work falls back, and only once per
+        // query: a brand-new session that stays dry is a model/tools miss, not a
+        // dead continuation.
+        if (
+          isEmptyOpenCodeResume({
+            resumedExistingSession: replayPrompt !== undefined,
+            alreadyFellBack: emptyResumeFellBack,
+            sawAssistantWork: outcome.sawAssistantWork,
+          })
+        ) {
+          log(`Empty resume on ${sessionId}; starting fresh session.`);
+          emptyResumeFellBack = true;
+          self.activeSessionId = undefined;
+          const created = await client.session.create();
+          if (aborted) return;
+          if (created.error) {
+            throw new Error(`OpenCode: failed to create session: ${JSON.stringify(created.error)}`);
           }
-          resultText = texts.join('');
+          const freshId = created.data?.id;
+          if (!freshId) throw new Error('OpenCode: failed to create session (no id)');
+          sessionId = freshId;
+          self.activeSessionId = freshId;
+          yield { type: 'init', continuation: freshId };
+          initYielded = true;
+          // Compose the replay the way a first-time query composes its opening
+          // prompt rather than wrapping the already-wrapped resume text twice.
+          // `replayPrompt` is defined here: it is what licensed this branch.
+          const retryText = wrapPromptWithContext(replayPrompt!, systemInstructions, effectiveModel);
+          outcome = yield* runTurn(freshId, retryText, attachments);
+          if (aborted) return;
         }
+
         // Empty-turn fallback: the turn completed (session.idle, no error) but
         // produced no text — the model emitted only reasoning/whitespace. Without
         // this the poll-loop delivers nothing and the user sees silence (observed
         // with free-tier nvidia models degenerating). Surface a visible, actionable
         // message instead of dead air.
+        //
+        // Applied to the FINAL outcome, after the empty-resume fallback above, so
+        // a resume that was retried on a fresh session cannot post this warning
+        // for the dead turn AND then answer normally.
+        let resultText = outcome.resultText;
         if (!resultText.trim()) {
           const m = effectiveModel ?? 'the current model';
           const warningText =
@@ -1326,32 +1529,11 @@ export class OpenCodeProvider implements AgentProvider {
             resultText = warningText;
           }
         }
-        // Per-turn cost attribution (Fleet Hardening Phase 0.1 follow-up):
-        // OpenCode's SSE stream has no round-trip counter either. Each
-        // distinct assistant message id is one LLM response (a tool call
-        // triggers a fresh assistant message for the follow-up), so counting
-        // them is the closest available proxy — not a literal HTTP request
-        // count, but the best signal this protocol exposes.
-        //
-        // Counted off assistantUsageById, the SAME map the usage sum below
-        // reads, so the two can never disagree — steps=N and a sum over some
-        // other N' messages is exactly the inconsistency this whole fix is
-        // about. (It's populated under the identical `role === 'assistant'`
-        // condition as roleByMessageId, so this is the same number, sourced
-        // where it can't drift.)
-        const stepCount = assistantUsageById.size;
-        // Summed over that same per-turn map — see sumOpenCodeTurnUsage for
-        // why (and for the evidence that these are per-response, not
-        // cumulative). Subagent responses are included in both, since those
-        // are real spend.
         yield {
           type: 'result',
           text: resultText,
-          steps: stepCount > 0 ? stepCount : null,
-          usage: sumOpenCodeTurnUsage(
-            [...assistantUsageById.values()],
-            lastAssistantMessageId ? assistantUsageById.get(lastAssistantMessageId) : undefined,
-          ),
+          steps: outcome.stepCount > 0 ? outcome.stepCount : null,
+          usage: outcome.usage,
         };
       }
     }
