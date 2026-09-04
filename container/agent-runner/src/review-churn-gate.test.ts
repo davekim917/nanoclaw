@@ -4,7 +4,7 @@
 // must stop the push, and everything else must not. A gate that blocks a push
 // because GitHub was slow would be worked around within a day, which is how
 // the advisory detector this replaces ended up ignored.
-import { describe, expect, test } from 'bun:test';
+import { afterEach, describe, expect, test } from 'bun:test';
 import { chmodSync, mkdtempSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
@@ -16,6 +16,18 @@ import {
   evaluateReviewChurnGate,
   type ChurnGateRun,
 } from './review-churn-gate.js';
+import { allowSubprocess, clearHermeticityAttempts, resetHermeticityAllowances } from './test-hermeticity.js';
+
+// One case drives a real script through the real spawn, which is the seam the
+// stubs above stand in for, so `bash` is opted in by name rather than left as
+// an undeclared escape under `NANOCLAW_TEST_HERMETICITY=enforce`. The allowance
+// is file-scoped and cleared after each test.
+allowSubprocess(['bash']);
+afterEach(() => {
+  clearHermeticityAttempts();
+  resetHermeticityAllowances();
+  allowSubprocess(['bash']);
+});
 
 const REFRAME_TEXT = [
   '======================================================================',

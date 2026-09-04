@@ -317,6 +317,15 @@ describe('topic-linked worktree topology', () => {
     expect(source).toContain("['status', '--porcelain=v2', '--branch', '--untracked-files=no']");
   });
 
+  test('opens the PR for the branch it captured, not the current checkout', async () => {
+    // `gh pr create` defaults --head to whatever is checked out, so a sibling
+    // switching branches mid-call would open the PR for their branch.
+    const source = readFileSync(fileURLToPath(new URL('./git-worktrees.ts', import.meta.url)), 'utf8');
+    const openPr = source.slice(source.indexOf("name: 'open_pr'"));
+    expect(openPr).toContain('capturedIdentity(resolved.context.worktree)');
+    expect(openPr).toContain("'--head', identity.branch");
+  });
+
   test('still refuses a detached HEAD', async () => {
     expect((await createWorktreeTool.handler({ repo: 'proj' })).isError).toBeFalsy();
     const worktree = join(firstTopic, 'proj');

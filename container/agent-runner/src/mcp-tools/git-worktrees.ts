@@ -674,7 +674,13 @@ export const openPrTool: McpToolDefinition = {
     const resolved = worktreeForTool(repo);
     if ('error' in resolved) return resolved.error;
     try {
-      const url = execFileSync('gh', ['pr', 'create', '--title', title, '--body', body], {
+      // Bound to the branch this call captured, not to whatever is checked out
+      // when `gh` runs: same-topic siblings share the worktree, and `gh pr
+      // create` defaults `--head` to the current branch, so a switch mid-call
+      // would open the PR for the sibling's branch — or push theirs to open it.
+      const identity = capturedIdentity(resolved.context.worktree);
+      if (!identity) return err('Cannot open a PR from a detached HEAD; create or switch to a branch explicitly');
+      const url = execFileSync('gh', ['pr', 'create', '--head', identity.branch, '--title', title, '--body', body], {
         cwd: resolved.context.worktree,
         encoding: 'utf8',
         stdio: ['ignore', 'pipe', 'pipe'],
