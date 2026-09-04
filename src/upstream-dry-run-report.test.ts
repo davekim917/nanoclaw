@@ -20,16 +20,17 @@ import {
 // `git merge-tree --write-tree --name-only origin/main upstream/main`
 // run against this fork on 2026-09-04, trimmed to a representative slice
 // that exercises every CONFLICT phrasing git emits: content, modify/delete,
-// add/add, rename-into-collision (which names two paths), and rename/delete
-// (also two paths — reproduced against a throwaway repo to confirm git
-// substitutes the actual ref names passed as arguments, not literal
-// "ours"/"theirs").
+// add/add, rename-into-collision (which names two paths), rename/delete
+// (also two paths), and rename/rename (three paths) — the rename phrasings
+// were reproduced against throwaway repos to confirm git substitutes the
+// actual ref names passed as arguments, not literal "ours"/"theirs".
 const MERGE_TREE_FIXTURE = `202f8a8359ab19db7a8ed40a4c42f5313f09d033
 .claude/skills/add-codex/SKILL.md
 container/agent-runner/src/formatter.ts
 setup/service.ts
 docs/architecture.md
 src/cli/resources/tasks.ts
+src/cli/resources/renamed-both-ways.ts
 src/modules/permissions/guard.ts
 src/modules/scheduling/create.ts
 src/modules/scheduling/runner.ts
@@ -42,6 +43,7 @@ CONFLICT (content): Merge conflict in container/agent-runner/src/formatter.ts
 CONFLICT (modify/delete): setup/service.ts deleted in upstream/main and modified in origin/main.  Version origin/main of setup/service.ts left in tree.
 CONFLICT (content): Merge conflict in docs/architecture.md
 CONFLICT (content): Merge conflict in src/cli/resources/tasks.ts
+CONFLICT (rename/rename): src/cli/resources/old-name.ts renamed to src/cli/resources/renamed-both-ways.ts in origin/main and to src/cli/resources/other-name.ts in upstream/main.
 CONFLICT (content): Merge conflict in src/modules/permissions/guard.ts
 CONFLICT (add/add): Merge conflict in src/db/migrations/index.ts
 CONFLICT (content): Merge conflict in src/router.ts
@@ -120,20 +122,30 @@ describe('extractConflictPath', () => {
       ),
     ).toBe('src/modules/scheduling/runner.ts');
   });
+
+  it('parses a rename/rename conflict as the fork (first-named) destination path', () => {
+    expect(
+      extractConflictPath(
+        'CONFLICT (rename/rename): src/cli/resources/old-name.ts renamed to src/cli/resources/renamed-both-ways.ts in origin/main and to src/cli/resources/other-name.ts in upstream/main.',
+      ),
+    ).toBe('src/cli/resources/renamed-both-ways.ts');
+  });
 });
 
 describe('parseMergeTreeConflicts', () => {
   it('counts every CONFLICT line by area and matches grep -c total', () => {
     const result = parseMergeTreeConflicts(MERGE_TREE_FIXTURE);
-    // 11 CONFLICT lines in the fixture above (including the two
-    // rename-into-collision lines and the one rename/delete line, each
-    // their own CONFLICT line).
-    expect(result.total).toBe(11);
+    // 12 CONFLICT lines in the fixture above (including the two
+    // rename-into-collision lines, the one rename/delete line, and the one
+    // rename/rename line, each their own CONFLICT line).
+    expect(result.total).toBe(12);
     expect(result.byArea.get('.claude')).toBe(1);
     expect(result.byArea.get('agent-runner/src')).toBe(1);
     expect(result.byArea.get('setup')).toBe(1);
     expect(result.byArea.get('docs')).toBe(1);
-    expect(result.byArea.get('src/cli')).toBe(1);
+    // src/cli: the plain content conflict plus the rename/rename conflict,
+    // correctly triaged to the fork-side destination rather than "other".
+    expect(result.byArea.get('src/cli')).toBe(2);
     expect(result.byArea.get('src/modules/permissions')).toBe(1);
     // The rename/delete conflict lands on its destination path, correctly
     // triaged into the module it renames within rather than "other".
@@ -355,7 +367,7 @@ describe('buildReportMarkdown', () => {
     );
     expect(md).not.toContain('2026-09-08T09:00:00.000Z');
     expect(md).toContain('490 commits behind upstream/main, 3046 ahead');
-    expect(md).toContain('Merge-tree conflicts (11 total)');
+    expect(md).toContain('Merge-tree conflicts (12 total)');
     expect(md).toContain('| agent-runner/src | 1 |');
     expect(md).toContain('New upstream migrations (1)');
     expect(md).toContain('**COLLISION** with src/db/migrations/068-sessions-sweep-quiet-until.ts');

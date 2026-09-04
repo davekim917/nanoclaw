@@ -91,16 +91,19 @@ export function classifyArea(filePath: string): ConflictArea {
 
 /**
  * One `git merge-tree --write-tree --name-only <ours> <theirs>` line ->
- * the path(s) it concerns. Handles the four CONFLICT phrasings git emits:
+ * the path(s) it concerns. Handles the five CONFLICT phrasings git emits:
  *   - "CONFLICT (content|add/add): Merge conflict in <path>"
  *   - "CONFLICT (modify/delete): <path> deleted in ... and modified in ..."
  *   - "CONFLICT (rename involved in collision): rename of <a> -> <b> has ..."
  *   - "CONFLICT (rename/delete): <a> renamed to <b> in <ref>, but deleted in <ref>."
- * The last two each name two paths; the destination (post-rename) path is
- * used, since that's where the conflict lands in the resulting tree and
- * therefore what area triage should attribute it to (verified against a
- * real `git merge-tree` run: git substitutes the actual ref names passed
- * as arguments in place of the literal words "ours"/"theirs").
+ *   - "CONFLICT (rename/rename): <a> renamed to <b> in <ref1> and to <c> in <ref2>."
+ * All but the first name two (or three) paths; the fork-side destination
+ * path is used — for rename/rename that's the FIRST destination named,
+ * since we always invoke merge-tree as `<ours> <theirs>` and git lists the
+ * first argument's rename first (verified against a real `git merge-tree`
+ * run: it substitutes the actual ref names passed as arguments in place of
+ * the literal words "ours"/"theirs", and the destination whose "in <ref>"
+ * matches ref1 comes first in the message).
  * Returns null for a line that isn't a CONFLICT line at all.
  */
 export function extractConflictPath(line: string): string | null {
@@ -121,6 +124,11 @@ export function extractConflictPath(line: string): string | null {
   // original — attribute to the renamed (destination) path.
   const renameDelete = line.match(/^CONFLICT \(rename\/delete\): \S+ renamed to (\S+) in \S+, but deleted in \S+\.$/);
   if (renameDelete) return renameDelete[1];
+
+  // Rename/rename: both sides renamed the same original file differently —
+  // attribute to the fork (ours, first-named) side's destination.
+  const renameRename = line.match(/^CONFLICT \(rename\/rename\): \S+ renamed to (\S+) in \S+ and to \S+ in \S+\.$/);
+  if (renameRename) return renameRename[1];
 
   return null;
 }
@@ -374,31 +382,33 @@ function git(args: string[], cwd: string): string {
 }
 
 /**
- * Try `git merge-tree`, which exits non-zero when it finds conflicts (that
- * is not a failure of the command — see `git help merge-tree`).
+ * Run a subprocess, tolerating exactly one documented "not really an
+ * error" exit status by returning its stdout instead of throwing — the
+ * shared shape behind every tolerant call site below: `git merge-tree`
+ * (1 = conflicts found, per `git help merge-tree`'s EXIT STATUS — anything
+ * else means "the merge was not able to complete... and the output is
+ * unspecified", a real error whose stdout can be an empty string that
+ * would otherwise silently parse as "zero conflicts"), `git grep`
+ * (1 = no matches, per `git help grep`), and `ratchet:report`
+ * (1 = GROWTH/NEW findings, docs/upstream-ratchet.md). Any other status
+ * rethrows.
  */
-function gitMergeTree(args: string[], cwd: string): string {
+function execTolerant(cmd: string, args: string[], cwd: string, tolerateStatus: number, maxBuffer: number): string {
   try {
-    return execFileSync('git', args, { cwd, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
+    return execFileSync(cmd, args, { cwd, encoding: 'utf8', maxBuffer });
   } catch (err) {
-    const asExecErr = err as { stdout?: string };
-    if (typeof asExecErr.stdout === 'string') return asExecErr.stdout;
+    const asExecErr = err as { status?: number; stdout?: string };
+    if (asExecErr.status === tolerateStatus && typeof asExecErr.stdout === 'string') return asExecErr.stdout;
     throw err;
   }
 }
 
-/**
- * `git grep` exits 1 (not an error — see `git help grep`) when nothing
- * matches, e.g. src/db/migrations/ has no files at all at `ref`.
- */
+function gitMergeTree(args: string[], cwd: string): string {
+  return execTolerant('git', args, cwd, 1, 64 * 1024 * 1024);
+}
+
 function gitGrepAllowNoMatch(args: string[], cwd: string): string {
-  try {
-    return execFileSync('git', args, { cwd, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
-  } catch (err) {
-    const asExecErr = err as { status?: number; stdout?: string };
-    if (asExecErr.status === 1 && typeof asExecErr.stdout === 'string') return asExecErr.stdout;
-    throw err;
-  }
+  return execTolerant('git', args, cwd, 1, 64 * 1024 * 1024);
 }
 
 /**
@@ -502,27 +512,23 @@ export function generateDryRunReport(opts: GenerateOptions): string {
   const changelogDiff = git(['diff', `${base}..${theirs}`, '--', 'CHANGELOG.md'], repoRoot);
   const breakingLines = parseBreakingChangelogLines(changelogDiff);
 
+  // ratchet:report measures repoRoot's physical working tree and index
+  // (mode via lstat, bytes via sha256 — docs/upstream-ratchet.md), not any
+  // git ref: there is no way to point it at `ours` without checking it
+  // out, which this report must never do. It is only run when the
+  // checkout's actual HEAD resolves to the same commit as `ours`; a
+  // supported alternate-worktree invocation on a feature branch would
+  // otherwise produce a ratchet summary describing that branch's tree
+  // while every other section of the report describes `ours` — skip
+  // rather than show a summary that contradicts the rest of the report.
+  const oursMatchesCheckout = git(['rev-parse', 'HEAD'], repoRoot).trim() === git(['rev-parse', ours], repoRoot).trim();
+
   let ratchetSummary: string | null = null;
   const packageJsonPath = path.join(repoRoot, 'package.json');
   try {
     const packageJson = JSON.parse(fs.readFileSync(packageJsonPath, 'utf8')) as { scripts?: Record<string, string> };
-    if (packageJson.scripts && 'ratchet:report' in packageJson.scripts) {
-      // Exit 1 means GROWTH or NEW findings (docs/upstream-ratchet.md) — the
-      // most informative case for a weekly report, not a failure to swallow.
-      // Exit 2 ("cannot measure" — pinned commit not fetched) and any other
-      // failure fall through to the catch below and skip the section.
-      let output: string;
-      try {
-        output = execFileSync('pnpm', ['run', 'ratchet:report'], {
-          cwd: repoRoot,
-          encoding: 'utf8',
-          maxBuffer: 16 * 1024 * 1024,
-        });
-      } catch (err) {
-        const asExecErr = err as { status?: number; stdout?: string };
-        if (asExecErr.status === 1 && typeof asExecErr.stdout === 'string') output = asExecErr.stdout;
-        else throw err;
-      }
+    if (oursMatchesCheckout && packageJson.scripts && 'ratchet:report' in packageJson.scripts) {
+      const output = execTolerant('pnpm', ['run', 'ratchet:report'], repoRoot, 1, 16 * 1024 * 1024);
       const nonEmptyLines = output.split('\n').filter((l) => l.trim().length > 0);
       ratchetSummary =
         nonEmptyLines.length > 0 ? nonEmptyLines[nonEmptyLines.length - 1] : '(ratchet:report produced no output)';
