@@ -762,7 +762,6 @@ describe('buildCentralProjection', () => {
   });
 });
 
-
 // ── #360: incremental append instead of a full rebuild ───────────────────────
 
 /** The columns that decide what a container sees. Archive ids are not among them. */
@@ -946,17 +945,15 @@ describe('appendArchiveProjection — #360', () => {
       // ARCHIVE_DEDUP_KEY_SQL that loses the index has to fail here, which it
       // could not do if this test carried its own copy of the SQL.
       const plan = (
-        db
-          .prepare(`EXPLAIN QUERY PLAN SELECT 1 FROM messages_archive WHERE ${ARCHIVE_DEDUP_KEY_SQL}`)
-          .all({
-            agent_group_id: 'ag-test-a',
-            thread_id: 'thread-1',
-            sent_at: '2026-01-01T10:00:00Z',
-            messaging_group_id: 'mg-1',
-            role: 'user',
-            sender_id: 'u-1',
-            text: 'first question',
-          }) as Array<{ detail: string }>
+        db.prepare(`EXPLAIN QUERY PLAN SELECT 1 FROM messages_archive WHERE ${ARCHIVE_DEDUP_KEY_SQL}`).all({
+          agent_group_id: 'ag-test-a',
+          thread_id: 'thread-1',
+          sent_at: '2026-01-01T10:00:00Z',
+          messaging_group_id: 'mg-1',
+          role: 'user',
+          sender_id: 'u-1',
+          text: 'first question',
+        }) as Array<{ detail: string }>
       )
         .map((r) => r.detail)
         .join(' | ');
@@ -1074,7 +1071,7 @@ describe('appendArchiveProjection — #360', () => {
 });
 
 describe('readArchiveScopeSignature — #360', () => {
-  it('counts only the scope\'s own rows and its own mutations', () => {
+  it("counts only the scope's own rows and its own mutations", () => {
     const src = twoSiblingSource('signature-src');
     addAgentWithWorkgroup(src, 'ag-test-c', 'folder-test-c', 'wg-other');
     addArchiveMsg(src, {

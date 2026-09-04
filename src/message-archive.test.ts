@@ -410,7 +410,6 @@ describe('archiveMessage', () => {
   });
 });
 
-
 describe('#360 — the archive schema is materialized at startup', () => {
   function schemaObjects(): string[] {
     const db = new Database(path.join(TEST_ROOT, 'archive.db'), { readonly: true });

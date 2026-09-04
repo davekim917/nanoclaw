@@ -1,7 +1,7 @@
 # Plan: Upstream async central-database seam (convergence seam 3, upstream #3334)
 
 Status: proposed (revision 3 — two Codex rounds, one correction batch each; see run.md)
-Approval state: pending the operator's approval, relayed by the orchestrating session `update-nanoclaw`. Seam order decision (seam 3 = #3334 first, before every other upstream theme) taken by `update-nanoclaw` on 2026-09-04 after the feasibility read; this plan reverses the 2026-09-02 decline recorded on fork issue #234 (its trigger "the mailbox/host-sweep seams are live" fired on 2026-09-04).
+Approval state: APPROVED 2026-09-04 20:40Z by `update-nanoclaw` under the operator's delegated engineering authority (the operator, 2026-09-03: "I defer to you to make the call"); the operator has the plan in his session log and may veto. PR 1 starts after PR 0 and PR 0b are merged. Seam order decision (seam 3 = #3334 first, before every other upstream theme) taken by `update-nanoclaw` on 2026-09-04 after the feasibility read; this plan reverses the 2026-09-02 decline recorded on fork issue #234 (its trigger "the mailbox/host-sweep seams are live" fired on 2026-09-04).
 Primary runtime: Claude (orchestrator: Fable 5.1; builders: worker tiers per PR; cross-model review: Codex gpt-5.6-sol high)
 Program: upstream convergence, sync phase (memory `project_upstream_sync_phase_2026_09_04`)
 Upstream target: `nanocoai/nanoclaw` `2cd7b5377` "[BREAKING] refactor(db): adopt async central database safely (#3334)" as it stands on `upstream/main` `b76fcb3d`. Fork base: `origin/main` `4275fcb7c`.

@@ -801,7 +801,6 @@ describe('#315 review r2 — a partial rebuild is never served as fresh', () => 
   });
 });
 
-
 describe('#360 — a message elsewhere does not rebuild this projection', () => {
   const scope = ['ag-one-a', 'ag-one-b'];
 
@@ -852,7 +851,7 @@ describe('#360 — a message elsewhere does not rebuild this projection', () => 
     expect(fs.statSync(dst).mtimeMs).toBe(mtime);
   });
 
-  it('appends this workgroup\'s new rows and lands what a full rebuild would', async () => {
+  it("appends this workgroup's new rows and lands what a full rebuild would", async () => {
     const src = makeTwoWorkgroupSource('append-seam');
     useFakeWorker();
     const dst = tmpPath('append-seam-dst');
