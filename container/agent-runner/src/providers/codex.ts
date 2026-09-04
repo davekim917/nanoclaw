@@ -1015,8 +1015,14 @@ export class CodexProvider implements AgentProvider {
       } else if (cfg?.type === 'http') {
         if (useHttpBridgeFallback) {
           const baseEnv: Record<string, string> = { REMOTE_MCP_NAME: name };
-          const authorization = cfg.headers?.Authorization ?? cfg.headers?.authorization;
-          if (authorization) baseEnv.REMOTE_MCP_AUTHORIZATION = authorization;
+          // The full validated header map, not just Authorization — a server
+          // wired with X-Api-Version or a custom OneCLI-managed placeholder
+          // header had every header past Authorization silently dropped by
+          // the bridge, which is a different set than the one the CLI,
+          // template, and approval flows validated and reported success on.
+          if (cfg.headers && Object.keys(cfg.headers).length > 0) {
+            baseEnv.REMOTE_MCP_HEADERS = JSON.stringify(cfg.headers);
+          }
           mcpServers[name] = {
             type: 'stdio',
             command: 'bun',

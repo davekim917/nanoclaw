@@ -175,12 +175,65 @@ const ONECLI_HEADER_VALUE_RE = new RegExp(`^(?:[A-Za-z][A-Za-z0-9-]* )?${ONECLI_
  */
 const RAW_SECRET_VALUE_RE =
   /(^|\s)(github_pat_|AKIA|-----BEGIN )|\bsk-(?:ant-)?[A-Za-z0-9_-]{20,}\b|\b(?:sk|rk)_(?:live|test)_[A-Za-z0-9_-]{12,}\b|\bxox[abpr]-[A-Za-z0-9-]+\b|\bghp_[A-Za-z0-9]+\b|\bglpat-[A-Za-z0-9_-]+\b|\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/;
-/** C0 control characters other than horizontal tab, plus DEL — mirrors the host's check. */
-const HEADER_VALUE_CONTROL_CHAR_RE = /[\x00-\x08\x0A-\x1F\x7F]/;
-
 type ParsedMcpServer =
   | { type: 'http'; url: string; headers?: Record<string, string> }
   | { command: string; args: string[]; env: Record<string, string> };
+
+/**
+ * Mirrors the host's `normalizeMcpHeaders` (src/container-config.ts).
+ *
+ * - Duplicate names, after lowercasing: HTTP header names are
+ *   case-insensitive, so `{ Authorization, authorization }` looks like two
+ *   headers to this plain-object copy but is one header on the wire —
+ *   `Headers` combines them with a comma, which no longer matches the
+ *   placeholder form already validated and can leave the server
+ *   unauthenticated.
+ * - Value validity, by constructing `new Headers({ [key]: value })` — the
+ *   same constructor the runtime hands the request to. It throws on control
+ *   characters AND on any code point above U+00FF: header values are Latin-1
+ *   bytes on the wire, not arbitrary Unicode, so `User-Agent: "测试"` used to
+ *   pass a control-character-only check and then fail when the actual MCP
+ *   connection tried to send it.
+ */
+function normalizeMcpHeaders(rawHeaders: unknown): { headers: Record<string, string> } | { error: string } {
+  if (typeof rawHeaders !== 'object' || rawHeaders === null || Array.isArray(rawHeaders)) {
+    return { error: 'headers must be an object with string values' };
+  }
+  const seenNames = new Set<string>();
+  const headers: Record<string, string> = {};
+  for (const [key, value] of Object.entries(rawHeaders)) {
+    if (typeof value !== 'string') return { error: 'headers must be an object with string values' };
+    if (!HEADER_NAME_RE.test(key)) {
+      return { error: `header name ${JSON.stringify(key)} is not a valid HTTP header field name` };
+    }
+    const lowerName = key.toLowerCase();
+    if (seenNames.has(lowerName)) {
+      return {
+        error: `header "${key}" duplicates an already-declared header of the same name (HTTP header names are case-insensitive) — Headers combines them into one value on the wire, which can silently break authentication`,
+      };
+    }
+    seenNames.add(lowerName);
+    try {
+      new Headers({ [key]: value });
+    } catch {
+      return {
+        error: `header "${key}" value is not valid for an HTTP header (control characters and any character above U+00FF are rejected by the transport)`,
+      };
+    }
+    if (RAW_SECRET_VALUE_RE.test(value)) {
+      return {
+        error: `header "${key}" carries a raw credential; declare it as "${ONECLI_PLACEHOLDER}" and let the OneCLI gateway inject the real value`,
+      };
+    }
+    if (!LITERAL_HEADER_ALLOWLIST.has(lowerName) && !ONECLI_HEADER_VALUE_RE.test(value)) {
+      return {
+        error: `header "${key}" is not a known configuration header, so its value must be exactly "${ONECLI_PLACEHOLDER}" or an auth scheme followed by it (e.g. "Bearer ${ONECLI_PLACEHOLDER}"). Configuration headers that carry no credential: ${[...LITERAL_HEADER_ALLOWLIST].join(', ')}`,
+      };
+    }
+    headers[key] = value;
+  }
+  return { headers };
+}
 
 /**
  * Mirrors the host's `parseMcpServerConfig` (src/container-config.ts) — the
@@ -239,35 +292,14 @@ function parseMcpServerInput(args: Record<string, unknown>): { config: ParsedMcp
       }
     }
     if (args.headers === undefined) return { config: { type: 'http', url } };
-    const rawHeaders = args.headers;
-    if (typeof rawHeaders !== 'object' || rawHeaders === null || Array.isArray(rawHeaders)) {
-      return { error: 'headers must be an object with string values' };
-    }
-    const headers: Record<string, string> = {};
-    for (const [key, value] of Object.entries(rawHeaders)) {
-      if (typeof value !== 'string') return { error: 'headers must be an object with string values' };
-      if (!HEADER_NAME_RE.test(key)) {
-        return { error: `header name ${JSON.stringify(key)} is not a valid HTTP header field name` };
-      }
-      if (HEADER_VALUE_CONTROL_CHAR_RE.test(value)) {
-        return {
-          error: `header "${key}" value contains a control character (CR, LF, or NUL are not valid in an HTTP header)`,
-        };
-      }
-      if (RAW_SECRET_VALUE_RE.test(value)) {
-        return {
-          error: `header "${key}" carries a raw credential; declare it as "${ONECLI_PLACEHOLDER}" and let the OneCLI gateway inject the real value`,
-        };
-      }
-      if (!LITERAL_HEADER_ALLOWLIST.has(key.toLowerCase()) && !ONECLI_HEADER_VALUE_RE.test(value)) {
-        return {
-          error: `header "${key}" is not a known configuration header, so its value must be exactly "${ONECLI_PLACEHOLDER}" or an auth scheme followed by it (e.g. "Bearer ${ONECLI_PLACEHOLDER}"). Configuration headers that carry no credential: ${[...LITERAL_HEADER_ALLOWLIST].join(', ')}`,
-        };
-      }
-      headers[key] = value;
-    }
+    const normalized = normalizeMcpHeaders(args.headers);
+    if ('error' in normalized) return normalized;
     return {
-      config: { type: 'http', url, ...(Object.keys(headers).length === 0 ? {} : { headers }) },
+      config: {
+        type: 'http',
+        url,
+        ...(Object.keys(normalized.headers).length === 0 ? {} : { headers: normalized.headers }),
+      },
     };
   }
   if (command === undefined) return { error: 'Provide exactly one of command or url' };

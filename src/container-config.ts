@@ -196,14 +196,6 @@ function isKnownRawSecret(value: string): boolean {
   return TOKEN_SHAPE_PATTERNS.some(([re]) => new RegExp(re.source, re.flags.replace('g', '')).test(value));
 }
 /**
- * C0 control characters other than horizontal tab, plus DEL. A header value
- * containing CR/LF/NUL is accepted here (it's just a JS string) but rejected
- * by every standard HTTP client when the remote MCP connects — the server
- * gets approved and restarted, then is unusable. Reject it here instead.
- */
-const HEADER_VALUE_CONTROL_CHAR_RE = /[\x00-\x08\x0A-\x1F\x7F]/;
-
-/**
  * A path segment or query value long and mixed enough that it could be a
  * bearer token — or could equally be a tenant id, workspace slug, or build
  * hash. Nothing in the string distinguishes those, which is why this is NOT a
@@ -245,27 +237,63 @@ export function validateMcpServerName(name: string): void {
   }
 }
 
-/** Validate one `headers` map for a remote MCP server. Returns a fresh copy. */
-function parseMcpHeaders(raw: unknown): Record<string, string> {
+/**
+ * Validate one `headers` map for a remote MCP server. Returns a fresh copy.
+ *
+ * Two rules a hand-rolled character check can't safely stand in for, so both
+ * defer to the thing that will actually consume this map:
+ *
+ * - Duplicate names, after lowercasing. HTTP header names are
+ *   case-insensitive, so `{ Authorization: "...", authorization: "..." }`
+ *   looks like two headers to this plain-object copy but is ONE header on
+ *   the wire — `Headers` combines them with a comma
+ *   (`Bearer x, Key onecli-managed`), which no longer matches the
+ *   placeholder form this function already validated and can leave the
+ *   server unauthenticated. Rejected outright rather than merged or
+ *   silently overwritten.
+ * - Value validity, by constructing `new Headers({ [key]: value })` — the
+ *   same constructor the runtime hands the request to, not a maintained
+ *   copy of its rules. It throws on control characters (CR/LF/NUL — what
+ *   the old hand-written check caught) AND on any code point above U+00FF:
+ *   header values are Latin-1 bytes on the wire, not arbitrary Unicode, so
+ *   `User-Agent: "测试"` passed a control-character-only check and then
+ *   failed when the actual MCP connection tried to send it — the server was
+ *   approved and restarted, then unusable.
+ *
+ * Mirrored as `normalizeMcpHeaders` in
+ * `container/agent-runner/src/mcp-tools/self-mod.ts` — there are no shared
+ * modules across the host/container boundary; keep the two in sync.
+ */
+function normalizeMcpHeaders(raw: unknown): Record<string, string> {
   if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
     throw new Error('headers must be a JSON object with string values');
   }
+  const seenNames = new Set<string>();
   const headers: Record<string, string> = {};
   for (const [key, value] of Object.entries(raw)) {
     if (typeof value !== 'string') throw new Error('headers must be a JSON object with string values');
     if (!HEADER_NAME_RE.test(key)) {
       throw new Error(`header name ${JSON.stringify(key)} is not a valid HTTP header field name`);
     }
-    if (HEADER_VALUE_CONTROL_CHAR_RE.test(value)) {
+    const lowerName = key.toLowerCase();
+    if (seenNames.has(lowerName)) {
       throw new Error(
-        `header "${key}" value contains a control character (CR, LF, or NUL are not valid in an HTTP header)`,
+        `header "${key}" duplicates an already-declared header of the same name (HTTP header names are case-insensitive) — Headers combines them into one value on the wire, which can silently break authentication`,
+      );
+    }
+    seenNames.add(lowerName);
+    try {
+      new Headers({ [key]: value });
+    } catch {
+      throw new Error(
+        `header "${key}" value is not valid for an HTTP header (control characters and any character above U+00FF are rejected by the transport)`,
       );
     }
     // Allowlisted configuration headers may hold a literal; everything else
     // must be the placeholder, whatever it is named and however short its
     // value. `abc123` is a perfectly good API key, so value length and
     // character mix cannot decide this.
-    if (!LITERAL_HEADER_ALLOWLIST.has(key.toLowerCase()) && !ONECLI_HEADER_VALUE_RE.test(value)) {
+    if (!LITERAL_HEADER_ALLOWLIST.has(lowerName) && !ONECLI_HEADER_VALUE_RE.test(value)) {
       throw new Error(
         `header "${key}" is not a known configuration header, so its value must be exactly "${ONECLI_PLACEHOLDER}" or an auth scheme followed by it (e.g. "Bearer ${ONECLI_PLACEHOLDER}") — the gateway substitutes the real secret at the proxy boundary. Configuration headers that carry no credential: ${[...LITERAL_HEADER_ALLOWLIST].join(', ')}`,
       );
@@ -347,7 +375,7 @@ export function parseMcpServerConfig(input: Record<string, unknown>): ParsedMcpS
         );
       }
     }
-    const headers = input.headers === undefined ? undefined : parseMcpHeaders(input.headers);
+    const headers = input.headers === undefined ? undefined : normalizeMcpHeaders(input.headers);
     return {
       type: 'http',
       url,

@@ -243,4 +243,25 @@ describe('add_mcp_server remote Streamable HTTP', () => {
         .error,
     ).toContain('control character');
   });
+
+  it('rejects a header value above U+00FF — Bun Headers is Latin-1, not arbitrary Unicode', async () => {
+    expect(
+      (await submit({ name: 'ua', url: 'https://example.com/mcp', headers: { 'User-Agent': '测试' } })).error,
+    ).toContain('above U+00FF');
+    expect(
+      (await submit({ name: 'ua', url: 'https://example.com/mcp', headers: { 'User-Agent': 'café' } })).payload,
+    ).toBeDefined();
+  });
+
+  it('rejects a case-variant duplicate header name', async () => {
+    expect(
+      (
+        await submit({
+          name: 'dup',
+          url: 'https://example.com/mcp',
+          headers: { Authorization: 'onecli-managed', authorization: 'Bearer onecli-managed' },
+        })
+      ).error,
+    ).toContain('case-insensitive');
+  });
 });

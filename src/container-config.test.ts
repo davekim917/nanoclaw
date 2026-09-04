@@ -488,6 +488,32 @@ describe('parseMcpServerConfig', () => {
     });
   });
 
+  it('rejects a header value above U+00FF — Bun/Node Headers is Latin-1, not arbitrary Unicode', () => {
+    // Passed a control-character-only check before; the actual MCP transport
+    // rejects it at connect time, so the server was approved and restarted,
+    // then unusable.
+    expect(() => parseMcpServerConfig({ url: 'https://example.com/mcp', headers: { 'User-Agent': '测试' } })).toThrow(
+      /above U\+00FF/,
+    );
+    // Latin-1 (up to U+00FF) is fine, even outside plain ASCII.
+    expect(parseMcpServerConfig({ url: 'https://example.com/mcp', headers: { 'User-Agent': 'café' } })).toMatchObject({
+      headers: { 'User-Agent': 'café' },
+    });
+  });
+
+  it('rejects a case-variant duplicate header name', () => {
+    // HTTP header names are case-insensitive; Headers combines "Authorization"
+    // and "authorization" into one comma-joined value on the wire, which no
+    // longer matches the placeholder form already validated and can leave
+    // the server unauthenticated.
+    expect(() =>
+      parseMcpServerConfig({
+        url: 'https://example.com/mcp',
+        headers: { Authorization: 'onecli-managed', authorization: 'Bearer onecli-managed' },
+      }),
+    ).toThrow(/case-insensitive/);
+  });
+
   it('rejects an env key that is not a valid environment variable name', () => {
     expect(() => parseMcpServerConfig({ command: 'node', env: { 'not-an-env-key': 'v' } })).toThrow(
       /environment variable name/,
