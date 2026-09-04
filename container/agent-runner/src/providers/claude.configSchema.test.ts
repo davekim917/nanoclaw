@@ -306,7 +306,7 @@ describe('per-model-family effort defaults', () => {
 
   // The concrete id the `opus` alias now resolves to (claude-opus-5[1m]).
   // Operator decision 2026-07-27: Opus 5 defaults to `high` for parity with
-  // the Codex gpt-5.6-sol default. The clamp path keeps xhigh available, so an
+  // the Codex high-effort default. The clamp path keeps xhigh available, so an
   // explicit `-e xhigh` still survives (guarded by the next test).
   it('test_effort_default_opus5_high_explicit_id: explicit claude-opus-5[1m] defaults to high', () => {
     const opts = run({ model: 'claude-opus-5[1m]' });

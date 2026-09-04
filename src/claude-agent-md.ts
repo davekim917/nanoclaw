@@ -46,19 +46,18 @@ export interface CodexWorkerTier {
 
 /**
  * Codex equivalents of the tiered Claude workers. Cheaper models carry a
- * higher reasoning effort to compensate. worker-high matches the parent's
- * own model at high effort — escalating from worker there buys reasoning
- * depth rather than a bigger model. worker-frontier is the top rung: same
- * model as worker-high, pushed to max effort, for frontier-hard work or
- * after worker-high has failed. Only tiers belong here — a role that is a
- * *kind* of worker rather than a rung (worker-codex, codex-rescue) is left
+ * higher reasoning effort to compensate. worker-high uses Sol at high
+ * effort. worker-frontier is the top rung: Astra
+ * at high effort, for frontier-hard work or after worker-high has failed.
+ * Only tiers belong here — a role that is a *kind* of worker rather than a
+ * rung (worker-codex, codex-rescue) is left
  * to inherit.
  */
 export const CODEX_WORKER_TIERS: Record<string, CodexWorkerTier> = {
   'worker-fast': { model: 'gpt-5.6-luna', effort: 'max' },
   worker: { model: 'gpt-5.6-terra', effort: 'xhigh' },
   'worker-high': { model: 'gpt-5.6-sol', effort: 'high' },
-  'worker-frontier': { model: 'gpt-5.6-sol', effort: 'max' },
+  'worker-frontier': { model: 'gpt-6-astra', effort: 'high' },
 };
 
 /**

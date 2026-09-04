@@ -399,10 +399,22 @@ describe('provider-aware vocabulary (codex)', () => {
     expect(r.intent).toEqual({ stickyModel: 'gpt-5.5' });
   });
 
-  it('resolves the Codex family names used by channel pins', () => {
-    expect(parseMessageFlags('-m luna hi', 'codex').intent).toEqual({ stickyModel: 'gpt-5.6-luna' });
-    expect(parseMessageFlags('-m terra hi', 'codex').intent).toEqual({ stickyModel: 'gpt-5.6-terra' });
-    expect(parseMessageFlags('-m sol hi', 'codex').intent).toEqual({ stickyModel: 'gpt-5.6-sol' });
+  it.each([
+    ['luna', 'gpt-5.6-luna'],
+    ['terra', 'gpt-5.6-terra'],
+    ['sol', 'gpt-5.6-sol'],
+    ['astra', 'gpt-6-astra'],
+    ['gpt6-astra', 'gpt-6-astra'],
+    ['gpt-6-astra', 'gpt-6-astra'],
+  ])('resolves Codex model %s for sticky and turn overrides', (alias, model) => {
+    for (const value of [alias, alias.toUpperCase()]) {
+      const sticky = parseMessageFlags(`-m ${value} hi`, 'codex');
+      expect(sticky.intent).toEqual({ stickyModel: model });
+      expect(sticky.errors).toEqual([]);
+      const turn = parseMessageFlags(`-m1 ${value} hi`, 'codex');
+      expect(turn.intent).toEqual({ turnModel: model });
+      expect(turn.errors).toEqual([]);
+    }
   });
 
   it('rejects claude ids on a codex group with a shape hint', () => {
