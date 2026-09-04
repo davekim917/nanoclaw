@@ -85,6 +85,9 @@ const calls = vi.hoisted(() => ({
   admittedTasks: 0,
   admitImpl: null as null | ((session: unknown) => number),
   hostScriptFails: false,
+  /** F-11.4 only: hold `killContainer`'s `onExit` instead of firing it inline. */
+  deferKillExit: false,
+  killExit: undefined as undefined | (() => void),
 }));
 
 vi.mock('../../container-runner.js', async (importOriginal) => {
@@ -106,6 +109,15 @@ vi.mock('../../container-runner.js', async (importOriginal) => {
     killContainer: (sessionId: string, reason: string, onExit?: () => void) => {
       calls.order.push('kill');
       calls.kills.push({ sessionId, reason });
+      // DEFERRED: hold the callback so a case can assert the gap between the
+      // kill REQUEST and the container actually going. Firing it inline (the
+      // default, which every other case here wants) collapses that gap, and a
+      // regression that cleared saved work right after `killContainer` returned
+      // would produce the same event order as the correct code.
+      if (calls.deferKillExit) {
+        calls.killExit = onExit;
+        return;
+      }
       // The process is provably gone once `onExit` fires — the container no
       // longer owns outbound.db from this point on. Without this the guarded
       // finalizer (mailbox seam round 8) reads the SAME `calls.running` it saw
@@ -406,6 +418,8 @@ beforeEach(() => {
   calls.admittedTasks = 0;
   calls.admitImpl = null;
   calls.hostScriptFails = false;
+  calls.deferKillExit = false;
+  calls.killExit = undefined;
   spawns.length = 0;
 });
 
@@ -581,8 +595,25 @@ describe('S2-PR11 scheduling + thread-close', () => {
       )
       .run(thread, new Date(Date.now() - CLOSE_CONFIRM_WINDOW_MS - 1_000).toISOString());
     calls.running = true;
+    // Hold the exit callback: the gap between "the kill was requested" and "the
+    // container is actually gone" is where a regression would write, and firing
+    // `onExit` inline collapses it (Codex delta).
+    calls.deferKillExit = true;
 
     await duty(SWEEP_DUTY_INVENTORY.T8).run(makeCtx());
+
+    // The kill has been REQUESTED and nothing else has happened. `outbound.db`
+    // still has its one writer, so a clear here would be the defect.
+    expect(calls.order, 'saved work was touched before the container went').toEqual(['kill']);
+
+    // The child closes: ownership drops, then the callback runs.
+    expect(calls.killExit, 'the close path was never handed a finalizer').toBeDefined();
+    calls.running = false;
+    calls.order.push('exit');
+    calls.killExit!();
+    // The finalizer's own work is async and floats off the callback, so give it
+    // macrotasks to land before reading the order.
+    for (let i = 0; i < 5; i++) await new Promise((resolve) => setImmediate(resolve));
 
     // Mirrors src/dashboard/thread-close.test.ts's "kills first, then clears
     // once the process is gone, then archives" (the `recordingDeps()` default:
@@ -591,21 +622,18 @@ describe('S2-PR11 scheduling + thread-close', () => {
     // if still running, then clear+archive in onExit): outbound.db has one
     // writer, so the host may not clear it while a container still owns it —
     // kill first, then clear once `onExit` proves the process is gone, then
-    // archive. The container-runner mock's `killContainer` flips `calls.running`
-    // to `false` when it fires `onExit`, matching the real registry.
-    expect(calls.order).toEqual(['kill', 'clear', 'archive']);
-    // Said outright, not just implied by the array's order (Codex final): NO
-    // saved-work or outbound mutation happens before the kill completes. The
-    // sequence above would still read correctly if a clear had also fired
-    // earlier and been overwritten in the recorder, and it is the ABSENCE of an
-    // early clear that outbound.db's single-writer rule actually demands — the
-    // host may not touch it while a container still owns it.
-    expect(calls.order.indexOf('clear'), 'saved work was cleared before the kill').toBeGreaterThan(
-      calls.order.indexOf('kill'),
-    );
+    // archive. This case drives that ordering against a REAL gap: the mock holds
+    // `onExit` (`deferKillExit`), the case asserts nothing happened while the
+    // container still owned outbound.db, and only then drops ownership and
+    // fires the callback itself.
+    //
+    // Kill requested, container gone, THEN clear, then archive — with 'exit'
+    // recorded by this case, so the ordering is asserted against a real gap
+    // rather than against a callback the recorder fired for itself.
+    expect(calls.order).toEqual(['kill', 'exit', 'clear', 'archive']);
     expect(
       calls.order.filter((step) => step === 'clear'),
-      'more than one clear — one of them ran too early',
+      'more than one clear — one of them ran before the exit',
     ).toEqual(['clear']);
     expect(calls.kills).toEqual([{ sessionId: 's1', reason: `thread close ${thread}` }]);
     expect(calls.archives).toEqual(['s1']);
