@@ -229,6 +229,24 @@ function collectModuleBindings(filePath: string, modulePath: string, root: strin
  * module the file touches at all, independent of what's bound against each
  * one (that's `collectModuleBindings`'s job, called once per discovered
  * module by `collectRelativeImportManifest` below).
+ *
+ * FAILS CLOSED rather than silently under-reporting: a `filePath` this
+ * function is called on is, by construction, one of the two manifest-pinned
+ * files (`collectRelativeImportManifest`'s only caller), so the manifest is
+ * only complete-by-construction if every edge is either pinned OR rejected —
+ * never silently dropped. Two edges this function cannot resolve statically
+ * would otherwise vanish with no trace:
+ *   - a COMPUTED dynamic import, `import(someExpression)` — the specifier
+ *     isn't a string/no-substitution-template literal, so `resolveModule`
+ *     has nothing to resolve. Throws instead of skipping.
+ *   - ANY `require(...)` call at all, literal argument or not — host code is
+ *     ESM (see this repo's CLAUDE.md "Module System (host)"); `require` is
+ *     undefined at runtime there, so a call to it is either dead code that
+ *     shouldn't exist or a real edge this manifest has no way to see. Either
+ *     way, it must not pass silently.
+ * A throw here fails the pinning `it()` with a message naming the exact
+ * file and line, which is the point: an edge the manifest can't literally
+ * pin must force a human to look, not vanish.
  */
 function discoverRelativeModules(filePath: string): string[] {
   const src = fs.readFileSync(path.join(REPO_ROOT, filePath), 'utf8');
@@ -245,22 +263,36 @@ function discoverRelativeModules(filePath: string): string[] {
     return undefined;
   }
 
+  function failClosed(kind: string, node: ts.Node): never {
+    const { line } = sourceFile.getLineAndCharacterOfPosition(node.getStart(sourceFile));
+    throw new Error(`${kind} in a manifest-pinned file: ${filePath}:${line + 1}`);
+  }
+
   function visit(node: ts.Node): void {
-    let specifierText: string | null = null;
     if (ts.isImportDeclaration(node)) {
-      specifierText = literalSpecifierText(node.moduleSpecifier);
+      const specifierText = literalSpecifierText(node.moduleSpecifier);
+      if (specifierText !== null) {
+        const resolved = resolveModule(specifierText);
+        if (resolved) modules.add(resolved);
+      }
+      // A static import's specifier is grammatically always a literal — no
+      // computed-specifier case exists here to fail closed on.
     } else if (ts.isExportDeclaration(node) && node.moduleSpecifier) {
-      specifierText = literalSpecifierText(node.moduleSpecifier);
-    } else if (
-      ts.isCallExpression(node) &&
-      node.expression.kind === ts.SyntaxKind.ImportKeyword &&
-      node.arguments.length > 0
-    ) {
-      specifierText = literalSpecifierText(node.arguments[0]);
-    }
-    if (specifierText !== null) {
+      const specifierText = literalSpecifierText(node.moduleSpecifier);
+      if (specifierText !== null) {
+        const resolved = resolveModule(specifierText);
+        if (resolved) modules.add(resolved);
+      }
+    } else if (ts.isCallExpression(node) && node.expression.kind === ts.SyntaxKind.ImportKeyword) {
+      const arg = node.arguments[0];
+      const specifierText = arg ? literalSpecifierText(arg) : null;
+      if (specifierText === null) failClosed('computed dynamic import', node);
       const resolved = resolveModule(specifierText);
       if (resolved) modules.add(resolved);
+      // An unresolvable-but-LITERAL specifier (a package import()) is fine —
+      // package imports aren't part of this repo-relative manifest at all.
+    } else if (ts.isCallExpression(node) && ts.isIdentifier(node.expression) && node.expression.text === 'require') {
+      failClosed('unexpected require() call', node);
     }
     ts.forEachChild(node, visit);
   }
