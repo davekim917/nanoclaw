@@ -242,6 +242,26 @@ export async function main(): Promise<void> {
   const db = initDb(dbPath);
   runMigrations(db);
 
+  // 1-0. Materialize the archive schema before ANY service that can spawn.
+  //
+  // `archive_row_marks` and its triggers are created by the archive's lazy
+  // open, which fires on the first archive WRITE. Until they exist every
+  // projection freshness stamp reports an unknown mutation count and fails
+  // closed, so every spawn does the full 19 s rebuild #360 exists to remove.
+  //
+  // Ahead of the dashboard for the same reason the OneCLI preflight below is:
+  // `startDashboard()` exposes endpoints that reach `wakeContainer` — a
+  // scheduled task's run-now, for one — so a dashboard-triggered spawn during
+  // the window would rebuild, and so would every spawn until unrelated chat
+  // traffic happened to open the archive. Ahead of channel recovery too, which
+  // archives messages: otherwise the one-time "Archive row-marks schema
+  // created" line would land from a recovery thread on some boots and from
+  // here on others, which is useless as a deploy gate.
+  //
+  // Nothing above this point can spawn, and the archive is a standalone file
+  // that depends only on DATA_DIR, so this is the earliest honest position.
+  ensureArchiveSchema();
+
   // Snapshot the agent-runner source for this boot (mailbox seam PR 0) —
   // must happen before anything can spawn a container, so every spawn this
   // process makes mounts the same tree, not the live checkout mid-`git pull`.
@@ -547,18 +567,6 @@ export async function main(): Promise<void> {
   // work actually begins (docs/specs/upstream-host-sweep-seam/plan.md §4.1).
   // PR 0 registers nothing, so this is inert by construction.
   await startHostModules({ db, signal: hostAbortController.signal });
-
-  // 4c. Materialize the archive schema before anything can read it.
-  //
-  // `archive_row_marks` and its triggers are created by the archive's lazy
-  // open, which fires on the first WRITE. Without this call an upgraded host
-  // has no marks table until chat traffic happens to arrive, and until then
-  // every archive projection stamp fails closed and every spawn does the full
-  // rebuild #360 exists to avoid. Placed ahead of channel recovery as well as
-  // the sweep: recovery archives messages, so leaving it later would make the
-  // one-time "Archive row-marks schema created" line land from a recovery
-  // thread on some boots and from here on others.
-  ensureArchiveSchema();
 
   // Start recovery only after permissions and delivery are fully wired. A
   // replay can immediately exercise either surface (sibling bots, unknown

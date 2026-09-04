@@ -239,6 +239,34 @@ describe('#360 — the archive has one write path', () => {
     expect(scanned.some((f) => f.startsWith('scripts/')), 'scripts/ was not scanned').toBe(true);
   });
 
+  it('materializes the archive schema before anything that can spawn', () => {
+    // The marks table is created by the archive's lazy open, on the first
+    // WRITE. Until it exists every projection stamp fails closed and every
+    // spawn does the full rebuild this release removes — so the eager call has
+    // to precede every startup step that can reach wakeContainer, not merely
+    // the sweep. startDashboard() exposes a scheduled task's run-now;
+    // channel recovery archives messages and would otherwise steal the
+    // one-time creation log line that serves as the deploy gate fact.
+    // Comment lines stripped first — the prose above the call names
+    // startDashboard() on purpose, to say what it is ordered against, and an
+    // index over the raw source would compare against that mention.
+    const main = fs
+      .readFileSync(path.join(REPO_ROOT, 'src/main.ts'), 'utf-8')
+      .split('\n')
+      .filter((line) => !/^\s*(\/\/|\*|\/\*)/.test(line))
+      .join('\n');
+    const at = (needle: string): number => {
+      const index = main.indexOf(needle);
+      expect(index, `src/main.ts no longer contains a call to ${needle}`).toBeGreaterThan(-1);
+      return index;
+    };
+
+    const archive = at('ensureArchiveSchema()');
+    for (const laterStep of ['startDashboard()', 'recoverAllChannelsAfterStartup(', 'startHostSweep()']) {
+      expect(archive, `ensureArchiveSchema() must run before ${laterStep}`).toBeLessThan(at(laterStep));
+    }
+  });
+
   it('keeps the marks table out of the projection schema the container mounts', () => {
     // Containers read the projection and never write it, so counters there
     // would be dead weight and a new surface. The projection's schema is
