@@ -215,6 +215,27 @@ describe('storage-manager.ts / storage-activity.ts contain no literal seam call'
       ['sessionContextPathFor', 'sessionsBaseDir', 'threadsBaseDir', 'threadWorktreeDir'].sort(),
     );
   });
+
+  // Same file, same 1553790a move, the other direction: storage-manager.ts
+  // ALSO imports from modules/mailbox/index.js now (sessionMailboxPath, to
+  // build the DB-path lookups session-manager.js used to provide). That
+  // module is the one that exports getAgentMailbox — an aliased
+  // `getAgentMailbox as foo` import from it would evade both the literal-call
+  // regex above and the session-manager.js set assertion. Pin its exact
+  // import set too, so a future import here re-triggers this review.
+  it("storage-manager.ts's only modules/mailbox/index.js import is sessionMailboxPath", () => {
+    const src = fs.readFileSync(path.join(REPO_ROOT, 'src/storage-manager.ts'), 'utf8');
+    const match = /import\s*\{([^}]*)\}\s*from\s*['"]\.\/modules\/mailbox\/index\.js['"]/.exec(src);
+    expect(
+      match,
+      'storage-manager.ts must import from modules/mailbox/index.js for this test to be meaningful',
+    ).not.toBeNull();
+    const names = match![1]
+      .split(',')
+      .map((n) => n.trim())
+      .filter(Boolean);
+    expect(names.sort()).toEqual(['sessionMailboxPath'].sort());
+  });
 });
 
 describe('scripts/reclaim-idle-thread-worktrees.ts — only imports getStorageReport from storage-manager.ts', () => {
