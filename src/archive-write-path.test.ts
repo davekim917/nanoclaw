@@ -67,28 +67,75 @@ function listTsFiles(root: string): string[] {
 }
 
 /**
- * Write statements against `messages_archive`, whitespace-tolerant and
+ * How `messages_archive` can legally be named in SQL.
+ *
+ * Quoting and schema qualification are the reason this is a shared fragment
+ * rather than a literal: `UPDATE "messages_archive" SET ...`,
+ * `UPDATE [messages_archive]`, `` UPDATE `messages_archive` `` and
+ * `UPDATE main.messages_archive` are all the same statement to SQLite, and a
+ * tripwire that only recognised the bare form would wave three of them through.
+ *
+ * The bare arm ends in a negative lookahead rather than a consumed character,
+ * so `messages_archive_fts` is excluded without eating the delimiter. `\b`
+ * cannot do that job — `_` is a word character, so there is no word boundary
+ * between `archive` and `_fts`. The quoted arms need no lookahead because the
+ * closing quote already ends the identifier.
+ */
+const ARCHIVE_TABLE_REF =
+  '(?:[A-Za-z_]\\w*\\s*\\.\\s*)?(?:"messages_archive"|`messages_archive`|\\[messages_archive\\]|messages_archive(?![_A-Za-z0-9]))';
+
+/**
+ * Write statements against the archive's base table, whitespace-tolerant and
  * case-insensitive.
  *
- * `messages_archive_fts` is excluded by the trailing boundary: the FTS shadow
- * table is maintained by `INSERT INTO messages_archive_fts(...)` inside the
- * sync triggers in both writer files, and those are not writes to the base
- * table. `\b` alone would not do it — `_` is a word character, so
- * `messages_archive_fts` contains no boundary after `archive`; the explicit
- * `[^_a-zA-Z0-9]` is what separates them.
+ * Used for BOTH the repo-wide scan and the owner-file count, so the two cannot
+ * drift: a form recognised in one is recognised in the other. `CREATE TRIGGER
+ * ... AFTER UPDATE ON messages_archive` does not match, because these require
+ * the table to follow the verb directly rather than after `ON`.
  */
-const WRITE_PATTERNS: Array<{ label: string; re: RegExp }> = [
-  { label: 'UPDATE messages_archive', re: /\bUPDATE\s+["'`]?messages_archive(?:["'`]|[^_a-zA-Z0-9]|$)/gi },
-  { label: 'DELETE FROM messages_archive', re: /\bDELETE\s+FROM\s+["'`]?messages_archive(?:["'`]|[^_a-zA-Z0-9]|$)/gi },
-  { label: 'REPLACE INTO messages_archive', re: /\bREPLACE\s+INTO\s+["'`]?messages_archive(?:["'`]|[^_a-zA-Z0-9]|$)/gi },
+const WRITE_PATTERNS: Array<{ label: string; re: () => RegExp }> = [
+  { label: 'UPDATE messages_archive', re: () => new RegExp(`\\bUPDATE\\s+${ARCHIVE_TABLE_REF}`, 'gi') },
+  { label: 'DELETE FROM messages_archive', re: () => new RegExp(`\\bDELETE\\s+FROM\\s+${ARCHIVE_TABLE_REF}`, 'gi') },
+  { label: 'INSERT INTO messages_archive', re: () => new RegExp(`\\bINSERT\\s+INTO\\s+${ARCHIVE_TABLE_REF}`, 'gi') },
   {
-    label: 'INSERT OR REPLACE INTO messages_archive',
-    re: /\bINSERT\s+OR\s+\w+\s+INTO\s+["'`]?messages_archive(?:["'`]|[^_a-zA-Z0-9]|$)/gi,
+    label: 'INSERT OR <verb> INTO messages_archive',
+    re: () => new RegExp(`\\bINSERT\\s+OR\\s+\\w+\\s+INTO\\s+${ARCHIVE_TABLE_REF}`, 'gi'),
   },
-  { label: 'INSERT INTO messages_archive', re: /\bINSERT\s+INTO\s+["'`]?messages_archive(?:["'`]|[^_a-zA-Z0-9]|$)/gi },
-  { label: 'DROP TABLE messages_archive', re: /\bDROP\s+TABLE\s+(?:IF\s+EXISTS\s+)?["'`]?messages_archive(?:["'`]|[^_a-zA-Z0-9]|$)/gi },
-  { label: 'VACUUM', re: /\bVACUUM\b/gi },
+  { label: 'REPLACE INTO messages_archive', re: () => new RegExp(`\\bREPLACE\\s+INTO\\s+${ARCHIVE_TABLE_REF}`, 'gi') },
+  {
+    label: 'DROP TABLE messages_archive',
+    re: () => new RegExp(`\\bDROP\\s+TABLE\\s+(?:IF\\s+EXISTS\\s+)?${ARCHIVE_TABLE_REF}`, 'gi'),
+  },
 ];
+
+/**
+ * `VACUUM`, but only where it could plausibly be aimed at the archive.
+ *
+ * A bare repository-wide keyword scan is wrong: `centralDb.exec('VACUUM')` has
+ * nothing to do with this invariant, and neither does the word in a comment
+ * about some other database. So a VACUUM is reported only in a file that also
+ * names the archive, which is the closest a static check gets to "on the
+ * archive connection".
+ *
+ * Worth flagging at all because SQLite's docs permit VACUUM to change the
+ * ROWIDs of any table without an INTEGER PRIMARY KEY, and `messages_archive`'s
+ * key is TEXT. The stamp's watermark is a rowid. Today's SQLite happens to
+ * preserve them (checked against the pinned better-sqlite3: a VACUUM after a
+ * delete left rowids 1, 3, 5 intact), and a compaction that did renumber could
+ * only lower `MAX(rowid)`, which the decrease rule already rebuilds on. So this
+ * guards the ASSUMPTION rather than a live corruption — but it is an assumption
+ * the design is stated in terms of, and it should not be silently taken away.
+ */
+const VACUUM_RE = () => /\bVACUUM\b/gi;
+const ARCHIVE_MENTION_RE = () => /messages_archive|archive\.db|ARCHIVE_PATH/i;
+
+function writeFormsIn(source: string): string[] {
+  const found: string[] = [];
+  for (const { label, re } of WRITE_PATTERNS) {
+    if (re().test(source)) found.push(label);
+  }
+  return found;
+}
 
 describe('#360 — the archive has one write path', () => {
   it('finds no write against messages_archive outside its two owners', () => {
@@ -96,12 +143,56 @@ describe('#360 — the archive has one write path', () => {
     for (const relative of [...listTsFiles('src'), ...listTsFiles('scripts')]) {
       if (WRITERS.has(relative)) continue;
       const source = fs.readFileSync(path.join(REPO_ROOT, relative), 'utf-8');
-      for (const { label, re } of WRITE_PATTERNS) {
-        re.lastIndex = 0;
-        if (re.test(source)) offenders.push(`${relative}: ${label}`);
+      for (const label of writeFormsIn(source)) offenders.push(`${relative}: ${label}`);
+      if (VACUUM_RE().test(source) && ARCHIVE_MENTION_RE().test(source)) {
+        offenders.push(`${relative}: VACUUM in a file that also names the archive`);
       }
     }
     expect(offenders, `${offenders.join('; ')}\n\n${WHY}`).toEqual([]);
+  });
+
+  it('recognises quoted, bracketed and schema-qualified table names', () => {
+    // The forms a future mutation could take without ever writing the bare
+    // name. Asserted directly rather than by planting code, so the coverage
+    // cannot rot: if a reader tightens ARCHIVE_TABLE_REF, this fails.
+    for (const statement of [
+      "UPDATE messages_archive SET sent_at = ?",
+      'UPDATE "messages_archive" SET sent_at = ?',
+      'UPDATE [messages_archive] SET sent_at = ?',
+      'UPDATE `messages_archive` SET sent_at = ?',
+      'UPDATE main.messages_archive SET sent_at = ?',
+      'UPDATE main . "messages_archive" SET sent_at = ?',
+      "delete   from   messages_archive where id = ?",
+      "REPLACE INTO messages_archive (id) VALUES (?)",
+      "INSERT OR REPLACE INTO messages_archive (id) VALUES (?)",
+      "DROP TABLE IF EXISTS messages_archive",
+    ]) {
+      expect(writeFormsIn(statement), `not recognised as a write: ${statement}`).not.toEqual([]);
+    }
+
+    // The FTS shadow table and the marks table are different tables, and the
+    // trigger DDL names the base table after ON rather than after the verb.
+    for (const statement of [
+      "INSERT INTO messages_archive_fts(rowid, text) VALUES (?, ?)",
+      "INSERT INTO messages_archive_fts(messages_archive_fts, rowid) VALUES ('delete', ?)",
+      'INSERT INTO "messages_archive_fts" (rowid) VALUES (?)',
+      "INSERT INTO archive_row_marks (agent_group_id, mutations) VALUES (?, 1)",
+      "CREATE TRIGGER x AFTER UPDATE ON messages_archive BEGIN SELECT 1; END",
+      "CREATE TRIGGER y AFTER DELETE ON messages_archive BEGIN SELECT 1; END",
+      "SELECT * FROM messages_archive WHERE id = ?",
+    ]) {
+      expect(writeFormsIn(statement), `wrongly flagged as a write: ${statement}`).toEqual([]);
+    }
+  });
+
+  it('does not flag a VACUUM of some other database', () => {
+    // The false positive the scan must not produce: unrelated maintenance code
+    // vacuuming the central DB, in a file that never mentions the archive.
+    const unrelated = "centralDb.exec('VACUUM');";
+    expect(VACUUM_RE().test(unrelated) && ARCHIVE_MENTION_RE().test(unrelated)).toBe(false);
+    // ...and the one it must still catch.
+    const archiveVacuum = "const db = new Database(ARCHIVE_PATH); db.exec('VACUUM');";
+    expect(VACUUM_RE().test(archiveVacuum) && ARCHIVE_MENTION_RE().test(archiveVacuum)).toBe(true);
   });
 
   it('keeps message-archive.ts down to the single upsert', () => {
@@ -110,10 +201,19 @@ describe('#360 — the archive has one write path', () => {
     // The base table is written in exactly one place, and that place is the
     // exported constant. The trigger BODIES in this file write
     // `messages_archive_fts` and `archive_row_marks`, never the base table.
-    const baseTableWrites = [
-      ...source.matchAll(/\b(?:INSERT\s+INTO|INSERT\s+OR\s+\w+\s+INTO|UPDATE|DELETE\s+FROM|REPLACE\s+INTO)\s+messages_archive(?:[^_a-zA-Z0-9]|$)/gi),
-    ];
-    expect(baseTableWrites, `message-archive.ts gained a second write to messages_archive.\n\n${WHY}`).toHaveLength(1);
+    // The SAME quote-aware patterns the repo-wide scan uses. An owner-specific
+    // regex here was the gap Codex found: a future
+    // `UPDATE "messages_archive" SET ...` inside this file matched neither the
+    // general scan (which skips owners) nor the narrower local pattern.
+    const baseTableWrites: string[] = [];
+    for (const { label, re } of WRITE_PATTERNS) {
+      for (const match of source.matchAll(re())) baseTableWrites.push(`${label} @ ${match.index}`);
+    }
+    expect(
+      baseTableWrites,
+      `message-archive.ts must contain exactly one write to messages_archive, found ${baseTableWrites.length}: ${baseTableWrites.join(', ')}.\n\n${WHY}`,
+    ).toHaveLength(1);
+    expect(VACUUM_RE().test(source), `message-archive.ts gained a VACUUM.\n\n${WHY}`).toBe(false);
     expect(ARCHIVE_UPSERT_SQL).toMatch(/INSERT INTO messages_archive/);
     expect(ARCHIVE_UPSERT_SQL).toMatch(/ON CONFLICT\(id\) DO UPDATE SET/);
     expect(source).toContain('ARCHIVE_UPSERT_SQL');
