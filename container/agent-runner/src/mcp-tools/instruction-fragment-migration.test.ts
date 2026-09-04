@@ -135,13 +135,14 @@ describe('container/CLAUDE.md "Working with Repos" prose migrated into the repo 
     expect(description).toContain('Generated with Claude Code');
   });
 
-  it('create_worktree description and continueFromThreadId param carry the tool-sequence and rollback guidance', () => {
+  it('create_worktree description and continueFromThreadId param carry the tool-sequence and transfer guidance', () => {
     const description = createWorktreeTool.tool.description;
     expect(description).toMatch(/git_commit.*git_push.*open_pr/);
     const continueFromThreadId = createWorktreeTool.tool.inputSchema.properties.continueFromThreadId as {
       description: string;
     };
-    expect(continueFromThreadId.description).toContain('move the exact checkout back');
+    expect(continueFromThreadId.description).toContain('source tombstone records the next owner');
+    expect(continueFromThreadId.description).toContain('request the transfer from the current owner');
     expect(continueFromThreadId.description).toContain('Never recreate, delete, or prune');
   });
 });
