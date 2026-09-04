@@ -617,18 +617,18 @@ async function routeInboundClaimed(event: InboundEvent, markReplayPending: () =>
         // operational pins (`-m` / `-e` persist), and spreading one channel's
         // pin to every future channel is a worse bug than the one this fixes.
         const inheritedTone = unanimousToneFor(inheritedAgent.id, mg.channel_type);
+        const isGroup = event.message.isGroup ?? mg.is_group === 1;
         createMessagingGroupAgent({
           id: `mga-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
           messaging_group_id: mg.id,
           agent_group_id: inheritedAgent.id,
-          // All platforms default to plain mention so each invocation is
-          // intentional. (Discord previously defaulted to mention-sticky for
-          // single-agent channels; with sibling agents now co-resident in
-          // every channel, sticky let one agent auto-dominate threads —
-          // owner directive 2026-05-26. mention-sticky stays available to set
-          // manually via `ncl wirings update`.)
-          engage_mode: 'mention',
-          engage_pattern: null,
+          // Group chats default to plain mention so each invocation is
+          // intentional. DMs always engage: Slack does not require or reliably
+          // emit a self-mention there, so persisting mention mode makes later
+          // unmentioned DM turns silently accumulate without waking the agent.
+          // mention-sticky stays available as an explicit group override.
+          engage_mode: isGroup ? 'mention' : 'pattern',
+          engage_pattern: isGroup ? null : '.',
           session_mode: 'per-thread',
           priority: 0,
           sender_scope: 'all',

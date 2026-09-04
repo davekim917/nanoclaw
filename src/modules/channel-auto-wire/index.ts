@@ -147,9 +147,11 @@ export const resolver: UnwiredChannelResolverFn = (event, mg) => {
     return [];
   }
 
-  // v2 engage model: DMs (threadId=null) use pattern='.' (always respond);
-  // group chats are always @mentions, use mention mode.
-  const engageMode: MessagingGroupAgent['engage_mode'] = event.threadId === null ? 'pattern' : 'mention';
+  // v2 engage model: DMs use pattern='.' (always respond); group chats use
+  // mention mode. Never infer this from threadId: Slack/Discord DMs can have
+  // subthreads, while non-threaded group platforms always have null thread ids.
+  const isGroup = event.message.isGroup ?? mg.is_group === 1;
+  const engageMode: MessagingGroupAgent['engage_mode'] = isGroup ? 'mention' : 'pattern';
   const engagePattern = engageMode === 'pattern' ? '.' : null;
 
   const sessionMode = resolveDefaultSessionMode(event.channelType);

@@ -640,13 +640,13 @@ describe('channel-type predicates accept bare base and variants', () => {
   });
 });
 
-describe('workspace-trust auto-wire inherits voice', () => {
+describe('workspace-trust auto-wire inherits voice and engagement defaults', () => {
   // Regression: the auto-wire path copied the agent group from an incumbent
   // channel but hardcoded default_tone null, so every channel created after
   // the hand-wired ones ran with NO tone injection — one agent sounded like
   // two different agents depending on the channel, for four months.
-  function arrangeAutoWire(existingTones: Array<string | null>) {
-    const mg = makeMg({ id: 'mg-new', platform_id: 'slack:CNEW' });
+  function arrangeAutoWire(existingTones: Array<string | null>, isGroup = false) {
+    const mg = makeMg({ id: 'mg-new', platform_id: 'slack:CNEW', is_group: isGroup ? 1 : 0 });
     // Auto-wire re-enters routing once the row exists; the second lookup must
     // report the channel as wired or routeInbound recurses forever.
     vi.mocked(getMessagingGroupWithAgentCount)
@@ -703,6 +703,34 @@ describe('workspace-trust auto-wire inherits voice', () => {
 
     expect(createMessagingGroupAgent).toHaveBeenCalledWith(
       expect.objectContaining({ default_model: null, default_effort: null }),
+    );
+  });
+
+  it('uses always-on accumulation for an auto-wired DM', async () => {
+    arrangeAutoWire(['engineering']);
+
+    await routeInbound(makeChatEvent('hello', { isDM: true }));
+
+    expect(createMessagingGroupAgent).toHaveBeenCalledWith(
+      expect.objectContaining({
+        engage_mode: 'pattern',
+        engage_pattern: '.',
+        ignored_message_policy: 'accumulate',
+      }),
+    );
+  });
+
+  it('uses mention accumulation for an auto-wired group', async () => {
+    arrangeAutoWire(['engineering'], true);
+
+    await routeInbound(makeChatEvent('@bot hello', { isDM: false, threadId: 'thread-1' }));
+
+    expect(createMessagingGroupAgent).toHaveBeenCalledWith(
+      expect.objectContaining({
+        engage_mode: 'mention',
+        engage_pattern: null,
+        ignored_message_policy: 'accumulate',
+      }),
     );
   });
 });

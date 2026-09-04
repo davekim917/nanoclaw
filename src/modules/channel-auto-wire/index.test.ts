@@ -119,6 +119,44 @@ describe('channel-auto-wire resolver', () => {
     expect(persisted[0].session_mode).toBe('per-thread');
   });
 
+  it('uses always-on engagement for a threaded DM', () => {
+    const ag = makeAgentGroup('ag-auto', 'example-labs-v2', 'helper');
+    createAgentGroup(ag);
+    process.env[ENV_FOLDER_KEY] = 'example-labs-v2';
+
+    const mg = makeMg('mg-dm', 'slack-example-labs', 'slack:DM');
+    createMessagingGroup(mg);
+    const event = makeEvent('slack-example-labs', 'slack:DM');
+    event.threadId = 'slack:DM:thread-1';
+    event.isDM = true;
+    event.message.isGroup = false;
+
+    const result = resolver(event, mg);
+
+    expect(result[0].engage_mode).toBe('pattern');
+    expect(result[0].engage_pattern).toBe('.');
+    expect(result[0].ignored_message_policy).toBe('accumulate');
+  });
+
+  it('uses mention engagement for a non-threaded group', () => {
+    const ag = makeAgentGroup('ag-auto', 'example-labs-v2', 'helper');
+    createAgentGroup(ag);
+    process.env[ENV_FOLDER_KEY] = 'example-labs-v2';
+
+    const mg = makeMg('mg-group', 'slack-example-labs', 'slack:GROUP');
+    mg.is_group = 1;
+    createMessagingGroup(mg);
+    const event = makeEvent('slack-example-labs', 'slack:GROUP');
+    event.isDM = false;
+    event.message.isGroup = true;
+
+    const result = resolver(event, mg);
+
+    expect(result[0].engage_mode).toBe('mention');
+    expect(result[0].engage_pattern).toBeNull();
+    expect(result[0].ignored_message_policy).toBe('accumulate');
+  });
+
   it('honors an explicit session_mode override', () => {
     const ag = makeAgentGroup('ag-auto', 'example-labs-v2', 'helper');
     createAgentGroup(ag);
