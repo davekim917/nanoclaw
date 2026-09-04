@@ -2,13 +2,10 @@ import fs from 'fs';
 import path from 'path';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
-const { tmpRoot } = vi.hoisted(() => {
-  // eslint-disable-next-line @typescript-eslint/no-require-imports -- vi.hoisted() runs before ESM imports are linked, so require() is the only way to get these Node builtins synchronously here
-  const fsMod = require('fs') as typeof import('fs');
-  // eslint-disable-next-line @typescript-eslint/no-require-imports -- vi.hoisted() runs before ESM imports are linked, so require() is the only way to get these Node builtins synchronously here
-  const osMod = require('os') as typeof import('os');
-  // eslint-disable-next-line @typescript-eslint/no-require-imports -- vi.hoisted() runs before ESM imports are linked, so require() is the only way to get these Node builtins synchronously here
-  const pathMod = require('path') as typeof import('path');
+const { tmpRoot } = await vi.hoisted(async () => {
+  const fsMod = await import('fs');
+  const osMod = await import('os');
+  const pathMod = await import('path');
   return { tmpRoot: fsMod.mkdtempSync(pathMod.join(osMod.tmpdir(), 'attach-dl-')) };
 });
 

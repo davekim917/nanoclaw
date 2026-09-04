@@ -68,13 +68,10 @@ const selfHeal = vi.hoisted(() => ({ enabled: false }));
 // DATA_DIR is redirected at a per-run temp root so anything in this file that
 // resolves a session path (the mailbox seam's `sessionMailboxPath`, heartbeats,
 // `sessionsBaseDir`) can never reach the real install's data directory.
-const testDataDir = vi.hoisted(() => {
-  // eslint-disable-next-line @typescript-eslint/no-require-imports -- vi.hoisted() runs before ESM imports are linked, so require() is the only way to get these Node builtins synchronously here
-  const nodeFs = require('fs') as typeof import('fs');
-  // eslint-disable-next-line @typescript-eslint/no-require-imports -- vi.hoisted() runs before ESM imports are linked, so require() is the only way to get these Node builtins synchronously here
-  const nodeOs = require('os') as typeof import('os');
-  // eslint-disable-next-line @typescript-eslint/no-require-imports -- vi.hoisted() runs before ESM imports are linked, so require() is the only way to get these Node builtins synchronously here
-  const nodePath = require('path') as typeof import('path');
+const testDataDir = await vi.hoisted(async () => {
+  const nodeFs = await import('fs');
+  const nodeOs = await import('os');
+  const nodePath = await import('path');
   return { dir: nodeFs.mkdtempSync(nodePath.join(nodeOs.tmpdir(), 'host-sweep-data-')) };
 });
 vi.mock('./config.js', async (importOriginal) => {

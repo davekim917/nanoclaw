@@ -84,13 +84,10 @@ const realMailboxSessions = vi.hoisted(() => new Set<string>());
 
 // DATA_DIR is a per-run temp root: the real-mailbox case provisions actual
 // session DBs under it, and nothing here can reach the install's data dir.
-const testDataDir = vi.hoisted(() => {
-  // eslint-disable-next-line @typescript-eslint/no-require-imports -- vi.hoisted() runs before ESM imports are linked, so require() is the only way to get these Node builtins synchronously here
-  const nodeFs = require('fs') as typeof import('fs');
-  // eslint-disable-next-line @typescript-eslint/no-require-imports -- vi.hoisted() runs before ESM imports are linked, so require() is the only way to get these Node builtins synchronously here
-  const nodeOs = require('os') as typeof import('os');
-  // eslint-disable-next-line @typescript-eslint/no-require-imports -- vi.hoisted() runs before ESM imports are linked, so require() is the only way to get these Node builtins synchronously here
-  const nodePath = require('path') as typeof import('path');
+const testDataDir = await vi.hoisted(async () => {
+  const nodeFs = await import('fs');
+  const nodeOs = await import('os');
+  const nodePath = await import('path');
   return { dir: nodeFs.mkdtempSync(nodePath.join(nodeOs.tmpdir(), 'container-restart-data-')) };
 });
 vi.mock('./config.js', async (importOriginal) => ({
