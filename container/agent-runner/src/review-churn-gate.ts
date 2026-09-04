@@ -114,6 +114,15 @@ function defaultRun(
  * seam, candidate primitives — plus the two ways out, one of which is not
  * "push anyway".
  */
+/**
+ * One argument, safe to paste into a shell. Git accepts `&` and backticks in a
+ * branch name, and this command is written to be executed — unquoted, such a
+ * name splits the assignment or substitutes a command.
+ */
+function shellQuote(value: string): string {
+  return `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
 export function refusalMessage(gateText: string, script: string, identity: { branch: string; head: string }): string {
   return [
     gateText.trim(),
@@ -133,8 +142,8 @@ export function refusalMessage(gateText: string, script: string, identity: { bra
     // The path is the one actually selected — the Claude mount, the /app
     // fallback, or an override — since printing a path the agent cannot run
     // turns the documented, PR-recorded override into a command that fails.
-    `    REVIEW_LOOP_ALLOW_SITE_PATCH=1 BRANCH=${identity.branch} ${script} push \\`,
-    `        ${identity.head}:refs/heads/${identity.branch}`,
+    `    REVIEW_LOOP_ALLOW_SITE_PATCH=1 BRANCH=${shellQuote(identity.branch)} ${shellQuote(script)} push \\`,
+    `        ${shellQuote(`${identity.head}:refs/heads/${identity.branch}`)}`,
   ].join('\n');
 }
 

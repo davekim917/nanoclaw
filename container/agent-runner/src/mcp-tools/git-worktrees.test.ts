@@ -317,6 +317,29 @@ describe('topic-linked worktree topology', () => {
     expect(source).toContain("['status', '--porcelain=v2', '--branch', '--untracked-files=no']");
   });
 
+  test('a force push carries the lease it captured, not one inferred at push time', async () => {
+    // A bare --force-with-lease expects whatever refs/remotes/origin/<branch>
+    // says when the push runs, and any sibling topic's create_worktree
+    // refreshes that ref with a shared fetch — so a commit that landed while
+    // the gate was on the network would be adopted as the expectation and then
+    // overwritten.
+    const source = readFileSync(fileURLToPath(new URL('./git-worktrees.ts', import.meta.url)), 'utf8');
+    expect(source).toContain('`--force-with-lease=refs/heads/${branch}:${identity.lease}`');
+    expect(source).not.toContain("'--force-with-lease'");
+    expect(source).toContain("tryGitAt(worktree, ['rev-parse', `refs/remotes/origin/${head}`])");
+
+    // And it still pushes: force from a worktree whose branch is on the remote.
+    expect((await createWorktreeTool.handler({ repo: 'proj' })).isError).toBeFalsy();
+    const worktree = join(firstTopic, 'proj');
+    writeFileSync(join(worktree, 'work.txt'), 'one\n');
+    expect((await gitCommitTool.handler({ repo: 'proj', message: 'one' })).isError).toBeFalsy();
+    expect((await gitPushTool.handler({ repo: 'proj' })).isError).toBeFalsy();
+    git(worktree, ['commit', '-q', '--amend', '-m', 'one amended']);
+    expect((await gitPushTool.handler({ repo: 'proj', force: true })).isError).toBeFalsy();
+    const branch = git(worktree, ['branch', '--show-current']);
+    expect(git(remote, ['rev-parse', branch])).toBe(git(worktree, ['rev-parse', 'HEAD']));
+  });
+
   test('opens the PR for the branch it captured, not the current checkout', async () => {
     // `gh pr create` defaults --head to whatever is checked out, so a sibling
     // switching branches mid-call would open the PR for their branch.

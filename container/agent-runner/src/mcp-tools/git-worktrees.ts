@@ -84,12 +84,20 @@ function runGitAt(cwd: string, args: string[], timeoutMs = 120_000): string {
  * branch's commit. `status --porcelain=v2 --branch` reports both from a single
  * snapshot, so there is no window to lose rather than a smaller one.
  */
-function capturedIdentity(worktree: string): { branch: string; head: string } | null {
+function capturedIdentity(worktree: string): { branch: string; head: string; lease: string } | null {
   const out = runGitAt(worktree, ['status', '--porcelain=v2', '--branch', '--untracked-files=no']);
   const oid = /^# branch\.oid (\S+)$/m.exec(out)?.[1];
   const head = /^# branch\.head (.+)$/m.exec(out)?.[1];
   if (!oid || !head || head === '(detached)' || oid === '(initial)') return null;
-  return { branch: head, head: oid };
+  // The remote value this caller actually integrated, read now rather than left
+  // to `--force-with-lease` to infer at push time. A bare lease expects
+  // whatever `refs/remotes/origin/<branch>` says when the push runs, and any
+  // sibling topic's `create_worktree` refreshes that ref with a shared
+  // `fetch --prune` — so a commit that landed while the gate was on the network
+  // would be adopted as the expectation and then overwritten. An empty lease
+  // means the branch must not exist on the remote yet.
+  const lease = tryGitAt(worktree, ['rev-parse', `refs/remotes/origin/${head}`]) ?? '';
+  return { branch: head, head: oid, lease };
 }
 
 function tryGitAt(cwd: string, args: string[], timeoutMs = 120_000): string | null {
@@ -630,7 +638,7 @@ export const gitPushTool: McpToolDefinition = {
       return await withRepositoryLock(resolved.context, async () => {
         const push = [
           'push',
-          ...(args.force === true ? ['--force-with-lease'] : []),
+          ...(args.force === true ? [`--force-with-lease=refs/heads/${branch}:${identity.lease}`] : []),
           'origin',
           `${head}:refs/heads/${branch}`,
         ];

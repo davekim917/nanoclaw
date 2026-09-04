@@ -87,8 +87,22 @@ describe('review churn gate at git_push', () => {
     const result = evaluateReviewChurnGate({ ...present, run: stub({ status: 3, stderr: REFRAME_TEXT }) });
     expect(result.status).toBe('refused');
     if (result.status !== 'refused') return;
-    expect(result.message).toContain('BRANCH=topic/thing');
-    expect(result.message).toContain('abc1234def:refs/heads/topic/thing');
+    expect(result.message).toContain("BRANCH='topic/thing'");
+    expect(result.message).toContain("'abc1234def:refs/heads/topic/thing'");
+  });
+
+  test('shell-quotes what it puts in a command an agent will run', () => {
+    // Git accepts `&` and backticks in a branch name; unquoted, one splits the
+    // assignment and the other substitutes a command.
+    const result = evaluateReviewChurnGate({
+      ...present,
+      branch: 'topic/foo&`whoami`',
+      run: stub({ status: 3, stderr: REFRAME_TEXT }),
+    });
+    expect(result.status).toBe('refused');
+    if (result.status !== 'refused') return;
+    expect(result.message).toContain("BRANCH='topic/foo&`whoami`'");
+    expect(result.message).toContain("'abc1234def:refs/heads/topic/foo&`whoami`'");
   });
 
   test('names the script it actually selected in the refusal', () => {
@@ -103,7 +117,7 @@ describe('review churn gate at git_push', () => {
     });
     expect(fallback.status).toBe('refused');
     if (fallback.status !== 'refused') return;
-    expect(fallback.message).toContain(`${CHURN_GATE_SCRIPT_PATHS[1]} push`);
+    expect(fallback.message).toContain(`'${CHURN_GATE_SCRIPT_PATHS[1]}' push`);
     expect(fallback.message).not.toContain(CHURN_GATE_SCRIPT_PATHS[0]);
   });
 

@@ -156,13 +156,14 @@ $line" >/dev/null
 # rejected push must not leave that claim in the PR body. `run_gate` just hands
 # the line back in GATE_OVERRIDE_LINE.
 GATE_OVERRIDE_LINE=""
+PUSH_HEAD=""
 run_gate() {
   local node out status=0 sha classes
   GATE_OVERRIDE_LINE=""
   node=$(runtime) || return 2
   out=$(payload_json | "$node" "$CHURN_JS" gate --json "$@") || status=$?
   if [ "$status" -eq 0 ] && [ "$(printf '%s' "$out" | jq -r .status)" = "override" ]; then
-    sha=$(git rev-parse --short HEAD)
+    sha=$(git rev-parse --short "${PUSH_HEAD:-HEAD}")
     classes=$(printf '%s' "$out" | jq -r '[.unlifted[] | "`\(.key)`"] | join(", ")')
     GATE_OVERRIDE_LINE="⚠️ \`REVIEW_LOOP_ALLOW_SITE_PATCH=1\` used at \`$sha\`: site patch pushed for $classes without the primitive fix."
   fi
@@ -223,8 +224,23 @@ case "${1:?usage: open|churn|classes|gate|push|body|reply|resolve|status}" in
     # --committed-only because `git push` sends committed history: an edit to
     # the primitive still sitting in the working tree would otherwise lift the
     # gate for a push that leaves it behind.
-    run_gate --committed-only
+    #
+    # A `<sha>:refs/heads/<branch>` argument pins the gate to that commit as
+    # well, so the verdict and the audit line describe what is being pushed
+    # rather than whatever the checkout holds when this runs. Callers that pass
+    # no refspec are pushing the checkout, and the gate reads it.
     shift
+    PUSH_HEAD=""
+    for arg in "$@"; do
+      case "$arg" in
+        *:refs/heads/*) PUSH_HEAD="${arg%%:*}" ;;
+      esac
+    done
+    if [ -n "$PUSH_HEAD" ]; then
+      run_gate --committed-only --head "$PUSH_HEAD"
+    else
+      run_gate --committed-only
+    fi
     git push "$@"
     if [ -n "$GATE_OVERRIDE_LINE" ]; then
       record_site_patch_override "$GATE_OVERRIDE_LINE"
