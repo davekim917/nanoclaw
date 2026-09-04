@@ -86,10 +86,18 @@ export interface SessionReadOptions {
    * Roll a hot journal back before opening.
    *
    * A rollback is a WRITE, so it is off by default: a fleet-wide console read
-   * must not write to sessions it is merely listing. The one caller that turns
-   * it on is the steer write path's pre-write probe, which owns that session's
-   * write anyway and whose read would otherwise fail permanently on any
-   * session whose host write was interrupted.
+   * must not write to sessions it is merely listing.
+   *
+   * The rule for turning it on is the seam's rule everywhere — restate what
+   * the open being replaced did, and no more. Pass it wherever that open was
+   * READ-WRITE (a read-write open always rolls a hot journal back on the way
+   * in) or recovered one explicitly; leave it off wherever the old open was a
+   * bare `readonly` handle, which never did. Do not add it to a new caller on
+   * the theory that recovery is harmless: without a replaced open to restate,
+   * it is a console read writing to a session it is only inspecting.
+   *
+   * Every caller that passes it today reads a single named session the caller
+   * already owns or is about to write, never a fleet fan-out.
    */
   recoverJournal?: boolean;
 }

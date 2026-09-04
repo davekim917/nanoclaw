@@ -659,12 +659,15 @@ describe('completeSpawnSideEffects', () => {
     }
   });
 
-  // A child interrupted partway through provisioning has inbound.db and no
-  // outbound.db, and `exists()` calls that ABSENT because a mailbox is both
-  // files. Taking the non-provisioning seam here therefore drops the
-  // spawn_task_id stamp silently, and the child then runs with no way for
+  // A child `resolveSession` has just created can have NO mailbox on disk at
+  // all, which is the shape `exists()` calls ABSENT. Note it is keyed on
+  // inbound.db ALONE (pinned by mailbox.test.ts's 'a session with only
+  // inbound.db exists'), so the HALF-provisioned shape — inbound.db present,
+  // outbound.db not — is PRESENT and is not what this guards; the fully-absent
+  // one is. Taking the non-provisioning seam there drops the spawn_task_id
+  // stamp silently, and the child then runs with no way for
   // `mountSpawnTools()` to give it progress or completion tools — while the
-  // `writeSessionMessage` one line later provisions the missing file anyway.
+  // `writeSessionMessage` one line later provisions the mailbox anyway.
   // Asserting the SEAM, not the file, is what makes this a regression guard
   // that survives the suite no longer touching disk at all.
   it('stamps spawn_task_id through the provisioning mailbox seam, never the existing-only one', async () => {
