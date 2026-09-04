@@ -68,6 +68,13 @@ function addLinkedWorktree(mainRoot: string): string {
   return worktreeRoot;
 }
 
+function cloneDetached(sourceRoot: string): string {
+  const cloneRoot = path.join(tempRoot(), 'clone');
+  execFileSync('git', ['clone', '--quiet', sourceRoot, cloneRoot]);
+  execFileSync('git', ['checkout', '--detach', '-q'], { cwd: cloneRoot });
+  return cloneRoot;
+}
+
 afterEach(() => {
   vi.restoreAllMocks();
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
@@ -315,7 +322,7 @@ describe('Git surfaces and modes', () => {
     );
     execFileSync('git', ['add', 'leak.md'], { cwd: worktreeRoot });
 
-    const options = resolveOptions(['--root', worktreeRoot], worktreeRoot);
+    const options = resolveOptions(['--root', worktreeRoot, '--index'], worktreeRoot);
     const report = runReport(options);
     expect(report.mode).toBe('install-aware');
     expect(report.registryOrigin).toBe('main-checkout');
@@ -367,6 +374,40 @@ describe('Git surfaces and modes', () => {
   it('portable mode works without install state', () => {
     const root = initRepo();
     expect(run(resolveOptions(['--root', root, '--portable'], root))).toEqual([]);
+
+    const stdout = vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
+    expect(main(['--root', root, '--index', '--portable'])).toBe(0);
+    expect(stdout.mock.calls.flat().join('')).toContain('portable — structural patterns only');
+  });
+
+  it.each(['--index', '--staged'])('fails closed for %s when no identifier registry resolves', (surface) => {
+    const root = cloneDetached(initInstallRepo('Synthetic Registry', 'Synthetic Local'));
+    const stdout = vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
+    const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+
+    expect(main(['--root', root, surface])).toBe(1);
+    expect(stdout).not.toHaveBeenCalled();
+    const output = stderr.mock.calls.flat().join('');
+    expect(output).toContain(`registry paths tried: ${path.join(root, 'data', 'v2.db')}`);
+    expect(output).toContain(
+      `identifier inventory paths tried: ${path.join(root, '.nanoclaw', 'public-boundary-identifiers')}`,
+    );
+    expect(output).toContain('indexed scans require an identifier registry');
+  });
+
+  it('allows explicit structural reporting for an indexed surface but still reports structural findings', () => {
+    const root = initRepo();
+    const stdout = vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
+    const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+
+    expect(main(['--root', root, '--index', '--allow-structural'])).toBe(0);
+    expect(stdout.mock.calls.flat().join('')).toContain('public boundary check passed');
+
+    const at = String.fromCharCode(64);
+    fs.writeFileSync(path.join(root, 'structural.md'), `person${at}company.dev\n`);
+    execFileSync('git', ['add', 'structural.md'], { cwd: root });
+    expect(main(['--root', root, '--index', '--allow-structural'])).toBe(1);
+    expect(stderr.mock.calls.flat().join('')).toContain('structural.md:1 email-address');
   });
 });
 
