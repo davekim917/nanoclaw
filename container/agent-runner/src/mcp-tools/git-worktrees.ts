@@ -74,6 +74,24 @@ function runGitAt(cwd: string, args: string[], timeoutMs = 120_000): string {
   }).trim();
 }
 
+/**
+ * The branch and the commit it points at, read in ONE git invocation.
+ *
+ * Two commands can straddle a sibling checking out another branch — they share
+ * this worktree — leaving a branch name from before the switch beside a commit
+ * from after it. Everything downstream is then pinned to an identity that never
+ * existed: the gate judges one PR's history while the refspec pushes the other
+ * branch's commit. `status --porcelain=v2 --branch` reports both from a single
+ * snapshot, so there is no window to lose rather than a smaller one.
+ */
+function capturedIdentity(worktree: string): { branch: string; head: string } | null {
+  const out = runGitAt(worktree, ['status', '--porcelain=v2', '--branch', '--untracked-files=no']);
+  const oid = /^# branch\.oid (\S+)$/m.exec(out)?.[1];
+  const head = /^# branch\.head (.+)$/m.exec(out)?.[1];
+  if (!oid || !head || head === '(detached)' || oid === '(initial)') return null;
+  return { branch: head, head: oid };
+}
+
 function tryGitAt(cwd: string, args: string[], timeoutMs = 120_000): string | null {
   try {
     return runGitAt(cwd, args, timeoutMs);
@@ -602,9 +620,9 @@ export const gitPushTool: McpToolDefinition = {
       // the remote is what the gate looked at, or nothing. Work a sibling adds
       // in the window is simply not pushed here; it gets its own verdict on
       // its own push.
-      const branch = runGitAt(worktree, ['branch', '--show-current']);
-      if (!branch) return err('Cannot push a detached HEAD; create or switch to a branch explicitly');
-      const head = runGitAt(worktree, ['rev-parse', 'HEAD']);
+      const identity = capturedIdentity(worktree);
+      if (!identity) return err('Cannot push a detached HEAD; create or switch to a branch explicitly');
+      const { branch, head } = identity;
 
       const gate = evaluateReviewChurnGate({ worktree, branch, head });
       if (gate.status === 'refused') return err(gate.message);

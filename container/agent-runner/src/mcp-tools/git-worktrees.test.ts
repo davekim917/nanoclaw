@@ -1,6 +1,17 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import { execFileSync } from 'child_process';
-import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'fs';
+import {
+  chmodSync,
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  writeFileSync,
+} from 'fs';
+import { fileURLToPath } from 'url';
 import { tmpdir } from 'os';
 import { join } from 'path';
 
@@ -292,6 +303,27 @@ describe('topic-linked worktree topology', () => {
     process.env.NANOCLAW_REVIEW_CHURN_GATE_SCRIPT = cleanGate;
     expect((await gitPushTool.handler({ repo: 'proj' })).isError).toBeFalsy();
     expect(git(remote, ['show-ref', '--verify', `refs/heads/${branch}`])).toContain(branch);
+  });
+
+  test('captures the branch and its commit in one git invocation', async () => {
+    // Two commands can straddle a sibling's checkout switch, leaving a branch
+    // name from before it beside a commit from after — an identity that never
+    // existed, which the gate would then judge and the refspec would push.
+    const source = readFileSync(fileURLToPath(new URL('./git-worktrees.ts', import.meta.url)), 'utf8');
+    const handler = source.slice(source.indexOf("name: 'git_push'"), source.indexOf("name: 'open_pr'"));
+    expect(handler).toContain('capturedIdentity(worktree)');
+    expect(handler).not.toContain("'branch', '--show-current'");
+    expect(handler).not.toContain("'rev-parse', 'HEAD'");
+    expect(source).toContain("['status', '--porcelain=v2', '--branch', '--untracked-files=no']");
+  });
+
+  test('still refuses a detached HEAD', async () => {
+    expect((await createWorktreeTool.handler({ repo: 'proj' })).isError).toBeFalsy();
+    const worktree = join(firstTopic, 'proj');
+    git(worktree, ['checkout', '-q', '--detach']);
+    const response = await gitPushTool.handler({ repo: 'proj' });
+    expect(response.isError).toBe(true);
+    expect(response.content[0].text).toContain('detached HEAD');
   });
 
   test('a sibling committing under the gate cannot smuggle that commit into the push', async () => {
