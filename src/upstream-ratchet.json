@@ -418,7 +418,7 @@
 "migrate-v2-reset.sh":{"diff":0,"mode":"100644","sha256":"1fb069bc90b08f2be7dc5af1190a8736f3a30b6855c017f81e838dc18f01892a"},
 "migrate-v2.sh":{"diff":25,"mode":"100644","sha256":"b7f76e28d4976ea5a82b184ad364bbf2de64af13c51d98021ebacf5a48ec8faf"},
 "nanoclaw.sh":{"diff":35,"mode":"100755","sha256":"6c1bd054c3e835db9aa671df227ba5c1317ae08c85ef457e93ea6944576e5f70"},
-"package.json":{"diff":67,"mode":"100644","sha256":"c98a0e05aa381589e3228346c707457f3c46b95693f67c432204ccce643a2b35"},
+"package.json":{"diff":68,"mode":"100644","sha256":"8847bcfcc2c749b687f8f9bb9c3f815c09599a424b7f47794f877fb5c71e100a"},
 "pnpm-lock.yaml":{"diff":1692,"mode":"100644","sha256":"b5060dea363a703b09459f45c7760a4365b3085e3e2725514ead3009722b76f7"},
 "pnpm-workspace.yaml":{"diff":18,"mode":"100644","sha256":"e5fd678ad7cf284ac1d83e2eb4b291ac813b6b4804dd074e649a89b5a4eee6c8"},
 "repo-tokens/README.md":{"diff":0,"mode":"100644","sha256":"165391d4be23ae6484060463ea211f52cadb9965fa508bd28e449ce2b6f4144d"},

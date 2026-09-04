@@ -30,6 +30,7 @@
     "test:watch": "vitest",
     "check:public-boundary": "tsx scripts/check-public-boundary.ts",
     "ratchet:report": "tsx scripts/upstream-ratchet-report.ts",
+    "upstream-dryrun-report": "tsx scripts/upstream-dry-run-report.ts",
     "build:dashboard": "tsx scripts/build-dashboard-spa.ts --install",
     "mailbox-model:generate": "cp src/mailbox/model.ts container/agent-runner/src/mailbox/model.generated.ts",
     "mailbox-model:check": "cmp src/mailbox/model.ts container/agent-runner/src/mailbox/model.generated.ts"
