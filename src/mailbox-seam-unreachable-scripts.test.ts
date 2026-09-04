@@ -119,16 +119,68 @@ function literalSpecifierText(node: ts.Expression): string | null {
 }
 
 /**
- * Throws `"<kind> in a manifest-pinned file: <file>:<line>"`, naming the
- * exact line `node` starts on in `sourceFile`. Shared by
- * `collectModuleBindings` and `discoverRelativeModules` so a specifier or
- * clause shape either can't statically resolve is a loud failure, not a
- * silently dropped edge — the manifest's completeness guarantee is that
- * every edge is either pinned or rejected, never skipped.
+ * Throws `"<kind> in a manifest-pinned file: <file>:<line>"` (plus a
+ * trailing ` <detail>` when given), naming the exact line `node` starts on
+ * in `sourceFile`. Shared by `collectModuleBindings` and
+ * `discoverRelativeModules` so a specifier or clause shape either can't
+ * statically resolve is a loud failure, not a silently dropped edge — the
+ * manifest's completeness guarantee is that every edge is either pinned or
+ * rejected, never skipped.
  */
-function failClosed(sourceFile: ts.SourceFile, filePath: string, kind: string, node: ts.Node): never {
+function failClosed(sourceFile: ts.SourceFile, filePath: string, kind: string, node: ts.Node, detail = ''): never {
   const { line } = sourceFile.getLineAndCharacterOfPosition(node.getStart(sourceFile));
-  throw new Error(`${kind} in a manifest-pinned file: ${filePath}:${line + 1}`);
+  const suffix = detail ? ` ${detail}` : '';
+  throw new Error(`${kind} in a manifest-pinned file: ${filePath}:${line + 1}${suffix}`);
+}
+
+/**
+ * Strips a recognized TypeScript source extension (`.ts`, `.tsx`, `.mts`,
+ * `.cts`) from the end of `p`, if present — the common form both
+ * `collectModuleBindings`'s target matching and
+ * `relativeResolutionCandidates`'s candidate generation compare against, so
+ * a `.mts`/`.cts` module is matched the same way a plain `.ts` one already
+ * was.
+ */
+function stripSourceExt(p: string): string {
+  return p.replace(/\.(ts|tsx|mts|cts)$/, '');
+}
+
+/**
+ * Every file path a relative specifier `specifierText`, written inside a
+ * file whose directory is `fileDir`, could resolve to under Node's
+ * ESM/NodeNext extension-mapping rules: `.js` -> `.ts`/`.tsx` (TypeScript
+ * compiles either to a `.js` of the same base name, so a `.js` specifier is
+ * ambiguous between them), `.mjs` -> `.mts`, `.cjs` -> `.cts`, and an
+ * extensionless specifier -> the same four extensions plus `/index.*` under
+ * each (a directory import). Pure path arithmetic — does not touch the
+ * filesystem, and does not itself decide relative-vs-package; callers
+ * already filter to specifiers starting with `.` before calling this.
+ *
+ * Shared by `discoverRelativeModules` (which existence-checks each
+ * candidate and fails closed if none exists on disk) and
+ * `collectModuleBindings`'s `specifierMatchesTarget` (which only needs to
+ * know whether ANY candidate, once extension-stripped, equals the target
+ * module it's already resolved to) — using one function for both closes the
+ * gap where the two could resolve the same specifier differently.
+ */
+function relativeResolutionCandidates(fileDir: string, specifierText: string): string[] {
+  const joined = path.posix.normalize(path.posix.join(fileDir, specifierText));
+  if (joined.endsWith('.js')) {
+    const base = joined.slice(0, -'.js'.length);
+    return [`${base}.ts`, `${base}.tsx`];
+  }
+  if (joined.endsWith('.mjs')) return [`${joined.slice(0, -'.mjs'.length)}.mts`];
+  if (joined.endsWith('.cjs')) return [`${joined.slice(0, -'.cjs'.length)}.cts`];
+  return [
+    `${joined}.ts`,
+    `${joined}.tsx`,
+    `${joined}.mts`,
+    `${joined}.cts`,
+    `${joined}/index.ts`,
+    `${joined}/index.tsx`,
+    `${joined}/index.mts`,
+    `${joined}/index.cts`,
+  ];
 }
 
 /**
@@ -176,12 +228,13 @@ function collectModuleBindings(filePath: string, modulePath: string, root: strin
   const src = fs.readFileSync(path.join(root, filePath), 'utf8');
   const sourceFile = ts.createSourceFile(filePath, src, ts.ScriptTarget.Latest, /* setParentNodes */ true);
   const fileDir = path.posix.dirname(filePath);
-  const targetNoExt = modulePath.replace(/\.ts$/, '');
+  const targetNoExt = stripSourceExt(modulePath);
 
   function specifierMatchesTarget(specifierText: string): boolean {
     if (!specifierText.startsWith('.')) return false; // package import — no repo-relative edge
-    const resolved = path.posix.normalize(path.posix.join(fileDir, specifierText)).replace(/\.js$/, '');
-    return resolved === targetNoExt || `${resolved}/index` === targetNoExt;
+    return relativeResolutionCandidates(fileDir, specifierText).some(
+      (candidate) => stripSourceExt(candidate) === targetNoExt,
+    );
   }
 
   function namedElementText(el: ts.ImportSpecifier | ts.ExportSpecifier): string | null {
@@ -272,8 +325,8 @@ function collectModuleBindings(filePath: string, modulePath: string, root: strin
  * function is called on is, by construction, one of the two manifest-pinned
  * files (`collectRelativeImportManifest`'s only caller), so the manifest is
  * only complete-by-construction if every edge is either pinned OR rejected —
- * never silently dropped. Two edges this function cannot resolve statically
- * would otherwise vanish with no trace:
+ * never silently dropped. Three edges this function cannot resolve
+ * statically would otherwise vanish with no trace:
  *   - a COMPUTED dynamic import, `import(someExpression)` — the specifier
  *     isn't a string/no-substitution-template literal, so `resolveModule`
  *     has nothing to resolve. Throws instead of skipping.
@@ -282,30 +335,35 @@ function collectModuleBindings(filePath: string, modulePath: string, root: strin
  *     undefined at runtime there, so a call to it is either dead code that
  *     shouldn't exist or a real edge this manifest has no way to see. Either
  *     way, it must not pass silently.
+ *   - a LITERAL relative specifier that doesn't resolve to any file on disk
+ *     under `relativeResolutionCandidates`'s extension-mapping rules (an
+ *     `.mjs`/`.cjs`/extensionless specifier this function previously only
+ *     tried a `.js` -> `.ts` mapping for, or a genuine typo) — a specifier
+ *     the module-discovery pass can't place anywhere is exactly the kind of
+ *     edge that must force a human to look, not silently contribute nothing.
  * A throw here fails the pinning `it()` with a message naming the exact
  * file and line, which is the point: an edge the manifest can't literally
  * pin must force a human to look, not vanish.
  */
-function discoverRelativeModules(filePath: string): string[] {
-  const src = fs.readFileSync(path.join(REPO_ROOT, filePath), 'utf8');
+function discoverRelativeModules(filePath: string, root: string = REPO_ROOT): string[] {
+  const src = fs.readFileSync(path.join(root, filePath), 'utf8');
   const sourceFile = ts.createSourceFile(filePath, src, ts.ScriptTarget.Latest, /* setParentNodes */ true);
   const fileDir = path.posix.dirname(filePath);
   const modules = new Set<string>();
 
-  function resolveModule(specifierText: string): string | undefined {
+  function resolveModule(specifierText: string, node: ts.Node): string | undefined {
     if (!specifierText.startsWith('.')) return undefined; // package import — no repo-relative edge
-    const joined = path.posix.normalize(path.posix.join(fileDir, specifierText)).replace(/\.js$/, '.ts');
-    if (fs.existsSync(path.join(REPO_ROOT, joined))) return joined;
-    const indexed = `${joined.replace(/\.ts$/, '')}/index.ts`;
-    if (fs.existsSync(path.join(REPO_ROOT, indexed))) return indexed;
-    return undefined;
+    for (const candidate of relativeResolutionCandidates(fileDir, specifierText)) {
+      if (fs.existsSync(path.join(root, candidate))) return candidate;
+    }
+    failClosed(sourceFile, filePath, 'unresolvable relative import', node, specifierText);
   }
 
   function visit(node: ts.Node): void {
     if (ts.isImportDeclaration(node)) {
       const specifierText = literalSpecifierText(node.moduleSpecifier);
       if (specifierText !== null) {
-        const resolved = resolveModule(specifierText);
+        const resolved = resolveModule(specifierText, node);
         if (resolved) modules.add(resolved);
       }
       // A static import's specifier is grammatically always a literal — no
@@ -313,17 +371,19 @@ function discoverRelativeModules(filePath: string): string[] {
     } else if (ts.isExportDeclaration(node) && node.moduleSpecifier) {
       const specifierText = literalSpecifierText(node.moduleSpecifier);
       if (specifierText !== null) {
-        const resolved = resolveModule(specifierText);
+        const resolved = resolveModule(specifierText, node);
         if (resolved) modules.add(resolved);
       }
     } else if (ts.isCallExpression(node) && node.expression.kind === ts.SyntaxKind.ImportKeyword) {
       const arg = node.arguments[0];
       const specifierText = arg ? literalSpecifierText(arg) : null;
       if (specifierText === null) failClosed(sourceFile, filePath, 'computed dynamic import', node);
-      const resolved = resolveModule(specifierText);
+      const resolved = resolveModule(specifierText, node);
       if (resolved) modules.add(resolved);
-      // An unresolvable-but-LITERAL specifier (a package import()) is fine —
-      // package imports aren't part of this repo-relative manifest at all.
+      // An unresolvable-but-LITERAL specifier that's a PACKAGE import (not
+      // relative) is fine — resolveModule returns undefined for it without
+      // failing closed, since package imports aren't part of this
+      // repo-relative manifest at all.
     } else if (ts.isCallExpression(node) && ts.isIdentifier(node.expression) && node.expression.text === 'require') {
       failClosed(sourceFile, filePath, 'unexpected require() call', node);
     }
@@ -436,6 +496,53 @@ describe('collectModuleBindings — backtick dynamic import specifiers', () => {
     fs.writeFileSync(path.join(dir, 'mailbox/index.ts'), 'export function getAgentMailbox() {}\n');
 
     expect(collectModuleBindings('entry.ts', 'mailbox/index.ts', dir)).toEqual(['dynamic']);
+  });
+});
+
+describe('discoverRelativeModules — NodeNext extension mapping and fail-closed resolution', () => {
+  // Codex on df6cf622: resolveModule only ever tried `.js` -> `.ts`, so a
+  // relative specifier ending `.mjs`/`.cjs` — or any other unresolvable
+  // relative specifier — silently resolved to nothing and the edge vanished
+  // from the manifest with no trace. Exercised here against synthetic
+  // fixtures (discoverRelativeModules's new `root` parameter) rather than
+  // by editing a real pinned file directly: storage-manager.ts is ALSO
+  // really `import`-ed by this test file itself (for `sessionHasOpenWork`),
+  // so a genuinely unresolvable specifier added there crashes the whole
+  // suite's module load — a real, even louder failure, but one that never
+  // reaches this function's own code path to prove its exact message.
+
+  it('resolves a `.mjs` specifier to its `.mts` source', () => {
+    const dir = tmpDir('nodenext-mjs');
+    fs.writeFileSync(dir + '/entry.ts', "import { x } from './helper.mjs';\n");
+    fs.writeFileSync(dir + '/helper.mts', 'export const x = 1;\n');
+
+    expect(discoverRelativeModules('entry.ts', dir)).toEqual(['helper.mts']);
+  });
+
+  it('resolves a `.cjs` specifier to its `.cts` source', () => {
+    const dir = tmpDir('nodenext-cjs');
+    fs.writeFileSync(dir + '/entry.ts', "import { x } from './helper.cjs';\n");
+    fs.writeFileSync(dir + '/helper.cts', 'export const x = 1;\n');
+
+    expect(discoverRelativeModules('entry.ts', dir)).toEqual(['helper.cts']);
+  });
+
+  it('resolves an extensionless specifier to a directory `/index.ts`', () => {
+    const dir = tmpDir('nodenext-extensionless-index');
+    fs.writeFileSync(dir + '/entry.ts', "import { x } from './helper';\n");
+    fs.mkdirSync(dir + '/helper', { recursive: true });
+    fs.writeFileSync(dir + '/helper/index.ts', 'export const x = 1;\n');
+
+    expect(discoverRelativeModules('entry.ts', dir)).toEqual(['helper/index.ts']);
+  });
+
+  it('fails closed with an exact file:line and the offending specifier when a relative import cannot be resolved at all', () => {
+    const dir = tmpDir('nodenext-unresolvable');
+    fs.writeFileSync(dir + '/entry.ts', ["import fs from 'node:fs';", "import './nope.mjs';", ''].join('\n'));
+
+    expect(() => discoverRelativeModules('entry.ts', dir)).toThrow(
+      'unresolvable relative import in a manifest-pinned file: entry.ts:2 ./nope.mjs',
+    );
   });
 });
 
