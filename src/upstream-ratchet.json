@@ -178,7 +178,7 @@
 ".claude/skills/slack-a2a-rooms/src/channels/slack-a2a.test.ts":{"diff":235,"mode":"100644","sha256":null,"deleted":true},
 ".claude/skills/slack-a2a-rooms/src/channels/slack-a2a.ts":{"diff":135,"mode":"100644","sha256":null,"deleted":true},
 ".claude/skills/slack-agent-flow/REMOVE.md":{"diff":45,"mode":"100644","sha256":null,"deleted":true},
-".claude/skills/slack-agent-flow/SKILL.md":{"diff":515,"mode":"100644","sha256":"a3c54e02818baa7765e388edc1ee4982f33a68be5d397ce612689c61c7dad42d"},
+".claude/skills/slack-agent-flow/SKILL.md":{"diff":542,"mode":"100644","sha256":"fe579cfc692b94bdd587990307f3f9ecb2c03fb090a21151d744e371e4a4f105"},
 ".claude/skills/slack-agent-flow/apply-fixtures.json":{"diff":9,"mode":"100644","sha256":null,"deleted":true},
 ".claude/skills/slack-agent-flow/container/agent-runner/src/mcp-tools/create-agent-slack.instructions.md":{"diff":9,"mode":"100644","sha256":null,"deleted":true},
 ".claude/skills/slack-agent-flow/container/agent-runner/src/mcp-tools/rooms.instructions.md":{"diff":22,"mode":"100644","sha256":null,"deleted":true},

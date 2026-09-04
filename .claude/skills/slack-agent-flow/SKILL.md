@@ -108,16 +108,29 @@ WG=$(pnpm exec tsx scripts/q.ts data/v2.db \
 # one per new agent, before its first spawn
 pnpm exec tsx scripts/q.ts data/v2.db \
   "update agent_groups set workgroup_id='${WG}' where folder='<new folder>'"
+
+# confirm it landed — the update above reports nothing either way
+pnpm exec tsx scripts/q.ts data/v2.db \
+  "select folder, workgroup_id from agent_groups where workgroup_id='${WG}'"
 ```
 
-Check `WG` before running any update. A folder that matches no row makes the
-select print nothing and still exit 0, and `scripts/q.ts` opens the database
-without `PRAGMA foreign_keys`, so the update writes an empty `workgroup_id`
-over every new agent instead of being refused by the column's reference to
-`workgroups(id)`. Nothing surfaces until first spawn, where the reconciler
-tries to insert that empty id and `workgroups.id`'s `CHECK (id GLOB '[a-z]*')`
-rejects it. Every spawn then fails the same way, so the agents are unreachable
-rather than merely misfiled.
+Both checks matter, because `scripts/q.ts` reports nothing about a mutation —
+it calls `run()` and discards the row count, so a typo is silent on the way in
+and on the way out.
+
+A mistyped **source** folder makes the select print nothing and still exit 0,
+and the wrapper opens the database without `PRAGMA foreign_keys`, so the update
+writes an empty `workgroup_id` instead of being refused by the column's
+reference to `workgroups(id)`. That surfaces only at first spawn, where the
+reconciler inserts the empty id and `workgroups.id`'s
+`CHECK (id GLOB '[a-z]*' AND id NOT LIKE 'ag-%')` rejects it. Every spawn then
+fails identically, so the agents are unreachable rather than misfiled.
+
+A mistyped **target** folder is quieter still: the update matches zero rows and
+says so nowhere. That agent keeps a NULL column, its first spawn falls back to
+its own folder name, and it comes up healthy in a workgroup of one — which is
+the exact failure this step exists to prevent, usually noticed a day later. The
+select back is what catches it: the team should be listed, one row per agent.
 
 An agent that has already spawned is sitting in its own workgroup of one, and
 rehoming it is a data migration rather than a column edit. Its memory canon is
@@ -129,17 +142,31 @@ re-points that symlink at the shared canon and leaves the old directory behind:
 target as already correct, and it never merges the two trees. The agent comes
 back healthy with none of what it wrote.
 
-Migrate the canon first, then set the column:
+No tool moves a canon between workgroups. `scripts/migrate-workgroup-memory.ts`
+consolidates the sources _inside_ one workgroup onto that workgroup's own
+canon: `inventory --workgroup <id>` collects the canon plus the group-local
+trees of the members already assigned to `<id>`, so pointing it at either side
+of this move leaves the other side untouched. Merging the two canons is a
+manual step, done with the host down so nothing writes underneath it.
 
 ```bash
-pnpm exec tsx scripts/migrate-workgroup-memory.ts inventory \
-  --workgroup <its own folder> --report /tmp/wg-memory.json
-pnpm exec tsx scripts/migrate-workgroup-memory.ts apply --report /tmp/wg-memory.json
+# 1. stop the service — a live host can respawn a container mid-copy
+#    (the unit name comes from the install slug; see setup/lib/install-slug.sh)
+systemctl --user stop "$(. setup/lib/install-slug.sh; systemd_unit)" \
+  || sudo systemctl stop "$(. setup/lib/install-slug.sh; systemd_unit)"
+#    macOS: launchctl bootout "gui/$(id -u)/$(. setup/lib/install-slug.sh; launchd_label)"
+
+# 2. look at both trees, then merge the old one into the destination by hand
+ls -R data/workgroups/<its own folder>/memory
+ls -R data/workgroups/${WG}/memory
+
+# 3. set the column, then start the service again
 ```
 
-Read the inventory before applying it, and keep the report: `rollback --report`
-reverses the apply. Restart the group once the column is set
-(`ncl groups restart --id <group id>`) so the next spawn mounts the shared
+Review the two trees before copying anything: they are plain Markdown, both
+sides may hold a file of the same name, and a blind `cp -r` silently picks a
+winner. Merge conflicting files by editing them, not by overwriting. Once the
+column is set and the host is back up, the group's next spawn mounts the shared
 canon.
 
 ### 3. Install one Slack app per agent
