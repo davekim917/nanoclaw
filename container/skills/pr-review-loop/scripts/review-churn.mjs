@@ -167,8 +167,22 @@ const NODE_BUILTINS = new Set([
   'zlib',
 ]);
 
-function seamCandidate(spec) {
+/**
+ * `relative` says the import was written as a path (`./x.js`) and has already
+ * been resolved to one, so it is in-repo and always eligible. Everything else
+ * is a package specifier, where two rules apply:
+ *
+ *   - a leading underscore means a Node internal (`_http_agent`,
+ *     `_stream_readable`, `_tls_wrap`), because npm forbids package names that
+ *     start with `_`. That is a rule rather than more names: enumerating the
+ *     `_http_*`, `_stream_*` and `_tls_*` families invites the next omission,
+ *     and every one of them would seam a class on something no diff can touch.
+ *   - the frozen core list covers the ordinary bare builtins.
+ */
+function seamCandidate(spec, relative) {
   if (SEAM_SPEC_DENY.test(spec)) return false;
+  if (relative) return true;
+  if (spec.startsWith('_')) return false;
   return !NODE_BUILTINS.has(spec);
 }
 
@@ -297,7 +311,7 @@ export function seamFor(files, findingText, ctx) {
     if (source == null) continue;
     for (const { spec, names } of importsOf(source)) {
       const resolved = resolveSpec(file, spec);
-      if (!seamCandidate(resolved)) continue;
+      if (!seamCandidate(resolved, spec.startsWith('.'))) continue;
       let entry = bySpec.get(resolved);
       if (!entry) {
         entry = { spec: resolved, relative: spec.startsWith('.'), files: new Set(), names: new Map() };

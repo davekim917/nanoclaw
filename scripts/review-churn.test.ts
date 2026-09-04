@@ -192,6 +192,24 @@ describe('review-churn classifier', () => {
     expect(churning[0].primitives).toContain('writeSessionMessage');
   });
 
+  it("never seams a class on Node's underscore-prefixed internals", () => {
+    // `_http_agent` and friends are bare-loadable on both runtimes. npm forbids
+    // package names starting with `_`, so a bare `_`-specifier is always a core
+    // internal — a rule, rather than an enumeration of the `_http_*`,
+    // `_stream_*` and `_tls_*` families that invites the next omission.
+    const churning = classify(fixture('internal-builtin-seam')).classes.filter((c) => c.rounds >= 3);
+    expect(churning).toHaveLength(1);
+    expect(churning[0].seam).toBeNull();
+  });
+
+  it('still seams on an in-repo module whose name starts with an underscore', () => {
+    // The rule is about package specifiers, not about the character: a relative
+    // import resolves to a path in this repo, which a diff can touch.
+    const churning = classify(fixture('underscore-module-seam')).classes.filter((c) => c.rounds >= 3);
+    expect(churning[0].seam).toBe('src/_shared.ts');
+    expect(churning[0].primitives).toContain('writeThing');
+  });
+
   it('keeps a real dependency seam-eligible, builtins around it notwithstanding', () => {
     // `undici` is a direct dependency of this repo AND a name bun reports as a
     // builtin. Its sites here also share `fs` and `node:test`, so the two
@@ -209,7 +227,13 @@ describe('review-churn classifier', () => {
     // payload two verdicts — a class seamed on `undici` refused a push on the
     // host and passed in a container.
     const bun = bunBinary();
-    for (const name of ['undici-seam', 'builtin-seam', 'builtin-with-real-seam']) {
+    for (const name of [
+      'undici-seam',
+      'builtin-seam',
+      'builtin-with-real-seam',
+      'internal-builtin-seam',
+      'underscore-module-seam',
+    ]) {
       const payload = fixture(name);
       const underNode = spawn(['classify', '--json'], payload);
       const underBun = spawnSync(bun, [SCRIPT, 'classify', '--json'], {
@@ -330,6 +354,13 @@ describe('review-churn gate', () => {
     expect(falling.status).toBe(0);
     expect(falling.decision.status).toBe('pass');
     expect(falling.decision.flagged).toHaveLength(0);
+  });
+
+  it('does not gate a class whose only shared import is a Node internal', () => {
+    const { status, decision } = gate(fixture('internal-builtin-seam'));
+    expect(status).toBe(0);
+    expect(decision.status).toBe('pass');
+    expect(decision.report.classes[0].rounds).toBe(3);
   });
 
   it('does not gate a class whose only shared import is a builtin', () => {

@@ -1,0 +1,43 @@
+{
+  "_comment": "The other side of the underscore rule: a repository file may legitimately be named with a leading underscore. Written as a relative import it resolves to an in-repo path, so it stays seam-eligible \u2014 the rule is about package specifiers, not about the character.",
+  "findings": [
+    {
+      "threadId": "UN1",
+      "commentId": 600,
+      "reviewId": "PRR_UN0",
+      "createdAt": "2026-09-01T01:00:00Z",
+      "path": "src/one.ts",
+      "line": 10,
+      "isResolved": false,
+      "isOutdated": false,
+      "body": "**<sub><sub>![P1 Badge](https://img.shields.io/badge/P1-orange?style=flat)</sub></sub>  Revalidate the state after the await**\n\nThe state is read before the await and `writeThing` runs after it, so a concurrent close wins the race and nothing revalidates it in between."
+    },
+    {
+      "threadId": "UN2",
+      "commentId": 601,
+      "reviewId": "PRR_UN1",
+      "createdAt": "2026-09-01T02:00:00Z",
+      "path": "src/two.ts",
+      "line": 20,
+      "isResolved": false,
+      "isOutdated": false,
+      "body": "**<sub><sub>![P1 Badge](https://img.shields.io/badge/P1-orange?style=flat)</sub></sub>  Revalidate the state after the await**\n\nThe state is read before the await and `writeThing` runs after it, so a concurrent close wins the race and nothing revalidates it in between."
+    },
+    {
+      "threadId": "UN3",
+      "commentId": 602,
+      "reviewId": "PRR_UN2",
+      "createdAt": "2026-09-01T03:00:00Z",
+      "path": "src/three.ts",
+      "line": 30,
+      "isResolved": false,
+      "isOutdated": false,
+      "body": "**<sub><sub>![P1 Badge](https://img.shields.io/badge/P1-orange?style=flat)</sub></sub>  Revalidate the state after the await**\n\nThe state is read before the await and `writeThing` runs after it, so a concurrent close wins the race and nothing revalidates it in between."
+    }
+  ],
+  "sources": {
+    "src/one.ts": "import { writeThing } from './_shared.js';\n",
+    "src/two.ts": "import { writeThing } from './_shared.js';\n",
+    "src/three.ts": "import { writeThing } from './_shared.js';\n"
+  }
+}
