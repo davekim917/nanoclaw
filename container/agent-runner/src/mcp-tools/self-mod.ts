@@ -127,9 +127,11 @@ const MCP_SERVER_NAME_RE = /^[A-Za-z0-9_-]{1,64}$/;
 /**
  * Mirrors the host's RESERVED_MCP_SERVER_NAMES (src/container-config.ts): a
  * plain-object `mcpServers[name] = config` assignment hits an inherited
- * Object.prototype setter/property for these, dropping the server silently.
+ * Object.prototype setter/property for the first three, dropping the server
+ * silently; `nanoclaw` would instead silently replace the built-in nanoclaw
+ * MCP server that src/index.ts seeds before layering container.json on top.
  */
-const RESERVED_MCP_SERVER_NAMES = new Set(['__proto__', 'constructor', 'prototype']);
+const RESERVED_MCP_SERVER_NAMES = new Set(['__proto__', 'constructor', 'prototype', 'nanoclaw']);
 const ENV_KEY_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
 /** RFC 7230 token charset — what a header field-name may contain. */
 const HEADER_NAME_RE = /^[A-Za-z0-9!#$%&'*+.^_`|~-]{1,64}$/;

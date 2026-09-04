@@ -108,12 +108,17 @@ export function isCredentialQueryKey(key: string): boolean {
 const MCP_SERVER_NAME_RE = /^[A-Za-z0-9_-]{1,64}$/;
 /**
  * `mcpServers[name] = config` at every write site (CLI, `applyAddMcpServer`,
- * `parseTemplateMcpServers`) is a plain-object assignment. These three names
- * all pass MCP_SERVER_NAME_RE's charset but hit an inherited Object.prototype
- * setter/property instead of creating an own enumerable entry — the server
- * silently vanishes from JSON.stringify while every caller reports success.
+ * `parseTemplateMcpServers`) is a plain-object assignment. `__proto__`,
+ * `constructor`, and `prototype` all pass MCP_SERVER_NAME_RE's charset but
+ * hit an inherited Object.prototype setter/property instead of creating an
+ * own enumerable entry — the server silently vanishes from JSON.stringify
+ * while every caller reports success. `nanoclaw` is reserved for a different
+ * reason: `container/agent-runner/src/index.ts` seeds a built-in `nanoclaw`
+ * MCP server, then layers every `container.json` mcpServers entry on top
+ * with the same plain assignment — a static entry named `nanoclaw` would
+ * silently replace the built-in and the agent loses its core tools.
  */
-const RESERVED_MCP_SERVER_NAMES = new Set(['__proto__', 'constructor', 'prototype']);
+const RESERVED_MCP_SERVER_NAMES = new Set(['__proto__', 'constructor', 'prototype', 'nanoclaw']);
 const ENV_KEY_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
 /** RFC 7230 token charset — what a header field-name may contain. */
 const HEADER_NAME_RE = /^[A-Za-z0-9!#$%&'*+.^_`|~-]{1,64}$/;

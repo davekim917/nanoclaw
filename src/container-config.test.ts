@@ -492,6 +492,14 @@ describe('parseMcpServerConfig', () => {
       expect(() => validateMcpServerName(reserved)).toThrow(/reserved/);
     }
   });
+
+  it('validateMcpServerName rejects "nanoclaw" — the built-in server the runner seeds', () => {
+    // container/agent-runner/src/index.ts seeds mcpServers.nanoclaw, then
+    // layers every container.json entry on top with the same plain
+    // assignment. A static entry named "nanoclaw" would silently replace
+    // the built-in.
+    expect(() => validateMcpServerName('nanoclaw')).toThrow(/reserved/);
+  });
 });
 
 describe('opaqueUrlParts', () => {

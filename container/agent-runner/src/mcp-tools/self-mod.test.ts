@@ -205,6 +205,10 @@ describe('add_mcp_server remote Streamable HTTP', () => {
     }
   });
 
+  it('rejects "nanoclaw" — the built-in server src/index.ts seeds', async () => {
+    expect((await submit({ name: 'nanoclaw', url: 'https://example.com/mcp' })).error).toContain('reserved');
+  });
+
   it('rejects control characters in a header value, allowlisted or not', async () => {
     expect(
       (
