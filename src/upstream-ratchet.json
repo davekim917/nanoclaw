@@ -896,7 +896,7 @@
 "src/modules/self-mod/index.ts":{"diff":10,"mode":"100644","sha256":"09c17c0eaadf11918be2eab7196cf4d85ac948240e696a0ee53483a2a95b3555"},
 "src/modules/self-mod/project.md":{"diff":0,"mode":"100644","sha256":"d01c3d65d8aec6f1907d63fb6415926c787ce75853702ecf25c14235a62ac9fa"},
 "src/modules/self-mod/request.test.ts":{"diff":334,"mode":"100644","sha256":"0f84161d0eb166db8859a25f321b57f0119d45a2031a8f8ab92b1d9878613ae8"},
-"src/modules/self-mod/request.ts":{"diff":154,"mode":"100644","sha256":"f02260d1d2009d1f118dfed5e93580636f406d7e93ef07ca1ec0ac08002c1924"},
+"src/modules/self-mod/request.ts":{"diff":161,"mode":"100644","sha256":"80a4ec39370d3f9de4b830d6baa8179c54c230d6e61d295d2bb76399f6744861"},
 "src/modules/typing/index.test.ts":{"diff":2,"mode":"100644","sha256":"aa1b25afe1cb4df5459217ada44a60402c7e554d8e919cdd1eb76f3f67bfe44b"},
 "src/modules/typing/index.ts":{"diff":0,"mode":"100644","sha256":"cf9d791e034dd160d7ed6629da265cec95b8d615a4ce839179a38aac7d70885e"},
 "src/mount-composition.test.ts":{"diff":215,"mode":"100644","sha256":null,"deleted":true},

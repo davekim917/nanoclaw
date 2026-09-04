@@ -11,6 +11,13 @@
  * Host-side sanitization for install_packages is defense-in-depth — the MCP
  * tool validates first. Both layers matter: the DB row carries the payload
  * verbatim through to shell exec on apply.
+ *
+ * `parseMcpServerConfig` below is where a bad remote-MCP config fails
+ * closed: it calls `isKnownRawSecret` (../../container-config.js) on every
+ * header value, URL query value, and URL path segment, so a credential
+ * never reaches the DB row this validator builds — durability of that
+ * rejection lives entirely in that one function, not in this file's own
+ * DB/hold-request plumbing.
  */
 import { createHash } from 'node:crypto';
 
