@@ -24,7 +24,13 @@ import { markProviderUnavailable } from '../../db/provider-health.js';
 import { resolveSpawnProvider } from '../../provider-fallback.js';
 import { OomKillObserver } from '../../resource-oom-observer.js';
 import { heartbeatPath } from '../../session-manager.js';
-import { getContainerSpawnedAt, killContainer, sessionStillActive, wakeContainer } from '../../container-runner.js';
+import {
+  getContainerSpawnedAt,
+  isContainerRunning,
+  killContainer,
+  sessionStillActive,
+  wakeContainer,
+} from '../../container-runner.js';
 import { log } from '../../log.js';
 import type { Session } from '../../types.js';
 import { type ForkContainerStateRow as ContainerState, type NanoclawMailboxSession } from '../mailbox/index.js';
@@ -240,6 +246,36 @@ export function notifyProviderHealParked(
 }
 
 /**
+ * Why this session must not be healed right now, or `null` when it may be
+ * (fork issue #343).
+ *
+ * Every input to the decision above is stale by the time it is acted on.
+ * `containerState` comes from the driver's observe read (W3), the `alive`
+ * verdict that admitted this session to the health phase was taken before
+ * that, and this function then awaits a mailbox open of its own for the
+ * attempt budget. A container that self-exits anywhere in that window is
+ * already gone by the kill: `killContainer` is a harmless no-op, but the
+ * accountability wake row the heal branch writes FIRST is counted forever by
+ * `countProviderHealAttemptsSinceRealInbound`, so the next genuine failure
+ * starts one attempt down and parks a heal early. The park branch's kill rests
+ * on the same stale read.
+ *
+ * Checked here, ahead of both branches, rather than immediately around
+ * `killContainer`: the attempt is what must not be spent, and the attempt is
+ * written before the kill.
+ *
+ * Synchronous and cheap — one central-DB row and the container-state lookup
+ * the host already keeps in memory — so it adds no suspension point of its own
+ * to widen the window it closes.
+ */
+function providerHealTargetUnavailableReason(sessionId: string): string | null {
+  const liveness = sessionStillActive(sessionId)();
+  if (liveness !== true) return typeof liveness === 'object' ? liveness.reason : 'session is not wakeable';
+  if (!isContainerRunning(sessionId)) return 'container already exited';
+  return null;
+}
+
+/**
  * Detection + action for one alive session. Always advances the debounce;
  * acts only when NANOCLAW_SELF_HEAL is armed. Returns true when the container
  * was killed, so the caller skips the reap/SLA checks for this tick.
@@ -285,6 +321,15 @@ async function sweepProviderHeal(
   };
   if (!SELF_HEAL_ENABLED) {
     log.info(`self-heal: would ${decision} failed provider`, bounds);
+    return false;
+  }
+
+  // #343: nothing below may act on a target that is already gone. Skipping
+  // costs nothing — a container that exited on its own needs no kill, and the
+  // session keeps its full attempt budget for a failure that is still real.
+  const unavailable = providerHealTargetUnavailableReason(session.id);
+  if (unavailable) {
+    log.info(`self-heal: skipping ${decision} — target is gone`, { ...bounds, reason: unavailable });
     return false;
   }
 

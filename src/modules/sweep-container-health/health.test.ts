@@ -874,17 +874,33 @@ describe('sweepProviderHeal — bounds, actions, and accountability', () => {
     runMigrations(db);
     armSelfHeal(true);
     _resetProviderHealTicksForTesting();
-    mockKillContainer.mockReset();
     mockMarkProviderUnavailable.mockReset();
     mockReadContainerConfig.mockReset().mockReturnValue({ provider: 'codex' });
     mockGetSession.mockReset().mockReturnValue(fakeSession());
     mockWakeContainer.mockReset();
-    // The park path kills the container and only then writes its notice, so
-    // "no container owns outbound" is the production precondition for that
-    // write (mailbox seam PR 5b's `writeOutboundWhenStopped`). `killContainer`
-    // is mocked here, so state it explicitly rather than inheriting whatever
-    // an earlier describe left on this shared spy.
-    mockIsContainerRunning.mockReset().mockReturnValue(false);
+    // Both of this duty's container preconditions, stated rather than
+    // inherited from whatever an earlier describe left on these shared spies.
+    //
+    // A heal is only ever decided for a container the driver saw ALIVE (the
+    // whole session:health phase is gated on it), and #343's re-check reads
+    // that same fact back immediately before acting — so the default here is
+    // `true`. The park path then kills the container and only afterwards
+    // writes its notice, and "no container owns outbound" is the production
+    // precondition for that write (mailbox seam PR 5b's
+    // `writeOutboundWhenStopped`). `killContainer` is mocked, so nothing would
+    // flip the flag on its own: give the mock production's own side effect
+    // instead of hard-coding one end of the sequence and breaking the other.
+    mockIsContainerRunning.mockReset().mockReturnValue(true);
+    mockKillContainer.mockReset().mockImplementation((_sessionId: string, _reason: string, onExit?: () => void) => {
+      // Production's own side effect, in the order the duty depends on: the
+      // container is gone the moment the kill lands. A HEAL kill hands its
+      // respawn to `onExit`, so the container comes back and the next attempt
+      // in a budget-exhaustion loop still starts from a live one; a PARK kill
+      // passes no `onExit` and the container stays down, which is exactly the
+      // precondition the parked notice's `writeOutboundWhenStopped` guard
+      // checks a moment later.
+      mockIsContainerRunning.mockReturnValue(Boolean(onExit));
+    });
   });
   afterEach(() => {
     armSelfHeal(false);
@@ -986,6 +1002,36 @@ describe('sweepProviderHeal — bounds, actions, and accountability', () => {
     expect(
       outDb.prepare("SELECT COUNT(*) AS c FROM messages_out WHERE id LIKE 'provider-heal-parked-%'").get(),
     ).toEqual({ c: 1 });
+  });
+
+  /**
+   * #343 — the kill decision rests on reads two mailbox opens old.
+   *
+   * `containerState` is the driver's observe read and the `alive` verdict that
+   * admitted this session to the health phase is older still; the budget read
+   * inside the duty awaits between them. A container that self-exits in that
+   * window needs no kill, and the accountability wake row is what would cost
+   * it: written before the kill and counted forever afterwards, so the next
+   * genuine failure would start one attempt down and park early.
+   */
+  it('a container that has already exited consumes no heal attempt', async () => {
+    const { inDb, outDb, mailbox } = makeSessionDbs();
+    // Arm the debounce on a live container, exactly as the two-tick path does.
+    expect(await _sweepProviderHealForTesting(mailbox, fakeSession(), 'group-folder', FAILED, intoOutDb(outDb))).toBe(
+      false,
+    );
+    // …then the container goes away on its own, before the tick that would act.
+    mockIsContainerRunning.mockReturnValue(false);
+
+    expect(await _sweepProviderHealForTesting(mailbox, fakeSession(), 'group-folder', FAILED, intoOutDb(outDb))).toBe(
+      false,
+    );
+
+    expect(mockKillContainer).not.toHaveBeenCalled();
+    // The budget is untouched: no attempt row, so a later real failure still
+    // has both attempts.
+    expect(healRows(inDb)).toHaveLength(0);
+    expect(countProviderHealAttemptsSinceRealInbound(mailbox)).toBe(0);
   });
 
   it('resets the attempt budget after a real inbound message', async () => {
