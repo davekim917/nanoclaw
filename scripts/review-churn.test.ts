@@ -1115,11 +1115,23 @@ describe('skill wiring', () => {
     const helper = fs.readFileSync(path.resolve('container/skills/pr-review-loop/scripts/codex-review.sh'), 'utf8');
     // gate → push → record, in that order. Recording is a claim that a site
     // patch was pushed, so a refused push must not leave it in the PR body.
-    expect(helper).toMatch(
-      /push\)\n[\s\S]*?run_gate --committed-only\n\s+shift\n\s+git push "\$@"\n\s+if \[ -n "\$GATE_OVERRIDE_LINE" \]; then\n\s+record_site_patch_override/,
+    const push = helper.slice(helper.indexOf('  push)'));
+    const order = ['run_gate --committed-only', 'git push "$@"', 'record_site_patch_override'].map((m) =>
+      push.indexOf(m),
     );
+    expect(order.every((i) => i >= 0)).toBe(true);
+    expect(order).toEqual([...order].sort((a, b) => a - b));
     // A named BRANCH resolves the PR, never the mutable checkout.
-    expect(helper).toMatch(/BRANCH:-\}" \]; then\n\s+PR=\$\(gh pr list --repo "\$REPO" --head "\$BRANCH"/);
+    expect(helper).toMatch(/BRANCH:-\}" \]; then\n[\s\S]*?PR=\$\(gh pr list --repo "\$REPO" --head "\$BRANCH"/);
+    // `--head` filters by branch name only, so a fork PR with the same branch
+    // name is in the result set; the source repository is what separates them.
+    expect(helper).toContain('headRepositoryOwner.login ==');
+    expect(helper).toContain('headRepository.name ==');
+    // One verdict describes one destination, so the push shapes that send more
+    // than the judged ref are refused rather than gated on the wrong one.
+    for (const shape of ['--all', '--mirror', '--tags']) expect(push).toContain(shape);
+    expect(push).toContain('is not <sha>:refs/heads/<branch>');
+    expect(push).toMatch(/push_refspecs" -gt 1/);
     // Evaluating the gate writes nothing at all.
     const gateBranch = helper.slice(helper.indexOf('  gate)'), helper.indexOf('  push)'));
     expect(gateBranch).not.toContain('record_site_patch_override');

@@ -78,6 +78,10 @@ export interface ChurnGateOptions {
   branch: string;
   /** The commit being pushed. Its history is the lift evidence. */
   head: string;
+  /** Whether this push was requested as a force. Shapes the override command. */
+  force?: boolean;
+  /** The lease captured with the identity, carried into the override command. */
+  lease?: string;
   /** Override for tests; defaults to CHURN_GATE_SCRIPT_PATHS. */
   scriptPaths?: string[];
   /** Override for tests; defaults to spawning bash. */
@@ -123,7 +127,21 @@ function shellQuote(value: string): string {
   return `'${value.replace(/'/g, `'\\''`)}'`;
 }
 
-export function refusalMessage(gateText: string, script: string, identity: { branch: string; head: string }): string {
+export function refusalMessage(
+  gateText: string,
+  script: string,
+  identity: { branch: string; head: string; force?: boolean; lease?: string },
+): string {
+  // A refused force push is usually a rewrite, so an override that pushes
+  // fast-forward-only is rejected by the remote and the documented escape
+  // hatch does not exist. The original request's force is carried through with
+  // the lease captured alongside the identity — not a bare `--force`, which
+  // would drop the very protection the captured lease provides, and not a bare
+  // `--force-with-lease`, which re-reads the tracking ref at override time.
+  const forceFlag =
+    identity.force === true
+      ? [`        ${shellQuote(`--force-with-lease=refs/heads/${identity.branch}:${identity.lease ?? ''}`)} \\`]
+      : [];
   return [
     gateText.trim(),
     '',
@@ -142,8 +160,13 @@ export function refusalMessage(gateText: string, script: string, identity: { bra
     // The path is the one actually selected — the Claude mount, the /app
     // fallback, or an override — since printing a path the agent cannot run
     // turns the documented, PR-recorded override into a command that fails.
+    // `origin` is spelled out for the same reason: `git push <refspec>` with
+    // no repository reads the refspec AS the repository name and dies trying
+    // to resolve it as a host, and `origin` is the remote this primitive
+    // pushes to.
     `    REVIEW_LOOP_ALLOW_SITE_PATCH=1 BRANCH=${shellQuote(identity.branch)} ${shellQuote(script)} push \\`,
-    `        ${shellQuote(`${identity.head}:refs/heads/${identity.branch}`)}`,
+    ...forceFlag,
+    `        origin ${shellQuote(`${identity.head}:refs/heads/${identity.branch}`)}`,
   ].join('\n');
 }
 
@@ -188,7 +211,12 @@ export function evaluateReviewChurnGate(options: ChurnGateOptions): ChurnGateRes
     // stdout; only `gate` (no --json) is run here, so stderr is the decision.
     return {
       status: 'refused',
-      message: refusalMessage(result.stderr || result.stdout, script, { branch: options.branch, head: options.head }),
+      message: refusalMessage(result.stderr || result.stdout, script, {
+        branch: options.branch,
+        head: options.head,
+        force: options.force,
+        lease: options.lease,
+      }),
     };
   }
   if (result.status === 0) return { status: 'pass' };

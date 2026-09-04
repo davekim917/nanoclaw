@@ -311,10 +311,30 @@ describe('topic-linked worktree topology', () => {
     // existed, which the gate would then judge and the refspec would push.
     const source = readFileSync(fileURLToPath(new URL('./git-worktrees.ts', import.meta.url)), 'utf8');
     const handler = source.slice(source.indexOf("name: 'git_push'"), source.indexOf("name: 'open_pr'"));
-    expect(handler).toContain('capturedIdentity(worktree)');
+    expect(handler).toContain('capturedIdentity(resolved.context)');
     expect(handler).not.toContain("'branch', '--show-current'");
     expect(handler).not.toContain("'rev-parse', 'HEAD'");
     expect(source).toContain("['status', '--porcelain=v2', '--branch', '--untracked-files=no']");
+  });
+
+  test('captures the whole identity inside the repository lock', async () => {
+    // The status read and the remote read describe one instant or they describe
+    // nothing: a sibling's create_worktree runs its `fetch --prune` under this
+    // same lock, so a capture straddling it would pair this checkout's commit
+    // with a tracking ref the fetch had just advanced, and the lease would name
+    // a commit this caller never integrated. The lock is taken by the capture
+    // itself rather than by its callers, so there is no way to spell an
+    // unlocked identity read.
+    const source = readFileSync(fileURLToPath(new URL('./git-worktrees.ts', import.meta.url)), 'utf8');
+    const captured = source.slice(
+      source.indexOf('async function capturedIdentity('),
+      source.indexOf('export const createWorktreeTool'),
+    );
+    expect(captured).toContain('withRepositoryLock(context, () => {');
+    // Both reads, inside the closure the lock wraps.
+    const locked = captured.slice(captured.indexOf('withRepositoryLock'));
+    expect(locked).toContain("'status', '--porcelain=v2'");
+    expect(locked).toContain('refs/remotes/origin/${head}');
   });
 
   test('a force push carries the lease it captured, not one inferred at push time', async () => {
@@ -345,7 +365,7 @@ describe('topic-linked worktree topology', () => {
     // switching branches mid-call would open the PR for their branch.
     const source = readFileSync(fileURLToPath(new URL('./git-worktrees.ts', import.meta.url)), 'utf8');
     const openPr = source.slice(source.indexOf("name: 'open_pr'"));
-    expect(openPr).toContain('capturedIdentity(resolved.context.worktree)');
+    expect(openPr).toContain('capturedIdentity(resolved.context)');
     expect(openPr).toContain("'--head', identity.branch");
   });
 

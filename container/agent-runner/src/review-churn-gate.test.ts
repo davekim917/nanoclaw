@@ -91,6 +91,40 @@ describe('review churn gate at git_push', () => {
     expect(result.message).toContain("'abc1234def:refs/heads/topic/thing'");
   });
 
+  test('names the remote, so git does not read the refspec as one', () => {
+    // `git push <sha>:refs/heads/<branch>` with no repository takes the whole
+    // refspec as the repository name and dies resolving it as a hostname, so
+    // an override command without `origin` is not an escape hatch at all.
+    const result = evaluateReviewChurnGate({ ...present, run: stub({ status: 3, stderr: REFRAME_TEXT }) });
+    expect(result.status).toBe('refused');
+    if (result.status !== 'refused') return;
+    expect(result.message).toContain("origin 'abc1234def:refs/heads/topic/thing'");
+  });
+
+  test('carries the original force and its captured lease into the override', () => {
+    // A refused force push is a rewrite; an override that pushes
+    // fast-forward-only is rejected by the remote, which leaves the documented
+    // escape hatch unusable. The lease is the captured one, not a re-read: a
+    // bare `--force-with-lease` would adopt whatever the tracking ref says when
+    // the override runs, which is the race the capture exists to close.
+    const result = evaluateReviewChurnGate({
+      ...present,
+      force: true,
+      lease: 'fee1dead',
+      run: stub({ status: 3, stderr: REFRAME_TEXT }),
+    });
+    expect(result.status).toBe('refused');
+    if (result.status !== 'refused') return;
+    expect(result.message).toContain("'--force-with-lease=refs/heads/topic/thing:fee1dead'");
+  });
+
+  test('adds no force flag to the override for a push that was not a force', () => {
+    const result = evaluateReviewChurnGate({ ...present, run: stub({ status: 3, stderr: REFRAME_TEXT }) });
+    expect(result.status).toBe('refused');
+    if (result.status !== 'refused') return;
+    expect(result.message).not.toContain('--force-with-lease');
+  });
+
   test('shell-quotes what it puts in a command an agent will run', () => {
     // Git accepts `&` and backticks in a branch name; unquoted, one splits the
     // assignment and the other substitutes a command.

@@ -36,7 +36,14 @@ REPO="${REPO:-$(gh repo view --json nameWithOwner -q .nameWithOwner)}"
 # which a sibling sharing the worktree can change underneath it. No open PR for
 # the branch exits non-zero, which callers read as "no verdict", never as pass.
 if [ -z "${PR:-}" ] && [ -n "${BRANCH:-}" ]; then
-  PR=$(gh pr list --repo "$REPO" --head "$BRANCH" --state open --json number -q '.[0].number')
+  # `--head` filters by branch NAME only ("<owner>:<branch>" syntax is not
+  # supported, per `gh pr list --help`), so a fork PR whose branch happens to
+  # share this name is returned alongside the first-party one and `.[0]` can
+  # pick it — the gate would then judge someone else's findings. The source
+  # repository is what disambiguates, so it is matched explicitly.
+  PR=$(gh pr list --repo "$REPO" --head "$BRANCH" --state open \
+    --json number,headRepositoryOwner,headRepository \
+    -q "[.[] | select(.headRepositoryOwner.login == \"${REPO%%/*}\" and .headRepository.name == \"${REPO##*/}\")][0].number")
   [ -n "$PR" ] || { echo "no open PR for branch $BRANCH" >&2; exit 1; }
 fi
 PR="${PR:-$(gh pr view --json number -q .number)}"
@@ -229,13 +236,41 @@ case "${1:?usage: open|churn|classes|gate|push|body|reply|resolve|status}" in
     # well, so the verdict and the audit line describe what is being pushed
     # rather than whatever the checkout holds when this runs. Callers that pass
     # no refspec are pushing the checkout, and the gate reads it.
+    #
+    # Only those two shapes are accepted. `git push -h` permits
+    # `[<repository> [<refspec>...]]` and exposes `--all`/`--mirror`/`--tags`,
+    # and one verdict cannot describe many destinations: a second refspec would
+    # ride to the remote unjudged, under a pass earned by the first. So the
+    # many-ref forms are refused here rather than gated on the wrong ref.
     shift
     PUSH_HEAD=""
+    push_refspecs=0
+    push_positional=0
     for arg in "$@"; do
       case "$arg" in
+        --all|--mirror|--tags)
+          echo "push $arg sends refs the churn gate cannot name; push <sha>:refs/heads/<branch> instead" >&2
+          exit 2
+          ;;
+        -*) continue ;;
+      esac
+      push_positional=$((push_positional + 1))
+      # `git push [<repository> [<refspec>...]]` — the first bare word is the
+      # remote, never a ref.
+      if [ "$push_positional" -eq 1 ]; then continue; fi
+      push_refspecs=$((push_refspecs + 1))
+      case "$arg" in
         *:refs/heads/*) PUSH_HEAD="${arg%%:*}" ;;
+        *)
+          echo "push refspec '$arg' is not <sha>:refs/heads/<branch>; the churn gate cannot pin a verdict to it" >&2
+          exit 2
+          ;;
       esac
     done
+    if [ "$push_refspecs" -gt 1 ]; then
+      echo "push sends $push_refspecs refspecs; the churn gate judges one branch at one commit" >&2
+      exit 2
+    fi
     if [ -n "$PUSH_HEAD" ]; then
       run_gate --committed-only --head "$PUSH_HEAD"
     else

@@ -214,6 +214,13 @@ which skips the gate, and a site patch that reaches the remote has already
 generated the next round. An exit of 3 is the gate refusing: read it, and make
 the next commit the reframe it names.
 
+One verdict describes one destination, so `push` accepts only the shapes it
+can name: no refspec, which gates the checkout, or a single
+`<sha>:refs/heads/<branch>` after the remote, which pins both the verdict and
+the audit line to the commit being sent. `--all`, `--mirror`, `--tags` and
+multi-refspec pushes are refused with exit 2 rather than gated on one ref
+while the others ride along unjudged.
+
 The gate in front of a push judges **committed history only**
 (`--committed-only`): a push sends commits, so an edit to the primitive still
 sitting in your working tree is not a reframe the PR will see. A bare

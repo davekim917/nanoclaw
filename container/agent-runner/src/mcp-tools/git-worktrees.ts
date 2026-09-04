@@ -84,20 +84,33 @@ function runGitAt(cwd: string, args: string[], timeoutMs = 120_000): string {
  * branch's commit. `status --porcelain=v2 --branch` reports both from a single
  * snapshot, so there is no window to lose rather than a smaller one.
  */
-function capturedIdentity(worktree: string): { branch: string; head: string; lease: string } | null {
-  const out = runGitAt(worktree, ['status', '--porcelain=v2', '--branch', '--untracked-files=no']);
-  const oid = /^# branch\.oid (\S+)$/m.exec(out)?.[1];
-  const head = /^# branch\.head (.+)$/m.exec(out)?.[1];
-  if (!oid || !head || head === '(detached)' || oid === '(initial)') return null;
-  // The remote value this caller actually integrated, read now rather than left
-  // to `--force-with-lease` to infer at push time. A bare lease expects
-  // whatever `refs/remotes/origin/<branch>` says when the push runs, and any
-  // sibling topic's `create_worktree` refreshes that ref with a shared
-  // `fetch --prune` — so a commit that landed while the gate was on the network
-  // would be adopted as the expectation and then overwritten. An empty lease
-  // means the branch must not exist on the remote yet.
-  const lease = tryGitAt(worktree, ['rev-parse', `refs/remotes/origin/${head}`]) ?? '';
-  return { branch: head, head: oid, lease };
+async function capturedIdentity(
+  context: RepositoryContext,
+): Promise<{ branch: string; head: string; lease: string } | null> {
+  // The whole capture is one critical section, and the lock is taken HERE
+  // rather than by each caller: an identity read outside it is the defect, so
+  // the primitive that produces identities is the place it cannot happen. The
+  // branch, the commit and the remote value are three reads of shared state
+  // that must describe one instant — a sibling topic's `create_worktree` runs
+  // its `fetch --prune` under this same lock, so a capture that straddled it
+  // would pair this checkout's commit with a remote value the fetch had just
+  // advanced, and the lease below would then name a commit this caller never
+  // integrated.
+  return await withRepositoryLock(context, () => {
+    const worktree = context.worktree;
+    const out = runGitAt(worktree, ['status', '--porcelain=v2', '--branch', '--untracked-files=no']);
+    const oid = /^# branch\.oid (\S+)$/m.exec(out)?.[1];
+    const head = /^# branch\.head (.+)$/m.exec(out)?.[1];
+    if (!oid || !head || head === '(detached)' || oid === '(initial)') return null;
+    // The remote value this caller actually integrated, read now rather than
+    // left to `--force-with-lease` to infer at push time: a bare lease expects
+    // whatever `refs/remotes/origin/<branch>` says when the push runs, so a
+    // commit that landed while the gate was on the network would be adopted as
+    // the expectation and then overwritten. An empty lease means the branch
+    // must not exist on the remote yet.
+    const lease = tryGitAt(worktree, ['rev-parse', `refs/remotes/origin/${head}`]) ?? '';
+    return { branch: head, head: oid, lease };
+  });
 }
 
 function tryGitAt(cwd: string, args: string[], timeoutMs = 120_000): string | null {
@@ -616,9 +629,11 @@ export const gitPushTool: McpToolDefinition = {
       // exist for container review loops. It fails open — only an explicit
       // refusal stops the push.
       //
-      // The gate runs outside the repository lock deliberately: it makes its
-      // own `gh` calls, and holding the lock across them would stall every
-      // sibling topic on this repo. Same-topic siblings share this worktree,
+      // The identity is captured under the repository lock (see
+      // `capturedIdentity`); the gate then runs OUTSIDE it, deliberately,
+      // because it makes its own `gh` calls and holding the lock across them
+      // would stall every sibling topic on this repo. Same-topic siblings
+      // share this worktree,
       // so the checkout can change underneath the verdict — a commit, a
       // rewrite, a checkout of another branch at the same commit. Rather than
       // detect each of those, the branch and commit are captured once, up
@@ -628,11 +643,17 @@ export const gitPushTool: McpToolDefinition = {
       // the remote is what the gate looked at, or nothing. Work a sibling adds
       // in the window is simply not pushed here; it gets its own verdict on
       // its own push.
-      const identity = capturedIdentity(worktree);
+      const identity = await capturedIdentity(resolved.context);
       if (!identity) return err('Cannot push a detached HEAD; create or switch to a branch explicitly');
       const { branch, head } = identity;
 
-      const gate = evaluateReviewChurnGate({ worktree, branch, head });
+      const gate = evaluateReviewChurnGate({
+        worktree,
+        branch,
+        head,
+        force: args.force === true,
+        lease: identity.lease,
+      });
       if (gate.status === 'refused') return err(gate.message);
 
       return await withRepositoryLock(resolved.context, async () => {
@@ -686,7 +707,7 @@ export const openPrTool: McpToolDefinition = {
       // when `gh` runs: same-topic siblings share the worktree, and `gh pr
       // create` defaults `--head` to the current branch, so a switch mid-call
       // would open the PR for the sibling's branch — or push theirs to open it.
-      const identity = capturedIdentity(resolved.context.worktree);
+      const identity = await capturedIdentity(resolved.context);
       if (!identity) return err('Cannot open a PR from a detached HEAD; create or switch to a branch explicitly');
       const url = execFileSync('gh', ['pr', 'create', '--head', identity.branch, '--title', title, '--body', body], {
         cwd: resolved.context.worktree,
