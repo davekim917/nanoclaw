@@ -385,6 +385,33 @@ export function restoreTaskRow(db: Database.Database, snapshot: TaskRowSnapshot)
 }
 
 /**
+ * Cancel ONE task row, addressed by its exact row id.
+ *
+ * Upstream's `cancelTask` matches `id = ? OR series_id = ?`, so it cancels
+ * whichever row of the series happens to be live when it runs. That is the
+ * right verb for "cancel this series" and the wrong one for any caller acting
+ * on a row it read EARLIER: between the read and the write, the occurrence it
+ * approved can complete and recurrence can arm a successor, and the
+ * series-wide cancel then consumes the successor while reporting success.
+ *
+ * The board move is exactly that caller — it snapshots one occurrence, writes
+ * a durable move intent naming that row id, and cancels. Scoped to the id, a
+ * changed row means zero touched, which is the move's existing abort-and-409
+ * path rather than a silent swap.
+ *
+ * Same status filter and the same recurrence clear as `cancelTask`, so a row
+ * cancelled through either name is in the same state afterwards.
+ */
+export function cancelTaskRow(db: Database.Database, rowId: string): number {
+  return db
+    .prepare(
+      `UPDATE messages_in SET status = 'cancelled', recurrence = NULL
+        WHERE id = ? AND kind = 'task' AND status IN ('pending', 'paused')`,
+    )
+    .run(rowId).changes;
+}
+
+/**
  * Board-cancel a series AND make it non-resurrectable. `cancelTask` cancels
  * the live row(s) and clears their recurrence, but crash residue
  * (`recurrence.ts` insert-then-clear) or a swallowed-parse strand can leave a

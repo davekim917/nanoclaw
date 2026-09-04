@@ -12,6 +12,22 @@ vi.mock('../../config.js', async () => {
   };
 });
 
+// A hook that fires INSIDE each mailbox acquisition, numbered, so a test can
+// act in the window the async funnel opened between two passes over the same
+// session. Real implementation otherwise.
+const onMailboxAcquire = vi.hoisted(() => ({ run: null as ((call: number) => void) | null, calls: 0 }));
+vi.mock('../../session-manager.js', async (importOriginal) => {
+  const real = await importOriginal<typeof import('../../session-manager.js')>();
+  return {
+    ...real,
+    withExistingMailboxSession: async (agentGroupId: string, sessionId: string, action: never) => {
+      onMailboxAcquire.calls += 1;
+      onMailboxAcquire.run?.(onMailboxAcquire.calls);
+      return real.withExistingMailboxSession(agentGroupId, sessionId, action);
+    },
+  };
+});
+
 vi.mock('../../container-runner.js', () => ({
   wakeContainer: vi.fn().mockResolvedValue(undefined),
   isContainerRunning: vi.fn().mockReturnValue(false),
@@ -530,6 +546,52 @@ describe('tasks CLI resource', () => {
       agentCtx(),
     );
     expect(cleared.ok).toBe(false);
+  });
+
+  // The script exemption is decided from a row read in one mailbox pass and
+  // applied to a write in a LATER one. Opening a mailbox yields, so between
+  // the two another caller can clear the script that exempted the frequent
+  // cron — and the pre-seam code, which read and wrote in one synchronous
+  // run, had no such window. `tasks update` makes exactly two acquisitions:
+  // the match read, then the write. This clears the script in between.
+  it('a script cleared between the match read and the write re-arms the recurrence ceiling', async () => {
+    const scripted = await dispatch(
+      {
+        id: 'cr',
+        command: 'tasks-create',
+        args: { prompt: 'triage', name: 'racer', recurrence: '*/10 * * * *', script: 'echo hi' },
+      },
+      agentCtx(),
+    );
+    expect(scripted.ok).toBe(true);
+    if (!scripted.ok) return;
+    const seriesId = (scripted.data as { series_id: string }).series_id;
+
+    onMailboxAcquire.calls = 0;
+    onMailboxAcquire.run = (call) => {
+      if (call !== 2) return; // 1 is the match read; act just before the write
+      const sess = getSessionsByAgentGroup('ag-1').find((x) => x.thread_id === taskThreadId(seriesId));
+      const db = new Database(inboundDbPath('ag-1', sess!.id));
+      const row = db
+        .prepare("SELECT id, content FROM messages_in WHERE series_id = ? AND kind = 'task'")
+        .get(seriesId) as {
+        id: string;
+        content: string;
+      };
+      const content = JSON.parse(row.content) as Record<string, unknown>;
+      delete content.script;
+      db.prepare('UPDATE messages_in SET content = ? WHERE id = ?').run(JSON.stringify(content), row.id);
+      db.close();
+    };
+
+    const upd = await dispatch(
+      { id: 'ur', command: 'tasks-update', args: { id: seriesId, recurrence: '*/5 * * * *' } },
+      agentCtx(),
+    );
+    onMailboxAcquire.run = null;
+
+    expect(upd.ok).toBe(false);
+    if (!upd.ok) expect(upd.error.message).toMatch(/has not been scheduled/);
   });
 
   it('--script-host round-trips through create, update, and get', async () => {

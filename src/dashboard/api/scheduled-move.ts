@@ -523,7 +523,7 @@ export const moveExecuteHandler: AuthHandler = async (req, params, ctx) => {
     kind: snapshot.kind,
   };
 
-  // Step 3: cancel the source live row (→ completed, recurrence cleared).
+  // Step 3: cancel the source live row (→ cancelled, recurrence cleared).
   // Capture the touched count (E-2): the §2a guard already proved the source is
   // live, so a 0-touch cancel is unexpected — but if it happens, abort BEFORE
   // inserting the target so a no-op cancel can never leave a target-only series.
@@ -533,15 +533,28 @@ export const moveExecuteHandler: AuthHandler = async (req, params, ctx) => {
   // guard, which reads as 0 touched and takes the abort branch below rather
   // than inserting into the target — the same fail-safe direction the pre-seam
   // open's throw had.
+  //
+  // BY ROW ID, not by series. Everything above — the delta hash, the verdict,
+  // the move_intent body, `restoreSnapshot` — describes the single occurrence
+  // `snapshot.id`. The pre-seam code could cancel the SERIES here because the
+  // read and the cancel were one synchronous run with no yield between them,
+  // so the live row could not change identity. Acquiring the mailbox now
+  // yields, and in that window this occurrence can complete and recurrence can
+  // arm a successor. A series-wide cancel would consume that successor, report
+  // a nonzero touch, and then move the stale snapshot on top of it. Scoped to
+  // the id, a changed row is 0 touched and takes the abort below, which is what
+  // "the key went stale" already means here.
   const cancelTouched =
     (await withExistingMailboxSession(source.agentGroupId, source.sessionId, (mailbox) =>
-      mailbox.cancelTask(source.seriesId),
+      mailbox.cancelTaskRow(snapshot.id),
     )) ?? 0;
   if (cancelTouched === 0) {
-    // Nothing was cancelled (raced terminal/move between the guard and here) —
-    // leave the intent unresolved for the recovery sweep and do NOT insert.
+    // Nothing was cancelled (the approved occurrence stopped being live between
+    // the guard and here) — leave the intent unresolved for the recovery sweep
+    // and do NOT insert.
     log.warn('scheduled-move: cancel touched 0 rows — aborting before target insert', {
       seriesId: source.seriesId,
+      rowId: snapshot.id,
     });
     return json({ error: 'stale_key', reason: 'stale_key' }, 409);
   }

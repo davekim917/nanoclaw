@@ -615,6 +615,28 @@ async function updateTaskCommand(args: Record<string, unknown>, ctx: CallerConte
       ) {
         throw new Error('this series runs its script on the host — an operator must make script changes');
       }
+      // The recurrence ceiling is enforced AGAIN, here, against the row this
+      // write will actually land on. The pre-pass above validates the input
+      // shape and reports a typo before the first write — that part has to
+      // stay ahead of the loop — but its script exemption was decided from a
+      // row read in an EARLIER mailbox pass. Opening a mailbox yields, so
+      // between the two passes another caller can clear the script that
+      // exempted a `*/5 * * * *`, and the high-frequency recurrence lands on a
+      // now-scriptless series. Re-deciding from `before`, with nothing awaited
+      // between the read and the write, is what ties the exemption to the row
+      // it exempts. The inverse ordering is covered too: a change that became
+      // valid while this call was in flight is no longer rejected on a stale
+      // read.
+      if (recurrence !== undefined) {
+        const scriptNow: string | null =
+          script !== undefined ? script : before ? parseContent(before.content).script : null;
+        enforceRecurrenceLimit(
+          recurrence,
+          bool(args.dangerously_override_recurrence_limit),
+          scriptNow != null,
+          resolveGroupTimezone(session.agent_group_id),
+        );
+      }
       const n = mailbox.updateTask(id, sessionUpdate);
       return { before, n };
     });

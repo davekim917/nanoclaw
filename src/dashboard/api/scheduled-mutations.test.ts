@@ -54,11 +54,21 @@ vi.mock('../../container-runner.js', async (importOriginal) => {
   const real = await importOriginal<typeof import('../../container-runner.js')>();
   return { ...real, wakeContainer: (...args: unknown[]) => mockWakeContainer(...args) };
 });
+// A hook that fires INSIDE the mutation's mailbox acquisition — the window the
+// async funnel opened between the preflight verdict and the write. Real
+// implementation otherwise, so every other case in this file is unaffected.
+const duringMailboxAcquire = vi.hoisted(() => ({ run: null as (() => void) | null }));
 vi.mock('../../session-manager.js', async (importOriginal) => {
   const real = await importOriginal<typeof import('../../session-manager.js')>();
   return {
     ...real,
     admitDueTaskContexts: (...args: unknown[]) => mockAdmitDueTaskContexts(...args),
+    withExistingMailboxSession: async (agentGroupId: string, sessionId: string, action: never) => {
+      const hook = duringMailboxAcquire.run;
+      duringMailboxAcquire.run = null;
+      hook?.();
+      return real.withExistingMailboxSession(agentGroupId, sessionId, action);
+    },
   };
 });
 
@@ -515,6 +525,37 @@ describe('pause / resume', () => {
     expect(row.status).toBe('pending');
     // Recomputed to a FUTURE slot — does NOT fire immediately.
     expect(Date.parse(row.process_after!)).toBeGreaterThan(NOW);
+  });
+
+  // The preflight approves a PAUSED row, then the mailbox acquisition yields.
+  // If another request resumes that row in the window, the old code still ran
+  // `updateTask` (rewriting process_after on a now-pending row) and only then
+  // discovered `resumeTask` touched nothing — reporting 409 while having
+  // silently rescheduled a live series.
+  it('a resume whose row was resumed during acquisition changes nothing and refuses', async () => {
+    const armed = isoIn(-48 * 3600_000);
+    insertRow(seedSession().inbound, {
+      id: 'r1',
+      series_id: 'ser-1',
+      status: 'paused',
+      recurrence: '0 9 * * *',
+      process_after: armed,
+    });
+
+    duringMailboxAcquire.run = () => {
+      const db = openInboundDb(path.join(TEST_DIR, 'v2-sessions', AG, SESS, 'inbound.db'));
+      db.prepare("UPDATE messages_in SET status = 'pending' WHERE id = 'r1'").run();
+      db.close();
+    };
+
+    const res = (await resumeHandler(postReq(), { key: keyFor('ser-1') }, ctxFor('owner', OWNER_SCOPES)))!;
+    expect(res.status).not.toBe(200);
+
+    // The decisive assertion: the armed instant is untouched. The bug was not
+    // the status code, it was the write that happened before it.
+    const row = liveRow('ser-1')!;
+    expect(row.status).toBe('pending');
+    expect(row.process_after).toBe(armed);
   });
 
   it('test_pause_claimed_409', async () => {

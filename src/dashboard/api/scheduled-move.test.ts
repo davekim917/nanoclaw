@@ -18,6 +18,23 @@ vi.mock('../../config.js', async (importOriginal) => ({
   GROUPS_DIR: `${TEST_DIR}/groups`,
 }));
 
+// A hook that fires INSIDE the move's mailbox acquisition, i.e. in the window
+// the async funnel opened between the snapshot/verdict and the cancel. Real
+// implementation otherwise, so every other case in this file is unaffected.
+const duringMailboxAcquire = vi.hoisted(() => ({ run: null as (() => void) | null }));
+vi.mock('../../session-manager.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../session-manager.js')>();
+  return {
+    ...actual,
+    withExistingMailboxSession: async (agentGroupId: string, sessionId: string, action: never) => {
+      const hook = duringMailboxAcquire.run;
+      duringMailboxAcquire.run = null;
+      hook?.();
+      return actual.withExistingMailboxSession(agentGroupId, sessionId, action);
+    },
+  };
+});
+
 import { initTestDb, closeDb, getDb } from '../../db/connection.js';
 import { openInboundDb } from '../../modules/mailbox/openers.js';
 import { ensureSchema } from '../../modules/mailbox/schema.js';
@@ -431,6 +448,45 @@ describe('moveExecuteHandler', () => {
     const tgtLive = liveRowsForSeries('tgt-ag', tgtSess!, 'ser-1');
     expect(tgtLive).toHaveLength(1);
     expect(tgtLive[0].recurrence).toBe('0 9 * * *');
+  });
+
+  // The move approves ONE occurrence and writes a move_intent naming that row
+  // id. Acquiring the mailbox is now async, so between the verdict and the
+  // cancel the approved occurrence can complete and recurrence can arm a
+  // successor. A series-wide cancel would consume the successor, report a
+  // nonzero touch and move the stale snapshot on top of it. This drives that
+  // exact interleave through the acquisition hook above.
+  it('a successor armed during mailbox acquisition is left alone, and the move reports stale_key', async () => {
+    const { key } = seedMoveFixture({ sourceProcessAfter: isoIn(10 * 3600_000) });
+    const srcInbound = path.join(TEST_DIR, 'v2-sessions', 'src-ag', 'src-sess', 'inbound.db');
+
+    duringMailboxAcquire.run = () => {
+      // The approved occurrence finishes...
+      const db = openInboundDb(srcInbound);
+      db.prepare("UPDATE messages_in SET status = 'completed' WHERE id = 'r1'").run();
+      db.close();
+      // ...and recurrence arms the next one.
+      insertRow(srcInbound, {
+        id: 'r2',
+        series_id: 'ser-1',
+        status: 'pending',
+        process_after: isoIn(24 * 3600_000),
+      });
+    };
+
+    const res = (await moveExecuteHandler(req(moveBody()), { key }, ctxFor('owner', OWNER_SCOPES)))!;
+    expect(res.status).toBe(409);
+    expect((await readJson(res)).reason).toBe('stale_key');
+
+    // The successor is untouched and still live...
+    const srcLive = liveRowsForSeries('src-ag', 'src-sess', 'ser-1');
+    expect(srcLive).toHaveLength(1);
+    expect(srcLive[0]!.id).toBe('r2');
+    expect(srcLive[0]!.recurrence).toBe('0 9 * * *');
+    // ...and nothing was inserted into the target from the stale snapshot.
+    const tgtSess = targetSessionId();
+    expect(tgtSess === null || liveRowsForSeries('tgt-ag', tgtSess, 'ser-1')).toBeTruthy();
+    if (tgtSess) expect(liveRowsForSeries('tgt-ag', tgtSess, 'ser-1')).toHaveLength(0);
   });
 
   it("a successful move carries the occurrence's slot, not its retry deadline", async () => {

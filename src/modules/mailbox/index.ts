@@ -79,7 +79,7 @@ import {
   type InboundRoutingAnchor,
   type RoutedTaskRow,
 } from './ops/lookups.js';
-import { listTurnUsageSince, type SessionTurnUsageRow } from './ops/reads.js';
+import { getLiveTaskRow, listTurnUsageSince, type ScheduledTaskRow, type SessionTurnUsageRow } from './ops/reads.js';
 import {
   admitDueRow,
   admitPendingUpgradeRow,
@@ -95,6 +95,7 @@ import {
 import {
   armNextTask,
   cancelSeriesWithStrandClear,
+  cancelTaskRow,
   getCliTaskRow,
   getCompletedRecurring,
   getCreatedTaskRow,
@@ -204,6 +205,7 @@ export {
 } from '../../mailbox/sqlite/tasks.js';
 export {
   cancelSeriesWithStrandClear,
+  cancelTaskRow,
   getCompletedRecurring,
   insertRecurrence,
   insertTaskRow,
@@ -448,6 +450,20 @@ export interface NanoclawMailboxSession extends MailboxSession {
    */
   restoreTaskSeries(touchedId: string, prior: TaskSeriesSnapshot | null, priorRecall: TaskSeriesSnapshot | null): void;
   cancelSeriesWithStrandClear(taskId: string): number;
+  /**
+   * Cancel ONE row by its exact id — the by-id twin of upstream's series-wide
+   * `cancelTask`, for a writer acting on a row it read earlier.
+   */
+  cancelTaskRow(rowId: string): number;
+  /**
+   * The newest LIVE (`pending`/`paused`) task row of a series.
+   *
+   * The read-only funnels have carried this since PR 6; the WRITE session
+   * needs it too, because a writer that approved a row before an await has to
+   * re-prove that row is still the live one before it mutates. Same op, same
+   * statement (invariant I-2) — the surface differs, the SQL does not.
+   */
+  getLiveTaskRow(seriesId: string): ScheduledTaskRow | null;
   upsertTaskSeries(row: {
     id: string;
     seriesId: string;
@@ -999,6 +1015,8 @@ function forkOps(
     restoreTaskRow: (snapshot) => restoreTaskRow(inbound, snapshot),
     restoreTaskSeries: (touchedId, prior, priorRecall) => restoreTaskSeries(inbound, touchedId, prior, priorRecall),
     cancelSeriesWithStrandClear: (taskId) => cancelSeriesWithStrandClear(inbound, taskId),
+    cancelTaskRow: (rowId) => cancelTaskRow(inbound, rowId),
+    getLiveTaskRow: (seriesId) => getLiveTaskRow(inbound, seriesId),
     upsertTaskSeries: (row) => upsertTaskSeries(inbound, row),
     listDueTaskRows: () => listDueTaskRows(inbound),
     resolvePendingTask: (taskId, status) => resolvePendingTask(inbound, taskId, status),

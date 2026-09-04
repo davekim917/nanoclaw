@@ -32,7 +32,7 @@ import { admitDueTaskContexts, withExistingMailboxSession } from '../../session-
 import { log } from '../../log.js';
 import { parseUtcTimestampMs } from '../../thread-context.js';
 import { emitDashboardEvent } from './events.js';
-import { verbVerdict, type HealthState, type SeriesKind } from './scheduled-board-matrix.js';
+import { verbVerdict, type HealthState, type SeriesKind, type Verb } from './scheduled-board-matrix.js';
 import type { AuthHandler, AuthedRequestContext } from '../router.js';
 import {
   canManageScheduled,
@@ -144,8 +144,6 @@ function resolveTarget(
 
   // Claim state from outbound.db. Absent/unreadable outbound + overdue → unknown
   // (never silently not-claimed — F6).
-  const processAfterMs = parseUtcTimestampMs(live.process_after);
-  const overdue = processAfterMs !== null && processAfterMs <= nowMs;
   let claimed = false;
   let outboundReadable = false;
   try {
@@ -158,14 +156,7 @@ function resolveTarget(
     outboundReadable = false;
   }
 
-  let health: HealthState;
-  if (live.status === 'paused') health = 'paused';
-  else if (claimed) health = 'processing';
-  else if (!outboundReadable && overdue) health = 'unknown';
-  else if (overdue) health = 'late';
-  else health = 'healthy';
-
-  const kind: SeriesKind = live.recurrence ? (live.thread_id ? 'thread_loop' : 'recurring') : 'one_off';
+  const { health, kind, processAfterMs } = gateStateFor(live, claimed, outboundReadable, nowMs);
 
   return {
     ok: {
@@ -183,16 +174,130 @@ function resolveTarget(
 }
 
 /**
- * Run one mutation against the target's inbound mailbox.
+ * The gate's derived state for one live row — the inputs `verbVerdict` reads.
+ *
+ * One function, two callers: the preflight in `resolveTarget` and the
+ * re-proof inside `withMutationSession`. They MUST agree, because the second
+ * exists to re-run the first's decision against fresher facts; two copies of
+ * these five lines would drift and the re-proof would start refusing (or
+ * allowing) things the preflight did not.
+ */
+function gateStateFor(
+  live: LiveRow,
+  claimed: boolean,
+  outboundReadable: boolean,
+  nowMs: number,
+): { health: HealthState; kind: SeriesKind; processAfterMs: number | null } {
+  const processAfterMs = parseUtcTimestampMs(live.process_after);
+  const overdue = processAfterMs !== null && processAfterMs <= nowMs;
+  let health: HealthState;
+  if (live.status === 'paused') health = 'paused';
+  else if (claimed) health = 'processing';
+  else if (!outboundReadable && overdue) health = 'unknown';
+  else if (overdue) health = 'late';
+  else health = 'healthy';
+  const kind: SeriesKind = live.recurrence ? (live.thread_id ? 'thread_loop' : 'recurring') : 'one_off';
+  return { health, kind, processAfterMs };
+}
+
+/** What a mutation produced: a touched-count, or the refusal to return verbatim. */
+type MutationOutcome = { touched: number } | { refused: Response };
+
+/**
+ * Run one mutation against the target's inbound mailbox, re-proving the
+ * verdict against the row the write will actually land on.
  *
  * Existing-only by construction: `resolveTarget` has already proved the file
  * is there and 503'd if not, so `undefined` here means the session vanished
  * between the gate and the write. That collapses to 0 touched, which every
  * caller already answers with the same 409 stale_key the pre-seam open's
  * throw produced.
+ *
+ * THE RE-PROOF. `resolveTarget` reads the live row, the claim and the health
+ * state, and `verbVerdict` approves the verb from them — all before this
+ * function's `await`. Before the seam that was safe: the gate and the write
+ * were one synchronous run, so nothing could move between them. Acquiring a
+ * mailbox is asynchronous now, and in that window another request can resume
+ * the paused row this one approved, a container can claim it, or the
+ * occurrence can complete and recurrence can arm a successor. The task ops
+ * key on the SERIES and its live status, not on the row that was approved, so
+ * every one of those writes lands and reports success against something the
+ * operator never saw.
+ *
+ * So the same verdict runs again here, inside the session, from a fresh read
+ * of the same three facts, with nothing awaited between the read and the
+ * write. A row that changed identity refuses as `stale_key` — the answer a
+ * genuinely stale key already gets. A row whose STATE moved (resumed,
+ * claimed, now overdue) refuses with that verb's own verdict, the same shape
+ * the preflight would have returned had it seen this state first.
+ *
+ * The claim read is fail-closed on purpose: `getProcessingClaimRows` degrades
+ * to empty only when `outbound.db` is genuinely absent, and throws when it is
+ * present but unopenable. That throw becomes `outboundReadable: false`, which
+ * is exactly what the preflight does with the same condition (F6 — never
+ * silently not-claimed), and the verdict decides from there rather than this
+ * function inventing a policy of its own.
  */
-function withMutationSession(t: ResolvedTarget, action: (mailbox: NanoclawMailboxSession) => number): Promise<number> {
-  return withExistingMailboxSession(t.agentGroupId, t.sessionId, action).then((touched) => touched ?? 0);
+async function withMutationSession(
+  t: ResolvedTarget,
+  verb: Verb,
+  nowMs: number,
+  action: (mailbox: NanoclawMailboxSession) => number,
+  verdictCtx?: { forced?: boolean },
+): Promise<MutationOutcome> {
+  const outcome = await withExistingMailboxSession(t.agentGroupId, t.sessionId, (mailbox) => {
+    const live = mailbox.getLiveTaskRow(t.seriesId);
+    // No live row, or a DIFFERENT one: the key names an occurrence that is no
+    // longer the one to act on.
+    if (!live || live.id !== t.live.id) {
+      log.warn('scheduled-mutations: approved row is no longer live — refusing', {
+        verb,
+        seriesId: t.seriesId,
+        approvedRowId: t.live.id,
+        liveRowId: live?.id ?? null,
+      });
+      return { refused: json({ error: 'stale_key', reason: 'stale_key' }, 409) };
+    }
+
+    // Fail-closed exactly as the preflight does: `getProcessingClaimRows`
+    // degrades to empty only when outbound.db is genuinely absent, and throws
+    // when it is present but unopenable. That throw is "unreadable", not
+    // "unclaimed" (F6), and the verdict decides what to do about it.
+    let claim: { claimed: boolean; outboundReadable: boolean };
+    try {
+      claim = {
+        claimed: mailbox.getProcessingClaimRows().some((c) => c.message_id === live.id),
+        outboundReadable: true,
+      };
+    } catch {
+      claim = { claimed: false, outboundReadable: false };
+    }
+    const { claimed } = claim;
+
+    const fresh = gateStateFor(live, claimed, claim.outboundReadable, nowMs);
+    const verdict = verbVerdict(verb, {
+      state: fresh.health,
+      kind: fresh.kind,
+      claimed,
+      processAfterMs: fresh.processAfterMs,
+      nowMs,
+      ...(verdictCtx?.forced === undefined ? {} : { forced: verdictCtx.forced }),
+    });
+    if (!verdict.allowed) {
+      log.warn('scheduled-mutations: the approved verdict no longer holds — refusing', {
+        verb,
+        seriesId: t.seriesId,
+        rowId: live.id,
+        was: t.health,
+        now: fresh.health,
+        reason: verdict.reason,
+      });
+      return { refused: verdictResponse(verdict) };
+    }
+
+    return { touched: action(mailbox) };
+  });
+  return outcome ?? { touched: 0 };
 }
 
 /** Emit the post-mutation SSE frame (non-null agent_group_id) + invalidate cache. */
@@ -307,8 +412,9 @@ export const editHandler: AuthHandler = async (req, params, ctx) => {
   // (invariant I-10). `undefined` reads as "nothing was touched", which the
   // stale-key branch below already answers — the same 409 the pre-seam open
   // produced for a session that vanished under the gate.
-  const touched = await withMutationSession(t, (mailbox) => mailbox.updateTask(t.seriesId, update));
-  if (touched === 0) return json({ error: 'stale_key', reason: 'stale_key' }, 409);
+  const outcome = await withMutationSession(t, 'edit', nowMs, (mailbox) => mailbox.updateTask(t.seriesId, update));
+  if ('refused' in outcome) return outcome.refused;
+  if (outcome.touched === 0) return json({ error: 'stale_key', reason: 'stale_key' }, 409);
 
   writeAudit(getDb(), {
     actor: ctx.user.id,
@@ -342,8 +448,9 @@ export const pauseHandler: AuthHandler = async (_req, params, ctx) => {
   });
   if (!verdict.allowed) return verdictResponse(verdict);
 
-  const touched = await withMutationSession(t, (mailbox) => mailbox.pauseTask(t.seriesId));
-  if (touched === 0) return json({ error: 'stale_key', reason: 'stale_key' }, 409);
+  const outcome = await withMutationSession(t, 'pause', nowMs, (mailbox) => mailbox.pauseTask(t.seriesId));
+  if ('refused' in outcome) return outcome.refused;
+  if (outcome.touched === 0) return json({ error: 'stale_key', reason: 'stale_key' }, 409);
 
   writeAudit(getDb(), {
     actor: ctx.user.id,
@@ -371,7 +478,7 @@ export const resumeHandler: AuthHandler = async (_req, params, ctx) => {
   });
   if (!verdict.allowed) return verdictResponse(verdict);
 
-  const touched = await withMutationSession(t, (mailbox) => {
+  const outcome = await withMutationSession(t, 'resume', nowMs, (mailbox) => {
     // §4.7: recompute process_after to the next FUTURE slot BEFORE flipping to
     // pending (skip-don't-replay, D3) — a paused-past-its-slot series must not
     // fire immediately on resume.
@@ -382,7 +489,8 @@ export const resumeHandler: AuthHandler = async (_req, params, ctx) => {
     }
     return mailbox.resumeTask(t.seriesId);
   });
-  if (touched === 0) return json({ error: 'stale_key', reason: 'stale_key' }, 409);
+  if ('refused' in outcome) return outcome.refused;
+  if (outcome.touched === 0) return json({ error: 'stale_key', reason: 'stale_key' }, 409);
 
   writeAudit(getDb(), {
     actor: ctx.user.id,
@@ -427,27 +535,34 @@ export const runNowHandler: AuthHandler = async (req, params, ctx) => {
   // Fire: process_after = now, then wake the container. Recurrence advances
   // normally on completion (an early fire does not shift the schedule — §4.6).
   let admittedTarget = false;
-  const touched = await withMutationSession(t, (mailbox) => {
-    // keepScheduledFor: an early fire does not shift the schedule (§4.6), so the
-    // occurrence is still FOR its original slot and must keep announcing that
-    // slot to the agent. Only `process_after` moves to now.
-    const n = mailbox.updateTask(t.seriesId, {
-      processAfter: new Date(nowMs).toISOString(),
-      keepScheduledFor: true,
-    });
-    if (n > 0) {
-      admitDueTaskContexts(mailbox, t.agentGroupId, t.sessionId);
-      admittedTarget = mailbox.taskPairIsAdmitted(t.live.id);
-      if (!admittedTarget) {
-        // Do not silently turn a failed run-now request into a later run-now.
-        // Keep the row inert (updateTask already invalidated stale recall) but
-        // restore its prior schedule so only the pre-existing fire remains.
-        mailbox.restoreInertTaskSchedule(t.live.id, t.live.process_after);
+  const outcome = await withMutationSession(
+    t,
+    'run_now',
+    nowMs,
+    (mailbox) => {
+      // keepScheduledFor: an early fire does not shift the schedule (§4.6), so the
+      // occurrence is still FOR its original slot and must keep announcing that
+      // slot to the agent. Only `process_after` moves to now.
+      const n = mailbox.updateTask(t.seriesId, {
+        processAfter: new Date(nowMs).toISOString(),
+        keepScheduledFor: true,
+      });
+      if (n > 0) {
+        admitDueTaskContexts(mailbox, t.agentGroupId, t.sessionId);
+        admittedTarget = mailbox.taskPairIsAdmitted(t.live.id);
+        if (!admittedTarget) {
+          // Do not silently turn a failed run-now request into a later run-now.
+          // Keep the row inert (updateTask already invalidated stale recall) but
+          // restore its prior schedule so only the pre-existing fire remains.
+          mailbox.restoreInertTaskSchedule(t.live.id, t.live.process_after);
+        }
       }
-    }
-    return n;
-  });
-  if (touched === 0) return json({ error: 'stale_key', reason: 'stale_key' }, 409);
+      return n;
+    },
+    { forced: body.force === true },
+  );
+  if ('refused' in outcome) return outcome.refused;
+  if (outcome.touched === 0) return json({ error: 'stale_key', reason: 'stale_key' }, 409);
   if (!admittedTarget) {
     return json(
       {
