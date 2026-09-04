@@ -11,6 +11,7 @@ import path from 'path';
 
 import type Database from 'better-sqlite3';
 
+import { log } from '../../log.js';
 import { isOwner, isGlobalAdmin } from '../../modules/permissions/db/user-roles.js';
 import type { ScheduledTaskRow } from '../../modules/mailbox/index.js';
 
@@ -157,6 +158,48 @@ export function writeAudit(db: Database.Database, e: AuditEntry): void {
  * lives only while the move is unresolved. Idempotent — re-running on an
  * already-resolved row is a harmless no-op.
  */
+/**
+ * Does an unresolved move intent still name this session?
+ *
+ * A move cancels the SOURCE series before it inserts into the target, so
+ * between those two steps the source session holds zero live task rows — which
+ * is exactly the state S19 (spent-task-session GC) collects. The recovery duty
+ * that repairs a crashed move only acts on intents older than one sweep
+ * interval, so on a stopped session S19 runs first and closes the row the
+ * restore needs. Every later `withQuietInvalidationSync` then refuses (no
+ * ACTIVE session row), the recovery's catch leaves the intent unresolved, and
+ * the series stays cancelled forever — the one outcome no later pass repairs.
+ *
+ * So the GC asks first. One central-DB read per spent task session per tick,
+ * against the table the intent already lives in.
+ *
+ * FAIL-CLOSED, unlike `recoverMoveIntents`' own read of the same table. That
+ * one treats an unreadable `scheduled_audit` as "no intents" and returns,
+ * which is right when the consequence is "repair nothing this tick". Here the
+ * consequence is DESTROYING the session a repair would restore into, so an
+ * unknown answer must block the close. The cost of being wrong that way is a
+ * spent task session staying open and quiet for another tick; the cost of the
+ * other way is unrecoverable.
+ */
+export function hasUnresolvedMoveIntent(db: Database.Database, sessionId: string): boolean {
+  try {
+    const row = db
+      .prepare(
+        `SELECT 1 AS present FROM scheduled_audit
+          WHERE action = 'move_intent' AND resolved_at IS NULL AND session_id = ?
+          LIMIT 1`,
+      )
+      .get(sessionId);
+    return row !== undefined;
+  } catch (err) {
+    log.warn('Could not read move intents before closing a spent task session — keeping it open', {
+      sessionId,
+      err,
+    });
+    return true;
+  }
+}
+
 export function purgeIntentBody(db: Database.Database, correlationId: string): void {
   // Explicit ISO, for the same reason the insert above already documents at the
   // `ts` field — this statement was writing the naive `datetime('now')` shape

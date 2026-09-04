@@ -657,6 +657,57 @@ describe('S2-PR11 scheduling + thread-close', () => {
     expect(calls.updates).toEqual([]);
   });
 
+  // ── Codex final, CRITICAL ─────────────────────────────────────────────────
+  //
+  // A move in flight is indistinguishable from a spent session by the cheap
+  // predicate: it cancels the SOURCE series before inserting into the target,
+  // so in between the source holds zero live rows and no container. S19 runs in
+  // `session:tail` on every tick; `recoverMoveIntents` (T11, tick:housekeeping)
+  // deliberately ignores intents younger than one sweep interval, so on a
+  // stopped session the GC always gets there first. Closing the row makes the
+  // repair impossible: every later restore's `withQuietInvalidationSync`
+  // refuses on a non-active session, the recovery's catch leaves the intent
+  // unresolved, and the series stays cancelled with nothing left to fix it.
+  it('the registered spent-task GC duty keeps a session an unresolved move intent still names', async () => {
+    const db = freshInbound();
+    const session = fakeSession({ id: 'sess-moving', thread_id: TASK_THREAD });
+    const ctx = makeCtx({ session, mailbox: sessionFor(db) });
+    // The audit row the move writes before it cancels the source.
+    getDb()
+      .prepare(
+        `INSERT INTO scheduled_audit (ts, actor, action, agent_group_id, session_id, series_id, correlation_id)
+         VALUES (?, 'u-owner', 'move_intent', 'ag-test', 'sess-moving', 'ser-moving', 'corr-ser-moving')`,
+      )
+      .run(new Date().toISOString());
+
+    await duty(SWEEP_DUTY_INVENTORY.S19).run(ctx);
+
+    expect(calls.updates, 'the GC closed the session a move intent still needs').toEqual([]);
+    expect(getDb().prepare("SELECT status FROM sessions WHERE id = 'sess-moving'").get()).toEqual({
+      status: 'active',
+    });
+  });
+
+  it('the registered spent-task GC duty closes the session once the move intent resolves', async () => {
+    const db = freshInbound();
+    const session = fakeSession({ id: 'sess-moved', thread_id: TASK_THREAD });
+    const ctx = makeCtx({ session, mailbox: sessionFor(db) });
+    // Same row, but resolved — which is what `purgeIntentBody` stamps when the
+    // move completes or the recovery gives up. The guard must not leak into a
+    // permanent leases-forever, so this is the discriminating half: without it
+    // the case above would pass for a GC that simply stopped collecting.
+    getDb()
+      .prepare(
+        `INSERT INTO scheduled_audit (ts, actor, action, agent_group_id, session_id, series_id, correlation_id, resolved_at)
+         VALUES (?, 'u-owner', 'move_intent', 'ag-test', 'sess-moved', 'ser-moved', 'corr-ser-moved', ?)`,
+      )
+      .run(new Date().toISOString(), new Date().toISOString());
+
+    await duty(SWEEP_DUTY_INVENTORY.S19).run(ctx);
+
+    expect(calls.updates).toEqual([{ id: 'sess-moved', patch: { status: 'closed' } }]);
+  });
+
   it('the registered spent-task GC duty keeps a session whose container is still running', async () => {
     calls.running = true;
     const db = freshInbound();

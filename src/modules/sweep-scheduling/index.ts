@@ -19,6 +19,8 @@
  */
 import { isContainerRunning } from '../../container-runner.js';
 import { advanceThreadClosures } from '../../dashboard/thread-close.js';
+import { getDb } from '../../db/connection.js';
+import { hasUnresolvedMoveIntent } from '../../dashboard/api/scheduled-shared.js';
 import { isTaskThread, updateSession } from '../../db/sessions.js';
 import {
   SWEEP_DUTY_INVENTORY,
@@ -137,10 +139,28 @@ export function registerSchedulingSweepDuties(): void {
       const { session, mailbox } = asSessionContext(ctx);
       if (isTaskThread(session.thread_id)) {
         const liveTasks = mailbox!.countLiveTasks();
-        if (shouldCloseTaskSession(session.thread_id, isContainerRunning(session.id), liveTasks)) {
-          updateSession(session.id, { status: 'closed' });
-          log.info('Closed spent task session', { sessionId: session.id, threadId: session.thread_id });
+        if (!shouldCloseTaskSession(session.thread_id, isContainerRunning(session.id), liveTasks)) return;
+        // A move in flight looks EXACTLY like a spent session: it cancels the
+        // source series before inserting into the target, so between those two
+        // steps the source holds zero live rows and no container. Closing it
+        // here is unrecoverable — `recoverMoveIntents` only acts on intents
+        // older than one sweep interval, so it always arrives after this duty,
+        // and its restore's `withQuietInvalidationSync` refuses on a session
+        // row that is no longer active. The intent then stays unresolved and
+        // the series stays cancelled, with nothing left that can repair it.
+        //
+        // Asked only once the cheap predicate above has already said "close",
+        // so the ordinary spent session pays one central-DB read and a live
+        // one pays nothing.
+        if (hasUnresolvedMoveIntent(getDb(), session.id)) {
+          log.info('Kept a spent task session open — an unresolved move intent still names it', {
+            sessionId: session.id,
+            threadId: session.thread_id,
+          });
+          return;
         }
+        updateSession(session.id, { status: 'closed' });
+        log.info('Closed spent task session', { sessionId: session.id, threadId: session.thread_id });
       }
     },
   });

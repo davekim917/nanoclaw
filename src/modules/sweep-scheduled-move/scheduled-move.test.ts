@@ -66,13 +66,20 @@ function childProcessTripwire(record: string[]): Record<string, (...args: unknow
 // One entry per invalidated session, and the write runs inside it, so this
 // records the ordering the restore depends on.
 const touched = vi.hoisted(() => [] as string[]);
+/**
+ * Most cases here want a pass-through recorder: they assert THAT the restore
+ * invalidated, not what the central DB made of it. One case needs the opposite
+ * — the REAL helper, so its refusal on a closed session row is observable — and
+ * flipping this is how it gets one without a second suite. Reset in beforeEach.
+ */
+const useRealQuietInvalidation = vi.hoisted(() => ({ on: false }));
 vi.mock('../../db/sessions.js', async (importOriginal) => {
   const real = await importOriginal<typeof import('../../db/sessions.js')>();
   return {
     ...real,
     withQuietInvalidationSync: <T>(id: string, write: () => T): T => {
       touched.push(id);
-      return write();
+      return useRealQuietInvalidation.on ? real.withQuietInvalidationSync(id, write) : write();
     },
   };
 });
@@ -344,7 +351,11 @@ describe('recoverMoveIntents (D3) + pruneAuditBodies (D4)', () => {
     db.exec(`
       CREATE TABLE sessions (
         id TEXT PRIMARY KEY, agent_group_id TEXT NOT NULL, messaging_group_id TEXT,
-        thread_id TEXT, status TEXT DEFAULT 'active', created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        thread_id TEXT, status TEXT DEFAULT 'active', created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        -- The REAL withQuietInvalidationSync writes both of these in one
+        -- statement (migration 068). Present so the one case that runs the real
+        -- helper exercises the statement rather than a missing-column throw.
+        last_active TEXT, sweep_quiet_until TEXT
       );
     `);
     return db;
@@ -441,6 +452,87 @@ describe('recoverMoveIntents (D3) + pruneAuditBodies (D4)', () => {
   // live task (exactly the crash state this recovery exists for) and can mark it
   // quiet; the row restored here is then due work hiding behind a mark taken
   // seconds earlier, which S2-PR15 would carry across a restart.
+  // ── Codex final, CRITICAL — why S19 must not collect the source ───────────
+  //
+  // The REAL `withQuietInvalidationSync`, not this suite's recorder: its whole
+  // contract is `WHERE id = ? AND status = 'active'`, so a source session that
+  // the spent-task GC has closed refuses the restore and the intent stays
+  // unresolved forever. Both halves are asserted, because the guard added to
+  // S19 (`hasUnresolvedMoveIntent`) is only worth having if the closed case
+  // really is unrecoverable.
+  it('the recovery restores into an ACTIVE source and is refused by a closed one', async () => {
+    const db = centralDb();
+    // The real helper reads `getDb()`, not the handle passed to the duty, so
+    // both have to be the same database for the refusal to be the real one.
+    mockGetDb.mockImplementation(() => db);
+    useRealQuietInvalidation.on = true;
+    try {
+      // ── Closed source: what S19 used to leave behind. ──────────────────────
+      const closedInbound = seedInbound('src-ag', 'sess-closed');
+      db.prepare(
+        "INSERT INTO sessions (id, agent_group_id, messaging_group_id, thread_id, status) VALUES ('sess-closed', 'src-ag', NULL, NULL, 'closed')",
+      ).run();
+      writeIntent(db, { seriesId: 'ser-closed', ag: 'src-ag', sess: 'sess-closed', tsMs: NOW - 2 * SWEEP_MS });
+
+      await recoverMoveIntents(db, { nowMs: NOW });
+
+      expect(
+        (
+          openInboundDb(closedInbound)
+            .prepare("SELECT COUNT(*) AS c FROM messages_in WHERE series_id='ser-closed'")
+            .get() as { c: number }
+        ).c,
+        'a closed source accepted a restore the invalidation must refuse',
+      ).toBe(0);
+      expect(
+        (
+          db.prepare("SELECT resolved_at FROM scheduled_audit WHERE correlation_id = 'corr-ser-closed'").get() as {
+            resolved_at: string | null;
+          }
+        ).resolved_at,
+        'the intent was stamped resolved over a restore that never happened',
+      ).toBeNull();
+
+      // ── Active source: the state the S19 guard preserves. ──────────────────
+      const liveInbound = seedInbound('src-ag', 'sess-live');
+      db.prepare(
+        "INSERT INTO sessions (id, agent_group_id, messaging_group_id, thread_id, status) VALUES ('sess-live', 'src-ag', NULL, NULL, 'active')",
+      ).run();
+      writeIntent(db, { seriesId: 'ser-live', ag: 'src-ag', sess: 'sess-live', tsMs: NOW - 2 * SWEEP_MS });
+
+      await recoverMoveIntents(db, { nowMs: NOW });
+
+      expect(
+        (
+          openInboundDb(liveInbound)
+            .prepare(
+              "SELECT COUNT(*) AS c FROM messages_in WHERE series_id='ser-live' AND status IN ('pending','paused')",
+            )
+            .get() as { c: number }
+        ).c,
+        'exactly one live row must come back',
+      ).toBe(1);
+      expect(
+        (
+          db.prepare("SELECT resolved_at FROM scheduled_audit WHERE correlation_id = 'corr-ser-live'").get() as {
+            resolved_at: string | null;
+          }
+        ).resolved_at,
+      ).toBeTruthy();
+      // The real helper moved the mark, in the same statement.
+      expect(db.prepare("SELECT sweep_quiet_until FROM sessions WHERE id = 'sess-live'").get()).toEqual({
+        sweep_quiet_until: null,
+      });
+      expect(h.spawns).toEqual([]);
+    } finally {
+      useRealQuietInvalidation.on = false;
+      // Restore the ORIGINAL implementation, which re-reads `h.centralDb` on
+      // every call — `mockClear()` in beforeEach does not undo an implementation.
+      mockGetDb.mockImplementation(() => h.centralDb);
+      db.close();
+    }
+  });
+
   it('touches the source session so a quiet mark taken during the same tick cannot hide the restored task', async () => {
     touched.length = 0;
     const db = centralDb();
