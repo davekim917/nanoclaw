@@ -1,49 +1,35 @@
 /**
  * scripts/open-a2a-room.ts — open a Slack agent-to-agent (A2A) room.
  *
- * Creates a group DM (MPIM) holding a human plus two or more sibling bots that
- * this host runs, posts an intro message from the first bot, and prints the
- * channel id plus the `ncl` commands that wire the room to each bot's agent
- * group.
+ * Creates a group DM (MPIM) holding a human plus two or more NanoClaw sibling
+ * bots, posts an intro message from the first bot, prints the channel id, and
+ * appends it to SLACK_A2A_ROOMS in .env so the slack-a2a-rooms bridge filter
+ * starts admitting bot-authored messages there (picked up within ~30s — no
+ * service restart required).
  *
  * Usage:
  *   pnpm exec tsx scripts/open-a2a-room.ts --instances <name,name…> [--user <slack user id>]
  *
- * Instance names follow the adapter's suffix-token convention: each name reads
- * its bot token from `SLACK_BOT_TOKEN_<NAME>` (uppercased, dashes →
- * underscores). A `slack-` prefix is accepted so the channelType an operator
- * sees in `ncl messaging-groups list` can be pasted verbatim, and `slack` (or
- * `default`) means the primary workspace's `SLACK_BOT_TOKEN`. The first listed
- * instance is the caller — it opens the conversation and posts the intro. Bot
- * user ids are resolved via `auth.test` per token.
+ * Instance names follow the slack-multi-instance convention: each name reads
+ * its bot token from SLACK_BOT_TOKEN_<NAME> (uppercased, dashes →
+ * underscores); the special name `default` reads SLACK_BOT_TOKEN. The first
+ * listed instance is the caller — it opens the conversation and posts the
+ * intro. Bot user ids are resolved via auth.test per token.
  *
- * Requires the `mpim:write` scope on the FIRST listed app — it is the one that
- * calls `conversations.open`. The others are members and need only the
- * `mpim:read` / `mpim:history` that `/add-slack` already asks for.
- * `/add-slack` does not ask for `mpim:write`, so it has to be added to the
- * caller and that app reinstalled before this runs (see the skill's
- * prerequisites). Without --user the room holds bots only,
- * which needs at least three instances (Slack turns a two-party open into a
- * 1:1 IM).
- *
- * Opening the room is the whole side effect: this reads `.env` and writes
- * nothing back, because a room carries no host-side registration. Sibling-bot
- * inbound reaches the router in every conversation via `isSiblingBotSender`
- * (src/modules/permissions/access.ts), and runaway loops are bounded per
- * thread by `SLACK_MAX_BOT_HOPS` (src/channels/slack-hop-limit.ts).
+ * Requires the `mpim:write` scope on every listed app (see the skill's
+ * prerequisites). Without --user the room holds bots only, which needs at
+ * least three instances (Slack turns a two-party open into a 1:1 IM).
  *
  * Token values are never printed.
  */
+import fs from 'fs';
 import path from 'path';
-import { fileURLToPath } from 'url';
 
 import { readEnvFile } from '../src/env.js';
 
 const SLACK_API = 'https://slack.com/api';
 
-const USAGE = 'Usage: pnpm exec tsx scripts/open-a2a-room.ts --instances <name,name…> [--user <slack user id>]';
-
-export interface SlackAuth {
+interface SlackAuth {
   name: string;
   envKey: string;
   token: string;
@@ -56,7 +42,7 @@ function fail(msg: string): never {
   process.exit(1);
 }
 
-export function parseArgs(argv: string[]): { instances: string[]; user?: string } {
+function parseArgs(argv: string[]): { instances: string[]; user?: string } {
   let instances: string[] = [];
   let user: string | undefined;
   for (let i = 0; i < argv.length; i++) {
@@ -68,7 +54,9 @@ export function parseArgs(argv: string[]): { instances: string[]; user?: string 
     } else if (argv[i] === '--user') {
       user = argv[++i];
     } else {
-      fail(`unknown argument: ${argv[i]}\n${USAGE}`);
+      fail(
+        `unknown argument: ${argv[i]}\nUsage: pnpm exec tsx scripts/open-a2a-room.ts --instances <name,name…> [--user <slack user id>]`,
+      );
     }
   }
   if (instances.length < 2) fail('--instances needs at least two comma-separated instance names');
@@ -83,38 +71,9 @@ export function parseArgs(argv: string[]): { instances: string[]; user?: string 
   return { instances, user };
 }
 
-/**
- * Strip the optional `slack-` prefix so an operator can paste either the
- * channelType (`slack-example-labs-codex`) or the bare suffix
- * (`example-labs-codex`). Exported for the convention test.
- */
-export function normalizeInstance(name: string): string {
-  // Lowercased first: the adapter derives its channelType from a lowercased
-  // suffix, so anything that keeps the operator's capitalization here would
-  // produce a channelType no registration ever used.
-  const trimmed = name.trim().toLowerCase();
-  if (trimmed === 'slack' || trimmed === 'default') return '';
-  return trimmed.startsWith('slack-') ? trimmed.slice('slack-'.length) : trimmed;
-}
-
-/**
- * The `.env` key holding this instance's bot token.
- *
- * Mirrors the suffix regex inside `parseSlackWorkspaces` (src/channels/slack.ts)
- * in reverse: the adapter lowercases the suffix and maps `_` → `-` to derive a
- * channelType, so this uppercases and maps `-` → `_` to get back to the key.
- * `scripts/open-a2a-room.test.ts` pins the round trip against the real parser.
- */
-export function tokenEnvKey(name: string): string {
-  const suffix = normalizeInstance(name);
-  if (suffix === '') return 'SLACK_BOT_TOKEN';
-  return `SLACK_BOT_TOKEN_${suffix.toUpperCase().replace(/-/g, '_')}`;
-}
-
-/** The channelType the adapter registers for this instance. */
-export function channelTypeForInstance(name: string): string {
-  const suffix = normalizeInstance(name);
-  return suffix === '' ? 'slack' : `slack-${suffix}`;
+function tokenEnvKey(name: string): string {
+  if (name === 'default') return 'SLACK_BOT_TOKEN';
+  return `SLACK_BOT_TOKEN_${name.toUpperCase().replace(/-/g, '_')}`;
 }
 
 async function slackCall(
@@ -132,12 +91,7 @@ async function slackCall(
   });
   const json = (await res.json()) as Record<string, unknown>;
   if (json.ok !== true) {
-    const err = String(json.error ?? `HTTP ${res.status}`);
-    const hint =
-      err === 'missing_scope' && method === 'conversations.open'
-        ? ' — the app needs the mpim:write scope, then a reinstall to mint a new xoxb- token'
-        : '';
-    throw new Error(`${method} failed: ${err}${hint}`);
+    throw new Error(`${method} failed: ${String(json.error ?? `HTTP ${res.status}`)}`);
   }
   return json;
 }
@@ -146,7 +100,7 @@ async function resolveAuth(name: string): Promise<SlackAuth> {
   const envKey = tokenEnvKey(name);
   const env = readEnvFile([envKey]);
   const token = env[envKey];
-  if (!token) fail(`missing ${envKey} in .env (the adapter's suffix-token convention)`);
+  if (!token) fail(`missing ${envKey} in .env (slack-multi-instance token convention)`);
   const auth = await slackCall(token, 'auth.test', {});
   const userId = typeof auth.user_id === 'string' ? auth.user_id : null;
   if (!userId) fail(`auth.test for instance "${name}" returned no user_id`);
@@ -157,6 +111,35 @@ async function resolveAuth(name: string): Promise<SlackAuth> {
     userId,
     botId: typeof auth.bot_id === 'string' ? auth.bot_id : null,
   };
+}
+
+/** Append the room to SLACK_A2A_ROOMS in .env (create the key if absent,
+ * no-op if the id is already listed). */
+function appendRoomToEnv(roomId: string): 'appended' | 'already-present' | 'created' {
+  const envPath = path.join(process.cwd(), '.env');
+  let content = '';
+  try {
+    content = fs.readFileSync(envPath, 'utf-8');
+  } catch {
+    // no .env — create one with just this key
+  }
+  const lines = content.split('\n');
+  const idx = lines.findIndex((l) => l.trim().startsWith('SLACK_A2A_ROOMS='));
+  if (idx === -1) {
+    const suffix = content.length > 0 && !content.endsWith('\n') ? '\n' : '';
+    fs.writeFileSync(envPath, `${content}${suffix}SLACK_A2A_ROOMS=${roomId}\n`);
+    return 'created';
+  }
+  const existing = lines[idx].slice(lines[idx].indexOf('=') + 1).trim();
+  const rooms = existing
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+  if (rooms.includes(roomId)) return 'already-present';
+  rooms.push(roomId);
+  lines[idx] = `SLACK_A2A_ROOMS=${rooms.join(',')}`;
+  fs.writeFileSync(envPath, lines.join('\n'));
+  return 'appended';
 }
 
 async function main(): Promise<void> {
@@ -170,7 +153,7 @@ async function main(): Promise<void> {
     auths.push(auth);
   }
 
-  const caller = auths[0]!;
+  const caller = auths[0];
   const otherBotUserIds = auths.slice(1).map((a) => a.userId);
   const members = [...(user ? [user] : []), ...otherBotUserIds];
 
@@ -190,34 +173,31 @@ async function main(): Promise<void> {
   const botMentions = otherBotUserIds.map((id) => `<@${id}>`).join(' ');
   const introText =
     `:robot_face: Agent-to-agent room opened by "${caller.name}". ` +
-    `${botMentions}${user ? ` <@${user}>` : ''} — the agents in this room can hear each other. ` +
-    `Conversation is mention-driven: @-mention an agent to get its reply, and it can @-mention the next one. ` +
-    `After too many consecutive agent-to-agent turns the thread pauses until a human speaks.`;
+    `${botMentions}${user ? ` <@${user}>` : ''} — bots in this room can hear each other. ` +
+    `Conversation is mention-driven: @-mention a bot to get its reply, and it can @-mention the next one. ` +
+    `After too many consecutive bot messages the room pauses until a human speaks.`;
   await slackCall(caller.token, 'chat.postMessage', {
     channel: channelId,
     text: introText,
   });
 
+  const envResult = appendRoomToEnv(channelId);
   console.log('');
   console.log(`A2A room channel id: ${channelId}`);
-  console.log('No .env change is needed — this fork admits sibling-bot messages everywhere.');
+  console.log(
+    envResult === 'already-present'
+      ? 'SLACK_A2A_ROOMS already lists this room — .env unchanged.'
+      : `SLACK_A2A_ROOMS ${envResult === 'created' ? 'created' : 'updated'} in .env — the bridge filter picks it up within ~30s (no restart needed).`,
+  );
   console.log('');
-  console.log('Next steps (once per room, per participating agent):');
-  console.log('  1. @-mention one bot in the room so the host auto-creates the messaging group.');
-  console.log('  2. Confirm the row and wire the other agents to it:');
-  for (const auth of auths) {
-    console.log(`       ncl messaging-groups list --channel-type ${channelTypeForInstance(auth.name)} --json`);
-  }
-  console.log('       ncl wirings create --messaging-group-id <id> --agent-group-id <agent group id> \\');
-  console.log('         --session-mode per-thread --ignored-message-policy accumulate');
-  console.log('     Both flags are load-bearing: ncl wirings create falls back to shared/drop, while');
-  console.log('     the router stamps per-thread/accumulate on the wirings it creates by itself.');
-  console.log('  3. Each agent needs a wiring on ITS OWN instance row — one room, one row per bot.');
+  console.log('Next steps (once per room):');
+  console.log(`  - Mention a bot in the room once so the host auto-creates the messaging group,`);
+  console.log(`    then allow bot senders through the access gate, e.g.:`);
+  console.log(
+    `      pnpm exec tsx scripts/q.ts data/v2.db "UPDATE messaging_groups SET unknown_sender_policy='public' WHERE platform_id='slack:${channelId}'"`,
+  );
+  console.log(`    (or approve / add the slack:bot:<bot_id> users as members instead of going public).`);
+  console.log(`  - Wire the room to each bot's agent group (ncl messaging-groups / wirings) if not auto-wired.`);
 }
 
-const invokedDirectly =
-  process.argv[1] !== undefined && path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url));
-
-if (invokedDirectly) {
-  main().catch((err) => fail(err instanceof Error ? err.message : String(err)));
-}
+main().catch((err) => fail(err instanceof Error ? err.message : String(err)));
