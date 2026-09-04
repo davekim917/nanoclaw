@@ -47,6 +47,8 @@ import {
   readWorkContinuation,
   restoreWorkContinuationResumeAttempt,
   _settleDetachedWakesForTesting,
+  _detachedWakeCountForTesting,
+  _resetDetachedWakesForTesting,
 } from './index.js';
 // Importing the module registers S6/S7/S8/S9a/S9b/S15/S10 as a duty source —
 // needed so the registry lookups below and `_sweepSessionForTesting` (F-13.2,
@@ -1018,6 +1020,10 @@ function saveContinuation(outDb: Database.Database, record: Record<string, unkno
 }
 
 beforeEach(() => {
+  // Keyed by session id, and every case here uses 'sess-test' — an entry left
+  // behind would suppress the next case's wake (#359 dedupe) and the case would
+  // pass for the wrong reason.
+  _resetDetachedWakesForTesting();
   armSelfHeal(false);
   mockKillContainer.mockReset();
   mockWakeContainer.mockReset().mockResolvedValue(true);
@@ -1553,6 +1559,61 @@ describe('registered S6/S7/S8/S9a/S9b/S15/S10 entries reach their bodies', () =>
 
     releaseWake(true);
     await _settleDetachedWakesForTesting();
+  });
+
+  it('a stalled wake gets ONE follow-up however many ticks pass over it (#359)', async () => {
+    const s9b = duty(SWEEP_DUTY_INVENTORY.S9b);
+    const { mailbox } = makeSessionDbs();
+
+    // One spawn, queued behind others on the projection worker, unresolved for
+    // the whole case — production's 20-47 s, which is tens of ticks.
+    let releaseWake: (woke: boolean) => void = () => undefined;
+    const spawn = new Promise<boolean>((resolve) => {
+      releaseWake = resolve;
+    });
+    mockWakeContainer.mockImplementation(() => spawn);
+
+    const plan = emptyPlan({ dueCount: 1, wakePriority: 'scheduled' });
+    await s9b.run(sessionCtx(mailbox, plan));
+    expect(_detachedWakeCountForTesting()).toBe(1);
+
+    // Ticks two and three see the same session with the same due row. Each one
+    // used to wrap the SAME deduped promise in a fresh `.then()`, retaining a
+    // context and a snapshot per tick.
+    await s9b.run(sessionCtx(mailbox, plan));
+    await s9b.run(sessionCtx(mailbox, plan));
+
+    expect(_detachedWakeCountForTesting(), 'a follow-up accumulated per tick').toBe(1);
+    // …and the later ticks did not ask for a second spawn either.
+    expect(mockWakeContainer).toHaveBeenCalledTimes(1);
+
+    releaseWake(true);
+    await _settleDetachedWakesForTesting();
+    expect(_detachedWakeCountForTesting(), 'the entry did not clear when the wake settled').toBe(0);
+  });
+
+  it('a spawn this duty did not start also suppresses a second wake (#359)', async () => {
+    const s9b = duty(SWEEP_DUTY_INVENTORY.S9b);
+    const { mailbox } = makeSessionDbs();
+    // Router ingress or agent-route got there first: the container is spawning,
+    // so there is nothing for this duty to add.
+    mockIsContainerSpawning.mockReturnValue(true);
+
+    let woke: boolean | undefined;
+    const plan = emptyPlan({ dueCount: 1, wakePriority: 'scheduled' });
+    await s9b.run(
+      sessionCtx(mailbox, plan, {
+        reportWoke: (v: boolean) => {
+          woke = v;
+        },
+      } as Partial<SweepSessionContext>),
+    );
+
+    expect(mockWakeContainer).not.toHaveBeenCalled();
+    expect(_detachedWakeCountForTesting()).toBe(0);
+    // Still justWoke, so the observe read and the quiet mark stay closed for a
+    // container that is coming up.
+    expect(woke).toBe(true);
   });
 
   it('the deferred attempt restore runs when the detached wake resolves false (#359)', async () => {

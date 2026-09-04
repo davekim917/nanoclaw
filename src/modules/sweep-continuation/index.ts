@@ -36,6 +36,7 @@ import { SELF_HEAL_ENABLED } from '../../config.js';
 import {
   getContainerSpawnedAt,
   isContainerRunning,
+  isContainerSpawning,
   sessionStillActive,
   wakeContainer,
   containerOwnsOutbound,
@@ -475,7 +476,7 @@ export function _notifyKillCeilingForTesting(
  * Entries remove themselves, so this set is empty whenever nothing is in
  * flight and it cannot grow without bound.
  */
-const detachedWakes = new Set<Promise<void>>();
+const detachedWakes = new Map<string, Promise<void>>();
 
 function trackDetachedWake(work: Promise<void>, sessionId: string): void {
   const tracked = work
@@ -487,14 +488,33 @@ function trackDetachedWake(work: Promise<void>, sessionId: string): void {
       log.warn('Detached container wake follow-up failed', { sessionId, err });
     })
     .finally(() => {
-      detachedWakes.delete(tracked);
+      // Only if it is still OURS. Keyed by session, so a later tick that
+      // legitimately started a new wake must not have its entry deleted by an
+      // older one settling.
+      if (detachedWakes.get(sessionId) === tracked) detachedWakes.delete(sessionId);
     });
-  detachedWakes.add(tracked);
+  detachedWakes.set(sessionId, tracked);
+}
+
+/**
+ * Test-only: forget every tracked follow-up.
+ *
+ * The map is keyed by session id and every suite here reuses one — so a case
+ * that leaves an entry behind would silently suppress the NEXT case's wake,
+ * which is the dedupe working and the test lying. Called from `beforeEach`.
+ */
+export function _resetDetachedWakesForTesting(): void {
+  detachedWakes.clear();
+}
+
+/** Test-only: how many detached follow-ups are in flight (#359 dedupe). */
+export function _detachedWakeCountForTesting(): number {
+  return detachedWakes.size;
 }
 
 /** Test-only: settle every wake S9b has started but not yet finished with. */
 export function _settleDetachedWakesForTesting(): Promise<void> {
-  return Promise.all([...detachedWakes]).then(() => undefined);
+  return Promise.all([...detachedWakes.values()]).then(() => undefined);
 }
 
 export function registerContinuationSweepDuties(): void {
@@ -593,6 +613,24 @@ export function registerContinuationSweepDuties(): void {
     run: async (ctx) => {
       const c = asSessionContext(ctx);
       const { session, plan } = c;
+      // A spawn for this session is already in flight (#359). `wakeContainer`
+      // dedupes by session, so calling it again returns the SAME promise —
+      // and wrapping that promise in a fresh `.then()` every tick is what made
+      // the follow-ups accumulate: one closure per tick, each retaining this
+      // context and its snapshot, for as long as the spawn is queued behind
+      // another on the projection worker. That can be tens of ticks.
+      //
+      // So: at most ONE follow-up per session. Checked BEFORE the attempt
+      // increment, not after — the in-flight wake already claimed an attempt,
+      // and consuming a second here would spend the budget twice for one spawn.
+      // `isContainerSpawning` covers the spawns this duty did not start
+      // (router ingress, agent-route), which need the same restraint.
+      if (detachedWakes.has(session.id) || isContainerSpawning(session.id)) {
+        // Same reasoning as the `reportWoke(true)` below: a container that is
+        // starting must not be observed and must not take a quiet mark.
+        c.reportWoke(true);
+        return;
+      }
       // Both of these open a mailbox of their own, so both go through the
       // window — an unopenable mailbox here is 'Host sweep mailbox unopenable'
       // with window 'session:wake', not the helper's legacy warning, and it

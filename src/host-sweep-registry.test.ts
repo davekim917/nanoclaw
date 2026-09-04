@@ -321,7 +321,7 @@ import './modules/sweep-continuation/index.js';
 // …and the settle point for the wake it now starts DETACHED (#359): the
 // attempt restore hangs off the spawn's promise, so a case that counts opens
 // or reads continuation state has to wait for it explicitly.
-import { _settleDetachedWakesForTesting } from './modules/sweep-continuation/index.js';
+import { _resetDetachedWakesForTesting, _settleDetachedWakesForTesting } from './modules/sweep-continuation/index.js';
 // Registers the scheduling family's duty source (S2-PR11: T8, S5, S18, S19) —
 // without it R-7's inventory is four registrations short and R-10's W2 branch
 // has nothing to make a session due.
@@ -456,6 +456,10 @@ function probeDuty(
 
 describe('sweep duty registry (S2-PR2)', () => {
   beforeEach(() => {
+    // S9b keeps at most one detached follow-up per session (#359). Cases here
+    // reuse session ids, so an entry left in flight by one would suppress the
+    // next one's wake and the case would pass for the wrong reason.
+    _resetDetachedWakesForTesting();
     resetAgentMailboxForTesting();
     registerAgentMailbox(() => fakeStore);
     h.selfHeal = false;
