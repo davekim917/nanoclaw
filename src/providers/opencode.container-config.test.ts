@@ -234,6 +234,64 @@ describe('opencode provider container-config reconciliation', () => {
     }
   });
 
+  it('forwards model capability declarations only when the host env sets them', () => {
+    const fn = getProviderContainerConfig('opencode')!;
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'nc-opencode-caps-'));
+    const ctx = makeCtx(root);
+    writeGlobalSources(ctx.hostEnv.HOME!);
+
+    try {
+      // Default: a group that declares nothing gets exactly the env it got before.
+      const bare = fn(ctx);
+      expect(bare.env?.OPENCODE_MODEL_CONTEXT_LIMIT).toBeUndefined();
+      expect(bare.env?.OPENCODE_MODEL_OUTPUT_LIMIT).toBeUndefined();
+      expect(bare.env?.OPENCODE_MODEL_INPUT_MODALITIES).toBeUndefined();
+
+      const declared = fn(
+        makeCtx(root, {
+          hostEnv: {
+            HOME: ctx.hostEnv.HOME,
+            OPENCODE_MODEL_CONTEXT_LIMIT: '128000',
+            OPENCODE_MODEL_OUTPUT_LIMIT: '8192',
+            OPENCODE_MODEL_INPUT_MODALITIES: 'image,pdf',
+          } as NodeJS.ProcessEnv,
+        }),
+      );
+      expect(declared.env?.OPENCODE_MODEL_CONTEXT_LIMIT).toBe('128000');
+      expect(declared.env?.OPENCODE_MODEL_OUTPUT_LIMIT).toBe('8192');
+      expect(declared.env?.OPENCODE_MODEL_INPUT_MODALITIES).toBe('image,pdf');
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('prefers the folder-scoped capability var over the bare one, and drops blanks', () => {
+    const fn = getProviderContainerConfig('opencode')!;
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'nc-opencode-caps-scoped-'));
+    const base = makeCtx(root);
+    writeGlobalSources(base.hostEnv.HOME!);
+
+    try {
+      // agentGroupFolder is 'example-opencode' -> EXAMPLE_OPENCODE.
+      const contribution = fn(
+        makeCtx(root, {
+          hostEnv: {
+            HOME: base.hostEnv.HOME,
+            OPENCODE_MODEL_CONTEXT_LIMIT: '64000',
+            OPENCODE_MODEL_CONTEXT_LIMIT_EXAMPLE_OPENCODE: '256000',
+            OPENCODE_MODEL_OUTPUT_LIMIT: '   ',
+          } as NodeJS.ProcessEnv,
+        }),
+      );
+      expect(contribution.env?.OPENCODE_MODEL_CONTEXT_LIMIT).toBe('256000');
+      // A blank value is not a declaration — it must not reach the container as
+      // one, since the container side treats blank as invalid anyway.
+      expect(contribution.env?.OPENCODE_MODEL_OUTPUT_LIMIT).toBeUndefined();
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it('keeps OneCLI active when auth is absent', () => {
     const fn = getProviderContainerConfig('opencode')!;
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'nc-opencode-no-auth-'));

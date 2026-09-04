@@ -12,8 +12,10 @@
  *   to `~/.config/opencode`, so a scoped definition does not need scoped auth.
  *
  * Env passthrough covers the runtime-read OPENCODE_* selector vars (provider/
- * model). NO_PROXY / no_proxy are merged so OpenCode's internal client can
- * still reach 127.0.0.1 when HTTPS_PROXY is set by OneCLI.
+ * model) plus the optional per-group model capability declarations
+ * (OPENCODE_MODEL_CAPABILITY_VARS). NO_PROXY / no_proxy are merged so
+ * OpenCode's internal client can still reach 127.0.0.1 when HTTPS_PROXY is set
+ * by OneCLI.
  */
 import fs from 'fs';
 import os from 'os';
@@ -51,6 +53,50 @@ export function copyOpenCodeSkills(source: string, target: string): void {
     },
   });
 }
+
+/**
+ * Per-group env passthrough, following the install-wide scoped-env convention:
+ * `<VAR>_<FOLDER>` (folder upper-cased, `-` → `_`) wins over the bare `<VAR>`.
+ * Mirrors container-runner's `resolveScopedEnv`, read off the spawn context's
+ * env rather than `process.env` so a caller can supply its own.
+ *
+ * This is NOT the `.env` selector-var pattern removed above. Provider and model
+ * are DB-authoritative (`container_configs`), so an env copy of those would be a
+ * second source of truth. The model-capability declarations below have no DB
+ * column at all — `.env` is their only channel, and an unset var leaves
+ * OpenCode's own behavior untouched.
+ */
+export function resolveScopedOpenCodeEnv(
+  hostEnv: NodeJS.ProcessEnv,
+  baseName: string,
+  folder: string | undefined,
+): string | undefined {
+  if (folder) {
+    const scoped = hostEnv[`${baseName}_${folder.toUpperCase().replace(/-/g, '_')}`];
+    if (scoped !== undefined) return scoped;
+  }
+  return hostEnv[baseName];
+}
+
+/**
+ * Model capability declarations the container provider reads at startup.
+ *
+ * `OPENCODE_MODEL_CONTEXT_LIMIT` + `OPENCODE_MODEL_OUTPUT_LIMIT` re-enable
+ * auto-compaction for a model OpenCode's registry does not know: an undeclared
+ * model resolves its context limit to 0, which silently disables compaction and
+ * kills long sessions against a fixed-window backend. opencode requires both
+ * halves, so a half-set pair is dropped by the container side.
+ *
+ * `OPENCODE_MODEL_INPUT_MODALITIES` (comma-separated: image, pdf, audio, video)
+ * opens the gate that lets non-text file parts reach an undeclared model at all.
+ *
+ * All three are inert when unset, which is the default for every group.
+ */
+const OPENCODE_MODEL_CAPABILITY_VARS = [
+  'OPENCODE_MODEL_CONTEXT_LIMIT',
+  'OPENCODE_MODEL_OUTPUT_LIMIT',
+  'OPENCODE_MODEL_INPUT_MODALITIES',
+] as const;
 
 function mergeNoProxy(current: string | undefined, additions: string): string {
   if (!current?.trim()) return additions;
@@ -197,6 +243,14 @@ registerProviderContainerConfig('opencode', (ctx) => {
   env.OPENCODE_PROVIDER = modelProvider;
 
   env.OPENCODE_EFFORT = dbConfig?.effort ?? DEFAULT_OPENCODE_EFFORT;
+
+  // Model capability declarations — see OPENCODE_MODEL_CAPABILITY_VARS. Only
+  // forwarded when actually set, so a group that declares nothing gets exactly
+  // the env it got before.
+  for (const varName of OPENCODE_MODEL_CAPABILITY_VARS) {
+    const value = resolveScopedOpenCodeEnv(ctx.hostEnv, varName, ctx.agentGroupFolder);
+    if (value !== undefined && value.trim() !== '') env[varName] = value;
+  }
   // Endpoint routing is determined by the cred-key in auth.json + the model
   // slug prefix (opencode-go/* → /zen/go/v1, opencode/* → /zen/v1, nvidia/*
   // → NVIDIA, etc.). We do NOT pass OPENCODE_BASE_URL — OpenCode's provider

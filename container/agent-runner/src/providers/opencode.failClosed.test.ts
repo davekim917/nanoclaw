@@ -6,6 +6,7 @@ import {
   _setOpenCodeAuthProvidersForTesting,
   buildOpenCodeConfig,
   buildOpencodeServerEnv,
+  OPENCODE_PERMISSIONS,
   parseOpenCodeAuthProviders,
   runtimeConfigKey,
   shouldBypassOpenCodeProxy,
@@ -59,8 +60,64 @@ describe('buildOpenCodeConfig — fail-closed guard (F1)', () => {
     const cfg = buildOpenCodeConfig({}, {}) as { plugin?: unknown; permission?: unknown };
     expect(cfg.plugin).toEqual([MANAGED_GIT_GUARD_PLUGIN, GUARD_PLUGIN]);
     // Sanity: the auto-approve setting the guard is protecting against is present,
-    // so the guard's presence is load-bearing, not cosmetic.
-    expect(cfg.permission).toBe('allow');
+    // so the guard's presence is load-bearing, not cosmetic. The permission map
+    // replaced the old `'allow'` string shorthand; every executing category is
+    // still `allow`, so the guard is exactly as load-bearing as it was.
+    expect(cfg.permission).toEqual(OPENCODE_PERMISSIONS);
+    for (const [category, action] of Object.entries(OPENCODE_PERMISSIONS)) {
+      if (category === 'question') continue;
+      expect(action).toBe('allow');
+    }
+  });
+
+  it('test_oc_provider_denies_question_only: `question` is the ONLY denied category', () => {
+    stubGuardPresent(true);
+    const cfg = buildOpenCodeConfig({}, {}) as { permission?: Record<string, string> };
+    const denied = Object.entries(cfg.permission ?? {})
+      .filter(([, action]) => action !== 'allow')
+      .map(([category]) => category);
+    expect(denied).toEqual(['question']);
+    expect(cfg.permission?.question).toBe('deny');
+    // The tool-executing categories the destructive-action guard classifies are
+    // still allowed at the OpenCode layer, so denials continue to route through
+    // the guard plugin's `tool.execute.before` throw rather than through
+    // OpenCode's own permission prompt.
+    expect(cfg.permission?.bash).toBe('allow');
+    expect(cfg.permission?.edit).toBe('allow');
+    expect(cfg.permission?.task).toBe('allow');
+    expect(cfg.permission?.external_directory).toBe('allow');
+  });
+
+  it('test_oc_provider_permission_keys_known_to_opencode: declares only 1.18.x permission categories', () => {
+    // Ground truth is opencode 1.18.x's own built-in documentation:
+    // "Known permission keys: read, edit, glob, grep, list, bash, task,
+    //  external_directory, todowrite, question, webfetch, websearch, lsp,
+    //  doom_loop, skill". Verified live against opencode 1.18.18: an UNKNOWN
+    //  permission key is tolerated (a config carrying `codesearch` loads fine),
+    //  so upstream's extra key is inert here rather than dangerous — but an
+    //  invalid ACTION is rejected outright ("Expected PermissionActionConfig,
+    //  got \"maybe\"") and takes the whole spawn down, guard included. So the
+    //  list is kept to keys with documented meaning in this version: declaring
+    //  one OpenCode does not know buys nothing and pre-commits us to whatever
+    //  semantics a later version gives it.
+    const known = [
+      'read',
+      'edit',
+      'glob',
+      'grep',
+      'list',
+      'bash',
+      'task',
+      'external_directory',
+      'todowrite',
+      'question',
+      'webfetch',
+      'websearch',
+      'lsp',
+      'doom_loop',
+      'skill',
+    ];
+    expect(Object.keys(OPENCODE_PERMISSIONS).sort()).toEqual([...known].sort());
   });
 
   it('test_oc_provider_allow_unguarded_optout: OPENCODE_ALLOW_UNGUARDED=1 permits an unguarded spawn (explicit opt-out)', () => {
@@ -70,25 +127,25 @@ describe('buildOpenCodeConfig — fail-closed guard (F1)', () => {
     expect(() => buildOpenCodeConfig({}, {})).not.toThrow();
   });
 
-  it('negative: no returned config sets permission:"allow" WITHOUT the guard plugin', () => {
+  it('negative: no returned config auto-approves tool calls WITHOUT the guard plugin', () => {
     // Sweep both reachable build paths (guard present, and opt-out + absent) and
-    // assert the invariant: any config with permission:'allow' must carry the
-    // guard plugin. The only way to get permission:'allow' with no plugin would
-    // be a regression that re-introduced a conditional mount.
+    // assert the invariant: any config that allows the executing categories must
+    // carry the guard plugin. The only way to get auto-approve with no plugin
+    // would be a regression that re-introduced a conditional mount.
     stubGuardPresent(true);
-    const guarded = buildOpenCodeConfig({}, {}) as { plugin?: unknown; permission?: unknown };
-    expect(guarded.permission).toBe('allow');
+    const guarded = buildOpenCodeConfig({}, {}) as { plugin?: unknown; permission?: Record<string, string> };
+    expect(guarded.permission?.bash).toBe('allow');
     expect(guarded.plugin).toEqual([MANAGED_GIT_GUARD_PLUGIN, GUARD_PLUGIN]);
 
     // Reset and exercise the opt-out path.
     for (const s of spies.splice(0)) s.mockRestore();
     stubGuardPresent(false);
     process.env.OPENCODE_ALLOW_UNGUARDED = '1';
-    const optout = buildOpenCodeConfig({}, {}) as { plugin?: unknown; permission?: unknown };
+    const optout = buildOpenCodeConfig({}, {}) as { plugin?: unknown; permission?: Record<string, string> };
     // Even on the opt-out path the plugin key is unconditionally present (opencode
     // harmlessly ignores a missing plugin path — verified on opencode@1.15.7), so
-    // there is no permission:'allow'-without-plugin config anywhere.
-    expect(optout.permission).toBe('allow');
+    // there is no auto-approve-without-plugin config anywhere.
+    expect(optout.permission?.bash).toBe('allow');
     expect(optout.plugin).toEqual([MANAGED_GIT_GUARD_PLUGIN, GUARD_PLUGIN]);
   });
 
@@ -371,7 +428,7 @@ describe('buildOpenCodeConfig + buildOpencodeServerEnv — combined spawn (F3)',
       model?: unknown;
     };
     expect(cfg.plugin).toEqual([MANAGED_GIT_GUARD_PLUGIN, GUARD_PLUGIN]);
-    expect(cfg.permission).toBe('allow');
+    expect(cfg.permission).toEqual(OPENCODE_PERMISSIONS);
     expect(cfg.model).toBe('anthropic/claude-opus-4-8');
     expect(cfg.mcp?.nanoclaw).toBeDefined();
 

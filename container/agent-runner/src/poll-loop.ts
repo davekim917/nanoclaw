@@ -60,6 +60,7 @@ import {
 import { clearBatchAnchors, getBatchAnchor, setCurrentBatchAnchors } from './current-batch.js';
 import {
   formatMessages,
+  extractAttachments,
   extractRouting,
   categorizeMessage,
   isClearCommand,
@@ -68,7 +69,13 @@ import {
   type RoutingContext,
 } from './formatter.js';
 import { isUploadTraceCommand, uploadTrace } from './upload-trace.js';
-import type { AgentProvider, AgentQuery, ProviderEvent, ProviderExchange } from './providers/types.js';
+import type {
+  AgentProvider,
+  AgentQuery,
+  ProviderEvent,
+  ProviderExchange,
+  PromptAttachment,
+} from './providers/types.js';
 import { autoCommitDirtyWorktrees, type AutoSaveResult } from './worktree-autosave.js';
 import { buildSessionRecap, wrapRecap } from './session-recap.js';
 import { ensureFreshContextBootstrap } from './memory/bootstrap.js';
@@ -671,8 +678,14 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     // never rotate again. (Incident 2026-06-25.)
     config.provider.resetRotationCycle?.();
 
+    // Structured view of the same attachments `formatMessages` already
+    // described inline, for a provider whose SDK takes real file parts. Every
+    // retry below replays this batch, so it carries the same media.
+    const batchAttachments = extractAttachments(keep);
+
     const query = config.provider.query({
       prompt,
+      attachments: batchAttachments,
       continuation,
       cwd: config.cwd,
       model: effectiveModel,
@@ -775,6 +788,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
           try {
             const retryQuery = config.provider.query({
               prompt,
+              attachments: batchAttachments,
               continuation,
               cwd: config.cwd,
               systemContext: config.systemContext,
@@ -848,6 +862,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
           try {
             const retryQuery = config.provider.query({
               prompt,
+              attachments: batchAttachments,
               continuation,
               cwd: config.cwd,
               systemContext: config.systemContext,
@@ -921,6 +936,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
         try {
           const retryQuery = config.provider.query({
             prompt,
+            attachments: batchAttachments,
             continuation,
             cwd: config.cwd,
             systemContext: config.systemContext,
@@ -991,6 +1007,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
           freshContextBootstrapRequired = false;
           const retryQuery = config.provider.query({
             prompt: retryPrompt,
+            attachments: batchAttachments,
             continuation: undefined,
             cwd: config.cwd,
             systemContext: config.systemContext,
@@ -1048,6 +1065,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
           freshContextBootstrapRequired = false;
           const retryQuery = config.provider.query({
             prompt: retryPrompt,
+            attachments: batchAttachments,
             continuation: undefined,
             cwd: config.cwd,
             systemContext: config.systemContext,
@@ -1108,6 +1126,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
           freshContextBootstrapRequired = false;
           const retryQuery = config.provider.query({
             prompt: retryPrompt,
+            attachments: batchAttachments,
             continuation: undefined,
             cwd: config.cwd,
             systemContext: config.systemContext,
@@ -1465,7 +1484,7 @@ export async function processQuery(
   // real push (initial batch, in-turn follow-up, durable continuation
   // launch) restarts the clock for the turn it starts.
   let turnStartedAtMs = Date.now();
-  const pushToQuery = (message: string): void => {
+  const pushToQuery = (message: string, attachments?: PromptAttachment[]): void => {
     turnIdle = false;
     // Same boundary as `turnIdle`, published for the host. A pushed turn runs
     // with no processing claim of its own (the initial batch was completed at
@@ -1473,7 +1492,7 @@ export async function processQuery(
     // and the idle reaper.
     setProviderTurnExecuting(true);
     turnStartedAtMs = Date.now();
-    query.push(message);
+    query.push(message, attachments);
   };
 
   const pauseAnsweredPrompt = (): void => {
@@ -1704,7 +1723,7 @@ export async function processQuery(
         log(`Pushing ${keep.length} follow-up message(s) into active query`);
         unwrappedNudged = false;
         taskBlockNudged = false;
-        pushToQuery(prompt);
+        pushToQuery(prompt, extractAttachments(keep));
         archivePrompts.push({ prompt });
         admittedInbound = true;
         markCompleted(keptIds);
