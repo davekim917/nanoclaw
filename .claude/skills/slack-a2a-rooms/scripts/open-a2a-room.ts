@@ -17,9 +17,12 @@
  * instance is the caller — it opens the conversation and posts the intro. Bot
  * user ids are resolved via `auth.test` per token.
  *
- * Requires the `mpim:write` scope on every listed app. `/add-slack` does not
- * ask for it, so it has to be added and the app reinstalled before this runs
- * (see the skill's prerequisites). Without --user the room holds bots only,
+ * Requires the `mpim:write` scope on the FIRST listed app — it is the one that
+ * calls `conversations.open`. The others are members and need only the
+ * `mpim:read` / `mpim:history` that `/add-slack` already asks for.
+ * `/add-slack` does not ask for `mpim:write`, so it has to be added to the
+ * caller and that app reinstalled before this runs (see the skill's
+ * prerequisites). Without --user the room holds bots only,
  * which needs at least three instances (Slack turns a two-party open into a
  * 1:1 IM).
  *
@@ -206,9 +209,9 @@ async function main(): Promise<void> {
     console.log(`       ncl messaging-groups list --channel-type ${channelTypeForInstance(auth.name)} --json`);
   }
   console.log('       ncl wirings create --messaging-group-id <id> --agent-group-id <agent group id> \\');
-  console.log('         --ignored-message-policy accumulate');
-  console.log('     accumulate is required for a room — ncl falls back to drop, which discards every');
-  console.log('     turn the agent was not mentioned in.');
+  console.log('         --session-mode per-thread --ignored-message-policy accumulate');
+  console.log('     Both flags are load-bearing: ncl wirings create falls back to shared/drop, while');
+  console.log('     the router stamps per-thread/accumulate on the wirings it creates by itself.');
   console.log('  3. Each agent needs a wiring on ITS OWN instance row — one room, one row per bot.');
 }
 

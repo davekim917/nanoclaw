@@ -57,22 +57,38 @@ room or work only in DMs.
 
 ### 2. Create each agent group
 
-From an existing Slack-wired agent, `create_agent` is the sanctioned path: it
-creates the folder under `groups/`, the `agent_groups` row and the
-bidirectional `send_message` grants, behind an owner/admin approval card. The
-agent is reachable by `send_message` as soon as the card is approved.
+From an existing Slack-wired agent, `create_agent` is the path that produces a
+working sibling in one step, behind an owner/admin approval card. It creates
+the folder under `groups/`, the `agent_groups` row, the container config, the
+role text as `standing-instructions.md`, and the `agent_destinations` grants in
+both directions. The agent is reachable by `send_message` as soon as the card
+is approved. Pass each agent's purpose from step 1 as its `instructions`.
 
-From the host, the equivalent is:
+`ncl groups create` is **not** the same thing, despite the name:
 
 ```bash
 ncl groups create --folder <slug> --name "<display name>"
 ```
 
-It is idempotent on `--folder`, so a re-run after a partial setup is safe.
+That provisions the folder and the `container_configs` row and stops there. It
+takes no instructions, so the group boots with no role, and it writes no
+destinations, so no sibling can reach it by `send_message`. Use it only for an
+agent that will be addressed over a channel, or finish the job by hand:
 
-At this point each agent exists and can be messaged by its siblings. It has no
-Slack presence yet — that is the next step, and it is the one an agent cannot
-do for itself.
+```bash
+# the role text create_agent would have staged
+$EDITOR groups/<slug>/standing-instructions.md
+
+# the grants create_agent would have opened, one per direction and per sibling
+ncl destinations add --agent-group-id <new group id> --local-name <sibling name> \
+  --target-type agent --target-id <sibling group id>
+ncl destinations add --agent-group-id <sibling group id> --local-name <new name> \
+  --target-type agent --target-id <new group id>
+```
+
+Either path is idempotent on the folder, so a re-run after a partial setup is
+safe. At this point each agent exists. It has no Slack presence yet — that is
+the next step, and it is the one an agent cannot do for itself.
 
 ### 3. Install one Slack app per agent
 
@@ -121,15 +137,20 @@ Confirm and fill in what is missing:
 
 ```bash
 ncl messaging-groups list --channel-type slack-<suffix> --json
-ncl wirings create --messaging-group-id <id> --agent-group-id <agent group id>
+ncl wirings create --messaging-group-id <id> --agent-group-id <agent group id> \
+  --session-mode per-thread --ignored-message-policy accumulate
 ```
 
 `/manage-channels` does the same conversationally.
 
-For a **room** wiring, add `--ignored-message-policy accumulate`. `ncl wirings
-create` falls back to `drop` when the flag is omitted, and a room agent that
-drops every turn it was not mentioned in arrives at its next mention with no
-idea what the team discussed.
+**Both flags are load-bearing, on DM and room wirings alike.** A wiring the
+router creates by itself is stamped `session_mode: 'per-thread'` and
+`ignored_message_policy: 'accumulate'` (`src/router.ts`), but `ncl wirings
+create` resolves only `engage_mode` from the channel declaration and falls back
+to `shared` and `drop` for these two. So a hand-made wiring silently behaves
+differently from every auto-wired one: every Slack thread collapses into one
+session, and each turn the agent was not addressed in is discarded instead of
+being kept as background context.
 
 ### 6. Open one shared room
 

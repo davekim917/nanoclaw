@@ -37,18 +37,25 @@ conversation to each agent group, which is ordinary `ncl` work.
   identities configured as suffix tokens (`SLACK_BOT_TOKEN_<SUFFIX>` →
   channelType `slack-<suffix>`; the unsuffixed `SLACK_BOT_TOKEN` is the
   primary instance).
-- **The `mpim:write` scope on every participating app.** `/add-slack` asks for
-  `mpim:read` and `mpim:history` (see and read a group DM) but not
-  `mpim:write` (create one), so this almost always has to be added.
+- **The `mpim:write` scope on the app that opens the room.** Only the
+  first-listed instance calls `conversations.open`; the others are members and
+  need nothing beyond the `mpim:read` and `mpim:history` that `/add-slack`
+  already asks for. `mpim:write` is not on that list, so the caller almost
+  always needs it added. Pick one app as the opener and grant it there rather
+  than to the whole set — the scope carries room-creation capability and a
+  reinstall for each app it is added to.
 
 Tell the user:
 
 ```nc:operator
-For each Slack app that will take part in the room:
-1. Go to api.slack.com/apps → your app → OAuth & Permissions.
+For the ONE Slack app that will open rooms (the first name you pass to --instances):
+1. Go to api.slack.com/apps → that app → OAuth & Permissions.
 2. Under Bot Token Scopes add: mpim:write (keep the existing mpim:read and mpim:history).
 3. Reinstall the app to the workspace — this mints a NEW Bot User OAuth Token (xoxb-…).
 4. Replace that app's SLACK_BOT_TOKEN_<SUFFIX> value in .env with the new token.
+
+The other participating apps need no change. If you later want a different app to open
+rooms, repeat these steps for that one.
 ```
 
 A reinstall invalidates the old token, so a bot whose `.env` line is not
@@ -130,14 +137,17 @@ conversation under its own channelType.
    ```bash
    ncl messaging-groups list --channel-type slack-<suffix> --json
    ncl wirings create --messaging-group-id <id> --agent-group-id <agent group id> \
-     --ignored-message-policy accumulate
+     --session-mode per-thread --ignored-message-policy accumulate
    ```
 
-   `--ignored-message-policy accumulate` is not optional for a room.
-   `ncl wirings create` falls back to `drop` when the flag is omitted, which
-   discards every turn the agent was not mentioned in — so an agent pulled in
-   by a later mention would arrive with no idea what the team had been
-   discussing.
+   **Both flags are load-bearing.** A wiring the router creates by itself is
+   stamped `session_mode: 'per-thread'` and `ignored_message_policy:
+'accumulate'` (`src/router.ts`), but `ncl wirings create` resolves only
+   `engage_mode` from the channel declaration and falls back to `shared` and
+   `drop` for these two. Omit them and a hand-made room wiring behaves unlike
+   every auto-wired one: the room's threads collapse into a single session, and
+   every turn the agent was not mentioned in is discarded rather than kept as
+   the ambient context the agents are told to rely on.
 
 3. Repeat step 2 for each other participating agent, using that agent's own
    channelType.
@@ -185,8 +195,9 @@ agents load on demand.
 
 ## Troubleshooting
 
-**`conversations.open failed: missing_scope`.** The calling app has no
-`mpim:write`. Add the scope, reinstall, and update that app's
+**`conversations.open failed: missing_scope`.** The app you listed FIRST has no
+`mpim:write` — that is the one that opens the room, and the only one that needs
+the scope. Add it there, reinstall, and update that app's
 `SLACK_BOT_TOKEN_<SUFFIX>` line — see Requires above.
 
 **`missing SLACK_BOT_TOKEN_X in .env`.** The instance name does not match a
