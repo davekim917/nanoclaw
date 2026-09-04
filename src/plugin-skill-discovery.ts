@@ -582,7 +582,7 @@ function mirrorSkillDir(dstDir: string, srcDir: string): boolean {
     }
   }
 
-  let srcEntries: string[] = [];
+  let srcEntries: string[];
   try {
     srcEntries = fs.readdirSync(srcDir);
   } catch {

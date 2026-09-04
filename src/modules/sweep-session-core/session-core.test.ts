@@ -69,8 +69,11 @@ afterEach(() => {
 // reach. `DATA_DIR` is redirected so nothing here can resolve a real session
 // path even by accident.
 const testDataDir = vi.hoisted(() => {
+  // eslint-disable-next-line @typescript-eslint/no-require-imports -- vi.hoisted() runs before ESM imports are linked, so require() is the only way to get these Node builtins synchronously here
   const nodeFs = require('fs') as typeof import('fs');
+  // eslint-disable-next-line @typescript-eslint/no-require-imports -- vi.hoisted() runs before ESM imports are linked, so require() is the only way to get these Node builtins synchronously here
   const nodeOs = require('os') as typeof import('os');
+  // eslint-disable-next-line @typescript-eslint/no-require-imports -- vi.hoisted() runs before ESM imports are linked, so require() is the only way to get these Node builtins synchronously here
   const nodePath = require('path') as typeof import('path');
   return { dir: nodeFs.mkdtempSync(nodePath.join(nodeOs.tmpdir(), 'sweep-session-core-')) };
 });

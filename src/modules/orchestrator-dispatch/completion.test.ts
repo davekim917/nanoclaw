@@ -1,6 +1,6 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { closeDb, createAgentGroup, createSession, initTestDb, runMigrations } from '../../db/index.js';
+import { closeDb, createAgentGroup, initTestDb, runMigrations } from '../../db/index.js';
 import { getDb } from '../../db/connection.js';
 import { getTaskById, insertTaskAtomic } from './db/tasks.js';
 import type { Task } from './db/tasks.js';

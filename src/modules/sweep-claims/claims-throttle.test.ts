@@ -30,7 +30,6 @@
  * `wiredCandidates` hits an in-memory DB, everything else is fs-only).
  */
 import fs from 'fs';
-import os from 'os';
 import path from 'path';
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -66,8 +65,11 @@ afterEach(() => {
 });
 
 const h = vi.hoisted(() => {
+  // eslint-disable-next-line @typescript-eslint/no-require-imports -- vi.hoisted() runs before ESM imports are linked, so require() is the only way to get these Node builtins synchronously here
   const nodeFs = require('fs') as typeof import('fs');
+  // eslint-disable-next-line @typescript-eslint/no-require-imports -- vi.hoisted() runs before ESM imports are linked, so require() is the only way to get these Node builtins synchronously here
   const nodeOs = require('os') as typeof import('os');
+  // eslint-disable-next-line @typescript-eslint/no-require-imports -- vi.hoisted() runs before ESM imports are linked, so require() is the only way to get these Node builtins synchronously here
   const nodePath = require('path') as typeof import('path');
   return { root: nodeFs.mkdtempSync(nodePath.join(nodeOs.tmpdir(), 'claims-throttle-')) };
 });
@@ -92,7 +94,7 @@ vi.mock('../../config.js', async (importOriginal) => {
 // Registers T20/T21 into host-sweep.ts's live registry, same as claims.test.ts.
 import './index.js';
 import { _listSweepRegistrationsForTesting, type SweepTickContext } from '../../host-sweep.js';
-import { closeDb, getDb, initTestDb } from '../../db/connection.js';
+import { closeDb, initTestDb } from '../../db/connection.js';
 import { _resetSelfHealThrottleForTesting, SELF_HEAL_MAX_NUDGES } from '../claims/self-heal.js';
 
 function fakeTickContext(): SweepTickContext {

@@ -9,7 +9,6 @@
  * registry-level exclusivity or the CodexItem-specific widening in isolation.
  */
 import fs from 'fs';
-import os from 'os';
 import path from 'path';
 
 import Database from 'better-sqlite3';
@@ -95,8 +94,11 @@ afterEach(() => {
 
 const selfHeal = vi.hoisted(() => ({ enabled: false }));
 const testDataDir = vi.hoisted(() => {
+  // eslint-disable-next-line @typescript-eslint/no-require-imports -- vi.hoisted() runs before ESM imports are linked, so require() is the only way to get these Node builtins synchronously here
   const nodeFs = require('fs') as typeof import('fs');
+  // eslint-disable-next-line @typescript-eslint/no-require-imports -- vi.hoisted() runs before ESM imports are linked, so require() is the only way to get these Node builtins synchronously here
   const nodeOs = require('os') as typeof import('os');
+  // eslint-disable-next-line @typescript-eslint/no-require-imports -- vi.hoisted() runs before ESM imports are linked, so require() is the only way to get these Node builtins synchronously here
   const nodePath = require('path') as typeof import('path');
   return { dir: nodeFs.mkdtempSync(nodePath.join(nodeOs.tmpdir(), 'sweep-container-health-')) };
 });

@@ -56,8 +56,11 @@ vi.mock('node:child_process', () => childProcessTripwire(spawns));
  * a UTC runner — the same reason `recurrence.test.ts` pins it.
  */
 const roots = vi.hoisted(() => {
+  // eslint-disable-next-line @typescript-eslint/no-require-imports -- vi.hoisted() runs before ESM imports are linked, so require() is the only way to get these Node builtins synchronously here
   const nodeFs = require('fs') as typeof import('fs');
+  // eslint-disable-next-line @typescript-eslint/no-require-imports -- vi.hoisted() runs before ESM imports are linked, so require() is the only way to get these Node builtins synchronously here
   const nodeOs = require('os') as typeof import('os');
+  // eslint-disable-next-line @typescript-eslint/no-require-imports -- vi.hoisted() runs before ESM imports are linked, so require() is the only way to get these Node builtins synchronously here
   const nodePath = require('path') as typeof import('path');
   const dir = nodeFs.mkdtempSync(nodePath.join(nodeOs.tmpdir(), 'sweep-scheduling-'));
   return { dir, groups: nodePath.join(dir, 'groups') };

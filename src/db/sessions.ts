@@ -1,6 +1,5 @@
 import type { PendingApproval, PendingQuestion, Session } from '../types.js';
 import { getDb, hasTable } from './connection.js';
-import { log } from '../log.js';
 
 // ── Sessions ──
 

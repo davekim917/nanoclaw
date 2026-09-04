@@ -66,7 +66,7 @@ import {
 } from '../modules/mailbox/index.js';
 import { hasAdminPrivilege } from '../modules/permissions/db/user-roles.js';
 import { withExistingMailboxSession } from '../session-manager.js';
-import { requiredConfirmations, threadsClose, type ThreadClosePayload } from './thread-close-guard.js';
+import { requiredConfirmations, threadsClose } from './thread-close-guard.js';
 import type { AuthHandler, AuthedRequestContext } from './router.js';
 
 const json = (status: number, body: unknown): Response =>

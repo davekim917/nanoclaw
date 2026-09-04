@@ -11,7 +11,6 @@
  * drives a full sweep tick through the registry) asserts it stayed empty.
  */
 import fs from 'fs';
-import os from 'os';
 import path from 'path';
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -114,8 +113,11 @@ describe('shouldReapIdleTaskContainer and shouldReapIdleChatContainer keep their
 // R-4's pattern) — mocks every seam host-sweep.ts reaches for on this path.
 
 const h = vi.hoisted(() => {
+  // eslint-disable-next-line @typescript-eslint/no-require-imports -- vi.hoisted() runs before ESM imports are linked, so require() is the only way to get these Node builtins synchronously here
   const nodeFs = require('fs') as typeof import('fs');
+  // eslint-disable-next-line @typescript-eslint/no-require-imports -- vi.hoisted() runs before ESM imports are linked, so require() is the only way to get these Node builtins synchronously here
   const nodeOs = require('os') as typeof import('os');
+  // eslint-disable-next-line @typescript-eslint/no-require-imports -- vi.hoisted() runs before ESM imports are linked, so require() is the only way to get these Node builtins synchronously here
   const nodePath = require('path') as typeof import('path');
   return {
     dataDir: nodeFs.mkdtempSync(nodePath.join(nodeOs.tmpdir(), 'sweep-idle-reap-')),
@@ -401,7 +403,7 @@ const fakeStore: AgentMailbox = {
   destroy: async () => undefined,
   runnerContext: async () => ({}),
   runnerEnvironment: async () => ({}),
-  session: async <T>(key: MailboxSessionKey, action: (mailbox: MailboxSession) => T | Promise<T>): Promise<T> =>
+  session: async <T>(_key: MailboxSessionKey, action: (mailbox: MailboxSession) => T | Promise<T>): Promise<T> =>
     action(h.mailbox as unknown as MailboxSession),
 };
 

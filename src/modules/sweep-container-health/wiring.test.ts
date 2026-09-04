@@ -15,7 +15,7 @@
  * discovered empirically by importing the barrel and mocking exactly what it
  * required, no more.
  */
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 const spawns = vi.hoisted(() => [] as string[]);
 function childProcessTripwire(record: string[]): Record<string, (...args: unknown[]) => never> {

@@ -147,13 +147,11 @@ import {
   type ProcessingClaim,
 } from './ops/sweep.js';
 import {
-  canAttemptContinuationRecovery,
   incrementWorkContinuationResumeAttempt,
   migrateLegacyWorkContinuationForRecovery,
   readContinuationRecoveryAttemptAt,
   readWorkContinuation,
   restoreWorkContinuationResumeAttempt,
-  WORK_CONTINUATION_RESUME_MAX_ATTEMPTS,
   type HostWorkContinuation,
 } from './ops/continuation.js';
 import {

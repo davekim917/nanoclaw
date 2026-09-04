@@ -213,7 +213,7 @@ async function restoreStoppedContinuationAttempt(
 
 export function notifyContinuationParked(
   mailbox: NanoclawMailboxSession,
-  session: Session,
+  _session: Session,
   continuation: HostWorkContinuation,
   writeMessage: (message: {
     id: string;

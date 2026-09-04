@@ -1298,7 +1298,6 @@ async function deliverMessage(
       chatThreadAnchorDisabled.set(session.id, msg.in_reply_to as string);
     }
     effectiveThreadId = null;
-    usedAnchor = false;
     platformMsgId = await deliveryAdapter.deliver(
       msg.channel_type,
       msg.platform_id,

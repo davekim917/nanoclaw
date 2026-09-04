@@ -1282,7 +1282,7 @@ describe('the close sequence order', () => {
         if (calls.filter((c) => c === 'clear').length === 1) live.owned = true;
         return true;
       },
-      killContainer: (id, _reason, onExit) => {
+      killContainer: (_id, _reason, onExit) => {
         calls.push('kill');
         live.owned = false; // the process is gone once onExit fires
         onExit?.();

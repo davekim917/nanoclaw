@@ -3,7 +3,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 
-import { discoverCodexAgentTargets, syncCodexAgentsMd, syncCodexLocalMarketplacePluginCache } from './codex-sync.js';
+import { discoverCodexAgentTargets, syncCodexLocalMarketplacePluginCache } from './codex-sync.js';
 
 let tmpDir: string;
 

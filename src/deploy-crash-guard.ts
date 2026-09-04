@@ -84,7 +84,9 @@ function readJson<T>(file: string): T | null {
 function unlinkQuiet(file: string): void {
   try {
     fs.unlinkSync(file);
-  } catch {}
+  } catch {
+    // Best-effort: nothing to clean up if the file is already gone.
+  }
 }
 
 /** Pure decision: what should this boot do? Exported for tests. */

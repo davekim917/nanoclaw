@@ -217,7 +217,7 @@ function killForProviderHeal(session: Session): void {
  */
 export function notifyProviderHealParked(
   mailbox: NanoclawMailboxSession,
-  session: Session,
+  _session: Session,
   failureReason: string | null,
   writeMessage: (message: {
     id: string;

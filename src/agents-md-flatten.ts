@@ -157,7 +157,7 @@ function flattenInner(filePath: string, visited: Set<string>, depth: number, opt
     // → ENOENT on a nonexistent file, with the failure marker spliced
     // mid-sentence into the composed AGENTS.md.
     const ref = match[2];
-    if (/\s/.test(ref) || !/[\/\.]/.test(ref) || /@\w+\s/.test(line)) {
+    if (/\s/.test(ref) || !/[/.]/.test(ref) || /@\w+\s/.test(line)) {
       out.push(line);
       continue;
     }
