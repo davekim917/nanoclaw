@@ -45,6 +45,21 @@ jobs:
       - name: Host tests
         run: pnpm exec vitest run
 
+      # The host suite can only prove src/upstream-ratchet.json is CURRENT — it
+      # has no git and this clone carries no upstream objects. Recomputing the
+      # diff numbers needs the pinned commit, so fetch exactly that one object
+      # (GitHub serves a by-sha fetch; --depth=1 keeps it to a single commit,
+      # under a second) and let the report arbitrate. Without this step the
+      # manifest's numbers are self-reported: a PR could regenerate it with
+      # --accept-all and nothing would ever recheck the arithmetic.
+      # Exit 1 = a diff grew or became newly divergent. Exit 2 = the fetch did
+      # not land, which is an infrastructure failure, not a ratchet failure.
+      - name: Upstream divergence ratchet
+        run: |
+          git fetch --depth=1 https://github.com/nanocoai/nanoclaw.git \
+            "$(node -p "require('./src/upstream-ratchet.json').upstream")"
+          pnpm run ratchet:report
+
       - name: Container tests
         working-directory: container/agent-runner
         # No concurrency flag here on purpose. `bun test` runs test FILES

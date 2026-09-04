@@ -8,11 +8,12 @@
  * wanted to.
  *
  * What that buys and what it does not: these cases prove the committed manifest
- * is CURRENT — every upstream-owned file still hashes to what it hashed when its
- * `diff` was measured, and every entry is internally well formed. They cannot
- * prove a `diff` value is the true line count; only `scripts/upstream-ratchet-report.ts`,
- * which has git, can do that, and it is the piece that arbitrates GROWTH vs SHRINK.
- * See docs/upstream-ratchet.md.
+ * is CURRENT — every upstream-owned file still hashes and still has the mode it
+ * had when its `diff` was measured, the pinned path set is complete, and every
+ * entry is internally well formed. They cannot prove a `diff` value is the true
+ * line count; only `scripts/upstream-ratchet-report.ts`, which has git, can do
+ * that, and it is the piece that arbitrates GROWTH vs SHRINK. Its decisions are
+ * tested in src/upstream-ratchet-core.test.ts. See docs/upstream-ratchet.md.
  */
 import fs from 'node:fs';
 import path from 'node:path';
@@ -22,12 +23,17 @@ import { beforeAll, describe, expect, it } from 'vitest';
 import { enforceHermeticity, hermeticityAttempts } from './test-hermeticity.js';
 import {
   checkTree,
+  fileModeOf,
   formatFindings,
   hashFile,
   MANIFEST_REL,
+  pathsSeal,
   readManifest,
   REGENERATE_HINT,
+  sealManifest,
   serializeManifest,
+  shellQuote,
+  validateRelPath,
   type UpstreamRatchetManifest,
 } from './upstream-ratchet.js';
 
@@ -39,6 +45,11 @@ const entries = Object.entries(manifest.files);
 // held to the strict guard rather than the repo's `warn` default.
 beforeAll(() => enforceHermeticity());
 
+/** A fixture manifest with a correct coverage seal, so seal findings stay opt-in. */
+function sealed(files: UpstreamRatchetManifest['files'], upstream = 'a'.repeat(40)): UpstreamRatchetManifest {
+  return sealManifest({ upstream, paths: '', files });
+}
+
 describe('upstream-ownership ratchet', () => {
   it('manifest pins one upstream commit and covers every entry with a well-formed diff and hash', () => {
     expect(manifest.upstream, 'the pinned upstream commit must be a full 40-character sha').toMatch(/^[0-9a-f]{40}$/);
@@ -47,20 +58,26 @@ describe('upstream-ownership ratchet', () => {
     const malformed = entries.filter(([, entry]) => {
       const diffOk = Number.isInteger(entry.diff) && entry.diff >= 0;
       const hashOk = entry.sha256 === null || /^[0-9a-f]{64}$/.test(entry.sha256);
-      return !diffOk || !hashOk;
+      const modeOk = entry.mode === '100644' || entry.mode === '100755' || entry.mode === '120000';
+      return !diffOk || !hashOk || !modeOk;
     });
     expect(
       malformed.map(([p]) => p),
-      'every entry needs a non-negative integer diff and a sha256 or null',
+      'every entry needs a non-negative integer diff, a git blob mode, and a sha256 or null',
     ).toEqual([]);
 
     // Sorted by path, so a regeneration is a readable diff rather than a reshuffle.
     expect(Object.keys(manifest.files)).toEqual([...Object.keys(manifest.files)].sort());
 
-    // No aggregate fields. A total or a timestamp in the file would change on
-    // every regeneration whatever moved, so every PR would collide on it, and it
-    // would duplicate a number the report script derives from the entries.
-    expect(Object.keys(manifest), 'the manifest carries only "upstream" and "files"').toEqual(['upstream', 'files']);
+    // Exactly three top-level fields. `paths` is a seal over the key SET, not an
+    // aggregate over the entries' contents, so it is stable across ordinary
+    // regenerations; a total or a timestamp would change on every one whatever
+    // moved, and every PR would then collide on it.
+    expect(Object.keys(manifest), 'the manifest carries only "upstream", "paths" and "files"').toEqual([
+      'upstream',
+      'paths',
+      'files',
+    ]);
 
     // The ON-DISK bytes are exactly the canonical serialization: one line per
     // file entry, sorted, fixed key order, optional flags only when true. This
@@ -114,6 +131,63 @@ describe('upstream-ownership ratchet', () => {
     expect(missing, `deleting an upstream file is new divergence — ${REGENERATE_HINT} --accept <path>`).toEqual([]);
   });
 
+  it('every recorded mode agrees with the file on disk', () => {
+    // A mode change carries no bytes and no lines: `chmod -x` on an upstream-owned
+    // file leaves the hash identical and `git diff --numstat` empty, so before
+    // `mode` existed the whole ratchet reported UNCHANGED for it. The recorded
+    // mode comes from the WORKING TREE (lstat), not the index, so an unstaged
+    // chmod is caught here rather than hiding until it is committed.
+    const wrong: string[] = [];
+    for (const [relPath, entry] of entries) {
+      if (entry.deleted === true) continue;
+      const actual = fileModeOf(path.join(REPO_ROOT, relPath));
+      if (actual !== entry.mode) wrong.push(`${relPath}: recorded ${entry.mode}, on disk ${actual}`);
+    }
+    expect(wrong, `a mode change is divergence too — regenerate: ${REGENERATE_HINT}`).toEqual([]);
+
+    // And the two halves of the mapping the recorded modes rely on.
+    for (const [relPath, entry] of entries) {
+      if (entry.deleted === true) continue;
+      const abs = path.join(REPO_ROOT, relPath);
+      const stat = fs.lstatSync(abs);
+      expect(stat.isSymbolicLink(), `${relPath}: symlink ⇔ mode 120000`).toBe(entry.mode === '120000');
+      if (!stat.isSymbolicLink()) {
+        expect((stat.mode & 0o100) !== 0, `${relPath}: owner exec bit ⇔ mode 100755`).toBe(entry.mode === '100755');
+      }
+    }
+  });
+
+  it('the coverage seal fails when an entry is removed by hand', () => {
+    // Without the seal, deleting one entry line leaves valid, sorted, canonical
+    // JSON: every per-entry check passes because there is no entry left to
+    // check, and that upstream-owned path is silently unprotected.
+    expect(manifest.paths, 'the committed seal covers exactly the committed key set').toBe(
+      pathsSeal(Object.keys(manifest.files)),
+    );
+
+    const files = { ...manifest.files };
+    const victim = Object.keys(files).find((p) => files[p].deleted !== true) ?? Object.keys(files)[0];
+    delete files[victim];
+    const gutted: UpstreamRatchetManifest = { upstream: manifest.upstream, paths: manifest.paths, files };
+
+    // Still perfectly well-formed on every other axis.
+    expect(Object.keys(gutted.files)).toEqual([...Object.keys(gutted.files)].sort());
+    expect(JSON.parse(serializeManifest(gutted)).files[victim]).toBeUndefined();
+
+    const findings = checkTree(gutted, REPO_ROOT);
+    expect(findings.map((f) => [f.kind, f.path])).toContainEqual(['malformed', MANIFEST_REL]);
+    expect(findings.find((f) => f.path === MANIFEST_REL)?.detail).toMatch(/seal .* does not cover/);
+
+    // Adding an entry by hand fails the same way.
+    const padded = sealManifest(manifest);
+    const extra: UpstreamRatchetManifest = {
+      upstream: manifest.upstream,
+      paths: padded.paths,
+      files: { ...manifest.files, 'invented/by/hand.md': { diff: 3, mode: '100644', sha256: 'd'.repeat(64) } },
+    };
+    expect(checkTree(extra, REPO_ROOT).some((f) => f.path === MANIFEST_REL)).toBe(true);
+  });
+
   it('checkTree reports changed, missing, resurrected against a fixture tree', () => {
     const root = uniqueTmpRoot('upstream-ratchet');
     fs.mkdirSync(path.join(root, 'src'), { recursive: true });
@@ -122,21 +196,18 @@ describe('upstream-ownership ratchet', () => {
     fs.writeFileSync(path.join(root, 'resurrected.txt'), 'the fork took this back\n');
     fs.symlinkSync('kept.txt', path.join(root, 'link'));
 
-    const fixture: UpstreamRatchetManifest = {
-      upstream: 'a'.repeat(40),
-      files: {
-        // Present and untouched since the manifest was written.
-        'kept.txt': { diff: 3, sha256: hashFile(path.join(root, 'kept.txt')) },
-        // Hashed against different bytes than the tree now holds.
-        'edited.txt': { diff: 3, sha256: 'b'.repeat(64) },
-        // Recorded as present, absent from the tree.
-        'gone.txt': { diff: 7, sha256: 'c'.repeat(64) },
-        // Recorded as deleted, present in the tree.
-        'resurrected.txt': { diff: 12, sha256: null, deleted: true },
-        // A symlink is hashed by its TARGET STRING, not the pointee.
-        link: { diff: 0, sha256: hashFile(path.join(root, 'link')) },
-      },
-    };
+    const fixture = sealed({
+      // Present and untouched since the manifest was written.
+      'kept.txt': { diff: 3, mode: '100644', sha256: hashFile(path.join(root, 'kept.txt')) },
+      // Hashed against different bytes than the tree now holds.
+      'edited.txt': { diff: 3, mode: '100644', sha256: 'b'.repeat(64) },
+      // Recorded as present, absent from the tree.
+      'gone.txt': { diff: 7, mode: '100644', sha256: 'c'.repeat(64) },
+      // Recorded as deleted, present in the tree.
+      'resurrected.txt': { diff: 12, mode: '100644', sha256: null, deleted: true },
+      // A symlink is hashed by its TARGET STRING, not the pointee.
+      link: { diff: 0, mode: '120000', sha256: hashFile(path.join(root, 'link')) },
+    });
 
     const findings = checkTree(fixture, root);
     expect(findings.map((f) => [f.kind, f.path])).toEqual([
@@ -157,19 +228,89 @@ describe('upstream-ownership ratchet', () => {
 
     // Manifest-level shape is checked too, not just per-entry state.
     const badPin = checkTree({ ...fixture, upstream: 'upstream/main' }, root);
-    expect(badPin[0]).toMatchObject({ kind: 'malformed', path: 'src/upstream-ratchet.json' });
+    expect(badPin[0]).toMatchObject({ kind: 'malformed', path: MANIFEST_REL });
+  });
+
+  it('checkTree reports a chmod and a file-to-symlink transition', () => {
+    const root = uniqueTmpRoot('upstream-ratchet-mode');
+    fs.mkdirSync(root, { recursive: true });
+    fs.writeFileSync(path.join(root, 'tool.sh'), '#!/bin/sh\necho hi\n');
+    fs.writeFileSync(path.join(root, 'note.md'), 'a note\n');
+    fs.writeFileSync(path.join(root, 'target.md'), 'a note\n');
+
+    const fixture = sealed({
+      'tool.sh': { diff: 0, mode: '100644', sha256: hashFile(path.join(root, 'tool.sh')) },
+      'note.md': { diff: 0, mode: '100644', sha256: hashFile(path.join(root, 'note.md')) },
+    });
+    expect(checkTree(fixture, root), 'the fixture starts clean').toEqual([]);
+
+    // chmod +x — identical bytes, so `changed` never fires and numstat would be
+    // empty. Only the mode check sees it.
+    fs.chmodSync(path.join(root, 'tool.sh'), 0o755);
+    const afterChmod = checkTree(fixture, root);
+    expect(afterChmod.map((f) => [f.kind, f.path])).toEqual([['mode', 'tool.sh']]);
+    expect(afterChmod[0].detail).toContain('expected 100644, got 100755');
+    fs.chmodSync(path.join(root, 'tool.sh'), 0o644);
+
+    // Regular file → symlink pointing at identical content. The bytes a reader
+    // sees through the link are the same; the blob is not.
+    fs.unlinkSync(path.join(root, 'note.md'));
+    fs.symlinkSync('target.md', path.join(root, 'note.md'));
+    const afterSwap = checkTree(fixture, root);
+    expect(afterSwap.map((f) => f.kind).sort()).toEqual(['changed', 'mode']);
+    expect(afterSwap.find((f) => f.kind === 'mode')?.detail).toContain('expected 100644, got 120000');
+
+    // A path that is neither a regular file nor a symlink has no blob mode.
+    fs.unlinkSync(path.join(root, 'note.md'));
+    fs.mkdirSync(path.join(root, 'note.md'));
+    expect(checkTree(fixture, root).find((f) => f.path === 'note.md')?.detail).toContain('no git blob mode');
+  });
+
+  it('checkTree rejects unusable manifest paths before touching the filesystem', () => {
+    const root = uniqueTmpRoot('upstream-ratchet-paths');
+    fs.mkdirSync(root, { recursive: true });
+
+    // A manifest key is joined to the repo root and then lstat-ed and READ. The
+    // hermeticity tripwire guards writes, not reads, so `../../.ssh/id_rsa` as a
+    // key would quietly read outside the checkout. The manifest is generated, so
+    // none of this fires unless somebody hand-edits it — which is exactly when
+    // it is worth having.
+    const cases: Array<[string, RegExp]> = [
+      ['../../.ssh/id_rsa', /".." segment/],
+      ['a/../../b', /".." segment/],
+      ['/etc/passwd', /absolute/],
+      ['C:/Windows/win.ini', /absolute/],
+      ['a//b.md', /empty segment/],
+      ['a/./b.md', /"\." or ".." segment/],
+      ['a\\b.md', /backslash/],
+      ['bad\0name.md', /NUL/],
+      ['', /empty/],
+    ];
+    for (const [key, pattern] of cases) {
+      const findings = checkTree(sealed({ [key]: { diff: 1, mode: '100644', sha256: 'e'.repeat(64) } }), root);
+      const finding = findings.find((f) => f.path === key);
+      expect(finding, `${JSON.stringify(key)} must be rejected`).toBeDefined();
+      expect(finding?.kind).toBe('malformed');
+      expect(finding?.detail, `${JSON.stringify(key)}: ${finding?.detail}`).toMatch(pattern);
+    }
+
+    // The same rule, at the unit level.
+    expect(validateRelPath('src/host-sweep.ts', root)).toBeNull();
+    expect(validateRelPath('.agents/skills', root)).toBeNull();
+    expect(validateRelPath('a b/c d.md', root)).toBeNull();
+    expect(validateRelPath('..', root)).not.toBeNull();
   });
 
   it('the manifest carries no unaudited headroom', () => {
     // HONEST LIMIT: this case cannot recompute a diff. It has no git, and the
-    // CI clone has no upstream objects. What it CAN close is every way an entry
-    // could carry a number nothing stands behind — a diff with no hash to pin it
-    // to, a hash with no file, a deletion that also claims content. Combined
-    // with case 2 (the hash still matches the tree), an entry's `diff` is then
-    // exactly the number the report script measured for exactly these bytes.
-    // The git-side proof that the number is CORRECT lives in
-    // scripts/upstream-ratchet-report.ts; running it is the definition of done
-    // for a PR that touches an upstream-owned file.
+    // CI clone has no upstream objects until the ratchet's CI step fetches them.
+    // What it CAN close is every way an entry could carry a number nothing
+    // stands behind — a diff with no hash to pin it to, a hash with no file, a
+    // deletion that also claims content. Combined with case 2 (the hash still
+    // matches the tree), the mode case above, and the coverage seal, an entry's
+    // `diff` is then exactly the number the report script measured for exactly
+    // these bytes at exactly this mode. The git-side proof that the number is
+    // CORRECT lives in scripts/upstream-ratchet-report.ts and runs in CI.
     const violations: string[] = [];
     for (const [relPath, entry] of entries) {
       // A deleted path has no fork bytes; a present one always has some.
@@ -178,17 +319,41 @@ describe('upstream-ownership ratchet', () => {
       // Deleted means the whole upstream file reads as removed — that is never
       // zero divergence, so a `deleted` entry claiming diff 0 is unaudited.
       if (entry.deleted === true && entry.diff === 0) violations.push(`${relPath}: deleted but claims diff 0`);
-      // diff 0 means byte-identical to upstream, which a deleted or a differing
-      // binary path can never be.
+      // diff 0 means byte- AND mode-identical to upstream, which a differing
+      // binary can never be.
       if (entry.diff === 0 && entry.binary === true) violations.push(`${relPath}: diff 0 but flagged binary`);
-      // A binary path has no lines to count; the report records one unit.
-      if (entry.binary === true && entry.diff !== 1) violations.push(`${relPath}: binary but diff is not 1`);
+      // A binary path has no lines to count: one unit for the bytes, plus at
+      // most one more for a differing mode.
+      if (entry.binary === true && (entry.diff < 1 || entry.diff > 2)) {
+        violations.push(`${relPath}: binary but diff is ${entry.diff}, not 1 or 2`);
+      }
       // Only `true` is ever written for the two optional flags — `false` would
       // read as an audited "no" that nothing produced.
       if ('deleted' in entry && entry.deleted !== true) violations.push(`${relPath}: "deleted" present but not true`);
       if ('binary' in entry && entry.binary !== true) violations.push(`${relPath}: "binary" present but not true`);
     }
     expect(violations, `regenerate the manifest: ${REGENERATE_HINT}`).toEqual([]);
+  });
+
+  it('printed commands survive a copy-paste for any valid path', () => {
+    // `-z` parsing already handles a path with a space or a newline; the hint
+    // that tells someone what to run has to as well, or the advertised command
+    // splits into two arguments or is read as an option.
+    expect(shellQuote('src/host-sweep.ts')).toBe('src/host-sweep.ts');
+    expect(shellQuote('a file.md')).toBe("'a file.md'");
+    expect(shellQuote("it's.md")).toBe(`'it'\\''s.md'`);
+    expect(shellQuote('line\nbreak.md')).toBe("'line\nbreak.md'");
+    expect(shellQuote('--not-a-flag.md')).toBe("'--not-a-flag.md'");
+    expect(shellQuote('-dash.md')).toBe("'-dash.md'");
+    expect(shellQuote('naïve.md')).toBe("'naïve.md'");
+    expect(shellQuote('')).toBe("''");
+    expect(shellQuote('a;rm -rf /.md')).toBe("'a;rm -rf /.md'");
+
+    // And the hints really carry the quoted form.
+    const root = uniqueTmpRoot('upstream-ratchet-quote');
+    fs.mkdirSync(root, { recursive: true });
+    const findings = checkTree(sealed({ 'a file.md': { diff: 4, mode: '100644', sha256: 'f'.repeat(64) } }), root);
+    expect(findings[0].hint).toContain("--accept 'a file.md'");
   });
 
   it('the ratchet library never spawns a subprocess or reaches the network', () => {

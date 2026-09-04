@@ -3,30 +3,33 @@
  *
  * `src/upstream-ratchet.json` is an allowlist of every path upstream owns at one
  * PINNED upstream commit, each with the size of the fork's divergence in that
- * file (`diff`, added+deleted lines vs the pinned commit) and a sha256 of the
- * fork's current bytes. Growth in `diff` fails; shrink is always allowed; a file
- * that was byte-identical and is no longer is NEW divergence and fails.
+ * file (`diff`), the fork's file mode, and a sha256 of the fork's current bytes.
+ * Growth in `diff` fails; shrink is always allowed; a file that was
+ * byte-identical and is no longer is NEW divergence and fails.
  *
  * ── Reach, stated plainly ──────────────────────────────────────────────────
  *
  * This module, and the vitest suite that drives it, CANNOT measure diff size.
  * A test here has no git: `src/test-hermeticity.ts` mocks `child_process` for
  * every host suite, and the fork's CI clone carries no upstream commit objects
- * at all (the same reason `src/mailbox-seam-manifest.ts` ships a committed hash
- * manifest). So the split is:
+ * until the ratchet's own CI step fetches them (the same reason
+ * `src/mailbox-seam-manifest.ts` ships a committed hash manifest). So the split
+ * is three ways:
  *
  *  - THIS module verifies the manifest is CURRENT: every upstream-owned file
- *    still hashes to what it hashed when its `diff` was measured, deleted stays
- *    deleted, present stays present, and every entry is internally well formed.
- *    That is what makes the recorded `diff` trustworthy without git.
- *  - `scripts/upstream-ratchet-report.ts` does the arbitration: it recomputes
- *    every `diff` against the pinned commit with one `git diff --numstat` and
- *    classifies each path as GROWTH / SHRINK / NEW / STALE / UNCHANGED.
+ *    still hashes AND still has the mode it had when its `diff` was measured,
+ *    deleted stays deleted, present stays present, the pinned path set is
+ *    complete, and every entry is internally well formed. That is what makes
+ *    the recorded `diff` trustworthy without git.
+ *  - `src/upstream-ratchet-core.ts` holds the pure arbitration — parsing git's
+ *    output, building entries, classifying GROWTH / NEW / SHRINK / STALE, and
+ *    the `--write` gate — so all of it has hermetic tests.
+ *  - `scripts/upstream-ratchet-report.ts` runs git and picks an exit code.
  *
  * Paths the FORK added are out of scope — they are not upstream-owned, and
  * there is nothing to ratchet against. Only the paths in
  * `git ls-tree -r <pinned sha>` get an entry, and every one of them does: no
- * exclusions, so a divergence cannot hide by being left off the list.
+ * exclusions, and the `paths` seal below makes an omission fail rather than pass.
  *
  * Pure `fs` + `crypto` by construction. Do not import `child_process` here.
  */
@@ -34,6 +37,29 @@ import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+
+/**
+ * The three blob modes git records for a file.
+ *
+ * Lives here rather than in `src/upstream-ratchet-core.ts` because it is part of
+ * the manifest's shape, and because the dependency between the two modules must
+ * run one way only: core imports this module, never the reverse (the host is
+ * ESM, where a cycle is a runtime trap — see CLAUDE.md, Module System).
+ */
+export type GitMode = '100644' | '100755' | '120000';
+
+export const GIT_MODES: readonly GitMode[] = ['100644', '100755', '120000'];
+
+export function isGitMode(value: string): value is GitMode {
+  return (GIT_MODES as readonly string[]).includes(value);
+}
+
+/**
+ * A submodule. The ratchet cannot express one: there are no bytes to hash and no
+ * lines to count, so every check it makes would be vacuous. Refused loudly on
+ * either side rather than silently recorded as something it is not.
+ */
+export const GITLINK_MODE = '160000';
 
 /** The repo this module was loaded from — a worktree when it is loaded from one. */
 export const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -47,10 +73,14 @@ export const REGENERATE_HINT = 'pnpm run ratchet:report -- --write';
 /**
  * One upstream-owned path.
  *
- *  - `diff`   added+deleted lines vs the pinned commit. 0 means byte-identical.
- *             For a path the fork DELETED this is upstream's own line count
- *             (every line reads as deleted). For a binary path it is 1 when the
- *             bytes differ.
+ *  - `diff`   added+deleted lines vs the pinned commit, plus one unit when the
+ *             fork's file mode differs from upstream's. 0 means byte- and
+ *             mode-identical. For a path the fork DELETED this is upstream's own
+ *             line count. For a binary path it is 1 for the bytes (plus the mode
+ *             unit if any), because there are no lines to count.
+ *  - `mode`   the FORK's working-tree mode, or upstream's when the fork deleted
+ *             the path. A mode change carries no bytes and no lines, so without
+ *             this field `chmod -x` on an upstream-owned file is invisible.
  *  - `sha256` sha256 of the FORK's current bytes, or `null` when the fork has
  *             deleted the path. For a symlink it is the sha256 of the link
  *             TARGET STRING, which is what git stores for a mode-120000 blob.
@@ -59,16 +89,28 @@ export const REGENERATE_HINT = 'pnpm run ratchet:report -- --write';
  */
 export interface UpstreamRatchetEntry {
   diff: number;
+  mode: GitMode;
   sha256: string | null;
   deleted?: true;
   binary?: true;
 }
 
 export interface UpstreamRatchetManifest {
-  /** The PINNED upstream commit. Never `upstream/main` — a moving base would
-   *  measure upstream's activity rather than the fork's divergence. Re-pinning
-   *  is a deliberate act: `--upstream <sha>`. */
+  /** The PINNED upstream commit, full 40-hex. Never `upstream/main` — a moving
+   *  base would measure upstream's activity rather than the fork's divergence.
+   *  Re-pinning is a deliberate act: `--upstream <rev>`. */
   upstream: string;
+  /**
+   * Coverage seal: sha256 of the pinned commit's sorted path list joined by
+   * newlines.
+   *
+   * Without it, deleting one entry line leaves valid, sorted, canonical JSON
+   * that every hermetic check passes — and that upstream-owned path is then
+   * silently unprotected. The seal is computed from the path SET, not from the
+   * entries' contents, so an ordinary regeneration never moves it; it changes
+   * only on a re-pin, where upstream's own tree changed.
+   */
+  paths: string;
   /** One entry per path in `git ls-tree -r <upstream>`, sorted by path. */
   files: Record<string, UpstreamRatchetEntry>;
 }
@@ -76,6 +118,8 @@ export interface UpstreamRatchetManifest {
 export type FindingKind =
   /** The fork's bytes moved since `diff` was measured — `diff` is now unproven. */
   | 'changed'
+  /** The fork's file mode moved since `diff` was measured. */
+  | 'mode'
   /** The entry is not marked deleted, but the file is absent from the tree. */
   | 'missing'
   /** The entry is marked deleted, but the file is present in the tree. */
@@ -108,6 +152,23 @@ export function writeManifest(manifest: UpstreamRatchetManifest, repoRoot: strin
 }
 
 /**
+ * The coverage seal for a set of upstream-owned paths.
+ *
+ * Sorted, joined by `\n` with no trailing newline, sha256'd. Deterministic and
+ * order-independent, so two regenerations of the same pinned commit agree.
+ */
+export function pathsSeal(paths: readonly string[]): string {
+  return createHash('sha256')
+    .update([...paths].sort().join('\n'), 'utf8')
+    .digest('hex');
+}
+
+/** The manifest with its seal recomputed from its own key set. */
+export function sealManifest(manifest: UpstreamRatchetManifest): UpstreamRatchetManifest {
+  return { ...manifest, paths: pathsSeal(Object.keys(manifest.files)) };
+}
+
+/**
  * The manifest's ON-DISK form: ONE LINE PER FILE ENTRY, sorted by path.
  *
  * `JSON.stringify(…, null, 2)` would spread every entry over four to six lines
@@ -117,11 +178,12 @@ export function writeManifest(manifest: UpstreamRatchetManifest, repoRoot: strin
  * line-level merge resolves them cleanly — two regenerations conflict only on
  * the paths they BOTH touched, which is exactly the case a human should look at.
  *
- * The file carries `upstream` and `files` and nothing else. No totals, no
- * counts, no timestamps: an aggregate would change on every regeneration
+ * The file carries `upstream`, `paths` and `files` and nothing else. No totals,
+ * no counts, no timestamps: an aggregate would change on every regeneration
  * regardless of which path moved, so every PR would conflict on it, and it would
  * be a second copy of a number `scripts/upstream-ratchet-report.ts` derives from
- * the entries anyway.
+ * the entries anyway. (`paths` is a seal over the key set, not an aggregate over
+ * their contents — it is stable across ordinary regenerations.)
  *
  * Deterministic by construction — sorted paths, fixed key order within an entry,
  * optional flags only when true — so `--write` twice on an unchanged tree
@@ -134,12 +196,16 @@ export function writeManifest(manifest: UpstreamRatchetManifest, repoRoot: strin
 export function serializeManifest(manifest: UpstreamRatchetManifest): string {
   const sorted = sortManifest(manifest);
   const paths = Object.keys(sorted.files);
-  const lines = [`{"upstream":${JSON.stringify(sorted.upstream)},"files":{`];
+  const lines = [`{"upstream":${JSON.stringify(sorted.upstream)},"paths":${JSON.stringify(sorted.paths)},"files":{`];
   paths.forEach((relPath, index) => {
     const entry = sorted.files[relPath];
     // Fixed key order, and an optional flag only when it is set — two runs over
     // the same tree must produce the same bytes.
-    const fields = [`"diff":${entry.diff}`, `"sha256":${JSON.stringify(entry.sha256)}`];
+    const fields = [
+      `"diff":${entry.diff}`,
+      `"mode":${JSON.stringify(entry.mode)}`,
+      `"sha256":${JSON.stringify(entry.sha256)}`,
+    ];
     if (entry.deleted === true) fields.push('"deleted":true');
     if (entry.binary === true) fields.push('"binary":true');
     const comma = index === paths.length - 1 ? '' : ',';
@@ -153,7 +219,36 @@ export function serializeManifest(manifest: UpstreamRatchetManifest): string {
 export function sortManifest(manifest: UpstreamRatchetManifest): UpstreamRatchetManifest {
   const files: Record<string, UpstreamRatchetEntry> = {};
   for (const key of Object.keys(manifest.files).sort()) files[key] = manifest.files[key];
-  return { upstream: manifest.upstream, files };
+  return { upstream: manifest.upstream, paths: manifest.paths, files };
+}
+
+/**
+ * Why a manifest key is not usable as a repo-relative path, or `null`.
+ *
+ * Called BEFORE any filesystem access. A manifest key is joined to the repo root
+ * and then `lstat`-ed and read; `../../.ssh/id_rsa` as a key would make the
+ * hermetic test read outside the checkout, and the hermeticity tripwire guards
+ * WRITES, not reads. The manifest is generated, so none of this should ever
+ * fire — it fires when someone hand-edits the file, which is precisely when the
+ * check is worth having.
+ */
+export function validateRelPath(relPath: string, repoRoot: string = REPO_ROOT): string | null {
+  if (relPath === '') return 'the path is empty';
+  if (relPath.includes('\0')) return 'the path contains a NUL byte';
+  // Git stores `/` on every platform. A backslash is a literal character in a
+  // git path, not a separator, so a key containing one cannot have come from
+  // `ls-tree` output on any host and is a hand edit or a Windows-ism.
+  if (relPath.includes('\\')) return 'the path contains a backslash';
+  if (relPath.startsWith('/') || /^[A-Za-z]:/.test(relPath)) return 'the path is absolute';
+  const segments = relPath.split('/');
+  if (segments.some((segment) => segment === '')) return 'the path has an empty segment';
+  if (segments.some((segment) => segment === '.' || segment === '..')) return 'the path has a "." or ".." segment';
+  // Belt and braces: even with the lexical checks above, the resolved path must
+  // land inside the repo.
+  const resolved = path.resolve(repoRoot, relPath);
+  const root = path.resolve(repoRoot);
+  if (resolved !== root && !resolved.startsWith(root + path.sep)) return 'the path resolves outside the repository';
+  return null;
 }
 
 /**
@@ -166,28 +261,68 @@ export function sortManifest(manifest: UpstreamRatchetManifest): UpstreamRatchet
  * would read as unchanged and a dangling one would read as deleted.
  */
 export function hashFile(abs: string): string | null {
-  let stat: fs.Stats;
+  const stat = lstat(abs);
+  if (stat === null) return null;
+  const content = stat.isSymbolicLink() ? Buffer.from(fs.readlinkSync(abs), 'utf8') : fs.readFileSync(abs);
+  return createHash('sha256').update(content).digest('hex');
+}
+
+/**
+ * The git file mode of a path in the WORKING TREE, or `null` when it is absent.
+ *
+ * Deliberately derived from `lstat` rather than from `git ls-files -s`. Every
+ * other measurement this tool makes is against the working tree — `git diff
+ * <commit>` with no second commit, and `hashFile` on the bytes on disk — so
+ * taking the mode from the INDEX would mix two different trees into one entry.
+ * It would also wedge the hermetic check: an unstaged `chmod +x` leaves the
+ * index at 100644 forever, so the recorded mode would permanently disagree with
+ * the file, and regenerating could not fix it.
+ *
+ * A path that is neither a regular file nor a symlink (a directory, a socket)
+ * has no blob mode; `null` there would read as "deleted", so it is reported by
+ * the caller instead.
+ */
+export function fileModeOf(abs: string): GitMode | null {
+  const stat = lstat(abs);
+  if (stat === null) return null;
+  if (stat.isSymbolicLink()) return '120000';
+  if (!stat.isFile()) return null;
+  // Git records the owner execute bit and nothing else.
+  return (stat.mode & 0o100) !== 0 ? '100755' : '100644';
+}
+
+/** Whether a path exists, symlinks included (a dangling link still counts). */
+export function pathExists(abs: string): boolean {
+  return lstat(abs) !== null;
+}
+
+function lstat(abs: string): fs.Stats | null {
   try {
-    stat = fs.lstatSync(abs);
+    return fs.lstatSync(abs);
     // eslint-disable-next-line no-catch-all/no-catch-all
   } catch (error) {
     void error; // ENOENT is the answer, not an error.
     return null;
   }
-  const content = stat.isSymbolicLink() ? Buffer.from(fs.readlinkSync(abs), 'utf8') : fs.readFileSync(abs);
-  return createHash('sha256').update(content).digest('hex');
 }
 
-/** Whether a path exists, symlinks included (a dangling link still counts). */
-export function pathExists(abs: string): boolean {
-  try {
-    fs.lstatSync(abs);
-    return true;
-    // eslint-disable-next-line no-catch-all/no-catch-all
-  } catch (error) {
-    void error;
-    return false;
-  }
+/**
+ * One argument, safe to paste into a POSIX shell.
+ *
+ * The hints this module and the report script print are meant to be run
+ * verbatim. An upstream path may hold a space, a quote, a newline or a leading
+ * dash, and an unquoted one would split into two arguments or be read as an
+ * option. Single quotes take everything literally; the only character that has
+ * to be handled is the single quote itself.
+ */
+export function shellQuote(value: string): string {
+  if (value !== '' && /^[A-Za-z0-9_./@:+-]+$/.test(value) && !value.startsWith('-')) return value;
+  return `'${value.split("'").join(`'\\''`)}'`;
+}
+
+/** `--accept <path>` for one path, quoted so it survives a copy-paste. */
+export function acceptFlag(relPath: string): string {
+  return `--accept ${shellQuote(relPath)}`;
 }
 
 const SHA256_RE = /^[0-9a-f]{64}$/;
@@ -208,7 +343,7 @@ export function checkTree(manifest: UpstreamRatchetManifest, repoRoot: string = 
       kind: 'malformed',
       path: MANIFEST_REL,
       detail: `"upstream" is not a 40-character commit sha: ${JSON.stringify(manifest.upstream)}`,
-      hint: `re-pin deliberately: pnpm run ratchet:report -- --upstream <sha>`,
+      hint: 're-pin deliberately: pnpm run ratchet:report -- --upstream <rev>',
     });
   }
   if (manifest.files === null || typeof manifest.files !== 'object') {
@@ -219,6 +354,21 @@ export function checkTree(manifest: UpstreamRatchetManifest, repoRoot: string = 
       hint: `regenerate: ${REGENERATE_HINT}`,
     });
     return findings;
+  }
+
+  // The coverage seal. This is the only check that can tell a complete manifest
+  // from one an entry was deleted out of — every other check here is per-entry,
+  // and a deleted entry has nothing left to check.
+  const seal = pathsSeal(Object.keys(manifest.files));
+  if (manifest.paths !== seal) {
+    findings.push({
+      kind: 'malformed',
+      path: MANIFEST_REL,
+      detail:
+        `"paths" seal ${JSON.stringify(manifest.paths)} does not cover the ${Object.keys(manifest.files).length} ` +
+        `entries present (expected ${seal}) — an entry was added or removed by hand`,
+      hint: `regenerate from the pinned commit: ${REGENERATE_HINT}`,
+    });
   }
 
   for (const [relPath, entry] of Object.entries(manifest.files)) {
@@ -233,8 +383,22 @@ function checkEntry(relPath: string, entry: UpstreamRatchetEntry, repoRoot: stri
     findings.push({ kind: 'malformed', path: relPath, detail, hint: `regenerate: ${REGENERATE_HINT}` });
   };
 
+  // BEFORE any filesystem access.
+  const invalidPath = validateRelPath(relPath, repoRoot);
+  if (invalidPath !== null) {
+    malformed(`not a usable repo-relative path: ${invalidPath}`);
+    return findings;
+  }
+
+  if (entry === null || typeof entry !== 'object') {
+    malformed('the entry is not an object');
+    return findings;
+  }
   if (!Number.isInteger(entry.diff) || entry.diff < 0) {
     malformed(`"diff" must be a non-negative integer, got ${JSON.stringify(entry.diff)}`);
+  }
+  if (typeof entry.mode !== 'string' || !isGitMode(entry.mode)) {
+    malformed(`"mode" must be 100644, 100755 or 120000, got ${JSON.stringify(entry.mode)}`);
   }
   if (entry.sha256 !== null && (typeof entry.sha256 !== 'string' || !SHA256_RE.test(entry.sha256))) {
     malformed(`"sha256" must be 64 lowercase hex characters or null, got ${JSON.stringify(entry.sha256)}`);
@@ -264,7 +428,7 @@ function checkEntry(relPath: string, entry: UpstreamRatchetEntry, repoRoot: stri
         kind: 'resurrected',
         path: relPath,
         detail: 'the manifest records this upstream path as deleted in the fork, but it is present in the tree',
-        hint: `re-adopting an upstream file is new divergence — regenerate and accept it: ${REGENERATE_HINT} --accept ${relPath}`,
+        hint: `re-adopting an upstream file is new divergence — regenerate and accept it: ${REGENERATE_HINT} ${acceptFlag(relPath)}`,
       });
     }
     return findings;
@@ -275,9 +439,28 @@ function checkEntry(relPath: string, entry: UpstreamRatchetEntry, repoRoot: stri
       kind: 'missing',
       path: relPath,
       detail: 'the manifest records this upstream path as present in the fork, but it is absent from the tree',
-      hint: `deleting an upstream file is new divergence — regenerate and accept it: ${REGENERATE_HINT} --accept ${relPath}`,
+      hint: `deleting an upstream file is new divergence — regenerate and accept it: ${REGENERATE_HINT} ${acceptFlag(relPath)}`,
     });
     return findings;
+  }
+
+  const actualMode = fileModeOf(abs);
+  if (actualMode === null) {
+    findings.push({
+      kind: 'mode',
+      path: relPath,
+      detail: 'the path is neither a regular file nor a symlink, so it has no git blob mode',
+      hint: `an upstream-owned path cannot be a directory or a device — restore it, then regenerate: ${REGENERATE_HINT}`,
+    });
+    return findings;
+  }
+  if (actualMode !== entry.mode) {
+    findings.push({
+      kind: 'mode',
+      path: relPath,
+      detail: `file mode changed since the manifest was written (expected ${entry.mode}, got ${actualMode})`,
+      hint: `a mode change is divergence too — regenerate and accept it: ${REGENERATE_HINT} ${acceptFlag(relPath)}`,
+    });
   }
 
   const actual = hashFile(abs);
@@ -297,7 +480,7 @@ export function formatFindings(findings: readonly Finding[]): string {
   return findings.map((f) => `  ${f.kind} ${f.path}: ${f.detail}\n    fix: ${f.hint}`).join('\n');
 }
 
-/** Divergent = every entry the fork is not byte-identical to upstream on. */
+/** Divergent = every entry the fork is not byte- and mode-identical to upstream on. */
 export function divergentEntries(manifest: UpstreamRatchetManifest): Array<[string, UpstreamRatchetEntry]> {
   return Object.entries(manifest.files).filter(([, entry]) => entry.diff > 0);
 }

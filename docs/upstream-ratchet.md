@@ -11,10 +11,10 @@ back toward upstream freely, and may only move further away as a named, justifie
 *added* are out of scope: they are not upstream-owned and there is nothing to ratchet against.
 
 ```
-{"upstream":"b76fcb3db0236b36a4d50bed02e89eff472d0e67","files":{
-"assets/logo.png":{"diff":1,"sha256":"…","binary":true},
-"docs/gone.md":{"diff":40,"sha256":null,"deleted":true},
-"src/host-sweep.ts":{"diff":1504,"sha256":"…"}
+{"upstream":"b76fcb3db0236b36a4d50bed02e89eff472d0e67","paths":"04812c26…","files":{
+"assets/logo.png":{"diff":1,"mode":"100644","sha256":"…","binary":true},
+"docs/gone.md":{"diff":40,"mode":"100644","sha256":null,"deleted":true},
+"src/host-sweep.ts":{"diff":1504,"mode":"100644","sha256":"…"}
 }}
 ```
 
@@ -35,24 +35,40 @@ the serializer would emit.
 
 | Field | Meaning |
 |---|---|
-| `upstream` | the pinned commit. **Not** `upstream/main` — a moving base measures upstream's activity, not the fork's divergence. Re-pinning is a deliberate act (`--upstream <sha>`), done by the sync orchestrator when a theme lands. |
-| `diff` | added + deleted lines vs the pinned commit. `0` is byte-identical. For a path the fork deleted, upstream's own line count. For a binary path, `1` when the bytes differ. |
+| `upstream` | the pinned commit, always a full 40-hex sha. **Not** `upstream/main` — a moving base measures upstream's activity, not the fork's divergence. Re-pinning is a deliberate act (`--upstream <rev>`), done by the sync orchestrator when a theme lands. |
+| `paths` | coverage seal: sha256 of the pinned commit's sorted path list. Without it, deleting one entry line leaves valid, sorted, canonical JSON that every other check passes, and that path is then silently unprotected. Stable across ordinary regenerations; it moves only on a re-pin. |
+| `diff` | added + deleted lines vs the pinned commit, **plus one unit when the fork's file mode differs from upstream's**. `0` is byte- and mode-identical. For a path the fork deleted, upstream's own line count. For a binary path, `1` for the bytes. |
+| `mode` | the **fork's** working-tree mode (`100644`, `100755` or `120000`), or upstream's when the fork deleted the path. A `chmod -x` changes no bytes and no lines, so without this field it is invisible to every other check. Taken from `lstat`, not from the index, so an unstaged chmod is caught rather than hidden until it is committed. |
 | `sha256` | sha256 of the **fork's** current bytes, `null` when the fork deleted the path. For a symlink it is the hash of the link *target string*, which is what git stores for a mode-120000 blob. |
 | `deleted` | present only when the fork deleted the path. |
 | `binary` | present only when git reported the path as binary. |
 
-## Two halves, and why
+**Submodules are not supported.** A gitlink has no bytes to hash and no lines to count, so every check would
+be vacuously true for it. One on either side is refused loudly rather than recorded as something it is not.
+
+## Three parts, and why
 
 `src/upstream-ratchet.test.ts` runs in the ordinary host vitest suite and has **no git**:
 `src/test-hermeticity.ts` mocks `child_process` for every host suite, and the fork's CI clone carries no
-upstream commit objects at all. So it cannot measure a diff. What it proves is that the manifest is
-**current** — every upstream-owned file still hashes to what it hashed when its `diff` was recorded,
-deleted stays deleted, present stays present, every entry is well formed. That is what makes a recorded
-`diff` trustworthy without git.
+upstream commit objects until the ratchet's own CI step fetches them. So it cannot measure a diff. What it
+proves is that the manifest is **current** — every upstream-owned file still hashes *and still has the mode*
+it had when its `diff` was recorded, deleted stays deleted, present stays present, the pinned path set is
+complete, and every entry is well formed. That is what makes a recorded `diff` trustworthy without git.
 
-`scripts/upstream-ratchet-report.ts` has git, and does the arbitration. It recomputes every entry against
-the pinned commit with one `git diff --numstat` for the whole tree (about a quarter of a second warm) and
-classifies each path.
+`src/upstream-ratchet-core.ts` holds the arbitration as pure functions: parsing git's output, building
+entries, classifying, and the `--write` gate. It lives apart from the script so the boundary matrix has
+hermetic tests (`src/upstream-ratchet-core.test.ts`) — a test can never drive the CLI, because
+`child_process` is mocked.
+
+`scripts/upstream-ratchet-report.ts` runs git and picks an exit code, and holds no decisions of its own. It
+recomputes every entry against the pinned commit with four whole-tree git calls (about a quarter of a second
+warm) and classifies each path.
+
+**The numbers are checked in CI, not self-reported.** `.github/workflows/ci.yml` has an
+`Upstream divergence ratchet` step that fetches the pinned commit by sha (`git fetch --depth=1 <url> <sha>`,
+which GitHub serves in well under a second) and runs the report. Without it a PR could regenerate the
+manifest with `--accept-all` and nothing would ever recheck the arithmetic. Exit 2 there means the fetch did
+not land — an infrastructure failure, not a ratchet failure.
 
 ## The three commands
 
@@ -62,29 +78,42 @@ pnpm run ratchet:report -- --write           # regenerate the manifest
 pnpm run ratchet:report -- --upstream <sha>  # re-pin to a newer upstream commit
 ```
 
-Useful flags: `--accept <path>` (repeatable) and `--accept-all` permit growth in `--write`; `--root <dir>`
-points at another checkout or worktree; `--json` gives machine output.
+Useful flags: `--accept <path>` (repeatable, and `--accept=<path>` for a path that starts with a dash) and
+`--accept-all` permit growth in `--write`; `--root <dir>` points at another checkout or worktree; `--json`
+gives machine output. Every path the tool prints back to you is shell-quoted, so a suggested command can be
+pasted as-is even for a path with a space or a quote in it.
 
 The default report prints a per-file table — verdict, path, recorded diff, current diff, delta — grouped by
 verdict, then the one-line summary. Paste the table into the PR body when a diff moved:
 
 ```
 GROWTH (1)
-  GROWTH    src/host-sweep.ts                                          1,504 → 1,505 (+1)
+  GROWTH    .github/workflows/ci.yml                                   49 → 64 (+15)
 
 959 upstream-owned files at b76fcb3d: 435 modified, 294 deleted in fork, 230 byte-identical, 0 binary
-UNCHANGED 958   (measured in 240 ms)
-729 divergent files, 127,333 diff lines vs b76fcb3d (Δ 1)
+UNCHANGED 958   (measured in 269 ms)
+729 divergent files, 127,348 diff lines vs b76fcb3d (Δ 15)
 ```
 
-The pinned commit has to be in the local clone. If it is not, the script exits **2** and prints the
-`git fetch upstream <sha>` to run.
+A GROWTH row that carries a parenthesised reason (`mode 100644 → 100755`, `binary bytes changed`,
+`restored in fork`) is one where the line count alone did not move — those are the cases where added+deleted
+is not a measurement.
+
+The pinned commit has to be in the local clone. If it is not, the script exits **2** — "cannot measure",
+which is deliberately a different code from "the ratchet failed" — and prints the `git fetch upstream <sha>`
+to run. `--upstream <rev>` accepts anything `git rev-parse` understands and persists the **resolved** 40-hex
+commit, so a tag or a branch name can never end up in the manifest as a moving pin.
+
+Two things make the script refuse outright rather than measure something misleading: an upstream-owned path
+that exists on disk but is **untracked** (git would report it as deleted while its bytes are read for the
+hash — this covers ignored files and paths that have become directories), and a **submodule** on either
+side.
 
 ## Reading the verdicts
 
 | Verdict | Meaning | Effect |
 |---|---|---|
-| **GROWTH** | the fork diverged further in that file | fails (exit 1) |
+| **GROWTH** | the fork diverged further in that file, its file mode changed, or a divergent binary's bytes changed | fails (exit 1) |
 | **NEW** | a byte-identical file is now divergent, or a present file is now deleted | fails (exit 1) |
 | **SHRINK** | the fork moved back toward upstream | always allowed |
 | **STALE** | recorded as divergent, now byte-identical | allowed; the manifest owes a `--write` |
