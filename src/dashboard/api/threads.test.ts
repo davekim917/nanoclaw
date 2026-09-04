@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import http from 'http';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -10,6 +10,7 @@ import { ASSIGN_DEDUPE_MS } from '../db/item-assignments.js';
 import type { AuthedRequestContext } from '../router.js';
 import Database from 'better-sqlite3';
 
+import { enforceHermeticity } from '../../test-hermeticity.js';
 import { ensureSchema } from '../../modules/mailbox/schema.js';
 import { readSessionOutbound, type ContainerState } from '../../modules/mailbox/index.js';
 import type { SessionTranscriptEntry } from './sessions.js';
@@ -27,6 +28,35 @@ import {
   type ThreadListDeps,
   type ThreadStateInput,
 } from './threads.js';
+
+// DATA_DIR is redirected at a per-run temp root. The mailbox-seam block below
+// provisions a real session tree so the read-only seam's own path resolution is
+// exercised, and that tree must not be the running install's `data/` — these
+// tests create in it and recursively delete from it. Same redirect
+// host-sweep.test.ts and container-restart.test.ts use.
+const testDataDir = vi.hoisted(() => {
+  // `vi.hoisted` runs before this file's own imports, so the temp root has to
+  // be built with `require` — the established shape in the two suites above.
+  /* eslint-disable @typescript-eslint/no-require-imports */
+  const nodeFs = require('fs') as typeof import('fs');
+  const nodeOs = require('os') as typeof import('os');
+  const nodePath = require('path') as typeof import('path');
+  /* eslint-enable @typescript-eslint/no-require-imports */
+  return { dir: nodeFs.mkdtempSync(nodePath.join(nodeOs.tmpdir(), 'threads-data-')) };
+});
+vi.mock('../../config.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../config.js')>()),
+  get DATA_DIR() {
+    return testDataDir.dir;
+  },
+}));
+
+// Every seam this file touches is mocked or redirected, so it holds itself to
+// the strict tripwire rather than the repo's `warn` default (issue #305).
+enforceHermeticity();
+afterAll(() => {
+  fs.rmSync(testDataDir.dir, { recursive: true, force: true });
+});
 
 // container-runner drags in the whole spawn path (docker, mounts, onecli). The
 // thread list only wants two functions off it, and both are injectable or
@@ -2315,7 +2345,7 @@ describe('attention-source rows in the thread list', () => {
 describe('mailbox seam', () => {
   const seamGroup = `ag-seam-${process.pid}`;
   const seamSession = `sess-seam-${process.pid}`;
-  const seamDir = path.join(process.cwd(), 'data', 'v2-sessions', seamGroup);
+  const seamDir = path.join(testDataDir.dir, 'v2-sessions', seamGroup);
 
   beforeEach(() => {
     closeDb();
@@ -2362,7 +2392,7 @@ describe('mailbox seam', () => {
     // created it — I-4: reads never provision.
     const absentGroup = `${seamGroup}-absent`;
     expect(readContainerState(absentGroup, seamSession)).toBeNull();
-    expect(fs.existsSync(path.join(process.cwd(), 'data', 'v2-sessions', absentGroup))).toBe(false);
+    expect(fs.existsSync(path.join(testDataDir.dir, 'v2-sessions', absentGroup))).toBe(false);
     // And nothing was written beside the outbound.db it did read.
     expect(fs.readdirSync(sessionDir).sort()).toEqual(['outbound.db']);
 

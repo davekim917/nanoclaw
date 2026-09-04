@@ -7,11 +7,47 @@ import { spawn } from 'child_process';
 import Database from 'better-sqlite3';
 import path from 'path';
 import fs from 'fs';
-import { describe, expect, it, afterEach, vi } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, afterEach, vi } from 'vitest';
 
+import { allowSubprocess, enforceHermeticity } from '../../test-hermeticity.js';
 import { decideTaskAction } from './watchdog.js';
 import type { Task } from './db/tasks.js';
 import * as mailboxIndex from '../mailbox/index.js';
+
+// DATA_DIR is redirected at a per-run temp root. The read-only seam resolves
+// `<DATA_DIR>/v2-sessions/<agent group>/<session>/outbound.db` and refuses
+// anything that resolves elsewhere, so the fixtures below have to live where a
+// real session does — but "where a real session does" must not be the running
+// install's own data tree, which these tests create in and recursively delete
+// from. Same redirect host-sweep.test.ts and container-restart.test.ts use.
+const testDataDir = vi.hoisted(() => {
+  // `vi.hoisted` runs before this file's own imports, so the temp root has to
+  // be built with `require` — the established shape in the two suites above.
+  /* eslint-disable @typescript-eslint/no-require-imports */
+  const nodeFs = require('fs') as typeof import('fs');
+  const nodeOs = require('os') as typeof import('os');
+  const nodePath = require('path') as typeof import('path');
+  /* eslint-enable @typescript-eslint/no-require-imports */
+  return { dir: nodeFs.mkdtempSync(nodePath.join(nodeOs.tmpdir(), 'watchdog-data-')) };
+});
+vi.mock('../../config.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../config.js')>()),
+  get DATA_DIR() {
+    return testDataDir.dir;
+  },
+}));
+
+// This file mocks or redirects every seam it touches, so it holds itself to the
+// strict tripwire rather than the repo's `warn` default (issue #305). The one
+// real escape it needs is the lock-holding child process below, declared by
+// name so the exemption is visible.
+enforceHermeticity();
+beforeAll(() => {
+  allowSubprocess([path.basename(process.execPath)]);
+});
+afterAll(() => {
+  fs.rmSync(testDataDir.dir, { recursive: true, force: true });
+});
 
 const BASE = Date.parse('2026-04-20T12:00:00.000Z');
 
@@ -279,15 +315,16 @@ describe('decideTaskAction', () => {
 });
 
 // ─── C2: pendingTerminalSpawnOutboundSeenAt ────────────────────────────────
-// Real on-disk SQLite DBs under the install's own session tree. The helper
-// reads through the mailbox module's read-only seam (PR 6), which resolves
-// `<DATA_DIR>/v2-sessions/<agent group>/<session>/outbound.db` and refuses
-// anything that resolves elsewhere — so the fixture has to live where a real
-// session does, and a path mock would no longer be exercising the real
-// resolution at all. Agent-group ids carry the pid so parallel suites cannot
-// collide.
+// Real on-disk SQLite DBs under a session tree rooted at the redirected
+// DATA_DIR above. The helper reads through the mailbox module's read-only seam
+// (PR 6), which resolves `<DATA_DIR>/v2-sessions/<agent group>/<session>/
+// outbound.db` and refuses anything that resolves elsewhere — so the fixture
+// has to live where a real session does, and a path mock would no longer be
+// exercising the real resolution at all. Redirecting DATA_DIR keeps that true
+// while putting the tree in a temp root. Agent-group ids carry the pid so
+// parallel suites cannot collide.
 
-const TEST_ROOT = path.join(process.cwd(), 'data', 'v2-sessions');
+const TEST_ROOT = path.join(testDataDir.dir, 'v2-sessions');
 const TEST_AG_PREFIX = `wd-${process.pid}-`;
 const tmpSessions: string[] = [];
 
