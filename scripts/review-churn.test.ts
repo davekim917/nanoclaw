@@ -303,6 +303,16 @@ describe('review-churn classifier', () => {
     expect(churning.seam).toBe('src/mailbox/write.ts');
   });
 
+  it('substantiates a seam reached through a destructured dynamic import', () => {
+    // `const { evaluateGate } = await import('./gate.js')` binds the same name
+    // a static import would, and this tree prescribes that form for circular
+    // imports on the host, so it is how a named seam often arrives.
+    const churning = classify(fixture('dynamic-import-seam')).classes[0];
+    expect(churning.seam).toBe('src/gate.ts');
+    expect(churning.primitives).toContain('evaluateGate');
+    expect(churning.seamSubstantiated).toBe(true);
+  });
+
   it('substantiates a seam the findings name through an alias', () => {
     // `import { evaluateGate as gate }` binds `gate`, which is the name a
     // finding will use, while the module exports `evaluateGate`. Both spellings
@@ -320,7 +330,17 @@ describe('review-churn classifier', () => {
     // is evidence for that class only.
     const report = classify(fixture('guessed-seam-with-named-sibling'));
     expect(report.classes.find((c) => c.rounds === 3)!.seamSubstantiated).toBe(false);
+    // Two flagged FILES import it, which is the rollup's own evidence.
     expect(report.seams[0].seamSubstantiated).toBe(true);
+
+    // One file, so no collective evidence exists: a sibling class naming the
+    // module substantiates only itself, and the guessed class's rounds are not
+    // carried behind it.
+    const sameFile = fixture('guessed-seam-with-named-sibling');
+    const findings = sameFile.findings as { path: string }[];
+    for (const f of findings) f.path = 'src/tool.ts';
+    const collapsed = JSON.parse(spawn(['classify', '--json'], sameFile).stdout) as Report;
+    expect(collapsed.seams.every((seam) => !seam.seamSubstantiated)).toBe(true);
 
     // And with EVERY class a guess, the shared files still substantiate it —
     // three signatures, three files, one import, nobody naming it.

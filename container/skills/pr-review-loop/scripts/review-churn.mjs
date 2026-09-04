@@ -286,6 +286,14 @@ export function importsOf(source) {
   for (const m of source.matchAll(/^[ \t]*(?:import|export)\s+(?:type\s+)?([^;'"]*?)\s*from\s*['"]([^'"]+)['"]/gm)) {
     push(m[2], m[1]);
   }
+  // `const { a, b } = await import('x')` binds names exactly like a static
+  // import, and this tree prescribes that form for circular imports on the
+  // host — so the seam a finding names most often arrives this way.
+  for (const m of source.matchAll(
+    /^[ \t]*(?:const|let|var)\s*(\{[^}]*\}|[A-Za-z_$][\w$]*)\s*=\s*(?:await\s+)?(?:import|require)\s*\(\s*['"]([^'"]+)['"]\s*\)/gm,
+  )) {
+    push(m[2], m[1]);
+  }
   for (const m of source.matchAll(/^[^'"\n]*\bimport\s*\(\s*['"]([^'"]+)['"]\s*\)/gm)) push(m[1], '');
   for (const m of source.matchAll(/^[^'"\n]*\brequire\s*\(\s*['"]([^'"]+)['"]\s*\)/gm)) push(m[1], '');
   return out;
@@ -531,7 +539,11 @@ export function classify(payload) {
       return {
         seam,
         seamInRepo: entries[0].cls.seamInRepo,
-        seamSubstantiated: filesOnSeam.size >= 2 || entries.some((e) => e.cls.seamSubstantiated),
+        // Its own files, with no `||` borrowing a class's naming: a class that
+        // named the module substantiates ITSELF and gates at the class level.
+        // Letting it also vouch for the rollup put a guessed class's rounds
+        // behind evidence that was never about them.
+        seamSubstantiated: filesOnSeam.size >= 2,
         rounds: rounds.length,
         findings: group.length,
         lastAt: lastAt(group),
