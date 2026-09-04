@@ -297,19 +297,30 @@ interface QueuedWake {
  * queue and all of `spawnContainer`'s preparation. One definition, evaluated in
  * the one place that is adjacent to `spawn()`.
  */
+/**
+ * Why this row cannot take a wake, or `null` when it can.
+ *
+ * THE one definition, used by the universal re-read on the wake path and by the
+ * opt-in guard alike. Two copies is how the archive axis came to be checked in
+ * one place and not the other.
+ *
+ * `archived_at` is a SECOND axis, not a shade of `status`. `archiveSessionById`
+ * stamps it and leaves `status` alone, so a thread-close that archives without
+ * closing leaves a row reading `active` — and a check that asked only about
+ * `status` would wave a wake straight into a thread the operator was told was
+ * finished. The archive-only close is the ordinary outcome, not an edge one.
+ */
+function unwakeableReason(fresh: Session | undefined): string | null {
+  if (!fresh) return 'session no longer exists';
+  if (fresh.status !== 'active') return `session is ${fresh.status}`;
+  if (fresh.archived_at != null) return 'session is archived';
+  return null;
+}
+
 export function sessionStillActive(sessionId: string): WakeGuard {
   return () => {
-    const fresh = getSession(sessionId);
-    if (!fresh) return { ok: false, reason: 'session no longer exists' };
-    if (fresh.status !== 'active') return { ok: false, reason: `session is ${fresh.status}` };
-    // `archived_at` is a SECOND axis, not a shade of `status`.
-    // `archiveSessionById` stamps it and leaves `status` alone, so a
-    // thread-close that archives without closing leaves a row reading `active`
-    // — and a guard that only asked about `status` would wave a wake straight
-    // into a thread the operator was told was finished. The archive-only close
-    // is the ordinary case, not an edge one.
-    if (fresh.archived_at != null) return { ok: false, reason: 'session is archived' };
-    return true;
+    const reason = unwakeableReason(getSession(sessionId));
+    return reason === null ? true : { ok: false, reason };
   };
 }
 
@@ -555,23 +566,22 @@ function refreshActiveSession(session: Session, stage: string): Session | null {
     log.warn('Container wake abandoned — session re-read failed', { sessionId: session.id, stage, err });
     return null;
   }
-  if (!fresh) {
-    log.warn('Container wake abandoned — session no longer exists', {
+  // Every wake passes through here, guarded or not — and MOST callers pass no
+  // guard: over twenty `wakeContainer` call sites hand in a session and nothing
+  // else. So this is the only place an archive-only closure can be refused for
+  // all of them, and it uses the same predicate the opt-in guard does.
+  const reason = unwakeableReason(fresh);
+  if (reason !== null) {
+    log.warn('Container wake abandoned — session cannot take a wake', {
       sessionId: session.id,
       stage,
-      status: 'missing',
+      status: fresh?.status ?? 'missing',
+      archivedAt: fresh?.archived_at ?? null,
+      reason,
     });
     return null;
   }
-  if (fresh.status !== 'active') {
-    log.warn('Container wake abandoned — session is no longer active', {
-      sessionId: session.id,
-      stage,
-      status: fresh.status,
-    });
-    return null;
-  }
-  return fresh;
+  return fresh ?? null;
 }
 
 /**
@@ -610,10 +620,16 @@ export function wakeContainer(
   // Spawning on one produces a container getActiveSessions() will never
   // return: no stuck detection, no heartbeat ceiling, no claim tolerance, for
   // as long as it runs. The inbound row stays pending for a live session.
-  if (session.status !== 'active') {
-    log.warn('Container wake refused — session is not active', {
+  // A fast path on the object the CALLER holds, which may be stale — the
+  // authority is `refreshActiveSession` after the first await. Same predicate,
+  // so the cheap answer and the authoritative one cannot disagree about what
+  // makes a session unwakeable.
+  const callerReason = unwakeableReason(session);
+  if (callerReason !== null) {
+    log.warn('Container wake refused — session cannot take a wake', {
       sessionId: session.id,
       status: session.status,
+      reason: callerReason,
     });
     return Promise.resolve(false);
   }

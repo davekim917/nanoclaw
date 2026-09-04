@@ -1975,6 +1975,35 @@ describe('killContainer against a session that is still spawning', () => {
     expect(isContainerRunning('sess-throw-queued')).toBe(false);
   });
 
+  /**
+   * An UNGUARDED wake must be refused for an archived session too.
+   *
+   * Most callers pass no guard — over twenty `wakeContainer` call sites hand in
+   * a session and nothing else, `applySpawnComplete` among them. The opt-in
+   * guard cannot help those; the universal re-read every wake passes through is
+   * the only place that can, and it asked about `status` alone. A thread-close
+   * that archives without closing leaves the row reading `active`, so an
+   * unguarded wake launched a container for a thread the operator was told was
+   * finished.
+   */
+  it('refuses an unguarded wake for an archived session whose status is still active', async () => {
+    seedSession('sess-unguarded-archived');
+    getDb()
+      .prepare('UPDATE sessions SET archived_at = ? WHERE id = ?')
+      .run('2026-09-04T00:00:00.000Z', 'sess-unguarded-archived');
+
+    // No guard, exactly as those callers wake.
+    await expect(wakeContainer(callerSnapshot('sess-unguarded-archived'))).resolves.toBe(false);
+
+    expect(isContainerRunning('sess-unguarded-archived')).toBe(false);
+    expect(
+      vi
+        .mocked(log.warn)
+        .mock.calls.filter((call) => String(call[0]).includes('cannot take a wake'))
+        .map((call) => (call[1] as { reason: string }).reason),
+    ).toContain('session is archived');
+  });
+
   it('still does nothing for a session that is neither running nor spawning', async () => {
     seedSession('sess-idle');
     const exits: string[] = [];
