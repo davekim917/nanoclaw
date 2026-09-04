@@ -99,10 +99,12 @@ add it before you paste the token, not after.
 ### 4. Restart the host
 
 The adapter reads the suffix tokens at startup. There is no hot-start here, so
-a new bot is invisible until a restart.
+a new bot is invisible until a restart. Use the install's own helper — it picks
+launchd or systemd, derives the unit from the install slug, and waits for the
+`ncl` socket so the wiring step below does not race the restart:
 
 ```bash
-sudo systemctl restart nanoclaw-v2
+bash setup/lib/restart.sh
 ```
 
 Confirm each new channelType registered:
@@ -124,6 +126,11 @@ ncl wirings create --messaging-group-id <id> --agent-group-id <agent group id>
 
 `/manage-channels` does the same conversationally.
 
+For a **room** wiring, add `--ignored-message-policy accumulate`. `ncl wirings
+create` falls back to `drop` when the flag is omitted, and a room agent that
+drops every turn it was not mentioned in arrives at its next mention with no
+idea what the team discussed.
+
 ### 6. Open one shared room
 
 One room for the whole team, not one per pair:
@@ -140,8 +147,11 @@ access-policy detail.
 ### 7. Introduce the team
 
 The agent that requested the team posts the introduction in the room — one or
-two lines naming what each new agent is for and tagging it with its literal
-`<@U…>` token. Nothing posts it automatically.
+two lines naming what each new agent is for and mentioning it as `@name`.
+Agents never handle raw Slack ids: inbound mentions are rewritten to `@name`
+before they reach the model, and `src/channels/slack-mentions.ts` rewrites an
+agent's `@name` back into Slack's mention token on the way out. Nothing posts
+the introduction automatically.
 
 ## Verify
 
@@ -162,9 +172,11 @@ anything a specific team must always follow in that group's
 `standing-instructions.md` instead of assuming it.
 
 - **Mention-driven turn taking.** A room is a group context, so the Slack group
-  defaults apply: an agent answers when @-mentioned and then stays engaged in
-  that thread. A reply that names a sibling in prose without tagging it reaches
-  nobody.
+  declaration applies: `engageMode: 'mention'`, which means every turn needs its
+  own mention — engagement does not persist across the thread. Opt a room into
+  sticky engagement per wiring with `ncl wirings update --engage-mode
+mention-sticky` if that is what the team wants. A reply that names a sibling
+  in prose without mentioning it reaches nobody.
 - **Self-limit the ping-pong.** Consecutive sibling turns with no human message
   are capped per thread by `SLACK_MAX_BOT_HOPS` (default 24), but that is a
   backstop, not the stopping rule. Converge and hand back to the human.
@@ -184,8 +196,8 @@ holding the human as an unknown sender. `ncl messaging-groups list --json`
 shows both.
 
 **A sibling's message in the room reaches nobody.** Almost always a missing
-`<@U…>` tag rather than a permissions problem — sibling bots are admitted past
-the access gate everywhere on this fork.
+`@name` mention rather than a permissions problem — sibling bots are admitted
+past the access gate everywhere on this fork.
 
 **`conversations.open` fails with `missing_scope`.** The calling app has no
 `mpim:write`. See step 3.

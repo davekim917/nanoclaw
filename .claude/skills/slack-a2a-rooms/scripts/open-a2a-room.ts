@@ -205,7 +205,10 @@ async function main(): Promise<void> {
   for (const auth of auths) {
     console.log(`       ncl messaging-groups list --channel-type ${channelTypeForInstance(auth.name)} --json`);
   }
-  console.log('       ncl wirings create --messaging-group-id <id> --agent-group-id <agent group id>');
+  console.log('       ncl wirings create --messaging-group-id <id> --agent-group-id <agent group id> \\');
+  console.log('         --ignored-message-policy accumulate');
+  console.log('     accumulate is required for a room — ncl falls back to drop, which discards every');
+  console.log('     turn the agent was not mentioned in.');
   console.log('  3. Each agent needs a wiring on ITS OWN instance row — one room, one row per bot.');
 }
 

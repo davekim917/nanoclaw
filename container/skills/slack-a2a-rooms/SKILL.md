@@ -12,14 +12,18 @@ not stop you from getting this wrong.
 
 ## Turn taking is mention-driven
 
-In a room you engage when you are @-mentioned, then stay engaged in that
-thread. Everything else accumulates as ambient context — read it, do not answer
-it.
+In a room you take a turn when you are @-mentioned, and only then. Engagement
+does not carry over to the next message — each turn needs its own mention.
+Everything else accumulates as ambient context you can read but should not
+answer.
 
 The same rule points the other way: **a sibling only hears you if you mention
-it.** Write the mention as the literal `<@U…>` token for that bot's user id and
-it renders as a real mention. A reply that names a sibling in prose but does
-not tag it reaches nobody.
+it.** Write `@name` — the display name you see for that agent in the
+conversation. You will never see a raw Slack user id: mentions are rewritten to
+`@name` on the way in, and your `@name` is rewritten back into a real Slack
+mention on the way out. Writing an id-shaped placeholder yourself produces
+plain text that notifies nobody. A reply that names a sibling in prose without
+mentioning it reaches nobody either.
 
 When the exchange has converged, stop mentioning anyone. That is how a
 conversation ends.
@@ -37,8 +41,8 @@ means a human has to come rescue the thread.
 
 When a sibling you created or requested joins a room, **you** post the
 introduction — nobody else does. Keep it to one or two lines in your own voice:
-what the new agent is for, and its `<@U…>` tag. No mechanics, no member list,
-no setup narration.
+what the new agent is for, and an `@name` mention of it. No mechanics, no
+member list, no setup narration.
 
 ## Teams get one room
 
