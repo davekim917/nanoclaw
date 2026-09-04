@@ -31,6 +31,9 @@ import './channel-auto-wire/index.js';
 import './bash-gate/index.js';
 // Orchestrator dispatch — task dispatch pipeline + reconciler.
 import './orchestrator-dispatch/index.js';
+// Sweep family: orchestrator, dormant (seam 2, S2-PR5) — T6 reconciler,
+// T14 auto-archive, T18 task watchdog. Registers at import.
+import './sweep-orchestrator/index.js';
 // Backlog + ship-log delivery action handlers (add_ship_log, add/update/delete_backlog_item).
 import './backlog/index.js';
 // Channel-config registers delivery actions for set_channel_model /
@@ -67,3 +70,18 @@ import './sweep-central/index.js';
 // Sweep-repo-fence (seam 2, PR 8 — G08): T5 approvals-reason-sweep,
 // T22 orphaned-repo-fence-release.
 import './sweep-repo-fence/index.js';
+// Sweep family: scheduled-move recovery (seam 2, S2-PR7) — T11
+// scheduled-move-recovery, T12 audit-body-prune on tick:housekeeping.
+import './sweep-scheduled-move/index.js';
+// Sweep container health — S11 provider self-heal, S14 running-container SLA,
+// S16 OOM / memory-pressure notice (convergence seam 2, PR 10).
+import './sweep-container-health/index.js';
+// sweep-egress: T2 egress-network-reheal (S2-PR6).
+import './sweep-egress/index.js';
+// sweep-claims: T20 claims-reconcile, T21 claims-self-heal (S2-PR6).
+import './sweep-claims/index.js';
+// S2-PR6's own barrel line for sweep-storage is deliberately absent: this
+// lineage already imports that module above (S2-PR1 owns it for the
+// onHostShutdown half), and its T13 registration rides that same import.
+// Sweep family: usage-rollup (T19, host-sweep seam S2-PR12).
+import './sweep-usage/index.js';

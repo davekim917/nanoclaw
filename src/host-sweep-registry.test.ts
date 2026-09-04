@@ -47,6 +47,12 @@ const h = vi.hoisted(() => {
     opens: [] as string[],
     failNextOpen: null as unknown,
     mailbox: null as NanoclawMailboxSession | null,
+    // F-6.3: order + cross-duty visibility probe for T20 (claims-reconcile) →
+    // T21 (claims-self-heal). `claimsStore` stands in for the claims/ FIFO
+    // directory reconcile deletes from and self-heal reads.
+    claimsOrder: [] as string[],
+    claimsStore: [] as string[],
+    claimsSelfHealSawStore: null as string[] | null,
   };
 });
 
@@ -182,8 +188,19 @@ vi.mock('./storage-maintenance-worker.js', () => ({
   stopStorageMaintenanceWorker: () => undefined,
 }));
 vi.mock('./storage-pressure-alert.js', () => ({ handleStoragePressureAlert: () => undefined }));
-vi.mock('./modules/claims/reconcile.js', () => ({ reconcileMergedClaims: async () => undefined }));
-vi.mock('./modules/claims/self-heal.js', () => ({ sweepClaimsSelfHeal: async () => undefined }));
+vi.mock('./modules/claims/reconcile.js', () => ({
+  reconcileMergedClaims: async () => {
+    h.claimsOrder.push('reconcile');
+    // Simulates the reconcile pass closing a merged claim before self-heal runs.
+    h.claimsStore = h.claimsStore.filter((c) => c !== 'claim-merged');
+  },
+}));
+vi.mock('./modules/claims/self-heal.js', () => ({
+  sweepClaimsSelfHeal: async () => {
+    h.claimsOrder.push('self-heal');
+    h.claimsSelfHealSawStore = [...h.claimsStore];
+  },
+}));
 vi.mock('./repo-fence-recovery.js', () => ({ sweepOrphanedRepoIngressFences: async () => null }));
 vi.mock('./db/channel-ingress-receipts.js', () => ({ pruneChannelIngressReceipts: vi.fn(() => undefined) }));
 vi.mock('./db/usage.js', () => ({ rollupSessionUsage: () => 0, pruneOldTurnUsage: () => undefined }));
@@ -235,7 +252,17 @@ import {
   type SweepSessionContext,
   type SweepTickContext,
 } from './host-sweep.js';
+// Registers S11/S14/S16 as a duty source at import time — needed so
+// `_resetSweepRegistryForTesting()`'s default replay (every recorded source,
+// not just the in-file built-ins) still surfaces the moved duties for R-7,
+// R-10 and R-11.
+import './modules/sweep-container-health/index.js';
 import { log } from './log.js';
+// Family module side-effect import (S2-PR7): registers T11
+// (scheduled-move-recovery) and T12 (audit-body-prune) as a duty source, so
+// R-7 below sees them at tick:housekeeping order 50/60 the same as every
+// other family this registry tracks.
+import './modules/sweep-scheduled-move/index.js';
 import { SessionDbMissingError, SessionDbUnopenableError } from './modules/mailbox/index.js';
 import { _mailboxSessionDepthForTesting } from './host-sweep-depth-probe.js';
 // Family modules moved out of host-sweep.ts register at import — pull them in
@@ -248,6 +275,16 @@ import './modules/sweep-idle-reap/index.js';
 // S2-PR4 moved the central housekeeping duties. Their own duty-body mocks are
 // already declared above (this file predates the move and anticipated it).
 import './modules/sweep-central/index.js';
+// S2-PR5 moved T6/T14/T18 (reconciler, auto-archive, task watchdog).
+import './modules/sweep-orchestrator/index.js';
+// S2-PR6 moved T2 (egress), T13 (storage) and T20/T21 (claims).
+import './modules/sweep-egress/index.js';
+import './modules/sweep-storage/index.js';
+import './modules/sweep-claims/index.js';
+// Side-effect import: registers 'sweep-usage' as a duty source (S2-PR12) so
+// R-7's registration count includes T19 after the family module moved it out
+// of host-sweep.ts's own in-file builtins.
+import './modules/sweep-usage/index.js';
 
 probe.depth = _mailboxSessionDepthForTesting;
 
@@ -365,6 +402,9 @@ describe('sweep duty registry (S2-PR2)', () => {
     h.opens = [];
     h.failNextOpen = null;
     h.mailbox = fakeMailbox();
+    h.claimsOrder = [];
+    h.claimsStore = ['claim-merged', 'claim-open'];
+    h.claimsSelfHealSawStore = null;
   });
 
   afterEach(() => {
@@ -1053,6 +1093,53 @@ describe('sweep duty registry (S2-PR2)', () => {
     expect(typeof idleReap.shouldReapIdleTaskContainer).toBe('function');
     expect(typeof idleReap.shouldReapIdleChatContainer).toBe('function');
     expect(idleReap.CHAT_IDLE_REAP_MS).toBe(15 * 60 * 1000);
+  });
+
+  // ── F-5.4 (S2-PR5, plan.md §8) ───────────────────────────────────────────────
+  it('reconciler, thread-close and watchdog run in tick:post-session', () => {
+    // The container-state ordering constraint (plan.md §4.3 constraint 1)
+    // survives the move of T6/T18 into src/modules/sweep-orchestrator/. T8
+    // thread-close is S2-PR11's family — assert its declared phase only, not
+    // its behavior.
+    const { duties } = _listSweepRegistrationsForTesting();
+    const byName = new Map(duties.map((d) => [d.name, d]));
+    for (const name of [SWEEP_DUTY_INVENTORY.T6, SWEEP_DUTY_INVENTORY.T8, SWEEP_DUTY_INVENTORY.T18]) {
+      expect(byName.get(name), `duty ${name}`).toBeDefined();
+      expect(byName.get(name)?.phase, `duty ${name}`).toBe('tick:post-session');
+    }
+  });
+
+  // ── F-6.3 (S2-PR6) ───────────────────────────────────────────────────────────
+  it('claims reconcile is ordered strictly before claims self-heal', async () => {
+    // Declared order: T20 (claims-reconcile, order 100) then T21
+    // (claims-self-heal, order 110), both tick:housekeeping (plan.md §4.3
+    // constraint 3). No sessions needed — tick:housekeeping runs regardless.
+    const { duties } = _listSweepRegistrationsForTesting();
+    const byName = new Map(duties.map((d) => [d.name, d]));
+    const reconcile = byName.get(SWEEP_DUTY_INVENTORY.T20);
+    const selfHeal = byName.get(SWEEP_DUTY_INVENTORY.T21);
+    expect(reconcile?.phase).toBe('tick:housekeeping');
+    expect(selfHeal?.phase).toBe('tick:housekeeping');
+    expect(reconcile?.order).toBeLessThan(selfHeal?.order ?? Infinity);
+
+    await _sweepOnceForTesting();
+
+    // Order, and NOT merely declared order — the probe proves reconcile's
+    // deletion of 'claim-merged' is visible to self-heal in the SAME tick.
+    expect(h.claimsOrder).toEqual(['reconcile', 'self-heal']);
+    expect(h.claimsSelfHealSawStore).toEqual(['claim-open']);
+    expect(h.spawns).toEqual([]);
+  });
+
+  // ── F-6.4 (S2-PR6) ───────────────────────────────────────────────────────────
+  it('egress re-heal runs before the session fan-out', () => {
+    // tick:pre-session is, by SWEEP_PHASES's declared order (R-1), the phase
+    // the driver runs before getActiveSessions()/the per-session loop.
+    const { duties } = _listSweepRegistrationsForTesting();
+    const egress = duties.find((d) => d.name === SWEEP_DUTY_INVENTORY.T2);
+    expect(egress).toBeDefined();
+    expect(egress?.phase).toBe('tick:pre-session');
+    expect(SWEEP_PHASES.indexOf('tick:pre-session')).toBeLessThan(SWEEP_PHASES.indexOf('session:plan'));
   });
 
   // ── duty registration sources ───────────────────────────────────────────────

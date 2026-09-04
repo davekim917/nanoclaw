@@ -28,50 +28,30 @@
  *        claimed a message and went quiet past tolerance since the claim."
  */
 import type Database from 'better-sqlite3';
-import { randomUUID } from 'crypto';
 import fs from 'fs';
 import path from 'path';
 
 import { SELF_HEAL_ENABLED } from './config.js';
-import { ensureEgressNetwork } from './egress-lockdown.js';
-import { readContainerConfig } from './container-config.js';
-import { markProviderUnavailable } from './db/provider-health.js';
-import { resolveSpawnProvider } from './provider-fallback.js';
-import { resolveContainerResources } from './container-resources.js';
 import { getActiveSessions, getSession, isTaskThread, updateSession } from './db/sessions.js';
 import { getAgentGroup } from './db/agent-groups.js';
 import {
   SessionDbMissingError,
   SessionDbUnopenableError,
-  sessionMailboxPath,
-  readSessionOutbound,
   type ForkContainerStateRow as ContainerState,
   type NanoclawMailboxSession,
 } from './modules/mailbox/index.js';
 import { withExistingNanoclawSession } from './modules/mailbox/session.js';
-// The scheduled-move recovery below walks an INJECTED sessions root, not
-// DATA_DIR, so its session DBs are not addressable by a mailbox key and it
-// cannot go through the seam. It stays on the module's own open funnel — the
-// one place in this file that still opens a session DB by path.
-import { openInboundDb as openInboundDbByPath } from './modules/mailbox/openers.js';
-import { restoreTaskRow, type TaskRowSnapshot } from './modules/scheduling/db.js';
-import { countLiveRowsInSessions } from './modules/scheduling/live-count.js';
 import { runHostGatedTaskScripts } from './modules/scheduling/host-script.js';
-import { purgeIntentBody } from './dashboard/api/scheduled-shared.js';
 import { advanceThreadClosures, syncDoneProposalMirror } from './dashboard/thread-close.js';
 import { log } from './log.js';
 import {
-  heartbeatPath,
   sessionDir,
   sessionsBaseDir,
-  writeSessionMessage,
   admitDueTaskContexts,
   deferMessageForFreshContextRetry,
 } from './session-manager.js';
-import { rollupSessionUsage, pruneOldTurnUsage } from './db/usage.js';
 import {
   getContainerSpawnedAt,
-  hasContainerEverRun,
   getActiveContainerSessionIds,
   isContainerRunning,
   containerOwnsOutbound,
@@ -79,29 +59,8 @@ import {
   sessionStillActive,
   wakeContainer,
 } from './container-runner.js';
-import {
-  SESSION_ARTIFACT_IDLE_MS as STORAGE_SESSION_ARTIFACT_IDLE_MS,
-  collectThreadWorktreeActivity,
-  pruneIdleSessionArtifacts as pruneIdleSessionArtifactsImpl,
-  pruneIdleThreadArtifacts as pruneIdleThreadArtifactsImpl,
-  type ThreadWorktreeActivity,
-} from './storage-manager.js';
-import { startStorageMaintenanceOnce } from './modules/sweep-storage/index.js';
 import type { Session } from './types.js';
 import { getDb } from './db/connection.js';
-import {
-  autoArchiveCompletedBefore,
-  getActiveTasks,
-  transitionToTerminal,
-} from './modules/orchestrator-dispatch/db/tasks.js';
-import { getCapabilityConfig } from './modules/orchestrator-dispatch/db/agent-group-capabilities.js';
-import { runReconcilerSweep } from './modules/orchestrator-dispatch/reconciler.js';
-import { decideTaskAction, pendingTerminalSpawnOutboundSeenAt } from './modules/orchestrator-dispatch/watchdog.js';
-import { OomKillObserver } from './resource-oom-observer.js';
-import { reconcileMergedClaims } from './modules/claims/reconcile.js';
-import { sweepClaimsSelfHeal } from './modules/claims/self-heal.js';
-
-const oomKillObserver = new OomKillObserver();
 
 /**
  * Session-DB timestamp parsing now lives with the mailbox module that owns
@@ -147,10 +106,6 @@ export const PENDING_MESSAGE_MAX_AGE_MS =
   (Number.isFinite(parsedMaxAgeHours) && parsedMaxAgeHours > 0 ? parsedMaxAgeHours : 24) * 60 * 60 * 1000;
 const MAX_TRIES = 5;
 const BACKOFF_BASE_MS = 5000;
-
-// Back-compat export for callers that still reference the old host-sweep
-// cleanup threshold. Storage-manager owns the actual cache cleanup policy.
-export const SESSION_ARTIFACT_IDLE_MS = STORAGE_SESSION_ARTIFACT_IDLE_MS;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Sweep duty registry (convergence seam 2, PR 2)
@@ -295,7 +250,7 @@ export interface SweepSessionContext extends SweepTickContext {
  * reached through the per-session driver, so this is a shape assertion with a
  * loud failure rather than a silent cast.
  */
-function asSessionContext(ctx: SweepTickContext | SweepSessionContext): SweepSessionContext {
+export function asSessionContext(ctx: SweepTickContext | SweepSessionContext): SweepSessionContext {
   if (!('session' in ctx)) throw new Error('a session-phase duty ran with a tick context');
   return ctx;
 }
@@ -586,7 +541,7 @@ async function runExclusiveSessionPhase(ctx: SweepSessionContext, phase: SweepPh
   if (fallthrough) await runDutyBody(fallthrough.name, phase, () => fallthrough.run(ctx));
 }
 
-async function runSlaObservationHooks(
+export async function runSlaObservationHooks(
   ctx: SweepSessionContext,
   state: ContainerState | null,
   mailbox: NanoclawMailboxSession,
@@ -596,7 +551,7 @@ async function runSlaObservationHooks(
   }
 }
 
-async function runSweepKillFollowUps(
+export async function runSweepKillFollowUps(
   ctx: SweepSessionContext,
   outcome: StuckDecision,
   mailbox: NanoclawMailboxSession,
@@ -695,78 +650,16 @@ export const SWEEP_DUTY_INVENTORY: Readonly<Record<string, string>> = {
   S19: 'spent-task-session-gc',
 };
 
+/**
+ * The decision `enforceRunningContainerSla` (S14, moved to
+ * `src/modules/sweep-container-health/index.ts`) computes and acts on. Stays
+ * here because `SweepKillFollowUp.run` and the S15/S10 kill follow-ups below
+ * (owned by other family PRs) reference it by name.
+ */
 export type StuckDecision =
   | { action: 'ok' }
   | { action: 'kill-ceiling'; heartbeatAgeMs: number; ceilingMs: number }
   | { action: 'kill-claim'; messageId: string; claimAgeMs: number; toleranceMs: number };
-
-/**
- * Pure decision for whether a running container should be killed this sweep
- * tick. Inputs are all deterministic; filesystem + DB reads happen in the
- * caller.
- */
-export function decideStuckAction(args: {
-  now: number;
-  heartbeatMtimeMs: number; // 0 when heartbeat file absent
-  containerState: ContainerState | null;
-  claims: Array<{ message_id: string; status_changed: string }>;
-  // Wall-clock when the host spawned the current container. Optional;
-  // omit (or pass 0) to disable the grace check. Used to gate the
-  // kill-claim path so a fresh container has SPAWN_GRACE_MS to clean its
-  // own pre-existing claims before being killed for them.
-  spawnedAtMs?: number;
-}): StuckDecision {
-  const { now, heartbeatMtimeMs, containerState, claims } = args;
-  const spawnedAtMs = args.spawnedAtMs ?? 0;
-  const declaredOperationMs = activeOperationTimeoutMs(containerState);
-
-  // Ceiling check only applies when we have an actual heartbeat timestamp.
-  // A freshly-spawned container hasn't had any SDK activity yet so no
-  // heartbeat file exists — if we treated that as infinitely stale we'd
-  // kill every container within seconds of spawn. Genuinely-dead containers
-  // that never wrote a heartbeat are caught by the separate "container
-  // process not running" cleanup path, not here. If a fresh container is
-  // hanging at the gate (claimed a message but never did anything) the
-  // claim-stuck check below handles it.
-  if (heartbeatMtimeMs !== 0) {
-    const heartbeatAge = now - heartbeatMtimeMs;
-    const ceiling = Math.max(ABSOLUTE_CEILING_MS, declaredOperationMs ?? 0);
-    if (heartbeatAge > ceiling) {
-      // Skip kill when the stale heartbeat is from a PRIOR container
-      // instance AND we're still inside the spawn-grace window. The
-      // heartbeat file persists across container restarts at a host-side
-      // path mounted into /workspace/.heartbeat — the new container
-      // inherits the previous instance's stale mtime until its first
-      // poll-loop iteration touches it. Without this, a host restart
-      // (or any post-crash respawn for a session whose previous heartbeat
-      // had already aged past the ceiling) SIGKILLs the fresh container
-      // before the agent-runner can mark itself alive, creating an
-      // infinite spawn → kill → respawn loop.
-      const inSpawnGrace = spawnedAtMs > 0 && now - spawnedAtMs < SPAWN_GRACE_MS;
-      const heartbeatFromPriorContainer = spawnedAtMs > 0 && heartbeatMtimeMs < spawnedAtMs;
-      if (!(inSpawnGrace && heartbeatFromPriorContainer)) {
-        return { action: 'kill-ceiling', heartbeatAgeMs: heartbeatAge, ceilingMs: ceiling };
-      }
-    }
-  }
-
-  const tolerance = Math.max(CLAIM_STUCK_MS, declaredOperationMs ?? 0);
-  // True only for claims this container could have produced itself; older
-  // claims are leftovers from a prior crashed container and the fresh one
-  // gets SPAWN_GRACE_MS to clean them on startup before we kill for them.
-  const inGrace = spawnedAtMs > 0 && now - spawnedAtMs < SPAWN_GRACE_MS;
-  for (const claim of claims) {
-    const claimedAt = parseSqliteUtc(claim.status_changed);
-    if (Number.isNaN(claimedAt)) continue;
-    const claimAge = now - claimedAt;
-    if (claimAge <= tolerance) continue;
-    if (heartbeatMtimeMs > claimedAt) continue;
-    if (inGrace && claimedAt < spawnedAtMs) continue;
-    return { action: 'kill-claim', messageId: claim.message_id, claimAgeMs: claimAge, toleranceMs: tolerance };
-  }
-
-  return { action: 'ok' };
-}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Ceiling-kill accountability wake.
@@ -863,7 +756,7 @@ export function decideContinuationWake(args: {
  * Returns `undefined` when a container owns the file — never an error. Every
  * caller's write is idempotent or retried on the next tick.
  */
-function writeOutboundWhenStopped<T>(
+export function writeOutboundWhenStopped<T>(
   session: Session,
   mailbox: NanoclawMailboxSession,
   action: (mailbox: NanoclawMailboxSession) => T,
@@ -1039,7 +932,7 @@ export function countToolRecoveryAttemptsSinceRealInbound(mailbox: NanoclawMailb
  * into the host-owned inbound DB. The row id doubles as the durable marker the
  * per-class attempt caps count, so every self-heal action goes through here.
  */
-function writeSystemWake(
+export function writeSystemWake(
   mailbox: NanoclawMailboxSession,
   session: Session,
   id: string,
@@ -1159,194 +1052,21 @@ export function _applyCeilingFollowUpForTesting(
   return applyCeilingFollowUp(mailbox, session, containerState, workContinuation, heartbeatAgeMs, ceilingMs);
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Failed-provider self-heal.
+// Failed-provider self-heal (S11), running-container SLA (S14) and the OOM /
+// memory-pressure notice (S16) moved to
+// `src/modules/sweep-container-health/index.ts` (convergence seam 2, PR 10).
 //
-// A container whose provider has given up writes provider_status='failed' and
-// then sits alive-but-useless until a human notices. Nothing reaps it: it holds
-// a claim so the idle reapers pass, and the absolute ceiling only fires after
-// 30 more silent minutes and then leaves the session dead until the next ping.
-//
-// Detection keys on provider_status because it is the only column carrying the
-// provider's own "I am done" verdict. Today only the Codex provider ever writes
-// it (container/agent-runner/src/providers/codex.ts) — Claude and OpenCode
-// never do — so this heals Codex sessions only until they follow. It is
-// deliberately NOT built on provider_executing: that flag says "busy", not
-// "given up", and a wedged provider can be either.
-//
-// Two consecutive sweep ticks are required so a transition the container
-// recovers from on its own never costs it a kill.
-// ─────────────────────────────────────────────────────────────────────────────
-
-/** Consecutive `failed` observations required before acting. */
-export const PROVIDER_HEAL_CONSECUTIVE_TICKS = 2;
-export const PROVIDER_HEAL_MAX_ATTEMPTS = 2;
-export const PROVIDER_HEAL_COOLDOWN_MS = 10 * 60 * 1000;
-const PROVIDER_HEAL_ID_PREFIX = 'provider-heal-';
-
-// sessionId → consecutive ticks observed with provider_status === 'failed'.
-// Mirrors the quietSessions cache above: module-level, host-lifetime, cleared
-// by any observation that is not 'failed' (including the container going away,
-// so a fresh container never inherits a half-finished debounce).
-const providerFailedTicks = new Map<string, number>();
-
-export type ProviderHealDecision = 'none' | 'wait' | 'heal' | 'park';
-
-export function decideProviderHeal(args: {
-  alive: boolean;
-  providerStatus: string | null | undefined;
-  consecutiveFailedTicks: number;
-  priorAttempts: number;
-  /** Age of the newest provider-heal marker row, or null when there is none. */
-  msSinceLastAttempt: number | null;
-}): ProviderHealDecision {
-  if (!args.alive || args.providerStatus !== 'failed') return 'none';
-  if (args.consecutiveFailedTicks < PROVIDER_HEAL_CONSECUTIVE_TICKS) return 'wait';
-  if (args.priorAttempts >= PROVIDER_HEAL_MAX_ATTEMPTS) return 'park';
-  if (args.msSinceLastAttempt !== null && args.msSinceLastAttempt < PROVIDER_HEAL_COOLDOWN_MS) return 'wait';
-  return 'heal';
-}
-
-/** Advance (or reset) the two-tick debounce. Returns the new consecutive count. */
-export function observeProviderStatus(sessionId: string, providerStatus: string | null | undefined): number {
-  if (providerStatus !== 'failed') {
-    providerFailedTicks.delete(sessionId);
-    return 0;
-  }
-  const ticks = (providerFailedTicks.get(sessionId) ?? 0) + 1;
-  providerFailedTicks.set(sessionId, ticks);
-  return ticks;
-}
-
-export function countProviderHealAttemptsSinceRealInbound(mailbox: NanoclawMailboxSession): number {
-  return mailbox.countRecoveryAttemptsSinceRealInbound(PROVIDER_HEAL_ID_PREFIX);
-}
-
-/** Age of the newest provider-heal marker row, or null when there is none. */
-export function providerHealLastAttemptAgeMs(mailbox: NanoclawMailboxSession, now: number): number | null {
-  const ts = mailbox.latestRecoveryMarkerTimestamp(PROVIDER_HEAL_ID_PREFIX);
-  if (!ts) return null;
-  const at = parseSqliteUtc(ts);
-  return Number.isFinite(at) ? Math.max(0, now - at) : null;
-}
-
-/** Newest provider-heal marker id — the per-episode idempotency key for the parked notice. */
-function providerHealLastAttemptId(mailbox: NanoclawMailboxSession): string | null {
-  return mailbox.latestRecoveryMarkerId(PROVIDER_HEAL_ID_PREFIX);
-}
-
-/**
- * Kill the failed container and queue the accountability wake that respawns it.
- * The wake row is written BEFORE the kill so the attempt is durably counted
- * even if the kill fizzles; on_wake rows are only consumed by a fresh
- * container's first poll, so the dying one cannot steal it.
- */
-function applyProviderHeal(
-  mailbox: NanoclawMailboxSession,
-  session: Session,
-  agentGroupFolder: string,
-  containerState: ContainerState | null,
-): void {
-  const failureReason = containerState?.provider_failure_reason ?? null;
-  let primaryProvider: string | null = null;
-  let routedTo: string | null = null;
-  try {
-    const containerConfig = readContainerConfig(agentGroupFolder);
-    const resolveArgs = {
-      agentGroupId: session.agent_group_id,
-      sessionProvider: session.agent_provider,
-      containerConfig,
-    };
-    primaryProvider = resolveSpawnProvider(resolveArgs).primaryProvider;
-    // A group with no declared fallback has nowhere to route, so recording a
-    // health window would only delay the honest error an operator needs to see.
-    // Owner-approved: respawn on the primary anyway, under the same cap.
-    if (containerConfig.providerFallback?.provider && failureReason) {
-      markProviderUnavailable(session.agent_group_id, primaryProvider, 'unavailable', { message: failureReason });
-    }
-    routedTo = resolveSpawnProvider(resolveArgs).provider;
-  } catch (err) {
-    log.warn('self-heal: provider routing lookup failed — respawning as configured', { sessionId: session.id, err });
-  }
-
-  const routedNote =
-    routedTo && primaryProvider && routedTo !== primaryProvider ? `; this session is now running on ${routedTo}` : '';
-  writeSystemWake(
-    mailbox,
-    session,
-    `${PROVIDER_HEAL_ID_PREFIX}${Date.now()}`,
-    `[system] Your previous container was restarted because its provider reported a hard failure` +
-      `${failureReason ? ` (${failureReason})` : ''}${routedNote}. Anything in flight was lost. ` +
-      `Check your durable checkpoints, resume what is safely resumable, and post ONE message accounting for ` +
-      `state — done / lost / next. Re-check any work claims in claims/ before resuming a seam. ` +
-      `If nothing was in flight, say so in one line.`,
-    { kind: 'agent_provider_heal', provider: primaryProvider, routed_to: routedTo, failure_reason: failureReason },
-  );
-
-  log.warn('self-heal: restarting container on failed provider', {
-    class: 'failed-provider',
-    sessionId: session.id,
-    provider: primaryProvider,
-    routedTo,
-    failureReason,
-  });
-}
-
-/**
- * The kill half of a provider heal.
- *
- * Split out of `applyProviderHeal` so it can run with NO mailbox session open.
- * `killContainer`'s `onExit` respawns the session, and its status-cleanup hop
- * through `delivery.ts` opens a session of its own — both on THIS key. Running
- * either from inside a session would trip the same-key nesting guard
- * (invariant I-3); the wake row is already durable by the time we get here,
- * which is the ordering the heal has always relied on.
- */
-function killForProviderHeal(session: Session): void {
-  killContainer(session.id, 'provider-failed-selfheal', () => {
-    void wakeContainer(session, 'interactive', { guard: sessionStillActive(session.id) });
-  });
-}
-
-/**
- * One visible notice when the attempt budget is spent, shaped like
- * notifyContinuationParked. Idempotent per heal episode: the key is the newest
- * marker row's id, which only changes when a fresh heal runs, and real inbound
- * resets the whole budget.
- */
-export function notifyProviderHealParked(
-  mailbox: NanoclawMailboxSession,
-  session: Session,
-  failureReason: string | null,
-  writeMessage: (message: {
-    id: string;
-    kind: string;
-    platformId: string | null;
-    channelType: string | null;
-    threadId: string | null;
-    content: string;
-  }) => void = (message) => mailbox.writeOutboundDirect(message),
-): boolean {
-  const episode = providerHealLastAttemptId(mailbox) ?? 'unknown';
-  const marker = `provider_heal_parked:${episode}`;
-  if (mailbox.outboundHasContentLike(marker)) return false;
-  const routing = mailbox.readSessionRouting();
-  if (!routing) return false;
-  writeMessage({
-    id: `provider-heal-parked-${episode}`,
-    kind: 'chat',
-    platformId: routing.platform_id,
-    channelType: routing.channel_type,
-    threadId: routing.thread_id,
-    content: JSON.stringify({
-      text:
-        `⚠️ My agent provider keeps failing${failureReason ? ` (${failureReason})` : ''} and ${PROVIDER_HEAL_MAX_ATTEMPTS} ` +
-        `automatic restarts did not fix it. I have stopped retrying. Reply in this thread and I will try again.`,
-      _system: { kind: marker, failure_reason: failureReason },
-    }),
-  });
-  return true;
-}
+// `providerFailedTicks` itself stays here, exported, rather than moving with
+// the rest of S11's body: the driver's own `!alive` cleanup below must stay
+// SYNCHRONOUS (a dynamic import there proved to add an await suspension
+// point the pre-seam code never had, letting a concurrent wake observe a
+// stale `alive=false` across the gap — Codex review, S2-PR10). The map's
+// SEMANTICS — the two-tick debounce, read and written only by
+// `observeProviderStatus`/`decideProviderHeal` — belong entirely to S11 in
+// `sweep-container-health`; that module imports this export directly
+// (module → host-sweep.js, the same direction every family already uses for
+// `SWEEP_DUTY_INVENTORY` — no cycle, no TDZ).
+export const providerFailedTicks = new Map<string, number>();
 
 /**
  * Run one short mailbox session for a session id.
@@ -1361,116 +1081,6 @@ export function notifyProviderHealParked(
  * Resolves `undefined` when the mailbox is gone — the read-path contract.
  */
 export type SessionRunner = <T>(action: (mailbox: NanoclawMailboxSession) => T | Promise<T>) => Promise<T | undefined>;
-
-/**
- * Detection + action for one alive session. Always advances the debounce;
- * acts only when NANOCLAW_SELF_HEAL is armed. Returns true when the container
- * was killed, so the caller skips the reap/SLA checks for this tick.
- *
- * `containerState` is read by the caller (it needs it for the reap decisions
- * too); everything else this needs is read inside its own short session, and
- * every kill happens between two of them.
- */
-async function sweepProviderHeal(
-  run: SessionRunner,
-  session: Session,
-  agentGroupFolder: string,
-  containerState: ContainerState | null,
-  writeParkedMessage?: Parameters<typeof notifyProviderHealParked>[3],
-): Promise<boolean> {
-  const providerStatus = containerState?.provider_status ?? null;
-  const consecutiveFailedTicks = observeProviderStatus(session.id, providerStatus);
-  const budget = await run((mailbox) => ({
-    priorAttempts: countProviderHealAttemptsSinceRealInbound(mailbox),
-    msSinceLastAttempt: providerHealLastAttemptAgeMs(mailbox, Date.now()),
-  }));
-  if (!budget) return false;
-  const { priorAttempts, msSinceLastAttempt } = budget;
-  const decision = decideProviderHeal({
-    alive: true,
-    providerStatus,
-    consecutiveFailedTicks,
-    priorAttempts,
-    msSinceLastAttempt,
-  });
-  if (decision === 'none' || decision === 'wait') return false;
-
-  const bounds = {
-    class: 'failed-provider',
-    sessionId: session.id,
-    providerStatus,
-    consecutiveFailedTicks,
-    priorAttempts,
-    maxAttempts: PROVIDER_HEAL_MAX_ATTEMPTS,
-    msSinceLastAttempt,
-    cooldownMs: PROVIDER_HEAL_COOLDOWN_MS,
-    failureReason: containerState?.provider_failure_reason ?? null,
-  };
-  if (!SELF_HEAL_ENABLED) {
-    log.info(`self-heal: would ${decision} failed provider`, bounds);
-    return false;
-  }
-
-  if (decision === 'park') {
-    // Kill first, then post: outbound.db has exactly one writer, and the
-    // container must be confirmed stopped before the host writes to it (same
-    // ordering as the kill-ceiling notice). No onExit — parked means no
-    // respawn until real inbound resets the budget.
-    log.warn('self-heal: provider heal budget exhausted — parking', bounds);
-    killContainer(session.id, 'provider-failed-selfheal-parked');
-    try {
-      await run((mailbox) => {
-        // Same yield boundary as the kill-ceiling notice: the park kill is
-        // above, this session opened after it, and a respawn in that gap owns
-        // outbound.db. The notice is one-per-episode and idempotent, so
-        // skipping it costs nothing a later tick cannot redo.
-        return writeOutboundWhenStopped(session, mailbox, () =>
-          notifyProviderHealParked(
-            mailbox,
-            session,
-            containerState?.provider_failure_reason ?? null,
-            writeParkedMessage,
-          ),
-        );
-      });
-    } catch (err) {
-      log.warn('self-heal: parked notice failed', { sessionId: session.id, err });
-    }
-    return true;
-  }
-
-  // Wake row first (durably counted even if the kill fizzles), session closed,
-  // then the kill and its respawn.
-  const wrote = await run((mailbox) => {
-    applyProviderHeal(mailbox, session, agentGroupFolder, containerState);
-    return true;
-  });
-  if (!wrote) return false;
-  killForProviderHeal(session);
-  return true;
-}
-
-/** Test-only entry point over an injected session. */
-export function _sweepProviderHealForTesting(
-  mailbox: NanoclawMailboxSession,
-  session: Session,
-  agentGroupFolder: string,
-  containerState: ContainerState | null,
-  writeParkedMessage?: Parameters<typeof notifyProviderHealParked>[3],
-): Promise<boolean> {
-  return sweepProviderHeal(
-    async (action) => action(mailbox),
-    session,
-    agentGroupFolder,
-    containerState,
-    writeParkedMessage,
-  );
-}
-
-/** Test-only: clear the module-level two-tick debounce between cases. */
-export function _resetProviderHealTicksForTesting(): void {
-  providerFailedTicks.clear();
-}
 
 let running = false;
 
@@ -1693,260 +1303,6 @@ export async function _prepareDueWakeForTesting(
   return prepareDueWake(mailbox, agentGroupId, sessionId);
 }
 
-// ─── Scheduled-move recovery + audit-body prune (D3 / D4) ─────────────────────
-
-interface MoveRecoveryOptions {
-  /** Sessions root parent; defaults to the real DATA_DIR's parent of v2-sessions. */
-  dataDir?: string;
-  nowMs?: number;
-}
-
-// TaskRowSnapshot fields, parsed from the intent's detail_json (A-1: a type
-// alias, not an empty-extends interface — clears the lone no-empty-interface lint).
-type MoveIntentSnapshot = TaskRowSnapshot;
-
-/**
- * Resolve the target channel-root session id (thread_id IS NULL, active) for a
- * (targetAgentGroupId, targetMessagingGroupId) pair from the central DB.
- * Defensive: returns null on any error (e.g. the `sessions` table is absent in a
- * minimal test DB, or no session exists yet because the move crashed before the
- * target insert). A null target session contributes 0 to the scoped count.
- */
-function resolveTargetSessionId(
-  centralDb: Database.Database,
-  targetAgentGroupId: string,
-  targetMessagingGroupId: string,
-): string | null {
-  try {
-    const row = centralDb
-      .prepare(
-        "SELECT id FROM sessions WHERE agent_group_id = ? AND messaging_group_id = ? AND thread_id IS NULL AND status = 'active' LIMIT 1",
-      )
-      .get(targetAgentGroupId, targetMessagingGroupId) as { id: string } | undefined;
-    return row?.id ?? null;
-  } catch {
-    return null;
-  }
-}
-
-interface ParsedIntentDetail {
-  snapshot: MoveIntentSnapshot | null;
-  targetAgentGroupId: string | null;
-  targetMessagingGroupId: string | null;
-}
-
-function parseIntentDetail(detailJson: string | null): ParsedIntentDetail {
-  if (!detailJson) return { snapshot: null, targetAgentGroupId: null, targetMessagingGroupId: null };
-  try {
-    const d = JSON.parse(detailJson) as {
-      snapshot?: MoveIntentSnapshot;
-      targetAgentGroupId?: string;
-      targetMessagingGroupId?: string;
-    };
-    return {
-      snapshot: d.snapshot ?? null,
-      targetAgentGroupId: typeof d.targetAgentGroupId === 'string' ? d.targetAgentGroupId : null,
-      targetMessagingGroupId: typeof d.targetMessagingGroupId === 'string' ? d.targetMessagingGroupId : null,
-    };
-  } catch {
-    return { snapshot: null, targetAgentGroupId: null, targetMessagingGroupId: null };
-  }
-}
-
-/**
- * Consume unresolved `move_intent` rows older than one sweep interval (D3).
- *
- * SCOPED predicate (M1): the live-row count is taken over EXACTLY {source
- * session, target session} — never a bare-series_id fleet scan that an unrelated
- * group reusing the same series_id could falsely satisfy. A crash BEFORE the
- * move's cancel leaves the SOURCE live; a crash after a successful target insert
- * leaves the TARGET live. If either holds a live row → stamp + purge (the move
- * resolved itself), never restore (would double the live rows). If the scoped
- * count is a readable ZERO → restore the source from the snapshot, re-checking
- * zero-live immediately before the insert (idempotent compensation, M10).
- *
- * FAIL-SAFE (F6 / M2): if the scoped count is UNREADABLE, the live state is
- * UNKNOWN — skip this intent this pass (leave it unresolved for a clean later
- * pass), NEVER restore on unknown.
- *
- * ADV-S2: an intent that can NEVER be restored (no snapshot body, or the source
- * inbound.db is gone) is RESOLVED (resolved_at stamped) rather than surfacing
- * forever as an unclearable 'stalled' repair row.
- *
- * Autonomous, not just observable. Additive — no firing-path change (C1).
- */
-export function recoverMoveIntents(centralDb: Database.Database, options: MoveRecoveryOptions): void {
-  const nowMs = options.nowMs ?? Date.now();
-  const dataDir = options.dataDir ?? path.dirname(sessionsBaseDir());
-  const sessionsRoot = options.dataDir ? path.join(options.dataDir, 'v2-sessions') : sessionsBaseDir();
-
-  let intents: Array<{
-    session_id: string;
-    agent_group_id: string;
-    series_id: string;
-    detail_json: string | null;
-    correlation_id: string | null;
-    ts: string;
-  }>;
-  try {
-    intents = centralDb
-      .prepare(
-        `SELECT session_id, agent_group_id, series_id, detail_json, correlation_id, ts
-           FROM scheduled_audit
-          WHERE action = 'move_intent' AND resolved_at IS NULL`,
-      )
-      .all() as typeof intents;
-  } catch {
-    // Table absent (feature not installed) — nothing to recover.
-    return;
-  }
-
-  for (const intent of intents) {
-    const tsMs = parseSqliteUtc(intent.ts);
-    // Only act on intents older than one sweep interval — the normal in-flight
-    // window is seconds; younger ones are likely still executing.
-    if (Number.isNaN(tsMs) || nowMs - tsMs <= SWEEP_INTERVAL_MS) continue;
-    if (!intent.correlation_id) continue;
-
-    const detail = parseIntentDetail(intent.detail_json);
-    const source = { agentGroupId: intent.agent_group_id, sessionId: intent.session_id };
-    const targetSessionId =
-      detail.targetAgentGroupId && detail.targetMessagingGroupId
-        ? resolveTargetSessionId(centralDb, detail.targetAgentGroupId, detail.targetMessagingGroupId)
-        : null;
-    const target =
-      detail.targetAgentGroupId && targetSessionId
-        ? { agentGroupId: detail.targetAgentGroupId, sessionId: targetSessionId }
-        : null;
-
-    // Scoped {source, target} live count — M1 (never a fleet-wide series scan).
-    const live = countLiveRowsInSessions(dataDir, [source, target], intent.series_id);
-    if (live.unreadable) {
-      // Live state UNKNOWN → skip this pass (leave unresolved). Never restore on
-      // unknown (F6 / M2).
-      log.warn('scheduled-move-recovery: scoped live count unreadable — deferring', {
-        seriesId: intent.series_id,
-        correlationId: intent.correlation_id,
-      });
-      continue;
-    }
-    if (live.count > 0) {
-      // A live row exists at source or target → the move's row landed; the intent
-      // breadcrumb has done its job. Stamp + purge; never restore (would double the
-      // live rows).
-      if (live.count > 1) {
-        // >1 = a PRE-EXISTING duplicate the move inherited (it didn't create it — the
-        // move's E-2 invariant already returned 500 and refused to claim success).
-        // We resolve the intent WITHOUT auto-deduping: deleting a row the move didn't
-        // own is its own data-loss risk, and leaving it unresolved would reintroduce
-        // the ADV-S2 zombie repair row. The board's duplicate-successor health detector
-        // surfaces the duplicate independently. Log it so it isn't silently swallowed.
-        log.warn(
-          'scheduled-move-recovery: >1 live row for series — pre-existing duplicate, resolving intent without dedup (surfaced via duplicate-successor health)',
-          { seriesId: intent.series_id, correlationId: intent.correlation_id, liveCount: live.count },
-        );
-      }
-      purgeIntentBody(centralDb, intent.correlation_id);
-      continue;
-    }
-
-    // Zero live rows in scope → restore the source from the snapshot.
-    if (!detail.snapshot) {
-      // ADV-S2: body lost (purged but still unresolved) — unrecoverable. RESOLVE
-      // it (stamp) so it does not surface forever as an unclearable repair row.
-      log.warn('scheduled-move-recovery: unresolved intent with no snapshot — resolving (unrecoverable)', {
-        seriesId: intent.series_id,
-        correlationId: intent.correlation_id,
-      });
-      purgeIntentBody(centralDb, intent.correlation_id);
-      continue;
-    }
-
-    const inboundPath = path.join(sessionsRoot, intent.agent_group_id, intent.session_id, 'inbound.db');
-    if (!fs.existsSync(inboundPath)) {
-      // ADV-S2: the source session is gone — cannot restore. RESOLVE so it does
-      // not zombie as a permanent stalled repair row.
-      log.warn('scheduled-move-recovery: source inbound.db missing — resolving (unrecoverable)', {
-        seriesId: intent.series_id,
-        correlationId: intent.correlation_id,
-      });
-      purgeIntentBody(centralDb, intent.correlation_id);
-      continue;
-    }
-    const snapshot = detail.snapshot;
-    let db: Database.Database | null = null;
-    try {
-      db = openInboundDbByPath(inboundPath);
-      // Idempotency re-check: the restore + the resolved_at stamp span two DB
-      // files (not atomic), so re-confirm a readable zero-live IMMEDIATELY before
-      // insert. An unreadable re-check defers (never restore on unknown).
-      const recheck = countLiveRowsInSessions(dataDir, [source, target], intent.series_id);
-      if (recheck.unreadable) {
-        log.warn('scheduled-move-recovery: re-check unreadable — deferring restore', {
-          seriesId: intent.series_id,
-        });
-        continue;
-      }
-      if (recheck.count === 0) {
-        restoreTaskRow(db, {
-          // Fresh id — the cancelled source row may still hold the snapshot id.
-          id: `task-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-          series_id: snapshot.series_id,
-          status: snapshot.status,
-          process_after: snapshot.process_after,
-          // Optional on the parsed audit body: an intent written before the
-          // column existed has none, and restoreTaskRow falls back.
-          scheduled_for: snapshot.scheduled_for,
-          recurrence: snapshot.recurrence,
-          content: snapshot.content,
-          platform_id: snapshot.platform_id,
-          channel_type: snapshot.channel_type,
-          thread_id: snapshot.thread_id,
-          kind: snapshot.kind,
-        });
-      }
-    } catch (err) {
-      log.error('scheduled-move-recovery: restore failed', {
-        seriesId: intent.series_id,
-        err: err instanceof Error ? err.message : String(err),
-      });
-      continue;
-    } finally {
-      db?.close();
-    }
-    // Stamp + purge AFTER the restore (so a crash before this makes the next
-    // pass re-evaluate; now a live row exists → it stamps without re-restoring).
-    purgeIntentBody(centralDb, intent.correlation_id);
-  }
-}
-
-const AUDIT_BODY_RETENTION_MS = 90 * 24 * 60 * 60 * 1000;
-
-/**
- * Prune `scheduled_audit` bodies older than 90 days (D4): NULL the
- * `before_preview`/`after_preview`/`detail_json` columns ONLY, keeping the
- * action-metadata row (actor/action/ts/hashes/correlation_id/resolved_at) for
- * the series' lifetime. This bounds the plaintext footprint while preserving
- * cancel-vs-completed distinguishability (the `action='cancel'` join, §4.3)
- * indefinitely. Design §4.4 retention.
- */
-export function pruneAuditBodies(centralDb: Database.Database, options: { nowMs?: number }): void {
-  const nowMs = options.nowMs ?? Date.now();
-  const cutoff = new Date(nowMs - AUDIT_BODY_RETENTION_MS).toISOString();
-  try {
-    centralDb
-      .prepare(
-        `UPDATE scheduled_audit
-            SET before_preview = NULL, after_preview = NULL, detail_json = NULL
-          WHERE ts < ?
-            AND (before_preview IS NOT NULL OR after_preview IS NOT NULL OR detail_json IS NOT NULL)`,
-      )
-      .run(cutoff);
-  } catch {
-    // Table absent — nothing to prune.
-  }
-}
-
 /**
  * "I cannot read this session" is not "this session is quiet", but both took
  * the same silent quiet-until return. Same backoff — a session the host cannot
@@ -2121,7 +1477,10 @@ async function sweepSession(session: Session, tick: SweepTickContext): Promise<n
 
     // A container that is gone cannot be mid-failure. Clearing here stops a
     // fresh container from inheriting the dead one's half-finished debounce and
-    // being killed on its first 'failed' observation.
+    // being killed on its first 'failed' observation. Synchronous, same as
+    // pre-seam: a dynamic import here would add an await suspension point on
+    // this branch that never existed before, letting a concurrent wake
+    // observe a stale `alive=false` across the gap.
     if (!alive) providerFailedTicks.delete(session.id);
 
     // ── W5: session:tail ─────────────────────────────────────────────────────
@@ -2158,46 +1517,6 @@ async function sweepSession(session: Session, tick: SweepTickContext): Promise<n
 }
 
 /**
- * Test-only entry point for the running-container SLA, including both post-kill
- * write paths. Builds the minimum session context the duty reads: the SLA and
- * its follow-ups touch `session`, `agentGroupId`, `agentGroupFolder` and the
- * two window openers, nothing else.
- */
-export function _enforceRunningContainerSlaForTesting(
-  run: SessionRunner,
-  session: Session,
-  agentGroupId: string,
-  agentGroupFolder: string,
-): Promise<void> {
-  const ctx: SweepSessionContext = {
-    now: Date.now(),
-    sessions: [session],
-    activeContainerSessionIds: new Set<string>(),
-    session,
-    agentGroupId,
-    agentGroupFolder,
-    mailbox: null,
-    hasOutbound: true,
-    alive: true,
-    justWoke: false,
-    plan: {
-      dueCount: 0,
-      wakePriority: 'interactive',
-      admittedTasks: 0,
-      workContinuation: null,
-      continuationWakeEligible: false,
-      hasOutbound: true,
-    },
-    observed: null,
-    killSnapshot: null,
-    run,
-    runIn: (_window, action) => run(action),
-    reportWoke: () => {},
-  };
-  return enforceRunningContainerSla(ctx);
-}
-
-/**
  * Test-only entry point for the stopped-container recovery admission — the
  * TOCTOU site: the container-state check must happen INSIDE the session, after
  * the open and immediately before the mutation.
@@ -2226,461 +1545,14 @@ export function _sweepSessionForTesting(session: Session): Promise<number | null
   return sweepSession(session, tick);
 }
 
-// ── Usage rollup (fleet-hardening Phase 0.1) ──
-//
-// Per-session cache of the outbound.db mtime last successfully rolled up, so
-// a session whose outbound.db hasn't changed since the last tick costs one
-// fs.statSync and nothing else — no DB open, no query. Same shape as the
-// `quietSessions` cache above (module-level Map, bounded to sessions still
-// active). Lost on host restart, which just means the next tick re-checks
-// every session once; rollupSessionUsage's own watermark still guarantees no
-// double-counting either way.
-const usageRollupMtimeCache = new Map<string, number>(); // session.id -> outbound.db mtimeMs
+// G64 (S2-PR6): the pruneIdleSessionArtifacts/pruneIdleThreadArtifacts
+// back-compat shims that used to live here are gone — callers use
+// storage-manager.ts's own exports (which already default `isContainerRunning`
+// and the sessions/threads roots) directly.
 
-/** Pure so the cache decision has one thing to unit-test. */
-export function shouldSkipUsageRollup(cachedMtimeMs: number | undefined, currentMtimeMs: number): boolean {
-  return cachedMtimeMs === currentMtimeMs;
-}
-
-async function sweepUsageRollup(sessions: readonly Session[]): Promise<void> {
-  for (const session of sessions) {
-    try {
-      const outPath = sessionMailboxPath({ agentGroupId: session.agent_group_id, sessionId: session.id }, 'outbound');
-      let mtimeMs: number;
-      try {
-        mtimeMs = fs.statSync(outPath).mtimeMs;
-      } catch {
-        continue; // container never spawned yet — no outbound.db to roll up
-      }
-      if (shouldSkipUsageRollup(usageRollupMtimeCache.get(session.id), mtimeMs)) continue;
-
-      // Read through the module's own read-only outbound funnel, NOT the
-      // provisioning mailbox session. This projection touches outbound.db
-      // only, and the seam's existence check is keyed on inbound.db —
-      // routing it through a provisioning session added a gate the pre-seam
-      // code never had, so a session whose inbound.db is gone while
-      // outbound.db remains stopped being rolled up at all, and its
-      // turn_usage rows would never reach the central totals. `outPath`
-      // above is already the gate that belongs here: no outbound file, no
-      // rollup. `rollupSessionUsage` (mailbox seam PR 6) asks for only the
-      // one op it uses, `readSessionOutbound`'s read-only wrapper supplies
-      // it, and neither one provisions or writes.
-      //
-      // `recoverJournal: true` and the write path's 5s busy_timeout, not the
-      // defaults: the replaced `openOutboundDb` path recovered a hot journal
-      // and waited 5s, same as the dashboard's single-session reads
-      // (`steer.ts`, `repository-workspaces/index.ts`). Without it, a live
-      // session whose container crashed mid-write — outbound.db present with
-      // a hot journal, inbound.db gone — throws on every tick under the
-      // console's 1s fleet-fan-out default and never advances its watermark,
-      // so its turn_usage rows never reach the central ledger.
-      const rolledUp = readSessionOutbound(
-        { agentGroupId: session.agent_group_id, sessionId: session.id },
-        (mailbox) => {
-          rollupSessionUsage(mailbox, session.agent_group_id, `${session.agent_group_id}/${session.id}`);
-          return true;
-        },
-        { busyTimeoutMs: 5000, recoverJournal: true },
-      );
-      // Only a rollup that RAN may claim this mtime as processed. A session
-      // whose inbound.db is gone while outbound.db remains resolves undefined
-      // here, and marking it done would skip it on every later sweep for as
-      // long as the outbound file is untouched — its turn_usage rows would
-      // never reach the central totals.
-      if (rolledUp) usageRollupMtimeCache.set(session.id, mtimeMs);
-    } catch (err) {
-      log.warn('Usage rollup failed for session', { err, sessionId: session.id });
-    }
-  }
-  // Bound the cache to sessions that still exist, mirroring the quietSessions
-  // cleanup above — closed sessions would otherwise accumulate forever.
-  if (usageRollupMtimeCache.size > sessions.length + 500) {
-    const live = new Set(sessions.map((s) => s.id));
-    for (const id of usageRollupMtimeCache.keys()) if (!live.has(id)) usageRollupMtimeCache.delete(id);
-  }
-}
-
-/** Test-only entry point for the usage-rollup sweep step. */
-export { sweepUsageRollup as _sweepUsageRollupForTesting };
-
-const DEFAULT_NO_PROGRESS_TIMEOUT_SEC = 1800;
-const DEFAULT_SPAWN_DEADLINE_SEC = 300;
-const DEFAULT_DRAIN_GRACE_SEC = 120;
-
-const ACTION_TO_FAIL_REASON: Record<string, string> = {
-  'fail-deadline': 'deadline_exceeded',
-  'fail-no-progress': 'no_progress_timeout',
-  'fail-container-exit': 'container_exit',
-  'fail-spawn-deadline': 'spawn_deadline',
-};
-
-async function sweepTaskWatchdog(): Promise<void> {
-  let tasks;
-  try {
-    tasks = getActiveTasks();
-  } catch (err) {
-    log.error('Task watchdog: failed to load active tasks', { err });
-    return;
-  }
-
-  const now = Date.now();
-
-  for (const task of tasks) {
-    try {
-      // Get child container status from in-memory container set.
-      //
-      // Three-state, not two. `'stopped'` means "ran and has since exited" —
-      // ONLY then is `fail-container-exit` a correct reap. `null` covers two
-      // legitimately-not-failed cases: (a) container hasn't been spawned yet
-      // because the orchestrator's concurrency cap is queueing it, (b) wake
-      // is in flight. Both look identical to `isContainerRunning` (returns
-      // false) but neither should reap. `hasContainerEverRun` is the sticky
-      // signal that disambiguates — set when activeContainers.add fires,
-      // never cleared, so true iff this host has observed the container
-      // running at some point in this process lifetime.
-      let childContainerStatus: 'running' | 'stopped' | null = null;
-      if (task.child_session_id !== null) {
-        if (isContainerRunning(task.child_session_id)) {
-          childContainerStatus = 'running';
-        } else if (hasContainerEverRun(task.child_session_id)) {
-          childContainerStatus = 'stopped';
-        } else {
-          childContainerStatus = null;
-        }
-      }
-
-      // Check child's outbound.db for pending terminal spawn actions (drain-first guard).
-      // Self-orchestration: child session lives in the SAME agent group as the parent,
-      // so the lookup uses parent_agent_group_id.
-      const terminalOutboundSeenAt =
-        task.child_session_id !== null
-          ? pendingTerminalSpawnOutboundSeenAt(task.parent_agent_group_id, task.child_session_id)
-          : null;
-
-      // Pull per-orchestrator timeout config; fall back to defaults when absent.
-      const cap = getCapabilityConfig(task.parent_agent_group_id, 'orchestrator');
-      const noProgressTimeoutSec = cap?.noProgressTimeoutSec ?? DEFAULT_NO_PROGRESS_TIMEOUT_SEC;
-      const spawnDeadlineSec = cap?.spawnDeadlineSec ?? DEFAULT_SPAWN_DEADLINE_SEC;
-      const drainGraceSec = cap?.drainGraceSec ?? DEFAULT_DRAIN_GRACE_SEC;
-
-      const decision = decideTaskAction({
-        now,
-        task,
-        childContainerStatus,
-        terminalOutboundSeenAt,
-        noProgressTimeoutSec,
-        spawnDeadlineSec,
-        drainGraceSec,
-      });
-
-      if (decision.action === 'ok') continue;
-
-      const nowIso = new Date(now).toISOString();
-      const failReason = ACTION_TO_FAIL_REASON[decision.action] ?? decision.action;
-      if (!(decision.action in ACTION_TO_FAIL_REASON)) {
-        log.warn('Task watchdog: unknown action, using raw value as fail_reason', { action: decision.action });
-      }
-      const transitioned = transitionToTerminal(task.task_id, 'failed', {
-        fail_reason: failReason,
-        failed_at: nowIso,
-      });
-
-      if (!transitioned) {
-        // Already in terminal state (race with reconciler or another path) — skip notify.
-        log.debug('Task watchdog: task already terminal, skipping notify', { taskId: task.task_id });
-        continue;
-      }
-
-      // Dashboard SSE emit (post-build drift fix B5 — watchdog-fail emit callsite)
-      void import('./dashboard/api/events.js')
-        .then((mod) =>
-          mod.emitDashboardEvent('task_event', {
-            task_id: task.task_id,
-            kind: 'failed',
-            agent_group_id: task.parent_agent_group_id,
-          }),
-        )
-        .catch(() => {
-          /* dashboard module may not be initialized in tests */
-        });
-
-      log.warn('Task watchdog: reaped task', {
-        taskId: task.task_id,
-        reason: decision.action,
-        parentAgentGroupId: task.parent_agent_group_id,
-        parentSessionId: task.parent_session_id,
-      });
-
-      const parentSession = getSession(task.parent_session_id);
-      if (!parentSession) continue;
-
-      try {
-        // Mirror applySpawnFailed's notify shape — kind='chat' with visible
-        // `text` so the orchestrator sees a normal turn input and reports
-        // the failure to the user. The prior `kind='system'` envelope
-        // (action `spawn_task_watchdog_fail`) had no consumer anywhere in
-        // the codebase — it sat silently in the parent's inbound and no
-        // human was ever told the task failed. The `_task_update` envelope
-        // keeps the machine-readable surface for any future consumer that
-        // wants to react to status transitions without parsing the text.
-        await writeSessionMessage(task.parent_agent_group_id, task.parent_session_id, {
-          id: randomUUID(),
-          kind: 'chat',
-          timestamp: nowIso,
-          content: JSON.stringify({
-            text:
-              `Task failed (watchdog): ${task.task_id}. Reason: ${failReason}. ` +
-              `The orchestrator should notify the user and decide whether to re-spawn.`,
-            _task_update: {
-              task_id: task.task_id,
-              status: 'failed',
-              fail_reason: failReason,
-              source: 'watchdog',
-            },
-          }),
-        });
-        // `parentSession` was fetched before the awaited mailbox write above,
-        // and the parent can be archived in that window — but so can it be
-        // archived during the wake's own awaits, which a re-read here cannot
-        // see. The proof travels with the wake.
-        void wakeContainer(parentSession, 'interactive', {
-          guard: sessionStillActive(parentSession.id),
-        }).catch((err) => log.warn('Task watchdog: wakeContainer(parent) failed', { taskId: task.task_id, err }));
-      } catch (err) {
-        log.warn('Task watchdog: failed to notify parent', { taskId: task.task_id, err });
-      }
-    } catch (err) {
-      log.error('Task watchdog: error processing task', { taskId: task.task_id, err });
-    }
-  }
-}
-
-/**
- * Auto-archive completed tasks older than 24h. Failed tasks are excluded
- * deliberately — operator must dismiss them explicitly so they stay
- * visible until acknowledged. No per-row SSE emit: the volume is "every
- * `done` card from yesterday at once," which would flood the bus; the
- * next dashboard list refresh picks the change up naturally.
- */
-const COMPLETED_AUTO_ARCHIVE_AGE_HOURS = 24;
-
-export function autoArchiveOldCompleted(): void {
-  try {
-    const cutoff = new Date(Date.now() - COMPLETED_AUTO_ARCHIVE_AGE_HOURS * 60 * 60 * 1000).toISOString();
-    const count = autoArchiveCompletedBefore(cutoff);
-    if (count > 0) log.info('Auto-archived completed tasks', { count });
-  } catch (err) {
-    log.warn('autoArchiveOldCompleted: failed', { err });
-  }
-}
-
-export function pruneIdleSessionArtifacts(now: number = Date.now(), root: string = sessionsBaseDir()): void {
-  pruneIdleSessionArtifactsImpl(now, root, isContainerRunning);
-}
-
-export function pruneIdleThreadArtifacts(
-  now: number = Date.now(),
-  root: string = path.join(path.dirname(sessionsBaseDir()), 'v2-threads'),
-  activityByWorktreeDir: Map<string, ThreadWorktreeActivity> = collectThreadWorktreeActivity(isContainerRunning),
-): void {
-  pruneIdleThreadArtifactsImpl(now, root, activityByWorktreeDir);
-}
-
-function heartbeatMtimeMs(agentGroupId: string, sessionId: string): number {
-  const hbPath = heartbeatPath(agentGroupId, sessionId);
-  try {
-    return fs.statSync(hbPath).mtimeMs;
-  } catch {
-    return 0;
-  }
-}
-
-function activeOperationTimeoutMs(state: ContainerState | null): number | null {
-  if (!state || (state.current_tool !== 'Bash' && state.current_tool !== 'CodexItem')) return null;
-  return typeof state.tool_declared_timeout_ms === 'number' ? state.tool_declared_timeout_ms : null;
-}
-
-async function enforceRunningContainerSla(ctx: SweepSessionContext): Promise<void> {
-  const session = ctx.session;
-  // Read + the observation hooks in one session, so the decision and the
-  // telemetry row see the same snapshot. The kill below then runs with nothing
-  // open (invariant I-3).
-  const observed = await ctx.runIn('session:health:sla-observe', async (mailbox) => {
-    const containerState = mailbox.getContainerState();
-    await runSlaObservationHooks(ctx, containerState, mailbox);
-    const decision = decideStuckAction({
-      now: Date.now(),
-      heartbeatMtimeMs: heartbeatMtimeMs(ctx.agentGroupId, session.id),
-      containerState,
-      claims: mailbox.getProcessingClaimRows(),
-      spawnedAtMs: getContainerSpawnedAt(session.id),
-    });
-    // Snapshot BEFORE the kill so the follow-ups have the pre-kill state —
-    // resetStuckProcessingRows clears the claims, so a read afterward would
-    // always be empty.
-    return {
-      containerState,
-      decision,
-      pendingClaims: decision.action === 'kill-ceiling' ? mailbox.getProcessingClaimRows().length : 0,
-      workContinuation: decision.action === 'kill-ceiling' ? mailbox.readWorkContinuation() : null,
-    };
-  });
-  if (!observed) return;
-  const { containerState, decision, pendingClaims, workContinuation } = observed;
-
-  if (decision.action === 'ok') return;
-
-  if (decision.action === 'kill-ceiling') {
-    log.warn('Killing container past absolute ceiling', {
-      sessionId: session.id,
-      heartbeatAgeMs: decision.heartbeatAgeMs,
-      ceilingMs: decision.ceilingMs,
-    });
-    killContainer(session.id, 'absolute-ceiling');
-    // The follow-ups run AFTER the kill, in a session opened only then, to
-    // honor the outbound.db single-writer invariant; the module opens the
-    // writable outbound handle lazily, only for the notice write.
-    //
-    // The kill above is a yield boundary: this session opened after it, and a
-    // replacement wake landing in that gap owns outbound.db. Upstream guards
-    // that with ONE `writeOutboundWhenStopped` around all three follow-ups,
-    // which is sound there because they are one synchronous block. Here the
-    // registry runs them as separate awaited duties, so a single check would
-    // authorize writes two yields later — each follow-up guards its OWN write
-    // instead (`registerBuiltInSweepDuties`, the three post-kill registrations).
-    await ctx.runIn('session:health:post-kill', (mailbox) =>
-      runSweepKillFollowUps(ctx, decision, mailbox, {
-        reason: 'absolute-ceiling',
-        containerState,
-        pendingClaims,
-        workContinuation,
-      }),
-    );
-    return;
-  }
-
-  log.warn('Killing container — message claimed then silent', {
-    sessionId: session.id,
-    messageId: decision.messageId,
-    claimAgeMs: decision.claimAgeMs,
-    toleranceMs: decision.toleranceMs,
-  });
-  killContainer(session.id, 'claim-stuck');
-  // Same yield boundary as the ceiling branch above; same per-follow-up guard.
-  await ctx.runIn('session:health:post-kill', (mailbox) =>
-    runSweepKillFollowUps(ctx, decision, mailbox, {
-      reason: 'claim-stuck',
-      containerState,
-      pendingClaims,
-      workContinuation,
-    }),
-  );
-}
-
-/**
- * Turn cgroup memory telemetry into something the AGENT can act on.
- *
- * The kernel kills children inside the cgroup, never PID 1, so the container
- * survives and nothing surfaces: agents read an OOM-killed chromium as "the
- * browser crashed", an OOM-killed `npm ci` as "probably buffering", and
- * vanished MCP servers as "infrastructure instability". Reconstructed
- * transcripts show they diagnose it correctly the moment they are TOLD — so
- * the notice below is the whole fix; the detection already worked and just
- * ended in a log file nobody in the container can read.
- *
- * The row is onWake=0 (the container is alive — this path only runs for
- * running containers) and trigger=0 via insertDeferredMessageWithContextIfNew,
- * so it can never wake a dead container; it rides along with the next real
- * message or the next turn.
- */
-function reportContainerOomTelemetry(
-  mailbox: NanoclawMailboxSession,
-  session: Session,
-  agentGroupFolder: string,
-  state: ContainerState | null,
-): void {
-  if (typeof state?.memory_oom_kill_events !== 'number' && typeof state?.memory_max_events !== 'number') return;
-  const spawnedAtMs = getContainerSpawnedAt(session.id);
-  const decision = oomKillObserver.observe(session.id, spawnedAtMs, {
-    oomKillCount: state.memory_oom_kill_events,
-    pressureCount: state.memory_max_events,
-    now: Date.now(),
-  });
-
-  let configuredLimitMb: number | null = null;
-  try {
-    configuredLimitMb = resolveContainerResources(readContainerConfig(agentGroupFolder).resources).memory.limitMb;
-  } catch {
-    // Resource validation already fails closed in the spawn path. Keep OOM
-    // diagnostics available even if an operator edits the file mid-run.
-  }
-  const cgroupMaxMb =
-    typeof state.memory_max_bytes === 'number' ? Math.round(state.memory_max_bytes / 1024 / 1024) : null;
-  const limitMb = configuredLimitMb ?? cgroupMaxMb;
-  const limitText = limitMb === null ? 'its memory limit' : `its ${limitMb} MB memory limit`;
-
-  if (decision.killDelta > 0) {
-    log.warn('Container cgroup OOM kill observed', {
-      sessionId: session.id,
-      agentGroup: agentGroupFolder,
-      newOomKills: decision.killDelta,
-      oomKillCount: decision.killCount,
-      oomEventCount: state.memory_oom_events ?? null,
-      memoryPressureEvents: decision.pressureCount,
-      notifiedAgent: decision.notifyKills,
-      configuredLimitMb,
-      cgroupMaxMb,
-      peakMb: typeof state.memory_peak_bytes === 'number' ? Math.round(state.memory_peak_bytes / 1024 / 1024) : null,
-      currentMb:
-        typeof state.memory_current_bytes === 'number' ? Math.round(state.memory_current_bytes / 1024 / 1024) : null,
-      telemetryAt: state.memory_telemetry_at ?? null,
-    });
-  }
-
-  if (decision.notifyKills) {
-    const plural = decision.killCount === 1 ? 'process' : 'processes';
-    writeSystemWake(
-      mailbox,
-      session,
-      `oom-kill-${spawnedAtMs}-${decision.killCount}`,
-      `[system] The Linux kernel has killed ${decision.killCount} ${plural} inside this container for exceeding ` +
-        `${limitText}, which is shared by EVERY process here — your agent, MCP servers, browsers, test runners, ` +
-        `builds. Your container itself survived, so nothing reported an error to you. The cgroup exposes only a ` +
-        `counter, so the names of the killed processes are not available. Symptoms this explains: a command exiting ` +
-        `with no output or a bare non-zero status, npm/pnpm installs dying silently, a browser or MCP server ` +
-        `disappearing mid-run, test failures that do not reproduce. Remedy: cut in-container parallelism ` +
-        `(jest --maxWorkers=2, vitest poolOptions.maxThreads, make -j2), do not run installs or suites concurrently, ` +
-        `close browser sessions when done, and write large output to a file instead of buffering it. Do NOT retry ` +
-        `the same command unchanged — it will be killed again.`,
-      { kind: 'agent_container_oom', oom_kill_count: decision.killCount, memory_limit_mb: limitMb },
-      0,
-    );
-    return;
-  }
-
-  if (decision.notifyPressure) {
-    log.warn('Container memory pressure without kills', {
-      sessionId: session.id,
-      agentGroup: agentGroupFolder,
-      memoryPressureEvents: decision.pressureCount,
-      configuredLimitMb,
-      cgroupMaxMb,
-    });
-    writeSystemWake(
-      mailbox,
-      session,
-      `oom-pressure-${spawnedAtMs}`,
-      `[system] This container has hit ${limitText} ${decision.pressureCount} times and had to reclaim memory to ` +
-        `stay under it. Nothing has been killed yet — this is the warning before that. The limit is shared by every ` +
-        `process here. If you are about to run something memory-heavy (a full test suite, a build, a browser, a ` +
-        `large install), reduce its parallelism now rather than after the kernel starts killing processes.`,
-      { kind: 'agent_container_memory_pressure', memory_pressure_events: decision.pressureCount },
-      0,
-    );
-  }
-}
-
-export { reportContainerOomTelemetry as _reportContainerOomTelemetryForTesting };
+// Running-container SLA (S14) and the OOM / memory-pressure notice (S16)
+// moved to src/modules/sweep-container-health/index.ts (convergence seam 2,
+// PR 10).
 
 export function _resetStuckProcessingRowsForTesting(
   mailbox: NanoclawMailboxSession,
@@ -2690,7 +1562,12 @@ export function _resetStuckProcessingRowsForTesting(
   resetStuckProcessingRows(mailbox, session, reason);
 }
 
-export { sweepTaskWatchdog as _sweepTaskWatchdogForTesting };
+// sweepTaskWatchdog moved with the orchestrator family (S2-PR5) into
+// src/modules/sweep-orchestrator/task-watchdog.ts — a sibling of that
+// family's index.ts, not index.ts itself, so this re-export doesn't create a
+// static cycle back through index.ts's own import of this file (registerSweepDuty
+// / registerSweepDutySource / SWEEP_DUTY_INVENTORY).
+export { sweepTaskWatchdog as _sweepTaskWatchdogForTesting } from './modules/sweep-orchestrator/task-watchdog.js';
 
 /**
  * Tell the user we just reaped their container for inactivity. The
@@ -2879,24 +1756,8 @@ function resetStuckProcessingRows(mailbox: NanoclawMailboxSession, session: Sess
 function registerBuiltInSweepDuties(): void {
   const id = SWEEP_DUTY_INVENTORY;
 
-  // ── tick:pre-session ───────────────────────────────────────────────────────
-
-  registerSweepDuty({
-    name: id.T2,
-    phase: 'tick:pre-session',
-    order: 10,
-    run: () => {
-      // Re-heal the egress network so already-running agents keep their gateway
-      // hop if it was detached out-of-band. Best-effort here: a heal failure
-      // isn't a leak (agents stay on the internal net), so log and continue.
-      // No-op when lockdown is disabled.
-      try {
-        ensureEgressNetwork();
-      } catch (err) {
-        log.error('Egress lockdown re-heal failed', { err });
-      }
-    },
-  });
+  // T2 (egress-network-reheal, tick:pre-session) moved to
+  // src/modules/sweep-egress/index.ts (S2-PR6).
 
   // ── session:plan (W1) ──────────────────────────────────────────────────────
 
@@ -3110,39 +1971,17 @@ function registerBuiltInSweepDuties(): void {
   });
 
   // ── session:health (W4) — EXCLUSIVE, nothing open ──────────────────────────
-
-  registerSweepDuty({
-    name: id.S11,
-    phase: 'session:health',
-    order: 10,
-    // 6a. Failed-provider self-heal. Runs first: a container whose provider has
-    // given up is not idle and not merely stuck, and healing it beats both
-    // reaping it as idle and waiting out the 30-minute ceiling. Returns true
-    // only when it killed the container, in which case the reap/SLA checks
-    // below have nothing left to decide this tick — which is exactly the
-    // `claims()` contract of an exclusive phase.
-    claims: (ctx) =>
-      sweepProviderHeal(ctx.run, ctx.session, ctx.agentGroupFolder, ctx.observed?.containerState ?? null),
-    run: (ctx) => {
-      log.debug('Provider self-heal handled this tick — skipping reap/SLA checks', {
-        sessionId: asSessionContext(ctx).session.id,
-      });
-    },
-  });
+  //
+  // S11 (provider self-heal, order 10) and S14 (running-container SLA, order
+  // 40, the fallthrough) register from
+  // src/modules/sweep-container-health/index.ts (convergence seam 2, PR 10).
+  // S12/S13 stay here (S2-PR3's family) — order in the exclusive chain is
+  // heal (10) → idle-task-reap (20) → idle-chat-reap (30) → SLA (40).
 
   // S12 (idle-task-reap) and S13 (idle-chat-reap) register from
   // src/modules/sweep-idle-reap/index.ts (seam 2, S2-PR3) at order 20/30 —
   // between this heal duty and the SLA fallthrough below. Do not re-add them
   // here; see plan.md §8 "S2-PR3 — idle reaps".
-
-  registerSweepDuty({
-    name: id.S14,
-    phase: 'session:health',
-    order: 40,
-    // 6. Running-container SLA: absolute ceiling + per-claim stuck rules. The
-    // fallthrough — no claims(), so it runs when nothing above it claimed.
-    run: (ctx) => enforceRunningContainerSla(asSessionContext(ctx)),
-  });
 
   // ── session:tail (W5) ──────────────────────────────────────────────────────
 
@@ -3207,20 +2046,9 @@ function registerBuiltInSweepDuties(): void {
   });
 
   // ── tick:post-session — container state is now current ─────────────────────
-
-  registerSweepDuty({
-    name: id.T6,
-    phase: 'tick:post-session',
-    order: 10,
-    // MODULE-HOOK:orchestrator-dispatch:reconciler — complete
-    // admitted-but-incomplete tasks. Runs after per-session sweeps so container
-    // state is current. Carries no guard of its own: it was the earliest
-    // unguarded call in the old tick body, and the phase runner is now the
-    // guard that keeps its throw from costing every duty behind it.
-    run: () => {
-      runReconcilerSweep();
-    },
-  });
+  //
+  // T6 orchestrator-reconciler (order 10) and T18 task-watchdog (order 25)
+  // moved to src/modules/sweep-orchestrator/index.ts (S2-PR5).
 
   registerSweepDuty({
     name: id.T8,
@@ -3245,50 +2073,8 @@ function registerBuiltInSweepDuties(): void {
     },
   });
 
-  registerSweepDuty({
-    name: id.T18,
-    phase: 'tick:post-session',
-    order: 25,
-    // MODULE-HOOK:orchestrator-dispatch:watchdog — reap tasks that have exceeded
-    // their deadline, spawn window, no-progress timeout, or whose child
-    // container exited.
-    run: () => sweepTaskWatchdog(),
-  });
-
-  registerSweepDuty({
-    name: id.T13,
-    phase: 'tick:post-session',
-    order: 30,
-    // Reclaim disk from idle caches and Docker artifacts after per-session sweep
-    // work has had a chance to notice and wake due messages. Fire-and-forget
-    // into a persistent worker. The worker owns the expensive synchronous
-    // filesystem/Docker implementation and its cadence state; the host event
-    // loop stays available for channel heartbeats and inbound events.
-    run: (ctx) => {
-      startStorageMaintenanceOnce([...ctx.activeContainerSessionIds]);
-    },
-  });
-
-  registerSweepDuty({
-    name: id.T19,
-    phase: 'tick:post-session',
-    order: 40,
-    // Fleet-hardening Phase 0.1 (per-turn usage accounting): roll per-session
-    // turn_usage rows into the central usage_daily table for `ncl usage`. Reuses
-    // the same `sessions` list the per-session loop above already fetched — no
-    // extra DB query. Isolated so a rollup failure never blocks the rest of the
-    // tick. `pruneOldTurnUsage` is its companion, not a separate duty: fleet
-    // volume is ~300-600 turns/day, so trimming the ledger the rollup just fed
-    // is trivial per-tick cost.
-    run: async (ctx) => {
-      try {
-        await sweepUsageRollup(ctx.sessions);
-      } catch (err) {
-        log.warn('Usage rollup sweep step failed', { err });
-      }
-      pruneOldTurnUsage();
-    },
-  });
+  // T13 (storage-maintenance, tick:post-session, order 30) moved to
+  // src/modules/sweep-storage/index.ts (S2-PR6).
 
   // T22 (orphaned-repo-fence-release) moved to src/modules/sweep-repo-fence/
   // (seam 2, PR 8 — G08). The wrapper moved; `repo-fence-recovery.ts` itself
@@ -3301,92 +2087,20 @@ function registerBuiltInSweepDuties(): void {
   // (seam 2, PR 8 — G08). The wrapper moved; modules/approvals/index.ts did
   // not.
 
-  registerSweepDuty({
-    name: id.T11,
-    phase: 'tick:housekeeping',
-    order: 50,
-    // MODULE-HOOK:scheduled-move-recovery — autonomous recovery of unresolved
-    // move intents. Additive (same pattern as the recurrence hook); touches only
-    // scheduled_audit (central) + the move's own session inbound rows — no
-    // firing-path change (C1).
-    run: () => {
-      try {
-        recoverMoveIntents(getDb(), {});
-      } catch (err) {
-        log.warn('scheduled-move-recovery: sweep hook failed', { err });
-      }
-    },
-  });
+  // T11 (scheduled-move-recovery) and T12 (audit-body-prune) are registered by
+  // src/modules/sweep-scheduled-move/index.ts (S2-PR7) — order 50/60 in this
+  // same 'tick:housekeeping' phase, between T10 above and T14 below.
 
-  registerSweepDuty({
-    name: id.T12,
-    phase: 'tick:housekeeping',
-    order: 60,
-    // 90d audit-body prune, the companion of the move recovery above.
-    run: () => {
-      try {
-        pruneAuditBodies(getDb(), {});
-      } catch (err) {
-        log.warn('scheduled-move-recovery: sweep hook failed', { err });
-      }
-    },
-  });
+  // T14 completed-task-auto-archive (order 70) moved to
+  // src/modules/sweep-orchestrator/index.ts (S2-PR5).
 
-  registerSweepDuty({
-    name: id.T14,
-    phase: 'tick:housekeeping',
-    order: 70,
-    // Auto-archive completed tasks older than 24h so the "Done" lane stays
-    // representative of recent work; failed tasks are intentionally skipped.
-    run: () => {
-      autoArchiveOldCompleted();
-    },
-  });
-
-  registerSweepDuty({
-    name: id.T20,
-    phase: 'tick:housekeeping',
-    order: 100,
-    // Claim reconciliation, then self-heal. Order is load-bearing: a claim whose
-    // pull request has merged must be CLOSED, not escalated at somebody — the
-    // reconcile pass deletes those files first, so the ladder below never sees
-    // them. Both are throttled internally to once per 10 minutes and each is
-    // isolated, so a GitHub outage cannot take the nudge ladder down with it.
-    run: async () => {
-      try {
-        await reconcileMergedClaims();
-      } catch (err) {
-        log.warn('Claims reconcile sweep step failed', { err });
-      }
-    },
-  });
-
-  registerSweepDuty({
-    name: id.T21,
-    phase: 'tick:housekeeping',
-    order: 110,
-    // Strictly after T20 — see the comment there.
-    run: async () => {
-      try {
-        await sweepClaimsSelfHeal();
-      } catch (err) {
-        log.warn('Claims self-heal sweep step failed', { err });
-      }
-    },
-  });
+  // T20 (claims-reconcile, order 100) and T21 (claims-self-heal, order 110,
+  // strictly after T20) moved to src/modules/sweep-claims/index.ts (S2-PR6).
 
   // ── SLA observation hooks — inside the SLA duty's own observe session ───────
-
-  registerSlaObservationHook({
-    name: id.S16,
-    order: 10,
-    // OOM / memory-pressure notice. SLA-only by construction: it is reached only
-    // when the exclusive chain falls through to the SLA branch, and it must see
-    // the same containerState snapshot the decision does.
-    run: (ctx, state, mailbox) => {
-      reportContainerOomTelemetry(mailbox, ctx.session, ctx.agentGroupFolder, state);
-    },
-  });
+  //
+  // S16 (OOM / memory-pressure notice) registers from
+  // src/modules/sweep-container-health/index.ts (convergence seam 2, PR 10).
 
   // ── Kill follow-ups — inside the session opened AFTER killContainer returns ─
 
