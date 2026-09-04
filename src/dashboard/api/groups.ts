@@ -9,7 +9,7 @@
  * siblings client-side without a second round trip — the Schedule lens filters
  * its rows on `agent_group_id` and needs that mapping.
  */
-import { getDb } from '../../db/connection.js';
+import { getRawDb } from '../../db/connection.js';
 import { log } from '../../log.js';
 import type { AuthHandler } from '../router.js';
 
@@ -24,12 +24,12 @@ export const groupsListHandler: AuthHandler = async (_req, _params, ctx) => {
   let rows: GroupRow[];
   try {
     if (ctx.scopes.no_filter) {
-      rows = getDb().prepare('SELECT id, name, workgroup_id FROM agent_groups ORDER BY name').all() as GroupRow[];
+      rows = getRawDb().prepare('SELECT id, name, workgroup_id FROM agent_groups ORDER BY name').all() as GroupRow[];
     } else if (ctx.scopes.allowed_group_ids.length === 0) {
       rows = [];
     } else {
       const placeholders = ctx.scopes.allowed_group_ids.map(() => '?').join(', ');
-      rows = getDb()
+      rows = getRawDb()
         .prepare(`SELECT id, name, workgroup_id FROM agent_groups WHERE id IN (${placeholders}) ORDER BY name`)
         .all(...ctx.scopes.allowed_group_ids) as GroupRow[];
     }

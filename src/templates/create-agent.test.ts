@@ -25,7 +25,7 @@ vi.mock('../log.js', () => ({
   isSurvivableIoError: vi.fn(() => false),
 }));
 
-import { closeDb, getAllAgentGroups, initTestDb, runMigrations } from '../db/index.js';
+import { closeDb, getAllAgentGroups, initTestDb, runMigrations, getRawDb } from '../db/index.js';
 import { getContainerConfig } from '../db/container-configs.js';
 import { findTaskSessions } from '../db/sessions.js';
 import { STANDING_INSTRUCTIONS_FILE } from '../group-persona.js';
@@ -59,15 +59,16 @@ function writeTask(name: string, schedule: string, prompt: string, script?: stri
   fs.writeFileSync(path.join(dir, `${name}.md`), `---\nschedule: "${schedule}"\n${scriptBlock}---\n\n${prompt}\n`);
 }
 
-beforeEach(() => {
+beforeEach(async () => {
   fs.rmSync(TEST_ROOT, { recursive: true, force: true });
   fs.mkdirSync(TEST_ROOT, { recursive: true });
-  runMigrations(initTestDb());
+  await initTestDb();
+  runMigrations(getRawDb());
   writeTemplate();
 });
 
-afterEach(() => {
-  closeDb();
+afterEach(async () => {
+  await closeDb();
   fs.rmSync(TEST_ROOT, { recursive: true, force: true });
 });
 

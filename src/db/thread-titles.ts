@@ -4,7 +4,7 @@
  * stored despite not being in the original spec (sibling-bot token
  * resolution on retry).
  */
-import { getDb } from './connection.js';
+import { getRawDb } from './connection.js';
 
 export interface ThreadTitleRow {
   thread_id: string;
@@ -17,7 +17,9 @@ export interface ThreadTitleRow {
 }
 
 export function getThreadTitleRow(threadId: string): ThreadTitleRow | undefined {
-  return getDb().prepare('SELECT * FROM thread_titles WHERE thread_id = ?').get(threadId) as ThreadTitleRow | undefined;
+  return getRawDb().prepare('SELECT * FROM thread_titles WHERE thread_id = ?').get(threadId) as
+    | ThreadTitleRow
+    | undefined;
 }
 
 /**
@@ -32,7 +34,7 @@ export function insertThreadTitleClaim(
   firstMessage: string,
   createdAt: string = new Date().toISOString(),
 ): void {
-  getDb()
+  getRawDb()
     .prepare(
       `INSERT INTO thread_titles (thread_id, channel_type, first_message, attempts, created_at)
        VALUES (@thread_id, @channel_type, @first_message, 0, @created_at)
@@ -43,14 +45,14 @@ export function insertThreadTitleClaim(
 
 /** Mark a thread as successfully titled — permanent, never re-attempted again. */
 export function markThreadTitled(threadId: string, title: string, titledAt: string = new Date().toISOString()): void {
-  getDb()
+  getRawDb()
     .prepare(`UPDATE thread_titles SET title = ?, titled_at = ? WHERE thread_id = ?`)
     .run(title, titledAt, threadId);
 }
 
 /** Record a failed attempt so the retry sweep's `attempts < N` filter eventually gives up. */
 export function recordThreadTitleAttemptFailure(threadId: string): void {
-  getDb().prepare(`UPDATE thread_titles SET attempts = attempts + 1 WHERE thread_id = ?`).run(threadId);
+  getRawDb().prepare(`UPDATE thread_titles SET attempts = attempts + 1 WHERE thread_id = ?`).run(threadId);
 }
 
 /**
@@ -60,7 +62,7 @@ export function recordThreadTitleAttemptFailure(threadId: string): void {
  * a stream of new failures.
  */
 export function getPendingThreadTitleRetries(sinceIso: string, maxAttempts: number, limit: number): ThreadTitleRow[] {
-  return getDb()
+  return getRawDb()
     .prepare(
       `SELECT * FROM thread_titles
        WHERE title IS NULL AND attempts < ? AND created_at >= ?

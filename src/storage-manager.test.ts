@@ -18,7 +18,7 @@ vi.mock('child_process', () => ({
 const centralDbMock = vi.hoisted(() => ({ current: null as null | { db: Database.Database } }));
 vi.mock('./db/connection.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('./db/connection.js')>()),
-  getDb: () => {
+  getRawDb: () => {
     if (!centralDbMock.current) throw new Error('central db unavailable in storage-manager unit test');
     return centralDbMock.current.db;
   },
@@ -593,7 +593,7 @@ describe('storage-manager session archive-then-reclaim', () => {
 
   it('fails closed when the central DB is unavailable, while cache pruning continues', () => {
     makeIdleSession('sess-no-db', 31 * DAY);
-    // centralDbMock.current stays null -> getDb throws
+    // centralDbMock.current stays null -> getRawDb throws
 
     const report = runApply();
 

@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { closeDb, initTestDb, runMigrations } from './db/index.js';
+import { closeDb, initTestDb, runMigrations, getRawDb } from './db/index.js';
 import { getThreadTitleRow, insertThreadTitleClaim, recordThreadTitleAttemptFailure } from './db/thread-titles.js';
 
 vi.mock('./llm.js', async (importOriginal) => ({
@@ -13,8 +13,9 @@ import { maybeRenameNewThread, retryPendingThreadTitles, _resetRenamedThreadsFor
 
 const THREAD_ID = 'discord:11111111111111111:22222222222222222:33333333333333333';
 
-function setupDb(): void {
-  const db = initTestDb();
+async function setupDb(): Promise<void> {
+  await initTestDb();
+  const db = getRawDb();
   runMigrations(db);
 }
 
@@ -35,8 +36,8 @@ describe('maybeRenameNewThread — durable idempotency (migration 062)', () => {
   const originalToken = process.env.DISCORD_BOT_TOKEN;
   let fetchMock: ReturnType<typeof vi.fn>;
 
-  beforeEach(() => {
-    setupDb();
+  beforeEach(async () => {
+    await setupDb();
     // The in-process race-claim Set is module-level state that otherwise
     // leaks across tests (and across real host restarts it's simply gone) —
     // reset it so each test starts from a genuinely fresh process.
@@ -48,8 +49,8 @@ describe('maybeRenameNewThread — durable idempotency (migration 062)', () => {
     vi.mocked(callHaiku).mockResolvedValue('Rollout fix');
   });
 
-  afterEach(() => {
-    closeDb();
+  afterEach(async () => {
+    await closeDb();
     vi.unstubAllGlobals();
     if (originalToken === undefined) delete process.env.DISCORD_BOT_TOKEN;
     else process.env.DISCORD_BOT_TOKEN = originalToken;
@@ -113,8 +114,8 @@ describe('retryPendingThreadTitles — host-sweep retry step', () => {
   let fetchMock: ReturnType<typeof vi.fn>;
   const NOW = '2026-08-31T12:00:00.000Z';
 
-  beforeEach(() => {
-    setupDb();
+  beforeEach(async () => {
+    await setupDb();
     _resetRenamedThreadsForTest();
     process.env.DISCORD_BOT_TOKEN = 'bot-token';
     fetchMock = vi.fn(async () => new Response(null, { status: 204 }));
@@ -123,8 +124,8 @@ describe('retryPendingThreadTitles — host-sweep retry step', () => {
     vi.mocked(callHaiku).mockResolvedValue('Retried title');
   });
 
-  afterEach(() => {
-    closeDb();
+  afterEach(async () => {
+    await closeDb();
     vi.unstubAllGlobals();
     if (originalToken === undefined) delete process.env.DISCORD_BOT_TOKEN;
     else process.env.DISCORD_BOT_TOKEN = originalToken;

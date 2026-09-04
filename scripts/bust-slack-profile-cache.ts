@@ -19,12 +19,12 @@
  *
  * Usage: pnpm exec tsx scripts/bust-slack-profile-cache.ts [--dry-run]
  */
-import { initDb, getDb } from '../src/db/connection.js';
+import { initDb, getRawDb } from '../src/db/connection.js';
 
 const dryRun = process.argv.includes('--dry-run');
 
-initDb('data/v2.db');
-const db = getDb();
+await initDb('data/v2.db');
+const db = getRawDb();
 
 // The reverse index is keyed by the OLD lowercased name, so it has to go too —
 // otherwise a retired name keeps resolving to a live bot.

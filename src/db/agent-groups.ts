@@ -1,8 +1,8 @@
 import type { AgentGroup } from '../types.js';
-import { getDb } from './connection.js';
+import { getRawDb } from './connection.js';
 
 export function createAgentGroup(group: AgentGroup): void {
-  getDb()
+  getRawDb()
     .prepare(
       `INSERT INTO agent_groups (id, name, folder, agent_provider, created_at)
        VALUES (@id, @name, @folder, @agent_provider, @created_at)`,
@@ -11,15 +11,15 @@ export function createAgentGroup(group: AgentGroup): void {
 }
 
 export function getAgentGroup(id: string): AgentGroup | undefined {
-  return getDb().prepare('SELECT * FROM agent_groups WHERE id = ?').get(id) as AgentGroup | undefined;
+  return getRawDb().prepare('SELECT * FROM agent_groups WHERE id = ?').get(id) as AgentGroup | undefined;
 }
 
 export function getAgentGroupByFolder(folder: string): AgentGroup | undefined {
-  return getDb().prepare('SELECT * FROM agent_groups WHERE folder = ?').get(folder) as AgentGroup | undefined;
+  return getRawDb().prepare('SELECT * FROM agent_groups WHERE folder = ?').get(folder) as AgentGroup | undefined;
 }
 
 export function getAllAgentGroups(): AgentGroup[] {
-  return getDb().prepare('SELECT * FROM agent_groups ORDER BY name').all() as AgentGroup[];
+  return getRawDb().prepare('SELECT * FROM agent_groups ORDER BY name').all() as AgentGroup[];
 }
 
 export function updateAgentGroup(id: string, updates: Partial<Pick<AgentGroup, 'name' | 'agent_provider'>>): void {
@@ -34,13 +34,13 @@ export function updateAgentGroup(id: string, updates: Partial<Pick<AgentGroup, '
   }
   if (fields.length === 0) return;
 
-  getDb()
+  getRawDb()
     .prepare(`UPDATE agent_groups SET ${fields.join(', ')} WHERE id = @id`)
     .run(values);
 }
 
 export function deleteAgentGroup(id: string): void {
-  getDb().prepare('DELETE FROM agent_groups WHERE id = ?').run(id);
+  getRawDb().prepare('DELETE FROM agent_groups WHERE id = ?').run(id);
 }
 
 /**
@@ -51,7 +51,7 @@ export function deleteAgentGroup(id: string): void {
  * workgroup or the workgroup declares none. See `mergeWorkgroupAndGroupSecrets`.
  */
 export function getWorkgroupOnecliSecrets(agentGroupId: string): string[] {
-  const row = getDb()
+  const row = getRawDb()
     .prepare(
       `SELECT w.onecli_secrets AS secrets FROM workgroups w
        JOIN agent_groups a ON a.workgroup_id = w.id
@@ -74,7 +74,7 @@ export function getWorkgroupOnecliSecrets(agentGroupId: string): string[] {
  * row directly. Returns [] if no such workgroup exists.
  */
 export function getWorkgroupOnecliSecretsById(workgroupId: string): string[] {
-  const row = getDb().prepare(`SELECT onecli_secrets AS secrets FROM workgroups WHERE id = ?`).get(workgroupId) as
+  const row = getRawDb().prepare(`SELECT onecli_secrets AS secrets FROM workgroups WHERE id = ?`).get(workgroupId) as
     | { secrets: string }
     | undefined;
   if (!row) return [];

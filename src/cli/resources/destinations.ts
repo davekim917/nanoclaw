@@ -1,4 +1,4 @@
-import { getDb, hasTable } from '../../db/connection.js';
+import { getRawDb, hasTableRaw } from '../../db/connection.js';
 import { getSessionsByAgentGroup } from '../../db/sessions.js';
 import { log } from '../../log.js';
 import { registerResource } from '../crud.js';
@@ -6,7 +6,7 @@ import { registerResource } from '../crud.js';
 /**
  * Project the agent's central `agent_destinations` rows into every active
  * session's `inbound.db`. The agent-to-agent module is optional, so we guard
- * on `hasTable('agent_destinations')` and load `writeDestinations` lazily —
+ * on `hasTableRaw('agent_destinations')` and load `writeDestinations` lazily —
  * same pattern as container-runner.ts on container wake.
  *
  * Called from every destination-mutating ncl command — `add` and `remove`
@@ -18,7 +18,7 @@ import { registerResource } from '../crud.js';
  * src/modules/agent-to-agent/db/agent-destinations.ts.
  */
 export async function projectDestinationsToSessions(agentGroupId: string): Promise<void> {
-  if (!hasTable(getDb(), 'agent_destinations')) return;
+  if (!hasTableRaw(getRawDb(), 'agent_destinations')) return;
   const { writeDestinations } = await import('../../modules/agent-to-agent/write-destinations.js');
   for (const session of getSessionsByAgentGroup(agentGroupId)) {
     try {
@@ -74,7 +74,7 @@ registerResource({
         const params: unknown[] = [];
         const where = agentGroupId ? 'WHERE ad.agent_group_id = ?' : '';
         if (agentGroupId) params.push(agentGroupId);
-        return getDb()
+        return getRawDb()
           .prepare(
             `SELECT
                ad.agent_group_id,
@@ -107,7 +107,7 @@ registerResource({
           throw new Error('--target-type must be channel or agent');
         }
         if (!targetId) throw new Error('--target-id is required');
-        getDb()
+        getRawDb()
           .prepare(
             `INSERT INTO agent_destinations (agent_group_id, local_name, target_type, target_id, created_at)
              VALUES (?, ?, ?, ?, ?)`,
@@ -125,7 +125,7 @@ registerResource({
         const localName = args.local_name as string;
         if (!agentGroupId) throw new Error('--agent-group-id is required');
         if (!localName) throw new Error('--local-name is required');
-        const result = getDb()
+        const result = getRawDb()
           .prepare('DELETE FROM agent_destinations WHERE agent_group_id = ? AND local_name = ?')
           .run(agentGroupId, localName);
         if (result.changes === 0) throw new Error('destination not found');

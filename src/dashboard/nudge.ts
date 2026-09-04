@@ -19,7 +19,7 @@
  */
 import { readClaims } from '../claims-board.js';
 import { dispatch } from '../cli/dispatch.js';
-import { getDb } from '../db/index.js';
+import { getRawDb } from '../db/index.js';
 import { log } from '../log.js';
 import { buildNudgePrompt, NUDGE_TASK_QUIET_ARGS } from '../modules/claims/self-heal.js';
 import { canAssign } from './assign.js';
@@ -54,7 +54,7 @@ export const observatoryNudgeHandler: AuthHandler = async (req, _params, ctx) =>
   const role = canAssign(ctx.user.id, agentGroupId);
   if (!role.ok) return json(role.reason === 'not_found' ? 404 : 403, { error: role.reason });
 
-  const agent = getDb()
+  const agent = getRawDb()
     .prepare(`SELECT * FROM agent_groups WHERE id = ? AND workgroup_id = ?`)
     .get(agentGroupId, workgroupId) as AgentGroup | undefined;
   if (!agent) return json(404, { error: 'agent_group_not_in_workgroup' });
@@ -76,7 +76,7 @@ export const observatoryNudgeHandler: AuthHandler = async (req, _params, ctx) =>
 
   // The thread's channel must be one this agent group is wired to — a nudge
   // can't make an agent speak somewhere it doesn't belong (assign's rule).
-  const target = getDb()
+  const target = getRawDb()
     .prepare(
       `SELECT mg.id, mg.name
          FROM messaging_group_agents mga

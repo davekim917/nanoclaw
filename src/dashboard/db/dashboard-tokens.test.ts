@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, it, expect } from 'vitest';
 
-import { closeDb, getDb, initTestDb, runMigrations } from '../../db/index.js';
+import { closeDb, getRawDb, initTestDb, runMigrations } from '../../db/index.js';
 import { consumeDashboardToken, issueDashboardToken } from './dashboard-tokens.js';
 
 function now(): string {
@@ -8,18 +8,21 @@ function now(): string {
 }
 
 function seedUser(id: string): void {
-  getDb().prepare("INSERT INTO users (id, kind, display_name, created_at) VALUES (?, 'test', NULL, ?)").run(id, now());
+  getRawDb()
+    .prepare("INSERT INTO users (id, kind, display_name, created_at) VALUES (?, 'test', NULL, ?)")
+    .run(id, now());
 }
 
-beforeEach(() => {
-  const db = initTestDb();
+beforeEach(async () => {
+  await initTestDb();
+  const db = getRawDb();
   runMigrations(db);
   seedUser('u1');
   seedUser('u2');
 });
 
-afterEach(() => {
-  closeDb();
+afterEach(async () => {
+  await closeDb();
 });
 
 describe('dashboard_tokens DAO', () => {
@@ -30,7 +33,7 @@ describe('dashboard_tokens DAO', () => {
     expect(record.used_at).toBeNull();
     expect(record.id).toBeGreaterThan(0);
 
-    const row = getDb().prepare('SELECT * FROM dashboard_tokens WHERE token_hmac = ?').get('hmac-abc') as
+    const row = getRawDb().prepare('SELECT * FROM dashboard_tokens WHERE token_hmac = ?').get('hmac-abc') as
       | { user_id: string; used_at: string | null }
       | undefined;
     expect(row?.user_id).toBe('u1');
@@ -49,7 +52,7 @@ describe('dashboard_tokens DAO', () => {
     expect(record!.user_id).toBe('u1');
     expect(record!.used_at).not.toBeNull();
 
-    const row = getDb().prepare('SELECT used_at FROM dashboard_tokens WHERE token_hmac = ?').get('hmac-x') as
+    const row = getRawDb().prepare('SELECT used_at FROM dashboard_tokens WHERE token_hmac = ?').get('hmac-x') as
       | { used_at: string | null }
       | undefined;
     expect(row?.used_at).not.toBeNull();
@@ -63,7 +66,7 @@ describe('dashboard_tokens DAO', () => {
   });
 
   it('test_consumeDashboardToken_expired', () => {
-    getDb()
+    getRawDb()
       .prepare(
         `INSERT INTO dashboard_tokens (user_id, token_hmac, issued_at, expires_at)
          VALUES ('u1', 'hmac-z', datetime('now', '-25 hours'), datetime('now', '-1 hour'))`,

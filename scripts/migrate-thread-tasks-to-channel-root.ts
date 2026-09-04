@@ -36,7 +36,7 @@ import Database from 'better-sqlite3';
 // itself.
 import '../src/mailbox/compose.js';
 import { DATA_DIR } from '../src/config.js';
-import { initDb, getDb } from '../src/db/connection.js';
+import { initDb, getRawDb } from '../src/db/connection.js';
 import { resolveActiveSession } from '../src/db/scheduled-tasks.js';
 import { findSessionByAgentGroupAndMessagingGroup } from '../src/db/sessions.js';
 import { ensureSchema } from '../src/modules/mailbox/schema.js';
@@ -89,7 +89,7 @@ async function migrateOnce(dryRun: boolean): Promise<MigrationResult> {
 
   // Find every thread-bound session (has a thread_id) that's still active
   // OR archived but might still have undelivered live tasks.
-  const threadSessions = getDb()
+  const threadSessions = getRawDb()
     .prepare(
       `SELECT id, agent_group_id, messaging_group_id, thread_id, status
          FROM sessions
@@ -270,7 +270,7 @@ async function migrateOnce(dryRun: boolean): Promise<MigrationResult> {
 
 async function main(): Promise<void> {
   const dryRun = process.argv.includes('--dry-run');
-  initDb(DB_PATH);
+  await initDb(DB_PATH);
 
   console.log(
     dryRun

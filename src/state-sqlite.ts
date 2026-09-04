@@ -9,7 +9,7 @@ import crypto from 'crypto';
 import type Database from 'better-sqlite3';
 import type { StateAdapter, QueueEntry } from 'chat';
 
-import { getDb } from './db/connection.js';
+import { getRawDb } from './db/connection.js';
 
 interface Lock {
   threadId: string;
@@ -43,7 +43,7 @@ export class SqliteStateAdapter implements StateAdapter {
   }
 
   async connect(): Promise<void> {
-    this.db = getDb();
+    this.db = getRawDb();
     this.cleanup();
   }
 

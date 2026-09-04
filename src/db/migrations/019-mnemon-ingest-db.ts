@@ -10,7 +10,7 @@ export const MNEMON_INGEST_DB_PATH = path.join(DATA_DIR, 'mnemon-ingest.db');
 
 export function openMnemonIngestDb(dbPath?: string): Database.Database {
   // Under vitest a no-arg open resolves to the REAL data/mnemon-ingest.db.
-  // A test that triggers a lazy getDb() without injecting its seam
+  // A test that triggers a lazy getRawDb() without injecting its seam
   // (setDeadLettersDb / setMnemonStoreIngestDb / setIngestDb) then writes
   // dead_letters and watermarks into PRODUCTION — 1,170 vitest-signature
   // dead_letter rows (EnvironmentTeardownError) were found on 2026-07-03,

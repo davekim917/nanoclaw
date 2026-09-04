@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, it, expect } from 'vitest';
 
-import { closeDb, initTestDb, runMigrations, getDb } from '../../../db/index.js';
+import { closeDb, initTestDb, runMigrations, getRawDb } from '../../../db/index.js';
 import { isAnyAdmin } from './user-roles.js';
 
 function now(): string {
@@ -8,18 +8,20 @@ function now(): string {
 }
 
 function insertUser(id: string): void {
-  getDb().prepare("INSERT INTO users (id, kind, display_name, created_at) VALUES (?, 'test', NULL, ?)").run(id, now());
+  getRawDb()
+    .prepare("INSERT INTO users (id, kind, display_name, created_at) VALUES (?, 'test', NULL, ?)")
+    .run(id, now());
 }
 
 function insertRole(userId: string, role: 'owner' | 'admin', agentGroupId: string | null): void {
   if (agentGroupId) {
-    getDb()
+    getRawDb()
       .prepare(
         'INSERT INTO user_roles (user_id, role, agent_group_id, granted_by, granted_at) VALUES (?, ?, ?, NULL, ?)',
       )
       .run(userId, role, agentGroupId, now());
   } else {
-    getDb()
+    getRawDb()
       .prepare(
         'INSERT INTO user_roles (user_id, role, agent_group_id, granted_by, granted_at) VALUES (?, ?, NULL, NULL, ?)',
       )
@@ -27,13 +29,14 @@ function insertRole(userId: string, role: 'owner' | 'admin', agentGroupId: strin
   }
 }
 
-beforeEach(() => {
-  const db = initTestDb();
+beforeEach(async () => {
+  await initTestDb();
+  const db = getRawDb();
   runMigrations(db);
 });
 
-afterEach(() => {
-  closeDb();
+afterEach(async () => {
+  await closeDb();
 });
 
 describe('isAnyAdmin', () => {
@@ -52,7 +55,7 @@ describe('isAnyAdmin', () => {
 
   it('test_isAnyAdmin_scoped_admin_true', () => {
     insertUser('u3');
-    getDb()
+    getRawDb()
       .prepare("INSERT INTO agent_groups (id, name, folder, created_at) VALUES ('ag-1', 'Test', 'test', ?)")
       .run(now());
     insertRole('u3', 'admin', 'ag-1');
@@ -61,11 +64,11 @@ describe('isAnyAdmin', () => {
 
   it('test_isAnyAdmin_member_false', () => {
     insertUser('u4');
-    getDb()
+    getRawDb()
       .prepare("INSERT INTO agent_groups (id, name, folder, created_at) VALUES ('ag-2', 'Test2', 'test2', ?)")
       .run(now());
     // member is not a valid UserRoleKind — insert directly and verify isAnyAdmin returns false
-    getDb()
+    getRawDb()
       .prepare(
         'INSERT INTO user_roles (user_id, role, agent_group_id, granted_by, granted_at) VALUES (?, ?, ?, NULL, ?)',
       )

@@ -54,7 +54,7 @@ import './modules/sweep-scheduling/index.js';
 // and the control arm of the post-kill case fails — the sibling-family import
 // S2-PR14's 23f0c4ab added to the family suites, owed here for the same reason.
 import './modules/sweep-session-core/index.js';
-import { getDb } from './db/connection.js';
+import { getRawDb } from './db/connection.js';
 import type { Session } from './types.js';
 
 // ─── Module mocks for C3 watchdog integration tests ──────────────────────────
@@ -222,7 +222,8 @@ describe('sweepUsageRollup over a hot journal', () => {
   // creates a GENUINE hot journal by killing a child process mid-transaction
   // (same technique as `db/session-db.test.ts`'s hot-journal-recovery cases).
   it('reads turn_usage and advances the watermark over a REAL hot journal with no inbound.db', async () => {
-    const db = initTestDb();
+    await initTestDb();
+    const db = getRawDb();
     runMigrations(db);
     db.prepare(
       `INSERT INTO agent_groups (id, name, folder, created_at)
@@ -275,7 +276,7 @@ describe('sweepUsageRollup over a hot journal', () => {
     if (!fs.existsSync(`${dbPath}-journal`)) {
       // Couldn't reproduce the crash residue on this platform — skip rather
       // than assert something we didn't actually set up.
-      closeDb();
+      await closeDb();
       return;
     }
 
@@ -292,7 +293,7 @@ describe('sweepUsageRollup over a hot journal', () => {
       reproduced = /readonly database/.test((err as Error).message);
     }
     if (!reproduced) {
-      closeDb();
+      await closeDb();
       return;
     }
 
@@ -303,10 +304,10 @@ describe('sweepUsageRollup over a hot journal', () => {
     // watermark advances. Without it (default recoverJournal: false, 1s
     // timeout), the read throws, `sweepUsageRollup`'s per-session catch
     // swallows it, and this table stays empty forever.
-    const rows = getDb().prepare('SELECT provider, model FROM turn_usage WHERE session_id = ?').all(session.id);
+    const rows = getRawDb().prepare('SELECT provider, model FROM turn_usage WHERE session_id = ?').all(session.id);
     expect(rows.length).toBeGreaterThan(0);
     expect(fs.existsSync(`${dbPath}-journal`)).toBe(false);
-    closeDb();
+    await closeDb();
   });
 
   // The deterministic sibling of the case above — `passes the write path
@@ -330,7 +331,8 @@ describe('sweepUsageRollup over a hot journal', () => {
 // ─── H-10 (mailbox seam §8): reads never provision ───────────────────────────
 describe('sweepSession on a session with no mailbox', () => {
   it('sweep treats a missing mailbox as no-op via withExistingMailboxSession', async () => {
-    const db = initTestDb();
+    await initTestDb();
+    const db = getRawDb();
     runMigrations(db);
     db.prepare(
       `INSERT INTO agent_groups (id, name, folder, created_at)
@@ -351,7 +353,7 @@ describe('sweepSession on a session with no mailbox', () => {
     expect(fs.existsSync(sessionPath)).toBe(false);
     expect(fs.existsSync(path.join(sessionPath, 'inbound.db'))).toBe(false);
     expect(mockWakeContainer).not.toHaveBeenCalled();
-    closeDb();
+    await closeDb();
   });
 
   // Round 8. The same TOCTOU class, on the two post-kill write paths that round
@@ -384,7 +386,8 @@ describe('sweepSession on a session with no mailbox', () => {
   }
 
   it('a replacement container that wakes during the post-kill open keeps its claim (ceiling)', async () => {
-    const db = initTestDb();
+    await initTestDb();
+    const db = getRawDb();
     runMigrations(db);
     db.prepare(`INSERT INTO agent_groups (id, name, folder, created_at) VALUES ('ag-sla', 'sla', 'sla', ?)`).run(
       new Date().toISOString(),
@@ -414,11 +417,12 @@ describe('sweepSession on a session with no mailbox', () => {
     expect(mockKillContainer).toHaveBeenCalledWith('sess-sla-ceiling', 'absolute-ceiling', expect.any(Function));
     // Claim intact and no restart notice written: both writes were skipped.
     expect(f.claims()).toBe(before);
-    closeDb();
+    await closeDb();
   });
 
   it('a replacement container that wakes during the post-kill open gets no stale ceiling wake', async () => {
-    const db = initTestDb();
+    await initTestDb();
+    const db = getRawDb();
     runMigrations(db);
     db.prepare(`INSERT INTO agent_groups (id, name, folder, created_at) VALUES ('ag-sla', 'sla', 'sla', ?)`).run(
       new Date().toISOString(),
@@ -477,11 +481,12 @@ describe('sweepSession on a session with no mailbox', () => {
     ).c;
     inbound.close();
     expect(respawns).toBe(0);
-    closeDb();
+    await closeDb();
   });
 
   it('a replacement container that wakes during the post-kill open keeps its claim (claim-stuck)', async () => {
-    const db = initTestDb();
+    await initTestDb();
+    const db = getRawDb();
     runMigrations(db);
     db.prepare(`INSERT INTO agent_groups (id, name, folder, created_at) VALUES ('ag-sla', 'sla', 'sla', ?)`).run(
       new Date().toISOString(),
@@ -509,7 +514,7 @@ describe('sweepSession on a session with no mailbox', () => {
     // already gone. The identity assertion is the first two arguments.
     expect(mockKillContainer).toHaveBeenCalledWith('sess-sla-claim', 'claim-stuck', expect.any(Function));
     expect(f.claims()).toBe(before);
-    closeDb();
+    await closeDb();
   });
 
   // Shared by the post-kill cases below. Pure file readers — no dependency on
@@ -565,7 +570,8 @@ describe('sweepSession on a session with no mailbox', () => {
   // returns and flips false only when `onExit` runs, which is production's
   // ordering and the one the old mocks did not have.
   it('the post-kill chain runs after the container actually exits, not when the kill is requested', async () => {
-    const db = initTestDb();
+    await initTestDb();
+    const db = getRawDb();
     runMigrations(db);
     db.prepare(`INSERT INTO agent_groups (id, name, folder, created_at) VALUES ('ag-sla', 'sla', 'sla', ?)`).run(
       new Date().toISOString(),
@@ -601,7 +607,8 @@ describe('sweepSession on a session with no mailbox', () => {
   });
 
   it('a replacement container that takes the session before the exit still refuses the chain', async () => {
-    const db = initTestDb();
+    await initTestDb();
+    const db = getRawDb();
     runMigrations(db);
     db.prepare(`INSERT INTO agent_groups (id, name, folder, created_at) VALUES ('ag-sla', 'sla', 'sla', ?)`).run(
       new Date().toISOString(),
@@ -639,7 +646,8 @@ describe('sweepSession on a session with no mailbox', () => {
   // guards its own write. The first half of this case is the control that
   // proves the second half is not vacuous.
   it('a wake that takes ownership between post-kill follow-ups stops the later follow-ups from writing', async () => {
-    const db = initTestDb();
+    await initTestDb();
+    const db = getRawDb();
     runMigrations(db);
     db.prepare(`INSERT INTO agent_groups (id, name, folder, created_at) VALUES ('ag-sla', 'sla', 'sla', ?)`).run(
       new Date().toISOString(),
@@ -711,7 +719,7 @@ describe('sweepSession on a session with no mailbox', () => {
     } finally {
       _resetSweepRegistryForTesting();
     }
-    closeDb();
+    await closeDb();
   });
 
   // Round 7 (TOCTOU). Opening a mailbox session is a yield, and a concurrent
@@ -723,7 +731,8 @@ describe('sweepSession on a session with no mailbox', () => {
   // new runner never got is consumed — saved work duplicated, parked early, or
   // lost. This is continue_work's recovery path.
   it('a container that starts during the open leaves the continuation and its attempt count untouched', async () => {
-    const db = initTestDb();
+    await initTestDb();
+    const db = getRawDb();
     runMigrations(db);
     db.prepare(
       `INSERT INTO agent_groups (id, name, folder, created_at)
@@ -766,7 +775,7 @@ describe('sweepSession on a session with no mailbox', () => {
     };
     after.close();
     expect(JSON.parse(row.value)).toEqual(saved);
-    closeDb();
+    await closeDb();
   });
 
   // Round 4: the outbound handle opens LAZILY, after the duties have started,
@@ -775,7 +784,8 @@ describe('sweepSession on a session with no mailbox', () => {
   // outbound.db is retried and logged every 60s instead of backing off, which
   // is the repeated-error load the backoff exists to contain.
   it('an unreadable outbound.db takes the mailbox backoff, not the per-tick duty retry', async () => {
-    const db = initTestDb();
+    await initTestDb();
+    const db = getRawDb();
     runMigrations(db);
     db.prepare(
       `INSERT INTO agent_groups (id, name, folder, created_at)
@@ -796,7 +806,7 @@ describe('sweepSession on a session with no mailbox', () => {
 
     // Backoff, not a throw: a rethrow here is the per-tick retry this pins against.
     await expect(_sweepSessionForTesting(session)).resolves.toEqual(expect.any(Number));
-    closeDb();
+    await closeDb();
   });
 
   /**
@@ -813,7 +823,8 @@ describe('sweepSession on a session with no mailbox', () => {
    * ceiling, no claim tolerance, for as long as it runs.
    */
   it('hands the wake the current session row, not the tick snapshot', async () => {
-    const db = initTestDb();
+    await initTestDb();
+    const db = getRawDb();
     runMigrations(db);
     db.prepare(
       `INSERT INTO agent_groups (id, name, folder, created_at)
@@ -848,7 +859,7 @@ describe('sweepSession on a session with no mailbox', () => {
     expect(mockWakeContainer).toHaveBeenCalledTimes(1);
     const { guard } = mockWakeContainer.mock.calls[0][2] as { guard: () => unknown };
     expect(guard()).toEqual({ ok: false, reason: 'session is closed' });
-    closeDb();
+    await closeDb();
   });
 
   // Round 2: the backoff belongs to an unopenable mailbox, never to a duty
@@ -857,7 +868,8 @@ describe('sweepSession on a session with no mailbox', () => {
   // for the full 30 minutes, and `last_active` does not move on failure, so
   // nothing would clear it early.
   it('a duty that throws propagates for the next-tick retry instead of being quiet-cached', async () => {
-    const db = initTestDb();
+    await initTestDb();
+    const db = getRawDb();
     runMigrations(db);
     db.prepare(
       `INSERT INTO agent_groups (id, name, folder, created_at)
@@ -881,6 +893,6 @@ describe('sweepSession on a session with no mailbox', () => {
     mockAdmitDueTaskContexts.mockReturnValue(0);
     const gone: Session = { ...fakeSession(), id: 'sess-dutythrow-gone', agent_group_id: 'ag-dutythrow' };
     await expect(_sweepSessionForTesting(gone)).resolves.toEqual(expect.any(Number));
-    closeDb();
+    await closeDb();
   });
 });

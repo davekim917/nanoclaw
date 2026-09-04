@@ -1,4 +1,4 @@
-import { getDb } from '../../db/connection.js';
+import { getRawDb } from '../../db/connection.js';
 import { getMembershipGroupIds } from '../../modules/permissions/db/agent-group-members.js';
 import type { GroupScope } from '../router.js';
 
@@ -27,7 +27,7 @@ export interface UserScopes {
  * enumeration query, locking the entire scoped-admin role tier out of the dashboard).
  */
 export function computeScopes(userId: string): UserScopes {
-  const rows = getDb()
+  const rows = getRawDb()
     .prepare('SELECT role, agent_group_id FROM user_roles WHERE user_id = ?')
     .all(userId) as UserRoleRow[];
 

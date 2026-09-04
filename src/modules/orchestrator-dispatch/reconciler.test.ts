@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { closeDb, createAgentGroup, initTestDb, runMigrations } from '../../db/index.js';
-import { getDb } from '../../db/connection.js';
+import { getRawDb } from '../../db/connection.js';
 import { runReconcilerSweep } from './reconciler.js';
 
 // Mock completeSpawnSideEffects so we can track calls without running the full side-effect chain
@@ -19,8 +19,9 @@ function tenMinutesAgo(): string {
   return new Date(Date.now() - 10 * 60 * 1000).toISOString();
 }
 
-function setupDb(): void {
-  const db = initTestDb();
+async function setupDb(): Promise<void> {
+  await initTestDb();
+  const db = getRawDb();
   db.pragma('foreign_keys = ON');
   runMigrations(db);
 }
@@ -33,13 +34,13 @@ function seedGroups(): void {
     agent_provider: null,
     created_at: now(),
   });
-  getDb()
+  getRawDb()
     .prepare(`INSERT INTO sessions (id, agent_group_id, created_at) VALUES (?, ?, ?)`)
     .run('sess-parent', 'ag-parent', now());
 }
 
 function insertOrphanedTask(taskId: string, leaseAt: string | null = null): void {
-  getDb()
+  getRawDb()
     .prepare(
       `INSERT INTO tasks (task_id, idempotency_key, parent_session_id, parent_agent_group_id,
         status, task_content, request_hash, admitted_at, surface_mode,
@@ -49,14 +50,14 @@ function insertOrphanedTask(taskId: string, leaseAt: string | null = null): void
     .run(taskId, `ik-${taskId}`, tenMinutesAgo(), leaseAt, now());
 }
 
-afterEach(() => {
-  closeDb();
+afterEach(async () => {
+  await closeDb();
   vi.clearAllMocks();
 });
 
 describe('runReconcilerSweep', () => {
   it('test_reconciler_picks_up_orphan: schedules side-effects for orphaned task', async () => {
-    setupDb();
+    await setupDb();
     seedGroups();
     insertOrphanedTask('task-orphan', null); // no lease
 
@@ -70,7 +71,7 @@ describe('runReconcilerSweep', () => {
   });
 
   it('test_reconciler_skips_active_lease: does not schedule when lease is held', async () => {
-    setupDb();
+    await setupDb();
     seedGroups();
     // lease set to NOW (not expired — within 60s TTL)
     insertOrphanedTask('task-leased', now());
@@ -85,7 +86,7 @@ describe('runReconcilerSweep', () => {
   });
 
   it('picks up multiple orphans in one sweep', async () => {
-    setupDb();
+    await setupDb();
     seedGroups();
     insertOrphanedTask('task-a');
     insertOrphanedTask('task-b');
@@ -104,7 +105,7 @@ describe('runReconcilerSweep', () => {
   });
 
   it('does nothing when no orphans exist', async () => {
-    setupDb();
+    await setupDb();
     seedGroups();
 
     const setImmediateSpy = vi.spyOn(global, 'setImmediate');

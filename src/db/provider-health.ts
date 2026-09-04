@@ -19,7 +19,7 @@
  * outlive an operator fixing the account, and a one-second reset should not
  * produce a hot loop.
  */
-import { getDb } from './connection.js';
+import { getRawDb } from './connection.js';
 
 /** Never trust an unbounded reset promise from a provider. */
 const MAX_COOLDOWN_MS = 7 * 24 * 60 * 60_000;
@@ -63,7 +63,7 @@ function cooldownMs(consecutiveFailures: number, resetAtMs: number | null, nowMs
 }
 
 export function getProviderHealth(agentGroupId: string, provider: string): ProviderHealthRow | undefined {
-  return getDb()
+  return getRawDb()
     .prepare(`SELECT * FROM provider_health WHERE agent_group_id = ? AND provider = ?`)
     .get(agentGroupId, provider) as ProviderHealthRow | undefined;
 }
@@ -97,7 +97,7 @@ export function markProviderUnavailable(
 ): string {
   if (!agentGroupId) throw new Error('agent group id is required');
   if (!provider) throw new Error('provider is required');
-  const db = getDb();
+  const db = getRawDb();
   const nowMs = options.nowMs ?? Date.now();
   const now = new Date(nowMs).toISOString();
   const resetAtMs = options.resetAt ? Date.parse(options.resetAt) : null;
@@ -138,7 +138,7 @@ export function markProviderAvailable(agentGroupId: string, provider: string, op
   // Only write when there is something to clear: a healthy provider must not
   // generate a DB write on every successful turn.
   if (!row || (row.unavailable_until === null && row.consecutive_failures === 0)) return;
-  getDb()
+  getRawDb()
     .prepare(
       `UPDATE provider_health
           SET unavailable_until = NULL, consecutive_failures = 0, updated_at = ?

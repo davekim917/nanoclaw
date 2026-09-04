@@ -4,7 +4,7 @@ import os from 'os';
 import path from 'path';
 import http from 'http';
 
-import { closeDb, createAgentGroup, getDb, initTestDb, runMigrations } from '../db/index.js';
+import { closeDb, createAgentGroup, getRawDb, initTestDb, runMigrations } from '../db/index.js';
 import { enforceHermeticity } from '../test-hermeticity.js';
 import type { AuthedRequestContext } from './router.js';
 
@@ -78,23 +78,23 @@ function ctx(over: { userId?: string; no_filter?: boolean; allowed?: string[] } 
 let claimsRoot: string;
 
 function seedAgent(id: string, folder = id): void {
-  getDb()
+  getRawDb()
     .prepare(`INSERT OR IGNORE INTO workgroups (id, display_name, created_at) VALUES ('wg-1', 'wg-1', ?)`)
     .run(iso());
   createAgentGroup({ id, name: id, folder, agent_provider: null, created_at: iso() });
   // `createAgentGroup` does not carry workgroup_id, and claims are per-workgroup
   // files — so a claim is unfindable without this.
-  getDb().prepare(`UPDATE agent_groups SET workgroup_id = 'wg-1' WHERE id = ?`).run(id);
+  getRawDb().prepare(`UPDATE agent_groups SET workgroup_id = 'wg-1' WHERE id = ?`).run(id);
 }
 
 function wire(agentGroupId: string, sessionMode = 'per-thread'): void {
-  getDb()
+  getRawDb()
     .prepare(
       `INSERT OR IGNORE INTO messaging_groups (id, channel_type, instance, platform_id, name, created_at)
        VALUES ('mg-1', 'slack-testworkspace', 'testworkspace', 'slack:CTESTCHAN01', '#example-eng', ?)`,
     )
     .run(iso());
-  getDb()
+  getRawDb()
     .prepare(
       `INSERT INTO messaging_group_agents (id, messaging_group_id, agent_group_id, session_mode, created_at)
        VALUES (?, 'mg-1', ?, ?, ?)`,
@@ -103,7 +103,7 @@ function wire(agentGroupId: string, sessionMode = 'per-thread'): void {
 }
 
 function seedSession(id: string, agentGroupId: string, threadId: string | null = THREAD): void {
-  getDb()
+  getRawDb()
     .prepare(
       `INSERT INTO sessions
          (id, agent_group_id, messaging_group_id, thread_id, agent_provider, status, container_status,
@@ -133,17 +133,18 @@ function writeClaim(opts: { slug: string; owner: string; ttlHours: number; claim
 const ACCEPTED = { status: 202, body: { message_id: 'm-1', echo_status: 'pending' } };
 
 function makeUserAdmin(userId: string): void {
-  getDb()
+  getRawDb()
     .prepare(`INSERT OR IGNORE INTO users (id, kind, display_name, created_at) VALUES (?, 'dashboard', ?, ?)`)
     .run(userId, userId, iso());
-  getDb()
+  getRawDb()
     .prepare(`INSERT INTO user_roles (user_id, role, agent_group_id, granted_at) VALUES (?, 'owner', NULL, ?)`)
     .run(userId, iso());
 }
 
-beforeEach(() => {
-  closeDb();
-  const db = initTestDb();
+beforeEach(async () => {
+  await closeDb();
+  await initTestDb();
+  const db = getRawDb();
   db.pragma('foreign_keys = ON');
   runMigrations(db);
   claimsRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ncc-claims-'));
@@ -175,7 +176,7 @@ describe('a chosen agent already on the thread is an ordinary send', () => {
     expect(payload.text).toContain('push it forward');
     expect(payload.text).toContain('Dana');
     // No new session row — an agent already here is steered, never re-assigned.
-    expect(getDb().prepare('SELECT COUNT(*) AS n FROM sessions').get()).toEqual({ n: 1 });
+    expect(getRawDb().prepare('SELECT COUNT(*) AS n FROM sessions').get()).toEqual({ n: 1 });
   });
 });
 
@@ -193,7 +194,7 @@ describe('assigning an agent with no session on the thread', () => {
 
     expect(res.status).toBe(202);
     expect(res.body['created_session']).toBe(true);
-    const created = getDb()
+    const created = getRawDb()
       .prepare(`SELECT id, agent_group_id, messaging_group_id, thread_id FROM sessions WHERE agent_group_id='ag-bravo'`)
       .get() as { id: string; messaging_group_id: string; thread_id: string };
     expect(created.messaging_group_id).toBe('mg-1');
@@ -215,7 +216,7 @@ describe('assigning an agent with no session on the thread', () => {
     expect(res.status).toBe(409);
     expect(res.body['error']).toBe('agent_not_wired_to_thread_channel');
     expect(applySessionSteer).not.toHaveBeenCalled();
-    expect(getDb().prepare('SELECT COUNT(*) AS n FROM sessions').get()).toEqual({ n: 1 });
+    expect(getRawDb().prepare('SELECT COUNT(*) AS n FROM sessions').get()).toEqual({ n: 1 });
   });
 
   it('does not mint a session for a caller who may not steer that agent', async () => {
@@ -224,7 +225,7 @@ describe('assigning an agent with no session on the thread', () => {
     wire('ag-alpha');
     wire('ag-bravo');
     seedSession('s-alpha', 'ag-alpha');
-    getDb()
+    getRawDb()
       .prepare(`INSERT INTO users (id, kind, display_name, created_at) VALUES ('u-nobody','dashboard','N',?)`)
       .run(iso());
 
@@ -236,7 +237,7 @@ describe('assigning an agent with no session on the thread', () => {
     // Disclose-as-not-found, and — the point of the test — the gate ran BEFORE
     // resolveSession, so no row exists for an agent this caller cannot reach.
     expect(res.status).toBe(404);
-    expect(getDb().prepare('SELECT COUNT(*) AS n FROM sessions').get()).toEqual({ n: 1 });
+    expect(getRawDb().prepare('SELECT COUNT(*) AS n FROM sessions').get()).toEqual({ n: 1 });
     expect(applySessionSteer).not.toHaveBeenCalled();
   });
 });

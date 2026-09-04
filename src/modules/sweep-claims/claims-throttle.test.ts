@@ -91,7 +91,7 @@ vi.mock('../../config.js', async (importOriginal) => {
 // Registers T20/T21 into host-sweep.ts's live registry, same as claims.test.ts.
 import './index.js';
 import { _listSweepRegistrationsForTesting, type SweepTickContext } from '../../host-sweep.js';
-import { closeDb, initTestDb } from '../../db/connection.js';
+import { closeDb, initTestDb, getRawDb } from '../../db/connection.js';
 import { _resetSelfHealThrottleForTesting, SELF_HEAL_MAX_NUDGES } from '../claims/self-heal.js';
 
 function fakeTickContext(): SweepTickContext {
@@ -140,7 +140,7 @@ function readStamp(): { auto_nudge_count?: number; auto_nudged_at?: string } {
 }
 
 describe('F-6.1', () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     _resetSelfHealThrottleForTesting();
     mockDispatch.mockClear();
     vi.useFakeTimers();
@@ -148,7 +148,8 @@ describe('F-6.1', () => {
     // whole 24h+ span these ticks cover.
     writeClaim(NOW - 30 * HOUR);
 
-    const db = initTestDb();
+    await initTestDb();
+    const db = getRawDb();
     db.exec(`
       CREATE TABLE agent_groups (
         id TEXT PRIMARY KEY, name TEXT NOT NULL, folder TEXT NOT NULL UNIQUE,
@@ -168,9 +169,9 @@ describe('F-6.1', () => {
     `);
   });
 
-  afterEach(() => {
+  afterEach(async () => {
     vi.useRealTimers();
-    closeDb();
+    await closeDb();
     fs.rmSync(h.root, { recursive: true, force: true });
   });
 

@@ -12,7 +12,7 @@ import Database from 'better-sqlite3';
 import '../src/mailbox/compose.js';
 import { DATA_DIR, GROUPS_DIR } from '../src/config.js';
 import { cleanupOrphansStrict } from '../src/container-runtime.js';
-import { closeDb, initDb } from '../src/db/connection.js';
+import { closeDb, initDb, getRawDb } from '../src/db/connection.js';
 import {
   isExactShippedMemoryScaffold,
   memoryTreeSha256,
@@ -1542,7 +1542,8 @@ export async function runCli(args = process.argv.slice(2), migrationHooks: Apply
   if (command === 'apply') {
     const report = applyMigrationReport(reportPath, migrationHooks);
     failIfBlocked(report, 'apply');
-    const db = initDb(report.dbPath);
+    await initDb(report.dbPath);
+    const db = getRawDb();
     try {
       // Awaited: the reconciliation became async with the mailbox seam, and
       // the `finally` below closes the central DB it is still using. Without
@@ -1556,7 +1557,7 @@ export async function runCli(args = process.argv.slice(2), migrationHooks: Apply
         report.dataDir,
       );
     } finally {
-      closeDb();
+      await closeDb();
     }
     return;
   }

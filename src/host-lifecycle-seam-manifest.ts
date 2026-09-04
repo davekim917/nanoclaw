@@ -1,5 +1,5 @@
 /**
- * Upstream host-lifecycle-seam manifest.
+ * Upstream seam-port manifest (host-lifecycle seam S2-PR0 + the seam-3 DbDriver layer).
  *
  * The file(s) listed in UPSTREAM_FILES are ported byte-for-byte from upstream
  * nanocoai/nanoclaw and must never be hand-edited — src/host-lifecycle-seam.test.ts
@@ -24,8 +24,33 @@ import { fileURLToPath } from 'node:url';
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 export const MANIFEST_PATH = path.join(REPO_ROOT, 'src/host-lifecycle-seam/UPSTREAM-MANIFEST.json');
 
-/** Every file ported verbatim from upstream for the host-lifecycle seam (S2-PR0). */
-export const UPSTREAM_FILES = ['src/host-lifecycle.ts'] as const;
+/**
+ * Every file ported verbatim from upstream, across both seams that have landed
+ * one: the host-lifecycle seam (S2-PR0, `src/host-lifecycle.ts`) and the async
+ * central-DB driver layer (seam 3 PR 1, everything under `src/db/driver*` /
+ * `src/db/drivers/` / `src/db/testing/` plus `src/db/compose.ts`).
+ *
+ * The driver files replaced the fork's type-only `DbDriver` stand-in, whose
+ * "exactly one importer" pin retired with it — a stand-in needs its blast radius
+ * capped, a real upstream file needs byte-equality, and that is this manifest's
+ * job. `src/db/connection.ts` is deliberately NOT here: it is fork-adapted
+ * (`getRawDb`/`hasTableRaw`, fork init semantics), so the upstream ratchet
+ * measures it as ordinary divergence instead.
+ *
+ * All entries share one pinned upstream commit, so a re-pin re-hashes them all.
+ */
+export const UPSTREAM_FILES = [
+  'src/db/compose.ts',
+  'src/db/driver-registry.test.ts',
+  'src/db/driver-registry.ts',
+  'src/db/driver.ts',
+  'src/db/drivers/shared.ts',
+  'src/db/drivers/sqlite.conformance.test.ts',
+  'src/db/drivers/sqlite.test.ts',
+  'src/db/drivers/sqlite.ts',
+  'src/db/testing/driver-conformance.ts',
+  'src/host-lifecycle.ts',
+] as const;
 
 /**
  * Upstream files this fork CANNOT carry byte-for-byte, with the fork-owned test that

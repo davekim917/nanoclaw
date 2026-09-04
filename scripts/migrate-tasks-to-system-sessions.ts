@@ -53,7 +53,7 @@ import { sessionMailboxPath } from '../src/mailbox/sqlite/paths.js';
 import { readSessionInbound, type ScheduledTaskRow } from '../src/modules/mailbox/index.js';
 import { resolveTaskSession } from '../src/session-manager.js';
 
-initDb(path.join(DATA_DIR, 'v2.db'));
+await initDb(path.join(DATA_DIR, 'v2.db'));
 
 const args = process.argv.slice(2);
 const APPLY = args.includes('--apply');

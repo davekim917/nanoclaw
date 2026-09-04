@@ -13,7 +13,7 @@
  * See docs/specs/scheduled-tasks-board/design.md §3a, §4.1, §4.2, §4.4, §4.5.
  */
 import { DATA_DIR } from '../../config.js';
-import { getDb } from '../../db/connection.js';
+import { getRawDb } from '../../db/connection.js';
 import { log } from '../../log.js';
 import {
   readSessionInbound,
@@ -96,7 +96,7 @@ interface RepairAuditRow {
 }
 
 function repairRows(nowMs: number, liveSeriesIds: Set<string>): ScheduledRow[] {
-  const db = getDb();
+  const db = getRawDb();
   let auditRows: RepairAuditRow[];
   try {
     auditRows = db
@@ -336,7 +336,7 @@ interface AuditTailRow {
 
 function readAuditTail(seriesId: string): AuditTailRow[] {
   try {
-    return getDb()
+    return getRawDb()
       .prepare(
         `SELECT ts, actor, action, before_preview, after_preview, correlation_id
            FROM scheduled_audit WHERE series_id = ? ORDER BY id DESC LIMIT 20`,
@@ -349,7 +349,7 @@ function readAuditTail(seriesId: string): AuditTailRow[] {
 
 function cancelAuditTsMs(seriesId: string): number | null {
   try {
-    const row = getDb()
+    const row = getRawDb()
       .prepare("SELECT ts FROM scheduled_audit WHERE series_id = ? AND action = 'cancel' ORDER BY id ASC LIMIT 1")
       .get(seriesId) as { ts: string } | undefined;
     return row ? parseUtcMs(row.ts) : null;

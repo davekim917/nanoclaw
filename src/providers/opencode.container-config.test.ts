@@ -11,7 +11,7 @@ import path from 'path';
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
-import { closeDb, initTestDb } from '../db/connection.js';
+import { closeDb, initTestDb, getRawDb } from '../db/connection.js';
 import { runMigrations } from '../db/migrations/index.js';
 import { getProviderContainerConfig, type ProviderContainerContext } from './provider-container-registry.js';
 // Importing the module registers the host config callback.
@@ -45,12 +45,13 @@ function writeGlobalSources(home: string): void {
 }
 
 describe('opencode provider container-config reconciliation', () => {
-  beforeEach(() => {
-    runMigrations(initTestDb());
+  beforeEach(async () => {
+    await initTestDb();
+    runMigrations(getRawDb());
   });
 
-  afterEach(() => {
-    closeDb();
+  afterEach(async () => {
+    await closeDb();
   });
 
   it('creates a missing runtime parent chain, reconciles stale entries, and preserves opencode.db', () => {

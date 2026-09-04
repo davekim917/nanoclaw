@@ -27,7 +27,7 @@ vi.mock('./config.js', async () => {
   return { ...actual, DATA_DIR: TEST_DIR };
 });
 
-import { initTestDb, closeDb, runMigrations, createAgentGroup } from './db/index.js';
+import { initTestDb, closeDb, runMigrations, createAgentGroup, getRawDb } from './db/index.js';
 import { createSession } from './db/sessions.js';
 import { initSessionFolder, sessionDir, writeSessionMessage } from './session-manager.js';
 import type { Session } from './types.js';
@@ -40,11 +40,12 @@ function now(): string {
   return new Date().toISOString();
 }
 
-beforeEach(() => {
+beforeEach(async () => {
   if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
   fs.mkdirSync(TEST_DIR, { recursive: true });
 
-  const db = initTestDb();
+  await initTestDb();
+  const db = getRawDb();
   runMigrations(db);
 
   createAgentGroup({ id: AG, name: 'SaveAtt', folder: 'saveatt', agent_provider: null, created_at: now() });
@@ -63,8 +64,8 @@ beforeEach(() => {
   initSessionFolder(AG, SESS);
 });
 
-afterEach(() => {
-  closeDb();
+afterEach(async () => {
+  await closeDb();
   if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
 });
 

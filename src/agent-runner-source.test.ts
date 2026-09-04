@@ -27,7 +27,7 @@ vi.mock('./log.js', async (importOriginal) => ({
 }));
 
 import { buildMounts } from './container-runner.js';
-import { closeDb, createAgentGroup, getDb, initTestDb, runMigrations } from './db/index.js';
+import { closeDb, createAgentGroup, getRawDb, initTestDb, runMigrations } from './db/index.js';
 import { ensureContainerConfig } from './db/container-configs.js';
 import { initGroupFilesystem } from './group-init.js';
 import {
@@ -55,7 +55,7 @@ function containerConfig(): ContainerConfig {
 // buildMounts fail-closes (W3) on a NULL workgroup_id — give the test group
 // a workgroup-of-1 so the archive/central projections resolve.
 function withWorkgroup(ag: AgentGroup): void {
-  const db = getDb();
+  const db = getRawDb();
   db.prepare(
     `INSERT OR IGNORE INTO workgroups (id, display_name, onecli_secrets, mnemon_store_id, created_at)
      VALUES (?, ?, '[]', ?, strftime('%Y-%m-%dT%H:%M:%fZ','now'))`,
@@ -98,16 +98,17 @@ function makeFakeSourceDir(): string {
   return dir;
 }
 
-beforeEach(() => {
+beforeEach(async () => {
   vi.clearAllMocks();
   resetAgentRunnerSourceForTesting();
   fs.rmSync(TEST_ROOT, { recursive: true, force: true });
   fs.mkdirSync(TEST_ROOT, { recursive: true });
-  runMigrations(initTestDb());
+  await initTestDb();
+  runMigrations(getRawDb());
 });
 
-afterEach(() => {
-  closeDb();
+afterEach(async () => {
+  await closeDb();
   fs.rmSync(TEST_ROOT, { recursive: true, force: true });
   resetAgentRunnerSourceForTesting();
 });

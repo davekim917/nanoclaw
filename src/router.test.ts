@@ -9,8 +9,8 @@ import { afterEach, beforeEach, describe, it, expect, vi } from 'vitest';
 
 vi.mock('./db/connection.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('./db/connection.js')>()),
-  getDb: vi.fn(),
-  hasTable: vi.fn(() => true),
+  getRawDb: vi.fn(),
+  hasTableRaw: vi.fn(() => true),
 }));
 vi.mock('./db/channel-ingress-receipts.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('./db/channel-ingress-receipts.js')>()),
@@ -203,7 +203,7 @@ import {
   getMessagingGroupAgents,
   createMessagingGroupAgent,
 } from './db/messaging-groups.js';
-import { getDb } from './db/connection.js';
+import { getRawDb } from './db/connection.js';
 import { writeSessionMessageIfNew, resolveSession } from './session-manager.js';
 import { wakeContainer } from './container-runner.js';
 import { getSession } from './db/sessions.js';
@@ -267,11 +267,11 @@ function makeChatEvent(text: string, overrides: Partial<InboundEvent> = {}): Inb
   };
 }
 
-/** Stub getDb() for the sole-intercept-responder tiebreak query in router.ts —
+/** Stub getRawDb() for the sole-intercept-responder tiebreak query in router.ts —
  *  it runs a single `prepare(...).get(mgId, platformId)` and expects
  *  `{ mg_id }` (the deterministic winner) or undefined. */
 function mockInterceptTiebreakWinner(winnerMgId: string | undefined): void {
-  vi.mocked(getDb).mockReturnValue({
+  vi.mocked(getRawDb).mockReturnValue({
     prepare: vi.fn(() => ({
       get: vi.fn(() => (winnerMgId === undefined ? undefined : { mg_id: winnerMgId })),
     })),
@@ -711,7 +711,7 @@ describe('workspace-trust auto-wire inherits voice and engagement defaults', () 
       .mockReturnValueOnce({ mg, agentCount: 0 })
       .mockReturnValue({ mg, agentCount: 1 });
     vi.mocked(getMessagingGroupAgents).mockReturnValue([makeAgent({ messaging_group_id: 'mg-new' })]);
-    vi.mocked(getDb).mockReturnValue({
+    vi.mocked(getRawDb).mockReturnValue({
       prepare: (sql: string) => ({
         // inheritedAgentGroupFor picks the incumbent; unanimousToneFor asks
         // what tone that agent already uses on this platform.

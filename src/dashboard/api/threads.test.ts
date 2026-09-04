@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-import { closeDb, initTestDb, runMigrations, createAgentGroup, getDb } from '../../db/index.js';
+import { closeDb, initTestDb, runMigrations, createAgentGroup, getRawDb } from '../../db/index.js';
 import { ATTENTION_ITEM_PREFIX, ATTENTION_MEMO_TTL_MS, clearAttentionMemo } from '../../attention-sources.js';
 import { ASSIGN_DEDUPE_MS } from '../db/item-assignments.js';
 import type { AuthedRequestContext } from '../router.js';
@@ -100,11 +100,12 @@ function makeCtx(opts: { no_filter?: boolean; allowed_group_ids?: string[] } = {
   };
 }
 
-function setupDb(): void {
+async function setupDb(): Promise<void> {
   // Module-level memo, and vitest keeps module state across files in a worker:
   // an un-cleared one would serve a previous DB's attention items into this one.
   clearAttentionMemo();
-  const db = initTestDb();
+  await initTestDb();
+  const db = getRawDb();
   db.pragma('foreign_keys = ON');
   runMigrations(db);
 }
@@ -112,11 +113,11 @@ function setupDb(): void {
 function seedAgentGroup(id: string, workgroupId?: string): void {
   createAgentGroup({ id, name: id, folder: id, agent_provider: null, created_at: iso(0) });
   // `createAgentGroup` does not carry workgroup_id; the reconcile path sets it.
-  if (workgroupId) getDb().prepare('UPDATE agent_groups SET workgroup_id = ? WHERE id = ?').run(workgroupId, id);
+  if (workgroupId) getRawDb().prepare('UPDATE agent_groups SET workgroup_id = ? WHERE id = ?').run(workgroupId, id);
 }
 
 function seedWorkgroup(id: string): void {
-  getDb().prepare('INSERT INTO workgroups (id, created_at) VALUES (?, ?)').run(id, iso(0));
+  getRawDb().prepare('INSERT INTO workgroups (id, created_at) VALUES (?, ?)').run(id, iso(0));
 }
 
 function insertSession(opts: {
@@ -134,7 +135,7 @@ function insertSession(opts: {
   taskRoutingPlatformId?: string | null;
   createdAt?: string;
 }): void {
-  getDb()
+  getRawDb()
     .prepare(
       `INSERT INTO sessions
          (id, agent_group_id, messaging_group_id, thread_id, agent_provider, status, container_status,
@@ -459,9 +460,9 @@ describe('deriveNeedsYouReason', () => {
 // ── §3.1 thread grouping ─────────────────────────────────────────────────────
 
 describe('buildThreadList — grouping', () => {
-  beforeEach(() => {
-    closeDb();
-    setupDb();
+  beforeEach(async () => {
+    await closeDb();
+    await setupDb();
   });
 
   it('collapses a six-agent thread to ONE row carrying six participants', async () => {
@@ -538,7 +539,7 @@ describe('buildThreadList — grouping', () => {
 
   it('resolves the channel key to a friendly name from messaging_groups', async () => {
     seedAgentGroup('ag-1');
-    getDb()
+    getRawDb()
       .prepare(
         `INSERT INTO messaging_groups (id, channel_type, instance, platform_id, name, created_at)
          VALUES (?, ?, ?, ?, ?, ?)`,
@@ -642,7 +643,7 @@ function insertMessagingGroup(opts: {
   name?: string | null;
   channelType?: string;
 }): void {
-  getDb()
+  getRawDb()
     .prepare(
       `INSERT INTO messaging_groups (id, channel_type, instance, platform_id, name, created_at)
        VALUES (?, ?, ?, ?, ?, ?)`,
@@ -658,9 +659,9 @@ function insertMessagingGroup(opts: {
 }
 
 describe('buildThreadList — synthetic session channel recovery (§3.2 gap, DEFECT 1)', () => {
-  beforeEach(() => {
-    closeDb();
-    setupDb();
+  beforeEach(async () => {
+    await closeDb();
+    await setupDb();
   });
 
   it('a synthetic (NULL thread_id) session lands in its messaging group channel, not unknown', async () => {
@@ -723,7 +724,7 @@ function insertTaskAnchor(opts: {
   channelType?: string;
   createdAt: string;
 }): void {
-  getDb()
+  getRawDb()
     .prepare(
       `INSERT INTO task_thread_anchors (session_id, channel_type, platform_id, thread_platform_id, created_at)
        VALUES (?, ?, ?, ?, ?)`,
@@ -732,9 +733,9 @@ function insertTaskAnchor(opts: {
 }
 
 describe('buildThreadList — scheduled tasks resolve to where they actually posted (task_thread_anchors)', () => {
-  beforeEach(() => {
-    closeDb();
-    setupDb();
+  beforeEach(async () => {
+    await closeDb();
+    await setupDb();
   });
 
   it('an anchored task thread resolves to its real channel and friendly name, not the tasks bucket', async () => {
@@ -813,9 +814,9 @@ describe('buildThreadList — scheduled tasks resolve to where they actually pos
 // ── Migration 056: the routing stamp, and why it LOSES to an anchor ──────────
 
 describe('buildThreadList — scheduled tasks fall back to their routing stamp (migration 056)', () => {
-  beforeEach(() => {
-    closeDb();
-    setupDb();
+  beforeEach(async () => {
+    await closeDb();
+    await setupDb();
   });
 
   it('a task session with no anchor but a routing stamp resolves to the stamped channel', async () => {
@@ -932,9 +933,9 @@ describe('buildThreadList — scheduled tasks fall back to their routing stamp (
 // ── DEFECT 2 (operator report, 2026-08-20): one human, two DM channels ───────
 
 describe('buildThreadList — DM dedupe by stable platform user id (DEFECT 2)', () => {
-  beforeEach(() => {
-    closeDb();
-    setupDb();
+  beforeEach(async () => {
+    await closeDb();
+    await setupDb();
   });
 
   /** Mirrors the live shape: `user_dms.user_id` / `users.id` are instance-scoped
@@ -947,10 +948,10 @@ describe('buildThreadList — DM dedupe by stable platform user id (DEFECT 2)', 
     displayName: string;
   }): void {
     const userId = `${opts.channelType}:${opts.rawUserId}`;
-    getDb()
+    getRawDb()
       .prepare(`INSERT OR IGNORE INTO users (id, kind, display_name, created_at) VALUES (?, 'human', ?, ?)`)
       .run(userId, opts.displayName, iso(0));
-    getDb()
+    getRawDb()
       .prepare(`INSERT INTO user_dms (user_id, channel_type, messaging_group_id, resolved_at) VALUES (?, ?, ?, ?)`)
       .run(userId, opts.channelType, opts.messagingGroupId, iso(0));
   }
@@ -1072,9 +1073,9 @@ describe('buildThreadList — DM dedupe by stable platform user id (DEFECT 2)', 
  * ceiling. There is no workgroup permission concept.
  */
 describe('buildThreadList — workgroup axis', () => {
-  beforeEach(() => {
-    closeDb();
-    setupDb();
+  beforeEach(async () => {
+    await closeDb();
+    await setupDb();
     seedWorkgroup('example-labs');
     seedWorkgroup('example-dev');
     seedAgentGroup('ag-lab-1', 'example-labs');
@@ -1214,9 +1215,9 @@ describe('replyTargetSessionId (§10.3)', () => {
 });
 
 describe('buildThreadList — reply target and snooze', () => {
-  beforeEach(() => {
-    closeDb();
-    setupDb();
+  beforeEach(async () => {
+    await closeDb();
+    await setupDb();
   });
 
   it('gives every participant the session a reply to THEM lands in', async () => {
@@ -1266,7 +1267,7 @@ describe('buildThreadList — reply target and snooze', () => {
       lastActive: iso(60_000),
     });
     // An unanswered `ask_question`: the outbound is newer than the last inbound.
-    getDb()
+    getRawDb()
       .prepare(`UPDATE sessions SET last_outbound_kind = 'chat-sdk:ask_question', last_active = ? WHERE id = ?`)
       .run(iso(900_000), 's-asked');
 
@@ -1322,7 +1323,7 @@ describe('buildThreadList — reply target and snooze', () => {
     seedAgentGroup('ag-1');
     const thread = 'slack:CTESTCHAN01:1700000000.11';
     insertSession({ id: 's-1', agentGroupId: 'ag-1', threadId: thread, lastOutboundAt: iso(60_000) });
-    getDb()
+    getRawDb()
       .prepare(`INSERT INTO thread_snoozes (thread_id, user_id, snoozed_at_activity, created_at) VALUES (?, ?, ?, ?)`)
       .run(thread, 'u1', iso(60_000), iso(0));
 
@@ -1333,7 +1334,7 @@ describe('buildThreadList — reply target and snooze', () => {
     expect((await buildThreadList(other, LIST_OPTS, deps())).threads[0]!.snoozed).toBe(false);
 
     // The thread speaks again: the same row stops hiding it, with no sweep.
-    getDb().prepare('UPDATE sessions SET last_outbound_at = ? WHERE id = ?').run(iso(0), 's-1');
+    getRawDb().prepare('UPDATE sessions SET last_outbound_at = ? WHERE id = ?').run(iso(0), 's-1');
     expect((await buildThreadList(makeCtx(), LIST_OPTS, deps())).threads[0]!.snoozed).toBe(false);
   });
 });
@@ -1438,13 +1439,13 @@ describe('mergeThreadTranscript', () => {
  */
 describe('assignable_agents', () => {
   function wire(mgId: string, platformId: string, agentGroupId: string): void {
-    getDb()
+    getRawDb()
       .prepare(
         `INSERT OR IGNORE INTO messaging_groups (id, channel_type, instance, platform_id, name, created_at)
          VALUES (?, 'slack-testworkspace', 'testworkspace', ?, '#example-eng', ?)`,
       )
       .run(mgId, platformId, iso(0));
-    getDb()
+    getRawDb()
       .prepare(
         `INSERT INTO messaging_group_agents (id, messaging_group_id, agent_group_id, session_mode, created_at)
          VALUES (?, ?, ?, 'per-thread', ?)`,
@@ -1452,8 +1453,8 @@ describe('assignable_agents', () => {
       .run(`mga-${mgId}-${agentGroupId}`, mgId, agentGroupId, iso(0));
   }
 
-  beforeEach(() => {
-    setupDb();
+  beforeEach(async () => {
+    await setupDb();
     for (const id of ['ag-here', 'ag-wired', 'ag-otherroom']) seedAgentGroup(id);
     wire('mg-1', 'slack:CTESTCHAN01', 'ag-here');
     wire('mg-1', 'slack:CTESTCHAN01', 'ag-wired');
@@ -1528,9 +1529,9 @@ describe('pickDoneProposal', () => {
 });
 
 describe('needs_you_reason on the wire (operator report 2026-08-21)', () => {
-  beforeEach(() => {
-    closeDb();
-    setupDb();
+  beforeEach(async () => {
+    await closeDb();
+    await setupDb();
   });
 
   it('is absent for a thread that is not needs_you', async () => {
@@ -1553,7 +1554,7 @@ describe('needs_you_reason on the wire (operator report 2026-08-21)', () => {
     });
     // Same "unanswered ask_question" setup as the reply-target test above: the
     // outbound is newer than the last inbound.
-    getDb()
+    getRawDb()
       .prepare(`UPDATE sessions SET last_outbound_kind = 'chat-sdk:ask_question', last_active = ? WHERE id = ?`)
       .run(iso(900_000), 's-asked');
 
@@ -1569,7 +1570,7 @@ describe('needs_you_reason on the wire (operator report 2026-08-21)', () => {
     seedAgentGroup('ag-task');
     const thread = 'slack:CTESTCHAN01:1.3';
     insertSession({ id: 's-task', agentGroupId: 'ag-task', threadId: thread });
-    getDb()
+    getRawDb()
       .prepare(
         `INSERT INTO tasks
            (task_id, idempotency_key, parent_session_id, parent_agent_group_id,
@@ -1611,8 +1612,8 @@ describe('needs_you_reason on the wire (operator report 2026-08-21)', () => {
 });
 
 describe('close state on the thread payload', () => {
-  beforeEach(() => {
-    setupDb();
+  beforeEach(async () => {
+    await setupDb();
     seedAgentGroup('ag-close');
   });
 
@@ -1629,7 +1630,7 @@ describe('close state on the thread payload', () => {
 
   it('an actual agent proposal surfaces with its reason and drops the count to ONE', async () => {
     insertSession({ id: 's-prop', agentGroupId: 'ag-close', threadId: 'slack:C1:1.2' });
-    getDb()
+    getRawDb()
       .prepare('UPDATE sessions SET done_proposal = ? WHERE id = ?')
       .run(JSON.stringify({ reason: 'shipped; suite green', proposed_at: iso(30_000) }), 's-prop');
     const t = await listOne();
@@ -1639,7 +1640,7 @@ describe('close state on the thread payload', () => {
 
   it('proposing does not move the thread out of running — it is a flag, not a state', async () => {
     insertSession({ id: 's-live', agentGroupId: 'ag-close', threadId: 'slack:C1:1.3' });
-    getDb()
+    getRawDb()
       .prepare('UPDATE sessions SET done_proposal = ? WHERE id = ?')
       .run(JSON.stringify({ reason: 'think I am done', proposed_at: iso(30_000) }), 's-live');
     const { threads } = await buildThreadList(makeCtx(), LIST_OPTS, deps({ containerStatus: () => 'running' }));
@@ -1652,7 +1653,7 @@ describe('close state on the thread payload', () => {
   it('an in-flight close sets `closing`; a finished one does not', async () => {
     insertSession({ id: 's-closing', agentGroupId: 'ag-close', threadId: 'slack:C1:1.4' });
     const insert = (state: string) =>
-      getDb()
+      getRawDb()
         .prepare(
           `INSERT INTO thread_closures (thread_id, requested_by, requested_at, reason, agent_proposed, session_ids, state)
            VALUES ('slack:C1:1.4', 'u1', ?, NULL, 0, '["s-closing"]', ?)
@@ -1707,15 +1708,15 @@ describe('attention-source rows in the thread list', () => {
   }
 
   function declare(value: string | null): void {
-    getDb().prepare(`UPDATE workgroups SET attention_sources = ? WHERE id = ?`).run(value, WG);
+    getRawDb().prepare(`UPDATE workgroups SET attention_sources = ? WHERE id = ?`).run(value, WG);
   }
 
   function attentionDeps(groupsRoot: string, over: Partial<ThreadListDeps> = {}): ThreadListDeps {
     return deps({ attentionEnv: { groupsRoot, claimsRoot: tmp('threads-attn-claims-') }, ...over });
   }
 
-  beforeEach(() => {
-    setupDb();
+  beforeEach(async () => {
+    await setupDb();
     seedWorkgroup(WG);
     seedAgentGroup('ag-example', WG);
   });
@@ -1726,7 +1727,7 @@ describe('attention-source rows in the thread list', () => {
 
   it('a declared source emits an ownerless row with a real channel key, and no sessions', async () => {
     declare(JSON.stringify([{ kind: 'release-board', root: 'releases', channel_key: CHANNEL_KEY }]));
-    getDb()
+    getRawDb()
       .prepare(
         `INSERT INTO messaging_groups (id, channel_type, instance, platform_id, name, created_at)
          VALUES (?, ?, ?, ?, ?, ?)`,
@@ -2118,7 +2119,7 @@ describe('attention-source rows in the thread list', () => {
       declare(JSON.stringify([{ kind: 'release-board', root: 'releases', channel_key: CHANNEL_KEY }]));
       const oldSince = iso(THIRTY_DAYS);
       const itemId = `${ATTENTION_ITEM_PREFIX}EXAMPLE-APP#817`;
-      getDb()
+      getRawDb()
         .prepare(`INSERT INTO thread_snoozes (thread_id, user_id, snoozed_at_activity, created_at) VALUES (?, ?, ?, ?)`)
         .run(itemId, 'u1', oldSince, iso(0));
       const { threads } = await buildThreadList(
@@ -2246,13 +2247,13 @@ describe('attention-source rows in the thread list', () => {
    */
   describe('once assigned', () => {
     function wireAgent(): void {
-      getDb()
+      getRawDb()
         .prepare(
           `INSERT INTO messaging_groups (id, channel_type, instance, platform_id, name, created_at)
            VALUES ('mg-example', 'slack-testworkspace', 'testworkspace', ?, '#example-room', ?)`,
         )
         .run(CHANNEL_KEY, iso(0));
-      getDb()
+      getRawDb()
         .prepare(
           `INSERT INTO messaging_group_agents (id, messaging_group_id, agent_group_id, session_mode, created_at)
            VALUES ('mga-example', 'mg-example', 'ag-example', 'per-thread', ?)`,
@@ -2261,7 +2262,7 @@ describe('attention-source rows in the thread list', () => {
     }
 
     function record(itemId: string, at = '2026-08-20T12:00:00.000Z'): void {
-      getDb()
+      getRawDb()
         .prepare(
           `INSERT INTO observatory_item_assignments
              (workgroup_id, item_id, agent_group_id, assigned_at, assigned_by)
@@ -2273,7 +2274,7 @@ describe('attention-source rows in the thread list', () => {
     beforeEach(() => {
       declare(JSON.stringify([{ kind: 'release-board', root: 'releases', channel_key: CHANNEL_KEY }]));
       wireAgent();
-      getDb()
+      getRawDb()
         .prepare(`INSERT INTO users (id, kind, display_name, created_at) VALUES ('u-owner', 'email', 'Olive Owner', ?)`)
         .run(iso(0));
     });
@@ -2308,7 +2309,7 @@ describe('attention-source rows in the thread list', () => {
       });
       // The row itself never disappears or mutates in the DB — a read must not
       // clean up what a sweep should own instead.
-      const row = getDb()
+      const row = getRawDb()
         .prepare(`SELECT assigned_at FROM observatory_item_assignments WHERE item_id = 'EXAMPLE-APP#817'`)
         .get() as { assigned_at: string };
       expect(row.assigned_at).toBe(staleAt);
@@ -2328,15 +2329,15 @@ describe('attention-source rows in the thread list', () => {
     });
 
     it('falls back to the raw user id when the assigner has no display name', async () => {
-      getDb().prepare(`UPDATE users SET display_name = NULL WHERE id = 'u-owner'`).run();
+      getRawDb().prepare(`UPDATE users SET display_name = NULL WHERE id = 'u-owner'`).run();
       record('EXAMPLE-APP#817');
       const { threads } = await buildThreadList(makeCtx(), LIST_OPTS, attentionDeps(boardRoot([readyPr()])));
       expect(threads[0]!.attention_source!.assigned!.by).toBe('u-owner');
     });
 
     it('another workgroup’s assignment on the same item id never leaks onto this row', async () => {
-      getDb().prepare(`INSERT INTO workgroups (id, created_at) VALUES ('wg-other-example', ?)`).run(iso(0));
-      getDb()
+      getRawDb().prepare(`INSERT INTO workgroups (id, created_at) VALUES ('wg-other-example', ?)`).run(iso(0));
+      getRawDb()
         .prepare(
           `INSERT INTO observatory_item_assignments
              (workgroup_id, item_id, agent_group_id, assigned_at, assigned_by)
@@ -2355,9 +2356,9 @@ describe('mailbox seam', () => {
   const seamSession = `sess-seam-${process.pid}`;
   const seamDir = path.join(testDataDir.dir, 'v2-sessions', seamGroup);
 
-  beforeEach(() => {
-    closeDb();
-    setupDb();
+  beforeEach(async () => {
+    await closeDb();
+    await setupDb();
   });
 
   afterEach(() => {

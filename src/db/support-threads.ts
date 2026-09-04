@@ -6,7 +6,7 @@
  * Slack thread + session, and read by the same handler to route follow-up emails
  * back into the existing thread/session. See migration 041.
  */
-import { getDb } from './connection.js';
+import { getRawDb } from './connection.js';
 
 export interface SupportThread {
   gmail_thread_id: string;
@@ -26,7 +26,7 @@ export interface SupportThread {
 }
 
 export function getSupportThread(gmailThreadId: string): SupportThread | undefined {
-  return getDb().prepare('SELECT * FROM support_threads WHERE gmail_thread_id = ?').get(gmailThreadId) as
+  return getRawDb().prepare('SELECT * FROM support_threads WHERE gmail_thread_id = ?').get(gmailThreadId) as
     | SupportThread
     | undefined;
 }
@@ -55,7 +55,7 @@ export interface UpsertSupportThread {
  * recorded ticket; `created_at` is preserved on conflict.
  */
 export function upsertSupportThread(t: UpsertSupportThread, now: string): void {
-  getDb()
+  getRawDb()
     .prepare(
       `INSERT INTO support_threads
          (gmail_thread_id, agent_group_id, messaging_group_id, linear_team, linear_issue,
@@ -87,7 +87,7 @@ export function upsertSupportThread(t: UpsertSupportThread, now: string): void {
  * agent never supplies a cross-row key (same security posture as scheduling).
  */
 export function getSupportThreadBySession(sessionId: string): SupportThread | undefined {
-  return getDb().prepare('SELECT * FROM support_threads WHERE session_id = ?').get(sessionId) as
+  return getRawDb().prepare('SELECT * FROM support_threads WHERE session_id = ?').get(sessionId) as
     | SupportThread
     | undefined;
 }
@@ -99,7 +99,7 @@ export function setSupportThreadTicket(
   linearTeam: string | null,
   now: string,
 ): void {
-  getDb()
+  getRawDb()
     .prepare(
       `UPDATE support_threads
           SET linear_issue = @linearIssue,
@@ -116,7 +116,7 @@ export function setSupportThreadTicket(
  * reopens a previously-closed thread (a customer reply revives the issue).
  */
 export function touchSupportThread(gmailThreadId: string, now: string, lastGmailMessageId?: string | null): void {
-  getDb()
+  getRawDb()
     .prepare(
       `UPDATE support_threads
           SET last_activity_at = @now,
@@ -138,13 +138,13 @@ export function touchSupportThread(gmailThreadId: string, now: string, lastGmail
  * what is, to everyone involved, an ongoing conversation.
  */
 export function rebindSupportThreadSession(gmailThreadId: string, sessionId: string): void {
-  getDb()
+  getRawDb()
     .prepare('UPDATE support_threads SET session_id = @sessionId WHERE gmail_thread_id = @gmailThreadId')
     .run({ gmailThreadId, sessionId });
 }
 
 export function closeSupportThread(gmailThreadId: string, now: string): void {
-  getDb()
+  getRawDb()
     .prepare("UPDATE support_threads SET status = 'closed', last_activity_at = ? WHERE gmail_thread_id = ?")
     .run(now, gmailThreadId);
 }

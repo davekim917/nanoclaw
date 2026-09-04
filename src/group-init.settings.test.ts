@@ -20,7 +20,7 @@ vi.mock('./log.js', () => ({
   isSurvivableIoError: vi.fn(() => false),
 }));
 
-import { closeDb, createAgentGroup, initTestDb, runMigrations } from './db/index.js';
+import { closeDb, createAgentGroup, initTestDb, runMigrations, getRawDb } from './db/index.js';
 import { initGroupFilesystem } from './group-init.js';
 import type { AgentGroup } from './types.js';
 
@@ -30,14 +30,15 @@ function makeGroup(id: string): AgentGroup {
   return ag;
 }
 
-beforeEach(() => {
+beforeEach(async () => {
   fs.rmSync(TEST_ROOT, { recursive: true, force: true });
   fs.mkdirSync(TEST_ROOT, { recursive: true });
-  runMigrations(initTestDb());
+  await initTestDb();
+  runMigrations(getRawDb());
 });
 
-afterEach(() => {
-  closeDb();
+afterEach(async () => {
+  await closeDb();
   fs.rmSync(TEST_ROOT, { recursive: true, force: true });
 });
 

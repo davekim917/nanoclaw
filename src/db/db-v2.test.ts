@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 
-import { getDb } from './connection.js';
+import { getRawDb } from './connection.js';
 import {
   initTestDb,
   closeDb,
@@ -41,27 +41,30 @@ function now() {
   return new Date().toISOString();
 }
 
-beforeEach(() => {
-  const db = initTestDb();
+beforeEach(async () => {
+  await initTestDb();
+  const db = getRawDb();
   runMigrations(db);
 });
 
-afterEach(() => {
-  closeDb();
+afterEach(async () => {
+  await closeDb();
 });
 
 // ── Migrations ──
 
 describe('migrations', () => {
-  it('should be idempotent', () => {
-    const db = initTestDb();
+  it('should be idempotent', async () => {
+    await initTestDb();
+    const db = getRawDb();
     runMigrations(db);
     // Running again should not throw
     runMigrations(db);
   });
 
-  it('adds messaging_group_agents.threads as a nullable, default-free override column (019)', () => {
-    const db = initTestDb();
+  it('adds messaging_group_agents.threads as a nullable, default-free override column (019)', async () => {
+    await initTestDb();
+    const db = getRawDb();
     runMigrations(db);
     const col = db
       .prepare(
@@ -233,13 +236,13 @@ describe('messaging group agents', () => {
     });
     // Same-workgroup siblings — cross-workgroup wiring is rejected by
     // assertSameWorkgroupWiring, which is not this test's subject.
-    getDb()
+    getRawDb()
       .prepare(
         `INSERT OR IGNORE INTO workgroups (id, display_name, onecli_secrets, mnemon_store_id, created_at)
          VALUES ('wg-prio', 'wg-prio', '[]', 'ag-1', datetime('now'))`,
       )
       .run();
-    getDb().prepare("UPDATE agent_groups SET workgroup_id = 'wg-prio' WHERE id IN ('ag-1','ag-2')").run();
+    getRawDb().prepare("UPDATE agent_groups SET workgroup_id = 'wg-prio' WHERE id IN ('ag-1','ag-2')").run();
     createMessagingGroupAgent({ ...mga(), id: 'mga-2', agent_group_id: 'ag-2', priority: 10 });
     const results = getMessagingGroupAgents('mg-1');
     expect(results[0].agent_group_id).toBe('ag-2');
@@ -321,7 +324,7 @@ describe('getChannelPeers — sibling-adapter awareness', () => {
     // workgroup_id so the workgroup-scoping filter doesn't drop them. The
     // cross-workgroup collision case is exercised in a separate describe
     // block below.
-    getDb()
+    getRawDb()
       .prepare(`INSERT INTO workgroups (id, display_name, created_at) VALUES ('wg-retail', 'Example Retail', ?)`)
       .run(now());
     createAgentGroup({
@@ -345,7 +348,7 @@ describe('getChannelPeers — sibling-adapter awareness', () => {
       agent_provider: null,
       created_at: now(),
     });
-    getDb()
+    getRawDb()
       .prepare(
         `UPDATE agent_groups SET workgroup_id = 'wg-retail' WHERE id IN ('primary','example-assistant-codex','unrelated')`,
       )
@@ -445,10 +448,10 @@ describe('getChannelPeers — workgroup tenant boundary', () => {
     // SAME platform_id `slack:C123COLLIDE`. Without workgroup scoping the
     // peer query would cross-pollinate (return the wrong-workgroup agent
     // as a "peer"). With workgroup scoping it must not.
-    getDb()
+    getRawDb()
       .prepare(`INSERT INTO workgroups (id, display_name, created_at) VALUES ('retail', 'Example Retail', ?)`)
       .run(now());
-    getDb()
+    getRawDb()
       .prepare(`INSERT INTO workgroups (id, display_name, created_at) VALUES ('example-labs', 'Example Labs', ?)`)
       .run(now());
     createAgentGroup({
@@ -459,8 +462,8 @@ describe('getChannelPeers — workgroup tenant boundary', () => {
       created_at: now(),
     });
     createAgentGroup({ id: 'helper', name: 'Helper', folder: 'helper', agent_provider: null, created_at: now() });
-    getDb().prepare(`UPDATE agent_groups SET workgroup_id = 'retail' WHERE id = 'primary'`).run();
-    getDb().prepare(`UPDATE agent_groups SET workgroup_id = 'example-labs' WHERE id = 'helper'`).run();
+    getRawDb().prepare(`UPDATE agent_groups SET workgroup_id = 'retail' WHERE id = 'primary'`).run();
+    getRawDb().prepare(`UPDATE agent_groups SET workgroup_id = 'example-labs' WHERE id = 'helper'`).run();
     createMessagingGroup({
       id: 'mg-primary-collide',
       channel_type: 'slack-retail',
@@ -770,7 +773,7 @@ describe('assertSameWorkgroupWiring (via createMessagingGroupAgent)', () => {
   });
 
   const makeWorkgroup = (id: string) =>
-    getDb()
+    getRawDb()
       .prepare(
         `INSERT OR IGNORE INTO workgroups (id, display_name, onecli_secrets, mnemon_store_id, created_at)
          VALUES (?, ?, '[]', ?, datetime('now'))`,
@@ -779,7 +782,7 @@ describe('assertSameWorkgroupWiring (via createMessagingGroupAgent)', () => {
 
   it('allows wiring agents that share a workgroup', () => {
     makeWorkgroup('wg-1');
-    getDb().prepare("UPDATE agent_groups SET workgroup_id = 'wg-1' WHERE id IN ('ag-a','ag-b')").run();
+    getRawDb().prepare("UPDATE agent_groups SET workgroup_id = 'wg-1' WHERE id IN ('ag-a','ag-b')").run();
     createMessagingGroupAgent(mgaRow('mga-a', 'ag-a'));
     createMessagingGroupAgent(mgaRow('mga-b', 'ag-b'));
     expect(getMessagingGroupAgents('mg-wg')).toHaveLength(2);
@@ -788,8 +791,8 @@ describe('assertSameWorkgroupWiring (via createMessagingGroupAgent)', () => {
   it('rejects wiring an agent from a different workgroup', () => {
     makeWorkgroup('wg-1');
     makeWorkgroup('wg-2');
-    getDb().prepare("UPDATE agent_groups SET workgroup_id = 'wg-1' WHERE id = 'ag-a'").run();
-    getDb().prepare("UPDATE agent_groups SET workgroup_id = 'wg-2' WHERE id = 'ag-c'").run();
+    getRawDb().prepare("UPDATE agent_groups SET workgroup_id = 'wg-1' WHERE id = 'ag-a'").run();
+    getRawDb().prepare("UPDATE agent_groups SET workgroup_id = 'wg-2' WHERE id = 'ag-c'").run();
     createMessagingGroupAgent(mgaRow('mga-a', 'ag-a'));
     expect(() => createMessagingGroupAgent(mgaRow('mga-c', 'ag-c'))).toThrow(/same workgroup/);
     expect(getMessagingGroupAgents('mg-wg')).toHaveLength(1);
@@ -812,8 +815,8 @@ describe('assertSameWorkgroupWiring (via createMessagingGroupAgent)', () => {
     });
     makeWorkgroup('wg-1');
     makeWorkgroup('wg-2');
-    getDb().prepare("UPDATE agent_groups SET workgroup_id = 'wg-1' WHERE id = 'ag-a'").run();
-    getDb().prepare("UPDATE agent_groups SET workgroup_id = 'wg-2' WHERE id = 'ag-c'").run();
+    getRawDb().prepare("UPDATE agent_groups SET workgroup_id = 'wg-1' WHERE id = 'ag-a'").run();
+    getRawDb().prepare("UPDATE agent_groups SET workgroup_id = 'wg-2' WHERE id = 'ag-c'").run();
     createMessagingGroupAgent(mgaRow('mga-a', 'ag-a'));
     expect(() =>
       createMessagingGroupAgent({ ...mgaRow('mga-c', 'ag-c'), messaging_group_id: 'mg-wg-sibling' }),

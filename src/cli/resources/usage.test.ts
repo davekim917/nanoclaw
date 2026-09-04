@@ -8,7 +8,7 @@
  */
 import { describe, expect, it, beforeEach, afterEach } from 'vitest';
 
-import { initTestDb, closeDb, runMigrations, createAgentGroup, getDb } from '../../db/index.js';
+import { initTestDb, closeDb, runMigrations, createAgentGroup, getRawDb } from '../../db/index.js';
 import { dispatch } from '../dispatch.js';
 import type { CallerContext } from '../frame.js';
 // Side-effect import: registers the `usage-list` / `usage-summary` commands.
@@ -18,7 +18,7 @@ const GID = 'ag-usage-cli';
 const HOST: CallerContext = { caller: 'host', sessionId: '', agentGroupId: '' } as CallerContext;
 
 function insertCentralTurn(turnId: string, model: string, cacheRead: number): void {
-  getDb()
+  getRawDb()
     .prepare(
       `INSERT INTO turn_usage (ts, session_id, agent_group_id, provider, model, turn_id, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cost_usd)
        VALUES ('2026-08-24T12:00:00.000Z', 'sess-1', ?, 'claude', ?, ?, 10, 5, ?, 1, 0.25)`,
@@ -27,8 +27,9 @@ function insertCentralTurn(turnId: string, model: string, cacheRead: number): vo
 }
 
 describe('ncl usage summary', () => {
-  beforeEach(() => {
-    const db = initTestDb();
+  beforeEach(async () => {
+    await initTestDb();
+    const db = getRawDb();
     runMigrations(db);
     createAgentGroup({
       id: GID,

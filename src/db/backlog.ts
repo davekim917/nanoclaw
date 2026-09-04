@@ -10,7 +10,7 @@
  * commit_digest_state: tracks the last-scanned SHA per repo so scan_commits
  * only picks up new commits on each run.
  */
-import { getDb } from './connection.js';
+import { getRawDb } from './connection.js';
 
 // ---- Types ----
 
@@ -51,7 +51,7 @@ export interface CommitDigestState {
 // ---- ship_log ----
 
 export function addShipLogEntry(entry: ShipLogEntry): void {
-  const db = getDb();
+  const db = getRawDb();
   db.prepare(
     `INSERT OR REPLACE INTO ship_log
        (id, agent_group_id, title, description, pr_url, branch, tags, shipped_at)
@@ -69,7 +69,7 @@ export function addShipLogEntry(entry: ShipLogEntry): void {
 }
 
 export function getShipLog(agentGroupId: string, limit = 50): ShipLogEntry[] {
-  const db = getDb();
+  const db = getRawDb();
   return db
     .prepare(
       `SELECT * FROM ship_log
@@ -84,7 +84,7 @@ export function getShipLogPaginated(
   limit = 20,
   offset = 0,
 ): { data: ShipLogEntry[]; total: number } {
-  const db = getDb();
+  const db = getRawDb();
   const total = (
     db
       .prepare('SELECT COUNT(*) AS c FROM ship_log WHERE agent_group_id = $agent_group_id')
@@ -101,7 +101,7 @@ export function getShipLogPaginated(
 }
 
 export function getShipLogSince(agentGroupId: string, since: string): ShipLogEntry[] {
-  const db = getDb();
+  const db = getRawDb();
   return db
     .prepare(
       `SELECT * FROM ship_log
@@ -114,12 +114,12 @@ export function getShipLogSince(agentGroupId: string, since: string): ShipLogEnt
 // ---- backlog_items ----
 
 export function getBacklogItemById(id: string): BacklogItem | null {
-  const db = getDb();
+  const db = getRawDb();
   return (db.prepare('SELECT * FROM backlog_items WHERE id = $id').get({ id: id }) as BacklogItem) || null;
 }
 
 export function addBacklogItem(item: BacklogItem): void {
-  const db = getDb();
+  const db = getRawDb();
   db.prepare(
     `INSERT OR REPLACE INTO backlog_items
        (id, agent_group_id, title, description, status, priority, tags, notes,
@@ -148,7 +148,7 @@ export function updateBacklogItem(
   >,
   agentGroupId?: string,
 ): boolean {
-  const db = getDb();
+  const db = getRawDb();
   const fields: string[] = [];
   const values: Record<string, unknown> = { id: id };
 
@@ -195,7 +195,7 @@ export function updateBacklogItem(
 }
 
 export function deleteBacklogItem(id: string, agentGroupId: string): boolean {
-  const db = getDb();
+  const db = getRawDb();
   const result = db
     .prepare('DELETE FROM backlog_items WHERE id = $id AND agent_group_id = $agent_group_id')
     .run({ id: id, agent_group_id: agentGroupId });
@@ -205,7 +205,7 @@ export function deleteBacklogItem(id: string, agentGroupId: string): boolean {
 const PRIORITY_ORDER = `CASE priority WHEN 'high' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END`;
 
 export function getBacklog(agentGroupId: string, status?: string, limit = 100): BacklogItem[] {
-  const db = getDb();
+  const db = getRawDb();
   let rows;
   if (status) {
     rows = db
@@ -233,7 +233,7 @@ export function getBacklogPaginated(
   limit = 20,
   offset = 0,
 ): { data: BacklogItem[]; total: number } {
-  const db = getDb();
+  const db = getRawDb();
   let total: number;
   let rows: BacklogItem[];
   if (status) {
@@ -267,7 +267,7 @@ export function getBacklogPaginated(
 }
 
 export function getBacklogResolvedSince(agentGroupId: string, since: string): BacklogItem[] {
-  const db = getDb();
+  const db = getRawDb();
   return db
     .prepare(
       `SELECT * FROM backlog_items
@@ -282,7 +282,7 @@ export function getBacklogResolvedSince(agentGroupId: string, since: string): Ba
 // ---- commit_digest_state ----
 
 export function getCommitDigestState(repoPath: string): CommitDigestState | null {
-  const db = getDb();
+  const db = getRawDb();
   return (
     (db
       .prepare('SELECT * FROM commit_digest_state WHERE repo_path = $repo_path')
@@ -291,7 +291,7 @@ export function getCommitDigestState(repoPath: string): CommitDigestState | null
 }
 
 export function upsertCommitDigestState(state: CommitDigestState): void {
-  const db = getDb();
+  const db = getRawDb();
   db.prepare(
     `INSERT OR REPLACE INTO commit_digest_state
        (repo_path, agent_group_id, last_commit_sha, last_scan)

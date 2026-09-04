@@ -54,7 +54,7 @@
  * step (e) of a completed close.
  */
 import { containerOwnsOutbound, killContainer } from '../container-runner.js';
-import { getDb } from '../db/index.js';
+import { getRawDb } from '../db/index.js';
 import { archiveSessionById, withQuietInvalidationSync } from '../db/sessions.js';
 import { guard } from '../guard/index.js';
 import { log } from '../log.js';
@@ -111,11 +111,11 @@ const CLOSE_WAKE_ID_PREFIX = 'thread-close-';
 export function syncDoneProposalMirror(sessionId: string, proposal: DoneProposal | null): DoneProposal | null {
   const encoded = proposal ? JSON.stringify(proposal) : null;
   try {
-    const current = getDb().prepare('SELECT done_proposal FROM sessions WHERE id = ?').get(sessionId) as
+    const current = getRawDb().prepare('SELECT done_proposal FROM sessions WHERE id = ?').get(sessionId) as
       | { done_proposal: string | null }
       | undefined;
     if (!current || current.done_proposal === encoded) return proposal;
-    getDb().prepare('UPDATE sessions SET done_proposal = ? WHERE id = ?').run(encoded, sessionId);
+    getRawDb().prepare('UPDATE sessions SET done_proposal = ? WHERE id = ?').run(encoded, sessionId);
   } catch (err) {
     log.warn('thread-close: done_proposal mirror failed', { sessionId, err });
   }
@@ -170,7 +170,7 @@ interface CloseSession {
  * the id the console renders addresses the same thread here.
  */
 function sessionsOnThread(threadId: string): CloseSession[] {
-  return getDb()
+  return getRawDb()
     .prepare(
       `SELECT id, agent_group_id, archived_at
          FROM sessions
@@ -186,7 +186,7 @@ function sessionsOnThread(threadId: string): CloseSession[] {
  */
 function stillOnThread(sessionId: string, threadId: string): boolean {
   return (
-    getDb()
+    getRawDb()
       .prepare(
         `SELECT 1
            FROM sessions
@@ -421,7 +421,7 @@ export async function requestThreadClose(
     };
   }
 
-  const existing = getDb().prepare('SELECT * FROM thread_closures WHERE thread_id = ?').get(threadId) as
+  const existing = getRawDb().prepare('SELECT * FROM thread_closures WHERE thread_id = ?').get(threadId) as
     | ThreadClosureRow
     | undefined;
   if (existing && existing.state !== 'closed') {
@@ -524,7 +524,7 @@ export async function requestThreadClose(
   // itself the lock: a LIVE closure is never overwritten, a finished one still
   // re-opens (the case the upsert exists for), and zero rows changed means
   // somebody else reserved it first.
-  const reserved = getDb()
+  const reserved = getRawDb()
     .prepare(
       `INSERT INTO thread_closures
          (thread_id, requested_by, requested_at, reason, agent_proposed, session_ids, state, forced, closed_at)
@@ -550,7 +550,7 @@ export async function requestThreadClose(
     // row the winner just wrote — and, the point of returning here, the loser
     // never reaches the fan-out below, so one close request produces one
     // wrap-up.
-    const winner = getDb().prepare('SELECT requested_at FROM thread_closures WHERE thread_id = ?').get(threadId) as
+    const winner = getRawDb().prepare('SELECT requested_at FROM thread_closures WHERE thread_id = ?').get(threadId) as
       | { requested_at: string }
       | undefined;
     log.info('thread-close: lost the reservation race', { threadId, userId: ctx.user.id });
@@ -886,7 +886,7 @@ export async function advanceThreadClosures(deps: ThreadCloseDeps = {}): Promise
   const now = deps.now ?? Date.now();
   let rows: ThreadClosureRow[];
   try {
-    rows = getDb()
+    rows = getRawDb()
       .prepare(`SELECT * FROM thread_closures WHERE state IN ('awaiting_confirmation', 'finalizing')`)
       .all() as ThreadClosureRow[];
   } catch (err) {
@@ -916,7 +916,7 @@ async function advanceOneClosure(row: ThreadClosureRow, now: number, deps: Threa
     return;
   }
 
-  const live = getDb()
+  const live = getRawDb()
     .prepare(
       `SELECT id, agent_group_id, archived_at FROM sessions WHERE id IN (${sessionIds.map(() => '?').join(', ')})`,
     )
@@ -949,7 +949,7 @@ async function advanceOneClosure(row: ThreadClosureRow, now: number, deps: Threa
     });
     if (!decision.finalize) return;
     forced = decision.forced;
-    getDb()
+    getRawDb()
       // `AND state = 'awaiting_confirmation'`: `row` was read before the
       // proposal reads above, which await, so the state that authorized this
       // transition is not the state at the moment of it. Without the predicate
@@ -981,7 +981,7 @@ async function advanceOneClosure(row: ThreadClosureRow, now: number, deps: Threa
   // Re-read rather than trusting the loop above: `finalizeSession` archives
   // inside `killContainer`'s exit callback, so a session stopping right now is
   // still open and this closure simply advances on the next tick.
-  const remaining = getDb()
+  const remaining = getRawDb()
     .prepare(
       `SELECT COUNT(*) AS n FROM sessions
         WHERE archived_at IS NULL AND id IN (${sessionIds.map(() => '?').join(', ')})`,
@@ -991,7 +991,7 @@ async function advanceOneClosure(row: ThreadClosureRow, now: number, deps: Threa
 }
 
 function markClosed(threadId: string, now: number, forced: boolean): void {
-  getDb()
+  getRawDb()
     .prepare(`UPDATE thread_closures SET state = 'closed', forced = ?, closed_at = ? WHERE thread_id = ?`)
     .run(forced ? 1 : 0, new Date(now).toISOString(), threadId);
   log.info('thread-close: closed', { threadId, forced });
@@ -1011,7 +1011,7 @@ export function readThreadClosures(threadIds: string[]): Map<string, ThreadClose
   const out = new Map<string, ThreadCloseState>();
   if (threadIds.length === 0) return out;
   try {
-    const rows = getDb()
+    const rows = getRawDb()
       .prepare(
         `SELECT thread_id, state, requested_by, requested_at, forced FROM thread_closures
           WHERE thread_id IN (${threadIds.map(() => '?').join(', ')})`,

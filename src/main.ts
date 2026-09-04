@@ -15,7 +15,7 @@ import { formatBuildInfoLog, readBuildInfo } from './build-info.js';
 import { DATA_DIR, REPO_ROOT } from './config.js';
 import { enforceStartupBackoff, resetCircuitBreaker } from './circuit-breaker.js';
 import { migrateGroupsToClaudeLocal } from './claude-md-compose.js';
-import { initDb } from './db/connection.js';
+import { getDb, getRawDb, initDb } from './db/connection.js';
 import { runMigrations } from './db/migrations/index.js';
 import { registerSecretsFromEnv } from './secret-scrubber.js';
 import {
@@ -239,7 +239,8 @@ export async function main(): Promise<void> {
 
   // 1. Init central DB
   const dbPath = path.join(DATA_DIR, 'v2.db');
-  const db = initDb(dbPath);
+  await initDb(dbPath);
+  const db = getRawDb();
   runMigrations(db);
 
   // 1-0. Materialize the archive schema before ANY service that can spawn.
@@ -566,7 +567,7 @@ export async function main(): Promise<void> {
   // onHostShutdown callbacks at import time; this is where registered start
   // work actually begins (docs/specs/upstream-host-sweep-seam/plan.md §4.1).
   // PR 0 registers nothing, so this is inert by construction.
-  await startHostModules({ db, signal: hostAbortController.signal });
+  await startHostModules({ db: getDb(), signal: hostAbortController.signal });
 
   // Start recovery only after permissions and delivery are fully wired. A
   // replay can immediately exercise either surface (sibling bots, unknown

@@ -114,7 +114,7 @@ function mockWorktreeCleanupDeps(
     GROUPS_DIR: `${dataDir}/groups`,
   }));
   vi.doMock('./container-runner.js', () => ({ isContainerRunning: () => false, isContainerSpawning: () => false }));
-  vi.doMock('./db/connection.js', () => ({ getDb: () => ({ prepare: () => ({ all: () => [] }) }) }));
+  vi.doMock('./db/connection.js', () => ({ getRawDb: () => ({ prepare: () => ({ all: () => [] }) }) }));
   vi.doMock('./session-manager.js', () => ({
     inboundDbPath: () => '',
     openOutboundDb: () => {

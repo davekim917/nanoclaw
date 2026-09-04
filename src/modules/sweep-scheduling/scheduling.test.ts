@@ -231,7 +231,7 @@ vi.mock('../orchestrator-dispatch/db/tasks.js', async (importOriginal) => {
 });
 
 import { CLOSE_CONFIRM_WINDOW_MS } from '../../dashboard/thread-close.js';
-import { closeDb, createAgentGroup, getDb, initTestDb, runMigrations } from '../../db/index.js';
+import { closeDb, createAgentGroup, getRawDb, initTestDb, runMigrations } from '../../db/index.js';
 import { openInboundDb } from '../mailbox/openers.js';
 import { ensureSchema } from '../mailbox/schema.js';
 import { SWEEP_DUTY_INVENTORY, _listSweepRegistrationsForTesting } from '../../host-sweep.js';
@@ -312,7 +312,7 @@ function fakeSession(over: Partial<Session> = {}): Session {
  * off the central row.
  */
 function seedCentralSession(session: Session): void {
-  getDb()
+  getRawDb()
     .prepare(
       `INSERT OR IGNORE INTO sessions (id, agent_group_id, messaging_group_id, thread_id, status,
                                        container_status, last_active, created_at)
@@ -397,8 +397,9 @@ const clone = (db: Database.Database) =>
     recurrence: string | null;
   };
 
-beforeEach(() => {
-  const db = initTestDb();
+beforeEach(async () => {
+  await initTestDb();
+  const db = getRawDb();
   db.pragma('foreign_keys = ON');
   runMigrations(db);
   createAgentGroup({
@@ -424,11 +425,11 @@ beforeEach(() => {
   spawns.length = 0;
 });
 
-afterEach(() => {
+afterEach(async () => {
   expect(spawns).toEqual([]);
   openInbound?.close();
   openInbound = null;
-  closeDb();
+  await closeDb();
   vi.restoreAllMocks();
 });
 
@@ -582,14 +583,14 @@ describe('S2-PR11 scheduling + thread-close', () => {
 
   it('thread-close advance stops the container, then clears saved work and archives, in that order', async () => {
     const thread = 'slack:C1:1.1';
-    getDb()
+    getRawDb()
       .prepare(
         `INSERT INTO sessions (id, agent_group_id, messaging_group_id, thread_id, status, container_status,
                                last_active, created_at)
          VALUES ('s1', 'ag-test', NULL, ?, 'active', 'stopped', ?, ?)`,
       )
       .run(thread, new Date().toISOString(), new Date().toISOString());
-    getDb()
+    getRawDb()
       .prepare(
         `INSERT INTO thread_closures (thread_id, requested_by, requested_at, reason, agent_proposed, session_ids, state)
          VALUES (?, 'admin', ?, NULL, 0, '["s1"]', 'awaiting_confirmation')`,
@@ -651,7 +652,8 @@ describe('S2-PR11 scheduling + thread-close', () => {
     // Its own comment says so: "a session stopping right now is still open and
     // this closure simply advances on the next tick".
     expect(
-      (getDb().prepare(`SELECT state FROM thread_closures WHERE thread_id = ?`).get(thread) as { state: string }).state,
+      (getRawDb().prepare(`SELECT state FROM thread_closures WHERE thread_id = ?`).get(thread) as { state: string })
+        .state,
     ).toBe('finalizing');
 
     // The next tick: the session is archived now, so the duty skips it and
@@ -660,7 +662,8 @@ describe('S2-PR11 scheduling + thread-close', () => {
 
     expect(calls.kills).toHaveLength(1);
     expect(
-      (getDb().prepare(`SELECT state FROM thread_closures WHERE thread_id = ?`).get(thread) as { state: string }).state,
+      (getRawDb().prepare(`SELECT state FROM thread_closures WHERE thread_id = ?`).get(thread) as { state: string })
+        .state,
     ).toBe('closed');
   });
 
@@ -745,7 +748,7 @@ describe('S2-PR11 scheduling + thread-close', () => {
     const session = fakeSession({ id: 'sess-moving', thread_id: TASK_THREAD });
     const ctx = makeCtx({ session, mailbox: sessionFor(db) });
     // The audit row the move writes before it cancels the source.
-    getDb()
+    getRawDb()
       .prepare(
         `INSERT INTO scheduled_audit (ts, actor, action, agent_group_id, session_id, series_id, correlation_id)
          VALUES (?, 'u-owner', 'move_intent', 'ag-test', 'sess-moving', 'ser-moving', 'corr-ser-moving')`,
@@ -755,7 +758,7 @@ describe('S2-PR11 scheduling + thread-close', () => {
     await duty(SWEEP_DUTY_INVENTORY.S19).run(ctx);
 
     expect(calls.updates, 'the GC closed the session a move intent still needs').toEqual([]);
-    expect(getDb().prepare("SELECT status FROM sessions WHERE id = 'sess-moving'").get()).toEqual({
+    expect(getRawDb().prepare("SELECT status FROM sessions WHERE id = 'sess-moving'").get()).toEqual({
       status: 'active',
     });
   });
@@ -768,7 +771,7 @@ describe('S2-PR11 scheduling + thread-close', () => {
     // move completes or the recovery gives up. The guard must not leak into a
     // permanent leases-forever, so this is the discriminating half: without it
     // the case above would pass for a GC that simply stopped collecting.
-    getDb()
+    getRawDb()
       .prepare(
         `INSERT INTO scheduled_audit (ts, actor, action, agent_group_id, session_id, series_id, correlation_id, resolved_at)
          VALUES (?, 'u-owner', 'move_intent', 'ag-test', 'sess-moved', 'ser-moved', 'corr-ser-moved', ?)`,

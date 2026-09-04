@@ -1,4 +1,4 @@
-import { getDb } from '../../db/connection.js';
+import { getRawDb } from '../../db/connection.js';
 import { log } from '../../log.js';
 
 /**
@@ -10,7 +10,7 @@ import { log } from '../../log.js';
  */
 export function pruneSteerIdempotency(): void {
   try {
-    const db = getDb();
+    const db = getRawDb();
     // Delete applied rows older than 60 seconds
     db.prepare(
       `DELETE FROM steer_idempotency WHERE status = 'applied' AND datetime(applied_at) < datetime('now', '-60 seconds')`,

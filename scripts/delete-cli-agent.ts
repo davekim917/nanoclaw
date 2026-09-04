@@ -14,7 +14,7 @@ import path from 'path';
 
 import { DATA_DIR } from '../src/config.js';
 import { getAgentGroupByFolder, deleteAgentGroup } from '../src/db/agent-groups.js';
-import { initDb } from '../src/db/connection.js';
+import { initDb, getRawDb } from '../src/db/connection.js';
 import { runMigrations } from '../src/db/migrations/index.js';
 
 interface Args {
@@ -36,7 +36,8 @@ function parseArgs(): Args {
 
 const args = parseArgs();
 
-const db = initDb(path.join(DATA_DIR, 'v2.db'));
+await initDb(path.join(DATA_DIR, 'v2.db'));
+const db = getRawDb();
 runMigrations(db);
 
 const ag = getAgentGroupByFolder(args.folder);

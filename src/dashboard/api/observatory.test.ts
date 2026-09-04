@@ -27,7 +27,7 @@ vi.mock('../../channels/channel-registry.js', async (importOriginal) => ({
 
 const { TEST_DIR } = vi.hoisted(() => ({ TEST_DIR: uniqueTmpRoot('observatory-api-test') }));
 
-import { initTestDb, closeDb, getDb } from '../../db/connection.js';
+import { initTestDb, closeDb, getRawDb } from '../../db/connection.js';
 import { getChannelAdapter } from '../../channels/channel-registry.js';
 import {
   buildObservatoryScene,
@@ -81,8 +81,9 @@ function makeReq(url: string): Request {
   return new Request(url);
 }
 
-function setupDb(): void {
-  const db = initTestDb();
+async function setupDb(): Promise<void> {
+  await initTestDb();
+  const db = getRawDb();
   db.exec(`
     CREATE TABLE agent_groups (
       id TEXT PRIMARY KEY, name TEXT NOT NULL, folder TEXT NOT NULL UNIQUE,
@@ -124,11 +125,11 @@ function setupDb(): void {
 }
 
 function addWorkgroup(id: string): void {
-  getDb().prepare("INSERT INTO workgroups (id, created_at) VALUES (?, datetime('now'))").run(id);
+  getRawDb().prepare("INSERT INTO workgroups (id, created_at) VALUES (?, datetime('now'))").run(id);
 }
 
 function addGroup(id: string, workgroupId: string, name = id, folder = id): void {
-  getDb()
+  getRawDb()
     .prepare(
       "INSERT INTO agent_groups (id, name, folder, agent_provider, workgroup_id, created_at) VALUES (?, ?, ?, 'claude', ?, datetime('now'))",
     )
@@ -136,7 +137,7 @@ function addGroup(id: string, workgroupId: string, name = id, folder = id): void
 }
 
 function addMessagingGroup(id: string, channelType: string, platformId: string, name: string | null = null): void {
-  getDb()
+  getRawDb()
     .prepare(
       "INSERT INTO messaging_groups (id, channel_type, platform_id, name, created_at) VALUES (?, ?, ?, ?, datetime('now'))",
     )
@@ -144,7 +145,7 @@ function addMessagingGroup(id: string, channelType: string, platformId: string, 
 }
 
 function wire(mgId: string, agentGroupId: string): void {
-  getDb()
+  getRawDb()
     .prepare(
       "INSERT INTO messaging_group_agents (id, messaging_group_id, agent_group_id, created_at) VALUES (?, ?, ?, datetime('now'))",
     )
@@ -156,7 +157,7 @@ function addSession(
   agentGroupId: string,
   opts: { messagingGroupId?: string | null; lastOutboundAt?: string | null; threadId?: string | null } = {},
 ): void {
-  getDb()
+  getRawDb()
     .prepare(
       "INSERT INTO sessions (id, agent_group_id, messaging_group_id, thread_id, status, last_outbound_at, created_at) VALUES (?, ?, ?, ?, 'active', ?, datetime('now'))",
     )
@@ -173,13 +174,13 @@ function writeClaim(workgroupId: string, slug: string, claim: Record<string, unk
   fs.writeFileSync(path.join(dir, `${slug}.json`), JSON.stringify(claim));
 }
 
-beforeEach(() => {
-  setupDb();
+beforeEach(async () => {
+  await setupDb();
   fs.rmSync(TEST_DIR, { recursive: true, force: true });
 });
 
-afterEach(() => {
-  closeDb();
+afterEach(async () => {
+  await closeDb();
   fs.rmSync(TEST_DIR, { recursive: true, force: true });
   vi.clearAllMocks();
 });
@@ -324,7 +325,7 @@ describe('readReleaseState', () => {
         'ava-folder/releases/release-state.json': JSON.stringify({ asOf: '2026-08-18T00:00:00Z', items }),
       });
     const remember = (wg: string, item: string, thread: string, by: string) =>
-      getDb()
+      getRawDb()
         .prepare('INSERT INTO observatory_item_threads VALUES (?, ?, ?, ?, ?)')
         .run(wg, item, thread, '2026-08-18T01:00:00.000Z', by);
 
@@ -337,7 +338,7 @@ describe('readReleaseState', () => {
     });
 
     it('names the thread, when it happened, and who fired it — by display name', async () => {
-      getDb().prepare("INSERT INTO users VALUES ('u-dash', 'email', 'Olive Owner', datetime('now'))").run();
+      getRawDb().prepare("INSERT INTO users VALUES ('u-dash', 'email', 'Olive Owner', datetime('now'))").run();
       remember('wg-1', 'X#1', 'slack:C1:1.1', 'u-dash');
       const dir = board([
         { id: 'X#1', kind: 'pr', title: 'shipped once', nextMover: 'human' },
@@ -356,12 +357,12 @@ describe('readReleaseState', () => {
     });
 
     it('resolves the name at READ time, so a rename shows on the next poll', async () => {
-      getDb().prepare("INSERT INTO users VALUES ('u-dash', 'email', 'Olive', datetime('now'))").run();
+      getRawDb().prepare("INSERT INTO users VALUES ('u-dash', 'email', 'Olive', datetime('now'))").run();
       remember('wg-1', 'X#1', 'slack:C1:1.1', 'u-dash');
       const dir = board([{ id: 'X#1', kind: 'pr', title: 't', nextMover: 'human' }]);
       expect((await scene(dir)).releaseState?.items[0]?.steeredThread?.by).toBe('Olive');
 
-      getDb().prepare("UPDATE users SET display_name = 'Olive Renamed' WHERE id = 'u-dash'").run();
+      getRawDb().prepare("UPDATE users SET display_name = 'Olive Renamed' WHERE id = 'u-dash'").run();
       expect((await scene(dir)).releaseState?.items[0]?.steeredThread?.by).toBe('Olive Renamed');
     });
 
@@ -380,7 +381,7 @@ describe('readReleaseState', () => {
     });
 
     it('renders the board rather than blanking it when the table is missing', async () => {
-      getDb().exec('DROP TABLE observatory_item_threads');
+      getRawDb().exec('DROP TABLE observatory_item_threads');
       const dir = board([{ id: 'X#1', kind: 'pr', title: 't', nextMover: 'human' }]);
       const s = await scene(dir);
       expect(s.releaseState?.items).toHaveLength(1);
@@ -688,7 +689,7 @@ describe('buildObservatoryScene', () => {
     addWorkgroup('wg-1');
     addGroup('ag-1', 'wg-1');
     addGroup('ag-2', 'wg-1');
-    getDb()
+    getRawDb()
       .prepare(
         "INSERT INTO container_configs (agent_group_id, provider, updated_at) VALUES ('ag-1', 'opencode', datetime('now'))",
       )

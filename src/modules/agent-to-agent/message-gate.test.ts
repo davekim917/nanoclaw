@@ -8,7 +8,7 @@ import { createDestination, deleteDestination, deleteAllDestinationsTouching } f
 import { getMessagePolicy, removeMessagePolicy, setMessagePolicy } from './db/agent-message-policies.js';
 import { applyA2aMessageGate } from './message-gate.js';
 import { initTestDb, closeDb, runMigrations, createAgentGroup } from '../../db/index.js';
-import { getDb } from '../../db/connection.js';
+import { getRawDb } from '../../db/connection.js';
 import { createPendingApproval, createSession, deletePendingApproval, getPendingApproval } from '../../db/sessions.js';
 import { requestApproval } from '../approvals/index.js';
 import { initSessionFolder } from '../../session-manager.js';
@@ -49,7 +49,7 @@ function now(): string {
 }
 
 function policyCount(): number {
-  return (getDb().prepare('SELECT COUNT(*) AS n FROM agent_message_policies').get() as { n: number }).n;
+  return (getRawDb().prepare('SELECT COUNT(*) AS n FROM agent_message_policies').get() as { n: number }).n;
 }
 
 function readPairedInboundTriggers(agentGroupId: string, sessionId: string) {
@@ -120,10 +120,11 @@ describe('agent message policies', () => {
   let SA: Session;
   let SB: Session;
 
-  beforeEach(() => {
+  beforeEach(async () => {
     if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
     fs.mkdirSync(TEST_DIR, { recursive: true });
-    const db = initTestDb();
+    await initTestDb();
+    const db = getRawDb();
     runMigrations(db);
     vi.mocked(requestApproval).mockClear();
 
@@ -139,8 +140,8 @@ describe('agent message policies', () => {
     createDestination({ agent_group_id: A, local_name: 'b', target_type: 'agent', target_id: B, created_at: now() });
   });
 
-  afterEach(() => {
-    closeDb();
+  afterEach(async () => {
+    await closeDb();
     if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
   });
 

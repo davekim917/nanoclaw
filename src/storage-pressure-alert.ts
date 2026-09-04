@@ -1,5 +1,5 @@
 import { getDeliveryAdapter } from './delivery.js';
-import { getDb } from './db/connection.js';
+import { getRawDb } from './db/connection.js';
 import { log } from './log.js';
 import { ensureUserDm } from './modules/permissions/user-dm.js';
 import type { StorageReport } from './storage-manager.js';
@@ -65,7 +65,7 @@ export async function handleStoragePressureAlert(report: StorageReport, now = Da
 
   let recipients: Array<{ user_id: string }>;
   try {
-    recipients = getDb()
+    recipients = getRawDb()
       .prepare(
         `SELECT user_id, MIN(CASE role WHEN 'owner' THEN 0 ELSE 1 END) AS priority
            FROM user_roles

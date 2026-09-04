@@ -1,4 +1,4 @@
-import { getDb } from '../../db/connection.js';
+import { getRawDb } from '../../db/connection.js';
 
 export interface DashboardTokenRecord {
   id: number;
@@ -13,7 +13,7 @@ export function issueDashboardToken(userId: string, tokenHmac: string, ttlHours:
   const now = new Date();
   const expiresAt = new Date(now.getTime() + ttlHours * 60 * 60 * 1000).toISOString();
   const issuedAt = now.toISOString();
-  return getDb()
+  return getRawDb()
     .prepare(
       `INSERT INTO dashboard_tokens (user_id, token_hmac, issued_at, expires_at)
        VALUES (@user_id, @token_hmac, @issued_at, @expires_at)
@@ -45,7 +45,7 @@ export function consumeDashboardToken(tokenHmac: string): DashboardTokenRecord |
   // moves to the next reader of that column. Binding one ISO value fixes both.
   const nowIso = new Date().toISOString();
   return (
-    (getDb()
+    (getRawDb()
       .prepare(
         `UPDATE dashboard_tokens
          SET used_at = @now
@@ -68,5 +68,5 @@ export function consumeDashboardToken(tokenHmac: string): DashboardTokenRecord |
  * issued; production cookies are tied to fresh tokens that get consumed quickly.
  */
 export function pruneDashboardTokens(): void {
-  getDb().prepare(`DELETE FROM dashboard_tokens WHERE expires_at < datetime('now', '-1 day')`).run();
+  getRawDb().prepare(`DELETE FROM dashboard_tokens WHERE expires_at < datetime('now', '-1 day')`).run();
 }

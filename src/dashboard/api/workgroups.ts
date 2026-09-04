@@ -14,7 +14,7 @@ import fs from 'fs';
 import path from 'path';
 
 import { DATA_DIR, GROUPS_DIR } from '../../config.js';
-import { getDb } from '../../db/connection.js';
+import { getRawDb } from '../../db/connection.js';
 import type { UsageDailyRow } from '../../db/usage.js';
 import { isCostApplicable } from '../../db/usage.js';
 import { log } from '../../log.js';
@@ -42,14 +42,14 @@ interface WorkgroupRow {
  * Returns null on either not-found or out-of-scope (disclose-as-not-found).
  */
 function resolveWorkgroup(id: string, ctx: AuthedRequestContext): WorkgroupRow | null {
-  const row = getDb().prepare('SELECT id, display_name FROM workgroups WHERE id = ?').get(id) as
+  const row = getRawDb().prepare('SELECT id, display_name FROM workgroups WHERE id = ?').get(id) as
     | WorkgroupRow
     | undefined;
   if (!row) return null;
   if (ctx.scopes.no_filter) return row;
   if (ctx.scopes.allowed_group_ids.length === 0) return null;
   const placeholders = ctx.scopes.allowed_group_ids.map(() => '?').join(', ');
-  const hit = getDb()
+  const hit = getRawDb()
     .prepare(`SELECT 1 FROM agent_groups WHERE workgroup_id = ? AND id IN (${placeholders}) LIMIT 1`)
     .get(row.id, ...ctx.scopes.allowed_group_ids);
   return hit ? row : null;
@@ -57,7 +57,7 @@ function resolveWorkgroup(id: string, ctx: AuthedRequestContext): WorkgroupRow |
 
 function workgroupAgentGroupIds(workgroupId: string): string[] {
   return (
-    getDb().prepare('SELECT id FROM agent_groups WHERE workgroup_id = ?').all(workgroupId) as Array<{ id: string }>
+    getRawDb().prepare('SELECT id FROM agent_groups WHERE workgroup_id = ?').all(workgroupId) as Array<{ id: string }>
   ).map((r) => r.id);
 }
 
@@ -67,14 +67,14 @@ export const workgroupsListHandler: AuthHandler = async (_req, _params, ctx) => 
   let rows: WorkgroupRow[];
   try {
     if (ctx.scopes.no_filter) {
-      rows = getDb()
+      rows = getRawDb()
         .prepare('SELECT id, display_name FROM workgroups ORDER BY COALESCE(display_name, id)')
         .all() as WorkgroupRow[];
     } else if (ctx.scopes.allowed_group_ids.length === 0) {
       rows = [];
     } else {
       const placeholders = ctx.scopes.allowed_group_ids.map(() => '?').join(', ');
-      rows = getDb()
+      rows = getRawDb()
         .prepare(
           `SELECT DISTINCT w.id, w.display_name FROM workgroups w
              JOIN agent_groups a ON a.workgroup_id = w.id
@@ -171,7 +171,7 @@ export const workgroupUsageHandler: AuthHandler = async (req, params, ctx) => {
       usage = [];
     } else {
       const placeholders = agentGroupIds.map(() => '?').join(', ');
-      const rawRows = getDb()
+      const rawRows = getRawDb()
         .prepare(
           `SELECT * FROM usage_daily
             WHERE agent_group_id IN (${placeholders}) AND date >= ?

@@ -5,7 +5,7 @@ import path from 'path';
 import Database from 'better-sqlite3';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { createAgentGroup, getDb, initTestDb, runMigrations } from '../db/index.js';
+import { createAgentGroup, getRawDb, initTestDb, runMigrations } from '../db/index.js';
 import { ensureSchema } from '../modules/mailbox/schema.js';
 import { guard } from '../guard/index.js';
 import type { AuthedRequestContext } from './router.js';
@@ -158,8 +158,9 @@ function ctxFor(userId: string, opts: { no_filter?: boolean; allowed?: string[] 
   };
 }
 
-function seed(): void {
-  const db = initTestDb();
+async function seed(): Promise<void> {
+  await initTestDb();
+  const db = getRawDb();
   db.pragma('foreign_keys = ON');
   runMigrations(db);
   createAgentGroup({ id: 'ag1', name: 'ag1', folder: 'ag1', agent_provider: null, created_at: iso(0) });
@@ -177,7 +178,7 @@ function seed(): void {
 }
 
 function insertSession(id: string, agentGroupId: string, threadId: string | null): void {
-  getDb()
+  getRawDb()
     .prepare(
       `INSERT INTO sessions (id, agent_group_id, messaging_group_id, thread_id, status, container_status,
                              last_active, last_outbound_at, created_at)
@@ -193,14 +194,14 @@ function outboundStub(): Database.Database {
   return db;
 }
 
-beforeEach(() => {
+beforeEach(async () => {
   containerOwns.value = false;
   containerOwns.queue = [];
   duringProposalRead.run = null;
   duringProposalRead.skip = 0;
   raceDuringWrapUp.whenOpening = null;
   raceDuringWrapUp.run = null;
-  seed();
+  await seed();
 });
 
 // ── The guard ────────────────────────────────────────────────────────────────
@@ -268,14 +269,14 @@ describe('requestThreadClose', () => {
       agent_proposed: false,
     });
     // Nothing was started.
-    expect(getDb().prepare('SELECT COUNT(*) AS n FROM thread_closures').get()).toMatchObject({ n: 0 });
+    expect(getRawDb().prepare('SELECT COUNT(*) AS n FROM thread_closures').get()).toMatchObject({ n: 0 });
   });
 
   it('records the close and freezes the fan-out on two confirmations', async () => {
     insertSession('s2', 'ag2', 'slack:C1:1.1');
     const res = await requestThreadClose('slack:C1:1.1', { confirmations: 2, reason: 'shipped' }, ctxFor('admin'));
     expect(res.status).toBe(202);
-    const row = getDb().prepare('SELECT * FROM thread_closures WHERE thread_id = ?').get('slack:C1:1.1') as {
+    const row = getRawDb().prepare('SELECT * FROM thread_closures WHERE thread_id = ?').get('slack:C1:1.1') as {
       state: string;
       requested_by: string;
       session_ids: string;
@@ -316,7 +317,7 @@ describe('requestThreadClose', () => {
     expect(res.status).toBe(202);
     expect(res.body).toMatchObject({ agent_proposed: true });
     expect(
-      getDb().prepare('SELECT agent_proposed FROM thread_closures WHERE thread_id = ?').get('slack:C1:1.1'),
+      getRawDb().prepare('SELECT agent_proposed FROM thread_closures WHERE thread_id = ?').get('slack:C1:1.1'),
     ).toMatchObject({ agent_proposed: 1 });
   });
 
@@ -376,7 +377,7 @@ describe('requestThreadClose', () => {
       required_confirmations: 2,
       agent_proposed: false,
     });
-    expect(getDb().prepare('SELECT 1 FROM thread_closures WHERE thread_id = ?').get(THREAD_RETRACT)).toBeUndefined();
+    expect(getRawDb().prepare('SELECT 1 FROM thread_closures WHERE thread_id = ?').get(THREAD_RETRACT)).toBeUndefined();
   });
 
   /**
@@ -393,10 +394,10 @@ describe('requestThreadClose', () => {
   it('refuses when the only group the caller administers leaves during the proposal reads', async () => {
     const THREAD_ESC = 'slack:C1:escalate';
     // A caller who administers ag1 and nothing else.
-    getDb()
+    getRawDb()
       .prepare(`INSERT INTO users (id, kind, display_name, created_at) VALUES ('scoped', 'dashboard', 'scoped', ?)`)
       .run(iso(0));
-    getDb()
+    getRawDb()
       .prepare(
         `INSERT INTO user_roles (user_id, role, agent_group_id, granted_by, granted_at)
          VALUES ('scoped', 'admin', 'ag1', NULL, ?)`,
@@ -408,7 +409,7 @@ describe('requestThreadClose', () => {
 
     // The ag1 session leaves and an ag2 session joins, both inside the reads.
     duringProposalRead.run = () => {
-      getDb().prepare("UPDATE sessions SET status = 'closed' WHERE id = 's-admin'").run();
+      getRawDb().prepare("UPDATE sessions SET status = 'closed' WHERE id = 's-admin'").run();
       insertSession('s-other-group', 'ag2', THREAD_ESC);
     };
 
@@ -418,7 +419,7 @@ describe('requestThreadClose', () => {
     // Refused, and as a not-found: the surface must not disclose the thread.
     expect(res.status).toBe(404);
     // Nothing reserved. Without one decision on the fresh set this was a 202.
-    expect(getDb().prepare('SELECT 1 FROM thread_closures WHERE thread_id = ?').get(THREAD_ESC)).toBeUndefined();
+    expect(getRawDb().prepare('SELECT 1 FROM thread_closures WHERE thread_id = ?').get(THREAD_ESC)).toBeUndefined();
   });
 
   /**
@@ -446,7 +447,7 @@ describe('requestThreadClose', () => {
     out.close();
 
     duringProposalRead.run = () => {
-      getDb().prepare("UPDATE sessions SET status = 'closed' WHERE id = 's-prop'").run();
+      getRawDb().prepare("UPDATE sessions SET status = 'closed' WHERE id = 's-prop'").run();
     };
 
     // TWO confirmations, so the close still succeeds — this pins what is
@@ -458,7 +459,7 @@ describe('requestThreadClose', () => {
     expect(res.body.agent_proposed).toBe(false);
     // …and the record agrees. These used to disagree.
     expect(
-      getDb().prepare('SELECT agent_proposed FROM thread_closures WHERE thread_id = ?').get(THREAD_R),
+      getRawDb().prepare('SELECT agent_proposed FROM thread_closures WHERE thread_id = ?').get(THREAD_R),
     ).toMatchObject({ agent_proposed: 0 });
   });
 
@@ -494,7 +495,7 @@ describe('requestThreadClose', () => {
     // It goes inactive inside the proposal reads, after the visible set was
     // taken and before membership is re-read.
     duringProposalRead.run = () => {
-      getDb().prepare("UPDATE sessions SET status = 'closed' WHERE id = 's-proposer'").run();
+      getRawDb().prepare("UPDATE sessions SET status = 'closed' WHERE id = 's-proposer'").run();
     };
 
     const res = await requestThreadClose(THREAD_P, { confirmations: 1 }, ctxFor('admin'));
@@ -508,7 +509,7 @@ describe('requestThreadClose', () => {
       agent_proposed: false,
     });
     // And nothing was reserved.
-    expect(getDb().prepare('SELECT 1 FROM thread_closures WHERE thread_id = ?').get(THREAD_P)).toBeUndefined();
+    expect(getRawDb().prepare('SELECT 1 FROM thread_closures WHERE thread_id = ?').get(THREAD_P)).toBeUndefined();
   });
 
   /**
@@ -527,7 +528,9 @@ describe('requestThreadClose', () => {
 
     expect(res.status).toBe(202);
     expect(new Set(res.body.session_ids as string[])).toEqual(new Set(['s1', 's-late']));
-    const row = getDb().prepare('SELECT session_ids FROM thread_closures WHERE thread_id = ?').get('slack:C1:1.1') as {
+    const row = getRawDb()
+      .prepare('SELECT session_ids FROM thread_closures WHERE thread_id = ?')
+      .get('slack:C1:1.1') as {
       session_ids: string;
     };
     expect(new Set(JSON.parse(row.session_ids) as string[])).toEqual(new Set(['s1', 's-late']));
@@ -553,7 +556,7 @@ describe('requestThreadClose', () => {
     // closed or stop a container in a group this caller has no privilege over.
     expect(res.status).toBe(409);
     expect(res.body).toMatchObject({ error: 'thread_extends_beyond_your_scope' });
-    expect(getDb().prepare('SELECT COUNT(*) AS n FROM thread_closures').get()).toMatchObject({ n: 0 });
+    expect(getRawDb().prepare('SELECT COUNT(*) AS n FROM thread_closures').get()).toMatchObject({ n: 0 });
   });
 
   it('refuses a second close while one is in flight', async () => {
@@ -601,11 +604,11 @@ describe('requestThreadClose', () => {
     // One closure, holding the winner's request — the loser did not overwrite
     // it, and the loser reports the winner's timestamp back.
     expect(
-      getDb().prepare('SELECT COUNT(*) AS n FROM thread_closures WHERE thread_id = ?').get(THREAD_RACE),
+      getRawDb().prepare('SELECT COUNT(*) AS n FROM thread_closures WHERE thread_id = ?').get(THREAD_RACE),
     ).toMatchObject({
       n: 1,
     });
-    const row = getDb().prepare('SELECT * FROM thread_closures WHERE thread_id = ?').get(THREAD_RACE) as {
+    const row = getRawDb().prepare('SELECT * FROM thread_closures WHERE thread_id = ?').get(THREAD_RACE) as {
       requested_at: string;
       reason: string;
       state: string;
@@ -679,7 +682,7 @@ describe('requestThreadClose', () => {
     // frozen, before s-leave's own write.
     raceDuringWrapUp.whenOpening = 's-stay';
     raceDuringWrapUp.run = () => {
-      getDb().prepare("UPDATE sessions SET status = 'closed' WHERE id = 's-leave'").run();
+      getRawDb().prepare("UPDATE sessions SET status = 'closed' WHERE id = 's-leave'").run();
     };
 
     const res = await requestThreadClose(THREAD_LEAVE, { confirmations: 2 }, ctxFor('admin'));
@@ -720,7 +723,7 @@ describe('requestThreadClose', () => {
     materializeSession('ag1', 's-due');
 
     const stampOf = (): string =>
-      (getDb().prepare('SELECT last_active FROM sessions WHERE id = ?').get('s-due') as { last_active: string })
+      (getRawDb().prepare('SELECT last_active FROM sessions WHERE id = ?').get('s-due') as { last_active: string })
         .last_active;
     const before = stampOf();
 
@@ -793,7 +796,7 @@ describe('the close sequence order', () => {
 
   function startClose(over: { requestedAt?: string } = {}): void {
     insertSession('s1', 'ag1', THREAD);
-    getDb()
+    getRawDb()
       .prepare(
         `INSERT INTO thread_closures (thread_id, requested_by, requested_at, reason, agent_proposed, session_ids, state)
          VALUES (?, 'admin', ?, NULL, 0, '["s1"]', 'awaiting_confirmation')`,
@@ -829,7 +832,7 @@ describe('the close sequence order', () => {
         },
         archiveSession: (id) => {
           calls.push('archive');
-          return getDb().prepare('UPDATE sessions SET archived_at = ? WHERE id = ?').run(iso(0), id).changes > 0;
+          return getRawDb().prepare('UPDATE sessions SET archived_at = ? WHERE id = ?').run(iso(0), id).changes > 0;
         },
         ...over,
       },
@@ -864,7 +867,7 @@ describe('the close sequence order', () => {
     // failed clear withholds is the ARCHIVE. The closure stays `finalizing`
     // and the next tick retries — against a container that is now stopped.
     expect(calls).toEqual(['kill', 'clear']);
-    expect(getDb().prepare('SELECT archived_at FROM sessions WHERE id = ?').get('s1')).toMatchObject({
+    expect(getRawDb().prepare('SELECT archived_at FROM sessions WHERE id = ?').get('s1')).toMatchObject({
       archived_at: null,
     });
   });
@@ -880,7 +883,7 @@ describe('the close sequence order', () => {
     startClose();
     const { deps } = recordingDeps();
     await advanceThreadClosures(deps);
-    const row = getDb().prepare('SELECT * FROM thread_closures WHERE thread_id = ?').get(THREAD) as {
+    const row = getRawDb().prepare('SELECT * FROM thread_closures WHERE thread_id = ?').get(THREAD) as {
       state: string;
       forced: number;
       closed_at: string;
@@ -896,7 +899,7 @@ describe('the close sequence order', () => {
     const { calls, deps } = recordingDeps({ readProposal: () => ({ reason: 'done', proposed_at: iso(10_000) }) });
     await advanceThreadClosures(deps);
     expect(calls).toEqual(['kill', 'clear', 'archive']);
-    expect(getDb().prepare('SELECT forced FROM thread_closures WHERE thread_id = ?').get(THREAD)).toMatchObject({
+    expect(getRawDb().prepare('SELECT forced FROM thread_closures WHERE thread_id = ?').get(THREAD)).toMatchObject({
       forced: 0,
     });
   });
@@ -929,7 +932,7 @@ describe('the close sequence order', () => {
       out.close();
     }
     // Inside the confirmation window, so only standing proposals finalize this.
-    getDb()
+    getRawDb()
       .prepare(
         `INSERT INTO thread_closures (thread_id, requested_by, requested_at, reason, agent_proposed, session_ids, state)
          VALUES (?, 'admin', ?, NULL, 1, ?, 'awaiting_confirmation')`,
@@ -959,12 +962,12 @@ describe('the close sequence order', () => {
       },
       archiveSession: (id) => {
         calls.push('archive');
-        return getDb().prepare('UPDATE sessions SET archived_at = ? WHERE id = ?').run(iso(0), id).changes > 0;
+        return getRawDb().prepare('UPDATE sessions SET archived_at = ? WHERE id = ?').run(iso(0), id).changes > 0;
       },
     });
 
     expect(calls).toEqual([]);
-    expect(getDb().prepare('SELECT state FROM thread_closures WHERE thread_id = ?').get(THREAD_F)).toMatchObject({
+    expect(getRawDb().prepare('SELECT state FROM thread_closures WHERE thread_id = ?').get(THREAD_F)).toMatchObject({
       state: 'awaiting_confirmation',
     });
   });
@@ -1006,7 +1009,7 @@ describe('the close sequence order', () => {
     // The tick is over and the exit has not happened, so nothing after the kill
     // has run. A promise that only the callback can settle would hang here.
     expect(calls).toEqual(['kill']);
-    expect(getDb().prepare('SELECT state FROM thread_closures WHERE thread_id = ?').get(THREAD)).toMatchObject({
+    expect(getRawDb().prepare('SELECT state FROM thread_closures WHERE thread_id = ?').get(THREAD)).toMatchObject({
       state: 'finalizing',
     });
 
@@ -1052,7 +1055,7 @@ describe('the close sequence order', () => {
       'thread-close: the post-exit settle failed; the closure stays finalizing for the next tick',
     );
     // Reported through the close path, and left for the next tick to retry.
-    expect(getDb().prepare('SELECT state FROM thread_closures WHERE thread_id = ?').get(THREAD)).toMatchObject({
+    expect(getRawDb().prepare('SELECT state FROM thread_closures WHERE thread_id = ?').get(THREAD)).toMatchObject({
       state: 'finalizing',
     });
     warn.mockRestore();
@@ -1063,7 +1066,7 @@ describe('the close sequence order', () => {
     const { calls, deps } = recordingDeps();
     await advanceThreadClosures(deps);
     expect(calls).toEqual([]);
-    expect(getDb().prepare('SELECT state FROM thread_closures WHERE thread_id = ?').get(THREAD)).toMatchObject({
+    expect(getRawDb().prepare('SELECT state FROM thread_closures WHERE thread_id = ?').get(THREAD)).toMatchObject({
       state: 'awaiting_confirmation',
     });
   });
@@ -1111,7 +1114,7 @@ describe('the close sequence order', () => {
       after.prepare("SELECT COUNT(*) AS n FROM session_state WHERE key IN ('work_continuation','pending_next')").get(),
     ).toMatchObject({ n: 0 });
     after.close();
-    expect(getDb().prepare('SELECT archived_at FROM sessions WHERE id = ?').get('s1')).not.toMatchObject({
+    expect(getRawDb().prepare('SELECT archived_at FROM sessions WHERE id = ?').get('s1')).not.toMatchObject({
       archived_at: null,
     });
   });
@@ -1146,10 +1149,10 @@ describe('the close sequence order', () => {
     });
 
     // It closed, and the host did not author the container's file to do it.
-    expect(getDb().prepare('SELECT state FROM thread_closures WHERE thread_id = ?').get(THREAD)).toMatchObject({
+    expect(getRawDb().prepare('SELECT state FROM thread_closures WHERE thread_id = ?').get(THREAD)).toMatchObject({
       state: 'closed',
     });
-    expect(getDb().prepare('SELECT archived_at FROM sessions WHERE id = ?').get('s1')).not.toMatchObject({
+    expect(getRawDb().prepare('SELECT archived_at FROM sessions WHERE id = ?').get('s1')).not.toMatchObject({
       archived_at: null,
     });
     expect(fs.existsSync(dbPathFor('ag1', 's1', 'outbound.db'))).toBe(false);
@@ -1188,7 +1191,7 @@ describe('the close sequence order', () => {
       after.prepare("SELECT COUNT(*) AS n FROM session_state WHERE key IN ('work_continuation','pending_next')").get(),
     ).toMatchObject({ n: 0 });
     after.close();
-    expect(getDb().prepare('SELECT state FROM thread_closures WHERE thread_id = ?').get(THREAD)).toMatchObject({
+    expect(getRawDb().prepare('SELECT state FROM thread_closures WHERE thread_id = ?').get(THREAD)).toMatchObject({
       state: 'closed',
     });
   });
@@ -1245,7 +1248,7 @@ describe('the close sequence order', () => {
     ).toMatchObject({ n: 1 });
     after.close();
     // Still finalizing, so the next tick retries against a stopped container.
-    expect(getDb().prepare('SELECT state FROM thread_closures WHERE thread_id = ?').get(THREAD)).toMatchObject({
+    expect(getRawDb().prepare('SELECT state FROM thread_closures WHERE thread_id = ?').get(THREAD)).toMatchObject({
       state: 'finalizing',
     });
   });
@@ -1346,7 +1349,7 @@ describe('the close sequence order', () => {
     expect(archived).toBeNull();
     // Left finalizing, so the next tick takes the kill path against the
     // replacement rather than skipping an archived session forever.
-    expect(getDb().prepare('SELECT state FROM thread_closures WHERE thread_id = ?').get(THREAD)).toMatchObject({
+    expect(getRawDb().prepare('SELECT state FROM thread_closures WHERE thread_id = ?').get(THREAD)).toMatchObject({
       state: 'finalizing',
     });
   });
@@ -1437,7 +1440,7 @@ describe('readDoneProposal / syncDoneProposalMirror', () => {
     insertSession('s1', 'ag1', 'slack:C1:1.1');
     const proposed = withProposal(JSON.stringify({ reason: 'finished', proposed_at: iso(0) }));
     syncDoneProposalMirror('s1', readDoneProposal(proposed));
-    const mirrored = getDb().prepare('SELECT done_proposal FROM sessions WHERE id = ?').get('s1') as {
+    const mirrored = getRawDb().prepare('SELECT done_proposal FROM sessions WHERE id = ?').get('s1') as {
       done_proposal: string;
     };
     expect(JSON.parse(mirrored.done_proposal)).toMatchObject({ reason: 'finished' });
@@ -1445,7 +1448,7 @@ describe('readDoneProposal / syncDoneProposalMirror', () => {
     // continue_work / real inbound delete the container-side record; the next
     // sweep must take the flag back off the row.
     syncDoneProposalMirror('s1', readDoneProposal(outboundStub()));
-    expect(getDb().prepare('SELECT done_proposal FROM sessions WHERE id = ?').get('s1')).toMatchObject({
+    expect(getRawDb().prepare('SELECT done_proposal FROM sessions WHERE id = ?').get('s1')).toMatchObject({
       done_proposal: null,
     });
     proposed.close();
@@ -1516,7 +1519,7 @@ describe('thread close on the mailbox seam', () => {
       );
     planted.close();
 
-    getDb()
+    getRawDb()
       .prepare(`UPDATE thread_closures SET requested_at = ? WHERE thread_id = ?`)
       .run(iso(CLOSE_CONFIRM_WINDOW_MS + 1_000), THREAD);
     await advanceThreadClosures({ now: NOW, isContainerRunning: () => false });
@@ -1526,7 +1529,7 @@ describe('thread close on the mailbox seam', () => {
       after.prepare("SELECT COUNT(*) AS n FROM session_state WHERE key IN ('work_continuation','pending_next')").get(),
     ).toMatchObject({ n: 0 });
     after.close();
-    expect(getDb().prepare('SELECT archived_at FROM sessions WHERE id = ?').get('s-seam')).not.toMatchObject({
+    expect(getRawDb().prepare('SELECT archived_at FROM sessions WHERE id = ?').get('s-seam')).not.toMatchObject({
       archived_at: null,
     });
   });

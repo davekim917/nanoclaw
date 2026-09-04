@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import http from 'http';
 
-import { closeDb, initTestDb, runMigrations, createAgentGroup, getDb } from '../db/index.js';
+import { closeDb, initTestDb, runMigrations, createAgentGroup, getRawDb } from '../db/index.js';
 import type { AuthedRequestContext } from './router.js';
 import * as userRoles from '../modules/permissions/db/user-roles.js';
 import { isSnoozed, readThreadSnoozes, threadSnoozeHandler, threadUnsnoozeHandler } from './thread-snooze.js';
@@ -43,7 +43,7 @@ function ctx(opts: { userId?: string; no_filter?: boolean; allowed?: string[] } 
 }
 
 function seedSession(id: string, agentGroupId: string, threadId: string | null, lastOutboundAt: string): void {
-  getDb()
+  getRawDb()
     .prepare(
       `INSERT INTO sessions (id, agent_group_id, messaging_group_id, thread_id, status, container_status,
                              last_active, last_outbound_at, created_at)
@@ -54,9 +54,10 @@ function seedSession(id: string, agentGroupId: string, threadId: string | null, 
 
 const post = (): Request => new Request('http://localhost/x', { method: 'POST' });
 
-beforeEach(() => {
-  closeDb();
-  const db = initTestDb();
+beforeEach(async () => {
+  await closeDb();
+  await initTestDb();
+  const db = getRawDb();
   db.pragma('foreign_keys = ON');
   runMigrations(db);
   createAgentGroup({ id: 'ag-1', name: 'ag-1', folder: 'ag-1', agent_provider: null, created_at: iso(0) });
@@ -108,9 +109,9 @@ describe('the endpoints', () => {
   it('re-snoozing an already-moved thread re-arms it at the new mark', async () => {
     seedSession('s-1', 'ag-1', 'slack:CTESTCHAN01:1700000000.11', iso(600_000));
     await threadSnoozeHandler(post(), { id: 'slack:CTESTCHAN01:1700000000.11' }, ctx());
-    getDb().prepare('UPDATE sessions SET last_outbound_at = ? WHERE id = ?').run(iso(0), 's-1');
+    getRawDb().prepare('UPDATE sessions SET last_outbound_at = ? WHERE id = ?').run(iso(0), 's-1');
     await threadSnoozeHandler(post(), { id: 'slack:CTESTCHAN01:1700000000.11' }, ctx());
-    const rows = getDb().prepare('SELECT * FROM thread_snoozes').all() as { snoozed_at_activity: string }[];
+    const rows = getRawDb().prepare('SELECT * FROM thread_snoozes').all() as { snoozed_at_activity: string }[];
     expect(rows).toHaveLength(1);
     expect(rows[0]!.snoozed_at_activity).toBe(iso(0));
   });
@@ -120,11 +121,11 @@ describe('the endpoints', () => {
     // Exactly the shape `bumpLastOutbound` writes — no zone marker. Nothing
     // downstream normalizes this table (053 works off an allowlist), so the
     // write site is the only place that can get it right.
-    getDb()
+    getRawDb()
       .prepare('UPDATE sessions SET last_outbound_at = ?, last_active = ? WHERE id = ?')
       .run('2026-08-20 06:16:56', '2026-08-20 06:00:00', 's-1');
     await threadSnoozeHandler(post(), { id: 'slack:CTESTCHAN01:1700000000.11' }, ctx());
-    const row = getDb().prepare('SELECT snoozed_at_activity, created_at FROM thread_snoozes').get() as {
+    const row = getRawDb().prepare('SELECT snoozed_at_activity, created_at FROM thread_snoozes').get() as {
       snoozed_at_activity: string;
       created_at: string;
     };
@@ -164,7 +165,7 @@ describe('the endpoints', () => {
     vi.mocked(userRoles.hasAdminPrivilege).mockReturnValue(false);
     const res = await threadSnoozeHandler(post(), { id: 'slack:CTESTCHAN01:1700000000.11' }, ctx());
     expect(res!.status).toBe(404);
-    expect(getDb().prepare('SELECT COUNT(*) AS n FROM thread_snoozes').get()).toEqual({ n: 0 });
+    expect(getRawDb().prepare('SELECT COUNT(*) AS n FROM thread_snoozes').get()).toEqual({ n: 0 });
 
     const un = await threadUnsnoozeHandler(post(), { id: 'slack:CTESTCHAN01:1700000000.11' }, ctx());
     expect(un!.status).toBe(404);
@@ -185,7 +186,7 @@ describe('the endpoints', () => {
     expect(res!.status).toBe(404);
     const un = await threadUnsnoozeHandler(post(), { id: 'board:EXAMPLE-APP#817' }, ctx());
     expect(un!.status).toBe(404);
-    expect(getDb().prepare('SELECT COUNT(*) AS n FROM thread_snoozes').get()).toEqual({ n: 0 });
+    expect(getRawDb().prepare('SELECT COUNT(*) AS n FROM thread_snoozes').get()).toEqual({ n: 0 });
   });
 
   it('404s an unknown thread and an out-of-scope one identically (§2a)', async () => {
@@ -199,7 +200,7 @@ describe('the endpoints', () => {
     expect(unknown!.status).toBe(404);
     expect(scoped!.status).toBe(404);
     expect(await unknown!.json()).toEqual(await scoped!.json());
-    expect(getDb().prepare('SELECT COUNT(*) AS n FROM thread_snoozes').get()).toEqual({ n: 0 });
+    expect(getRawDb().prepare('SELECT COUNT(*) AS n FROM thread_snoozes').get()).toEqual({ n: 0 });
   });
 });
 

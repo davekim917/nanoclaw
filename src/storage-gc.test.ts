@@ -70,7 +70,7 @@ vi.mock('./container-runner.js', async (importOriginal) => ({
 }));
 vi.mock('./db/connection.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('./db/connection.js')>()),
-  getDb: () => ({
+  getRawDb: () => ({
     prepare: () => ({
       all: () => {
         if (state.inventoryFails) throw new Error('database unavailable');

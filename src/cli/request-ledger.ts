@@ -15,7 +15,7 @@
  * it cannot prove that nothing happened — `dispatch()` posts approval cards
  * before it can fail, so an exception is "outcome unknown", not "nothing ran".
  */
-import { getDb } from '../db/connection.js';
+import { getRawDb } from '../db/connection.js';
 import { log } from '../log.js';
 import type { ResponseFrame } from './frame.js';
 
@@ -37,7 +37,7 @@ export type CliRequestClaim =
  * it. Atomic: the INSERT either wins the row or conflicts, in one statement.
  */
 export function claimCliRequest(sessionId: string, requestId: string, command: string): CliRequestClaim {
-  const db = getDb();
+  const db = getRawDb();
 
   const claimed = db
     .prepare(
@@ -91,7 +91,7 @@ export function claimCliRequest(sessionId: string, requestId: string, command: s
 
 /** Record the outcome. A retry after this replays `response` verbatim. */
 export function completeCliRequest(sessionId: string, requestId: string, response: ResponseFrame): void {
-  getDb()
+  getRawDb()
     .prepare(
       `UPDATE cli_request_executions
           SET status = 'done', response = @response, completed_at = @completed_at
@@ -151,7 +151,7 @@ const PAYLOAD_RETENTION_DAYS = 7;
  */
 export function pruneCliRequestExecutions(): void {
   try {
-    const db = getDb();
+    const db = getRawDb();
 
     db.prepare(
       `DELETE FROM cli_request_executions

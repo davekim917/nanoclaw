@@ -38,7 +38,7 @@ vi.mock('../../session-manager.js', async () => {
 import { readContainerConfig, writeContainerConfig } from '../../container-config.js';
 import { writeSessionMessage } from '../../session-manager.js';
 import { createAgentGroup } from '../../db/agent-groups.js';
-import { closeDb, initTestDb, runMigrations } from '../../db/index.js';
+import { closeDb, getRawDb, initTestDb, runMigrations } from '../../db/index.js';
 import { ensureContainerConfig, getContainerConfig } from '../../db/container-configs.js';
 import { createSession } from '../../db/sessions.js';
 import type { Session } from '../../types.js';
@@ -50,11 +50,12 @@ function now(): string {
 
 let session: Session;
 
-beforeEach(() => {
+beforeEach(async () => {
   vi.clearAllMocks();
   fs.rmSync(TEST_DIR, { recursive: true, force: true });
   fs.mkdirSync(`${TEST_DIR}/groups/agent`, { recursive: true });
-  runMigrations(initTestDb());
+  await initTestDb();
+  runMigrations(getRawDb());
 
   createAgentGroup({ id: 'ag-1', name: 'Agent', folder: 'agent', agent_provider: null, created_at: now() });
   ensureContainerConfig('ag-1');
@@ -80,8 +81,8 @@ beforeEach(() => {
   });
 });
 
-afterEach(() => {
-  closeDb();
+afterEach(async () => {
+  await closeDb();
   fs.rmSync(TEST_DIR, { recursive: true, force: true });
 });
 

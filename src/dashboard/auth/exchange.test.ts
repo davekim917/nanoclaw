@@ -18,7 +18,7 @@ vi.mock('../router.js', async (importOriginal) => ({
 }));
 
 import crypto from 'crypto';
-import { closeDb, initTestDb, runMigrations, getDb } from '../../db/index.js';
+import { closeDb, initTestDb, runMigrations, getRawDb } from '../../db/index.js';
 import { issueDashboardToken, consumeDashboardToken } from '../db/dashboard-tokens.js';
 import { exchangeHandler } from './exchange.js';
 import { resolveServerKey } from './cookie.js';
@@ -56,18 +56,19 @@ function issueRawToken(userId: string): string {
 }
 
 function insertUser(id: string): void {
-  getDb()
+  getRawDb()
     .prepare("INSERT OR IGNORE INTO users (id, kind, display_name, created_at) VALUES (?, 'test', NULL, ?)")
     .run(id, new Date().toISOString());
 }
 
-beforeEach(() => {
-  const db = initTestDb();
+beforeEach(async () => {
+  await initTestDb();
+  const db = getRawDb();
   runMigrations(db);
 });
 
-afterEach(() => {
-  closeDb();
+afterEach(async () => {
+  await closeDb();
   vi.clearAllMocks();
 });
 
@@ -126,7 +127,7 @@ describe('exchangeHandler', () => {
     const tokenHmac = hmacToken(rawToken);
 
     // Insert with past expires_at
-    getDb()
+    getRawDb()
       .prepare(
         `INSERT INTO dashboard_tokens (user_id, token_hmac, issued_at, expires_at)
          VALUES (?, ?, datetime('now', '-2 hours'), datetime('now', '-1 hour'))`,

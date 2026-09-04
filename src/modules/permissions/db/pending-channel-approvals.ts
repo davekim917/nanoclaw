@@ -9,7 +9,7 @@
  * `hasInFlightChannelApproval` in the request flow and drops silently
  * instead of spamming the owner.
  */
-import { getDb } from '../../../db/connection.js';
+import { getRawDb } from '../../../db/connection.js';
 
 export interface PendingChannelApproval {
   messaging_group_id: string;
@@ -25,7 +25,7 @@ export interface PendingChannelApproval {
 }
 
 export function createPendingChannelApproval(row: PendingChannelApproval): boolean {
-  const result = getDb()
+  const result = getRawDb()
     .prepare(
       `INSERT OR IGNORE INTO pending_channel_approvals (
          messaging_group_id, agent_group_id, original_message,
@@ -41,13 +41,13 @@ export function createPendingChannelApproval(row: PendingChannelApproval): boole
 }
 
 export function getPendingChannelApproval(messagingGroupId: string): PendingChannelApproval | undefined {
-  return getDb()
+  return getRawDb()
     .prepare('SELECT * FROM pending_channel_approvals WHERE messaging_group_id = ?')
     .get(messagingGroupId) as PendingChannelApproval | undefined;
 }
 
 export function hasInFlightChannelApproval(messagingGroupId: string): boolean {
-  const row = getDb()
+  const row = getRawDb()
     .prepare('SELECT 1 AS x FROM pending_channel_approvals WHERE messaging_group_id = ?')
     .get(messagingGroupId) as { x: number } | undefined;
   return row !== undefined;
@@ -59,7 +59,7 @@ export function updatePendingChannelApprovalCard(
   question: string,
   optionsJson: string,
 ): void {
-  getDb()
+  getRawDb()
     .prepare(
       'UPDATE pending_channel_approvals SET title = ?, question = ?, options_json = ? WHERE messaging_group_id = ?',
     )
@@ -67,5 +67,5 @@ export function updatePendingChannelApprovalCard(
 }
 
 export function deletePendingChannelApproval(messagingGroupId: string): void {
-  getDb().prepare('DELETE FROM pending_channel_approvals WHERE messaging_group_id = ?').run(messagingGroupId);
+  getRawDb().prepare('DELETE FROM pending_channel_approvals WHERE messaging_group_id = ?').run(messagingGroupId);
 }

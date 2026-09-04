@@ -8,7 +8,7 @@ import {
   initTestDb,
   runMigrations,
 } from '../../db/index.js';
-import { getDb } from '../../db/connection.js';
+import { getRawDb } from '../../db/connection.js';
 import { getTaskByParentAndIdempotency, getTaskById, insertTaskAtomic } from './db/tasks.js';
 import type { Task } from './db/tasks.js';
 import { computeRequestHash } from './derive-task-id.js';
@@ -106,8 +106,9 @@ function now(): string {
   return new Date().toISOString();
 }
 
-function setupDb(): void {
-  const db = initTestDb();
+async function setupDb(): Promise<void> {
+  await initTestDb();
+  const db = getRawDb();
   db.pragma('foreign_keys = ON');
   runMigrations(db);
 }
@@ -132,7 +133,7 @@ function seedAgentGroup(id: string): void {
 }
 
 function seedSession(sessId: string, agId: string, mgId: string | null = null): void {
-  getDb()
+  getRawDb()
     .prepare(`INSERT OR IGNORE INTO sessions (id, agent_group_id, messaging_group_id, created_at) VALUES (?, ?, ?, ?)`)
     .run(sessId, agId, mgId, now());
 }
@@ -156,7 +157,7 @@ function grantOrchestrator(agId: string): void {
     spawnDeadlineSec: 300,
     drainGraceSec: 120,
   });
-  getDb()
+  getRawDb()
     .prepare(
       `INSERT INTO agent_group_capabilities (agent_group_id, role, config_json, granted_by, granted_at)
        VALUES (?, 'orchestrator', ?, NULL, ?)
@@ -172,7 +173,7 @@ function grantOrchestratorCap1(agId: string): void {
     spawnDeadlineSec: 300,
     drainGraceSec: 120,
   });
-  getDb()
+  getRawDb()
     .prepare(
       `INSERT INTO agent_group_capabilities (agent_group_id, role, config_json, granted_by, granted_at)
        VALUES (?, 'orchestrator', ?, NULL, ?)
@@ -216,8 +217,8 @@ beforeEach(async () => {
   vi.mocked(getChannelAdapter).mockReturnValue(undefined); // default: no adapter (headless)
 });
 
-afterEach(() => {
-  closeDb();
+afterEach(async () => {
+  await closeDb();
   vi.clearAllMocks();
 });
 
@@ -225,7 +226,7 @@ afterEach(() => {
 
 describe('applySpawnTask', () => {
   it('test_admit_missing_capability_rejects: rejects when caller has no orchestrator capability', async () => {
-    setupDb();
+    await setupDb();
     seedAgentGroup('ag-caller');
     seedSession('sess-caller', 'ag-caller');
 
@@ -244,7 +245,7 @@ describe('applySpawnTask', () => {
   });
 
   it('test_admit_happy_path: inserts task with correct fields (headless mode)', async () => {
-    setupDb();
+    await setupDb();
     seedAgentGroup('ag-caller');
     seedSession('sess-caller', 'ag-caller');
     grantOrchestrator('ag-caller');
@@ -263,7 +264,7 @@ describe('applySpawnTask', () => {
   });
 
   it('test_idempotency_replay_succeeds_at_cap: replay succeeds even when at concurrency cap', async () => {
-    setupDb();
+    await setupDb();
     seedAgentGroup('ag-caller');
     seedSession('sess-caller', 'ag-caller');
     grantOrchestratorCap1('ag-caller');
@@ -315,7 +316,7 @@ describe('applySpawnTask', () => {
   });
 
   it('test_idempotency_replay_with_different_payload: rejects with key_reused', async () => {
-    setupDb();
+    await setupDb();
     seedAgentGroup('ag-caller');
     seedSession('sess-caller', 'ag-caller');
     grantOrchestrator('ag-caller');
@@ -365,7 +366,7 @@ describe('applySpawnTask', () => {
   });
 
   it('test_cap_rejects_new_admission: rejects when at concurrency cap', async () => {
-    setupDb();
+    await setupDb();
     seedAgentGroup('ag-caller');
     seedSession('sess-caller', 'ag-caller');
     grantOrchestratorCap1('ag-caller');
@@ -387,7 +388,7 @@ describe('applySpawnTask', () => {
   });
 
   it('test_headless_path_when_no_create_thread: surface_mode=headless when adapter lacks createThread', async () => {
-    setupDb();
+    await setupDb();
     seedAgentGroup('ag-caller');
     seedMessagingGroup('mg-1');
     seedSession('sess-caller', 'ag-caller', 'mg-1');
@@ -406,7 +407,7 @@ describe('applySpawnTask', () => {
   });
 
   it('ASSERT: surface_mode=native_thread when adapter has createThread and mgId is non-null', async () => {
-    setupDb();
+    await setupDb();
     seedAgentGroup('ag-caller');
     seedMessagingGroup('mg-1');
     seedSession('sess-caller', 'ag-caller', 'mg-1');
@@ -424,7 +425,7 @@ describe('applySpawnTask', () => {
   });
 
   it('ASSERT: post-INSERT setImmediate(completeSpawnSideEffects, task_id, childAgentGroupId) called', async () => {
-    setupDb();
+    await setupDb();
     seedAgentGroup('ag-caller');
     seedSession('sess-caller', 'ag-caller');
     grantOrchestrator('ag-caller');
@@ -439,7 +440,7 @@ describe('applySpawnTask', () => {
   });
 
   it('ASSERT: notify-caller wrapped in try/catch — writeSessionMessage failure does not throw', async () => {
-    setupDb();
+    await setupDb();
     seedAgentGroup('ag-caller');
     seedSession('sess-caller', 'ag-caller');
     grantOrchestrator('ag-caller');
@@ -457,13 +458,13 @@ describe('applySpawnTask', () => {
 
 describe('completeSpawnSideEffects', () => {
   it('test_lease_skip_when_held: skips silently when lease is already held', async () => {
-    setupDb();
+    await setupDb();
     seedAgentGroup('ag-caller');
     seedSession('sess-caller', 'ag-caller');
 
     // Insert task with lease already held (set to now, not expired)
     const taskId = 'task-leased';
-    getDb()
+    getRawDb()
       .prepare(
         `INSERT INTO tasks (task_id, idempotency_key, parent_session_id, parent_agent_group_id,
           status, task_content, request_hash, admitted_at, surface_mode,
@@ -481,12 +482,12 @@ describe('completeSpawnSideEffects', () => {
   });
 
   it('test_concurrent_setImmediate_dedupe: second call returns same promise (in-process guard)', async () => {
-    setupDb();
+    await setupDb();
     seedAgentGroup('ag-caller');
     seedSession('sess-caller', 'ag-caller');
 
     const taskId = 'task-dedup';
-    getDb()
+    getRawDb()
       .prepare(
         `INSERT INTO tasks (task_id, idempotency_key, parent_session_id, parent_agent_group_id,
           status, task_content, request_hash, admitted_at, surface_mode,
@@ -508,13 +509,13 @@ describe('completeSpawnSideEffects', () => {
   });
 
   it('test_adapter_unavailable_marks_failed_immediately: adapter_unavailable does not consume retry budget', async () => {
-    setupDb();
+    await setupDb();
     seedAgentGroup('ag-caller');
     seedMessagingGroup('mg-1');
     seedSession('sess-caller', 'ag-caller', 'mg-1');
 
     const taskId = 'task-no-adapter';
-    getDb()
+    getRawDb()
       .prepare(
         `INSERT INTO tasks (task_id, idempotency_key, parent_session_id, parent_agent_group_id,
           parent_messaging_group_id, status, task_content, request_hash,
@@ -537,12 +538,12 @@ describe('completeSpawnSideEffects', () => {
   });
 
   it('test_completion_exhausted_after_5_failures: marks failed after 5 throws', async () => {
-    setupDb();
+    await setupDb();
     seedAgentGroup('ag-caller');
     seedSession('sess-caller', 'ag-caller');
 
     const taskId = 'task-exhaust';
-    getDb()
+    getRawDb()
       .prepare(
         `INSERT INTO tasks (task_id, idempotency_key, parent_session_id, parent_agent_group_id,
           status, task_content, request_hash, admitted_at, surface_mode,
@@ -557,7 +558,7 @@ describe('completeSpawnSideEffects', () => {
     // 5 failures
     for (let i = 0; i < 5; i++) {
       // Reset the lease between calls (simulate each call as a separate process run)
-      getDb().prepare(`UPDATE tasks SET completion_lease_at = NULL WHERE task_id = ?`).run(taskId);
+      getRawDb().prepare(`UPDATE tasks SET completion_lease_at = NULL WHERE task_id = ?`).run(taskId);
       await completeSpawnSideEffects(taskId, 'ag-caller');
     }
 
@@ -567,12 +568,12 @@ describe('completeSpawnSideEffects', () => {
   });
 
   it('test_status_cas_aborts_on_cancel_mid_flight: aborts when status no longer pending', async () => {
-    setupDb();
+    await setupDb();
     seedAgentGroup('ag-caller');
     seedSession('sess-caller', 'ag-caller');
 
     const taskId = 'task-cancelled-mid';
-    getDb()
+    getRawDb()
       .prepare(
         `INSERT INTO tasks (task_id, idempotency_key, parent_session_id, parent_agent_group_id,
           status, task_content, request_hash, admitted_at, surface_mode,
@@ -590,13 +591,13 @@ describe('completeSpawnSideEffects', () => {
   });
 
   it('test_slack_thread_id_is_parent_message_id: persists threadId not messageId', async () => {
-    setupDb();
+    await setupDb();
     seedAgentGroup('ag-caller');
     seedMessagingGroup('mg-1');
     seedSession('sess-caller', 'ag-caller', 'mg-1');
 
     const taskId = 'task-slack-thread';
-    getDb()
+    getRawDb()
       .prepare(
         `INSERT INTO tasks (task_id, idempotency_key, parent_session_id, parent_agent_group_id,
           parent_messaging_group_id, status, task_content, request_hash,
@@ -620,12 +621,12 @@ describe('completeSpawnSideEffects', () => {
   });
 
   it('test_open_session_write_order: tasks UPDATE before writeSessionMessage before wakeContainer', async () => {
-    setupDb();
+    await setupDb();
     seedAgentGroup('ag-caller');
     seedSession('sess-caller', 'ag-caller');
 
     const taskId = 'task-write-order';
-    getDb()
+    getRawDb()
       .prepare(
         `INSERT INTO tasks (task_id, idempotency_key, parent_session_id, parent_agent_group_id,
           status, task_content, request_hash, admitted_at, surface_mode,
@@ -673,7 +674,7 @@ describe('completeSpawnSideEffects', () => {
   // Asserting the SEAM, not the file, is what makes this a regression guard
   // that survives the suite no longer touching disk at all.
   it('stamps spawn_task_id through the provisioning mailbox seam, never the existing-only one', async () => {
-    setupDb();
+    await setupDb();
     seedAgentGroup('ag-caller');
     seedSession('sess-caller', 'ag-caller');
     // The child row the mocked `resolveSession` claims to have created. Without
@@ -684,7 +685,7 @@ describe('completeSpawnSideEffects', () => {
     // `INSERT OR IGNORE` is silently dropped here, because a second row with
     // the same (agent_group_id, messaging_group_id, thread_id) collides with
     // `sess-caller` on the sessions unique index.
-    getDb()
+    getRawDb()
       .prepare(
         `INSERT INTO sessions (id, agent_group_id, messaging_group_id, thread_id, created_at)
          VALUES ('child-sess-ag-caller', 'ag-caller', NULL, 'task-stamp-seam', ?)`,
@@ -695,7 +696,7 @@ describe('completeSpawnSideEffects', () => {
     hostExistingSessionMock.mockClear();
 
     const taskId = 'task-stamp-seam';
-    getDb()
+    getRawDb()
       .prepare(
         `INSERT INTO tasks (task_id, idempotency_key, parent_session_id, parent_agent_group_id,
           status, task_content, request_hash, admitted_at, surface_mode,
@@ -723,7 +724,7 @@ vi.mock('../../dashboard/api/events.js', async (importOriginal) => ({
 
 describe('D6: emitDashboardEvent emits after apply functions commit', () => {
   it('test_applySpawnTask_emits_task_event_admit', async () => {
-    setupDb();
+    await setupDb();
     seedAgentGroup('ag-caller');
     seedSession('sess-caller', 'ag-caller');
     grantOrchestrator('ag-caller');
@@ -747,7 +748,7 @@ describe('D6: emitDashboardEvent emits after apply functions commit', () => {
   });
 
   it('test_emit_fires_after_commit: emit NOT called if admission is rejected (cap reached)', async () => {
-    setupDb();
+    await setupDb();
     seedAgentGroup('ag-caller');
     seedSession('sess-caller', 'ag-caller');
     grantOrchestratorCap1('ag-caller');

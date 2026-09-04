@@ -1,5 +1,5 @@
 import type { UserRole, UserRoleKind } from '../../../types.js';
-import { getDb } from '../../../db/connection.js';
+import { getRawDb } from '../../../db/connection.js';
 import { equivalentSlackUserIds } from '../../../slack-user-identity.js';
 
 /**
@@ -19,7 +19,7 @@ export function grantRole(row: UserRole): void {
   if (row.role === 'owner' && row.agent_group_id !== null) {
     throw new Error('owner role must be global (agent_group_id = null)');
   }
-  getDb()
+  getRawDb()
     .prepare(
       `INSERT INTO user_roles (user_id, role, agent_group_id, granted_by, granted_at)
        VALUES (@user_id, @role, @agent_group_id, @granted_by, @granted_at)`,
@@ -29,23 +29,23 @@ export function grantRole(row: UserRole): void {
 
 export function revokeRole(userId: string, role: UserRoleKind, agentGroupId: string | null): void {
   if (agentGroupId === null) {
-    getDb()
+    getRawDb()
       .prepare('DELETE FROM user_roles WHERE user_id = ? AND role = ? AND agent_group_id IS NULL')
       .run(userId, role);
   } else {
-    getDb()
+    getRawDb()
       .prepare('DELETE FROM user_roles WHERE user_id = ? AND role = ? AND agent_group_id = ?')
       .run(userId, role, agentGroupId);
   }
 }
 
 export function getUserRoles(userId: string): UserRole[] {
-  return getDb().prepare('SELECT * FROM user_roles WHERE user_id = ?').all(userId) as UserRole[];
+  return getRawDb().prepare('SELECT * FROM user_roles WHERE user_id = ?').all(userId) as UserRole[];
 }
 
 export function isOwner(userId: string): boolean {
   return hasEquivalentRole(userId, (candidate) => {
-    const row = getDb()
+    const row = getRawDb()
       .prepare('SELECT 1 FROM user_roles WHERE user_id = ? AND role = ? AND agent_group_id IS NULL LIMIT 1')
       .get(candidate, 'owner');
     return !!row;
@@ -54,7 +54,7 @@ export function isOwner(userId: string): boolean {
 
 export function isGlobalAdmin(userId: string): boolean {
   return hasEquivalentRole(userId, (candidate) => {
-    const row = getDb()
+    const row = getRawDb()
       .prepare('SELECT 1 FROM user_roles WHERE user_id = ? AND role = ? AND agent_group_id IS NULL LIMIT 1')
       .get(candidate, 'admin');
     return !!row;
@@ -63,7 +63,7 @@ export function isGlobalAdmin(userId: string): boolean {
 
 export function isAdminOfAgentGroup(userId: string, agentGroupId: string): boolean {
   return hasEquivalentRole(userId, (candidate) => {
-    const row = getDb()
+    const row = getRawDb()
       .prepare('SELECT 1 FROM user_roles WHERE user_id = ? AND role = ? AND agent_group_id = ? LIMIT 1')
       .get(candidate, 'admin', agentGroupId);
     return !!row;
@@ -76,26 +76,26 @@ export function hasAdminPrivilege(userId: string, agentGroupId: string): boolean
 }
 
 export function getOwners(): UserRole[] {
-  return getDb()
+  return getRawDb()
     .prepare('SELECT * FROM user_roles WHERE role = ? AND agent_group_id IS NULL ORDER BY granted_at')
     .all('owner') as UserRole[];
 }
 
 export function hasAnyOwner(): boolean {
-  const row = getDb()
+  const row = getRawDb()
     .prepare('SELECT 1 FROM user_roles WHERE role = ? AND agent_group_id IS NULL LIMIT 1')
     .get('owner');
   return !!row;
 }
 
 export function getGlobalAdmins(): UserRole[] {
-  return getDb()
+  return getRawDb()
     .prepare('SELECT * FROM user_roles WHERE role = ? AND agent_group_id IS NULL ORDER BY granted_at')
     .all('admin') as UserRole[];
 }
 
 export function getAdminsOfAgentGroup(agentGroupId: string): UserRole[] {
-  return getDb()
+  return getRawDb()
     .prepare('SELECT * FROM user_roles WHERE role = ? AND agent_group_id = ? ORDER BY granted_at')
     .all('admin', agentGroupId) as UserRole[];
 }
@@ -103,7 +103,7 @@ export function getAdminsOfAgentGroup(agentGroupId: string): UserRole[] {
 /** True if the user has any admin role: owner or admin (global or scoped). */
 export function isAnyAdmin(userId: string): boolean {
   return hasEquivalentRole(userId, (candidate) => {
-    const row = getDb()
+    const row = getRawDb()
       .prepare("SELECT 1 FROM user_roles WHERE user_id = ? AND role IN ('owner', 'admin') LIMIT 1")
       .get(candidate);
     return !!row;

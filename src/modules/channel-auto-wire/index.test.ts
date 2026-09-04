@@ -7,7 +7,14 @@
  */
 import { beforeEach, afterEach, describe, expect, it } from 'vitest';
 
-import { closeDb, createAgentGroup, createMessagingGroup, initTestDb, runMigrations } from '../../db/index.js';
+import {
+  closeDb,
+  createAgentGroup,
+  createMessagingGroup,
+  initTestDb,
+  runMigrations,
+  getRawDb,
+} from '../../db/index.js';
 import { getMessagingGroupAgents, getMessagingGroupByPlatform } from '../../db/messaging-groups.js';
 import type { InboundEvent } from '../../channels/adapter.js';
 import type { AgentGroup, MessagingGroup } from '../../types.js';
@@ -56,8 +63,9 @@ const ENV_DISCORD_KEY = 'NANOCLAW_DEFAULT_AGENT_GROUP_DISCORD';
 
 let saved: Record<string, string | undefined> = {};
 
-beforeEach(() => {
-  const db = initTestDb();
+beforeEach(async () => {
+  await initTestDb();
+  const db = getRawDb();
   runMigrations(db);
   saved = {
     [ENV_FOLDER_KEY]: process.env[ENV_FOLDER_KEY],
@@ -73,12 +81,12 @@ beforeEach(() => {
   delete process.env[ENV_DISCORD_KEY];
 });
 
-afterEach(() => {
+afterEach(async () => {
   for (const [k, v] of Object.entries(saved)) {
     if (v === undefined) delete process.env[k];
     else process.env[k] = v;
   }
-  closeDb();
+  await closeDb();
 });
 
 describe('channel-auto-wire resolver', () => {

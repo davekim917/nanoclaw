@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import http from 'http';
 
-import { closeDb, createAgentGroup, getDb, initTestDb, runMigrations } from '../../db/index.js';
+import { closeDb, createAgentGroup, getRawDb, initTestDb, runMigrations } from '../../db/index.js';
 import { groupsListHandler } from './groups.js';
 import type { AuthedRequestContext } from '../router.js';
 
@@ -26,15 +26,16 @@ function makeReq(): Request {
   return new Request('http://localhost/dashboard/api/groups');
 }
 
-function setupDb(): void {
-  const db = initTestDb();
+async function setupDb(): Promise<void> {
+  await initTestDb();
+  const db = getRawDb();
   db.pragma('foreign_keys = ON');
   runMigrations(db);
 }
 
 describe('groupsListHandler', () => {
-  beforeEach(() => {
-    setupDb();
+  beforeEach(async () => {
+    await setupDb();
     createAgentGroup({
       id: 'ag-1',
       name: 'example-labs',
@@ -51,8 +52,8 @@ describe('groupsListHandler', () => {
     });
     createAgentGroup({ id: 'ag-3', name: 'personal', folder: 'personal', agent_provider: null, created_at: now() });
   });
-  afterEach(() => {
-    closeDb();
+  afterEach(async () => {
+    await closeDb();
     vi.clearAllMocks();
   });
 
@@ -80,8 +81,8 @@ describe('groupsListHandler', () => {
   // this column; without it the Schedule lens (keyed on agent_group_id) cannot
   // honour the workgroup filter.
   it('carries workgroup_id so the SPA can map a workgroup to its siblings', async () => {
-    getDb().prepare(`INSERT INTO workgroups (id, created_at) VALUES ('example-labs', ?)`).run(now());
-    getDb().prepare(`UPDATE agent_groups SET workgroup_id = 'example-labs' WHERE id IN ('ag-1', 'ag-2')`).run();
+    getRawDb().prepare(`INSERT INTO workgroups (id, created_at) VALUES ('example-labs', ?)`).run(now());
+    getRawDb().prepare(`UPDATE agent_groups SET workgroup_id = 'example-labs' WHERE id IN ('ag-1', 'ag-2')`).run();
 
     const res: Response = (await groupsListHandler(makeReq(), {}, makeCtx({ no_filter: true })))!;
     const body = (await res.json()) as { groups: { id: string; workgroup_id: string | null }[] };

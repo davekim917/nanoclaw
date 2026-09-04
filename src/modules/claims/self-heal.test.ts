@@ -22,7 +22,7 @@ import {
   type SelfHealTaskInput,
 } from './self-heal.js';
 import { readClaims } from '../../claims-board.js';
-import { closeDb, getDb, initTestDb } from '../../db/connection.js';
+import { closeDb, getRawDb, initTestDb } from '../../db/connection.js';
 import { log } from '../../log.js';
 
 // Only needed by the one test that exercises the REAL createTask path; the rest
@@ -658,8 +658,9 @@ describe('sweepClaimsSelfHeal hostile re-read handling', () => {
 });
 
 describe('wiredCandidates — where a claim can actually be reached', () => {
-  beforeEach(() => {
-    const db = initTestDb();
+  beforeEach(async () => {
+    await initTestDb();
+    const db = getRawDb();
     db.exec(`
       CREATE TABLE agent_groups (
         id TEXT PRIMARY KEY, name TEXT NOT NULL, folder TEXT NOT NULL UNIQUE,
@@ -689,14 +690,14 @@ describe('wiredCandidates — where a claim can actually be reached', () => {
     `);
   });
 
-  afterEach(() => {
-    closeDb();
+  afterEach(async () => {
+    await closeDb();
     stamp.db?.close();
     stamp.db = null;
   });
 
   function anchor(channelType: string, platformId: string, threadPlatformId: string, createdAt: string): void {
-    getDb()
+    getRawDb()
       .prepare('INSERT INTO task_thread_anchors VALUES (?, ?, ?, ?, ?)')
       .run('sess-task', channelType, platformId, threadPlatformId, createdAt);
   }
@@ -720,10 +721,10 @@ describe('wiredCandidates — where a claim can actually be reached', () => {
 
   it('picks the newest anchor when a series has spoken in more than one room', async () => {
     anchor('slack-example', 'slack:C0AAA', '1111.0001', '2026-08-19T00:00:00Z');
-    getDb()
+    getRawDb()
       .prepare('INSERT INTO messaging_groups VALUES (?, ?, ?, NULL, ?, ?)')
       .run('mg-2', 'slack-example', 'slack:C0BBB', '#channel-b', '2026-08-01T00:00:00Z');
-    getDb()
+    getRawDb()
       .prepare('INSERT INTO messaging_group_agents VALUES (?, ?, ?, ?)')
       .run('w-2', 'mg-2', 'ag-1', '2026-08-01T00:00:00Z');
     anchor('slack-example', 'slack:C0BBB', '2222.0002', '2026-08-21T00:00:00Z');

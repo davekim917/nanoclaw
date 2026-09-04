@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
-import { closeDb, initTestDb } from './connection.js';
+import { closeDb, initTestDb, getRawDb } from './connection.js';
 import { runMigrations } from './migrations/index.js';
 import {
   claimChannelIngress,
@@ -21,8 +21,9 @@ const key: ChannelIngressReceiptKey = {
   messageId: 'm1',
 };
 
-beforeEach(() => {
-  runMigrations(initTestDb());
+beforeEach(async () => {
+  await initTestDb();
+  runMigrations(getRawDb());
 });
 
 afterEach(() => closeDb());

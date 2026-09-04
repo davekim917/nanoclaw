@@ -20,7 +20,7 @@ import { CronExpressionParser } from 'cron-parser';
 
 import { DATA_DIR, TIMEZONE } from '../../config.js';
 import { resolveGroupTimezone } from '../../container-config.js';
-import { getDb } from '../../db/connection.js';
+import { getRawDb } from '../../db/connection.js';
 import { log } from '../../log.js';
 import {
   readSessionInbound,
@@ -523,7 +523,7 @@ export function buildDetailRow(
   nowMs: number,
 ): ScheduledRow | null {
   const location = locate(dataDir, agentGroupId, sessionId);
-  const central = getDb();
+  const central = getRawDb();
   const ag = central.prepare('SELECT name, agent_provider FROM agent_groups WHERE id = ?').get(agentGroupId) as
     | { name: string; agent_provider: string | null }
     | undefined;
@@ -640,7 +640,7 @@ async function doAssemble(scopes: AuthScopes, options: ScheduledAssemblyOptions)
   const startGen = getScheduledCache().gen;
   const startedAt = Date.now();
 
-  const central = getDb();
+  const central = getRawDb();
   const agentGroups = new Map(
     (
       central.prepare('SELECT id, name, agent_provider FROM agent_groups').all() as Array<{

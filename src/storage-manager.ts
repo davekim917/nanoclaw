@@ -22,7 +22,7 @@ import Database from 'better-sqlite3';
 import { CONTAINER_IMAGE, CONTAINER_IMAGE_BASE, CONTAINER_INSTALL_LABEL, DATA_DIR } from './config.js';
 import { runningContainerMounts as inspectRunningContainerMounts } from './container-mounts.js';
 import { CONTAINER_RUNTIME_BIN } from './container-runtime.js';
-import { getDb } from './db/connection.js';
+import { getRawDb } from './db/connection.js';
 import { getAllContainerConfigs } from './db/container-configs.js';
 import { log } from './log.js';
 import { resolveRepositoryWorkUnit } from './repository-workspaces.js';
@@ -839,7 +839,7 @@ export function collectThreadWorktreeActivity(
     wg: string;
   }>;
   try {
-    rows = getDb()
+    rows = getRawDb()
       .prepare(
         `SELECT s.id, s.agent_group_id, s.thread_id, s.last_active, mg.platform_id,
                 COALESCE(ag.workgroup_id, ag.folder) AS wg
@@ -1091,7 +1091,7 @@ interface CentralSessionRow {
  */
 function centralSessionRow(sessionId: string): CentralSessionRow | null | 'unavailable' {
   try {
-    const row = getDb()
+    const row = getRawDb()
       .prepare('SELECT status, COALESCE(last_active, created_at) AS last_activity FROM sessions WHERE id = ?')
       .get(sessionId) as CentralSessionRow | undefined;
     return row ?? null;
@@ -1256,13 +1256,13 @@ function isConstraintViolation(err: unknown): boolean {
 
 function releaseArchivingRow(sessionId: string): 'active' | 'closed' | 'failed' {
   try {
-    getDb().prepare("UPDATE sessions SET status = 'active' WHERE id = ? AND status = 'archiving'").run(sessionId);
+    getRawDb().prepare("UPDATE sessions SET status = 'active' WHERE id = ? AND status = 'archiving'").run(sessionId);
     return 'active';
   } catch (err) {
     // The ONLY expected failure: a fresh session claimed this row's active
     // triple while it was archiving (migration 049). That row is history now.
     if (isConstraintViolation(err)) {
-      getDb().prepare("UPDATE sessions SET status = 'closed' WHERE id = ? AND status = 'archiving'").run(sessionId);
+      getRawDb().prepare("UPDATE sessions SET status = 'closed' WHERE id = ? AND status = 'archiving'").run(sessionId);
       log.warn('storage-manager: archiving row lost its triple to a newer session, closed instead', { sessionId });
       return 'closed';
     }
@@ -1348,7 +1348,7 @@ function createArchiveSessionAction(args: {
         // Claim the row before touching the disk. An 'unavailable' DB throws
         // out of here and the dir is kept (fail closed).
         if (args.sessionStatus === 'active') {
-          const claimedRow = getDb()
+          const claimedRow = getRawDb()
             .prepare("UPDATE sessions SET status = 'archiving' WHERE id = ? AND status = 'active'")
             .run(args.sessionId).changes;
           if (claimedRow !== 1) {
@@ -1426,7 +1426,7 @@ function createArchiveSessionAction(args: {
           rescue_path: archivePath,
         });
         if (args.sessionStatus === 'active') {
-          const closed = getDb()
+          const closed = getRawDb()
             .prepare("UPDATE sessions SET status = 'closed' WHERE id = ? AND status = 'archiving'")
             .run(args.sessionId).changes;
           // The row stopped being ours between the claim and here. The archive
@@ -1470,7 +1470,7 @@ export function finishInterruptedSessionArchivals(sessionsRoot: string = session
 
   let archiving: Array<{ id: string; agent_group_id: string }>;
   try {
-    archiving = getDb()
+    archiving = getRawDb()
       .prepare("SELECT id, agent_group_id FROM sessions WHERE status = 'archiving'")
       .all() as typeof archiving;
   } catch (err) {
@@ -1485,7 +1485,7 @@ export function finishInterruptedSessionArchivals(sessionsRoot: string = session
     // row still in it names THIS attempt — no stale-line ambiguity. The
     // archive is re-listed here rather than trusted from its size.
     if (entry && isPublishedArchive(entry.rescue_path)) {
-      const closed = getDb()
+      const closed = getRawDb()
         .prepare("UPDATE sessions SET status = 'closed' WHERE id = ? AND status = 'archiving'")
         .run(row.id).changes;
       if (closed !== 1) {
@@ -1502,7 +1502,7 @@ export function finishInterruptedSessionArchivals(sessionsRoot: string = session
       // Dir gone with no readable archive behind it. Closing the row is the
       // only honest state — the session cannot run — but this is data loss and
       // it gets said out loud rather than counted as a success.
-      getDb().prepare("UPDATE sessions SET status = 'closed' WHERE id = ? AND status = 'archiving'").run(row.id);
+      getRawDb().prepare("UPDATE sessions SET status = 'closed' WHERE id = ? AND status = 'archiving'").run(row.id);
       log.error('storage-manager: session directory lost with no readable rescue archive', {
         sessionId: row.id,
         agentGroupId: row.agent_group_id,
@@ -1556,7 +1556,7 @@ interface SessionReclaimCandidate {
 /** Active-row count for the count cap; null means "cannot tell" — cap disabled. */
 function activeSessionCount(): number | null {
   try {
-    const row = getDb().prepare("SELECT COUNT(*) AS n FROM sessions WHERE status = 'active'").get() as
+    const row = getRawDb().prepare("SELECT COUNT(*) AS n FROM sessions WHERE status = 'active'").get() as
       | { n: number }
       | undefined;
     return typeof row?.n === 'number' ? row.n : null;
@@ -2062,7 +2062,7 @@ function topicSessionActivity(): Map<string, number> | null {
   }
   let rows: Row[];
   try {
-    rows = getDb()
+    rows = getRawDb()
       .prepare(
         `SELECT s.id AS session_id, s.thread_id, s.messaging_group_id, mg.platform_id,
                 COALESCE(ag.workgroup_id, ag.folder) AS workgroup_id,

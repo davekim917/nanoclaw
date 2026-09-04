@@ -152,7 +152,7 @@ import { formatMemoryMb, resolveContainerResources } from './container-resources
 import { mergeWorkgroupAndGroupSecrets } from './onecli-secrets.js';
 import { getProviderContainerConfig } from './providers/provider-container-registry.js';
 import { log } from './log.js';
-import { closeDb, getDb, initTestDb } from './db/connection.js';
+import { closeDb, getRawDb, initTestDb } from './db/connection.js';
 import { allowSubprocess } from './test-hermeticity.js';
 import type { MemoryAdmissionResult } from './memory-admission.js';
 import type { Session } from './types.js';
@@ -1550,7 +1550,7 @@ describe('wakeContainer re-reads the session after every admission await', () =>
   const AGENT_GROUP_FOLDER = '__wake-admission-test__';
 
   function seedSession(id: string, status: string): void {
-    getDb()
+    getRawDb()
       .prepare(
         `INSERT INTO sessions (id, agent_group_id, messaging_group_id, thread_id, agent_provider, status,
                                container_status, last_active, created_at)
@@ -1560,7 +1560,7 @@ describe('wakeContainer re-reads the session after every admission await', () =>
   }
 
   function archive(id: string): void {
-    getDb().prepare("UPDATE sessions SET status = 'closed' WHERE id = ?").run(id);
+    getRawDb().prepare("UPDATE sessions SET status = 'closed' WHERE id = ?").run(id);
   }
 
   /** What the caller still believes: an active session, by id. */
@@ -1588,11 +1588,11 @@ describe('wakeContainer re-reads the session after every admission await', () =>
       });
   }
 
-  beforeEach(() => {
+  beforeEach(async () => {
     vi.mocked(log.warn).mockClear();
     memoryStub.reset();
-    initTestDb();
-    getDb().exec(`
+    await initTestDb();
+    getRawDb().exec(`
       CREATE TABLE sessions (
         id TEXT PRIMARY KEY,
         agent_group_id TEXT,
@@ -1612,7 +1612,7 @@ describe('wakeContainer re-reads the session after every admission await', () =>
         workgroup_id TEXT
       );
     `);
-    getDb()
+    getRawDb()
       .prepare('INSERT INTO agent_groups (id, name, folder, agent_provider, workgroup_id) VALUES (?, ?, ?, NULL, ?)')
       .run(AGENT_GROUP_ID, 'wake admission', AGENT_GROUP_FOLDER, 'wg-wake-admission');
     // Keep these independent of the host's real disk pressure; otherwise a full
@@ -1623,10 +1623,10 @@ describe('wakeContainer re-reads the session after every admission await', () =>
     allowSubprocess([ABSENT_CONTAINER_RUNTIME_BIN]);
   });
 
-  afterEach(() => {
+  afterEach(async () => {
     vi.unstubAllEnvs();
     memoryStub.reset();
-    closeDb();
+    await closeDb();
   });
 
   it('does not spawn a session that was archived while storage admission was awaited', async () => {
@@ -1691,7 +1691,7 @@ describe('killContainer against a session that is still spawning', () => {
   const AGENT_GROUP_FOLDER = '__kill-spawning-test__';
 
   function seedSession(id: string): void {
-    getDb()
+    getRawDb()
       .prepare(
         `INSERT INTO sessions (id, agent_group_id, messaging_group_id, thread_id, agent_provider, status,
                                container_status, last_active, created_at)
@@ -1714,12 +1714,12 @@ describe('killContainer against a session that is still spawning', () => {
     };
   }
 
-  beforeEach(() => {
+  beforeEach(async () => {
     vi.mocked(log.warn).mockClear();
     vi.mocked(log.info).mockClear();
     memoryStub.reset();
-    initTestDb();
-    getDb().exec(`
+    await initTestDb();
+    getRawDb().exec(`
       CREATE TABLE sessions (
         id TEXT PRIMARY KEY, agent_group_id TEXT, messaging_group_id TEXT, thread_id TEXT,
         agent_provider TEXT, status TEXT, container_status TEXT, last_active TEXT, created_at TEXT,
@@ -1729,18 +1729,18 @@ describe('killContainer against a session that is still spawning', () => {
         id TEXT PRIMARY KEY, name TEXT, folder TEXT, agent_provider TEXT, workgroup_id TEXT
       );
     `);
-    getDb()
+    getRawDb()
       .prepare('INSERT INTO agent_groups (id, name, folder, agent_provider, workgroup_id) VALUES (?, ?, ?, NULL, ?)')
       .run(AGENT_GROUP_ID, 'kill spawning', AGENT_GROUP_FOLDER, 'wg-kill-spawning');
     vi.stubEnv('NANOCLAW_STORAGE_MANAGER_ENABLED', '0');
     allowSubprocess([ABSENT_CONTAINER_RUNTIME_BIN]);
   });
 
-  afterEach(() => {
+  afterEach(async () => {
     storageGate.hold = null;
     vi.unstubAllEnvs();
     memoryStub.reset();
-    closeDb();
+    await closeDb();
   });
 
   it('fires onExit exactly once and leaves no container running', async () => {
@@ -1919,14 +1919,15 @@ describe('killContainer against a session that is still spawning', () => {
    */
   it('refuses a session that is archived even though its status is still active', () => {
     seedSession('sess-archived');
-    getDb()
+    getRawDb()
       .prepare('UPDATE sessions SET archived_at = ? WHERE id = ?')
       .run('2026-09-04T00:00:00.000Z', 'sess-archived');
 
     // The precondition that makes this case worth having: the row still says
     // `active`, so `status` alone cannot answer.
     expect(
-      (getDb().prepare('SELECT status FROM sessions WHERE id = ?').get('sess-archived') as { status: string }).status,
+      (getRawDb().prepare('SELECT status FROM sessions WHERE id = ?').get('sess-archived') as { status: string })
+        .status,
     ).toBe('active');
 
     expect(sessionStillActive('sess-archived')()).toEqual({ ok: false, reason: 'session is archived' });
@@ -1997,7 +1998,7 @@ describe('killContainer against a session that is still spawning', () => {
    */
   it('refuses an unguarded wake for an archived session whose status is still active', async () => {
     seedSession('sess-unguarded-archived');
-    getDb()
+    getRawDb()
       .prepare('UPDATE sessions SET archived_at = ? WHERE id = ?')
       .run('2026-09-04T00:00:00.000Z', 'sess-unguarded-archived');
 

@@ -13,7 +13,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 
 import Database from 'better-sqlite3';
 
-import { initTestDb, closeDb, getDb } from '../../db/connection.js';
+import { initTestDb, closeDb, getRawDb } from '../../db/connection.js';
 import { openInboundDb } from '../../modules/mailbox/openers.js';
 import { ensureSchema } from '../../modules/mailbox/schema.js';
 import { invalidateScheduledCache, getScheduledCache, SWEEP_INTERVAL_MS } from './scheduled-shared.js';
@@ -34,8 +34,9 @@ function isoIn(ms: number): string {
   return new Date(NOW + ms).toISOString();
 }
 
-function setupCentralDb(): void {
-  const db = initTestDb();
+async function setupCentralDb(): Promise<void> {
+  await initTestDb();
+  const db = getRawDb();
   db.exec(`
     CREATE TABLE agent_groups (
       id TEXT PRIMARY KEY, name TEXT NOT NULL, folder TEXT NOT NULL UNIQUE,
@@ -55,7 +56,7 @@ function setupCentralDb(): void {
 }
 
 function addGroup(id: string, name: string, folder: string, provider: string | null = null): void {
-  getDb()
+  getRawDb()
     .prepare(
       "INSERT INTO agent_groups (id, name, folder, agent_provider, created_at) VALUES (?, ?, ?, ?, datetime('now'))",
     )
@@ -63,7 +64,7 @@ function addGroup(id: string, name: string, folder: string, provider: string | n
 }
 
 function addMg(id: string, channelType: string, platformId: string, name: string): void {
-  getDb()
+  getRawDb()
     .prepare(
       "INSERT INTO messaging_groups (id, channel_type, platform_id, name, created_at) VALUES (?, ?, ?, ?, datetime('now'))",
     )
@@ -76,7 +77,7 @@ function addSession(
   messagingGroupId: string | null,
   threadId: string | null = null,
 ): void {
-  getDb()
+  getRawDb()
     .prepare(
       "INSERT INTO sessions (id, agent_group_id, messaging_group_id, thread_id, status, created_at) VALUES (?, ?, ?, ?, 'active', datetime('now'))",
     )
@@ -149,10 +150,10 @@ function opts(): ScheduledAssemblyOptions {
   return { dataDir: TEST_DIR, nowMs: NOW };
 }
 
-beforeEach(() => {
+beforeEach(async () => {
   if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
   fs.mkdirSync(TEST_DIR, { recursive: true });
-  setupCentralDb();
+  await setupCentralDb();
   invalidateScheduledCache();
   // Drop any single-flight promise a sibling test file left behind — vitest can
   // schedule files into the same worker, and a leaked in-flight assembly would
@@ -160,12 +161,12 @@ beforeEach(() => {
   _resetAssemblyInFlightForTesting();
 });
 
-afterEach(() => {
+afterEach(async () => {
   // Reset shared singletons on the way out too — leave nothing for the next
   // file to inherit (hermetic regardless of order).
   invalidateScheduledCache();
   _resetAssemblyInFlightForTesting();
-  closeDb();
+  await closeDb();
   vi.restoreAllMocks();
   if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
 });

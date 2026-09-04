@@ -1,4 +1,4 @@
-import { getDb } from '../../db/connection.js';
+import { getRawDb } from '../../db/connection.js';
 
 export type SteerTargetType = 'task' | 'session';
 
@@ -45,7 +45,7 @@ export function reserveIdempotency(
   text: string,
   requestHash: string,
 ): ReservedSteer {
-  const db = getDb();
+  const db = getRawDb();
 
   const existing = db
     .prepare(
@@ -124,7 +124,7 @@ export function reserveIdempotency(
 }
 
 export function applyIdempotency(userId: string, idempotencyKey: string, response: SteerResponse): void {
-  getDb()
+  getRawDb()
     .prepare(
       `UPDATE steer_idempotency
        SET status = 'applied', applied_at = @applied_at, cached_response = @cached_response
@@ -140,7 +140,7 @@ export function applyIdempotency(userId: string, idempotencyKey: string, respons
 }
 
 export function markEchoAttempted(idempotencyRowId: number): void {
-  getDb().prepare('UPDATE steer_idempotency SET echo_attempted = 1 WHERE id = ?').run(idempotencyRowId);
+  getRawDb().prepare('UPDATE steer_idempotency SET echo_attempted = 1 WHERE id = ?').run(idempotencyRowId);
 }
 
 /**
@@ -154,7 +154,7 @@ export function markEchoAttempted(idempotencyRowId: number): void {
  * messages. Post-build QA fix SF-1.
  */
 export function claimEchoAttempted(idempotencyRowId: number): boolean {
-  const result = getDb()
+  const result = getRawDb()
     .prepare('UPDATE steer_idempotency SET echo_attempted = 1 WHERE id = ? AND echo_attempted = 0')
     .run(idempotencyRowId);
   return result.changes > 0;

@@ -23,7 +23,7 @@ import { DATA_DIR, GROUPS_DIR } from '../../config.js';
 import { getAgentGroup } from '../../db/agent-groups.js';
 import { getWorkgroupOnecliSecrets } from '../../db/agent-groups.js';
 import { getMessagingGroup } from '../../db/messaging-groups.js';
-import { getDb } from '../../db/connection.js';
+import { getRawDb } from '../../db/connection.js';
 import { findSystemSession, taskThreadId, withQuietInvalidationSync } from '../../db/sessions.js';
 import { readSessionInbound, type ScheduledTaskRow } from '../../modules/mailbox/index.js';
 import { withExistingMailboxSession } from '../../session-manager.js';
@@ -163,7 +163,7 @@ export { computeSecretDelta };
  * isn't authorized for.
  */
 function isWired(agentGroupId: string, messagingGroupId: string): boolean {
-  const row = getDb()
+  const row = getRawDb()
     .prepare('SELECT 1 AS ok FROM messaging_group_agents WHERE agent_group_id = ? AND messaging_group_id = ?')
     .get(agentGroupId, messagingGroupId) as { ok: number } | undefined;
   return !!row;
@@ -470,7 +470,7 @@ export const moveExecuteHandler: AuthHandler = async (req, params, ctx) => {
 
   const wasPaused = snapshot.status === 'paused';
   const correlationId = randomUUID();
-  const central = getDb();
+  const central = getRawDb();
 
   // Step 2b: durable move_intent BEFORE cancel (F2). Full snapshot in
   // detail_json; correlation_id links the recovery.

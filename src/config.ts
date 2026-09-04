@@ -66,6 +66,7 @@ export const SENDER_ALLOWLIST_PATH = path.join(HOME_DIR, '.config', 'nanoclaw', 
 export const STORE_DIR = path.resolve(PROJECT_ROOT, 'store');
 export const GROUPS_DIR = path.resolve(PROJECT_ROOT, 'groups');
 export const DATA_DIR = path.resolve(PROJECT_ROOT, 'data');
+export const CENTRAL_DB_PATH = path.join(DATA_DIR, 'v2.db');
 export const REPO_ROOT = PROJECT_ROOT;
 
 // Feature flag: when '1', workgroup members share a dedicated

@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { closeDb, initTestDb, getDb } from '../db/connection.js';
+import { closeDb, initTestDb, getRawDb } from '../db/connection.js';
 import { observatoryNudgeHandler, _resetNudgeDedupeForTesting } from './nudge.js';
 import type { AuthedRequestContext } from './router.js';
 
@@ -57,10 +57,11 @@ const claimsAre = (claims: object[]): void => {
   mockReadClaims.mockReturnValue(claims as never);
 };
 
-beforeEach(() => {
+beforeEach(async () => {
   vi.clearAllMocks();
   _resetNudgeDedupeForTesting();
-  const db = initTestDb();
+  await initTestDb();
+  const db = getRawDb();
   // Only the tables nudge touches — same pattern as assign.test.ts.
   db.exec(`
     CREATE TABLE workgroups (id TEXT PRIMARY KEY, created_at TEXT NOT NULL);
@@ -89,8 +90,8 @@ beforeEach(() => {
   mockDispatch.mockResolvedValue({ id: 'x', ok: true, data: { series_id: 'push-obs-7-ab12' } });
 });
 
-afterEach(() => {
-  closeDb();
+afterEach(async () => {
+  await closeDb();
 });
 
 const nudge = (userId = OWNER, body: object = { workgroupId: 'wg-1', claimSlug: CLAIM.slug, agentGroupId: 'ag-1' }) =>
@@ -157,7 +158,7 @@ describe('observatoryNudgeHandler', () => {
 
   it('falls back to the user id when the pusher has no display name', async () => {
     claimsAre([CLAIM]);
-    getDb().prepare(`INSERT INTO user_roles (user_id, role, agent_group_id) VALUES ('u-noname','owner',NULL)`).run();
+    getRawDb().prepare(`INSERT INTO user_roles (user_id, role, agent_group_id) VALUES ('u-noname','owner',NULL)`).run();
     expect((await nudge('u-noname'))!.status).toBe(200);
     const prompt = mockDispatch.mock.calls[0]![0].args.prompt as string;
     expect(prompt.startsWith('Pushed forward by u-noname via the Observatory —')).toBe(true);
@@ -214,7 +215,7 @@ describe('observatoryNudgeHandler', () => {
 
   it('rejects an agent group outside the workgroup', async () => {
     claimsAre([CLAIM]);
-    getDb().prepare("INSERT INTO agent_groups VALUES ('ag-x','other','other','claude',NULL,datetime('now'))").run();
+    getRawDb().prepare("INSERT INTO agent_groups VALUES ('ag-x','other','other','claude',NULL,datetime('now'))").run();
     const res = (await nudge(OWNER, { workgroupId: 'wg-1', claimSlug: CLAIM.slug, agentGroupId: 'ag-x' }))!;
     expect(res.status).toBe(404);
   });

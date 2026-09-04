@@ -27,7 +27,7 @@
  */
 import { EnvHttpProxyAgent, fetch as undiciFetch, type Dispatcher } from 'undici';
 
-import { getDb } from '../db/connection.js';
+import { getRawDb } from '../db/connection.js';
 import { log } from '../log.js';
 import { readSessionInbound, readSessionOutbound, type MessageTailRow } from '../modules/mailbox/index.js';
 import {
@@ -332,7 +332,7 @@ function pickCandidates(cap: number): CandidateRow[] {
   // empties next tick, starving every real session forever. Prioritizing
   // recently-active untitled sessions titles the visible inbox cards first; the
   // empty-skip stamp in the loop below drains the rest of the shells.
-  const rows = getDb()
+  const rows = getRawDb()
     .prepare(
       `SELECT id, agent_group_id, title, title_generated_at, title_basis_seq
          FROM sessions
@@ -432,7 +432,7 @@ function readSessionSlice(agentGroupId: string, sessionId: string): SliceResult 
 }
 
 function persistTitle(sessionId: string, title: string, basisSeq: number, generatedAt: string): void {
-  getDb()
+  getRawDb()
     .prepare(
       `UPDATE sessions
           SET title = ?,
@@ -458,7 +458,7 @@ function persistTitle(sessionId: string, title: string, basisSeq: number, genera
  */
 function stampFailureBackoff(sessionId: string): void {
   const stamp = new Date(Date.now() - (COOLDOWN_HOURS * 60 - FAILURE_BACKOFF_MINUTES) * 60_000).toISOString();
-  getDb().prepare(`UPDATE sessions SET title_generated_at = ? WHERE id = ?`).run(stamp, sessionId);
+  getRawDb().prepare(`UPDATE sessions SET title_generated_at = ? WHERE id = ?`).run(stamp, sessionId);
 }
 
 /**

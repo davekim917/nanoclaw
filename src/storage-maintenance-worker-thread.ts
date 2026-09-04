@@ -40,12 +40,18 @@ type StorageWorkerRequest =
 const port = parentPort;
 if (!port) throw new Error('Storage maintenance worker requires a parent port');
 
-initDb((workerData as StorageWorkerData).dbPath);
+await initDb((workerData as StorageWorkerData).dbPath);
 
 port.on('message', (message: StorageWorkerRequest) => {
   try {
     if (message.command === 'close') {
-      closeDb();
+      // `void`, not `await`: this listener must stay synchronous (an async
+      // listener would report success before the close ran, and is a
+      // no-misused-promises error). `closeDb()` runs `SqliteDriver.close()`,
+      // whose body reaches `raw.close()` synchronously whenever no driver
+      // transaction is open — and this worker opens none — so the handle is
+      // shut before `postMessage`, exactly as before the driver landed.
+      void closeDb();
       port.postMessage({ id: message.id, ok: true });
       port.close();
       return;
@@ -72,4 +78,8 @@ port.on('message', (message: StorageWorkerRequest) => {
   }
 });
 
-process.once('exit', closeDb);
+// Same reasoning as the 'close' command: an exit handler cannot await, and
+// `closeDb()` closes the raw handle synchronously when no transaction is open.
+process.once('exit', () => {
+  void closeDb();
+});

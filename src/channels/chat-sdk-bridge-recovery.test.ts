@@ -7,7 +7,7 @@ vi.mock('../webhook-server.js', async (importOriginal) => ({
   registerWebhookAdapter: vi.fn(),
 }));
 
-import { closeDb, getDb, initTestDb, runMigrations } from '../db/index.js';
+import { closeDb, getRawDb, initTestDb, runMigrations } from '../db/index.js';
 import { createPendingApproval } from '../db/sessions.js';
 import type { ChannelSetup } from './adapter.js';
 import { createChatSdkBridge, handleForwardedEvent, RecoveryIngressGate } from './chat-sdk-bridge.js';
@@ -58,8 +58,9 @@ function message(options: {
   } as unknown as ChatMessage;
 }
 
-beforeEach(() => {
-  const db = initTestDb();
+beforeEach(async () => {
+  await initTestDb();
+  const db = getRawDb();
   runMigrations(db);
 });
 
@@ -68,16 +69,16 @@ afterEach(() => closeDb());
 describe('Chat SDK bridge missed-message recovery', () => {
   it('persists the pre-restart cursor as a gap before platform initialization can emit live traffic', async () => {
     const oldCursor = '2026-07-21T18:00:00.000Z';
-    getDb()
+    getRawDb()
       .prepare('INSERT INTO chat_sdk_kv (key, value, expires_at) VALUES (?, ?, NULL)')
       .run('nanoclaw:recovery-cursor:stub', JSON.stringify(oldCursor));
     let gapDuringInitialize: string | undefined;
     const adapter = {
       name: 'stub',
       initialize: async () => {
-        const row = getDb().prepare("SELECT value FROM chat_sdk_kv WHERE key = 'nanoclaw:recovery-gap:stub'").get() as
-          | { value: string }
-          | undefined;
+        const row = getRawDb()
+          .prepare("SELECT value FROM chat_sdk_kv WHERE key = 'nanoclaw:recovery-gap:stub'")
+          .get() as { value: string } | undefined;
         gapDuringInitialize = row ? (JSON.parse(row.value) as string) : undefined;
       },
       channelIdFromThreadId: () => 'stub:C',
@@ -93,7 +94,7 @@ describe('Chat SDK bridge missed-message recovery', () => {
     } as ChannelSetup);
 
     expect(gapDuringInitialize).toBe(oldCursor);
-    const cursor = getDb()
+    const cursor = getRawDb()
       .prepare("SELECT value FROM chat_sdk_kv WHERE key = 'nanoclaw:recovery-cursor:stub'")
       .get() as { value: string };
     expect(JSON.parse(cursor.value)).toBe(oldCursor);
@@ -440,7 +441,7 @@ describe('Chat SDK bridge missed-message recovery', () => {
       }),
     ).resolves.toMatchObject({ failedTargets: 1 });
     expect(
-      getDb().prepare("SELECT value FROM chat_sdk_kv WHERE key = 'nanoclaw:recovery-gap:stub'").get(),
+      getRawDb().prepare("SELECT value FROM chat_sdk_kv WHERE key = 'nanoclaw:recovery-gap:stub'").get(),
     ).toBeDefined();
 
     await expect(
@@ -452,7 +453,7 @@ describe('Chat SDK bridge missed-message recovery', () => {
     ).resolves.toMatchObject({ failedTargets: 0, recoveredMessages: 1 });
     expect(inbound).toEqual(['missed']);
     expect(
-      getDb().prepare("SELECT value FROM chat_sdk_kv WHERE key = 'nanoclaw:recovery-gap:stub'").get(),
+      getRawDb().prepare("SELECT value FROM chat_sdk_kv WHERE key = 'nanoclaw:recovery-gap:stub'").get(),
     ).toBeUndefined();
   });
 });
@@ -577,7 +578,8 @@ describe('Chat SDK bridge dead-target registry', () => {
   const classify = (err: unknown) =>
     err instanceof Error && err.message.includes('channel_not_found') ? ('permanent' as const) : ('transient' as const);
   const readKv = (key: string): string | undefined =>
-    (getDb().prepare('SELECT value FROM chat_sdk_kv WHERE key = ?').get(key) as { value: string } | undefined)?.value;
+    (getRawDb().prepare('SELECT value FROM chat_sdk_kv WHERE key = ?').get(key) as { value: string } | undefined)
+      ?.value;
 
   it('parks a permanently-failing target, completes the pass, and skips it next pass', async () => {
     const fetchMessages = vi.fn(async () => {
@@ -643,7 +645,7 @@ describe('Chat SDK bridge dead-target registry', () => {
 
   it('re-probes an expired dead entry and clears it on success', async () => {
     const expired = { 'stub:C-expired-key': { until: '2020-01-01T00:00:00.000Z', error: 'channel_not_found' } };
-    getDb()
+    getRawDb()
       .prepare('INSERT INTO chat_sdk_kv (key, value, expires_at) VALUES (?, ?, NULL)')
       .run('nanoclaw:recovery-dead:stub', JSON.stringify(JSON.stringify(expired)));
     const fetchMessages = vi.fn(async () => ({ messages: [] }));

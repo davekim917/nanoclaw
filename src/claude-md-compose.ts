@@ -32,7 +32,7 @@ import path from 'path';
 
 import { GROUPS_DIR } from './config.js';
 import { readContainerConfig, validateMcpServers, type McpServerConfig } from './container-config.js';
-import { getDb } from './db/connection.js';
+import { getRawDb } from './db/connection.js';
 import { getContainerConfig } from './db/container-configs.js';
 import { flattenClaudeMd } from './agents-md-flatten.js';
 import { CODEX_PROJECT_DOC_CONFIGURED_MAX_BYTES, warnIfOversized } from './codex-project-doc-cap.js';
@@ -74,7 +74,7 @@ const COMPOSED_HEADER =
 function personaSymlinkRoots(group: AgentGroup, groupDir: string): string[] {
   if (!group.workgroup_id) return [groupDir];
   try {
-    const siblings = getDb()
+    const siblings = getRawDb()
       .prepare(`SELECT folder FROM agent_groups WHERE workgroup_id = ?`)
       .all(group.workgroup_id) as Array<{ folder: string }>;
     return [groupDir, ...siblings.map((s) => path.resolve(GROUPS_DIR, s.folder))];

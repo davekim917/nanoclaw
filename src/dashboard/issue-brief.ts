@@ -12,7 +12,7 @@
  * parse as a github.com issue/PR path — the browser can pick which item,
  * never which host gets called.
  */
-import { getDb } from '../db/index.js';
+import { getRawDb } from '../db/index.js';
 import { log } from '../log.js';
 import { readReleaseState } from './api/observatory.js';
 import type { AuthHandler } from './router.js';
@@ -46,7 +46,7 @@ export function _resetIssueBriefCacheForTesting(): void {
 
 /** Mirror of capabilities.ts resolveScopedEnvVar — deliberate duplication, same as there. */
 function githubTokenFor(workgroupId: string): string | null {
-  const folders = getDb().prepare('SELECT folder FROM agent_groups WHERE workgroup_id = ?').all(workgroupId) as {
+  const folders = getRawDb().prepare('SELECT folder FROM agent_groups WHERE workgroup_id = ?').all(workgroupId) as {
     folder: string;
   }[];
   for (const { folder } of folders) {

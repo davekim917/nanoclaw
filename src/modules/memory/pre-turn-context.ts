@@ -3,7 +3,7 @@ import path from 'path';
 import { createHash } from 'crypto';
 
 import { buildSessionServicesSnapshot, type SessionServicesSnapshot } from '../../capabilities.js';
-import { getDb } from '../../db/connection.js';
+import { getRawDb } from '../../db/connection.js';
 import { log } from '../../log.js';
 import {
   queryArchiveExactLinks,
@@ -307,7 +307,7 @@ function extractSenderId(normalizedContent: string): string | null {
  * channelType as "no verified namespace for this conversation" and skips
  * stripping/prefixing rather than throwing.
  */
-function lookupChannelType(db: ReturnType<typeof getDb>, messagingGroupId: string | null): string | null {
+function lookupChannelType(db: ReturnType<typeof getRawDb>, messagingGroupId: string | null): string | null {
   if (!messagingGroupId) return null;
   try {
     const row = db.prepare('SELECT channel_type FROM messaging_groups WHERE id = ?').get(messagingGroupId) as
@@ -1847,7 +1847,7 @@ export function buildPreTurnContext(input: PreTurnContextInput): PreTurnContext 
   // otherwise make meaningless per line.
   const tokenStatsBefore = { ...TOKEN_STREAM_CACHE_STATS };
   const offsetStatsBefore = { ...OFFSET_SLICE_STATS };
-  const db = getDb();
+  const db = getRawDb();
   const scope = db
     .prepare(
       `SELECT s.agent_group_id, s.messaging_group_id, s.thread_id, a.workgroup_id

@@ -16,7 +16,7 @@ import {
   TASKS_SYSTEM_THREAD_ID,
 } from './db/sessions.js';
 import { getAgentGroup } from './db/agent-groups.js';
-import { getDb, hasTable } from './db/connection.js';
+import { getRawDb, hasTableRaw } from './db/connection.js';
 import {
   getTaskThreadAnchor,
   setTaskThreadAnchor,
@@ -579,7 +579,7 @@ async function drainSession(session: Session): Promise<DrainOutcome> {
   // "progress" makes the no-progress timer mean what it says.
   if (isSpawnChildSession(session.id)) {
     try {
-      getDb()
+      getRawDb()
         .prepare(`UPDATE tasks SET last_progress_at = ? WHERE child_session_id = ?`)
         .run(new Date().toISOString(), session.id);
     } catch (err) {
@@ -918,7 +918,7 @@ async function deliverMessage(
   // `agent_destinations` table won't exist and `routeAgentMessage`'s permission
   // check will throw, which falls into the normal retry → mark-failed path.
   if (msg.channel_type === 'agent') {
-    if (!hasTable(getDb(), 'agent_destinations')) {
+    if (!hasTableRaw(getRawDb(), 'agent_destinations')) {
       throw new Error(`agent-to-agent module not installed — cannot route message ${msg.id}`);
     }
     const { routeAgentMessage } = await import('./modules/agent-to-agent/agent-route.js');
@@ -962,8 +962,8 @@ async function deliverMessage(
     // doesn't exist and we permit all non-origin channel sends (the
     // origin-chat case is always allowed regardless). Inlined SQL instead
     // of importing `hasDestination` so core doesn't depend on the module.
-    if (!isOriginChat && hasTable(getDb(), 'agent_destinations')) {
-      const row = getDb()
+    if (!isOriginChat && hasTableRaw(getRawDb(), 'agent_destinations')) {
+      const row = getRawDb()
         .prepare(
           'SELECT 1 FROM agent_destinations WHERE agent_group_id = ? AND target_type = ? AND target_id = ? LIMIT 1',
         )
@@ -1143,7 +1143,7 @@ async function deliverMessage(
   // Guarded: without the interactive module, `pending_questions` doesn't
   // exist and we skip persistence — the card still delivers to the user,
   // but the response path has nowhere to land and will log unclaimed.
-  if (content.type === 'ask_question' && content.questionId && hasTable(getDb(), 'pending_questions')) {
+  if (content.type === 'ask_question' && content.questionId && hasTableRaw(getRawDb(), 'pending_questions')) {
     const title = content.title as string | undefined;
     const rawOptions = content.options as unknown;
     if (!title || !Array.isArray(rawOptions)) {

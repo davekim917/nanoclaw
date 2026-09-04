@@ -18,7 +18,7 @@ import {
 } from './container-config.js';
 import { TIMEZONE } from './config.js';
 import { createAgentGroup } from './db/agent-groups.js';
-import { closeDb, initTestDb } from './db/connection.js';
+import { closeDb, initTestDb, getRawDb } from './db/connection.js';
 import { ensureContainerConfig, getContainerConfig, updateContainerConfigScalars } from './db/container-configs.js';
 import { runMigrations } from './db/migrations/index.js';
 import type { AgentGroup } from './types.js';
@@ -231,13 +231,14 @@ const TZ_GROUP: AgentGroup = {
 };
 
 describe('resolveGroupTimezone', () => {
-  beforeEach(() => {
-    runMigrations(initTestDb());
+  beforeEach(async () => {
+    await initTestDb();
+    runMigrations(getRawDb());
     createAgentGroup(TZ_GROUP);
     ensureContainerConfig(TZ_GROUP.id);
   });
-  afterEach(() => {
-    closeDb();
+  afterEach(async () => {
+    await closeDb();
   });
 
   it('returns the install-global timezone when no override is set', () => {

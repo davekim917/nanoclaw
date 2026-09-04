@@ -2,7 +2,7 @@ import fs from 'fs';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { initTestDb, closeDb, runMigrations } from '../../db/index.js';
-import { getDb } from '../../db/connection.js';
+import { getRawDb } from '../../db/connection.js';
 import { createAgentGroup } from '../../db/agent-groups.js';
 import { createMessagingGroup } from '../../db/messaging-groups.js';
 import { createSession, getSession } from '../../db/sessions.js';
@@ -113,10 +113,11 @@ async function runDestructiveGate(label: string, requestId: string, command?: st
   );
 }
 
-beforeEach(() => {
+beforeEach(async () => {
   if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true, force: true });
   fs.mkdirSync(TEST_DIR, { recursive: true });
-  const db = initTestDb();
+  await initTestDb();
+  const db = getRawDb();
   runMigrations(db);
   seedSession();
   mocks.deliver.mockReset();
@@ -124,8 +125,8 @@ beforeEach(() => {
   mocks.wakeContainer.mockResolvedValue(undefined);
 });
 
-afterEach(() => {
-  closeDb();
+afterEach(async () => {
+  await closeDb();
   if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true, force: true });
 });
 
@@ -143,7 +144,7 @@ describe('bash destructive gate delivery', () => {
     expect(Array.from(content.title).length).toBeLessThanOrEqual(140);
     expect(content.title).toMatch(/…$/);
 
-    const pending = getDb()
+    const pending = getRawDb()
       .prepare('SELECT title, platform_message_id FROM pending_approvals WHERE request_id = ?')
       .get('gate-long-title') as { title: string; platform_message_id: string } | undefined;
     expect(pending?.title).toBe(content.title);
@@ -174,7 +175,7 @@ describe('bash destructive gate delivery', () => {
     expect(content.question).toContain('--target=module.production');
     expect(content.question).toContain('…[middle omitted; full command retained in the approval record]…');
 
-    const pending = getDb()
+    const pending = getRawDb()
       .prepare('SELECT payload FROM pending_approvals WHERE request_id = ?')
       .get('gate-long-command') as { payload: string } | undefined;
     expect(JSON.parse(pending!.payload).command).toBe(command);
@@ -189,7 +190,7 @@ describe('bash destructive gate delivery', () => {
     );
 
     const pendingCount = (
-      getDb()
+      getRawDb()
         .prepare('SELECT COUNT(*) AS count FROM pending_approvals WHERE request_id = ?')
         .get('gate-delivery-fail') as { count: number }
     ).count;

@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { closeDb, initTestDb, getDb } from '../db/connection.js';
+import { closeDb, initTestDb, getRawDb } from '../db/connection.js';
 import { runMigrations } from '../db/migrations/index.js';
 import { createAgentGroup } from '../db/agent-groups.js';
 import { observatoryIssueBriefHandler, _resetIssueBriefCacheForTesting } from './issue-brief.js';
@@ -41,10 +41,11 @@ function ghResponses(issue: unknown, comments: unknown): void {
 }
 
 describe('observatoryIssueBriefHandler', () => {
-  beforeEach(() => {
-    const db = initTestDb();
+  beforeEach(async () => {
+    await initTestDb();
+    const db = getRawDb();
     runMigrations(db);
-    getDb()
+    getRawDb()
       .prepare(`INSERT INTO workgroups (id, display_name, created_at) VALUES ('wg-1', 'Example', ?)`)
       .run(new Date().toISOString());
     createAgentGroup({
@@ -54,12 +55,12 @@ describe('observatoryIssueBriefHandler', () => {
       agent_provider: null,
       created_at: new Date().toISOString(),
     });
-    getDb().prepare(`UPDATE agent_groups SET workgroup_id = 'wg-1' WHERE id = 'ag-1'`).run();
+    getRawDb().prepare(`UPDATE agent_groups SET workgroup_id = 'wg-1' WHERE id = 'ag-1'`).run();
     vi.stubEnv('GITHUB_TOKEN_EXAMPLE_CO', 'tok-scoped');
     _resetIssueBriefCacheForTesting();
   });
-  afterEach(() => {
-    closeDb();
+  afterEach(async () => {
+    await closeDb();
     vi.unstubAllEnvs();
     vi.unstubAllGlobals();
     vi.clearAllMocks();

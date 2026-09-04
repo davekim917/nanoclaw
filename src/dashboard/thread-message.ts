@@ -54,7 +54,7 @@
  * precisely `claim.sh`'s exit-3 condition. `expiring` and `stale` are both
  * already takeable, and `parked` is explicitly free.
  */
-import { getDb } from '../db/index.js';
+import { getRawDb } from '../db/index.js';
 import { log } from '../log.js';
 import { resolveSession } from '../session-manager.js';
 import { readChannelDirectory, readClaimsByThread, threadChannelKey, wiredAgentsByChannel } from './api/threads.js';
@@ -114,7 +114,7 @@ interface ThreadAgent {
 
 /** Active sessions on this thread, with the identity a claim owner is matched against. */
 function agentsOnThread(threadId: string): ThreadAgent[] {
-  return getDb()
+  return getRawDb()
     .prepare(
       `SELECT s.id AS session_id, ag.id AS agent_group_id, ag.name AS name, ag.folder AS folder
          FROM sessions s
@@ -320,7 +320,7 @@ export async function sendThreadMessage(
 }
 
 function agentNameOf(agentGroupId: string): string {
-  const row = getDb().prepare('SELECT name FROM agent_groups WHERE id = ?').get(agentGroupId) as
+  const row = getRawDb().prepare('SELECT name FROM agent_groups WHERE id = ?').get(agentGroupId) as
     | { name: string }
     | undefined;
   return row?.name ?? agentGroupId;

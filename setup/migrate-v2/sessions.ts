@@ -26,7 +26,7 @@ import Database from 'better-sqlite3';
 // entrypoint loads the composition slot itself.
 import '../../src/mailbox/compose.js';
 import { DATA_DIR } from '../../src/config.js';
-import { initDb, closeDb } from '../../src/db/connection.js';
+import { initDb, closeDb, getRawDb } from '../../src/db/connection.js';
 import { getAllAgentGroups } from '../../src/db/agent-groups.js';
 import { getMessagingGroupsByAgentGroup } from '../../src/db/messaging-groups.js';
 import { runMigrations } from '../../src/db/migrations/index.js';
@@ -84,7 +84,8 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
-  const v2Db = initDb(v2DbPath);
+  await initDb(v2DbPath);
+  const v2Db = getRawDb();
   runMigrations(v2Db);
 
   const agentGroups = getAllAgentGroups();
@@ -185,7 +186,7 @@ async function main(): Promise<void> {
     }
   }
 
-  closeDb();
+  await closeDb();
 
   console.log(`OK:created=${sessionsCreated},reused=${sessionsReused},skipped=${sessionsSkipped},files=${filesCopied}`);
 }

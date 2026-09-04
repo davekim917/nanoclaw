@@ -42,7 +42,7 @@ import { getAgentMailbox } from './mailbox/index.js';
 import { sessionContextPath, writeSessionContext } from './session-manager.js';
 import { inboundDbPath } from './mailbox/sqlite/paths.js';
 import { buildContainerCodexConfig } from './providers/codex.js';
-import { closeDb, createAgentGroup, getDb, initTestDb, runMigrations } from './db/index.js';
+import { closeDb, createAgentGroup, getRawDb, initTestDb, runMigrations } from './db/index.js';
 import { ensureContainerConfig, updateContainerConfigScalars } from './db/container-configs.js';
 import { initGroupFilesystem } from './group-init.js';
 import { STANDING_INSTRUCTIONS_FILE, readGroupPersona } from './group-persona.js';
@@ -70,7 +70,7 @@ function session(id: string, agentGroupId: string): Session {
 // runs; buildMounts fail-closes (W3) on a NULL workgroup_id. Give the test group
 // a workgroup-of-1 (folder as its own workgroup) so the archive projection resolves.
 function withWorkgroup(ag: AgentGroup): void {
-  const db = getDb();
+  const db = getRawDb();
   db.prepare(
     `INSERT OR IGNORE INTO workgroups (id, display_name, onecli_secrets, mnemon_store_id, created_at)
      VALUES (?, ?, '[]', ?, datetime('now'))`,
@@ -79,7 +79,7 @@ function withWorkgroup(ag: AgentGroup): void {
 }
 
 function assignWorkgroup(ag: AgentGroup, workgroupId: string): void {
-  const db = getDb();
+  const db = getRawDb();
   db.prepare(
     `INSERT OR IGNORE INTO workgroups (id, display_name, onecli_secrets, mnemon_store_id, created_at)
      VALUES (?, ?, '[]', ?, datetime('now'))`,
@@ -105,15 +105,16 @@ function providerContribution(provider: string, ag: AgentGroup, sess: Session): 
   );
 }
 
-beforeEach(() => {
+beforeEach(async () => {
   vi.clearAllMocks();
   fs.rmSync(TEST_ROOT, { recursive: true, force: true });
   fs.mkdirSync(TEST_ROOT, { recursive: true });
-  runMigrations(initTestDb());
+  await initTestDb();
+  runMigrations(getRawDb());
 });
 
-afterEach(() => {
-  closeDb();
+afterEach(async () => {
+  await closeDb();
   fs.rmSync(TEST_ROOT, { recursive: true, force: true });
 });
 

@@ -3,7 +3,7 @@ import os from 'os';
 import path from 'path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { closeDb, initTestDb, getDb } from '../db/connection.js';
+import { closeDb, initTestDb, getRawDb } from '../db/connection.js';
 import { observatorySteerHandler, recordClaimThread, _resetSteerDedupeForTesting } from './observatory-steer.js';
 import type { AuthedRequestContext } from './router.js';
 
@@ -81,7 +81,7 @@ const claimsAre = (claims: object[]): void => void mockReadClaims.mockReturnValu
 
 let tmpRoot: string;
 
-beforeEach(() => {
+beforeEach(async () => {
   vi.clearAllMocks();
   _resetSteerDedupeForTesting();
   mockGetAdapter.mockReturnValue(undefined);
@@ -89,7 +89,8 @@ beforeEach(() => {
   tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'steer-claims-'));
   mockClaimsRoot.mockReturnValue(tmpRoot);
 
-  const db = initTestDb();
+  await initTestDb();
+  const db = getRawDb();
   db.exec(`
     CREATE TABLE workgroups (id TEXT PRIMARY KEY, created_at TEXT NOT NULL);
     CREATE TABLE agent_groups (
@@ -123,8 +124,8 @@ beforeEach(() => {
   mockDispatch.mockResolvedValue({ id: 'x', ok: true, data: { series_id: 'steer-ab12' } });
 });
 
-afterEach(() => {
-  closeDb();
+afterEach(async () => {
+  await closeDb();
   fs.rmSync(tmpRoot, { recursive: true, force: true });
 });
 
@@ -382,7 +383,7 @@ describe('observatorySteerHandler — release-board items', () => {
       return { postParent, createThread };
     };
     const rows = () =>
-      getDb().prepare('SELECT workgroup_id, item_id, thread_id, created_by FROM observatory_item_threads').all();
+      getRawDb().prepare('SELECT workgroup_id, item_id, thread_id, created_by FROM observatory_item_threads').all();
     const ship = (text: string) => steer(OWNER, { workgroupId: 'wg-1', itemId: 'XZ#912', agentGroupId: 'ag-1', text });
 
     it('records the thread the first steer opened, against the item and the operator', async () => {
@@ -433,7 +434,7 @@ describe('observatorySteerHandler — release-board items', () => {
 
     it('refuses to continue a recorded thread the agent is not wired to', async () => {
       threading();
-      getDb()
+      getRawDb()
         .prepare(
           `INSERT INTO observatory_item_threads VALUES ('wg-1', 'XZ#912', 'slack:C0OTHERROOM:9.9', '2026-08-18T00:00:00.000Z', '${OWNER}')`,
         )
@@ -446,7 +447,7 @@ describe('observatorySteerHandler — release-board items', () => {
 
     it("scopes the memory to the workgroup — another workgroup's XZ#912 is not this one", async () => {
       threading();
-      getDb()
+      getRawDb()
         .prepare(
           `INSERT INTO observatory_item_threads VALUES ('wg-other', 'XZ#912', 'slack:C0OTHERROOM:9.9', '2026-08-18T00:00:00.000Z', '${OWNER}')`,
         )

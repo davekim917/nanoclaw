@@ -1,7 +1,7 @@
 import { describe, expect, it, beforeEach, afterEach } from 'vitest';
 import Database from 'better-sqlite3';
 
-import { initTestDb, closeDb, runMigrations, createAgentGroup, getDb } from './index.js';
+import { initTestDb, closeDb, runMigrations, createAgentGroup, getRawDb } from './index.js';
 import { rollupSessionUsage, listUsageDaily, pruneOldTurnUsage, summarizeTurnUsage } from './usage.js';
 import { listTurnUsageSince } from '../modules/mailbox/ops/reads.js';
 
@@ -72,8 +72,9 @@ function insertTurn(
 }
 
 describe('rollupSessionUsage', () => {
-  beforeEach(() => {
-    const db = initTestDb();
+  beforeEach(async () => {
+    await initTestDb();
+    const db = getRawDb();
     runMigrations(db);
     createAgentGroup({
       id: GID,
@@ -196,8 +197,9 @@ function makeOutboundDbWithTurnMeta(): Database.Database {
 }
 
 describe('rollupSessionUsage — central turn_usage mirror', () => {
-  beforeEach(() => {
-    const db = initTestDb();
+  beforeEach(async () => {
+    await initTestDb();
+    const db = getRawDb();
     runMigrations(db);
     createAgentGroup({
       id: GID,
@@ -225,7 +227,7 @@ describe('rollupSessionUsage — central turn_usage mirror', () => {
     expect(daily).toHaveLength(1);
     expect(daily[0].turns).toBe(1);
 
-    const centralRows = getDb().prepare('SELECT * FROM turn_usage').all() as Array<Record<string, unknown>>;
+    const centralRows = getRawDb().prepare('SELECT * FROM turn_usage').all() as Array<Record<string, unknown>>;
     expect(centralRows).toHaveLength(1);
     expect(centralRows[0]).toMatchObject({
       session_id: 'sess-1',
@@ -264,14 +266,14 @@ describe('rollupSessionUsage — central turn_usage mirror', () => {
 
     expect(rollupSessionUsage(sessionOf(outDb), GID, SESSION_DIR)).toBe(2);
 
-    const centralRows = getDb().prepare('SELECT turn_id FROM turn_usage ORDER BY id ASC').all() as Array<{
+    const centralRows = getRawDb().prepare('SELECT turn_id FROM turn_usage ORDER BY id ASC').all() as Array<{
       turn_id: string | null;
     }>;
     expect(centralRows).toHaveLength(2);
     expect(centralRows[0].turn_id).toBe('shared-turn-id');
     expect(centralRows[1].turn_id).toBe('shared-turn-id');
 
-    const distinct = getDb().prepare('SELECT COUNT(DISTINCT turn_id) AS n FROM turn_usage').get() as { n: number };
+    const distinct = getRawDb().prepare('SELECT COUNT(DISTINCT turn_id) AS n FROM turn_usage').get() as { n: number };
     expect(distinct.n).toBe(1);
   });
 
@@ -282,7 +284,7 @@ describe('rollupSessionUsage — central turn_usage mirror', () => {
     expect(() => rollupSessionUsage(sessionOf(outDb), GID, SESSION_DIR)).not.toThrow();
     expect(rollupSessionUsage(sessionOf(outDb), GID, SESSION_DIR)).toBe(0); // watermark already advanced by the call above
 
-    const centralRows = getDb().prepare('SELECT * FROM turn_usage').all() as Array<Record<string, unknown>>;
+    const centralRows = getRawDb().prepare('SELECT * FROM turn_usage').all() as Array<Record<string, unknown>>;
     expect(centralRows).toHaveLength(1);
     expect(centralRows[0].steps).toBeNull();
     expect(centralRows[0].duration_ms).toBeNull();
@@ -301,14 +303,15 @@ describe('rollupSessionUsage — central turn_usage mirror', () => {
       )
       .run();
     rollupSessionUsage(sessionOf(outDb), GID, `${GID}/sess-xyz`);
-    const row = getDb().prepare('SELECT session_id FROM turn_usage').get() as { session_id: string };
+    const row = getRawDb().prepare('SELECT session_id FROM turn_usage').get() as { session_id: string };
     expect(row.session_id).toBe('sess-xyz');
   });
 });
 
 describe('listUsageDaily filters', () => {
-  beforeEach(() => {
-    const db = initTestDb();
+  beforeEach(async () => {
+    await initTestDb();
+    const db = getRawDb();
     runMigrations(db);
     createAgentGroup({
       id: GID,
@@ -345,14 +348,15 @@ describe('listUsageDaily filters', () => {
 });
 
 describe('pruneOldTurnUsage', () => {
-  beforeEach(() => {
-    const db = initTestDb();
+  beforeEach(async () => {
+    await initTestDb();
+    const db = getRawDb();
     runMigrations(db);
   });
   afterEach(() => closeDb());
 
   it('deletes central turn_usage rows older than 30 days, keeps recent ones', () => {
-    const db = getDb();
+    const db = getRawDb();
     const old = new Date(Date.now() - 31 * 86_400_000).toISOString();
     const recent = new Date(Date.now() - 1 * 86_400_000).toISOString();
     db.prepare(
@@ -370,16 +374,17 @@ describe('pruneOldTurnUsage', () => {
     expect(remaining[0].ts).toBe(recent);
   });
 
-  it('never throws — returns 0 rather than crashing the sweep', () => {
-    closeDb(); // no DB initialized — getDb() would throw inside
+  it('never throws — returns 0 rather than crashing the sweep', async () => {
+    await closeDb(); // no DB initialized — getRawDb() would throw inside
     expect(() => pruneOldTurnUsage()).not.toThrow();
     expect(pruneOldTurnUsage()).toBe(0);
   });
 });
 
 describe('summarizeTurnUsage', () => {
-  beforeEach(() => {
-    const db = initTestDb();
+  beforeEach(async () => {
+    await initTestDb();
+    const db = getRawDb();
     runMigrations(db);
   });
   afterEach(() => closeDb());
@@ -398,7 +403,7 @@ describe('summarizeTurnUsage', () => {
     cacheWrite?: number;
     cost?: number;
   }): void {
-    getDb()
+    getRawDb()
       .prepare(
         `INSERT INTO turn_usage (ts, session_id, agent_group_id, provider, model, turn_id, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cost_usd)
          VALUES (@ts, @session, @group, @provider, @model, @turn_id, @input, @output, @cache_read, @cache_write, @cost)`,

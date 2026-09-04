@@ -18,7 +18,7 @@ import fs from 'fs';
 
 import { DATA_DIR, TIMEZONE } from '../../config.js';
 import { resolveGroupTimezone } from '../../container-config.js';
-import { getDb } from '../../db/connection.js';
+import { getRawDb } from '../../db/connection.js';
 import { getSession, QuietInvalidationError, withQuietInvalidationSync } from '../../db/sessions.js';
 import {
   readSessionInbound,
@@ -486,7 +486,7 @@ export const editHandler: AuthHandler = async (req, params, ctx) => {
   if ('refused' in outcome) return outcome.refused;
   if (outcome.touched === 0) return json({ error: 'stale_key', reason: 'stale_key' }, 409);
 
-  writeAudit(getDb(), {
+  writeAudit(getRawDb(), {
     actor: ctx.user.id,
     action: 'edit',
     agentGroupId: t.agentGroupId,
@@ -522,7 +522,7 @@ export const pauseHandler: AuthHandler = async (_req, params, ctx) => {
   if ('refused' in outcome) return outcome.refused;
   if (outcome.touched === 0) return json({ error: 'stale_key', reason: 'stale_key' }, 409);
 
-  writeAudit(getDb(), {
+  writeAudit(getRawDb(), {
     actor: ctx.user.id,
     action: 'pause',
     agentGroupId: t.agentGroupId,
@@ -562,7 +562,7 @@ export const resumeHandler: AuthHandler = async (_req, params, ctx) => {
   if ('refused' in outcome) return outcome.refused;
   if (outcome.touched === 0) return json({ error: 'stale_key', reason: 'stale_key' }, 409);
 
-  writeAudit(getDb(), {
+  writeAudit(getRawDb(), {
     actor: ctx.user.id,
     action: 'resume',
     agentGroupId: t.agentGroupId,
@@ -648,7 +648,7 @@ export const runNowHandler: AuthHandler = async (req, params, ctx) => {
     void wakeContainer(session).catch((err) => log.warn('scheduled-mutations: run-now wake failed', { err }));
   }
 
-  writeAudit(getDb(), {
+  writeAudit(getRawDb(), {
     actor: ctx.user.id,
     action: 'run_now',
     agentGroupId: t.agentGroupId,
@@ -698,7 +698,7 @@ export const cancelHandler: AuthHandler = async (_req, params, ctx) => {
   // touched 0 → nothing live AND no terminal recurrence to clear → stale key.
   if (touched === 0) return json({ error: 'stale_key', reason: 'stale_key' }, 409);
 
-  writeAudit(getDb(), {
+  writeAudit(getRawDb(), {
     actor: ctx.user.id,
     action: 'cancel',
     agentGroupId: decoded.agentGroupId,

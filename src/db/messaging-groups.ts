@@ -14,12 +14,12 @@ import {
   getDestinationByTarget,
   normalizeName,
 } from '../modules/agent-to-agent/db/agent-destinations.js';
-import { getDb, hasTable } from './connection.js';
+import { getRawDb, hasTableRaw } from './connection.js';
 
 // ── Messaging Groups ──
 
 export function createMessagingGroup(group: MessagingGroup): void {
-  getDb()
+  getRawDb()
     .prepare(
       `INSERT INTO messaging_groups (id, channel_type, platform_id, instance, name, is_group, unknown_sender_policy, created_at)
        VALUES (@id, @channel_type, @platform_id, @instance, @name, @is_group, @unknown_sender_policy, @created_at)`,
@@ -28,7 +28,7 @@ export function createMessagingGroup(group: MessagingGroup): void {
 }
 
 export function getMessagingGroup(id: string): MessagingGroup | undefined {
-  return getDb().prepare('SELECT * FROM messaging_groups WHERE id = ?').get(id) as MessagingGroup | undefined;
+  return getRawDb().prepare('SELECT * FROM messaging_groups WHERE id = ?').get(id) as MessagingGroup | undefined;
 }
 
 /**
@@ -47,11 +47,11 @@ export function getMessagingGroupByPlatform(
   instance?: string,
 ): MessagingGroup | undefined {
   if (instance !== undefined) {
-    return getDb()
+    return getRawDb()
       .prepare('SELECT * FROM messaging_groups WHERE channel_type = ? AND platform_id = ? AND instance = ?')
       .get(channelType, platformId, instance) as MessagingGroup | undefined;
   }
-  return getDb()
+  return getRawDb()
     .prepare(
       `SELECT * FROM messaging_groups
         WHERE channel_type = ? AND platform_id = ?
@@ -86,7 +86,7 @@ export function getMessagingGroupWithAgentCount(
   platformId: string,
   instance: string = channelType,
 ): { mg: MessagingGroup; agentCount: number } | null {
-  const row = getDb()
+  const row = getRawDb()
     .prepare(
       `SELECT mg.*, COUNT(mga.id) AS agent_count
          FROM messaging_groups mg
@@ -101,7 +101,7 @@ export function getMessagingGroupWithAgentCount(
 }
 
 export function getAllMessagingGroups(): MessagingGroup[] {
-  return getDb().prepare('SELECT * FROM messaging_groups ORDER BY name').all() as MessagingGroup[];
+  return getRawDb().prepare('SELECT * FROM messaging_groups ORDER BY name').all() as MessagingGroup[];
 }
 
 /**
@@ -111,7 +111,9 @@ export function getAllMessagingGroups(): MessagingGroup[] {
  * a single instance's rows, filter on `mg.instance`.
  */
 export function getMessagingGroupsByChannel(channelType: string): MessagingGroup[] {
-  return getDb().prepare('SELECT * FROM messaging_groups WHERE channel_type = ?').all(channelType) as MessagingGroup[];
+  return getRawDb()
+    .prepare('SELECT * FROM messaging_groups WHERE channel_type = ?')
+    .all(channelType) as MessagingGroup[];
 }
 
 /**
@@ -203,13 +205,13 @@ export function updateMessagingGroup(id: string, updates: MessagingGroupUpdates)
   }
   if (fields.length === 0) return;
 
-  getDb()
+  getRawDb()
     .prepare(`UPDATE messaging_groups SET ${fields.join(', ')} WHERE id = @id`)
     .run(values);
 }
 
 export function deleteMessagingGroup(id: string): void {
-  getDb().prepare('DELETE FROM messaging_groups WHERE id = ?').run(id);
+  getRawDb().prepare('DELETE FROM messaging_groups WHERE id = ?').run(id);
 }
 
 /**
@@ -223,7 +225,7 @@ export function deleteMessagingGroup(id: string): void {
  * admin command).
  */
 export function setMessagingGroupDeniedAt(id: string, deniedAt: string | null): void {
-  getDb().prepare('UPDATE messaging_groups SET denied_at = ? WHERE id = ?').run(deniedAt, id);
+  getRawDb().prepare('UPDATE messaging_groups SET denied_at = ? WHERE id = ?').run(deniedAt, id);
 }
 
 // ── Messaging Group Agents ──
@@ -248,7 +250,7 @@ export function assertSameWorkgroupWiring(messagingGroupId: string, agentGroupId
   // This row-level invariant is intentional and unconditional — fan-out on
   // one wiring row never spans workgroups, with or without
   // NANOCLAW_THREAD_WORKTREES: the workgroup is the data-pool boundary.
-  const row = getDb()
+  const row = getRawDb()
     .prepare(
       `SELECT ag.id AS agent_group_id, COALESCE(ag.workgroup_id, ag.folder) AS wg
          FROM messaging_group_agents mga
@@ -283,7 +285,7 @@ export function assertSameWorkgroupWiring(messagingGroupId: string, agentGroupId
 export function createMessagingGroupAgent(mga: MessagingGroupAgent): void {
   // Immediate transaction so guard + insert are atomic against a concurrent
   // wiring from another process (codex phase-A review P2).
-  getDb()
+  getRawDb()
     .transaction(() => {
       assertSameWorkgroupWiring(mga.messaging_group_id, mga.agent_group_id);
       insertMessagingGroupAgentRow(mga);
@@ -294,7 +296,7 @@ export function createMessagingGroupAgent(mga: MessagingGroupAgent): void {
 }
 
 function insertMessagingGroupAgentRow(mga: MessagingGroupAgent): void {
-  getDb()
+  getRawDb()
     .prepare(
       `INSERT INTO messaging_group_agents (
          id, messaging_group_id, agent_group_id,
@@ -340,7 +342,7 @@ export function ensureAgentDestinationForWiring(mga: MessagingGroupAgent): void 
   // Guarded: when the agent-to-agent module isn't installed the table
   // doesn't exist — skip silently. Without the module, the ACL check in
   // delivery is also skipped (same guard), so channel sends still work.
-  if (!hasTable(getDb(), 'agent_destinations')) return;
+  if (!hasTableRaw(getRawDb(), 'agent_destinations')) return;
 
   const existing = getDestinationByTarget(mga.agent_group_id, 'channel', mga.messaging_group_id);
   if (existing) return;
@@ -380,7 +382,7 @@ export function getMessagingGroupAgents(messagingGroupId: string): MessagingGrou
   //     unrelated conversations.
   //
   // Schema CREATE TABLE defaults need a separate migration to match.
-  return getDb()
+  return getRawDb()
     .prepare(
       `SELECT
          id, messaging_group_id, agent_group_id,
@@ -404,7 +406,7 @@ export function getMessagingGroupAgentByPair(
   messagingGroupId: string,
   agentGroupId: string,
 ): MessagingGroupAgent | undefined {
-  return getDb()
+  return getRawDb()
     .prepare('SELECT * FROM messaging_group_agents WHERE messaging_group_id = ? AND agent_group_id = ?')
     .get(messagingGroupId, agentGroupId) as MessagingGroupAgent | undefined;
 }
@@ -448,7 +450,7 @@ export interface ChannelPeer {
 }
 
 export function getChannelPeers(messagingGroupId: string, agentGroupId: string): ChannelPeer[] {
-  const db = getDb();
+  const db = getRawDb();
   const cols = db.prepare(`PRAGMA table_info(agent_groups)`).all() as Array<{ name: string }>;
   const hasWorkgroupId = cols.some((c) => c.name === 'workgroup_id');
   // Workgroup-scoped query (post-migration-036). The self-side workgroup is
@@ -494,7 +496,7 @@ export function getChannelPeers(messagingGroupId: string, agentGroupId: string):
 }
 
 export function getMessagingGroupAgent(id: string): MessagingGroupAgent | undefined {
-  return getDb().prepare('SELECT * FROM messaging_group_agents WHERE id = ?').get(id) as
+  return getRawDb().prepare('SELECT * FROM messaging_group_agents WHERE id = ?').get(id) as
     | MessagingGroupAgent
     | undefined;
 }
@@ -527,18 +529,18 @@ export function updateMessagingGroupAgent(
   }
   if (fields.length === 0) return;
 
-  getDb()
+  getRawDb()
     .prepare(`UPDATE messaging_group_agents SET ${fields.join(', ')} WHERE id = @id`)
     .run(values);
 }
 
 export function deleteMessagingGroupAgent(id: string): void {
-  getDb().prepare('DELETE FROM messaging_group_agents WHERE id = ?').run(id);
+  getRawDb().prepare('DELETE FROM messaging_group_agents WHERE id = ?').run(id);
 }
 
 /** Get all messaging groups wired to an agent group (reverse lookup). */
 export function getMessagingGroupsByAgentGroup(agentGroupId: string): MessagingGroup[] {
-  return getDb()
+  return getRawDb()
     .prepare(
       `SELECT mg.* FROM messaging_groups mg
        JOIN messaging_group_agents mga ON mga.messaging_group_id = mg.id
@@ -556,7 +558,7 @@ export function getMessagingGroupsByAgentGroup(agentGroupId: string): MessagingG
  * before any wiring); callers must handle that case.
  */
 export function getPrimaryMessagingGroupByAgentGroup(agentGroupId: string): MessagingGroup | null {
-  const row = getDb()
+  const row = getRawDb()
     .prepare(
       `SELECT mg.* FROM messaging_groups mg
        JOIN messaging_group_agents mga ON mga.messaging_group_id = mg.id

@@ -26,7 +26,7 @@
  * {@link liveContainerState}). Everything else on the row comes from one
  * central-DB query plus a `statSync` per session.
  */
-import { getDb } from '../../db/connection.js';
+import { getRawDb } from '../../db/connection.js';
 import { getContainerConfig, resolveProviderName } from '../../db/container-configs.js';
 import { TASKS_SYSTEM_THREAD_ID } from '../../db/sessions.js';
 import { readSessionOutbound, type ContainerState } from '../../modules/mailbox/index.js';
@@ -682,7 +682,7 @@ function selectScopedSessions(
             ) t ON t.child_session_id = s.id AND t.rn = 1
      WHERE ${conditions.join(' AND ')}
   `;
-  return getDb()
+  return getRawDb()
     .prepare(sql)
     .all(...(values as [])) as ThreadSessionRow[];
 }
@@ -707,7 +707,7 @@ export function readChannelDirectory(): ChannelDirectory {
   const byId = new Map<string, string>();
   const dmDedupeKey = new Map<string, string>();
   try {
-    const rows = getDb().prepare('SELECT id, platform_id, name FROM messaging_groups').all() as {
+    const rows = getRawDb().prepare('SELECT id, platform_id, name FROM messaging_groups').all() as {
       id: string;
       platform_id: string;
       name: string | null;
@@ -745,7 +745,7 @@ export function readChannelDirectory(): ChannelDirectory {
   // that needs the fallback today (zero name collisions among the uncovered
   // rows), so it is left out rather than built speculatively.
   try {
-    const dmRows = getDb()
+    const dmRows = getRawDb()
       .prepare(
         `SELECT mg.platform_id AS platform_id, ud.channel_type AS channel_type, ud.user_id AS user_id,
                 u.display_name AS display_name
@@ -810,7 +810,7 @@ export function wiredAgentsByChannel(): Map<string, WiredAgent[]> {
   const byChannel = new Map<string, WiredAgent[]>();
   let rows: (WiredAgent & { platform_id: string })[];
   try {
-    rows = getDb()
+    rows = getRawDb()
       .prepare(
         // `session_mode` is per WIRING (messaging_group_agents), not per
         // channel, and the COALESCE default is `per-thread` — the operational
@@ -961,7 +961,7 @@ async function resolveIdentities(
   const agentIds = [...new Set([...wanted.values()].map((p) => p.agentGroupId))];
   const groups = new Map(
     (
-      getDb()
+      getRawDb()
         .prepare(`SELECT * FROM agent_groups WHERE id IN (${agentIds.map(() => '?').join(', ')})`)
         .all(...agentIds) as AgentGroup[]
     ).map((g) => [g.id, g]),
@@ -972,7 +972,7 @@ async function resolveIdentities(
   // ~20 round trips here.
   const avatars = new Map<string, string | null>();
   try {
-    const rows = getDb()
+    const rows = getRawDb()
       .prepare(
         `SELECT mga.agent_group_id AS agent_group_id, mg.channel_type AS channel_type
            FROM messaging_group_agents mga
@@ -1039,7 +1039,7 @@ export function readClaimsByThread(agentGroupIds: string[], now: number, claimsR
   let workgroupIds: string[];
   try {
     workgroupIds = (
-      getDb()
+      getRawDb()
         .prepare(
           `SELECT DISTINCT workgroup_id FROM agent_groups
             WHERE workgroup_id IS NOT NULL AND id IN (${agentGroupIds.map(() => '?').join(', ')})`,
@@ -1094,7 +1094,7 @@ function readTaskThreadAnchors(sessionIds: string[]): Map<string, TaskAnchor> {
   if (sessionIds.length === 0) return bySession;
   let rows: { session_id: string; platform_id: string; created_at: string }[];
   try {
-    rows = getDb()
+    rows = getRawDb()
       .prepare(
         `SELECT session_id, platform_id, created_at FROM task_thread_anchors
           WHERE session_id IN (${sessionIds.map(() => '?').join(', ')})`,
@@ -2037,7 +2037,7 @@ export async function buildThreadDetail(
   if (thread.session_ids.length === 0) return { thread, transcript: [] };
 
   const byName = new Map(thread.participants.map((p) => [p.agent_group_id, p.name]));
-  const rows = getDb()
+  const rows = getRawDb()
     .prepare(`SELECT id, agent_group_id FROM sessions WHERE id IN (${thread.session_ids.map(() => '?').join(', ')})`)
     .all(...thread.session_ids) as { id: string; agent_group_id: string }[];
 

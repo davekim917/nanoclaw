@@ -1,11 +1,12 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 
-import { getDb, initTestDb, closeDb } from './connection.js';
+import { getRawDb, initTestDb, closeDb } from './connection.js';
 import { getWorkgroupOnecliSecrets } from './agent-groups.js';
 
 describe('getWorkgroupOnecliSecrets', () => {
-  beforeEach(() => {
-    const db = initTestDb();
+  beforeEach(async () => {
+    await initTestDb();
+    const db = getRawDb();
     db.exec(`
       CREATE TABLE workgroups (
         id TEXT PRIMARY KEY,
@@ -52,7 +53,7 @@ describe('getWorkgroupOnecliSecrets', () => {
   });
 
   it('returns [] (not a throw) when onecli_secrets holds malformed JSON', () => {
-    getDb().prepare(`UPDATE workgroups SET onecli_secrets = ? WHERE id = ?`).run('{not json', 'wg-retail');
+    getRawDb().prepare(`UPDATE workgroups SET onecli_secrets = ? WHERE id = ?`).run('{not json', 'wg-retail');
     expect(getWorkgroupOnecliSecrets('ag-retail')).toEqual([]);
   });
 });
