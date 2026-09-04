@@ -78,7 +78,7 @@ interface Payload {
   findings: unknown[];
   sources?: Record<string, string>;
   repoRoot?: string;
-  commits?: { sha: string; date: string; message: string; files: string[] }[];
+  commits?: { sha: string; date: string; message: string; files: string[]; added?: string[] }[];
   worktree?: string[];
 }
 
@@ -394,15 +394,16 @@ describe('review-churn gate', () => {
 
   it('lifts on a trailer naming a primitive the commit declares, not only the classifier guess', () => {
     // The classifier's candidates are a ranking, not a fact. An author who
-    // moved the invariant somewhere else says so, with the diff behind it.
+    // moved the invariant somewhere else says so, and the commit's own added
+    // lines are what back the claim.
     const payload = fixture('toctou-class');
-    payload.sources = { ...payload.sources, 'src/guard.ts': 'export function guardEveryWrite() {}\n' };
     payload.commits = [
       {
         sha: 'kkk1111',
         date: AFTER,
         message: 'fix: one guard for every caller\n\nReframe: race enforced in guardEveryWrite\n',
         files: ['src/guard.ts'],
+        added: ['export function guardEveryWrite(session: Session) {'],
       },
     ];
     const { status, decision } = gate(payload);
@@ -410,18 +411,79 @@ describe('review-churn gate', () => {
     expect(decision.flagged[0].liftedBy).toBe('reframe trailer');
   });
 
+  it('lifts on a short primitive name, which is an ordinary name', () => {
+    const payload = fixture('toctou-class');
+    payload.commits = [
+      {
+        sha: 'mmm3333',
+        date: AFTER,
+        message: 'fix: one guard\n\nReframe: race enforced in run\n',
+        files: ['src/guard.ts'],
+        added: ['export function run(session: Session) {'],
+      },
+    ];
+    expect(gate(payload).status).toBe(0);
+  });
+
+  it('does not accept a declaration the commit merely touched the file of', () => {
+    // Otherwise a site patch edits that file for something unrelated, points
+    // its trailer at a helper that was already there, and the gate opens.
+    const payload = fixture('toctou-class');
+    payload.commits = [
+      {
+        sha: 'nnn4444',
+        date: AFTER,
+        message: 'chore: unrelated edit\n\nReframe: race enforced in guardEveryWrite\n',
+        files: ['src/guard.ts'],
+        added: ['  logger.debug("unrelated");'],
+      },
+    ];
+    expect(gate(payload).status).toBe(3);
+  });
+
   it('does not lift on a trailer naming something the commit never declares', () => {
     const payload = fixture('toctou-class');
-    payload.sources = { ...payload.sources, 'src/guard.ts': 'export function guardEveryWrite() {}\n' };
     payload.commits = [
       {
         sha: 'lll2222',
         date: AFTER,
         message: 'fix: claim without a diff\n\nReframe: race enforced in someOtherPlace\n',
         files: ['src/guard.ts'],
+        added: ['export function guardEveryWrite() {}'],
       },
     ];
     expect(gate(payload).status).toBe(3);
+  });
+
+  it('does not let one declared primitive clear two classes at once', () => {
+    // Both classes were reframed into the same new function, so the classifier
+    // seams no longer separate them. The trailer has to say which invariant it
+    // fixed, and it only clears that one.
+    const payload = fixture('shared-primitive');
+    payload.commits = [
+      {
+        sha: 'ooo5555',
+        date: AFTER,
+        message: 'fix: one guard\n\nReframe: race enforced in guardEveryWrite\n',
+        files: ['src/guard.ts'],
+        added: ['export function guardEveryWrite(session: Session) {'],
+      },
+    ];
+    const { status, decision } = gate(payload);
+    expect(status).toBe(3);
+    expect(decision.unlifted).toHaveLength(1);
+    expect(decision.unlifted[0].signature).toBe('inv:durability');
+  });
+
+  it('says so when a class at three rounds is reported rather than gated', () => {
+    // "no finding class has reached 3 rounds" would be false here, and these
+    // commands do not print the class table.
+    const { status, text } = gate(fixture('guessed-seam'));
+    expect(status).toBe(0);
+    expect(text).toContain('reported, not gated');
+    expect(text).toContain('inv:race @ src/db/messages-out.ts');
+    expect(text).toContain('3 rounds');
+    expect(text).not.toContain('no finding class has reached 3 rounds');
   });
 
   it('does not gate a class whose only shared import is a Node internal', () => {

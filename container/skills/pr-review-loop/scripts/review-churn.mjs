@@ -527,39 +527,10 @@ export const CLASS_ROUND_LIMIT = 3;
  */
 const REFRAME_TRAILER = /^\s*Reframe:\s*(.+?)\s+enforced in\s+(.+?)\s*$/gim;
 
-/**
- * Does the trailer name this entry's primitive?
- *
- * The classifier's candidates come first, but they are a ranking, not a fact:
- * it can name the wrong export of the right file, or the right file's neighbour.
- * So a trailer also counts when the commit DECLARES what it names — the author
- * saying "the invariant now lives here", with the diff to back it. That keeps
- * an honest reframe from being refused over the classifier's guess, and it is
- * not a free pass: the name has to be declared in a file the commit touched.
- */
-function primitiveNamed(entry, trailer, changedFiles, ctx) {
+/** Does the trailer name one of the classifier's candidates for this entry? */
+function primitiveNamed(entry, trailer) {
   if (entry.primitives.some((p) => trailer.primitive.includes(p))) return true;
-  if (entry.seam && trailer.primitive.includes(path.posix.basename(entry.seam).replace(/\.[jt]sx?$/, ''))) {
-    return true;
-  }
-  return declaredInChangedFiles(trailer.primitive, changedFiles, ctx);
-}
-
-/** Is any identifier the trailer names declared in a file the commit touched? */
-function declaredInChangedFiles(named, changedFiles, ctx) {
-  const identifiers = (named.match(/[A-Za-z_$][\w$]*/g) ?? []).filter((word) => word.length > 3);
-  if (identifiers.length === 0) return false;
-  for (const file of changedFiles) {
-    const source = readSource(file, ctx);
-    if (source == null) continue;
-    for (const id of identifiers) {
-      const declaration = new RegExp(
-        `\\b(?:function|class|const|let|var|interface|type|enum)\\s+${id}\\b|\\b${id}\\s*[:=]\\s*(?:async\\s*)?\\(`,
-      );
-      if (declaration.test(source)) return true;
-    }
-  }
-  return false;
+  return Boolean(entry.seam) && trailer.primitive.includes(path.posix.basename(entry.seam).replace(/\.[jt]sx?$/, ''));
 }
 
 /** Does the trailer name this entry's invariant? */
@@ -571,6 +542,44 @@ function invariantNamed(entry, trailer) {
   ].filter((t) => t && t.length > 3);
   if (tokens.length === 0) return true;
   return tokens.some((t) => said.includes(t.toLowerCase()));
+}
+
+/**
+ * Is an identifier the trailer names DECLARED BY this commit?
+ *
+ * The current contents of a touched file are not evidence: a site patch could
+ * edit a file for something unrelated and point its trailer at a helper that
+ * was already there. So this reads the commit's own added lines. Length is not
+ * a filter either — `run`, `tx` and `get` are ordinary primitive names, and a
+ * short name still has to appear in a declaration the commit introduced.
+ */
+function declaredByCommit(named, commit, ctx) {
+  const identifiers = named.match(/[A-Za-z_$][\w$]*/g) ?? [];
+  if (identifiers.length === 0) return false;
+  const added = addedLines(commit, ctx);
+  if (added.length === 0) return false;
+  return identifiers.some((id) => {
+    const declaration = new RegExp(
+      `\\b(?:function|class|const|let|var|interface|type|enum)\\s+${id}\\b|\\b${id}\\s*[:=]\\s*(?:async\\s*)?\\(`,
+    );
+    return added.some((line) => declaration.test(line));
+  });
+}
+
+/** The `+` side of a commit's diff. Supplied by the payload in tests. */
+function addedLines(commit, ctx) {
+  if (Array.isArray(commit.added)) return commit.added;
+  if (!ctx.repoRoot || !commit.sha) return [];
+  if (!ctx.addedCache) ctx.addedCache = new Map();
+  const cached = ctx.addedCache.get(commit.sha);
+  if (cached) return cached;
+  const diff = git(ctx.repoRoot, ['show', '--unified=0', '--format=', commit.sha]);
+  const lines = diff
+    .split('\n')
+    .filter((line) => line.startsWith('+') && !line.startsWith('+++'))
+    .map((line) => line.slice(1));
+  ctx.addedCache.set(commit.sha, lines);
+  return lines;
 }
 
 function touches(changedFiles, seam, seamInRepo) {
@@ -594,10 +603,12 @@ function instant(value) {
   return Number.isNaN(t) ? null : t;
 }
 
-function reframeTrailers(messages) {
+function reframeTrailers(commits) {
   const out = [];
-  for (const msg of messages) {
-    for (const m of (msg ?? '').matchAll(REFRAME_TRAILER)) out.push({ invariant: m[1], primitive: m[2] });
+  for (const commit of commits) {
+    for (const m of (commit.message ?? '').matchAll(REFRAME_TRAILER)) {
+      out.push({ invariant: m[1], primitive: m[2], commit });
+    }
   }
   return out;
 }
@@ -660,7 +671,7 @@ export function decideGate(payload, options = {}) {
       return since === null || at === null || at >= since;
     });
     const changed = [...worktree, ...recent.flatMap((c) => c.files ?? [])];
-    const trailers = reframeTrailers(recent.map((c) => c.message ?? ''));
+    const trailers = reframeTrailers(recent);
     // A trailer naming only the primitive is enough while that primitive
     // belongs to one flagged class. When two flagged classes share it —
     // a race AND a durability defect at the same write — one trailer would
@@ -670,9 +681,18 @@ export function decideGate(payload, options = {}) {
         other !== entry &&
         ((entry.seam && other.seam === entry.seam) || other.primitives.some((p) => entry.primitives.includes(p))),
     );
-    const named = trailers.filter(
-      (t) => primitiveNamed(entry, t, changed, ctx) && (!shared || invariantNamed(entry, t)),
-    );
+    const named = trailers.filter((t) => {
+      const byCandidate = primitiveNamed(entry, t);
+      // The classifier's candidates are a ranking, not a fact, so a trailer
+      // also counts when its commit DECLARES the primitive it names. That is
+      // the stronger claim — the author overruling the classifier — so it
+      // always names the invariant too: without that, one trailer naming a
+      // newly declared primitive would clear every flagged class at once,
+      // whatever the classifier had guessed their seams to be.
+      const byDeclaration = !byCandidate && declaredByCommit(t.primitive, t.commit, ctx);
+      if (byDeclaration) return invariantNamed(entry, t);
+      return byCandidate && (!shared || invariantNamed(entry, t));
+    });
     const touched = touches(changed, entry.seam, entry.seamInRepo);
     return {
       ...entry,
@@ -681,11 +701,33 @@ export function decideGate(payload, options = {}) {
     };
   });
 
+  // Classes at the limit that are NOT gated, because their seam is a guess.
+  // They are the "reported" half of the rule and must appear in the output: a
+  // gate that prints "no finding class has reached 3 rounds" while the table
+  // holds one is telling the operator something false.
+  const reported = [
+    ...report.classes.filter((c) => c.rounds >= CLASS_ROUND_LIMIT && !(c.seam && c.seamSubstantiated)),
+    ...report.seams.filter(
+      (s) =>
+        s.rounds >= CLASS_ROUND_LIMIT &&
+        !s.severityFalling &&
+        !s.seamSubstantiated &&
+        !report.classes.some((c) => c.seam === s.seam && c.rounds >= CLASS_ROUND_LIMIT),
+    ),
+  ].map((row) => ({
+    key: row.key ?? `seam ${row.seam}`,
+    rounds: row.rounds,
+    seam: row.seam ?? null,
+    reason: row.seam
+      ? 'the seam is a guess: one flagged file, and the findings name nothing it exports'
+      : 'the sites share no seam',
+  }));
+
   const unlifted = decided.filter((e) => !e.lifted);
   const allow =
     options.allowSitePatch ?? (Boolean(payload.allowSitePatch) || process.env.REVIEW_LOOP_ALLOW_SITE_PATCH === '1');
   const status = unlifted.length === 0 ? 'pass' : allow ? 'override' : 'refuse';
-  return { status, flagged: decided, unlifted, report };
+  return { status, flagged: decided, unlifted, reported, report };
 }
 
 // ── rendering ───────────────────────────────────────────────────────────────
@@ -718,11 +760,16 @@ function renderClasses(report) {
 
 function renderGate(decision) {
   const bar = '='.repeat(70);
+  const reportedLines = (decision.reported ?? []).map(
+    (r) => `  reported, not gated: ${r.key} — ${r.rounds} rounds; ${r.reason}`,
+  );
   if (decision.status === 'pass') {
     const n = decision.flagged.length;
-    return n === 0
-      ? 'review-loop gate: ok — no finding class has reached 3 rounds.'
-      : `review-loop gate: ok — ${n} flagged class(es), each already reframed at the primitive.`;
+    const head =
+      n === 0
+        ? 'review-loop gate: ok — no finding class is gated.'
+        : `review-loop gate: ok — ${n} flagged class(es), each already reframed at the primitive.`;
+    return [head, ...reportedLines].join('\n');
   }
   const lines = [
     bar,
@@ -751,6 +798,7 @@ function renderGate(decision) {
     lines.push('');
     lines.push('Escape hatch (loud, recorded in the PR body): REVIEW_LOOP_ALLOW_SITE_PATCH=1');
   }
+  lines.push(...reportedLines);
   lines.push(bar);
   return lines.join('\n');
 }
