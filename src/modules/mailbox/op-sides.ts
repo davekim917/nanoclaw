@@ -41,6 +41,63 @@ export interface OpSides {
   outbound: Set<string>;
 }
 
+/**
+ * Blank out comments, leaving everything else at its original offset.
+ *
+ * Load-bearing, not tidiness. `splitEntries` cuts on top-level commas and
+ * `objectLiteralBody` counts braces, and BOTH are fooled by prose: one comma
+ * in a doc comment between two entries makes the splitter start the next chunk
+ * mid-sentence, the `key:` regex fails to match, and that op is dropped from
+ * the map entirely. A dropped op is not a loud failure — `computeOpSides`
+ * fails closed to "inbound", so the outbound-only ratchet rule silently stops
+ * covering it. That is exactly what happened when PR 6's `outboundPresent`
+ * comment landed above `readDoneProposal` in `composeOutboundOps`: the rule's
+ * own string fixture went red while a real-tree scan stayed green.
+ *
+ * Characters are replaced with spaces rather than removed so brace and comma
+ * positions elsewhere are untouched. String and template literals are tracked
+ * so a `//` inside one is never mistaken for a comment.
+ */
+function blankComments(source: string): string {
+  const out = source.split('');
+  let i = 0;
+  while (i < source.length) {
+    const c = source[i];
+    const next = source[i + 1];
+    if (c === '"' || c === "'" || c === '`') {
+      const quote = c;
+      i++;
+      while (i < source.length) {
+        if (source[i] === '\\') {
+          i += 2;
+          continue;
+        }
+        if (source[i] === quote) {
+          i++;
+          break;
+        }
+        i++;
+      }
+      continue;
+    }
+    if (c === '/' && next === '/') {
+      while (i < source.length && source[i] !== '\n') out[i++] = ' ';
+      continue;
+    }
+    if (c === '/' && next === '*') {
+      const end = source.indexOf('*/', i + 2);
+      const stop = end === -1 ? source.length : end + 2;
+      while (i < stop) {
+        if (source[i] !== '\n') out[i] = ' ';
+        i++;
+      }
+      continue;
+    }
+    i++;
+  }
+  return out.join('');
+}
+
 /** Split the top-level `key: value` entries of one object literal. */
 function splitEntries(body: string): Array<{ key: string; value: string }> {
   const out: Array<{ key: string; value: string }> = [];
@@ -64,7 +121,8 @@ function splitEntries(body: string): Array<{ key: string; value: string }> {
 }
 
 /** The object literal a named function returns, as source text. */
-function objectLiteralBody(source: string, fnName: string): string {
+function objectLiteralBody(rawSource: string, fnName: string): string {
+  const source = blankComments(rawSource);
   const fnAt = source.search(new RegExp(`function\\s+${fnName}\\s*\\(`));
   if (fnAt === -1) throw new Error(`op-sides: ${fnName} not found — the composition moved`);
   const returnAt = source.indexOf('return {', fnAt);
