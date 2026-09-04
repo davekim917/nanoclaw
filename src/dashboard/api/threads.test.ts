@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import http from 'http';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -8,7 +8,11 @@ import { closeDb, initTestDb, runMigrations, createAgentGroup, getDb } from '../
 import { ATTENTION_ITEM_PREFIX, ATTENTION_MEMO_TTL_MS, clearAttentionMemo } from '../../attention-sources.js';
 import { ASSIGN_DEDUPE_MS } from '../db/item-assignments.js';
 import type { AuthedRequestContext } from '../router.js';
-import type { ContainerState } from '../../db/session-db.js';
+import Database from 'better-sqlite3';
+
+import { enforceHermeticity } from '../../test-hermeticity.js';
+import { ensureSchema } from '../../modules/mailbox/schema.js';
+import { readSessionOutbound, type ContainerState } from '../../modules/mailbox/index.js';
 import type { SessionTranscriptEntry } from './sessions.js';
 import {
   buildThreadList,
@@ -16,6 +20,7 @@ import {
   deriveThreadState,
   isScheduledTaskThread,
   mergeThreadTranscript,
+  readContainerState,
   pickDoneProposal,
   replyTargetSessionId,
   threadChannelKey,
@@ -23,6 +28,35 @@ import {
   type ThreadListDeps,
   type ThreadStateInput,
 } from './threads.js';
+
+// DATA_DIR is redirected at a per-run temp root. The mailbox-seam block below
+// provisions a real session tree so the read-only seam's own path resolution is
+// exercised, and that tree must not be the running install's `data/` — these
+// tests create in it and recursively delete from it. Same redirect
+// host-sweep.test.ts and container-restart.test.ts use.
+const testDataDir = vi.hoisted(() => {
+  // `vi.hoisted` runs before this file's own imports, so the temp root has to
+  // be built with `require` — the established shape in the two suites above.
+  /* eslint-disable @typescript-eslint/no-require-imports */
+  const nodeFs = require('fs') as typeof import('fs');
+  const nodeOs = require('os') as typeof import('os');
+  const nodePath = require('path') as typeof import('path');
+  /* eslint-enable @typescript-eslint/no-require-imports */
+  return { dir: nodeFs.mkdtempSync(nodePath.join(nodeOs.tmpdir(), 'threads-data-')) };
+});
+vi.mock('../../config.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../config.js')>()),
+  get DATA_DIR() {
+    return testDataDir.dir;
+  },
+}));
+
+// Every seam this file touches is mocked or redirected, so it holds itself to
+// the strict tripwire rather than the repo's `warn` default (issue #305).
+enforceHermeticity();
+afterAll(() => {
+  fs.rmSync(testDataDir.dir, { recursive: true, force: true });
+});
 
 // container-runner drags in the whole spawn path (docker, mounts, onecli). The
 // thread list only wants two functions off it, and both are injectable or
@@ -2304,5 +2338,74 @@ describe('attention-source rows in the thread list', () => {
       const { threads } = await buildThreadList(makeCtx(), LIST_OPTS, attentionDeps(boardRoot([readyPr()])));
       expect(threads[0]!.attention_source!.assigned).toBeNull();
     });
+  });
+});
+
+// ── Mailbox seam (PR 6) ──────────────────────────────────────────────────────
+describe('mailbox seam', () => {
+  const seamGroup = `ag-seam-${process.pid}`;
+  const seamSession = `sess-seam-${process.pid}`;
+  const seamDir = path.join(testDataDir.dir, 'v2-sessions', seamGroup);
+
+  beforeEach(() => {
+    closeDb();
+    setupDb();
+  });
+
+  afterEach(() => {
+    fs.rmSync(seamDir, { recursive: true, force: true });
+  });
+
+  it('thread listing reads container state and outbound history through the seam', async () => {
+    const sessionDir = path.join(seamDir, seamSession);
+    fs.mkdirSync(sessionDir, { recursive: true });
+    const outbound = path.join(sessionDir, 'outbound.db');
+    ensureSchema(outbound, 'outbound');
+    const db = new Database(outbound);
+    db.prepare(
+      `INSERT INTO container_state (id, current_tool, tool_declared_timeout_ms, tool_started_at, updated_at)
+       VALUES (1, 'Bash', 600000, ?, ?)`,
+    ).run(iso(30_000), iso(30_000));
+    // Outbound history the same read-only session serves: what this session has
+    // said, and which inbound trigger each reply answered.
+    db.prepare(
+      "INSERT INTO messages_out (id, seq, in_reply_to, timestamp, kind, content) VALUES ('o1', 1, 'in-1', ?, 'chat', '{}')",
+    ).run(iso(20_000));
+    db.prepare(
+      "INSERT INTO messages_out (id, seq, in_reply_to, timestamp, kind, content) VALUES ('o2', 3, 'in-1', ?, 'chat', '{}')",
+    ).run(iso(10_000));
+    db.close();
+
+    // The probe reads container_state off the real production path — DATA_DIR
+    // resolution included — not an injected handle.
+    const state = readContainerState(seamGroup, seamSession);
+    expect(state?.current_tool).toBe('Bash');
+    expect(state?.tool_declared_timeout_ms).toBe(600_000);
+
+    // The same read-only session answers the outbound history question.
+    const replies = readSessionOutbound({ agentGroupId: seamGroup, sessionId: seamSession }, (mailbox) =>
+      mailbox.latestReplyTimestampByTrigger(),
+    );
+    expect(replies?.get('in-1')).toBe(iso(10_000));
+
+    // A session with no mailbox answers "nothing", and the read must not have
+    // created it — I-4: reads never provision.
+    const absentGroup = `${seamGroup}-absent`;
+    expect(readContainerState(absentGroup, seamSession)).toBeNull();
+    expect(fs.existsSync(path.join(testDataDir.dir, 'v2-sessions', absentGroup))).toBe(false);
+    // And nothing was written beside the outbound.db it did read.
+    expect(fs.readdirSync(sessionDir).sort()).toEqual(['outbound.db']);
+
+    // End to end: the list surfaces that state for a live container, using the
+    // real probe (no `containerState` dep override).
+    seedAgentGroup(seamGroup);
+    insertSession({ id: seamSession, agentGroupId: seamGroup, threadId: 'slack:CSEAM:1' });
+    const { threads } = await buildThreadList(makeCtx(), LIST_OPTS, {
+      ...deps({ activeContainerSessionIds: () => [seamSession] }),
+      containerState: undefined,
+      containerStatus: undefined,
+    });
+    const row = threads.find((t) => t.thread_id === 'slack:CSEAM:1');
+    expect(row?.current_tool).toBe('Bash');
   });
 });

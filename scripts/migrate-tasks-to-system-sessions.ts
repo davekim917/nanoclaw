@@ -49,7 +49,9 @@ import { initDb } from '../src/db/connection.js';
 import { getAgentGroup } from '../src/db/agent-groups.js';
 import { getActiveSessions, isTaskThread } from '../src/db/sessions.js';
 import { cancelSeriesWithStrandClear, deleteTask, insertTaskRow } from '../src/modules/scheduling/db.js';
-import { inboundDbPath, resolveTaskSession } from '../src/session-manager.js';
+import { sessionMailboxPath } from '../src/mailbox/sqlite/paths.js';
+import { readSessionInbound, type ScheduledTaskRow } from '../src/modules/mailbox/index.js';
+import { resolveTaskSession } from '../src/session-manager.js';
 
 initDb(path.join(DATA_DIR, 'v2.db'));
 
@@ -58,18 +60,17 @@ const APPLY = args.includes('--apply');
 const DELETE_JUNK = args.includes('--delete-junk');
 const seriesFilter = args.includes('--series') ? args[args.indexOf('--series') + 1] : null;
 
-interface LiveRow {
-  id: string;
-  series_id: string | null;
-  status: 'pending' | 'paused';
-  process_after: string | null;
-  recurrence: string | null;
-  content: string;
-  platform_id: string | null;
-  channel_type: string | null;
-  thread_id: string | null;
-}
+// Row shape is the mailbox module's — one definition of the scheduled-task row.
+type LiveRow = ScheduledTaskRow;
 
+/**
+ * A raw read-write handle. Still here because the row mutators this script
+ * drives (`insertTaskRow`, `cancelSeriesWithStrandClear`, `deleteTask` in
+ * src/modules/scheduling/db.ts) take a `Database` handle; they move onto the
+ * mailbox session in the scheduling batch of the seam series
+ * (docs/specs/upstream-mailbox-seam/plan.md §5 PR 4), and this opener goes
+ * with them. Every READ below already goes through the module.
+ */
 function openRw(path: string): Database.Database {
   const db = new Database(path);
   db.pragma('journal_mode = DELETE');
@@ -93,24 +94,18 @@ let duplicates = 0;
 
 for (const session of getActiveSessions()) {
   if (isTaskThread(session.thread_id)) continue; // already on the new model
-  const srcPath = inboundDbPath(session.agent_group_id, session.id);
-  if (!fs.existsSync(srcPath)) continue;
-
-  const src = new Database(srcPath, { readonly: true });
-  let rows: LiveRow[];
-  try {
-    rows = src
-      .prepare(
-        `SELECT id, series_id, status, process_after, recurrence, content,
-                platform_id, channel_type, thread_id
-           FROM messages_in
-          WHERE kind = 'task' AND status IN ('pending', 'paused')
-          ORDER BY seq DESC`,
-      )
-      .all() as LiveRow[];
-  } finally {
-    src.close();
-  }
+  const srcPath = sessionMailboxPath({ agentGroupId: session.agent_group_id, sessionId: session.id }, 'inbound');
+  // Read-only seam: a survey pass must never provision or migrate a session it
+  // is only reading. `undefined` is "no mailbox" — nothing to consolidate.
+  // 5s busy_timeout because this is an operator-run one-shot against a LIVE
+  // fleet: a session that is briefly busy must be waited for, not silently
+  // skipped and left un-consolidated.
+  const rows =
+    readSessionInbound(
+      { agentGroupId: session.agent_group_id, sessionId: session.id },
+      (mailbox) => mailbox.listLiveTaskRows(),
+      { busyTimeoutMs: 5000 },
+    ) ?? [];
   if (rows.length === 0) continue;
 
   // One live row per series — newest wins if a strand left more than one.
@@ -158,7 +153,7 @@ for (const session of getActiveSessions()) {
     }
 
     const { session: target } = resolveTaskSession(session.agent_group_id, seriesId);
-    const targetPath = inboundDbPath(session.agent_group_id, target.id);
+    const targetPath = sessionMailboxPath({ agentGroupId: session.agent_group_id, sessionId: target.id }, 'inbound');
     const targetDb = openRw(targetPath);
     try {
       const existing = targetDb

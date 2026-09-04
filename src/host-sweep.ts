@@ -44,6 +44,7 @@ import {
   SessionDbMissingError,
   SessionDbUnopenableError,
   sessionMailboxPath,
+  readSessionOutbound,
   type ForkContainerStateRow as ContainerState,
   type NanoclawMailboxSession,
 } from './modules/mailbox/index.js';
@@ -52,7 +53,7 @@ import { withExistingNanoclawSession } from './modules/mailbox/session.js';
 // DATA_DIR, so its session DBs are not addressable by a mailbox key and it
 // cannot go through the seam. It stays on the module's own open funnel — the
 // one place in this file that still opens a session DB by path.
-import { openInboundDb as openInboundDbByPath, openOutboundDb } from './modules/mailbox/openers.js';
+import { openInboundDb as openInboundDbByPath } from './modules/mailbox/openers.js';
 import { restoreTaskRow, type TaskRowSnapshot } from './modules/scheduling/db.js';
 import { countLiveRowsInSessions } from './modules/scheduling/live-count.js';
 import { runHostGatedTaskScripts } from './modules/scheduling/host-script.js';
@@ -2253,22 +2254,40 @@ async function sweepUsageRollup(sessions: readonly Session[]): Promise<void> {
       }
       if (shouldSkipUsageRollup(usageRollupMtimeCache.get(session.id), mtimeMs)) continue;
 
-      // Read through the module's own outbound funnel, NOT the mailbox
-      // session. This projection touches outbound.db only, and the seam's
-      // existence check is keyed on inbound.db — routing it through a session
-      // added a gate the pre-seam code never had, so a session whose
-      // inbound.db is gone while outbound.db remains stopped being rolled up
-      // at all, and its turn_usage rows would never reach the central totals.
-      // `outPath` above is already the gate that belongs here: no outbound
-      // file, no rollup. Same funnel `worktree-cleanup.ts` and the GC use, so
-      // there is still one implementation of every statement.
-      const outDb = openOutboundDb(outPath);
-      try {
-        rollupSessionUsage(outDb, session.agent_group_id, `${session.agent_group_id}/${session.id}`);
-      } finally {
-        outDb.close();
-      }
-      usageRollupMtimeCache.set(session.id, mtimeMs);
+      // Read through the module's own read-only outbound funnel, NOT the
+      // provisioning mailbox session. This projection touches outbound.db
+      // only, and the seam's existence check is keyed on inbound.db —
+      // routing it through a provisioning session added a gate the pre-seam
+      // code never had, so a session whose inbound.db is gone while
+      // outbound.db remains stopped being rolled up at all, and its
+      // turn_usage rows would never reach the central totals. `outPath`
+      // above is already the gate that belongs here: no outbound file, no
+      // rollup. `rollupSessionUsage` (mailbox seam PR 6) asks for only the
+      // one op it uses, `readSessionOutbound`'s read-only wrapper supplies
+      // it, and neither one provisions or writes.
+      //
+      // `recoverJournal: true` and the write path's 5s busy_timeout, not the
+      // defaults: the replaced `openOutboundDb` path recovered a hot journal
+      // and waited 5s, same as the dashboard's single-session reads
+      // (`steer.ts`, `repository-workspaces/index.ts`). Without it, a live
+      // session whose container crashed mid-write — outbound.db present with
+      // a hot journal, inbound.db gone — throws on every tick under the
+      // console's 1s fleet-fan-out default and never advances its watermark,
+      // so its turn_usage rows never reach the central ledger.
+      const rolledUp = readSessionOutbound(
+        { agentGroupId: session.agent_group_id, sessionId: session.id },
+        (mailbox) => {
+          rollupSessionUsage(mailbox, session.agent_group_id, `${session.agent_group_id}/${session.id}`);
+          return true;
+        },
+        { busyTimeoutMs: 5000, recoverJournal: true },
+      );
+      // Only a rollup that RAN may claim this mtime as processed. A session
+      // whose inbound.db is gone while outbound.db remains resolves undefined
+      // here, and marking it done would skip it on every later sweep for as
+      // long as the outbound file is untouched — its turn_usage rows would
+      // never reach the central totals.
+      if (rolledUp) usageRollupMtimeCache.set(session.id, mtimeMs);
     } catch (err) {
       log.warn('Usage rollup failed for session', { err, sessionId: session.id });
     }
@@ -2280,6 +2299,9 @@ async function sweepUsageRollup(sessions: readonly Session[]): Promise<void> {
     for (const id of usageRollupMtimeCache.keys()) if (!live.has(id)) usageRollupMtimeCache.delete(id);
   }
 }
+
+/** Test-only entry point for the usage-rollup sweep step. */
+export { sweepUsageRollup as _sweepUsageRollupForTesting };
 
 const DEFAULT_NO_PROGRESS_TIMEOUT_SEC = 1800;
 const DEFAULT_SPAWN_DEADLINE_SEC = 300;

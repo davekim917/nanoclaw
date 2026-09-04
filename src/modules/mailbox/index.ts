@@ -51,6 +51,7 @@ import {
   readSessionRouting,
   replaceDestinations,
   runInsertMessage,
+  setSessionRoutingSpawnTaskId,
   upsertSessionRouting,
   type DestinationRow,
   type MessageInsert,
@@ -77,6 +78,7 @@ import {
   type InboundRoutingAnchor,
   type RoutedTaskRow,
 } from './ops/lookups.js';
+import { listTurnUsageSince, type SessionTurnUsageRow } from './ops/reads.js';
 import {
   armNextTask,
   cancelSeriesWithStrandClear,
@@ -216,6 +218,23 @@ export {
 export { sessionMailboxDir, sessionMailboxPath } from '../../mailbox/sqlite/paths.js';
 
 /**
+ * Read-only session access for the operator surfaces (dashboard, Observatory,
+ * the dispatch watchdog). A console read must never provision, migrate or
+ * write a session it is only listing — see read-only.ts for why `session()` is
+ * the wrong funnel there.
+ */
+export {
+  readSessionInbound,
+  readSessionOutbound,
+  type InboundSessionRead,
+  type OutboundSessionRead,
+  type SessionReadLocation,
+  type SessionReadOptions,
+} from './read-only.js';
+export type { OutboundSystemRow, ScheduledTaskRow, SessionTurnUsageRow, TaskFireRow } from './ops/reads.js';
+export type { ContainerState, ProcessingClaim } from './ops/sweep.js';
+
+/**
  * `(mtime, size)` of a session's outbound.db for the delivery sweep's quiet
  * gate, or `null` when the file must not be armed off (absent, unreadable, or
  * mid-rollback). Path-level rather than a session op: the sweep needs the
@@ -311,6 +330,8 @@ export interface NanoclawMailboxSession extends MailboxSession {
     session_id?: string | null;
   }): void;
   readSessionRouting(): ForkSessionRouting | null;
+  /** Stamp the owning dispatched task without touching the chat routing columns. */
+  setSessionRoutingSpawnTaskId(taskId: string): void;
   /** Snake-case destination rows; upstream's `replaceDestinations` takes the record shape. */
   replaceDestinationRows(entries: DestinationRow[]): void;
   inboundHasMessage(messageId: string): boolean;
@@ -348,6 +369,12 @@ export interface NanoclawMailboxSession extends MailboxSession {
   syncProcessingAcks(): void;
   /** Raw snake_case claim rows; upstream's `getProcessingClaims` returns the record shape. */
   getProcessingClaimRows(): ProcessingClaim[];
+  /**
+   * Per-turn usage rows newer than the central watermark, oldest first.
+   * `[]` when the container never wrote the table — the normal case, not an
+   * error, so the caller never probes `sqlite_master` itself.
+   */
+  listTurnUsageSince(afterId: number): SessionTurnUsageRow[];
 
   // --- fork-only tasks ----------------------------------------------------
   // Upstream's task ops on `MailboxSession` are reused wherever the statement
@@ -815,6 +842,7 @@ function forkOps(
     nextEvenSeq: () => nextEvenSeq(inbound),
     upsertSessionRouting: (routing) => upsertSessionRouting(inbound, routing),
     readSessionRouting: () => readSessionRouting(inbound),
+    setSessionRoutingSpawnTaskId: (taskId) => setSessionRoutingSpawnTaskId(inbound, taskId),
     replaceDestinationRows: (entries) => replaceDestinations(inbound, entries),
     inboundHasMessage: (messageId) => inboundHasMessage(inbound, messageId),
 
@@ -832,6 +860,9 @@ function forkOps(
     expireStalePending: (maxAgeMs) => expireStalePending(inbound, maxAgeMs),
     getDueWakePriority: () => getDueWakePriority(inbound),
     syncProcessingAcks: () => readOutbound(undefined, (outbound) => syncProcessingAcks(inbound, outbound)),
+    // A never-woken session has no turn usage: empty is the honest answer here,
+    // not the opener's throw (the rollup runs over every session every tick).
+    listTurnUsageSince: (afterId) => readOutbound([], (outbound) => listTurnUsageSince(outbound, afterId)),
 
     insertTaskRow: (row) => insertTaskRow(inbound, row),
     resumeTask: (taskId) => resumeTask(inbound, taskId),

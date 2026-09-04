@@ -3,13 +3,51 @@
  * The decideTaskAction tests are pure (no DB required).
  * The pendingTerminalSpawnOutboundSeenAt tests use in-memory SQLite via mocked path resolution.
  */
+import { spawn } from 'child_process';
 import Database from 'better-sqlite3';
 import path from 'path';
 import fs from 'fs';
-import { describe, expect, it, afterEach, vi } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, afterEach, vi } from 'vitest';
 
+import { allowSubprocess, enforceHermeticity } from '../../test-hermeticity.js';
 import { decideTaskAction } from './watchdog.js';
 import type { Task } from './db/tasks.js';
+import * as mailboxIndex from '../mailbox/index.js';
+
+// DATA_DIR is redirected at a per-run temp root. The read-only seam resolves
+// `<DATA_DIR>/v2-sessions/<agent group>/<session>/outbound.db` and refuses
+// anything that resolves elsewhere, so the fixtures below have to live where a
+// real session does — but "where a real session does" must not be the running
+// install's own data tree, which these tests create in and recursively delete
+// from. Same redirect host-sweep.test.ts and container-restart.test.ts use.
+const testDataDir = vi.hoisted(() => {
+  // `vi.hoisted` runs before this file's own imports, so the temp root has to
+  // be built with `require` — the established shape in the two suites above.
+  /* eslint-disable @typescript-eslint/no-require-imports */
+  const nodeFs = require('fs') as typeof import('fs');
+  const nodeOs = require('os') as typeof import('os');
+  const nodePath = require('path') as typeof import('path');
+  /* eslint-enable @typescript-eslint/no-require-imports */
+  return { dir: nodeFs.mkdtempSync(nodePath.join(nodeOs.tmpdir(), 'watchdog-data-')) };
+});
+vi.mock('../../config.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../config.js')>()),
+  get DATA_DIR() {
+    return testDataDir.dir;
+  },
+}));
+
+// This file mocks or redirects every seam it touches, so it holds itself to the
+// strict tripwire rather than the repo's `warn` default (issue #305). The one
+// real escape it needs is the lock-holding child process below, declared by
+// name so the exemption is visible.
+enforceHermeticity();
+beforeAll(() => {
+  allowSubprocess([path.basename(process.execPath)]);
+});
+afterAll(() => {
+  fs.rmSync(testDataDir.dir, { recursive: true, force: true });
+});
 
 const BASE = Date.parse('2026-04-20T12:00:00.000Z');
 
@@ -277,20 +315,18 @@ describe('decideTaskAction', () => {
 });
 
 // ─── C2: pendingTerminalSpawnOutboundSeenAt ────────────────────────────────
-// Tests use real on-disk SQLite DBs in a temp directory, with vi.mock to
-// redirect outboundDbPath to the temp location.
+// Real on-disk SQLite DBs under a session tree rooted at the redirected
+// DATA_DIR above. The helper reads through the mailbox module's read-only seam
+// (PR 6), which resolves `<DATA_DIR>/v2-sessions/<agent group>/<session>/
+// outbound.db` and refuses anything that resolves elsewhere — so the fixture
+// has to live where a real session does, and a path mock would no longer be
+// exercising the real resolution at all. Redirecting DATA_DIR keeps that true
+// while putting the tree in a temp root. Agent-group ids carry the pid so
+// parallel suites cannot collide.
 
-const TEST_ROOT = uniqueTmpRoot('watchdog-test');
+const TEST_ROOT = path.join(testDataDir.dir, 'v2-sessions');
+const TEST_AG_PREFIX = `wd-${process.pid}-`;
 const tmpSessions: string[] = [];
-
-vi.mock('../../session-manager.js', async (importOriginal) => {
-  const real = await importOriginal<typeof import('../../session-manager.js')>();
-  return {
-    ...real,
-    outboundDbPath: (agentGroupId: string, sessionId: string) =>
-      path.join(TEST_ROOT, agentGroupId, sessionId, 'outbound.db'),
-  };
-});
 
 function makeTmpOutboundDb(agentGroupId: string, sessionId: string): Database.Database {
   const dir = path.join(TEST_ROOT, agentGroupId, sessionId);
@@ -327,7 +363,7 @@ afterEach(() => {
 describe('pendingTerminalSpawnOutboundSeenAt', () => {
   it('test_returns_null_no_pending: returns null when only chat messages exist', async () => {
     const { pendingTerminalSpawnOutboundSeenAt } = await import('./watchdog.js');
-    const agentGroupId = 'ag-null-test';
+    const agentGroupId = TEST_AG_PREFIX + 'null-test';
     const sessionId = 'sess-null-test';
     const db = makeTmpOutboundDb(agentGroupId, sessionId);
     db.prepare("INSERT INTO messages_out VALUES ('m1', 1, null, '2026-01-01T00:00:00.000Z', 'chat', ?)").run(
@@ -341,7 +377,7 @@ describe('pendingTerminalSpawnOutboundSeenAt', () => {
 
   it('test_returns_min_timestamp: returns earliest timestamp for multiple terminal rows', async () => {
     const { pendingTerminalSpawnOutboundSeenAt } = await import('./watchdog.js');
-    const agentGroupId = 'ag-min-test';
+    const agentGroupId = TEST_AG_PREFIX + 'min-test';
     const sessionId = 'sess-min-test';
     const db = makeTmpOutboundDb(agentGroupId, sessionId);
     db.prepare("INSERT INTO messages_out VALUES ('m1', 1, null, '2026-01-01T00:01:00.000Z', 'system', ?)").run(
@@ -361,7 +397,7 @@ describe('pendingTerminalSpawnOutboundSeenAt', () => {
 
   it('test_excludes_chat_messages_with_action_word: excludes non-system rows even with action text', async () => {
     const { pendingTerminalSpawnOutboundSeenAt } = await import('./watchdog.js');
-    const agentGroupId = 'ag-chat-test';
+    const agentGroupId = TEST_AG_PREFIX + 'chat-test';
     const sessionId = 'sess-chat-test';
     const db = makeTmpOutboundDb(agentGroupId, sessionId);
     // Chat message containing action text — kind='chat' guard must reject it
@@ -376,7 +412,7 @@ describe('pendingTerminalSpawnOutboundSeenAt', () => {
 
   it('test_excludes_false_positive_match: excludes system rows with action as superstring of spawn_complete', async () => {
     const { pendingTerminalSpawnOutboundSeenAt } = await import('./watchdog.js');
-    const agentGroupId = 'ag-fp-test';
+    const agentGroupId = TEST_AG_PREFIX + 'fp-test';
     const sessionId = 'sess-fp-test';
     const db = makeTmpOutboundDb(agentGroupId, sessionId);
     // "spawn_complete_other" contains "spawn_complete" as substring — must NOT match
@@ -398,7 +434,7 @@ describe('pendingTerminalSpawnOutboundSeenAt', () => {
 
   it('matches spawn_failed correctly', async () => {
     const { pendingTerminalSpawnOutboundSeenAt } = await import('./watchdog.js');
-    const agentGroupId = 'ag-failed-test';
+    const agentGroupId = TEST_AG_PREFIX + 'failed-test';
     const sessionId = 'sess-failed-test';
     const db = makeTmpOutboundDb(agentGroupId, sessionId);
     db.prepare("INSERT INTO messages_out VALUES ('m1', 1, null, '2026-01-01T00:05:00.000Z', 'system', ?)").run(
@@ -409,4 +445,103 @@ describe('pendingTerminalSpawnOutboundSeenAt', () => {
     const result = pendingTerminalSpawnOutboundSeenAt(agentGroupId, sessionId);
     expect(result).toBe('2026-01-01T00:05:00.000Z');
   });
+});
+
+// Codex P2 (thread PRRT_kwDORfvfVM6fE-8N): the pre-seam open
+// (`new Database(dbPath, { readonly: true })`, no `timeout` key) took
+// better-sqlite3's own default of 5000ms, not "none" — the seam's 1s
+// fleet-fan-out default was a real regression here, not a tolerant one. A
+// read that times out early answers null — "no terminal spawn seen" — which
+// bypasses the drain-first guard and can fail a task whose
+// spawn_complete/spawn_failed is still on its way in under lock contention.
+describe('pendingTerminalSpawnOutboundSeenAt busy_timeout', () => {
+  it('passes the write path busy_timeout (5s, no journal recovery) to readSessionOutbound', async () => {
+    const spy = vi.spyOn(mailboxIndex, 'readSessionOutbound').mockReturnValue(undefined);
+    const { pendingTerminalSpawnOutboundSeenAt } = await import('./watchdog.js');
+    pendingTerminalSpawnOutboundSeenAt('ag-wd-opts', 'sess-wd-opts');
+
+    expect(spy).toHaveBeenCalledTimes(1);
+    expect(spy.mock.calls[0]?.[0]).toEqual({ agentGroupId: 'ag-wd-opts', sessionId: 'sess-wd-opts' });
+    // No `recoverJournal`: the pre-seam open never recovered a hot journal
+    // either, so the fix restates that behavior exactly rather than widening
+    // it — only the timeout regressed.
+    expect(spy.mock.calls[0]?.[2]).toEqual({ busyTimeoutMs: 5000 });
+    spy.mockRestore();
+  });
+
+  // Deterministic, environment-independent proof the guard survives real lock
+  // contention: a separate PROCESS holds an EXCLUSIVE write transaction on
+  // outbound.db for longer than the seam's old 1s default but well inside the
+  // fixed 5s. better-sqlite3 is synchronous, so a same-process lock (e.g. a
+  // second connection plus a same-thread timer) can never interleave with the
+  // watchdog's own synchronous read — the read would simply block the one JS
+  // thread the "releasing" timer also needs. A child process is the only way
+  // to hold the lock concurrently with the parent's read.
+  it('reads through real lock contention that outlasts the old 1s default', async () => {
+    const agentGroupId = TEST_AG_PREFIX + 'lock-test';
+    const sessionId = 'sess-lock-test';
+    const db = makeTmpOutboundDb(agentGroupId, sessionId);
+    db.prepare("INSERT INTO messages_out VALUES ('m1', 1, null, '2026-01-01T00:05:00.000Z', 'system', ?)").run(
+      JSON.stringify({ action: 'spawn_complete', task_id: 'task-1' }),
+    );
+    db.close();
+    const dbPath = path.join(TEST_ROOT, agentGroupId, sessionId, 'outbound.db');
+
+    // Codex P2 (thread PRRT_kwDORfvfVM6fFQHh): a fixed delay before starting
+    // the parent read raced the child under load — the child might not have
+    // run BEGIN EXCLUSIVE yet, so the read would find the lock free, return
+    // instantly, and the elapsed-time assertion would fail spuriously (and
+    // throwing there skipped `holder.kill()`, leaking the child into
+    // teardown). The child now prints a line to stdout the instant it holds
+    // the lock, and the parent's read starts only once it has seen that line
+    // — no fixed timer, no race either direction.
+    //
+    // Holds an EXCLUSIVE transaction for ~1.5s (past the old 1s default,
+    // inside the fixed 5s) before committing and exiting.
+    const child = `
+      const Database = require('better-sqlite3');
+      const db = new Database(${JSON.stringify(dbPath)});
+      db.prepare('BEGIN EXCLUSIVE').run();
+      console.log('locked');
+      setTimeout(() => {
+        db.prepare('COMMIT').run();
+        db.close();
+        process.exit(0);
+      }, 1500);
+    `;
+    const holder = spawn(process.execPath, ['-e', child], { cwd: process.cwd(), stdio: ['ignore', 'pipe', 'ignore'] });
+
+    try {
+      await new Promise<void>((resolve, reject) => {
+        let buf = '';
+        holder.stdout!.on('data', (chunk: Buffer) => {
+          buf += chunk.toString();
+          if (buf.includes('locked')) resolve();
+        });
+        holder.once('exit', (code) => reject(new Error(`lock holder exited early (code ${code})`)));
+        holder.once('error', reject);
+      });
+
+      const start = Date.now();
+      const { pendingTerminalSpawnOutboundSeenAt } = await import('./watchdog.js');
+      // With the fix (5s busy_timeout): waits out the child's remaining hold
+      // and reads the committed row. Without it (1s default): times out well
+      // before the child commits and answers null — the false "no terminal
+      // spawn seen" this whole fix exists to close.
+      const result = pendingTerminalSpawnOutboundSeenAt(agentGroupId, sessionId);
+      const elapsedMs = Date.now() - start;
+      // eslint-disable-next-line no-console
+      console.log(`[lock-test] elapsed waiting on the held lock: ${elapsedMs}ms`);
+
+      expect(result).toBe('2026-01-01T00:05:00.000Z');
+      // Proves the read actually waited on the lock rather than finding it
+      // already free — a read that returned instantly wouldn't demonstrate
+      // contention tolerance at all. The lock was confirmed held immediately
+      // before this, so any wait here is against the child's own hold, not a
+      // race on the start line above.
+      expect(elapsedMs).toBeGreaterThan(300);
+    } finally {
+      holder.kill();
+    }
+  }, 20000);
 });

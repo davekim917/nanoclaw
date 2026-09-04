@@ -26,15 +26,10 @@
  * {@link liveContainerState}). Everything else on the row comes from one
  * central-DB query plus a `statSync` per session.
  */
-import fs from 'fs';
-
-import Database from 'better-sqlite3';
-
 import { getDb } from '../../db/connection.js';
 import { getContainerConfig, resolveProviderName } from '../../db/container-configs.js';
-import { getContainerState, openOutboundDb, type ContainerState } from '../../db/session-db.js';
 import { TASKS_SYSTEM_THREAD_ID } from '../../db/sessions.js';
-import { outboundDbPath } from '../../session-manager.js';
+import { readSessionOutbound, type ContainerState } from '../../modules/mailbox/index.js';
 import { getActiveContainerSessionIds, resolveAssistantName } from '../../container-runner.js';
 import { readContainerConfig } from '../../container-config.js';
 import { getKnownSlackBots } from '../../channels/slack-mentions.js';
@@ -864,21 +859,28 @@ export function wiredAgentsByChannel(): Map<string, WiredAgent[]> {
  * {@link liveContainerState}. Opening a per-session SQLite file is the single
  * most expensive thing on this path.
  */
-function readContainerState(agentGroupId: string, sessionId: string): ContainerState | null {
-  const p = outboundDbPath(agentGroupId, sessionId);
-  if (!fs.existsSync(p)) return null;
-  let db: Database.Database | null = null;
+export function readContainerState(agentGroupId: string, sessionId: string): ContainerState | null {
   try {
-    db = openOutboundDb(p);
-    return getContainerState(db);
+    // Read-only seam, never `withExistingMailboxSession`: the console must not
+    // provision, migrate or schema-ensure a session it is only listing
+    // (docs/specs/upstream-mailbox-seam/plan.md I-4). The two options restate
+    // exactly what this probe did before the seam — the write path's 5s
+    // busy_timeout, because this is one named live session rather than a fleet
+    // fan-out, and the hot-journal rollback that keeps a SIGKILLed container's
+    // outbound.db from failing every later read. A session with no mailbox
+    // answers `undefined`, which is the same "nothing to show" as a null row.
+    return (
+      readSessionOutbound({ agentGroupId, sessionId }, (mailbox) => mailbox.getContainerState(), {
+        busyTimeoutMs: 5000,
+        recoverJournal: true,
+      }) ?? null
+    );
   } catch (err) {
     log.warn('threads: container_state probe failed', {
       sessionId,
       err: err instanceof Error ? err.message : String(err),
     });
     return null;
-  } finally {
-    db?.close();
   }
 }
 

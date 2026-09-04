@@ -1,8 +1,5 @@
-import Database from 'better-sqlite3';
-import fs from 'fs';
-
 import { log } from '../../log.js';
-import { outboundDbPath } from '../../session-manager.js';
+import { readSessionOutbound } from '../mailbox/index.js';
 import type { Task } from './db/tasks.js';
 
 export type TaskActionDecision =
@@ -95,17 +92,25 @@ export function decideTaskAction(args: {
  * Content is deserialized as JSON to avoid substring false-positive matches (S20).
  */
 export function pendingTerminalSpawnOutboundSeenAt(agentGroupId: string, sessionId: string): string | null {
-  const dbPath = outboundDbPath(agentGroupId, sessionId);
-  if (!fs.existsSync(dbPath)) return null;
-
-  let db: Database.Database | null = null;
   try {
-    db = new Database(dbPath, { readonly: true });
-
-    const rows = db.prepare(`SELECT timestamp, content FROM messages_out WHERE kind = 'system'`).all() as Array<{
-      timestamp: string;
-      content: string;
-    }>;
+    // Read-only seam: the watchdog inspects a child it does not own, on the
+    // sweep's schedule, and must never provision or migrate it (invariant
+    // I-4). A session with no outbound.db has nothing to report.
+    //
+    // `busyTimeoutMs: 5000` restates what the pre-seam open actually gave
+    // this read: `new Database(dbPath, { readonly: true })` with no `timeout`
+    // key takes better-sqlite3's own default, which is 5000ms, not "none" —
+    // the seam's 1s fleet-fan-out default is a real regression here, not a
+    // tolerant one. A watchdog read that times out early answers `null` —
+    // "no terminal spawn seen" — which bypasses the drain-first guard and can
+    // fail a task whose spawn_complete/spawn_failed is still on its way in
+    // under lock contention on a busy outbound.db. No `recoverJournal`: the
+    // pre-seam open never recovered a hot journal either, so this restates
+    // the old behavior exactly rather than widening it.
+    const rows = readSessionOutbound({ agentGroupId, sessionId }, (mailbox) => mailbox.listOutboundSystemMessages(), {
+      busyTimeoutMs: 5000,
+    });
+    if (!rows) return null;
 
     let earliest: string | null = null;
     for (const row of rows) {
@@ -124,11 +129,5 @@ export function pendingTerminalSpawnOutboundSeenAt(agentGroupId: string, session
   } catch (err) {
     log.warn('pendingTerminalSpawnOutboundSeenAt: failed to read outbound.db', { agentGroupId, sessionId, err });
     return null;
-  } finally {
-    try {
-      db?.close();
-    } catch {
-      /* ignore close errors */
-    }
   }
 }

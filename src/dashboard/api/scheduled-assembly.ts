@@ -16,16 +16,18 @@
  *
  * See docs/specs/scheduled-tasks-board/design.md §3a, §4.1, §4.8, §4.9.
  */
-import fs from 'fs';
-import path from 'path';
-
-import Database from 'better-sqlite3';
 import { CronExpressionParser } from 'cron-parser';
 
 import { DATA_DIR, TIMEZONE } from '../../config.js';
 import { resolveGroupTimezone } from '../../container-config.js';
 import { getDb } from '../../db/connection.js';
 import { log } from '../../log.js';
+import {
+  readSessionInbound,
+  readSessionOutbound,
+  type ScheduledTaskRow,
+  type SessionReadLocation,
+} from '../../modules/mailbox/index.js';
 import { availableVerbs, type HealthState, type SeriesKind, type Verb } from './scheduled-board-matrix.js';
 import {
   SWEEP_INTERVAL_MS,
@@ -246,59 +248,12 @@ export function deriveHealth(ctx: HealthCtx): HealthState {
 
 // ── Per-session read ──────────────────────────────────────────────────────────
 
-interface RawRow {
-  id: string;
-  series_id: string | null;
-  recurrence: string | null;
-  process_after: string | null;
-  status: string;
-  kind: string;
-  timestamp: string;
-  platform_id: string | null;
-  channel_type: string | null;
-  thread_id: string | null;
-  content: string;
-}
-
-// A `cancelled` row is an INTENTIONALLY-terminated task, not a scheduled one —
-// it must drop off the board entirely (not surface as "stalled"). The board's
-// own cancel nulls the recurrence (so board-cancelled tasks fall out via the
-// `recurrence IS NOT NULL` filter), but legacy/agent-side cancels leave the cron
-// set, so we must also exclude `status = 'cancelled'` explicitly. We intentionally
-// do NOT exclude completed/failed/expired here: deriveHealth's strand detector
-// relies on seeing a terminal-but-still-recurring latest row to catch a genuine
-// silent death (the fired-but-no-successor signature §4.1).
-const LATEST_PER_SERIES_SQL = `
-  SELECT id, series_id, recurrence, process_after, status, kind, timestamp,
-         platform_id, channel_type, thread_id, content
-    FROM messages_in
-   WHERE recurrence IS NOT NULL
-     AND status != 'cancelled'
-     AND seq = (SELECT MAX(m2.seq) FROM messages_in m2 WHERE m2.series_id = messages_in.series_id)
-`;
-
-/** Live (pending|paused) one-off rows — no recurrence — kept for visibility + cancel. */
-const ONE_OFF_LIVE_SQL = `
-  SELECT id, series_id, recurrence, process_after, status, kind, timestamp,
-         platform_id, channel_type, thread_id, content
-    FROM messages_in
-   WHERE recurrence IS NULL AND kind = 'task' AND status IN ('pending', 'paused')
-     AND seq = (SELECT MAX(m2.seq) FROM messages_in m2 WHERE m2.series_id = messages_in.series_id)
-`;
-
-const DUP_SERIES_SQL = `
-  SELECT series_id FROM messages_in
-   WHERE status IN ('pending', 'paused') AND kind = 'task'
-   GROUP BY series_id HAVING COUNT(*) > 1
-`;
-
-/** All live rows of a specific duplicate series (not just MAX(seq)). */
-const ALL_LIVE_FOR_SERIES_SQL = `
-  SELECT id, series_id, recurrence, process_after, status, kind, timestamp,
-         platform_id, channel_type, thread_id, content
-    FROM messages_in
-   WHERE series_id = ? AND status IN ('pending', 'paused') AND kind = 'task'
-`;
+/**
+ * The board reads its rows through the mailbox module's named ops, so the row
+ * shape is the module's. Aliased rather than re-declared: one definition, and
+ * a column added there reaches the board without a second edit here.
+ */
+type RawRow = ScheduledTaskRow;
 
 interface SessionDescriptor {
   agentGroupId: string;
@@ -314,11 +269,13 @@ interface SessionReadResult {
   unreadable: number;
 }
 
-function inboundPathOf(dataDir: string, agentGroupId: string, sessionId: string): string {
-  return path.join(dataDir, 'v2-sessions', agentGroupId, sessionId, 'inbound.db');
-}
-function outboundPathOf(dataDir: string, agentGroupId: string, sessionId: string): string {
-  return path.join(dataDir, 'v2-sessions', agentGroupId, sessionId, 'outbound.db');
+/**
+ * The board's session locator. `dataDir` rides along because the read layer
+ * threads an injected fixture root through its whole path (its `ReadOptions`
+ * test seam) and `DATA_DIR` is a module constant with no env override.
+ */
+function locate(dataDir: string, agentGroupId: string, sessionId: string): SessionReadLocation {
+  return { dataDir, agentGroupId, sessionId };
 }
 
 /** Channel display name for a (channel_type, platform_id) destination, or null. */
@@ -348,28 +305,20 @@ interface OutboundView {
  * the list path never needs them; the detail handler (B4) reads them on demand
  * for the single series it renders.
  */
-function readOutbound(outboundPath: string): OutboundView {
-  if (!fs.existsSync(outboundPath)) return { readable: false, claimed: new Set() };
-  let db: Database.Database | null = null;
+function readOutbound(location: SessionReadLocation): OutboundView {
   try {
-    db = new Database(outboundPath, { readonly: true });
-    db.pragma('busy_timeout = 1000');
-    const claimed = new Set(
-      (
-        db.prepare("SELECT message_id FROM processing_ack WHERE status = 'processing'").all() as Array<{
-          message_id: string;
-        }>
-      ).map((r) => r.message_id),
-    );
+    const claimed = readSessionOutbound(location, (mailbox) => new Set(mailbox.listProcessingClaimedMessageIds()));
+    // `undefined` is "this session has no outbound.db" — absent, not
+    // unobservable — which is the same not-readable answer the existsSync
+    // guard gave before the seam.
+    if (!claimed) return { readable: false, claimed: new Set() };
     return { readable: true, claimed };
   } catch (err) {
     log.warn('scheduled-assembly: outbound read failed', {
-      outboundPath,
+      sessionId: location.sessionId,
       err: err instanceof Error ? err.message : String(err),
     });
     return { readable: false, claimed: new Set() };
-  } finally {
-    db?.close();
   }
 }
 
@@ -489,31 +438,32 @@ function readSession(
   mgByDest: Map<string, string>,
   nowMs: number,
 ): SessionReadResult {
-  const inboundPath = inboundPathOf(dataDir, desc.agentGroupId, desc.sessionId);
-  if (!fs.existsSync(inboundPath)) return { rows: [], searchByKey: {}, unreadable: 0 };
-
-  let inDb: Database.Database | null = null;
+  const location = locate(dataDir, desc.agentGroupId, desc.sessionId);
   try {
-    inDb = new Database(inboundPath, { readonly: true });
-    inDb.pragma('busy_timeout = 1000');
+    // Read-only seam, deliberately not `withExistingMailboxSession`: this runs
+    // across EVERY session in the fleet on a console poll, and a board read
+    // must never provision, schema-ensure or migrate a session it is only
+    // listing (docs/specs/upstream-mailbox-seam/plan.md I-4, and the read-only
+    // rationale in src/modules/mailbox/read-only.ts).
+    const read = readSessionInbound(location, (mailbox) => {
+      const dupSeries = new Set(mailbox.listDuplicateLiveTaskSeriesIds());
+      // For duplicate series, return ALL live rows (not just MAX(seq)) so the
+      // hidden second fireable row is visible.
+      const dupRows: RawRow[] = [];
+      for (const seriesId of dupSeries) dupRows.push(...mailbox.listLiveTaskRowsForSeries(seriesId));
+      return {
+        dupSeries,
+        dupRows,
+        latest: mailbox.listLatestRecurringSeriesRows(),
+        oneOffs: mailbox.listLiveOneOffTaskRows(),
+      };
+    });
+    // No mailbox on disk — nothing to contribute, and NOT an unreadable
+    // session: absence is a complete answer, a failed read is not.
+    if (!read) return { rows: [], searchByKey: {}, unreadable: 0 };
+    const { dupSeries, dupRows, latest, oneOffs } = read;
 
-    const dupSeries = new Set(
-      (inDb.prepare(DUP_SERIES_SQL).all() as Array<{ series_id: string | null }>)
-        .map((r) => r.series_id)
-        .filter((s): s is string => s !== null),
-    );
-
-    const latest = inDb.prepare(LATEST_PER_SERIES_SQL).all() as RawRow[];
-    const oneOffs = inDb.prepare(ONE_OFF_LIVE_SQL).all() as RawRow[];
-
-    // For duplicate series, return ALL live rows (not just MAX(seq)) so the
-    // hidden second fireable row is visible.
-    const dupRows: RawRow[] = [];
-    for (const seriesId of dupSeries) {
-      dupRows.push(...(inDb.prepare(ALL_LIVE_FOR_SERIES_SQL).all(seriesId) as RawRow[]));
-    }
-
-    const outbound = readOutbound(outboundPathOf(dataDir, desc.agentGroupId, desc.sessionId));
+    const outbound = readOutbound(location);
 
     const rows: ScheduledRow[] = [];
     const searchByKey: Record<string, string> = {};
@@ -548,28 +498,10 @@ function readSession(
       err: err instanceof Error ? err.message : String(err),
     });
     return { rows: [], searchByKey: {}, unreadable: 1 };
-  } finally {
-    inDb?.close();
   }
 }
 
 // ── Single-series detail row (B4 helper) ────────────────────────────────────────
-
-const ONE_SERIES_LATEST_SQL = `
-  SELECT id, series_id, recurrence, process_after, status, kind, timestamp,
-         platform_id, channel_type, thread_id, content
-    FROM messages_in
-   WHERE series_id = ?
-   ORDER BY seq DESC LIMIT 1
-`;
-
-const ONE_SERIES_LIVE_SQL = `
-  SELECT id, series_id, recurrence, process_after, status, kind, timestamp,
-         platform_id, channel_type, thread_id, content
-    FROM messages_in
-   WHERE series_id = ? AND status IN ('pending', 'paused')
-   ORDER BY seq DESC LIMIT 1
-`;
 
 /**
  * Build the FULL board row for ONE series — the detail endpoint's `row` (B4).
@@ -590,9 +522,7 @@ export function buildDetailRow(
   dataDir: string,
   nowMs: number,
 ): ScheduledRow | null {
-  const inboundPath = inboundPathOf(dataDir, agentGroupId, sessionId);
-  if (!fs.existsSync(inboundPath)) return null;
-
+  const location = locate(dataDir, agentGroupId, sessionId);
   const central = getDb();
   const ag = central.prepare('SELECT name, agent_provider FROM agent_groups WHERE id = ?').get(agentGroupId) as
     | { name: string; agent_provider: string | null }
@@ -619,13 +549,13 @@ export function buildDetailRow(
     sessionId,
   };
 
-  let inDb: Database.Database | null = null;
   try {
-    inDb = new Database(inboundPath, { readonly: true });
-    inDb.pragma('busy_timeout = 1000');
-    const raw =
-      (inDb.prepare(ONE_SERIES_LIVE_SQL).get(seriesId) as RawRow | undefined) ??
-      (inDb.prepare(ONE_SERIES_LATEST_SQL).get(seriesId) as RawRow | undefined);
+    // Same read-only seam as the list path: a detail render must not provision
+    // or migrate the session it is rendering.
+    const raw = readSessionInbound(
+      location,
+      (mailbox) => mailbox.getLiveSeriesRow(seriesId) ?? mailbox.getLatestSeriesRow(seriesId),
+    );
     if (!raw) return null;
     // A cancelled series is intentionally ended and is excluded from the board
     // list (LATEST_PER_SERIES_SQL). The detail tier 404s to match — never
@@ -634,7 +564,7 @@ export function buildDetailRow(
 
     const isLive = raw.status === 'pending' || raw.status === 'paused';
     const isStrand = !isLive && raw.recurrence !== null;
-    const outbound = readOutbound(outboundPathOf(dataDir, agentGroupId, sessionId));
+    const outbound = readOutbound(location);
     const row = rawToRow(raw, desc, mgByDest, outbound, nowMs, false);
     // A terminal-with-recurrence latest row is a residual strand; the §4.1
     // ladder in rawToRow only sees live rows, so force the verdict here.
@@ -655,8 +585,6 @@ export function buildDetailRow(
       err: err instanceof Error ? err.message : String(err),
     });
     return null;
-  } finally {
-    inDb?.close();
   }
 }
 
