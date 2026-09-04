@@ -1128,8 +1128,15 @@ describe('skill wiring', () => {
     expect(helper).toContain('headRepositoryOwner.login ==');
     expect(helper).toContain('headRepository.name ==');
     // One verdict describes one destination, so the push shapes that send more
-    // than the judged ref are refused rather than gated on the wrong one.
-    for (const shape of ['--all', '--mirror', '--tags']) expect(push).toContain(shape);
+    // than the judged ref are refused rather than gated on the wrong one. The
+    // mechanism is an allowlist, not a denylist: `--branches` is `--all` under
+    // another spelling, and a denylist misses the next alias git adds. Options
+    // are also required to be self-contained, since a separate value argument
+    // would be counted as the remote or a refspec.
+    for (const shape of ['--all', '--branches', '--mirror', '--tags', '--follow-tags', '--prune'])
+      expect(push).toContain(shape);
+    expect(push).toContain('is not known to the churn gate to leave the ref set alone');
+    expect(push).toContain('--push-option=*');
     expect(push).toContain('is not <sha>:refs/heads/<branch>');
     expect(push).toMatch(/push_refspecs" -gt 1/);
     // Evaluating the gate writes nothing at all.

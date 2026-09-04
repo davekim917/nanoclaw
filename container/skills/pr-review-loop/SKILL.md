@@ -217,9 +217,10 @@ the next commit the reframe it names.
 One verdict describes one destination, so `push` accepts only the shapes it
 can name: no refspec, which gates the checkout, or a single
 `<sha>:refs/heads/<branch>` after the remote, which pins both the verdict and
-the audit line to the commit being sent. `--all`, `--mirror`, `--tags` and
-multi-refspec pushes are refused with exit 2 rather than gated on one ref
-while the others ride along unjudged.
+the audit line to the commit being sent. Options are allowlisted rather than
+denylisted — anything not known to leave the ref set alone, and to carry its
+value inline, is refused with exit 2. A denylist would miss `--branches`,
+which is `--all` under another spelling, and the next alias after it.
 
 The gate in front of a push judges **committed history only**
 (`--committed-only`): a push sends commits, so an edit to the primitive still

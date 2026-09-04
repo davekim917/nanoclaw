@@ -248,11 +248,30 @@ case "${1:?usage: open|churn|classes|gate|push|body|reply|resolve|status}" in
     push_positional=0
     for arg in "$@"; do
       case "$arg" in
-        --all|--mirror|--tags)
-          echo "push $arg sends refs the churn gate cannot name; push <sha>:refs/heads/<branch> instead" >&2
+        # Named for a precise message. Not the mechanism — that is the
+        # allowlist below, because a denylist of ref-expanding options misses
+        # aliases by construction: `--branches` is `--all` under another
+        # spelling, and the next alias git adds would be a bypass again.
+        --all|--branches|--no-branches|--mirror|--tags|--follow-tags|--prune|--delete|-d)
+          echo "push $arg sends or removes refs the churn gate cannot name; push <sha>:refs/heads/<branch> instead" >&2
           exit 2
           ;;
-        -*) continue ;;
+        # Options known not to change WHICH refs are sent, and known to be
+        # self-contained — no separate value argument, which would otherwise be
+        # counted below as the remote or a refspec and mis-gate the push. An
+        # option that is not on this list is refused rather than assumed
+        # harmless: the gate's whole claim is that what reaches the remote is
+        # what it judged, and an unrecognised option can break that claim.
+        -f|--force|--force-with-lease|--force-with-lease=*|--force-if-includes|\
+        -u|--set-upstream|-n|--dry-run|-q|--quiet|-v|--verbose|--porcelain|\
+        --atomic|--no-atomic|--verify|--no-verify|--progress|--no-progress|\
+        --thin|--no-thin|-4|--ipv4|-6|--ipv6|--push-option=*|--repo=*)
+          continue
+          ;;
+        -*)
+          echo "push option '$arg' is not known to the churn gate to leave the ref set alone; drop it, use its =value form, or add it to the allowlist in codex-review.sh" >&2
+          exit 2
+          ;;
       esac
       push_positional=$((push_positional + 1))
       # `git push [<repository> [<refspec>...]]` — the first bare word is the
