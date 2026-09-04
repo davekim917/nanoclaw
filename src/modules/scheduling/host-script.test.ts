@@ -238,7 +238,7 @@ describe('runHostGatedTaskScripts', () => {
     const db = freshDb();
     insertHostGatedTask(db, 't-tz-override', 'echo "{\\"wakeAgent\\": true, \\"data\\": {\\"tz\\": \\"$TZ\\"}}"');
 
-    await runHostGatedTaskScripts(db, TEST_GROUP_ID, 'sess-test');
+    await runHostGatedTaskScripts(sessionFor(db), TEST_GROUP_ID, 'sess-test');
 
     expect(rowContent(db, 't-tz-override').scriptOutput).toEqual({ tz: 'Asia/Tokyo' });
     db.close();
@@ -250,7 +250,7 @@ describe('runHostGatedTaskScripts', () => {
     const db = freshDb();
     insertHostGatedTask(db, 't-tz-default', 'echo "{\\"wakeAgent\\": true, \\"data\\": {\\"tz\\": \\"$TZ\\"}}"');
 
-    await runHostGatedTaskScripts(db, TEST_GROUP_ID, 'sess-test');
+    await runHostGatedTaskScripts(sessionFor(db), TEST_GROUP_ID, 'sess-test');
 
     expect(rowContent(db, 't-tz-default').scriptOutput).toEqual({ tz: TIMEZONE });
     db.close();

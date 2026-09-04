@@ -159,7 +159,7 @@ describe('handleRecurrence', () => {
     });
     db.prepare(`UPDATE messages_in SET status='completed' WHERE id='task-group-tz'`).run();
 
-    await handleRecurrence(db, fakeSession());
+    await handleRecurrence(sessionFor(db), fakeSession());
 
     const follow = db.prepare(`SELECT process_after FROM messages_in WHERE id != 'task-group-tz'`).get() as {
       process_after: string;
