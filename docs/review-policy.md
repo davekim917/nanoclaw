@@ -68,7 +68,8 @@ whose seam the classifier cannot substantiate — no shared import, or a single
 flagged file whose findings name nothing that module exports — is reported and
 not gated, because the refusal would name a primitive the fix has no reason to
 touch and the override would be the only way out. The reframe trailer may name
-any primitive the commit itself declares, not only the classifier's candidates. `REVIEW_LOOP_ALLOW_SITE_PATCH=1` overrides the gate loudly and
+any primitive the commit itself introduces, not only the classifier's
+candidates. `REVIEW_LOOP_ALLOW_SITE_PATCH=1` overrides the gate loudly and
 records the override in the PR body.
 
 ## Fix discipline

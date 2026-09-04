@@ -285,6 +285,24 @@ describe('review-churn classifier', () => {
     expect(classify(fixture('toctou-class')).classes[0].seamSubstantiated).toBe(true);
   });
 
+  it('reads imports at line starts, so neither a doc example nor a string blinds it', () => {
+    // The classifier's own header contains ` *   import { a, b } from '…'`,
+    // which is not an import; a file may equally contain `const marker = "/*"`
+    // above its imports, which does not open a comment. Anchoring to the line
+    // start answers both without a lexer.
+    const payload = fixture('toctou-class');
+    payload.sources = {
+      ...payload.sources,
+      'src/router.ts':
+        "/**\n *   import { fake } from './not-real.js';\n */\n" +
+        'const marker = "/*";\n' +
+        "import { writeSessionMessage, wakeContainer } from './mailbox/write.js';\n",
+    };
+    const report = JSON.parse(spawn(['classify', '--json'], payload).stdout) as Report;
+    const churning = report.classes.find((c) => c.rounds >= 3)!;
+    expect(churning.seam).toBe('src/mailbox/write.ts');
+  });
+
   it('substantiates a seam the findings name through an alias', () => {
     // `import { evaluateGate as gate }` binds `gate`, which is the name a
     // finding will use, while the module exports `evaluateGate`. Both spellings
@@ -553,26 +571,48 @@ describe('review-churn gate', () => {
     expect(decision.reported[0].rounds).toBe(3);
   });
 
-  it('does not read a declaration inside a block comment, wherever its delimiters are', () => {
-    // The post-image answers this whatever the diff showed: a declaration added
-    // inside a block comment whose `/*` and `*/` never changed does not appear
-    // in a --unified=0 hunk at all, and that is the shape the line scanner this
-    // replaces could not see.
+  it('accepts any shape the commit introduced, method or otherwise', () => {
+    // The check does not try to recognise declaration syntax, so a method on an
+    // existing class, an arrow in an object literal and a plain function all
+    // count without enumerating them.
+    const payload = fixture('toctou-class');
+    for (const introduced of [
+      'export function guardEveryWrite(session: Session) {}\n',
+      'class Guards {\n  async guardEveryWrite(session: Session) {}\n}\n',
+      'const guards = { guardEveryWrite: (session: Session) => {} };\n',
+    ]) {
+      payload.commits = [
+        {
+          sha: 'rrr8888',
+          date: AFTER,
+          message: 'fix: one guard\n\nReframe: race enforced in guardEveryWrite\n',
+          files: ['src/guard.ts'],
+          before: { 'src/guard.ts': '// nothing yet\n' },
+          after: { 'src/guard.ts': introduced },
+        },
+      ];
+      expect(gate(payload).status, introduced).toBe(0);
+    }
+  });
+
+  it('accepts a name introduced only in a comment — the documented trade', () => {
+    // Presence and absence, not "is this executable". Proving the latter with
+    // regexes took four review rounds and still leaked, so this weaker rule is
+    // deliberate: the trailer is already an explicit claim by the author on a
+    // file the commit changed, and the classifier's candidates remain the
+    // primary lift path. Encoded as a test so the trade stays visible rather
+    // than being rediscovered as a bug.
     const payload = fixture('toctou-class');
     payload.commits = [
       {
-        sha: 'qqq7777',
+        sha: 'sss9999',
         date: AFTER,
-        message: 'docs: sketch the guard\n\nReframe: race enforced in guardEveryWrite\n',
+        message: 'docs: sketch it\n\nReframe: race enforced in guardEveryWrite\n',
         files: ['src/guard.ts'],
-        before: { 'src/guard.ts': '/*\n sketch\n*/\n' },
-        after: { 'src/guard.ts': '/*\n sketch\n export function guardEveryWrite(session: Session) {}\n*/\n' },
+        before: { 'src/guard.ts': '// nothing yet\n' },
+        after: { 'src/guard.ts': '// export function guardEveryWrite() {}\n' },
       },
     ];
-    expect(gate(payload).status).toBe(3);
-
-    // The same declaration outside the comment does lift it.
-    payload.commits[0].after = { 'src/guard.ts': 'export function guardEveryWrite(session: Session) {}\n' };
     expect(gate(payload).status).toBe(0);
   });
 

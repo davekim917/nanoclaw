@@ -257,8 +257,7 @@ export function signatureOf(finding) {
  * statement is the one construct regex reads reliably. `[^;'"]*?` spans
  * newlines so multi-line `import { a, b } from '…'` blocks are read whole.
  */
-export function importsOf(rawSource) {
-  const source = stripSource(rawSource);
+export function importsOf(source) {
   const out = [];
   const push = (spec, clause) => {
     if (!spec) return;
@@ -278,11 +277,17 @@ export function importsOf(rawSource) {
       });
     out.push({ spec, names });
   };
-  for (const m of source.matchAll(/\b(?:import|export)\s+(?:type\s+)?([^;'"]*?)\s*from\s*['"]([^'"]+)['"]/g)) {
+  // Anchored to the start of a line, which is where a real import statement
+  // lives and where a doc-comment example does not: this file's own header
+  // shows ` *   import { a, b } from '…'`, and reading that as an import made
+  // the classifier seam findings on a module called `…`. An anchor rather than
+  // comment-stripping, because stripping comments correctly means knowing what
+  // is a string, which means a lexer.
+  for (const m of source.matchAll(/^[ \t]*(?:import|export)\s+(?:type\s+)?([^;'"]*?)\s*from\s*['"]([^'"]+)['"]/gm)) {
     push(m[2], m[1]);
   }
-  for (const m of source.matchAll(/\bimport\s*\(\s*['"]([^'"]+)['"]\s*\)/g)) push(m[1], '');
-  for (const m of source.matchAll(/\brequire\s*\(\s*['"]([^'"]+)['"]\s*\)/g)) push(m[1], '');
+  for (const m of source.matchAll(/^[^'"\n]*\bimport\s*\(\s*['"]([^'"]+)['"]\s*\)/gm)) push(m[1], '');
+  for (const m of source.matchAll(/^[^'"\n]*\brequire\s*\(\s*['"]([^'"]+)['"]\s*\)/gm)) push(m[1], '');
   return out;
 }
 
@@ -576,40 +581,34 @@ function invariantNamed(entry, trailer) {
 }
 
 /**
- * Did this commit INTRODUCE a declaration of something the trailer names?
+ * Did this commit INTRODUCE something the trailer names?
  *
- * Read from the file either side of the commit, never from the diff. A diff
- * hunk is text without context — an added line sitting inside a block comment
- * whose delimiters never changed looks exactly like code — and three rounds of
- * this review went into enumerating the ways a line can fail to be code before
- * the answer turned out to be "ask the file, where the question is decidable".
+ * The question is deliberately NOT "is there a declaration here, as code".
+ * Rounds 2, 3, 4 and 6 of this review all landed on that one — comments,
+ * strings, block state, delimiters outside the hunk, template literals, method
+ * syntax — because answering it with regexes means re-deriving a JavaScript
+ * lexer one counterexample at a time, and the next counterexample always
+ * exists.
  *
- * Present in the post-image and absent from the pre-image, both comment- and
- * string-stripped, is precisely "this commit introduced this primitive". A
- * declaration that was already there does not count, which is what stops a site
- * patch from pointing its trailer at an existing helper.
+ * What the check has to stop is a trailer pointing at something the commit did
+ * not bring: a pre-existing helper, or a name from nowhere. Present in the
+ * post-image as a whole identifier and absent from the pre-image says exactly
+ * that, and identifier boundaries answer it completely. It is weaker evidence
+ * than a parsed declaration — a name introduced in a comment would pass — and
+ * that is the trade: the trailer is already an explicit claim by the author on
+ * a file the commit changed, and the classifier's own candidates remain the
+ * primary path. This is the fallback for when the ranking guessed wrong.
  */
 function declaredByCommit(named, commit, ctx) {
-  const matchers = (named.match(/[A-Za-z_$][\w$]*/g) ?? []).map(declarationMatcher);
+  const matchers = (named.match(/[A-Za-z_$][\w$]*/g) ?? []).map(identifierMatcher);
   if (matchers.length === 0) return false;
   for (const file of commit.files ?? []) {
     const after = fileAtCommit(commit, file, 'after', ctx);
     if (after == null) continue;
     const before = fileAtCommit(commit, file, 'before', ctx) ?? '';
-    const afterCode = stripSource(after, { strings: true });
-    const beforeCode = stripSource(before, { strings: true });
-    if (matchers.some((m) => m.test(afterCode) && !m.test(beforeCode))) return true;
+    if (matchers.some((m) => m.test(after) && !m.test(before))) return true;
   }
   return false;
-}
-
-/** A declaration of one identifier, as code. */
-function declarationMatcher(id) {
-  const escaped = id.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  return new RegExp(
-    `\\b(?:function|class|const|let|var|interface|type|enum)\\s+${escaped}(?![A-Za-z0-9_$])` +
-      `|(?<![A-Za-z0-9_$])${escaped}\\s*[:=]\\s*(?:async\\s*)?\\(`,
-  );
 }
 
 /**
@@ -648,55 +647,6 @@ function renamedFrom(commit, ctx) {
   }
   ctx.renameCache.set(commit.sha, map);
   return map;
-}
-
-/**
- * Source with its comments blanked, line by line, carrying block-comment state
- * across lines — and optionally its string literals too. Every reader of source
- * text goes through this: the import scan, which otherwise reads the
- * `import { a, b } from '…'` example in this file's own header as a real
- * import, and the declaration scan, which otherwise reads a commented-out or
- * quoted `function foo` as declaring one.
- *
- * `strings` is opt-in because the two readers want opposite things: a module
- * specifier IS a string literal, so blanking strings would leave the import
- * scan with no specifier to read at all. Deliberately not a parser — this file
- * ships dependency-free into containers, and the cost of being crude is a seam
- * missed or a lift refused, never one wrongly granted.
- */
-export function stripNonCode(lines, { strings = false } = {}) {
-  let inBlock = false;
-  return lines.map((raw) => {
-    let line = raw;
-    if (inBlock) {
-      const end = line.indexOf('*/');
-      if (end === -1) return '';
-      line = ' '.repeat(end + 2) + line.slice(end + 2);
-      inBlock = false;
-    }
-    // Opening a block that does not close on this line takes the rest of it.
-    for (;;) {
-      const open = line.indexOf('/*');
-      if (open === -1) break;
-      const close = line.indexOf('*/', open + 2);
-      if (close === -1) {
-        line = line.slice(0, open);
-        inBlock = true;
-        break;
-      }
-      line = line.slice(0, open) + ' '.repeat(close + 2 - open) + line.slice(close + 2);
-    }
-    line = line.replace(/\/\/.*$/, ' ');
-    if (!strings) return line;
-    return line
-      .replace(/`[^`]*`/g, ' ')
-      .replace(/'[^']*'/g, ' ')
-      .replace(/"[^"]*"/g, ' ');
-  });
-}
-
-function stripSource(source, options) {
-  return stripNonCode(source.split('\n'), options).join('\n');
 }
 
 function touches(changedFiles, seam, seamInRepo) {

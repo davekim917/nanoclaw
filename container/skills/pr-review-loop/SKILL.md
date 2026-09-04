@@ -117,9 +117,11 @@ either:
   Naming the primitive is enough while it belongs to one flagged class; when
   two do — a race *and* a durability defect at the same write — the trailer
   must name the invariant it fixed, or it would clear both. The primitive does
-  **not** have to be one the classifier guessed: any name your commit actually
-  declares counts, because the candidates are a ranking and you have the diff.
-  A name nothing in the commit declares does not count.
+  **not** have to be one the classifier guessed: any name your commit
+  introduces counts, because the candidates are a ranking and you have the
+  diff. Introduced means the name is in the file after your commit and was not
+  there before — a helper that already existed is not something you brought,
+  and a name that appears in neither is a claim about nothing.
 
 A commit that touches one more call site lifts nothing, which is the point.
 
