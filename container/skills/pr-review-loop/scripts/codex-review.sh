@@ -283,13 +283,19 @@ case "${1:?usage: open|churn|classes|gate|push|body|reply|resolve|status}" in
       # remote, never a ref.
       if [ "$push_positional" -eq 1 ]; then continue; fi
       push_refspecs=$((push_refspecs + 1))
-      case "$arg" in
-        *:refs/heads/*) PUSH_HEAD="${arg%%:*}" ;;
-        *)
-          echo "push refspec '$arg' is not <sha>:refs/heads/<branch>; the churn gate cannot pin a verdict to it" >&2
-          exit 2
-          ;;
-      esac
+      # A positive grammar, matching the option allowlist above: one literal
+      # commit, one literal branch, and nothing that git will expand. Counting
+      # arguments does not prove there is one destination — `refs/heads/*:refs/
+      # heads/*` is a single argument that pushes every branch — and a source
+      # that is a ref rather than a SHA can move between the verdict and the
+      # push. Both are shapes the gate cannot pin a verdict to, so the rule is
+      # what IS accepted rather than a list of what is not.
+      if [[ "$arg" =~ ^([0-9a-f]{7,40}):refs/heads/([^*?[:space:]^~:\\]+)$ ]]; then
+        PUSH_HEAD="${BASH_REMATCH[1]}"
+      else
+        echo "push refspec '$arg' is not <sha>:refs/heads/<branch> with a literal commit and no wildcard; the churn gate cannot pin a verdict to it" >&2
+        exit 2
+      fi
     done
     if [ "$push_refspecs" -gt 1 ]; then
       echo "push sends $push_refspecs refspecs; the churn gate judges one branch at one commit" >&2

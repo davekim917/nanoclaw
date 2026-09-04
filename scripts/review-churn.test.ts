@@ -1143,6 +1143,11 @@ describe('skill wiring', () => {
     expect(push).not.toContain('--repo=*');
     expect(push).toContain('is not <sha>:refs/heads/<branch>');
     expect(push).toMatch(/push_refspecs" -gt 1/);
+    // The refspec is validated by a positive grammar for the same reason the
+    // options are: counting arguments does not prove there is one destination,
+    // since `refs/heads/*:refs/heads/*` is one argument that pushes every
+    // branch, and a ref source can move between the verdict and the push.
+    expect(push).toMatch(/\[\[ "\$arg" =~ \^\(\[0-9a-f\]\{7,40\}\):refs\/heads\//);
     // Evaluating the gate writes nothing at all.
     const gateBranch = helper.slice(helper.indexOf('  gate)'), helper.indexOf('  push)'));
     expect(gateBranch).not.toContain('record_site_patch_override');
