@@ -8,6 +8,7 @@ import {
   buildCodexHooksJson,
   createCodexConfigOverrides,
   interruptCodexTurn,
+  parseTomlTableHeader,
   probeCodexThreadHealth,
   readCodexTurnSnapshot,
   writeCodexHooksJson,
@@ -456,6 +457,47 @@ describe('writeCodexMcpConfigToml', () => {
       // The unrelated server is still there and still parses.
       expect(config).toContain('[mcp_servers.good]');
       expect(config).toContain('args = ["run", "good.ts"]');
+    } finally {
+      if (prevHome === undefined) {
+        delete process.env.HOME;
+      } else {
+        process.env.HOME = prevHome;
+      }
+      if (prevCodexHome === undefined) {
+        delete process.env.CODEX_HOME;
+      } else {
+        process.env.CODEX_HOME = prevCodexHome;
+      }
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('re-strips a quoted server name containing a bracket instead of duplicating its table', () => {
+    // tomlKey emits `[mcp_servers."a]b"]` for a hostile name. A header scanner
+    // that stops at the FIRST `]` does not recognize that line, keeps the whole
+    // stale table as base config, and appends a second copy on the next spawn —
+    // duplicate-table TOML that codex refuses, growing by one table per spawn.
+    const prevHome = process.env.HOME;
+    const prevCodexHome = process.env.CODEX_HOME;
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-home-'));
+    try {
+      process.env.HOME = home;
+      delete process.env.CODEX_HOME;
+      const codexDir = path.join(home, '.codex');
+      fs.mkdirSync(codexDir, { recursive: true });
+      fs.writeFileSync(path.join(codexDir, 'config.toml'), '[features]\nhooks = true\n');
+
+      const servers = { 'a]b': { command: 'bun', args: ['x'] } };
+      writeCodexMcpConfigToml(servers);
+      writeCodexMcpConfigToml(servers);
+      writeCodexMcpConfigToml(servers);
+
+      const config = fs.readFileSync(path.join(codexDir, 'config.toml'), 'utf-8');
+      expect(config.split('[mcp_servers.').length - 1).toBe(1);
+      expect(config).toContain('[mcp_servers."a]b"]');
+      // Non-MCP base config still survives the round trip.
+      expect(config).toContain('[features]');
+      expect(config).toContain('hooks = true');
     } finally {
       if (prevHome === undefined) {
         delete process.env.HOME;

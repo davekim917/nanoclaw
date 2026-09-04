@@ -19,6 +19,33 @@ import {
   setupCodexRuntime,
   stripPluginsAndMarketplacesForTest,
 } from './codex-companion-setup.js';
+import { parseTomlTableHeader } from './providers/codex-app-server.js';
+
+describe('parseTomlTableHeader', () => {
+  it('closes on the LAST bracket so a quoted segment may contain one', () => {
+    expect(parseTomlTableHeader('[features]')).toBe('features');
+    expect(parseTomlTableHeader('  [mcp_servers.nanoclaw.env]  ')).toBe('mcp_servers.nanoclaw.env');
+    expect(parseTomlTableHeader('[plugins."github@openai-curated"]')).toBe('plugins."github@openai-curated"');
+    expect(parseTomlTableHeader('[mcp_servers."a]b"]')).toBe('mcp_servers."a]b"');
+    expect(parseTomlTableHeader('key = "value"')).toBeNull();
+    expect(parseTomlTableHeader('')).toBeNull();
+  });
+});
+
+describe('splitPluginsAndMarketplaces', () => {
+  it('strips a plugin table whose quoted name contains a bracket', () => {
+    // Containers must carry ZERO host CLI plugin state. A header the scanner
+    // fails to recognize leaks the table AND, because the in-block flag goes
+    // stale, silently swallows whatever base config follows it.
+    const stripped = stripPluginsAndMarketplacesForTest(
+      ['[plugins."we]ird@mkt"]', 'enabled = true', '', '[features]', 'hooks = true', ''].join('\n'),
+    );
+    expect(stripped).not.toContain('we]ird@mkt');
+    expect(stripped).not.toContain('enabled = true');
+    expect(stripped).toContain('[features]');
+    expect(stripped).toContain('hooks = true');
+  });
+});
 
 describe('renderMcpServer', () => {
   it('emits stdio servers with command + args + env', () => {

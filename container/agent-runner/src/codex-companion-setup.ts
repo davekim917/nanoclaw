@@ -38,7 +38,7 @@ import { spawnSync, type SpawnSyncReturns } from 'node:child_process';
 import fs from 'fs';
 import path from 'path';
 
-import { tomlBasicString, tomlKey, writeCodexHooksJson } from './providers/codex-app-server.js';
+import { parseTomlTableHeader, tomlBasicString, tomlKey, writeCodexHooksJson } from './providers/codex-app-server.js';
 import {
   type AgentRuntime,
   discoverPortableSkills,
@@ -277,9 +277,9 @@ function splitPluginsAndMarketplaces(toml: string): { base: string; plugins: str
   const plugins: string[] = [];
   let inStrippedBlock = false;
   for (const line of toml.split('\n')) {
-    const header = line.match(/^\s*\[([^\]]+)\]\s*$/);
-    if (header) {
-      inStrippedBlock = isPluginTable(header[1].trim());
+    const header = parseTomlTableHeader(line);
+    if (header !== null) {
+      inStrippedBlock = isPluginTable(header);
     }
     (inStrippedBlock ? plugins : base).push(line);
   }

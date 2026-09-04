@@ -525,14 +525,36 @@ export interface CodexHttpMcpServer {
 
 const MCP_MARKER = '# --- nanoclaw runtime MCP servers ---';
 
+/**
+ * Parse a TOML table header line, returning the table name or null.
+ *
+ * Sole owner of "is this line a table header" for every config.toml scanner in
+ * the tree — this file's MCP stripper and codex-companion-setup's plugin
+ * stripper both call it, because one of them getting the grammar wrong is how
+ * a block goes unrecognized.
+ *
+ * `.+` is greedy on purpose: the closing bracket is the LAST `]` on the line,
+ * not the first. A quoted key segment may legally contain `]` — which is
+ * exactly what `tomlKey` now emits for a hostile server name — and a negated
+ * class stops at the inner bracket, fails the end anchor, and reports "not a
+ * header" for a line that is one. Both scanners then mis-handle the block: the
+ * MCP stripper keeps the stale table as base config and the next spawn appends
+ * a duplicate table, which codex refuses outright; the plugin stripper leaves
+ * its flag stale and silently drops the following lines from the base config.
+ */
+export function parseTomlTableHeader(line: string): string | null {
+  const match = line.match(/^\s*\[(.+)\]\s*$/);
+  return match ? match[1].trim() : null;
+}
+
 function stripExistingMcpServers(toml: string): string {
   const out: string[] = [];
   let inMcpBlock = false;
   for (const line of toml.split('\n')) {
     if (line.trim() === MCP_MARKER) continue;
-    const header = line.match(/^\s*\[([^\]]+)\]\s*$/);
-    if (header) {
-      inMcpBlock = header[1].trim().startsWith('mcp_servers.');
+    const header = parseTomlTableHeader(line);
+    if (header !== null) {
+      inMcpBlock = header.startsWith('mcp_servers.');
       if (inMcpBlock) continue;
     }
     if (!inMcpBlock) out.push(line);
