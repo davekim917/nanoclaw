@@ -102,133 +102,21 @@ function listTsFiles(root: string): string[] {
 }
 
 /**
- * Every runtime-reaching binding name a module (repo-root-relative path)
- * exports: `export function`/`const`/`class`/`let`/`var` declarations, and a
- * local `export { a, b as c };` (no `from` — re-exporting names already
- * declared in the same file). `export type` and per-specifier `type`
- * exports are excluded — erased at compile time, no runtime binding.
- * Seeds the mailbox-factory name set below from `src/mailbox/index.ts`'s
- * own export list, rather than hard-coding it.
+ * The literal specifier text of a static or dynamic import/export target, or
+ * `null` if it isn't a literal at all (a computed dynamic-import specifier
+ * is a real edge these walkers can't resolve statically — same "no path
+ * found" gap the transitive TARGETS walk further down has for computed
+ * specifiers). A static import's specifier is grammatically always a
+ * `StringLiteral` (`import x from \`./y\`` isn't valid syntax), but a
+ * dynamic `import(...)` accepts a backtick template with no substitutions
+ * too (`import(\`./mailbox/index.js\`)`) — same accessor for both, shared by
+ * `collectModuleBindings` and `discoverRelativeModules` below, so neither
+ * can drift out of sync with the other.
  */
-function exportedNamesOf(filePath: string): Set<string> {
-  const src = fs.readFileSync(path.join(REPO_ROOT, filePath), 'utf8');
-  const sourceFile = ts.createSourceFile(filePath, src, ts.ScriptTarget.Latest, /* setParentNodes */ true);
-  const names = new Set<string>();
-
-  function isExportModifier(node: { modifiers?: ts.NodeArray<ts.ModifierLike> }): boolean {
-    return node.modifiers?.some((m) => m.kind === ts.SyntaxKind.ExportKeyword) ?? false;
-  }
-
-  function visit(node: ts.Node): void {
-    if ((ts.isFunctionDeclaration(node) || ts.isClassDeclaration(node)) && node.name && isExportModifier(node)) {
-      names.add(node.name.text);
-    } else if (ts.isVariableStatement(node) && isExportModifier(node)) {
-      for (const decl of node.declarationList.declarations) {
-        if (ts.isIdentifier(decl.name)) names.add(decl.name.text);
-      }
-    } else if (
-      ts.isExportDeclaration(node) &&
-      !node.isTypeOnly &&
-      !node.moduleSpecifier &&
-      node.exportClause &&
-      ts.isNamedExports(node.exportClause)
-    ) {
-      for (const el of node.exportClause.elements) {
-        if (!el.isTypeOnly) names.add(el.name.text);
-      }
-    }
-    ts.forEachChild(node, visit);
-  }
-
-  visit(sourceFile);
-  return names;
+function literalSpecifierText(node: ts.Expression): string | null {
+  if (ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node)) return node.text;
+  return null;
 }
-
-/**
- * `true` if `filePath` (repo-root-relative) has a static `import { ... }`
- * declaration binding ANY name in `names` — from any module, not a specific
- * one, since the goal is finding every file that could reach the seam
- * regardless of which import path it went through. Skips type-only imports
- * (whole-clause and per-specifier). Does NOT treat a namespace import
- * (`import * as ns from '<module>'`) as binding any name — a namespace
- * import doesn't introduce a binding literally named `getAgentMailbox`;
- * catching member access through a namespace alias would need real
- * call-graph analysis, out of scope for this one-level scan (the same
- * scoping boundary the transitive TARGETS walk further down draws for
- * computed specifiers).
- */
-function fileBindsAnyName(filePath: string, names: ReadonlySet<string>): boolean {
-  const src = fs.readFileSync(path.join(REPO_ROOT, filePath), 'utf8');
-  const sourceFile = ts.createSourceFile(filePath, src, ts.ScriptTarget.Latest, /* setParentNodes */ true);
-  let found = false;
-
-  function visit(node: ts.Node): void {
-    if (found) return;
-    if (
-      ts.isImportDeclaration(node) &&
-      node.importClause?.phaseModifier !== ts.SyntaxKind.TypeKeyword &&
-      node.importClause?.namedBindings &&
-      ts.isNamedImports(node.importClause.namedBindings)
-    ) {
-      for (const el of node.importClause.namedBindings.elements) {
-        if (el.isTypeOnly) continue;
-        if (names.has((el.propertyName ?? el.name).text)) {
-          found = true;
-          return;
-        }
-      }
-    }
-    ts.forEachChild(node, visit);
-  }
-
-  visit(sourceFile);
-  return found;
-}
-
-/**
- * Modules whose binding set can, in principle, reach the mailbox seam —
- * COMPUTED at test-collection time rather than hand-listed. A hand-listed
- * set went stale: `src/db/scheduled-tasks.ts` binds `getAgentMailbox`
- * directly (`initStubSessionFolder`) and was missing, so an aliased import
- * of one of ITS exports (e.g. `resolveActiveSession`) into a pinned file
- * would have evaded every assertion below.
- *
- * The set is `{ src/mailbox/index.ts }` (the seam factory itself) UNION
- * every non-test `src/**\/*.ts` file that binds `getAgentMailbox`,
- * `withMailboxSession`, `withExistingMailboxSession`, or any other runtime
- * export of `src/mailbox/index.ts` (read from that file's own AST via
- * `exportedNamesOf`, not hard-coded — `withMailboxSession` and
- * `withExistingMailboxSession` live in `src/session-manager.ts`, not
- * `src/mailbox/index.ts`, so they're seeded explicitly alongside it).
- *
- * One level is enough: the pinned files' (`storage-manager.ts`,
- * `worktree-cleanup.ts`) own imports FROM every module in this set are then
- * checked by `collectModuleBindings` below, so a script that imports
- * something from ANY file that can itself reach the seam gets the same
- * scrutiny as importing from the seam directly.
- *
- * `src/modules/mailbox/index.ts` — the fork's own mailbox implementation
- * module, which `storage-manager.ts`/`worktree-cleanup.ts` import
- * `sessionMailboxPath` from — is deliberately NOT a member: it does not
- * itself export or import `getAgentMailbox`/`withMailboxSession`/
- * `withExistingMailboxSession` (`grep -n getAgentMailbox
- * src/modules/mailbox/index.ts` matches only prose in doc comments, never a
- * declaration or import — the seam factory is exported exclusively from
- * `src/mailbox/index.ts`). It's still worth pinning drift on for its own
- * reasons, same as `modules/mailbox/openers.ts` — see the separate
- * non-seam-adjacent-module assertions in the two describe blocks below.
- */
-const SEAM_ADJACENT_MODULES: readonly string[] = (() => {
-  const mailboxFactoryPath = 'src/mailbox/index.ts';
-  const names = new Set<string>(['getAgentMailbox', 'withMailboxSession', 'withExistingMailboxSession']);
-  for (const name of exportedNamesOf(mailboxFactoryPath)) names.add(name);
-
-  const modules = new Set<string>([mailboxFactoryPath]);
-  for (const file of listTsFiles('src')) {
-    if (file !== mailboxFactoryPath && fileBindsAnyName(file, names)) modules.add(file);
-  }
-  return [...modules].sort();
-})();
 
 /**
  * Every distinct binding `filePath` (repo-root-relative, e.g.
@@ -268,22 +156,6 @@ function collectModuleBindings(filePath: string, modulePath: string, root: strin
     if (el.isTypeOnly) return null;
     const original = (el.propertyName ?? el.name).text;
     return el.propertyName ? `${original} as ${el.name.text}` : original;
-  }
-
-  /**
-   * The literal specifier text of a static or dynamic import/export target,
-   * or `null` if it isn't a literal at all (a computed dynamic-import
-   * specifier is a real edge this walker can't resolve statically — same
-   * "no path found" gap the transitive walk below has for computed
-   * specifiers). A static import's specifier is grammatically always a
-   * `StringLiteral` (`import x from \`./y\`` isn't valid syntax), but a
-   * dynamic `import(...)` accepts a backtick template with no
-   * substitutions too (`import(\`./mailbox/index.js\`)`) — same accessor
-   * for both so neither path can drift out of sync with the other.
-   */
-  function literalSpecifierText(node: ts.Expression): string | null {
-    if (ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node)) return node.text;
-    return null;
   }
 
   const bindings: string[] = [];
@@ -346,6 +218,73 @@ function collectModuleBindings(filePath: string, modulePath: string, root: strin
 
   visit(sourceFile);
   return bindings;
+}
+
+/**
+ * Every module `filePath` (repo-root-relative) has a relative import,
+ * export-from, or dynamic `import()` edge to, resolved to a repo-root-relative
+ * `.ts` path — with the same `/index.ts` directory-import fallback the
+ * transitive TARGETS walk further down uses for its own specifier
+ * resolution. This is edge DISCOVERY, not binding collection: it finds every
+ * module the file touches at all, independent of what's bound against each
+ * one (that's `collectModuleBindings`'s job, called once per discovered
+ * module by `collectRelativeImportManifest` below).
+ */
+function discoverRelativeModules(filePath: string): string[] {
+  const src = fs.readFileSync(path.join(REPO_ROOT, filePath), 'utf8');
+  const sourceFile = ts.createSourceFile(filePath, src, ts.ScriptTarget.Latest, /* setParentNodes */ true);
+  const fileDir = path.posix.dirname(filePath);
+  const modules = new Set<string>();
+
+  function resolveModule(specifierText: string): string | undefined {
+    if (!specifierText.startsWith('.')) return undefined; // package import — no repo-relative edge
+    const joined = path.posix.normalize(path.posix.join(fileDir, specifierText)).replace(/\.js$/, '.ts');
+    if (fs.existsSync(path.join(REPO_ROOT, joined))) return joined;
+    const indexed = `${joined.replace(/\.ts$/, '')}/index.ts`;
+    if (fs.existsSync(path.join(REPO_ROOT, indexed))) return indexed;
+    return undefined;
+  }
+
+  function visit(node: ts.Node): void {
+    let specifierText: string | null = null;
+    if (ts.isImportDeclaration(node)) {
+      specifierText = literalSpecifierText(node.moduleSpecifier);
+    } else if (ts.isExportDeclaration(node) && node.moduleSpecifier) {
+      specifierText = literalSpecifierText(node.moduleSpecifier);
+    } else if (
+      ts.isCallExpression(node) &&
+      node.expression.kind === ts.SyntaxKind.ImportKeyword &&
+      node.arguments.length > 0
+    ) {
+      specifierText = literalSpecifierText(node.arguments[0]);
+    }
+    if (specifierText !== null) {
+      const resolved = resolveModule(specifierText);
+      if (resolved) modules.add(resolved);
+    }
+    ts.forEachChild(node, visit);
+  }
+
+  visit(sourceFile);
+  return [...modules].sort();
+}
+
+/**
+ * The COMPLETE relative-import manifest of `filePath`: every module it has
+ * any edge to (`discoverRelativeModules`), mapped to the exact bindings
+ * `collectModuleBindings` finds against it. Deliberately not limited to a
+ * curated or derived "seam-adjacent" subset of modules — see the doc
+ * comment on the pin tests below (`storage-manager.ts imports exactly this
+ * relative-import manifest`, and worktree-cleanup.ts's counterpart) for why
+ * these two specific files are pinned this way instead of walked like the
+ * TARGETS scripts further down.
+ */
+function collectRelativeImportManifest(filePath: string): Record<string, string[]> {
+  const manifest: Record<string, string[]> = {};
+  for (const modulePath of discoverRelativeModules(filePath)) {
+    manifest[modulePath] = collectModuleBindings(filePath, modulePath);
+  }
+  return manifest;
 }
 
 const cleanupDirs: string[] = [];
@@ -515,54 +454,42 @@ describe('storage-manager.ts / storage-activity.ts contain no literal seam call'
     expect(/\b(getAgentMailbox|withMailboxSession|withExistingMailboxSession)\s*\(/.test(src)).toBe(false);
   });
 
-  // Sweep every COMPUTED seam-adjacent module (not a hand-list — see
-  // SEAM_ADJACENT_MODULES's doc comment), asserting the exact — possibly
-  // empty — import set from each, so a new import from ANY of them,
-  // however named or aliased, re-triggers this review. A module not
-  // explicitly pinned below defaults to an expected empty set: if
-  // storage-manager.ts doesn't currently import from it, that's exactly
-  // what an unmodified `expected[seamModule] ?? []` asserts, and the
-  // moment it starts importing from a newly-discovered seam-adjacent
-  // module this fails until a human adds the real binding set here.
-  it('storage-manager.ts imports exactly the pinned binding set from every seam-adjacent module', () => {
-    const expected: Record<string, string[]> = {
+  // Three rounds of Codex review on this file progressively widened a
+  // curated "seam-adjacent modules" set — first hand-listed, then derived
+  // from which files bind the seam factory's names directly — and each
+  // widening still missed a real gap: a file that reaches the seam only
+  // through a SECOND hop (storage-manager.ts -> some helper -> a file that
+  // itself binds getAgentMailbox) escapes any one-level "does this file
+  // bind the factory" classification, however the set of candidate files is
+  // chosen.
+  //
+  // The fix is to stop classifying modules at all. storage-manager.ts and
+  // worktree-cleanup.ts are the two files EXEMPT from the transitive
+  // TARGETS walk further down (they legitimately import real seam-adjacent
+  // helpers, so "zero path to the seam" is the wrong invariant for them).
+  // For exactly these two, pin the COMPLETE relative-import manifest
+  // instead: every module either file has ANY edge to, each mapped to its
+  // exact binding set. This is complete by construction — there is no set
+  // of modules to keep in sync, because the set IS "every module this file
+  // imports from." A brand-new import to ANY module, first-hop or
+  // otherwise, changes the manifest and fails this assertion. What it does
+  // NOT do is prove no import here transitively reaches the seam two or
+  // more hops away — that residual risk is exactly what the TARGETS walk
+  // covers for the scripts, and for these two files, review. That is the
+  // honest boundary this test draws, not a gap it hides.
+  it('storage-manager.ts imports exactly this complete relative-import manifest', () => {
+    expect(collectRelativeImportManifest('src/storage-manager.ts')).toEqual({
+      'src/config.ts': ['CONTAINER_IMAGE', 'CONTAINER_IMAGE_BASE', 'CONTAINER_INSTALL_LABEL', 'DATA_DIR'],
+      'src/container-mounts.ts': ['runningContainerMounts as inspectRunningContainerMounts'],
+      'src/container-runtime.ts': ['CONTAINER_RUNTIME_BIN'],
+      'src/db/connection.ts': ['getDb'],
+      'src/db/container-configs.ts': ['getAllContainerConfigs'],
+      'src/log.ts': ['log'],
+      'src/modules/mailbox/index.ts': ['sessionMailboxPath'],
+      'src/repository-workspaces.ts': ['resolveRepositoryWorkUnit'],
       'src/session-manager.ts': ['sessionContextPathFor', 'sessionsBaseDir', 'threadsBaseDir', 'threadWorktreeDir'],
-    };
-    for (const seamModule of SEAM_ADJACENT_MODULES) {
-      expect(collectModuleBindings('src/storage-manager.ts', seamModule).sort(), seamModule).toEqual(
-        (expected[seamModule] ?? []).sort(),
-      );
-    }
-  });
-
-  // src/modules/mailbox/index.ts is not itself seam-adjacent (see
-  // SEAM_ADJACENT_MODULES's doc comment for why), so it sits outside the
-  // sweep above — pinned separately for the same "future import re-triggers
-  // this review" reason, since it's still a module worth watching drift on.
-  it("storage-manager.ts's only modules/mailbox/index.js import is sessionMailboxPath", () => {
-    expect(collectModuleBindings('src/storage-manager.ts', 'src/modules/mailbox/index.ts').sort()).toEqual(
-      ['sessionMailboxPath'].sort(),
-    );
-  });
-
-  it('the derived SEAM_ADJACENT_MODULES set is non-empty and contains every currently known member', () => {
-    // Regression guard for the derivation itself: if the AST scan breaks
-    // (wrong glob, wrong node-kind check, an exception silently swallowed
-    // somewhere), the set could come back empty or drastically undersized
-    // and every sweep above would vacuously pass. `src/db/scheduled-tasks.ts`
-    // is the file Codex's finding was actually about (it binds
-    // getAgentMailbox directly, in initStubSessionFolder); the other three
-    // are the pre-existing known callers.
-    expect(SEAM_ADJACENT_MODULES.length).toBeGreaterThan(0);
-    for (const known of [
-      'src/mailbox/index.ts',
-      'src/session-manager.ts',
-      'src/container-runner.ts',
-      'src/delivery.ts',
-      'src/db/scheduled-tasks.ts',
-    ]) {
-      expect(SEAM_ADJACENT_MODULES, known).toContain(known);
-    }
+      'src/storage-activity.ts': ['tryRunWithStorageCleanupClaim'],
+    });
   });
 });
 
@@ -611,38 +538,36 @@ describe('worktree-cleanup.ts contains no literal seam call, and the only contai
     expect(/\b(getAgentMailbox|withMailboxSession|withExistingMailboxSession)\s*\(/.test(src)).toBe(false);
   });
 
-  // Sweep every COMPUTED seam-adjacent module (not a hand-list — see
-  // SEAM_ADJACENT_MODULES's doc comment), asserting the exact — possibly
-  // empty — import set from each, so a new import from ANY of them,
-  // however named or aliased, re-triggers this review. worktree-cleanup.ts
-  // no longer imports from session-manager.js at all (1553790a moved it
-  // onto the mailbox module's own funnels) — that shows up here as an
-  // unpinned module defaulting to an expected empty set.
-  it('worktree-cleanup.ts imports exactly the pinned binding set from every seam-adjacent module', () => {
-    const expected: Record<string, string[]> = {
+  // See the doc comment on storage-manager.ts's manifest pin above for why
+  // these two specific files (the ones exempt from the TARGETS transitive
+  // walk further down) are pinned as a COMPLETE relative-import manifest
+  // rather than walked or classified against a curated module set.
+  it('worktree-cleanup.ts imports exactly this complete relative-import manifest', () => {
+    expect(collectRelativeImportManifest('src/worktree-cleanup.ts')).toEqual({
+      'src/config.ts': ['DATA_DIR', 'GROUPS_DIR'],
+      'src/container-mounts.ts': ['runningContainerMounts'],
       'src/container-runner.ts': ['isContainerRunning', 'isContainerSpawning'],
-    };
-    for (const seamModule of SEAM_ADJACENT_MODULES) {
-      expect(collectModuleBindings('src/worktree-cleanup.ts', seamModule).sort(), seamModule).toEqual(
-        (expected[seamModule] ?? []).sort(),
-      );
-    }
-  });
-
-  // src/modules/mailbox/openers.ts and src/modules/mailbox/index.ts are not
-  // themselves seam-adjacent (openers.ts is the raw DB-open funnel
-  // worktree-cleanup.ts deliberately stays on — see the comment on that
-  // import in the source file; index.ts's reasoning is in
-  // SEAM_ADJACENT_MODULES's doc comment), so neither sits in the sweep
-  // above. Pinned separately for the same "future import re-triggers this
-  // review" reason.
-  it("worktree-cleanup.ts's only modules/mailbox/openers.js import is openOutboundDb, and its only modules/mailbox/index.js import is sessionMailboxPath", () => {
-    expect(collectModuleBindings('src/worktree-cleanup.ts', 'src/modules/mailbox/openers.ts').sort()).toEqual(
-      ['openOutboundDb'].sort(),
-    );
-    expect(collectModuleBindings('src/worktree-cleanup.ts', 'src/modules/mailbox/index.ts').sort()).toEqual(
-      ['sessionMailboxPath'].sort(),
-    );
+      'src/db/connection.ts': ['getDb'],
+      'src/host-lifecycle.ts': ['onHostShutdown', 'onHostStart'],
+      'src/log.ts': ['log'],
+      'src/modules/mailbox/index.ts': ['sessionMailboxPath'],
+      'src/modules/mailbox/openers.ts': ['openOutboundDb'],
+      'src/modules/mailbox/ops/continuation.ts': ['hasWorkContinuationRow'],
+      'src/modules/mailbox/ops/sweep.ts': ['getContainerState', 'getProcessingClaims'],
+      'src/repository-workspaces.ts': [
+        'canonicalRepoDir',
+        'defaultTopicBranch',
+        'isRepositoryName',
+        'resolveRepositoryWorkUnit',
+        'topicStateDir',
+        'topicWorktreesDir',
+        'transferTombstonesDir',
+        'withHostRepositoryLock',
+        'withRepositoryLifecycleClaims',
+      ],
+      'src/safe-git.ts': ['safeGitArgs', 'safeGitEnv'],
+      'src/storage-manager.ts': ['dirSizeBytes', 'sessionWasReclaimed'],
+    });
   });
 });
 
