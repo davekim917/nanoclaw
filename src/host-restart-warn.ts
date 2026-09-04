@@ -130,7 +130,19 @@ function hasRecentRestartNote(mailbox: NanoclawMailboxSession, now: number): boo
  * graceful shutdown path and startup backstop idempotent for one interruption.
  * Returns true when a note was written.
  */
-export function warnSessionIfWorkInFlight(mailbox: NanoclawMailboxSession, session: Session, reason: string): boolean {
+export function warnSessionIfWorkInFlight(
+  mailbox: NanoclawMailboxSession,
+  session: Session,
+  reason: string,
+  /**
+   * True only when the caller KNOWS this session's container is still running
+   * — the graceful-shutdown path, which iterates the live container registry
+   * before stopping anything. It decides whether `provider_executing` may be
+   * trusted on its own; see `liveExecutingTurn` below. Defaults to false so a
+   * caller that does not know takes the stricter reading.
+   */
+  containerLive = false,
+): boolean {
   const now = Date.now();
   if (hasRecentRestartNote(mailbox, now)) return false;
   const state = mailbox.getContainerState();
@@ -179,10 +191,31 @@ export function warnSessionIfWorkInFlight(mailbox: NanoclawMailboxSession, sessi
   const providerIdle = state?.provider_executing === 0;
   const freshHeartbeat =
     !providerIdle && heartbeatAgeMs !== null && heartbeatAgeMs <= RESTART_WARN_HEARTBEAT_FRESH_MS;
+  // A turn that is executing RIGHT NOW needs no heartbeat corroboration, but
+  // only when we know the container is alive — which is exactly the
+  // graceful-shutdown path, where this runs against the live registry before
+  // stopAllContainers.
+  //
+  // The window is real and it is not an edge case. The Codex provider has no
+  // total-turn and no idle timeout by design (its watchdog is health-probe
+  // based: `codex.factory.test.ts` asserts the absence of both, and probing
+  // only begins after CODEX_HEALTH_PROBE_QUIET_MS = 60s, every 30s). So a
+  // healthy turn can stream nothing for well past the freshness window. A
+  // pushed follow-up turn in that state holds no processing claim (its rows
+  // were completed when it was pushed), may sit between tools with no
+  // current_tool, and may have no continuation — the ae2rvy shape exactly,
+  // with a stale heartbeat on top. Requiring both would strand it.
+  //
+  // Not extended to the startup backstop: there the previous host is gone, so
+  // this flag is whatever a dead container last wrote and nothing has reset it
+  // yet (`resetProviderExecuting` runs at the NEXT container's startup). Stale
+  // 1s would warn that session on every boot. There, freshness still rules.
+  const liveExecutingTurn = containerLive && state?.provider_executing === 1;
   const midWork =
     resumableContinuation ||
     processingClaimKey !== null ||
     freshHeartbeat ||
+    liveExecutingTurn ||
     decideCeilingFollowUp({
       hasContinuation: false,
       currentTool: state?.current_tool ?? null,
@@ -209,6 +242,7 @@ export function warnSessionIfWorkInFlight(mailbox: NanoclawMailboxSession, sessi
       toolStartedAt: state?.tool_started_at ?? null,
       heartbeatAgeMs,
       providerExecuting: state?.provider_executing ?? null,
+      containerLive,
     });
     return false;
   }
@@ -221,7 +255,9 @@ export function warnSessionIfWorkInFlight(mailbox: NanoclawMailboxSession, sessi
       // the graceful-shutdown warn and the startup backstop — which run
       // seconds apart, on either side of the same interruption — derive the
       // SAME id and the second one is a no-op rather than a duplicate note.
-      (state?.tool_started_at ?? processingClaimKey ?? `heartbeat-${Math.floor(heartbeatMs! / 60_000)}`);
+      (state?.tool_started_at ??
+        processingClaimKey ??
+        (heartbeatMs !== null ? `heartbeat-${Math.floor(heartbeatMs / 60_000)}` : 'provider-executing'));
   const episodeBucket = Math.floor(now / RESTART_NOTE_DEDUPE_MS);
   const recoveryHash = createHash('sha256').update(recoveryKey).digest('hex').slice(0, 16);
   const inserted = mailbox.insertDeferredMessageWithContextIfNew({
@@ -248,14 +284,14 @@ export function warnSessionIfWorkInFlight(mailbox: NanoclawMailboxSession, sessi
   return inserted;
 }
 
-async function warnSessions(session: Session, reason: string): Promise<void> {
+async function warnSessions(session: Session, reason: string, containerLive = false): Promise<void> {
   try {
     // Existing-only. The note is for a session whose container is about to be
     // stopped, so its mailbox is there; provisioning one here would author an
     // outbound.db the host must never create (invariant I-10) for a session
     // that has already been reclaimed.
     await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) =>
-      warnSessionIfWorkInFlight(mailbox, session, reason),
+      warnSessionIfWorkInFlight(mailbox, session, reason, containerLive),
     );
   } catch (err) {
     log.warn('host-restart warn failed for session', { sessionId: session.id, err });
@@ -270,7 +306,9 @@ async function warnSessions(session: Session, reason: string): Promise<void> {
 export async function warnActiveContainersOfShutdown(reason: string): Promise<void> {
   for (const sessionId of getActiveContainerSessionIds()) {
     const session = getSession(sessionId);
-    if (session) await warnSessions(session, reason);
+    // These ids come from the live container registry and nothing has been
+    // stopped yet, so `provider_executing` is current state, not residue.
+    if (session) await warnSessions(session, reason, true);
   }
 }
 
