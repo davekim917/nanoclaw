@@ -1,7 +1,7 @@
 import Database from 'better-sqlite3';
 import fs from 'fs';
 import path from 'path';
-import { describe, expect, it, beforeEach, afterEach, vi } from 'vitest';
+import { describe, expect, it, beforeEach, afterEach, vi, type MockInstance } from 'vitest';
 
 import { forwardAttachedFiles, isSafeAttachmentName, routeAgentMessage } from './agent-route.js';
 import { log } from '../../log.js';
@@ -30,6 +30,13 @@ vi.mock('../../config.js', async () => {
 // authorizes. Lets a case revoke a grant mid-route with no timing dependence.
 const duringSourceLookup = vi.hoisted(() => ({ run: null as (() => void) | null }));
 
+// One-shot hook on the first `sessionDir` resolution after it is armed — which
+// is inside the attachment copy, the only thing between the two authorization
+// proofs that touches the filesystem. Lets a case revoke a grant with the file
+// bytes already on disk. Each case asserts WHICH proof refused, so a hook that
+// fired at the wrong moment fails rather than passing for the wrong reason.
+const duringFileCopy = vi.hoisted(() => ({ run: null as (() => void) | null }));
+
 vi.mock('../../session-manager.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../../session-manager.js')>();
   return {
@@ -39,6 +46,12 @@ vi.mock('../../session-manager.js', async (importOriginal) => {
       duringSourceLookup.run = null;
       hook?.();
       return actual.withExistingMailboxSession(agentGroupId, sessionId, action);
+    },
+    sessionDir: (agentGroupId: string, sessionId: string) => {
+      const hook = duringFileCopy.run;
+      duringFileCopy.run = null;
+      hook?.();
+      return actual.sessionDir(agentGroupId, sessionId);
     },
   };
 });
@@ -210,6 +223,13 @@ describe('routeAgentMessage return-path', () => {
 
   afterEach(() => {
     duringSourceLookup.run = null;
+    duringFileCopy.run = null;
+    // A `vi.spyOn(log, 'warn')` inside a case is NOT restored by that case when
+    // an assertion above its restore call throws — the spy then survives into
+    // the next case and reports the previous one's warnings as its own. That
+    // turns one real failure into two, and the second is a lie. Restoring here
+    // is unconditional; module factory mocks are untouched by it.
+    vi.restoreAllMocks();
     closeDb();
     if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
   });
@@ -589,6 +609,115 @@ describe('routeAgentMessage return-path', () => {
     const targetPath = path.join(sessionDir(B, SB.id), parsed.attachments[0].localPath);
     expect(fs.existsSync(targetPath)).toBe(true);
     expect(fs.readFileSync(targetPath, 'utf-8')).toBe('fake-pdf-bytes');
+  });
+
+  /** Every file under a session's inbox tree, relative to it. */
+  function inboxFiles(agentGroupId: string, sessionId: string): string[] {
+    const root = path.join(sessionDir(agentGroupId, sessionId), 'inbox');
+    if (!fs.existsSync(root)) return [];
+    const out: string[] = [];
+    const walk = (dir: string, prefix: string): void => {
+      for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+        const rel = prefix ? `${prefix}/${entry.name}` : entry.name;
+        if (entry.isDirectory()) walk(path.join(dir, entry.name), rel);
+        else out.push(rel);
+      }
+    };
+    walk(root, '');
+    return out.sort();
+  }
+
+  /** The `stage` field of every route-denial warning since the spy was installed. */
+  function denialStages(warn: MockInstance<typeof log.warn>): string[] {
+    return warn.mock.calls
+      .filter((call) => String(call[0]).includes('destination grant was revoked'))
+      .map((call) => String((call[1] as { stage?: string }).stage));
+  }
+
+  /**
+   * File BYTES are a delivery, and a revoked grant must stop them too.
+   *
+   * The copy lands in the target's inbox, which its container mounts and reads,
+   * with or without an inbound row pointing at them. So the grant is re-proved
+   * immediately before the copy as well as before the write — the copy used to
+   * sit between the source-mailbox await and the only re-proof, so a grant
+   * revoked during that lookup still handed the peer the payload.
+   */
+  it('copies no files when the destination grant is revoked during the source lookup', async () => {
+    // Forward first, so the reply below carries an in_reply_to and takes the
+    // source-mailbox lookup — the await this case opens its window inside.
+    await routeAgentMessage(
+      { id: 'msg-fwd-f', platform_id: B, content: JSON.stringify({ text: 'ping' }), in_reply_to: null },
+      S1,
+    );
+    const inboundId = readPairedInboundTriggers(B, SB.id)[0].id;
+
+    const outboxDir = path.join(sessionDir(B, SB.id), 'outbox', 'msg-reply-file');
+    fs.mkdirSync(outboxDir, { recursive: true });
+    fs.writeFileSync(path.join(outboxDir, 'secret.pdf'), 'payload-bytes');
+
+    const warn = vi.spyOn(log, 'warn');
+    duringSourceLookup.run = () => {
+      getDb().prepare('DELETE FROM agent_destinations WHERE agent_group_id = ? AND target_id = ?').run(B, A);
+    };
+
+    await expect(
+      routeAgentMessage(
+        {
+          id: 'msg-reply-file',
+          platform_id: A,
+          content: JSON.stringify({ text: 'here', files: ['secret.pdf'] }),
+          in_reply_to: inboundId,
+        },
+        SB,
+      ),
+    ).rejects.toThrow(/no destination for/);
+
+    // Refused by the FIRST proof, so the copy never ran at all.
+    expect(denialStages(warn)).toEqual(['before the file copy']);
+    expect(inboxFiles(A, S1.id)).toEqual([]);
+    expect(inboxFiles(A, S2.id)).toEqual([]);
+    expect(readPairedInboundTriggers(A, S1.id)).toHaveLength(0);
+    expect(readPairedInboundTriggers(A, S2.id)).toHaveLength(0);
+  });
+
+  /**
+   * And when the revocation lands after the bytes are on disk, they come back out.
+   *
+   * The inbound row is never written on a denial, but the files already are.
+   * Leaving them is a silent partial delivery of exactly the payload the guard
+   * just refused — the peer's container mounts that directory either way.
+   */
+  it('removes the forwarded files when the grant is revoked after the copy', async () => {
+    const outboxDir = path.join(sessionDir(A, S1.id), 'outbox', 'msg-late-revoke');
+    fs.mkdirSync(outboxDir, { recursive: true });
+    fs.writeFileSync(path.join(outboxDir, 'report.pdf'), 'fake-pdf-bytes');
+
+    const warn = vi.spyOn(log, 'warn');
+    // Fires inside the copy: the first proof has already allowed, and the bytes
+    // land before the second one is asked.
+    duringFileCopy.run = () => {
+      getDb().prepare('DELETE FROM agent_destinations WHERE agent_group_id = ? AND target_id = ?').run(A, B);
+    };
+
+    await expect(
+      routeAgentMessage(
+        {
+          id: 'msg-late-revoke',
+          platform_id: B,
+          content: JSON.stringify({ text: 'see attached', files: ['report.pdf'] }),
+          in_reply_to: null,
+        },
+        S1,
+      ),
+    ).rejects.toThrow(/no destination for/);
+
+    // Refused by the SECOND proof — which is what makes this the
+    // bytes-already-written case rather than the one above.
+    expect(denialStages(warn)).toEqual(['before the write']);
+    // Nothing left behind, and no row either.
+    expect(inboxFiles(B, SB.id)).toEqual([]);
+    expect(readPairedInboundTriggers(B, SB.id)).toHaveLength(0);
   });
 
   it('file forwarding: skips symlinked source files', async () => {

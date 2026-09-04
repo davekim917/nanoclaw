@@ -499,12 +499,51 @@ async function performAgentRoute(
   // so "both ends are our agents" is not a reason to skip it.
   const scrubbed = scrubSecrets(msg.content);
 
+  // AUTHORIZATION IS RE-PROVED TWICE, because this function has two awaits and
+  // two side effects, and each proof sits adjacent to the effect it authorizes.
+  //
+  // The `a2aSend` guard in `routeAgentMessage` ran before the source-mailbox
+  // lookup above; the thread-context build below can be a platform HTTP call
+  // lasting seconds. An admin revoking this `agent_destinations` grant inside
+  // either window must not get the payload delivered by either route — and file
+  // BYTES are a delivery: they land in the target's inbox, which its container
+  // mounts and reads, with or without an inbound row pointing at them.
+  //
+  // Synchronous, with nothing awaited between a proof and the effect after it.
+  // `grant` is passed exactly as the first call did, so an approved replay
+  // re-proves on the terms it was approved under rather than being denied by
+  // its own approval. A `hold` counts as a refusal both times: this invocation
+  // already cleared the gate once, and asking again would double-prompt the
+  // operator for one message.
+  const proveDestination = () =>
+    guard(a2aSend, {
+      actor: { kind: 'agent', agentGroupId: session.agent_group_id, sessionId: session.id },
+      resource: { from: session.agent_group_id, to: targetAgentGroupId },
+      payload: { id: msg.id, platform_id: targetAgentGroupId, content: msg.content, in_reply_to: msg.in_reply_to },
+      grant,
+    });
+  const refuse = (reason: string | undefined, stage: 'before the file copy' | 'before the write'): never => {
+    log.warn('agent-route: destination grant was revoked while routing; dropping the message', {
+      from: session.agent_group_id,
+      to: targetAgentGroupId,
+      msgId: msg.id,
+      stage,
+      reason,
+    });
+    throw new GuardDenyError(reason ?? 'destination grant revoked while routing');
+  };
+
+  // PROOF ONE, before the copy. Nothing has been written yet, so this refusal
+  // leaves nothing to undo.
+  const beforeCopy = proveDestination();
+  if (beforeCopy.effect !== 'allow') refuse(beforeCopy.reason, 'before the file copy');
+
   // If the source message references files (via `send_file`), forward the
   // bytes from the source's outbox into the target's inbox so the target
   // agent can actually see and re-send them. Without this, agent-to-agent
   // file attachments look like they arrive but the target has no way to
   // read the bytes — they live in a session dir it doesn't mount.
-  const forwardedContent = forwardFileAttachments(
+  const { content: forwardedContent, writtenPaths } = forwardFileAttachments(
     { ...msg, content: scrubbed },
     a2aMsgId,
     session,
@@ -523,38 +562,12 @@ async function performAgentRoute(
   // the backfill quoting a chat the target session is no longer bound to.
   const contentForWrite = await addThreadContext(forwardedContent, effective.mgId, effective.threadId, targetSession);
 
-  // AUTHORIZATION, re-proved immediately before the write it authorizes.
-  //
-  // The `a2aSend` guard above ran before two awaits — the source-mailbox lookup
-  // and the thread-context build, which can be a platform HTTP call lasting
-  // seconds. An admin revoking this `agent_destinations` grant in that window
-  // still gets the message inserted, archived, engaged and the target woken.
-  // Nothing here re-consulted the live guard, and a grant cannot save it: a
-  // grant never loosens a deny, it just was not asked again.
-  //
-  // Synchronous, with no await between it and `writeSessionMessage` below.
-  // `opts.grant` is passed exactly as the first call did, so an approved replay
-  // re-proves on the same terms it was approved under rather than being denied
-  // by its own approval.
-  const stillAuthorized = guard(a2aSend, {
-    actor: { kind: 'agent', agentGroupId: session.agent_group_id, sessionId: session.id },
-    resource: { from: session.agent_group_id, to: targetAgentGroupId },
-    payload: { id: msg.id, platform_id: targetAgentGroupId, content: msg.content, in_reply_to: msg.in_reply_to },
-    grant,
-  });
-  if (stillAuthorized.effect !== 'allow') {
-    // The same refusal the pre-check gives, so the caller's contract is
-    // unchanged and nothing is written. A `hold` here is treated as a refusal
-    // rather than re-opening an approval: this invocation already cleared the
-    // gate once, and asking a second time would double-prompt the operator for
-    // one message.
-    log.warn('agent-route: destination grant was revoked while routing; dropping the message', {
-      from: session.agent_group_id,
-      to: targetAgentGroupId,
-      msgId: msg.id,
-      reason: stillAuthorized.reason,
-    });
-    throw new GuardDenyError(stillAuthorized.reason ?? 'destination grant revoked while routing');
+  // PROOF TWO, before the write. The copy already happened, so this refusal has
+  // something to undo: the bytes come back out before the denial is raised.
+  const beforeWrite = proveDestination();
+  if (beforeWrite.effect !== 'allow') {
+    removeForwardedFiles(writtenPaths);
+    refuse(beforeWrite.reason, 'before the write');
   }
 
   await writeSessionMessage(targetAgentGroupId, targetSession.id, {
@@ -662,23 +675,38 @@ async function addThreadContext(
  * If the source content isn't JSON or has no files, returns the original
  * content string unchanged — this is safe to call on every route.
  */
+/**
+ * The forwarded content, plus the absolute paths the copy actually created.
+ *
+ * The paths are returned rather than reconstructed by the caller: the only
+ * place that knows where a byte landed is the code that wrote it, and a caller
+ * rebuilding `sessionDir(...) + localPath` would be a second definition of that
+ * — one that stops matching the moment the layout changes. They stay OUT of
+ * `content`, which is what an absolute host path must never leak into.
+ */
+interface ForwardedContent {
+  content: string;
+  /** Absolute, host-side. Empty when nothing was copied. */
+  writtenPaths: string[];
+}
+
 function forwardFileAttachments(
   msg: RoutableAgentMessage,
   a2aMsgId: string,
   sourceSession: Session,
   targetAgentGroupId: string,
   targetSessionId: string,
-): string {
+): ForwardedContent {
   let parsed: Record<string, unknown>;
   try {
     parsed = JSON.parse(msg.content);
   } catch {
-    return msg.content;
+    return { content: msg.content, writtenPaths: [] };
   }
   const files = parsed.files as unknown;
-  if (!Array.isArray(files) || files.length === 0) return msg.content;
+  if (!Array.isArray(files) || files.length === 0) return { content: msg.content, writtenPaths: [] };
   const filenames = files.filter((f): f is string => typeof f === 'string');
-  if (filenames.length === 0) return msg.content;
+  if (filenames.length === 0) return { content: msg.content, writtenPaths: [] };
 
   const attachments = forwardAttachedFiles(
     {
@@ -698,7 +726,44 @@ function forwardFileAttachments(
   const existing = Array.isArray(parsed.attachments) ? (parsed.attachments as Record<string, unknown>[]) : [];
   parsed.attachments = [...existing, ...attachments];
 
-  return JSON.stringify(parsed);
+  const targetSessionRoot = sessionDir(targetAgentGroupId, targetSessionId);
+  return {
+    content: JSON.stringify(parsed),
+    writtenPaths: attachments.map((attachment) => path.join(targetSessionRoot, attachment.localPath)),
+  };
+}
+
+/**
+ * Remove attachments this route copied, when the route then refuses to write.
+ *
+ * The bytes are the side effect the caller cannot take back any other way: the
+ * inbound row is never inserted on a denial, but the files are already in the
+ * target's inbox, where its container mounts and reads them. Leaving them is a
+ * silent partial delivery of exactly the payload the guard just refused.
+ *
+ * Best-effort by construction. A file that will not unlink is logged and the
+ * denial still stands — failing to clean up must not turn a refusal into a
+ * successful route. The now-empty message directory is removed too, and only
+ * if it IS empty, so a concurrent writer's file is never taken with it.
+ */
+function removeForwardedFiles(writtenPaths: string[]): void {
+  const dirs = new Set<string>();
+  for (const file of writtenPaths) {
+    try {
+      fs.rmSync(file, { force: true });
+      dirs.add(path.dirname(file));
+    } catch (err) {
+      log.warn('agent-route: could not remove a forwarded file after the route was denied', { file, err });
+    }
+  }
+  for (const dir of dirs) {
+    try {
+      fs.rmdirSync(dir);
+    } catch {
+      // Non-empty or already gone. Either is fine — this is tidying, not the
+      // guarantee; the guarantee is that the refused bytes are gone.
+    }
+  }
 }
 
 function countForwardedFiles(contentStr: string): number {
