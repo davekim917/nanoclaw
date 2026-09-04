@@ -327,10 +327,24 @@ async function sweepProviderHeal(
   // #343: nothing below may act on a target that is already gone. Skipping
   // costs nothing — a container that exited on its own needs no kill, and the
   // session keeps its full attempt budget for a failure that is still real.
+  //
+  // Returns TRUE, and the distinction matters more than the saving does. This
+  // is an exclusive phase's first claimant: `false` means "not mine, try the
+  // next one", and S12/S13/S14 would then act on the SAME stale observation
+  // that brought us here — reaping, killing for the ceiling or a stuck claim,
+  // resetting claims, writing OOM telemetry and an accountability wake, all
+  // against a container that no longer exists. Before this guard existed the
+  // heal branch reached `killContainer` (a no-op on a dead container), spent an
+  // attempt and returned `true`, so the chain stopped. Claiming the slot keeps
+  // that behaviour exactly and drops only the wasted attempt, which is the
+  // whole point of the fix.
   const unavailable = providerHealTargetUnavailableReason(session.id);
   if (unavailable) {
-    log.info(`self-heal: skipping ${decision} — target is gone`, { ...bounds, reason: unavailable });
-    return false;
+    log.info(`self-heal: ${decision} target already gone — nothing to do this pass`, {
+      ...bounds,
+      reason: unavailable,
+    });
+    return true;
   }
 
   if (decision === 'park') {

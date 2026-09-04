@@ -997,8 +997,20 @@ describe('sweepProviderHeal — bounds, actions, and accountability', () => {
     expect(notices).toHaveLength(1);
     expect(JSON.parse(notices[0].content)._system.kind).toContain('provider_heal_parked:');
 
+    // The idempotency rerun needs its own precondition. The park kill above
+    // hands `killContainer` no `onExit`, so the mock leaves the container
+    // stopped — and #343's re-check would then claim the pass and return
+    // before the notice logic ran at all, making "still one notice" true for
+    // the wrong reason. State that a container is there to park again, so the
+    // rerun reaches `notifyProviderHealParked` and the per-episode marker is
+    // what suppresses the second write.
+    mockIsContainerRunning.mockReturnValue(true);
+    mockKillContainer.mockClear();
     _resetProviderHealTicksForTesting();
     await twoFailedTicks(mailbox, outDb);
+    // It really did take the park branch again — otherwise the assertion below
+    // proves nothing about idempotency.
+    expect(mockKillContainer).toHaveBeenCalledWith('sess-test', 'provider-failed-selfheal-parked');
     expect(
       outDb.prepare("SELECT COUNT(*) AS c FROM messages_out WHERE id LIKE 'provider-heal-parked-%'").get(),
     ).toEqual({ c: 1 });
@@ -1023,8 +1035,12 @@ describe('sweepProviderHeal — bounds, actions, and accountability', () => {
     // …then the container goes away on its own, before the tick that would act.
     mockIsContainerRunning.mockReturnValue(false);
 
+    // TRUE, not false: this is the exclusive chain's first claimant, and `false`
+    // would hand S12/S13/S14 the same stale observation to act on. The slot is
+    // claimed with nothing done — which is what the pre-#343 code achieved by
+    // killing a dead container and spending an attempt for it.
     expect(await _sweepProviderHealForTesting(mailbox, fakeSession(), 'group-folder', FAILED, intoOutDb(outDb))).toBe(
-      false,
+      true,
     );
 
     expect(mockKillContainer).not.toHaveBeenCalled();
@@ -1457,6 +1473,90 @@ describe('registered S11/S14/S16 entries reach their bodies', () => {
 
     // run() is the no-op log branch taken when claims() already handled it.
     expect(() => s11.run(ctx)).not.toThrow();
+    armSelfHeal(false);
+  });
+
+  /**
+   * #343, at the level the bug actually lives: the exclusive chain.
+   *
+   * `runExclusiveSessionPhase` walks `session:health` in order, calls each
+   * duty's `claims()`, and stops at the first one that answers true; a `false`
+   * from S11 hands the slot to S12 (idle-task reap), S13 (idle-chat reap) and
+   * finally S14 (the SLA fallthrough) — all of which would then act on the
+   * SAME stale observation, against a container that has already exited.
+   *
+   * So this walks the REGISTERED duties exactly as the driver does, recording
+   * who is consulted, and pins that S11 claims the pass on its own.
+   */
+  it('S11 claims the pass when the heal target has already exited, so S12/S13/S14 never run', async () => {
+    const { duties } = _listSweepRegistrationsForTesting();
+    const chain = duties.filter((d) => d.phase === 'session:health').sort((a, b) => a.order - b.order);
+    // The chain this case is about: heal (10) → idle-task (20) → idle-chat (30)
+    // → SLA (40, the fallthrough with no claims()).
+    expect(chain.map((d) => d.name)).toEqual([
+      SWEEP_DUTY_INVENTORY.S11,
+      SWEEP_DUTY_INVENTORY.S12,
+      SWEEP_DUTY_INVENTORY.S13,
+      SWEEP_DUTY_INVENTORY.S14,
+    ]);
+
+    armSelfHeal(true);
+    const { inDb, mailbox } = makeSessionDbs();
+    const session = fakeSession();
+    mockGetSession.mockReturnValue(session);
+    const FAILED_STATE = { provider_status: 'failed', provider_failure_reason: 'gone' } as unknown as ContainerState;
+    const ctx = {
+      session,
+      agentGroupId: session.agent_group_id,
+      agentGroupFolder: 'group-folder',
+      killSnapshot: null,
+      observed: {
+        containerState: FAILED_STATE,
+        processingClaimCount: 0,
+        lastOutboundAtMs: null,
+        lastInboundAtMs: null,
+      },
+      run: async (action: (m: NanoclawMailboxSession) => unknown) => action(mailbox),
+      runIn: async (_window: string, action: (m: NanoclawMailboxSession) => unknown) => action(mailbox),
+    } as unknown as Parameters<NonNullable<(typeof chain)[number]['claims']>>[0];
+
+    // Tick 1 on a LIVE container only arms the two-tick debounce.
+    mockIsContainerRunning.mockReturnValue(true);
+    expect(await chain[0].claims!(ctx)).toBe(false);
+
+    // The container exits on its own inside the window the driver cannot see:
+    // `alive` was read before the observe open, and the budget read awaits
+    // again after it.
+    mockIsContainerRunning.mockReturnValue(false);
+    mockKillContainer.mockClear();
+
+    // The driver's own loop, verbatim (src/host-sweep.ts runExclusiveSessionPhase).
+    const consulted: string[] = [];
+    let claimedBy: string | null = null;
+    for (const duty of chain) {
+      if (!duty.claims) continue;
+      consulted.push(duty.name);
+      if (await duty.claims(ctx)) {
+        claimedBy = duty.name;
+        await duty.run(ctx);
+        break;
+      }
+    }
+    if (!claimedBy) {
+      const fallthrough = chain.find((d) => !d.claims)!;
+      consulted.push(fallthrough.name);
+      await fallthrough.run(ctx);
+    }
+
+    // S11 took the pass; nothing after it was even asked.
+    expect(claimedBy).toBe(SWEEP_DUTY_INVENTORY.S11);
+    expect(consulted).toEqual([SWEEP_DUTY_INVENTORY.S11]);
+    // …and it did nothing while holding the slot: no kill of any kind, and no
+    // accountability wake row, so the attempt budget is intact.
+    expect(mockKillContainer).not.toHaveBeenCalled();
+    expect(inDb.prepare("SELECT id FROM messages_in WHERE id LIKE 'provider-heal-%'").all()).toHaveLength(0);
+    expect(countProviderHealAttemptsSinceRealInbound(mailbox)).toBe(0);
+
     armSelfHeal(false);
   });
 
