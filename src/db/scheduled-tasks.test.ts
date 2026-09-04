@@ -1113,6 +1113,113 @@ describe('test_scheduleTask_revalidates_the_session_after_the_await', () => {
   });
 
   /**
+   * An ADMITTED task must come back with its recall partner.
+   *
+   * The whole-row restore brought `trigger` back faithfully — and dropped the
+   * `recall-<id>` context row the upsert deletes. That pairing is not optional:
+   * the due-admission sweep rebuilds recall only for `trigger = 0` rows, so a
+   * restored `trigger = 1` task is never given one, and a container can claim it
+   * without the context the pair exists to guarantee.
+   *
+   * The condition is what makes this correct rather than blanket. An INERT task
+   * legitimately has no recall until the sweep builds one, so restoring a stale
+   * partner there would put back exactly what the upsert deletes it to avoid.
+   */
+  it('restores the recall partner of an admitted task, and only of an admitted one', async () => {
+    const processAfter = new Date(Date.now() + 86400000).toISOString();
+    const base = {
+      agentGroupId: AGENT_GROUP_ID,
+      cron: '0 5 * * *',
+      processAfter,
+      seriesId: 's-recall',
+    };
+    await scheduleTask({ ...base, id: 't-rc-1', prompt: 'first', destination: TEST_DESTINATION });
+    const sessionId = taskSessionIdFor('s-recall');
+
+    // The due-admission seam's output: the task flipped wakeable and given its
+    // context row. Planted directly because that seam is the sweep's, not this
+    // module's.
+    {
+      const db = openInboundDb(inboundPath(sessionId));
+      db.prepare("UPDATE messages_in SET trigger = 1 WHERE id = 't-rc-1'").run();
+      db.prepare(
+        `INSERT INTO messages_in
+           (id, seq, kind, timestamp, status, tries, process_after, recurrence, series_id, content,
+            platform_id, channel_type, thread_id, trigger)
+         VALUES ('recall-t-rc-1', 4, 'system', ?, 'pending', 0, NULL, NULL, 'recall-t-rc-1', ?, NULL, NULL, NULL, 0)`,
+      ).run(new Date().toISOString(), JSON.stringify({ subtype: 'recall_context' }));
+      db.close();
+    }
+
+    const idsAndTriggers = (): Array<{ id: string; trigger: number }> => {
+      const db = openInboundDb(inboundPath(sessionId));
+      const rows = db
+        .prepare("SELECT id, trigger FROM messages_in WHERE id IN ('t-rc-1', 'recall-t-rc-1') ORDER BY id")
+        .all() as Array<{ id: string; trigger: number }>;
+      db.close();
+      return rows;
+    };
+    expect(idsAndTriggers()).toEqual([
+      { id: 'recall-t-rc-1', trigger: 0 },
+      { id: 't-rc-1', trigger: 1 },
+    ]);
+
+    failsRoutingStamp.sessionId = sessionId;
+    await expect(
+      scheduleTask({ ...base, id: 't-rc-2', prompt: 'second', destination: TEST_DESTINATION }),
+    ).rejects.toThrow(/database is locked/);
+
+    // Both halves back: an admitted task with the context row that must
+    // accompany it.
+    expect(idsAndTriggers()).toEqual([
+      { id: 'recall-t-rc-1', trigger: 0 },
+      { id: 't-rc-1', trigger: 1 },
+    ]);
+  });
+
+  it('leaves an inert task without a recall partner, as a normal reschedule does', async () => {
+    const processAfter = new Date(Date.now() + 86400000).toISOString();
+    const base = {
+      agentGroupId: AGENT_GROUP_ID,
+      cron: '0 5 * * *',
+      processAfter,
+      seriesId: 's-recall-inert',
+    };
+    await scheduleTask({ ...base, id: 't-ri-1', prompt: 'first', destination: TEST_DESTINATION });
+    const sessionId = taskSessionIdFor('s-recall-inert');
+
+    // Inert (`trigger = 0`) and carrying a recall partner anyway — the shape a
+    // reschedule of an already-admitted row leaves behind mid-flight.
+    {
+      const db = openInboundDb(inboundPath(sessionId));
+      db.prepare(
+        `INSERT INTO messages_in
+           (id, seq, kind, timestamp, status, tries, process_after, recurrence, series_id, content,
+            platform_id, channel_type, thread_id, trigger)
+         VALUES ('recall-t-ri-1', 4, 'system', ?, 'pending', 0, NULL, NULL, 'recall-t-ri-1', ?, NULL, NULL, NULL, 0)`,
+      ).run(new Date().toISOString(), JSON.stringify({ subtype: 'recall_context' }));
+      db.close();
+    }
+
+    failsRoutingStamp.sessionId = sessionId;
+    await expect(
+      scheduleTask({ ...base, id: 't-ri-2', prompt: 'second', destination: TEST_DESTINATION }),
+    ).rejects.toThrow(/database is locked/);
+
+    // The task is back; the stale partner is not. The sweep builds a current
+    // one when the row becomes due, which is the entire reason the upsert
+    // deletes it.
+    const db = openInboundDb(inboundPath(sessionId));
+    const ids = (
+      db.prepare("SELECT id FROM messages_in WHERE id IN ('t-ri-1', 'recall-t-ri-1') ORDER BY id").all() as Array<{
+        id: string;
+      }>
+    ).map((r) => r.id);
+    db.close();
+    expect(ids).toEqual(['t-ri-1']);
+  });
+
+  /**
    * A series can hold more than one live row, and the undo must touch only one.
    *
    * `ncl tasks run` inserts a `<series>-run` occurrence alongside the scheduled

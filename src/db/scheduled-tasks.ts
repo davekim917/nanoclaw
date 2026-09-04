@@ -350,7 +350,7 @@ export async function scheduleTask(def: TaskDef): Promise<void> {
         setTaskRoutingPlatformId(sessionId, def.destination.platformId);
       } catch (err) {
         try {
-          mailbox.restoreTaskSeries(upserted.touchedId, upserted.prior);
+          mailbox.restoreTaskSeries(upserted.touchedId, upserted.prior, upserted.priorRecall);
         } catch (restoreErr) {
           // Both databases are now unhappy and the series is genuinely
           // inconsistent. Say so loudly; the caller still gets the original

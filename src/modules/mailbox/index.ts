@@ -389,7 +389,7 @@ export interface NanoclawMailboxSession extends MailboxSession {
    * more than one live row, so undoing by `series_id` would cancel a sibling
    * occurrence this write never touched.
    */
-  restoreTaskSeries(touchedId: string, prior: TaskSeriesSnapshot | null): void;
+  restoreTaskSeries(touchedId: string, prior: TaskSeriesSnapshot | null, priorRecall: TaskSeriesSnapshot | null): void;
   cancelSeriesWithStrandClear(taskId: string): number;
   upsertTaskSeries(row: {
     id: string;
@@ -839,7 +839,7 @@ function forkOps(
     armNextRecurrence: (originalId, msg, newId, nextRun, status) =>
       armNextTask(inbound, originalId, msg, newId, nextRun, status),
     restoreTaskRow: (snapshot) => restoreTaskRow(inbound, snapshot),
-    restoreTaskSeries: (touchedId, prior) => restoreTaskSeries(inbound, touchedId, prior),
+    restoreTaskSeries: (touchedId, prior, priorRecall) => restoreTaskSeries(inbound, touchedId, prior, priorRecall),
     cancelSeriesWithStrandClear: (taskId) => cancelSeriesWithStrandClear(inbound, taskId),
     upsertTaskSeries: (row) => upsertTaskSeries(inbound, row),
     listDueTaskRows: () => listDueTaskRows(inbound),

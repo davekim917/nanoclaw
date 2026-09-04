@@ -319,12 +319,53 @@ async function resolveTargetSession(
       // even though researcher itself is in agent-shared mode and
       // fallback.mgId is null). The originating-session semantic wins;
       // any cross-mg context already crossed at the original send.
-      if (fallback.mgId === null || candidate.messaging_group_id === fallback.mgId) {
+      //
+      // `fallback.mgId === null` has TWO causes and they are not the same
+      // permission. Either the caller is genuinely agent-shared — nothing was
+      // inherited, and the originating-session semantic above applies — or the
+      // caller HAS a messaging group and `resolveFallback` just refused to
+      // inherit it because the target's wiring was revoked during the awaited
+      // lookup. Reading the second as the first reuses an mg-bound candidate
+      // and delivers into a chat the target is no longer wired to, which is the
+      // exact bypass the cross-tenant gate exists to prevent.
+      //
+      // So an mg-BOUND candidate is accepted only while that wiring still
+      // exists, asked here rather than inferred from `fallback`. An
+      // agent-shared candidate binds no chat and needs no such proof. Self-sends
+      // keep their own threading, as the original gate exempts them.
+      const candidateMgId = candidate.messaging_group_id;
+      const candidateWiringHolds =
+        candidateMgId === null || targetAgentGroupId === sourceSession.agent_group_id
+          ? true
+          : targetWiredToMessagingGroup(targetAgentGroupId, candidateMgId);
+      if (!candidateWiringHolds) {
+        log.info('agent-route: return-path candidate abandoned — target no longer wired to its chat', {
+          from: sourceSession.agent_group_id,
+          to: targetAgentGroupId,
+          candidateSession: candidate.id,
+          candidateMgId,
+        });
+      } else if (fallback.mgId === null || candidate.messaging_group_id === fallback.mgId) {
         return { session: candidate, created: false, fallback };
       }
     }
   }
   return { ...resolveSession(targetAgentGroupId, fallback.mgId, fallback.threadId, fallback.mode), fallback };
+}
+
+/**
+ * Is this agent group still wired to this messaging group?
+ *
+ * The same question `resolveFallback` asks before inheriting a caller's chat,
+ * named once so the return-path candidate can ask it too and the two cannot
+ * drift into different definitions of "wired".
+ */
+function targetWiredToMessagingGroup(agentGroupId: string, messagingGroupId: string): boolean {
+  return (
+    getDb()
+      .prepare('SELECT 1 AS ok FROM messaging_group_agents WHERE agent_group_id = ? AND messaging_group_id = ?')
+      .get(agentGroupId, messagingGroupId) !== undefined
+  );
 }
 
 export async function routeAgentMessage(
@@ -479,10 +520,7 @@ async function performAgentRoute(
   const resolveFallback = (): SessionFallback => {
     let inheritMg = false;
     if (callerMgId && targetAgentGroupId !== session.agent_group_id) {
-      const wired = getDb()
-        .prepare('SELECT 1 AS ok FROM messaging_group_agents WHERE agent_group_id = ? AND messaging_group_id = ?')
-        .get(targetAgentGroupId, callerMgId) as { ok: number } | undefined;
-      inheritMg = !!wired;
+      inheritMg = targetWiredToMessagingGroup(targetAgentGroupId, callerMgId);
       if (!inheritMg) {
         log.info('agent-route: target not wired to caller mg — using agent-shared session', {
           from: session.agent_group_id,
@@ -612,11 +650,27 @@ async function performAgentRoute(
         sourceSessionId: session.id,
       },
       {
+        // TWO preconditions, both re-proved by the writer at the insert.
+        //
+        // The destination grant, and — for a target session BOUND to a chat —
+        // that the target is still wired to it. The session was chosen before
+        // `addThreadContext` and before this call's own awaits, so a wiring
+        // revoked in either window would otherwise deliver into a chat the
+        // target no longer belongs to.
         guard: () => {
           const verdict = proveDestination();
-          return verdict.effect === 'allow'
-            ? true
-            : { ok: false as const, reason: verdict.reason ?? 'destination grant revoked while routing' };
+          if (verdict.effect !== 'allow') {
+            return { ok: false as const, reason: verdict.reason ?? 'destination grant revoked while routing' };
+          }
+          const targetMgId = targetSession.messaging_group_id;
+          if (
+            targetMgId !== null &&
+            targetAgentGroupId !== session.agent_group_id &&
+            !targetWiredToMessagingGroup(targetAgentGroupId, targetMgId)
+          ) {
+            return { ok: false as const, reason: `target is no longer wired to messaging group ${targetMgId}` };
+          }
+          return true;
         },
       },
     );

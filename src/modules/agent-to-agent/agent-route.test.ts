@@ -533,6 +533,62 @@ describe('routeAgentMessage return-path', () => {
     expect(readPairedInboundTriggers(A, S2.id)).toHaveLength(0);
   });
 
+  /**
+   * A return-path candidate bound to a chat needs that wiring to still exist.
+   *
+   * `resolveFallback` refuses to inherit a caller's messaging group once the
+   * target's wiring is revoked, and reports that by returning `mgId: null`. But
+   * `mgId === null` also means "the caller is agent-shared", and the candidate
+   * check read the two as one permission — so a revocation during the awaited
+   * lookup produced an agent-shared fallback, which was then taken as licence to
+   * reuse the mg-BOUND candidate from the earlier exchange. The reply landed in
+   * a chat the target no longer belongs to, which is the exact bypass the
+   * cross-tenant gate exists to prevent.
+   */
+  it('does not reuse an mg-bound return-path candidate whose wiring was revoked mid-lookup', async () => {
+    // A chat A belongs to. The forward runs BEFORE S1 is bound to it, so it
+    // lands in SB the ordinary way; binding S1 afterwards is what makes the
+    // return-path candidate mg-BOUND, which is the only shape at issue here.
+    getDb()
+      .prepare(
+        `INSERT INTO messaging_groups (id, channel_type, instance, platform_id, name, is_group, unknown_sender_policy, created_at)
+         VALUES ('mg-shared', 'slack', 'slack', 'slack:C-shared', 'Shared', 1, 'public', ?)`,
+      )
+      .run(now());
+    getDb()
+      .prepare(
+        `INSERT INTO messaging_group_agents (id, messaging_group_id, agent_group_id, created_at)
+         VALUES ('mga-a', 'mg-shared', ?, ?)`,
+      )
+      .run(A, now());
+
+    await routeAgentMessage(
+      { id: 'msg-wire-fwd', platform_id: B, content: JSON.stringify({ text: 'ping' }), in_reply_to: null },
+      S1,
+    );
+    const inboundId = readPairedInboundTriggers(B, SB.id)[0].id;
+    // Bound directly: `updateSession` deliberately does not expose the mg
+    // column, and this is planting a prior exchange's shape, not a route.
+    getDb().prepare("UPDATE sessions SET messaging_group_id = 'mg-shared' WHERE id = ?").run(S1.id);
+
+    // The admin unwires A from that chat while B's reply is mid-lookup.
+    duringSourceLookup.run = () => {
+      getDb()
+        .prepare("DELETE FROM messaging_group_agents WHERE agent_group_id = ? AND messaging_group_id = 'mg-shared'")
+        .run(A);
+    };
+
+    await routeAgentMessage(
+      { id: 'msg-wire-reply', platform_id: A, content: JSON.stringify({ text: 'pong' }), in_reply_to: inboundId },
+      SB,
+    );
+
+    // The mg-bound candidate is abandoned; the reply takes the agent-shared
+    // path instead of being delivered into the chat A was just removed from.
+    expect(readPairedInboundTriggers(A, S1.id)).toHaveLength(0);
+    expect(readPairedInboundTriggers(A, S2.id)).toHaveLength(1);
+  });
+
   it('self-message is allowed without a destination row', async () => {
     // A targets itself — no agent_destinations row exists for A→A.
     await routeAgentMessage(

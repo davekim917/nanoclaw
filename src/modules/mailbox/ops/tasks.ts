@@ -463,6 +463,13 @@ export interface TaskSeriesSnapshot {
 export interface UpsertedTaskSeries {
   touchedId: string;
   prior: TaskSeriesSnapshot | null;
+  /**
+   * The `recall-<id>` context row as it stood beside `prior`, or `null`.
+   *
+   * Captured because the upsert DELETES it, and whether that deletion should be
+   * undone depends on the task row's own `trigger` — see `restoreTaskSeries`.
+   */
+  priorRecall: TaskSeriesSnapshot | null;
 }
 
 /**
@@ -494,16 +501,37 @@ export interface UpsertedTaskSeries {
  * Two fields do not come back byte-identical, both deliberately:
  *   - `seq` is freshly allocated, because the row is re-inserted. A successful
  *     re-schedule re-seqs too, so this is a state the series reaches normally.
- *   - the recall partner stays deleted. The upsert removes it precisely so a
- *     stale context cannot ride along, and the next due sweep rebuilds it. A
- *     compensated row therefore sits inert with no recall, which is exactly
- *     where a normal re-schedule leaves it.
+ *
+ * The RECALL PARTNER comes back only when the task row it belongs to was
+ * ADMITTED (`trigger = 1`), and that condition is the whole subtlety. An inert
+ * task (`trigger = 0`) has its context rebuilt by the due-admission sweep, so
+ * leaving the recall deleted is exactly where a normal re-schedule leaves it.
+ * An ADMITTED task is different: the sweep rebuilds recall only for
+ * `trigger = 0` rows, so it will never rebuild this one — and a restored
+ * `trigger = 1` task with no recall partner is claimable by a container without
+ * the context row the pair exists to guarantee. The first version of this undo
+ * restored `trigger` faithfully and dropped the partner, which produced exactly
+ * that.
  *
  * EVERY OTHER COLUMN comes back exactly, including ones nobody thought to name
  * — `tries`, `trigger`, `timestamp` — because the restore is built from the
  * snapshot's own keys rather than from a list written here.
  */
-export function restoreTaskSeries(db: Database.Database, touchedId: string, prior: TaskSeriesSnapshot | null): void {
+export function restoreTaskSeries(
+  db: Database.Database,
+  touchedId: string,
+  prior: TaskSeriesSnapshot | null,
+  priorRecall: TaskSeriesSnapshot | null = null,
+): void {
+  const insertWholeRow = (row: TaskSeriesSnapshot): void => {
+    const columns = Object.keys(row).filter((column) => column !== 'seq');
+    const values: Record<string, unknown> = { seq: nextEvenSeq(db) };
+    for (const column of columns) values[column] = row[column];
+    db.prepare(
+      `INSERT INTO messages_in (seq, ${columns.join(', ')})
+       VALUES (@seq, ${columns.map((column) => `@${column}`).join(', ')})`,
+    ).run(values);
+  };
   db.transaction(() => {
     // The update branch already removed this; the insert branch never had one.
     // Kept so the undo is complete on its own terms rather than by relying on
@@ -521,13 +549,11 @@ export function restoreTaskSeries(db: Database.Database, touchedId: string, prio
     // `seq` is the single exception, and it is reallocated rather than
     // restored: a successful re-schedule allocates a fresh one too, so this is
     // a value the row reaches normally.
-    const columns = Object.keys(prior).filter((column) => column !== 'seq');
-    const values: Record<string, unknown> = { seq: nextEvenSeq(db) };
-    for (const column of columns) values[column] = prior[column];
-    db.prepare(
-      `INSERT INTO messages_in (seq, ${columns.join(', ')})
-       VALUES (@seq, ${columns.map((column) => `@${column}`).join(', ')})`,
-    ).run(values);
+    // The recall partner goes back FIRST, so the pair keeps its original order:
+    // context below its trigger, on adjacent even seqs, exactly as
+    // `insertMessageWithContext` writes it.
+    if (priorRecall && prior.trigger === 1) insertWholeRow(priorRecall);
+    insertWholeRow(prior);
   })();
 }
 
@@ -573,6 +599,13 @@ export function upsertTaskSeries(
         .get(row.seriesId) as TaskSeriesSnapshot | undefined;
 
       if (activeRow) {
+        // Captured BEFORE the delete below, in the same statement sequence that
+        // chose the task row, so the pair a compensation puts back is the pair
+        // this upsert actually took apart.
+        const priorRecall =
+          (db.prepare("SELECT * FROM messages_in WHERE id = ? AND kind = 'system'").get(`recall-${activeRow.id}`) as
+            | TaskSeriesSnapshot
+            | undefined) ?? null;
         db.prepare("DELETE FROM messages_in WHERE id = ? AND kind = 'system'").run(`recall-${activeRow.id}`);
         db.prepare(
           `UPDATE messages_in
@@ -600,7 +633,7 @@ export function upsertTaskSeries(
           row.threadId,
           activeRow.id,
         );
-        return { touchedId: activeRow.id, prior: activeRow };
+        return { touchedId: activeRow.id, prior: activeRow, priorRecall };
       }
 
       db.prepare(
@@ -621,7 +654,7 @@ export function upsertTaskSeries(
         row.channelType,
         row.threadId,
       );
-      return { touchedId: row.id, prior: null };
+      return { touchedId: row.id, prior: null, priorRecall: null };
     })
     .immediate();
 }
