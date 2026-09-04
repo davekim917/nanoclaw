@@ -1,9 +1,19 @@
-import { describe, it, expect, afterEach } from 'vitest';
+import { describe, it, expect, afterEach, beforeEach } from 'vitest';
 import Database from 'better-sqlite3';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
-import { buildCentralProjection, buildArchiveProjection } from './per-agent-projections.js';
+import {
+  buildCentralProjection,
+  buildArchiveProjection,
+  appendArchiveProjection,
+  decideArchiveProjectionMode,
+  readArchiveScopeSignature,
+  ARCHIVE_DEDUP_KEY_SQL,
+  ARCHIVE_PROJECTION_STAMP_VERSION,
+  type ArchiveProjectionStamp,
+} from './per-agent-projections.js';
+import { ARCHIVE_MUTATION_MARKS_SQL } from '../message-archive.js';
 import { migration025 } from './migrations/025-agent-group-capabilities.js';
 import { migration026 } from './migrations/026-tasks-and-dispatch-routing.js';
 
@@ -175,6 +185,9 @@ function makeArchiveSrc(label: string): string {
       channel_name        TEXT
     );
   `);
+  // The real archive's mutation counters, from the writer that owns them, so
+  // the fixture cannot drift from what `initSchema` actually creates.
+  db.exec(ARCHIVE_MUTATION_MARKS_SQL);
   db.close();
   return p;
 }
@@ -746,5 +759,474 @@ describe('buildCentralProjection', () => {
 
     expect(countRows(dst, 'backlog_items')).toBe(1);
     expect(countRows(dst, 'ship_log')).toBe(1);
+  });
+});
+
+
+// ── #360: incremental append instead of a full rebuild ───────────────────────
+
+/** The columns that decide what a container sees. Archive ids are not among them. */
+function contentRows(p: string): Array<Record<string, unknown>> {
+  return getAllArchiveRows(p)
+    .map((r) => ({
+      agent_group_id: r.agent_group_id,
+      messaging_group_id: r.messaging_group_id,
+      thread_id: r.thread_id,
+      role: r.role,
+      sender_id: r.sender_id,
+      text: r.text,
+      sent_at: r.sent_at,
+    }))
+    .sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b)));
+}
+
+function ftsHits(p: string, term: string): number {
+  const db = new Database(p, { readonly: true });
+  try {
+    const row = db
+      .prepare(`SELECT COUNT(*) AS n FROM messages_archive_fts WHERE messages_archive_fts MATCH ?`)
+      .get(term) as { n: number };
+    return row.n;
+  } finally {
+    db.close();
+  }
+}
+
+function maxRowid(p: string, scope: string[]): number {
+  const db = new Database(p, { readonly: true });
+  try {
+    const row = db
+      .prepare(
+        `SELECT COALESCE(MAX(rowid), 0) AS m FROM messages_archive WHERE agent_group_id IN (${scope
+          .map(() => '?')
+          .join(', ')})`,
+      )
+      .get(...scope) as { m: number };
+    return row.m;
+  } finally {
+    db.close();
+  }
+}
+
+function twoSiblingSource(label: string): string {
+  const src = makeArchiveSrc(label);
+  addWorkgroup(src, 'wg-append', 'ag-test-a');
+  addAgentWithWorkgroup(src, 'ag-test-a', 'folder-test-a', 'wg-append');
+  addAgentWithWorkgroup(src, 'ag-test-b', 'folder-test-b', 'wg-append');
+  // The same user message archived against both siblings, plus one reply each.
+  addArchiveMsg(src, {
+    id: 'm1-a',
+    agent_group_id: 'ag-test-a',
+    role: 'user',
+    sender_id: 'u-1',
+    text: 'first question',
+    sent_at: '2026-01-01T10:00:00Z',
+  });
+  addArchiveMsg(src, {
+    id: 'm1-b',
+    agent_group_id: 'ag-test-b',
+    role: 'user',
+    sender_id: 'u-1',
+    text: 'first question',
+    sent_at: '2026-01-01T10:00:00Z',
+  });
+  addArchiveMsg(src, {
+    id: 'r1-a',
+    agent_group_id: 'ag-test-a',
+    role: 'assistant',
+    sender_id: 'ag-test-a',
+    text: 'first answer',
+    sent_at: '2026-01-01T10:01:00Z',
+  });
+  return src;
+}
+
+describe('appendArchiveProjection — #360', () => {
+  const scope = ['ag-test-a', 'ag-test-b'];
+
+  it('lands the same row set as a fresh full build of the grown source', () => {
+    const src = twoSiblingSource('append-equiv-src');
+    const dst = tmpPath('append-equiv-dst');
+    buildArchiveProjection(src, dst, 'ag-test-a', scope);
+    const watermark = maxRowid(src, scope);
+
+    addArchiveMsg(src, {
+      id: 'm2-a',
+      agent_group_id: 'ag-test-a',
+      role: 'user',
+      sender_id: 'u-1',
+      text: 'second question',
+      sent_at: '2026-01-01T11:00:00Z',
+    });
+    addArchiveMsg(src, {
+      id: 'm2-b',
+      agent_group_id: 'ag-test-b',
+      role: 'user',
+      sender_id: 'u-1',
+      text: 'second question',
+      sent_at: '2026-01-01T11:00:00Z',
+    });
+    addArchiveMsg(src, {
+      id: 'r2-b',
+      agent_group_id: 'ag-test-b',
+      role: 'assistant',
+      sender_id: 'ag-test-b',
+      text: 'second answer',
+      sent_at: '2026-01-01T11:01:00Z',
+    });
+
+    const { written, merged } = appendArchiveProjection(src, dst, 'ag-test-a', watermark, scope);
+    // The sibling pair collapses to one row, so three new source rows land as two.
+    expect(written).toBe(2);
+    expect(merged).toBe(0);
+
+    const expected = tmpPath('append-equiv-expected');
+    buildArchiveProjection(src, expected, 'ag-test-a', scope);
+    expect(contentRows(dst)).toEqual(contentRows(expected));
+    expect(getAllArchiveRows(dst)).toHaveLength(getAllArchiveRows(expected).length);
+  });
+
+  it('inserts nothing for a sibling duplicate of an already-projected message', () => {
+    const src = twoSiblingSource('append-dup-src');
+    const dst = tmpPath('append-dup-dst');
+    buildArchiveProjection(src, dst, 'ag-test-a', scope);
+    const before = getAllArchiveRows(dst);
+    const watermark = maxRowid(src, scope);
+
+    // The sibling's copy of the FIRST question arrives late — it is content-
+    // identical to a row the full build already collapsed and projected.
+    addArchiveMsg(src, {
+      id: 'm1-b-late',
+      agent_group_id: 'ag-test-b',
+      role: 'user',
+      sender_id: 'u-1',
+      text: 'first question',
+      sent_at: '2026-01-01T10:00:00Z',
+    });
+
+    // Nothing new is inserted, and the merge is a no-op because the late copy
+    // carries no metadata the projected row is missing.
+    expect(appendArchiveProjection(src, dst, 'ag-test-a', watermark, scope)).toEqual({ written: 0, merged: 0 });
+    expect(getAllArchiveRows(dst)).toEqual(before);
+  });
+
+  it('makes appended rows findable through messages_archive_fts', () => {
+    const src = twoSiblingSource('append-fts-src');
+    const dst = tmpPath('append-fts-dst');
+    buildArchiveProjection(src, dst, 'ag-test-a', scope);
+    const watermark = maxRowid(src, scope);
+    expect(ftsHits(dst, 'zarquon')).toBe(0);
+
+    addArchiveMsg(src, {
+      id: 'm3-a',
+      agent_group_id: 'ag-test-a',
+      role: 'user',
+      sender_id: 'u-1',
+      text: 'the zarquon question',
+      sent_at: '2026-01-01T12:00:00Z',
+    });
+    expect(appendArchiveProjection(src, dst, 'ag-test-a', watermark, scope).written).toBe(1);
+    expect(ftsHits(dst, 'zarquon')).toBe(1);
+  });
+
+  it('resolves the dedup guard through an index, not a scan of the projection', () => {
+    // The guard runs once per candidate row against a projection that reaches
+    // 240 MB on the live host. If the planner ever stops using
+    // idx_archive_thread(agent_group_id, thread_id, sent_at) for it — an `IS`
+    // on a nullable column that stopped being index-usable, a dropped index —
+    // the append quietly becomes quadratic and is slower than the full rebuild
+    // it replaced.
+    const src = twoSiblingSource('append-plan-src');
+    const dst = tmpPath('append-plan-dst');
+    buildArchiveProjection(src, dst, 'ag-test-a', scope);
+
+    const db = new Database(dst, { readonly: true });
+    try {
+      // The REAL predicate, imported, not retyped: a future edit to
+      // ARCHIVE_DEDUP_KEY_SQL that loses the index has to fail here, which it
+      // could not do if this test carried its own copy of the SQL.
+      const plan = (
+        db
+          .prepare(`EXPLAIN QUERY PLAN SELECT 1 FROM messages_archive WHERE ${ARCHIVE_DEDUP_KEY_SQL}`)
+          .all({
+            agent_group_id: 'ag-test-a',
+            thread_id: 'thread-1',
+            sent_at: '2026-01-01T10:00:00Z',
+            messaging_group_id: 'mg-1',
+            role: 'user',
+            sender_id: 'u-1',
+            text: 'first question',
+          }) as Array<{ detail: string }>
+      )
+        .map((r) => r.detail)
+        .join(' | ');
+      expect(plan, `dedup guard fell back to a table scan: ${plan}`).toMatch(/USING (COVERING )?INDEX/);
+      expect(plan).not.toMatch(/SCAN messages_archive(?! USING)/);
+    } finally {
+      db.close();
+    }
+  });
+
+  it('merges a late duplicate into the projected row instead of discarding it', () => {
+    const src = twoSiblingSource('append-merge-src');
+    const dst = tmpPath('append-merge-dst');
+    buildArchiveProjection(src, dst, 'ag-test-a', scope);
+    const watermark = maxRowid(src, scope);
+
+    // The projected copy of 'first question' came from a row with no
+    // sender_name and no channel_name. The sibling's copy arrives later WITH
+    // both. The full build would fold them in with MAX(); an append that just
+    // dropped the duplicate would leave the projection permanently missing
+    // them, since the stamp advances either way and thread-search reads them.
+    withDb(src, (db) => {
+      db.prepare(
+        `INSERT INTO messages_archive
+           (id, agent_group_id, messaging_group_id, channel_type, thread_id, role,
+            sender_id, sender_name, text, sent_at, created_at, channel_name)
+         VALUES ('m1-b-late', 'ag-test-b', 'mg-1', 'slack', 'thread-1', 'user',
+                 'u-1', 'Real Name', 'first question', '2026-01-01T10:00:00Z',
+                 '2026-01-01T00:00:00Z', 'general')`,
+      ).run();
+    });
+
+    expect(appendArchiveProjection(src, dst, 'ag-test-a', watermark, scope)).toEqual({ written: 0, merged: 1 });
+
+    const mergedRow = getAllArchiveRows(dst).find((r) => r.text === 'first question');
+    expect(mergedRow?.sender_name).toBe('Real Name');
+    expect(mergedRow?.channel_name).toBe('general');
+
+    // Full parity with a fresh full build, ids included.
+    const expected = tmpPath('append-merge-expected');
+    buildArchiveProjection(src, expected, 'ag-test-a', scope);
+    expect(getAllArchiveRows(dst)).toEqual(getAllArchiveRows(expected));
+  });
+
+  it('never lets a NULL in the late copy erase metadata already projected', () => {
+    const src = twoSiblingSource('append-nullsafe-src');
+    // Give the FIRST copy the metadata, so the late one has NULLs where the
+    // projected row has values. SQLite's scalar max() returns NULL if either
+    // argument is NULL, so a bare max() here would wipe the projected name.
+    withDb(src, (db) => {
+      db.prepare("UPDATE messages_archive SET sender_name = 'Real Name' WHERE id = 'm1-a'").run();
+    });
+    const dst = tmpPath('append-nullsafe-dst');
+    buildArchiveProjection(src, dst, 'ag-test-a', scope);
+    const watermark = maxRowid(src, scope);
+
+    withDb(src, (db) => {
+      db.prepare(
+        `INSERT INTO messages_archive
+           (id, agent_group_id, messaging_group_id, channel_type, thread_id, role,
+            sender_id, sender_name, text, sent_at, created_at, channel_name)
+         VALUES ('m1-b-null', 'ag-test-b', 'mg-1', 'slack', 'thread-1', 'user',
+                 'u-1', NULL, 'first question', '2026-01-01T10:00:00Z',
+                 '2026-01-01T00:00:00Z', NULL)`,
+      ).run();
+    });
+
+    // merged 0 is the assertion, not an accident: the NULL-safe fold produces
+    // exactly what is already stored, so nothing is rewritten. A bare
+    // max(sender_name, @sender_name) would instead have written NULL over the
+    // name and reported a merge.
+    expect(appendArchiveProjection(src, dst, 'ag-test-a', watermark, scope)).toEqual({ written: 0, merged: 0 });
+    const mergedRow = getAllArchiveRows(dst).find((r) => r.text === 'first question');
+    expect(mergedRow?.sender_name).toBe('Real Name');
+
+    const expected = tmpPath('append-nullsafe-expected');
+    buildArchiveProjection(src, expected, 'ag-test-a', scope);
+    expect(getAllArchiveRows(dst)).toEqual(getAllArchiveRows(expected));
+  });
+
+  it('appends in legacy single-agent mode, guarding on the primary key', () => {
+    const src = twoSiblingSource('append-legacy-src');
+    const dst = tmpPath('append-legacy-dst');
+    buildArchiveProjection(src, dst, 'ag-test-a');
+    const watermark = maxRowid(src, ['ag-test-a']);
+
+    addArchiveMsg(src, {
+      id: 'legacy-new',
+      agent_group_id: 'ag-test-a',
+      role: 'user',
+      sender_id: 'u-1',
+      text: 'legacy addition',
+      sent_at: '2026-01-01T13:00:00Z',
+    });
+    // A verbatim repeat under a DIFFERENT id is a genuinely distinct legacy row
+    // and must survive: legacy mode has no dedup in the full build either.
+    addArchiveMsg(src, {
+      id: 'legacy-new-2',
+      agent_group_id: 'ag-test-a',
+      role: 'user',
+      sender_id: 'u-1',
+      text: 'legacy addition',
+      sent_at: '2026-01-01T13:00:00Z',
+    });
+    expect(appendArchiveProjection(src, dst, 'ag-test-a', watermark)).toEqual({ written: 2, merged: 0 });
+
+    const expected = tmpPath('append-legacy-expected');
+    buildArchiveProjection(src, expected, 'ag-test-a');
+    expect(getAllArchiveRows(dst)).toEqual(getAllArchiveRows(expected));
+
+    // Re-running the same append is a no-op: every id is already present, and
+    // legacy mode never merges.
+    expect(appendArchiveProjection(src, dst, 'ag-test-a', watermark)).toEqual({ written: 0, merged: 0 });
+  });
+});
+
+describe('readArchiveScopeSignature — #360', () => {
+  it('counts only the scope\'s own rows and its own mutations', () => {
+    const src = twoSiblingSource('signature-src');
+    addAgentWithWorkgroup(src, 'ag-test-c', 'folder-test-c', 'wg-other');
+    addArchiveMsg(src, {
+      id: 'other-1',
+      agent_group_id: 'ag-test-c',
+      role: 'user',
+      sender_id: 'u-9',
+      text: 'other workgroup',
+      sent_at: '2026-01-01T10:00:00Z',
+    });
+
+    const scope = ['ag-test-a', 'ag-test-b'];
+    const mine = readArchiveScopeSignature(src, 'ag-test-a', scope);
+    expect(mine.count).toBe(3);
+    expect(mine.mutations).toBe(0);
+
+    // An edit in the OTHER workgroup moves its counter, never mine.
+    withDb(src, (db) => {
+      db.prepare("UPDATE messages_archive SET text = 'edited elsewhere' WHERE id = 'other-1'").run();
+    });
+    expect(readArchiveScopeSignature(src, 'ag-test-a', scope)).toEqual(mine);
+    expect(readArchiveScopeSignature(src, 'ag-test-c', ['ag-test-c']).mutations).toBe(1);
+
+    // An edit inside my scope does move mine.
+    withDb(src, (db) => {
+      db.prepare("UPDATE messages_archive SET text = 'edited here' WHERE id = 'r1-a'").run();
+    });
+    expect(readArchiveScopeSignature(src, 'ag-test-a', scope).mutations).toBe(1);
+  });
+
+  it('reports an unknown mutation count for an archive with no marks table', () => {
+    const src = tmpPath('signature-nomarks');
+    const db = new Database(src);
+    db.exec(`
+      CREATE TABLE messages_archive (
+        id TEXT PRIMARY KEY, agent_group_id TEXT NOT NULL, messaging_group_id TEXT,
+        channel_type TEXT NOT NULL, platform_id TEXT, thread_id TEXT, role TEXT NOT NULL,
+        sender_id TEXT, sender_name TEXT, text TEXT NOT NULL, sent_at TEXT NOT NULL,
+        created_at TEXT NOT NULL, channel_name TEXT
+      );
+    `);
+    db.close();
+    expect(readArchiveScopeSignature(src, 'ag-test-a', ['ag-test-a']).mutations).toBeNull();
+  });
+
+  it('waits on a writer holding the source lock rather than failing instantly', () => {
+    const src = twoSiblingSource('signature-busy');
+    // An EXCLUSIVE transaction left open on the source is what the host's
+    // synchronous archive writer looks like mid-commit. v1 touched the source
+    // only when it was already rebuilding; v2 reads it on every spawn, so this
+    // is now on the hot path and must wait rather than abort the spawn.
+    const writer = new Database(src);
+    writer.exec('BEGIN EXCLUSIVE');
+    try {
+      const startedAt = Date.now();
+      let threw: unknown = null;
+      try {
+        readArchiveScopeSignature(src, 'ag-test-a', ['ag-test-a', 'ag-test-b']);
+      } catch (err) {
+        threw = err;
+      }
+      const elapsed = Date.now() - startedAt;
+      // Whether it eventually wins or eventually gives up, it must have WAITED
+      // — an unset busy timeout returns SQLITE_BUSY in microseconds.
+      expect(elapsed, `gave up after ${elapsed}ms, so no busy timeout was in effect`).toBeGreaterThan(500);
+      if (threw) expect(String((threw as { code?: string }).code)).toMatch(/SQLITE_BUSY/);
+    } finally {
+      writer.exec('ROLLBACK');
+      writer.close();
+    }
+  }, 30_000);
+
+  it('reads a missing source as an empty, unedited scope', () => {
+    expect(readArchiveScopeSignature(path.join(os.tmpdir(), 'ncproj-absent.db'), 'ag-test-a')).toEqual({
+      count: 0,
+      maxRowid: 0,
+      mutations: 0,
+    });
+  });
+});
+
+describe('decideArchiveProjectionMode — #360', () => {
+  function stamp(overrides: Partial<ArchiveProjectionStamp> = {}): ArchiveProjectionStamp {
+    return {
+      version: ARCHIVE_PROJECTION_STAMP_VERSION,
+      agentGroupId: 'ag-test-a',
+      scope: ['ag-test-a', 'ag-test-b'],
+      rows: { count: 10, maxRowid: 100 },
+      mutations: 0,
+      ...overrides,
+    };
+  }
+
+  let dst: string;
+  beforeEach(() => {
+    dst = tmpPath('decide-dst');
+    fs.writeFileSync(dst, 'not empty');
+  });
+
+  it('reuses when the scope has not moved', () => {
+    expect(decideArchiveProjectionMode(dst, stamp(), stamp())).toEqual({ mode: 'reused', sinceRowid: null });
+  });
+
+  it('appends when both counters grew', () => {
+    const next = stamp({ rows: { count: 12, maxRowid: 140 } });
+    expect(decideArchiveProjectionMode(dst, stamp(), next)).toEqual({ mode: 'appended', sinceRowid: 100 });
+  });
+
+  it('rebuilds when the row count went down', () => {
+    const next = stamp({ rows: { count: 9, maxRowid: 100 } });
+    expect(decideArchiveProjectionMode(dst, stamp(), next).mode).toBe('rebuilt');
+  });
+
+  it('rebuilds when maxRowid moved without the count moving', () => {
+    const next = stamp({ rows: { count: 10, maxRowid: 140 } });
+    expect(decideArchiveProjectionMode(dst, stamp(), next).mode).toBe('rebuilt');
+  });
+
+  it('rebuilds when maxRowid went DOWN at an unchanged count', () => {
+    // A restore from backup can land a file with the same number of rows and a
+    // lower high-water mark. Reuse would serve rows the source no longer has,
+    // and append would start from a watermark above everything present.
+    const next = stamp({ rows: { count: 10, maxRowid: 60 } });
+    expect(decideArchiveProjectionMode(dst, stamp(), next).mode).toBe('rebuilt');
+  });
+
+  it('rebuilds on any maxRowid decrease, whatever the count did', () => {
+    for (const count of [8, 10, 12]) {
+      const next = stamp({ rows: { count, maxRowid: 60 } });
+      expect(decideArchiveProjectionMode(dst, stamp(), next).mode, `count ${count}`).toBe('rebuilt');
+    }
+  });
+
+  it('rebuilds on an in-place edit, which no watermark can see', () => {
+    const next = stamp({ rows: { count: 10, maxRowid: 100 }, mutations: 1 });
+    expect(decideArchiveProjectionMode(dst, stamp(), next).mode).toBe('rebuilt');
+    // ...including when rows were appended in the same window.
+    const both = stamp({ rows: { count: 12, maxRowid: 140 }, mutations: 1 });
+    expect(decideArchiveProjectionMode(dst, stamp(), both).mode).toBe('rebuilt');
+  });
+
+  it('rebuilds when either side could not count mutations', () => {
+    expect(decideArchiveProjectionMode(dst, stamp({ mutations: null }), stamp()).mode).toBe('rebuilt');
+    expect(decideArchiveProjectionMode(dst, stamp(), stamp({ mutations: null })).mode).toBe('rebuilt');
+  });
+
+  it('rebuilds for a v1 stamp, a changed scope, a changed agent and a missing projection', () => {
+    expect(decideArchiveProjectionMode(dst, null, stamp()).mode).toBe('rebuilt');
+    expect(decideArchiveProjectionMode(dst, stamp({ version: 1 }), stamp()).mode).toBe('rebuilt');
+    expect(decideArchiveProjectionMode(dst, stamp({ scope: ['ag-test-a'] }), stamp()).mode).toBe('rebuilt');
+    expect(decideArchiveProjectionMode(dst, stamp({ agentGroupId: 'ag-test-b' }), stamp()).mode).toBe('rebuilt');
+    fs.writeFileSync(dst, '');
+    expect(decideArchiveProjectionMode(dst, stamp(), stamp()).mode).toBe('rebuilt');
   });
 });

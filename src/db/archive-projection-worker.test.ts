@@ -7,6 +7,7 @@
  * an unchanged source is not rebuilt, and a rebuild that fails still aborts the
  * spawn.
  */
+import { createHash } from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -15,7 +16,7 @@ import path from 'node:path';
 import Database from 'better-sqlite3';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { enforceHermeticity } from '../test-hermeticity.js';
+import { allowWritesTo, clearHermeticityAttempts, enforceHermeticity } from '../test-hermeticity.js';
 import {
   __setArchiveProjectionWorkerFactoryForTest,
   ensureArchiveProjection,
@@ -26,8 +27,11 @@ import {
   archiveProjectionStampPath,
   buildArchiveProjection,
   computeArchiveProjectionStamp,
+  materializeArchiveProjection,
   readArchiveProjectionStamp,
+  removeArchiveProjectionStamp,
 } from './per-agent-projections.js';
+import { ARCHIVE_MUTATION_MARKS_SQL, ARCHIVE_UPSERT_SQL } from '../message-archive.js';
 
 // The stamp path (per-agent-projections.js) is always `DATA_DIR/projection-
 // stamps/<digest>.json`, regardless of where the projection db itself lives —
@@ -97,10 +101,18 @@ function makeTwoWorkgroupSource(label: string): string {
       sender_name         TEXT,
       text                TEXT NOT NULL,
       sent_at             TEXT NOT NULL,
-      created_at          TEXT NOT NULL,
+      -- Same DEFAULT as the real schema in message-archive.ts. Load-bearing:
+      -- the host's upsert does not supply created_at, so a fixture without it
+      -- fails NOT NULL on any write driven through ARCHIVE_UPSERT_SQL.
+      created_at          TEXT NOT NULL DEFAULT (datetime('now')),
       channel_name        TEXT
     );
+    CREATE INDEX idx_archive_ag_sent ON messages_archive(agent_group_id, sent_at);
+    CREATE INDEX idx_archive_thread ON messages_archive(agent_group_id, thread_id, sent_at);
   `);
+  // The mutation counters the freshness stamp reads, taken from the writer that
+  // owns them so the fixture cannot drift from what `initSchema` creates.
+  db.exec(ARCHIVE_MUTATION_MARKS_SQL);
   const insert = db.prepare(
     `INSERT INTO messages_archive
        (id, agent_group_id, messaging_group_id, channel_type, platform_id, thread_id,
@@ -175,6 +187,75 @@ function makeTwoWorkgroupSource(label: string): string {
   return file;
 }
 
+/** Archive one more message against `agentGroupId`, as the host's writer would. */
+function archiveInto(file: string, row: Msg): void {
+  const db = new Database(file);
+  try {
+    db.prepare(
+      `INSERT INTO messages_archive
+         (id, agent_group_id, messaging_group_id, channel_type, platform_id, thread_id,
+          role, sender_id, sender_name, text, sent_at, created_at, channel_name)
+       VALUES (?, ?, ?, 'slack', 'p1', ?, ?, ?, 'Someone', ?, ?, '2026-01-01T00:00:00Z', 'general')`,
+    ).run(
+      row.id,
+      row.agent_group_id,
+      row.messaging_group_id ?? 'mg-1',
+      row.thread_id ?? 'thread-1',
+      row.role,
+      row.sender_id,
+      row.text,
+      row.sent_at,
+    );
+  } finally {
+    db.close();
+  }
+}
+
+/**
+ * Archive a message through the host's REAL write statement.
+ *
+ * Not a hand-copied lookalike: `ARCHIVE_UPSERT_SQL` is the one statement
+ * `archiveMessage`/`upsertArchiveMessage` run, so an "edit" here is exactly the
+ * `ON CONFLICT(id) DO UPDATE` an edited chat message or a redelivered outbound
+ * row produces on the live host — the case the whole marks mechanism exists for.
+ */
+function upsertThroughHostStatement(file: string, msg: Partial<ArchiveUpsert> & { id: string }): void {
+  const db = new Database(file);
+  try {
+    db.prepare(ARCHIVE_UPSERT_SQL).run({
+      id: msg.id,
+      agentGroupId: msg.agentGroupId ?? 'ag-one-a',
+      messagingGroupId: msg.messagingGroupId ?? 'mg-1',
+      channelType: msg.channelType ?? 'slack',
+      channelName: msg.channelName ?? 'general',
+      platformId: msg.platformId ?? 'p1',
+      threadId: msg.threadId ?? 'thread-1',
+      role: msg.role ?? 'assistant',
+      senderId: msg.senderId ?? 'ag-one-a',
+      senderName: msg.senderName ?? 'Someone',
+      text: msg.text ?? 'text',
+      sentAt: msg.sentAt ?? '2026-01-01T10:01:00Z',
+    });
+  } finally {
+    db.close();
+  }
+}
+
+interface ArchiveUpsert {
+  id: string;
+  agentGroupId: string;
+  messagingGroupId: string | null;
+  channelType: string;
+  channelName: string | null;
+  platformId: string | null;
+  threadId: string | null;
+  role: string;
+  senderId: string | null;
+  senderName: string | null;
+  text: string;
+  sentAt: string;
+}
+
 function allRows(file: string): Array<Record<string, unknown>> {
   const db = new Database(file, { readonly: true });
   try {
@@ -208,25 +289,30 @@ class FakeWorker extends EventEmitter {
   postMessage(message: Record<string, unknown>): void {
     this.posted.push(message);
     queueMicrotask(() => {
+      // Both failure behaviors drop the stamp first, mirroring
+      // `materializeArchiveProjection`: it invalidates before it writes, so a
+      // build that dies never leaves a stamp claiming the file is current.
       if (this.behavior === 'fail') {
+        removeArchiveProjectionStamp(message.dstPath as string);
         this.emit('message', { id: message.id, ok: false, error: 'source is corrupt' });
         return;
       }
       if (this.behavior === 'partial') {
         // What a build that dies after writing the schema leaves behind: a
         // non-empty file with no rows in it.
+        removeArchiveProjectionStamp(message.dstPath as string);
         fs.writeFileSync(message.dstPath as string, 'SQLite format 3\u0000partial');
         this.emit('message', { id: message.id, ok: false, error: 'disk went away mid-build' });
         return;
       }
       try {
-        buildArchiveProjection(
+        const result = materializeArchiveProjection(
           message.srcPath as string,
           message.dstPath as string,
           message.agentGroupId as string,
           message.workgroupMemberIds as string[] | undefined,
         );
-        this.emit('message', { id: message.id, ok: true, bytes: fs.statSync(message.dstPath as string).size });
+        this.emit('message', { id: message.id, ok: true, ...result });
       } catch (error) {
         this.emit('message', { id: message.id, ok: false, error: (error as Error).message });
       }
@@ -289,84 +375,112 @@ describe('#315 — what the session sees is unchanged', () => {
 });
 
 describe('#315 — an unchanged source is not rebuilt', () => {
+  /**
+   * Since #360 the reuse/append/rebuild decision is made ON the worker, so
+   * every call reaches it and `worker.posted.length` no longer distinguishes a
+   * reuse from a rebuild. These cases assert the returned `mode` instead, which
+   * is the thing that was actually being claimed all along.
+   */
   it('skips the second build when nothing moved', async () => {
     const src = makeTwoWorkgroupSource('reuse');
-    const worker = useFakeWorker();
+    useFakeWorker();
     const dst = tmpPath('reuse-dst');
 
-    await ensureArchiveProjection(src, dst, 'ag-one-a', ['ag-one-a', 'ag-one-b']);
-    expect(worker.posted).toHaveLength(1);
+    expect((await ensureArchiveProjection(src, dst, 'ag-one-a', ['ag-one-a', 'ag-one-b'])).mode).toBe('rebuilt');
+    const mtime = fs.statSync(dst).mtimeMs;
 
-    await ensureArchiveProjection(src, dst, 'ag-one-a', ['ag-one-a', 'ag-one-b']);
-    expect(worker.posted).toHaveLength(1);
+    expect((await ensureArchiveProjection(src, dst, 'ag-one-a', ['ag-one-a', 'ag-one-b'])).mode).toBe('reused');
+    expect(fs.statSync(dst).mtimeMs).toBe(mtime);
   });
 
   it('ignores the order the workgroup members arrive in', async () => {
     const src = makeTwoWorkgroupSource('order');
-    const worker = useFakeWorker();
+    useFakeWorker();
     const dst = tmpPath('order-dst');
 
     await ensureArchiveProjection(src, dst, 'ag-one-a', ['ag-one-a', 'ag-one-b']);
-    await ensureArchiveProjection(src, dst, 'ag-one-a', ['ag-one-b', 'ag-one-a']);
-    expect(worker.posted).toHaveLength(1);
+    expect((await ensureArchiveProjection(src, dst, 'ag-one-a', ['ag-one-b', 'ag-one-a'])).mode).toBe('reused');
   });
 
-  it('rebuilds when the source file changes', async () => {
+  it('rebuilds when a projected row is edited in place', async () => {
     const src = makeTwoWorkgroupSource('changed');
-    const worker = useFakeWorker();
+    useFakeWorker();
     const dst = tmpPath('changed-dst');
 
     await ensureArchiveProjection(src, dst, 'ag-one-a', ['ag-one-a', 'ag-one-b']);
-    expect(worker.posted).toHaveLength(1);
 
-    // An EDIT, not an append: this is the case a row-count or MAX(sent_at)
-    // watermark would miss, and why the stamp keys on file identity instead.
-    const db = new Database(src);
-    db.prepare("UPDATE messages_archive SET text = 'edited in place' WHERE id = 'w1-a-a'").run();
-    db.close();
+    // An EDIT, not an append, driven through the host's REAL write statement:
+    // `messages_archive` is upserted with `ON CONFLICT(id) DO UPDATE SET
+    // text = ...`, so this moves neither the row count nor MAX(rowid), and an
+    // append would carry the stale text past the container forever. The
+    // source's mutation counters exist for exactly this case and must force a
+    // FULL rebuild, not an append.
+    upsertThroughHostStatement(src, { id: 'w1-a-a', text: 'edited in place' });
+
+    expect((await ensureArchiveProjection(src, dst, 'ag-one-a', ['ag-one-a', 'ag-one-b'])).mode).toBe('rebuilt');
+    expect(allRows(dst).map((row) => row.text)).toContain('edited in place');
+    expect(allRows(dst).map((row) => row.text)).not.toContain('answer from a');
+  });
+
+  it('reuses when the same message is re-archived with identical content', async () => {
+    const src = makeTwoWorkgroupSource('idempotent-upsert');
+    useFakeWorker();
+    const dst = tmpPath('idempotent-upsert-dst');
 
     await ensureArchiveProjection(src, dst, 'ag-one-a', ['ag-one-a', 'ag-one-b']);
-    expect(worker.posted).toHaveLength(2);
-    expect(allRows(dst).map((row) => row.text)).toContain('edited in place');
+    const mtime = fs.statSync(dst).mtimeMs;
+
+    // A redelivery that carries the same text, sender_name and channel_name.
+    // The row is rewritten, but nothing the projection reads has moved, so the
+    // marks triggers must NOT fire and this must stay a reuse — otherwise every
+    // retry on the live host would cost a full rebuild.
+    upsertThroughHostStatement(src, {
+      id: 'w1-a-a',
+      text: 'answer from a',
+      senderName: 'Someone',
+      channelName: 'general',
+    });
+
+    expect((await ensureArchiveProjection(src, dst, 'ag-one-a', ['ag-one-a', 'ag-one-b'])).mode).toBe('reused');
+    expect(fs.statSync(dst).mtimeMs).toBe(mtime);
   });
 
   it('rebuilds when the workgroup membership changes', async () => {
     const src = makeTwoWorkgroupSource('scope');
-    const worker = useFakeWorker();
+    useFakeWorker();
     const dst = tmpPath('scope-dst');
 
     await ensureArchiveProjection(src, dst, 'ag-one-a', ['ag-one-a', 'ag-one-b']);
     expect(allRows(dst).map((row) => row.text)).toContain('answer from b');
 
-    await ensureArchiveProjection(src, dst, 'ag-one-a', ['ag-one-a']);
-    expect(worker.posted).toHaveLength(2);
+    expect((await ensureArchiveProjection(src, dst, 'ag-one-a', ['ag-one-a'])).mode).toBe('rebuilt');
     expect(allRows(dst).map((row) => row.text)).not.toContain('answer from b');
   });
 
   it('rebuilds when the projection file has been deleted underneath it', async () => {
     const src = makeTwoWorkgroupSource('deleted');
-    const worker = useFakeWorker();
+    useFakeWorker();
     const dst = tmpPath('deleted-dst');
 
     await ensureArchiveProjection(src, dst, 'ag-one-a', ['ag-one-a', 'ag-one-b']);
     fs.unlinkSync(dst);
 
-    await ensureArchiveProjection(src, dst, 'ag-one-a', ['ag-one-a', 'ag-one-b']);
-    expect(worker.posted).toHaveLength(2);
+    expect((await ensureArchiveProjection(src, dst, 'ag-one-a', ['ag-one-a', 'ag-one-b'])).mode).toBe('rebuilt');
     expect(fs.existsSync(dst)).toBe(true);
   });
 
   it('does not treat a stamp from an older builder as fresh', async () => {
     const src = makeTwoWorkgroupSource('version');
-    const worker = useFakeWorker();
+    useFakeWorker();
     const dst = tmpPath('version-dst');
 
     await ensureArchiveProjection(src, dst, 'ag-one-a', ['ag-one-a', 'ag-one-b']);
     const stamp = computeArchiveProjectionStamp(src, 'ag-one-a', ['ag-one-a', 'ag-one-b']);
     fs.writeFileSync(archiveProjectionStampPath(dst), JSON.stringify({ ...stamp, version: stamp.version - 1 }));
 
-    await ensureArchiveProjection(src, dst, 'ag-one-a', ['ag-one-a', 'ag-one-b']);
-    expect(worker.posted).toHaveLength(2);
+    // A v1 stamp costs exactly one rebuild, then the v2 stamp takes over.
+    expect((await ensureArchiveProjection(src, dst, 'ag-one-a', ['ag-one-a', 'ag-one-b'])).mode).toBe('rebuilt');
+    expect((await ensureArchiveProjection(src, dst, 'ag-one-a', ['ag-one-a', 'ag-one-b'])).mode).toBe('reused');
   });
 });
 
@@ -389,9 +503,8 @@ describe('#315 — fail-closed is unchanged', () => {
     const dst = tmpPath('failthenok-dst');
     await expect(ensureArchiveProjection(src, dst, 'ag-one-a', ['ag-one-a'])).rejects.toThrow();
 
-    const worker = useFakeWorker('build');
-    await ensureArchiveProjection(src, dst, 'ag-one-a', ['ag-one-a']);
-    expect(worker.posted).toHaveLength(1);
+    useFakeWorker('build');
+    expect((await ensureArchiveProjection(src, dst, 'ag-one-a', ['ag-one-a'])).mode).toBe('rebuilt');
     expect(allRows(dst).length).toBeGreaterThan(0);
   });
 
@@ -423,26 +536,26 @@ describe('S2-PR16 — F-16.1', () => {
     const worker = useFakeWorker();
     const dst = tmpPath('f16-1-dst');
 
-    // Build once, then ask again with nothing changed: the second call must not
-    // reach the worker at all.
-    await ensureArchiveProjection(src, dst, 'ag-one-a', ['ag-one-a', 'ag-one-b']);
-    expect(worker.posted).toHaveLength(1);
-    await ensureArchiveProjection(src, dst, 'ag-one-a', ['ag-one-a', 'ag-one-b']);
-    expect(worker.posted, 'a fresh projection was rebuilt').toHaveLength(1);
+    // Build once, then ask again with nothing changed: the second call must
+    // write nothing.
+    expect((await ensureArchiveProjection(src, dst, 'ag-one-a', ['ag-one-a', 'ag-one-b'])).mode).toBe('rebuilt');
+    const second = await ensureArchiveProjection(src, dst, 'ag-one-a', ['ag-one-a', 'ag-one-b']);
+    expect(second.mode, 'a fresh projection was rebuilt').toBe('reused');
+    expect(second.rows).toBe(0);
 
-    // An in-place edit — the change a row-count or MAX(sent_at) watermark
-    // misses — must send a second build to the worker and land in the file.
+    // An in-place edit — the change a row count or a rowid watermark misses —
+    // must force a full rebuild and land in the file.
     const db = new Database(src);
     db.prepare("UPDATE messages_archive SET text = 'edited for F-16.1' WHERE id = 'w1-a-a'").run();
     db.close();
 
-    await ensureArchiveProjection(src, dst, 'ag-one-a', ['ag-one-a', 'ag-one-b']);
-    expect(worker.posted, 'a stale projection was reused').toHaveLength(2);
+    const third = await ensureArchiveProjection(src, dst, 'ag-one-a', ['ag-one-a', 'ag-one-b']);
+    expect(third.mode, 'a stale projection was reused').toBe('rebuilt');
     expect(allRows(dst).map((row) => row.text)).toContain('edited for F-16.1');
 
-    // Off-thread, not in process: every build went through the worker seam, and
-    // the host never fell back to the synchronous builder.
-    expect(worker.posted.map((request) => request.dstPath)).toEqual([dst, dst]);
+    // Off-thread, not in process: every decision went through the worker seam,
+    // and the host never fell back to running it synchronously.
+    expect(worker.posted.map((request) => request.dstPath)).toEqual([dst, dst, dst]);
   });
 });
 
@@ -458,6 +571,21 @@ describe('#315 — the real worker thread builds the projection', () => {
     await ensureArchiveProjection(src, dst, 'ag-one-a', ['ag-one-a', 'ag-one-b']);
 
     expect(allRows(dst)).toEqual(allRows(expected));
+
+    // The stamp is written by whichever thread runs the DECISION, and since
+    // #360 that is the worker. A real Worker is a separate module registry that
+    // never saw this file's `vi.mock('../config.js')`, so its stamp landed under
+    // the REAL DATA_DIR — and the hermeticity guard cannot see a worker
+    // thread's writes to tell us. Remove it here rather than leaving a stray
+    // file in a live install's data tree (#305); the guard has to be told this
+    // one write is deliberate, because it CAN see ours.
+    const { DATA_DIR: realDataDir } = await vi.importActual<typeof import('../config.js')>('../config.js');
+    const digest = createHash('sha256').update(path.resolve(dst)).digest('hex').slice(0, 32);
+    const leakedStamp = path.join(realDataDir, 'projection-stamps', `${digest}.json`);
+    expect(fs.existsSync(leakedStamp), 'the real worker did not write its stamp where expected').toBe(true);
+    allowWritesTo(path.join(realDataDir, 'projection-stamps'));
+    fs.rmSync(leakedStamp, { force: true });
+    clearHermeticityAttempts();
   }, 60_000);
 });
 
@@ -475,44 +603,24 @@ describe('#315 review r1 — a TRUNCATE-mode journal must not disable reuse', ()
   /**
    * `journal_mode = TRUNCATE` commits by truncating the rollback journal to
    * zero bytes rather than deleting it, so `archive.db-journal` is present on
-   * every healthy install. Treating its existence as a write in flight would
-   * fail every freshness check and rebuild on every spawn.
+   * every healthy install. The v1 stamp had to stat it, because it inferred the
+   * source's state from the main file's size and mtime and a commit in flight
+   * made that inference unsafe. The v2 stamp does not infer: `count`,
+   * `maxRowid` and `mutations` come from an actual successful read of the
+   * source, and a genuinely hot journal makes that read fail outright rather
+   * than return something untrustworthy. The stat check and its `journal` stamp
+   * field are gone with it; these cases hold the property it was protecting.
    */
   it('reuses the projection when a zero-byte journal sits next to the source', async () => {
     const src = makeTwoWorkgroupSource('zero-journal');
-    const worker = useFakeWorker();
+    useFakeWorker();
     const dst = tmpPath('zero-journal-dst');
 
     fs.writeFileSync(`${src}-journal`, '');
     tmpFiles.push(`${src}-journal`);
 
-    await ensureArchiveProjection(src, dst, 'ag-one-a', ['ag-one-a', 'ag-one-b']);
-    expect(worker.posted).toHaveLength(1);
-
-    await ensureArchiveProjection(src, dst, 'ag-one-a', ['ag-one-a', 'ag-one-b']);
-    expect(worker.posted).toHaveLength(1);
-    expect(computeArchiveProjectionStamp(src, 'ag-one-a', ['ag-one-a', 'ag-one-b']).journal).toBeNull();
-  });
-
-  it('still refuses to reuse while a non-empty journal shows a write in flight', async () => {
-    const src = makeTwoWorkgroupSource('hot-journal');
-    const worker = useFakeWorker();
-    const dst = tmpPath('hot-journal-dst');
-    const scope = ['ag-one-a', 'ag-one-b'];
-
-    await ensureArchiveProjection(src, dst, 'ag-one-a', scope);
-    expect(worker.posted).toHaveLength(1);
-    expect(archiveProjectionIsFresh(dst, computeArchiveProjectionStamp(src, 'ag-one-a', scope))).toBe(true);
-
-    // Asserted at the freshness gate rather than by driving another build: a
-    // genuinely hot journal makes SQLite refuse the read-only open of the
-    // source, so the build behind it fails closed anyway.
-    fs.writeFileSync(`${src}-journal`, 'rollback pages in flight');
-    tmpFiles.push(`${src}-journal`);
-
-    const hotStamp = computeArchiveProjectionStamp(src, 'ag-one-a', scope);
-    expect(hotStamp.journal).not.toBeNull();
-    expect(archiveProjectionIsFresh(dst, hotStamp)).toBe(false);
+    expect((await ensureArchiveProjection(src, dst, 'ag-one-a', ['ag-one-a', 'ag-one-b'])).mode).toBe('rebuilt');
+    expect((await ensureArchiveProjection(src, dst, 'ag-one-a', ['ag-one-a', 'ag-one-b'])).mode).toBe('reused');
   });
 
   it('matches what a real TRUNCATE-mode commit leaves on disk', async () => {
@@ -527,13 +635,11 @@ describe('#315 review r1 — a TRUNCATE-mode journal must not disable reuse', ()
     // as clean rather than as a write in flight.
     expect(fs.existsSync(`${src}-journal`)).toBe(true);
     expect(fs.statSync(`${src}-journal`).size).toBe(0);
-    expect(computeArchiveProjectionStamp(src, 'ag-one-a', ['ag-one-a']).journal).toBeNull();
 
-    const worker = useFakeWorker();
+    useFakeWorker();
     const dst = tmpPath('real-truncate-dst');
-    await ensureArchiveProjection(src, dst, 'ag-one-a', ['ag-one-a']);
-    await ensureArchiveProjection(src, dst, 'ag-one-a', ['ag-one-a']);
-    expect(worker.posted).toHaveLength(1);
+    expect((await ensureArchiveProjection(src, dst, 'ag-one-a', ['ag-one-a'])).mode).toBe('rebuilt');
+    expect((await ensureArchiveProjection(src, dst, 'ag-one-a', ['ag-one-a'])).mode).toBe('reused');
   });
 });
 
@@ -674,13 +780,12 @@ describe('#315 review r2 — a partial rebuild is never served as fresh', () => 
     // this partial file look current.
     expect(archiveProjectionIsFresh(dst, computeArchiveProjectionStamp(src, 'ag-one-a', scope))).toBe(false);
 
-    const worker = useFakeWorker('build');
-    await ensureArchiveProjection(src, dst, 'ag-one-a', scope);
-    expect(worker.posted).toHaveLength(1);
+    useFakeWorker('build');
+    expect((await ensureArchiveProjection(src, dst, 'ag-one-a', scope)).mode).toBe('rebuilt');
     expect(allRows(dst).map((row) => row.text)).toContain('shared question');
   });
 
-  it('drops the stamp before dispatching, not after succeeding', async () => {
+  it('drops the stamp before writing, not after succeeding', async () => {
     const src = makeTwoWorkgroupSource('invalidate-first');
     const scope = ['ag-one-a'];
     const dst = tmpPath('invalidate-first-dst');
@@ -693,5 +798,262 @@ describe('#315 review r2 — a partial rebuild is never served as fresh', () => 
     // Force a rebuild by changing the scope, then fail it.
     await expect(ensureArchiveProjection(src, dst, 'ag-one-a', ['ag-one-a', 'ag-one-b'])).rejects.toThrow();
     expect(readArchiveProjectionStamp(dst)).toBeNull();
+  });
+});
+
+
+describe('#360 — a message elsewhere does not rebuild this projection', () => {
+  const scope = ['ag-one-a', 'ag-one-b'];
+
+  it('reuses when the OTHER workgroup archives a message', async () => {
+    const src = makeTwoWorkgroupSource('cross-wg');
+    useFakeWorker();
+    const dst = tmpPath('cross-wg-dst');
+
+    await ensureArchiveProjection(src, dst, 'ag-one-a', scope);
+    const mtime = fs.statSync(dst).mtimeMs;
+
+    // Workgroup two gets a new message. Under the v1 stat stamp this moved
+    // `data/archive.db` and invalidated every session's projection on the host.
+    archiveInto(src, {
+      id: 'w2-u-b',
+      agent_group_id: 'ag-two-a',
+      role: 'user',
+      sender_id: 'u-9',
+      text: 'other tenant follow-up',
+      sent_at: '2026-01-01T12:00:00Z',
+    });
+
+    const result = await ensureArchiveProjection(src, dst, 'ag-one-a', scope);
+    expect(result.mode).toBe('reused');
+    expect(result.rows).toBe(0);
+    expect(fs.statSync(dst).mtimeMs).toBe(mtime);
+    expect(allRows(dst).map((row) => row.text)).not.toContain('other tenant follow-up');
+  });
+
+  it('reuses when the OTHER workgroup EDITS a message', async () => {
+    const src = makeTwoWorkgroupSource('cross-wg-edit');
+    useFakeWorker();
+    const dst = tmpPath('cross-wg-edit-dst');
+
+    await ensureArchiveProjection(src, dst, 'ag-one-a', scope);
+    const mtime = fs.statSync(dst).mtimeMs;
+
+    // Workgroup two edits one of its own rows. Its mark moves; ours does not.
+    upsertThroughHostStatement(src, {
+      id: 'w2-a-a',
+      agentGroupId: 'ag-two-a',
+      senderId: 'ag-two-a',
+      text: 'other tenant reply, edited',
+      sentAt: '2026-01-01T11:01:00Z',
+    });
+
+    expect((await ensureArchiveProjection(src, dst, 'ag-one-a', scope)).mode).toBe('reused');
+    expect(fs.statSync(dst).mtimeMs).toBe(mtime);
+  });
+
+  it('appends this workgroup\'s new rows and lands what a full rebuild would', async () => {
+    const src = makeTwoWorkgroupSource('append-seam');
+    useFakeWorker();
+    const dst = tmpPath('append-seam-dst');
+
+    await ensureArchiveProjection(src, dst, 'ag-one-a', scope);
+
+    archiveInto(src, {
+      id: 'w1-u-a2',
+      agent_group_id: 'ag-one-a',
+      role: 'user',
+      sender_id: 'u-1',
+      text: 'follow-up question',
+      sent_at: '2026-01-01T12:00:00Z',
+    });
+    archiveInto(src, {
+      id: 'w1-u-b2',
+      agent_group_id: 'ag-one-b',
+      role: 'user',
+      sender_id: 'u-1',
+      text: 'follow-up question',
+      sent_at: '2026-01-01T12:00:00Z',
+    });
+    archiveInto(src, {
+      id: 'w1-a-a2',
+      agent_group_id: 'ag-one-a',
+      role: 'assistant',
+      sender_id: 'ag-one-a',
+      text: 'follow-up answer',
+      sent_at: '2026-01-01T12:01:00Z',
+    });
+
+    const result = await ensureArchiveProjection(src, dst, 'ag-one-a', scope);
+    expect(result.mode).toBe('appended');
+    // The sibling pair collapses, so three source rows land as two.
+    expect(result.rows).toBe(2);
+    expect(result.sinceRowid).toBeGreaterThan(0);
+
+    const expected = tmpPath('append-seam-expected');
+    buildArchiveProjection(src, expected, 'ag-one-a', scope);
+    const shape = (file: string) =>
+      allRows(file)
+        .map((r) => [r.messaging_group_id, r.thread_id, r.role, r.sender_id, r.sent_at, r.text, r.agent_group_id])
+        .sort();
+    expect(shape(dst)).toEqual(shape(expected));
+    expect(allRows(dst)).toHaveLength(allRows(expected).length);
+  });
+
+  it('inserts nothing when a sibling duplicate of a projected message arrives late', async () => {
+    const src = makeTwoWorkgroupSource('late-dup');
+    useFakeWorker();
+    const dst = tmpPath('late-dup-dst');
+
+    await ensureArchiveProjection(src, dst, 'ag-one-a', scope);
+    const before = allRows(dst);
+
+    archiveInto(src, {
+      id: 'w1-u-b-late',
+      agent_group_id: 'ag-one-b',
+      role: 'user',
+      sender_id: 'u-1',
+      text: 'shared question',
+      sent_at: '2026-01-01T10:00:00Z',
+    });
+
+    const result = await ensureArchiveProjection(src, dst, 'ag-one-a', scope);
+    expect(result.mode).toBe('appended');
+    expect(result.rows).toBe(0);
+    expect(allRows(dst)).toEqual(before);
+  });
+
+  it('rebuilds when a row disappears from the scope', async () => {
+    const src = makeTwoWorkgroupSource('shrunk');
+    useFakeWorker();
+    const dst = tmpPath('shrunk-dst');
+
+    await ensureArchiveProjection(src, dst, 'ag-one-a', scope);
+
+    const db = new Database(src);
+    db.prepare("DELETE FROM messages_archive WHERE id = 'w1-a-b'").run();
+    db.close();
+
+    expect((await ensureArchiveProjection(src, dst, 'ag-one-a', scope)).mode).toBe('rebuilt');
+    expect(allRows(dst).map((row) => row.text)).not.toContain('answer from b');
+  });
+
+  it('rebuilds, once, against an archive with no mutation counters', async () => {
+    const src = makeTwoWorkgroupSource('no-marks');
+    const db = new Database(src);
+    db.exec('DROP TRIGGER messages_archive_mark_update; DROP TRIGGER messages_archive_mark_delete');
+    db.exec('DROP TABLE archive_row_marks');
+    db.close();
+    useFakeWorker();
+    const dst = tmpPath('no-marks-dst');
+
+    // Fail closed: an archive that cannot report edits is rebuilt every time,
+    // which is exactly the pre-#360 behavior, never an unsound reuse.
+    expect((await ensureArchiveProjection(src, dst, 'ag-one-a', scope)).mode).toBe('rebuilt');
+    expect((await ensureArchiveProjection(src, dst, 'ag-one-a', scope)).mode).toBe('rebuilt');
+  });
+
+  it('falls back to a full rebuild when the append itself fails', async () => {
+    const src = makeTwoWorkgroupSource('append-fails');
+    useFakeWorker();
+    const dst = tmpPath('append-fails-dst');
+
+    await ensureArchiveProjection(src, dst, 'ag-one-a', scope);
+
+    archiveInto(src, {
+      id: 'w1-u-a3',
+      agent_group_id: 'ag-one-a',
+      role: 'user',
+      sender_id: 'u-1',
+      text: 'row that forces an append',
+      sent_at: '2026-01-01T13:00:00Z',
+    });
+
+    // Truncate the projection's schema out from under the append. Opening it
+    // succeeds, the INSERT does not — the class of failure a corrupt or
+    // half-written projection produces.
+    const dstDb = new Database(dst);
+    dstDb.exec('DROP TABLE messages_archive');
+    dstDb.close();
+
+    const result = await ensureArchiveProjection(src, dst, 'ag-one-a', scope);
+    expect(result.mode).toBe('rebuilt');
+    expect(allRows(dst).map((row) => row.text)).toContain('row that forces an append');
+    // A valid stamp afterwards, so the NEXT spawn reuses rather than repeating.
+    expect((await ensureArchiveProjection(src, dst, 'ag-one-a', scope)).mode).toBe('reused');
+  });
+
+  it('makes the same three decisions in legacy single-agent mode', async () => {
+    const src = makeTwoWorkgroupSource('legacy-modes');
+    useFakeWorker();
+    const dst = tmpPath('legacy-modes-dst');
+
+    expect((await ensureArchiveProjection(src, dst, 'ag-one-a')).mode).toBe('rebuilt');
+    expect((await ensureArchiveProjection(src, dst, 'ag-one-a')).mode).toBe('reused');
+
+    // A message for the sibling is out of scope in legacy mode, so still a reuse.
+    archiveInto(src, {
+      id: 'w1-u-b4',
+      agent_group_id: 'ag-one-b',
+      role: 'user',
+      sender_id: 'u-1',
+      text: 'sibling only',
+      sent_at: '2026-01-01T14:00:00Z',
+    });
+    expect((await ensureArchiveProjection(src, dst, 'ag-one-a')).mode).toBe('reused');
+
+    archiveInto(src, {
+      id: 'w1-u-a4',
+      agent_group_id: 'ag-one-a',
+      role: 'user',
+      sender_id: 'u-1',
+      text: 'mine only',
+      sent_at: '2026-01-01T14:01:00Z',
+    });
+    const appended = await ensureArchiveProjection(src, dst, 'ag-one-a');
+    expect(appended.mode).toBe('appended');
+    expect(appended.rows).toBe(1);
+    expect(allRows(dst).map((row) => row.text)).toContain('mine only');
+    expect(allRows(dst).map((row) => row.text)).not.toContain('sibling only');
+  });
+
+  it('makes the same three decisions in process when the worker is unavailable', async () => {
+    const src = makeTwoWorkgroupSource('fallback-modes');
+    __setArchiveProjectionWorkerFactoryForTest(() => {
+      throw new Error('worker threads unavailable');
+    });
+    const dst = tmpPath('fallback-modes-dst');
+
+    expect((await ensureArchiveProjection(src, dst, 'ag-one-a', scope)).mode).toBe('rebuilt');
+    expect((await ensureArchiveProjection(src, dst, 'ag-one-a', scope)).mode).toBe('reused');
+
+    archiveInto(src, {
+      id: 'w1-a-a5',
+      agent_group_id: 'ag-one-a',
+      role: 'assistant',
+      sender_id: 'ag-one-a',
+      text: 'answered on the main thread',
+      sent_at: '2026-01-01T15:00:00Z',
+    });
+    const appended = await ensureArchiveProjection(src, dst, 'ag-one-a', scope);
+    expect(appended.mode).toBe('appended');
+    expect(appended.rows).toBe(1);
+    expect(allRows(dst).map((row) => row.text)).toContain('answered on the main thread');
+
+    const db = new Database(src);
+    db.prepare("UPDATE messages_archive SET text = 'edited on the main thread' WHERE id = 'w1-a-a'").run();
+    db.close();
+    expect((await ensureArchiveProjection(src, dst, 'ag-one-a', scope)).mode).toBe('rebuilt');
+    expect(allRows(dst).map((row) => row.text)).toContain('edited on the main thread');
+  });
+
+  it('reuses an empty projection when there is no source archive yet', async () => {
+    useFakeWorker();
+    const dst = tmpPath('no-source-dst');
+    const src = path.join(os.tmpdir(), `ncproj-w-absent-${process.pid}-${Math.random()}.db`);
+
+    expect((await ensureArchiveProjection(src, dst, 'ag-one-a', scope)).mode).toBe('rebuilt');
+    expect((await ensureArchiveProjection(src, dst, 'ag-one-a', scope)).mode).toBe('reused');
+    expect(allRows(dst)).toEqual([]);
   });
 });

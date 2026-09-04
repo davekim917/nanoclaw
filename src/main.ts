@@ -33,6 +33,7 @@ import { stopAllContainers } from './container-runner.js';
 import { writeUpstreamPolicySnapshot } from './container-updates.js';
 import { setDeliveryAdapter, startActiveDeliveryPoll, startSweepDeliveryPoll, stopDeliveryPolls } from './delivery.js';
 import { startHostSweep, stopHostSweep } from './host-sweep.js';
+import { ensureArchiveSchema } from './message-archive.js';
 import { startHostModules, stopHostModules } from './host-lifecycle.js';
 import { runOnecliBootPreflight } from './onecli-preflight.js';
 import { resetStorageActivityState } from './storage-activity.js';
@@ -240,6 +241,26 @@ export async function main(): Promise<void> {
   const dbPath = path.join(DATA_DIR, 'v2.db');
   const db = initDb(dbPath);
   runMigrations(db);
+
+  // 1-0. Materialize the archive schema before ANY service that can spawn.
+  //
+  // `archive_row_marks` and its triggers are created by the archive's lazy
+  // open, which fires on the first archive WRITE. Until they exist every
+  // projection freshness stamp reports an unknown mutation count and fails
+  // closed, so every spawn does the full 19 s rebuild #360 exists to remove.
+  //
+  // Ahead of the dashboard for the same reason the OneCLI preflight below is:
+  // `startDashboard()` exposes endpoints that reach `wakeContainer` — a
+  // scheduled task's run-now, for one — so a dashboard-triggered spawn during
+  // the window would rebuild, and so would every spawn until unrelated chat
+  // traffic happened to open the archive. Ahead of channel recovery too, which
+  // archives messages: otherwise the one-time "Archive row-marks schema
+  // created" line would land from a recovery thread on some boots and from
+  // here on others, which is useless as a deploy gate.
+  //
+  // Nothing above this point can spawn, and the archive is a standalone file
+  // that depends only on DATA_DIR, so this is the earliest honest position.
+  ensureArchiveSchema();
 
   // Snapshot the agent-runner source for this boot (mailbox seam PR 0) —
   // must happen before anything can spawn a container, so every spawn this

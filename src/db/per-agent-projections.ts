@@ -120,7 +120,7 @@ export function buildArchiveProjection(
   dstPath: string,
   agentGroupId: string,
   workgroupMemberIds?: string[],
-): void {
+): number {
   if (fs.existsSync(dstPath)) fs.unlinkSync(dstPath);
   const dst = new Database(dstPath);
   try {
@@ -128,9 +128,9 @@ export function buildArchiveProjection(
     if (!fs.existsSync(srcPath)) {
       // No source yet — empty projection is correct. Container open will
       // succeed and queries return no rows.
-      return;
+      return 0;
     }
-    const src = new Database(srcPath, { readonly: true });
+    const src = openArchiveSourceForRead(srcPath);
     try {
       // Materialized with `.all()`, deliberately, NOT streamed with
       // `.iterate()`.
@@ -211,6 +211,7 @@ export function buildArchiveProjection(
         }
       });
       insertMany(rows);
+      return rows.length;
     } finally {
       src.close();
     }
@@ -228,93 +229,198 @@ export function buildArchiveProjection(
 /**
  * Everything the archive projection's contents depend on.
  *
- * Recorded next to the projection so a spawn can tell, without reading the
- * 400 MB source, whether the file it already has is still the file this build
- * would produce. See `ensureArchiveProjection`.
+ * Recorded next to the projection so a spawn can tell, from two index-only
+ * counts rather than a read of the 400 MB source, whether the file it already
+ * has is still current — and, when it is not, whether the difference is rows
+ * that merely arrived. See `materializeArchiveProjection`.
  *
  * Bump `ARCHIVE_PROJECTION_STAMP_VERSION` whenever `buildArchiveProjection`'s
  * output changes for identical inputs — the schema, the dedup grouping, the
  * column list. A stamp from an older builder never satisfies a newer one.
+ * Version 2 replaced v1's stat signature over the whole archive file with this
+ * scope-keyed watermark (#360).
  */
-export const ARCHIVE_PROJECTION_STAMP_VERSION = 1;
+export const ARCHIVE_PROJECTION_STAMP_VERSION = 2;
 
 export interface ArchiveProjectionStamp {
   version: number;
   agentGroupId: string;
   /** Sorted workgroup member ids, or null for the legacy single-agent filter. */
   scope: string[] | null;
-  /** Source file identity. Absent when the source does not exist yet. */
-  src: { size: string; mtimeNs: string } | null;
+  /** Watermark over THIS scope's rows, not over the whole archive file. */
+  rows: { count: number; maxRowid: number };
   /**
-   * A HOT `-journal` sidecar, meaning a write was in flight when we looked.
-   * Null in the normal case, including when a zero-byte journal is present.
+   * Non-append changes to this scope's rows (`archive_row_marks`), or null when
+   * the source could not report them — an archive written by a host that
+   * predates the marks table. Null on either side of a comparison forces a
+   * rebuild.
    */
-  journal: { size: string; mtimeNs: string } | null;
+  mutations: number | null;
 }
 
-function statSignature(filePath: string): { size: string; mtimeNs: string } | null {
+/**
+ * The SQL scope filter, matching `buildArchiveProjection`'s two branches
+ * exactly — including that an EMPTY member array falls through to the legacy
+ * single-agent filter rather than matching nothing.
+ */
+function archiveScopeFilter(
+  agentGroupId: string,
+  workgroupMemberIds?: string[],
+): { sql: string; params: string[] } {
+  if (workgroupMemberIds && workgroupMemberIds.length > 0) {
+    return {
+      sql: `agent_group_id IN (${workgroupMemberIds.map(() => '?').join(', ')})`,
+      params: [...workgroupMemberIds],
+    };
+  }
+  return { sql: 'agent_group_id = ?', params: [agentGroupId] };
+}
+
+/**
+ * Count this scope's rows and its non-append changes, cheaply.
+ *
+ * `COUNT(*)` and `MAX(rowid)` over `agent_group_id IN (...)` are served by
+ * `idx_archive_ag_sent(agent_group_id, sent_at)` — every SQLite index carries
+ * the rowid, so neither touches the table or the 135 MB `text` column.
+ * `archive_row_marks` holds one row per agent group.
+ *
+ * A missing source reads as an empty, unedited scope, so a fresh install with
+ * no `archive.db` yet reuses its empty projection instead of rewriting it on
+ * every spawn.
+ */
+export function readArchiveScopeSignature(
+  srcPath: string,
+  agentGroupId: string,
+  workgroupMemberIds?: string[],
+): { count: number; maxRowid: number; mutations: number | null } {
+  if (!fs.existsSync(srcPath)) return { count: 0, maxRowid: 0, mutations: 0 };
   try {
-    const stat = fs.statSync(filePath, { bigint: true });
-    return { size: String(stat.size), mtimeNs: String(stat.mtimeNs) };
-  } catch {
-    return null;
+    return readArchiveScopeSignatureOnce(srcPath, agentGroupId, workgroupMemberIds);
+  } catch (err) {
+    // v1 touched the source only when it was already going to rebuild; v2 reads
+    // it on EVERY spawn, so a lock held by the host's synchronous archive writer
+    // is now on the hot path. One retry after a short pause covers the case
+    // where the busy timeout expired against a burst of writes. A second
+    // failure is left to throw: that aborts the spawn and the sweep retries it,
+    // exactly as a failed rebuild does today.
+    if (!isSqliteBusy(err)) throw err;
+    log.warn('Archive scope signature read was busy — retrying once', { srcPath, agentGroupId });
+    sleepSync(ARCHIVE_BUSY_RETRY_DELAY_MS);
+    return readArchiveScopeSignatureOnce(srcPath, agentGroupId, workgroupMemberIds);
   }
 }
 
 /**
- * A rollback journal that actually holds pages, meaning a write was in flight.
+ * How long a read of the canonical archive waits on a lock before giving up.
  *
- * Existence alone does NOT mean that. Under `journal_mode = TRUNCATE` — which
- * is what `archive.db` uses — SQLite commits by truncating the journal to zero
- * bytes rather than deleting it, so `archive.db-journal` sits there
- * permanently at length 0 on every healthy install. Treating its presence as a
- * hot journal would make every freshness check fail and every spawn rebuild,
- * which is the cost this stamp exists to avoid. Verified against the live host:
- * `data/archive.db-journal` is a persistent zero-byte file.
+ * Stated explicitly rather than inherited: better-sqlite3 currently defaults
+ * `timeout` to 5000 ms, so this pins today's behavior rather than changing it,
+ * and a future change to that default cannot silently shorten the wait on the
+ * spawn path.
  */
-function hotJournalSignature(filePath: string): { size: string; mtimeNs: string } | null {
-  const signature = statSignature(filePath);
-  if (!signature || signature.size === '0') return null;
-  return signature;
+export const ARCHIVE_READ_BUSY_TIMEOUT_MS = 5000;
+
+/** Pause before the single retry of a busy signature read. */
+const ARCHIVE_BUSY_RETRY_DELAY_MS = 250;
+
+/** Every read-only open of the canonical archive, with one busy policy. */
+function openArchiveSourceForRead(srcPath: string): Database.Database {
+  return new Database(srcPath, { readonly: true, timeout: ARCHIVE_READ_BUSY_TIMEOUT_MS });
+}
+
+function isSqliteBusy(err: unknown): boolean {
+  const code = (err as { code?: unknown } | null)?.code;
+  return typeof code === 'string' && (code === 'SQLITE_BUSY' || code.startsWith('SQLITE_BUSY_'));
+}
+
+/**
+ * Block this thread briefly.
+ *
+ * Everything on this path is already synchronous better-sqlite3 work on a
+ * worker thread (or, in the fallback, a host thread that has accepted the
+ * blocking cost), so a real sleep is honest here and an async retry would
+ * change the shape of every caller.
+ */
+function sleepSync(ms: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+function readArchiveScopeSignatureOnce(
+  srcPath: string,
+  agentGroupId: string,
+  workgroupMemberIds?: string[],
+): { count: number; maxRowid: number; mutations: number | null } {
+  const src = openArchiveSourceForRead(srcPath);
+  try {
+    const scope = archiveScopeFilter(agentGroupId, workgroupMemberIds);
+    const rows = src
+      .prepare(`SELECT COUNT(*) AS count, COALESCE(MAX(rowid), 0) AS maxRowid FROM messages_archive WHERE ${scope.sql}`)
+      .get(...scope.params) as { count: number; maxRowid: number };
+    let mutations: number | null = null;
+    try {
+      const marks = src
+        .prepare(`SELECT COALESCE(SUM(mutations), 0) AS mutations FROM archive_row_marks WHERE ${scope.sql}`)
+        .get(...scope.params) as { mutations: number };
+      mutations = marks.mutations;
+    } catch {
+      // No `archive_row_marks` table: an archive last opened by a host that
+      // predates it. Fail closed — null never compares equal, so every spawn
+      // rebuilds until the host restarts and `initSchema` creates the table.
+      mutations = null;
+    }
+    return { count: rows.count, maxRowid: rows.maxRowid, mutations };
+  } finally {
+    src.close();
+  }
 }
 
 /**
  * Describe the inputs of the projection that `buildArchiveProjection` would
  * write right now.
  *
- * Source-change detection is a file-identity check (size plus nanosecond
- * mtime), NOT a row watermark, and that is deliberate. `messages_archive` is
- * not append-only: `upsertArchiveMessage` (`src/message-archive.ts`) carries an
- * `ON CONFLICT(id) DO UPDATE SET text = excluded.text` clause, so an edited
- * message rewrites a row in place, leaving row count and `MAX(sent_at)`
- * untouched. Any cheap scoped watermark would therefore miss edits and serve a
- * container stale history. `PRAGMA data_version` is no help either — SQLite
- * only guarantees it meaningful within one connection, and every spawn opens a
- * fresh one.
+ * Keyed on the SCOPE's own rows, not on the whole archive file. The v1 stamp
+ * was a stat signature over `data/archive.db`, so a message archived for any
+ * agent group anywhere invalidated every session's projection: on the live host
+ * that was 435 full rebuilds against 65 reuses in one day, median 19 s each,
+ * against projections of 230-240 MB (#360).
  *
- * The cost of that soundness is a coarser gate: because the file identity
- * covers the whole archive, a write for ANY agent group invalidates every
- * group's stamp. Reuse therefore catches quiet periods, spawn bursts and spawn
- * retries rather than most spawns on a busy host. Removing the stall does not
- * depend on the hit rate — the rebuild runs off the main thread either way.
- * `archive.db` runs `journal_mode = TRUNCATE`, so a commit always moves the
- * main file; there is no WAL sidecar to miss. That mode also leaves a
- * permanent zero-byte `-journal` file behind, which is why only a NON-EMPTY
- * journal counts as a write in flight — see `hotJournalSignature`.
+ * `messages_archive` is NOT append-only, which is why the v1 stamp took the
+ * coarse route: `ARCHIVE_UPSERT_SQL` in `src/message-archive.ts` carries
+ * `ON CONFLICT(id) DO UPDATE SET text = excluded.text`, so re-archiving a
+ * message id rewrites the row in place and moves neither `COUNT(*)` nor
+ * `MAX(rowid)`.
+ *
+ * Why the two fields TOGETHER are sound where a stat signature was needed
+ * before. That single upsert is the whole write side — held by
+ * `src/archive-write-path.test.ts` — so the archive can only ever gain a row,
+ * have a row rewritten, or (through nothing in the tree today) lose one.
+ * `count`/`maxRowid` see the first. `mutations` — a per-agent-group counter the
+ * `archive_row_marks` triggers increment on any content-changing UPDATE and on
+ * any DELETE — sees the other two. Between them they see everything that write
+ * path can do, which is what lets the stamp stop watching the file itself and
+ * start watching only this scope's rows.
+ *
+ * Only a pure append reuses the projection incrementally; anything the marks
+ * counter reports forces a full rebuild, because the dedup identity includes
+ * `text` and an edited row cannot be located in the projection to replace.
+ *
+ * `PRAGMA data_version` is no help here: SQLite only guarantees it meaningful
+ * within one connection, and every spawn opens a fresh one.
  */
 export function computeArchiveProjectionStamp(
   srcPath: string,
   agentGroupId: string,
   workgroupMemberIds?: string[],
 ): ArchiveProjectionStamp {
+  const signature = readArchiveScopeSignature(srcPath, agentGroupId, workgroupMemberIds);
   return {
     version: ARCHIVE_PROJECTION_STAMP_VERSION,
     agentGroupId,
     // Sorted so member order from the central DB cannot force a rebuild, and
     // copied so a later mutation of the caller's array cannot alter the stamp.
     scope: workgroupMemberIds ? [...workgroupMemberIds].sort() : null,
-    src: statSignature(srcPath),
-    journal: hotJournalSignature(`${srcPath}-journal`),
+    rows: { count: signature.count, maxRowid: signature.maxRowid },
+    mutations: signature.mutations,
   };
 }
 
@@ -392,32 +498,350 @@ export function removeArchiveProjectionStamp(dstPath: string): void {
   fs.rmSync(archiveProjectionStampPath(dstPath), { force: true });
 }
 
+export type ArchiveProjectionMode = 'reused' | 'appended' | 'rebuilt';
+
+export interface ArchiveProjectionResult {
+  mode: ArchiveProjectionMode;
+  /** Rows written. 0 for a reuse; for an append, only the ones that survived dedup. */
+  rows: number;
+  /**
+   * Append only: cross-batch duplicates that carried metadata the projected
+   * row was missing and were folded into it. A duplicate identical to what is
+   * already there counts as neither a write nor a merge.
+   */
+  merged: number;
+  bytes: number;
+  ms: number;
+  /** The rowid the append started after. Null for the other two modes. */
+  sinceRowid: number | null;
+}
+
+/**
+ * Which of the three paths makes the projection current.
+ *
+ * Fails closed in every ambiguous case — a missing or unreadable stamp, a stamp
+ * from an older builder, a different agent or scope, a missing or empty
+ * projection file, a scope whose row count went DOWN, a `maxRowid` that moved
+ * without the count moving, or either side unable to count mutations — all land
+ * on a full rebuild.
+ *
+ * Append requires BOTH counters to have grown. Growth in one alone means rows
+ * left as well as arrived, and the identity of what left is not recoverable
+ * from a watermark.
+ */
+export function decideArchiveProjectionMode(
+  dstPath: string,
+  previous: ArchiveProjectionStamp | null,
+  current: ArchiveProjectionStamp,
+): { mode: ArchiveProjectionMode; sinceRowid: number | null } {
+  const rebuild = { mode: 'rebuilt' as const, sinceRowid: null };
+  if (!previous) return rebuild;
+  if (previous.version !== ARCHIVE_PROJECTION_STAMP_VERSION) return rebuild;
+  if (current.version !== ARCHIVE_PROJECTION_STAMP_VERSION) return rebuild;
+  if (previous.agentGroupId !== current.agentGroupId) return rebuild;
+  if (JSON.stringify(previous.scope ?? null) !== JSON.stringify(current.scope ?? null)) return rebuild;
+  try {
+    if (fs.statSync(dstPath).size === 0) return rebuild;
+  } catch {
+    return rebuild;
+  }
+  // An unknown mutation count on either side means an in-place edit may have
+  // happened unseen, and an append would carry it past the container forever.
+  if (previous.mutations === null || previous.mutations === undefined) return rebuild;
+  if (current.mutations === null) return rebuild;
+  if (previous.mutations !== current.mutations) return rebuild;
+
+  const before = previous.rows;
+  if (!before || typeof before.count !== 'number' || typeof before.maxRowid !== 'number') return rebuild;
+  if (before.count === current.rows.count && before.maxRowid === current.rows.maxRowid) {
+    return { mode: 'reused', sinceRowid: null };
+  }
+  if (before.count < current.rows.count && before.maxRowid < current.rows.maxRowid) {
+    return { mode: 'appended', sinceRowid: before.maxRowid };
+  }
+  return rebuild;
+}
+
 /**
  * True when the projection already on disk was built from exactly these
- * inputs, so rebuilding it would reproduce the same file byte for byte.
- *
- * Fails closed in every ambiguous case: a missing or unreadable stamp, a stamp
- * from an older builder, a missing or empty projection file, or a source that
- * has moved all return false and force a rebuild. A NON-EMPTY journal at either
- * build time or now also forces one, since a commit was in flight and the main
- * file's identity cannot be trusted to describe the committed state. The
- * zero-byte journal that `journal_mode = TRUNCATE` leaves behind after every
- * successful commit is not that, and must not block reuse.
+ * inputs, so nothing needs writing.
  */
 export function archiveProjectionIsFresh(dstPath: string, stamp: ArchiveProjectionStamp): boolean {
-  if (stamp.version !== ARCHIVE_PROJECTION_STAMP_VERSION) return false;
-  if (stamp.journal !== null) return false;
-  const previous = readArchiveProjectionStamp(dstPath);
-  if (!previous) return false;
+  return decideArchiveProjectionMode(dstPath, readArchiveProjectionStamp(dstPath), stamp).mode === 'reused';
+}
+
+/**
+ * Copy the scope's rows above `sinceRowid` into an existing projection.
+ *
+ * The SELECT is the full build's, verbatim, restricted to the new rowids — same
+ * workgroup widening, same dedup `GROUP BY`, so a batch that arrives together
+ * collapses exactly as a full build would collapse it. What a full build can do
+ * and this cannot is see ACROSS batches, hence the `NOT EXISTS` guard: a
+ * sibling's copy of a user message already projected in an earlier batch must
+ * not be inserted a second time. Its column order is chosen so
+ * `idx_archive_thread(agent_group_id, thread_id, sent_at)` serves the lookup
+ * rather than scanning a 240 MB projection per candidate row; `agent_group_id`
+ * is constant across the projection and is in the predicate only to open that
+ * index.
+ *
+ * A dedup hit is a MERGE, not a discard. The dedup key covers only the six
+ * content columns; the full build also folds the rest of the bucket with
+ * `MIN(id)`, `MIN(created_at)` and `MAX(channel_type/channel_name/platform_id/
+ * sender_name)`. Dropping a late duplicate on the floor would therefore leave
+ * the projection holding whichever metadata arrived first — a NULL
+ * `sender_name`, a missing `channel_name` — permanently, because the stamp
+ * advances either way and `thread-search.ts` reads exactly those columns. So
+ * when the guarded INSERT writes no row, the existing row is updated with the
+ * same aggregate semantics, which is correct precisely because MIN and MAX are
+ * associative: folding a partial aggregate into another partial aggregate
+ * reproduces the aggregate over the union, and the row set matches a full
+ * build exactly, ids included.
+ *
+ * The merge must use NULL-SAFE forms. SQLite's SCALAR `min(a,b)`/`max(a,b)`
+ * return NULL if ANY argument is NULL, the opposite of the aggregate `MIN()`/
+ * `MAX()` the full build uses, which skip NULLs. A bare `max(sender_name,
+ * @sender_name)` would therefore erase a known name the moment a copy without
+ * one arrived.
+ *
+ * Legacy single-agent mode has no dedup in the full build either, so it guards
+ * on the primary key instead and never merges. Guarding on content there would
+ * wrongly drop a genuinely distinct row that happened to repeat a message
+ * verbatim.
+ *
+ * The source read is materialized and the source closed BEFORE the projection
+ * is opened for writing, for the same reason the full build does it: under
+ * `journal_mode = TRUNCATE` a reader blocks the host's synchronous archive
+ * writer.
+ */
+export function appendArchiveProjection(
+  srcPath: string,
+  dstPath: string,
+  agentGroupId: string,
+  sinceRowid: number,
+  workgroupMemberIds?: string[],
+): { written: number; merged: number } {
+  const widened = Boolean(workgroupMemberIds && workgroupMemberIds.length > 0);
+  const src = openArchiveSourceForRead(srcPath);
+  let rows: Array<Record<string, unknown>>;
   try {
-    if (fs.statSync(dstPath).size === 0) return false;
-  } catch {
-    return false;
+    if (widened) {
+      const members = workgroupMemberIds as string[];
+      const placeholders = members.map(() => '?').join(', ');
+      rows = src
+        .prepare(
+          `SELECT
+             MIN(id)               AS id,
+             messaging_group_id,
+             MAX(channel_type)     AS channel_type,
+             MAX(channel_name)     AS channel_name,
+             MAX(platform_id)      AS platform_id,
+             thread_id,
+             role,
+             sender_id,
+             MAX(sender_name)      AS sender_name,
+             text,
+             sent_at,
+             MIN(created_at)       AS created_at
+           FROM messages_archive
+           WHERE agent_group_id IN (${placeholders}) AND rowid > ?
+           GROUP BY messaging_group_id, thread_id, role, sender_id, sent_at, text`,
+        )
+        .all(...members, sinceRowid) as Array<Record<string, unknown>>;
+    } else {
+      rows = src
+        .prepare(
+          `SELECT ${ARCHIVE_COLS.join(', ')} FROM messages_archive WHERE agent_group_id = ? AND rowid > ?`,
+        )
+        .all(agentGroupId, sinceRowid) as Array<Record<string, unknown>>;
+    }
+  } finally {
+    src.close();
   }
-  // Compare only the fields that decide the contents. `dstPath` is recorded
-  // for operators, not for the decision.
-  const { dstPath: _recordedPath, ...comparable } = previous as ArchiveProjectionStamp & { dstPath?: string };
-  return JSON.stringify(comparable) === JSON.stringify(stamp);
+
+  const dst = new Database(dstPath);
+  try {
+    const colList = ARCHIVE_COLS.join(', ');
+    const valueList = ARCHIVE_COLS.map((c) => `@${c}`).join(', ');
+    const guard = widened
+      ? `NOT EXISTS (${ARCHIVE_DEDUP_MATCH_SQL})`
+      : `NOT EXISTS (SELECT 1 FROM messages_archive WHERE id = @id)`;
+    // INSERT ... SELECT ... WHERE, not VALUES: the guard has to be evaluated
+    // per row inside SQLite. The AFTER INSERT trigger in ARCHIVE_SCHEMA_SQL
+    // populates `messages_archive_fts` for whatever actually lands, exactly as
+    // it does for a full build.
+    const insertStmt = dst.prepare(`INSERT INTO messages_archive (${colList}) SELECT ${valueList} WHERE ${guard}`);
+    // Only the widened path can produce a dedup hit worth merging.
+    const merges: Array<[string, 'MIN' | 'MAX']> = [
+      ['id', 'MIN'],
+      ['created_at', 'MIN'],
+      ['channel_type', 'MAX'],
+      ['channel_name', 'MAX'],
+      ['platform_id', 'MAX'],
+      ['sender_name', 'MAX'],
+    ];
+    const mergeStmt = widened
+      ? dst.prepare(
+          `UPDATE messages_archive
+              SET ${merges.map(([col, fn]) => `${col} = ${nullSafeFold(fn, col)}`).join(',\n                  ')}
+            WHERE ${ARCHIVE_DEDUP_KEY_SQL}
+              -- Only when the fold would actually move something. Without this
+              -- every late duplicate rewrites an identical row and fires the
+              -- FTS update trigger for nothing, and the merged count would
+              -- report no-ops. IS NOT is the NULL-safe inequality.
+              AND (${merges.map(([col, fn]) => `${col} IS NOT ${nullSafeFold(fn, col)}`).join(' OR ')})`,
+        )
+      : null;
+    const insertMany = dst.transaction((batch: Array<Record<string, unknown>>) => {
+      let written = 0;
+      let merged = 0;
+      for (const row of batch) {
+        const params: Record<string, unknown> = {};
+        // Stamp the spawning agent's id onto every row, as the full build does.
+        for (const col of ARCHIVE_COLS) params[col] = col === 'agent_group_id' ? agentGroupId : (row[col] ?? null);
+        const inserted = insertStmt.run(params).changes;
+        if (inserted > 0) {
+          written += inserted;
+        } else if (mergeStmt) {
+          // The guard matched, so this is a cross-batch duplicate. Fold it into
+          // the row already there rather than losing its metadata.
+          merged += mergeStmt.run(params).changes > 0 ? 1 : 0;
+        }
+      }
+      return { written, merged };
+    });
+    return insertMany(rows);
+  } finally {
+    dst.close();
+  }
+}
+
+/**
+ * The dedup identity, as one string, used by BOTH the append's `NOT EXISTS`
+ * guard and its merge `UPDATE`.
+ *
+ * Column order is chosen so `idx_archive_thread(agent_group_id, thread_id,
+ * sent_at)` serves the lookup with three equality constraints rather than
+ * scanning a 240 MB projection per candidate row. `agent_group_id` is constant
+ * across the projection and is in the predicate only to open that index.
+ *
+ * Exported so the query-plan test runs `EXPLAIN QUERY PLAN` on THIS string
+ * rather than a hand-retyped copy: a future edit to the real predicate that
+ * loses the index must fail that test, which it cannot do if the test carries
+ * its own duplicate of the SQL.
+ */
+export const ARCHIVE_DEDUP_KEY_SQL = `agent_group_id     =  @agent_group_id
+              AND thread_id          IS @thread_id
+              AND sent_at            =  @sent_at
+              AND messaging_group_id IS @messaging_group_id
+              AND role               =  @role
+              AND sender_id          IS @sender_id
+              AND text               =  @text`;
+
+export const ARCHIVE_DEDUP_MATCH_SQL = `SELECT 1 FROM messages_archive
+            WHERE ${ARCHIVE_DEDUP_KEY_SQL}`;
+
+/**
+ * `MIN`/`MAX` of the stored column and the incoming parameter, skipping NULLs
+ * the way the full build's AGGREGATE MIN/MAX do.
+ *
+ * SQLite's two-argument scalar `min()`/`max()` return NULL if either argument
+ * is NULL, so the bare form would erase known metadata. In an UPDATE's SET, the
+ * bare column name on the right-hand side reads the row's ORIGINAL value.
+ */
+function nullSafeFold(fn: 'MIN' | 'MAX', column: string): string {
+  return `CASE WHEN ${column} IS NULL THEN @${column} WHEN @${column} IS NULL THEN ${column} ELSE ${fn}(${column}, @${column}) END`;
+}
+
+/**
+ * Make the session's archive projection current, and say how.
+ *
+ * The single implementation of the reuse/append/rebuild decision. It runs on
+ * the projection worker thread in the normal case and in process when the
+ * worker is unavailable; both call THIS, so the two paths cannot drift.
+ *
+ * It belongs on whichever thread reads the source, never on the host's: the
+ * decision needs `COUNT(*)`/`MAX(rowid)` over the source, and a boot with ~800
+ * sessions would run that query 800 times on the main thread.
+ *
+ * Stamp discipline is unchanged from #315 — the stamp is removed BEFORE any
+ * write and rewritten only after the write succeeds, so a crash in between
+ * leaves no stamp and the next spawn rebuilds. The stamp is read from the
+ * source before the rows are, which can only make it describe LESS than the
+ * projection actually holds; the next spawn then re-offers rows the dedup guard
+ * already covers. Over-copying is safe, under-copying would not be.
+ */
+export function materializeArchiveProjection(
+  srcPath: string,
+  dstPath: string,
+  agentGroupId: string,
+  workgroupMemberIds?: string[],
+): ArchiveProjectionResult {
+  const startedAt = Date.now();
+  const stamp = computeArchiveProjectionStamp(srcPath, agentGroupId, workgroupMemberIds);
+  const decision = decideArchiveProjectionMode(dstPath, readArchiveProjectionStamp(dstPath), stamp);
+
+  if (decision.mode === 'reused') {
+    return {
+      mode: 'reused',
+      rows: 0,
+      merged: 0,
+      bytes: projectionBytes(dstPath),
+      ms: Date.now() - startedAt,
+      sinceRowid: null,
+    };
+  }
+
+  if (decision.mode === 'appended' && decision.sinceRowid !== null) {
+    removeArchiveProjectionStamp(dstPath);
+    try {
+      const { written, merged } = appendArchiveProjection(
+        srcPath,
+        dstPath,
+        agentGroupId,
+        decision.sinceRowid,
+        workgroupMemberIds,
+      );
+      writeArchiveProjectionStamp(dstPath, stamp);
+      return {
+        mode: 'appended',
+        rows: written,
+        merged,
+        bytes: projectionBytes(dstPath),
+        ms: Date.now() - startedAt,
+        sinceRowid: decision.sinceRowid,
+      };
+    } catch (err) {
+      // A corrupt projection, a read-only file, a schema that is not what we
+      // expect. The full build below replaces the file outright and is the
+      // recovery path for all of them.
+      log.warn('Archive projection append failed — falling back to a full rebuild', {
+        err,
+        agentGroupId,
+        dstPath,
+        sinceRowid: decision.sinceRowid,
+      });
+    }
+  }
+
+  removeArchiveProjectionStamp(dstPath);
+  const rows = buildArchiveProjection(srcPath, dstPath, agentGroupId, workgroupMemberIds);
+  writeArchiveProjectionStamp(dstPath, stamp);
+  return {
+    mode: 'rebuilt',
+    rows,
+    merged: 0,
+    bytes: projectionBytes(dstPath),
+    ms: Date.now() - startedAt,
+    sinceRowid: null,
+  };
+}
+
+function projectionBytes(filePath: string): number {
+  try {
+    return fs.statSync(filePath).size;
+  } catch {
+    return 0;
+  }
 }
 
 /**

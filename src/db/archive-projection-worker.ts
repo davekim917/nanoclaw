@@ -1,40 +1,33 @@
 /**
  * Host-side owner of the archive projection build.
  *
- * Two changes to a spawn's cost, in the order they apply:
+ * This module is now a thin transport. One request means "make this projection
+ * current"; the worker decides between reuse, append and full rebuild and says
+ * which it did (`materializeArchiveProjection`). The host thread reads nothing
+ * from the 400 MB source.
  *
- *   1. Skip the build entirely when the projection on disk was built from
- *      exactly these inputs (`archiveProjectionIsFresh`).
- *   2. When a build IS needed, run it on a worker thread and await it, so the
- *      host's event loop stays free for adapters, delivery and the sweep.
- *
- * Before this, `buildArchiveProjection` ran synchronously on the main thread on
+ * Before #315, `buildArchiveProjection` ran synchronously on the main thread on
  * every container spawn: a `GROUP BY` over an unindexed 135 MB `text` column
  * against a 414 MB source, then a row-by-row rewrite of a projection as large
  * as 238 MB. That was the dominant cause of #315 — 327 stalls in one day, p50
- * 18.3 s, max 59.7 s, with 86% of them ending inside a container spawn.
- *
- * Only step 2 is load-bearing for the stall: it removes main-thread blocking
- * whether or not step 1 ever hits. Step 1 is what stops the fleet rewriting
- * tens of gigabytes of projections it already has.
+ * 18.3 s, max 59.7 s, with 86% of them ending inside a container spawn. Moving
+ * it off-thread removed the stall but not the work: #360 measured 435 full
+ * rebuilds against 65 reuses in a day, median 19 s and p90 28 s each, because
+ * the v1 freshness stamp keyed on the whole archive file and a message for any
+ * agent group invalidated every session's projection. Five of those serialized
+ * behind one worker is what made a post-boot sweep tick take 200 s.
  *
  * Mirrors `src/storage-maintenance-worker.ts`: one persistent worker, which
  * also serializes rebuilds so concurrent spawns cannot stampede the same
  * source file.
  */
-import fs from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { Worker } from 'node:worker_threads';
 
 import { onHostShutdown } from '../host-lifecycle.js';
 import { log } from '../log.js';
-import {
-  archiveProjectionIsFresh,
-  buildArchiveProjection,
-  computeArchiveProjectionStamp,
-  removeArchiveProjectionStamp,
-  writeArchiveProjectionStamp,
-} from './per-agent-projections.js';
+import { materializeArchiveProjection } from './per-agent-projections.js';
+import type { ArchiveProjectionResult } from './per-agent-projections.js';
 import type { ArchiveProjectionRequest, ArchiveProjectionResponse } from './archive-projection-worker-thread.js';
 
 interface WorkerLike {
@@ -74,13 +67,16 @@ class WorkerUnavailableError extends Error {}
 
 class ArchiveProjectionWorker {
   private worker: WorkerLike | null = null;
-  private readonly pending = new Map<number, { resolve(bytes: number): void; reject(error: Error): void }>();
+  private readonly pending = new Map<
+    number,
+    { resolve(result: ArchiveProjectionResult): void; reject(error: Error): void }
+  >();
   private nextId = 1;
   private stopped = false;
 
   constructor(private readonly workerFactory: ArchiveProjectionWorkerFactory = createWorker) {}
 
-  build(request: Omit<ArchiveProjectionRequest, 'id'>): Promise<number> {
+  build(request: Omit<ArchiveProjectionRequest, 'id'>): Promise<ArchiveProjectionResult> {
     if (this.stopped) return Promise.reject(new WorkerUnavailableError('Archive projection worker is stopped'));
     let worker: WorkerLike;
     try {
@@ -89,7 +85,7 @@ class ArchiveProjectionWorker {
       return Promise.reject(new WorkerUnavailableError(error instanceof Error ? error.message : String(error)));
     }
     const id = this.nextId++;
-    return new Promise<number>((resolve, reject) => {
+    return new Promise<ArchiveProjectionResult>((resolve, reject) => {
       this.pending.set(id, { resolve, reject });
       try {
         worker.postMessage({ id, ...request } satisfies ArchiveProjectionRequest);
@@ -119,8 +115,18 @@ class ArchiveProjectionWorker {
       // A build that ran and threw is a real failure and must reach the spawn
       // path as one — never a WorkerUnavailableError, which would silently
       // retry the same doomed build on the main thread.
-      if (message.ok) pending.resolve(message.bytes ?? 0);
-      else pending.reject(new Error(message.error ?? 'Archive projection build failed'));
+      if (message.ok) {
+        pending.resolve({
+          mode: message.mode ?? 'rebuilt',
+          rows: message.rows ?? 0,
+          merged: message.merged ?? 0,
+          bytes: message.bytes ?? 0,
+          ms: message.ms ?? 0,
+          sinceRowid: message.sinceRowid ?? null,
+        });
+      } else {
+        pending.reject(new Error(message.error ?? 'Archive projection build failed'));
+      }
     });
     worker.on('error', (error) => this.handleWorkerFailure(worker, new WorkerUnavailableError(error.message)));
     worker.on('exit', (code) => {
@@ -151,8 +157,9 @@ class ArchiveProjectionWorker {
 let sharedWorker = new ArchiveProjectionWorker();
 
 /**
- * Produce the session's archive projection, reusing the existing file when its
- * inputs have not moved and building off the main thread when they have.
+ * Produce the session's archive projection, reusing the existing file when this
+ * workgroup's own rows have not moved, extending it in place when rows have
+ * only been added, and rebuilding it off the main thread otherwise.
  *
  * Fail-closed is unchanged from the synchronous original: a build that runs and
  * throws propagates, and the spawn aborts rather than mounting a projection
@@ -161,38 +168,19 @@ let sharedWorker = new ArchiveProjectionWorker();
  * The one deliberate exception is the worker being unavailable — it failed to
  * start, crashed, or the host is shutting it down. That is an infrastructure
  * fault, not a bad projection, and refusing every spawn on it would take the
- * fleet down. Those cases fall back to building in process, which is correct
- * but blocking, and say so at WARN.
+ * fleet down. Those cases fall back to running the SAME decision in process,
+ * which is correct but blocking, and say so at WARN.
  */
 export async function ensureArchiveProjection(
   srcPath: string,
   dstPath: string,
   agentGroupId: string,
   workgroupMemberIds?: string[],
-): Promise<void> {
-  const stamp = computeArchiveProjectionStamp(srcPath, agentGroupId, workgroupMemberIds);
-  if (archiveProjectionIsFresh(dstPath, stamp)) {
-    log.info('Archive projection reused', {
-      agentGroupId,
-      dstPath,
-      bytes: statSizeOrZero(dstPath),
-      scope: stamp.scope?.length ?? null,
-    });
-    return;
-  }
-
-  // Invalidate BEFORE building. A build can leave a non-empty partial file
-  // behind — the schema is written before the first row — and an earlier stamp
-  // that still matches the unchanged source would make the next spawn mount
-  // that partial projection as fresh. Storage cleanup deleting the projection
-  // and leaving the stamp is one way to get there.
-  removeArchiveProjectionStamp(dstPath);
-
-  const startedAt = Date.now();
-  let bytes: number;
+): Promise<ArchiveProjectionResult> {
+  let result: ArchiveProjectionResult;
   let offThread = true;
   try {
-    bytes = await sharedWorker.build({ srcPath, dstPath, agentGroupId, workgroupMemberIds });
+    result = await sharedWorker.build({ srcPath, dstPath, agentGroupId, workgroupMemberIds });
   } catch (error) {
     if (!(error instanceof WorkerUnavailableError)) throw error;
     log.warn('Archive projection worker unavailable — building on the main thread', {
@@ -201,27 +189,36 @@ export async function ensureArchiveProjection(
       err: error.message,
     });
     offThread = false;
-    buildArchiveProjection(srcPath, dstPath, agentGroupId, workgroupMemberIds);
-    bytes = statSizeOrZero(dstPath);
+    result = materializeArchiveProjection(srcPath, dstPath, agentGroupId, workgroupMemberIds);
   }
 
-  writeArchiveProjectionStamp(dstPath, stamp);
-  log.info('Archive projection built', {
-    agentGroupId,
-    dstPath,
-    ms: Date.now() - startedAt,
-    bytes,
-    offThread,
-    scope: stamp.scope?.length ?? null,
-  });
-}
-
-function statSizeOrZero(filePath: string): number {
-  try {
-    return fs.statSync(filePath).size;
-  } catch {
-    return 0;
+  const scope = workgroupMemberIds?.length ?? null;
+  if (result.mode === 'reused') {
+    log.info('Archive projection reused', { agentGroupId, dstPath, bytes: result.bytes, ms: result.ms, offThread, scope });
+  } else if (result.mode === 'appended') {
+    log.info('Archive projection appended', {
+      agentGroupId,
+      dstPath,
+      rows: result.rows,
+      merged: result.merged,
+      ms: result.ms,
+      bytes: result.bytes,
+      sinceRowid: result.sinceRowid,
+      offThread,
+      scope,
+    });
+  } else {
+    log.info('Archive projection built', {
+      agentGroupId,
+      dstPath,
+      rows: result.rows,
+      ms: result.ms,
+      bytes: result.bytes,
+      offThread,
+      scope,
+    });
   }
+  return result;
 }
 
 export function stopArchiveProjectionWorker(): Promise<void> {

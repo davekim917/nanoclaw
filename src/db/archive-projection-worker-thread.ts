@@ -9,14 +9,20 @@
  * (p50 18 s, ~20/hour). The work itself is unchanged; only the thread it runs
  * on is.
  *
+ * Since #360 the DECISION runs here too, not just the build: one request means
+ * "make this projection current", and the reply says whether that took a reuse,
+ * an append or a full rebuild. The decision needs `COUNT(*)`/`MAX(rowid)` over
+ * the source, and a boot with ~800 sessions cannot afford to run that on the
+ * host's own thread.
+ *
  * The projection is self-contained IO: it reads one SQLite file and writes
  * another, sharing no state with the host. Nothing but the four request fields
  * crosses the boundary. Mirrors `src/storage-maintenance-worker-thread.ts`.
  */
-import fs from 'node:fs';
 import { parentPort } from 'node:worker_threads';
 
-import { buildArchiveProjection } from './per-agent-projections.js';
+import { materializeArchiveProjection } from './per-agent-projections.js';
+import type { ArchiveProjectionMode } from './per-agent-projections.js';
 
 export interface ArchiveProjectionRequest {
   id: number;
@@ -29,7 +35,12 @@ export interface ArchiveProjectionRequest {
 export interface ArchiveProjectionResponse {
   id: number;
   ok: boolean;
+  mode?: ArchiveProjectionMode;
+  rows?: number;
+  merged?: number;
   bytes?: number;
+  ms?: number;
+  sinceRowid?: number | null;
   error?: string;
 }
 
@@ -38,14 +49,22 @@ if (!port) throw new Error('Archive projection worker requires a parent port');
 
 port.on('message', (message: ArchiveProjectionRequest) => {
   try {
-    buildArchiveProjection(message.srcPath, message.dstPath, message.agentGroupId, message.workgroupMemberIds);
-    let bytes = 0;
-    try {
-      bytes = fs.statSync(message.dstPath).size;
-    } catch {
-      bytes = 0;
-    }
-    port.postMessage({ id: message.id, ok: true, bytes } satisfies ArchiveProjectionResponse);
+    const result = materializeArchiveProjection(
+      message.srcPath,
+      message.dstPath,
+      message.agentGroupId,
+      message.workgroupMemberIds,
+    );
+    port.postMessage({
+      id: message.id,
+      ok: true,
+      mode: result.mode,
+      rows: result.rows,
+      merged: result.merged,
+      bytes: result.bytes,
+      ms: result.ms,
+      sinceRowid: result.sinceRowid,
+    } satisfies ArchiveProjectionResponse);
   } catch (error) {
     port.postMessage({
       id: message.id,

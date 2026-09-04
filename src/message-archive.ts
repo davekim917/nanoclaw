@@ -29,6 +29,52 @@ import { log } from './log.js';
 
 const ARCHIVE_PATH = path.join(DATA_DIR, 'archive.db');
 
+/**
+ * A per-agent-group counter of NON-APPEND changes to `messages_archive`.
+ *
+ * `messages_archive` is very nearly append-only, but not quite:
+ * `upsertStmt` below carries `ON CONFLICT(id) DO UPDATE SET text = ...`, so
+ * re-archiving a message id — an edited chat message, a redelivered outbound
+ * row — rewrites the row in place. Row count and `MAX(rowid)` do not move when
+ * that happens, which makes a cheap watermark unsound on its own: the archive
+ * projection in `src/db/per-agent-projections.ts` keys its freshness stamp on
+ * `COUNT(*)` and `MAX(rowid)` over one workgroup's rows, and an in-place edit
+ * would slip past both and leave a container serving stale text forever.
+ *
+ * These triggers make the un-watermarkable changes countable. They fire only
+ * when a row's projected content actually moves, so an idempotent re-archive of
+ * identical text costs nothing and does not invalidate anybody's projection.
+ * `sent_at`, `role`, `sender_id`, `messaging_group_id` and `thread_id` are not
+ * in the `WHEN` clause because no write path updates them; if one ever does,
+ * add it here — the projection's dedup key includes them.
+ *
+ * Kept as a side table rather than an `updated_at` column on `messages_archive`
+ * itself: adding a column to the live multi-hundred-megabyte archive would need
+ * a second index over it to be queryable per agent group, and this table is one
+ * row per agent group.
+ */
+export const ARCHIVE_MUTATION_MARKS_SQL = `
+  CREATE TABLE IF NOT EXISTS archive_row_marks (
+    agent_group_id TEXT PRIMARY KEY,
+    mutations      INTEGER NOT NULL DEFAULT 0
+  );
+  CREATE TRIGGER IF NOT EXISTS messages_archive_mark_update
+  AFTER UPDATE ON messages_archive
+  WHEN old.text IS NOT new.text
+    OR old.sender_name IS NOT new.sender_name
+    OR old.channel_name IS NOT new.channel_name
+  BEGIN
+    INSERT INTO archive_row_marks (agent_group_id, mutations) VALUES (new.agent_group_id, 1)
+    ON CONFLICT(agent_group_id) DO UPDATE SET mutations = mutations + 1;
+  END;
+  CREATE TRIGGER IF NOT EXISTS messages_archive_mark_delete
+  AFTER DELETE ON messages_archive
+  BEGIN
+    INSERT INTO archive_row_marks (agent_group_id, mutations) VALUES (old.agent_group_id, 1)
+    ON CONFLICT(agent_group_id) DO UPDATE SET mutations = mutations + 1;
+  END;
+`;
+
 let _db: Database.Database | null = null;
 let _dbPath: string | null = null;
 
@@ -163,6 +209,76 @@ function initSchema(db: Database.Database): void {
       VALUES (new.rowid, new.text, new.sender_name);
     END;
   `);
+  ensureArchiveRowMarks(db);
+}
+
+/**
+ * Create `archive_row_marks` and its triggers, and say so ONCE.
+ *
+ * The archive projection's freshness stamp fails closed while these are
+ * absent — every spawn rebuilds, which is the pre-#360 behavior — so an
+ * operator upgrading a live install needs to see the moment they appear. The
+ * existence check reads `sqlite_master` rather than trusting the silence of
+ * `IF NOT EXISTS`, which cannot tell "created" from "already there", and it
+ * checks the triggers as well as the table so a partially-applied schema is
+ * still reported.
+ */
+function ensureArchiveRowMarks(db: Database.Database): void {
+  const present = new Set(
+    (
+      db
+        .prepare(
+          `SELECT name FROM sqlite_master
+            WHERE name IN ('archive_row_marks', 'messages_archive_mark_update', 'messages_archive_mark_delete')`,
+        )
+        .all() as Array<{ name: string }>
+    ).map((row) => row.name),
+  );
+  if (present.size === 3) {
+    db.exec(ARCHIVE_MUTATION_MARKS_SQL);
+    return;
+  }
+  const startedAt = Date.now();
+  db.exec(ARCHIVE_MUTATION_MARKS_SQL);
+  log.info('Archive row-marks schema created', { ms: Date.now() - startedAt });
+}
+
+/**
+ * Open the archive once at host startup so its schema exists before anything
+ * reads it.
+ *
+ * `initSchema` is otherwise reached only through the lazy `openDb()`, which
+ * runs on the first archive WRITE. On a host upgrading into #360 that means
+ * `archive_row_marks` would not exist until some unrelated chat traffic
+ * happened to arrive — and until it does, every archive projection stamp
+ * reports an unknown mutation count and fails closed, so every spawn keeps
+ * doing the full 19 s rebuild this release exists to remove. A boot that
+ * spawns before anyone speaks would get none of the benefit.
+ *
+ * Idempotent and cheap: on every later boot the schema is already there and
+ * this is a file open plus a `sqlite_master` lookup.
+ */
+export function ensureArchiveSchema(): void {
+  openDb();
+}
+
+/**
+ * Test hook — drop the cached connection so the next open behaves like a fresh
+ * host boot against an archive that already exists on disk.
+ *
+ * Needed because that is the ONLY way to exercise the `sqlite_master` gate in
+ * `ensureArchiveRowMarks`: the connection cache otherwise short-circuits every
+ * call after the first within one process.
+ */
+export function __resetArchiveConnectionForTest(): void {
+  if (!_db) return;
+  try {
+    _db.close();
+  } catch {
+    // stale handle
+  }
+  _db = null;
+  _dbPath = null;
 }
 
 export interface ArchiveMessage {
@@ -180,17 +296,29 @@ export interface ArchiveMessage {
   sentAt: string;
 }
 
-const upsertStmt = () =>
-  openDb().prepare(
-    `INSERT INTO messages_archive
+/**
+ * The ONLY statement in the host that writes `messages_archive`.
+ *
+ * Exported so tests can exercise the real thing rather than a hand-copied
+ * lookalike, and so `src/archive-write-path.test.ts` can hold the invariant
+ * that no second write path appears: the `archive_row_marks` triggers above,
+ * and therefore the archive projection's freshness stamp, are correct only
+ * because every mutation the archive can undergo goes through here.
+ *
+ * Note the `DO UPDATE`: this is an upsert, not an append. Re-archiving a
+ * message id rewrites the row in place, which is exactly what the marks
+ * triggers exist to count.
+ */
+export const ARCHIVE_UPSERT_SQL = `INSERT INTO messages_archive
        (id, agent_group_id, messaging_group_id, channel_type, channel_name, platform_id, thread_id, role, sender_id, sender_name, text, sent_at)
      VALUES (@id, @agentGroupId, @messagingGroupId, @channelType, @channelName, @platformId, @threadId, @role, @senderId, @senderName, @text, @sentAt)
      ON CONFLICT(id) DO UPDATE SET
        text = excluded.text,
        sender_name = excluded.sender_name,
        channel_name = COALESCE(excluded.channel_name, channel_name)
-     WHERE excluded.text IS NOT NULL`,
-  );
+     WHERE excluded.text IS NOT NULL`;
+
+const upsertStmt = () => openDb().prepare(ARCHIVE_UPSERT_SQL);
 
 export function upsertArchiveMessage(msg: ArchiveMessage): void {
   if (!msg.text || msg.text.length === 0) return;
