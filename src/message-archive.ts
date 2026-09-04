@@ -29,6 +29,52 @@ import { log } from './log.js';
 
 const ARCHIVE_PATH = path.join(DATA_DIR, 'archive.db');
 
+/**
+ * A per-agent-group counter of NON-APPEND changes to `messages_archive`.
+ *
+ * `messages_archive` is very nearly append-only, but not quite:
+ * `upsertStmt` below carries `ON CONFLICT(id) DO UPDATE SET text = ...`, so
+ * re-archiving a message id — an edited chat message, a redelivered outbound
+ * row — rewrites the row in place. Row count and `MAX(rowid)` do not move when
+ * that happens, which makes a cheap watermark unsound on its own: the archive
+ * projection in `src/db/per-agent-projections.ts` keys its freshness stamp on
+ * `COUNT(*)` and `MAX(rowid)` over one workgroup's rows, and an in-place edit
+ * would slip past both and leave a container serving stale text forever.
+ *
+ * These triggers make the un-watermarkable changes countable. They fire only
+ * when a row's projected content actually moves, so an idempotent re-archive of
+ * identical text costs nothing and does not invalidate anybody's projection.
+ * `sent_at`, `role`, `sender_id`, `messaging_group_id` and `thread_id` are not
+ * in the `WHEN` clause because no write path updates them; if one ever does,
+ * add it here — the projection's dedup key includes them.
+ *
+ * Kept as a side table rather than an `updated_at` column on `messages_archive`
+ * itself: adding a column to the live multi-hundred-megabyte archive would need
+ * a second index over it to be queryable per agent group, and this table is one
+ * row per agent group.
+ */
+export const ARCHIVE_MUTATION_MARKS_SQL = `
+  CREATE TABLE IF NOT EXISTS archive_row_marks (
+    agent_group_id TEXT PRIMARY KEY,
+    mutations      INTEGER NOT NULL DEFAULT 0
+  );
+  CREATE TRIGGER IF NOT EXISTS messages_archive_mark_update
+  AFTER UPDATE ON messages_archive
+  WHEN old.text IS NOT new.text
+    OR old.sender_name IS NOT new.sender_name
+    OR old.channel_name IS NOT new.channel_name
+  BEGIN
+    INSERT INTO archive_row_marks (agent_group_id, mutations) VALUES (new.agent_group_id, 1)
+    ON CONFLICT(agent_group_id) DO UPDATE SET mutations = mutations + 1;
+  END;
+  CREATE TRIGGER IF NOT EXISTS messages_archive_mark_delete
+  AFTER DELETE ON messages_archive
+  BEGIN
+    INSERT INTO archive_row_marks (agent_group_id, mutations) VALUES (old.agent_group_id, 1)
+    ON CONFLICT(agent_group_id) DO UPDATE SET mutations = mutations + 1;
+  END;
+`;
+
 let _db: Database.Database | null = null;
 let _dbPath: string | null = null;
 
@@ -163,6 +209,7 @@ function initSchema(db: Database.Database): void {
       VALUES (new.rowid, new.text, new.sender_name);
     END;
   `);
+  db.exec(ARCHIVE_MUTATION_MARKS_SQL);
 }
 
 export interface ArchiveMessage {
