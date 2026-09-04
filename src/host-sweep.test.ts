@@ -20,7 +20,6 @@ import {
   type ContainerState,
 } from './modules/mailbox/ops/sweep.js';
 import { composeNanoclawSession, type NanoclawMailboxSession } from './modules/mailbox/index.js';
-import * as mailboxIndex from './modules/mailbox/index.js';
 import { getAgentMailbox } from './mailbox/index.js';
 import { withExistingNanoclawSession } from './modules/mailbox/session.js';
 import { closeDb, initTestDb, runMigrations } from './db/index.js';
@@ -1302,31 +1301,17 @@ describe('sweepUsageRollup over a hot journal', () => {
     closeDb();
   });
 
-  // The genuine-crash case above is only reproducible where the platform's
-  // SIGKILL residue leaves a real hot journal — some sandboxes never produce
-  // one and the case above self-skips there. This one is deterministic
-  // everywhere: it spies on the module's own `readSessionOutbound` and pins
-  // the exact options `sweepUsageRollup` must pass at the call site, which is
-  // the actual regression (a missing third argument, defaulting to the
-  // console fan-out's `recoverJournal: false` / 1s timeout instead of the
-  // write path's `recoverJournal: true` / 5s that `openOutboundDb` always
-  // gave).
-  it('passes the write path options (recoverJournal, 5s busy_timeout) to readSessionOutbound', async () => {
-    const spy = vi.spyOn(mailboxIndex, 'readSessionOutbound').mockReturnValue(undefined);
-    const session: Session = { ...fakeSession(), id: 'sess-usage-opts', agent_group_id: 'ag-usage-opts' };
-    const dir = path.join(testDataDir.dir, 'v2-sessions', session.agent_group_id, session.id);
-    fs.mkdirSync(dir, { recursive: true });
-    // The stat gate only needs a file to exist; readSessionOutbound is mocked
-    // so its content is irrelevant here.
-    fs.writeFileSync(path.join(dir, 'outbound.db'), '');
-
-    await _sweepUsageRollupForTesting([session]);
-
-    expect(spy).toHaveBeenCalledTimes(1);
-    expect(spy.mock.calls[0]?.[0]).toEqual({ agentGroupId: session.agent_group_id, sessionId: session.id });
-    expect(spy.mock.calls[0]?.[2]).toEqual({ busyTimeoutMs: 5000, recoverJournal: true });
-    spy.mockRestore();
-  });
+  // The deterministic sibling of the case above — `passes the write path
+  // options (recoverJournal, 5s busy_timeout) to readSessionOutbound` — moved
+  // to src/modules/sweep-usage/usage.test.ts with the T19 body (S2-PR12),
+  // where it drives the registered duty instead of a driver hook.
+  //
+  // The hot-journal case above could not follow it. That suite mocks
+  // `readSessionOutbound` (the very seam this asserts through) and arms a
+  // `child_process` tripwire, and this case needs the REAL funnel plus a
+  // killed child process to leave a genuine hot journal behind. It stays on
+  // this file's fixture and reaches across for the moved body, the same way
+  // the S14 SLA cases above do.
 });
 
 // ─────────────────────────────────────────────────────────────────────────────

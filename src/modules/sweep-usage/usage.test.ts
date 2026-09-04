@@ -489,4 +489,32 @@ describe('registered usage-rollup duty (T19)', () => {
     );
     expect(h.spawns).toEqual([]);
   });
+
+  /**
+   * Moved from `src/host-sweep.test.ts` under its exact title. Mailbox seam
+   * PR 6 (Codex P2) added it against the driver's own T19 body; S2-PR12 moved
+   * that body here, so the case follows it and now drives the REGISTERED duty
+   * instead of the driver's test-only hook.
+   *
+   * It overlaps the case above by design — that one's subject is "never the
+   * raw opener", this one's is "the third argument is present and exact". The
+   * options are the half that is invisible until a container crashes
+   * mid-write, so they keep a case whose title says so.
+   */
+  it('passes the write path options (recoverJournal, 5s busy_timeout) to readSessionOutbound', async () => {
+    const sessionId = 'sess-usage-opts';
+    const dir = path.join(h.dataDir, 'v2-sessions', 'ag-test', sessionId);
+    fs.mkdirSync(dir, { recursive: true });
+    // The stat gate only needs a file to exist; readSessionOutbound is mocked
+    // here, so its content is irrelevant.
+    fs.writeFileSync(path.join(dir, 'outbound.db'), '');
+
+    const duty = getDuty();
+    await duty.run(tickContext([fakeSession(sessionId)]) as never);
+
+    expect(h.mockReadSessionOutbound).toHaveBeenCalledTimes(1);
+    expect(h.mockReadSessionOutbound.mock.calls[0]?.[0]).toEqual({ agentGroupId: 'ag-test', sessionId });
+    expect(h.mockReadSessionOutbound.mock.calls[0]?.[2]).toEqual({ busyTimeoutMs: 5000, recoverJournal: true });
+    expect(h.spawns).toEqual([]);
+  });
 });
