@@ -155,7 +155,7 @@ Post-deploy: restart **required**. Evidence: `Host sweep error` still 0; `Host s
 ### Risks / open decisions
 
 - **The in-flight guard is the whole safety argument.** If it is missing or leaks an entry, an event reconcile can run inside a session the tick is sweeping, and both paths write the same mailbox. Cases 3 and 4 assert it; the `finally` release is the code review's focus.
-- **Needs Dave in product terms:** wakes get faster on a session that just received mail; the 60-second beat becomes a floor rather than a fixed drum. Recommend accepting.
+- **Needs the operator in product terms:** wakes get faster on a session that just received mail; the 60-second beat becomes a floor rather than a fixed drum. Recommend accepting.
 
 ### Executable acceptance criteria
 
@@ -298,7 +298,7 @@ Post-deploy: restart required. Evidence: `ncl groups config add-mcp-server --url
 ### Risks / open decisions
 
 - **`groups.ts` is where the dual-write invariant can silently die.** A structural test asserting both writers ships with this PR.
-- **Needs Dave in product terms:** remote MCP servers over `--url` let an agent's tool surface reach a declared network endpoint. Recommend taking it, gated behind the existing `access: 'approval'` on `config add-mcp-server`.
+- **Needs the operator in product terms:** remote MCP servers over `--url` let an agent's tool surface reach a declared network endpoint. Recommend taking it, gated behind the existing `access: 'approval'` on `config add-mcp-server`.
 
 ### Executable acceptance criteria
 
@@ -360,7 +360,7 @@ Post-deploy evidence: one recurring task re-arms at its expected local time in t
 ### Risks / open decisions
 
 - The fork's `handleRecurrence` refuses to arm when the invalidation throws for a closed session (`recurrence.ts:165-175`) — deliberate fail-closed, no upstream equivalent. Keep it.
-- Nothing needs Dave.
+- Nothing needs the operator.
 
 ### Executable acceptance criteria
 
@@ -427,7 +427,7 @@ Post-deploy: restart required. Evidence: an approval card on an MPDM-shaped conv
 ### Risks / open decisions
 
 - **Highest live risk of the five.** A wrong resolution silently changes who can talk to an agent, or who counts as an owner.
-- **Needs Dave in product terms:** privacy-safe logging at the approval and dashboard-token flows means a DM failure there no longer records the handle. Recommend it.
+- **Needs the operator in product terms:** privacy-safe logging at the approval and dashboard-token flows means a DM failure there no longer records the handle. Recommend it.
 
 ### Executable acceptance criteria
 
