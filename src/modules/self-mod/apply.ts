@@ -87,10 +87,19 @@ export async function applyInstallPackages(payload: Record<string, unknown>, ses
     });
     log.info('Container rebuild completed (bundled with install)', { agentGroupId: session.agent_group_id });
   } catch (e) {
-    await notifyAgent(
-      session,
-      `Packages added to config (${pkgs}) but rebuild failed: ${e instanceof Error ? e.message : String(e)}. Tell the user — an admin will need to retry the install_packages request or inspect the build logs.`,
-    );
+    // Best-effort: updateContainerConfigJson above (before this try block)
+    // already committed the package list. This handler is reached almost
+    // exclusively via approval-replay (reenterGuardedDeliveryAction) — an
+    // awaited rejection here would propagate to response-handler.ts's catch,
+    // which attempts its own fallback notify; if that ALSO fails, the
+    // approval row is never deleted and stays clickable, risking a second
+    // buildAgentGroupImage + killContainer for an already-updated config.
+    void Promise.resolve(
+      notifyAgent(
+        session,
+        `Packages added to config (${pkgs}) but rebuild failed: ${e instanceof Error ? e.message : String(e)}. Tell the user — an admin will need to retry the install_packages request or inspect the build logs.`,
+      ),
+    ).catch((err) => log.warn('install_packages failure notification failed', { err, agentGroupId: session.agent_group_id }));
     log.error('Bundled rebuild failed after install approval', { agentGroupId: session.agent_group_id, err: e });
   }
 }

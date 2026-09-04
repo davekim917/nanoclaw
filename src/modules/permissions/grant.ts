@@ -155,7 +155,14 @@ export async function handleGrantAccess(content: Record<string, unknown>, sessio
       added_at: new Date().toISOString(),
     });
     log.info('grant_access: member added', { callerId, targetUserId, targetAgentGroupId });
-    await notifyAgent(session, `Granted member access: \`${targetUserId}\` → \`${targetAgentGroupId}\`.`);
+    // Best-effort: addMember above already committed. This is a system-action
+    // delivery handler — an awaited rejection here would leave the message
+    // undelivered, so the delivery loop retries the whole handler (re-adding
+    // an already-added member) rather than just re-attempting the
+    // notification.
+    void Promise.resolve(
+      notifyAgent(session, `Granted member access: \`${targetUserId}\` → \`${targetAgentGroupId}\`.`),
+    ).catch((err) => log.warn('grant_access notification failed', { targetUserId, targetAgentGroupId, err }));
     return;
   }
 
@@ -172,7 +179,10 @@ export async function handleGrantAccess(content: Record<string, unknown>, sessio
     granted_at: new Date().toISOString(),
   });
   log.info('grant_access: admin granted', { callerId, targetUserId, targetAgentGroupId });
-  await notifyAgent(session, `Granted admin: \`${targetUserId}\` → \`${targetAgentGroupId}\`.`);
+  // Best-effort — see the matching comment on the member-grant path above.
+  void Promise.resolve(notifyAgent(session, `Granted admin: \`${targetUserId}\` → \`${targetAgentGroupId}\`.`)).catch(
+    (err) => log.warn('grant_access notification failed', { targetUserId, targetAgentGroupId, err }),
+  );
 }
 
 export async function handleRevokeAccess(content: Record<string, unknown>, session: Session): Promise<void> {
@@ -239,7 +249,12 @@ export async function handleRevokeAccess(content: Record<string, unknown>, sessi
     return;
   }
   log.info('revoke_access: revoked', { callerId, targetUserId, targetAgentGroupId });
-  await notifyAgent(session, `Revoked access: \`${targetUserId}\` ← \`${targetAgentGroupId}\`.`);
+  // Best-effort: removeMember/revokeRole above already committed. Same
+  // reasoning as the grant paths — an awaited rejection here would cause a
+  // full-handler retry that re-attempts an already-completed revoke.
+  void Promise.resolve(notifyAgent(session, `Revoked access: \`${targetUserId}\` ← \`${targetAgentGroupId}\`.`)).catch(
+    (err) => log.warn('revoke_access notification failed', { targetUserId, targetAgentGroupId, err }),
+  );
 }
 
 export async function handleListAccess(content: Record<string, unknown>, session: Session): Promise<void> {

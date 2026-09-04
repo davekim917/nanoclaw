@@ -329,7 +329,15 @@ function createApprovalHandler(logPrefix: string) {
     // reaching this function always means approved.
     await writeGateAck(session, p.requestId, 'approved');
     log.info(`${logPrefix} gate approved`, { requestId: p.requestId, userId });
-    await notifyAgent(session, `${logPrefix} gate approved: ${p.label}`);
+    // Best-effort: writeGateAck above already recorded the approval. This is
+    // an approval handler (registerApprovalHandler) — an awaited rejection
+    // here would propagate to response-handler.ts's catch, which attempts
+    // its own fallback notify; if that ALSO fails, the approval row is never
+    // deleted and stays clickable, risking a replay of the already-recorded
+    // ack.
+    void Promise.resolve(notifyAgent(session, `${logPrefix} gate approved: ${p.label}`)).catch((err) =>
+      log.warn(`${logPrefix} gate approval notification failed`, { requestId: p.requestId, err }),
+    );
   };
 }
 

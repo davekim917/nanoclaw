@@ -16,6 +16,7 @@ import { getContainerConfig } from '../db/container-configs.js';
 import { getAgentGroup } from '../db/agent-groups.js';
 import { getSession } from '../db/sessions.js';
 import { guard, type GuardActor } from '../guard/index.js';
+import { log } from '../log.js';
 import { registerApprovalHandler, requestApproval } from '../modules/approvals/index.js';
 import type { PendingApproval } from '../types.js';
 import type { CallerContext, ErrorCode, RequestFrame, ResponseFrame } from './frame.js';
@@ -220,12 +221,22 @@ registerApprovalHandler('cli_command', async ({ payload, approval, notify }) => 
   const callerContext = parseCallerContext(payload.callerContext) ?? { caller: 'host' };
   const response = await dispatch(frame, callerContext, { grant: approval });
 
+  // notify is best-effort here, not part of the approval's success/failure:
+  // dispatch() above has ALREADY executed (or attempted) the command, so a
+  // rejected notify must not fail this handler — an awaited rejection would
+  // propagate to the approval-processing caller, which could leave the
+  // approval row undeleted/still-clickable and risk replaying an
+  // already-executed, non-idempotent command.
   if (response.ok) {
     const localized = localizeIsoTimestamps(response.data);
     const data = typeof localized === 'string' ? localized : JSON.stringify(localized, null, 2);
-    await notify(`Your \`ncl ${frame.command}\` request was approved and executed.\n\n${data}`);
+    void Promise.resolve(
+      notify(`Your \`ncl ${frame.command}\` request was approved and executed.\n\n${data}`),
+    ).catch((err) => log.warn('cli_command approval notification failed', { command: frame.command, err: errMsg(err) }));
   } else {
-    await notify(`Your \`ncl ${frame.command}\` request was approved but failed: ${response.error.message}`);
+    void Promise.resolve(
+      notify(`Your \`ncl ${frame.command}\` request was approved but failed: ${response.error.message}`),
+    ).catch((err) => log.warn('cli_command approval notification failed', { command: frame.command, err: errMsg(err) }));
   }
 });
 

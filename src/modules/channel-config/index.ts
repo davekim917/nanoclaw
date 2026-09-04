@@ -182,10 +182,17 @@ async function handleSetChannelModel(content: Record<string, unknown>, session: 
       : normalizedModel === model
         ? `set to ${normalizedModel}`
         : `set to ${normalizedModel} (via ${model})`;
-  await notifyAgent(
-    session,
-    `✅ Channel default_model ${label} for ${channelName ?? 'current channel'}. Takes effect on next container spawn.`,
-  );
+  // Best-effort: updateMessagingGroupAgent above already committed. This is a
+  // system-action delivery handler — an awaited rejection here would leave
+  // the message undelivered, so the delivery loop retries the whole handler
+  // (re-applying an already-applied model change) rather than just
+  // re-attempting the notification.
+  void Promise.resolve(
+    notifyAgent(
+      session,
+      `✅ Channel default_model ${label} for ${channelName ?? 'current channel'}. Takes effect on next container spawn.`,
+    ),
+  ).catch((err) => log.warn('set_channel_model notification failed', { wiringId: wiring.id, err }));
 }
 
 async function handleSetChannelEffort(content: Record<string, unknown>, session: Session): Promise<void> {
@@ -244,10 +251,13 @@ async function handleSetChannelEffort(content: Record<string, unknown>, session:
     by: callerId,
   });
   const label = normalizedEffort === null ? 'cleared' : `set to ${normalizedEffort}`;
-  await notifyAgent(
-    session,
-    `✅ Channel default_effort ${label} for ${channelName ?? 'current channel'}. Takes effect on next container spawn.`,
-  );
+  // Best-effort — see the matching comment in handleSetChannelModel above.
+  void Promise.resolve(
+    notifyAgent(
+      session,
+      `✅ Channel default_effort ${label} for ${channelName ?? 'current channel'}. Takes effect on next container spawn.`,
+    ),
+  ).catch((err) => log.warn('set_channel_effort notification failed', { wiringId: wiring.id, err }));
 }
 
 const CHANNEL_CONFIG_ACTION = unguarded(
