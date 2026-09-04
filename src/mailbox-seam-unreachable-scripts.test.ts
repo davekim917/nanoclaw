@@ -124,8 +124,8 @@ const SEAM_ADJACENT_MODULES = [
  * `type` imports/exports are excluded — erased at compile time, no runtime
  * binding, so they cannot reach the seam.
  */
-function collectModuleBindings(filePath: string, modulePath: string): string[] {
-  const src = fs.readFileSync(path.join(REPO_ROOT, filePath), 'utf8');
+function collectModuleBindings(filePath: string, modulePath: string, root: string = REPO_ROOT): string[] {
+  const src = fs.readFileSync(path.join(root, filePath), 'utf8');
   const sourceFile = ts.createSourceFile(filePath, src, ts.ScriptTarget.Latest, /* setParentNodes */ true);
   const fileDir = path.posix.dirname(filePath);
   const targetNoExt = modulePath.replace(/\.ts$/, '');
@@ -142,11 +142,36 @@ function collectModuleBindings(filePath: string, modulePath: string): string[] {
     return el.propertyName ? `${original} as ${el.name.text}` : original;
   }
 
+  /**
+   * The literal specifier text of a static or dynamic import/export target,
+   * or `null` if it isn't a literal at all (a computed dynamic-import
+   * specifier is a real edge this walker can't resolve statically — same
+   * "no path found" gap the transitive walk below has for computed
+   * specifiers). A static import's specifier is grammatically always a
+   * `StringLiteral` (`import x from \`./y\`` isn't valid syntax), but a
+   * dynamic `import(...)` accepts a backtick template with no
+   * substitutions too (`import(\`./mailbox/index.js\`)`) — same accessor
+   * for both so neither path can drift out of sync with the other.
+   */
+  function literalSpecifierText(node: ts.Expression): string | null {
+    if (ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node)) return node.text;
+    return null;
+  }
+
   const bindings: string[] = [];
 
   function visit(node: ts.Node): void {
-    if (ts.isImportDeclaration(node) && ts.isStringLiteral(node.moduleSpecifier)) {
-      if (specifierMatchesTarget(node.moduleSpecifier.text) && !node.importClause?.isTypeOnly) {
+    if (ts.isImportDeclaration(node)) {
+      const specifierText = literalSpecifierText(node.moduleSpecifier);
+      if (
+        specifierText !== null &&
+        specifierMatchesTarget(specifierText) &&
+        // ImportClause.isTypeOnly is deprecated as of TypeScript 5.9 in favor
+        // of phaseModifier (which also distinguishes `import defer`, a
+        // different phase, not type-only — so type-only is specifically the
+        // TypeKeyword case).
+        node.importClause?.phaseModifier !== ts.SyntaxKind.TypeKeyword
+      ) {
         const clause = node.importClause;
         if (!clause) {
           bindings.push('(side-effect)'); // bare `import '<module>'`
@@ -164,8 +189,9 @@ function collectModuleBindings(filePath: string, modulePath: string): string[] {
           }
         }
       }
-    } else if (ts.isExportDeclaration(node) && node.moduleSpecifier && ts.isStringLiteral(node.moduleSpecifier)) {
-      if (specifierMatchesTarget(node.moduleSpecifier.text) && !node.isTypeOnly) {
+    } else if (ts.isExportDeclaration(node) && node.moduleSpecifier) {
+      const specifierText = literalSpecifierText(node.moduleSpecifier);
+      if (specifierText !== null && specifierMatchesTarget(specifierText) && !node.isTypeOnly) {
         if (!node.exportClause) {
           bindings.push('*'); // `export * from '<module>'`
         } else if (ts.isNamedExports(node.exportClause)) {
@@ -182,10 +208,10 @@ function collectModuleBindings(filePath: string, modulePath: string): string[] {
       // the bare `import` keyword.
       ts.isCallExpression(node) &&
       node.expression.kind === ts.SyntaxKind.ImportKeyword &&
-      node.arguments.length > 0 &&
-      ts.isStringLiteral(node.arguments[0])
+      node.arguments.length > 0
     ) {
-      if (specifierMatchesTarget(node.arguments[0].text)) bindings.push('dynamic');
+      const specifierText = literalSpecifierText(node.arguments[0]);
+      if (specifierText !== null && specifierMatchesTarget(specifierText)) bindings.push('dynamic');
     }
     ts.forEachChild(node, visit);
   }
@@ -236,6 +262,50 @@ function callNeverReachingSeam(fn: () => void): void {
     expect((err as Error).message).not.toBe(NOT_REGISTERED);
   }
 }
+
+describe('collectModuleBindings — backtick dynamic import specifiers', () => {
+  // Regression: `ts.isStringLiteral` alone misses a dynamic `import(...)`
+  // written with a backtick template that has no substitutions
+  // (`import(\`./mailbox/index.js\`)`) — a NoSubstitutionTemplateLiteral is a
+  // distinct AST node kind from StringLiteral, and TypeScript accepts either
+  // as a dynamic-import specifier. A destructured alias on the awaited
+  // result (the realistic shape this would appear in) exercises that the
+  // walker still recurses into the surrounding variable declaration to find
+  // the call expression.
+  it('a backtick dynamic import with a destructured alias is still recorded as `dynamic`', () => {
+    const dir = tmpDir('backtick-dynamic-import');
+    fs.writeFileSync(
+      path.join(dir, 'entry.ts'),
+      [
+        'export async function evade() {',
+        '  const { getAgentMailbox: alias } = await import(`./mailbox/index.js`);',
+        '  return alias;',
+        '}',
+      ].join('\n'),
+    );
+    fs.mkdirSync(path.join(dir, 'mailbox'), { recursive: true });
+    fs.writeFileSync(path.join(dir, 'mailbox/index.ts'), 'export function getAgentMailbox() {}\n');
+
+    expect(collectModuleBindings('entry.ts', 'mailbox/index.ts', dir)).toEqual(['dynamic']);
+  });
+
+  it('the equivalent plain-string dynamic import is recorded identically, proving the two forms share one code path', () => {
+    const dir = tmpDir('string-dynamic-import');
+    fs.writeFileSync(
+      path.join(dir, 'entry.ts'),
+      [
+        'export async function evade() {',
+        "  const { getAgentMailbox: alias } = await import('./mailbox/index.js');",
+        '  return alias;',
+        '}',
+      ].join('\n'),
+    );
+    fs.mkdirSync(path.join(dir, 'mailbox'), { recursive: true });
+    fs.writeFileSync(path.join(dir, 'mailbox/index.ts'), 'export function getAgentMailbox() {}\n');
+
+    expect(collectModuleBindings('entry.ts', 'mailbox/index.ts', dir)).toEqual(['dynamic']);
+  });
+});
 
 describe('negative control: the harness actually detects a real seam hit', () => {
   it('getAgentMailbox() throws "No agent mailbox registered" when the factory is unregistered', async () => {
