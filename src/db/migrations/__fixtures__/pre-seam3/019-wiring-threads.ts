@@ -1,4 +1,4 @@
-import type { Migration } from './index.js';
+import type { Migration } from '../../index.js';
 
 /**
  * Per-wiring thread-policy override on `messaging_group_agents`.
@@ -14,7 +14,6 @@ import type { Migration } from './index.js';
 export const migration019: Migration = {
   version: 19,
   name: 'wiring-threads-override',
-  sqliteOnly: true,
   up(db) {
     db.exec(`ALTER TABLE messaging_group_agents ADD COLUMN threads INTEGER;`);
   },

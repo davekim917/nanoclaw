@@ -47,6 +47,12 @@ import { migration041 } from './041-support-threads.js';
 import { migration042 } from './042-support-threads-subject-sender.js';
 import { migration043 } from './043-scheduled-audit.js';
 import { migration044 } from './044-channel-ingress-receipts.js';
+// Fork 045 is a strict SUPERSET of upstream's 021-approval-question
+// ('approval-question-render-metadata' — the same `name`, so only one of them
+// can ever be in this list): it adds the `question` column on
+// `pending_questions` as well as on the three approval tables. Upstream's 021 is
+// therefore deliberately NOT imported; importing both would share a `name` and
+// break FRESH installs (see src/db/migrations/registry.test.ts).
 import { migration045 } from './045-approval-question-render-metadata.js';
 import { migration046 } from './046-provider-health.js';
 import { migration047 } from './047-usage-daily.js';
@@ -67,11 +73,14 @@ import { migration061 } from './061-turn-usage-turn-id.js';
 import { migration062 } from './062-thread-titles.js';
 import { migration063 } from './063-channel-instructions-profile.js';
 import { migration064 } from './064-container-config-security-json.js';
-import { migration065 } from './065-container-config-timezone.js';
-import { migration066 } from './066-approvals-instance.js';
 import { migration067 } from './067-cli-request-executions.js';
 import { migration068 } from './068-sessions-sweep-quiet-until.js';
 import { migration069 } from './069-messaging-group-name-source.js';
+// Upstream's 022/024, adopted under upstream's `name` at fork file numbers so
+// they sort after this fork's local migrations. 071 is shadow schema: zero
+// fork writers (plan §4.3).
+import { migration070 } from './070-messaging-group-detached-at.js';
+import { migration071 } from './071-host-coordination.js';
 // Upstream's 014/015 — file numbers clash with local but uniqueness is by `name`.
 // Aliased to avoid JS identifier collisions with the local 014/015 above.
 import { migration014 as containerConfigs } from './014-container-configs.js';
@@ -81,11 +90,27 @@ import { migration015 as cliScope } from './015-cli-scope.js';
 // recreate that backfills instance = channel_type; safe on existing DBs.
 import { migration016 as messagingGroupInstance } from './016-messaging-group-instance.js';
 import { migration019 } from './019-wiring-threads.js';
+// Upstream's 020/023 — adopted verbatim, replacing this fork's 065/066, which
+// carried the same `name` and the same SQL under a fork file number. Live
+// installs already hold both ledger rows, so these are skipped there; fresh
+// installs get exactly what upstream's files produce.
+import { migration020 } from './020-container-config-timezone.js';
+import { migration023 } from './023-approvals-instance.js';
 
 export interface Migration {
   version: number;
   name: string;
   up: (db: Database.Database) => void;
+  /**
+   * Inert in this fork, and deliberately so.
+   *
+   * Upstream's async runner uses it to refuse a SQLite-specific migration on a
+   * non-SQLite dialect and to route the allowed ones through its raw escape
+   * hatch. The fork's runner is synchronous and SQLite-only, so it never reads
+   * the flag — the field exists purely so upstream's migration files can land
+   * BYTE-IDENTICAL instead of diverging on one line each.
+   */
+  sqliteOnly?: true;
   /**
    * Run with foreign_keys=OFF. Required for table recreates (SQLite can't
    * drop a table-level UNIQUE without DROP+RENAME, and DROP fails FK
@@ -173,10 +198,11 @@ export const migrations: Migration[] = [
   // `containerConfigs` creates. Ordering here is execution order, not file
   // number — registering 064 next to 063 runs it before the table exists.
   migration064,
-  // Same constraint as 064: 065 ALTERs container_configs, so it must run
-  // after the aliased `containerConfigs` creates the table.
-  migration065,
-  migration066,
+  // Same constraint as 064: upstream's 020 ALTERs container_configs, so it must
+  // run after the aliased `containerConfigs` creates the table. Position is
+  // unchanged from the fork's 065, which this replaces.
+  migration020,
+  migration023,
   // Standalone CREATE TABLE with no timestamp for 053 to normalize — position
   // relative to 053 is irrelevant, same reasoning as 054/055/056 above.
   migration067,
@@ -190,6 +216,13 @@ export const migrations: Migration[] = [
   // fixed — a name_source added before it would be silently dropped on a
   // fresh DB. Execution order, not file number.
   migration069,
+  // After migration069 for the same reason it is there: upstream's 016
+  // RECREATES messaging_groups with a fixed column list, so detached_at has to
+  // be added after that recreate or a fresh DB silently loses it.
+  migration070,
+  // Shadow schema — four tables with zero fork writers. Creates no timestamp
+  // for 053 to normalize, so its position relative to 053 is irrelevant.
+  migration071,
   // Last on purpose: normalizes whatever naive timestamps every migration
   // above has left behind (016's messaging_groups recreate copies created_at
   // through as-is).

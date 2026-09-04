@@ -12,7 +12,7 @@
  * type, which is the correct key on single-instance installs.
  */
 import type Database from 'better-sqlite3';
-import type { Migration } from './index.js';
+import type { Migration } from '../../index.js';
 
 export const migration066: Migration = {
   version: 66,
