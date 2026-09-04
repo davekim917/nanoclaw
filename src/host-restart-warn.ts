@@ -26,6 +26,12 @@
  * the sweep's ceiling kill and idle reaper already read those as. Quiet
  * sessions get no note, so a restart does not wake every idle container into
  * a public "nothing happened".
+ *
+ * Known residual: this closes the GRACEFUL path. After an unclean host crash
+ * the startup backstop cannot trust `provider_executing` (it is whatever the
+ * dead container last wrote), so a session interrupted mid-turn with more than
+ * RESTART_WARN_HEARTBEAT_FRESH_MS of provider silence — a long quiet Codex tool
+ * call, say — still gets no note on that path.
  */
 import { createHash } from 'crypto';
 import fs from 'node:fs';
@@ -82,18 +88,41 @@ function freshProcessingClaimKey(mailbox: NanoclawMailboxSession, now: number): 
 }
 
 /**
- * Heartbeat mtime, or null when there is no usable one. A missing file (never
- * woken, or cleared at spawn) and a future mtime both read as "no signal"
- * rather than as evidence.
+ * How far ahead of a clock sampled AFTER the read an mtime may sit and still be
+ * believed.
+ *
+ * A stamp slightly in the future is the normal case here, not an anomaly: the
+ * graceful-shutdown warn runs BEFORE `stopAllContainers`, so the container is
+ * still alive and still touching this file while we stat it. Comparing against
+ * the caller's entry clock and rejecting anything newer would therefore discard
+ * the single freshest, most conclusive heartbeat there is — the busiest
+ * container, mid-turn, would be the one session left with no note. That is the
+ * exact stranding this module was changed to prevent.
+ *
+ * The bound still has to exist, because a genuinely bad stamp (a clock step, a
+ * file restored from elsewhere) would otherwise read as permanently fresh and
+ * warn this session on every restart forever. Container and host share one
+ * kernel clock and one filesystem, so a few seconds past a post-read sample is
+ * already far more than a concurrent touch can explain.
  */
-function heartbeatMtimeMs(session: Session, now: number): number | null {
+const HEARTBEAT_MAX_SKEW_MS = 5_000;
+
+/**
+ * Heartbeat mtime, or null when there is no usable one. A missing file (never
+ * woken, or cleared at spawn) reads as "no signal" rather than as evidence, and
+ * so does a stamp beyond {@link HEARTBEAT_MAX_SKEW_MS} in the future.
+ */
+function heartbeatMtimeMs(session: Session): number | null {
   let mtimeMs: number;
   try {
     mtimeMs = fs.statSync(heartbeatPath(session.agent_group_id, session.id)).mtimeMs;
   } catch {
     return null;
   }
-  return Number.isFinite(mtimeMs) && mtimeMs <= now ? mtimeMs : null;
+  if (!Number.isFinite(mtimeMs)) return null;
+  // Re-sample AFTER the stat: everything between the caller's `now` and this
+  // point is time a live container had to write the file.
+  return mtimeMs <= Date.now() + HEARTBEAT_MAX_SKEW_MS ? mtimeMs : null;
 }
 
 
@@ -107,7 +136,19 @@ function hasRecentRestartNote(mailbox: NanoclawMailboxSession, now: number): boo
  * graceful shutdown path and startup backstop idempotent for one interruption.
  * Returns true when a note was written.
  */
-export function warnSessionIfWorkInFlight(mailbox: NanoclawMailboxSession, session: Session, reason: string): boolean {
+export function warnSessionIfWorkInFlight(
+  mailbox: NanoclawMailboxSession,
+  session: Session,
+  reason: string,
+  /**
+   * True only when the caller KNOWS this session's container is still running
+   * — the graceful-shutdown path, which iterates the live container registry
+   * before stopping anything. It decides whether `provider_executing` may be
+   * trusted on its own; see `liveExecutingTurn` below. Defaults to false so a
+   * caller that does not know takes the stricter reading.
+   */
+  containerLive = false,
+): boolean {
   const now = Date.now();
   if (hasRecentRestartNote(mailbox, now)) return false;
   const state = mailbox.getContainerState();
@@ -148,15 +189,58 @@ export function warnSessionIfWorkInFlight(mailbox: NanoclawMailboxSession, sessi
   // DB without the column drops to the tool-only tier in getContainerState and
   // reads back undefined, and there the heartbeat alone is still better
   // evidence than nothing.
-  const heartbeatMs = heartbeatMtimeMs(session, now);
-  const heartbeatAgeMs = heartbeatMs === null ? null : now - heartbeatMs;
+  const heartbeatMs = heartbeatMtimeMs(session);
+  // Clamped: a live container writing the file while we read it legitimately
+  // produces a stamp newer than `now`, and that is maximally fresh, not
+  // negative age. See HEARTBEAT_MAX_SKEW_MS.
+  const heartbeatAgeMs = heartbeatMs === null ? null : Math.max(0, now - heartbeatMs);
   const providerIdle = state?.provider_executing === 0;
   const freshHeartbeat =
     !providerIdle && heartbeatAgeMs !== null && heartbeatAgeMs <= RESTART_WARN_HEARTBEAT_FRESH_MS;
+  // A turn that is executing RIGHT NOW needs no heartbeat corroboration, but
+  // only when we know the container is alive — which is exactly the
+  // graceful-shutdown path, where this runs against the live registry before
+  // stopAllContainers.
+  //
+  // The window is real and it is not an edge case. The Codex provider has no
+  // total-turn and no idle timeout by design (its watchdog is health-probe
+  // based: `codex.factory.test.ts` asserts the absence of both, and probing
+  // only begins after CODEX_HEALTH_PROBE_QUIET_MS = 60s, every 30s). So a
+  // healthy turn can stream nothing for well past the freshness window. A
+  // pushed follow-up turn in that state holds no processing claim (its rows
+  // were completed when it was pushed), may sit between tools with no
+  // current_tool, and may have no continuation — the ae2rvy shape exactly,
+  // with a stale heartbeat on top. Requiring both would strand it.
+  //
+  // Not extended to the startup backstop: there the previous host is gone, so
+  // this flag is whatever a dead container last wrote and nothing has reset it
+  // yet (`resetProviderExecuting` runs at the NEXT container's startup). Stale
+  // 1s would warn that session on every boot. There, freshness still rules.
+  //
+  // The heartbeat FILE must exist even here, and that is not belt-and-braces —
+  // it is what makes `containerLive` mean what it says. A container killed by
+  // SIGKILL or the OOM reaper never runs the `finally` that lowers the flag
+  // (poll-loop.ts), so `provider_executing` stays 1 in outbound.db until the
+  // NEXT container clears it in `clearStaleProcessingAcks` at startup. The host
+  // registers a respawn in `activeContainers` immediately after `spawn()`
+  // (container-runner.ts), which is BEFORE the runner has booted far enough to
+  // run that reset — so in that window `containerLive` is true and the flag is
+  // pure residue from the dead container. A shutdown landing there would write
+  // a mid-work note for a container that has not begun a turn.
+  //
+  // Heartbeat existence closes exactly that window and nothing else. The spawn
+  // path deletes the file before starting the container (container-runner.ts),
+  // and only `touchHeartbeat` recreates it — first reached on a streamed
+  // provider event, well after the reset. So a heartbeat that EXISTS proves the
+  // flag was written by THIS container. Existence, deliberately not freshness:
+  // a stale-but-present heartbeat is the long-quiet Codex turn this clause was
+  // added for.
+  const liveExecutingTurn = containerLive && state?.provider_executing === 1 && heartbeatMs !== null;
   const midWork =
     resumableContinuation ||
     processingClaimKey !== null ||
     freshHeartbeat ||
+    liveExecutingTurn ||
     decideCeilingFollowUp({
       hasContinuation: false,
       currentTool: state?.current_tool ?? null,
@@ -183,6 +267,7 @@ export function warnSessionIfWorkInFlight(mailbox: NanoclawMailboxSession, sessi
       toolStartedAt: state?.tool_started_at ?? null,
       heartbeatAgeMs,
       providerExecuting: state?.provider_executing ?? null,
+      containerLive,
     });
     return false;
   }
@@ -195,6 +280,8 @@ export function warnSessionIfWorkInFlight(mailbox: NanoclawMailboxSession, sessi
       // the graceful-shutdown warn and the startup backstop — which run
       // seconds apart, on either side of the same interruption — derive the
       // SAME id and the second one is a no-op rather than a duplicate note.
+      // Non-null by construction: every remaining signal that can reach here —
+      // freshHeartbeat and liveExecutingTurn alike — requires a heartbeat mtime.
       (state?.tool_started_at ?? processingClaimKey ?? `heartbeat-${Math.floor(heartbeatMs! / 60_000)}`);
   const episodeBucket = Math.floor(now / RESTART_NOTE_DEDUPE_MS);
   const recoveryHash = createHash('sha256').update(recoveryKey).digest('hex').slice(0, 16);
@@ -222,14 +309,14 @@ export function warnSessionIfWorkInFlight(mailbox: NanoclawMailboxSession, sessi
   return inserted;
 }
 
-async function warnSessions(session: Session, reason: string): Promise<void> {
+async function warnSessions(session: Session, reason: string, containerLive = false): Promise<void> {
   try {
     // Existing-only. The note is for a session whose container is about to be
     // stopped, so its mailbox is there; provisioning one here would author an
     // outbound.db the host must never create (invariant I-10) for a session
     // that has already been reclaimed.
     await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) =>
-      warnSessionIfWorkInFlight(mailbox, session, reason),
+      warnSessionIfWorkInFlight(mailbox, session, reason, containerLive),
     );
   } catch (err) {
     log.warn('host-restart warn failed for session', { sessionId: session.id, err });
@@ -244,7 +331,9 @@ async function warnSessions(session: Session, reason: string): Promise<void> {
 export async function warnActiveContainersOfShutdown(reason: string): Promise<void> {
   for (const sessionId of getActiveContainerSessionIds()) {
     const session = getSession(sessionId);
-    if (session) await warnSessions(session, reason);
+    // These ids come from the live container registry and nothing has been
+    // stopped yet, so `provider_executing` is current state, not residue.
+    if (session) await warnSessions(session, reason, true);
   }
 }
 

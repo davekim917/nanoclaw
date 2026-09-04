@@ -378,13 +378,31 @@ describe('a long autonomous turn interrupted by a restart', () => {
     expect(noteRows(inDb)).toHaveLength(0);
   });
 
-  it('ignores a heartbeat stamped in the future rather than trusting it', () => {
+  it('trusts a heartbeat touched while we were reading it', () => {
+    // The graceful-shutdown warn runs BEFORE stopAllContainers, so the
+    // container is alive and still touching this file. A stamp a little newer
+    // than the caller's entry clock is the normal case and the single most
+    // conclusive evidence there is; rejecting it would leave the busiest
+    // mid-turn container as the one session with no note.
+    const { inDb, outDb } = makeDbs();
+    const session = fakeSession();
+    touchHeartbeat(session, -2_000);
+
+    expect(warnSessionIfWorkInFlight(mailboxOver(inDb, outDb), session, 'graceful host shutdown')).toBe(true);
+    expect(noteRows(inDb)).toHaveLength(1);
+  });
+
+  it('ignores a stamp too far ahead to be a concurrent touch', () => {
+    // Container and host share one clock and one filesystem, so a minute into
+    // the future is a bad timestamp, not a write that raced our stat. Believing
+    // it would warn this session on every restart forever.
     const { inDb, outDb } = makeDbs();
     const session = fakeSession();
     touchHeartbeat(session, -60_000);
 
     expect(warnSessionIfWorkInFlight(mailboxOver(inDb, outDb), session, 'graceful host shutdown')).toBe(false);
     expect(noteRows(inDb)).toHaveLength(0);
+    expect((noSignalLogCalls()[0][1] as { heartbeatAgeMs: number | null }).heartbeatAgeMs).toBeNull();
   });
 });
 
@@ -460,15 +478,62 @@ describe('the heartbeat is paired with provider_executing', () => {
     expect(noteRows(inDb)).toHaveLength(1);
   });
 
-  it('an executing turn with a stale heartbeat is still not enough on its own', () => {
-    // The two are an AND, not an OR: a raised flag with no recent stream event
-    // is the wedged-provider shape the ceiling kill handles, not this one.
+  it('an executing turn with a stale heartbeat is not enough from the startup backstop', () => {
+    // There the previous host is gone, so a raised flag is whatever a dead
+    // container last wrote and nothing has reset it — believing it would warn
+    // this session on every boot.
     const { inDb, outDb } = makeDbs();
     withProviderExecuting(outDb, 1);
     const session = fakeSession();
     touchHeartbeat(session, RESTART_WARN_HEARTBEAT_FRESH_MS + 1_000);
 
-    expect(warnSessionIfWorkInFlight(mailboxOver(inDb, outDb), session, 'graceful host shutdown')).toBe(false);
+    expect(warnSessionIfWorkInFlight(mailboxOver(inDb, outDb), session, 'host startup after an unclean stop')).toBe(
+      false,
+    );
+    expect(noteRows(inDb)).toHaveLength(0);
+  });
+
+  it('a LIVE executing turn needs no heartbeat corroboration', () => {
+    // Codex has no total-turn and no idle timeout by design, and its health
+    // probe only starts after 60s of quiet — so a healthy turn can stream
+    // nothing for well past the freshness window. A pushed follow-up turn in
+    // that state holds no claim, may sit between tools, and may have no
+    // continuation. During graceful shutdown the container is still running,
+    // so the flag is current state and is evidence on its own.
+    const { inDb, outDb } = makeDbs();
+    withProviderExecuting(outDb, 1);
+    const session = fakeSession();
+    touchHeartbeat(session, 10 * 60 * 1000);
+
+    expect(warnSessionIfWorkInFlight(mailboxOver(inDb, outDb), session, 'graceful host shutdown', true)).toBe(true);
+    expect(noteRows(inDb)).toHaveLength(1);
+  });
+
+  it('a live container that is NOT executing still gets nothing', () => {
+    // The live-container branch must not become "warn every running session".
+    const { inDb, outDb } = makeDbs();
+    withProviderExecuting(outDb, 0);
+    const session = fakeSession();
+    touchHeartbeat(session, 10 * 60 * 1000);
+
+    expect(warnSessionIfWorkInFlight(mailboxOver(inDb, outDb), session, 'graceful host shutdown', true)).toBe(false);
+    expect(noteRows(inDb)).toHaveLength(0);
+  });
+
+  it('a raised flag with NO heartbeat file is residue, not a live turn', () => {
+    // The respawn window. A container killed by SIGKILL or the OOM reaper
+    // never lowers the flag, and the host registers the replacement in
+    // activeContainers immediately after spawn() — before the runner boots far
+    // enough to clear it. So containerLive is true while the flag is pure
+    // residue. The spawn path deletes the heartbeat and only a streamed
+    // provider event recreates it, so its ABSENCE is what identifies that
+    // window: no turn has started under this container yet.
+    const { inDb, outDb } = makeDbs();
+    withProviderExecuting(outDb, 1);
+
+    expect(warnSessionIfWorkInFlight(mailboxOver(inDb, outDb), fakeSession(), 'graceful host shutdown', true)).toBe(
+      false,
+    );
     expect(noteRows(inDb)).toHaveLength(0);
   });
 
