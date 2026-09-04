@@ -36,8 +36,8 @@
     }
   ],
   "sources": {
-    "src/one.ts": "import path from 'path';\nimport fs from 'node:fs';\nimport { writeSessionMessage } from './mailbox/write.js';\n",
-    "src/two.ts": "import path from 'path';\nimport fs from 'node:fs';\nimport { writeSessionMessage } from './mailbox/write.js';\n",
-    "src/three.ts": "import path from 'path';\nimport fs from 'node:fs';\nimport { writeSessionMessage } from './mailbox/write.js';\n"
+    "src/one.ts": "import path from 'path';\nimport fs from 'node:fs';\nimport { test } from 'node:test';\nimport { writeSessionMessage } from './mailbox/write.js';\n",
+    "src/two.ts": "import path from 'path';\nimport fs from 'node:fs';\nimport { test } from 'node:test';\nimport { writeSessionMessage } from './mailbox/write.js';\n",
+    "src/three.ts": "import path from 'path';\nimport fs from 'node:fs';\nimport { test } from 'node:test';\nimport { writeSessionMessage } from './mailbox/write.js';\n"
   }
 }

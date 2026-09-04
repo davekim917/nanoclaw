@@ -155,10 +155,13 @@ describe('review-churn classifier', () => {
     expect(churning[0].primitives).toEqual([]);
   });
 
-  it('never seams a class on a Node builtin, bare or node:-prefixed', () => {
+  it('never seams a class on a Node builtin, bare, prefixed, or prefix-only', () => {
     // A builtin is shared by nearly every file in the tree and owns no
     // write/wake/read primitive, so it is the specifier the seam ranking would
-    // reward and the one answer that can never be right.
+    // reward and the one answer that can never be right. The fixture's sites
+    // share `path` (bare), `node:fs` (prefixed, in builtinModules) and
+    // `node:test` (prefixed, in builtinModules on neither runtime) — so the
+    // `node:` prefix has to be rejected outright, not looked up in the list.
     const churning = classify(fixture('builtin-seam')).classes.filter((c) => c.rounds >= 3);
     expect(churning).toHaveLength(1);
     expect(churning[0].seam).toBeNull();

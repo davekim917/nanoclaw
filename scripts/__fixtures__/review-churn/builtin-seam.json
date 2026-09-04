@@ -1,5 +1,5 @@
 {
-  "_comment": "Three rounds of one class whose sites share nothing but Node builtins: `path` written bare and `node:fs` prefixed. A builtin is not a seam \u2014 no shared write/wake/read primitive lives there \u2014 and a class seamed on one could never be lifted by a diff, only by the trailer. It must come out seamless, which means reported and not gated.",
+  "_comment": "Three rounds of one class whose sites share nothing but Node builtins: `path` written bare, `node:fs` prefixed and in builtinModules, and `node:test` prefixed and NOT in builtinModules on either runtime. A builtin is not a seam \u2014 no shared write/wake/read primitive lives there \u2014 and a class seamed on one could never be lifted by a diff, only by the trailer. It must come out seamless, which means reported and not gated.",
   "findings": [
     {
       "threadId": "T1",
@@ -36,8 +36,8 @@
     }
   ],
   "sources": {
-    "src/one.ts": "import path from 'path';\nimport fs from 'node:fs';\nimport { helper0 } from './helper0.js';\n",
-    "src/two.ts": "import path from 'path';\nimport fs from 'node:fs';\nimport { helper1 } from './helper1.js';\n",
-    "src/three.ts": "import path from 'path';\nimport fs from 'node:fs';\nimport { helper2 } from './helper2.js';\n"
+    "src/one.ts": "import path from 'path';\nimport fs from 'node:fs';\nimport { test } from 'node:test';\nimport { helper0 } from './helper0.js';\n",
+    "src/two.ts": "import path from 'path';\nimport fs from 'node:fs';\nimport { test } from 'node:test';\nimport { helper1 } from './helper1.js';\n",
+    "src/three.ts": "import path from 'path';\nimport fs from 'node:fs';\nimport { test } from 'node:test';\nimport { helper2 } from './helper2.js';\n"
   }
 }

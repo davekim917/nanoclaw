@@ -91,21 +91,27 @@ const STOPWORDS = new Set(
   ).split(/\s+/),
 );
 
-// Import specifiers that are never the seam: the test runner and type-only
-// packages carry no shared write/wake/read primitive.
-const SEAM_SPEC_DENY = /^(?:vitest$|bun:|@types\/)/;
+// Import specifiers that are never the seam: builtins, the test runner, and
+// type-only packages carry no shared write/wake/read primitive.
+//
+// The `node:` prefix stays an unconditional reject and is NOT delegated to the
+// list below: prefix-only builtins (`node:test`, `node:sqlite`) are absent from
+// `builtinModules` on both runtimes this file runs on, so a list-only check
+// would let them through.
+const SEAM_SPEC_DENY = /^(?:node:|vitest$|bun:|@types\/)/;
 
-// Neither does a Node builtin. `node:`-prefixed ones were already excluded by
-// the pattern above, but most of this tree writes them bare (`import path from
-// 'path'`), and a bare builtin is a specifier every file shares — exactly what
-// the seam ranking rewards. A class seamed on `path` is worse than a class
-// with no seam: nothing a diff touches can lift it, so only the reframe
-// trailer could, which reads as the gate refusing work that fixed the defect.
+// The list covers the other half: most of this tree writes builtins bare
+// (`import path from 'path'`), and a bare builtin is a specifier nearly every
+// file shares — exactly what the seam ranking rewards. A class seamed on `path`
+// is worse than a class with no seam: nothing a diff touches can lift it, so
+// only the reframe trailer could, which reads as the gate refusing the very
+// work that fixed the defect. Taken from `node:module` rather than hand-kept so
+// it cannot drift as Node adds modules.
 const NODE_BUILTINS = new Set(builtinModules.map((name) => name.replace(/^node:/, '')));
 
 function seamCandidate(spec) {
   if (SEAM_SPEC_DENY.test(spec)) return false;
-  return !NODE_BUILTINS.has(spec.replace(/^node:/, ''));
+  return !NODE_BUILTINS.has(spec);
 }
 
 // ── finding parsing ─────────────────────────────────────────────────────────
