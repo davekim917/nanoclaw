@@ -39,7 +39,7 @@ Also check, every time:
 | Check | Command | Why |
 |---|---|---|
 | Upgrade tripwire | `node_modules/.bin/tsx scripts/upgrade-state.ts get` vs `node -p "require('./package.json').version"` | Any port that bumps `version` halts the host on next build+restart. Keep the fork's version; never take upstream's. |
-| Migration collision | `git diff --name-only --diff-filter=A $BASE..upstream/main -- src/db/migrations/` and `grep -rn "name: '" src/db/migrations/*.ts` | Ledger is keyed by `name`, NOT file number. Fork's own migrations run 065–069 (065 `container-config-timezone`, 066 `approvals-instance`, 067 `cli-request-executions`, 068 `sessions-sweep-quiet-until`, 069 `messaging-group-name-source`); the next fork ordinal is **070**. An upstream migration file that collides with an already-used fork number gets renumbered to the fork's next free ordinal — keep upstream's `name` verbatim. A same-`name` migration is already applied; don't re-add it. |
+| Migration collision | `git diff --name-only --diff-filter=A $BASE..upstream/main -- src/db/migrations/` and `grep -rn "name: '" src/db/migrations/*.ts` | Ledger is keyed by `name`, NOT file number. Fork's own migrations run 065–069 (065 `container-config-timezone`, 066 `approvals-instance`, 067 `cli-request-executions`, 068 `sessions-sweep-quiet-until`, 069 `messaging-group-name-source`); the next fork ordinal is **070**. An upstream migration file that collides with an already-used fork number gets renumbered to the fork's next free ordinal — keep upstream's `name` verbatim. A same-`name` migration is already applied; don't re-add it. A ported migration that ALTERs `container_configs` is registered right after the aliased `containerConfigs` migration in `src/db/migrations/index.ts` — the array runs in ARRAY order, not filename order, and that table is created late. |
 | Host runtime gate | `git show upstream/main:package.json \| grep -A2 engines` vs `node -v` | Upstream moved to Node ≥22 in 2.3.0; fork is on Node 22 as of 2026-09-02. |
 | Nested pnpm | use `node_modules/.bin/tsx` / `node_modules/.bin/vitest` directly | `pnpm exec` nested here costs ~80 s CPU and times out tool calls. |
 
@@ -144,6 +144,8 @@ ERR0=$(wc -l < logs/nanoclaw.error.log 2>/dev/null || echo 0)
 sudo systemctl restart nanoclaw-v2
 ```
 
+**Checkpoint caveat:** the host logs rotate daily with `copytruncate`; if rotation fires between the checkpoint and the read, the file shrinks and the scoped tail is empty. If `wc -l < logs/nanoclaw.log` is smaller than `$LOG0`, scope from the last `OneCLI preflight ok` line instead (`tail -n +$(grep -n 'OneCLI preflight ok' logs/nanoclaw.log | tail -1 | cut -d: -f1)`), and likewise for the error log from its first line after the restart timestamp.
+
 **Post-restart gate, read at +2.5 minutes with ANSI codes stripped, scoped to `tail -n +$((LOG0+1)) logs/nanoclaw.log` / `tail -n +$((ERR0+1)) logs/nanoclaw.error.log` — all required rows, or it is not deployed:**
 
 | Check | What passes |
@@ -154,6 +156,8 @@ sudo systemctl restart nanoclaw-v2
 | Errors | 0 `ERROR` lines in the scoped tail |
 | Warnings | every WARN class present in the scoped error-log tail is compared against the previous few hours; a class never seen before is investigated before calling the deploy green, a familiar recurring one is not |
 | Restarts | `NRestarts` 0 (no crash loop) |
+| Container started | `docker ps --filter name=nanoclaw-v2- --format '{{.Names}} {{.Status}}'` shows at least one container created after the restart — `OneCLI gateway applied` is logged during argument assembly, BEFORE the actual `spawn`, so a mount or egress failure after that line still leaves no container |
+| Runtime (host upgrades, §5) | `MP=$(systemctl show -p MainPID --value nanoclaw-v2); /proc/$MP/exe -v` prints the intended Node version — systemd can restart through an old executable path and every other row still passes |
 | Env proxy | `NODE_USE_ENV_PROXY` absent from the daemon environ |
 | Seam counters | in the scoped tail: `Host sweep duty failed` = 0; `Host sweep mailbox unopenable` = 0; `tick threw` = 0 |
 | Quiet cache | `Host sweep quiet cache warmed warmed=N` present in the scoped tail, N roughly the fleet size after the first post-boot tick |
