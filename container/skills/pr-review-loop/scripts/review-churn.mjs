@@ -353,6 +353,16 @@ export function seamFor(files, findingText, ctx) {
       for (const n of names) entry.names.set(n, (entry.names.get(n) ?? 0) + 1);
     }
   }
+  // A seam that does not exist is not a seam. An import scan reading text will
+  // eventually read prose as an import — a doc-comment example inside a block
+  // comment is the case that keeps arriving — and no amount of comment
+  // detection settles it, because comment detection needs a lexer. Existence
+  // does settle it: `./fake.js` from an example resolves to no file, so it
+  // cannot be a candidate however convincingly it was written. Package
+  // specifiers are taken as given; they are not liftable by a diff anyway.
+  for (const [spec, entry] of [...bySpec]) {
+    if (entry.relative && !moduleExists(spec, ctx)) bySpec.delete(spec);
+  }
   const scored = [...bySpec.values()].map((e) => ({
     spec: e.spec,
     inRepo: e.relative,
@@ -427,6 +437,28 @@ export function severityFalling(findings) {
   const order = roundsOf(findings).filter((k) => byRound.has(k));
   if (order.length < 2) return false;
   return byRound.get(order[order.length - 1]) > byRound.get(order[0]);
+}
+
+/**
+ * Is there a file behind this resolved specifier? Extensions are tried the way
+ * a resolver would, and the sources map answers first so tests stay hermetic.
+ */
+function moduleExists(spec, ctx) {
+  const candidates = [spec, spec.replace(/\.ts$/, '.tsx'), spec.replace(/\.ts$/, '.js'), spec.replace(/\.ts$/, '.mjs')];
+  if (ctx.sources) {
+    if (candidates.some((c) => Object.prototype.hasOwnProperty.call(ctx.sources, c))) return true;
+    // A payload that carries sources at all is authoritative about them: this
+    // keeps a fixture from reaching the disk for a module it never described.
+    if (!ctx.repoRoot) return false;
+  }
+  if (!ctx.repoRoot) return false;
+  return candidates.some((c) => {
+    try {
+      return fs.existsSync(path.join(ctx.repoRoot, c));
+    } catch {
+      return false;
+    }
+  });
 }
 
 /** Does this file import the module the class settled on as its seam? */
@@ -575,14 +607,58 @@ export const CLASS_ROUND_LIMIT = 3;
  */
 const REFRAME_TRAILER = /^\s*Reframe:\s*(.+?)\s+enforced in\s+(.+?)\s*$/gim;
 
+/**
+ * The one identifier a trailer names, or null.
+ *
+ * `Reframe: <invariant> enforced in <primitive>` gives a free-text phrase, and
+ * every consumer of it used to re-interpret that text its own way: one matched
+ * candidates as substrings, the other treated every word as an independent
+ * name to look for — so `enforced in nonexistent guard function` was satisfied
+ * by a commit that added the word `function`. Parsed once, here, and both
+ * consumers take the result.
+ *
+ * A phrase that leaves more than one candidate after dropping language words
+ * names nothing usable: "the write path" and "nonexistent guard" are prose,
+ * not primitives, and a trailer that cannot name its primitive does not lift
+ * the gate.
+ */
+const TRAILER_NOISE = new Set([
+  'a',
+  'an',
+  'and',
+  'async',
+  'class',
+  'const',
+  'enum',
+  'export',
+  'for',
+  'function',
+  'in',
+  'interface',
+  'let',
+  'method',
+  'new',
+  'of',
+  'the',
+  'this',
+  'to',
+  'type',
+  'var',
+]);
+
+export function trailerPrimitive(primitive) {
+  const tokens = (primitive.match(/[A-Za-z_$][\w$]*/g) ?? []).filter(
+    (token) => !TRAILER_NOISE.has(token.toLowerCase()),
+  );
+  return tokens.length === 1 ? tokens[0] : null;
+}
+
 /** Does the trailer name one of the classifier's candidates for this entry? */
 function primitiveNamed(entry, trailer) {
-  // Whole identifiers, the same rule the substantiation check uses: a trailer
-  // naming `target` must not match a candidate called `get`, which would lift
-  // the gate on a trailer that is about something else entirely.
-  if (entry.primitives.some((p) => identifierMatcher(p).test(trailer.primitive))) return true;
-  if (!entry.seam) return false;
-  return identifierMatcher(path.posix.basename(entry.seam).replace(/\.[jt]sx?$/, '')).test(trailer.primitive);
+  const named = trailerPrimitive(trailer.primitive);
+  if (!named) return false;
+  if (entry.primitives.some((p) => p === named)) return true;
+  return Boolean(entry.seam) && path.posix.basename(entry.seam).replace(/\.[jt]sx?$/, '') === named;
 }
 
 /** Does the trailer name this entry's invariant? */
@@ -616,13 +692,14 @@ function invariantNamed(entry, trailer) {
  * primary path. This is the fallback for when the ranking guessed wrong.
  */
 function declaredByCommit(named, commit, ctx) {
-  const matchers = (named.match(/[A-Za-z_$][\w$]*/g) ?? []).map(identifierMatcher);
-  if (matchers.length === 0) return false;
+  const identifier = trailerPrimitive(named);
+  if (!identifier) return false;
+  const matcher = identifierMatcher(identifier);
   for (const file of commit.files ?? []) {
     const after = fileAtCommit(commit, file, 'after', ctx);
     if (after == null) continue;
     const before = fileAtCommit(commit, file, 'before', ctx) ?? '';
-    if (matchers.some((m) => m.test(after) && !m.test(before))) return true;
+    if (matcher.test(after) && !matcher.test(before)) return true;
   }
   return false;
 }

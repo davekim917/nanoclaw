@@ -303,6 +303,19 @@ describe('review-churn classifier', () => {
     expect(churning.seam).toBe('src/mailbox/write.ts');
   });
 
+  it('will not seam on a module that does not exist', () => {
+    // A block comment carrying `import { evaluateGate } from './fake.js'` is
+    // read as an import by any line-anchored scan, and the findings name
+    // `evaluateGate`, so the fake module would substantiate and the gate would
+    // refuse naming a module nobody can open. Existence settles what comment
+    // detection cannot: the real import is chosen instead, unsubstantiated.
+    const churning = classify(fixture('commented-import-seam')).classes[0];
+    expect(churning.rounds).toBe(3);
+    expect(churning.seam).toBe('src/db/messages-out.ts');
+    expect(churning.seamSubstantiated).toBe(false);
+    expect(gate(fixture('commented-import-seam')).status).toBe(0);
+  });
+
   it('substantiates a seam reached through a destructured dynamic import', () => {
     // `const { evaluateGate } = await import('./gate.js')` binds the same name
     // a static import would, and this tree prescribes that form for circular
@@ -526,6 +539,30 @@ describe('review-churn gate', () => {
       },
     ];
     expect(gate(payload).status).toBe(3);
+  });
+
+  it('does not lift on a trailer that names a phrase rather than a primitive', () => {
+    // `enforced in nonexistent guard function` names no single identifier, and
+    // treating each word as a candidate meant a commit adding the WORD
+    // `function` satisfied it. A trailer that cannot name its primitive lifts
+    // nothing.
+    const payload = fixture('toctou-class');
+    payload.commits = [
+      {
+        sha: 'uuu1111',
+        date: AFTER,
+        message: 'fix: something\n\nReframe: race enforced in nonexistent guard function\n',
+        files: ['src/guard.ts'],
+        before: { 'src/guard.ts': '' },
+        after: { 'src/guard.ts': 'export function unrelated() {}\n' },
+      },
+    ];
+    expect(gate(payload).status).toBe(3);
+
+    // Naming one identifier, which the commit introduces, still lifts.
+    payload.commits[0].message = 'fix: something\n\nReframe: race enforced in the guardEveryWrite function\n';
+    payload.commits[0].after = { 'src/guard.ts': 'export function guardEveryWrite() {}\n' };
+    expect(gate(payload).status).toBe(0);
   });
 
   it('does not lift on a trailer whose primitive merely contains a candidate', () => {

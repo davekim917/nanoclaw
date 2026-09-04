@@ -38,6 +38,9 @@
   "sources": {
     "src/one.ts": "import { helper0 } from './helper0.js';\n",
     "src/two.ts": "import { helper1 } from './helper1.js';\n",
-    "src/three.ts": "import { helper2 } from './helper2.js';\n"
+    "src/three.ts": "import { helper2 } from './helper2.js';\n",
+    "src/helper0.ts": "export function helper0() {}\n",
+    "src/helper1.ts": "export function helper1() {}\n",
+    "src/helper2.ts": "export function helper2() {}\n"
   }
 }

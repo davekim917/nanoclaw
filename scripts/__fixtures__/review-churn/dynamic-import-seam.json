@@ -36,6 +36,7 @@
     }
   ],
   "sources": {
-    "src/tool.ts": "const { evaluateGate } = await import('./gate.js');\n"
+    "src/tool.ts": "const { evaluateGate } = await import('./gate.js');\n",
+    "src/gate.ts": "export function evaluateGate() {}\n"
   }
 }

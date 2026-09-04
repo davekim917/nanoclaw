@@ -38,6 +38,7 @@
   "sources": {
     "src/site1.ts": "import { writeSessionMessage } from './mailbox/write.js';\n",
     "src/site2.ts": "import { writeSessionMessage } from './mailbox/write.js';\n",
-    "src/site3.ts": "import { writeSessionMessage } from './mailbox/write.js';\n"
+    "src/site3.ts": "import { writeSessionMessage } from './mailbox/write.js';\n",
+    "src/mailbox/write.ts": "export function writeSessionMessage() {}\n"
   }
 }

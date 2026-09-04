@@ -61,6 +61,8 @@
     "src/router.ts": "import { writeSessionMessage, wakeContainer } from './mailbox/write.js';\nimport { log } from './log.js';\n",
     "src/delivery.ts": "import { writeSessionMessage } from './mailbox/write.js';\nimport { log } from './log.js';\n",
     "src/tasks.ts": "import { wakeContainer } from './mailbox/write.js';\n",
-    "src/dashboard/close.ts": "import {\n  writeSessionMessage,\n} from '../mailbox/write.js';\n"
+    "src/dashboard/close.ts": "import {\n  writeSessionMessage,\n} from '../mailbox/write.js';\n",
+    "src/mailbox/write.ts": "export function writeSessionMessage() {}\nexport function wakeContainer() {}\n",
+    "src/log.ts": "export function log() {}\n"
   }
 }

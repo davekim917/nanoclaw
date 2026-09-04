@@ -36,6 +36,7 @@
     }
   ],
   "sources": {
-    "src/one.ts": "import { get } from './store.js';\n"
+    "src/one.ts": "import { get } from './store.js';\n",
+    "src/store.ts": "export function get() {}\n"
   }
 }

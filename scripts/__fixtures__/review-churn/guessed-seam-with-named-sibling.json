@@ -48,6 +48,8 @@
   ],
   "sources": {
     "src/tool.ts": "import { writeMessageOut } from './db/messages-out.js';\nimport { evaluateGate } from './gate.js';\n",
-    "src/other.ts": "import { writeMessageOut } from './db/messages-out.js';\n"
+    "src/other.ts": "import { writeMessageOut } from './db/messages-out.js';\n",
+    "src/db/messages-out.ts": "export function writeMessageOut() {}\n",
+    "src/gate.ts": "export function evaluateGate() {}\n"
   }
 }
