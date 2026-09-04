@@ -263,18 +263,46 @@ describe('unknown-sender decline_notify flow', () => {
     expect(channelRows.c).toBe(0);
   });
 
-  it('threads the decline under the message it answers, and keeps the FYI unthreaded', async () => {
-    const { routeInbound } = await import('../../router.js');
-    // A Slack-shaped DM: the bridge gives every root DM message its own
-    // thread, and dm.threads is on by default, so a hard-null threadId would
-    // post the decline at the channel root instead of under the stranger.
-    await routeInbound({ ...strangerDm('hi'), threadId: 'slack:D123:1699999999.000100' });
+  it('sends the decline on the wiring thread it was given, FYI always unthreaded', async () => {
+    // The decline is a reply TO the stranger, so it goes where the wiring
+    // would reply. The access gate hands down the thread router fanout
+    // already resolved for that wiring (resolveThreadPolicy), so this seam
+    // takes the address rather than re-deriving it from the event.
+    const { declineAndNotify } = await import('./sender-approval.js');
+    const thread = 'slack:D123:1699999999.000100';
+    await declineAndNotify({
+      messagingGroupId: 'mg-dm-stranger',
+      agentGroupId: 'ag-1',
+      senderIdentity: 'tg:stranger',
+      senderName: 'Stranger',
+      event: { ...strangerDm('hi'), threadId: thread },
+      threadId: thread,
+    });
     await waitForDeliveries(2);
 
-    expect(deliverMock.mock.calls[0][2]).toBe('slack:D123:1699999999.000100');
+    expect(deliverMock.mock.calls[0][2]).toBe(thread);
     // The owner FYI opens a fresh line in the owner's own DM — it is not a
-    // reply to the stranger, so it must not inherit their thread.
+    // reply to the stranger, so it must never inherit their thread.
     expect(deliverMock.mock.calls[1][2]).toBeNull();
+  });
+
+  it('collapses the decline to the root when the wiring turns threads off', async () => {
+    // threads = 0 on the wiring makes resolveThreadPolicy hand the gate a
+    // null even though the event carries a real thread. Forwarding the raw
+    // event thread here would post declines inside sub-threads the operator
+    // deliberately collapsed.
+    const { declineAndNotify } = await import('./sender-approval.js');
+    await declineAndNotify({
+      messagingGroupId: 'mg-dm-stranger',
+      agentGroupId: 'ag-1',
+      senderIdentity: 'tg:stranger',
+      senderName: 'Stranger',
+      event: { ...strangerDm('hi'), threadId: 'slack:D123:1699999999.000100' },
+      threadId: null,
+    });
+    await waitForDeliveries(2);
+
+    expect(deliverMock.mock.calls[0][2]).toBeNull();
   });
 
   it('dedupes: a second message within 24h sends no further decline or FYI', async () => {
@@ -536,7 +564,8 @@ describe('unknown-sender decline_notify flow', () => {
   it('converting a pending card row into a stamp drops the retained message body', async () => {
     updateMessagingGroup('mg-dm-stranger', { unknown_sender_policy: 'request_approval' });
     const { routeInbound } = await import('../../router.js');
-    await routeInbound(strangerDm('let me in, my token is abc123'));
+    const carded = strangerDm('let me in, my token is abc123');
+    await routeInbound(carded);
     await waitForDeliveries(1);
 
     const card = (await db())
@@ -552,6 +581,15 @@ describe('unknown-sender decline_notify flow', () => {
       .prepare(`SELECT original_message FROM pending_sender_approvals WHERE id LIKE 'decline:%'`)
       .get() as { original_message: string };
     expect(stamp.original_message).toBe('{"declined":true}');
+
+    // The conversion destroys the retained event, which is the only thing
+    // that could ever resolve the carded message's ingress receipt. Leaving
+    // it `deferred` would strand it until the seven-day prune, so the
+    // conversion has to close it out first.
+    const receipt = (await db())
+      .prepare('SELECT status FROM channel_ingress_receipts WHERE message_id = ?')
+      .get(carded.message.id) as { status: string } | undefined;
+    expect(receipt?.status).toBe('completed');
   });
 
   it('honors caller-supplied copy and conversation-scoped dedupe', async () => {

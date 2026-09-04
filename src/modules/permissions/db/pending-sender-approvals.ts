@@ -97,6 +97,16 @@ const DECLINE_STAMP_ID_PREFIX = 'decline:';
 const DECLINE_STAMP_BODY = '{"declined":true}';
 
 /** ISO timestamp of the last decline for this pair, if any. */
+/**
+ * True for a decline stamp, false for a real approval card. The two share the
+ * table and its UNIQUE key, so anything that reads a row for the pair without
+ * knowing which flow wrote it has to ask — a stamp has no approver, no render
+ * metadata, and a sentinel body rather than a retained event.
+ */
+export function isDeclineStampId(id: string): boolean {
+  return id.startsWith(DECLINE_STAMP_ID_PREFIX);
+}
+
 export function getDeclineStampAt(messagingGroupId: string, senderIdentity: string): string | undefined {
   const row = getDb()
     .prepare(

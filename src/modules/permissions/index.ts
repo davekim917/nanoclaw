@@ -131,6 +131,8 @@ async function handleUnknownSender(
   agentGroupId: string,
   accessReason: string,
   event: InboundEvent,
+  /** This wiring's policy-resolved reply thread — see AccessGateFn. */
+  effectiveThreadId: string | null,
 ): Promise<boolean> {
   const parsed = safeParseContent(event.message.content);
   const senderName = parsed.sender ?? null;
@@ -208,6 +210,7 @@ async function handleUnknownSender(
       senderIdentity: userId,
       senderName,
       event,
+      threadId: effectiveThreadId,
     }).catch((err) => log.error('decline_notify flow threw', { err }));
     return false;
   }
@@ -244,14 +247,14 @@ export function setSiblingBotIdsProvider(provider: () => ReadonlySet<string>): v
   getSiblingBotIds = provider;
 }
 
-setAccessGate(async (event, userId, mg, agentGroupId): Promise<AccessGateResult> => {
+setAccessGate(async (event, userId, mg, agentGroupId, effectiveThreadId): Promise<AccessGateResult> => {
   // Public channels skip the access check entirely.
   if (mg.unknown_sender_policy === 'public') {
     return { allowed: true };
   }
 
   if (!userId) {
-    await handleUnknownSender(mg, null, agentGroupId, 'unknown_user', event);
+    await handleUnknownSender(mg, null, agentGroupId, 'unknown_user', event, effectiveThreadId);
     return {
       allowed: false,
       reason: 'unknown_user',
@@ -279,7 +282,7 @@ setAccessGate(async (event, userId, mg, agentGroupId): Promise<AccessGateResult>
     return { allowed: true };
   }
 
-  const replayPending = await handleUnknownSender(mg, userId, agentGroupId, decision.reason, event);
+  const replayPending = await handleUnknownSender(mg, userId, agentGroupId, decision.reason, event, effectiveThreadId);
   return {
     allowed: false,
     reason: decision.reason,

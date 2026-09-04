@@ -37,6 +37,7 @@ import { normalizeOptions, type RawOption } from '../../channels/ask-question.js
 import { getAllAgentGroups } from '../../db/agent-groups.js';
 import { getMessagingGroup } from '../../db/messaging-groups.js';
 import { getDeliveryAdapter } from '../../delivery.js';
+import { completeDeferredInbound } from '../../router.js';
 import { log } from '../../log.js';
 import type { InboundEvent } from '../../channels/adapter.js';
 import { pickApprovalDelivery, pickApprover } from '../approvals/primitive.js';
@@ -46,6 +47,7 @@ import {
   createPendingSenderApproval,
   getDeclineStampAt,
   getInFlightSenderApproval,
+  isDeclineStampId,
   upsertDeclineStamp,
 } from './db/pending-sender-approvals.js';
 import { getAdminsOfAgentGroup, getGlobalAdmins, getOwners } from './db/user-roles.js';
@@ -268,6 +270,15 @@ export interface DeclineAndNotifyInput {
    * clears a stamp keyed on the sender identity.
    */
   dedupeKey?: string;
+  /**
+   * Thread address to send the decline on — the wiring's policy-resolved
+   * reply thread, NOT the raw `event.threadId`. The access gate gets this
+   * from router fanout (`resolveThreadPolicy`), so a wiring that collapses
+   * DM sub-threads to the root has its declines collapsed too. Omitted by
+   * callers outside the fanout loop (channel modules), which fall back to
+   * the event's own thread.
+   */
+  threadId?: string | null;
   /** Override the sender-facing decline copy. */
   declineText?: string;
   /** Override the owner-facing FYI copy. */
@@ -307,6 +318,25 @@ export async function declineAndNotify(input: DeclineAndNotifyInput): Promise<vo
   // bootstrap state) but the decline still goes out.
   const stampAgentGroupId = agentGroupId ?? getAllAgentGroups()[0]?.id;
   if (stampAgentGroupId) {
+    // Converting a pending CARD into a stamp destroys the retained event, and
+    // that event is the only thing that can resolve its ingress receipt. The
+    // first message left the receipt `deferred` (a card was pending); if we
+    // overwrite without closing it, the receipt stays falsely deferred until
+    // the 7-day prune with nothing left to resolve it. Close it first, and
+    // only for a real card row — a stamp being refreshed has no receipt of
+    // its own, and its body is the sentinel, not an event.
+    const existing = getInFlightSenderApproval(messagingGroupId, senderKey);
+    if (existing && !isDeclineStampId(existing.id)) {
+      try {
+        completeDeferredInbound(JSON.parse(existing.original_message) as InboundEvent);
+      } catch (err) {
+        log.debug('decline_notify: converted card had no resolvable deferred receipt', {
+          messagingGroupId,
+          approvalId: existing.id,
+          err,
+        });
+      }
+    }
     upsertDeclineStamp({
       messaging_group_id: messagingGroupId,
       agent_group_id: stampAgentGroupId,
@@ -330,6 +360,12 @@ export async function declineAndNotify(input: DeclineAndNotifyInput): Promise<vo
   // at the channel root, detached from the message it answers. Adapters
   // without DM threading (Telegram et al.) carry a null threadId on the
   // event anyway, so this is a no-op there.
+  //
+  // `input.threadId` is the wiring's policy-resolved address, so a wiring
+  // with threads off collapses the decline to the root exactly like the
+  // agent's own replies. It is only absent for callers outside router
+  // fanout, which have no wiring to honor and fall back to the event.
+  const declineThreadId = input.threadId !== undefined ? input.threadId : (event.threadId ?? null);
   const owner = ownerDisplayName();
   const declineText = input.declineText ?? `I'm ${owner ?? 'my owner'}'s personal agent — I can't help you directly.`;
   let declined = true;
@@ -337,7 +373,7 @@ export async function declineAndNotify(input: DeclineAndNotifyInput): Promise<vo
     await adapter.deliver(
       event.channelType,
       event.platformId,
-      event.threadId ?? null,
+      declineThreadId,
       'chat-sdk',
       JSON.stringify({ text: declineText }),
       undefined,
