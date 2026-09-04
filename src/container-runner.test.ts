@@ -28,6 +28,25 @@ vi.mock('./container-runtime.js', async (importOriginal) => {
 // and its drain, and the startReservedWake continuation are the code under test.
 const ABSENT_CONTAINER_RUNTIME_BIN = vi.hoisted(() => 'nanoclaw-absent-container-runtime');
 
+// Holds the wake at its FIRST await — background storage admission — so a test
+// can act on a session while it is genuinely in flight. `null` means the real
+// pass-through, which is what every other case in this file gets.
+const storageGate = vi.hoisted(() => ({ hold: null as Promise<void> | null }));
+
+vi.mock('./storage-maintenance-worker.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./storage-maintenance-worker.js')>();
+  return {
+    ...actual,
+    assertStorageAdmissionInBackground: async () => {
+      if (storageGate.hold) await storageGate.hold;
+      // `allowed` short-circuits before anything reads the report.
+      return { allowed: true } as Awaited<
+        ReturnType<typeof import('./storage-maintenance-worker.js').assertStorageAdmissionInBackground>
+      >;
+    },
+  };
+});
+
 const memoryStub = vi.hoisted(() => ({
   queueNext: new Set<string>(),
   queuedPayloads: [] as unknown[],
@@ -114,6 +133,9 @@ import {
   resolveWorkgroupIdAtSpawn,
   stripEnvEntry,
   wakeContainer,
+  killContainer,
+  isContainerRunning,
+  isContainerSpawning,
 } from './container-runner.js';
 import { formatMemoryMb, resolveContainerResources } from './container-resources.js';
 import { mergeWorkgroupAndGroupSecrets } from './onecli-secrets.js';
@@ -1627,6 +1649,147 @@ describe('wakeContainer re-reads the session after every admission await', () =>
     expect(abandons()).toEqual([{ sessionId: 'sess-queued', stage: 'memory-admission-dequeue', status: 'closed' }]);
     // And the reservation it was just admitted into is handed back, not leaked.
     expect(memoryStub.releasedIds).toEqual(['sess-trigger', 'sess-queued']);
+  });
+});
+
+/**
+ * `killContainer` has to mean something for a session that is SPAWNING.
+ *
+ * `containerOwnsOutbound` is deliberately true for one — a wake issued a moment
+ * ago is about to hold the file — so every caller that asks "is anyone there?"
+ * before killing gets `true`, calls `killContainer`, and used to get silence:
+ * the process was not yet in `activeContainers`, so the call returned without
+ * killing anything and without firing `onExit`. The container then came up and
+ * kept running. A confirmed thread close left the fresh container alive, a
+ * self-mod rebuild left the old image running, a provider self-heal never
+ * respawned on the fallback.
+ */
+describe('killContainer against a session that is still spawning', () => {
+  const AGENT_GROUP_ID = 'ag-kill-spawning';
+  const AGENT_GROUP_FOLDER = '__kill-spawning-test__';
+
+  function seedSession(id: string): void {
+    getDb()
+      .prepare(
+        `INSERT INTO sessions (id, agent_group_id, messaging_group_id, thread_id, agent_provider, status,
+                               container_status, last_active, created_at)
+         VALUES (?, ?, NULL, NULL, NULL, 'active', 'stopped', NULL, '2026-08-19T00:00:00.000Z')`,
+      )
+      .run(id, AGENT_GROUP_ID);
+  }
+
+  function callerSnapshot(id: string): Session {
+    return {
+      id,
+      agent_group_id: AGENT_GROUP_ID,
+      messaging_group_id: null,
+      thread_id: null,
+      agent_provider: null,
+      status: 'active',
+      container_status: 'stopped',
+      last_active: null,
+      created_at: '2026-08-19T00:00:00.000Z',
+    };
+  }
+
+  beforeEach(() => {
+    vi.mocked(log.warn).mockClear();
+    vi.mocked(log.info).mockClear();
+    memoryStub.reset();
+    initTestDb();
+    getDb().exec(`
+      CREATE TABLE sessions (
+        id TEXT PRIMARY KEY, agent_group_id TEXT, messaging_group_id TEXT, thread_id TEXT,
+        agent_provider TEXT, status TEXT, container_status TEXT, last_active TEXT, created_at TEXT
+      );
+      CREATE TABLE agent_groups (
+        id TEXT PRIMARY KEY, name TEXT, folder TEXT, agent_provider TEXT, workgroup_id TEXT
+      );
+    `);
+    getDb()
+      .prepare('INSERT INTO agent_groups (id, name, folder, agent_provider, workgroup_id) VALUES (?, ?, ?, NULL, ?)')
+      .run(AGENT_GROUP_ID, 'kill spawning', AGENT_GROUP_FOLDER, 'wg-kill-spawning');
+    vi.stubEnv('NANOCLAW_STORAGE_MANAGER_ENABLED', '0');
+    allowSubprocess([ABSENT_CONTAINER_RUNTIME_BIN]);
+  });
+
+  afterEach(() => {
+    storageGate.hold = null;
+    vi.unstubAllEnvs();
+    memoryStub.reset();
+    closeDb();
+  });
+
+  it('fires onExit exactly once and leaves no container running', async () => {
+    seedSession('sess-spawning');
+    let release!: () => void;
+    storageGate.hold = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+
+    const wake = wakeContainer(callerSnapshot('sess-spawning'));
+    // Parked on the storage-admission await: in flight by the host's own
+    // predicate, which is exactly what every caller consults before killing.
+    await Promise.resolve();
+    expect(isContainerSpawning('sess-spawning')).toBe(true);
+    expect(isContainerRunning('sess-spawning')).toBe(false);
+
+    const exits: string[] = [];
+    killContainer('sess-spawning', 'test kill during spawn', () => exits.push('exit'));
+    // Nothing fires yet — the wake is still running, and firing here would
+    // report an exit for a container that may still be about to appear.
+    expect(exits).toEqual([]);
+
+    release();
+    await expect(wake).resolves.toBe(false);
+    await Promise.resolve();
+
+    // The guarantee: the caller's exit-driven work ran, exactly once, and no
+    // container survived the request.
+    expect(exits).toEqual(['exit']);
+    // Aborted AT the cancellation point, not merely swept up by the settle
+    // path afterwards: the wake failure carries the cancellation itself.
+    expect(
+      vi
+        .mocked(log.warn)
+        .mock.calls.filter((call) => String(call[0]).startsWith('wakeContainer failed'))
+        .map((call) => String((call[1] as { err?: unknown }).err)),
+    ).toEqual(['Error: Container spawn cancelled by a kill request: test kill during spawn']);
+    expect(isContainerRunning('sess-spawning')).toBe(false);
+    expect(isContainerSpawning('sess-spawning')).toBe(false);
+  });
+
+  it('records the kill as deferred rather than silently dropping it', async () => {
+    seedSession('sess-deferred');
+    let release!: () => void;
+    storageGate.hold = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+
+    const wake = wakeContainer(callerSnapshot('sess-deferred'));
+    await Promise.resolve();
+    killContainer('sess-deferred', 'thread close', () => {});
+    release();
+    await wake;
+
+    // The operator-visible trace that the request was taken, not ignored.
+    expect(
+      vi
+        .mocked(log.info)
+        .mock.calls.filter((call) => String(call[0]).startsWith('Container kill deferred'))
+        .map((call) => call[1] as { sessionId: string; reason: string }),
+    ).toEqual([{ sessionId: 'sess-deferred', reason: 'thread close' }]);
+  });
+
+  it('still does nothing for a session that is neither running nor spawning', async () => {
+    seedSession('sess-idle');
+    const exits: string[] = [];
+
+    killContainer('sess-idle', 'nothing to kill', () => exits.push('exit'));
+
+    // Unchanged contract, and callers depend on it: `container-restart` reads
+    // "not running" as "this restart did not happen", not as an exit.
+    expect(exits).toEqual([]);
   });
 });
 

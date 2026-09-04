@@ -238,6 +238,25 @@ export function getContainerSpawnedAt(sessionId: string): number {
 const wakePromises = new Map<string, Promise<boolean>>();
 const spawningSessions = new Set<string>();
 
+/**
+ * Kill requests made against a session whose container does not exist YET.
+ *
+ * `killContainer` used to return silently for these. That is not a no-op from
+ * the caller's side: `containerOwnsOutbound` is deliberately true for a
+ * SPAWNING session — a wake issued a moment ago is about to hold the file — so
+ * every caller that asks "is anyone there?" before killing gets `true`, calls
+ * `killContainer`, and gets nothing. The container then comes up and keeps
+ * running, and the caller's `onExit` work never runs: a confirmed thread close
+ * leaves the fresh container alive, a self-mod rebuild leaves the old image
+ * running, a provider self-heal never respawns on the fallback.
+ *
+ * A request recorded here is honoured at the last point before `docker run`
+ * (the spawn is cancelled) or, if the process registered first, by killing it
+ * once the wake settles. Either way `onExit` fires exactly once, so exit-driven
+ * work runs for a spawning session exactly as it does for a running one.
+ */
+const pendingKills = new Map<string, { reason: string; onExit: Array<() => void> }>();
+
 let memoryAdmission: MemoryAdmissionController<Session> | null = null;
 let containerShutdownInProgress = false;
 
@@ -610,6 +629,7 @@ function trackWake(sessionId: string, run: () => Promise<boolean>): Promise<bool
     })
     .finally(() => {
       if (wakePromises.get(sessionId) === tracked) wakePromises.delete(sessionId);
+      settlePendingKill(sessionId);
     });
   wakePromises.set(sessionId, tracked);
   return tracked;
@@ -731,6 +751,13 @@ async function spawnReservedContainer(caller: Session): Promise<boolean> {
       releaseMemoryReservation(session.id);
       return false;
     }
+    // Asked here as well as at the last word before `docker run`, and asked
+    // BEFORE `spawnContainer` does its preparation: that builds mounts, writes
+    // a capabilities snapshot and clears the heartbeat file. A session someone
+    // has already asked us to kill should not do that work at all, let alone
+    // leave its traces on disk.
+    const earlyCancellation = pendingKillCancellation(spawnSession.id);
+    if (earlyCancellation) throw earlyCancellation;
     await spawnContainer(spawnSession, storageActivity, spawnAgentGroup, spawnContainerConfig, spawnWorkgroupId);
     storageActivity = null; // activeContainers owns it until process exit
     return true;
@@ -1115,6 +1142,14 @@ async function spawnContainer(
   if (containerShutdownInProgress) {
     throw new Error('Container spawn cancelled because host shutdown is in progress');
   }
+  // The LAST word before the process exists. Everything above this line awaits,
+  // so a request landing in any of those windows is seen here even though the
+  // earlier check at the reserved spawn boundary already passed. Nothing awaits
+  // between here and `activeContainers.set` below, so a request either loses to
+  // that whole block and is honoured here, or arrives after registration and
+  // takes the ordinary running-container path. `trackWake` settles it either way.
+  const lateCancellation = pendingKillCancellation(session.id);
+  if (lateCancellation) throw lateCancellation;
   const container = spawn(CONTAINER_RUNTIME_BIN, args, { stdio: ['ignore', 'pipe', 'pipe'] });
 
   activeContainers.set(session.id, {
@@ -1196,23 +1231,19 @@ async function spawnContainer(
   });
 }
 
-/** Kill a container for a session. */
-export function killContainer(sessionId: string, reason: string, onExit?: () => void): void {
-  const entry = activeContainers.get(sessionId);
-  if (!entry) return;
-
-  if (onExit) {
-    entry.process.once('close', onExit);
-  }
-
-  log.info('Killing container', { sessionId, reason, containerName: entry.containerName });
-
-  // A killed container never reaches its turn boundary, so it can never emit
-  // the `turn_end` row that tells the host to delete this session's 💭 status.
-  // Without this the thinking label survives as the run's only visible output —
-  // permanently for a scheduled task, whose NORMAL exit is the idle reaper
-  // killing it mid-stream. Dynamic import: delivery.ts imports this module.
-  // Fire-and-forget and never throws — cleanup must not block the kill.
+/**
+ * A killed container never reaches its turn boundary, so it can never emit the
+ * `turn_end` row that tells the host to delete this session's 💭 status.
+ * Without this the thinking label survives as the run's only visible output —
+ * permanently for a scheduled task, whose NORMAL exit is the idle reaper
+ * killing it mid-stream. Dynamic import: delivery.ts imports this module.
+ * Fire-and-forget and never throws — cleanup must not block the kill.
+ *
+ * Runs for a CANCELLED spawn too. No container reached a turn, so it is
+ * usually a no-op, but the two paths are one event from a caller's point of
+ * view and should not differ in what they leave behind.
+ */
+function clearStatusOnKill(sessionId: string, reason: string): void {
   void import('./delivery.js')
     .then((m) => m.clearSessionStatusOnKill(sessionId))
     .catch((err) => {
@@ -1222,11 +1253,93 @@ export function killContainer(sessionId: string, reason: string, onExit?: () => 
         err: err instanceof Error ? err.message : String(err),
       });
     });
+}
 
+/** Stop a RUNNING container, attaching every exit callback before the stop. */
+function stopRunningContainer(sessionId: string, reason: string, onExit: Array<() => void>): void {
+  const entry = activeContainers.get(sessionId);
+  if (!entry) return;
+  for (const callback of onExit) entry.process.once('close', callback);
+  log.info('Killing container', { sessionId, reason, containerName: entry.containerName });
+  clearStatusOnKill(sessionId, reason);
   try {
     stopContainer(entry.containerName);
   } catch {
     entry.process.kill('SIGKILL');
+  }
+}
+
+/**
+ * Kill a container for a session, INCLUDING one that is still spawning.
+ *
+ * Three states, and only the third is a no-op:
+ *   - running: stop it, and `onExit` fires on the process close, as always.
+ *   - spawning: the request is recorded and honoured when the wake reaches its
+ *     cancellation point or registers a process; `onExit` still fires. See
+ *     `pendingKills`.
+ *   - neither: nothing to kill and no exit to report, so `onExit` does NOT
+ *     fire. Callers rely on that — `container-restart` treats "not running" as
+ *     "this restart did not happen" rather than as an exit.
+ */
+export function killContainer(sessionId: string, reason: string, onExit?: () => void): void {
+  if (!activeContainers.has(sessionId)) {
+    if (!isContainerSpawning(sessionId)) return;
+    const pending = pendingKills.get(sessionId) ?? { reason, onExit: [] };
+    if (onExit) pending.onExit.push(onExit);
+    pendingKills.set(sessionId, pending);
+    log.info('Container kill deferred — a wake is in flight for this session', { sessionId, reason });
+    return;
+  }
+  stopRunningContainer(sessionId, reason, onExit ? [onExit] : []);
+}
+
+/**
+ * The error a spawn should abort with when a kill was requested mid-wake.
+ *
+ * Consulted at BOTH points a spawn can still be stopped: once at the reserved
+ * spawn boundary, before any of the preparation that writes to disk, and again
+ * as the last word before `docker run`. Everything between those two awaits, so
+ * one check cannot cover both — the same after-every-await discipline the rest
+ * of this file follows.
+ */
+function pendingKillCancellation(sessionId: string): Error | null {
+  const pending = pendingKills.get(sessionId);
+  return pending ? new Error(`Container spawn cancelled by a kill request: ${pending.reason}`) : null;
+}
+
+/**
+ * Settle a kill request recorded while the session was spawning.
+ *
+ * Called from `trackWake`'s completion, which is the ONE place every wake ends
+ * — cancelled at the pre-spawn check, failed on admission or a lease, or
+ * succeeded. Putting it there rather than at the cancellation point means a
+ * wake that dies before ever reaching that point still settles the request,
+ * instead of leaving a caller waiting on an `onExit` that can never come.
+ */
+function settlePendingKill(sessionId: string): void {
+  const pending = pendingKills.get(sessionId);
+  if (!pending) return;
+  // A second wake is already in flight for this session. The request is against
+  // the SESSION, not one attempt, so leave it for that wake to settle.
+  if (isContainerSpawning(sessionId)) return;
+  pendingKills.delete(sessionId);
+  if (activeContainers.has(sessionId)) {
+    // The wake got a process registered before the request could stop it. Kill
+    // it now; the callbacks ride the real process exit, as they would have if
+    // the request had arrived a moment later.
+    stopRunningContainer(sessionId, pending.reason, pending.onExit);
+    return;
+  }
+  // No container was ever started. There is no process close to ride, so the
+  // exit work runs now — the caller's contract is "this session has no
+  // container any more", and that is satisfied.
+  clearStatusOnKill(sessionId, pending.reason);
+  for (const callback of pending.onExit) {
+    try {
+      callback();
+    } catch (err) {
+      log.warn('Container kill exit callback threw after a cancelled spawn', { sessionId, err });
+    }
   }
 }
 
