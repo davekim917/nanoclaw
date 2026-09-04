@@ -283,7 +283,11 @@ export function findOutboundOnlySessions(
 ): OutboundOnlySessionMatch[] {
   const found: OutboundOnlySessionMatch[] = [];
   for (const { file, src } of sources) {
-    const stripped = stripComments(src);
+    // Length-preserving, so the reported line is the line in the real file.
+    // `stripComments` DELETES, which shifts every offset after the first
+    // comment: a call under a three-line block comment was reported three
+    // lines early. The sibling write rule below already uses this one.
+    const stripped = blankComments(src);
     for (const { index, body } of sessionCallBodies(stripped)) {
       // Ops invoked on whatever the action named its parameter. Matching
       // `<ident>.<op>(` rather than a fixed `mailbox.` keeps it working for the

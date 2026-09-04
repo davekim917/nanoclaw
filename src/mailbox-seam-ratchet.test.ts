@@ -20,7 +20,8 @@ import {
   OUTBOUND_WRITE_GUARD,
   RATCHET_SCAN_ROOTS,
 } from './mailbox-seam-ratchet.js';
-import { computeOpSides, outboundWriteOps } from './modules/mailbox/op-sides.js';
+import { _classifyCompositionForTesting, computeOpSides, outboundWriteOps } from './modules/mailbox/op-sides.js';
+import { composeNanoclawSession } from './modules/mailbox/index.js';
 import { DEFERRED_UPSTREAM_FILES, UNPORTABLE_UPSTREAM_FILES, UPSTREAM_FILES } from './mailbox-seam-manifest.js';
 import type { DeliveryActionHandler } from './delivery.js';
 
@@ -118,6 +119,22 @@ describe('no raw session-DB access or passed session handle outside the mailbox 
   // exemption (see the top of that file) — so the check would have sat dead
   // forever. It is per-half instead: the runner's entry lands when the runner
   // half is done, which is R3's gate.
+  // R3 emptied the runner half, so it is an EXACT set too, symmetric with the
+  // host assertion above. Without this, the generic subset and stale-entry
+  // checks below both ACCEPT a newly added runner entry (it is not a "new
+  // offender" once listed, and it is not stale while it still matches), and
+  // the port gate right below returns early the moment one exists — so a
+  // finished half could silently reopen while all three tests stayed green.
+  // "Leave once, never re-enter" has to be asserted, not just narrated.
+  it('the runner allowlist is empty and stays empty', () => {
+    expect(
+      allowlist.filter(isRunnerPath),
+      'The runner half of the mailbox seam is complete (R3). A new runner caller belongs behind the ' +
+        'runner mailbox module, not on src/mailbox/RATCHET.json — this list may not grow again.',
+    ).toEqual([]);
+    expect(RATCHET_SCAN_ROOTS).toContain(RUNNER_ROOT);
+  });
+
   it("once the runner allowlist is empty, the runner's deferred registry test must be ported", () => {
     const runnerEntries = allowlist.filter(isRunnerPath);
     if (runnerEntries.length > 0) return;
@@ -328,6 +345,144 @@ describe('host outbound writes go through the stopped-container guard', () => {
     const fine = `
       await withExistingMailboxSession(a, b, (mailbox) => mailbox.readWorkContinuation());`;
     expect(findUnguardedOutboundWrites([{ file: 'fixture.ts', src: fine }], outboundWriteOps())).toEqual([]);
+  });
+
+  // The derivation is only trustworthy if it names EVERY op the session has.
+  // `composeNanoclawSession` builds closures and touches no database until one
+  // is called, so its key set is available from stub handles and is ground
+  // truth. A parser that quietly missed an entry is the failure this module
+  // has actually suffered; this is the assertion that cannot miss it.
+  it('the derived map names exactly the ops the composed session has', () => {
+    const stub = {} as never;
+    const actual = Object.keys(
+      composeNanoclawSession(
+        stub,
+        () => stub,
+        () => stub,
+        true,
+      ),
+    ).sort();
+    const sides = computeOpSides();
+    const derived = [...sides.inbound, ...sides.outbound].sort();
+    expect(derived).toEqual(actual);
+    // And the two halves partition it — no op in both, none in neither.
+    expect([...sides.inbound].filter((k) => sides.outbound.has(k))).toEqual([]);
+  });
+
+  // The grammar cases a text scanner silently dropped. Each one is a valid
+  // composition; each used to remove its ops from BOTH sets, which made both
+  // ratchet rules stop covering them while every test stayed green.
+  describe('op-side parsing covers the grammar a scanner could not', () => {
+    it('a comma inside a string literal does not split an entry', () => {
+      const src = `
+        function comp(inbound: never, readableOutbound: never) {
+          return {
+            inboundOp: () => query(inbound, 'SELECT a, b, c FROM t'),
+            outboundOp: () => query(readableOutbound(), 'SELECT x, y FROM u'),
+          };
+        }`;
+      const sides = _classifyCompositionForTesting(src, 'comp');
+      expect([...sides.inbound]).toEqual(['inboundOp']);
+      expect([...sides.outbound]).toEqual(['outboundOp']);
+    });
+
+    it('a handle name inside a string is not a handle reference', () => {
+      const src = `
+        function comp(inbound: never) {
+          return {
+            looksLikeAWrite: () => log(inbound, 'writableOutbound is not called here'),
+          };
+        }`;
+      const sides = _classifyCompositionForTesting(src, 'comp');
+      // Classified from the AST, so the string is text — not a use of the handle.
+      expect([...sides.inbound]).toEqual(['looksLikeAWrite']);
+      expect([...sides.outbound]).toEqual([]);
+    });
+
+    it('a computed key with a literal name is classified, not dropped', () => {
+      const src = `
+        function comp(readableOutbound: never) {
+          return {
+            ['computedOutbound']: () => readableOutbound(),
+          };
+        }`;
+      const sides = _classifyCompositionForTesting(src, 'comp');
+      expect([...sides.outbound]).toEqual(['computedOutbound']);
+    });
+
+    it('a method-syntax and a shorthand entry are both classified', () => {
+      const src = `
+        const shorthandOp = () => readableOutbound();
+        function comp(inbound: never, readableOutbound: never) {
+          return {
+            methodOp() {
+              return inbound;
+            },
+            shorthandOp,
+          };
+        }`;
+      const sides = _classifyCompositionForTesting(src, 'comp');
+      expect([...sides.inbound]).toEqual(['methodOp']);
+      expect([...sides.outbound]).toEqual(['shorthandOp']);
+    });
+
+    it('a NESTED spread is followed to its leaves', () => {
+      const src = `
+        function inner(writableOutbound: never) {
+          return { innerWrite: () => writableOutbound() };
+        }
+        function middle(inbound: never, writableOutbound: never) {
+          return { ...inner(writableOutbound), middleRead: () => inbound };
+        }
+        function comp(inbound: never, writableOutbound: never) {
+          return { ...middle(inbound, writableOutbound), own: () => inbound };
+        }`;
+      const sides = _classifyCompositionForTesting(src, 'comp');
+      expect([...sides.outbound]).toEqual(['innerWrite']);
+      expect([...sides.inbound].sort()).toEqual(['middleRead', 'own']);
+    });
+
+    it('a key it cannot evaluate THROWS rather than vanishing', () => {
+      const src = `
+        function comp(readableOutbound: never) {
+          return { [dynamicName]: () => readableOutbound() };
+        }`;
+      expect(() => _classifyCompositionForTesting(src, 'comp')).toThrow(/computed key/);
+    });
+
+    it('a spread it cannot resolve THROWS rather than contributing nothing', () => {
+      const src = `
+        function comp(inbound: never) {
+          return { ...somethingFromAnotherModule, own: () => inbound };
+        }`;
+      expect(() => _classifyCompositionForTesting(src, 'comp')).toThrow(/cannot resolve/);
+    });
+
+    it('a spread cycle THROWS instead of recursing forever', () => {
+      const src = `
+        function a(inbound: never) {
+          return { ...b(inbound) };
+        }
+        function b(inbound: never) {
+          return { ...a(inbound) };
+        }`;
+      expect(() => _classifyCompositionForTesting(src, 'a')).toThrow(/spread cycle/);
+    });
+  });
+
+  // Same property, the sibling rule. This one used the length-CHANGING strip
+  // and reported a call under a three-line block comment three lines early.
+  it('the outbound-only rule reports the real line too', () => {
+    const src = [
+      '/* one',
+      ' * two',
+      ' */',
+      'const x = 1;',
+      'await withExistingMailboxSession(a, b, (m) => m.readDoneProposal());',
+    ].join('\n');
+    const hits = findOutboundOnlySessions([{ file: 'fixture.ts', src }], computeOpSides());
+    expect(hits).toHaveLength(1);
+    expect(hits[0].line).toBe(5);
   });
 
   // Line numbers are the real file's — a failure message that sent the next

@@ -1120,6 +1120,5 @@ function forkOps(
     outboundHasRecentContentLike: (marker, withinSeconds) =>
       readOutbound(false, (outbound) => outboundHasRecentContentLike(outbound, marker, withinSeconds)),
     hasNonStatusReplyTo: (messageId) => readOutbound(false, (outbound) => hasNonStatusReplyTo(outbound, messageId)),
-    writeOutboundDirect: (message) => writeOutboundDirectRow(writableOutbound(), message),
   };
 }
