@@ -478,16 +478,58 @@ describe('the heartbeat is paired with provider_executing', () => {
     expect(noteRows(inDb)).toHaveLength(1);
   });
 
-  it('an executing turn with a stale heartbeat is still not enough on its own', () => {
-    // The two are an AND, not an OR: a raised flag with no recent stream event
-    // is the wedged-provider shape the ceiling kill handles, not this one.
+  it('an executing turn with a stale heartbeat is not enough from the startup backstop', () => {
+    // There the previous host is gone, so a raised flag is whatever a dead
+    // container last wrote and nothing has reset it — believing it would warn
+    // this session on every boot.
     const { inDb, outDb } = makeDbs();
     withProviderExecuting(outDb, 1);
     const session = fakeSession();
     touchHeartbeat(session, RESTART_WARN_HEARTBEAT_FRESH_MS + 1_000);
 
-    expect(warnSessionIfWorkInFlight(mailboxOver(inDb, outDb), session, 'graceful host shutdown')).toBe(false);
+    expect(warnSessionIfWorkInFlight(mailboxOver(inDb, outDb), session, 'host startup after an unclean stop')).toBe(
+      false,
+    );
     expect(noteRows(inDb)).toHaveLength(0);
+  });
+
+  it('a LIVE executing turn needs no heartbeat corroboration', () => {
+    // Codex has no total-turn and no idle timeout by design, and its health
+    // probe only starts after 60s of quiet — so a healthy turn can stream
+    // nothing for well past the freshness window. A pushed follow-up turn in
+    // that state holds no claim, may sit between tools, and may have no
+    // continuation. During graceful shutdown the container is still running,
+    // so the flag is current state and is evidence on its own.
+    const { inDb, outDb } = makeDbs();
+    withProviderExecuting(outDb, 1);
+    const session = fakeSession();
+    touchHeartbeat(session, 10 * 60 * 1000);
+
+    expect(warnSessionIfWorkInFlight(mailboxOver(inDb, outDb), session, 'graceful host shutdown', true)).toBe(true);
+    expect(noteRows(inDb)).toHaveLength(1);
+  });
+
+  it('a live container that is NOT executing still gets nothing', () => {
+    // The live-container branch must not become "warn every running session".
+    const { inDb, outDb } = makeDbs();
+    withProviderExecuting(outDb, 0);
+    const session = fakeSession();
+    touchHeartbeat(session, 10 * 60 * 1000);
+
+    expect(warnSessionIfWorkInFlight(mailboxOver(inDb, outDb), session, 'graceful host shutdown', true)).toBe(false);
+    expect(noteRows(inDb)).toHaveLength(0);
+  });
+
+  it('a live executing turn with no heartbeat file at all still gets a note', () => {
+    // Exercises the recoveryKey fallback: no tool stamp, no claim, no
+    // heartbeat mtime to round.
+    const { inDb, outDb } = makeDbs();
+    withProviderExecuting(outDb, 1);
+
+    expect(warnSessionIfWorkInFlight(mailboxOver(inDb, outDb), fakeSession(), 'graceful host shutdown', true)).toBe(
+      true,
+    );
+    expect(noteRows(inDb)).toHaveLength(1);
   });
 
   it('a legacy outbound DB without the column still trusts the heartbeat', () => {
