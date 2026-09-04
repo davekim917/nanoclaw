@@ -1,15 +1,30 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { createHash } from 'crypto';
-import { readFile } from 'fs/promises';
+import { readFile, stat, utimes } from 'fs/promises';
 import * as path from 'path';
+import fsSync from 'fs';
+import cpSync from 'child_process';
 
 import {
   checkAgentRunnerDepsDrift,
   classifyLabels,
   computeAgentRunnerDepsHash,
   LABEL_RETRY_DELAY_MS,
+  DEPS_DRIFT_CACHE_TTL_MS,
+  resetDepsDriftCacheForTests,
 } from './agent-runner-image-check.js';
 import { CONTAINER_IMAGE, REPO_ROOT } from './config.js';
+
+// The cache is module-scoped (see agent-runner-image-check.ts), so any test
+// in this file that gets an `ok: true` result would otherwise leak a cache
+// entry into a later test using the same imageRef + unchanged files — e.g. a
+// scripted-mock test asserting `inspect.calls()` would silently see 0 calls
+// instead of the count it expects. Reset before every test so each case
+// starts from "nothing cached", matching the pre-caching behaviour every
+// existing test below was written against.
+beforeEach(() => {
+  resetDepsDriftCacheForTests();
+});
 
 describe('computeAgentRunnerDepsHash', () => {
   it('matches sha256(sha256(package.json) || sha256(bun.lock)) sliced to 16 chars', async () => {
@@ -237,5 +252,318 @@ describe('agent runner image source navigation', () => {
     // Graphify is decommissioned. Nothing may reintroduce the venv, the
     // wheelhouse, the gateway, or the in-image Python contracts.
     expect(dockerfile).not.toMatch(/graphify/i);
+  });
+});
+
+/**
+ * Perf follow-up to PR #315: the spawn path logs this stage's wall time and
+ * it was showing up as the next-largest cost after that PR — most of it
+ * spent on a `docker inspect` round-trip (occasionally plus the
+ * LABEL_RETRY_DELAY_MS relabel-race pause) that answers the same "still in
+ * sync" question every spawn already knows the answer to. These tests cover
+ * the cache added to buy that back.
+ */
+describe('checkAgentRunnerDepsDrift result cache', () => {
+  const scriptedInspect = (reads: string[]): { run: (ref: string) => Promise<string>; calls: () => number } => {
+    let i = 0;
+    return {
+      run: async () => {
+        const value = reads[Math.min(i, reads.length - 1)];
+        i += 1;
+        return value;
+      },
+      calls: () => i,
+    };
+  };
+  const labeled = (hash: string): string => JSON.stringify({ 'nanoclaw.agentRunnerDepsHash': hash });
+
+  it('skips re-inspecting the image on a second call with unchanged inputs', async () => {
+    const expected = await computeAgentRunnerDepsHash();
+    const imageRef = 'nanoclaw-agent-cache-test:hit';
+    const inspect = scriptedInspect([labeled(expected)]);
+
+    const r1 = await checkAgentRunnerDepsDrift(imageRef, { inspect: inspect.run, retryDelayMs: 0 });
+    expect(r1.ok).toBe(true);
+    expect(inspect.calls()).toBe(1);
+
+    // Second call passes an inspect that would fail the test if it were ever
+    // invoked — the only way this call can still succeed is via the cache.
+    const r2 = await checkAgentRunnerDepsDrift(imageRef, {
+      inspect: async () => {
+        throw new Error('cache miss: docker inspect was re-run for unchanged inputs');
+      },
+      retryDelayMs: 0,
+    });
+
+    expect(r2).toEqual(r1);
+    expect(inspect.calls()).toBe(1); // still 1 — the second call never touched the real inspect
+  });
+
+  it('never caches a failing result — every call re-checks until it passes', async () => {
+    const imageRef = 'nanoclaw-agent-cache-test:miss';
+    const inspect = scriptedInspect([labeled('0000000000000000')]);
+
+    const r1 = await checkAgentRunnerDepsDrift(imageRef, { inspect: inspect.run, retryDelayMs: 0 });
+    expect(r1.ok).toBe(false);
+
+    const r2 = await checkAgentRunnerDepsDrift(imageRef, { inspect: inspect.run, retryDelayMs: 0 });
+    expect(r2.ok).toBe(false);
+
+    // Both calls actually re-ran the check — a cached failure would have
+    // left calls() at 1.
+    expect(inspect.calls()).toBe(2);
+  });
+
+  it('is keyed on imageRef — a per-agent override never serves the base image cache or vice versa', async () => {
+    const expected = await computeAgentRunnerDepsHash();
+    const inspectBase = scriptedInspect([labeled(expected)]);
+    const inspectOverride = scriptedInspect([labeled(expected)]);
+
+    await checkAgentRunnerDepsDrift(CONTAINER_IMAGE, { inspect: inspectBase.run, retryDelayMs: 0 });
+    expect(inspectBase.calls()).toBe(1);
+
+    // Different imageRef, same underlying files: must still hit the network,
+    // not the base image's cache entry.
+    const r = await checkAgentRunnerDepsDrift('nanoclaw-agent-cache-test:override', {
+      inspect: inspectOverride.run,
+      retryDelayMs: 0,
+    });
+    expect(r.ok).toBe(true);
+    expect(inspectOverride.calls()).toBe(1);
+  });
+
+  it('resetDepsDriftCacheForTests forces a fresh check even with unchanged inputs', async () => {
+    const expected = await computeAgentRunnerDepsHash();
+    const imageRef = 'nanoclaw-agent-cache-test:reset';
+    const inspect1 = scriptedInspect([labeled(expected)]);
+    await checkAgentRunnerDepsDrift(imageRef, { inspect: inspect1.run, retryDelayMs: 0 });
+    expect(inspect1.calls()).toBe(1);
+
+    resetDepsDriftCacheForTests();
+
+    const inspect2 = scriptedInspect([labeled(expected)]);
+    const r = await checkAgentRunnerDepsDrift(imageRef, { inspect: inspect2.run, retryDelayMs: 0 });
+    expect(r.ok).toBe(true);
+    expect(inspect2.calls()).toBe(1); // re-ran for real, not served from the cleared cache
+  });
+
+  /**
+   * Regression cover for the Codex P1 finding on this PR: an unbounded cache
+   * keyed only on file fingerprint would serve a stale `ok: true` forever if
+   * the image were later removed or retagged out-of-band (no file edit
+   * involved) — `docker run` would then fail downstream while
+   * requestContainerRebuild, which container-runner.ts only calls on `!ok`,
+   * never fires. The TTL bounds that staleness window instead of leaving it
+   * open for the rest of the host process's life.
+   */
+  it('expires a cached result after DEPS_DRIFT_CACHE_TTL_MS, even with unchanged inputs', async () => {
+    const expected = await computeAgentRunnerDepsHash();
+    const imageRef = 'nanoclaw-agent-cache-test:ttl';
+
+    vi.useFakeTimers();
+    try {
+      const inspect1 = scriptedInspect([labeled(expected)]);
+      const r1 = await checkAgentRunnerDepsDrift(imageRef, { inspect: inspect1.run, retryDelayMs: 0 });
+      expect(r1.ok).toBe(true);
+      expect(inspect1.calls()).toBe(1);
+
+      // Well inside the TTL: still served from cache.
+      vi.advanceTimersByTime(DEPS_DRIFT_CACHE_TTL_MS - 1);
+      const inspectStillCached = scriptedInspect([labeled(expected)]);
+      const r2 = await checkAgentRunnerDepsDrift(imageRef, { inspect: inspectStillCached.run, retryDelayMs: 0 });
+      expect(r2).toEqual(r1);
+      expect(inspectStillCached.calls()).toBe(0);
+
+      // Past the TTL: must re-check for real, even though the files never changed.
+      vi.advanceTimersByTime(2);
+      const inspectAfterTtl = scriptedInspect([labeled(expected)]);
+      const r3 = await checkAgentRunnerDepsDrift(imageRef, { inspect: inspectAfterTtl.run, retryDelayMs: 0 });
+      expect(r3.ok).toBe(true);
+      expect(inspectAfterTtl.calls()).toBe(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  /**
+   * Regression cover for the Codex P2 finding on this PR:
+   * wakeRepositoryMountSessions (src/container-restart.ts) fires
+   * wakeContainer for every session in a group without awaiting between
+   * them, so a burst of spawns sharing an imageRef can all reach this check
+   * before any one of them has populated okResultCache. Without coalescing,
+   * every one of them would independently pay the full inspect cost —
+   * exactly the burst case caching is meant to help most.
+   */
+  it('coalesces concurrent calls for the same imageRef into a single check', async () => {
+    const expected = await computeAgentRunnerDepsHash();
+    const imageRef = 'nanoclaw-agent-cache-test:coalesce';
+    const inspect = scriptedInspect([labeled(expected)]);
+
+    // Two calls fired back-to-back, neither awaited before the other starts —
+    // the shape of an un-awaited wakeContainer burst.
+    const [r1, r2] = await Promise.all([
+      checkAgentRunnerDepsDrift(imageRef, { inspect: inspect.run, retryDelayMs: 0 }),
+      checkAgentRunnerDepsDrift(imageRef, { inspect: inspect.run, retryDelayMs: 0 }),
+    ]);
+
+    expect(r1.ok).toBe(true);
+    expect(r2).toEqual(r1);
+    expect(inspect.calls()).toBe(1); // both calls shared one in-flight check
+
+    // Once the burst has settled, a later call is no longer coalesced — it
+    // goes through okResultCache/TTL as usual, and (files unchanged) is
+    // served from there without a second inspect.
+    const r3 = await checkAgentRunnerDepsDrift(imageRef, {
+      inspect: async () => {
+        throw new Error('should not be called — post-settle call should hit okResultCache, not re-inspect');
+      },
+      retryDelayMs: 0,
+    });
+    expect(r3).toEqual(r1);
+  });
+
+  /**
+   * Regression cover for the Codex P2 finding on this PR: a
+   * caller must not be handed an in-flight check's result if
+   * package.json/bun.lock were edited after that check read its fingerprint
+   * but before it finished (e.g. while awaiting a slow docker inspect).
+   * Otherwise it could receive a pre-edit `ok: true` and launch with
+   * stale image-baked dependencies — exactly the failure mode this whole
+   * module exists to prevent.
+   */
+  it('does not join an in-flight check whose fingerprint is now stale', async () => {
+    const expected = await computeAgentRunnerDepsHash();
+    const imageRef = 'nanoclaw-agent-cache-test:fingerprint-revalidate';
+    const pkgPath = path.join(REPO_ROOT, 'container/agent-runner/package.json');
+    const original = await stat(pkgPath);
+
+    // Deferred first inspect so the test controls exactly when check #1's
+    // docker-inspect round-trip completes, opening a window to simulate a
+    // package.json edit while it's still in flight.
+    let releaseFirstInspect: () => void = () => {};
+    const firstInspectGate = new Promise<void>((resolve) => {
+      releaseFirstInspect = resolve;
+    });
+    let firstInspectCalls = 0;
+    const firstInspect = async (): Promise<string> => {
+      firstInspectCalls += 1;
+      await firstInspectGate;
+      return labeled(expected);
+    };
+
+    try {
+      const check1 = checkAgentRunnerDepsDrift(imageRef, { inspect: firstInspect, retryDelayMs: 0 });
+
+      // Let check1 read its fingerprint and register in inFlightChecks
+      // before editing the file — its only await before that point is the
+      // fs.stat pair inside currentDepsFileFingerprint.
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+
+      // Simulate an edit: bump mtime without touching content (content
+      // drives the hash; the fingerprint keys on mtime+size).
+      await utimes(pkgPath, new Date(), new Date(original.mtimeMs + 5_000));
+
+      let secondInspectCalls = 0;
+      const secondInspect = async (): Promise<string> => {
+        secondInspectCalls += 1;
+        return labeled(expected);
+      };
+      const check2 = checkAgentRunnerDepsDrift(imageRef, { inspect: secondInspect, retryDelayMs: 0 });
+
+      releaseFirstInspect();
+
+      const [r1, r2] = await Promise.all([check1, check2]);
+
+      expect(r1.ok).toBe(true);
+      expect(r2.ok).toBe(true);
+      // check2 must have run its own inspect rather than being handed
+      // check1's (pre-edit) answer.
+      expect(firstInspectCalls).toBe(1);
+      expect(secondInspectCalls).toBe(1);
+    } finally {
+      await utimes(pkgPath, original.atime, original.mtime);
+    }
+  });
+});
+
+/**
+ * Tripwire: this stage must never fall back to a synchronous fs/child_process
+ * call. Every real call it makes today (readFile, execFile-via-promisify,
+ * plus the stat added for the cache) is already async — this guards against
+ * a future edit reintroducing a sync one (readFileSync/statSync/existsSync,
+ * execSync/execFileSync/spawnSync), which would block the host's event loop
+ * for the same multi-second `docker inspect` cost PR #315's follow-up exists
+ * to get off the spawn path.
+ *
+ * Pattern from src/host-sweep-registry.test.ts: spy on the sync members only
+ * (the async ones — execFile via the `inspect` option, readFile for hashing
+ * — stay real) so an accidental sync call throws loudly instead of silently
+ * spawning a real process/reading a real file, and record calls so the test
+ * fails even if the code under test happens to swallow the throw.
+ */
+describe('checkAgentRunnerDepsDrift stays off the sync fs/child_process surface', () => {
+  it('throws if any sync fs or child_process API fires across a cache-miss, cache-hit, and failing call', async () => {
+    const record: string[] = [];
+    const tripwire =
+      (name: string) =>
+      (...args: unknown[]): never => {
+        record.push(name);
+        throw new Error(`sync call attempted during deps-drift-check: ${name}(${JSON.stringify(args[0])})`);
+      };
+
+    const spies = [
+      vi.spyOn(fsSync, 'readFileSync').mockImplementation(tripwire('readFileSync') as typeof fsSync.readFileSync),
+      vi.spyOn(fsSync, 'statSync').mockImplementation(tripwire('statSync') as typeof fsSync.statSync),
+      vi.spyOn(fsSync, 'existsSync').mockImplementation(tripwire('existsSync') as typeof fsSync.existsSync),
+      vi.spyOn(cpSync, 'execSync').mockImplementation(tripwire('execSync') as typeof cpSync.execSync),
+      vi
+        .spyOn(cpSync, 'execFileSync')
+        .mockImplementation(tripwire('execFileSync') as unknown as typeof cpSync.execFileSync),
+      vi.spyOn(cpSync, 'spawnSync').mockImplementation(tripwire('spawnSync') as unknown as typeof cpSync.spawnSync),
+    ];
+
+    try {
+      const expected = await computeAgentRunnerDepsHash();
+
+      // Cache miss, passing result (populates the cache).
+      const r1 = await checkAgentRunnerDepsDrift('nanoclaw-agent-tripwire-test', {
+        inspect: async () => JSON.stringify({ 'nanoclaw.agentRunnerDepsHash': expected }),
+        retryDelayMs: 0,
+      });
+      expect(r1.ok).toBe(true);
+
+      // Cache hit, unchanged inputs — must not touch inspect or the sync surface.
+      const r2 = await checkAgentRunnerDepsDrift('nanoclaw-agent-tripwire-test', {
+        inspect: async () => {
+          throw new Error('should not be called on a cache hit');
+        },
+        retryDelayMs: 0,
+      });
+      expect(r2.ok).toBe(true);
+
+      // Failing path (real drift: a present-but-mismatched label — this
+      // fails closed regardless of imageRef, unlike an unresolved/missing
+      // label map which opt-out branches ok:true for a non-base override).
+      const r3 = await checkAgentRunnerDepsDrift('nanoclaw-agent-tripwire-test-fail', {
+        inspect: async () => JSON.stringify({ 'nanoclaw.agentRunnerDepsHash': '0000000000000000' }),
+        retryDelayMs: 0,
+      });
+      expect(r3.ok).toBe(false);
+
+      // Unresolved-label retry-sleep path, on the base image so it fails
+      // closed rather than opt-out branching to ok:true.
+      const r4 = await checkAgentRunnerDepsDrift(CONTAINER_IMAGE, {
+        inspect: async () => 'null',
+        retryDelayMs: 0,
+      });
+      expect(r4.ok).toBe(false);
+      expect(r4.retried).toBe(true);
+    } finally {
+      spies.forEach((s) => s.mockRestore());
+    }
+
+    expect(record).toEqual([]);
   });
 });
