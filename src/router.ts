@@ -58,7 +58,6 @@ import { parseMessageFlags, formatFlagConfirmation, type FlagIntent } from './fl
 import { maybeRenameNewThread } from './topic-title.js';
 import { sessionStillActive, wakeContainer } from './container-runner.js';
 import { getContainerConfig, resolveProviderName } from './db/container-configs.js';
-import { getSession } from './db/sessions.js';
 import type { AgentGroup, ChannelType, MessagingGroup, MessagingGroupAgent } from './types.js';
 import { isChannelVariant } from './types.js';
 import type { InboundEvent } from './channels/adapter.js';

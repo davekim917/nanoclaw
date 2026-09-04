@@ -14,7 +14,7 @@ import {
   wakeContainer,
 } from './container-runner.js';
 import { randomUUID } from 'crypto';
-import { getSession, getSessionsByAgentGroup } from './db/sessions.js';
+import { getSessionsByAgentGroup } from './db/sessions.js';
 import { log } from './log.js';
 import { SessionDbMissingError, sessionMailboxPath, type NanoclawMailboxSession } from './modules/mailbox/index.js';
 import { repoIngressFenceAckToken } from './modules/mailbox/ops/fence.js';
