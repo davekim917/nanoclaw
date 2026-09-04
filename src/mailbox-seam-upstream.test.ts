@@ -14,7 +14,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 
-import { UPSTREAM_FILES, type MailboxSeamManifest } from './mailbox-seam-manifest.js';
+import { FORK_DIVERGED_UPSTREAM_FILES, UPSTREAM_FILES, type MailboxSeamManifest } from './mailbox-seam-manifest.js';
 
 const REPO_ROOT = path.resolve(__dirname, '..');
 const MANIFEST_PATH = path.join(REPO_ROOT, 'src/mailbox/UPSTREAM-MANIFEST.json');
@@ -40,6 +40,23 @@ describe('every ported upstream file matches UPSTREAM-MANIFEST.json', () => {
         actualHash,
         `${relPath} drifted from upstream ${manifest.upstream}; regenerate with scripts/mailbox-seam-manifest.ts --update ${manifest.upstream} only when intentionally syncing upstream`,
       ).toBe(expectedHash);
+    });
+  }
+});
+
+describe('every fork-diverged former upstream file still exists in the working tree', () => {
+  // These files were ported byte-for-byte but have since been hand-edited for
+  // a fork-only feature — they are intentionally excluded from UPSTREAM_FILES
+  // and never hash-checked against the manifest again (see the doc comment on
+  // FORK_DIVERGED_UPSTREAM_FILES). This only guards against the path being
+  // deleted or renamed out from under the tracking list.
+  for (const relPath of FORK_DIVERGED_UPSTREAM_FILES) {
+    it(`${relPath} exists`, () => {
+      const abs = path.join(REPO_ROOT, relPath);
+      expect(
+        fs.existsSync(abs),
+        `${relPath} is listed in FORK_DIVERGED_UPSTREAM_FILES but missing from the working tree`,
+      ).toBe(true);
     });
   }
 });

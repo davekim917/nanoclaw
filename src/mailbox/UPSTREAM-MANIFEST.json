@@ -4,7 +4,6 @@
     "container/agent-runner/bunfig.toml": "3c35bbe6522d71981d126ea0ad6a1cfea291c0223f11f7deaf5b58a44bd13b43",
     "container/agent-runner/src/db/container-state.ts": "551bed7b9ac4039c28e6d218ffe81dbb512ac709b27b6e733dd6ea23c72d832b",
     "container/agent-runner/src/db/index.ts": "39bab9732a23047c55729d06f63e7725f9063b52918544a8effcddb584585546",
-    "container/agent-runner/src/db/messages-in.ts": "69ae36398582e998d1b113dbb2e0141d8f2141a24ab0bec25d2eeb8240bcd492",
     "container/agent-runner/src/db/messages-out.ts": "705e8829d2c0300fd925dbafac6b3aeed5b543329aabad647637c458985a0ce2",
     "container/agent-runner/src/db/session-routing.ts": "a52e5941ffa7623a63e495cd2b908e5408700cde3c9028a5d8e6a1f83980b96e",
     "container/agent-runner/src/db/session-state.ts": "6b1f428f5559abf9013bdd889e013185d5c456e3294846d661ad844caa642914",
