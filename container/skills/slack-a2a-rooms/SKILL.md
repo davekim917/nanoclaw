@@ -65,7 +65,9 @@ transcript next session.
 ## Creating siblings
 
 `create_agent` gives you a new agent group and a `send_message` destination you
-can address immediately. A Slack bot for that agent is an operator step:
+can address immediately. It does not put that agent in your workgroup, so it
+starts out able to hear you but sharing none of your archive, memory or files —
+say so when you report the new agent, because an operator has to place it. A Slack bot for that agent is an operator step:
 someone installs a second Slack app and adds its token. So when the user asks
 for an agent that shows up in Slack, create the group, tell them the Slack side
 needs an operator, and name the `slack-agent-flow` skill as where those steps
