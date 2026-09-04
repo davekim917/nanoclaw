@@ -520,16 +520,21 @@ describe('the heartbeat is paired with provider_executing', () => {
     expect(noteRows(inDb)).toHaveLength(0);
   });
 
-  it('a live executing turn with no heartbeat file at all still gets a note', () => {
-    // Exercises the recoveryKey fallback: no tool stamp, no claim, no
-    // heartbeat mtime to round.
+  it('a raised flag with NO heartbeat file is residue, not a live turn', () => {
+    // The respawn window. A container killed by SIGKILL or the OOM reaper
+    // never lowers the flag, and the host registers the replacement in
+    // activeContainers immediately after spawn() — before the runner boots far
+    // enough to clear it. So containerLive is true while the flag is pure
+    // residue. The spawn path deletes the heartbeat and only a streamed
+    // provider event recreates it, so its ABSENCE is what identifies that
+    // window: no turn has started under this container yet.
     const { inDb, outDb } = makeDbs();
     withProviderExecuting(outDb, 1);
 
     expect(warnSessionIfWorkInFlight(mailboxOver(inDb, outDb), fakeSession(), 'graceful host shutdown', true)).toBe(
-      true,
+      false,
     );
-    expect(noteRows(inDb)).toHaveLength(1);
+    expect(noteRows(inDb)).toHaveLength(0);
   });
 
   it('a legacy outbound DB without the column still trusts the heartbeat', () => {

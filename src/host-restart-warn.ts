@@ -26,6 +26,12 @@
  * the sweep's ceiling kill and idle reaper already read those as. Quiet
  * sessions get no note, so a restart does not wake every idle container into
  * a public "nothing happened".
+ *
+ * Known residual: this closes the GRACEFUL path. After an unclean host crash
+ * the startup backstop cannot trust `provider_executing` (it is whatever the
+ * dead container last wrote), so a session interrupted mid-turn with more than
+ * RESTART_WARN_HEARTBEAT_FRESH_MS of provider silence — a long quiet Codex tool
+ * call, say — still gets no note on that path.
  */
 import { createHash } from 'crypto';
 import fs from 'node:fs';
@@ -210,7 +216,26 @@ export function warnSessionIfWorkInFlight(
   // this flag is whatever a dead container last wrote and nothing has reset it
   // yet (`resetProviderExecuting` runs at the NEXT container's startup). Stale
   // 1s would warn that session on every boot. There, freshness still rules.
-  const liveExecutingTurn = containerLive && state?.provider_executing === 1;
+  //
+  // The heartbeat FILE must exist even here, and that is not belt-and-braces —
+  // it is what makes `containerLive` mean what it says. A container killed by
+  // SIGKILL or the OOM reaper never runs the `finally` that lowers the flag
+  // (poll-loop.ts), so `provider_executing` stays 1 in outbound.db until the
+  // NEXT container clears it in `clearStaleProcessingAcks` at startup. The host
+  // registers a respawn in `activeContainers` immediately after `spawn()`
+  // (container-runner.ts), which is BEFORE the runner has booted far enough to
+  // run that reset — so in that window `containerLive` is true and the flag is
+  // pure residue from the dead container. A shutdown landing there would write
+  // a mid-work note for a container that has not begun a turn.
+  //
+  // Heartbeat existence closes exactly that window and nothing else. The spawn
+  // path deletes the file before starting the container (container-runner.ts),
+  // and only `touchHeartbeat` recreates it — first reached on a streamed
+  // provider event, well after the reset. So a heartbeat that EXISTS proves the
+  // flag was written by THIS container. Existence, deliberately not freshness:
+  // a stale-but-present heartbeat is the long-quiet Codex turn this clause was
+  // added for.
+  const liveExecutingTurn = containerLive && state?.provider_executing === 1 && heartbeatMs !== null;
   const midWork =
     resumableContinuation ||
     processingClaimKey !== null ||
@@ -255,9 +280,9 @@ export function warnSessionIfWorkInFlight(
       // the graceful-shutdown warn and the startup backstop — which run
       // seconds apart, on either side of the same interruption — derive the
       // SAME id and the second one is a no-op rather than a duplicate note.
-      (state?.tool_started_at ??
-        processingClaimKey ??
-        (heartbeatMs !== null ? `heartbeat-${Math.floor(heartbeatMs / 60_000)}` : 'provider-executing'));
+      // Non-null by construction: every remaining signal that can reach here —
+      // freshHeartbeat and liveExecutingTurn alike — requires a heartbeat mtime.
+      (state?.tool_started_at ?? processingClaimKey ?? `heartbeat-${Math.floor(heartbeatMs! / 60_000)}`);
   const episodeBucket = Math.floor(now / RESTART_NOTE_DEDUPE_MS);
   const recoveryHash = createHash('sha256').update(recoveryKey).digest('hex').slice(0, 16);
   const inserted = mailbox.insertDeferredMessageWithContextIfNew({
