@@ -234,24 +234,28 @@ function createGateHandler(category: GateCategory) {
 
     // Schedule the timeout before we dispatch the approval, so if anything
     // below throws we still auto-resolve on the container side.
-    const timer = setTimeout(async () => {
-      pendingTimeouts.delete(requestId);
-      sessionsWithActiveGates.delete(session.id);
-      log.warn(`${category.logPrefix} gate timed out`, { requestId, agentGroupId: session.agent_group_id });
-      await writeGateAck(
-        session,
-        requestId,
-        'timeout',
-        `${category.logPrefix} gate timed out after ${BASH_GATE_TIMEOUT_MS / 60_000} minutes.`,
-      );
-      const pending = getPendingApprovalByRequestId(requestId);
-      if (pending) {
-        await editApprovalCard(
-          pending,
-          `🕒 *${pending.title}* — timed out\n\nNo approval received within ${BASH_GATE_TIMEOUT_MS / 60_000} minutes. The ${category.kindNoun} was not run.`,
+    const timer = setTimeout(() => {
+      void (async () => {
+        pendingTimeouts.delete(requestId);
+        sessionsWithActiveGates.delete(session.id);
+        log.warn(`${category.logPrefix} gate timed out`, { requestId, agentGroupId: session.agent_group_id });
+        await writeGateAck(
+          session,
+          requestId,
+          'timeout',
+          `${category.logPrefix} gate timed out after ${BASH_GATE_TIMEOUT_MS / 60_000} minutes.`,
         );
-        deletePendingApproval(pending.approval_id);
-      }
+        const pending = getPendingApprovalByRequestId(requestId);
+        if (pending) {
+          await editApprovalCard(
+            pending,
+            `🕒 *${pending.title}* — timed out\n\nNo approval received within ${BASH_GATE_TIMEOUT_MS / 60_000} minutes. The ${category.kindNoun} was not run.`,
+          );
+          deletePendingApproval(pending.approval_id);
+        }
+      })().catch((err) => {
+        log.error(`${category.logPrefix} gate timeout handler failed`, { requestId, err });
+      });
     }, BASH_GATE_TIMEOUT_MS);
     timer.unref(); // don't block process shutdown on a pending gate
     pendingTimeouts.set(requestId, timer);
@@ -325,7 +329,7 @@ function createApprovalHandler(logPrefix: string) {
     // reaching this function always means approved.
     await writeGateAck(session, p.requestId, 'approved');
     log.info(`${logPrefix} gate approved`, { requestId: p.requestId, userId });
-    notifyAgent(session, `${logPrefix} gate approved: ${p.label}`);
+    await notifyAgent(session, `${logPrefix} gate approved: ${p.label}`);
   };
 }
 

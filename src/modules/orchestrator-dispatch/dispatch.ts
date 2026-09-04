@@ -218,7 +218,11 @@ export async function applySpawnTask(content: Record<string, unknown>, callerSes
 
   // Schedule side-effect completion. Pass the resolved child agent group id
   // so the side-effect path doesn't need to re-derive it.
-  setImmediate(completeSpawnSideEffects, admittedTask.task_id, childAgentGroupId);
+  // completeSpawnSideEffects internally .catch()es _runCompletionSideEffects,
+  // so the promise it returns never rejects — void is safe here.
+  setImmediate(() => {
+    void completeSpawnSideEffects(admittedTask.task_id, childAgentGroupId);
+  });
 }
 
 /**
@@ -236,7 +240,7 @@ export async function completeSpawnSideEffects(taskId: string, childAgentGroupId
     log.warn('completeSpawnSideEffects: unhandled error', { taskId, err });
   });
   completionInFlight.set(taskId, promise);
-  promise.finally(() => {
+  void promise.finally(() => {
     completionInFlight.delete(taskId);
   });
   return promise;

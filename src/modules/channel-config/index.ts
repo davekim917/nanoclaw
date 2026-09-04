@@ -126,34 +126,34 @@ async function handleSetChannelModel(content: Record<string, unknown>, session: 
   // model: string = set, null = clear, anything else = reject
   const model = args.model === null ? null : typeof args.model === 'string' ? args.model : undefined;
   if (model === undefined) {
-    notifyAgent(session, 'set_channel_model failed: `model` must be a string (to pin) or null (to clear).');
+    await notifyAgent(session, 'set_channel_model failed: `model` must be a string (to pin) or null (to clear).');
     return;
   }
 
   const callerId = await deriveCallerId(session);
   if (!callerId) {
-    notifyAgent(session, 'set_channel_model failed: could not identify the user who sent this message.');
+    await notifyAgent(session, 'set_channel_model failed: could not identify the user who sent this message.');
     return;
   }
   const agent = getAgentGroup(session.agent_group_id);
   if (!agent) {
-    notifyAgent(session, 'set_channel_model failed: agent group not found.');
+    await notifyAgent(session, 'set_channel_model failed: agent group not found.');
     return;
   }
   if (!hasMutateAuthority(callerId, agent.id)) {
-    notifyAgent(session, `set_channel_model denied: ${callerId} is not an owner / admin of ${agent.name}.`);
+    await notifyAgent(session, `set_channel_model denied: ${callerId} is not an owner / admin of ${agent.name}.`);
     return;
   }
 
   const mgId = await resolveChannelMessagingGroupId(session, channelName);
   if (!mgId) {
-    notifyAgent(session, `set_channel_model failed: channel ${channelName ?? '(current)'} not resolvable.`);
+    await notifyAgent(session, `set_channel_model failed: channel ${channelName ?? '(current)'} not resolvable.`);
     return;
   }
 
   const wiring = getMessagingGroupAgentByPair(mgId, agent.id);
   if (!wiring) {
-    notifyAgent(session, `set_channel_model failed: channel ${channelName ?? mgId} is not wired to this agent.`);
+    await notifyAgent(session, `set_channel_model failed: channel ${channelName ?? mgId} is not wired to this agent.`);
     return;
   }
 
@@ -163,7 +163,7 @@ async function handleSetChannelModel(content: Record<string, unknown>, session: 
   );
   const parsedModel: ParsedChannelValue = model === null ? { value: null } : parseChannelModel(model.trim(), provider);
   if (parsedModel.error || (model !== null && !parsedModel.value)) {
-    notifyAgent(session, `set_channel_model failed: ${parsedModel.error ?? 'invalid model'}.`);
+    await notifyAgent(session, `set_channel_model failed: ${parsedModel.error ?? 'invalid model'}.`);
     return;
   }
   const normalizedModel = parsedModel.value ?? null;
@@ -182,7 +182,7 @@ async function handleSetChannelModel(content: Record<string, unknown>, session: 
       : normalizedModel === model
         ? `set to ${normalizedModel}`
         : `set to ${normalizedModel} (via ${model})`;
-  notifyAgent(
+  await notifyAgent(
     session,
     `✅ Channel default_model ${label} for ${channelName ?? 'current channel'}. Takes effect on next container spawn.`,
   );
@@ -193,34 +193,34 @@ async function handleSetChannelEffort(content: Record<string, unknown>, session:
   const channelName = typeof args.channel === 'string' ? args.channel : undefined;
   const effort = args.effort === null ? null : typeof args.effort === 'string' ? args.effort : undefined;
   if (effort === undefined) {
-    notifyAgent(session, 'set_channel_effort failed: `effort` must be a provider-supported level or null.');
+    await notifyAgent(session, 'set_channel_effort failed: `effort` must be a provider-supported level or null.');
     return;
   }
 
   const callerId = await deriveCallerId(session);
   if (!callerId) {
-    notifyAgent(session, 'set_channel_effort failed: could not identify the user who sent this message.');
+    await notifyAgent(session, 'set_channel_effort failed: could not identify the user who sent this message.');
     return;
   }
   const agent = getAgentGroup(session.agent_group_id);
   if (!agent) {
-    notifyAgent(session, 'set_channel_effort failed: agent group not found.');
+    await notifyAgent(session, 'set_channel_effort failed: agent group not found.');
     return;
   }
   if (!hasMutateAuthority(callerId, agent.id)) {
-    notifyAgent(session, `set_channel_effort denied: ${callerId} is not an owner / admin of ${agent.name}.`);
+    await notifyAgent(session, `set_channel_effort denied: ${callerId} is not an owner / admin of ${agent.name}.`);
     return;
   }
 
   const mgId = await resolveChannelMessagingGroupId(session, channelName);
   if (!mgId) {
-    notifyAgent(session, `set_channel_effort failed: channel ${channelName ?? '(current)'} not resolvable.`);
+    await notifyAgent(session, `set_channel_effort failed: channel ${channelName ?? '(current)'} not resolvable.`);
     return;
   }
 
   const wiring = getMessagingGroupAgentByPair(mgId, agent.id);
   if (!wiring) {
-    notifyAgent(session, `set_channel_effort failed: channel ${channelName ?? mgId} is not wired to this agent.`);
+    await notifyAgent(session, `set_channel_effort failed: channel ${channelName ?? mgId} is not wired to this agent.`);
     return;
   }
 
@@ -230,7 +230,7 @@ async function handleSetChannelEffort(content: Record<string, unknown>, session:
   );
   const parsedEffort: ParsedChannelValue = effort === null ? { value: null } : parseChannelEffort(effort, provider);
   if (parsedEffort.error || (effort !== null && !parsedEffort.value)) {
-    notifyAgent(session, `set_channel_effort failed: ${parsedEffort.error ?? 'invalid effort'}.`);
+    await notifyAgent(session, `set_channel_effort failed: ${parsedEffort.error ?? 'invalid effort'}.`);
     return;
   }
   const normalizedEffort = parsedEffort.value ?? null;
@@ -244,7 +244,7 @@ async function handleSetChannelEffort(content: Record<string, unknown>, session:
     by: callerId,
   });
   const label = normalizedEffort === null ? 'cleared' : `set to ${normalizedEffort}`;
-  notifyAgent(
+  await notifyAgent(
     session,
     `✅ Channel default_effort ${label} for ${channelName ?? 'current channel'}. Takes effect on next container spawn.`,
   );

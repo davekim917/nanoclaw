@@ -162,7 +162,7 @@ function lastNotifyText(): string {
  * is the production path for every case these tests cover.
  */
 async function submitAddMcpServer(content: Record<string, unknown>, s: Session): Promise<void> {
-  if (!validateAddMcpServer(content, s)) return;
+  if (!(await validateAddMcpServer(content, s))) return;
   await requestAddMcpServerHold(content, s);
 }
 

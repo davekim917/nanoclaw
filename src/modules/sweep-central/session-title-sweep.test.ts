@@ -306,7 +306,7 @@ describe('the registered session-title-sweep duty calls runSessionTitleSweep', (
     spy.mockClear();
     spy.mockImplementationOnce(async () => ({ generated: 0, skipped: 0 }));
 
-    t15Duty().run(fakeTickCtx);
+    void t15Duty().run(fakeTickCtx);
     await waitUntil(() => spy.mock.calls.length > 0);
 
     expect(spy).toHaveBeenCalledTimes(1);
@@ -323,7 +323,7 @@ describe('the registered session-title-sweep duty calls runSessionTitleSweep', (
         throw new Error('title sweep boom');
       });
 
-      t15Duty().run(fakeTickCtx);
+      void t15Duty().run(fakeTickCtx);
       await waitUntil(() => warn.mock.calls.length > 0);
 
       expect(warn).toHaveBeenCalledWith(

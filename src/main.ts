@@ -674,8 +674,12 @@ export function isDirectExecution(moduleUrl: string, argvEntry: string | undefin
  * (src/index.ts) after the deploy crash guard has run.
  */
 export function startNanoClaw(): void {
-  process.on('SIGTERM', () => shutdown('SIGTERM'));
-  process.on('SIGINT', () => shutdown('SIGINT'));
+  process.on('SIGTERM', () => {
+    shutdown('SIGTERM').catch((err) => log.fatal('Shutdown handler failed', { err, signal: 'SIGTERM' }));
+  });
+  process.on('SIGINT', () => {
+    shutdown('SIGINT').catch((err) => log.fatal('Shutdown handler failed', { err, signal: 'SIGINT' }));
+  });
   main().catch((err) => {
     log.fatal('Startup failed', { err });
     process.exit(1);

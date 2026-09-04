@@ -119,32 +119,37 @@ export function ensureServerStarted(): void {
 
   const port = parseInt(process.env.WEBHOOK_PORT || String(DEFAULT_PORT), 10);
 
-  server = http.createServer(async (req, res) => {
-    try {
-      const webReq = await toWebRequest(req);
-      const result = await dispatch(webReq, req, res);
-      if (result !== null) {
-        await fromWebResponse(result, res);
-      }
-      // null → handler already wrote to res directly (SSE bypass)
-    } catch (err) {
-      // Body cap (post-build QA fix SF-5) — return 413 instead of 500.
-      if (err instanceof RequestTooLargeError) {
-        log.warn('Request body too large — rejected', { url: req.url, max: MAX_REQUEST_BODY_BYTES });
-        if (!res.headersSent) {
-          res.writeHead(413, { 'Content-Type': 'text/plain' });
-          res.end('Payload Too Large');
-        } else {
-          res.end();
+  server = http.createServer((req, res) => {
+    // The whole body is wrapped in try/catch below, so this IIFE's promise
+    // never rejects — void is safe here. http.createServer's request
+    // listener type is synchronous (req, res) => void, hence the wrapper.
+    void (async () => {
+      try {
+        const webReq = await toWebRequest(req);
+        const result = await dispatch(webReq, req, res);
+        if (result !== null) {
+          await fromWebResponse(result, res);
         }
-        return;
+        // null → handler already wrote to res directly (SSE bypass)
+      } catch (err) {
+        // Body cap (post-build QA fix SF-5) — return 413 instead of 500.
+        if (err instanceof RequestTooLargeError) {
+          log.warn('Request body too large — rejected', { url: req.url, max: MAX_REQUEST_BODY_BYTES });
+          if (!res.headersSent) {
+            res.writeHead(413, { 'Content-Type': 'text/plain' });
+            res.end('Payload Too Large');
+          } else {
+            res.end();
+          }
+          return;
+        }
+        log.error('Request handler error', { url: req.url, err });
+        if (!res.headersSent) {
+          res.writeHead(500, { 'Content-Type': 'text/plain' });
+          res.end('Internal Server Error');
+        }
       }
-      log.error('Request handler error', { url: req.url, err });
-      if (!res.headersSent) {
-        res.writeHead(500, { 'Content-Type': 'text/plain' });
-        res.end('Internal Server Error');
-      }
-    }
+    })();
   });
 
   server.listen(port, '0.0.0.0', () => {

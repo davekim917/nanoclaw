@@ -420,14 +420,18 @@ export function setDeliveryAdapter(adapter: ChannelDeliveryAdapter): void {
 export function startActiveDeliveryPoll(): void {
   if (activePolling) return;
   activePolling = true;
-  pollActive();
+  // pollActive wraps its own body in try/catch and always reschedules itself,
+  // so its returned promise never rejects — void is safe here.
+  void pollActive();
 }
 
 /** Start the sweep poll loop (~60s). */
 export function startSweepDeliveryPoll(): void {
   if (sweepPolling) return;
   sweepPolling = true;
-  pollSweep();
+  // pollSweep wraps its own body in try/catch and always reschedules itself,
+  // so its returned promise never rejects — void is safe here.
+  void pollSweep();
 }
 
 // Stall attribution: both loops do synchronous SQLite per session, so a slow
@@ -451,7 +455,9 @@ async function pollActive(): Promise<void> {
     log.info('Active delivery poll timing', { cycleMs, polled });
   }
 
-  setTimeout(pollActive, ACTIVE_POLL_MS);
+  setTimeout(() => {
+    void pollActive();
+  }, ACTIVE_POLL_MS);
 }
 
 // A session idle past this horizon has no deliverable outbound left — its
@@ -466,8 +472,18 @@ async function pollSweep(): Promise<void> {
   // (2350 sessions/cycle observed) and every stall drops live Discord inbound
   // at the local forward hop, so the per-session change-gate inside the cycle
   // is what keeps the work proportional to what actually changed.
-  await runSweepDeliveryCycle();
-  setTimeout(pollSweep, SWEEP_POLL_MS);
+  //
+  // try/catch mirrors pollActive: without it, a throw here would reject this
+  // function's promise and skip the reschedule below, silently killing the
+  // sweep loop forever instead of just skipping one cycle.
+  try {
+    await runSweepDeliveryCycle();
+  } catch (err) {
+    log.error('Sweep delivery poll error', { err });
+  }
+  setTimeout(() => {
+    void pollSweep();
+  }, SWEEP_POLL_MS);
 }
 
 /**

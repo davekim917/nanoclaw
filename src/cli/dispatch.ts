@@ -223,9 +223,9 @@ registerApprovalHandler('cli_command', async ({ payload, approval, notify }) => 
   if (response.ok) {
     const localized = localizeIsoTimestamps(response.data);
     const data = typeof localized === 'string' ? localized : JSON.stringify(localized, null, 2);
-    notify(`Your \`ncl ${frame.command}\` request was approved and executed.\n\n${data}`);
+    await notify(`Your \`ncl ${frame.command}\` request was approved and executed.\n\n${data}`);
   } else {
-    notify(`Your \`ncl ${frame.command}\` request was approved but failed: ${response.error.message}`);
+    await notify(`Your \`ncl ${frame.command}\` request was approved but failed: ${response.error.message}`);
   }
 });
 

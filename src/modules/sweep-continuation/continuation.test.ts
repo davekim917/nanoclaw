@@ -1761,16 +1761,16 @@ describe('registered S6/S7/S8/S9a/S9b/S15/S10 entries reach their bodies', () =>
     const ctx = sessionCtx(mailbox, emptyPlan(), { killSnapshot: snapshot } as Partial<SweepSessionContext>);
 
     // A claim-stuck kill has never notified.
-    s15.run(ctx, { action: 'kill-claim', messageId: 'm1', claimAgeMs: 90_000, toleranceMs: CLAIM_STUCK_MS }, mailbox);
+    void s15.run(ctx, { action: 'kill-claim', messageId: 'm1', claimAgeMs: 90_000, toleranceMs: CLAIM_STUCK_MS }, mailbox);
     expect(outDb.prepare('SELECT COUNT(*) AS c FROM messages_out').get()).toEqual({ c: 0 });
 
-    s15.run(ctx, { action: 'kill-ceiling', heartbeatAgeMs: 32 * 60_000, ceilingMs: ABSOLUTE_CEILING_MS }, mailbox);
+    void s15.run(ctx, { action: 'kill-ceiling', heartbeatAgeMs: 32 * 60_000, ceilingMs: ABSOLUTE_CEILING_MS }, mailbox);
     const row = outDb.prepare('SELECT content FROM messages_out').get() as { content: string };
     expect(JSON.parse(row.content)._system.kind).toBe('agent_restart_inactivity');
 
     // The gate is the SNAPSHOT's claim count, not a fresh read.
     const quiet = makeNotifyTestDbs();
-    s15.run(
+    void s15.run(
       sessionCtx(quiet.mailbox, emptyPlan(), {
         killSnapshot: { ...snapshot, pendingClaims: 0 },
       } as Partial<SweepSessionContext>),

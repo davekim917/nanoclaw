@@ -1271,6 +1271,8 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
               setTimeout(startGateway, delayMs);
             };
             listenerPromise.then(() => reschedule()).catch(reschedule);
+          }).catch((err) => {
+            log.error('Gateway listener failed to start', { adapter: adapter.name, err });
           });
         };
         startGateway();

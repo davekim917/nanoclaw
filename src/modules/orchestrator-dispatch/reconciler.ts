@@ -11,7 +11,11 @@ export function runReconcilerSweep(): void {
     // Lease + completionInFlight in completeSpawnSideEffects dedupes against
     // any in-flight setImmediate from the original admit. Self-orchestration:
     // child agent group is always the parent's agent group.
-    setImmediate(completeSpawnSideEffects, task.task_id, task.parent_agent_group_id);
+    // completeSpawnSideEffects internally .catch()es its own work, so the
+    // promise it returns never rejects — void is safe here.
+    setImmediate(() => {
+      void completeSpawnSideEffects(task.task_id, task.parent_agent_group_id);
+    });
   }
 }
 

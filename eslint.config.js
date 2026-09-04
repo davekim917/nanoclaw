@@ -29,4 +29,22 @@ export default [
       '@typescript-eslint/no-explicit-any': 'warn',
     },
   },
+  // Type-aware promise-safety rules, scoped to src/ only: scripts/ is covered by
+  // tsconfig.scripts.json, which typescript-eslint's projectService cannot
+  // auto-discover (it only looks for a file literally named tsconfig.json), and
+  // 3 of those scripts are excluded from typechecking entirely (PR #335).
+  {
+    files: ['src/**/*.ts'],
+    languageOptions: {
+      parserOptions: {
+        projectService: true,
+        tsconfigRootDir: import.meta.dirname,
+      },
+    },
+    rules: {
+      '@typescript-eslint/no-floating-promises': 'error',
+      '@typescript-eslint/no-misused-promises': 'error',
+      '@typescript-eslint/await-thenable': 'error',
+    },
+  },
 ]

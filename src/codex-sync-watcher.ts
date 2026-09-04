@@ -347,7 +347,10 @@ function main(): void {
   // Graceful shutdown on SIGTERM (systemctl stop).
   const shutdown = (signal: string) => {
     log(`received ${signal}, shutting down`);
-    watcher.close().finally(() => process.exit(0));
+    watcher
+      .close()
+      .catch((err) => logError(`watcher close error: ${err instanceof Error ? err.message : String(err)}`))
+      .finally(() => process.exit(0));
   };
   process.on('SIGTERM', () => shutdown('SIGTERM'));
   process.on('SIGINT', () => shutdown('SIGINT'));

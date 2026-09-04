@@ -188,12 +188,14 @@ async function _writeAndEchoSteer(
     // single CAS guarantees we don't double-echo if the original
     // setImmediate already ran.
     if (!reserved.echoAttempted && claimEchoAttempted(reserved.id)) {
-      setImmediate(async () => {
-        try {
-          await _fireEchoAsync(exec, trimmedText, ctx);
-        } catch {
-          // outer catch covers sync throws — claim already committed
-        }
+      setImmediate(() => {
+        void (async () => {
+          try {
+            await _fireEchoAsync(exec, trimmedText, ctx);
+          } catch {
+            // outer catch covers sync throws — claim already committed
+          }
+        })();
       });
     }
     return { status: 202, body: _responseShapeForTarget(reserved.cached) };
@@ -282,12 +284,14 @@ async function _writeAndEchoSteer(
   applyIdempotency(userId, idempotencyKey, steerResponse);
 
   if (claimEchoAttempted(reserved.id)) {
-    setImmediate(async () => {
-      try {
-        await _fireEchoAsync(exec, trimmedText, ctx);
-      } catch {
-        // outer catch covers sync throws — claim already committed; nothing to roll back
-      }
+    setImmediate(() => {
+      void (async () => {
+        try {
+          await _fireEchoAsync(exec, trimmedText, ctx);
+        } catch {
+          // outer catch covers sync throws — claim already committed; nothing to roll back
+        }
+      })();
     });
   }
 

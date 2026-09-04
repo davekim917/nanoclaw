@@ -114,7 +114,7 @@ describe('callHaiku', () => {
     // mockImplementation (not mockResolvedValue) — a fresh Response per call,
     // since callHaikuHttpError now reads the body once via .json() and a
     // shared Response instance can't be read twice.
-    fetchMock.mockImplementation(async () => jsonResponse({}, { status: 429, headers: { 'retry-after': '1' } }));
+    fetchMock.mockImplementation(() => jsonResponse({}, { status: 429, headers: { 'retry-after': '1' } }));
 
     const promise = callHaiku('hello');
     promise.catch(() => {});
@@ -191,7 +191,7 @@ describe('callHaiku', () => {
     it('throws once every slot is exhausted', async () => {
       // mockImplementation for the same reason as above — a fresh Response
       // per call.
-      fetchMock.mockImplementation(async () => jsonResponse({ error: { type: 'rate_limit_error' } }, { status: 429 }));
+      fetchMock.mockImplementation(() => jsonResponse({ error: { type: 'rate_limit_error' } }, { status: 429 }));
 
       const promise = callHaiku('hello');
       promise.catch(() => {});
@@ -282,7 +282,7 @@ describe('callHaiku', () => {
       // mockImplementation (not mockResolvedValue) — a fresh Response per
       // call, since the error body is read via .json() and a shared Response
       // instance can't be read twice.
-      fetchMock.mockImplementation(async () => jsonResponse({}, { status: 429, headers: { 'retry-after': '3600' } }));
+      fetchMock.mockImplementation(() => jsonResponse({}, { status: 429, headers: { 'retry-after': '3600' } }));
 
       const first = await callHaiku('hello').catch((err: unknown) => err);
       expect(first).toBeInstanceOf(CallHaikuHttpError);

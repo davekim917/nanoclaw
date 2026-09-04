@@ -19,10 +19,10 @@ import { log } from '../../log.js';
 import type { Session } from '../../types.js';
 import { notifyAgent, requestApproval } from '../approvals/index.js';
 
-export function validateInstallPackages(content: Record<string, unknown>, session: Session): boolean {
+export async function validateInstallPackages(content: Record<string, unknown>, session: Session): Promise<boolean> {
   const agentGroup = getAgentGroup(session.agent_group_id);
   if (!agentGroup) {
-    notifyAgent(session, 'install_packages failed: agent group not found.');
+    await notifyAgent(session, 'install_packages failed: agent group not found.');
     return false;
   }
 
@@ -33,22 +33,22 @@ export function validateInstallPackages(content: Record<string, unknown>, sessio
   const NPM_RE = /^(@[a-z0-9][a-z0-9._-]*\/)?[a-z0-9][a-z0-9._-]*$/;
   const MAX_PACKAGES = 20;
   if (apt.length + npm.length === 0) {
-    notifyAgent(session, 'install_packages failed: at least one apt or npm package is required.');
+    await notifyAgent(session, 'install_packages failed: at least one apt or npm package is required.');
     return false;
   }
   if (apt.length + npm.length > MAX_PACKAGES) {
-    notifyAgent(session, `install_packages failed: max ${MAX_PACKAGES} packages per request.`);
+    await notifyAgent(session, `install_packages failed: max ${MAX_PACKAGES} packages per request.`);
     return false;
   }
   const invalidApt = apt.find((p) => !APT_RE.test(p));
   if (invalidApt) {
-    notifyAgent(session, `install_packages failed: invalid apt package name "${invalidApt}".`);
+    await notifyAgent(session, `install_packages failed: invalid apt package name "${invalidApt}".`);
     log.warn('install_packages: invalid apt package rejected', { pkg: invalidApt });
     return false;
   }
   const invalidNpm = npm.find((p) => !NPM_RE.test(p));
   if (invalidNpm) {
-    notifyAgent(session, `install_packages failed: invalid npm package name "${invalidNpm}".`);
+    await notifyAgent(session, `install_packages failed: invalid npm package name "${invalidNpm}".`);
     log.warn('install_packages: invalid npm package rejected', { pkg: invalidNpm });
     return false;
   }
@@ -125,24 +125,24 @@ export function escapeInvisibles(s: string): string {
   });
 }
 
-export function validateAddMcpServer(content: Record<string, unknown>, session: Session): boolean {
+export async function validateAddMcpServer(content: Record<string, unknown>, session: Session): Promise<boolean> {
   const agentGroup = getAgentGroup(session.agent_group_id);
   if (!agentGroup) {
-    notifyAgent(session, 'add_mcp_server failed: agent group not found.');
+    await notifyAgent(session, 'add_mcp_server failed: agent group not found.');
     return false;
   }
   const serverName = content.name as string;
   const command = content.command as string;
   if (typeof serverName !== 'string' || !serverName || typeof command !== 'string' || !command) {
-    notifyAgent(session, 'add_mcp_server failed: name and command are required.');
+    await notifyAgent(session, 'add_mcp_server failed: name and command are required.');
     return false;
   }
   if (content.args !== undefined && !isStringArray(content.args)) {
-    notifyAgent(session, 'add_mcp_server failed: args must be an array of strings.');
+    await notifyAgent(session, 'add_mcp_server failed: args must be an array of strings.');
     return false;
   }
   if (content.env !== undefined && !isStringRecord(content.env)) {
-    notifyAgent(session, 'add_mcp_server failed: env must be a map of string keys to string values.');
+    await notifyAgent(session, 'add_mcp_server failed: env must be a map of string keys to string values.');
     return false;
   }
 
@@ -150,15 +150,15 @@ export function validateAddMcpServer(content: Record<string, unknown>, session: 
   const env = (content.env as Record<string, string> | undefined) || {};
 
   if (args.length > MAX_MCP_ARGS) {
-    notifyAgent(session, `add_mcp_server failed: max ${MAX_MCP_ARGS} args per server.`);
+    await notifyAgent(session, `add_mcp_server failed: max ${MAX_MCP_ARGS} args per server.`);
     return false;
   }
   if (Object.keys(env).length > MAX_MCP_ENV_VARS) {
-    notifyAgent(session, `add_mcp_server failed: max ${MAX_MCP_ENV_VARS} env vars per server.`);
+    await notifyAgent(session, `add_mcp_server failed: max ${MAX_MCP_ENV_VARS} env vars per server.`);
     return false;
   }
   if (Buffer.byteLength(JSON.stringify({ name: serverName, command, args, env }), 'utf8') > MCP_PAYLOAD_MAX_BYTES) {
-    notifyAgent(session, `add_mcp_server failed: payload exceeds ${MCP_PAYLOAD_MAX_BYTES} bytes.`);
+    await notifyAgent(session, `add_mcp_server failed: payload exceeds ${MCP_PAYLOAD_MAX_BYTES} bytes.`);
     return false;
   }
   return true;
@@ -195,7 +195,7 @@ export async function requestAddMcpServerHold(content: Record<string, unknown>, 
     `env: ${escapeInvisibles(JSON.stringify(displayEnv))}\n` +
     '```';
   if (Buffer.byteLength(question, 'utf8') > MCP_APPROVAL_CARD_MAX_BYTES) {
-    notifyAgent(
+    await notifyAgent(
       session,
       `add_mcp_server failed: rendered approval card exceeds ${MCP_APPROVAL_CARD_MAX_BYTES} bytes — trim args/env.`,
     );
@@ -219,11 +219,11 @@ export async function handleChangeModel(content: Record<string, unknown>, sessio
   const slug = content.slug as string;
   const effort = content.effort as string | undefined;
   if (!slug) {
-    notifyAgent(session, 'change_model failed: --slug (the model identifier) is required.');
+    await notifyAgent(session, 'change_model failed: --slug (the model identifier) is required.');
     return;
   }
   if (effort && !['low', 'medium', 'high', 'max'].includes(effort)) {
-    notifyAgent(session, 'change_model failed: --effort must be one of: low, medium, high, max.');
+    await notifyAgent(session, 'change_model failed: --effort must be one of: low, medium, high, max.');
     return;
   }
 

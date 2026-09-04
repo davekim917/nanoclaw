@@ -22,7 +22,7 @@ import { notifyAgent, registerApprovalHandler, requestApproval, type ApprovalHan
 async function handleStartRemoteControl(content: Record<string, unknown>, session: Session): Promise<void> {
   const agentGroup = getAgentGroup(session.agent_group_id);
   if (!agentGroup) {
-    notifyAgent(session, 'start_remote_control failed: agent group not found.');
+    await notifyAgent(session, 'start_remote_control failed: agent group not found.');
     return;
   }
   const sender = (content.sender as string) || 'unknown';
@@ -47,7 +47,7 @@ async function handleStartRemoteControl(content: Record<string, unknown>, sessio
 async function handleStopRemoteControl(_content: Record<string, unknown>, session: Session): Promise<void> {
   const agentGroup = getAgentGroup(session.agent_group_id);
   if (!agentGroup) {
-    notifyAgent(session, 'stop_remote_control failed: agent group not found.');
+    await notifyAgent(session, 'stop_remote_control failed: agent group not found.');
     return;
   }
   await requestApproval({
@@ -67,7 +67,7 @@ async function handleGetRemoteControlStatus(_content: Record<string, unknown>, s
   const text = active
     ? `Remote Control active (pid=${active.pid}): ${active.url}`
     : 'No active Remote Control session.';
-  notifyAgent(session, text);
+  await notifyAgent(session, text);
 }
 
 const applyStartRemoteControl: ApprovalHandler = async ({ session, payload, notify }) => {
@@ -84,14 +84,14 @@ const applyStartRemoteControl: ApprovalHandler = async ({ session, payload, noti
   // Backstop notify on the session so the agent can relay; primitive notify
   // already targets the originating session, but keep behavior in line with
   // the previous direct-execute path.
-  notifyAgent(session, result.ok ? `Remote Control ready: ${result.url}` : `Remote Control failed: ${result.error}`);
+  await notifyAgent(session, result.ok ? `Remote Control ready: ${result.url}` : `Remote Control failed: ${result.error}`);
 };
 
 const applyStopRemoteControl: ApprovalHandler = async ({ session, notify }) => {
   const result = stopRemoteControl();
   const text = result.ok ? 'Remote Control stopped.' : `Remote Control: ${result.error}`;
   await notify(text);
-  notifyAgent(session, text);
+  await notifyAgent(session, text);
 };
 
 const REMOTE_CONTROL_ACTION = unguarded(
