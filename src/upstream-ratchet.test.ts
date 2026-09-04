@@ -269,7 +269,7 @@ describe('upstream-ownership ratchet', () => {
     expect(checkTree(fixture, root).find((f) => f.path === 'note.md')?.detail).toContain('no git blob mode');
   });
 
-  it('an ignored upstream path is recorded, not checked against the tree', () => {
+  it('an ignored upstream path present on disk produces no finding', () => {
     // `.claude/scheduled_tasks.lock` is upstream-tracked, deleted in this fork,
     // AND gitignored here — it is a RUNTIME LOCK FILE. On the production
     // checkout some process recreates it whenever the system is running, so a
