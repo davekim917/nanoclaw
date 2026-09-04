@@ -8,7 +8,6 @@
  */
 import fs from 'fs';
 import path from 'path';
-import { createHash } from 'crypto';
 
 import type { Handler } from './router.js';
 

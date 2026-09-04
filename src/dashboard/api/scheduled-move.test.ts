@@ -366,7 +366,7 @@ describe('movePreviewHandler', () => {
   });
 
   it('out-of-scope target key → 404 (never 403)', async () => {
-    const { key } = seedMoveFixture();
+    seedMoveFixture();
     const res = (await movePreviewHandler(
       req({ targetAgentGroupId: 'tgt-ag', targetMessagingGroupId: 'tgt-mg' }),
       { key: encodeKey('nonexistent', 'x', 'y') },

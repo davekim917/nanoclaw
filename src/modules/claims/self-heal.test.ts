@@ -643,7 +643,7 @@ describe('sweepClaimsSelfHeal hostile re-read handling', () => {
     const dir = root({ seam: claim(30) });
     const file = path.join(dir, 'wg-a', 'claims', 'seam.json');
     const d = deps(dir, {
-      createTask: async (input: SelfHealTaskInput) => {
+      createTask: async (_input: SelfHealTaskInput) => {
         fs.rmSync(file);
         execFileSync('mkfifo', [file]);
         return true;

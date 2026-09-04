@@ -18,6 +18,43 @@
 # this install actually catches leaks; closing the gap here means diffing
 # each pushed ref against its remote counterpart. Do not describe this hook
 # as scanning "the content being pushed" until it does.
+#
+# set -e: below is now two gates, not one — without this, a failing boundary
+# check would be masked by a passing lint step (the script's exit code is the
+# LAST command's, not the first failure's). pre-commit already does this for
+# the same reason.
+set -e
 repo_root=$(dirname "$(cd "$(git rev-parse --git-common-dir)" && pwd)")
 worktree_root=$(git rev-parse --show-toplevel)
 (cd "$repo_root" && pnpm run check:public-boundary -- --root "$worktree_root" --index)
+
+# Seam 3 lint gate — for no-floating-promises / no-misused-promises /
+# projectService and friends to actually gate anything, `pnpm run lint` itself
+# must be green and enforced (see docs/specs for the seam plan).
+#
+# Known gap, pre-existing pattern (same class as the boundary check's own
+# comment above): this lints the WORKTREE's on-disk files, not the object
+# content of the commit(s) actually being pushed — a commit with a lint error
+# that the working tree has since fixed only in unstaged content would pass.
+# Closing it means linting the pushed SHA's tree (e.g. a `git archive`/export
+# to a throwaway directory per ref on stdin), which the boundary check would
+# need too for the same reason; out of scope for this PR (Codex review, #380).
+#
+# Unlike prettier's compiled binary, eslint.config.js is a plain ES module:
+# its own `import globals from 'globals'` (and typescript-eslint, the
+# no-catch-all plugin, ...) is resolved by Node relative to the CONFIG FILE's
+# own location, not cwd — so `--resolve-plugins-relative-to`/PATH tricks that
+# work for prettier do nothing here, and pointing `--config` at the main
+# checkout's copy while linting the worktree's files fails too (flat config
+# treats paths outside the config's own directory as "outside the base path"
+# and ignores them). The worktree has to lint against ITS OWN
+# eslint.config.js — which is correct anyway, since that's the version of the
+# rules the pushed branch should be gated by — but needs node_modules
+# reachable from inside it, and agent worktrees deliberately have none (see
+# banner comment above). Link the main checkout's in, once, if not already
+# present; never overwrite an existing entry (could be a real install, not
+# this hook's symlink).
+if [ ! -e "$worktree_root/node_modules" ]; then
+  ln -s "$repo_root/node_modules" "$worktree_root/node_modules"
+fi
+(cd "$worktree_root" && node_modules/.bin/eslint --quiet src/ scripts/)

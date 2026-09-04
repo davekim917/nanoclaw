@@ -25,10 +25,10 @@ import type { Session } from './types.js';
 
 // ── hoisted state every mock factory reads ───────────────────────────────────
 
-const h = vi.hoisted(() => {
-  const nodeFs = require('fs') as typeof import('fs');
-  const nodeOs = require('os') as typeof import('os');
-  const nodePath = require('path') as typeof import('path');
+const h = await vi.hoisted(async () => {
+  const nodeFs = await import('fs');
+  const nodeOs = await import('os');
+  const nodePath = await import('path');
   return {
     dataDir: nodeFs.mkdtempSync(nodePath.join(nodeOs.tmpdir(), 'sweep-registry-')),
     selfHeal: false,

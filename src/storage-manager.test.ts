@@ -54,7 +54,7 @@ import { CONTAINER_IMAGE, CONTAINER_IMAGE_BASE, CONTAINER_INSTALL_LABEL } from '
 import { CONTAINER_RUNTIME_BIN } from './container-runtime.js';
 import { resolveRepositoryWorkUnit } from './repository-workspaces.js';
 import { log } from './log.js';
-import { sessionContextPath, sessionContextPathFor } from './session-manager.js';
+import { sessionContextPathFor } from './session-manager.js';
 
 // The rescue round-trip suite needs a REAL tar/zstd. `vi.mock('child_process')`
 // intercepts the `node:`-prefixed specifier too, so a plain import would just

@@ -4,8 +4,6 @@ import path from 'path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const { TEST_ROOT } = vi.hoisted(() => ({ TEST_ROOT: uniqueTmpRoot('agent-runner-source-test') }));
-const GROUPS_DIR = path.join(TEST_ROOT, 'groups');
-const DATA_DIR = path.join(TEST_ROOT, 'data');
 
 // Same pattern as src/provider-surfaces.test.ts: override the data/groups
 // roots buildMounts writes under, leave REPO_ROOT (used by

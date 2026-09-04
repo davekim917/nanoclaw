@@ -13,7 +13,6 @@ import {
   verbVerdict,
   availableVerbs,
   type HealthState,
-  type SeriesKind,
   type VerbCtx,
 } from './scheduled-board-matrix.js';
 

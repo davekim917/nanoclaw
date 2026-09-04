@@ -170,6 +170,7 @@ export function computeManifestFromGit(upstreamSha: string): MailboxSeamManifest
         `mailbox-seam-manifest: ${relPath} not found at upstream ${upstreamSha} (git show failed): ${
           err instanceof Error ? err.message : String(err)
         }`,
+        { cause: err },
       );
     }
     files[relPath] = sha256(content);

@@ -55,10 +55,10 @@ vi.mock('node:child_process', () => childProcessTripwire(spawns));
  * inbound.db fixture. `Asia/Tokyo` is pinned so the cron grid is exact even on
  * a UTC runner — the same reason `recurrence.test.ts` pins it.
  */
-const roots = vi.hoisted(() => {
-  const nodeFs = require('fs') as typeof import('fs');
-  const nodeOs = require('os') as typeof import('os');
-  const nodePath = require('path') as typeof import('path');
+const roots = await vi.hoisted(async () => {
+  const nodeFs = await import('fs');
+  const nodeOs = await import('os');
+  const nodePath = await import('path');
   const dir = nodeFs.mkdtempSync(nodePath.join(nodeOs.tmpdir(), 'sweep-scheduling-'));
   return { dir, groups: nodePath.join(dir, 'groups') };
 });

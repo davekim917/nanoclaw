@@ -986,7 +986,7 @@ function canonicalGitControlMounts(gitDir: string, stateDir: string): VolumeMoun
       if ((writeError as NodeJS.ErrnoException).code !== 'EEXIST') throw writeError;
       const placeholderStat = fs.lstatSync(indexSource);
       if (placeholderStat.isSymbolicLink() || !placeholderStat.isFile() || placeholderStat.size !== 0) {
-        throw new Error(`Unsafe canonical Git index placeholder: ${indexSource}`);
+        throw new Error(`Unsafe canonical Git index placeholder: ${indexSource}`, { cause: writeError });
       }
     }
   }
@@ -1004,7 +1004,7 @@ function canonicalGitControlMounts(gitDir: string, stateDir: string): VolumeMoun
       if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
       const stat = fs.lstatSync(file);
       if (stat.isSymbolicLink() || !stat.isFile() || stat.size !== 0) {
-        throw new Error(`Canonical repository has unsafe object alternates: ${file}`);
+        throw new Error(`Canonical repository has unsafe object alternates: ${file}`, { cause: error });
       }
     }
   }
@@ -4541,8 +4541,8 @@ async function buildContainerArgs(
       let recheck: string;
       try {
         recheck = fs.realpathSync(mount.hostPath);
-      } catch {
-        throw new Error(`Overlay mount source vanished before spawn: ${mount.hostPath}`);
+      } catch (e) {
+        throw new Error(`Overlay mount source vanished before spawn: ${mount.hostPath}`, { cause: e });
       }
       const allowed = mount.overlayAllowedRoots.some((root) => recheck === root || recheck.startsWith(root + path.sep));
       if (recheck !== mount.hostPath || !allowed) {

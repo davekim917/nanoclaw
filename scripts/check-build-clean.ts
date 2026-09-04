@@ -25,6 +25,14 @@
  * at prebuild time — not for a peer's mid-build edit to an already-dirty (or
  * newly dirty) file, which would otherwise slip through unnoticed just
  * because *some* dirt was already permitted.
+ *
+ * Third guard, unrelated failure family: `pnpm run lint` must be green
+ * before tsc runs (seam 3 — no-floating-promises / no-misused-promises /
+ * projectService only gate anything if the pre-existing backlog can't just
+ * sit there red forever). Runs throttled (ionice + nice), same as the manual
+ * invocations this mirrors, so a build kicked off on a shared host doesn't
+ * starve co-resident agent containers; falls back to an unthrottled run if
+ * ionice isn't installed rather than blocking on a missing OS utility.
  */
 import { execFileSync } from 'node:child_process';
 import crypto from 'node:crypto';
@@ -149,7 +157,87 @@ export function checkFreshness(head: string, originMain: string, allowLocal: boo
   };
 }
 
+interface EslintMessage {
+  ruleId: string | null;
+  line: number;
+  message: string;
+  severity: number;
+}
+
+interface EslintFileResult {
+  filePath: string;
+  messages: EslintMessage[];
+}
+
+/**
+ * Runs a command and returns its stdout whether it exited 0 or not — eslint
+ * exits 1 the moment it finds a single lint error, which is the normal,
+ * expected outcome here (not a tooling failure), and its JSON report is on
+ * stdout either way. A genuine spawn failure (bad path, ENOENT) has no
+ * `.stdout` on the thrown error, so that case still throws.
+ */
+function execCaptureStdout(cmd: string, args: string[], options: { cwd: string }): string {
+  try {
+    return execFileSync(cmd, args, { encoding: 'utf8', cwd: options.cwd });
+  } catch (err) {
+    const stdout = (err as NodeJS.ErrnoException & { stdout?: string }).stdout;
+    if (typeof stdout === 'string') return stdout;
+    throw err;
+  }
+}
+
+/**
+ * Absolute path to this script's own directory's parent — the repo root
+ * where `node_modules/`, `src/`, and `scripts/` actually live. Resolving via
+ * `import.meta.url` (not `process.cwd()`) matters here specifically:
+ * check-build-clean.test.ts spawns this script with `cwd` pointed at a
+ * throwaway fixture git repo that has none of those — a relative
+ * `node_modules/.bin/eslint` (or relative `src/`/`scripts/` lint targets)
+ * would silently resolve against the fixture instead of the real checkout.
+ */
+const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+
+/** Prebuild lint gate: refuses to build if `pnpm run lint`'s eslint invocation finds errors. */
+function runLintGate(): void {
+  const eslintBin = path.join(REPO_ROOT, 'node_modules', '.bin', 'eslint');
+  const eslintArgs = ['src/', 'scripts/', '--quiet', '-f', 'json'];
+  let stdout: string;
+  try {
+    stdout = execCaptureStdout('ionice', ['-c3', 'nice', '-n', '10', eslintBin, ...eslintArgs], { cwd: REPO_ROOT });
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
+      console.error('BUILD REFUSED: lint gate could not run.');
+      console.error(err instanceof Error ? err.message : String(err));
+      process.exit(1);
+    }
+    // ionice isn't installed on this host — throttling is a courtesy to
+    // co-resident builders, not a build-correctness requirement.
+    stdout = execCaptureStdout(eslintBin, eslintArgs, { cwd: REPO_ROOT });
+  }
+
+  const results = JSON.parse(stdout) as EslintFileResult[];
+  const errors: Array<{ filePath: string; line: number; ruleId: string | null; message: string }> = [];
+  for (const result of results) {
+    for (const m of result.messages) {
+      if (m.severity === 2) {
+        errors.push({ filePath: result.filePath, line: m.line, ruleId: m.ruleId, message: m.message });
+      }
+    }
+  }
+  if (errors.length === 0) return;
+
+  console.error(`BUILD REFUSED: \`pnpm run lint\` found ${errors.length} error(s).\n`);
+  for (const e of errors.slice(0, 20)) {
+    console.error(`  ${e.filePath}:${e.line}  ${e.ruleId ?? '(parse error)'}  ${e.message}`);
+  }
+  if (errors.length > 20) console.error(`  ... and ${errors.length - 20} more`);
+  console.error('\nRun `pnpm run lint` to see the full list, fix, then rebuild.');
+  process.exit(1);
+}
+
 function main(): void {
+  runLintGate();
+
   // NOTE: don't .trim() the raw output before splitting — porcelain status
   // codes can start with a leading space (e.g. " M path" for an unstaged
   // modification), and trimming the whole multi-line string strips that

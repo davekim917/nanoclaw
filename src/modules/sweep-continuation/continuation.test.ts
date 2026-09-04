@@ -99,10 +99,10 @@ afterEach(() => {
 // a separate test file (vi.mock is per-file).
 
 const selfHeal = vi.hoisted(() => ({ enabled: false }));
-const testDataDir = vi.hoisted(() => {
-  const nodeFs = require('fs') as typeof import('fs');
-  const nodeOs = require('os') as typeof import('os');
-  const nodePath = require('path') as typeof import('path');
+const testDataDir = await vi.hoisted(async () => {
+  const nodeFs = await import('fs');
+  const nodeOs = await import('os');
+  const nodePath = await import('path');
   return { dir: nodeFs.mkdtempSync(nodePath.join(nodeOs.tmpdir(), 'sweep-continuation-')) };
 });
 vi.mock('../../config.js', async (importOriginal) => {
@@ -836,7 +836,7 @@ describe('durable continuation wake', () => {
   });
 
   it('routes parked accounting through the continuation source in an agent-shared session', () => {
-    const { inDb, outDb, mailbox } = makeSessionDbs();
+    const { inDb, mailbox } = makeSessionDbs();
     inDb
       .prepare(
         `INSERT INTO messages_in
@@ -865,7 +865,7 @@ describe('notifyKillCeiling (Layer-3 fix)', () => {
   // where the notify should fire (see the spam-gate test below for the
   // claims=0 case).
   it('writes a visible chat outbound with the session route before killContainer', () => {
-    const { inDb, outDb, mailbox } = makeNotifyTestDbs();
+    const { outDb, mailbox } = makeNotifyTestDbs();
     const heartbeatAgeMs = 32 * 60_000;
 
     _notifyKillCeilingForTesting(mailbox, fakeSession(), heartbeatAgeMs, 1);
@@ -894,7 +894,7 @@ describe('notifyKillCeiling (Layer-3 fix)', () => {
   });
 
   it('reports a persisted Codex control-plane failure instead of calling it generic silence', () => {
-    const { inDb, outDb, mailbox } = makeNotifyTestDbs();
+    const { outDb, mailbox } = makeNotifyTestDbs();
     _notifyKillCeilingForTesting(mailbox, fakeSession(), 62 * 60_000, 1, {
       current_tool: 'CodexItem',
       tool_declared_timeout_ms: 3_600_000,
@@ -922,19 +922,19 @@ describe('notifyKillCeiling (Layer-3 fix)', () => {
     // wake before) — the only thing that distinguishes "user waiting" from
     // "idle" is whether any inbound was claimed (processing_ack) when we
     // killed.
-    const { inDb, outDb, mailbox } = makeNotifyTestDbs();
+    const { outDb, mailbox } = makeNotifyTestDbs();
     _notifyKillCeilingForTesting(mailbox, fakeSession(), 32 * 60_000, 0);
     expect(outDb.prepare('SELECT COUNT(*) AS c FROM messages_out').get()).toEqual({ c: 0 });
   });
 
   it('skips when the session has never been routed (fresh session_routing row missing)', () => {
-    const { inDb, outDb, mailbox } = makeNotifyTestDbs({ withRouting: false });
+    const { outDb, mailbox } = makeNotifyTestDbs({ withRouting: false });
     _notifyKillCeilingForTesting(mailbox, fakeSession(), 32 * 60_000, 1);
     expect(outDb.prepare('SELECT COUNT(*) AS c FROM messages_out').get()).toEqual({ c: 0 });
   });
 
   it('is idempotent within 60s — a re-firing sweep tick does not duplicate the notice', () => {
-    const { inDb, outDb, mailbox } = makeNotifyTestDbs({ recentNotice: true });
+    const { outDb, mailbox } = makeNotifyTestDbs({ recentNotice: true });
     _notifyKillCeilingForTesting(mailbox, fakeSession(), 32 * 60_000, 1);
     // Only the seed row should be present; the second call recognized the
     // marker and skipped.
@@ -1761,7 +1761,11 @@ describe('registered S6/S7/S8/S9a/S9b/S15/S10 entries reach their bodies', () =>
     const ctx = sessionCtx(mailbox, emptyPlan(), { killSnapshot: snapshot } as Partial<SweepSessionContext>);
 
     // A claim-stuck kill has never notified.
-    void s15.run(ctx, { action: 'kill-claim', messageId: 'm1', claimAgeMs: 90_000, toleranceMs: CLAIM_STUCK_MS }, mailbox);
+    void s15.run(
+      ctx,
+      { action: 'kill-claim', messageId: 'm1', claimAgeMs: 90_000, toleranceMs: CLAIM_STUCK_MS },
+      mailbox,
+    );
     expect(outDb.prepare('SELECT COUNT(*) AS c FROM messages_out').get()).toEqual({ c: 0 });
 
     void s15.run(ctx, { action: 'kill-ceiling', heartbeatAgeMs: 32 * 60_000, ceilingMs: ABSOLUTE_CEILING_MS }, mailbox);

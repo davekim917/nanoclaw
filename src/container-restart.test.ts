@@ -84,10 +84,10 @@ const realMailboxSessions = vi.hoisted(() => new Set<string>());
 
 // DATA_DIR is a per-run temp root: the real-mailbox case provisions actual
 // session DBs under it, and nothing here can reach the install's data dir.
-const testDataDir = vi.hoisted(() => {
-  const nodeFs = require('fs') as typeof import('fs');
-  const nodeOs = require('os') as typeof import('os');
-  const nodePath = require('path') as typeof import('path');
+const testDataDir = await vi.hoisted(async () => {
+  const nodeFs = await import('fs');
+  const nodeOs = await import('os');
+  const nodePath = await import('path');
   return { dir: nodeFs.mkdtempSync(nodePath.join(nodeOs.tmpdir(), 'container-restart-data-')) };
 });
 vi.mock('./config.js', async (importOriginal) => ({

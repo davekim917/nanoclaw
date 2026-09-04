@@ -34,7 +34,7 @@ export async function applySpawnNeedsInput(content: Record<string, unknown>, cal
   const rawQuestion = (content.question as string | undefined) ?? null;
   const question = rawQuestion ? rawQuestion.slice(0, 500) : null;
 
-  let flipped = false;
+  let flipped: boolean;
   try {
     flipped = flagNeedsInput(taskId, question);
   } catch (err) {

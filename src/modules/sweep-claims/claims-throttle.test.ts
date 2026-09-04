@@ -30,7 +30,6 @@
  * `wiredCandidates` hits an in-memory DB, everything else is fs-only).
  */
 import fs from 'fs';
-import os from 'os';
 import path from 'path';
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -65,10 +64,10 @@ afterEach(() => {
   spawnAttempts.length = 0;
 });
 
-const h = vi.hoisted(() => {
-  const nodeFs = require('fs') as typeof import('fs');
-  const nodeOs = require('os') as typeof import('os');
-  const nodePath = require('path') as typeof import('path');
+const h = await vi.hoisted(async () => {
+  const nodeFs = await import('fs');
+  const nodeOs = await import('os');
+  const nodePath = await import('path');
   return { root: nodeFs.mkdtempSync(nodePath.join(nodeOs.tmpdir(), 'claims-throttle-')) };
 });
 
@@ -92,7 +91,7 @@ vi.mock('../../config.js', async (importOriginal) => {
 // Registers T20/T21 into host-sweep.ts's live registry, same as claims.test.ts.
 import './index.js';
 import { _listSweepRegistrationsForTesting, type SweepTickContext } from '../../host-sweep.js';
-import { closeDb, getDb, initTestDb } from '../../db/connection.js';
+import { closeDb, initTestDb } from '../../db/connection.js';
 import { _resetSelfHealThrottleForTesting, SELF_HEAL_MAX_NUDGES } from '../claims/self-heal.js';
 
 function fakeTickContext(): SweepTickContext {

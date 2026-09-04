@@ -94,7 +94,9 @@ describe('runReconcilerSweep', () => {
 
     runReconcilerSweep();
 
-    const taskIds = (setImmediateSpy.mock.calls as unknown as [Function, string, string][]).map((c) => c[1]);
+    const taskIds = (setImmediateSpy.mock.calls as unknown as [(...args: unknown[]) => void, string, string][]).map(
+      (c) => c[1],
+    );
     expect(taskIds).toContain('task-a');
     expect(taskIds).toContain('task-b');
 

@@ -7,21 +7,16 @@
  */
 import { spawnSync } from 'child_process';
 import fs from 'fs';
-import os from 'os';
 import path from 'path';
 
 import Database from 'better-sqlite3';
 import { describe, expect, it, vi } from 'vitest';
 
-import { countDueMessages } from './modules/mailbox/ops/sweep.js';
-import { composeNanoclawSession, type NanoclawMailboxSession } from './modules/mailbox/index.js';
 import { getAgentMailbox } from './mailbox/index.js';
 import { withExistingMailboxSession } from './session-manager.js';
 import { closeDb, initTestDb, runMigrations } from './db/index.js';
 import {
   ABSOLUTE_CEILING_MS,
-  CLAIM_STUCK_MS,
-  SPAWN_GRACE_MS,
   _resetSweepRegistryForTesting,
   registerSweepKillFollowUp,
   _sweepSessionForTesting,
@@ -68,16 +63,15 @@ import type { Session } from './types.js';
 // these imports, so they are unaffected.
 
 // Shadow-mode flag. host-sweep captures SELF_HEAL_ENABLED as a module-level
-// const, so the mock exposes it as a getter over a mutable box that individual
-// tests flip via armSelfHeal().
+// const, so the mock exposes it as a getter over a mutable box.
 const selfHeal = vi.hoisted(() => ({ enabled: false }));
 // DATA_DIR is redirected at a per-run temp root so anything in this file that
 // resolves a session path (the mailbox seam's `sessionMailboxPath`, heartbeats,
 // `sessionsBaseDir`) can never reach the real install's data directory.
-const testDataDir = vi.hoisted(() => {
-  const nodeFs = require('fs') as typeof import('fs');
-  const nodeOs = require('os') as typeof import('os');
-  const nodePath = require('path') as typeof import('path');
+const testDataDir = await vi.hoisted(async () => {
+  const nodeFs = await import('fs');
+  const nodeOs = await import('os');
+  const nodePath = await import('path');
   return { dir: nodeFs.mkdtempSync(nodePath.join(nodeOs.tmpdir(), 'host-sweep-data-')) };
 });
 vi.mock('./config.js', async (importOriginal) => {
@@ -92,10 +86,6 @@ vi.mock('./config.js', async (importOriginal) => {
     },
   };
 });
-
-function armSelfHeal(enabled: boolean): void {
-  selfHeal.enabled = enabled;
-}
 
 const mockKillContainer = vi.fn();
 const mockReadContainerConfig = vi.fn();
@@ -157,80 +147,6 @@ vi.mock('./db/sessions.js', async (importOriginal) => {
   };
 });
 
-// ─── Class 1: failed-provider self-heal ──────────────────────────────────────
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Orphan claim cleanup (regression test for the SIGKILL → claim-stuck loop)
-//
-// Repro of the production bug seen 2026-04-30: container A claimed message M
-// (writes processing_ack row with status='processing'). Host kills A by
-// absolute-ceiling. Old behavior: messages_in.M was reset to pending but
-// processing_ack.M survived. On the next sweep tick, wakeContainer spawned B,
-// the same-tick SLA check saw M's stale claim age (hours), and SIGKILL'd B
-// before agent-runner could run clearStaleProcessingAcks(). Loop. The fix
-// deletes processing_ack 'processing' rows when the host kills/cleans the
-// container, breaking the loop atomically.
-// ─────────────────────────────────────────────────────────────────────────────
-
-function makeSessionDbs(): {
-  inDb: Database.Database;
-  outDb: Database.Database;
-  mailbox: NanoclawMailboxSession;
-} {
-  const inDb = new Database(':memory:');
-  inDb.exec(`
-    CREATE TABLE messages_in (
-      id            TEXT PRIMARY KEY,
-      seq           INTEGER UNIQUE,
-      kind          TEXT NOT NULL,
-      timestamp     TEXT NOT NULL,
-      status        TEXT DEFAULT 'pending',
-      process_after TEXT,
-      recurrence    TEXT,
-      series_id     TEXT,
-      tries         INTEGER DEFAULT 0,
-      trigger       INTEGER NOT NULL DEFAULT 1,
-      platform_id   TEXT,
-      channel_type  TEXT,
-      thread_id     TEXT,
-      content       TEXT NOT NULL,
-      source_session_id TEXT,
-      on_wake       INTEGER NOT NULL DEFAULT 0
-    );
-    CREATE TABLE session_routing (
-      id            INTEGER PRIMARY KEY CHECK (id = 1),
-      channel_type  TEXT,
-      platform_id   TEXT,
-      thread_id     TEXT
-    );
-  `);
-  const outDb = new Database(':memory:');
-  outDb.exec(`
-    CREATE TABLE processing_ack (
-      message_id     TEXT PRIMARY KEY,
-      status         TEXT NOT NULL,
-      status_changed TEXT NOT NULL
-    );
-    CREATE TABLE messages_out (
-      id          TEXT PRIMARY KEY,
-      seq         INTEGER UNIQUE,
-      in_reply_to TEXT,
-      timestamp   TEXT NOT NULL,
-      kind        TEXT NOT NULL,
-      content     TEXT NOT NULL
-    );
-    CREATE TABLE session_state (
-      key        TEXT PRIMARY KEY,
-      value      TEXT NOT NULL,
-      updated_at TEXT NOT NULL
-    );
-  `);
-  // The exact session surface the registered mailbox hands an action, built
-  // over these in-memory handles by the production composer — so a test drives
-  // the same ops the sweep does, without a temp directory.
-  return { inDb, outDb, mailbox: composeNanoclawSession(inDb, () => outDb) };
-}
-
 function fakeSession(): Session {
   return {
     id: 'sess-test',
@@ -285,84 +201,6 @@ describe('parseSqliteUtc', () => {
     expect(parseSqliteUtc(bare)).toBe(Date.parse(bare + 'Z'));
   });
 });
-
-// ─────────────────────────────────────────────────────────────────────────────
-// kill-ceiling notify (Layer-3 fix)
-//
-// Background: host-sweep used to silently reap a stale-heartbeat container
-// after ABSOLUTE_CEILING_MS (30 min). Users waiting on a wedged agent saw
-// nothing for the entire window, then the container came back as if
-// nothing happened. `notifyKillCeiling` writes a chat outbound on the
-// session's primary route before kill, so the user gets a "resend please"
-// signal within a sweep tick of the heartbeat going stale.
-// ─────────────────────────────────────────────────────────────────────────────
-
-function makeNotifyTestDbs(opts?: { withRouting?: boolean; recentNotice?: boolean }): {
-  inDb: Database.Database;
-  outDb: Database.Database;
-  mailbox: NanoclawMailboxSession;
-} {
-  const inDb = new Database(':memory:');
-  inDb.exec(`
-    CREATE TABLE session_routing (
-      id            INTEGER PRIMARY KEY CHECK (id = 1),
-      channel_type  TEXT,
-      platform_id   TEXT,
-      thread_id     TEXT,
-      spawn_task_id TEXT,
-      session_id    TEXT
-    );
-    CREATE TABLE messages_in (
-      id            TEXT PRIMARY KEY,
-      seq           INTEGER UNIQUE,
-      kind          TEXT NOT NULL,
-      timestamp     TEXT NOT NULL,
-      status        TEXT DEFAULT 'pending',
-      process_after TEXT,
-      recurrence    TEXT,
-      series_id     TEXT,
-      tries         INTEGER DEFAULT 0,
-      trigger       INTEGER NOT NULL DEFAULT 1,
-      platform_id   TEXT,
-      channel_type  TEXT,
-      thread_id     TEXT,
-      content       TEXT NOT NULL,
-      source_session_id TEXT,
-      on_wake       INTEGER NOT NULL DEFAULT 0
-    );
-  `);
-  if (opts?.withRouting !== false) {
-    inDb
-      .prepare(
-        `INSERT INTO session_routing (id, channel_type, platform_id, thread_id)
-         VALUES (1, 'slack', 'C-TEST', 'T-TEST')`,
-      )
-      .run();
-  }
-  const outDb = new Database(':memory:');
-  outDb.exec(`
-    CREATE TABLE messages_out (
-      id           TEXT PRIMARY KEY,
-      seq          INTEGER UNIQUE,
-      in_reply_to  TEXT,
-      timestamp    TEXT NOT NULL,
-      kind         TEXT NOT NULL,
-      platform_id  TEXT,
-      channel_type TEXT,
-      thread_id    TEXT,
-      content      TEXT NOT NULL
-    );
-  `);
-  if (opts?.recentNotice) {
-    outDb
-      .prepare(
-        `INSERT INTO messages_out (id, seq, timestamp, kind, content)
-         VALUES ('prior', 1, datetime('now'), 'chat', '{"_system":{"kind":"agent_restart_inactivity"}}')`,
-      )
-      .run();
-  }
-  return { inDb, outDb, mailbox: composeNanoclawSession(inDb, () => outDb) };
-}
 
 // shouldReapIdleTaskContainer / shouldReapIdleChatContainer cases moved to
 // src/modules/sweep-idle-reap/idle-reap.test.ts (seam 2, S2-PR3 — F-3.1).

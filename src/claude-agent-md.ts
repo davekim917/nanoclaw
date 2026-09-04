@@ -112,7 +112,7 @@ function extractScalar(frontmatter: string, key: string): string | null {
     const m = line.match(/^([A-Za-z_][A-Za-z0-9_-]*)\s*:\s*(.*)$/);
     if (!m) continue;
     if (m[1] !== key) continue;
-    let value = m[2].trim();
+    const value = m[2].trim();
 
     // Folded block scalar: `key: |` then indented lines below.
     if (value === '|' || value === '|-' || value === '|+' || value === '>') {

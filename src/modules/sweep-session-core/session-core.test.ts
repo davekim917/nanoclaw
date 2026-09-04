@@ -68,10 +68,10 @@ afterEach(() => {
 // Only the seams the four duties (and S5, which F-9.2 must run past) actually
 // reach. `DATA_DIR` is redirected so nothing here can resolve a real session
 // path even by accident.
-const testDataDir = vi.hoisted(() => {
-  const nodeFs = require('fs') as typeof import('fs');
-  const nodeOs = require('os') as typeof import('os');
-  const nodePath = require('path') as typeof import('path');
+const testDataDir = await vi.hoisted(async () => {
+  const nodeFs = await import('fs');
+  const nodeOs = await import('os');
+  const nodePath = await import('path');
   return { dir: nodeFs.mkdtempSync(nodePath.join(nodeOs.tmpdir(), 'sweep-session-core-')) };
 });
 vi.mock('../../config.js', async (importOriginal) => {

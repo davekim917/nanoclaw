@@ -11,7 +11,6 @@
  * drives a full sweep tick through the registry) asserts it stayed empty.
  */
 import fs from 'fs';
-import os from 'os';
 import path from 'path';
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -113,10 +112,10 @@ describe('shouldReapIdleTaskContainer and shouldReapIdleChatContainer keep their
 // its declared order. Harness follows src/host-sweep-registry.test.ts (R-10 /
 // R-4's pattern) — mocks every seam host-sweep.ts reaches for on this path.
 
-const h = vi.hoisted(() => {
-  const nodeFs = require('fs') as typeof import('fs');
-  const nodeOs = require('os') as typeof import('os');
-  const nodePath = require('path') as typeof import('path');
+const h = await vi.hoisted(async () => {
+  const nodeFs = await import('fs');
+  const nodeOs = await import('os');
+  const nodePath = await import('path');
   return {
     dataDir: nodeFs.mkdtempSync(nodePath.join(nodeOs.tmpdir(), 'sweep-idle-reap-')),
     sessions: [] as Session[],
@@ -401,7 +400,7 @@ const fakeStore: AgentMailbox = {
   destroy: async () => undefined,
   runnerContext: async () => ({}),
   runnerEnvironment: async () => ({}),
-  session: async <T>(key: MailboxSessionKey, action: (mailbox: MailboxSession) => T | Promise<T>): Promise<T> =>
+  session: async <T>(_key: MailboxSessionKey, action: (mailbox: MailboxSession) => T | Promise<T>): Promise<T> =>
     action(h.mailbox as unknown as MailboxSession),
 };
 

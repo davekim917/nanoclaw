@@ -50,7 +50,7 @@ export function findCodexSkillsRoot(dir: string): string | null {
  */
 export function materializeSymlinkedSkills(dir: string, skillsRoot: string, dryRun = false): string {
   const srcRoot = path.join(dir, skillsRoot);
-  let entries: string[] = [];
+  let entries: string[];
   try {
     entries = fs.readdirSync(srcRoot);
   } catch {
@@ -106,7 +106,7 @@ export function refreshMaterializedCodexSkills(
   pluginsRoot = path.join(os.homedir(), 'plugins'),
 ): MaterializeRefreshResult {
   const refreshed: string[] = [];
-  let names: string[] = [];
+  let names: string[];
   try {
     names = fs.readdirSync(pluginsRoot);
   } catch {

@@ -15,10 +15,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 // ── hoisted state the mock factories read ────────────────────────────────────
 
-const h = vi.hoisted(() => {
-  const nodeFs = require('fs') as typeof import('fs');
-  const nodeOs = require('os') as typeof import('os');
-  const nodePath = require('path') as typeof import('path');
+const h = await vi.hoisted(async () => {
+  const nodeFs = await import('fs');
+  const nodeOs = await import('os');
+  const nodePath = await import('path');
   return {
     dataDir: nodeFs.mkdtempSync(nodePath.join(nodeOs.tmpdir(), 'sweep-usage-')),
     spawns: [] as string[],

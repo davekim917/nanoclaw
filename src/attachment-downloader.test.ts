@@ -2,10 +2,10 @@ import fs from 'fs';
 import path from 'path';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
-const { tmpRoot } = vi.hoisted(() => {
-  const fsMod = require('fs') as typeof import('fs');
-  const osMod = require('os') as typeof import('os');
-  const pathMod = require('path') as typeof import('path');
+const { tmpRoot } = await vi.hoisted(async () => {
+  const fsMod = await import('fs');
+  const osMod = await import('os');
+  const pathMod = await import('path');
   return { tmpRoot: fsMod.mkdtempSync(pathMod.join(osMod.tmpdir(), 'attach-dl-')) };
 });
 

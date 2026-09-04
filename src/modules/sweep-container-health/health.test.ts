@@ -9,7 +9,6 @@
  * registry-level exclusivity or the CodexItem-specific widening in isolation.
  */
 import fs from 'fs';
-import os from 'os';
 import path from 'path';
 
 import Database from 'better-sqlite3';
@@ -94,10 +93,10 @@ afterEach(() => {
 // a separate test file (vi.mock is per-file).
 
 const selfHeal = vi.hoisted(() => ({ enabled: false }));
-const testDataDir = vi.hoisted(() => {
-  const nodeFs = require('fs') as typeof import('fs');
-  const nodeOs = require('os') as typeof import('os');
-  const nodePath = require('path') as typeof import('path');
+const testDataDir = await vi.hoisted(async () => {
+  const nodeFs = await import('fs');
+  const nodeOs = await import('os');
+  const nodePath = await import('path');
   return { dir: nodeFs.mkdtempSync(nodePath.join(nodeOs.tmpdir(), 'sweep-container-health-')) };
 });
 vi.mock('../../config.js', async (importOriginal) => {
