@@ -23,6 +23,7 @@ const { TEST_DIR } = vi.hoisted(() => ({ TEST_DIR: uniqueTmpRoot('test-cli-tasks
 
 import { initTestDb, closeDb, runMigrations, createAgentGroup, getDb } from '../../db/index.js';
 import { createMessagingGroup } from '../../db/messaging-groups.js';
+import { ensureContainerConfig, updateContainerConfigScalars } from '../../db/container-configs.js';
 import { createSession, findSessionByAgentGroup, getSessionsByAgentGroup, taskThreadId } from '../../db/sessions.js';
 import { countDueMessages } from '../../db/session-db.js';
 import { inboundDbPath, initSessionFolder } from '../../session-manager.js';
@@ -109,6 +110,185 @@ describe('tasks CLI resource', () => {
   afterEach(() => {
     closeDb();
     if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
+  });
+
+  it("computes an unscoped --process-after in EACH matched group's timezone", async () => {
+    // An unscoped host `tasks update` fans out across every active session,
+    // which can span groups whose timezone overrides differ. Computing the
+    // instant once from whichever group matched first would write one group's
+    // wall-clock reading onto another group's series.
+    createGroup('ag-tokyo');
+    createGroup('ag-kolkata');
+    ensureContainerConfig('ag-tokyo');
+    ensureContainerConfig('ag-kolkata');
+    updateContainerConfigScalars('ag-tokyo', { timezone: 'Asia/Tokyo' }); // UTC+9, no DST
+    updateContainerConfigScalars('ag-kolkata', { timezone: 'Asia/Kolkata' }); // UTC+5:30, no DST
+
+    const made: Record<string, { series_id: string; session_id: string }> = {};
+    for (const group of ['ag-tokyo', 'ag-kolkata']) {
+      const resp = await dispatch(
+        {
+          id: `create-${group}`,
+          command: 'tasks-create',
+          args: { group, prompt: 'digest', name: 'digest', process_after: '2026-01-15T09:00:00Z' },
+        },
+        { caller: 'host' },
+      );
+      expect(resp.ok).toBe(true);
+      if (!resp.ok) return;
+      made[group] = resp.data as { series_id: string; session_id: string };
+    }
+
+    // Force a shared series id so one unscoped update matches both groups —
+    // the exact collision the fan-out has to survive.
+    const sharedId = made['ag-tokyo'].series_id;
+    const kolkataDb = new Database(inboundDbPath('ag-kolkata', made['ag-kolkata'].session_id));
+    kolkataDb.prepare('UPDATE messages_in SET id = ?, series_id = ? WHERE kind = ?').run(sharedId, sharedId, 'task');
+    kolkataDb.close();
+
+    const updated = await dispatch(
+      { id: 'tz-fanout', command: 'tasks-update', args: { id: sharedId, process_after: '2026-10-01T09:00:00' } },
+      { caller: 'host' },
+    );
+    expect(updated.ok).toBe(true);
+
+    const processAfterOf = (group: string): string => {
+      const db = new Database(inboundDbPath(group, made[group].session_id), { readonly: true });
+      const row = db.prepare("SELECT process_after FROM messages_in WHERE kind = 'task'").get() as {
+        process_after: string;
+      };
+      db.close();
+      return row.process_after;
+    };
+
+    // 09:00 local: Tokyo is UTC+9, Kolkata UTC+5:30. One shared value for both
+    // would mean the fan-out used a single group's zone.
+    expect(processAfterOf('ag-tokyo')).toBe('2026-10-01T00:00:00.000Z');
+    expect(processAfterOf('ag-kolkata')).toBe('2026-10-01T03:30:00.000Z');
+  });
+
+  it('enforces the recurrence ceiling in EVERY matched timezone, not a representative one', async () => {
+    // The ceiling counts fires in a rolling 24h window, and that count is
+    // zone-dependent when a cron's fires cluster on one weekday. Pinned clock:
+    // Monday 2026-01-05T00:00:00Z, cron "0 19,20,21,22,23 * * 1".
+    //   Asia/Tokyo (+9)      → local Mon 09:00; window catches all 5 fires.
+    //   Pacific/Honolulu (-10) → local Sun 14:00; window ends before any fire.
+    // Validating only the first match would let the 5-fire cron through.
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-01-05T00:00:00.000Z'));
+    try {
+      createGroup('ag-honolulu');
+      createGroup('ag-tokyo-cap');
+      ensureContainerConfig('ag-honolulu');
+      ensureContainerConfig('ag-tokyo-cap');
+      updateContainerConfigScalars('ag-honolulu', { timezone: 'Pacific/Honolulu' });
+      updateContainerConfigScalars('ag-tokyo-cap', { timezone: 'Asia/Tokyo' });
+
+      const made: Record<string, { series_id: string; session_id: string }> = {};
+      // Honolulu first: it is the permissive zone, so it is what a
+      // first-match-wins validator would have used.
+      for (const group of ['ag-honolulu', 'ag-tokyo-cap']) {
+        const r = await dispatch(
+          {
+            id: `cap-create-${group}`,
+            command: 'tasks-create',
+            args: { group, prompt: 'digest', name: 'capped', process_after: '2999-01-01T00:00:00Z' },
+          },
+          { caller: 'host' },
+        );
+        expect(r.ok).toBe(true);
+        if (!r.ok) return;
+        made[group] = r.data as { series_id: string; session_id: string };
+      }
+      const sharedId = made['ag-honolulu'].series_id;
+      const tdb = new Database(inboundDbPath('ag-tokyo-cap', made['ag-tokyo-cap'].session_id));
+      tdb.prepare('UPDATE messages_in SET id = ?, series_id = ? WHERE kind = ?').run(sharedId, sharedId, 'task');
+      tdb.close();
+
+      const updated = await dispatch(
+        { id: 'cap-update', command: 'tasks-update', args: { id: sharedId, recurrence: '0 19,20,21,22,23 * * 1' } },
+        { caller: 'host' },
+      );
+      expect(updated.ok).toBe(false);
+
+      // Rejected before any write: neither series took the new cron.
+      for (const group of ['ag-honolulu', 'ag-tokyo-cap']) {
+        const db = new Database(inboundDbPath(group, made[group].session_id), { readonly: true });
+        const row = db.prepare("SELECT recurrence FROM messages_in WHERE kind = 'task'").get() as {
+          recurrence: string | null;
+        };
+        db.close();
+        expect(row.recurrence).toBeNull();
+      }
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("excludes a same-id terminal row in another session from an unscoped update's validation set", async () => {
+    // selectTask() prioritizes a live row but falls back to terminal
+    // (completed/cancelled) history when a session has none for the matched
+    // id — right for getTask and the audit before/after lookups, wrong for
+    // the unscoped-update validation set, which must cover exactly the rows
+    // updateTask() can actually mutate. Left unfiltered, a scriptless
+    // terminal row in one session could subject a SCRIPTED live task in
+    // another session to the (script-exempt) recurrence ceiling.
+    createGroup('ag-terminal-a');
+    createGroup('ag-terminal-b');
+
+    const a = await dispatch(
+      {
+        id: 'create-a',
+        command: 'tasks-create',
+        args: {
+          group: 'ag-terminal-a',
+          prompt: 'digest',
+          name: 'scripted',
+          process_after: '2026-01-15T09:00:00Z',
+          script: 'echo \'{"wakeAgent": false}\'',
+        },
+      },
+      { caller: 'host' },
+    );
+    expect(a.ok).toBe(true);
+    if (!a.ok) return;
+    const { series_id: sharedId, session_id: sessionA } = a.data as { series_id: string; session_id: string };
+
+    const b = await dispatch(
+      {
+        id: 'create-b',
+        command: 'tasks-create',
+        args: { group: 'ag-terminal-b', prompt: 'digest', name: 'scriptless', process_after: '2026-01-15T09:00:00Z' },
+      },
+      { caller: 'host' },
+    );
+    expect(b.ok).toBe(true);
+    if (!b.ok) return;
+    const { session_id: sessionB } = b.data as { series_id: string; session_id: string };
+
+    // Force the same series id onto B's row, then terminate it — the exact
+    // shape selectTask()'s live-first fallback exists for.
+    const bDb = new Database(inboundDbPath('ag-terminal-b', sessionB));
+    bDb
+      .prepare("UPDATE messages_in SET id = ?, series_id = ?, status = 'cancelled' WHERE kind = ?")
+      .run(sharedId, sharedId, 'task');
+    bDb.close();
+
+    // Every 5 minutes comfortably exceeds the 4-fire/24h ceiling in any zone:
+    // rejected if B's scriptless terminal row is (wrongly) validated,
+    // accepted if it's excluded — A's own row IS scripted, so A is exempt.
+    const updated = await dispatch(
+      { id: 'terminal-exclude', command: 'tasks-update', args: { id: sharedId, recurrence: '*/5 * * * *' } },
+      { caller: 'host' },
+    );
+    expect(updated.ok).toBe(true);
+
+    const aDb = new Database(inboundDbPath('ag-terminal-a', sessionA), { readonly: true });
+    const row = aDb.prepare("SELECT recurrence FROM messages_in WHERE kind = 'task'").get() as {
+      recurrence: string | null;
+    };
+    aDb.close();
+    expect(row.recurrence).toBe('*/5 * * * *');
   });
 
   it('create writes the task into the group system session, not the caller chat session', async () => {
@@ -1183,6 +1363,61 @@ describe('tasks CLI resource', () => {
       expect(rows[0]!.before_hash).toBeNull();
       expect(rows[0]!.after_hash).toBeTruthy();
       expect(rows[0]!.ts).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/); // explicit ISO, not sqlite's naive default
+    });
+
+    it('records the instant it actually wrote, per group, on a schedule-only update', async () => {
+      // The written value and the audited value must be the same object. When
+      // the per-session merge happened at the write call while the audit read
+      // the pre-merge update, a schedule-only edit wrote a new instant and
+      // recorded nothing — and each group can receive a different instant.
+      createGroup('ag-audit-tokyo');
+      createGroup('ag-audit-kolkata');
+      ensureContainerConfig('ag-audit-tokyo');
+      ensureContainerConfig('ag-audit-kolkata');
+      updateContainerConfigScalars('ag-audit-tokyo', { timezone: 'Asia/Tokyo' });
+      updateContainerConfigScalars('ag-audit-kolkata', { timezone: 'Asia/Kolkata' });
+
+      const made: Record<string, { series_id: string }> = {};
+      for (const group of ['ag-audit-tokyo', 'ag-audit-kolkata']) {
+        const r = await dispatch(
+          {
+            id: `audit-create-${group}`,
+            command: 'tasks-create',
+            args: { group, prompt: 'digest', name: 'audited-digest', process_after: '2999-01-01T00:00:00Z' },
+          },
+          { caller: 'host' },
+        );
+        expect(r.ok).toBe(true);
+        if (!r.ok) return;
+        made[group] = r.data as { series_id: string };
+      }
+      const sharedId = made['ag-audit-tokyo'].series_id;
+      const kolkataSession = getSessionsByAgentGroup('ag-audit-kolkata').find(
+        (sess) => sess.thread_id === taskThreadId(made['ag-audit-kolkata'].series_id),
+      )!;
+      const kdb = new Database(inboundDbPath('ag-audit-kolkata', kolkataSession.id));
+      kdb.prepare('UPDATE messages_in SET id = ?, series_id = ? WHERE kind = ?').run(sharedId, sharedId, 'task');
+      kdb.close();
+
+      const updated = await dispatch(
+        { id: 'audit-tz', command: 'tasks-update', args: { id: sharedId, process_after: '2026-10-01T09:00:00' } },
+        { caller: 'host' },
+      );
+      expect(updated.ok).toBe(true);
+      if (!updated.ok) return;
+      // The reported field list names what changed, even though the only
+      // changed field is computed per session.
+      expect((updated.data as { fields: string[] }).fields).toContain('processAfter');
+
+      const details = (
+        getDb()
+          .prepare("SELECT agent_group_id, detail_json FROM scheduled_audit WHERE series_id = ? AND action = 'update'")
+          .all(sharedId) as Array<{ agent_group_id: string; detail_json: string | null }>
+      ).map((r) => ({ group: r.agent_group_id, processAfter: JSON.parse(r.detail_json ?? '{}').processAfter }));
+
+      expect(details).toHaveLength(2);
+      expect(details.find((d) => d.group === 'ag-audit-tokyo')?.processAfter).toBe('2026-10-01T00:00:00.000Z');
+      expect(details.find((d) => d.group === 'ag-audit-kolkata')?.processAfter).toBe('2026-10-01T03:30:00.000Z');
     });
 
     it('update writes before+after with differing hashes when the prompt changes', async () => {

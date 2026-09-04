@@ -4,6 +4,7 @@ import type Database from 'better-sqlite3';
 import { CronExpressionParser } from 'cron-parser';
 
 import { GROUPS_DIR, TIMEZONE } from '../../config.js';
+import { resolveGroupTimezone } from '../../container-config.js';
 import { getAgentGroup } from '../../db/agent-groups.js';
 import { getDb } from '../../db/connection.js';
 import { getMessagingGroup } from '../../db/messaging-groups.js';
@@ -35,7 +36,6 @@ import {
 import { resolveTaskFlagIntent } from '../../modules/scheduling/task-flags.js';
 import { writeAudit } from '../../dashboard/api/scheduled-shared.js';
 import { inboundDbPath, resolveTaskSession, withInboundDb } from '../../session-manager.js';
-import { formatLocalStamp, parseZonedToUtc } from '../../timezone.js';
 import { registerResource } from '../crud.js';
 import { appendRunLog } from '../../modules/scheduling/run-log.js';
 import { formatTasksTable } from '../format-tasks.js';
@@ -92,13 +92,13 @@ function actorFor(ctx: CallerContext): string {
   return ctx.caller === 'agent' ? `agent:${ctx.agentGroupId}` : 'host';
 }
 
-function firstRunIso(value: unknown, recurrence: string | null): string {
+function firstRunIso(value: unknown, recurrence: string | null, tz: string = TIMEZONE): string {
   if (str(value) === undefined && recurrence) {
-    const next = CronExpressionParser.parse(recurrence, { tz: TIMEZONE }).next().toISOString();
+    const next = CronExpressionParser.parse(recurrence, { tz }).next().toISOString();
     if (!next) throw new Error('recurrence did not produce a next run');
     return next;
   }
-  return parseProcessAfter(value);
+  return parseProcessAfter(value, tz);
 }
 
 function normalizeNullableString(value: unknown): string | null | undefined {
@@ -306,9 +306,12 @@ function createTask(args: Record<string, unknown>, ctx: CallerContext) {
   if (scriptHost && ctx.caller === 'agent') {
     throw new Error('--script-host runs the script on the host and can only be set by a host operator');
   }
-  validateRecurrence(recurrence);
-  enforceRecurrenceLimit(recurrence, bool(args.dangerously_override_recurrence_limit), script != null);
-  const processAfter = firstRunIso(args.process_after, recurrence);
+  // Wall-clock fields (--process-after, the cron grid) are interpreted in the
+  // owning group's timezone, not the install's.
+  const tz = resolveGroupTimezone(group);
+  validateRecurrence(recurrence, tz);
+  enforceRecurrenceLimit(recurrence, bool(args.dangerously_override_recurrence_limit), script != null, tz);
+  const processAfter = firstRunIso(args.process_after, recurrence, tz);
   const id = makeTaskId(args.name);
   const originSessionId = ctx.caller === 'agent' ? ctx.sessionId : null;
   const { routing, note: routingNote } = resolveTaskRouting(args, ctx);
@@ -545,31 +548,63 @@ function updateTaskCommand(args: Record<string, unknown>, ctx: CallerContext) {
   }
   if (chatLimitArg(args) !== undefined) update.chatLimit = chatLimitArg(args);
   if (args.quiet_status !== undefined) update.quietStatus = bool(args.quiet_status);
-  if (args.process_after !== undefined) update.processAfter = parseProcessAfter(args.process_after);
   const recurrence = normalizeNullableString(args.recurrence);
   const script = normalizeNullableString(args.script);
-  if (recurrence !== undefined) {
-    validateRecurrence(recurrence);
-    // Effective script AFTER this update: the new value when provided
-    // (including an explicit clear), else whatever the task already has.
-    let scriptAfter: string | null = script !== undefined ? script : null;
-    if (script === undefined) {
-      for (const session of selectedSessions(args, ctx)) {
-        const row = withInbound(session, (db) => selectTask(db, id));
-        if (row) {
-          scriptAfter = parseContent(row.content).script;
-          break;
-        }
-      }
+
+  // An unscoped host `tasks update` fans out across every active session,
+  // which can span groups with different timezone overrides. There is no
+  // representative zone here: the persisted instant differs per group, and so
+  // does the recurrence ceiling, which counts fires in a rolling 24h window —
+  // a cron whose fires cluster on one weekday can be past that window in one
+  // zone and still inside it in another. So EVERY matched session validates in
+  // its own zone, and all of that happens before the first write.
+  //
+  // codex: selectTask() prioritizes a live row but falls back to terminal
+  // (completed/cancelled) history when a session has none — right for getTask
+  // and the audit before/after lookups below, which want that history, but
+  // WRONG here: updateTask() only ever mutates pending/paused rows, so a
+  // terminal row can never be one of the writes this validates for. Left
+  // unfiltered, a live series edited in one session can be rejected by a
+  // same-id terminal row's stale script/timezone in a different one. Require
+  // live status at the one place `matched` is built, rather than in
+  // selectTask() itself, which other callers rely on for terminal history.
+  const matched = selectedSessions(args, ctx)
+    .map((session) => ({ session, row: withInbound(session, (db) => selectTask(db, id)) }))
+    .filter(
+      (m): m is { session: ScopedSession; row: TaskRow } =>
+        m.row !== undefined && (m.row.status === 'pending' || m.row.status === 'paused'),
+    );
+
+  const validationZones =
+    matched.length > 0
+      ? matched.map((m) => ({ tz: resolveGroupTimezone(m.session.agent_group_id), row: m.row }))
+      : // Nothing matched: still validate the input shape so a typo is reported
+        // as one, rather than as "no live task matched".
+        [{ tz: TIMEZONE, row: undefined }];
+
+  for (const { tz, row } of validationZones) {
+    if (args.process_after !== undefined) parseProcessAfter(args.process_after, tz);
+    if (recurrence !== undefined) {
+      validateRecurrence(recurrence, tz);
+      // Effective script AFTER this update: the new value when provided
+      // (including an explicit clear), else whatever THIS task already has.
+      const scriptAfter: string | null = script !== undefined ? script : row ? parseContent(row.content).script : null;
+      enforceRecurrenceLimit(recurrence, bool(args.dangerously_override_recurrence_limit), scriptAfter != null, tz);
     }
-    enforceRecurrenceLimit(recurrence, bool(args.dangerously_override_recurrence_limit), scriptAfter != null);
-    update.recurrence = recurrence;
-    // A new cron with the old armed timestamp fires off the new grid (or a
-    // day late). Unless the caller pinned --process-after explicitly,
-    // re-derive the next fire from the new expression.
-    if (recurrence !== null && args.process_after === undefined) {
-      update.processAfter = CronExpressionParser.parse(recurrence, { tz: TIMEZONE }).next().toDate().toISOString();
-    }
+  }
+  if (recurrence !== undefined) update.recurrence = recurrence;
+
+  // A new cron with the old armed timestamp fires off the new grid (or a day
+  // late). Unless the caller pinned --process-after explicitly, re-derive the
+  // next fire from the new expression — in the receiving group's zone.
+  const rearmFromCron = recurrence !== undefined && recurrence !== null && args.process_after === undefined;
+  const hasWallClockUpdate = args.process_after !== undefined || rearmFromCron;
+
+  function wallClockUpdate(agentGroupId: string): TaskUpdate {
+    if (!hasWallClockUpdate) return {};
+    const tz = resolveGroupTimezone(agentGroupId);
+    if (args.process_after !== undefined) return { processAfter: parseProcessAfter(args.process_after, tz) };
+    return { processAfter: CronExpressionParser.parse(recurrence!, { tz }).next().toDate().toISOString() };
   }
   if (script !== undefined) update.script = script;
   if (args.script_host !== undefined) {
@@ -597,11 +632,19 @@ function updateTaskCommand(args: Record<string, unknown>, ctx: CallerContext) {
     if (flagError) throw new Error(flagError);
     if (flagIntent && (flagIntent.turnModel || flagIntent.turnEffort)) update.flagIntent = flagIntent;
   }
-  const fields = Object.keys(update);
+  // `wallClockUpdate` contributes exactly one key when it contributes any, so
+  // the reported field list is the same for every session even though the
+  // instant behind `processAfter` differs per group.
+  const fields = hasWallClockUpdate ? [...Object.keys(update), 'processAfter'] : Object.keys(update);
   if (fields.length === 0) throw new Error('nothing to update');
 
   let touched = 0;
-  for (const session of selectedSessions(args, ctx)) {
+  for (const { session } of matched) {
+    // One value per session, and the ONLY one: what gets written is what gets
+    // audited and what gets reported. Merging the per-session part at the
+    // `updateTask` call while the audit kept reading the pre-merge object is
+    // how a schedule-only update wrote a new instant and recorded nothing.
+    const sessionUpdate: TaskUpdate = { ...update, ...wallClockUpdate(session.agent_group_id) };
     const result = withInbound(session, (db) => {
       const before = selectTask(db, id);
       // Close the indirect path to host execution: an agent swapping the
@@ -610,14 +653,14 @@ function updateTaskCommand(args: Record<string, unknown>, ctx: CallerContext) {
       // clears the flag, reject.
       if (
         ctx.caller === 'agent' &&
-        update.script !== undefined &&
-        update.scriptHost !== false &&
+        sessionUpdate.script !== undefined &&
+        sessionUpdate.scriptHost !== false &&
         before &&
         parseContent(before.content).scriptHost
       ) {
         throw new Error('this series runs its script on the host — an operator must make script changes');
       }
-      const n = updateTask(db, id, update);
+      const n = updateTask(db, id, sessionUpdate);
       return { before, n };
     });
     if (!result) continue;
@@ -631,11 +674,13 @@ function updateTaskCommand(args: Record<string, unknown>, ctx: CallerContext) {
         sessionId: session.id,
         seriesId: id,
         before: before ? parseContent(before.content).prompt : undefined,
-        ...(update.prompt !== undefined ? { after: update.prompt } : {}),
-        ...(update.script !== undefined && update.script !== null ? { scriptAfter: update.script } : {}),
+        ...(sessionUpdate.prompt !== undefined ? { after: sessionUpdate.prompt } : {}),
+        ...(sessionUpdate.script !== undefined && sessionUpdate.script !== null
+          ? { scriptAfter: sessionUpdate.script }
+          : {}),
         detail: {
-          ...(update.recurrence !== undefined ? { recurrence: update.recurrence } : {}),
-          ...(update.processAfter !== undefined ? { processAfter: update.processAfter } : {}),
+          ...(sessionUpdate.recurrence !== undefined ? { recurrence: sessionUpdate.recurrence } : {}),
+          ...(sessionUpdate.processAfter !== undefined ? { processAfter: sessionUpdate.processAfter } : {}),
         },
       });
     }
@@ -741,7 +786,7 @@ registerResource({
       // cron grid (firstRunIso). Required only for one-shots, enforced in the
       // create handler — so the generic col.required validator must stay off here.
       description:
-        'Next run time (ISO 8601 or naive local). Required for one-shots; with --recurrence the first run is derived from the cron grid.',
+        "Next run time (ISO 8601, or naive wall-clock read in the owning group's timezone). Required for one-shots; with --recurrence the first run is derived from the cron grid, also in that timezone.",
       updatable: true,
     },
     { name: 'recurrence', type: 'string', description: 'Optional cron expression.', updatable: true },
@@ -791,7 +836,7 @@ registerResource({
       access: 'open',
       description:
         `Create a scheduled task (recurring or one-shot) in the agent group system session.\n\n` +
-        `Requires --prompt plus EITHER --recurrence (recurring; first run derived from the cron grid) OR --process-after (one-shot, ISO 8601 or naive local). Always pass --name for a readable id.\n\n` +
+        `Requires --prompt plus EITHER --recurrence (recurring; first run derived from the cron grid) OR --process-after (one-shot, ISO 8601 or naive wall-clock in the group's timezone). Always pass --name for a readable id.\n\n` +
         `--script contract (pre-task gate, runs BEFORE the agent wakes):\n` +
         `  bash, 30s timeout, 1MB output cap. Its LAST stdout line must be JSON:\n` +
         `    {"wakeAgent": <bool>, "data": {...}}\n` +
@@ -830,7 +875,8 @@ registerResource({
         {
           name: 'process_after',
           type: 'string',
-          description: 'First/next run time (ISO 8601 or naive local). Required for one-shots.',
+          description:
+            "First/next run time (ISO 8601, or naive wall-clock read in the owning group's timezone). Required for one-shots.",
         },
         {
           name: 'script',
@@ -945,7 +991,11 @@ registerResource({
       args: [
         { name: 'id', type: 'string', description: 'Task series id.', required: true },
         { name: 'prompt', type: 'string', description: 'Replace the task prompt.' },
-        { name: 'process_after', type: 'string', description: 'New next-run time (ISO 8601 or naive local).' },
+        {
+          name: 'process_after',
+          type: 'string',
+          description: "New next-run time (ISO 8601, or naive wall-clock read in the owning group's timezone).",
+        },
         {
           name: 'chat_limit',
           type: 'string',

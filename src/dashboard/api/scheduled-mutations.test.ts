@@ -74,6 +74,8 @@ function setupCentralDb(): void {
     CREATE TABLE sessions (id TEXT PRIMARY KEY, agent_group_id TEXT NOT NULL, messaging_group_id TEXT, thread_id TEXT, agent_provider TEXT, status TEXT DEFAULT 'active', container_status TEXT DEFAULT 'stopped', last_active TEXT, created_at TEXT NOT NULL);
     CREATE TABLE users (id TEXT PRIMARY KEY, kind TEXT NOT NULL, display_name TEXT, created_at TEXT NOT NULL);
     CREATE TABLE user_roles (user_id TEXT NOT NULL, role TEXT NOT NULL, agent_group_id TEXT, granted_by TEXT, granted_at TEXT NOT NULL, PRIMARY KEY (user_id, role, agent_group_id));
+    -- Cron edits resolve the owning group's timezone override (resolveGroupTimezone).
+    CREATE TABLE container_configs (agent_group_id TEXT PRIMARY KEY, timezone TEXT, updated_at TEXT);
   `);
   migration043.up(db);
   db.prepare("INSERT INTO agent_groups (id, name, folder, created_at) VALUES (?, ?, ?, datetime('now'))").run(

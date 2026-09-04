@@ -24,10 +24,10 @@ import {
   ONECLI_API_KEY,
   ONECLI_URL,
   TASK_SCRIPT_TIMEOUT_MS,
-  TIMEZONE,
   WORKGROUP_SHARED_FS,
 } from './config.js';
 import {
+  effectiveTimezone,
   readContainerConfig,
   readContainerConfigForSpawn,
   validateMcpServers,
@@ -3314,7 +3314,14 @@ async function buildContainerArgs(
   // Environment — only vars read by code we don't own.
   // Everything NanoClaw-specific is in container.json (read by runner at startup).
   for (const [key, value] of Object.entries(mailboxEnvironment ?? {})) args.push('-e', `${key}=${value}`);
-  args.push('-e', `TZ=${TIMEZONE}`);
+  // A per-group timezone override rides container.json (mirrored there by the
+  // ncl write paths). The verdict comes from `effectiveTimezone`, the same
+  // predicate `resolveGroupTimezone` applies to the DB row, so the container's
+  // POSIX `TZ` and the host's scheduling grid can never disagree about which
+  // override is honoured. Anything unconfirmed falls back to the install
+  // timezone rather than to UTC, so a hand-edited file can't silently move an
+  // agent's clock.
+  args.push('-e', `TZ=${effectiveTimezone(containerConfig.timezone)}`);
 
   // Claude Code behavior locks — duplicated from settings.json env block so
   // the values are set regardless of the SDK's settings-loading order.

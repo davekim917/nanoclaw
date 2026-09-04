@@ -9,7 +9,12 @@ import fs from 'fs';
 import path from 'path';
 
 import { GROUPS_DIR } from './config.js';
-import { validateMcpServers, type McpServerConfig, type AdditionalMountConfig } from './container-config.js';
+import {
+  honouredTimezoneOverride,
+  validateMcpServers,
+  type McpServerConfig,
+  type AdditionalMountConfig,
+} from './container-config.js';
 import { getAllAgentGroups } from './db/agent-groups.js';
 import { getContainerConfig, createContainerConfig } from './db/container-configs.js';
 import { log } from './log.js';
@@ -24,6 +29,7 @@ interface LegacyContainerJson {
   provider?: string;
   assistantName?: string;
   maxMessagesPerPrompt?: number;
+  timezone?: string;
 }
 
 export function backfillContainerConfigs(): void {
@@ -66,6 +72,9 @@ export function backfillContainerConfigs(): void {
       additional_mounts: JSON.stringify(legacy.additionalMounts ?? []),
       cli_scope: 'group',
       security_json: null,
+      // Follow the install-global timezone; a legacy container.json may already
+      // carry an override, which the spawn path reads from the file directly.
+      timezone: honouredTimezoneOverride(legacy.timezone) ?? null,
       updated_at: new Date().toISOString(),
     };
 

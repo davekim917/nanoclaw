@@ -52,6 +52,8 @@ function setupCentralDb(): void {
       id TEXT PRIMARY KEY, agent_group_id TEXT NOT NULL, messaging_group_id TEXT,
       thread_id TEXT, status TEXT DEFAULT 'active', created_at TEXT NOT NULL
     );
+    -- Health derivation resolves the owning group's timezone override.
+    CREATE TABLE container_configs (agent_group_id TEXT PRIMARY KEY, timezone TEXT, updated_at TEXT);
     CREATE TABLE users (id TEXT PRIMARY KEY, kind TEXT NOT NULL, display_name TEXT, created_at TEXT NOT NULL);
     CREATE TABLE user_roles (user_id TEXT NOT NULL, role TEXT NOT NULL, agent_group_id TEXT, granted_by TEXT, granted_at TEXT NOT NULL, PRIMARY KEY (user_id, role, agent_group_id));
   `);

@@ -12,6 +12,7 @@
  * with the host caller — same code path a real approval would take.
  */
 import fs from 'fs';
+import path from 'path';
 import { describe, expect, it, beforeEach, afterEach, vi } from 'vitest';
 
 vi.mock('../../container-runner.js', () => ({
@@ -501,6 +502,121 @@ describe('groups CLI resource config', () => {
     // assistant_name IS mirrored — the spawn path reads it from the file, so
     // a DB-only write would silently keep the old name (same trap as provider).
     expect(readContainerConfig(folder).assistantName).toBe('Renamed');
+  });
+
+  it('test_groups_create_timezone_lands_in_the_db_row_not_only_container_json', async () => {
+    // initGroupFilesystem deliberately skips the container_configs insert, so
+    // without an explicit stamp the scalar write here updates zero rows — the
+    // container would get the requested zone while host-side scheduling kept
+    // following the install one until the next startup backfill.
+    const response = await dispatch(
+      {
+        id: 'req-create-tz',
+        command: 'groups-create',
+        args: { folder: 'created-with-tz', name: 'Created With TZ', timezone: 'Europe/Lisbon' },
+      },
+      { caller: 'host' },
+    );
+    expect(response.ok).toBe(true);
+    if (!response.ok) return;
+
+    const created = response.data as { id: string; folder: string };
+    expect(getContainerConfig(created.id)?.timezone).toBe('Europe/Lisbon');
+    expect(readContainerConfig(created.folder).timezone).toBe('Europe/Lisbon');
+  });
+
+  it('test_groups_config_update_timezone_dual_writes_and_clears', async () => {
+    // Same trap as provider: scheduling reads the DB row, the container's TZ
+    // env comes from container.json. A one-sided write splits the two.
+    const id = 'ag-timezone';
+    const folder = 'timezone-group';
+    createAgentGroup({ id, name: folder, folder, agent_provider: null, created_at: now() });
+    ensureContainerConfig(id);
+    const groupDir = `${TEST_DIR}/groups/${folder}`;
+    fs.mkdirSync(groupDir, { recursive: true });
+    fs.writeFileSync(
+      `${groupDir}/container.json`,
+      JSON.stringify({ mcpServers: {}, packages: { apt: [], npm: [] }, skills: 'all' }) + '\n',
+    );
+
+    const set = await dispatch(
+      { id: 'req-tz-set', command: 'groups-config-update', args: { id, timezone: 'Europe/Lisbon' } },
+      { caller: 'host' },
+    );
+    expect(set.ok).toBe(true);
+    expect(getContainerConfig(id)?.timezone).toBe('Europe/Lisbon');
+    expect(readContainerConfig(folder).timezone).toBe('Europe/Lisbon');
+
+    // `--timezone ""` clears both sides back to the install default.
+    const clear = await dispatch(
+      { id: 'req-tz-clear', command: 'groups-config-update', args: { id, timezone: '' } },
+      { caller: 'host' },
+    );
+    expect(clear.ok).toBe(true);
+    expect(getContainerConfig(id)?.timezone).toBeNull();
+    expect(readContainerConfig(folder).timezone).toBeUndefined();
+  });
+
+  it('test_groups_config_update_rejects_a_fixed_offset_and_canonicalizes_an_alias', async () => {
+    const id = 'ag-timezone-canon';
+    const folder = 'timezone-canon';
+    createAgentGroup({ id, name: folder, folder, agent_provider: null, created_at: now() });
+    ensureContainerConfig(id);
+    const groupDir = `${TEST_DIR}/groups/${folder}`;
+    fs.mkdirSync(groupDir, { recursive: true });
+    fs.writeFileSync(
+      `${groupDir}/container.json`,
+      JSON.stringify({ mcpServers: {}, packages: { apt: [], npm: [] }, skills: 'all' }) + '\n',
+    );
+
+    // Intl accepts all of these; POSIX TZ reads them differently — "+01:00"
+    // with the opposite sign, "CST" as a zero-offset abbreviation, and
+    // "europe/lisbon" is not a zoneinfo path at all, since the lookup is a
+    // case-sensitive file path. None of these depends on which tzdata the
+    // machine carries, unlike a retired alias such as Asia/Calcutta, which is
+    // pruned on some hosts and shipped on others.
+    for (const bad of ['+01:00', '-05:00', 'CST', 'EST', 'europe/lisbon']) {
+      const rejected = await dispatch(
+        { id: `req-tz-${bad}`, command: 'groups-config-update', args: { id, timezone: bad } },
+        { caller: 'host' },
+      );
+      expect(rejected.ok).toBe(false);
+      expect(JSON.stringify(rejected)).toMatch(/invalid --timezone/);
+    }
+    expect(getContainerConfig(id)?.timezone).toBeNull();
+
+    // A spelling the zone database has is stored VERBATIM — no ICU rewriting.
+    // That is the whole point: ICU maps Asia/Kolkata onto Asia/Calcutta, whose
+    // file some hosts prune, so storing the resolved name would have handed
+    // the container a zone it cannot open. Which aliases exist varies by
+    // machine, so drive the case off the database rather than assuming.
+    const zoneExists = (tz: string): boolean => fs.existsSync(path.join('/usr/share/zoneinfo', tz));
+    const shipped = ['Europe/Lisbon', 'Asia/Tokyo', 'Asia/Kolkata', 'Europe/Kyiv'].filter(zoneExists);
+    expect(shipped.length).toBeGreaterThan(0);
+    for (const typed of shipped) {
+      const ok = await dispatch(
+        { id: `req-tz-canon-${typed}`, command: 'groups-config-update', args: { id, timezone: typed } },
+        { caller: 'host' },
+      );
+      expect(ok.ok).toBe(true);
+      expect(getContainerConfig(id)?.timezone).toBe(typed);
+      expect(readContainerConfig(folder).timezone).toBe(typed);
+    }
+  });
+
+  it('test_groups_config_update_rejects_a_non_iana_timezone', async () => {
+    const id = 'ag-timezone-bad';
+    const folder = 'timezone-bad';
+    createAgentGroup({ id, name: folder, folder, agent_provider: null, created_at: now() });
+    ensureContainerConfig(id);
+
+    const response = await dispatch(
+      { id: 'req-tz-bad', command: 'groups-config-update', args: { id, timezone: 'Not/AZone' } },
+      { caller: 'host' },
+    );
+    expect(response.ok).toBe(false);
+    expect(JSON.stringify(response)).toMatch(/invalid --timezone/);
+    expect(getContainerConfig(id)?.timezone).toBeNull();
   });
 
   it('test_legacy_gitnexus_key_is_behaviorally_inert', () => {

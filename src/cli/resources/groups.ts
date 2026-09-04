@@ -18,17 +18,41 @@ import { getDb, hasTable } from '../../db/connection.js';
 import { getSession } from '../../db/sessions.js';
 import { writeSessionMessage } from '../../session-manager.js';
 import {
+  ensureContainerConfig,
   getContainerConfig,
   updateContainerConfigScalars,
   updateContainerConfigJson,
 } from '../../db/container-configs.js';
 import { getDeniedModel } from '../../db/denied-models.js';
 import { assertValidGroupFolder } from '../../group-folder.js';
+import { canonicalizeIanaTimezone, timezoneRejectionReason } from '../../timezone.js';
 import { initGroupFilesystem } from '../../group-init.js';
 import { findSiblingParityDrifts } from '../../sibling-parity.js';
 import { createAgentFromTemplate } from '../../templates/create-agent.js';
 import type { AgentGroup, ContainerConfigRow } from '../../types.js';
 import { registerResource } from '../crud.js';
+
+/**
+ * Parse a --timezone flag: undefined = not passed, null = explicit clear
+ * (empty string → follow the install default), otherwise the CANONICAL IANA
+ * id. Invalid ids throw here, in the handler — for agent callers that is after
+ * approval (rare, self-healing: a retry raises a fresh card).
+ *
+ * Validated against the zone database, not merely Intl-acceptable: the stored
+ * string is handed to the container as POSIX `TZ` and opened there as a
+ * case-sensitive file path, so only a spelling the database actually has can
+ * keep host scheduling and the container clock on the same zone.
+ */
+function parseTimezoneFlag(value: unknown): string | null | undefined {
+  if (value === undefined) return undefined;
+  const tz = String(value);
+  if (tz === '') return null;
+  const canonical = canonicalizeIanaTimezone(tz);
+  if (canonical === null) {
+    throw new Error(`invalid --timezone: ${timezoneRejectionReason(tz)}. Pass "" to follow the install default`);
+  }
+  return canonical;
+}
 
 /** Deserialize JSON columns for display. */
 function presentConfig(row: ContainerConfigRow, folder?: string): Record<string, unknown> {
@@ -47,6 +71,7 @@ function presentConfig(row: ContainerConfigRow, folder?: string): Record<string,
     packages_npm: JSON.parse(row.packages_npm),
     additional_mounts: JSON.parse(row.additional_mounts),
     cli_scope: row.cli_scope,
+    timezone: row.timezone,
     resources: fileConfig?.resources ?? null,
     effective_resources: fileConfig ? resolveContainerResources(fileConfig.resources) : null,
     // Privilege overrides are the whole point of auditing this: a config that
@@ -114,11 +139,14 @@ registerResource({
       description:
         'Create (or return the existing) agent group with its container config. Idempotent on --folder. ' +
         'With --template <ref>, stamp from a local template under templates/ (MCP servers + instructions ' +
-        '+ skills + paused recurring tasks). Use --folder <slug> and --name <display name>.',
+        '+ skills + paused recurring tasks). Use --folder <slug> and --name <display name>. ' +
+        'Optional --timezone <IANA id> sets the group timezone (template task schedules fire in it); like --name, it is ignored when the folder already exists.',
       handler: async (args) => {
+        const timezone = parseTimezoneFlag(args.timezone) ?? undefined;
         if (args.template) {
           return createAgentFromTemplate(String(args.template), {
             name: args.name ? String(args.name) : undefined,
+            timezone,
           });
         }
         const folder = args.folder as string;
@@ -139,10 +167,23 @@ registerResource({
         // backfill ran (#2415). The template branch above provisions its own
         // config + folder in `createAgentFromTemplate`; this covers the bare
         // path. Mirrors what `setup/register.ts` does after creating an agent
-        // group via the setup flow. The config row is stamped with the
-        // instance default provider (`ensureContainerConfig` inside) — per-group
-        // `groups config update --provider` still wins.
+        // group via the setup flow.
         initGroupFilesystem(group);
+        // `initGroupFilesystem` deliberately does NOT insert the config row —
+        // its caller in the create-agent flow runs it before the agent_groups
+        // insert, where the FK would fail (see the note in group-init.ts). The
+        // row exists by here only because the insert above already ran, so
+        // stamp it explicitly. Idempotent (INSERT OR IGNORE), and without it
+        // the scalar write below silently updates zero rows and the group's
+        // scheduling keeps following the install timezone until the next host
+        // startup backfill.
+        ensureContainerConfig(id);
+        if (timezone) {
+          updateContainerConfigScalars(id, { timezone });
+          updateContainerConfig(folder, (config) => {
+            config.timezone = timezone;
+          });
+        }
         return getAgentGroupByFolder(folder);
       },
     },
@@ -350,7 +391,8 @@ registerResource({
       description:
         'Update container config fields. Changes are saved but do NOT take effect until you run `ncl groups restart`. ' +
         'Use --id <group-id> and scalar flags, or resource flags: --memory-request-mb, --memory-limit-mb, ' +
-        '--memory-swap-limit-mb, --cpus, --cpu-shares, --pids-limit.',
+        '--memory-swap-limit-mb, --cpus, --cpu-shares, --pids-limit. ' +
+        '--timezone takes an IANA id like "Europe/Lisbon" ("" clears back to the install default). Tasks created or edited afterwards use the new zone; an already-armed occurrence keeps its absolute fire time and the series moves onto the new grid at its next re-arm. The container clock follows after a restart.',
       handler: async (args) => {
         const id = args.id as string;
         if (!id) throw new Error('--id is required');
@@ -362,10 +404,19 @@ registerResource({
         const updates: Partial<
           Pick<
             ContainerConfigRow,
-            'provider' | 'model' | 'effort' | 'image_tag' | 'assistant_name' | 'max_messages_per_prompt' | 'cli_scope'
+            | 'provider'
+            | 'model'
+            | 'effort'
+            | 'image_tag'
+            | 'assistant_name'
+            | 'max_messages_per_prompt'
+            | 'cli_scope'
+            | 'timezone'
           >
         > = {};
         if (args.provider !== undefined) updates.provider = args.provider as string;
+        const timezone = parseTimezoneFlag(args.timezone);
+        if (timezone !== undefined) updates.timezone = timezone;
         if (args.model !== undefined) updates.model = args.model as string;
         if (args.effort !== undefined) updates.effort = args.effort as string;
         if (args.image_tag !== undefined) updates.image_tag = args.image_tag as string;
@@ -435,7 +486,8 @@ registerResource({
           updates.provider !== undefined ||
           updates.model !== undefined ||
           updates.effort !== undefined ||
-          updates.assistant_name !== undefined
+          updates.assistant_name !== undefined ||
+          updates.timezone !== undefined
         ) {
           updateContainerConfig(group.folder, (config) => {
             if (updates.provider !== undefined) config.provider = updates.provider as string;
@@ -443,6 +495,9 @@ registerResource({
             if (updates.effort !== undefined) config.effort = (updates.effort as string) || undefined;
             if (updates.assistant_name !== undefined)
               config.assistantName = (updates.assistant_name as string) || undefined;
+            // `--timezone ""` maps to null here, which must ERASE the field so
+            // the spawn falls back to the install timezone.
+            if (updates.timezone !== undefined) config.timezone = updates.timezone ?? undefined;
             return config;
           });
         }
