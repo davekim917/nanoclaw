@@ -15,7 +15,8 @@ import type { Adapter, Chat } from 'chat';
 
 const captured = vi.hoisted(() => ({ chat: null as unknown }));
 
-vi.mock('../webhook-server.js', () => ({
+vi.mock('../webhook-server.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../webhook-server.js')>()),
   registerWebhookAdapter: vi.fn((chat: unknown) => {
     captured.chat = chat;
   }),

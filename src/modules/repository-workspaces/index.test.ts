@@ -30,7 +30,8 @@ vi.mock('../../config.js', async () => {
   return { ...actual, DATA_DIR: hostActionDataDir };
 });
 
-vi.mock('../../container-restart.js', () => ({
+vi.mock('../../container-restart.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../container-restart.js')>()),
   RepositoryMountQuiescenceError: hostActionMocks.RepositoryMountQuiescenceError,
   quiesceSessionsForRepositoryMounts: hostActionMocks.quiesceSessionsForRepositoryMounts,
   releaseRepositoryMountQuiescence: hostActionMocks.releaseRepositoryMountQuiescence,

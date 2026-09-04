@@ -11,8 +11,14 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { log } from '../../log.js';
 import type { Session } from '../../types.js';
 
+// NOT spread: log.ts installs process-wide uncaughtException/unhandledRejection
+// handlers (including process.exit(1)) at module scope — importOriginal() would
+// install those in this test file's worker. Kept as a complete stub instead.
+// (davekim917/nanoclaw#355 review thread)
 vi.mock('../../log.js', () => ({
-  log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
+  setLogScrubber: vi.fn(),
+  log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn(), fatal: vi.fn() },
+  isSurvivableIoError: vi.fn(() => false),
 }));
 
 // The ack goes through the mailbox seam now (plan §4.5b) — `ackRow` opens its
@@ -27,7 +33,8 @@ let openMailbox: () => {
   markDeliveryFailed: (id: string, error?: string) => void;
 };
 let mailboxExists = true;
-vi.mock('../../session-manager.js', () => ({
+vi.mock('../../session-manager.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../session-manager.js')>()),
   // The real helper resolves `undefined` — without running the action — when
   // the session has no mailbox. That answer has to reach `ackRow`.
   withExistingMailboxSession: async (_agentGroupId: string, _sessionId: string, action: (m: unknown) => unknown) =>
@@ -44,7 +51,8 @@ function recordingMailbox(): ReturnType<typeof openMailbox> {
 }
 
 const releaseOrphans = vi.fn(async (_msg: { kind: string }, _session: Session) => null);
-vi.mock('../../repo-fence-recovery.js', () => ({
+vi.mock('../../repo-fence-recovery.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../repo-fence-recovery.js')>()),
   releaseOrphanedRepoIngressFencesForDroppedMessage: (msg: { kind: string }, session: Session) =>
     releaseOrphans(msg, session),
 }));

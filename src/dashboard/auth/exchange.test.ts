@@ -12,7 +12,8 @@ vi.mock('./cookie.js', async (importOriginal) => {
 });
 
 // Mock router.js register to avoid side-effect route table pollution
-vi.mock('../router.js', () => ({
+vi.mock('../router.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../router.js')>()),
   register: vi.fn(),
 }));
 

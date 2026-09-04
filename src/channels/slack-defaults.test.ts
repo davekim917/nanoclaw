@@ -14,7 +14,8 @@ const env = vi.hoisted(() => ({
   values: {} as Record<string, string>,
 }));
 
-vi.mock('../env.js', () => ({
+vi.mock('../env.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../env.js')>()),
   readEnvFileMatching: () => env.values,
   readEnvFile: () => env.values,
 }));

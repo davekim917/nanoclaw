@@ -205,7 +205,8 @@ vi.mock('../mailbox/index.js', async (importOriginal) => {
  * `runHostGatedTaskScripts` runs opted-in shell scripts — mocked outright, and
  * the tripwire above is what proves no real one ever ran.
  */
-vi.mock('../scheduling/host-script.js', () => ({
+vi.mock('../scheduling/host-script.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../scheduling/host-script.js')>()),
   runHostGatedTaskScripts: async (...args: unknown[]) => {
     calls.hostScripts.push(args);
     if (calls.hostScriptFails) throw new Error('host-gated script blew up');

@@ -15,7 +15,8 @@ vi.mock('./config.js', async (importOriginal) => ({
   GROUPS_DIR: path.join(TEST_ROOT, 'groups'),
 }));
 
-vi.mock('./capabilities.js', () => ({
+vi.mock('./capabilities.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./capabilities.js')>()),
   buildSessionServicesSnapshot: vi.fn((agentGroupId: string, messagingGroupId: string | null) => ({
     agentGroupId,
     services: [
@@ -43,9 +44,12 @@ vi.mock('./message-archive.js', async (importOriginal) => {
 // The formatter's routing lookup is orthogonal to this integration. Stub only
 // those two container DB readers so Node Vitest can exercise the real
 // provider-neutral formatting seam without importing bun:sqlite.
+// NOT spread: these modules transitively import `bun:sqlite`, which does not
+// resolve under Node Vitest — importOriginal() would throw at import time.
 vi.mock('../container/agent-runner/src/db/session-routing.js', () => ({
   getSessionRouting: () => ({ channel_type: null, platform_id: null, thread_id: null }),
 }));
+// NOT spread: same bun:sqlite constraint as session-routing.js above.
 vi.mock('../container/agent-runner/src/destinations.js', () => ({
   findByRouting: () => undefined,
 }));

@@ -2,7 +2,8 @@ import fs from 'fs';
 import { describe, expect, it, beforeEach, afterEach, vi } from 'vitest';
 
 const killed: Array<{ sessionId: string; reason: string }> = [];
-vi.mock('../../container-runner.js', () => ({
+vi.mock('../../container-runner.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../container-runner.js')>()),
   killContainer: vi.fn((sessionId: string, reason: string) => {
     killed.push({ sessionId, reason });
   }),

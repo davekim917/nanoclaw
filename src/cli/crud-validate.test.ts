@@ -1,7 +1,11 @@
 import { describe, it, expect, vi } from 'vitest';
 
-vi.mock('../db/connection.js', () => ({ getDb: vi.fn() }));
-vi.mock('../db/container-configs.js', () => ({
+vi.mock('../db/connection.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../db/connection.js')>()),
+  getDb: vi.fn(),
+}));
+vi.mock('../db/container-configs.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../db/container-configs.js')>()),
   getContainerConfig: vi.fn(() => ({ cli_scope: 'group' })),
 }));
 

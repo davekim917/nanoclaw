@@ -63,7 +63,8 @@ vi.mock('../../session-manager.js', async (importOriginal) => {
   };
 });
 
-vi.mock('../../container-runner.js', () => ({
+vi.mock('../../container-runner.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../container-runner.js')>()),
   wakeContainer: vi.fn().mockResolvedValue(true),
   killContainer: vi.fn(),
 }));
@@ -76,7 +77,8 @@ vi.mock('../../db/sessions.js', async (importOriginal) => {
   };
 });
 
-vi.mock('../../channels/channel-registry.js', () => ({
+vi.mock('../../channels/channel-registry.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../channels/channel-registry.js')>()),
   getChannelAdapter: vi.fn(),
   registerChannelAdapter: vi.fn(),
   getActiveAdapters: vi.fn().mockReturnValue([]),
@@ -712,7 +714,8 @@ describe('completeSpawnSideEffects', () => {
 
 // ── D6: emitDashboardEvent call-sites ────────────────────────────────────────
 
-vi.mock('../../dashboard/api/events.js', () => ({
+vi.mock('../../dashboard/api/events.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../dashboard/api/events.js')>()),
   emitDashboardEvent: vi.fn(),
   startSSEFeed: vi.fn(),
   stopSSEFeed: vi.fn(),

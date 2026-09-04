@@ -27,7 +27,10 @@ import { log } from '../../log.js';
 
 // Only needed by the one test that exercises the REAL createTask path; the rest
 // inject a recording createTask and never reach dispatch.
-vi.mock('../../cli/dispatch.js', () => ({ dispatch: vi.fn() }));
+vi.mock('../../cli/dispatch.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../cli/dispatch.js')>()),
+  dispatch: vi.fn(),
+}));
 
 // A call-through wrapper, not a stub: every test but one gets the real
 // classifier untouched. The one exception (`hostile re-read handling` below)

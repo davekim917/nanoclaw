@@ -6,9 +6,10 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 // hook fires with the inserted row — so mock the FS-touching helper and
 // keep only the DB side effect (`ensureContainerConfig`) as the observable.
 const ensureContainerConfigSpy = vi.fn();
-vi.mock('../group-init.js', async () => {
+vi.mock('../group-init.js', async (importOriginal) => {
   const { ensureContainerConfig } = await import('../db/container-configs.js');
   return {
+    ...(await importOriginal<typeof import('../group-init.js')>()),
     initGroupFilesystem: vi.fn((group: { id: string }) => {
       ensureContainerConfigSpy(group.id);
       ensureContainerConfig(group.id);
@@ -16,9 +17,14 @@ vi.mock('../group-init.js', async () => {
   };
 });
 
+// NOT spread: log.ts installs process-wide uncaughtException/unhandledRejection
+// handlers (including process.exit(1)) at module scope — importOriginal() would
+// install those in this test file's worker. Kept as a complete stub instead.
+// (davekim917/nanoclaw#355 review thread)
 vi.mock('../log.js', () => ({
-  log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
+  log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn(), fatal: vi.fn() },
   setLogScrubber: vi.fn(),
+  isSurvivableIoError: vi.fn(() => false),
 }));
 
 // `wirings.ts`'s postCommit projects the new destination into every running
@@ -26,7 +32,8 @@ vi.mock('../log.js', () => ({
 // That helper opens on-disk session DB files we don't have in a unit test, so
 // mock it and observe that the projection is invoked per live session.
 const writeDestinationsSpy = vi.fn();
-vi.mock('../modules/agent-to-agent/write-destinations.js', () => ({
+vi.mock('../modules/agent-to-agent/write-destinations.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../modules/agent-to-agent/write-destinations.js')>()),
   writeDestinations: (...args: unknown[]) => writeDestinationsSpy(...args),
 }));
 

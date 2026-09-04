@@ -30,24 +30,33 @@ const approvalState = vi.hoisted(() => ({
   observedContexts: [] as CallerContext[],
 }));
 
+// NOT spread: log.ts installs process-wide uncaughtException/unhandledRejection
+// handlers (including process.exit(1)) at module scope — importOriginal() would
+// install those in this test file's worker. Kept as a complete stub instead.
+// (davekim917/nanoclaw#355 review thread)
 vi.mock('../log.js', () => ({
-  log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
+  setLogScrubber: vi.fn(),
+  log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn(), fatal: vi.fn() },
+  isSurvivableIoError: vi.fn(() => false),
 }));
 
 const mockGetContainerConfig = vi.fn();
-vi.mock('../db/container-configs.js', () => ({
+vi.mock('../db/container-configs.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../db/container-configs.js')>()),
   getContainerConfig: (...args: unknown[]) => mockGetContainerConfig(...args),
 }));
 
 const mockGetAgentGroup = vi.fn();
-vi.mock('../db/agent-groups.js', () => ({
+vi.mock('../db/agent-groups.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../db/agent-groups.js')>()),
   getAgentGroup: (...args: unknown[]) => mockGetAgentGroup(...args),
 }));
 
 const mockGetSession = vi.fn();
 // The guard's grant check re-fetches the approval row to prove it's live.
 const mockGetPendingApproval = vi.fn();
-vi.mock('../db/sessions.js', () => ({
+vi.mock('../db/sessions.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../db/sessions.js')>()),
   getSession: (...args: unknown[]) => mockGetSession(...args),
   getPendingApproval: (...args: unknown[]) => mockGetPendingApproval(...args),
 }));
@@ -55,11 +64,13 @@ vi.mock('../db/sessions.js', () => ({
 // dispatch's post-handler looks up the resource's `scopeField` via getResource.
 // The real resources aren't registered in this unit test, so mock it.
 const mockGetResource = vi.fn();
-vi.mock('./crud.js', () => ({
+vi.mock('./crud.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./crud.js')>()),
   getResource: (...args: unknown[]) => mockGetResource(...args),
 }));
 
-vi.mock('../modules/approvals/index.js', () => ({
+vi.mock('../modules/approvals/index.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../modules/approvals/index.js')>()),
   registerApprovalHandler: approvalState.registerApprovalHandler,
   requestApproval: approvalState.requestApproval,
 }));

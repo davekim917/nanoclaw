@@ -26,7 +26,8 @@ import { classifyForHostExecution, runHostGatedTaskScripts } from './host-script
 // Default null → falls back to the real install TIMEZONE; individual tests
 // set an override to test propagation.
 const containerConfigState = vi.hoisted(() => ({ timezone: null as string | null }));
-vi.mock('../../db/container-configs.js', () => ({
+vi.mock('../../db/container-configs.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../db/container-configs.js')>()),
   getContainerConfig: () => ({ timezone: containerConfigState.timezone }),
 }));
 

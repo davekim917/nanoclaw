@@ -16,9 +16,11 @@ import { describe, expect, it, beforeEach, afterEach, vi } from 'vitest';
 
 const TEST_DIR = uniqueTmpRoot('test-a2a-parity');
 
-vi.mock('../../container-runner.js', async () => {
+vi.mock('../../container-runner.js', async (importOriginal) => {
+  const real = await importOriginal<typeof import('../../container-runner.js')>();
   const { getSession } = await import('../../db/sessions.js');
   return {
+    ...real,
     wakeContainer: vi.fn().mockResolvedValue(true),
     isContainerRunning: vi.fn().mockReturnValue(false),
     getActiveContainerCount: vi.fn().mockReturnValue(0),
@@ -36,7 +38,8 @@ vi.mock('../../container-runner.js', async () => {
 });
 
 const getChannelAdapter = vi.fn();
-vi.mock('../../channels/channel-registry.js', () => ({
+vi.mock('../../channels/channel-registry.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../channels/channel-registry.js')>()),
   getChannelAdapter: (key: string) => getChannelAdapter(key),
 }));
 

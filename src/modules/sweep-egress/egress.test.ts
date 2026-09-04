@@ -51,7 +51,8 @@ afterEach(() => {
 
 const mockEnsureEgressNetwork = vi.fn();
 
-vi.mock('../../egress-lockdown.js', () => ({
+vi.mock('../../egress-lockdown.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../egress-lockdown.js')>()),
   ensureEgressNetwork: (...args: unknown[]) => mockEnsureEgressNetwork(...args),
 }));
 

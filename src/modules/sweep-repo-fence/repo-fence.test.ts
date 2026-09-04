@@ -32,11 +32,16 @@ import os from 'os';
 import path from 'path';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
-// Spread the real module: `importOriginal` on the mailbox session seam below
-// pulls in session-manager, which uses more of log.js than these four levels.
-vi.mock('../../log.js', async (importOriginal) => ({
-  ...(await importOriginal<typeof import('../../log.js')>()),
+// NOT spread: log.ts installs process-wide uncaughtException/unhandledRejection
+// handlers (including process.exit(1)) at module scope — importOriginal() would
+// install those in this test file's worker. Kept as a complete stub instead,
+// covering the full export surface (session-manager.js, pulled in via the
+// mailbox session seam below, uses more of log.js than just `log`).
+// (davekim917/nanoclaw#355 review thread)
+vi.mock('../../log.js', () => ({
+  setLogScrubber: vi.fn(),
   log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn(), fatal: vi.fn() },
+  isSurvivableIoError: vi.fn(() => false),
 }));
 
 /**
@@ -66,7 +71,8 @@ vi.mock('child_process', () => childProcessTripwire(spawns));
 vi.mock('node:child_process', () => childProcessTripwire(spawns));
 
 const mockWakeRepositoryMountSessions = vi.fn();
-vi.mock('../../container-restart.js', () => ({
+vi.mock('../../container-restart.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../container-restart.js')>()),
   wakeRepositoryMountSessions: (...args: unknown[]) => mockWakeRepositoryMountSessions(...args),
 }));
 
@@ -95,16 +101,19 @@ const awaitingReasonApprovals: ApprovalRow[] = [];
 const deletedApprovalIds: string[] = [];
 const finalizeRejectCalls: Array<{ approvalId: string; sessionId: string; userId: string; reason?: string }> = [];
 
-vi.mock('../../db/agent-groups.js', () => ({
+vi.mock('../../db/agent-groups.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../db/agent-groups.js')>()),
   getAgentGroup: (id: string) => agentGroups.get(id),
   getAllAgentGroups: () => [...agentGroups.values()],
 }));
 
-vi.mock('../../db/messaging-groups.js', () => ({
+vi.mock('../../db/messaging-groups.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../db/messaging-groups.js')>()),
   getMessagingGroup: (id: string) => ({ id, platform_id: `platform-${id}` }),
 }));
 
-vi.mock('../../db/sessions.js', () => ({
+vi.mock('../../db/sessions.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../db/sessions.js')>()),
   getActiveSessions: () => {
     getActiveSessionsCalls.count += 1;
     return sessions.filter((session) => session.status === 'active');
@@ -119,7 +128,8 @@ vi.mock('../../db/sessions.js', () => ({
   },
 }));
 
-vi.mock('../approvals/finalize.js', () => ({
+vi.mock('../approvals/finalize.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../approvals/finalize.js')>()),
   finalizeReject: (approval: ApprovalRow, session: TestSession, userId: string, reason?: string) => {
     finalizeRejectCalls.push({ approvalId: approval.approval_id, sessionId: session.id, userId, reason });
   },

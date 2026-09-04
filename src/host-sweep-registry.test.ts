@@ -108,7 +108,10 @@ vi.mock('./config.js', async (importOriginal) => {
   };
 });
 
-vi.mock('./egress-lockdown.js', () => ({ ensureEgressNetwork: () => undefined }));
+vi.mock('./egress-lockdown.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./egress-lockdown.js')>()),
+  ensureEgressNetwork: () => undefined,
+}));
 
 vi.mock('./db/sessions.js', async (importOriginal) => {
   const real = await importOriginal<typeof import('./db/sessions.js')>();
@@ -192,13 +195,21 @@ vi.mock('./session-manager.js', async (importOriginal) => {
   };
 });
 
-vi.mock('./modules/scheduling/host-script.js', () => ({ runHostGatedTaskScripts: async () => undefined }));
-vi.mock('./modules/scheduling/recurrence.js', () => ({ handleRecurrence: async () => undefined }));
-vi.mock('./dashboard/thread-close.js', () => ({
+vi.mock('./modules/scheduling/host-script.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./modules/scheduling/host-script.js')>()),
+  runHostGatedTaskScripts: async () => undefined,
+}));
+vi.mock('./modules/scheduling/recurrence.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./modules/scheduling/recurrence.js')>()),
+  handleRecurrence: async () => undefined,
+}));
+vi.mock('./dashboard/thread-close.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./dashboard/thread-close.js')>()),
   advanceThreadClosures: () => undefined,
   syncDoneProposalMirror: () => undefined,
 }));
-vi.mock('./modules/orchestrator-dispatch/reconciler.js', () => ({
+vi.mock('./modules/orchestrator-dispatch/reconciler.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./modules/orchestrator-dispatch/reconciler.js')>()),
   runReconcilerSweep: () => undefined,
   runReconcilerOnStartup: () => undefined,
 }));
@@ -212,7 +223,8 @@ vi.mock('./modules/orchestrator-dispatch/db/tasks.js', async (importOriginal) =>
     transitionToTerminal: () => false,
   };
 });
-vi.mock('./modules/orchestrator-dispatch/db/agent-group-capabilities.js', () => ({
+vi.mock('./modules/orchestrator-dispatch/db/agent-group-capabilities.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./modules/orchestrator-dispatch/db/agent-group-capabilities.js')>()),
   getCapabilityConfig: () => undefined,
 }));
 vi.mock('./modules/orchestrator-dispatch/watchdog.js', async (importOriginal) => {
@@ -223,53 +235,84 @@ vi.mock('./modules/orchestrator-dispatch/watchdog.js', async (importOriginal) =>
     decideTaskAction: () => (h.watchdogAction ? { action: h.watchdogAction } : { action: 'ok' }),
   };
 });
-vi.mock('./storage-maintenance-worker.js', () => ({
+vi.mock('./storage-maintenance-worker.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./storage-maintenance-worker.js')>()),
   runStorageMaintenanceInBackground: async () => null,
   stopStorageMaintenanceWorker: () => undefined,
 }));
-vi.mock('./storage-pressure-alert.js', () => ({ handleStoragePressureAlert: () => undefined }));
-vi.mock('./modules/claims/reconcile.js', () => ({
+vi.mock('./storage-pressure-alert.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./storage-pressure-alert.js')>()),
+  handleStoragePressureAlert: () => undefined,
+}));
+vi.mock('./modules/claims/reconcile.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./modules/claims/reconcile.js')>()),
   reconcileMergedClaims: async () => {
     h.claimsOrder.push('reconcile');
     // Simulates the reconcile pass closing a merged claim before self-heal runs.
     h.claimsStore = h.claimsStore.filter((c) => c !== 'claim-merged');
   },
 }));
-vi.mock('./modules/claims/self-heal.js', () => ({
+vi.mock('./modules/claims/self-heal.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./modules/claims/self-heal.js')>()),
   sweepClaimsSelfHeal: async () => {
     h.claimsOrder.push('self-heal');
     h.claimsSelfHealSawStore = [...h.claimsStore];
   },
 }));
-vi.mock('./repo-fence-recovery.js', () => ({ sweepOrphanedRepoIngressFences: async () => null }));
-vi.mock('./db/channel-ingress-receipts.js', () => ({ pruneChannelIngressReceipts: vi.fn(() => undefined) }));
-vi.mock('./db/usage.js', () => ({ rollupSessionUsage: () => 0, pruneOldTurnUsage: () => undefined }));
-vi.mock('./github-app-token.js', () => ({ refreshExpiringGitHubAppTokens: async () => undefined }));
+vi.mock('./repo-fence-recovery.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./repo-fence-recovery.js')>()),
+  sweepOrphanedRepoIngressFences: async () => null,
+}));
+vi.mock('./db/channel-ingress-receipts.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./db/channel-ingress-receipts.js')>()),
+  pruneChannelIngressReceipts: vi.fn(() => undefined),
+}));
+vi.mock('./db/usage.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./db/usage.js')>()),
+  rollupSessionUsage: () => 0,
+  pruneOldTurnUsage: () => undefined,
+}));
+vi.mock('./github-app-token.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./github-app-token.js')>()),
+  refreshExpiringGitHubAppTokens: async () => undefined,
+}));
 // F-14.2 imports the production modules barrel, and several barrel modules
 // register approval handlers at import. Stub those members too — the duty this
 // file drives (T5) only needs `sweepAwaitingReasonRejects`, and loading the real
 // approvals module here would pull the delivery adapter into a registry test.
-vi.mock('./modules/approvals/index.js', () => ({
+vi.mock('./modules/approvals/index.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./modules/approvals/index.js')>()),
   sweepAwaitingReasonRejects: async () => undefined,
   registerApprovalHandler: () => undefined,
   requestApproval: async () => undefined,
   notifyAgent: async () => undefined,
 }));
-vi.mock('./dashboard/session-title-sweep.js', () => ({ runSessionTitleSweep: async () => undefined }));
-vi.mock('./topic-title.js', () => ({ retryPendingThreadTitles: async () => undefined }));
-vi.mock('./dashboard/db/dashboard-tokens.js', () => ({ pruneDashboardTokens: () => undefined }));
+vi.mock('./dashboard/session-title-sweep.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./dashboard/session-title-sweep.js')>()),
+  runSessionTitleSweep: async () => undefined,
+}));
+vi.mock('./topic-title.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./topic-title.js')>()),
+  retryPendingThreadTitles: async () => undefined,
+}));
+vi.mock('./dashboard/db/dashboard-tokens.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./dashboard/db/dashboard-tokens.js')>()),
+  pruneDashboardTokens: () => undefined,
+}));
 vi.mock('./container-config.js', async (importOriginal) => {
   const real = await importOriginal<typeof import('./container-config.js')>();
   return { ...real, readContainerConfig: () => ({}) };
 });
-vi.mock('./provider-fallback.js', () => ({
+vi.mock('./provider-fallback.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./provider-fallback.js')>()),
   resolveSpawnProvider: () => ({ provider: 'claude', primaryProvider: 'claude' }),
 }));
 vi.mock('./db/provider-health.js', async (importOriginal) => {
   const real = await importOriginal<typeof import('./db/provider-health.js')>();
   return { ...real, markProviderUnavailable: () => undefined };
 });
-vi.mock('./db/connection.js', () => ({
+vi.mock('./db/connection.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./db/connection.js')>()),
   getDb: () => ({
     prepare: () => ({ run: () => undefined, get: () => undefined, all: () => [] }),
   }),

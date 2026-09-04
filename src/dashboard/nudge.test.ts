@@ -15,7 +15,10 @@ const mockReadClaims = vi.mocked(_readClaimsRaw);
 // everything in front of it: who may push, which claims are reachable, that the
 // task lands in the claim's OWN thread, and that the prompt comes from the claim
 // file rather than the request body.
-vi.mock('../cli/dispatch.js', () => ({ dispatch: vi.fn() }));
+vi.mock('../cli/dispatch.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../cli/dispatch.js')>()),
+  dispatch: vi.fn(),
+}));
 // Only the claim read is stubbed — permalink resolution runs for real.
 vi.mock('../claims-board.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../claims-board.js')>()),

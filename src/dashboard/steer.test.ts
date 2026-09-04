@@ -24,7 +24,8 @@ const mockEmitDashboardEvent = vi.mocked(_edeRaw);
 // ── Mocks ────────────────────────────────────────────────────────────────────
 // Simple synchronous factories — vi.fn() created inside factory to avoid TDZ.
 
-vi.mock('../session-manager.js', () => ({
+vi.mock('../session-manager.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../session-manager.js')>()),
   writeSessionMessage: vi.fn().mockResolvedValue(undefined),
   openInboundDb: vi.fn(),
   openOutboundDb: vi.fn(),
@@ -36,7 +37,8 @@ vi.mock('../session-manager.js', () => ({
 
 // The steer write path's partial-write probe reads through the mailbox
 // module's read-only seam (PR 6); mocked at the seam, not at a raw opener.
-vi.mock('../modules/mailbox/read-only.js', () => ({
+vi.mock('../modules/mailbox/read-only.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../modules/mailbox/read-only.js')>()),
   readSessionInbound: vi.fn().mockReturnValue(false),
   readSessionOutbound: vi.fn().mockReturnValue(undefined),
 }));
@@ -72,19 +74,22 @@ vi.mock('../container-runner.js', async (importOriginal) => {
   };
 });
 
-vi.mock('../channels/channel-registry.js', () => ({
+vi.mock('../channels/channel-registry.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../channels/channel-registry.js')>()),
   getChannelAdapter: vi.fn().mockReturnValue(undefined),
   registerChannelAdapter: vi.fn(),
   getActiveAdapters: vi.fn().mockReturnValue([]),
 }));
 
-vi.mock('../db/messaging-groups.js', () => ({
+vi.mock('../db/messaging-groups.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../db/messaging-groups.js')>()),
   getMessagingGroup: vi.fn().mockReturnValue(undefined),
   createMessagingGroup: vi.fn(),
   getMessagingGroupByPlatform: vi.fn().mockReturnValue(undefined),
 }));
 
-vi.mock('./api/events.js', () => ({
+vi.mock('./api/events.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./api/events.js')>()),
   emitDashboardEvent: vi.fn(),
   startSSEFeed: vi.fn(),
   stopSSEFeed: vi.fn(),

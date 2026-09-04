@@ -1,32 +1,44 @@
 import { afterEach, beforeEach, describe, it, expect, vi } from 'vitest';
 
-vi.mock('../../delivery.js', () => ({
+vi.mock('../../delivery.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../delivery.js')>()),
   getDeliveryAdapter: vi.fn(),
 }));
 
-vi.mock('../../db/messaging-groups.js', () => ({
+vi.mock('../../db/messaging-groups.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../db/messaging-groups.js')>()),
   getMessagingGroup: vi.fn(),
 }));
 
-vi.mock('../../modules/permissions/user-dm.js', () => ({
+vi.mock('../../modules/permissions/user-dm.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../modules/permissions/user-dm.js')>()),
   ensureUserDm: vi.fn(),
 }));
 
-vi.mock('../db/dashboard-tokens.js', () => ({
+vi.mock('../db/dashboard-tokens.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../db/dashboard-tokens.js')>()),
   issueDashboardToken: vi.fn(),
 }));
 
-vi.mock('./cookie.js', () => ({
+vi.mock('./cookie.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./cookie.js')>()),
   resolveServerKey: vi.fn(() => Buffer.from('a'.repeat(64), 'hex')),
   dashboardSessionTtlHours: vi.fn(() => 720),
 }));
 
+// NOT spread: log.ts installs process-wide uncaughtException/unhandledRejection
+// handlers (including process.exit(1)) at module scope — importOriginal() would
+// install those in this test file's worker. Kept as a complete stub instead.
+// (davekim917/nanoclaw#355 review thread)
 vi.mock('../../log.js', () => ({
-  log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
+  setLogScrubber: vi.fn(),
+  log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn(), fatal: vi.fn() },
+  isSurvivableIoError: vi.fn(() => false),
 }));
 
 // Suppress side-effect registration during test module load
-vi.mock('../../command-gate.js', () => ({
+vi.mock('../../command-gate.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../command-gate.js')>()),
   registerInterceptHandler: vi.fn(),
   getInterceptHandler: vi.fn(),
   clearInterceptHandlers: vi.fn(),

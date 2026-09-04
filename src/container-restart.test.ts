@@ -2,11 +2,14 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 // --- Mocks ---
 
-// Spread the real module: session-manager (now loaded for real, for the
-// real-mailbox case) uses more of log.js than the four levels stubbed here.
-vi.mock('./log.js', async (importOriginal) => ({
-  ...(await importOriginal<typeof import('./log.js')>()),
+// NOT spread: log.ts installs process-wide uncaughtException/unhandledRejection
+// handlers (including process.exit(1)) at module scope — importOriginal() would
+// install those in this test file's worker. Kept as a complete stub instead.
+// (davekim917/nanoclaw#355 review thread)
+vi.mock('./log.js', () => ({
+  setLogScrubber: vi.fn(),
   log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn(), fatal: vi.fn() },
+  isSurvivableIoError: vi.fn(() => false),
 }));
 
 const mockIsContainerRunning = vi.fn<(id: string) => boolean>();
@@ -19,6 +22,7 @@ const mockWakeContainer = vi.fn();
 vi.mock('./container-runner.js', async (importOriginal) => {
   const real = await importOriginal<typeof import('./container-runner.js')>();
   return {
+    ...real,
     isContainerRunning: (...args: unknown[]) => mockIsContainerRunning(args[0] as string),
     isContainerSpawning: (...args: unknown[]) => mockIsContainerSpawning(args[0] as string),
     // The real definition, over the same two mocks: a container "owns"
@@ -42,7 +46,8 @@ vi.mock('./container-runner.js', async (importOriginal) => {
 
 const mockGetSessionsByAgentGroup = vi.fn();
 const mockGetSession = vi.fn();
-vi.mock('./db/sessions.js', () => ({
+vi.mock('./db/sessions.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./db/sessions.js')>()),
   getSessionsByAgentGroup: (...args: unknown[]) => mockGetSessionsByAgentGroup(...args),
   getSession: (...args: unknown[]) => mockGetSession(...args),
 }));

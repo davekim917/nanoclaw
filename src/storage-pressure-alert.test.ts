@@ -8,18 +8,32 @@ const mocks = vi.hoisted(() => ({
   warn: vi.fn(),
 }));
 
-vi.mock('./db/connection.js', () => ({
+vi.mock('./db/connection.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./db/connection.js')>()),
   getDb: () => ({ prepare: () => ({ all: () => mocks.roleRows }) }),
 }));
-vi.mock('./modules/permissions/user-dm.js', () => ({
+vi.mock('./modules/permissions/user-dm.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./modules/permissions/user-dm.js')>()),
   ensureUserDm: (...args: unknown[]) => mocks.ensureUserDm(...args),
 }));
-vi.mock('./delivery.js', () => ({
+vi.mock('./delivery.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./delivery.js')>()),
   getDeliveryAdapter: () => mocks.getDeliveryAdapter(),
 }));
+// NOT spread: log.ts installs process-wide uncaughtException/unhandledRejection
+// handlers (including process.exit(1)) at module scope — importOriginal() would
+// install those in this test file's worker. Kept as a complete stub instead.
+// (davekim917/nanoclaw#355 review thread)
 vi.mock('./log.js', () => ({
-  log: { info: vi.fn(), warn: (...args: unknown[]) => mocks.warn(...args), error: vi.fn(), debug: vi.fn() },
   setLogScrubber: vi.fn(),
+  log: {
+    info: vi.fn(),
+    warn: (...args: unknown[]) => mocks.warn(...args),
+    error: vi.fn(),
+    debug: vi.fn(),
+    fatal: vi.fn(),
+  },
+  isSurvivableIoError: vi.fn(() => false),
 }));
 
 import { _resetStoragePressureAlertForTesting, handleStoragePressureAlert } from './storage-pressure-alert.js';

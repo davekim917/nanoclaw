@@ -5,7 +5,8 @@ import { getDb } from '../../db/connection.js';
 import { runReconcilerSweep } from './reconciler.js';
 
 // Mock completeSpawnSideEffects so we can track calls without running the full side-effect chain
-vi.mock('./dispatch.js', () => ({
+vi.mock('./dispatch.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./dispatch.js')>()),
   completeSpawnSideEffects: vi.fn().mockResolvedValue(undefined),
   applySpawnTask: vi.fn(),
 }));

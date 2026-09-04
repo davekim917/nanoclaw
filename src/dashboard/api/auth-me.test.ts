@@ -1,7 +1,8 @@
 import { afterEach, beforeEach, describe, it, expect, vi } from 'vitest';
 
 // Mock canAccessAgentGroup — needed by requireAuth in router.js
-vi.mock('../../modules/permissions/access.js', () => ({
+vi.mock('../../modules/permissions/access.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../modules/permissions/access.js')>()),
   canAccessAgentGroup: vi.fn(() => ({ allowed: true, reason: 'owner' })),
 }));
 

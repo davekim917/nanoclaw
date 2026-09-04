@@ -33,7 +33,8 @@ import { upsertUser } from './db/users.js';
 import { grantRole } from './db/user-roles.js';
 
 // Mock container runner — prevent actual docker spawn.
-vi.mock('../../container-runner.js', () => ({
+vi.mock('../../container-runner.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../container-runner.js')>()),
   wakeContainer: vi.fn().mockResolvedValue(undefined),
   isContainerRunning: vi.fn().mockReturnValue(false),
   getActiveContainerCount: vi.fn().mockReturnValue(0),
@@ -42,7 +43,8 @@ vi.mock('../../container-runner.js', () => ({
 
 // Mock delivery adapter — record decline + FYI sends for assertions.
 const deliverMock = vi.fn().mockResolvedValue('plat-msg-id');
-vi.mock('../../delivery.js', () => ({
+vi.mock('../../delivery.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../delivery.js')>()),
   getDeliveryAdapter: () => ({
     deliver: deliverMock,
   }),

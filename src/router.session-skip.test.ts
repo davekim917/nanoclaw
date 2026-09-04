@@ -39,11 +39,13 @@ vi.mock('./config.js', async () => {
 
 const { TEST_DIR } = vi.hoisted(() => ({ TEST_DIR: uniqueTmpRoot('test-router-session-skip') }));
 
-vi.mock('./message-archive.js', () => ({
+vi.mock('./message-archive.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./message-archive.js')>()),
   archiveMessage: vi.fn(),
 }));
 
-vi.mock('./topic-title.js', () => ({
+vi.mock('./topic-title.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./topic-title.js')>()),
   maybeRenameNewThread: vi.fn(),
 }));
 

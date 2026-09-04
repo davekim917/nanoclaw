@@ -22,11 +22,13 @@ vi.mock('./config.js', async (importOriginal) => ({
     return state.dataDir;
   },
 }));
-vi.mock('./container-runner.js', () => ({
+vi.mock('./container-runner.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./container-runner.js')>()),
   isContainerRunning: (id: string) => state.running.has(id),
   isContainerSpawning: (id: string) => state.spawning.has(id),
 }));
-vi.mock('./db/connection.js', () => ({
+vi.mock('./db/connection.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./db/connection.js')>()),
   getDb: () => ({ prepare: () => ({ all: () => state.rows }) }),
 }));
 // The GC's reclaim gate reads outbound state through the mailbox module's
@@ -54,11 +56,16 @@ vi.mock('./modules/mailbox/index.js', async (importOriginal) => {
     },
   };
 });
-// Spread the real module: the mailbox module barrel (imported for the session
-// path helper) pulls in code that uses more of log.js than these four levels.
-vi.mock('./log.js', async (importOriginal) => ({
-  ...(await importOriginal<typeof import('./log.js')>()),
+// NOT spread: log.ts installs process-wide uncaughtException/unhandledRejection
+// handlers (including process.exit(1)) at module scope — importOriginal() would
+// install those in this test file's worker. Kept as a complete stub instead,
+// covering the full export surface (the mailbox module barrel, imported for the
+// session path helper, uses more of log.js than just `log`).
+// (davekim917/nanoclaw#355 review thread)
+vi.mock('./log.js', () => ({
+  setLogScrubber: vi.fn(),
   log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn(), fatal: vi.fn() },
+  isSurvivableIoError: vi.fn(() => false),
 }));
 
 import { log } from './log.js';

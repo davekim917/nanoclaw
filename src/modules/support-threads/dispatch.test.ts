@@ -16,7 +16,8 @@ import Database from 'better-sqlite3';
 import fs from 'fs';
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 
-vi.mock('../../container-runner.js', () => ({
+vi.mock('../../container-runner.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../container-runner.js')>()),
   wakeContainer: vi.fn().mockResolvedValue(undefined),
   isContainerRunning: vi.fn().mockReturnValue(false),
   killContainer: vi.fn(),
@@ -33,7 +34,8 @@ const { postParent, createThread, adapterDeliver } = vi.hoisted(() => ({
   createThread: vi.fn(),
   adapterDeliver: vi.fn(),
 }));
-vi.mock('../../channels/channel-registry.js', () => ({
+vi.mock('../../channels/channel-registry.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../channels/channel-registry.js')>()),
   getChannelAdapter: () => ({ postParent, createThread, deliver: adapterDeliver }),
 }));
 

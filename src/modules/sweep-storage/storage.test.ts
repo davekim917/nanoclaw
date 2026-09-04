@@ -70,20 +70,24 @@ const mocks = vi.hoisted(() => ({
   logDebug: vi.fn(),
 }));
 
-vi.mock('../../storage-maintenance-worker.js', () => ({
+vi.mock('../../storage-maintenance-worker.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../storage-maintenance-worker.js')>()),
   runStorageMaintenanceInBackground: mocks.runStorageMaintenanceInBackground,
   stopStorageMaintenanceWorker: mocks.stopStorageMaintenanceWorker,
 }));
-vi.mock('../../storage-pressure-alert.js', () => ({
+vi.mock('../../storage-pressure-alert.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../storage-pressure-alert.js')>()),
   handleStoragePressureAlert: mocks.handleStoragePressureAlert,
 }));
-vi.mock('../../log.js', async (importOriginal) => {
-  const real = await importOriginal<typeof import('../../log.js')>();
-  return {
-    ...real,
-    log: { info: mocks.logInfo, warn: mocks.logWarn, error: mocks.logError, debug: mocks.logDebug },
-  };
-});
+// NOT spread: log.ts installs process-wide uncaughtException/unhandledRejection
+// handlers (including process.exit(1)) at module scope — importOriginal() would
+// install those in this test file's worker. Kept as a complete stub instead.
+// (davekim917/nanoclaw#355 review thread)
+vi.mock('../../log.js', () => ({
+  setLogScrubber: vi.fn(),
+  log: { info: mocks.logInfo, warn: mocks.logWarn, error: mocks.logError, debug: mocks.logDebug, fatal: vi.fn() },
+  isSurvivableIoError: vi.fn(() => false),
+}));
 
 // Registers T13 into host-sweep.ts's live registry — needed so the F-6.2
 // registered-wrapper case below can obtain it by name, the same accessor R-7

@@ -14,7 +14,8 @@ vi.mock('../../config.js', async (importOriginal) => ({
   DATA_DIR: TEST_ROOT,
 }));
 
-vi.mock('../../capabilities.js', () => ({
+vi.mock('../../capabilities.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../capabilities.js')>()),
   buildSessionServicesSnapshot: vi.fn((agentGroupId: string, messagingGroupId: string | null) => {
     if (FAILURES.capabilities) throw new Error('fixture capability failure');
     return {

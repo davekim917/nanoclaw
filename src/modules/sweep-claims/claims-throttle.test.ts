@@ -74,7 +74,10 @@ const h = vi.hoisted(() => {
 
 const mockDispatch = vi.hoisted(() => vi.fn(async (..._args: unknown[]) => ({ ok: true })));
 
-vi.mock('../../cli/dispatch.js', () => ({ dispatch: (...args: unknown[]) => mockDispatch(...args) }));
+vi.mock('../../cli/dispatch.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../cli/dispatch.js')>()),
+  dispatch: (...args: unknown[]) => mockDispatch(...args),
+}));
 
 vi.mock('../claims/escalation.js', async (importOriginal) => {
   const real = await importOriginal<typeof import('../claims/escalation.js')>();

@@ -177,11 +177,13 @@ vi.mock('../orchestrator-dispatch/db/tasks.js', async (importOriginal) => {
   return { ...real, getActiveTasks: () => [], getOrphanedTasks: () => [], transitionToTerminal: () => false };
 });
 
-vi.mock('../orchestrator-dispatch/db/agent-group-capabilities.js', () => ({
+vi.mock('../orchestrator-dispatch/db/agent-group-capabilities.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../orchestrator-dispatch/db/agent-group-capabilities.js')>()),
   getCapabilityConfig: () => undefined,
 }));
 
-vi.mock('../orchestrator-dispatch/reconciler.js', () => ({
+vi.mock('../orchestrator-dispatch/reconciler.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../orchestrator-dispatch/reconciler.js')>()),
   runReconcilerSweep: () => undefined,
   runReconcilerOnStartup: () => undefined,
 }));

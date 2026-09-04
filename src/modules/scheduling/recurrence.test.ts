@@ -30,7 +30,8 @@ vi.mock('../../config.js', async (importOriginal) => {
 
 // The auto-pause note goes through the shared appendRunLog helper, which
 // resolves the group folder from the central DB — mock it to a fixed folder.
-vi.mock('../../db/agent-groups.js', () => ({
+vi.mock('../../db/agent-groups.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../db/agent-groups.js')>()),
   getAgentGroup: (id: string) => (id === 'ag-test' ? { id, folder: 'g-test' } : undefined),
 }));
 
@@ -57,7 +58,8 @@ const { TEST_DIR } = vi.hoisted(() => ({ TEST_DIR: uniqueTmpRoot('recurrence-tes
 // (not initialized here). Default: no override → falls back to the mocked
 // install TIMEZONE; individual tests set an override to test precedence.
 const containerConfigState = vi.hoisted(() => ({ timezone: null as string | null }));
-vi.mock('../../db/container-configs.js', () => ({
+vi.mock('../../db/container-configs.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../db/container-configs.js')>()),
   getContainerConfig: () => ({ timezone: containerConfigState.timezone }),
 }));
 const DB_PATH = path.join(TEST_DIR, 'inbound.db');

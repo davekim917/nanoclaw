@@ -23,7 +23,10 @@ const mockClaimsRoot = vi.mocked(_claimsBaseDirRaw);
 // have their own suites. What THIS one pins is everything in front of them —
 // who may steer, whether the operator's words survive intact, which thread the
 // task lands in, and what happens when there is no thread yet.
-vi.mock('../cli/dispatch.js', () => ({ dispatch: vi.fn() }));
+vi.mock('../cli/dispatch.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../cli/dispatch.js')>()),
+  dispatch: vi.fn(),
+}));
 vi.mock('../claims-board.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../claims-board.js')>()),
   readClaims: vi.fn(),

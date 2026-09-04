@@ -37,7 +37,8 @@ const TEST_GROUPS_DIR = `${TEST_ROOT}/groups`;
 const TEST_DATA_DIR = `${TEST_ROOT}/data`;
 
 // ── Mocks ────────────────────────────────────────────────────────────────────
-vi.mock('../../container-runner.js', () => ({
+vi.mock('../../container-runner.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../container-runner.js')>()),
   wakeContainer: vi.fn().mockResolvedValue(undefined),
   isContainerRunning: vi.fn().mockReturnValue(false),
   getActiveContainerCount: vi.fn().mockReturnValue(0),
@@ -54,12 +55,14 @@ vi.mock('../../config.js', async () => {
 });
 
 // Mock writeDestinations — it requires a full session inbound.db; not in scope here
-vi.mock('./write-destinations.js', () => ({
+vi.mock('./write-destinations.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./write-destinations.js')>()),
   writeDestinations: vi.fn(),
 }));
 
 // Mock writeSessionMessage + getSession so notifyAgent doesn't need a real inbound DB
-vi.mock('../../session-manager.js', () => ({
+vi.mock('../../session-manager.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../session-manager.js')>()),
   writeSessionMessage: vi.fn(),
   initSessionFolder: vi.fn(),
   sessionDir: vi.fn(),
@@ -76,7 +79,8 @@ vi.mock('../../session-manager.js', () => ({
 // continue to assert correctly via capturedApprovalRequests.length.
 const capturedApprovalRequests: Array<{ payload: Record<string, unknown>; session: unknown }> = [];
 
-vi.mock('../approvals/index.js', () => ({
+vi.mock('../approvals/index.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../approvals/index.js')>()),
   requestApproval: vi.fn(async (opts: { session: unknown; payload: Record<string, unknown> }) => {
     capturedApprovalRequests.push({ payload: opts.payload, session: opts.session });
   }),

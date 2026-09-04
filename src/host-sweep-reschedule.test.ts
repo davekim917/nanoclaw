@@ -18,7 +18,8 @@ const mockRunReconcilerSweep = vi.fn();
 // registry the guard for every tick duty, so its throw is now isolated one
 // level lower — this case still pins the property that matters: whatever a duty
 // does, the next tick happens.
-vi.mock('./modules/orchestrator-dispatch/reconciler.js', () => ({
+vi.mock('./modules/orchestrator-dispatch/reconciler.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./modules/orchestrator-dispatch/reconciler.js')>()),
   runReconcilerSweep: () => mockRunReconcilerSweep(),
   runReconcilerOnStartup: vi.fn(),
 }));
@@ -69,20 +70,51 @@ function childProcessTripwire(record: string[]): Record<string, (...args: unknow
 vi.mock('child_process', () => childProcessTripwire(spawnAttempts));
 vi.mock('node:child_process', () => childProcessTripwire(spawnAttempts));
 
-vi.mock('./egress-lockdown.js', () => ({ ensureEgressNetwork: () => undefined }));
-vi.mock('./storage-maintenance-worker.js', () => ({
+vi.mock('./egress-lockdown.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./egress-lockdown.js')>()),
+  ensureEgressNetwork: () => undefined,
+}));
+vi.mock('./storage-maintenance-worker.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./storage-maintenance-worker.js')>()),
   runStorageMaintenanceInBackground: async () => null,
   stopStorageMaintenanceWorker: () => undefined,
 }));
-vi.mock('./storage-pressure-alert.js', () => ({ handleStoragePressureAlert: () => undefined }));
-vi.mock('./modules/claims/reconcile.js', () => ({ reconcileMergedClaims: async () => undefined }));
-vi.mock('./modules/claims/self-heal.js', () => ({ sweepClaimsSelfHeal: async () => undefined }));
-vi.mock('./repo-fence-recovery.js', () => ({ sweepOrphanedRepoIngressFences: async () => null }));
-vi.mock('./github-app-token.js', () => ({ refreshExpiringGitHubAppTokens: async () => undefined }));
-vi.mock('./modules/approvals/index.js', () => ({ sweepAwaitingReasonRejects: async () => undefined }));
-vi.mock('./dashboard/session-title-sweep.js', () => ({ runSessionTitleSweep: async () => undefined }));
-vi.mock('./topic-title.js', () => ({ retryPendingThreadTitles: async () => undefined }));
-vi.mock('./dashboard/db/dashboard-tokens.js', () => ({ pruneDashboardTokens: () => undefined }));
+vi.mock('./storage-pressure-alert.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./storage-pressure-alert.js')>()),
+  handleStoragePressureAlert: () => undefined,
+}));
+vi.mock('./modules/claims/reconcile.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./modules/claims/reconcile.js')>()),
+  reconcileMergedClaims: async () => undefined,
+}));
+vi.mock('./modules/claims/self-heal.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./modules/claims/self-heal.js')>()),
+  sweepClaimsSelfHeal: async () => undefined,
+}));
+vi.mock('./repo-fence-recovery.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./repo-fence-recovery.js')>()),
+  sweepOrphanedRepoIngressFences: async () => null,
+}));
+vi.mock('./github-app-token.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./github-app-token.js')>()),
+  refreshExpiringGitHubAppTokens: async () => undefined,
+}));
+vi.mock('./modules/approvals/index.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./modules/approvals/index.js')>()),
+  sweepAwaitingReasonRejects: async () => undefined,
+}));
+vi.mock('./dashboard/session-title-sweep.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./dashboard/session-title-sweep.js')>()),
+  runSessionTitleSweep: async () => undefined,
+}));
+vi.mock('./topic-title.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./topic-title.js')>()),
+  retryPendingThreadTitles: async () => undefined,
+}));
+vi.mock('./dashboard/db/dashboard-tokens.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./dashboard/db/dashboard-tokens.js')>()),
+  pruneDashboardTokens: () => undefined,
+}));
 
 import { SWEEP_INTERVAL_MS, startHostSweep, stopHostSweep } from './host-sweep.js';
 import { log } from './log.js';

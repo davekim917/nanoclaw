@@ -4,7 +4,8 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 // Mock compute-scopes — needs a real DB; stub it out (post-build QA fix MF-3:
 // requireAuth now uses computeScopes via dynamic import, replacing the prior
 // canAccessAgentGroup approach that was leaving scoped admins with empty groups).
-vi.mock('./auth/compute-scopes.js', () => ({
+vi.mock('./auth/compute-scopes.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./auth/compute-scopes.js')>()),
   computeScopes: vi.fn(() => ({
     role: 'owner' as const,
     allowed_group_ids: [],
@@ -14,7 +15,8 @@ vi.mock('./auth/compute-scopes.js', () => ({
 
 // requireAuth resolves the real display_name for ctx.user via getUser (a DB call) —
 // stub it same as computeScopes so these tests don't need a live DB.
-vi.mock('../modules/permissions/db/users.js', () => ({
+vi.mock('../modules/permissions/db/users.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../modules/permissions/db/users.js')>()),
   getUser: vi.fn(() => undefined),
 }));
 

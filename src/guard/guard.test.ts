@@ -14,11 +14,18 @@ import { defineGuardedAction, type GuardedAction } from './guard-actions.js';
 import { ALLOW, DENY, HOLD, type GuardInput } from './types.js';
 
 const mockGetPendingApproval = vi.fn();
-vi.mock('../db/sessions.js', () => ({
+vi.mock('../db/sessions.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../db/sessions.js')>()),
   getPendingApproval: (...args: unknown[]) => mockGetPendingApproval(...args),
 }));
+// NOT spread: log.ts installs process-wide uncaughtException/unhandledRejection
+// handlers (including process.exit(1)) at module scope — importOriginal() would
+// install those in this test file's worker. Kept as a complete stub instead.
+// (davekim917/nanoclaw#355 review thread)
 vi.mock('../log.js', () => ({
-  log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
+  setLogScrubber: vi.fn(),
+  log: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn(), fatal: vi.fn() },
+  isSurvivableIoError: vi.fn(() => false),
 }));
 
 const AGENT = { kind: 'agent', agentGroupId: 'ag-1', sessionId: 'sess-1' } as const;
