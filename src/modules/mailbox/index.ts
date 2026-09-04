@@ -395,6 +395,8 @@ export interface NanoclawMailboxSession extends MailboxSession {
     id: string;
     seriesId: string;
     processAfter: string;
+    /** The slot this occurrence is FOR, when it differs from `processAfter` (board move only). */
+    scheduledFor?: string | null;
     recurrence: string;
     content: string;
     platformId: string | null;

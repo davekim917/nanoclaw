@@ -137,6 +137,7 @@ export interface TaskUpdate {
 // occurrence of a recurring task is updated, not just the completed row the
 // agent last saw. Returns the number of rows touched.
 export function updateTask(db: Database.Database, taskId: string, update: TaskUpdate): number {
+  migrateMessagesInTable(db);
   const setProcessAfter = update.processAfter !== undefined;
   const setRecurrence = update.recurrence !== undefined;
   const mergeContent =
@@ -574,6 +575,15 @@ export function upsertTaskSeries(
     id: string;
     seriesId: string;
     processAfter: string;
+    /**
+     * The slot this occurrence is FOR, when it differs from `processAfter`.
+     * Only the board's move flow passes it: a source row in retry backoff
+     * carries the backoff deadline in `process_after`, and stamping the
+     * destination's slot from that would change the occurrence's identity as a
+     * side effect of moving it. Everyone else arms a slot and a run time that
+     * are the same instant.
+     */
+    scheduledFor?: string | null;
     recurrence: string;
     content: string;
     platformId: string | null;
@@ -581,6 +591,7 @@ export function upsertTaskSeries(
     threadId: string | null;
   },
 ): UpsertedTaskSeries {
+  migrateMessagesInTable(db);
   return db
     .transaction((): UpsertedTaskSeries => {
       // The WHOLE row, and selected ONCE. `scheduleTask` has to be able to undo
@@ -623,9 +634,10 @@ export function upsertTaskSeries(
         ).run(
           nextEvenSeq(db),
           row.processAfter,
-          // The slot moves with the deadline on a re-schedule: this IS a
-          // reschedule, not a run-now, so the occurrence is now FOR the new time.
-          row.processAfter,
+          // The slot moves with the deadline on a re-schedule, unless the caller
+          // named one: this IS a reschedule, not a run-now, so absent an
+          // explicit slot the occurrence is now FOR the new time.
+          isoSlot(row.scheduledFor ?? row.processAfter),
           row.recurrence,
           row.content,
           row.platformId,
@@ -646,7 +658,7 @@ export function upsertTaskSeries(
         nextEvenSeq(db),
         new Date().toISOString(),
         row.processAfter,
-        row.processAfter,
+        isoSlot(row.scheduledFor ?? row.processAfter),
         row.recurrence,
         row.seriesId,
         row.content,

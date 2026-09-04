@@ -20,9 +20,6 @@ vi.mock('../../config.js', async (importOriginal) => ({
 
 import { ensureSchema, openInboundDb } from '../../db/session-db.js';
 import {
-import { withMailboxSession } from '../../session-manager.js';
-import { parseProcessingAckRecord } from '../../mailbox/model.js';
-import type { NanoclawMailboxSession } from '../../modules/mailbox/index.js';
   insertTaskRow,
   insertRecurrence,
   cancelTask,
@@ -35,6 +32,9 @@ import type { NanoclawMailboxSession } from '../../modules/mailbox/index.js';
   type RecurringMessage,
   type TaskRowSnapshot,
 } from './db.js';
+import { withMailboxSession } from '../../session-manager.js';
+import { parseProcessingAckRecord } from '../../mailbox/model.js';
+import type { NanoclawMailboxSession } from '../../modules/mailbox/index.js';
 
 const TEST_DIR = TEST_ROOT;
 const DB_PATH = path.join(TEST_DIR, 'inbound.db');
