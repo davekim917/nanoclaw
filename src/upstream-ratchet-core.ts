@@ -196,50 +196,6 @@ export function hashCatFileBatch(stdout: Buffer, ids: readonly string[]): Map<st
   return out;
 }
 
-/** One `git check-attr <attrs...> --stdin -z` record: one attribute's value for one path. */
-export interface CheckAttrRecord {
-  path: string;
-  attr: string;
-  value: string;
-}
-
-/**
- * `git check-attr <attrs...> --stdin -z` output → one record per (path, attr)
- * pair, in request order. `-z` NUL-delimits every field (path, attr, value) so
- * a path containing a space or a non-ASCII byte round-trips exactly, the same
- * reason every other parser in this module takes `-z`/`-Z` output.
- */
-export function parseCheckAttrRecords(stdout: string): CheckAttrRecord[] {
-  const fields = stdout.split('\0');
-  if (fields[fields.length - 1] === '') fields.pop(); // the trailing NUL after the last record
-  if (fields.length % 3 !== 0) {
-    fail(`could not parse check-attr -z output: ${fields.length} NUL-delimited fields is not a multiple of 3`);
-  }
-  const out: CheckAttrRecord[] = [];
-  for (let i = 0; i < fields.length; i += 3) {
-    out.push({ path: fields[i] ?? '', attr: fields[i + 1] ?? '', value: fields[i + 2] ?? '' });
-  }
-  return out;
-}
-
-/**
- * Paths where at least one CONTENT-TRANSFORMING attribute (`text`, `eol`,
- * `ident`, `filter`) is set to something other than git's literal
- * `"unspecified"` — i.e. paths where a real checkout of the queried ref could
- * produce different bytes than the blob's raw stored content. Every other
- * attribute (`diff`, `merge`, `export-ignore`, `linguist-*`, …) does not
- * transform checkout bytes and is deliberately never queried for this.
- *
- * `"unspecified"` is git's own literal string for "no rule applies" — a real
- * attribute value can never equal it, so the exact-match check has no false
- * negative.
- */
-export function pathsWithCheckoutFilters(records: readonly CheckAttrRecord[]): Set<string> {
-  const out = new Set<string>();
-  for (const record of records) if (record.value !== 'unspecified') out.add(record.path);
-  return out;
-}
-
 /**
  * `git ls-files -s -z` → path → mode, for the fork's index.
  *

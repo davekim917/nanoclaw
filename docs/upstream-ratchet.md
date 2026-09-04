@@ -236,21 +236,47 @@ entry that `--check` never writes. The untracked-shadow check has no meaning eit
 bytes sitting at a path the fork's index does not track, which cannot happen inside a single commit's own
 tree.
 
-### Checkout filters (CRLF, ident, smudge)
+### Checkout filters (CRLF, working-tree-encoding, ident, smudge)
 
 A ref's raw git blob bytes are not always what a real checkout produces: `.gitattributes` can declare
-`text`/`eol` (CRLF conversion), `ident`, or a `filter` (clean/smudge), and `hashFile` — what the default
-report and the local currency test hash — always reads the CHECKED-OUT (post-filter) bytes. `--check`
-hashes to match: for every upstream-owned regular file, it asks `git check-attr` (scoped to `<ref>`'s own
-`.gitattributes` via `--source=<ref>`, never the running checkout's) which paths have one of those
-attributes set, and for exactly that set re-hashes via `git cat-file --filters` — one path at a time,
-because `--batch --filters` reports the object's PRE-filter size in its header even though it writes the
-POST-filter bytes, which desyncs the batch framing this tool otherwise relies on. Every other upstream
-path — the overwhelming majority — is still hashed from the single batched raw `cat-file --batch` call. A
-symlink (`120000`) is never a candidate: git does not run checkout filters on a symlink's target string.
-Neither this fork's tree nor the pinned upstream commit declares any `.gitattributes` rule today, so on a
-real `--check` run this is one `check-attr` call that flags nothing, at effectively no extra cost — the
-mechanism exists for the day either tree adds one.
+`text`/`eol` (CRLF conversion), `working-tree-encoding` (a codec other than UTF-8), `ident`, or a `filter`
+(a clean/smudge pair), and `core.autocrlf` can convert line endings with **no attribute at all**.
+`hashFile` — what the default report and the local currency test hash — always reads the CHECKED-OUT
+(post-filter) bytes, so `--check` has to match that or it can disagree with a clean working tree.
+
+**Every upstream-owned regular file is re-hashed via one `git cat-file --filters <ref>:<path>` process,
+unconditionally — never a subset chosen by asking which attributes are set.** An attribute selector was
+tried first and rejected: it would need to enumerate every attribute that can move a checkout byte
+(`text`, `eol`, `working-tree-encoding`, `ident`, `filter`, and `core.autocrlf` with none of them present),
+and a `filter=X` value can itself literally be the string `unspecified` — indistinguishable by string
+comparison from git's own "no rule applies" sentinel. Hashing unconditionally has no list to keep complete.
+
+This costs one subprocess per upstream-owned regular file (959 in this repo today, one `cat-file --filters`
+each) rather than one batched call, and that is deliberate, not an oversight: `git cat-file --batch
+--filters` was tested by hand across every documented invocation shape and reports the **pre-filter** blob
+size in its header while writing the **post-filter** (different-length) bytes to stdout — a real, measured
+git behavior on the git version this fork runs, not a parsing mistake. A size that lies desyncs the
+size-driven framing every other record in the same batch depends on, so batching it is not safe on this git
+version; git's own test suite has no case for this exact combination (`--batch` is only tested with
+`--textconv`, whose one fixture happens not to change length). A single, non-batch `--filters` call has no
+such problem — its entire stdout, to EOF, is the filtered content, with nothing to misparse.
+
+`--attr-source=<ref>` pins WHICH `.gitattributes` git consults to `<ref>`'s own tree, not the running
+checkout's — confirmed by hand: without it, querying an attribute-bearing commit while the current checkout
+carries no `.gitattributes` at all silently returns the unfiltered bytes. Filter **drivers** are
+deliberately handled the opposite way: `filter.<name>.smudge`/`.clean` live in git CONFIG, never in a
+commit, so `--check` reads them from the RUNNING repository's config, exactly like a real `git checkout
+<ref>` in that same checkout would — there is no ref-sourced equivalent to pin them to, because git itself
+has none.
+
+A symlink (`120000`) is never a candidate for any of this: git does not run checkout filters on a symlink's
+target string, so the plain (raw, batched) blob hash already agrees with `hashFile`, which now hashes a
+symlink target as raw bytes rather than decoding and re-encoding it as UTF-8 — the only way to agree with
+git's blob for a non-UTF8 target, since git stores that target as opaque bytes with no encoding of its own.
+
+Neither this fork's tree nor the pinned upstream commit declares any `.gitattributes` rule today, so a real
+`--check` run hits none of this — every path lands on the "no filter changed anything" branch of
+`cat-file --filters` — but the mechanism exists correctly for the day either tree adds one.
 
 ## From a linked worktree
 

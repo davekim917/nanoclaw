@@ -356,11 +356,23 @@ function realpath(abs: string): string | null {
  * (`.agents/skills`, `AGENTS.md`), and git's content for those is the target
  * string. Following them instead would hash the pointee, so a re-aimed symlink
  * would read as unchanged and a dangling one would read as deleted.
+ *
+ * Reads the target as RAW BYTES (`{ encoding: 'buffer' }`), not as a decoded
+ * string re-encoded to UTF-8: a symlink target is whatever byte sequence the
+ * OS stores, with no encoding guarantee, and `readlinkSync` (string mode)
+ * decodes it as UTF-8 first — silently mangling a non-UTF8 target before this
+ * function ever sees it. `scripts/upstream-ratchet-report.ts --check <ref>`
+ * hashes a symlink's git blob content directly (git stores the target string
+ * verbatim, byte for byte, with no encoding of its own), so the two sides
+ * must both be byte-based to ever agree on a non-UTF8 target. Both of this
+ * fork's real symlinks are plain ASCII, so this is unobservable on the
+ * committed manifest today — ASCII round-trips identically through UTF-8
+ * either way — and changes no recorded hash.
  */
 export function hashFile(abs: string): string | null {
   const stat = lstat(abs);
   if (stat === null) return null;
-  const content = stat.isSymbolicLink() ? Buffer.from(fs.readlinkSync(abs), 'utf8') : fs.readFileSync(abs);
+  const content = stat.isSymbolicLink() ? fs.readlinkSync(abs, { encoding: 'buffer' }) : fs.readFileSync(abs);
   return createHash('sha256').update(content).digest('hex');
 }
 

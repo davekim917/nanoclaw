@@ -63,12 +63,10 @@ import {
   findUntrackedShadows,
   hashBlobContent,
   hashCatFileBatch,
-  parseCheckAttrRecords,
   parseLsFiles,
   parseLsTree,
   parseLsTreeEntries,
   parseNumstat,
-  pathsWithCheckoutFilters,
   RatchetError,
   writeGate,
   type Row,
@@ -79,7 +77,6 @@ import {
   checkTree,
   divergentEntries,
   fileModeOf,
-  GITLINK_MODE,
   hashFile,
   isGitMode,
   manifestPath,
@@ -329,69 +326,82 @@ export function computeFromGit(root: string, sha: string): UpstreamRatchetManife
  * (src/upstream-ratchet-core.ts) needs the exact same id list back, in the
  * exact same order, to find each record's boundary in the framing.
  */
+/**
+ * Raw (unfiltered) blob content for a set of ids via ONE `cat-file --batch`
+ * call — the only remaining caller is `computeFromRef`'s SYMLINK hashing.
+ * Regular files no longer go through this: see `hashFilteredBlob`'s comment
+ * for why `--batch --filters` cannot be trusted, which is what forces a
+ * one-object-at-a-time call for every regular file instead of a batch.
+ */
 function catFileBatch(root: string, ids: readonly string[]): Buffer {
   if (ids.length === 0) return Buffer.alloc(0);
   return execFileSync('git', ['-C', root, 'cat-file', '--batch'], {
     input: ids.join('\n') + '\n',
-    // Bounded by construction: `computeFromRef` only ever requests blob ids for
-    // upstream-owned paths, never the fork's own added content — a large
-    // fork-only asset (the default report never reads it either) cannot blow
-    // this or abort --check on a ref that never touches an upstream file.
+    // Bounded by construction: only ever called with upstream-owned symlink
+    // blob ids (a target string, never large) — see computeFromRef.
     maxBuffer: 512 * 1024 * 1024,
     stdio: ['pipe', 'pipe', 'inherit'],
   }) as Buffer;
 }
 
-/** Attributes that can make a real checkout's bytes differ from a blob's raw stored content. */
-const CHECKOUT_FILTER_ATTRS = ['text', 'eol', 'ident', 'filter'] as const;
-
-/**
- * Upstream-owned regular-file paths (from `candidates`) where `<ref>`'s OWN
- * gitattributes — not the running checkout's — set one of `CHECKOUT_FILTER_ATTRS`.
- *
- * `--source=<ref>` is what makes this ref-correct rather than
- * worktree-correct: `git check-attr` (like `git cat-file --filters`, see
- * `hashFilteredBlob`) otherwise resolves attributes from the CURRENT working
- * tree regardless of which commit's blob is being asked about — confirmed by
- * hand: querying an attribute-bearing older commit while HEAD carries no
- * `.gitattributes` at all returns "unspecified" without `--source`.
- */
-function checkoutFilteredPaths(root: string, ref: string, candidates: readonly string[]): Set<string> {
-  if (candidates.length === 0) return new Set();
-  const stdout = execFileSync(
-    'git',
-    ['-C', root, 'check-attr', `--source=${ref}`, ...CHECKOUT_FILTER_ATTRS, '--stdin', '-z'],
-    {
-      input: candidates.map((p) => `${p}\0`).join(''),
-      maxBuffer: 512 * 1024 * 1024,
-      encoding: 'utf8',
-      stdio: ['pipe', 'pipe', 'inherit'],
-    },
-  );
-  return pathsWithCheckoutFilters(parseCheckAttrRecords(stdout));
-}
-
 /**
  * The sha256 a real checkout of `<ref>:<relPath>` would hash to, per
  * `hashFile` — git's blob content AFTER the filters `<ref>`'s own
- * gitattributes declare (CRLF/eol conversion, ident, clean/smudge).
+ * gitattributes declare (CRLF/eol conversion, working-tree-encoding, ident,
+ * clean/smudge), using filter DRIVERS from the RUNNING repo's git config
+ * (`filter.<name>.smudge` etc. are config, never committed) — exactly what a
+ * real `git checkout <ref>` in THIS checkout would do.
  *
- * One subprocess per path, deliberately never batched: `git cat-file --batch
- * --filters` reports the PRE-filter blob size in its header even though it
- * writes the POST-filter (different-length) bytes — verified by hand, not a
- * hypothetical: a 6-byte LF blob with `eol=crlf` set writes 9 CRLF bytes to
- * stdout while the header still says `blob 6`. That desyncs
- * `parseCatFileBatch`'s size-driven framing for every record after the first
- * mismatch, so a single-object, non-batch `--filters` call is used instead:
- * its ENTIRE stdout, to EOF, IS the filtered content, with no header and
- * nothing to misparse. `--attr-source=<ref>` (the global flag; `cat-file` has
- * no per-invocation `--source`) pins attributes to `<ref>`'s own
- * `.gitattributes`, exactly like `checkoutFilteredPaths` above.
+ * One subprocess PER REGULAR upstream-owned path, unconditionally — every one
+ * of them, not a subset selected by querying which attributes are set.
+ * Two things forced this design, in order:
  *
- * A 120000 (symlink) entry never reaches this function: `--filters` returns a
- * symlink's raw target string byte-for-byte unchanged — verified by hand — so
- * the batched raw hash already agrees with `hashFile`'s symlink handling and
- * `checkoutFilteredPaths` is never asked about a symlink path.
+ * 1. There is no reliable selector. `git check-attr` only reports the FOUR
+ *    named attributes (`text`/`eol`/`ident`/`filter`) it is asked about, but a
+ *    real checkout's bytes can also move under `core.autocrlf` with NO
+ *    attribute at all (`\n` → `\r\n` on write), under `working-tree-encoding`
+ *    (a fifth attribute, UTF-8 ⇄ another codec), and a `filter=X` value can
+ *    itself literally BE the string `"unspecified"` — a value distinct from
+ *    check-attr's own "no rule applies" sentinel, indistinguishable from it by
+ *    string comparison alone. A round-1 fix that grew the attribute list would
+ *    still be one enumeration away from the next transform; hashing
+ *    unconditionally has no such list to keep complete.
+ * 2. `git cat-file --batch --filters` cannot be trusted at all, REGARDLESS of
+ *    selection, and this was verified by hand rather than assumed: fed
+ *    `<ref>:<path> <path>` (the documented batch+filters input shape) it
+ *    writes the CORRECT, POST-filter bytes to stdout — but its header still
+ *    reports the PRE-filter blob size (`blob 6` for a 6-byte LF blob that
+ *    filters to 9 CRLF bytes). Every invocation shape was tried —
+ *    `--batch-check --filters`, a custom `--batch=<format>` with
+ *    `%(objectsize)`, `--batch-command --filters` with both `contents
+ *    <object> <path>` and `contents <object>:<path> <path>` — and every one
+ *    either reports the pre-filter size or refuses the record outright.
+ *    Git's OWN test suite (`t8010-cat-file-filters.sh`, upstream) has no case
+ *    for `--batch --filters` at all — only `--batch --textconv`, and that
+ *    one test's fixture happens not to change length, which would hide this
+ *    exact class of bug rather than catch it. A size that lies desyncs the
+ *    framing every OTHER record in the same stream depends on, so there is no
+ *    safe way to batch this on the git version this fork runs (2.43.0) — the
+ *    one-shot fallback below was chosen deliberately, not as a shortcut.
+ *
+ * A single-object, non-batch `--filters` call has neither problem: its ENTIRE
+ * stdout, to EOF, IS the filtered content — no header, no size field, nothing
+ * to misparse. `--attr-source=<ref>` (the global flag; `cat-file` has no
+ * per-invocation `--source`) pins ATTRIBUTE resolution to `<ref>`'s own
+ * `.gitattributes` rather than the running checkout's — verified by hand:
+ * without it, querying an attribute-bearing commit while HEAD carries none at
+ * all silently returns the UNfiltered bytes. Filter DRIVERS are deliberately
+ * NOT ref-sourced this way, because git itself does not source them that way:
+ * `filter.<name>.smudge`/`.clean` live in git CONFIG, never in a commit, so a
+ * real `git checkout <ref>` also runs whatever driver the CURRENT repo's
+ * config defines — `--check` matching that (rather than trying to pin it) is
+ * what "checkout-equivalent" has to mean for a filter driver specifically.
+ * See "Checkout filters" in docs/upstream-ratchet.md.
+ *
+ * Never called for a symlink (120000): `--filters` returns a symlink's raw
+ * target string byte-for-byte unchanged (verified by hand), so the plain
+ * batched raw hash already agrees with `hashFile`'s (now byte-based, see
+ * src/upstream-ratchet.ts) symlink handling with no extra work.
  */
 function hashFilteredBlob(root: string, ref: string, relPath: string): string {
   const content = execFileSync(
@@ -413,14 +423,13 @@ function hashFilteredBlob(root: string, ref: string, relPath: string): string {
  *
  *  - `forkIndex`/`modeOf` come from `git ls-tree -r -z <ref>` (the FULL tree,
  *    kept in `refEntries` for gitlink-ancestor detection), not `ls-files`.
- *  - `hashOf` for a REGULAR file (100644/100755) is the RAW blob hash from ONE
- *    `git cat-file --batch`, UNLESS `checkoutFilteredPaths` flags the path —
- *    then it is `hashFilteredBlob`'s checkout-equivalent hash instead. Only
- *    UPSTREAM-OWNED paths' blobs are ever requested (never the fork's own
- *    added content, however large) — see `catFileBatch`'s comment. A 120000
- *    (symlink) entry always uses the raw batch hash: git never filters a
- *    symlink's target-string content on checkout, so raw already agrees with
- *    `hashFile` — proven in src/upstream-ratchet-core.test.ts.
+ *  - `hashOf` for a REGULAR upstream-owned file (100644/100755) is ALWAYS
+ *    `hashFilteredBlob`'s checkout-equivalent hash — one subprocess per path,
+ *    unconditionally, never a selected subset (see that function's comment
+ *    for why). A 120000 (symlink) entry uses the raw batch hash instead:
+ *    filters never apply to a symlink's content on checkout. Only
+ *    UPSTREAM-OWNED, non-gitlink symlink blobs are ever batch-requested
+ *    (never the fork's own added content, however large).
  *  - `ignored` is always empty: `git check-ignore` needs a live index and
  *    working tree, neither of which a bare commit has. An upstream path the
  *    fork deleted AND gitignored is simply absent from `ls-tree`, so it is
@@ -444,29 +453,27 @@ function computeFromRef(
   const upstreamModes = parseLsTree(git(root, ['ls-tree', '-r', '-z', sha]));
   const refEntries = parseLsTreeEntries(git(root, ['ls-tree', '-r', '-z', ref]));
 
-  // Only upstream-owned, non-gitlink paths ever need their bytes read — never
-  // the fork's own added content, however large.
-  const upstreamBlobIds = [
+  // Symlinks only: never filtered on checkout, so the plain blob is already
+  // checkout-equivalent, and a batch call is safe for these because raw
+  // (unfiltered) `cat-file --batch` reports the correct size. Scoped to
+  // upstream-owned, non-gitlink paths — never the fork's own added content.
+  const symlinkBlobIds = [
     ...new Set(
       [...refEntries.entries()]
-        .filter(([relPath, entry]) => upstreamModes.has(relPath) && entry.mode !== GITLINK_MODE)
+        .filter(([relPath, entry]) => upstreamModes.has(relPath) && entry.mode === '120000')
         .map(([, entry]) => entry.blob),
     ),
   ];
-  const rawHashes = hashCatFileBatch(catFileBatch(root, upstreamBlobIds), upstreamBlobIds);
+  const symlinkHashes = hashCatFileBatch(catFileBatch(root, symlinkBlobIds), symlinkBlobIds);
 
-  // Only REGULAR files (100644/100755) can be attribute-filtered on checkout —
-  // a symlink's content is always its raw target string, never candidate for
-  // this. In a ref with no relevant .gitattributes rule at all (true of both
-  // trees today), checkoutFilteredPaths returns empty and this costs exactly
-  // one check-attr call with zero one-object-at-a-time hashing after it.
-  const filterCandidates = [...upstreamModes.keys()].filter((relPath) => {
+  // Every regular upstream-owned file, unconditionally — see
+  // hashFilteredBlob's comment for why there is no cheaper, safe selection.
+  const regularPaths = [...upstreamModes.keys()].filter((relPath) => {
     const entry = refEntries.get(relPath);
     return entry !== undefined && (entry.mode === '100644' || entry.mode === '100755');
   });
-  const filteredPaths = checkoutFilteredPaths(root, ref, filterCandidates);
   const filteredHashes = new Map<string, string>();
-  for (const relPath of filteredPaths) filteredHashes.set(relPath, hashFilteredBlob(root, ref, relPath));
+  for (const relPath of regularPaths) filteredHashes.set(relPath, hashFilteredBlob(root, ref, relPath));
 
   const modeOf = (relPath: string): GitMode | null => {
     const mode = refEntries.get(relPath)?.mode;
@@ -476,7 +483,7 @@ function computeFromRef(
     const filtered = filteredHashes.get(relPath);
     if (filtered !== undefined) return filtered;
     const entry = refEntries.get(relPath);
-    return entry === undefined ? null : (rawHashes.get(entry.blob) ?? null);
+    return entry === undefined ? null : (symlinkHashes.get(entry.blob) ?? null);
   };
   const forkIndex = new Map([...refEntries].map(([p, e]) => [p, e.mode]));
   const numstat = parseNumstat(git(root, ['diff', '--numstat', '--no-renames', '-z', sha, ref]));

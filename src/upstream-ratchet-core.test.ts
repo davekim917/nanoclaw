@@ -25,18 +25,16 @@ import {
   classify,
   decideCheckOutcome,
   findUntrackedShadows,
+  hashBlobContent,
   hashCatFileBatch,
   isBlocking,
   parseCatFileBatch,
-  parseCheckAttrRecords,
   parseLsFiles,
   parseLsTree,
   parseLsTreeEntries,
   parseNumstat,
-  pathsWithCheckoutFilters,
   RatchetError,
   writeGate,
-  type CheckAttrRecord,
   type NumstatRecord,
   type Row,
 } from './upstream-ratchet-core.js';
@@ -297,65 +295,35 @@ describe('commit-source parsing (--check <ref>)', () => {
     expect(hashCatFileBatch(linkBatch, [linkId]).get(linkId)).toBe(hashFile(path.join(root, 'link')));
   });
 
-  it('parses check-attr -z records and finds paths with a content-transforming attribute set', () => {
-    // Exactly `git check-attr text eol ident filter --stdin -z`'s framing:
-    // <path>\0<attr>\0<value>\0, repeated per (path, attr) pair, in request
-    // order — real output captured by hand for a CRLF-tagged file, an
-    // untouched symlink, and .gitattributes itself.
-    const field = (s: string): string => s + '\0';
-    const stdout =
-      field('crlftest.txt') +
-      field('text') +
-      field('set') +
-      field('crlftest.txt') +
-      field('eol') +
-      field('crlf') +
-      field('crlftest.txt') +
-      field('ident') +
-      field('unspecified') +
-      field('crlftest.txt') +
-      field('filter') +
-      field('unspecified') +
-      field('mylink') +
-      field('text') +
-      field('unspecified') +
-      field('mylink') +
-      field('eol') +
-      field('unspecified') +
-      field('mylink') +
-      field('ident') +
-      field('unspecified') +
-      field('mylink') +
-      field('filter') +
-      field('unspecified');
+  it('hashes a NON-UTF8 symlink target as raw bytes, matching what a git blob for it stores', () => {
+    // Round 2 hashed a symlink target through `Buffer.from(readlinkSync(abs), 'utf8')`
+    // — decode-then-reencode, which is lossless for ASCII/valid-UTF8 targets
+    // (both of this fork's real symlinks) but MANGLES a target that is not
+    // valid UTF-8: Node's string-mode readlinkSync decodes with the invalid
+    // sequence replaced (U+FFFD), so the "fixed" bytes are never recoverable
+    // by re-encoding. `hashFile` now reads the target as a raw Buffer
+    // (`{ encoding: 'buffer' }`), which is the only way to agree with a git
+    // blob for a 120000 entry — git stores that target string as opaque
+    // bytes, with no encoding of its own.
+    const root = uniqueTmpRoot('upstream-ratchet-check-symlink-non-utf8');
+    fs.mkdirSync(root, { recursive: true });
+    // 0xff/0xfe are never valid as the first byte of a UTF-8 sequence, and
+    // 0x81/0x82 are lone continuation bytes with no valid lead — guaranteed
+    // to be mangled by a decode/re-encode round trip. No NUL byte: a symlink
+    // target is a path, and paths cannot contain one on any platform.
+    const rawTarget = Buffer.from([0x2e, 0x2f, 0xff, 0xfe, 0x81, 0x82]);
+    fs.symlinkSync(rawTarget, path.join(root, 'weird-link'));
 
-    const records = parseCheckAttrRecords(stdout);
-    expect(records).toHaveLength(8);
-    expect(records[0]).toEqual({ path: 'crlftest.txt', attr: 'text', value: 'set' });
-    expect(records[1]).toEqual({ path: 'crlftest.txt', attr: 'eol', value: 'crlf' });
+    // The raw bytes really did survive on disk (proves the fixture is real,
+    // not testing a Node bug).
+    expect(fs.readlinkSync(path.join(root, 'weird-link'), { encoding: 'buffer' })).toEqual(rawTarget);
 
-    // crlftest.txt has `text`/`eol` SET (a real checkout could produce
-    // different bytes); mylink has every queried attribute "unspecified" —
-    // git's own literal string for "no rule applies" — so it is untouched.
-    expect(pathsWithCheckoutFilters(records)).toEqual(new Set(['crlftest.txt']));
-  });
-
-  it('finds no filtered paths when every attribute is unspecified — the common case today', () => {
-    // Neither tree carries a .gitattributes today (verified by hand against
-    // both nanoclaw-v2 and the upstream pin), so this is the actual shape
-    // `checkoutFilteredPaths` sees on every real `--check` run right now: one
-    // check-attr call, zero one-object-at-a-time `--filters` hashing after it.
-    const records: CheckAttrRecord[] = [
-      { path: 'src/router.ts', attr: 'text', value: 'unspecified' },
-      { path: 'src/router.ts', attr: 'eol', value: 'unspecified' },
-      { path: 'src/router.ts', attr: 'ident', value: 'unspecified' },
-      { path: 'src/router.ts', attr: 'filter', value: 'unspecified' },
-    ];
-    expect(pathsWithCheckoutFilters(records)).toEqual(new Set());
-  });
-
-  it('refuses a NUL-field count that is not a multiple of 3', () => {
-    expect(() => parseCheckAttrRecords('a\0text\0')).toThrow(/not a multiple of 3/);
+    const expected = hashBlobContent(rawTarget);
+    expect(hashFile(path.join(root, 'weird-link'))).toBe(expected);
+    // The OLD decode/re-encode behavior would NOT have matched — pinning the
+    // regression, not just the new behavior.
+    const mangled = Buffer.from(fs.readlinkSync(path.join(root, 'weird-link')), 'utf8');
+    expect(mangled.equals(rawTarget), 'the fixture must actually exercise a lossy round trip').toBe(false);
   });
 });
 
