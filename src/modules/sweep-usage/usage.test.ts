@@ -268,6 +268,24 @@ describe('F-12.1', () => {
   });
 });
 
+// The same three, under the verbatim titles they carry in
+// src/host-sweep.test.ts on main. F-12.1 above is the plan's own aggregate
+// criterion and keeps its exact title; folding main's three named cases into it
+// would have retired three case names this move is only supposed to relocate.
+describe('shouldSkipUsageRollup', () => {
+  it('skips when the cached mtime matches the current outbound.db mtime (unchanged since last rollup)', () => {
+    expect(shouldSkipUsageRollup(1000, 1000)).toBe(true);
+  });
+
+  it('does not skip when the outbound.db mtime moved (new turn_usage rows written)', () => {
+    expect(shouldSkipUsageRollup(1000, 2000)).toBe(false);
+  });
+
+  it('does not skip a session never seen before (no cache entry)', () => {
+    expect(shouldSkipUsageRollup(undefined, 1000)).toBe(false);
+  });
+});
+
 // ── registered usage-rollup duty (T19): F-12.2, F-12.3 + supporting cases ────
 
 describe('registered usage-rollup duty (T19)', () => {
