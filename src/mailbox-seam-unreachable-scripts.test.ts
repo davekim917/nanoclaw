@@ -800,6 +800,7 @@ describe('worktree-cleanup.ts contains no literal seam call, and the only contai
       'src/repository-workspaces.ts': [
         'canonicalRepoDir',
         'defaultTopicBranch',
+        'ensureRepositoryLock',
         'isRepositoryName',
         'resolveRepositoryWorkUnit',
         'topicStateDir',
