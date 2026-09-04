@@ -1146,7 +1146,7 @@ describe('storage GC — apply mode', () => {
     },
   );
 
-  it.skipIf(!hasTrash)('#185: upgrades a legacy repo-only journal with the same staged-index safety', () => {
+  it.skipIf(!hasTrash)('#185: legacy repo-only recovery preserves ambiguous staged and unmerged worktrees', () => {
     const { topicDir, worktree, canonical, branch } = topicFixture('thread-idle-legacy-journal');
     const repo = path.basename(worktree);
     const stagedTopic = path.join(path.dirname(topicDir), 'legacy-unrelated-staged-topic');
@@ -1157,7 +1157,17 @@ describe('storage GC — apply mode', () => {
     git(stagedWorktree, ['add', 'only-in-index.txt']);
     const stagedAdmin = git(stagedWorktree, ['rev-parse', '--absolute-git-dir']);
     const stagedIndex = fs.readFileSync(path.join(stagedAdmin, 'index'));
+    const detachedTopic = path.join(path.dirname(topicDir), 'legacy-unrelated-detached-topic');
+    const detachedWorktree = path.join(detachedTopic, 'worktrees', repo);
+    fs.mkdirSync(path.dirname(detachedWorktree), { recursive: true });
+    git(canonical, ['worktree', 'add', '-q', '--detach', detachedWorktree, 'origin/HEAD']);
+    fs.writeFileSync(path.join(detachedWorktree, 'detached-only.txt'), 'must survive legacy recovery\n');
+    git(detachedWorktree, ['add', 'detached-only.txt']);
+    git(detachedWorktree, ['commit', '-q', '-m', 'detached work']);
+    const detachedAdmin = git(detachedWorktree, ['rev-parse', '--absolute-git-dir']);
+    const detachedHead = git(detachedWorktree, ['rev-parse', 'HEAD']);
     fs.rmSync(stagedTopic, { recursive: true, force: true });
+    fs.rmSync(detachedTopic, { recursive: true, force: true });
     fs.rmSync(topicDir, { recursive: true, force: true });
     const journalPath = path.join(state.dataDir, '.gc-pending-prunes.json');
     fs.writeFileSync(journalPath, JSON.stringify([{ workgroupId: WG, repo }]));
@@ -1168,7 +1178,9 @@ describe('storage GC — apply mode', () => {
     const registrations = git(canonical, ['worktree', 'list', '--porcelain']);
     expect(registrations).not.toContain(`branch refs/heads/${branch}\n`);
     expect(registrations).toContain(`worktree ${stagedWorktree}`);
+    expect(registrations).toContain(`worktree ${detachedWorktree}`);
     expect(fs.readFileSync(path.join(stagedAdmin, 'index'))).toEqual(stagedIndex);
+    expect(git(canonical, [`--git-dir=${detachedAdmin}`, 'rev-parse', 'HEAD'])).toBe(detachedHead);
     expect(fs.existsSync(journalPath)).toBe(false);
   });
 

@@ -1403,6 +1403,21 @@ function linkedIndexMatchesHead(canonical: string, adminDir: string): boolean | 
   }
 }
 
+function linkedHeadIsAncestorOf(canonical: string, adminDir: string, integrationRef: string): boolean | null {
+  try {
+    execFileSync('git', safeGitArgs([`--git-dir=${adminDir}`, 'merge-base', '--is-ancestor', 'HEAD', integrationRef]), {
+      cwd: canonical,
+      env: safeGitEnv(),
+      stdio: 'pipe',
+      timeout: 30_000,
+    });
+    return true;
+  } catch (error) {
+    if ((error as { status?: number }).status === 1) return false;
+    return null;
+  }
+}
+
 function pathIsMissing(target: string): boolean | null {
   try {
     fs.lstatSync(target);
@@ -1427,7 +1442,11 @@ function linkedAdminIsLocked(adminDir: string): boolean | null {
 /** Remove one exact missing registration only after re-proving that its
  * private index has no staged state and no explicit lock. The branch ref and
  * every commit remain intact. */
-function removeMissingWorktreeRegistration(entry: PendingWorktreeRemoval, dataDir: string): boolean {
+function removeMissingWorktreeRegistration(
+  entry: PendingWorktreeRemoval,
+  dataDir: string,
+  requiredAncestor?: string,
+): boolean {
   if (
     typeof entry.workgroupId !== 'string' ||
     typeof entry.repo !== 'string' ||
@@ -1509,7 +1528,8 @@ function removeMissingWorktreeRegistration(entry: PendingWorktreeRemoval, dataDi
       'owner=$3',
       'expected_gitdir=$4',
       'canonical=$5',
-      'shift 5',
+      'required_ancestor=$6',
+      'shift 6',
       '[ "$lock_path" -ef /dev/fd/3 ] || exit 73',
       '[ "$admin" -ef /dev/fd/4 ] || exit 74',
       '[ ! -e "$owner" ] && [ ! -L "$owner" ] || exit 75',
@@ -1517,6 +1537,7 @@ function removeMissingWorktreeRegistration(entry: PendingWorktreeRemoval, dataDi
       'IFS= read -r actual_gitdir < "$admin/gitdir" || exit 77',
       '[ "$actual_gitdir" = "$expected_gitdir" ] || exit 78',
       'git "$@" --git-dir="$admin" diff-index --cached --quiet HEAD -- || exit 79',
+      'if [ -n "$required_ancestor" ]; then git "$@" --git-dir="$admin" merge-base --is-ancestor HEAD "$required_ancestor" || exit 80; fi',
       'exec git "$@" -C "$canonical" worktree remove --force "$owner"',
     ].join('\n');
     execFileSync(
@@ -1535,6 +1556,7 @@ function removeMissingWorktreeRegistration(entry: PendingWorktreeRemoval, dataDi
         target.owner,
         target.gitdir,
         canonical,
+        requiredAncestor ?? '',
         ...safeGitArgs([]),
       ],
       {
@@ -1568,6 +1590,8 @@ function completeLegacyPendingRemoval(entry: PendingWorktreeRemoval, dataDir: st
   } catch {
     return false;
   }
+  const integrationRef = git(canonical, ['symbolic-ref', '--quiet', 'refs/remotes/origin/HEAD']);
+  if (!integrationRef) return false;
   const records = linkedWorktreeAdminRecords(canonical);
   if (records === null) return false;
   for (const record of records) {
@@ -1578,7 +1602,16 @@ function completeLegacyPendingRemoval(entry: PendingWorktreeRemoval, dataDir: st
     const clean = linkedIndexMatchesHead(canonical, record.adminDir);
     if (clean === null) return false;
     if (!clean) continue;
-    if (!removeMissingWorktreeRegistration({ ...entry, worktreePath: record.owner }, dataDir)) return false;
+    const contained = linkedHeadIsAncestorOf(canonical, record.adminDir, integrationRef);
+    if (contained === null) return false;
+    // A repo-only legacy journal cannot identify the checkout GC actually
+    // moved. Preserve any missing sibling whose private HEAD is not already
+    // contained in the integration branch; it may be the last reference to
+    // user commits even when its private index is clean.
+    if (!contained) continue;
+    if (!removeMissingWorktreeRegistration({ ...entry, worktreePath: record.owner }, dataDir, integrationRef)) {
+      return false;
+    }
   }
   return true;
 }
