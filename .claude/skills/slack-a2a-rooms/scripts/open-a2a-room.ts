@@ -49,6 +49,37 @@ export interface SlackAuth {
   token: string;
   userId: string; // U… bot user id (auth.test user_id)
   botId: string | null; // B… bot id (auth.test bot_id)
+  teamId: string | null; // T… workspace id (auth.test team_id)
+}
+
+/**
+ * Refuse a roster whose bots do not all live in one Slack workspace.
+ *
+ * The adapter's suffix-token convention is per-instance, not per-workspace, so
+ * nothing stops an operator from naming two instances installed in different
+ * workspaces. Every `auth.test` then succeeds, because each token is valid
+ * where it lives, and the mismatch only surfaces at `conversations.open`,
+ * which cannot build an MPIM out of user ids from another workspace and says
+ * so with an error that names neither instance.
+ *
+ * Exported for the convention test.
+ */
+export function assertSameWorkspace(auths: SlackAuth[]): void {
+  const known = auths.filter((a): a is SlackAuth & { teamId: string } => a.teamId !== null);
+  const teams = [...new Set(known.map((a) => a.teamId))];
+  if (teams.length <= 1) return;
+  const byTeam = teams
+    .map(
+      (team) =>
+        `${team}: ${known
+          .filter((a) => a.teamId === team)
+          .map((a) => a.name)
+          .join(', ')}`,
+    )
+    .join('; ');
+  // Thrown, not `fail`ed: main()'s catch routes it to the same exit path, and
+  // a throw is what lets the convention test cover this without exiting vitest.
+  throw new Error(`instances span ${teams.length} Slack workspaces, and a group DM cannot cross one — ${byTeam}`);
 }
 
 function fail(msg: string): never {
@@ -164,6 +195,7 @@ async function resolveAuth(name: string): Promise<SlackAuth> {
     token,
     userId,
     botId: typeof auth.bot_id === 'string' ? auth.bot_id : null,
+    teamId: typeof auth.team_id === 'string' ? auth.team_id : null,
   };
 }
 
@@ -177,6 +209,7 @@ async function main(): Promise<void> {
     console.log(`  ${name}: bot user ${auth.userId}${auth.botId ? ` (bot id ${auth.botId})` : ''}`);
     auths.push(auth);
   }
+  assertSameWorkspace(auths);
 
   const caller = auths[0]!;
   const otherBotUserIds = auths.slice(1).map((a) => a.userId);

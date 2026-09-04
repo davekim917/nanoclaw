@@ -102,14 +102,45 @@ this is the query wrapper's job (the same way `/clone-as-codex` does it):
 WG=$(pnpm exec tsx scripts/q.ts data/v2.db \
   "select coalesce(workgroup_id, folder) from agent_groups where folder='<source folder>'" | tr -d '\n')
 
+# stop here if the folder did not match a row — see below for why this matters
+[ -n "$WG" ] || { echo "no agent group with folder '<source folder>'"; exit 1; }
+
 # one per new agent, before its first spawn
 pnpm exec tsx scripts/q.ts data/v2.db \
   "update agent_groups set workgroup_id='${WG}' where folder='<new folder>'"
 ```
 
-An agent that has already spawned is sitting in its own workgroup of one: set
-the column and restart that group (`ncl groups restart --id <group id>`) so the
-next spawn reconciles it onto the shared workgroup.
+Check `WG` before running any update. A folder that matches no row makes the
+select print nothing and still exit 0, and `scripts/q.ts` opens the database
+without `PRAGMA foreign_keys`, so the update writes an empty `workgroup_id`
+over every new agent instead of being refused by the column's reference to
+`workgroups(id)`. Nothing surfaces until first spawn, where the reconciler
+tries to insert that empty id and `workgroups.id`'s `CHECK (id GLOB '[a-z]*')`
+rejects it. Every spawn then fails the same way, so the agents are unreachable
+rather than merely misfiled.
+
+An agent that has already spawned is sitting in its own workgroup of one, and
+rehoming it is a data migration rather than a column edit. Its memory canon is
+a real directory at `data/workgroups/<its own folder>/memory`, reached through
+a `groups/<folder>/memory` symlink that points at the container path and so
+looks identical before and after the move. Changing the column and restarting
+re-points that symlink at the shared canon and leaves the old directory behind:
+`prepareWorkgroupMemoryMember` treats the unchanged link plus an existing
+target as already correct, and it never merges the two trees. The agent comes
+back healthy with none of what it wrote.
+
+Migrate the canon first, then set the column:
+
+```bash
+pnpm exec tsx scripts/migrate-workgroup-memory.ts inventory \
+  --workgroup <its own folder> --report /tmp/wg-memory.json
+pnpm exec tsx scripts/migrate-workgroup-memory.ts apply --report /tmp/wg-memory.json
+```
+
+Read the inventory before applying it, and keep the report: `rollback --report`
+reverses the apply. Restart the group once the column is set
+(`ncl groups restart --id <group id>`) so the next spawn mounts the shared
+canon.
 
 ### 3. Install one Slack app per agent
 

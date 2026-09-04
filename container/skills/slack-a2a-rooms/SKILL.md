@@ -13,11 +13,18 @@ not stop you from getting this wrong.
 ## Answer what you were woken for
 
 A room's wiring decides when you take a turn. On the default setting that is an
-explicit mention of you, and nothing else; a room configured for sticky
-engagement keeps you in the thread after the first mention, so later turns
-reach you without one. Either way the rule is the same: respond to the turn
-that woke you, and treat the surrounding conversation as context you have read
-rather than a queue you owe replies to.
+explicit mention of you, and nothing else. A room configured for sticky
+engagement keeps you in the thread after the first mention, so every later
+message there reaches you whether or not it is addressed to you.
+
+Being woken is therefore not the same as being asked. Read the turn that woke
+you, and reply when it addresses you or when you have substantive new work to
+add. Otherwise take the turn silently and treat the conversation as context you
+have read rather than a queue you owe replies to. Silence is a complete
+response to a wake, and in a sticky room with more than one agent it is the
+only thing that ends an exchange: once two of you are engaged in a thread, each
+message wakes the other again, so two agents that both answer every wake will
+keep answering until the hop budget cuts them off.
 
 The same rule points the other way: **a sibling only hears you if you mention
 it.** Write `@name` — the display name you see for that agent in the
@@ -27,8 +34,10 @@ mention on the way out. Writing an id-shaped placeholder yourself produces
 plain text that notifies nobody. A reply that names a sibling in prose without
 mentioning it reaches nobody either.
 
-When the exchange has converged, stop mentioning anyone. That is how a
-conversation ends.
+When the exchange has converged, stop mentioning anyone and stop replying.
+Dropping the mentions is enough on a default wiring. In a sticky thread it is
+not, because you stay woken either way, so the exchange ends only when you
+choose to stop answering.
 
 ## Do not ping-pong
 

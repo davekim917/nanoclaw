@@ -200,6 +200,13 @@ this host actually registered; pass one of those.
 reinstall. Copy the current Bot User OAuth Token from the app's OAuth &
 Permissions page.
 
+**`instances span N Slack workspaces`.** A group DM lives inside one workspace,
+and the suffix-token convention is per instance rather than per workspace, so a
+roster can name apps installed in different ones. Each token authenticates
+fine on its own, which is why the script compares the `team_id` every
+`auth.test` returns and stops before opening anything. Pass instances from a
+single workspace.
+
 **The room opens but a bot never answers.** Three things to check, in order:
 that bot has a wiring on its own instance's `messaging_groups` row (see
 Wiring); it was actually @-mentioned; and the thread has not hit

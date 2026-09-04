@@ -13,7 +13,7 @@
  */
 import { describe, expect, it, vi } from 'vitest';
 
-import { channelTypeForInstance, normalizeInstance, tokenEnvKey } from './open-a2a-room.js';
+import { assertSameWorkspace, channelTypeForInstance, normalizeInstance, tokenEnvKey } from './open-a2a-room.js';
 
 const env = vi.hoisted(() => ({ values: {} as Record<string, string> }));
 
@@ -80,5 +80,33 @@ describe('open-a2a-room instance naming matches the Slack adapter', () => {
     expect(normalizeInstance('default')).toBe('');
     expect(tokenEnvKey('default')).toBe('SLACK_BOT_TOKEN');
     expect(tokenEnvKey('slack')).toBe('SLACK_BOT_TOKEN');
+  });
+});
+
+describe('open-a2a-room refuses a roster that spans Slack workspaces', () => {
+  const auth = (name: string, teamId: string | null) => ({
+    name,
+    envKey: `SLACK_BOT_TOKEN_${name.toUpperCase()}`,
+    token: 'xoxb-test',
+    userId: `U0${name.toUpperCase()}`,
+    botId: null,
+    teamId,
+  });
+
+  it('test_same_workspace_passes: every bot in one workspace is accepted', () => {
+    expect(() => assertSameWorkspace([auth('dana', 'T111'), auth('eli', 'T111')])).not.toThrow();
+  });
+
+  it('test_cross_workspace_rejected: the error names the workspaces and their instances', () => {
+    // conversations.open cannot build an MPIM from foreign-workspace user ids,
+    // and the error it returns names neither instance — so the roster is
+    // checked here, before the room is created.
+    expect(() => assertSameWorkspace([auth('dana', 'T111'), auth('eli', 'T222')])).toThrow(/spans? 2 Slack workspaces/);
+    expect(() => assertSameWorkspace([auth('dana', 'T111'), auth('eli', 'T222')])).toThrow(/T111: dana/);
+    expect(() => assertSameWorkspace([auth('dana', 'T111'), auth('eli', 'T222')])).toThrow(/T222: eli/);
+  });
+
+  it('test_unknown_team_id_does_not_block: a response without team_id is not treated as a mismatch', () => {
+    expect(() => assertSameWorkspace([auth('dana', 'T111'), auth('eli', null)])).not.toThrow();
   });
 });
