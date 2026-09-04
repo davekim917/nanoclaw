@@ -212,6 +212,7 @@ GATE_OVERRIDE_LINE=""
 GATE_OVERRIDE_LINES=()
 PUSH_HEAD=""
 PUSH_DEST=""
+PUSH_DRY_RUN=0
 run_gate() {
   local node out status=0 sha classes pr saved_pr="$PR"
   GATE_OVERRIDE_LINE=""
@@ -304,6 +305,7 @@ case "${1:?usage: open|churn|classes|gate|push|body|reply|resolve|status}" in
     shift
     PUSH_HEAD=""
     PUSH_DEST=""
+    PUSH_DRY_RUN=0
     push_refspecs=0
     push_positional=0
     for arg in "$@"; do
@@ -327,8 +329,14 @@ case "${1:?usage: open|churn|classes|gate|push|body|reply|resolve|status}" in
         # option that is not on this list is refused rather than assumed
         # harmless: the gate's whole claim is that what reaches the remote is
         # what it judged, and an unrecognised option can break that claim.
+        -n|--dry-run)
+          # Allowed, but it updates nothing, so nothing may be recorded as
+          # pushed. See PUSH_DRY_RUN below.
+          PUSH_DRY_RUN=1
+          continue
+          ;;
         -f|--force|--force-with-lease|--force-with-lease=*|--force-if-includes|\
-        -u|--set-upstream|-n|--dry-run|-q|--quiet|-v|--verbose|--porcelain|\
+        -u|--set-upstream|-q|--quiet|-v|--verbose|--porcelain|\
         --atomic|--no-atomic|--verify|--no-verify|--progress|--no-progress|\
         --thin|--no-thin|-4|--ipv4|-6|--ipv6|--push-option=*)
           continue
@@ -362,6 +370,30 @@ case "${1:?usage: open|churn|classes|gate|push|body|reply|resolve|status}" in
       echo "push sends $push_refspecs refspecs; the churn gate judges one branch at one commit" >&2
       exit 2
     fi
+    # No refspec is not "push the checkout": `push.default=matching` and a
+    # configured `remote.<name>.push` both let a bare push update several
+    # branches, so the gate would judge the checkout while git sent more. The
+    # refspec is therefore always explicit — built here from the checkout when
+    # the caller gave none — and git is never left to decide what a push means.
+    # One `git status` for the pair, so the branch and the commit describe one
+    # instant rather than two.
+    if [ "$push_refspecs" -eq 0 ]; then
+      push_status=$(git status --porcelain=v2 --branch --untracked-files=no)
+      push_oid=$(printf '%s\n' "$push_status" | sed -n 's/^# branch\.oid //p')
+      push_branch=$(printf '%s\n' "$push_status" | sed -n 's/^# branch\.head //p')
+      if [ -z "$push_oid" ] || [ -z "$push_branch" ] || [ "$push_branch" = "(detached)" ] || [ "$push_oid" = "(initial)" ]; then
+        echo "cannot push a detached HEAD; check out a branch or pass <sha>:refs/heads/<branch>" >&2
+        exit 2
+      fi
+      PUSH_HEAD="$push_oid"
+      PUSH_DEST="$push_branch"
+      # Add the remote too when the caller named none, since a refspec without
+      # one is read by git as the repository.
+      if [ "$push_positional" -eq 0 ]; then
+        set -- "$@" origin
+      fi
+      set -- "$@" "$push_oid:refs/heads/$push_branch"
+    fi
     # The gate is about the branch this push UPDATES, which is the refspec's
     # destination — not the checkout's branch, and not BRANCH, either of which
     # can name a different branch whose PRs are clean. Resolving again from the
@@ -379,11 +411,19 @@ case "${1:?usage: open|churn|classes|gate|push|body|reply|resolve|status}" in
       run_gate --committed-only
     fi
     git push "$@"
-    # One line per PR that was overridden — each body records its own.
-    for override in ${GATE_OVERRIDE_LINES[@]+"${GATE_OVERRIDE_LINES[@]}"}; do
-      PR="${override%%$'\t'*}"
-      record_site_patch_override "${override#*$'\t'}"
-    done
+    # One line per PR that was overridden — each body records its own. A dry
+    # run updated no remote, so recording one would write a claim into the PR
+    # body that nothing backs.
+    if [ "$PUSH_DRY_RUN" -eq 1 ]; then
+      if [ ${#GATE_OVERRIDE_LINES[@]} -gt 0 ]; then
+        echo "dry run: the override was NOT recorded on the PR, because nothing was pushed" >&2
+      fi
+    else
+      for override in ${GATE_OVERRIDE_LINES[@]+"${GATE_OVERRIDE_LINES[@]}"}; do
+        PR="${override%%$'\t'*}"
+        record_site_patch_override "${override#*$'\t'}"
+      done
+    fi
     ;;
   body)
     # A single review comment is NOT nested under the PR number; the reply

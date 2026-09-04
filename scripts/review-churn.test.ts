@@ -1135,6 +1135,16 @@ describe('skill wiring', () => {
     expect(helper).toContain('base_repo()');
     expect(helper).toContain('--limit "$PR_LIST_LIMIT"');
     expect(helper).toContain('the listing may be truncated');
+    // Never a bare push: `push.default=matching` and a configured
+    // `remote.<name>.push` both let one update several branches, so the
+    // refspec is built from the checkout when the caller gave none and git is
+    // never left to decide what a push means.
+    expect(push).toContain('push_refspecs" -eq 0');
+    expect(push).toContain('set -- "$@" "$push_oid:refs/heads/$push_branch"');
+    // A dry run updates no remote, so it must not write a claim that a site
+    // patch was pushed into any PR body.
+    expect(push).toContain('PUSH_DRY_RUN=1');
+    expect(push).toMatch(/PUSH_DRY_RUN" -eq 1 \]; then\n[\s\S]*?was NOT recorded/);
     // And every PR the branch resolves to, not the first: one branch can have
     // open PRs into two bases, a push updates both, and a verdict from one
     // would let a held class on the other ride along. The loop is inside
