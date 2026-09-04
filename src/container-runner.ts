@@ -359,7 +359,27 @@ function getMemoryAdmission(): MemoryAdmissionController<QueuedWake> {
 function releaseMemoryReservation(sessionId: string): void {
   if (!memoryAdmission) return;
   if (containerShutdownInProgress) return;
-  const ready = memoryAdmission.release(sessionId);
+  startDrained(memoryAdmission.release(sessionId));
+}
+
+/**
+ * Drop this session's admission entirely — reservation AND any queued request.
+ *
+ * `release` frees a reservation but leaves a QUEUED wake in the controller, and
+ * a queued wake outlives the promise that created it: `wakeContainer` returns
+ * false, `trackWake` settles, and the controller still holds the payload until
+ * some later release drains it. Anything that concludes "this session has no
+ * container and never will" has to say so to the controller too, or the wake it
+ * thought it had cancelled starts minutes later.
+ */
+function cancelMemoryAdmission(sessionId: string): void {
+  if (!memoryAdmission) return;
+  if (containerShutdownInProgress) return;
+  startDrained(memoryAdmission.cancel(sessionId));
+}
+
+/** Start whatever a release or cancel admitted in this session's place. */
+function startDrained(ready: QueuedWake[]): void {
   for (const queued of ready) {
     void startReservedWake(queued).catch((err) => {
       log.warn('Queued container wake failed', { sessionId: queued.session.id, err });
@@ -1429,9 +1449,17 @@ function settlePendingKill(sessionId: string): void {
     stopRunningContainer(sessionId, pending.reason, pending.onExit);
     return;
   }
-  // No container was ever started. There is no process close to ride, so the
-  // exit work runs now — the caller's contract is "this session has no
-  // container any more", and that is satisfied.
+  // No container was ever started — but the wake may still be QUEUED. The
+  // memory-admission controller keeps a queued payload after the wake promise
+  // settles, so firing the exit work here without cancelling it would let a
+  // caller clear and archive the session as final, and a later reservation
+  // release would then drain the queue and spawn into it. `archiveSessionById`
+  // sets only `archived_at`, so `sessionStillActive` would not catch that
+  // spawn either: the row is still `active`.
+  cancelMemoryAdmission(sessionId);
+  // There is no process close to ride, so the exit work runs now — the
+  // caller's contract is "this session has no container any more", and with the
+  // queue cleared that is now true rather than nearly true.
   clearStatusOnKill(sessionId, pending.reason);
   for (const callback of pending.onExit) {
     try {

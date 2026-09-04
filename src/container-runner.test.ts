@@ -52,11 +52,13 @@ const memoryStub = vi.hoisted(() => ({
   queuedPayloads: [] as unknown[],
   requestedIds: [] as string[],
   releasedIds: [] as string[],
+  cancelledIds: [] as string[],
   reset() {
     this.queueNext.clear();
     this.queuedPayloads = [];
     this.requestedIds = [];
     this.releasedIds = [];
+    this.cancelledIds = [];
   },
 }));
 
@@ -93,7 +95,15 @@ vi.mock('./memory-admission.js', () => {
       return drained;
     }
     cancel(id: string): T[] {
-      return this.release(id);
+      memoryStub.cancelledIds.push(id);
+      // The real controller drops the QUEUED entry as well as the reservation.
+      // Modelling that is the whole point here: a stub that aliased cancel to
+      // release would pass whether or not the code under test cancels.
+      memoryStub.queueNext.delete(id);
+      memoryStub.queuedPayloads = memoryStub.queuedPayloads.filter(
+        (payload) => (payload as { session: { id: string } }).session.id !== id,
+      );
+      return [];
     }
     shutdown(): void {
       memoryStub.queuedPayloads = [];
@@ -1847,6 +1857,44 @@ describe('killContainer against a session that is still spawning', () => {
     ).toEqual([{ sessionId: 'sess-queued-guard', reason: 'no longer wanted' }]);
     // And the reservation it was admitted into is handed back, not leaked.
     expect(memoryStub.releasedIds).toContain('sess-queued-guard');
+  });
+
+  /**
+   * A queued wake outlives the promise that created it.
+   *
+   * `wakeContainer` returns false when memory admission queues, `trackWake`
+   * settles, and the controller still holds the payload until some later
+   * release drains it. So "no container running, and the wake promise is
+   * finished" is NOT "this session has no container coming" — and the kill
+   * settle used to treat it as such, firing the caller's exit work. Thread-close
+   * then clears and archives the session as final, a later release drains the
+   * queue, and a container spawns into a thread the operator was told was
+   * closed. `sessionStillActive` does not catch it either: `archiveSessionById`
+   * sets only `archived_at`, so the row is still `active`.
+   */
+  it('cancels a queued wake before reporting the exit, so nothing spawns later', async () => {
+    seedSession('sess-queued-kill');
+    let release!: () => void;
+    storageGate.hold = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    // The wake will QUEUE rather than spawn once it gets past admission.
+    memoryStub.queueNext.add('sess-queued-kill');
+
+    const wake = wakeContainer(callerSnapshot('sess-queued-kill'));
+    await Promise.resolve();
+    const exits: string[] = [];
+    killContainer('sess-queued-kill', 'thread close', () => exits.push('exit'));
+
+    release();
+    await expect(wake).resolves.toBe(false);
+    await Promise.resolve();
+
+    // The exit was reported, AND the controller no longer holds the wake — so
+    // the next reservation release has nothing to drain into this session.
+    expect(exits).toEqual(['exit']);
+    expect(memoryStub.cancelledIds).toContain('sess-queued-kill');
+    expect(memoryStub.queuedPayloads).toEqual([]);
   });
 
   it('still does nothing for a session that is neither running nor spawning', async () => {
