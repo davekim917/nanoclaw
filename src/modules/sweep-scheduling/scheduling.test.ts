@@ -594,6 +594,19 @@ describe('S2-PR11 scheduling + thread-close', () => {
     // archive. The container-runner mock's `killContainer` flips `calls.running`
     // to `false` when it fires `onExit`, matching the real registry.
     expect(calls.order).toEqual(['kill', 'clear', 'archive']);
+    // Said outright, not just implied by the array's order (Codex final): NO
+    // saved-work or outbound mutation happens before the kill completes. The
+    // sequence above would still read correctly if a clear had also fired
+    // earlier and been overwritten in the recorder, and it is the ABSENCE of an
+    // early clear that outbound.db's single-writer rule actually demands — the
+    // host may not touch it while a container still owns it.
+    expect(calls.order.indexOf('clear'), 'saved work was cleared before the kill').toBeGreaterThan(
+      calls.order.indexOf('kill'),
+    );
+    expect(
+      calls.order.filter((step) => step === 'clear'),
+      'more than one clear — one of them ran too early',
+    ).toEqual(['clear']);
     expect(calls.kills).toEqual([{ sessionId: 's1', reason: `thread close ${thread}` }]);
     expect(calls.archives).toEqual(['s1']);
     expect(
