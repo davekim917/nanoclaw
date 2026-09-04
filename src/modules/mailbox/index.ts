@@ -596,6 +596,31 @@ export type NanoclawOutboundSession = NanoclawOutboundRead &
 
 export type NanoclawMailboxAction<T> = (mailbox: NanoclawMailboxSession) => T | Promise<T>;
 
+/**
+ * Extra arguments the outbound funnels demand when their action is async.
+ *
+ * Empty for every synchronous action, so the call site is unchanged. For an
+ * action returning a promise it is `[never]`, and the call fails to compile
+ * for want of an argument nothing can supply.
+ *
+ * A conditional on the RETURN type would not do this — it types the result and
+ * defers the complaint to whatever consumes it. A conditional on the parameter
+ * (`(o) => T extends PromiseLike<unknown> ? never : T`) is worse: a conditional
+ * is not an inference site, so `T` never binds and every action passes. The
+ * arity check is the one form that both preserves inference for `T` (including
+ * `void`, which an intersection guard rejects) and refuses at the call itself.
+ */
+export type SyncActionOnly<T> = T extends PromiseLike<unknown> ? [actionMustNotBeAsync: never] : [];
+
+/** Structural promise test — `instanceof Promise` misses a thenable from another realm. */
+function isThenable(value: unknown): boolean {
+  return (
+    (typeof value === 'object' || typeof value === 'function') &&
+    value !== null &&
+    typeof (value as { then?: unknown }).then === 'function'
+  );
+}
+
 /** Normalize upstream's boolean flag shape onto the fork's 0|1 columns. */
 function toMessageInsert(message: NanoclawInboundInsert): MessageInsert {
   const flag = (value: boolean | 0 | 1 | undefined): 0 | 1 | undefined =>
@@ -830,13 +855,23 @@ export function composeOutboundOps(
  * `composeOutboundOps` directly above, and `read-only.ts` cannot import that
  * without a static import cycle through this barrel — which the host's ESM
  * rules say to avoid rather than rely on hoisting to survive.
+ *
+ * The action must be SYNCHRONOUS. This function is `async` only so callers can
+ * `await` it beside the other funnels; its body does not await, and the
+ * handles close as soon as the action RETURNS. An `async` action returns a
+ * promise at that moment, so its continuation would resume onto closed
+ * handles — `The database connection is not open`, or worse, a handle opened
+ * after the await that nothing ever closes. The rest parameter below makes
+ * that a compile error rather than a runtime surprise, and the runtime check
+ * in the sync core catches the JavaScript caller the types cannot reach.
  */
 export async function withExistingNanoclawOutbound<T>(
   agentGroupId: string,
   sessionId: string,
   action: (outbound: NanoclawOutboundSession) => T,
+  ...sync: SyncActionOnly<T>
 ): Promise<T | undefined> {
-  return withExistingNanoclawOutboundSync(agentGroupId, sessionId, action);
+  return withExistingNanoclawOutboundSync(agentGroupId, sessionId, action, ...sync);
 }
 
 /**
@@ -862,19 +897,35 @@ export function withExistingNanoclawOutboundSync<T>(
   agentGroupId: string,
   sessionId: string,
   action: (outbound: NanoclawOutboundSession) => T,
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars -- type-level only
+  ..._sync: SyncActionOnly<T>
 ): T | undefined {
   const outboundPath = sessionMailboxPath({ agentGroupId, sessionId }, 'outbound');
   if (sessionDbPathIsGone(outboundPath)) return undefined;
   let readable: Database.Database | undefined;
   let writable: Database.Database | undefined;
   try {
-    return action(
+    const result = action(
       composeOutboundOps(
         () => writable ?? (readable ??= openOutboundDb(outboundPath)),
         () => (writable ??= openOutboundDbWritable(outboundPath)),
         true,
       ),
     );
+    // The type above stops a TypeScript caller; this stops the ones it cannot
+    // see — plain JavaScript, an `as never`, a callback whose return type is
+    // widened through a generic. Returning the promise would hand back a value
+    // that only resolves after `finally` has closed the handles it needs, so
+    // the failure surfaces here, at the call, instead of somewhere downstream
+    // as a closed-connection error nobody can trace back.
+    if (isThenable(result)) {
+      throw new TypeError(
+        'withExistingNanoclawOutbound requires a synchronous action: the outbound handles close when it ' +
+          'returns, so an async action resumes onto closed handles. Read what you need synchronously and ' +
+          'await outside the funnel.',
+      );
+    }
+    return result;
   } finally {
     writable?.close();
     readable?.close();

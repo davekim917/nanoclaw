@@ -493,6 +493,34 @@ describe('NanoclawAgentMailbox', () => {
     expect(proposal).toMatchObject({ reason: 'done here' });
   });
 
+  // The funnel closes its handles the moment the action RETURNS, so an async
+  // action would resume onto closed handles. Both halves of the refusal are
+  // pinned: the compile error a TypeScript caller gets, and the throw that
+  // catches everything the types cannot see.
+  it('refuses an async action at compile time', () => {
+    // Compiled, never CALLED: the assertion is the `@ts-expect-error` below,
+    // which fails the build the day an async action stops being an error.
+    // Running it would only prove the runtime half, which the next case owns.
+    const wouldNotCompile = async (): Promise<void> => {
+      // @ts-expect-error an async action needs an extra `never` argument that
+      // nothing can supply — this line ceasing to error IS the regression.
+      await withExistingNanoclawOutbound('ag-compile', 'sess-compile', async (outbound) => {
+        await Promise.resolve();
+        return outbound.readDoneProposal();
+      });
+    };
+    expect(typeof wouldNotCompile).toBe('function');
+  });
+
+  it('refuses a thenable-returning action at runtime, with the handles closed', async () => {
+    const key = freshKey();
+    getAgentMailbox().prepare(key);
+    const asyncAction = (async () => undefined) as unknown as (outbound: unknown) => undefined;
+    await expect(withExistingNanoclawOutbound(key.agentGroupId, key.sessionId, asyncAction as never)).rejects.toThrow(
+      /requires a synchronous action/,
+    );
+  });
+
   it('the outbound funnel answers undefined only when outbound.db is genuinely absent', async () => {
     const key = freshKey();
     getAgentMailbox().prepare(key);
