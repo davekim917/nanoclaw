@@ -528,6 +528,26 @@ describe('review-churn gate', () => {
     expect(gate(payload).status).toBe(3);
   });
 
+  it('does not lift on a trailer whose primitive merely contains a candidate', () => {
+    // A candidate called `evaluateGate` must not be matched by a trailer about
+    // an `evaluateGateTarget`: that trailer is about something else, and
+    // matching it lifts the gate with no reframe behind it.
+    // The commit introduces nothing, so the declaration fallback cannot fire
+    // and the only thing that could lift this is the candidate match itself.
+    const gated = fixture('named-seam-single-file');
+    gated.commits = [
+      {
+        sha: 'ttt0000',
+        date: AFTER,
+        message: 'fix: something else\n\nReframe: race enforced in evaluateGateTarget\n',
+        files: ['src/elsewhere.ts'],
+        before: { 'src/elsewhere.ts': 'export function evaluateGateTarget() {}\n' },
+        after: { 'src/elsewhere.ts': 'export function evaluateGateTarget() {}\nlog("edit");\n' },
+      },
+    ];
+    expect(gate(gated).status).toBe(3);
+  });
+
   it('does not lift on a trailer naming something the commit never declares', () => {
     const payload = fixture('toctou-class');
     payload.commits = [

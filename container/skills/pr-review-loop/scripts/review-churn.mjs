@@ -577,8 +577,12 @@ const REFRAME_TRAILER = /^\s*Reframe:\s*(.+?)\s+enforced in\s+(.+?)\s*$/gim;
 
 /** Does the trailer name one of the classifier's candidates for this entry? */
 function primitiveNamed(entry, trailer) {
-  if (entry.primitives.some((p) => trailer.primitive.includes(p))) return true;
-  return Boolean(entry.seam) && trailer.primitive.includes(path.posix.basename(entry.seam).replace(/\.[jt]sx?$/, ''));
+  // Whole identifiers, the same rule the substantiation check uses: a trailer
+  // naming `target` must not match a candidate called `get`, which would lift
+  // the gate on a trailer that is about something else entirely.
+  if (entry.primitives.some((p) => identifierMatcher(p).test(trailer.primitive))) return true;
+  if (!entry.seam) return false;
+  return identifierMatcher(path.posix.basename(entry.seam).replace(/\.[jt]sx?$/, '')).test(trailer.primitive);
 }
 
 /** Does the trailer name this entry's invariant? */
