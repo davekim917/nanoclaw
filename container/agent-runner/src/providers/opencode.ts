@@ -448,6 +448,94 @@ function clampOpenCodeEffort(raw: string | undefined): string | null {
   return effortClampMap[(raw || '').trim().toLowerCase()] || null;
 }
 
+/**
+ * The input modalities OpenCode's config schema accepts on a model entry
+ * (`modalities.input`, opencode 1.18.x). Anything outside this set makes
+ * OpenCode reject the whole config, so operator input is validated against it
+ * rather than passed through.
+ */
+const MODEL_INPUT_MODALITIES = ['text', 'audio', 'image', 'video', 'pdf'] as const;
+
+/**
+ * A limit env var must be a bare positive integer (a token count). Units
+ * ("64k"), blank strings, zero and negatives are rejected rather than coerced:
+ * `Number()` would turn blank into 0 — which is exactly the silent
+ * compaction-disabling value this whole feature exists to avoid — and "64k"
+ * into NaN, whose emitted config is unparseable JSON that stops OpenCode
+ * booting. Invalid input is treated as unset.
+ */
+export function parseLimitEnv(varName: string, raw: string | undefined): number | undefined {
+  if (raw === undefined) return undefined;
+  const trimmed = raw.trim();
+  if (!/^\d+$/.test(trimmed) || Number(trimmed) <= 0) {
+    log(`Ignoring invalid ${varName}: "${raw}"`);
+    return undefined;
+  }
+  return Number(trimmed);
+}
+
+/**
+ * The `limit` block for the main model entry, or undefined.
+ *
+ * OpenCode auto-compacts a session once tokens reach `limit.context` minus the
+ * max output tokens. A registry-unknown custom model resolves `limit.context`
+ * to 0, which silently disables compaction and kills long sessions against a
+ * fixed-window backend. Declaring the limit is the only way to switch it back on.
+ *
+ * BOTH values are required, which is where this departs from upstream (which
+ * emits `context` alone when no output limit is set). opencode 1.18.x's own
+ * config schema is `limit: optional(Struct({context: Finite, input:
+ * optional(Finite), output: Finite}))` — read out of the shipped binary — so a
+ * `limit` carrying only `context` fails validation and takes the entire config
+ * down with it, dropping every MCP server and the guard plugin along with the
+ * limit. Absent or half-set env vars emit no `limit` key and behavior is
+ * unchanged.
+ */
+export function resolveModelLimit(
+  env: NodeJS.ProcessEnv = process.env,
+): { context: number; output: number } | undefined {
+  const context = parseLimitEnv('OPENCODE_MODEL_CONTEXT_LIMIT', env.OPENCODE_MODEL_CONTEXT_LIMIT);
+  const output = parseLimitEnv('OPENCODE_MODEL_OUTPUT_LIMIT', env.OPENCODE_MODEL_OUTPUT_LIMIT);
+  if (context === undefined && output === undefined) return undefined;
+  if (context === undefined || output === undefined) {
+    log(
+      'Ignoring model limit declaration: opencode requires BOTH OPENCODE_MODEL_CONTEXT_LIMIT and ' +
+        'OPENCODE_MODEL_OUTPUT_LIMIT to be valid positive integers',
+    );
+    return undefined;
+  }
+  return { context, output };
+}
+
+/**
+ * The `modalities` block for the main model entry, or undefined.
+ *
+ * OpenCode drops every non-text file part whose modality the model does not
+ * declare, substituting an "this model does not support <modality> input"
+ * error, and a registry-unknown custom model declares nothing. So an image can
+ * reach the session store and never reach the model. Declaring the modalities
+ * is the only thing that opens that gate; `attachment` is a registry/UI flag
+ * rather than a pipeline gate, but it is set alongside so the entry stays
+ * internally consistent. Absent the env var, no capability keys are emitted.
+ */
+export function resolveModelModalities(
+  env: NodeJS.ProcessEnv = process.env,
+): { input: string[]; output: string[] } | undefined {
+  const requested = (env.OPENCODE_MODEL_INPUT_MODALITIES ?? '')
+    .split(',')
+    .map((entry) => entry.trim().toLowerCase())
+    .filter(Boolean)
+    .filter((entry, i, a) => a.indexOf(entry) === i)
+    .filter((entry) => {
+      if ((MODEL_INPUT_MODALITIES as readonly string[]).includes(entry)) return true;
+      log(`Ignoring unknown OPENCODE_MODEL_INPUT_MODALITIES entry: ${entry}`);
+      return false;
+    })
+    .filter((entry) => entry !== 'text');
+  if (requested.length === 0) return undefined;
+  return { input: ['text', ...requested], output: ['text'] };
+}
+
 export function buildOpenCodeConfig(
   options: ProviderOptions,
   turn: OpenCodeTurnOverrides = {},
@@ -498,6 +586,13 @@ export function buildOpenCodeConfig(
   const modelsToRegister = [defaultModelId, smallModelId]
     .filter((mid): mid is string => Boolean(mid))
     .filter((mid, i, a) => a.indexOf(mid) === i);
+  // limit / modalities describe the MAIN model only — the env vars name no
+  // small-model equivalent, and spreading them onto a distinct
+  // OPENCODE_SMALL_MODEL entry would falsely declare its context window and
+  // media support as the main model's. A differing small model gets a bare
+  // entry and resolves through OpenCode's own undeclared-model default.
+  const modelLimit = resolveModelLimit();
+  const modelModalities = resolveModelModalities();
   const modelsBlock =
     modelsToRegister.length > 0
       ? {
@@ -509,6 +604,8 @@ export function buildOpenCodeConfig(
                 name: mid,
                 tool_call: true,
                 ...(mid === defaultModelId && modelOptions ? { options: modelOptions } : {}),
+                ...(mid === defaultModelId && modelLimit ? { limit: modelLimit } : {}),
+                ...(mid === defaultModelId && modelModalities ? { attachment: true, modalities: modelModalities } : {}),
               },
             ]),
           ),
