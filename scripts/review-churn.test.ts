@@ -1122,7 +1122,14 @@ describe('skill wiring', () => {
     expect(order.every((i) => i >= 0)).toBe(true);
     expect(order).toEqual([...order].sort((a, b) => a - b));
     // A named BRANCH resolves the PR, never the mutable checkout.
-    expect(helper).toMatch(/BRANCH:-\}" \]; then\n[\s\S]*?PR=\$\(gh pr list --repo "\$REPO" --head "\$BRANCH"/);
+    expect(helper).toMatch(/BRANCH:-\}" \]; then\n[\s\S]*?PR_LIST=\$\(gh pr list --repo "\$REPO" --head "\$BRANCH"/);
+    // And every PR the branch resolves to, not the first: one branch can have
+    // open PRs into two bases, a push updates both, and a verdict from one
+    // would let a held class on the other ride along. The loop is inside
+    // run_gate, which is the seam `gate` and `push` share.
+    const runGate = helper.slice(helper.indexOf('run_gate() {'), helper.indexOf('case "${1'));
+    expect(runGate).toContain('for pr in $PR_LIST');
+    expect(helper).not.toMatch(/\)\]\[0\]\.number/);
     // `--head` filters by branch name only, so a fork PR with the same branch
     // name is in the result set; the source repository is what separates them.
     expect(helper).toContain('headRepositoryOwner.login ==');

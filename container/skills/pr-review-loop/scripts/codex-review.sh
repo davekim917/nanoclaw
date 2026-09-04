@@ -41,12 +41,20 @@ if [ -z "${PR:-}" ] && [ -n "${BRANCH:-}" ]; then
   # share this name is returned alongside the first-party one and `.[0]` can
   # pick it — the gate would then judge someone else's findings. The source
   # repository is what disambiguates, so it is matched explicitly.
-  PR=$(gh pr list --repo "$REPO" --head "$BRANCH" --state open \
+  #
+  # And ALL of them, not the first: one branch can have open PRs into two base
+  # branches, `--head` does not separate those either, and a push updates every
+  # one of them. A verdict from one PR would let a held class on the other ride
+  # along, so every matching PR is gated (see `run_gate`).
+  PR_LIST=$(gh pr list --repo "$REPO" --head "$BRANCH" --state open \
     --json number,headRepositoryOwner,headRepository \
-    -q "[.[] | select(.headRepositoryOwner.login == \"${REPO%%/*}\" and .headRepository.name == \"${REPO##*/}\")][0].number")
-  [ -n "$PR" ] || { echo "no open PR for branch $BRANCH" >&2; exit 1; }
+    -q "[.[] | select(.headRepositoryOwner.login == \"${REPO%%/*}\" and .headRepository.name == \"${REPO##*/}\")] | .[].number")
+  [ -n "$PR_LIST" ] || { echo "no open PR for branch $BRANCH" >&2; exit 1; }
+  PR=$(printf '%s\n' "$PR_LIST" | head -1)
 fi
 PR="${PR:-$(gh pr view --json number -q .number)}"
+# An explicitly named PR is exactly one; a branch may have resolved to several.
+PR_LIST="${PR_LIST:-$PR}"
 OWNER="${REPO%/*}"
 NAME="${REPO#*/}"
 
@@ -162,19 +170,38 @@ $line" >/dev/null
 # pushed, so only `push` records it, and only after the push succeeds — a
 # rejected push must not leave that claim in the PR body. `run_gate` just hands
 # the line back in GATE_OVERRIDE_LINE.
+#
+# Every PR in PR_LIST is judged, and the first refusal is the answer. A push
+# updates every open PR whose head is this branch, so a verdict from one of
+# them is not a verdict about the push — this is the seam both `gate` and
+# `push` route through, which is why the loop lives here and not in either
+# caller. Override lines come back per PR in GATE_OVERRIDE_LINES, tab-separated
+# as `<pr>\t<line>`, since each PR body records its own.
 GATE_OVERRIDE_LINE=""
+GATE_OVERRIDE_LINES=()
 PUSH_HEAD=""
 run_gate() {
-  local node out status=0 sha classes
+  local node out status=0 sha classes pr saved_pr="$PR"
   GATE_OVERRIDE_LINE=""
+  GATE_OVERRIDE_LINES=()
   node=$(runtime) || return 2
-  out=$(payload_json | "$node" "$CHURN_JS" gate --json "$@") || status=$?
-  if [ "$status" -eq 0 ] && [ "$(printf '%s' "$out" | jq -r .status)" = "override" ]; then
-    sha=$(git rev-parse --short "${PUSH_HEAD:-HEAD}")
-    classes=$(printf '%s' "$out" | jq -r '[.unlifted[] | "`\(.key)`"] | join(", ")')
-    GATE_OVERRIDE_LINE="⚠️ \`REVIEW_LOOP_ALLOW_SITE_PATCH=1\` used at \`$sha\`: site patch pushed for $classes without the primitive fix."
-  fi
-  return "$status"
+  for pr in $PR_LIST; do
+    PR="$pr"
+    status=0
+    out=$(payload_json | "$node" "$CHURN_JS" gate --json "$@") || status=$?
+    if [ "$status" -ne 0 ]; then
+      PR="$saved_pr"
+      return "$status"
+    fi
+    if [ "$(printf '%s' "$out" | jq -r .status)" = "override" ]; then
+      sha=$(git rev-parse --short "${PUSH_HEAD:-HEAD}")
+      classes=$(printf '%s' "$out" | jq -r '[.unlifted[] | "`\(.key)`"] | join(", ")')
+      GATE_OVERRIDE_LINE="⚠️ \`REVIEW_LOOP_ALLOW_SITE_PATCH=1\` used at \`$sha\`: site patch pushed for $classes without the primitive fix."
+      GATE_OVERRIDE_LINES+=("$pr"$'\t'"$GATE_OVERRIDE_LINE")
+    fi
+  done
+  PR="$saved_pr"
+  return 0
 }
 
 case "${1:?usage: open|churn|classes|gate|push|body|reply|resolve|status}" in
@@ -307,9 +334,11 @@ case "${1:?usage: open|churn|classes|gate|push|body|reply|resolve|status}" in
       run_gate --committed-only
     fi
     git push "$@"
-    if [ -n "$GATE_OVERRIDE_LINE" ]; then
-      record_site_patch_override "$GATE_OVERRIDE_LINE"
-    fi
+    # One line per PR that was overridden — each body records its own.
+    for override in ${GATE_OVERRIDE_LINES[@]+"${GATE_OVERRIDE_LINES[@]}"}; do
+      PR="${override%%$'\t'*}"
+      record_site_patch_override "${override#*$'\t'}"
+    done
     ;;
   body)
     # A single review comment is NOT nested under the PR number; the reply
