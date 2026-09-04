@@ -1,0 +1,66 @@
+---
+name: slack-a2a-rooms
+description: How to behave in a shared Slack room with sibling agents — mention-driven turn taking, who posts an introduction, the bot-to-bot hop budget, and why room history is not shared memory. Read this when you are in a Slack group DM that holds other agents, when a sibling @-mentions you, or before introducing a new sibling in a room.
+---
+
+# Sharing a Slack room with sibling agents
+
+A room is one Slack group conversation holding a human and two or more agents,
+each with its own bot user. You hear the others' messages the same way you hear
+a human's. Everything below is convention, not enforcement — the platform will
+not stop you from getting this wrong.
+
+## Turn taking is mention-driven
+
+In a room you engage when you are @-mentioned, then stay engaged in that
+thread. Everything else accumulates as ambient context — read it, do not answer
+it.
+
+The same rule points the other way: **a sibling only hears you if you mention
+it.** Write the mention as the literal `<@U…>` token for that bot's user id and
+it renders as a real mention. A reply that names a sibling in prose but does
+not tag it reaches nobody.
+
+When the exchange has converged, stop mentioning anyone. That is how a
+conversation ends.
+
+## Do not ping-pong
+
+There is a hop budget: after a run of consecutive agent-to-agent turns with no
+human message, sibling traffic in that thread is dropped until a human speaks.
+Do not treat that ceiling as the stopping rule — self-limit well below it. Do
+the work, converge, hand back to the human. Two agents alternating
+acknowledgements is the failure mode the budget exists to catch, and hitting it
+means a human has to come rescue the thread.
+
+## You introduce the agents you bring in
+
+When a sibling you created or requested joins a room, **you** post the
+introduction — nobody else does. Keep it to one or two lines in your own voice:
+what the new agent is for, and its `<@U…>` tag. No mechanics, no member list,
+no setup narration.
+
+## Teams get one room
+
+When the user asks for several agents on one project, they want **one** shared
+room with all of them, not one room per pair. Say so if the request is
+drifting toward the second. Slack mints a _new_ conversation whenever a group
+DM's membership changes, so a room cannot grow in place — an agent added later
+means a new room and fresh wiring. Ask for the full roster up front.
+
+## Room history is not memory
+
+Rooms, DMs and channels are separate conversations and do not share history.
+Anything durable — a decision, a preference, ongoing state — goes in your
+memory directory. Do not assume a sibling read something you said in a
+different conversation, and do not assume you will still have the room's
+transcript next session.
+
+## Creating siblings
+
+On this install, `create_agent` gives a new agent group and a `send_message`
+destination. It does **not** provision a Slack app: a new agent arrives as its
+own Slack bot only after an operator installs a second Slack app for it. If
+the user asks for an agent that appears in Slack, create the group, say plainly
+that the Slack bot needs an operator step, and point them at the
+`slack-agent-flow` skill on the host.
