@@ -32,7 +32,8 @@ vi.mock('../../config.js', async () => {
   return { ...actual, DATA_DIR: TEST_DIR };
 });
 
-vi.mock('../../container-runner.js', () => ({
+vi.mock('../../container-runner.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../container-runner.js')>()),
   wakeContainer: mocks.wakeContainer,
 }));
 

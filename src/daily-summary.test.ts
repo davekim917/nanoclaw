@@ -15,23 +15,46 @@ const dailySummaryMocks = vi.hoisted(() => ({
   logDebug: vi.fn(),
 }));
 
-vi.mock('./db/agent-groups.js', () => ({ getAllAgentGroups: dailySummaryMocks.getAllAgentGroups }));
-vi.mock('./db/backlog.js', () => ({
+vi.mock('./db/agent-groups.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./db/agent-groups.js')>()),
+  getAllAgentGroups: dailySummaryMocks.getAllAgentGroups,
+}));
+vi.mock('./db/backlog.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./db/backlog.js')>()),
   getBacklog: dailySummaryMocks.getBacklog,
   getBacklogResolvedSince: dailySummaryMocks.getBacklogResolvedSince,
   getShipLogSince: dailySummaryMocks.getShipLogSince,
 }));
-vi.mock('./db/messaging-groups.js', () => ({ getMessagingGroup: dailySummaryMocks.getMessagingGroup }));
-vi.mock('./delivery.js', () => ({ getDeliveryAdapter: dailySummaryMocks.getDeliveryAdapter }));
-vi.mock('./container-config.js', () => ({ readContainerConfig: dailySummaryMocks.readContainerConfig }));
-vi.mock('./github-token.js', () => ({ resolveGitHubToken: dailySummaryMocks.resolveGitHubToken }));
+vi.mock('./db/messaging-groups.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./db/messaging-groups.js')>()),
+  getMessagingGroup: dailySummaryMocks.getMessagingGroup,
+}));
+vi.mock('./delivery.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./delivery.js')>()),
+  getDeliveryAdapter: dailySummaryMocks.getDeliveryAdapter,
+}));
+vi.mock('./container-config.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./container-config.js')>()),
+  readContainerConfig: dailySummaryMocks.readContainerConfig,
+}));
+vi.mock('./github-token.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./github-token.js')>()),
+  resolveGitHubToken: dailySummaryMocks.resolveGitHubToken,
+}));
+// NOT spread: log.ts installs process-wide uncaughtException/unhandledRejection
+// handlers (including process.exit(1)) at module scope — importOriginal() would
+// install those in this test file's worker. Kept as a complete stub instead.
+// (davekim917/nanoclaw#355 review thread)
 vi.mock('./log.js', () => ({
+  setLogScrubber: vi.fn(),
   log: {
     warn: dailySummaryMocks.logWarn,
     error: dailySummaryMocks.logError,
     info: dailySummaryMocks.logInfo,
     debug: dailySummaryMocks.logDebug,
+    fatal: vi.fn(),
   },
+  isSurvivableIoError: vi.fn(() => false),
 }));
 
 import { splitForLimit } from './channels/chat-sdk-bridge.js';

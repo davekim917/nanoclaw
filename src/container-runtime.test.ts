@@ -1,7 +1,12 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 // Mock log
+// NOT spread: log.ts installs process-wide uncaughtException/unhandledRejection
+// handlers (including process.exit(1)) at module scope — importOriginal() would
+// install those in this test file's worker. Kept as a complete stub instead.
+// (davekim917/nanoclaw#355 review thread)
 vi.mock('./log.js', () => ({
+  setLogScrubber: vi.fn(),
   log: {
     debug: vi.fn(),
     info: vi.fn(),
@@ -9,6 +14,7 @@ vi.mock('./log.js', () => ({
     error: vi.fn(),
     fatal: vi.fn(),
   },
+  isSurvivableIoError: vi.fn(() => false),
 }));
 
 // Mock child_process — store the mock fn so tests can configure it

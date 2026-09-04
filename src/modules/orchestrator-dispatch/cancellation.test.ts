@@ -7,11 +7,13 @@ import type { Task } from './db/tasks.js';
 import { applySpawnCancel } from './cancellation.js';
 import type { Session } from '../../types.js';
 
-vi.mock('../../session-manager.js', () => ({
+vi.mock('../../session-manager.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../session-manager.js')>()),
   writeSessionMessage: vi.fn().mockResolvedValue(undefined),
 }));
 
-vi.mock('../../container-runner.js', () => ({
+vi.mock('../../container-runner.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../container-runner.js')>()),
   killContainer: vi.fn(),
   wakeContainer: vi.fn().mockResolvedValue(true),
 }));

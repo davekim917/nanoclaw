@@ -16,20 +16,27 @@ vi.mock('child_process', () => ({
 // a real in-memory sessions table, so status CAS (active -> archiving ->
 // closed) is exercised against actual SQL rather than a hand-rolled fake.
 const centralDbMock = vi.hoisted(() => ({ current: null as null | { db: Database.Database } }));
-vi.mock('./db/connection.js', () => ({
+vi.mock('./db/connection.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./db/connection.js')>()),
   getDb: () => {
     if (!centralDbMock.current) throw new Error('central db unavailable in storage-manager unit test');
     return centralDbMock.current.db;
   },
 }));
 
-vi.mock('./db/container-configs.js', () => ({
+vi.mock('./db/container-configs.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./db/container-configs.js')>()),
   getAllContainerConfigs: () => mockGetAllContainerConfigs(),
 }));
 
+// NOT spread: log.ts installs process-wide uncaughtException/unhandledRejection
+// handlers (including process.exit(1)) at module scope — importOriginal() would
+// install those in this test file's worker. Kept as a complete stub instead.
+// (davekim917/nanoclaw#355 review thread)
 vi.mock('./log.js', () => ({
-  log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
+  log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn(), fatal: vi.fn() },
   setLogScrubber: vi.fn(),
+  isSurvivableIoError: vi.fn(() => false),
 }));
 
 import {

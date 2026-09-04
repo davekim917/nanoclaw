@@ -19,7 +19,10 @@ const mockDispatch = vi.mocked(_dispatchRaw);
 // pins is everything in front of it: who may assign, which items and channels
 // are reachable, that a double press queues once, and that the prompt is
 // composed from the board rather than from the request body.
-vi.mock('../cli/dispatch.js', () => ({ dispatch: vi.fn() }));
+vi.mock('../cli/dispatch.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../cli/dispatch.js')>()),
+  dispatch: vi.fn(),
+}));
 
 const OWNER = 'u-owner';
 const ADMIN = 'u-admin';

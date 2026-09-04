@@ -26,7 +26,8 @@ import { upsertUserDm } from '../permissions/db/user-dms.js';
 import { grantRole } from '../permissions/db/user-roles.js';
 import { requestApproval } from './primitive.js';
 
-vi.mock('../../container-runner.js', () => ({
+vi.mock('../../container-runner.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../container-runner.js')>()),
   wakeContainer: vi.fn().mockResolvedValue(undefined),
 }));
 

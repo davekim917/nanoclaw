@@ -88,7 +88,8 @@ vi.mock('../orchestrator-dispatch/db/tasks.js', async (importOriginal) => {
   };
 });
 
-vi.mock('../orchestrator-dispatch/db/agent-group-capabilities.js', () => ({
+vi.mock('../orchestrator-dispatch/db/agent-group-capabilities.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../orchestrator-dispatch/db/agent-group-capabilities.js')>()),
   getCapabilityConfig: (...args: unknown[]) => mockGetCapabilityConfig(...args),
 }));
 

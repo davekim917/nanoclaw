@@ -7,13 +7,20 @@
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 
+// NOT spread: log.ts installs process-wide uncaughtException/unhandledRejection
+// handlers (including process.exit(1)) at module scope — importOriginal() would
+// install those in this test file's worker. Kept as a complete stub instead.
+// (davekim917/nanoclaw#355 review thread)
 vi.mock('../../log.js', () => ({
-  log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
+  setLogScrubber: vi.fn(),
+  log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn(), fatal: vi.fn() },
+  isSurvivableIoError: vi.fn(() => false),
 }));
 
 // wirings' postCommit projects destinations into live session DBs — no
 // sessions run in this test, but the module must not open on-disk DB files.
-vi.mock('../../modules/agent-to-agent/write-destinations.js', () => ({
+vi.mock('../../modules/agent-to-agent/write-destinations.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../modules/agent-to-agent/write-destinations.js')>()),
   writeDestinations: vi.fn(),
 }));
 

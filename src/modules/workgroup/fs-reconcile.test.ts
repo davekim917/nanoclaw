@@ -15,7 +15,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 // applies them via its static mock hoisting.
 
 // We need log to not throw so silence it.
+// NOT spread: log.ts installs process-wide uncaughtException/unhandledRejection
+// handlers (including process.exit(1)) at module scope — importOriginal() would
+// install those in this test file's worker. Kept as a complete stub instead.
+// (davekim917/nanoclaw#355 review thread)
 vi.mock('../../log.js', () => ({
+  setLogScrubber: vi.fn(),
   log: {
     info: vi.fn(),
     warn: vi.fn(),
@@ -23,6 +28,7 @@ vi.mock('../../log.js', () => ({
     debug: vi.fn(),
     fatal: vi.fn(),
   },
+  isSurvivableIoError: vi.fn(() => false),
 }));
 
 import { reconcileWorkgroupFsState } from './fs-reconcile.js';

@@ -34,7 +34,8 @@ vi.mock('../../config.js', async () => {
 const TEST_DIR = '/tmp/nanoclaw-test-permissions-grant';
 
 const notifyCalls: Array<{ sessionId: string; text: string }> = [];
-vi.mock('../approvals/index.js', () => ({
+vi.mock('../approvals/index.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../approvals/index.js')>()),
   notifyAgent: (session: { id: string }, text: string) => {
     notifyCalls.push({ sessionId: session.id, text });
   },

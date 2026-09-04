@@ -138,7 +138,8 @@ vi.mock('../../db/sessions.js', async (importOriginal) => {
   };
 });
 
-vi.mock('../../channels/channel-registry.js', () => ({
+vi.mock('../../channels/channel-registry.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../channels/channel-registry.js')>()),
   getChannelAdapter: vi.fn(),
   registerChannelAdapter: vi.fn(),
   getActiveAdapters: vi.fn().mockReturnValue([]),

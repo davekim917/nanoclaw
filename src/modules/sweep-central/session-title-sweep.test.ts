@@ -98,13 +98,17 @@ vi.mock('../../config.js', async (importOriginal) => {
     },
   };
 });
-// Full replacement, not importOriginal: config.ts's own top-level code reads
-// ONECLI_API_KEY and other secrets straight off the real .env file via
-// readEnvFile() — with the config.js mock above now using importOriginal
-// (needed for its OTHER exports), config.ts's real body executes for real,
-// so this file must keep BOTH env.js exports safely stubbed, never real, to
-// avoid ever loading actual on-disk secrets into this process.
-vi.mock('../../env.js', () => ({
+// config.ts's own top-level code reads ONECLI_API_KEY and other secrets
+// straight off the real .env file via readEnvFile() — with the config.js mock
+// above now using importOriginal (needed for its OTHER exports), config.ts's
+// real body executes for real, so this file must keep BOTH env.js exports
+// safely stubbed, never real, to avoid ever loading actual on-disk secrets
+// into this process. Spreading importOriginal below is still safe: env.ts has
+// no import-time side effects (its functions only touch disk when CALLED),
+// and both of its exports are explicitly overridden immediately after the
+// spread, so they always resolve to the stub, never the real implementation.
+vi.mock('../../env.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../env.js')>()),
   readEnvFile: vi.fn(() => ({})),
   readEnvFileMatching: vi.fn(() => ({})),
 }));

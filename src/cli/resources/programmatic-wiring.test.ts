@@ -21,7 +21,8 @@ import fs from 'fs';
 
 import { describe, expect, it, beforeEach, afterEach, vi } from 'vitest';
 
-vi.mock('../../container-runner.js', () => ({
+vi.mock('../../container-runner.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../container-runner.js')>()),
   wakeContainer: vi.fn().mockResolvedValue(undefined),
   isContainerRunning: vi.fn().mockReturnValue(false),
   getActiveContainerCount: vi.fn().mockReturnValue(0),
@@ -37,9 +38,10 @@ vi.mock('../../config.js', async () => {
 // groups-create calls initGroupFilesystem, which scaffolds under the real
 // groups/ dir — neutralize the FS writes but keep the container_configs row
 // the assertions below count.
-vi.mock('../../group-init.js', async () => {
+vi.mock('../../group-init.js', async (importOriginal) => {
   const { ensureContainerConfig } = await import('../../db/container-configs.js');
   return {
+    ...(await importOriginal<typeof import('../../group-init.js')>()),
     initGroupFilesystem: vi.fn((group: { id: string }) => {
       ensureContainerConfig(group.id);
     }),
@@ -48,7 +50,10 @@ vi.mock('../../group-init.js', async () => {
 
 // wirings' postCommit projects destinations into live session DBs — no
 // sessions run in this test, but the module must not open on-disk DB files.
-vi.mock('../../modules/agent-to-agent/write-destinations.js', () => ({ writeDestinations: vi.fn() }));
+vi.mock('../../modules/agent-to-agent/write-destinations.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../modules/agent-to-agent/write-destinations.js')>()),
+  writeDestinations: vi.fn(),
+}));
 
 const { TEST_DIR } = vi.hoisted(() => ({ TEST_DIR: uniqueTmpRoot('test-cli-programmatic-wiring') }));
 

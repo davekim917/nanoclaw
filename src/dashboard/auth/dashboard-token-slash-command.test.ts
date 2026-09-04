@@ -1,28 +1,39 @@
 import { afterEach, beforeEach, describe, it, expect, vi } from 'vitest';
 
-vi.mock('../../channels/chat-sdk-bridge.js', () => ({
+vi.mock('../../channels/chat-sdk-bridge.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../channels/chat-sdk-bridge.js')>()),
   registerSlashCommandHandler: vi.fn(),
 }));
 
-vi.mock('../../modules/permissions/db/user-roles.js', () => ({
+vi.mock('../../modules/permissions/db/user-roles.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../modules/permissions/db/user-roles.js')>()),
   isAnyAdmin: vi.fn(),
 }));
 
-vi.mock('../../modules/permissions/db/agent-group-members.js', () => ({
+vi.mock('../../modules/permissions/db/agent-group-members.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../modules/permissions/db/agent-group-members.js')>()),
   hasAnyMembership: vi.fn(),
 }));
 
-vi.mock('../../modules/permissions/db/users.js', () => ({
+vi.mock('../../modules/permissions/db/users.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../modules/permissions/db/users.js')>()),
   upsertUser: vi.fn(),
 }));
 
-vi.mock('./dashboard-token-issue.js', () => ({
+vi.mock('./dashboard-token-issue.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./dashboard-token-issue.js')>()),
   mintDashboardTokenUrl: vi.fn(),
   formatTtl: vi.fn(() => '720h'),
 }));
 
+// NOT spread: log.ts installs process-wide uncaughtException/unhandledRejection
+// handlers (including process.exit(1)) at module scope — importOriginal() would
+// install those in this test file's worker. Kept as a complete stub instead.
+// (davekim917/nanoclaw#355 review thread)
 vi.mock('../../log.js', () => ({
-  log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
+  setLogScrubber: vi.fn(),
+  log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn(), fatal: vi.fn() },
+  isSurvivableIoError: vi.fn(() => false),
 }));
 
 import { dashboardTokenSlashCommand } from './dashboard-token-slash-command.js';

@@ -9,7 +9,8 @@ import type { Session } from '../../types.js';
 
 const deliverMock = vi.fn().mockResolvedValue(undefined);
 
-vi.mock('../../channels/channel-registry.js', () => ({
+vi.mock('../../channels/channel-registry.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../channels/channel-registry.js')>()),
   getChannelAdapter: vi.fn(() => ({ deliver: deliverMock })),
 }));
 

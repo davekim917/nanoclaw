@@ -9,11 +9,18 @@ const { tmpRoot } = vi.hoisted(() => {
   return { tmpRoot: fsMod.mkdtempSync(pathMod.join(osMod.tmpdir(), 'attach-dl-')) };
 });
 
-vi.mock('./container-config.js', () => ({ readContainerConfig: () => ({}) }));
-vi.mock('./session-manager.js', () => ({
+vi.mock('./container-config.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./container-config.js')>()),
+  readContainerConfig: () => ({}),
+}));
+vi.mock('./session-manager.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./session-manager.js')>()),
   sessionDir: (ag: string, sess: string) => path.join(tmpRoot, ag, sess),
 }));
-vi.mock('./config.js', () => ({ GROUPS_DIR: path.join(tmpRoot, 'groups') }));
+vi.mock('./config.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./config.js')>()),
+  GROUPS_DIR: path.join(tmpRoot, 'groups'),
+}));
 
 import { persistInboundAttachments } from './attachment-downloader.js';
 

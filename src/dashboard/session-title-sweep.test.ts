@@ -11,7 +11,8 @@ import { log } from '../log.js';
 // sweep will pick up.
 let TMP_DIR: string;
 
-vi.mock('../config.js', () => ({
+vi.mock('../config.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../config.js')>()),
   get DATA_DIR() {
     return TMP_DIR;
   },
@@ -24,7 +25,8 @@ vi.mock('../config.js', () => ({
 // reason: this repo's real on-disk `.env` holds real OAuth tokens, and tests
 // must never read them). Credential slots for the tests below come
 // exclusively from process.env, set explicitly per test.
-vi.mock('../env.js', () => ({
+vi.mock('../env.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../env.js')>()),
   readEnvFileMatching: vi.fn(() => ({})),
 }));
 

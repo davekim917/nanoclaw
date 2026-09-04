@@ -19,11 +19,19 @@ vi.mock('../config.js', async (importOriginal) => ({
 }));
 
 const dispatch = vi.fn();
-vi.mock('./dispatch.js', () => ({ dispatch: (...args: unknown[]) => dispatch(...args) }));
+vi.mock('./dispatch.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./dispatch.js')>()),
+  dispatch: (...args: unknown[]) => dispatch(...args),
+}));
 
-vi.mock('../log.js', async (importOriginal) => ({
-  ...(await importOriginal<typeof import('../log.js')>()),
+// NOT spread: log.ts installs process-wide uncaughtException/unhandledRejection
+// handlers (including process.exit(1)) at module scope — importOriginal() would
+// install those in this test file's worker. Kept as a complete stub instead.
+// (davekim917/nanoclaw#355 review thread)
+vi.mock('../log.js', () => ({
+  setLogScrubber: vi.fn(),
   log: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn(), fatal: vi.fn() },
+  isSurvivableIoError: vi.fn(() => false),
 }));
 
 const TEST_DIR = '/tmp/nanoclaw-test-cli-delivery-action';

@@ -66,10 +66,12 @@ afterEach(() => {
 const mockReconcileMergedClaims = vi.fn();
 const mockSweepClaimsSelfHeal = vi.fn();
 
-vi.mock('../claims/reconcile.js', () => ({
+vi.mock('../claims/reconcile.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../claims/reconcile.js')>()),
   reconcileMergedClaims: (...args: unknown[]) => mockReconcileMergedClaims(...args),
 }));
-vi.mock('../claims/self-heal.js', () => ({
+vi.mock('../claims/self-heal.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../claims/self-heal.js')>()),
   sweepClaimsSelfHeal: (...args: unknown[]) => mockSweepClaimsSelfHeal(...args),
 }));
 

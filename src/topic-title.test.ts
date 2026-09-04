@@ -3,7 +3,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { closeDb, initTestDb, runMigrations } from './db/index.js';
 import { getThreadTitleRow, insertThreadTitleClaim, recordThreadTitleAttemptFailure } from './db/thread-titles.js';
 
-vi.mock('./llm.js', () => ({
+vi.mock('./llm.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./llm.js')>()),
   callHaiku: vi.fn(async () => 'Rollout fix'),
 }));
 

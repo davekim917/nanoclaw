@@ -49,9 +49,13 @@ const dm = vi.hoisted(() => ({ ensure: vi.fn() }));
 // factory's module survives `vi.resetModules()`, so the mocked module (and the
 // DB connection it closed over) would stay bound to the FIRST test's graph and
 // `pickApprover` would answer from a previous test's database.
-vi.mock('../permissions/user-dm.js', () => ({ ensureUserDm: dm.ensure }));
+vi.mock('../permissions/user-dm.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../permissions/user-dm.js')>()),
+  ensureUserDm: dm.ensure,
+}));
 
-vi.mock('../../container-runner.js', () => ({
+vi.mock('../../container-runner.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../container-runner.js')>()),
   wakeContainer: vi.fn().mockResolvedValue(undefined),
 }));
 

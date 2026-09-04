@@ -50,7 +50,10 @@ function childProcessTripwire(record: string[]): Record<string, (...args: unknow
 vi.mock('child_process', () => childProcessTripwire(h.spawns));
 vi.mock('node:child_process', () => childProcessTripwire(h.spawns));
 
-vi.mock('../../llm.js', () => ({ callHaiku: vi.fn(async () => 'Rollout fix') }));
+vi.mock('../../llm.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../llm.js')>()),
+  callHaiku: vi.fn(async () => 'Rollout fix'),
+}));
 // Spy on retryPendingThreadTitles while keeping it real by default (a plain
 // `vi.fn(real.impl)`, not a `vi.spyOn`), so the existing direct-call cases
 // below keep exercising real behavior — the registered-duty describe below

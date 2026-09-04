@@ -44,16 +44,19 @@ vi.mock('./config.js', async (importOriginal) => ({
     return state.groupsDir;
   },
 }));
-vi.mock('./container-runtime.js', () => ({
+vi.mock('./container-runtime.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./container-runtime.js')>()),
   get CONTAINER_RUNTIME_BIN() {
     return state.dockerBin;
   },
 }));
-vi.mock('./container-runner.js', () => ({
+vi.mock('./container-runner.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./container-runner.js')>()),
   isContainerRunning: (id: string) => state.running.has(id),
   isContainerSpawning: (id: string) => state.spawning.has(id),
 }));
-vi.mock('./db/connection.js', () => ({
+vi.mock('./db/connection.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./db/connection.js')>()),
   getDb: () => ({
     prepare: () => ({
       all: () => {
@@ -71,7 +74,8 @@ vi.mock('./db/connection.js', () => ({
     }),
   }),
 }));
-vi.mock('./session-manager.js', () => ({
+vi.mock('./session-manager.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./session-manager.js')>()),
   sessionsBaseDir: () => path.join(state.dataDir, 'v2-sessions'),
   threadsBaseDir: () => path.join(state.dataDir, 'v2-threads'),
   threadWorktreeDir: (key: string) => path.join(state.dataDir, 'v2-threads', key, 'worktrees'),
@@ -101,9 +105,14 @@ vi.mock('./modules/mailbox/index.js', async (importOriginal) => {
       }),
   };
 });
-vi.mock('./log.js', async (importOriginal) => ({
-  ...(await importOriginal<typeof import('./log.js')>()),
+// NOT spread: log.ts installs process-wide uncaughtException/unhandledRejection
+// handlers (including process.exit(1)) at module scope — importOriginal() would
+// install those in this test file's worker. Kept as a complete stub instead.
+// (davekim917/nanoclaw#355 review thread)
+vi.mock('./log.js', () => ({
+  setLogScrubber: vi.fn(),
   log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn(), fatal: vi.fn() },
+  isSurvivableIoError: vi.fn(() => false),
 }));
 
 import {

@@ -2,7 +2,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { parseMarkdown, type Adapter, type Message as ChatMessage } from 'chat';
 
-vi.mock('../webhook-server.js', () => ({ registerWebhookAdapter: vi.fn() }));
+vi.mock('../webhook-server.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../webhook-server.js')>()),
+  registerWebhookAdapter: vi.fn(),
+}));
 
 import { closeDb, getDb, initTestDb, runMigrations } from '../db/index.js';
 import { createPendingApproval } from '../db/sessions.js';

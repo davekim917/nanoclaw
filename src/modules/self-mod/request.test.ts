@@ -53,7 +53,8 @@ vi.mock('@onecli-sh/sdk', () => ({
   },
 }));
 
-vi.mock('../../container-runner.js', () => ({
+vi.mock('../../container-runner.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../container-runner.js')>()),
   wakeContainer: vi.fn().mockResolvedValue(undefined),
 }));
 
@@ -67,7 +68,8 @@ vi.mock('../../session-manager.js', async () => {
   return { ...actual, writeSessionMessage: vi.fn() };
 });
 
-vi.mock('../../webhook-server.js', () => ({
+vi.mock('../../webhook-server.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../webhook-server.js')>()),
   registerWebhookAdapter: vi.fn(),
 }));
 

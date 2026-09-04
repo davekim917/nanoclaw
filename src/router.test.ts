@@ -7,11 +7,13 @@ import { afterEach, beforeEach, describe, it, expect, vi } from 'vitest';
 
 // ── Mock everything that touches I/O ──
 
-vi.mock('./db/connection.js', () => ({
+vi.mock('./db/connection.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./db/connection.js')>()),
   getDb: vi.fn(),
   hasTable: vi.fn(() => true),
 }));
-vi.mock('./db/channel-ingress-receipts.js', () => ({
+vi.mock('./db/channel-ingress-receipts.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./db/channel-ingress-receipts.js')>()),
   claimChannelIngress: vi.fn(() => true),
   claimDeferredChannelIngress: vi.fn(() => true),
   completeChannelIngress: vi.fn(),
@@ -27,28 +29,33 @@ vi.mock('./db/container-configs.js', async (importOriginal) => ({
   getContainerConfig: vi.fn(() => undefined),
 }));
 
-vi.mock('./db/messaging-groups.js', () => ({
+vi.mock('./db/messaging-groups.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./db/messaging-groups.js')>()),
   getMessagingGroupWithAgentCount: vi.fn(),
   getMessagingGroupAgents: vi.fn(() => []),
   createMessagingGroup: vi.fn(),
   createMessagingGroupAgent: vi.fn(),
 }));
 
-vi.mock('./db/agent-groups.js', () => ({
+vi.mock('./db/agent-groups.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./db/agent-groups.js')>()),
   getAgentGroup: vi.fn(() => null),
 }));
 
-vi.mock('./db/dropped-messages.js', () => ({
+vi.mock('./db/dropped-messages.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./db/dropped-messages.js')>()),
   recordDroppedMessage: vi.fn(),
 }));
 
-vi.mock('./db/sessions.js', () => ({
+vi.mock('./db/sessions.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./db/sessions.js')>()),
   findSessionForAgent: vi.fn(() => undefined),
   getSession: vi.fn(() => null),
   markSessionEngaged: vi.fn(),
 }));
 
-vi.mock('./channels/channel-registry.js', () => ({
+vi.mock('./channels/channel-registry.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./channels/channel-registry.js')>()),
   getChannelAdapter: vi.fn(() => null),
   // Static behavior-faithful fallback (fork: plain mention groups) — the real
   // registry never returns undefined; it resolves undeclared adapters through
@@ -74,7 +81,8 @@ const sessionFiles = vi.hoisted(() => ({ inbound: true, outbound: true }));
 const writeOutboundDirect = vi.hoisted(() => vi.fn());
 /** The outbound SESSION's write op — what the two notices call now. */
 const outboundSessionWrite = vi.hoisted(() => vi.fn());
-vi.mock('./session-manager.js', () => ({
+vi.mock('./session-manager.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./session-manager.js')>()),
   resolveSession: vi.fn(),
   sessionMessageExists: vi.fn(() => false),
   writeSessionMessageIfNew: vi.fn(async () => true),
@@ -111,54 +119,70 @@ vi.mock('./container-runner.js', async (importOriginal) => {
   };
 });
 
-vi.mock('./attachment-downloader.js', () => ({
+vi.mock('./attachment-downloader.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./attachment-downloader.js')>()),
   persistInboundAttachments: vi.fn((_, __, ___, content: string) => content),
 }));
 
-vi.mock('./modules/bash-gate/index.js', () => ({
+vi.mock('./modules/bash-gate/index.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./modules/bash-gate/index.js')>()),
   cancelPendingGatesForSession: vi.fn(),
   sessionHasActiveGates: vi.fn(() => false),
 }));
 
-vi.mock('./modules/typing/index.js', () => ({
+vi.mock('./modules/typing/index.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./modules/typing/index.js')>()),
   startTypingRefresh: vi.fn(),
   stopTypingRefresh: vi.fn(),
 }));
 
+// NOT spread: log.ts installs process-wide uncaughtException/unhandledRejection
+// handlers (including process.exit(1)) at module scope — importOriginal() would
+// install those in this test file's worker. Kept as a complete stub instead.
+// (davekim917/nanoclaw#355 review thread)
 vi.mock('./log.js', () => ({
+  setLogScrubber: vi.fn(),
   log: {
+    debug: vi.fn(),
     info: vi.fn(),
     warn: vi.fn(),
     error: vi.fn(),
-    debug: vi.fn(),
+    fatal: vi.fn(),
   },
+  isSurvivableIoError: vi.fn(() => false),
 }));
 
-vi.mock('./message-archive.js', () => ({
+vi.mock('./message-archive.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./message-archive.js')>()),
   archiveMessage: vi.fn(),
 }));
 
-vi.mock('./flag-parser.js', () => ({
+vi.mock('./flag-parser.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./flag-parser.js')>()),
   parseMessageFlags: vi.fn(() => ({ intent: undefined, errors: [], warnings: [], cleanedText: null })),
   formatFlagConfirmation: vi.fn(() => null),
 }));
 
-vi.mock('./topic-title.js', () => ({
+vi.mock('./topic-title.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./topic-title.js')>()),
   maybeRenameNewThread: vi.fn(),
 }));
 
-vi.mock('./modules/permissions/db/user-roles.js', () => ({
+vi.mock('./modules/permissions/db/user-roles.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./modules/permissions/db/user-roles.js')>()),
   isAnyAdmin: vi.fn(() => false),
   // command-gate's isAdmin() gate for ADMIN_COMMANDS. Default deny, so a test
   // that wants the denial branch only has to send the command.
   hasAdminPrivilege: vi.fn(() => false),
 }));
 
-vi.mock('./modules/permissions/db/agent-group-members.js', () => ({
+vi.mock('./modules/permissions/db/agent-group-members.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./modules/permissions/db/agent-group-members.js')>()),
   hasAnyMembership: vi.fn(() => false),
 }));
 
-vi.mock('./delivery.js', () => ({
+vi.mock('./delivery.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./delivery.js')>()),
   getDeliveryAdapter: vi.fn(() => null),
 }));
 

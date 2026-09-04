@@ -6,14 +6,27 @@ const mocks = vi.hoisted(() => ({
   sessions: [] as unknown[],
 }));
 
-vi.mock('./channel-registry.js', () => ({ getActiveAdapters: () => mocks.adapters }));
-vi.mock('../db/messaging-groups.js', () => ({
+vi.mock('./channel-registry.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./channel-registry.js')>()),
+  getActiveAdapters: () => mocks.adapters,
+}));
+vi.mock('../db/messaging-groups.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../db/messaging-groups.js')>()),
   getMessagingGroupsByChannel: (channelType: string) =>
     mocks.groups.filter((group) => (group as { channel_type: string }).channel_type === channelType),
 }));
-vi.mock('../db/sessions.js', () => ({ getActiveSessions: () => mocks.sessions }));
+vi.mock('../db/sessions.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../db/sessions.js')>()),
+  getActiveSessions: () => mocks.sessions,
+}));
+// NOT spread: log.ts installs process-wide uncaughtException/unhandledRejection
+// handlers (including process.exit(1)) at module scope — importOriginal() would
+// install those in this test file's worker. Kept as a complete stub instead.
+// (davekim917/nanoclaw#355 review thread)
 vi.mock('../log.js', () => ({
-  log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
+  setLogScrubber: vi.fn(),
+  log: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn(), fatal: vi.fn() },
+  isSurvivableIoError: vi.fn(() => false),
 }));
 
 import {

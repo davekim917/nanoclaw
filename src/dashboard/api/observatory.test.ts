@@ -20,7 +20,8 @@ vi.mock('../../config.js', async (importOriginal) => ({
 // on import and are instantiated by initChannelAdapters), so permalink
 // resolution is exercised through a mocked lookup. Default: nothing registered,
 // which is exactly what every pre-existing test in this file already saw.
-vi.mock('../../channels/channel-registry.js', () => ({
+vi.mock('../../channels/channel-registry.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../channels/channel-registry.js')>()),
   getChannelAdapter: vi.fn(() => undefined),
 }));
 

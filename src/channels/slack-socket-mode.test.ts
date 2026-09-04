@@ -13,7 +13,8 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 const env = vi.hoisted(() => ({ values: {} as Record<string, string> }));
 const adapterCalls = vi.hoisted(() => ({ configs: [] as Array<Record<string, unknown>> }));
 
-vi.mock('../env.js', () => ({
+vi.mock('../env.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../env.js')>()),
   readEnvFileMatching: () => env.values,
   readEnvFile: () => env.values,
 }));
@@ -34,7 +35,8 @@ vi.mock('@slack/web-api', () => ({
 }));
 
 // The bridge is not under test here and would stand up a real Chat instance.
-vi.mock('./chat-sdk-bridge.js', () => ({
+vi.mock('./chat-sdk-bridge.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./chat-sdk-bridge.js')>()),
   createChatSdkBridge: (config: { channelType?: string }) => ({
     name: config.channelType ?? 'slack',
     channelType: config.channelType ?? 'slack',
