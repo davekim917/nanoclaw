@@ -45,10 +45,16 @@ export const STALE_THREAD_RE = /thread\s+not\s+found|unknown\s+thread|thread[_\s
 
 /**
  * Escape a string for emission inside a TOML basic string (double-quoted).
- * Handles `"` and `\`. Rejects newlines: basic strings can't contain raw
- * newlines, and silently converting them to `\n` would mask misconfiguration
- * (e.g. a secret pasted with a trailing newline). Multiline strings are
- * unsupported for `config.toml` use here.
+ * Handles `"`, `\` and the C0/DEL control range. Rejects newlines: basic
+ * strings can't contain raw newlines, and silently converting them to `\n`
+ * would mask misconfiguration (e.g. a secret pasted with a trailing newline).
+ * Multiline strings are unsupported for `config.toml` use here.
+ *
+ * Every other control character IS escaped rather than rejected: TOML forbids
+ * raw C0 controls and DEL inside basic strings, so one stray invisible byte in
+ * an MCP env value or header made codex reject the whole config file — which
+ * drops EVERY MCP server for that group, not just the offending one.
+ * (upstream 05860324c)
  */
 export function tomlBasicString(value: string): string {
   if (value.includes('\n') || value.includes('\r')) {
@@ -56,7 +62,30 @@ export function tomlBasicString(value: string): string {
       `MCP config value contains newline (not supported in config.toml): ${JSON.stringify(value.slice(0, 40))}${value.length > 40 ? '…' : ''}`,
     );
   }
-  return `"${value.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
+  // The control-char replace must stay LAST: an earlier pass would double the
+  // backslash it emits into a literal `\\uXXXX`.
+  return `"${value
+    .replace(/\\/g, '\\\\')
+    .replace(/"/g, '\\"')
+    // eslint-disable-next-line no-control-regex
+    .replace(/[\x00-\x1f\x7f]/g, (c) => `\\u${c.charCodeAt(0).toString(16).toUpperCase().padStart(4, '0')}`)}"`;
+}
+
+/**
+ * Emit a TOML key, quoting anything that is not a bare key.
+ *
+ * MCP server names and env keys are operator- (and, through the
+ * `add_mcp_server` approval flow, agent-) supplied, and nothing on the host
+ * validates their charset — `validateMcpServers` only rejects the deprecated
+ * SSE transport. `[A-Za-z0-9_-]+` is exactly TOML's bare-key grammar, so an
+ * ordinary name stays byte-identical and anything else is quoted. A name with
+ * a dot would otherwise nest itself under a sibling table, and a name with a
+ * `]` or a quote could close the header and open its own `[mcp_servers.*]`
+ * table carrying a command the approval card never showed. Bare and quoted
+ * forms name the same table. (upstream 2e97ab046)
+ */
+export function tomlKey(name: string): string {
+  return /^[A-Za-z0-9_-]+$/.test(name) ? name : tomlBasicString(name);
 }
 
 function tomlInlineStringMap(map: Record<string, string>): string {
@@ -481,6 +510,11 @@ export interface CodexStdioMcpServer {
   command: string;
   args?: string[];
   env?: Record<string, string>;
+  /**
+   * Working directory for the server process. Codex's stdio MCP transport
+   * takes this natively. Absolute by the time it reaches here.
+   */
+  cwd?: string;
 }
 
 export interface CodexHttpMcpServer {
@@ -525,7 +559,8 @@ export function writeCodexMcpConfigToml(servers: Record<string, CodexMcpServer>)
 
   const lines: string[] = base ? [base, '', MCP_MARKER, ''] : [];
   for (const [name, config] of Object.entries(servers)) {
-    lines.push(`[mcp_servers.${name}]`);
+    const tomlName = tomlKey(name);
+    lines.push(`[mcp_servers.${tomlName}]`);
     if (config.type === 'http') {
       lines.push(`url = ${tomlBasicString(config.url)}`);
       if (config.headers && Object.keys(config.headers).length > 0) {
@@ -534,14 +569,20 @@ export function writeCodexMcpConfigToml(servers: Record<string, CodexMcpServer>)
     } else {
       lines.push('type = "stdio"');
       lines.push(`command = ${tomlBasicString(config.command)}`);
+      // Codex launches the stdio server here natively. Must stay ABOVE the
+      // `[mcp_servers.*.env]` sub-table header or TOML re-parents it into the
+      // env table. (upstream 5e15069da)
+      if (config.cwd) {
+        lines.push(`cwd = ${tomlBasicString(config.cwd)}`);
+      }
       if (config.args && config.args.length > 0) {
         const argsStr = config.args.map(tomlBasicString).join(', ');
         lines.push(`args = [${argsStr}]`);
       }
       if (config.env && Object.keys(config.env).length > 0) {
-        lines.push(`[mcp_servers.${name}.env]`);
+        lines.push(`[mcp_servers.${tomlName}.env]`);
         for (const [key, value] of Object.entries(config.env)) {
-          lines.push(`${key} = ${tomlBasicString(value)}`);
+          lines.push(`${tomlKey(key)} = ${tomlBasicString(value)}`);
         }
       }
     }

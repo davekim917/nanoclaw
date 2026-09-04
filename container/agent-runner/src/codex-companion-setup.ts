@@ -38,7 +38,7 @@ import { spawnSync, type SpawnSyncReturns } from 'node:child_process';
 import fs from 'fs';
 import path from 'path';
 
-import { tomlBasicString, writeCodexHooksJson } from './providers/codex-app-server.js';
+import { tomlBasicString, tomlKey, writeCodexHooksJson } from './providers/codex-app-server.js';
 import {
   type AgentRuntime,
   discoverPortableSkills,
@@ -135,7 +135,11 @@ export function stripPluginsAndMarketplacesForTest(toml: string): string {
 
 function renderMcpServer(name: string, config: McpServerConfig): string[] {
   const lines: string[] = [];
-  lines.push(`[mcp_servers.${name}]`);
+  // Same quoting and cwd rules as writeCodexMcpConfigToml — this is the second
+  // Codex config.toml writer in the tree and shares its blast radius: one
+  // malformed entry makes codex reject the file and drops every MCP server.
+  const tomlName = tomlKey(name);
+  lines.push(`[mcp_servers.${tomlName}]`);
 
   if (config.type === 'sse') {
     throw new Error(`MCP server "${name}" uses deprecated SSE transport. Use type: "http" instead.`);
@@ -151,14 +155,18 @@ function renderMcpServer(name: string, config: McpServerConfig): string[] {
 
   lines.push('type = "stdio"');
   lines.push(`command = ${tomlBasicString(config.command)}`);
+  // Above the env sub-table header, or TOML re-parents it. (upstream 5e15069da)
+  if (config.cwd) {
+    lines.push(`cwd = ${tomlBasicString(config.cwd)}`);
+  }
   if (config.args && config.args.length > 0) {
     const argsStr = config.args.map(tomlBasicString).join(', ');
     lines.push(`args = [${argsStr}]`);
   }
   if (config.env && Object.keys(config.env).length > 0) {
-    lines.push(`[mcp_servers.${name}.env]`);
+    lines.push(`[mcp_servers.${tomlName}.env]`);
     for (const [key, value] of Object.entries(config.env)) {
-      lines.push(`${key} = ${tomlBasicString(value)}`);
+      lines.push(`${tomlKey(key)} = ${tomlBasicString(value)}`);
     }
   }
   return lines;

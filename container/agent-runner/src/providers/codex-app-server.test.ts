@@ -385,6 +385,140 @@ describe('writeCodexMcpConfigToml', () => {
     }
   });
 
+  it('quotes non-bare names and keys so one dotted server cannot eat the others (upstream 2e97ab046)', () => {
+    // Emitted bare, `acme.tools` re-nests itself as a table under a phantom
+    // `acme` server, and a name carrying `]` or `"` can close the header and
+    // open its own [mcp_servers.*] table with a command nobody approved.
+    const prevHome = process.env.HOME;
+    const prevCodexHome = process.env.CODEX_HOME;
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-home-'));
+    try {
+      process.env.HOME = home;
+      delete process.env.CODEX_HOME;
+
+      writeCodexMcpConfigToml({
+        'acme.tools': { command: 'bun', args: ['run', 'acme.ts'], env: { 'x.y': 'z' } },
+        good: { command: 'bun', args: ['run', 'good.ts'] },
+      });
+
+      const config = fs.readFileSync(path.join(home, '.codex', 'config.toml'), 'utf-8');
+      const parsed = Bun.TOML.parse(config) as {
+        mcp_servers: Record<string, { args?: string[]; env?: Record<string, string> }>;
+      };
+
+      // One server named `acme.tools` — not a table nested under `acme`.
+      expect(Object.keys(parsed.mcp_servers).sort()).toEqual(['acme.tools', 'good']);
+      expect(parsed.mcp_servers['acme.tools'].args).toEqual(['run', 'acme.ts']);
+      expect(parsed.mcp_servers['acme.tools'].env).toEqual({ 'x.y': 'z' });
+      // The unrelated server survives intact — that is the regression that matters.
+      expect(parsed.mcp_servers.good.args).toEqual(['run', 'good.ts']);
+      // Bare-safe names stay byte-identical, so no live config churns.
+      expect(config).toContain('[mcp_servers.good]');
+      expect(config).toContain('[mcp_servers."acme.tools".env]');
+    } finally {
+      if (prevHome === undefined) {
+        delete process.env.HOME;
+      } else {
+        process.env.HOME = prevHome;
+      }
+      if (prevCodexHome === undefined) {
+        delete process.env.CODEX_HOME;
+      } else {
+        process.env.CODEX_HOME = prevCodexHome;
+      }
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('escapes a control byte instead of emitting it raw, keeping the other servers (upstream 05860324c)', () => {
+    // A raw C0 byte is forbidden in a TOML basic string, so codex rejected the
+    // WHOLE file and the group lost every MCP server, not just this one.
+    // Oracle is JSON.parse, not Bun.TOML.parse: TOML basic-string escapes are
+    // JSON-compatible here, and Bun's TOML parser does not implement \uXXXX.
+    const prevHome = process.env.HOME;
+    const prevCodexHome = process.env.CODEX_HOME;
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-home-'));
+    try {
+      process.env.HOME = home;
+      delete process.env.CODEX_HOME;
+
+      const bell = String.fromCharCode(7);
+      writeCodexMcpConfigToml({
+        tainted: { command: 'bun', env: { TOKEN: `tok${bell}en` } },
+        good: { command: 'bun', args: ['run', 'good.ts'] },
+      });
+
+      const config = fs.readFileSync(path.join(home, '.codex', 'config.toml'), 'utf-8');
+      expect(config).not.toContain(bell);
+      expect(config).toContain('TOKEN = "tok\\u0007en"');
+      const emitted = config.split('TOKEN = ')[1].split('\n')[0];
+      expect(JSON.parse(emitted)).toBe(`tok${bell}en`);
+      // The unrelated server is still there and still parses.
+      expect(config).toContain('[mcp_servers.good]');
+      expect(config).toContain('args = ["run", "good.ts"]');
+    } finally {
+      if (prevHome === undefined) {
+        delete process.env.HOME;
+      } else {
+        process.env.HOME = prevHome;
+      }
+      if (prevCodexHome === undefined) {
+        delete process.env.CODEX_HOME;
+      } else {
+        process.env.CODEX_HOME = prevCodexHome;
+      }
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('emits stdio cwd above the env sub-table and omits it when undeclared (upstream 5e15069da)', () => {
+    const prevHome = process.env.HOME;
+    const prevCodexHome = process.env.CODEX_HOME;
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-home-'));
+    try {
+      process.env.HOME = home;
+      delete process.env.CODEX_HOME;
+
+      writeCodexMcpConfigToml({
+        probe: {
+          command: '/workspace/plugins/sdr/run.js',
+          args: ['--flag'],
+          env: { FOO: 'bar' },
+          cwd: '/workspace/plugin-data/sdr',
+        },
+        plain: { command: 'bun' },
+      });
+
+      const config = fs.readFileSync(path.join(home, '.codex', 'config.toml'), 'utf-8');
+      // Ordering is load-bearing: below the [.env] header TOML re-parents cwd
+      // into the env table and codex launches in the wrong directory.
+      expect(config).toContain(
+        'command = "/workspace/plugins/sdr/run.js"\n' +
+          'cwd = "/workspace/plugin-data/sdr"\n' +
+          'args = ["--flag"]\n' +
+          '[mcp_servers.probe.env]',
+      );
+      const parsed = Bun.TOML.parse(config) as {
+        mcp_servers: Record<string, { cwd?: string; env?: Record<string, string> }>;
+      };
+      expect(parsed.mcp_servers.probe.cwd).toBe('/workspace/plugin-data/sdr');
+      expect(parsed.mcp_servers.probe.env).toEqual({ FOO: 'bar' });
+      expect(parsed.mcp_servers.plain.cwd).toBeUndefined();
+    } finally {
+      if (prevHome === undefined) {
+        delete process.env.HOME;
+      } else {
+        process.env.HOME = prevHome;
+      }
+      if (prevCodexHome === undefined) {
+        delete process.env.CODEX_HOME;
+      } else {
+        process.env.CODEX_HOME = prevCodexHome;
+      }
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
   it('writes config.toml + hooks.json to CODEX_HOME, not $HOME/.codex (codex #126 rotation)', () => {
     // On OAuth rotation the provider sets CODEX_HOME to a fallback dir; the writers
     // must target it (else the rotated app-server runs with stale config and — for

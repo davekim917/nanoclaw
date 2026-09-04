@@ -1010,6 +1010,7 @@ export class CodexProvider implements AgentProvider {
           command: cfg.command,
           args: cfg.args,
           env: augmentWithProxyEnv(cfg.env ?? {}),
+          ...(cfg.cwd ? { cwd: cfg.cwd } : {}),
         };
       } else if (cfg?.type === 'http') {
         if (useHttpBridgeFallback) {

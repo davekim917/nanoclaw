@@ -48,6 +48,27 @@ describe('renderMcpServer', () => {
     expect(lines).toEqual(['[mcp_servers.m]', 'type = "stdio"', 'command = "x"']);
   });
 
+  it('quotes non-bare names/keys and emits cwd above the env header', () => {
+    // Second Codex config.toml writer in the tree, same blast radius as
+    // writeCodexMcpConfigToml: one malformed table drops every MCP server.
+    const lines = renderMcpServerForTest('acme.tools', {
+      type: 'stdio',
+      command: 'bun',
+      args: ['run', '/app/mcp.ts'],
+      env: { 'x.y': 'bar' },
+      cwd: '/workspace/plugin-data/acme',
+    });
+    expect(lines).toEqual([
+      '[mcp_servers."acme.tools"]',
+      'type = "stdio"',
+      'command = "bun"',
+      'cwd = "/workspace/plugin-data/acme"',
+      'args = ["run", "/app/mcp.ts"]',
+      '[mcp_servers."acme.tools".env]',
+      '"x.y" = "bar"',
+    ]);
+  });
+
   it('emits native Codex HTTP servers with url + http_headers, no command/args', () => {
     const lines = renderMcpServerForTest('deepwiki', {
       type: 'http',
