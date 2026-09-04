@@ -56,7 +56,11 @@ async function prepareDueWake(
   // ratchet's allowlist. The script runner can spend the full pre-task timeout
   // per row, so the session is held across that work exactly as it was when
   // these lines passed a raw handle.
-  await runHostGatedTaskScripts(mailbox, sessionId);
+  //
+  // `agentGroupId` rides along because the callee resolves the GROUP's
+  // timezone for its local-time gate: a session parameter identifies the
+  // mailbox, not the group whose zone override applies.
+  await runHostGatedTaskScripts(mailbox, agentGroupId, sessionId);
   const admittedTasks = admitDueTaskContexts(mailbox, agentGroupId, sessionId);
   const dueCount = mailbox.countDueMessages();
   return {
@@ -152,6 +156,11 @@ export function registerSchedulingSweepDuties(): void {
     // state is current. Nothing here can START a close; only an operator can.
     run: async () => {
       try {
+        // Awaited (mailbox seam PR 4): the close path became asynchronous when
+        // its proposal reads moved behind the funnel, and an unawaited call
+        // would let the tick finish while the close is still mid-flight —
+        // rejections escaping this catch, and the duty reporting success it
+        // has not had.
         await advanceThreadClosures();
       } catch (err) {
         log.warn('thread-close sweep step failed', { err });
