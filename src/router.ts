@@ -266,6 +266,20 @@ export type AccessGateFn = (
   userId: string | null,
   mg: MessagingGroup,
   agentGroupId: string,
+  /**
+   * The thread address THIS wiring would reply on — `event.threadId` already
+   * policy-stripped by resolveThreadPolicy (null when the wiring or its
+   * channel declaration opts out of threads, or the adapter can't thread).
+   *
+   * The gate needs it because a refusal can still speak to the sender
+   * (decline_notify), and a bot-authored reply has to honor the same thread
+   * policy the agent's replies do — otherwise a wiring that deliberately
+   * collapses DM sub-threads to the root gets its declines posted inside
+   * them. Passed in rather than recomputed: fanout has already resolved it
+   * for this wiring, and duplicating the computation is how the two sides
+   * drift.
+   */
+  effectiveThreadId: string | null,
 ) => AccessGateResult | Promise<AccessGateResult>;
 
 let accessGate: AccessGateFn | null = null;
@@ -877,7 +891,8 @@ async function routeInboundClaimed(event: InboundEvent, markReplayPending: () =>
 
     const engages = evaluateEngage(agent, messageText, isMention, mg, effectiveThreadId, supportsThreads);
 
-    const accessDecision = engages && accessGate ? await accessGate(event, userId, mg, agent.agent_group_id) : null;
+    const accessDecision =
+      engages && accessGate ? await accessGate(event, userId, mg, agent.agent_group_id, effectiveThreadId) : null;
     if (accessDecision && !accessDecision.allowed && accessDecision.replayPending) markReplayPending();
     const accessOk = engages && (!accessDecision || accessDecision.allowed);
     const scopeOk = engages && (!senderScopeGate || senderScopeGate(event, userId, mg, agent).allowed);

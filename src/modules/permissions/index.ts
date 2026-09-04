@@ -7,7 +7,7 @@
  *      sight. Returns null when the payload doesn't carry enough to identify
  *      a sender.
  *   2. setAccessGate — runs after agent resolution. Enforces the
- *      unknown_sender_policy (strict/request_approval/public) and the
+ *      unknown_sender_policy (strict/request_approval/decline_notify/public) and the
  *      owner/global-admin/scoped-admin/member access hierarchy. Records its
  *      own `dropped_messages` row on refusal (structural drops are recorded
  *      by core).
@@ -57,7 +57,7 @@ import { deletePendingSenderApproval, getPendingSenderApproval } from './db/pend
 import { hasAdminPrivilege } from './db/user-roles.js';
 import { getUser, upsertUser } from './db/users.js';
 import './grant.js';
-import { requestSenderApproval } from './sender-approval.js';
+import { declineAndNotify, requestSenderApproval } from './sender-approval.js';
 import { channelsRegister, sendersAdmit } from './guard.js';
 import { ensureUserDm } from './user-dm.js';
 
@@ -131,6 +131,8 @@ async function handleUnknownSender(
   agentGroupId: string,
   accessReason: string,
   event: InboundEvent,
+  /** This wiring's policy-resolved reply thread — see AccessGateFn. */
+  effectiveThreadId: string | null,
 ): Promise<boolean> {
   const parsed = safeParseContent(event.message.content);
   const senderName = parsed.sender ?? null;
@@ -146,8 +148,8 @@ async function handleUnknownSender(
 
   // The admission decision is the guard's senders.admit decision (./guard.ts)
   // — unknown_sender_policy verbatim: strict → deny, request_approval → hold,
-  // public → allow (short-circuited before the gate). Drop-recording and the
-  // hold creation stay here.
+  // decline_notify → deny, public → allow (short-circuited before the gate).
+  // Drop-recording, the hold creation and the decline side effects stay here.
   const decision = guard(sendersAdmit, {
     actor: userId ? { kind: 'human', userId } : { kind: 'system' },
     payload: {
@@ -160,10 +162,14 @@ async function handleUnknownSender(
 
   if (decision.effect === 'allow') return false; // public is handled before this gate.
 
+  const isDeclineNotify = mg.unknown_sender_policy === 'decline_notify';
+
   log.info(
-    decision.effect === 'hold'
-      ? 'MESSAGE DROPPED — unknown sender (approval requested)'
-      : 'MESSAGE DROPPED — unknown sender (strict policy)',
+    isDeclineNotify
+      ? 'MESSAGE DROPPED — unknown sender (decline-and-notify policy)'
+      : decision.effect === 'hold'
+        ? 'MESSAGE DROPPED — unknown sender (approval requested)'
+        : 'MESSAGE DROPPED — unknown sender (strict policy)',
     {
       messagingGroupId: mg.id,
       agentGroupId,
@@ -172,6 +178,42 @@ async function handleUnknownSender(
     },
   );
   recordDroppedMessage(dropRecord);
+
+  // decline_notify: polite in-DM decline + one-line owner FYI, no card.
+  // Fire-and-forget like the hold path — declineAndNotify dedupes itself
+  // (24h stamp) and logs its own failures; the sender's message stays
+  // dropped either way, so nothing is retained for replay.
+  // Gated on the guard's own verdict, not on the policy string alone: the
+  // guard (./guard.ts) is the decision seam, so a future policy change that
+  // makes decline_notify hold must card, not decline behind the guard's back.
+  if (decision.effect === 'deny' && isDeclineNotify) {
+    // The decline copy assumes a 1:1 DM surface, so this needs POSITIVE
+    // evidence of one — `mg.is_group !== 1` is not that. An adapter that
+    // reports neither isDM nor isGroup (older chat-sdk plugin builds;
+    // `adapterIsDM` returns undefined) gets is_group = 0 from the router's
+    // auto-create default, so 0 can mean "uncertain", not "confirmed DM"
+    // — the same reason the user_dms cache requires `event.isDM === true`
+    // (src/router.ts, the 2a branch). Without the evidence the drop above
+    // stands and nothing is sent: silence beats posting "I'm <owner>'s
+    // personal agent" into a channel.
+    const confirmedDm = mg.is_group !== 1 && (event.isDM === true || event.message.isGroup === false);
+    if (!confirmedDm) {
+      log.warn('decline_notify skipped — no confirmed 1:1 DM context (no public decline)', {
+        messagingGroupId: mg.id,
+        isGroupRow: mg.is_group,
+      });
+      return false;
+    }
+    void declineAndNotify({
+      messagingGroupId: mg.id,
+      agentGroupId,
+      senderIdentity: userId,
+      senderName,
+      event,
+      threadId: effectiveThreadId,
+    }).catch((err) => log.error('decline_notify flow threw', { err }));
+    return false;
+  }
 
   // Persist the exact event only for a held sender with a stable identity.
   // A deny or identity-less hold remains an ordinary completed drop.
@@ -205,14 +247,14 @@ export function setSiblingBotIdsProvider(provider: () => ReadonlySet<string>): v
   getSiblingBotIds = provider;
 }
 
-setAccessGate(async (event, userId, mg, agentGroupId): Promise<AccessGateResult> => {
+setAccessGate(async (event, userId, mg, agentGroupId, effectiveThreadId): Promise<AccessGateResult> => {
   // Public channels skip the access check entirely.
   if (mg.unknown_sender_policy === 'public') {
     return { allowed: true };
   }
 
   if (!userId) {
-    await handleUnknownSender(mg, null, agentGroupId, 'unknown_user', event);
+    await handleUnknownSender(mg, null, agentGroupId, 'unknown_user', event, effectiveThreadId);
     return {
       allowed: false,
       reason: 'unknown_user',
@@ -240,7 +282,7 @@ setAccessGate(async (event, userId, mg, agentGroupId): Promise<AccessGateResult>
     return { allowed: true };
   }
 
-  const replayPending = await handleUnknownSender(mg, userId, agentGroupId, decision.reason, event);
+  const replayPending = await handleUnknownSender(mg, userId, agentGroupId, decision.reason, event, effectiveThreadId);
   return {
     allowed: false,
     reason: decision.reason,
@@ -303,6 +345,35 @@ async function handleSenderApprovalResponse(payload: ResponsePayload): Promise<b
     });
     return true; // claim the response so it's not unclaimed-logged, but do nothing
   }
+  // The card is only actionable while the group still runs the flow that
+  // issued it. `decline_notify` promises the opposite of a card — no buttons,
+  // no approval path, grants stay explicit (`ncl members add`) — so a button
+  // delivered before the flip must not still grant membership afterwards.
+  //
+  // Checked here rather than by deleting rows inside the policy update: the
+  // click is the decision seam, so this holds no matter how the policy
+  // changed (ncl, dashboard, auto-wire, a direct DB edit), and it covers the
+  // window before the sender's next message converts the card into a stamp.
+  // Only decline_notify voids the card. `strict` and `public` do not: neither
+  // promises there is no approval path, so an admin approving an outstanding
+  // card there is a legitimate explicit grant, and that behavior predates
+  // this policy.
+  const currentMg = getMessagingGroup(row.messaging_group_id);
+  if (currentMg?.unknown_sender_policy === 'decline_notify') {
+    log.warn('Unknown-sender approval click rejected — group switched to decline_notify', {
+      approvalId: row.id,
+      senderIdentity: row.sender_identity,
+      messagingGroupId: row.messaging_group_id,
+      clickerId,
+    });
+    // Void the card the same way a deny does: drop the row (and with it the
+    // retained message body) and close out the deferred inbound so it does
+    // not sit unresolved.
+    deletePendingSenderApproval(row.id);
+    completeStoredDeferredInbound(row.original_message);
+    return true;
+  }
+
   const approverId = clickerId;
   const approved = payload.value === 'approve';
 

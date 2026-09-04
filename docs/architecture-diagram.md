@@ -158,7 +158,7 @@ erDiagram
     string platform_id
     string name
     bool is_group
-    string unknown_sender_policy "strict | request_approval | public"
+    string unknown_sender_policy "strict | request_approval | decline_notify | public"
   }
   users {
     string id PK "namespaced <channel>:<handle>"

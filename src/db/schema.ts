@@ -36,7 +36,7 @@ CREATE TABLE messaging_groups (
   name                  TEXT,
   is_group              INTEGER DEFAULT 0,
   unknown_sender_policy TEXT NOT NULL DEFAULT 'strict',
-                        -- 'strict' | 'request_approval' | 'public'
+                        -- 'strict' | 'request_approval' | 'decline_notify' | 'public'
   created_at            TEXT NOT NULL,
   denied_at             TEXT,
   UNIQUE(channel_type, platform_id, instance)

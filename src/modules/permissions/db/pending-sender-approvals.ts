@@ -66,3 +66,105 @@ export function getInFlightSenderApproval(
 export function deletePendingSenderApproval(id: string): void {
   getDb().prepare('DELETE FROM pending_sender_approvals WHERE id = ?').run(id);
 }
+
+// ── Decline stamps (decline_notify dedupe) ──
+// The decline-and-notify flow persists "last declined at" per (messaging
+// group, sender) by reusing this table's UNIQUE key — an id prefix
+// distinguishes stamps from real card rows. Stamps never render a card and
+// no click can resolve one: response handlers look a row up by exact id, and
+// a stamp's id is not a `nsa-` id any card was ever delivered with.
+//
+// Two collisions on the UNIQUE key, both deliberate:
+//   - policy flipped decline_notify → request_approval, stale stamp in the
+//     way: requestSenderApproval clears the stamp before carding.
+//   - policy flipped request_approval → decline_notify, card row in the way:
+//     upsertDeclineStamp converts the row into the stamp shape. The card is
+//     obsolete once the policy no longer cards.
+
+const DECLINE_STAMP_ID_PREFIX = 'decline:';
+
+/**
+ * A stamp records only THAT a sender was declined, never what they wrote.
+ *
+ * `original_message` exists so an approved card can replay the held event; a
+ * declined sender has no replay path, so keeping their message would retain
+ * content from someone the operator explicitly turned away, with no reader
+ * and no expiry (the row is refreshed, not deleted). This inert sentinel goes
+ * in its place — NOT NULL is satisfied, and the one function that ever parses
+ * the column (`isSameInboundEvent`) already treats unparseable content as
+ * "not the retained event".
+ */
+const DECLINE_STAMP_BODY = '{"declined":true}';
+
+/** ISO timestamp of the last decline for this pair, if any. */
+/**
+ * True for a decline stamp, false for a real approval card. The two share the
+ * table and its UNIQUE key, so anything that reads a row for the pair without
+ * knowing which flow wrote it has to ask — a stamp has no approver, no render
+ * metadata, and a sentinel body rather than a retained event.
+ */
+export function isDeclineStampId(id: string): boolean {
+  return id.startsWith(DECLINE_STAMP_ID_PREFIX);
+}
+
+export function getDeclineStampAt(messagingGroupId: string, senderIdentity: string): string | undefined {
+  const row = getDb()
+    .prepare(
+      `SELECT created_at FROM pending_sender_approvals
+        WHERE messaging_group_id = ? AND sender_identity = ? AND id LIKE '${DECLINE_STAMP_ID_PREFIX}%'`,
+    )
+    .get(messagingGroupId, senderIdentity) as { created_at: string } | undefined;
+  return row?.created_at;
+}
+
+/**
+ * Record (or refresh) the decline stamp. `agent_group_id` must reference a
+ * real agent group (FK). title / question / options_json keep their column
+ * defaults, so `getAskQuestionRender` can never build a clickable card out of
+ * a stamp; `sender_name` and `original_message` are deliberately not taken
+ * from the caller — the dedupe key and the timestamp are the whole record.
+ */
+export function upsertDeclineStamp(stamp: {
+  messaging_group_id: string;
+  agent_group_id: string;
+  sender_identity: string;
+}): void {
+  getDb()
+    .prepare(
+      `INSERT INTO pending_sender_approvals (
+         id, messaging_group_id, agent_group_id, sender_identity,
+         sender_name, original_message, approver_user_id, created_at
+       )
+       VALUES (
+         @id, @messaging_group_id, @agent_group_id, @sender_identity,
+         NULL, @original_message, '', @created_at
+       )
+       ON CONFLICT(messaging_group_id, sender_identity) DO UPDATE SET
+         id = excluded.id,
+         created_at = excluded.created_at,
+         sender_name = excluded.sender_name,
+         original_message = excluded.original_message,
+         approver_user_id = excluded.approver_user_id,
+         title = excluded.title,
+         question = excluded.question,
+         options_json = excluded.options_json`,
+    )
+    .run({
+      id: `${DECLINE_STAMP_ID_PREFIX}${stamp.messaging_group_id}:${stamp.sender_identity}`,
+      ...stamp,
+      // Overwrites a converted card row's retained body too, so flipping a
+      // messaging group to decline_notify drops the pending card's content.
+      original_message: DECLINE_STAMP_BODY,
+      created_at: new Date().toISOString(),
+    });
+}
+
+/** Remove any decline stamp for this pair — real card rows are untouched. */
+export function clearDeclineStamp(messagingGroupId: string, senderIdentity: string): void {
+  getDb()
+    .prepare(
+      `DELETE FROM pending_sender_approvals
+        WHERE messaging_group_id = ? AND sender_identity = ? AND id LIKE '${DECLINE_STAMP_ID_PREFIX}%'`,
+    )
+    .run(messagingGroupId, senderIdentity);
+}

@@ -21,7 +21,8 @@
  *   NANOCLAW_DEFAULT_SESSION_MODE_<CHANNEL_TYPE>    per-thread | shared |
  *                                                   agent-shared (default: per-thread)
  *   NANOCLAW_DEFAULT_SENDER_POLICY_<CHANNEL_TYPE>   strict | request_approval |
- *                                                   public (default: strict — the
+ *                                                   decline_notify | public
+ *                                                   (default: strict — the
  *                                                   safe v2 upstream default)
  *   NANOCLAW_DEFAULT_IGNORED_POLICY_<CHANNEL_TYPE>  accumulate | drop
  *                                                   (default: accumulate)
@@ -69,7 +70,7 @@ import { SESSION_MODES } from '../../types.js';
 
 const VALID_SESSION_MODES = new Set<string>(SESSION_MODES);
 
-const VALID_SENDER_POLICIES = new Set(['strict', 'request_approval', 'public'] as const);
+const VALID_SENDER_POLICIES = new Set(['strict', 'request_approval', 'decline_notify', 'public'] as const);
 type SenderPolicy = MessagingGroup['unknown_sender_policy'];
 
 const VALID_IGNORED_POLICIES = new Set(['drop', 'accumulate'] as const);

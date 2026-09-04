@@ -7,7 +7,7 @@ description: Wire channels to agent groups, manage isolation levels, add new cha
 
 Wire messaging channels to agent groups. See `docs/isolation-model.md` for the full isolation model.
 
-Privilege is a **user-level** concept, not a channel-level one (see `src/modules/permissions/db/user-roles.ts`, `src/modules/permissions/access.ts`). There is no "main channel" / "main group" — any user can be granted `owner` or `admin` (global or scoped to an agent group) via `grantRole()`, and messages from unknown senders are gated per-messaging-group by `unknown_sender_policy` (`strict` | `request_approval` | `public`).
+Privilege is a **user-level** concept, not a channel-level one (see `src/modules/permissions/db/user-roles.ts`, `src/modules/permissions/access.ts`). There is no "main channel" / "main group" — any user can be granted `owner` or `admin` (global or scoped to an agent group) via `grantRole()`, and messages from unknown senders are gated per-messaging-group by `unknown_sender_policy` (`strict` | `request_approval` | `decline_notify` | `public`).
 
 ## Assess Current State
 
@@ -108,7 +108,7 @@ pnpm exec tsx setup/index.ts --step register -- \
 
 The `register` step creates the agent group (reusing it if the folder already exists), the messaging group, and the wiring row. `createMessagingGroupAgent` auto-creates the companion `agent_destinations` row so the agent can address the channel by name.
 
-Omitted engage/policy fields default from the channel adapter's declaration (see "Channel Defaults" above). Optional overrides: `--trigger "<regex>"` (explicit engage pattern), `--engage-mode <pattern|mention|mention-sticky>`, `--is-group <true|false>`, `--unknown-sender-policy <strict|request_approval|public>`. Don't pick a mention mode on a channel whose declaration says `mentions: 'never'` — it can never engage there.
+Omitted engage/policy fields default from the channel adapter's declaration (see "Channel Defaults" above). Optional overrides: `--trigger "<regex>"` (explicit engage pattern), `--engage-mode <pattern|mention|mention-sticky>`, `--is-group <true|false>`, `--unknown-sender-policy <strict|request_approval|decline_notify|public>`. Don't pick a mention mode on a channel whose declaration says `mentions: 'never'` — it can never engage there.
 
 New agent groups are created on the instance default provider (`DEFAULT_AGENT_PROVIDER` in `.env`, or `claude` when unset). To run a group on a different provider, switch it after creation with `ncl groups config update --provider <name>` (e.g. `codex`).
 

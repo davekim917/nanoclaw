@@ -45,7 +45,7 @@ CREATE TABLE messaging_groups (
 ```
 
 - `instance`: adapter-instance name — N adapters of one platform (e.g. three Slack apps in one workspace) each own their rows. The default instance IS the channel type: migration 016 backfills `instance = channel_type` and `createMessagingGroup` stamps the same default, so single-instance installs never see the dimension. Inbound lookups are exact-on-instance (an unknown named instance auto-creates its own row); outbound lookups resolve default-instance-first.
-- `unknown_sender_policy`: `strict` (drop), `request_approval` (ask admin), `public` (allow).
+- `unknown_sender_policy`: `strict` (drop silently), `request_approval` (drop + card an admin), `decline_notify` (drop + politely decline in the sender's DM and FYI the owner, no card), `public` (allow).
 - **Readers:** `src/router.ts`, `src/delivery.ts`, `src/session-manager.ts`
 - **Writers:** `src/db/messaging-groups.ts`, channel setup flows
 
@@ -340,7 +340,14 @@ The check reads the HOST's zone database, not the agent image's. A host with new
 
 ### 1.16 `pending_sender_approvals`
 
-In-flight state for the `unknown_sender_policy = 'request_approval'` flow. A row exists while an admin-approval card is outstanding for a first-time sender in a wired messaging group; `UNIQUE(messaging_group_id, sender_identity)` dedups concurrent attempts from the same sender instead of spamming the admin with repeat cards.
+In-flight state for the unknown-sender flows. `UNIQUE(messaging_group_id, sender_identity)` dedups repeat attempts from the same sender instead of spamming the admin.
+
+The table holds **two kinds of row**, told apart by the `id` prefix:
+
+- **Approval cards** (`nsa-*`) — `unknown_sender_policy = 'request_approval'`. A row exists while an admin-approval card is outstanding for a first-time sender in a wired messaging group. It retains the original `InboundEvent` so the message can be replayed once the sender is approved.
+- **Decline stamps** (`decline:*`) — `unknown_sender_policy = 'decline_notify'`. Not a card, and never rendered as one: it is a dedupe receipt meaning "this sender was already declined here", suppressing further decline/FYI pairs for 24h. It deliberately keeps no trace of the declined message — `original_message` is the literal `{"declined":true}`, `sender_name` is NULL, and `title`/`options_json` are empty so nothing can draw it as a card.
+
+Both kinds share the UNIQUE key, so flipping a messaging group's policy converts one into the other rather than colliding: `requestSenderApproval` clears a stale stamp before carding, and `declineAndNotify` overwrites a pending card with a stamp (dropping the retained message body).
 
 ```sql
 CREATE TABLE pending_sender_approvals (
@@ -358,7 +365,7 @@ CREATE TABLE pending_sender_approvals (
 );
 ```
 
-Deleted on admin approve (after adding the sender as a member) or deny.
+A card row is deleted on admin approve (after adding the sender as a member) or deny. A stamp row is never clicked — it expires by age (24h) and is cleared if the policy flips back to `request_approval`.
 
 - Access layer: `src/modules/permissions/db/pending-sender-approvals.ts`
 - **Readers/writers:** `src/modules/permissions/sender-approval.ts`, `src/modules/permissions/index.ts`, `src/db/sessions.ts` (`getAskQuestionRender`), `src/cli/resources/groups.ts`

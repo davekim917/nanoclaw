@@ -27,15 +27,31 @@
  * sender_identity). A replay of the retained event remains deferred; a later
  * message from that sender is dropped without replacing it or sending another
  * card.
+ *
+ * This file also carries the `decline_notify` continuation: no card, no
+ * buttons — a polite in-DM decline plus a one-line owner FYI, deduped per
+ * (sender, messaging group) per 24h via a persisted decline stamp that reuses
+ * this table's UNIQUE key. See declineAndNotify at the bottom.
  */
 import { normalizeOptions, type RawOption } from '../../channels/ask-question.js';
+import { getAllAgentGroups } from '../../db/agent-groups.js';
 import { getMessagingGroup } from '../../db/messaging-groups.js';
 import { getDeliveryAdapter } from '../../delivery.js';
+import { completeDeferredInbound } from '../../router.js';
 import { log } from '../../log.js';
 import type { InboundEvent } from '../../channels/adapter.js';
 import { pickApprovalDelivery, pickApprover } from '../approvals/primitive.js';
 import { AGENT_ACCESS_SCOPE_WARNING } from './channel-approval.js';
-import { createPendingSenderApproval, getInFlightSenderApproval } from './db/pending-sender-approvals.js';
+import {
+  clearDeclineStamp,
+  createPendingSenderApproval,
+  getDeclineStampAt,
+  getInFlightSenderApproval,
+  isDeclineStampId,
+  upsertDeclineStamp,
+} from './db/pending-sender-approvals.js';
+import { getAdminsOfAgentGroup, getGlobalAdmins, getOwners } from './db/user-roles.js';
+import { getUser } from './db/users.js';
 
 const APPROVAL_OPTIONS: RawOption[] = [
   { label: 'Allow', selectedLabel: '✅ Allowed', value: 'approve', style: 'primary' },
@@ -71,6 +87,12 @@ function isSameInboundEvent(raw: string, event: InboundEvent): boolean {
 /** True only when this exact event is the one retained for later replay. */
 export async function requestSenderApproval(input: RequestSenderApprovalInput): Promise<boolean> {
   const { messagingGroupId, agentGroupId, senderIdentity, senderName, event } = input;
+
+  // A stale decline stamp (this messaging group was decline_notify before
+  // flipping back to request_approval) occupies the
+  // UNIQUE(messaging_group_id, sender_identity) key this flow needs — clear
+  // it so the in-flight check and the row insert see a clean slate.
+  clearDeclineStamp(messagingGroupId, senderIdentity);
 
   // In-flight dedup: don't spam the admin if the same unknown sender
   // retries while a card is already pending. A replay of the retained event
@@ -185,3 +207,260 @@ export async function requestSenderApproval(input: RequestSenderApprovalInput): 
  */
 export const APPROVE_VALUE = 'approve';
 export const REJECT_VALUE = 'reject';
+
+// ── Decline-and-notify (unknown_sender_policy = 'decline_notify') ──
+
+/** At most one decline + one FYI per (sender, messaging group) per this window. */
+export const DECLINE_NOTIFY_DEDUPE_MS = 24 * 60 * 60 * 1000;
+
+/** Stamp key for a sender the resolver couldn't identify — the messaging
+ *  group (a 1:1 DM) still keys the pair, so dedupe holds. */
+const UNKNOWN_SENDER_KEY = 'unknown';
+
+/**
+ * OWNERS-FIRST candidate order for the FYI — the reverse of pickApprover.
+ *
+ * The FYI is a personal notice ("someone DMed YOUR agent"), not a decision
+ * anyone can act on, so routing it to a group admin tells the wrong person.
+ * pickApprover deliberately puts scoped admins first because a card needs
+ * whoever can decide it; this notification needs whoever owns the agent.
+ * Same reasoning, and the same live failure, as the escalation module's
+ * escalationApprovers (src/modules/escalation/index.ts): the card landed in
+ * a teammate's DM while the owner saw nothing. Admins stay on as
+ * reachability fallback.
+ */
+function fyiRecipients(agentGroupId: string | null): string[] {
+  const ordered: string[] = [];
+  const seen = new Set<string>();
+  const add = (id: string): void => {
+    if (!seen.has(id)) {
+      seen.add(id);
+      ordered.push(id);
+    }
+  };
+  for (const r of getOwners()) add(r.user_id);
+  for (const r of getGlobalAdmins()) add(r.user_id);
+  if (agentGroupId) {
+    for (const r of getAdminsOfAgentGroup(agentGroupId)) add(r.user_id);
+  }
+  return ordered;
+}
+
+/** First owner with a display_name, for the decline copy. */
+function ownerDisplayName(): string | null {
+  for (const owner of getOwners()) {
+    const name = getUser(owner.user_id)?.display_name;
+    if (name && name.length > 0) return name;
+  }
+  return null;
+}
+
+export interface DeclineAndNotifyInput {
+  messagingGroupId: string;
+  /** Approver-resolution anchor; null falls back to global admins/owners. */
+  agentGroupId: string | null;
+  senderIdentity: string | null; // namespaced user id, when resolvable
+  senderName: string | null;
+  event: InboundEvent;
+  /**
+   * Override the dedupe key when the decline is scoped to the conversation
+   * rather than to one sender — e.g. a channel module declining every
+   * unauthorized invitation into the same conversation with one message.
+   * Callers that pass this own both halves: `requestSenderApproval` only
+   * clears a stamp keyed on the sender identity.
+   */
+  dedupeKey?: string;
+  /**
+   * Thread address to send the decline on — the wiring's policy-resolved
+   * reply thread, NOT the raw `event.threadId`. The access gate gets this
+   * from router fanout (`resolveThreadPolicy`), so a wiring that collapses
+   * DM sub-threads to the root has its declines collapsed too. Omitted by
+   * callers outside the fanout loop (channel modules), which fall back to
+   * the event's own thread.
+   */
+  threadId?: string | null;
+  /** Override the sender-facing decline copy. */
+  declineText?: string;
+  /** Override the owner-facing FYI copy. */
+  fyiText?: string;
+}
+
+/**
+ * The decline_notify continuation: (a) a short polite decline sent as the
+ * bot into the sender's DM, (b) a one-line informational FYI to the owner's
+ * DM — plain text, NOT an approval card, no buttons. Grants stay explicit
+ * (`ncl members add`). Callers record the dropped message; dedupe is
+ * self-contained here — a persisted decline stamp (pending_sender_approvals
+ * shape) suppresses repeats for 24h.
+ */
+export async function declineAndNotify(input: DeclineAndNotifyInput): Promise<void> {
+  const { messagingGroupId, agentGroupId, senderIdentity, senderName, event } = input;
+
+  // Dedupe: at most one decline + FYI per (sender, messaging group) per 24h,
+  // or per (conversation) when the caller supplies its own key.
+  const senderKey = input.dedupeKey ?? senderIdentity ?? UNKNOWN_SENDER_KEY;
+  const stampedAt = getDeclineStampAt(messagingGroupId, senderKey);
+  if (stampedAt && Date.now() - new Date(stampedAt).getTime() < DECLINE_NOTIFY_DEDUPE_MS) {
+    log.debug('decline_notify deduped — declined within the last 24h', { messagingGroupId, senderIdentity });
+    return;
+  }
+
+  const adapter = getDeliveryAdapter();
+  if (!adapter) {
+    log.error('decline_notify skipped — no delivery adapter is wired', { messagingGroupId });
+    return;
+  }
+
+  // Persist the stamp before sending: a delivery hiccup must not turn into a
+  // decline storm on the sender's next message. FK needs a real agent group —
+  // fall back to the first one (same reference-group pattern as the channel
+  // card flow); with zero agent groups the stamp is skipped (no dedupe, rare
+  // bootstrap state) but the decline still goes out.
+  const stampAgentGroupId = agentGroupId ?? getAllAgentGroups()[0]?.id;
+  if (stampAgentGroupId) {
+    // Converting a pending CARD into a stamp destroys the retained event, and
+    // that event is the only thing that can resolve its ingress receipt. The
+    // first message left the receipt `deferred` (a card was pending); if we
+    // overwrite without closing it, the receipt stays falsely deferred until
+    // the 7-day prune with nothing left to resolve it. Close it first, and
+    // only for a real card row — a stamp being refreshed has no receipt of
+    // its own, and its body is the sentinel, not an event.
+    const existing = getInFlightSenderApproval(messagingGroupId, senderKey);
+    if (existing && !isDeclineStampId(existing.id)) {
+      try {
+        completeDeferredInbound(JSON.parse(existing.original_message) as InboundEvent);
+      } catch (err) {
+        log.debug('decline_notify: converted card had no resolvable deferred receipt', {
+          messagingGroupId,
+          approvalId: existing.id,
+          err,
+        });
+      }
+    }
+    upsertDeclineStamp({
+      messaging_group_id: messagingGroupId,
+      agent_group_id: stampAgentGroupId,
+      sender_identity: senderKey,
+    });
+  } else {
+    log.debug('decline_notify stamp skipped — no agent groups exist', { messagingGroupId });
+  }
+
+  const originMg = getMessagingGroup(messagingGroupId);
+
+  // (a) Polite decline in the sender's DM, as the bot. Instance-addressed so
+  // a per-agent bot identity registered as its own adapter instance answers
+  // as itself.
+  //
+  // Threaded on the originating message, not hard-null: this is a reply TO
+  // the stranger, so it belongs where they wrote. Slack DMs make that load
+  // bearing — the bridge turns each root DM message into its own thread
+  // (chat-sdk-bridge.ts, the DM auto-threading block) and dm.threads is on
+  // by default (slack.ts SLACK_DEFAULTS), so a null here posts the decline
+  // at the channel root, detached from the message it answers. Adapters
+  // without DM threading (Telegram et al.) carry a null threadId on the
+  // event anyway, so this is a no-op there.
+  //
+  // `input.threadId` is the wiring's policy-resolved address, so a wiring
+  // with threads off collapses the decline to the root exactly like the
+  // agent's own replies. It is only absent for callers outside router
+  // fanout, which have no wiring to honor and fall back to the event.
+  const declineThreadId = input.threadId !== undefined ? input.threadId : (event.threadId ?? null);
+
+  // Resolve the FYI recipient BEFORE composing the decline. `ownerDisplayName`
+  // picks the first owner carrying a name with no regard for reachability,
+  // while `pickApprovalDelivery` picks the first owner reachable on the origin
+  // channel. On an install with several owners those are different people, so
+  // composing first told the stranger they had reached one owner's agent while
+  // a different owner got the notice — the wrong name disclosed to someone we
+  // are in the middle of refusing.
+  const approvers = fyiRecipients(agentGroupId);
+  const target =
+    approvers.length > 0
+      ? // Same-channel-type only: the FYI names a sender identity originating
+        // in THIS workspace, so it must not fall back to a different surface
+        // where the same owner happens to be registered (cross-tenant audit
+        // 2026-05-03).
+        await pickApprovalDelivery(approvers, event.channelType, { sameChannelTypeOnly: true })
+      : null;
+
+  // Name the recipient only when they are an owner. `fyiRecipients` falls back
+  // to admins for reachability, and an admin is not whose personal agent this
+  // is — in that case the honest name is still an owner's, even an unreachable
+  // one.
+  const ownerIds = new Set(getOwners().map((r) => r.user_id));
+  const namedOwner =
+    (target && ownerIds.has(target.userId) ? getUser(target.userId)?.display_name : null) || ownerDisplayName();
+  const declineText =
+    input.declineText ?? `I'm ${namedOwner ?? 'my owner'}'s personal agent — I can't help you directly.`;
+  let declined = true;
+  try {
+    await adapter.deliver(
+      event.channelType,
+      event.platformId,
+      declineThreadId,
+      'chat-sdk',
+      JSON.stringify({ text: declineText }),
+      undefined,
+      originMg?.instance ?? event.instance,
+    );
+  } catch (err) {
+    declined = false;
+    log.warn('decline_notify: decline delivery failed', { messagingGroupId, err });
+  }
+
+  // (b) Owner FYI — owners first (see fyiRecipients). Recipient was resolved
+  // above so the decline could name them; the decline still goes out when
+  // nobody is reachable, only the notice is skipped.
+  if (approvers.length === 0) {
+    log.warn('decline_notify FYI skipped — no owner or admin configured', { messagingGroupId, senderIdentity });
+    return;
+  }
+  if (!target) {
+    log.warn('decline_notify FYI skipped — no in-workspace approver reachable on the origin channel_type', {
+      messagingGroupId,
+      senderIdentity,
+    });
+    return;
+  }
+
+  const senderDisplay = senderName && senderName.length > 0 ? senderName : (senderIdentity ?? 'An unknown sender');
+  const who =
+    senderIdentity && senderDisplay !== senderIdentity ? `${senderDisplay} (${senderIdentity})` : senderDisplay;
+  // The FYI must not claim a decline that a platform error swallowed —
+  // otherwise a transient failure leaves the stranger on silence while the
+  // owner believes they were answered.
+  const outcome = declined
+    ? 'I sent a polite decline'
+    : "I couldn't deliver the decline, so they've had no reply (see the host log)";
+  const fyiText =
+    input.fyiText ??
+    `FYI: ${who} DMed your agent on ${event.channelType} — ${outcome}. Allow them any time with \`ncl members add\`.`;
+  try {
+    await adapter.deliver(
+      target.messagingGroup.channel_type,
+      target.messagingGroup.platform_id,
+      null,
+      'chat-sdk',
+      JSON.stringify({ text: fyiText }),
+      undefined,
+      // Exact-key dispatch: on an install whose bots are all named
+      // instances there is nothing registered under the bare channel_type,
+      // so an omitted instance either sends as the wrong sibling bot or
+      // resolves no adapter at all.
+      target.messagingGroup.instance,
+    );
+    log.info(
+      declined
+        ? 'decline_notify handled — decline sent, owner notified'
+        : 'decline_notify — owner notified, but the decline itself failed to deliver',
+      {
+        messagingGroupId,
+        senderIdentity,
+        notified: target.userId,
+      },
+    );
+  } catch (err) {
+    log.error('decline_notify: owner FYI delivery failed', { messagingGroupId, err });
+  }
+}
