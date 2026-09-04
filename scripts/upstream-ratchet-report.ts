@@ -29,9 +29,17 @@
  *                          every number for reasons outside the fork
  *   --root <dir>           repo to operate on (default: this script's checkout)
  *   --json                 machine-readable output
+ *   --check <ref>          evaluate <ref>'s own committed tree instead of the
+ *                          working tree — the merge-gate mode: no writes, no
+ *                          working-tree dependence. Also runs a STALE-MANIFEST
+ *                          currency check (sha256/mode/deleted vs <ref>'s real
+ *                          tree). Incompatible with --write, --accept,
+ *                          --accept-all and --upstream. See "Checking a PR
+ *                          head before merge" in docs/upstream-ratchet.md.
  *
  * Exit 2 (not 1) when the pinned commit is not in the clone: that is "cannot
- * measure", not "the ratchet failed", and CI needs to tell them apart.
+ * measure", not "the ratchet failed", and CI needs to tell them apart. Same
+ * code when a `--check` ref does not resolve, or carries no manifest.
  *
  * This file holds NO decisions. Parsing, entry building, classification and the
  * write gate all live in `src/upstream-ratchet-core.ts` so they can be tested
@@ -39,7 +47,10 @@
  * rendering and the exit code.
  *
  * Cost: five whole-tree git calls (`rev-parse`, `ls-tree`, `ls-files`,
- * `diff --numstat`, `check-ignore --stdin`), never a per-file one.
+ * `diff --numstat`, `check-ignore --stdin`), never a per-file one. `--check`
+ * costs four (`rev-parse`, `show`, two `ls-tree`, `diff --numstat`) plus ONE
+ * `cat-file --batch` over <ref>'s blob ids, in place of `ls-files`/lstat/
+ * `check-ignore` — there is no working tree or index for a bare commit.
  */
 import { execFileSync } from 'node:child_process';
 import path from 'node:path';
@@ -49,8 +60,10 @@ import {
   buildManifest,
   classify,
   findUntrackedShadows,
+  hashCatFileBatch,
   parseLsFiles,
   parseLsTree,
+  parseLsTreeEntries,
   parseNumstat,
   RatchetError,
   writeGate,
@@ -59,16 +72,24 @@ import {
 } from '../src/upstream-ratchet-core.js';
 import {
   acceptFlag,
+  checkTree,
   divergentEntries,
   fileModeOf,
+  GITLINK_MODE,
   hashFile,
+  isGitMode,
   manifestPath,
+  MANIFEST_REL,
   pathExists,
   readManifest,
+  REGENERATE_HINT,
   sealManifest,
   shellQuote,
   totalDiffLines,
   writeManifest,
+  type Finding,
+  type GitMode,
+  type TreeReader,
   type UpstreamRatchetManifest,
 } from '../src/upstream-ratchet.js';
 
@@ -81,6 +102,8 @@ interface Options {
   acceptAll: boolean;
   upstream: string | null;
   json: boolean;
+  /** `--check <ref>`: evaluate `<ref>`'s own tree instead of the working tree. */
+  check: string | null;
 }
 
 function parseArgs(argv: readonly string[]): Options {
@@ -91,6 +114,7 @@ function parseArgs(argv: readonly string[]): Options {
     acceptAll: false,
     upstream: null,
     json: false,
+    check: null,
   };
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
@@ -114,6 +138,7 @@ function parseArgs(argv: readonly string[]): Options {
     else if (name === '--accept-all') options.acceptAll = true;
     else if (name === '--upstream') options.upstream = inline ?? next();
     else if (name === '--json') options.json = true;
+    else if (name === '--check') options.check = inline ?? next();
     else if (name === '--help' || name === '-h') usage();
     // `pnpm run ratchet:report -- --write` can forward a bare `--`.
     else if (arg !== '--') fail(`unknown argument: ${arg}`);
@@ -124,6 +149,14 @@ function parseArgs(argv: readonly string[]): Options {
     // full delta printed for review.
     options.write = true;
     options.acceptAll = true;
+  }
+  if (options.check !== null) {
+    // `--check` evaluates a fixed commit with no writes and no working-tree
+    // dependence — the four flags below all either write or move the pin, none
+    // of which make sense against a ref that is not this checkout's HEAD.
+    if (options.write || options.accept.size > 0 || options.acceptAll || options.upstream !== null) {
+      usageError('--check is incompatible with --write, --accept, --accept-all and --upstream');
+    }
   }
   return options;
 }
@@ -137,17 +170,28 @@ function fail(message: string): never {
   process.exit(1);
 }
 
+/** A malformed invocation — distinct exit code from `fail`'s "the ratchet failed" (1). */
+function usageError(message: string): never {
+  console.error(`upstream-ratchet: ${message}`);
+  process.exit(2);
+}
+
 function usage(): never {
   console.log(
     [
       'Usage: tsx scripts/upstream-ratchet-report.ts [--root <dir>] [--json]',
       '       tsx scripts/upstream-ratchet-report.ts --write [--accept <path>]... [--accept-all]',
       '       tsx scripts/upstream-ratchet-report.ts --upstream <rev>',
+      '       tsx scripts/upstream-ratchet-report.ts --check <ref> [--json]',
       '',
       'Reports the fork divergence recorded in src/upstream-ratchet.json against the pinned',
       'upstream commit. Exits 1 when any upstream-owned file grew its diff or became newly',
       'divergent; shrink is always allowed. Exits 2 when the pinned commit is not in this',
       'clone. See docs/upstream-ratchet.md.',
+      '',
+      '--check <ref> evaluates the tree of <ref> (a sha, a remote-tracking branch, FETCH_HEAD,',
+      'anything git rev-parse understands) instead of the working tree, with no writes and no',
+      'working-tree dependence. Incompatible with --write, --accept, --accept-all, --upstream.',
     ].join('\n'),
   );
   process.exit(0);
@@ -271,6 +315,84 @@ export function computeFromGit(root: string, sha: string): UpstreamRatchetManife
   );
 }
 
+/**
+ * `git cat-file --batch` over an exact, deduplicated id list, as a raw `Buffer`.
+ *
+ * Not routed through `git()`: that helper forces `encoding: 'utf8'`, which is
+ * right for the text porcelain output every other call here reads, and WRONG
+ * for blob content — an upstream-owned binary file, or a symlink target in a
+ * non-UTF8 byte sequence, would come back mangled. `parseCatFileBatch`
+ * (src/upstream-ratchet-core.ts) needs the exact same id list back, in the
+ * exact same order, to find each record's boundary in the framing.
+ */
+function catFileBatch(root: string, ids: readonly string[]): Buffer {
+  if (ids.length === 0) return Buffer.alloc(0);
+  return execFileSync('git', ['-C', root, 'cat-file', '--batch'], {
+    input: ids.join('\n') + '\n',
+    maxBuffer: 512 * 1024 * 1024,
+    stdio: ['pipe', 'pipe', 'inherit'],
+  }) as Buffer;
+}
+
+/**
+ * The manifest `ref`'s own tree implies, measured against the pinned commit —
+ * the `--check` counterpart to `computeFromGit`, sharing `buildManifest` (and
+ * therefore `classify`/`writeGate`/rendering) as the one arbitration path so
+ * there is no second implementation of GROWTH/NEW/SHRINK/STALE.
+ *
+ * Three things differ from the working-tree measurement, all because there is
+ * no working tree and no index for a bare ref:
+ *
+ *  - `forkIndex`/`modeOf`/`hashOf` all come from `git ls-tree -r -z <ref>` and
+ *    ONE `git cat-file --batch` over its blob ids, not from `ls-files`/`lstat`/
+ *    reading the disk. A symlink's blob content IS its target string (what git
+ *    stores for a 120000 entry), so hashing the blob bytes directly agrees with
+ *    `hashFile`'s symlink handling without special-casing the mode — proven in
+ *    src/upstream-ratchet-core.test.ts.
+ *  - `ignored` is always empty: `git check-ignore` needs a live index and
+ *    working tree, neither of which a bare commit has. An upstream path the
+ *    fork deleted AND gitignored is simply absent from `ls-tree`, so it is
+ *    classified as plain `deleted` here (not `deleted + ignored`) — the `diff`
+ *    number `classify()` compares is the same numstat line count either way,
+ *    so this does not change a GROWTH/NEW/SHRINK verdict, only the `ignored`
+ *    flag on the recomputed (never written) entry.
+ *  - the untracked-shadow check (`findUntrackedShadows`) does not run: it
+ *    exists because a real working tree can hold bytes at a path the index
+ *    does not track, which cannot happen inside a single commit's own tree.
+ *
+ * Returns the `TreeReader` alongside the manifest so the caller can also run
+ * `checkTree` (the STALE-MANIFEST currency check) against the very same
+ * `ls-tree`/blob-hash data, with no second git round-trip.
+ */
+function computeFromRef(
+  root: string,
+  sha: string,
+  ref: string,
+): { manifest: UpstreamRatchetManifest; reader: TreeReader } {
+  const upstreamModes = parseLsTree(git(root, ['ls-tree', '-r', '-z', sha]));
+  const refEntries = parseLsTreeEntries(git(root, ['ls-tree', '-r', '-z', ref]));
+
+  const blobIds = [...new Set([...refEntries.values()].filter((e) => e.mode !== GITLINK_MODE).map((e) => e.blob))];
+  const blobHashes = hashCatFileBatch(catFileBatch(root, blobIds), blobIds);
+
+  const modeOf = (relPath: string): GitMode | null => {
+    const mode = refEntries.get(relPath)?.mode;
+    return mode !== undefined && isGitMode(mode) ? mode : null;
+  };
+  const hashOf = (relPath: string): string | null => {
+    const entry = refEntries.get(relPath);
+    return entry === undefined ? null : (blobHashes.get(entry.blob) ?? null);
+  };
+  const forkIndex = new Map([...refEntries].map(([p, e]) => [p, e.mode]));
+  const numstat = parseNumstat(git(root, ['diff', '--numstat', '--no-renames', '-z', sha, ref]));
+
+  const manifest = sealManifest(
+    buildManifest({ upstream: sha, upstreamModes, forkIndex, numstat, modeOf, hashOf, ignored: new Set<string>() }),
+  );
+  const reader: TreeReader = { exists: (relPath) => refEntries.has(relPath), modeOf, hashOf };
+  return { manifest, reader };
+}
+
 // ── output ───────────────────────────────────────────────────────────────────
 
 const ORDER: Verdict[] = ['NEW', 'GROWTH', 'STALE', 'SHRINK', 'DROPPED'];
@@ -320,8 +442,160 @@ function acceptCommand(rows: readonly Row[]): string {
   return `pnpm run ratchet:report -- --write ${rows.map((r) => acceptFlag(r.path)).join(' ')}`;
 }
 
+/** One STALE-MANIFEST row: the manifest committed at the ref disagrees with the ref's own tree. */
+function renderCurrencyFinding(f: Finding): string {
+  return `  STALE-MANIFEST ${f.path.padEnd(51)} ${f.detail}`;
+}
+
+/**
+ * `--check <ref>`: evaluate `<ref>`'s tree exactly as the default report
+ * evaluates the working tree, with no writes and no working-tree dependence.
+ * See `computeFromRef` for what "commit-sourced measurement" means concretely.
+ *
+ * Two independent things can fail it, both surfaced as their own section:
+ *
+ *  - `classify()` against the manifest COMMITTED AT `<ref>` — the same
+ *    GROWTH/NEW/SHRINK/STALE arbitration the default report runs, just pointed
+ *    at a ref instead of a checkout. This is what would have caught "merged
+ *    without regenerating the manifest, main went Δ 187" BEFORE the merge.
+ *  - the STALE-MANIFEST currency check — `checkTree` (src/upstream-ratchet.ts)
+ *    run with a ref-backed `TreeReader` instead of the filesystem — which
+ *    catches a manifest whose sha256/mode/deleted bookkeeping disagrees with
+ *    `<ref>`'s real tree even when the `diff` arithmetic alone would not (e.g.
+ *    a same-line-count text edit, which `classify()` deliberately does not
+ *    block). Reuses the exact per-entry logic `checkTree` already has for the
+ *    local working tree — including the `ignored` skip — rather than a second
+ *    implementation.
+ */
+function runCheck(options: Options): never {
+  const root = options.root;
+  const ref = options.check as string;
+  const started = Date.now();
+
+  let resolvedRef: string;
+  try {
+    resolvedRef = git(root, ['rev-parse', '--verify', '--end-of-options', `${ref}^{commit}`], true).trim();
+    // eslint-disable-next-line no-catch-all/no-catch-all
+  } catch (error) {
+    void error;
+    console.error(`upstream-ratchet: --check ref ${JSON.stringify(ref)} does not resolve to a commit in this clone.`);
+    process.exit(2);
+  }
+
+  let manifestText: string;
+  try {
+    manifestText = git(root, ['show', `${resolvedRef}:${MANIFEST_REL}`], true);
+    // eslint-disable-next-line no-catch-all/no-catch-all
+  } catch (error) {
+    void error;
+    console.error(`upstream-ratchet: ${ref} (${resolvedRef.slice(0, 8)}) carries no manifest at ${MANIFEST_REL}`);
+    process.exit(2);
+  }
+  let committed: UpstreamRatchetManifest;
+  try {
+    committed = JSON.parse(manifestText) as UpstreamRatchetManifest;
+    // eslint-disable-next-line no-catch-all/no-catch-all
+  } catch (error) {
+    fail(
+      `could not parse the manifest at ${ref}:${MANIFEST_REL}: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+
+  const sha = resolveCommit(root, committed.upstream);
+
+  let current: UpstreamRatchetManifest;
+  let currencyFindings: Finding[];
+  try {
+    const result = computeFromRef(root, sha, resolvedRef);
+    current = result.manifest;
+    currencyFindings = checkTree(committed, root, result.reader);
+  } catch (error) {
+    // A RatchetError is a refusal with a written-out reason (a gitlink, an
+    // unparseable record); anything else is a bug and keeps its stack.
+    if (error instanceof RatchetError) fail(error.message);
+    throw error;
+  }
+  const elapsedMs = Date.now() - started;
+
+  const rows = classify(committed, current);
+  const { blocking } = writeGate(rows, new Set(), false);
+
+  const before = counts(committed);
+  const after = counts(current);
+  const deltaLines = after.lines - before.lines;
+  const summary =
+    `${n(after.divergent)} divergent files, ${n(after.lines)} diff lines vs ${sha.slice(0, 8)} ` +
+    `(Δ ${deltaLines >= 0 ? '' : '-'}${n(Math.abs(deltaLines))})`;
+  const failing = blocking.length > 0 || currencyFindings.length > 0;
+
+  if (options.json) {
+    console.log(
+      JSON.stringify(
+        {
+          mode: 'check',
+          ref,
+          resolvedRef,
+          upstream: sha,
+          summary,
+          elapsedMs,
+          counts: after,
+          delta: { lines: deltaLines, divergent: after.divergent - before.divergent },
+          rows: rows.filter((r) => r.verdict !== 'UNCHANGED'),
+          blocking: blocking.map((r) => r.path),
+          staleManifest: currencyFindings.map((f) => ({ path: f.path, kind: f.kind, detail: f.detail })),
+          exitCode: failing ? 1 : 0,
+        },
+        null,
+        2,
+      ),
+    );
+  } else {
+    console.log(
+      `Checking ${ref} (${resolvedRef.slice(0, 8)}) against the manifest committed there, pinned upstream ` +
+        `${sha.slice(0, 8)}.\n` +
+        `Commit-source measurement: ignored-path detection and untracked-shadow checking do not apply to a ` +
+        `bare ref and are skipped.\n`,
+    );
+    for (const verdict of ORDER) {
+      const group = rows.filter((r) => r.verdict === verdict);
+      if (group.length === 0) continue;
+      console.log(`${verdict} (${n(group.length)})`);
+      for (const row of group) console.log(renderRow(row));
+      console.log('');
+    }
+    if (currencyFindings.length > 0) {
+      console.log(`STALE-MANIFEST (${n(currencyFindings.length)})`);
+      for (const f of currencyFindings) console.log(renderCurrencyFinding(f));
+      console.log('');
+    }
+    console.log(
+      `${n(after.total)} upstream-owned files at ${sha.slice(0, 8)}: ` +
+        `${n(after.modified)} modified, ${n(after.deleted)} deleted in fork, ` +
+        `${n(after.identical)} byte-identical, ${n(after.binary)} binary`,
+    );
+    console.log(`UNCHANGED ${n(rows.filter((r) => r.verdict === 'UNCHANGED').length)}   (measured in ${elapsedMs} ms)`);
+    console.log(summary);
+
+    if (failing) {
+      const parts: string[] = [];
+      if (blocking.length > 0)
+        parts.push(`${n(blocking.length)} upstream-owned file(s) grew or became newly divergent`);
+      if (currencyFindings.length > 0) {
+        parts.push(
+          `${n(currencyFindings.length)} manifest entr${currencyFindings.length === 1 ? 'y is' : 'ies are'} stale ` +
+            `against ${ref}'s tree — regenerate on that branch: ${REGENERATE_HINT}`,
+        );
+      }
+      console.error(`\nupstream-ratchet: --check failing — ${parts.join('; ')}.`);
+    }
+  }
+
+  process.exit(failing ? 1 : 0);
+}
+
 function main(): void {
   const options = parseArgs(process.argv.slice(2));
+  if (options.check !== null) runCheck(options);
   const root = options.root;
   const committedPath = manifestPath(root);
   let committed: UpstreamRatchetManifest;

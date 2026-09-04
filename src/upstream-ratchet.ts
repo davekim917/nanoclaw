@@ -426,13 +426,47 @@ const SHA256_RE = /^[0-9a-f]{64}$/;
 const COMMIT_RE = /^[0-9a-f]{40}$/;
 
 /**
- * Every way the working tree and the committed manifest disagree.
+ * Where `checkTree`/`checkEntry` read presence, mode and content from.
+ *
+ * The default is the local working tree (`fsTreeReader`), which is what every
+ * existing caller gets when it omits the parameter — behavior is unchanged.
+ * `scripts/upstream-ratchet-report.ts --check <ref>` supplies a reader backed
+ * by `git ls-tree`/`cat-file --batch` over a commit instead, so the SAME
+ * per-entry currency logic (missing / resurrected / mode / changed, and the
+ * `ignored` skip) runs against a bare ref with no working tree at all.
+ */
+export interface TreeReader {
+  exists(relPath: string): boolean;
+  modeOf(relPath: string): GitMode | null;
+  hashOf(relPath: string): string | null;
+}
+
+/** The default `TreeReader`: the local working tree under `repoRoot`. */
+export function fsTreeReader(repoRoot: string): TreeReader {
+  return {
+    exists: (relPath) => pathExists(path.join(repoRoot, relPath)),
+    modeOf: (relPath) => fileModeOf(path.join(repoRoot, relPath)),
+    hashOf: (relPath) => hashFile(path.join(repoRoot, relPath)),
+  };
+}
+
+/**
+ * Every way the tree and the committed manifest disagree.
  *
  * An empty result means the manifest is CURRENT — not that the fork is at zero
  * divergence, and not that the recorded `diff` values are the smallest they
  * could be. See the reach note at the top of this file.
+ *
+ * `reader` defaults to the local working tree; passing a git-commit-backed one
+ * (see `TreeReader` above) checks a ref's tree instead, with no fs access.
+ * The physical ancestor-symlink-escape check (`ancestorEscape`) only applies to
+ * a real filesystem, so it runs only for the default reader.
  */
-export function checkTree(manifest: UpstreamRatchetManifest, repoRoot: string = REPO_ROOT): Finding[] {
+export function checkTree(
+  manifest: UpstreamRatchetManifest,
+  repoRoot: string = REPO_ROOT,
+  reader?: TreeReader,
+): Finding[] {
   const findings: Finding[] = [];
 
   if (typeof manifest.upstream !== 'string' || !COMMIT_RE.test(manifest.upstream)) {
@@ -469,29 +503,33 @@ export function checkTree(manifest: UpstreamRatchetManifest, repoRoot: string = 
   }
 
   for (const [relPath, entry] of Object.entries(manifest.files)) {
-    findings.push(...checkEntry(relPath, entry, repoRoot));
+    findings.push(...checkEntry(relPath, entry, repoRoot, reader));
   }
   return findings;
 }
 
-function checkEntry(relPath: string, entry: UpstreamRatchetEntry, repoRoot: string): Finding[] {
+function checkEntry(relPath: string, entry: UpstreamRatchetEntry, repoRoot: string, reader?: TreeReader): Finding[] {
   const findings: Finding[] = [];
   const malformed = (detail: string): void => {
     findings.push({ kind: 'malformed', path: relPath, detail, hint: `regenerate: ${REGENERATE_HINT}` });
   };
 
-  // BEFORE any filesystem access. Lexical rules first, then the physical check:
-  // an ancestor directory can be a symlink out of the tree even when every
-  // lexical rule passes.
+  // BEFORE any filesystem access. Lexical rules first, then (for the default,
+  // fs-backed reader only) the physical check: an ancestor directory can be a
+  // symlink out of the tree even when every lexical rule passes. A git commit
+  // has no such concept — ls-tree already yields clean, tree-relative paths —
+  // so a non-default reader skips it.
   const invalidPath = validateRelPath(relPath, repoRoot);
   if (invalidPath !== null) {
     malformed(`not a usable repo-relative path: ${invalidPath}`);
     return findings;
   }
-  const escape = ancestorEscape(relPath, repoRoot);
-  if (escape !== null) {
-    malformed(`not a usable repo-relative path: ${escape}`);
-    return findings;
+  if (reader === undefined) {
+    const escape = ancestorEscape(relPath, repoRoot);
+    if (escape !== null) {
+      malformed(`not a usable repo-relative path: ${escape}`);
+      return findings;
+    }
   }
 
   if (entry === null || typeof entry !== 'object') {
@@ -546,8 +584,8 @@ function checkEntry(relPath: string, entry: UpstreamRatchetEntry, repoRoot: stri
   // check nothing else about it.
   if (entry.ignored === true) return findings;
 
-  const abs = path.join(repoRoot, relPath);
-  const present = pathExists(abs);
+  const active = reader ?? fsTreeReader(repoRoot);
+  const present = active.exists(relPath);
 
   if (entry.deleted === true) {
     if (present) {
@@ -571,7 +609,7 @@ function checkEntry(relPath: string, entry: UpstreamRatchetEntry, repoRoot: stri
     return findings;
   }
 
-  const actualMode = fileModeOf(abs);
+  const actualMode = active.modeOf(relPath);
   if (actualMode === null) {
     findings.push({
       kind: 'mode',
@@ -590,7 +628,7 @@ function checkEntry(relPath: string, entry: UpstreamRatchetEntry, repoRoot: stri
     });
   }
 
-  const actual = hashFile(abs);
+  const actual = active.hashOf(relPath);
   if (actual !== entry.sha256) {
     findings.push({
       kind: 'changed',

@@ -13,6 +13,10 @@
  * running the script for real — the CI job fetches the pinned commit and runs
  * the report on every PR.
  */
+import { createHash } from 'node:crypto';
+import fs from 'node:fs';
+import path from 'node:path';
+
 import { beforeAll, describe, expect, it } from 'vitest';
 
 import { enforceHermeticity, hermeticityAttempts } from './test-hermeticity.js';
@@ -20,9 +24,12 @@ import {
   buildManifest,
   classify,
   findUntrackedShadows,
+  hashCatFileBatch,
   isBlocking,
+  parseCatFileBatch,
   parseLsFiles,
   parseLsTree,
+  parseLsTreeEntries,
   parseNumstat,
   RatchetError,
   writeGate,
@@ -30,6 +37,7 @@ import {
   type Row,
 } from './upstream-ratchet-core.js';
 import {
+  hashFile,
   sealManifest,
   type GitMode,
   type UpstreamRatchetEntry,
@@ -161,6 +169,90 @@ describe('parsing git output', () => {
     expect(() => parseNumstat(`12 7 src/router.ts${NUL}`)).toThrow(/could not parse numstat record/);
     expect(() => parseNumstat(`x\ty\tsrc/router.ts${NUL}`)).toThrow(/could not parse numstat counts/);
     expect(() => parseLsTree(`100644 blob aaaa src/router.ts${NUL}`)).toThrow(/could not parse ls-tree record/);
+  });
+});
+
+describe('commit-source parsing (--check <ref>)', () => {
+  it('reads mode and blob id for any tree, including a 120000 symlink and a 160000 gitlink', () => {
+    const stdout =
+      `100644 blob aaaa1111\tsrc/router.ts${NUL}` +
+      `100755 blob bbbb2222\tbin/ncl${NUL}` +
+      `120000 blob cccc3333\tAGENTS.md${NUL}` +
+      // Unlike parseLsTree, a gitlink is recorded rather than rejected: this
+      // parser reads the CHECKED ref's own tree, and a fork-side gitlink is
+      // caught by assertNoGitlinkShadows, not by the parser.
+      `160000 commit dddd4444\tvendor/thing${NUL}`;
+    expect([...parseLsTreeEntries(stdout)]).toEqual([
+      ['src/router.ts', { mode: '100644', blob: 'aaaa1111' }],
+      ['bin/ncl', { mode: '100755', blob: 'bbbb2222' }],
+      ['AGENTS.md', { mode: '120000', blob: 'cccc3333' }],
+      ['vendor/thing', { mode: '160000', blob: 'dddd4444' }],
+    ]);
+  });
+
+  it('refuses a malformed ls-tree record rather than guessing', () => {
+    expect(() => parseLsTreeEntries(`100644 blob aaaa src/router.ts${NUL}`)).toThrow(/could not parse ls-tree record/);
+  });
+
+  /** One `cat-file --batch` record: `<id> SP blob SP <size> LF <content> LF`. */
+  function batchRecord(id: string, content: Buffer): Buffer {
+    return Buffer.concat([Buffer.from(`${id} blob ${content.length}\n`, 'utf8'), content, Buffer.from('\n', 'utf8')]);
+  }
+
+  it('parses cat-file --batch framing back into id → content, including binary bytes', () => {
+    const idA = 'a'.repeat(40);
+    const idB = 'b'.repeat(40);
+    const binary = Buffer.from([0x00, 0xff, 0x0a, 0x50, 0x4e, 0x47]); // a raw byte string with an embedded LF
+    const stdout = Buffer.concat([batchRecord(idA, Buffer.from('hello\n', 'utf8')), batchRecord(idB, binary)]);
+    const parsed = parseCatFileBatch(stdout, [idA, idB]);
+    expect(parsed.get(idA)?.toString('utf8')).toBe('hello\n');
+    expect(parsed.get(idB)).toEqual(binary);
+  });
+
+  it('refuses a missing object and truncated framing rather than guessing', () => {
+    const id = 'c'.repeat(40);
+    expect(() => parseCatFileBatch(Buffer.from(`${id} missing\n`, 'utf8'), [id])).toThrow(/is missing from this clone/);
+    // Header present, content shorter than the declared size.
+    expect(() => parseCatFileBatch(Buffer.from(`${id} blob 10\nabc\n`, 'utf8'), [id])).toThrow(
+      /truncated while reading the content/,
+    );
+    // No trailing LF at all — the header itself never terminates.
+    expect(() => parseCatFileBatch(Buffer.from(`${id} blob 3`, 'utf8'), [id])).toThrow(
+      /truncated while reading the header/,
+    );
+  });
+
+  it('hashes batch content to sha256, matching a direct hash of the same bytes', () => {
+    const id = 'd'.repeat(40);
+    const content = Buffer.from('src/router.ts contents\n', 'utf8');
+    const stdout = batchRecord(id, content);
+    const expected = createHash('sha256').update(content).digest('hex');
+    expect(hashCatFileBatch(stdout, [id]).get(id)).toBe(expected);
+  });
+
+  it('hashes a fixture BOTH ways — hashFile (fs/lstat) and hashCatFileBatch (cat-file --batch simulated) — and agrees', () => {
+    // This is the load-bearing equivalence: a manifest entry written from a
+    // worktree's WORKING TREE (hashFile) must check identical against the
+    // SAME commit's blobs read via cat-file --batch (hashCatFileBatch), or
+    // `--check` would flag every file as STALE-MANIFEST regardless of truth.
+    const root = uniqueTmpRoot('upstream-ratchet-check-hash-equivalence');
+    fs.mkdirSync(root, { recursive: true });
+
+    // A regular file: git's blob content for it is exactly its bytes.
+    const fileContent = Buffer.from('#!/bin/sh\necho hi\n', 'utf8');
+    fs.writeFileSync(path.join(root, 'tool.sh'), fileContent);
+    const fileId = 'e'.repeat(40);
+    const fileBatch = batchRecord(fileId, fileContent);
+    expect(hashCatFileBatch(fileBatch, [fileId]).get(fileId)).toBe(hashFile(path.join(root, 'tool.sh')));
+
+    // A symlink: git's blob content for a 120000 entry IS the target string,
+    // which is exactly what hashFile hashes for a symlink (fs.readlinkSync,
+    // never the pointee) — so no special-casing is needed for mode 120000.
+    fs.symlinkSync('tool.sh', path.join(root, 'link'));
+    const linkTarget = Buffer.from('tool.sh', 'utf8');
+    const linkId = 'f'.repeat(40);
+    const linkBatch = batchRecord(linkId, linkTarget);
+    expect(hashCatFileBatch(linkBatch, [linkId]).get(linkId)).toBe(hashFile(path.join(root, 'link')));
   });
 });
 

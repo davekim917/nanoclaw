@@ -198,6 +198,44 @@ A PR that touches an upstream-owned file regenerates `src/upstream-ratchet.json`
 A PR that **grows** a diff carries the `--accept` in that manifest change and one line of justification in
 the PR body. Shrink needs neither.
 
+## Checking a PR head before merge
+
+The default report measures the **working tree** of the checkout it runs in — it needs a worktree checked
+out to the PR's commit. A merge gate does not have that: it has a remote ref. `--check <ref>` evaluates
+`<ref>`'s own committed tree exactly as the default report evaluates the working tree, with no writes and
+no dependence on the working tree of the checkout it runs in. This is what would have caught a real miss —
+a PR merged without regenerating the manifest, so `main` went `Δ 187` and failed only after the merge,
+not before it.
+
+```bash
+git fetch origin <branch> && ./node_modules/.bin/tsx scripts/upstream-ratchet-report.ts --check FETCH_HEAD
+```
+
+`<ref>` is anything `git rev-parse` understands: a sha, `origin/<branch>`, `FETCH_HEAD`. Two things run,
+each reported in its own section:
+
+- the same GROWTH/NEW/SHRINK/STALE classification the default report runs, against the manifest
+  **committed at `<ref>`** (not the local `src/upstream-ratchet.json`) — the same arbitration, just pointed
+  at a ref instead of a checkout;
+- a **STALE-MANIFEST** currency check — the same per-entry logic the hermetic host-suite test
+  (`src/upstream-ratchet.test.ts`) runs against a local working tree, run here against `<ref>`'s own tree
+  instead. It catches a manifest whose `sha256`/`mode`/`deleted` bookkeeping disagrees with `<ref>`'s real
+  content even in a case the diff-line arithmetic alone would not flag (an equal-size text edit, which the
+  default classification deliberately allows through).
+
+Either section failing exits 1. Exit codes are otherwise unchanged: **2** means "cannot measure" — `<ref>`
+does not resolve to a commit in this clone, `<ref>` carries no manifest at `src/upstream-ratchet.json`, or
+its pinned upstream commit is not in this clone (with the `git fetch upstream <sha>` to run, same as the
+default report). `--json` works. `--check` is incompatible with `--write`, `--accept`, `--accept-all` and
+`--upstream` — a ref that is not this checkout's HEAD is nothing any of them could act on.
+
+What does not apply to a bare commit, and is skipped rather than approximated: `git check-ignore` needs a
+live index and working tree, so an upstream path the fork deleted and gitignored just reads as plain
+`deleted` there — it does not change a GROWTH/NEW/SHRINK verdict, only the `ignored` flag on a manifest
+entry that `--check` never writes. The untracked-shadow check has no meaning either: it exists to catch
+bytes sitting at a path the fork's index does not track, which cannot happen inside a single commit's own
+tree.
+
 ## From a linked worktree
 
 Run the boundary check as

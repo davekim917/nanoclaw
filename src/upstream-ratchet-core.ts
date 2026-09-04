@@ -23,6 +23,8 @@
  * commit and runs the report on every PR, which is what makes the manifest's
  * numbers verified rather than self-reported.
  */
+import { createHash } from 'node:crypto';
+
 import {
   GITLINK_MODE,
   isGitMode,
@@ -61,6 +63,94 @@ export function parseLsTree(stdout: string): Map<string, GitMode> {
     if (!isGitMode(mode))
       fail(`unexpected git mode ${JSON.stringify(mode)} for ${relPath} in the pinned upstream tree`);
     out.set(relPath, mode);
+  }
+  return out;
+}
+
+/** One `git ls-tree -r -z` record for an arbitrary (non-upstream) tree: its mode string and blob id. */
+export interface LsTreeEntry {
+  mode: string;
+  blob: string;
+}
+
+/**
+ * `git ls-tree -r -z <ref>` → path → `{mode, blob}`, for ANY tree — used to read
+ * the CHECKED ref's own tree (a PR head, not the pinned upstream commit).
+ *
+ * Deliberately more permissive than `parseLsTree`: it does not reject a 160000
+ * gitlink or validate the mode against `GIT_MODES`. `parseLsTree`'s gitlink
+ * rejection is upstream-tree-specific wording ("gitlink in the pinned upstream
+ * tree"), which would misdescribe a gitlink that is the FORK's own — that case
+ * is caught by `assertNoGitlinkShadows` instead, exactly as `parseLsFiles`'s
+ * fork-index parsing already leaves gitlink detection to the caller rather than
+ * the parser. `blob` is the object id `git cat-file --batch` needs to read the
+ * entry's content for hashing.
+ */
+export function parseLsTreeEntries(stdout: string): Map<string, LsTreeEntry> {
+  const out = new Map<string, LsTreeEntry>();
+  for (const record of stdout.split('\0')) {
+    if (record === '') continue;
+    const tab = record.indexOf('\t');
+    if (tab === -1) fail(`could not parse ls-tree record: ${JSON.stringify(record)}`);
+    const relPath = record.slice(tab + 1);
+    const meta = record.slice(0, tab).split(' ');
+    const mode = meta[0] ?? '';
+    const blob = meta[2] ?? '';
+    if (mode === '' || blob === '') fail(`could not parse ls-tree record: ${JSON.stringify(record)}`);
+    out.set(relPath, { mode, blob });
+  }
+  return out;
+}
+
+/**
+ * `git cat-file --batch` output framing → object id → raw content bytes.
+ *
+ * The format is `<sha> SP <type> SP <size> LF <content> LF`, repeated once per
+ * requested id, in the order the ids were sent on stdin. Binary-safe by
+ * construction — content is never decoded as text, because a blob's bytes may
+ * be arbitrary (a binary file) or a symlink's target string in a non-UTF8
+ * encoding.
+ *
+ * `ids` must be the exact list sent to `cat-file --batch`, in the same order —
+ * the framing has no separators of its own between records other than the
+ * fixed header/size/LF shape, so there is no way to recover record boundaries
+ * without knowing how many records to expect.
+ */
+export function parseCatFileBatch(stdout: Buffer, ids: readonly string[]): Map<string, Buffer> {
+  const out = new Map<string, Buffer>();
+  let offset = 0;
+  for (const id of ids) {
+    const headerEnd = stdout.indexOf(0x0a, offset);
+    if (headerEnd === -1) fail(`cat-file --batch output truncated while reading the header for ${id}`);
+    const header = stdout.subarray(offset, headerEnd).toString('utf8');
+    const parts = header.split(' ');
+    if (parts[1] === 'missing') fail(`git object ${parts[0] ?? id} is missing from this clone`);
+    if (parts.length < 3) fail(`could not parse cat-file --batch header: ${JSON.stringify(header)}`);
+    const size = Number(parts[2]);
+    if (!Number.isInteger(size) || size < 0) fail(`could not parse cat-file --batch header: ${JSON.stringify(header)}`);
+    const contentStart = headerEnd + 1;
+    const contentEnd = contentStart + size;
+    if (contentEnd > stdout.length) fail(`cat-file --batch output truncated while reading the content for ${id}`);
+    out.set(id, stdout.subarray(contentStart, contentEnd));
+    offset = contentEnd + 1; // the trailing LF git appends after the content
+  }
+  return out;
+}
+
+/**
+ * `parseCatFileBatch` output → object id → sha256 hex of its content.
+ *
+ * This MUST agree with `hashFile` (src/upstream-ratchet.ts) byte for byte: git
+ * stores a symlink's blob content as the target string itself, which is
+ * exactly what `hashFile` hashes for a symlink (`fs.readlinkSync`, not the
+ * pointee) — so a manifest written from a worktree's working tree and one
+ * measured here from the same commit's blobs must hash identically. Proven in
+ * src/upstream-ratchet-core.test.ts by hashing one fixture both ways.
+ */
+export function hashCatFileBatch(stdout: Buffer, ids: readonly string[]): Map<string, string> {
+  const out = new Map<string, string>();
+  for (const [id, content] of parseCatFileBatch(stdout, ids)) {
+    out.set(id, createHash('sha256').update(content).digest('hex'));
   }
   return out;
 }
