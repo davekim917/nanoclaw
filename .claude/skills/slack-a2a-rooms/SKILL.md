@@ -129,8 +129,15 @@ conversation under its own channelType.
 
    ```bash
    ncl messaging-groups list --channel-type slack-<suffix> --json
-   ncl wirings create --messaging-group-id <id> --agent-group-id <agent group id>
+   ncl wirings create --messaging-group-id <id> --agent-group-id <agent group id> \
+     --ignored-message-policy accumulate
    ```
+
+   `--ignored-message-policy accumulate` is not optional for a room.
+   `ncl wirings create` falls back to `drop` when the flag is omitted, which
+   discards every turn the agent was not mentioned in — so an agent pulled in
+   by a later mention would arrive with no idea what the team had been
+   discussing.
 
 3. Repeat step 2 for each other participating agent, using that agent's own
    channelType.
@@ -147,24 +154,34 @@ usual; a private room with known humans is a reasonable place to relax it:
 ncl messaging-groups update --id <id> --unknown-sender-policy public
 ```
 
-## Engagement: A2A conversation is mention-driven
+## Engagement: every turn needs a mention
 
 An MPIM is a _group_ context in the channel-defaults model (Slack DMs are only
-`D…` channels), so the Slack group defaults apply: `engage_mode:
-mention-sticky`, per-thread stickiness. An agent replies when it is
-@-mentioned and then stays engaged in that thread — it does not answer every
-room message. Bot-to-bot conversation is therefore **mention-driven by
-design**: agent A's reply reaches agent B when it @-mentions B, and the chain
-continues only as long as each reply mentions the next speaker.
+`D…` channels), so the Slack group declaration applies: `engageMode: 'mention'`
+(`SLACK_DEFAULTS`, `src/channels/slack.ts`). Each turn an agent takes needs its
+own mention — engagement does **not** persist across a thread the way
+`mention-sticky` would. Bot-to-bot conversation is therefore mention-driven by
+design: agent A's reply reaches agent B only when it @-mentions B, and the
+chain continues only as long as each reply mentions the next speaker.
+
+If a room should keep an agent engaged after the first mention, opt in per
+wiring — Slack declares `threads: true` for groups, so sticky is not coerced
+away here:
+
+```bash
+ncl wirings update --id <wiring id> --engage-mode mention-sticky
+```
 
 Slack does not emit `app_mention` for bot-authored messages, but mention
-detection still works — the text-level detector matches the bot's own `<@U…>`
-token, which the adapter deliberately leaves unresolved in the text. This is
-the intended loop governor alongside the hop limit. Prompt the agents (group
-CLAUDE.md / standing instructions) to @-mention the sibling they want an
-answer from, and to stop mentioning anyone once the exchange has converged.
-The agent-facing half of these conventions ships as the container skill of the
-same name (`container/skills/slack-a2a-rooms/`), which agents load on demand.
+detection still works on the message text. Note the direction of translation:
+inbound, `<@U…>` tokens are rewritten to `@displayName` before an agent sees
+them, and outbound, `src/channels/slack-mentions.ts` rewrites an agent's
+`@name` back into Slack's mention token. Agents therefore write `@name`, never
+a raw id. Prompt them (group CLAUDE.md / standing instructions) to mention the
+sibling they want an answer from, and to stop mentioning anyone once the
+exchange has converged. The agent-facing half of these conventions ships as the
+container skill of the same name (`container/skills/slack-a2a-rooms/`), which
+agents load on demand.
 
 ## Troubleshooting
 
