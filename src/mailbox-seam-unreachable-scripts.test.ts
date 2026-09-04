@@ -207,15 +207,12 @@ describe('storage-manager.ts / storage-activity.ts contain no literal seam call'
       .split(',')
       .map((n) => n.trim())
       .filter(Boolean);
+    // 1553790a moved storage-manager.ts's DB-path lookups (inboundDbPath,
+    // outboundDbPath) onto the mailbox module's own sessionMailboxPath — the
+    // remaining session-manager.js imports are only the thread/session
+    // directory-layout helpers, none of which reach the seam.
     expect(names.sort()).toEqual(
-      [
-        'inboundDbPath',
-        'outboundDbPath',
-        'sessionContextPathFor',
-        'sessionsBaseDir',
-        'threadsBaseDir',
-        'threadWorktreeDir',
-      ].sort(),
+      ['sessionContextPathFor', 'sessionsBaseDir', 'threadsBaseDir', 'threadWorktreeDir'].sort(),
     );
   });
 });
@@ -276,15 +273,34 @@ describe('worktree-cleanup.ts contains no literal seam call, and the only contai
     expect(names.sort()).toEqual(['isContainerRunning', 'isContainerSpawning'].sort());
   });
 
-  it("worktree-cleanup.ts's only session-manager.js imports are the non-seam DB path helpers", () => {
+  // 1553790a moved worktree-cleanup.ts's DB-path lookups (inboundDbPath,
+  // openOutboundDb) off session-manager.js entirely, onto the mailbox
+  // module's own sessionMailboxPath and openOutboundDb — the file now has no
+  // session-manager.js import at all. Pinning stays on the two files that
+  // replaced it, so a future import there still re-triggers this review.
+  it('worktree-cleanup.ts no longer imports from session-manager.js', () => {
     const src = fs.readFileSync(path.join(REPO_ROOT, 'src/worktree-cleanup.ts'), 'utf8');
-    const match = /import\s*\{([^}]*)\}\s*from\s*['"]\.\/session-manager\.js['"]/.exec(src);
-    expect(match).not.toBeNull();
-    const names = match![1]
+    expect(/from\s*['"]\.\/session-manager\.js['"]/.test(src)).toBe(false);
+  });
+
+  it("worktree-cleanup.ts's only modules/mailbox/openers.js import is openOutboundDb, and its only modules/mailbox/index.js import is sessionMailboxPath — pinned so a future import here re-triggers this review", () => {
+    const src = fs.readFileSync(path.join(REPO_ROOT, 'src/worktree-cleanup.ts'), 'utf8');
+
+    const openersMatch = /import\s*\{([^}]*)\}\s*from\s*['"]\.\/modules\/mailbox\/openers\.js['"]/.exec(src);
+    expect(openersMatch).not.toBeNull();
+    const openersNames = openersMatch![1]
       .split(',')
       .map((n) => n.trim())
       .filter(Boolean);
-    expect(names.sort()).toEqual(['inboundDbPath', 'openOutboundDb'].sort());
+    expect(openersNames.sort()).toEqual(['openOutboundDb'].sort());
+
+    const indexMatch = /import\s*\{([^}]*)\}\s*from\s*['"]\.\/modules\/mailbox\/index\.js['"]/.exec(src);
+    expect(indexMatch).not.toBeNull();
+    const indexNames = indexMatch![1]
+      .split(',')
+      .map((n) => n.trim())
+      .filter(Boolean);
+    expect(indexNames.sort()).toEqual(['sessionMailboxPath'].sort());
   });
 });
 
