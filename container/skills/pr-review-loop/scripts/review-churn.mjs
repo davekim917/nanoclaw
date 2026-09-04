@@ -92,7 +92,99 @@ const STOPWORDS = new Set(
 
 // Import specifiers that are never the seam: builtins, the test runner, and
 // type-only packages carry no shared write/wake/read primitive.
+//
+// The `node:` prefix stays an unconditional reject and is NOT delegated to the
+// list below: prefix-only builtins (`node:test`, `node:sqlite`, `node:sea`) are
+// absent from every runtime's builtin list, and their bare forms — `test`,
+// `sqlite` — are ordinary npm package names that must stay eligible.
 const SEAM_SPEC_DENY = /^(?:node:|vitest$|bun:|@types\/)/;
+
+// The bare names, as a FROZEN list of Node core specifiers rather than the
+// executing runtime's `builtinModules`. The two are not the same set: Bun
+// reports its compatibility packages — `undici`, `ws`, `bun` — as builtins, and
+// `undici` is a real dependency imported across this repo. Deriving the deny
+// set from the runtime therefore made the host and the container disagree about
+// the same payload: a three-round class seamed on `undici` refused a push on
+// the host and passed inside a container. A gate that answers differently
+// depending on who runs it is not a gate.
+//
+// Node core changes about once a year; a wrong answer here costs a seam
+// candidate, not correctness of the round count.
+const NODE_BUILTINS = new Set([
+  'assert',
+  'assert/strict',
+  'async_hooks',
+  'buffer',
+  'child_process',
+  'cluster',
+  'console',
+  'constants',
+  'crypto',
+  'dgram',
+  'diagnostics_channel',
+  'dns',
+  'dns/promises',
+  'domain',
+  'events',
+  'fs',
+  'fs/promises',
+  'http',
+  'http2',
+  'https',
+  'inspector',
+  'inspector/promises',
+  'module',
+  'net',
+  'os',
+  'path',
+  'path/posix',
+  'path/win32',
+  'perf_hooks',
+  'process',
+  'punycode',
+  'querystring',
+  'readline',
+  'readline/promises',
+  'repl',
+  'stream',
+  'stream/consumers',
+  'stream/promises',
+  'stream/web',
+  'string_decoder',
+  'sys',
+  'timers',
+  'timers/promises',
+  'tls',
+  'trace_events',
+  'tty',
+  'url',
+  'util',
+  'util/types',
+  'v8',
+  'vm',
+  'wasi',
+  'worker_threads',
+  'zlib',
+]);
+
+/**
+ * `relative` says the import was written as a path (`./x.js`) and has already
+ * been resolved to one, so it is in-repo and always eligible. Everything else
+ * is a package specifier, where two rules apply:
+ *
+ *   - a leading underscore means a Node internal (`_http_agent`,
+ *     `_stream_readable`, `_tls_wrap`), because npm forbids package names that
+ *     start with `_`. That is a rule rather than more names: enumerating the
+ *     `_http_*`, `_stream_*` and `_tls_*` families invites the next omission,
+ *     and every one of them would seam a class on something no diff can touch.
+ *   - the frozen core list covers the ordinary bare builtins.
+ */
+function seamCandidate(spec, relative) {
+  if (SEAM_SPEC_DENY.test(spec)) return false;
+  if (relative) return true;
+  if (spec.startsWith('_')) return false;
+  return !NODE_BUILTINS.has(spec);
+}
 
 // ── finding parsing ─────────────────────────────────────────────────────────
 
@@ -219,7 +311,7 @@ export function seamFor(files, findingText, ctx) {
     if (source == null) continue;
     for (const { spec, names } of importsOf(source)) {
       const resolved = resolveSpec(file, spec);
-      if (SEAM_SPEC_DENY.test(resolved)) continue;
+      if (!seamCandidate(resolved, spec.startsWith('.'))) continue;
       let entry = bySpec.get(resolved);
       if (!entry) {
         entry = { spec: resolved, relative: spec.startsWith('.'), files: new Set(), names: new Map() };

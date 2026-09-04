@@ -16,12 +16,30 @@ import { describe, expect, it } from 'vitest';
 
 import { allowSubprocess, enforceHermeticity } from '../src/test-hermeticity.js';
 
-allowSubprocess(['node', 'git']);
+allowSubprocess(['node', 'bun', 'git']);
 enforceHermeticity();
 
 const SCRIPT = path.resolve('.claude/skills/pr-review-loop/scripts/review-churn.mjs');
 const CONTAINER_SCRIPT = path.resolve('container/skills/pr-review-loop/scripts/review-churn.mjs');
 const FIXTURES = path.resolve('scripts/__fixtures__/review-churn');
+
+// The classifier runs on the host under node and inside agent containers under
+// bun, so the cross-runtime case needs both. Missing bun is an error, not a
+// skip: the property it checks — that the two runtimes decide identically — is
+// the whole reason the deny set is a frozen list.
+function bunBinary(): string {
+  const candidates = [
+    ...(process.env.PATH ?? '')
+      .split(path.delimiter)
+      .filter(Boolean)
+      .map((dir) => path.join(dir, 'bun')),
+    path.join(process.env.HOME ?? '', '.bun/bin/bun'),
+    '/usr/local/bin/bun',
+  ];
+  const found = candidates.find((candidate) => fs.existsSync(candidate));
+  if (!found) throw new Error('bun is required for the cross-runtime case; install it or put it on PATH');
+  return found;
+}
 
 interface Site {
   file: string;
@@ -155,6 +173,90 @@ describe('review-churn classifier', () => {
     expect(churning[0].primitives).toEqual([]);
   });
 
+  it('never seams a class on a Node builtin, bare, prefixed, or prefix-only', () => {
+    // A builtin is shared by nearly every file in the tree and owns no
+    // write/wake/read primitive, so it is the specifier the seam ranking would
+    // reward and the one answer that can never be right. The fixture's sites
+    // share `path` (bare), `node:fs` (prefixed, in builtinModules) and
+    // `node:test` (prefixed, in builtinModules on neither runtime) — so the
+    // `node:` prefix has to be rejected outright, not looked up in the list.
+    const churning = classify(fixture('builtin-seam')).classes.filter((c) => c.rounds >= 3);
+    expect(churning).toHaveLength(1);
+    expect(churning[0].seam).toBeNull();
+    expect(churning[0].primitives).toEqual([]);
+  });
+
+  it('prefers the module that owns the primitive over the builtins every file shares', () => {
+    const churning = classify(fixture('builtin-with-real-seam')).classes.filter((c) => c.rounds >= 3);
+    expect(churning[0].seam).toBe('src/mailbox/write.ts');
+    expect(churning[0].primitives).toContain('writeSessionMessage');
+  });
+
+  it("never seams a class on Node's underscore-prefixed internals", () => {
+    // `_http_agent` and friends are bare-loadable on both runtimes. npm forbids
+    // package names starting with `_`, so a bare `_`-specifier is always a core
+    // internal — a rule, rather than an enumeration of the `_http_*`,
+    // `_stream_*` and `_tls_*` families that invites the next omission.
+    const churning = classify(fixture('internal-builtin-seam')).classes.filter((c) => c.rounds >= 3);
+    expect(churning).toHaveLength(1);
+    expect(churning[0].seam).toBeNull();
+  });
+
+  it('still seams on an in-repo module whose name starts with an underscore', () => {
+    // The rule is about package specifiers, not about the character: a relative
+    // import resolves to a path in this repo, which a diff can touch.
+    const churning = classify(fixture('underscore-module-seam')).classes.filter((c) => c.rounds >= 3);
+    expect(churning[0].seam).toBe('src/_shared.ts');
+    expect(churning[0].primitives).toContain('writeThing');
+  });
+
+  it('keeps a real dependency seam-eligible, builtins around it notwithstanding', () => {
+    // `undici` is a direct dependency of this repo AND a name bun reports as a
+    // builtin. Its sites here also share `fs` and `node:test`, so the two
+    // categories are exercised together.
+    const churning = classify(fixture('undici-seam')).classes.filter((c) => c.rounds >= 3);
+    expect(churning).toHaveLength(1);
+    expect(churning[0].seam).toBe('undici');
+    expect(churning[0].primitives).toContain('requestWithPool');
+  });
+
+  it('decides identically under node and under bun', () => {
+    // The deny set is a frozen list of Node core specifiers, never the
+    // executing runtime's `builtinModules`: bun reports `undici`, `ws` and
+    // `bun` as builtins and node does not, so a runtime-derived set gave one
+    // payload two verdicts — a class seamed on `undici` refused a push on the
+    // host and passed in a container.
+    const bun = bunBinary();
+    for (const name of [
+      'undici-seam',
+      'builtin-seam',
+      'builtin-with-real-seam',
+      'internal-builtin-seam',
+      'underscore-module-seam',
+    ]) {
+      const payload = fixture(name);
+      const underNode = spawn(['classify', '--json'], payload);
+      const underBun = spawnSync(bun, [SCRIPT, 'classify', '--json'], {
+        input: JSON.stringify(payload),
+        encoding: 'utf8',
+      });
+      expect(underNode.status, `node failed on ${name}`).toBe(0);
+      expect(underBun.status, `bun failed on ${name}: ${underBun.stderr}`).toBe(0);
+      expect(JSON.parse(underBun.stdout), `${name} classifies differently under bun`).toEqual(
+        JSON.parse(underNode.stdout),
+      );
+    }
+  });
+
+  it('does not derive the deny set from whatever runtime is executing it', () => {
+    // A structural guard, because the cross-runtime case above can only catch
+    // the disagreements those two runtimes happen to have today.
+    const source = fs.readFileSync(SCRIPT, 'utf8');
+    const code = source.replace(/^\s*(\/\/.*|\*.*|\/\*.*)$/gm, '');
+    expect(code).not.toContain('builtinModules');
+    expect(code).not.toContain("from 'node:module'");
+  });
+
   it('reads severity direction per seam, not per finding', () => {
     const falling = classify(fixture('seam-drift-falling'));
     const flat = classify(fixture('seam-drift-flat'));
@@ -252,6 +354,23 @@ describe('review-churn gate', () => {
     expect(falling.status).toBe(0);
     expect(falling.decision.status).toBe('pass');
     expect(falling.decision.flagged).toHaveLength(0);
+  });
+
+  it('does not gate a class whose only shared import is a Node internal', () => {
+    const { status, decision } = gate(fixture('internal-builtin-seam'));
+    expect(status).toBe(0);
+    expect(decision.status).toBe('pass');
+    expect(decision.report.classes[0].rounds).toBe(3);
+  });
+
+  it('does not gate a class whose only shared import is a builtin', () => {
+    // Seamed on `path`, the refusal named `path` as the primitive: no diff
+    // could lift it, because the lift-by-diff path only matches in-repo
+    // modules. A gate whose only exit is the override is worse than no gate.
+    const { status, decision } = gate(fixture('builtin-seam'));
+    expect(status).toBe(0);
+    expect(decision.status).toBe('pass');
+    expect(decision.flagged).toHaveLength(0);
   });
 
   it('passes a PR whose worst class has run two rounds', () => {
