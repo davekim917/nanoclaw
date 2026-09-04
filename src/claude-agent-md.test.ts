@@ -173,22 +173,21 @@ describe('formatCodexAgentToml — worker model tiering', () => {
     expect(order.indexOf(fast.effort)).toBeGreaterThan(order.indexOf(top.effort));
   });
 
-  test('worker-frontier maps to Sol at max reasoning effort', () => {
-    // The actual top rung: same Codex model as worker-high, pushed to max
-    // effort rather than a different model, since Codex has no Fable-priced
-    // equivalent to escalate to.
-    expect(CODEX_WORKER_TIERS['worker-frontier']).toEqual({ model: 'gpt-5.6-sol', effort: 'max' });
+  test('worker-frontier maps to Astra at high reasoning effort', () => {
+    // The actual top rung: Astra at high effort provides the larger-model
+    // escalation over worker-high.
+    expect(CODEX_WORKER_TIERS['worker-frontier']).toEqual({ model: 'gpt-6-astra', effort: 'high' });
   });
 
-  test('emits gpt-5.6-sol and max reasoning effort for worker-frontier', () => {
+  test('emits gpt-6-astra and high reasoning effort for worker-frontier', () => {
     const out = formatCodexAgentToml({
       name: 'worker-frontier',
       description: 'Frontier-tier work. Runs on Fable 5.1 at medium effort.',
       body: 'b',
     });
-    expect(out).toContain('model = "gpt-5.6-sol"');
-    expect(out).toContain('model_reasoning_effort = "max"');
-    expect(out).toContain('Runs on gpt-5.6-sol at max reasoning.');
+    expect(out).toContain('model = "gpt-6-astra"');
+    expect(out).toContain('model_reasoning_effort = "high"');
+    expect(out).toContain('Runs on gpt-6-astra at high reasoning.');
     expect(out).not.toContain('Fable');
   });
 });

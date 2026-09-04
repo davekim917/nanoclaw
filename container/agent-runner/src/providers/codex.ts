@@ -384,7 +384,7 @@ export function materializeRawImageGeneration(
 // uses low | medium | high | xhigh | max | ultra. Ultra is a real Codex effort
 // value that adds proactive task delegation, not Claude's `ultracode` flag.
 //
-// Default is `high` for the production model (gpt-5.6-sol); operators can dial
+// Default is `high` for the production model (gpt-6-astra); operators can dial
 // down or up per-agent via container.json when cost/latency dictate ("high"
 // covers the deeper of the standard tiers without the proactive-delegation
 // extras of xhigh/max/ultra). Changed from xhigh → high per operator decision
@@ -1048,7 +1048,7 @@ export class CodexProvider implements AgentProvider {
 
     // Model precedence: stickyConfig (per-agent) > CODEX_MODEL env (host
     // default) > built-in default.
-    this.model = this.stickyConfig.model ?? (options.env?.CODEX_MODEL as string | undefined) ?? 'gpt-5.6-sol';
+    this.model = this.stickyConfig.model ?? (options.env?.CODEX_MODEL as string | undefined) ?? 'gpt-6-astra';
 
     // Fallback OAuth identities. Empty when CODEX_FALLBACK_HOMES is unset
     // (the host didn't mount any fallbacks). Read from process.env rather
