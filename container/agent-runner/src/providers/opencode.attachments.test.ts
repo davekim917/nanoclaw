@@ -1,6 +1,12 @@
 import { describe, it, expect } from 'bun:test';
 
-import { buildAttachmentFileParts, buildPromptParts, forwardableAttachmentMime } from './opencode.js';
+import {
+  buildAttachmentFileParts,
+  buildPromptParts,
+  declarationsApplyToModel,
+  forwardableAttachmentMime,
+  resolveModelCapabilities,
+} from './opencode.js';
 
 const allPresent = () => true;
 const nonePresent = () => false;
@@ -12,7 +18,7 @@ describe('buildAttachmentFileParts', () => {
     // would only duplicate the work and inflate the request body.
     const parts = buildAttachmentFileParts(
       [{ filename: 'cat.png', mime: 'image/png', path: '/workspace/inbox/cat.png' }],
-      allPresent,
+      { exists: allPresent },
     );
     expect(parts).toEqual([
       { type: 'file', mime: 'image/png', filename: 'cat.png', url: 'file:///workspace/inbox/cat.png' },
@@ -20,10 +26,9 @@ describe('buildAttachmentFileParts', () => {
   });
 
   it('test_oc_attachment_mime_from_extension: falls back to the extension when the channel gave no mime', () => {
-    const parts = buildAttachmentFileParts(
-      [{ filename: 'Report.PDF', path: '/workspace/inbox/Report.PDF' }],
-      allPresent,
-    );
+    const parts = buildAttachmentFileParts([{ filename: 'Report.PDF', path: '/workspace/inbox/Report.PDF' }], {
+      exists: allPresent,
+    });
     expect(parts).toHaveLength(1);
     expect(parts[0]?.mime).toBe('application/pdf');
   });
@@ -38,7 +43,7 @@ describe('buildAttachmentFileParts', () => {
         // the request.
         { filename: 'clip.mp4', mime: 'video/mp4', path: '/workspace/inbox/clip.mp4' },
       ],
-      allPresent,
+      { exists: allPresent },
     );
     // They are still described in the prompt text by the formatter, so nothing
     // is lost — just not handed over as media.
@@ -46,15 +51,14 @@ describe('buildAttachmentFileParts', () => {
   });
 
   it('test_oc_attachment_skips_unreadable: drops an attachment with no readable local file', () => {
-    const linkOnly = buildAttachmentFileParts(
-      [{ filename: 'cat.png', mime: 'image/png', url: 'https://x/cat.png' }],
-      allPresent,
-    );
+    const linkOnly = buildAttachmentFileParts([{ filename: 'cat.png', mime: 'image/png', url: 'https://x/cat.png' }], {
+      exists: allPresent,
+    });
     expect(linkOnly).toEqual([]);
 
     const missing = buildAttachmentFileParts(
       [{ filename: 'cat.png', mime: 'image/png', path: '/workspace/inbox/gone.png' }],
-      nonePresent,
+      { exists: nonePresent },
     );
     expect(missing).toEqual([]);
   });
@@ -65,7 +69,7 @@ describe('buildAttachmentFileParts', () => {
     // a TypeError from `.startsWith()` that aborts the entire provider query.
     const parts = buildAttachmentFileParts(
       [{ mime: { foo: 'bar' }, filename: 'cat.png', path: '/workspace/inbox/cat.png' } as never],
-      allPresent,
+      { exists: allPresent },
     );
     expect(parts).toHaveLength(1);
     expect(parts[0]?.mime).toBe('image/png');
@@ -82,21 +86,23 @@ describe('buildAttachmentFileParts', () => {
         allPresent,
       ),
     ).not.toThrow();
-    expect(buildAttachmentFileParts([{ mime: {}, filename: {}, path: {} } as never], allPresent)).toEqual([]);
+    expect(buildAttachmentFileParts([{ mime: {}, filename: {}, path: {} } as never], { exists: allPresent })).toEqual(
+      [],
+    );
   });
 
   it('a non-string filename is dropped from the part rather than emitted', () => {
     const parts = buildAttachmentFileParts(
       [{ mime: 'image/png', filename: { a: 1 }, path: '/workspace/inbox/cat.png' } as never],
-      allPresent,
+      { exists: allPresent },
     );
     expect(parts[0]?.filename).toBeUndefined();
     expect(parts[0]?.url).toBe('file:///workspace/inbox/cat.png');
   });
 
   it('an absent attachment list is an empty part list, not a throw', () => {
-    expect(buildAttachmentFileParts(undefined, allPresent)).toEqual([]);
-    expect(buildAttachmentFileParts([], allPresent)).toEqual([]);
+    expect(buildAttachmentFileParts(undefined, { exists: allPresent })).toEqual([]);
+    expect(buildAttachmentFileParts([], { exists: allPresent })).toEqual([]);
   });
 });
 
@@ -105,7 +111,7 @@ describe('buildPromptParts', () => {
     const parts = buildPromptParts(
       'look at this',
       [{ filename: 'cat.png', mime: 'image/png', path: '/workspace/inbox/cat.png' }],
-      allPresent,
+      { exists: allPresent },
     );
     expect(parts[0]).toEqual({ type: 'text', text: 'look at this' });
     expect(parts).toHaveLength(2);
@@ -113,54 +119,111 @@ describe('buildPromptParts', () => {
   });
 
   it('test_oc_prompt_parts_unchanged_without_media: a turn with no attachments is the old single text part', () => {
-    expect(buildPromptParts('hello', undefined, allPresent)).toEqual([{ type: 'text', text: 'hello' }]);
-    expect(buildPromptParts('hello', [], allPresent)).toEqual([{ type: 'text', text: 'hello' }]);
+    expect(buildPromptParts('hello', undefined, { exists: allPresent })).toEqual([{ type: 'text', text: 'hello' }]);
+    expect(buildPromptParts('hello', [], { exists: allPresent })).toEqual([{ type: 'text', text: 'hello' }]);
   });
 });
 
 describe('forwardableAttachmentMime', () => {
   it('test_oc_forward_images_and_pdfs_unconditionally: the long-standing behavior is unchanged', () => {
-    expect(forwardableAttachmentMime('image/png', {})).toBe(true);
-    expect(forwardableAttachmentMime('image/heic', {})).toBe(true);
-    expect(forwardableAttachmentMime('application/pdf', {})).toBe(true);
-    expect(forwardableAttachmentMime('text/plain', {})).toBe(false);
-    expect(forwardableAttachmentMime('application/zip', {})).toBe(false);
+    expect(forwardableAttachmentMime('image/png', undefined, {})).toBe(true);
+    expect(forwardableAttachmentMime('image/heic', undefined, {})).toBe(true);
+    expect(forwardableAttachmentMime('application/pdf', undefined, {})).toBe(true);
+    expect(forwardableAttachmentMime('text/plain', undefined, {})).toBe(false);
+    expect(forwardableAttachmentMime('application/zip', undefined, {})).toBe(false);
   });
 
   it('test_oc_forward_audio_video_only_when_declared: the advertised modalities are the forwarded ones', () => {
     // resolveModelModalities accepts and advertises audio and video, but the
     // forwarder used to drop both — so declaring either did nothing. One
     // declaration now drives both gates.
-    expect(forwardableAttachmentMime('audio/ogg', {})).toBe(false);
-    expect(forwardableAttachmentMime('video/mp4', {})).toBe(false);
+    expect(forwardableAttachmentMime('audio/ogg', undefined, {})).toBe(false);
+    expect(forwardableAttachmentMime('video/mp4', undefined, {})).toBe(false);
 
-    const audioOnly = { OPENCODE_MODEL_INPUT_MODALITIES: 'audio' };
-    expect(forwardableAttachmentMime('audio/ogg', audioOnly)).toBe(true);
-    expect(forwardableAttachmentMime('video/mp4', audioOnly)).toBe(false);
+    const audioOnly = { OPENCODE_MODEL: 'nvidia/m', OPENCODE_MODEL_INPUT_MODALITIES: 'audio' };
+    expect(forwardableAttachmentMime('audio/ogg', 'nvidia/m', audioOnly)).toBe(true);
+    expect(forwardableAttachmentMime('video/mp4', 'nvidia/m', audioOnly)).toBe(false);
 
-    const both = { OPENCODE_MODEL_INPUT_MODALITIES: 'audio,video' };
-    expect(forwardableAttachmentMime('audio/mpeg', both)).toBe(true);
-    expect(forwardableAttachmentMime('video/webm', both)).toBe(true);
+    const both = { OPENCODE_MODEL: 'nvidia/m', OPENCODE_MODEL_INPUT_MODALITIES: 'audio,video' };
+    expect(forwardableAttachmentMime('audio/mpeg', 'nvidia/m', both)).toBe(true);
+    expect(forwardableAttachmentMime('video/webm', 'nvidia/m', both)).toBe(true);
 
     // Declaring an image modality does not open the audio gate.
-    expect(forwardableAttachmentMime('audio/ogg', { OPENCODE_MODEL_INPUT_MODALITIES: 'image' })).toBe(false);
+    expect(
+      forwardableAttachmentMime('audio/ogg', 'nvidia/m', {
+        OPENCODE_MODEL: 'nvidia/m',
+        OPENCODE_MODEL_INPUT_MODALITIES: 'image',
+      }),
+    ).toBe(false);
   });
 
   it('test_oc_forward_audio_extension_fallback: a voice note with no channel mime resolves by extension', () => {
     // The host names a Telegram voice note `.ogg` via its own TYPE_TO_EXT map,
     // and reports no mimeType for it.
-    const previous = process.env.OPENCODE_MODEL_INPUT_MODALITIES;
+    const previousModalities = process.env.OPENCODE_MODEL_INPUT_MODALITIES;
+    const previousModel = process.env.OPENCODE_MODEL;
     process.env.OPENCODE_MODEL_INPUT_MODALITIES = 'audio';
+    process.env.OPENCODE_MODEL = 'nvidia/test-model';
     try {
-      const parts = buildAttachmentFileParts(
-        [{ filename: 'voice.ogg', path: '/workspace/inbox/voice.ogg' }],
-        allPresent,
-      );
+      const parts = buildAttachmentFileParts([{ filename: 'voice.ogg', path: '/workspace/inbox/voice.ogg' }], {
+        exists: allPresent,
+      });
       expect(parts).toHaveLength(1);
       expect(parts[0]?.mime).toBe('audio/ogg');
     } finally {
-      if (previous === undefined) delete process.env.OPENCODE_MODEL_INPUT_MODALITIES;
-      else process.env.OPENCODE_MODEL_INPUT_MODALITIES = previous;
+      if (previousModalities === undefined) delete process.env.OPENCODE_MODEL_INPUT_MODALITIES;
+      else process.env.OPENCODE_MODEL_INPUT_MODALITIES = previousModalities;
+      if (previousModel === undefined) delete process.env.OPENCODE_MODEL;
+      else process.env.OPENCODE_MODEL = previousModel;
     }
+  });
+});
+
+describe('declarationsApplyToModel / resolveModelCapabilities', () => {
+  const env = {
+    OPENCODE_MODEL: 'openrouter/shared',
+    OPENCODE_MODEL_CONTEXT_LIMIT: '128000',
+    OPENCODE_MODEL_OUTPUT_LIMIT: '8192',
+    OPENCODE_MODEL_INPUT_MODALITIES: 'image,audio',
+  };
+
+  it('test_oc_caps_full_slug_identity: a provider-id collision does not inherit the declarations', () => {
+    // `openrouter/shared` and `nvidia/shared` are different models that share an
+    // id. Comparing ids alone applied one model's context window and media
+    // support to the other.
+    expect(declarationsApplyToModel('openrouter/shared', env)).toBe(true);
+    expect(declarationsApplyToModel('nvidia/shared', env)).toBe(false);
+    expect(resolveModelCapabilities('nvidia/shared', env)).toEqual({});
+    expect(resolveModelCapabilities('openrouter/shared', env)).toEqual({
+      limit: { context: 128000, output: 8192 },
+      modalities: { input: ['text', 'image', 'audio'], output: ['text'] },
+    });
+  });
+
+  it('test_oc_caps_no_override_is_the_configured_model: an unresolved effective model applies them', () => {
+    expect(declarationsApplyToModel(undefined, env)).toBe(true);
+    expect(resolveModelCapabilities(undefined, env).limit).toEqual({ context: 128000, output: 8192 });
+  });
+
+  it('slugs compare trimmed and case-insensitively', () => {
+    expect(declarationsApplyToModel('  OpenRouter/Shared ', env)).toBe(true);
+  });
+
+  it('no configured model means no declarations apply anywhere', () => {
+    expect(declarationsApplyToModel('nvidia/m', { OPENCODE_MODEL_CONTEXT_LIMIT: '1' })).toBe(false);
+    expect(resolveModelCapabilities('nvidia/m', { OPENCODE_MODEL_CONTEXT_LIMIT: '1' })).toEqual({});
+  });
+
+  it('test_oc_caps_forwarder_and_writer_agree: media forwarding follows the same predicate', () => {
+    // The round-3 fix checked identity in the config writer only; the forwarder
+    // read the declarations unconditionally. Both now route through
+    // resolveModelCapabilities, so an override cannot be handed audio the
+    // configured model declared, nor have its own media dropped for a reason
+    // that belongs to a different model.
+    expect(forwardableAttachmentMime('audio/ogg', 'openrouter/shared', env)).toBe(true);
+    expect(forwardableAttachmentMime('audio/ogg', 'nvidia/shared', env)).toBe(false);
+    // Images and PDFs stay unconditional on every model.
+    expect(forwardableAttachmentMime('image/png', 'nvidia/shared', env)).toBe(true);
+    expect(forwardableAttachmentMime('application/pdf', 'nvidia/shared', env)).toBe(true);
   });
 });

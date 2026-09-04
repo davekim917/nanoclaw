@@ -55,21 +55,24 @@ const ATTACHMENT_MIME_BY_EXT: Record<string, string> = {
 /**
  * Which media a turn may hand over as a file part.
  *
- * Images and PDFs are unconditional — that is the long-standing behavior and
- * the channels' common case. Audio and video ride the SAME declaration that
- * opens OpenCode's own gate for them: `OPENCODE_MODEL_INPUT_MODALITIES`. One
- * source of truth rather than two hardcoded lists, which is the drift this
- * closes — the config advertised `audio`/`video` as accepted values while the
- * forwarder silently dropped both, so declaring either did nothing.
+ * Images and PDFs are unconditional — the long-standing behavior and the
+ * channels' common case. Audio and video ride the SAME declaration that opens
+ * OpenCode's own gate for them, resolved through `resolveModelCapabilities` so
+ * this and the config writer cannot disagree about whether the declarations
+ * apply to the model actually running.
  *
- * Still closed by default: the env var is unset for every group unless an
- * operator declares it, and an undeclared modality is one OpenCode would drop
- * anyway (it substitutes a "does not support <modality> input" error), so
- * forwarding it would only inflate the request.
+ * Closed by default: the env var is unset unless an operator sets it, and an
+ * undeclared modality is one OpenCode substitutes a "does not support
+ * <modality> input" error for anyway, so forwarding it would only inflate the
+ * request.
  */
-export function forwardableAttachmentMime(mime: string, env: NodeJS.ProcessEnv = process.env): boolean {
+export function forwardableAttachmentMime(
+  mime: string,
+  effectiveModel?: string,
+  env: NodeJS.ProcessEnv = process.env,
+): boolean {
   if (mime.startsWith('image/') || mime === 'application/pdf') return true;
-  const declared = resolveModelModalities(env)?.input ?? [];
+  const declared = resolveModelCapabilities(effectiveModel, env).modalities?.input ?? [];
   if (mime.startsWith('audio/')) return declared.includes('audio');
   if (mime.startsWith('video/')) return declared.includes('video');
   return false;
@@ -116,13 +119,14 @@ function attachmentMime(att: PromptAttachment): string | undefined {
  */
 export function buildAttachmentFileParts(
   attachments: PromptAttachment[] | undefined,
-  exists: (path: string) => boolean = fs.existsSync,
+  opts: { effectiveModel?: string; env?: NodeJS.ProcessEnv; exists?: (path: string) => boolean } = {},
 ): FilePartInput[] {
+  const exists = opts.exists ?? fs.existsSync;
   const parts: FilePartInput[] = [];
   for (const att of attachments ?? []) {
     const mime = attachmentMime(att);
     if (!mime) continue;
-    if (!forwardableAttachmentMime(mime)) continue;
+    if (!forwardableAttachmentMime(mime, opts.effectiveModel, opts.env)) continue;
     if (typeof att.path !== 'string' || !att.path || !exists(att.path)) {
       const label =
         (typeof att.filename === 'string' && att.filename) ||
@@ -151,9 +155,9 @@ export function buildAttachmentFileParts(
 export function buildPromptParts(
   text: string,
   attachments?: PromptAttachment[],
-  exists: (path: string) => boolean = fs.existsSync,
+  opts: { effectiveModel?: string; env?: NodeJS.ProcessEnv; exists?: (path: string) => boolean } = {},
 ): Array<{ type: 'text'; text: string } | FilePartInput> {
-  return [{ type: 'text', text }, ...buildAttachmentFileParts(attachments, exists)];
+  return [{ type: 'text', text }, ...buildAttachmentFileParts(attachments, opts)];
 }
 
 /**
@@ -706,6 +710,53 @@ export function resolveModelLimit(
  * rather than a pipeline gate, but it is set alongside so the entry stays
  * internally consistent. Absent the env var, no capability keys are emitted.
  */
+/**
+ * Do the capability env vars describe the model this turn is actually running?
+ *
+ * THE invariant these declarations live under, in one predicate. They describe
+ * exactly ONE model — the group's configured default, `OPENCODE_MODEL`, which is
+ * the model the operator measured when they wrote the vars. Every consumer must
+ * ask this before applying any of them, and enforcing it per call site is what
+ * produced two rounds of review findings, one per site.
+ *
+ * Compared as FULL slugs, provider and model id together. `openrouter/shared`
+ * and `nvidia/shared` are different models that happen to share an id, so an
+ * id-only comparison silently applies one model's context window and media
+ * support to the other. Slugs are trimmed and lower-cased; a value carrying no
+ * provider prefix only matches an equally prefix-less configured model, since
+ * there is nothing to compare a provider against.
+ */
+export function declarationsApplyToModel(
+  effectiveModel: string | undefined,
+  env: NodeJS.ProcessEnv = process.env,
+): boolean {
+  const configured = env.OPENCODE_MODEL?.trim().toLowerCase();
+  if (!configured) return false;
+  // No per-turn override resolved: the turn runs the configured model.
+  const effective = effectiveModel?.trim().toLowerCase();
+  if (!effective) return true;
+  return effective === configured;
+}
+
+/**
+ * The capability declarations that apply to `effectiveModel`, or nothing.
+ *
+ * The single seam every consumer routes through — the config writer, which
+ * attaches `limit`/`modalities` to a model entry, and the attachment forwarder,
+ * which decides whether audio and video may be handed over. Both used to make
+ * this call themselves, and they disagreed: the writer checked identity (by
+ * model id only), the forwarder did not check at all.
+ */
+export function resolveModelCapabilities(
+  effectiveModel: string | undefined,
+  env: NodeJS.ProcessEnv = process.env,
+): { limit?: { context: number; output: number }; modalities?: { input: string[]; output: string[] } } {
+  if (!declarationsApplyToModel(effectiveModel, env)) return {};
+  const limit = resolveModelLimit(env);
+  const modalities = resolveModelModalities(env);
+  return { ...(limit ? { limit } : {}), ...(modalities ? { modalities } : {}) };
+}
+
 export function resolveModelModalities(
   env: NodeJS.ProcessEnv = process.env,
 ): { input: string[]; output: string[] } | undefined {
@@ -774,22 +825,13 @@ export function buildOpenCodeConfig(
   const modelsToRegister = [defaultModelId, smallModelId]
     .filter((mid): mid is string => Boolean(mid))
     .filter((mid, i, a) => a.indexOf(mid) === i);
-  // limit / modalities describe ONE model: the group's CONFIGURED default
-  // (OPENCODE_MODEL), which is the model the operator measured when they wrote
-  // the env vars. Deliberately NOT the effective model: a per-turn `-m` (or a
-  // change_model) selects a different model, and with effort active
-  // runtimeConfigKey rebuilds the runtime, so attaching these to the override
-  // would declare the configured model's context window and media support on a
-  // model that has neither — premature or absent compaction, and modality
-  // claims the backend rejects. A model in use that is not the configured one
-  // gets a bare entry and resolves through OpenCode's own undeclared-model
-  // default, same as OPENCODE_SMALL_MODEL (the env vars name no small-model
-  // equivalent either).
-  const configuredModelId = process.env.OPENCODE_MODEL
-    ? (splitModelSlug(process.env.OPENCODE_MODEL)?.modelID ?? process.env.OPENCODE_MODEL)
-    : undefined;
-  const modelLimit = resolveModelLimit();
-  const modelModalities = resolveModelModalities();
+  // limit / modalities describe ONE model — see resolveModelCapabilities, which
+  // owns that decision for every consumer. Applied to the EFFECTIVE model's
+  // entry, and empty unless that model IS the configured one, so a per-turn
+  // `-m` or a change_model gets a bare entry and resolves through OpenCode's own
+  // undeclared-model default (the same treatment OPENCODE_SMALL_MODEL gets — the
+  // env vars name no small-model equivalent either).
+  const { limit: modelLimit, modalities: modelModalities } = resolveModelCapabilities(model);
   const modelsBlock =
     modelsToRegister.length > 0
       ? {
@@ -801,10 +843,8 @@ export function buildOpenCodeConfig(
                 name: mid,
                 tool_call: true,
                 ...(mid === defaultModelId && modelOptions ? { options: modelOptions } : {}),
-                ...(mid === configuredModelId && modelLimit ? { limit: modelLimit } : {}),
-                ...(mid === configuredModelId && modelModalities
-                  ? { attachment: true, modalities: modelModalities }
-                  : {}),
+                ...(mid === defaultModelId && modelLimit ? { limit: modelLimit } : {}),
+                ...(mid === defaultModelId && modelModalities ? { attachment: true, modalities: modelModalities } : {}),
               },
             ]),
           ),
@@ -1329,7 +1369,7 @@ export class OpenCodeProvider implements AgentProvider {
             // default. Switching models mid-session is just a different body.model
             // on the next prompt — no server respawn.
             body: {
-              parts: buildPromptParts(turnText, turnAttachments),
+              parts: buildPromptParts(turnText, turnAttachments, { effectiveModel }),
               ...(promptModel ? { model: promptModel } : {}),
             },
           });
