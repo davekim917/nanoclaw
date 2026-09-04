@@ -9,13 +9,14 @@
 // Every fixture carries its own `sources`, so no case reads the checkout.
 import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 
 import { describe, expect, it } from 'vitest';
 
 import { allowSubprocess, enforceHermeticity } from '../src/test-hermeticity.js';
 
-allowSubprocess(['node']);
+allowSubprocess(['node', 'git']);
 enforceHermeticity();
 
 const SCRIPT = path.resolve('.claude/skills/pr-review-loop/scripts/review-churn.mjs');
@@ -57,6 +58,7 @@ interface Decision {
 interface Payload {
   findings: unknown[];
   sources?: Record<string, string>;
+  repoRoot?: string;
   commits?: { sha: string; date: string; message: string; files: string[] }[];
   worktree?: string[];
 }
@@ -134,6 +136,23 @@ describe('review-churn classifier', () => {
     expect(report.classes.find((c) => c.rounds >= 3)!.sites.map((s) => s.title)).not.toContain(
       'Treat an absent config value as empty',
     );
+  });
+
+  it('splits one invariant at two unrelated seams into two classes', () => {
+    const churning = classify(fixture('two-seams')).classes.filter((c) => c.rounds >= 3);
+    expect(churning).toHaveLength(2);
+    expect(new Set(churning.map((c) => c.seam))).toEqual(new Set(['src/mailbox/write.ts', 'src/db/tasks.ts']));
+    for (const c of churning) {
+      expect(c.findings).toBe(3);
+      expect(c.primitives).toHaveLength(1);
+    }
+  });
+
+  it('reports a class whose sites share no seam, with no seam to name', () => {
+    const churning = classify(fixture('seamless-class')).classes.filter((c) => c.rounds >= 3);
+    expect(churning).toHaveLength(1);
+    expect(churning[0].seam).toBeNull();
+    expect(churning[0].primitives).toEqual([]);
   });
 
   it('reads severity direction per seam, not per finding', () => {
@@ -245,6 +264,120 @@ describe('review-churn gate', () => {
     expect(decision.status).toBe('pass');
     expect(decision.report.classes.every((c) => c.rounds < 3)).toBe(true);
   });
+
+  it('gates each seam separately when one invariant runs at two of them', () => {
+    const payload = fixture('two-seams');
+    const refused = gate(payload);
+    expect(refused.status).toBe(3);
+    expect(refused.decision.unlifted).toHaveLength(2);
+
+    payload.commits = [
+      { sha: 'eee5555', date: AFTER, message: 'fix: guard the mailbox write', files: ['src/mailbox/write.ts'] },
+    ];
+    const partial = gate(payload);
+    expect(partial.status).toBe(3);
+    expect(partial.decision.unlifted).toHaveLength(1);
+    expect(partial.decision.unlifted[0].seam).toBe('src/db/tasks.ts');
+  });
+
+  it('never gates a class with no seam, because nothing could lift it', () => {
+    const { status, decision } = gate(fixture('seamless-class'));
+    expect(status).toBe(0);
+    expect(decision.status).toBe('pass');
+    expect(decision.flagged).toHaveLength(0);
+    expect(decision.report.classes[0].rounds).toBe(3);
+  });
+
+  it('compares commit dates as instants, not strings, across UTC offsets', () => {
+    // The last finding is 15:00Z. 09:00-07:00 is 16:00Z — later, though it
+    // sorts earlier as a string.
+    const later = fixture('toctou-class');
+    later.commits = [
+      {
+        sha: 'fff6666',
+        date: '2026-09-01T09:00:00-07:00',
+        message: 'fix(mailbox): guard the write',
+        files: ['src/mailbox/write.ts'],
+      },
+    ];
+    expect(gate(later).status).toBe(0);
+
+    // 23:00+09:00 is 14:00Z — earlier, though it sorts later.
+    const earlier = fixture('toctou-class');
+    earlier.commits = [
+      {
+        sha: 'ggg7777',
+        date: '2026-09-01T23:00:00+09:00',
+        message: 'chore: earlier work',
+        files: ['src/mailbox/write.ts'],
+      },
+    ];
+    expect(gate(earlier).status).toBe(3);
+  });
+
+  it('requires the invariant in the trailer when two classes share a primitive', () => {
+    const named = fixture('shared-primitive');
+    named.commits = [
+      {
+        sha: 'hhh8888',
+        date: AFTER,
+        message: 'fix: one guard\n\nReframe: race enforced in writeSessionMessage\n',
+        files: ['src/elsewhere.ts'],
+      },
+    ];
+    const one = gate(named);
+    expect(one.status).toBe(3);
+    expect(one.decision.unlifted).toHaveLength(1);
+    expect(one.decision.unlifted[0].signature).toBe('inv:durability');
+
+    const vague = fixture('shared-primitive');
+    vague.commits = [
+      {
+        sha: 'iii9999',
+        date: AFTER,
+        message: 'fix: one guard\n\nReframe: the write path enforced in writeSessionMessage\n',
+        files: ['src/elsewhere.ts'],
+      },
+    ];
+    expect(gate(vague).decision.unlifted).toHaveLength(2);
+  });
+
+  it('reads commits back to the oldest finding, not a fixed history cap', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'review-churn-git-'));
+    const git = (...args: string[]) => {
+      const res = spawnSync('git', args, {
+        cwd: root,
+        encoding: 'utf8',
+        env: {
+          ...process.env,
+          GIT_AUTHOR_DATE: '2026-09-01T16:00:00Z',
+          GIT_COMMITTER_DATE: '2026-09-01T16:00:00Z',
+          GIT_AUTHOR_NAME: 'test',
+          GIT_AUTHOR_EMAIL: 'test@example.com',
+          GIT_COMMITTER_NAME: 'test',
+          GIT_COMMITTER_EMAIL: 'test@example.com',
+        },
+      });
+      if (res.status !== 0) throw new Error(`git ${args.join(' ')}: ${res.stderr}`);
+    };
+    try {
+      git('init', '-q', '-b', 'main');
+      fs.mkdirSync(path.join(root, 'src/mailbox'), { recursive: true });
+      fs.writeFileSync(path.join(root, 'src/mailbox/write.ts'), 'export function writeSessionMessage() {}\n');
+      git('add', '-A');
+      git('commit', '-qm', 'fix(mailbox): guard the write');
+      // 34 later commits, so the reframe above falls outside any `-n 30` cap.
+      for (let i = 0; i < 34; i += 1) git('commit', '-q', '--allow-empty', '-m', `filler ${i}`);
+
+      const payload = fixture('toctou-class');
+      payload.repoRoot = root;
+      const { status, decision } = gate(payload);
+      expect(status).toBe(0);
+      expect(decision.flagged[0].liftedBy).toBe('diff touches the primitive');
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
 });
 
 describe('skill wiring', () => {
@@ -265,8 +398,18 @@ describe('skill wiring', () => {
     expect(fs.statSync(CONTAINER_SCRIPT).mode & 0o111).toBeGreaterThan(0);
   });
 
-  it('routes the push subcommand through the gate', () => {
+  it('routes the push subcommand through the gate, and records the override only after the push', () => {
     const helper = fs.readFileSync(path.resolve('container/skills/pr-review-loop/scripts/codex-review.sh'), 'utf8');
-    expect(helper).toMatch(/push\)\n\s+#[\s\S]*?run_gate\n\s+shift\n\s+git push/);
+    // gate → push → record, in that order. Recording is a claim that a site
+    // patch was pushed, so a refused push must not leave it in the PR body.
+    expect(helper).toMatch(
+      /push\)\n[\s\S]*?run_gate\n\s+shift\n\s+git push "\$@"\n\s+if \[ -n "\$GATE_OVERRIDE_LINE" \]; then\n\s+record_site_patch_override/,
+    );
+    // Evaluating the gate writes nothing at all.
+    const gateBranch = helper.slice(helper.indexOf('  gate)'), helper.indexOf('  push)'));
+    expect(gateBranch).not.toContain('record_site_patch_override');
+    expect(helper.slice(helper.indexOf('run_gate() {'), helper.indexOf('case "${1'))).not.toContain(
+      'record_site_patch_override',
+    );
   });
 });

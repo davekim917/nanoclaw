@@ -297,13 +297,45 @@ export function severityFalling(findings) {
   return byRound.get(order[order.length - 1]) > byRound.get(order[0]);
 }
 
+/** Does this file import the module the class settled on as its seam? */
+function fileImports(file, seam, ctx) {
+  if (!file) return false;
+  const source = readSource(file, ctx);
+  if (source == null) return false;
+  return importsOf(source).some(({ spec }) => resolveSpec(file, spec) === seam);
+}
+
+function buildClass(signature, group, derived) {
+  const rounds = roundsOf(group);
+  return {
+    key: `${signature} @ ${derived.seam ?? '-'}`,
+    signature,
+    seam: derived.seam,
+    seamInRepo: derived.seamInRepo,
+    primitives: derived.primitives,
+    rounds: rounds.length,
+    roundIds: rounds,
+    findings: group.length,
+    lastAt: lastAt(group),
+    severities: group.map((f) => severityOf(f.body)),
+    severityFalling: severityFalling(group),
+    families: [...new Set(group.flatMap((f) => invariantFamilies(f)))],
+    sites: group.map((f) => ({
+      file: f.path ?? '(none)',
+      line: f.line ?? null,
+      title: titleOf(f.body),
+      severity: severityOf(f.body),
+      threadId: f.threadId ?? null,
+      commentId: f.commentId ?? null,
+    })),
+  };
+}
+
 export function classify(payload) {
   const ctx = { repoRoot: payload.repoRoot, sources: payload.sources };
   const findings = (payload.findings ?? []).filter((f) => f && f.body);
 
-  // Pass 1 — group by invariant signature. The seam is DERIVED from the group
-  // (it needs every site's imports), so it joins the key in pass 2 rather than
-  // splitting the group here.
+  // Pass 1 — group by invariant signature.
   const groups = new Map();
   for (const f of findings) {
     const sig = signatureOf(f);
@@ -311,38 +343,34 @@ export function classify(payload) {
     groups.get(sig).push(f);
   }
 
+  // Pass 2 — partition each signature group by the seam its sites actually
+  // share. Three unrelated races at three different seams are three classes,
+  // not one fabricated class with an arbitrary seam: the seam is derived from
+  // the whole group, so without this split the derived seam would belong to
+  // whichever subset happened to dominate, and the gate would refuse work at a
+  // primitive that has nothing to do with most of the findings.
   const built = [];
   for (const [signature, group] of groups) {
-    const files = [...new Set(group.map((f) => f.path).filter(Boolean))];
-    const text = group.map((f) => f.body).join('\n');
-    const { seam, seamInRepo, primitives } = seamFor(files, text, ctx);
-    const rounds = roundsOf(group);
-    built.push({
-      cls: {
-        key: `${signature} @ ${seam ?? '-'}`,
-        signature,
-        seam,
-        seamInRepo,
-        primitives,
-        rounds: rounds.length,
-        roundIds: rounds,
-        findings: group.length,
-        lastAt: lastAt(group),
-        severities: group.map((f) => severityOf(f.body)),
-        severityFalling: severityFalling(group),
-        families: [...new Set(group.flatMap((f) => invariantFamilies(f)))],
-        sites: group.map((f) => ({
-          file: f.path ?? '(none)',
-          line: f.line ?? null,
-          title: titleOf(f.body),
-          severity: severityOf(f.body),
-          threadId: f.threadId ?? null,
-          commentId: f.commentId ?? null,
-        })),
-      },
-      group,
-    });
+    let remaining = group;
+    while (remaining.length > 0) {
+      const files = [...new Set(remaining.map((f) => f.path).filter(Boolean))];
+      const text = remaining.map((f) => f.body).join('\n');
+      const derived = seamFor(files, text, ctx);
+      const members = derived.seam ? remaining.filter((f) => fileImports(f.path, derived.seam, ctx)) : [];
+      if (members.length === 0) {
+        // Nothing shared: one seamless class holding the rest. It is reported
+        // and never gated — see decideGate.
+        built.push({
+          cls: buildClass(signature, remaining, { seam: null, seamInRepo: false, primitives: [] }),
+          group: remaining,
+        });
+        break;
+      }
+      built.push({ cls: buildClass(signature, members, derived), group: members });
+      remaining = remaining.filter((f) => !members.includes(f));
+    }
   }
+
   built.sort(
     (a, b) => b.cls.rounds - a.cls.rounds || b.cls.findings - a.cls.findings || a.cls.key.localeCompare(b.cls.key),
   );
@@ -394,6 +422,23 @@ export const CLASS_ROUND_LIMIT = 3;
  */
 const REFRAME_TRAILER = /^\s*Reframe:\s*(.+?)\s+enforced in\s+(.+?)\s*$/gim;
 
+/** Does the trailer name this entry's primitive (or its seam module)? */
+function primitiveNamed(entry, trailer) {
+  if (entry.primitives.some((p) => trailer.primitive.includes(p))) return true;
+  return Boolean(entry.seam) && trailer.primitive.includes(path.posix.basename(entry.seam).replace(/\.[jt]sx?$/, ''));
+}
+
+/** Does the trailer name this entry's invariant? */
+function invariantNamed(entry, trailer) {
+  const said = trailer.invariant.toLowerCase();
+  const tokens = [
+    ...(entry.families ?? []),
+    ...(entry.signature?.startsWith('title:') ? entry.signature.slice(6).split('-') : []),
+  ].filter((t) => t && t.length > 3);
+  if (tokens.length === 0) return true;
+  return tokens.some((t) => said.includes(t.toLowerCase()));
+}
+
 function touches(changedFiles, seam, seamInRepo) {
   if (!seam || !seamInRepo) return false;
   const seamBase = seam.replace(/\.[jt]sx?$/, '');
@@ -401,6 +446,18 @@ function touches(changedFiles, seam, seamInRepo) {
     const base = f.replace(/\.[jt]sx?$/, '');
     return base === seamBase || base.endsWith(`/${seamBase}`) || seamBase.endsWith(`/${base}`);
   });
+}
+
+/**
+ * Commit dates come back as `%cI`, which carries the committer's UTC offset,
+ * while GitHub timestamps are `Z`. Lexicographic comparison across offsets is
+ * not chronological (`12:00-07:00` is later than `18:00Z` but sorts earlier),
+ * so both sides are parsed to instants. An unparseable date is treated as
+ * unknown and kept, the same as a missing one.
+ */
+function instant(value) {
+  const t = Date.parse(value ?? '');
+  return Number.isNaN(t) ? null : t;
 }
 
 function reframeTrailers(messages) {
@@ -426,7 +483,11 @@ export function decideGate(payload, options = {}) {
 
   const flagged = [];
   for (const c of report.classes) {
-    if (c.rounds >= CLASS_ROUND_LIMIT) {
+    // A class whose sites share no seam is reported, never gated: there is no
+    // primitive to move the check into, so neither a diff nor a trailer could
+    // lift it and the override would be the only way past. That is a worse
+    // failure than missing it — the class table still shows the row.
+    if (c.rounds >= CLASS_ROUND_LIMIT && c.seam) {
       flagged.push({ kind: 'class', ...c, reason: `${c.rounds} rounds on one finding class` });
     }
   }
@@ -449,15 +510,23 @@ export function decideGate(payload, options = {}) {
   }
 
   const decided = flagged.map((entry) => {
-    const since = entry.lastAt ?? lastAt(payload.findings ?? []);
-    const recent = commits.filter((c) => !since || !c.date || c.date >= since);
+    const since = instant(entry.lastAt ?? lastAt(payload.findings ?? []));
+    const recent = commits.filter((c) => {
+      const at = instant(c.date);
+      return since === null || at === null || at >= since;
+    });
     const changed = [...worktree, ...recent.flatMap((c) => c.files ?? [])];
     const trailers = reframeTrailers(recent.map((c) => c.message ?? ''));
-    const named = trailers.filter(
-      (t) =>
-        entry.primitives.some((p) => t.primitive.includes(p)) ||
-        (entry.seam && t.primitive.includes(path.posix.basename(entry.seam).replace(/\.[jt]sx?$/, ''))),
+    // A trailer naming only the primitive is enough while that primitive
+    // belongs to one flagged class. When two flagged classes share it —
+    // a race AND a durability defect at the same write — one trailer would
+    // otherwise clear both, so the trailer must name the invariant too.
+    const shared = flagged.some(
+      (other) =>
+        other !== entry &&
+        ((entry.seam && other.seam === entry.seam) || other.primitives.some((p) => entry.primitives.includes(p))),
     );
+    const named = trailers.filter((t) => primitiveNamed(entry, t) && (!shared || invariantNamed(entry, t)));
     const touched = touches(changed, entry.seam, entry.seamInRepo);
     return {
       ...entry,
@@ -524,8 +593,9 @@ function renderGate(decision) {
     lines.push('');
   }
   if (decision.status === 'override') {
-    lines.push('REVIEW_LOOP_ALLOW_SITE_PATCH=1 is set: the site patch goes through and is');
-    lines.push('recorded in the PR body. The class above is still unfixed.');
+    lines.push('REVIEW_LOOP_ALLOW_SITE_PATCH=1 is set: the site patch goes through, and');
+    lines.push('`codex-review.sh push` records it in the PR body once the push succeeds.');
+    lines.push('The class above is still unfixed.');
   } else {
     lines.push('The next commit must move the invariant into the primitive, not patch');
     lines.push('another call site. The gate lifts on a commit whose diff touches that');
@@ -557,10 +627,17 @@ function gitContext(payload) {
   if (!root) return payload;
   const out = { ...payload };
   if (!out.commits) {
+    // Back to the oldest finding on the PR, not a fixed commit count: a
+    // reframe that lifted the gate at round 4 must still lift it at round 12,
+    // and on a busy branch that commit is long past any `-n` cap.
+    const oldest = (payload.findings ?? [])
+      .map((f) => f.createdAt)
+      .filter(Boolean)
+      .sort()[0];
+    const window = oldest ? [`--since=${oldest}`] : ['-n', '30'];
     const raw = git(root, [
       'log',
-      '-n',
-      '30',
+      ...window,
       `--format=${RECORD_SEP}%H${FIELD_SEP}%cI${FIELD_SEP}%B${FIELD_SEP}`,
       '--name-only',
     ]);

@@ -63,9 +63,10 @@ rounds. `pr-review-loop`'s gate (`codex-review.sh gate`, run by
 `codex-review.sh push`) makes this deterministic: three rounds on one class, or
 on one seam with severity not falling, exits non-zero naming the class, the
 sites and the candidate primitive, and lifts only on a commit that touches that
-primitive or carries `Reframe: <invariant> enforced in <primitive>`.
-`REVIEW_LOOP_ALLOW_SITE_PATCH=1` overrides it loudly and records the override
-in the PR body.
+primitive or carries `Reframe: <invariant> enforced in <primitive>`. A class
+whose sites share no seam is reported and not gated — there is no primitive to
+lift it with. `REVIEW_LOOP_ALLOW_SITE_PATCH=1` overrides the gate loudly and
+records the override in the PR body.
 
 ## Fix discipline
 

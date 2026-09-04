@@ -114,13 +114,24 @@ either:
 - a commit, or uncommitted work, whose diff touches that primitive and is dated
   after the class's last finding; or
 - a commit message carrying `Reframe: <invariant> enforced in <primitive>`.
+  Naming the primitive is enough while it belongs to one flagged class; when
+  two do — a race *and* a durability defect at the same write — the trailer
+  must name the invariant it fixed, or it would clear both.
 
 A commit that touches one more call site lifts nothing, which is the point.
 
+Two rounds counted are not gated. A class whose sites share **no** seam is
+reported in the table and never gated: there is no primitive to move the check
+into, so neither a diff nor a trailer could lift it and the override would be
+the only way out. Read that row yourself — it usually means the findings were
+merged too coarsely, or the sites genuinely need splitting.
+
 `REVIEW_LOOP_ALLOW_SITE_PATCH=1` overrides the refusal. It prints the override
-banner and writes a line into the PR body naming the class that is still
-unfixed, so whoever merges sees the call that was made. Use it when the reframe
-honestly belongs to a different PR — then open that PR.
+banner, and `codex-review.sh push` writes a line into the PR body naming the
+class that is still unfixed once the push succeeds, so whoever merges sees the
+call that was made. (`codex-review.sh gate` on its own writes nothing — it is
+a read-only check you can run as often as you like.) Use the override when the
+reframe honestly belongs to a different PR — then open that PR.
 
 ## The helper
 

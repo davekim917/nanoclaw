@@ -17,8 +17,9 @@
 # seam, and the loop refuses another site patch until the primitive fix lands.
 # It lifts on a commit that touches that primitive, or one whose message
 # carries `Reframe: <invariant> enforced in <primitive>`.
-# REVIEW_LOOP_ALLOW_SITE_PATCH=1 overrides it, loudly, and writes the override
-# into the PR body.
+# REVIEW_LOOP_ALLOW_SITE_PATCH=1 overrides it, loudly; `push` writes the
+# override into the PR body once the push succeeds. `gate` alone writes
+# nothing.
 #
 # The reviewer is `chatgpt-codex-connector` in GraphQL and
 # `chatgpt-codex-connector[bot]` in REST, so every login match here is a
@@ -139,15 +140,21 @@ $line" >/dev/null
 
 # Runs the gate and returns its exit status: 0 pass/override, 3 REFRAME
 # REQUIRED. Human-readable output comes back on stderr from the classifier.
+#
+# Evaluating the gate writes NOTHING. The override line claims a site patch was
+# pushed, so only `push` records it, and only after the push succeeds — a
+# rejected push must not leave that claim in the PR body. `run_gate` just hands
+# the line back in GATE_OVERRIDE_LINE.
+GATE_OVERRIDE_LINE=""
 run_gate() {
-  local node out status=0
+  local node out status=0 sha classes
+  GATE_OVERRIDE_LINE=""
   node=$(runtime) || return 2
   out=$(payload_json | "$node" "$CHURN_JS" gate --json) || status=$?
   if [ "$status" -eq 0 ] && [ "$(printf '%s' "$out" | jq -r .status)" = "override" ]; then
-    local sha classes
     sha=$(git rev-parse --short HEAD)
     classes=$(printf '%s' "$out" | jq -r '[.unlifted[] | "`\(.key)`"] | join(", ")')
-    record_site_patch_override "⚠️ \`REVIEW_LOOP_ALLOW_SITE_PATCH=1\` used at \`$sha\`: site patch pushed for $classes without the primitive fix."
+    GATE_OVERRIDE_LINE="⚠️ \`REVIEW_LOOP_ALLOW_SITE_PATCH=1\` used at \`$sha\`: site patch pushed for $classes without the primitive fix."
   fi
   return "$status"
 }
@@ -191,7 +198,7 @@ case "${1:?usage: open|churn|classes|gate|push|body|reply|resolve|status}" in
     ;;
   gate)
     # Exit 3 = REFRAME REQUIRED. Do not push a site patch past this; the next
-    # commit is the primitive fix.
+    # commit is the primitive fix. Read-only: see run_gate.
     run_gate
     ;;
   push)
@@ -200,6 +207,9 @@ case "${1:?usage: open|churn|classes|gate|push|body|reply|resolve|status}" in
     run_gate
     shift
     git push "$@"
+    if [ -n "$GATE_OVERRIDE_LINE" ]; then
+      record_site_patch_override "$GATE_OVERRIDE_LINE"
+    fi
     ;;
   body)
     # A single review comment is NOT nested under the PR number; the reply
