@@ -882,6 +882,36 @@ describe('extractAttachments', () => {
     expect(extractAttachments(rows).map((a) => a.filename)).toEqual(['a.png', 'b.png']);
   });
 
+  it('normalizes non-string channel fields to undefined rather than passing them through', () => {
+    // Every field here is channel-supplied and untyped. The host stages the file
+    // without normalizing them (deriveAttachmentName reads mimeType through its
+    // own typeof guard and writes the record back verbatim), so a bridge that
+    // reports `mimeType: {}` reaches this seam. Passing that through violates
+    // PromptAttachment's declared string type and crashes whichever provider
+    // calls a string method on it first.
+    const rows = [
+      attachmentRow('a1', {
+        text: 'look',
+        attachments: [{ name: { weird: true }, mimeType: { foo: 'bar' }, localPath: 'inbox/cat.png', url: 42 }],
+      }),
+    ];
+    expect(extractAttachments(rows)).toEqual([
+      { filename: undefined, mime: undefined, path: '/workspace/inbox/cat.png', url: undefined },
+    ]);
+  });
+
+  it('a non-string localPath yields no path, not "/workspace/[object Object]"', () => {
+    const rows = [attachmentRow('a1', { text: 'x', attachments: [{ name: 'cat.png', localPath: { a: 1 } }] })];
+    expect(extractAttachments(rows)[0]?.path).toBeUndefined();
+  });
+
+  it('an empty-string field is treated as absent', () => {
+    const rows = [attachmentRow('a1', { text: 'x', attachments: [{ name: '', mimeType: '', url: '' }] })];
+    expect(extractAttachments(rows)).toEqual([
+      { filename: undefined, mime: undefined, path: undefined, url: undefined },
+    ]);
+  });
+
   it('malformed content is no attachments, not a throw', () => {
     const rows = [{ ...attachmentRow('a1', {}), content: 'not-json{' } as MessageInRow];
     expect(extractAttachments(rows)).toEqual([]);

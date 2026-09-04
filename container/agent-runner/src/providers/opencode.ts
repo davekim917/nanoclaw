@@ -41,9 +41,16 @@ const ATTACHMENT_MIME_BY_EXT: Record<string, string> = {
   '.pdf': 'application/pdf',
 };
 
+/**
+ * `PromptAttachment` declares string fields and `extractAttachments` normalizes
+ * them, but this function is exported and structurally typed, so the `typeof`
+ * guards are the second half of that contract rather than a duplicate of it: a
+ * caller that hands over a channel-supplied object directly gets the
+ * extension fallback instead of a TypeError that would abort the whole query.
+ */
 function attachmentMime(att: PromptAttachment): string | undefined {
-  if (att.mime) return att.mime;
-  const name = att.path || att.filename || '';
+  if (typeof att.mime === 'string' && att.mime) return att.mime;
+  const name = (typeof att.path === 'string' ? att.path : '') || (typeof att.filename === 'string' ? att.filename : '');
   const dot = name.lastIndexOf('.');
   return dot < 0 ? undefined : ATTACHMENT_MIME_BY_EXT[name.slice(dot).toLowerCase()];
 }
@@ -80,12 +87,21 @@ export function buildAttachmentFileParts(
     const mime = attachmentMime(att);
     if (!mime) continue;
     if (!mime.startsWith('image/') && mime !== 'application/pdf') continue;
-    if (!att.path || !exists(att.path)) {
-      const label = att.filename || att.path || att.url || 'unnamed';
+    if (typeof att.path !== 'string' || !att.path || !exists(att.path)) {
+      const label =
+        (typeof att.filename === 'string' && att.filename) ||
+        (typeof att.path === 'string' && att.path) ||
+        (typeof att.url === 'string' && att.url) ||
+        'unnamed';
       log(`Attachment has no readable local file, not sent as media: ${label}`);
       continue;
     }
-    parts.push({ type: 'file', mime, filename: att.filename, url: pathToFileURL(att.path).href });
+    parts.push({
+      type: 'file',
+      mime,
+      filename: typeof att.filename === 'string' ? att.filename : undefined,
+      url: pathToFileURL(att.path).href,
+    });
   }
   return parts;
 }

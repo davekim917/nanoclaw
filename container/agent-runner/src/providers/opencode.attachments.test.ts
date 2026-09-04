@@ -56,6 +56,41 @@ describe('buildAttachmentFileParts', () => {
     expect(missing).toEqual([]);
   });
 
+  it('test_oc_attachment_non_string_mime_falls_back: a non-string mime uses the extension instead of throwing', () => {
+    // buildAttachmentFileParts is exported and structurally typed, so a caller
+    // that hands over a raw channel object must get the extension fallback, not
+    // a TypeError from `.startsWith()` that aborts the entire provider query.
+    const parts = buildAttachmentFileParts(
+      [{ mime: { foo: 'bar' }, filename: 'cat.png', path: '/workspace/inbox/cat.png' } as never],
+      allPresent,
+    );
+    expect(parts).toHaveLength(1);
+    expect(parts[0]?.mime).toBe('image/png');
+  });
+
+  it('test_oc_attachment_non_string_fields_never_throw: no field shape can abort the turn', () => {
+    expect(() =>
+      buildAttachmentFileParts(
+        [
+          { mime: 42, filename: {}, path: {}, url: [] } as never,
+          { mime: 'image/png', filename: {}, path: {} } as never,
+          { mime: {}, filename: {}, path: {} } as never,
+        ],
+        allPresent,
+      ),
+    ).not.toThrow();
+    expect(buildAttachmentFileParts([{ mime: {}, filename: {}, path: {} } as never], allPresent)).toEqual([]);
+  });
+
+  it('a non-string filename is dropped from the part rather than emitted', () => {
+    const parts = buildAttachmentFileParts(
+      [{ mime: 'image/png', filename: { a: 1 }, path: '/workspace/inbox/cat.png' } as never],
+      allPresent,
+    );
+    expect(parts[0]?.filename).toBeUndefined();
+    expect(parts[0]?.url).toBe('file:///workspace/inbox/cat.png');
+  });
+
   it('an absent attachment list is an empty part list, not a throw', () => {
     expect(buildAttachmentFileParts(undefined, allPresent)).toEqual([]);
     expect(buildAttachmentFileParts([], allPresent)).toEqual([]);

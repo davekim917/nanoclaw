@@ -673,15 +673,35 @@ export function extractAttachments(messages: MessageInRow[]): PromptAttachment[]
     const content = parseContent(msg.content);
     if (!Array.isArray(content.attachments)) continue;
     for (const a of content.attachments) {
+      const localPath = attachmentString(a.localPath);
       out.push({
-        filename: a.filename || a.name || undefined,
-        mime: a.mimeType || a.mime || undefined,
-        path: a.localPath ? `/workspace/${a.localPath}` : undefined,
-        url: a.url || undefined,
+        filename: attachmentString(a.filename) ?? attachmentString(a.name),
+        mime: attachmentString(a.mimeType) ?? attachmentString(a.mime),
+        path: localPath ? `/workspace/${localPath}` : undefined,
+        url: attachmentString(a.url),
       });
     }
   }
   return out;
+}
+
+/**
+ * Every field on an inbound attachment is channel-supplied and untyped. The
+ * host stages the file without normalizing them — `deriveAttachmentName` reads
+ * `mimeType` through a `typeof` guard and writes the record back verbatim — so
+ * a bridge that reports `mimeType: {}` puts a non-string here. Anything that is
+ * not a non-empty string becomes `undefined`, which is the same value an
+ * attachment that simply omitted the field produces: for `mime` that means the
+ * consumer falls through to the filename extension, exactly as it would for a
+ * channel that sent no MIME at all.
+ *
+ * Normalized HERE, at the one seam that reads the raw content JSON, rather than
+ * in each consumer — `PromptAttachment` declares string fields, and a value
+ * that reaches a provider having violated its own type is a crash waiting for
+ * whichever provider calls a string method on it first.
+ */
+function attachmentString(value: unknown): string | undefined {
+  return typeof value === 'string' && value ? value : undefined;
 }
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
