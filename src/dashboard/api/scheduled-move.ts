@@ -44,6 +44,7 @@ import {
   rateLimit,
   sessionInboundPathFor,
   writeAudit,
+  approvedRowChanged,
 } from './scheduled-shared.js';
 
 // ── Test seam ─────────────────────────────────────────────────────────────────
@@ -534,20 +535,57 @@ export const moveExecuteHandler: AuthHandler = async (req, params, ctx) => {
   // than inserting into the target — the same fail-safe direction the pre-seam
   // open's throw had.
   //
-  // BY ROW ID, not by series. Everything above — the delta hash, the verdict,
-  // the move_intent body, `restoreSnapshot` — describes the single occurrence
-  // `snapshot.id`. The pre-seam code could cancel the SERIES here because the
-  // read and the cancel were one synchronous run with no yield between them,
-  // so the live row could not change identity. Acquiring the mailbox now
-  // yields, and in that window this occurrence can complete and recurrence can
-  // arm a successor. A series-wide cancel would consume that successor, report
-  // a nonzero touch, and then move the stale snapshot on top of it. Scoped to
-  // the id, a changed row is 0 touched and takes the abort below, which is what
-  // "the key went stale" already means here.
+  // BY ROW ID, and only if that row is still exactly what was approved.
+  // Everything above — the delta hash, the verdict, the move_intent body,
+  // `restoreSnapshot` — describes the single occurrence `snapshot.id`. The
+  // pre-seam code could cancel the SERIES here because the read and the cancel
+  // were one synchronous run with no yield between them, so nothing could
+  // change. Acquiring the mailbox now yields, and in that window the
+  // occurrence can complete and arm a successor, or be admitted and fired
+  // where it stands. Every refusal below returns 0 touched and takes the abort
+  // branch, which is what "the key went stale" already means here.
   const cancelTouched =
-    (await withExistingMailboxSession(source.agentGroupId, source.sessionId, (mailbox) =>
-      mailbox.cancelTaskRow(snapshot.id),
-    )) ?? 0;
+    (await withExistingMailboxSession(source.agentGroupId, source.sessionId, (mailbox) => {
+      // Re-prove the approved occurrence, inside the session, with nothing
+      // awaited between the read and the write.
+      //
+      // The id alone is not enough, and that is the whole finding: admission
+      // MUTATES a task row in place. A dashboard run-now landing in this
+      // acquisition window flips `trigger` 0 → 1 and moves `process_after`
+      // while the id and the `pending` status stay exactly as §2's read saw
+      // them — so an id-scoped cancel would cancel an occurrence that is now
+      // triggered (and possibly claimed by a container mid-fire), and the
+      // move would then recreate the stale snapshot in the target.
+      const current = mailbox.getLiveTaskRow(source.seriesId);
+      if (!current || current.id !== snapshot.id) return 0;
+      const changed = approvedRowChanged(snapshot, current);
+      if (changed) {
+        log.warn('scheduled-move: the approved occurrence changed under the move — refusing', {
+          seriesId: source.seriesId,
+          rowId: snapshot.id,
+          field: changed,
+        });
+        return 0;
+      }
+      // Inert, absolutely and not merely unchanged. §2a's verdict passed
+      // `claimed: false` without proving it; a move must not consume an
+      // occurrence that is armed to fire or already being fired.
+      if (current.trigger !== 0) {
+        log.warn('scheduled-move: the approved occurrence is admitted — refusing', {
+          seriesId: source.seriesId,
+          rowId: snapshot.id,
+        });
+        return 0;
+      }
+      if (mailbox.getProcessingClaimRows().some((claim) => claim.message_id === snapshot.id)) {
+        log.warn('scheduled-move: the approved occurrence is claimed — refusing', {
+          seriesId: source.seriesId,
+          rowId: snapshot.id,
+        });
+        return 0;
+      }
+      return mailbox.cancelTaskRow(snapshot.id);
+    })) ?? 0;
   if (cancelTouched === 0) {
     // Nothing was cancelled (the approved occurrence stopped being live between
     // the guard and here) — leave the intent unresolved for the recovery sweep

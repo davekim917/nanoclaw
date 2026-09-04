@@ -12,6 +12,7 @@ import path from 'path';
 import type Database from 'better-sqlite3';
 
 import { isOwner, isGlobalAdmin } from '../../modules/permissions/db/user-roles.js';
+import type { ScheduledTaskRow } from '../../modules/mailbox/index.js';
 
 /**
  * Host sweep cadence. MIRRORS the private `SWEEP_INTERVAL_MS = 60_000` at
@@ -336,4 +337,66 @@ export function moduleOwner(seriesId: string): { moduleOwned: boolean; owner?: s
   const staticOwner = MODULE_STATIC[seriesId];
   if (staticOwner) return { moduleOwned: true, owner: staticOwner };
   return { moduleOwned: false };
+}
+
+/* ─── Writer-side approval re-proof ───────────────────────────────────────── */
+
+/**
+ * The row fields every board verdict is computed from.
+ *
+ * A subset of `ScheduledTaskRow`, named rather than aliased so adding a column
+ * to the read does not silently widen what counts as "changed".
+ */
+export type ApprovedTaskRow = Pick<
+  ScheduledTaskRow,
+  | 'id'
+  | 'seq'
+  | 'status'
+  | 'trigger'
+  | 'process_after'
+  | 'scheduled_for'
+  | 'recurrence'
+  | 'series_id'
+  | 'platform_id'
+  | 'channel_type'
+  | 'thread_id'
+>;
+
+const APPROVAL_FIELDS = [
+  'id',
+  'seq',
+  'status',
+  'trigger',
+  'process_after',
+  'scheduled_for',
+  'recurrence',
+  'series_id',
+  'platform_id',
+  'channel_type',
+  'thread_id',
+] as const satisfies ReadonlyArray<keyof ApprovedTaskRow>;
+
+/**
+ * Has the row a board write was approved against changed underneath it?
+ *
+ * Returns the FIRST differing field, or `null` when the row is byte-equal on
+ * every field a verdict reads. The field name is returned rather than a
+ * boolean so the refusal log says which fact moved.
+ *
+ * Why an id check is not enough: admission MUTATES a task row in place rather
+ * than replacing it. A concurrent run-now can flip `trigger` 0 → 1 and move
+ * `process_after` while the id and the `pending` status both stay exactly as
+ * the approving read saw them. Every board writer acquires its mailbox
+ * asynchronously, so that window is real for all of them — which is why this
+ * lives here and not in either caller.
+ *
+ * `content` is deliberately NOT compared: an edit to the prompt is the thing
+ * some of these verbs exist to do, and the move carries the snapshot's copy
+ * forward by design.
+ */
+export function approvedRowChanged(approved: ApprovedTaskRow, current: ApprovedTaskRow): string | null {
+  for (const field of APPROVAL_FIELDS) {
+    if (approved[field] !== current[field]) return field;
+  }
+  return null;
 }

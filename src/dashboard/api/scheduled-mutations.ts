@@ -41,6 +41,7 @@ import {
   rateLimit,
   sessionInboundPathFor,
   writeAudit,
+  approvedRowChanged,
 } from './scheduled-shared.js';
 
 // `moduleOwner` (the single canonical module-owned registry) lives in
@@ -247,14 +248,19 @@ async function withMutationSession(
 ): Promise<MutationOutcome> {
   const outcome = await withExistingMailboxSession(t.agentGroupId, t.sessionId, (mailbox) => {
     const live = mailbox.getLiveTaskRow(t.seriesId);
-    // No live row, or a DIFFERENT one: the key names an occurrence that is no
-    // longer the one to act on.
-    if (!live || live.id !== t.live.id) {
-      log.warn('scheduled-mutations: approved row is no longer live — refusing', {
+    // No live row, a DIFFERENT one, or the SAME one rewritten underneath us.
+    // The id alone would miss the third: admission mutates a row in place, so
+    // a concurrent run-now flips `trigger` and moves `process_after` while the
+    // id and the status stay put. `approvedRowChanged` is shared with the
+    // board move, which needs the same proof for the same reason.
+    const changed = live ? approvedRowChanged(t.live, live) : 'row';
+    if (!live || changed) {
+      log.warn('scheduled-mutations: the approved row is no longer the one to act on — refusing', {
         verb,
         seriesId: t.seriesId,
         approvedRowId: t.live.id,
         liveRowId: live?.id ?? null,
+        field: changed,
       });
       return { refused: json({ error: 'stale_key', reason: 'stale_key' }, 409) };
     }

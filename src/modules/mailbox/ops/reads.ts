@@ -26,11 +26,24 @@ import type Database from 'better-sqlite3';
  */
 export interface ScheduledTaskRow {
   id: string;
+  /**
+   * Monotonic per-session sequence. Carried so a writer can tell "the row I
+   * approved" from "a row that has since been rewritten in place" — an id
+   * alone cannot, because admission mutates the row rather than replacing it.
+   */
+  seq: number;
   series_id: string | null;
   recurrence: string | null;
   process_after: string | null;
   scheduled_for: string | null;
   status: string;
+  /**
+   * 0 = inert, 1 = admitted and fireable. NULL only on a legacy `inbound.db`
+   * that predates the column and has not met a writer yet — see
+   * {@link scheduledColumns}. Inside a mailbox session the column always
+   * exists, because opening one migrates.
+   */
+  trigger: number | null;
   kind: string;
   timestamp: string;
   platform_id: string | null;
@@ -53,11 +66,16 @@ export interface ScheduledTaskRow {
  * written before the column existed.
  */
 function scheduledColumns(db: Database.Database): string {
-  const hasScheduledFor = (db.prepare("PRAGMA table_info('messages_in')").all() as Array<{ name: string }>).some(
-    (column) => column.name === 'scheduled_for',
+  const columns = new Set(
+    (db.prepare("PRAGMA table_info('messages_in')").all() as Array<{ name: string }>).map((column) => column.name),
   );
-  return `id, series_id, recurrence, process_after, ${hasScheduledFor ? 'scheduled_for' : 'NULL AS scheduled_for'},
-         status, kind, timestamp, platform_id, channel_type, thread_id, content`;
+  // `trigger` is lazily added by the same migration as `scheduled_for`, so it
+  // gets the same treatment for the same reason: naming a missing column
+  // throws, and the read-only session deliberately never migrates.
+  const scheduledFor = columns.has('scheduled_for') ? 'scheduled_for' : 'NULL AS scheduled_for';
+  const trigger = columns.has('trigger') ? '"trigger"' : 'NULL AS "trigger"';
+  return `id, seq, series_id, recurrence, process_after, ${scheduledFor},
+         status, ${trigger}, kind, timestamp, platform_id, channel_type, thread_id, content`;
 }
 
 /**
