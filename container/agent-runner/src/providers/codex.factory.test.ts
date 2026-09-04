@@ -5,6 +5,7 @@ import path from 'path';
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
 
 import { createProvider } from './factory.js';
+import { MEMORY_SESSION_HOOK } from '../memory/session-hook.js';
 import {
   CodexProvider,
   augmentWithProxyEnv,
@@ -1297,5 +1298,27 @@ describe('mirrorCodexAgentsToHome (codex #126)', () => {
     // src == dst → no self-copy.
     fs.mkdirSync(path.join(primary, 'agents'), { recursive: true });
     expect(mirrorCodexAgentsToHome(primary, primary)).toBe(false);
+  });
+});
+
+/**
+ * Codex's `push` steers the live turn when it has handles, and falls back to
+ * the same `pending` queue opencode always uses when it does not — or when the
+ * steer RPC rejects on a turn-boundary race. `hasQueuedWork` reports that
+ * queue so the poll-loop does not publish `provider_executing = 0` in the gap
+ * before the queued turn starts (#333).
+ */
+describe('CodexProvider queued-work signal', () => {
+  it('reports the fallback queue when there is no live turn to steer', () => {
+    const provider = new CodexProvider({});
+    provider.registerMemorySessionHook(MEMORY_SESSION_HOOK);
+    // No app server has started, so the turn tracker holds no handles and
+    // every push takes the queueing branch. The generator is lazy, so nothing
+    // here spawns codex.
+    const query = provider.query({ prompt: 'first turn', cwd: '/workspace' });
+
+    expect(query.hasQueuedWork?.()).toBe(true);
+    query.push('follow-up with no turn in flight');
+    expect(query.hasQueuedWork?.()).toBe(true);
   });
 });
