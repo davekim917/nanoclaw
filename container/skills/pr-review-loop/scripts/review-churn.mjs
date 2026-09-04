@@ -257,7 +257,51 @@ export function signatureOf(finding) {
  * statement is the one construct regex reads reliably. `[^;'"]*?` spans
  * newlines so multi-line `import { a, b } from '…'` blocks are read whole.
  */
+/**
+ * Which lines sit inside a block comment.
+ *
+ * Comment delimiters are located AFTER blanking single-line quoted spans, so
+ * `const marker = "/*"` does not open a comment and a doc example inside
+ * `/* … *\/` does not read as code. Both of those arrived as review findings,
+ * and they cannot both be satisfied by "detect the prose better" without a
+ * lexer — so the delimiters get just enough string awareness to be right on
+ * one line at a time, and every remaining ambiguity drops the candidate rather
+ * than keeping it. A dropped import makes the gate quiet; a kept one makes it
+ * refuse honest work.
+ */
+function commentedLines(lines) {
+  let inBlock = false;
+  return lines.map((raw) => {
+    const masked = raw
+      .replace(/`[^`]*`/g, ' ')
+      .replace(/'[^']*'/g, ' ')
+      .replace(/"[^"]*"/g, ' ');
+    const wasInBlock = inBlock;
+    let rest = masked;
+    let commented = wasInBlock;
+    for (;;) {
+      if (inBlock) {
+        const close = rest.indexOf('*/');
+        if (close === -1) break;
+        rest = rest.slice(close + 2);
+        inBlock = false;
+        continue;
+      }
+      const open = rest.indexOf('/*');
+      if (open === -1) break;
+      rest = rest.slice(open + 2);
+      inBlock = true;
+      commented = true;
+    }
+    const trimmed = raw.trim();
+    return commented || trimmed.startsWith('//') || trimmed.startsWith('*');
+  });
+}
+
 export function importsOf(source) {
+  const lines = source.split('\n');
+  const commented = commentedLines(lines);
+  source = lines.map((line, i) => (commented[i] ? '' : line)).join('\n');
   const out = [];
   const push = (spec, clause) => {
     if (!spec) return;
@@ -444,7 +488,18 @@ export function severityFalling(findings) {
  * a resolver would, and the sources map answers first so tests stay hermetic.
  */
 function moduleExists(spec, ctx) {
-  const candidates = [spec, spec.replace(/\.ts$/, '.tsx'), spec.replace(/\.ts$/, '.js'), spec.replace(/\.ts$/, '.mjs')];
+  // `from './gate'` is valid and used in this tree, so an extensionless
+  // specifier gets the extensions a resolver would try; `.js` in an ESM
+  // specifier already became `.ts` upstream, and the sibling extensions cover
+  // the rest.
+  const bare = /\.[a-z]+$/i.test(spec) ? [] : ['.ts', '.tsx', '.js', '.mjs', '/index.ts', '/index.js'];
+  const candidates = [
+    spec,
+    spec.replace(/\.ts$/, '.tsx'),
+    spec.replace(/\.ts$/, '.js'),
+    spec.replace(/\.ts$/, '.mjs'),
+    ...bare.map((ext) => `${spec}${ext}`),
+  ];
   if (ctx.sources) {
     if (candidates.some((c) => Object.prototype.hasOwnProperty.call(ctx.sources, c))) return true;
     // A payload that carries sources at all is authoritative about them: this

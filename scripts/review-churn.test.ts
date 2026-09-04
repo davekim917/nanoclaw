@@ -303,6 +303,29 @@ describe('review-churn classifier', () => {
     expect(churning.seam).toBe('src/mailbox/write.ts');
   });
 
+  it('resolves an extensionless import the way a resolver would', () => {
+    // `from './gate'` is valid and used in this tree; the existence rule must
+    // not delete a real seam because the specifier carried no extension.
+    const churning = classify(fixture('extensionless-import-seam')).classes[0];
+    expect(churning.seam).toBe('src/gate');
+    expect(churning.seamSubstantiated).toBe(true);
+    expect(gate(fixture('extensionless-import-seam')).status).toBe(3);
+  });
+
+  it('will not seam on an import that is inside a comment, real module or not', () => {
+    // Two shapes in one fixture, because existence only settles the first: a
+    // module that does not exist, and a REAL module named by every finding.
+    // Comment context decides the second, with delimiters located after
+    // single-line quoted spans are blanked — which is what keeps
+    // `const marker = "/*"` from opening a comment and swallowing the imports
+    // below it.
+    const churning = classify(fixture('commented-import-seam')).classes[0];
+    expect(churning.rounds).toBe(3);
+    expect(churning.seam).toBe('src/db/messages-out.ts');
+    expect(churning.seamSubstantiated).toBe(false);
+    expect(gate(fixture('commented-import-seam')).status).toBe(0);
+  });
+
   it('will not seam on a module that does not exist', () => {
     // A block comment carrying `import { evaluateGate } from './fake.js'` is
     // read as an import by any line-anchored scan, and the findings name
