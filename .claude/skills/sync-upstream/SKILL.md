@@ -75,9 +75,10 @@ git -C /home/ubuntu/nanoclaw-v2 worktree add --detach "$W" origin/main
 git -C "$W" switch -c port/<theme>
 ln -s /home/ubuntu/nanoclaw-v2/node_modules "$W/node_modules"   # read-only use; NEVER pnpm install/rebuild in a worktree
 git -C "$W" cherry-pick -x <sha>...                                # resolve against fork intent
-node_modules/.bin/tsc --noEmit -p tsconfig.json
-ionice -c3 nice -n 10 node_modules/.bin/vitest run --pool=forks --maxWorkers=2 <targeted files>   # load < 8; never the whole suite
-gh pr create ...   # then run the pr-review-loop skill
+(cd "$W" && node_modules/.bin/tsc --noEmit -p tsconfig.json)
+(cd "$W" && ionice -c3 nice -n 10 node_modules/.bin/vitest run --pool=forks --maxWorkers=2 <targeted files>)   # load < 8; never the whole suite
+(cd /home/ubuntu/nanoclaw-v2 && pnpm run check:public-boundary -- --root "$W" --index)   # scans $W's commits; run from the live checkout only so pnpm/tsx resolve
+(cd "$W" && gh pr create ...)   # gh's head branch is inferred from cwd — must run from $W; then run the pr-review-loop skill
 git -C /home/ubuntu/nanoclaw-v2 worktree remove "$W"               # from the live checkout, after the PR
 ```
 
@@ -86,7 +87,7 @@ Port rules that have already bitten:
 - **Every git command in a port worker's brief is `git -C /abs/path ...`**, never a bare `cd && git`; a fallen-through `cd` chain has landed a `git checkout <sha> -- .` in the live checkout before.
 - **Never `git stash`, `-u` or otherwise**, in the live checkout or a worktree a peer might touch — live sessions write untracked files a stash would sweep up.
 - **Synthetic ids only** in anything committed — source, tests, comments. A real `sess-…`/`ag-…`/`mg-…` id or an operator/client name in a comment blocks the next push from the live checkout (the boundary hook is blind in a worktree, and a GitHub merge runs no hook at all).
-- **Before any push from a worktree**, run the boundary check against the LIVE root, not the worktree's own (read-only, safe outside a build window): `pnpm run check:public-boundary -- --root /home/ubuntu/nanoclaw-v2 --index`.
+- **Before any push from a worktree**, run the boundary check with `--root` pointing at the *worktree* (that's the content it scans — `--index` reads each tracked file via `git show :<file>` under `--root`), executed from the live checkout so `pnpm`/`tsx` resolve — the same split the repo's own pre-push hook uses: `(cd /home/ubuntu/nanoclaw-v2 && pnpm run check:public-boundary -- --root "$W" --index)`. Pointing `--root` at the live checkout instead scans the live checkout's own (usually empty) index and proves nothing about the worktree's commits.
 - **Targeted vitest only**, never a full suite concurrently with another session: `ionice -c3 nice -n 10 node_modules/.bin/vitest run --pool=forks --maxWorkers=2 <files>` at load < 8.
 - **A bare `vi.mock` factory of a project module must spread `importOriginal`** (`vi.mock('../foo.js', async (importOriginal) => ({ ...(await importOriginal()), ... }))`) so a batch that adds an export doesn't silently undefine it for every mocking suite — except `./log.js`, which is intentionally a full stub (mocking the logger's real implementation is never wanted).
 - **Codex thread counts come from the GraphQL `reviewThreads` API only** — the REST login filter silently returns 0 and reads as a clean review that never happened.
@@ -170,13 +171,17 @@ The upstream sync runs with several sessions up at once, sharing the fork and th
 - **Patch inbox, not direct writes.** A session that isn't the deployer never commits to the live checkout. It produces `git format-patch` files into the deployer's scratchpad inbox and messages the filenames; the deployer applies them (`git am`) between deploy windows.
 - **Check "is this mine?" before touching any dirt in the live checkout.** `git status --porcelain` plus `/proc/*/cwd` for every process rooted there — a change you didn't make is not automatically a peer's mistake to clean up; it may be an operator-side tool.
 - **Operator-side tools may edit the live checkout directly** — an interactive editor, an interactive Codex TUI launched in that directory. That's expected, not a collision to fix. If you find dirt you didn't create and can't attribute to a known peer session, rescue it to a patch file before doing anything destructive; never `reset`/`checkout -- .`/`clean` without first knowing whose work it is.
-- **If the operator's tool needs to move its work off the live checkout** (because it branched there, or because it's mid-edit when a deploy window needs the tree clean), give the exact five commands — "commit to a branch" alone reads as switching the shared checkout, which breaks every other session's assumption that it's on `main`:
+- **If the operator's tool needs to move its work off the live checkout** (because it's mid-edit, still on `main`, when a deploy window needs the tree clean), give the exact commands — "commit to a branch" alone reads as switching the shared checkout, which breaks every other session's assumption that it's on `main`. Branch **before** committing (a commit made first lands on shared `main`, not on a branch that doesn't exist yet), and stage only the paths that are actually the operator's WIP (`git add -A` sweeps up any other session's or operator-side tool's untracked dirt too):
   ```bash
-  git -C /home/ubuntu/nanoclaw-v2 add -A && git -C /home/ubuntu/nanoclaw-v2 commit -m "<wip>"
+  git -C /home/ubuntu/nanoclaw-v2 status --porcelain                         # attribute what's dirty before touching any of it
+  git -C /home/ubuntu/nanoclaw-v2 switch -c wip/<topic>                      # branch first, off the current (still-main) tree
+  git -C /home/ubuntu/nanoclaw-v2 add <the attributed paths>                 # explicit paths only, never -A
+  git -C /home/ubuntu/nanoclaw-v2 commit -m "<wip>"
   git -C /home/ubuntu/nanoclaw-v2 switch main
-  git -C /home/ubuntu/nanoclaw-v2 worktree add /home/ubuntu/nanoclaw-wt-<topic> <branch>
+  git -C /home/ubuntu/nanoclaw-v2 worktree add /home/ubuntu/nanoclaw-wt-<topic> wip/<topic>
   # continue editing in /home/ubuntu/nanoclaw-wt-<topic> from here
   ```
+  If the tool already created its own branch (the `git switch -c` case in gotcha 9 below), skip the branch-creation step and commit directly onto that branch, then continue from `switch main`.
 
 ## Gotchas (each one cost real downtime or a blocked push)
 
