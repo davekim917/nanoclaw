@@ -2,6 +2,12 @@ import * as fs from 'fs';
 import { spawn, type ChildProcess } from 'child_process';
 
 import { createOpencodeClient, type OpencodeClient } from '@opencode-ai/sdk';
+// The root client carries no `.question` surface in 1.18.23 (verified against
+// the installed `dist/gen/sdk.gen.d.ts`: no Question class at all). list/reply/
+// reject for the interactive `question` tool exist only on the `/v2` subpath
+// client, which talks to the SAME server on plain `/question` routes. Imported
+// separately so the session/event client above is untouched.
+import { createOpencodeClient as createOpencodeQuestionClient } from '@opencode-ai/sdk/v2';
 
 import { memoryContextForSessionStart, type MemorySessionHookRegistration } from '../memory/session-hook.js';
 import { registerProvider } from './provider-registry.js';
@@ -14,6 +20,50 @@ import { MANAGED_GIT_OPENCODE_PLUGIN_PATH } from '../managed-git-guard.js';
 function log(msg: string): void {
   console.error(`[opencode-provider] ${msg}`);
 }
+
+/**
+ * Every permission category OpenCode 1.18.x knows about, read off the CLI's own
+ * built-in documentation ("Known permission keys: read, edit, glob, grep, list,
+ * bash, task, external_directory, todowrite, question, webfetch, websearch,
+ * lsp, doom_loop, skill"), all set to `allow` EXCEPT `question`.
+ *
+ * The provider used to emit the top-level string shorthand `permission: 'allow'`.
+ * That leaves `question` — OpenCode's built-in interactive multi-choice tool —
+ * to whatever OpenCode's own default/config merge resolves it to, and upstream
+ * observed that resolution land on BOTH `question -> deny *` and
+ * `question -> allow *` for one session. Whichever rule wins last, `allow`
+ * sometimes does, and a headless container has nobody to answer an interactive
+ * question: the tool call never returns and the session is wedged forever.
+ * Enumerating the categories makes `question` a single deterministic `deny`
+ * that cannot contradict itself.
+ *
+ * GUARD PARITY IS UNCHANGED. Every other category keeps the exact
+ * "allow everything" behavior the string shorthand produced, so the
+ * fail-closed destructive-action plugin below is still the ONLY thing standing
+ * between the agent and a destructive command — the same contract, the same
+ * classifier, the same `tool.execute.before` throw. This list deliberately does
+ * NOT include a category OpenCode does not document (upstream's `codesearch`,
+ * absent from 1.18.x's key list): an unknown key would be a config change with
+ * no known meaning here. A category OpenCode adds later is likewise absent, and
+ * resolves to OpenCode's own default rather than to `allow`.
+ */
+export const OPENCODE_PERMISSIONS: Record<string, string> = {
+  read: 'allow',
+  edit: 'allow',
+  glob: 'allow',
+  grep: 'allow',
+  list: 'allow',
+  bash: 'allow',
+  task: 'allow',
+  external_directory: 'allow',
+  todowrite: 'allow',
+  question: 'deny',
+  webfetch: 'allow',
+  websearch: 'allow',
+  lsp: 'allow',
+  doom_loop: 'allow',
+  skill: 'allow',
+};
 
 /** The fields we read off OpenCode's AssistantMessage (`message.updated`). */
 export type OpenCodeAssistantUsage = {
@@ -490,15 +540,15 @@ export function buildOpenCodeConfig(
   // the Bootstrap destructive-action gate, at parity with the
   // Claude Code `block-destructive` hook via a shared decision core. OpenCode
   // auto-approves every tool call
-  // (`permission: 'allow'` + permission auto-reply), so this plugin's
+  // (OPENCODE_PERMISSIONS allows every category + permission auto-reply), so this plugin's
   // `tool.execute.before` throw is the ONLY guardrail standing between the agent
   // and a destructive command. The plugin is mounted read-only from the
   // bootstrap plugin at /workspace/plugins/bootstrap.
   //
   // FAIL-CLOSED: if the plugin is absent (e.g. a group excludes the bootstrap
-  // plugin), we REFUSE to build a config — returning one with `permission:
-  // 'allow'` but no guard would run an unguarded prod agent with auto-approve on
-  // every tool call. Throwing aborts the spawn; the sweep retries, and the
+  // plugin), we REFUSE to build a config — returning one that allows every
+  // permission category but has no guard would run an unguarded prod agent with
+  // auto-approve on every tool call. Throwing aborts the spawn; the sweep retries, and the
   // operator sees the failure rather than a silently-unguarded agent. The old
   // behavior here was warn-and-continue, which is exactly the silent gap this
   // closes. Set OPENCODE_ALLOW_UNGUARDED=1 to opt out (dev-only escape hatch,
@@ -509,7 +559,7 @@ export function buildOpenCodeConfig(
   if (!guardAvailable && !allowUnguarded) {
     throw new Error(
       `OpenCode destructive-action guard plugin not found at ${GUARD_PLUGIN} — refusing to spawn an unguarded agent ` +
-        `(permission:'allow' auto-approves every tool call). Mount the bootstrap plugin, or set ` +
+        `(every permission category is allowed, so tool calls are auto-approved). Mount the bootstrap plugin, or set ` +
         `OPENCODE_ALLOW_UNGUARDED=1 to override (dev-only).`,
     );
   }
@@ -524,7 +574,7 @@ export function buildOpenCodeConfig(
     ...(model ? { model } : {}),
     ...(smallModel ? { small_model: smallModel } : {}),
     enabled_providers: enabledProviders,
-    permission: 'allow',
+    permission: OPENCODE_PERMISSIONS,
     autoupdate: false,
     snapshot: false,
     provider: providerOptions,
@@ -539,9 +589,136 @@ export function buildOpenCodeConfig(
   };
 }
 
+/**
+ * Minimal shape of the `/v2` SDK surface this module needs for question
+ * handling — narrowed so tests can pass a fake without constructing the real
+ * `@opencode-ai/sdk/v2` client. `question.reply` takes flat parameters
+ * (`{ requestID, answers }`) in 1.18.23, and `question.list` returns every
+ * pending request across sessions.
+ */
+export interface QuestionClient {
+  question: {
+    reply(params: { requestID: string; answers: string[][] }): Promise<{ data?: unknown; error?: unknown }>;
+    list(): Promise<{ data?: Array<{ id: string; sessionID?: string; questions?: unknown[] }>; error?: unknown }>;
+  };
+}
+
+/**
+ * Steers the model rather than just silently declining: nothing in this
+ * container can answer an interactive question, so tell it to decide on its own
+ * or fall back to nanoclaw's own blocking MCP tool (`ask_user_question`), which
+ * actually reaches the human through the chat channel instead of OpenCode's
+ * headless-dead-end question tool.
+ */
+export const QUESTION_STEERING_TEXT =
+  'Interactive questions are not available in this environment. Decide autonomously based on your best judgment, or use the ask_user_question MCP tool to ask the human through the chat channel.';
+
+/**
+ * Answer one pending question request with the steering text, one custom answer
+ * per sub-question (OpenCode's `question` tool accepts free text that is not one
+ * of the offered option labels). Never throws — a failed auto-answer must not
+ * take the session down any harder than the question already threatened to.
+ */
+export async function autoAnswerQuestion(
+  questionClient: QuestionClient,
+  req: { id?: string; questions?: unknown[] },
+): Promise<void> {
+  if (!req.id) return;
+  const count = Array.isArray(req.questions) && req.questions.length > 0 ? req.questions.length : 1;
+  try {
+    const res = await questionClient.question.reply({
+      requestID: req.id,
+      answers: Array.from({ length: count }, () => [QUESTION_STEERING_TEXT]),
+    });
+    if (res.error) {
+      log(`Failed to auto-answer question ${req.id}: ${JSON.stringify(res.error)}`);
+    }
+  } catch (err) {
+    log(`Failed to auto-answer question ${req.id}: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
+/**
+ * Fail-open budget shared by both question paths. A hung `list()`/`reply()`
+ * round-trip must block neither runtime startup nor the turn that is waiting on
+ * the event loop, so each await races a timer and logs one line on expiry.
+ */
+const QUESTION_TIMEOUT_MS = 10_000;
+
+/**
+ * Handle a `question.asked` SSE event: always answer it, whichever session
+ * raised it. `question: 'deny'` in OPENCODE_PERMISSIONS should stop the tool
+ * from ever firing, but this is the real fix for the wedge — one OpenCode server
+ * is shared across every session on this runtime, so a pending question wedges
+ * the whole server, not only the session that asked. A config regression, or an
+ * OpenCode path that raises the event before consulting permission, must never
+ * be able to leave a question unanswered.
+ *
+ * Called inline from the turn's event loop, hence the timeout: a `reply()` that
+ * never resolves would stall the turn, not just startup.
+ */
+export async function handleQuestionAsked(
+  questionClient: QuestionClient,
+  req: { id?: string; sessionID?: string; questions?: unknown[] },
+  timeoutMs = QUESTION_TIMEOUT_MS,
+): Promise<void> {
+  log(`Auto-answering question ${req.id ?? '(no id)'} (sessionID=${req.sessionID ?? 'unknown'})`);
+  await raceWithTimeout(autoAnswerQuestion(questionClient, req), timeoutMs, () =>
+    log(`Timed out after ${timeoutMs}ms auto-answering question ${req.id ?? '(no id)'}; continuing`),
+  );
+}
+
+/**
+ * Defensive belt: drain any question requests already pending when a shared
+ * runtime comes up (one that raced the event subscription, or survived a prior
+ * server instance) so none of them sits there wedging future turns before the
+ * event-driven handler ever sees it. Fail-open — the `question.asked` handler
+ * still answers later if a slow round-trip eventually completes.
+ */
+export async function drainPendingQuestions(
+  questionClient: QuestionClient,
+  timeoutMs = QUESTION_TIMEOUT_MS,
+): Promise<void> {
+  const drain = (async () => {
+    try {
+      const res = await questionClient.question.list();
+      if (res.error) {
+        log(`Failed to list pending questions: ${JSON.stringify(res.error)}`);
+        return;
+      }
+      for (const req of res.data ?? []) {
+        await autoAnswerQuestion(questionClient, req);
+      }
+    } catch (err) {
+      log(`Failed to list pending questions: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  })();
+  await raceWithTimeout(drain, timeoutMs, () =>
+    log(`Timed out after ${timeoutMs}ms draining pending questions; continuing startup`),
+  );
+}
+
+/**
+ * Await `work`, giving up after `timeoutMs`. The timer is always cleared so a
+ * fast path cannot leave it holding the process alive or firing into a promise
+ * nobody races anymore.
+ */
+async function raceWithTimeout(work: Promise<unknown>, timeoutMs: number, onTimeout: () => void): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timedOut = new Promise<true>((resolve) => {
+    timer = setTimeout(() => resolve(true), timeoutMs);
+  });
+  try {
+    if (await Promise.race([work.then(() => false as const), timedOut])) onTimeout();
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 type SharedRuntime = {
   proc: ChildProcess;
   client: OpencodeClient;
+  questionClient: QuestionClient;
   stream: AsyncGenerator<{ type: string; properties: Record<string, unknown> }, void, void>;
   streamRelease: () => void;
 };
@@ -608,11 +785,16 @@ async function ensureSharedRuntime(
       // Also pass `directory` to the SDK client — opencode uses it as a hint
       // for project-context features (project root, file paths in completions).
       const client = createOpencodeClient({ baseUrl: url, ...(cwd ? { directory: cwd } : {}) });
+      const questionClient = createOpencodeQuestionClient({ baseUrl: url }) as unknown as QuestionClient;
       const sub = await client.event.subscribe();
       const stream = sub.stream as AsyncGenerator<{ type: string; properties: Record<string, unknown> }, void, void>;
+      // Belt-and-suspenders drain before this runtime serves any turn — see
+      // drainPendingQuestions. Bounded, so a hung round-trip cannot block spawn.
+      await drainPendingQuestions(questionClient);
       sharedRuntime = {
         proc,
         client,
+        questionClient,
         stream,
         streamRelease: () => {
           void stream.return?.(undefined);
@@ -734,7 +916,7 @@ export class OpenCodeProvider implements AgentProvider {
     async function* gen(): AsyncGenerator<ProviderEvent> {
       let initYielded = false;
       const rt = await ensureSharedRuntime(self.options, queryCwd, turn);
-      const { client, stream } = rt;
+      const { client, stream, questionClient } = rt;
 
       while (!aborted) {
         while (pending.length === 0 && !ended && !aborted) {
@@ -870,6 +1052,14 @@ export class OpenCodeProvider implements AgentProvider {
                     log(`Failed to auto-reply permission: ${err instanceof Error ? err.message : String(err)}`);
                   }
                 }
+                break;
+              }
+              case 'question.asked': {
+                // Answered regardless of sessionID: the OpenCode server is
+                // shared across sessions and ONE unanswered question wedges the
+                // whole server, so this must not filter by turn.
+                const req = ev.properties as { id?: string; sessionID?: string; questions?: unknown[] };
+                await handleQuestionAsked(questionClient, req);
                 break;
               }
               case 'session.status': {
