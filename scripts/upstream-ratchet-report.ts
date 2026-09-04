@@ -60,6 +60,7 @@ import {
   buildManifest,
   classify,
   decideCheckOutcome,
+  findDirectoryShadows,
   findUntrackedShadows,
   hashBlobContent,
   hashCatFileBatch,
@@ -491,6 +492,22 @@ function computeFromRef(
   // if git ever starts consulting attributes somewhere it doesn't today.
   const refEntries = parseLsTreeEntries(git(root, [`--attr-source=${ref}`, 'ls-tree', '-r', '-z', ref]));
 
+  // A directory shadow means there is no blob at all for an upstream-owned
+  // path in <ref>'s tree — not "present", not "deleted", but a path an
+  // ordinary lookup would misread as deleted while a real checkout of <ref>
+  // would refuse outright (findUntrackedShadows' working-tree equivalent).
+  // Refused the same way an unmeasurable pinned commit is: exit 2, "cannot
+  // measure", not "the ratchet failed".
+  const directoryShadows = findDirectoryShadows([...upstreamModes.keys()], [...refEntries.keys()]);
+  if (directoryShadows.length > 0) {
+    console.error(
+      `upstream-ratchet: ${directoryShadows.length} upstream-owned path(s) are directories in ${ref}'s tree, ` +
+        `not blobs — their divergence cannot be measured:\n` +
+        directoryShadows.map((s) => `  ${s.upstreamPath} (e.g. ${s.example} exists under it)`).join('\n'),
+    );
+    process.exit(2);
+  }
+
   // Symlinks only: never filtered on checkout, so the plain blob is already
   // checkout-equivalent, and a batch call is safe for these because raw
   // (unfiltered) `cat-file --batch` reports the correct size. Scoped to
@@ -671,7 +688,22 @@ function runCheck(options: Options): never {
   }
   const elapsedMs = Date.now() - started;
 
-  const rows = classify(committed, current);
+  // `checkTree` already validates the committed manifest's shape (a
+  // `malformed` finding fires for `"files": null`, a non-object `files`, or
+  // any entry that is `null`/non-object) WITHOUT crashing — it early-returns
+  // at the manifest level, and `checkEntry` early-returns per entry. `classify`
+  // and `counts` make no such promise: `classify`'s second loop does
+  // `Object.entries(committed.files)` (throws on `null`/non-object) and reads
+  // `before.diff` unguarded (throws on a `null` entry), and `counts` does
+  // `Object.values(manifest.files)` (same throw). A `--check <ref>` reads
+  // `committed` from `git show <ref>:...json` — an ARBITRARY ref's content,
+  // never guaranteed well-formed the way the default report's local
+  // `readManifest` effectively always is. Reusing `checkTree`'s own
+  // `malformed` findings here (rather than a second shape-validator) is what
+  // stops BEFORE either crashes: a malformed manifest means only that its
+  // findings are shown and the run fails, not that it exits by throwing.
+  const malformed = currencyFindings.some((f) => f.kind === 'malformed');
+  const rows = malformed ? [] : classify(committed, current);
   // The exit decision is one pure function (src/upstream-ratchet-core.ts,
   // unit-tested there) — `runCheck` has no ad hoc `failing` computation of its
   // own to drop `currencyFindings` from by accident. Shadows the raw
@@ -681,7 +713,9 @@ function runCheck(options: Options): never {
   const { failing, blocking } = outcome;
   currencyFindings = outcome.currencyFindings;
 
-  const before = counts(committed);
+  const before = malformed
+    ? { total: 0, divergent: 0, identical: 0, deleted: 0, modified: 0, binary: 0, lines: 0 }
+    : counts(committed);
   const after = counts(current);
   const deltaLines = after.lines - before.lines;
   const summary =

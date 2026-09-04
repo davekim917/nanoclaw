@@ -24,6 +24,7 @@ import {
   buildManifest,
   classify,
   decideCheckOutcome,
+  findDirectoryShadows,
   findUntrackedShadows,
   hashBlobContent,
   hashCatFileBatch,
@@ -39,6 +40,7 @@ import {
   type Row,
 } from './upstream-ratchet-core.js';
 import {
+  checkTree,
   hashFile,
   sealManifest,
   type Finding,
@@ -366,6 +368,50 @@ describe('--check exit decision (decideCheckOutcome)', () => {
     expect(outcome.blocking).toHaveLength(1);
     expect(outcome.currencyFindings).toHaveLength(1);
   });
+
+  describe('a malformed manifest read from an arbitrary ref (`--check` cannot trust `git show`)', () => {
+    // `--check <ref>` reads `committed` from `git show <ref>:...json` — an
+    // ARBITRARY ref's content, never guaranteed well-formed the way the
+    // default report's local `readManifest` effectively always is.
+    // `checkTree` already validates this shape without crashing (it
+    // early-returns a `malformed` finding); `classify` and `counts`
+    // (scripts/upstream-ratchet-report.ts) do not. `runCheck` reuses
+    // `checkTree`'s `malformed` findings to decide whether to call `classify`
+    // at all — these two cases pin BOTH halves: the shape is safely detected,
+    // and calling `classify` on it directly (what `runCheck` no longer does)
+    // really does throw, which is why the guard exists.
+    const root = uniqueTmpRoot('upstream-ratchet-check-malformed-manifest');
+
+    it('"files": null is caught by checkTree without throwing, and WOULD throw classify', () => {
+      const brokenManifest = { upstream: 'a'.repeat(40), paths: '', files: null } as unknown as UpstreamRatchetManifest;
+      const findings = checkTree(brokenManifest, root);
+      expect(findings.some((f) => f.kind === 'malformed')).toBe(true);
+
+      // Regression pin: this is exactly what `runCheck` skips by checking
+      // `currencyFindings` for a `malformed` kind BEFORE calling classify.
+      expect(() => classify(brokenManifest, manifestOf({}))).toThrow();
+
+      // decideCheckOutcome, given the findings and an EMPTY rows array (what
+      // runCheck passes when it skips classify), still fails correctly.
+      const outcome = decideCheckOutcome([], findings);
+      expect(outcome.failing).toBe(true);
+    });
+
+    it('a null entry is caught by checkTree without throwing, and WOULD throw classify', () => {
+      const brokenManifest = sealManifest({
+        upstream: 'a'.repeat(40),
+        paths: '',
+        files: { 'src/router.ts': null as unknown as UpstreamRatchetEntry },
+      });
+      const findings = checkTree(brokenManifest, root);
+      expect(findings.some((f) => f.kind === 'malformed' && f.path === 'src/router.ts')).toBe(true);
+
+      expect(() => classify(brokenManifest, manifestOf({}))).toThrow();
+
+      const outcome = decideCheckOutcome([], findings);
+      expect(outcome.failing).toBe(true);
+    });
+  });
 });
 
 describe('untracked shadows', () => {
@@ -410,6 +456,41 @@ describe('untracked shadows', () => {
   it('is silent on a genuinely deleted path and on a tracked one', () => {
     expect(findUntrackedShadows(upstream, new Set(upstream), () => true)).toEqual([]);
     expect(findUntrackedShadows(upstream, new Set(), () => false)).toEqual([]);
+  });
+});
+
+describe('directory shadows (--check <ref>)', () => {
+  it('flags an upstream-owned path that is a directory in the ref, not a blob', () => {
+    // upstream owns `foo` as a file; the ref replaces it with a directory
+    // holding `foo/bar` — ls-tree -r lists `foo/bar` and never mentions `foo`
+    // at all, which an ordinary lookup would misread as "foo is deleted".
+    const shadows = findDirectoryShadows(['foo', 'src/router.ts'], ['foo/bar', 'src/router.ts']);
+    expect(shadows).toEqual([{ upstreamPath: 'foo', example: 'foo/bar' }]);
+  });
+
+  it('flags a shadow at any depth, and only the paths that are actually shadowed', () => {
+    const shadows = findDirectoryShadows(['a', 'a/b', 'untouched.md'], ['a/b/c.txt', 'untouched.md']);
+    // Both `a` and `a/b` are directory ancestors of `a/b/c.txt` — both shadowed.
+    expect(shadows.map((s) => s.upstreamPath).sort()).toEqual(['a', 'a/b']);
+    // `untouched.md` is a real blob in the ref, not a directory — never shadowed.
+    expect(shadows.some((s) => s.upstreamPath === 'untouched.md')).toBe(false);
+  });
+
+  it('does not flag an upstream path that is genuinely deleted (absent, not a directory)', () => {
+    expect(findDirectoryShadows(['gone.md'], ['other.txt'])).toEqual([]);
+  });
+
+  it('does not flag an upstream path that is present as an ordinary blob', () => {
+    expect(findDirectoryShadows(['src/router.ts'], ['src/router.ts'])).toEqual([]);
+  });
+
+  it('is unaffected by which paths are filtered OUT of upstreamPaths — the shadow is a property of refPaths alone', () => {
+    // The shadowing path itself (foo/bar) is typically fork-added, not
+    // upstream-owned — passing the ref's FULL path list (not pre-filtered to
+    // upstream-owned paths) is what lets this fire at all.
+    expect(findDirectoryShadows(['foo'], ['foo/bar', 'unrelated/fork-added.txt'])).toEqual([
+      { upstreamPath: 'foo', example: 'foo/bar' },
+    ]);
   });
 });
 

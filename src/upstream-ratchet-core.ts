@@ -287,6 +287,54 @@ export function findUntrackedShadows(
   return upstreamPaths.filter((relPath) => !tracked.has(relPath) && !ignored.has(relPath) && exists(relPath));
 }
 
+/** One upstream-owned path that is a DIRECTORY in a ref's tree rather than a blob. */
+export interface DirectoryShadow {
+  /** The upstream-owned path — present or deleted, it does not matter which. */
+  upstreamPath: string;
+  /** One concrete path found under it in the ref's tree, as evidence. */
+  example: string;
+}
+
+/**
+ * Upstream-owned paths that are directories in `<ref>`'s tree rather than
+ * blobs — the `--check <ref>` analogue of `findUntrackedShadows` above, for a
+ * bare commit instead of a working tree.
+ *
+ * `git ls-tree -r` lists only BLOBS, never the directories that contain them:
+ * if upstream owns `foo` (a file) and `<ref>` replaces it with a directory
+ * (`foo/bar`, `foo/baz`), `ls-tree -r <ref>` lists `foo/bar` and `foo/baz` and
+ * says nothing about `foo` itself — there is no entry for it to be absent OR
+ * present. Reading that as "foo is deleted" (what an ordinary lookup of
+ * `refEntries.get('foo')` would conclude) is wrong the same way
+ * `findUntrackedShadows` exists to catch for a working tree: `foo`'s
+ * divergence cannot be measured, because there is no blob there at all to
+ * hash or count lines against — a real checkout of `<ref>` would refuse this
+ * exact tree for the same reason `findUntrackedShadows` refuses one where an
+ * upstream path went from a file to a directory on disk.
+ *
+ * `refPaths` must be the ref's FULL path list (every blob `ls-tree -r`
+ * reports), not filtered to upstream-owned paths first — the shadowing path
+ * (`foo/bar`) is typically a fork-added path, not an upstream-owned one, so
+ * filtering it out before computing prefixes would hide exactly the case this
+ * function exists to catch.
+ */
+export function findDirectoryShadows(upstreamPaths: readonly string[], refPaths: readonly string[]): DirectoryShadow[] {
+  const exampleByPrefix = new Map<string, string>();
+  for (const refPath of refPaths) {
+    const segments = refPath.split('/');
+    for (let i = 1; i < segments.length; i += 1) {
+      const prefix = segments.slice(0, i).join('/');
+      if (!exampleByPrefix.has(prefix)) exampleByPrefix.set(prefix, refPath);
+    }
+  }
+  const shadows: DirectoryShadow[] = [];
+  for (const upstreamPath of upstreamPaths) {
+    const example = exampleByPrefix.get(upstreamPath);
+    if (example !== undefined) shadows.push({ upstreamPath, example });
+  }
+  return shadows;
+}
+
 // ── building the current manifest ────────────────────────────────────────────
 
 export interface BuildInput {
