@@ -11,30 +11,48 @@ import { isDirectExecution, resolveChannelMetadataUpdates, runWorkgroupMemorySta
 // flow's own, richer name classification (channel-approval.ts) on the same
 // first inbound event, with no ordering guarantee between the two writers.
 // This callback fires at most once per channel per process, so "never
-// overwrite an existing name" loses that race safely without losing any
-// legitimate rename-tracking it never did in the first place.
+// overwrite an existing name" loses that race safely — but only while the
+// channel is unwired, which is the only state requestChannelApproval (the
+// gate that runs channel-approval.ts's classifier) ever fires for. Once
+// wired, that second writer is gone, so a rename must still propagate on
+// each host restart's one-shot re-fetch — round 5 finding on this file.
 describe('resolveChannelMetadataUpdates', () => {
-  it('sets the name only when the messaging group has none yet', () => {
-    expect(resolveChannelMetadataUpdates({ name: null, is_group: 0 }, 'General', undefined)).toEqual({
+  it('sets the name only when the messaging group has none yet (unwired)', () => {
+    expect(resolveChannelMetadataUpdates({ name: null, is_group: 0 }, 'General', undefined, false)).toEqual({
       name: 'General',
     });
   });
 
-  it('never overwrites an already-set name, even a differing one', () => {
+  it('never overwrites an already-set name while unwired, even a differing one', () => {
     expect(
-      resolveChannelMetadataUpdates({ name: 'Group DM: Alice and Bob', is_group: 1 }, 'mpdm-alice--bob-1', undefined),
+      resolveChannelMetadataUpdates(
+        { name: 'Group DM: Alice and Bob', is_group: 1 },
+        'mpdm-alice--bob-1',
+        undefined,
+        false,
+      ),
     ).toEqual({});
   });
 
+  it('refreshes a differing name once the channel is wired — no race left to protect', () => {
+    expect(
+      resolveChannelMetadataUpdates({ name: 'old-channel-name', is_group: 0 }, 'renamed-channel', undefined, true),
+    ).toEqual({ name: 'renamed-channel' });
+  });
+
+  it('leaves a matching wired name alone', () => {
+    expect(resolveChannelMetadataUpdates({ name: 'Existing', is_group: 0 }, 'Existing', undefined, true)).toEqual({});
+  });
+
   it('still updates is_group independently of the name decision', () => {
-    expect(resolveChannelMetadataUpdates({ name: 'Existing', is_group: 0 }, 'Existing', true)).toEqual({
+    expect(resolveChannelMetadataUpdates({ name: 'Existing', is_group: 0 }, 'Existing', true, true)).toEqual({
       is_group: 1,
     });
   });
 
   it('returns an empty object when nothing changed', () => {
-    expect(resolveChannelMetadataUpdates({ name: 'Existing', is_group: 1 }, 'Existing', true)).toEqual({});
-    expect(resolveChannelMetadataUpdates({ name: 'Existing', is_group: 1 }, undefined, undefined)).toEqual({});
+    expect(resolveChannelMetadataUpdates({ name: 'Existing', is_group: 1 }, 'Existing', true, true)).toEqual({});
+    expect(resolveChannelMetadataUpdates({ name: 'Existing', is_group: 1 }, undefined, undefined, true)).toEqual({});
   });
 });
 
