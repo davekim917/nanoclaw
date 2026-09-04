@@ -2026,6 +2026,132 @@ function makeResultQuery(result: ProviderEvent): { query: AgentQuery; pushes: st
   };
 }
 
+/**
+ * provider_executing tracks TURNS, not stream lifetime. A multi-turn stream
+ * stays open after `result` to accept pushes (claude.ts's generator exits only
+ * on end()/abort), so a flag raised for the whole processQuery call would sit
+ * at 1 through the container's entire idle stretch and hold the host's
+ * scheduled-task reaper off a container with nothing left to do. The host side
+ * of the contract is pinned in src/modules/mailbox/mailbox.test.ts.
+ */
+describe('processQuery provider_executing', () => {
+  const providerExecuting = (): number =>
+    (
+      getOutboundDb().prepare('SELECT provider_executing FROM container_state WHERE id = 1').get() as
+        | { provider_executing: number }
+        | undefined
+    )?.provider_executing ?? 0;
+
+  it('clears at `result` while the stream stays open, and raises again on the next pushed turn', async () => {
+    const observed: Record<string, number> = {};
+    async function* events(): AsyncGenerator<ProviderEvent> {
+      yield { type: 'init', continuation: 'sess-exec-flag' };
+      observed.duringTurn = providerExecuting();
+      // Unwrapped output draws the one-shot re-wrap nudge, which pushes into
+      // the open stream — a genuinely new turn, so the flag must go back up.
+      yield { type: 'result', text: 'unwrapped' };
+      observed.afterNudgedResult = providerExecuting();
+      // `unwrappedNudged` is one-shot, so this result nudges nothing: the turn
+      // is over and the stream is still open. This is the idle stretch a
+      // whole-call bracket would have kept flagged busy right through.
+      yield { type: 'result', text: 'unwrapped again' };
+      observed.afterFinalResult = providerExecuting();
+      // A compaction re-injects bootstrap through pushToQuery — another turn
+      // that holds no processing claim of its own.
+      yield { type: 'compacted', text: 'Context compacted.' };
+      observed.afterCompactionPush = providerExecuting();
+    }
+    const query: AgentQuery = { push: () => {}, end: () => {}, events: events(), abort: () => {} };
+
+    await processQuery(query, ERR_ROUTING, ['m1'], 'claude', undefined, 'prompt', undefined, {});
+
+    expect(observed.duringTurn).toBe(1);
+    expect(observed.afterNudgedResult).toBe(1);
+    expect(observed.afterFinalResult).toBe(0);
+    expect(observed.afterCompactionPush).toBe(1);
+    // The stream ended without a further `result`; the finally is the floor.
+    expect(providerExecuting()).toBe(0);
+  });
+
+  // Codex review on #333: lowering the turn level at `result` is correct, but
+  // the handling that FOLLOWS completes the batch's processing claim and only
+  // then decides whether to push a corrective follow-up. A sweep tick landing
+  // in that gap saw no due row, no claim, no continuation and no raised turn,
+  // and killed the container mid-decision. The bounded scope spans the gap.
+  it('stays raised while result handling completes the claim and decides on a follow-up', async () => {
+    const operations = getAgentMailbox().operations;
+    const markMessages = operations.markMessages.bind(operations);
+    const atCompletion: number[] = [];
+    const spy = spyOn(operations, 'markMessages').mockImplementation((ids, status) => {
+      if (status === 'completed') atCompletion.push(providerExecuting());
+      markMessages(ids, status);
+    });
+
+    try {
+      // Unwrapped output draws the one-shot re-wrap nudge, so handling pushes
+      // a follow-up turn AFTER completing the batch — the exact ordering the
+      // race depends on.
+      const { query } = makeResultQuery({ type: 'result', text: 'unwrapped' });
+      await processQuery(query, ERR_ROUTING, ['m-claimed'], 'claude', undefined, 'prompt', undefined, {});
+    } finally {
+      spy.mockRestore();
+    }
+
+    // The claim was completed at least once, and the flag was raised every
+    // time — never the window where every reaper term reads idle.
+    expect(atCompletion.length).toBeGreaterThan(0);
+    expect(atCompletion.every((value) => value === 1)).toBe(true);
+  });
+
+  // Codex review on #333, round 2: OpenCodeProvider.push() has no merge path.
+  // Every push is appended to `pending` and dequeued later as its OWN turn, so
+  // the `result` that ends the running turn can arrive with a follow-up already
+  // accepted and not yet dispatched. Lowering the turn level there published
+  // idle across that whole gap — and since the follow-up's rows were completed
+  // when they were pushed, no due row, claim or continuation covered it either.
+  // The provider now reports its queue and the poll-loop holds the level up.
+  it('stays raised across a provider-queued follow-up turn (opencode push semantics)', async () => {
+    const pending: string[] = [];
+    const observed: Record<string, number> = {};
+    async function* events(): AsyncGenerator<ProviderEvent> {
+      yield { type: 'init', continuation: 'sess-queued' };
+      // A compaction re-injects the bootstrap through pushToQuery while this
+      // turn is still running. On a queueing provider it lands in `pending`
+      // instead of merging into the turn.
+      yield { type: 'compacted', text: 'Context compacted.' };
+      expect(pending.length).toBe(1);
+      // The running turn now ends. Scratchpad-only text so result handling
+      // pushes nothing of its own — the queued prompt is the ONLY work left,
+      // and it has not started.
+      yield { type: 'result', text: '<internal>just thinking</internal>' };
+      // The generator resumes only after result handling finished, so this is
+      // exactly the window a sweep tick could land in.
+      observed.inGap = providerExecuting();
+      pending.shift(); // the queued turn starts
+      observed.queuedTurnRunning = providerExecuting();
+      yield { type: 'result', text: '<internal>done</internal>' };
+      observed.afterQueuedTurnEnds = providerExecuting();
+    }
+    const query: AgentQuery = {
+      push: (m: string) => {
+        pending.push(m);
+      },
+      end: () => {},
+      events: events(),
+      abort: () => {},
+      hasQueuedWork: () => pending.length > 0,
+    };
+
+    await processQuery(query, ERR_ROUTING, ['m-queued'], 'opencode', undefined, 'prompt', undefined, {});
+
+    expect(observed.inGap).toBe(1);
+    expect(observed.queuedTurnRunning).toBe(1);
+    // Queue drained and nothing pushed — the container is genuinely idle now.
+    expect(observed.afterQueuedTurnEnds).toBe(0);
+    expect(providerExecuting()).toBe(0);
+  });
+});
+
 it('re-bootstraps bounded canon and capabilities immediately after provider compaction', async () => {
   const pushes: string[] = [];
   async function* events(): AsyncGenerator<ProviderEvent> {

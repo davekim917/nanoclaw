@@ -1176,7 +1176,8 @@ export function _applyCeilingFollowUpForTesting(
 // provider's own "I am done" verdict. Today only the Codex provider ever writes
 // it (container/agent-runner/src/providers/codex.ts) — Claude and OpenCode
 // never do — so this heals Codex sessions only until they follow. It is
-// deliberately NOT built on provider_executing, which has no writer anywhere.
+// deliberately NOT built on provider_executing: that flag says "busy", not
+// "given up", and a wedged provider can be either.
 //
 // Two consecutive sweep ticks are required so a transition the container
 // recovers from on its own never costs it a kill.

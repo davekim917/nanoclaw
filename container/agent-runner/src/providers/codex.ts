@@ -1101,6 +1101,13 @@ export class CodexProvider implements AgentProvider {
   query(input: QueryInput): AgentQuery {
     if (!this.memorySessionHook) throw new Error('Codex memory session hook was not registered');
     const pending: string[] = [];
+    // Steering RPCs that have been issued but not settled. A steer that
+    // rejects falls back to `pending`, and that rejection is asynchronous — it
+    // can land after the poll-loop has already sampled `hasQueuedWork` at the
+    // current turn's `result`. Counting the in-flight RPC keeps the signal
+    // true across that window; `sendCodexRequest` bounds it at 60s, and the
+    // catch below queues BEFORE the decrement, so the signal never dips.
+    let steersInFlight = 0;
     let waiting: (() => void) | null = null;
     let ended = false;
     let aborted = false;
@@ -1487,19 +1494,33 @@ export class CodexProvider implements AgentProvider {
         // check and the call) and on missing handles.
         if (turnTracker.server && turnTracker.threadId && turnTracker.currentTurnId) {
           const expectedTurnId = turnTracker.currentTurnId;
+          steersInFlight += 1;
           void steerCodexTurn(turnTracker.server, {
             threadId: turnTracker.threadId,
             expectedTurnId,
             inputText: message,
-          }).catch(() => {
-            pending.push(message);
-            kick();
-          });
+          })
+            .catch(() => {
+              pending.push(message);
+              kick();
+            })
+            // Runs after the catch above, so `pending` already holds the
+            // fallback by the time the counter drops.
+            .finally(() => {
+              steersInFlight -= 1;
+            });
           return;
         }
         pending.push(message);
         kick();
       },
+      // Steering keeps the push inside the running turn, but the fallbacks
+      // above queue it as a separate future turn — same shape as opencode.
+      // An unsettled steer counts too: its rejection queues asynchronously,
+      // after the poll-loop may already have sampled this. Reported so the
+      // poll-loop doesn't publish idle in the gap before a queued turn
+      // starts. See AgentQuery.hasQueuedWork.
+      hasQueuedWork: () => pending.length > 0 || steersInFlight > 0,
       end: () => {
         ended = true;
         kick();

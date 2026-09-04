@@ -19,6 +19,7 @@ import {
   initTestSessionDb as upstreamInitTestSessionDb,
 } from '../../mailbox/sqlite/connection.js';
 import { ensureNanoclawInboundTestSchema, ensureNanoclawOutboundSchema } from './schema.js';
+import { resetProviderExecutingScopes } from './container-state.js';
 import { clearTickRepositoryBarrier } from './selection.js';
 import { setMailboxTestMode } from './index.js';
 
@@ -28,6 +29,11 @@ export function initTestSessionDb(): { inbound: Database; outbound: Database } {
   // A fresh session DB starts a fresh poll tick — never inherit the previous
   // test's memoized fence token.
   clearTickRepositoryBarrier();
+  // provider_executing's two scopes are module-level counters, so a test that
+  // left a turn raised or a scope open would otherwise carry it into the next.
+  // Zeroed without a DB write: the fresh outbound has no container_state row
+  // yet, and publishing one here would change what every other test observes.
+  resetProviderExecutingScopes();
   const { inbound, outbound } = upstreamInitTestSessionDb();
   ensureNanoclawInboundTestSchema(inbound);
   ensureNanoclawOutboundSchema(outbound);
