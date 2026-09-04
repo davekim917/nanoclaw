@@ -37,6 +37,23 @@ afterEach(() => {
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 });
 
+/**
+ * What a reclaim actually reads: the MARKER COUNT under the active dir, with a
+ * missing directory counting as zero (tryRunWithStorageCleanupClaim swallows
+ * ENOENT). An empty directory left behind blocks nothing, so these cases assert
+ * on markers rather than on the directory's existence — a planter's discard
+ * deliberately no longer removes the shared directory, because doing so would
+ * mean discounting its own in-flight registration and that discount cannot tell
+ * itself apart from another planter's.
+ */
+function activeMarkers(root: string): string[] {
+  try {
+    return fs.readdirSync(path.join(root, '.nanoclaw-storage-active'));
+  } catch {
+    return [];
+  }
+}
+
 function sessionDirShape(dataDir: string, ag: string, sess: string): string {
   return path.join(dataDir, 'v2-sessions', ag, sess);
 }
@@ -201,7 +218,7 @@ describe('synchronous storage activity marker', () => {
 
     expect(() => plantStorageActivityMarker(root, 'writer')).toThrow(/being reclaimed/);
     // A marker left behind here would block cleanup for this root forever.
-    expect(fs.existsSync(path.join(root, '.nanoclaw-storage-active'))).toBe(false);
+    expect(activeMarkers(root)).toHaveLength(0);
   });
 
   it('is idempotent on release', () => {
@@ -301,7 +318,7 @@ describe('synchronous storage activity marker', () => {
 
     expect(() => plantStorageActivityMarker(root, 'writer')).toThrow('no space left on device');
     vi.restoreAllMocks();
-    expect(fs.existsSync(path.join(root, '.nanoclaw-storage-active'))).toBe(false);
+    expect(activeMarkers(root)).toHaveLength(0);
   });
 
   // Two independent SYNC holders, no lease involved: the original independence
@@ -360,17 +377,16 @@ describe('acquireStorageActivityLease retries the marker-dir ENOENT race', () =>
     });
 
     await expect(acquireStorageActivityLease(root, 'writer')).rejects.toMatchObject({ code: 'ENOENT' });
-    expect(fs.existsSync(activeDir), 'no marker or dir must be left behind').toBe(false);
+    expect(activeMarkers(root), 'no marker must be left behind').toHaveLength(0);
   });
 
   it('rethrows a non-ENOENT plant failure without retrying', async () => {
     const root = tempRoot();
-    const activeDir = path.join(root, '.nanoclaw-storage-active');
     const err = Object.assign(new Error('no space left on device'), { code: 'ENOSPC' });
     vi.spyOn(fs.promises, 'writeFile').mockRejectedValueOnce(err);
 
     await expect(acquireStorageActivityLease(root, 'writer')).rejects.toThrow('no space left on device');
-    expect(fs.existsSync(activeDir)).toBe(false);
+    expect(activeMarkers(root)).toHaveLength(0);
   });
 });
 

@@ -100,30 +100,34 @@ function endPlant(key: string): void {
   else plantsInFlight.delete(key);
 }
 
-/**
- * True when some holder or in-flight plant in this process still needs the
- * directory. `ownPlants` discounts the caller's OWN registration: a planter's
- * discard runs while it is still registered, and it must still be able to
- * clean up after itself when nobody else is around.
- */
-function activeDirInUse(key: string, ownPlants = 0): boolean {
-  return heldLeases.has(key) || (plantsInFlight.get(key) ?? 0) > ownPlants;
+/** True when some holder or in-flight plant in this process still needs the directory. */
+function activeDirInUse(key: string): boolean {
+  return heldLeases.has(key) || plantsInFlight.has(key);
 }
 
 /**
  * Tidy the active directory away, but only when nothing in this process still
- * needs it. Removing it is never REQUIRED for correctness — a reclaim gates on
- * marker count, not on the directory existing (see tryRunWithStorageCleanupClaim)
- * — while removing it at the wrong moment is exactly what breaks a concurrent
- * plant. So "in use" always wins.
+ * needs it. Two rules make this safe, and both matter:
+ *
+ *   - ONLY A RELEASE CALLS THIS. A planter's discard removes its own marker
+ *     and stops there. A discard that also removed the directory would have to
+ *     discount its own registration to get past the check, and a discount is
+ *     indistinguishable from "some other planter is registered" — so the sync
+ *     release would happily delete the directory out from under a concurrent
+ *     plant, which is the whole bug this map exists to close.
+ *   - REMOVING IT IS NEVER REQUIRED FOR CORRECTNESS. A reclaim gates on marker
+ *     COUNT and tolerates ENOENT (see tryRunWithStorageCleanupClaim), so an
+ *     empty directory left behind blocks nothing. Removing it at the wrong
+ *     moment, by contrast, breaks a live plant. "In use" therefore always wins,
+ *     and so does "not sure".
  */
-async function removeActiveDirIfUnused(key: string, activeDir: string, ownPlants = 0): Promise<void> {
-  if (activeDirInUse(key, ownPlants)) return;
+async function removeActiveDirIfUnused(key: string, activeDir: string): Promise<void> {
+  if (activeDirInUse(key)) return;
   await fs.promises.rmdir(activeDir).catch(() => undefined);
 }
 
-function removeActiveDirIfUnusedSync(key: string, activeDir: string, ownPlants = 0): void {
-  if (activeDirInUse(key, ownPlants)) return;
+function removeActiveDirIfUnusedSync(key: string, activeDir: string): void {
+  if (activeDirInUse(key)) return;
   try {
     fs.rmdirSync(activeDir);
   } catch {
@@ -259,9 +263,12 @@ export async function acquireStorageActivityLease(
           await fs.promises.mkdir(activeDir, { recursive: true });
           await fs.promises.writeFile(marker, `${process.pid}\n`, { flag: 'w' });
         },
+        // Discard removes OUR MARKER and nothing else. Leaving an empty
+        // directory behind costs nothing (see removeActiveDirIfUnused); taking
+        // it would mean discounting our own registration, and that discount
+        // cannot tell itself apart from another planter's.
         async () => {
           await fs.promises.rm(marker, { force: true }).catch(() => undefined);
-          await removeActiveDirIfUnused(key, activeDir, 1);
         },
       );
 
@@ -330,11 +337,19 @@ export function plantStorageActivityMarker(resourceRoot: string, holderId: strin
   const activeDir = activeDirPath(resourceRoot);
   const marker = path.join(activeDir, markerName(`${holderId}-${process.pid}-${randomUUID()}`));
   const key = leaseKey(resourceRoot);
+  // Withdraw this marker and nothing else. Used from inside the plant retry
+  // and from the claim re-check below, where we are still (or were just)
+  // registered as planting — the one situation in which removing the shared
+  // directory cannot be justified. See removeActiveDirIfUnused.
   const discard = (): void => {
     fs.rmSync(marker, { force: true });
-    // An async lease or plant started on this root AFTER the early return
-    // above must not lose its directory here — same rule as release().
-    removeActiveDirIfUnusedSync(key, activeDir, plantsInFlight.has(key) ? 1 : 0);
+  };
+  // The returned release, by contrast, is a genuine last-user check: by then
+  // this planter is registered nowhere, so `activeDirInUse` answers about
+  // other parties only.
+  const releaseMarker = (): void => {
+    discard();
+    removeActiveDirIfUnusedSync(key, activeDir);
   };
   // Plant under the bounded ENOENT retry. A releasing holder's
   // `fs.promises.rmdir` runs its syscall on the libuv threadpool, so it can
@@ -367,7 +382,7 @@ export function plantStorageActivityMarker(resourceRoot: string, holderId: strin
   return () => {
     if (released) return;
     released = true;
-    discard();
+    releaseMarker();
   };
 }
 
