@@ -6,7 +6,9 @@ file records what the steps need that this install does not have yet.
 
 **Requires the provisioning port (tracked separately).** Apply step 1 is a
 precondition gate, so running the skill today stops there rather than
-half-installing.
+half-installing. The frontmatter description says so too, because descriptions
+are the discovery mechanism and an agent picking this skill for a live request
+would otherwise land in a workflow that cannot finish.
 
 ## Dependency
 

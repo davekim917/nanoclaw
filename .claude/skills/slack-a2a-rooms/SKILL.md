@@ -1,6 +1,6 @@
 ---
 name: slack-a2a-rooms
-description: Agent-to-agent Slack rooms — a group DM (MPIM) holding a human plus two or more NanoClaw sibling bots, where each bot hears the room over its own Socket Mode connection. Registers the admission policy on the Slack channel's bot-inbound guard so bot-authored inbound is admitted only for rooms allowlisted in SLACK_A2A_ROOMS (re-attributed as slack:bot:<bot_id>, hop-limited via SLACK_A2A_MAX_HOPS), plus scripts/open-a2a-room.ts to open a room and register it.
+description: NOT INSTALLABLE ON THIS HOST YET — needs src/channels/slack-a2a-guard.ts from the provisioning port; the apply gate stops, so do not select this to fulfil a request. Reference only. Agent-to-agent Slack rooms — a group DM (MPIM) holding a human plus two or more NanoClaw sibling bots, where each bot hears the room over its own Socket Mode connection. Registers the admission policy on the Slack channel's bot-inbound guard so bot-authored inbound is admitted only for rooms allowlisted in SLACK_A2A_ROOMS (re-attributed as slack:bot:<bot_id>, hop-limited via SLACK_A2A_MAX_HOPS), plus scripts/open-a2a-room.ts to open a room and register it.
 ---
 
 # Slack agent-to-agent rooms (SLACK_A2A_ROOMS)

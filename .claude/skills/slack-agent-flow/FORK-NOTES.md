@@ -54,6 +54,20 @@ them. Sampled and confirmed absent: `src/env-file.ts`,
 `container/skills/canvas-work/SKILL.md`,
 `container/skills/welcome/addenda/slack.md`.
 
+### Blocking conflicts with this fork's rules
+
+These are not missing substrate. They are places where upstream's shipped
+content and this install's standing rules disagree, so the provisioning port
+has to decide them rather than discover them.
+
+| What | Where | Tracked |
+|---|---|---|
+| The prerequisite puts `NANOCLAW_INSTALL_TOKEN` / `SLACK_MANAGER_TOKEN` in `.env`, and the provisioner reads them from disk. This fork keeps secrets in the OneCLI gateway, injected per request, never on disk — and a workspace-level app-creation token is as privileged as Slack credentials get. | `SKILL.md` prerequisites; `src/modules/slack-agent-flow/env-file.ts`, `provision.ts` | [#387](https://github.com/davekim917/nanoclaw/issues/387) |
+| `resolveRoomFamily` matches a room by name across **every** messaging group with no caller or workgroup scoping, and `ensureAgentRoom` opens and wires the replacement MPIM before the `callerInRoom` check runs. `add_to_room` can therefore pull another workgroup's room and its members across the data-pool boundary. | `src/modules/slack-agent-flow/room-actions.ts` (`resolveRoomFamily`) | [#388](https://github.com/davekim917/nanoclaw/issues/388) |
+
+Neither is reachable today, because both apply gates stop the install. Both
+become live the moment the port makes it applicable.
+
 ### Runtime credential
 
 The flow's prerequisites call for `NANOCLAW_INSTALL_TOKEN` (managed broker) or
