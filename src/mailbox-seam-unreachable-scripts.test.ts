@@ -359,6 +359,21 @@ function discoverRelativeModules(filePath: string, root: string = REPO_ROOT): st
     failClosed(sourceFile, filePath, 'unresolvable relative import', node, specifierText);
   }
 
+  // The five ts.SyntaxKind shapes this visitor treats as module edges — every
+  // other node kind (a plain call, a type reference, a class, …) creates no
+  // module-graph edge at all and falls through to the unconditional
+  // ts.forEachChild(node, visit) recursion below, so this list IS the
+  // coverage claim, not just a subset of it:
+  //   - ImportDeclaration        `import ... from '<module>'`
+  //   - ExportDeclaration        `export ... from '<module>'`
+  //   - ImportKeyword call       dynamic `import('<module>')`
+  //   - a CallExpression to the identifier `require`
+  //   - ImportEqualsDeclaration  `import x = require('<module>')` /
+  //                              `import x = SomeNamespace.Member` — see
+  //                              below; TypeScript's own CommonJS-interop
+  //                              form, never used in this repo's ESM host
+  //                              code, so ANY occurrence fails closed
+  //                              unconditionally rather than being parsed.
   function visit(node: ts.Node): void {
     if (ts.isImportDeclaration(node)) {
       const specifierText = literalSpecifierText(node.moduleSpecifier);
@@ -386,6 +401,14 @@ function discoverRelativeModules(filePath: string, root: string = REPO_ROOT): st
       // repo-relative manifest at all.
     } else if (ts.isCallExpression(node) && ts.isIdentifier(node.expression) && node.expression.text === 'require') {
       failClosed(sourceFile, filePath, 'unexpected require() call', node);
+    } else if (ts.isImportEqualsDeclaration(node)) {
+      // `import x = require('./m.js')` (CommonJS interop) or
+      // `import x = SomeNamespace.Member` — either way a module-graph edge
+      // (or an internal alias) this visitor doesn't parse, in code this
+      // repo's ESM host (see CLAUDE.md "Module System (host)") and its own
+      // `@typescript-eslint/no-require-imports` lint rule already ban. The
+      // tripwire agrees with the lint rule rather than silently skipping.
+      failClosed(sourceFile, filePath, 'import-equals declaration', node);
     }
     ts.forEachChild(node, visit);
   }
@@ -542,6 +565,24 @@ describe('discoverRelativeModules — NodeNext extension mapping and fail-closed
 
     expect(() => discoverRelativeModules('entry.ts', dir)).toThrow(
       'unresolvable relative import in a manifest-pinned file: entry.ts:2 ./nope.mjs',
+    );
+  });
+
+  // Codex on 74f344d0: `import x = require('./m.js')` — an
+  // ImportEqualsDeclaration, TypeScript's own CommonJS-interop import form —
+  // is a node kind this visitor never checked for at all, so it fell
+  // straight through to the unconditional forEachChild recursion with no
+  // edge recorded and no failure, even though it's an unconditional ban
+  // under this repo's `@typescript-eslint/no-require-imports` (host code is
+  // ESM). Fails closed unconditionally now, without even inspecting the
+  // module reference.
+  it('fails closed on any import-equals declaration, unconditionally', () => {
+    const dir = tmpDir('nodenext-import-equals');
+    fs.writeFileSync(dir + '/entry.ts', ["import m = require('./helper.js');", 'void m;', ''].join('\n'));
+    fs.writeFileSync(dir + '/helper.ts', 'export const x = 1;\n');
+
+    expect(() => discoverRelativeModules('entry.ts', dir)).toThrow(
+      'import-equals declaration in a manifest-pinned file: entry.ts:1',
     );
   });
 });
