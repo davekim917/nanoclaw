@@ -16,12 +16,30 @@ import { describe, expect, it } from 'vitest';
 
 import { allowSubprocess, enforceHermeticity } from '../src/test-hermeticity.js';
 
-allowSubprocess(['node', 'git']);
+allowSubprocess(['node', 'bun', 'git']);
 enforceHermeticity();
 
 const SCRIPT = path.resolve('.claude/skills/pr-review-loop/scripts/review-churn.mjs');
 const CONTAINER_SCRIPT = path.resolve('container/skills/pr-review-loop/scripts/review-churn.mjs');
 const FIXTURES = path.resolve('scripts/__fixtures__/review-churn');
+
+// The classifier runs on the host under node and inside agent containers under
+// bun, so the cross-runtime case needs both. Missing bun is an error, not a
+// skip: the property it checks — that the two runtimes decide identically — is
+// the whole reason the deny set is a frozen list.
+function bunBinary(): string {
+  const candidates = [
+    ...(process.env.PATH ?? '')
+      .split(path.delimiter)
+      .filter(Boolean)
+      .map((dir) => path.join(dir, 'bun')),
+    path.join(process.env.HOME ?? '', '.bun/bin/bun'),
+    '/usr/local/bin/bun',
+  ];
+  const found = candidates.find((candidate) => fs.existsSync(candidate));
+  if (!found) throw new Error('bun is required for the cross-runtime case; install it or put it on PATH');
+  return found;
+}
 
 interface Site {
   file: string;
@@ -172,6 +190,47 @@ describe('review-churn classifier', () => {
     const churning = classify(fixture('builtin-with-real-seam')).classes.filter((c) => c.rounds >= 3);
     expect(churning[0].seam).toBe('src/mailbox/write.ts');
     expect(churning[0].primitives).toContain('writeSessionMessage');
+  });
+
+  it('keeps a real dependency seam-eligible, builtins around it notwithstanding', () => {
+    // `undici` is a direct dependency of this repo AND a name bun reports as a
+    // builtin. Its sites here also share `fs` and `node:test`, so the two
+    // categories are exercised together.
+    const churning = classify(fixture('undici-seam')).classes.filter((c) => c.rounds >= 3);
+    expect(churning).toHaveLength(1);
+    expect(churning[0].seam).toBe('undici');
+    expect(churning[0].primitives).toContain('requestWithPool');
+  });
+
+  it('decides identically under node and under bun', () => {
+    // The deny set is a frozen list of Node core specifiers, never the
+    // executing runtime's `builtinModules`: bun reports `undici`, `ws` and
+    // `bun` as builtins and node does not, so a runtime-derived set gave one
+    // payload two verdicts — a class seamed on `undici` refused a push on the
+    // host and passed in a container.
+    const bun = bunBinary();
+    for (const name of ['undici-seam', 'builtin-seam', 'builtin-with-real-seam']) {
+      const payload = fixture(name);
+      const underNode = spawn(['classify', '--json'], payload);
+      const underBun = spawnSync(bun, [SCRIPT, 'classify', '--json'], {
+        input: JSON.stringify(payload),
+        encoding: 'utf8',
+      });
+      expect(underNode.status, `node failed on ${name}`).toBe(0);
+      expect(underBun.status, `bun failed on ${name}: ${underBun.stderr}`).toBe(0);
+      expect(JSON.parse(underBun.stdout), `${name} classifies differently under bun`).toEqual(
+        JSON.parse(underNode.stdout),
+      );
+    }
+  });
+
+  it('does not derive the deny set from whatever runtime is executing it', () => {
+    // A structural guard, because the cross-runtime case above can only catch
+    // the disagreements those two runtimes happen to have today.
+    const source = fs.readFileSync(SCRIPT, 'utf8');
+    const code = source.replace(/^\s*(\/\/.*|\*.*|\/\*.*)$/gm, '');
+    expect(code).not.toContain('builtinModules');
+    expect(code).not.toContain("from 'node:module'");
   });
 
   it('reads severity direction per seam, not per finding', () => {

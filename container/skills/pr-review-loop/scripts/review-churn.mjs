@@ -49,7 +49,6 @@
  */
 import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
-import { builtinModules } from 'node:module';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -95,19 +94,78 @@ const STOPWORDS = new Set(
 // type-only packages carry no shared write/wake/read primitive.
 //
 // The `node:` prefix stays an unconditional reject and is NOT delegated to the
-// list below: prefix-only builtins (`node:test`, `node:sqlite`) are absent from
-// `builtinModules` on both runtimes this file runs on, so a list-only check
-// would let them through.
+// list below: prefix-only builtins (`node:test`, `node:sqlite`, `node:sea`) are
+// absent from every runtime's builtin list, and their bare forms — `test`,
+// `sqlite` — are ordinary npm package names that must stay eligible.
 const SEAM_SPEC_DENY = /^(?:node:|vitest$|bun:|@types\/)/;
 
-// The list covers the other half: most of this tree writes builtins bare
-// (`import path from 'path'`), and a bare builtin is a specifier nearly every
-// file shares — exactly what the seam ranking rewards. A class seamed on `path`
-// is worse than a class with no seam: nothing a diff touches can lift it, so
-// only the reframe trailer could, which reads as the gate refusing the very
-// work that fixed the defect. Taken from `node:module` rather than hand-kept so
-// it cannot drift as Node adds modules.
-const NODE_BUILTINS = new Set(builtinModules.map((name) => name.replace(/^node:/, '')));
+// The bare names, as a FROZEN list of Node core specifiers rather than the
+// executing runtime's `builtinModules`. The two are not the same set: Bun
+// reports its compatibility packages — `undici`, `ws`, `bun` — as builtins, and
+// `undici` is a real dependency imported across this repo. Deriving the deny
+// set from the runtime therefore made the host and the container disagree about
+// the same payload: a three-round class seamed on `undici` refused a push on
+// the host and passed inside a container. A gate that answers differently
+// depending on who runs it is not a gate.
+//
+// Node core changes about once a year; a wrong answer here costs a seam
+// candidate, not correctness of the round count.
+const NODE_BUILTINS = new Set([
+  'assert',
+  'assert/strict',
+  'async_hooks',
+  'buffer',
+  'child_process',
+  'cluster',
+  'console',
+  'constants',
+  'crypto',
+  'dgram',
+  'diagnostics_channel',
+  'dns',
+  'dns/promises',
+  'domain',
+  'events',
+  'fs',
+  'fs/promises',
+  'http',
+  'http2',
+  'https',
+  'inspector',
+  'inspector/promises',
+  'module',
+  'net',
+  'os',
+  'path',
+  'path/posix',
+  'path/win32',
+  'perf_hooks',
+  'process',
+  'punycode',
+  'querystring',
+  'readline',
+  'readline/promises',
+  'repl',
+  'stream',
+  'stream/consumers',
+  'stream/promises',
+  'stream/web',
+  'string_decoder',
+  'sys',
+  'timers',
+  'timers/promises',
+  'tls',
+  'trace_events',
+  'tty',
+  'url',
+  'util',
+  'util/types',
+  'v8',
+  'vm',
+  'wasi',
+  'worker_threads',
+  'zlib',
+]);
 
 function seamCandidate(spec) {
   if (SEAM_SPEC_DENY.test(spec)) return false;

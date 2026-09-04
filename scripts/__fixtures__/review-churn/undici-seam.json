@@ -1,0 +1,43 @@
+{
+  "_comment": "Three rounds of one class whose sites share a real dependency, `undici`, alongside the builtins `fs` and `node:test`. Bun reports `undici` and `ws` as builtins and Node does not, so a deny set taken from the executing runtime would refuse this seam in a container and accept it on the host \u2014 the same payload, two verdicts. `undici` must stay seam-eligible on both.",
+  "findings": [
+    {
+      "threadId": "U1",
+      "commentId": 500,
+      "reviewId": "PRR_U0",
+      "createdAt": "2026-09-01T01:00:00Z",
+      "path": "src/one.ts",
+      "line": 10,
+      "isResolved": false,
+      "isOutdated": false,
+      "body": "**<sub><sub>![P1 Badge](https://img.shields.io/badge/P1-orange?style=flat)</sub></sub>  Revalidate the agent after the await**\n\nThe pool is read before the await and `requestWithPool` runs after it, so a concurrent close wins the race and nothing revalidates the agent in between."
+    },
+    {
+      "threadId": "U2",
+      "commentId": 501,
+      "reviewId": "PRR_U1",
+      "createdAt": "2026-09-01T02:00:00Z",
+      "path": "src/two.ts",
+      "line": 20,
+      "isResolved": false,
+      "isOutdated": false,
+      "body": "**<sub><sub>![P1 Badge](https://img.shields.io/badge/P1-orange?style=flat)</sub></sub>  Revalidate the agent after the await**\n\nThe pool is read before the await and `requestWithPool` runs after it, so a concurrent close wins the race and nothing revalidates the agent in between."
+    },
+    {
+      "threadId": "U3",
+      "commentId": 502,
+      "reviewId": "PRR_U2",
+      "createdAt": "2026-09-01T03:00:00Z",
+      "path": "src/three.ts",
+      "line": 30,
+      "isResolved": false,
+      "isOutdated": false,
+      "body": "**<sub><sub>![P1 Badge](https://img.shields.io/badge/P1-orange?style=flat)</sub></sub>  Revalidate the agent after the await**\n\nThe pool is read before the await and `requestWithPool` runs after it, so a concurrent close wins the race and nothing revalidates the agent in between."
+    }
+  ],
+  "sources": {
+    "src/one.ts": "import fs from 'fs';\nimport { test } from 'node:test';\nimport { requestWithPool } from 'undici';\n",
+    "src/two.ts": "import fs from 'fs';\nimport { test } from 'node:test';\nimport { requestWithPool } from 'undici';\n",
+    "src/three.ts": "import fs from 'fs';\nimport { test } from 'node:test';\nimport { requestWithPool } from 'undici';\n"
+  }
+}
