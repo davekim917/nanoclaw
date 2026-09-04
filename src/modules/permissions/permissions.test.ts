@@ -307,6 +307,30 @@ describe('ensureUserDm', () => {
     expect(getMessagingGroup(mg!.id)?.instance).toBe('slack');
   });
 
+  it('does not reuse a sibling instance row for the same platform_id', async () => {
+    // Direct-addressable channels make platform_id the user's own handle, so
+    // it is identical across bots. An existing row under a sibling instance
+    // must not be adopted: dispatching on its exact instance would reach the
+    // wrong bot with the wrong token.
+    await mountMockAdapter('telegram', undefined, 'telegram-bot-a');
+    seedUser('telegram:U-owner', 'telegram');
+
+    createMessagingGroup({
+      id: 'mg-sibling',
+      channel_type: 'telegram',
+      instance: 'telegram-bot-b',
+      platform_id: 'U-owner',
+      name: 'Sibling bot DM',
+      is_group: 0,
+      unknown_sender_policy: 'strict',
+      created_at: now(),
+    });
+
+    const mg = await ensureUserDm('telegram:U-owner', 'telegram-bot-a');
+    expect(mg!.id).not.toBe('mg-sibling');
+    expect(getMessagingGroup(mg!.id)?.instance).toBe('telegram-bot-a');
+  });
+
   it('returns null when the adapter is not registered', async () => {
     seedUser('missing:42', 'missing');
     expect(await ensureUserDm('missing:42')).toBeNull();

@@ -97,8 +97,17 @@ export async function ensureUserDm(userId: string, instance?: string): Promise<M
 
   // Find-or-create the underlying messaging_group. A DM we received
   // earlier may already have a row matching (channel_type, platform_id).
+  //
+  // Scoped to the requested instance. Without it this lookup resolves
+  // default-instance-first and then the lexically-first NAMED instance, so on
+  // a multi-bot direct-addressable channel — where platform_id is the user's
+  // handle and therefore identical across bots — it returns a sibling's row
+  // and the instance we were asked for is silently discarded. The caller then
+  // dispatches on that row's exact instance and reaches the wrong bot. The
+  // table is UNIQUE(channel_type, platform_id, instance), so a per-instance
+  // row is the intended shape; exact-only here means a miss creates one.
   const now = new Date().toISOString();
-  let mg = getMessagingGroupByPlatform(channelType, dmPlatformId);
+  let mg = getMessagingGroupByPlatform(channelType, dmPlatformId, instance);
   if (!mg) {
     const mgId = `mg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     mg = {
