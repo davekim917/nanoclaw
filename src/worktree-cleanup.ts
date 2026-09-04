@@ -1181,9 +1181,10 @@ function overlapsAny(target: string, mounts: string[]): boolean {
  * (its registration is still valid there, so the checkout works immediately).
  * If the destination is already occupied (the agent beat us to it), keep the
  * live copy and trash the quarantined one — safe per the precondition above.
- * If anything couldn't be put back valid, prune every repo's canonical
- * registration afterward so nothing dangles against a missing path (pruning
- * a repo that WAS restored cleanly is a harmless no-op — its path exists).
+ * If one repo copy cannot be restored and is successfully trashed, remove
+ * only that exact missing checkout's canonical registration afterward. A
+ * repository-wide prune is forbidden here: another missing registration can
+ * still hold the only copy of an agent's staged index.
  */
 function reconcileQuarantine(candidate: GcCandidate, quarantinePath: string, dataDir: string): void {
   // Never let the recovery marker itself land back inside a restored topic.
@@ -1193,7 +1194,7 @@ function reconcileQuarantine(candidate: GcCandidate, quarantinePath: string, dat
     // Best-effort — a leftover marker is a leak, not a correctness issue.
   }
   const repos = (safeDirectories(path.join(quarantinePath, 'worktrees')) ?? []).filter(isRepositoryName);
-  let stranded = repos.length === 0 && fs.existsSync(quarantinePath); // no per-repo split known — see fallback below
+  const pendingRemovals: PendingWorktreeRemoval[] = [];
 
   if (repos.length > 0) {
     const destWorktrees = path.join(candidate.path, 'worktrees');
@@ -1206,7 +1207,6 @@ function reconcileQuarantine(candidate: GcCandidate, quarantinePath: string, dat
           repo,
           to,
         });
-        stranded = true;
         // A locked copy restores, never trashes — leave it in quarantine
         // rather than destroy something explicitly marked "don't touch".
         if (isWorktreeLocked(from)) {
@@ -1217,6 +1217,11 @@ function reconcileQuarantine(candidate: GcCandidate, quarantinePath: string, dat
         } else {
           try {
             trashPath(from);
+            pendingRemovals.push({
+              workgroupId: path.basename(path.dirname(candidate.path)),
+              repo,
+              worktreePath: to,
+            });
           } catch (err) {
             log.error('Storage GC: could not trash a superseded quarantine repo copy', { repo, from, err });
           }
@@ -1232,9 +1237,9 @@ function reconcileQuarantine(candidate: GcCandidate, quarantinePath: string, dat
           to,
           err,
         });
-        stranded = true;
         try {
           trashPath(from);
+          pendingRemovals.push({ workgroupId: path.basename(path.dirname(candidate.path)), repo, worktreePath: to });
         } catch (trashErr) {
           log.error('Storage GC: could not even trash the stranded quarantine repo copy', {
             repo,
@@ -1256,7 +1261,6 @@ function reconcileQuarantine(candidate: GcCandidate, quarantinePath: string, dat
     // No repo split to reconcile — fall back to a whole-topic restore.
     try {
       fs.renameSync(quarantinePath, candidate.path);
-      stranded = false;
     } catch (err) {
       log.error('Storage GC: idle-topic rollback rename failed; trashing the quarantined copy instead', {
         quarantinePath,
@@ -1271,15 +1275,11 @@ function reconcileQuarantine(candidate: GcCandidate, quarantinePath: string, dat
     }
   }
 
-  if (stranded) {
-    const workgroupId = path.basename(path.dirname(candidate.path));
-    for (const repo of safeDirectories(path.join(candidate.path, 'worktrees')) ?? []) {
-      if (!isRepositoryName(repo)) continue;
-      if (git(canonicalRepoDir(workgroupId, repo, dataDir), ['worktree', 'prune']) === null) {
-        log.warn('Storage GC: git worktree prune failed after idle-topic rollback; may need a manual prune', {
-          workgroupId,
-          repo,
-        });
+  for (const pending of pendingRemovals) {
+    if (!removeMissingWorktreeRegistration(pending, dataDir)) {
+      const prior = readPendingPrunes(dataDir);
+      if (!writePendingPrunes(dataDir, [...prior, pending])) {
+        log.error('Storage GC: could not journal an exact rollback deregistration retry', { ...pending });
       }
     }
   }
@@ -1292,15 +1292,17 @@ function laterThan(a: number | null, b: number | null): boolean {
   return b > a;
 }
 
-/** Durable record of canonical-repo prunes a trash is (or was) about to require.
- *  See #185: a crash between a successful trash and the prune loop that
+/** Durable record of exact linked-worktree removals a trash is (or was) about to require.
+ *  See #185: a crash between a successful trash and the deregistration loop that
  *  follows it would otherwise leave a dangling `.git/worktrees/<name>`
  *  registration with nothing to find it. */
 const PENDING_PRUNE_FILE = '.gc-pending-prunes.json';
 
-interface PendingPrune {
+interface PendingWorktreeRemoval {
   workgroupId: string;
   repo: string;
+  /** Added in v2. Older journals omitted this and are recovered conservatively. */
+  worktreePath?: string;
 }
 
 function pendingPrunePath(dataDir: string): string {
@@ -1308,11 +1310,13 @@ function pendingPrunePath(dataDir: string): string {
 }
 
 /** Best-effort — a journal read failure only costs the crash-recovery safety
- *  net for this pass; the prune loop that follows still runs regardless. */
-function readPendingPrunes(dataDir: string): PendingPrune[] {
+ *  net for this pass; the exact deregistration loop still runs regardless. */
+function readPendingPrunes(dataDir: string): PendingWorktreeRemoval[] {
   try {
     const raw: unknown = JSON.parse(fs.readFileSync(pendingPrunePath(dataDir), 'utf8'));
-    return Array.isArray(raw) ? (raw as PendingPrune[]) : [];
+    return Array.isArray(raw)
+      ? (raw.filter((entry) => typeof entry === 'object' && entry !== null) as PendingWorktreeRemoval[])
+      : [];
   } catch {
     return [];
   }
@@ -1321,7 +1325,7 @@ function readPendingPrunes(dataDir: string): PendingPrune[] {
 /** Returns whether the write actually landed — callers that are about to
  *  trash something the journal is meant to protect must abort on `false`
  *  rather than proceed without a durable record (Codex P2). */
-function writePendingPrunes(dataDir: string, entries: PendingPrune[]): boolean {
+function writePendingPrunes(dataDir: string, entries: PendingWorktreeRemoval[]): boolean {
   const target = pendingPrunePath(dataDir);
   try {
     if (entries.length === 0) {
@@ -1341,23 +1345,200 @@ function writePendingPrunes(dataDir: string, entries: PendingPrune[]): boolean {
   }
 }
 
+interface MissingWorktreeAdminRecord {
+  adminDir: string;
+  owner: string;
+}
+
+/** Read Git's private linked-worktree records without allowing `prune` to
+ * make a repository-wide deletion decision for us. */
+function linkedWorktreeAdminRecords(canonical: string): MissingWorktreeAdminRecord[] | null {
+  try {
+    const gitDir = fs.lstatSync(path.join(canonical, '.git'));
+    if (!gitDir.isDirectory() || gitDir.isSymbolicLink()) return null;
+  } catch {
+    return null;
+  }
+  const root = path.join(canonical, '.git', 'worktrees');
+  let entries: fs.Dirent[];
+  try {
+    const stat = fs.lstatSync(root);
+    if (!stat.isDirectory() || stat.isSymbolicLink()) return null;
+    entries = fs.readdirSync(root, { withFileTypes: true });
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'ENOENT' ? [] : null;
+  }
+  const records: MissingWorktreeAdminRecord[] = [];
+  try {
+    for (const entry of entries) {
+      if (!entry.isDirectory() || entry.isSymbolicLink()) return null;
+      const adminDir = path.join(root, entry.name);
+      const pointer = path.join(adminDir, 'gitdir');
+      const stat = fs.lstatSync(pointer);
+      if (!stat.isFile() || stat.isSymbolicLink()) return null;
+      const gitdir = fs.readFileSync(pointer, 'utf8').trim();
+      if (!path.isAbsolute(gitdir) || path.basename(gitdir) !== '.git') return null;
+      records.push({ adminDir, owner: path.dirname(path.resolve(gitdir)) });
+    }
+    return records;
+  } catch {
+    return null;
+  }
+}
+
+function linkedIndexMatchesHead(canonical: string, adminDir: string): boolean | null {
+  try {
+    execFileSync('git', safeGitArgs([`--git-dir=${adminDir}`, 'diff-index', '--cached', '--quiet', 'HEAD', '--']), {
+      cwd: canonical,
+      env: safeGitEnv(),
+      stdio: 'pipe',
+      timeout: 30_000,
+    });
+    return true;
+  } catch (error) {
+    if ((error as { status?: number }).status === 1) return false;
+    return null;
+  }
+}
+
+function pathIsMissing(target: string): boolean | null {
+  try {
+    fs.lstatSync(target);
+    return false;
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === 'ENOENT' || code === 'ENOTDIR') return true;
+    return null;
+  }
+}
+
+function linkedAdminIsLocked(adminDir: string): boolean | null {
+  try {
+    fs.lstatSync(path.join(adminDir, 'locked'));
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false;
+    return null;
+  }
+}
+
+/** Remove one exact missing registration only after re-proving that its
+ * private index has no staged state and no explicit lock. The branch ref and
+ * every commit remain intact. */
+function removeMissingWorktreeRegistration(entry: PendingWorktreeRemoval, dataDir: string): boolean {
+  if (
+    typeof entry.workgroupId !== 'string' ||
+    typeof entry.repo !== 'string' ||
+    typeof entry.worktreePath !== 'string' ||
+    !path.isAbsolute(entry.worktreePath) ||
+    path.basename(entry.worktreePath) !== entry.repo ||
+    path.basename(path.dirname(entry.worktreePath)) !== 'worktrees'
+  ) {
+    return false;
+  }
+  let restoreEmptyDirectory = false;
+  const missing = pathIsMissing(entry.worktreePath);
+  if (missing === null) return false;
+  if (!missing) {
+    try {
+      const stat = fs.lstatSync(entry.worktreePath);
+      if (!stat.isDirectory() || stat.isSymbolicLink() || fs.readdirSync(entry.worktreePath).length !== 0) return false;
+      // A spawn can recreate an empty topic slot before rollback completes.
+      // rmdir is the atomic proof that it still contains no agent data. Put
+      // the placeholder back after Git releases the stale registration.
+      fs.rmdirSync(entry.worktreePath);
+      restoreEmptyDirectory = true;
+    } catch {
+      return false;
+    }
+  }
+  const restorePlaceholder = (): boolean => {
+    if (!restoreEmptyDirectory) return true;
+    try {
+      fs.mkdirSync(entry.worktreePath!, { recursive: true });
+      return true;
+    } catch (error) {
+      log.warn('Storage GC: could not restore an empty topic placeholder after deregistration', {
+        worktreePath: entry.worktreePath,
+        error,
+      });
+      return false;
+    }
+  };
+  let canonical: string;
+  try {
+    canonical = canonicalRepoDir(entry.workgroupId, entry.repo, dataDir);
+  } catch {
+    restorePlaceholder();
+    return false;
+  }
+  const records = linkedWorktreeAdminRecords(canonical);
+  if (records === null) {
+    restorePlaceholder();
+    return false;
+  }
+  const target = records.find((record) => path.resolve(record.owner) === path.resolve(entry.worktreePath!));
+  if (!target) {
+    return restorePlaceholder();
+  }
+  if (linkedAdminIsLocked(target.adminDir) !== false || linkedIndexMatchesHead(canonical, target.adminDir) !== true) {
+    restorePlaceholder();
+    return false;
+  }
+  if (git(canonical, ['worktree', 'remove', '--force', target.owner]) === null) {
+    restorePlaceholder();
+    return false;
+  }
+  const after = linkedWorktreeAdminRecords(canonical);
+  const removed = after !== null && !after.some((record) => path.resolve(record.owner) === path.resolve(target.owner));
+  return restorePlaceholder() && removed;
+}
+
+/** Pre-exact-path journals can only name a canonical repository. Recover them
+ * without global prune by removing every missing registration that independently
+ * proves unlocked and index-clean. Locked or staged records are intentionally
+ * preserved; they cannot be the clean checkout the GC journaled before trash. */
+function completeLegacyPendingRemoval(entry: PendingWorktreeRemoval, dataDir: string): boolean {
+  if (typeof entry.workgroupId !== 'string' || typeof entry.repo !== 'string') return false;
+  let canonical: string;
+  try {
+    canonical = canonicalRepoDir(entry.workgroupId, entry.repo, dataDir);
+  } catch {
+    return false;
+  }
+  const records = linkedWorktreeAdminRecords(canonical);
+  if (records === null) return false;
+  for (const record of records) {
+    const missing = pathIsMissing(record.owner);
+    const locked = linkedAdminIsLocked(record.adminDir);
+    if (missing === null || locked === null) return false;
+    if (!missing || locked) continue;
+    const clean = linkedIndexMatchesHead(canonical, record.adminDir);
+    if (clean === null) return false;
+    if (!clean) continue;
+    if (git(canonical, ['worktree', 'remove', '--force', record.owner]) === null) return false;
+  }
+  return true;
+}
+
 /**
- * Finish any per-repo prune left pending by a crash between a successful
+ * Finish any exact deregistration left pending by a crash between a successful
  * trash and the deregistration loop that follows it (#185). Run once at the
- * start of every apply pass, same shape as recoverOrphanedQuarantine: retry,
- * and only clear an entry once `git worktree prune` actually succeeds — a
- * repeat failure just stays journaled for the next pass, exactly the
- * "may need a manual prune" state a non-crash prune failure already leaves.
+ * start of every apply pass, same shape as recoverOrphanedQuarantine. A repeat
+ * failure stays journaled for the next pass; no operator command is required.
  */
 function runPendingPrunes(dataDir: string): void {
   const pending = readPendingPrunes(dataDir);
   if (pending.length === 0) return;
-  const remaining = pending.filter(({ workgroupId, repo }) => {
-    if (git(canonicalRepoDir(workgroupId, repo, dataDir), ['worktree', 'prune']) === null) {
-      log.warn('Storage GC: pending prune still failing; retrying next pass', { workgroupId, repo });
+  const remaining = pending.filter((entry) => {
+    const completed = entry.worktreePath
+      ? removeMissingWorktreeRegistration(entry, dataDir)
+      : completeLegacyPendingRemoval(entry, dataDir);
+    if (!completed) {
+      log.warn('Storage GC: pending targeted deregistration still failing; retrying next pass', { ...entry });
       return true;
     }
-    log.warn('Storage GC: completed a prune left pending by an interrupted pass', { workgroupId, repo });
+    log.warn('Storage GC: completed a targeted deregistration left pending by an interrupted pass', { ...entry });
     return false;
   });
   writePendingPrunes(dataDir, remaining);
@@ -1576,12 +1757,19 @@ function finalizeIdleCollection(candidate: GcCandidate, dataDir: string): { ok: 
     return { ok: false, reason: 'aborted-late-activity' };
   }
 
-  // #185: journal the prunes this trash is about to require BEFORE trashing,
+  // #185: journal the exact deregistrations this trash is about to require BEFORE trashing,
   // so a crash between the trash succeeding and the loop below finishing
   // leaves a durable record instead of a silently dangling registration.
   // runPendingPrunes sweeps this at the start of the next apply pass.
   const priorPending = readPendingPrunes(dataDir);
-  const journaled = writePendingPrunes(dataDir, [...priorPending, ...repos.map((repo) => ({ workgroupId, repo }))]);
+  const journaled = writePendingPrunes(dataDir, [
+    ...priorPending,
+    ...repos.map((repo) => ({
+      workgroupId,
+      repo,
+      worktreePath: path.join(candidate.path, 'worktrees', repo),
+    })),
+  ]);
   if (!journaled) {
     // Codex P2: a read-only dataDir or ENOSPC here must not fall through to
     // trashing anyway — that's exactly the crash-without-a-record window
@@ -1590,7 +1778,7 @@ function finalizeIdleCollection(candidate: GcCandidate, dataDir: string): { ok: 
     return { ok: false, reason: 'aborted-prune-journal-unwritable' };
   }
 
-  // Genuinely clear — commit the delete FIRST. Prune runs only once that
+  // Genuinely clear — commit the delete FIRST. Deregistration runs only once that
   // succeeds (Codex P2): a trash failure below leaves every canonical
   // registration untouched, so the restored checkout stays usable.
   try {
@@ -1606,24 +1794,30 @@ function finalizeIdleCollection(candidate: GcCandidate, dataDir: string): { ok: 
     throw err;
   }
 
-  // Deregister each repo's linked worktree from its CANONICAL repo, so a
+  // Deregister each exact linked worktree from its CANONICAL repo, so a
   // resumed thread's later create_worktree doesn't hit git's "already
   // checked out at <missing-path>" error against a stale registration. Safe
-  // unconditionally: container-runner.ts's mount comment documents that
-  // topic worktree registrations always use exact host paths on both sides
-  // (no container-relative back-pointer can land in them), so `worktree
-  // prune` only ever removes entries whose path is genuinely gone — which,
-  // for this repo, is now true.
+  // because the checkout was proven disposable before trash and the helper
+  // re-proves that the private linked index is clean and unlocked. Never use
+  // repository-wide prune: unrelated missing owners may retain staged work.
   for (const repo of repos) {
-    if (git(canonicalRepoDir(workgroupId, repo, dataDir), ['worktree', 'prune']) === null) {
-      log.warn('Storage GC: git worktree prune failed after idle collection; may need a manual prune', {
-        workgroupId,
-        repo,
-      });
+    const pending = {
+      workgroupId,
+      repo,
+      worktreePath: path.join(candidate.path, 'worktrees', repo),
+    };
+    if (!removeMissingWorktreeRegistration(pending, dataDir)) {
+      log.warn(
+        'Storage GC: targeted worktree deregistration failed after idle collection; retry is journaled',
+        pending,
+      );
     } else {
       writePendingPrunes(
         dataDir,
-        readPendingPrunes(dataDir).filter((e) => !(e.workgroupId === workgroupId && e.repo === repo)),
+        readPendingPrunes(dataDir).filter(
+          (entry) =>
+            !(entry.workgroupId === workgroupId && entry.repo === repo && entry.worktreePath === pending.worktreePath),
+        ),
       );
     }
   }

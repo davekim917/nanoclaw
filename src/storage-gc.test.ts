@@ -16,9 +16,9 @@ const state = vi.hoisted(() => ({
   rowsPerCall: null as Array<Array<Record<string, string | null>>> | null,
   call: 0,
   failAtCall: null as number | null,
-  /** Codex P2 test only: make the NEXT `git worktree prune` call fail, then
+  /** Make the NEXT targeted `git worktree remove` call fail, then
    *  self-clear — everything else passes through to the real execFileSync. */
-  failPruneOnce: false,
+  failRemovalOnce: false,
 }));
 
 vi.mock('child_process', async (importOriginal) => {
@@ -27,9 +27,15 @@ vi.mock('child_process', async (importOriginal) => {
     ...actual,
     execFileSync: (...args: Parameters<typeof actual.execFileSync>) => {
       const [file, fileArgs] = args;
-      if (state.failPruneOnce && file === 'git' && Array.isArray(fileArgs) && fileArgs.includes('prune')) {
-        state.failPruneOnce = false;
-        throw new Error('simulated: sweep prune still failing');
+      if (
+        state.failRemovalOnce &&
+        file === 'git' &&
+        Array.isArray(fileArgs) &&
+        fileArgs.includes('worktree') &&
+        fileArgs.includes('remove')
+      ) {
+        state.failRemovalOnce = false;
+        throw new Error('simulated: targeted deregistration still failing');
       }
       return actual.execFileSync(...args);
     },
@@ -264,7 +270,7 @@ beforeEach(() => {
   state.rowsPerCall = null;
   state.call = 0;
   state.failAtCall = null;
-  state.failPruneOnce = false;
+  state.failRemovalOnce = false;
   delete process.env.NANOCLAW_STORAGE_GC;
   delete process.env.NANOCLAW_TOPIC_IDLE_RECLAIM_DAYS;
 });
@@ -755,7 +761,7 @@ describe('storage GC — apply mode', () => {
     expect(find(report, topicDir)).toMatchObject({ collect: true, reason: 'idle-and-clean' });
     expect(fs.existsSync(topicDir)).toBe(false);
     // The canonical repo no longer lists the collected worktree...
-    expect(git(canonical, ['worktree', 'list'])).not.toContain(branch);
+    expect(git(canonical, ['worktree', 'list', '--porcelain'])).not.toContain(`branch refs/heads/${branch}\n`);
     // ...so a resumed thread's create_worktree (same branch, fresh path) works.
     expect(() => git(canonical, ['worktree', 'add', '-q', worktree, branch])).not.toThrow();
   });
@@ -1097,21 +1103,84 @@ describe('storage GC — apply mode', () => {
     expect(git(canonical, ['worktree', 'list'])).toContain(branch);
   });
 
-  it.skipIf(!hasTrash)('#185: sweeps and finishes a prune left dangling by a crash between trash and dereg', () => {
-    const { topicDir, worktree, canonical, branch } = topicFixture('thread-idle-prunecrash');
+  it.skipIf(!hasTrash)(
+    '#185: finishes one exact deregistration without touching an unrelated missing staged index',
+    () => {
+      const { topicDir, worktree, canonical, branch } = topicFixture('thread-idle-prunecrash');
+      const repo = path.basename(worktree);
+      const stagedTopic = path.join(path.dirname(topicDir), 'unrelated-staged-topic');
+      const stagedWorktree = path.join(stagedTopic, 'worktrees', repo);
+      fs.mkdirSync(path.dirname(stagedWorktree), { recursive: true });
+      git(canonical, ['worktree', 'add', '-q', '-b', `${branch}-staged`, stagedWorktree, 'origin/HEAD']);
+      fs.writeFileSync(path.join(stagedWorktree, 'only-in-index.txt'), 'must survive\n');
+      git(stagedWorktree, ['add', 'only-in-index.txt']);
+      const stagedAdmin = git(stagedWorktree, ['rev-parse', '--absolute-git-dir']);
+      const stagedIndex = fs.readFileSync(path.join(stagedAdmin, 'index'));
+      fs.rmSync(stagedTopic, { recursive: true, force: true });
+      // Simulate the crash window directly: the checkout is already gone (as
+      // if trashPath had succeeded) but the canonical registration was never
+      // removed, and the journal records its exact path. The staged sibling is
+      // also missing, but is unrelated and must retain its private index.
+      fs.rmSync(topicDir, { recursive: true, force: true });
+      fs.writeFileSync(
+        path.join(state.dataDir, '.gc-pending-prunes.json'),
+        JSON.stringify([{ workgroupId: WG, repo, worktreePath: worktree }]),
+      );
+      state.rows = [];
+      process.env.NANOCLAW_STORAGE_GC = 'apply';
+      runStorageGcOnce(state.dataDir, state.groupsDir);
+      expect(git(canonical, ['worktree', 'list', '--porcelain'])).not.toContain(`branch refs/heads/${branch}\n`);
+      expect(git(canonical, ['worktree', 'list', '--porcelain'])).toContain(`worktree ${stagedWorktree}`);
+      expect(fs.readFileSync(path.join(stagedAdmin, 'index'))).toEqual(stagedIndex);
+      expect(fs.existsSync(path.join(state.dataDir, '.gc-pending-prunes.json'))).toBe(false);
+      // The branch is free again for a fresh checkout.
+      expect(() => git(canonical, ['worktree', 'add', '-q', `${worktree}-2`, branch])).not.toThrow();
+    },
+  );
+
+  it.skipIf(!hasTrash)('#185: upgrades a legacy repo-only journal with the same staged-index safety', () => {
+    const { topicDir, worktree, canonical, branch } = topicFixture('thread-idle-legacy-journal');
     const repo = path.basename(worktree);
-    // Simulate the crash window directly: the checkout is already gone (as
-    // if trashPath had succeeded) but the canonical registration was never
-    // pruned, and the journal #185 writes before every trash records exactly
-    // this pending prune — the state a crash right after trashPath leaves.
+    const stagedTopic = path.join(path.dirname(topicDir), 'legacy-unrelated-staged-topic');
+    const stagedWorktree = path.join(stagedTopic, 'worktrees', repo);
+    fs.mkdirSync(path.dirname(stagedWorktree), { recursive: true });
+    git(canonical, ['worktree', 'add', '-q', '-b', `${branch}-staged`, stagedWorktree, 'origin/HEAD']);
+    fs.writeFileSync(path.join(stagedWorktree, 'only-in-index.txt'), 'must survive legacy recovery\n');
+    git(stagedWorktree, ['add', 'only-in-index.txt']);
+    const stagedAdmin = git(stagedWorktree, ['rev-parse', '--absolute-git-dir']);
+    const stagedIndex = fs.readFileSync(path.join(stagedAdmin, 'index'));
+    fs.rmSync(stagedTopic, { recursive: true, force: true });
     fs.rmSync(topicDir, { recursive: true, force: true });
-    fs.writeFileSync(path.join(state.dataDir, '.gc-pending-prunes.json'), JSON.stringify([{ workgroupId: WG, repo }]));
-    state.rows = [];
+    const journalPath = path.join(state.dataDir, '.gc-pending-prunes.json');
+    fs.writeFileSync(journalPath, JSON.stringify([{ workgroupId: WG, repo }]));
     process.env.NANOCLAW_STORAGE_GC = 'apply';
+
     runStorageGcOnce(state.dataDir, state.groupsDir);
-    expect(git(canonical, ['worktree', 'list'])).not.toContain(branch);
-    expect(fs.existsSync(path.join(state.dataDir, '.gc-pending-prunes.json'))).toBe(false);
-    // The branch is free again for a fresh checkout.
+
+    const registrations = git(canonical, ['worktree', 'list', '--porcelain']);
+    expect(registrations).not.toContain(`branch refs/heads/${branch}\n`);
+    expect(registrations).toContain(`worktree ${stagedWorktree}`);
+    expect(fs.readFileSync(path.join(stagedAdmin, 'index'))).toEqual(stagedIndex);
+    expect(fs.existsSync(journalPath)).toBe(false);
+  });
+
+  it.skipIf(!hasTrash)('#185: a failed exact deregistration remains journaled and retries automatically', () => {
+    const { topicDir, worktree, canonical, branch } = topicFixture('thread-idle-remove-retry');
+    const repo = path.basename(worktree);
+    fs.rmSync(topicDir, { recursive: true, force: true });
+    const journalPath = path.join(state.dataDir, '.gc-pending-prunes.json');
+    const pending = [{ workgroupId: WG, repo, worktreePath: worktree }];
+    fs.writeFileSync(journalPath, JSON.stringify(pending));
+    state.failRemovalOnce = true;
+    process.env.NANOCLAW_STORAGE_GC = 'apply';
+
+    runStorageGcOnce(state.dataDir, state.groupsDir);
+    expect(JSON.parse(fs.readFileSync(journalPath, 'utf8'))).toEqual(pending);
+    expect(git(canonical, ['worktree', 'list', '--porcelain'])).toContain(`worktree ${worktree}`);
+
+    runStorageGcOnce(state.dataDir, state.groupsDir);
+    expect(fs.existsSync(journalPath)).toBe(false);
+    expect(git(canonical, ['worktree', 'list', '--porcelain'])).not.toContain(`worktree ${worktree}`);
     expect(() => git(canonical, ['worktree', 'add', '-q', `${worktree}-2`, branch])).not.toThrow();
   });
 
@@ -1136,21 +1205,17 @@ describe('storage GC — apply mode', () => {
     expect(git(canonical, ['worktree', 'list'])).toContain(branch);
   });
 
-  it.skipIf(!hasTrash)('Codex P2: a trash failure preserves an OLDER pending-prune entry for the same repo', () => {
+  it.skipIf(!hasTrash)('Codex P2: a trash failure preserves an OLDER pending removal for the same repo', () => {
     const { topicDir, worktree, canonical, branch } = topicFixture('thread-idle-trashfail-journal');
     const repo = path.basename(worktree);
     state.rows = [sessionRow('thread-idle-trashfail-journal', 'folder-a', 'active', 20)];
     // A stale entry from an earlier interrupted pass, for the SAME
     // workgroupId/repo this attempt is about to journal too.
-    const olderEntry = { workgroupId: WG, repo };
+    const olderEntry = { workgroupId: WG, repo, worktreePath: worktree };
     fs.writeFileSync(path.join(state.dataDir, '.gc-pending-prunes.json'), JSON.stringify([olderEntry]));
 
-    // Make the SWEEP's own prune attempt on the older entry fail (as if it
-    // were still failing from the prior interrupted pass), so it survives
-    // into this pass's collection cycle instead of being cleared before
-    // collection even starts. Self-clearing: only that one call is touched,
-    // every other git invocation (status/log/stash, the real trash) is real.
-    state.failPruneOnce = true;
+    // The old entry points at the still-live path, so the sweep keeps it for
+    // later rather than deregistering or deleting that checkout.
 
     // Block trash-cli's own trash dir so the real /usr/bin/trash call fails
     // deterministically (same technique as the P2 trash-failure test above).

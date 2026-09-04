@@ -10,7 +10,7 @@
 #
 # A worktree is SAFE only when ALL of these hold:
 #   1. It is not the main checkout.
-#   2. It is not locked by a LIVE process. A lock whose pid is dead is stale.
+#   2. It is not locked. Explicit locks require deliberate owner recovery.
 #   3. No live process has its cwd inside it.
 #   4. Its working tree is clean (no modified or untracked files).
 #   5. Its HEAD is an ancestor of the integration branch — i.e. every commit
@@ -37,7 +37,8 @@ DO_REMOVE=0
 [ "${1:-}" = "--remove" ] && DO_REMOVE=1
 
 MAIN_ROOT="$(git rev-parse --path-format=absolute --git-common-dir)"
-MAIN_ROOT="$(dirname "$MAIN_ROOT")"
+COMMON_DIR="$MAIN_ROOT"
+MAIN_ROOT="$(dirname "$COMMON_DIR")"
 
 # `git worktree list --porcelain` is the only listing that reports lock state
 # machine-readably; the human format buries it in a trailing word.
@@ -55,28 +56,59 @@ in_use() {
   ls -l /proc/*/cwd 2>/dev/null | grep -q " -> ${d}\(/\|$\)"
 }
 
+# A vanished linked checkout can still hold its only staged tree and detached
+# HEAD inside .git/worktrees/<id>. Resolve that exact private admin record; a
+# repository-wide prune is never safe because it cannot distinguish siblings.
+admin_for_path() {
+  local wanted="${1%/}" admin pointer
+  for admin in "$COMMON_DIR"/worktrees/*; do
+    [ -d "$admin" ] || continue
+    [ -f "$admin/gitdir" ] || continue
+    IFS= read -r pointer < "$admin/gitdir" || continue
+    [ "${pointer%/.git}" = "$wanted" ] && { printf '%s\n' "$admin"; return 0; }
+  done
+  return 1
+}
+
 classify() {
   [ -z "$path" ] && return
   [ "$path" = "$MAIN_ROOT" ] && return
   total=$((total + 1))
 
-  # A lock is only meaningful if the process that took it still exists.
-  # Lock reasons look like: "claude session <name> (pid 2660338 start ...)".
+  # Locks are explicit preservation state. Even a dead pid can leave staged
+  # data in the private linked index, so audit reports it but never clears it.
   if [ -n "$locked" ]; then
     lock_pid="$(grep -oE 'pid [0-9]+' <<<"$lockreason" | head -1 | awk '{print $2}')"
-    if [ -n "$lock_pid" ] && kill -0 "$lock_pid" 2>/dev/null; then
-      printf 'KEEP  %-70s locked by live pid %s\n' "$path" "$lock_pid"; keep=$((keep + 1)); return
+    if [ -n "$lock_pid" ] && kill -0 "$lock_pid" 2>/dev/null; then lock_state="live pid $lock_pid"
+    elif [ -n "$lock_pid" ]; then lock_state="pid $lock_pid gone"
+    else lock_state="no pid in reason"
     fi
-    if [ -z "$lock_pid" ]; then
-      printf 'KEEP  %-70s locked, no pid in reason — cannot prove idle\n' "$path"; keep=$((keep + 1)); return
-    fi
-    stale_lock=" (stale lock, pid $lock_pid gone)"
-  else
-    stale_lock=""
+    printf 'KEEP  %-70s locked (%s)\n' "$path" "$lock_state"; keep=$((keep + 1)); return
   fi
 
   if [ ! -d "$path" ]; then
-    printf 'SAFE  %-70s directory is gone — prunable\n' "$path"; safe+=("$path"); return
+    local admin rc age_h
+    admin="$(admin_for_path "$path")" || {
+      printf 'KEEP  %-70s directory gone, private admin record unprovable\n' "$path"; keep=$((keep + 1)); return
+    }
+    git --git-dir="$admin" diff-index --cached --quiet HEAD -- 2>/dev/null
+    rc=$?
+    if [ "$rc" -eq 1 ]; then
+      printf 'KEEP  %-70s directory gone, staged state survives in private index\n' "$path"; keep=$((keep + 1)); return
+    fi
+    if [ "$rc" -ne 0 ]; then
+      printf 'KEEP  %-70s directory gone, private index unprovable\n' "$path"; keep=$((keep + 1)); return
+    fi
+    if ! git --git-dir="$admin" merge-base --is-ancestor HEAD "$INTEGRATION" 2>/dev/null; then
+      printf 'KEEP  %-70s directory gone, HEAD is not contained in %s\n' "$path" "$INTEGRATION"
+      keep=$((keep + 1)); return
+    fi
+    age_h=$(( ( $(date +%s) - $(stat -c %Y "$admin" 2>/dev/null || echo 0) ) / 3600 ))
+    if [ "$age_h" -lt "$MIN_IDLE_HOURS" ]; then
+      printf 'KEEP  %-70s missing admin active %sh ago (< %sh quiet window)\n' "$path" "$age_h" "$MIN_IDLE_HOURS"
+      keep=$((keep + 1)); return
+    fi
+    printf 'SAFE  %-70s directory gone, index clean + HEAD merged\n' "$path"; safe+=("$path"); return
   fi
 
   # Second belt: a session can sit in a worktree WITHOUT locking it, and
@@ -112,7 +144,7 @@ classify() {
     keep=$((keep + 1)); return
   fi
 
-  printf 'SAFE  %-70s merged + clean%s\n' "$path" "$stale_lock"
+  printf 'SAFE  %-70s merged + clean\n' "$path"
   safe+=("$path")
 }
 
@@ -136,12 +168,21 @@ if [ "$DO_REMOVE" = 1 ] && [ "${#safe[@]}" -gt 0 ]; then
   for p in "${safe[@]}"; do
     # Re-check immediately before acting: this loop can run long enough for a
     # new session to claim a worktree that was idle when we classified it.
-    if [ -d "$p" ] && [ -n "$(git -C "$p" status --porcelain 2>/dev/null)" ]; then
-      echo "skip   $p — became dirty since classification"; continue
+    if [ -d "$p" ]; then
+      if in_use "$p" || [ -n "$(git -C "$p" status --porcelain 2>/dev/null)" ]; then
+        echo "skip   $p — became active or dirty since classification"; continue
+      fi
+    else
+      admin="$(admin_for_path "$p")" || { echo "skip   $p — private admin record vanished"; continue; }
+      if ! git --git-dir="$admin" diff-index --cached --quiet HEAD -- 2>/dev/null; then
+        echo "skip   $p — private index became staged or unreadable"; continue
+      fi
+      if ! git --git-dir="$admin" merge-base --is-ancestor HEAD "$INTEGRATION" 2>/dev/null; then
+        echo "skip   $p — private HEAD is no longer contained in $INTEGRATION"; continue
+      fi
     fi
     if git worktree remove --force "$p" 2>/dev/null; then echo "removed $p"; else echo "FAILED  $p"; fi
   done
-  git worktree prune
   echo
   echo "Branches left behind by removed worktrees are NOT deleted — review with:"
   echo "  git branch --merged $INTEGRATION"

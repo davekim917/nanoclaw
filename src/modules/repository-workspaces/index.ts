@@ -64,9 +64,17 @@ export interface TransferRepositoryWorktreeInput {
   source: RepositoryWorkUnit;
   destination: RepositoryWorkUnit;
   loadSourceSessions: () => Promise<RepositorySourceSessionState[]> | RepositorySourceSessionState[];
+  beforeSourceActivityCheckWhileClaimed?: () => Promise<void> | void;
   beforeMoveWhileClaimed?: () => Promise<void> | void;
   afterMoveWhileClaimed?: (result: { sourcePath: string; destinationPath: string }) => Promise<void> | void;
   dataDir?: string;
+}
+
+class RepositorySourceActiveError extends Error {
+  constructor(readonly sessionIds: string[]) {
+    super(`source topic is active in session(s): ${sessionIds.join(', ')}`);
+    this.name = 'RepositorySourceActiveError';
+  }
 }
 
 function git(cwd: string, args: string[], timeout = 120_000): string {
@@ -356,21 +364,28 @@ export async function transferRepositoryWorktree(
   }
   if (input.source.key === input.destination.key) throw new Error('source and destination topics are identical');
 
-  return withRepositoryLifecycleClaims([input.source, input.destination], () =>
-    withHostRepositoryLock(
+  return withRepositoryLifecycleClaims([input.source, input.destination], async () => {
+    // Stop source writers at a safe turn boundary before taking the Git lock.
+    // A draining source tool may itself need that lock; taking it first would
+    // deadlock quiescence against the very Git operation we are waiting on.
+    // The lifecycle claims already prevent a fresh source spawn in this gap.
+    await input.beforeSourceActivityCheckWhileClaimed?.();
+    return withHostRepositoryLock(
       input.workgroupId,
       input.repo,
       async () => {
         // Claims are acquired before observing activity. A source spawn that
         // begins afterward fails at the spawn gate; an already-running or
-        // already-spawning session is visible in this fresh snapshot.
+        // already-spawning session is either quiesced by the host action or
+        // visible in this fresh snapshot. The lifecycle claims remain held,
+        // so no fresh source writer can enter between the barrier and proof.
         const sourceSessions = await input.loadSourceSessions();
         const active = sourceSessions.filter(
           (session) =>
             session.running || session.spawning || session.processing || session.activeTool || session.continuation,
         );
         if (active.length > 0) {
-          throw new Error(`source topic is active in session(s): ${active.map((session) => session.id).join(', ')}`);
+          throw new RepositorySourceActiveError(active.map((session) => session.id));
         }
 
         // Destination siblings already mount the topic root. Stop them before
@@ -471,8 +486,8 @@ export async function transferRepositoryWorktree(
         return result;
       },
       input.dataDir,
-    ),
-  );
+    );
+  });
 }
 
 /**
@@ -746,17 +761,43 @@ export function resolveTransferSourceWorkUnit(
   sourceThreadId: string,
   rows: TransferSourceRow[],
 ): RepositoryWorkUnit {
-  const units = new Map<string, RepositoryWorkUnit>();
-  for (const row of rows) {
-    if (!row.platform_id || !row.messaging_group_id || !row.thread_id) continue;
-    if (!externalThreadAliases(row.platform_id, row.thread_id).has(sourceThreadId)) continue;
-    const unit = resolveRepositoryWorkUnit({
+  const resolvedRows = rows.map((row) => ({
+    row,
+    unit: resolveRepositoryWorkUnit({
       workgroupId,
       sessionId: row.id,
       platformId: row.platform_id,
       messagingGroupId: row.messaging_group_id,
       threadId: row.thread_id,
-    });
+    }),
+  }));
+
+  // Managed locators are a separate namespace from adapter-owned thread IDs.
+  // Otherwise an external ID that happens to equal another topic's locator
+  // makes the only exact, host-generated identity ambiguous.
+  if (/^(?:thread|conversation|task|session)-[a-f0-9]{32}$/.test(sourceThreadId)) {
+    const locatorUnits = new Map<string, RepositoryWorkUnit>();
+    for (const { unit } of resolvedRows) {
+      if (`${unit.kind}-${unit.id}` === sourceThreadId) locatorUnits.set(unit.key, unit);
+    }
+    if (locatorUnits.size > 1) {
+      throw new Error(`source thread is ambiguous in workgroup ${workgroupId}: ${sourceThreadId}`);
+    }
+    if (locatorUnits.size === 1) return [...locatorUnits.values()][0];
+    // Adapter-owned IDs are not constrained by the managed locator grammar.
+    // If no exact managed identity exists, retain the legacy alias lookup.
+  }
+
+  const units = new Map<string, RepositoryWorkUnit>();
+  for (const { row, unit } of resolvedRows) {
+    const aliases = new Set<string>();
+    if (row.thread_id) {
+      aliases.add(row.thread_id);
+      if (row.platform_id && row.messaging_group_id) {
+        for (const alias of externalThreadAliases(row.platform_id, row.thread_id)) aliases.add(alias);
+      }
+    }
+    if (!aliases.has(sourceThreadId)) continue;
     units.set(unit.key, unit);
   }
   if (units.size === 0) throw new Error(`source thread is unknown in workgroup ${workgroupId}: ${sourceThreadId}`);
@@ -766,25 +807,37 @@ export function resolveTransferSourceWorkUnit(
   return [...units.values()][0];
 }
 
-async function sourceSessionStates(source: RepositoryWorkUnit): Promise<RepositorySourceSessionState[]> {
-  const rows = sessionsForWorkUnit(source);
+async function sourceSessionStates(
+  source: RepositoryWorkUnit,
+  rows: Array<Session & { platform_id: string | null }> = sessionsForWorkUnit(source),
+): Promise<RepositorySourceSessionState[]> {
   const { isContainerRunning, isContainerSpawning } = await import('../../container-runner.js');
   const states: RepositorySourceSessionState[] = [];
   for (const row of rows) {
+    const running = isContainerRunning(row.id);
+    const spawning = isContainerSpawning(row.id);
+    // Closed sessions cannot accept another turn or continuation. Once their
+    // runtime is stopped, stale outbound claims are residue, not a possible
+    // writer; the exact checkout transfer is the recovery path for that work.
+    if (row.status === 'closed' && !running && !spawning) {
+      states.push({
+        id: row.id,
+        running: false,
+        spawning: false,
+        processing: false,
+        activeTool: false,
+        continuation: false,
+      });
+      continue;
+    }
     let processing: boolean;
     let activeTool = false;
     let continuation = false;
     try {
       // Read-only seam: the quiescence probe must never provision or migrate a
-      // session it is only inspecting.
-      // Both options restate what `openOutboundDb` did before the seam, and
-      // both matter here. The 5s busy_timeout is the write path's, because
-      // this is a handful of named sessions rather than a console fan-out.
-      // The hot-journal rollback is load-bearing: a SIGKILLed or OOM-killed
-      // container leaves a journal a read-only handle cannot get past, so
-      // without recovery the read throws, the catch calls the session active,
-      // and the transfer is refused until some other subsystem happens to
-      // recover the file.
+      // session it is only inspecting. Hot-journal recovery is load-bearing:
+      // an unreadable existing mailbox must fail closed rather than strand a
+      // recoverable processing claim behind a crash artifact.
       const state = readSessionOutbound(
         { agentGroupId: row.agent_group_id, sessionId: row.id },
         (mailbox) => ({
@@ -794,24 +847,23 @@ async function sourceSessionStates(source: RepositoryWorkUnit): Promise<Reposito
         }),
         { busyTimeoutMs: 5000, recoverJournal: true },
       );
-      // `undefined` (no outbound.db) counts as ACTIVE, deliberately. Before the
-      // seam the raw opener threw SessionDbMissingError on that file and the
-      // catch below made it active; keeping it active is what makes this a
-      // behavior-preserving refactor. It is arguably over-conservative — a
-      // session whose container never ran holds no claim — but relaxing it is
-      // a fail-closed policy change and does not belong in a seam move.
-      if (!state) throw new Error(`no outbound mailbox for session ${row.id}`);
-      processing = state.processing;
-      activeTool = state.activeTool;
-      continuation = state.continuation;
+      if (!state) {
+        // A missing mailbox on a non-terminal session may mean it is between
+        // creation and first boot. Transfer without proof remains unsafe.
+        throw new Error(`no outbound mailbox for session ${row.id}`);
+      } else {
+        processing = state.processing;
+        activeTool = state.activeTool;
+        continuation = state.continuation;
+      }
     } catch {
-      // Unknown state is active: a transfer must fail closed.
+      // An unreadable non-terminal mailbox is unknown state, so fail closed.
       processing = true;
     }
     states.push({
       id: row.id,
-      running: isContainerRunning(row.id),
-      spawning: isContainerSpawning(row.id),
+      running,
+      spawning,
       processing,
       activeTool,
       continuation,
@@ -830,37 +882,68 @@ export async function applyRepositoryTransferAction(content: Record<string, unkn
     throw new Error('repository_transfer payload is invalid');
   }
   assertRepositoryRequestId(requestId);
-  const workgroupId = workgroupForSession(session);
-  const destination = workUnitForSession(session, workgroupId);
-  if (destination.key !== destinationWorkUnitKey) throw new Error('destination repository work-unit changed');
-  const sourceRows = getDb()
-    .prepare(
-      `SELECT s.id, s.messaging_group_id, s.thread_id, mg.platform_id
-         FROM sessions s
-         JOIN agent_groups ag ON ag.id = s.agent_group_id
-         LEFT JOIN messaging_groups mg ON mg.id = s.messaging_group_id
-        WHERE COALESCE(ag.workgroup_id, ag.folder) = ?`,
-    )
-    .all(workgroupId) as TransferSourceRow[];
-  const source = resolveTransferSourceWorkUnit(workgroupId, sourceThreadId, sourceRows);
 
   let affectedSessions: Session[] = [];
   let releaseWakeSessions: Session[] = [];
-  let quiescence: RepositoryMountQuiescence | null = null;
+  let sourceSessions: Array<Session & { platform_id: string | null }> = [];
+  let sourceFailureNoticePersisted = false;
+  const pendingQuiescences: RepositoryMountQuiescence[] = [];
+  const rememberQuiescence = (value: RepositoryMountQuiescence): void => {
+    pendingQuiescences.push(value);
+    affectedSessions = uniqueSessionsById(affectedSessions, value.sessions);
+  };
+  const releaseQuiescence = async (value: RepositoryMountQuiescence): Promise<void> => {
+    releaseWakeSessions = uniqueSessionsById(releaseWakeSessions, await releaseRepositoryMountQuiescence(value));
+    const index = pendingQuiescences.indexOf(value);
+    if (index >= 0) pendingQuiescences.splice(index, 1);
+  };
   try {
+    // Resolution belongs inside the recovery boundary. The container has
+    // already durably queued the request and returned control to the agent; a
+    // lookup rejection must therefore produce the same explicit failure wake
+    // as a later Git/quiescence rejection instead of becoming a log-only job.
+    const workgroupId = workgroupForSession(session);
+    const destination = workUnitForSession(session, workgroupId);
+    if (destination.key !== destinationWorkUnitKey) throw new Error('destination repository work-unit changed');
+    const sourceRows = getDb()
+      .prepare(
+        `SELECT s.id, s.messaging_group_id, s.thread_id, mg.platform_id
+           FROM sessions s
+           JOIN agent_groups ag ON ag.id = s.agent_group_id
+           LEFT JOIN messaging_groups mg ON mg.id = s.messaging_group_id
+          WHERE COALESCE(ag.workgroup_id, ag.folder) = ?`,
+      )
+      .all(workgroupId) as TransferSourceRow[];
+    const source = resolveTransferSourceWorkUnit(workgroupId, sourceThreadId, sourceRows);
+
     await transferRepositoryWorktree({
       workgroupId,
       repo,
       source,
       destination,
-      loadSourceSessions: () => sourceSessionStates(source),
-      beforeMoveWhileClaimed: async () => {
-        quiescence = await quiesceSessionsForRepositoryMounts(
-          sessionsForWorkUnit(destination),
-          `repository-transfer:${requestId}`,
-          REPOSITORY_MOUNT_QUIESCENCE_TIMEOUT_MS,
+      beforeSourceActivityCheckWhileClaimed: async () => {
+        sourceSessions = sessionsForWorkUnit(source);
+        rememberQuiescence(
+          await quiesceSessionsForRepositoryMounts(
+            sourceSessions,
+            `repository-transfer-source:${requestId}`,
+            REPOSITORY_MOUNT_QUIESCENCE_TIMEOUT_MS,
+          ),
         );
-        affectedSessions = quiescence.sessions;
+        // Re-read under the lifecycle claim. A row created while barriers
+        // activated cannot spawn, but it must still participate in the final
+        // active-state proof instead of escaping through a stale row snapshot.
+        sourceSessions = sessionsForWorkUnit(source);
+      },
+      loadSourceSessions: () => sourceSessionStates(source, sourceSessions),
+      beforeMoveWhileClaimed: async () => {
+        rememberQuiescence(
+          await quiesceSessionsForRepositoryMounts(
+            sessionsForWorkUnit(destination),
+            `repository-transfer:${requestId}`,
+            REPOSITORY_MOUNT_QUIESCENCE_TIMEOUT_MS,
+          ),
+        );
       },
       afterMoveWhileClaimed: async (result) => {
         const destinationSessions = sessionsForWorkUnit(destination);
@@ -882,35 +965,98 @@ export async function applyRepositoryTransferAction(content: Record<string, unkn
             onWake: 1,
           });
         }
-        if (!quiescence) throw new Error('repository transfer quiescence was lost before barrier release');
-        releaseWakeSessions = await releaseRepositoryMountQuiescence(quiescence);
-        quiescence = null;
+        for (const sourceSession of sourceSessions.filter((candidate) => candidate.status === 'active')) {
+          try {
+            await writeSessionMessageIfNew(sourceSession.agent_group_id, sourceSession.id, {
+              id: `repository-transfer-source-complete-${requestId}`,
+              kind: 'chat',
+              timestamp: new Date().toISOString(),
+              platformId: sourceSession.agent_group_id,
+              channelType: 'agent',
+              threadId: sourceSession.thread_id,
+              content: JSON.stringify({
+                text:
+                  `Repository handoff complete: ${repo} moved exactly from this topic to ${result.destinationPath}. ` +
+                  'No work was discarded. Coordinate with the destination topic for further edits; the exact checkout ' +
+                  'can be transferred back later with create_worktree if needed.',
+                sender: 'system',
+                senderId: 'system',
+              }),
+              onWake: 1,
+            });
+          } catch (notificationError) {
+            log.warn('Repository transfer source completion notice could not be persisted', {
+              requestId,
+              sourceSessionId: sourceSession.id,
+              error: notificationError instanceof Error ? notificationError.message : String(notificationError),
+            });
+          }
+        }
+        for (const pending of [...pendingQuiescences].reverse()) await releaseQuiescence(pending);
       },
     });
-    const sessionsToWake = uniqueSessionsById(affectedSessions, releaseWakeSessions, [session]);
+    const sessionsToWake = uniqueSessionsById(
+      affectedSessions,
+      releaseWakeSessions,
+      sourceSessions.filter((candidate) => candidate.status === 'active'),
+      [session],
+    );
     wakeRepositoryMountSessions(sessionsToWake);
   } catch (error) {
     if (error instanceof RepositoryMountQuiescenceError) {
-      affectedSessions = error.quiescence.sessions;
-      releaseWakeSessions = error.releaseWakeSessions;
-      quiescence = error.barriersReleased ? null : error.quiescence;
-    }
-    let failure: unknown = error;
-    let barriersReleased = quiescence === null;
-    if (quiescence) {
-      try {
-        releaseWakeSessions = await releaseRepositoryMountQuiescence(quiescence);
-        barriersReleased = true;
-        quiescence = null;
-      } catch (releaseError) {
-        failure = new AggregateError(
-          [error, releaseError],
-          'repository transfer failed and its ingress barrier could not be released',
-        );
+      affectedSessions = uniqueSessionsById(affectedSessions, error.quiescence.sessions);
+      releaseWakeSessions = uniqueSessionsById(releaseWakeSessions, error.releaseWakeSessions);
+      if (!error.barriersReleased && !pendingQuiescences.includes(error.quiescence)) {
+        pendingQuiescences.push(error.quiescence);
       }
     }
+    let failure: unknown = error;
+    for (const pending of [...pendingQuiescences].reverse()) {
+      try {
+        await releaseQuiescence(pending);
+      } catch (releaseError) {
+        failure = new AggregateError(
+          [failure, releaseError],
+          'repository transfer failed and its ingress barrier could not be released',
+        );
+        break;
+      }
+    }
+    const barriersReleased = pendingQuiescences.length === 0;
     const message = failure instanceof Error ? failure.message : String(failure);
     const requesterWasStopped = affectedSessions.some((candidate) => candidate.id === session.id);
+    const activeSource = error instanceof RepositorySourceActiveError;
+    const sourceSessionsToNotify = sourceSessions.filter((candidate) => candidate.status === 'active');
+    for (const sourceSession of sourceSessionsToNotify) {
+      try {
+        await writeSessionMessageIfNew(sourceSession.agent_group_id, sourceSession.id, {
+          id: `repository-transfer-source-failed-${requestId}`,
+          kind: 'chat',
+          timestamp: new Date().toISOString(),
+          platformId: sourceSession.agent_group_id,
+          channelType: 'agent',
+          threadId: sourceSession.thread_id,
+          content: JSON.stringify({
+            text: activeSource
+              ? `Repository handoff requested for ${repo}, but this topic still has durable active or continued work. ` +
+                'Finish or checkpoint that work and let the continuation chain complete; the requesting topic was told ' +
+                'to retry. Do not delete or prune anything, and no host action is needed.'
+              : `Repository handoff for ${repo} failed before completion; the checkout remains with this topic and no ` +
+                `source work was deleted. The requesting topic received the same recovery error: ${message}`,
+            sender: 'system',
+            senderId: 'system',
+          }),
+          onWake: 1,
+        });
+        sourceFailureNoticePersisted = true;
+      } catch (notificationError) {
+        log.warn('Repository transfer source failure notice could not be persisted', {
+          requestId,
+          sourceSessionId: sourceSession.id,
+          error: notificationError instanceof Error ? notificationError.message : String(notificationError),
+        });
+      }
+    }
     await writeSessionMessageIfNew(session.agent_group_id, session.id, {
       id: `repository-transfer-failed-${requestId}`,
       kind: 'chat',
@@ -920,15 +1066,23 @@ export async function applyRepositoryTransferAction(content: Record<string, unkn
       threadId: session.thread_id,
       content: JSON.stringify({
         text:
-          `Repository transfer for ${repo} needs recovery; no source work was deleted. ` +
-          `Retry the same transfer after resolving this error: ${message}`,
+          (activeSource
+            ? `Repository transfer for ${repo} is waiting on active work in the source topic. ` +
+              (sourceFailureNoticePersisted
+                ? 'The source agent was notified; '
+                : 'Wait for the source topic to finish or checkpoint; ') +
+              'retry the same create_worktree transfer afterward. No host action is needed. '
+            : `Repository transfer for ${repo} needs recovery; no source work was deleted. ` +
+              'Retry the same transfer after resolving this error: ') + message,
         sender: 'system',
         senderId: 'system',
       }),
       onWake: requesterWasStopped ? 1 : 0,
     });
     if (barriersReleased) {
-      const sessionsToWake = uniqueSessionsById(affectedSessions, releaseWakeSessions, [session]);
+      const sessionsToWake = uniqueSessionsById(affectedSessions, releaseWakeSessions, sourceSessionsToNotify, [
+        session,
+      ]);
       wakeRepositoryMountSessions(sessionsToWake);
     }
     throw failure;

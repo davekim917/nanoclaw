@@ -141,7 +141,8 @@ describe('container/CLAUDE.md "Working with Repos" prose migrated into the repo 
     const continueFromThreadId = createWorktreeTool.tool.inputSchema.properties.continueFromThreadId as {
       description: string;
     };
-    expect(continueFromThreadId.description).toContain('ask the operator rather than recreating a branch');
+    expect(continueFromThreadId.description).toContain('move the exact checkout back');
+    expect(continueFromThreadId.description).toContain('Never recreate, delete, or prune');
   });
 });
 

@@ -319,7 +319,8 @@ export function evaluateManagedGitCommand(
     operation,
     reason:
       `BLOCKED: ${operation} is host-only for NanoClaw managed repositories because canonical Git metadata is shared ` +
-      'across topic worktrees. Use create_worktree or ask the host operator to perform repository maintenance.',
+      'across topic worktrees. Use create_worktree; when it reports another managed owner, retry with the shown ' +
+      'continueFromThreadId. Never delete or prune a sibling checkout.',
   };
 }
 

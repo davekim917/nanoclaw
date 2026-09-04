@@ -319,6 +319,21 @@ function validateExistingWorktree(context: RepositoryContext, branchArg: string 
   return ok(`Worktree ready at ${context.worktree} (existing ${current}; left untouched)`);
 }
 
+/** A crash or concurrent topic-root recreation can leave the exact repo slot
+ * as an empty directory while Git still owns its linked admin record. Removing
+ * an empty directory is the atomic proof that no agent bytes are present; the
+ * branch/index safety decision still happens below against the private admin. */
+function removeEmptyTopicPlaceholder(context: RepositoryContext): void {
+  try {
+    const stat = fs.lstatSync(context.worktree);
+    if (!stat.isDirectory() || stat.isSymbolicLink() || fs.readdirSync(context.worktree).length !== 0) return;
+    fs.rmdirSync(context.worktree);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code !== 'ENOENT' && code !== 'ENOTDIR' && code !== 'ENOTEMPTY') throw error;
+  }
+}
+
 function branchOwner(gitDir: string, branch: string): string | null {
   const porcelain = tryGitDir(gitDir, ['worktree', 'list', '--porcelain'], 10_000) ?? '';
   let currentPath: string | null = null;
@@ -326,6 +341,95 @@ function branchOwner(gitDir: string, branch: string): string | null {
     if (line.startsWith('worktree ')) currentPath = line.slice('worktree '.length);
     if (line === `branch refs/heads/${branch}` && currentPath) return currentPath;
     if (line === '') currentPath = null;
+  }
+  return null;
+}
+
+function managedTopicLocator(context: RepositoryContext, owner: string): string | null {
+  const topicsRoot = canonicalPath(path.join(context.dataDir, 'v2-topics', context.workgroupId));
+  const relative = path.relative(topicsRoot, canonicalPath(owner));
+  if (!relative || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) return null;
+  const parts = relative.split(path.sep);
+  if (parts.length !== 3 || parts[1] !== 'worktrees' || parts[2] !== context.repo) return null;
+  return /^(?:thread|task|conversation|session)-[a-f0-9]{32}$/.test(parts[0]!) ? parts[0]! : null;
+}
+
+function worktreePathIsMissing(owner: string): boolean {
+  try {
+    fs.lstatSync(owner);
+    return false;
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === 'ENOENT' || code === 'ENOTDIR') return true;
+    throw new Error(`worktree owner path is unreadable: ${owner}`);
+  }
+}
+
+interface LinkedWorktreeAdminRecord {
+  adminDir: string;
+  owner: string;
+}
+
+function linkedWorktreeAdminRecords(gitDir: string): LinkedWorktreeAdminRecord[] {
+  const root = path.join(gitDir, 'worktrees');
+  let entries: fs.Dirent[];
+  try {
+    const stat = fs.lstatSync(root);
+    if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error('linked-worktree admin root is invalid');
+    entries = fs.readdirSync(root, { withFileTypes: true });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return [];
+    throw error;
+  }
+
+  return entries.map((entry) => {
+    if (!entry.isDirectory() || entry.isSymbolicLink()) {
+      throw new Error(`linked-worktree admin entry is invalid: ${entry.name}`);
+    }
+    const adminDir = path.join(root, entry.name);
+    const gitdirFile = path.join(adminDir, 'gitdir');
+    const stat = fs.lstatSync(gitdirFile);
+    if (!stat.isFile() || stat.isSymbolicLink()) {
+      throw new Error(`linked-worktree gitdir record is invalid: ${entry.name}`);
+    }
+    const pointer = fs.readFileSync(gitdirFile, 'utf8').trim();
+    if (!path.isAbsolute(pointer) || path.basename(pointer) !== '.git') {
+      throw new Error(`linked-worktree gitdir record is malformed: ${entry.name}`);
+    }
+    return { adminDir, owner: path.dirname(path.resolve(pointer)) };
+  });
+}
+
+function linkedWorktreeIsLocked(adminDir: string): boolean {
+  try {
+    fs.lstatSync(path.join(adminDir, 'locked'));
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false;
+    throw error;
+  }
+}
+
+function linkedWorktreeIndexMatchesHead(context: RepositoryContext, adminDir: string): boolean {
+  const index = path.join(adminDir, 'index');
+  const stat = fs.lstatSync(index);
+  if (!stat.isFile() || stat.isSymbolicLink()) throw new Error('linked-worktree index is invalid');
+  try {
+    runGitAt(context.canonical, [`--git-dir=${adminDir}`, 'diff-index', '--cached', '--quiet', 'HEAD', '--'], 10_000);
+    return true;
+  } catch (error) {
+    if ((error as { status?: number }).status === 1) return false;
+    throw new Error('linked-worktree index could not be compared with HEAD', { cause: error });
+  }
+}
+
+function missingOwnerRemovalBlocker(context: RepositoryContext, targetOwner: string): string | null {
+  const records = linkedWorktreeAdminRecords(context.gitDir);
+  const target = records.find((record) => path.resolve(record.owner) === path.resolve(targetOwner));
+  if (!target) return `linked metadata for ${targetOwner} could not be identified`;
+  if (linkedWorktreeIsLocked(target.adminDir)) return `linked metadata for ${targetOwner} is locked`;
+  if (!linkedWorktreeIndexMatchesHead(context, target.adminDir)) {
+    return `missing worktree ${target.owner} has staged changes in its linked index`;
   }
   return null;
 }
@@ -363,15 +467,50 @@ async function createLinkedWorktree(context: RepositoryContext, branchArg: strin
     baseRef = runGitDir(context.gitDir, ['symbolic-ref', '--quiet', 'refs/remotes/origin/HEAD'], 10_000);
     runGitDir(context.gitDir, ['rev-parse', '--verify', `${baseRef}^{commit}`], 10_000);
   }
+  removeEmptyTopicPlaceholder(context);
   const existing = validateExistingWorktree(context, branchArg);
   if (existing) {
     if (context.pin.kind !== 'local-only') await emitRefresh(context);
     return existing;
   }
 
-  const owner = branchOwner(context.gitDir, branch);
+  let owner = branchOwner(context.gitDir, branch);
+  if (owner && worktreePathIsMissing(owner)) {
+    // A killed or externally removed topic can leave only Git's linked-worktree
+    // registration behind. The branch ref survives removal, but a private
+    // linked index may contain the last recoverable staged blobs. Remove only
+    // this proven-clean registration: repository-wide prune would also delete
+    // unrelated missing owners whose private indexes still hold staged work.
+    const blocker = missingOwnerRemovalBlocker(context, owner);
+    if (blocker) {
+      return err(`Branch '${branch}' has a missing registered owner, but automatic cleanup refused: ${blocker}`);
+    }
+    runGitDir(context.gitDir, ['worktree', 'remove', '--force', owner], 120_000);
+    owner = branchOwner(context.gitDir, branch);
+    if (owner) {
+      return err(`Branch '${branch}' still has a registered owner after targeted automatic cleanup: ${owner}`);
+    }
+  }
   if (owner && canonicalPath(owner) !== canonicalPath(context.worktree)) {
-    return err(`Branch '${branch}' is already checked out by another worktree at ${owner}`);
+    if (canonicalPath(owner) === canonicalPath(context.canonical)) {
+      return err(
+        `Branch '${branch}' is checked out by the canonical repository. ` +
+          "Retry without an explicit branch to use this topic's generated branch, or choose a different branch name. " +
+          'No prune or host cleanup is needed.',
+      );
+    }
+    const locator = managedTopicLocator(context, owner);
+    if (locator) {
+      return err(
+        `Branch '${branch}' is already checked out by another managed topic at ${owner}. ` +
+          `To preserve and move that exact checkout, retry create_worktree with continueFromThreadId: '${locator}'. ` +
+          'Do not delete or prune it.',
+      );
+    }
+    return err(
+      `Branch '${branch}' is already checked out by an unmanaged worktree at ${owner}. ` +
+        'Preserve it and coordinate with that checkout owner; do not delete or prune it.',
+    );
   }
 
   fs.mkdirSync(context.topicRoot, { recursive: true });
@@ -497,9 +636,10 @@ export const createWorktreeTool: McpToolDefinition = {
         continueFromThreadId: {
           type: 'string',
           description:
-            'Optional source external thread id whose exact inactive worktree should move to this topic. ' +
-            'If migrated work looks missing afterward, ask the operator rather than recreating a branch — the source ' +
-            'topology stays outside agent mounts for rollback.',
+            'Optional source external thread id or managed topic locator shown by a branch collision; the exact ' +
+            'inactive worktree moves to this topic. The source tombstone makes the move reversible: from the original ' +
+            'topic, call create_worktree with this destination locator to move the exact checkout back. Never recreate, ' +
+            'delete, or prune a sibling branch.',
         },
       },
       required: ['repo'],

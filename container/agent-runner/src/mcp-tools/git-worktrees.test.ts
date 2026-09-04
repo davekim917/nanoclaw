@@ -240,15 +240,130 @@ describe('topic-linked worktree topology', () => {
   });
 
   test('explicit branch already owned by another worktree is rejected without mutation', async () => {
+    const sourceLocator = `thread-${'a'.repeat(32)}`;
+    const sourceTopic = useTopic(sourceLocator, 'thread:slack:C1:1.1');
     expect((await createWorktreeTool.handler({ repo: 'proj', branch: 'shared-feature' })).isError).toBeFalsy();
-    const firstHead = git(join(firstTopic, 'proj'), ['rev-parse', 'HEAD']);
+    const firstHead = git(join(sourceTopic, 'proj'), ['rev-parse', 'HEAD']);
     const secondTopic = useTopic('topic-two', 'thread:slack:C1:2.2');
 
     const response = await createWorktreeTool.handler({ repo: 'proj', branch: 'shared-feature' });
     expect(response.isError).toBe(true);
     expect(response.content[0].text).toContain('already checked out');
+    expect(response.content[0].text).toContain(`continueFromThreadId: '${sourceLocator}'`);
+    expect(response.content[0].text).toContain('Do not delete or prune it');
     expect(existsSync(join(secondTopic, 'proj'))).toBe(false);
-    expect(git(join(firstTopic, 'proj'), ['rev-parse', 'HEAD'])).toBe(firstHead);
+    expect(git(join(sourceTopic, 'proj'), ['rev-parse', 'HEAD'])).toBe(firstHead);
+  });
+
+  test('an explicit branch held by the canonical checkout gets a self-service alternative', async () => {
+    const response = await createWorktreeTool.handler({ repo: 'proj', branch: 'main' });
+    expect(response.isError).toBe(true);
+    expect(response.content[0].text).toContain('checked out by the canonical repository');
+    expect(response.content[0].text).toContain('Retry without an explicit branch');
+    expect(response.content[0].text).toContain('No prune or host cleanup is needed');
+    expect(existsSync(join(firstTopic, 'proj'))).toBe(false);
+    expect(git(canonical, ['branch', '--show-current'])).toBe('main');
+  });
+
+  test('a missing unlocked owner is removed and its unpushed branch is reattached losslessly', async () => {
+    expect((await createWorktreeTool.handler({ repo: 'proj', branch: 'surviving-feature' })).isError).toBeFalsy();
+    const abandoned = join(firstTopic, 'proj');
+    writeFileSync(join(abandoned, 'preserved.txt'), 'committed before directory loss\n');
+    git(abandoned, ['add', '-A']);
+    git(abandoned, ['commit', '-q', '-m', 'preserve local branch']);
+    const preservedHead = git(abandoned, ['rev-parse', 'HEAD']);
+
+    // Model a killed/removed topic directory whose canonical registration
+    // survived. The branch ref is intact; only the linked checkout vanished.
+    rmSync(abandoned, { recursive: true, force: true });
+    const destinationTopic = useTopic('topic-two', 'thread:slack:C1:2.2');
+
+    const response = await createWorktreeTool.handler({ repo: 'proj', branch: 'surviving-feature' });
+    const recovered = join(destinationTopic, 'proj');
+    expect(response.isError).toBeFalsy();
+    expect(git(recovered, ['rev-parse', 'HEAD'])).toBe(preservedHead);
+    expect(readFileSync(join(recovered, 'preserved.txt'), 'utf8')).toBe('committed before directory loss\n');
+  });
+
+  test('the current topic self-heals its own missing registration', async () => {
+    expect((await createWorktreeTool.handler({ repo: 'proj', branch: 'same-topic-feature' })).isError).toBeFalsy();
+    const worktree = join(firstTopic, 'proj');
+    writeFileSync(join(worktree, 'preserved.txt'), 'committed before same-topic directory loss\n');
+    git(worktree, ['add', '-A']);
+    git(worktree, ['commit', '-q', '-m', 'preserve same-topic branch']);
+    const preservedHead = git(worktree, ['rev-parse', 'HEAD']);
+    rmSync(worktree, { recursive: true, force: true });
+    mkdirSync(worktree, { recursive: true });
+
+    const response = await createWorktreeTool.handler({ repo: 'proj', branch: 'same-topic-feature' });
+    expect(response.isError).toBeFalsy();
+    expect(git(worktree, ['rev-parse', 'HEAD'])).toBe(preservedHead);
+    expect(readFileSync(join(worktree, 'preserved.txt'), 'utf8')).toBe('committed before same-topic directory loss\n');
+  });
+
+  test('a missing locked owner is preserved and remains blocked', async () => {
+    expect((await createWorktreeTool.handler({ repo: 'proj', branch: 'locked-feature' })).isError).toBeFalsy();
+    const locked = join(firstTopic, 'proj');
+    git(canonical, ['worktree', 'lock', '--reason', 'operator hold', locked]);
+    const preservedHead = git(locked, ['rev-parse', 'HEAD']);
+    rmSync(locked, { recursive: true, force: true });
+    const destinationTopic = useTopic('topic-two', 'thread:slack:C1:2.2');
+
+    const response = await createWorktreeTool.handler({ repo: 'proj', branch: 'locked-feature' });
+    expect(response.isError).toBe(true);
+    expect(response.content[0].text).toContain('automatic cleanup refused');
+    expect(response.content[0].text).toContain('is locked');
+    expect(existsSync(join(destinationTopic, 'proj'))).toBe(false);
+    expect(git(canonical, ['rev-parse', 'refs/heads/locked-feature'])).toBe(preservedHead);
+  });
+
+  test('a missing owner with staged state is never pruned', async () => {
+    expect((await createWorktreeTool.handler({ repo: 'proj', branch: 'staged-feature' })).isError).toBeFalsy();
+    const staged = join(firstTopic, 'proj');
+    writeFileSync(join(staged, 'recoverable.txt'), 'recoverable only from the linked index\n');
+    git(staged, ['add', 'recoverable.txt']);
+    const adminDir = git(staged, ['rev-parse', '--absolute-git-dir']);
+    const indexBefore = readFileSync(join(adminDir, 'index'));
+    rmSync(staged, { recursive: true, force: true });
+    const destinationTopic = useTopic('topic-two', 'thread:slack:C1:2.2');
+
+    const response = await createWorktreeTool.handler({ repo: 'proj', branch: 'staged-feature' });
+    expect(response.isError).toBe(true);
+    expect(response.content[0].text).toContain('automatic cleanup refused');
+    expect(response.content[0].text).toContain('has staged changes');
+    expect(existsSync(join(destinationTopic, 'proj'))).toBe(false);
+    expect(readFileSync(join(adminDir, 'index'))).toEqual(indexBefore);
+    expect(git(canonical, ['worktree', 'list', '--porcelain'])).toContain(`worktree ${staged}`);
+  });
+
+  test('an unrelated missing staged owner does not block targeted recovery of a clean owner', async () => {
+    expect((await createWorktreeTool.handler({ repo: 'proj', branch: 'staged-sibling' })).isError).toBeFalsy();
+    const stagedSibling = join(firstTopic, 'proj');
+    writeFileSync(join(stagedSibling, 'recoverable.txt'), 'keep this staged blob\n');
+    git(stagedSibling, ['add', 'recoverable.txt']);
+    const stagedAdmin = git(stagedSibling, ['rev-parse', '--absolute-git-dir']);
+    const stagedIndex = readFileSync(join(stagedAdmin, 'index'));
+    rmSync(stagedSibling, { recursive: true, force: true });
+
+    const cleanTopic = useTopic('topic-two', 'thread:slack:C1:2.2');
+    expect((await createWorktreeTool.handler({ repo: 'proj', branch: 'clean-sibling' })).isError).toBeFalsy();
+    const cleanOwner = join(cleanTopic, 'proj');
+    writeFileSync(join(cleanOwner, 'committed.txt'), 'keep this commit\n');
+    git(cleanOwner, ['add', 'committed.txt']);
+    git(cleanOwner, ['commit', '-q', '-m', 'clean branch commit']);
+    const cleanHead = git(cleanOwner, ['rev-parse', 'HEAD']);
+    rmSync(cleanOwner, { recursive: true, force: true });
+
+    const destinationTopic = useTopic('topic-three', 'thread:slack:C1:3.3');
+    const response = await createWorktreeTool.handler({ repo: 'proj', branch: 'clean-sibling' });
+    const recovered = join(destinationTopic, 'proj');
+    expect(response.isError).toBeFalsy();
+    expect(git(recovered, ['rev-parse', 'HEAD'])).toBe(cleanHead);
+    expect(readFileSync(join(recovered, 'committed.txt'), 'utf8')).toBe('keep this commit\n');
+    expect(readFileSync(join(stagedAdmin, 'index'))).toEqual(stagedIndex);
+    const worktrees = git(canonical, ['worktree', 'list', '--porcelain']);
+    expect(worktrees).toContain(`worktree ${stagedSibling}`);
+    expect(worktrees).not.toContain(`worktree ${cleanOwner}`);
   });
 
   test('linked-worktree-fetch-commit-push-works-through-scoped-git-metadata', async () => {

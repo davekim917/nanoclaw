@@ -62,8 +62,9 @@ vi.mock('../../session-manager.js', async () => {
 
 // The quiescence probe reads the source sessions' outbound state through the
 // mailbox module's read-only seam (PR 6). Mocked at the seam rather than at a
-// raw opener: these fixtures have no outbound.db on disk, and the real seam
-// answers `undefined` for that, which the probe treats as ACTIVE (fail-closed).
+// raw opener: these fixtures have no outbound.db on disk. Non-terminal source
+// sessions treat that as ACTIVE (fail-closed); closed and non-running sources
+// are terminal and do not require a mailbox to prove quiescence.
 vi.mock('../mailbox/read-only.js', async () => {
   const actual = await vi.importActual<typeof import('../mailbox/read-only.js')>('../mailbox/read-only.js');
   return { ...actual, readSessionOutbound: hostActionMocks.readSessionOutbound };
@@ -724,15 +725,29 @@ describe('exact topic transfer', () => {
     expect(git(sourcePath, ['status', '--porcelain=v2', '--untracked-files=all'])).toBe(beforeStatus);
     expect(createHash('sha256').update(fs.readFileSync(beforeIndexPath)).digest('hex')).toBe(beforeIndexHash);
 
+    let sourceQuiesced = false;
     await transferRepositoryWorktree({
       workgroupId: 'wg-a',
       repo: 'proj',
       source,
       destination,
       dataDir: root,
-      loadSourceSessions: () => [],
+      beforeSourceActivityCheckWhileClaimed: () => {
+        sourceQuiesced = true;
+      },
+      loadSourceSessions: () => [
+        {
+          id: 'session-active',
+          running: !sourceQuiesced,
+          spawning: false,
+          processing: false,
+          activeTool: false,
+          continuation: false,
+        },
+      ],
     });
 
+    expect(sourceQuiesced).toBe(true);
     const afterIndexPath = git(destinationPath, ['rev-parse', '--path-format=absolute', '--git-path', 'index']);
     expect(git(destinationPath, ['branch', '--show-current'])).toBe('');
     expect(git(destinationPath, ['rev-parse', 'HEAD'])).toBe(beforeHead);
@@ -1008,31 +1023,32 @@ describe('exact topic transfer', () => {
     fs.writeFileSync(path.join(sourcePath, 'ongoing.txt'), 'preserve through replay\n');
 
     const requestId = 'repo-1723600000000-aabbccddeeff0011';
-    const epoch = `repository-transfer:${requestId}`;
-    let durableBarrier: 'none' | 'active' | 'released' = 'none';
+    const destinationEpoch = `repository-transfer:${requestId}`;
+    const sourceEpoch = `repository-transfer-source:${requestId}`;
+    const durableBarriers = new Set<string>();
     let releaseFailuresRemaining = 2;
     const observedEpochs: string[] = [];
     const delivered = new Set<string>();
     hostActionMocks.quiesceSessionsForRepositoryMounts.mockImplementation(
       async (sessions: Session[], requestedEpoch: string, timeoutMs: number) => {
-        expect(sessions.map((candidate) => candidate.id)).toEqual([destinationSession.id]);
-        expect(requestedEpoch).toBe(epoch);
+        const expectedSession = requestedEpoch === sourceEpoch ? sourceSession.id : destinationSession.id;
+        expect(sessions.map((candidate) => candidate.id)).toEqual([expectedSession]);
+        expect([sourceEpoch, destinationEpoch]).toContain(requestedEpoch);
         expect(timeoutMs).toBe(REPOSITORY_MOUNT_QUIESCENCE_TIMEOUT_MS);
         observedEpochs.push(requestedEpoch);
-        if (durableBarrier === 'none') durableBarrier = 'active';
-        else expect(durableBarrier).toBe('active');
+        durableBarriers.add(requestedEpoch);
         return { epoch: requestedEpoch, sessions: [], barrierSessions: sessions };
       },
     );
     hostActionMocks.releaseRepositoryMountQuiescence.mockImplementation(
       (quiescence: { epoch: string; barrierSessions: Session[] }) => {
-        expect(quiescence.epoch).toBe(epoch);
+        expect([sourceEpoch, destinationEpoch]).toContain(quiescence.epoch);
         if (releaseFailuresRemaining > 0) {
           releaseFailuresRemaining -= 1;
           throw new Error('simulated crash before durable barrier release');
         }
-        durableBarrier = 'released';
-        return [destinationSession];
+        durableBarriers.delete(quiescence.epoch);
+        return quiescence.barrierSessions;
       },
     );
     hostActionMocks.writeSessionMessageIfNew.mockImplementation(
@@ -1059,19 +1075,203 @@ describe('exact topic transfer', () => {
     expect(fs.existsSync(sourcePath)).toBe(false);
     expect(fs.readFileSync(path.join(destinationPath, 'ongoing.txt'), 'utf8')).toBe('preserve through replay\n');
     expect(readTransferTombstone(source, 'proj', hostActionDataDir)?.phase).toBe('moved');
-    expect(durableBarrier).toBe('active');
+    expect(durableBarriers).toEqual(new Set([sourceEpoch, destinationEpoch]));
     expect(hostActionMocks.wakeRepositoryMountSessions).not.toHaveBeenCalled();
 
     await applyRepositoryTransferAction(action, destinationSession);
-    expect(observedEpochs).toEqual([epoch, epoch]);
-    expect(durableBarrier).toBe('released');
+    expect(observedEpochs).toEqual([sourceEpoch, destinationEpoch, sourceEpoch, destinationEpoch]);
+    expect(durableBarriers.size).toBe(0);
     expect(fs.readFileSync(path.join(destinationPath, 'ongoing.txt'), 'utf8')).toBe('preserve through replay\n');
+    const woken = hostActionMocks.wakeRepositoryMountSessions.mock.calls.at(-1)![0] as Session[];
+    expect(woken.map((candidate) => candidate.id)).toEqual([destinationSession.id, sourceSession.id]);
+  });
+
+  it('keeps an active source fail-closed but ignores stale mailbox residue once the task is closed and stopped', async () => {
+    const db = initTestDb();
+    runMigrations(db);
+    const now = new Date().toISOString();
+    db.prepare("INSERT INTO workgroups (id, onecli_secrets, created_at) VALUES ('wg-a', '[]', ?)").run(now);
+    db.prepare(
+      `INSERT INTO agent_groups (id, name, folder, agent_provider, created_at, workgroup_id)
+       VALUES (?, ?, ?, 'claude', ?, 'wg-a')`,
+    ).run('agent-a', 'Agent A', 'agent-a', now);
+    db.prepare(
+      `INSERT INTO messaging_groups
+         (id, channel_type, platform_id, instance, name, is_group, unknown_sender_policy, created_at)
+       VALUES (?, 'slack', ?, 'slack', ?, 1, 'strict', ?)`,
+    ).run('mg-destination', 'C-destination', 'destination', now);
+    const sourceSession = {
+      id: 'session-source-task',
+      agent_group_id: 'agent-a',
+      messaging_group_id: null,
+      thread_id: 'system:tasks:resume-source-task',
+      agent_provider: 'claude',
+      status: 'active',
+      container_status: 'stopped',
+      last_active: null,
+      created_at: now,
+    } satisfies Session;
+    const destinationSession = {
+      ...sourceSession,
+      id: 'session-destination',
+      messaging_group_id: 'mg-destination',
+      thread_id: '222.222',
+      container_status: 'running',
+    } satisfies Session;
+    for (const candidate of [sourceSession, destinationSession]) {
+      db.prepare(
+        `INSERT INTO sessions
+           (id, agent_group_id, messaging_group_id, thread_id, agent_provider, status, container_status, last_active, created_at)
+         VALUES (@id, @agent_group_id, @messaging_group_id, @thread_id, @agent_provider, @status, @container_status, @last_active, @created_at)`,
+      ).run(candidate);
+    }
+
+    hostActionMocks.getAgentGroup.mockReturnValue({ id: 'agent-a', folder: 'agent-a', workgroup_id: 'wg-a' });
+    hostActionMocks.getAllAgentGroups.mockReturnValue([{ id: 'agent-a', folder: 'agent-a', workgroup_id: 'wg-a' }]);
+    hostActionMocks.getSessionsByAgentGroup.mockReturnValue([sourceSession, destinationSession]);
+    hostActionMocks.readSessionOutbound.mockReturnValue(undefined);
+    hostActionMocks.quiesceSessionsForRepositoryMounts.mockImplementation(
+      async (sessions: Session[], epoch: string) => ({ epoch, sessions: [], barrierSessions: sessions }),
+    );
+    hostActionMocks.releaseRepositoryMountQuiescence.mockReturnValue([destinationSession]);
+    hostActionMocks.writeSessionMessageIfNew.mockResolvedValue(true);
+    hostActionMocks.wakeRepositoryMountSessions.mockImplementation(() => undefined);
+
+    const canonical = canonicalRepoDir('wg-a', 'proj', hostActionDataDir);
+    cloneTo(canonical);
+    const source = resolveRepositoryWorkUnit({
+      workgroupId: 'wg-a',
+      sessionId: sourceSession.id,
+      platformId: null,
+      messagingGroupId: null,
+      threadId: sourceSession.thread_id,
+    });
+    const destination = resolveRepositoryWorkUnit({
+      workgroupId: 'wg-a',
+      sessionId: destinationSession.id,
+      platformId: 'C-destination',
+      messagingGroupId: destinationSession.messaging_group_id,
+      threadId: destinationSession.thread_id,
+    });
+    const sourcePath = path.join(topicWorktreesDir(source, hostActionDataDir), 'proj');
+    const destinationPath = path.join(topicWorktreesDir(destination, hostActionDataDir), 'proj');
+    fs.mkdirSync(path.dirname(sourcePath), { recursive: true });
+    git(canonical, ['worktree', 'add', '-b', 'closed-task-transfer', sourcePath]);
+    fs.writeFileSync(path.join(sourcePath, 'ongoing.txt'), 'preserved from closed task\n');
+
+    await expect(
+      applyRepositoryTransferAction(
+        {
+          requestId: 'repo-1723600000000-1111222233334444',
+          repo: 'proj',
+          sourceThreadId: sourceSession.thread_id,
+          destinationWorkUnitKey: destination.key,
+        },
+        destinationSession,
+      ),
+    ).rejects.toThrow(/source topic is active/);
+    expect(hostActionMocks.readSessionOutbound).toHaveBeenCalledTimes(1);
+    expect(fs.existsSync(sourcePath)).toBe(true);
+    expect(fs.existsSync(destinationPath)).toBe(false);
+    const sourceNotice = hostActionMocks.writeSessionMessageIfNew.mock.calls.find(
+      (call) =>
+        (call[2] as { id: string }).id === 'repository-transfer-source-failed-repo-1723600000000-1111222233334444',
+    )?.[2] as { content: string };
+    expect(JSON.parse(sourceNotice.content).text).toContain('no host action is needed');
+
+    db.prepare("UPDATE sessions SET status = 'closed' WHERE id = ?").run(sourceSession.id);
+    hostActionMocks.readSessionOutbound.mockClear();
+    hostActionMocks.readSessionOutbound.mockImplementation(
+      (_location: unknown, action: (mailbox: unknown) => unknown) =>
+        action({
+          getProcessingClaimRows: () => [],
+          getContainerState: () => null,
+          hasWorkContinuation: () => true,
+        }),
+    );
+    await applyRepositoryTransferAction(
+      {
+        requestId: 'repo-1723600000000-5555666677778888',
+        repo: 'proj',
+        sourceThreadId: sourceSession.thread_id,
+        destinationWorkUnitKey: destination.key,
+      },
+      destinationSession,
+    );
+
+    expect(hostActionMocks.readSessionOutbound).not.toHaveBeenCalled();
+    expect(fs.existsSync(sourcePath)).toBe(false);
+    expect(fs.readFileSync(path.join(destinationPath, 'ongoing.txt'), 'utf8')).toBe('preserved from closed task\n');
+  });
+
+  it('writes and wakes a durable failure when source resolution rejects before any Git mutation', async () => {
+    const db = initTestDb();
+    runMigrations(db);
+    const now = new Date().toISOString();
+    db.prepare("INSERT INTO workgroups (id, onecli_secrets, created_at) VALUES ('wg-a', '[]', ?)").run(now);
+    db.prepare(
+      `INSERT INTO agent_groups (id, name, folder, agent_provider, created_at, workgroup_id)
+       VALUES (?, ?, ?, 'claude', ?, 'wg-a')`,
+    ).run('agent-a', 'Agent A', 'agent-a', now);
+    db.prepare(
+      `INSERT INTO messaging_groups
+         (id, channel_type, platform_id, instance, name, is_group, unknown_sender_policy, created_at)
+       VALUES (?, 'slack', ?, 'slack', ?, 1, 'strict', ?)`,
+    ).run('mg-destination', 'C-destination', 'destination', now);
+    const destinationSession = {
+      id: 'session-destination',
+      agent_group_id: 'agent-a',
+      messaging_group_id: 'mg-destination',
+      thread_id: '222.222',
+      agent_provider: 'claude',
+      status: 'active',
+      container_status: 'running',
+      last_active: null,
+      created_at: now,
+    } satisfies Session;
+    db.prepare(
+      `INSERT INTO sessions
+         (id, agent_group_id, messaging_group_id, thread_id, agent_provider, status, container_status, last_active, created_at)
+       VALUES (@id, @agent_group_id, @messaging_group_id, @thread_id, @agent_provider, @status, @container_status, @last_active, @created_at)`,
+    ).run(destinationSession);
+
+    hostActionMocks.getAgentGroup.mockReturnValue({ id: 'agent-a', folder: 'agent-a', workgroup_id: 'wg-a' });
+    hostActionMocks.getAllAgentGroups.mockReturnValue([{ id: 'agent-a', folder: 'agent-a', workgroup_id: 'wg-a' }]);
+    hostActionMocks.getSessionsByAgentGroup.mockReturnValue([destinationSession]);
+    hostActionMocks.writeSessionMessageIfNew.mockResolvedValue(true);
+    hostActionMocks.wakeRepositoryMountSessions.mockImplementation(() => undefined);
+
+    const destination = resolveRepositoryWorkUnit({
+      workgroupId: 'wg-a',
+      sessionId: destinationSession.id,
+      platformId: 'C-destination',
+      messagingGroupId: destinationSession.messaging_group_id,
+      threadId: destinationSession.thread_id,
+    });
+    const requestId = 'repo-1723600000000-0011223344556677';
+    await expect(
+      applyRepositoryTransferAction(
+        {
+          requestId,
+          repo: 'proj',
+          sourceThreadId: 'thread-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+          destinationWorkUnitKey: destination.key,
+        },
+        destinationSession,
+      ),
+    ).rejects.toThrow(/source thread is unknown/);
+
+    expect(hostActionMocks.quiesceSessionsForRepositoryMounts).not.toHaveBeenCalled();
+    expect(hostActionMocks.writeSessionMessageIfNew).toHaveBeenCalledTimes(1);
+    const failure = hostActionMocks.writeSessionMessageIfNew.mock.calls[0]![2];
+    expect(failure.id).toBe(`repository-transfer-failed-${requestId}`);
+    expect(JSON.parse(failure.content).text).toContain('source thread is unknown');
     expect(hostActionMocks.wakeRepositoryMountSessions).toHaveBeenCalledWith([destinationSession]);
   });
 });
 
 describe('transfer source thread resolution', () => {
-  const row = (id: string, platformId: string, threadId: string, messagingGroupId: string) => ({
+  const row = (id: string, platformId: string | null, threadId: string | null, messagingGroupId: string | null) => ({
     id,
     platform_id: platformId,
     thread_id: threadId,
@@ -1106,6 +1306,63 @@ describe('transfer source thread resolution', () => {
         threadId: 'slack:C-source:171234.567',
       }).key,
     );
+  });
+
+  it('resolves a scheduled-task source from its stored system task thread id', () => {
+    const threadId = 'system:tasks:push-xzo-pr-1355-5bb7';
+    const source = resolveTransferSourceWorkUnit('wg-a', threadId, [row('scheduled-task', null, threadId, null)]);
+
+    expect(source).toEqual(
+      resolveRepositoryWorkUnit({
+        workgroupId: 'wg-a',
+        sessionId: 'scheduled-task',
+        platformId: null,
+        messagingGroupId: null,
+        threadId,
+      }),
+    );
+  });
+
+  it('resolves a normal thread source from its managed topic locator', () => {
+    const sourceRow = row('source', 'slack:C-source', '171234.567', 'mg-source');
+    const expected = resolveRepositoryWorkUnit({
+      workgroupId: 'wg-a',
+      sessionId: sourceRow.id,
+      platformId: sourceRow.platform_id,
+      messagingGroupId: sourceRow.messaging_group_id,
+      threadId: sourceRow.thread_id,
+    });
+
+    expect(resolveTransferSourceWorkUnit('wg-a', `${expected.kind}-${expected.id}`, [sourceRow])).toEqual(expected);
+  });
+
+  it('gives an exact managed locator precedence over a colliding external thread id', () => {
+    const managedRow = row('managed', 'slack:C-managed', '171234.567', 'mg-managed');
+    const expected = resolveRepositoryWorkUnit({
+      workgroupId: 'wg-a',
+      sessionId: managedRow.id,
+      platformId: managedRow.platform_id,
+      messagingGroupId: managedRow.messaging_group_id,
+      threadId: managedRow.thread_id,
+    });
+    const locator = `${expected.kind}-${expected.id}`;
+    const collidingExternalRow = row('external', 'slack:C-external', locator, 'mg-external');
+
+    expect(resolveTransferSourceWorkUnit('wg-a', locator, [managedRow, collidingExternalRow])).toEqual(expected);
+  });
+
+  it('retains a locator-shaped external thread id when no managed locator matches it', () => {
+    const externalId = `thread-${'a'.repeat(32)}`;
+    const externalRow = row('external', 'slack:C-external', externalId, 'mg-external');
+    const expected = resolveRepositoryWorkUnit({
+      workgroupId: 'wg-a',
+      sessionId: externalRow.id,
+      platformId: externalRow.platform_id,
+      messagingGroupId: externalRow.messaging_group_id,
+      threadId: externalRow.thread_id,
+    });
+
+    expect(resolveTransferSourceWorkUnit('wg-a', externalId, [externalRow])).toEqual(expected);
   });
 
   it('rejects unknown and cross-conversation ambiguous raw thread ids', () => {
