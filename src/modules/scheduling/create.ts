@@ -1,5 +1,5 @@
 import { randomUUID } from 'crypto';
-import { touchSessionActivity } from '../../db/sessions.js';
+import { withQuietInvalidationSync } from '../../db/sessions.js';
 
 import { CronExpressionParser } from 'cron-parser';
 
@@ -159,28 +159,36 @@ export async function createScheduledTask(
   const id = makeTaskId(task.name);
   const { session } = resolveTaskSession(agentGroupId, id);
 
-  const row = await withExistingMailboxSession(agentGroupId, session.id, (mailbox) => {
-    mailbox.insertTaskRow({
-      id,
-      seriesId: id,
-      processAfter: task.processAfter,
-      recurrence: task.recurrence,
-      content: JSON.stringify({
-        prompt: task.prompt,
-        script: task.script,
-        originSessionId: options?.originSessionId ?? null,
-        // Physical send suppression: the agent-runner drops chat-kind
-        // outbound writes for tasks carrying muteChat (watcher-style tasks
-        // whose contract is board/file output, never channel posts).
-        ...(task.muteChat ? { muteChat: true } : {}),
-      }),
-      status: options?.status ?? 'pending',
-    });
-    return mailbox.getCreatedTaskRow(id) as ScheduledTaskRow;
-  });
+  // The insert changes when this session next has work due, and due-ness lives
+  // only in the session DB where the host sweep's quiet cache cannot see it.
+  // `withQuietInvalidationSync` clears the mark in the same synchronous turn as
+  // the insert, INSIDE the mailbox callback: `withExistingMailboxSession` awaits
+  // the mailbox's existence before it calls back, so invalidating outside would
+  // leave that await between the two (Codex round 3, H1). Fail-closed — a
+  // refused invalidation aborts the create rather than landing a row behind a
+  // mark nothing will clear.
+  const row = await withExistingMailboxSession(agentGroupId, session.id, (mailbox) =>
+    withQuietInvalidationSync(session.id, () => {
+      mailbox.insertTaskRow({
+        id,
+        seriesId: id,
+        processAfter: task.processAfter,
+        recurrence: task.recurrence,
+        content: JSON.stringify({
+          prompt: task.prompt,
+          script: task.script,
+          originSessionId: options?.originSessionId ?? null,
+          // Physical send suppression: the agent-runner drops chat-kind
+          // outbound writes for tasks carrying muteChat (watcher-style tasks
+          // whose contract is board/file output, never channel posts).
+          ...(task.muteChat ? { muteChat: true } : {}),
+        }),
+        status: options?.status ?? 'pending',
+      });
+      return mailbox.getCreatedTaskRow(id) as ScheduledTaskRow;
+    }),
+  );
   if (!row) throw new Error('task system session inbound.db not found');
-  // Quiet-cache/delivery-horizon invalidation — see touchSessionActivity.
-  touchSessionActivity(session.id);
 
   return { session: { id: session.id, agent_group_id: session.agent_group_id }, row };
 }

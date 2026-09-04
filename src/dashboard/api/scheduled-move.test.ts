@@ -76,7 +76,14 @@ function setupCentralDb(): void {
       container_status TEXT DEFAULT 'stopped', last_active TEXT, created_at TEXT NOT NULL,
       -- Migration 056: a move re-schedules into the target, which re-stamps
       -- the series' routing through resolveTaskSession.
-      task_routing_platform_id TEXT
+      task_routing_platform_id TEXT,
+      -- Migration 068: the host sweep's persisted quiet mark. Load-bearing —
+      -- both the compensation restore and scheduleTask wrap their write in
+      -- withQuietInvalidationSync, which nulls this column in the same
+      -- statement that moves last_active. Without the column that UPDATE
+      -- throws, and the helper is fail-closed, so the write it guards does not
+      -- happen at all.
+      sweep_quiet_until TEXT
     );
     CREATE INDEX idx_sessions_agent_group ON sessions(agent_group_id);
     CREATE UNIQUE INDEX sessions_channel_root_unique ON sessions(agent_group_id, messaging_group_id)
@@ -819,6 +826,34 @@ describe('moveExecuteHandler', () => {
       c: number;
     };
     expect(moveRows.c).toBe(0);
+  });
+
+  // Codex round 2, H2. The move cancels the source, then AWAITS the target
+  // insert. A sweep tick landing in that await sees a source with no live task
+  // and can mark it quiet. The compensation puts the pending row back — due work
+  // behind a mark taken during the await, which S2-PR15 would carry across a
+  // restart. Asserted on the central sessions row, not the funnel.
+  it('the compensation restore clears the source session quiet mark', async () => {
+    const { key } = seedMoveFixture({ sourceProcessAfter: isoIn(10 * 3600_000) });
+    getDb().prepare("DELETE FROM messaging_group_agents WHERE agent_group_id = 'tgt-ag'").run();
+
+    // The mark a sweep took while the target insert was in flight.
+    const stale = '2026-06-01T00:00:00.000Z';
+    getDb()
+      .prepare("UPDATE sessions SET last_active = ?, sweep_quiet_until = '2099-01-01T00:00:00.000Z' WHERE id = ?")
+      .run(stale, 'src-sess');
+
+    const res = (await moveExecuteHandler(req(moveBody()), { key }, ctxFor('owner', OWNER_SCOPES)))!;
+    expect(res.status).toBeGreaterThanOrEqual(500);
+    // The restore must actually have happened, or the assertion below is vacuous.
+    expect(liveRowsForSeries('src-ag', 'src-sess', 'ser-1')).toHaveLength(1);
+
+    const row = getDb().prepare('SELECT last_active, sweep_quiet_until FROM sessions WHERE id = ?').get('src-sess') as {
+      last_active: string | null;
+      sweep_quiet_until: string | null;
+    };
+    expect(row.sweep_quiet_until, 'the restored task is hidden behind a live quiet mark').toBeNull();
+    expect(row.last_active).not.toBe(stale);
   });
 
   // ── M2: compensation must NOT restore when the count is UNREADABLE ─────────────

@@ -175,11 +175,40 @@ export function updateSession(
   const values: Record<string, unknown> = { id };
 
   for (const [key, value] of Object.entries(updates)) {
-    if (value !== undefined) {
+    if (value === undefined) continue;
+    if (key === 'last_active') {
+      // MONOTONIC, never verbatim (Codex round 4, H1). Callers pass a raw
+      // `new Date().toISOString()` (session-manager.ts, delivery admission),
+      // which is millisecond-resolution — so an ordinary activity write landing
+      // in the SAME millisecond as `withQuietInvalidationSync`'s strict +1 ms
+      // would put the column back to the value a sweep's queued flush is
+      // guarded on (`WHERE last_active IS <basis>`), and that flush would then
+      // reinstall a mark over work that has just become due. An A→B→A step is
+      // the whole vulnerability; forbidding the step down closes it. No +1 ms
+      // here: only the invalidation needs a STRICT increase, and bumping on
+      // every activity write would drift the column off wall-clock for no gain.
+      fields.push(
+        'last_active = CASE WHEN last_active IS NULL OR last_active < @last_active THEN @last_active ELSE last_active END',
+      );
+    } else {
       fields.push(`${key} = @${key}`);
-      values[key] = value;
     }
+    values[key] = value;
   }
+  // The host sweep's persisted quiet mark (migration 068) is a prediction of
+  // when this session next has work — taken while `last_active` held some
+  // earlier value. Moving `last_active` is precisely the event that says the
+  // prediction is stale, so the mark dies in the SAME statement, never in a
+  // second write a caller could forget or a crash could lose. This is the
+  // durable half of the in-memory cache's `mark.lastActive === last_active`
+  // check.
+  //
+  // `updateSession` and `withQuietInvalidationSync` are the only two writers of
+  // `last_active` in the host (`createSession`'s INSERT aside), and both null
+  // the mark in the same statement. A future raw-SQL writer would silently
+  // reintroduce a mark that outlives a newly due row — and, unless it carried
+  // the monotonic CASE above, the round-4 ABA with it.
+  if (updates.last_active !== undefined) fields.push('sweep_quiet_until = NULL');
   if (fields.length === 0) return;
 
   getDb()
@@ -187,23 +216,168 @@ export function updateSession(
     .run(values);
 }
 
-/**
- * Bump a session's central last_active to now. REQUIRED after any write that
- * changes when the session next has due work (task insert, process_after
- * edit, recurrence re-arm): the host-sweep quiet cache and the delivery
- * sweep's activity horizon both key on last_active, so a task written into a
- * quiet/dormant session without this bump sits unseen until the cache
- * expires — or, past the 7-day delivery horizon, indefinitely.
- */
-export function touchSessionActivity(id: string): void {
-  try {
-    updateSession(id, { last_active: new Date().toISOString() });
-  } catch (err) {
-    // Advisory freshness hint — a failed bump must never abort the task
-    // write it rides on. Worst case is the old behavior (cache skips until
-    // expiry), loudly.
-    log.warn('touchSessionActivity failed', { sessionId: id, err });
+/** A central-DB quiet-mark invalidation that did not land. Thrown, never swallowed. */
+export class QuietInvalidationError extends Error {
+  readonly sessionId: string;
+  constructor(sessionId: string, cause: unknown) {
+    super(`quiet-mark invalidation failed for session ${sessionId}`, { cause });
+    this.name = 'QuietInvalidationError';
+    this.sessionId = sessionId;
   }
+}
+
+/**
+ * Run a due-ness write with its quiet mark invalidated first, or not at all.
+ *
+ * This is the ONLY shape a due-ness write may have. `write` must be the
+ * synchronous better-sqlite3 mutation itself, called from inside an
+ * already-open mailbox callback — never a promise, never a mailbox open.
+ *
+ * ── Why synchronous-only, and why there is no second invalidation ──
+ * The mark this clears is written by `persistQuietSessionMarks`, guarded by
+ * `WHERE sessions.last_active IS <basis>`. Order a sweep's flush against this
+ * helper and there are exactly two cases, both safe:
+ *
+ *   - The flush computed its basis BEFORE this UPDATE. The UPDATE moves
+ *     `last_active` off that basis, so the flush's guard fails and the mark is
+ *     never (re-)established. The value is always strictly greater, even inside
+ *     one millisecond: `toISOString()` is millisecond resolution, so a
+ *     same-millisecond write would otherwise republish the identical basis and
+ *     leave the guard satisfied.
+ *   - The flush computed its basis AFTER this UPDATE. Then it read a session
+ *     whose due row is already committed — `write()` runs with no `await`
+ *     between it and this statement, and better-sqlite3 is synchronous on the
+ *     single host thread, so no sweep tick can observe the gap — and a mark
+ *     taken over work it can see is a correct mark, not a stale one.
+ *
+ * An earlier revision bracketed the write with a second, swallowed
+ * invalidation to cover an `await` in between (Codex round 2, H1). That is what
+ * this shape removes: a best-effort second write is not a guarantee, and its
+ * failure reproduced the very outcome it was added to prevent (round 3, H1).
+ * No await, no window, no second write.
+ *
+ * ── Fail-closed, including on zero rows ──
+ * The statement is written here rather than delegated to `updateSession`
+ * because the affected-row count is the point (round 3, H2). `changes !== 1`
+ * means no ACTIVE session row was there to invalidate — closed, archiving, or
+ * deleted between the caller's discovery and this callback — and the mailbox
+ * write is then abandoned rather than committed into a session the sweep will
+ * never enumerate. `status = 'active'` is exactly the sweep's own enumeration
+ * predicate (`getActiveSessions`) and `getWarmQuietSessionMarks`'.
+ *
+ * `archived_at` is deliberately NOT in the predicate, even though the column
+ * exists on this table (migration 031). Archiving is an operator-side display
+ * flag — an archived session still processes inbound traffic, still runs its
+ * container, and is still enumerated by `getActiveSessions` — so refusing its
+ * due-ness writes would break live sessions merely dismissed from the inbox
+ * view. The predicate has to match what the sweep enumerates, and that is
+ * `status` alone.
+ */
+export function withQuietInvalidationSync<T>(sessionId: string, write: () => T): T {
+  const now = new Date().toISOString();
+  let changes: number;
+  try {
+    changes = getDb()
+      .prepare(
+        `UPDATE sessions
+            SET last_active = CASE
+                  WHEN last_active IS NULL OR last_active < @now THEN @now
+                  -- Strictly increasing even when the clock has not moved: see
+                  -- the first ordering case above.
+                  ELSE strftime('%Y-%m-%dT%H:%M:%fZ', last_active, '+0.001 seconds')
+                END,
+                sweep_quiet_until = NULL
+          WHERE id = @id
+            AND status = 'active'`,
+      )
+      .run({ id: sessionId, now }).changes;
+  } catch (err) {
+    throw new QuietInvalidationError(sessionId, err);
+  }
+  if (changes !== 1) {
+    throw new QuietInvalidationError(
+      sessionId,
+      new Error(`no active session row to invalidate (${changes} rows matched)`),
+    );
+  }
+  return write();
+}
+
+/** One quiet mark to persist: the session, the ISO instant its skip expires, and the basis it was computed on. */
+export interface QuietSessionMark {
+  sessionId: string;
+  /** ISO-8601 UTC. */
+  quietUntil: string;
+  /**
+   * The row's `last_active` at the moment the mark was computed. The write
+   * guard, not decoration — see `persistQuietSessionMarks`.
+   */
+  lastActive: string | null;
+}
+
+/**
+ * Persist a whole tick's newly-taken quiet marks.
+ *
+ * ONE statement for the batch, not one per session, and called only on the
+ * quiet TRANSITION — never on a tick that merely re-confirms an existing mark.
+ * A per-tick write of the ~840 rows the cache already holds would be a new
+ * cost, not a saving; the whole point of the cache is that a quiet session
+ * costs nothing per tick.
+ *
+ * ── The `last_active` guard is load-bearing, not belt-and-braces. ──
+ * A mark is computed against the `last_active` the driver read at the START of
+ * that session's sweep, but the batch is flushed only after the WHOLE fan-out,
+ * and the driver yields to the event loop after every session. Inbound arriving
+ * in one of those yields bumps `last_active` and clears this column (see
+ * `updateSession`) — and an unconditional write would then put the now-stale
+ * expiry straight back, so a restart before the next tick would warm it and
+ * skip a session that is genuinely due, without ever opening its inbound.db.
+ * Comparing the basis null-safely (`IS`, not `=`, because `last_active` is
+ * nullable) makes that write a no-op for exactly the rows that moved. The
+ * in-memory mark needs no equivalent: the next tick re-reads `last_active` and
+ * invalidates it there.
+ */
+export function persistQuietSessionMarks(marks: readonly QuietSessionMark[]): void {
+  if (marks.length === 0) return;
+  const byId: Record<string, { until: string; basis: string | null }> = {};
+  for (const mark of marks) byId[mark.sessionId] = { until: mark.quietUntil, basis: mark.lastActive };
+  getDb()
+    .prepare(
+      `UPDATE sessions
+          SET sweep_quiet_until = json_extract(j.value, '$.until')
+         FROM json_each(@marks) AS j
+        WHERE sessions.id = j.key
+          AND sessions.last_active IS json_extract(j.value, '$.basis')`,
+    )
+    .run({ marks: JSON.stringify(byId) });
+}
+
+/** A persisted quiet mark, with the `last_active` the warm path re-bases it on. */
+export interface WarmQuietSessionMark {
+  id: string;
+  sweep_quiet_until: string;
+  last_active: string | null;
+}
+
+/**
+ * Every still-valid persisted quiet mark, for `startHostSweep` to warm the
+ * in-memory cache from. One query, no per-session DB opens.
+ *
+ * `status = 'active'` is what makes a prune duty unnecessary: a closed or
+ * archiving session is never in the sweep's session list, so a mark left on
+ * its row is unreachable rather than stale, and the reclaim deletes the row.
+ * An expired mark is filtered here rather than cleared, so this is a pure read.
+ */
+export function getWarmQuietSessionMarks(nowIso: string): WarmQuietSessionMark[] {
+  return getDb()
+    .prepare(
+      `SELECT id, sweep_quiet_until, last_active
+         FROM sessions
+        WHERE status = 'active'
+          AND sweep_quiet_until IS NOT NULL
+          AND datetime(sweep_quiet_until) > datetime(@now)`,
+    )
+    .all({ now: nowIso }) as WarmQuietSessionMark[];
 }
 
 /**

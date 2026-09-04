@@ -24,7 +24,7 @@ import { getAgentGroup } from '../../db/agent-groups.js';
 import { getWorkgroupOnecliSecrets } from '../../db/agent-groups.js';
 import { getMessagingGroup } from '../../db/messaging-groups.js';
 import { getDb } from '../../db/connection.js';
-import { findSystemSession, taskThreadId } from '../../db/sessions.js';
+import { findSystemSession, taskThreadId, withQuietInvalidationSync } from '../../db/sessions.js';
 import { readSessionInbound, type ScheduledTaskRow } from '../../modules/mailbox/index.js';
 import { withExistingMailboxSession } from '../../session-manager.js';
 import * as scheduledTasks from '../../db/scheduled-tasks.js';
@@ -656,7 +656,32 @@ export const moveExecuteHandler: AuthHandler = async (req, params, ctx) => {
       if (!live.unreadable && live.count === 0) {
         restored =
           (await withExistingMailboxSession(source.agentGroupId, source.sessionId, (mailbox) => {
-            mailbox.restoreTaskRow(restoreSnapshot);
+            // The source was cancelled, then the target insert was AWAITED — a
+            // sweep tick can land in that await, see a source with no live task
+            // and mark it quiet. Restoring the pending row here puts due work
+            // back behind that mark, and S2-PR15 would carry it across a
+            // restart. The central-DB invalidation is what clears it.
+            //
+            // Invalidate BEFORE the restore, in the same synchronous turn
+            // (Codex pre-pass Part C, round 3 H1): inbound.db and the central DB
+            // are two separate files with no shared transaction, so a crash
+            // between them is survivable only if the mark dies first. Its worst
+            // case is one wasted sweep of a session whose restore then fails;
+            // the reverse leaves a restored due row hidden behind a persisted
+            // quiet mark for up to `QUIET_SESSION_BACKOFF_MS` after a warmed
+            // restart. This also keeps the invalidation before `purgeIntentBody`
+            // below: a crash between the two still leaves the intent for
+            // `recoverMoveIntents` to finish.
+            //
+            // FAIL-CLOSED (Codex round 2, H1; round 3, H2): the invalidation
+            // inside `withQuietInvalidationSync` throws — on a central-DB error
+            // AND on a session row that is gone or no longer active — and the
+            // throw escapes into the `restoreErr` catch below. `restored` stays
+            // false, the `move_restore_failed` audit row is written and
+            // `purgeIntentBody` is SKIPPED, so `recoverMoveIntents` still owns
+            // the repair. A swallowed failure would restore the row behind a
+            // mark nothing clears and then purge the only record of it.
+            withQuietInvalidationSync(source.sessionId, () => mailbox.restoreTaskRow(restoreSnapshot));
             return true;
           })) ?? false;
       }

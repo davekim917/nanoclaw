@@ -410,6 +410,42 @@ describe('#315 — fail-closed is unchanged', () => {
   });
 });
 
+describe('S2-PR16 — F-16.1', () => {
+  /**
+   * F-16.1, carried from `main` unchanged in substance: the seam-2 integration
+   * must not lose #315's reuse/rebuild decision, and it must keep making it on
+   * a worker thread rather than the host's own. Both halves in one case,
+   * because either alone passes for the wrong reason — a build that never
+   * happens is "reused", and a build that always happens is "rebuilt".
+   */
+  it('a fresh projection is reused and a stale one is rebuilt on a worker thread', async () => {
+    const src = makeTwoWorkgroupSource('f16-1');
+    const worker = useFakeWorker();
+    const dst = tmpPath('f16-1-dst');
+
+    // Build once, then ask again with nothing changed: the second call must not
+    // reach the worker at all.
+    await ensureArchiveProjection(src, dst, 'ag-one-a', ['ag-one-a', 'ag-one-b']);
+    expect(worker.posted).toHaveLength(1);
+    await ensureArchiveProjection(src, dst, 'ag-one-a', ['ag-one-a', 'ag-one-b']);
+    expect(worker.posted, 'a fresh projection was rebuilt').toHaveLength(1);
+
+    // An in-place edit — the change a row-count or MAX(sent_at) watermark
+    // misses — must send a second build to the worker and land in the file.
+    const db = new Database(src);
+    db.prepare("UPDATE messages_archive SET text = 'edited for F-16.1' WHERE id = 'w1-a-a'").run();
+    db.close();
+
+    await ensureArchiveProjection(src, dst, 'ag-one-a', ['ag-one-a', 'ag-one-b']);
+    expect(worker.posted, 'a stale projection was reused').toHaveLength(2);
+    expect(allRows(dst).map((row) => row.text)).toContain('edited for F-16.1');
+
+    // Off-thread, not in process: every build went through the worker seam, and
+    // the host never fell back to the synchronous builder.
+    expect(worker.posted.map((request) => request.dstPath)).toEqual([dst, dst]);
+  });
+});
+
 describe('#315 — the real worker thread builds the projection', () => {
   it('produces the same contents off the main thread as the synchronous builder', async () => {
     const src = makeTwoWorkgroupSource('realworker');

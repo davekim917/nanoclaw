@@ -11,14 +11,9 @@ import os from 'os';
 import path from 'path';
 
 import Database from 'better-sqlite3';
-import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
-import {
-  countDueMessages,
-  deleteOrphanProcessingClaims,
-  getProcessingClaims,
-  type ContainerState,
-} from './modules/mailbox/ops/sweep.js';
+import { countDueMessages } from './modules/mailbox/ops/sweep.js';
 import { composeNanoclawSession, type NanoclawMailboxSession } from './modules/mailbox/index.js';
 import { getAgentMailbox } from './mailbox/index.js';
 import { withExistingMailboxSession } from './session-manager.js';
@@ -26,38 +21,21 @@ import { closeDb, initTestDb, runMigrations } from './db/index.js';
 import {
   ABSOLUTE_CEILING_MS,
   CLAIM_STUCK_MS,
-  CONTINUATION_WAKE_MIN_INTERVAL_MS,
   SPAWN_GRACE_MS,
-  WORK_CONTINUATION_RESUME_MAX_ATTEMPTS,
-  _applyCeilingFollowUpForTesting,
-  _hasWorkContinuationForTesting,
-  _notifyKillCeilingForTesting,
-  _prepareDueWakeForTesting,
-  _resetStuckProcessingRowsForTesting,
   _resetSweepRegistryForTesting,
   registerSweepKillFollowUp,
-  _incrementStoppedContinuationAttemptForTesting,
   _sweepSessionForTesting,
-  canAttemptContinuationRecovery,
-  countToolRecoveryAttemptsSinceRealInbound,
-  decideCeilingFollowUp,
-  decideContinuationWake,
-  hasDueRecoveryWake,
   parseSqliteUtc,
-  parkDueRecoveryWakes,
-  readContinuationRecoveryAttemptAt,
-  readWorkContinuation,
-  restoreWorkContinuationResumeAttempt,
-  incrementWorkContinuationResumeAttempt,
-  migrateLegacyWorkContinuationForRecovery,
-  notifyContinuationParked,
-  shouldCloseTaskSession,
 } from './host-sweep.js';
 // S14 (the running-container SLA) and both post-kill write paths moved to the
 // container-health family in S2-PR10; its test-only entry point moved with the
 // body. These SLA cases are mailbox seam PR 5b's and B1's, and they still drive
 // the same duty through the same registry.
-import { _enforceRunningContainerSlaForTesting } from './modules/sweep-container-health/index.js';
+import {
+  _enforceRunningContainerSlaForTesting,
+  _resetPostKillForTesting,
+  _settlePostKillForTesting,
+} from './modules/sweep-container-health/index.js';
 // T19 (the usage rollup) moved to the sweep-usage family in S2-PR12, and the
 // module exports its body directly. The two cases below are mailbox seam
 // PR 6's (Codex P2, the hot-journal durability options): they exercise the
@@ -67,6 +45,20 @@ import { _enforceRunningContainerSlaForTesting } from './modules/sweep-container
 // cases stay on this file's fixture and reach across for the moved body, the
 // same way the SLA cases above do.
 import { sweepUsageRollup as _sweepUsageRollupForTesting } from './modules/sweep-usage/index.js';
+// The TOCTOU entry point moved with `incrementStoppedContinuationAttempt` into
+// the continuation family (S2-PR13); the case below is unchanged.
+import { _incrementStoppedContinuationAttemptForTesting } from './modules/sweep-continuation/index.js';
+// The error-rule case below drives a THROW through the due-admission duty
+// (S5), which now lives in the scheduling family module (S2-PR11) — importing
+// it registers that duty so the case keeps its original vehicle.
+import './modules/sweep-scheduling/index.js';
+// The post-kill follow-up chain this file asserts is now spread across three
+// families: S15 (ceiling notice) and S10 (accountability wake) register from
+// sweep-continuation, S17's post-kill orphan-claim reset from sweep-session-core.
+// Without these side-effect imports `runSweepKillFollowUps` dispatches nothing
+// and the control arm of the post-kill case fails — the sibling-family import
+// S2-PR14's 23f0c4ab added to the family suites, owed here for the same reason.
+import './modules/sweep-session-core/index.js';
 import { getDb } from './db/connection.js';
 import type { Session } from './types.js';
 
@@ -165,519 +157,7 @@ vi.mock('./db/sessions.js', async (importOriginal) => {
   };
 });
 
-describe('decideCeilingFollowUp', () => {
-  const NOW = Date.parse('2026-07-28T12:00:00.000Z');
-
-  it('wakes when a fresh tool was in flight at kill time', () => {
-    expect(
-      decideCeilingFollowUp({
-        hasContinuation: false,
-        currentTool: 'Bash',
-        toolStartedAt: new Date(NOW - 5 * 60_000).toISOString(),
-        priorToolAttempts: 0,
-        now: NOW,
-      }),
-    ).toEqual({
-      action: 'wake-accountable',
-      reason: 'tool',
-    });
-  });
-
-  it('wakes for an explicit durable continuation', () => {
-    expect(
-      decideCeilingFollowUp({
-        hasContinuation: true,
-        currentTool: null,
-        toolStartedAt: null,
-        priorToolAttempts: 0,
-        now: NOW,
-      }),
-    ).toEqual({
-      action: 'wake-accountable',
-      reason: 'continuation',
-    });
-  });
-
-  it('stays quiet without an explicit continuation or fresh tool', () => {
-    expect(
-      decideCeilingFollowUp({
-        hasContinuation: false,
-        currentTool: null,
-        toolStartedAt: null,
-        priorToolAttempts: 0,
-        now: NOW,
-      }),
-    ).toEqual({ action: 'none' });
-  });
-
-  // Contract change (owner-approved): the bound is the ceiling that actually
-  // fired plus one sweep interval, not ABSOLUTE_CEILING_MS flat. Starting a
-  // tool emits a provider event which touches the heartbeat, so at kill time
-  // the tool is always at LEAST as old as the heartbeat age that just crossed
-  // the ceiling — the old bound made this branch unreachable and every wedged
-  // tool went dark with no accountability wake.
-  it('wakes for a tool wedged since exactly the ceiling that fired', () => {
-    expect(
-      decideCeilingFollowUp({
-        hasContinuation: false,
-        currentTool: 'Bash',
-        toolStartedAt: new Date(NOW - ABSOLUTE_CEILING_MS - 1).toISOString(),
-        priorToolAttempts: 0,
-        now: NOW,
-        ceilingMs: ABSOLUTE_CEILING_MS,
-      }),
-    ).toEqual({ action: 'wake-accountable', reason: 'tool' });
-  });
-
-  // The sweep-lag slack belongs to the kill path only. host-restart-warn asks
-  // "is a tool in flight right now" against live state and omits ceilingMs, so
-  // it must keep the plain ABSOLUTE_CEILING_MS freshness window.
-  it('keeps the un-widened freshness window when no ceiling is supplied', () => {
-    expect(
-      decideCeilingFollowUp({
-        hasContinuation: false,
-        currentTool: 'Bash',
-        toolStartedAt: new Date(NOW - ABSOLUTE_CEILING_MS - 1).toISOString(),
-        priorToolAttempts: 0,
-        now: NOW,
-      }),
-    ).toEqual({ action: 'none' });
-  });
-
-  it('honors a ceiling widened by the tool’s own declared timeout', () => {
-    const widened = 60 * 60 * 1000;
-    const args = {
-      hasContinuation: false,
-      currentTool: 'Bash' as const,
-      // Detected one sweep tick after a 60-min ceiling elapsed.
-      toolStartedAt: new Date(NOW - widened - 30_000).toISOString(),
-      priorToolAttempts: 0,
-      now: NOW,
-    };
-    expect(decideCeilingFollowUp({ ...args, ceilingMs: widened })).toEqual({
-      action: 'wake-accountable',
-      reason: 'tool',
-    });
-    // Without the widened ceiling the same tool reads as stale garbage.
-    expect(decideCeilingFollowUp(args)).toEqual({ action: 'none' });
-  });
-
-  it('still rejects a tool older than the ceiling plus one sweep interval', () => {
-    expect(
-      decideCeilingFollowUp({
-        hasContinuation: false,
-        currentTool: 'Bash',
-        toolStartedAt: new Date(NOW - ABSOLUTE_CEILING_MS - 60_000 - 1).toISOString(),
-        priorToolAttempts: 0,
-        now: NOW,
-        ceilingMs: ABSOLUTE_CEILING_MS,
-      }),
-    ).toEqual({ action: 'none' });
-  });
-
-  it('rejects future and malformed tool timestamps', () => {
-    for (const toolStartedAt of [new Date(NOW + 1).toISOString(), 'not-a-time']) {
-      expect(
-        decideCeilingFollowUp({
-          hasContinuation: false,
-          currentTool: 'Bash',
-          toolStartedAt,
-          priorToolAttempts: 0,
-          now: NOW,
-        }),
-      ).toEqual({ action: 'none' });
-    }
-  });
-
-  it('caps a wedged tool at the ceiling once the attempt budget is spent', () => {
-    expect(
-      decideCeilingFollowUp({
-        hasContinuation: false,
-        currentTool: 'Bash',
-        toolStartedAt: new Date(NOW - ABSOLUTE_CEILING_MS - 1).toISOString(),
-        priorToolAttempts: WORK_CONTINUATION_RESUME_MAX_ATTEMPTS,
-        now: NOW,
-        ceilingMs: ABSOLUTE_CEILING_MS,
-      }),
-    ).toEqual({ action: 'none' });
-  });
-
-  it('caps tool-only recovery after two attempts without real inbound', () => {
-    expect(
-      decideCeilingFollowUp({
-        hasContinuation: false,
-        currentTool: 'Bash',
-        toolStartedAt: new Date(NOW - 5 * 60_000).toISOString(),
-        priorToolAttempts: WORK_CONTINUATION_RESUME_MAX_ATTEMPTS,
-        now: NOW,
-      }),
-    ).toEqual({ action: 'none' });
-  });
-});
-
-describe('applyCeilingFollowUp — accountability wake rows', () => {
-  const HB_AGE = 35 * 60 * 1000;
-
-  beforeEach(() => armSelfHeal(false));
-  afterEach(() => armSelfHeal(false));
-
-  function respawnRows(inDb: Database.Database) {
-    return inDb
-      .prepare(
-        "SELECT id, kind, status, trigger, on_wake, content FROM messages_in WHERE id LIKE 'ceiling-respawn-%' ORDER BY seq",
-      )
-      .all() as Array<{ id: string; kind: string; status: string; trigger: number; on_wake: number; content: string }>;
-  }
-
-  const continuation = {
-    id: 'cont-1',
-    task: 'write the dbt tests',
-    source_message_id: 'origin-1',
-    phase: 'queued' as const,
-    chain: 1,
-    resume_attempts: 0,
-    recovery_episode: 0,
-  };
-
-  it('writes one deterministic deferred on_wake pair for a continuation', () => {
-    const { inDb, mailbox } = makeSessionDbs();
-    inDb
-      .prepare(
-        `INSERT INTO messages_in (id, seq, kind, timestamp, status, trigger, content)
-         VALUES ('legacy-user', 2, 'chat', ?, 'completed', 1, 'legacy plain-text inbound')`,
-      )
-      .run('2026-07-28T11:59:00.000Z');
-    const res = _applyCeilingFollowUpForTesting(mailbox, fakeSession(), null, continuation, HB_AGE);
-    expect(res).toEqual({ action: 'wake-accountable', reason: 'continuation' });
-    const rows = respawnRows(inDb);
-    expect(rows).toHaveLength(1);
-    expect(rows[0].status).toBe('pending');
-    expect(rows[0].trigger).toBe(0);
-    expect(rows[0].on_wake).toBe(1);
-    const content = JSON.parse(rows[0].content);
-    expect(content.sender).toBe('system');
-    expect(content._system.kind).toBe('agent_ceiling_respawn');
-    expect(content._system.reason).toBe('continuation');
-    expect(content.text).toContain('idle ceiling');
-    // The wake must name the saved task, or the agent can't tell this wake IS
-    // its continuation and re-derives (or redoes) the promised work.
-    expect(content.text).toContain('write the dbt tests');
-    expect(content.text).toContain('cont-1');
-    const recall = inDb
-      .prepare("SELECT trigger, on_wake, content FROM messages_in WHERE id LIKE 'recall-ceiling-respawn-%'")
-      .get() as { trigger: number; on_wake: number; content: string };
-    expect(recall.trigger).toBe(0);
-    expect(recall.on_wake).toBe(1);
-    expect(JSON.parse(recall.content)).toEqual({ subtype: 'recall_context', deferred: true });
-    _applyCeilingFollowUpForTesting(mailbox, fakeSession(), null, continuation, HB_AGE);
-    expect(respawnRows(inDb)).toHaveLength(1);
-  });
-
-  it('writes a fresh wake after real inbound starts a new recovery episode', () => {
-    const { inDb, mailbox } = makeSessionDbs();
-    _applyCeilingFollowUpForTesting(mailbox, fakeSession(), null, continuation, HB_AGE);
-    _applyCeilingFollowUpForTesting(mailbox, fakeSession(), null, { ...continuation, recovery_episode: 1 }, HB_AGE);
-
-    const rows = respawnRows(inDb);
-    expect(rows).toHaveLength(2);
-    expect(rows[0].id).not.toBe(rows[1].id);
-  });
-
-  it('wakes on a fresh in-flight-tool signal', () => {
-    armSelfHeal(true);
-    const { inDb, mailbox } = makeSessionDbs();
-    const res = _applyCeilingFollowUpForTesting(
-      mailbox,
-      fakeSession(),
-      { current_tool: 'Bash', tool_started_at: new Date().toISOString() } as ContainerState,
-      null,
-      HB_AGE,
-    );
-    expect(res).toEqual({ action: 'wake-accountable', reason: 'tool' });
-    const rows = respawnRows(inDb);
-    expect(rows).toHaveLength(1);
-    // A tool-only wake has no saved task to name.
-    expect(JSON.parse(rows[0].content).text).not.toContain('saved continuation');
-  });
-
-  // Class 2's accountability artifact: a container killed at the ceiling with a
-  // wedged tool must leave behind an on_wake row that respawns it.
-  it('writes the wedged-tool accountability artifact for a tool stuck since the ceiling', () => {
-    armSelfHeal(true);
-    const { inDb, mailbox } = makeSessionDbs();
-    const res = _applyCeilingFollowUpForTesting(
-      mailbox,
-      fakeSession(),
-      {
-        current_tool: 'Bash',
-        tool_started_at: new Date(Date.now() - ABSOLUTE_CEILING_MS - 1_000).toISOString(),
-      } as ContainerState,
-      null,
-      HB_AGE,
-    );
-    expect(res).toEqual({ action: 'wake-accountable', reason: 'tool' });
-    const rows = respawnRows(inDb);
-    expect(rows).toHaveLength(1);
-    expect(rows[0].on_wake).toBe(1);
-    const content = JSON.parse(rows[0].content);
-    expect(content._system.kind).toBe('agent_ceiling_respawn');
-    expect(content._system.reason).toBe('tool');
-    expect(content.text).toContain('done / lost / next');
-  });
-
-  it('shadow mode logs but writes nothing for the wedged-tool wake', () => {
-    armSelfHeal(false);
-    const { inDb, mailbox } = makeSessionDbs();
-    const res = _applyCeilingFollowUpForTesting(
-      mailbox,
-      fakeSession(),
-      { current_tool: 'Bash', tool_started_at: new Date().toISOString() } as ContainerState,
-      null,
-      HB_AGE,
-    );
-    expect(res).toEqual({ action: 'none' });
-    expect(respawnRows(inDb)).toHaveLength(0);
-  });
-
-  it('shadow mode never withholds the long-shipped continuation wake', () => {
-    armSelfHeal(false);
-    const { inDb, mailbox } = makeSessionDbs();
-    const res = _applyCeilingFollowUpForTesting(mailbox, fakeSession(), null, continuation, HB_AGE);
-    expect(res).toEqual({ action: 'wake-accountable', reason: 'continuation' });
-    expect(respawnRows(inDb)).toHaveLength(1);
-  });
-
-  it('does not fire for a quiet idle container', () => {
-    const { inDb, mailbox } = makeSessionDbs();
-    const res = _applyCeilingFollowUpForTesting(mailbox, fakeSession(), null, null, HB_AGE);
-    expect(res).toEqual({ action: 'none' });
-    expect(respawnRows(inDb)).toHaveLength(0);
-  });
-});
-
 // ─── Class 1: failed-provider self-heal ──────────────────────────────────────
-
-describe('durable continuation wake', () => {
-  const continuation = {
-    id: 'cont-1',
-    task: 'write the dbt tests',
-    source_message_id: 'origin-1',
-    phase: 'queued' as const,
-    chain: 1,
-    resume_attempts: 0,
-    recovery_episode: 0,
-  };
-
-  it('throttles respins after a recent spawn', () => {
-    const now = Date.now();
-    expect(decideContinuationWake({ now, spawnedAtMs: now - 60_000 })).toBe(false);
-    expect(decideContinuationWake({ now, spawnedAtMs: now - CONTINUATION_WAKE_MIN_INTERVAL_MS - 1 })).toBe(true);
-    expect(decideContinuationWake({ now, spawnedAtMs: 0 })).toBe(true);
-    expect(
-      decideContinuationWake({
-        now,
-        spawnedAtMs: 0,
-        lastRecoveryAttemptAtMs: now - 60_000,
-      }),
-    ).toBe(false);
-  });
-
-  it('reads valid current and legacy stored work', () => {
-    const { outDb } = makeSessionDbs();
-    expect(_hasWorkContinuationForTesting(outDb)).toBe(false);
-    outDb.prepare('INSERT INTO session_state VALUES (?, ?, ?)').run(
-      'work_continuation',
-      JSON.stringify({
-        id: continuation.id,
-        task: continuation.task,
-        phase: continuation.phase,
-        chain: continuation.chain,
-        resume_attempts: continuation.resume_attempts,
-      }),
-      new Date().toISOString(),
-    );
-    expect(_hasWorkContinuationForTesting(outDb)).toBe(true);
-    expect(readWorkContinuation(outDb)?.recovery_episode).toBe(0);
-    outDb
-      .prepare('UPDATE session_state SET value = ? WHERE key = ?')
-      .run(JSON.stringify({ ...continuation, task: '  ' }), 'work_continuation');
-    expect(_hasWorkContinuationForTesting(outDb)).toBe(false);
-    outDb.prepare('DELETE FROM session_state').run();
-    outDb
-      .prepare('INSERT INTO session_state VALUES (?, ?, ?)')
-      .run('pending_next', JSON.stringify({ task: 'legacy task', chain: 2 }), new Date().toISOString());
-    expect(_hasWorkContinuationForTesting(outDb)).toBe(true);
-  });
-
-  it('exposes the shared recovery cap', () => {
-    expect(WORK_CONTINUATION_RESUME_MAX_ATTEMPTS).toBe(2);
-  });
-
-  it('increments exactly twice, rejects a third attempt, and restores a rejected wake', () => {
-    const { outDb } = makeSessionDbs();
-    outDb
-      .prepare('INSERT INTO session_state VALUES (?, ?, ?)')
-      .run(
-        'work_continuation',
-        JSON.stringify({ ...continuation, phase: 'running', runner_id: 'stopped-runner' }),
-        new Date().toISOString(),
-      );
-
-    const previous = readWorkContinuation(outDb)!;
-    const first = incrementWorkContinuationResumeAttempt(outDb, continuation.id);
-    expect(first?.resume_attempts).toBe(1);
-    expect(first?.source_message_id).toBe('origin-1');
-    expect(first).toMatchObject({ phase: 'queued' });
-    expect(first?.runner_id).toBeUndefined();
-    expect(readContinuationRecoveryAttemptAt(outDb, first!)).toBeGreaterThan(Date.now() - 1_000);
-    expect(restoreWorkContinuationResumeAttempt(outDb, first!, previous)).toMatchObject({
-      phase: 'running',
-      runner_id: 'stopped-runner',
-      resume_attempts: 0,
-    });
-
-    const retriedFirst = incrementWorkContinuationResumeAttempt(outDb, continuation.id);
-    const second = incrementWorkContinuationResumeAttempt(outDb, continuation.id);
-    expect(second?.resume_attempts).toBe(2);
-    expect(canAttemptContinuationRecovery(second!)).toBe(false);
-    expect(incrementWorkContinuationResumeAttempt(outDb, continuation.id)).toBeNull();
-
-    expect(restoreWorkContinuationResumeAttempt(outDb, second!, retriedFirst!)?.resume_attempts).toBe(1);
-    expect(restoreWorkContinuationResumeAttempt(outDb, second!, retriedFirst!)).toBeNull();
-    expect(readWorkContinuation(outDb)?.resume_attempts).toBe(1);
-  });
-
-  it('migrates a legacy promise into a counted one-shot recovery record', () => {
-    const { outDb } = makeSessionDbs();
-    outDb
-      .prepare('INSERT INTO session_state VALUES (?, ?, ?)')
-      .run('pending_next', JSON.stringify({ task: 'legacy task', chain: 2 }), new Date().toISOString());
-    const migrated = migrateLegacyWorkContinuationForRecovery(outDb);
-    expect(migrated?.id).not.toBe('legacy-pending-next');
-    expect(migrated?.resume_attempts).toBe(1);
-    expect(outDb.prepare("SELECT 1 FROM session_state WHERE key = 'pending_next'").get()).toBeUndefined();
-    expect(readWorkContinuation(outDb)?.id).toBe(migrated?.id);
-  });
-
-  it('restores the legacy promise exactly when its recovery spawn is rejected', () => {
-    const { outDb } = makeSessionDbs();
-    outDb
-      .prepare('INSERT INTO session_state VALUES (?, ?, ?)')
-      .run('pending_next', JSON.stringify({ task: 'legacy task', chain: 2 }), new Date().toISOString());
-
-    const previous = readWorkContinuation(outDb)!;
-    const attempted = migrateLegacyWorkContinuationForRecovery(outDb)!;
-    expect(restoreWorkContinuationResumeAttempt(outDb, attempted, previous)).toEqual(previous);
-    expect(outDb.prepare("SELECT 1 FROM session_state WHERE key = 'work_continuation'").get()).toBeUndefined();
-    expect(outDb.prepare("SELECT value FROM session_state WHERE key = 'pending_next'").get()).toEqual({
-      value: JSON.stringify({ task: 'legacy task', chain: 2 }),
-    });
-    expect(readWorkContinuation(outDb)).toEqual(previous);
-  });
-
-  it('parks only due recovery rows at the cap and leaves real inbound wakeable', () => {
-    const { inDb } = makeSessionDbs();
-    const now = new Date().toISOString();
-    const insert = inDb.prepare(
-      `INSERT INTO messages_in (id, seq, kind, timestamp, status, trigger, content)
-       VALUES (?, ?, 'chat', ?, 'pending', 1, ?)`,
-    );
-    insert.run('ceiling-respawn-cont-1', 2, now, JSON.stringify({ sender: 'system' }));
-    insert.run('host-restart-cont-1', 4, now, JSON.stringify({ sender: 'system' }));
-    insert.run('user-1', 6, now, JSON.stringify({ sender: 'Alice' }));
-
-    expect(hasDueRecoveryWake(inDb, now)).toBe(true);
-    expect(parkDueRecoveryWakes(inDb, now)).toBe(2);
-    expect(hasDueRecoveryWake(inDb, now)).toBe(false);
-    expect(inDb.prepare("SELECT status FROM messages_in WHERE id = 'user-1'").get()).toEqual({ status: 'pending' });
-  });
-
-  it('caps tool-only episodes and resets the count after real inbound', () => {
-    const { inDb, mailbox } = makeSessionDbs();
-    const insert = inDb.prepare(
-      `INSERT INTO messages_in (id, seq, kind, timestamp, status, trigger, content)
-       VALUES (?, ?, 'chat', ?, 'completed', 1, ?)`,
-    );
-    insert.run('ceiling-respawn-tool-1', 2, '2026-07-28T12:00:00.000Z', JSON.stringify({ sender: 'system' }));
-    insert.run('ceiling-respawn-tool-2', 4, '2026-07-28T12:01:00.000Z', JSON.stringify({ sender: 'system' }));
-    expect(countToolRecoveryAttemptsSinceRealInbound(mailbox)).toBe(2);
-    insert.run('user-1', 6, '2026-07-28T12:02:00.000Z', JSON.stringify({ sender: 'user' }));
-    expect(countToolRecoveryAttemptsSinceRealInbound(mailbox)).toBe(0);
-    insert.run('ceiling-respawn-tool-3', 8, '2026-07-28T12:03:00.000Z', JSON.stringify({ sender: 'system' }));
-    expect(countToolRecoveryAttemptsSinceRealInbound(mailbox)).toBe(1);
-  });
-
-  it('treats historical non-JSON content as real inbound when counting tool recovery attempts', () => {
-    const { inDb, mailbox } = makeSessionDbs();
-    const insert = inDb.prepare(
-      `INSERT INTO messages_in (id, seq, kind, timestamp, status, trigger, content)
-       VALUES (?, ?, 'chat', ?, 'completed', 1, ?)`,
-    );
-    insert.run('ceiling-respawn-tool-1', 2, '2026-07-28T12:00:00.000Z', JSON.stringify({ sender: 'system' }));
-    insert.run('legacy-user-1', 4, '2026-07-28T12:01:00.000Z', 'legacy plain-text inbound');
-    insert.run('ceiling-respawn-tool-2', 6, '2026-07-28T12:02:00.000Z', JSON.stringify({ sender: 'system' }));
-
-    expect(countToolRecoveryAttemptsSinceRealInbound(mailbox)).toBe(1);
-  });
-
-  it('orders mixed ISO and SQLite-style timestamps chronologically when resetting tool attempts', () => {
-    const { inDb, mailbox } = makeSessionDbs();
-    const insert = inDb.prepare(
-      `INSERT INTO messages_in (id, seq, kind, timestamp, status, trigger, content)
-       VALUES (?, ?, 'chat', ?, 'completed', 1, ?)`,
-    );
-    insert.run('user-old', 2, '2026-07-28T01:00:00.000Z', JSON.stringify({ sender: 'user' }));
-    insert.run('ceiling-respawn-tool-old', 4, '2026-07-28T01:30:00.000Z', JSON.stringify({ sender: 'system' }));
-    insert.run('user-new', 6, '2026-07-28 02:00:00', JSON.stringify({ sender: 'user' }));
-    insert.run('ceiling-respawn-tool-new', 8, '2026-07-28T02:30:00.000Z', JSON.stringify({ sender: 'system' }));
-
-    expect(countToolRecoveryAttemptsSinceRealInbound(mailbox)).toBe(1);
-  });
-
-  it('writes exactly one public parked accounting for repeated sweeps', () => {
-    const { inDb, outDb, mailbox } = makeSessionDbs();
-    inDb.prepare('INSERT INTO session_routing VALUES (1, ?, ?, ?)').run('slack', 'C-1', 'T-1');
-    const capped = { ...continuation, resume_attempts: WORK_CONTINUATION_RESUME_MAX_ATTEMPTS };
-    const write = (message: { id: string; kind: string; content: string }) => {
-      outDb
-        .prepare(
-          `INSERT OR IGNORE INTO messages_out (id, seq, timestamp, kind, content)
-           VALUES (?, (SELECT COALESCE(MAX(seq), 0) + 2 FROM messages_out), ?, ?, ?)`,
-        )
-        .run(message.id, new Date().toISOString(), message.kind, message.content);
-    };
-
-    expect(notifyContinuationParked(mailbox, fakeSession(), capped, write)).toBe(true);
-    expect(notifyContinuationParked(mailbox, fakeSession(), capped, write)).toBe(false);
-    expect(notifyContinuationParked(mailbox, fakeSession(), { ...capped, recovery_episode: 1 }, write)).toBe(true);
-    expect(
-      outDb.prepare("SELECT COUNT(*) AS count FROM messages_out WHERE id LIKE 'continuation-parked-%'").get(),
-    ).toEqual({ count: 2 });
-  });
-
-  it('routes parked accounting through the continuation source in an agent-shared session', () => {
-    const { inDb, outDb, mailbox } = makeSessionDbs();
-    inDb
-      .prepare(
-        `INSERT INTO messages_in
-           (id, seq, kind, timestamp, status, trigger, platform_id, channel_type, thread_id, content)
-         VALUES (?, 2, 'chat', ?, 'completed', 1, 'C-SHARED', 'slack', 'T-SHARED', '{}')`,
-      )
-      .run('origin-1', new Date().toISOString());
-    const writes: Array<{ platformId: string | null; channelType: string | null; threadId: string | null }> = [];
-
-    expect(
-      notifyContinuationParked(mailbox, fakeSession(), continuation, (message) =>
-        writes.push({
-          platformId: message.platformId,
-          channelType: message.channelType,
-          threadId: message.threadId,
-        }),
-      ),
-    ).toBe(true);
-    expect(writes).toEqual([{ platformId: 'C-SHARED', channelType: 'slack', threadId: 'T-SHARED' }]);
-  });
-});
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Orphan claim cleanup (regression test for the SIGKILL → claim-stuck loop)
@@ -764,216 +244,6 @@ function fakeSession(): Session {
     created_at: new Date().toISOString(),
   };
 }
-
-describe('deleteOrphanProcessingClaims', () => {
-  it('removes only processing rows, leaves completed/failed alone', () => {
-    const { outDb } = makeSessionDbs();
-    const ts = new Date().toISOString();
-    outDb.prepare("INSERT INTO processing_ack VALUES ('m-proc', 'processing', ?)").run(ts);
-    outDb.prepare("INSERT INTO processing_ack VALUES ('m-done', 'completed', ?)").run(ts);
-    outDb.prepare("INSERT INTO processing_ack VALUES ('m-fail', 'failed', ?)").run(ts);
-
-    const removed = deleteOrphanProcessingClaims(outDb);
-
-    expect(removed).toBe(1);
-    const remaining = outDb.prepare('SELECT message_id, status FROM processing_ack ORDER BY message_id').all();
-    expect(remaining).toEqual([
-      { message_id: 'm-done', status: 'completed' },
-      { message_id: 'm-fail', status: 'failed' },
-    ]);
-  });
-
-  it('returns 0 when nothing to clear', () => {
-    const { outDb } = makeSessionDbs();
-    expect(deleteOrphanProcessingClaims(outDb)).toBe(0);
-  });
-});
-
-describe('scheduled due admission precedes wake classification', () => {
-  it('counts and classifies the trigger inserted by the admission seam', async () => {
-    const { inDb, mailbox } = makeSessionDbs();
-    // The sweep hands `admitDueTaskContexts` the SESSION now, not a handle
-    // (invariant I-9). The stub writes the admitted trigger straight into the
-    // fixture DB behind that session, which is what the assertions below read.
-    mockAdmitDueTaskContexts.mockImplementationOnce(() => {
-      inDb
-        .prepare(
-          `INSERT INTO messages_in
-           (id, seq, kind, timestamp, status, process_after, recurrence, series_id, trigger, content)
-         VALUES ('task-admitted', 2, 'task', ?, 'pending', ?, NULL, 'task-admitted', 1, '{}')`,
-        )
-        .run(new Date().toISOString(), new Date(Date.now() - 1_000).toISOString());
-      return 1;
-    });
-
-    const result = await _prepareDueWakeForTesting(mailbox, 'ag-test', 'sess-test');
-
-    expect(mockAdmitDueTaskContexts).toHaveBeenCalledWith(mailbox, 'ag-test', 'sess-test');
-    expect(result).toEqual({ admittedTasks: 1, dueCount: 1, wakePriority: 'scheduled' });
-  });
-});
-
-describe('resetStuckProcessingRows — orphan claim cleanup', () => {
-  it('deletes orphan processing_ack rows so next sweep tick does not see them', () => {
-    const { inDb, outDb, mailbox } = makeSessionDbs();
-    const claimedAt = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString(); // 2h ago
-
-    // messages_in.status stays 'pending' during processing — only the
-    // container's processing_ack moves to 'processing'. See
-    // src/db/schema.ts header comment on processing_ack.
-    inDb
-      .prepare(
-        "INSERT INTO messages_in (id, seq, kind, timestamp, status, content) VALUES ('m-1', 1, 'chat', ?, 'pending', '{}')",
-      )
-      .run(claimedAt);
-    outDb.prepare("INSERT INTO processing_ack VALUES ('m-1', 'processing', ?)").run(claimedAt);
-
-    // Sanity: the orphan claim is what would trip claim-stuck.
-    expect(getProcessingClaims(outDb)).toHaveLength(1);
-
-    _resetStuckProcessingRowsForTesting(mailbox, fakeSession(), 'absolute-ceiling');
-
-    // Regression assertion: orphan claim is gone — next sweep tick will see
-    // an empty claims list and not kill the freshly respawned container.
-    expect(getProcessingClaims(outDb)).toEqual([]);
-
-    // And the message itself was rescheduled with backoff (existing behavior).
-    const row = inDb.prepare('SELECT status, tries, process_after FROM messages_in WHERE id = ?').get('m-1') as {
-      status: string;
-      tries: number;
-      process_after: string | null;
-    };
-    expect(row.status).toBe('pending');
-    expect(row.tries).toBe(1);
-    expect(row.process_after).not.toBeNull();
-  });
-
-  it('makes a paired crashed turn inert with its recall until fresh due admission', () => {
-    const { inDb, outDb, mailbox } = makeSessionDbs();
-    const claimedAt = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString();
-    inDb
-      .prepare(
-        `INSERT INTO messages_in
-           (id, seq, kind, timestamp, status, process_after, tries, trigger, content)
-         VALUES ('recall-m-paired', 2, 'system', ?, 'pending', ?, 0, 0, ?),
-                ('m-paired', 4, 'chat', ?, 'pending', ?, 0, 1, ?)`,
-      )
-      .run(
-        claimedAt,
-        claimedAt,
-        JSON.stringify({ subtype: 'recall_context', revision: 'before-crash' }),
-        claimedAt,
-        claimedAt,
-        JSON.stringify({ text: 'retry me' }),
-      );
-    outDb.prepare("INSERT INTO processing_ack VALUES ('m-paired', 'processing', ?)").run(claimedAt);
-
-    _resetStuckProcessingRowsForTesting(mailbox, fakeSession(), 'container-crash');
-
-    const pair = inDb.prepare('SELECT id, trigger, tries, process_after FROM messages_in ORDER BY seq').all() as Array<{
-      id: string;
-      trigger: number;
-      tries: number;
-      process_after: string | null;
-    }>;
-    expect(pair).toHaveLength(2);
-    expect(pair[0]).toMatchObject({ id: 'recall-m-paired', trigger: 0, tries: 0 });
-    expect(pair[1]).toMatchObject({ id: 'm-paired', trigger: 0, tries: 1 });
-    expect(pair[0]!.process_after).not.toBeNull();
-    expect(pair[0]!.process_after).toBe(pair[1]!.process_after);
-    expect(
-      (
-        inDb
-          .prepare(
-            `SELECT COUNT(*) AS count
-               FROM messages_in
-              WHERE status = 'pending' AND trigger = 1
-                AND (process_after IS NULL OR datetime(process_after) <= datetime('now'))`,
-          )
-          .get() as { count: number }
-      ).count,
-    ).toBe(0);
-    expect(getProcessingClaims(outDb)).toEqual([]);
-  });
-
-  it('still clears orphan claims even when the inbound message has already been retried (skip path)', () => {
-    // Edge case: the inbound row was already rescheduled (process_after in
-    // future), so the per-message retry loop skips it. The orphan in
-    // processing_ack must still be removed — otherwise the bug remains.
-    const { inDb, outDb, mailbox } = makeSessionDbs();
-    const claimedAt = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString();
-    const future = new Date(Date.now() + 60_000).toISOString();
-
-    inDb
-      .prepare(
-        "INSERT INTO messages_in (id, seq, kind, timestamp, status, process_after, tries, content) VALUES ('m-2', 2, 'chat', ?, 'pending', ?, 1, '{}')",
-      )
-      .run(claimedAt, future);
-    outDb.prepare("INSERT INTO processing_ack VALUES ('m-2', 'processing', ?)").run(claimedAt);
-
-    _resetStuckProcessingRowsForTesting(mailbox, fakeSession(), 'claim-stuck');
-
-    expect(getProcessingClaims(outDb)).toEqual([]);
-    const row = inDb.prepare('SELECT tries FROM messages_in WHERE id = ?').get('m-2') as { tries: number };
-    expect(row.tries).toBe(1); // not bumped, the skip path held
-  });
-
-  it('retries an input that produced only progress/status rows', () => {
-    const { inDb, outDb, mailbox } = makeSessionDbs();
-    const claimedAt = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString();
-
-    inDb
-      .prepare(
-        "INSERT INTO messages_in (id, seq, kind, timestamp, status, content) VALUES ('m-status-only', 3, 'chat', ?, 'pending', '{}')",
-      )
-      .run(claimedAt);
-    outDb.prepare("INSERT INTO processing_ack VALUES ('m-status-only', 'processing', ?)").run(claimedAt);
-    outDb
-      .prepare(
-        "INSERT INTO messages_out (id, seq, in_reply_to, timestamp, kind, content) VALUES ('progress-1', 2, 'm-status-only', ?, 'status', '{}')",
-      )
-      .run(new Date().toISOString());
-
-    _resetStuckProcessingRowsForTesting(mailbox, fakeSession(), 'absolute-ceiling');
-
-    const row = inDb
-      .prepare('SELECT status, tries, process_after FROM messages_in WHERE id = ?')
-      .get('m-status-only') as { status: string; tries: number; process_after: string | null };
-    expect(row.status).toBe('pending');
-    expect(row.tries).toBe(1);
-    expect(row.process_after).not.toBeNull();
-    expect(getProcessingClaims(outDb)).toEqual([]);
-  });
-
-  it('does not retry an input after a non-status response was written', () => {
-    const { inDb, outDb, mailbox } = makeSessionDbs();
-    const claimedAt = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString();
-
-    inDb
-      .prepare(
-        "INSERT INTO messages_in (id, seq, kind, timestamp, status, content) VALUES ('m-answered', 4, 'chat', ?, 'pending', '{}')",
-      )
-      .run(claimedAt);
-    outDb.prepare("INSERT INTO processing_ack VALUES ('m-answered', 'processing', ?)").run(claimedAt);
-    outDb
-      .prepare(
-        "INSERT INTO messages_out (id, seq, in_reply_to, timestamp, kind, content) VALUES ('reply-1', 4, 'm-answered', ?, 'chat', '{}')",
-      )
-      .run(new Date().toISOString());
-
-    _resetStuckProcessingRowsForTesting(mailbox, fakeSession(), 'absolute-ceiling');
-
-    const row = inDb.prepare('SELECT status, tries, process_after FROM messages_in WHERE id = ?').get('m-answered') as {
-      status: string;
-      tries: number;
-      process_after: string | null;
-    };
-    expect(row.status).toBe('completed');
-    expect(row.tries).toBe(0);
-    expect(row.process_after).toBeNull();
-    expect(getProcessingClaims(outDb)).toEqual([]);
-  });
-});
 
 describe('parseSqliteUtc', () => {
   // Regression: SQLite TIMESTAMP strings have no zone marker, but Date.parse
@@ -1093,110 +363,6 @@ function makeNotifyTestDbs(opts?: { withRouting?: boolean; recentNotice?: boolea
   }
   return { inDb, outDb, mailbox: composeNanoclawSession(inDb, () => outDb) };
 }
-
-describe('notifyKillCeiling (Layer-3 fix)', () => {
-  // `pendingClaims=1` means the container had an in-flight inbound when we
-  // killed it — i.e. a user was actually waiting. That's the only case
-  // where the notify should fire (see the spam-gate test below for the
-  // claims=0 case).
-  it('writes a visible chat outbound with the session route before killContainer', () => {
-    const { inDb, outDb, mailbox } = makeNotifyTestDbs();
-    const heartbeatAgeMs = 32 * 60_000;
-
-    _notifyKillCeilingForTesting(mailbox, fakeSession(), heartbeatAgeMs, 1);
-
-    const rows = outDb
-      .prepare('SELECT timestamp, kind, platform_id, channel_type, thread_id, content FROM messages_out')
-      .all() as Array<{
-      timestamp: string;
-      kind: string;
-      platform_id: string | null;
-      channel_type: string | null;
-      thread_id: string | null;
-      content: string;
-    }>;
-    expect(rows).toHaveLength(1);
-    expect(rows[0].timestamp).toMatch(/^\d{4}-\d{2}-\d{2}T.*Z$/);
-    expect(rows[0].kind).toBe('chat');
-    expect(rows[0].channel_type).toBe('slack');
-    expect(rows[0].platform_id).toBe('C-TEST');
-    expect(rows[0].thread_id).toBe('T-TEST');
-    const body = JSON.parse(rows[0].content) as { text: string; _system?: { kind: string } };
-    expect(body.text).toContain('32 minutes');
-    expect(body.text).toContain('picked up automatically');
-    expect(body.text).toContain('no need to resend');
-    expect(body._system?.kind).toBe('agent_restart_inactivity');
-  });
-
-  it('reports a persisted Codex control-plane failure instead of calling it generic silence', () => {
-    const { inDb, outDb, mailbox } = makeNotifyTestDbs();
-    _notifyKillCeilingForTesting(mailbox, fakeSession(), 62 * 60_000, 1, {
-      current_tool: 'CodexItem',
-      tool_declared_timeout_ms: 3_600_000,
-      tool_started_at: '2026-07-15T11:22:53.000Z',
-      provider_status: 'failed',
-      provider_failure_reason: 'three JSON-RPC health probes timed out',
-    });
-
-    const row = outDb.prepare('SELECT content FROM messages_out').get() as { content: string };
-    const body = JSON.parse(row.content) as {
-      text: string;
-      _system: { provider_status: string; provider_failure_reason: string };
-    };
-    expect(body.text).toContain('Codex control-plane recovery did not complete');
-    expect(body.text).toContain('three JSON-RPC health probes timed out');
-    expect(body.text).not.toContain('went silent');
-    expect(body._system.provider_status).toBe('failed');
-  });
-
-  it('skips when no inbound was claimed at kill time (idle session, no user waiting)', () => {
-    // The kill-ceiling sweep fires on every container that hits the 30-min
-    // idle ceiling, not just ones with users waiting on a reply. Without
-    // this gate, every quiet operator gets a restart notice every half
-    // hour across every wired session. Routing is present (session DID
-    // wake before) — the only thing that distinguishes "user waiting" from
-    // "idle" is whether any inbound was claimed (processing_ack) when we
-    // killed.
-    const { inDb, outDb, mailbox } = makeNotifyTestDbs();
-    _notifyKillCeilingForTesting(mailbox, fakeSession(), 32 * 60_000, 0);
-    expect(outDb.prepare('SELECT COUNT(*) AS c FROM messages_out').get()).toEqual({ c: 0 });
-  });
-
-  it('skips when the session has never been routed (fresh session_routing row missing)', () => {
-    const { inDb, outDb, mailbox } = makeNotifyTestDbs({ withRouting: false });
-    _notifyKillCeilingForTesting(mailbox, fakeSession(), 32 * 60_000, 1);
-    expect(outDb.prepare('SELECT COUNT(*) AS c FROM messages_out').get()).toEqual({ c: 0 });
-  });
-
-  it('is idempotent within 60s — a re-firing sweep tick does not duplicate the notice', () => {
-    const { inDb, outDb, mailbox } = makeNotifyTestDbs({ recentNotice: true });
-    _notifyKillCeilingForTesting(mailbox, fakeSession(), 32 * 60_000, 1);
-    // Only the seed row should be present; the second call recognized the
-    // marker and skipped.
-    const rows = outDb.prepare('SELECT id FROM messages_out').all() as Array<{ id: string }>;
-    expect(rows).toHaveLength(1);
-    expect(rows[0].id).toBe('prior');
-  });
-});
-
-describe('shouldCloseTaskSession', () => {
-  it('closes a spent per-task session (no live tasks, no container)', () => {
-    expect(shouldCloseTaskSession('system:tasks:task-1', false, 0)).toBe(true);
-  });
-
-  it('keeps it while a task is still live (recurring re-armed, or pending/paused)', () => {
-    expect(shouldCloseTaskSession('system:tasks:task-1', false, 1)).toBe(false);
-  });
-
-  it('keeps it while its container is running (mid-fire)', () => {
-    expect(shouldCloseTaskSession('system:tasks:task-1', true, 0)).toBe(false);
-  });
-
-  it('never touches non-task sessions', () => {
-    expect(shouldCloseTaskSession('telegram:12345', false, 0)).toBe(false);
-    expect(shouldCloseTaskSession(null, false, 0)).toBe(false);
-  });
-});
 
 // shouldReapIdleTaskContainer / shouldReapIdleChatContainer cases moved to
 // src/modules/sweep-idle-reap/idle-reap.test.ts (seam 2, S2-PR3 — F-3.1).
@@ -1385,7 +551,15 @@ describe('sweepSession on a session with no mailbox', () => {
     db.prepare(`INSERT INTO agent_groups (id, name, folder, created_at) VALUES ('ag-sla', 'sla', 'sla', ?)`).run(
       new Date().toISOString(),
     );
-    mockKillContainer.mockReset();
+    // Production's shape, which the old bare mock did not model: the kill only
+    // REQUESTS the stop, and the post-kill chain runs from the container's own
+    // `close` — so invoke `onExit` rather than letting the chain vanish.
+    // `isContainerRunning` stays under each case's control, which is how they
+    // express "a replacement took the session" versus "it stayed dead".
+    _resetPostKillForTesting();
+    mockKillContainer.mockReset().mockImplementation((_id: string, _reason: string, onExit?: () => void) => {
+      onExit?.();
+    });
     // Live all the way through: the container is alive so the SLA runs, and it
     // is STILL alive after the kill because a wake replaced it in the gap.
     mockIsContainerRunning.mockReset().mockReturnValue(true);
@@ -1394,8 +568,12 @@ describe('sweepSession on a session with no mailbox', () => {
     const f = slaFixture('sess-sla-ceiling', ABSOLUTE_CEILING_MS + 60_000, 10_000);
     const before = f.claims();
     await _enforceRunningContainerSlaForTesting(f.run, f.session, 'ag-sla', 'sla');
+    await _settlePostKillForTesting();
 
-    expect(mockKillContainer).toHaveBeenCalledWith('sess-sla-ceiling', 'absolute-ceiling');
+    // `killContainer` now takes an `onExit` third argument (Codex final), which is
+    // a function when a container was there to kill and `undefined` when it had
+    // already gone. The identity assertion is the first two arguments.
+    expect(mockKillContainer).toHaveBeenCalledWith('sess-sla-ceiling', 'absolute-ceiling', expect.any(Function));
     // Claim intact and no restart notice written: both writes were skipped.
     expect(f.claims()).toBe(before);
     closeDb();
@@ -1407,7 +585,15 @@ describe('sweepSession on a session with no mailbox', () => {
     db.prepare(`INSERT INTO agent_groups (id, name, folder, created_at) VALUES ('ag-sla', 'sla', 'sla', ?)`).run(
       new Date().toISOString(),
     );
-    mockKillContainer.mockReset();
+    // Production's shape, which the old bare mock did not model: the kill only
+    // REQUESTS the stop, and the post-kill chain runs from the container's own
+    // `close` — so invoke `onExit` rather than letting the chain vanish.
+    // `isContainerRunning` stays under each case's control, which is how they
+    // express "a replacement took the session" versus "it stayed dead".
+    _resetPostKillForTesting();
+    mockKillContainer.mockReset().mockImplementation((_id: string, _reason: string, onExit?: () => void) => {
+      onExit?.();
+    });
     mockIsContainerRunning.mockReset().mockReturnValue(true);
     mockReadContainerConfig.mockReset().mockReturnValue({ provider: 'claude' });
 
@@ -1436,6 +622,7 @@ describe('sweepSession on a session with no mailbox', () => {
     plant.close();
 
     await _enforceRunningContainerSlaForTesting(f.run, f.session, 'ag-sla', 'sla');
+    await _settlePostKillForTesting();
 
     // The accountability row is inbound, so no single-writer hazard — but it is
     // `on_wake = 1`, which the live replacement never consumes. Writing it here
@@ -1461,7 +648,15 @@ describe('sweepSession on a session with no mailbox', () => {
     db.prepare(`INSERT INTO agent_groups (id, name, folder, created_at) VALUES ('ag-sla', 'sla', 'sla', ?)`).run(
       new Date().toISOString(),
     );
-    mockKillContainer.mockReset();
+    // Production's shape, which the old bare mock did not model: the kill only
+    // REQUESTS the stop, and the post-kill chain runs from the container's own
+    // `close` — so invoke `onExit` rather than letting the chain vanish.
+    // `isContainerRunning` stays under each case's control, which is how they
+    // express "a replacement took the session" versus "it stayed dead".
+    _resetPostKillForTesting();
+    mockKillContainer.mockReset().mockImplementation((_id: string, _reason: string, onExit?: () => void) => {
+      onExit?.();
+    });
     mockIsContainerRunning.mockReset().mockReturnValue(true);
     mockReadContainerConfig.mockReset().mockReturnValue({ provider: 'claude' });
 
@@ -1469,10 +664,130 @@ describe('sweepSession on a session with no mailbox', () => {
     const f = slaFixture('sess-sla-claim', 10 * 60_000, 5 * 60_000);
     const before = f.claims();
     await _enforceRunningContainerSlaForTesting(f.run, f.session, 'ag-sla', 'sla');
+    await _settlePostKillForTesting();
 
-    expect(mockKillContainer).toHaveBeenCalledWith('sess-sla-claim', 'claim-stuck');
+    // `killContainer` now takes an `onExit` third argument (Codex final), which is
+    // a function when a container was there to kill and `undefined` when it had
+    // already gone. The identity assertion is the first two arguments.
+    expect(mockKillContainer).toHaveBeenCalledWith('sess-sla-claim', 'claim-stuck', expect.any(Function));
     expect(f.claims()).toBe(before);
     closeDb();
+  });
+
+  // Shared by the post-kill cases below. Pure file readers — no dependency on
+  // which central DB is installed, so they are safe at describe scope.
+  const sessionDir = (session: Session): string =>
+    path.join(testDataDir.dir, 'v2-sessions', session.agent_group_id, session.id);
+  // A live continuation is what makes S10 (the accountability wake) write at
+  // all — without one `decideCeilingFollowUp` returns 'none' and the S10 half
+  // of the assertion would pass for the wrong reason.
+  const plantContinuation = (session: Session): void => {
+    const out = new Database(path.join(sessionDir(session), 'outbound.db'));
+    out
+      .prepare(
+        `INSERT INTO session_state (key, value, updated_at) VALUES ('work_continuation', ?, ?)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`,
+      )
+      .run(
+        JSON.stringify({
+          id: 'cont-followups',
+          task: 'finish the migration',
+          phase: 'running',
+          chain: 0,
+          runner_id: 'runner-old',
+          resume_attempts: 0,
+          recovery_episode: 0,
+        }),
+        new Date().toISOString(),
+      );
+    out.close();
+  };
+  const respawnWakes = (session: Session): number => {
+    const inbound = new Database(path.join(sessionDir(session), 'inbound.db'));
+    const n = (
+      inbound.prepare("SELECT COUNT(*) AS c FROM messages_in WHERE id LIKE 'ceiling-respawn-%'").get() as {
+        c: number;
+      }
+    ).c;
+    inbound.close();
+    return n;
+  };
+
+  // ── Codex final, HIGH ─────────────────────────────────────────────────────
+  //
+  // `killContainer` only REQUESTS the stop: it calls `stopContainer` and
+  // returns, and `activeContainers` is cleared by the spawn path's own `close`
+  // handler when the child actually goes. Running the follow-up chain on the
+  // next line therefore raced the exit — `containerOwnsOutbound` was still
+  // true, the early-out fired, and the ceiling notice, the orphan-claim reset
+  // and the accountability wake were skipped with nothing to retry them. The
+  // chain now hangs off `onExit`, which fires after that finalizer.
+  //
+  // The fixture is the point: ownership stays TRUE after `killContainer`
+  // returns and flips false only when `onExit` runs, which is production's
+  // ordering and the one the old mocks did not have.
+  it('the post-kill chain runs after the container actually exits, not when the kill is requested', async () => {
+    const db = initTestDb();
+    runMigrations(db);
+    db.prepare(`INSERT INTO agent_groups (id, name, folder, created_at) VALUES ('ag-sla', 'sla', 'sla', ?)`).run(
+      new Date().toISOString(),
+    );
+    _resetPostKillForTesting();
+    mockIsContainerRunning.mockReset().mockReturnValue(true);
+    mockReadContainerConfig.mockReset().mockReturnValue({ provider: 'claude' });
+
+    let exit: (() => void) | undefined;
+    mockKillContainer.mockReset().mockImplementation((_id: string, _reason: string, onExit?: () => void) => {
+      // Requested, not done: the container still owns outbound.db here.
+      exit = onExit;
+    });
+
+    const f = slaFixture('sess-postkill-onexit', ABSOLUTE_CEILING_MS + 60_000, 10_000);
+    plantContinuation(f.session);
+    const before = f.claims();
+    await _enforceRunningContainerSlaForTesting(f.run, f.session, 'ag-sla', 'sla');
+
+    // Nothing yet — and this is exactly where the old code ran the chain.
+    await _settlePostKillForTesting();
+    expect(f.claims(), 'the chain ran while the container still owned outbound.db').toBe(before);
+    expect(respawnWakes(f.session)).toBe(0);
+
+    // The child closes: ownership drops, then `onExit` fires.
+    expect(exit, 'no onExit was registered, so the chain could never run').toBeDefined();
+    mockIsContainerRunning.mockReturnValue(false);
+    exit!();
+    await _settlePostKillForTesting();
+
+    expect(f.claims(), 'S17 did not reset the orphan claim').toBe(0);
+    expect(respawnWakes(f.session), 'S10 did not queue the accountability wake').toBe(1);
+  });
+
+  it('a replacement container that takes the session before the exit still refuses the chain', async () => {
+    const db = initTestDb();
+    runMigrations(db);
+    db.prepare(`INSERT INTO agent_groups (id, name, folder, created_at) VALUES ('ag-sla', 'sla', 'sla', ?)`).run(
+      new Date().toISOString(),
+    );
+    _resetPostKillForTesting();
+    mockIsContainerRunning.mockReset().mockReturnValue(true);
+    mockReadContainerConfig.mockReset().mockReturnValue({ provider: 'claude' });
+
+    let exit: (() => void) | undefined;
+    mockKillContainer.mockReset().mockImplementation((_id: string, _reason: string, onExit?: () => void) => {
+      exit = onExit;
+    });
+
+    const f = slaFixture('sess-postkill-replaced', ABSOLUTE_CEILING_MS + 60_000, 10_000);
+    plantContinuation(f.session);
+    const before = f.claims();
+    await _enforceRunningContainerSlaForTesting(f.run, f.session, 'ag-sla', 'sla');
+
+    // The old container goes, a fresh one is already up: ownership never drops.
+    exit!();
+    await _settlePostKillForTesting();
+
+    expect(f.claims(), 'the fresh runner lost its claim').toBe(before);
+    expect(respawnWakes(f.session), 'a stale accountability wake greeted the replacement').toBe(0);
   });
 
   // Codex round 9, on the seam-2 duty registry. Upstream guards the post-kill
@@ -1493,58 +808,45 @@ describe('sweepSession on a session with no mailbox', () => {
     );
     mockReadContainerConfig.mockReset().mockReturnValue({ provider: 'claude' });
 
-    const sessionDir = (session: Session): string =>
-      path.join(testDataDir.dir, 'v2-sessions', session.agent_group_id, session.id);
-    // A live continuation is what makes S10 (the accountability wake) write at
-    // all — without one `decideCeilingFollowUp` returns 'none' and the S10 half
-    // of the assertion would pass for the wrong reason.
-    const plantContinuation = (session: Session): void => {
-      const out = new Database(path.join(sessionDir(session), 'outbound.db'));
-      out
-        .prepare(
-          `INSERT INTO session_state (key, value, updated_at) VALUES ('work_continuation', ?, ?)
-           ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`,
-        )
-        .run(
-          JSON.stringify({
-            id: 'cont-followups',
-            task: 'finish the migration',
-            phase: 'running',
-            chain: 0,
-            runner_id: 'runner-old',
-            resume_attempts: 0,
-            recovery_episode: 0,
-          }),
-          new Date().toISOString(),
-        );
-      out.close();
-    };
-    const respawnWakes = (session: Session): number => {
-      const inbound = new Database(path.join(sessionDir(session), 'inbound.db'));
-      const n = (
-        inbound.prepare("SELECT COUNT(*) AS c FROM messages_in WHERE id LIKE 'ceiling-respawn-%'").get() as {
-          c: number;
-        }
-      ).c;
-      inbound.close();
-      return n;
-    };
-
     // Control: ownership never flips, so every follow-up writes.
-    mockKillContainer.mockReset();
+    // Production's shape, which the old bare mock did not model: the kill only
+    // REQUESTS the stop, and the post-kill chain runs from the container's own
+    // `close` — so invoke `onExit` rather than letting the chain vanish.
+    // `isContainerRunning` stays under each case's control, which is how they
+    // express "a replacement took the session" versus "it stayed dead".
+    _resetPostKillForTesting();
+    mockKillContainer.mockReset().mockImplementation((_id: string, _reason: string, onExit?: () => void) => {
+      onExit?.();
+    });
     mockIsContainerRunning.mockReset().mockReturnValue(false);
     const control = slaFixture('sess-followups-control', ABSOLUTE_CEILING_MS + 60_000, 10_000);
     plantContinuation(control.session);
     await _enforceRunningContainerSlaForTesting(control.run, control.session, 'ag-sla', 'sla');
+    await _settlePostKillForTesting();
 
-    expect(mockKillContainer).toHaveBeenCalledWith('sess-followups-control', 'absolute-ceiling');
+    // `killContainer` now takes an `onExit` third argument (Codex final), which is
+    // a function when a container was there to kill and `undefined` when it had
+    // already gone. The identity assertion is the first two arguments.
+    // No container to kill (`isContainerRunning` is false before the SLA runs),
+    // so there is no `close` to hang the chain off and it runs inline —
+    // ownership is already gone. Asserted rather than left implicit: the
+    // callback's presence is what the whole fix turns on.
+    expect(mockKillContainer).toHaveBeenCalledWith('sess-followups-control', 'absolute-ceiling', undefined);
     expect(control.claims()).toBe(0); // S17 cleared the orphan claim
     expect(respawnWakes(control.session)).toBe(1); // S10 queued the accountability wake
 
     // Guarded: a wake takes the session between S15 (order 10) and S17 (order
     // 20) — registered as a follow-up at order 15, which is exactly the yield
     // boundary the loop's `await` creates.
-    mockKillContainer.mockReset();
+    // Production's shape, which the old bare mock did not model: the kill only
+    // REQUESTS the stop, and the post-kill chain runs from the container's own
+    // `close` — so invoke `onExit` rather than letting the chain vanish.
+    // `isContainerRunning` stays under each case's control, which is how they
+    // express "a replacement took the session" versus "it stayed dead".
+    _resetPostKillForTesting();
+    mockKillContainer.mockReset().mockImplementation((_id: string, _reason: string, onExit?: () => void) => {
+      onExit?.();
+    });
     mockIsContainerRunning.mockReset().mockReturnValue(false);
     registerSweepKillFollowUp({
       name: 'test:wake-between-post-kill-follow-ups',
@@ -1558,8 +860,12 @@ describe('sweepSession on a session with no mailbox', () => {
       plantContinuation(guarded.session);
       const claimsBefore = guarded.claims();
       await _enforceRunningContainerSlaForTesting(guarded.run, guarded.session, 'ag-sla', 'sla');
+      await _settlePostKillForTesting();
 
-      expect(mockKillContainer).toHaveBeenCalledWith('sess-followups-guarded', 'absolute-ceiling');
+      // `killContainer` now takes an `onExit` third argument (Codex final): a
+      // function when a container was there to kill, `undefined` when it had
+      // already gone and the chain runs inline.
+      expect(mockKillContainer).toHaveBeenCalledWith('sess-followups-guarded', 'absolute-ceiling', undefined);
       // Both later follow-ups skipped: the fresh runner keeps its claim and no
       // stale accountability wake was queued against its recovery cap.
       expect(guarded.claims()).toBe(claimsBefore);

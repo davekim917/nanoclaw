@@ -28,6 +28,7 @@ import {
   findSessionByAgentGroupAndMessagingGroup,
   getSession,
   setTaskRoutingPlatformId,
+  withQuietInvalidationSync,
 } from './sessions.js';
 import { getDb } from './connection.js';
 
@@ -345,17 +346,27 @@ export async function scheduleTask(def: TaskDef): Promise<void> {
       //
       // Nothing awaits between any of these, so no concurrent `scheduleTask`
       // for this series can interleave with the write-stamp-restore triple.
-      const upserted = mailbox.upsertTaskSeries({
-        id: def.id,
-        seriesId: def.seriesId,
-        processAfter: def.processAfter,
-        scheduledFor: def.scheduledFor,
-        recurrence: def.cron,
-        content,
-        platformId: def.destination.platformId,
-        channelType: def.destination.channelType,
-        threadId: def.destination.threadId,
-      });
+      // The quiet mark dies in the same synchronous turn as the row that makes
+      // this session due — no await between them, so no sweep tick can flush a
+      // mark over work it cannot yet see (Codex round 3, H1). The helper is
+      // also fail-closed on a vanished or non-active session row, which is the
+      // same race the status check above answers, one layer down and atomically.
+      // It wraps the upsert alone: a refusal must land BEFORE the row, and the
+      // stamp/restore compensation below is about the central-DB side of a row
+      // that has already been written.
+      const upserted = withQuietInvalidationSync(sessionId, () =>
+        mailbox.upsertTaskSeries({
+          id: def.id,
+          seriesId: def.seriesId,
+          processAfter: def.processAfter,
+          scheduledFor: def.scheduledFor,
+          recurrence: def.cron,
+          content,
+          platformId: def.destination.platformId,
+          channelType: def.destination.channelType,
+          threadId: def.destination.threadId,
+        }),
+      );
       try {
         setTaskRoutingPlatformId(sessionId, def.destination.platformId);
       } catch (err) {
@@ -395,13 +406,32 @@ export async function scheduleTask(def: TaskDef): Promise<void> {
     return await withMailboxSession(def.agentGroupId, sessionId, action);
   };
 
-  if ((await write(session.id)) === 'written') return;
+  // A task row is about to change when this session next has work due, and
+  // due-ness lives only in the session DB where the host sweep's quiet cache
+  // cannot see it. The invalidation is a central-DB write that nulls
+  // `sweep_quiet_until` and advances `last_active` in one statement, so the
+  // session is swept on the next tick rather than sleeping through its first
+  // fire — and, since S2-PR15 persists that mark, across a restart too.
+  //
+  // Invalidation lives INSIDE `stamp`, around the upsert itself — see
+  // `withQuietInvalidationSync`. It used to bracket this await from the
+  // outside; that left a whole mailbox funnel between the invalidation and the
+  // row, which is what Codex round 3 (H1) rejected.
+  //
+  // Each attempt invalidates only the session it is about to write to, so a
+  // spurious invalidation ahead of a write that then fails (session closed,
+  // retried against a different session) never touches the WRONG session's mark.
+  if ((await write(session.id)) === 'written') {
+    return;
+  }
 
   // Lost the race. Re-resolve and try once more. This terminates: the lookups
   // behind `resolveTaskSession` filter `status = 'active'`, so the closed row
   // can never come back — a fresh active task session is minted instead.
   const retry = resolveTaskSession(def.agentGroupId, def.seriesId);
-  if ((await write(retry.session.id)) === 'written') return;
+  if ((await write(retry.session.id)) === 'written') {
+    return;
+  }
   throw new Error(
     `scheduleTask: task session for series ${def.seriesId} was closed twice while scheduling; not retrying again`,
   );

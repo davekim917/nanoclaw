@@ -55,7 +55,7 @@
  */
 import { containerOwnsOutbound, killContainer } from '../container-runner.js';
 import { getDb } from '../db/index.js';
-import { archiveSessionById, touchSessionActivity } from '../db/sessions.js';
+import { archiveSessionById, withQuietInvalidationSync } from '../db/sessions.js';
 import { guard } from '../guard/index.js';
 import { log } from '../log.js';
 import {
@@ -250,34 +250,44 @@ async function writeCloseWrapUp(
       // the container that is running RIGHT NOW is exactly who this is for; the
       // ceiling path's `1` exists to keep a DYING container from eating its own
       // accountability notice, which is not the situation here.
-      const wrote = mailbox.insertDeferredMessageWithContextIfNew({
-        id: `${CLOSE_WAKE_ID_PREFIX}${session.id}-${requestedAt}`,
-        kind: 'chat',
-        timestamp: requestedAt,
-        platformId: session.agent_group_id,
-        channelType: 'agent',
-        threadId: null,
-        content: JSON.stringify({
-          text,
-          sender: 'system',
-          senderId: 'system',
-          _system: { kind: 'thread_close_wrap_up', thread_id: threadId },
-        }),
-        processAfter: null,
-        recurrence: null,
-        onWake: 0,
-      });
+      //
       // Due-ness. The wrap-up is a deferred trigger row, and both the sweep's
       // quiet cache and the delivery sweep's activity horizon key on
-      // `last_active` — a row written into a quiet session without this bump
-      // sits unseen until the cache expires, or indefinitely past the 7-day
-      // horizon. The wake this row triggers would bump it, but not until the
-      // wake happens; the insert-to-wake window is exactly the gap. Same call
-      // every other deferred-write path makes (`modules/scheduling/create.ts`,
-      // `recurrence.ts`, `cli/resources/tasks.ts`), synchronous with the
-      // insert, and advisory — it swallows its own failure rather than
-      // aborting the write it rides on.
-      if (wrote) touchSessionActivity(session.id);
+      // `last_active` — a row written into a quiet session without an
+      // invalidation sits unseen until the cache expires, or indefinitely past
+      // the 7-day horizon. The wake this row triggers would bump it, but not
+      // until the wake happens; the insert-to-wake window is exactly the gap.
+      //
+      // `withQuietInvalidationSync` is the single form every due-ness write in
+      // the fork takes (`modules/scheduling/create.ts`, `recurrence.ts`,
+      // `cli/resources/tasks.ts`, `db/scheduled-tasks.ts`): the mark dies in
+      // the same synchronous turn as the row, inside the mailbox callback so
+      // no await can sit between them, and FAIL-CLOSED — the advisory bump
+      // this replaced swallowed a central-DB refusal and left the row behind a
+      // mark nothing would clear. A refusal now throws into the catch below,
+      // which logs and answers `false`, so the close simply has no wrap-up
+      // request this pass rather than a silently unseen one. A session with no
+      // ACTIVE central row is also refused, and that is right: it has no sweep
+      // to reach it.
+      const wrote = withQuietInvalidationSync(session.id, () =>
+        mailbox.insertDeferredMessageWithContextIfNew({
+          id: `${CLOSE_WAKE_ID_PREFIX}${session.id}-${requestedAt}`,
+          kind: 'chat',
+          timestamp: requestedAt,
+          platformId: session.agent_group_id,
+          channelType: 'agent',
+          threadId: null,
+          content: JSON.stringify({
+            text,
+            sender: 'system',
+            senderId: 'system',
+            _system: { kind: 'thread_close_wrap_up', thread_id: threadId },
+          }),
+          processAfter: null,
+          recurrence: null,
+          onWake: 0,
+        }),
+      );
       return wrote;
     });
     return inserted ?? false;

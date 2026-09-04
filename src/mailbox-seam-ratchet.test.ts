@@ -34,22 +34,24 @@ const allowlistSet = new Set(allowlist);
  * The host half of the allowlist is DONE (PR 7), so it is no longer a
  * shrinking subset — it is an exact set, and this is what it may contain.
  *
- * Two documented exemptions, and they are the SAME exemption twice: both walk
- * an INJECTED sessions root rather than DATA_DIR, and the mailbox is keyed on
- * DATA_DIR, so neither can be addressed by a mailbox key at all.
+ * ONE documented exemption. It walks an INJECTED sessions root rather than
+ * DATA_DIR, and the mailbox is keyed on DATA_DIR, so it cannot be addressed by
+ * a mailbox key at all.
  *
  *  - `src/storage-manager.ts` — reclaim probes in a worker thread, read-only.
- *  - `src/modules/sweep-scheduled-move/index.ts` — the move-intent recovery,
- *    which seam 2's S2-PR7 moved here out of `host-sweep.ts`. `plan.md` §5
- *    books it as the one permanent KEEP-PATCH (F-7.3), and its own header says
- *    so at the open.
  *
- * The rationale for each lives at the top of its file; a third entry here
- * means writing that kind of justification there first. Neither is residue to
- * chase — the seam cannot express an injected root, and pretending otherwise
- * is what would break the recovery's own tests, which inject one.
+ * `src/modules/sweep-scheduled-move/index.ts` was the second entry, booked in
+ * `plan.md` §5 as the permanent KEEP-PATCH (F-7.3) because `recoverMoveIntents`
+ * walked an injected sessions root. S2-PR14 dropped that injection —
+ * `MoveRecoveryOptions.dataDir` is gone and the one production caller always
+ * passed the real root — so the restore now goes through
+ * `withExistingMailboxSession` and the exemption no longer has a premise.
+ *
+ * The rationale lives at the top of the exempted file; a second entry here
+ * means writing that kind of justification there first. This one is not
+ * residue to chase — the seam cannot express an injected root.
  */
-const HOST_ALLOWLIST_EXEMPTIONS = ['src/modules/sweep-scheduled-move/index.ts', 'src/storage-manager.ts'];
+const HOST_ALLOWLIST_EXEMPTIONS = ['src/storage-manager.ts'];
 const RUNNER_ROOT = 'container/agent-runner/src';
 const isRunnerPath = (relPath: string): boolean => relPath.startsWith(RUNNER_ROOT + '/');
 

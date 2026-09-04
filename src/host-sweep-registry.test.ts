@@ -14,6 +14,7 @@
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
+import { fileURLToPath } from 'node:url';
 
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -53,6 +54,12 @@ const h = vi.hoisted(() => {
     claimsOrder: [] as string[],
     claimsStore: [] as string[],
     claimsSelfHealSawStore: null as string[] | null,
+    // S2-PR15: the durable half of the quiet cache. `quietWrites` is one entry
+    // per persistence CALL (so a per-tick re-write shows up as a second entry);
+    // `persistedQuiet` stands in for the `sessions.sweep_quiet_until` column.
+    quietWrites: [] as { sessionId: string; quietUntil: string; lastActive: string | null }[][],
+    persistedQuiet: new Map<string, { quietUntil: string; lastActiveAtWrite: string | null }>(),
+    failQuietPersist: false,
   };
 });
 
@@ -110,6 +117,39 @@ vi.mock('./db/sessions.js', async (importOriginal) => {
     getActiveSessions: () => h.sessions,
     getSession: (id: string) => h.sessions.find((s) => s.id === id),
     updateSession: () => undefined,
+    persistQuietSessionMarks: (
+      marks: readonly { sessionId: string; quietUntil: string; lastActive: string | null }[],
+    ) => {
+      if (h.failQuietPersist) throw new Error('quiet mark persistence: disk I/O error');
+      h.quietWrites.push(marks.map((m) => ({ ...m })));
+      for (const m of marks) {
+        const row = h.sessions.find((s) => s.id === m.sessionId);
+        // The real statement's `AND sessions.last_active IS json_extract(...,'$.basis')`
+        // guard: a row whose last_active moved between the sweep and the flush
+        // is not written. Asserted against real SQLite in
+        // src/db/migrations/068-sessions-sweep-quiet-until.test.ts.
+        if ((row?.last_active ?? null) !== m.lastActive) continue;
+        h.persistedQuiet.set(m.sessionId, { quietUntil: m.quietUntil, lastActiveAtWrite: m.lastActive });
+      }
+    },
+    // The real query's three filters, over the fake column. The `last_active`
+    // arm models the production mechanism exactly: `updateSession` NULLs
+    // `sweep_quiet_until` in the same statement that writes `last_active`, so a
+    // moved `last_active` means the row simply is not returned. That clear is
+    // asserted against a real SQLite DB in
+    // src/db/migrations/068-sessions-sweep-quiet-until.test.ts.
+    getWarmQuietSessionMarks: (nowIso: string) => {
+      const nowMs = Date.parse(nowIso);
+      const rows: { id: string; sweep_quiet_until: string; last_active: string | null }[] = [];
+      for (const session of h.sessions) {
+        if (session.status !== 'active') continue;
+        const mark = h.persistedQuiet.get(session.id);
+        if (!mark || mark.lastActiveAtWrite !== session.last_active) continue;
+        if (!(Date.parse(mark.quietUntil) > nowMs)) continue;
+        rows.push({ id: session.id, sweep_quiet_until: mark.quietUntil, last_active: session.last_active });
+      }
+      return rows;
+    },
   };
 });
 
@@ -205,7 +245,16 @@ vi.mock('./repo-fence-recovery.js', () => ({ sweepOrphanedRepoIngressFences: asy
 vi.mock('./db/channel-ingress-receipts.js', () => ({ pruneChannelIngressReceipts: vi.fn(() => undefined) }));
 vi.mock('./db/usage.js', () => ({ rollupSessionUsage: () => 0, pruneOldTurnUsage: () => undefined }));
 vi.mock('./github-app-token.js', () => ({ refreshExpiringGitHubAppTokens: async () => undefined }));
-vi.mock('./modules/approvals/index.js', () => ({ sweepAwaitingReasonRejects: async () => undefined }));
+// F-14.2 imports the production modules barrel, and several barrel modules
+// register approval handlers at import. Stub those members too — the duty this
+// file drives (T5) only needs `sweepAwaitingReasonRejects`, and loading the real
+// approvals module here would pull the delivery adapter into a registry test.
+vi.mock('./modules/approvals/index.js', () => ({
+  sweepAwaitingReasonRejects: async () => undefined,
+  registerApprovalHandler: () => undefined,
+  requestApproval: async () => undefined,
+  notifyAgent: async () => undefined,
+}));
 vi.mock('./dashboard/session-title-sweep.js', () => ({ runSessionTitleSweep: async () => undefined }));
 vi.mock('./topic-title.js', () => ({ retryPendingThreadTitles: async () => undefined }));
 vi.mock('./dashboard/db/dashboard-tokens.js', () => ({ pruneDashboardTokens: () => undefined }));
@@ -234,12 +283,15 @@ vi.mock('./db/connection.js', () => ({
 import './modules/sweep-repo-fence/index.js';
 import { registerAgentMailbox, resetAgentMailboxForTesting } from './mailbox/index.js';
 import {
+  QUIET_SESSION_BACKOFF_MS,
   SWEEP_DUTY_INVENTORY,
   SWEEP_INTERVAL_MS,
   SWEEP_PHASES,
   _listSweepRegistrationsForTesting,
   _resetSweepRegistryForTesting,
   _unregisterSweepDutySourceForTesting,
+  _lastSweepTickStatsForTesting,
+  _resetQuietSessionCacheForTesting,
   _setSweepYieldForTesting,
   _sweepOnceForTesting,
   registerSlaObservationHook,
@@ -257,6 +309,28 @@ import {
 // not just the in-file built-ins) still surfaces the moved duties for R-7,
 // R-10 and R-11.
 import './modules/sweep-container-health/index.js';
+// Registers S2/S3/S4/S17 as a duty source at import time — needed so
+// `_resetSweepRegistryForTesting()`'s default replay (every recorded source,
+// not just the in-file built-ins) still surfaces the moved duties for R-7,
+// R-10 and R-11.
+import './modules/sweep-session-core/index.js';
+// S2-PR13's family registers S6/S7/S8/S9a/S9b/S15/S10 as its own duty source
+// at import time; without this line R-7's inventory is seven registrations
+// short. Import for side effects only.
+import './modules/sweep-continuation/index.js';
+// …and the settle point for the wake it now starts DETACHED (#359): the
+// attempt restore hangs off the spawn's promise, so a case that counts opens
+// or reads continuation state has to wait for it explicitly.
+import { _resetDetachedWakesForTesting, _settleDetachedWakesForTesting } from './modules/sweep-continuation/index.js';
+// The post-kill follow-up chain now starts from the container's own exit
+// (Codex final), so it is asynchronous with respect to the tick that ordered
+// the kill. Settling after every tick is a no-op when nothing is in flight and
+// restores exactly the accounting the previous in-tick `await` gave.
+import { _resetPostKillForTesting, _settlePostKillForTesting } from './modules/sweep-container-health/index.js';
+// Registers the scheduling family's duty source (S2-PR11: T8, S5, S18, S19) —
+// without it R-7's inventory is four registrations short and R-10's W2 branch
+// has nothing to make a session due.
+import './modules/sweep-scheduling/index.js';
 import { log } from './log.js';
 // Family module side-effect import (S2-PR7): registers T11
 // (scheduled-move-recovery) and T12 (audit-body-prune) as a duty source, so
@@ -266,7 +340,9 @@ import './modules/sweep-scheduled-move/index.js';
 import { SessionDbMissingError, SessionDbUnopenableError } from './modules/mailbox/index.js';
 import { _mailboxSessionDepthForTesting } from './host-sweep-depth-probe.js';
 // Family modules moved out of host-sweep.ts register at import — pull them in
-// here so the hermetic registry harness sees the full 39-registration set.
+// here so the hermetic registry harness sees the full 41-registration set —
+// the seam-2 port's 39 (38 names, S17 twice) plus the two fork duties
+// sweep-central owns, T23 (#285) and FORK1 (#247).
 // Each registers itself via `registerSweepDutySource`, so a default
 // (builtins-restoring) `_resetSweepRegistryForTesting()` replays it
 // automatically, same as the in-file builtins.
@@ -285,6 +361,8 @@ import './modules/sweep-claims/index.js';
 // R-7's registration count includes T19 after the family module moved it out
 // of host-sweep.ts's own in-file builtins.
 import './modules/sweep-usage/index.js';
+
+const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
 probe.depth = _mailboxSessionDepthForTesting;
 
@@ -315,8 +393,9 @@ function fakeMailbox(overrides: Record<string, unknown> = {}): NanoclawMailboxSe
     expireStalePending: () => 0,
     getProcessingClaimRows: () => [],
     hasOutbound: () => true,
-    legacyInboundHandle: () => ({}),
-    legacyOutboundHandle: () => ({}),
+    // Added with the mailbox PR 4 merge: S6's mirror now reads the parsed
+    // proposal through the session instead of taking the outbound handle.
+    readDoneProposal: () => null,
     countDueMessages: () => 0,
     getDueWakePriority: () => 'interactive',
     readWorkContinuation: () => null,
@@ -384,6 +463,11 @@ function probeDuty(
 
 describe('sweep duty registry (S2-PR2)', () => {
   beforeEach(() => {
+    // S9b keeps at most one detached follow-up per session (#359). Cases here
+    // reuse session ids, so an entry left in flight by one would suppress the
+    // next one's wake and the case would pass for the wrong reason.
+    _resetDetachedWakesForTesting();
+    _resetPostKillForTesting();
     resetAgentMailboxForTesting();
     registerAgentMailbox(() => fakeStore);
     h.selfHeal = false;
@@ -405,6 +489,9 @@ describe('sweep duty registry (S2-PR2)', () => {
     h.claimsOrder = [];
     h.claimsStore = ['claim-merged', 'claim-open'];
     h.claimsSelfHealSawStore = null;
+    h.quietWrites.length = 0;
+    h.persistedQuiet.clear();
+    h.failQuietPersist = false;
   });
 
   afterEach(() => {
@@ -449,6 +536,7 @@ describe('sweep duty registry (S2-PR2)', () => {
     registerSweepDuty(probeDuty('house-5', 'tick:housekeeping', 5, seen));
 
     await _sweepOnceForTesting();
+    await _settlePostKillForTesting();
 
     expect(seen).toEqual([
       'pre-10',
@@ -543,6 +631,7 @@ describe('sweep duty registry (S2-PR2)', () => {
     });
 
     await _sweepOnceForTesting();
+    await _settlePostKillForTesting();
 
     expect(seen).toEqual([
       'tick-pre',
@@ -583,6 +672,7 @@ describe('sweep duty registry (S2-PR2)', () => {
     registerSweepDuty({ name: 'c', phase: 'tick:housekeeping', order: 10, run: capture });
 
     await _sweepOnceForTesting();
+    await _settlePostKillForTesting();
 
     expect(scan).toHaveBeenCalledTimes(1);
     // Four reads (two sessions × the plan duty, plus the two tick duties), one array.
@@ -658,6 +748,7 @@ describe('sweep duty registry (S2-PR2)', () => {
         });
 
         await _sweepOnceForTesting();
+        await _settlePostKillForTesting();
 
         expect(error).toHaveBeenCalledWith(
           'Host sweep duty failed',
@@ -668,6 +759,7 @@ describe('sweep duty registry (S2-PR2)', () => {
         // the very next tick sweeps it again.
         h.opens = [];
         await _sweepOnceForTesting();
+        await _settlePostKillForTesting();
         expect(h.opens.length).toBeGreaterThan(0);
         expect(h.spawns).toEqual([]);
       });
@@ -686,6 +778,7 @@ describe('sweep duty registry (S2-PR2)', () => {
       });
 
       await _sweepOnceForTesting();
+      await _settlePostKillForTesting();
 
       expect(h.kills.map((k) => k.reason)).toContain('absolute-ceiling');
       expect(error).toHaveBeenCalledWith(
@@ -773,6 +866,7 @@ describe('sweep duty registry (S2-PR2)', () => {
     });
 
     await _sweepOnceForTesting();
+    await _settlePostKillForTesting();
 
     // Registration IS the guard. Before the seam an unguarded throw here
     // silently skipped every duty ordered behind it for the rest of the tick.
@@ -827,6 +921,7 @@ describe('sweep duty registry (S2-PR2)', () => {
       h.failNextOpen = new SessionDbUnopenableError('/tmp/inbound.db', new Error('boom'));
 
       await _sweepOnceForTesting();
+      await _settlePostKillForTesting();
 
       expect(error).toHaveBeenCalledWith(
         'Host sweep mailbox unopenable',
@@ -836,6 +931,7 @@ describe('sweep duty registry (S2-PR2)', () => {
       // Backed off: the next tick skips the session entirely.
       h.opens = [];
       await _sweepOnceForTesting();
+      await _settlePostKillForTesting();
       expect(h.opens).toEqual([]);
       expect(h.spawns).toEqual([]);
     });
@@ -921,6 +1017,7 @@ describe('sweep duty registry (S2-PR2)', () => {
         const session = arm();
 
         await _sweepOnceForTesting();
+        await _settlePostKillForTesting();
 
         then?.();
 
@@ -934,6 +1031,7 @@ describe('sweep duty registry (S2-PR2)', () => {
         h.opens = [];
         h.failNextOpen = null;
         await _sweepOnceForTesting();
+        await _settlePostKillForTesting();
         expect(h.opens.length).toBeGreaterThan(0);
         expect(h.spawns).toEqual([]);
       });
@@ -948,11 +1046,13 @@ describe('sweep duty registry (S2-PR2)', () => {
       h.failNextOpen = new SessionDbMissingError('/gone/inbound.db');
 
       await _sweepOnceForTesting();
+      await _settlePostKillForTesting();
 
       expect(error).not.toHaveBeenCalledWith('Host sweep mailbox unopenable', expect.anything());
       expect(error).not.toHaveBeenCalledWith('Host sweep duty failed', expect.anything());
       h.opens = [];
       await _sweepOnceForTesting();
+      await _settlePostKillForTesting();
       expect(h.opens).toEqual([]);
       expect(h.spawns).toEqual([]);
     });
@@ -965,6 +1065,7 @@ describe('sweep duty registry (S2-PR2)', () => {
       continuationWakeSession(new SessionDbMissingError('/gone/inbound.db'));
 
       await _sweepOnceForTesting();
+      await _settlePostKillForTesting();
 
       expect(error).not.toHaveBeenCalledWith('Host sweep mailbox unopenable', expect.anything());
       expect(error).not.toHaveBeenCalledWith('Host sweep duty failed', expect.anything());
@@ -977,6 +1078,7 @@ describe('sweep duty registry (S2-PR2)', () => {
       h.opens = [];
       h.failNextOpen = null;
       await _sweepOnceForTesting();
+      await _settlePostKillForTesting();
       expect(h.opens.length).toBeGreaterThan(0);
       expect(h.spawns).toEqual([]);
     });
@@ -1123,6 +1225,7 @@ describe('sweep duty registry (S2-PR2)', () => {
     expect(reconcile?.order).toBeLessThan(selfHeal?.order ?? Infinity);
 
     await _sweepOnceForTesting();
+    await _settlePostKillForTesting();
 
     // Order, and NOT merely declared order — the probe proves reconcile's
     // deletion of 'claim-merged' is visible to self-heal in the SAME tick.
@@ -1140,6 +1243,223 @@ describe('sweep duty registry (S2-PR2)', () => {
     expect(egress).toBeDefined();
     expect(egress?.phase).toBe('tick:pre-session');
     expect(SWEEP_PHASES.indexOf('tick:pre-session')).toBeLessThan(SWEEP_PHASES.indexOf('session:plan'));
+  });
+
+  // ── F-14.1 (S2-PR14, plan.md §8) ─────────────────────────────────────────────
+  //
+  // Structural, not a line budget. The plan's original "under 300 lines" was an
+  // estimate written before the build. Re-measured on the B3 integration
+  // lineage re-based onto mailbox seam PR 7's head: `wc -l` 1,409, which is
+  // 1,410 by the `split('\n')` count the assertion below uses, one more for the
+  // trailing newline. Section breakdown, in `split('\n')` elements, contiguous
+  // and summing exactly to 1,410:
+  // sweepSession + helpers 262, driver start/stop/sweep/sweepOnce 253, error
+  // rule + SLA hooks + kill follow-ups + windowedRunner 182, registry 143,
+  // re-exports + writeSystemWake + providerFailedTicks + the outbound-ownership
+  // guard docs 140, tick constants + quiet cache 120, shared context + duty
+  // types 109, phase list 73, duty inventory 53, imports 29, file header 26,
+  // tail re-exports + the empty built-in source 20. (S2-PR14's own head,
+  // dc440893, measured 1,198 by the same count — see the ratchet comment below
+  // for the delta's real cause.) The three assertions below are what the
+  // criterion actually means; the ceiling at the end is a REGROWTH ratchet, not
+  // a target — it catches a duty body creeping back into the driver, which is
+  // the failure this case exists to prevent.
+  it('host-sweep.ts contains no inline duty bodies', async () => {
+    const source = fs.readFileSync(path.join(REPO_ROOT, 'src/host-sweep.ts'), 'utf8');
+
+    // (1) No duty ORIGINATES in the driver. Re-evaluate host-sweep.ts in a fresh
+    // module graph — its own import list, no family module and no modules barrel
+    // — and the registry it builds is empty. `registerSweepDutySource` invokes
+    // its registrar immediately, so this also proves `registerBuiltInSweepDuties`
+    // registers nothing rather than merely being unreferenced.
+    vi.resetModules();
+    const isolated = await import('./host-sweep.js');
+    const fresh = isolated._listSweepRegistrationsForTesting();
+    expect(fresh.duties, 'a duty is registered by host-sweep.ts itself').toEqual([]);
+    expect(fresh.slaObservationHooks).toEqual([]);
+    expect(fresh.killFollowUps).toEqual([]);
+
+    // (2) No inline registration call site. The driver DEFINES the four
+    // registration surfaces and never calls three of them; every duty call site
+    // is a `src/modules/sweep-*` module. The single exception is the driver
+    // declaring its own empty source, which is part of the registry contract —
+    // `_resetSweepRegistryForTesting()` replays every recorded source and
+    // `_unregisterSweepDutySourceForTesting` refuses this one by name — so it is
+    // pinned exactly rather than forbidden.
+    const callSites = (needle: string) => source.split(needle).length - 1;
+    const definitions = (needle: string) => source.split(`export function ${needle}(`).length - 1;
+    for (const surface of ['registerSweepDuty', 'registerSlaObservationHook', 'registerSweepKillFollowUp'] as const) {
+      expect(definitions(surface), `${surface} is defined once`).toBe(1);
+      expect(callSites(`${surface}(`) - definitions(surface), `${surface} is called inline in host-sweep.ts`).toBe(0);
+      expect(source.includes(`${surface}({`), `${surface} is called with an inline body`).toBe(false);
+    }
+    expect(definitions('registerSweepDutySource')).toBe(1);
+    expect(callSites('registerSweepDutySource(') - definitions('registerSweepDutySource')).toBe(1);
+    expect(source).toContain("registerSweepDutySource('host-sweep:builtin', registerBuiltInSweepDuties)");
+    expect(source).toContain('function registerBuiltInSweepDuties(): void {}');
+
+    // (3) The export surface is the driver, the registry, the phase list, the
+    // shared context, the error rule and the test accessors — nothing else. A
+    // subset assertion, so a duty helper leaking back out as an export fails
+    // here even though a removal would not.
+    const ALLOWED_EXPORTS = new Set([
+      // phase list
+      'SWEEP_PHASES',
+      'sweepPhaseKind',
+      // registry
+      'registerSweepDuty',
+      'registerSweepDutySource',
+      'registerSlaObservationHook',
+      'registerSweepKillFollowUp',
+      'runSlaObservationHooks',
+      'runSweepKillFollowUps',
+      'SWEEP_DUTY_INVENTORY',
+      // shared context + error rule
+      'asSessionContext',
+      'SweepWindowAbort',
+      'dutyFailureFields',
+      // driver + its tick constants
+      'startHostSweep',
+      'stopHostSweep',
+      'SWEEP_INTERVAL_MS',
+      'ABSOLUTE_CEILING_MS',
+      'CLAIM_STUCK_MS',
+      'SPAWN_GRACE_MS',
+      'QUIET_SESSION_BACKOFF_MS',
+      'providerFailedTicks',
+      'writeSystemWake',
+      // The outbound-ownership guard the families share on both sides of a kill
+      // (mailbox seam PR 5 / 5b — 7199be48, 3b6cbb5f, bb9fb1ff). A predicate and
+      // two wrappers around a caller's own action: no duty body, no session held.
+      'containerOwnsOutbound',
+      'writeOutboundWhenStopped',
+      'withStoppedContainerSession',
+      // re-exports the families and their callers reach through the driver
+      'parseSqliteUtc',
+      'decideCeilingFollowUp',
+      'WORK_CONTINUATION_RESUME_MAX_ATTEMPTS',
+      // test accessors
+      '_lastSweepTickStatsForTesting',
+      '_listSweepRegistrationsForTesting',
+      '_resetQuietSessionCacheForTesting',
+      '_resetSweepRegistryForTesting',
+      '_unregisterSweepDutySourceForTesting',
+      '_setSweepYieldForTesting',
+      '_sweepOnceForTesting',
+      '_sweepSessionForTesting',
+      '_sweepTaskWatchdogForTesting',
+    ]);
+    const actualExports = Object.keys(isolated);
+    expect([...actualExports].filter((name) => !ALLOWED_EXPORTS.has(name))).toEqual([]);
+    // Not vacuous: the driver, the registry and the phase list are all still here.
+    for (const core of ['startHostSweep', 'registerSweepDuty', 'SWEEP_PHASES', 'asSessionContext']) {
+      expect(actualExports, `host-sweep.ts no longer exports ${core}`).toContain(core);
+    }
+
+    // Regrowth ratchet. 1,410 by this measure on the B3 integration lineage
+    // re-based onto mailbox seam PR 7's head (1,409 by `wc -l`), against 1,198
+    // on S2-PR14's own head (dc440893, same count). Of the +212, six lines are
+    // the base's own two fork duties in `SWEEP_DUTY_INVENTORY` (T23
+    // `cli-request-execution-prune` from #285 and FORK1
+    // `github-token-file-refresh` from #247) — inventory entries, not bodies;
+    // both duties register from `src/modules/sweep-central/`. Another 55 are
+    // #359's wake instrumentation: the `reportWake` channel on the session
+    // context, the per-tick accumulator, and the three counters on the timing
+    // line. That is driver-owned measurement of the driver's own loop — the
+    // same status as `lastTickStats` beside it — and it exists because
+    // `sessionsMs` conflated walking sessions with waiting on spawns. The
+    // remaining +151 is NOT a duty coming home either — measured with
+    // `git diff --stat dc440893 HEAD -- src/host-sweep.ts` and read hunk by
+    // hunk, the two largest pieces are:
+    //  - +152 net lines: S2-PR15's quiet-session backoff jitter + boot-time
+    //    cache warm (`quietSessionJitter`/`quietSessionBackoffMs`/
+    //    `warmQuietSessionCache`, issue #320), plus its per-tick flush further
+    //    down (`newQuietMarks`/`persistQuietSessionMarks`) and
+    //    `_lastSweepTickStatsForTesting` — real driver code, not comment, but
+    //    not a registrable duty body either: it is the sweep loop's own cache,
+    //    same status as `sweepDuties`/`sweepKillFollowUps` above. Per-commit,
+    //    `git show --numstat <sha> -- src/host-sweep.ts`: f84d43d0 (jitter)
+    //    +53/-3, d2a0cd34 (persist + warm) +95/-1 — the +144 feature pair —
+    //    and its follow-up b6e0bc2e (guard the mark write) +9/-1. The earlier
+    //    "~90 lines" here was an eyeballed hunk read, not a measurement
+    //    (Codex round 2, minor finding 4); the ratchet below is unaffected,
+    //    since the total +149 it was reconciling against was always measured.
+    //  - a near-wash (-59/+58 across two hunks): `containerOwnsOutbound`/
+    //    `writeOutboundWhenStopped`/`withStoppedContainerSession` moved from a
+    //    local PR14 definition to an import from `container-runner.js`
+    //    (mailbox PR 4 round 8) plus PR 7's re-worded doc block at the new
+    //    (earlier) location.
+    // The remainder is the `withExistingMailboxSession` rename (PR 7) and other
+    // one-line diffs scattered through `sweepOnce`/`sweepSession`. None of it is
+    // a duty body: no duty originates here, no registration surface is called
+    // inline, and the export allowlist is unchanged (the three structural
+    // assertions above, which is what the F-14.1 criterion actually means).
+    // Ratchet raised from 1,300 to 1,400 and then to 1,450 — measured (1,410)
+    // + ~40, the same measured-plus-headroom rule 1,400 was set by, deliberately
+    // NOT rounded up to 1,500: headroom nobody has audited is headroom a duty
+    // body can come home into, which is the one thing this number exists to
+    // catch. The rise is for the same reason plan.md's own estimate was always
+    // going to be wrong — `warmQuietSessionCache` with its persistence path,
+    // and now #359's wake instrumentation, are legitimate driver-owned
+    // functionality that arrived after the plan's line budget was written. The
+    // three structural assertions above are the criterion; this number only has
+    // to fail when a duty body comes home.
+    expect(source.split('\n').length).toBeLessThanOrEqual(1450);
+    expect(h.spawns).toEqual([]);
+  });
+
+  // ── F-14.2 (S2-PR14, plan.md §8) ─────────────────────────────────────────────
+  it('the registered duty set still matches the inventory after every family has moved', async () => {
+    // R-7's assertion, re-run at the end state and reached the way production
+    // reaches it: through the modules barrel src/main.ts imports, not through
+    // this file's own per-family side-effect imports.
+    //
+    // Codex round on bea7c74f (F1): the barrel has to be loaded into a FRESH
+    // module graph and the registry read from THAT graph's host-sweep instance.
+    // Importing the barrel while `_listSweepRegistrationsForTesting` is still
+    // this file's static binding reads a registry the file's own per-family
+    // imports already populated — the case would stay green with a family line
+    // deleted from src/modules/index.ts, which is exactly the regression it
+    // exists to catch. `vi.mock` factories survive `resetModules()`, so the
+    // fresh graph gets the same stubs.
+    vi.resetModules();
+    await import('./modules/index.js');
+    const hs = await import('./host-sweep.js');
+
+    const { duties, slaObservationHooks, killFollowUps } = hs._listSweepRegistrationsForTesting();
+    const actual: Array<[string, string, string, number]> = [
+      ...duties.map((d): [string, string, string, number] => ['duty', d.name, d.phase, d.order]),
+      ...slaObservationHooks.map((hk): [string, string, string, number] => [
+        'sla-observation-hook',
+        hk.name,
+        'sla-observation-hook',
+        hk.order,
+      ]),
+      ...killFollowUps.map((f): [string, string, string, number] => [
+        'kill-follow-up',
+        f.name,
+        'kill-follow-up',
+        f.order,
+      ]),
+    ];
+
+    expect(actual).toEqual(EXPECTED_REGISTRATIONS);
+    // 41 registrations over 40 names. The seam-2 port is 38 duties in 39
+    // registrations — S17 is the only one registered twice, once as a
+    // session:health duty and once as the post-kill follow-up — plus the two
+    // fork duties the upstream seam does not have: T23
+    // `cli-request-execution-prune` (#285) and FORK1
+    // `github-token-file-refresh` (#247), both from `sweep-central`. The
+    // numbers here said 39/38/38 from before those two landed; the tuple
+    // comparison above was already right, which is why it never failed.
+    expect(actual).toHaveLength(41);
+    const names = new Set(actual.map((r) => r[1]));
+    expect(names.size).toBe(40);
+    // The inventory comes from the same fresh instance, not this file's binding.
+    expect(names).toEqual(new Set(Object.values(hs.SWEEP_DUTY_INVENTORY)));
+    expect(Object.keys(hs.SWEEP_DUTY_INVENTORY)).toHaveLength(40);
+    expect(actual.filter((r) => r[1] === hs.SWEEP_DUTY_INVENTORY.S17)).toHaveLength(2);
+    expect(h.spawns).toEqual([]);
   });
 
   // ── duty registration sources ───────────────────────────────────────────────
@@ -1209,11 +1529,13 @@ describe('sweep duty registry (S2-PR2)', () => {
       h.mailbox = fakeMailbox({ getNextFutureProcessAfter: () => null });
 
       await _sweepOnceForTesting();
+      await _settlePostKillForTesting();
       expect(h.opens.length).toBeGreaterThan(0);
 
       // Second tick: skipped entirely, no mailbox opened.
       h.opens = [];
       await _sweepOnceForTesting();
+      await _settlePostKillForTesting();
       expect(h.opens).toEqual([]);
 
       // A due row sooner than the cap shortens the skip.
@@ -1224,12 +1546,14 @@ describe('sweep duty registry (S2-PR2)', () => {
       h.sessions = [nudged];
       h.opens = [];
       await _sweepOnceForTesting();
+      await _settlePostKillForTesting();
       expect(h.opens).toContain(nudged.id);
       // Past its next due row but well inside the 30-minute cap: swept again.
       h.opens = [];
       vi.useFakeTimers({ shouldAdvanceTime: true });
       vi.setSystemTime(Date.now() + 10_000);
       await _sweepOnceForTesting();
+      await _settlePostKillForTesting();
       vi.useRealTimers();
       expect(h.opens).toContain(nudged.id);
       expect(h.spawns).toEqual([]);
@@ -1240,13 +1564,437 @@ describe('sweep duty registry (S2-PR2)', () => {
       h.sessions = [session];
 
       await _sweepOnceForTesting();
+      await _settlePostKillForTesting();
       h.opens = [];
       await _sweepOnceForTesting();
+      await _settlePostKillForTesting();
       expect(h.opens).toEqual([]);
 
       h.sessions = [fakeSession('sess-invalidate', { last_active: '2026-04-20T13:30:00.000Z' })];
       await _sweepOnceForTesting();
+      await _settlePostKillForTesting();
       expect(h.opens).toContain('sess-invalidate');
+      expect(h.spawns).toEqual([]);
+    });
+  });
+
+  // ── S2-PR15 (#320): the quiet backoff is jittered ────────────────────────────
+  //
+  // Live evidence the cases below pin: the whole quiet population (~840
+  // sessions) took its mark in one tick and therefore expired in one tick, on
+  // an exact 30-minute grid, 48 times a day. The jitter never LENGTHENS a
+  // skip — the 30-minute ceiling §4.4 pins is untouched — it only spreads the
+  // cohort's expiry across the window below it.
+  describe('quiet backoff jitter (S2-PR15)', () => {
+    const HERD = 200;
+    const MINUTE = 60_000;
+
+    /**
+     * Mark `HERD` sessions quiet in one tick, then step a tick per minute and
+     * record, for each session, the FIRST minute at which it was swept again.
+     * That minute IS the observed backoff — the skip check is a `Date.now() <
+     * skipUntilMs` compare, so the first tick past `skipUntilMs` sweeps it.
+     *
+     * Registry stripped to the driver (`builtins: false`): 200 sessions × 17
+     * ticks through 39 duty bodies measures the duties, not the cache, and the
+     * quiet hint is driver machinery that runs either way.
+     */
+    async function observeBackoffMinutes(): Promise<Map<string, number>> {
+      _resetSweepRegistryForTesting({ builtins: false });
+      _resetQuietSessionCacheForTesting();
+      _setSweepYieldForTesting(async () => undefined);
+      h.sessions = Array.from({ length: HERD }, (_, i) => fakeSession(`sess-herd-${i}`));
+      h.mailbox = fakeMailbox({ getNextFutureProcessAfter: () => null });
+
+      const startMs = Date.UTC(2026, 8, 3, 12, 0, 0);
+      vi.setSystemTime(startMs);
+      h.opens = [];
+      await _sweepOnceForTesting();
+      await _settlePostKillForTesting();
+      // A swept session opens twice (W1 and W5); a skipped one opens not at all.
+      expect(new Set(h.opens).size).toBe(HERD);
+
+      const firstSweptAt = new Map<string, number>();
+      for (let minute = 1; minute <= 31; minute++) {
+        vi.setSystemTime(startMs + minute * MINUTE);
+        h.opens = [];
+        await _sweepOnceForTesting();
+        await _settlePostKillForTesting();
+        for (const id of new Set(h.opens)) if (!firstSweptAt.has(id)) firstSweptAt.set(id, minute);
+      }
+      return firstSweptAt;
+    }
+
+    beforeEach(() => {
+      vi.useFakeTimers({ shouldAdvanceTime: false });
+    });
+    afterEach(() => {
+      vi.useRealTimers();
+      _resetQuietSessionCacheForTesting();
+    });
+
+    // ── Q-7 ──────────────────────────────────────────────────────────────────
+    it('quiet backoff is jittered so one cohort does not expire in one tick', async () => {
+      const observed = await observeBackoffMinutes();
+      expect(observed.size).toBe(HERD);
+
+      const minutes = [...observed.values()];
+      const spread = Math.max(...minutes) - Math.min(...minutes);
+      expect(spread, 'the cohort expires across a window, not on one grid line').toBeGreaterThan(10);
+      // Never past the cap: the jitter only ever shortens the skip, so §4.4's
+      // 30-minute bound still holds for every session.
+      expect(Math.max(...minutes)).toBeLessThanOrEqual(QUIET_SESSION_BACKOFF_MS / MINUTE);
+      expect(h.spawns).toEqual([]);
+    });
+
+    // ── S2-PR15 acceptance ───────────────────────────────────────────────────
+    it('quiet marks expire on a jittered schedule, never all on one tick', async () => {
+      const first = await observeBackoffMinutes();
+
+      const minutes = [...first.values()];
+      const window = QUIET_SESSION_BACKOFF_MS / MINUTE;
+      expect(Math.max(...minutes) - Math.min(...minutes)).toBeGreaterThanOrEqual(window * 0.2);
+
+      // The herd assertion: no single tick takes the whole cohort back.
+      const perMinute = new Map<number, number>();
+      for (const m of minutes) perMinute.set(m, (perMinute.get(m) ?? 0) + 1);
+      expect(Math.max(...perMinute.values()), 'a whole cohort still expires on one tick').toBeLessThan(HERD);
+
+      // Deterministic: the jitter is a hash of the session id, not
+      // Math.random, so a second identical run reproduces every expiry.
+      const second = await observeBackoffMinutes();
+      expect([...second.entries()].sort()).toEqual([...first.entries()].sort());
+      expect(h.spawns).toEqual([]);
+    });
+  });
+
+  // ── S2-PR15 (#320): the quiet mark survives a restart ────────────────────────
+  //
+  // The cache was process-local, so every boot threw it away and the first tick
+  // after one swept every active session — ~850 of them, a 457 s tick, nine
+  // times in the 22 hours of log #320 was filed against. The mark now lives on
+  // the session row (migration 068) and `startHostSweep` warms the map from it.
+  describe('quiet-cache durability (S2-PR15)', () => {
+    const MINUTE = 60_000;
+
+    /**
+     * Drive ONE tick the way a fresh host does: through `startHostSweep`, which
+     * is where the warm happens. `_sweepOnceForTesting` deliberately does not
+     * warm — a case that used it would pass with the warm path deleted.
+     */
+    async function firstTickAfterRestart(): Promise<void> {
+      stopHostSweep();
+      const before = _lastSweepTickStatsForTesting().ticks;
+      // Fake ONLY setTimeout, so the driver's 60 s re-arm is a timer this test
+      // can drop while the tick's own awaits and setImmediate yields stay real.
+      // A caller that is ALREADY on fake timers keeps its own clock — calling
+      // `useFakeTimers` again reinstalls it and would silently undo a
+      // `setSystemTime` the case depends on.
+      const callerFakedTimers = vi.isFakeTimers();
+      if (!callerFakedTimers) vi.useFakeTimers({ toFake: ['setTimeout'] });
+      try {
+        startHostSweep();
+        for (let i = 0; i < 500 && _lastSweepTickStatsForTesting().ticks === before; i++) {
+          await new Promise((resolve) => setImmediate(resolve));
+        }
+      } finally {
+        stopHostSweep();
+        vi.clearAllTimers();
+        if (!callerFakedTimers) vi.useRealTimers();
+      }
+      expect(_lastSweepTickStatsForTesting().ticks, 'the restart tick never completed').toBe(before + 1);
+    }
+
+    /** A driver-only registry and an empty cache — a cold process. */
+    function coldDriver(sessions: Session[]): void {
+      _resetSweepRegistryForTesting({ builtins: false });
+      _resetQuietSessionCacheForTesting();
+      h.sessions = sessions;
+      h.mailbox = fakeMailbox({ getNextFutureProcessAfter: () => null });
+    }
+
+    afterEach(() => {
+      stopHostSweep();
+      _resetQuietSessionCacheForTesting();
+    });
+
+    // ── Q-1 ──────────────────────────────────────────────────────────────────
+    it('a quiet mark survives a driver restart and is warmed without opening any session DB', async () => {
+      coldDriver([fakeSession('sess-warm-a'), fakeSession('sess-warm-b')]);
+
+      await _sweepOnceForTesting();
+      await _settlePostKillForTesting();
+      expect(h.quietWrites).toHaveLength(1);
+      expect(h.quietWrites[0]!.map((m) => m.sessionId).sort()).toEqual(['sess-warm-a', 'sess-warm-b']);
+
+      // The restart: the process-local map is gone, the rows are not.
+      _resetQuietSessionCacheForTesting();
+      h.opens = [];
+      await firstTickAfterRestart();
+
+      expect(_lastSweepTickStatsForTesting()).toMatchObject({ skippedQuiet: 2, sweptSessions: 0 });
+      expect(h.opens, 'a warmed session must cost zero session-DB opens').toEqual([]);
+      expect(h.spawns).toEqual([]);
+    });
+
+    // ── S2-PR15 acceptance ───────────────────────────────────────────────────
+    it('the quiet cache is warm on the first tick after a restart', async () => {
+      const ids = ['w-1', 'w-2', 'w-3', 'w-4', 'w-5'];
+      coldDriver(ids.map((id) => fakeSession(id)));
+
+      await _sweepOnceForTesting();
+      await _settlePostKillForTesting();
+      _resetQuietSessionCacheForTesting();
+      h.opens = [];
+      await firstTickAfterRestart();
+
+      expect(_lastSweepTickStatsForTesting()).toMatchObject({ skippedQuiet: ids.length, sweptSessions: 0 });
+      expect(h.opens).toEqual([]);
+      expect(h.spawns).toEqual([]);
+    });
+
+    // ── Q-2 ──────────────────────────────────────────────────────────────────
+    it('a warmed mark whose last_active moved is dropped, and that session is swept on the first tick after the restart', async () => {
+      coldDriver([fakeSession('sess-moved')]);
+      await _sweepOnceForTesting();
+      await _settlePostKillForTesting();
+      expect(h.quietWrites).toHaveLength(1);
+
+      // Production nulls the column in the same statement that writes
+      // last_active (updateSession), so the warm query never returns the row.
+      _resetQuietSessionCacheForTesting();
+      h.sessions = [fakeSession('sess-moved', { last_active: '2026-04-20T13:30:00.000Z' })];
+      h.opens = [];
+      await firstTickAfterRestart();
+
+      expect(_lastSweepTickStatsForTesting()).toMatchObject({ skippedQuiet: 0, sweptSessions: 1 });
+      expect(h.opens).toContain('sess-moved');
+      expect(h.spawns).toEqual([]);
+    });
+
+    // ── S2-PR15 acceptance ───────────────────────────────────────────────────
+    it('a persisted quiet mark is ignored when last_active moved after it', async () => {
+      coldDriver([fakeSession('sess-ignored')]);
+      await _sweepOnceForTesting();
+      await _settlePostKillForTesting();
+      const persisted = h.quietWrites[0]![0]!;
+      // The mark itself is still in the future — only the moved last_active
+      // disqualifies it, so this is not an expiry test in disguise.
+      expect(Date.parse(persisted.quietUntil)).toBeGreaterThan(Date.now());
+
+      _resetQuietSessionCacheForTesting();
+      h.sessions = [fakeSession('sess-ignored', { last_active: '2026-04-20T14:00:00.000Z' })];
+      h.opens = [];
+      await firstTickAfterRestart();
+
+      expect(h.opens, 'the session was skipped on a mark older than its last_active').toContain('sess-ignored');
+      expect(_lastSweepTickStatsForTesting().skippedQuiet).toBe(0);
+      expect(h.spawns).toEqual([]);
+    });
+
+    // ── Q-3 ──────────────────────────────────────────────────────────────────
+    it('a warmed mark never outlives its next due row', async () => {
+      const startMs = Date.UTC(2026, 8, 3, 12, 0, 0);
+      // `setImmediate` stays REAL: the driver's per-session yield uses it, and
+      // `firstTickAfterRestart` awaits macrotasks to observe the tick complete.
+      vi.useFakeTimers({ toFake: ['Date', 'setTimeout'] });
+      try {
+        vi.setSystemTime(startMs);
+        coldDriver([fakeSession('sess-due')]);
+        h.mailbox = fakeMailbox({
+          getNextFutureProcessAfter: () => new Date(startMs + 5 * MINUTE).toISOString(),
+        });
+
+        await _sweepOnceForTesting();
+        await _settlePostKillForTesting();
+        // The persisted value IS the due row, not the backoff cap — which is
+        // why a warm can never cross one that already existed at mark time.
+        expect(h.quietWrites[0]![0]!.quietUntil).toBe(new Date(startMs + 5 * MINUTE).toISOString());
+
+        _resetQuietSessionCacheForTesting();
+        vi.setSystemTime(startMs + 6 * MINUTE);
+        h.opens = [];
+        await firstTickAfterRestart();
+
+        expect(h.opens).toContain('sess-due');
+        expect(_lastSweepTickStatsForTesting()).toMatchObject({ skippedQuiet: 0, sweptSessions: 1 });
+      } finally {
+        vi.useRealTimers();
+      }
+      expect(h.spawns).toEqual([]);
+    });
+
+    // ── Q-4 ──────────────────────────────────────────────────────────────────
+    it('a session with a live container is never warmed as quiet', async () => {
+      coldDriver([fakeSession('sess-live')]);
+      await _sweepOnceForTesting();
+      await _settlePostKillForTesting();
+      expect(h.quietWrites).toHaveLength(1);
+
+      // The container came back between the mark and the boot. A live session
+      // is never quiet, whatever the row says.
+      _resetQuietSessionCacheForTesting();
+      h.running.add('sess-live');
+      h.opens = [];
+      await firstTickAfterRestart();
+
+      expect(h.opens).toContain('sess-live');
+      expect(_lastSweepTickStatsForTesting().skippedQuiet).toBe(0);
+      expect(h.spawns).toEqual([]);
+    });
+
+    // ── Q-5 ──────────────────────────────────────────────────────────────────
+    it('the quiet mark is written on the transition only, not on every confirming tick', async () => {
+      coldDriver([fakeSession('sess-once')]);
+
+      await _sweepOnceForTesting();
+      await _settlePostKillForTesting();
+      await _sweepOnceForTesting();
+      await _settlePostKillForTesting();
+      await _sweepOnceForTesting();
+      await _settlePostKillForTesting();
+
+      // Three ticks, one write. A per-tick write of the ~840 rows the cache
+      // holds would be a new cost, not a saving.
+      expect(h.quietWrites).toHaveLength(1);
+      expect(h.quietWrites[0]).toHaveLength(1);
+      expect(h.spawns).toEqual([]);
+    });
+
+    // Not a plan-named case; the property the `skipUnreadable` carve-out exists
+    // for. Its causes are process-local, so a fresh process must re-try rather
+    // than inherit a dead one's verdict.
+    it('an unreadable session takes the backoff in-process but persists no mark', async () => {
+      _resetSweepRegistryForTesting({ builtins: false });
+      _resetQuietSessionCacheForTesting();
+      h.sessions = [fakeSession('sess-unreadable')];
+      h.mailbox = fakeMailbox();
+      h.exists = false; // the mailbox store answers "gone" — the read-path contract
+
+      await _sweepOnceForTesting();
+      await _settlePostKillForTesting();
+      expect(h.quietWrites, 'an unreadable session must not persist a mark').toEqual([]);
+
+      // In-process it is still backed off, exactly as before this PR.
+      h.opens = [];
+      await _sweepOnceForTesting();
+      await _settlePostKillForTesting();
+      expect(h.opens).toEqual([]);
+      expect(h.spawns).toEqual([]);
+    });
+
+    // Codex F1, driven through the registered path.
+    //
+    // SCOPE, narrowed after Codex round 2 (L2): this case owns the DRIVER half —
+    // that each queued mark carries the `last_active` it was computed against,
+    // and that a session invalidated mid-fan-out is not skipped after a restart.
+    // It does NOT prove the storage contract: the `persistQuietSessionMarks`
+    // mock below models the null-safe comparison itself, so deleting the SQL
+    // guard leaves this case green. The statement's own guard — including the
+    // NULL-basis arm that a `=` comparison silently drops — is owned by
+    // "does not write back a mark whose last_active moved between the sweep and
+    // the flush" in src/db/migrations/068-sessions-sweep-quiet-until.test.ts,
+    // against real SQLite. Omitting the field from the driver is a compile
+    // error, so the two together close the path.
+    it('a mark invalidated during the fan-out is not written back, and that session is swept after a restart', async () => {
+      const early = fakeSession('sess-early');
+      const late = fakeSession('sess-late');
+      coldDriver([early, late]);
+
+      // Ingress landing in the yield after the FIRST session: the central row's
+      // last_active advances (and production's `updateSession` nulls the column
+      // in that same statement).
+      let yields = 0;
+      _setSweepYieldForTesting(async () => {
+        if (++yields === 1) {
+          h.sessions[0] = fakeSession('sess-early', { last_active: '2026-04-20T13:45:00.000Z' });
+          h.persistedQuiet.delete('sess-early');
+        }
+      });
+
+      await _sweepOnceForTesting();
+      await _settlePostKillForTesting();
+
+      // Both were queued — the driver cannot know — but only the untouched one
+      // is actually persisted.
+      expect(h.quietWrites[0]!.map((m) => m.sessionId).sort()).toEqual(['sess-early', 'sess-late']);
+      expect([...h.persistedQuiet.keys()]).toEqual(['sess-late']);
+
+      _resetQuietSessionCacheForTesting();
+      h.opens = [];
+      await firstTickAfterRestart();
+
+      expect(h.opens, 'a stale mark was written back and warmed').toContain('sess-early');
+      expect(_lastSweepTickStatsForTesting()).toMatchObject({ skippedQuiet: 1, sweptSessions: 1 });
+      expect(h.spawns).toEqual([]);
+    });
+
+    // Codex round 2, H1/H2 — the property both restore-path fixes rely on.
+    // A tick:housekeeping duty runs AFTER the fan-out and after the mark flush,
+    // so a duty that puts due work back into a session the fan-out just marked
+    // quiet has exactly one way to be seen: move `last_active`. This proves the
+    // driver honours that, in-process and across a restart.
+    it('a housekeeping duty that touches a session invalidates the mark that tick took', async () => {
+      _resetSweepRegistryForTesting({ builtins: false });
+      _resetQuietSessionCacheForTesting();
+      h.sessions = [fakeSession('sess-restored')];
+      h.mailbox = fakeMailbox({ getNextFutureProcessAfter: () => null });
+
+      // Stands in for recoverMoveIntents' restoreTaskRow inside
+      // withQuietInvalidationSync, and for scheduled-move's compensation: due
+      // work put back after the flush, and the central-DB write that announces
+      // it.
+      let restored = false;
+      registerSweepDuty({
+        name: 'probe-restore',
+        phase: 'tick:housekeeping',
+        order: 10,
+        run: () => {
+          if (restored) return;
+          restored = true;
+          // What withQuietInvalidationSync does: move last_active, null the column.
+          h.sessions[0] = fakeSession('sess-restored', { last_active: '2026-04-20T14:30:00.000Z' });
+          h.persistedQuiet.delete('sess-restored');
+        },
+      });
+
+      await _sweepOnceForTesting();
+      await _settlePostKillForTesting();
+      expect(h.quietWrites[0]!.map((m) => m.sessionId)).toEqual(['sess-restored']);
+      expect([...h.persistedQuiet.keys()], 'the flush wrote a mark the restore had already cleared').toEqual([]);
+
+      // Restart IMMEDIATELY, with no intervening tick: the mark this tick took
+      // is gone from the row, so the warm has nothing to offer and the session
+      // is swept. Deliberately no in-process tick in between — a second tick
+      // would sweep the session (proving the in-process half, which R-9's
+      // "a last_active change invalidates the mark immediately" already owns),
+      // find it quiet again and take a FRESH, legitimate mark, which the warm
+      // would then honour. That is correct behavior, not the regression this
+      // case exists for.
+      _resetQuietSessionCacheForTesting();
+      h.opens = [];
+      await firstTickAfterRestart();
+      expect(h.opens, 'a mark cleared by housekeeping survived the restart').toContain('sess-restored');
+      expect(_lastSweepTickStatsForTesting().skippedQuiet).toBe(0);
+      expect(h.spawns).toEqual([]);
+    });
+
+    // ── Q-6 ──────────────────────────────────────────────────────────────────
+    it('a failed persistence write degrades to a cold sweep and never to a skipped due session', async () => {
+      const warn = vi.spyOn(log, 'warn').mockImplementation(() => {});
+      coldDriver([fakeSession('sess-writefail')]);
+      h.failQuietPersist = true;
+
+      await expect(_sweepOnceForTesting()).resolves.toBeUndefined();
+      expect(warn.mock.calls.map((c) => c[0])).toContain('Host sweep quiet mark persistence failed');
+
+      // Degraded to today's pre-cache behavior: the in-memory mark goes with
+      // the failed write, so the very next tick sweeps the session rather than
+      // skipping it on a mark no restart could ever recover.
+      h.opens = [];
+      await _sweepOnceForTesting();
+      await _settlePostKillForTesting();
+      expect(h.opens).toContain('sess-writefail');
       expect(h.spawns).toEqual([]);
     });
   });
@@ -1277,6 +2025,7 @@ describe('sweep duty registry (S2-PR2)', () => {
       });
 
       await _sweepOnceForTesting();
+      await _settlePostKillForTesting();
 
       expect(depths).toEqual([1, 0]);
       expect(h.spawns).toEqual([]);
@@ -1288,8 +2037,77 @@ describe('sweep duty registry (S2-PR2)', () => {
       h.mailbox = fakeMailbox({ countDueMessages: () => 1 });
 
       await _sweepOnceForTesting();
+      await _settlePostKillForTesting();
 
       expect(h.wakes).toEqual([{ sessionId: 'sess-wake', depth: 0 }]);
+      expect(h.spawns).toEqual([]);
+    });
+
+    // ── #359 ─────────────────────────────────────────────────────────────────
+    //
+    // `sessionsMs` mixed "walked N sessions" with "waited on M container
+    // spawns", and the two differ by three orders of magnitude per unit — a
+    // cold tick's cost tracked spawn COUNT, so every comparison between two
+    // ticks was really a comparison of how many containers happened to be due.
+    // These counters are what make the line readable, and `spawnsAwaited: 0`
+    // is the property the detach exists to hold.
+    it('the tick-timing line counts wakes started, spawns awaited and spawn wait (#359)', async () => {
+      const session = fakeSession('sess-counted');
+      h.sessions = [session];
+      h.mailbox = fakeMailbox({ countDueMessages: () => 1 });
+
+      await _sweepOnceForTesting();
+      await _settlePostKillForTesting();
+      await _settleDetachedWakesForTesting();
+
+      expect(h.wakes).toEqual([{ sessionId: 'sess-counted', depth: 0 }]);
+      const stats = _lastSweepTickStatsForTesting();
+      expect(stats.wakesStarted, 'the wake was not counted').toBe(1);
+      expect(stats.spawnsAwaited, 'the per-session loop awaited a spawn').toBe(0);
+      // Not "zero": the loop is still inside `wakeContainer` for its
+      // synchronous prologue. A second here means someone put an await back.
+      expect(stats.spawnWaitMs).toBeLessThan(1_000);
+      expect(h.spawns).toEqual([]);
+    });
+
+    it('a slow tick logs the three wake counters on its timing line (#359)', async () => {
+      const info = vi.spyOn(log, 'info').mockImplementation(() => undefined);
+      // The line only fires above 1 s. Fake Date ONLY — the tick's own yields
+      // are setImmediate and stay real — and let the mailbox advance the clock
+      // as a side effect of a read the tick is going to make anyway.
+      vi.useFakeTimers({ toFake: ['Date'] });
+      try {
+        h.sessions = [fakeSession('sess-slow')];
+        h.mailbox = fakeMailbox({
+          countDueMessages: () => {
+            vi.setSystemTime(Date.now() + 2_000);
+            return 1;
+          },
+        });
+
+        await _sweepOnceForTesting();
+        await _settlePostKillForTesting();
+        await _settleDetachedWakesForTesting();
+
+        const line = info.mock.calls.find((c) => c[0] === 'Host sweep tick timing');
+        expect(line, 'the timing line did not fire — the tick was under 1 s').toBeDefined();
+        expect(Object.keys(line![1] as object).sort()).toEqual(
+          [
+            'sessionsMs',
+            'skippedQuiet',
+            'spawnWaitMs',
+            'spawnsAwaited',
+            'sweepMs',
+            'sweptSessions',
+            'wakesStarted',
+          ].sort(),
+        );
+        expect((line![1] as { wakesStarted: number }).wakesStarted).toBe(1);
+        expect((line![1] as { spawnsAwaited: number }).spawnsAwaited).toBe(0);
+      } finally {
+        vi.useRealTimers();
+        info.mockRestore();
+      }
       expect(h.spawns).toEqual([]);
     });
 
@@ -1324,9 +2142,11 @@ describe('sweep duty registry (S2-PR2)', () => {
 
       // Two consecutive 'failed' observations are required before it acts.
       await _sweepOnceForTesting();
+      await _settlePostKillForTesting();
       expect(h.kills).toEqual([]);
       h.running.add('sess-heal');
       await _sweepOnceForTesting();
+      await _settlePostKillForTesting();
 
       expect(h.kills).toEqual([{ sessionId: 'sess-heal', reason: 'provider-failed-selfheal', depth: 0 }]);
       // killForProviderHeal's onExit respawn, still at depth zero.
@@ -1341,7 +2161,9 @@ describe('sweep duty registry (S2-PR2)', () => {
         countRecoveryAttemptsSinceRealInbound: () => 2,
       });
       await _sweepOnceForTesting();
+      await _settlePostKillForTesting();
       await _sweepOnceForTesting();
+      await _settlePostKillForTesting();
       expect(h.kills).toEqual([{ sessionId: 'sess-heal', reason: 'provider-failed-selfheal-parked', depth: 0 }]);
       expect(h.wakes).toEqual([]);
       expect(h.spawns).toEqual([]);
@@ -1353,6 +2175,7 @@ describe('sweep duty registry (S2-PR2)', () => {
       h.running.add(task.id);
       h.mailbox = fakeMailbox({ getContainerState: () => ({ provider_executing: 0 }) });
       await _sweepOnceForTesting();
+      await _settlePostKillForTesting();
       expect(h.kills).toEqual([{ sessionId: 'sess-task', reason: 'scheduled-task-idle', depth: 0 }]);
 
       h.kills = [];
@@ -1365,6 +2188,7 @@ describe('sweep duty registry (S2-PR2)', () => {
         latestInboundTimestamp: () => new Date(Date.now() - 60 * 60_000).toISOString(),
       });
       await _sweepOnceForTesting();
+      await _settlePostKillForTesting();
       expect(h.kills).toEqual([{ sessionId: 'sess-chat', reason: 'chat-idle-reap', depth: 0 }]);
       expect(h.spawns).toEqual([]);
     });
@@ -1373,6 +2197,7 @@ describe('sweep duty registry (S2-PR2)', () => {
       aliveSession('sess-ceiling');
       armCeilingKill();
       await _sweepOnceForTesting();
+      await _settlePostKillForTesting();
       expect(h.kills).toEqual([{ sessionId: 'sess-ceiling', reason: 'absolute-ceiling', depth: 0 }]);
 
       h.kills = [];
@@ -1385,6 +2210,7 @@ describe('sweep duty registry (S2-PR2)', () => {
         getProcessingClaimRows: () => [{ message_id: 'm1', status_changed: claimedAt }],
       });
       await _sweepOnceForTesting();
+      await _settlePostKillForTesting();
       expect(h.kills).toEqual([{ sessionId: 'sess-stuck', reason: 'claim-stuck', depth: 0 }]);
       expect(h.spawns).toEqual([]);
     });
@@ -1408,6 +2234,7 @@ describe('sweep duty registry (S2-PR2)', () => {
     }
 
     await _sweepOnceForTesting();
+    await _settlePostKillForTesting();
 
     expect(h.kills.map((k) => k.reason)).toEqual(['absolute-ceiling']);
     // Registered 230, 210, 220 — run 210, 220, 230, after the three built-in
@@ -1415,9 +2242,12 @@ describe('sweep duty registry (S2-PR2)', () => {
     expect(seen).toEqual(['probe-210', 'probe-220', 'probe-230']);
     // One session for all of them...
     expect(new Set(openCountAtRun).size).toBe(1);
-    // ...and it was opened strictly AFTER killContainer returned: the open
-    // count when the follow-ups ran is exactly one more than at the kill.
-    expect(openCountAtRun[0]).toBe(h.opensAtKill[0]! + 1);
+    // ...and it was opened strictly AFTER the kill. Not "exactly one more" any
+    // more: the chain is started from the container's own exit (Codex final),
+    // so it can land after the tick's own `session:tail` window has opened and
+    // closed. The property that matters — the follow-ups never share the
+    // pre-kill session — is what this asserts.
+    expect(openCountAtRun[0]).toBeGreaterThan(h.opensAtKill[0]!);
     expect(h.spawns).toEqual([]);
   });
 
@@ -1439,6 +2269,10 @@ describe('sweep duty registry (S2-PR2)', () => {
     });
 
     await _sweepOnceForTesting();
+    await _settlePostKillForTesting();
+    // The wake is detached (#359), so the attempt restore's open — the eighth
+    // on this path — can land after the tick returns. Settle before counting.
+    await _settleDetachedWakesForTesting();
     const worstPathOpens = h.opens.filter((id) => id === session.id).length;
     expect(worstPathOpens).toBeGreaterThan(0);
     expect(worstPathOpens).toBeLessThanOrEqual(8);
@@ -1452,8 +2286,10 @@ describe('sweep duty registry (S2-PR2)', () => {
     h.sessions = [quiet];
     h.running.delete(quiet.id);
     await _sweepOnceForTesting();
+    await _settlePostKillForTesting();
     h.opens = [];
     await _sweepOnceForTesting();
+    await _settlePostKillForTesting();
     expect(h.opens).toEqual([]);
     expect(h.spawns).toEqual([]);
   });
@@ -1491,6 +2327,7 @@ describe('sweep duty registry (S2-PR2)', () => {
     });
 
     await _sweepOnceForTesting();
+    await _settlePostKillForTesting();
 
     expect(error).toHaveBeenCalledWith(
       'Host sweep duty failed',

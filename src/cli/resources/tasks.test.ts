@@ -355,6 +355,96 @@ describe('tasks CLI resource', () => {
     systemDb.close();
   });
 
+  // Codex round 2, H1 (b). `ncl tasks` writes due-ness straight into the
+  // session DB, where the host sweep's quiet cache cannot see it, so every
+  // mutating command brackets its write with `withQuietInvalidationSync`.
+  // Fail-closed: a central DB that refuses the invalidation must refuse the
+  // command, not land a task row behind a mark nothing will clear. (What the
+  // bracket does on each side is asserted on real SQLite in
+  // src/db/migrations/068-sessions-sweep-quiet-until.test.ts.)
+  it('create writes nothing when the quiet-mark invalidation fails', async () => {
+    const sessionsModule = await import('../../db/sessions.js');
+    const spy = vi.spyOn(sessionsModule, 'withQuietInvalidationSync').mockImplementation((id: string) => {
+      throw new sessionsModule.QuietInvalidationError(id, new Error('central DB is read-only'));
+    });
+
+    const resp = await dispatch(
+      {
+        id: 'req-faulted',
+        command: 'tasks-create',
+        args: { prompt: 'should not land', process_after: '2026-01-15T09:00:00Z' },
+      },
+      agentCtx(),
+    );
+    spy.mockRestore();
+
+    expect(resp.ok, 'a refused invalidation reported success').toBe(false);
+    if (resp.ok) return;
+    expect(resp.error.message).toMatch(/quiet-mark invalidation failed/);
+
+    // The per-series session was resolved (and its inbound.db provisioned)
+    // before the bracket, so an empty mailbox is the abort, not a missing
+    // session.
+    const taskSessions = getSessionsByAgentGroup('ag-1').filter((sess) => sess.thread_id?.startsWith('system:tasks'));
+    expect(taskSessions).toHaveLength(1);
+    const db = new Database(inboundDbPath('ag-1', taskSessions[0]!.id), { readonly: true });
+    expect(db.prepare("SELECT COUNT(*) AS count FROM messages_in WHERE kind = 'task'").get()).toEqual({ count: 0 });
+    db.close();
+  });
+
+  // The narrowing the probe buys (lead review, 2026-09-04): a group-scoped
+  // mutation visits every session `selectedSessions` returns, and wrapping the
+  // per-session OPEN would charge 2N central-DB writes plus N spurious sweeps
+  // for one series. The probe means only the session that holds the row is
+  // invalidated.
+  it('pause invalidates only the session that holds the series', async () => {
+    const created = await dispatch(
+      {
+        id: 'req-narrow-create',
+        command: 'tasks-create',
+        args: { prompt: 'the only series', process_after: '2026-01-15T09:00:00Z' },
+      },
+      agentCtx(),
+    );
+    expect(created.ok).toBe(true);
+    if (!created.ok) return;
+    const { series_id: seriesId, session_id: holder } = created.data as { series_id: string; session_id: string };
+
+    // A second task session in the same group, holding a different series — it
+    // is in the fan-out and must be left alone.
+    const other = await dispatch(
+      {
+        id: 'req-narrow-other',
+        command: 'tasks-create',
+        args: { prompt: 'a different series', process_after: '2026-01-15T09:00:00Z' },
+      },
+      agentCtx(),
+    );
+    expect(other.ok).toBe(true);
+    if (!other.ok) return;
+    const bystander = (other.data as { session_id: string }).session_id;
+    expect(bystander).not.toBe(holder);
+
+    const sessionsModule = await import('../../db/sessions.js');
+    const original = sessionsModule.withQuietInvalidationSync;
+    const invalidated: string[] = [];
+    const spy = vi
+      .spyOn(sessionsModule, 'withQuietInvalidationSync')
+      .mockImplementation(<T>(id: string, write: () => T) => {
+        invalidated.push(id);
+        return original(id, write);
+      });
+
+    const resp = await dispatch(
+      { id: 'req-narrow-pause', command: 'tasks-pause', args: { id: seriesId, group: 'ag-1' } },
+      agentCtx(),
+    );
+    spy.mockRestore();
+
+    expect(resp.ok).toBe(true);
+    expect(invalidated, 'the fan-out invalidated a session that does not hold the series').toEqual([holder]);
+  });
+
   it('create and update persist quiet-status independently from the chat budget', async () => {
     const resp = await dispatch(
       {

@@ -85,3 +85,17 @@ import './sweep-claims/index.js';
 // onHostShutdown half), and its T13 registration rides that same import.
 // Sweep family: usage-rollup (T19, host-sweep seam S2-PR12).
 import './sweep-usage/index.js';
+// Sweep per-session core — S2 processing_ack sync, S3 stale-pending expiry,
+// S4 pre-wake orphan-claim reset, S17 orphan-claim retry (convergence seam 2,
+// PR 9).
+import './sweep-session-core/index.js';
+
+// Continuation and ceiling accountability (S2-PR13, G09) — S6 done-proposal-mirror,
+// S7 continuation-read, S8 continuation-recovery-parking, S9a
+// continuation-wake-eligibility, S9b container-wake, S15 kill-ceiling-notice,
+// S10 ceiling-kill-accountability.
+import './sweep-continuation/index.js';
+
+// Sweep duty family: scheduling + thread-close (S2-PR11) — thread-close-advance,
+// due-wake-admission, recurrence-fanout, spent-task-session-gc.
+import './sweep-scheduling/index.js';

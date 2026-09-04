@@ -153,7 +153,15 @@ function setupCentralDb(): void {
       last_active TEXT, created_at TEXT NOT NULL,
       -- Migration 056: scheduleTask stamps the destination it validated onto
       -- the task session so the console can place the task in its channel.
-      task_routing_platform_id TEXT
+      task_routing_platform_id TEXT,
+      -- Migration 068: the host sweep's persisted quiet mark. Load-bearing in
+      -- this fixture, not scenery — scheduleTask's write runs inside
+      -- withQuietInvalidationSync, whose whole job is to null this column in the
+      -- same statement that moves last_active. Without the column that UPDATE
+      -- throws, and since the helper is fail-closed the schedule aborts, so a
+      -- missing column here reads as a scheduling failure rather than as a
+      -- silently absent invalidation (Codex round 2, L1; round 3, H1).
+      sweep_quiet_until TEXT
     );
     CREATE INDEX IF NOT EXISTS idx_sessions_agent_group ON sessions(agent_group_id);
   `);
@@ -389,6 +397,215 @@ describe('test_scheduleTask_rejects_cross_workgroup_peer', () => {
 });
 
 // ── test_scheduletask_omits_script_when_absent ─────────────────────────────
+// Codex round 2, L1. `scheduleTask` inserts a task row into a session that may
+// have been quiet for days — `scheduled-move`'s re-home is the live case — and
+// due-ness lives only in the session DB where the sweep's quiet cache cannot
+// see it. The central-DB touch at the end of `scheduleTask` is what invalidates
+// the mark, including the persisted one S2-PR15 warms after a restart.
+describe('scheduleTask invalidates the target session quiet mark (S2-PR15)', () => {
+  it('clears sweep_quiet_until and advances last_active on the task session', async () => {
+    // Pre-create the EXACT row scheduleTask will resolve — the per-series
+    // `system:tasks:s-quiet` session — and seed it ALREADY quiet-marked.
+    // `resolveTaskSession` reuses it via `findSystemSession`, so the mark is
+    // genuinely present when the touch runs.
+    //
+    // The earlier shape of this case marked "every active session" first and
+    // then let scheduleTask CREATE the task session, which starts with
+    // `sweep_quiet_until` NULL — so the null assertion held with the touch
+    // deleted (Codex round 3). Only the `last_active` half bit. Hence the
+    // before-state assertion below: it is what stops this going vacuous again.
+    const TASK_SESSION_ID = 'sess-task-quiet';
+    const STALE = '2026-06-01T00:00:00.000Z';
+    const MARK = '2099-01-01T00:00:00.000Z';
+    getDb()
+      .prepare(
+        `INSERT INTO sessions (id, agent_group_id, messaging_group_id, thread_id, agent_provider, status,
+                               container_status, last_active, sweep_quiet_until, created_at)
+         VALUES (?, ?, NULL, ?, NULL, 'active', 'stopped', ?, ?, datetime('now'))`,
+      )
+      .run(TASK_SESSION_ID, AGENT_GROUP_ID, taskThreadId('s-quiet'), STALE, MARK);
+    seedInboundDb(TASK_SESSION_ID);
+
+    const read = (): { last_active: string | null; sweep_quiet_until: string | null } =>
+      getDb().prepare('SELECT last_active, sweep_quiet_until FROM sessions WHERE id = ?').get(TASK_SESSION_ID) as {
+        last_active: string | null;
+        sweep_quiet_until: string | null;
+      };
+    expect(read(), 'the fixture is not marked, so the assertions below prove nothing').toEqual({
+      last_active: STALE,
+      sweep_quiet_until: MARK,
+    });
+
+    await scheduleTask({
+      id: 't-quiet',
+      agentGroupId: AGENT_GROUP_ID,
+      cron: '0 3 * * *',
+      processAfter: new Date(Date.now() + 86400000).toISOString(),
+      seriesId: 's-quiet',
+      prompt: 'do thing',
+      destination: TEST_DESTINATION,
+    });
+
+    // The pre-created row is the one that was used — no fresh sibling was made,
+    // which would put the marked row back out of the assertion's reach.
+    const sessions = getDb()
+      .prepare("SELECT id FROM sessions WHERE agent_group_id = ? AND thread_id = ? AND status = 'active'")
+      .all(AGENT_GROUP_ID, taskThreadId('s-quiet')) as Array<{ id: string }>;
+    expect(sessions.map((r) => r.id)).toEqual([TASK_SESSION_ID]);
+
+    const after = read();
+    expect(after.sweep_quiet_until, 'the quiet mark outlived a new task row').toBeNull();
+    expect(after.last_active).not.toBe(STALE);
+    expect(after.last_active).not.toBeNull();
+  });
+});
+
+// ── Crash-safety ordering (Codex pre-pass, review/b3/review.json Part C) ────
+//
+// The quiet-mark invalidation and the task-row write are two separate DB files
+// with no shared transaction. A crash between them is survivable only if the
+// invalidation (central DB, harmless if spurious) happens BEFORE the write
+// (session DB, the thing that actually needs the mark gone) — the reverse
+// lets a persisted quiet mark outlive a task row a warmed restart cannot see.
+//
+// Codex round 2 (H1) added the second half: `write` awaits the mailbox funnel,
+// so a sweep tick can flush a mark INSIDE that await, based on the
+// `last_active` the pre-write invalidation just published. `scheduleTask`
+// therefore brackets the write — fail-closed before, advisory after.
+/** Does a live task row for `seriesId` exist in this session's inbound.db right now? */
+function taskRowVisible(sessionId: string, seriesId: string): boolean {
+  const dbPath = inboundPath(sessionId);
+  // `resolveTaskSession` provisions a brand-new task session's inbound.db
+  // (schema only) synchronously, so the file's existence proves nothing on its
+  // own — whether the task ROW is there yet is the write this ordering protects.
+  if (!fs.existsSync(dbPath)) return false;
+  const db = openInboundDb(dbPath);
+  const row = db.prepare('SELECT 1 FROM messages_in WHERE series_id = ? LIMIT 1').get(seriesId);
+  db.close();
+  return row !== undefined;
+}
+
+describe('scheduleTask invalidates the quiet mark in the same turn as the task-row write', () => {
+  it('invalidates with the row not yet written, inside the mailbox callback', async () => {
+    seedActiveSession();
+    seedInboundDb();
+
+    const sessionsModule = await import('./sessions.js');
+    const original = sessionsModule.withQuietInvalidationSync;
+    // Each entry: the session invalidated, and whether the task row was already
+    // there at that instant. What the helper DOES (clear the mark, advance
+    // last_active, refuse when no active row matched) is asserted against real
+    // SQLite in src/db/migrations/068-sessions-sweep-quiet-until.test.ts; what
+    // this case owns is that scheduleTask's write is the thing it wraps.
+    const observed: Array<[string, boolean]> = [];
+    const spy = vi
+      .spyOn(sessionsModule, 'withQuietInvalidationSync')
+      .mockImplementation(<T>(id: string, write: () => T) => {
+        observed.push([id, taskRowVisible(id, 's-order')]);
+        return original(id, write);
+      });
+
+    await scheduleTask({
+      id: 't-order',
+      agentGroupId: AGENT_GROUP_ID,
+      cron: '0 3 * * *',
+      processAfter: new Date(Date.now() + 86400000).toISOString(),
+      seriesId: 's-order',
+      prompt: 'do thing',
+      destination: TEST_DESTINATION,
+    });
+    spy.mockRestore();
+
+    const sessionId = taskSessionIdFor('s-order');
+    // Once (the happy path never retries), for this session, with nothing
+    // written yet.
+    expect(observed).toEqual([[sessionId, false]]);
+    // Positive control: the row IS there once scheduleTask returns, so the
+    // absence above was ordering rather than a write that never happened.
+    expect(taskRowVisible(sessionId, 's-order')).toBe(true);
+  });
+
+  // Codex round 2 H1 (a), in its final form. In-process there is no longer a
+  // window between the invalidation and the write, so the interleave that
+  // remains is a flush whose basis was computed BEFORE the invalidation — the
+  // `WHERE last_active IS <basis>` guard is what rejects it.
+  it('a quiet mark computed before the write is rejected by the flush guard', async () => {
+    seedActiveSession();
+    seedInboundDb();
+
+    const sessionsModule = await import('./sessions.js');
+    const original = sessionsModule.withQuietInvalidationSync;
+    const basis: Array<string | null> = [];
+    // Stand in for a sweep tick that read this session at the top of the tick,
+    // found nothing due, and flushed its mark after the write landed. The basis
+    // it carries is the pre-invalidation `last_active`; the flush itself is the
+    // real `persistQuietSessionMarks`, so the guard under test is production's.
+    const spy = vi
+      .spyOn(sessionsModule, 'withQuietInvalidationSync')
+      .mockImplementation(<T>(id: string, write: () => T) => {
+        basis.push(
+          (getDb().prepare('SELECT last_active FROM sessions WHERE id = ?').get(id) as { last_active: string | null })
+            .last_active,
+        );
+        return original(id, write);
+      });
+
+    await scheduleTask({
+      id: 't-interleave',
+      agentGroupId: AGENT_GROUP_ID,
+      cron: '0 3 * * *',
+      processAfter: new Date(Date.now() + 86400000).toISOString(),
+      seriesId: 's-interleave',
+      prompt: 'do thing',
+      destination: TEST_DESTINATION,
+    });
+    spy.mockRestore();
+
+    const sessionId = taskSessionIdFor('s-interleave');
+    expect(basis, 'the invalidation never ran, so the flush below proves nothing').toHaveLength(1);
+    sessionsModule.persistQuietSessionMarks([
+      { sessionId, quietUntil: '2099-01-01T00:00:00.000Z', lastActive: basis[0]! },
+    ]);
+
+    const after = getDb().prepare('SELECT sweep_quiet_until FROM sessions WHERE id = ?').get(sessionId) as {
+      sweep_quiet_until: string | null;
+    };
+    expect(after.sweep_quiet_until, 'a mark computed before the write hid the task row').toBeNull();
+    expect(taskRowVisible(sessionId, 's-interleave'), 'no task row was written at all').toBe(true);
+  });
+
+  // Codex round 2, H1 (b). Fail-closed: a refused invalidation must not let the
+  // session-DB row land behind a live mark. (That the helper refuses on a
+  // central-DB failure AND on a missing or non-active session row is the 068
+  // suite's business; this case owns the call site not swallowing that refusal.)
+  it('a failed invalidation aborts the schedule before any task row is written', async () => {
+    seedActiveSession();
+    seedInboundDb();
+
+    const sessionsModule = await import('./sessions.js');
+    const spy = vi.spyOn(sessionsModule, 'withQuietInvalidationSync').mockImplementation((id: string) => {
+      throw new sessionsModule.QuietInvalidationError(id, new Error('central DB is read-only'));
+    });
+
+    await expect(
+      scheduleTask({
+        id: 't-faulted',
+        agentGroupId: AGENT_GROUP_ID,
+        cron: '0 3 * * *',
+        processAfter: new Date(Date.now() + 86400000).toISOString(),
+        seriesId: 's-faulted',
+        prompt: 'do thing',
+        destination: TEST_DESTINATION,
+      }),
+    ).rejects.toThrow(/quiet-mark invalidation failed/);
+    spy.mockRestore();
+
+    // The task session was resolved (and its inbound.db provisioned) before the
+    // write, so the row's absence is the abort, not a missing session.
+    expect(taskRowVisible(taskSessionIdFor('s-faulted'), 's-faulted')).toBe(false);
+  });
+});
+
 describe('test_scheduletask_omits_script_when_absent', () => {
   it('content JSON has no "script" key when TaskDef.script is undefined', async () => {
     seedActiveSession();

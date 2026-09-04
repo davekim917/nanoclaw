@@ -12,7 +12,7 @@
  * funnel, NOT a raw `openOutboundDb`.
  *
  * Deliberately NOT routed through a PROVISIONING mailbox session
- * (`withExistingNanoclawSession`): this projection touches outbound.db only,
+ * (`withExistingMailboxSession`): this projection touches outbound.db only,
  * and the seam's existence check is keyed on inbound.db — routing it through
  * a provisioning session would add a gate the pre-seam code never had, so a
  * session whose inbound.db is gone while outbound.db remains would stop being

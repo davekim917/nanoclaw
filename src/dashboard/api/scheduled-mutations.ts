@@ -19,7 +19,7 @@ import fs from 'fs';
 import { DATA_DIR, TIMEZONE } from '../../config.js';
 import { resolveGroupTimezone } from '../../container-config.js';
 import { getDb } from '../../db/connection.js';
-import { getSession } from '../../db/sessions.js';
+import { getSession, QuietInvalidationError, withQuietInvalidationSync } from '../../db/sessions.js';
 import {
   readSessionInbound,
   readSessionOutbound,
@@ -301,12 +301,30 @@ async function withMutationSession(
       return { refused: verdictResponse(verdict) };
     }
 
-    return { touched: action(mailbox) };
+    // The quiet-mark invalidation sits HERE: inside the session, after the
+    // re-proof above, in the same synchronous turn as the statement it
+    // protects. Outside the callback, `withExistingMailboxSession`'s await
+    // would sit between the invalidation and the row (Codex round 3, H1), and
+    // ahead of the re-proof it would charge a session whose verdict then
+    // refuses. It throws `QuietInvalidationError`, which
+    // `mutateWithInvalidation` maps to the 503 this surface owes.
+    return { touched: withQuietInvalidationSync(t.sessionId, () => action(mailbox)) };
   });
   return outcome ?? { touched: 0 };
 }
 
-/** Emit the post-mutation SSE frame (non-null agent_group_id) + invalidate cache. */
+/**
+ * Emit the post-mutation SSE frame (non-null agent_group_id) + invalidate cache.
+ *
+ * The quiet-mark invalidation this used to also do here now sits immediately
+ * before the write itself, inside `withMutationSession`'s mailbox callback:
+ * the session DB and the central DB are two separate files with no shared
+ * transaction, so the mark has to die first (Codex pre-pass,
+ * review/b3/review.json Part C) and in the same synchronous turn as the
+ * statement (round 3, H1). This function still runs after the write and only on
+ * the success paths — the SSE frame and the cache both describe what already
+ * happened, so there is nothing to gain by moving them earlier.
+ */
 function afterMutation(agentGroupId: string, sessionId: string): void {
   try {
     emitDashboardEvent('session_event', { session_id: sessionId, agent_group_id: agentGroupId, kind: 'inbound' });
@@ -314,6 +332,52 @@ function afterMutation(agentGroupId: string, sessionId: string): void {
     /* non-fatal */
   }
   invalidateScheduledCache();
+}
+
+/**
+ * Run one mutation with its quiet-mark invalidation immediately before it.
+ *
+ * The single due-ness-write entry for this module. `withQuietInvalidationSync`
+ * runs INSIDE `withMutationSession`'s mailbox callback, after that function's
+ * in-session re-proof and in the same synchronous turn as the statement it
+ * protects — outside the callback, the funnel's await would sit between the
+ * invalidation and the row (Codex round 3, H1). This wrapper adds only the
+ * refusal mapping: the 503 this surface owes, rather than a throw at the router.
+ *
+ * A cron edit or a resume recomputes `process_after` straight in the session
+ * DB, which the host sweep's quiet cache cannot see; without the invalidation a
+ * quiet session sleeps past its new due time, and since S2-PR15 persists that
+ * mark, across a restart too.
+ *
+ * FAIL-CLOSED (Codex round 2, H1): a central DB that refuses the invalidation —
+ * including because no ACTIVE session row is there any more — gets a 503 and NO
+ * write, not a silent success whose due-time change stays hidden behind a mark
+ * nothing will clear. A 503 is retryable and visible; missed work is neither.
+ */
+async function mutateWithInvalidation(
+  t: ResolvedTarget,
+  verb: Verb,
+  nowMs: number,
+  action: (mailbox: NanoclawMailboxSession) => number,
+  verdictCtx?: { forced?: boolean },
+): Promise<MutationOutcome> {
+  try {
+    return await withMutationSession(t, verb, nowMs, action, verdictCtx);
+  } catch (err) {
+    const refused = quietRefusal(t.sessionId, err);
+    if (refused) return { refused };
+    throw err;
+  }
+}
+
+/** The 503 a refused quiet-mark invalidation owes, or null if `err` is something else. */
+function quietRefusal(sessionId: string, err: unknown): Response | null {
+  if (!(err instanceof QuietInvalidationError)) return null;
+  log.warn('scheduled-mutations: quiet-mark invalidation failed — mutation refused', {
+    sessionId,
+    err: err.message,
+  });
+  return json({ error: 'invalidation_failed', reason: 'invalidation_failed' }, 503);
 }
 
 /**
@@ -418,7 +482,7 @@ export const editHandler: AuthHandler = async (req, params, ctx) => {
   // (invariant I-10). `undefined` reads as "nothing was touched", which the
   // stale-key branch below already answers — the same 409 the pre-seam open
   // produced for a session that vanished under the gate.
-  const outcome = await withMutationSession(t, 'edit', nowMs, (mailbox) => mailbox.updateTask(t.seriesId, update));
+  const outcome = await mutateWithInvalidation(t, 'edit', nowMs, (mailbox) => mailbox.updateTask(t.seriesId, update));
   if ('refused' in outcome) return outcome.refused;
   if (outcome.touched === 0) return json({ error: 'stale_key', reason: 'stale_key' }, 409);
 
@@ -454,7 +518,7 @@ export const pauseHandler: AuthHandler = async (_req, params, ctx) => {
   });
   if (!verdict.allowed) return verdictResponse(verdict);
 
-  const outcome = await withMutationSession(t, 'pause', nowMs, (mailbox) => mailbox.pauseTask(t.seriesId));
+  const outcome = await mutateWithInvalidation(t, 'pause', nowMs, (mailbox) => mailbox.pauseTask(t.seriesId));
   if ('refused' in outcome) return outcome.refused;
   if (outcome.touched === 0) return json({ error: 'stale_key', reason: 'stale_key' }, 409);
 
@@ -484,7 +548,7 @@ export const resumeHandler: AuthHandler = async (_req, params, ctx) => {
   });
   if (!verdict.allowed) return verdictResponse(verdict);
 
-  const outcome = await withMutationSession(t, 'resume', nowMs, (mailbox) => {
+  const outcome = await mutateWithInvalidation(t, 'resume', nowMs, (mailbox) => {
     // §4.7: recompute process_after to the next FUTURE slot BEFORE flipping to
     // pending (skip-don't-replay, D3) — a paused-past-its-slot series must not
     // fire immediately on resume.
@@ -541,7 +605,7 @@ export const runNowHandler: AuthHandler = async (req, params, ctx) => {
   // Fire: process_after = now, then wake the container. Recurrence advances
   // normally on completion (an early fire does not shift the schedule — §4.6).
   let admittedTarget = false;
-  const outcome = await withMutationSession(
+  const outcome = await mutateWithInvalidation(
     t,
     'run_now',
     nowMs,
@@ -617,13 +681,17 @@ export const cancelHandler: AuthHandler = async (_req, params, ctx) => {
   if (!inboundPath) return json({ error: 'not_found' }, 404);
   if (!fs.existsSync(inboundPath)) return json({ error: 'session_unreadable', reason: 'session_unreadable' }, 503);
 
+  // Cancel has no ResolvedTarget, so it opens the mailbox itself and calls the
+  // same helper from inside the callback, mapping the same refusal.
   let touched: number;
   try {
     touched =
       (await withExistingMailboxSession(decoded.agentGroupId, decoded.sessionId, (mailbox) =>
-        mailbox.cancelSeriesWithStrandClear(decoded.seriesId),
+        withQuietInvalidationSync(decoded.sessionId, () => mailbox.cancelSeriesWithStrandClear(decoded.seriesId)),
       )) ?? 0;
   } catch (err) {
+    const refused = quietRefusal(decoded.sessionId, err);
+    if (refused) return refused;
     log.warn('scheduled-mutations: cancel failed', { err: err instanceof Error ? err.message : String(err) });
     return json({ error: 'session_unreadable', reason: 'session_unreadable' }, 503);
   }

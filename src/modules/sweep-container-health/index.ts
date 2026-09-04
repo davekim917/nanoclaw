@@ -27,9 +27,11 @@ import { heartbeatPath } from '../../session-manager.js';
 import {
   getContainerSpawnedAt,
   isContainerRunning,
+  isContainerSpawning,
   killContainer,
   sessionStillActive,
   wakeContainer,
+  containerOwnsOutbound,
 } from '../../container-runner.js';
 import { log } from '../../log.js';
 import type { Session } from '../../types.js';
@@ -46,11 +48,13 @@ import {
   registerSweepDuty,
   registerSweepDutySource,
   runSlaObservationHooks,
+  dutyFailureFields,
   runSweepKillFollowUps,
   writeOutboundWhenStopped,
   writeSystemWake,
   type SessionRunner,
   type StuckDecision,
+  type SweepKillSnapshot,
   type SweepSessionContext,
 } from '../../host-sweep.js';
 
@@ -496,6 +500,99 @@ export function decideStuckAction(args: {
   return { action: 'ok' };
 }
 
+/**
+ * Post-kill follow-ups, started from the container's OWN exit (Codex final).
+ *
+ * `killContainer` only REQUESTS the stop: it calls `stopContainer` (or SIGKILLs)
+ * and returns, while `activeContainers` is cleared by the spawn path's own
+ * `close` handler whenever the child actually goes. Running the chain on the
+ * next line therefore raced the exit — `containerOwnsOutbound` was still true,
+ * the early-out fired, and the ceiling notice, the orphan-claim reset and the
+ * accountability wake were skipped for good, with nothing to retry them. The
+ * positive tests missed it because their `killContainer` mock cleared
+ * `isContainerRunning` synchronously, which production does not.
+ *
+ * So the chain hangs off `onExit`, which `stopRunningContainer` registers as a
+ * `once('close')` AFTER the spawn path's finalizer — so by the time it runs the
+ * session is already out of `activeContainers` and the host may write. The
+ * per-write `writeOutboundWhenStopped` guards inside each follow-up are
+ * unchanged and still do the real work: `runSweepKillFollowUps` awaits between
+ * follow-ups, so a replacement can still take the session mid-chain.
+ *
+ * Two paths `onExit` cannot cover, both handled here:
+ *  - nothing to kill (the container already exited, or never ran). No callback
+ *    is ever invoked, so the chain runs inline — ownership is already false.
+ *  - a kill deferred behind an in-flight spawn. `killContainer` queues the
+ *    callback in `pendingKills` and fires it when that spawn's container is
+ *    stopped, which is the behaviour we want and needs nothing here.
+ *
+ * The chain is asynchronous with respect to the tick that ordered the kill, so
+ * a rejection is logged and never thrown into it, exactly as the detached wake
+ * does. `_settlePostKillForTesting` is how a case waits for it.
+ */
+const postKillChains = new Set<Promise<void>>();
+
+function trackPostKill(work: Promise<void>, sessionId: string): void {
+  const tracked = work
+    .catch((err: unknown) => {
+      // Classification survives the detach. A follow-up that throws is tagged
+      // with its duty and window by `runDutyBody`, and the per-session catch in
+      // the driver is what normally turns that tag into 'Host sweep duty
+      // failed' — but this chain outlives the tick, so that catch never sees
+      // it. Reported here in the same shape, on the same field pair every
+      // post-deploy check filters on.
+      const fields = dutyFailureFields(err);
+      if (fields.duty) log.error('Host sweep duty failed', { err, sessionId, ...fields });
+      else log.warn('Post-kill follow-up chain failed', { sessionId, err });
+    })
+    .finally(() => {
+      postKillChains.delete(tracked);
+    });
+  postKillChains.add(tracked);
+}
+
+/** Test-only: settle every post-kill chain still running. */
+export function _settlePostKillForTesting(): Promise<void> {
+  return Promise.all([...postKillChains]).then(() => undefined);
+}
+
+/** Test-only: forget every tracked chain, so one case cannot leak into the next. */
+export function _resetPostKillForTesting(): void {
+  postKillChains.clear();
+}
+
+/**
+ * Kill, then run the follow-ups when the container is actually gone.
+ *
+ * `snapshot` is read BEFORE the kill (the claims a reset would clear), so it is
+ * captured by the caller and closed over here.
+ */
+function killThenFollowUp(
+  ctx: SweepSessionContext,
+  decision: StuckDecision,
+  snapshot: SweepKillSnapshot,
+  reason: string,
+): void {
+  const sessionId = ctx.session.id;
+  const chain = (): Promise<void> =>
+    ctx
+      .runIn('session:health:post-kill', (mailbox) => {
+        // Early-out only, and now a genuine one: a REPLACEMENT container took
+        // the session between the exit and this open. It is not what makes the
+        // writes safe — each follow-up carries its own
+        // `writeOutboundWhenStopped` immediately before its own mutation.
+        if (containerOwnsOutbound(sessionId)) return;
+        return runSweepKillFollowUps(ctx, decision, mailbox, snapshot);
+      })
+      .then(() => undefined);
+
+  const wasThere = isContainerRunning(sessionId) || isContainerSpawning(sessionId);
+  killContainer(sessionId, reason, wasThere ? () => trackPostKill(chain(), sessionId) : undefined);
+  // Nothing to kill: no `close` will ever fire, so the chain would be lost.
+  // Ownership is already false, so this is the one case that may run inline.
+  if (!wasThere) trackPostKill(chain(), sessionId);
+}
+
 async function enforceRunningContainerSla(ctx: SweepSessionContext): Promise<void> {
   const session = ctx.session;
   // Read + the observation hooks in one session, so the decision and the
@@ -532,17 +629,11 @@ async function enforceRunningContainerSla(ctx: SweepSessionContext): Promise<voi
       heartbeatAgeMs: decision.heartbeatAgeMs,
       ceilingMs: decision.ceilingMs,
     });
-    killContainer(session.id, 'absolute-ceiling');
-    // The follow-ups run AFTER the kill, in a session opened only then, to
-    // honor the outbound.db single-writer invariant; the module opens the
-    // writable outbound handle lazily, only for the notice write.
-    await ctx.runIn('session:health:post-kill', (mailbox) =>
-      runSweepKillFollowUps(ctx, decision, mailbox, {
-        reason: 'absolute-ceiling',
-        containerState,
-        pendingClaims,
-        workContinuation,
-      }),
+    killThenFollowUp(
+      ctx,
+      decision,
+      { reason: 'absolute-ceiling', containerState, pendingClaims, workContinuation },
+      'absolute-ceiling',
     );
     return;
   }
@@ -553,14 +644,11 @@ async function enforceRunningContainerSla(ctx: SweepSessionContext): Promise<voi
     claimAgeMs: decision.claimAgeMs,
     toleranceMs: decision.toleranceMs,
   });
-  killContainer(session.id, 'claim-stuck');
-  await ctx.runIn('session:health:post-kill', (mailbox) =>
-    runSweepKillFollowUps(ctx, decision, mailbox, {
-      reason: 'claim-stuck',
-      containerState,
-      pendingClaims,
-      workContinuation,
-    }),
+  killThenFollowUp(
+    ctx,
+    decision,
+    { reason: 'claim-stuck', containerState, pendingClaims, workContinuation },
+    'claim-stuck',
   );
 }
 
@@ -710,6 +798,7 @@ export function _enforceRunningContainerSlaForTesting(
     run,
     runIn: (_window, action) => run(action),
     reportWoke: () => {},
+    reportWake: () => {},
   };
   return enforceRunningContainerSla(ctx);
 }

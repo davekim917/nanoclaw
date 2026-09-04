@@ -37,6 +37,11 @@ const h = vi.hoisted(() => {
     // `vi` is available here even though it isn't `require`d: the
     // `import { vi } from 'vitest'` below is a real ES import, hoisted by
     // the module system itself before this factory runs.
+    //
+    // The default impl runs the caller's action against a read session
+    // exposing the one op `rollupSessionUsage` asks for, and returns what the
+    // action returned — the real funnel's contract. A case that needs the
+    // "outbound gone" answer overrides it to return undefined.
     mockGetActiveSessions: vi.fn(() => [] as unknown[]),
     mockOpenOutboundDb: vi.fn((_path: string) => ({ close: () => undefined }) as unknown),
     mockReadSessionOutbound: vi.fn((_location: unknown, action: (mailbox: unknown) => unknown, _options?: unknown) =>
@@ -103,6 +108,17 @@ vi.mock('../../container-runner.js', async (importOriginal) => {
   return {
     ...real,
     isContainerRunning: () => false,
+    // `containerOwnsOutbound` moved from host-sweep.ts into container-runner.ts
+    // (mailbox PR 4 round 8 — thread-close's finalizer is its second caller).
+    // Composed from the MOCKED checks: spreading `...real` alone leaves the
+    // real predicate reading live module state, so every guard in this suite's
+    // duty graph would silently bypass this mock. Same composition
+    // src/host-sweep.test.ts uses.
+    // The running half of that composition is this suite's own
+    // `isContainerRunning: () => false` above — no case here runs a container —
+    // so only the spawning half is left, and it stays on the real predicate
+    // because nothing here spawns one either.
+    containerOwnsOutbound: (sessionId: string) => real.isContainerSpawning(sessionId),
     hasContainerEverRun: () => false,
     getActiveContainerSessionIds: () => [],
     killContainer: () => undefined,
@@ -212,6 +228,7 @@ import {
   type SweepTickContext,
 } from '../../host-sweep.js';
 import { log } from '../../log.js';
+import { SessionDbUnopenableError } from '../mailbox/index.js';
 import type { Session } from '../../types.js';
 // Side-effect import: registers 'sweep-usage' as a duty source
 // (registerSweepDutySource calls the registrar immediately, and records it
@@ -326,7 +343,7 @@ describe('registered usage-rollup duty (T19)', () => {
 
     // sess-changed has a real outbound.db on disk so fs.statSync succeeds;
     // sess-no-outbound has none, so the duty's own `continue` (no outbound.db
-    // yet) fires without ever calling openOutboundDb for it.
+    // yet) fires without ever calling readSessionOutbound for it.
     const dir = path.join(h.dataDir, 'v2-sessions', 'ag-test', 'sess-changed');
     fs.mkdirSync(dir, { recursive: true });
     fs.writeFileSync(path.join(dir, 'outbound.db'), '');
@@ -345,7 +362,9 @@ describe('registered usage-rollup duty (T19)', () => {
   it('logs the preserved failure string when the rollup throws, without blocking pruneOldTurnUsage', async () => {
     const warnSpy = vi.spyOn(log, 'warn').mockImplementation(() => undefined);
     h.mockReadSessionOutbound.mockImplementationOnce(() => {
-      throw new Error('outbound.db unopenable');
+      // The classification the real read funnel raises for a present-but-
+      // unopenable outbound.db — routed to this duty's own per-session catch.
+      throw new SessionDbUnopenableError('/fixture/outbound.db', new Error('outbound.db unopenable'));
     });
     const dir = path.join(h.dataDir, 'v2-sessions', 'ag-test', 'sess-fail');
     fs.mkdirSync(dir, { recursive: true });
@@ -367,7 +386,7 @@ describe('registered usage-rollup duty (T19)', () => {
 
   // F-12.2, exact title, corrected by the orchestrator (plan.md amended):
   // confirmed the raw-opener funnel is deliberate as-built (mailbox PR 6
-  // never routed this call through withExistingNanoclawSession — my earlier
+  // never routed this call through withExistingMailboxSession — my earlier
   // brief's framing was stale). Three assertions, each on its own session id:
   //  1. inbound.db GONE while outbound.db remains → the rollup STILL runs on
   //     outbound alone and the cache updates (constraint 21's purpose:
