@@ -952,6 +952,54 @@ describe('exact topic transfer', () => {
     expect(fs.existsSync(aPath)).toBe(true);
   });
 
+  it('rejects a stale direct reversal after the recorded destination transfers onward', async () => {
+    const canonical = canonicalRepoDir('wg-a', 'proj', root);
+    cloneTo(canonical);
+    const a = workUnit('slack:C1:chain-a');
+    const b = workUnit('slack:C1:chain-b');
+    const c = workUnit('slack:C1:chain-c');
+    const aPath = path.join(topicWorktreesDir(a, root), 'proj');
+    const bPath = path.join(topicWorktreesDir(b, root), 'proj');
+    const cPath = path.join(topicWorktreesDir(c, root), 'proj');
+    fs.mkdirSync(path.dirname(aPath), { recursive: true });
+    git(canonical, ['worktree', 'add', '-b', 'chained-transfer', aPath]);
+    fs.writeFileSync(path.join(aPath, 'preserved.txt'), 'owned by the latest destination\n');
+
+    await transferRepositoryWorktree({
+      workgroupId: 'wg-a',
+      repo: 'proj',
+      source: a,
+      destination: b,
+      dataDir: root,
+      loadSourceSessions: () => [],
+    });
+    await transferRepositoryWorktree({
+      workgroupId: 'wg-a',
+      repo: 'proj',
+      source: b,
+      destination: c,
+      dataDir: root,
+      loadSourceSessions: () => [],
+    });
+
+    await expect(
+      transferRepositoryWorktree({
+        workgroupId: 'wg-a',
+        repo: 'proj',
+        source: b,
+        destination: a,
+        dataDir: root,
+        loadSourceSessions: () => [],
+      }),
+    ).rejects.toThrow(/transferred onward to a different destination/);
+
+    expect(fs.existsSync(aPath)).toBe(false);
+    expect(fs.existsSync(bPath)).toBe(false);
+    expect(fs.readFileSync(path.join(cPath, 'preserved.txt'), 'utf8')).toBe('owned by the latest destination\n');
+    expect(readTransferTombstone(a, 'proj', root)?.destinationWorkUnitKey).toBe(b.key);
+    expect(readTransferTombstone(b, 'proj', root)?.destinationWorkUnitKey).toBe(c.key);
+  });
+
   it('replays a moved transfer with the same barrier epoch and releases queued destination ingress exactly once', async () => {
     const db = initTestDb();
     runMigrations(db);
@@ -1092,7 +1140,7 @@ describe('exact topic transfer', () => {
     expect(woken.map((candidate) => candidate.id)).toEqual([destinationSession.id, sourceSession.id]);
   });
 
-  it('keeps an active source fail-closed but ignores stale mailbox residue once the task is closed and stopped', async () => {
+  it('delivers pre-quiescence failures and ignores stale mailbox residue once the source task closes', async () => {
     const db = initTestDb();
     runMigrations(db);
     const now = new Date().toISOString();
@@ -1136,8 +1184,15 @@ describe('exact topic transfer', () => {
     hostActionMocks.getAllAgentGroups.mockReturnValue([{ id: 'agent-a', folder: 'agent-a', workgroup_id: 'wg-a' }]);
     hostActionMocks.getSessionsByAgentGroup.mockReturnValue([sourceSession, destinationSession]);
     hostActionMocks.readSessionOutbound.mockReturnValue(undefined);
+    let rejectBeforeStoppingSource = true;
     hostActionMocks.quiesceSessionsForRepositoryMounts.mockImplementation(
-      async (sessions: Session[], epoch: string) => ({ epoch, sessions: [], barrierSessions: sessions }),
+      async (sessions: Session[], epoch: string) => {
+        if (rejectBeforeStoppingSource) {
+          rejectBeforeStoppingSource = false;
+          throw new Error('existing different ingress-fence epoch');
+        }
+        return { epoch, sessions: [], barrierSessions: sessions };
+      },
     );
     hostActionMocks.releaseRepositoryMountQuiescence.mockReturnValue([destinationSession]);
     hostActionMocks.writeSessionMessageIfNew.mockResolvedValue(true);
@@ -1164,6 +1219,25 @@ describe('exact topic transfer', () => {
     fs.mkdirSync(path.dirname(sourcePath), { recursive: true });
     git(canonical, ['worktree', 'add', '-b', 'closed-task-transfer', sourcePath]);
     fs.writeFileSync(path.join(sourcePath, 'ongoing.txt'), 'preserved from closed task\n');
+
+    const preQuiescenceRequestId = 'repo-1723600000000-0000111122223333';
+    await expect(
+      applyRepositoryTransferAction(
+        {
+          requestId: preQuiescenceRequestId,
+          repo: 'proj',
+          sourceThreadId: sourceSession.thread_id,
+          destinationWorkUnitKey: destination.key,
+        },
+        destinationSession,
+      ),
+    ).rejects.toThrow(/existing different ingress-fence epoch/);
+    const immediateSourceNotice = hostActionMocks.writeSessionMessageIfNew.mock.calls.find(
+      (call) => (call[2] as { id: string }).id === `repository-transfer-source-failed-${preQuiescenceRequestId}`,
+    )?.[2] as { onWake: number };
+    expect(immediateSourceNotice.onWake).toBe(0);
+    hostActionMocks.writeSessionMessageIfNew.mockClear();
+    hostActionMocks.wakeRepositoryMountSessions.mockClear();
 
     await expect(
       applyRepositoryTransferAction(

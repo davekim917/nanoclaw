@@ -407,6 +407,9 @@ export async function transferRepositoryWorktree(
         }
         const existingSourceTombstone = readTransferTombstone(input.source, input.repo, input.dataDir);
         if (existingSourceTombstone) {
+          if (existingSourceTombstone.destinationWorkUnitKey !== input.destination.key) {
+            throw new Error('source topic worktree was transferred onward to a different destination');
+          }
           const sourceExists = fs.existsSync(existingSourceTombstone.sourcePath);
           const destinationExists = fs.existsSync(existingSourceTombstone.destinationPath);
           if (!sourceExists && destinationExists) {
@@ -1027,6 +1030,7 @@ export async function applyRepositoryTransferAction(content: Record<string, unkn
     const requesterWasStopped = affectedSessions.some((candidate) => candidate.id === session.id);
     const activeSource = error instanceof RepositorySourceActiveError;
     const sourceSessionsToNotify = sourceSessions.filter((candidate) => candidate.status === 'active');
+    const stoppedSessionIds = new Set(affectedSessions.map((candidate) => candidate.id));
     for (const sourceSession of sourceSessionsToNotify) {
       try {
         await writeSessionMessageIfNew(sourceSession.agent_group_id, sourceSession.id, {
@@ -1047,7 +1051,7 @@ export async function applyRepositoryTransferAction(content: Record<string, unkn
             sender: 'system',
             senderId: 'system',
           }),
-          onWake: 1,
+          onWake: stoppedSessionIds.has(sourceSession.id) ? 1 : 0,
         });
         sourceFailureNoticePersisted = true;
       } catch (notificationError) {

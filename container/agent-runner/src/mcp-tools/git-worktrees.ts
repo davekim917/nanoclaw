@@ -640,9 +640,9 @@ export const createWorktreeTool: McpToolDefinition = {
           type: 'string',
           description:
             'Optional source external thread id or managed topic locator shown by a branch collision; the exact ' +
-            'inactive worktree moves to this topic. The source tombstone makes the move reversible: from the original ' +
-            'topic, call create_worktree with this destination locator to move the exact checkout back. Never recreate, ' +
-            'delete, or prune a sibling branch.',
+            'inactive worktree moves to this topic. The source tombstone records the next owner: from the original ' +
+            'topic, call create_worktree with that destination locator only while it still owns the checkout. If it moved ' +
+            'onward, request the transfer from the current owner. Never recreate, delete, or prune a sibling branch.',
         },
       },
       required: ['repo'],
