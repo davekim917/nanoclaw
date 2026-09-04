@@ -306,7 +306,17 @@ async function withMutationSession(
   return outcome ?? { touched: 0 };
 }
 
-/** Emit the post-mutation SSE frame (non-null agent_group_id) + invalidate cache. */
+/**
+ * Emit the post-mutation SSE frame (non-null agent_group_id) + invalidate cache.
+ *
+ * The quiet-mark invalidation this used to also do here moved to
+ * `touchBeforeMutation`, called BEFORE each mutation's session-DB write, not
+ * after (Codex pre-pass, review/b3/review.json Part C): the session DB and the
+ * central DB are two separate files with no shared transaction, so a crash
+ * between them is survivable only by invalidating first. This function still
+ * runs after the write — the SSE frame and the cache both describe what
+ * already happened, so there is nothing to gain by moving them earlier.
+ */
 function afterMutation(agentGroupId: string, sessionId: string): void {
   try {
     emitDashboardEvent('session_event', { session_id: sessionId, agent_group_id: agentGroupId, kind: 'inbound' });
@@ -314,14 +324,27 @@ function afterMutation(agentGroupId: string, sessionId: string): void {
     /* non-fatal */
   }
   invalidateScheduledCache();
-  // Every mutation above can change when this session next has work due — a cron
-  // edit and a resume both recompute `process_after` directly in the session DB,
-  // which the host sweep's quiet cache cannot see. This is the central-DB write
-  // that invalidates the quiet mark (`updateSession` nulls `sweep_quiet_until` in
-  // the same statement), so a quiet session cannot sleep past its new due time —
-  // and, since S2-PR15 persists that mark, cannot sleep past it across a restart
-  // either. Deliberately OUTSIDE any session/funnel callback: it touches the
-  // central `sessions` row, not session-DB rows. Advisory and self-logging.
+}
+
+/**
+ * Invalidate the quiet mark for a session about to receive a due-ness-changing
+ * write — a cron edit or a resume both recompute `process_after` directly in
+ * the session DB, which the host sweep's quiet cache cannot see.
+ * `touchSessionActivity` is the central-DB write that clears it
+ * (`updateSession` nulls `sweep_quiet_until` in the same statement), so a
+ * quiet session cannot sleep past its new due time — and, since S2-PR15
+ * persists that mark, cannot sleep past it across a restart either.
+ *
+ * Called BEFORE the mutation's session-DB write, not after: `touchSessionActivity`
+ * swallows its own failures (it must never abort the write it rides on), so
+ * the worst case of touching first is one wasted sweep of a session whose
+ * write then fails or finds nothing new (harmless). Touching after the write
+ * leaves a window where a crash between the two lets a persisted quiet mark
+ * survive a due-ness change already committed to inbound.db — up to
+ * `QUIET_SESSION_BACKOFF_MS` of silently missed due work on a warmed restart,
+ * which is the failure this ordering exists to rule out.
+ */
+function touchBeforeMutation(sessionId: string): void {
   touchSessionActivity(sessionId);
 }
 
@@ -627,6 +650,7 @@ export const cancelHandler: AuthHandler = async (_req, params, ctx) => {
   if (!fs.existsSync(inboundPath)) return json({ error: 'session_unreadable', reason: 'session_unreadable' }, 503);
 
   let touched: number;
+  touchBeforeMutation(decoded.sessionId);
   try {
     touched =
       (await withExistingMailboxSession(decoded.agentGroupId, decoded.sessionId, (mailbox) =>

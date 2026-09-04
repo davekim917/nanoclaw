@@ -238,6 +238,24 @@ export async function recoverMoveIntents(centralDb: Database.Database, options: 
         const recheck = countLiveRowsInSessions(dataDir, [source, target], intent.series_id);
         if (recheck.unreadable) return 'deferred' as const;
         if (recheck.count === 0) {
+          // This duty runs in tick:housekeeping — AFTER the session fan-out and
+          // after the quiet-mark flush. The fan-out saw a source with no live
+          // task (that is the crash state this recovery exists for) and may have
+          // just marked it quiet, so the row about to be restored is a DUE task
+          // hiding behind a mark taken seconds ago, and S2-PR15 would carry that
+          // mark across a restart. The central-DB touch is what invalidates it.
+          //
+          // Touched BEFORE the restore, not after (Codex pre-pass,
+          // review/b3/review.json Part C): inbound.db and the central DB are two
+          // separate files with no shared transaction, so a crash between the
+          // two statements is possible even with no `await` between them —
+          // touch-then-restore means the worst case is one wasted sweep of a
+          // session that then finds nothing new to restore (the idempotency
+          // re-check above already tolerates a repeated call); restore-then-touch
+          // means the worst case is the restored row landing durably while the
+          // persisted quiet mark survives the crash, hiding the just-restored due
+          // task for up to `QUIET_SESSION_BACKOFF_MS` after a warmed restart.
+          touchSessionActivity(intent.session_id);
           mailbox.restoreTaskRow({
             // Fresh id — the cancelled source row may still hold the snapshot id.
             id: `task-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
@@ -254,13 +272,6 @@ export async function recoverMoveIntents(centralDb: Database.Database, options: 
             thread_id: snapshot.thread_id,
             kind: snapshot.kind,
           });
-          // This duty runs in tick:housekeeping — AFTER the session fan-out and
-          // after the quiet-mark flush. The fan-out saw a source with no live
-          // task (that is the crash state this recovery exists for) and may have
-          // just marked it quiet, so the row we restore here is a DUE task hiding
-          // behind a mark taken seconds ago, and S2-PR15 would carry that mark
-          // across a restart. The central-DB touch is what invalidates it.
-          touchSessionActivity(intent.session_id);
         }
         return 'restored' as const;
       });

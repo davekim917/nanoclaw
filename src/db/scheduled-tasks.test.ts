@@ -459,6 +459,66 @@ describe('scheduleTask invalidates the target session quiet mark (S2-PR15)', () 
   });
 });
 
+// ── Crash-safety ordering (Codex pre-pass, review/b3/review.json Part C) ────
+//
+// The quiet-mark touch and the task-row write are two separate DB files with
+// no shared transaction. A crash between them is survivable only if the touch
+// (central DB, advisory, harmless if spurious) happens BEFORE the write
+// (session DB, the thing that actually needs the mark gone) — the reverse
+// lets a persisted quiet mark outlive a task row a warmed restart cannot see.
+describe('scheduleTask invalidates the quiet mark before writing the task row, not after', () => {
+  it('touchSessionActivity fires before the task row exists in the session DB', async () => {
+    seedActiveSession();
+    seedInboundDb();
+
+    const sessionsModule = await import('./sessions.js');
+    const originalTouch = sessionsModule.touchSessionActivity;
+    const readsAtTouchTime: Array<{ existed: boolean; rowPresent: boolean }> = [];
+    const touchSpy = vi.spyOn(sessionsModule, 'touchSessionActivity').mockImplementation((id: string) => {
+      // Read the SAME session's inbound.db, at the instant the quiet mark is
+      // invalidated, before calling through to the real touch. If the write
+      // already landed, this proves the ordering the fix removed; if it has
+      // not (file absent, or present with no row for this series yet), this
+      // proves the touch precedes it.
+      const dbPath = inboundPath(id);
+      if (!fs.existsSync(dbPath)) {
+        readsAtTouchTime.push({ existed: false, rowPresent: false });
+      } else {
+        const db = openInboundDb(dbPath);
+        const row = db.prepare("SELECT 1 FROM messages_in WHERE series_id = 's-order' LIMIT 1").get();
+        db.close();
+        readsAtTouchTime.push({ existed: true, rowPresent: row !== undefined });
+      }
+      return originalTouch(id);
+    });
+
+    await scheduleTask({
+      id: 't-order',
+      agentGroupId: AGENT_GROUP_ID,
+      cron: '0 3 * * *',
+      processAfter: new Date(Date.now() + 86400000).toISOString(),
+      seriesId: 's-order',
+      prompt: 'do thing',
+      destination: TEST_DESTINATION,
+    });
+    touchSpy.mockRestore();
+
+    // touchSessionActivity ran exactly once (the happy path never retries) and
+    // saw no row for this series at that instant — the write had not happened
+    // yet. A read of an existing file with the row already present, or of a
+    // file that does not exist because the write already provisioned and
+    // filled it, would both fail this.
+    expect(readsAtTouchTime).toEqual([{ existed: false, rowPresent: false }]);
+
+    // Positive control: the row IS there once scheduleTask returns — proves
+    // the absence above was ordering, not a write that silently never happened.
+    const db = openInboundDb(taskInboundPath('s-order'));
+    const row = db.prepare("SELECT 1 FROM messages_in WHERE series_id = 's-order' LIMIT 1").get();
+    db.close();
+    expect(row).toBeTruthy();
+  });
+});
+
 describe('test_scheduletask_omits_script_when_absent', () => {
   it('content JSON has no "script" key when TaskDef.script is undefined', async () => {
     seedActiveSession();

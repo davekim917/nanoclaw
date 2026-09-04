@@ -656,6 +656,24 @@ export const moveExecuteHandler: AuthHandler = async (req, params, ctx) => {
       if (!live.unreadable && live.count === 0) {
         restored =
           (await withExistingMailboxSession(source.agentGroupId, source.sessionId, (mailbox) => {
+            // The source was cancelled, then the target insert was AWAITED — a
+            // sweep tick can land in that await, see a source with no live task
+            // and mark it quiet. Restoring the pending row here puts due work
+            // back behind that mark, and S2-PR15 would carry it across a
+            // restart. `touchSessionActivity` is what invalidates it.
+            //
+            // Touched BEFORE the restore, not after (Codex pre-pass,
+            // review/b3/review.json Part C): inbound.db and the central DB are
+            // two separate files with no shared transaction, so a crash between
+            // the restore write and a later touch is possible even without an
+            // `await` in between them. Touch-then-restore's worst case is one
+            // wasted sweep of a session whose restore then fails; the reverse
+            // leaves a restored due row hidden behind a persisted quiet mark for
+            // up to `QUIET_SESSION_BACKOFF_MS` after a warmed restart. This also
+            // means the touch lands before `purgeIntentBody` below, same as
+            // before: a crash between the two still leaves the intent for
+            // `recoverMoveIntents` to finish.
+            touchSessionActivity(source.sessionId);
             mailbox.restoreTaskRow(restoreSnapshot);
             return true;
           })) ?? false;
@@ -676,13 +694,6 @@ export const moveExecuteHandler: AuthHandler = async (req, params, ctx) => {
         correlationId,
       });
     } else {
-      // The source was cancelled, then the target insert was AWAITED — a sweep
-      // tick can land in that await, see a source with no live task and mark it
-      // quiet. Restoring the pending row here puts due work back behind that
-      // mark, and S2-PR15 would carry it across a restart. Invalidate before
-      // purging the intent, so a crash between the two still leaves the intent
-      // for `recoverMoveIntents` to finish.
-      touchSessionActivity(source.sessionId);
       purgeIntentBody(central, correlationId);
     }
     invalidateScheduledCache();

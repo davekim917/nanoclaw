@@ -396,18 +396,35 @@ export async function scheduleTask(def: TaskDef): Promise<void> {
     return await withMailboxSession(def.agentGroupId, sessionId, action);
   };
 
-  // A task row just changed when this session next has work due, and due-ness
-  // lives only in the session DB where the host sweep's quiet cache cannot see
-  // it. `touchSessionActivity` is the central-DB write that invalidates the
-  // quiet mark (`updateSession` nulls `sweep_quiet_until` in the same
-  // statement), so the session is swept on the next tick rather than sleeping
-  // through its first fire — and, since S2-PR15 persists that mark, across a
-  // restart too. Here rather than at the call sites: this is the chokepoint
-  // every scheduled task insert passes through, including `scheduled-move`'s
-  // re-home into a target session that may have been quiet for days. It fires
-  // for whichever session the row actually landed in, retry included.
+  // A task row is about to change when this session next has work due, and
+  // due-ness lives only in the session DB where the host sweep's quiet cache
+  // cannot see it. `touchSessionActivity` is the central-DB write that
+  // invalidates the quiet mark (`updateSession` nulls `sweep_quiet_until` in
+  // the same statement), so the session is swept on the next tick rather than
+  // sleeping through its first fire — and, since S2-PR15 persists that mark,
+  // across a restart too.
+  //
+  // Touched BEFORE the write, not after (Codex pre-pass, review/b3/review.json
+  // Part C): the session DB and the central DB are two separate files with no
+  // shared transaction, so a crash between them can only be survived by
+  // invalidating first. Touch-then-write means the worst case of a crash in
+  // the gap is a session woken for nothing — one wasted sweep, since the
+  // touched session's mailbox holds no new due row yet. Write-then-touch means
+  // the worst case is the task row landing durably in inbound.db while the
+  // persisted quiet mark survives the crash untouched — up to
+  // QUIET_SESSION_BACKOFF_MS of silently missed due work after a warmed
+  // restart, which is the failure this ordering exists to rule out.
+  // `touchSessionActivity` itself swallows failures (a central-DB write that
+  // must never abort the task write it rides on), so a spurious touch ahead of
+  // a write that then fails (session closed, retried against a different
+  // session) is harmless — it does not touch the WRONG session's mark, because
+  // each attempt below touches only the id it is about to write to.
+  //
+  // Here rather than at the call sites: this is the chokepoint every scheduled
+  // task insert passes through, including `scheduled-move`'s re-home into a
+  // target session that may have been quiet for days.
+  touchSessionActivity(session.id);
   if ((await write(session.id)) === 'written') {
-    touchSessionActivity(session.id);
     return;
   }
 
@@ -415,8 +432,8 @@ export async function scheduleTask(def: TaskDef): Promise<void> {
   // behind `resolveTaskSession` filter `status = 'active'`, so the closed row
   // can never come back — a fresh active task session is minted instead.
   const retry = resolveTaskSession(def.agentGroupId, def.seriesId);
+  touchSessionActivity(retry.session.id);
   if ((await write(retry.session.id)) === 'written') {
-    touchSessionActivity(retry.session.id);
     return;
   }
   throw new Error(
