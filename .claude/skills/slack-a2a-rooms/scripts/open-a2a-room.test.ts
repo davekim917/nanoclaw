@@ -13,7 +13,14 @@
  */
 import { describe, expect, it, vi } from 'vitest';
 
-import { assertSameWorkspace, channelTypeForInstance, normalizeInstance, tokenEnvKey } from './open-a2a-room.js';
+import {
+  assertDistinctInstances,
+  assertSameWorkspace,
+  channelTypeForInstance,
+  normalizeInstance,
+  parseArgs,
+  tokenEnvKey,
+} from './open-a2a-room.js';
 
 const env = vi.hoisted(() => ({ values: {} as Record<string, string> }));
 
@@ -108,5 +115,46 @@ describe('open-a2a-room refuses a roster that spans Slack workspaces', () => {
 
   it('test_unknown_team_id_does_not_block: a response without team_id is not treated as a mismatch', () => {
     expect(() => assertSameWorkspace([auth('dana', 'T111'), auth('eli', null)])).not.toThrow();
+  });
+});
+
+describe('open-a2a-room refuses two spellings of one instance', () => {
+  it('test_distinct_instances_pass: different bots are accepted', () => {
+    expect(() => assertDistinctInstances(['dana', 'eli'])).not.toThrow();
+    expect(() => assertDistinctInstances(['slack-dana', 'eli'])).not.toThrow();
+  });
+
+  it('test_alias_duplicate_rejected: channelType and bare suffix name one bot', () => {
+    // Both spellings resolve to the same token and the same bot user id, so a
+    // roster like this used to satisfy the two-instance minimum and then put
+    // the caller's own id into conversations.open.
+    expect(() => assertDistinctInstances(['example-labs', 'slack-example-labs'])).toThrow(
+      /lists the same instance twice/,
+    );
+    expect(() => assertDistinctInstances(['example-labs', 'slack-example-labs'])).toThrow(/example-labs/);
+  });
+
+  it('test_case_and_underscore_aliases_rejected: normalization collapses these too', () => {
+    expect(() => assertDistinctInstances(['Example-Labs', 'example_labs'])).toThrow(/lists the same instance twice/);
+  });
+
+  it('test_primary_aliases_rejected: "slack" and "default" are one instance', () => {
+    expect(() => assertDistinctInstances(['slack', 'default'])).toThrow(/the primary instance/);
+  });
+
+  it('test_parse_args_applies_the_check: the guard runs before the count minimums', () => {
+    // The check has to be wired in, not merely present: it runs ahead of the
+    // "--instances needs at least two" branch, which calls process.exit and
+    // would take the test runner with it.
+    expect(() => parseArgs(['--instances', 'example-labs,slack-example-labs', '--user', 'U0HUMAN'])).toThrow(
+      /lists the same instance twice/,
+    );
+    expect(() => parseArgs(['--instances', 'dana,eli', '--user', 'U0HUMAN'])).not.toThrow();
+  });
+
+  it('test_alias_duplicate_cannot_satisfy_the_minimum: three entries, two bots', () => {
+    // The bot-only path needs three real instances; three spellings of two
+    // bots must not pass for them.
+    expect(() => assertDistinctInstances(['dana', 'eli', 'slack-eli'])).toThrow(/lists the same instance twice/);
   });
 });

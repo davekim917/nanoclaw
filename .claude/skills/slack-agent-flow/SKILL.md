@@ -162,20 +162,38 @@ spawn, as the block above does, and there is nothing to move.
 **Rehome a group that has already spawned.** Move its shared directory by hand,
 with the host down so nothing writes underneath the copy:
 
+Names come from the install slug, so read them once and reuse them:
+
+```bash
+UNIT=$(. setup/lib/install-slug.sh; systemd_unit)     # Linux
+LABEL=$(. setup/lib/install-slug.sh; launchd_label)   # macOS
+```
+
 ```bash
 # 1. stop the service — a live host can respawn a container mid-copy
-#    (the unit name comes from the install slug; see setup/lib/install-slug.sh)
-systemctl --user stop "$(. setup/lib/install-slug.sh; systemd_unit)" \
-  || sudo systemctl stop "$(. setup/lib/install-slug.sh; systemd_unit)"
-#    macOS: launchctl bootout "gui/$(id -u)/$(. setup/lib/install-slug.sh; launchd_label)"
+# Linux
+systemctl --user stop "$UNIT" || sudo systemctl stop "$UNIT"
+# macOS
+launchctl bootout "gui/$(id -u)/$LABEL"
 
 # 2. inventory both sides — everything under the old id, not only memory/
 find data/workgroups/<its own folder> -type f | sort
 find data/workgroups/${WG} -type f | sort
 
 # 3. merge the old tree into the destination by hand, then set the column
-#    and start the service again
+
+# 4. start the service again
+# Linux
+systemctl --user start "$UNIT" || sudo systemctl start "$UNIT"
+# macOS — bootout UNLOADED the job, so load it rather than kickstarting it
+launchctl bootstrap "gui/$(id -u)" ~/Library/LaunchAgents/"$LABEL".plist
 ```
+
+Step 4 is not `bash setup/lib/restart.sh`. That script's macOS branch is
+`launchctl kickstart -k`, which restarts a job that is still loaded and fails
+on one `bootout` has removed; its Linux branch is a `restart`, which is fine
+but pointless on a stopped unit. Use the commands above, which mirror the pair
+`setup/auto.ts` prints for the same situation.
 
 Read both inventories before copying. The trees are plain files, both sides can
 hold the same name, and a blind `cp -r` silently picks a winner — merge a

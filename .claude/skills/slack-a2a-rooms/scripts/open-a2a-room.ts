@@ -87,6 +87,36 @@ function fail(msg: string): never {
   process.exit(1);
 }
 
+/**
+ * Reject two spellings of one instance.
+ *
+ * `--instances` accepts either the channelType or the bare suffix, so
+ * `example-labs` and `slack-example-labs` name the same bot while reading as
+ * two entries. Counting raw entries let such a roster satisfy the minimums,
+ * and the duplicate then resolved to the same bot user id — putting the
+ * caller's own id into `conversations.open`, which does not build the room
+ * that was asked for. Rejected rather than silently collapsed: dropping one
+ * quietly would shrink a three-bot room to two and turn the MPIM into a 1:1
+ * IM, which is the failure the minimums exist to prevent.
+ *
+ * Exported for the convention test.
+ */
+export function assertDistinctInstances(instances: string[]): void {
+  const bySuffix = new Map<string, string[]>();
+  for (const name of instances) {
+    const suffix = normalizeInstance(name);
+    bySuffix.set(suffix, [...(bySuffix.get(suffix) ?? []), name]);
+  }
+  const collisions = [...bySuffix.entries()].filter(([, names]) => names.length > 1);
+  if (collisions.length === 0) return;
+  const detail = collisions
+    .map(([suffix, names]) => `${names.join(' and ')} both name ${suffix === '' ? 'the primary instance' : suffix}`)
+    .join('; ');
+  // Thrown rather than `fail`ed, matching assertSameWorkspace: main()'s catch
+  // routes it to the same exit and the convention test can cover it.
+  throw new Error(`--instances lists the same instance twice — ${detail}`);
+}
+
 export function parseArgs(argv: string[]): { instances: string[]; user?: string } {
   let instances: string[] = [];
   let user: string | undefined;
@@ -102,6 +132,9 @@ export function parseArgs(argv: string[]): { instances: string[]; user?: string 
       fail(`unknown argument: ${argv[i]}\n${USAGE}`);
     }
   }
+  // Before the count checks, so a roster of aliases cannot satisfy a minimum
+  // it does not actually meet.
+  assertDistinctInstances(instances);
   if (instances.length < 2) fail('--instances needs at least two comma-separated instance names');
   if (!user && instances.length < 3) {
     fail(
