@@ -96,6 +96,20 @@ function toolPart(sessionID: string, messageID: string, id: string): Ev {
   return { type: 'message.part.updated', properties: { part: { id, type: 'tool', messageID, sessionID } } };
 }
 
+function assistantWithUsage(
+  sessionID: string,
+  id: string,
+  tokens: { input: number; output: number },
+  cost: number,
+): Ev {
+  return {
+    type: 'message.updated',
+    properties: {
+      info: { id, role: 'assistant', sessionID, providerID: 'nvidia', modelID: 'test-model', cost, tokens },
+    },
+  };
+}
+
 function newProvider(deps: OpenCodeRuntimeDeps): OpenCodeProvider {
   const provider = new OpenCodeProvider({}, deps);
   provider.registerMemorySessionHook({ command: 'noop', matcher: undefined } as never);
@@ -125,15 +139,15 @@ describe('isEmptyOpenCodeResume', () => {
     expect(
       isEmptyOpenCodeResume({ resumedExistingSession: true, alreadyFellBack: false, sawAssistantWork: false }),
     ).toBe(true);
-    expect(isEmptyOpenCodeResume({ resumedExistingSession: true, alreadyFellBack: true, sawAssistantWork: false })).toBe(
-      false,
-    );
+    expect(
+      isEmptyOpenCodeResume({ resumedExistingSession: true, alreadyFellBack: true, sawAssistantWork: false }),
+    ).toBe(false);
   });
 
   it('test_oc_resume_work_blocks_fallback: any assistant work keeps the session', () => {
-    expect(isEmptyOpenCodeResume({ resumedExistingSession: true, alreadyFellBack: false, sawAssistantWork: true })).toBe(
-      false,
-    );
+    expect(
+      isEmptyOpenCodeResume({ resumedExistingSession: true, alreadyFellBack: false, sawAssistantWork: true }),
+    ).toBe(false);
   });
 });
 
@@ -146,11 +160,7 @@ describe('OpenCodeProvider — empty-resume fallback', () => {
         // Turn 1 on the resumed session: bare envelope, then idle. No parts.
         [assistantEnvelope(resumed, 'm1'), idle(resumed)],
         // Turn 2 on the replacement session: a real answer.
-        [
-          assistantEnvelope(fresh, 'm2'),
-          textPart(fresh, 'm2', 'p1', 'recovered answer'),
-          idle(fresh),
-        ],
+        [assistantEnvelope(fresh, 'm2'), textPart(fresh, 'm2', 'p1', 'recovered answer'), idle(fresh)],
       ],
       [fresh],
     );
@@ -252,6 +262,57 @@ describe('OpenCodeProvider — empty-resume fallback', () => {
     // Exactly one session created (the opening one) and one prompt sent.
     expect(created).toEqual([fresh]);
     expect(prompts).toHaveLength(1);
+    query.abort();
+  });
+
+  it("test_oc_resume_subagent_usage_still_summed: a subagent session's spend stays in the turn usage", async () => {
+    // sumOpenCodeTurnUsage deliberately sums EVERY assistant message the turn
+    // saw, subagents included, because those are real spend. The session filter
+    // the fallback needs must not narrow that sum.
+    const own = 'sess-own';
+    const sub = 'sess-subagent';
+    const { deps } = makeRuntime(
+      [
+        [
+          assistantWithUsage(own, 'm1', { input: 100, output: 10 }, 0.01),
+          textPart(own, 'm1', 'p1', 'answer'),
+          assistantWithUsage(sub, 'm2', { input: 500, output: 50 }, 0.05),
+          idle(own),
+        ],
+      ],
+      [own],
+    );
+
+    const query = newProvider(deps).query({ prompt: 'hello', cwd: '/workspace/agent' });
+    const seen = await drainUntilResult(query.events);
+    const result = seen.at(-1) as Extract<ProviderEvent, { type: 'result' }>;
+    expect(result.usage).toMatchObject({ inputTokens: 600, outputTokens: 60 });
+    expect(result.steps).toBe(2);
+    query.abort();
+  });
+
+  it("test_oc_resume_foreign_session_work_does_not_count: another session's output does not keep a dead resume", async () => {
+    // A concurrent session producing parts says nothing about whether THIS
+    // continuation is alive, so it must not suppress the fallback.
+    const resumed = 'sess-dead';
+    const other = 'sess-other';
+    const fresh = 'sess-fresh';
+    const { deps, created } = makeRuntime(
+      [
+        [
+          assistantEnvelope(resumed, 'm1'),
+          assistantEnvelope(other, 'm2'),
+          textPart(other, 'm2', 'p1', 'someone else'),
+          idle(resumed),
+        ],
+        [assistantEnvelope(fresh, 'm3'), textPart(fresh, 'm3', 'p2', 'recovered'), idle(fresh)],
+      ],
+      [fresh],
+    );
+
+    const query = newProvider(deps).query({ prompt: 'hello', continuation: resumed, cwd: '/workspace/agent' });
+    await drainUntilResult(query.events);
+    expect(created).toEqual([fresh]);
     query.abort();
   });
 });

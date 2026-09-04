@@ -1085,7 +1085,11 @@ export interface OpenCodeRuntimeHandle {
 }
 
 export interface OpenCodeRuntimeDeps {
-  getRuntime(options: ProviderOptions, cwd: string | undefined, turn: OpenCodeTurnOverrides): Promise<OpenCodeRuntimeHandle>;
+  getRuntime(
+    options: ProviderOptions,
+    cwd: string | undefined,
+    turn: OpenCodeTurnOverrides,
+  ): Promise<OpenCodeRuntimeHandle>;
 }
 
 export class OpenCodeProvider implements AgentProvider {
@@ -1255,6 +1259,9 @@ export class OpenCodeProvider implements AgentProvider {
           // partTextById on purpose — it is what separates a live session from a
           // poisoned one below.
           const partMessageIds = new Set<string>();
+          // messageID → the session that owns it, so the work determination
+          // below can narrow to this turn while the usage sum stays wide.
+          const sessionByMessageId = new Map<string, string>();
           // `message.updated` fires repeatedly for the same record, so latch the
           // error rather than reading only the last event.
           const erroredMessageIds = new Set<string>();
@@ -1323,9 +1330,14 @@ export class OpenCodeProvider implements AgentProvider {
                         tokens?: { input?: number; output?: number; cache?: { read?: number; write?: number } };
                       }
                     | undefined;
-                  if (info?.sessionID && info.sessionID !== turnSessionId) break;
+                  // NOT filtered by sessionID. Subagent responses arrive under
+                  // their own session and are real spend, so they belong in the
+                  // usage sum — see sumOpenCodeTurnUsage. The session is
+                  // recorded instead, and only the work determination below
+                  // narrows to this turn's session.
                   if (info?.id && info?.role) {
                     roleByMessageId.set(info.id, info.role);
+                    if (info.sessionID) sessionByMessageId.set(info.id, info.sessionID);
                     if (info.error) erroredMessageIds.add(info.id);
                     if (info.role === 'assistant') assistantUsageById.set(info.id, info);
                   }
@@ -1335,7 +1347,9 @@ export class OpenCodeProvider implements AgentProvider {
                   const part = ev.properties.part as
                     | { id?: string; type?: string; messageID?: string; sessionID?: string; text?: string }
                     | undefined;
-                  if (part?.sessionID && part.sessionID !== turnSessionId) break;
+                  // Also unfiltered, for the same reason: a part belongs to a
+                  // message, and which turn that message counts toward is
+                  // decided from sessionByMessageId below.
                   if (part?.messageID) partMessageIds.add(part.messageID);
                   if (part?.type === 'text' && part.id && part.messageID && part.text) {
                     partTextById.set(part.id, { messageID: part.messageID, text: part.text });
@@ -1431,6 +1445,14 @@ export class OpenCodeProvider implements AgentProvider {
             // part — or that it carries a provider error, which marks a LIVE
             // session whose turn failed: replaying that on a fresh session would
             // discard the history and bury the error.
+            // Narrowed to THIS turn's session (an id whose session the stream
+            // never reported counts, so an SDK that omits it fails safe toward
+            // keeping the session). A subagent's own messages are spend, not
+            // proof this continuation is alive — but the parent's tool call
+            // that launched it is a part on a message of this session, so a
+            // turn that only dispatched a subagent still reads as work.
+            const owner = sessionByMessageId.get(msgId);
+            if (owner !== undefined && owner !== turnSessionId) continue;
             if (partMessageIds.has(msgId) || erroredMessageIds.has(msgId)) sawAssistantWork = true;
           }
           let resultText = '';
