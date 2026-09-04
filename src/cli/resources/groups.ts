@@ -206,6 +206,7 @@ registerResource({
           }
           const counts = {
             sessions: 0,
+            cli_request_executions: 0,
             pending_questions: 0,
             pending_approvals: 0,
             agent_destinations_owned: 0,
@@ -230,6 +231,15 @@ registerResource({
           counts.pending_questions = db
             .prepare(
               'DELETE FROM pending_questions WHERE session_id IN (SELECT id FROM sessions WHERE agent_group_id = ?)',
+            )
+            .run(groupId).changes;
+          // The ncl execution ledger (src/cli/request-ledger.ts) retains its
+          // newest claim per session on a terminal signal, not a clock, so a
+          // deleted session's claim would otherwise never expire. Must run
+          // before the sessions delete below — it resolves them by subquery.
+          counts.cli_request_executions = db
+            .prepare(
+              'DELETE FROM cli_request_executions WHERE session_id IN (SELECT id FROM sessions WHERE agent_group_id = ?)',
             )
             .run(groupId).changes;
           if (hasPendingApprovals) {

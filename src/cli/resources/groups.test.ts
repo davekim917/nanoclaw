@@ -139,6 +139,13 @@ describe('groups CLI delete cascades dependent rows (#2525)', () => {
       `INSERT INTO user_roles (user_id, role, agent_group_id, granted_by, granted_at) VALUES (?, 'admin', ?, NULL, ?)`,
     ).run(UID, GID, now());
 
+    // The agent's ncl execution ledger is retained on a terminal signal rather
+    // than a clock, so a claim the group delete leaves behind never expires.
+    db.prepare(
+      `INSERT INTO cli_request_executions (session_id, request_id, command, status, response, claimed_at, completed_at)
+       VALUES (?, 'cli-1-abcdef', 'tasks-create', 'done', '{"id":"cli-1-abcdef","ok":true,"data":1}', ?, ?)`,
+    ).run(SID, now(), now());
+
     // Container config row exercises the ON DELETE CASCADE on container_configs.
     db.prepare(
       `INSERT INTO container_configs
@@ -164,6 +171,7 @@ describe('groups CLI delete cascades dependent rows (#2525)', () => {
       agent_group_members: 1,
       user_roles: 1,
       container_configs: 1,
+      cli_request_executions: 1,
     });
 
     // The group and every dependent row must be gone.
@@ -180,6 +188,7 @@ describe('groups CLI delete cascades dependent rows (#2525)', () => {
     expect(count('SELECT COUNT(*) AS c FROM agent_group_members WHERE agent_group_id = ?', GID)).toBe(0);
     expect(count('SELECT COUNT(*) AS c FROM user_roles WHERE agent_group_id = ?', GID)).toBe(0);
     expect(count('SELECT COUNT(*) AS c FROM container_configs WHERE agent_group_id = ?', GID)).toBe(0);
+    expect(count('SELECT COUNT(*) AS c FROM cli_request_executions WHERE session_id = ?', SID)).toBe(0);
 
     // Unrelated tables untouched.
     expect(count('SELECT COUNT(*) AS c FROM users WHERE id = ?', UID)).toBe(1);
