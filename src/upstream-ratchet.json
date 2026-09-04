@@ -890,7 +890,7 @@
 "src/modules/scheduling/task-content.ts":{"diff":20,"mode":"100644","sha256":null,"deleted":true},
 "src/modules/self-mod/agent.md":{"diff":35,"mode":"100644","sha256":"63c5640e37fea22c6c02e60853fe4d830f0ac06d34127479be097ba8c563a87e"},
 "src/modules/self-mod/apply.test.ts":{"diff":172,"mode":"100644","sha256":"4a24054cad1c31fa49d4e9978145cbde30ee3539ee5c761607b364afa0b044d2"},
-"src/modules/self-mod/apply.ts":{"diff":221,"mode":"100644","sha256":"451ff94bfe4ec17cdd385001ebfcc91522bc556d1936d89f617cde77e055ebe1"},
+"src/modules/self-mod/apply.ts":{"diff":231,"mode":"100644","sha256":"a507546676c5c8ccc7cdb7a4ad6e80a1b1e81100bf62cd30c5b4775f7ee64ebf"},
 "src/modules/self-mod/guard.test.ts":{"diff":89,"mode":"100644","sha256":null,"deleted":true},
 "src/modules/self-mod/guard.ts":{"diff":25,"mode":"100644","sha256":"10f3954b17ffe6d89af21a13371078e163e53e0d8afea33d0eb74ef342afd4e8"},
 "src/modules/self-mod/index.ts":{"diff":10,"mode":"100644","sha256":"09c17c0eaadf11918be2eab7196cf4d85ac948240e696a0ee53483a2a95b3555"},

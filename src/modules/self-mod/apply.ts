@@ -10,6 +10,16 @@
  *
  * install_packages: update DB + rebuild image + kill container + on_wake.
  * add_mcp_server: update DB + kill container + on_wake.
+ *
+ * getContainerConfig/updateContainerConfigJson/updateContainerConfigScalars
+ * (../../db/container-configs.js) below are generic DB persistence CRUD,
+ * shared by every operationally-mutated container-config field (provider,
+ * model, packages, mcp_servers, timezone, …) — they hold no MCP-specific
+ * validation. The credential/URL/header/name invariants for a remote MCP
+ * server all live one layer down, in `parseMcpServerConfig`,
+ * `validateMcpServerName`, and `isKnownRawSecret` (../../container-config.js)
+ * — the single primitive every one of those rules is enforced in, called
+ * before any of the DB writes below ever run.
  */
 import { buildAgentGroupImage, killContainer, wakeContainer } from '../../container-runner.js';
 import { getAgentGroup } from '../../db/agent-groups.js';
