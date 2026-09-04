@@ -155,6 +155,22 @@ describe('review-churn classifier', () => {
     expect(churning[0].primitives).toEqual([]);
   });
 
+  it('never seams a class on a Node builtin, bare or node:-prefixed', () => {
+    // A builtin is shared by nearly every file in the tree and owns no
+    // write/wake/read primitive, so it is the specifier the seam ranking would
+    // reward and the one answer that can never be right.
+    const churning = classify(fixture('builtin-seam')).classes.filter((c) => c.rounds >= 3);
+    expect(churning).toHaveLength(1);
+    expect(churning[0].seam).toBeNull();
+    expect(churning[0].primitives).toEqual([]);
+  });
+
+  it('prefers the module that owns the primitive over the builtins every file shares', () => {
+    const churning = classify(fixture('builtin-with-real-seam')).classes.filter((c) => c.rounds >= 3);
+    expect(churning[0].seam).toBe('src/mailbox/write.ts');
+    expect(churning[0].primitives).toContain('writeSessionMessage');
+  });
+
   it('reads severity direction per seam, not per finding', () => {
     const falling = classify(fixture('seam-drift-falling'));
     const flat = classify(fixture('seam-drift-flat'));
@@ -252,6 +268,16 @@ describe('review-churn gate', () => {
     expect(falling.status).toBe(0);
     expect(falling.decision.status).toBe('pass');
     expect(falling.decision.flagged).toHaveLength(0);
+  });
+
+  it('does not gate a class whose only shared import is a builtin', () => {
+    // Seamed on `path`, the refusal named `path` as the primitive: no diff
+    // could lift it, because the lift-by-diff path only matches in-repo
+    // modules. A gate whose only exit is the override is worse than no gate.
+    const { status, decision } = gate(fixture('builtin-seam'));
+    expect(status).toBe(0);
+    expect(decision.status).toBe('pass');
+    expect(decision.flagged).toHaveLength(0);
   });
 
   it('passes a PR whose worst class has run two rounds', () => {

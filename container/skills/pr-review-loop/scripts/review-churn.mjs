@@ -49,6 +49,7 @@
  */
 import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
+import { builtinModules } from 'node:module';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -90,9 +91,22 @@ const STOPWORDS = new Set(
   ).split(/\s+/),
 );
 
-// Import specifiers that are never the seam: builtins, the test runner, and
-// type-only packages carry no shared write/wake/read primitive.
-const SEAM_SPEC_DENY = /^(?:node:|vitest$|bun:|@types\/)/;
+// Import specifiers that are never the seam: the test runner and type-only
+// packages carry no shared write/wake/read primitive.
+const SEAM_SPEC_DENY = /^(?:vitest$|bun:|@types\/)/;
+
+// Neither does a Node builtin. `node:`-prefixed ones were already excluded by
+// the pattern above, but most of this tree writes them bare (`import path from
+// 'path'`), and a bare builtin is a specifier every file shares — exactly what
+// the seam ranking rewards. A class seamed on `path` is worse than a class
+// with no seam: nothing a diff touches can lift it, so only the reframe
+// trailer could, which reads as the gate refusing work that fixed the defect.
+const NODE_BUILTINS = new Set(builtinModules.map((name) => name.replace(/^node:/, '')));
+
+function seamCandidate(spec) {
+  if (SEAM_SPEC_DENY.test(spec)) return false;
+  return !NODE_BUILTINS.has(spec.replace(/^node:/, ''));
+}
 
 // ── finding parsing ─────────────────────────────────────────────────────────
 
@@ -219,7 +233,7 @@ export function seamFor(files, findingText, ctx) {
     if (source == null) continue;
     for (const { spec, names } of importsOf(source)) {
       const resolved = resolveSpec(file, spec);
-      if (SEAM_SPEC_DENY.test(resolved)) continue;
+      if (!seamCandidate(resolved)) continue;
       let entry = bySpec.get(resolved);
       if (!entry) {
         entry = { spec: resolved, relative: spec.startsWith('.'), files: new Set(), names: new Map() };

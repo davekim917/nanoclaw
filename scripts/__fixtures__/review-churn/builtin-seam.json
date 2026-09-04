@@ -1,0 +1,43 @@
+{
+  "_comment": "Three rounds of one class whose sites share nothing but Node builtins: `path` written bare and `node:fs` prefixed. A builtin is not a seam \u2014 no shared write/wake/read primitive lives there \u2014 and a class seamed on one could never be lifted by a diff, only by the trailer. It must come out seamless, which means reported and not gated.",
+  "findings": [
+    {
+      "threadId": "T1",
+      "commentId": 401,
+      "reviewId": "PRR_B0",
+      "createdAt": "2026-09-01T01:00:00Z",
+      "path": "src/one.ts",
+      "line": 10,
+      "isResolved": false,
+      "isOutdated": false,
+      "body": "**<sub><sub>![P1 Badge](https://img.shields.io/badge/P1-orange?style=flat)</sub></sub>  Revalidate the row after the await**\n\nThe row is read before the await and `doThing` runs after it, so a concurrent archive wins the race and nothing revalidates the row in between."
+    },
+    {
+      "threadId": "T2",
+      "commentId": 402,
+      "reviewId": "PRR_B1",
+      "createdAt": "2026-09-01T02:00:00Z",
+      "path": "src/two.ts",
+      "line": 20,
+      "isResolved": false,
+      "isOutdated": false,
+      "body": "**<sub><sub>![P1 Badge](https://img.shields.io/badge/P1-orange?style=flat)</sub></sub>  Revalidate the row after the await**\n\nThe row is read before the await and `doThing` runs after it, so a concurrent archive wins the race and nothing revalidates the row in between."
+    },
+    {
+      "threadId": "T3",
+      "commentId": 403,
+      "reviewId": "PRR_B2",
+      "createdAt": "2026-09-01T03:00:00Z",
+      "path": "src/three.ts",
+      "line": 30,
+      "isResolved": false,
+      "isOutdated": false,
+      "body": "**<sub><sub>![P1 Badge](https://img.shields.io/badge/P1-orange?style=flat)</sub></sub>  Revalidate the row after the await**\n\nThe row is read before the await and `doThing` runs after it, so a concurrent archive wins the race and nothing revalidates the row in between."
+    }
+  ],
+  "sources": {
+    "src/one.ts": "import path from 'path';\nimport fs from 'node:fs';\nimport { helper0 } from './helper0.js';\n",
+    "src/two.ts": "import path from 'path';\nimport fs from 'node:fs';\nimport { helper1 } from './helper1.js';\n",
+    "src/three.ts": "import path from 'path';\nimport fs from 'node:fs';\nimport { helper2 } from './helper2.js';\n"
+  }
+}
