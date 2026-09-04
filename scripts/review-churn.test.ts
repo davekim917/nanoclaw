@@ -50,6 +50,7 @@ interface ClassRow {
   key: string;
   signature: string;
   seam: string | null;
+  seamSubstantiated?: boolean;
   primitives: string[];
   rounds: number;
   findings: number;
@@ -257,6 +258,24 @@ describe('review-churn classifier', () => {
     expect(code).not.toContain("from 'node:module'");
   });
 
+  it('marks a seam it had to guess at, and one it has evidence for', () => {
+    // With one flagged file there is no shared import to measure, so the seam
+    // is whichever import ranks first. The findings naming what that module
+    // exports is the only evidence left; without it the answer is a guess.
+    const guessed = classify(fixture('guessed-seam')).classes[0];
+    expect(guessed.rounds).toBe(3);
+    expect(guessed.seam).toBe('src/db/messages-out.ts');
+    expect(guessed.seamSubstantiated).toBe(false);
+
+    const named = classify(fixture('named-seam-single-file')).classes[0];
+    expect(named.rounds).toBe(3);
+    expect(named.seam).toBe('src/gate.ts');
+    expect(named.seamSubstantiated).toBe(true);
+
+    // Two flagged files sharing the module is evidence on its own.
+    expect(classify(fixture('toctou-class')).classes[0].seamSubstantiated).toBe(true);
+  });
+
   it('reads severity direction per seam, not per finding', () => {
     const falling = classify(fixture('seam-drift-falling'));
     const flat = classify(fixture('seam-drift-flat'));
@@ -354,6 +373,55 @@ describe('review-churn gate', () => {
     expect(falling.status).toBe(0);
     expect(falling.decision.status).toBe('pass');
     expect(falling.decision.flagged).toHaveLength(0);
+  });
+
+  it('reports a guessed seam without gating it', () => {
+    // The refusal would name a primitive the fix has no reason to touch, so
+    // the only way past would be the override — the failure the gate exists to
+    // prevent, arrived at by the gate itself.
+    const { status, decision } = gate(fixture('guessed-seam'));
+    expect(status).toBe(0);
+    expect(decision.status).toBe('pass');
+    expect(decision.flagged).toHaveLength(0);
+    expect(decision.report.classes[0].rounds).toBe(3);
+  });
+
+  it('still gates a single-file class when the findings name what the seam exports', () => {
+    const { status, decision } = gate(fixture('named-seam-single-file'));
+    expect(status).toBe(3);
+    expect(decision.unlifted[0].seam).toBe('src/gate.ts');
+  });
+
+  it('lifts on a trailer naming a primitive the commit declares, not only the classifier guess', () => {
+    // The classifier's candidates are a ranking, not a fact. An author who
+    // moved the invariant somewhere else says so, with the diff behind it.
+    const payload = fixture('toctou-class');
+    payload.sources = { ...payload.sources, 'src/guard.ts': 'export function guardEveryWrite() {}\n' };
+    payload.commits = [
+      {
+        sha: 'kkk1111',
+        date: AFTER,
+        message: 'fix: one guard for every caller\n\nReframe: race enforced in guardEveryWrite\n',
+        files: ['src/guard.ts'],
+      },
+    ];
+    const { status, decision } = gate(payload);
+    expect(status).toBe(0);
+    expect(decision.flagged[0].liftedBy).toBe('reframe trailer');
+  });
+
+  it('does not lift on a trailer naming something the commit never declares', () => {
+    const payload = fixture('toctou-class');
+    payload.sources = { ...payload.sources, 'src/guard.ts': 'export function guardEveryWrite() {}\n' };
+    payload.commits = [
+      {
+        sha: 'lll2222',
+        date: AFTER,
+        message: 'fix: claim without a diff\n\nReframe: race enforced in someOtherPlace\n',
+        files: ['src/guard.ts'],
+      },
+    ];
+    expect(gate(payload).status).toBe(3);
   });
 
   it('does not gate a class whose only shared import is a Node internal', () => {

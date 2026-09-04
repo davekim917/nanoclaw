@@ -116,14 +116,27 @@ either:
 - a commit message carrying `Reframe: <invariant> enforced in <primitive>`.
   Naming the primitive is enough while it belongs to one flagged class; when
   two do — a race *and* a durability defect at the same write — the trailer
-  must name the invariant it fixed, or it would clear both.
+  must name the invariant it fixed, or it would clear both. The primitive does
+  **not** have to be one the classifier guessed: any name your commit actually
+  declares counts, because the candidates are a ranking and you have the diff.
+  A name nothing in the commit declares does not count.
 
 A commit that touches one more call site lifts nothing, which is the point.
 
-Two rounds counted are not gated. A class whose sites share **no** seam is
-reported in the table and never gated: there is no primitive to move the check
-into, so neither a diff nor a trailer could lift it and the override would be
-the only way out. Read that row yourself — it usually means the findings were
+Two rounds counted are not gated. Neither is a class whose seam the classifier
+cannot **substantiate** — it is reported in the table and left alone. That
+covers two cases:
+
+- **No seam at all.** The sites share no import, so there is no primitive to
+  move the check into.
+- **A guessed seam.** All the findings landed on one file, so there was no
+  shared import to measure and the seam is whichever of that file's imports
+  ranked first. Unless the findings name something that module exports, the
+  ranking had no evidence behind it.
+
+Both would refuse with a primitive your fix has no reason to touch, leaving the
+override as the only way out — the failure this gate exists to prevent, arrived
+at by the gate. Read those rows yourself: they usually mean the findings were
 merged too coarsely, or the sites genuinely need splitting.
 
 `REVIEW_LOOP_ALLOW_SITE_PATCH=1` overrides the refusal. It prints the override

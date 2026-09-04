@@ -338,9 +338,15 @@ export function seamFor(files, findingText, ctx) {
   // A module nothing shares is not a seam. One flagged file is the exception:
   // its own imports are the only candidates there are.
   const top = scored.find((s) => s.fileCount >= 2 || files.length === 1);
-  if (!top) return { seam: null, seamInRepo: false, primitives: [] };
+  if (!top) return { seam: null, seamInRepo: false, substantiated: false, primitives: [] };
   const primitives = (top.mentioned.length > 0 ? top.mentioned : top.names).slice(0, 3);
-  return { seam: top.spec, seamInRepo: top.inRepo, primitives };
+  // Whether the ranking actually had evidence, as opposed to picking the
+  // best-ranked import of a single file. Two or more flagged files sharing the
+  // module IS the evidence; with one file the only evidence left is that the
+  // findings name something the module exports. Neither, and the seam is a
+  // guess — reported, never gated. See decideGate.
+  const substantiated = top.fileCount >= 2 || top.mentioned.length > 0;
+  return { seam: top.spec, seamInRepo: top.inRepo, substantiated, primitives };
 }
 
 // ── classification ──────────────────────────────────────────────────────────
@@ -404,6 +410,7 @@ function buildClass(signature, group, derived) {
     signature,
     seam: derived.seam,
     seamInRepo: derived.seamInRepo,
+    seamSubstantiated: derived.substantiated,
     primitives: derived.primitives,
     rounds: rounds.length,
     roundIds: rounds,
@@ -453,7 +460,12 @@ export function classify(payload) {
         // Nothing shared: one seamless class holding the rest. It is reported
         // and never gated — see decideGate.
         built.push({
-          cls: buildClass(signature, remaining, { seam: null, seamInRepo: false, primitives: [] }),
+          cls: buildClass(signature, remaining, {
+            seam: null,
+            seamInRepo: false,
+            substantiated: false,
+            primitives: [],
+          }),
           group: remaining,
         });
         break;
@@ -483,6 +495,7 @@ export function classify(payload) {
       return {
         seam,
         seamInRepo: entries[0].cls.seamInRepo,
+        seamSubstantiated: entries.some((e) => e.cls.seamSubstantiated),
         rounds: rounds.length,
         findings: group.length,
         lastAt: lastAt(group),
@@ -514,10 +527,39 @@ export const CLASS_ROUND_LIMIT = 3;
  */
 const REFRAME_TRAILER = /^\s*Reframe:\s*(.+?)\s+enforced in\s+(.+?)\s*$/gim;
 
-/** Does the trailer name this entry's primitive (or its seam module)? */
-function primitiveNamed(entry, trailer) {
+/**
+ * Does the trailer name this entry's primitive?
+ *
+ * The classifier's candidates come first, but they are a ranking, not a fact:
+ * it can name the wrong export of the right file, or the right file's neighbour.
+ * So a trailer also counts when the commit DECLARES what it names — the author
+ * saying "the invariant now lives here", with the diff to back it. That keeps
+ * an honest reframe from being refused over the classifier's guess, and it is
+ * not a free pass: the name has to be declared in a file the commit touched.
+ */
+function primitiveNamed(entry, trailer, changedFiles, ctx) {
   if (entry.primitives.some((p) => trailer.primitive.includes(p))) return true;
-  return Boolean(entry.seam) && trailer.primitive.includes(path.posix.basename(entry.seam).replace(/\.[jt]sx?$/, ''));
+  if (entry.seam && trailer.primitive.includes(path.posix.basename(entry.seam).replace(/\.[jt]sx?$/, ''))) {
+    return true;
+  }
+  return declaredInChangedFiles(trailer.primitive, changedFiles, ctx);
+}
+
+/** Is any identifier the trailer names declared in a file the commit touched? */
+function declaredInChangedFiles(named, changedFiles, ctx) {
+  const identifiers = (named.match(/[A-Za-z_$][\w$]*/g) ?? []).filter((word) => word.length > 3);
+  if (identifiers.length === 0) return false;
+  for (const file of changedFiles) {
+    const source = readSource(file, ctx);
+    if (source == null) continue;
+    for (const id of identifiers) {
+      const declaration = new RegExp(
+        `\\b(?:function|class|const|let|var|interface|type|enum)\\s+${id}\\b|\\b${id}\\s*[:=]\\s*(?:async\\s*)?\\(`,
+      );
+      if (declaration.test(source)) return true;
+    }
+  }
+  return false;
 }
 
 /** Does the trailer name this entry's invariant? */
@@ -570,26 +612,36 @@ function reframeTrailers(messages) {
  */
 export function decideGate(payload, options = {}) {
   const report = classify(payload);
+  const ctx = { repoRoot: payload.repoRoot, sources: payload.sources };
   const commits = payload.commits ?? [];
   const worktree = payload.worktree ?? [];
 
   const flagged = [];
   for (const c of report.classes) {
-    // A class whose sites share no seam is reported, never gated: there is no
-    // primitive to move the check into, so neither a diff nor a trailer could
-    // lift it and the override would be the only way past. That is a worse
-    // failure than missing it — the class table still shows the row.
-    if (c.rounds >= CLASS_ROUND_LIMIT && c.seam) {
+    // A class whose seam the classifier cannot substantiate is reported, never
+    // gated. With no seam there is no primitive to move the check into; with a
+    // GUESSED seam — one flagged file, and nothing in the findings naming what
+    // that module exports — the refusal names a primitive the fix has no reason
+    // to touch, so the only way past is the override. A gate that fires on an
+    // unfalsifiable seam drives people to the override, which is the failure it
+    // exists to prevent. The class table still shows the row either way.
+    if (c.rounds >= CLASS_ROUND_LIMIT && c.seam && c.seamSubstantiated) {
       flagged.push({ kind: 'class', ...c, reason: `${c.rounds} rounds on one finding class` });
     }
   }
   for (const s of report.seams) {
-    if (s.rounds >= CLASS_ROUND_LIMIT && !s.severityFalling && !flagged.some((f) => f.seam === s.seam)) {
+    if (
+      s.rounds >= CLASS_ROUND_LIMIT &&
+      s.seamSubstantiated &&
+      !s.severityFalling &&
+      !flagged.some((f) => f.seam === s.seam)
+    ) {
       flagged.push({
         kind: 'seam',
         key: `seam ${s.seam}`,
         seam: s.seam,
         seamInRepo: s.seamInRepo,
+        seamSubstantiated: s.seamSubstantiated,
         primitives: s.primitives,
         rounds: s.rounds,
         findings: s.findings,
@@ -618,7 +670,9 @@ export function decideGate(payload, options = {}) {
         other !== entry &&
         ((entry.seam && other.seam === entry.seam) || other.primitives.some((p) => entry.primitives.includes(p))),
     );
-    const named = trailers.filter((t) => primitiveNamed(entry, t) && (!shared || invariantNamed(entry, t)));
+    const named = trailers.filter(
+      (t) => primitiveNamed(entry, t, changed, ctx) && (!shared || invariantNamed(entry, t)),
+    );
     const touched = touches(changed, entry.seam, entry.seamInRepo);
     return {
       ...entry,
