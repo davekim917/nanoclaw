@@ -329,13 +329,24 @@ export function readArchiveScopeSignature(
  * against projections of 230-240 MB (#360).
  *
  * `messages_archive` is NOT append-only, which is why the v1 stamp took the
- * coarse route: `upsertStmt` in `src/message-archive.ts` carries
+ * coarse route: `ARCHIVE_UPSERT_SQL` in `src/message-archive.ts` carries
  * `ON CONFLICT(id) DO UPDATE SET text = excluded.text`, so re-archiving a
  * message id rewrites the row in place and moves neither `COUNT(*)` nor
- * `MAX(rowid)`. The `mutations` field closes exactly that hole: triggers on the
- * source count the updates and deletes that a watermark cannot see, per agent
- * group, and any change to that count forces a full rebuild. Appends — the
- * overwhelmingly common case — move only `count` and `maxRowid`.
+ * `MAX(rowid)`.
+ *
+ * Why the two fields TOGETHER are sound where a stat signature was needed
+ * before. That single upsert is the whole write side — held by
+ * `src/archive-write-path.test.ts` — so the archive can only ever gain a row,
+ * have a row rewritten, or (through nothing in the tree today) lose one.
+ * `count`/`maxRowid` see the first. `mutations` — a per-agent-group counter the
+ * `archive_row_marks` triggers increment on any content-changing UPDATE and on
+ * any DELETE — sees the other two. Between them they see everything that write
+ * path can do, which is what lets the stamp stop watching the file itself and
+ * start watching only this scope's rows.
+ *
+ * Only a pure append reuses the projection incrementally; anything the marks
+ * counter reports forces a full rebuild, because the dedup identity includes
+ * `text` and an edited row cannot be located in the projection to replace.
  *
  * `PRAGMA data_version` is no help here: SQLite only guarantees it meaningful
  * within one connection, and every spawn opens a fresh one.

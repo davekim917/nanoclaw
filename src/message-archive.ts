@@ -209,7 +209,38 @@ function initSchema(db: Database.Database): void {
       VALUES (new.rowid, new.text, new.sender_name);
     END;
   `);
+  ensureArchiveRowMarks(db);
+}
+
+/**
+ * Create `archive_row_marks` and its triggers, and say so ONCE.
+ *
+ * The archive projection's freshness stamp fails closed while these are
+ * absent — every spawn rebuilds, which is the pre-#360 behavior — so an
+ * operator upgrading a live install needs to see the moment they appear. The
+ * existence check reads `sqlite_master` rather than trusting the silence of
+ * `IF NOT EXISTS`, which cannot tell "created" from "already there", and it
+ * checks the triggers as well as the table so a partially-applied schema is
+ * still reported.
+ */
+function ensureArchiveRowMarks(db: Database.Database): void {
+  const present = new Set(
+    (
+      db
+        .prepare(
+          `SELECT name FROM sqlite_master
+            WHERE name IN ('archive_row_marks', 'messages_archive_mark_update', 'messages_archive_mark_delete')`,
+        )
+        .all() as Array<{ name: string }>
+    ).map((row) => row.name),
+  );
+  if (present.size === 3) {
+    db.exec(ARCHIVE_MUTATION_MARKS_SQL);
+    return;
+  }
+  const startedAt = Date.now();
   db.exec(ARCHIVE_MUTATION_MARKS_SQL);
+  log.info('Archive row-marks schema created', { ms: Date.now() - startedAt });
 }
 
 export interface ArchiveMessage {
@@ -227,17 +258,29 @@ export interface ArchiveMessage {
   sentAt: string;
 }
 
-const upsertStmt = () =>
-  openDb().prepare(
-    `INSERT INTO messages_archive
+/**
+ * The ONLY statement in the host that writes `messages_archive`.
+ *
+ * Exported so tests can exercise the real thing rather than a hand-copied
+ * lookalike, and so `src/archive-write-path.test.ts` can hold the invariant
+ * that no second write path appears: the `archive_row_marks` triggers above,
+ * and therefore the archive projection's freshness stamp, are correct only
+ * because every mutation the archive can undergo goes through here.
+ *
+ * Note the `DO UPDATE`: this is an upsert, not an append. Re-archiving a
+ * message id rewrites the row in place, which is exactly what the marks
+ * triggers exist to count.
+ */
+export const ARCHIVE_UPSERT_SQL = `INSERT INTO messages_archive
        (id, agent_group_id, messaging_group_id, channel_type, channel_name, platform_id, thread_id, role, sender_id, sender_name, text, sent_at)
      VALUES (@id, @agentGroupId, @messagingGroupId, @channelType, @channelName, @platformId, @threadId, @role, @senderId, @senderName, @text, @sentAt)
      ON CONFLICT(id) DO UPDATE SET
        text = excluded.text,
        sender_name = excluded.sender_name,
        channel_name = COALESCE(excluded.channel_name, channel_name)
-     WHERE excluded.text IS NOT NULL`,
-  );
+     WHERE excluded.text IS NOT NULL`;
+
+const upsertStmt = () => openDb().prepare(ARCHIVE_UPSERT_SQL);
 
 export function upsertArchiveMessage(msg: ArchiveMessage): void {
   if (!msg.text || msg.text.length === 0) return;
