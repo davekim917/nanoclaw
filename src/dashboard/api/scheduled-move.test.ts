@@ -78,10 +78,11 @@ function setupCentralDb(): void {
       -- the series' routing through resolveTaskSession.
       task_routing_platform_id TEXT,
       -- Migration 068: the host sweep's persisted quiet mark. Load-bearing —
-      -- both the compensation restore and scheduleTask end with a
-      -- touchSessionActivity call whose job is to null this column, and that
-      -- helper swallows its own errors, so without the column the invalidation
-      -- vanishes silently and every assertion below still passes.
+      -- both the compensation restore and scheduleTask wrap their write in
+      -- withQuietInvalidationSync, which nulls this column in the same
+      -- statement that moves last_active. Without the column that UPDATE
+      -- throws, and the helper is fail-closed, so the write it guards does not
+      -- happen at all.
       sweep_quiet_until TEXT
     );
     CREATE INDEX idx_sessions_agent_group ON sessions(agent_group_id);

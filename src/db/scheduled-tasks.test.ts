@@ -155,11 +155,12 @@ function setupCentralDb(): void {
       -- the task session so the console can place the task in its channel.
       task_routing_platform_id TEXT,
       -- Migration 068: the host sweep's persisted quiet mark. Load-bearing in
-      -- this fixture, not scenery — scheduleTask ends with a
-      -- touchSessionActivity call whose whole job is to null this column, and
-      -- that helper swallows its own errors by design. Without the column the
-      -- call throws into the swallow and every assertion below stays green with
-      -- the invalidation silently gone (Codex round 2, L1).
+      -- this fixture, not scenery — scheduleTask's write runs inside
+      -- withQuietInvalidationSync, whose whole job is to null this column in the
+      -- same statement that moves last_active. Without the column that UPDATE
+      -- throws, and since the helper is fail-closed the schedule aborts, so a
+      -- missing column here reads as a scheduling failure rather than as a
+      -- silently absent invalidation (Codex round 2, L1; round 3, H1).
       sweep_quiet_until TEXT
     );
     CREATE INDEX IF NOT EXISTS idx_sessions_agent_group ON sessions(agent_group_id);

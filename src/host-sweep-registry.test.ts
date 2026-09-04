@@ -1868,9 +1868,10 @@ describe('sweep duty registry (S2-PR2)', () => {
       h.sessions = [fakeSession('sess-restored')];
       h.mailbox = fakeMailbox({ getNextFutureProcessAfter: () => null });
 
-      // Stands in for recoverMoveIntents' restoreTaskRow + touchSessionActivity,
-      // and for scheduled-move's compensation: due work put back after the
-      // flush, and the central-DB touch that announces it.
+      // Stands in for recoverMoveIntents' restoreTaskRow inside
+      // withQuietInvalidationSync, and for scheduled-move's compensation: due
+      // work put back after the flush, and the central-DB write that announces
+      // it.
       let restored = false;
       registerSweepDuty({
         name: 'probe-restore',
@@ -1879,7 +1880,7 @@ describe('sweep duty registry (S2-PR2)', () => {
         run: () => {
           if (restored) return;
           restored = true;
-          // What touchSessionActivity does: move last_active, null the column.
+          // What withQuietInvalidationSync does: move last_active, null the column.
           h.sessions[0] = fakeSession('sess-restored', { last_active: '2026-04-20T14:30:00.000Z' });
           h.persistedQuiet.delete('sess-restored');
         },
