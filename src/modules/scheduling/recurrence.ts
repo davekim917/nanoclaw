@@ -158,12 +158,22 @@ export async function handleRecurrence(mailbox: NanoclawMailboxSession, session:
       // successor visible, and it happens in the same synchronous turn as the
       // arm.
       //
-      // Fail-closed twice over. If the invalidation throws — a central-DB error,
-      // or no ACTIVE session row, which is what a session closed under this tick
-      // looks like — the arm never happens and this row's `catch` below logs it.
-      // The predecessor keeps its recurrence, so the next tick retries rather
-      // than losing the series, and a successor is never armed into a session
-      // `getActiveSessions()` will not enumerate.
+      // Fail-closed: if the invalidation throws, the arm never happens and this
+      // row's `catch` below logs it — per row, so the rest of this session's
+      // recurrences still run and the duty itself does not fail. The two
+      // reasons it can throw do NOT have the same aftermath, and only one of
+      // them is a retry (Codex round 5):
+      //
+      //  - A transient central-DB error. The session is still ACTIVE, so it is
+      //    still enumerated, and the predecessor still carries its recurrence —
+      //    the next tick re-attempts the arm. Nothing is lost.
+      //  - No ACTIVE session row, which is what a session closed under this tick
+      //    looks like. There is no retry, and there must not be one: a closed
+      //    session is gone from `getActiveSessions()`, so no recurrence duty
+      //    will run for it again. The series stops here rather than arming a
+      //    successor into a session the sweep will never enumerate — invisible
+      //    work is the outcome this refusal exists to prevent, and a closed
+      //    session's schedule ending with it is the intended lifecycle.
       //
       // The mark this clears is flushed with `session.last_active` as its basis
       // — the value the driver read when it listed the tick's sessions, before
