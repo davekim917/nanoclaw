@@ -1057,6 +1057,62 @@ describe('test_scheduleTask_revalidates_the_session_after_the_await', () => {
   });
 
   /**
+   * The undo restores the WHOLE row, not the columns someone remembered.
+   *
+   * The first snapshot was a column list and it omitted `tries` and `trigger`.
+   * `restoreTaskRow` hardcodes both to 0 — right for its board-move caller, a
+   * row arriving in a new session; wrong for an undo, which put the row back
+   * with its retry count silently reset. A list is also a thing that goes stale
+   * the next time `messages_in` gains a column, with nothing failing loudly.
+   *
+   * So this pins the property rather than the two fields: everything except the
+   * documented exceptions comes back byte-identical, and the assertion is
+   * generated from the row itself, so a new column is covered the day it is
+   * added.
+   */
+  it('restores every column of the prior row, including tries and trigger', async () => {
+    const processAfter = new Date(Date.now() + 86400000).toISOString();
+    const base = {
+      agentGroupId: AGENT_GROUP_ID,
+      cron: '0 5 * * *',
+      processAfter,
+      seriesId: 's-whole-row',
+    };
+    await scheduleTask({ ...base, id: 't-wr-1', prompt: 'first', destination: TEST_DESTINATION });
+    const sessionId = taskSessionIdFor('s-whole-row');
+
+    // State a successful re-schedule would carry forward and the old snapshot
+    // silently dropped: a row that has already been attempted, and one the due
+    // sweep has already made wakeable.
+    {
+      const db = openInboundDb(inboundPath(sessionId));
+      db.prepare("UPDATE messages_in SET tries = 3, trigger = 1 WHERE id = 't-wr-1'").run();
+      db.close();
+    }
+
+    /** The whole row, minus the two documented exceptions. */
+    const wholeRow = (): Record<string, unknown> => {
+      const db = openInboundDb(inboundPath(sessionId));
+      const row = db.prepare("SELECT * FROM messages_in WHERE id = 't-wr-1'").get() as Record<string, unknown>;
+      db.close();
+      delete row.seq; // reallocated, exactly as a successful re-schedule does
+      return row;
+    };
+    const before = wholeRow();
+    expect(before.tries).toBe(3);
+    expect(before.trigger).toBe(1);
+
+    failsRoutingStamp.sessionId = sessionId;
+    await expect(
+      scheduleTask({ ...base, id: 't-wr-2', prompt: 'second', destination: TEST_DESTINATION }),
+    ).rejects.toThrow(/database is locked/);
+
+    // Every column, not a chosen few. A snapshot that drops a column fails here
+    // whether or not anyone remembered to assert on that column by name.
+    expect(wholeRow()).toEqual(before);
+  });
+
+  /**
    * A series can hold more than one live row, and the undo must touch only one.
    *
    * `ncl tasks run` inserts a `<series>-run` occurrence alongside the scheduled

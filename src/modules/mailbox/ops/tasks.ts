@@ -434,14 +434,24 @@ export function cancelSeriesWithStrandClear(db: Database.Database, taskId: strin
 }
 
 /**
- * A live series row plus its `timestamp`, which `TaskRowSnapshot` omits.
+ * The ENTIRE prior row, column for column, as `SELECT *` returned it.
  *
- * The board-move flow that owns `TaskRowSnapshot` re-inserts into a DIFFERENT
- * session, where a fresh timestamp is correct. A compensation puts a row back
- * where it was, so it has to carry the original.
+ * Deliberately NOT a named subset, and deliberately not `TaskRowSnapshot`. The
+ * first version of this was a column list, and it omitted `tries` and
+ * `trigger`: `restoreTaskRow` hardcodes both to 0, which is right for its
+ * board-move caller (a row arriving in a new session) and wrong for an undo,
+ * so a restored row came back with its retry count zeroed. A named list is also
+ * a list that goes stale the next time a column is added to `messages_in`, and
+ * nothing fails loudly when it does.
+ *
+ * So the shape is open on purpose: whatever columns the table has, the snapshot
+ * has, and `restoreTaskSeries` writes all of them back. `id` and `series_id`
+ * are named only because the restore reasons about them explicitly.
  */
-export interface TaskSeriesSnapshot extends TaskRowSnapshot {
-  timestamp: string;
+export interface TaskSeriesSnapshot {
+  id: string;
+  series_id: string;
+  [column: string]: unknown;
 }
 
 /**
@@ -489,8 +499,9 @@ export interface UpsertedTaskSeries {
  *     compensated row therefore sits inert with no recall, which is exactly
  *     where a normal re-schedule leaves it.
  *
- * What DOES come back exactly is everything a caller or the dashboard reads:
- * the row id, series identity, status, due time, recurrence, content and route.
+ * EVERY OTHER COLUMN comes back exactly, including ones nobody thought to name
+ * — `tries`, `trigger`, `timestamp` — because the restore is built from the
+ * snapshot's own keys rather than from a list written here.
  */
 export function restoreTaskSeries(db: Database.Database, touchedId: string, prior: TaskSeriesSnapshot | null): void {
   db.transaction(() => {
@@ -500,12 +511,23 @@ export function restoreTaskSeries(db: Database.Database, touchedId: string, prio
     db.prepare("DELETE FROM messages_in WHERE id = ? AND kind = 'system'").run(`recall-${touchedId}`);
     db.prepare('DELETE FROM messages_in WHERE id = ?').run(touchedId);
     if (!prior) return;
-    restoreTaskRow(db, prior);
-    // `restoreTaskRow` stamps `new Date()`, which is right for its board-move
-    // caller (a row arriving in a new session) and wrong here (a row going back
-    // to what it was). The upsert's update branch never touches `timestamp`, so
-    // a successful re-schedule preserves it and this must too.
-    db.prepare('UPDATE messages_in SET timestamp = ? WHERE id = ?').run(prior.timestamp, prior.id);
+    // EVERY column the snapshot carries, written back by name FROM THE SNAPSHOT
+    // ITSELF. Not `restoreTaskRow`: that is the board-move insert, which names
+    // its columns and hardcodes `tries` and `trigger` to 0 — correct for a row
+    // arriving in a new session, wrong for a row going back to what it was.
+    // Building the statement from the row's own keys is what makes a column
+    // added to `messages_in` tomorrow restore correctly with no edit here.
+    //
+    // `seq` is the single exception, and it is reallocated rather than
+    // restored: a successful re-schedule allocates a fresh one too, so this is
+    // a value the row reaches normally.
+    const columns = Object.keys(prior).filter((column) => column !== 'seq');
+    const values: Record<string, unknown> = { seq: nextEvenSeq(db) };
+    for (const column of columns) values[column] = prior[column];
+    db.prepare(
+      `INSERT INTO messages_in (seq, ${columns.join(', ')})
+       VALUES (@seq, ${columns.map((column) => `@${column}`).join(', ')})`,
+    ).run(values);
   })();
 }
 
@@ -535,19 +557,19 @@ export function upsertTaskSeries(
 ): UpsertedTaskSeries {
   return db
     .transaction((): UpsertedTaskSeries => {
-      // The full row, not just its id, and selected ONCE. `scheduleTask` has to
-      // be able to undo this write when its central-DB companion fails, and the
-      // only place that knows WHICH live row was chosen is here. A caller
-      // re-running this SELECT could land on a different row when the series has
-      // more than one live occurrence (`ncl tasks run` creates exactly that), and
-      // would then restore a row this never overwrote.
+      // The WHOLE row, and selected ONCE. `scheduleTask` has to be able to undo
+      // this write when its central-DB companion fails, and the only place that
+      // knows WHICH live row was chosen is here. A caller re-running this SELECT
+      // could land on a different row when the series has more than one live
+      // occurrence (`ncl tasks run` creates exactly that), and would then
+      // restore a row this never overwrote.
+      //
+      // `SELECT *`, not a column list: a named list silently drops whatever it
+      // forgets, which is how `tries` and `trigger` were lost from the first
+      // version of this snapshot, and it goes stale the next time a column is
+      // added to `messages_in`.
       const activeRow = db
-        .prepare(
-          `SELECT id, series_id, status, process_after, recurrence, content,
-                platform_id, channel_type, thread_id, kind, timestamp
-           FROM messages_in
-          WHERE series_id = ? AND status IN ('pending', 'paused')`,
-        )
+        .prepare("SELECT * FROM messages_in WHERE series_id = ? AND status IN ('pending', 'paused')")
         .get(row.seriesId) as TaskSeriesSnapshot | undefined;
 
       if (activeRow) {
