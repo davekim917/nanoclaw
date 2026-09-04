@@ -50,6 +50,9 @@ import {
   _detachedWakeCountForTesting,
   _resetDetachedWakesForTesting,
 } from './index.js';
+// The post-kill follow-up chain is started from `killContainer`'s `onExit` and
+// therefore outlives the tick (Codex final); this is how a case waits for it.
+import { _settlePostKillForTesting } from '../sweep-container-health/index.js';
 // Importing the module registers S6/S7/S8/S9a/S9b/S15/S10 as a duty source —
 // needed so the registry lookups below and `_sweepSessionForTesting` (F-13.2,
 // F-13.4) see the real duties rather than the driver's remaining set.
@@ -1137,6 +1140,12 @@ describe('S2-PR13 — continuation and ceiling accountability, through the regis
       });
       await s9a.run(sessionCtx(mailbox, plan));
       await s9b.run(sessionCtx(mailbox, plan));
+      // One simulated TICK per call, and S9b keeps at most one detached
+      // follow-up per session (#359). Every call here reuses 'sess-test', so
+      // without settling the previous one the next tick is suppressed as a
+      // duplicate — which is correct in production, where ticks are 60 s apart,
+      // and an artefact here.
+      await _settleDetachedWakesForTesting();
       return { outDb, before, mailbox, plan };
     }
 
@@ -1282,7 +1291,7 @@ describe('S2-PR13 — continuation and ceiling accountability, through the regis
     // The discriminator for "notify AFTER the kill": count the outbound notices
     // that exist at the moment killContainer is called.
     let outboundAtKill = -1;
-    mockKillContainer.mockImplementation(() => {
+    mockKillContainer.mockImplementation((_id: string, _reason: string, onExit?: () => void) => {
       const h = new Database(outboundPath, { readonly: true });
       outboundAtKill = (h.prepare('SELECT COUNT(*) AS c FROM messages_out').get() as { c: number }).c;
       h.close();
@@ -1292,12 +1301,18 @@ describe('S2-PR13 — continuation and ceiling accountability, through the regis
       // case has its own two cases in the container-health suite (mailbox seam
       // PR 5 round 8, 3b6cbb5f).
       mockIsContainerRunning.mockReturnValue(false);
+      // …and the child's `close` is what carries the follow-up chain now
+      // (Codex final): the kill only requests the stop, so without firing this
+      // the notify/reset/follow-up assertions below have nothing to observe.
+      onExit?.();
     });
 
     await _sweepSessionForTesting(session);
+    await _settlePostKillForTesting();
 
     // 1. kill
-    expect(mockKillContainer).toHaveBeenCalledWith('sess-ceiling', 'absolute-ceiling');
+    // Three arguments now: the post-kill chain rides on `onExit` (Codex final).
+    expect(mockKillContainer).toHaveBeenCalledWith('sess-ceiling', 'absolute-ceiling', expect.any(Function));
     // 2. notify — written only after the kill returned, and only because the
     //    claim count was snapshotted in the observe session BEFORE the reset
     //    below cleared it. A post-kill read would have seen 0 claims and

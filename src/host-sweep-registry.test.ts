@@ -1317,6 +1317,7 @@ describe('sweep duty registry (S2-PR2)', () => {
       // shared context + error rule
       'asSessionContext',
       'SweepWindowAbort',
+      'dutyFailureFields',
       // driver + its tick constants
       'startHostSweep',
       'stopHostSweep',
@@ -2241,9 +2242,12 @@ describe('sweep duty registry (S2-PR2)', () => {
     expect(seen).toEqual(['probe-210', 'probe-220', 'probe-230']);
     // One session for all of them...
     expect(new Set(openCountAtRun).size).toBe(1);
-    // ...and it was opened strictly AFTER killContainer returned: the open
-    // count when the follow-ups ran is exactly one more than at the kill.
-    expect(openCountAtRun[0]).toBe(h.opensAtKill[0]! + 1);
+    // ...and it was opened strictly AFTER the kill. Not "exactly one more" any
+    // more: the chain is started from the container's own exit (Codex final),
+    // so it can land after the tick's own `session:tail` window has opened and
+    // closed. The property that matters — the follow-ups never share the
+    // pre-kill session — is what this asserts.
+    expect(openCountAtRun[0]).toBeGreaterThan(h.opensAtKill[0]!);
     expect(h.spawns).toEqual([]);
   });
 

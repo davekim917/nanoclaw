@@ -569,7 +569,17 @@ function tagDutyFailure(err: unknown, duty: string, window: SweepWindow): unknow
 }
 
 /** The `duty`/`window` fields for whichever body threw, or nothing. */
-function dutyFailureFields(err: unknown): { duty?: string; window?: SweepWindow } {
+/**
+ * The duty and window a tagged failure carries, or `{}` for an untagged one.
+ *
+ * Exported for one caller: the post-kill follow-up chain, which the container
+ * exit now drives (Codex final). That chain outlives the tick, so its failures
+ * no longer reach the per-session catch below that classifies them — and a
+ * follow-up that throws must still be reported as 'Host sweep duty failed' with
+ * the duty and window the tag names, not flattened into a generic message.
+ * Error-rule surface, the same category as `SweepWindowAbort`.
+ */
+export function dutyFailureFields(err: unknown): { duty?: string; window?: SweepWindow } {
   if (err === null || typeof err !== 'object' || !(SWEEP_DUTY_TAG in err)) return {};
   const tag = (err as Record<symbol, SweepDutyTag>)[SWEEP_DUTY_TAG];
   return { duty: tag.duty, window: tag.window };

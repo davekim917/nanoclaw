@@ -48,6 +48,7 @@ import {
   registerSweepDuty,
   registerSweepDutySource,
   runSlaObservationHooks,
+  dutyFailureFields,
   runSweepKillFollowUps,
   writeOutboundWhenStopped,
   writeSystemWake,
@@ -534,7 +535,15 @@ const postKillChains = new Set<Promise<void>>();
 function trackPostKill(work: Promise<void>, sessionId: string): void {
   const tracked = work
     .catch((err: unknown) => {
-      log.warn('Post-kill follow-up chain failed', { sessionId, err });
+      // Classification survives the detach. A follow-up that throws is tagged
+      // with its duty and window by `runDutyBody`, and the per-session catch in
+      // the driver is what normally turns that tag into 'Host sweep duty
+      // failed' — but this chain outlives the tick, so that catch never sees
+      // it. Reported here in the same shape, on the same field pair every
+      // post-deploy check filters on.
+      const fields = dutyFailureFields(err);
+      if (fields.duty) log.error('Host sweep duty failed', { err, sessionId, ...fields });
+      else log.warn('Post-kill follow-up chain failed', { sessionId, err });
     })
     .finally(() => {
       postKillChains.delete(tracked);
