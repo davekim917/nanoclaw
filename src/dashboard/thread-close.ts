@@ -58,8 +58,12 @@ import { getDb } from '../db/index.js';
 import { archiveSessionById, touchSessionActivity } from '../db/sessions.js';
 import { guard } from '../guard/index.js';
 import { log } from '../log.js';
-import { CLOSE_REASON_MAX_CHARS, type DoneProposal } from '../modules/mailbox/index.js';
-import { withExistingNanoclawOutbound, withExistingNanoclawOutboundSync } from '../modules/mailbox/session.js';
+import {
+  CLOSE_REASON_MAX_CHARS,
+  withExistingNanoclawOutbound,
+  withExistingNanoclawOutboundSync,
+  type DoneProposal,
+} from '../modules/mailbox/index.js';
 import { hasAdminPrivilege } from '../modules/permissions/db/user-roles.js';
 import { withExistingMailboxSession } from '../session-manager.js';
 import { requiredConfirmations, threadsClose, type ThreadClosePayload } from './thread-close-guard.js';

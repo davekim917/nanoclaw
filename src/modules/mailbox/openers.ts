@@ -135,7 +135,7 @@ export function sessionDbPathIsGone(dbPath: string): boolean {
  * Reading one row of `sqlite_master` touches the same header, and it is closer
  * to what callers actually do with the handle anyway.
  */
-function assertQueryable(db: Database.Database, dbPath: string): void {
+export function assertQueryable(db: Database.Database, dbPath: string): void {
   try {
     db.prepare('SELECT 1 FROM sqlite_master LIMIT 1').get();
   } catch (err) {

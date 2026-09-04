@@ -72,11 +72,11 @@ const RAW_OPENER_NAMES = [
   'outboundDbPath',
   'getInboundDb',
   'getOutboundDb',
-  // The mailbox module's two transitional handle accessors. A caller that has
-  // moved onto withMailboxSession but still hands the open handle to a helper
-  // owned by a later PR of this series has not finished migrating — counting
-  // them here is what keeps that honest, so such a file stays on the allowlist
-  // instead of appearing clean. PR 7 deletes the accessors and these entries.
+  // The mailbox module's two transitional handle accessors. PR 7 deleted them,
+  // and these entries stay as the tripwire: a caller that moves onto
+  // withMailboxSession but then hands the open handle to a helper has not
+  // finished migrating, and reintroducing an accessor under either name would
+  // make that file an offender again rather than let it pass clean.
   'legacyInboundHandle',
   'legacyOutboundHandle',
 ];
@@ -116,6 +116,24 @@ function listTsFiles(root: string): string[] {
 /** Naive comment strip — good enough for an allowlist scan, not a compiler. */
 function stripComments(src: string): string {
   return src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:])\/\/.*$/gm, '$1');
+}
+
+/**
+ * The same strip, but LENGTH-PRESERVING: every comment character becomes a
+ * space and every newline survives, so an offset into the result is an offset
+ * into the original.
+ *
+ * `stripComments` deletes, which shifts every offset after the first comment —
+ * fine for the boolean pattern checks that consume it, wrong for any rule that
+ * reports a line number. The two exist side by side rather than merged because
+ * deleting also JOINS the text either side of a comment, and patterns (a)-(d)
+ * were reviewed against that behaviour.
+ */
+function blankComments(src: string): string {
+  const blank = (match: string): string => match.replace(/[^\n]/g, ' ');
+  return src
+    .replace(/\/\*[\s\S]*?\*\//g, blank)
+    .replace(/(^|[^:])(\/\/.*)$/gm, (_m, head, comment) => head + blank(comment));
 }
 
 function matchesPatternA(src: string): boolean {
@@ -184,4 +202,197 @@ export function computeOffenders(): OffenderMatch[] {
     }
   }
   return offenders.sort((x, y) => x.file.localeCompare(y.file));
+}
+
+/* ─── Inbound-keyed sessions doing outbound-only work ──────────────────────── */
+
+/**
+ * A `withMailboxSession` / `withExistingMailboxSession` action whose body uses
+ * ONLY outbound-side ops.
+ *
+ * The mailbox session's existence check is keyed on inbound.db. An action that
+ * needs nothing from inbound.db but is wrapped in one therefore answers
+ * `undefined` for a real cohort — a session whose inbound.db is gone while
+ * outbound.db remains — and the caller reports outbound state as empty when it
+ * is not. That is not hypothetical: it is the bug the usage rollup carried
+ * (fixed by reading through the outbound funnel) and the one
+ * `thread-close.ts`'s done-proposal read carried.
+ *
+ * The fix for a flagged site is `withExistingNanoclawOutbound`, the
+ * outbound-keyed funnel, which asks an outbound-only existence question.
+ *
+ * Heuristic by construction, and deliberately conservative in the safe
+ * direction: an action mentioning even one inbound-side op is not reported, and
+ * an op this scanner cannot classify counts as inbound (see op-sides.ts). So it
+ * under-reports rather than crying wolf.
+ */
+export interface OutboundOnlySessionMatch {
+  file: string;
+  line: number;
+  ops: string[];
+}
+
+const SESSION_OPENERS = ['withMailboxSession', 'withExistingMailboxSession'];
+
+interface CallSite {
+  /** The callee's name. */
+  name: string;
+  /** Offset of the callee name in `src`. */
+  index: number;
+  /** Offset of the closing paren, so one call's span can contain another's. */
+  end: number;
+  /** Everything between the parens — the arguments, action callback included. */
+  body: string;
+}
+
+/** Every call to a function whose name matches `namePattern`, with its span. */
+function callSites(src: string, namePattern: string): CallSite[] {
+  const out: CallSite[] = [];
+  const re = new RegExp(`\\b(${namePattern})\\s*\\(`, 'g');
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(src))) {
+    const open = m.index + m[0].length - 1;
+    let depth = 0;
+    for (let i = open; i < src.length; i++) {
+      if (src[i] === '(') depth++;
+      else if (src[i] === ')') {
+        depth--;
+        if (depth === 0) {
+          out.push({ name: m[1], index: m.index, end: i, body: src.slice(open + 1, i) });
+          break;
+        }
+      }
+    }
+  }
+  return out;
+}
+
+/** The action body of one session call, found by balancing from its open paren. */
+function sessionCallBodies(src: string): Array<{ index: number; body: string }> {
+  return callSites(src, `(?:${SESSION_OPENERS.join('|')})`).map(({ index, body }) => ({ index, body }));
+}
+
+/**
+ * Every inbound-keyed session call in `roots` whose action uses only
+ * outbound-side ops. `outboundOps` is injected so a test can drive the checker
+ * over a string without touching the real module.
+ */
+export function findOutboundOnlySessions(
+  sources: Array<{ file: string; src: string }>,
+  sides: { inbound: ReadonlySet<string>; outbound: ReadonlySet<string> },
+): OutboundOnlySessionMatch[] {
+  const found: OutboundOnlySessionMatch[] = [];
+  for (const { file, src } of sources) {
+    // Length-preserving, so the reported line is the line in the real file.
+    // `stripComments` DELETES, which shifts every offset after the first
+    // comment: a call under a three-line block comment was reported three
+    // lines early. The sibling write rule below already uses this one.
+    const stripped = blankComments(src);
+    for (const { index, body } of sessionCallBodies(stripped)) {
+      // Ops invoked on whatever the action named its parameter. Matching
+      // `<ident>.<op>(` rather than a fixed `mailbox.` keeps it working for the
+      // handful of sites that name it something else.
+      const ops = [...body.matchAll(/\b[A-Za-z_$][\w$]*\.([A-Za-z_$][\w$]*)\s*\(/g)].map((x) => x[1]);
+      // BOTH sides, or a mixed action reads as outbound-only: filtering the
+      // inbound ops out before the `every` below made the check vacuously true
+      // for exactly the actions it must not flag.
+      const sessionOps = ops.filter((op) => sides.outbound.has(op) || sides.inbound.has(op));
+      if (sessionOps.length === 0) continue;
+      if (!sessionOps.every((op) => sides.outbound.has(op))) continue;
+      found.push({
+        file,
+        line: stripped.slice(0, index).split('\n').length,
+        ops: [...new Set(sessionOps)],
+      });
+    }
+  }
+  return found;
+}
+
+/** Non-test host sources, for the check above. */
+export function hostSourcesForOutboundScan(): Array<{ file: string; src: string }> {
+  return listTsFiles('src').map((file) => ({ file, src: fs.readFileSync(path.join(REPO_ROOT, file), 'utf8') }));
+}
+
+/* ─── Host outbound writes outside the stopped-container guard ─────────────── */
+
+/**
+ * The one sanctioned way for the host to write a session's `outbound.db`.
+ *
+ * `outbound.db` has a single writer. The host may write it only while no
+ * container owns the session, and the check has to sit INSIDE the session and
+ * immediately before the mutation, with no await between the two: opening a
+ * mailbox session is a yield, and a wake landing in that gap starts a container
+ * that now owns the file. `withStoppedContainerSession` (src/host-sweep.ts) is
+ * that shape — it re-checks `containerOwnsOutbound()` inside the session and
+ * resolves `undefined` when a container took it.
+ */
+export const OUTBOUND_WRITE_GUARD = 'withStoppedContainerSession';
+
+/**
+ * A host-side session action that MUTATES `outbound.db` without that guard.
+ *
+ * This is a structural close on a defect class rather than a lint: four
+ * separate review rounds found instances of it by reading, and reading is not
+ * a repeatable check. Each instance costs the same way — the write lands on a
+ * file a live container owns, deleting the fresh runner's processing claim,
+ * pushing its continuation back to `queued`, or contending for the write lock.
+ *
+ * Reach, stated plainly so the residue is not mistaken for coverage: the check
+ * is LEXICAL, and it is about writes made through the MAILBOX SESSION. It does
+ * NOT see:
+ *
+ *  - a write reached through a `SessionRunner`-style callback parameter, or
+ *    one made by a helper the action calls, because the op name is not in the
+ *    body it scans. Those sites carry the ownership check inline instead.
+ *  - a write made through `withExistingNanoclawOutbound`, the outbound funnel,
+ *    which is not a `with*Session` call. Those writes (the router's two
+ *    notices, thread-close's force-clear) are a separate class made
+ *    deliberately while a container may be running; this guard is not their
+ *    remedy.
+ *
+ * All of them are outside this rule, none of them are exempt from the
+ * property.
+ */
+export interface OutboundWriteMatch {
+  file: string;
+  line: number;
+  /** The session opener the action was passed to. */
+  opener: string;
+  ops: string[];
+}
+
+/**
+ * Every host-side session action that writes `outbound.db` outside the guard.
+ *
+ * `writeOps` is injected (from `outboundWriteOps()`) so a test can drive the
+ * checker over a fixture string without touching the real module.
+ */
+export function findUnguardedOutboundWrites(
+  sources: Array<{ file: string; src: string }>,
+  writeOps: ReadonlySet<string>,
+): OutboundWriteMatch[] {
+  const found: OutboundWriteMatch[] = [];
+  for (const { file, src } of sources) {
+    // Length-preserving, so the reported line is the line in the real file.
+    const stripped = blankComments(src);
+    // Spans of every guarded session, so a write nested inside one is exempt
+    // however deeply it is wrapped.
+    const guarded = callSites(stripped, OUTBOUND_WRITE_GUARD).map((c) => ({ from: c.index, to: c.end }));
+    for (const call of callSites(stripped, 'with[A-Za-z0-9_$]*Session')) {
+      if (call.name === OUTBOUND_WRITE_GUARD) continue;
+      if (guarded.some((g) => call.index > g.from && call.index < g.to)) continue;
+      const ops = [...call.body.matchAll(/\b[A-Za-z_$][\w$]*\.([A-Za-z_$][\w$]*)\s*\(/g)]
+        .map((x) => x[1])
+        .filter((op) => writeOps.has(op));
+      if (ops.length === 0) continue;
+      found.push({
+        file,
+        line: stripped.slice(0, call.index).split('\n').length,
+        opener: call.name,
+        ops: [...new Set(ops)],
+      });
+    }
+  }
+  return found;
 }

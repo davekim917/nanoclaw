@@ -6,9 +6,21 @@ import { getDb } from '../../db/connection.js';
 import { createAgentGroup } from '../../db/agent-groups.js';
 import { createMessagingGroup } from '../../db/messaging-groups.js';
 import { createSession, getSession } from '../../db/sessions.js';
-import { initSessionFolder, openInboundDb } from '../../session-manager.js';
+import { initSessionFolder } from '../../session-manager.js';
+import type Database from 'better-sqlite3';
+
+import { openInboundDb as openInboundDbAt } from '../../modules/mailbox/openers.js';
+import { inboundDbPath } from '../../mailbox/sqlite/paths.js';
 import { getDeliveryAction } from '../../delivery.js';
 import './index.js';
+
+// `session-manager`'s ids-addressed inbound opener went away with the mailbox
+// seam's raw wrappers (PR 7). Production code opens sessions through the seam;
+// this fixture still wants a plain handle on a named session's file, which is
+// the module's own path-addressed funnel plus the layout helper.
+function openInboundDb(agentGroupId: string, sessionId: string): Database.Database {
+  return openInboundDbAt(inboundDbPath(agentGroupId, sessionId));
+}
 
 const mocks = vi.hoisted(() => ({
   deliver: vi.fn(),

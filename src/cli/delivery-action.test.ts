@@ -31,7 +31,8 @@ const TEST_DIR = '/tmp/nanoclaw-test-cli-delivery-action';
 import { closeDb, initTestDb, runMigrations } from '../db/index.js';
 import { getDeliveryAction } from '../delivery.js';
 import { log } from '../log.js';
-import { inboundDbPath, initSessionFolder } from '../session-manager.js';
+import { initSessionFolder } from '../session-manager.js';
+import { inboundDbPath } from '../mailbox/sqlite/paths.js';
 import type { Session } from '../types.js';
 import './delivery-action.js';
 

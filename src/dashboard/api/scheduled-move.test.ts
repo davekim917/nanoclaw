@@ -18,8 +18,26 @@ vi.mock('../../config.js', async (importOriginal) => ({
   GROUPS_DIR: `${TEST_DIR}/groups`,
 }));
 
+// A hook that fires INSIDE the move's mailbox acquisition, i.e. in the window
+// the async funnel opened between the snapshot/verdict and the cancel. Real
+// implementation otherwise, so every other case in this file is unaffected.
+const duringMailboxAcquire = vi.hoisted(() => ({ run: null as (() => void) | null }));
+vi.mock('../../session-manager.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../session-manager.js')>();
+  return {
+    ...actual,
+    withExistingMailboxSession: async (agentGroupId: string, sessionId: string, action: never) => {
+      const hook = duringMailboxAcquire.run;
+      duringMailboxAcquire.run = null;
+      hook?.();
+      return actual.withExistingMailboxSession(agentGroupId, sessionId, action);
+    },
+  };
+});
+
 import { initTestDb, closeDb, getDb } from '../../db/connection.js';
-import { ensureSchema, openInboundDb } from '../../db/session-db.js';
+import { openInboundDb, openOutboundDbWritable } from '../../modules/mailbox/openers.js';
+import { ensureSchema } from '../../modules/mailbox/schema.js';
 import { taskThreadId } from '../../db/sessions.js';
 import { migration043 } from '../../db/migrations/043-scheduled-audit.js';
 import { encodeKey, invalidateScheduledCache, _resetScheduledRateLimitForTesting } from './scheduled-shared.js';
@@ -141,15 +159,24 @@ function insertRow(
     content?: string;
     platform_id?: string;
     channel_type?: string;
+    /**
+     * 0 = inert, 1 = admitted. Defaults to 0 because that is what
+     * `insertTaskRow` writes: a scheduled occurrence is inert until the sweep
+     * admits it. Omitting the column let SQLite apply its DEFAULT 1, so every
+     * fixture row here looked ALREADY ADMITTED — invisible while nothing read
+     * the column, and wrong the moment the move started requiring an inert row.
+     */
+    trigger?: 0 | 1;
   },
 ): void {
   const db = openInboundDb(inboundPath);
   const seq = (db.prepare('SELECT COALESCE(MAX(seq),0) AS m FROM messages_in').get() as { m: number }).m + 2;
   const processAfter = row.process_after ?? isoIn(3600_000);
   db.prepare(
-    `INSERT INTO messages_in (id, seq, kind, timestamp, status, process_after, scheduled_for, recurrence, series_id, content, platform_id, channel_type)
-     VALUES (@id, @seq, 'task', @ts, @status, @processAfter, @scheduledFor, @recurrence, @seriesId, @content, @platformId, @channelType)`,
+    `INSERT INTO messages_in (id, seq, kind, timestamp, status, process_after, scheduled_for, recurrence, series_id, content, platform_id, channel_type, "trigger")
+     VALUES (@id, @seq, 'task', @ts, @status, @processAfter, @scheduledFor, @recurrence, @seriesId, @content, @platformId, @channelType, @trigger)`,
   ).run({
+    trigger: row.trigger ?? 0,
     id: row.id,
     seq,
     ts: isoIn(-3600_000),
@@ -430,6 +457,95 @@ describe('moveExecuteHandler', () => {
     const tgtLive = liveRowsForSeries('tgt-ag', tgtSess!, 'ser-1');
     expect(tgtLive).toHaveLength(1);
     expect(tgtLive[0].recurrence).toBe('0 9 * * *');
+  });
+
+  // The move approves ONE occurrence and writes a move_intent naming that row
+  // id. Acquiring the mailbox is now async, so between the verdict and the
+  // cancel the approved occurrence can complete and recurrence can arm a
+  // successor. A series-wide cancel would consume the successor, report a
+  // nonzero touch and move the stale snapshot on top of it. This drives that
+  // exact interleave through the acquisition hook above.
+  it('a successor armed during mailbox acquisition is left alone, and the move reports stale_key', async () => {
+    const { key } = seedMoveFixture({ sourceProcessAfter: isoIn(10 * 3600_000) });
+    const srcInbound = path.join(TEST_DIR, 'v2-sessions', 'src-ag', 'src-sess', 'inbound.db');
+
+    duringMailboxAcquire.run = () => {
+      // The approved occurrence finishes...
+      const db = openInboundDb(srcInbound);
+      db.prepare("UPDATE messages_in SET status = 'completed' WHERE id = 'r1'").run();
+      db.close();
+      // ...and recurrence arms the next one.
+      insertRow(srcInbound, {
+        id: 'r2',
+        series_id: 'ser-1',
+        status: 'pending',
+        process_after: isoIn(24 * 3600_000),
+      });
+    };
+
+    const res = (await moveExecuteHandler(req(moveBody()), { key }, ctxFor('owner', OWNER_SCOPES)))!;
+    expect(res.status).toBe(409);
+    expect((await readJson(res)).reason).toBe('stale_key');
+
+    // The successor is untouched and still live...
+    const srcLive = liveRowsForSeries('src-ag', 'src-sess', 'ser-1');
+    expect(srcLive).toHaveLength(1);
+    expect(srcLive[0]!.id).toBe('r2');
+    expect(srcLive[0]!.recurrence).toBe('0 9 * * *');
+    // ...and nothing was inserted into the target from the stale snapshot.
+    const tgtSess = targetSessionId();
+    expect(tgtSess === null || liveRowsForSeries('tgt-ag', tgtSess, 'ser-1')).toBeTruthy();
+    if (tgtSess) expect(liveRowsForSeries('tgt-ag', tgtSess, 'ser-1')).toHaveLength(0);
+  });
+
+  // The sibling of the successor case, and the one an id-scoped cancel alone
+  // does NOT catch: a concurrent dashboard run-now admits the SAME occurrence
+  // during the acquisition window. The row keeps its id and its `pending`
+  // status — admission mutates in place — so only the fields the verdict reads
+  // reveal it. Cancelling here would consume an occurrence that is armed to
+  // fire, and the move would recreate the stale snapshot in the target.
+  it('an occurrence admitted during mailbox acquisition is left alone, and the move reports stale_key', async () => {
+    const { key } = seedMoveFixture({ sourceProcessAfter: isoIn(10 * 3600_000) });
+    const srcInbound = path.join(TEST_DIR, 'v2-sessions', 'src-ag', 'src-sess', 'inbound.db');
+
+    duringMailboxAcquire.run = () => {
+      // Exactly what run-now's admission does: arm the row where it stands.
+      const db = openInboundDb(srcInbound);
+      db.prepare('UPDATE messages_in SET "trigger" = 1, process_after = ? WHERE id = \'r1\'').run(isoIn(0));
+      db.close();
+    };
+
+    const res = (await moveExecuteHandler(req(moveBody()), { key }, ctxFor('owner', OWNER_SCOPES)))!;
+    expect(res.status).toBe(409);
+    expect((await readJson(res)).reason).toBe('stale_key');
+
+    // The occurrence is untouched: still live, still armed, not cancelled.
+    const srcLive = liveRowsForSeries('src-ag', 'src-sess', 'ser-1');
+    expect(srcLive).toHaveLength(1);
+    expect(srcLive[0]!.id).toBe('r1');
+    expect(srcLive[0]!.status).toBe('pending');
+    // ...and nothing was written into the target from the stale snapshot.
+    const tgtSess = targetSessionId();
+    if (tgtSess) expect(liveRowsForSeries('tgt-ag', tgtSess, 'ser-1')).toHaveLength(0);
+  });
+
+  // The claim half of the same guard: a container holding a processing claim
+  // on the approved occurrence means it is mid-fire, whatever the row says.
+  it('an occurrence claimed during mailbox acquisition is left alone', async () => {
+    const { key } = seedMoveFixture({ sourceProcessAfter: isoIn(10 * 3600_000) });
+    const outbound = path.join(TEST_DIR, 'v2-sessions', 'src-ag', 'src-sess', 'outbound.db');
+
+    duringMailboxAcquire.run = () => {
+      const db = openOutboundDbWritable(outbound);
+      db.prepare("INSERT INTO processing_ack (message_id, status, status_changed) VALUES ('r1', 'processing', ?)").run(
+        new Date().toISOString(),
+      );
+      db.close();
+    };
+
+    const res = (await moveExecuteHandler(req(moveBody()), { key }, ctxFor('owner', OWNER_SCOPES)))!;
+    expect(res.status).toBe(409);
+    expect(liveRowsForSeries('src-ag', 'src-sess', 'ser-1')).toHaveLength(1);
   });
 
   it("a successful move carries the occurrence's slot, not its retry deadline", async () => {

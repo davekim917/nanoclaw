@@ -40,14 +40,34 @@ vi.mock('../../claims-board.js', async (importOriginal) => {
   return { ...actual, readClaims: vi.fn(actual.readClaims) };
 });
 
-// The routing-stamp rung reads a per-session inbound DB. Back it with a real
-// in-memory one so the production SQL is what these tests exercise, not a stub.
-const stamp = vi.hoisted(() => ({ db: null as InstanceType<typeof Database> | null, path: '/nonexistent/inbound.db' }));
-vi.mock('../../session-manager.js', () => ({
-  inboundDbPath: () => stamp.path,
-  withInboundDb: <T>(_agentGroupId: string, _sessionId: string, fn: (db: InstanceType<typeof Database>) => T): T =>
-    fn(stamp.db!),
+// The routing-stamp rung reads a per-session inbound DB through the mailbox
+// module's read-only session. Only the FILE is stubbed — the action still runs
+// the module's real `getLatestTaskRoutingStamp` against an in-memory DB, so the
+// production SQL is what these tests exercise, not a stub. `db: null` stands
+// for "this session has no mailbox", which the seam answers as `undefined`.
+const stamp = vi.hoisted(() => ({
+  db: null as InstanceType<typeof Database> | null,
+  // The options the probe threaded through, so a test can pin them. The read
+  // funnel's defaults are the console fan-out's, not this caller's.
+  lastOptions: undefined as unknown,
 }));
+vi.mock('../mailbox/index.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../mailbox/index.js')>();
+  const { getLatestTaskRoutingStamp } = await import('../mailbox/ops/reads.js');
+  return {
+    ...actual,
+    readSessionInbound: <T>(
+      _location: unknown,
+      action: (mailbox: { getLatestTaskRoutingStamp: (seriesId: string) => unknown }) => T,
+      options?: unknown,
+    ): T | undefined => {
+      stamp.lastOptions = options;
+      return stamp.db === null
+        ? undefined
+        : action({ getLatestTaskRoutingStamp: (seriesId: string) => getLatestTaskRoutingStamp(stamp.db!, seriesId) });
+    },
+  };
+});
 
 const HOUR = 60 * 60 * 1000;
 const NOW = Date.parse('2026-08-20T12:00:00Z');
@@ -670,7 +690,6 @@ describe('wiredCandidates — where a claim can actually be reached', () => {
     closeDb();
     stamp.db?.close();
     stamp.db = null;
-    stamp.path = '/nonexistent/inbound.db';
   });
 
   function anchor(channelType: string, platformId: string, threadPlatformId: string, createdAt: string): void {
@@ -726,8 +745,6 @@ describe('wiredCandidates — where a claim can actually be reached', () => {
       threadId,
     );
     stamp.db = db;
-    stamp.path = fs.mkdtempSync(path.join(os.tmpdir(), 'self-heal-inbound-'));
-    fs.writeFileSync((stamp.path = path.join(stamp.path, 'inbound.db')), '');
   }
 
   it('prefers where the series LANDED over where its replies are addressed', async () => {
@@ -739,6 +756,21 @@ describe('wiredCandidates — where a claim can actually be reached', () => {
 
     const [row] = await wiredCandidates('wg-a', 'system:tasks:nightly-sweep-abcd');
     expect(row.deliverThreadId).toBe('slack:C0AAA:1787250153.097109');
+  });
+
+  // The read funnel defaults to the console fan-out's 1s busy_timeout and no
+  // journal recovery. The `withInboundDb` this replaced opened READ-WRITE with
+  // busy_timeout 5000, and a read-write open is what rolls a hot journal back,
+  // so defaulting here would make the probe stricter than the code it replaced:
+  // a contended session would start failing it, and one whose host write was
+  // interrupted would fail it permanently.
+  it("threads the replaced open's 5s timeout and journal recovery, not the fan-out defaults", async () => {
+    stampRouting('slack:C0AAA', 'slack-example', null);
+    stamp.lastOptions = undefined;
+
+    await wiredCandidates('wg-a', 'system:tasks:nightly-sweep-abcd');
+
+    expect(stamp.lastOptions).toEqual({ busyTimeoutMs: 5000, recoverJournal: true });
   });
 
   it('falls back to the routing stamp when the series never anchored', async () => {

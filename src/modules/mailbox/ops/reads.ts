@@ -26,11 +26,24 @@ import type Database from 'better-sqlite3';
  */
 export interface ScheduledTaskRow {
   id: string;
+  /**
+   * Monotonic per-session sequence. Carried so a writer can tell "the row I
+   * approved" from "a row that has since been rewritten in place" — an id
+   * alone cannot, because admission mutates the row rather than replacing it.
+   */
+  seq: number;
   series_id: string | null;
   recurrence: string | null;
   process_after: string | null;
   scheduled_for: string | null;
   status: string;
+  /**
+   * 0 = inert, 1 = admitted and fireable. NULL only on a legacy `inbound.db`
+   * that predates the column and has not met a writer yet — see
+   * {@link scheduledColumns}. Inside a mailbox session the column always
+   * exists, because opening one migrates.
+   */
+  trigger: number | null;
   kind: string;
   timestamp: string;
   platform_id: string | null;
@@ -53,11 +66,16 @@ export interface ScheduledTaskRow {
  * written before the column existed.
  */
 function scheduledColumns(db: Database.Database): string {
-  const hasScheduledFor = (db.prepare("PRAGMA table_info('messages_in')").all() as Array<{ name: string }>).some(
-    (column) => column.name === 'scheduled_for',
+  const columns = new Set(
+    (db.prepare("PRAGMA table_info('messages_in')").all() as Array<{ name: string }>).map((column) => column.name),
   );
-  return `id, series_id, recurrence, process_after, ${hasScheduledFor ? 'scheduled_for' : 'NULL AS scheduled_for'},
-         status, kind, timestamp, platform_id, channel_type, thread_id, content`;
+  // `trigger` is lazily added by the same migration as `scheduled_for`, so it
+  // gets the same treatment for the same reason: naming a missing column
+  // throws, and the read-only session deliberately never migrates.
+  const scheduledFor = columns.has('scheduled_for') ? 'scheduled_for' : 'NULL AS scheduled_for';
+  const trigger = columns.has('trigger') ? '"trigger"' : 'NULL AS "trigger"';
+  return `id, seq, series_id, recurrence, process_after, ${scheduledFor},
+         status, ${trigger}, kind, timestamp, platform_id, channel_type, thread_id, content`;
 }
 
 /**
@@ -226,10 +244,13 @@ export function listProcessingClaimedMessageIds(db: Database.Database): string[]
   ).map((r) => r.message_id);
 }
 
-/** Is a work-continuation chain queued or running for this session? */
-export function hasWorkContinuation(db: Database.Database): boolean {
-  return db.prepare("SELECT 1 FROM session_state WHERE key = 'work_continuation'").get() !== undefined;
-}
+/**
+ * Is a work-continuation chain queued or running for this session?
+ *
+ * The continuation family owns the statement (invariant I-2); this is the
+ * read-side name for it, re-exported rather than re-implemented.
+ */
+export { hasWorkContinuationRow as hasWorkContinuation } from './continuation.js';
 
 /* ─── Outbound message history ─────────────────────────────────────────────── */
 
@@ -305,4 +326,149 @@ export function listTurnUsageSince(db: Database.Database, afterId: number): Sess
     db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name = 'turn_usage' LIMIT 1").get() !== undefined;
   if (!present) return [];
   return db.prepare('SELECT * FROM turn_usage WHERE id > ? ORDER BY id ASC').all(afterId) as SessionTurnUsageRow[];
+}
+
+/* ─── Fleet-fan-out probes (inbound) ───────────────────────────────────────── */
+
+/**
+ * The id of the newest inbound row, or `null` on an empty mailbox.
+ *
+ * The SSE feed stamps its `inbound_message` frame with it so a console client
+ * can dedupe against the row it already rendered; a mailbox with no rows falls
+ * back to the caller's synthetic id.
+ */
+export function latestInboundMessageId(db: Database.Database): string | null {
+  const row = db.prepare('SELECT id FROM messages_in ORDER BY seq DESC LIMIT 1').get() as { id: string } | undefined;
+  return row?.id ?? null;
+}
+
+/**
+ * Does this session hold at least one live recurring row?
+ *
+ * Kind-agnostic and status-scoped exactly as the sessions list asks it: a
+ * session parked on the stale boundary is not idle if something is still
+ * scheduled to wake it.
+ */
+export function hasPendingRecurrence(db: Database.Database): boolean {
+  return (
+    db
+      .prepare(
+        `SELECT 1 FROM messages_in
+          WHERE status IN ('pending', 'paused')
+            AND recurrence IS NOT NULL
+          LIMIT 1`,
+      )
+      .get() !== undefined
+  );
+}
+
+/**
+ * Has this session ever been woken?
+ *
+ * `trigger` postdates the initial schema, so a DB old enough to lack the
+ * column makes this THROW rather than answer false — the caller decides what
+ * an unanswerable probe means (both of today's callers fail it closed to
+ * "has woken", which never suppresses a real title).
+ */
+export function hasTriggeredInboundRow(db: Database.Database): boolean {
+  return db.prepare('SELECT 1 FROM messages_in WHERE trigger = 1 LIMIT 1').get() !== undefined;
+}
+
+/** One message as the transcript and title surfaces read it, either direction. */
+export interface MessageTailRow {
+  seq: number;
+  kind: string;
+  timestamp: string;
+  content: string;
+}
+
+const TAIL_COLUMNS = 'seq, kind, timestamp, content';
+const TAIL_FILTER = "WHERE content IS NOT NULL AND content <> ''\n        ORDER BY seq DESC\n        LIMIT ?";
+
+/**
+ * The last `limit` non-empty inbound rows, newest first.
+ *
+ * One shape for both readers of a session's tail — the session-detail
+ * transcript and the title sweep's slice — because they ask the same question
+ * and a second near-identical select is how the two would drift.
+ */
+export function listInboundTail(db: Database.Database, limit: number): MessageTailRow[] {
+  return db.prepare(`SELECT ${TAIL_COLUMNS} FROM messages_in ${TAIL_FILTER}`).all(limit) as MessageTailRow[];
+}
+
+/** The outbound twin of {@link listInboundTail}. */
+export function listOutboundTail(db: Database.Database, limit: number): MessageTailRow[] {
+  return db.prepare(`SELECT ${TAIL_COLUMNS} FROM messages_out ${TAIL_FILTER}`).all(limit) as MessageTailRow[];
+}
+
+/**
+ * How many live (pending|paused) task rows this session holds for a series.
+ *
+ * The move flow's scoped invariant counter: asked of exactly the named
+ * sessions, never fleet-wide, so an unrelated group reusing the same series id
+ * cannot satisfy it.
+ */
+export function countLiveSeriesRows(db: Database.Database, seriesId: string): number {
+  return (
+    db
+      .prepare(
+        `SELECT COUNT(*) AS c FROM messages_in
+          WHERE series_id = ? AND kind = 'task' AND status IN ('pending','paused')`,
+      )
+      .get(seriesId) as { c: number }
+  ).c;
+}
+
+/** The delivery routing one task series last stamped on a fire. */
+export interface TaskRoutingStamp {
+  platformId: string;
+  channelType: string;
+  threadId: string | null;
+}
+
+/**
+ * The newest routed row of ONE series, thread included.
+ *
+ * The claim self-heal's second rung: a `system:tasks:<series>` claim has no
+ * messaging group of its own, so where the series posts is the only honest
+ * subject. `null` means the series was created `--isolated` and stamped no
+ * routing on purpose — a real answer, not a miss.
+ */
+export function getLatestTaskRoutingStamp(db: Database.Database, seriesId: string): TaskRoutingStamp | null {
+  return (
+    (db
+      .prepare(
+        `SELECT platform_id AS platformId, channel_type AS channelType, thread_id AS threadId
+           FROM messages_in
+          WHERE kind = 'task' AND series_id = ? AND platform_id IS NOT NULL
+          ORDER BY seq DESC
+          LIMIT 1`,
+      )
+      .get(seriesId) as TaskRoutingStamp | undefined) ?? null
+  );
+}
+
+/** Channel a task session last delivered into, for the Slack owner-safety gate. */
+export interface TaskDeliveryRoute {
+  channel_type: string | null;
+  platform_id: string;
+}
+
+/**
+ * The newest routed task row in the SESSION, any series.
+ *
+ * Insertion order (`rowid`), not `seq`: the gate wants the most recently
+ * written route, and an empty `platform_id` is treated as no route at all so a
+ * blank stamp cannot resolve to a messaging group.
+ */
+export function getLatestTaskDeliveryRoute(db: Database.Database): TaskDeliveryRoute | null {
+  return (
+    (db
+      .prepare(
+        `SELECT channel_type, platform_id FROM messages_in
+          WHERE kind = 'task' AND platform_id IS NOT NULL AND platform_id <> ''
+       ORDER BY rowid DESC LIMIT 1`,
+      )
+      .get() as TaskDeliveryRoute | undefined) ?? null
+  );
 }

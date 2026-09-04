@@ -1,4 +1,15 @@
 /**
+ * The module's two READ-ONLY session funnels — `readSessionInbound` and
+ * `readSessionOutbound` — which reach one session's storage without
+ * provisioning it.
+ *
+ * The third existing-only funnel, the outbound-keyed WRITE session
+ * `withExistingNanoclawOutbound`, is not here: it hands the action the module's
+ * typed outbound ops, built from `composeOutboundOps`, and that lives in
+ * `index.ts`. Importing it here would put a static cycle through the barrel.
+ * All three share the same absence rule — an absent DB is `undefined`, a
+ * present-but-unopenable one raises — and the README lists them together.
+ *
  * Read-only session access for the host's operator surfaces.
  *
  * `withExistingMailboxSession` is the default for a caller that only reads
@@ -15,6 +26,16 @@
  *  - The board's opens are `{ readonly: true }` with a 1s busy_timeout, not
  *    the write path's 5s — a slow session must degrade to `unreadable` on that
  *    request, never hold the console's event loop for five seconds per file.
+ *
+ * These helpers do NOT reuse the module's read-write funnels wholesale, and
+ * `readSessionInbound` in particular must not: `openInboundDb` opens
+ * READ-WRITE (no `readonly`), sets `journal_mode = DELETE` — a write to the
+ * header — and plants a storage-activity marker whose lifetime is the
+ * handle's. A console request fans out across every session in the fleet, so
+ * routing it there would write to every session it merely lists and would
+ * churn a reclaim-blocking marker per session per poll. What the two funnels
+ * share is the FAILURE CLASSIFICATION (`assertQueryable`, below), which is the
+ * part that was genuinely forked.
  *
  * So the operator surfaces get a genuinely read-only session: a `readonly`
  * handle (SQLite itself refuses a write), no schema-ensure, no migration memo,
@@ -37,27 +58,44 @@ import { DATA_DIR } from '../../config.js';
 import { getContainerState, getProcessingClaims, type ContainerState, type ProcessingClaim } from './ops/sweep.js';
 import { inboundHasMessage } from './ops/ingress.js';
 import {
+  countLiveSeriesRows,
   getLatestSeriesRow,
+  getLatestTaskDeliveryRoute,
+  getLatestTaskRoutingStamp,
   getLatestTaskRow,
   getLiveSeriesRow,
   getLiveTaskRow,
+  hasPendingRecurrence,
+  hasTriggeredInboundRow,
   hasWorkContinuation,
+  latestInboundMessageId,
   latestReplyTimestampByTrigger,
   listDuplicateLiveTaskSeriesIds,
+  listInboundTail,
   listLatestRecurringSeriesRows,
   listLiveOneOffTaskRows,
   listLiveTaskRows,
   listLiveTaskRowsForSeries,
   listOutboundSystemMessages,
+  listOutboundTail,
   listProcessingClaimedMessageIds,
   listRecentTaskFires,
   listTurnUsageSince,
+  type MessageTailRow,
   type OutboundSystemRow,
   type ScheduledTaskRow,
   type SessionTurnUsageRow,
+  type TaskDeliveryRoute,
   type TaskFireRow,
+  type TaskRoutingStamp,
 } from './ops/reads.js';
-import { recoverHotJournal, sessionDbPathIsGone } from './openers.js';
+import {
+  assertQueryable,
+  asMissingDbError,
+  recoverHotJournal,
+  SessionDbMissingError,
+  sessionDbPathIsGone,
+} from './openers.js';
 
 /**
  * Which session to read, and where its data lives.
@@ -115,6 +153,13 @@ export interface InboundSessionRead {
   getLiveTaskRow(seriesId: string): ScheduledTaskRow | null;
   getLatestTaskRow(seriesId: string): ScheduledTaskRow | null;
   listRecentTaskFires(seriesId: string, limit: number): TaskFireRow[];
+  latestInboundMessageId(): string | null;
+  hasPendingRecurrence(): boolean;
+  hasTriggeredInboundRow(): boolean;
+  listInboundTail(limit: number): MessageTailRow[];
+  countLiveSeriesRows(seriesId: string): number;
+  getLatestTaskRoutingStamp(seriesId: string): TaskRoutingStamp | null;
+  getLatestTaskDeliveryRoute(): TaskDeliveryRoute | null;
 }
 
 export interface OutboundSessionRead {
@@ -125,9 +170,20 @@ export interface OutboundSessionRead {
   latestReplyTimestampByTrigger(): Map<string, string>;
   listOutboundSystemMessages(): OutboundSystemRow[];
   listTurnUsageSince(afterId: number): SessionTurnUsageRow[];
+  listOutboundTail(limit: number): MessageTailRow[];
 }
 
-export type { ContainerState, OutboundSystemRow, ProcessingClaim, ScheduledTaskRow, SessionTurnUsageRow, TaskFireRow };
+export type {
+  ContainerState,
+  MessageTailRow,
+  OutboundSystemRow,
+  ProcessingClaim,
+  ScheduledTaskRow,
+  SessionTurnUsageRow,
+  TaskDeliveryRoute,
+  TaskFireRow,
+  TaskRoutingStamp,
+};
 
 /**
  * Resolve one side of a session's mailbox under `dataDir`, with the same
@@ -144,11 +200,60 @@ function resolveReadPath(location: SessionReadLocation, side: 'inbound' | 'outbo
   return resolved === expected && resolved.startsWith(base + path.sep) ? resolved : null;
 }
 
+/**
+ * Open one side read-only, with the SAME failure classification the module's
+ * read-write funnels apply.
+ *
+ * `assertQueryable` is the shared half: a handle that constructs but cannot
+ * answer `SELECT 1 FROM sqlite_master` is a present-but-unopenable DB, and it
+ * raises `SessionDbUnopenableError` here exactly as it does through
+ * `openInboundDb`/`openOutboundDb`. Before this, the read path constructed a
+ * handle and handed it out unprobed, so the same corrupt file was a silent
+ * empty read on one funnel and a classified error on the other — one behavior
+ * with two answers, which is the fork this closes.
+ *
+ * What is deliberately NOT shared is the part that writes. `openOutboundDb`
+ * recovers a hot journal unconditionally; a rollback is a write, and a
+ * fleet-wide console read must not perform one on every session it lists, so
+ * it stays opt-in through `recoverJournal`. Callers that own the session's
+ * write anyway (the steer probe, the usage rollup) pass it and get byte-for-byte
+ * the read-write funnel's behavior.
+ */
 function openRead(dbPath: string, options: SessionReadOptions): Database.Database {
   if (options.recoverJournal) recoverHotJournal(dbPath);
-  const db = new Database(dbPath, { readonly: true });
-  db.pragma(`busy_timeout = ${options.busyTimeoutMs ?? 1000}`);
+  let db: Database.Database | undefined;
+  try {
+    db = new Database(dbPath, { readonly: true });
+    db.pragma(`busy_timeout = ${options.busyTimeoutMs ?? 1000}`);
+  } catch (err) {
+    // The construction half. better-sqlite3 opens eagerly, so a mode-000 file
+    // or an exhausted descriptor table fails HERE, not at the first query —
+    // classifying only post-construction failures would have left the common
+    // case raising a raw SqliteError on this funnel and a classified one on
+    // the read-write funnels.
+    db?.close();
+    throw asMissingDbError(err, dbPath);
+  }
+  assertQueryable(db, dbPath);
   return db;
+}
+
+/**
+ * `openRead`, with a vanished file answered as absence rather than an error.
+ *
+ * The public contract is "`undefined` means ABSENT, and only absent". The
+ * `sessionDbPathIsGone` pre-check answers that for every ordinary case, and
+ * this closes the race where the file is removed between that check and the
+ * open — which classifies as `SessionDbMissingError` and is still, honestly,
+ * absence. A present-but-unopenable DB keeps throwing.
+ */
+function openReadOrAbsent(dbPath: string, options: SessionReadOptions): Database.Database | undefined {
+  try {
+    return openRead(dbPath, options);
+  } catch (err) {
+    if (err instanceof SessionDbMissingError) return undefined;
+    throw err;
+  }
 }
 
 /**
@@ -166,7 +271,8 @@ export function readSessionInbound<T>(
 ): T | undefined {
   const dbPath = resolveReadPath(location, 'inbound');
   if (dbPath === null || sessionDbPathIsGone(dbPath)) return undefined;
-  const db = openRead(dbPath, options);
+  const db = openReadOrAbsent(dbPath, options);
+  if (!db) return undefined;
   try {
     return action({
       inboundHasMessage: (messageId) => inboundHasMessage(db, messageId),
@@ -180,6 +286,13 @@ export function readSessionInbound<T>(
       getLiveTaskRow: (seriesId) => getLiveTaskRow(db, seriesId),
       getLatestTaskRow: (seriesId) => getLatestTaskRow(db, seriesId),
       listRecentTaskFires: (seriesId, limit) => listRecentTaskFires(db, seriesId, limit),
+      latestInboundMessageId: () => latestInboundMessageId(db),
+      hasPendingRecurrence: () => hasPendingRecurrence(db),
+      hasTriggeredInboundRow: () => hasTriggeredInboundRow(db),
+      listInboundTail: (limit) => listInboundTail(db, limit),
+      countLiveSeriesRows: (seriesId) => countLiveSeriesRows(db, seriesId),
+      getLatestTaskRoutingStamp: (seriesId) => getLatestTaskRoutingStamp(db, seriesId),
+      getLatestTaskDeliveryRoute: () => getLatestTaskDeliveryRoute(db),
     });
   } finally {
     db.close();
@@ -194,7 +307,8 @@ export function readSessionOutbound<T>(
 ): T | undefined {
   const dbPath = resolveReadPath(location, 'outbound');
   if (dbPath === null || sessionDbPathIsGone(dbPath)) return undefined;
-  const db = openRead(dbPath, options);
+  const db = openReadOrAbsent(dbPath, options);
+  if (!db) return undefined;
   try {
     return action({
       getContainerState: () => getContainerState(db),
@@ -204,6 +318,7 @@ export function readSessionOutbound<T>(
       latestReplyTimestampByTrigger: () => latestReplyTimestampByTrigger(db),
       listOutboundSystemMessages: () => listOutboundSystemMessages(db),
       listTurnUsageSince: (afterId) => listTurnUsageSince(db, afterId),
+      listOutboundTail: (limit) => listOutboundTail(db, limit),
     });
   } finally {
     db.close();

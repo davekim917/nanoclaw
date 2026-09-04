@@ -56,10 +56,9 @@ import { randomBytes } from 'node:crypto';
 import { afterEach, describe, expect, it } from 'vitest';
 import ts from 'typescript';
 
+import { inboundDbPath, outboundDbPath } from './mailbox/sqlite/paths.js';
 import {
-  inboundDbPath,
   isAdmissiblePreTurnTrigger,
-  outboundDbPath,
   readThreadDirOwner,
   sessionContextPathFor,
   sessionsBaseDir,
@@ -792,10 +791,12 @@ describe('worktree-cleanup.ts contains no literal seam call, and the only contai
       'src/db/connection.ts': ['getDb'],
       'src/host-lifecycle.ts': ['onHostShutdown', 'onHostStart'],
       'src/log.ts': ['log'],
-      'src/modules/mailbox/index.ts': ['sessionMailboxPath'],
-      'src/modules/mailbox/openers.ts': ['openOutboundDb'],
-      'src/modules/mailbox/ops/continuation.ts': ['hasWorkContinuationRow'],
-      'src/modules/mailbox/ops/sweep.ts': ['getContainerState', 'getProcessingClaims'],
+      // PR 7 moved this file's outbound read onto the seam, and the manifest
+      // is how you can see it: the raw opener and the three op modules it
+      // reached into directly are gone, replaced by one funnel import from the
+      // barrel. Four entries out, one binding in — a strictly smaller surface,
+      // which is what this pin exists to make visible rather than to forbid.
+      'src/modules/mailbox/index.ts': ['readSessionOutbound', 'sessionMailboxPath'],
       'src/repository-workspaces.ts': [
         'canonicalRepoDir',
         'defaultTopicBranch',

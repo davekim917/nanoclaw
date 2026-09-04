@@ -18,8 +18,8 @@ import { getSessionsByAgentGroup } from './db/sessions.js';
 import { log } from './log.js';
 import { SessionDbMissingError, sessionMailboxPath, type NanoclawMailboxSession } from './modules/mailbox/index.js';
 import { repoIngressFenceAckToken } from './modules/mailbox/ops/fence.js';
-import { withExistingNanoclawOutbound, withExistingNanoclawSession } from './modules/mailbox/session.js';
-import { writeSessionMessage } from './session-manager.js';
+import { withExistingNanoclawOutbound } from './modules/mailbox/index.js';
+import { withExistingMailboxSession, writeSessionMessage } from './session-manager.js';
 import type { Session } from './types.js';
 import fs from 'fs';
 
@@ -162,7 +162,7 @@ async function inSessionMailbox<T>(
 ): Promise<T | typeof MAILBOX_GONE> {
   let result: T | undefined;
   try {
-    result = await withExistingNanoclawSession(session.agent_group_id, session.id, action);
+    result = await withExistingMailboxSession(session.agent_group_id, session.id, action);
   } catch (err) {
     if (vanishedSessionIsSkippable(err, session)) return MAILBOX_GONE;
     throw barrierSessionError(err, session, phase);
@@ -559,7 +559,7 @@ export async function restartAgentGroupContainers(
     const withdrawWake = async (): Promise<void> => {
       if (!wakeId) return;
       try {
-        const withdrawn = await withExistingNanoclawSession(session.agent_group_id, session.id, (mailbox) =>
+        const withdrawn = await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) =>
           mailbox.withdrawUnconsumedWake(wakeId, () => containerOwnsOutbound(session.id)),
         );
         if (withdrawn)
@@ -603,7 +603,7 @@ export async function restartAgentGroupContainers(
       // than as "nothing pending": this session's container is RUNNING, so a
       // missing mailbox is an inconsistent host view, and the conservative
       // answer is to leave it alone.
-      const due = await withExistingNanoclawSession(session.agent_group_id, session.id, (mailbox) =>
+      const due = await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) =>
         mailbox.countDueMessages(),
       );
       if (due === undefined) throw new Error(`session ${session.id} has no mailbox to read pending work from`);

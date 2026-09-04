@@ -13,10 +13,26 @@ vi.mock('../../config.js', async () => {
 
 const { TEST_DIR } = vi.hoisted(() => ({ TEST_DIR: uniqueTmpRoot('test-slack-subject') }));
 
+// Records the options the gate threads through while leaving the read itself
+// real — every other case in this file runs against genuine session DBs.
+const readOptions = vi.hoisted(() => ({ last: undefined as unknown }));
+vi.mock('../mailbox/index.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../mailbox/index.js')>();
+  return {
+    ...actual,
+    readSessionInbound: ((location: never, action: never, options?: never) => {
+      readOptions.last = options;
+      return actual.readSessionInbound(location, action, options);
+    }) as typeof actual.readSessionInbound,
+  };
+});
+
 import { initTestDb, closeDb, runMigrations, createAgentGroup, getDb } from '../../db/index.js';
 import { createMessagingGroup } from '../../db/messaging-groups.js';
 import { createSession, taskThreadId, TASKS_SYSTEM_THREAD_ID } from '../../db/sessions.js';
-import { initSessionFolder, withInboundDb } from '../../session-manager.js';
+import { initSessionFolder } from '../../session-manager.js';
+import { openInboundDb } from '../../modules/mailbox/openers.js';
+import { inboundDbPath } from '../../mailbox/sqlite/paths.js';
 import type { Session } from '../../types.js';
 import { resolveSlackSafetyMessagingGroupId } from './task-slack-subject.js';
 
@@ -44,12 +60,15 @@ function makeSession(id: string, threadId: string | null, mgId: string | null = 
 
 /** Insert a task row the way the scheduler does — destination on the row itself. */
 function addTaskRow(sessionId: string, channelType: string, platformId: string, seq = 2): void {
-  withInboundDb(GROUP, sessionId, (db) => {
+  const db = openInboundDb(inboundDbPath(GROUP, sessionId));
+  try {
     db.prepare(
       `INSERT INTO messages_in (id, seq, timestamp, status, tries, kind, channel_type, platform_id, content)
        VALUES (?, ?, ?, 'pending', 0, 'task', ?, ?, ?)`,
     ).run(`task-${seq}`, seq, NOW, channelType, platformId, JSON.stringify({ prompt: 'x' }));
-  });
+  } finally {
+    db.close();
+  }
 }
 
 beforeEach(() => {
@@ -95,6 +114,23 @@ describe('resolveSlackSafetyMessagingGroupId', () => {
     const s = makeSession('sess-task', taskThreadId('career-journal-daily-c1fe'));
     addTaskRow('sess-task', 'discord', DM_PLATFORM);
     expect(resolveSlackSafetyMessagingGroupId(s)).toBe('mg-dm');
+  });
+
+  // The read funnel defaults to the console fan-out's 1s busy_timeout and no
+  // journal recovery. The `withInboundDb` this replaced opened READ-WRITE with
+  // busy_timeout 5000, and a read-write open is what rolls a hot journal back.
+  // Defaulting here would make the SPAWN GATE stricter than the code it
+  // replaced: a contended session, or one whose host write was interrupted,
+  // would fail to resolve its route and fall through to the fail-closed null —
+  // which is what spawns every scheduled fire under the `-noslack` identity.
+  it("threads the replaced open's 5s timeout and journal recovery, not the fan-out defaults", () => {
+    const s = makeSession('sess-task-opts', taskThreadId('career-journal-daily-c1fe'));
+    addTaskRow('sess-task-opts', 'discord', DM_PLATFORM);
+    readOptions.last = undefined;
+
+    resolveSlackSafetyMessagingGroupId(s);
+
+    expect(readOptions.last).toEqual({ busyTimeoutMs: 5000, recoverJournal: true });
   });
 
   it('resolves a task pointed at a shared channel to that channel, not to null', () => {

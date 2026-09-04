@@ -612,20 +612,32 @@ async function seriesRoutingStamp(
   sessionId: string,
   seriesId: string,
 ): Promise<{ messagingGroupId: string; deliverThreadId: string | null } | null> {
-  const { inboundDbPath, withInboundDb } = await import('../../session-manager.js');
-  if (!fs.existsSync(inboundDbPath(agentGroupId, sessionId))) return null;
-
-  const stamp = withInboundDb(agentGroupId, sessionId, (inbound) =>
-    inbound
-      .prepare(
-        `SELECT platform_id AS platformId, channel_type AS channelType, thread_id AS threadId
-           FROM messages_in
-          WHERE kind = 'task' AND series_id = ? AND platform_id IS NOT NULL
-          ORDER BY seq DESC
-          LIMIT 1`,
-      )
-      .get(seriesId),
-  ) as { platformId: string; channelType: string; threadId: string | null } | undefined;
+  // Read-only seam: a self-heal probe must never provision or migrate the task
+  // session it is asking about (invariant I-4). `undefined` is "no mailbox",
+  // which reads the same as "no routing stamp" here — both leave the claim
+  // unrouted rather than guessing a destination.
+  //
+  // The two options restore what the replaced `withInboundDb` did. It reached
+  // `openInboundDb`: a READ-WRITE open with `busy_timeout = 5000` and
+  // `journal_mode = DELETE`. The funnel defaults to the console fan-out's 1s
+  // and no recovery, which is stricter on both counts.
+  //
+  // The timeout is the demonstrable half — 5000 to 1000, so a contended
+  // session gives up where it used to wait. `recoverJournal` is here on
+  // MECHANISM rather than a reproduced failure: `recoverHotJournal` is a
+  // read-write open that touches the DB, which is what the replaced open
+  // already was, so this restores its behavior rather than adding one. (A hot
+  // journal would not reproduce on this host to prove it end to end — the
+  // header comes back zeroed and SQLite ignores it.)
+  //
+  // What the conversion still drops is the schema-ensure, the migration and
+  // the reclaim-blocking activity marker, which is the whole point of it.
+  const { readSessionInbound } = await import('../mailbox/index.js');
+  const stamp = readSessionInbound(
+    { agentGroupId, sessionId },
+    (mailbox) => mailbox.getLatestTaskRoutingStamp(seriesId),
+    { busyTimeoutMs: 5000, recoverJournal: true },
+  );
   if (!stamp) return null; // `--isolated`: stamped no routing on purpose
 
   const mg = db

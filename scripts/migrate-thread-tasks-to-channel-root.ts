@@ -39,7 +39,8 @@ import { DATA_DIR } from '../src/config.js';
 import { initDb, getDb } from '../src/db/connection.js';
 import { resolveActiveSession } from '../src/db/scheduled-tasks.js';
 import { findSessionByAgentGroupAndMessagingGroup } from '../src/db/sessions.js';
-import { ensureSchema, nextEvenSeq } from '../src/db/session-db.js';
+import { ensureSchema } from '../src/modules/mailbox/schema.js';
+import { nextEvenSeq } from '../src/modules/mailbox/ops/ingress.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DB_PATH = path.join(__dirname, '..', 'data', 'v2.db');
@@ -216,14 +217,10 @@ async function migrateOnce(dryRun: boolean): Promise<MigrationResult> {
           // source row migrated so a subsequent run skips it. Single-statement
           // so atomicity is trivial.
           channelDb
-            .prepare(
-              `UPDATE source_db.messages_in SET status = 'migrated', recurrence = NULL WHERE id = ?`,
-            )
+            .prepare(`UPDATE source_db.messages_in SET status = 'migrated', recurrence = NULL WHERE id = ?`)
             .run(task.id);
           result.tasks_skipped_already_migrated += 1;
-          console.log(
-            `[skip-already] series=${task.series_id} (channel-root already has live row ${existing.id})`,
-          );
+          console.log(`[skip-already] series=${task.series_id} (channel-root already has live row ${existing.id})`);
           continue;
         }
 
@@ -248,9 +245,7 @@ async function migrateOnce(dryRun: boolean): Promise<MigrationResult> {
               task.channel_type,
             );
           channelDb
-            .prepare(
-              `UPDATE source_db.messages_in SET status = 'migrated', recurrence = NULL WHERE id = ?`,
-            )
+            .prepare(`UPDATE source_db.messages_in SET status = 'migrated', recurrence = NULL WHERE id = ?`)
             .run(task.id);
         });
         tx();

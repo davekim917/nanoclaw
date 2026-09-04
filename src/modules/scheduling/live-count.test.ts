@@ -11,7 +11,8 @@ import os from 'os';
 import path from 'path';
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 
-import { ensureSchema, openInboundDb } from '../../db/session-db.js';
+import { openInboundDb } from '../mailbox/openers.js';
+import { ensureSchema } from '../mailbox/schema.js';
 import { countLiveRowsInSessions } from './live-count.js';
 
 const TEST_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'nc-livecount-'));

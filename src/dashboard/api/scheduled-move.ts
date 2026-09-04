@@ -25,17 +25,11 @@ import { getWorkgroupOnecliSecrets } from '../../db/agent-groups.js';
 import { getMessagingGroup } from '../../db/messaging-groups.js';
 import { getDb } from '../../db/connection.js';
 import { findSystemSession, taskThreadId } from '../../db/sessions.js';
-import { openInboundDb } from '../../db/session-db.js';
 import { readSessionInbound, type ScheduledTaskRow } from '../../modules/mailbox/index.js';
+import { withExistingMailboxSession } from '../../session-manager.js';
 import * as scheduledTasks from '../../db/scheduled-tasks.js';
 import { type TaskDef } from '../../db/scheduled-tasks.js';
-import {
-  cancelTask,
-  pauseTask,
-  restoreTaskRow,
-  updateTask,
-  type TaskRowSnapshot,
-} from '../../modules/scheduling/db.js';
+import { type TaskRowSnapshot } from '../../modules/scheduling/db.js';
 import { countLiveRowsInSessions } from '../../modules/scheduling/live-count.js';
 import { log } from '../../log.js';
 import { parseUtcTimestampMs } from '../../thread-context.js';
@@ -50,6 +44,7 @@ import {
   rateLimit,
   sessionInboundPathFor,
   writeAudit,
+  approvedRowChanged,
 } from './scheduled-shared.js';
 
 // ── Test seam ─────────────────────────────────────────────────────────────────
@@ -335,10 +330,6 @@ export const movePreviewHandler: AuthHandler = async (req, params, ctx) => {
 
 // ── D2: execute handler ─────────────────────────────────────────────────────────
 
-function inboundPathOf(dataDir: string, agentGroupId: string, sessionId: string): string {
-  return path.join(dataDir, 'v2-sessions', agentGroupId, sessionId, 'inbound.db');
-}
-
 /** Map the source live-row status to the §4.0 health state the move guard needs. */
 function moveGuardState(status: string, processAfterMs: number | null, nowMs: number): HealthState {
   if (status === 'paused') return 'paused';
@@ -533,24 +524,75 @@ export const moveExecuteHandler: AuthHandler = async (req, params, ctx) => {
     kind: snapshot.kind,
   };
 
-  // Step 3: cancel the source live row (→ completed, recurrence cleared).
+  // Step 3: cancel the source live row (→ cancelled, recurrence cleared).
   // Capture the touched count (E-2): the §2a guard already proved the source is
   // live, so a 0-touch cancel is unexpected — but if it happens, abort BEFORE
   // inserting the target so a no-op cancel can never leave a target-only series.
-  let cancelTouched = 0;
-  {
-    const srcDb = openInboundDb(sourceInbound);
-    try {
-      cancelTouched = cancelTask(srcDb, source.seriesId);
-    } finally {
-      srcDb.close();
-    }
-  }
+  //
+  // Existing-only (invariant I-10): the §2a guard just proved the source row
+  // is live, so the mailbox is there. `undefined` means it vanished under the
+  // guard, which reads as 0 touched and takes the abort branch below rather
+  // than inserting into the target — the same fail-safe direction the pre-seam
+  // open's throw had.
+  //
+  // BY ROW ID, and only if that row is still exactly what was approved.
+  // Everything above — the delta hash, the verdict, the move_intent body,
+  // `restoreSnapshot` — describes the single occurrence `snapshot.id`. The
+  // pre-seam code could cancel the SERIES here because the read and the cancel
+  // were one synchronous run with no yield between them, so nothing could
+  // change. Acquiring the mailbox now yields, and in that window the
+  // occurrence can complete and arm a successor, or be admitted and fired
+  // where it stands. Every refusal below returns 0 touched and takes the abort
+  // branch, which is what "the key went stale" already means here.
+  const cancelTouched =
+    (await withExistingMailboxSession(source.agentGroupId, source.sessionId, (mailbox) => {
+      // Re-prove the approved occurrence, inside the session, with nothing
+      // awaited between the read and the write.
+      //
+      // The id alone is not enough, and that is the whole finding: admission
+      // MUTATES a task row in place. A dashboard run-now landing in this
+      // acquisition window flips `trigger` 0 → 1 and moves `process_after`
+      // while the id and the `pending` status stay exactly as §2's read saw
+      // them — so an id-scoped cancel would cancel an occurrence that is now
+      // triggered (and possibly claimed by a container mid-fire), and the
+      // move would then recreate the stale snapshot in the target.
+      const current = mailbox.getLiveTaskRow(source.seriesId);
+      if (!current || current.id !== snapshot.id) return 0;
+      const changed = approvedRowChanged(snapshot, current);
+      if (changed) {
+        log.warn('scheduled-move: the approved occurrence changed under the move — refusing', {
+          seriesId: source.seriesId,
+          rowId: snapshot.id,
+          field: changed,
+        });
+        return 0;
+      }
+      // Inert, absolutely and not merely unchanged. §2a's verdict passed
+      // `claimed: false` without proving it; a move must not consume an
+      // occurrence that is armed to fire or already being fired.
+      if (current.trigger !== 0) {
+        log.warn('scheduled-move: the approved occurrence is admitted — refusing', {
+          seriesId: source.seriesId,
+          rowId: snapshot.id,
+        });
+        return 0;
+      }
+      if (mailbox.getProcessingClaimRows().some((claim) => claim.message_id === snapshot.id)) {
+        log.warn('scheduled-move: the approved occurrence is claimed — refusing', {
+          seriesId: source.seriesId,
+          rowId: snapshot.id,
+        });
+        return 0;
+      }
+      return mailbox.cancelTaskRow(snapshot.id);
+    })) ?? 0;
   if (cancelTouched === 0) {
-    // Nothing was cancelled (raced terminal/move between the guard and here) —
-    // leave the intent unresolved for the recovery sweep and do NOT insert.
+    // Nothing was cancelled (the approved occurrence stopped being live between
+    // the guard and here) — leave the intent unresolved for the recovery sweep
+    // and do NOT insert.
     log.warn('scheduled-move: cancel touched 0 rows — aborting before target insert', {
       seriesId: source.seriesId,
+      rowId: snapshot.id,
     });
     return json({ error: 'stale_key', reason: 'stale_key' }, 409);
   }
@@ -565,22 +607,29 @@ export const moveExecuteHandler: AuthHandler = async (req, params, ctx) => {
       );
       const tgtSessId = targetSessionIdFor(target.agentGroupId, source.seriesId);
       if (tgtSessId) {
-        const tgtDb = openInboundDb(inboundPathOf(dataDir, target.agentGroupId, tgtSessId));
-        try {
-          pauseTask(tgtDb, source.seriesId);
+        // A DIFFERENT key from the source session above, and that session is
+        // closed by now — the two opens are sequential, never nested, which is
+        // what the same-key nesting guard (invariant I-3) forbids.
+        //
+        // `scheduleTask` just provisioned this mailbox, so `undefined` is a
+        // genuine fault: staging exists so the row is never simultaneously
+        // pending and due, and skipping it would land a paused move as
+        // pending. Throwing takes the restore path, as the pre-seam open did.
+        const staged = await withExistingMailboxSession(target.agentGroupId, tgtSessId, (mailbox) => {
+          mailbox.pauseTask(source.seriesId);
           // keepScheduledFor: this restores the row's RUN time after the
           // staged grace insert. scheduleTask already stamped the occurrence's
           // slot from the snapshot, and moving it again here would overwrite it
           // with the run time.
           if (snapshot.process_after) {
-            updateTask(tgtDb, source.seriesId, {
+            mailbox.updateTask(source.seriesId, {
               processAfter: snapshot.process_after,
               keepScheduledFor: true,
             });
           }
-        } finally {
-          tgtDb.close();
-        }
+          return true;
+        });
+        if (!staged) throw new Error(`target task session ${tgtSessId} has no inbound mailbox to stage into`);
       }
     } else {
       await scheduledTasks.scheduleTask(taskDefFromSnapshot(snapshot, source.seriesId, target.agentGroupId, targetMg));
@@ -605,13 +654,11 @@ export const moveExecuteHandler: AuthHandler = async (req, params, ctx) => {
         source.seriesId,
       );
       if (!live.unreadable && live.count === 0) {
-        const srcDb = openInboundDb(sourceInbound);
-        try {
-          restoreTaskRow(srcDb, restoreSnapshot);
-          restored = true;
-        } finally {
-          srcDb.close();
-        }
+        restored =
+          (await withExistingMailboxSession(source.agentGroupId, source.sessionId, (mailbox) => {
+            mailbox.restoreTaskRow(restoreSnapshot);
+            return true;
+          })) ?? false;
       }
     } catch (restoreErr) {
       log.error('scheduled-move: source restore ALSO failed', {

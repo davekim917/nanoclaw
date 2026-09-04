@@ -39,7 +39,8 @@ vi.mock('./db/messaging-groups.js', async (importOriginal) => {
 
 import { buildMounts } from './container-runner.js';
 import { getAgentMailbox } from './mailbox/index.js';
-import { inboundDbPath, sessionContextPath, writeSessionContext } from './session-manager.js';
+import { sessionContextPath, writeSessionContext } from './session-manager.js';
+import { inboundDbPath } from './mailbox/sqlite/paths.js';
 import { buildContainerCodexConfig } from './providers/codex.js';
 import { closeDb, createAgentGroup, getDb, initTestDb, runMigrations } from './db/index.js';
 import { ensureContainerConfig, updateContainerConfigScalars } from './db/container-configs.js';

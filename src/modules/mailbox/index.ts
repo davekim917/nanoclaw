@@ -27,6 +27,7 @@ import {
   openInboundDb,
   openOutboundDb,
   openOutboundDbRw,
+  openOutboundDbWritable,
   sessionDbPathIsGone,
 } from './openers.js';
 import { ensureNanoclawInboundSchema, ensureSchema } from './schema.js';
@@ -78,13 +79,29 @@ import {
   type InboundRoutingAnchor,
   type RoutedTaskRow,
 } from './ops/lookups.js';
-import { listTurnUsageSince, type SessionTurnUsageRow } from './ops/reads.js';
+import { getLiveTaskRow, listTurnUsageSince, type ScheduledTaskRow, type SessionTurnUsageRow } from './ops/reads.js';
+import {
+  admitDueRow,
+  admitPendingUpgradeRow,
+  deferForFreshContextRetry,
+  demoteUnpairedLegacyTasks,
+  listDueAdmissionRows,
+  listUnpairedPendingUpgradeRows,
+  restoreInertTaskSchedule,
+  taskPairIsAdmitted,
+  type DueAdmissionRow,
+  type PendingUpgradeRow,
+} from './ops/admission.js';
 import {
   armNextTask,
   cancelSeriesWithStrandClear,
+  cancelTaskRow,
+  getCliTaskRow,
   getCompletedRecurring,
+  getCreatedTaskRow,
   insertRecurrence,
   insertTaskRow,
+  listCliTaskSeries,
   listDueTaskRows,
   resolvePendingTask,
   restoreTaskRow,
@@ -93,6 +110,8 @@ import {
   setPendingTaskContent,
   updateTask,
   upsertTaskSeries,
+  type CliTaskRow,
+  type CreatedTaskRow,
   type HostGatedTaskRow,
   type RecurringMessage as ForkRecurringMessage,
   type TaskRowInsert,
@@ -164,6 +183,7 @@ export {
   WORK_CONTINUATION_TASK_MAX_CHARS,
   type HostWorkContinuation,
 } from './ops/continuation.js';
+export { writeOutboundDirectRow } from './ops/recovery.js';
 export type { DirectOutboundRow, InboundMessageRouting } from './ops/recovery.js';
 export { INTERACTIVE_WAKE_MAX_AGE_MS, type ContainerState as ForkContainerStateRow } from './ops/sweep.js';
 export { readRepoIngressFence } from './ops/fence.js';
@@ -185,12 +205,15 @@ export {
 } from '../../mailbox/sqlite/tasks.js';
 export {
   cancelSeriesWithStrandClear,
+  cancelTaskRow,
   getCompletedRecurring,
   insertRecurrence,
   insertTaskRow,
   restoreTaskRow,
   resumeTask,
   updateTask,
+  type CliTaskRow,
+  type CreatedTaskRow,
   type HostGatedTaskRow,
   type RecurringMessage,
   type TaskRowInsert,
@@ -199,6 +222,7 @@ export {
   type TaskUpdate,
   type UpsertedTaskSeries,
 } from './ops/tasks.js';
+export type { DueAdmissionRow, PendingUpgradeRow } from './ops/admission.js';
 export {
   CLOSE_REASON_MAX_CHARS,
   clearWorkContinuation,
@@ -231,7 +255,15 @@ export {
   type SessionReadLocation,
   type SessionReadOptions,
 } from './read-only.js';
-export type { OutboundSystemRow, ScheduledTaskRow, SessionTurnUsageRow, TaskFireRow } from './ops/reads.js';
+export type {
+  MessageTailRow,
+  OutboundSystemRow,
+  ScheduledTaskRow,
+  SessionTurnUsageRow,
+  TaskDeliveryRoute,
+  TaskFireRow,
+  TaskRoutingStamp,
+} from './ops/reads.js';
 export type { ContainerState, ProcessingClaim } from './ops/sweep.js';
 
 /**
@@ -418,6 +450,20 @@ export interface NanoclawMailboxSession extends MailboxSession {
    */
   restoreTaskSeries(touchedId: string, prior: TaskSeriesSnapshot | null, priorRecall: TaskSeriesSnapshot | null): void;
   cancelSeriesWithStrandClear(taskId: string): number;
+  /**
+   * Cancel ONE row by its exact id — the by-id twin of upstream's series-wide
+   * `cancelTask`, for a writer acting on a row it read earlier.
+   */
+  cancelTaskRow(rowId: string): number;
+  /**
+   * The newest LIVE (`pending`/`paused`) task row of a series.
+   *
+   * The read-only funnels have carried this since PR 6; the WRITE session
+   * needs it too, because a writer that approved a row before an await has to
+   * re-prove that row is still the live one before it mutates. Same op, same
+   * statement (invariant I-2) — the surface differs, the SQL does not.
+   */
+  getLiveTaskRow(seriesId: string): ScheduledTaskRow | null;
   upsertTaskSeries(row: {
     id: string;
     seriesId: string;
@@ -434,6 +480,26 @@ export interface NanoclawMailboxSession extends MailboxSession {
   listDueTaskRows(): HostGatedTaskRow[];
   resolvePendingTask(taskId: string, status: 'completed' | 'failed'): void;
   setPendingTaskContent(taskId: string, content: string): void;
+  /**
+   * The `ncl tasks` board's own series view. Not upstream's `listLiveTasks` /
+   * `getTask`: those pick a series' representative row by a paused-or-future
+   * rank and return a `TaskRecord`, which carries no routing columns — and the
+   * CLI's table shows where a task posts.
+   */
+  listCliTaskSeries(status?: 'pending' | 'paused'): CliTaskRow[];
+  getCliTaskRow(id: string): CliTaskRow | undefined;
+  getCreatedTaskRow(id: string): CreatedTaskRow | undefined;
+
+  // --- host-owned due admission -------------------------------------------
+  /** The recall POLICY stays with session-manager; these commit its decision. */
+  demoteUnpairedLegacyTasks(): void;
+  listDueAdmissionRows(): DueAdmissionRow[];
+  admitDueRow(recall: MessageInsert, taskId: string): boolean;
+  listUnpairedPendingUpgradeRows(): PendingUpgradeRow[];
+  admitPendingUpgradeRow(recall: MessageInsert, messageId: string): boolean;
+  deferForFreshContextRetry(messageId: string, backoffSec: number): void;
+  taskPairIsAdmitted(taskId: string): boolean;
+  restoreInertTaskSchedule(taskId: string, processAfter: string | null): void;
 
   // --- fork-only recall pairing -------------------------------------------
   readProviderRecallState(provider: string): ProviderRecallState;
@@ -481,29 +547,6 @@ export interface NanoclawMailboxSession extends MailboxSession {
   hasNonStatusReplyTo(messageId: string): boolean;
   /** The fork's `MAX(seq) + 2` direct write; opens the writable outbound handle. */
   writeOutboundDirect(message: DirectOutboundRow): void;
-
-  // --- TRANSITIONAL: raw handles for callers not yet on the seam ----------
-  /**
-   * The open inbound / readable outbound handles behind this session.
-   *
-   * These exist for exactly one reason: a handful of helpers the host sweep
-   * calls still take a `Database.Database` and live in files owned by other
-   * PRs of this series (`modules/scheduling/*`, `dashboard/thread-close.ts`,
-   * `session-manager.ts`, `db/usage.ts`). Handing them the session's own
-   * handle keeps the sweep on ONE open per session per duty instead of
-   * reopening the file beside a live session.
-   *
-   * Every use is a debt, not an API: `src/mailbox-seam-ratchet.ts` counts
-   * these names as raw access, so a file that calls one stays on the
-   * allowlist until its callee moves behind the seam. PR 7 deletes both.
-   *
-   * The handle is valid only for the duration of the action; never store it.
-   *
-   * @deprecated Removed in mailbox seam PR 7.
-   */
-  legacyInboundHandle(): Database.Database;
-  /** @deprecated Removed in mailbox seam PR 7. See `legacyInboundHandle`. */
-  legacyOutboundHandle(): Database.Database;
 }
 
 /**
@@ -535,19 +578,48 @@ export type NanoclawOutboundRead = Pick<
 >;
 
 /**
- * The reads plus the one outbound WRITE the host performs on this head.
+ * The reads plus the outbound WRITES the host performs.
  *
- * `clearWorkContinuation` is the thread-close force-clear — a host write to a
- * container-owned key, valid only with the container confirmed stopped (see
- * the policy around it in `dashboard/thread-close.ts`). It is the single
- * reason this type is not simply `NanoclawOutboundRead`, and the reason PR 7's
- * read-only type is the narrower of the two: `OutboundSessionRead` is a
- * `Pick` of this, or this is `OutboundSessionRead & { clearWorkContinuation }`,
- * whichever direction reads better once both exist in one tree.
+ * Two, and they are the reason this type is not simply `NanoclawOutboundRead`:
+ *
+ *  - `clearWorkContinuation` — the thread-close force-clear, a host write to a
+ *    container-owned key, valid only with the container confirmed stopped (see
+ *    the policy around it in `dashboard/thread-close.ts`).
+ *  - `writeOutboundDirect` — the router's two notices (a command-gate denial,
+ *    a flag confirmation), which append an id-unique row rather than mutating
+ *    container-owned state. Outbound-keyed because they read nothing from
+ *    inbound.db; through the mailbox session they were silently dropped for a
+ *    session whose inbound.db had been reclaimed.
  */
-export type NanoclawOutboundSession = NanoclawOutboundRead & Pick<NanoclawMailboxSession, 'clearWorkContinuation'>;
+export type NanoclawOutboundSession = NanoclawOutboundRead &
+  Pick<NanoclawMailboxSession, 'clearWorkContinuation' | 'writeOutboundDirect'>;
 
 export type NanoclawMailboxAction<T> = (mailbox: NanoclawMailboxSession) => T | Promise<T>;
+
+/**
+ * Extra arguments the outbound funnels demand when their action is async.
+ *
+ * Empty for every synchronous action, so the call site is unchanged. For an
+ * action returning a promise it is `[never]`, and the call fails to compile
+ * for want of an argument nothing can supply.
+ *
+ * A conditional on the RETURN type would not do this — it types the result and
+ * defers the complaint to whatever consumes it. A conditional on the parameter
+ * (`(o) => T extends PromiseLike<unknown> ? never : T`) is worse: a conditional
+ * is not an inference site, so `T` never binds and every action passes. The
+ * arity check is the one form that both preserves inference for `T` (including
+ * `void`, which an intersection guard rejects) and refuses at the call itself.
+ */
+export type SyncActionOnly<T> = T extends PromiseLike<unknown> ? [actionMustNotBeAsync: never] : [];
+
+/** Structural promise test — `instanceof Promise` misses a thenable from another realm. */
+function isThenable(value: unknown): boolean {
+  return (
+    (typeof value === 'object' || typeof value === 'function') &&
+    value !== null &&
+    typeof (value as { then?: unknown }).then === 'function'
+  );
+}
 
 /** Normalize upstream's boolean flag shape onto the fork's 0|1 columns. */
 function toMessageInsert(message: NanoclawInboundInsert): MessageInsert {
@@ -737,7 +809,127 @@ export function composeOutboundOps(
     readDoneProposal: () => readOutbound(null, readDoneProposal),
     readContinuationPresence: () => readOutbound(null, readContinuationPresence),
     clearWorkContinuation: () => (outboundPresent ? clearWorkContinuation(writableOutbound()) : null),
+    // The direct notice deliberately does NOT degrade, which is the write rule
+    // rather than an exception to it: `openOutboundDbWritable` refuses a
+    // missing file instead of creating one, so a never-woken session raises
+    // `SessionDbMissingError` here — the failure the router's two notice
+    // writers already handle. `clearWorkContinuation` degrades because
+    // "nothing to clear" is a true answer for a session that never ran;
+    // "the notice was written" would not be.
+    writeOutboundDirect: (message) => writeOutboundDirectRow(writableOutbound(), message),
   };
+}
+
+/**
+ * Run one operation against a session's OUTBOUND database alone.
+ *
+ * Resolves `undefined` — never provisions, never throws — when `outbound.db`
+ * is genuinely absent. That is the never-woken shape: the container owns that
+ * file, and one that never ran has not written it.
+ *
+ * Deliberately NOT the mailbox session. That funnel's existence check is keyed
+ * on `inbound.db`, so it answers `undefined` for a session whose inbound.db is
+ * gone while outbound.db remains — a real cohort — and any caller reading
+ * outbound state through it reports that state as empty when it is not. Four
+ * separate review findings across this series were instances of that one
+ * mistake, the last of them the router's two notices. The rule the seam
+ * settles on: the existence question a read asks is keyed to the file the read
+ * actually touches.
+ *
+ * The action receives the module's TYPED outbound ops, not a raw `Database` —
+ * a handle leaving the module is the shape the seam exists to remove
+ * (invariant I-9), whether or not the ratchet's name patterns happen to catch
+ * the parameter. The ops are the same composition `forkOps` spreads, so an op
+ * cannot behave differently depending on which funnel reached it.
+ *
+ * Both handles open lazily and only if the action asks: a pure read never
+ * opens the writer, and once the writer is open the reads share it, so a
+ * clear-then-verify sees its own write on one connection. A file that is
+ * present but will not open raises `SessionDbUnopenableError` from the
+ * opener — unreadable is a fault, never an empty answer. A file that vanishes
+ * between the existence check and the first op raises `SessionDbMissingError`
+ * rather than resolving `undefined`; that race is a fault too.
+ *
+ * Lives HERE rather than beside the two read funnels in `read-only.ts`, which
+ * is where the rest of the "ways in" are documented. It is built from
+ * `composeOutboundOps` directly above, and `read-only.ts` cannot import that
+ * without a static import cycle through this barrel — which the host's ESM
+ * rules say to avoid rather than rely on hoisting to survive.
+ *
+ * The action must be SYNCHRONOUS. This function is `async` only so callers can
+ * `await` it beside the other funnels; its body does not await, and the
+ * handles close as soon as the action RETURNS. An `async` action returns a
+ * promise at that moment, so its continuation would resume onto closed
+ * handles — `The database connection is not open`, or worse, a handle opened
+ * after the await that nothing ever closes. The rest parameter below makes
+ * that a compile error rather than a runtime surprise, and the runtime check
+ * in the sync core catches the JavaScript caller the types cannot reach.
+ */
+export async function withExistingNanoclawOutbound<T>(
+  agentGroupId: string,
+  sessionId: string,
+  action: (outbound: NanoclawOutboundSession) => T,
+  ...sync: SyncActionOnly<T>
+): Promise<T | undefined> {
+  return withExistingNanoclawOutboundSync(agentGroupId, sessionId, action, ...sync);
+}
+
+/**
+ * The same funnel, without the promise.
+ *
+ * The body below never awaited anything: `action` returns `T`, better-sqlite3
+ * is synchronous, and the `async` keyword on the form above is conformance
+ * with the mailbox interface rather than a statement about the work. That
+ * distinction stops being cosmetic the moment a caller needs SEVERAL sessions'
+ * outbound state as of ONE instant.
+ *
+ * A `Promise.all` fan-out cannot give that. Each read resolves at its own
+ * moment, so by the time the last one lands the first is already history — and
+ * for thread-close, "history" is a container that has since taken new work and
+ * cleared its proposal. Deciding from that set kills a working agent. Called in
+ * a loop with nothing awaited between the calls and the decision, this gives
+ * the one instant the decision needs.
+ *
+ * Same existence rule, same typed ops, same fault behavior as the async form —
+ * it IS the async form's body, so the two cannot drift.
+ */
+export function withExistingNanoclawOutboundSync<T>(
+  agentGroupId: string,
+  sessionId: string,
+  action: (outbound: NanoclawOutboundSession) => T,
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars -- type-level only
+  ..._sync: SyncActionOnly<T>
+): T | undefined {
+  const outboundPath = sessionMailboxPath({ agentGroupId, sessionId }, 'outbound');
+  if (sessionDbPathIsGone(outboundPath)) return undefined;
+  let readable: Database.Database | undefined;
+  let writable: Database.Database | undefined;
+  try {
+    const result = action(
+      composeOutboundOps(
+        () => writable ?? (readable ??= openOutboundDb(outboundPath)),
+        () => (writable ??= openOutboundDbWritable(outboundPath)),
+        true,
+      ),
+    );
+    // The type above stops a TypeScript caller; this stops the ones it cannot
+    // see — plain JavaScript, an `as never`, a callback whose return type is
+    // widened through a generic. Returning the promise would hand back a value
+    // that only resolves after `finally` has closed the handles it needs, so
+    // the failure surfaces here, at the call, instead of somewhere downstream
+    // as a closed-connection error nobody can trace back.
+    if (isThenable(result)) {
+      throw new TypeError(
+        'withExistingNanoclawOutbound requires a synchronous action: the outbound handles close when it ' +
+          'returns, so an async action resumes onto closed handles. Read what you need synchronously and ' +
+          'await outside the funnel.',
+      );
+    }
+    return result;
+  } finally {
+    writable?.close();
+    readable?.close();
+  }
 }
 
 export function composeNanoclawSession(
@@ -874,10 +1066,24 @@ function forkOps(
     restoreTaskRow: (snapshot) => restoreTaskRow(inbound, snapshot),
     restoreTaskSeries: (touchedId, prior, priorRecall) => restoreTaskSeries(inbound, touchedId, prior, priorRecall),
     cancelSeriesWithStrandClear: (taskId) => cancelSeriesWithStrandClear(inbound, taskId),
+    cancelTaskRow: (rowId) => cancelTaskRow(inbound, rowId),
+    getLiveTaskRow: (seriesId) => getLiveTaskRow(inbound, seriesId),
     upsertTaskSeries: (row) => upsertTaskSeries(inbound, row),
     listDueTaskRows: () => listDueTaskRows(inbound),
     resolvePendingTask: (taskId, status) => resolvePendingTask(inbound, taskId, status),
     setPendingTaskContent: (taskId, content) => setPendingTaskContent(inbound, taskId, content),
+    listCliTaskSeries: (status) => listCliTaskSeries(inbound, status),
+    getCliTaskRow: (id) => getCliTaskRow(inbound, id),
+    getCreatedTaskRow: (id) => getCreatedTaskRow(inbound, id),
+
+    demoteUnpairedLegacyTasks: () => demoteUnpairedLegacyTasks(inbound),
+    listDueAdmissionRows: () => listDueAdmissionRows(inbound),
+    admitDueRow: (recall, taskId) => admitDueRow(inbound, recall, taskId),
+    listUnpairedPendingUpgradeRows: () => listUnpairedPendingUpgradeRows(inbound),
+    admitPendingUpgradeRow: (recall, messageId) => admitPendingUpgradeRow(inbound, recall, messageId),
+    deferForFreshContextRetry: (messageId, backoffSec) => deferForFreshContextRetry(inbound, messageId, backoffSec),
+    taskPairIsAdmitted: (taskId) => taskPairIsAdmitted(inbound, taskId),
+    restoreInertTaskSchedule: (taskId, processAfter) => restoreInertTaskSchedule(inbound, taskId, processAfter),
 
     readProviderRecallState: (provider) => readProviderRecallState(readableOutbound(), provider),
     listOpenChatContents: () => listOpenChatContents(inbound),
@@ -914,9 +1120,5 @@ function forkOps(
     outboundHasRecentContentLike: (marker, withinSeconds) =>
       readOutbound(false, (outbound) => outboundHasRecentContentLike(outbound, marker, withinSeconds)),
     hasNonStatusReplyTo: (messageId) => readOutbound(false, (outbound) => hasNonStatusReplyTo(outbound, messageId)),
-    writeOutboundDirect: (message) => writeOutboundDirectRow(writableOutbound(), message),
-
-    legacyInboundHandle: () => inbound,
-    legacyOutboundHandle: () => readableOutbound(),
   };
 }

@@ -40,7 +40,7 @@ import {
   type ForkContainerStateRow as ContainerState,
   type NanoclawMailboxSession,
 } from './modules/mailbox/index.js';
-import { withExistingNanoclawSession } from './modules/mailbox/session.js';
+
 import { runHostGatedTaskScripts } from './modules/scheduling/host-script.js';
 import { advanceThreadClosures, syncDoneProposalMirror } from './dashboard/thread-close.js';
 import { log } from './log.js';
@@ -49,6 +49,7 @@ import {
   sessionsBaseDir,
   admitDueTaskContexts,
   deferMessageForFreshContextRetry,
+  withExistingMailboxSession,
 } from './session-manager.js';
 import {
   getContainerSpawnedAt,
@@ -1075,7 +1076,7 @@ export const providerFailedTicks = new Map<string, number>();
  * a `killContainer` call rather than hold one across it (invariant I-3):
  * a kill respawns through `onExit` and clears the session's status through
  * `delivery.ts`, and both of those open a mailbox session on this same key.
- * Production passes `withExistingNanoclawSession`; a test passes a runner over
+ * Production passes `withExistingMailboxSession`; a test passes a runner over
  * its own in-memory handles.
  *
  * Resolves `undefined` when the mailbox is gone — the read-path contract.
@@ -1272,21 +1273,19 @@ async function prepareDueWake(
   // on the host BEFORE admission, so a gated/errored fire never becomes due
   // and never spawns a container. See host-script.ts's runHostGatedTaskScripts.
   //
-  // `runHostGatedTaskScripts` takes this session (mailbox seam PR 4): it is a
-  // sweep callee with no other production caller, and a SESSION parameter is
-  // the seam's sanctioned object — invariant I-9 forbids handing out raw
-  // handles, not sessions, so the callee stays off the ratchet's allowlist.
-  // It can spend the full pre-task timeout per row, so the session is held
-  // across that work exactly as it was when this line passed a raw handle.
-  // `admitDueTaskContexts` still takes one: it lives in `session-manager.ts`
-  // and moves behind the seam in PR 7. `legacyInboundHandle` survives here for
-  // that one call and nothing else.
+  // `runHostGatedTaskScripts` and `admitDueTaskContexts` both take this
+  // session: they are sweep callees with no other production caller, and a
+  // SESSION parameter is the seam's sanctioned object — invariant I-9 forbids
+  // handing out raw handles, not sessions, so neither callee lands on the
+  // ratchet's allowlist. The script runner can spend the full pre-task timeout
+  // per row, so the session is held across that work exactly as it was when
+  // these lines passed a raw handle.
   //
   // `agentGroupId` rides along because the callee resolves the GROUP's
   // timezone for its local-time gate: a session parameter identifies the
   // mailbox, not the group whose zone override applies.
   await runHostGatedTaskScripts(mailbox, agentGroupId, sessionId);
-  const admittedTasks = admitDueTaskContexts(mailbox.legacyInboundHandle(), agentGroupId, sessionId);
+  const admittedTasks = admitDueTaskContexts(mailbox, agentGroupId, sessionId);
   const dueCount = mailbox.countDueMessages();
   return {
     admittedTasks,
@@ -1326,7 +1325,7 @@ async function sweepSession(session: Session, tick: SweepTickContext): Promise<n
   // closed, never held across a wake or a kill (invariant I-3). Reads never
   // provision (invariant I-4): a session whose mailbox is gone resolves
   // undefined and is counted as unreadable rather than silently recreated.
-  const baseRun: SessionRunner = (action) => withExistingNanoclawSession(agentGroup.id, session.id, action);
+  const baseRun: SessionRunner = (action) => withExistingMailboxSession(agentGroup.id, session.id, action);
 
   // `session:plan` fills this in; every later phase reads it.
   const plan: WakePlan = {
@@ -1525,7 +1524,7 @@ export function _incrementStoppedContinuationAttemptForTesting(
   session: Session,
   expectedId: string,
 ): Promise<HostWorkContinuation | null> {
-  const run: SessionRunner = (action) => withExistingNanoclawSession(session.agent_group_id, session.id, action);
+  const run: SessionRunner = (action) => withExistingMailboxSession(session.agent_group_id, session.id, action);
   return incrementStoppedContinuationAttempt(run, session, expectedId);
 }
 
@@ -1718,7 +1717,7 @@ function resetStuckProcessingRows(mailbox: NanoclawMailboxSession, session: Sess
     } else {
       const backoffMs = BACKOFF_BASE_MS * Math.pow(2, msg.tries);
       const backoffSec = Math.floor(backoffMs / 1000);
-      deferMessageForFreshContextRetry(mailbox.legacyInboundHandle(), msg.id, backoffSec);
+      deferMessageForFreshContextRetry(mailbox, msg.id, backoffSec);
       log.info('Reset stale message with backoff', {
         messageId: msg.id,
         tries: msg.tries,

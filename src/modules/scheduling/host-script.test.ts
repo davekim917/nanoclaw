@@ -14,7 +14,8 @@ import path from 'path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { TIMEZONE } from '../../config.js';
-import { ensureSchema, openInboundDb } from '../../db/session-db.js';
+import { openInboundDb } from '../mailbox/openers.js';
+import { ensureSchema } from '../mailbox/schema.js';
 import { composeNanoclawSession } from '../mailbox/index.js';
 import { insertTaskRow } from './db.js';
 import { classifyForHostExecution, runHostGatedTaskScripts } from './host-script.js';

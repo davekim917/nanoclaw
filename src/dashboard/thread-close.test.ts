@@ -6,7 +6,7 @@ import Database from 'better-sqlite3';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { createAgentGroup, getDb, initTestDb, runMigrations } from '../db/index.js';
-import { ensureSchema } from '../db/session-db.js';
+import { ensureSchema } from '../modules/mailbox/schema.js';
 import { guard } from '../guard/index.js';
 import type { AuthedRequestContext } from './router.js';
 
@@ -28,8 +28,8 @@ const duringProposalRead = vi.hoisted(() => ({
   skip: 0,
 }));
 
-vi.mock('../modules/mailbox/session.js', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('../modules/mailbox/session.js')>();
+vi.mock('../modules/mailbox/index.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../modules/mailbox/index.js')>();
   return {
     ...actual,
     // The SYNC funnel is what the decision path reads through now: the async

@@ -17,8 +17,11 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 
 import Database from 'better-sqlite3';
 
+import type { NanoclawMailboxSession } from '../../modules/mailbox/index.js';
+
 import { initTestDb, closeDb, getDb } from '../../db/connection.js';
-import { ensureSchema, openInboundDb } from '../../db/session-db.js';
+import { openInboundDb } from '../../modules/mailbox/openers.js';
+import { ensureSchema } from '../../modules/mailbox/schema.js';
 import { migration043 } from '../../db/migrations/043-scheduled-audit.js';
 import {
   encodeKey,
@@ -29,6 +32,21 @@ import {
 } from './scheduled-shared.js';
 import type { AuthedRequestContext } from '../router.js';
 
+// Unique per-file temp dir (mkdtemp) — no fixed /tmp path a sibling file or a
+// parallel agent process could collide on (hermeticity, matches the read/
+// assembly test fix). Hoisted because DATA_DIR is mocked to it below: the
+// mutation writes go through the mailbox seam, which resolves session paths
+// from DATA_DIR, so the injected `dataDir` and DATA_DIR have to be the same
+// root or the gate would read the fixture and the write would miss it.
+const TEST_DIR = vi.hoisted(() => {
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  return require('fs').mkdtempSync(require('path').join(require('os').tmpdir(), 'nc-sched-mut-')) as string;
+});
+vi.mock('../../config.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../config.js')>()),
+  DATA_DIR: TEST_DIR,
+}));
+
 // wakeContainer is mocked so run-now doesn't try to spawn a real container.
 const mockWakeContainer = vi.fn().mockResolvedValue(true);
 const mockAdmitDueTaskContexts = vi.fn().mockReturnValue(1);
@@ -36,11 +54,21 @@ vi.mock('../../container-runner.js', async (importOriginal) => {
   const real = await importOriginal<typeof import('../../container-runner.js')>();
   return { ...real, wakeContainer: (...args: unknown[]) => mockWakeContainer(...args) };
 });
+// A hook that fires INSIDE the mutation's mailbox acquisition — the window the
+// async funnel opened between the preflight verdict and the write. Real
+// implementation otherwise, so every other case in this file is unaffected.
+const duringMailboxAcquire = vi.hoisted(() => ({ run: null as (() => void) | null }));
 vi.mock('../../session-manager.js', async (importOriginal) => {
   const real = await importOriginal<typeof import('../../session-manager.js')>();
   return {
     ...real,
     admitDueTaskContexts: (...args: unknown[]) => mockAdmitDueTaskContexts(...args),
+    withExistingMailboxSession: async (agentGroupId: string, sessionId: string, action: never) => {
+      const hook = duringMailboxAcquire.run;
+      duringMailboxAcquire.run = null;
+      hook?.();
+      return real.withExistingMailboxSession(agentGroupId, sessionId, action);
+    },
   };
 });
 
@@ -53,10 +81,6 @@ import {
   _setMutationsTestOptions,
 } from './scheduled-mutations.js';
 
-// Unique per-file temp dir (mkdtemp) — no fixed /tmp path a sibling file or a
-// parallel agent process could collide on (hermeticity, matches the read/
-// assembly test fix).
-const TEST_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'nc-sched-mut-'));
 const NOW = Date.parse('2026-06-13T12:00:00Z');
 const AG = 'ag-1';
 const SESS = 'sess-1';
@@ -224,34 +248,32 @@ beforeEach(() => {
   _resetScheduledRateLimitForTesting();
   mockWakeContainer.mockClear();
   mockAdmitDueTaskContexts.mockReset();
-  mockAdmitDueTaskContexts.mockImplementation((db: Database.Database) => {
-    const task = db
-      .prepare(
-        `SELECT id, timestamp, process_after
-           FROM messages_in
-          WHERE kind = 'task' AND status = 'pending' AND trigger = 0
-            AND (process_after IS NULL OR datetime(process_after) <= datetime('now'))
-          ORDER BY seq
-          LIMIT 1`,
-      )
-      .get() as { id: string; timestamp: string; process_after: string | null } | undefined;
+  // The stub stands in for the recall POLICY only — which row deserves a pair
+  // and what the pair says. The COMMIT is the module's real `admitDueRow`, so
+  // run-now's admission probe is checked against the production transaction
+  // rather than a second hand-written copy of it.
+  mockAdmitDueTaskContexts.mockImplementation((mailbox: NanoclawMailboxSession) => {
+    const [task] = mailbox.listDueAdmissionRows();
     if (!task) return 0;
-    const maxSeq = (db.prepare('SELECT COALESCE(MAX(seq), 0) AS seq FROM messages_in').get() as { seq: number }).seq;
-    const recallSeq = maxSeq + 2 - (maxSeq % 2);
-    db.prepare(
-      `INSERT INTO messages_in
-         (id, seq, kind, timestamp, status, process_after, recurrence, series_id, trigger, content)
-       VALUES (?, ?, 'system', ?, 'pending', ?, NULL, ?, 0, ?)`,
-    ).run(
-      `recall-${task.id}`,
-      recallSeq,
-      task.timestamp,
-      task.process_after,
-      `recall-${task.id}`,
-      JSON.stringify({ subtype: 'recall_context', source: 'fresh-test-admission' }),
-    );
-    db.prepare('UPDATE messages_in SET seq = ?, trigger = 1 WHERE id = ? AND trigger = 0').run(recallSeq + 2, task.id);
-    return 1;
+    return mailbox.admitDueRow(
+      {
+        id: `recall-${task.id}`,
+        kind: 'system',
+        timestamp: task.timestamp,
+        platformId: null,
+        channelType: null,
+        threadId: null,
+        content: JSON.stringify({ subtype: 'recall_context', source: 'fresh-test-admission' }),
+        processAfter: task.process_after,
+        recurrence: null,
+        trigger: 0,
+        sourceSessionId: null,
+        onWake: 0,
+      },
+      task.id,
+    )
+      ? 1
+      : 0;
   });
   _setMutationsTestOptions({ dataDir: TEST_DIR, nowMs: NOW });
   addUser('owner');
@@ -503,6 +525,37 @@ describe('pause / resume', () => {
     expect(row.status).toBe('pending');
     // Recomputed to a FUTURE slot — does NOT fire immediately.
     expect(Date.parse(row.process_after!)).toBeGreaterThan(NOW);
+  });
+
+  // The preflight approves a PAUSED row, then the mailbox acquisition yields.
+  // If another request resumes that row in the window, the old code still ran
+  // `updateTask` (rewriting process_after on a now-pending row) and only then
+  // discovered `resumeTask` touched nothing — reporting 409 while having
+  // silently rescheduled a live series.
+  it('a resume whose row was resumed during acquisition changes nothing and refuses', async () => {
+    const armed = isoIn(-48 * 3600_000);
+    insertRow(seedSession().inbound, {
+      id: 'r1',
+      series_id: 'ser-1',
+      status: 'paused',
+      recurrence: '0 9 * * *',
+      process_after: armed,
+    });
+
+    duringMailboxAcquire.run = () => {
+      const db = openInboundDb(path.join(TEST_DIR, 'v2-sessions', AG, SESS, 'inbound.db'));
+      db.prepare("UPDATE messages_in SET status = 'pending' WHERE id = 'r1'").run();
+      db.close();
+    };
+
+    const res = (await resumeHandler(postReq(), { key: keyFor('ser-1') }, ctxFor('owner', OWNER_SCOPES)))!;
+    expect(res.status).not.toBe(200);
+
+    // The decisive assertion: the armed instant is untouched. The bug was not
+    // the status code, it was the write that happened before it.
+    const row = liveRow('ser-1')!;
+    expect(row.status).toBe('pending');
+    expect(row.process_after).toBe(armed);
   });
 
   it('test_pause_claimed_409', async () => {

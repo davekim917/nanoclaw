@@ -48,12 +48,8 @@ import { buildThreadContextBlock, withThreadContext } from './thread-context.js'
 import { cancelPendingGatesForSession, sessionHasActiveGates } from './modules/bash-gate/index.js';
 import { startTypingRefresh, stopTypingRefresh } from './modules/typing/index.js';
 import { log } from './log.js';
-import {
-  resolveSession,
-  sessionMessageExists,
-  writeSessionMessageIfNew,
-  writeOutboundDirect,
-} from './session-manager.js';
+import { resolveSession, sessionMessageExists, writeSessionMessageIfNew } from './session-manager.js';
+import { withExistingNanoclawOutbound } from './modules/mailbox/index.js';
 import { archiveMessage } from './message-archive.js';
 import { parseMessageFlags, formatFlagConfirmation, type FlagIntent } from './flag-parser.js';
 import { maybeRenameNewThread } from './topic-title.js';
@@ -1320,14 +1316,23 @@ async function deliverToAgent(
       return;
     }
     if (gate.action === 'deny') {
-      writeOutboundDirect(session.agent_group_id, session.id, {
-        id: `deny-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-        kind: 'chat',
-        platformId: deliveryAddr.platformId,
-        channelType: deliveryAddr.channelType,
-        threadId: deliveryAddr.threadId,
-        content: JSON.stringify({ text: `Permission denied: ${gate.command} requires admin access.` }),
-      });
+      // Existing-only: a denial is not a reason to provision a mailbox
+      // (invariant I-10). OUTBOUND-keyed, not the mailbox session: writing the
+      // notice needs nothing from inbound.db, and a retained session whose
+      // inbound.db has been reclaimed while outbound.db remains would answer
+      // `undefined` from the inbound-keyed funnel — the denial would be logged
+      // with no reply ever written. Pre-seam this opened outbound.db directly,
+      // so the inbound dependency would have been new.
+      await withExistingNanoclawOutbound(session.agent_group_id, session.id, (outbound) =>
+        outbound.writeOutboundDirect({
+          id: `deny-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+          kind: 'chat',
+          platformId: deliveryAddr.platformId,
+          channelType: deliveryAddr.channelType,
+          threadId: deliveryAddr.threadId,
+          content: JSON.stringify({ text: `Permission denied: ${gate.command} requires admin access.` }),
+        }),
+      );
       log.info('Admin command denied by gate', { command: gate.command, userId, agentGroupId: agent.agent_group_id });
       return;
     }
@@ -1370,14 +1375,19 @@ async function deliverToAgent(
       flagCleanedText = parsed.cleanedText;
       const notice = formatFlagConfirmation(parsed.intent ?? {}, parsed.warnings, parsed.errors);
       if (notice) {
-        writeOutboundDirect(session.agent_group_id, session.id, {
-          id: `flag-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-          kind: 'chat',
-          platformId: deliveryAddr.platformId,
-          channelType: deliveryAddr.channelType,
-          threadId: deliveryAddr.threadId,
-          content: JSON.stringify({ text: notice }),
-        });
+        // Outbound-keyed for the same reason as the denial notice above: an
+        // inbound-keyed existence check would silently drop this confirmation
+        // for a session whose inbound.db is gone and outbound.db is not.
+        await withExistingNanoclawOutbound(session.agent_group_id, session.id, (outbound) =>
+          outbound.writeOutboundDirect({
+            id: `flag-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+            kind: 'chat',
+            platformId: deliveryAddr.platformId,
+            channelType: deliveryAddr.channelType,
+            threadId: deliveryAddr.threadId,
+            content: JSON.stringify({ text: notice }),
+          }),
+        );
       }
     }
   }

@@ -18,7 +18,8 @@ vi.mock('../../config.js', async (importOriginal) => ({
   DATA_DIR: `${TEST_ROOT}/data`,
 }));
 
-import { ensureSchema, openInboundDb } from '../../db/session-db.js';
+import { openInboundDb } from '../mailbox/openers.js';
+import { ensureSchema } from '../mailbox/schema.js';
 import {
   insertTaskRow,
   insertRecurrence,

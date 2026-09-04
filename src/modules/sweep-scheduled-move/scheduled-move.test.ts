@@ -273,8 +273,8 @@ describe('recoverMoveIntents (D3) + pruneAuditBodies (D4)', () => {
   let recoverMoveIntents: typeof import('./index.js').recoverMoveIntents;
   let pruneAuditBodies: typeof import('./index.js').pruneAuditBodies;
   let migration043: typeof import('../../db/migrations/043-scheduled-audit.js').migration043;
-  let ensureSchema: typeof import('../../db/session-db.js').ensureSchema;
-  let openInboundDb: typeof import('../../db/session-db.js').openInboundDb;
+  let ensureSchema: typeof import('../mailbox/schema.js').ensureSchema;
+  let openInboundDb: typeof import('../mailbox/openers.js').openInboundDb;
 
   // Unique per-file temp root (mkdtempSync) so parallel vitest workers never
   // share a fixed path and clobber each other's rmSync.
@@ -285,7 +285,8 @@ describe('recoverMoveIntents (D3) + pruneAuditBodies (D4)', () => {
   beforeEach(async () => {
     ({ recoverMoveIntents, pruneAuditBodies } = await import('./index.js'));
     ({ migration043 } = await import('../../db/migrations/043-scheduled-audit.js'));
-    ({ ensureSchema, openInboundDb } = await import('../../db/session-db.js'));
+    ({ ensureSchema } = await import('../mailbox/schema.js'));
+    ({ openInboundDb } = await import('../mailbox/openers.js'));
     if (fs.existsSync(DIR)) fs.rmSync(DIR, { recursive: true });
     fs.mkdirSync(DIR, { recursive: true });
   });

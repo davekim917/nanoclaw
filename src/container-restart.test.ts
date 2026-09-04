@@ -95,11 +95,6 @@ vi.mock('./config.js', async (importOriginal) => ({
 // Only the outbound message write is stubbed; the rest of session-manager
 // (the nesting guard, the provision/exists split) is the real thing, because
 // the real-mailbox case runs through it.
-vi.mock('./session-manager.js', async (importOriginal) => ({
-  ...(await importOriginal<typeof import('./session-manager.js')>()),
-  writeSessionMessage: (...args: unknown[]) => mockWriteSessionMessage(...args),
-}));
-
 // Real fs, except that a MODEL session's inbound.db existence is answered from
 // the sets above — those sessions have no files on disk. A real-mailbox
 // session, and every other path, falls through to the real answer.
@@ -170,17 +165,20 @@ function modelMailbox(sessionId: string): NanoclawMailboxSession {
   } as unknown as NanoclawMailboxSession;
 }
 
-vi.mock('./modules/mailbox/session.js', async (importOriginal) => {
-  const real = await importOriginal<typeof import('./modules/mailbox/session.js')>();
-  const { SessionDbMissingError } = await import('./modules/mailbox/index.js');
+vi.mock('./session-manager.js', async (importOriginal) => {
+  const real = await importOriginal<typeof import('./session-manager.js')>();
   return {
     ...real,
-    withExistingNanoclawSession: async (
+    // One factory per module: vitest keeps only the LAST vi.mock for a given
+    // specifier, so the writeSessionMessage override has to live here too
+    // rather than in a second call that would silently replace this one.
+    writeSessionMessage: (...args: unknown[]) => mockWriteSessionMessage(...args),
+    withExistingMailboxSession: async (
       agentGroupId: string,
       sessionId: string,
       action: (mailbox: NanoclawMailboxSession) => unknown,
     ) => {
-      if (realMailboxSessions.has(sessionId)) return real.withExistingNanoclawSession(agentGroupId, sessionId, action);
+      if (realMailboxSessions.has(sessionId)) return real.withExistingMailboxSession(agentGroupId, sessionId, action);
       beforeInboundOpen?.(sessionId);
       // The seam reports a vanished session as `undefined`, never as a throw.
       if (missingInboundDbs.has(sessionId)) return undefined;
@@ -188,6 +186,17 @@ vi.mock('./modules/mailbox/session.js', async (importOriginal) => {
       openedInboundDbs.push(sessionId);
       return action(modelMailbox(sessionId));
     },
+  };
+});
+
+// `withExistingNanoclawOutbound` moved to the mailbox barrel when PR 4's round
+// 8 made it a typed outbound session — it is composed from `composeOutboundOps`,
+// which lives there. Its own factory, spreading the real module so every other
+// export (the seam itself, used by the `realMailboxSessions` cases) stays real.
+vi.mock('./modules/mailbox/index.js', async (importOriginal) => {
+  const real = await importOriginal<typeof import('./modules/mailbox/index.js')>();
+  return {
+    ...real,
     withExistingNanoclawOutbound: async (
       agentGroupId: string,
       sessionId: string,
@@ -201,9 +210,6 @@ vi.mock('./modules/mailbox/session.js', async (importOriginal) => {
       if (missingOutboundDbs.has(sessionId)) return undefined;
       return action(modelMailbox(sessionId));
     },
-    // Referenced only so the unused-import lint stays quiet if the real class
-    // is needed by a future case; the engine imports it from the barrel.
-    __SessionDbMissingError: SessionDbMissingError,
   };
 });
 

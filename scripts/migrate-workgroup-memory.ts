@@ -5,6 +5,11 @@ import { pathToFileURL } from 'url';
 
 import Database from 'better-sqlite3';
 
+// Composition slot. These are standalone `tsx` entrypoints: they never load
+// `src/modules/index.js`, so nothing else registers an AgentMailbox and any
+// path reaching `getAgentMailbox()` throws `No agent mailbox registered`.
+// Importing it for side effect is idempotent — ESM evaluates it once.
+import '../src/mailbox/compose.js';
 import { DATA_DIR, GROUPS_DIR } from '../src/config.js';
 import { cleanupOrphansStrict } from '../src/container-runtime.js';
 import { closeDb, initDb } from '../src/db/connection.js';
@@ -1510,7 +1515,7 @@ function failIfBlocked(report: MigrationReport, action: 'apply' | 'rollback'): v
   throw new Error(`${action} blocked for workgroup(s): ${details}`);
 }
 
-export function runCli(args = process.argv.slice(2), migrationHooks: ApplyHooks = {}): void {
+export async function runCli(args = process.argv.slice(2), migrationHooks: ApplyHooks = {}): Promise<void> {
   const [command] = args;
   const reportPath = optionValue(args, '--report');
   if (!command || !reportPath) usage();
@@ -1539,7 +1544,11 @@ export function runCli(args = process.argv.slice(2), migrationHooks: ApplyHooks 
     failIfBlocked(report, 'apply');
     const db = initDb(report.dbPath);
     try {
-      reconcilePendingUpgradeContexts(
+      // Awaited: the reconciliation became async with the mailbox seam, and
+      // the `finally` below closes the central DB it is still using. Without
+      // the await, `closeDb()` fires mid-pass and a rejection escapes this
+      // try/catch as an unhandled rejection.
+      await reconcilePendingUpgradeContexts(
         db,
         report.workgroups
           .filter((workgroup) => workgroup.status === 'applied')
@@ -1560,7 +1569,7 @@ export function runCli(args = process.argv.slice(2), migrationHooks: ApplyHooks 
 
 if (process.argv[1] && pathToFileURL(path.resolve(process.argv[1])).href === import.meta.url) {
   try {
-    runCli();
+    await runCli();
   } catch (err) {
     if (!(err instanceof Error)) throw err;
     console.error(err.message);

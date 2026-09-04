@@ -48,24 +48,23 @@ import {
   threadWorktreeDir,
   threadsBaseDir,
   initSessionFolder,
-  inboundDbPath,
-  outboundDbPath,
   sessionClaudeProjectsDir,
   sessionContextPath,
   sessionContextPathFor,
   sessionDir,
   sessionMessageExists,
+  withExistingMailboxSession,
   withMailboxSession,
-  writeOutboundDirect,
   writeSessionMessage,
   writeSessionMessageIfNew,
   SessionWriteRefusedError,
   isAdmissiblePreTurnTrigger,
   reconcilePendingUpgradeContexts,
 } from './session-manager.js';
+import { inboundDbPath, outboundDbPath } from './mailbox/sqlite/paths.js';
 import { initTestDb, closeDb, runMigrations, createAgentGroup, getDb } from './db/index.js';
 import { createSession } from './db/sessions.js';
-import { insertDeferredMessageWithContextIfNew } from './db/session-db.js';
+import { insertDeferredMessageWithContextIfNew } from './modules/mailbox/ops/ingress.js';
 import { insertRecurrence, insertTaskRow, type RecurringMessage } from './modules/scheduling/db.js';
 import { getSessionClaudeMounts } from './session-claude-mounts.js';
 import type { AgentGroup, Session } from './types.js';
@@ -73,33 +72,39 @@ import type { AgentGroup, Session } from './types.js';
 const AG = 'ag-test';
 const SESS = 'sess-test';
 
-async function admitDueTaskContexts(db: Database.Database, agentGroupId: string, sessionId: string): Promise<number> {
-  const module = (await import('./session-manager.js')) as typeof import('./session-manager.js') & {
-    admitDueTaskContexts: (db: Database.Database, agentGroupId: string, sessionId: string) => number;
-  };
-  return module.admitDueTaskContexts(db, agentGroupId, sessionId);
+// The three admission entry points take a mailbox SESSION now (mailbox seam
+// PR 7), not a raw handle. These wrappers open one for the named session so
+// each test still calls the production function directly — the fixtures hold
+// their own handle on the same file for assertions, which stays valid because
+// session DBs are journal_mode=DELETE.
+async function admitDueTaskContexts(agentGroupId: string, sessionId: string): Promise<number> {
+  const module = await import('./session-manager.js');
+  return (
+    (await module.withExistingMailboxSession(agentGroupId, sessionId, (mailbox) =>
+      module.admitDueTaskContexts(mailbox, agentGroupId, sessionId),
+    )) ?? 0
+  );
 }
 
-async function admitPendingUpgradeContexts(
-  db: Database.Database,
-  agentGroupId: string,
-  sessionId: string,
-): Promise<number> {
-  const module = (await import('./session-manager.js')) as typeof import('./session-manager.js') & {
-    admitPendingUpgradeContexts: (db: Database.Database, agentGroupId: string, sessionId: string) => number;
-  };
-  return module.admitPendingUpgradeContexts(db, agentGroupId, sessionId);
+async function admitPendingUpgradeContexts(agentGroupId: string, sessionId: string): Promise<number> {
+  const module = await import('./session-manager.js');
+  return (
+    (await module.withExistingMailboxSession(agentGroupId, sessionId, (mailbox) =>
+      module.admitPendingUpgradeContexts(mailbox, agentGroupId, sessionId),
+    )) ?? 0
+  );
 }
 
 async function deferMessageForFreshContextRetry(
-  db: Database.Database,
+  agentGroupId: string,
+  sessionId: string,
   messageId: string,
   backoffSec: number,
 ): Promise<void> {
-  const module = (await import('./session-manager.js')) as typeof import('./session-manager.js') & {
-    deferMessageForFreshContextRetry: (db: Database.Database, messageId: string, backoffSec: number) => void;
-  };
-  module.deferMessageForFreshContextRetry(db, messageId, backoffSec);
+  const module = await import('./session-manager.js');
+  await module.withExistingMailboxSession(agentGroupId, sessionId, (mailbox) =>
+    module.deferMessageForFreshContextRetry(mailbox, messageId, backoffSec),
+  );
 }
 
 describe('threadWorktreeDir', () => {
@@ -148,18 +153,30 @@ describe('threadWorktreeDir', () => {
 });
 
 /**
- * Tests for session-manager's direct outbound write path.
+ * Tests for the direct outbound write path.
  *
- * Drives the real `writeOutboundDirect` entry against a real session folder
- * on disk. A previous implementation opened the outbound DB through
- * `openOutboundDb` (readonly: true), so every INSERT threw SQLITE_READONLY
- * and the command-gate denial path silently never delivered. Goes red if the
- * open call reverts to the readonly form.
+ * Drives the real `writeOutboundDirect` op through the mailbox seam against a
+ * real session folder on disk. A previous implementation opened the outbound
+ * DB readonly, so every INSERT threw SQLITE_READONLY and the command-gate
+ * denial path silently never delivered. Goes red if the open reverts to the
+ * readonly form.
  */
 describe('writeOutboundDirect', () => {
   const TEST_DIR = TEST_DATA_DIR;
   const AG = 'ag-test';
   const SESS = 'sess-test';
+
+  /** The seam's op, for a session the fixture has already provisioned. */
+  async function writeOutboundDirectRow(message: {
+    id: string;
+    kind: string;
+    platformId: string | null;
+    channelType: string | null;
+    threadId: string | null;
+    content: string;
+  }): Promise<void> {
+    await withExistingMailboxSession(AG, SESS, (mailbox) => mailbox.writeOutboundDirect(message));
+  }
 
   function readMessagesOut(): Array<{ id: string; seq: number; kind: string; content: string }> {
     const db = new Database(outboundDbPath(AG, SESS), { readonly: true });
@@ -187,7 +204,7 @@ describe('writeOutboundDirect', () => {
 
   it('inserts into messages_out with an even host-side seq (requires a writable outbound.db)', async () => {
     // With a readonly open this very call throws SQLITE_READONLY.
-    writeOutboundDirect(AG, SESS, {
+    await writeOutboundDirectRow({
       id: 'denial-1',
       kind: 'chat',
       platformId: 'slack:C1',
@@ -205,7 +222,7 @@ describe('writeOutboundDirect', () => {
   });
 
   it('keeps host seq numbers even across multiple writes and ignores duplicate ids', async () => {
-    writeOutboundDirect(AG, SESS, {
+    await writeOutboundDirectRow({
       id: 'denial-1',
       kind: 'chat',
       platformId: null,
@@ -213,7 +230,7 @@ describe('writeOutboundDirect', () => {
       threadId: null,
       content: '{"text":"first"}',
     });
-    writeOutboundDirect(AG, SESS, {
+    await writeOutboundDirectRow({
       id: 'denial-2',
       kind: 'chat',
       platformId: null,
@@ -222,7 +239,7 @@ describe('writeOutboundDirect', () => {
       content: '{"text":"second"}',
     });
     // INSERT OR IGNORE — a delivery retry with the same id must not throw or duplicate.
-    writeOutboundDirect(AG, SESS, {
+    await writeOutboundDirectRow({
       id: 'denial-1',
       kind: 'chat',
       platformId: null,
@@ -773,7 +790,7 @@ describe('writeSessionMessage re-provisions a deleted session folder', () => {
     fs.writeFileSync(path.join(memoryRoot, 'index.md'), '# Current canon\nupgrade-cutover context');
     fs.writeFileSync(path.join(memoryRoot, 'system', 'definition.md'), '# Definition\nfresh upgrade context');
 
-    expect(await admitPendingUpgradeContexts(db, AG, SESS)).toBe(2);
+    expect(await admitPendingUpgradeContexts(AG, SESS)).toBe(2);
     const pairs = db
       .prepare(
         `SELECT id,seq,kind,status,trigger,content
@@ -821,7 +838,7 @@ describe('writeSessionMessage re-provisions a deleted session folder', () => {
     );
     expect(db.prepare('SELECT id FROM messages_in WHERE id = ?').get('recall-task-before-upgrade')).toBeUndefined();
 
-    expect(await admitPendingUpgradeContexts(db, AG, SESS)).toBe(0);
+    expect(await admitPendingUpgradeContexts(AG, SESS)).toBe(0);
     expect(
       (
         db
@@ -889,7 +906,7 @@ describe('writeSessionMessage re-provisions a deleted session folder', () => {
     fs.writeFileSync(path.join(memoryRoot, 'index.md'), '# Current canon\nlegacy upgrade context');
     fs.writeFileSync(path.join(memoryRoot, 'system', 'definition.md'), '# Definition\nfresh legacy context');
 
-    expect(reconcilePendingUpgradeContexts(getDb(), ['reset'])).toEqual({
+    expect(await reconcilePendingUpgradeContexts(getDb(), ['reset'])).toEqual({
       sessions: 1,
       admitted: 1,
       mtimesRestored: 0,
@@ -932,17 +949,17 @@ describe('writeSessionMessage re-provisions a deleted session folder', () => {
       content: JSON.stringify({ prompt: 'deferred by the fence' }),
     });
 
-    const { activateRepoIngressFence, releaseRepoIngressFence } = await import('./db/session-db.js');
+    const { activateRepoIngressFence, releaseRepoIngressFence } = await import('./modules/mailbox/ops/fence.js');
     const fence = activateRepoIngressFence(fencedDb, 'repository-activation:test');
 
-    expect(await admitDueTaskContexts(fencedDb, AG, SESS)).toBe(0);
+    expect(await admitDueTaskContexts(AG, SESS)).toBe(0);
     expect(
       (fencedDb.prepare('SELECT trigger FROM messages_in WHERE id = ?').get('task-fenced') as { trigger: number })
         .trigger,
     ).toBe(0);
 
     releaseRepoIngressFence(fencedDb, 'repository-activation:test', fence.generation);
-    expect(await admitDueTaskContexts(fencedDb, AG, SESS)).toBe(1);
+    expect(await admitDueTaskContexts(AG, SESS)).toBe(1);
     fencedDb.close();
   });
 
@@ -962,7 +979,7 @@ describe('writeSessionMessage re-provisions a deleted session folder', () => {
     fs.writeFileSync(path.join(memoryRoot, 'index.md'), '# Current canon\nfirst-fire context written after scheduling');
     fs.writeFileSync(path.join(memoryRoot, 'system', 'definition.md'), '# Definition\nfresh on every admission');
 
-    expect(await admitDueTaskContexts(db, AG, SESS)).toBe(1);
+    expect(await admitDueTaskContexts(AG, SESS)).toBe(1);
     const pair = db
       .prepare('SELECT id, seq, kind, trigger, content FROM messages_in WHERE id IN (?, ?) ORDER BY seq')
       .all('recall-task-first-fire', 'task-first-fire') as Array<{
@@ -986,7 +1003,7 @@ describe('writeSessionMessage re-provisions a deleted session folder', () => {
     );
     expect(JSON.stringify(recall.memoryEvidence)).toContain('first-fire context written after scheduling');
 
-    expect(await admitDueTaskContexts(db, AG, SESS)).toBe(0);
+    expect(await admitDueTaskContexts(AG, SESS)).toBe(0);
     expect(
       (
         db
@@ -1027,7 +1044,7 @@ describe('writeSessionMessage re-provisions a deleted session folder', () => {
     );
     expect(marker).toEqual({ subtype: 'recall_context', deferred: true });
 
-    expect(await admitDueTaskContexts(db, AG, SESS)).toBe(1);
+    expect(await admitDueTaskContexts(AG, SESS)).toBe(1);
     const pair = db
       .prepare('SELECT id, kind, trigger, on_wake, content FROM messages_in WHERE id IN (?, ?) ORDER BY seq')
       .all(`recall-${wakeId}`, wakeId) as Array<{
@@ -1070,7 +1087,7 @@ describe('writeSessionMessage re-provisions a deleted session folder', () => {
     fs.writeFileSync(path.join(memoryRoot, 'index.md'), '# Current canon\nrecurrence memory written after cloning');
     fs.writeFileSync(path.join(memoryRoot, 'system', 'definition.md'), '# Definition\nfresh on every admission');
 
-    expect(await admitDueTaskContexts(db, AG, SESS)).toBe(1);
+    expect(await admitDueTaskContexts(AG, SESS)).toBe(1);
     const pair = db
       .prepare(
         'SELECT id, seq, kind, trigger, series_id, recurrence, platform_id, channel_type, thread_id, content FROM messages_in WHERE id IN (?, ?) ORDER BY seq',
@@ -1101,18 +1118,26 @@ describe('writeSessionMessage re-provisions a deleted session folder', () => {
 
   it("a retry backoff moves process_after but NEVER the occurrence's scheduled slot", async () => {
     initSessionFolder(AG, SESS);
-    const db = new Database(inboundDbPath(AG, SESS));
+    const seed = new Database(inboundDbPath(AG, SESS));
     try {
-      insertTaskRow(db, {
+      insertTaskRow(seed, {
         id: 'task-crash-retry',
         seriesId: 'task-crash-retry',
         processAfter: '2026-01-05T09:00:00.000Z',
         recurrence: '0 9 * * *',
         content: JSON.stringify({ prompt: "prepare today's brief" }),
       });
+    } finally {
+      seed.close();
+    }
 
-      await deferMessageForFreshContextRetry(db, 'task-crash-retry', 600);
+    // The defer goes through the mailbox seam, which opens its own handle —
+    // hence the seed handle above is closed first and the assertions below
+    // read from a fresh one.
+    await deferMessageForFreshContextRetry(AG, SESS, 'task-crash-retry', 600);
 
+    const db = new Database(inboundDbPath(AG, SESS), { readonly: true });
+    try {
       const row = db
         .prepare('SELECT process_after, scheduled_for, tries FROM messages_in WHERE id = ?')
         .get('task-crash-retry') as { process_after: string; scheduled_for: string; tries: number };
@@ -1161,7 +1186,7 @@ describe('writeSessionMessage re-provisions a deleted session folder', () => {
         expect.arrayContaining([expect.objectContaining({ name: 'Test capability before-crash' })]),
       );
 
-      await deferMessageForFreshContextRetry(db, 'chat-crash-retry', 60);
+      await deferMessageForFreshContextRetry(AG, SESS, 'chat-crash-retry', 60);
       const deferred = db
         .prepare('SELECT id, trigger, process_after FROM messages_in WHERE id IN (?, ?) ORDER BY id')
         .all('chat-crash-retry', 'recall-chat-crash-retry') as Array<{
@@ -1194,7 +1219,7 @@ describe('writeSessionMessage re-provisions a deleted session folder', () => {
         'recall-chat-crash-retry',
       );
 
-      expect(await admitDueTaskContexts(db, AG, SESS)).toBe(1);
+      expect(await admitDueTaskContexts(AG, SESS)).toBe(1);
       const replacement = db
         .prepare('SELECT id, seq, kind, trigger, content FROM messages_in WHERE id IN (?, ?) ORDER BY seq')
         .all('recall-chat-crash-retry', 'chat-crash-retry') as Array<{
@@ -1218,7 +1243,7 @@ describe('writeSessionMessage re-provisions a deleted session folder', () => {
         expect.arrayContaining([expect.objectContaining({ name: 'Test capability before-crash' })]),
       );
 
-      expect(await admitDueTaskContexts(db, AG, SESS)).toBe(0);
+      expect(await admitDueTaskContexts(AG, SESS)).toBe(0);
       expect(
         (
           db
@@ -1243,7 +1268,7 @@ describe('writeSessionMessage re-provisions a deleted session folder', () => {
     });
     const db = new Database(inboundDbPath(AG, SESS));
     try {
-      expect(await admitDueTaskContexts(db, AG, SESS)).toBe(0);
+      expect(await admitDueTaskContexts(AG, SESS)).toBe(0);
       expect(db.prepare('SELECT kind, trigger FROM messages_in WHERE id = ?').get('accumulated-chat-only')).toEqual({
         kind: 'chat',
         trigger: 0,
@@ -1273,7 +1298,7 @@ describe('writeSessionMessage re-provisions a deleted session folder', () => {
     );
 
     try {
-      expect(await admitDueTaskContexts(db, AG, SESS)).toBe(0);
+      expect(await admitDueTaskContexts(AG, SESS)).toBe(0);
       expect(db.prepare('SELECT trigger FROM messages_in WHERE id = ?').get('malformed-clear')).toEqual({
         trigger: 0,
       });
@@ -1416,7 +1441,7 @@ describe('session migration pass preserves the idle clock', () => {
     initSessionFolder(MIGRATION_AG, sessionId);
     const before = ageInbound(sessionId);
 
-    expect(reconcilePendingUpgradeContexts(getDb(), ['mtime'])).toMatchObject({ sessions: 1, mtimesRestored: 0 });
+    expect(await reconcilePendingUpgradeContexts(getDb(), ['mtime'])).toMatchObject({ sessions: 1, mtimesRestored: 0 });
     expect(fs.statSync(inboundDbPath(MIGRATION_AG, sessionId)).mtimeMs).toBe(before);
   });
 
@@ -1444,7 +1469,7 @@ describe('session migration pass preserves the idle clock', () => {
     legacy.close();
     const before = ageInbound(sessionId);
 
-    expect(reconcilePendingUpgradeContexts(getDb(), ['mtime'])).toMatchObject({
+    expect(await reconcilePendingUpgradeContexts(getDb(), ['mtime'])).toMatchObject({
       sessions: 1,
       admitted: 0,
       mtimesRestored: 1,
@@ -1465,7 +1490,7 @@ describe('session migration pass preserves the idle clock', () => {
     seedSession(sessionId);
     initSessionFolder(MIGRATION_AG, sessionId);
 
-    reconcilePendingUpgradeContexts(getDb(), ['mtime']);
+    await reconcilePendingUpgradeContexts(getDb(), ['mtime']);
 
     expect(fs.existsSync(path.join(DATA_DIR, 'pending-upgrade-mtimes.json'))).toBe(false);
   });
@@ -1586,7 +1611,7 @@ describe('session migration pass preserves the idle clock', () => {
     broken.exec('CREATE TABLE x (a)');
     broken.close();
 
-    const result = reconcilePendingUpgradeContexts(getDb(), ['mtime']);
+    const result = await reconcilePendingUpgradeContexts(getDb(), ['mtime']);
     expect(result).toMatchObject({ sessions: 1, admitted: 0, skipped: 1, stubsRemoved: 1 });
 
     // The healthy session was migrated, not merely counted.
@@ -1664,7 +1689,7 @@ describe('session migration pass preserves the idle clock', () => {
     fs.writeFileSync(path.join(memoryRoot, 'system', 'definition.md'), '# Definition\nfresh context');
     const before = ageInbound(sessionId);
 
-    expect(reconcilePendingUpgradeContexts(getDb(), ['mtime'])).toEqual({
+    expect(await reconcilePendingUpgradeContexts(getDb(), ['mtime'])).toEqual({
       sessions: 1,
       admitted: 0,
       mtimesRestored: 0,
@@ -1732,7 +1757,7 @@ describe('session migration pass preserves the idle clock', () => {
     fs.writeFileSync(path.join(memoryRoot, 'system', 'definition.md'), '# Definition\nfresh context');
     const before = ageInbound(sessionId);
 
-    expect(reconcilePendingUpgradeContexts(getDb(), ['mtime'])).toEqual({
+    expect(await reconcilePendingUpgradeContexts(getDb(), ['mtime'])).toEqual({
       sessions: 1,
       // The committed admission is invisible to the counter — which is exactly
       // why the counter must not be what authorizes a clock rewind.
@@ -1857,7 +1882,7 @@ describe('session migration pass preserves the idle clock', () => {
     fs.writeFileSync(path.join(memoryRoot, 'system', 'definition.md'), '# Definition\nfresh context');
     const before = ageInbound(sessionId);
 
-    expect(reconcilePendingUpgradeContexts(getDb(), ['mtime'])).toEqual({
+    expect(await reconcilePendingUpgradeContexts(getDb(), ['mtime'])).toEqual({
       sessions: 1,
       admitted: 1,
       mtimesRestored: 0,

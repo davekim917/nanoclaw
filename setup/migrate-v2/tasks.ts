@@ -23,8 +23,20 @@ import { initDb, closeDb } from '../../src/db/connection.js';
 import { getAgentGroupByFolder } from '../../src/db/agent-groups.js';
 import { getMessagingGroupByPlatform } from '../../src/db/messaging-groups.js';
 import { runMigrations } from '../../src/db/migrations/index.js';
-import { insertTask } from '../../src/modules/scheduling/db.js';
-import { openInboundDb, resolveSession } from '../../src/session-manager.js';
+// PRE-EXISTING BREAK, repaired here: this named `insertTask`, which that
+// module has never exported (it is `insertTaskRow`). Phase 1e therefore
+// aborted at ESM instantiation before any task was migrated, independently of
+// the mailbox seam. Left unfixed, this file still would not instantiate.
+import { insertTaskRow } from '../../src/modules/scheduling/db.js';
+import { resolveSession } from '../../src/session-manager.js';
+// The mailbox module's path-addressed open funnel plus the layout helper.
+// `session-manager`'s ids-addressed `openInboundDb` went away with the seam's
+// raw surface, and the seam itself is not reachable here: this runs under
+// `tsx` from migrate-v2.sh, before any host boot, so `mailbox/compose.js` has
+// not registered an implementation.
+import { openInboundDb } from '../../src/modules/mailbox/openers.js';
+import { migrateMessagesInTable } from '../../src/modules/mailbox/schema.js';
+import { inboundDbPath } from '../../src/mailbox/sqlite/paths.js';
 import { readEnvFile } from '../../src/env.js';
 import { buildDiscordResolver, type DiscordResolver } from './discord-resolver.js';
 import { parseJid, v2PlatformId } from './shared.js';
@@ -120,36 +132,59 @@ async function main(): Promise<void> {
   for (const t of activeTasks) {
     try {
       const ag = getAgentGroupByFolder(t.group_folder);
-      if (!ag) { skipped++; continue; }
+      if (!ag) {
+        skipped++;
+        continue;
+      }
 
       const parsed = parseJid(t.chat_jid);
-      if (!parsed) { skipped++; continue; }
+      if (!parsed) {
+        skipped++;
+        continue;
+      }
 
       let platformId: string;
       if (parsed.channel_type === 'discord') {
         const resolved = discordResolver?.resolve(parsed.id) ?? null;
-        if (!resolved) { skipped++; continue; }
+        if (!resolved) {
+          skipped++;
+          continue;
+        }
         platformId = resolved;
       } else {
         platformId = v2PlatformId(parsed.channel_type, t.chat_jid);
       }
       const mg = getMessagingGroupByPlatform(parsed.channel_type, platformId);
-      if (!mg) { skipped++; continue; }
+      if (!mg) {
+        skipped++;
+        continue;
+      }
 
       const scheduling = toCron(t);
-      if (!scheduling) { skipped++; continue; }
+      if (!scheduling) {
+        skipped++;
+        continue;
+      }
 
       const { session } = resolveSession(ag.id, mg.id, null, 'shared');
-      const inboxDb = openInboundDb(ag.id, session.id);
+      const inboxDb = openInboundDb(inboundDbPath(ag.id, session.id));
       try {
+        // What the removed session-manager wrapper did on every open.
+        migrateMessagesInTable(inboxDb);
         // Idempotence check
-        const existing = inboxDb
-          .prepare("SELECT id FROM messages_in WHERE id = ? AND kind = 'task'")
-          .get(t.id) as { id: string } | undefined;
-        if (existing) { skipped++; continue; }
+        const existing = inboxDb.prepare("SELECT id FROM messages_in WHERE id = ? AND kind = 'task'").get(t.id) as
+          | { id: string }
+          | undefined;
+        if (existing) {
+          skipped++;
+          continue;
+        }
 
-        insertTask(inboxDb, {
+        insertTaskRow(inboxDb, {
           id: t.id,
+          // A migrated v1 task starts its own series, exactly as a freshly
+          // created one does (createScheduledTask, ncl tasks create).
+          seriesId: t.id,
           processAfter: scheduling.processAfter,
           recurrence: scheduling.recurrence,
           platformId,
