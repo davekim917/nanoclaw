@@ -43,6 +43,7 @@ import {
 import {
   inboundHasMessage,
   insertDeferredMessageWithContextIfNew,
+  withdrawUnconsumedWake,
   insertMessageIfNew,
   insertMessageWithContext,
   insertMessageWithContextIfNew,
@@ -70,11 +71,48 @@ import {
   getLatestRoutedTaskRow,
   getLatestTaskContent,
   getRecentInboundChatSenders,
+  hasRestartNoteSince,
   type ChannelDestination,
   type InboundChatSenderRow,
   type InboundRoutingAnchor,
   type RoutedTaskRow,
 } from './ops/lookups.js';
+import {
+  armNextTask,
+  cancelSeriesWithStrandClear,
+  getCompletedRecurring,
+  insertRecurrence,
+  insertTaskRow,
+  listDueTaskRows,
+  resolvePendingTask,
+  restoreTaskRow,
+  restoreTaskSeries,
+  resumeTask,
+  setPendingTaskContent,
+  updateTask,
+  upsertTaskSeries,
+  type HostGatedTaskRow,
+  type RecurringMessage as ForkRecurringMessage,
+  type TaskRowInsert,
+  type TaskRowSnapshot,
+  type TaskSeriesSnapshot,
+  type UpsertedTaskSeries,
+  type TaskUpdate as ForkTaskUpdate,
+} from './ops/tasks.js';
+import {
+  hasMatchingBootstrapRecall,
+  listOpenChatContents,
+  listRecentRecallRows,
+  readProviderRecallState,
+  type ProviderRecallState,
+} from './ops/recall.js';
+import {
+  clearWorkContinuation,
+  readContinuationPresence,
+  readDoneProposal,
+  type ContinuationPresence,
+  type DoneProposal,
+} from './ops/session-state.js';
 import {
   countDueMessages,
   expireStalePending,
@@ -82,6 +120,7 @@ import {
   getDueWakePriority,
   getNextFutureProcessAfter,
   getProcessingClaims,
+  hasProcessingAck,
   syncProcessingAcks,
   type ContainerState as ForkContainerState,
   type ProcessingClaim,
@@ -118,11 +157,54 @@ export { SessionDbMissingError, SessionDbUnopenableError } from './openers.js';
 export { parseSqliteUtc } from './sqlite-utc.js';
 export {
   canAttemptContinuationRecovery,
+  readWorkContinuation,
   WORK_CONTINUATION_RESUME_MAX_ATTEMPTS,
+  WORK_CONTINUATION_TASK_MAX_CHARS,
   type HostWorkContinuation,
 } from './ops/continuation.js';
 export type { DirectOutboundRow, InboundMessageRouting } from './ops/recovery.js';
 export { INTERACTIVE_WAKE_MAX_AGE_MS, type ContainerState as ForkContainerStateRow } from './ops/sweep.js';
+export { readRepoIngressFence } from './ops/fence.js';
+export {
+  hasMatchingBootstrapRecall,
+  listOpenChatContents,
+  listRecentRecallRows,
+  readProviderRecallState,
+  type ProviderRecallState,
+} from './ops/recall.js';
+export { nextEvenSeq, type DestinationRow, type MessageInsert } from './ops/ingress.js';
+export {
+  cancelAllTasks,
+  cancelTask,
+  clearRecurrence,
+  deleteTask,
+  pauseTask,
+  trailingFailedRuns,
+} from '../../mailbox/sqlite/tasks.js';
+export {
+  cancelSeriesWithStrandClear,
+  getCompletedRecurring,
+  insertRecurrence,
+  insertTaskRow,
+  restoreTaskRow,
+  resumeTask,
+  updateTask,
+  type HostGatedTaskRow,
+  type RecurringMessage,
+  type TaskRowInsert,
+  type TaskRowSnapshot,
+  type TaskSeriesSnapshot,
+  type TaskUpdate,
+  type UpsertedTaskSeries,
+} from './ops/tasks.js';
+export {
+  CLOSE_REASON_MAX_CHARS,
+  clearWorkContinuation,
+  readContinuationPresence,
+  readDoneProposal,
+  type ContinuationPresence,
+  type DoneProposal,
+} from './ops/session-state.js';
 
 /**
  * The session directory layout, for callers that only need a PATH.
@@ -208,6 +290,18 @@ export interface NanoclawMailboxSession extends MailboxSession {
   insertMessageWithContext(trigger: MessageInsert, context: MessageInsert | null): void;
   insertMessageWithContextIfNew(trigger: MessageInsert, context: MessageInsert | null): boolean;
   insertDeferredMessageWithContextIfNew(message: MessageInsert): boolean;
+  /**
+   * Withdraw an `on_wake` row and its recall partner, but only on a proof that
+   * no container could have claimed the message.
+   *
+   * `containerOwnsOutbound` is the caller's half of that proof — the container
+   * registry is host state this module cannot see — and must be a live probe,
+   * not a value read earlier: it is invoked inside the op, immediately before
+   * the delete. The outbound `processing_ack` half is read here. See
+   * `withdrawUnconsumedWake` in `ops/ingress.ts` for why the inbound row's own
+   * `status` cannot answer this.
+   */
+  withdrawUnconsumedWake(messageId: string, containerOwnsOutbound: () => boolean): boolean;
   nextEvenSeq(): number;
   upsertSessionRouting(routing: {
     channel_type: string | null;
@@ -254,6 +348,78 @@ export interface NanoclawMailboxSession extends MailboxSession {
   syncProcessingAcks(): void;
   /** Raw snake_case claim rows; upstream's `getProcessingClaims` returns the record shape. */
   getProcessingClaimRows(): ProcessingClaim[];
+
+  // --- fork-only tasks ----------------------------------------------------
+  // Upstream's task ops on `MailboxSession` are reused wherever the statement
+  // matches (`cancelTask`, `pauseTask`, `deleteTask`, `clearRecurrence`,
+  // `trailingFailedRuns`, `listLiveTasks`, `getTask`, `getTaskStats`,
+  // `countLiveTasks`, `findTaskBySeriesSlug`); only the ops below differ.
+  /** Fork insert: routing columns, and `trigger = 0` so the row lands inert. */
+  insertTaskRow(row: TaskRowInsert): void;
+  /** Fork resume: also drops the stale recall pair and re-seqs the occurrence. */
+  resumeTask(taskId: string): number;
+  /** Fork update: script/threadAnchor/quietStatus/flagIntent/chatLimit + recall invalidation. */
+  updateTask(taskId: string, update: ForkTaskUpdate): number;
+  /** Fork shape: includes 'expired' and carries the routing columns forward. */
+  getCompletedRecurringRows(): ForkRecurringMessage[];
+  insertRecurrence(
+    msg: ForkRecurringMessage,
+    newId: string,
+    nextRun: string | null,
+    status?: 'pending' | 'paused',
+  ): void;
+  /**
+   * Upstream's `armNextTask` under a fork name: same one-transaction guarantee,
+   * fork insert semantics. Renamed rather than overridden because the fork's
+   * clone needs the whole source row, which upstream's two-argument shape
+   * cannot carry.
+   */
+  armNextRecurrence(
+    originalId: string,
+    msg: ForkRecurringMessage,
+    newId: string,
+    nextRun: string | null,
+    status?: 'pending' | 'paused',
+  ): void;
+  restoreTaskRow(snapshot: TaskRowSnapshot): void;
+  /**
+   * Undo one `upsertTaskSeries`, addressed by the row it actually touched.
+   *
+   * Both arguments come from that upsert's own return value. A series can hold
+   * more than one live row, so undoing by `series_id` would cancel a sibling
+   * occurrence this write never touched.
+   */
+  restoreTaskSeries(touchedId: string, prior: TaskSeriesSnapshot | null, priorRecall: TaskSeriesSnapshot | null): void;
+  cancelSeriesWithStrandClear(taskId: string): number;
+  upsertTaskSeries(row: {
+    id: string;
+    seriesId: string;
+    processAfter: string;
+    /** The slot this occurrence is FOR, when it differs from `processAfter` (board move only). */
+    scheduledFor?: string | null;
+    recurrence: string;
+    content: string;
+    platformId: string | null;
+    channelType: string | null;
+    threadId: string | null;
+    /** Returns the row it touched and that row's prior state, for `restoreTaskSeries`. */
+  }): UpsertedTaskSeries;
+  listDueTaskRows(): HostGatedTaskRow[];
+  resolvePendingTask(taskId: string, status: 'completed' | 'failed'): void;
+  setPendingTaskContent(taskId: string, content: string): void;
+
+  // --- fork-only recall pairing -------------------------------------------
+  readProviderRecallState(provider: string): ProviderRecallState;
+  listOpenChatContents(): Array<{ content: string }>;
+  listRecentRecallRows(limit: number): Array<{ id: string; status: string; content: string }>;
+  hasMatchingBootstrapRecall(excludeRecallId: string | null, provider: string, contextEpoch: number): boolean;
+
+  // --- fork-only container session state ----------------------------------
+  readContinuationPresence(): ContinuationPresence | null;
+  /** Opens outbound.db read-write. The only host write to a container-owned key. */
+  clearWorkContinuation(): ContinuationPresence | null;
+  readDoneProposal(): DoneProposal | null;
+  hasRestartNoteSince(since: string): boolean;
 
   // --- fork-only repository fence ----------------------------------------
   readRepoIngressFence(): RepoIngressFence | null;
@@ -312,6 +478,47 @@ export interface NanoclawMailboxSession extends MailboxSession {
   /** @deprecated Removed in mailbox seam PR 7. See `legacyInboundHandle`. */
   legacyOutboundHandle(): Database.Database;
 }
+
+/**
+ * The outbound-owned READS, named once.
+ *
+ * Every signature is the session's own — a `Pick`, not a second declaration —
+ * so each op has one definition however it is reached (invariant I-2). This
+ * is the half that is safe on any session, including one the host is only
+ * inspecting: nothing here writes the container-owned file.
+ *
+ * Deliberately the SAME op vocabulary as PR 7's read-only `OutboundSessionRead`
+ * — same names, same signatures — so the two can be expressed in terms of each
+ * other rather than maintained as parallel types. `getProcessingClaimRows`
+ * matches it exactly; `getContainerState` returns `NanoclawContainerState`,
+ * which extends `ops/sweep`'s `ContainerState` that PR 7 declares, so it is
+ * assignable in that direction. PR 7's other reads (`listTurnUsageSince`,
+ * `listOutboundTail`, `hasWorkContinuation`, …) live in `ops/reads.ts`, which
+ * is PR 6's file and does not exist on this head; they join this vocabulary
+ * when PR 6 merges down, and the union belongs in ONE of these two types then,
+ * not in a third.
+ */
+export type NanoclawOutboundRead = Pick<
+  NanoclawMailboxSession,
+  | 'getContainerState'
+  | 'getProcessingClaimRows'
+  | 'readRepositoryMountBarrierAck'
+  | 'readDoneProposal'
+  | 'readContinuationPresence'
+>;
+
+/**
+ * The reads plus the one outbound WRITE the host performs on this head.
+ *
+ * `clearWorkContinuation` is the thread-close force-clear — a host write to a
+ * container-owned key, valid only with the container confirmed stopped (see
+ * the policy around it in `dashboard/thread-close.ts`). It is the single
+ * reason this type is not simply `NanoclawOutboundRead`, and the reason PR 7's
+ * read-only type is the narrower of the two: `OutboundSessionRead` is a
+ * `Pick` of this, or this is `OutboundSessionRead & { clearWorkContinuation }`,
+ * whichever direction reads better once both exist in one tree.
+ */
+export type NanoclawOutboundSession = NanoclawOutboundRead & Pick<NanoclawMailboxSession, 'clearWorkContinuation'>;
 
 export type NanoclawMailboxAction<T> = (mailbox: NanoclawMailboxSession) => T | Promise<T>;
 
@@ -455,6 +662,57 @@ export class NanoclawAgentMailbox extends SqliteAgentMailbox {
  * reimplementing the composition — one definition of "what a Nanoclaw mailbox
  * session is", which is what invariant I-2 asks for.
  */
+/**
+ * The outbound ops, bound to handles the caller owns.
+ *
+ * One composition, two entry points: `forkOps` spreads it into the full
+ * mailbox session, and `withExistingNanoclawOutbound` hands it out on its own
+ * to a caller that has no business with inbound.db. Both accessors stay lazy,
+ * so an action that only reads never opens the writer.
+ *
+ * `outboundPresent` false degrades the READS to empty, exactly as it does
+ * inside a mailbox session. The outbound-keyed funnel always passes true — it
+ * has already established the file is there.
+ */
+export function composeOutboundOps(
+  readableOutbound: () => Database.Database,
+  writableOutbound: () => Database.Database,
+  outboundPresent: boolean,
+): NanoclawOutboundSession {
+  const readOutbound = <T>(empty: T, read: (outbound: Database.Database) => T): T =>
+    outboundPresent ? read(readableOutbound()) : empty;
+  return {
+    getContainerState: () => {
+      const row = readOutbound(null, getContainerState);
+      if (!row) return null;
+      return {
+        ...row,
+        currentTool: row.current_tool,
+        toolDeclaredTimeoutMs: row.tool_declared_timeout_ms,
+        toolStartedAt: row.tool_started_at === null ? null : parseIsoTimestamp(sqliteTimestamp(row.tool_started_at)),
+      };
+    },
+    getProcessingClaimRows: () => readOutbound([], getProcessingClaims),
+    readRepositoryMountBarrierAck: () => readOutbound(null, readRepositoryMountBarrierAck),
+    // These three honour `outboundPresent` too, and the last one has to.
+    //
+    // They used to open the accessors directly, so on an inbound-only
+    // never-woken session the reads could throw and — the part that matters —
+    // `clearWorkContinuation` would take the WRITABLE handle and author the
+    // container-owned `outbound.db` the host must never create (I-10). Every
+    // current caller happens to guard these or reach them through the
+    // outbound-only funnel, so it was latent rather than live; a doc comment
+    // promising the degrade while three ops ignored it is exactly how it stops
+    // being latent.
+    //
+    // The empty values are the same answers a present-but-empty outbound.db
+    // gives: no proposal, no continuation record, and nothing cleared.
+    readDoneProposal: () => readOutbound(null, readDoneProposal),
+    readContinuationPresence: () => readOutbound(null, readContinuationPresence),
+    clearWorkContinuation: () => (outboundPresent ? clearWorkContinuation(writableOutbound()) : null),
+  };
+}
+
 export function composeNanoclawSession(
   inbound: Database.Database,
   readableOutbound: () => Database.Database,
@@ -471,12 +729,13 @@ export function composeNanoclawSession(
 /**
  * The fork's ops, bound to the handles open for this session.
  *
- * Both outbound accessors are threaded in and both are lazy: an action that
- * only reads never opens the writable handle, so the host keeps its
- * read-only-by-default posture on the container-owned file. The writable one
- * is used by the two host-side writers that already existed — the direct
- * outbound notice and the work-continuation recovery admission — both of
- * which only run with the container confirmed stopped.
+ * Both outbound accessors are threaded in and both are lazy: a session that
+ * never touches outbound.db opens no handle, and one that only reads it never
+ * opens the writer. The writable one serves the three host-side writers that
+ * already existed — the direct outbound notice, the work-continuation recovery
+ * admission, and the thread-close path force-clearing a container-owned
+ * continuation (`clearWorkContinuation`) — every one of which runs only with
+ * the container confirmed stopped.
  */
 function forkOps(
   inbound: Database.Database,
@@ -486,7 +745,14 @@ function forkOps(
 ): Omit<NanoclawMailboxSession, keyof MailboxSession> &
   Pick<
     NanoclawMailboxSession,
-    'setRouting' | 'countDueMessages' | 'markDelivered' | 'markDeliveryFailed' | 'getContainerState' | 'insertMessage'
+    | 'setRouting'
+    | 'countDueMessages'
+    | 'markDelivered'
+    | 'markDeliveryFailed'
+    | 'getContainerState'
+    | 'insertMessage'
+    | 'resumeTask'
+    | 'updateTask'
   > {
   /**
    * Run an outbound READ, or answer `empty` when this session has no
@@ -504,6 +770,10 @@ function forkOps(
     outboundPresent ? read(readableOutbound()) : empty;
 
   return {
+    // The outbound-owned ops come from the one composition the outbound-keyed
+    // funnel also uses, so the two surfaces cannot drift apart.
+    ...composeOutboundOps(readableOutbound, writableOutbound, outboundPresent),
+
     hasOutbound: () => outboundPresent,
 
     setRouting: (routing) =>
@@ -515,16 +785,6 @@ function forkOps(
     countDueMessages: () => countDueMessages(inbound),
     markDelivered: (messageOutId, platformMessageId) => markDelivered(inbound, messageOutId, platformMessageId),
     markDeliveryFailed: (messageOutId, errorMessage) => markDeliveryFailed(inbound, messageOutId, errorMessage),
-    getContainerState: () => {
-      const row = readOutbound(null, getContainerState);
-      if (!row) return null;
-      return {
-        ...row,
-        currentTool: row.current_tool,
-        toolDeclaredTimeoutMs: row.tool_declared_timeout_ms,
-        toolStartedAt: row.tool_started_at === null ? null : parseIsoTimestamp(sqliteTimestamp(row.tool_started_at)),
-      };
-    },
     insertMessage: async (message) => {
       runInsertMessage(inbound, toMessageInsert(message), false);
     },
@@ -533,6 +793,25 @@ function forkOps(
     insertMessageWithContext: (trigger, context) => insertMessageWithContext(inbound, trigger, context),
     insertMessageWithContextIfNew: (trigger, context) => insertMessageWithContextIfNew(inbound, trigger, context),
     insertDeferredMessageWithContextIfNew: (message) => insertDeferredMessageWithContextIfNew(inbound, message),
+    withdrawUnconsumedWake: (messageId, containerOwnsOutbound) =>
+      withdrawUnconsumedWake(inbound, messageId, () => {
+        // Ownership first: it is a Map lookup, and a container that owns
+        // outbound.db can write a claim between this read and the delete, so no
+        // ack read could rule it out anyway.
+        if (containerOwnsOutbound()) return true;
+        // A session with no outbound.db has never run a container, so nothing
+        // can have claimed. `outboundPresent` is a real ENOENT/ENOTDIR — an
+        // unreadable file reaches the opener and throws below.
+        if (!outboundPresent) return false;
+        try {
+          return hasProcessingAck(readableOutbound(), messageId);
+        } catch {
+          // Unopenable, corrupt, or missing the table: consumption is
+          // unprovable, so preserve the row. Losing the message costs more than
+          // one stale restart notice.
+          return true;
+        }
+      }),
     nextEvenSeq: () => nextEvenSeq(inbound),
     upsertSessionRouting: (routing) => upsertSessionRouting(inbound, routing),
     readSessionRouting: () => readSessionRouting(inbound),
@@ -553,13 +832,34 @@ function forkOps(
     expireStalePending: (maxAgeMs) => expireStalePending(inbound, maxAgeMs),
     getDueWakePriority: () => getDueWakePriority(inbound),
     syncProcessingAcks: () => readOutbound(undefined, (outbound) => syncProcessingAcks(inbound, outbound)),
-    getProcessingClaimRows: () => readOutbound([], getProcessingClaims),
+
+    insertTaskRow: (row) => insertTaskRow(inbound, row),
+    resumeTask: (taskId) => resumeTask(inbound, taskId),
+    updateTask: (taskId, update) => updateTask(inbound, taskId, update),
+    getCompletedRecurringRows: () => getCompletedRecurring(inbound),
+    insertRecurrence: (msg, newId, nextRun, status) => insertRecurrence(inbound, msg, newId, nextRun, status),
+    armNextRecurrence: (originalId, msg, newId, nextRun, status) =>
+      armNextTask(inbound, originalId, msg, newId, nextRun, status),
+    restoreTaskRow: (snapshot) => restoreTaskRow(inbound, snapshot),
+    restoreTaskSeries: (touchedId, prior, priorRecall) => restoreTaskSeries(inbound, touchedId, prior, priorRecall),
+    cancelSeriesWithStrandClear: (taskId) => cancelSeriesWithStrandClear(inbound, taskId),
+    upsertTaskSeries: (row) => upsertTaskSeries(inbound, row),
+    listDueTaskRows: () => listDueTaskRows(inbound),
+    resolvePendingTask: (taskId, status) => resolvePendingTask(inbound, taskId, status),
+    setPendingTaskContent: (taskId, content) => setPendingTaskContent(inbound, taskId, content),
+
+    readProviderRecallState: (provider) => readProviderRecallState(readableOutbound(), provider),
+    listOpenChatContents: () => listOpenChatContents(inbound),
+    listRecentRecallRows: (limit) => listRecentRecallRows(inbound, limit),
+    hasMatchingBootstrapRecall: (excludeRecallId, provider, contextEpoch) =>
+      hasMatchingBootstrapRecall(inbound, excludeRecallId, provider, contextEpoch),
+
+    hasRestartNoteSince: (since) => hasRestartNoteSince(inbound, since),
 
     readRepoIngressFence: () => readRepoIngressFence(inbound),
     activateRepoIngressFence: (epoch) => activateRepoIngressFence(inbound, epoch),
     admitRepoIngressFenceMessage: (epoch, messageId) => admitRepoIngressFenceMessage(inbound, epoch, messageId),
     releaseRepoIngressFence: (epoch, generation) => releaseRepoIngressFence(inbound, epoch, generation),
-    readRepositoryMountBarrierAck: () => readOutbound(null, readRepositoryMountBarrierAck),
 
     readWorkContinuation: () => readOutbound(null, readWorkContinuation),
     readContinuationRecoveryAttemptAt: (continuation) =>

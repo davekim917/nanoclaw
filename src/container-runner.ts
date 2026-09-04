@@ -73,6 +73,7 @@ import {
 } from './db/agent-groups.js';
 import { getDb, hasTable } from './db/connection.js';
 import { getMessagingGroup } from './db/messaging-groups.js';
+import { getSession } from './db/sessions.js';
 import { withExistingNanoclawSession } from './modules/mailbox/session.js';
 import { buildCentralProjection } from './db/per-agent-projections.js';
 import { ensureArchiveProjection } from './db/archive-projection-worker.js';
@@ -237,7 +238,120 @@ export function getContainerSpawnedAt(sessionId: string): number {
 const wakePromises = new Map<string, Promise<boolean>>();
 const spawningSessions = new Set<string>();
 
-let memoryAdmission: MemoryAdmissionController<Session> | null = null;
+/**
+ * Kill requests made against a session whose container does not exist YET.
+ *
+ * `killContainer` used to return silently for these. That is not a no-op from
+ * the caller's side: `containerOwnsOutbound` is deliberately true for a
+ * SPAWNING session — a wake issued a moment ago is about to hold the file — so
+ * every caller that asks "is anyone there?" before killing gets `true`, calls
+ * `killContainer`, and gets nothing. The container then comes up and keeps
+ * running, and the caller's `onExit` work never runs: a confirmed thread close
+ * leaves the fresh container alive, a self-mod rebuild leaves the old image
+ * running, a provider self-heal never respawns on the fallback.
+ *
+ * A request recorded here is honoured at the last point before `docker run`
+ * (the spawn is cancelled) or, if the process registered first, by killing it
+ * once the wake settles. Either way `onExit` fires exactly once, so exit-driven
+ * work runs for a spawning session exactly as it does for a running one.
+ */
+const pendingKills = new Map<string, { reason: string; onExit: Array<() => void> }>();
+
+/**
+ * A caller's precondition, re-proved by the WAKE PATH at the last instant.
+ *
+ * Same contract and same reasoning as `WriteGuard` in session-manager: `true`
+ * proceeds, anything else refuses. Synchronous by requirement — it is called
+ * with nothing awaited between it and `spawn()`.
+ */
+export type WakeGuardResult = boolean | { ok: false; reason: string };
+export type WakeGuard = () => WakeGuardResult;
+
+export interface WakeContainerOptions {
+  /**
+   * Re-proved immediately before `spawn()`, and again when a queued wake is
+   * dequeued.
+   *
+   * Callers proved their preconditions and then called `wakeContainer`, which
+   * awaits storage admission, an unbounded wait in the memory queue, a storage
+   * lease, and all of `spawnContainer`'s preparation before the process exists.
+   * A re-read at the call site cannot see inside any of that. The proof belongs
+   * where the spawn is.
+   */
+  guard?: WakeGuard;
+}
+
+/** What a queued wake carries: the session AND the caller's still-unproved guard. */
+interface QueuedWake {
+  session: Session;
+  guard?: WakeGuard;
+}
+
+/**
+ * The wake guard nearly every caller wants: the central row is still ACTIVE at
+ * the moment the process is created.
+ *
+ * Five call sites had written this by hand as a `getSession()` immediately
+ * before `wakeContainer`, which proves it before the call rather than before
+ * the spawn — and the wake then awaits storage admission, an unbounded memory
+ * queue and all of `spawnContainer`'s preparation. One definition, evaluated in
+ * the one place that is adjacent to `spawn()`.
+ */
+/**
+ * Why this row cannot take a wake, or `null` when it can.
+ *
+ * THE one definition, used by the universal re-read on the wake path and by the
+ * opt-in guard alike. Two copies is how the archive axis came to be checked in
+ * one place and not the other.
+ *
+ * `archived_at` is a SECOND axis, not a shade of `status`. `archiveSessionById`
+ * stamps it and leaves `status` alone, so a thread-close that archives without
+ * closing leaves a row reading `active` — and a check that asked only about
+ * `status` would wave a wake straight into a thread the operator was told was
+ * finished. The archive-only close is the ordinary outcome, not an edge one.
+ */
+function unwakeableReason(fresh: Session | undefined): string | null {
+  if (!fresh) return 'session no longer exists';
+  if (fresh.status !== 'active') return `session is ${fresh.status}`;
+  if (fresh.archived_at != null) return 'session is archived';
+  return null;
+}
+
+export function sessionStillActive(sessionId: string): WakeGuard {
+  return () => {
+    const reason = unwakeableReason(getSession(sessionId));
+    return reason === null ? true : { ok: false, reason };
+  };
+}
+
+/** Evaluate a wake guard and normalize its answer. */
+function wakeRefusalFrom(guard: WakeGuard | undefined): string | null {
+  if (!guard) return null;
+  let verdict: WakeGuardResult;
+  try {
+    verdict = guard();
+  } catch (err) {
+    // A THROWN guard is a refusal, not an exception to propagate.
+    //
+    // `sessionStillActive` reads the central DB, and a DB read can throw —
+    // transient I/O, corruption, a closed handle. Propagating that from the
+    // dequeue took it out through `trackWake`'s generic catch, which resolves
+    // `false` and never releases the memory reservation the dequeue is holding:
+    // every RETURNED refusal on that path releases, a thrown one leaked a slot
+    // off the admission budget permanently. Normalizing here means there is one
+    // refusal shape and one set of cleanup paths, rather than a second exit
+    // nobody wired.
+    //
+    // Refusing is also the right answer on its own terms: a guard that cannot
+    // answer has not said yes.
+    return `guard threw: ${err instanceof Error ? err.message : String(err)}`;
+  }
+  if (verdict === true) return null;
+  if (verdict === false) return 'guard refused';
+  return verdict.reason;
+}
+
+let memoryAdmission: MemoryAdmissionController<QueuedWake> | null = null;
 let containerShutdownInProgress = false;
 
 export function resolveMemoryAdmissionBudgetMb(
@@ -264,11 +378,11 @@ export function detectDockerMemoryMb(): number {
   return Math.floor(os.totalmem() / 1024 / 1024);
 }
 
-function getMemoryAdmission(): MemoryAdmissionController<Session> {
+function getMemoryAdmission(): MemoryAdmissionController<QueuedWake> {
   if (!memoryAdmission) {
     const dockerMemoryMb = detectDockerMemoryMb();
     const budgetMb = resolveMemoryAdmissionBudgetMb(dockerMemoryMb);
-    memoryAdmission = new MemoryAdmissionController<Session>(budgetMb);
+    memoryAdmission = new MemoryAdmissionController<QueuedWake>(budgetMb);
     log.info('Initialized container memory admission', {
       dockerMemoryMb,
       budgetMb,
@@ -281,10 +395,30 @@ function getMemoryAdmission(): MemoryAdmissionController<Session> {
 function releaseMemoryReservation(sessionId: string): void {
   if (!memoryAdmission) return;
   if (containerShutdownInProgress) return;
-  const ready = memoryAdmission.release(sessionId);
-  for (const queuedSession of ready) {
-    void startReservedWake(queuedSession).catch((err) => {
-      log.warn('Queued container wake failed', { sessionId: queuedSession.id, err });
+  startDrained(memoryAdmission.release(sessionId));
+}
+
+/**
+ * Drop this session's admission entirely — reservation AND any queued request.
+ *
+ * `release` frees a reservation but leaves a QUEUED wake in the controller, and
+ * a queued wake outlives the promise that created it: `wakeContainer` returns
+ * false, `trackWake` settles, and the controller still holds the payload until
+ * some later release drains it. Anything that concludes "this session has no
+ * container and never will" has to say so to the controller too, or the wake it
+ * thought it had cancelled starts minutes later.
+ */
+function cancelMemoryAdmission(sessionId: string): void {
+  if (!memoryAdmission) return;
+  if (containerShutdownInProgress) return;
+  startDrained(memoryAdmission.cancel(sessionId));
+}
+
+/** Start whatever a release or cancel admitted in this session's place. */
+function startDrained(ready: QueuedWake[]): void {
+  for (const queued of ready) {
+    void startReservedWake(queued).catch((err) => {
+      log.warn('Queued container wake failed', { sessionId: queued.session.id, err });
     });
   }
 }
@@ -299,6 +433,24 @@ export function isContainerRunning(sessionId: string): boolean {
 
 export function isContainerSpawning(sessionId: string): boolean {
   return spawningSessions.has(sessionId) || wakePromises.has(sessionId);
+}
+
+/**
+ * Could a container be writing this session's `outbound.db` right now?
+ *
+ * `outbound.db` has exactly ONE writer. The host may write it only while no
+ * container owns it, and "owns it" includes a container that is still
+ * SPAWNING — a wake issued a moment ago has not reached `isContainerRunning`
+ * yet but is about to hold the file.
+ *
+ * Lives here rather than in a caller because it is a question about the
+ * container registry above, and it now has two callers on different paths:
+ * the sweep's stopped-container writes and the thread-close finalizer's
+ * archive-or-kill decision. Two copies of this predicate would be two
+ * definitions of "owns", which is the drift the seam work exists to remove.
+ */
+export function containerOwnsOutbound(sessionId: string): boolean {
+  return isContainerRunning(sessionId) || isContainerSpawning(sessionId);
 }
 
 /** Snapshot passed to isolated maintenance workers; never expose the mutable map. */
@@ -388,6 +540,51 @@ export function resolveWorkgroupIdAtSpawn(
 }
 
 /**
+ * Re-read the session from the central DB and return it only while it is still
+ * active. The wake path's status guard runs on the object the CALLER handed us,
+ * but the path then awaits — storage admission, an unbounded wait in the memory
+ * admission queue, the storage-activity lease — and a reclaim closes the row
+ * (it never deletes it) at any point in that window. Spawning on a closed row
+ * produces a container `getActiveSessions()` will never return: no stuck
+ * detection, no heartbeat ceiling, no claim tolerance, for as long as it runs.
+ *
+ * So every await in the wake path is followed by this, and the fresh row — not
+ * the caller's snapshot — is what continues. Callers keeping their own pre-wake
+ * re-read are then belt-and-braces rather than load-bearing.
+ *
+ * Fail closed: a DB that cannot be read is treated as "do not spawn". The
+ * inbound row stays pending and host-sweep retries on its next tick.
+ *
+ * Callers own the release of anything already held at their bail point — see
+ * each call site; this helper deliberately holds and releases nothing.
+ */
+function refreshActiveSession(session: Session, stage: string): Session | null {
+  let fresh: Session | undefined;
+  try {
+    fresh = getSession(session.id);
+  } catch (err) {
+    log.warn('Container wake abandoned — session re-read failed', { sessionId: session.id, stage, err });
+    return null;
+  }
+  // Every wake passes through here, guarded or not — and MOST callers pass no
+  // guard: over twenty `wakeContainer` call sites hand in a session and nothing
+  // else. So this is the only place an archive-only closure can be refused for
+  // all of them, and it uses the same predicate the opt-in guard does.
+  const reason = unwakeableReason(fresh);
+  if (reason !== null) {
+    log.warn('Container wake abandoned — session cannot take a wake', {
+      sessionId: session.id,
+      stage,
+      status: fresh?.status ?? 'missing',
+      archivedAt: fresh?.archived_at ?? null,
+      reason,
+    });
+    return null;
+  }
+  return fresh ?? null;
+}
+
+/**
  * Wake up a container for a session. If already running or mid-spawn, no-op
  * (the in-flight wake promise is reused).
  *
@@ -399,7 +596,11 @@ export function resolveWorkgroupIdAtSpawn(
  * its next tick. Callers that care (e.g. the router's typing indicator)
  * can branch on the boolean.
  */
-export function wakeContainer(session: Session, priority: MemoryAdmissionPriority = 'interactive'): Promise<boolean> {
+export function wakeContainer(
+  session: Session,
+  priority: MemoryAdmissionPriority = 'interactive',
+  options: WakeContainerOptions = {},
+): Promise<boolean> {
   if (containerShutdownInProgress) {
     log.debug('Container wake ignored — host shutdown in progress', { sessionId: session.id });
     return Promise.resolve(false);
@@ -419,23 +620,34 @@ export function wakeContainer(session: Session, priority: MemoryAdmissionPriorit
   // Spawning on one produces a container getActiveSessions() will never
   // return: no stuck detection, no heartbeat ceiling, no claim tolerance, for
   // as long as it runs. The inbound row stays pending for a live session.
-  if (session.status !== 'active') {
-    log.warn('Container wake refused — session is not active', {
+  // A fast path on the object the CALLER holds, which may be stale — the
+  // authority is `refreshActiveSession` after the first await. Same predicate,
+  // so the cheap answer and the authoritative one cannot disagree about what
+  // makes a session unwakeable.
+  const callerReason = unwakeableReason(session);
+  if (callerReason !== null) {
+    log.warn('Container wake refused — session cannot take a wake', {
       sessionId: session.id,
       status: session.status,
+      reason: callerReason,
     });
     return Promise.resolve(false);
   }
 
   return trackWake(session.id, async () => {
     if (!(await checkStorageAdmission(session, false))) return false;
+    // First await behind us. Nothing is held yet — storage admission takes no
+    // lease and the memory request has not been made — so this bail releases
+    // nothing. Everything below runs on the fresh row.
+    const admitted = refreshActiveSession(session, 'storage-admission');
+    if (!admitted) return false;
 
     const admission = getMemoryAdmission();
-    const agentGroup = getAgentGroup(session.agent_group_id);
+    const agentGroup = getAgentGroup(admitted.agent_group_id);
     if (!agentGroup) {
       log.error('Container wake rejected — agent group not found', {
-        sessionId: session.id,
-        agentGroupId: session.agent_group_id,
+        sessionId: admitted.id,
+        agentGroupId: admitted.agent_group_id,
       });
       return false;
     }
@@ -444,7 +656,7 @@ export function wakeContainer(session: Session, priority: MemoryAdmissionPriorit
       effectiveResources = resolveContainerResources(readContainerConfig(agentGroup.folder).resources);
     } catch (err) {
       log.error('Container wake rejected — invalid resource configuration', {
-        sessionId: session.id,
+        sessionId: admitted.id,
         agentGroup: agentGroup.folder,
         err,
       });
@@ -454,10 +666,18 @@ export function wakeContainer(session: Session, priority: MemoryAdmissionPriorit
     // Priority is part of the atomic admission decision. A task-only wake must
     // never enter as interactive and be demoted afterward: it could otherwise
     // reserve free memory and bypass an older scheduled head before demotion.
-    const decision = admission.request(session.id, effectiveResources.memory.requestMb, session, priority);
+    // The queued payload is what startReservedWake later resumes on, so it must
+    // be the fresh row — not the caller's snapshot — even though that row is
+    // itself re-read again at dequeue.
+    const decision = admission.request(
+      admitted.id,
+      effectiveResources.memory.requestMb,
+      { session: admitted, guard: options.guard },
+      priority,
+    );
     if (decision.status === 'rejected') {
       log.error('Container wake rejected — memory request exceeds host budget', {
-        sessionId: session.id,
+        sessionId: admitted.id,
         agentGroup: agentGroup.folder,
         requestMb: decision.requestMb,
         budgetMb: decision.budgetMb,
@@ -466,7 +686,7 @@ export function wakeContainer(session: Session, priority: MemoryAdmissionPriorit
     }
     if (decision.status === 'queued') {
       log.warn('Container wake queued — memory budget exhausted', {
-        sessionId: session.id,
+        sessionId: admitted.id,
         agentGroup: agentGroup.folder,
         requestMb: decision.requestMb,
         budgetMb: decision.budgetMb,
@@ -477,7 +697,7 @@ export function wakeContainer(session: Session, priority: MemoryAdmissionPriorit
       return false;
     }
 
-    return spawnReservedContainer(session);
+    return spawnReservedContainer(admitted, options.guard);
   });
 }
 
@@ -501,17 +721,45 @@ export function isContainerSpawnWorkgroupAllowed(
   return allowed.has(workgroupId);
 }
 
-function startReservedWake(session: Session): Promise<boolean> {
+function startReservedWake(queued: QueuedWake): Promise<boolean> {
+  const { session, guard } = queued;
   if (activeContainers.has(session.id)) return Promise.resolve(true);
   const existing = wakePromises.get(session.id);
   if (existing) return existing;
 
   return trackWake(session.id, async () => {
-    if (!(await checkStorageAdmission(session, true))) {
+    // Dequeued from the memory-admission queue holding a reservation, carrying
+    // the session object captured when the wake was first queued — which can be
+    // an arbitrarily long wait. Re-read before spending the slot, and release
+    // the reservation on a bail so the next queued session can take it.
+    const dequeued = refreshActiveSession(session, 'memory-admission-dequeue');
+    if (!dequeued) {
       releaseMemoryReservation(session.id);
       return false;
     }
-    return spawnReservedContainer(session);
+    // The caller's own precondition, asked at the dequeue too. The queue wait
+    // is unbounded, and the session row being active again says nothing about
+    // whether the caller still wants this wake — a thread the operator closed
+    // while it queued, a destination revoked, a task cancelled.
+    const dequeueRefusal = wakeRefusalFrom(guard);
+    if (dequeueRefusal !== null) {
+      log.warn('Queued container wake refused by its guard at the dequeue', {
+        sessionId: session.id,
+        reason: dequeueRefusal,
+      });
+      releaseMemoryReservation(session.id);
+      return false;
+    }
+    if (!(await checkStorageAdmission(dequeued, true))) {
+      releaseMemoryReservation(dequeued.id);
+      return false;
+    }
+    const admitted = refreshActiveSession(dequeued, 'queued-storage-admission');
+    if (!admitted) {
+      releaseMemoryReservation(dequeued.id);
+      return false;
+    }
+    return spawnReservedContainer(admitted, guard);
   });
 }
 
@@ -523,6 +771,7 @@ function trackWake(sessionId: string, run: () => Promise<boolean>): Promise<bool
     })
     .finally(() => {
       if (wakePromises.get(sessionId) === tracked) wakePromises.delete(sessionId);
+      settlePendingKill(sessionId);
     });
   wakePromises.set(sessionId, tracked);
   return tracked;
@@ -564,8 +813,16 @@ async function checkStorageAdmission(session: Session, queued: boolean): Promise
   }
 }
 
-async function spawnReservedContainer(session: Session): Promise<boolean> {
+async function spawnReservedContainer(caller: Session, guard?: WakeGuard): Promise<boolean> {
   if (containerShutdownInProgress) return false;
+  // Entry re-read. Reached both straight off an admitted request and as the
+  // memory-queue dequeue continuation; either way a reservation is held by now,
+  // so a bail here must give it back.
+  const session = refreshActiveSession(caller, 'reserved-spawn');
+  if (!session) {
+    releaseMemoryReservation(caller.id);
+    return false;
+  }
   const spawnAgentGroup = getAgentGroup(session.agent_group_id);
   if (!spawnAgentGroup) {
     log.error('Container wake rejected — agent group not found at reserved spawn', {
@@ -627,7 +884,31 @@ async function spawnReservedContainer(session: Session): Promise<boolean> {
   let storageActivity: StorageActivityLease | null = null;
   try {
     storageActivity = await acquireContainerStorageActivity(session, spawnWorkgroupId);
-    await spawnContainer(session, storageActivity, spawnAgentGroup, spawnContainerConfig, spawnWorkgroupId);
+    // Last re-read, after the final await and immediately before the actual
+    // spawn. Two things are held here: the storage-activity lease, which the
+    // `finally` below releases because `storageActivity` is still non-null, and
+    // the memory reservation, which is ours to hand back explicitly.
+    const spawnSession = refreshActiveSession(session, 'pre-spawn');
+    if (!spawnSession) {
+      releaseMemoryReservation(session.id);
+      return false;
+    }
+    // Asked here as well as at the last word before `docker run`, and asked
+    // BEFORE `spawnContainer` does its preparation: that builds mounts, writes
+    // a capabilities snapshot and clears the heartbeat file. A session someone
+    // has already asked us to kill should not do that work at all, let alone
+    // leave its traces on disk.
+    const earlyCancellation = pendingKillCancellation(spawnSession.id);
+    if (earlyCancellation) throw earlyCancellation;
+    // The caller's own precondition, asked here for the same reason and again
+    // as the last word before `spawn()`. `spawnContainer` builds mounts, writes
+    // a capabilities snapshot and clears the heartbeat file; a wake whose
+    // caller no longer wants it should not do that work or leave its traces.
+    const earlyGuardRefusal = wakeRefusalFrom(guard);
+    if (earlyGuardRefusal !== null) {
+      throw new Error(`Container spawn refused by its guard: ${earlyGuardRefusal}`);
+    }
+    await spawnContainer(spawnSession, storageActivity, spawnAgentGroup, spawnContainerConfig, spawnWorkgroupId, guard);
     storageActivity = null; // activeContainers owns it until process exit
     return true;
   } catch (err) {
@@ -742,6 +1023,7 @@ async function spawnContainer(
   agentGroup: AgentGroup,
   containerConfig: ContainerConfig,
   admittedWorkgroupId: string,
+  guard?: WakeGuard,
 ): Promise<void> {
   // Refresh the destination map and current-thread routing so any admin
   // changes take effect on wake. Destinations come from the agent-to-agent
@@ -749,9 +1031,9 @@ async function spawnContainer(
   const routingWritesStartedAt = Date.now();
   if (hasTable(getDb(), 'agent_destinations')) {
     const { writeDestinations } = await import('./modules/agent-to-agent/write-destinations.js');
-    writeDestinations(agentGroup.id, session.id);
+    await writeDestinations(agentGroup.id, session.id);
   }
-  writeSessionRouting(agentGroup.id, session.id);
+  await writeSessionRouting(agentGroup.id, session.id);
   logSpawnStage('routing-writes', routingWritesStartedAt);
 
   // Materialize the runner's immutable startup context before buildMounts
@@ -1011,6 +1293,23 @@ async function spawnContainer(
   if (containerShutdownInProgress) {
     throw new Error('Container spawn cancelled because host shutdown is in progress');
   }
+  // The LAST word before the process exists. Everything above this line awaits,
+  // so a request landing in any of those windows is seen here even though the
+  // earlier check at the reserved spawn boundary already passed. Nothing awaits
+  // between here and `activeContainers.set` below, so a request either loses to
+  // that whole block and is honoured here, or arrives after registration and
+  // takes the ordinary running-container path. `trackWake` settles it either way.
+  const lateCancellation = pendingKillCancellation(session.id);
+  if (lateCancellation) throw lateCancellation;
+  // THE GUARD POINT. Everything above this line awaits — routing writes, the
+  // mailbox context, the dependency check, mount construction, argument
+  // construction — and the caller's precondition was last proved before all of
+  // it. This is the only place in the wake path where "still true?" and "the
+  // process now exists" are adjacent, so this is where the question belongs.
+  const guardRefusal = wakeRefusalFrom(guard);
+  if (guardRefusal !== null) {
+    throw new Error(`Container spawn refused by its guard: ${guardRefusal}`);
+  }
   const container = spawn(CONTAINER_RUNTIME_BIN, args, { stdio: ['ignore', 'pipe', 'pipe'] });
 
   activeContainers.set(session.id, {
@@ -1092,23 +1391,19 @@ async function spawnContainer(
   });
 }
 
-/** Kill a container for a session. */
-export function killContainer(sessionId: string, reason: string, onExit?: () => void): void {
-  const entry = activeContainers.get(sessionId);
-  if (!entry) return;
-
-  if (onExit) {
-    entry.process.once('close', onExit);
-  }
-
-  log.info('Killing container', { sessionId, reason, containerName: entry.containerName });
-
-  // A killed container never reaches its turn boundary, so it can never emit
-  // the `turn_end` row that tells the host to delete this session's 💭 status.
-  // Without this the thinking label survives as the run's only visible output —
-  // permanently for a scheduled task, whose NORMAL exit is the idle reaper
-  // killing it mid-stream. Dynamic import: delivery.ts imports this module.
-  // Fire-and-forget and never throws — cleanup must not block the kill.
+/**
+ * A killed container never reaches its turn boundary, so it can never emit the
+ * `turn_end` row that tells the host to delete this session's 💭 status.
+ * Without this the thinking label survives as the run's only visible output —
+ * permanently for a scheduled task, whose NORMAL exit is the idle reaper
+ * killing it mid-stream. Dynamic import: delivery.ts imports this module.
+ * Fire-and-forget and never throws — cleanup must not block the kill.
+ *
+ * Runs for a CANCELLED spawn too. No container reached a turn, so it is
+ * usually a no-op, but the two paths are one event from a caller's point of
+ * view and should not differ in what they leave behind.
+ */
+function clearStatusOnKill(sessionId: string, reason: string): void {
   void import('./delivery.js')
     .then((m) => m.clearSessionStatusOnKill(sessionId))
     .catch((err) => {
@@ -1118,11 +1413,101 @@ export function killContainer(sessionId: string, reason: string, onExit?: () => 
         err: err instanceof Error ? err.message : String(err),
       });
     });
+}
 
+/** Stop a RUNNING container, attaching every exit callback before the stop. */
+function stopRunningContainer(sessionId: string, reason: string, onExit: Array<() => void>): void {
+  const entry = activeContainers.get(sessionId);
+  if (!entry) return;
+  for (const callback of onExit) entry.process.once('close', callback);
+  log.info('Killing container', { sessionId, reason, containerName: entry.containerName });
+  clearStatusOnKill(sessionId, reason);
   try {
     stopContainer(entry.containerName);
   } catch {
     entry.process.kill('SIGKILL');
+  }
+}
+
+/**
+ * Kill a container for a session, INCLUDING one that is still spawning.
+ *
+ * Three states, and only the third is a no-op:
+ *   - running: stop it, and `onExit` fires on the process close, as always.
+ *   - spawning: the request is recorded and honoured when the wake reaches its
+ *     cancellation point or registers a process; `onExit` still fires. See
+ *     `pendingKills`.
+ *   - neither: nothing to kill and no exit to report, so `onExit` does NOT
+ *     fire. Callers rely on that — `container-restart` treats "not running" as
+ *     "this restart did not happen" rather than as an exit.
+ */
+export function killContainer(sessionId: string, reason: string, onExit?: () => void): void {
+  if (!activeContainers.has(sessionId)) {
+    if (!isContainerSpawning(sessionId)) return;
+    const pending = pendingKills.get(sessionId) ?? { reason, onExit: [] };
+    if (onExit) pending.onExit.push(onExit);
+    pendingKills.set(sessionId, pending);
+    log.info('Container kill deferred — a wake is in flight for this session', { sessionId, reason });
+    return;
+  }
+  stopRunningContainer(sessionId, reason, onExit ? [onExit] : []);
+}
+
+/**
+ * The error a spawn should abort with when a kill was requested mid-wake.
+ *
+ * Consulted at BOTH points a spawn can still be stopped: once at the reserved
+ * spawn boundary, before any of the preparation that writes to disk, and again
+ * as the last word before `docker run`. Everything between those two awaits, so
+ * one check cannot cover both — the same after-every-await discipline the rest
+ * of this file follows.
+ */
+function pendingKillCancellation(sessionId: string): Error | null {
+  const pending = pendingKills.get(sessionId);
+  return pending ? new Error(`Container spawn cancelled by a kill request: ${pending.reason}`) : null;
+}
+
+/**
+ * Settle a kill request recorded while the session was spawning.
+ *
+ * Called from `trackWake`'s completion, which is the ONE place every wake ends
+ * — cancelled at the pre-spawn check, failed on admission or a lease, or
+ * succeeded. Putting it there rather than at the cancellation point means a
+ * wake that dies before ever reaching that point still settles the request,
+ * instead of leaving a caller waiting on an `onExit` that can never come.
+ */
+function settlePendingKill(sessionId: string): void {
+  const pending = pendingKills.get(sessionId);
+  if (!pending) return;
+  // A second wake is already in flight for this session. The request is against
+  // the SESSION, not one attempt, so leave it for that wake to settle.
+  if (isContainerSpawning(sessionId)) return;
+  pendingKills.delete(sessionId);
+  if (activeContainers.has(sessionId)) {
+    // The wake got a process registered before the request could stop it. Kill
+    // it now; the callbacks ride the real process exit, as they would have if
+    // the request had arrived a moment later.
+    stopRunningContainer(sessionId, pending.reason, pending.onExit);
+    return;
+  }
+  // No container was ever started — but the wake may still be QUEUED. The
+  // memory-admission controller keeps a queued payload after the wake promise
+  // settles, so firing the exit work here without cancelling it would let a
+  // caller clear and archive the session as final, and a later reservation
+  // release would then drain the queue and spawn into it. `archiveSessionById`
+  // sets only `archived_at`, so `sessionStillActive` would not catch that
+  // spawn either: the row is still `active`.
+  cancelMemoryAdmission(sessionId);
+  // There is no process close to ride, so the exit work runs now — the
+  // caller's contract is "this session has no container any more", and with the
+  // queue cleared that is now true rather than nearly true.
+  clearStatusOnKill(sessionId, pending.reason);
+  for (const callback of pending.onExit) {
+    try {
+      callback();
+    } catch (err) {
+      log.warn('Container kill exit callback threw after a cancelled spawn', { sessionId, err });
+    }
   }
 }
 

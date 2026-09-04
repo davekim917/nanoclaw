@@ -14,6 +14,73 @@ vi.mock('../config.js', async (importOriginal) => ({
   DATA_DIR: TEST_DIR,
 }));
 
+// Models the ONE interleave that matters: the sweep closing a spent-but-active
+// task session inside the mailbox funnel's await, between `resolveTaskSession`
+// and the write. Inert unless a test arms it, so the rest of this file runs
+// against the real session-manager.
+const raceCloses = vi.hoisted(() => ({ sessionId: null as string | null }));
+
+// The same interleave for AUTHORIZATION rather than session liveness: an admin
+// unwiring the agent from the destination's messaging group inside the funnel's
+// await, after `resolveAndValidateDestination` proved the wiring and before the
+// row is written. Inert unless a test arms it.
+const raceRevokes = vi.hoisted(() => ({ sessionId: null as string | null }));
+
+// Makes the guarded task-row write itself fail — a busy or corrupt session DB —
+// so a test can see which of the two synchronous statements committed. Inert
+// unless a test arms it.
+const failsTaskWrite = vi.hoisted(() => ({ sessionId: null as string | null }));
+
+// Makes the CENTRAL routing stamp fail — v2.db busy — while the session's
+// inbound.db write succeeds. The two have no transaction between them, so this
+// is the only way to observe which side is left ahead. Inert unless armed.
+const failsRoutingStamp = vi.hoisted(() => ({ sessionId: null as string | null }));
+
+vi.mock('./sessions.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./sessions.js')>();
+  return {
+    ...actual,
+    setTaskRoutingPlatformId: (id: string, platformId: string) => {
+      if (failsRoutingStamp.sessionId === id) {
+        failsRoutingStamp.sessionId = null;
+        throw new Error('database is locked');
+      }
+      return actual.setTaskRoutingPlatformId(id, platformId);
+    },
+  };
+});
+
+vi.mock('../session-manager.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../session-manager.js')>();
+  return {
+    ...actual,
+    withExistingMailboxSession: async (agentGroupId: string, sessionId: string, action: never) => {
+      if (raceCloses.sessionId === sessionId) {
+        raceCloses.sessionId = null;
+        const { getDb: centralDb } = await import('./connection.js');
+        centralDb().prepare("UPDATE sessions SET status = 'closed' WHERE id = ?").run(sessionId);
+      }
+      if (raceRevokes.sessionId === sessionId) {
+        raceRevokes.sessionId = null;
+        const { getDb: centralDb } = await import('./connection.js');
+        centralDb().prepare('DELETE FROM messaging_group_agents WHERE agent_group_id = ?').run(agentGroupId);
+      }
+      if (failsTaskWrite.sessionId === sessionId) {
+        failsTaskWrite.sessionId = null;
+        const run = action as unknown as (mailbox: Record<string, unknown>) => unknown;
+        return actual.withExistingMailboxSession(agentGroupId, sessionId, ((mailbox: Record<string, unknown>) =>
+          run({
+            ...mailbox,
+            upsertTaskSeries: () => {
+              throw new Error('database is locked');
+            },
+          })) as never);
+      }
+      return actual.withExistingMailboxSession(agentGroupId, sessionId, action);
+    },
+  };
+});
+
 import { initTestDb, closeDb, getDb } from './connection.js';
 import { ensureSchema, openInboundDb } from './session-db.js';
 import { scheduleTask, resolveActiveSession } from './scheduled-tasks.js';
@@ -48,6 +115,17 @@ function taskInboundPath(seriesId: string): string {
     .get(AGENT_GROUP_ID, taskThreadId(seriesId)) as { id: string } | undefined;
   if (!row) throw new Error(`missing task session for ${seriesId}`);
   return inboundPath(row.id);
+}
+
+/** The ACTIVE task session for a series — the lookup filters closed rows out. */
+function taskSessionIdFor(seriesId: string): string {
+  const row = getDb()
+    .prepare(
+      "SELECT id FROM sessions WHERE agent_group_id = ? AND messaging_group_id IS NULL AND thread_id = ? AND status = 'active' ORDER BY created_at DESC LIMIT 1",
+    )
+    .get(AGENT_GROUP_ID, taskThreadId(seriesId)) as { id: string } | undefined;
+  if (!row) throw new Error(`no active task session for ${seriesId}`);
+  return row.id;
 }
 
 function setupCentralDb(): void {
@@ -130,22 +208,19 @@ describe('test_scheduleTask_rejects_unwired_destination', () => {
     ).run();
 
     await expect(
-      scheduleTask(
-        {
-          id: 't-unwired',
-          agentGroupId: AGENT_GROUP_ID,
-          cron: '0 3 * * *',
-          processAfter: new Date(Date.now() + 86400000).toISOString(),
-          seriesId: 's-unwired',
-          prompt: 'should not schedule',
-          destination: {
-            platformId: 'discord:test:unwired',
-            channelType: 'discord',
-            threadId: null,
-          },
+      scheduleTask({
+        id: 't-unwired',
+        agentGroupId: AGENT_GROUP_ID,
+        cron: '0 3 * * *',
+        processAfter: new Date(Date.now() + 86400000).toISOString(),
+        seriesId: 's-unwired',
+        prompt: 'should not schedule',
+        destination: {
+          platformId: 'discord:test:unwired',
+          channelType: 'discord',
+          threadId: null,
         },
-        TEST_DIR,
-      ),
+      }),
     ).rejects.toThrow(/not wired/);
   });
 
@@ -154,22 +229,19 @@ describe('test_scheduleTask_rejects_unwired_destination', () => {
     seedInboundDb();
 
     await expect(
-      scheduleTask(
-        {
-          id: 't-missing-mg',
-          agentGroupId: AGENT_GROUP_ID,
-          cron: '0 3 * * *',
-          processAfter: new Date(Date.now() + 86400000).toISOString(),
-          seriesId: 's-missing-mg',
-          prompt: 'should not schedule',
-          destination: {
-            platformId: 'discord:test:does-not-exist',
-            channelType: 'discord',
-            threadId: null,
-          },
+      scheduleTask({
+        id: 't-missing-mg',
+        agentGroupId: AGENT_GROUP_ID,
+        cron: '0 3 * * *',
+        processAfter: new Date(Date.now() + 86400000).toISOString(),
+        seriesId: 's-missing-mg',
+        prompt: 'should not schedule',
+        destination: {
+          platformId: 'discord:test:does-not-exist',
+          channelType: 'discord',
+          threadId: null,
         },
-        TEST_DIR,
-      ),
+      }),
     ).rejects.toThrow(/no messaging group/);
   });
 });
@@ -199,18 +271,15 @@ describe('test_scheduleTask_rejects_cross_workgroup_peer', () => {
     ).run(MESSAGING_GROUP_ID);
 
     await expect(
-      scheduleTask(
-        {
-          id: 't-xwg',
-          agentGroupId: AGENT_GROUP_ID,
-          cron: '0 3 * * *',
-          processAfter: new Date(Date.now() + 86400000).toISOString(),
-          seriesId: 's-xwg',
-          prompt: 'should not schedule',
-          destination: TEST_DESTINATION,
-        },
-        TEST_DIR,
-      ),
+      scheduleTask({
+        id: 't-xwg',
+        agentGroupId: AGENT_GROUP_ID,
+        cron: '0 3 * * *',
+        processAfter: new Date(Date.now() + 86400000).toISOString(),
+        seriesId: 's-xwg',
+        prompt: 'should not schedule',
+        destination: TEST_DESTINATION,
+      }),
     ).rejects.toThrow(/cross workgroup boundaries/i);
   });
 
@@ -235,18 +304,15 @@ describe('test_scheduleTask_rejects_cross_workgroup_peer', () => {
     ).run(MESSAGING_GROUP_ID);
 
     await expect(
-      scheduleTask(
-        {
-          id: 't-peer-null',
-          agentGroupId: AGENT_GROUP_ID,
-          cron: '0 3 * * *',
-          processAfter: new Date(Date.now() + 86400000).toISOString(),
-          seriesId: 's-peer-null',
-          prompt: 'should not schedule',
-          destination: TEST_DESTINATION,
-        },
-        TEST_DIR,
-      ),
+      scheduleTask({
+        id: 't-peer-null',
+        agentGroupId: AGENT_GROUP_ID,
+        cron: '0 3 * * *',
+        processAfter: new Date(Date.now() + 86400000).toISOString(),
+        seriesId: 's-peer-null',
+        prompt: 'should not schedule',
+        destination: TEST_DESTINATION,
+      }),
     ).rejects.toThrow(/cross workgroup boundaries/i);
   });
 
@@ -271,18 +337,15 @@ describe('test_scheduleTask_rejects_cross_workgroup_peer', () => {
     ).run(MESSAGING_GROUP_ID);
 
     await expect(
-      scheduleTask(
-        {
-          id: 't-sibling',
-          agentGroupId: AGENT_GROUP_ID,
-          cron: '0 3 * * *',
-          processAfter: new Date(Date.now() + 86400000).toISOString(),
-          seriesId: 's-sibling',
-          prompt: 'should schedule',
-          destination: TEST_DESTINATION,
-        },
-        TEST_DIR,
-      ),
+      scheduleTask({
+        id: 't-sibling',
+        agentGroupId: AGENT_GROUP_ID,
+        cron: '0 3 * * *',
+        processAfter: new Date(Date.now() + 86400000).toISOString(),
+        seriesId: 's-sibling',
+        prompt: 'should schedule',
+        destination: TEST_DESTINATION,
+      }),
     ).resolves.toBeUndefined();
   });
 
@@ -311,18 +374,15 @@ describe('test_scheduleTask_rejects_cross_workgroup_peer', () => {
     // AGENT_GROUP_ID already has workgroup_id NULL (default).
 
     await expect(
-      scheduleTask(
-        {
-          id: 't-null-wg',
-          agentGroupId: AGENT_GROUP_ID,
-          cron: '0 3 * * *',
-          processAfter: new Date(Date.now() + 86400000).toISOString(),
-          seriesId: 's-null-wg',
-          prompt: 'should not schedule',
-          destination: TEST_DESTINATION,
-        },
-        TEST_DIR,
-      ),
+      scheduleTask({
+        id: 't-null-wg',
+        agentGroupId: AGENT_GROUP_ID,
+        cron: '0 3 * * *',
+        processAfter: new Date(Date.now() + 86400000).toISOString(),
+        seriesId: 's-null-wg',
+        prompt: 'should not schedule',
+        destination: TEST_DESTINATION,
+      }),
     ).rejects.toThrow(/cross workgroup boundaries/i);
   });
 });
@@ -333,18 +393,15 @@ describe('test_scheduletask_omits_script_when_absent', () => {
     seedActiveSession();
     seedInboundDb();
 
-    await scheduleTask(
-      {
-        id: 't-no-script',
-        agentGroupId: AGENT_GROUP_ID,
-        cron: '0 3 * * *',
-        processAfter: new Date(Date.now() + 86400000).toISOString(),
-        seriesId: 's-no-script',
-        prompt: 'do thing',
-        destination: TEST_DESTINATION,
-      },
-      TEST_DIR,
-    );
+    await scheduleTask({
+      id: 't-no-script',
+      agentGroupId: AGENT_GROUP_ID,
+      cron: '0 3 * * *',
+      processAfter: new Date(Date.now() + 86400000).toISOString(),
+      seriesId: 's-no-script',
+      prompt: 'do thing',
+      destination: TEST_DESTINATION,
+    });
 
     const db = openInboundDb(taskInboundPath('s-no-script'));
     const row = db.prepare("SELECT content FROM messages_in WHERE series_id = 's-no-script'").get() as {
@@ -364,19 +421,16 @@ describe('test_scheduletask_includes_script_when_present', () => {
     seedActiveSession();
     seedInboundDb();
 
-    await scheduleTask(
-      {
-        id: 't-with-script',
-        agentGroupId: AGENT_GROUP_ID,
-        cron: '0 3 * * *',
-        processAfter: new Date(Date.now() + 86400000).toISOString(),
-        seriesId: 's-with-script',
-        prompt: 'do thing',
-        script: 'echo hi',
-        destination: TEST_DESTINATION,
-      },
-      TEST_DIR,
-    );
+    await scheduleTask({
+      id: 't-with-script',
+      agentGroupId: AGENT_GROUP_ID,
+      cron: '0 3 * * *',
+      processAfter: new Date(Date.now() + 86400000).toISOString(),
+      seriesId: 's-with-script',
+      prompt: 'do thing',
+      script: 'echo hi',
+      destination: TEST_DESTINATION,
+    });
 
     const db = openInboundDb(taskInboundPath('s-with-script'));
     const row = db.prepare("SELECT content FROM messages_in WHERE series_id = 's-with-script'").get() as {
@@ -397,18 +451,15 @@ describe('test_scheduleTask_inserts_new', () => {
     seedInboundDb();
 
     const processAfter = new Date(Date.now() + 86400000).toISOString();
-    await scheduleTask(
-      {
-        id: 't1',
-        agentGroupId: AGENT_GROUP_ID,
-        cron: '0 3 * * *',
-        processAfter,
-        seriesId: 's1',
-        prompt: 'do thing',
-        destination: TEST_DESTINATION,
-      },
-      TEST_DIR,
-    );
+    await scheduleTask({
+      id: 't1',
+      agentGroupId: AGENT_GROUP_ID,
+      cron: '0 3 * * *',
+      processAfter,
+      seriesId: 's1',
+      prompt: 'do thing',
+      destination: TEST_DESTINATION,
+    });
 
     const db = openInboundDb(taskInboundPath('s1'));
     const rows = db.prepare("SELECT * FROM messages_in WHERE series_id = 's1'").all() as Array<{
@@ -446,30 +497,24 @@ describe('test_scheduleTask_idempotent', () => {
     const processAfter1 = new Date(Date.now() + 86400000).toISOString();
     const processAfter2 = new Date(Date.now() + 172800000).toISOString();
 
-    await scheduleTask(
-      {
-        id: 't2a',
-        agentGroupId: AGENT_GROUP_ID,
-        cron: '0 3 * * *',
-        processAfter: processAfter1,
-        seriesId: 's-idempotent',
-        destination: TEST_DESTINATION,
-        prompt: 'do thing',
-      },
-      TEST_DIR,
-    );
-    await scheduleTask(
-      {
-        id: 't2b',
-        agentGroupId: AGENT_GROUP_ID,
-        cron: '0 3 * * *',
-        processAfter: processAfter2,
-        destination: TEST_DESTINATION,
-        seriesId: 's-idempotent',
-        prompt: 'do thing updated',
-      },
-      TEST_DIR,
-    );
+    await scheduleTask({
+      id: 't2a',
+      agentGroupId: AGENT_GROUP_ID,
+      cron: '0 3 * * *',
+      processAfter: processAfter1,
+      seriesId: 's-idempotent',
+      destination: TEST_DESTINATION,
+      prompt: 'do thing',
+    });
+    await scheduleTask({
+      id: 't2b',
+      agentGroupId: AGENT_GROUP_ID,
+      cron: '0 3 * * *',
+      processAfter: processAfter2,
+      destination: TEST_DESTINATION,
+      seriesId: 's-idempotent',
+      prompt: 'do thing updated',
+    });
 
     const db = openInboundDb(taskInboundPath('s-idempotent'));
     const rows = db.prepare("SELECT * FROM messages_in WHERE series_id = 's-idempotent'").all() as Array<{
@@ -487,18 +532,15 @@ describe('test_scheduleTask_idempotent', () => {
     seedInboundDb();
 
     const initialProcessAfter = new Date(Date.now() + 86400000).toISOString();
-    await scheduleTask(
-      {
-        id: 't-admitted',
-        agentGroupId: AGENT_GROUP_ID,
-        cron: '0 3 * * *',
-        processAfter: initialProcessAfter,
-        seriesId: 's-admitted',
-        destination: TEST_DESTINATION,
-        prompt: 'first version',
-      },
-      TEST_DIR,
-    );
+    await scheduleTask({
+      id: 't-admitted',
+      agentGroupId: AGENT_GROUP_ID,
+      cron: '0 3 * * *',
+      processAfter: initialProcessAfter,
+      seriesId: 's-admitted',
+      destination: TEST_DESTINATION,
+      prompt: 'first version',
+    });
 
     const inboundDbPath = taskInboundPath('s-admitted');
     {
@@ -523,18 +565,15 @@ describe('test_scheduleTask_idempotent', () => {
     }
 
     const updatedProcessAfter = new Date(Date.now() + 172800000).toISOString();
-    await scheduleTask(
-      {
-        id: 'ignored-for-active-update',
-        agentGroupId: AGENT_GROUP_ID,
-        cron: '0 4 * * *',
-        processAfter: updatedProcessAfter,
-        seriesId: 's-admitted',
-        destination: TEST_DESTINATION,
-        prompt: 'second version',
-      },
-      TEST_DIR,
-    );
+    await scheduleTask({
+      id: 'ignored-for-active-update',
+      agentGroupId: AGENT_GROUP_ID,
+      cron: '0 4 * * *',
+      processAfter: updatedProcessAfter,
+      seriesId: 's-admitted',
+      destination: TEST_DESTINATION,
+      prompt: 'second version',
+    });
 
     const db = openInboundDb(inboundDbPath);
     const rows = db
@@ -573,18 +612,15 @@ describe('test_scheduleTask_does_not_resurrect_completed_row', () => {
     const processAfter2 = new Date(Date.now() + 172800000).toISOString();
 
     // Schedule, then mark the row completed (simulating sweeper-clone after task fired).
-    await scheduleTask(
-      {
-        id: 'tcompleted',
-        agentGroupId: AGENT_GROUP_ID,
-        cron: '0 3 * * *',
-        destination: TEST_DESTINATION,
-        processAfter: processAfter1,
-        seriesId: 's-completed-history',
-        prompt: 'first',
-      },
-      TEST_DIR,
-    );
+    await scheduleTask({
+      id: 'tcompleted',
+      agentGroupId: AGENT_GROUP_ID,
+      cron: '0 3 * * *',
+      destination: TEST_DESTINATION,
+      processAfter: processAfter1,
+      seriesId: 's-completed-history',
+      prompt: 'first',
+    });
     {
       const db = openInboundDb(taskInboundPath('s-completed-history'));
       db.prepare("UPDATE messages_in SET status = 'completed' WHERE series_id = ?").run('s-completed-history');
@@ -592,18 +628,15 @@ describe('test_scheduleTask_does_not_resurrect_completed_row', () => {
     }
 
     // Re-schedule with same seriesId. The completed row must NOT be updated; a new row is inserted.
-    await scheduleTask(
-      {
-        id: 'tnew',
-        agentGroupId: AGENT_GROUP_ID,
-        destination: TEST_DESTINATION,
-        cron: '0 4 * * *',
-        processAfter: processAfter2,
-        seriesId: 's-completed-history',
-        prompt: 'second',
-      },
-      TEST_DIR,
-    );
+    await scheduleTask({
+      id: 'tnew',
+      agentGroupId: AGENT_GROUP_ID,
+      destination: TEST_DESTINATION,
+      cron: '0 4 * * *',
+      processAfter: processAfter2,
+      seriesId: 's-completed-history',
+      prompt: 'second',
+    });
 
     const db = openInboundDb(taskInboundPath('s-completed-history'));
     const rows = db
@@ -629,18 +662,15 @@ describe('test_scheduleTask_re_enable_after_cancel', () => {
     seedActiveSession();
     seedInboundDb();
 
-    await scheduleTask(
-      {
-        id: 'tc1',
-        destination: TEST_DESTINATION,
-        agentGroupId: AGENT_GROUP_ID,
-        cron: '0 3 * * *',
-        processAfter: new Date(Date.now() + 86400000).toISOString(),
-        seriesId: 's-cancel-reenable',
-        prompt: 'before-cancel',
-      },
-      TEST_DIR,
-    );
+    await scheduleTask({
+      id: 'tc1',
+      destination: TEST_DESTINATION,
+      agentGroupId: AGENT_GROUP_ID,
+      cron: '0 3 * * *',
+      processAfter: new Date(Date.now() + 86400000).toISOString(),
+      seriesId: 's-cancel-reenable',
+      prompt: 'before-cancel',
+    });
     // A module disable flow flips the seeded row to cancelled.
     {
       const db = openInboundDb(taskInboundPath('s-cancel-reenable'));
@@ -652,18 +682,15 @@ describe('test_scheduleTask_re_enable_after_cancel', () => {
 
     // Re-enable.
     const newProcessAfter = new Date(Date.now() + 172800000).toISOString();
-    await scheduleTask(
-      {
-        destination: TEST_DESTINATION,
-        id: 'tc2',
-        agentGroupId: AGENT_GROUP_ID,
-        cron: '0 3 * * *',
-        processAfter: newProcessAfter,
-        seriesId: 's-cancel-reenable',
-        prompt: 'after-reenable',
-      },
-      TEST_DIR,
-    );
+    await scheduleTask({
+      destination: TEST_DESTINATION,
+      id: 'tc2',
+      agentGroupId: AGENT_GROUP_ID,
+      cron: '0 3 * * *',
+      processAfter: newProcessAfter,
+      seriesId: 's-cancel-reenable',
+      prompt: 'after-reenable',
+    });
 
     const db = openInboundDb(taskInboundPath('s-cancel-reenable'));
     const rows = db
@@ -682,18 +709,15 @@ describe('test_scheduleTask_resolves_session_when_missing', () => {
   it('creates a session stub when no active session exists for the agent group', async () => {
     // No session seeded — scheduleTask should create one.
     const processAfter = new Date(Date.now() + 86400000).toISOString();
-    await scheduleTask(
-      {
-        id: 't3',
-        agentGroupId: AGENT_GROUP_ID,
-        cron: '0 3 * * *',
-        processAfter,
-        seriesId: 's3',
-        prompt: 'created session',
-        destination: TEST_DESTINATION,
-      },
-      TEST_DIR,
-    );
+    await scheduleTask({
+      id: 't3',
+      agentGroupId: AGENT_GROUP_ID,
+      cron: '0 3 * * *',
+      processAfter,
+      seriesId: 's3',
+      prompt: 'created session',
+      destination: TEST_DESTINATION,
+    });
 
     // A per-series system session row should now exist in the central DB.
     const centralDb = getDb();
@@ -713,6 +737,641 @@ describe('test_scheduleTask_resolves_session_when_missing', () => {
     const rows = db.prepare("SELECT * FROM messages_in WHERE series_id = 's3'").all();
     db.close();
     expect(rows).toHaveLength(1);
+  });
+});
+
+// ── test_scheduleTask_leaves_the_container_owned_outbound_alone ────────────
+describe('test_scheduleTask_leaves_the_container_owned_outbound_alone', () => {
+  /**
+   * A second task on a live series must not write the container's file.
+   *
+   * `resolveTaskSession` hands back the EXISTING per-series session here, and
+   * its container may be running. The provisioning funnel's `prepare()` calls
+   * `ensureSchema(..., 'outbound')`, which opens outbound.db read-write and
+   * runs DDL across the mount — the same defect Codex raised against routine
+   * ingress on #291, in the other place it occurred. Pre-seam this path opened
+   * inbound.db alone.
+   *
+   * Deleting outbound.db is the probe: `ensureSchema` would recreate it, so
+   * its continued absence proves no writable outbound open happened. The task
+   * row must still land, because the inbound write is what this path is for.
+   */
+  it('does not open or recreate outbound.db when the series session already exists', async () => {
+    const processAfter = new Date(Date.now() + 86400000).toISOString();
+    const base = {
+      agentGroupId: AGENT_GROUP_ID,
+      cron: '0 4 * * *',
+      processAfter,
+      seriesId: 's-outbound',
+      destination: TEST_DESTINATION,
+    };
+
+    // First call creates the session and provisions both DBs.
+    await scheduleTask({ ...base, id: 't-outbound-1', prompt: 'first' });
+    const sessionRow = getDb()
+      .prepare(
+        "SELECT id FROM sessions WHERE agent_group_id = ? AND messaging_group_id IS NULL AND thread_id = ? AND status = 'active' LIMIT 1",
+      )
+      .get(AGENT_GROUP_ID, taskThreadId('s-outbound')) as { id: string };
+    const outbound = path.join(agentSessionDir(sessionRow.id), 'outbound.db');
+    expect(fs.existsSync(outbound)).toBe(true);
+    fs.rmSync(outbound);
+
+    // Second call on the same series — the session exists now.
+    await scheduleTask({ ...base, id: 't-outbound-2', prompt: 'second' });
+
+    expect(fs.existsSync(outbound)).toBe(false);
+    // `upsertTaskSeries` keeps one live row per series and updates it in place,
+    // so the second call is visible as the new content on the same row — which
+    // is the point: the inbound write still happened.
+    const db = openInboundDb(inboundPath(sessionRow.id));
+    const rows = db
+      .prepare("SELECT id, content FROM messages_in WHERE series_id = 's-outbound' ORDER BY seq")
+      .all() as Array<{ id: string; content: string }>;
+    db.close();
+    expect(rows).toHaveLength(1);
+    expect(JSON.parse(rows[0]!.content).prompt).toBe('second');
+  });
+});
+
+// ── test_scheduleTask_revalidates_the_session_after_the_await ──────────────
+describe('test_scheduleTask_revalidates_the_session_after_the_await', () => {
+  /**
+   * `resolveTaskSession` runs before the mailbox funnel's await and can only
+   * return an ACTIVE session. In that gap the sweep can observe
+   * `countLiveTasks() === 0` on a spent-but-active task session and close it.
+   *
+   * Writing anyway produced a successful-looking schedule whose row sat in a
+   * closed session — `getActiveSessions()` excludes it, so the task never
+   * fired. Pre-seam, resolution and the write were one synchronous turn.
+   *
+   * The re-validation happens inside the session with no await before the
+   * write, and a lost race re-resolves once. That terminates because the
+   * lookups filter `status = 'active'`: the closed row can never come back.
+   */
+  it('writes into a fresh session when the old one is closed during the open', async () => {
+    const processAfter = new Date(Date.now() + 86400000).toISOString();
+    const base = {
+      agentGroupId: AGENT_GROUP_ID,
+      cron: '0 5 * * *',
+      processAfter,
+      seriesId: 's-race',
+      destination: TEST_DESTINATION,
+    };
+    await scheduleTask({ ...base, id: 't-race-1', prompt: 'first' });
+    const firstId = taskSessionIdFor('s-race');
+
+    // Arm the interleave: this session is closed inside the next funnel open.
+    raceCloses.sessionId = firstId;
+    await scheduleTask({ ...base, id: 't-race-2', prompt: 'second' });
+
+    // The old session really was closed, and it is NOT where the row went.
+    expect(getDb().prepare('SELECT status FROM sessions WHERE id = ?').get(firstId)).toMatchObject({
+      status: 'closed',
+    });
+    const secondId = taskSessionIdFor('s-race');
+    expect(secondId).not.toBe(firstId);
+
+    // The task landed in the fresh ACTIVE session, so the sweep can still fire it.
+    expect(getDb().prepare('SELECT status FROM sessions WHERE id = ?').get(secondId)).toMatchObject({
+      status: 'active',
+    });
+    const db = openInboundDb(inboundPath(secondId));
+    const rows = db.prepare("SELECT id FROM messages_in WHERE series_id = 's-race'").all() as Array<{ id: string }>;
+    db.close();
+    expect(rows.map((r) => r.id)).toEqual(['t-race-2']);
+  });
+
+  /**
+   * A rejected schedule must not move where the series is DISPLAYED.
+   *
+   * `sessions.task_routing_platform_id` is what the Observatory derives a task
+   * thread's channel from, and re-scheduling an existing series re-stamps it.
+   * Stamped before the funnel, a revalidation that throws inside leaves the
+   * series showing the new destination while its task row still carries the
+   * old one — a request that was refused, and moved the task anyway.
+   *
+   * Reverting the deferred stamp fails this test: the stamp is the rejected
+   * destination.
+   */
+  it('leaves the routing stamp alone when the redirect is rejected inside the funnel', async () => {
+    const processAfter = new Date(Date.now() + 86400000).toISOString();
+    const base = {
+      agentGroupId: AGENT_GROUP_ID,
+      cron: '0 5 * * *',
+      processAfter,
+      seriesId: 's-stamp',
+    };
+    await scheduleTask({ ...base, id: 't-stamp-1', prompt: 'first', destination: TEST_DESTINATION });
+    const sessionId = taskSessionIdFor('s-stamp');
+    const stampOf = (): string | null =>
+      (
+        getDb().prepare('SELECT task_routing_platform_id AS p FROM sessions WHERE id = ?').get(sessionId) as {
+          p: string | null;
+        }
+      ).p;
+    expect(stampOf()).toBe(TEST_PLATFORM_ID);
+
+    // A second messaging group the agent IS wired to, so the redirect is
+    // legitimate at request time and only fails mid-flight.
+    const OTHER_PLATFORM = 'discord:test:c1-other';
+    getDb()
+      .prepare(
+        `INSERT INTO messaging_groups (id, channel_type, platform_id, name, is_group, unknown_sender_policy, created_at)
+         VALUES ('mg-other-c1', ?, ?, 'Other', 1, 'public', ?)`,
+      )
+      .run(TEST_CHANNEL_TYPE, OTHER_PLATFORM, new Date().toISOString());
+    getDb()
+      .prepare(
+        `INSERT INTO messaging_group_agents (id, messaging_group_id, agent_group_id, created_at)
+         VALUES ('mga-other-c1', 'mg-other-c1', ?, ?)`,
+      )
+      .run(AGENT_GROUP_ID, new Date().toISOString());
+
+    // The wiring is revoked inside the funnel, after the pre-check passed.
+    raceRevokes.sessionId = sessionId;
+    await expect(
+      scheduleTask({
+        ...base,
+        id: 't-stamp-2',
+        prompt: 'second',
+        destination: { platformId: OTHER_PLATFORM, channelType: TEST_CHANNEL_TYPE, threadId: null },
+      }),
+    ).rejects.toThrow(/is not wired to messaging group/);
+
+    // The refusal moved nothing: not the task row, and not the stamp the
+    // dashboard renders the series from.
+    expect(stampOf()).toBe(TEST_PLATFORM_ID);
+    const db = openInboundDb(inboundPath(sessionId));
+    const rows = db.prepare("SELECT id FROM messages_in WHERE series_id = 's-stamp'").all() as Array<{ id: string }>;
+    db.close();
+    expect(rows.map((r) => r.id)).toEqual(['t-stamp-1']);
+  });
+
+  /**
+   * A task write that FAILS must not move where the series is displayed either.
+   *
+   * The stamp and the task row are two statements with nothing awaited between
+   * them, so the only way to get one without the other is a throw from the
+   * write. Stamped first, a busy or corrupt session DB leaves the series shown
+   * at a destination no task row carries — the same partial state the rejected
+   * redirect produces, read from the other side. Stamped last, the failure mode
+   * is "the route did not move" instead of "the display did".
+   *
+   * Reverting the stamp back above `upsertTaskSeries` fails this test: the
+   * stamp is the new destination and the task row is still the old one.
+   */
+  it('leaves the routing stamp alone when the task write itself throws', async () => {
+    const processAfter = new Date(Date.now() + 86400000).toISOString();
+    const base = {
+      agentGroupId: AGENT_GROUP_ID,
+      cron: '0 5 * * *',
+      processAfter,
+      seriesId: 's-write-fail',
+    };
+    await scheduleTask({ ...base, id: 't-wf-1', prompt: 'first', destination: TEST_DESTINATION });
+    const sessionId = taskSessionIdFor('s-write-fail');
+    const stampOf = (): string | null =>
+      (
+        getDb().prepare('SELECT task_routing_platform_id AS p FROM sessions WHERE id = ?').get(sessionId) as {
+          p: string | null;
+        }
+      ).p;
+    expect(stampOf()).toBe(TEST_PLATFORM_ID);
+
+    // A second wired messaging group, so the redirect is legitimate throughout
+    // and only the write fails.
+    const OTHER_PLATFORM = 'discord:test:c1-wf';
+    getDb()
+      .prepare(
+        `INSERT INTO messaging_groups (id, channel_type, platform_id, name, is_group, unknown_sender_policy, created_at)
+         VALUES ('mg-wf-c1', ?, ?, 'Other', 1, 'public', ?)`,
+      )
+      .run(TEST_CHANNEL_TYPE, OTHER_PLATFORM, new Date().toISOString());
+    getDb()
+      .prepare(
+        `INSERT INTO messaging_group_agents (id, messaging_group_id, agent_group_id, created_at)
+         VALUES ('mga-wf-c1', 'mg-wf-c1', ?, ?)`,
+      )
+      .run(AGENT_GROUP_ID, new Date().toISOString());
+
+    failsTaskWrite.sessionId = sessionId;
+    await expect(
+      scheduleTask({
+        ...base,
+        id: 't-wf-2',
+        prompt: 'second',
+        destination: { platformId: OTHER_PLATFORM, channelType: TEST_CHANNEL_TYPE, threadId: null },
+      }),
+    ).rejects.toThrow(/database is locked/);
+
+    // Neither half moved.
+    expect(stampOf()).toBe(TEST_PLATFORM_ID);
+    const db = openInboundDb(inboundPath(sessionId));
+    const rows = db.prepare("SELECT id FROM messages_in WHERE series_id = 's-write-fail'").all() as Array<{
+      id: string;
+    }>;
+    db.close();
+    expect(rows.map((r) => r.id)).toEqual(['t-wf-1']);
+  });
+
+  /**
+   * The other side of the same non-atomicity: the CENTRAL stamp fails.
+   *
+   * `scheduleTask` writes to two databases with no transaction spanning them.
+   * Ordering the task row first closed "the display moved but the route did
+   * not" and opened its mirror image — the task committed at its new
+   * destination while the stamp keeps the old one and the caller sees a
+   * rejection. Order cannot fix that in either direction, so the pair is
+   * compensated: the task row goes back to what it was and the original failure
+   * is rethrown.
+   *
+   * Reverting the compensation fails this test: the row carries the new route
+   * over a rejected request.
+   */
+  it('restores the previous task row when the central routing stamp fails', async () => {
+    const processAfter = new Date(Date.now() + 86400000).toISOString();
+    const base = {
+      agentGroupId: AGENT_GROUP_ID,
+      cron: '0 5 * * *',
+      processAfter,
+      seriesId: 's-stamp-fail',
+    };
+    await scheduleTask({ ...base, id: 't-sf-1', prompt: 'first', destination: TEST_DESTINATION });
+    const sessionId = taskSessionIdFor('s-stamp-fail');
+
+    const liveRow = (): Record<string, unknown> | undefined => {
+      const db = openInboundDb(inboundPath(sessionId));
+      const row = db
+        .prepare(
+          `SELECT id, series_id, status, process_after, recurrence, content,
+                  platform_id, channel_type, thread_id, kind, timestamp
+             FROM messages_in
+            WHERE series_id = 's-stamp-fail' AND status IN ('pending', 'paused')`,
+        )
+        .get() as Record<string, unknown> | undefined;
+      db.close();
+      return row;
+    };
+    const stampOf = (): string | null =>
+      (
+        getDb().prepare('SELECT task_routing_platform_id AS p FROM sessions WHERE id = ?').get(sessionId) as {
+          p: string | null;
+        }
+      ).p;
+    const before = liveRow();
+    expect(before).toBeDefined();
+    expect(stampOf()).toBe(TEST_PLATFORM_ID);
+
+    // A second wired group, so the redirect is legitimate throughout and only
+    // the central write fails.
+    const OTHER_PLATFORM = 'discord:test:c1-sf';
+    getDb()
+      .prepare(
+        `INSERT INTO messaging_groups (id, channel_type, platform_id, name, is_group, unknown_sender_policy, created_at)
+         VALUES ('mg-sf-c1', ?, ?, 'Other', 1, 'public', ?)`,
+      )
+      .run(TEST_CHANNEL_TYPE, OTHER_PLATFORM, new Date().toISOString());
+    getDb()
+      .prepare(
+        `INSERT INTO messaging_group_agents (id, messaging_group_id, agent_group_id, created_at)
+         VALUES ('mga-sf-c1', 'mg-sf-c1', ?, ?)`,
+      )
+      .run(AGENT_GROUP_ID, new Date().toISOString());
+
+    failsRoutingStamp.sessionId = sessionId;
+    await expect(
+      scheduleTask({
+        ...base,
+        id: 't-sf-2',
+        prompt: 'second',
+        destination: { platformId: OTHER_PLATFORM, channelType: TEST_CHANNEL_TYPE, threadId: null },
+      }),
+    ).rejects.toThrow(/database is locked/);
+
+    // Both sides agree again, on the OLD destination — which is what a
+    // rejection means. `seq` is excluded: the compensation re-inserts, and a
+    // successful re-schedule re-seqs too, so the series reaches this normally.
+    expect(liveRow()).toEqual(before);
+    expect(stampOf()).toBe(TEST_PLATFORM_ID);
+  });
+
+  /**
+   * The undo restores the WHOLE row, not the columns someone remembered.
+   *
+   * The first snapshot was a column list and it omitted `tries` and `trigger`.
+   * `restoreTaskRow` hardcodes both to 0 — right for its board-move caller, a
+   * row arriving in a new session; wrong for an undo, which put the row back
+   * with its retry count silently reset. A list is also a thing that goes stale
+   * the next time `messages_in` gains a column, with nothing failing loudly.
+   *
+   * So this pins the property rather than the two fields: everything except the
+   * documented exceptions comes back byte-identical, and the assertion is
+   * generated from the row itself, so a new column is covered the day it is
+   * added.
+   */
+  it('restores every column of the prior row, including tries and trigger', async () => {
+    const processAfter = new Date(Date.now() + 86400000).toISOString();
+    const base = {
+      agentGroupId: AGENT_GROUP_ID,
+      cron: '0 5 * * *',
+      processAfter,
+      seriesId: 's-whole-row',
+    };
+    await scheduleTask({ ...base, id: 't-wr-1', prompt: 'first', destination: TEST_DESTINATION });
+    const sessionId = taskSessionIdFor('s-whole-row');
+
+    // State a successful re-schedule would carry forward and the old snapshot
+    // silently dropped: a row that has already been attempted, and one the due
+    // sweep has already made wakeable.
+    {
+      const db = openInboundDb(inboundPath(sessionId));
+      db.prepare("UPDATE messages_in SET tries = 3, trigger = 1 WHERE id = 't-wr-1'").run();
+      db.close();
+    }
+
+    /** The whole row, minus the two documented exceptions. */
+    const wholeRow = (): Record<string, unknown> => {
+      const db = openInboundDb(inboundPath(sessionId));
+      const row = db.prepare("SELECT * FROM messages_in WHERE id = 't-wr-1'").get() as Record<string, unknown>;
+      db.close();
+      delete row.seq; // reallocated, exactly as a successful re-schedule does
+      return row;
+    };
+    const before = wholeRow();
+    expect(before.tries).toBe(3);
+    expect(before.trigger).toBe(1);
+
+    failsRoutingStamp.sessionId = sessionId;
+    await expect(
+      scheduleTask({ ...base, id: 't-wr-2', prompt: 'second', destination: TEST_DESTINATION }),
+    ).rejects.toThrow(/database is locked/);
+
+    // Every column, not a chosen few. A snapshot that drops a column fails here
+    // whether or not anyone remembered to assert on that column by name.
+    expect(wholeRow()).toEqual(before);
+  });
+
+  /**
+   * An ADMITTED task must come back with its recall partner.
+   *
+   * The whole-row restore brought `trigger` back faithfully — and dropped the
+   * `recall-<id>` context row the upsert deletes. That pairing is not optional:
+   * the due-admission sweep rebuilds recall only for `trigger = 0` rows, so a
+   * restored `trigger = 1` task is never given one, and a container can claim it
+   * without the context the pair exists to guarantee.
+   *
+   * The condition is what makes this correct rather than blanket. An INERT task
+   * legitimately has no recall until the sweep builds one, so restoring a stale
+   * partner there would put back exactly what the upsert deletes it to avoid.
+   */
+  it('restores the recall partner of an admitted task, and only of an admitted one', async () => {
+    const processAfter = new Date(Date.now() + 86400000).toISOString();
+    const base = {
+      agentGroupId: AGENT_GROUP_ID,
+      cron: '0 5 * * *',
+      processAfter,
+      seriesId: 's-recall',
+    };
+    await scheduleTask({ ...base, id: 't-rc-1', prompt: 'first', destination: TEST_DESTINATION });
+    const sessionId = taskSessionIdFor('s-recall');
+
+    // The due-admission seam's output: the task flipped wakeable and given its
+    // context row. Planted directly because that seam is the sweep's, not this
+    // module's.
+    {
+      const db = openInboundDb(inboundPath(sessionId));
+      db.prepare("UPDATE messages_in SET trigger = 1 WHERE id = 't-rc-1'").run();
+      db.prepare(
+        `INSERT INTO messages_in
+           (id, seq, kind, timestamp, status, tries, process_after, recurrence, series_id, content,
+            platform_id, channel_type, thread_id, trigger)
+         VALUES ('recall-t-rc-1', 4, 'system', ?, 'pending', 0, NULL, NULL, 'recall-t-rc-1', ?, NULL, NULL, NULL, 0)`,
+      ).run(new Date().toISOString(), JSON.stringify({ subtype: 'recall_context' }));
+      db.close();
+    }
+
+    const idsAndTriggers = (): Array<{ id: string; trigger: number }> => {
+      const db = openInboundDb(inboundPath(sessionId));
+      const rows = db
+        .prepare("SELECT id, trigger FROM messages_in WHERE id IN ('t-rc-1', 'recall-t-rc-1') ORDER BY id")
+        .all() as Array<{ id: string; trigger: number }>;
+      db.close();
+      return rows;
+    };
+    expect(idsAndTriggers()).toEqual([
+      { id: 'recall-t-rc-1', trigger: 0 },
+      { id: 't-rc-1', trigger: 1 },
+    ]);
+
+    failsRoutingStamp.sessionId = sessionId;
+    await expect(
+      scheduleTask({ ...base, id: 't-rc-2', prompt: 'second', destination: TEST_DESTINATION }),
+    ).rejects.toThrow(/database is locked/);
+
+    // Both halves back: an admitted task with the context row that must
+    // accompany it.
+    expect(idsAndTriggers()).toEqual([
+      { id: 'recall-t-rc-1', trigger: 0 },
+      { id: 't-rc-1', trigger: 1 },
+    ]);
+  });
+
+  it('leaves an inert task without a recall partner, as a normal reschedule does', async () => {
+    const processAfter = new Date(Date.now() + 86400000).toISOString();
+    const base = {
+      agentGroupId: AGENT_GROUP_ID,
+      cron: '0 5 * * *',
+      processAfter,
+      seriesId: 's-recall-inert',
+    };
+    await scheduleTask({ ...base, id: 't-ri-1', prompt: 'first', destination: TEST_DESTINATION });
+    const sessionId = taskSessionIdFor('s-recall-inert');
+
+    // Inert (`trigger = 0`) and carrying a recall partner anyway — the shape a
+    // reschedule of an already-admitted row leaves behind mid-flight.
+    {
+      const db = openInboundDb(inboundPath(sessionId));
+      db.prepare(
+        `INSERT INTO messages_in
+           (id, seq, kind, timestamp, status, tries, process_after, recurrence, series_id, content,
+            platform_id, channel_type, thread_id, trigger)
+         VALUES ('recall-t-ri-1', 4, 'system', ?, 'pending', 0, NULL, NULL, 'recall-t-ri-1', ?, NULL, NULL, NULL, 0)`,
+      ).run(new Date().toISOString(), JSON.stringify({ subtype: 'recall_context' }));
+      db.close();
+    }
+
+    failsRoutingStamp.sessionId = sessionId;
+    await expect(
+      scheduleTask({ ...base, id: 't-ri-2', prompt: 'second', destination: TEST_DESTINATION }),
+    ).rejects.toThrow(/database is locked/);
+
+    // The task is back; the stale partner is not. The sweep builds a current
+    // one when the row becomes due, which is the entire reason the upsert
+    // deletes it.
+    const db = openInboundDb(inboundPath(sessionId));
+    const ids = (
+      db.prepare("SELECT id FROM messages_in WHERE id IN ('t-ri-1', 'recall-t-ri-1') ORDER BY id").all() as Array<{
+        id: string;
+      }>
+    ).map((r) => r.id);
+    db.close();
+    expect(ids).toEqual(['t-ri-1']);
+  });
+
+  /**
+   * A series can hold more than one live row, and the undo must touch only one.
+   *
+   * `ncl tasks run` inserts a `<series>-run` occurrence alongside the scheduled
+   * one, on purpose, so an on-demand fire reports to the same destination
+   * (`runTaskCommand` in `src/cli/resources/tasks.ts`). A compensation that
+   * cleared every live row of the series would cancel that occurrence outright,
+   * and the single captured snapshot could only put one row back — a failed
+   * re-schedule turning into silent data loss on a row it never wrote.
+   *
+   * The assertion is the whole live set, not just the sibling: a correct undo
+   * leaves every live row exactly as it was, whichever one the upsert selected.
+   */
+  it('restores only the row it touched, leaving a sibling live occurrence alone', async () => {
+    const processAfter = new Date(Date.now() + 86400000).toISOString();
+    const base = {
+      agentGroupId: AGENT_GROUP_ID,
+      cron: '0 5 * * *',
+      processAfter,
+      seriesId: 's-sibling',
+    };
+    await scheduleTask({ ...base, id: 't-sib-1', prompt: 'scheduled', destination: TEST_DESTINATION });
+    const sessionId = taskSessionIdFor('s-sibling');
+
+    // The run-now occupant, planted the way `ncl tasks run` does: same series,
+    // its own row id, recurrence NULL so `handleRecurrence` cannot re-arm it.
+    {
+      const db = openInboundDb(inboundPath(sessionId));
+      db.prepare(
+        `INSERT INTO messages_in
+           (id, seq, kind, timestamp, status, tries, process_after, recurrence, series_id, content,
+            platform_id, channel_type, thread_id, trigger)
+         VALUES ('t-sib-1-run', 999, 'task', ?, 'pending', 0, ?, NULL, 's-sibling', ?, ?, ?, NULL, 0)`,
+      ).run(
+        new Date().toISOString(),
+        new Date().toISOString(),
+        JSON.stringify({ prompt: 'run now' }),
+        TEST_PLATFORM_ID,
+        TEST_CHANNEL_TYPE,
+      );
+      db.close();
+    }
+
+    const liveRows = (): Array<Record<string, unknown>> => {
+      const db = openInboundDb(inboundPath(sessionId));
+      const rows = db
+        .prepare(
+          `SELECT id, series_id, status, process_after, recurrence, content,
+                  platform_id, channel_type, thread_id, kind, timestamp
+             FROM messages_in
+            WHERE series_id = 's-sibling' AND status IN ('pending', 'paused')
+         ORDER BY id`,
+        )
+        .all() as Array<Record<string, unknown>>;
+      db.close();
+      return rows;
+    };
+    const before = liveRows();
+    expect(before.map((r) => r.id)).toEqual(['t-sib-1', 't-sib-1-run']);
+
+    failsRoutingStamp.sessionId = sessionId;
+    await expect(
+      scheduleTask({ ...base, id: 't-sib-2', prompt: 'rescheduled', destination: TEST_DESTINATION }),
+    ).rejects.toThrow(/database is locked/);
+
+    // Both rows survive, both unchanged. Undoing by `series_id` deletes the
+    // run-now row and never brings it back.
+    expect(liveRows()).toEqual(before);
+  });
+
+  /**
+   * And when there was no prior row, the compensation is a removal.
+   *
+   * A series whose only row is terminal is treated as absent by the upsert, so
+   * it INSERTS. Compensating that by "restoring the previous row" would restore
+   * nothing and leave the insert standing, which is why the absent case is
+   * carried explicitly rather than falling out of the restore.
+   */
+  it('removes a series the failed schedule created, when there was no prior row', async () => {
+    const processAfter = new Date(Date.now() + 86400000).toISOString();
+    const base = {
+      agentGroupId: AGENT_GROUP_ID,
+      cron: '0 5 * * *',
+      processAfter,
+      seriesId: 's-create-fail',
+    };
+    // Schedule once so the task SESSION exists (its id is what arms the mock),
+    // then make its row terminal so the next schedule takes the insert branch.
+    await scheduleTask({ ...base, id: 't-cf-1', prompt: 'first', destination: TEST_DESTINATION });
+    const sessionId = taskSessionIdFor('s-create-fail');
+    {
+      const db = openInboundDb(inboundPath(sessionId));
+      db.prepare("UPDATE messages_in SET status = 'completed' WHERE id = 't-cf-1'").run();
+      db.close();
+    }
+
+    const rowsFor = (): Array<{ id: string; status: string }> => {
+      const db = openInboundDb(inboundPath(sessionId));
+      const rows = db
+        .prepare("SELECT id, status FROM messages_in WHERE series_id = 's-create-fail' ORDER BY id")
+        .all() as Array<{ id: string; status: string }>;
+      db.close();
+      return rows;
+    };
+    expect(rowsFor()).toEqual([{ id: 't-cf-1', status: 'completed' }]);
+
+    failsRoutingStamp.sessionId = sessionId;
+    await expect(
+      scheduleTask({ ...base, id: 't-cf-2', prompt: 'second', destination: TEST_DESTINATION }),
+    ).rejects.toThrow(/database is locked/);
+
+    // The insert is gone and the terminal row it was scheduled alongside is
+    // untouched — the compensation removes only what the upsert added.
+    expect(rowsFor()).toEqual([{ id: 't-cf-1', status: 'completed' }]);
+  });
+
+  /**
+   * Authorization is a precondition read before the funnel's await, and the
+   * task row it guards is written after it. Revoke the wiring in that window
+   * and the pre-check's proof is stale: the row would persist a route to a
+   * chat the agent is no longer authorized for, and `delivery.ts` permits a
+   * non-origin send when `agent_destinations` has no entry — so the stale
+   * authorization becomes a real one at fire time.
+   *
+   * Reverting the in-session `resolveAndValidateDestination(def)` call fails
+   * this test: the task persists and nothing is thrown.
+   */
+  it('refuses to persist a task when the destination wiring is revoked during the open', async () => {
+    const processAfter = new Date(Date.now() + 86400000).toISOString();
+    const base = {
+      agentGroupId: AGENT_GROUP_ID,
+      cron: '0 5 * * *',
+      processAfter,
+      seriesId: 's-revoke',
+      destination: TEST_DESTINATION,
+    };
+    // First write proves the wiring is good and creates the series' session.
+    await scheduleTask({ ...base, id: 't-revoke-1', prompt: 'first' });
+    const sessionId = taskSessionIdFor('s-revoke');
+
+    // Arm the interleave: the wiring is deleted inside the next funnel open,
+    // after the pre-check has already passed.
+    raceRevokes.sessionId = sessionId;
+    await expect(scheduleTask({ ...base, id: 't-revoke-2', prompt: 'second' })).rejects.toThrow(
+      /is not wired to messaging group/,
+    );
+
+    // Same rejection shape as the pre-check, and NOTHING was written: the
+    // second task is absent, and the first one is untouched.
+    const db = openInboundDb(inboundPath(sessionId));
+    const rows = db.prepare("SELECT id FROM messages_in WHERE series_id = 's-revoke'").all() as Array<{ id: string }>;
+    db.close();
+    expect(rows.map((r) => r.id)).toEqual(['t-revoke-1']);
   });
 });
 
@@ -741,8 +1400,32 @@ describe('test_resolveActiveSession_unique_index_handles_race', () => {
     // Easier test: just call resolveActiveSession twice — second call hits
     // the existing row via lookup. That validates the lookup path. The
     // catch-on-conflict path is exercised by the unique-index test below.
-    const first = await resolveActiveSession(AGENT_GROUP_ID, MESSAGING_GROUP_ID, TEST_DIR);
+    const first = await resolveActiveSession(AGENT_GROUP_ID, MESSAGING_GROUP_ID);
     expect(first.id).toBe(winnerId);
+  });
+
+  /**
+   * The mailbox must land under the SAME root the rest of the process uses.
+   *
+   * This used to take a `dataDir` argument, mkdir a session directory under
+   * it, and then call `prepare()`, which derives its own paths from the
+   * configured `DATA_DIR`. A caller passing anything else got an empty
+   * directory under its root and the real databases under `DATA_DIR` — a
+   * session with no mailbox where it was asked for, and a write into the
+   * configured root. There is no root argument any more, and `prepare()`
+   * mkdirs the directory itself, so this pins the one remaining root.
+   *
+   * The scratch root here is the mocked `DATA_DIR` at the top of the file,
+   * which is what makes this a real scratch-root assertion rather than a
+   * tautology.
+   */
+  it('provisions the session mailbox under the configured root, both files', async () => {
+    const { id } = await resolveActiveSession(AGENT_GROUP_ID, MESSAGING_GROUP_ID);
+
+    expect(fs.existsSync(path.join(agentSessionDir(id), 'inbound.db'))).toBe(true);
+    expect(fs.existsSync(path.join(agentSessionDir(id), 'outbound.db'))).toBe(true);
+    // And nothing was created outside it — the whole tree lives under the root.
+    expect(agentSessionDir(id).startsWith(TEST_DIR)).toBe(true);
   });
 
   it('rejects a duplicate channel-root INSERT once the unique index is applied', () => {

@@ -226,7 +226,7 @@ export async function main(): Promise<void> {
   // stopped — the on_wake note makes the next spawn account publicly instead
   // of the session going dark until a human pings.
   try {
-    warnMarkedRunningSessionsOfStartup('host startup after an unclean stop');
+    await warnMarkedRunningSessionsOfStartup('host startup after an unclean stop');
   } catch (err) {
     log.error('host-restart startup warn failed', { err });
   }
@@ -572,7 +572,7 @@ async function shutdown(signal: string): Promise<void> {
     // on_wake note (due immediately) makes the post-restart spawn account
     // for the interruption publicly instead of the session going dark.
     try {
-      warnActiveContainersOfShutdown('graceful host shutdown');
+      await warnActiveContainersOfShutdown('graceful host shutdown');
     } catch (err) {
       log.error('host-restart shutdown warn failed', { err });
     }

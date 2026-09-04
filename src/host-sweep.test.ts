@@ -176,6 +176,13 @@ vi.mock('./container-runner.js', async (importOriginal) => {
   return {
     ...real,
     isContainerRunning: (...args: unknown[]) => mockIsContainerRunning(...args),
+    // `containerOwnsOutbound` moved from host-sweep.ts into container-runner.ts
+    // (it now has a second caller, thread-close's finalizer). Composed here from
+    // the MOCKED running check plus the real spawning one, which is exactly what
+    // the host-sweep-local version did under this mock — spreading `...real`
+    // alone would silently bypass `mockIsContainerRunning`.
+    containerOwnsOutbound: (sessionId: string) =>
+      Boolean(mockIsContainerRunning(sessionId)) || real.isContainerSpawning(sessionId),
     hasContainerEverRun: (...args: unknown[]) => mockHasContainerEverRun(...args),
     wakeContainer: (...args: unknown[]) => mockWakeContainer(...args),
     killContainer: (...args: unknown[]) => mockKillContainer(...args),
@@ -1705,6 +1712,44 @@ describe('sweepTaskWatchdog (C3)', () => {
     expect(mockWakeContainer).toHaveBeenCalled();
   });
 
+  /**
+   * The parent can be archived while the notification is being written.
+   *
+   * `parentSession` is fetched before the awaited mailbox write and was handed
+   * straight to `wakeContainer` after it. A reclaim inside that window leaves a
+   * snapshot that still says `active`, and waking on it spawns a container
+   * `getActiveSessions()` will never return — no stuck detection, no heartbeat
+   * ceiling, no claim tolerance, for as long as it runs.
+   *
+   * The notification itself still lands: the row is durable and the parent may
+   * come back. Only the wake is withheld.
+   */
+  it('hands the parent wake a guard that refuses a session archived under it', async () => {
+    const task = makeTask({
+      last_progress_at: new Date(NOW - 2 * 60 * 60 * 1000).toISOString(),
+    });
+    mockGetActiveTasks.mockReturnValue([task]);
+    mockTransitionToTerminal.mockReturnValue(true);
+    // The reclaim lands while the wake is in flight, which is exactly the window
+    // a caller-side re-read cannot observe.
+    let parentGone = false;
+    mockWriteSessionMessage.mockImplementation(async () => {
+      parentGone = true;
+    });
+    mockGetSession.mockImplementation(() => (parentGone ? undefined : fakeParentSession()));
+
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW);
+
+    await _sweepTaskWatchdogForTesting();
+
+    expect(mockWriteSessionMessage).toHaveBeenCalled();
+    // Issued with a guard rather than skipped: the parent can also be archived
+    // during the wake's own awaits, which a re-read here could never see.
+    const { guard } = mockWakeContainer.mock.calls[0][2] as { guard: () => unknown };
+    expect(guard()).toEqual({ ok: false, reason: 'session no longer exists' });
+  });
+
   it('test_watchdog_skips_when_drain_active: task with recent terminal outbound is not reaped', async () => {
     const task = makeTask({
       last_progress_at: new Date(NOW - 2 * 60 * 60 * 1000).toISOString(), // 2 hours ago
@@ -3141,6 +3186,58 @@ describe('sweepSession on a session with no mailbox', () => {
 
     // Backoff, not a throw: a rethrow here is the per-tick retry this pins against.
     await expect(_sweepSessionForTesting(session)).resolves.toEqual(expect.any(Number));
+    closeDb();
+  });
+
+  /**
+   * The wake must be handed the session row as it is NOW, not the tick's
+   * snapshot.
+   *
+   * `sessions` is read once per tick by `getActiveSessions()`, before a serial
+   * per-session loop that awaits container spawns, so the object reaching this
+   * duty can be many seconds old. The storage worker the same tick starts
+   * closes rows with `UPDATE sessions SET status = 'archiving' … WHERE status =
+   * 'active'`. `wakeContainer`'s only liveness gate reads `status` off the
+   * object it is given, so a stale one defeats it and spawns a container
+   * `getActiveSessions()` will never return — no stuck detection, no heartbeat
+   * ceiling, no claim tolerance, for as long as it runs.
+   */
+  it('hands the wake the current session row, not the tick snapshot', async () => {
+    const db = initTestDb();
+    runMigrations(db);
+    db.prepare(
+      `INSERT INTO agent_groups (id, name, folder, created_at)
+       VALUES ('ag-stale', 'stale snapshot', 'stale-snapshot', ?)`,
+    ).run(new Date().toISOString());
+    mockWakeContainer.mockReset().mockResolvedValue(true);
+    mockIsContainerRunning.mockReset().mockReturnValue(false);
+    mockHasContainerEverRun.mockReset().mockReturnValue(false);
+    mockAdmitDueTaskContexts.mockReturnValue(0);
+
+    const snapshot: Session = { ...fakeSession(), id: 'sess-stale', agent_group_id: 'ag-stale', status: 'active' };
+    getAgentMailbox().prepare({ agentGroupId: snapshot.agent_group_id, sessionId: snapshot.id });
+    const inboundPath = path.join(testDataDir.dir, 'v2-sessions', snapshot.agent_group_id, snapshot.id, 'inbound.db');
+    const inDb = new Database(inboundPath);
+    inDb
+      .prepare(
+        `INSERT INTO messages_in (id, seq, kind, timestamp, status, trigger, content)
+         VALUES ('due-1', 2, 'chat', ?, 'pending', 1, ?)`,
+      )
+      .run(new Date().toISOString(), JSON.stringify({ text: 'hello', senderId: 'U1' }));
+    inDb.close();
+
+    // The row was closed by the reclaim after the tick's snapshot was taken.
+    mockGetSession.mockReset().mockReturnValue({ ...snapshot, status: 'closed' });
+
+    await _sweepSessionForTesting(snapshot);
+
+    // The liveness proof now travels WITH the wake instead of preceding it: a
+    // re-read here proves the row live before the call, and the call then
+    // awaits admission, an unbounded memory-queue wait and the whole spawn
+    // preparation. The guard is asked where the process is created.
+    expect(mockWakeContainer).toHaveBeenCalledTimes(1);
+    const { guard } = mockWakeContainer.mock.calls[0][2] as { guard: () => unknown };
+    expect(guard()).toEqual({ ok: false, reason: 'session is closed' });
     closeDb();
   });
 

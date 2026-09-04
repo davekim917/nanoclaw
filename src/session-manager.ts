@@ -41,19 +41,27 @@ import type { MailboxSession, MailboxSessionKey } from './mailbox/types.js';
 // Typing the helpers with it is what lets a caller reach a fork op without a
 // cast; an action written against upstream's narrower `MailboxSession` is
 // still accepted, since the parameter only widens.
-import type { NanoclawMailboxSession } from './modules/mailbox/index.js';
+import {
+  hasMatchingBootstrapRecall,
+  listOpenChatContents,
+  listRecentRecallRows,
+  nextEvenSeq,
+  readProviderRecallState,
+  readRepoIngressFence,
+  type MessageInsert,
+  type NanoclawMailboxSession,
+  type ProviderRecallState,
+} from './modules/mailbox/index.js';
+// The module's open funnels, reached directly. These back the raw
+// openInboundDb/openOutboundDb/openOutboundDbRw/withInboundDb/writeOutboundDirect
+// helpers this file still exports for callers PR 7 has not converted yet —
+// which is also why session-manager.ts stays on the raw-access allowlist.
 import {
   openInboundDb as openInboundDbRaw,
   openOutboundDb as openOutboundDbRaw,
   openOutboundDbRw as openOutboundDbRwRaw,
-  upsertSessionRouting,
-  insertMessageWithContext,
-  insertMessageWithContextIfNew,
-  migrateMessagesInTable,
-  nextEvenSeq,
-  readRepoIngressFence,
-  type MessageInsert,
-} from './db/session-db.js';
+} from './modules/mailbox/openers.js';
+import { migrateMessagesInTable } from './modules/mailbox/schema.js';
 import { log } from './log.js';
 import { buildPreTurnContext } from './modules/memory/pre-turn-context.js';
 import type { Session, SessionMode } from './types.js';
@@ -578,38 +586,59 @@ async function runMailboxSession<T>(
  * writeDestinations() (when installed) so the latest routing is always in
  * place, including after admin rewiring.
  */
-export function writeSessionRouting(agentGroupId: string, sessionId: string): void {
-  const dbPath = inboundDbPath(agentGroupId, sessionId);
-  if (!fs.existsSync(dbPath)) return;
+export async function writeSessionRouting(agentGroupId: string, sessionId: string): Promise<void> {
+  // Resolved INSIDE the session. The route is read from the central DB and the
+  // funnel below yields before the upsert, so a session rewired or closed in
+  // that window would otherwise be stamped with the route it had on entry.
+  // Every lookup here is synchronous, so nothing yields between the resolution
+  // and the write.
+  const resolveRoute = ():
+    | { channelType: string | null; platformId: string | null; threadId: string | null }
+    | undefined => {
+    const session = getSession(sessionId);
+    if (!session) return undefined;
 
-  const session = getSession(sessionId);
-  if (!session) return;
-
-  let channelType: string | null = null;
-  let platformId: string | null = null;
-  if (session.messaging_group_id) {
-    const mg = getMessagingGroup(session.messaging_group_id);
-    if (mg) {
-      channelType = mg.channel_type;
-      platformId = mg.platform_id;
+    let channelType: string | null = null;
+    let platformId: string | null = null;
+    if (session.messaging_group_id) {
+      const mg = getMessagingGroup(session.messaging_group_id);
+      if (mg) {
+        channelType = mg.channel_type;
+        platformId = mg.platform_id;
+      }
     }
-  }
 
-  assertChannelRoutingConsistency({ channelType, platformId });
+    assertChannelRoutingConsistency({ channelType, platformId });
+    return { channelType, platformId, threadId: session.thread_id };
+  };
 
-  const db = openInboundDb(agentGroupId, sessionId);
-  try {
-    upsertSessionRouting(db, {
-      channel_type: channelType,
-      platform_id: platformId,
-      thread_id: session.thread_id,
+  // Cheap short-circuit: a session that is already gone needs no mailbox
+  // opened. The authoritative read is the one inside the callback.
+  if (!resolveRoute()) return;
+
+  // Existing-only. Routing is refreshed on every wake, and a session whose
+  // mailbox is gone has nothing to route to; provisioning one here would
+  // resurrect a reclaimed directory (invariant I-10). The old code expressed
+  // the same rule as an existsSync on inbound.db.
+  const written = await withExistingMailboxSession(agentGroupId, sessionId, (mailbox) => {
+    const route = resolveRoute();
+    if (!route) return undefined;
+    mailbox.upsertSessionRouting({
+      channel_type: route.channelType,
+      platform_id: route.platformId,
+      thread_id: route.threadId,
       session_id: sessionId,
       // spawn_task_id intentionally omitted — preserved via COALESCE on conflict
     });
-  } finally {
-    db.close();
-  }
-  log.debug('Session routing written', { sessionId, channelType, platformId, threadId: session.thread_id });
+    return route;
+  });
+  if (!written) return;
+  log.debug('Session routing written', {
+    sessionId,
+    channelType: written.channelType,
+    platformId: written.platformId,
+    threadId: written.threadId,
+  });
 }
 
 /**
@@ -685,15 +714,49 @@ export function isAdmissiblePreTurnTrigger(message: SessionMessageInput): boolea
   return true;
 }
 
+/**
+ * The four recall reads, however the caller reached them.
+ *
+ * `NanoclawMailboxSession` satisfies this structurally, which is the whole
+ * point: the write path passes its open session, while the two admission
+ * passes that still receive a raw handle from `host-sweep.ts` pass
+ * {@link recallSourceForHandle}. Both run the SAME statements — the module
+ * owns them (invariant I-2); this interface only decides which handle they
+ * execute against. The adapter disappears with the raw helpers in PR 7.
+ */
+interface RecallSource {
+  readProviderRecallState(provider: string): ProviderRecallState;
+  listOpenChatContents(): Array<{ content: string }>;
+  listRecentRecallRows(limit: number): Array<{ id: string; status: string; content: string }>;
+  hasMatchingBootstrapRecall(excludeRecallId: string | null, provider: string, contextEpoch: number): boolean;
+}
+
+function recallSourceForHandle(agentGroupId: string, sessionId: string, inbound: Database.Database): RecallSource {
+  return {
+    readProviderRecallState: (provider) => {
+      const outbound = openOutboundDb(agentGroupId, sessionId);
+      try {
+        return readProviderRecallState(outbound, provider);
+      } finally {
+        outbound.close();
+      }
+    },
+    listOpenChatContents: () => listOpenChatContents(inbound),
+    listRecentRecallRows: (limit) => listRecentRecallRows(inbound, limit),
+    hasMatchingBootstrapRecall: (excludeRecallId, provider, contextEpoch) =>
+      hasMatchingBootstrapRecall(inbound, excludeRecallId, provider, contextEpoch),
+  };
+}
+
 function buildRecallRow(
   agentGroupId: string,
   sessionId: string,
   message: SessionMessageInput,
   normalizedContent: string,
-  inboundDb: Database.Database,
+  mailbox: RecallSource,
 ): MessageInsert | null {
   if (!isAdmissiblePreTurnTrigger({ ...message, content: normalizedContent })) return null;
-  const lifecycle = resolveRecallLifecycle(inboundDb, agentGroupId, sessionId, `recall-${message.id}`);
+  const lifecycle = resolveRecallLifecycle(mailbox, agentGroupId, sessionId, `recall-${message.id}`);
   return {
     id: `recall-${message.id}`,
     kind: 'system',
@@ -770,7 +833,7 @@ function recallFingerprints(context: ParsedRecallContext): string[] {
  * recall rows. This is deliberately bounded and adds no lifecycle ledger.
  */
 function resolveRecallLifecycle(
-  inboundDb: Database.Database,
+  mailbox: RecallSource,
   agentGroupId: string,
   sessionId: string,
   excludeRecallId?: string,
@@ -780,19 +843,11 @@ function resolveRecallLifecycle(
   let contextEpoch = 0;
   let hasContinuation = false;
   try {
-    const outbound = openOutboundDb(agentGroupId, sessionId);
-    try {
-      const epochRow = outbound
-        .prepare('SELECT value FROM session_state WHERE key = ?')
-        .get(`memory_context_epoch:${provider}`) as { value: string } | undefined;
-      const parsedEpoch = Number.parseInt(epochRow?.value ?? '0', 10);
-      contextEpoch = Number.isSafeInteger(parsedEpoch) && parsedEpoch >= 0 ? parsedEpoch : 0;
-      hasContinuation =
-        outbound.prepare('SELECT 1 FROM session_state WHERE key = ? LIMIT 1').get(`continuation:${provider}`) !==
-        undefined;
-    } finally {
-      outbound.close();
-    }
+    // Reached through the session's own outbound handle now, not a second
+    // open of the same file. The catch is unchanged and load-bearing: an
+    // unreadable outbound.db means "admit a fresh bootstrap", never a throw
+    // that would drop the inbound message.
+    ({ contextEpoch, hasContinuation } = mailbox.readProviderRecallState(provider));
   } catch (error) {
     log.warn('Unable to read provider recall lifecycle; admitting a fresh bootstrap', {
       agentGroupId,
@@ -807,49 +862,14 @@ function resolveRecallLifecycle(
   // host cannot observe that future epoch yet; treat the pending boundary as
   // fresh now so same-batch follow-ups carry full canon and unsuppressed
   // relevant evidence into the reset context.
-  const pendingClear = (
-    inboundDb
-      .prepare(
-        `SELECT content
-           FROM messages_in
-          WHERE kind IN ('chat', 'chat-sdk')
-            AND status NOT IN ('completed', 'failed', 'cancelled')
-            AND instr(lower(content), '/clear') > 0
-          ORDER BY seq DESC
-        `,
-      )
-      .all() as Array<{ content: string }>
-  ).some((row) => latestUserText(row.content).toLocaleLowerCase('en-US').startsWith('/clear'));
+  const pendingClear = mailbox
+    .listOpenChatContents()
+    .some((row) => latestUserText(row.content).toLocaleLowerCase('en-US').startsWith('/clear'));
   if (pendingClear) hasContinuation = false;
 
-  const rows = inboundDb
-    .prepare(
-      `SELECT id, status, content
-         FROM messages_in
-        WHERE kind = 'system'
-          AND id LIKE 'recall-%'
-        ORDER BY seq DESC
-        LIMIT 256`,
-    )
-    .all() as Array<{ id: string; status: string; content: string }>;
+  const rows = mailbox.listRecentRecallRows(256);
   const bootstrapAlreadyQueuedOrDelivered =
-    !pendingClear &&
-    inboundDb
-      .prepare(
-        `SELECT 1
-           FROM messages_in
-          WHERE kind = 'system'
-            AND id LIKE 'recall-%'
-            AND (? IS NULL OR id <> ?)
-            AND status NOT IN ('failed', 'cancelled')
-            AND json_valid(content)
-            AND json_extract(content, '$.subtype') = 'recall_context'
-            AND json_extract(content, '$.provider') = ?
-            AND json_extract(content, '$.contextEpoch') = ?
-            AND json_type(content, '$.trustedCapabilities') = 'object'
-          LIMIT 1`,
-      )
-      .get(excludeRecallId ?? null, excludeRecallId ?? null, provider, contextEpoch) !== undefined;
+    !pendingClear && mailbox.hasMatchingBootstrapRecall(excludeRecallId ?? null, provider, contextEpoch);
   const seen = new Set<string>();
   for (const row of rows) {
     if (row.id === excludeRecallId) continue;
@@ -871,22 +891,85 @@ function resolveRecallLifecycle(
 }
 
 /** Read-only replay guard used before router side effects. */
-export function sessionMessageExists(agentGroupId: string, sessionId: string, messageId: string): boolean {
-  if (!fs.existsSync(inboundDbPath(agentGroupId, sessionId))) return false;
-  const db = openInboundDb(agentGroupId, sessionId);
-  try {
-    return db.prepare('SELECT 1 FROM messages_in WHERE id = ? LIMIT 1').get(messageId) !== undefined;
-  } finally {
-    db.close();
+export async function sessionMessageExists(
+  agentGroupId: string,
+  sessionId: string,
+  messageId: string,
+): Promise<boolean> {
+  // A read, so existing-only: no mailbox means the message is provably not
+  // there, and a replay guard must never be the thing that creates a session.
+  return (
+    (await withExistingMailboxSession(agentGroupId, sessionId, (mailbox) => mailbox.inboundHasMessage(messageId))) ??
+    false
+  );
+}
+
+/**
+ * A caller's precondition, handed to the WRITER so the writer can prove it.
+ *
+ * `true` proceeds; `false` or `{ ok: false, reason }` refuses and nothing is
+ * written. Must be synchronous — that is the entire point. The writer calls it
+ * inside the mailbox action, after every await it performs, with no await
+ * between the call and the insert. An async guard would reintroduce exactly the
+ * window it exists to close.
+ */
+export type WriteGuardResult = boolean | { ok: false; reason: string };
+export type WriteGuard = () => WriteGuardResult;
+
+export interface WriteSessionMessageOptions {
+  /**
+   * Re-proved by the writer immediately before the insert.
+   *
+   * Callers used to prove their preconditions themselves and then call this
+   * function, which awaits — `acquireStorageActivityLease`, the reclaim-journal
+   * import, both mailbox funnels — before the row lands. Every one of those is
+   * a window in which the proof goes stale, and no amount of care at the call
+   * site can close a window inside the callee. So the proof moves to where the
+   * write is.
+   */
+  guard?: WriteGuard;
+}
+
+/** Thrown when a write's guard refuses at the last instant. No row is written. */
+export class SessionWriteRefusedError extends Error {
+  constructor(readonly reason: string) {
+    super(`session write refused: ${reason}`);
+    this.name = 'SessionWriteRefusedError';
   }
+}
+
+/**
+ * Evaluate a guard and normalize its answer.
+ *
+ * Called ONLY from inside the mailbox action, with nothing awaited between here
+ * and the insert.
+ */
+function refusalFrom(guard: WriteGuard | undefined): string | null {
+  if (!guard) return null;
+  let verdict: WriteGuardResult;
+  try {
+    verdict = guard();
+  } catch (err) {
+    // A THROWN guard is a refusal. Letting it propagate out of the mailbox
+    // action would surface as the funnel's own error rather than a refusal,
+    // and the caller's contract — `SessionWriteRefusedError` means nothing was
+    // written — would be silently unavailable for the one case where the
+    // precondition could not even be evaluated. A guard that cannot answer has
+    // not said yes.
+    return `guard threw: ${err instanceof Error ? err.message : String(err)}`;
+  }
+  if (verdict === true) return null;
+  if (verdict === false) return 'guard refused';
+  return verdict.reason;
 }
 
 export async function writeSessionMessage(
   agentGroupId: string,
   sessionId: string,
   message: SessionMessageInput,
+  options: WriteSessionMessageOptions = {},
 ): Promise<void> {
-  await writeSessionMessageInternal(agentGroupId, sessionId, message, false);
+  await writeSessionMessageInternal(agentGroupId, sessionId, message, false, options.guard);
 }
 
 /** Idempotent channel-ingress variant; false means this platform id was already routed. */
@@ -894,8 +977,9 @@ export async function writeSessionMessageIfNew(
   agentGroupId: string,
   sessionId: string,
   message: SessionMessageInput,
+  options: WriteSessionMessageOptions = {},
 ): Promise<boolean> {
-  return writeSessionMessageInternal(agentGroupId, sessionId, message, true);
+  return writeSessionMessageInternal(agentGroupId, sessionId, message, true, options.guard);
 }
 
 async function writeSessionMessageInternal(
@@ -903,6 +987,7 @@ async function writeSessionMessageInternal(
   sessionId: string,
   message: SessionMessageInput,
   ignoreDuplicateId: boolean,
+  guard?: WriteGuard,
 ): Promise<boolean> {
   // A session mid-archival is about to lose its directory. Re-provisioning it
   // below would resurrect the dir seconds before the reclaim removes it, and
@@ -930,7 +1015,7 @@ async function writeSessionMessageInternal(
   // see its claim and wait for it to finish.
   const lease = await acquireStorageActivityLease(sessionDir(agentGroupId, sessionId), `inbound-${sessionId}`);
   try {
-    return await writeSessionMessageLocked(agentGroupId, sessionId, message, ignoreDuplicateId);
+    return await writeSessionMessageLocked(agentGroupId, sessionId, message, ignoreDuplicateId, guard);
   } finally {
     await lease.release();
   }
@@ -941,6 +1026,7 @@ async function writeSessionMessageLocked(
   sessionId: string,
   message: SessionMessageInput,
   ignoreDuplicateId: boolean,
+  guard?: WriteGuard,
 ): Promise<boolean> {
   // Waiting for the claim above can mean waiting out a reclaim that archived
   // and deleted this session while we queued. Re-provisioning it here would
@@ -1007,8 +1093,30 @@ async function writeSessionMessageLocked(
     initSessionFolder(agentGroupId, sessionId);
   }
 
+  // THE GUARD, ASKED BEFORE THE BYTES LAND TOO.
+  //
+  // `extractAttachmentFiles` below decodes inline base64 into the target
+  // session's mounted `inbox`, which its container reads — so the extraction is
+  // itself a delivery, and it happens before the mailbox action where the guard
+  // used to run for the first time. A precondition already false here should
+  // never write those bytes at all.
+  //
+  // Cheap to ask twice: the guard is synchronous by contract, and the second
+  // ask inside the insert is the one that closes the window this function's own
+  // awaits open.
+  const refusedBeforeExtract = refusalFrom(guard);
+  if (refusedBeforeExtract !== null) {
+    log.warn('Session write refused by its guard before extracting attachments', {
+      agentGroupId,
+      sessionId,
+      messageId: message.id,
+      reason: refusedBeforeExtract,
+    });
+    throw new SessionWriteRefusedError(refusedBeforeExtract);
+  }
+
   // Extract base64 attachment data, save to inbox, replace with file paths
-  const content = extractAttachmentFiles(agentGroupId, sessionId, message.id, message.content);
+  const { content, writtenPaths } = extractAttachmentFiles(agentGroupId, sessionId, message.id, message.content);
 
   // Scheduled occurrences are always inert until the due-time admission seam
   // builds current recall and flips them wakeable. Keep this invariant even if
@@ -1028,18 +1136,70 @@ async function writeSessionMessageLocked(
     sourceSessionId: message.sourceSessionId ?? null,
     onWake: message.onWake ?? 0,
   };
-  const db = openInboundDb(agentGroupId, sessionId);
-  let inserted: boolean;
-  try {
-    const recallRow = isScheduledTask ? null : buildRecallRow(agentGroupId, sessionId, message, content, db);
-    if (ignoreDuplicateId) {
-      inserted = insertMessageWithContextIfNew(db, row, recallRow);
-    } else {
-      insertMessageWithContext(db, row, recallRow);
-      inserted = true;
-    }
-  } finally {
-    db.close();
+  // One session for the whole write: the recall lifecycle reads and the paired
+  // insert are one logical step against this session's mailbox, and the pair
+  // must be decided from the same snapshot the insert lands in.
+  //
+  // EXISTING-ONLY first, and that is the point. The provisioning funnel runs
+  // `prepare()`, which runs `ensureSchema(..., 'outbound')` — it opens the
+  // CONTAINER-owned outbound.db read-write and executes DDL. Routine ingress
+  // runs while that container is live and writing the same file across the
+  // mount, and pre-seam this path only ever opened inbound.db, so taking the
+  // provisioning funnel per message made the host a second writer for no gain.
+  //
+  // Nothing is lost by skipping `prepare()` here. Both branches above already
+  // provision explicitly when they must, so the mailbox exists by this line;
+  // and the inbound repair `prepare()` would do is done by `session()` itself
+  // on either funnel — the first touch of a path in a process runs upstream's
+  // `migrateMessagesInTable` plus `ensureNanoclawInboundSchema`, which creates
+  // and migrates `session_routing`. What is skipped is exactly the write to
+  // the file the host does not own.
+  //
+  // The provisioning fallback is the reclaim race between the check above and
+  // this open, and it keeps this path's behavior identical to what it replaced.
+  //
+  // Callers must not already hold a session on this key: both funnels throw on
+  // same-key nesting. Every host caller was audited for this in the ingress
+  // batch; delivery action handlers in particular run with no session open
+  // (plan §4.5b, invariant I-9).
+  // THE GUARD POINT. Inside the mailbox action, after every await this function
+  // performs — the storage-activity lease, the reclaim-journal import, the
+  // funnel's own open — and with nothing awaited between it and the insert
+  // below. A caller's precondition proved out here is proved at the instant the
+  // row lands, which is the only instant that matters.
+  //
+  // The refusal is carried out rather than thrown from inside the action: the
+  // mailbox session should close normally, and the caller's error is raised
+  // once, after it does.
+  let refusedReason: string | null = null;
+  const insert = (mailbox: NanoclawMailboxSession): boolean => {
+    refusedReason = refusalFrom(guard);
+    if (refusedReason !== null) return false;
+    const recallRow = isScheduledTask ? null : buildRecallRow(agentGroupId, sessionId, message, content, mailbox);
+    if (ignoreDuplicateId) return mailbox.insertMessageWithContextIfNew(row, recallRow);
+    mailbox.insertMessageWithContext(row, recallRow);
+    return true;
+  };
+  const inserted =
+    (await withExistingMailboxSession(agentGroupId, sessionId, insert)) ??
+    (await withMailboxSession(agentGroupId, sessionId, insert));
+
+  // A refusal is loud. `void` has no room for a result, and a silent return
+  // would let a caller that forgets to check believe it wrote — the dangerous
+  // default. Every existing caller already treats a failed write as an
+  // exception, so this composes with what they do today.
+  if (refusedReason !== null) {
+    // The bytes went in before this point, so the refusal has something to
+    // undo. The caller's own cleanup cannot reach these — it knows only the
+    // files it forwarded, not the ones decoded from inline `data` here.
+    removeExtractedAttachments(writtenPaths);
+    log.warn('Session write refused by its guard at the insert', {
+      agentGroupId,
+      sessionId,
+      messageId: message.id,
+      reason: refusedReason,
+    });
+    throw new SessionWriteRefusedError(refusedReason);
   }
 
   if (!inserted) {
@@ -1128,7 +1288,7 @@ export function admitPendingUpgradeContexts(db: Database.Database, agentGroupId:
         onWake: message.on_wake,
       },
       message.content,
-      db,
+      recallSourceForHandle(agentGroupId, sessionId, db),
     );
     if (!recall) continue;
 
@@ -1550,7 +1710,7 @@ export function admitDueTaskContexts(db: Database.Database, agentGroupId: string
           onWake: 0,
         },
         task.content,
-        db,
+        recallSourceForHandle(agentGroupId, sessionId, db),
       )!;
     } catch (error) {
       if (!(error instanceof Error)) throw error;
@@ -1638,25 +1798,31 @@ export function admitDueTaskContexts(db: Database.Database, agentGroupId: string
  *   4. `wx` flag on writeFileSync to refuse following a pre-existing symlink
  *      at the target file path or overwriting any existing file.
  */
+interface ExtractedAttachments {
+  content: string;
+  /** Absolute paths this call created, so a refused write can take them back. */
+  writtenPaths: string[];
+}
+
 function extractAttachmentFiles(
   agentGroupId: string,
   sessionId: string,
   messageId: string,
   contentStr: string,
-): string {
+): ExtractedAttachments {
   let parsed: Record<string, unknown>;
   try {
     parsed = JSON.parse(contentStr);
   } catch {
-    return contentStr;
+    return { content: contentStr, writtenPaths: [] };
   }
 
   const attachments = parsed.attachments as Array<Record<string, unknown>> | undefined;
-  if (!Array.isArray(attachments)) return contentStr;
+  if (!Array.isArray(attachments)) return { content: contentStr, writtenPaths: [] };
 
   if (!isSafeAttachmentName(messageId)) {
     log.warn('Rejecting unsafe inbound message id', { messageId });
-    return contentStr;
+    return { content: contentStr, writtenPaths: [] };
   }
 
   const inboxRoot = path.join(sessionDir(agentGroupId, sessionId), 'inbox');
@@ -1668,6 +1834,7 @@ function extractAttachmentFiles(
   let inboxResolved = false;
 
   let changed = false;
+  const writtenPaths: string[] = [];
   for (const att of attachments) {
     if (typeof att.data !== 'string') continue;
 
@@ -1738,10 +1905,43 @@ function extractAttachmentFiles(
     att.localPath = `inbox/${messageId}/${filename}`;
     delete att.data;
     changed = true;
+    writtenPaths.push(filePath);
     log.debug('Saved attachment to inbox', { messageId, filename, size: att.size });
   }
 
-  return changed ? JSON.stringify(parsed) : contentStr;
+  return { content: changed ? JSON.stringify(parsed) : contentStr, writtenPaths };
+}
+
+/**
+ * Take back attachment bytes this writer wrote for a message it then refused.
+ *
+ * The bytes are the side effect a refusal cannot otherwise undo: they land in
+ * the target session's mounted `inbox`, which its container reads, with or
+ * without a row pointing at them. The caller's own cleanup cannot cover these —
+ * it only knows about files IT forwarded, not the ones this function decoded
+ * out of inline `data`.
+ *
+ * Best-effort, and the refusal stands either way: failing to tidy up must never
+ * turn a refused write into a successful one. The message directory goes only
+ * if it is actually empty, so a concurrent writer's file is never taken with it.
+ */
+function removeExtractedAttachments(writtenPaths: string[]): void {
+  const dirs = new Set<string>();
+  for (const file of writtenPaths) {
+    try {
+      fs.rmSync(file, { force: true });
+      dirs.add(path.dirname(file));
+    } catch (err) {
+      log.warn('Could not remove an inbox attachment after the write was refused', { file, err });
+    }
+  }
+  for (const dir of dirs) {
+    try {
+      fs.rmdirSync(dir);
+    } catch {
+      // Non-empty or already gone; tidying, not the guarantee.
+    }
+  }
 }
 
 /** Open the inbound DB for a session (host reads/writes). */

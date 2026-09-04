@@ -5,18 +5,20 @@
  * wakes a fresh container via the onExit callback — race-free.
  */
 import {
+  containerOwnsOutbound,
   getContainerSpawnedAt,
   isContainerRunning,
   isContainerSpawning,
   killContainer,
+  sessionStillActive,
   wakeContainer,
 } from './container-runner.js';
 import { randomUUID } from 'crypto';
-import { getSession, getSessionsByAgentGroup } from './db/sessions.js';
+import { getSessionsByAgentGroup } from './db/sessions.js';
 import { log } from './log.js';
 import { SessionDbMissingError, sessionMailboxPath, type NanoclawMailboxSession } from './modules/mailbox/index.js';
 import { repoIngressFenceAckToken } from './modules/mailbox/ops/fence.js';
-import { withExistingNanoclawSession } from './modules/mailbox/session.js';
+import { withExistingNanoclawOutbound, withExistingNanoclawSession } from './modules/mailbox/session.js';
 import { writeSessionMessage } from './session-manager.js';
 import type { Session } from './types.js';
 import fs from 'fs';
@@ -280,19 +282,28 @@ async function activateRepositoryMountBarriers(
 async function sessionReachedRepositoryBarrier(session: Session, expectedAck: string): Promise<boolean> {
   if (!isContainerRunning(session.id) && !isContainerSpawning(session.id)) return true;
   try {
-    const drained = await withExistingNanoclawSession(
+    // OUTBOUND-keyed: all three reads are outbound-owned and nothing here
+    // touches inbound.db, so outbound.db's existence is the question to ask.
+    // The inbound-keyed funnel added a gate the pre-seam probe never had — it
+    // opened outbound.db alone — and a session whose inbound.db is reclaimed
+    // mid-transition could then never report drained, burning the full barrier
+    // timeout and turning a survivable transition into a quiescence failure
+    // that kills every affected container.
+    const drained = await withExistingNanoclawOutbound(
       session.agent_group_id,
       session.id,
-      (mailbox) =>
+      (outbound) =>
         // The EXACT activation token, never merely "some ack": a stale
         // generation from a previous barrier on this session would otherwise
         // read as drained.
-        mailbox.readRepositoryMountBarrierAck() === expectedAck &&
-        mailbox.getProcessingClaimRows().length === 0 &&
-        !mailbox.getContainerState()?.current_tool,
+        outbound.readRepositoryMountBarrierAck() === expectedAck &&
+        outbound.getProcessingClaimRows().length === 0 &&
+        !outbound.getContainerState()?.current_tool,
     );
-    // undefined = no mailbox for a session the host believes is running.
-    // Unknown acknowledgement or work state is never safe to stop.
+    // undefined = no outbound.db at all for a session the host believes is
+    // running. Unknown acknowledgement or work state is never safe to stop,
+    // and neither is a present-but-unreadable file, which raises into the
+    // catch below.
     return drained ?? false;
   } catch {
     return false;
@@ -492,17 +503,27 @@ export async function restartAgentGroupContainers(
   let restarted = 0;
   let failed = 0;
   for (const session of sessions) {
-    if (wakeMessage) {
-      // Awaited so the write is durable before killContainer — but a failure
-      // must cost this session only. Before the await existed, the write was
-      // fire-and-forget and its rejection escaped as an unhandledRejection, so
-      // the loop always finished; letting it throw here instead would kill the
-      // sessions ahead of it and strand every one behind it, half-restarting
-      // the group. Skip this session's kill (never kill a container whose wake
-      // message did not land), count it, and carry on.
+    // WRITE FIRST. `on_wake` rows are visible only on a container's FIRST poll
+    // (`selection.ts` adds `AND on_wake = 0` to every later one), so the row
+    // has to exist before any fresh container looks — writing it after the
+    // checks instead means a replacement that completes its first poll during
+    // the write never sees it, and the row then waits for an unrelated future
+    // spawn. Deferring the write does not remove that failure, it relocates it.
+    //
+    // The paths below that decline to restart therefore COMPENSATE rather than
+    // reorder: `withdrawWake` removes the row if, and only if, nothing has
+    // consumed it. See `withdrawUnconsumedWake`.
+    //
+    // Awaited so the row is durable before `killContainer`, and a failure costs
+    // this session only: before the await existed the write was
+    // fire-and-forget and its rejection escaped as an unhandledRejection, so
+    // the loop always finished; letting it throw here would kill the sessions
+    // ahead of it and strand every one behind it, half-restarting the group.
+    const wakeId = wakeMessage ? `restart-${Date.now()}-${Math.random().toString(36).slice(2, 8)}` : null;
+    if (wakeMessage && wakeId) {
       try {
         await writeSessionMessage(agentGroupId, session.id, {
-          id: `restart-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+          id: wakeId,
           kind: 'chat',
           timestamp: new Date().toISOString(),
           platformId: agentGroupId,
@@ -525,14 +546,43 @@ export async function restartAgentGroupContainers(
         continue;
       }
     }
+
+    // Take back the promise when the restart it announced does not happen.
+    // Existing-only and best-effort: a session whose mailbox is gone has no row
+    // to withdraw, and failing to withdraw must not itself abort the loop — the
+    // worst case is the stale notice this exists to prevent, logged.
+    //
+    // The ownership probe is passed as a thunk, not as a value: the op invokes
+    // it immediately before its delete, so a container that came up while this
+    // decline path was being taken is still seen. Reading it here instead would
+    // reintroduce the stale precondition every other fix in this PR removes.
+    const withdrawWake = async (): Promise<void> => {
+      if (!wakeId) return;
+      try {
+        const withdrawn = await withExistingNanoclawSession(session.agent_group_id, session.id, (mailbox) =>
+          mailbox.withdrawUnconsumedWake(wakeId, () => containerOwnsOutbound(session.id)),
+        );
+        if (withdrawn)
+          log.info('Restart: withdrew the wake message for a container it did not restart', {
+            agentGroupId,
+            sessionId: session.id,
+          });
+      } catch (err) {
+        log.warn('Restart: could not withdraw the wake message', { agentGroupId, sessionId: session.id, err });
+      }
+    };
+
     // The container can exit during the awaited write above, and killContainer
     // no-ops on a session it no longer tracks — counting that as a restart
     // reports work that did not happen.
-    if (!isContainerRunning(session.id)) continue;
+    if (!isContainerRunning(session.id)) {
+      await withdrawWake();
+      continue;
+    }
     // Generation token for the process we are about to kill. The pending read
-    // below is async now, so the snapshotted container can exit and an inbound
-    // wake can install a REPLACEMENT before control returns — and killing that
-    // one is both wrong and silent: if the read saw no due rows, no onExit is
+    // below is async, so the snapshotted container can exit and an inbound wake
+    // can install a REPLACEMENT before control returns — and killing that one
+    // is both wrong and silent: if the read saw no due rows, no onExit is
     // installed, so the replacement's freshly claimed input goes dark until a
     // later recovery pass. `spawnedAt` changes on every spawn, so comparing it
     // across the await identifies the process rather than merely the session.
@@ -543,8 +593,8 @@ export async function restartAgentGroupContainers(
     // claimed. Without this, a provider switch mid-conversation leaves the
     // claimed messages dark until the next inbound or a slow sweep backoff.
     //
-    // This open can throw too, now that the inbound funnel refuses under a
-    // reclaim claim — same rule as the write: cost this session, not the loop.
+    // This open can throw, now that the inbound funnel refuses under a reclaim
+    // claim — same rule as the write: cost this session, not the loop.
     let hasPending: boolean;
     try {
       // Read-only, so `withExistingMailboxSession` — never the provisioning
@@ -552,8 +602,7 @@ export async function restartAgentGroupContainers(
       // `undefined` (no mailbox) is treated exactly like a read failure rather
       // than as "nothing pending": this session's container is RUNNING, so a
       // missing mailbox is an inconsistent host view, and the conservative
-      // answer is to leave it alone. Same rule as the write above: cost this
-      // session, not the loop.
+      // answer is to leave it alone.
       const due = await withExistingNanoclawSession(session.agent_group_id, session.id, (mailbox) =>
         mailbox.countDueMessages(),
       );
@@ -566,15 +615,20 @@ export async function restartAgentGroupContainers(
         sessionId: session.id,
         err,
       });
+      await withdrawWake();
       continue;
     }
     // Re-check the generation, not just liveness: a replacement is "running"
-    // too. Leave it alone — it is doing the work this restart wanted done.
+    // too. Leave it alone — it is doing the work this restart wanted done. If
+    // that replacement's first poll already took the wake row, the withdrawal
+    // is a no-op and it keeps it; if it polled before the row landed, the
+    // withdrawal is what stops the row outliving this restart.
     if (getContainerSpawnedAt(session.id) !== spawnGeneration) {
       log.info('Restart: container was replaced while reading pending work; leaving the replacement alone', {
         agentGroupId,
         sessionId: session.id,
       });
+      await withdrawWake();
       continue;
     }
     killContainer(
@@ -582,8 +636,11 @@ export async function restartAgentGroupContainers(
       reason,
       wakeMessage || hasPending || options.respawnAll
         ? () => {
-            const s = getSession(session.id);
-            if (s) wakeContainer(s);
+            // The liveness proof rides WITH the wake instead of preceding it:
+            // `wakeContainer` awaits admission, the memory queue and the whole
+            // spawn preparation, and a `getSession` here proves nothing about
+            // any of that.
+            void wakeContainer(session, 'interactive', { guard: sessionStillActive(session.id) });
           }
         : undefined,
     );

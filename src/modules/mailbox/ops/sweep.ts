@@ -179,6 +179,25 @@ export interface ProcessingClaim {
   status_changed: string;
 }
 
+/**
+ * Has a container acknowledged this inbound message at all?
+ *
+ * ANY row, in ANY status — deliberately not just `'processing'`. The question
+ * is whether a container ever reached the message, and a claim it has since
+ * finished is still a claim: by the time the host asks, the row may already
+ * read `completed`, `failed` or `script-skip:error`.
+ *
+ * This is the only durable record of consumption the host can see promptly.
+ * `messages_in.status` is NOT: the container claims by writing here, in
+ * `outbound.db`, and the inbound row stays `pending` until a later sweep tick
+ * runs `syncProcessingAcks`. Anything that reads inbound `status` to decide
+ * whether a message was consumed has a window, one sweep interval wide, in
+ * which a claimed message looks untouched.
+ */
+export function hasProcessingAck(outDb: Database.Database, messageId: string): boolean {
+  return outDb.prepare('SELECT 1 FROM processing_ack WHERE message_id = ? LIMIT 1').get(messageId) !== undefined;
+}
+
 /** Return processing_ack rows still in 'processing' with their claim timestamps. */
 export function getProcessingClaims(outDb: Database.Database): ProcessingClaim[] {
   return outDb

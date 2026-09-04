@@ -73,8 +73,9 @@ import {
   hasContainerEverRun,
   getActiveContainerSessionIds,
   isContainerRunning,
-  isContainerSpawning,
+  containerOwnsOutbound,
   killContainer,
+  sessionStillActive,
   wakeContainer,
 } from './container-runner.js';
 import {
@@ -840,18 +841,6 @@ export function decideContinuationWake(args: {
  * outbound.db safe.
  */
 /**
- * Could a container be writing this session's `outbound.db` right now?
- *
- * `outbound.db` has exactly ONE writer. The host may write it only while no
- * container owns it, and "owns it" includes a container that is still
- * SPAWNING — a wake issued a moment ago has not reached `isContainerRunning`
- * yet but is about to hold the file.
- */
-function containerOwnsOutbound(sessionId: string): boolean {
-  return isContainerRunning(sessionId) || isContainerSpawning(sessionId);
-}
-
-/**
  * THE guard for every host-side write to the container-owned `outbound.db`.
  *
  * `outbound.db` has one writer. The host may write it only while no container
@@ -1314,8 +1303,7 @@ function applyProviderHeal(
  */
 function killForProviderHeal(session: Session): void {
   killContainer(session.id, 'provider-failed-selfheal', () => {
-    const fresh = getSession(session.id);
-    if (fresh) void wakeContainer(fresh);
+    void wakeContainer(session, 'interactive', { guard: sessionStillActive(session.id) });
   });
 }
 
@@ -1673,15 +1661,20 @@ async function prepareDueWake(
   // on the host BEFORE admission, so a gated/errored fire never becomes due
   // and never spawns a container. See host-script.ts's runHostGatedTaskScripts.
   //
-  // Both helpers still take a raw handle and live in files this PR must not
-  // touch — both belong to PR 4, the ingress family (plan §5):
-  // `modules/scheduling/host-script.ts` and `session-manager.ts`. Handing them
-  // this session's own handle
-  // keeps the admission seam on ONE open — reopening inbound.db beside a live
-  // session would be worse, not cleaner. Both move behind the seam with their
-  // own PRs; `legacyInboundHandle` is what keeps host-sweep.ts on the
-  // raw-access allowlist until they do.
-  await runHostGatedTaskScripts(mailbox.legacyInboundHandle(), agentGroupId, sessionId);
+  // `runHostGatedTaskScripts` takes this session (mailbox seam PR 4): it is a
+  // sweep callee with no other production caller, and a SESSION parameter is
+  // the seam's sanctioned object — invariant I-9 forbids handing out raw
+  // handles, not sessions, so the callee stays off the ratchet's allowlist.
+  // It can spend the full pre-task timeout per row, so the session is held
+  // across that work exactly as it was when this line passed a raw handle.
+  // `admitDueTaskContexts` still takes one: it lives in `session-manager.ts`
+  // and moves behind the seam in PR 7. `legacyInboundHandle` survives here for
+  // that one call and nothing else.
+  //
+  // `agentGroupId` rides along because the callee resolves the GROUP's
+  // timezone for its local-time gate: a session parameter identifies the
+  // mailbox, not the group whose zone override applies.
+  await runHostGatedTaskScripts(mailbox, agentGroupId, sessionId);
   const admittedTasks = admitDueTaskContexts(mailbox.legacyInboundHandle(), agentGroupId, sessionId);
   const dueCount = mailbox.countDueMessages();
   return {
@@ -2424,9 +2417,13 @@ async function sweepTaskWatchdog(): Promise<void> {
             },
           }),
         });
-        void wakeContainer(parentSession).catch((err) =>
-          log.warn('Task watchdog: wakeContainer(parent) failed', { taskId: task.task_id, err }),
-        );
+        // `parentSession` was fetched before the awaited mailbox write above,
+        // and the parent can be archived in that window — but so can it be
+        // archived during the wake's own awaits, which a re-read here cannot
+        // see. The proof travels with the wake.
+        void wakeContainer(parentSession, 'interactive', {
+          guard: sessionStillActive(parentSession.id),
+        }).catch((err) => log.warn('Task watchdog: wakeContainer(parent) failed', { taskId: task.task_id, err }));
       } catch (err) {
         log.warn('Task watchdog: failed to notify parent', { taskId: task.task_id, err });
       }
@@ -2964,15 +2961,16 @@ function registerBuiltInSweepDuties(): void {
     // close path trusts (see thread-close.ts). Isolated: a mirror failure must
     // never cost this session its sweep.
     //
-    // Still a raw-handle callee: `dashboard/thread-close.ts` moves behind the
-    // seam in PR 4, and this line becomes `syncDoneProposalMirror(session.id)`
-    // then. It only reads. Guarded on `hasOutbound` because a raw handle is the
-    // one thing the module cannot degrade for a never-woken session.
+    // `syncDoneProposalMirror` now takes the PARSED proposal (mailbox seam
+    // PR 4), so the read is the module's own op and no handle leaves the
+    // session. The `hasOutbound` guard is kept for what it costs: a
+    // never-woken session has no proposal to mirror and no outbound file to
+    // open looking for one.
     run: (ctx) => {
       const { session, mailbox } = asSessionContext(ctx);
       if (mailbox!.hasOutbound()) {
         try {
-          syncDoneProposalMirror(session.id, mailbox!.legacyOutboundHandle());
+          syncDoneProposalMirror(session.id, mailbox!.readDoneProposal());
         } catch (err) {
           log.warn('done_proposal mirror failed', { sessionId: session.id, err });
         }
@@ -3069,7 +3067,18 @@ function registerBuiltInSweepDuties(): void {
         // etc.) return false and leave messages pending for the next tick.
         // Classification is passed into the atomic admission decision so a
         // scheduled wake can never reserve memory as interactive first.
-        const woke = await wakeContainer(session, plan.wakePriority);
+        // Re-read immediately before the wake. `session` came from the tick's
+        // `getActiveSessions()` snapshot, taken before a serial per-session
+        // loop that awaits container spawns, so by this duty it can be many
+        // seconds old — and the storage worker this same tick starts closes
+        // rows with `UPDATE sessions SET status = 'archiving' … WHERE status =
+        // 'active'`. `wakeContainer`'s only liveness gate reads `status` off
+        // the object it is handed, so a stale one defeats it and spawns a
+        // container `getActiveSessions()` will never return: no stuck
+        // detection, no heartbeat ceiling, no claim tolerance. Every other
+        // by-id caller already re-reads (`router.ts`, `agent-route.ts`,
+        // `container-restart.ts`); this one did not.
+        const woke = await wakeContainer(session, plan.wakePriority, { guard: sessionStillActive(session.id) });
         c.reportWoke(woke);
         if (!woke && resumedContinuation) {
           await restoreStoppedContinuationAttempt(wakeRun, session, resumedContinuation, plan.workContinuation!);
@@ -3141,12 +3150,14 @@ function registerBuiltInSweepDuties(): void {
     order: 20,
     // 8. Recurrence fanout for completed recurring tasks.
     // MODULE-HOOK:scheduling-recurrence:start
-    // Still a raw-handle callee: `modules/scheduling/recurrence.ts` moves behind
-    // the seam in PR 4.
+    // Takes this session (mailbox seam PR 4). Same rule as
+    // `runHostGatedTaskScripts` above: a sweep callee with no other production
+    // caller receives the sweep's session, never a raw handle and never its
+    // own nested open on the same key.
     run: async (ctx) => {
       const { session, mailbox } = asSessionContext(ctx);
       const { handleRecurrence } = await import('./modules/scheduling/recurrence.js');
-      await handleRecurrence(mailbox!.legacyInboundHandle(), session);
+      await handleRecurrence(mailbox!, session);
     },
     // MODULE-HOOK:scheduling-recurrence:end
   });
@@ -3198,9 +3209,14 @@ function registerBuiltInSweepDuties(): void {
     // in that order (src/dashboard/thread-close.ts). Central-DB scan of the few
     // in-flight rows, once per tick, after the per-session loop so container
     // state is current. Nothing here can START a close; only an operator can.
-    run: () => {
+    run: async () => {
       try {
-        advanceThreadClosures();
+        // Awaited (mailbox seam PR 4): the close path became asynchronous when
+        // its proposal reads moved behind the funnel, and an unawaited call
+        // would let the tick finish while the close is still mid-flight —
+        // rejections escaping this catch, and the duty reporting success it
+        // has not had.
+        await advanceThreadClosures();
       } catch (err) {
         log.warn('thread-close sweep step failed', { err });
       }

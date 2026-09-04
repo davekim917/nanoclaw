@@ -19,6 +19,20 @@ const mockWakeContainer = vi.fn();
 vi.mock('./container-runner.js', () => ({
   isContainerRunning: (...args: unknown[]) => mockIsContainerRunning(args[0] as string),
   isContainerSpawning: (...args: unknown[]) => mockIsContainerSpawning(args[0] as string),
+  // The real definition, over the same two mocks: a container "owns"
+  // outbound.db while it is running OR still spawning.
+  containerOwnsOutbound: (...args: unknown[]) =>
+    mockIsContainerRunning(args[0] as string) || mockIsContainerSpawning(args[0] as string),
+  // The real definition, over the same session mock: a guard the WAKE PATH
+  // evaluates at the spawn, not a check the caller makes before calling.
+  sessionStillActive:
+    (...args: unknown[]) =>
+    () => {
+      const fresh = mockGetSession(args[0] as string);
+      if (!fresh) return { ok: false, reason: 'session no longer exists' };
+      if (fresh.status !== 'active') return { ok: false, reason: `session is ${fresh.status}` };
+      return true;
+    },
   getContainerSpawnedAt: (...args: unknown[]) => mockGetContainerSpawnedAt(args[0] as string),
   killContainer: (...args: unknown[]) =>
     mockKillContainer(args[0] as string, args[1] as string, args[2] as (() => void) | undefined),
@@ -35,6 +49,19 @@ vi.mock('./db/sessions.js', () => ({
 const mockWriteSessionMessage = vi.fn();
 /** Session rows that exist in the central DB but own no mailbox. */
 const missingInboundDbs = new Set<string>();
+/** Every withdrawal attempt, and whether it actually removed a row. */
+const withdrawnWakes: Array<{
+  sessionId: string;
+  messageId: string;
+  withdrew: boolean;
+  containerOwned: boolean;
+}> = [];
+/** When true, the model treats the wake row as already claimed by a first poll. */
+let wakeAlreadyConsumed = false;
+// The barrier's drain probe reads OUTBOUND-owned state, so it goes through the
+// outbound-keyed funnel and its absence set is a different one — that split is
+// the point of the fix it models.
+const missingOutboundDbs = new Set<string>();
 /** Session mailboxes that exist but are unreadable (present file, no schema). */
 const unreadableInboundDbs = new Set<string>();
 /** Session ids the seam actually handed a mailbox session back for. */
@@ -129,6 +156,16 @@ function modelMailbox(sessionId: string): NanoclawMailboxSession {
       processingSessions.has(sessionId) ? [{ message_id: 'late', status_changed: new Date().toISOString() }] : [],
     getContainerState: () => (toolSessions.has(sessionId) ? { current_tool: 'Bash' } : null),
     countDueMessages: () => mockCountDueMessages(sessionId),
+    // Models the op: the claim proof runs FIRST — a container that owns
+    // outbound.db, or a `processing_ack` for this message, withdraws nothing —
+    // and only then the guarded DELETE. Invoking the probe here is what makes
+    // this model catch a caller that stops passing a live one.
+    withdrawUnconsumedWake: (messageId: string, containerOwnsOutbound: () => boolean) => {
+      const owned = containerOwnsOutbound();
+      const withdrew = !owned && !wakeAlreadyConsumed;
+      withdrawnWakes.push({ sessionId, messageId, withdrew, containerOwned: owned });
+      return withdrew;
+    },
   } as unknown as NanoclawMailboxSession;
 }
 
@@ -148,6 +185,19 @@ vi.mock('./modules/mailbox/session.js', async (importOriginal) => {
       if (missingInboundDbs.has(sessionId)) return undefined;
       if (unreadableInboundDbs.has(sessionId)) throw new Error('no such table: messages_in');
       openedInboundDbs.push(sessionId);
+      return action(modelMailbox(sessionId));
+    },
+    withExistingNanoclawOutbound: async (
+      agentGroupId: string,
+      sessionId: string,
+      action: (outbound: unknown) => unknown,
+    ) => {
+      if (realMailboxSessions.has(sessionId)) {
+        return real.withExistingNanoclawOutbound(agentGroupId, sessionId, action as never);
+      }
+      // Keyed on outbound.db, deliberately independent of missingInboundDbs:
+      // a session whose inbound.db is gone still has outbound state to read.
+      if (missingOutboundDbs.has(sessionId)) return undefined;
       return action(modelMailbox(sessionId));
     },
     // Referenced only so the unused-import lint stays quiet if the real class
@@ -184,6 +234,9 @@ beforeEach(() => {
   activationFailures.clear();
   releaseFailures.clear();
   missingInboundDbs.clear();
+  withdrawnWakes.length = 0;
+  wakeAlreadyConsumed = false;
+  missingOutboundDbs.clear();
   unreadableInboundDbs.clear();
   openedInboundDbs.length = 0;
   beforeInboundOpen = null;
@@ -646,6 +699,78 @@ describe('restartAgentGroupContainers', () => {
     expect(mockKillContainer).not.toHaveBeenCalled();
   });
 
+  /**
+   * A wake row is a claim that a restart happened. It must not outlive a
+   * restart that did not.
+   *
+   * `on_wake` rows are visible ONLY on a container's first poll — every later
+   * poll filters them out — so the row has to be written BEFORE any fresh
+   * container looks, and a row left behind by a path that declined to restart
+   * waits for an unrelated future spawn and surfaces there as a stale
+   * "restarted to apply X".
+   *
+   * Writing it after the checks instead does not fix that, it relocates it: a
+   * replacement completing its first poll during the write never sees the row
+   * at all. So the write stays first and the declining paths withdraw it.
+   */
+  it('withdraws the wake message for a session it decides not to restart', async () => {
+    mockGetSessionsByAgentGroup.mockReturnValue([makeSession('s1', 'g1')]);
+    // Running at collection, gone by the time the awaited write returns — so
+    // this restart declines, and NOTHING owns outbound.db at the withdrawal.
+    // That is the decline path where consumption is provably impossible.
+    let calls = 0;
+    mockIsContainerRunning.mockImplementation(() => {
+      calls += 1;
+      return calls < 2;
+    });
+
+    const count = await restartAgentGroupContainers('g1', 'test', 'Resuming.');
+
+    expect(count).toBe(0);
+    expect(mockKillContainer).not.toHaveBeenCalled();
+    // The row was written — it has to precede any first poll — and then taken
+    // back, because the restart it announced did not happen.
+    expect(mockWriteSessionMessage.mock.calls.map((c) => c[1])).toEqual(['s1']);
+    expect(withdrawnWakes).toHaveLength(1);
+    expect(withdrawnWakes[0]).toMatchObject({ withdrew: true, containerOwned: false });
+    // Withdrawn by the id it was written under, so nothing else can match.
+    const written = mockWriteSessionMessage.mock.calls[0][2] as { id: string };
+    expect(withdrawnWakes[0].messageId).toBe(written.id);
+  });
+
+  /**
+   * A live replacement keeps the row, whether or not it has claimed it yet.
+   *
+   * The withdrawal used to rest on `status = 'pending' AND on_wake = 1` alone,
+   * documented as making a consumed row a no-op delete. It does not: a
+   * container claims by writing `processing_ack` in `outbound.db`, and the
+   * inbound row stays `pending` until a later sweep tick syncs it. So for one
+   * sweep interval a claimed row still looks untouched, and a replacement
+   * mid-first-poll — selected the row, not yet acked — would have it deleted
+   * out from under it.
+   *
+   * The cost of the fail-closed rule is stated rather than buried: this decline
+   * path, and the pending-read-failure one, no longer withdraw at all, so a row
+   * neither of them can prove unconsumed may still surface later as a stale
+   * "restarted to apply X". A stale notice is recoverable; a deleted restart
+   * message is not.
+   */
+  it('leaves the wake message alone when a replacement container is live', async () => {
+    mockGetSessionsByAgentGroup.mockReturnValue([makeSession('s1', 'g1')]);
+    mockIsContainerRunning.mockReturnValue(true);
+    // A replacement appears while the pending read is in flight.
+    mockGetContainerSpawnedAt.mockReturnValueOnce(1000).mockReturnValue(2000);
+
+    const count = await restartAgentGroupContainers('g1', 'test', 'Resuming.');
+
+    expect(count).toBe(0);
+    expect(mockKillContainer).not.toHaveBeenCalled();
+    // The withdrawal was attempted and refused on the ownership proof, before
+    // the delete could run.
+    expect(withdrawnWakes).toHaveLength(1);
+    expect(withdrawnWakes[0]).toMatchObject({ withdrew: false, containerOwned: true });
+  });
+
   it('keeps going when the pending-work open throws, without killing that container', async () => {
     mockGetSessionsByAgentGroup.mockReturnValue([makeSession('s1', 'g1'), makeSession('s2', 'g1')]);
     mockIsContainerRunning.mockReturnValue(true);
@@ -738,33 +863,52 @@ describe('restartAgentGroupContainers', () => {
     expect(typeof onExit).toBe('function');
   });
 
-  it('onExit callback calls wakeContainer with refreshed session', async () => {
+  /**
+   * The respawn's liveness proof travels WITH the wake.
+   *
+   * This used to be `getSession()` then `wakeContainer(fresh)`, which proves
+   * the row live before the call. The call then awaits storage admission, an
+   * unbounded memory-queue wait and the whole spawn preparation, none of which
+   * a re-read here can see. The guard is evaluated by the wake path with
+   * nothing awaited between it and `spawn()`.
+   */
+  it('onExit wakes with a guard the wake path proves at the spawn', async () => {
     mockGetSessionsByAgentGroup.mockReturnValue([makeSession('s1', 'g1')]);
     mockIsContainerRunning.mockReturnValue(true);
-    const freshSession = makeSession('s1', 'g1');
-    mockGetSession.mockReturnValue(freshSession);
+    mockGetSession.mockReturnValue(makeSession('s1', 'g1'));
 
     await restartAgentGroupContainers('g1', 'test', 'Resuming.');
 
-    // Simulate container exit by calling the onExit callback
     const onExit = mockKillContainer.mock.calls[0][2] as () => void;
     onExit();
 
-    expect(mockGetSession).toHaveBeenCalledWith('s1');
-    expect(mockWakeContainer).toHaveBeenCalledWith(freshSession);
+    expect(mockWakeContainer).toHaveBeenCalledWith(expect.objectContaining({ id: 's1' }), 'interactive', {
+      guard: expect.any(Function),
+    });
+    const { guard } = mockWakeContainer.mock.calls[0][2] as { guard: () => unknown };
+    expect(guard()).toBe(true);
   });
 
-  it('onExit callback does not wake if session no longer exists', async () => {
+  /**
+   * A session that vanished is refused by the guard rather than skipped here.
+   *
+   * The refusal moves, it does not disappear: the wake is issued and the wake
+   * path declines it at the spawn. That covers strictly more than the old skip,
+   * which could only see a session that had already gone by the time `onExit`
+   * ran — never one that goes during the wake's own awaits.
+   */
+  it('onExit hands the wake a guard that refuses a session that no longer exists', async () => {
     mockGetSessionsByAgentGroup.mockReturnValue([makeSession('s1', 'g1')]);
     mockIsContainerRunning.mockReturnValue(true);
-    mockGetSession.mockReturnValue(undefined);
 
     await restartAgentGroupContainers('g1', 'test', 'Resuming.');
 
     const onExit = mockKillContainer.mock.calls[0][2] as () => void;
+    mockGetSession.mockReturnValue(undefined);
     onExit();
 
-    expect(mockWakeContainer).not.toHaveBeenCalled();
+    const { guard } = mockWakeContainer.mock.calls[0][2] as { guard: () => unknown };
+    expect(guard()).toEqual({ ok: false, reason: 'session no longer exists' });
   });
 
   it('handles multiple running sessions with wake message', async () => {
@@ -797,5 +941,7 @@ describe('restartAgentGroupContainers', () => {
     mockGetSession.mockReturnValue(makeSession('s1', 'ag1'));
     onExit();
     expect(mockWakeContainer).toHaveBeenCalled();
+    const { guard } = mockWakeContainer.mock.calls[0][2] as { guard: () => unknown };
+    expect(guard()).toBe(true);
   });
 });

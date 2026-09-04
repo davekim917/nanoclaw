@@ -141,6 +141,71 @@ export function insertDeferredMessageWithContextIfNew(db: Database.Database, mes
 }
 
 /** Strict internal-host variant: duplicate ids retain the existing constraint error contract. */
+/**
+ * Withdraw an `on_wake` trigger row that no container has consumed, plus its
+ * recall partner.
+ *
+ * This exists because `on_wake` rows are visible ONLY on a container's FIRST
+ * poll — `selection.ts` adds `AND on_wake = 0` to every subsequent one. That
+ * makes the row a promise with exactly one chance to be kept: written before a
+ * restart that then does not happen, it is not merely wasted, it waits for
+ * some unrelated future spawn and surfaces there as a stale "restarted to
+ * apply X".
+ *
+ * It cannot be fixed by writing the row later instead. The row must exist
+ * BEFORE any fresh container's first poll, or that container's one look at it
+ * misses it. So the write stays first and the paths that decline compensate
+ * here.
+ *
+ * `status = 'pending' AND on_wake = 1` narrows the delete, but it does NOT by
+ * itself prove the row is unconsumed, and it was documented as if it did. A
+ * container claims a message by writing `processing_ack` in `outbound.db`; the
+ * inbound row it claimed stays `pending` until a later sweep tick runs
+ * `syncProcessingAcks`. So there is a window, one sweep interval wide, in which
+ * a claimed wake row still reads `pending` — and deleting it there destroys the
+ * message a replacement container is already working on, which is strictly
+ * worse than the stale notice this op exists to prevent.
+ *
+ * Hence `claimPossible`, evaluated HERE rather than by the caller, and the
+ * withdrawal proceeds only on a proof that no container could have claimed:
+ *
+ *   - no container owns `outbound.db` — running OR spawning, since a container
+ *     that has not finished spawning is about to poll — which is the caller's
+ *     half, because the container registry is host state this module cannot
+ *     see; and
+ *   - no `processing_ack` row for this message id, in any status, which is this
+ *     module's half.
+ *
+ * Both halves are needed. Ownership alone misses a container that claimed and
+ * then exited; the ack alone misses one that is mid-poll, having selected the
+ * row but not yet written its claim.
+ *
+ * Fail closed: `claimPossible` answers true when it cannot tell — an
+ * `outbound.db` that is present but unopenable preserves the row. An unwithdrawn
+ * wake row costs one stale "restarted to apply X" notice; a wrongly withdrawn
+ * one costs the message.
+ *
+ * The recall partner is removed only when the trigger actually was — a consumed
+ * trigger keeps its context. The host is the sole writer of `inbound.db`, so
+ * there is no race with the container on the delete itself.
+ *
+ * @param claimPossible synchronous probe: could any container have claimed this
+ *   message, or is that unprovable? Called once, immediately before the delete.
+ * @returns true when an unconsumed row was withdrawn.
+ */
+export function withdrawUnconsumedWake(
+  db: Database.Database,
+  messageId: string,
+  claimPossible: () => boolean,
+): boolean {
+  if (claimPossible()) return false;
+  const withdrawn =
+    db.prepare("DELETE FROM messages_in WHERE id = ? AND status = 'pending' AND on_wake = 1").run(messageId).changes >
+    0;
+  if (withdrawn) db.prepare("DELETE FROM messages_in WHERE id = ? AND kind = 'system'").run(`recall-${messageId}`);
+  return withdrawn;
+}
+
 export function insertMessageWithContext(
   db: Database.Database,
   trigger: MessageInsert,

@@ -1,7 +1,7 @@
 import Database from 'better-sqlite3';
 import fs from 'fs';
 import path from 'path';
-import { describe, expect, it, beforeEach, afterEach, vi } from 'vitest';
+import { describe, expect, it, beforeEach, afterEach, vi, type MockInstance } from 'vitest';
 
 import { forwardAttachedFiles, isSafeAttachmentName, routeAgentMessage } from './agent-route.js';
 import { log } from '../../log.js';
@@ -9,18 +9,65 @@ import { createDestination } from './db/agent-destinations.js';
 import { initTestDb, closeDb, runMigrations, createAgentGroup } from '../../db/index.js';
 import { createSession, updateSession } from '../../db/sessions.js';
 import { initSessionFolder, inboundDbPath, sessionDir, writeSessionMessage } from '../../session-manager.js';
+import { getDb } from '../../db/connection.js';
+import { SessionDbMissingError } from '../mailbox/index.js';
 import type { Session } from '../../types.js';
 
-vi.mock('../../container-runner.js', () => ({
-  wakeContainer: vi.fn().mockResolvedValue(undefined),
-  isContainerRunning: vi.fn().mockReturnValue(false),
-  getActiveContainerCount: vi.fn().mockReturnValue(0),
-  killContainer: vi.fn(),
-}));
+vi.mock('../../container-runner.js', async () => {
+  // Reads through this file's real `db/sessions`, so the guard answers what a
+  // case has actually set up.
+  const { getSession } = await import('../../db/sessions.js');
+  return {
+    wakeContainer: vi.fn().mockResolvedValue(undefined),
+    isContainerRunning: vi.fn().mockReturnValue(false),
+    getActiveContainerCount: vi.fn().mockReturnValue(0),
+    killContainer: vi.fn(),
+    // The real definition. The route hands its liveness proof to the wake path
+    // rather than proving it before the call; it only builds the guard here.
+    sessionStillActive: (sessionId: string) => () => {
+      const fresh = getSession(sessionId);
+      if (!fresh) return { ok: false, reason: 'session no longer exists' };
+      if (fresh.status !== 'active') return { ok: false, reason: `session is ${fresh.status}` };
+      if (fresh.archived_at != null) return { ok: false, reason: 'session is archived' };
+      return true;
+    },
+  };
+});
 
 vi.mock('../../config.js', async () => {
   const actual = await vi.importActual('../../config.js');
   return { ...actual, DATA_DIR: TEST_DIR };
+});
+
+// One-shot hook that fires inside the source-mailbox lookup — the first await
+// standing between the route's authorization decision and the write it
+// authorizes. Lets a case revoke a grant mid-route with no timing dependence.
+const duringSourceLookup = vi.hoisted(() => ({ run: null as (() => void) | null }));
+
+// One-shot hook on the first `sessionDir` resolution after it is armed — which
+// is inside the attachment copy, the only thing between the two authorization
+// proofs that touches the filesystem. Lets a case revoke a grant with the file
+// bytes already on disk. Each case asserts WHICH proof refused, so a hook that
+// fired at the wrong moment fails rather than passing for the wrong reason.
+const duringFileCopy = vi.hoisted(() => ({ run: null as (() => void) | null }));
+
+vi.mock('../../session-manager.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../session-manager.js')>();
+  return {
+    ...actual,
+    withExistingMailboxSession: async (agentGroupId: string, sessionId: string, action: never) => {
+      const hook = duringSourceLookup.run;
+      duringSourceLookup.run = null;
+      hook?.();
+      return actual.withExistingMailboxSession(agentGroupId, sessionId, action);
+    },
+    sessionDir: (agentGroupId: string, sessionId: string) => {
+      const hook = duringFileCopy.run;
+      duringFileCopy.run = null;
+      hook?.();
+      return actual.sessionDir(agentGroupId, sessionId);
+    },
+  };
 });
 
 const { TEST_DIR } = vi.hoisted(() => ({ TEST_DIR: uniqueTmpRoot('test-a2a-route') }));
@@ -189,6 +236,14 @@ describe('routeAgentMessage return-path', () => {
   });
 
   afterEach(() => {
+    duringSourceLookup.run = null;
+    duringFileCopy.run = null;
+    // A `vi.spyOn(log, 'warn')` inside a case is NOT restored by that case when
+    // an assertion above its restore call throws — the spy then survives into
+    // the next case and reports the previous one's warnings as its own. That
+    // turns one real failure into two, and the second is a lie. Restoring here
+    // is unconditional; module factory mocks are untouched by it.
+    vi.restoreAllMocks();
     closeDb();
     if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
   });
@@ -401,6 +456,153 @@ describe('routeAgentMessage return-path', () => {
     expect(s2Rows).toHaveLength(1);
   });
 
+  /**
+   * A destination revoked mid-route must not still deliver.
+   *
+   * The `a2aSend` guard runs at the top of `routeAgentMessage`, and the route
+   * then awaits — the source-mailbox lookup here, and in production a
+   * thread-context build that can be a platform HTTP call lasting seconds. An
+   * admin revoking the grant inside that window used to get the message
+   * inserted, archived, engaged and the target woken on an authorization that
+   * no longer held.
+   */
+  it('drops a message whose destination grant is revoked while the route is in flight', async () => {
+    // A.S1 → B first, so B has a row to reply to and the reply takes the
+    // return-path lookup — the await this case opens its window inside.
+    await routeAgentMessage(
+      { id: 'msg-fwd', platform_id: B, content: JSON.stringify({ text: 'ping' }), in_reply_to: null },
+      S1,
+    );
+    const inboundId = readPairedInboundTriggers(B, SB.id)[0].id;
+
+    // The admin revokes B→A while the lookup is in flight.
+    duringSourceLookup.run = () => {
+      getDb().prepare('DELETE FROM agent_destinations WHERE agent_group_id = ? AND target_id = ?').run(B, A);
+    };
+
+    await expect(
+      routeAgentMessage(
+        { id: 'msg-reply', platform_id: A, content: JSON.stringify({ text: 'pong' }), in_reply_to: inboundId },
+        SB,
+      ),
+    ).rejects.toThrow(/no destination for/);
+
+    // Nothing written, on either candidate session.
+    expect(readPairedInboundTriggers(A, S1.id)).toHaveLength(0);
+    expect(readPairedInboundTriggers(A, S2.id)).toHaveLength(0);
+  });
+
+  /**
+   * Unprovable provenance is not a licence to route.
+   *
+   * The loopback check asks whether this reply is the caller talking to itself.
+   * When the caller's own inbound storage is gone the answer is unknowable, and
+   * the seam briefly spelled that as `false` — "not a loopback" — which routed
+   * a self-directed reply nobody could vouch for and cost an extra self turn.
+   * A definite read fails instead.
+   */
+  it('fails rather than routing a self-reply whose own inbound storage is gone', async () => {
+    fs.rmSync(inboundDbPath(A, S1.id));
+
+    await expect(
+      routeAgentMessage(
+        { id: 'self-reply', platform_id: A, content: JSON.stringify({ text: 'to myself' }), in_reply_to: 'some-row' },
+        S1,
+      ),
+    ).rejects.toThrow(SessionDbMissingError);
+
+    // And it did not fall through to the newest-session heuristic instead.
+    expect(readPairedInboundTriggers(A, S2.id)).toHaveLength(0);
+  });
+
+  /**
+   * The RETURN-PATH lookup must fail on unprovable provenance too.
+   *
+   * The self-loopback site was fixed in an earlier round; this one still mapped
+   * a missing source mailbox to `null` and fell through to `resolveSession`,
+   * which picks the newest active session of the target or creates one. So a
+   * reply whose origin nobody could vouch for was delivered anyway, to a
+   * session that never took part in the conversation. The two sites read the
+   * same storage and must answer "I cannot tell" the same way.
+   */
+  it('fails a peer reply rather than routing it when the source mailbox is gone', async () => {
+    await routeAgentMessage(
+      { id: 'msg-prov', platform_id: B, content: JSON.stringify({ text: 'ping' }), in_reply_to: null },
+      S1,
+    );
+    const inboundId = readPairedInboundTriggers(B, SB.id)[0].id;
+
+    // B's own inbound storage disappears before it replies.
+    fs.rmSync(inboundDbPath(B, SB.id));
+
+    await expect(
+      routeAgentMessage(
+        { id: 'msg-prov-reply', platform_id: A, content: JSON.stringify({ text: 'pong' }), in_reply_to: inboundId },
+        SB,
+      ),
+    ).rejects.toThrow(SessionDbMissingError);
+
+    // And it did not fall through to the newest-session heuristic instead.
+    expect(readPairedInboundTriggers(A, S1.id)).toHaveLength(0);
+    expect(readPairedInboundTriggers(A, S2.id)).toHaveLength(0);
+  });
+
+  /**
+   * A return-path candidate bound to a chat needs that wiring to still exist.
+   *
+   * `resolveFallback` refuses to inherit a caller's messaging group once the
+   * target's wiring is revoked, and reports that by returning `mgId: null`. But
+   * `mgId === null` also means "the caller is agent-shared", and the candidate
+   * check read the two as one permission — so a revocation during the awaited
+   * lookup produced an agent-shared fallback, which was then taken as licence to
+   * reuse the mg-BOUND candidate from the earlier exchange. The reply landed in
+   * a chat the target no longer belongs to, which is the exact bypass the
+   * cross-tenant gate exists to prevent.
+   */
+  it('does not reuse an mg-bound return-path candidate whose wiring was revoked mid-lookup', async () => {
+    // A chat A belongs to. The forward runs BEFORE S1 is bound to it, so it
+    // lands in SB the ordinary way; binding S1 afterwards is what makes the
+    // return-path candidate mg-BOUND, which is the only shape at issue here.
+    getDb()
+      .prepare(
+        `INSERT INTO messaging_groups (id, channel_type, instance, platform_id, name, is_group, unknown_sender_policy, created_at)
+         VALUES ('mg-shared', 'slack', 'slack', 'slack:C-shared', 'Shared', 1, 'public', ?)`,
+      )
+      .run(now());
+    getDb()
+      .prepare(
+        `INSERT INTO messaging_group_agents (id, messaging_group_id, agent_group_id, created_at)
+         VALUES ('mga-a', 'mg-shared', ?, ?)`,
+      )
+      .run(A, now());
+
+    await routeAgentMessage(
+      { id: 'msg-wire-fwd', platform_id: B, content: JSON.stringify({ text: 'ping' }), in_reply_to: null },
+      S1,
+    );
+    const inboundId = readPairedInboundTriggers(B, SB.id)[0].id;
+    // Bound directly: `updateSession` deliberately does not expose the mg
+    // column, and this is planting a prior exchange's shape, not a route.
+    getDb().prepare("UPDATE sessions SET messaging_group_id = 'mg-shared' WHERE id = ?").run(S1.id);
+
+    // The admin unwires A from that chat while B's reply is mid-lookup.
+    duringSourceLookup.run = () => {
+      getDb()
+        .prepare("DELETE FROM messaging_group_agents WHERE agent_group_id = ? AND messaging_group_id = 'mg-shared'")
+        .run(A);
+    };
+
+    await routeAgentMessage(
+      { id: 'msg-wire-reply', platform_id: A, content: JSON.stringify({ text: 'pong' }), in_reply_to: inboundId },
+      SB,
+    );
+
+    // The mg-bound candidate is abandoned; the reply takes the agent-shared
+    // path instead of being delivered into the chat A was just removed from.
+    expect(readPairedInboundTriggers(A, S1.id)).toHaveLength(0);
+    expect(readPairedInboundTriggers(A, S2.id)).toHaveLength(1);
+  });
+
   it('self-message is allowed without a destination row', async () => {
     // A targets itself — no agent_destinations row exists for A→A.
     await routeAgentMessage(
@@ -509,6 +711,115 @@ describe('routeAgentMessage return-path', () => {
     const targetPath = path.join(sessionDir(B, SB.id), parsed.attachments[0].localPath);
     expect(fs.existsSync(targetPath)).toBe(true);
     expect(fs.readFileSync(targetPath, 'utf-8')).toBe('fake-pdf-bytes');
+  });
+
+  /** Every file under a session's inbox tree, relative to it. */
+  function inboxFiles(agentGroupId: string, sessionId: string): string[] {
+    const root = path.join(sessionDir(agentGroupId, sessionId), 'inbox');
+    if (!fs.existsSync(root)) return [];
+    const out: string[] = [];
+    const walk = (dir: string, prefix: string): void => {
+      for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+        const rel = prefix ? `${prefix}/${entry.name}` : entry.name;
+        if (entry.isDirectory()) walk(path.join(dir, entry.name), rel);
+        else out.push(rel);
+      }
+    };
+    walk(root, '');
+    return out.sort();
+  }
+
+  /** The `stage` field of every route-denial warning since the spy was installed. */
+  function denialStages(warn: MockInstance<typeof log.warn>): string[] {
+    return warn.mock.calls
+      .filter((call) => String(call[0]).includes('destination grant was revoked'))
+      .map((call) => String((call[1] as { stage?: string }).stage));
+  }
+
+  /**
+   * File BYTES are a delivery, and a revoked grant must stop them too.
+   *
+   * The copy lands in the target's inbox, which its container mounts and reads,
+   * with or without an inbound row pointing at them. So the grant is re-proved
+   * immediately before the copy as well as before the write — the copy used to
+   * sit between the source-mailbox await and the only re-proof, so a grant
+   * revoked during that lookup still handed the peer the payload.
+   */
+  it('copies no files when the destination grant is revoked during the source lookup', async () => {
+    // Forward first, so the reply below carries an in_reply_to and takes the
+    // source-mailbox lookup — the await this case opens its window inside.
+    await routeAgentMessage(
+      { id: 'msg-fwd-f', platform_id: B, content: JSON.stringify({ text: 'ping' }), in_reply_to: null },
+      S1,
+    );
+    const inboundId = readPairedInboundTriggers(B, SB.id)[0].id;
+
+    const outboxDir = path.join(sessionDir(B, SB.id), 'outbox', 'msg-reply-file');
+    fs.mkdirSync(outboxDir, { recursive: true });
+    fs.writeFileSync(path.join(outboxDir, 'secret.pdf'), 'payload-bytes');
+
+    const warn = vi.spyOn(log, 'warn');
+    duringSourceLookup.run = () => {
+      getDb().prepare('DELETE FROM agent_destinations WHERE agent_group_id = ? AND target_id = ?').run(B, A);
+    };
+
+    await expect(
+      routeAgentMessage(
+        {
+          id: 'msg-reply-file',
+          platform_id: A,
+          content: JSON.stringify({ text: 'here', files: ['secret.pdf'] }),
+          in_reply_to: inboundId,
+        },
+        SB,
+      ),
+    ).rejects.toThrow(/no destination for/);
+
+    // Refused by the FIRST proof, so the copy never ran at all.
+    expect(denialStages(warn)).toEqual(['before the file copy']);
+    expect(inboxFiles(A, S1.id)).toEqual([]);
+    expect(inboxFiles(A, S2.id)).toEqual([]);
+    expect(readPairedInboundTriggers(A, S1.id)).toHaveLength(0);
+    expect(readPairedInboundTriggers(A, S2.id)).toHaveLength(0);
+  });
+
+  /**
+   * And when the revocation lands after the bytes are on disk, they come back out.
+   *
+   * The inbound row is never written on a denial, but the files already are.
+   * Leaving them is a silent partial delivery of exactly the payload the guard
+   * just refused — the peer's container mounts that directory either way.
+   */
+  it('removes the forwarded files when the grant is revoked after the copy', async () => {
+    const outboxDir = path.join(sessionDir(A, S1.id), 'outbox', 'msg-late-revoke');
+    fs.mkdirSync(outboxDir, { recursive: true });
+    fs.writeFileSync(path.join(outboxDir, 'report.pdf'), 'fake-pdf-bytes');
+
+    const warn = vi.spyOn(log, 'warn');
+    // Fires inside the copy: the first proof has already allowed, and the bytes
+    // land before the second one is asked.
+    duringFileCopy.run = () => {
+      getDb().prepare('DELETE FROM agent_destinations WHERE agent_group_id = ? AND target_id = ?').run(A, B);
+    };
+
+    await expect(
+      routeAgentMessage(
+        {
+          id: 'msg-late-revoke',
+          platform_id: B,
+          content: JSON.stringify({ text: 'see attached', files: ['report.pdf'] }),
+          in_reply_to: null,
+        },
+        S1,
+      ),
+    ).rejects.toThrow(/no destination for/);
+
+    // Refused by the SECOND proof — which is what makes this the
+    // bytes-already-written case rather than the one above.
+    expect(denialStages(warn)).toEqual(['before the write']);
+    // Nothing left behind, and no row either.
+    expect(inboxFiles(B, SB.id)).toEqual([]);
+    expect(readPairedInboundTriggers(B, SB.id)).toHaveLength(0);
   });
 
   it('file forwarding: skips symlinked source files', async () => {

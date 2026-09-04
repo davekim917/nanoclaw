@@ -43,8 +43,9 @@ vi.mock('../../log.js', async (importOriginal) => ({
 import { getAgentMailbox } from '../../mailbox/index.js';
 import type { InboundMessage, MailboxSessionKey } from '../../mailbox/types.js';
 import { SessionDbMissingError } from './openers.js';
-import { withMailboxSession } from '../../session-manager.js';
+import { withExistingMailboxSession, withMailboxSession } from '../../session-manager.js';
 import { shouldReapIdleTaskContainer } from '../sweep-idle-reap/index.js';
+import { withExistingNanoclawOutbound } from './session.js';
 import { sessionOutboundStorageStat, type NanoclawMailboxSession } from './index.js';
 
 const DATA_DIR = path.join(TEST_ROOT, 'data');
@@ -296,6 +297,36 @@ describe('NanoclawAgentMailbox', () => {
     expect(row).toEqual({ status: 'delivered', platform_message_id: 'p1', error: null });
   });
 
+  /**
+   * Every timestamp a JS writer puts in a session DB is ISO-8601 UTC.
+   *
+   * `datetime('now')` yields the naive `YYYY-MM-DD HH:MM:SS` shape, which
+   * `new Date()` misparses as LOCAL time and which sorts below ISO as TEXT.
+   * `markPending` wrote that into the same `delivered_at` column its two
+   * siblings fill with bound ISO, so a still-pending row compared and ordered
+   * differently from a resolved one.
+   */
+  it('markPending writes delivered_at as ISO, like its siblings', async () => {
+    const key = freshKey();
+    const mailbox = getAgentMailbox();
+    mailbox.prepare(key);
+
+    await mailbox.session(key, async (mailboxSession) => {
+      const m = fork(mailboxSession);
+      m.markPending('out-iso-pending');
+      m.markPending('out-iso-resolved');
+      m.markDelivered('out-iso-resolved', 'p1');
+    });
+
+    const rows = raw(dbPath(key, 'inbound'), (db) =>
+      db.prepare('SELECT message_out_id, delivered_at FROM delivered ORDER BY message_out_id').all(),
+    ) as Array<{ message_out_id: string; delivered_at: string }>;
+    for (const row of rows) {
+      expect(row.delivered_at).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/);
+      expect(Number.isNaN(Date.parse(row.delivered_at))).toBe(false);
+    }
+  });
+
   it('withMailboxSession throws on same-key nesting and allows other keys', async () => {
     const outer = freshKey();
     const other = freshKey();
@@ -389,6 +420,56 @@ describe('NanoclawAgentMailbox', () => {
     }
   });
 
+  /**
+   * The mirror cohort, and the invariant three review findings on this PR were
+   * circling: an outbound-only session — inbound.db gone, outbound.db present.
+   *
+   * `exists()` is inbound-keyed, so the mailbox-session funnel cannot see this
+   * session at all and answers `undefined`. Every caller that read
+   * outbound-owned state through it therefore reported that state as EMPTY
+   * when it was not. The outbound-keyed funnel asks the question that matches
+   * the file it touches, and reads the row.
+   */
+  it('the outbound funnel reads an outbound-only session the mailbox funnel cannot see', async () => {
+    const key = freshKey();
+    getAgentMailbox().prepare(key);
+    raw(dbPath(key, 'outbound'), (db) =>
+      db
+        .prepare('INSERT INTO session_state (key, value, updated_at) VALUES (?, ?, ?)')
+        .run(
+          'done_proposal',
+          JSON.stringify({ reason: 'done here', proposed_at: new Date().toISOString() }),
+          new Date().toISOString(),
+        ),
+    );
+    // The host-owned half goes; the container's half stays.
+    fs.rmSync(dbPath(key, 'inbound'));
+
+    // The inbound-keyed funnel is blind to it.
+    expect(await getAgentMailbox().exists(key)).toBe(false);
+    expect(
+      await withExistingMailboxSession(key.agentGroupId, key.sessionId, (m) => fork(m).readDoneProposal()),
+    ).toBeUndefined();
+
+    // The outbound-keyed one reads the record that is really there.
+    const proposal = await withExistingNanoclawOutbound(key.agentGroupId, key.sessionId, (outbound) =>
+      outbound.readDoneProposal(),
+    );
+    expect(proposal).toMatchObject({ reason: 'done here' });
+  });
+
+  it('the outbound funnel answers undefined only when outbound.db is genuinely absent', async () => {
+    const key = freshKey();
+    getAgentMailbox().prepare(key);
+    fs.rmSync(dbPath(key, 'outbound'));
+
+    expect(
+      await withExistingNanoclawOutbound(key.agentGroupId, key.sessionId, (outbound) => outbound.readDoneProposal()),
+    ).toBeUndefined();
+    // A read never provisions the file the container owns.
+    expect(fs.existsSync(dbPath(key, 'outbound'))).toBe(false);
+  });
+
   it('a session with only inbound.db exists, and its outbound reads degrade instead of failing', async () => {
     const key = freshKey();
     const mailbox = getAgentMailbox();
@@ -425,6 +506,13 @@ describe('NanoclawAgentMailbox', () => {
         outboundIds: session.listOutboundMessageIds(),
         noticed: session.outboundHasContentLike('anything'),
         answered: session.hasNonStatusReplyTo('m-inbound-only'),
+        // These three opened the accessors directly, ignoring the degrade this
+        // whole case documents. The reads threw; worse, the CLEAR took the
+        // WRITABLE handle and authored the container-owned outbound.db the
+        // host must never create (invariant I-10) — checked below.
+        proposal: session.readDoneProposal(),
+        continuationPresence: session.readContinuationPresence(),
+        cleared: session.clearWorkContinuation(),
       };
     });
 
@@ -439,6 +527,9 @@ describe('NanoclawAgentMailbox', () => {
       outboundIds: [],
       noticed: false,
       answered: false,
+      proposal: null,
+      continuationPresence: null,
+      cleared: null,
     });
     // The read path did not provision the file it found missing (invariant I-4).
     expect(fs.existsSync(dbPath(key, 'outbound'))).toBe(false);
@@ -477,6 +568,156 @@ describe('NanoclawAgentMailbox', () => {
       ),
     );
     expect(statuses).toEqual({ 'm-done': 'completed', 'm-script-failed': 'failed', 'm-untouched': 'pending' });
+  });
+});
+
+/**
+ * `withdrawUnconsumedWake` takes back a restart announcement whose restart did
+ * not happen. It may do that ONLY on a proof that no container could have
+ * claimed the message, and the inbound row's own `status` is not that proof: a
+ * container claims by writing `processing_ack` in `outbound.db`, and the row it
+ * claimed stays `pending` in `inbound.db` until a later sweep tick syncs it.
+ *
+ * These run the real op over real session files, because the thing under test
+ * is a read that crosses from inbound.db to outbound.db.
+ */
+describe('withdrawUnconsumedWake claim proof', () => {
+  const NOBODY_OWNS = () => false;
+
+  /** A restart announcement: an `on_wake` trigger plus its recall partner. */
+  async function seedWakeRow(key: MailboxSessionKey): Promise<void> {
+    const mailbox = getAgentMailbox();
+    await mailbox.session(key, (m) =>
+      fork(m).insertMessageWithContextIfNew(
+        {
+          id: 'restart-1',
+          kind: 'chat',
+          timestamp: new Date().toISOString(),
+          platformId: 'ag-1',
+          channelType: 'agent',
+          threadId: null,
+          content: JSON.stringify({ text: 'Resuming.' }),
+          processAfter: null,
+          recurrence: null,
+          onWake: 1,
+        },
+        {
+          id: 'recall-restart-1',
+          kind: 'system',
+          timestamp: new Date().toISOString(),
+          platformId: 'ag-1',
+          channelType: 'agent',
+          threadId: null,
+          content: JSON.stringify({ subtype: 'recall_context' }),
+          processAfter: null,
+          recurrence: null,
+          trigger: 0,
+        },
+      ),
+    );
+  }
+
+  function inboundIds(key: MailboxSessionKey): string[] {
+    return raw(dbPath(key, 'inbound'), (db) =>
+      (db.prepare('SELECT id FROM messages_in ORDER BY seq').all() as Array<{ id: string }>).map((r) => r.id),
+    );
+  }
+
+  it('withdraws the row and its recall partner when nothing could have claimed it', async () => {
+    const key = freshKey();
+    getAgentMailbox().prepare(key);
+    await seedWakeRow(key);
+
+    const withdrawn = await getAgentMailbox().session(key, (m) =>
+      fork(m).withdrawUnconsumedWake('restart-1', NOBODY_OWNS),
+    );
+
+    expect(withdrawn).toBe(true);
+    expect(inboundIds(key)).toEqual([]);
+  });
+
+  /**
+   * The interleave Codex reported. A replacement container claims the row
+   * between the write and the withdrawal; its claim lands in `outbound.db`, and
+   * `messages_in.status` is STILL `pending` because no sweep tick has synced it
+   * yet. The guarded DELETE alone would match and destroy the message the
+   * replacement is about to act on.
+   */
+  it('preserves a row a container has already claimed, while inbound still reads pending', async () => {
+    const key = freshKey();
+    getAgentMailbox().prepare(key);
+    await seedWakeRow(key);
+
+    // The container's claim — written where a container writes it. Planted
+    // raw because the host owns no op that writes outbound processing_ack.
+    raw(dbPath(key, 'outbound'), (db) => {
+      db.prepare('INSERT INTO processing_ack (message_id, status, status_changed) VALUES (?, ?, ?)').run(
+        'restart-1',
+        'processing',
+        new Date().toISOString(),
+      );
+    });
+    // The precondition that makes this case interesting rather than trivial.
+    expect(
+      raw(
+        dbPath(key, 'inbound'),
+        (db) =>
+          (db.prepare('SELECT status FROM messages_in WHERE id = ?').get('restart-1') as { status: string }).status,
+      ),
+    ).toBe('pending');
+
+    const withdrawn = await getAgentMailbox().session(key, (m) =>
+      fork(m).withdrawUnconsumedWake('restart-1', NOBODY_OWNS),
+    );
+
+    expect(withdrawn).toBe(false);
+    expect(inboundIds(key)).toEqual(['recall-restart-1', 'restart-1']);
+  });
+
+  it('preserves the row while a container owns outbound.db, ack or no ack', async () => {
+    const key = freshKey();
+    getAgentMailbox().prepare(key);
+    await seedWakeRow(key);
+
+    // No ack yet: a fresh replacement mid-first-poll has selected the row and
+    // not written its claim. Ownership is the only thing that can see it.
+    const withdrawn = await getAgentMailbox().session(key, (m) =>
+      fork(m).withdrawUnconsumedWake('restart-1', () => true),
+    );
+
+    expect(withdrawn).toBe(false);
+    expect(inboundIds(key)).toEqual(['recall-restart-1', 'restart-1']);
+  });
+
+  it('preserves the row when outbound.db is present but unopenable', async () => {
+    const key = freshKey();
+    getAgentMailbox().prepare(key);
+    await seedWakeRow(key);
+
+    // Present, so the absent-outbound shortcut does not apply, and not a
+    // database, so the ack read cannot answer. Unprovable means preserve.
+    fs.writeFileSync(dbPath(key, 'outbound'), 'not a database at all');
+
+    const withdrawn = await getAgentMailbox().session(key, (m) =>
+      fork(m).withdrawUnconsumedWake('restart-1', NOBODY_OWNS),
+    );
+
+    expect(withdrawn).toBe(false);
+    expect(inboundIds(key)).toEqual(['recall-restart-1', 'restart-1']);
+  });
+
+  it('withdraws when the session has no outbound.db at all — no container has ever run', async () => {
+    const key = freshKey();
+    getAgentMailbox().prepare(key);
+    await seedWakeRow(key);
+    fs.rmSync(dbPath(key, 'outbound'));
+
+    const withdrawn = await getAgentMailbox().session(key, (m) =>
+      fork(m).withdrawUnconsumedWake('restart-1', NOBODY_OWNS),
+    );
+
+    expect(withdrawn).toBe(true);
+    expect(inboundIds(key)).toEqual([]);
   });
 });
 

@@ -6,6 +6,11 @@
  * (docs/specs/upstream-mailbox-seam/plan.md §4.4, "Sweep / container state"):
  * the SQL belongs to the module that owns the session DBs, the throttle and
  * cap policy stays in the sweep. Internal to `src/modules/mailbox/`.
+ *
+ * This file is the ONE host-side implementation of the continuation record —
+ * its type, its size cap and its parser (invariant I-2). `ops/session-state.ts`
+ * owns the neighbouring keys (raw presence, force-clear, done proposal) and
+ * imports the record from here rather than parsing it a second time.
  */
 import type Database from 'better-sqlite3';
 import { randomUUID } from 'crypto';
@@ -15,7 +20,8 @@ import { parseSqliteUtc } from '../sqlite-utc.js';
 /** Hard cap on automatic resume attempts for one continuation record. */
 export const WORK_CONTINUATION_RESUME_MAX_ATTEMPTS = 2;
 
-const WORK_CONTINUATION_TASK_MAX_CHARS = 500;
+/** Longest task string a continuation record may carry before it is treated as absent. */
+export const WORK_CONTINUATION_TASK_MAX_CHARS = 500;
 
 export interface HostWorkContinuation {
   id: string;

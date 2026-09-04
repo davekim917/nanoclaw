@@ -1,4 +1,4 @@
-import { describe, expect, it, beforeEach, vi } from 'vitest';
+import { afterEach, describe, expect, it, beforeEach, vi } from 'vitest';
 
 // Only the wake-admission block below needs this; nothing else in the file
 // asserts on logs. The refusal's log line is the ONLY observable difference —
@@ -9,6 +9,112 @@ vi.mock('./log.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('./log.js')>();
   return { ...actual, log: { ...actual.log, warn: vi.fn(), error: vi.fn(), info: vi.fn(), debug: vi.fn() } };
 });
+
+// getMemoryAdmission() sizes its budget from a `docker info` probe at first
+// use. That is a real daemon round-trip from a unit test — the hermeticity
+// tripwire flags it — so point the runtime binary at a name that does not
+// exist: the probe fails instantly into its documented os.totalmem() fallback,
+// and nothing leaves the process. Everything else in container-runtime is real.
+vi.mock('./container-runtime.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./container-runtime.js')>();
+  return { ...actual, CONTAINER_RUNTIME_BIN: ABSENT_CONTAINER_RUNTIME_BIN };
+});
+
+// The memory-admission controller is stubbed so the queue can be driven
+// deterministically. The real controller's budget is a module-level singleton
+// derived from Docker-visible RAM at first use — unreachable from a unit test,
+// and host-dependent — so exhausting it for real is not an option. Everything
+// AROUND the controller stays real: the queued payload, releaseMemoryReservation
+// and its drain, and the startReservedWake continuation are the code under test.
+const ABSENT_CONTAINER_RUNTIME_BIN = vi.hoisted(() => 'nanoclaw-absent-container-runtime');
+
+// Holds the wake at its FIRST await — background storage admission — so a test
+// can act on a session while it is genuinely in flight. `null` means the real
+// pass-through, which is what every other case in this file gets.
+const storageGate = vi.hoisted(() => ({ hold: null as Promise<void> | null }));
+
+vi.mock('./storage-maintenance-worker.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./storage-maintenance-worker.js')>();
+  return {
+    ...actual,
+    assertStorageAdmissionInBackground: async () => {
+      if (storageGate.hold) await storageGate.hold;
+      // `allowed` short-circuits before anything reads the report.
+      return { allowed: true } as Awaited<
+        ReturnType<typeof import('./storage-maintenance-worker.js').assertStorageAdmissionInBackground>
+      >;
+    },
+  };
+});
+
+const memoryStub = vi.hoisted(() => ({
+  queueNext: new Set<string>(),
+  queuedPayloads: [] as unknown[],
+  requestedIds: [] as string[],
+  releasedIds: [] as string[],
+  cancelledIds: [] as string[],
+  reset() {
+    this.queueNext.clear();
+    this.queuedPayloads = [];
+    this.requestedIds = [];
+    this.releasedIds = [];
+    this.cancelledIds = [];
+  },
+}));
+
+vi.mock('./memory-admission.js', () => {
+  class StubMemoryAdmissionController<T> {
+    readonly budgetMb: number;
+    constructor(budgetMb: number) {
+      this.budgetMb = budgetMb;
+    }
+    get reservedMb(): number {
+      return 0;
+    }
+    get queuedCount(): number {
+      return memoryStub.queuedPayloads.length;
+    }
+    isQueued(id: string): boolean {
+      return memoryStub.queueNext.has(id);
+    }
+    hasReservation(): boolean {
+      return false;
+    }
+    request(id: string, requestMb: number, payload: T): MemoryAdmissionResult {
+      memoryStub.requestedIds.push(id);
+      if (memoryStub.queueNext.has(id)) {
+        memoryStub.queuedPayloads.push(payload);
+        return { status: 'queued', budgetMb: this.budgetMb, requestMb, position: memoryStub.queuedPayloads.length };
+      }
+      return { status: 'admitted', budgetMb: this.budgetMb, requestMb };
+    }
+    release(id: string): T[] {
+      memoryStub.releasedIds.push(id);
+      const drained = memoryStub.queuedPayloads as T[];
+      memoryStub.queuedPayloads = [];
+      return drained;
+    }
+    cancel(id: string): T[] {
+      memoryStub.cancelledIds.push(id);
+      // The real controller drops the QUEUED entry as well as the reservation.
+      // Modelling that is the whole point here: a stub that aliased cancel to
+      // release would pass whether or not the code under test cancels.
+      memoryStub.queueNext.delete(id);
+      memoryStub.queuedPayloads = memoryStub.queuedPayloads.filter(
+        (payload) => (payload as { session: { id: string } }).session.id !== id,
+      );
+      return [];
+    }
+    shutdown(): void {
+      memoryStub.queuedPayloads = [];
+    }
+  }
+  return {
+    MemoryAdmissionController:
+      StubMemoryAdmissionController as unknown as typeof import('./memory-admission.js').MemoryAdmissionController,
+  };
+});
+
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
@@ -37,11 +143,18 @@ import {
   resolveWorkgroupIdAtSpawn,
   stripEnvEntry,
   wakeContainer,
+  killContainer,
+  sessionStillActive,
+  isContainerRunning,
+  isContainerSpawning,
 } from './container-runner.js';
 import { formatMemoryMb, resolveContainerResources } from './container-resources.js';
 import { mergeWorkgroupAndGroupSecrets } from './onecli-secrets.js';
 import { getProviderContainerConfig } from './providers/provider-container-registry.js';
 import { log } from './log.js';
+import { closeDb, getDb, initTestDb } from './db/connection.js';
+import { allowSubprocess } from './test-hermeticity.js';
+import type { MemoryAdmissionResult } from './memory-admission.js';
 import type { Session } from './types.js';
 
 describe('resolveProviderName', () => {
@@ -1410,6 +1523,496 @@ describe('wakeContainer session-status admission', () => {
     } finally {
       vi.unstubAllEnvs();
     }
+  });
+});
+
+// The guard above runs on the object the CALLER handed us, and the wake path
+// then awaits — storage admission, an unbounded wait in the memory-admission
+// queue, the storage-activity lease. A reclaim closes the session row inside any
+// of those windows, and spawning on a closed row produces a container
+// getActiveSessions() will never return. These cover the re-reads that follow
+// each await; the DB row, not the caller's snapshot, is the authority.
+describe('wakeContainer re-reads the session after every admission await', () => {
+  const AGENT_GROUP_ID = 'ag-wake-admission';
+  // Deliberately a folder that does not exist under groups/: readContainerConfig
+  // returns the empty config for it (no disk fixture, no spawn side effects),
+  // while the strict spawn-fence read fails on it — which is how the trigger
+  // session below reaches releaseMemoryReservation without touching Docker.
+  const AGENT_GROUP_FOLDER = '__wake-admission-test__';
+
+  function seedSession(id: string, status: string): void {
+    getDb()
+      .prepare(
+        `INSERT INTO sessions (id, agent_group_id, messaging_group_id, thread_id, agent_provider, status,
+                               container_status, last_active, created_at)
+         VALUES (?, ?, NULL, NULL, NULL, ?, 'stopped', NULL, '2026-08-19T00:00:00.000Z')`,
+      )
+      .run(id, AGENT_GROUP_ID, status);
+  }
+
+  function archive(id: string): void {
+    getDb().prepare("UPDATE sessions SET status = 'closed' WHERE id = ?").run(id);
+  }
+
+  /** What the caller still believes: an active session, by id. */
+  function callerSnapshot(id: string): Session {
+    return {
+      id,
+      agent_group_id: AGENT_GROUP_ID,
+      messaging_group_id: null,
+      thread_id: null,
+      agent_provider: null,
+      status: 'active',
+      container_status: 'stopped',
+      last_active: null,
+      created_at: '2026-08-19T00:00:00.000Z',
+    };
+  }
+
+  function abandons(): Array<{ sessionId: string; stage: string; status: string }> {
+    return vi
+      .mocked(log.warn)
+      .mock.calls.filter((call) => String(call[0]).startsWith('Container wake abandoned'))
+      .map((call) => {
+        const meta = call[1] as { sessionId: string; stage: string; status: string };
+        return { sessionId: meta.sessionId, stage: meta.stage, status: meta.status };
+      });
+  }
+
+  beforeEach(() => {
+    vi.mocked(log.warn).mockClear();
+    memoryStub.reset();
+    initTestDb();
+    getDb().exec(`
+      CREATE TABLE sessions (
+        id TEXT PRIMARY KEY,
+        agent_group_id TEXT,
+        messaging_group_id TEXT,
+        thread_id TEXT,
+        agent_provider TEXT,
+        status TEXT,
+        container_status TEXT,
+        last_active TEXT,
+        created_at TEXT
+      );
+      CREATE TABLE agent_groups (
+        id TEXT PRIMARY KEY,
+        name TEXT,
+        folder TEXT,
+        agent_provider TEXT,
+        workgroup_id TEXT
+      );
+    `);
+    getDb()
+      .prepare('INSERT INTO agent_groups (id, name, folder, agent_provider, workgroup_id) VALUES (?, ?, ?, NULL, ?)')
+      .run(AGENT_GROUP_ID, 'wake admission', AGENT_GROUP_FOLDER, 'wg-wake-admission');
+    // Keep these independent of the host's real disk pressure; otherwise a full
+    // filesystem sends them into the real cleanup worker.
+    vi.stubEnv('NANOCLAW_STORAGE_MANAGER_ENABLED', '0');
+    // The mocked runtime binary above does not exist, so this permits a call
+    // that resolves to ENOENT — nothing actually escapes the process.
+    allowSubprocess([ABSENT_CONTAINER_RUNTIME_BIN]);
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    memoryStub.reset();
+    closeDb();
+  });
+
+  it('does not spawn a session that was archived while storage admission was awaited', async () => {
+    seedSession('sess-storage', 'active');
+    // The reclaim lands while checkStorageAdmission is in flight: the caller's
+    // object still says active, the row does not.
+    archive('sess-storage');
+
+    await expect(wakeContainer(callerSnapshot('sess-storage'))).resolves.toBe(false);
+
+    expect(abandons()).toEqual([{ sessionId: 'sess-storage', stage: 'storage-admission', status: 'closed' }]);
+    // Never reached memory admission, so it never reached the spawn either.
+    expect(memoryStub.requestedIds).not.toContain('sess-storage');
+    expect(memoryStub.releasedIds).toEqual([]);
+  });
+
+  it('does not spawn a session that was archived while it sat in the memory-admission queue', async () => {
+    seedSession('sess-queued', 'active');
+    seedSession('sess-trigger', 'active');
+
+    memoryStub.queueNext.add('sess-queued');
+    await expect(wakeContainer(callerSnapshot('sess-queued'))).resolves.toBe(false);
+    // Queued holding no reservation, on the row as it looked when it queued.
+    expect(memoryStub.queuedPayloads).toHaveLength(1);
+    // The queue carries the session AND the caller's guard, so a wake that
+    // waits an arbitrarily long time resumes with its precondition intact.
+    expect((memoryStub.queuedPayloads[0] as { session: Session }).session.status).toBe('active');
+
+    // The wait in the queue is unbounded; the reclaim lands inside it.
+    archive('sess-queued');
+    vi.mocked(log.warn).mockClear();
+
+    // Any release drains the queue and hands the payload to startReservedWake.
+    // This one fails its authoritative spawn-config read, which is an existing
+    // release path — no Docker, no disk fixture.
+    vi.stubEnv('NANOCLAW_CONTAINER_SPAWN_WORKGROUP_ALLOWLIST', '');
+    await expect(wakeContainer(callerSnapshot('sess-trigger'))).resolves.toBe(false);
+    await Promise.resolve();
+
+    // Caught at the dequeue, before the queued session spends its slot — not
+    // later, at the pre-spawn re-read.
+    expect(abandons()).toEqual([{ sessionId: 'sess-queued', stage: 'memory-admission-dequeue', status: 'closed' }]);
+    // And the reservation it was just admitted into is handed back, not leaked.
+    expect(memoryStub.releasedIds).toEqual(['sess-trigger', 'sess-queued']);
+  });
+});
+
+/**
+ * `killContainer` has to mean something for a session that is SPAWNING.
+ *
+ * `containerOwnsOutbound` is deliberately true for one — a wake issued a moment
+ * ago is about to hold the file — so every caller that asks "is anyone there?"
+ * before killing gets `true`, calls `killContainer`, and used to get silence:
+ * the process was not yet in `activeContainers`, so the call returned without
+ * killing anything and without firing `onExit`. The container then came up and
+ * kept running. A confirmed thread close left the fresh container alive, a
+ * self-mod rebuild left the old image running, a provider self-heal never
+ * respawned on the fallback.
+ */
+describe('killContainer against a session that is still spawning', () => {
+  const AGENT_GROUP_ID = 'ag-kill-spawning';
+  const AGENT_GROUP_FOLDER = '__kill-spawning-test__';
+
+  function seedSession(id: string): void {
+    getDb()
+      .prepare(
+        `INSERT INTO sessions (id, agent_group_id, messaging_group_id, thread_id, agent_provider, status,
+                               container_status, last_active, created_at)
+         VALUES (?, ?, NULL, NULL, NULL, 'active', 'stopped', NULL, '2026-08-19T00:00:00.000Z')`,
+      )
+      .run(id, AGENT_GROUP_ID);
+  }
+
+  function callerSnapshot(id: string): Session {
+    return {
+      id,
+      agent_group_id: AGENT_GROUP_ID,
+      messaging_group_id: null,
+      thread_id: null,
+      agent_provider: null,
+      status: 'active',
+      container_status: 'stopped',
+      last_active: null,
+      created_at: '2026-08-19T00:00:00.000Z',
+    };
+  }
+
+  beforeEach(() => {
+    vi.mocked(log.warn).mockClear();
+    vi.mocked(log.info).mockClear();
+    memoryStub.reset();
+    initTestDb();
+    getDb().exec(`
+      CREATE TABLE sessions (
+        id TEXT PRIMARY KEY, agent_group_id TEXT, messaging_group_id TEXT, thread_id TEXT,
+        agent_provider TEXT, status TEXT, container_status TEXT, last_active TEXT, created_at TEXT,
+        archived_at TEXT
+      );
+      CREATE TABLE agent_groups (
+        id TEXT PRIMARY KEY, name TEXT, folder TEXT, agent_provider TEXT, workgroup_id TEXT
+      );
+    `);
+    getDb()
+      .prepare('INSERT INTO agent_groups (id, name, folder, agent_provider, workgroup_id) VALUES (?, ?, ?, NULL, ?)')
+      .run(AGENT_GROUP_ID, 'kill spawning', AGENT_GROUP_FOLDER, 'wg-kill-spawning');
+    vi.stubEnv('NANOCLAW_STORAGE_MANAGER_ENABLED', '0');
+    allowSubprocess([ABSENT_CONTAINER_RUNTIME_BIN]);
+  });
+
+  afterEach(() => {
+    storageGate.hold = null;
+    vi.unstubAllEnvs();
+    memoryStub.reset();
+    closeDb();
+  });
+
+  it('fires onExit exactly once and leaves no container running', async () => {
+    seedSession('sess-spawning');
+    let release!: () => void;
+    storageGate.hold = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+
+    const wake = wakeContainer(callerSnapshot('sess-spawning'));
+    // Parked on the storage-admission await: in flight by the host's own
+    // predicate, which is exactly what every caller consults before killing.
+    await Promise.resolve();
+    expect(isContainerSpawning('sess-spawning')).toBe(true);
+    expect(isContainerRunning('sess-spawning')).toBe(false);
+
+    const exits: string[] = [];
+    killContainer('sess-spawning', 'test kill during spawn', () => exits.push('exit'));
+    // Nothing fires yet — the wake is still running, and firing here would
+    // report an exit for a container that may still be about to appear.
+    expect(exits).toEqual([]);
+
+    release();
+    await expect(wake).resolves.toBe(false);
+    await Promise.resolve();
+
+    // The guarantee: the caller's exit-driven work ran, exactly once, and no
+    // container survived the request.
+    expect(exits).toEqual(['exit']);
+    // Aborted AT the cancellation point, not merely swept up by the settle
+    // path afterwards: the wake failure carries the cancellation itself.
+    expect(
+      vi
+        .mocked(log.warn)
+        .mock.calls.filter((call) => String(call[0]).startsWith('wakeContainer failed'))
+        .map((call) => String((call[1] as { err?: unknown }).err)),
+    ).toEqual(['Error: Container spawn cancelled by a kill request: test kill during spawn']);
+    expect(isContainerRunning('sess-spawning')).toBe(false);
+    expect(isContainerSpawning('sess-spawning')).toBe(false);
+  });
+
+  it('records the kill as deferred rather than silently dropping it', async () => {
+    seedSession('sess-deferred');
+    let release!: () => void;
+    storageGate.hold = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+
+    const wake = wakeContainer(callerSnapshot('sess-deferred'));
+    await Promise.resolve();
+    killContainer('sess-deferred', 'thread close', () => {});
+    release();
+    await wake;
+
+    // The operator-visible trace that the request was taken, not ignored.
+    expect(
+      vi
+        .mocked(log.info)
+        .mock.calls.filter((call) => String(call[0]).startsWith('Container kill deferred'))
+        .map((call) => call[1] as { sessionId: string; reason: string }),
+    ).toEqual([{ sessionId: 'sess-deferred', reason: 'thread close' }]);
+  });
+
+  /**
+   * The wake path's own guard.
+   *
+   * A caller proving its precondition and THEN calling `wakeContainer` proves it
+   * before storage admission, before an unbounded wait in the memory queue, and
+   * before all of `spawnContainer`'s preparation. The guard is asked where the
+   * process is created instead, and again at the dequeue, so a wake that queues
+   * for minutes cannot resume on a precondition nobody has re-asked.
+   */
+  it('refuses the spawn when the caller guard fails, without leaving a container', async () => {
+    seedSession('sess-guarded');
+
+    const asked: number[] = [];
+    await expect(
+      wakeContainer(callerSnapshot('sess-guarded'), 'interactive', {
+        guard: () => {
+          asked.push(1);
+          return { ok: false, reason: 'thread was closed while this wake queued' };
+        },
+      }),
+    ).resolves.toBe(false);
+
+    // Asked at least once, and no container survived the refusal.
+    expect(asked.length).toBeGreaterThan(0);
+    expect(isContainerRunning('sess-guarded')).toBe(false);
+    expect(
+      vi
+        .mocked(log.warn)
+        .mock.calls.filter((call) => String(call[0]).startsWith('wakeContainer failed'))
+        .map((call) => String((call[1] as { err?: unknown }).err)),
+    ).toEqual(['Error: Container spawn refused by its guard: thread was closed while this wake queued']);
+  });
+
+  it('carries the guard through the memory queue and asks it again at the dequeue', async () => {
+    seedSession('sess-queued-guard');
+    seedSession('sess-releaser');
+
+    const state = { wanted: true };
+    memoryStub.queueNext.add('sess-queued-guard');
+    await expect(
+      wakeContainer(callerSnapshot('sess-queued-guard'), 'interactive', {
+        guard: () => (state.wanted ? true : { ok: false, reason: 'no longer wanted' }),
+      }),
+    ).resolves.toBe(false);
+    expect(memoryStub.queuedPayloads).toHaveLength(1);
+
+    // The wait in the queue is unbounded; the caller's reason to wake expires
+    // inside it. Nothing re-reads the session row here — it is still active —
+    // so only the caller's own guard can see this.
+    state.wanted = false;
+    vi.mocked(log.warn).mockClear();
+
+    // Any release drains the queue and resumes the queued wake.
+    await expect(wakeContainer(callerSnapshot('sess-releaser'))).resolves.toBe(false);
+    await Promise.resolve();
+
+    expect(
+      vi
+        .mocked(log.warn)
+        .mock.calls.filter((call) => String(call[0]).startsWith('Queued container wake refused'))
+        .map((call) => call[1] as { sessionId: string; reason: string }),
+    ).toEqual([{ sessionId: 'sess-queued-guard', reason: 'no longer wanted' }]);
+    // And the reservation it was admitted into is handed back, not leaked.
+    expect(memoryStub.releasedIds).toContain('sess-queued-guard');
+  });
+
+  /**
+   * A queued wake outlives the promise that created it.
+   *
+   * `wakeContainer` returns false when memory admission queues, `trackWake`
+   * settles, and the controller still holds the payload until some later
+   * release drains it. So "no container running, and the wake promise is
+   * finished" is NOT "this session has no container coming" — and the kill
+   * settle used to treat it as such, firing the caller's exit work. Thread-close
+   * then clears and archives the session as final, a later release drains the
+   * queue, and a container spawns into a thread the operator was told was
+   * closed. `sessionStillActive` does not catch it either: `archiveSessionById`
+   * sets only `archived_at`, so the row is still `active`.
+   */
+  it('cancels a queued wake before reporting the exit, so nothing spawns later', async () => {
+    seedSession('sess-queued-kill');
+    let release!: () => void;
+    storageGate.hold = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    // The wake will QUEUE rather than spawn once it gets past admission.
+    memoryStub.queueNext.add('sess-queued-kill');
+
+    const wake = wakeContainer(callerSnapshot('sess-queued-kill'));
+    await Promise.resolve();
+    const exits: string[] = [];
+    killContainer('sess-queued-kill', 'thread close', () => exits.push('exit'));
+
+    release();
+    await expect(wake).resolves.toBe(false);
+    await Promise.resolve();
+
+    // The exit was reported, AND the controller no longer holds the wake — so
+    // the next reservation release has nothing to drain into this session.
+    expect(exits).toEqual(['exit']);
+    expect(memoryStub.cancelledIds).toContain('sess-queued-kill');
+    expect(memoryStub.queuedPayloads).toEqual([]);
+  });
+
+  /**
+   * `archived_at` is a second axis, not a shade of `status`.
+   *
+   * `archiveSessionById` stamps `archived_at` and leaves `status` alone, so a
+   * thread-close that archives without closing leaves a row still reading
+   * `active`. A guard that asked only about `status` waved a wake straight into
+   * a thread the operator had been told was finished — and the archive-only
+   * close is the ordinary case, not an edge one.
+   */
+  it('refuses a session that is archived even though its status is still active', () => {
+    seedSession('sess-archived');
+    getDb()
+      .prepare('UPDATE sessions SET archived_at = ? WHERE id = ?')
+      .run('2026-09-04T00:00:00.000Z', 'sess-archived');
+
+    // The precondition that makes this case worth having: the row still says
+    // `active`, so `status` alone cannot answer.
+    expect(
+      (getDb().prepare('SELECT status FROM sessions WHERE id = ?').get('sess-archived') as { status: string }).status,
+    ).toBe('active');
+
+    expect(sessionStillActive('sess-archived')()).toEqual({ ok: false, reason: 'session is archived' });
+  });
+
+  it('admits a live session that has never been archived', () => {
+    seedSession('sess-live');
+    expect(sessionStillActive('sess-live')()).toBe(true);
+  });
+
+  /**
+   * A guard that THROWS is a refusal, and must release like one.
+   *
+   * `sessionStillActive` reads the central DB, and a DB read can throw —
+   * transient I/O, corruption, a closed handle. Propagating that from the
+   * dequeue took it out through `trackWake`'s generic catch, which resolves
+   * `false` and never releases the reservation the dequeue is holding: every
+   * RETURNED refusal on that path released, a thrown one leaked a slot off the
+   * admission budget permanently.
+   */
+  it('treats a guard that throws at the dequeue as a refusal, and returns the slot', async () => {
+    seedSession('sess-throw-queued');
+    seedSession('sess-throw-releaser');
+
+    let explode = false;
+    memoryStub.queueNext.add('sess-throw-queued');
+    await expect(
+      wakeContainer(callerSnapshot('sess-throw-queued'), 'interactive', {
+        guard: () => {
+          if (explode) throw new Error('database is locked');
+          return true;
+        },
+      }),
+    ).resolves.toBe(false);
+    expect(memoryStub.queuedPayloads).toHaveLength(1);
+
+    // The central DB starts failing while the wake sits in the queue.
+    explode = true;
+    vi.mocked(log.warn).mockClear();
+
+    // Any release drains the queue and resumes the queued wake, whose guard
+    // now throws instead of answering.
+    await expect(wakeContainer(callerSnapshot('sess-throw-releaser'))).resolves.toBe(false);
+    await Promise.resolve();
+
+    // Refused with the throw as its reason, and — the part that leaked — the
+    // reservation handed back rather than stranded.
+    expect(
+      vi
+        .mocked(log.warn)
+        .mock.calls.filter((call) => String(call[0]).startsWith('Queued container wake refused'))
+        .map((call) => (call[1] as { reason: string }).reason),
+    ).toEqual(['guard threw: database is locked']);
+    expect(memoryStub.releasedIds).toContain('sess-throw-queued');
+    expect(isContainerRunning('sess-throw-queued')).toBe(false);
+  });
+
+  /**
+   * An UNGUARDED wake must be refused for an archived session too.
+   *
+   * Most callers pass no guard — over twenty `wakeContainer` call sites hand in
+   * a session and nothing else, `applySpawnComplete` among them. The opt-in
+   * guard cannot help those; the universal re-read every wake passes through is
+   * the only place that can, and it asked about `status` alone. A thread-close
+   * that archives without closing leaves the row reading `active`, so an
+   * unguarded wake launched a container for a thread the operator was told was
+   * finished.
+   */
+  it('refuses an unguarded wake for an archived session whose status is still active', async () => {
+    seedSession('sess-unguarded-archived');
+    getDb()
+      .prepare('UPDATE sessions SET archived_at = ? WHERE id = ?')
+      .run('2026-09-04T00:00:00.000Z', 'sess-unguarded-archived');
+
+    // No guard, exactly as those callers wake.
+    await expect(wakeContainer(callerSnapshot('sess-unguarded-archived'))).resolves.toBe(false);
+
+    expect(isContainerRunning('sess-unguarded-archived')).toBe(false);
+    expect(
+      vi
+        .mocked(log.warn)
+        .mock.calls.filter((call) => String(call[0]).includes('cannot take a wake'))
+        .map((call) => (call[1] as { reason: string }).reason),
+    ).toContain('session is archived');
+  });
+
+  it('still does nothing for a session that is neither running nor spawning', async () => {
+    seedSession('sess-idle');
+    const exits: string[] = [];
+
+    killContainer('sess-idle', 'nothing to kill', () => exits.push('exit'));
+
+    // Unchanged contract, and callers depend on it: `container-restart` reads
+    // "not running" as "this restart did not happen", not as an exit.
+    expect(exits).toEqual([]);
   });
 });
 

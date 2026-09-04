@@ -16,12 +16,24 @@ import { describe, expect, it, beforeEach, afterEach, vi } from 'vitest';
 
 const TEST_DIR = uniqueTmpRoot('test-a2a-parity');
 
-vi.mock('../../container-runner.js', () => ({
-  wakeContainer: vi.fn().mockResolvedValue(true),
-  isContainerRunning: vi.fn().mockReturnValue(false),
-  getActiveContainerCount: vi.fn().mockReturnValue(0),
-  killContainer: vi.fn(),
-}));
+vi.mock('../../container-runner.js', async () => {
+  const { getSession } = await import('../../db/sessions.js');
+  return {
+    wakeContainer: vi.fn().mockResolvedValue(true),
+    isContainerRunning: vi.fn().mockReturnValue(false),
+    getActiveContainerCount: vi.fn().mockReturnValue(0),
+    killContainer: vi.fn(),
+    // The real definition: the route builds this guard and the wake path is
+    // what evaluates it, next to `spawn()`.
+    sessionStillActive: (sessionId: string) => () => {
+      const fresh = getSession(sessionId);
+      if (!fresh) return { ok: false, reason: 'session no longer exists' };
+      if (fresh.status !== 'active') return { ok: false, reason: `session is ${fresh.status}` };
+      if (fresh.archived_at != null) return { ok: false, reason: 'session is archived' };
+      return true;
+    },
+  };
+});
 
 const getChannelAdapter = vi.fn();
 vi.mock('../../channels/channel-registry.js', () => ({
@@ -31,6 +43,25 @@ vi.mock('../../channels/channel-registry.js', () => ({
 vi.mock('../../config.js', async () => {
   const actual = await vi.importActual('../../config.js');
   return { ...actual, DATA_DIR: TEST_DIR };
+});
+
+// One-shot hook fired inside the return-path lookup — the await that now sits
+// between the cross-tenant wiring check and the session it authorizes. Same
+// seam shape as `raceCloses` in src/db/scheduled-tasks.test.ts; inert unless a
+// test arms it.
+const duringReturnPathLookup = vi.hoisted(() => ({ run: null as (() => void) | null }));
+
+vi.mock('../../session-manager.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../session-manager.js')>();
+  return {
+    ...actual,
+    withExistingMailboxSession: async (agentGroupId: string, sessionId: string, action: never) => {
+      const hook = duringReturnPathLookup.run;
+      duringReturnPathLookup.run = null;
+      hook?.();
+      return actual.withExistingMailboxSession(agentGroupId, sessionId, action);
+    },
+  };
 });
 
 const A = 'ag-src';
@@ -152,6 +183,41 @@ describe('a2a parity with a normally-engaged session', () => {
 
     await route(JSON.stringify({ text: 'do the thing' }), sourceSessionId);
 
+    expect(fetchThreadHistory).not.toHaveBeenCalled();
+    const rows = await targetInbound();
+    expect(JSON.parse(rows[0].content).text).toBe('do the thing');
+  });
+
+  /**
+   * The cross-tenant wiring gate must hold when the link is MADE, not when the
+   * message arrived.
+   *
+   * `messaging_group_agents` decides whether the target may inherit the
+   * caller's chat. The return-path lookup between that check and the session it
+   * authorizes became awaiting behind the mailbox seam, so a wiring revoked in
+   * the window left a target session bound to a chat the target is no longer
+   * authorized for — and a default `send_message` from that session posts into
+   * it, which is precisely what the 2026-05-03 cross-tenant audit added this
+   * gate to stop.
+   */
+  it('does not inherit the caller chat when the wiring is revoked during the return-path lookup', async () => {
+    const { getDb } = await import('../../db/connection.js');
+    const fetchThreadHistory = vi.fn().mockResolvedValue([{ sender: 'Operator', text: 'hi', timestamp: now() }]);
+    getChannelAdapter.mockReturnValue({ fetchThreadHistory });
+
+    // Revoked inside the lookup, after the pre-check proved it.
+    duringReturnPathLookup.run = () => {
+      getDb().prepare('DELETE FROM messaging_group_agents WHERE agent_group_id = ?').run(B);
+    };
+
+    await route(JSON.stringify({ text: 'do the thing' }), sourceSessionId);
+
+    // Agent-shared, exactly as if the revocation had landed one moment earlier.
+    const { getSessionsByAgentGroup } = await import('../../db/sessions.js');
+    const targets = getSessionsByAgentGroup(B);
+    expect(targets).toHaveLength(1);
+    expect(targets[0].messaging_group_id).toBeNull();
+    // No chat surface, so no history to backfill from one.
     expect(fetchThreadHistory).not.toHaveBeenCalled();
     const rows = await targetInbound();
     expect(JSON.parse(rows[0].content).text).toBe('do the thing');

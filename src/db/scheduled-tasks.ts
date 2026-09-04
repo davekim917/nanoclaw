@@ -18,16 +18,21 @@
  * existing row's cron + processAfter + content rather than inserting a
  * duplicate.
  */
-import fs from 'fs';
-import path from 'path';
 
-import { DATA_DIR } from '../config.js';
-import { resolveTaskSession } from '../session-manager.js';
-import { createSession, findSessionByAgentGroupAndMessagingGroup } from './sessions.js';
+import { log } from '../log.js';
+import { getAgentMailbox } from '../mailbox/index.js';
+import { resolveTaskSession, withExistingMailboxSession, withMailboxSession } from '../session-manager.js';
+import type { NanoclawMailboxSession } from '../modules/mailbox/index.js';
+import {
+  createSession,
+  findSessionByAgentGroupAndMessagingGroup,
+  getSession,
+  setTaskRoutingPlatformId,
+} from './sessions.js';
 import { getDb } from './connection.js';
-import { ensureSchema, migrateMessagesInTable, openInboundDb } from './session-db.js';
-import { sqliteUtcToIso } from '../modules/mailbox/sqlite-utc.js';
-import { nextEvenSeq } from './session-db.js';
+
+/** Did the row land, or was the session closed under us before the write? */
+type StampOutcome = 'written' | 'session-closed';
 
 export interface TaskDef {
   id: string;
@@ -97,30 +102,30 @@ export interface TaskDef {
   };
 }
 
-/**
- * ISO-normalize a slot that came out of a session-DB column.
- *
- * A move carries the SOURCE occurrence's slot into the destination DB, and on
- * a pre-upgrade install either source column can still hold SQLite's naive
- * `YYYY-MM-DD HH:MM:SS`. Persisting that shape into `scheduled_for` would put
- * a value in the destination that every reader compares as a string against
- * ISO ones, and that `new Date()` reads as local time. NULL stays NULL.
- */
-function isoSlot(value: string | null | undefined): string | null {
-  return value == null ? null : sqliteUtcToIso(value);
-}
-
 function generateSessionId(): string {
   return `sess-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
-function initStubSessionFolder(dataDir: string, agentGroupId: string, sessionId: string): void {
-  const dir = path.join(dataDir, 'v2-sessions', agentGroupId, sessionId);
-  fs.mkdirSync(dir, { recursive: true });
-  const inboundPath = path.join(dir, 'inbound.db');
-  ensureSchema(inboundPath, 'inbound');
-  const outboundPath = path.join(dir, 'outbound.db');
-  ensureSchema(outboundPath, 'outbound');
+/**
+ * Provision the mailbox for a freshly created channel-root session.
+ *
+ * `prepare()` is the single provisioning path, and it is the WHOLE path: it
+ * mkdirs `sessionMailboxDir(key)` itself before creating whichever mailbox
+ * files are absent, with upstream's baseline plus the fork's schema.
+ *
+ * This used to mkdir the directory first, from a `dataDir` parameter, while
+ * `prepare()` derived its own paths from the configured `DATA_DIR`. The two
+ * could disagree: a caller passing a non-default root got an empty directory
+ * under it and the actual databases under `DATA_DIR` — a session with no
+ * mailbox where it was asked for, and a write into the configured root. There
+ * is no root parameter any more, so they cannot disagree.
+ *
+ * Deliberately NOT `initSessionFolder`: that also creates the `outbox/`
+ * directory, and a stub session that has never run a container has no outbox
+ * to hold. Keeping the shapes distinct preserves the existing on-disk result.
+ */
+function initStubSessionFolder(agentGroupId: string, sessionId: string): void {
+  getAgentMailbox().prepare({ agentGroupId, sessionId });
 }
 
 /**
@@ -134,11 +139,7 @@ function initStubSessionFolder(dataDir: string, agentGroupId: string, sessionId:
  * makes the second INSERT throw `SQLITE_CONSTRAINT_UNIQUE`, which we catch
  * and resolve by re-lookup.
  */
-export async function resolveActiveSession(
-  agentGroupId: string,
-  messagingGroupId: string,
-  dataDir: string = DATA_DIR,
-): Promise<{ id: string }> {
+export async function resolveActiveSession(agentGroupId: string, messagingGroupId: string): Promise<{ id: string }> {
   const existing = findSessionByAgentGroupAndMessagingGroup(agentGroupId, messagingGroupId);
   if (existing) return { id: existing.id };
 
@@ -161,7 +162,7 @@ export async function resolveActiveSession(
     if (winner) return { id: winner.id };
     throw err;
   }
-  initStubSessionFolder(dataDir, agentGroupId, sessionId);
+  initStubSessionFolder(agentGroupId, sessionId);
   return { id: sessionId };
 }
 
@@ -247,109 +248,161 @@ function resolveAndValidateDestination(def: TaskDef): { messagingGroupId: string
   return validate.immediate();
 }
 
-export async function scheduleTask(def: TaskDef, _dataDir?: string): Promise<void> {
-  const dataDir = _dataDir ?? DATA_DIR;
+export async function scheduleTask(def: TaskDef): Promise<void> {
   resolveAndValidateDestination(def);
   // Stamp the session with the same destination the `messages_in` row below
   // carries. `resolveAndValidateDestination` has already proved it names a
   // real, wired messaging group, so the stamp can never point at a channel the
   // agent isn't authorized for. A `scheduled-move` re-schedule lands here too
   // and re-stamps the series' new home (migration 056).
-  const { session } = resolveTaskSession(def.agentGroupId, def.seriesId, def.destination.platformId);
-  const inboundDbPath = path.join(dataDir, 'v2-sessions', def.agentGroupId, session.id, 'inbound.db');
+  // No routing id: the stamp is deferred to `stamp`, which applies it only
+  // after re-validating the destination. See the note there.
+  const { session } = resolveTaskSession(def.agentGroupId, def.seriesId);
 
-  // Through the funnel, not a hand-rolled open: openInboundDb sets these same
-  // two pragmas AND plants the storage-activity marker that keeps a concurrent
-  // reclaim from unlinking this file between the open and the insert below.
-  const db = openInboundDb(inboundDbPath);
-  try {
-    // The statements below name `scheduled_for`, which is added lazily on the
-    // first writable open of a session. `resolveTaskSession` returns an
-    // EXISTING task session untouched, and this opener does not migrate, so on
-    // an upgraded install scheduling into a series whose session predates the
-    // column would throw `no such column` until the sweep reached it.
-    migrateMessagesInTable(db);
-    const content = JSON.stringify({
-      prompt: def.prompt,
-      ...(def.script !== undefined ? { script: def.script } : {}),
-      ...(def.quietStatus ? { quietStatus: true } : {}),
-      ...(def.flagIntent ? { flagIntent: def.flagIntent } : {}),
-    });
-    const platformId = def.destination.platformId;
-    const channelType = def.destination.channelType;
-    const threadId = def.destination.threadId;
+  const content = JSON.stringify({
+    prompt: def.prompt,
+    ...(def.script !== undefined ? { script: def.script } : {}),
+    ...(def.quietStatus ? { quietStatus: true } : {}),
+    ...(def.flagIntent ? { flagIntent: def.flagIntent } : {}),
+  });
 
-    const persist = db.transaction(() => {
-      // Idempotency: active series (pending/paused) → UPDATE; terminal rows
-      // (completed/failed/cancelled) are treated as absent so a fresh row is
-      // inserted, enabling re-scheduling after cancellation.
-      const activeRow = db
-        .prepare("SELECT id FROM messages_in WHERE series_id = ? AND status IN ('pending', 'paused')")
-        .get(def.seriesId) as { id: string } | undefined;
-
-      if (activeRow) {
-        // A due row may already have been admitted as recall + trigger before
-        // an operator reschedules it. Remove that now-stale recall and move the
-        // task to a fresh inert seq atomically; the next due sweep will build
-        // current context immediately before making it wakeable again.
-        db.prepare("DELETE FROM messages_in WHERE id = ? AND kind = 'system'").run(`recall-${activeRow.id}`);
-        const seq = nextEvenSeq(db);
-        db.prepare(
-          `UPDATE messages_in
-              SET seq           = ?,
-                  process_after = ?,
-                  -- Moves with process_after: an operator rescheduling a live
-                  -- series genuinely changes which slot the occurrence is for,
-                  -- unlike a retry backoff, which only moves process_after.
-                  scheduled_for = ?,
-                  recurrence    = ?,
-                  content       = ?,
-                  platform_id   = ?,
-                  channel_type  = ?,
-                  thread_id     = ?,
-                  tries         = 0,
-                  trigger       = 0
-            WHERE id = ?`,
-        ).run(
-          seq,
-          def.processAfter,
-          isoSlot(def.scheduledFor ?? def.processAfter),
-          def.cron,
-          content,
-          platformId,
-          channelType,
-          threadId,
-          activeRow.id,
-        );
-        return;
-      }
-
-      const seq = nextEvenSeq(db);
-      db.prepare(
-        `INSERT INTO messages_in
-           (id, seq, kind, timestamp, status, tries, process_after, scheduled_for, recurrence, series_id, content,
-            platform_id, channel_type, thread_id, trigger)
-         VALUES (?, ?, 'task', ?, 'pending', 0, ?, ?, ?, ?, ?, ?, ?, ?, 0)`,
-      ).run(
-        def.id,
-        seq,
-        new Date().toISOString(),
-        def.processAfter,
-        // Stamped equal at insert, then diverges — a deferral moves only
-        // process_after, so the occurrence keeps the slot it was armed for.
-        // A move is the one caller that arms them apart, preserving the source
-        // occurrence's slot across the transfer.
-        isoSlot(def.scheduledFor ?? def.processAfter),
-        def.cron,
-        def.seriesId,
+  // Existing-only first, provisioning only if there is genuinely no mailbox.
+  // `resolveTaskSession` may have just created the session row, and a task is
+  // a legitimate reason to author its mailbox — but it just as often hands
+  // back a live series whose container is running, and the provisioning
+  // funnel's `prepare()` runs `ensureSchema(..., 'outbound')`: a read-write
+  // open and DDL on the CONTAINER-owned outbound.db, across the mount, from
+  // the host. Pre-seam this path opened inbound.db and nothing else. Same
+  // rule, and the same reasoning, as the ingress write in `session-manager.ts`
+  // (mailbox seam PR 4, review round 1).
+  //
+  // Either funnel carries what the hand-rolled open used to: the same two
+  // pragmas AND the storage-activity marker that keeps a concurrent reclaim
+  // from unlinking the file between the open and the insert. And `session()`
+  // runs the inbound legacy migrations on both, so nothing a new task row
+  // needs is skipped by not provisioning.
+  const stamp =
+    (sessionId: string) =>
+    (mailbox: NanoclawMailboxSession): StampOutcome => {
+      // Re-read the session's status INSIDE the session, immediately before the
+      // write, with no await in between — that ordering is the whole point.
+      //
+      // `resolveTaskSession` above ran before this funnel's await, and it can
+      // only return an ACTIVE session. In the gap, the sweep can observe
+      // `countLiveTasks() === 0` on a spent-but-still-active task session and
+      // close it (`host-sweep.ts`, `shouldCloseTaskSession`). The row would
+      // then land in a closed session's inbound.db — a successful write that
+      // `getActiveSessions()` excludes, so the task never fires while this
+      // function reports success. Pre-seam, resolution and the write were one
+      // synchronous turn and no such gap existed.
+      //
+      // Same shape as `withStoppedContainerSession` one layer down: restore the
+      // check-then-write adjacency the seam's await broke, at the seam rather
+      // than at each call site.
+      if (getSession(sessionId)?.status !== 'active') return 'session-closed';
+      // AUTHORIZATION, re-validated here too, for the same reason and in the
+      // same place: `resolveAndValidateDestination` ran before the funnel's
+      // await, and the wiring it proved can be revoked in that window — a
+      // `messaging_group_agents` row removed, or a cross-workgroup peer added.
+      // The task row persists the route, and `delivery.ts` permits a
+      // non-origin send when `agent_destinations` has no entry, so a stale
+      // authorization here becomes a real one at fire time.
+      //
+      // It throws on failure, exactly as the pre-check does, so the caller's
+      // contract is unchanged and nothing is written — the throw lands before
+      // `upsertTaskSeries`. Re-running it is a read-only IMMEDIATE transaction
+      // on the central DB; it has no side effects.
+      resolveAndValidateDestination(def);
+      // The ROUTING STAMP lands here, not in `resolveTaskSession` above.
+      // `sessions.task_routing_platform_id` is what the Observatory derives a
+      // task thread's channel from, and re-scheduling an existing series
+      // re-stamps it. Applied before the funnel, a revalidation that throws
+      // here would leave the series DISPLAYED at the new destination while its
+      // task row still carries the old one — a rejected request that moved the
+      // task anyway. Applying it only once the destination has been re-proved,
+      // in the same synchronous step as the write it describes, removes that
+      // partial state instead of compensating for it afterwards.
+      //
+      // TWO DATABASES, NO SHARED TRANSACTION. The task row lands in this
+      // session's `inbound.db` and the stamp lands in the central DB, so
+      // statement order cannot make the pair atomic — it only chooses which
+      // side is left ahead when the other fails. Ordering alone was the round-12
+      // answer and it was half of one: it closed "the display moved but the
+      // route did not" and opened "the route moved but the display did not",
+      // where the caller sees a rejection over a task that is committed at its
+      // new destination.
+      //
+      // So the pair is compensated. Write the task row, then stamp; if the stamp
+      // throws, put back the ONE row the upsert touched and rethrow. The
+      // caller's contract is unchanged — a rejection still means nothing moved —
+      // and now the inbound side agrees with the central side the caller and
+      // the dashboard will read.
+      //
+      // The undo is addressed by ROW ID, from the upsert's own return value,
+      // never by `series_id`: a series can hold a second live row (`ncl tasks
+      // run` inserts one deliberately), and clearing the series would cancel an
+      // occurrence this write never touched.
+      //
+      // Nothing awaits between any of these, so no concurrent `scheduleTask`
+      // for this series can interleave with the write-stamp-restore triple.
+      const upserted = mailbox.upsertTaskSeries({
+        id: def.id,
+        seriesId: def.seriesId,
+        processAfter: def.processAfter,
+        scheduledFor: def.scheduledFor,
+        recurrence: def.cron,
         content,
-        platformId,
-        channelType,
-        threadId,
-      );
-    });
-    persist.immediate();
-  } finally {
-    db.close();
-  }
+        platformId: def.destination.platformId,
+        channelType: def.destination.channelType,
+        threadId: def.destination.threadId,
+      });
+      try {
+        setTaskRoutingPlatformId(sessionId, def.destination.platformId);
+      } catch (err) {
+        try {
+          mailbox.restoreTaskSeries(upserted.touchedId, upserted.prior, upserted.priorRecall);
+        } catch (restoreErr) {
+          // Both databases are now unhappy and the series is genuinely
+          // inconsistent. Say so loudly; the caller still gets the original
+          // failure, because that is the one that describes what it asked for.
+          log.error('scheduleTask: the routing stamp failed AND the task row could not be restored', {
+            seriesId: def.seriesId,
+            sessionId,
+            err,
+            restoreErr,
+          });
+        }
+        throw err;
+      }
+      return 'written';
+    };
+
+  // `undefined` still means "no mailbox" and still falls through to the
+  // provisioning funnel; 'session-closed' is the new, separate outcome.
+  const write = async (sessionId: string): Promise<StampOutcome> => {
+    const action = stamp(sessionId);
+    const existing = await withExistingMailboxSession(def.agentGroupId, sessionId, action);
+    if (existing !== undefined) return existing;
+    // Asked BEFORE the provisioning funnel, not only inside its action.
+    // `withMailboxSession` calls `prepare()`, which runs `ensureSchema` on
+    // inbound.db AND on the container-owned outbound.db — so provisioning
+    // completes before the action can answer 'session-closed', and a session
+    // closed during the read above would be handed a host-authored
+    // outbound.db it must never have (invariants I-4/I-10). This narrows that
+    // window rather than closing it: one await still follows. The action's own
+    // check remains the authoritative one.
+    if (getSession(sessionId)?.status !== 'active') return 'session-closed';
+    return await withMailboxSession(def.agentGroupId, sessionId, action);
+  };
+
+  if ((await write(session.id)) === 'written') return;
+
+  // Lost the race. Re-resolve and try once more. This terminates: the lookups
+  // behind `resolveTaskSession` filter `status = 'active'`, so the closed row
+  // can never come back — a fresh active task session is minted instead.
+  const retry = resolveTaskSession(def.agentGroupId, def.seriesId);
+  if ((await write(retry.session.id)) === 'written') return;
+  throw new Error(
+    `scheduleTask: task session for series ${def.seriesId} was closed twice while scheduling; not retrying again`,
+  );
 }

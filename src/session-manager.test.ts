@@ -55,9 +55,11 @@ import {
   sessionContextPathFor,
   sessionDir,
   sessionMessageExists,
+  withMailboxSession,
   writeOutboundDirect,
   writeSessionMessage,
   writeSessionMessageIfNew,
+  SessionWriteRefusedError,
   isAdmissiblePreTurnTrigger,
   reconcilePendingUpgradeContexts,
 } from './session-manager.js';
@@ -310,8 +312,49 @@ describe('writeSessionMessage re-provisions a deleted session folder', () => {
   it('treats a missing inbound DB as unseen without creating it', async () => {
     fs.rmSync(sessionDir(AG, SESS), { recursive: true, force: true });
 
-    expect(sessionMessageExists(AG, SESS, 'next-platform-message')).toBe(false);
+    expect(await sessionMessageExists(AG, SESS, 'next-platform-message')).toBe(false);
     expect(fs.existsSync(sessionDir(AG, SESS))).toBe(false);
+  });
+
+  /**
+   * Routine ingress must never write the container-owned outbound.db.
+   *
+   * The provisioning funnel's `prepare()` calls `ensureSchema(..., 'outbound')`,
+   * which opens that file read-write and runs DDL. A message arriving while the
+   * container is live would make the host a second writer on a cross-mount
+   * SQLite file, on every message — which is not what the pre-seam path did
+   * (it opened inbound.db and nothing else).
+   *
+   * Deleting outbound.db is the crisp probe: `ensureSchema` would recreate it,
+   * so its continued absence proves no writable outbound open happened. The
+   * message must still land, because the whole point is that the inbound write
+   * is unaffected.
+   */
+  it('does not open or recreate outbound.db when writing to a session that already exists', async () => {
+    initSessionFolder(AG, SESS);
+    expect(fs.existsSync(outboundDbPath(AG, SESS))).toBe(true);
+    fs.rmSync(outboundDbPath(AG, SESS));
+
+    await writeSessionMessage(AG, SESS, {
+      id: 'no-outbound-write-1',
+      kind: 'chat',
+      timestamp: new Date().toISOString(),
+      platformId: 'slack:C1',
+      channelType: 'slack',
+      threadId: null,
+      content: JSON.stringify({ text: 'routine ingress' }),
+    });
+
+    expect(fs.existsSync(outboundDbPath(AG, SESS))).toBe(false);
+    const db = new Database(inboundDbPath(AG, SESS), { readonly: true });
+    try {
+      const row = db.prepare('SELECT id FROM messages_in WHERE id = ?').get('no-outbound-write-1') as
+        | { id: string }
+        | undefined;
+      expect(row?.id).toBe('no-outbound-write-1');
+    } finally {
+      db.close();
+    }
   });
 
   it('deduplicates replayed platform message ids before they can create a second agent turn', async () => {
@@ -1953,6 +1996,181 @@ describe('the shared-transcript migration is gone', () => {
  * These assert the two halves of the lease contract that closes it. Both fail
  * against the pre-fix writer, which took no lease and re-checked nothing.
  */
+/**
+ * The writer's own guard.
+ *
+ * Callers used to prove their preconditions and then call `writeSessionMessage`,
+ * which awaits — a storage-activity lease, a reclaim-journal import, the mailbox
+ * funnel — before the row lands. Every one of those is a window where the proof
+ * goes stale, and nothing a caller does can close a window inside the callee.
+ * So the proof is handed to the writer, which evaluates it inside the mailbox
+ * action with nothing awaited between the answer and the insert.
+ */
+describe('writeSessionMessage evaluates its caller guard at the insert', () => {
+  const GUARD_SESS = 'sess-guard';
+
+  beforeEach(() => {
+    fs.rmSync(sessionDir(AG, GUARD_SESS), { recursive: true, force: true });
+    const db = initTestDb();
+    runMigrations(db);
+    createAgentGroup({
+      id: AG,
+      name: 'Guard',
+      folder: 'guard',
+      agent_provider: null,
+      created_at: new Date().toISOString(),
+    });
+    createSession({
+      id: GUARD_SESS,
+      agent_group_id: AG,
+      messaging_group_id: null,
+      thread_id: null,
+      agent_provider: null,
+      status: 'active',
+      container_status: 'stopped',
+      last_active: null,
+      created_at: new Date().toISOString(),
+    });
+    initSessionFolder(AG, GUARD_SESS);
+  });
+
+  afterEach(() => {
+    fs.rmSync(sessionDir(AG, GUARD_SESS), { recursive: true, force: true });
+    closeDb();
+  });
+
+  function rowIds(): string[] {
+    const db = new Database(inboundDbPath(AG, GUARD_SESS), { readonly: true });
+    try {
+      return (db.prepare('SELECT id FROM messages_in').all() as Array<{ id: string }>).map((r) => r.id);
+    } finally {
+      db.close();
+    }
+  }
+
+  const message = (id: string) => ({
+    id,
+    kind: 'chat',
+    timestamp: new Date().toISOString(),
+    platformId: 'slack:C1',
+    channelType: 'slack',
+    threadId: null,
+    content: JSON.stringify({ text: 'hello' }),
+  });
+
+  /** Every file under the session's inbox tree, relative to it. */
+  function inboxFiles(): string[] {
+    const root = path.join(sessionDir(AG, GUARD_SESS), 'inbox');
+    if (!fs.existsSync(root)) return [];
+    const out: string[] = [];
+    const walk = (dir: string, prefix: string): void => {
+      for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+        const rel = prefix ? `${prefix}/${entry.name}` : entry.name;
+        if (entry.isDirectory()) walk(path.join(dir, entry.name), rel);
+        else out.push(rel);
+      }
+    };
+    walk(root, '');
+    return out.sort();
+  }
+
+  const withAttachment = (id: string) => ({
+    ...message(id),
+    content: JSON.stringify({
+      text: 'see attached',
+      attachments: [{ name: 'payload.txt', data: Buffer.from('secret-bytes').toString('base64') }],
+    }),
+  });
+
+  /**
+   * A guard already false must not let the BYTES land either.
+   *
+   * `extractAttachmentFiles` decodes inline base64 into the target session's
+   * mounted `inbox`, which its container reads — so extraction is a delivery in
+   * its own right, and it happens before the mailbox action where the guard
+   * first ran. A precondition already false on entry should write nothing at
+   * all.
+   */
+  it('writes no attachment bytes when the guard is already false on entry', async () => {
+    await expect(
+      writeSessionMessage(AG, GUARD_SESS, withAttachment('att-pre'), {
+        guard: () => ({ ok: false, reason: 'destination revoked' }),
+      }),
+    ).rejects.toThrow(SessionWriteRefusedError);
+
+    expect(inboxFiles()).toEqual([]);
+    expect(rowIds()).not.toContain('att-pre');
+  });
+
+  /**
+   * And bytes already written are taken back when the guard refuses at the insert.
+   *
+   * This is the window the entry check cannot cover: the grant holds on entry,
+   * the extraction runs, and the revocation lands during the writer's own
+   * awaits. The caller's cleanup cannot reach these files — it knows only what
+   * IT forwarded, not what the writer decoded from inline `data`.
+   */
+  it('removes the attachment bytes it wrote when the guard refuses at the insert', async () => {
+    let authorized = true;
+    const write = writeSessionMessage(AG, GUARD_SESS, withAttachment('att-mid'), {
+      guard: () => (authorized ? true : { ok: false, reason: 'destination revoked' }),
+    });
+    // Revoked after the entry check and the extraction, before the insert.
+    authorized = false;
+
+    await expect(write).rejects.toThrow(SessionWriteRefusedError);
+
+    expect(inboxFiles()).toEqual([]);
+    expect(rowIds()).not.toContain('att-mid');
+  });
+
+  it('keeps the attachment bytes when the write is allowed', async () => {
+    await writeSessionMessage(AG, GUARD_SESS, withAttachment('att-ok'), { guard: () => true });
+    expect(inboxFiles()).toEqual(['att-ok/payload.txt']);
+    expect(rowIds()).toContain('att-ok');
+  });
+
+  it('writes when the guard still holds', async () => {
+    await writeSessionMessage(AG, GUARD_SESS, message('guard-ok'), { guard: () => true });
+    expect(rowIds()).toContain('guard-ok');
+  });
+
+  /**
+   * The interleave the caller could not see: the precondition holds when
+   * `writeSessionMessage` is CALLED and fails by the time the row would land.
+   * The guard is only ever asked once, inside the action, so flipping it after
+   * the call proves the writer asks it late rather than early.
+   */
+  it('writes nothing when the guard fails during its own awaits', async () => {
+    const state = { authorized: true };
+    const write = writeSessionMessage(AG, GUARD_SESS, message('guard-revoked'), {
+      guard: () => (state.authorized ? true : { ok: false, reason: 'destination revoked' }),
+    });
+    // Revoked while the writer is between its entry and its insert. Everything
+    // it awaits happens after this line and before the guard runs.
+    state.authorized = false;
+
+    await expect(write).rejects.toThrow(SessionWriteRefusedError);
+    expect(rowIds()).not.toContain('guard-revoked');
+  });
+
+  it('treats a bare false as a refusal, and writes nothing', async () => {
+    await expect(writeSessionMessage(AG, GUARD_SESS, message('guard-false'), { guard: () => false })).rejects.toThrow(
+      SessionWriteRefusedError,
+    );
+    expect(rowIds()).not.toContain('guard-false');
+  });
+
+  it('refuses the idempotent variant the same way', async () => {
+    await expect(
+      writeSessionMessageIfNew(AG, GUARD_SESS, message('guard-ifnew'), {
+        guard: () => ({ ok: false, reason: 'no longer wired' }),
+      }),
+    ).rejects.toThrow(/no longer wired/);
+    expect(rowIds()).not.toContain('guard-ifnew');
+  });
+});
+
 describe('writeSessionMessage does not race an in-flight session archival', () => {
   // `CLEANUP_CLAIM` in storage-activity.ts. Written directly because the
   // reaper's own helper holds it only for a synchronous callback, and this
@@ -2191,5 +2409,100 @@ describe('runner session context path', () => {
     // stops removing context files and each reclaimed session leaks one.
     expect(sessionContextPathFor(sessionDir('ag-ctx', 'sess-ctx'))).toBe(sessionContextPath('ag-ctx', 'sess-ctx'));
     expect(sessionContextPath('ag-ctx', 'sess-ctx').endsWith('/ag-ctx/.context/sess-ctx.json')).toBe(true);
+  });
+});
+
+/**
+ * PR 4 (mailbox seam, ingress family): `writeSessionMessage` writes through
+ * `withMailboxSession`, so the mailbox's `prepare()` is now the provisioning
+ * path AND the same-key nesting guard is live on the host's busiest write.
+ */
+describe('mailbox seam: ingress writes', () => {
+  const AG_ING = 'ag-ingress';
+  const SESS_ING = 'sess-ingress';
+
+  const ingressMessage = (id: string) => ({
+    id,
+    kind: 'chat' as const,
+    timestamp: new Date().toISOString(),
+    platformId: 'slack:C1',
+    channelType: 'slack' as const,
+    threadId: null,
+    content: JSON.stringify({ text: 'through the seam' }),
+  });
+
+  beforeEach(() => {
+    fs.rmSync(sessionDir(AG_ING, SESS_ING), { recursive: true, force: true });
+    const db = initTestDb();
+    runMigrations(db);
+    createAgentGroup({
+      id: AG_ING,
+      name: 'Ingress',
+      folder: 'ingress',
+      agent_provider: null,
+      created_at: new Date().toISOString(),
+    });
+    for (const id of [SESS_ING, 'sess-ingress-other']) {
+      createSession({
+        id,
+        agent_group_id: AG_ING,
+        messaging_group_id: null,
+        thread_id: id === SESS_ING ? null : 'slack:C1:other',
+        agent_provider: null,
+        status: 'active',
+        container_status: 'stopped',
+        last_active: null,
+        created_at: new Date().toISOString(),
+      });
+    }
+  });
+
+  afterEach(() => {
+    fs.rmSync(sessionDir(AG_ING, SESS_ING), { recursive: true, force: true });
+    fs.rmSync(sessionDir(AG_ING, 'sess-ingress-other'), { recursive: true, force: true });
+    closeDb();
+  });
+
+  it('writeSessionMessage provisions through prepare() and never nests a same-key session', async () => {
+    // (1) Provisioning. Nothing on disk for this session yet — the write itself
+    // has to create the mailbox, which is `prepare()`'s job now that the raw
+    // `initSessionFolder` open is gone from the write path.
+    expect(fs.existsSync(inboundDbPath(AG_ING, SESS_ING))).toBe(false);
+    await writeSessionMessage(AG_ING, SESS_ING, ingressMessage('provisioned'));
+    expect(fs.existsSync(inboundDbPath(AG_ING, SESS_ING))).toBe(true);
+    expect(fs.existsSync(outboundDbPath(AG_ING, SESS_ING))).toBe(true);
+    const written = new Database(inboundDbPath(AG_ING, SESS_ING), { readonly: true });
+    try {
+      expect(
+        (written.prepare("SELECT id FROM messages_in WHERE id NOT LIKE 'recall-%'").all() as { id: string }[]).map(
+          (r) => r.id,
+        ),
+      ).toEqual(['provisioned']);
+    } finally {
+      written.close();
+    }
+
+    // (2) The nesting guard. Calling the writer from inside an open session on
+    // the SAME key must reject — a serialized implementation would deadlock
+    // there (invariant I-3). This is the case that would only have shown up in
+    // production before the guard existed.
+    await expect(
+      withMailboxSession(AG_ING, SESS_ING, async () => {
+        await writeSessionMessage(AG_ING, SESS_ING, ingressMessage('nested'));
+      }),
+    ).rejects.toThrow(/Nested mailbox session/);
+
+    // (3) A different key from inside an open session is fine, and the refused
+    // nested write left nothing behind.
+    await withMailboxSession(AG_ING, SESS_ING, async () => {
+      await writeSessionMessage(AG_ING, 'sess-ingress-other', ingressMessage('sibling'));
+    });
+    const after = new Database(inboundDbPath(AG_ING, SESS_ING), { readonly: true });
+    try {
+      expect(after.prepare('SELECT 1 FROM messages_in WHERE id = ?').get('nested')).toBeUndefined();
+    } finally {
+      after.close();
+    }
+    fs.rmSync(sessionDir(AG_ING, 'sess-ingress-other'), { recursive: true, force: true });
   });
 });

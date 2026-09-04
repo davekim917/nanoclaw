@@ -68,9 +68,23 @@ vi.mock('./session-manager.js', () => ({
   writeOutboundDirect: vi.fn(),
 }));
 
-vi.mock('./container-runner.js', () => ({
-  wakeContainer: vi.fn(),
-}));
+vi.mock('./container-runner.js', async () => {
+  // Reads through this file's own `db/sessions` mock, so the guard answers what
+  // a test has set up rather than what the real DB happens to hold.
+  const { getSession } = await import('./db/sessions.js');
+  return {
+    wakeContainer: vi.fn(),
+    // The real definition. The router hands its liveness proof to the WAKE PATH
+    // instead of making it before the call — it only builds the guard here; the
+    // wake path is what asks it, next to `spawn()`.
+    sessionStillActive: (sessionId: string) => () => {
+      const fresh = getSession(sessionId);
+      if (!fresh) return { ok: false, reason: 'session no longer exists' };
+      if (fresh.status !== 'active') return { ok: false, reason: `session is ${fresh.status}` };
+      return true;
+    },
+  };
+});
 
 vi.mock('./attachment-downloader.js', () => ({
   persistInboundAttachments: vi.fn((_, __, ___, content: string) => content),
@@ -338,7 +352,10 @@ describe('C2: pre-fanout intercept dispatch', () => {
 
     // Normal path: idempotent session write called (fan-out ran)
     expect(writeSessionMessageIfNew).toHaveBeenCalledOnce();
-    expect(wakeContainer).toHaveBeenCalledWith(session, 'interactive');
+    // Third argument is the liveness guard the WAKE PATH evaluates next to
+    // `spawn()`; the router no longer re-reads the row and passes a fresh copy,
+    // because that proves nothing about the wake's own awaits.
+    expect(wakeContainer).toHaveBeenCalledWith(session, 'interactive', { guard: expect.any(Function) });
   });
 
   it('test_routeInbound_intercept_filter_drops', async () => {

@@ -56,9 +56,8 @@ import {
 import { archiveMessage } from './message-archive.js';
 import { parseMessageFlags, formatFlagConfirmation, type FlagIntent } from './flag-parser.js';
 import { maybeRenameNewThread } from './topic-title.js';
-import { wakeContainer } from './container-runner.js';
+import { sessionStillActive, wakeContainer } from './container-runner.js';
 import { getContainerConfig, resolveProviderName } from './db/container-configs.js';
-import { getSession } from './db/sessions.js';
 import type { AgentGroup, ChannelType, MessagingGroup, MessagingGroupAgent } from './types.js';
 import { isChannelVariant } from './types.js';
 import type { InboundEvent } from './channels/adapter.js';
@@ -1228,7 +1227,7 @@ async function deliverToAgent(
   // their old platform ids. Check the actual per-session id before every side
   // effect as a migration-safe second line of defense, and also make a partial
   // fan-out retry harmless for agents whose row was already committed.
-  if (sessionMessageExists(agent.agent_group_id, session.id, routedMessageId)) {
+  if (await sessionMessageExists(agent.agent_group_id, session.id, routedMessageId)) {
     log.debug('Duplicate session message ignored before agent side effects', {
       sessionId: session.id,
       agentGroup: session.agent_group_id,
@@ -1466,16 +1465,19 @@ async function deliverToAgent(
         mg.instance,
       );
     }
-    const freshSession = getSession(session.id);
-    if (freshSession) {
+    {
       // Priority is applied atomically inside wakeContainer. If this session
       // was queued for scheduled work, the returned promise now represents
       // the real promotion/admission result rather than a stale queued=false.
-      const woke = await wakeContainer(freshSession, 'interactive');
+      //
+      // The liveness proof is the wake's, not ours: a `getSession` here proved
+      // the row live before the call, and the call then awaits admission, the
+      // memory queue and the spawn preparation.
+      const woke = await wakeContainer(session, 'interactive', { guard: sessionStillActive(session.id) });
       // wakeContainer never throws — it returns false on transient spawn
       // failure (host-sweep retries). Stop the typing indicator we just
       // started so it doesn't leak; the inbound row stays pending.
-      if (!woke) stopTypingRefresh(freshSession.id);
+      if (!woke) stopTypingRefresh(session.id);
     }
   }
 }
