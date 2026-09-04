@@ -1302,7 +1302,6 @@ export async function _prepareDueWakeForTesting(
   return prepareDueWake(mailbox, agentGroupId, sessionId);
 }
 
-
 /**
  * "I cannot read this session" is not "this session is quiet", but both took
  * the same silent quiet-until return. Same backoff — a session the host cannot
@@ -2090,6 +2089,7 @@ function registerBuiltInSweepDuties(): void {
   // T11 (scheduled-move-recovery) and T12 (audit-body-prune) are registered by
   // src/modules/sweep-scheduled-move/index.ts (S2-PR7) — order 50/60 in this
   // same 'tick:housekeeping' phase, between T10 above and T14 below.
+
   // T14 completed-task-auto-archive (order 70) moved to
   // src/modules/sweep-orchestrator/index.ts (S2-PR5).
 

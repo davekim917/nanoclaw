@@ -34,13 +34,22 @@ const allowlistSet = new Set(allowlist);
  * The host half of the allowlist is DONE (PR 7), so it is no longer a
  * shrinking subset — it is an exact set, and this is what it may contain.
  *
- * `src/storage-manager.ts` is the single documented exemption: its reclaim
- * probes run in a worker thread over an INJECTED sessions root, which the
- * DATA_DIR-keyed mailbox cannot address, and they are strictly read-only. The
- * rationale lives at the top of that file; adding a second entry here means
- * writing the same kind of justification there first.
+ * Two documented exemptions, and they are the SAME exemption twice: both walk
+ * an INJECTED sessions root rather than DATA_DIR, and the mailbox is keyed on
+ * DATA_DIR, so neither can be addressed by a mailbox key at all.
+ *
+ *  - `src/storage-manager.ts` — reclaim probes in a worker thread, read-only.
+ *  - `src/modules/sweep-scheduled-move/index.ts` — the move-intent recovery,
+ *    which seam 2's S2-PR7 moved here out of `host-sweep.ts`. `plan.md` §5
+ *    books it as the one permanent KEEP-PATCH (F-7.3), and its own header says
+ *    so at the open.
+ *
+ * The rationale for each lives at the top of its file; a third entry here
+ * means writing that kind of justification there first. Neither is residue to
+ * chase — the seam cannot express an injected root, and pretending otherwise
+ * is what would break the recovery's own tests, which inject one.
  */
-const HOST_ALLOWLIST_EXEMPTIONS = ['src/storage-manager.ts'];
+const HOST_ALLOWLIST_EXEMPTIONS = ['src/modules/sweep-scheduled-move/index.ts', 'src/storage-manager.ts'];
 const RUNNER_ROOT = 'container/agent-runner/src';
 const isRunnerPath = (relPath: string): boolean => relPath.startsWith(RUNNER_ROOT + '/');
 

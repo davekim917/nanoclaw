@@ -136,8 +136,6 @@ vi.mock('./session-manager.js', async (importOriginal) => {
   return {
     ...real,
     admitDueTaskContexts: (...args: unknown[]) => mockAdmitDueTaskContexts(...args),
-    outboundDbPath: real.outboundDbPath,
-    writeSessionMessage: (...args: unknown[]) => mockWriteSessionMessage(...args),
   };
 });
 
@@ -1180,8 +1178,6 @@ describe('notifyKillCeiling (Layer-3 fix)', () => {
     expect(rows[0].id).toBe('prior');
   });
 });
-
-
 
 describe('shouldCloseTaskSession', () => {
   it('closes a spent per-task session (no live tasks, no container)', () => {
