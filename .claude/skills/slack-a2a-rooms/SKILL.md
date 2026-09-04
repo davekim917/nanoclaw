@@ -121,8 +121,14 @@ conversation under its own channelType.
 
    ```bash
    ncl messaging-groups create --channel-type slack-<suffix> \
-     --platform-id <channel id> --is-group 1
+     --platform-id slack:<channel id> --is-group 1
    ```
+
+   The `slack:` prefix is required. `messaging_groups.platform_id` holds the
+   canonical id the Chat SDK adapter delivers inbound (`slack:C…`), and the
+   CLI stores and matches `--platform-id` exactly, so a row keyed on the bare
+   `C…` the opener prints would never match an event — it would sit unused
+   while an addressed message quietly created a second, unwired row.
 
    Do this per instance rather than relying on a mention to bootstrap it. The
    host creates a row only for the instance an inbound event addresses, which

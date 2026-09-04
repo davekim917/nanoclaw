@@ -182,14 +182,27 @@ find data/workgroups/${WG} -type f | sort
 
 # 3. merge the old tree into the destination by hand, then set the column
 
-# 4. start the service again
+# 4. reconcile the container config — if it declares a workgroup, the DB
+#    column alone does not hold (see below)
+grep -n workgroup_id groups/<folder>/container.json
+
+# 5. start the service again
 # Linux
 systemctl --user start "$UNIT" || sudo systemctl start "$UNIT"
 # macOS — bootout UNLOADED the job, so load it rather than kickstarting it
 launchctl bootstrap "gui/$(id -u)" ~/Library/LaunchAgents/"$LABEL".plist
 ```
 
-Step 4 is not `bash setup/lib/restart.sh`. That script's macOS branch is
+**Check `container.json` too.** `groups/<folder>/container.json` may carry an
+explicit `workgroup_id`, and it wins: `resolveWorkgroupIdAtSpawn` returns the
+config value whenever it is defined and only falls back to the `agent_groups`
+row otherwise, then `reconcileWorkgroupAtSpawn` writes that value straight back
+over the column. A DB-only edit is therefore reverted on the first spawn, which
+returns the agent to the workgroup whose files you just moved away — the worst
+version of this failure, because the data moved and the membership did not.
+Set the key to the destination id, or delete it and let the column decide.
+
+Step 5 is not `bash setup/lib/restart.sh`. That script's macOS branch is
 `launchctl kickstart -k`, which restarts a job that is still loaded and fails
 on one `bootout` has removed; its Linux branch is a `restart`, which is fine
 but pointless on a stopped unit. Use the commands above, which mirror the pair

@@ -280,11 +280,14 @@ async function main(): Promise<void> {
   console.log("  1. Create each instance's row for this channel. Idempotent — a re-run returns");
   console.log('     the existing row. Every bot needs its OWN row; the host only auto-creates one');
   console.log('     for an instance that is addressed, which never happens for the opener itself');
-  console.log('     and never happens at all in a room with no human in it:');
+  console.log('     and never happens at all in a room with no human in it.');
+  console.log('     Note the slack: prefix — messaging_groups.platform_id holds the canonical');
+  console.log('     id the adapter delivers, and the CLI matches it exactly, so a row keyed on');
+  console.log('     the bare channel id never matches an inbound event:');
   for (const auth of auths) {
     console.log(
       `       ncl messaging-groups create --channel-type ${channelTypeForInstance(auth.name)} \\\n` +
-        `         --platform-id ${channelId} --is-group 1`,
+        `         --platform-id slack:${channelId} --is-group 1`,
     );
   }
   console.log('  2. Wire each agent to its own row:');
