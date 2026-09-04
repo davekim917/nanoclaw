@@ -134,18 +134,6 @@ function failClosed(sourceFile: ts.SourceFile, filePath: string, kind: string, n
 }
 
 /**
- * Strips a recognized TypeScript source extension (`.ts`, `.tsx`, `.mts`,
- * `.cts`) from the end of `p`, if present — the common form both
- * `collectModuleBindings`'s target matching and
- * `relativeResolutionCandidates`'s candidate generation compare against, so
- * a `.mts`/`.cts` module is matched the same way a plain `.ts` one already
- * was.
- */
-function stripSourceExt(p: string): string {
-  return p.replace(/\.(ts|tsx|mts|cts)$/, '');
-}
-
-/**
  * Every file path a relative specifier `specifierText`, written inside a
  * file whose directory is `fileDir`, could resolve to under Node's
  * ESM/NodeNext extension-mapping rules: `.js` -> `.ts`/`.tsx` (TypeScript
@@ -158,10 +146,19 @@ function stripSourceExt(p: string): string {
  *
  * Shared by `discoverRelativeModules` (which existence-checks each
  * candidate and fails closed if none exists on disk) and
- * `collectModuleBindings`'s `specifierMatchesTarget` (which only needs to
- * know whether ANY candidate, once extension-stripped, equals the target
- * module it's already resolved to) — using one function for both closes the
- * gap where the two could resolve the same specifier differently.
+ * `collectModuleBindings`'s `specifierMatchesTarget` (which checks whether
+ * the target module it's already resolved to — an exact repo-relative path,
+ * extension included — is ITSELF one of these candidates) — using one
+ * function for both closes the gap where the two could resolve the same
+ * specifier differently.
+ *
+ * The comparison at the call site MUST be exact-path equality, never
+ * extension-stripped: a fix-induced bug in an earlier round stripped both
+ * sides down to a bare extensionless base before comparing, so `./foo.js`
+ * (whose only real candidates are `foo.ts`/`foo.tsx`) and `./foo.mjs`
+ * (whose only real candidate is `foo.mts`) both stripped to the same
+ * `foo` and matched EITHER target — `foo.ts` and `foo.mts` are two
+ * distinct files with distinct binding sets, and stripping conflated them.
  */
 function relativeResolutionCandidates(fileDir: string, specifierText: string): string[] {
   const joined = path.posix.normalize(path.posix.join(fileDir, specifierText));
@@ -228,13 +225,15 @@ function collectModuleBindings(filePath: string, modulePath: string, root: strin
   const src = fs.readFileSync(path.join(root, filePath), 'utf8');
   const sourceFile = ts.createSourceFile(filePath, src, ts.ScriptTarget.Latest, /* setParentNodes */ true);
   const fileDir = path.posix.dirname(filePath);
-  const targetNoExt = stripSourceExt(modulePath);
 
+  // Exact-path equality against `modulePath` (an already-resolved,
+  // extension-intact repo-relative path — see relativeResolutionCandidates's
+  // doc comment for the fix-induced bug this replaced: extension-stripped
+  // comparison conflated distinct files sharing a base name, e.g. foo.ts
+  // and foo.mts).
   function specifierMatchesTarget(specifierText: string): boolean {
     if (!specifierText.startsWith('.')) return false; // package import — no repo-relative edge
-    return relativeResolutionCandidates(fileDir, specifierText).some(
-      (candidate) => stripSourceExt(candidate) === targetNoExt,
-    );
+    return relativeResolutionCandidates(fileDir, specifierText).includes(modulePath);
   }
 
   function namedElementText(el: ts.ImportSpecifier | ts.ExportSpecifier): string | null {
@@ -427,10 +426,10 @@ function discoverRelativeModules(filePath: string, root: string = REPO_ROOT): st
  * these two specific files are pinned this way instead of walked like the
  * TARGETS scripts further down.
  */
-function collectRelativeImportManifest(filePath: string): Record<string, string[]> {
+function collectRelativeImportManifest(filePath: string, root: string = REPO_ROOT): Record<string, string[]> {
   const manifest: Record<string, string[]> = {};
-  for (const modulePath of discoverRelativeModules(filePath)) {
-    manifest[modulePath] = collectModuleBindings(filePath, modulePath);
+  for (const modulePath of discoverRelativeModules(filePath, root)) {
+    manifest[modulePath] = collectModuleBindings(filePath, modulePath, root);
   }
   return manifest;
 }
@@ -584,6 +583,36 @@ describe('discoverRelativeModules — NodeNext extension mapping and fail-closed
     expect(() => discoverRelativeModules('entry.ts', dir)).toThrow(
       'import-equals declaration in a manifest-pinned file: entry.ts:1',
     );
+  });
+
+  // Codex on d91bc418: this round's own fix — comparing extension-stripped
+  // candidates instead of exact resolved paths — was itself fix-induced.
+  // `./foo.js`'s only real candidates are `foo.ts`/`foo.tsx`; `./foo.mjs`'s
+  // only real candidate is `foo.mts`. Stripped to a bare `foo`, both
+  // specifiers' candidates matched EITHER target, so foo.ts and foo.mts —
+  // two distinct files with distinct binding sets — got merged into one
+  // manifest entry, and swapping which specifier pointed at which file left
+  // the manifest unchanged.
+  it('two distinct same-basename modules (`foo.ts` and `foo.mts`) get two distinct manifest entries, and swapping the specifiers changes the manifest', () => {
+    const dir = tmpDir('nodenext-same-basename-distinct-extensions');
+    fs.writeFileSync(dir + '/foo.ts', 'export const a = 1;\nexport const b = 1;\n');
+    fs.writeFileSync(dir + '/foo.mts', 'export const a = 2;\nexport const b = 2;\n');
+
+    fs.writeFileSync(
+      dir + '/entry.ts',
+      ["import { a } from './foo.js';", "import { b } from './foo.mjs';", ''].join('\n'),
+    );
+    expect(collectRelativeImportManifest('entry.ts', dir)).toEqual({ 'foo.ts': ['a'], 'foo.mts': ['b'] });
+
+    // Swap which specifier points at which name — `.js` now binds `b`,
+    // `.mjs` now binds `a`. A stripped-comparison bug conflates `foo.ts` and
+    // `foo.mts` (both strip to `foo`), so the swap would leave the manifest
+    // identical to the one above; the fix must not.
+    fs.writeFileSync(
+      dir + '/entry.ts',
+      ["import { b } from './foo.js';", "import { a } from './foo.mjs';", ''].join('\n'),
+    );
+    expect(collectRelativeImportManifest('entry.ts', dir)).toEqual({ 'foo.ts': ['b'], 'foo.mts': ['a'] });
   });
 });
 
