@@ -30,7 +30,11 @@ function log(msg: string): void {
   console.error(`[opencode-provider] ${msg}`);
 }
 
-/** Extension → MIME fallback, for adapters that report no `mimeType`. */
+/**
+ * Extension → MIME fallback, for adapters that report no `mimeType`. The audio
+ * and video entries mirror the host's own `TYPE_TO_EXT` mapping, which is what
+ * names a Telegram voice note `.ogg` and an animation `.mp4` in the first place.
+ */
 const ATTACHMENT_MIME_BY_EXT: Record<string, string> = {
   '.png': 'image/png',
   '.jpg': 'image/jpeg',
@@ -39,7 +43,37 @@ const ATTACHMENT_MIME_BY_EXT: Record<string, string> = {
   '.webp': 'image/webp',
   '.heic': 'image/heic',
   '.pdf': 'application/pdf',
+  '.mp3': 'audio/mpeg',
+  '.ogg': 'audio/ogg',
+  '.wav': 'audio/wav',
+  '.m4a': 'audio/mp4',
+  '.mp4': 'video/mp4',
+  '.webm': 'video/webm',
+  '.mov': 'video/quicktime',
 };
+
+/**
+ * Which media a turn may hand over as a file part.
+ *
+ * Images and PDFs are unconditional — that is the long-standing behavior and
+ * the channels' common case. Audio and video ride the SAME declaration that
+ * opens OpenCode's own gate for them: `OPENCODE_MODEL_INPUT_MODALITIES`. One
+ * source of truth rather than two hardcoded lists, which is the drift this
+ * closes — the config advertised `audio`/`video` as accepted values while the
+ * forwarder silently dropped both, so declaring either did nothing.
+ *
+ * Still closed by default: the env var is unset for every group unless an
+ * operator declares it, and an undeclared modality is one OpenCode would drop
+ * anyway (it substitutes a "does not support <modality> input" error), so
+ * forwarding it would only inflate the request.
+ */
+export function forwardableAttachmentMime(mime: string, env: NodeJS.ProcessEnv = process.env): boolean {
+  if (mime.startsWith('image/') || mime === 'application/pdf') return true;
+  const declared = resolveModelModalities(env)?.input ?? [];
+  if (mime.startsWith('audio/')) return declared.includes('audio');
+  if (mime.startsWith('video/')) return declared.includes('video');
+  return false;
+}
 
 /**
  * `PromptAttachment` declares string fields and `extractAttachments` normalizes
@@ -66,10 +100,12 @@ function attachmentMime(att: PromptAttachment): string | undefined {
  * shares this container's filesystem, so base64-ing here would only duplicate
  * that work and inflate the request body.
  *
- * Only images and PDFs are forwarded. PDFs go through even though a given
- * backend may reject them, since the alternative is silently withholding a
- * document the user did send. Anything skipped is still described in the prompt
- * text, so it is never lost — just not handed over as media.
+ * What may be forwarded is `forwardableAttachmentMime`: images and PDFs always,
+ * audio and video when the group declared those modalities. PDFs go through
+ * even though a given backend may reject them, since the alternative is
+ * silently withholding a document the user did send. Anything skipped is still
+ * described in the prompt text, so it is never lost — just not handed over as
+ * media.
  *
  * NOTE: a model OpenCode's registry does not know declares no input modalities,
  * and OpenCode then drops every non-text part it is handed. Declaring
@@ -86,7 +122,7 @@ export function buildAttachmentFileParts(
   for (const att of attachments ?? []) {
     const mime = attachmentMime(att);
     if (!mime) continue;
-    if (!mime.startsWith('image/') && mime !== 'application/pdf') continue;
+    if (!forwardableAttachmentMime(mime)) continue;
     if (typeof att.path !== 'string' || !att.path || !exists(att.path)) {
       const label =
         (typeof att.filename === 'string' && att.filename) ||
@@ -394,6 +430,10 @@ export function isEmptyOpenCodeResume(opts: { resumedExistingSession: boolean; s
  * Marker in the error a dead continuation raises. Matched by STALE_SESSION_RE
  * below, so the runner classifies it as a stale session and runs its ONE
  * recovery path — the same one a pruned transcript takes.
+ *
+ * Keep it regex-literal: it is spliced into that alternation verbatim, so a
+ * metacharacter added here silently changes what the whole pattern matches.
+ * `opencode.empty-resume.test.ts` asserts the marker still classifies.
  */
 export const EMPTY_RESUME_ERROR = 'resumed OpenCode session produced no assistant work';
 
@@ -734,11 +774,20 @@ export function buildOpenCodeConfig(
   const modelsToRegister = [defaultModelId, smallModelId]
     .filter((mid): mid is string => Boolean(mid))
     .filter((mid, i, a) => a.indexOf(mid) === i);
-  // limit / modalities describe the MAIN model only — the env vars name no
-  // small-model equivalent, and spreading them onto a distinct
-  // OPENCODE_SMALL_MODEL entry would falsely declare its context window and
-  // media support as the main model's. A differing small model gets a bare
-  // entry and resolves through OpenCode's own undeclared-model default.
+  // limit / modalities describe ONE model: the group's CONFIGURED default
+  // (OPENCODE_MODEL), which is the model the operator measured when they wrote
+  // the env vars. Deliberately NOT the effective model: a per-turn `-m` (or a
+  // change_model) selects a different model, and with effort active
+  // runtimeConfigKey rebuilds the runtime, so attaching these to the override
+  // would declare the configured model's context window and media support on a
+  // model that has neither — premature or absent compaction, and modality
+  // claims the backend rejects. A model in use that is not the configured one
+  // gets a bare entry and resolves through OpenCode's own undeclared-model
+  // default, same as OPENCODE_SMALL_MODEL (the env vars name no small-model
+  // equivalent either).
+  const configuredModelId = process.env.OPENCODE_MODEL
+    ? (splitModelSlug(process.env.OPENCODE_MODEL)?.modelID ?? process.env.OPENCODE_MODEL)
+    : undefined;
   const modelLimit = resolveModelLimit();
   const modelModalities = resolveModelModalities();
   const modelsBlock =
@@ -752,8 +801,10 @@ export function buildOpenCodeConfig(
                 name: mid,
                 tool_call: true,
                 ...(mid === defaultModelId && modelOptions ? { options: modelOptions } : {}),
-                ...(mid === defaultModelId && modelLimit ? { limit: modelLimit } : {}),
-                ...(mid === defaultModelId && modelModalities ? { attachment: true, modalities: modelModalities } : {}),
+                ...(mid === configuredModelId && modelLimit ? { limit: modelLimit } : {}),
+                ...(mid === configuredModelId && modelModalities
+                  ? { attachment: true, modalities: modelModalities }
+                  : {}),
               },
             ]),
           ),

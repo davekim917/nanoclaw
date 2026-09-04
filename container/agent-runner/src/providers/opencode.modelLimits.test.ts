@@ -155,6 +155,39 @@ describe('buildOpenCodeConfig — model capability declarations', () => {
     expect(cfg.provider?.nvidia?.models?.['test-model']?.limit).toEqual({ context: 128000, output: 8192 });
   });
 
+  it('test_oc_limits_follow_configured_model_not_turn_override: a `-m` switch does not inherit them', () => {
+    // The env vars describe the model the operator measured — the group's
+    // configured default. A per-turn `-m` selects a different model, and with
+    // effort active runtimeConfigKey rebuilds the runtime, so inheriting these
+    // would declare the configured model's context window and media support on
+    // a model that has neither: premature or absent compaction, and modality
+    // claims the backend rejects.
+    stubGuardPresent();
+    process.env.OPENCODE_MODEL = 'nvidia/test-model';
+    process.env.OPENCODE_MODEL_CONTEXT_LIMIT = '128000';
+    process.env.OPENCODE_MODEL_OUTPUT_LIMIT = '8192';
+    process.env.OPENCODE_MODEL_INPUT_MODALITIES = 'image';
+
+    const cfg = buildOpenCodeConfig({}, { model: 'nvidia/other-model' }) as {
+      provider?: Record<string, { models?: Record<string, Record<string, unknown>> }>;
+    };
+    const overridden = cfg.provider?.nvidia?.models?.['other-model'];
+    expect(overridden).toEqual({ id: 'other-model', name: 'other-model', tool_call: true });
+    expect(overridden).not.toHaveProperty('limit');
+    expect(overridden).not.toHaveProperty('modalities');
+  });
+
+  it('a `-m` that names the configured model still gets the declarations', () => {
+    stubGuardPresent();
+    process.env.OPENCODE_MODEL = 'nvidia/test-model';
+    process.env.OPENCODE_MODEL_CONTEXT_LIMIT = '128000';
+    process.env.OPENCODE_MODEL_OUTPUT_LIMIT = '8192';
+    const cfg = buildOpenCodeConfig({}, { model: 'nvidia/test-model' }) as {
+      provider?: Record<string, { models?: Record<string, Record<string, unknown>> }>;
+    };
+    expect(cfg.provider?.nvidia?.models?.['test-model']?.limit).toEqual({ context: 128000, output: 8192 });
+  });
+
   it('test_oc_limits_half_set_is_dropped: a context limit with no output limit emits nothing', () => {
     stubGuardPresent();
     process.env.OPENCODE_MODEL_CONTEXT_LIMIT = '128000';

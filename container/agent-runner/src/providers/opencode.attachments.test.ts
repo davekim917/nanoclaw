@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'bun:test';
 
-import { buildAttachmentFileParts, buildPromptParts } from './opencode.js';
+import { buildAttachmentFileParts, buildPromptParts, forwardableAttachmentMime } from './opencode.js';
 
 const allPresent = () => true;
 const nonePresent = () => false;
@@ -28,11 +28,14 @@ describe('buildAttachmentFileParts', () => {
     expect(parts[0]?.mime).toBe('application/pdf');
   });
 
-  it('test_oc_attachment_skips_non_media: drops anything that is neither image nor pdf', () => {
+  it('test_oc_attachment_skips_non_media: drops anything the group has not opened the gate for', () => {
     const parts = buildAttachmentFileParts(
       [
         { filename: 'notes.txt', mime: 'text/plain', path: '/workspace/inbox/notes.txt' },
         { filename: 'archive.zip', path: '/workspace/inbox/archive.zip' },
+        // Undeclared modality: OpenCode would drop it anyway, substituting a
+        // "does not support video input" error, so forwarding only inflates
+        // the request.
         { filename: 'clip.mp4', mime: 'video/mp4', path: '/workspace/inbox/clip.mp4' },
       ],
       allPresent,
@@ -112,5 +115,52 @@ describe('buildPromptParts', () => {
   it('test_oc_prompt_parts_unchanged_without_media: a turn with no attachments is the old single text part', () => {
     expect(buildPromptParts('hello', undefined, allPresent)).toEqual([{ type: 'text', text: 'hello' }]);
     expect(buildPromptParts('hello', [], allPresent)).toEqual([{ type: 'text', text: 'hello' }]);
+  });
+});
+
+describe('forwardableAttachmentMime', () => {
+  it('test_oc_forward_images_and_pdfs_unconditionally: the long-standing behavior is unchanged', () => {
+    expect(forwardableAttachmentMime('image/png', {})).toBe(true);
+    expect(forwardableAttachmentMime('image/heic', {})).toBe(true);
+    expect(forwardableAttachmentMime('application/pdf', {})).toBe(true);
+    expect(forwardableAttachmentMime('text/plain', {})).toBe(false);
+    expect(forwardableAttachmentMime('application/zip', {})).toBe(false);
+  });
+
+  it('test_oc_forward_audio_video_only_when_declared: the advertised modalities are the forwarded ones', () => {
+    // resolveModelModalities accepts and advertises audio and video, but the
+    // forwarder used to drop both — so declaring either did nothing. One
+    // declaration now drives both gates.
+    expect(forwardableAttachmentMime('audio/ogg', {})).toBe(false);
+    expect(forwardableAttachmentMime('video/mp4', {})).toBe(false);
+
+    const audioOnly = { OPENCODE_MODEL_INPUT_MODALITIES: 'audio' };
+    expect(forwardableAttachmentMime('audio/ogg', audioOnly)).toBe(true);
+    expect(forwardableAttachmentMime('video/mp4', audioOnly)).toBe(false);
+
+    const both = { OPENCODE_MODEL_INPUT_MODALITIES: 'audio,video' };
+    expect(forwardableAttachmentMime('audio/mpeg', both)).toBe(true);
+    expect(forwardableAttachmentMime('video/webm', both)).toBe(true);
+
+    // Declaring an image modality does not open the audio gate.
+    expect(forwardableAttachmentMime('audio/ogg', { OPENCODE_MODEL_INPUT_MODALITIES: 'image' })).toBe(false);
+  });
+
+  it('test_oc_forward_audio_extension_fallback: a voice note with no channel mime resolves by extension', () => {
+    // The host names a Telegram voice note `.ogg` via its own TYPE_TO_EXT map,
+    // and reports no mimeType for it.
+    const previous = process.env.OPENCODE_MODEL_INPUT_MODALITIES;
+    process.env.OPENCODE_MODEL_INPUT_MODALITIES = 'audio';
+    try {
+      const parts = buildAttachmentFileParts(
+        [{ filename: 'voice.ogg', path: '/workspace/inbox/voice.ogg' }],
+        allPresent,
+      );
+      expect(parts).toHaveLength(1);
+      expect(parts[0]?.mime).toBe('audio/ogg');
+    } finally {
+      if (previous === undefined) delete process.env.OPENCODE_MODEL_INPUT_MODALITIES;
+      else process.env.OPENCODE_MODEL_INPUT_MODALITIES = previous;
+    }
   });
 });
