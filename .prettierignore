@@ -1,0 +1,7 @@
+# The upstream-ownership ratchet manifest is written by a custom serializer
+# (serializeManifest in src/upstream-ratchet.ts): one line per file entry,
+# sorted by path, so two PRs regenerating it conflict only on paths they both
+# touched. Prettier would reflow all 959 entries back into an indented shape and
+# turn the file into a merge minefield. Regenerate it, never format it:
+#   pnpm run ratchet:report -- --write
+src/upstream-ratchet.json

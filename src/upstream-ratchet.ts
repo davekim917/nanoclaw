@@ -104,7 +104,49 @@ export function readManifest(repoRoot: string = REPO_ROOT): UpstreamRatchetManif
 export function writeManifest(manifest: UpstreamRatchetManifest, repoRoot: string = REPO_ROOT): void {
   const target = manifestPath(repoRoot);
   fs.mkdirSync(path.dirname(target), { recursive: true });
-  fs.writeFileSync(target, JSON.stringify(sortManifest(manifest), null, 2) + '\n');
+  fs.writeFileSync(target, serializeManifest(manifest));
+}
+
+/**
+ * The manifest's ON-DISK form: ONE LINE PER FILE ENTRY, sorted by path.
+ *
+ * `JSON.stringify(…, null, 2)` would spread every entry over four to six lines
+ * and indent them, which makes this file a merge minefield: two PRs that each
+ * regenerate it after touching unrelated upstream-owned files would collide on
+ * the indented braces between their entries. One line per path means git's
+ * line-level merge resolves them cleanly — two regenerations conflict only on
+ * the paths they BOTH touched, which is exactly the case a human should look at.
+ *
+ * The file carries `upstream` and `files` and nothing else. No totals, no
+ * counts, no timestamps: an aggregate would change on every regeneration
+ * regardless of which path moved, so every PR would conflict on it, and it would
+ * be a second copy of a number `scripts/upstream-ratchet-report.ts` derives from
+ * the entries anyway.
+ *
+ * Deterministic by construction — sorted paths, fixed key order within an entry,
+ * optional flags only when true — so `--write` twice on an unchanged tree
+ * produces byte-identical output. `src/upstream-ratchet.json` is in
+ * `.prettierignore`, because prettier would reflow it straight back into the
+ * indented shape this avoids.
+ *
+ * Still ordinary JSON: `readManifest` is a plain `JSON.parse`.
+ */
+export function serializeManifest(manifest: UpstreamRatchetManifest): string {
+  const sorted = sortManifest(manifest);
+  const paths = Object.keys(sorted.files);
+  const lines = [`{"upstream":${JSON.stringify(sorted.upstream)},"files":{`];
+  paths.forEach((relPath, index) => {
+    const entry = sorted.files[relPath];
+    // Fixed key order, and an optional flag only when it is set — two runs over
+    // the same tree must produce the same bytes.
+    const fields = [`"diff":${entry.diff}`, `"sha256":${JSON.stringify(entry.sha256)}`];
+    if (entry.deleted === true) fields.push('"deleted":true');
+    if (entry.binary === true) fields.push('"binary":true');
+    const comma = index === paths.length - 1 ? '' : ',';
+    lines.push(`${JSON.stringify(relPath)}:{${fields.join(',')}}${comma}`);
+  });
+  lines.push('}}');
+  return lines.join('\n') + '\n';
 }
 
 /** The manifest with `files` in path order, so a regeneration produces a stable diff. */

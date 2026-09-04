@@ -10,16 +10,28 @@ back toward upstream freely, and may only move further away as a named, justifie
 **pinned** commit — no exclusions, so nothing can diverge by being left off the list. Paths the fork
 *added* are out of scope: they are not upstream-owned and there is nothing to ratchet against.
 
-```json
-{
-  "upstream": "b76fcb3db0236b36a4d50bed02e89eff472d0e67",
-  "files": {
-    "src/host-sweep.ts": { "diff": 1462, "sha256": "…" },
-    "docs/gone.md":      { "diff": 40, "sha256": null, "deleted": true },
-    "assets/logo.png":   { "diff": 1, "sha256": "…", "binary": true }
-  }
-}
 ```
+{"upstream":"b76fcb3db0236b36a4d50bed02e89eff472d0e67","files":{
+"assets/logo.png":{"diff":1,"sha256":"…","binary":true},
+"docs/gone.md":{"diff":40,"sha256":null,"deleted":true},
+"src/host-sweep.ts":{"diff":1504,"sha256":"…"}
+}}
+```
+
+**One line per file entry, sorted by path, and nothing but `upstream` and `files`.** That layout is the
+point, not a quirk: pretty-printed JSON spreads each entry over four to six indented lines, so two PRs that
+each regenerate the manifest after touching unrelated upstream-owned files collide on the braces between
+their entries. One line per path lets git merge them, and two regenerations conflict only on the paths they
+**both** touched. No totals, no counts, no timestamps — an aggregate would change on every regeneration
+whatever moved, so every PR would conflict on it, and the report derives those numbers from the entries
+anyway.
+
+The file is written by `serializeManifest` (`src/upstream-ratchet.ts`) and is in `.prettierignore`, because
+prettier would reflow it straight back into the indented shape. It is still ordinary JSON — `readManifest` is
+a plain `JSON.parse`. Never hand-edit or reformat it; regenerate it. The serializer is deterministic (sorted
+paths, fixed key order, optional flags only when true), so `--write` twice on an unchanged tree produces
+byte-identical output, and `src/upstream-ratchet.test.ts` fails if the committed bytes are not exactly what
+the serializer would emit.
 
 | Field | Meaning |
 |---|---|
@@ -52,6 +64,18 @@ pnpm run ratchet:report -- --upstream <sha>  # re-pin to a newer upstream commit
 
 Useful flags: `--accept <path>` (repeatable) and `--accept-all` permit growth in `--write`; `--root <dir>`
 points at another checkout or worktree; `--json` gives machine output.
+
+The default report prints a per-file table — verdict, path, recorded diff, current diff, delta — grouped by
+verdict, then the one-line summary. Paste the table into the PR body when a diff moved:
+
+```
+GROWTH (1)
+  GROWTH    src/host-sweep.ts                                          1,504 → 1,505 (+1)
+
+959 upstream-owned files at b76fcb3d: 435 modified, 294 deleted in fork, 230 byte-identical, 0 binary
+UNCHANGED 958   (measured in 240 ms)
+729 divergent files, 127,333 diff lines vs b76fcb3d (Δ 1)
+```
 
 The pinned commit has to be in the local clone. If it is not, the script exits **2** and prints the
 `git fetch upstream <sha>` to run.

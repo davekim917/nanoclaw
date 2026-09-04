@@ -24,8 +24,10 @@ import {
   checkTree,
   formatFindings,
   hashFile,
+  MANIFEST_REL,
   readManifest,
   REGENERATE_HINT,
+  serializeManifest,
   type UpstreamRatchetManifest,
 } from './upstream-ratchet.js';
 
@@ -54,6 +56,25 @@ describe('upstream-ownership ratchet', () => {
 
     // Sorted by path, so a regeneration is a readable diff rather than a reshuffle.
     expect(Object.keys(manifest.files)).toEqual([...Object.keys(manifest.files)].sort());
+
+    // No aggregate fields. A total or a timestamp in the file would change on
+    // every regeneration whatever moved, so every PR would collide on it, and it
+    // would duplicate a number the report script derives from the entries.
+    expect(Object.keys(manifest), 'the manifest carries only "upstream" and "files"').toEqual(['upstream', 'files']);
+
+    // The ON-DISK bytes are exactly the canonical serialization: one line per
+    // file entry, sorted, fixed key order, optional flags only when true. This
+    // is three guarantees in one assertion — the merge-friendly layout is not
+    // just a convention, `--write` is idempotent on an unchanged tree (the same
+    // input can only produce these bytes), and prettier has not reflowed the
+    // file back into an indented shape (it is in .prettierignore for that).
+    const onDisk = fs.readFileSync(path.join(REPO_ROOT, MANIFEST_REL), 'utf8');
+    expect(
+      onDisk,
+      `${MANIFEST_REL} is not in canonical form — do not hand-edit or reformat it, regenerate: ${REGENERATE_HINT}`,
+    ).toBe(serializeManifest(manifest));
+    const bodyLines = onDisk.trimEnd().split('\n').slice(1, -1);
+    expect(bodyLines.length, 'one line per file entry').toBe(entries.length);
   });
 
   it('every upstream-owned file matches the manifest — a divergence change without a regenerated manifest fails', () => {
