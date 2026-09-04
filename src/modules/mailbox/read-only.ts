@@ -96,7 +96,6 @@ import {
   SessionDbMissingError,
   sessionDbPathIsGone,
 } from './openers.js';
-import { sessionMailboxPath } from '../../mailbox/sqlite/paths.js';
 
 /**
  * Which session to read, and where its data lives.
