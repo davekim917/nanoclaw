@@ -7,7 +7,9 @@ description: "Bring upstream nanocoai/nanoclaw work into this production-critica
 
 This fork diverged from upstream trunk in 2026 around the spawn, sweep, router, delivery, session-manager and poll-loop paths, on a host the two production workgroups use daily. As of 2026-09-04 the fork is **490 commits behind upstream/main** (488 of those predate 2026-09-02 — upstream shipped only 2 more in the two days since). A read-only dry-run (`git merge-tree --write-tree`) touches 389 files on both sides, ~100 of them with real content conflicts, concentrated by area: `agent-runner/src` 26, `modules/permissions` 12, `setup` 11, `.claude` 11, `docs` 8, `cli/resources` 7, `agent-to-agent` 6, `approvals` 5, `scheduling` 4. A full `git merge upstream/main` is still never attempted directly — it would touch every one of the fork's own architectural seams at once. This skill replaces "merge and resolve" with "inventory, decide per theme, port one theme per PR, deploy with a gate". `/update-nanoclaw` is still the tool for the cherry-pick mechanics and the A–F audit; this skill decides *what* to feed it and how to land it without downtime.
 
-**Standing decisions (do not re-litigate without a trigger):** the agent-mailbox seam and the host-lifecycle/host-sweep-duty-registry seam are now **ADOPTED**, built in the fork's own shape rather than upstream's literal `src/mailbox/`/`src/drivers/` code (`docs/specs/upstream-mailbox-seam/plan.md`, `docs/specs/upstream-host-sweep-seam/plan.md`). All host session-DB access funnels through `src/modules/mailbox/` — the host allowlist is down to the two documented KEEP-PATCH exemptions — and `src/host-sweep.ts` is driver + registry only, with duties registered in `src/modules/sweep-*/` behind a 41-entry pinned registration table (`src/host-sweep-registry.test.ts`). When an upstream change lands in one of these areas, **port it INTO the seam**: take upstream's driver/façade shape, keep the fork's own registrations and module bodies, and re-run the drift tests (§1 below) — never hand-merge a seam file directly. The **async central-DB and session-driver** seams remain **DECLINED**; re-open triggers are unchanged in fork issue #234. Upstream's Slack Agents provisioning model is still DECLINED (fork already runs one app per agent via suffix tokens).
+**Standing decisions (do not re-litigate without a trigger):** the agent-mailbox seam and the host-lifecycle/host-sweep-duty-registry seam are **ADOPTED**, built in the fork's own shape rather than upstream's literal `src/mailbox/`/`src/drivers/` code (`docs/specs/upstream-mailbox-seam/plan.md`, `docs/specs/upstream-host-sweep-seam/plan.md`). All host session-DB access funnels through `src/modules/mailbox/` — the host allowlist is down to the two documented KEEP-PATCH exemptions — and `src/host-sweep.ts` is driver + registry only, with duties registered in `src/modules/sweep-*/` behind a 41-entry pinned registration table (`src/host-sweep-registry.test.ts`). When an upstream change lands in one of these areas, **port it INTO the seam**: take upstream's driver/façade shape, keep the fork's own registrations and module bodies, and re-run the drift tests (§1 below) — never hand-merge a seam file directly.
+
+The remaining three items fork issue #234 recorded as declined on 2026-09-02 are **no longer declined** — treat that issue as a record of a decision since reversed, not as current guidance. **Async central-DB** (upstream's `[BREAKING] refactor(db): adopt async central database safely`, #3334) is being ported first, as **seam 3**: the fork's sync `better-sqlite3` central-DB access conflicts with upstream's async driver in nearly every theme, so seam 3 goes in ahead of general theme ports rather than being re-derived per theme forever. The **session-driver seam** (`adoptRunningSessions()`) plus the **durable-host coordination** rollup (upstream #3653: claim fencing, durable delivery attempts, durable respawn intent) are a committed **seam 4** — restart survival without pausing agent work is the operator's own stated must-have and needs both halves, landing alongside a redesign of the fork's boot-time workgroup shared-FS reconcile (which today forces every container to stop on host start, contradicting session adoption). Upstream's **Slack Agents provisioning/onboarding model is in scope**: port it and solve the suffix-token compatibility (the fork's `SLACK_BOT_TOKEN_<SUFFIX>` per-agent-app model) as an engineering problem, with a migration path for the fork's existing apps, rather than treating the incompatibility as a reason to decline. **Nothing from seam 3, seam 4, or the provisioning port merges or deploys without the operator's explicit go** — triage, plans, and PRs may proceed ahead of that, deploys don't.
 
 ## When to use
 
@@ -77,6 +79,10 @@ ln -s /home/ubuntu/nanoclaw-v2/node_modules "$W/node_modules"   # read-only use;
 git -C "$W" cherry-pick -x <sha>...                                # resolve against fork intent
 (cd "$W" && node_modules/.bin/tsc --noEmit -p tsconfig.json)
 (cd "$W" && ionice -c3 nice -n 10 node_modules/.bin/vitest run --pool=forks --maxWorkers=2 <targeted files>)   # load < 8; never the whole suite
+# If the theme touches container/agent-runner/**: the root tsconfig only includes src/**/*, and the root
+# vitest config excludes runner tests (they run under Bun, not Node) — the two commands above never see
+# runner code at all. Verify it separately, including the mandatory hermeticity gate:
+(cd "$W/container/agent-runner" && bun install && bun run typecheck && bun run test)
 (cd /home/ubuntu/nanoclaw-v2 && pnpm run check:public-boundary -- --root "$W" --index)   # scans $W's commits; run from the live checkout only so pnpm/tsx resolve
 (cd "$W" && gh pr create ...)   # gh's head branch is inferred from cwd — must run from $W; then run the pr-review-loop skill
 git -C /home/ubuntu/nanoclaw-v2 worktree remove "$W"               # from the live checkout, after the PR
@@ -107,6 +113,11 @@ The live checkout `/home/ubuntu/nanoclaw-v2` is shared by every session in the c
 cd /home/ubuntu/nanoclaw-v2
 # 1. Announce BUILD START first — no merges or pushes to main by anyone (including origin) until the gate result lands.
 gh pr merge <n> --merge            # merge commit, never squash (loses upstream topology)
+gh pr view <n> --json state,mergeCommit --jq '.state, .mergeCommit.oid'   # must print MERGED and a real sha before pulling —
+                                    # `gh pr merge` only guarantees the merge if it landed immediately; with required
+                                    # checks pending it enables auto-merge/queues instead, and a pull right after can
+                                    # silently stay on the OLD origin/main (the sha-equality check downstream still
+                                    # "passes" for that old commit)
 git pull --ff-only origin main     # HEAD must now equal origin/main; a non-fast-forward here means announce again and retry
 ```
 
@@ -125,7 +136,7 @@ node -p "require('./dist/BUILD_INFO.json').sha" && git rev-parse HEAD && git rev
 grep -c <a-symbol-the-PR-introduced> dist/<file>.js   # content proof — a sha match alone is not proof the PR is in dist
 ```
 
-Restart only at a moment with **zero `Status delivered` lines in the previous 120 s** — a short waiter loop checking that is fine — then checkpoint the logs (they're append-only across restarts; logrotate is daily via `copytruncate`, not per-restart, so a whole-file grep after the first successful boot ever is permanently non-zero and proves nothing about *this* restart) before restarting:
+**Restart only when the fleet is actually quiet** — the full rule (`docs/specs/upstream-mailbox-seam/plan.md` §6): no deliveries for 10 minutes and no container younger than 5 minutes. "No deliveries" means both delivery log lines, not just one — `src/delivery.ts` logs `Status delivered` for status-message updates and a separate `Message delivered` for ordinary chat replies; a check that greps only the first can call the fleet quiet while a container is mid-turn on a normal reply. A short waiter loop against both lines, plus `docker ps` for container age, is fine. Then checkpoint the logs (they're append-only across restarts; logrotate is daily via `copytruncate`, not per-restart, so a whole-file grep after the first successful boot ever is permanently non-zero and proves nothing about *this* restart) before restarting:
 
 ```bash
 LOG0=$(wc -l < logs/nanoclaw.log 2>/dev/null || echo 0)
@@ -190,7 +201,7 @@ The upstream sync runs with several sessions up at once, sharing the fork and th
 1. **Rebuilding a native addon while the host runs segfaults it.** `prebuild-install` overwrites `better_sqlite3.node` in place (hardlinked into the pnpm store); the live process's mmap changes underneath and it dies with SIGSEGV + a 5 GB core dump. Stop the service first. (2026-09-02, ~30 s outage + false unit alert.)
 2. **Node ≥22.23 honors `NODE_USE_ENV_PROXY=1`; Node 20 ignored it.** The daemon carries `HTTPS_PROXY` = the OneCLI gateway. On Node 22 the host's own `fetch()` to the OneCLI control API (`127.0.0.1:10254`) went through the proxy and failed → every spawn refused for 11 minutes with the host "healthy". Fixed by `/etc/systemd/system/nanoclaw-v2.service.d/node22-env-proxy.conf` (`ExecStart=… onecli run -- /usr/bin/env -u NODE_USE_ENV_PROXY /usr/bin/node …`). The tell is `[UNDICI-EHPA] EnvHttpProxyAgent is experimental` on process start. Keep the drop-in; verify with the environ grep in the gate.
 3. **`/update-nanoclaw`'s live dry-run merge and `migrate-nanoclaw` are wrong tools here** — the first edits the live tree, the second assumes customizations small enough to extract and replay.
-4. **`/migrate-slack-agents` must not be run** — it detects an unsuffixed `SLACK_BOT_TOKEN` (we have none) and its later phases assume upstream's provisioning substrate.
+4. **`/migrate-slack-agents` — not until the provisioning port lands.** As shipped today it detects an unsuffixed `SLACK_BOT_TOKEN` (the fork has none, only the suffixed per-agent form) and its later phases assume upstream's provisioning substrate outright; running it now would misfire. The provisioning model itself is in scope (standing decisions, above) — this gotcha retires once the seam that solves suffix-token compatibility and the migration path lands, not before.
 5. **Worker reports about "silently skipped migrations" are wrong** — the ledger is name-keyed. Renumber files, keep names.
 6. **A pre-existing ~28% intermittent `OneCLI gateway not applied` rate exists (issue #239)** — one refusal after a restart is not a regression; zero successes is.
 7. **The image's `pnpm --version` may not equal `PNPM_VERSION`** (issue #240) — verify pins *inside* the built image, not from the Dockerfile.
@@ -203,7 +214,7 @@ The upstream sync runs with several sessions up at once, sharing the fork and th
 ## References
 
 - Seam design + PR series + deploy protocol: `docs/specs/upstream-mailbox-seam/plan.md`, `docs/specs/upstream-host-sweep-seam/plan.md`.
-- Decline record + re-open triggers (async central-DB, session-driver): fork issue #234.
+- Original decline record, now partially reversed (see "Standing decisions" above for current state): fork issue #234; the reversal itself and the operator's own words on it: memory `project_upstream_sync_phase_2026_09_04`.
 - Node 22 runbook + incidents: memory `project_node22_upgrade_2026_09_02`.
 - Live-checkout single-writer rule: memory `feedback_live_checkout_single_writer`.
 - Boundary hook / real-id scrubbing: memory `feedback_boundary_hook_flags_names_in_docs`.
