@@ -1041,8 +1041,9 @@ export async function applyRepositoryTransferAction(content: Record<string, unkn
               ? `Repository handoff requested for ${repo}, but this topic still has durable active or continued work. ` +
                 'Finish or checkpoint that work and let the continuation chain complete; the requesting topic was told ' +
                 'to retry. Do not delete or prune anything, and no host action is needed.'
-              : `Repository handoff for ${repo} failed before completion; the checkout remains with this topic and no ` +
-                `source work was deleted. The requesting topic received the same recovery error: ${message}`,
+              : `Repository handoff finalization for ${repo} encountered an error. No source work was discarded. ` +
+                'Do not recreate or prune the checkout; the requesting topic can safely retry using the durable ' +
+                `transfer state. Recovery error: ${message}`,
             sender: 'system',
             senderId: 'system',
           }),

@@ -1077,6 +1077,12 @@ describe('exact topic transfer', () => {
     expect(readTransferTombstone(source, 'proj', hostActionDataDir)?.phase).toBe('moved');
     expect(durableBarriers).toEqual(new Set([sourceEpoch, destinationEpoch]));
     expect(hostActionMocks.wakeRepositoryMountSessions).not.toHaveBeenCalled();
+    const sourceFailure = hostActionMocks.writeSessionMessageIfNew.mock.calls.find(
+      (call) => (call[2] as { id: string }).id === `repository-transfer-source-failed-${requestId}`,
+    )?.[2] as { content: string };
+    const sourceFailureText = JSON.parse(sourceFailure.content).text as string;
+    expect(sourceFailureText).toContain('handoff finalization');
+    expect(sourceFailureText).not.toContain('remains with this topic');
 
     await applyRepositoryTransferAction(action, destinationSession);
     expect(observedEpochs).toEqual([sourceEpoch, destinationEpoch, sourceEpoch, destinationEpoch]);

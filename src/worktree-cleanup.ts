@@ -32,6 +32,7 @@ import { log } from './log.js';
 import {
   canonicalRepoDir,
   defaultTopicBranch,
+  ensureRepositoryLock,
   isRepositoryName,
   resolveRepositoryWorkUnit,
   topicStateDir,
@@ -1348,6 +1349,7 @@ function writePendingPrunes(dataDir: string, entries: PendingWorktreeRemoval[]):
 interface MissingWorktreeAdminRecord {
   adminDir: string;
   owner: string;
+  gitdir: string;
 }
 
 /** Read Git's private linked-worktree records without allowing `prune` to
@@ -1378,7 +1380,7 @@ function linkedWorktreeAdminRecords(canonical: string): MissingWorktreeAdminReco
       if (!stat.isFile() || stat.isSymbolicLink()) return null;
       const gitdir = fs.readFileSync(pointer, 'utf8').trim();
       if (!path.isAbsolute(gitdir) || path.basename(gitdir) !== '.git') return null;
-      records.push({ adminDir, owner: path.dirname(path.resolve(gitdir)) });
+      records.push({ adminDir, owner: path.dirname(path.resolve(gitdir)), gitdir });
     }
     return records;
   } catch {
@@ -1485,9 +1487,69 @@ function removeMissingWorktreeRegistration(entry: PendingWorktreeRemoval, dataDi
     restorePlaceholder();
     return false;
   }
-  if (git(canonical, ['worktree', 'remove', '--force', target.owner]) === null) {
+  let lockFd: number | null = null;
+  let adminFd: number | null = null;
+  try {
+    const lockPath = ensureRepositoryLock(entry.workgroupId, entry.repo, dataDir);
+    lockFd = fs.openSync(lockPath, fs.constants.O_RDWR | fs.constants.O_NOFOLLOW);
+    adminFd = fs.openSync(target.adminDir, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+    const lockStat = fs.fstatSync(lockFd);
+    const adminStat = fs.fstatSync(adminFd);
+    if (!lockStat.isFile() || !adminStat.isDirectory()) throw new Error('repository cleanup lock state is invalid');
+
+    // `flock` owns the same inode used by container create_worktree. Once held,
+    // re-prove that both path ownership and the recoverable private index are
+    // still exactly what this pass observed. File descriptors 3 and 4 pin the
+    // lock/admin identities across path replacement; cooperating writers cannot
+    // swap in a newly recreated worktree between this proof and the removal.
+    const script = [
+      'set -eu',
+      'lock_path=$1',
+      'admin=$2',
+      'owner=$3',
+      'expected_gitdir=$4',
+      'canonical=$5',
+      'shift 5',
+      '[ "$lock_path" -ef /dev/fd/3 ] || exit 73',
+      '[ "$admin" -ef /dev/fd/4 ] || exit 74',
+      '[ ! -e "$owner" ] && [ ! -L "$owner" ] || exit 75',
+      '[ ! -e "$admin/locked" ] && [ ! -L "$admin/locked" ] || exit 76',
+      'IFS= read -r actual_gitdir < "$admin/gitdir" || exit 77',
+      '[ "$actual_gitdir" = "$expected_gitdir" ] || exit 78',
+      'git "$@" --git-dir="$admin" diff-index --cached --quiet HEAD -- || exit 79',
+      'exec git "$@" -C "$canonical" worktree remove --force "$owner"',
+    ].join('\n');
+    execFileSync(
+      'flock',
+      [
+        '-x',
+        '-w',
+        '120',
+        lockPath,
+        'sh',
+        '-c',
+        script,
+        'sh',
+        lockPath,
+        target.adminDir,
+        target.owner,
+        target.gitdir,
+        canonical,
+        ...safeGitArgs([]),
+      ],
+      {
+        cwd: canonical,
+        env: safeGitEnv(),
+        stdio: ['ignore', 'pipe', 'pipe', lockFd, adminFd],
+        timeout: 125_000,
+      },
+    );
+  } catch {
     restorePlaceholder();
     return false;
+  } finally {
+    if (adminFd !== null) fs.closeSync(adminFd);
+    if (lockFd !== null) fs.closeSync(lockFd);
   }
   const after = linkedWorktreeAdminRecords(canonical);
   const removed = after !== null && !after.some((record) => path.resolve(record.owner) === path.resolve(target.owner));
@@ -1516,7 +1578,7 @@ function completeLegacyPendingRemoval(entry: PendingWorktreeRemoval, dataDir: st
     const clean = linkedIndexMatchesHead(canonical, record.adminDir);
     if (clean === null) return false;
     if (!clean) continue;
-    if (git(canonical, ['worktree', 'remove', '--force', record.owner]) === null) return false;
+    if (!removeMissingWorktreeRegistration({ ...entry, worktreePath: record.owner }, dataDir)) return false;
   }
   return true;
 }

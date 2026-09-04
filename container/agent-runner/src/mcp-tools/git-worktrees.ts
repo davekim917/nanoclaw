@@ -475,11 +475,14 @@ async function createLinkedWorktree(context: RepositoryContext, branchArg: strin
   }
 
   let owner = branchOwner(context.gitDir, branch);
-  if (owner && worktreePathIsMissing(owner)) {
-    // A killed or externally removed topic can leave only Git's linked-worktree
+  if (owner && canonicalPath(owner) === canonicalPath(context.worktree) && worktreePathIsMissing(owner)) {
+    // A killed or externally removed current topic can leave only Git's linked-worktree
     // registration behind. The branch ref survives removal, but a private
     // linked index may contain the last recoverable staged blobs. Remove only
-    // this proven-clean registration: repository-wide prune would also delete
+    // this proven-clean registration only when its path is this container's
+    // observable topic mount. Sibling topic paths are intentionally unmounted,
+    // so ENOENT for them is not evidence that the host checkout is missing.
+    // Repository-wide prune would also delete
     // unrelated missing owners whose private indexes still hold staged work.
     const blocker = missingOwnerRemovalBlocker(context, owner);
     if (blocker) {

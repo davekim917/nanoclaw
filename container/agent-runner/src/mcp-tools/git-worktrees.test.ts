@@ -265,7 +265,9 @@ describe('topic-linked worktree topology', () => {
     expect(git(canonical, ['branch', '--show-current'])).toBe('main');
   });
 
-  test('a missing unlocked owner is removed and its unpushed branch is reattached losslessly', async () => {
+  test('an unmounted managed sibling is never deregistered and is routed through exact transfer', async () => {
+    const sourceLocator = `thread-${'b'.repeat(32)}`;
+    firstTopic = useTopic(sourceLocator, 'thread:slack:C1:1.1');
     expect((await createWorktreeTool.handler({ repo: 'proj', branch: 'surviving-feature' })).isError).toBeFalsy();
     const abandoned = join(firstTopic, 'proj');
     writeFileSync(join(abandoned, 'preserved.txt'), 'committed before directory loss\n');
@@ -279,10 +281,11 @@ describe('topic-linked worktree topology', () => {
     const destinationTopic = useTopic('topic-two', 'thread:slack:C1:2.2');
 
     const response = await createWorktreeTool.handler({ repo: 'proj', branch: 'surviving-feature' });
-    const recovered = join(destinationTopic, 'proj');
-    expect(response.isError).toBeFalsy();
-    expect(git(recovered, ['rev-parse', 'HEAD'])).toBe(preservedHead);
-    expect(readFileSync(join(recovered, 'preserved.txt'), 'utf8')).toBe('committed before directory loss\n');
+    expect(response.isError).toBe(true);
+    expect(response.content[0].text).toContain(`continueFromThreadId: '${sourceLocator}'`);
+    expect(existsSync(join(destinationTopic, 'proj'))).toBe(false);
+    expect(git(canonical, ['rev-parse', 'refs/heads/surviving-feature'])).toBe(preservedHead);
+    expect(git(canonical, ['worktree', 'list', '--porcelain'])).toContain(`worktree ${abandoned}`);
   });
 
   test('the current topic self-heals its own missing registration', async () => {
@@ -307,13 +310,11 @@ describe('topic-linked worktree topology', () => {
     git(canonical, ['worktree', 'lock', '--reason', 'operator hold', locked]);
     const preservedHead = git(locked, ['rev-parse', 'HEAD']);
     rmSync(locked, { recursive: true, force: true });
-    const destinationTopic = useTopic('topic-two', 'thread:slack:C1:2.2');
-
     const response = await createWorktreeTool.handler({ repo: 'proj', branch: 'locked-feature' });
     expect(response.isError).toBe(true);
     expect(response.content[0].text).toContain('automatic cleanup refused');
     expect(response.content[0].text).toContain('is locked');
-    expect(existsSync(join(destinationTopic, 'proj'))).toBe(false);
+    expect(existsSync(locked)).toBe(false);
     expect(git(canonical, ['rev-parse', 'refs/heads/locked-feature'])).toBe(preservedHead);
   });
 
@@ -325,13 +326,11 @@ describe('topic-linked worktree topology', () => {
     const adminDir = git(staged, ['rev-parse', '--absolute-git-dir']);
     const indexBefore = readFileSync(join(adminDir, 'index'));
     rmSync(staged, { recursive: true, force: true });
-    const destinationTopic = useTopic('topic-two', 'thread:slack:C1:2.2');
-
     const response = await createWorktreeTool.handler({ repo: 'proj', branch: 'staged-feature' });
     expect(response.isError).toBe(true);
     expect(response.content[0].text).toContain('automatic cleanup refused');
     expect(response.content[0].text).toContain('has staged changes');
-    expect(existsSync(join(destinationTopic, 'proj'))).toBe(false);
+    expect(existsSync(staged)).toBe(false);
     expect(readFileSync(join(adminDir, 'index'))).toEqual(indexBefore);
     expect(git(canonical, ['worktree', 'list', '--porcelain'])).toContain(`worktree ${staged}`);
   });
@@ -354,16 +353,14 @@ describe('topic-linked worktree topology', () => {
     const cleanHead = git(cleanOwner, ['rev-parse', 'HEAD']);
     rmSync(cleanOwner, { recursive: true, force: true });
 
-    const destinationTopic = useTopic('topic-three', 'thread:slack:C1:3.3');
     const response = await createWorktreeTool.handler({ repo: 'proj', branch: 'clean-sibling' });
-    const recovered = join(destinationTopic, 'proj');
     expect(response.isError).toBeFalsy();
-    expect(git(recovered, ['rev-parse', 'HEAD'])).toBe(cleanHead);
-    expect(readFileSync(join(recovered, 'committed.txt'), 'utf8')).toBe('keep this commit\n');
+    expect(git(cleanOwner, ['rev-parse', 'HEAD'])).toBe(cleanHead);
+    expect(readFileSync(join(cleanOwner, 'committed.txt'), 'utf8')).toBe('keep this commit\n');
     expect(readFileSync(join(stagedAdmin, 'index'))).toEqual(stagedIndex);
     const worktrees = git(canonical, ['worktree', 'list', '--porcelain']);
     expect(worktrees).toContain(`worktree ${stagedSibling}`);
-    expect(worktrees).not.toContain(`worktree ${cleanOwner}`);
+    expect(worktrees).toContain(`worktree ${cleanOwner}`);
   });
 
   test('linked-worktree-fetch-commit-push-works-through-scoped-git-metadata', async () => {

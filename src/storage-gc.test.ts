@@ -19,6 +19,7 @@ const state = vi.hoisted(() => ({
   /** Make the NEXT targeted `git worktree remove` call fail, then
    *  self-clear — everything else passes through to the real execFileSync. */
   failRemovalOnce: false,
+  beforeRemovalLock: null as (() => void) | null,
 }));
 
 vi.mock('child_process', async (importOriginal) => {
@@ -27,13 +28,19 @@ vi.mock('child_process', async (importOriginal) => {
     ...actual,
     execFileSync: (...args: Parameters<typeof actual.execFileSync>) => {
       const [file, fileArgs] = args;
-      if (
-        state.failRemovalOnce &&
-        file === 'git' &&
+      const targetedRemoval =
+        file === 'flock' &&
         Array.isArray(fileArgs) &&
-        fileArgs.includes('worktree') &&
-        fileArgs.includes('remove')
-      ) {
+        fileArgs[4] === 'sh' &&
+        fileArgs[5] === '-c' &&
+        typeof fileArgs[6] === 'string' &&
+        fileArgs[6].includes('worktree remove --force');
+      if (file === 'flock' && targetedRemoval && state.beforeRemovalLock) {
+        const hook = state.beforeRemovalLock;
+        state.beforeRemovalLock = null;
+        hook();
+      }
+      if (state.failRemovalOnce && file === 'flock' && targetedRemoval) {
         state.failRemovalOnce = false;
         throw new Error('simulated: targeted deregistration still failing');
       }
@@ -271,6 +278,7 @@ beforeEach(() => {
   state.call = 0;
   state.failAtCall = null;
   state.failRemovalOnce = false;
+  state.beforeRemovalLock = null;
   delete process.env.NANOCLAW_STORAGE_GC;
   delete process.env.NANOCLAW_TOPIC_IDLE_RECLAIM_DAYS;
 });
@@ -1182,6 +1190,32 @@ describe('storage GC — apply mode', () => {
     expect(fs.existsSync(journalPath)).toBe(false);
     expect(git(canonical, ['worktree', 'list', '--porcelain'])).not.toContain(`worktree ${worktree}`);
     expect(() => git(canonical, ['worktree', 'add', '-q', `${worktree}-2`, branch])).not.toThrow();
+  });
+
+  it.skipIf(!hasTrash)('#185: a checkout recreated before lock acquisition is preserved exactly', () => {
+    const { topicDir, worktree, canonical, branch } = topicFixture('thread-idle-remove-race');
+    const repo = path.basename(worktree);
+    fs.rmSync(topicDir, { recursive: true, force: true });
+    const journalPath = path.join(state.dataDir, '.gc-pending-prunes.json');
+    const pending = [{ workgroupId: WG, repo, worktreePath: worktree }];
+    fs.writeFileSync(journalPath, JSON.stringify(pending));
+    state.rows = [sessionRow('thread-idle-remove-race', 'folder-a', 'active', 0)];
+    state.beforeRemovalLock = () => {
+      // Model create_worktree winning the repository lock before GC does: it
+      // removes the stale admin, creates a fresh checkout at the same path,
+      // and starts new untracked work before GC acquires the lock.
+      git(canonical, ['worktree', 'remove', '--force', worktree]);
+      fs.mkdirSync(path.dirname(worktree), { recursive: true });
+      git(canonical, ['worktree', 'add', '-q', worktree, branch]);
+      fs.writeFileSync(path.join(worktree, 'new-agent-work.txt'), 'must survive the stale retry\n');
+    };
+    process.env.NANOCLAW_STORAGE_GC = 'apply';
+
+    runStorageGcOnce(state.dataDir, state.groupsDir);
+
+    expect(fs.readFileSync(path.join(worktree, 'new-agent-work.txt'), 'utf8')).toBe('must survive the stale retry\n');
+    expect(git(canonical, ['worktree', 'list', '--porcelain'])).toContain(`worktree ${worktree}`);
+    expect(JSON.parse(fs.readFileSync(journalPath, 'utf8'))).toEqual(pending);
   });
 
   it.skipIf(!hasTrash)('Codex P2: aborts collection when the prune journal cannot be persisted', () => {
