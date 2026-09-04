@@ -199,6 +199,11 @@ import {
   SWEEP_DUTY_INVENTORY,
 } from '../../host-sweep.js';
 import { log } from '../../log.js';
+// The integration case below needs a FULLY MIGRATED central DB: it drives the
+// real `updateSession` and the real `withQuietInvalidationSync`, both of which
+// write columns a hand-rolled `sessions` table does not have.
+import { closeDb, initTestDb, runMigrations } from '../../db/index.js';
+import { taskThreadId } from '../../db/sessions.js';
 // Side-effect import: registers 'sweep-scheduled-move' as a duty source
 // (registerSweepDutySource calls the registrar immediately, and records it
 // so it survives `_resetSweepRegistryForTesting()` below) — without this
@@ -206,6 +211,11 @@ import { log } from '../../log.js';
 // the D3/D4 describe's beforeEach would register it too late for the
 // "registered duty" describe above, which runs first.
 import './index.js';
+// …and the scheduling family, whose S19 (spent-task-session GC) is the OTHER
+// half of the interaction the integration case below drives: it runs in
+// `session:tail` on every tick and `recoverMoveIntents` only ever arrives
+// afterwards, on `tick:housekeeping`.
+import '../sweep-scheduling/index.js';
 
 describe('the child_process tripwire bites when a seam mock is removed', () => {
   it('throws and records the attempted spawn', async () => {
@@ -452,6 +462,83 @@ describe('recoverMoveIntents (D3) + pruneAuditBodies (D4)', () => {
   // live task (exactly the crash state this recovery exists for) and can mark it
   // quiet; the row restored here is then due work hiding behind a mark taken
   // seconds earlier, which S2-PR15 would carry across a restart.
+  // ── Codex delta — the two duties, in production phase order ───────────────
+  //
+  // The interaction, not either half: S19 (spent-task-session GC, session:tail)
+  // runs on every tick and `recoverMoveIntents` (T11, tick:housekeeping) only
+  // acts on intents older than one sweep interval, so on a stopped session the
+  // GC ALWAYS gets there first. Both are the REGISTERED duties, the central DB
+  // is fully migrated, and `withQuietInvalidationSync` is the real one — which
+  // together is the only arrangement in which the bug could have been seen.
+  it('S19 leaves the source open and T11 then restores the move', async () => {
+    const db = initTestDb();
+    runMigrations(db);
+    mockGetDb.mockImplementation(() => db);
+    useRealQuietInvalidation.on = true;
+    _resetSweepRegistryForTesting();
+    try {
+      const iso = new Date().toISOString();
+      const thread = taskThreadId('ser-gc');
+      db.prepare(`INSERT INTO agent_groups (id, name, folder, created_at) VALUES ('src-ag', 'src', 'src', ?)`).run(iso);
+      db.prepare(
+        `INSERT INTO sessions (id, agent_group_id, messaging_group_id, thread_id, status, container_status,
+                               last_active, created_at)
+         VALUES ('sess-gc', 'src-ag', NULL, ?, 'active', 'stopped', ?, ?)`,
+      ).run(thread, iso, iso);
+
+      // The crash state: the move cancelled the source series and died before
+      // the target insert, so the inbound has NO live rows and the intent is
+      // unresolved. That is indistinguishable from a spent task session.
+      const inbound = seedInbound('src-ag', 'sess-gc');
+      writeIntent(db, { seriesId: 'ser-gc', ag: 'src-ag', sess: 'sess-gc', tsMs: NOW - 2 * SWEEP_MS });
+
+      const duties = _listSweepRegistrationsForTesting().duties;
+      const s19 = duties.find((d) => d.name === SWEEP_DUTY_INVENTORY.S19)!;
+      const t11 = duties.find((d) => d.name === SWEEP_DUTY_INVENTORY.T11)!;
+      expect([s19.phase, t11.phase]).toEqual(['session:tail', 'tick:housekeeping']);
+
+      // session:tail — the GC's turn, and the whole point is that it declines.
+      await s19.run({
+        session: { id: 'sess-gc', agent_group_id: 'src-ag', thread_id: thread },
+        agentGroupId: 'src-ag',
+        // S19 asks the mailbox one question.
+        mailbox: { countLiveTasks: () => 0 },
+      } as never);
+
+      expect(
+        (db.prepare("SELECT status FROM sessions WHERE id = 'sess-gc'").get() as { status: string }).status,
+        'the GC closed the source and made the move unrecoverable',
+      ).toBe('active');
+
+      // tick:housekeeping — T11's turn, one phase later in the same tick.
+      await t11.run({} as never);
+
+      expect(
+        (
+          openInboundDb(inbound)
+            .prepare(
+              "SELECT COUNT(*) AS c FROM messages_in WHERE series_id='ser-gc' AND status IN ('pending','paused')",
+            )
+            .get() as { c: number }
+        ).c,
+        'exactly one live row must come back',
+      ).toBe(1);
+      expect(
+        (
+          db.prepare("SELECT resolved_at FROM scheduled_audit WHERE correlation_id = 'corr-ser-gc'").get() as {
+            resolved_at: string | null;
+          }
+        ).resolved_at,
+        'the intent was left unresolved',
+      ).toBeTruthy();
+      expect(h.spawns).toEqual([]);
+    } finally {
+      useRealQuietInvalidation.on = false;
+      mockGetDb.mockImplementation(() => h.centralDb);
+      closeDb();
+    }
+  });
+
   // ── Codex final, CRITICAL — why S19 must not collect the source ───────────
   //
   // The REAL `withQuietInvalidationSync`, not this suite's recorder: its whole
