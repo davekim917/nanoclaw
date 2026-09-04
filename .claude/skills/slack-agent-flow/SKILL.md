@@ -68,7 +68,33 @@ ncl destinations add --agent-group-id <sibling group id> --local-name <new name>
 
 Either path is idempotent on the folder, so a re-run after a partial setup is
 safe. At this point each agent exists. It has no Slack presence yet — that is
-the next step, and it is the one an agent cannot do for itself.
+step 3, and it is the one an agent cannot do for itself.
+
+Put the whole team in **one workgroup** before any of them spawns. The
+workgroup is the data-pool boundary — shared chat archive, the one memory
+canon, shared files, workgroup-level OneCLI secrets ([docs/workgroups.md](../../../docs/workgroups.md)).
+Neither creation path sets it: `createAgentGroup`'s INSERT omits
+`workgroup_id`, so `resolveWorkgroupIdAtSpawn` falls back to the folder name
+and the first spawn writes each agent into a workgroup of one. Routed messages
+between them still work, which is what makes this easy to miss — the agents
+talk and share nothing.
+
+`workgroup_id` lives on the `agent_groups` row and no `ncl` verb owns it, so
+this is the query wrapper's job (the same way `/clone-as-codex` does it):
+
+```bash
+# the workgroup the team joins — an existing agent's, or a new id of your choosing
+WG=$(pnpm exec tsx scripts/q.ts data/v2.db \
+  "select coalesce(workgroup_id, folder) from agent_groups where folder='<source folder>'" | tr -d '\n')
+
+# one per new agent, before its first spawn
+pnpm exec tsx scripts/q.ts data/v2.db \
+  "update agent_groups set workgroup_id='${WG}' where folder='<new folder>'"
+```
+
+An agent that has already spawned is sitting in its own workgroup of one: set
+the column and restart that group (`ncl groups restart --id <group id>`) so the
+next spawn reconciles it onto the shared workgroup.
 
 ### 3. Install one Slack app per agent
 
@@ -162,7 +188,9 @@ the introduction automatically.
 
 Walk it once, in this order — each check tells you which step to go back to:
 
-1. `ncl groups list --json` shows every new agent group.
+1. `ncl groups list --json` shows every new agent group, and
+   `pnpm exec tsx scripts/q.ts data/v2.db "select folder, workgroup_id from agent_groups"`
+   shows one shared `workgroup_id` across the team rather than one per folder.
 2. A DM to each new bot gets a reply. No reply means step 4 or step 5.
 3. In the room, @-mentioning an agent gets a reply. No reply means that
    agent's room wiring (step 6), not its DM.
