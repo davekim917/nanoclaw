@@ -1,7 +1,40 @@
-import Database from 'better-sqlite3';
-import { describe, expect, it, vi } from 'vitest';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 
-import { warnSessionIfWorkInFlight } from './host-restart-warn.js';
+import Database from 'better-sqlite3';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+
+/**
+ * The heartbeat lives under DATA_DIR, which is a hard-coded resolve of the
+ * project root — so the only way to point it at a fixture is to replace the
+ * path helper. Partial mock: every other session-manager export (including
+ * `withExistingMailboxSession`, which these cases never reach because they
+ * call `warnSessionIfWorkInFlight` directly) stays the real one.
+ */
+const heartbeatRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'nanoclaw-restart-warn-'));
+vi.mock('./session-manager.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./session-manager.js')>()),
+  heartbeatPath: (agentGroupId: string, sessionId: string) =>
+    path.join(heartbeatRoot, `${agentGroupId}__${sessionId}.heartbeat`),
+}));
+
+/**
+ * Partial, not wholesale: `log.js` also exports `setLogScrubber`, which
+ * `secret-scrubber.ts` reaches for at import time through this module's own
+ * dependency graph. Replacing the module outright makes that import throw
+ * before a single case runs.
+ */
+vi.mock('./log.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./log.js')>();
+  return {
+    ...actual,
+    log: { ...actual.log, info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
+  };
+});
+
+import { log } from './log.js';
+import { RESTART_WARN_HEARTBEAT_FRESH_MS, warnSessionIfWorkInFlight } from './host-restart-warn.js';
 import { hasRestartNoteSince } from './modules/mailbox/ops/lookups.js';
 import { getContainerState, getProcessingClaims } from './modules/mailbox/ops/sweep.js';
 import { insertDeferredMessageWithContextIfNew } from './modules/mailbox/ops/ingress.js';
@@ -94,6 +127,22 @@ function makeDbs(): { inDb: Database.Database; outDb: Database.Database } {
   return { inDb, outDb };
 }
 
+/**
+ * Add the fork's `provider_executing` column. `makeDbs` deliberately omits it,
+ * so the default fixture exercises the LEGACY tier — `getContainerState` falls
+ * back to tool-only columns and the field reads undefined — while these cases
+ * exercise a modern outbound DB.
+ */
+function withProviderExecuting(outDb: Database.Database, executing: 0 | 1): void {
+  outDb.exec('ALTER TABLE container_state ADD COLUMN provider_executing INTEGER NOT NULL DEFAULT 0');
+  outDb
+    .prepare(
+      `INSERT INTO container_state (id, provider_executing, updated_at) VALUES (1, ?, ?)
+       ON CONFLICT(id) DO UPDATE SET provider_executing = excluded.provider_executing`,
+    )
+    .run(executing, new Date().toISOString());
+}
+
 function fakeSession(): Session {
   return {
     id: 'sess-test',
@@ -106,6 +155,30 @@ function fakeSession(): Session {
     last_active: null,
     created_at: new Date().toISOString(),
   };
+}
+
+/**
+ * Touch the fixture heartbeat `agoMs` in the past, the way a streaming turn
+ * would have. Absent unless a case asks for it, so every other case in this
+ * file keeps exercising the "no heartbeat signal" path.
+ */
+function touchHeartbeat(session: Session, agoMs: number): void {
+  const file = path.join(heartbeatRoot, `${session.agent_group_id}__${session.id}.heartbeat`);
+  fs.writeFileSync(file, '');
+  const at = new Date(Date.now() - agoMs);
+  fs.utimesSync(file, at, at);
+}
+
+afterEach(() => {
+  for (const entry of fs.readdirSync(heartbeatRoot)) fs.rmSync(path.join(heartbeatRoot, entry), { force: true });
+  vi.clearAllMocks();
+});
+
+/** The one line that says a session was considered and found to have no signal. */
+function noSignalLogCalls(): unknown[][] {
+  return vi
+    .mocked(log.info)
+    .mock.calls.filter(([message]) => message === 'host-restart: no accountability note, no work-in-flight signal');
 }
 
 function noteRows(inDb: Database.Database) {
@@ -227,5 +300,186 @@ describe('warnSessionIfWorkInFlight', () => {
     outDb.exec('DROP TABLE processing_ack');
     expect(warnSessionIfWorkInFlight(mailboxOver(inDb, outDb), fakeSession(), 'startup')).toBe(false);
     expect(noteRows(inDb)).toHaveLength(0);
+  });
+});
+
+describe('a long autonomous turn interrupted by a restart', () => {
+  /**
+   * The 2026-09-04 incident, reproduced exactly. sess-1788440696563-ae2rvy was
+   * four minutes into one open query when the host went down:
+   *
+   *   - its triggering row was claimed and then marked `completed` seconds
+   *     later, because the runner releases the claim as soon as the first
+   *     result event lands and keeps the query open for follow-up pushes;
+   *   - it was between two tool calls, so container_state carried no
+   *     current_tool;
+   *   - it had never called continue_work, so there was no continuation;
+   *   - it was posting status edits up to five seconds before the SIGTERM,
+   *     and its heartbeat was touched at the same time.
+   *
+   * Every signal the predicate had was absent while the agent was
+   * demonstrably mid-turn. No note meant no on_wake row, so nothing respawned
+   * the session and the user waiting in Slack got silence.
+   */
+  function incidentDbs(): { inDb: Database.Database; outDb: Database.Database } {
+    const { inDb, outDb } = makeDbs();
+    const fourMinutesAgo = new Date(Date.now() - 4 * 60 * 1000).toISOString();
+    // The triggering row, admitted four minutes ago and long since released.
+    inDb
+      .prepare(
+        `INSERT INTO messages_in (id, seq, kind, timestamp, status, trigger, content)
+         VALUES ('m-trigger', 1, 'chat-sdk', ?, 'processed', 1, '{}')`,
+      )
+      .run(fourMinutesAgo);
+    outDb
+      .prepare("INSERT INTO processing_ack (message_id, status, status_changed) VALUES ('m-trigger', 'completed', ?)")
+      .run(fourMinutesAgo);
+    // Live status narration, which is deliberately NOT evidence on its own.
+    outDb
+      .prepare("INSERT INTO messages_out (id, seq, timestamp, kind, content) VALUES ('o1', 1, ?, 'status', '{}')")
+      .run(new Date(Date.now() - 5_000).toISOString());
+    // Between tools: a row exists, but no tool is open.
+    outDb
+      .prepare('INSERT INTO container_state (id, current_tool, tool_started_at, updated_at) VALUES (1, NULL, NULL, ?)')
+      .run(new Date(Date.now() - 5_000).toISOString());
+    return { inDb, outDb };
+  }
+
+  it('writes the accountability note on a heartbeat from five seconds ago', () => {
+    const { inDb, outDb } = incidentDbs();
+    const session = fakeSession();
+    touchHeartbeat(session, 5_000);
+
+    expect(warnSessionIfWorkInFlight(mailboxOver(inDb, outDb), session, 'graceful host shutdown')).toBe(true);
+    const pair = inDb.prepare('SELECT id, trigger, on_wake FROM messages_in WHERE id != ? ORDER BY seq').all(
+      'm-trigger',
+    ) as Array<{ id: string; trigger: number; on_wake: number }>;
+    expect(pair).toHaveLength(2);
+    expect(pair.map((row) => row.on_wake), 'the note must be on_wake so the NEXT container sees it').toEqual([1, 1]);
+    expect(noteRows(inDb)).toHaveLength(1);
+  });
+
+  it('is what changed: the same session gets nothing without a heartbeat', () => {
+    const { inDb, outDb } = incidentDbs();
+
+    expect(warnSessionIfWorkInFlight(mailboxOver(inDb, outDb), fakeSession(), 'graceful host shutdown')).toBe(false);
+    expect(noteRows(inDb)).toHaveLength(0);
+  });
+
+  it('leaves an idle container alone — a stale heartbeat is not work in flight', () => {
+    // The spam guard this clause must not break. An idle container never
+    // touches its heartbeat, so its mtime is the end of its last turn; at ten
+    // minutes it is well outside the live window and must stay silent.
+    const { inDb, outDb } = makeDbs();
+    const session = fakeSession();
+    touchHeartbeat(session, 10 * 60 * 1000);
+
+    expect(warnSessionIfWorkInFlight(mailboxOver(inDb, outDb), session, 'graceful host shutdown')).toBe(false);
+    expect(noteRows(inDb)).toHaveLength(0);
+  });
+
+  it('ignores a heartbeat stamped in the future rather than trusting it', () => {
+    const { inDb, outDb } = makeDbs();
+    const session = fakeSession();
+    touchHeartbeat(session, -60_000);
+
+    expect(warnSessionIfWorkInFlight(mailboxOver(inDb, outDb), session, 'graceful host shutdown')).toBe(false);
+    expect(noteRows(inDb)).toHaveLength(0);
+  });
+});
+
+describe('the heartbeat freshness boundary', () => {
+  // No fake timers here: the signal IS a real file mtime, so faking the clock
+  // over real I/O would test the mock rather than the read.
+  it('a heartbeat one second past the window is not work in flight, and says so', () => {
+    const { inDb, outDb } = makeDbs();
+    const session = fakeSession();
+    touchHeartbeat(session, RESTART_WARN_HEARTBEAT_FRESH_MS + 1_000);
+
+    expect(warnSessionIfWorkInFlight(mailboxOver(inDb, outDb), session, 'graceful host shutdown')).toBe(false);
+    expect(noteRows(inDb)).toHaveLength(0);
+    const calls = noSignalLogCalls();
+    expect(calls, 'the reason line is the only trace a skipped session leaves').toHaveLength(1);
+    const fields = calls[0][1] as { heartbeatAgeMs: number | null; hasProcessingClaim: boolean };
+    expect(fields.heartbeatAgeMs).toBeGreaterThan(RESTART_WARN_HEARTBEAT_FRESH_MS);
+    expect(fields.hasProcessingClaim).toBe(false);
+  });
+
+  it('a missing heartbeat is not work in flight, and reports a null age', () => {
+    const { inDb, outDb } = makeDbs();
+
+    expect(warnSessionIfWorkInFlight(mailboxOver(inDb, outDb), fakeSession(), 'graceful host shutdown')).toBe(false);
+    expect(noteRows(inDb)).toHaveLength(0);
+    const calls = noSignalLogCalls();
+    expect(calls).toHaveLength(1);
+    expect((calls[0][1] as { heartbeatAgeMs: number | null }).heartbeatAgeMs).toBeNull();
+  });
+
+  it('the shutdown warn and the startup backstop agree on one note per interruption', () => {
+    // Both paths run seconds apart against the same dead container, so the
+    // heartbeat-derived recovery key must round to the same value and the
+    // second call must find the note already there.
+    const { inDb, outDb } = makeDbs();
+    const session = fakeSession();
+    touchHeartbeat(session, 5_000);
+
+    expect(warnSessionIfWorkInFlight(mailboxOver(inDb, outDb), session, 'graceful host shutdown')).toBe(true);
+    expect(
+      warnSessionIfWorkInFlight(mailboxOver(inDb, outDb), session, 'host startup after an unclean stop'),
+      'the dedupe must hold across both restart paths',
+    ).toBe(false);
+    expect(noteRows(inDb)).toHaveLength(1);
+  });
+});
+
+describe('the heartbeat is paired with provider_executing', () => {
+  // The runner touches the heartbeat after EVERY stream event, including the
+  // terminal `result` that ends a turn. So a session whose turn just finished
+  // normally has an mtime seconds old, and the heartbeat ALONE would warn it —
+  // the idle spam the guard exists to prevent. `provider_executing` is lowered
+  // on that same `result`, which is what tells the two apart.
+  it('a turn that just ended is not work in flight, however fresh the heartbeat', () => {
+    const { inDb, outDb } = makeDbs();
+    withProviderExecuting(outDb, 0);
+    const session = fakeSession();
+    touchHeartbeat(session, 1_000);
+
+    expect(warnSessionIfWorkInFlight(mailboxOver(inDb, outDb), session, 'graceful host shutdown')).toBe(false);
+    expect(noteRows(inDb)).toHaveLength(0);
+    const fields = noSignalLogCalls()[0][1] as { providerExecuting: number | null };
+    expect(fields.providerExecuting).toBe(0);
+  });
+
+  it('a turn still executing is work in flight', () => {
+    const { inDb, outDb } = makeDbs();
+    withProviderExecuting(outDb, 1);
+    const session = fakeSession();
+    touchHeartbeat(session, 5_000);
+
+    expect(warnSessionIfWorkInFlight(mailboxOver(inDb, outDb), session, 'graceful host shutdown')).toBe(true);
+    expect(noteRows(inDb)).toHaveLength(1);
+  });
+
+  it('an executing turn with a stale heartbeat is still not enough on its own', () => {
+    // The two are an AND, not an OR: a raised flag with no recent stream event
+    // is the wedged-provider shape the ceiling kill handles, not this one.
+    const { inDb, outDb } = makeDbs();
+    withProviderExecuting(outDb, 1);
+    const session = fakeSession();
+    touchHeartbeat(session, RESTART_WARN_HEARTBEAT_FRESH_MS + 1_000);
+
+    expect(warnSessionIfWorkInFlight(mailboxOver(inDb, outDb), session, 'graceful host shutdown')).toBe(false);
+    expect(noteRows(inDb)).toHaveLength(0);
+  });
+
+  it('a legacy outbound DB without the column still trusts the heartbeat', () => {
+    // makeDbs has no provider_executing, so getContainerState drops to the
+    // tool-only tier and the field reads undefined. Undefined must not veto.
+    const { inDb, outDb } = makeDbs();
+    const session = fakeSession();
+    touchHeartbeat(session, 5_000);
+
+    expect(warnSessionIfWorkInFlight(mailboxOver(inDb, outDb), session, 'graceful host shutdown')).toBe(true);
+    expect(noteRows(inDb)).toHaveLength(1);
   });
 });

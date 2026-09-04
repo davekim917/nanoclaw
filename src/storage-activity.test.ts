@@ -37,6 +37,23 @@ afterEach(() => {
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 });
 
+/**
+ * What a reclaim actually reads: the MARKER COUNT under the active dir, with a
+ * missing directory counting as zero (tryRunWithStorageCleanupClaim swallows
+ * ENOENT). An empty directory left behind blocks nothing, so these cases assert
+ * on markers rather than on the directory's existence — a planter's discard
+ * deliberately no longer removes the shared directory, because doing so would
+ * mean discounting its own in-flight registration and that discount cannot tell
+ * itself apart from another planter's.
+ */
+function activeMarkers(root: string): string[] {
+  try {
+    return fs.readdirSync(path.join(root, '.nanoclaw-storage-active'));
+  } catch {
+    return [];
+  }
+}
+
 function sessionDirShape(dataDir: string, ag: string, sess: string): string {
   return path.join(dataDir, 'v2-sessions', ag, sess);
 }
@@ -201,7 +218,7 @@ describe('synchronous storage activity marker', () => {
 
     expect(() => plantStorageActivityMarker(root, 'writer')).toThrow(/being reclaimed/);
     // A marker left behind here would block cleanup for this root forever.
-    expect(fs.existsSync(path.join(root, '.nanoclaw-storage-active'))).toBe(false);
+    expect(activeMarkers(root)).toHaveLength(0);
   });
 
   it('is idempotent on release', () => {
@@ -301,7 +318,7 @@ describe('synchronous storage activity marker', () => {
 
     expect(() => plantStorageActivityMarker(root, 'writer')).toThrow('no space left on device');
     vi.restoreAllMocks();
-    expect(fs.existsSync(path.join(root, '.nanoclaw-storage-active'))).toBe(false);
+    expect(activeMarkers(root)).toHaveLength(0);
   });
 
   // Two independent SYNC holders, no lease involved: the original independence
@@ -360,17 +377,16 @@ describe('acquireStorageActivityLease retries the marker-dir ENOENT race', () =>
     });
 
     await expect(acquireStorageActivityLease(root, 'writer')).rejects.toMatchObject({ code: 'ENOENT' });
-    expect(fs.existsSync(activeDir), 'no marker or dir must be left behind').toBe(false);
+    expect(activeMarkers(root), 'no marker must be left behind').toHaveLength(0);
   });
 
   it('rethrows a non-ENOENT plant failure without retrying', async () => {
     const root = tempRoot();
-    const activeDir = path.join(root, '.nanoclaw-storage-active');
     const err = Object.assign(new Error('no space left on device'), { code: 'ENOSPC' });
     vi.spyOn(fs.promises, 'writeFile').mockRejectedValueOnce(err);
 
     await expect(acquireStorageActivityLease(root, 'writer')).rejects.toThrow('no space left on device');
-    expect(fs.existsSync(activeDir)).toBe(false);
+    expect(activeMarkers(root)).toHaveLength(0);
   });
 });
 
@@ -510,5 +526,102 @@ describe('acquireStorageActivityLease is observable and bounded', () => {
     fs.rmSync(claim, { force: true });
     await pending;
     expect(settled).toBe('resolved');
+  });
+});
+
+describe('the marker mkdir itself loses the release race', () => {
+  // The incident (2026-09-04, sess-1788440696563-ae2rvy). The retry above only
+  // ever covered writeFile, because the mkdir sat OUTSIDE the try. But a
+  // recursive mkdir is not one atomic syscall — Node walks the path — so a
+  // releasing holder's rmdir of the same leaf can surface as ENOENT out of the
+  // MKDIR. That ENOENT escaped acquireStorageActivityLease, propagated through
+  // writeSessionMessage into the router, and aborted the route BEFORE the
+  // inbound row was written: an accepted Slack message dropped on the floor.
+  //
+  // `mockRejectedValueOnce` is not enough on the async path: its first mkdir
+  // call is for resourceRoot, not activeDir. Both tests therefore fail the
+  // FIRST activeDir mkdir and let every later one through, which is exactly
+  // the shape of a single lost race.
+  function enoent(dir: string): NodeJS.ErrnoException {
+    return Object.assign(new Error(`ENOENT: no such file or directory, mkdir '${dir}'`), { code: 'ENOENT' });
+  }
+
+  it('acquireStorageActivityLease survives it and still plants a marker', async () => {
+    const root = tempRoot();
+    const activeDir = path.join(root, '.nanoclaw-storage-active');
+    const realMkdir = fs.promises.mkdir.bind(fs.promises);
+    let failed = false;
+    vi.spyOn(fs.promises, 'mkdir').mockImplementation(async (dir, opts) => {
+      if (!failed && dir === activeDir) {
+        failed = true;
+        throw enoent(activeDir);
+      }
+      return realMkdir(dir as fs.PathLike, opts as fs.MakeDirectoryOptions);
+    });
+
+    const lease = await acquireStorageActivityLease(root, 'writer');
+
+    expect(failed, 'the mkdir race must actually have fired').toBe(true);
+    expect(fs.readdirSync(activeDir), 'the retry must leave a marker').toHaveLength(1);
+    await lease.release();
+  });
+
+  it('plantStorageActivityMarker survives it and still plants a marker', () => {
+    const root = tempRoot();
+    const activeDir = path.join(root, '.nanoclaw-storage-active');
+    const realMkdirSync = fs.mkdirSync.bind(fs);
+    let failed = false;
+    vi.spyOn(fs, 'mkdirSync').mockImplementation((dir, opts) => {
+      if (!failed && dir === activeDir) {
+        failed = true;
+        throw enoent(activeDir);
+      }
+      return realMkdirSync(dir as fs.PathLike, opts as fs.MakeDirectoryOptions);
+    });
+
+    const release = plantStorageActivityMarker(root, 'writer');
+
+    expect(failed, 'the mkdir race must actually have fired').toBe(true);
+    expect(fs.readdirSync(activeDir), 'the retry must leave a marker').toHaveLength(1);
+    release();
+  });
+
+  it('rethrows once the bound is exhausted, leaving nothing behind', async () => {
+    const root = tempRoot();
+    const activeDir = path.join(root, '.nanoclaw-storage-active');
+    const realMkdir = fs.promises.mkdir.bind(fs.promises);
+    let activeDirAttempts = 0;
+    vi.spyOn(fs.promises, 'mkdir').mockImplementation(async (dir, opts) => {
+      if (dir === activeDir) {
+        activeDirAttempts++;
+        throw enoent(activeDir);
+      }
+      return realMkdir(dir as fs.PathLike, opts as fs.MakeDirectoryOptions);
+    });
+
+    await expect(acquireStorageActivityLease(root, 'writer')).rejects.toMatchObject({ code: 'ENOENT' });
+    expect(activeDirAttempts, 'bounded at three attempts, never an unbounded spin').toBe(3);
+    expect(fs.existsSync(activeDir)).toBe(false);
+  });
+});
+
+describe('concurrent acquire/release on one root', () => {
+  // The production interleave with no mocks at all: two deliveries of the same
+  // Slack message racing on one session root, each acquiring and releasing.
+  // Before the fix this failed intermittently — the loser's mkdir or writeFile
+  // hit the winner's rmdir. Every acquisition must succeed; a lost race is a
+  // dropped inbound message, never an error the caller has to handle.
+  it('never surfaces a race to the caller', async () => {
+    const root = tempRoot();
+    const cycle = async (id: string): Promise<void> => {
+      for (let i = 0; i < 40; i++) {
+        const lease = await acquireStorageActivityLease(root, id);
+        await lease.release();
+      }
+    };
+
+    await Promise.all([cycle('a'), cycle('b'), cycle('c'), cycle('d')]);
+
+    expect(fs.existsSync(path.join(root, '.nanoclaw-storage-active'))).toBe(false);
   });
 });
