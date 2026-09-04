@@ -16,6 +16,13 @@ import { isDirectExecution, resolveChannelMetadataUpdates, runWorkgroupMemorySta
 // gate that runs channel-approval.ts's classifier) ever fires for. Once
 // wired, that second writer is gone, so a rename must still propagate on
 // each host restart's one-shot re-fetch — round 5 finding on this file.
+//
+// Round 6: the wired-refresh path reopened a second issue. For a Slack MPIM,
+// reportChannelMetadata's generic fetch always returns Slack's own internal
+// `mpdm-alice--bob--carol-1` slug, never the participant-roster name
+// channel-approval.ts classified once at wiring time — so refreshing on any
+// differing name clobbered that human-readable name back to noise on every
+// host restart. SLACK_MPIM_SLUG_RE excludes that shape from both branches.
 describe('resolveChannelMetadataUpdates', () => {
   it('sets the name only when the messaging group has none yet (unwired)', () => {
     expect(resolveChannelMetadataUpdates({ name: null, is_group: 0 }, 'General', undefined, false)).toEqual({
@@ -27,7 +34,7 @@ describe('resolveChannelMetadataUpdates', () => {
     expect(
       resolveChannelMetadataUpdates(
         { name: 'Group DM: Alice and Bob', is_group: 1 },
-        'mpdm-alice--bob-1',
+        'renamed-elsewhere',
         undefined,
         false,
       ),
@@ -42,6 +49,20 @@ describe('resolveChannelMetadataUpdates', () => {
 
   it('leaves a matching wired name alone', () => {
     expect(resolveChannelMetadataUpdates({ name: 'Existing', is_group: 0 }, 'Existing', undefined, true)).toEqual({});
+  });
+
+  it('never treats a Slack MPIM slug as a real name, wired or not', () => {
+    expect(
+      resolveChannelMetadataUpdates(
+        { name: 'Group DM: Alice and Bob', is_group: 1 },
+        'mpdm-alice--bob-1',
+        undefined,
+        true,
+      ),
+    ).toEqual({});
+    expect(resolveChannelMetadataUpdates({ name: null, is_group: 1 }, 'mpdm-alice--bob-1', undefined, false)).toEqual(
+      {},
+    );
   });
 
   it('still updates is_group independently of the name decision', () => {

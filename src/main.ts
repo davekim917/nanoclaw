@@ -178,7 +178,21 @@ export function runWorkgroupMemoryStartupGate(
  * set-once rule that ignores wiring status would silently freeze the name on
  * every established channel forever the moment it's approved. So: unwired →
  * set-once (protect the race); wired → refresh on change (no race to protect).
+ *
+ * Wired refresh has one more trap: for a Slack MPIM, `reportChannelMetadata`'s
+ * generic per-channel fetch (chat-sdk-bridge.ts) always returns Slack's own
+ * internal slug (`mpdm-alice--bob--carol-1`, see the comment on
+ * `resolveSlackConversation` in slack.ts) as `name` — it never has the
+ * participant-roster lookup that produces a human-readable "Group DM: Alice
+ * and Bob". That richer lookup runs once, at wiring time, in
+ * channel-approval.ts, and never again. So treating the slug as a genuine
+ * rename on the wired-refresh path would clobber the human name back to
+ * noise on every host restart. `SLACK_MPIM_SLUG_RE` recognizes that shape and
+ * is excluded from both branches — it was never a name worth persisting in
+ * the unwired case either, just previously masked there by `!mg.name`.
  */
+const SLACK_MPIM_SLUG_RE = /^mpdm-.+-\d+$/;
+
 export function resolveChannelMetadataUpdates(
   mg: { name: string | null; is_group: number },
   name: string | undefined,
@@ -186,7 +200,7 @@ export function resolveChannelMetadataUpdates(
   isWired: boolean,
 ): Partial<{ name: string; is_group: number }> {
   const updates: Partial<{ name: string; is_group: number }> = {};
-  if (name) {
+  if (name && !SLACK_MPIM_SLUG_RE.test(name)) {
     if (isWired ? name !== mg.name : !mg.name) updates.name = name;
   }
   if (isGroup !== undefined) {
