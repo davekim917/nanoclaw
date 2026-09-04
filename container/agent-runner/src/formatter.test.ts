@@ -15,6 +15,7 @@ import { getInboundDb } from './mailbox/sqlite/connection.js';
 import { closeSessionDb, initTestSessionDb } from './modules/mailbox/testing.js';
 import { getPendingMessages } from './db/messages-in.js';
 import {
+  extractAttachments,
   formatMessages,
   stripInternalTags,
   stripLegacyTaskContract,
@@ -829,5 +830,60 @@ describe('hasFlagIntent', () => {
     const [sys] = getPendingMessages();
     expect(hasFlagIntent(sys)).toBe(false);
     expect(hasFlagIntent({ ...sys, kind: 'chat', content: 'not-json{' } as never)).toBe(false);
+  });
+});
+
+describe('extractAttachments', () => {
+  function attachmentRow(id: string, content: unknown): MessageInRow {
+    return {
+      id,
+      kind: 'chat-sdk',
+      timestamp: new Date().toISOString(),
+      status: 'pending',
+      process_after: null,
+      recurrence: null,
+      tries: 0,
+      trigger: 1,
+      seq: 1,
+      platform_id: null,
+      channel_type: 'slack',
+      thread_id: null,
+      content: JSON.stringify(content),
+    };
+  }
+
+  it('resolves localPath against the /workspace mount, matching the text rendering', () => {
+    const rows = [
+      attachmentRow('a1', {
+        text: 'look',
+        attachments: [{ name: 'cat.png', mimeType: 'image/png', localPath: 'inbox/cat.png' }],
+      }),
+    ];
+    expect(extractAttachments(rows)).toEqual([
+      { filename: 'cat.png', mime: 'image/png', path: '/workspace/inbox/cat.png', url: undefined },
+    ]);
+  });
+
+  it('carries a link-only attachment through with no path', () => {
+    const rows = [
+      attachmentRow('a1', { text: 'link', attachments: [{ filename: 'doc.pdf', url: 'https://x/doc.pdf' }] }),
+    ];
+    expect(extractAttachments(rows)).toEqual([
+      { filename: 'doc.pdf', mime: undefined, path: undefined, url: 'https://x/doc.pdf' },
+    ]);
+  });
+
+  it('flattens across the batch and ignores messages with no attachments', () => {
+    const rows = [
+      attachmentRow('a1', { text: 'plain' }),
+      attachmentRow('a2', { text: 'one', attachments: [{ name: 'a.png', localPath: 'inbox/a.png' }] }),
+      attachmentRow('a3', { text: 'two', attachments: [{ name: 'b.png', localPath: 'inbox/b.png' }] }),
+    ];
+    expect(extractAttachments(rows).map((a) => a.filename)).toEqual(['a.png', 'b.png']);
+  });
+
+  it('malformed content is no attachments, not a throw', () => {
+    const rows = [{ ...attachmentRow('a1', {}), content: 'not-json{' } as MessageInRow];
+    expect(extractAttachments(rows)).toEqual([]);
   });
 });

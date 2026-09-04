@@ -1,7 +1,8 @@
 import * as fs from 'fs';
 import { spawn, type ChildProcess } from 'child_process';
+import { pathToFileURL } from 'url';
 
-import { createOpencodeClient, type OpencodeClient } from '@opencode-ai/sdk';
+import { createOpencodeClient, type FilePartInput, type OpencodeClient } from '@opencode-ai/sdk';
 // The root client carries no `.question` surface in 1.18.23 (verified against
 // the installed `dist/gen/sdk.gen.d.ts`: no Question class at all). list/reply/
 // reject for the interactive `question` tool exist only on the `/v2` subpath
@@ -11,7 +12,15 @@ import { createOpencodeClient as createOpencodeQuestionClient } from '@opencode-
 
 import { memoryContextForSessionStart, type MemorySessionHookRegistration } from '../memory/session-hook.js';
 import { registerProvider } from './provider-registry.js';
-import type { AgentProvider, AgentQuery, ProviderEvent, ProviderOptions, QueryInput, TurnUsageInfo } from './types.js';
+import type {
+  AgentProvider,
+  AgentQuery,
+  ProviderEvent,
+  ProviderOptions,
+  PromptAttachment,
+  QueryInput,
+  TurnUsageInfo,
+} from './types.js';
 import { mcpServersToOpenCodeConfig } from './mcp-to-opencode.js';
 import { buildSecretEnvVarList, MCP_HEADER_ONLY_SECRET_VARS } from './secret-env.js';
 import { shouldPostInfraWarning } from '../modules/mailbox/index.js';
@@ -19,6 +28,80 @@ import { MANAGED_GIT_OPENCODE_PLUGIN_PATH } from '../managed-git-guard.js';
 
 function log(msg: string): void {
   console.error(`[opencode-provider] ${msg}`);
+}
+
+/** Extension → MIME fallback, for adapters that report no `mimeType`. */
+const ATTACHMENT_MIME_BY_EXT: Record<string, string> = {
+  '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.gif': 'image/gif',
+  '.webp': 'image/webp',
+  '.heic': 'image/heic',
+  '.pdf': 'application/pdf',
+};
+
+function attachmentMime(att: PromptAttachment): string | undefined {
+  if (att.mime) return att.mime;
+  const name = att.path || att.filename || '';
+  const dot = name.lastIndexOf('.');
+  return dot < 0 ? undefined : ATTACHMENT_MIME_BY_EXT[name.slice(dot).toLowerCase()];
+}
+
+/**
+ * Turn a turn's attachments into OpenCode file parts, so the model sees the
+ * media itself rather than only the `[image: cat.png — saved to …]` line the
+ * formatter already renders into the prompt text.
+ *
+ * The URL is a `file://` path, NOT a data: URI, deliberately: OpenCode resolves
+ * a file: part server-side, reading the file and re-emitting it as a base64
+ * data URI for any mime that is neither text/plain nor a directory. The server
+ * shares this container's filesystem, so base64-ing here would only duplicate
+ * that work and inflate the request body.
+ *
+ * Only images and PDFs are forwarded. PDFs go through even though a given
+ * backend may reject them, since the alternative is silently withholding a
+ * document the user did send. Anything skipped is still described in the prompt
+ * text, so it is never lost — just not handed over as media.
+ *
+ * NOTE: a model OpenCode's registry does not know declares no input modalities,
+ * and OpenCode then drops every non-text part it is handed. Declaring
+ * OPENCODE_MODEL_INPUT_MODALITIES is what opens that gate — see
+ * resolveModelModalities.
+ *
+ * `exists` is injectable so tests can drive resolvability without touching disk.
+ */
+export function buildAttachmentFileParts(
+  attachments: PromptAttachment[] | undefined,
+  exists: (path: string) => boolean = fs.existsSync,
+): FilePartInput[] {
+  const parts: FilePartInput[] = [];
+  for (const att of attachments ?? []) {
+    const mime = attachmentMime(att);
+    if (!mime) continue;
+    if (!mime.startsWith('image/') && mime !== 'application/pdf') continue;
+    if (!att.path || !exists(att.path)) {
+      const label = att.filename || att.path || att.url || 'unnamed';
+      log(`Attachment has no readable local file, not sent as media: ${label}`);
+      continue;
+    }
+    parts.push({ type: 'file', mime, filename: att.filename, url: pathToFileURL(att.path).href });
+  }
+  return parts;
+}
+
+/**
+ * The prompt body for one turn: the text the formatter produced, plus any media
+ * that came with it. Both the opening prompt and every follow-up push go
+ * through here — OpenCode holds one query open per session, so in practice most
+ * real messages arrive as pushes, and media has to travel on that path too.
+ */
+export function buildPromptParts(
+  text: string,
+  attachments?: PromptAttachment[],
+  exists: (path: string) => boolean = fs.existsSync,
+): Array<{ type: 'text'; text: string } | FilePartInput> {
+  return [{ type: 'text', text }, ...buildAttachmentFileParts(attachments, exists)];
 }
 
 /**
@@ -979,7 +1062,9 @@ export class OpenCodeProvider implements AgentProvider {
       this.activeSessionId = undefined;
     }
 
-    const pending: string[] = [];
+    // Each queued turn carries its own media, so a photo sent as a follow-up
+    // reaches the model as a file part rather than only as prose.
+    const pending: Array<{ text: string; attachments?: PromptAttachment[] }> = [];
     let waiting: (() => void) | null = null;
     let ended = false;
     let aborted = false;
@@ -1000,7 +1085,10 @@ export class OpenCodeProvider implements AgentProvider {
     // canonical bytes arrive per turn only in paired untrusted recall.
     const memoryContext = memoryContextForSessionStart('startup');
     const systemInstructions = [input.systemContext?.instructions, memoryContext].filter(Boolean).join('\n\n');
-    pending.push(wrapPromptWithContext(input.prompt, systemInstructions, effectiveModel));
+    pending.push({
+      text: wrapPromptWithContext(input.prompt, systemInstructions, effectiveModel),
+      attachments: input.attachments,
+    });
 
     const kick = (): void => {
       waiting?.();
@@ -1026,7 +1114,7 @@ export class OpenCodeProvider implements AgentProvider {
         if (aborted) return;
         if (pending.length === 0 && ended) return;
 
-        const text = pending.shift()!;
+        const { text, attachments } = pending.shift()!;
         let sessionId = self.activeSessionId;
 
         if (!sessionId) {
@@ -1050,7 +1138,7 @@ export class OpenCodeProvider implements AgentProvider {
           // unset (no override + no env default) opencode uses the session/server
           // default. Switching models mid-session is just a different body.model
           // on the next prompt — no server respawn.
-          body: { parts: [{ type: 'text', text }], ...(promptModel ? { model: promptModel } : {}) },
+          body: { parts: buildPromptParts(text, attachments), ...(promptModel ? { model: promptModel } : {}) },
         });
         if (promptRes.error) {
           self.activeSessionId = undefined;
@@ -1269,8 +1357,11 @@ export class OpenCodeProvider implements AgentProvider {
     }
 
     return {
-      push: (message: string) => {
-        pending.push(wrapPromptWithContext(message, systemInstructions, effectiveModel));
+      push: (message: string, attachments?: PromptAttachment[]) => {
+        pending.push({
+          text: wrapPromptWithContext(message, systemInstructions, effectiveModel),
+          attachments,
+        });
         kick();
       },
       // OpenCode has no mid-turn merge: `push` above always appends, and the

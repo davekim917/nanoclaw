@@ -1,6 +1,7 @@
 import { getSessionRouting } from './db/session-routing.js';
 import { findByRouting } from './destinations.js';
 import type { MessageInRow } from './db/messages-in.js';
+import type { PromptAttachment } from './providers/types.js';
 import { TIMEZONE, formatLocalTime, formatLocalDateTimeFull } from './timezone.js';
 
 /**
@@ -655,6 +656,32 @@ function formatAttachments(attachments: any[] | undefined): string {
     return url ? `[${type}: ${escapeXml(name)} (${escapeXml(url)})]` : `[${type}: ${escapeXml(name)}]`;
   });
   return '\n' + parts.join('\n');
+}
+
+/**
+ * Structured view of the attachments in a batch, for providers whose SDK takes
+ * real file parts. Additive: `formatAttachments` above still renders every one
+ * of these into the prompt text, so nothing here is load-bearing for a provider
+ * that ignores it.
+ *
+ * `localPath` is relative to the session directory, which is mounted at
+ * `/workspace` in the container — the same resolution `formatAttachments` uses.
+ */
+export function extractAttachments(messages: MessageInRow[]): PromptAttachment[] {
+  const out: PromptAttachment[] = [];
+  for (const msg of messages) {
+    const content = parseContent(msg.content);
+    if (!Array.isArray(content.attachments)) continue;
+    for (const a of content.attachments) {
+      out.push({
+        filename: a.filename || a.name || undefined,
+        mime: a.mimeType || a.mime || undefined,
+        path: a.localPath ? `/workspace/${a.localPath}` : undefined,
+        url: a.url || undefined,
+      });
+    }
+  }
+  return out;
 }
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
