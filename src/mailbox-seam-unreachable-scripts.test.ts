@@ -73,6 +73,57 @@ import { getAgentMailbox, registerAgentMailbox, resetAgentMailboxForTesting } fr
 
 const REPO_ROOT = path.resolve(__dirname, '..');
 
+/**
+ * Modules whose binding set can, in principle, reach the mailbox seam: the
+ * seam factory itself (`src/mailbox/index.ts` — `getAgentMailbox`,
+ * `withMailboxSession`, `withExistingMailboxSession`) and the fork's own
+ * mailbox implementation module it's layered on (`src/modules/mailbox/index.ts`,
+ * which ALSO exports `getAgentMailbox` — see
+ * docs/specs/upstream-mailbox-seam/plan.md §4.2), plus the two files whose
+ * OWN bodies call the seam (`src/session-manager.ts`, `src/container-runner.ts`)
+ * and `src/delivery.ts` (the loop the seam's handlers run inside). Same four
+ * files as the transitive import-graph walk's own `SEAM_ADJACENT_FILES`
+ * below, plus `src/modules/mailbox/index.ts` — kept as a separate constant
+ * rather than shared, because that walk's target set is a different,
+ * independent decision from this one.
+ *
+ * `pinnedImportsFrom` asserts the EXACT set of named bindings a file imports
+ * from each of these — including the empty set for a module it currently
+ * does NOT import from — so a future import from ANY of them (renamed,
+ * aliased, or otherwise) fails this test instead of silently widening
+ * reachability. An aliased `getAgentMailbox as foo` shows up in the captured
+ * specifier text verbatim and cannot hide behind the alias.
+ */
+const SEAM_ADJACENT_MODULES = [
+  'src/session-manager.ts',
+  'src/container-runner.ts',
+  'src/delivery.ts',
+  'src/mailbox/index.ts',
+  'src/modules/mailbox/index.ts',
+] as const;
+
+/**
+ * The exact set of named bindings `filePath` (repo-root-relative, e.g.
+ * `src/storage-manager.ts`) imports from `modulePath` (same form, e.g.
+ * `src/mailbox/index.ts`) via a static `import { ... } from` — `[]` when
+ * there is no such import at all. Resolves the expected relative specifier
+ * from the two paths rather than hard-coding one, so the same helper works
+ * regardless of how deep either file sits in the tree.
+ */
+function pinnedImportsFrom(filePath: string, modulePath: string): string[] {
+  const src = fs.readFileSync(path.join(REPO_ROOT, filePath), 'utf8');
+  const fromDir = path.posix.dirname(filePath);
+  let specifier = path.posix.relative(fromDir, modulePath).replace(/\.ts$/, '.js');
+  if (!specifier.startsWith('.')) specifier = './' + specifier;
+  const escaped = specifier.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const match = new RegExp(`import\\s*\\{([^}]*)\\}\\s*from\\s*['"]${escaped}['"]`).exec(src);
+  if (!match) return [];
+  return match[1]
+    .split(',')
+    .map((n) => n.trim())
+    .filter(Boolean);
+}
+
 const cleanupDirs: string[] = [];
 afterEach(() => {
   for (const dir of cleanupDirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
@@ -196,45 +247,27 @@ describe('storage-manager.ts / storage-activity.ts contain no literal seam call'
     expect(/\b(getAgentMailbox|withMailboxSession|withExistingMailboxSession)\s*\(/.test(src)).toBe(false);
   });
 
-  it("storage-manager.ts's only session-manager.js imports are the non-seam path helpers", () => {
-    const src = fs.readFileSync(path.join(REPO_ROOT, 'src/storage-manager.ts'), 'utf8');
-    const match = /import\s*\{([^}]*)\}\s*from\s*['"]\.\/session-manager\.js['"]/.exec(src);
-    expect(
-      match,
-      'storage-manager.ts must import from session-manager.js for this test to be meaningful',
-    ).not.toBeNull();
-    const names = match![1]
-      .split(',')
-      .map((n) => n.trim())
-      .filter(Boolean);
-    // 1553790a moved storage-manager.ts's DB-path lookups (inboundDbPath,
-    // outboundDbPath) onto the mailbox module's own sessionMailboxPath — the
-    // remaining session-manager.js imports are only the thread/session
-    // directory-layout helpers, none of which reach the seam.
-    expect(names.sort()).toEqual(
-      ['sessionContextPathFor', 'sessionsBaseDir', 'threadsBaseDir', 'threadWorktreeDir'].sort(),
-    );
-  });
-
-  // Same file, same 1553790a move, the other direction: storage-manager.ts
-  // ALSO imports from modules/mailbox/index.js now (sessionMailboxPath, to
-  // build the DB-path lookups session-manager.js used to provide). That
-  // module is the one that exports getAgentMailbox — an aliased
-  // `getAgentMailbox as foo` import from it would evade both the literal-call
-  // regex above and the session-manager.js set assertion. Pin its exact
-  // import set too, so a future import here re-triggers this review.
-  it("storage-manager.ts's only modules/mailbox/index.js import is sessionMailboxPath", () => {
-    const src = fs.readFileSync(path.join(REPO_ROOT, 'src/storage-manager.ts'), 'utf8');
-    const match = /import\s*\{([^}]*)\}\s*from\s*['"]\.\/modules\/mailbox\/index\.js['"]/.exec(src);
-    expect(
-      match,
-      'storage-manager.ts must import from modules/mailbox/index.js for this test to be meaningful',
-    ).not.toBeNull();
-    const names = match![1]
-      .split(',')
-      .map((n) => n.trim())
-      .filter(Boolean);
-    expect(names.sort()).toEqual(['sessionMailboxPath'].sort());
+  // 1553790a moved storage-manager.ts's DB-path lookups (inboundDbPath,
+  // outboundDbPath) off session-manager.js onto the mailbox module's own
+  // sessionMailboxPath. Pinning only the file it moved AWAY from would miss
+  // the file it moved TO — modules/mailbox/index.ts is the one that exports
+  // getAgentMailbox, so an aliased `getAgentMailbox as foo` import from it
+  // would evade a session-manager.js-only check. Sweep every seam-adjacent
+  // module instead, asserting the exact (possibly empty) import set from
+  // each, so a new import from ANY of them re-triggers this review.
+  it('storage-manager.ts imports exactly the pinned binding set from every seam-adjacent module', () => {
+    const expected: Record<(typeof SEAM_ADJACENT_MODULES)[number], string[]> = {
+      'src/session-manager.ts': ['sessionContextPathFor', 'sessionsBaseDir', 'threadsBaseDir', 'threadWorktreeDir'],
+      'src/container-runner.ts': [],
+      'src/delivery.ts': [],
+      'src/mailbox/index.ts': [],
+      'src/modules/mailbox/index.ts': ['sessionMailboxPath'],
+    };
+    for (const seamModule of SEAM_ADJACENT_MODULES) {
+      expect(pinnedImportsFrom('src/storage-manager.ts', seamModule).sort(), seamModule).toEqual(
+        expected[seamModule].sort(),
+      );
+    }
   });
 });
 
@@ -283,45 +316,39 @@ describe('worktree-cleanup.ts contains no literal seam call, and the only contai
     expect(/\b(getAgentMailbox|withMailboxSession|withExistingMailboxSession)\s*\(/.test(src)).toBe(false);
   });
 
-  it("worktree-cleanup.ts's only container-runner.ts imports are isContainerRunning, isContainerSpawning", () => {
-    const src = fs.readFileSync(path.join(REPO_ROOT, 'src/worktree-cleanup.ts'), 'utf8');
-    const match = /import\s*\{([^}]*)\}\s*from\s*['"]\.\/container-runner\.js['"]/.exec(src);
-    expect(match).not.toBeNull();
-    const names = match![1]
-      .split(',')
-      .map((n) => n.trim())
-      .filter(Boolean);
-    expect(names.sort()).toEqual(['isContainerRunning', 'isContainerSpawning'].sort());
-  });
-
   // 1553790a moved worktree-cleanup.ts's DB-path lookups (inboundDbPath,
   // openOutboundDb) off session-manager.js entirely, onto the mailbox
   // module's own sessionMailboxPath and openOutboundDb — the file now has no
-  // session-manager.js import at all. Pinning stays on the two files that
-  // replaced it, so a future import there still re-triggers this review.
-  it('worktree-cleanup.ts no longer imports from session-manager.js', () => {
-    const src = fs.readFileSync(path.join(REPO_ROOT, 'src/worktree-cleanup.ts'), 'utf8');
-    expect(/from\s*['"]\.\/session-manager\.js['"]/.test(src)).toBe(false);
+  // session-manager.js import at all, but DOES import from
+  // modules/mailbox/index.ts, which exports getAgentMailbox. Sweep every
+  // seam-adjacent module (not just the ones a pre-refactor test happened to
+  // check), asserting the exact — possibly empty — import set from each, so
+  // a new import from ANY of them, however named or aliased, re-triggers
+  // this review.
+  it('worktree-cleanup.ts imports exactly the pinned binding set from every seam-adjacent module', () => {
+    const expected: Record<(typeof SEAM_ADJACENT_MODULES)[number], string[]> = {
+      'src/session-manager.ts': [],
+      'src/container-runner.ts': ['isContainerRunning', 'isContainerSpawning'],
+      'src/delivery.ts': [],
+      'src/mailbox/index.ts': [],
+      'src/modules/mailbox/index.ts': ['sessionMailboxPath'],
+    };
+    for (const seamModule of SEAM_ADJACENT_MODULES) {
+      expect(pinnedImportsFrom('src/worktree-cleanup.ts', seamModule).sort(), seamModule).toEqual(
+        expected[seamModule].sort(),
+      );
+    }
   });
 
-  it("worktree-cleanup.ts's only modules/mailbox/openers.js import is openOutboundDb, and its only modules/mailbox/index.js import is sessionMailboxPath — pinned so a future import here re-triggers this review", () => {
-    const src = fs.readFileSync(path.join(REPO_ROOT, 'src/worktree-cleanup.ts'), 'utf8');
-
-    const openersMatch = /import\s*\{([^}]*)\}\s*from\s*['"]\.\/modules\/mailbox\/openers\.js['"]/.exec(src);
-    expect(openersMatch).not.toBeNull();
-    const openersNames = openersMatch![1]
-      .split(',')
-      .map((n) => n.trim())
-      .filter(Boolean);
-    expect(openersNames.sort()).toEqual(['openOutboundDb'].sort());
-
-    const indexMatch = /import\s*\{([^}]*)\}\s*from\s*['"]\.\/modules\/mailbox\/index\.js['"]/.exec(src);
-    expect(indexMatch).not.toBeNull();
-    const indexNames = indexMatch![1]
-      .split(',')
-      .map((n) => n.trim())
-      .filter(Boolean);
-    expect(indexNames.sort()).toEqual(['sessionMailboxPath'].sort());
+  // modules/mailbox/openers.ts is not itself a seam-adjacent module (it's the
+  // raw DB-open funnel worktree-cleanup.ts deliberately stays on — see the
+  // comment on that import in the source file — not an exporter of
+  // getAgentMailbox), so it sits outside the sweep above. Pinned separately
+  // for the same "future import re-triggers this review" reason.
+  it("worktree-cleanup.ts's only modules/mailbox/openers.js import is openOutboundDb", () => {
+    expect(pinnedImportsFrom('src/worktree-cleanup.ts', 'src/modules/mailbox/openers.ts').sort()).toEqual(
+      ['openOutboundDb'].sort(),
+    );
   });
 });
 
