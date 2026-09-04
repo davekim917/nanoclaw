@@ -60,16 +60,24 @@ afterAll(() => {
 
 // container-runner drags in the whole spawn path (docker, mounts, onecli). The
 // thread list only wants two functions off it, and both are injectable or
-// trivially stubbed.
-vi.mock('../../container-runner.js', () => ({
-  getActiveContainerSessionIds: () => [],
-  resolveAssistantName: (group: { name: string }) => Promise.resolve(`persona:${group.name}`),
-  // Reached through thread-close.ts's read side, which the list imports for
-  // `readThreadClosures`. Neither is called on this path; stubbed so the module
-  // graph resolves without the spawn path.
-  isContainerRunning: () => false,
-  killContainer: () => {},
-}));
+// trivially stubbed. Spread the real module rather than a bare literal — this
+// suite doesn't reach `sessionStillActive` today, but a literal with only the
+// functions this test happens to call throws "no such export" the moment
+// anything on the thread-close/router import path reaches for one that isn't
+// listed here, the way #291's guard conversion tripped four other suites.
+vi.mock('../../container-runner.js', async (importOriginal) => {
+  const real = await importOriginal<typeof import('../../container-runner.js')>();
+  return {
+    ...real,
+    getActiveContainerSessionIds: () => [],
+    resolveAssistantName: (group: { name: string }) => Promise.resolve(`persona:${group.name}`),
+    // Reached through thread-close.ts's read side, which the list imports for
+    // `readThreadClosures`. Neither is called on this path; stubbed so the module
+    // graph resolves without the spawn path.
+    isContainerRunning: () => false,
+    killContainer: () => {},
+  };
+});
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 

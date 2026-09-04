@@ -68,21 +68,21 @@ vi.mock('./session-manager.js', () => ({
   writeOutboundDirect: vi.fn(),
 }));
 
-vi.mock('./container-runner.js', async () => {
-  // Reads through this file's own `db/sessions` mock, so the guard answers what
-  // a test has set up rather than what the real DB happens to hold.
-  const { getSession } = await import('./db/sessions.js');
+// `...real` carries `sessionStillActive` through UNCHANGED — the REAL
+// predicate, not a hand-rolled copy. It closes over `getSession` from
+// `./db/sessions.js`, which this file mocks separately (above), so it answers
+// what a test has set up rather than what the real DB happens to hold.
+// Reusing it (rather than re-deriving its three axes here) is what keeps this
+// suite from drifting the way a hand-rolled copy previously had: it was
+// missing the `archived_at` axis `unwakeableReason` checks alongside
+// existence and `status`. Spreading `...real` also means a future caller
+// reaching for a different export off this module doesn't throw "no such
+// export" the way #291's guard conversion did to four other suites.
+vi.mock('./container-runner.js', async (importOriginal) => {
+  const real = await importOriginal<typeof import('./container-runner.js')>();
   return {
+    ...real,
     wakeContainer: vi.fn(),
-    // The real definition. The router hands its liveness proof to the WAKE PATH
-    // instead of making it before the call — it only builds the guard here; the
-    // wake path is what asks it, next to `spawn()`.
-    sessionStillActive: (sessionId: string) => () => {
-      const fresh = getSession(sessionId);
-      if (!fresh) return { ok: false, reason: 'session no longer exists' };
-      if (fresh.status !== 'active') return { ok: false, reason: `session is ${fresh.status}` };
-      return true;
-    },
   };
 });
 
