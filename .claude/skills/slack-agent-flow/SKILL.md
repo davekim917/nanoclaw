@@ -13,30 +13,10 @@ This is an operational skill — it installs no code. Everything it does is
 `ncl` work, `/add-slack`'s app install repeated per agent, and one run of the
 `/slack-a2a-rooms` opener.
 
-## What this fork does not do
-
-Upstream automates the Slack half: an agent calls `create_agent` and the host
-provisions a Slack app for it through a managed broker, hot-starts the adapter
-mid-process, opens the DM and the room, and offers `create_room` /
-`add_to_room` MCP tools plus a room canvas. **This fork has declined that
-provisioning model** (fork issue #234). It runs one Slack app per agent via
-suffix tokens, installed deliberately.
-
-Concretely, the following upstream steps have no equivalent here and are not
-part of this flow:
-
-| Upstream step                                                                                       | Here                                                                                                   |
-| --------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------ |
-| Managed app provisioning (`NANOCLAW_INSTALL_TOKEN` / `SLACK_MANAGER_TOKEN`, `apps.manifest.create`) | Install each Slack app by hand — `/add-slack`, or `/clone-as-codex` for a sibling of an existing group |
-| `/migrate-slack-agents`                                                                             | Must not be run on this install                                                                        |
-| Adapter hot-start after boot                                                                        | Restart the host so the new suffix token registers                                                     |
-| `create_room` / `add_to_room` MCP tools                                                             | `pnpm exec tsx scripts/open-a2a-room.ts` from `/slack-a2a-rooms`                                       |
-| Room canvas tab holding the room contract                                                           | Not built. Put the roster in the room's first message                                                  |
-| `SLACK_A2A_ROOMS` allowlist registration                                                            | Not needed — sibling bots are admitted everywhere                                                      |
-| `scripts/slack-agent-flow-finish.ts` resume script                                                  | Each step below is independently re-runnable                                                           |
-
-What carries over unchanged is the _shape_ of the result and the conventions
-for running it, which is what the rest of this document covers.
+Install each Slack app by hand: this install runs one app per agent as a
+suffix token and has no managed provisioning, so there is no broker to ask for
+an app and no `/migrate-slack-agents` to run against it. An agent that asks for
+a room gets one from the opener script in step 6, run by an operator.
 
 ## Prerequisites
 
@@ -93,24 +73,28 @@ the next step, and it is the one an agent cannot do for itself.
 ### 3. Install one Slack app per agent
 
 Repeat `/add-slack`'s app-creation steps once per agent, in the same
-workspace. For a sibling of an existing group, `/clone-as-codex` (or
-`/clone-as-opencode`) already scripts this whole leg including the env keys and
-the folder layout — use it rather than redoing the work here.
-
-Naming that works: the agent's name plus a suffix, so Slack's `@`-autocomplete
-groups them (`helper`, `helper-research`). The bot display name, the env
-suffix and the resulting channelType are independent but should be kept
-aligned:
+workspace. Name each bot after its agent plus a suffix so Slack's
+`@`-autocomplete groups them (`helper`, `helper-research`). The bot display
+name, the env suffix and the resulting channelType are independent but should
+be kept aligned:
 
 ```bash
 SLACK_BOT_TOKEN_<SUFFIX>=xoxb-…      # → channelType slack-<suffix-lowercased-with-dashes>
 SLACK_APP_TOKEN_<SUFFIX>=xapp-…      # Socket Mode
 ```
 
-**Add `mpim:write` to the scope list** if the agent will be in a shared room.
-`/add-slack`'s list does not include it, and it is what `conversations.open`
-needs. Adding a scope requires a reinstall, which mints a new bot token — so
-add it before you paste the token, not after.
+`/clone-as-codex` and `/clone-as-opencode` are a different entry point, not a
+shortcut for this step: each one creates its own new agent group, folder and
+container config alongside the app. Reach for one **instead of** step 2 when
+what you want is a provider sibling of an existing agent. For the groups step 2
+created, do the app install here and read `/clone-as-codex`'s env-var section
+as the reference for the token layout.
+
+Add `mpim:write` to exactly **one** app — the one that will open rooms, which
+is the first name you pass to `--instances` in step 6. The rest need only the
+`mpim:read` and `mpim:history` that `/add-slack` already asks for. Adding a
+scope requires a reinstall, which mints a new bot token, so add it before you
+paste that app's token rather than after.
 
 ### 4. Restart the host
 
@@ -187,10 +171,10 @@ Walk it once, in this order — each check tells you which step to go back to:
 
 ## Conventions worth setting
 
-These are what upstream ships as always-on agent instructions. Here they live
-in the container skill `slack-a2a-rooms`, which agents load on demand — put
-anything a specific team must always follow in that group's
-`standing-instructions.md` instead of assuming it.
+The agent-facing versions of these live in the container skill
+`slack-a2a-rooms`, which agents load on demand. Put anything a specific team
+must always follow in that group's `standing-instructions.md`, where it becomes
+standing context rather than something the agent has to go and read.
 
 - **Mention-driven turn taking.** A room is a group context, so the Slack group
   declaration applies: `engageMode: 'mention'`, which means every turn needs its
@@ -220,9 +204,10 @@ shows both.
 `@name` mention rather than a permissions problem — sibling bots are admitted
 past the access gate everywhere on this fork.
 
-**`conversations.open` fails with `missing_scope`.** The calling app has no
-`mpim:write`. See step 3.
+**`conversations.open` fails with `missing_scope`.** The app listed first in
+`--instances` is the one that opens the room, and it needs `mpim:write`. Add
+the scope there, reinstall, and update that app's token line. See step 3.
 
-**An agent asks to create a room itself.** There is no `create_room` tool here.
-The agent should create the groups and then tell the operator to run the opener
-in step 6.
+**An agent says it will open a room and then nothing happens.** Room creation
+is an operator step: the agent creates the groups and hands you the roster, and
+you run the opener in step 6. Tell it to report the roster and stop.

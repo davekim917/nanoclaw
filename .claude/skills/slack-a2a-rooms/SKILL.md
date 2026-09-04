@@ -17,20 +17,6 @@ that is this fork's one-app-per-agent model, and `/clone-as-codex` (or
 `/clone-as-opencode`) walks the whole second-app install if a sibling does not
 have one yet.
 
-## What this fork does differently
-
-Upstream ships this skill on top of a bot-inbound guard that **drops every
-bot-authored message by default** and re-admits it only inside rooms listed in
-a `SLACK_A2A_ROOMS` allowlist. This fork inverts that: sibling bots talking to
-each other in ordinary channels is a first-class feature, so
-`isSiblingBotSender` (`src/modules/permissions/access.ts`) admits them past the
-access gate everywhere, and `slack-hop-limit.ts` bounds only a runaway —
-per thread, counting only this host's own bots, `SLACK_MAX_BOT_HOPS` default 24.
-
-So there is **no allowlist to register a room in**, and nothing here writes to
-`.env`. Opening the room is the whole mechanical step; the rest is wiring the
-conversation to each agent group, which is ordinary `ncl` work.
-
 ## Requires
 
 - **The Slack channel installed** (`/add-slack`), with at least two bot
@@ -119,8 +105,8 @@ pnpm exec tsx scripts/open-a2a-room.ts --instances dana,eli --user <your-slack-u
 - `--user` is the human's Slack user id (`U…`/`W…`). Without it you get a
   bots-only room, which needs at least three instances, because Slack collapses
   a two-party open into a 1:1 IM.
-- The script prints the room's channel id. It writes nothing — not to `.env`,
-  not to the database.
+- The script prints the room's channel id and the `ncl` commands for the next
+  step. That channel id is the handle for everything below.
 
 ## Wiring the room
 
@@ -155,10 +141,13 @@ conversation under its own channelType.
 `/manage-channels` does the same thing conversationally if you would rather
 not assemble the ids by hand.
 
-**Access policy.** Sibling bots are admitted by `isSiblingBotSender` without
-any policy change, so a room usually needs none. A human in the room who is
-not yet a known sender is governed by the row's `unknown_sender_policy` as
-usual; a private room with known humans is a reasonable place to relax it:
+**Access policy governs the humans in the room.** Sibling bots reach the router
+in every conversation on this host — `isSiblingBotSender`
+(`src/modules/permissions/access.ts`) admits them, and `slack-hop-limit.ts`
+bounds a runaway exchange per thread at `SLACK_MAX_BOT_HOPS` (default 24). Set
+the policy for the people: a human who is not yet a known sender is governed by
+the row's `unknown_sender_policy`, and a private room with known humans is a
+reasonable place to relax it:
 
 ```bash
 ncl messaging-groups update --id <id> --unknown-sender-policy public
@@ -168,19 +157,22 @@ ncl messaging-groups update --id <id> --unknown-sender-policy public
 
 An MPIM is a _group_ context in the channel-defaults model (Slack DMs are only
 `D…` channels), so the Slack group declaration applies: `engageMode: 'mention'`
-(`SLACK_DEFAULTS`, `src/channels/slack.ts`). Each turn an agent takes needs its
-own mention — engagement does **not** persist across a thread the way
-`mention-sticky` would. Bot-to-bot conversation is therefore mention-driven by
-design: agent A's reply reaches agent B only when it @-mentions B, and the
-chain continues only as long as each reply mentions the next speaker.
+(`SLACK_DEFAULTS`, `src/channels/slack.ts`). Under it each turn an agent takes
+needs its own mention, which makes bot-to-bot conversation mention-driven by
+design: agent A's reply reaches agent B when it @-mentions B, and the chain
+continues as long as each reply mentions the next speaker.
 
-If a room should keep an agent engaged after the first mention, opt in per
-wiring — Slack declares `threads: true` for groups, so sticky is not coerced
-away here:
+To keep an agent engaged in a thread after the first mention, set sticky
+engagement on that wiring. Slack declares `threads: true` for groups, so
+`validateEngageAgainstChannel` keeps the mode rather than coercing it back:
 
 ```bash
 ncl wirings update --id <wiring id> --engage-mode mention-sticky
 ```
+
+The container skill's turn-taking rule follows whichever mode is set — it tells
+agents to answer the turn that woke them, so sticky rooms behave as configured
+without an instruction change.
 
 Slack does not emit `app_mention` for bot-authored messages, but mention
 detection still works on the message text. Note the direction of translation:
@@ -221,15 +213,17 @@ section covers it.
 ## Notes
 
 - **MPIM id prefix.** Older workspaces mint MPIM ids starting with `G`, newer
-  ones with `C`. Nothing here branches on the prefix, but the adapter's
-  visibility helper calls a `C…` id "workspace"-visible, which is cosmetic.
+  ones with `C`. Pass whichever the opener prints; the adapter's visibility
+  helper labels a `C…` id "workspace"-visible, which is cosmetic.
 - **Rooms never grow in place.** Slack mints a _new_ conversation when an MPIM's
   membership changes, so adding an agent later means opening a new room and
   wiring it. Open rooms complete where you can.
 - **Cross-host rooms.** The opener only handles tokens that live in this
   host's `.env`. For sibling bots on a different NanoClaw host, run it where
   the first bot's token lives and wire the room on the other host by hand.
-- **Edited bot messages** (`message_changed`) are not delivered as new inbound.
+- **Edited bot messages.** Slack sends an edit as `message_changed`, which the
+  adapter treats as an update rather than new inbound — an agent sees the
+  original text, so ask a sibling to post a correction rather than edit.
 - **Attribution.** A bot sender's `users` row takes whatever display name the
   bridge serialized, which is often `unknown` for bot events because
   `event.username` is frequently absent.

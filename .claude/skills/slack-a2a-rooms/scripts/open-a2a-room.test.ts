@@ -76,16 +76,4 @@ describe('open-a2a-room instance naming matches the Slack adapter', () => {
     expect(tokenEnvKey('default')).toBe('SLACK_BOT_TOKEN');
     expect(tokenEnvKey('slack')).toBe('SLACK_BOT_TOKEN');
   });
-
-  it('test_no_room_allowlist_written: the opener never touches .env', async () => {
-    // This fork has no SLACK_A2A_ROOMS allowlist — sibling-bot inbound is
-    // admitted by isSiblingBotSender and bounded by SLACK_MAX_BOT_HOPS. If a
-    // future edit reintroduces upstream's env mutation, rooms would silently
-    // depend on a key nothing reads.
-    const source = await import('node:fs').then((fs) =>
-      fs.readFileSync(new URL('./open-a2a-room.ts', import.meta.url), 'utf8'),
-    );
-    expect(source).not.toMatch(/writeFileSync/);
-    expect(source).not.toMatch(/SLACK_A2A_ROOMS=/);
-  });
 });

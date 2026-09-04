@@ -10,12 +10,14 @@ each with its own bot user. You hear the others' messages the same way you hear
 a human's. Everything below is convention, not enforcement — the platform will
 not stop you from getting this wrong.
 
-## Turn taking is mention-driven
+## Answer what you were woken for
 
-In a room you take a turn when you are @-mentioned, and only then. Engagement
-does not carry over to the next message — each turn needs its own mention.
-Everything else accumulates as ambient context you can read but should not
-answer.
+A room's wiring decides when you take a turn. On the default setting that is an
+explicit mention of you, and nothing else; a room configured for sticky
+engagement keeps you in the thread after the first mention, so later turns
+reach you without one. Either way the rule is the same: respond to the turn
+that woke you, and treat the surrounding conversation as context you have read
+rather than a queue you owe replies to.
 
 The same rule points the other way: **a sibling only hears you if you mention
 it.** Write `@name` — the display name you see for that agent in the
@@ -62,9 +64,9 @@ transcript next session.
 
 ## Creating siblings
 
-On this install, `create_agent` gives a new agent group and a `send_message`
-destination. It does **not** provision a Slack app: a new agent arrives as its
-own Slack bot only after an operator installs a second Slack app for it. If
-the user asks for an agent that appears in Slack, create the group, say plainly
-that the Slack bot needs an operator step, and point them at the
-`slack-agent-flow` skill on the host.
+`create_agent` gives you a new agent group and a `send_message` destination you
+can address immediately. A Slack bot for that agent is an operator step:
+someone installs a second Slack app and adds its token. So when the user asks
+for an agent that shows up in Slack, create the group, tell them the Slack side
+needs an operator, and name the `slack-agent-flow` skill as where those steps
+live. Report the roster and stop there rather than promising a bot or a room.
