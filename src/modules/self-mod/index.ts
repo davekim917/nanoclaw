@@ -26,6 +26,7 @@
  */
 import { reenterGuardedDeliveryAction, registerDeliveryAction } from '../../delivery.js';
 import { unguarded } from '../../guard/index.js';
+import { log } from '../../log.js';
 import { notifyAgent, registerApprovalHandler } from '../approvals/index.js';
 import { applyAddMcpServer, applyChangeModel, applyInstallPackages } from './apply.js';
 import { selfModAddMcpServer, selfModInstallPackages } from './guard.js';
@@ -41,13 +42,21 @@ registerDeliveryAction('install_packages', applyInstallPackages, {
   guardAction: selfModInstallPackages,
   precheck: validateInstallPackages,
   requestHold: requestInstallPackagesHold,
-  onDeny: (_content, session, reason) => notifyAgent(session, `install_packages denied: ${reason}`),
+  onDeny: (_content, session, reason) => {
+    void notifyAgent(session, `install_packages denied: ${reason}`).catch((err) =>
+      log.error('Failed to notify agent of install_packages denial', { err }),
+    );
+  },
 });
 registerDeliveryAction('add_mcp_server', applyAddMcpServer, {
   guardAction: selfModAddMcpServer,
   precheck: validateAddMcpServer,
   requestHold: requestAddMcpServerHold,
-  onDeny: (_content, session, reason) => notifyAgent(session, `add_mcp_server denied: ${reason}`),
+  onDeny: (_content, session, reason) => {
+    void notifyAgent(session, `add_mcp_server denied: ${reason}`).catch((err) =>
+      log.error('Failed to notify agent of add_mcp_server denial', { err }),
+    );
+  },
 });
 registerDeliveryAction(
   'change_model',

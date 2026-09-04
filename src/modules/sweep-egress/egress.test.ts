@@ -82,7 +82,9 @@ describe('the registered egress-network-reheal wrapper calls ensureEgressNetwork
   it('run(ctx) calls ensureEgressNetwork with no arguments', () => {
     const duty = getDuty('egress-network-reheal');
 
-    duty.run(fakeTickContext());
+    // The duty interface's `run` is typed `void | Promise<void>` to cover both
+    // sync and async duties; this one is sync (see index.ts).
+    void duty.run(fakeTickContext());
 
     expect(mockEnsureEgressNetwork).toHaveBeenCalledTimes(1);
     expect(mockEnsureEgressNetwork).toHaveBeenCalledWith();

@@ -30,13 +30,13 @@ import { notifyAgent, type ApprovalHandler } from '../approvals/index.js';
 export async function applyInstallPackages(payload: Record<string, unknown>, session: Session): Promise<void> {
   const agentGroup = getAgentGroup(session.agent_group_id);
   if (!agentGroup) {
-    notifyAgent(session, 'install_packages approved but agent group missing.');
+    await notifyAgent(session, 'install_packages approved but agent group missing.');
     return;
   }
 
   const configRow = getContainerConfig(agentGroup.id);
   if (!configRow) {
-    notifyAgent(session, 'install_packages approved but container config missing.');
+    await notifyAgent(session, 'install_packages approved but container config missing.');
     return;
   }
 
@@ -79,14 +79,27 @@ export async function applyInstallPackages(payload: Record<string, unknown>, ses
     });
     killContainer(session.id, 'rebuild applied', () => {
       const s = getSession(session.id);
-      if (s) wakeContainer(s);
+      if (s) {
+        void wakeContainer(s).catch((err) =>
+          log.error('Failed to wake container after install_packages rebuild', { err, sessionId: session.id }),
+        );
+      }
     });
     log.info('Container rebuild completed (bundled with install)', { agentGroupId: session.agent_group_id });
   } catch (e) {
-    notifyAgent(
-      session,
-      `Packages added to config (${pkgs}) but rebuild failed: ${e instanceof Error ? e.message : String(e)}. Tell the user — an admin will need to retry the install_packages request or inspect the build logs.`,
-    );
+    // Best-effort: updateContainerConfigJson above (before this try block)
+    // already committed the package list. This handler is reached almost
+    // exclusively via approval-replay (reenterGuardedDeliveryAction) — an
+    // awaited rejection here would propagate to response-handler.ts's catch,
+    // which attempts its own fallback notify; if that ALSO fails, the
+    // approval row is never deleted and stays clickable, risking a second
+    // buildAgentGroupImage + killContainer for an already-updated config.
+    void Promise.resolve(
+      notifyAgent(
+        session,
+        `Packages added to config (${pkgs}) but rebuild failed: ${e instanceof Error ? e.message : String(e)}. Tell the user — an admin will need to retry the install_packages request or inspect the build logs.`,
+      ),
+    ).catch((err) => log.warn('install_packages failure notification failed', { err, agentGroupId: session.agent_group_id }));
     log.error('Bundled rebuild failed after install approval', { agentGroupId: session.agent_group_id, err: e });
   }
 }
@@ -94,13 +107,13 @@ export async function applyInstallPackages(payload: Record<string, unknown>, ses
 export async function applyAddMcpServer(payload: Record<string, unknown>, session: Session): Promise<void> {
   const agentGroup = getAgentGroup(session.agent_group_id);
   if (!agentGroup) {
-    notifyAgent(session, 'add_mcp_server approved but agent group missing.');
+    await notifyAgent(session, 'add_mcp_server approved but agent group missing.');
     return;
   }
 
   const configRow = getContainerConfig(agentGroup.id);
   if (!configRow) {
-    notifyAgent(session, 'add_mcp_server approved but container config missing.');
+    await notifyAgent(session, 'add_mcp_server approved but container config missing.');
     return;
   }
 
@@ -129,7 +142,11 @@ export async function applyAddMcpServer(payload: Record<string, unknown>, sessio
   });
   killContainer(session.id, 'mcp server added', () => {
     const s = getSession(session.id);
-    if (s) wakeContainer(s);
+    if (s) {
+      void wakeContainer(s).catch((err) =>
+        log.error('Failed to wake container after add_mcp_server', { err, sessionId: session.id }),
+      );
+    }
   });
   log.info('MCP server add approved', { agentGroupId: session.agent_group_id });
 }
@@ -221,7 +238,11 @@ export async function performModelChange(
 
   killContainer(session.id, 'model changed', () => {
     const s = getSession(session.id);
-    if (s) wakeContainer(s);
+    if (s) {
+      void wakeContainer(s).catch((err) =>
+        log.error('Failed to wake container after model change', { err, sessionId: session.id }),
+      );
+    }
   });
 }
 

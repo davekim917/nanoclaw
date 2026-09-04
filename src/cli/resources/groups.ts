@@ -25,6 +25,7 @@ import {
 } from '../../db/container-configs.js';
 import { getDeniedModel } from '../../db/denied-models.js';
 import { assertValidGroupFolder } from '../../group-folder.js';
+import { log } from '../../log.js';
 import { canonicalizeIanaTimezone, timezoneRejectionReason } from '../../timezone.js';
 import { initGroupFilesystem } from '../../group-init.js';
 import { findSiblingParityDrifts } from '../../sibling-parity.js';
@@ -361,7 +362,11 @@ registerResource({
             message
               ? () => {
                   const s = getSession(ctx.sessionId);
-                  if (s) wakeContainer(s);
+                  if (s) {
+                    void wakeContainer(s).catch((err) =>
+                      log.error('Failed to wake container after ncl restart', { err, sessionId: ctx.sessionId }),
+                    );
+                  }
                 }
               : undefined,
           );

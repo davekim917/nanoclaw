@@ -156,7 +156,7 @@ describe('the registered thread-title-retry duty calls retryPendingThreadTitles'
     spy.mockClear();
     spy.mockImplementationOnce(async () => ({ attempted: 0, titled: 0 }));
 
-    t16Duty().run(fakeTickCtx);
+    void t16Duty().run(fakeTickCtx);
     await waitUntil(() => spy.mock.calls.length > 0);
 
     expect(spy).toHaveBeenCalledTimes(1);
@@ -173,7 +173,7 @@ describe('the registered thread-title-retry duty calls retryPendingThreadTitles'
         throw new Error('thread-title retry boom');
       });
 
-      t16Duty().run(fakeTickCtx);
+      void t16Duty().run(fakeTickCtx);
       await waitUntil(() => warn.mock.calls.length > 0);
 
       expect(warn).toHaveBeenCalledWith(

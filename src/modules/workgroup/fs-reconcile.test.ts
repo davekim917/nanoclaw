@@ -105,7 +105,7 @@ describe('reconcileWorkgroupFsState', () => {
     };
     seedMigrationReport(db, report);
 
-    await reconcileWorkgroupFsState(db);
+    reconcileWorkgroupFsState(db);
 
     // logs/ dir should now exist in tmpDir
     const logPath = path.join(tmpDir, 'logs', 'migration-036.log');

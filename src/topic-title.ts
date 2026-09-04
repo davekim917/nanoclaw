@@ -264,7 +264,9 @@ export function maybeRenameNewThread(
       // record either way.
       if (!renamed) renamedThreads.delete(threadPlatformId);
     }
-  })();
+  })().catch((err) => {
+    log.warn('maybeRenameNewThread: title attempt failed', { err, threadPlatformId });
+  });
 }
 
 /**

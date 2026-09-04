@@ -423,7 +423,7 @@ export async function startDiscordSlashCommands(): Promise<boolean> {
 
   client = new Client({ intents: [GatewayIntentBits.Guilds] });
 
-  client.once('clientReady', async () => {
+  const handleClientReady = async (): Promise<void> => {
     log.info('Discord slash-command client ready', { username: client?.user?.username });
     const clientId = client?.user?.id;
     if (clientId) {
@@ -439,6 +439,11 @@ export async function startDiscordSlashCommands(): Promise<boolean> {
       if (textChannel) {
         await textChannel.send(message);
       }
+    });
+  };
+  client.once('clientReady', () => {
+    handleClientReady().catch((err) => {
+      log.error('Discord clientReady handler failed', { err });
     });
   });
 

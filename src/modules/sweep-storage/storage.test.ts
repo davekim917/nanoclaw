@@ -224,8 +224,8 @@ describe('F-6.2', () => {
       sessions: [],
       activeContainerSessionIds: new Set<string>(),
     } as unknown as SweepTickContext;
-    t13!.run(ctx);
-    t13!.run(ctx);
+    void t13!.run(ctx);
+    void t13!.run(ctx);
 
     expect(mocks.runStorageMaintenanceInBackground).toHaveBeenCalledTimes(2);
   });
@@ -240,7 +240,7 @@ describe('F-6.2', () => {
     const sentinel = new Set(['sentinel-session-a', 'sentinel-session-b']);
     const ctx = { now: Date.now(), sessions: [], activeContainerSessionIds: sentinel } as unknown as SweepTickContext;
 
-    t13.run(ctx);
+    void t13.run(ctx);
     await Promise.resolve();
     await Promise.resolve();
 

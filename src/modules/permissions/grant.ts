@@ -97,21 +97,21 @@ export async function handleGrantAccess(content: Record<string, unknown>, sessio
   const targetAgentGroupId = typeof args.agentGroupId === 'string' ? args.agentGroupId : session.agent_group_id;
 
   if (!rawUser) {
-    notifyAgent(session, 'grant_access failed: `user` is required.');
+    await notifyAgent(session, 'grant_access failed: `user` is required.');
     return;
   }
   if (role !== 'member' && role !== 'admin') {
-    notifyAgent(session, `grant_access failed: role must be \`member\` or \`admin\`, got \`${role}\`.`);
+    await notifyAgent(session, `grant_access failed: role must be \`member\` or \`admin\`, got \`${role}\`.`);
     return;
   }
   if (!getAgentGroup(targetAgentGroupId)) {
-    notifyAgent(session, `grant_access failed: agent group \`${targetAgentGroupId}\` does not exist.`);
+    await notifyAgent(session, `grant_access failed: agent group \`${targetAgentGroupId}\` does not exist.`);
     return;
   }
 
   const callerId = await deriveCallerId(session);
   if (!callerId) {
-    notifyAgent(session, 'grant_access failed: could not determine caller (no recent inbound message).');
+    await notifyAgent(session, 'grant_access failed: could not determine caller (no recent inbound message).');
     return;
   }
 
@@ -124,17 +124,17 @@ export async function handleGrantAccess(content: Record<string, unknown>, sessio
       targetAgentGroupId,
       authority: describeAuthority(callerId, targetAgentGroupId),
     });
-    notifyAgent(session, `grant_access denied: you don't have authority over agent group \`${targetAgentGroupId}\`.`);
+    await notifyAgent(session, `grant_access denied: you don't have authority over agent group \`${targetAgentGroupId}\`.`);
     return;
   }
   if (role === 'admin' && !callerIsGlobal) {
-    notifyAgent(session, 'grant_access denied: only owner / global admin can grant `admin`. You can grant `member`.');
+    await notifyAgent(session, 'grant_access denied: only owner / global admin can grant `admin`. You can grant `member`.');
     return;
   }
 
   const targetUserId = resolveTargetUserId(rawUser, session);
   if (!targetUserId) {
-    notifyAgent(
+    await notifyAgent(
       session,
       `grant_access failed: could not resolve \`${rawUser}\` to a user id (needs a namespaced id, a platform mention, or a bare handle).`,
     );
@@ -145,7 +145,7 @@ export async function handleGrantAccess(content: Record<string, unknown>, sessio
 
   if (role === 'member') {
     if (isMember(targetUserId, targetAgentGroupId) || hasAdminPrivilege(targetUserId, targetAgentGroupId)) {
-      notifyAgent(session, `\`${targetUserId}\` already has access to \`${targetAgentGroupId}\`.`);
+      await notifyAgent(session, `\`${targetUserId}\` already has access to \`${targetAgentGroupId}\`.`);
       return;
     }
     addMember({
@@ -155,13 +155,20 @@ export async function handleGrantAccess(content: Record<string, unknown>, sessio
       added_at: new Date().toISOString(),
     });
     log.info('grant_access: member added', { callerId, targetUserId, targetAgentGroupId });
-    notifyAgent(session, `Granted member access: \`${targetUserId}\` → \`${targetAgentGroupId}\`.`);
+    // Best-effort: addMember above already committed. This is a system-action
+    // delivery handler — an awaited rejection here would leave the message
+    // undelivered, so the delivery loop retries the whole handler (re-adding
+    // an already-added member) rather than just re-attempting the
+    // notification.
+    void Promise.resolve(
+      notifyAgent(session, `Granted member access: \`${targetUserId}\` → \`${targetAgentGroupId}\`.`),
+    ).catch((err) => log.warn('grant_access notification failed', { targetUserId, targetAgentGroupId, err }));
     return;
   }
 
   // role === 'admin'
   if (isAdminOfAgentGroup(targetUserId, targetAgentGroupId)) {
-    notifyAgent(session, `\`${targetUserId}\` is already admin of \`${targetAgentGroupId}\`.`);
+    await notifyAgent(session, `\`${targetUserId}\` is already admin of \`${targetAgentGroupId}\`.`);
     return;
   }
   grantRole({
@@ -172,7 +179,10 @@ export async function handleGrantAccess(content: Record<string, unknown>, sessio
     granted_at: new Date().toISOString(),
   });
   log.info('grant_access: admin granted', { callerId, targetUserId, targetAgentGroupId });
-  notifyAgent(session, `Granted admin: \`${targetUserId}\` → \`${targetAgentGroupId}\`.`);
+  // Best-effort — see the matching comment on the member-grant path above.
+  void Promise.resolve(notifyAgent(session, `Granted admin: \`${targetUserId}\` → \`${targetAgentGroupId}\`.`)).catch(
+    (err) => log.warn('grant_access notification failed', { targetUserId, targetAgentGroupId, err }),
+  );
 }
 
 export async function handleRevokeAccess(content: Record<string, unknown>, session: Session): Promise<void> {
@@ -181,46 +191,46 @@ export async function handleRevokeAccess(content: Record<string, unknown>, sessi
   const targetAgentGroupId = typeof args.agentGroupId === 'string' ? args.agentGroupId : session.agent_group_id;
 
   if (!rawUser) {
-    notifyAgent(session, 'revoke_access failed: `user` is required.');
+    await notifyAgent(session, 'revoke_access failed: `user` is required.');
     return;
   }
   if (!getAgentGroup(targetAgentGroupId)) {
-    notifyAgent(session, `revoke_access failed: agent group \`${targetAgentGroupId}\` does not exist.`);
+    await notifyAgent(session, `revoke_access failed: agent group \`${targetAgentGroupId}\` does not exist.`);
     return;
   }
 
   const callerId = await deriveCallerId(session);
   if (!callerId) {
-    notifyAgent(session, 'revoke_access failed: could not determine caller.');
+    await notifyAgent(session, 'revoke_access failed: could not determine caller.');
     return;
   }
 
   const callerIsGlobal = isOwner(callerId) || isGlobalAdmin(callerId);
   const callerIsScopedAdmin = isAdminOfAgentGroup(callerId, targetAgentGroupId);
   if (!callerIsGlobal && !callerIsScopedAdmin) {
-    notifyAgent(session, `revoke_access denied: you don't have authority over agent group \`${targetAgentGroupId}\`.`);
+    await notifyAgent(session, `revoke_access denied: you don't have authority over agent group \`${targetAgentGroupId}\`.`);
     return;
   }
 
   const targetUserId = resolveTargetUserId(rawUser, session);
   if (!targetUserId) {
-    notifyAgent(session, `revoke_access failed: could not resolve \`${rawUser}\`.`);
+    await notifyAgent(session, `revoke_access failed: could not resolve \`${rawUser}\`.`);
     return;
   }
 
   // Never let a scoped admin revoke owner or global admin.
   if (!callerIsGlobal && (isOwner(targetUserId) || isGlobalAdmin(targetUserId))) {
-    notifyAgent(session, 'revoke_access denied: you cannot revoke an owner or global admin. Ask a global admin.');
+    await notifyAgent(session, 'revoke_access denied: you cannot revoke an owner or global admin. Ask a global admin.');
     return;
   }
   // Owners are never revoked via this path — sensitive, do it manually.
   if (isOwner(targetUserId)) {
-    notifyAgent(session, 'revoke_access refused: owner revocation must be done by direct edit (safety).');
+    await notifyAgent(session, 'revoke_access refused: owner revocation must be done by direct edit (safety).');
     return;
   }
   // Scoped admins can only revoke `member`, not `admin` (that's an escalation).
   if (!callerIsGlobal && isAdminOfAgentGroup(targetUserId, targetAgentGroupId)) {
-    notifyAgent(session, 'revoke_access denied: only a global admin can revoke another admin.');
+    await notifyAgent(session, 'revoke_access denied: only a global admin can revoke another admin.');
     return;
   }
 
@@ -235,18 +245,23 @@ export async function handleRevokeAccess(content: Record<string, unknown>, sessi
   }
 
   if (!revoked) {
-    notifyAgent(session, `\`${targetUserId}\` had no access to \`${targetAgentGroupId}\` to revoke.`);
+    await notifyAgent(session, `\`${targetUserId}\` had no access to \`${targetAgentGroupId}\` to revoke.`);
     return;
   }
   log.info('revoke_access: revoked', { callerId, targetUserId, targetAgentGroupId });
-  notifyAgent(session, `Revoked access: \`${targetUserId}\` ← \`${targetAgentGroupId}\`.`);
+  // Best-effort: removeMember/revokeRole above already committed. Same
+  // reasoning as the grant paths — an awaited rejection here would cause a
+  // full-handler retry that re-attempts an already-completed revoke.
+  void Promise.resolve(notifyAgent(session, `Revoked access: \`${targetUserId}\` ← \`${targetAgentGroupId}\`.`)).catch(
+    (err) => log.warn('revoke_access notification failed', { targetUserId, targetAgentGroupId, err }),
+  );
 }
 
 export async function handleListAccess(content: Record<string, unknown>, session: Session): Promise<void> {
   const args = content as GrantArgs;
   const targetAgentGroupId = typeof args.agentGroupId === 'string' ? args.agentGroupId : session.agent_group_id;
   if (!getAgentGroup(targetAgentGroupId)) {
-    notifyAgent(session, `list_access failed: agent group \`${targetAgentGroupId}\` does not exist.`);
+    await notifyAgent(session, `list_access failed: agent group \`${targetAgentGroupId}\` does not exist.`);
     return;
   }
 
@@ -267,7 +282,7 @@ export async function handleListAccess(content: Record<string, unknown>, session
   // Referenced for type-check silence on the import and future extension.
   void getUserRoles;
 
-  notifyAgent(session, lines.join('\n'));
+  await notifyAgent(session, lines.join('\n'));
 }
 
 const ACCESS_ACTION = unguarded(

@@ -445,8 +445,10 @@ describe('the registered central-housekeeping duties call their expected depende
 
     // The T17 `run` body is `void import(...).then(...)` — it returns before
     // the dynamic import resolves, so poll for the spy call rather than
-    // awaiting `run()` itself.
-    registeredDuty(SWEEP_DUTY_INVENTORY.T17).run(fakeTickCtx);
+    // awaiting `run()` itself. The duty interface's `run` is typed
+    // `void | Promise<void>` to cover both sync and async duties; this one is
+    // sync (see index.ts) so there's nothing to actually await here.
+    void registeredDuty(SWEEP_DUTY_INVENTORY.T17).run(fakeTickCtx);
     const start = Date.now();
     while (spy.mock.calls.length === 0) {
       if (Date.now() - start > 1000) throw new Error('timed out waiting for pruneDashboardTokens to be called');

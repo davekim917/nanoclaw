@@ -690,7 +690,7 @@ describe('the dormant module takes no action when the spawn_task capability is r
   it('the reconciler acts on nothing: getOrphanedTasks is empty and no side effect is scheduled', async () => {
     const duty = getDuty('orchestrator-reconciler');
 
-    duty.run(fakeTickContext());
+    void duty.run(fakeTickContext());
     await new Promise((resolve) => setImmediate(resolve)); // flush anything setImmediate would have queued
 
     expect(mockGetOrphanedTasks).toHaveBeenCalled();
@@ -715,7 +715,7 @@ describe('the dormant module takes no action when the spawn_task capability is r
     capabilityGranted = true;
     const duty = getDuty('orchestrator-reconciler');
 
-    duty.run(fakeTickContext());
+    void duty.run(fakeTickContext());
     await new Promise((resolve) => setImmediate(resolve));
 
     expect(completeSpawnSideEffects).toHaveBeenCalledWith('would-be-reconciled', 'parent-ag');
@@ -749,7 +749,7 @@ describe('the registered orchestrator-reconciler wrapper calls runReconcilerSwee
   it('run(ctx) calls runReconcilerSweep with no arguments', () => {
     const duty = getDuty('orchestrator-reconciler');
 
-    duty.run(fakeTickContext());
+    void duty.run(fakeTickContext());
 
     expect(runReconcilerSweep).toHaveBeenCalledTimes(1);
     expect(runReconcilerSweep).toHaveBeenCalledWith();
@@ -810,7 +810,7 @@ describe('the registered completed-task-auto-archive wrapper calls autoArchiveOl
   it('run(ctx) calls autoArchiveOldCompleted with no arguments', () => {
     const duty = getDuty('completed-task-auto-archive');
 
-    duty.run(fakeTickContext());
+    void duty.run(fakeTickContext());
 
     expect(autoArchiveOldCompleted).toHaveBeenCalledTimes(1);
     expect(autoArchiveOldCompleted).toHaveBeenCalledWith();

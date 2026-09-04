@@ -478,7 +478,11 @@ export async function quiesceSessionsForRepositoryMounts(
 }
 
 export function wakeRepositoryMountSessions(sessions: Session[]): void {
-  for (const session of sessions) wakeContainer(session);
+  for (const session of sessions) {
+    void wakeContainer(session).catch((err) =>
+      log.warn('Failed to wake session after repository mount quiescence', { sessionId: session.id, err }),
+    );
+  }
 }
 
 /**

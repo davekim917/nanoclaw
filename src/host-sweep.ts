@@ -893,7 +893,10 @@ export function startHostSweep(): void {
   // Before the first tick, never inside it: a warm that ran per tick would be
   // a second source of truth racing the map the tick is writing.
   warmQuietSessionCache();
-  sweep();
+  // sweep() wraps its own body in try/catch and always reschedules itself
+  // (see the comment above sweep()), so its returned promise never rejects —
+  // void is safe here.
+  void sweep();
 }
 
 export function stopHostSweep(): void {
@@ -916,7 +919,9 @@ async function sweep(): Promise<void> {
   } catch (err) {
     log.error('Host sweep tick threw — rescheduling anyway', { err });
   }
-  setTimeout(sweep, SWEEP_INTERVAL_MS);
+  setTimeout(() => {
+    void sweep();
+  }, SWEEP_INTERVAL_MS);
 }
 
 /**
