@@ -159,7 +159,7 @@ codex-review.sh open                      # unresolved Codex threads, TSV: threa
 codex-review.sh body <comment_id>         # the full finding
 codex-review.sh churn                     # findings by file AND by class across rounds — the churn detector
 codex-review.sh classes                   # the class table alone: invariant signature @ seam, sites, primitives
-codex-review.sh gate                      # the reframe gate — exit 3 when a class has run 3 rounds unfixed
+codex-review.sh gate [--committed-only]   # the reframe gate — exit 3 when a class has run 3 rounds unfixed
 codex-review.sh push [git push args…]     # gate, then push — the loop's only push path
 codex-review.sh reply <comment_id> <text> # reply on that thread
 codex-review.sh resolve <thread_id>       # mark it resolved
@@ -213,6 +213,12 @@ codex-review.sh push          # runs the reframe gate, then git push
 which skips the gate, and a site patch that reaches the remote has already
 generated the next round. An exit of 3 is the gate refusing: read it, and make
 the next commit the reframe it names.
+
+The gate in front of a push judges **committed history only**
+(`--committed-only`): a push sends commits, so an edit to the primitive still
+sitting in your working tree is not a reframe the PR will see. A bare
+`codex-review.sh gate` does count the working tree, which is what makes it
+useful before you commit.
 
 **In an agent container** the tool is `git_push`, and it runs this same gate
 before it pushes — the refusal comes back as the tool's error with the class,

@@ -30,8 +30,14 @@
  *
  * Commands
  *   review-churn.mjs classify [--json]   payload on stdin  → class table
- *   review-churn.mjs gate     [--json]   payload on stdin  → gate decision,
+ *   review-churn.mjs gate     [--json] [--committed-only]
+ *                                        payload on stdin  → gate decision,
  *                                        exit 3 = REFRAME REQUIRED
+ *
+ * `--committed-only` drops uncommitted work from the lift evidence. A bare
+ * `gate` counts the working tree, so it can be run before committing; a gate
+ * run in front of a PUSH must not, because a push sends committed history and
+ * an edit sitting in the working tree is not a reframe that reaches the PR.
  *
  * Payload (stdin, JSON):
  *   {
@@ -1090,7 +1096,7 @@ export async function main(argv) {
   const cmd = argv[0];
   const json = argv.includes('--json');
   if (cmd !== 'classify' && cmd !== 'gate') {
-    process.stderr.write('usage: review-churn.mjs classify|gate [--json]  < payload.json\n');
+    process.stderr.write('usage: review-churn.mjs classify|gate [--json] [--committed-only]  < payload.json\n');
     return 2;
   }
   const raw = await readStdin();
@@ -1106,7 +1112,9 @@ export async function main(argv) {
     process.stdout.write(json ? `${JSON.stringify(report, null, 2)}\n` : `${renderClasses(report)}\n`);
     return 0;
   }
-  const decision = decideGate(gitContext(payload), {
+  const context = gitContext(payload);
+  if (argv.includes('--committed-only')) context.worktree = [];
+  const decision = decideGate(context, {
     allowSitePatch: argv.includes('--allow-site-patch') ? true : undefined,
   });
   // Human text always goes to stderr so `--json` on stdout stays parseable and

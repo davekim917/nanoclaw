@@ -453,6 +453,22 @@ describe('review-churn gate', () => {
     expect(gate(payload).status).toBe(0);
   });
 
+  it('ignores uncommitted work under --committed-only, because a push sends commits', () => {
+    // The same evidence that lifts a pre-commit check must not lift a gate run
+    // in front of a push: an edit in the working tree never reaches the PR.
+    const payload = fixture('toctou-class');
+    payload.worktree = ['src/mailbox/write.ts'];
+    const out = spawn(['gate', '--json', '--committed-only'], payload);
+    expect(out.status).toBe(3);
+    expect((JSON.parse(out.stdout) as Decision).status).toBe('refuse');
+
+    // A commit at the primitive still lifts it.
+    payload.commits = [
+      { sha: 'jjj0000', date: AFTER, message: 'fix(mailbox): guard the write', files: ['src/mailbox/write.ts'] },
+    ];
+    expect(spawn(['gate', '--json', '--committed-only'], payload).status).toBe(0);
+  });
+
   it('does not accept a seam commit that predates the finding as the reframe', () => {
     const payload = fixture('toctou-class');
     payload.commits = [
@@ -981,7 +997,7 @@ describe('skill wiring', () => {
     // gate → push → record, in that order. Recording is a claim that a site
     // patch was pushed, so a refused push must not leave it in the PR body.
     expect(helper).toMatch(
-      /push\)\n[\s\S]*?run_gate\n\s+shift\n\s+git push "\$@"\n\s+if \[ -n "\$GATE_OVERRIDE_LINE" \]; then\n\s+record_site_patch_override/,
+      /push\)\n[\s\S]*?run_gate --committed-only\n\s+shift\n\s+git push "\$@"\n\s+if \[ -n "\$GATE_OVERRIDE_LINE" \]; then\n\s+record_site_patch_override/,
     );
     // Evaluating the gate writes nothing at all.
     const gateBranch = helper.slice(helper.indexOf('  gate)'), helper.indexOf('  push)'));

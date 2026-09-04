@@ -261,9 +261,12 @@ describe('topic-linked worktree topology', () => {
     const branch = git(worktree, ['branch', '--show-current']);
 
     const gateScript = join(root, 'refusing-gate.sh');
+    // Exits 3 only when invoked with --committed-only, so this also proves the
+    // push gate judges committed history rather than the working tree.
     writeFileSync(
       gateScript,
-      '#!/usr/bin/env bash\necho "REFRAME REQUIRED: inv:race @ src/mailbox/write.ts" >&2\nexit 3\n',
+      '#!/usr/bin/env bash\ncase "$*" in *--committed-only*) ;; *) exit 0 ;; esac\n' +
+        'echo "REFRAME REQUIRED: inv:race @ src/mailbox/write.ts" >&2\nexit 3\n',
     );
     chmodSync(gateScript, 0o755);
     process.env.NANOCLAW_REVIEW_CHURN_GATE_SCRIPT = gateScript;

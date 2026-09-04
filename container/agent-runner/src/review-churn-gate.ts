@@ -41,6 +41,15 @@ export const CHURN_GATE_SCRIPT_ENV = 'NANOCLAW_REVIEW_CHURN_GATE_SCRIPT';
 /** Exit status the skill's gate uses for REFRAME REQUIRED. */
 export const REFRAME_REQUIRED_EXIT = 3;
 
+/**
+ * `--committed-only` is not optional here. A bare `gate` counts uncommitted
+ * work at the primitive as evidence of the reframe, which is right for a
+ * pre-commit check and wrong in front of a push: `git_push` sends committed
+ * history, so an edit still sitting in the working tree would lift the gate
+ * for a push that leaves the fix behind.
+ */
+export const CHURN_GATE_ARGS = ['gate', '--committed-only'];
+
 const DEFAULT_TIMEOUT_MS = 45_000;
 
 export type ChurnGateResult =
@@ -61,14 +70,14 @@ export interface ChurnGateOptions {
   /** Override for tests; defaults to CHURN_GATE_SCRIPT_PATHS. */
   scriptPaths?: string[];
   /** Override for tests; defaults to spawning bash. */
-  run?: (script: string, worktree: string, timeoutMs: number) => ChurnGateRun;
+  run?: (script: string, args: string[], worktree: string, timeoutMs: number) => ChurnGateRun;
   timeoutMs?: number;
   exists?: (p: string) => boolean;
   env?: NodeJS.ProcessEnv;
 }
 
-function defaultRun(script: string, worktree: string, timeoutMs: number): ChurnGateRun {
-  const res = spawnSync('bash', [script, 'gate'], {
+function defaultRun(script: string, args: string[], worktree: string, timeoutMs: number): ChurnGateRun {
+  const res = spawnSync('bash', [script, ...args], {
     cwd: worktree,
     encoding: 'utf8',
     timeout: timeoutMs,
@@ -121,7 +130,7 @@ export function evaluateReviewChurnGate(options: ChurnGateOptions): ChurnGateRes
   const run = options.run ?? defaultRun;
   let result: ChurnGateRun;
   try {
-    result = run(script, options.worktree, options.timeoutMs ?? DEFAULT_TIMEOUT_MS);
+    result = run(script, CHURN_GATE_ARGS, options.worktree, options.timeoutMs ?? DEFAULT_TIMEOUT_MS);
   } catch (error) {
     return {
       status: 'skipped',

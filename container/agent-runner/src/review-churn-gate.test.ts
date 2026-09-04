@@ -10,6 +10,7 @@ import { tmpdir } from 'os';
 import { join } from 'path';
 
 import {
+  CHURN_GATE_ARGS,
   CHURN_GATE_SCRIPT_ENV,
   CHURN_GATE_SCRIPT_PATHS,
   evaluateReviewChurnGate,
@@ -25,7 +26,9 @@ const REFRAME_TEXT = [
   '  candidate primitive(s): writeSessionMessage',
 ].join('\n');
 
-function stub(result: Partial<ChurnGateRun>): (script: string, worktree: string, timeoutMs: number) => ChurnGateRun {
+function stub(
+  result: Partial<ChurnGateRun>,
+): (script: string, args: string[], worktree: string, timeoutMs: number) => ChurnGateRun {
   return () => ({ status: 0, stdout: '', stderr: '', ...result });
 }
 
@@ -77,6 +80,22 @@ describe('review churn gate at git_push', () => {
     expect(threw.status).toBe('skipped');
     if (threw.status !== 'skipped') return;
     expect(threw.reason).toContain('no bash on PATH');
+  });
+
+  test('judges only what the push will send', () => {
+    // A push carries committed history. Uncommitted work at the primitive is
+    // evidence for a pre-commit check, not for a push, so the gate is always
+    // invoked with --committed-only here.
+    expect(CHURN_GATE_ARGS).toEqual(['gate', '--committed-only']);
+    let seen: string[] = [];
+    evaluateReviewChurnGate({
+      ...present,
+      run: (_script, args) => {
+        seen = args;
+        return { status: 0, stdout: '', stderr: '' };
+      },
+    });
+    expect(seen).toEqual(['gate', '--committed-only']);
   });
 
   test('reads the mounted skill from both provider paths', () => {

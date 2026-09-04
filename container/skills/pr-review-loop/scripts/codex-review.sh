@@ -5,7 +5,7 @@
 #   codex-review.sh body <comment_id>         # full comment body for one finding
 #   codex-review.sh churn                     # findings by file AND by class across rounds — the churn detector
 #   codex-review.sh classes [--json]          # the class table alone (invariant signature @ seam)
-#   codex-review.sh gate                      # REFRAME gate: exit 3 when a class has run 3 rounds unfixed
+#   codex-review.sh gate [--committed-only]   # REFRAME gate: exit 3 when a class has run 3 rounds unfixed
 #   codex-review.sh push [git push args…]     # gate, then push — the loop's only push path
 #   codex-review.sh reply <comment_id> <text> # reply on that thread
 #   codex-review.sh resolve <thread_id>       # mark the thread resolved
@@ -150,7 +150,7 @@ run_gate() {
   local node out status=0 sha classes
   GATE_OVERRIDE_LINE=""
   node=$(runtime) || return 2
-  out=$(payload_json | "$node" "$CHURN_JS" gate --json) || status=$?
+  out=$(payload_json | "$node" "$CHURN_JS" gate --json "$@") || status=$?
   if [ "$status" -eq 0 ] && [ "$(printf '%s' "$out" | jq -r .status)" = "override" ]; then
     sha=$(git rev-parse --short HEAD)
     classes=$(printf '%s' "$out" | jq -r '[.unlifted[] | "`\(.key)`"] | join(", ")')
@@ -199,12 +199,21 @@ case "${1:?usage: open|churn|classes|gate|push|body|reply|resolve|status}" in
   gate)
     # Exit 3 = REFRAME REQUIRED. Do not push a site patch past this; the next
     # commit is the primitive fix. Read-only: see run_gate.
-    run_gate
+    #
+    # Counts uncommitted work at the primitive as evidence, so it can be run
+    # before committing. Pass --committed-only to judge only what a push would
+    # actually send — which is what the push path and the container's git_push
+    # tool both do.
+    shift
+    run_gate "$@"
     ;;
   push)
     # The loop's push path. The gate runs first so a refusal costs nothing —
     # a site patch that reaches the remote has already generated next round.
-    run_gate
+    # --committed-only because `git push` sends committed history: an edit to
+    # the primitive still sitting in the working tree would otherwise lift the
+    # gate for a push that leaves it behind.
+    run_gate --committed-only
     shift
     git push "$@"
     if [ -n "$GATE_OVERRIDE_LINE" ]; then

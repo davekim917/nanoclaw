@@ -582,10 +582,12 @@ export const gitPushTool: McpToolDefinition = {
     const repo = typeof args.repo === 'string' ? args.repo : '';
     const resolved = worktreeForTool(repo);
     if ('error' in resolved) return resolved.error;
-    // Before the lock and before the network: a container agent's push path is
-    // this tool, not the skill's `codex-review.sh push`, so the gate has to sit
-    // here or it does not exist for container review loops. It fails open —
-    // only an explicit refusal stops the push.
+    // A container agent's push path is this tool, not the skill's
+    // `codex-review.sh push`, so the gate has to sit here or it does not exist
+    // for container review loops. Outside the repository lock deliberately:
+    // the gate makes its own `gh` calls, and holding the lock across them would
+    // stall every sibling topic on this repo. It fails open — only an explicit
+    // refusal stops the push.
     const gate = evaluateReviewChurnGate({ worktree: resolved.context.worktree });
     if (gate.status === 'refused') return err(gate.message);
     try {
