@@ -1122,7 +1122,19 @@ describe('skill wiring', () => {
     expect(order.every((i) => i >= 0)).toBe(true);
     expect(order).toEqual([...order].sort((a, b) => a - b));
     // A named BRANCH resolves the PR, never the mutable checkout.
-    expect(helper).toMatch(/BRANCH:-\}" \]; then\n[\s\S]*?PR_LIST=\$\(gh pr list --repo "\$REPO" --head "\$BRANCH"/);
+    expect(helper).toMatch(/BRANCH:-\}" \]; then\n[\s\S]*?PR_LIST=\$\(resolve_pr_list "\$BRANCH"/);
+    // The verdict is about the branch the push UPDATES. The checkout's branch
+    // and BRANCH can both name something else whose PRs are clean, so the
+    // refspec's destination re-resolves before the gate runs.
+    expect(push).toContain('PUSH_DEST="${BASH_REMATCH[2]}"');
+    expect(push).toMatch(/PUSH_DEST" != "\$\{BRANCH:-\}"/);
+    expect(push).toContain('PR_LIST=$(resolve_pr_list "$PUSH_DEST"');
+    // The PR lives in the base repository, which a fork clone does not point
+    // at, and the listing is bounded — a full page fails closed rather than
+    // gating a subset.
+    expect(helper).toContain('base_repo()');
+    expect(helper).toContain('--limit "$PR_LIST_LIMIT"');
+    expect(helper).toContain('the listing may be truncated');
     // And every PR the branch resolves to, not the first: one branch can have
     // open PRs into two bases, a push updates both, and a verdict from one
     // would let a held class on the other ride along. The loop is inside

@@ -35,20 +35,51 @@ REPO="${REPO:-$(gh repo view --json nameWithOwner -q .nameWithOwner)}"
 # branch — `gh pr view` follows whatever is checked out at the moment it runs,
 # which a sibling sharing the worktree can change underneath it. No open PR for
 # the branch exits non-zero, which callers read as "no verdict", never as pass.
-if [ -z "${PR:-}" ] && [ -n "${BRANCH:-}" ]; then
-  # `--head` filters by branch NAME only ("<owner>:<branch>" syntax is not
-  # supported, per `gh pr list --help`), so a fork PR whose branch happens to
-  # share this name is returned alongside the first-party one and `.[0]` can
-  # pick it — the gate would then judge someone else's findings. The source
-  # repository is what disambiguates, so it is matched explicitly.
-  #
-  # And ALL of them, not the first: one branch can have open PRs into two base
-  # branches, `--head` does not separate those either, and a push updates every
-  # one of them. A verdict from one PR would let a held class on the other ride
-  # along, so every matching PR is gated (see `run_gate`).
-  PR_LIST=$(gh pr list --repo "$REPO" --head "$BRANCH" --state open \
+#
+# One implementation, because the push path resolves a second time once it has
+# parsed which branch the refspec actually updates — the checkout's branch and
+# the pushed branch need not be the same, and a verdict about the wrong one is
+# not a verdict.
+#
+# `--head` filters by branch NAME only ("<owner>:<branch>" syntax is not
+# supported, per `gh pr list --help`), so a fork PR whose branch happens to
+# share this name comes back alongside the first-party one; the source
+# repository is what disambiguates, and it is matched explicitly. Every match
+# is returned, not the first: one branch can have open PRs into two base
+# branches, `--head` does not separate those either, and a push updates every
+# one of them.
+#
+# The PR lives in the BASE repository, which is not always the one this clone
+# points at — a fork clone's PR targets upstream — so the fork's parent is
+# consulted when the fork itself has none. And the listing is bounded (`--limit`
+# defaults to 30): the limit is raised and a full page is treated as possible
+# truncation, which fails closed rather than gating a subset.
+PR_LIST_LIMIT=200
+resolve_pr_list() {
+  local branch="$1" repo="$2" out
+  out=$(gh pr list --repo "$repo" --head "$branch" --state open --limit "$PR_LIST_LIMIT" \
     --json number,headRepositoryOwner,headRepository \
     -q "[.[] | select(.headRepositoryOwner.login == \"${REPO%%/*}\" and .headRepository.name == \"${REPO##*/}\")] | .[].number")
+  if [ "$(printf '%s' "$out" | grep -c .)" -ge "$PR_LIST_LIMIT" ]; then
+    echo "branch $branch has at least $PR_LIST_LIMIT open PRs in $repo; the listing may be truncated and the gate will not judge a subset" >&2
+    exit 1
+  fi
+  printf '%s' "$out"
+}
+
+# The base repository for this branch: this repo, or its parent when this is a
+# fork with no PR of its own.
+base_repo() {
+  local parent
+  if [ -n "$(resolve_pr_list "$1" "$REPO")" ]; then printf '%s' "$REPO"; return 0; fi
+  parent=$(gh repo view "$REPO" --json parent -q 'if .parent then .parent.owner.login + "/" + .parent.name else "" end' 2>/dev/null || true)
+  if [ -n "$parent" ] && [ -n "$(resolve_pr_list "$1" "$parent")" ]; then printf '%s' "$parent"; return 0; fi
+  printf '%s' "$REPO"
+}
+
+if [ -z "${PR:-}" ] && [ -n "${BRANCH:-}" ]; then
+  REPO=$(base_repo "$BRANCH")
+  PR_LIST=$(resolve_pr_list "$BRANCH" "$REPO")
   [ -n "$PR_LIST" ] || { echo "no open PR for branch $BRANCH" >&2; exit 1; }
   PR=$(printf '%s\n' "$PR_LIST" | head -1)
 fi
@@ -180,6 +211,7 @@ $line" >/dev/null
 GATE_OVERRIDE_LINE=""
 GATE_OVERRIDE_LINES=()
 PUSH_HEAD=""
+PUSH_DEST=""
 run_gate() {
   local node out status=0 sha classes pr saved_pr="$PR"
   GATE_OVERRIDE_LINE=""
@@ -271,6 +303,7 @@ case "${1:?usage: open|churn|classes|gate|push|body|reply|resolve|status}" in
     # many-ref forms are refused here rather than gated on the wrong ref.
     shift
     PUSH_HEAD=""
+    PUSH_DEST=""
     push_refspecs=0
     push_positional=0
     for arg in "$@"; do
@@ -319,6 +352,7 @@ case "${1:?usage: open|churn|classes|gate|push|body|reply|resolve|status}" in
       # what IS accepted rather than a list of what is not.
       if [[ "$arg" =~ ^([0-9a-f]{7,40}):refs/heads/([^*?[:space:]^~:\\]+)$ ]]; then
         PUSH_HEAD="${BASH_REMATCH[1]}"
+        PUSH_DEST="${BASH_REMATCH[2]}"
       else
         echo "push refspec '$arg' is not <sha>:refs/heads/<branch> with a literal commit and no wildcard; the churn gate cannot pin a verdict to it" >&2
         exit 2
@@ -327,6 +361,17 @@ case "${1:?usage: open|churn|classes|gate|push|body|reply|resolve|status}" in
     if [ "$push_refspecs" -gt 1 ]; then
       echo "push sends $push_refspecs refspecs; the churn gate judges one branch at one commit" >&2
       exit 2
+    fi
+    # The gate is about the branch this push UPDATES, which is the refspec's
+    # destination — not the checkout's branch, and not BRANCH, either of which
+    # can name a different branch whose PRs are clean. Resolving again from the
+    # destination is what binds the verdict to the push; without it a clean
+    # verdict for A authorises a push that updates B.
+    if [ -n "$PUSH_DEST" ] && [ "$PUSH_DEST" != "${BRANCH:-}" ]; then
+      REPO=$(base_repo "$PUSH_DEST")
+      PR_LIST=$(resolve_pr_list "$PUSH_DEST" "$REPO")
+      [ -n "$PR_LIST" ] || { echo "no open PR for branch $PUSH_DEST" >&2; exit 1; }
+      PR=$(printf '%s\n' "$PR_LIST" | head -1)
     fi
     if [ -n "$PUSH_HEAD" ]; then
       run_gate --committed-only --head "$PUSH_HEAD"
