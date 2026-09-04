@@ -1118,18 +1118,26 @@ describe('writeSessionMessage re-provisions a deleted session folder', () => {
 
   it("a retry backoff moves process_after but NEVER the occurrence's scheduled slot", async () => {
     initSessionFolder(AG, SESS);
-    const db = new Database(inboundDbPath(AG, SESS));
+    const seed = new Database(inboundDbPath(AG, SESS));
     try {
-      insertTaskRow(db, {
+      insertTaskRow(seed, {
         id: 'task-crash-retry',
         seriesId: 'task-crash-retry',
         processAfter: '2026-01-05T09:00:00.000Z',
         recurrence: '0 9 * * *',
         content: JSON.stringify({ prompt: "prepare today's brief" }),
       });
+    } finally {
+      seed.close();
+    }
 
-      await deferMessageForFreshContextRetry(db, 'task-crash-retry', 600);
+    // The defer goes through the mailbox seam, which opens its own handle —
+    // hence the seed handle above is closed first and the assertions below
+    // read from a fresh one.
+    await deferMessageForFreshContextRetry(AG, SESS, 'task-crash-retry', 600);
 
+    const db = new Database(inboundDbPath(AG, SESS), { readonly: true });
+    try {
       const row = db
         .prepare('SELECT process_after, scheduled_for, tries FROM messages_in WHERE id = ?')
         .get('task-crash-retry') as { process_after: string; scheduled_for: string; tries: number };

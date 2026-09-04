@@ -44,7 +44,7 @@ vi.mock('../../session-manager.js', async (importOriginal) => {
 });
 
 import { closeDb, createAgentGroup, createMessagingGroup, getDb, initTestDb, runMigrations } from '../../db/index.js';
-import { ensureSchema } from '../../db/session-db.js';
+import { ensureSchema } from '../mailbox/schema.js';
 import { createDestination } from './db/agent-destinations.js';
 import { writeDestinations } from './write-destinations.js';
 

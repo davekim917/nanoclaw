@@ -33,7 +33,8 @@ vi.mock('../log.js', async (importOriginal) => ({
 
 import { closeDb, deleteSession, getDb, initTestDb, runMigrations } from '../db/index.js';
 import { getDeliveryAction, type DeliveryActionHandler } from '../delivery.js';
-import { inboundDbPath, initSessionFolder } from '../session-manager.js';
+import { inboundDbPath } from '../mailbox/sqlite/paths.js';
+import { initSessionFolder } from '../session-manager.js';
 import type { Session } from '../types.js';
 import './delivery-action.js';
 import { claimCliRequest, completeCliRequest, pruneCliRequestExecutions } from './request-ledger.js';

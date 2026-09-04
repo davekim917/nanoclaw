@@ -18,7 +18,7 @@ import os from 'os';
 import path from 'path';
 import { describe, it, expect, afterEach, vi } from 'vitest';
 
-import { deferMessageForFreshContextRetry } from '../session-manager.js';
+import { deferForFreshContextRetry } from './ops/admission.js';
 import {
   openInboundDb,
   openOutboundDb,
@@ -491,7 +491,7 @@ describe('migrateMessagesInTable', () => {
     ).run('legacy-then-crash', 2, '2026-01-04T12:05:00.000Z', '2026-01-05T09:00:00.000Z');
 
     migrateMessagesInTable(db);
-    deferMessageForFreshContextRetry(db, 'legacy-then-crash', 600);
+    deferForFreshContextRetry(db, 'legacy-then-crash', 600);
 
     const row = db
       .prepare('SELECT process_after, scheduled_for FROM messages_in WHERE id = ?')

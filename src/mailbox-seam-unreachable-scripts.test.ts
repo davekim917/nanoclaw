@@ -56,10 +56,9 @@ import { randomBytes } from 'node:crypto';
 import { afterEach, describe, expect, it } from 'vitest';
 import ts from 'typescript';
 
+import { inboundDbPath, outboundDbPath } from './mailbox/sqlite/paths.js';
 import {
-  inboundDbPath,
   isAdmissiblePreTurnTrigger,
-  outboundDbPath,
   readThreadDirOwner,
   sessionContextPathFor,
   sessionsBaseDir,
