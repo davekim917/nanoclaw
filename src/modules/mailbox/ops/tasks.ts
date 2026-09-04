@@ -445,28 +445,18 @@ export interface TaskSeriesSnapshot extends TaskRowSnapshot {
 }
 
 /**
- * The row `upsertTaskSeries` would UPDATE, captured so it can be put back.
+ * What one `upsertTaskSeries` did, in the terms a compensation needs.
  *
- * Deliberately the SAME predicate the upsert uses to decide UPDATE-vs-INSERT
- * (`status IN ('pending','paused')`, terminal rows treated as absent). If these
- * two ever disagreed, a compensation would restore a row the upsert did not
- * touch, or miss the one it did.
+ * `touchedId` is the row it inserted or updated — the ONLY row it may undo.
+ * `prior` is that row as it stood before, or `null` when the upsert created it.
  */
-export function readLiveTaskSeriesRow(db: Database.Database, seriesId: string): TaskSeriesSnapshot | null {
-  return (
-    (db
-      .prepare(
-        `SELECT id, series_id, status, process_after, recurrence, content,
-                platform_id, channel_type, thread_id, kind, timestamp
-           FROM messages_in
-          WHERE series_id = ? AND status IN ('pending', 'paused')`,
-      )
-      .get(seriesId) as TaskSeriesSnapshot | undefined) ?? null
-  );
+export interface UpsertedTaskSeries {
+  touchedId: string;
+  prior: TaskSeriesSnapshot | null;
 }
 
 /**
- * Put a series back the way `readLiveTaskSeriesRow` found it.
+ * Put back the ONE row an `upsertTaskSeries` inserted or updated.
  *
  * `scheduleTask` writes to TWO databases with no transaction spanning them: the
  * task row in the session's `inbound.db`, and `sessions.task_routing_platform_id`
@@ -475,15 +465,23 @@ export function readLiveTaskSeriesRow(db: Database.Database, seriesId: string): 
  * chooses which side is left ahead when the other fails. So the second write
  * failing is compensated rather than ordered around.
  *
- * `prior === null` means the upsert INSERTED a series that did not exist, and
- * the compensation is to remove it. A non-null `prior` means the upsert UPDATED
- * in place, and the compensation is to put the captured values back.
+ * Addressed by ROW ID, never by `series_id`. A series can hold more than one
+ * live row: `ncl tasks run` inserts a `<series>-run` occurrence alongside the
+ * scheduled one, deliberately, so an on-demand fire reports to the same
+ * destination (`src/cli/resources/tasks.ts`). A compensation that cleared every
+ * live row of the series would cancel that sibling occurrence outright, and
+ * `prior` could only put one of them back — turning a failed re-schedule into
+ * silent data loss on a row it never touched.
  *
- * Both cases clear whatever is live first, so one path covers them: the upsert's
- * update branch keeps the row id, its insert branch mints one, and deleting by
- * the live predicate does not have to know which happened.
+ * `touchedId` and `prior` therefore both come from `upsertTaskSeries`' OWN
+ * selection rather than a second query. Two lookups over an unordered
+ * `SELECT … LIMIT 1` could disagree about which live row is "the" one, and
+ * disagreeing here means restoring a row that was never overwritten.
  *
- * Two fields do NOT come back byte-identical, both deliberately:
+ * `prior === null` means the upsert INSERTED, and removing that insert is the
+ * restore.
+ *
+ * Two fields do not come back byte-identical, both deliberately:
  *   - `seq` is freshly allocated, because the row is re-inserted. A successful
  *     re-schedule re-seqs too, so this is a state the series reaches normally.
  *   - the recall partner stays deleted. The upsert removes it precisely so a
@@ -494,15 +492,13 @@ export function readLiveTaskSeriesRow(db: Database.Database, seriesId: string): 
  * What DOES come back exactly is everything a caller or the dashboard reads:
  * the row id, series identity, status, due time, recurrence, content and route.
  */
-export function restoreTaskSeries(db: Database.Database, seriesId: string, prior: TaskSeriesSnapshot | null): void {
+export function restoreTaskSeries(db: Database.Database, touchedId: string, prior: TaskSeriesSnapshot | null): void {
   db.transaction(() => {
-    const live = db
-      .prepare("SELECT id FROM messages_in WHERE series_id = ? AND status IN ('pending', 'paused')")
-      .all(seriesId) as Array<{ id: string }>;
-    for (const row of live) {
-      db.prepare("DELETE FROM messages_in WHERE id = ? AND kind = 'system'").run(`recall-${row.id}`);
-      db.prepare('DELETE FROM messages_in WHERE id = ?').run(row.id);
-    }
+    // The update branch already removed this; the insert branch never had one.
+    // Kept so the undo is complete on its own terms rather than by relying on
+    // what the upsert happened to do first.
+    db.prepare("DELETE FROM messages_in WHERE id = ? AND kind = 'system'").run(`recall-${touchedId}`);
+    db.prepare('DELETE FROM messages_in WHERE id = ?').run(touchedId);
     if (!prior) return;
     restoreTaskRow(db, prior);
     // `restoreTaskRow` stamps `new Date()`, which is right for its board-move
@@ -536,16 +532,28 @@ export function upsertTaskSeries(
     channelType: string | null;
     threadId: string | null;
   },
-): void {
-  db.transaction(() => {
-    const activeRow = db
-      .prepare("SELECT id FROM messages_in WHERE series_id = ? AND status IN ('pending', 'paused')")
-      .get(row.seriesId) as { id: string } | undefined;
+): UpsertedTaskSeries {
+  return db
+    .transaction((): UpsertedTaskSeries => {
+      // The full row, not just its id, and selected ONCE. `scheduleTask` has to
+      // be able to undo this write when its central-DB companion fails, and the
+      // only place that knows WHICH live row was chosen is here. A caller
+      // re-running this SELECT could land on a different row when the series has
+      // more than one live occurrence (`ncl tasks run` creates exactly that), and
+      // would then restore a row this never overwrote.
+      const activeRow = db
+        .prepare(
+          `SELECT id, series_id, status, process_after, recurrence, content,
+                platform_id, channel_type, thread_id, kind, timestamp
+           FROM messages_in
+          WHERE series_id = ? AND status IN ('pending', 'paused')`,
+        )
+        .get(row.seriesId) as TaskSeriesSnapshot | undefined;
 
-    if (activeRow) {
-      db.prepare("DELETE FROM messages_in WHERE id = ? AND kind = 'system'").run(`recall-${activeRow.id}`);
-      db.prepare(
-        `UPDATE messages_in
+      if (activeRow) {
+        db.prepare("DELETE FROM messages_in WHERE id = ? AND kind = 'system'").run(`recall-${activeRow.id}`);
+        db.prepare(
+          `UPDATE messages_in
             SET seq           = ?,
                 process_after = ?,
                 scheduled_for = ?,
@@ -557,39 +565,43 @@ export function upsertTaskSeries(
                 tries         = 0,
                 trigger       = 0
           WHERE id = ?`,
+        ).run(
+          nextEvenSeq(db),
+          row.processAfter,
+          // The slot moves with the deadline on a re-schedule: this IS a
+          // reschedule, not a run-now, so the occurrence is now FOR the new time.
+          row.processAfter,
+          row.recurrence,
+          row.content,
+          row.platformId,
+          row.channelType,
+          row.threadId,
+          activeRow.id,
+        );
+        return { touchedId: activeRow.id, prior: activeRow };
+      }
+
+      db.prepare(
+        `INSERT INTO messages_in
+         (id, seq, kind, timestamp, status, tries, process_after, scheduled_for, recurrence, series_id, content,
+          platform_id, channel_type, thread_id, trigger)
+       VALUES (?, ?, 'task', ?, 'pending', 0, ?, ?, ?, ?, ?, ?, ?, ?, 0)`,
       ).run(
+        row.id,
         nextEvenSeq(db),
+        new Date().toISOString(),
         row.processAfter,
         row.processAfter,
         row.recurrence,
+        row.seriesId,
         row.content,
         row.platformId,
         row.channelType,
         row.threadId,
-        activeRow.id,
       );
-      return;
-    }
-
-    db.prepare(
-      `INSERT INTO messages_in
-         (id, seq, kind, timestamp, status, tries, process_after, scheduled_for, recurrence, series_id, content,
-          platform_id, channel_type, thread_id, trigger)
-       VALUES (?, ?, 'task', ?, 'pending', 0, ?, ?, ?, ?, ?, ?, ?, ?, 0)`,
-    ).run(
-      row.id,
-      nextEvenSeq(db),
-      new Date().toISOString(),
-      row.processAfter,
-      row.processAfter,
-      row.recurrence,
-      row.seriesId,
-      row.content,
-      row.platformId,
-      row.channelType,
-      row.threadId,
-    );
-  }).immediate();
+      return { touchedId: row.id, prior: null };
+    })
+    .immediate();
 }
 
 /* ─── Host-gated pre-task scripts ─────────────────────────────────────────── */

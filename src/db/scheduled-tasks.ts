@@ -323,17 +323,20 @@ export async function scheduleTask(def: TaskDef): Promise<void> {
       // where the caller sees a rejection over a task that is committed at its
       // new destination.
       //
-      // So the pair is compensated. Capture what the upsert is about to
-      // overwrite (or `null`, meaning it is about to create the series), write
-      // the task row, then stamp; if the stamp throws, put the task row back and
-      // rethrow. The caller's contract is unchanged — a rejection still means
-      // nothing moved — and now the inbound side agrees with the central side
-      // the caller and the dashboard will read.
+      // So the pair is compensated. Write the task row, then stamp; if the stamp
+      // throws, put back the ONE row the upsert touched and rethrow. The
+      // caller's contract is unchanged — a rejection still means nothing moved —
+      // and now the inbound side agrees with the central side the caller and
+      // the dashboard will read.
+      //
+      // The undo is addressed by ROW ID, from the upsert's own return value,
+      // never by `series_id`: a series can hold a second live row (`ncl tasks
+      // run` inserts one deliberately), and clearing the series would cancel an
+      // occurrence this write never touched.
       //
       // Nothing awaits between any of these, so no concurrent `scheduleTask`
-      // for this series can interleave with the capture-write-restore triple.
-      const prior = mailbox.readLiveTaskSeriesRow(def.seriesId);
-      mailbox.upsertTaskSeries({
+      // for this series can interleave with the write-stamp-restore triple.
+      const upserted = mailbox.upsertTaskSeries({
         id: def.id,
         seriesId: def.seriesId,
         processAfter: def.processAfter,
@@ -347,7 +350,7 @@ export async function scheduleTask(def: TaskDef): Promise<void> {
         setTaskRoutingPlatformId(sessionId, def.destination.platformId);
       } catch (err) {
         try {
-          mailbox.restoreTaskSeries(def.seriesId, prior);
+          mailbox.restoreTaskSeries(upserted.touchedId, upserted.prior);
         } catch (restoreErr) {
           // Both databases are now unhappy and the series is genuinely
           // inconsistent. Say so loudly; the caller still gets the original

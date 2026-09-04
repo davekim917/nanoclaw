@@ -1057,6 +1057,76 @@ describe('test_scheduleTask_revalidates_the_session_after_the_await', () => {
   });
 
   /**
+   * A series can hold more than one live row, and the undo must touch only one.
+   *
+   * `ncl tasks run` inserts a `<series>-run` occurrence alongside the scheduled
+   * one, on purpose, so an on-demand fire reports to the same destination
+   * (`runTaskCommand` in `src/cli/resources/tasks.ts`). A compensation that
+   * cleared every live row of the series would cancel that occurrence outright,
+   * and the single captured snapshot could only put one row back — a failed
+   * re-schedule turning into silent data loss on a row it never wrote.
+   *
+   * The assertion is the whole live set, not just the sibling: a correct undo
+   * leaves every live row exactly as it was, whichever one the upsert selected.
+   */
+  it('restores only the row it touched, leaving a sibling live occurrence alone', async () => {
+    const processAfter = new Date(Date.now() + 86400000).toISOString();
+    const base = {
+      agentGroupId: AGENT_GROUP_ID,
+      cron: '0 5 * * *',
+      processAfter,
+      seriesId: 's-sibling',
+    };
+    await scheduleTask({ ...base, id: 't-sib-1', prompt: 'scheduled', destination: TEST_DESTINATION });
+    const sessionId = taskSessionIdFor('s-sibling');
+
+    // The run-now occupant, planted the way `ncl tasks run` does: same series,
+    // its own row id, recurrence NULL so `handleRecurrence` cannot re-arm it.
+    {
+      const db = openInboundDb(inboundPath(sessionId));
+      db.prepare(
+        `INSERT INTO messages_in
+           (id, seq, kind, timestamp, status, tries, process_after, recurrence, series_id, content,
+            platform_id, channel_type, thread_id, trigger)
+         VALUES ('t-sib-1-run', 999, 'task', ?, 'pending', 0, ?, NULL, 's-sibling', ?, ?, ?, NULL, 0)`,
+      ).run(
+        new Date().toISOString(),
+        new Date().toISOString(),
+        JSON.stringify({ prompt: 'run now' }),
+        TEST_PLATFORM_ID,
+        TEST_CHANNEL_TYPE,
+      );
+      db.close();
+    }
+
+    const liveRows = (): Array<Record<string, unknown>> => {
+      const db = openInboundDb(inboundPath(sessionId));
+      const rows = db
+        .prepare(
+          `SELECT id, series_id, status, process_after, recurrence, content,
+                  platform_id, channel_type, thread_id, kind, timestamp
+             FROM messages_in
+            WHERE series_id = 's-sibling' AND status IN ('pending', 'paused')
+         ORDER BY id`,
+        )
+        .all() as Array<Record<string, unknown>>;
+      db.close();
+      return rows;
+    };
+    const before = liveRows();
+    expect(before.map((r) => r.id)).toEqual(['t-sib-1', 't-sib-1-run']);
+
+    failsRoutingStamp.sessionId = sessionId;
+    await expect(
+      scheduleTask({ ...base, id: 't-sib-2', prompt: 'rescheduled', destination: TEST_DESTINATION }),
+    ).rejects.toThrow(/database is locked/);
+
+    // Both rows survive, both unchanged. Undoing by `series_id` deletes the
+    // run-now row and never brings it back.
+    expect(liveRows()).toEqual(before);
+  });
+
+  /**
    * And when there was no prior row, the compensation is a removal.
    *
    * A series whose only row is terminal is treated as absent by the upsert, so

@@ -84,7 +84,6 @@ import {
   insertRecurrence,
   insertTaskRow,
   listDueTaskRows,
-  readLiveTaskSeriesRow,
   resolvePendingTask,
   restoreTaskRow,
   restoreTaskSeries,
@@ -97,6 +96,7 @@ import {
   type TaskRowInsert,
   type TaskRowSnapshot,
   type TaskSeriesSnapshot,
+  type UpsertedTaskSeries,
   type TaskUpdate as ForkTaskUpdate,
 } from './ops/tasks.js';
 import {
@@ -195,6 +195,7 @@ export {
   type TaskRowSnapshot,
   type TaskSeriesSnapshot,
   type TaskUpdate,
+  type UpsertedTaskSeries,
 } from './ops/tasks.js';
 export {
   CLOSE_REASON_MAX_CHARS,
@@ -382,12 +383,13 @@ export interface NanoclawMailboxSession extends MailboxSession {
   ): void;
   restoreTaskRow(snapshot: TaskRowSnapshot): void;
   /**
-   * The live row `upsertTaskSeries` would UPDATE, captured so a caller whose
-   * SECOND write (in another database) fails can put this one back.
+   * Undo one `upsertTaskSeries`, addressed by the row it actually touched.
+   *
+   * Both arguments come from that upsert's own return value. A series can hold
+   * more than one live row, so undoing by `series_id` would cancel a sibling
+   * occurrence this write never touched.
    */
-  readLiveTaskSeriesRow(seriesId: string): TaskSeriesSnapshot | null;
-  /** Undo an `upsertTaskSeries`: restore `prior`, or remove the series it created. */
-  restoreTaskSeries(seriesId: string, prior: TaskSeriesSnapshot | null): void;
+  restoreTaskSeries(touchedId: string, prior: TaskSeriesSnapshot | null): void;
   cancelSeriesWithStrandClear(taskId: string): number;
   upsertTaskSeries(row: {
     id: string;
@@ -398,7 +400,8 @@ export interface NanoclawMailboxSession extends MailboxSession {
     platformId: string | null;
     channelType: string | null;
     threadId: string | null;
-  }): void;
+    /** Returns the row it touched and that row's prior state, for `restoreTaskSeries`. */
+  }): UpsertedTaskSeries;
   listDueTaskRows(): HostGatedTaskRow[];
   resolvePendingTask(taskId: string, status: 'completed' | 'failed'): void;
   setPendingTaskContent(taskId: string, content: string): void;
@@ -836,8 +839,7 @@ function forkOps(
     armNextRecurrence: (originalId, msg, newId, nextRun, status) =>
       armNextTask(inbound, originalId, msg, newId, nextRun, status),
     restoreTaskRow: (snapshot) => restoreTaskRow(inbound, snapshot),
-    readLiveTaskSeriesRow: (seriesId) => readLiveTaskSeriesRow(inbound, seriesId),
-    restoreTaskSeries: (seriesId, prior) => restoreTaskSeries(inbound, seriesId, prior),
+    restoreTaskSeries: (touchedId, prior) => restoreTaskSeries(inbound, touchedId, prior),
     cancelSeriesWithStrandClear: (taskId) => cancelSeriesWithStrandClear(inbound, taskId),
     upsertTaskSeries: (row) => upsertTaskSeries(inbound, row),
     listDueTaskRows: () => listDueTaskRows(inbound),
