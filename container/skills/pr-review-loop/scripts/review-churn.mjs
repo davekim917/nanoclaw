@@ -286,6 +286,20 @@ export function importsOf(rawSource) {
   return out;
 }
 
+/**
+ * Matches a bound name as a whole JavaScript identifier.
+ *
+ * `\b` is the wrong boundary here: it sits between a word and a non-word
+ * character, and `$` is a non-word character, so `\b$guard\b` neither anchors
+ * where it looks like it does nor survives being interpolated — `$` is a regex
+ * metacharacter. The name is escaped and the boundaries are explicit: no
+ * identifier character on either side.
+ */
+export function identifierMatcher(name) {
+  const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return new RegExp(`(?<![A-Za-z0-9_$])${escaped}(?![A-Za-z0-9_$])`);
+}
+
 /** Relative specifiers resolve to repo-relative paths; `.js` → `.ts` (ESM TS). */
 export function resolveSpec(fromFile, spec) {
   if (!spec.startsWith('.')) return spec;
@@ -330,8 +344,9 @@ export function seamFor(files, findingText, ctx) {
     spec: e.spec,
     inRepo: e.relative,
     fileCount: e.files.size,
-    // Whole identifiers: `get` must not count because a finding said "target".
-    mentioned: [...e.names.keys()].filter((n) => new RegExp(`\\b${n}\\b`).test(findingText)),
+    // Whole identifiers: `get` must not count because a finding said "target",
+    // and `$guard` must count when a finding names it.
+    mentioned: [...e.names.keys()].filter((n) => identifierMatcher(n).test(findingText)),
     names: [...e.names.keys()],
   }));
   scored.sort(
@@ -561,41 +576,59 @@ function invariantNamed(entry, trailer) {
 }
 
 /**
- * Is an identifier the trailer names DECLARED BY this commit?
+ * Did this commit INTRODUCE a declaration of something the trailer names?
  *
- * The current contents of a touched file are not evidence: a site patch could
- * edit a file for something unrelated and point its trailer at a helper that
- * was already there. So this reads the commit's own added lines. Length is not
- * a filter either — `run`, `tx` and `get` are ordinary primitive names, and a
- * short name still has to appear in a declaration the commit introduced.
+ * Read from the file either side of the commit, never from the diff. A diff
+ * hunk is text without context — an added line sitting inside a block comment
+ * whose delimiters never changed looks exactly like code — and three rounds of
+ * this review went into enumerating the ways a line can fail to be code before
+ * the answer turned out to be "ask the file, where the question is decidable".
+ *
+ * Present in the post-image and absent from the pre-image, both comment- and
+ * string-stripped, is precisely "this commit introduced this primitive". A
+ * declaration that was already there does not count, which is what stops a site
+ * patch from pointing its trailer at an existing helper.
  */
 function declaredByCommit(named, commit, ctx) {
-  const identifiers = named.match(/[A-Za-z_$][\w$]*/g) ?? [];
-  if (identifiers.length === 0) return false;
-  const added = stripNonCode(addedLines(commit, ctx), { strings: true }).filter((line) => line.trim());
-  if (added.length === 0) return false;
-  return identifiers.some((id) => {
-    const declaration = new RegExp(
-      `\\b(?:function|class|const|let|var|interface|type|enum)\\s+${id}\\b|\\b${id}\\s*[:=]\\s*(?:async\\s*)?\\(`,
-    );
-    return added.some((line) => declaration.test(line));
-  });
+  const matchers = (named.match(/[A-Za-z_$][\w$]*/g) ?? []).map(declarationMatcher);
+  if (matchers.length === 0) return false;
+  for (const file of commit.files ?? []) {
+    const after = fileAtCommit(commit, file, 'after', ctx);
+    if (after == null) continue;
+    const before = fileAtCommit(commit, file, 'before', ctx) ?? '';
+    const afterCode = stripSource(after, { strings: true });
+    const beforeCode = stripSource(before, { strings: true });
+    if (matchers.some((m) => m.test(afterCode) && !m.test(beforeCode))) return true;
+  }
+  return false;
 }
 
-/** The `+` side of a commit's diff. Supplied by the payload in tests. */
-function addedLines(commit, ctx) {
-  if (Array.isArray(commit.added)) return commit.added;
-  if (!ctx.repoRoot || !commit.sha) return [];
-  if (!ctx.addedCache) ctx.addedCache = new Map();
-  const cached = ctx.addedCache.get(commit.sha);
-  if (cached) return cached;
-  const diff = git(ctx.repoRoot, ['show', '--unified=0', '--format=', commit.sha]);
-  const lines = diff
-    .split('\n')
-    .filter((line) => line.startsWith('+') && !line.startsWith('+++'))
-    .map((line) => line.slice(1));
-  ctx.addedCache.set(commit.sha, lines);
-  return lines;
+/** A declaration of one identifier, as code. */
+function declarationMatcher(id) {
+  const escaped = id.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return new RegExp(
+    `\\b(?:function|class|const|let|var|interface|type|enum)\\s+${escaped}(?![A-Za-z0-9_$])` +
+      `|(?<![A-Za-z0-9_$])${escaped}\\s*[:=]\\s*(?:async\\s*)?\\(`,
+  );
+}
+
+/**
+ * One file as it stood before or after a commit. Supplied by the payload in
+ * tests; read with `git show` otherwise, and cached, since a trailer usually
+ * points at one commit and a handful of files.
+ */
+function fileAtCommit(commit, file, side, ctx) {
+  const supplied = side === 'after' ? commit.after : commit.before;
+  if (supplied && Object.prototype.hasOwnProperty.call(supplied, file)) return supplied[file];
+  if (!ctx.repoRoot || !commit.sha) return null;
+  if (!ctx.blobCache) ctx.blobCache = new Map();
+  const key = `${commit.sha}:${side}:${file}`;
+  if (ctx.blobCache.has(key)) return ctx.blobCache.get(key);
+  const ref = side === 'after' ? commit.sha : `${commit.sha}^`;
+  const text = git(ctx.repoRoot, ['show', `${ref}:${file}`]);
+  const value = text === '' ? null : text;
+  ctx.blobCache.set(key, value);
+  return value;
 }
 
 /**
@@ -643,8 +676,8 @@ export function stripNonCode(lines, { strings = false } = {}) {
   });
 }
 
-function stripSource(source) {
-  return stripNonCode(source.split('\n')).join('\n');
+function stripSource(source, options) {
+  return stripNonCode(source.split('\n'), options).join('\n');
 }
 
 function touches(changedFiles, seam, seamInRepo) {

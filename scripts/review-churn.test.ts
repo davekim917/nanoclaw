@@ -80,7 +80,14 @@ interface Payload {
   findings: unknown[];
   sources?: Record<string, string>;
   repoRoot?: string;
-  commits?: { sha: string; date: string; message: string; files: string[]; added?: string[] }[];
+  commits?: {
+    sha: string;
+    date: string;
+    message: string;
+    files: string[];
+    before?: Record<string, string>;
+    after?: Record<string, string>;
+  }[];
   worktree?: string[];
 }
 
@@ -442,7 +449,8 @@ describe('review-churn gate', () => {
         date: AFTER,
         message: 'fix: one guard for every caller\n\nReframe: race enforced in guardEveryWrite\n',
         files: ['src/guard.ts'],
-        added: ['export function guardEveryWrite(session: Session) {'],
+        before: { 'src/guard.ts': '' },
+        after: { 'src/guard.ts': 'export function guardEveryWrite(session: Session) {}\n' },
       },
     ];
     const { status, decision } = gate(payload);
@@ -458,7 +466,8 @@ describe('review-churn gate', () => {
         date: AFTER,
         message: 'fix: one guard\n\nReframe: race enforced in run\n',
         files: ['src/guard.ts'],
-        added: ['export function run(session: Session) {'],
+        before: { 'src/guard.ts': '' },
+        after: { 'src/guard.ts': 'export function run(session: Session) {}\n' },
       },
     ];
     expect(gate(payload).status).toBe(0);
@@ -474,7 +483,8 @@ describe('review-churn gate', () => {
         date: AFTER,
         message: 'chore: unrelated edit\n\nReframe: race enforced in guardEveryWrite\n',
         files: ['src/guard.ts'],
-        added: ['  logger.debug("unrelated");'],
+        before: { 'src/guard.ts': 'export function guardEveryWrite() {}\n' },
+        after: { 'src/guard.ts': 'export function guardEveryWrite() {}\nlogger.debug("unrelated");\n' },
       },
     ];
     expect(gate(payload).status).toBe(3);
@@ -488,7 +498,8 @@ describe('review-churn gate', () => {
         date: AFTER,
         message: 'fix: claim without a diff\n\nReframe: race enforced in someOtherPlace\n',
         files: ['src/guard.ts'],
-        added: ['export function guardEveryWrite() {}'],
+        before: { 'src/guard.ts': '' },
+        after: { 'src/guard.ts': 'export function guardEveryWrite() {}\n' },
       },
     ];
     expect(gate(payload).status).toBe(3);
@@ -505,7 +516,8 @@ describe('review-churn gate', () => {
         date: AFTER,
         message: 'fix: one guard\n\nReframe: race enforced in guardEveryWrite\n',
         files: ['src/guard.ts'],
-        added: ['export function guardEveryWrite(session: Session) {'],
+        before: { 'src/guard.ts': '' },
+        after: { 'src/guard.ts': 'export function guardEveryWrite(session: Session) {}\n' },
       },
     ];
     const { status, decision } = gate(payload);
@@ -541,9 +553,11 @@ describe('review-churn gate', () => {
     expect(decision.reported[0].rounds).toBe(3);
   });
 
-  it('does not read a declaration inside a multi-line block comment', () => {
-    // An ordinary block comment repeats no marker on its interior lines, so
-    // stripping has to carry state across the added lines.
+  it('does not read a declaration inside a block comment, wherever its delimiters are', () => {
+    // The post-image answers this whatever the diff showed: a declaration added
+    // inside a block comment whose `/*` and `*/` never changed does not appear
+    // in a --unified=0 hunk at all, and that is the shape the line scanner this
+    // replaces could not see.
     const payload = fixture('toctou-class');
     payload.commits = [
       {
@@ -551,34 +565,24 @@ describe('review-churn gate', () => {
         date: AFTER,
         message: 'docs: sketch the guard\n\nReframe: race enforced in guardEveryWrite\n',
         files: ['src/guard.ts'],
-        added: ['/*', 'export function guardEveryWrite(session: Session) {', '}', '*/'],
+        before: { 'src/guard.ts': '/*\n sketch\n*/\n' },
+        after: { 'src/guard.ts': '/*\n sketch\n export function guardEveryWrite(session: Session) {}\n*/\n' },
       },
     ];
     expect(gate(payload).status).toBe(3);
 
-    // The same lines outside a comment do lift it.
-    payload.commits[0].added = ['export function guardEveryWrite(session: Session) {', '}'];
+    // The same declaration outside the comment does lift it.
+    payload.commits[0].after = { 'src/guard.ts': 'export function guardEveryWrite(session: Session) {}\n' };
     expect(gate(payload).status).toBe(0);
   });
 
-  it('does not read a comment or a string as a declaration', () => {
-    // A doc example or a log message mentioning `function guardEveryWrite` is
-    // not a primitive, and a trailer pointing at one must not lift the gate.
-    const payload = fixture('toctou-class');
-    payload.commits = [
-      {
-        sha: 'ppp6666',
-        date: AFTER,
-        message: 'docs: mention the guard\n\nReframe: race enforced in guardEveryWrite\n',
-        files: ['src/guard.ts'],
-        added: [
-          '// export function guardEveryWrite(session: Session) {',
-          ' * `function guardEveryWrite` is where this will live.',
-          'const message = "function guardEveryWrite";',
-        ],
-      },
-    ];
-    expect(gate(payload).status).toBe(3);
+  it('matches a binding containing a dollar sign as a whole identifier', () => {
+    // `$` is a regex metacharacter and not a word character, so the old
+    // `\b${name}\b` neither escaped it nor anchored where it appeared to.
+    const churning = classify(fixture('dollar-name-seam')).classes[0];
+    expect(churning.rounds).toBe(3);
+    expect(churning.seamSubstantiated).toBe(true);
+    expect(gate(fixture('dollar-name-seam')).status).toBe(3);
   });
 
   it('says so when a class at three rounds is reported rather than gated', () => {
@@ -695,6 +699,44 @@ describe('review-churn gate', () => {
       },
     ];
     expect(gate(vague).decision.unlifted).toHaveLength(2);
+  });
+
+  it('reads the file either side of a real commit to judge a reframe trailer', () => {
+    // The payload can supply both images, so the tests above are hermetic; this
+    // one exercises the `git show` path they stand in for.
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'review-churn-blob-'));
+    const git = (...args: string[]) => {
+      const res = spawnSync('git', args, {
+        cwd: root,
+        encoding: 'utf8',
+        env: {
+          ...process.env,
+          GIT_AUTHOR_DATE: '2026-09-01T16:00:00Z',
+          GIT_COMMITTER_DATE: '2026-09-01T16:00:00Z',
+          GIT_AUTHOR_NAME: 'test',
+          GIT_AUTHOR_EMAIL: 'test@example.com',
+          GIT_COMMITTER_NAME: 'test',
+          GIT_COMMITTER_EMAIL: 'test@example.com',
+        },
+      });
+      if (res.status !== 0) throw new Error(`git ${args.join(' ')}: ${res.stderr}`);
+      return res.stdout.trim();
+    };
+    try {
+      git('init', '-q', '-b', 'main');
+      fs.writeFileSync(path.join(root, 'guard.ts'), '// nothing yet\n');
+      git('add', '-A');
+      git('commit', '-qm', 'base');
+      fs.writeFileSync(path.join(root, 'guard.ts'), 'export function guardEveryWrite() {}\n');
+      git('add', '-A');
+      git('commit', '-qm', 'fix\n\nReframe: race enforced in guardEveryWrite\n');
+
+      const payload = fixture('toctou-class');
+      payload.repoRoot = root;
+      expect(spawn(['gate', '--json'], payload).status).toBe(0);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
   });
 
   it('reads commits back to the oldest finding, not a fixed history cap', () => {
