@@ -1,0 +1,31 @@
+# Run record: upstream async central-database seam (seam 3, upstream #3334)
+
+## 2026-09-04 19:05Z — plan drafted (revision 1)
+
+- Decision to port #3334 first as seam 3 taken by `update-nanoclaw` after the feasibility read (orchestrator scratchpad `seam3-3334-feasibility.md`, spot-verified: upstream `getDb()` still sync; 4 of 6 new upstream migration names already in the fork's ledger; fork eslint lacks `projectService`/`no-floating-promises`/`no-misused-promises`; 9 `hasTable` truthiness sites).
+- Reverses the 2026-09-02 decline on fork issue #234 (comment posted 2026-09-04).
+- PR 0 (lint rules) started in worktree `wt-pr0-lint` on branch `seam3/pr0-promise-lint` under the standing delegation; independent of plan approval.
+- Plan-stage cross-model review: pending (Codex gpt-5.6-sol high, vendored adversarial prompt).
+
+## 2026-09-04 19:40Z — plan-stage cross-model review, round 1 (revision 1)
+
+- Reviewer: Codex, external model family. Transport exactly per the cross-model contract: `codex exec --ignore-user-config --model gpt-5.6-sol -c 'model_reasoning_effort="high"' --ephemeral --yolo --output-schema <vendored schema> --output-last-message <json>`, vendored adversarial prompt with the four markers filled, plan text on stdin, foreground, 3 600 000 ms timeout. Process log reported model `gpt-5.6-sol`, effort `high` (matches). Wall 5 m 44 s, exit 0. Classification: `completed`. Raw verdict: `needs-attention`, 5 findings, all `high` → recorded as `must_fix`.
+- Findings, each traced to source by the lead and **accepted**:
+  1. Raw `*Sync` twins can interleave into an open driver transaction on the shared better-sqlite3 handle (upstream's `activeTransaction` gate covers driver `access()` only). Fix: no twins (§4.2 → leaf + all importers per PR); driver transactions land last (PR 6) so PRs 1–5 hold zero driver transactions; `withRawDb` throws on `db.inTransaction` (§4.1); tripwire that `db.transaction(` has no fork callers until PR 6 (R4).
+  2. The cited primitive (`withExistingNanoclawOutboundSync`'s `SyncActionOnly`) is not what the write guard runs through — `withExistingMailboxSession`'s action admits promises (`session-manager.ts:522`); the `expectTypeOf` case restates the alias. Fix: `evaluateGuardSync` with a runtime thenable check at every evaluation site + AST test that no `await` sits between it and the insert/spawn (§4.5 I-1, §8.6).
+  3. Seeding the ledger with the four shared names proves the delta, not the schema. Fix: live-upgrade fixture = frozen `origin/main` registry then the reconciled registry, schema-diffed against a fresh install; same diff in the deploy rehearsal (§8.2).
+  4. The watchdog is a `Promise.race`: rollback without aborting the closure body. Fix: watchdog = detection; DB-only closures enforced by an AST test; per-site post-commit-effect tests (§4.4, §8.6).
+  5. SQL-constant parity is text parity, not behavior parity. Moot under fix 1 (no twins).
+- Peer input folded into the same batch (update-nanoclaw-3's read-only scout, verified): upstream deleted the duty-registry sweep (153-line reconcile driver) → PR 5b is a conversion, not a merge; `withQuietInvalidationSync` joins the sync allowlist; the exclusive `session:health` window is a mailbox-level claims ordering, not a central transaction; F-14.1 ceiling 1,419/1,450 re-measured in PR 5b; mixed `vi.mock`/`initTestDb` test files convert per file.
+- PR 0 evidence folded in: no hook or CI runs lint; `pnpm run lint` red on `origin/main` (92 errors, all `src/`); `projectService` cannot see `tsconfig.scripts.json` → type-aware block scoped to `src/**/*.ts`; new PR 0b fixes the 92 and installs the `pre-push` + build-guard gate (§4.5 I-2).
+- Rejected findings: none. Coverage: other-family review completed; revision 2 goes to a second Codex pass scoped to the redesigned sections (§4.1, §4.2, §4.4, §4.5, §8.6) because the correction changed the design, not just the text.
+
+## 2026-09-04 20:10Z — plan-stage cross-model review, round 2 (revision 2) → revision 3
+
+- Same transport, same flags; model `gpt-5.6-sol`, effort `high` (log-confirmed). Wall 7 m 23 s, exit 0, `completed`. Raw verdict `needs-attention`, 3 findings (2 high, 1 medium) → `must_fix`. All three traced to source and **accepted**:
+  1. "Expected zero" refusals under `withRawDb` was false: driver `get/all/run` are microtask suspension points, so an already-queued guard evaluation can run while `inTransaction` is true and a legitimate write/wake would be refused. Fix: fork-level central lease (`src/db/central-lease.ts`): `centralTransaction` and `withCentralSync` are mutually exclusive; sync blocks wait, never refuse; `withRawDb` becomes an unreachable belt; cross-context overlap test in §8.6 exercises the real write and wake paths between two awaited driver statements. (Also confirms migration 068's contract text: "in the same synchronous turn as that write" — preserved by running `withQuietInvalidationSync` inside `withCentralSync`.)
+  2. `cli/resources/wirings.ts:333-339` calls a messaging-groups leaf export inside a raw IMMEDIATE transaction with a parent-plus-companion rollback invariant; PR 4 converting that leaf async would break it. Fix: leaf exports reachable from a raw transaction closure stay synchronous (no async form) until PR 6 converts them with their closure (§4.2); rollback test for the wiring case added in PR 4 (§8.4).
+  3. The zero-driver-transaction tripwire could not distinguish raw from driver receivers by text. Fix: TypeScript-checker receiver resolution in `src/db/transaction-closures.test.ts` from PR 1, with positive fixtures for both receiver types (§4.4, R4).
+- Rejected: none. Stopping rule: two rounds on the raw/driver-coexistence class; the lease is the reframe at the primitive. No third automated round — revision 3 goes to the deployer for the operator's approval with this record.
+- Operator directives relayed 20:05Z: every merge to main and every build window HOLDS until the operator's explicit go; seam 4 (after this seam) = #3653 + `adoptRunningSessions()` + boot-time workgroup shared-FS reconcile redesign, a committed must-have.
+- 20:20Z: operator's explicit go for the sync relayed by `update-nanoclaw`; hold released. Order: PR 0 → PR 0b → this plan (patch 039) → PR 1.

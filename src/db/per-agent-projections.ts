@@ -263,7 +263,10 @@ export interface ArchiveProjectionStamp {
  * exactly — including that an EMPTY member array falls through to the legacy
  * single-agent filter rather than matching nothing.
  */
-function archiveScopeFilter(agentGroupId: string, workgroupMemberIds?: string[]): { sql: string; params: string[] } {
+function archiveScopeFilter(
+  agentGroupId: string,
+  workgroupMemberIds?: string[],
+): { sql: string; params: string[] } {
   if (workgroupMemberIds && workgroupMemberIds.length > 0) {
     return {
       sql: `agent_group_id IN (${workgroupMemberIds.map(() => '?').join(', ')})`,
@@ -646,7 +649,9 @@ export function appendArchiveProjection(
         .all(...members, sinceRowid) as Array<Record<string, unknown>>;
     } else {
       rows = src
-        .prepare(`SELECT ${ARCHIVE_COLS.join(', ')} FROM messages_archive WHERE agent_group_id = ? AND rowid > ?`)
+        .prepare(
+          `SELECT ${ARCHIVE_COLS.join(', ')} FROM messages_archive WHERE agent_group_id = ? AND rowid > ?`,
+        )
         .all(agentGroupId, sinceRowid) as Array<Record<string, unknown>>;
     }
   } finally {

@@ -194,14 +194,7 @@ export async function ensureArchiveProjection(
 
   const scope = workgroupMemberIds?.length ?? null;
   if (result.mode === 'reused') {
-    log.info('Archive projection reused', {
-      agentGroupId,
-      dstPath,
-      bytes: result.bytes,
-      ms: result.ms,
-      offThread,
-      scope,
-    });
+    log.info('Archive projection reused', { agentGroupId, dstPath, bytes: result.bytes, ms: result.ms, offThread, scope });
   } else if (result.mode === 'appended') {
     log.info('Archive projection appended', {
       agentGroupId,
