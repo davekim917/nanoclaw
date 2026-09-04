@@ -59,7 +59,7 @@ import { archiveSessionById, touchSessionActivity } from '../db/sessions.js';
 import { guard } from '../guard/index.js';
 import { log } from '../log.js';
 import { CLOSE_REASON_MAX_CHARS, type DoneProposal } from '../modules/mailbox/index.js';
-import { withExistingNanoclawOutbound } from '../modules/mailbox/session.js';
+import { withExistingNanoclawOutbound, withExistingNanoclawOutboundSync } from '../modules/mailbox/session.js';
 import { hasAdminPrivilege } from '../modules/permissions/db/user-roles.js';
 import { withExistingMailboxSession } from '../session-manager.js';
 import { requiredConfirmations, threadsClose, type ThreadClosePayload } from './thread-close-guard.js';
@@ -139,6 +139,40 @@ async function readSessionProposal(agentGroupId: string, sessionId: string): Pro
     );
   } catch {
     // Unreadable is absent here, as it was pre-seam.
+    return null;
+  }
+}
+
+/**
+ * Every session's proposal, read SYNCHRONOUSLY, as of one instant.
+ *
+ * The async fan-out this replaces at the decision point resolved each session
+ * at its own moment: A's read could land, A could then take new work and clear
+ * its `done_proposal`, and B's read could still be outstanding — and A's cached
+ * `true` would then buy a close over an agent that is mid-turn. Sampling twice
+ * did not fix it, because both samples had the same shape; a second stale set
+ * is still stale.
+ *
+ * Nothing awaits inside this loop, so every value is read after the last change
+ * that could precede the decision and before any change that could follow it.
+ * The caller must not await between calling this and deciding.
+ *
+ * Unreadable is absent, exactly as the async read treats it.
+ */
+function sampleProposalsSync(
+  sessions: readonly CloseSession[],
+  read: (agentGroupId: string, sessionId: string) => DoneProposal | null,
+): Map<string, DoneProposal | null> {
+  const proposals = new Map<string, DoneProposal | null>();
+  for (const session of sessions) proposals.set(session.id, read(session.agent_group_id, session.id));
+  return proposals;
+}
+
+/** The synchronous twin of `readSessionProposal`, same existence and fault rules. */
+function readSessionProposalSync(agentGroupId: string, sessionId: string): DoneProposal | null {
+  try {
+    return withExistingNanoclawOutboundSync(agentGroupId, sessionId, (outbound) => outbound.readDoneProposal()) ?? null;
+  } catch {
     return null;
   }
 }
@@ -431,17 +465,12 @@ export async function requestThreadClose(
   //
   // The cost is one extra outbound open per session on this thread, on an
   // operator action that already opens them once.
-  const sampleProposals = async (): Promise<Map<string, boolean>> =>
-    new Map(
-      await Promise.all(
-        visible.map(async (s) => [s.id, (await readSessionProposal(s.agent_group_id, s.id)) !== null] as const),
-      ),
-    );
-  const firstSample = await sampleProposals();
-  const secondSample = await sampleProposals();
-  const proposalsBySession = new Map(
-    visible.map((s) => [s.id, firstSample.get(s.id) === true && secondSample.get(s.id) === true] as const),
-  );
+  // The fan-out is a CANDIDATE read and nothing more. It exists so a session
+  // whose outbound.db is slow to open does not stall the decision, and so the
+  // mirror stays warm; its values never decide anything, because each one
+  // resolves at its own moment and the earliest is stale by the time the last
+  // lands.
+  await Promise.all(visible.map((s) => readSessionProposal(s.agent_group_id, s.id)));
 
   // ── One synchronous decision. No await from here to the reservation. ──────
   //
@@ -462,6 +491,16 @@ export async function requestThreadClose(
       body: { error: 'thread_extends_beyond_your_scope', thread_id: threadId, visible_sessions: freshVisible.length },
     };
   }
+
+  // Sampled HERE, synchronously, over the fresh membership — after the last
+  // await and with nothing awaited between these reads and the decision they
+  // feed. This is the whole point of the restructure: the set that decides is
+  // read at one instant, not assembled from N moments.
+  const proposalsBySession = new Map(
+    [...sampleProposalsSync(freshVisible, readSessionProposalSync)].map(
+      ([sessionId, proposal]) => [sessionId, proposal !== null] as const,
+    ),
+  );
 
   const decision = decideClosure(freshVisible, proposalsBySession, confirmations, {
     userId: ctx.user.id,
@@ -689,7 +728,12 @@ export interface ThreadCloseDeps {
   archiveSession?: (sessionId: string) => boolean;
   clearContinuation?: (session: CloseSession, threadId: string) => boolean | Promise<boolean>;
   /** The agent's confirmation source; defaults to the session's own outbound.db. */
-  readProposal?: (agentGroupId: string, sessionId: string) => DoneProposal | null | Promise<DoneProposal | null>;
+  /**
+   * SYNCHRONOUS by contract. The finalization decision samples every live
+   * session with nothing awaited between the reads and the decision, so a dep
+   * that returned a promise could not participate in that instant at all.
+   */
+  readProposal?: (agentGroupId: string, sessionId: string) => DoneProposal | null;
 }
 
 /**
@@ -911,49 +955,29 @@ async function advanceOneClosure(row: ThreadClosureRow, now: number, deps: Threa
     if (Number.isNaN(requestedAtMs)) {
       log.warn('thread-close: unparseable requested_at — finalizing', { threadId: row.thread_id });
     }
-    const sampleProposalAtMs = async (): Promise<(number | null)[]> =>
-      Promise.all(
-        live.map(async (s) => {
-          const p = await (deps.readProposal ?? readSessionProposal)(s.agent_group_id, s.id);
-          const at = p ? Date.parse(p.proposed_at) : NaN;
-          return Number.isNaN(at) ? null : at;
-        }),
-      );
+    // A CANDIDATE pass, and only that. Its job is to warm the outbound opens
+    // and the proposal mirror; its values decide nothing, because each resolves
+    // at its own moment and the first is already history when the last lands.
+    // Sampling twice did not help — a second set assembled the same way is
+    // stale the same way, which is what the previous round got wrong.
+    if (!deps.readProposal) {
+      await Promise.all(live.map((s) => readSessionProposal(s.agent_group_id, s.id)));
+    }
+
+    // THE DECISION SET, read synchronously, all of it, with nothing awaited
+    // between these reads and `decideCloseFinalization` below.
+    const proposalAtMs = [...sampleProposalsSync(live, deps.readProposal ?? readSessionProposalSync).values()].map(
+      (proposal) => {
+        const at = proposal ? Date.parse(proposal.proposed_at) : NaN;
+        return Number.isNaN(at) ? null : at;
+      },
+    );
     const decision = decideCloseFinalization({
       requestedAtMs: Number.isNaN(requestedAtMs) ? 0 : requestedAtMs,
       now,
-      // Resolved BEFORE the decision so the fan-out is frozen the way it
-      // always was: one read per session, all of them taken now.
-      proposalAtMs: await sampleProposalAtMs(),
+      proposalAtMs,
     });
     if (!decision.finalize) return;
-    // A CONFIRMED finalization needs the confirmation to still stand.
-    //
-    // These reads await, one per session, so a proposal sampled early can be
-    // retracted while a later one is still settling — and a container clears
-    // `done_proposal` exactly when it takes on new work. Acting on the stale
-    // read means killing a container that has since picked up a real turn,
-    // before the forced deadline the operator was promised.
-    //
-    // The read cannot be made synchronous, so it is taken twice and any
-    // disagreement is resolved against finalizing. Declining costs nothing
-    // durable: the row stays `awaiting_confirmation` and the next tick asks
-    // again, while the FORCED path is time-based and unaffected — so a genuine
-    // confirmation that keeps standing still lands, and one that does not falls
-    // back to the deadline rather than to an early kill.
-    if (!decision.forced) {
-      const reconfirm = decideCloseFinalization({
-        requestedAtMs: Number.isNaN(requestedAtMs) ? 0 : requestedAtMs,
-        now,
-        proposalAtMs: await sampleProposalAtMs(),
-      });
-      if (!reconfirm.finalize || reconfirm.forced) {
-        log.info('thread-close: the proposal was withdrawn while confirming; waiting for the deadline instead', {
-          threadId: row.thread_id,
-        });
-        return;
-      }
-    }
     forced = decision.forced;
     getDb()
       // `AND state = 'awaiting_confirmation'`: `row` was read before the

@@ -23,6 +23,16 @@ vi.mock('./container-runner.js', () => ({
   // outbound.db while it is running OR still spawning.
   containerOwnsOutbound: (...args: unknown[]) =>
     mockIsContainerRunning(args[0] as string) || mockIsContainerSpawning(args[0] as string),
+  // The real definition, over the same session mock: a guard the WAKE PATH
+  // evaluates at the spawn, not a check the caller makes before calling.
+  sessionStillActive:
+    (...args: unknown[]) =>
+    () => {
+      const fresh = mockGetSession(args[0] as string);
+      if (!fresh) return { ok: false, reason: 'session no longer exists' };
+      if (fresh.status !== 'active') return { ok: false, reason: `session is ${fresh.status}` };
+      return true;
+    },
   getContainerSpawnedAt: (...args: unknown[]) => mockGetContainerSpawnedAt(args[0] as string),
   killContainer: (...args: unknown[]) =>
     mockKillContainer(args[0] as string, args[1] as string, args[2] as (() => void) | undefined),
@@ -853,33 +863,52 @@ describe('restartAgentGroupContainers', () => {
     expect(typeof onExit).toBe('function');
   });
 
-  it('onExit callback calls wakeContainer with refreshed session', async () => {
+  /**
+   * The respawn's liveness proof travels WITH the wake.
+   *
+   * This used to be `getSession()` then `wakeContainer(fresh)`, which proves
+   * the row live before the call. The call then awaits storage admission, an
+   * unbounded memory-queue wait and the whole spawn preparation, none of which
+   * a re-read here can see. The guard is evaluated by the wake path with
+   * nothing awaited between it and `spawn()`.
+   */
+  it('onExit wakes with a guard the wake path proves at the spawn', async () => {
     mockGetSessionsByAgentGroup.mockReturnValue([makeSession('s1', 'g1')]);
     mockIsContainerRunning.mockReturnValue(true);
-    const freshSession = makeSession('s1', 'g1');
-    mockGetSession.mockReturnValue(freshSession);
+    mockGetSession.mockReturnValue(makeSession('s1', 'g1'));
 
     await restartAgentGroupContainers('g1', 'test', 'Resuming.');
 
-    // Simulate container exit by calling the onExit callback
     const onExit = mockKillContainer.mock.calls[0][2] as () => void;
     onExit();
 
-    expect(mockGetSession).toHaveBeenCalledWith('s1');
-    expect(mockWakeContainer).toHaveBeenCalledWith(freshSession);
+    expect(mockWakeContainer).toHaveBeenCalledWith(expect.objectContaining({ id: 's1' }), 'interactive', {
+      guard: expect.any(Function),
+    });
+    const { guard } = mockWakeContainer.mock.calls[0][2] as { guard: () => unknown };
+    expect(guard()).toBe(true);
   });
 
-  it('onExit callback does not wake if session no longer exists', async () => {
+  /**
+   * A session that vanished is refused by the guard rather than skipped here.
+   *
+   * The refusal moves, it does not disappear: the wake is issued and the wake
+   * path declines it at the spawn. That covers strictly more than the old skip,
+   * which could only see a session that had already gone by the time `onExit`
+   * ran — never one that goes during the wake's own awaits.
+   */
+  it('onExit hands the wake a guard that refuses a session that no longer exists', async () => {
     mockGetSessionsByAgentGroup.mockReturnValue([makeSession('s1', 'g1')]);
     mockIsContainerRunning.mockReturnValue(true);
-    mockGetSession.mockReturnValue(undefined);
 
     await restartAgentGroupContainers('g1', 'test', 'Resuming.');
 
     const onExit = mockKillContainer.mock.calls[0][2] as () => void;
+    mockGetSession.mockReturnValue(undefined);
     onExit();
 
-    expect(mockWakeContainer).not.toHaveBeenCalled();
+    const { guard } = mockWakeContainer.mock.calls[0][2] as { guard: () => unknown };
+    expect(guard()).toEqual({ ok: false, reason: 'session no longer exists' });
   });
 
   it('handles multiple running sessions with wake message', async () => {
@@ -912,5 +941,7 @@ describe('restartAgentGroupContainers', () => {
     mockGetSession.mockReturnValue(makeSession('s1', 'ag1'));
     onExit();
     expect(mockWakeContainer).toHaveBeenCalled();
+    const { guard } = mockWakeContainer.mock.calls[0][2] as { guard: () => unknown };
+    expect(guard()).toBe(true);
   });
 });

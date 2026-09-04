@@ -1724,14 +1724,14 @@ describe('sweepTaskWatchdog (C3)', () => {
    * The notification itself still lands: the row is durable and the parent may
    * come back. Only the wake is withheld.
    */
-  it('does not wake a parent session that was archived while the notification was being written', async () => {
+  it('hands the parent wake a guard that refuses a session archived under it', async () => {
     const task = makeTask({
       last_progress_at: new Date(NOW - 2 * 60 * 60 * 1000).toISOString(),
     });
     mockGetActiveTasks.mockReturnValue([task]);
     mockTransitionToTerminal.mockReturnValue(true);
-    // The reclaim lands inside the awaited write, so the pre-await fetch saw an
-    // active parent and the post-await one does not.
+    // The reclaim lands while the wake is in flight, which is exactly the window
+    // a caller-side re-read cannot observe.
     let parentGone = false;
     mockWriteSessionMessage.mockImplementation(async () => {
       parentGone = true;
@@ -1744,7 +1744,10 @@ describe('sweepTaskWatchdog (C3)', () => {
     await _sweepTaskWatchdogForTesting();
 
     expect(mockWriteSessionMessage).toHaveBeenCalled();
-    expect(mockWakeContainer).not.toHaveBeenCalled();
+    // Issued with a guard rather than skipped: the parent can also be archived
+    // during the wake's own awaits, which a re-read here could never see.
+    const { guard } = mockWakeContainer.mock.calls[0][2] as { guard: () => unknown };
+    expect(guard()).toEqual({ ok: false, reason: 'session no longer exists' });
   });
 
   it('test_watchdog_skips_when_drain_active: task with recent terminal outbound is not reaped', async () => {
@@ -3228,10 +3231,13 @@ describe('sweepSession on a session with no mailbox', () => {
 
     await _sweepSessionForTesting(snapshot);
 
-    // Woken with the CURRENT row, whose status lets wakeContainer's own guard
-    // refuse. Handed the snapshot, that guard sees 'active' and spawns.
+    // The liveness proof now travels WITH the wake instead of preceding it: a
+    // re-read here proves the row live before the call, and the call then
+    // awaits admission, an unbounded memory-queue wait and the whole spawn
+    // preparation. The guard is asked where the process is created.
     expect(mockWakeContainer).toHaveBeenCalledTimes(1);
-    expect(mockWakeContainer.mock.calls[0][0]).toMatchObject({ id: 'sess-stale', status: 'closed' });
+    const { guard } = mockWakeContainer.mock.calls[0][2] as { guard: () => unknown };
+    expect(guard()).toEqual({ ok: false, reason: 'session is closed' });
     closeDb();
   });
 

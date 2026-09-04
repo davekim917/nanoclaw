@@ -35,7 +35,13 @@ import { GuardDenyError, guard } from '../../guard/index.js';
 import { log } from '../../log.js';
 import { upsertArchiveMessage } from '../../message-archive.js';
 import { scrubSecrets } from '../../secret-scrubber.js';
-import { resolveSession, sessionDir, withExistingMailboxSession, writeSessionMessage } from '../../session-manager.js';
+import {
+  resolveSession,
+  sessionDir,
+  SessionWriteRefusedError,
+  withExistingMailboxSession,
+  writeSessionMessage,
+} from '../../session-manager.js';
 import { prependThreadContext } from '../../thread-context.js';
 import type { PendingApproval, Session, SessionMode } from '../../types.js';
 import { requestApproval } from '../approvals/index.js';
@@ -268,16 +274,32 @@ async function resolveTargetSession(
   // session link rather than their own pre-await copy.
 ): Promise<{ session: Session; created: boolean; fallback: SessionFallback }> {
   // Both lookups read the SOURCE session's queue, in one short session of its
-  // own. Existing-only: this is the return-path read, and a source whose
-  // mailbox is gone simply falls through to the newest-active heuristic.
-  const originSessionId =
-    (await withExistingMailboxSession(sourceSession.agent_group_id, sourceSession.id, (mailbox) => {
-      const direct = msg.in_reply_to ? mailbox.getInboundSourceSessionId(msg.in_reply_to) : null;
-      // Peer-affinity fallback — covers the case where the container's
-      // outbound write didn't carry in_reply_to (e.g. legacy MCP send_message
-      // path, container running pre-fix code).
-      return direct ?? mailbox.getMostRecentPeerSourceSessionId(targetAgentGroupId);
-    })) ?? null;
+  // own. Existing-only, and `undefined` means the mailbox is GONE — which is
+  // not the same answer as "this reply has no return path".
+  //
+  // `?? null` spelled it as one, and the difference is a delivery: unprovable
+  // provenance fell through to `resolveSession`, which picks the newest active
+  // session of the target or creates one. A reply whose origin nobody could
+  // vouch for was then delivered to a session that never took part in the
+  // conversation. This is the same definite-read semantics restored at the
+  // self-loopback site; the two sites read the same storage and must answer
+  // "I cannot tell" the same way.
+  //
+  // A present-but-unreadable DB already raises from the funnel
+  // (`SessionDbUnopenableError`), so this only has to close the missing case.
+  const lookup = await withExistingMailboxSession(sourceSession.agent_group_id, sourceSession.id, (mailbox) => {
+    const direct = msg.in_reply_to ? mailbox.getInboundSourceSessionId(msg.in_reply_to) : null;
+    // Peer-affinity fallback — covers the case where the container's
+    // outbound write didn't carry in_reply_to (e.g. legacy MCP send_message
+    // path, container running pre-fix code).
+    return direct ?? mailbox.getMostRecentPeerSourceSessionId(targetAgentGroupId);
+  });
+  if (lookup === undefined) {
+    // The session DIRECTORY, not a reconstructed inbound.db path: the ratchet
+    // keeps this module off raw session-DB access and only ever shrinks.
+    throw new SessionDbMissingError(sessionDir(sourceSession.agent_group_id, sourceSession.id));
+  }
+  const originSessionId = lookup;
   // Re-derived here, after the yield and before anything is resolved or
   // created. If the wiring was revoked in the window this now takes the same
   // agent-shared path the pre-check takes on failure, so the outcome matches
@@ -562,24 +584,49 @@ async function performAgentRoute(
   // the backfill quoting a chat the target session is no longer bound to.
   const contentForWrite = await addThreadContext(forwardedContent, effective.mgId, effective.threadId, targetSession);
 
-  // PROOF TWO, before the write. The copy already happened, so this refusal has
-  // something to undo: the bytes come back out before the denial is raised.
-  const beforeWrite = proveDestination();
-  if (beforeWrite.effect !== 'allow') {
-    removeForwardedFiles(writtenPaths);
-    refuse(beforeWrite.reason, 'before the write');
+  // PROOF TWO IS NOW THE WRITER'S, not ours.
+  //
+  // A synchronous check here proves the grant held before `writeSessionMessage`
+  // was CALLED. That function then awaits — a storage-activity lease, a
+  // reclaim-journal import, the mailbox funnel — before the row lands, and a
+  // revocation inside any of those windows still got the message delivered.
+  // No amount of care at this call site can close a window inside the callee,
+  // so the proof is handed to the callee, which evaluates it with nothing
+  // awaited between the answer and the insert.
+  //
+  // The refusal keeps this function's contract: `SessionWriteRefusedError`
+  // becomes the same `GuardDenyError` the pre-checks raise, and the copied
+  // bytes are removed on the way out exactly as before.
+  try {
+    await writeSessionMessage(
+      targetAgentGroupId,
+      targetSession.id,
+      {
+        id: a2aMsgId,
+        kind: 'chat',
+        timestamp: new Date().toISOString(),
+        platformId: session.agent_group_id,
+        channelType: 'agent',
+        threadId: null,
+        content: contentForWrite,
+        sourceSessionId: session.id,
+      },
+      {
+        guard: () => {
+          const verdict = proveDestination();
+          return verdict.effect === 'allow'
+            ? true
+            : { ok: false as const, reason: verdict.reason ?? 'destination grant revoked while routing' };
+        },
+      },
+    );
+  } catch (err) {
+    if (err instanceof SessionWriteRefusedError) {
+      removeForwardedFiles(writtenPaths);
+      refuse(err.reason, 'before the write');
+    }
+    throw err;
   }
-
-  await writeSessionMessage(targetAgentGroupId, targetSession.id, {
-    id: a2aMsgId,
-    kind: 'chat',
-    timestamp: new Date().toISOString(),
-    platformId: session.agent_group_id,
-    channelType: 'agent',
-    threadId: null,
-    content: contentForWrite,
-    sourceSessionId: session.id,
-  });
   // Archived only once the row is durable, and from `scrubbed` rather than
   // `contentForWrite` — the archive holds the message the peer actually sent,
   // not the thread transcript we wrapped around it.
@@ -594,8 +641,18 @@ async function performAgentRoute(
     a2aMsgId,
     forwardedFileCount: countForwardedFiles(forwardedContent),
   });
-  const fresh = getSession(targetSession.id);
-  if (fresh) await wakeContainer(fresh);
+  // The wake's own precondition goes to the wake path for the same reason. The
+  // pre-wake `getSession` here proved the target was live before `wakeContainer`
+  // was called; that function then awaits admission, an unbounded memory-queue
+  // wait and all of `spawnContainer`'s preparation before a process exists.
+  await wakeContainer(targetSession, 'interactive', {
+    guard: () => {
+      const fresh = getSession(targetSession.id);
+      if (!fresh) return { ok: false as const, reason: 'target session no longer exists' };
+      if (fresh.status !== 'active') return { ok: false as const, reason: `target session is ${fresh.status}` };
+      return true;
+    },
+  });
 }
 
 /**

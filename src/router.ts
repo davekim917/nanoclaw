@@ -56,7 +56,7 @@ import {
 import { archiveMessage } from './message-archive.js';
 import { parseMessageFlags, formatFlagConfirmation, type FlagIntent } from './flag-parser.js';
 import { maybeRenameNewThread } from './topic-title.js';
-import { wakeContainer } from './container-runner.js';
+import { sessionStillActive, wakeContainer } from './container-runner.js';
 import { getContainerConfig, resolveProviderName } from './db/container-configs.js';
 import { getSession } from './db/sessions.js';
 import type { AgentGroup, ChannelType, MessagingGroup, MessagingGroupAgent } from './types.js';
@@ -1466,16 +1466,19 @@ async function deliverToAgent(
         mg.instance,
       );
     }
-    const freshSession = getSession(session.id);
-    if (freshSession) {
+    {
       // Priority is applied atomically inside wakeContainer. If this session
       // was queued for scheduled work, the returned promise now represents
       // the real promotion/admission result rather than a stale queued=false.
-      const woke = await wakeContainer(freshSession, 'interactive');
+      //
+      // The liveness proof is the wake's, not ours: a `getSession` here proved
+      // the row live before the call, and the call then awaits admission, the
+      // memory queue and the spawn preparation.
+      const woke = await wakeContainer(session, 'interactive', { guard: sessionStillActive(session.id) });
       // wakeContainer never throws — it returns false on transient spawn
       // failure (host-sweep retries). Stop the typing indicator we just
       // started so it doesn't leak; the inbound row stays pending.
-      if (!woke) stopTypingRefresh(freshSession.id);
+      if (!woke) stopTypingRefresh(session.id);
     }
   }
 }

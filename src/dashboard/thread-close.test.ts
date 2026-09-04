@@ -307,27 +307,46 @@ describe('requestThreadClose', () => {
   });
 
   /**
-   * A proposal retracted while the reads are settling must not buy the close.
+   * A proposal retracted DURING the candidate fan-out must not buy the close.
    *
-   * Refreshing membership catches a proposer that LEFT the thread; it cannot
-   * catch one that stayed and cleared its `done_proposal`, which is exactly
-   * what a container does the moment it takes on new work. One confirmation
-   * would then close a thread over an agent that is mid-turn.
+   * The fan-out resolves one session at a time, so A's read can land, A can
+   * then take new work and clear its `done_proposal`, and B's read can still be
+   * outstanding. Two complete samples did not fix that: a second set assembled
+   * the same way goes stale the same way, and the previous round's test could
+   * only express a retraction BETWEEN whole samples.
+   *
+   * The decision now comes from one synchronous sweep of the fresh membership,
+   * taken after the fan-out with nothing awaited before the decision — so a
+   * retraction at any point before that instant is seen, and one after it
+   * cannot have raced the kill.
    */
-  it('does not count a proposal that is retracted while the reads are settling', async () => {
+  it('does not count a proposal retracted while a sibling read is still outstanding', async () => {
     const THREAD_RETRACT = 'slack:C1:retract';
-    insertSession('s-retractor', 'ag1', THREAD_RETRACT);
-    fs.rmSync(path.dirname(dbPathFor('ag1', 's-retractor', 'inbound.db')), { recursive: true, force: true });
-    materializeSession('ag1', 's-retractor');
-    const out = new Database(dbPathFor('ag1', 's-retractor', 'outbound.db'));
-    out
-      .prepare('INSERT INTO session_state (key, value, updated_at) VALUES (?, ?, ?)')
-      .run('done_proposal', JSON.stringify({ reason: 'done', proposed_at: iso(0) }), iso(0));
-    out.close();
+    // Two agent groups, because one thread may hold only one active session per
+    // group. Two sessions is the whole point: the fan-out has to have a sibling
+    // still outstanding when the first one retracts.
+    for (const [group, id] of [
+      ['ag1', 's-retractor'],
+      ['ag2', 's-sibling'],
+    ] as const) {
+      insertSession(id, group, THREAD_RETRACT);
+      fs.rmSync(path.dirname(dbPathFor(group, id, 'inbound.db')), { recursive: true, force: true });
+      materializeSession(group, id);
+      // ONLY the retractor proposes. The sibling exists to keep a read
+      // outstanding while the retractor's has already resolved — if it also
+      // proposed, its standing proposal would legitimately buy the cheap bar
+      // and the case would prove nothing.
+      if (id !== 's-retractor') continue;
+      const out = new Database(dbPathFor(group, id, 'outbound.db'));
+      out
+        .prepare('INSERT INTO session_state (key, value, updated_at) VALUES (?, ?, ?)')
+        .run('done_proposal', JSON.stringify({ reason: 'done', proposed_at: iso(0) }), iso(0));
+      out.close();
+    }
 
-    // The agent takes new work and clears its proposal BETWEEN the samples:
-    // the first read sees it standing, the second does not. With a single
-    // sample this interleave is invisible.
+    // The retractor's own read has already resolved; the sibling's has not.
+    // With a fan-out deciding, the retractor's resolved `true` is what counts
+    // and the close is bought over an agent that is mid-turn.
     duringProposalRead.skip = 1;
     duringProposalRead.run = () => {
       const db = new Database(dbPathFor('ag1', 's-retractor', 'outbound.db'));
@@ -338,7 +357,6 @@ describe('requestThreadClose', () => {
     // ONE confirmation, which only a standing proposal can buy.
     const res = await requestThreadClose(THREAD_RETRACT, { confirmations: 1 }, ctxFor('admin'));
 
-    // Refused. With a single sample this was a 202 that killed a working agent.
     expect(res.status).toBe(409);
     expect(res.body).toMatchObject({
       error: 'confirmation_required',
@@ -871,35 +889,76 @@ describe('the close sequence order', () => {
   });
 
   /**
-   * A confirmation retracted while the reads settle must not buy the kill.
+   * A confirmation retracted during the candidate fan-out must not buy the kill.
    *
-   * The finalizer samples one proposal per live session, each behind its own
-   * await, and then decides. A container clears `done_proposal` the moment it
-   * takes on new work, so a proposal read early can be gone before the last one
-   * lands — and acting on the stale read kills a container that has since
-   * picked up a real turn, before the forced deadline the operator was
-   * promised.
+   * The finalizer sampled one proposal per live session behind its own await,
+   * then decided. A container clears `done_proposal` the moment it takes on new
+   * work, so A's read could resolve present, A could go back to work, and B's
+   * read could still be outstanding — and A's resolved value still finalized,
+   * killing a container mid-turn before the deadline the operator was promised.
    *
-   * Declining costs nothing durable. The row stays `awaiting_confirmation` and
-   * the next tick asks again; the FORCED path is time-based and untouched, so a
-   * proposal that keeps standing still lands and one that does not falls back
-   * to the deadline.
+   * Sampling twice did not fix it; a second fan-out is stale the same way. The
+   * decision now reads every live session SYNCHRONOUSLY, after the fan-out and
+   * with nothing awaited before `decideCloseFinalization`, so a retraction at
+   * any point before that instant is seen.
+   *
+   * Declining costs nothing durable: the row stays `awaiting_confirmation`, the
+   * next tick asks again, and the forced path is time-based and untouched.
    */
-  it('does not finalize on a confirmation retracted while the proposal reads settle', async () => {
-    // Inside the window, so only a standing proposal can finalize this.
-    startClose({ requestedAt: iso(30_000) });
-    let reads = 0;
-    const { calls, deps } = recordingDeps({
-      // Sample one sees the proposal; sample two does not.
-      readProposal: () => (++reads === 1 ? { reason: 'done', proposed_at: iso(10_000) } : null),
+  it('does not finalize on a confirmation retracted during the candidate reads', async () => {
+    const THREAD_F = 'slack:C1:finalize-retract';
+    for (const [group, id] of [
+      ['ag1', 'f-retractor'],
+      ['ag2', 'f-sibling'],
+    ] as const) {
+      insertSession(id, group, THREAD_F);
+      fs.rmSync(path.dirname(dbPathFor(group, id, 'inbound.db')), { recursive: true, force: true });
+      materializeSession(group, id);
+      const out = new Database(dbPathFor(group, id, 'outbound.db'));
+      out
+        .prepare('INSERT INTO session_state (key, value, updated_at) VALUES (?, ?, ?)')
+        .run('done_proposal', JSON.stringify({ reason: 'done', proposed_at: iso(10_000) }), iso(10_000));
+      out.close();
+    }
+    // Inside the confirmation window, so only standing proposals finalize this.
+    getDb()
+      .prepare(
+        `INSERT INTO thread_closures (thread_id, requested_by, requested_at, reason, agent_proposed, session_ids, state)
+         VALUES (?, 'admin', ?, NULL, 1, ?, 'awaiting_confirmation')`,
+      )
+      .run(THREAD_F, iso(30_000), JSON.stringify(['f-retractor', 'f-sibling']));
+
+    // Fires after the retractor's read has resolved, while the sibling's is
+    // still outstanding — the interleave two whole samples could not express.
+    duringProposalRead.skip = 1;
+    duringProposalRead.run = () => {
+      const db = new Database(dbPathFor('ag1', 'f-retractor', 'outbound.db'));
+      db.prepare("DELETE FROM session_state WHERE key = 'done_proposal'").run();
+      db.close();
+    };
+
+    const calls: string[] = [];
+    // `readProposal` deliberately NOT injected: this case has to exercise the
+    // real fan-out and the real synchronous decision over real files.
+    await advanceThreadClosures({
+      now: NOW,
+      isContainerRunning: () => false,
+      clearContinuation: () => {
+        calls.push('clear');
+        return true;
+      },
+      killContainer: (_id, _reason, onExit) => {
+        calls.push('kill');
+        onExit?.();
+      },
+      archiveSession: (id) => {
+        calls.push('archive');
+        return getDb().prepare('UPDATE sessions SET archived_at = ? WHERE id = ?').run(iso(0), id).changes > 0;
+      },
     });
 
-    await advanceThreadClosures(deps);
-
-    // No kill, no clear, no archive — and both samples were actually taken.
     expect(calls).toEqual([]);
-    expect(reads).toBe(2);
-    expect(getDb().prepare('SELECT state FROM thread_closures WHERE thread_id = ?').get(THREAD)).toMatchObject({
+    expect(getDb().prepare('SELECT state FROM thread_closures WHERE thread_id = ?').get(THREAD_F)).toMatchObject({
       state: 'awaiting_confirmation',
     });
   });
@@ -912,15 +971,12 @@ describe('the close sequence order', () => {
    * real kill. So the await was awaiting nothing, and when the later exit's
    * settle failed, it rejected a promise with no local catch: the error escaped
    * this function's caller and surfaced at the process `unhandledRejection`
-   * handler, outside the closure loop's per-row containment, where the close
-   * could neither report nor retry it.
+   * handler, outside `advanceThreadClosures`' per-row containment.
    *
    * Resolving from the callback keeps both shapes right. A synchronous exit —
    * an already-stopped container, or an injected kill — still orders kill,
    * clear and archive before the tick returns, which the other cases here pin.
-   * This one pins the asynchronous shape: the tick must not block on an exit
-   * that has not happened, and the later exit's work must still be this
-   * function's to catch.
+   * This one pins the asynchronous shape.
    */
   it('returns without blocking on a kill whose exit lands on a later tick', async () => {
     startClose();

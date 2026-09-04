@@ -10,6 +10,7 @@ import {
   isContainerRunning,
   isContainerSpawning,
   killContainer,
+  sessionStillActive,
   wakeContainer,
 } from './container-runner.js';
 import { randomUUID } from 'crypto';
@@ -635,8 +636,11 @@ export async function restartAgentGroupContainers(
       reason,
       wakeMessage || hasPending || options.respawnAll
         ? () => {
-            const s = getSession(session.id);
-            if (s) wakeContainer(s);
+            // The liveness proof rides WITH the wake instead of preceding it:
+            // `wakeContainer` awaits admission, the memory queue and the whole
+            // spawn preparation, and a `getSession` here proves nothing about
+            // any of that.
+            void wakeContainer(session, 'interactive', { guard: sessionStillActive(session.id) });
           }
         : undefined,
     );

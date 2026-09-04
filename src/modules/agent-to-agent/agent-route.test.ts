@@ -501,6 +501,38 @@ describe('routeAgentMessage return-path', () => {
     expect(readPairedInboundTriggers(A, S2.id)).toHaveLength(0);
   });
 
+  /**
+   * The RETURN-PATH lookup must fail on unprovable provenance too.
+   *
+   * The self-loopback site was fixed in an earlier round; this one still mapped
+   * a missing source mailbox to `null` and fell through to `resolveSession`,
+   * which picks the newest active session of the target or creates one. So a
+   * reply whose origin nobody could vouch for was delivered anyway, to a
+   * session that never took part in the conversation. The two sites read the
+   * same storage and must answer "I cannot tell" the same way.
+   */
+  it('fails a peer reply rather than routing it when the source mailbox is gone', async () => {
+    await routeAgentMessage(
+      { id: 'msg-prov', platform_id: B, content: JSON.stringify({ text: 'ping' }), in_reply_to: null },
+      S1,
+    );
+    const inboundId = readPairedInboundTriggers(B, SB.id)[0].id;
+
+    // B's own inbound storage disappears before it replies.
+    fs.rmSync(inboundDbPath(B, SB.id));
+
+    await expect(
+      routeAgentMessage(
+        { id: 'msg-prov-reply', platform_id: A, content: JSON.stringify({ text: 'pong' }), in_reply_to: inboundId },
+        SB,
+      ),
+    ).rejects.toThrow(SessionDbMissingError);
+
+    // And it did not fall through to the newest-session heuristic instead.
+    expect(readPairedInboundTriggers(A, S1.id)).toHaveLength(0);
+    expect(readPairedInboundTriggers(A, S2.id)).toHaveLength(0);
+  });
+
   it('self-message is allowed without a destination row', async () => {
     // A targets itself — no agent_destinations row exists for A→A.
     await routeAgentMessage(

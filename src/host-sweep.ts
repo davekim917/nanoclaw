@@ -75,6 +75,7 @@ import {
   isContainerRunning,
   containerOwnsOutbound,
   killContainer,
+  sessionStillActive,
   wakeContainer,
 } from './container-runner.js';
 import {
@@ -1302,8 +1303,7 @@ function applyProviderHeal(
  */
 function killForProviderHeal(session: Session): void {
   killContainer(session.id, 'provider-failed-selfheal', () => {
-    const fresh = getSession(session.id);
-    if (fresh) void wakeContainer(fresh);
+    void wakeContainer(session, 'interactive', { guard: sessionStillActive(session.id) });
   });
 }
 
@@ -2417,18 +2417,13 @@ async function sweepTaskWatchdog(): Promise<void> {
             },
           }),
         });
-        // Re-read before the wake: `parentSession` was fetched before the
-        // awaited mailbox write above, and the parent can be archived in that
-        // window. Belt-and-braces now that `wakeContainer` re-reads internally
-        // after every admission await — but it is one central lookup, and the
-        // duty that hands it a stale object is the one that has to stop doing
-        // so.
-        const freshParent = getSession(parentSession.id);
-        if (freshParent) {
-          void wakeContainer(freshParent).catch((err) =>
-            log.warn('Task watchdog: wakeContainer(parent) failed', { taskId: task.task_id, err }),
-          );
-        }
+        // `parentSession` was fetched before the awaited mailbox write above,
+        // and the parent can be archived in that window — but so can it be
+        // archived during the wake's own awaits, which a re-read here cannot
+        // see. The proof travels with the wake.
+        void wakeContainer(parentSession, 'interactive', {
+          guard: sessionStillActive(parentSession.id),
+        }).catch((err) => log.warn('Task watchdog: wakeContainer(parent) failed', { taskId: task.task_id, err }));
       } catch (err) {
         log.warn('Task watchdog: failed to notify parent', { taskId: task.task_id, err });
       }
@@ -3083,8 +3078,7 @@ function registerBuiltInSweepDuties(): void {
         // detection, no heartbeat ceiling, no claim tolerance. Every other
         // by-id caller already re-reads (`router.ts`, `agent-route.ts`,
         // `container-restart.ts`); this one did not.
-        const fresh = getSession(session.id);
-        const woke = fresh ? await wakeContainer(fresh, plan.wakePriority) : false;
+        const woke = await wakeContainer(session, plan.wakePriority, { guard: sessionStillActive(session.id) });
         c.reportWoke(woke);
         if (!woke && resumedContinuation) {
           await restoreStoppedContinuationAttempt(wakeRun, session, resumedContinuation, plan.workContinuation!);
