@@ -512,3 +512,100 @@ describe('acquireStorageActivityLease is observable and bounded', () => {
     expect(settled).toBe('resolved');
   });
 });
+
+describe('the marker mkdir itself loses the release race', () => {
+  // The incident (2026-09-04, sess-1788440696563-ae2rvy). The retry above only
+  // ever covered writeFile, because the mkdir sat OUTSIDE the try. But a
+  // recursive mkdir is not one atomic syscall — Node walks the path — so a
+  // releasing holder's rmdir of the same leaf can surface as ENOENT out of the
+  // MKDIR. That ENOENT escaped acquireStorageActivityLease, propagated through
+  // writeSessionMessage into the router, and aborted the route BEFORE the
+  // inbound row was written: an accepted Slack message dropped on the floor.
+  //
+  // `mockRejectedValueOnce` is not enough on the async path: its first mkdir
+  // call is for resourceRoot, not activeDir. Both tests therefore fail the
+  // FIRST activeDir mkdir and let every later one through, which is exactly
+  // the shape of a single lost race.
+  function enoent(dir: string): NodeJS.ErrnoException {
+    return Object.assign(new Error(`ENOENT: no such file or directory, mkdir '${dir}'`), { code: 'ENOENT' });
+  }
+
+  it('acquireStorageActivityLease survives it and still plants a marker', async () => {
+    const root = tempRoot();
+    const activeDir = path.join(root, '.nanoclaw-storage-active');
+    const realMkdir = fs.promises.mkdir.bind(fs.promises);
+    let failed = false;
+    vi.spyOn(fs.promises, 'mkdir').mockImplementation(async (dir, opts) => {
+      if (!failed && dir === activeDir) {
+        failed = true;
+        throw enoent(activeDir);
+      }
+      return realMkdir(dir as fs.PathLike, opts as fs.MakeDirectoryOptions);
+    });
+
+    const lease = await acquireStorageActivityLease(root, 'writer');
+
+    expect(failed, 'the mkdir race must actually have fired').toBe(true);
+    expect(fs.readdirSync(activeDir), 'the retry must leave a marker').toHaveLength(1);
+    await lease.release();
+  });
+
+  it('plantStorageActivityMarker survives it and still plants a marker', () => {
+    const root = tempRoot();
+    const activeDir = path.join(root, '.nanoclaw-storage-active');
+    const realMkdirSync = fs.mkdirSync.bind(fs);
+    let failed = false;
+    vi.spyOn(fs, 'mkdirSync').mockImplementation((dir, opts) => {
+      if (!failed && dir === activeDir) {
+        failed = true;
+        throw enoent(activeDir);
+      }
+      return realMkdirSync(dir as fs.PathLike, opts as fs.MakeDirectoryOptions);
+    });
+
+    const release = plantStorageActivityMarker(root, 'writer');
+
+    expect(failed, 'the mkdir race must actually have fired').toBe(true);
+    expect(fs.readdirSync(activeDir), 'the retry must leave a marker').toHaveLength(1);
+    release();
+  });
+
+  it('rethrows once the bound is exhausted, leaving nothing behind', async () => {
+    const root = tempRoot();
+    const activeDir = path.join(root, '.nanoclaw-storage-active');
+    const realMkdir = fs.promises.mkdir.bind(fs.promises);
+    let activeDirAttempts = 0;
+    vi.spyOn(fs.promises, 'mkdir').mockImplementation(async (dir, opts) => {
+      if (dir === activeDir) {
+        activeDirAttempts++;
+        throw enoent(activeDir);
+      }
+      return realMkdir(dir as fs.PathLike, opts as fs.MakeDirectoryOptions);
+    });
+
+    await expect(acquireStorageActivityLease(root, 'writer')).rejects.toMatchObject({ code: 'ENOENT' });
+    expect(activeDirAttempts, 'bounded at three attempts, never an unbounded spin').toBe(3);
+    expect(fs.existsSync(activeDir)).toBe(false);
+  });
+});
+
+describe('concurrent acquire/release on one root', () => {
+  // The production interleave with no mocks at all: two deliveries of the same
+  // Slack message racing on one session root, each acquiring and releasing.
+  // Before the fix this failed intermittently — the loser's mkdir or writeFile
+  // hit the winner's rmdir. Every acquisition must succeed; a lost race is a
+  // dropped inbound message, never an error the caller has to handle.
+  it('never surfaces a race to the caller', async () => {
+    const root = tempRoot();
+    const cycle = async (id: string): Promise<void> => {
+      for (let i = 0; i < 40; i++) {
+        const lease = await acquireStorageActivityLease(root, id);
+        await lease.release();
+      }
+    };
+
+    await Promise.all([cycle('a'), cycle('b'), cycle('c'), cycle('d')]);
+
+    expect(fs.existsSync(path.join(root, '.nanoclaw-storage-active'))).toBe(false);
+  });
+});

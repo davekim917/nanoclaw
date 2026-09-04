@@ -82,7 +82,26 @@ export function warnSessionIfWorkInFlight(mailbox: NanoclawMailboxSession, sessi
       priorToolAttempts: 0,
       now,
     }).action === 'wake-accountable';
-  if (!midWork) return false;
+  if (!midWork) {
+    // Say WHY, once per interrupted container per restart. The three signals
+    // are deliberately narrow (see the spam guard in the module header), so a
+    // session that is genuinely mid-work but shows none of them goes dark with
+    // no note and no trace that a decision was even made. That is what made
+    // the 2026-09-04 restart unresolvable from logs: two sibling sessions got
+    // notes, the one actually killed mid-turn got silence, and nothing
+    // recorded which signal it was missing. Bounded — this runs only for
+    // sessions whose containers are about to be stopped.
+    log.info('host-restart: no accountability note, no work-in-flight signal', {
+      sessionId: session.id,
+      reason,
+      hasContinuation: continuation !== null,
+      resumableContinuation,
+      hasProcessingClaim: processingClaimKey !== null,
+      currentTool: state?.current_tool ?? null,
+      toolStartedAt: state?.tool_started_at ?? null,
+    });
+    return false;
+  }
 
   const recoveryKey = continuation
     ? `${continuation.id}-${continuation.recovery_episode}-${continuation.resume_attempts}`

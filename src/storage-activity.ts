@@ -79,6 +79,75 @@ function delay(ms: number): Promise<void> {
 }
 
 /**
+ * How many times planting an activity marker may be retried after an ENOENT.
+ *
+ * Planting is two syscalls against a directory other holders are concurrently
+ * creating and removing — `mkdir(activeDir, { recursive: true })` then
+ * `writeFile(marker)` — and BOTH can lose that race with ENOENT:
+ *
+ *   - the writeFile, when a releasing holder's rmdir lands between the two;
+ *   - the mkdir ITSELF, because a recursive mkdir is not one atomic syscall.
+ *     Node walks the path, and a concurrent rmdir of the leaf between its
+ *     internal steps surfaces as ENOENT out of the mkdir call. Measured on
+ *     Node 22: ~4 mkdir ENOENTs and ~70 writeFile ENOENTs per 20k contended
+ *     plant/release pairs.
+ *
+ * The mkdir used to sit outside the retry, so its ENOENT escaped to the
+ * caller. On the inbound path that caller is `writeSessionMessage`, and the
+ * throw aborted the route BEFORE the row was written — an accepted platform
+ * message dropped on the floor. This is what stranded
+ * sess-1788440696563-ae2rvy on 2026-09-04.
+ *
+ * A retry is only ever losing a race with a rmdir that has already been
+ * issued, so a small bound is enough; three attempts covers a burst of
+ * overlapping releases without turning a genuine failure (ENOSPC, EACCES)
+ * into a spin. Exhausting the bound rethrows, exactly as before.
+ */
+const PLANT_MAX_ATTEMPTS = 3;
+const PLANT_RETRY_BACKOFF_MS = 5;
+
+function isEnoent(err: unknown): boolean {
+  return (err as NodeJS.ErrnoException | undefined)?.code === 'ENOENT';
+}
+
+/**
+ * Run `plant` under the bounded ENOENT retry above. `discard` undoes a partial
+ * plant before each retry (and before the final rethrow) so a failed attempt
+ * neither proceeds unprotected nor strands a marker that would block this
+ * root's reclaim forever.
+ */
+async function plantWithEnoentRetry(plant: () => Promise<void>, discard: () => Promise<void>): Promise<void> {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      await plant();
+      return;
+    } catch (err) {
+      await discard();
+      if (attempt >= PLANT_MAX_ATTEMPTS || !isEnoent(err)) throw err;
+      await delay(PLANT_RETRY_BACKOFF_MS * attempt);
+    }
+  }
+}
+
+/**
+ * Synchronous twin of {@link plantWithEnoentRetry}. No backoff between
+ * attempts on purpose: the only sleep available here would block the event
+ * loop, and the rmdir this is racing has already been issued — retrying
+ * immediately is what clears it.
+ */
+function plantWithEnoentRetrySync(plant: () => void, discard: () => void): void {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      plant();
+      return;
+    } catch (err) {
+      discard();
+      if (attempt >= PLANT_MAX_ATTEMPTS || !isEnoent(err)) throw err;
+    }
+  }
+}
+
+/**
  * Acquire a shared activity lease for a cache-bearing resource root.
  *
  * The worker's cleanup claim and the host's double-checked marker form a
@@ -117,22 +186,20 @@ export async function acquireStorageActivityLease(
       continue;
     }
 
-    // Plant, retrying ONCE on ENOENT — see plantStorageActivityMarker below,
-    // which this mirrors: a releasing holder's rmdir can land between our
-    // mkdir and our writeFile and take the directory we just made, and one
-    // retry clears it because that rmdir is done.
-    for (let attempt = 0; ; attempt++) {
-      await fs.promises.mkdir(activeDir, { recursive: true });
-      try {
+    // Plant, retrying on ENOENT — see plantStorageActivityMarker below, which
+    // this mirrors. The mkdir is INSIDE the try on purpose: a recursive mkdir
+    // is not atomic, so a releasing holder's rmdir of this same directory can
+    // make the mkdir itself fail ENOENT, not just the writeFile after it.
+    await plantWithEnoentRetry(
+      async () => {
+        await fs.promises.mkdir(activeDir, { recursive: true });
         await fs.promises.writeFile(marker, `${process.pid}\n`, { flag: 'w' });
-        break;
-      } catch (err) {
+      },
+      async () => {
         await fs.promises.rm(marker, { force: true }).catch(() => undefined);
         await fs.promises.rmdir(activeDir).catch(() => undefined);
-        if (attempt === 0 && (err as NodeJS.ErrnoException).code === 'ENOENT') continue;
-        throw err;
-      }
-    }
+      },
+    );
 
     if (await claimExists(resourceRoot)) {
       await fs.promises.rm(marker, { force: true });
@@ -200,26 +267,20 @@ export function plantStorageActivityMarker(resourceRoot: string, holderId: strin
       // Another live holder still owns it.
     }
   };
-  // Plant, retrying ONCE on ENOENT. A releasing holder's `fs.promises.rmdir`
-  // runs its syscall on the libuv threadpool, so it can land between these two
-  // synchronous calls and take the directory we just made — an ordinary race
-  // with no bearing on whether we may proceed. One retry clears it, because the
-  // rmdir that caused it is done; a loop would only spin. Any other failure
-  // (ENOSPC leaving a partial marker) is real: discard so we neither proceed
-  // unprotected nor strand a file that blocks this root's reclaim forever, and
-  // let the caller see it. acquireStorageActivityLease above mirrors this same
-  // retry-once handling, for the same race.
-  for (let attempt = 0; ; attempt++) {
+  // Plant under the bounded ENOENT retry. A releasing holder's
+  // `fs.promises.rmdir` runs its syscall on the libuv threadpool, so it can
+  // land between these two synchronous calls and take the directory we just
+  // made — an ordinary race with no bearing on whether we may proceed. The
+  // mkdir is INSIDE the retry with the writeFile, not before it: a recursive
+  // mkdir is not atomic, so that same rmdir can also make the MKDIR fail
+  // ENOENT (see PLANT_MAX_ATTEMPTS). Any other failure (ENOSPC leaving a
+  // partial marker) is real: discard so we neither proceed unprotected nor
+  // strand a file that blocks this root's reclaim forever, and let the caller
+  // see it. acquireStorageActivityLease above mirrors this same handling.
+  plantWithEnoentRetrySync(() => {
     fs.mkdirSync(activeDir, { recursive: true });
-    try {
-      fs.writeFileSync(marker, `${process.pid}\n`, { flag: 'w' });
-      break;
-    } catch (err) {
-      discard();
-      if (attempt === 0 && (err as NodeJS.ErrnoException).code === 'ENOENT') continue;
-      throw err;
-    }
-  }
+    fs.writeFileSync(marker, `${process.pid}\n`, { flag: 'w' });
+  }, discard);
   if (fs.existsSync(cleanupClaimPath(resourceRoot))) {
     discard();
     throw new Error(`session storage is being reclaimed, retry: ${resourceRoot}`);
