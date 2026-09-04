@@ -276,6 +276,26 @@ describe('review-churn classifier', () => {
     expect(classify(fixture('toctou-class')).classes[0].seamSubstantiated).toBe(true);
   });
 
+  it('substantiates a seam the findings name through an alias', () => {
+    // `import { evaluateGate as gate }` binds `gate`, which is the name a
+    // finding will use, while the module exports `evaluateGate`. Both spellings
+    // are what the module provides, so either one is evidence.
+    const aliased = classify(fixture('aliased-seam')).classes[0];
+    expect(aliased.seam).toBe('src/gate.ts');
+    expect(aliased.seamSubstantiated).toBe(true);
+  });
+
+  it('does not let a sibling class lend its evidence to a guessed seam', () => {
+    // A one-round class that names the module must not promote a three-round
+    // class that merely guessed the same import.
+    const report = classify(fixture('guessed-seam-with-named-sibling'));
+    const guessed = report.classes.find((c) => c.rounds === 3)!;
+    expect(guessed.seamSubstantiated).toBe(false);
+    // The rollup counts the substantiated class only, so it is one round.
+    expect(report.seams).toHaveLength(1);
+    expect(report.seams[0].rounds).toBe(1);
+  });
+
   it('reads severity direction per seam, not per finding', () => {
     const falling = classify(fixture('seam-drift-falling'));
     const flat = classify(fixture('seam-drift-flat'));
@@ -473,6 +493,37 @@ describe('review-churn gate', () => {
     expect(status).toBe(3);
     expect(decision.unlifted).toHaveLength(1);
     expect(decision.unlifted[0].signature).toBe('inv:durability');
+  });
+
+  it('gates an aliased seam like any other substantiated one', () => {
+    expect(gate(fixture('aliased-seam')).status).toBe(3);
+  });
+
+  it('does not gate a guessed seam that a sibling class happens to name', () => {
+    const { status, decision, text } = gate(fixture('guessed-seam-with-named-sibling'));
+    expect(status).toBe(0);
+    expect(decision.flagged).toHaveLength(0);
+    expect(text).toContain('reported, not gated');
+  });
+
+  it('does not read a comment or a string as a declaration', () => {
+    // A doc example or a log message mentioning `function guardEveryWrite` is
+    // not a primitive, and a trailer pointing at one must not lift the gate.
+    const payload = fixture('toctou-class');
+    payload.commits = [
+      {
+        sha: 'ppp6666',
+        date: AFTER,
+        message: 'docs: mention the guard\n\nReframe: race enforced in guardEveryWrite\n',
+        files: ['src/guard.ts'],
+        added: [
+          '// export function guardEveryWrite(session: Session) {',
+          ' * `function guardEveryWrite` is where this will live.',
+          'const message = "function guardEveryWrite";',
+        ],
+      },
+    ];
+    expect(gate(payload).status).toBe(3);
   });
 
   it('says so when a class at three rounds is reported rather than gated', () => {

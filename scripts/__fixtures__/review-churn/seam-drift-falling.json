@@ -1,5 +1,5 @@
 {
-  "_comment": "Three rounds landing on ONE seam, but each a different invariant family and severity falling P1 → P2 → P3. No class reaches three rounds, and per docs/review-policy.md falling severity is convergence, so the gate must let this through.",
+  "_comment": "Three rounds landing on ONE seam, but each a different invariant family and severity falling P1 \u2192 P2 \u2192 P3. No class reaches three rounds, and per docs/review-policy.md falling severity is convergence, so the gate must let this through. Every finding names `writeSessionMessage`, which is what makes the shared seam evidence rather than a guess \u2014 a rollup built from guessed seams would be aggregating rounds nobody can act on.",
   "findings": [
     {
       "threadId": "S1",
@@ -21,7 +21,7 @@
       "line": 88,
       "isResolved": true,
       "isOutdated": false,
-      "body": "**<sub><sub>![P2 Badge](https://img.shields.io/badge/P2-yellow?style=flat)</sub></sub>  Treat an absent outbound file as empty**\n\nWhen the file is missing this returns undefined and the caller reads a null field; return an empty list instead."
+      "body": "**<sub><sub>![P2 Badge](https://img.shields.io/badge/P2-yellow?style=flat)</sub></sub>  Treat an absent outbound file as empty**\n\nWhen the file is missing this returns undefined and the caller reads a null field; return an empty list instead. The call into `writeSessionMessage` is where this has to hold."
     },
     {
       "threadId": "S3",
@@ -32,7 +32,7 @@
       "line": 120,
       "isResolved": false,
       "isOutdated": false,
-      "body": "**<sub><sub>![P3 Badge](https://img.shields.io/badge/P3-blue?style=flat)</sub></sub>  Roll back the stamp when the write throws**\n\nThe row is persisted before the write and never rolled back on failure, so a partial rollback leaves the stamp behind."
+      "body": "**<sub><sub>![P3 Badge](https://img.shields.io/badge/P3-blue?style=flat)</sub></sub>  Roll back the stamp when the write throws**\n\nThe row is persisted before the write and never rolled back on failure, so a partial rollback leaves the stamp behind. The call into `writeSessionMessage` is where this has to hold."
     }
   ],
   "sources": {

@@ -266,11 +266,15 @@ export function importsOf(source) {
       .split(',')
       .map((part) => part.trim())
       .filter(Boolean)
-      .map((part) => {
-        const m = /^(?:\*\s+as\s+|type\s+)?([A-Za-z_$][\w$]*)(?:\s+as\s+[A-Za-z_$][\w$]*)?$/.exec(part);
-        return m ? m[1] : null;
-      })
-      .filter(Boolean);
+      // Both sides of an alias: `import { evaluateGate as gate }` binds `gate`,
+      // and a finding will say `gate`, but the module exports `evaluateGate`.
+      // Substantiation asks whether the findings name something this module
+      // provides, so both spellings have to count.
+      .flatMap((part) => {
+        const m = /^(?:\*\s+as\s+|type\s+)?([A-Za-z_$][\w$]*)(?:\s+as\s+([A-Za-z_$][\w$]*))?$/.exec(part);
+        if (!m) return [];
+        return m[2] ? [m[1], m[2]] : [m[1]];
+      });
     out.push({ spec, names });
   };
   for (const m of source.matchAll(/\b(?:import|export)\s+(?:type\s+)?([^;'"]*?)\s*from\s*['"]([^'"]+)['"]/g)) {
@@ -482,9 +486,14 @@ export function classify(payload) {
   // Seam rollup — the safety net for a class key that splits. Findings hop
   // wording as well as files; when they keep landing on ONE seam with severity
   // flat, that is the same defect however the titles read.
+  // Only substantiated classes feed the rollup. Otherwise a one-round class
+  // that names the module lends its evidence to a three-round class that
+  // guessed the same import, and the rollup gates on rounds the guess
+  // contributed — refusing the push while the class table reports that very
+  // class as not gated.
   const bySeam = new Map();
   for (const b of built) {
-    if (!b.cls.seam) continue;
+    if (!b.cls.seam || !b.cls.seamSubstantiated) continue;
     if (!bySeam.has(b.cls.seam)) bySeam.set(b.cls.seam, []);
     bySeam.get(b.cls.seam).push(b);
   }
@@ -495,7 +504,7 @@ export function classify(payload) {
       return {
         seam,
         seamInRepo: entries[0].cls.seamInRepo,
-        seamSubstantiated: entries.some((e) => e.cls.seamSubstantiated),
+        seamSubstantiated: true,
         rounds: rounds.length,
         findings: group.length,
         lastAt: lastAt(group),
@@ -556,7 +565,7 @@ function invariantNamed(entry, trailer) {
 function declaredByCommit(named, commit, ctx) {
   const identifiers = named.match(/[A-Za-z_$][\w$]*/g) ?? [];
   if (identifiers.length === 0) return false;
-  const added = addedLines(commit, ctx);
+  const added = addedLines(commit, ctx).map(strippedCode).filter(Boolean);
   if (added.length === 0) return false;
   return identifiers.some((id) => {
     const declaration = new RegExp(
@@ -564,6 +573,24 @@ function declaredByCommit(named, commit, ctx) {
     );
     return added.some((line) => declaration.test(line));
   });
+}
+
+/**
+ * An added line with its comments and string literals removed, so that a
+ * comment, a doc example or a message mentioning `function guardEveryWrite` is
+ * not read as declaring it. Line-level and deliberately crude: a block comment
+ * spanning lines still starts with its own marker on each line in a diff, and
+ * the cost of being wrong here is a lift refused, never one wrongly granted.
+ */
+function strippedCode(line) {
+  const trimmed = line.trim();
+  if (trimmed.startsWith('//') || trimmed.startsWith('*') || trimmed.startsWith('/*')) return '';
+  return line
+    .replace(/`[^`]*`/g, ' ')
+    .replace(/'[^']*'/g, ' ')
+    .replace(/"[^"]*"/g, ' ')
+    .replace(/\/\*[\s\S]*?\*\//g, ' ')
+    .replace(/\/\/.*$/, ' ');
 }
 
 /** The `+` side of a commit's diff. Supplied by the payload in tests. */
@@ -705,23 +732,16 @@ export function decideGate(payload, options = {}) {
   // They are the "reported" half of the rule and must appear in the output: a
   // gate that prints "no finding class has reached 3 rounds" while the table
   // holds one is telling the operator something false.
-  const reported = [
-    ...report.classes.filter((c) => c.rounds >= CLASS_ROUND_LIMIT && !(c.seam && c.seamSubstantiated)),
-    ...report.seams.filter(
-      (s) =>
-        s.rounds >= CLASS_ROUND_LIMIT &&
-        !s.severityFalling &&
-        !s.seamSubstantiated &&
-        !report.classes.some((c) => c.seam === s.seam && c.rounds >= CLASS_ROUND_LIMIT),
-    ),
-  ].map((row) => ({
-    key: row.key ?? `seam ${row.seam}`,
-    rounds: row.rounds,
-    seam: row.seam ?? null,
-    reason: row.seam
-      ? 'the seam is a guess: one flagged file, and the findings name nothing it exports'
-      : 'the sites share no seam',
-  }));
+  const reported = report.classes
+    .filter((c) => c.rounds >= CLASS_ROUND_LIMIT && !(c.seam && c.seamSubstantiated))
+    .map((c) => ({
+      key: c.key,
+      rounds: c.rounds,
+      seam: c.seam,
+      reason: c.seam
+        ? 'the seam is a guess: one flagged file, and the findings name nothing it exports'
+        : 'the sites share no seam',
+    }));
 
   const unlifted = decided.filter((e) => !e.lifted);
   const allow =
