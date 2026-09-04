@@ -279,17 +279,52 @@ describe('the persisted quiet mark (S2-PR15)', () => {
   it('leaves last_active at the invalidated value when the write throws', () => {
     createSession(session('s-1', ACTIVE));
 
+    // Captured INSIDE the write, so it is the value the invalidation itself
+    // published. Reading it after the throw and comparing it to itself would
+    // pass no matter what ran in between.
+    let atWriteTime: string | null = null;
     expect(() =>
       withQuietInvalidationSync('s-1', () => {
+        atWriteTime = lastActiveOf('s-1');
         throw new Error('mailbox write failed');
       }),
     ).toThrow(/mailbox write failed/);
-    const afterFailure = lastActiveOf('s-1');
 
-    expect(afterFailure).not.toBe(ACTIVE);
+    expect(atWriteTime).not.toBe(ACTIVE);
     expect(markOf('s-1')).toBeNull();
-    // No second bump: the value is the one the invalidation wrote.
-    expect(lastActiveOf('s-1')).toBe(afterFailure);
+    expect(lastActiveOf('s-1'), 'something wrote last_active after the write failed').toBe(atWriteTime);
+  });
+
+  // Codex round 4, H1. The ABA the monotonic `updateSession` closes: the
+  // invalidation moves B → B+1 ms, an ordinary activity write in the SAME
+  // millisecond used to put B back verbatim, and a sweep flush queued on basis
+  // B then matched again and reinstalled a mark over work that had just become
+  // due. `updateSession` never steps `last_active` DOWN now, so B is not
+  // reachable a second time.
+  it('an ordinary activity write in the same millisecond cannot restore the pre-invalidation basis', () => {
+    // B is in the FUTURE relative to the wall clock, which is how this test
+    // reaches the same-millisecond path without fake timers: the helper's
+    // `last_active < @now` arm cannot fire, so it must take the strict
+    // `+0.001 seconds` arm — exactly what a same-millisecond invalidation does.
+    const B = new Date(Date.now() + 3600_000).toISOString();
+    createSession(session('s-1', B));
+    const basis = lastActiveOf('s-1');
+    expect(basis).toBe(B);
+
+    // The due-ness write invalidates: B → B+1 ms (strictly greater).
+    withQuietInvalidationSync('s-1', () => undefined);
+    const invalidated = lastActiveOf('s-1')!;
+    expect(invalidated, 'the invalidation did not take the +1 ms arm').toBe(new Date(Date.parse(B) + 1).toISOString());
+
+    // The activity write that used to land verbatim, carrying the
+    // pre-invalidation value — what a same-millisecond
+    // `new Date().toISOString()` from session-manager produces.
+    updateSession('s-1', { last_active: B });
+    expect(lastActiveOf('s-1'), 'an activity write stepped last_active backwards').toBe(invalidated);
+
+    // The sweep's flush, queued on B, now lands.
+    persistQuietSessionMarks([{ sessionId: 's-1', quietUntil: FUTURE, lastActive: basis }]);
+    expect(markOf('s-1'), 'a stale mark was reinstalled over a newly due row').toBeNull();
   });
 
   it('an update that does not touch last_active leaves the mark alone', () => {

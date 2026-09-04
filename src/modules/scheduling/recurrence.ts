@@ -152,23 +152,25 @@ export async function handleRecurrence(mailbox: NanoclawMailboxSession, session:
       const backoffAt = scriptFails > 0 ? Date.now() + scriptBackoffMinutes(scriptFails) * 60_000 : 0;
       const nextRun = new Date(Math.max(cronNext.getTime(), backoffAt)).toISOString();
 
-      // Bracketed like every other due-ness write (Codex round 2, H1). The
-      // re-arm moves `process_after` in the session DB, which the quiet cache
-      // cannot see, so the central-DB invalidation is what makes the successor
-      // visible. Fail-closed: if it throws, the arm never happens and this
-      // row's `catch` below logs it — the predecessor keeps its recurrence, so
-      // the next tick retries rather than losing the series.
+      // Invalidated like every other due-ness write (Codex round 2 H1, round 3
+      // H1): the re-arm moves `process_after` in the session DB, which the quiet
+      // cache cannot see, so the central-DB invalidation is what makes the
+      // successor visible, and it happens in the same synchronous turn as the
+      // arm.
       //
-      // The POST half is redundant *here* and kept only so this site has the
-      // same one-call shape as the others. This body runs inside the session's
-      // own sweep pass with no `await` between the arm and the invalidation, and
-      // the mark that tick may flush carries `session.last_active` as its basis
+      // Fail-closed twice over. If the invalidation throws — a central-DB error,
+      // or no ACTIVE session row, which is what a session closed under this tick
+      // looks like — the arm never happens and this row's `catch` below logs it.
+      // The predecessor keeps its recurrence, so the next tick retries rather
+      // than losing the series, and a successor is never armed into a session
+      // `getActiveSessions()` will not enumerate.
+      //
+      // The mark this clears is flushed with `session.last_active` as its basis
       // — the value the driver read when it listed the tick's sessions, before
-      // this pass ran (`newQuietMarks.push` in src/host-sweep.ts) — so the
-      // pre-write invalidation alone already fails that flush's
-      // `WHERE last_active IS <basis>` guard, and the in-memory mark's
-      // `mark.lastActive === session.last_active` check on the next tick with
-      // it. It costs one extra central-DB UPDATE per re-arm.
+      // this pass ran (`newQuietMarks.push`, src/host-sweep.ts) — so moving the
+      // column here fails that flush's `WHERE last_active IS <basis>` guard, and
+      // the in-memory mark's `mark.lastActive === session.last_active` check on
+      // the next tick with it.
       withQuietInvalidationSync(session.id, () => mailbox.armNextRecurrence(msg.id, msg, newId, nextRun));
 
       log.info('Inserted next recurrence', {

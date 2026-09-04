@@ -175,10 +175,25 @@ export function updateSession(
   const values: Record<string, unknown> = { id };
 
   for (const [key, value] of Object.entries(updates)) {
-    if (value !== undefined) {
+    if (value === undefined) continue;
+    if (key === 'last_active') {
+      // MONOTONIC, never verbatim (Codex round 4, H1). Callers pass a raw
+      // `new Date().toISOString()` (session-manager.ts, delivery admission),
+      // which is millisecond-resolution — so an ordinary activity write landing
+      // in the SAME millisecond as `withQuietInvalidationSync`'s strict +1 ms
+      // would put the column back to the value a sweep's queued flush is
+      // guarded on (`WHERE last_active IS <basis>`), and that flush would then
+      // reinstall a mark over work that has just become due. An A→B→A step is
+      // the whole vulnerability; forbidding the step down closes it. No +1 ms
+      // here: only the invalidation needs a STRICT increase, and bumping on
+      // every activity write would drift the column off wall-clock for no gain.
+      fields.push(
+        'last_active = CASE WHEN last_active IS NULL OR last_active < @last_active THEN @last_active ELSE last_active END',
+      );
+    } else {
       fields.push(`${key} = @${key}`);
-      values[key] = value;
     }
+    values[key] = value;
   }
   // The host sweep's persisted quiet mark (migration 065) is a prediction of
   // when this session next has work — taken while `last_active` held some
@@ -186,9 +201,13 @@ export function updateSession(
   // prediction is stale, so the mark dies in the SAME statement, never in a
   // second write a caller could forget or a crash could lose. This is the
   // durable half of the in-memory cache's `mark.lastActive === last_active`
-  // check, and `updateSession` is the only writer of `last_active` in the host
-  // — a future raw-SQL writer would silently reintroduce a mark that outlives
-  // a newly due row.
+  // check.
+  //
+  // `updateSession` and `withQuietInvalidationSync` are the only two writers of
+  // `last_active` in the host (`createSession`'s INSERT aside), and both null
+  // the mark in the same statement. A future raw-SQL writer would silently
+  // reintroduce a mark that outlives a newly due row — and, unless it carried
+  // the monotonic CASE above, the round-4 ABA with it.
   if (updates.last_active !== undefined) fields.push('sweep_quiet_until = NULL');
   if (fields.length === 0) return;
 

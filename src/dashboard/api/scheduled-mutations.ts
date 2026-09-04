@@ -309,12 +309,13 @@ async function withMutationSession(
 /**
  * Emit the post-mutation SSE frame (non-null agent_group_id) + invalidate cache.
  *
- * The quiet-mark invalidation this used to also do here now brackets the write
- * itself, in `mutateWithInvalidation`: the session DB and the central DB are
- * two separate files with no shared transaction, so the mark has to die before
- * the write (Codex pre-pass, review/b3/review.json Part C) and again after it
- * (round 2, H1). This function still runs after the write and only on the
- * success paths — the SSE frame and the cache both describe what already
+ * The quiet-mark invalidation this used to also do here now sits immediately
+ * before the write itself, inside `mutateWithInvalidation`'s mailbox callback:
+ * the session DB and the central DB are two separate files with no shared
+ * transaction, so the mark has to die first (Codex pre-pass,
+ * review/b3/review.json Part C) and in the same synchronous turn as the
+ * statement (round 3, H1). This function still runs after the write and only on
+ * the success paths — the SSE frame and the cache both describe what already
  * happened, so there is nothing to gain by moving them earlier.
  */
 function afterMutation(agentGroupId: string, sessionId: string): void {
@@ -327,7 +328,7 @@ function afterMutation(agentGroupId: string, sessionId: string): void {
 }
 
 /**
- * Run one mutation with its quiet-mark invalidation on both sides.
+ * Run one mutation with its quiet-mark invalidation immediately before it.
  *
  * The single due-ness-write entry for this module. `withQuietInvalidationSync`
  * runs INSIDE the mailbox callback, in the same synchronous turn as the

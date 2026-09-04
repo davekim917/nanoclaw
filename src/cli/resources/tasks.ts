@@ -139,20 +139,22 @@ function withInbound<T>(session: ScopedSession, fn: (mailbox: NanoclawMailboxSes
 }
 
 /**
- * ── Quiet-mark invalidation in this file: PROBE FIRST, then bracket ──
+ * ── Quiet-mark invalidation in this file: PROBE FIRST, then invalidate ──
  *
  * Every mutating command below writes due-ness straight into the session DB,
- * where the host sweep's quiet cache cannot see it, so each write is bracketed
- * by `withQuietInvalidationSync` — fail-closed before it, advisory after (see
- * that helper). A swallowed central-DB failure would leave the row hidden
+ * where the host sweep's quiet cache cannot see it, so each write runs inside
+ * `withQuietInvalidationSync`: ONE fail-closed invalidation, then the statement,
+ * in the same synchronous turn (see that helper — there is no second call and
+ * none is owed). A swallowed central-DB failure would leave the row hidden
  * behind a mark nothing clears until `QUIET_SESSION_BACKOFF_MS` expires, past a
  * warmed restart, since S2-PR15 persists the mark.
  *
- * The bracket goes INSIDE the mailbox action, after the action's own read, not
+ * The call goes INSIDE the mailbox action, after the action's own read, not
  * around `withInbound`. These commands fan out across every session the caller
  * can see (`selectedSessions`) and typically one holds the series, so wrapping
- * the open would charge 2N central-DB writes and N spurious sweeps for one
- * mutation. Each site instead asks its already-open handle whether this session
+ * the open would charge N central-DB writes and N spurious sweeps for one
+ * mutation — and would put the funnel's await between the invalidation and the
+ * statement. Each site instead asks its already-open handle whether this session
  * holds the target row and returns 0 when it does not — no invalidation, no
  * write. `getCliTaskRow(id)` is the probe for the per-series verbs, and it is a
  * strict SUPERSET of what they can touch: it matches
@@ -162,8 +164,9 @@ function withInbound<T>(session: ScopedSession, fn: (mailbox: NanoclawMailboxSes
  * write would match nothing. Cancel-all probes with `listCliTaskSeries()`,
  * whose pending/paused set is exactly what `cancelAllTasks` updates.
  *
- * Inside the action there is also no `await` between the invalidation and the
- * write, so no sweep tick can interleave between them at all.
+ * Inside the action there is no `await` between the invalidation and the write,
+ * so no sweep tick can interleave between them at all — which is exactly why
+ * one invalidation is enough.
  *
  * Reads (`list`, `show`) never invalidate.
  */

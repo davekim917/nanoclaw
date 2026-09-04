@@ -282,6 +282,40 @@ function fakeSession(over: Partial<Session> = {}): Session {
   } as Session;
 }
 
+/**
+ * Seed the central `sessions` row a duty's context session stands for.
+ *
+ * The production precondition, not fixture decoration: a session reaches a
+ * sweep duty because `getActiveSessions()` returned its row, so an ACTIVE
+ * central row exists by construction. `withQuietInvalidationSync` (the
+ * quiet-mark invalidation every due-ness write goes through) refuses when no
+ * active row matches — which is the point, since a re-arm into a session the
+ * sweep will never enumerate is invisible work — so a fixture that hands the
+ * duty a `Session` object with no row behind it is testing a state production
+ * cannot produce.
+ *
+ * `messaging_group_id` is NULL because `foreign_keys = ON` here and the fake
+ * session's 'mg-test' has no row; nothing in these duties reads that column
+ * off the central row.
+ */
+function seedCentralSession(session: Session): void {
+  getDb()
+    .prepare(
+      `INSERT OR IGNORE INTO sessions (id, agent_group_id, messaging_group_id, thread_id, status,
+                                       container_status, last_active, created_at)
+       VALUES (@id, @agent_group_id, NULL, @thread_id, @status, @container_status, @last_active, @created_at)`,
+    )
+    .run({
+      id: session.id,
+      agent_group_id: session.agent_group_id,
+      thread_id: session.thread_id,
+      status: session.status,
+      container_status: session.container_status,
+      last_active: session.last_active,
+      created_at: session.created_at,
+    });
+}
+
 function duty(name: string): SweepDuty {
   const found = _listSweepRegistrationsForTesting().duties.find((d) => d.name === name);
   if (!found) throw new Error(`duty ${name} is not registered`);
@@ -291,6 +325,8 @@ function duty(name: string): SweepDuty {
 function makeCtx(over: Partial<SweepSessionContext> = {}): SweepSessionContext {
   const session = over.session ?? fakeSession();
   const mailbox = over.mailbox ?? null;
+  for (const s of over.sessions ?? [session]) seedCentralSession(s);
+  seedCentralSession(session);
   return {
     now: Date.now(),
     sessions: over.sessions ?? [session],
