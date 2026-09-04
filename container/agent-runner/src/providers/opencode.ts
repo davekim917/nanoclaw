@@ -366,7 +366,7 @@ function mergeNoProxy(current: string | undefined, addition: string): string {
 const SESSION_STATUS_RETRY_ERROR_AFTER = 3;
 
 /**
- * Should this turn be replayed on a brand-new session?
+ * Is this turn a dead continuation the runner should recover from?
  *
  * Codex's `startOrResumeCodexThread` starts a fresh thread when `thread/resume`
  * reports the id gone. OpenCode's equivalent failure is quieter: a poisoned
@@ -374,24 +374,43 @@ const SESSION_STATUS_RETRY_ERROR_AFTER = 3;
  * no assistant work, and the runner treats that as a finished turn — silence,
  * every turn, forever.
  *
- * Only a RESUME that produced no assistant work falls back, and only once per
- * query. A brand-new session that stays dry is a model or tools miss, not a
- * dead continuation, and replaying it would double the spend for the same
- * silence. "Work" is deliberately wide (a part of any type, a provider error on
- * the assistant record, a permission, a question, a compaction) so a turn that
- * did something and merely said nothing is never discarded.
+ * Only a RESUME counts. A brand-new session that stays dry is a model or tools
+ * miss, not a dead continuation, and recovering it would double the spend for
+ * the same silence. "Work" is deliberately wide (a part of any type, a provider
+ * error on the assistant record, a permission, a question, a compaction) so a
+ * turn that did something and merely said nothing is never discarded.
+ *
+ * There is no once-per-query latch because the recovery does not happen here:
+ * the provider raises a stale-session error and the poll-loop retries with
+ * `continuation: undefined`, so the replacement query has nothing to resume and
+ * structurally cannot reach this branch again.
  */
-export function isEmptyOpenCodeResume(opts: {
-  resumedExistingSession: boolean;
-  alreadyFellBack: boolean;
-  sawAssistantWork: boolean;
-}): boolean {
-  return opts.resumedExistingSession && !opts.alreadyFellBack && !opts.sawAssistantWork;
+export function isEmptyOpenCodeResume(opts: { resumedExistingSession: boolean; sawAssistantWork: boolean }): boolean {
+  return opts.resumedExistingSession && !opts.sawAssistantWork;
 }
 
 /** Stale / dead OpenCode session heuristics (complement Claude-centric host patterns). */
-const STALE_SESSION_RE =
-  /no conversation found|ENOENT.*\.jsonl|session.*not found|NotFoundError|connection reset|ECONNRESET|404|event timeout/i;
+/**
+ * Marker in the error a dead continuation raises. Matched by STALE_SESSION_RE
+ * below, so the runner classifies it as a stale session and runs its ONE
+ * recovery path — the same one a pruned transcript takes.
+ */
+export const EMPTY_RESUME_ERROR = 'resumed OpenCode session produced no assistant work';
+
+const STALE_SESSION_RE = new RegExp(
+  [
+    'no conversation found',
+    'ENOENT.*\\.jsonl',
+    'session.*not found',
+    'NotFoundError',
+    'connection reset',
+    'ECONNRESET',
+    '404',
+    'event timeout',
+    EMPTY_RESUME_ERROR,
+  ].join('|'),
+  'i',
+);
 
 /**
  * Build the env handed to the `opencode serve` child, stripping the auth secrets
@@ -1193,8 +1212,6 @@ export class OpenCodeProvider implements AgentProvider {
     const self = this;
     const queryCwd = input.cwd;
     const IDLE_TIMEOUT_MS = 90_000;
-    // At most one empty-resume fallback per query() — see isEmptyOpenCodeResume.
-    let emptyResumeFellBack = false;
 
     async function* gen(): AsyncGenerator<ProviderEvent> {
       let initYielded = false;
@@ -1510,42 +1527,33 @@ export class OpenCodeProvider implements AgentProvider {
           return { resultText, sawAssistantWork, stepCount, usage };
         }
 
-        let outcome = yield* runTurn(sessionId, text, attachments);
+        const outcome = yield* runTurn(sessionId, text, attachments);
         if (aborted) return;
 
         // Empty-resume recovery. A poisoned continuation accepts promptAsync,
         // emits session.idle having produced nothing, and would otherwise be
-        // reported as a finished, silent turn — every turn, forever. Only a
-        // RESUME that produced no assistant work falls back, and only once per
-        // query: a brand-new session that stays dry is a model/tools miss, not a
-        // dead continuation.
+        // reported as a finished, silent turn — every turn, forever.
+        //
+        // Recovery is RAISED, not performed here. Upstream creates a fresh
+        // session inline and replays the prompt into it, because upstream's
+        // runner has no recovery path of its own. This one does: the poll-loop's
+        // stale-session branch clears the continuation, resets the provider
+        // context, re-arms the memory bootstrap, and retries with a recap built
+        // from the per-session DB. Replaying inline would skip all four — most
+        // visibly the recap, so "continue with that plan" would be retried on a
+        // session that has never heard of the plan. Raising a
+        // stale-session-shaped error routes this into the one recovery the
+        // runner already owns, and that retry carries `continuation: undefined`,
+        // so the replacement query cannot reach this branch again.
         if (
           isEmptyOpenCodeResume({
             resumedExistingSession: replayPrompt !== undefined,
-            alreadyFellBack: emptyResumeFellBack,
             sawAssistantWork: outcome.sawAssistantWork,
           })
         ) {
-          log(`Empty resume on ${sessionId}; starting fresh session.`);
-          emptyResumeFellBack = true;
+          log(`Empty resume on ${sessionId} — raising as a stale session so the runner recovers with a recap.`);
           self.activeSessionId = undefined;
-          const created = await client.session.create();
-          if (aborted) return;
-          if (created.error) {
-            throw new Error(`OpenCode: failed to create session: ${JSON.stringify(created.error)}`);
-          }
-          const freshId = created.data?.id;
-          if (!freshId) throw new Error('OpenCode: failed to create session (no id)');
-          sessionId = freshId;
-          self.activeSessionId = freshId;
-          yield { type: 'init', continuation: freshId };
-          initYielded = true;
-          // Compose the replay the way a first-time query composes its opening
-          // prompt rather than wrapping the already-wrapped resume text twice.
-          // `replayPrompt` is defined here: it is what licensed this branch.
-          const retryText = wrapPromptWithContext(replayPrompt!, systemInstructions, effectiveModel);
-          outcome = yield* runTurn(freshId, retryText, attachments);
-          if (aborted) return;
+          throw new Error(`${EMPTY_RESUME_ERROR} (session ${sessionId})`);
         }
 
         // Empty-turn fallback: the turn completed (session.idle, no error) but

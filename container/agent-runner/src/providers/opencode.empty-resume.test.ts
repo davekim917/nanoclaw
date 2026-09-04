@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
 
 import {
+  EMPTY_RESUME_ERROR,
   isEmptyOpenCodeResume,
   OpenCodeProvider,
   type OpenCodeRuntimeDeps,
@@ -126,90 +127,80 @@ async function drainUntilResult(events: AsyncGenerator<ProviderEvent>): Promise<
   return seen;
 }
 
+/** Drains until the generator throws, returning the error. Fails if it does not. */
+async function drainExpectingThrow(events: AsyncGenerator<ProviderEvent>): Promise<Error> {
+  try {
+    for await (const ev of events) {
+      if (ev.type === 'result') break;
+    }
+  } catch (err) {
+    return err as Error;
+  }
+  throw new Error('expected the query to raise a stale-session error, but it completed');
+}
+
 describe('isEmptyOpenCodeResume', () => {
-  it('test_oc_resume_only_resumes_fall_back: a fresh session that stays dry is never replayed', () => {
+  it('test_oc_resume_only_resumes_recover: a fresh session that stays dry is never recovered', () => {
     // A brand-new session with no output is a model/tools miss, not a dead
-    // continuation — replaying it would double the spend for the same silence.
-    expect(
-      isEmptyOpenCodeResume({ resumedExistingSession: false, alreadyFellBack: false, sawAssistantWork: false }),
-    ).toBe(false);
+    // continuation — recovering it would double the spend for the same silence.
+    expect(isEmptyOpenCodeResume({ resumedExistingSession: false, sawAssistantWork: false })).toBe(false);
   });
 
-  it('test_oc_resume_falls_back_once: at most one fallback per query', () => {
-    expect(
-      isEmptyOpenCodeResume({ resumedExistingSession: true, alreadyFellBack: false, sawAssistantWork: false }),
-    ).toBe(true);
-    expect(
-      isEmptyOpenCodeResume({ resumedExistingSession: true, alreadyFellBack: true, sawAssistantWork: false }),
-    ).toBe(false);
+  it('test_oc_resume_dead_continuation_detected: a silent resume is a dead continuation', () => {
+    expect(isEmptyOpenCodeResume({ resumedExistingSession: true, sawAssistantWork: false })).toBe(true);
   });
 
-  it('test_oc_resume_work_blocks_fallback: any assistant work keeps the session', () => {
-    expect(
-      isEmptyOpenCodeResume({ resumedExistingSession: true, alreadyFellBack: false, sawAssistantWork: true }),
-    ).toBe(false);
+  it('test_oc_resume_work_blocks_recovery: any assistant work keeps the session', () => {
+    expect(isEmptyOpenCodeResume({ resumedExistingSession: true, sawAssistantWork: true })).toBe(false);
   });
 });
 
-describe('OpenCodeProvider — empty-resume fallback', () => {
-  it('test_oc_resume_replays_on_fresh_session: a silent resume is retried on a new session', async () => {
+describe('OpenCodeProvider — empty-resume recovery', () => {
+  it('test_oc_resume_raises_stale_session: a silent resume raises rather than replaying inline', async () => {
+    // Recovery belongs to the poll-loop's stale-session branch, which clears the
+    // continuation, resets the provider context, re-arms the memory bootstrap
+    // and retries with a recap from the per-session DB. Replaying inline here
+    // would skip all four and lose the conversation history.
     const resumed = 'sess-dead';
-    const fresh = 'sess-fresh';
     const { deps, prompts, created } = makeRuntime(
-      [
-        // Turn 1 on the resumed session: bare envelope, then idle. No parts.
-        [assistantEnvelope(resumed, 'm1'), idle(resumed)],
-        // Turn 2 on the replacement session: a real answer.
-        [assistantEnvelope(fresh, 'm2'), textPart(fresh, 'm2', 'p1', 'recovered answer'), idle(fresh)],
-      ],
-      [fresh],
+      [[assistantEnvelope(resumed, 'm1'), idle(resumed)]],
+      ['sess-should-not-be-used'],
     );
 
-    const query = newProvider(deps).query({ prompt: 'hello', continuation: resumed, cwd: '/workspace/agent' });
-    const seen = await drainUntilResult(query.events);
+    const provider = newProvider(deps);
+    const query = provider.query({ prompt: 'hello', continuation: resumed, cwd: '/workspace/agent' });
+    const err = await drainExpectingThrow(query.events);
 
-    // The dead session's id is announced first, then the replacement's.
-    expect(seen.filter((e) => e.type === 'init')).toEqual([
-      { type: 'init', continuation: resumed },
-      { type: 'init', continuation: fresh },
-    ]);
-    expect(created).toEqual([fresh]);
-    expect(prompts.map((p) => p.sessionId)).toEqual([resumed, fresh]);
-    const result = seen.at(-1);
-    expect(result?.type).toBe('result');
-    expect(result && 'text' in result ? result.text : undefined).toBe('recovered answer');
+    expect(err.message).toContain(EMPTY_RESUME_ERROR);
+    expect(err.message).toContain(resumed);
+    // No fresh session is created here, and the dead one was prompted exactly once.
+    expect(created).toEqual([]);
+    expect(prompts.map((p) => p.sessionId)).toEqual([resumed]);
     query.abort();
   });
 
-  it('test_oc_resume_replay_prompt_wrapped_once: the replay is composed, not double-wrapped', async () => {
+  it('test_oc_resume_error_is_session_invalid: the runner classifies that error as a stale session', () => {
+    // This is the whole contract with the poll-loop: `isSessionInvalid` is what
+    // selects the recap-bearing recovery branch. If the marker and the matcher
+    // ever drift apart, the turn surfaces as a plain error instead.
+    const provider = newProvider(makeRuntime([], []).deps);
+    expect(provider.isSessionInvalid(new Error(`${EMPTY_RESUME_ERROR} (session sess-dead)`))).toBe(true);
+    // Unrelated failures still classify as they did.
+    expect(provider.isSessionInvalid(new Error('some unrelated provider failure'))).toBe(false);
+  });
+
+  it('test_oc_resume_clears_active_session: the dead id is dropped so nothing resumes it again', async () => {
     const resumed = 'sess-dead';
-    const fresh = 'sess-fresh';
-    const { deps, prompts } = makeRuntime(
-      [
-        [assistantEnvelope(resumed, 'm1'), idle(resumed)],
-        [assistantEnvelope(fresh, 'm2'), textPart(fresh, 'm2', 'p1', 'ok'), idle(fresh)],
-      ],
-      [fresh],
-    );
-
-    const query = newProvider(deps).query({
-      prompt: 'do the thing',
-      continuation: resumed,
-      cwd: '/workspace/agent',
-      systemContext: { instructions: 'BE BRIEF' },
-    });
-    await drainUntilResult(query.events);
-
-    const replayText = (prompts[1]!.parts[0] as { text: string }).text;
-    // One <system> block, not the resume text wrapped a second time.
-    expect(replayText.match(/<system>/g) ?? []).toHaveLength(1);
-    expect(replayText).toContain('BE BRIEF');
-    expect(replayText).toContain('do the thing');
+    const { deps } = makeRuntime([[assistantEnvelope(resumed, 'm1'), idle(resumed)]], ['sess-unused']);
+    const provider = newProvider(deps);
+    const query = provider.query({ prompt: 'hello', continuation: resumed, cwd: '/workspace/agent' });
+    await drainExpectingThrow(query.events);
+    expect((provider as unknown as { activeSessionId?: string }).activeSessionId).toBeUndefined();
     query.abort();
   });
 
-  it('test_oc_resume_tool_only_turn_is_work: a turn that produced a tool part is not replayed', async () => {
-    // The assistant said nothing but did something. Replaying would discard the
+  it('test_oc_resume_tool_only_turn_is_work: a turn that produced a tool part is not recovered', async () => {
+    // The assistant said nothing but did something. Recovering would discard the
     // history for a turn that genuinely ran.
     const resumed = 'sess-live';
     const { deps, prompts, created } = makeRuntime(
@@ -223,14 +214,15 @@ describe('OpenCodeProvider — empty-resume fallback', () => {
     expect(created).toEqual([]);
     expect(prompts.map((p) => p.sessionId)).toEqual([resumed]);
     expect(seen.filter((e) => e.type === 'init')).toHaveLength(1);
+    expect(seen.at(-1)?.type).toBe('result');
     query.abort();
   });
 
-  it('test_oc_resume_errored_turn_is_work: a provider error on the assistant record is not replayed', async () => {
-    // An errored turn marks a LIVE session whose request failed. Replaying it
+  it('test_oc_resume_errored_turn_is_work: a provider error on the assistant record is not recovered', async () => {
+    // An errored turn marks a LIVE session whose request failed. Recovering it
     // would throw away the history and bury the error.
     const resumed = 'sess-live';
-    const { deps, created } = makeRuntime(
+    const { deps } = makeRuntime(
       [
         [
           {
@@ -244,12 +236,12 @@ describe('OpenCodeProvider — empty-resume fallback', () => {
     );
 
     const query = newProvider(deps).query({ prompt: 'hello', continuation: resumed, cwd: '/workspace/agent' });
-    await drainUntilResult(query.events);
-    expect(created).toEqual([]);
+    const seen = await drainUntilResult(query.events);
+    expect(seen.at(-1)?.type).toBe('result');
     query.abort();
   });
 
-  it('test_oc_resume_fresh_session_not_replayed: an opening query with no continuation never falls back', async () => {
+  it('test_oc_resume_fresh_session_not_recovered: an opening query with no continuation never raises', async () => {
     const fresh = 'sess-new';
     const { deps, prompts, created } = makeRuntime(
       [[assistantEnvelope(fresh, 'm1'), idle(fresh)]],
@@ -257,18 +249,20 @@ describe('OpenCodeProvider — empty-resume fallback', () => {
     );
 
     const query = newProvider(deps).query({ prompt: 'hello', cwd: '/workspace/agent' });
-    await drainUntilResult(query.events);
+    const seen = await drainUntilResult(query.events);
 
-    // Exactly one session created (the opening one) and one prompt sent.
+    // Exactly one session created (the opening one) and one prompt sent — the
+    // dry turn surfaces through the empty-turn warning, not as an error.
     expect(created).toEqual([fresh]);
     expect(prompts).toHaveLength(1);
+    expect(seen.at(-1)?.type).toBe('result');
     query.abort();
   });
 
   it("test_oc_resume_subagent_usage_still_summed: a subagent session's spend stays in the turn usage", async () => {
     // sumOpenCodeTurnUsage deliberately sums EVERY assistant message the turn
-    // saw, subagents included, because those are real spend. The session filter
-    // the fallback needs must not narrow that sum.
+    // saw, subagents included, because those are real spend. The session
+    // narrowing the recovery needs must not narrow that sum.
     const own = 'sess-own';
     const sub = 'sess-subagent';
     const { deps } = makeRuntime(
@@ -293,11 +287,10 @@ describe('OpenCodeProvider — empty-resume fallback', () => {
 
   it("test_oc_resume_foreign_session_work_does_not_count: another session's output does not keep a dead resume", async () => {
     // A concurrent session producing parts says nothing about whether THIS
-    // continuation is alive, so it must not suppress the fallback.
+    // continuation is alive, so it must not suppress the recovery.
     const resumed = 'sess-dead';
     const other = 'sess-other';
-    const fresh = 'sess-fresh';
-    const { deps, created } = makeRuntime(
+    const { deps } = makeRuntime(
       [
         [
           assistantEnvelope(resumed, 'm1'),
@@ -305,14 +298,13 @@ describe('OpenCodeProvider — empty-resume fallback', () => {
           textPart(other, 'm2', 'p1', 'someone else'),
           idle(resumed),
         ],
-        [assistantEnvelope(fresh, 'm3'), textPart(fresh, 'm3', 'p2', 'recovered'), idle(fresh)],
       ],
-      [fresh],
+      ['sess-unused'],
     );
 
     const query = newProvider(deps).query({ prompt: 'hello', continuation: resumed, cwd: '/workspace/agent' });
-    await drainUntilResult(query.events);
-    expect(created).toEqual([fresh]);
+    const err = await drainExpectingThrow(query.events);
+    expect(err.message).toContain(EMPTY_RESUME_ERROR);
     query.abort();
   });
 });
