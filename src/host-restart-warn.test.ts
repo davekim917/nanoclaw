@@ -127,6 +127,22 @@ function makeDbs(): { inDb: Database.Database; outDb: Database.Database } {
   return { inDb, outDb };
 }
 
+/**
+ * Add the fork's `provider_executing` column. `makeDbs` deliberately omits it,
+ * so the default fixture exercises the LEGACY tier — `getContainerState` falls
+ * back to tool-only columns and the field reads undefined — while these cases
+ * exercise a modern outbound DB.
+ */
+function withProviderExecuting(outDb: Database.Database, executing: 0 | 1): void {
+  outDb.exec('ALTER TABLE container_state ADD COLUMN provider_executing INTEGER NOT NULL DEFAULT 0');
+  outDb
+    .prepare(
+      `INSERT INTO container_state (id, provider_executing, updated_at) VALUES (1, ?, ?)
+       ON CONFLICT(id) DO UPDATE SET provider_executing = excluded.provider_executing`,
+    )
+    .run(executing, new Date().toISOString());
+}
+
 function fakeSession(): Session {
   return {
     id: 'sess-test',
@@ -412,6 +428,58 @@ describe('the heartbeat freshness boundary', () => {
       warnSessionIfWorkInFlight(mailboxOver(inDb, outDb), session, 'host startup after an unclean stop'),
       'the dedupe must hold across both restart paths',
     ).toBe(false);
+    expect(noteRows(inDb)).toHaveLength(1);
+  });
+});
+
+describe('the heartbeat is paired with provider_executing', () => {
+  // The runner touches the heartbeat after EVERY stream event, including the
+  // terminal `result` that ends a turn. So a session whose turn just finished
+  // normally has an mtime seconds old, and the heartbeat ALONE would warn it —
+  // the idle spam the guard exists to prevent. `provider_executing` is lowered
+  // on that same `result`, which is what tells the two apart.
+  it('a turn that just ended is not work in flight, however fresh the heartbeat', () => {
+    const { inDb, outDb } = makeDbs();
+    withProviderExecuting(outDb, 0);
+    const session = fakeSession();
+    touchHeartbeat(session, 1_000);
+
+    expect(warnSessionIfWorkInFlight(mailboxOver(inDb, outDb), session, 'graceful host shutdown')).toBe(false);
+    expect(noteRows(inDb)).toHaveLength(0);
+    const fields = noSignalLogCalls()[0][1] as { providerExecuting: number | null };
+    expect(fields.providerExecuting).toBe(0);
+  });
+
+  it('a turn still executing is work in flight', () => {
+    const { inDb, outDb } = makeDbs();
+    withProviderExecuting(outDb, 1);
+    const session = fakeSession();
+    touchHeartbeat(session, 5_000);
+
+    expect(warnSessionIfWorkInFlight(mailboxOver(inDb, outDb), session, 'graceful host shutdown')).toBe(true);
+    expect(noteRows(inDb)).toHaveLength(1);
+  });
+
+  it('an executing turn with a stale heartbeat is still not enough on its own', () => {
+    // The two are an AND, not an OR: a raised flag with no recent stream event
+    // is the wedged-provider shape the ceiling kill handles, not this one.
+    const { inDb, outDb } = makeDbs();
+    withProviderExecuting(outDb, 1);
+    const session = fakeSession();
+    touchHeartbeat(session, RESTART_WARN_HEARTBEAT_FRESH_MS + 1_000);
+
+    expect(warnSessionIfWorkInFlight(mailboxOver(inDb, outDb), session, 'graceful host shutdown')).toBe(false);
+    expect(noteRows(inDb)).toHaveLength(0);
+  });
+
+  it('a legacy outbound DB without the column still trusts the heartbeat', () => {
+    // makeDbs has no provider_executing, so getContainerState drops to the
+    // tool-only tier and the field reads undefined. Undefined must not veto.
+    const { inDb, outDb } = makeDbs();
+    const session = fakeSession();
+    touchHeartbeat(session, 5_000);
+
+    expect(warnSessionIfWorkInFlight(mailboxOver(inDb, outDb), session, 'graceful host shutdown')).toBe(true);
     expect(noteRows(inDb)).toHaveLength(1);
   });
 });

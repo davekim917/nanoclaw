@@ -19,10 +19,11 @@
  * Spam guard: only sessions with explicit evidence of work in flight are
  * warned — a resumable work continuation, a fresh tool start, a fresh
  * processing claim, or a fresh heartbeat. Narration/status output is
- * deliberately not evidence. The heartbeat is not narration and does count:
- * the runner touches it once per streamed provider event and never on an idle
- * poll, so a fresh mtime is direct evidence that an SDK stream was open, which
- * is the same authority the sweep's ceiling kill already reads it as. Quiet
+ * deliberately not evidence. The heartbeat is not narration and does count,
+ * paired with `provider_executing`: the runner touches it once per streamed
+ * provider event and never on an idle poll, so a fresh mtime plus a raised
+ * executing flag is direct evidence that a turn was open — the same authority
+ * the sweep's ceiling kill and idle reaper already read those as. Quiet
  * sessions get no note, so a restart does not wake every idle container into
  * a public "nothing happened".
  */
@@ -130,9 +131,28 @@ export function warnSessionIfWorkInFlight(mailbox: NanoclawMailboxSession, sessi
   // The heartbeat is what survives that, because the runner touches it per
   // streamed provider event and never on an idle poll. See
   // RESTART_WARN_HEARTBEAT_FRESH_MS.
+  //
+  // Paired with `provider_executing`, because the heartbeat alone is one step
+  // too generous. The runner touches it after EVERY stream event including the
+  // terminal `result`, so a turn that just ended normally leaves an mtime
+  // seconds old — and a restart inside the window would warn a session with
+  // nothing in flight, which is the idle spam this guard exists to prevent.
+  // `provider_executing` is the column that separates those two: the runner
+  // raises it on the prompt that starts a turn and lowers it on the `result`
+  // that ends one (`container/agent-runner/src/modules/mailbox/container-state.ts`),
+  // and it also covers the runner-driven windows the host cannot otherwise see
+  // — a pre-task script batch, a pushed follow-up turn, a continuation turn —
+  // which is the same blind spot the sweep's idle reaper added it for.
+  //
+  // An explicit 0 vetoes the heartbeat. undefined does not: a legacy outbound
+  // DB without the column drops to the tool-only tier in getContainerState and
+  // reads back undefined, and there the heartbeat alone is still better
+  // evidence than nothing.
   const heartbeatMs = heartbeatMtimeMs(session, now);
   const heartbeatAgeMs = heartbeatMs === null ? null : now - heartbeatMs;
-  const freshHeartbeat = heartbeatAgeMs !== null && heartbeatAgeMs <= RESTART_WARN_HEARTBEAT_FRESH_MS;
+  const providerIdle = state?.provider_executing === 0;
+  const freshHeartbeat =
+    !providerIdle && heartbeatAgeMs !== null && heartbeatAgeMs <= RESTART_WARN_HEARTBEAT_FRESH_MS;
   const midWork =
     resumableContinuation ||
     processingClaimKey !== null ||
@@ -162,6 +182,7 @@ export function warnSessionIfWorkInFlight(mailbox: NanoclawMailboxSession, sessi
       currentTool: state?.current_tool ?? null,
       toolStartedAt: state?.tool_started_at ?? null,
       heartbeatAgeMs,
+      providerExecuting: state?.provider_executing ?? null,
     });
     return false;
   }
