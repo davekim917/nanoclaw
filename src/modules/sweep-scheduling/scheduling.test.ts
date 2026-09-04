@@ -352,6 +352,7 @@ function makeCtx(over: Partial<SweepSessionContext> = {}): SweepSessionContext {
     runIn: async <T>(_window: unknown, action: (m: NanoclawMailboxSession) => T | Promise<T>) =>
       action(mailbox as NanoclawMailboxSession),
     reportWoke: () => undefined,
+    reportWake: () => undefined,
     ...over,
   } as SweepSessionContext;
 }

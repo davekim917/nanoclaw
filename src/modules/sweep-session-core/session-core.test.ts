@@ -242,6 +242,7 @@ function sessionCtx(
     run: async () => undefined,
     runIn: async () => undefined,
     reportWoke: () => undefined,
+    reportWake: () => undefined,
     ...overrides,
   } as SweepSessionContext;
 }

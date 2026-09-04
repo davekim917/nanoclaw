@@ -46,6 +46,7 @@ import {
   readContinuationRecoveryAttemptAt,
   readWorkContinuation,
   restoreWorkContinuationResumeAttempt,
+  _settleDetachedWakesForTesting,
 } from './index.js';
 // Importing the module registers S6/S7/S8/S9a/S9b/S15/S10 as a duty source —
 // needed so the registry lookups below and `_sweepSessionForTesting` (F-13.2,
@@ -988,6 +989,7 @@ function sessionCtx(
       return action(mailbox);
     },
     reportWoke: () => undefined,
+    reportWake: () => undefined,
     ...rest,
   } as unknown as SweepSessionContext;
 }
@@ -1071,6 +1073,10 @@ describe('S2-PR13 — continuation and ceiling accountability, through the regis
     mockWakeContainer.mockResolvedValue(false);
     const windowsSeen: string[] = [];
     await s9b.run(sessionCtx(mailbox, plan, { windowsSeen }));
+    // The wake is DETACHED (#359), so the restore that hangs off it is no
+    // longer synchronous with the duty. Settling is the sanctioned wait; the
+    // assertions themselves are unchanged.
+    await _settleDetachedWakesForTesting();
 
     expect(mockWakeContainer).toHaveBeenCalledTimes(1);
     expect(windowsSeen).toEqual(['session:wake', 'session:wake']);
@@ -1497,6 +1503,170 @@ describe('registered S6/S7/S8/S9a/S9b/S15/S10 entries reach their bodies', () =>
     expect(order).toEqual(['open:session:wake', 'close:session:wake', 'wake']);
     expect(windowsSeen).toEqual(['session:wake']);
     expect(readWorkContinuation(outDb)?.resume_attempts).toBe(1);
+  });
+
+  // ── #359 ───────────────────────────────────────────────────────────────────
+  //
+  // The per-session loop is serial and a container spawn can take 20-47 s, so
+  // awaiting the wake here made a tick's cost track the number of containers
+  // that happened to be due rather than the number of sessions. These three
+  // cases pin the detach: the duty returns without the spawn, the follow-up
+  // still happens, and a failed follow-up cannot reach the tick.
+
+  it('a wake that takes five seconds does not hold the per-session loop (#359)', async () => {
+    const s9b = duty(SWEEP_DUTY_INVENTORY.S9b);
+    const { mailbox } = makeSessionDbs();
+
+    // A spawn that never settles during the case: if the duty awaited it, the
+    // `await` below would never resolve and the case would time out rather
+    // than fail — which is exactly the signal we want, so it is also asserted
+    // positively against a wake that is still pending afterwards.
+    let releaseWake: (woke: boolean) => void = () => undefined;
+    const spawn = new Promise<boolean>((resolve) => {
+      releaseWake = resolve;
+    });
+    mockWakeContainer.mockImplementation(() => spawn);
+
+    const plan = emptyPlan({ dueCount: 1, wakePriority: 'scheduled' });
+    const reported: { awaited: boolean; waitMs: number }[] = [];
+    let woke: boolean | undefined;
+    const ctx = sessionCtx(mailbox, plan, {
+      reportWake: (stats: { awaited: boolean; waitMs: number }) => reported.push(stats),
+      reportWoke: (v: boolean) => {
+        woke = v;
+      },
+    } as Partial<SweepSessionContext>);
+
+    await s9b.run(ctx);
+
+    // The duty is DONE while the spawn is still in flight.
+    expect(mockWakeContainer).toHaveBeenCalledTimes(1);
+    // Instrumentation: one wake started, none awaited, and the loop spent only
+    // the call's synchronous prologue inside it.
+    expect(reported).toHaveLength(1);
+    expect(reported[0]!.awaited).toBe(false);
+    expect(reported[0]!.waitMs).toBeLessThan(1_000);
+    // …and the session still counts as woken for the rest of this tick, so the
+    // observe read and the health chain stay skipped for a container that is
+    // starting.
+    expect(woke).toBe(true);
+
+    releaseWake(true);
+    await _settleDetachedWakesForTesting();
+  });
+
+  it('the deferred attempt restore runs when the detached wake resolves false (#359)', async () => {
+    const s9b = duty(SWEEP_DUTY_INVENTORY.S9b);
+    const { outDb, mailbox } = makeSessionDbs();
+    saveContinuation(outDb, CONTINUATION);
+
+    let releaseWake: (woke: boolean) => void = () => undefined;
+    mockWakeContainer.mockImplementation(
+      () =>
+        new Promise<boolean>((resolve) => {
+          releaseWake = resolve;
+        }),
+    );
+
+    const plan = emptyPlan({ continuationWakeEligible: true, workContinuation: readWorkContinuation(outDb) });
+    await s9b.run(sessionCtx(mailbox, plan));
+
+    // The attempt is consumed synchronously, before the wake — unchanged.
+    expect(readWorkContinuation(outDb)?.resume_attempts).toBe(1);
+
+    // The refusal arrives after the duty returned; the restore still lands.
+    releaseWake(false);
+    await _settleDetachedWakesForTesting();
+    expect(readWorkContinuation(outDb)?.resume_attempts).toBe(0);
+  });
+
+  it('a refused deferred restore costs the tick nothing and is logged at info (#359)', async () => {
+    const s9b = duty(SWEEP_DUTY_INVENTORY.S9b);
+    const { outDb, mailbox } = makeSessionDbs();
+    saveContinuation(outDb, CONTINUATION);
+    const info = vi.spyOn(log, 'info').mockImplementation(() => undefined);
+
+    let releaseWake: (woke: boolean) => void = () => undefined;
+    mockWakeContainer.mockImplementation(
+      () =>
+        new Promise<boolean>((resolve) => {
+          releaseWake = resolve;
+        }),
+    );
+
+    const plan = emptyPlan({ continuationWakeEligible: true, workContinuation: readWorkContinuation(outDb) });
+    await s9b.run(sessionCtx(mailbox, plan));
+    expect(readWorkContinuation(outDb)?.resume_attempts).toBe(1);
+
+    // The window the detach opens: 20-47 s later the wake answers "refused",
+    // but by then something else has started a container, so the host may not
+    // write outbound.db. `withStoppedContainerSession` answers `undefined` and
+    // the restore does not run — which is correct, not a fault: the running
+    // container owns the continuation record and rewrites it itself.
+    mockIsContainerRunning.mockReturnValue(true);
+    releaseWake(false);
+    await _settleDetachedWakesForTesting();
+
+    // No throw reached the tick, and nothing was written behind the container.
+    expect(readWorkContinuation(outDb)?.resume_attempts).toBe(1);
+    expect(
+      info.mock.calls.some(
+        (c) => c[0] === 'Deferred continuation-attempt restore skipped — the host may not write outbound.db',
+      ),
+      'a refused restore was not reported at info',
+    ).toBe(true);
+    info.mockRestore();
+  });
+
+  it('a deferred restore lands when no container took the session (#359)', async () => {
+    const s9b = duty(SWEEP_DUTY_INVENTORY.S9b);
+    const { outDb, mailbox } = makeSessionDbs();
+    saveContinuation(outDb, CONTINUATION);
+
+    let releaseWake: (woke: boolean) => void = () => undefined;
+    mockWakeContainer.mockImplementation(
+      () =>
+        new Promise<boolean>((resolve) => {
+          releaseWake = resolve;
+        }),
+    );
+
+    const plan = emptyPlan({ continuationWakeEligible: true, workContinuation: readWorkContinuation(outDb) });
+    await s9b.run(sessionCtx(mailbox, plan));
+    expect(readWorkContinuation(outDb)?.resume_attempts).toBe(1);
+
+    // The case the attempt budget exists for: the spawn was refused and NO
+    // container came up, so the guard permits the write and the attempt goes
+    // back for the next tick to spend.
+    mockIsContainerRunning.mockReturnValue(false);
+    releaseWake(false);
+    await _settleDetachedWakesForTesting();
+
+    expect(readWorkContinuation(outDb)?.resume_attempts).toBe(0);
+  });
+
+  it('a detached wake that rejects is logged and never thrown into the tick (#359)', async () => {
+    const s9b = duty(SWEEP_DUTY_INVENTORY.S9b);
+    const { outDb, mailbox } = makeSessionDbs();
+    saveContinuation(outDb, CONTINUATION);
+    const warn = vi.spyOn(log, 'warn').mockImplementation(() => undefined);
+
+    mockWakeContainer.mockRejectedValue(new Error('spawn exploded'));
+
+    const plan = emptyPlan({ continuationWakeEligible: true, workContinuation: readWorkContinuation(outDb) });
+    // The duty itself resolves — the rejection is not its business.
+    await expect(s9b.run(sessionCtx(mailbox, plan))).resolves.toBeUndefined();
+    await expect(_settleDetachedWakesForTesting()).resolves.toBeUndefined();
+
+    expect(
+      warn.mock.calls.some((c) => c[0] === 'Detached container wake follow-up failed'),
+      'the rejection was not logged',
+    ).toBe(true);
+    // The attempt stays consumed: nothing told us the wake was refused, only
+    // that it failed, and inventing a restore from a rejection would hand the
+    // budget back for a spawn that may well have started.
+    expect(readWorkContinuation(outDb)?.resume_attempts).toBe(1);
+    warn.mockRestore();
   });
 
   it('S15: the registered kill-ceiling notice writes from the pre-kill snapshot and only for a ceiling kill', () => {

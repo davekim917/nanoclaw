@@ -318,6 +318,10 @@ import './modules/sweep-session-core/index.js';
 // at import time; without this line R-7's inventory is seven registrations
 // short. Import for side effects only.
 import './modules/sweep-continuation/index.js';
+// …and the settle point for the wake it now starts DETACHED (#359): the
+// attempt restore hangs off the spawn's promise, so a case that counts opens
+// or reads continuation state has to wait for it explicitly.
+import { _settleDetachedWakesForTesting } from './modules/sweep-continuation/index.js';
 // Registers the scheduling family's duty source (S2-PR11: T8, S5, S18, S19) —
 // without it R-7's inventory is four registrations short and R-10's W2 branch
 // has nothing to make a session due.
@@ -1217,15 +1221,15 @@ describe('sweep duty registry (S2-PR2)', () => {
   //
   // Structural, not a line budget. The plan's original "under 300 lines" was an
   // estimate written before the build. Re-measured on the B3 integration
-  // lineage re-based onto mailbox seam PR 7's head: `wc -l` 1,354, which is
-  // 1,355 by the `split('\n')` count the assertion below uses, one more for the
+  // lineage re-based onto mailbox seam PR 7's head: `wc -l` 1,409, which is
+  // 1,410 by the `split('\n')` count the assertion below uses, one more for the
   // trailing newline. Section breakdown, in `split('\n')` elements, contiguous
-  // and summing exactly to 1,355:
-  // sweepSession + helpers 257, driver start/stop/sweep/sweepOnce 214, error
+  // and summing exactly to 1,410:
+  // sweepSession + helpers 262, driver start/stop/sweep/sweepOnce 253, error
   // rule + SLA hooks + kill follow-ups + windowedRunner 182, registry 143,
   // re-exports + writeSystemWake + providerFailedTicks + the outbound-ownership
-  // guard docs 140, tick constants + quiet cache 123, shared context + duty
-  // types 98, phase list 73, duty inventory 53, file header 26, imports 26,
+  // guard docs 140, tick constants + quiet cache 120, shared context + duty
+  // types 109, phase list 73, duty inventory 53, imports 29, file header 26,
   // tail re-exports + the empty built-in source 20. (S2-PR14's own head,
   // dc440893, measured 1,198 by the same count — see the ratchet comment below
   // for the delta's real cause.) The three assertions below are what the
@@ -1323,14 +1327,19 @@ describe('sweep duty registry (S2-PR2)', () => {
       expect(actualExports, `host-sweep.ts no longer exports ${core}`).toContain(core);
     }
 
-    // Regrowth ratchet. 1,355 by this measure on the B3 integration lineage
-    // re-based onto mailbox seam PR 7's head (1,354 by `wc -l`), against 1,198
-    // on S2-PR14's own head (dc440893, same count). Of the +157, six lines are
+    // Regrowth ratchet. 1,410 by this measure on the B3 integration lineage
+    // re-based onto mailbox seam PR 7's head (1,409 by `wc -l`), against 1,198
+    // on S2-PR14's own head (dc440893, same count). Of the +212, six lines are
     // the base's own two fork duties in `SWEEP_DUTY_INVENTORY` (T23
     // `cli-request-execution-prune` from #285 and FORK1
     // `github-token-file-refresh` from #247) — inventory entries, not bodies;
-    // both duties register from `src/modules/sweep-central/`. The remaining
-    // +151 is NOT a duty coming home either — measured with
+    // both duties register from `src/modules/sweep-central/`. Another 55 are
+    // #359's wake instrumentation: the `reportWake` channel on the session
+    // context, the per-tick accumulator, and the three counters on the timing
+    // line. That is driver-owned measurement of the driver's own loop — the
+    // same status as `lastTickStats` beside it — and it exists because
+    // `sessionsMs` conflated walking sessions with waiting on spawns. The
+    // remaining +151 is NOT a duty coming home either — measured with
     // `git diff --stat dc440893 HEAD -- src/host-sweep.ts` and read hunk by
     // hunk, the two largest pieces are:
     //  - +152 net lines: S2-PR15's quiet-session backoff jitter + boot-time
@@ -1356,12 +1365,17 @@ describe('sweep duty registry (S2-PR2)', () => {
     // a duty body: no duty originates here, no registration surface is called
     // inline, and the export allowlist is unchanged (the three structural
     // assertions above, which is what the F-14.1 criterion actually means).
-    // Ratchet raised from 1,300 to 1,400 — measured (1,355) + ~45 — for the
-    // same reason plan.md's own estimate was always going to be wrong:
-    // `warmQuietSessionCache` and its persistence path are legitimate
-    // driver-owned functionality that arrived after the plan's line budget was
-    // written, not scope creep into a duty body.
-    expect(source.split('\n').length).toBeLessThanOrEqual(1400);
+    // Ratchet raised from 1,300 to 1,400 and then to 1,450 — measured (1,410)
+    // + ~40, the same measured-plus-headroom rule 1,400 was set by, deliberately
+    // NOT rounded up to 1,500: headroom nobody has audited is headroom a duty
+    // body can come home into, which is the one thing this number exists to
+    // catch. The rise is for the same reason plan.md's own estimate was always
+    // going to be wrong — `warmQuietSessionCache` with its persistence path,
+    // and now #359's wake instrumentation, are legitimate driver-owned
+    // functionality that arrived after the plan's line budget was written. The
+    // three structural assertions above are the criterion; this number only has
+    // to fail when a duty body comes home.
+    expect(source.split('\n').length).toBeLessThanOrEqual(1450);
     expect(h.spawns).toEqual([]);
   });
 
@@ -1967,6 +1981,72 @@ describe('sweep duty registry (S2-PR2)', () => {
       expect(h.spawns).toEqual([]);
     });
 
+    // ── #359 ─────────────────────────────────────────────────────────────────
+    //
+    // `sessionsMs` mixed "walked N sessions" with "waited on M container
+    // spawns", and the two differ by three orders of magnitude per unit — a
+    // cold tick's cost tracked spawn COUNT, so every comparison between two
+    // ticks was really a comparison of how many containers happened to be due.
+    // These counters are what make the line readable, and `spawnsAwaited: 0`
+    // is the property the detach exists to hold.
+    it('the tick-timing line counts wakes started, spawns awaited and spawn wait (#359)', async () => {
+      const session = fakeSession('sess-counted');
+      h.sessions = [session];
+      h.mailbox = fakeMailbox({ countDueMessages: () => 1 });
+
+      await _sweepOnceForTesting();
+      await _settleDetachedWakesForTesting();
+
+      expect(h.wakes).toEqual([{ sessionId: 'sess-counted', depth: 0 }]);
+      const stats = _lastSweepTickStatsForTesting();
+      expect(stats.wakesStarted, 'the wake was not counted').toBe(1);
+      expect(stats.spawnsAwaited, 'the per-session loop awaited a spawn').toBe(0);
+      // Not "zero": the loop is still inside `wakeContainer` for its
+      // synchronous prologue. A second here means someone put an await back.
+      expect(stats.spawnWaitMs).toBeLessThan(1_000);
+      expect(h.spawns).toEqual([]);
+    });
+
+    it('a slow tick logs the three wake counters on its timing line (#359)', async () => {
+      const info = vi.spyOn(log, 'info').mockImplementation(() => undefined);
+      // The line only fires above 1 s. Fake Date ONLY — the tick's own yields
+      // are setImmediate and stay real — and let the mailbox advance the clock
+      // as a side effect of a read the tick is going to make anyway.
+      vi.useFakeTimers({ toFake: ['Date'] });
+      try {
+        h.sessions = [fakeSession('sess-slow')];
+        h.mailbox = fakeMailbox({
+          countDueMessages: () => {
+            vi.setSystemTime(Date.now() + 2_000);
+            return 1;
+          },
+        });
+
+        await _sweepOnceForTesting();
+        await _settleDetachedWakesForTesting();
+
+        const line = info.mock.calls.find((c) => c[0] === 'Host sweep tick timing');
+        expect(line, 'the timing line did not fire — the tick was under 1 s').toBeDefined();
+        expect(Object.keys(line![1] as object).sort()).toEqual(
+          [
+            'sessionsMs',
+            'skippedQuiet',
+            'spawnWaitMs',
+            'spawnsAwaited',
+            'sweepMs',
+            'sweptSessions',
+            'wakesStarted',
+          ].sort(),
+        );
+        expect((line![1] as { wakesStarted: number }).wakesStarted).toBe(1);
+        expect((line![1] as { spawnsAwaited: number }).spawnsAwaited).toBe(0);
+      } finally {
+        vi.useRealTimers();
+        info.mockRestore();
+      }
+      expect(h.spawns).toEqual([]);
+    });
+
     it('the task watchdog’s parent wake', async () => {
       const { _sweepTaskWatchdogForTesting } = await import('./host-sweep.js');
       const tasksModule = await import('./modules/orchestrator-dispatch/db/tasks.js');
@@ -2113,6 +2193,9 @@ describe('sweep duty registry (S2-PR2)', () => {
     });
 
     await _sweepOnceForTesting();
+    // The wake is detached (#359), so the attempt restore's open — the eighth
+    // on this path — can land after the tick returns. Settle before counting.
+    await _settleDetachedWakesForTesting();
     const worstPathOpens = h.opens.filter((id) => id === session.id).length;
     expect(worstPathOpens).toBeGreaterThan(0);
     expect(worstPathOpens).toBeLessThanOrEqual(8);

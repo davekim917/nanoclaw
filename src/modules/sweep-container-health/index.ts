@@ -720,6 +720,7 @@ export function _enforceRunningContainerSlaForTesting(
     run,
     runIn: (_window, action) => run(action),
     reportWoke: () => {},
+    reportWake: () => {},
   };
   return enforceRunningContainerSla(ctx);
 }

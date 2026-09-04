@@ -309,6 +309,17 @@ export interface SweepSessionContext extends SweepTickContext {
    * which gates the observe read and the whole health chain (constraint 10).
    */
   reportWoke(woke: boolean): void;
+  /**
+   * Wake instrumentation (#359). A duty that starts a container wake says so,
+   * and says whether the per-session loop waited for it and for how long.
+   *
+   * `sessionsMs` alone mixed "walked N sessions" with "waited on M container
+   * spawns", and the two differ by three orders of magnitude per unit: a cold
+   * tick's cost tracked spawn COUNT, not session count, and every comparison
+   * between two ticks was really a comparison of how many containers happened
+   * to be due. These three counters separate the two on the tick-timing line.
+   */
+  reportWake(stats: { awaited: boolean; waitMs: number }): void;
 }
 
 /**
@@ -903,10 +914,32 @@ async function sweep(): Promise<void> {
  * after a restart. `Host sweep tick timing` only logs above 1 s, so a spy on it
  * cannot see a fast tick; `ticks` is what lets a test await one.
  */
-const lastTickStats = { ticks: 0, sweptSessions: 0, skippedQuiet: 0 };
+const lastTickStats = {
+  ticks: 0,
+  sweptSessions: 0,
+  skippedQuiet: 0,
+  wakesStarted: 0,
+  spawnsAwaited: 0,
+  spawnWaitMs: 0,
+};
+
+/**
+ * This tick's wake instrumentation (#359), reset at the top of every tick and
+ * copied into `lastTickStats` at the end. Module-level rather than a field on
+ * `SweepTickContext` because the per-session contexts are built one at a time
+ * and every one of them has to add into the same tick total.
+ */
+const tickWakeStats = { wakesStarted: 0, spawnsAwaited: 0, spawnWaitMs: 0 };
 
 /** Test-only: the counters from the last completed tick. */
-export function _lastSweepTickStatsForTesting(): { ticks: number; sweptSessions: number; skippedQuiet: number } {
+export function _lastSweepTickStatsForTesting(): {
+  ticks: number;
+  sweptSessions: number;
+  skippedQuiet: number;
+  wakesStarted: number;
+  spawnsAwaited: number;
+  spawnWaitMs: number;
+} {
   return { ...lastTickStats };
 }
 
@@ -916,6 +949,9 @@ async function sweepOnce(): Promise<void> {
   // fires. One line per slow tick, with the per-session share, convicts or
   // clears it from the log alone.
   const sweepStartedAtMs = Date.now();
+  tickWakeStats.wakesStarted = 0;
+  tickWakeStats.spawnsAwaited = 0;
+  tickWakeStats.spawnWaitMs = 0;
   let sweptSessions = 0;
   if (!running) return;
 
@@ -1053,10 +1089,24 @@ async function sweepOnce(): Promise<void> {
   lastTickStats.ticks++;
   lastTickStats.sweptSessions = sweptSessions;
   lastTickStats.skippedQuiet = skippedQuiet;
+  lastTickStats.wakesStarted = tickWakeStats.wakesStarted;
+  lastTickStats.spawnsAwaited = tickWakeStats.spawnsAwaited;
+  lastTickStats.spawnWaitMs = tickWakeStats.spawnWaitMs;
 
   const sweepMs = Date.now() - sweepStartedAtMs;
   if (sweepMs >= 1_000) {
-    log.info('Host sweep tick timing', { sweepMs, sessionsMs, sweptSessions, skippedQuiet: lastSkippedQuiet });
+    // `wakesStarted`/`spawnsAwaited`/`spawnWaitMs` are what make `sessionsMs`
+    // readable (#359): with spawnsAwaited 0 and spawnWaitMs near zero,
+    // sessionsMs is the cost of walking the sessions and nothing else.
+    log.info('Host sweep tick timing', {
+      sweepMs,
+      sessionsMs,
+      sweptSessions,
+      skippedQuiet: lastSkippedQuiet,
+      wakesStarted: tickWakeStats.wakesStarted,
+      spawnsAwaited: tickWakeStats.spawnsAwaited,
+      spawnWaitMs: tickWakeStats.spawnWaitMs,
+    });
   }
 }
 
@@ -1167,6 +1217,11 @@ async function sweepSession(session: Session, tick: SweepTickContext): Promise<n
     runIn,
     reportWoke(woke: boolean): void {
       justWoke = woke;
+    },
+    reportWake(stats: { awaited: boolean; waitMs: number }): void {
+      tickWakeStats.wakesStarted++;
+      if (stats.awaited) tickWakeStats.spawnsAwaited++;
+      tickWakeStats.spawnWaitMs += stats.waitMs;
     },
   };
 

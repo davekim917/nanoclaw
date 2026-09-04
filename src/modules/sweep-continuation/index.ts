@@ -182,21 +182,31 @@ export function _incrementStoppedContinuationAttemptForTesting(
   return incrementStoppedContinuationAttempt(run, session, expectedId);
 }
 
+/**
+ * What became of a restore. `refused` is not a failure: it is
+ * `withStoppedContainerSession` answering `undefined`, which means either a
+ * container took `outbound.db` or the mailbox is gone — in both cases the host
+ * must not write, and both are ordinary.
+ */
+type RestoreOutcome = 'restored' | 'refused' | 'failed';
+
 async function restoreStoppedContinuationAttempt(
   run: SessionRunner,
   session: Session,
   attempted: HostWorkContinuation,
   previous: HostWorkContinuation,
-): Promise<void> {
+): Promise<RestoreOutcome> {
   try {
-    await withStoppedContainerSession(run, session, (mailbox) =>
+    const result = await withStoppedContainerSession(run, session, (mailbox) =>
       mailbox.restoreWorkContinuationResumeAttempt(attempted, previous),
     );
+    return result === undefined ? 'refused' : 'restored';
   } catch (err) {
     // Same split as the increment above: an opener failure is the window's to
     // report and unwind; anything else keeps the pre-seam warn-and-continue.
     if (err instanceof SweepWindowAbort) throw err;
     log.warn('Failed to restore continuation recovery attempt after rejected wake', { sessionId: session.id, err });
+    return 'failed';
   }
 }
 
@@ -449,6 +459,44 @@ export function _notifyKillCeilingForTesting(
 // open) and the two ceiling kill follow-ups S15 and S10.
 // ─────────────────────────────────────────────────────────────────────────────
 
+/**
+ * Wakes S9b has started and not yet settled (#359).
+ *
+ * The wake is detached, so its follow-up work outlives the tick that started
+ * it. Two things need that fact to be observable:
+ *
+ *  - a rejection must be LOGGED, not thrown into a tick that has moved on and
+ *    would otherwise report a duty failure for a session it has finished with;
+ *  - a test has to be able to wait for it. `_settleDetachedWakesForTesting`
+ *    is the only sanctioned way — an acceptance case that asserts on the
+ *    attempt restore is asserting on work that is deliberately no longer
+ *    synchronous with the duty, and a timer-based wait would be flaky.
+ *
+ * Entries remove themselves, so this set is empty whenever nothing is in
+ * flight and it cannot grow without bound.
+ */
+const detachedWakes = new Set<Promise<void>>();
+
+function trackDetachedWake(work: Promise<void>, sessionId: string): void {
+  const tracked = work
+    .catch((err: unknown) => {
+      // Never rethrown. The tick that started this wake is gone; the only
+      // thing left to do about a failure is say so. `SweepWindowAbort` from
+      // the restore's own short window lands here too — same treatment, since
+      // the session it names is no longer being swept.
+      log.warn('Detached container wake follow-up failed', { sessionId, err });
+    })
+    .finally(() => {
+      detachedWakes.delete(tracked);
+    });
+  detachedWakes.add(tracked);
+}
+
+/** Test-only: settle every wake S9b has started but not yet finished with. */
+export function _settleDetachedWakesForTesting(): Promise<void> {
+  return Promise.all([...detachedWakes]).then(() => undefined);
+}
+
 export function registerContinuationSweepDuties(): void {
   const id = SWEEP_DUTY_INVENTORY;
 
@@ -554,6 +602,10 @@ export function registerContinuationSweepDuties(): void {
         ? await incrementStoppedContinuationAttempt(wakeRun, session, plan.workContinuation!.id)
         : null;
       const continuationWake = resumedContinuation !== null;
+      // Snapshotted for the deferred restore below: `plan` belongs to the
+      // session context and the tick moves on, so the detached continuation
+      // must not read it later.
+      const continuationForRestore = plan.workContinuation;
       if ((plan.dueCount > 0 || continuationWake) && !isContainerRunning(session.id)) {
         log.info('Waking container for due messages', {
           sessionId: session.id,
@@ -576,11 +628,83 @@ export function registerContinuationSweepDuties(): void {
         // detection, no heartbeat ceiling, no claim tolerance. Every other
         // by-id caller already re-reads (`router.ts`, `agent-route.ts`,
         // `container-restart.ts`); this one did not.
-        const woke = await wakeContainer(session, plan.wakePriority, { guard: sessionStillActive(session.id) });
-        c.reportWoke(woke);
-        if (!woke && resumedContinuation) {
-          await restoreStoppedContinuationAttempt(wakeRun, session, resumedContinuation, plan.workContinuation!);
-        }
+        //
+        // DETACHED (#359). The per-session loop is serial, and a spawn can take
+        // 20-47 s because `ensureArchiveProjection` awaits ONE worker thread
+        // that serialises builds — so awaiting here made the tick's cost track
+        // the number of containers that happened to be due, not the number of
+        // sessions. Measured on B2's boot: ticks at ~800 sessions ranged 9.7 s
+        // (0 spawns) to 456 s (8 spawns) on identical code. Starting the wake
+        // and walking on removes the whole of that from `sessionsMs`.
+        //
+        // Nothing about the wake itself changes: same guard, same priority,
+        // same admission, same `wakeContainer`. Only who waits.
+        const wakeStartedAtMs = Date.now();
+        const wakeInFlight = wakeContainer(session, plan.wakePriority, {
+          guard: sessionStillActive(session.id),
+        });
+        // Time the loop actually spent inside the call — after the detach this
+        // is `wakeContainer`'s synchronous prologue up to its first await, so a
+        // non-trivial `spawnWaitMs` on the tick-timing line means someone put
+        // an await back.
+        c.reportWake({ awaited: false, waitMs: Date.now() - wakeStartedAtMs });
+        // `justWoke` for the rest of this tick's windows, exactly as an awaited
+        // wake would be. It closes TWO gates, and both must stay closed for a
+        // container that is starting:
+        //
+        //  - the driver's observe read (`alive && !justWoke && plan.hasOutbound`),
+        //    which exists to be skipped on the tick that woke a container: it
+        //    has not yet cleared stale `processing_ack` rows from a previous
+        //    crash, and reading claims now is what produces the spawn-kill loop;
+        //  - the quiet-mark branch, which must never mark a session with a
+        //    spawn in flight.
+        //
+        // Reporting FALSE would open both the moment `isContainerRunning` flips
+        // true between here and the driver's own `alive = isContainerRunning(…)`
+        // a few lines later — the one ordering that distinguishes the two
+        // values, and the one where false is wrong. (Everywhere else they are
+        // indistinguishable: a detached spawn has not started yet, so `alive` is
+        // false and the observe read is skipped either way, and the quiet branch
+        // is already unreachable because S9b only wakes when `dueCount > 0` or a
+        // continuation is present, both of which fail its predicate.)
+        c.reportWoke(true);
+        // The attempt restore hangs off the promise. It runs in its own short
+        // window like the increment above, it can outlive this tick, and it can
+        // NEVER throw into it: a rejection here is the wake's own fault
+        // reporting, and the tick has already moved on.
+        //
+        // A REFUSED restore is logged at info, not warn, and the consumed
+        // attempt is deliberately not chased. `withStoppedContainerSession`
+        // answers `undefined` for exactly two reasons, and neither is a fault:
+        // a container now owns `outbound.db`, or the mailbox is gone. The
+        // detach widens the first — the wake's answer can arrive 20-47 s later,
+        // and any path (router ingress, agent-route, another sweep) can have
+        // started a container in between. Writing the record back THEN would
+        // break the one-writer rule `writeOutboundWhenStopped` exists to
+        // enforce, and it would be wrong on its own terms: a running container
+        // owns the continuation, will work it, and rewrites the record itself.
+        // The attempt is consumed by a container that is up, which is what the
+        // wake asked for. The case where the attempt would really be lost — no
+        // container ever came up — is the case where the guard permits the
+        // write and the restore lands.
+        trackDetachedWake(
+          wakeInFlight.then(async (woke) => {
+            if (woke || !resumedContinuation) return;
+            const outcome = await restoreStoppedContinuationAttempt(
+              wakeRun,
+              session,
+              resumedContinuation,
+              continuationForRestore!,
+            );
+            if (outcome === 'refused') {
+              log.info('Deferred continuation-attempt restore skipped — the host may not write outbound.db', {
+                sessionId: session.id,
+                continuationId: resumedContinuation.id,
+              });
+            }
+          }),
+          session.id,
+        );
       }
     },
   });
