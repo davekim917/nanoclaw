@@ -1,0 +1,41 @@
+{
+  "_comment": "A single-file class whose import binds the short name `get`, and findings that never mention it \u2014 they talk about a `target`. Substring matching would read that as the findings naming what the module exports and treat the guessed seam as substantiated.",
+  "findings": [
+    {
+      "threadId": "W1",
+      "commentId": 800,
+      "reviewId": "PRR_W0",
+      "createdAt": "2026-09-01T01:00:00Z",
+      "path": "src/one.ts",
+      "line": 10,
+      "isResolved": false,
+      "isOutdated": false,
+      "body": "**<sub><sub>![P2 Badge](https://img.shields.io/badge/P2-yellow?style=flat)</sub></sub>  Revalidate the target after the await**\n\nThe target is read before the await and written after it, so a concurrent writer wins the race and nothing revalidates the target in between."
+    },
+    {
+      "threadId": "W2",
+      "commentId": 801,
+      "reviewId": "PRR_W1",
+      "createdAt": "2026-09-01T02:00:00Z",
+      "path": "src/one.ts",
+      "line": 11,
+      "isResolved": false,
+      "isOutdated": false,
+      "body": "**<sub><sub>![P2 Badge](https://img.shields.io/badge/P2-yellow?style=flat)</sub></sub>  Revalidate the target after the await**\n\nThe target is read before the await and written after it, so a concurrent writer wins the race and nothing revalidates the target in between."
+    },
+    {
+      "threadId": "W3",
+      "commentId": 802,
+      "reviewId": "PRR_W2",
+      "createdAt": "2026-09-01T03:00:00Z",
+      "path": "src/one.ts",
+      "line": 12,
+      "isResolved": false,
+      "isOutdated": false,
+      "body": "**<sub><sub>![P2 Badge](https://img.shields.io/badge/P2-yellow?style=flat)</sub></sub>  Revalidate the target after the await**\n\nThe target is read before the await and written after it, so a concurrent writer wins the race and nothing revalidates the target in between."
+    }
+  ],
+  "sources": {
+    "src/one.ts": "import { get } from './store.js';\n"
+  }
+}

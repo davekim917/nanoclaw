@@ -60,6 +60,7 @@ interface SeamRow {
   seam: string;
   rounds: number;
   severityFalling: boolean;
+  seamSubstantiated?: boolean;
 }
 interface Report {
   classes: ClassRow[];
@@ -71,6 +72,7 @@ interface Decision {
   status: 'pass' | 'refuse' | 'override';
   flagged: (ClassRow & { lifted: boolean; liftedBy: string | null; reason: string })[];
   unlifted: ClassRow[];
+  reported: { key: string; rounds: number; seam: string | null; reason: string }[];
   report: Report;
 }
 
@@ -285,15 +287,32 @@ describe('review-churn classifier', () => {
     expect(aliased.seamSubstantiated).toBe(true);
   });
 
-  it('does not let a sibling class lend its evidence to a guessed seam', () => {
-    // A one-round class that names the module must not promote a three-round
-    // class that merely guessed the same import.
+  it('substantiates a rollup on its own files, never on a sibling class naming it', () => {
+    // The rollup exists to see signature drift across files that share a
+    // callee, where no single class can substantiate the seam alone. Its
+    // evidence is therefore its own: two or more flagged files importing the
+    // module, the same standard the class-level rule uses. One class's naming
+    // is evidence for that class only.
     const report = classify(fixture('guessed-seam-with-named-sibling'));
-    const guessed = report.classes.find((c) => c.rounds === 3)!;
-    expect(guessed.seamSubstantiated).toBe(false);
-    // The rollup counts the substantiated class only, so it is one round.
-    expect(report.seams).toHaveLength(1);
-    expect(report.seams[0].rounds).toBe(1);
+    expect(report.classes.find((c) => c.rounds === 3)!.seamSubstantiated).toBe(false);
+    expect(report.seams[0].seamSubstantiated).toBe(true);
+
+    // And with EVERY class a guess, the shared files still substantiate it —
+    // three signatures, three files, one import, nobody naming it.
+    const collective = classify(fixture('collective-seam'));
+    expect(collective.classes).toHaveLength(3);
+    expect(collective.classes.every((c) => c.rounds === 1 && !c.seamSubstantiated)).toBe(true);
+    expect(collective.seams[0].seam).toBe('src/mailbox/write.ts');
+    expect(collective.seams[0].rounds).toBe(3);
+    expect(collective.seams[0].seamSubstantiated).toBe(true);
+  });
+
+  it('does not count a bound name that only appears inside a longer word', () => {
+    // `get` must not be substantiated by a finding that said "target".
+    const churning = classify(fixture('substring-name-seam')).classes[0];
+    expect(churning.rounds).toBe(3);
+    expect(churning.seam).toBe('src/store.ts');
+    expect(churning.seamSubstantiated).toBe(false);
   });
 
   it('reads severity direction per seam, not per finding', () => {
@@ -499,11 +518,47 @@ describe('review-churn gate', () => {
     expect(gate(fixture('aliased-seam')).status).toBe(3);
   });
 
-  it('does not gate a guessed seam that a sibling class happens to name', () => {
+  it('gates a seam its files collectively substantiate, and says so only once', () => {
+    // Two flagged files sharing the import is the rollup's own evidence, so
+    // the seam gates. The class table must not simultaneously report that
+    // class as "not gated" — two answers to one question.
     const { status, decision, text } = gate(fixture('guessed-seam-with-named-sibling'));
+    expect(status).toBe(3);
+    expect(decision.flagged[0].key).toBe('seam src/db/messages-out.ts');
+    expect(decision.reported).toHaveLength(0);
+    expect(text).not.toContain('reported, not gated');
+  });
+
+  it('gates signature drift no single class can substantiate', () => {
+    const { status, decision } = gate(fixture('collective-seam'));
+    expect(status).toBe(3);
+    expect(decision.unlifted[0].key).toBe('seam src/mailbox/write.ts');
+  });
+
+  it('does not gate a seam substantiated only by a substring of a finding', () => {
+    const { status, decision } = gate(fixture('substring-name-seam'));
     expect(status).toBe(0);
-    expect(decision.flagged).toHaveLength(0);
-    expect(text).toContain('reported, not gated');
+    expect(decision.reported[0].rounds).toBe(3);
+  });
+
+  it('does not read a declaration inside a multi-line block comment', () => {
+    // An ordinary block comment repeats no marker on its interior lines, so
+    // stripping has to carry state across the added lines.
+    const payload = fixture('toctou-class');
+    payload.commits = [
+      {
+        sha: 'qqq7777',
+        date: AFTER,
+        message: 'docs: sketch the guard\n\nReframe: race enforced in guardEveryWrite\n',
+        files: ['src/guard.ts'],
+        added: ['/*', 'export function guardEveryWrite(session: Session) {', '}', '*/'],
+      },
+    ];
+    expect(gate(payload).status).toBe(3);
+
+    // The same lines outside a comment do lift it.
+    payload.commits[0].added = ['export function guardEveryWrite(session: Session) {', '}'];
+    expect(gate(payload).status).toBe(0);
   });
 
   it('does not read a comment or a string as a declaration', () => {

@@ -257,7 +257,8 @@ export function signatureOf(finding) {
  * statement is the one construct regex reads reliably. `[^;'"]*?` spans
  * newlines so multi-line `import { a, b } from '…'` blocks are read whole.
  */
-export function importsOf(source) {
+export function importsOf(rawSource) {
+  const source = stripSource(rawSource);
   const out = [];
   const push = (spec, clause) => {
     if (!spec) return;
@@ -329,7 +330,8 @@ export function seamFor(files, findingText, ctx) {
     spec: e.spec,
     inRepo: e.relative,
     fileCount: e.files.size,
-    mentioned: [...e.names.keys()].filter((n) => findingText.includes(n)),
+    // Whole identifiers: `get` must not count because a finding said "target".
+    mentioned: [...e.names.keys()].filter((n) => new RegExp(`\\b${n}\\b`).test(findingText)),
     names: [...e.names.keys()],
   }));
   scored.sort(
@@ -486,14 +488,9 @@ export function classify(payload) {
   // Seam rollup — the safety net for a class key that splits. Findings hop
   // wording as well as files; when they keep landing on ONE seam with severity
   // flat, that is the same defect however the titles read.
-  // Only substantiated classes feed the rollup. Otherwise a one-round class
-  // that names the module lends its evidence to a three-round class that
-  // guessed the same import, and the rollup gates on rounds the guess
-  // contributed — refusing the push while the class table reports that very
-  // class as not gated.
   const bySeam = new Map();
   for (const b of built) {
-    if (!b.cls.seam || !b.cls.seamSubstantiated) continue;
+    if (!b.cls.seam) continue;
     if (!bySeam.has(b.cls.seam)) bySeam.set(b.cls.seam, []);
     bySeam.get(b.cls.seam).push(b);
   }
@@ -501,10 +498,20 @@ export function classify(payload) {
     .map(([seam, entries]) => {
       const group = entries.flatMap((e) => e.group);
       const rounds = roundsOf(group);
+      // The rollup carries its OWN evidence, measured over its own files: two
+      // or more flagged files importing the module is the same standard the
+      // class-level rule uses, and it is what the rollup exists to see —
+      // signature drift across files that share a callee, where no single
+      // class can substantiate the seam alone. What it must never do is take
+      // one class's naming as evidence for another class's guess, so naming
+      // counts only for the class that did the naming.
+      const filesOnSeam = new Set(
+        [...new Set(group.map((f) => f.path).filter(Boolean))].filter((file) => fileImports(file, seam, ctx)),
+      );
       return {
         seam,
         seamInRepo: entries[0].cls.seamInRepo,
-        seamSubstantiated: true,
+        seamSubstantiated: filesOnSeam.size >= 2 || entries.some((e) => e.cls.seamSubstantiated),
         rounds: rounds.length,
         findings: group.length,
         lastAt: lastAt(group),
@@ -565,7 +572,7 @@ function invariantNamed(entry, trailer) {
 function declaredByCommit(named, commit, ctx) {
   const identifiers = named.match(/[A-Za-z_$][\w$]*/g) ?? [];
   if (identifiers.length === 0) return false;
-  const added = addedLines(commit, ctx).map(strippedCode).filter(Boolean);
+  const added = stripNonCode(addedLines(commit, ctx), { strings: true }).filter((line) => line.trim());
   if (added.length === 0) return false;
   return identifiers.some((id) => {
     const declaration = new RegExp(
@@ -573,24 +580,6 @@ function declaredByCommit(named, commit, ctx) {
     );
     return added.some((line) => declaration.test(line));
   });
-}
-
-/**
- * An added line with its comments and string literals removed, so that a
- * comment, a doc example or a message mentioning `function guardEveryWrite` is
- * not read as declaring it. Line-level and deliberately crude: a block comment
- * spanning lines still starts with its own marker on each line in a diff, and
- * the cost of being wrong here is a lift refused, never one wrongly granted.
- */
-function strippedCode(line) {
-  const trimmed = line.trim();
-  if (trimmed.startsWith('//') || trimmed.startsWith('*') || trimmed.startsWith('/*')) return '';
-  return line
-    .replace(/`[^`]*`/g, ' ')
-    .replace(/'[^']*'/g, ' ')
-    .replace(/"[^"]*"/g, ' ')
-    .replace(/\/\*[\s\S]*?\*\//g, ' ')
-    .replace(/\/\/.*$/, ' ');
 }
 
 /** The `+` side of a commit's diff. Supplied by the payload in tests. */
@@ -607,6 +596,55 @@ function addedLines(commit, ctx) {
     .map((line) => line.slice(1));
   ctx.addedCache.set(commit.sha, lines);
   return lines;
+}
+
+/**
+ * Source with its comments blanked, line by line, carrying block-comment state
+ * across lines — and optionally its string literals too. Every reader of source
+ * text goes through this: the import scan, which otherwise reads the
+ * `import { a, b } from '…'` example in this file's own header as a real
+ * import, and the declaration scan, which otherwise reads a commented-out or
+ * quoted `function foo` as declaring one.
+ *
+ * `strings` is opt-in because the two readers want opposite things: a module
+ * specifier IS a string literal, so blanking strings would leave the import
+ * scan with no specifier to read at all. Deliberately not a parser — this file
+ * ships dependency-free into containers, and the cost of being crude is a seam
+ * missed or a lift refused, never one wrongly granted.
+ */
+export function stripNonCode(lines, { strings = false } = {}) {
+  let inBlock = false;
+  return lines.map((raw) => {
+    let line = raw;
+    if (inBlock) {
+      const end = line.indexOf('*/');
+      if (end === -1) return '';
+      line = ' '.repeat(end + 2) + line.slice(end + 2);
+      inBlock = false;
+    }
+    // Opening a block that does not close on this line takes the rest of it.
+    for (;;) {
+      const open = line.indexOf('/*');
+      if (open === -1) break;
+      const close = line.indexOf('*/', open + 2);
+      if (close === -1) {
+        line = line.slice(0, open);
+        inBlock = true;
+        break;
+      }
+      line = line.slice(0, open) + ' '.repeat(close + 2 - open) + line.slice(close + 2);
+    }
+    line = line.replace(/\/\/.*$/, ' ');
+    if (!strings) return line;
+    return line
+      .replace(/`[^`]*`/g, ' ')
+      .replace(/'[^']*'/g, ' ')
+      .replace(/"[^"]*"/g, ' ');
+  });
+}
+
+function stripSource(source) {
+  return stripNonCode(source.split('\n')).join('\n');
 }
 
 function touches(changedFiles, seam, seamInRepo) {
@@ -732,8 +770,17 @@ export function decideGate(payload, options = {}) {
   // They are the "reported" half of the rule and must appear in the output: a
   // gate that prints "no finding class has reached 3 rounds" while the table
   // holds one is telling the operator something false.
+  const gatedSeams = new Set(flagged.map((f) => f.seam).filter(Boolean));
   const reported = report.classes
-    .filter((c) => c.rounds >= CLASS_ROUND_LIMIT && !(c.seam && c.seamSubstantiated))
+    .filter(
+      (c) =>
+        c.rounds >= CLASS_ROUND_LIMIT &&
+        !(c.seam && c.seamSubstantiated) &&
+        // Its seam may still be gated by the rollup, on evidence the rollup
+        // carries. Saying "not gated" beside a refusal naming the same seam
+        // would be two answers to one question.
+        !(c.seam && gatedSeams.has(c.seam)),
+    )
     .map((c) => ({
       key: c.key,
       rounds: c.rounds,
