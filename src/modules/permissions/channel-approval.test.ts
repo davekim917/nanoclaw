@@ -37,13 +37,25 @@ const telegramDefaults: ChannelDefaults = {
 };
 registerChannelAdapter('telegram', { factory: () => null, defaults: telegramDefaults });
 
-// Mock container runner — prevent actual docker spawn.
-vi.mock('../../container-runner.js', () => ({
-  wakeContainer: vi.fn().mockResolvedValue(undefined),
-  isContainerRunning: vi.fn().mockReturnValue(false),
-  getActiveContainerCount: vi.fn().mockReturnValue(0),
-  killContainer: vi.fn(),
-}));
+// Mock container runner — prevent actual docker spawn. `...real` carries
+// `sessionStillActive` through UNCHANGED: the router builds the replay's wake
+// guard from it (`wakeContainer(session, priority, { guard: sessionStillActive(...) })`,
+// #291), and this file never mocks `./db/sessions.js`, so the real predicate
+// reads this suite's real sqlite fixture — exactly the liveness the replayed
+// session should prove. A literal mock without it throws "no such export" the
+// moment the guard is built, which the replay's catch swallows, silently
+// skipping the wake — see the fleet-wide hardening in router.test.ts and
+// siblings (commit 94800223) for the same pattern.
+vi.mock('../../container-runner.js', async (importOriginal) => {
+  const real = await importOriginal<typeof import('../../container-runner.js')>();
+  return {
+    ...real,
+    wakeContainer: vi.fn().mockResolvedValue(undefined),
+    isContainerRunning: vi.fn().mockReturnValue(false),
+    getActiveContainerCount: vi.fn().mockReturnValue(0),
+    killContainer: vi.fn(),
+  };
+});
 
 // Mock delivery adapter.
 const deliverMock = vi.fn().mockResolvedValue('plat-msg-id');
