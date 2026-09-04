@@ -11,7 +11,7 @@
  * direct dynamic import. When scheduling moves to the modules branch in
  * PR #8, the install skill re-fills the marker on install.
  */
-import { touchSessionActivity } from '../../db/sessions.js';
+import { withQuietInvalidationSync } from '../../db/sessions.js';
 import { CronExpressionParser } from 'cron-parser';
 
 import { resolveGroupTimezone } from '../../container-config.js';
@@ -132,8 +132,9 @@ export async function handleRecurrence(mailbox: NanoclawMailboxSession, session:
         // series in place; leave the why in the run log. Insert + clear are
         // one transaction: a crash between them would leave the predecessor
         // still recurrence-armed next to a live successor → double-fire.
-        mailbox.armNextRecurrence(msg.id, msg, newId, cronNext.toISOString(), 'paused');
-        touchSessionActivity(session.id);
+        withQuietInvalidationSync(session.id, () =>
+          mailbox.armNextRecurrence(msg.id, msg, newId, cronNext.toISOString(), 'paused'),
+        );
         appendHostTaskNote(
           session.agent_group_id,
           msg.series_id,
@@ -151,8 +152,24 @@ export async function handleRecurrence(mailbox: NanoclawMailboxSession, session:
       const backoffAt = scriptFails > 0 ? Date.now() + scriptBackoffMinutes(scriptFails) * 60_000 : 0;
       const nextRun = new Date(Math.max(cronNext.getTime(), backoffAt)).toISOString();
 
-      mailbox.armNextRecurrence(msg.id, msg, newId, nextRun);
-      touchSessionActivity(session.id);
+      // Bracketed like every other due-ness write (Codex round 2, H1). The
+      // re-arm moves `process_after` in the session DB, which the quiet cache
+      // cannot see, so the central-DB invalidation is what makes the successor
+      // visible. Fail-closed: if it throws, the arm never happens and this
+      // row's `catch` below logs it — the predecessor keeps its recurrence, so
+      // the next tick retries rather than losing the series.
+      //
+      // The POST half is redundant *here* and kept only so this site has the
+      // same one-call shape as the others. This body runs inside the session's
+      // own sweep pass with no `await` between the arm and the invalidation, and
+      // the mark that tick may flush carries `session.last_active` as its basis
+      // — the value the driver read when it listed the tick's sessions, before
+      // this pass ran (`newQuietMarks.push` in src/host-sweep.ts) — so the
+      // pre-write invalidation alone already fails that flush's
+      // `WHERE last_active IS <basis>` guard, and the in-memory mark's
+      // `mark.lastActive === session.last_active` check on the next tick with
+      // it. It costs one extra central-DB UPDATE per re-arm.
+      withQuietInvalidationSync(session.id, () => mailbox.armNextRecurrence(msg.id, msg, newId, nextRun));
 
       log.info('Inserted next recurrence', {
         originalId: msg.id,

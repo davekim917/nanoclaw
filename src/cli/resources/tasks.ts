@@ -13,7 +13,7 @@ import {
   getSession,
   isTaskThread,
   TASKS_SYSTEM_THREAD_ID,
-  touchSessionActivity,
+  withQuietInvalidation,
 } from '../../db/sessions.js';
 import { type TaskUpdate } from '../../modules/scheduling/db.js';
 import type { CliTaskRow, NanoclawMailboxSession } from '../../modules/mailbox/index.js';
@@ -136,6 +136,32 @@ function selectedSessions(args: Record<string, unknown>, ctx: CallerContext): Sc
  */
 function withInbound<T>(session: ScopedSession, fn: (mailbox: NanoclawMailboxSession) => T): Promise<T | undefined> {
   return withExistingMailboxSession(session.agent_group_id, session.id, fn);
+}
+
+/**
+ * `withInbound` for an operation that CHANGES when the session next has work
+ * due — every task create/edit/pause/resume/cancel/run-now below.
+ *
+ * `withQuietInvalidation` invalidates the session's quiet mark fail-closed
+ * before the write and again after it (see that helper). Fail-closed matters
+ * here for the same reason it does on the dashboard: `ncl tasks` writes
+ * due-ness straight into the session DB, where the host sweep's quiet cache
+ * cannot see it, and a swallowed central-DB failure would leave the row hidden
+ * behind a mark nothing clears until `QUIET_SESSION_BACKOFF_MS` expires — past
+ * a warmed restart, since S2-PR15 persists the mark.
+ *
+ * These commands fan out across every session the caller can see and only some
+ * of them match the series, so this invalidates sessions whose write turns out
+ * to touch nothing. That is the safe direction and the only knowable one — a
+ * writer cannot learn its row count before attempting the write — and it costs
+ * one ordinary sweep of a session that has nothing to do. Reads (`list`,
+ * `show`) stay on plain `withInbound`.
+ */
+function withInboundInvalidating<T>(
+  session: ScopedSession,
+  fn: (mailbox: NanoclawMailboxSession) => T,
+): Promise<T | undefined> {
+  return withQuietInvalidation(session.id, () => withInbound(session, fn));
 }
 
 function parseContent(raw: string): {
@@ -287,7 +313,7 @@ async function createTask(args: Record<string, unknown>, ctx: CallerContext) {
   // routed to (migration 056). NO_ROUTING passes null and stamps nothing.
   const { session } = resolveTaskSession(group, id, routing.platformId);
 
-  const created = await withInbound(session, (mailbox) => {
+  const created = await withInboundInvalidating(session, (mailbox) => {
     mailbox.insertTaskRow({
       id,
       seriesId: id,
@@ -317,7 +343,6 @@ async function createTask(args: Record<string, unknown>, ctx: CallerContext) {
     return mailbox.getCliTaskRow(id);
   });
   if (!created) throw new Error('task system session inbound.db not found');
-  touchSessionActivity(session.id);
   writeAudit(getDb(), {
     actor: actorFor(ctx),
     action: 'create',
@@ -456,10 +481,8 @@ async function mutateTask(
   const id = taskId(args);
   let touched = 0;
   for (const session of selectedSessions(args, ctx)) {
-    const n = (await withInbound(session, (mailbox) => fn(mailbox, id))) ?? 0;
-    // Quiet-cache/delivery-horizon invalidation — see touchSessionActivity.
+    const n = (await withInboundInvalidating(session, (mailbox) => fn(mailbox, id))) ?? 0;
     if (n > 0) {
-      touchSessionActivity(session.id);
       // No before/after body: pause/resume/delete/cancel don't touch the
       // prompt, matching the dashboard's own pause/resume/cancel audit rows
       // (scheduled-mutations.ts) — a status-only change is the "after" here.
@@ -643,7 +666,6 @@ async function updateTaskCommand(args: Record<string, unknown>, ctx: CallerConte
     if (!result) continue;
     const { before, n } = result;
     if (n > 0) {
-      touchSessionActivity(session.id);
       writeAudit(getDb(), {
         actor: actorFor(ctx),
         action: 'update',
@@ -674,7 +696,7 @@ async function cancelTaskCommand(args: Record<string, unknown>, ctx: CallerConte
 
   let touched = 0;
   for (const session of selectedSessions(args, ctx)) {
-    const result = await withInbound(session, (mailbox) => {
+    const result = await withInboundInvalidating(session, (mailbox) => {
       const seriesIds = mailbox.listCliTaskSeries().map((r) => r.series_id ?? r.row_id);
       // Upstream's `cancelTask()` with no id IS cancel-all; there is one
       // statement behind both names (invariant I-2).
@@ -682,7 +704,6 @@ async function cancelTaskCommand(args: Record<string, unknown>, ctx: CallerConte
     });
     if (!result) continue;
     if (result.n > 0) {
-      touchSessionActivity(session.id);
       for (const seriesId of result.seriesIds) {
         writeAudit(getDb(), {
           actor: actorFor(ctx),
@@ -709,7 +730,7 @@ async function cancelTaskCommand(args: Record<string, unknown>, ctx: CallerConte
 async function runTaskCommand(args: Record<string, unknown>, ctx: CallerContext) {
   const id = taskId(args);
   for (const session of selectedSessions(args, ctx)) {
-    const fired = await withInbound(session, (mailbox) => {
+    const fired = await withInboundInvalidating(session, (mailbox) => {
       const row = mailbox.getCliTaskRow(id);
       if (!row) return undefined;
       const seriesKey = row.series_id ?? row.row_id;
@@ -731,7 +752,6 @@ async function runTaskCommand(args: Record<string, unknown>, ctx: CallerContext)
       return { series_id: seriesKey, row_id: rowId, status: 'pending' };
     });
     if (fired) {
-      touchSessionActivity(session.id);
       writeAudit(getDb(), {
         actor: actorFor(ctx),
         action: 'run_now',

@@ -63,19 +63,23 @@ function childProcessTripwire(record: string[]): Record<string, (...args: unknow
 // `last_active`) is asserted against real SQLite in
 // src/db/migrations/065-sessions-sweep-quiet-until.test.ts.
 //
-// Each entry is `<phase>:<session id>`: the restore is BRACKETED by a
-// fail-closed `invalidateSessionQuiet` before the row lands and an advisory
-// `touchSessionActivity` after it, so the ordering is observable here.
+// Each entry is `<phase>:<session id>`: the restore goes through
+// `withQuietInvalidationSync`, which invalidates fail-closed before the row
+// lands and again after it, so both sides are observable here. What the real
+// bracket does on each side is asserted on real SQLite in
+// src/db/migrations/065-sessions-sweep-quiet-until.test.ts.
 const touched = vi.hoisted(() => [] as string[]);
 vi.mock('../../db/sessions.js', async (importOriginal) => {
   const real = await importOriginal<typeof import('../../db/sessions.js')>();
   return {
     ...real,
-    invalidateSessionQuiet: (id: string) => {
+    withQuietInvalidationSync: <T>(id: string, write: () => T): T => {
       touched.push(`pre:${id}`);
-    },
-    touchSessionActivity: (id: string) => {
-      touched.push(`post:${id}`);
+      try {
+        return write();
+      } finally {
+        touched.push(`post:${id}`);
+      }
     },
   };
 });
@@ -474,7 +478,7 @@ describe('recoverMoveIntents (D3) + pruneAuditBodies (D4)', () => {
     writeIntent(db, { seriesId: 'ser-faulted', ag: 'src-ag', sess: 'src-sess', tsMs: NOW - 2 * SWEEP_MS });
 
     const sessionsModule = await import('../../db/sessions.js');
-    const spy = vi.spyOn(sessionsModule, 'invalidateSessionQuiet').mockImplementation((id: string) => {
+    const spy = vi.spyOn(sessionsModule, 'withQuietInvalidationSync').mockImplementation((id: string) => {
       throw new sessionsModule.QuietInvalidationError(id, new Error('central DB is read-only'));
     });
     await recoverMoveIntents(db, { nowMs: NOW });

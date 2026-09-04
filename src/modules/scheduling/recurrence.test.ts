@@ -34,6 +34,23 @@ vi.mock('../../db/agent-groups.js', () => ({
   getAgentGroup: (id: string) => (id === 'ag-test' ? { id, folder: 'g-test' } : undefined),
 }));
 
+// The re-arm is a due-ness write, so it goes through `withQuietInvalidationSync`
+// — a central-DB write, and this file's fixture deliberately never initializes
+// that singleton. Record the call and pass through; what the real bracket does
+// on each side is asserted against real SQLite in
+// src/db/migrations/065-sessions-sweep-quiet-until.test.ts.
+const invalidated = vi.hoisted(() => [] as string[]);
+vi.mock('../../db/sessions.js', async (importOriginal) => {
+  const real = await importOriginal<typeof import('../../db/sessions.js')>();
+  return {
+    ...real,
+    withQuietInvalidationSync: <T>(id: string, write: () => T): T => {
+      invalidated.push(id);
+      return write();
+    },
+  };
+});
+
 const { TEST_DIR } = vi.hoisted(() => ({ TEST_DIR: uniqueTmpRoot('recurrence-test') }));
 
 // resolveGroupTimezone reads the group's config row from the central DB
@@ -123,6 +140,57 @@ describe('handleRecurrence', () => {
     expect(follow.recurrence).toBe('0 9 * * *');
     expect(follow.series_id).toBe('task-1');
     expect(new Date(follow.process_after).getTime()).toBeGreaterThan(Date.now());
+  });
+
+  it('invalidates the session quiet mark as it arms the successor', async () => {
+    // The re-arm moves `process_after` in the session DB, where the host sweep's
+    // quiet cache cannot see it — the central-DB invalidation is what makes the
+    // successor visible before its slot.
+    invalidated.length = 0;
+    const db = freshDb();
+    insertTaskRow(db, {
+      id: 'task-inv',
+      seriesId: 'task-inv',
+      processAfter: '2020-01-01T00:00:00.000Z',
+      recurrence: '0 9 * * *',
+      content: JSON.stringify({ prompt: 'daily digest' }),
+    });
+    db.prepare(`UPDATE messages_in SET status='completed' WHERE id='task-inv'`).run();
+
+    await handleRecurrence(sessionFor(db), fakeSession());
+
+    expect(invalidated, 'the successor was armed without invalidating the mark').toEqual(['sess-test']);
+  });
+
+  // Codex round 2, H1 (b). Fail-closed: a refused invalidation must leave the
+  // series ARMED for the next tick rather than write a successor the quiet
+  // cache cannot see.
+  it('arms nothing when the quiet-mark invalidation fails, leaving the series for the next tick', async () => {
+    const db = freshDb();
+    insertTaskRow(db, {
+      id: 'task-faulted',
+      seriesId: 'task-faulted',
+      processAfter: '2020-01-01T00:00:00.000Z',
+      recurrence: '0 9 * * *',
+      content: JSON.stringify({ prompt: 'daily digest' }),
+    });
+    db.prepare(`UPDATE messages_in SET status='completed' WHERE id='task-faulted'`).run();
+
+    const sessionsModule = await import('../../db/sessions.js');
+    const spy = vi.spyOn(sessionsModule, 'withQuietInvalidationSync').mockImplementation((id: string) => {
+      throw new sessionsModule.QuietInvalidationError(id, new Error('central DB is read-only'));
+    });
+    await handleRecurrence(sessionFor(db), fakeSession());
+    spy.mockRestore();
+
+    const rows = db.prepare(`SELECT id, recurrence FROM messages_in ORDER BY seq`).all() as Array<{
+      id: string;
+      recurrence: string | null;
+    }>;
+    expect(rows, 'a successor was armed behind a mark nothing will clear').toHaveLength(1);
+    // The predecessor keeps its recurrence, so the next tick re-attempts the arm
+    // instead of dropping the series.
+    expect(rows[0]!.recurrence).toBe('0 9 * * *');
   });
 
   it('interprets the cron expression in TIMEZONE, not UTC (the v1 regression)', async () => {

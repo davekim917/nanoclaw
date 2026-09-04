@@ -1,5 +1,5 @@
 import { randomUUID } from 'crypto';
-import { touchSessionActivity } from '../../db/sessions.js';
+import { withQuietInvalidation } from '../../db/sessions.js';
 
 import { CronExpressionParser } from 'cron-parser';
 
@@ -159,28 +159,34 @@ export async function createScheduledTask(
   const id = makeTaskId(task.name);
   const { session } = resolveTaskSession(agentGroupId, id);
 
-  const row = await withExistingMailboxSession(agentGroupId, session.id, (mailbox) => {
-    mailbox.insertTaskRow({
-      id,
-      seriesId: id,
-      processAfter: task.processAfter,
-      recurrence: task.recurrence,
-      content: JSON.stringify({
-        prompt: task.prompt,
-        script: task.script,
-        originSessionId: options?.originSessionId ?? null,
-        // Physical send suppression: the agent-runner drops chat-kind
-        // outbound writes for tasks carrying muteChat (watcher-style tasks
-        // whose contract is board/file output, never channel posts).
-        ...(task.muteChat ? { muteChat: true } : {}),
-      }),
-      status: options?.status ?? 'pending',
-    });
-    return mailbox.getCreatedTaskRow(id) as ScheduledTaskRow;
-  });
+  // Bracketed by `withQuietInvalidation`: the insert changes when this session
+  // next has work due, and due-ness lives only in the session DB where the host
+  // sweep's quiet cache cannot see it. Fail-closed before the write (a refused
+  // central-DB invalidation aborts the create rather than landing a row behind a
+  // mark nothing clears), re-invalidated after it — the mailbox funnel is
+  // awaited, so a sweep tick can flush a mark inside that window.
+  const row = await withQuietInvalidation(session.id, () =>
+    withExistingMailboxSession(agentGroupId, session.id, (mailbox) => {
+      mailbox.insertTaskRow({
+        id,
+        seriesId: id,
+        processAfter: task.processAfter,
+        recurrence: task.recurrence,
+        content: JSON.stringify({
+          prompt: task.prompt,
+          script: task.script,
+          originSessionId: options?.originSessionId ?? null,
+          // Physical send suppression: the agent-runner drops chat-kind
+          // outbound writes for tasks carrying muteChat (watcher-style tasks
+          // whose contract is board/file output, never channel posts).
+          ...(task.muteChat ? { muteChat: true } : {}),
+        }),
+        status: options?.status ?? 'pending',
+      });
+      return mailbox.getCreatedTaskRow(id) as ScheduledTaskRow;
+    }),
+  );
   if (!row) throw new Error('task system session inbound.db not found');
-  // Quiet-cache/delivery-horizon invalidation — see touchSessionActivity.
-  touchSessionActivity(session.id);
 
   return { session: { id: session.id, agent_group_id: session.agent_group_id }, row };
 }

@@ -19,7 +19,7 @@ import fs from 'fs';
 import { DATA_DIR, TIMEZONE } from '../../config.js';
 import { resolveGroupTimezone } from '../../container-config.js';
 import { getDb } from '../../db/connection.js';
-import { getSession, invalidateSessionQuiet, touchSessionActivity } from '../../db/sessions.js';
+import { getSession, QuietInvalidationError, withQuietInvalidation } from '../../db/sessions.js';
 import {
   readSessionInbound,
   readSessionOutbound,
@@ -309,13 +309,13 @@ async function withMutationSession(
 /**
  * Emit the post-mutation SSE frame (non-null agent_group_id) + invalidate cache.
  *
- * The quiet-mark invalidation this used to also do here moved to
- * `touchBeforeMutation`, called BEFORE each mutation's session-DB write, not
- * after (Codex pre-pass, review/b3/review.json Part C): the session DB and the
- * central DB are two separate files with no shared transaction, so a crash
- * between them is survivable only by invalidating first. This function still
- * runs after the write — the SSE frame and the cache both describe what
- * already happened, so there is nothing to gain by moving them earlier.
+ * The quiet-mark invalidation this used to also do here now brackets the write
+ * itself, in `mutateWithInvalidation`: the session DB and the central DB are
+ * two separate files with no shared transaction, so the mark has to die before
+ * the write (Codex pre-pass, review/b3/review.json Part C) and again after it
+ * (round 2, H1). This function still runs after the write and only on the
+ * success paths — the SSE frame and the cache both describe what already
+ * happened, so there is nothing to gain by moving them earlier.
  */
 function afterMutation(agentGroupId: string, sessionId: string): void {
   try {
@@ -327,58 +327,42 @@ function afterMutation(agentGroupId: string, sessionId: string): void {
 }
 
 /**
- * Invalidate the quiet mark for a session about to receive a due-ness-changing
- * write — a cron edit or a resume both recompute `process_after` directly in
- * the session DB, which the host sweep's quiet cache cannot see. The central-DB
- * write clears it (`updateSession` nulls `sweep_quiet_until` in the same
- * statement), so a quiet session cannot sleep past its new due time — and,
- * since S2-PR15 persists that mark, cannot sleep past it across a restart.
+ * Run one mutation with its quiet-mark invalidation on both sides.
  *
- * Called BEFORE the mutation's session-DB write, not after: the session DB and
- * the central DB are two separate files with no shared transaction, so a crash
- * between them survives only if the mark dies first. The worst case of
- * invalidating first is one wasted sweep of a session whose write then fails or
- * finds nothing new (harmless); the reverse lets a persisted quiet mark survive
- * a due-ness change already committed to inbound.db — up to
- * `QUIET_SESSION_BACKOFF_MS` of silently missed due work on a warmed restart.
+ * The single bracketed-write entry for this module: `withQuietInvalidation`
+ * invalidates fail-closed before the session-DB write and again after it, and
+ * the refusal is mapped to the HTTP answer this surface owes rather than
+ * thrown at the router. A cron edit or a resume recomputes `process_after`
+ * straight in the session DB, which the host sweep's quiet cache cannot see;
+ * without the invalidation a quiet session sleeps past its new due time, and
+ * since S2-PR15 persists that mark, across a restart too.
  *
- * FAIL-CLOSED (Codex round 2, H1): returns a 503 for the handler to return
- * instead of its mutation, and the handler must return it. A swallowed
- * central-DB failure here would let the session-DB write land behind a mark
- * nothing clears — silently missed work — where a 503 is a retryable no-op the
- * operator can see. `touchAfterMutation` is the swallowing half, and only
- * because by then the row has landed and there is nothing left to abort.
+ * FAIL-CLOSED (Codex round 2, H1): a central DB that refuses the invalidation
+ * gets a 503 and NO write, not a silent success whose due-time change stays
+ * hidden behind a mark nothing will clear. A 503 is retryable and visible;
+ * missed work is neither.
  */
-function touchBeforeMutation(sessionId: string): Response | null {
+async function mutateWithInvalidation(
+  t: ResolvedTarget,
+  action: (mailbox: NanoclawMailboxSession) => number,
+): Promise<{ touched: number } | { refused: Response }> {
   try {
-    invalidateSessionQuiet(sessionId);
-    return null;
+    return { touched: await withQuietInvalidation(t.sessionId, () => withMutationSession(t, action)) };
   } catch (err) {
-    log.warn('scheduled-mutations: quiet-mark invalidation failed — mutation refused', {
-      sessionId,
-      err: err instanceof Error ? err.message : String(err),
-    });
-    return json({ error: 'invalidation_failed', reason: 'invalidation_failed' }, 503);
+    const refused = quietRefusal(t.sessionId, err);
+    if (refused) return { refused };
+    throw err;
   }
 }
 
-/**
- * Re-invalidate AFTER the mutation's session-DB write has landed.
- *
- * `withMutationSession` awaits the mailbox funnel, so a whole sweep tick can
- * run inside it: it can read the `last_active` that `touchBeforeMutation` just
- * wrote, see a session with nothing newly due (the write has not happened yet),
- * and flush a quiet mark computed on that basis. This second call advances
- * `last_active` again and nulls the column, which both clears a mark already
- * flushed and disarms one still in flight — `persistQuietSessionMarks` writes
- * only `WHERE last_active IS <basis>`.
- *
- * Unconditional, before the `touched === 0` check: a mutation that reports zero
- * rows may still have written (run-now's inert-schedule restore), and an
- * invalidation for a session that truly changed nothing costs one sweep.
- */
-function touchAfterMutation(sessionId: string): void {
-  touchSessionActivity(sessionId);
+/** The 503 a refused quiet-mark invalidation owes, or null if `err` is something else. */
+function quietRefusal(sessionId: string, err: unknown): Response | null {
+  if (!(err instanceof QuietInvalidationError)) return null;
+  log.warn('scheduled-mutations: quiet-mark invalidation failed — mutation refused', {
+    sessionId,
+    err: err.message,
+  });
+  return json({ error: 'invalidation_failed', reason: 'invalidation_failed' }, 503);
 }
 
 /**
@@ -682,20 +666,23 @@ export const cancelHandler: AuthHandler = async (_req, params, ctx) => {
   if (!inboundPath) return json({ error: 'not_found' }, 404);
   if (!fs.existsSync(inboundPath)) return json({ error: 'session_unreadable', reason: 'session_unreadable' }, 503);
 
+  // Cancel has no ResolvedTarget, so it brackets its own open with the same
+  // helper and maps the same refusal.
   let touched: number;
-  const blocked = touchBeforeMutation(decoded.sessionId);
-  if (blocked) return blocked;
   try {
-    touched =
-      (await withExistingMailboxSession(decoded.agentGroupId, decoded.sessionId, (mailbox) =>
-        mailbox.cancelSeriesWithStrandClear(decoded.seriesId),
-      )) ?? 0;
+    touched = await withQuietInvalidation(
+      decoded.sessionId,
+      async () =>
+        (await withExistingMailboxSession(decoded.agentGroupId, decoded.sessionId, (mailbox) =>
+          mailbox.cancelSeriesWithStrandClear(decoded.seriesId),
+        )) ?? 0,
+    );
   } catch (err) {
+    const refused = quietRefusal(decoded.sessionId, err);
+    if (refused) return refused;
     log.warn('scheduled-mutations: cancel failed', { err: err instanceof Error ? err.message : String(err) });
-    touchAfterMutation(decoded.sessionId);
     return json({ error: 'session_unreadable', reason: 'session_unreadable' }, 503);
   }
-  touchAfterMutation(decoded.sessionId);
   // touched 0 → nothing live AND no terminal recurrence to clear → stale key.
   if (touched === 0) return json({ error: 'stale_key', reason: 'stale_key' }, 409);
 

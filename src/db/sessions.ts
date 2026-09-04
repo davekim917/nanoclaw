@@ -276,6 +276,58 @@ export function touchSessionActivity(id: string): void {
   }
 }
 
+/**
+ * Run a due-ness write with its quiet-mark invalidation on BOTH sides. This is
+ * the only shape any due-ness writer should have — one call, not a hand-rolled
+ * pair per site.
+ *
+ * - Before: `invalidateSessionQuiet`, fail-closed. It throws, `write` never
+ *   runs, and the caller's own failure path (a 503, a rejected `scheduleTask`,
+ *   an unresolved move intent, an un-armed recurrence the next tick retries)
+ *   takes over. The session DB and the central DB are two separate files with
+ *   no shared transaction, so this ordering is also what makes a crash between
+ *   them survivable: a spurious invalidation costs one wasted sweep, an
+ *   un-invalidated mark hides due work for up to `QUIET_SESSION_BACKOFF_MS`
+ *   after a warmed restart.
+ * - After: `touchSessionActivity`, swallowing, in a `finally`. Any `await`
+ *   inside `write` is a window a whole sweep tick can run in — reading the
+ *   `last_active` the first call published, finding nothing due yet, and
+ *   flushing a mark on that basis. The second call advances `last_active`
+ *   again and nulls the column, which clears a mark already flushed and
+ *   disarms one still in flight (`persistQuietSessionMarks` writes only
+ *   `WHERE last_active IS <basis>`). It runs on the throwing path too: a write
+ *   that failed midway may still have landed.
+ *
+ * Over-invalidating is the safe direction — a writer cannot know whether its
+ * write will match a row before attempting it, and the cost of invalidating a
+ * session that turned out to need nothing is one sweep of a session that has
+ * nothing to do.
+ */
+export async function withQuietInvalidation<T>(sessionId: string, write: () => Promise<T>): Promise<T> {
+  invalidateSessionQuiet(sessionId);
+  try {
+    return await write();
+  } finally {
+    touchSessionActivity(sessionId);
+  }
+}
+
+/**
+ * `withQuietInvalidation` for a synchronous write — a statement inside a
+ * mailbox action, or a sweep duty body that must not gain an `await`. Same
+ * contract; there is no interleave window inside `write`, but the post-write
+ * call still disarms a mark flushed between the two by the tick this write
+ * runs inside.
+ */
+export function withQuietInvalidationSync<T>(sessionId: string, write: () => T): T {
+  invalidateSessionQuiet(sessionId);
+  try {
+    return write();
+  } finally {
+    touchSessionActivity(sessionId);
+  }
+}
+
 /** One quiet mark to persist: the session, the ISO instant its skip expires, and the basis it was computed on. */
 export interface QuietSessionMark {
   sessionId: string;

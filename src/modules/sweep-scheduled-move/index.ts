@@ -18,7 +18,7 @@ import path from 'path';
 
 import { log } from '../../log.js';
 import { getDb } from '../../db/connection.js';
-import { invalidateSessionQuiet, touchSessionActivity } from '../../db/sessions.js';
+import { withQuietInvalidationSync } from '../../db/sessions.js';
 import { sessionsBaseDir } from '../../session-manager.js';
 import { parseSqliteUtc } from '../mailbox/sqlite-utc.js';
 // Move recovery resolves its source session through the seam, like every other
@@ -256,38 +256,30 @@ export async function recoverMoveIntents(centralDb: Database.Database, options: 
           // persisted quiet mark survives the crash, hiding the just-restored due
           // task for up to `QUIET_SESSION_BACKOFF_MS` after a warmed restart.
           //
-          // FAIL-CLOSED (Codex round 2, H1): `invalidateSessionQuiet` throws, and
-          // the throw escapes the mailbox action into this loop's catch, which
-          // logs and leaves the intent UNRESOLVED for the next recovery pass. A
-          // swallowed failure would instead restore the row behind a mark nothing
-          // clears and then stamp the intent resolved — the one outcome no later
-          // pass can repair.
-          invalidateSessionQuiet(intent.session_id);
-          mailbox.restoreTaskRow({
-            // Fresh id — the cancelled source row may still hold the snapshot id.
-            id: `task-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-            series_id: snapshot.series_id,
-            status: snapshot.status,
-            process_after: snapshot.process_after,
-            // Optional on the parsed audit body: an intent written before the
-            // column existed has none, and restoreTaskRow falls back.
-            scheduled_for: snapshot.scheduled_for,
-            recurrence: snapshot.recurrence,
-            content: snapshot.content,
-            platform_id: snapshot.platform_id,
-            channel_type: snapshot.channel_type,
-            thread_id: snapshot.thread_id,
-            kind: snapshot.kind,
-          });
-          // Re-invalidate after the restore. The fan-out that ran before this
-          // housekeeping duty may have flushed a quiet mark for this session
-          // computed on the `last_active` the call above just wrote;
-          // `persistQuietSessionMarks` guards its write with
-          // `WHERE last_active IS <basis>`, so advancing the column again both
-          // clears a mark already flushed and disarms one still in flight.
-          // Swallowing is right here: the row has landed and there is nothing
-          // left to abort.
-          touchSessionActivity(intent.session_id);
+          // FAIL-CLOSED (Codex round 2, H1): the pre-restore invalidation inside
+          // `withQuietInvalidationSync` throws, and the throw escapes the mailbox
+          // action into this loop's catch, which logs and leaves the intent
+          // UNRESOLVED for the next recovery pass. A swallowed failure would
+          // instead restore the row behind a mark nothing clears and then stamp
+          // the intent resolved — the one outcome no later pass can repair.
+          withQuietInvalidationSync(intent.session_id, () =>
+            mailbox.restoreTaskRow({
+              // Fresh id — the cancelled source row may still hold the snapshot id.
+              id: `task-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+              series_id: snapshot.series_id,
+              status: snapshot.status,
+              process_after: snapshot.process_after,
+              // Optional on the parsed audit body: an intent written before the
+              // column existed has none, and restoreTaskRow falls back.
+              scheduled_for: snapshot.scheduled_for,
+              recurrence: snapshot.recurrence,
+              content: snapshot.content,
+              platform_id: snapshot.platform_id,
+              channel_type: snapshot.channel_type,
+              thread_id: snapshot.thread_id,
+              kind: snapshot.kind,
+            }),
+          );
         }
         return 'restored' as const;
       });

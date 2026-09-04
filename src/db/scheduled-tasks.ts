@@ -28,8 +28,7 @@ import {
   findSessionByAgentGroupAndMessagingGroup,
   getSession,
   setTaskRoutingPlatformId,
-  invalidateSessionQuiet,
-  touchSessionActivity,
+  withQuietInvalidation,
 } from './sessions.js';
 import { getDb } from './connection.js';
 
@@ -404,41 +403,20 @@ export async function scheduleTask(def: TaskDef): Promise<void> {
   // session is swept on the next tick rather than sleeping through its first
   // fire — and, since S2-PR15 persists that mark, across a restart too.
   //
-  // The write is BRACKETED by two invalidations, and both halves are load-bearing:
-  //
-  // 1. BEFORE, fail-closed (`invalidateSessionQuiet`, Codex round 2 H1). The
-  //    session DB and the central DB are two separate files with no shared
-  //    transaction, so a crash between them can only be survived by
-  //    invalidating first: the worst case of a crash in the gap is a session
-  //    woken for nothing (one wasted sweep — its mailbox holds no new due row
-  //    yet), where the reverse leaves the task row durable in inbound.db behind
-  //    a persisted mark, i.e. up to QUIET_SESSION_BACKOFF_MS of silently missed
-  //    due work after a warmed restart. Throwing rather than swallowing is the
-  //    other half of the same argument: a central DB that refuses this write
-  //    would otherwise let the task row land behind a mark nothing will clear,
-  //    so the mutation is abandoned before it touches the session DB and the
-  //    caller retries.
-  // 2. AFTER, advisory (`touchSessionActivity`). `write` awaits the mailbox
-  //    funnel, so a whole sweep tick can run inside it: it can read this
-  //    session's freshly-touched `last_active`, find no due row (the upsert has
-  //    not happened yet), and flush a quiet mark computed on that basis. The
-  //    post-write call advances `last_active` again and nulls the column, which
-  //    both clears a mark already flushed and disarms one still in flight —
-  //    `persistQuietSessionMarks` writes only `WHERE last_active IS <basis>`.
-  //    Swallowing is right here and only here: the row has already landed, so
-  //    there is nothing left to abort.
+  // `withQuietInvalidation` brackets the write: fail-closed before it (a
+  // central DB that refuses the invalidation aborts the schedule rather than
+  // landing a task row behind a mark nothing will clear), advisory after it
+  // (the mailbox funnel is awaited, so a whole sweep tick can flush a mark
+  // inside that window — see the helper for why the second call disarms it).
   //
   // Each attempt invalidates only the id it is about to write to, so a
-  // spurious touch ahead of a write that then fails (session closed, retried
-  // against a different session) never touches the WRONG session's mark.
+  // spurious invalidation ahead of a write that then fails (session closed,
+  // retried against a different session) never touches the WRONG session's mark.
   //
   // Here rather than at the call sites: this is the chokepoint every scheduled
   // task insert passes through, including `scheduled-move`'s re-home into a
   // target session that may have been quiet for days.
-  invalidateSessionQuiet(session.id);
-  const outcome = await write(session.id);
-  touchSessionActivity(session.id);
-  if (outcome === 'written') {
+  if ((await withQuietInvalidation(session.id, () => write(session.id))) === 'written') {
     return;
   }
 
@@ -446,10 +424,7 @@ export async function scheduleTask(def: TaskDef): Promise<void> {
   // behind `resolveTaskSession` filter `status = 'active'`, so the closed row
   // can never come back — a fresh active task session is minted instead.
   const retry = resolveTaskSession(def.agentGroupId, def.seriesId);
-  invalidateSessionQuiet(retry.session.id);
-  const retryOutcome = await write(retry.session.id);
-  touchSessionActivity(retry.session.id);
-  if (retryOutcome === 'written') {
+  if ((await withQuietInvalidation(retry.session.id, () => write(retry.session.id))) === 'written') {
     return;
   }
   throw new Error(

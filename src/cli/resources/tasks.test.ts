@@ -355,6 +355,43 @@ describe('tasks CLI resource', () => {
     systemDb.close();
   });
 
+  // Codex round 2, H1 (b). `ncl tasks` writes due-ness straight into the
+  // session DB, where the host sweep's quiet cache cannot see it, so every
+  // mutating command goes through `withQuietInvalidating`'s bracket. Fail-closed:
+  // a central DB that refuses the invalidation must refuse the command, not land
+  // a task row behind a mark nothing will clear. (What the bracket does on each
+  // side is asserted on real SQLite in
+  // src/db/migrations/065-sessions-sweep-quiet-until.test.ts.)
+  it('create writes nothing when the quiet-mark invalidation fails', async () => {
+    const sessionsModule = await import('../../db/sessions.js');
+    const spy = vi.spyOn(sessionsModule, 'withQuietInvalidation').mockImplementation((id: string) => {
+      throw new sessionsModule.QuietInvalidationError(id, new Error('central DB is read-only'));
+    });
+
+    const resp = await dispatch(
+      {
+        id: 'req-faulted',
+        command: 'tasks-create',
+        args: { prompt: 'should not land', process_after: '2026-01-15T09:00:00Z' },
+      },
+      agentCtx(),
+    );
+    spy.mockRestore();
+
+    expect(resp.ok, 'a refused invalidation reported success').toBe(false);
+    if (resp.ok) return;
+    expect(resp.error.message).toMatch(/quiet-mark invalidation failed/);
+
+    // The per-series session was resolved (and its inbound.db provisioned)
+    // before the bracket, so an empty mailbox is the abort, not a missing
+    // session.
+    const taskSessions = getSessionsByAgentGroup('ag-1').filter((sess) => sess.thread_id?.startsWith('system:tasks'));
+    expect(taskSessions).toHaveLength(1);
+    const db = new Database(inboundDbPath('ag-1', taskSessions[0]!.id), { readonly: true });
+    expect(db.prepare("SELECT COUNT(*) AS count FROM messages_in WHERE kind = 'task'").get()).toEqual({ count: 0 });
+    db.close();
+  });
+
   it('create and update persist quiet-status independently from the chat budget', async () => {
     const resp = await dispatch(
       {

@@ -7,8 +7,12 @@ import { migration068 } from './068-sessions-sweep-quiet-until.js';
 import {
   createSession,
   getWarmQuietSessionMarks,
+  invalidateSessionQuiet,
   persistQuietSessionMarks,
+  QuietInvalidationError,
   updateSession,
+  withQuietInvalidation,
+  withQuietInvalidationSync,
   type QuietSessionMark,
 } from '../sessions.js';
 import type { Session } from '../../types.js';
@@ -100,6 +104,13 @@ describe('the persisted quiet mark (S2-PR15)', () => {
     return row?.sweep_quiet_until ?? null;
   }
 
+  function lastActiveOf(id: string): string | null {
+    const row = getDb().prepare('SELECT last_active FROM sessions WHERE id = ?').get(id) as
+      | { last_active: string | null }
+      | undefined;
+    return row?.last_active ?? null;
+  }
+
   const ACTIVE = '2026-08-20T00:00:00.000Z';
   const FUTURE = '2099-01-01T00:00:00.000Z';
   const PAST = '2000-01-01T00:00:00.000Z';
@@ -176,6 +187,67 @@ describe('the persisted quiet mark (S2-PR15)', () => {
     updateSession('s-1', { last_active: '2026-09-03T12:00:00.000Z' });
 
     expect(markOf('s-1')).toBeNull();
+  });
+
+  // ── The invalidation primitive and its bracket (Codex round 2, H1) ────────
+  //
+  // Every due-ness writer goes through these two: `invalidateSessionQuiet`
+  // fail-closed before its session-DB write, `withQuietInvalidation` wrapping
+  // the write so the second, swallowing call lands after it. Tested here, on
+  // real SQLite, so the call-site suites can mock the seam and still be
+  // testing something real.
+  it('invalidateSessionQuiet clears the mark and moves last_active', () => {
+    createSession(session('s-1', ACTIVE));
+    persistQuietSessionMarks([{ sessionId: 's-1', quietUntil: FUTURE, lastActive: ACTIVE }]);
+
+    invalidateSessionQuiet('s-1');
+
+    expect(markOf('s-1')).toBeNull();
+    expect(lastActiveOf('s-1')).not.toBe(ACTIVE);
+  });
+
+  // The reason the flush guard is EXACT rather than near-exact. `toISOString()`
+  // is millisecond resolution, so a pre/post pair around a sub-millisecond
+  // write would otherwise publish the same basis twice and leave a flush
+  // landing between them satisfied — re-marking a session that has just become
+  // due. Advancing by 1 ms when the clock has not moved removes that case.
+  it('invalidateSessionQuiet always advances last_active, even inside one millisecond', () => {
+    createSession(session('s-1', null));
+    const seen = new Set<string>();
+    for (let i = 0; i < 50; i++) {
+      invalidateSessionQuiet('s-1');
+      seen.add(lastActiveOf('s-1')!);
+    }
+    expect(seen.size, 'two invalidations published the same last_active').toBe(50);
+    // Strictly increasing, not merely distinct.
+    const ordered = [...seen];
+    expect([...ordered].sort()).toEqual(ordered);
+  });
+
+  it('a flush that lands between the two calls of a bracket does not survive it', async () => {
+    createSession(session('s-1', ACTIVE));
+
+    await withQuietInvalidation('s-1', async () => {
+      // The sweep tick that runs inside the awaited write: it reads the
+      // last_active the pre-write call just published and marks on that basis.
+      persistQuietSessionMarks([{ sessionId: 's-1', quietUntil: FUTURE, lastActive: lastActiveOf('s-1') }]);
+      expect(markOf('s-1'), 'the simulated flush never landed').toBe(FUTURE);
+    });
+
+    expect(markOf('s-1'), 'a mark flushed mid-write outlived the bracket').toBeNull();
+  });
+
+  it('a bracket whose invalidation fails runs no write and throws', () => {
+    createSession(session('s-1', ACTIVE));
+    getDb().exec('DROP TABLE sessions');
+    let ran = false;
+
+    expect(() =>
+      withQuietInvalidationSync('s-1', () => {
+        ran = true;
+      }),
+    ).toThrow(QuietInvalidationError);
+    expect(ran, 'the write ran behind a mark that could not be cleared').toBe(false);
   });
 
   it('an update that does not touch last_active leaves the mark alone', () => {
