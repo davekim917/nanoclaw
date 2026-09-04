@@ -6,6 +6,16 @@ Access layer: `src/db/`. `src/db/schema.ts`'s `SCHEMA` constant is a *reference 
 
 ---
 
+## 0. Driver
+
+Everything below is reached through `src/db/connection.ts`. Since seam 3 PR 1 that module exposes two handles on the same SQLite connection.
+
+`getDb()` returns upstream's `DbDriver` (`src/db/driver.ts`, ported byte-for-byte along with `src/db/drivers/sqlite.ts`, `src/db/driver-registry.ts` and `src/db/compose.ts`). Its `get`/`all`/`run`/`exec`/`transaction`/`hasTable`/`close` all return promises, the composition in `compose.ts` picks the backend, and `initDb`/`initTestDb`/`closeDb`/`hasTable` are async with it. The driver is the boundary a non-SQLite backend would replace; session mailboxes deliberately do not use it.
+
+`getRawDb()` returns the underlying synchronous better-sqlite3 handle, via upstream's own `sqliteRaw` escape hatch. It is TRANSITIONAL. The fork's call sites were all synchronous when the driver landed and convert leaf by leaf across seam-3 PRs 3 to 5; `getRawDb()` and its companion `hasTableRaw()` are deleted in PR 6. The set of files that reference either one is pinned by `src/db/raw-db-ratchet.test.ts`, which allows removals and fails on any addition.
+
+The two handles share one connection, so transactions stay raw until PR 6. A driver transaction yields at every `await`, and a raw statement landing in that window would execute inside the open `BEGIN IMMEDIATE`. A synchronous `db.transaction(() => …)()` closure cannot be interleaved, so every fork transaction remains one until PR 6 introduces `src/db/central-lease.ts`. `src/db/transaction-closures.test.ts` enforces both halves with the TypeScript checker rather than by text: a `DbDriver` receiver on `.transaction(` is forbidden anywhere in `src/`, and a better-sqlite3 receiver is allowed only in the file set that test pins.
+
 ## 1. Tables
 
 ### 1.1 `agent_groups`
