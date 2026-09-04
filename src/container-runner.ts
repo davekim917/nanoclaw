@@ -257,7 +257,65 @@ const spawningSessions = new Set<string>();
  */
 const pendingKills = new Map<string, { reason: string; onExit: Array<() => void> }>();
 
-let memoryAdmission: MemoryAdmissionController<Session> | null = null;
+/**
+ * A caller's precondition, re-proved by the WAKE PATH at the last instant.
+ *
+ * Same contract and same reasoning as `WriteGuard` in session-manager: `true`
+ * proceeds, anything else refuses. Synchronous by requirement — it is called
+ * with nothing awaited between it and `spawn()`.
+ */
+export type WakeGuardResult = boolean | { ok: false; reason: string };
+export type WakeGuard = () => WakeGuardResult;
+
+export interface WakeContainerOptions {
+  /**
+   * Re-proved immediately before `spawn()`, and again when a queued wake is
+   * dequeued.
+   *
+   * Callers proved their preconditions and then called `wakeContainer`, which
+   * awaits storage admission, an unbounded wait in the memory queue, a storage
+   * lease, and all of `spawnContainer`'s preparation before the process exists.
+   * A re-read at the call site cannot see inside any of that. The proof belongs
+   * where the spawn is.
+   */
+  guard?: WakeGuard;
+}
+
+/** What a queued wake carries: the session AND the caller's still-unproved guard. */
+interface QueuedWake {
+  session: Session;
+  guard?: WakeGuard;
+}
+
+/**
+ * The wake guard nearly every caller wants: the central row is still ACTIVE at
+ * the moment the process is created.
+ *
+ * Five call sites had written this by hand as a `getSession()` immediately
+ * before `wakeContainer`, which proves it before the call rather than before
+ * the spawn — and the wake then awaits storage admission, an unbounded memory
+ * queue and all of `spawnContainer`'s preparation. One definition, evaluated in
+ * the one place that is adjacent to `spawn()`.
+ */
+export function sessionStillActive(sessionId: string): WakeGuard {
+  return () => {
+    const fresh = getSession(sessionId);
+    if (!fresh) return { ok: false, reason: 'session no longer exists' };
+    if (fresh.status !== 'active') return { ok: false, reason: `session is ${fresh.status}` };
+    return true;
+  };
+}
+
+/** Evaluate a wake guard and normalize its answer. */
+function wakeRefusalFrom(guard: WakeGuard | undefined): string | null {
+  if (!guard) return null;
+  const verdict = guard();
+  if (verdict === true) return null;
+  if (verdict === false) return 'guard refused';
+  return verdict.reason;
+}
+
+let memoryAdmission: MemoryAdmissionController<QueuedWake> | null = null;
 let containerShutdownInProgress = false;
 
 export function resolveMemoryAdmissionBudgetMb(
@@ -284,11 +342,11 @@ export function detectDockerMemoryMb(): number {
   return Math.floor(os.totalmem() / 1024 / 1024);
 }
 
-function getMemoryAdmission(): MemoryAdmissionController<Session> {
+function getMemoryAdmission(): MemoryAdmissionController<QueuedWake> {
   if (!memoryAdmission) {
     const dockerMemoryMb = detectDockerMemoryMb();
     const budgetMb = resolveMemoryAdmissionBudgetMb(dockerMemoryMb);
-    memoryAdmission = new MemoryAdmissionController<Session>(budgetMb);
+    memoryAdmission = new MemoryAdmissionController<QueuedWake>(budgetMb);
     log.info('Initialized container memory admission', {
       dockerMemoryMb,
       budgetMb,
@@ -302,9 +360,9 @@ function releaseMemoryReservation(sessionId: string): void {
   if (!memoryAdmission) return;
   if (containerShutdownInProgress) return;
   const ready = memoryAdmission.release(sessionId);
-  for (const queuedSession of ready) {
-    void startReservedWake(queuedSession).catch((err) => {
-      log.warn('Queued container wake failed', { sessionId: queuedSession.id, err });
+  for (const queued of ready) {
+    void startReservedWake(queued).catch((err) => {
+      log.warn('Queued container wake failed', { sessionId: queued.session.id, err });
     });
   }
 }
@@ -483,7 +541,11 @@ function refreshActiveSession(session: Session, stage: string): Session | null {
  * its next tick. Callers that care (e.g. the router's typing indicator)
  * can branch on the boolean.
  */
-export function wakeContainer(session: Session, priority: MemoryAdmissionPriority = 'interactive'): Promise<boolean> {
+export function wakeContainer(
+  session: Session,
+  priority: MemoryAdmissionPriority = 'interactive',
+  options: WakeContainerOptions = {},
+): Promise<boolean> {
   if (containerShutdownInProgress) {
     log.debug('Container wake ignored — host shutdown in progress', { sessionId: session.id });
     return Promise.resolve(false);
@@ -546,7 +608,12 @@ export function wakeContainer(session: Session, priority: MemoryAdmissionPriorit
     // The queued payload is what startReservedWake later resumes on, so it must
     // be the fresh row — not the caller's snapshot — even though that row is
     // itself re-read again at dequeue.
-    const decision = admission.request(admitted.id, effectiveResources.memory.requestMb, admitted, priority);
+    const decision = admission.request(
+      admitted.id,
+      effectiveResources.memory.requestMb,
+      { session: admitted, guard: options.guard },
+      priority,
+    );
     if (decision.status === 'rejected') {
       log.error('Container wake rejected — memory request exceeds host budget', {
         sessionId: admitted.id,
@@ -569,7 +636,7 @@ export function wakeContainer(session: Session, priority: MemoryAdmissionPriorit
       return false;
     }
 
-    return spawnReservedContainer(admitted);
+    return spawnReservedContainer(admitted, options.guard);
   });
 }
 
@@ -593,7 +660,8 @@ export function isContainerSpawnWorkgroupAllowed(
   return allowed.has(workgroupId);
 }
 
-function startReservedWake(session: Session): Promise<boolean> {
+function startReservedWake(queued: QueuedWake): Promise<boolean> {
+  const { session, guard } = queued;
   if (activeContainers.has(session.id)) return Promise.resolve(true);
   const existing = wakePromises.get(session.id);
   if (existing) return existing;
@@ -608,6 +676,19 @@ function startReservedWake(session: Session): Promise<boolean> {
       releaseMemoryReservation(session.id);
       return false;
     }
+    // The caller's own precondition, asked at the dequeue too. The queue wait
+    // is unbounded, and the session row being active again says nothing about
+    // whether the caller still wants this wake — a thread the operator closed
+    // while it queued, a destination revoked, a task cancelled.
+    const dequeueRefusal = wakeRefusalFrom(guard);
+    if (dequeueRefusal !== null) {
+      log.warn('Queued container wake refused by its guard at the dequeue', {
+        sessionId: session.id,
+        reason: dequeueRefusal,
+      });
+      releaseMemoryReservation(session.id);
+      return false;
+    }
     if (!(await checkStorageAdmission(dequeued, true))) {
       releaseMemoryReservation(dequeued.id);
       return false;
@@ -617,7 +698,7 @@ function startReservedWake(session: Session): Promise<boolean> {
       releaseMemoryReservation(dequeued.id);
       return false;
     }
-    return spawnReservedContainer(admitted);
+    return spawnReservedContainer(admitted, guard);
   });
 }
 
@@ -671,7 +752,7 @@ async function checkStorageAdmission(session: Session, queued: boolean): Promise
   }
 }
 
-async function spawnReservedContainer(caller: Session): Promise<boolean> {
+async function spawnReservedContainer(caller: Session, guard?: WakeGuard): Promise<boolean> {
   if (containerShutdownInProgress) return false;
   // Entry re-read. Reached both straight off an admitted request and as the
   // memory-queue dequeue continuation; either way a reservation is held by now,
@@ -758,7 +839,15 @@ async function spawnReservedContainer(caller: Session): Promise<boolean> {
     // leave its traces on disk.
     const earlyCancellation = pendingKillCancellation(spawnSession.id);
     if (earlyCancellation) throw earlyCancellation;
-    await spawnContainer(spawnSession, storageActivity, spawnAgentGroup, spawnContainerConfig, spawnWorkgroupId);
+    // The caller's own precondition, asked here for the same reason and again
+    // as the last word before `spawn()`. `spawnContainer` builds mounts, writes
+    // a capabilities snapshot and clears the heartbeat file; a wake whose
+    // caller no longer wants it should not do that work or leave its traces.
+    const earlyGuardRefusal = wakeRefusalFrom(guard);
+    if (earlyGuardRefusal !== null) {
+      throw new Error(`Container spawn refused by its guard: ${earlyGuardRefusal}`);
+    }
+    await spawnContainer(spawnSession, storageActivity, spawnAgentGroup, spawnContainerConfig, spawnWorkgroupId, guard);
     storageActivity = null; // activeContainers owns it until process exit
     return true;
   } catch (err) {
@@ -873,6 +962,7 @@ async function spawnContainer(
   agentGroup: AgentGroup,
   containerConfig: ContainerConfig,
   admittedWorkgroupId: string,
+  guard?: WakeGuard,
 ): Promise<void> {
   // Refresh the destination map and current-thread routing so any admin
   // changes take effect on wake. Destinations come from the agent-to-agent
@@ -1150,6 +1240,15 @@ async function spawnContainer(
   // takes the ordinary running-container path. `trackWake` settles it either way.
   const lateCancellation = pendingKillCancellation(session.id);
   if (lateCancellation) throw lateCancellation;
+  // THE GUARD POINT. Everything above this line awaits — routing writes, the
+  // mailbox context, the dependency check, mount construction, argument
+  // construction — and the caller's precondition was last proved before all of
+  // it. This is the only place in the wake path where "still true?" and "the
+  // process now exists" are adjacent, so this is where the question belongs.
+  const guardRefusal = wakeRefusalFrom(guard);
+  if (guardRefusal !== null) {
+    throw new Error(`Container spawn refused by its guard: ${guardRefusal}`);
+  }
   const container = spawn(CONTAINER_RUNTIME_BIN, args, { stdio: ['ignore', 'pipe', 'pipe'] });
 
   activeContainers.set(session.id, {

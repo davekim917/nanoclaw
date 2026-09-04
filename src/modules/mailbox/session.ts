@@ -78,6 +78,33 @@ export async function withExistingNanoclawOutbound<T>(
   sessionId: string,
   action: (outbound: NanoclawOutboundSession) => T,
 ): Promise<T | undefined> {
+  return withExistingNanoclawOutboundSync(agentGroupId, sessionId, action);
+}
+
+/**
+ * The same funnel, without the promise.
+ *
+ * The body above never awaited anything: `action` returns `T`, better-sqlite3
+ * is synchronous, and the `async` keyword was conformance with the mailbox
+ * interface rather than a statement about the work. That distinction stops
+ * being cosmetic the moment a caller needs SEVERAL sessions' outbound state as
+ * of ONE instant.
+ *
+ * A `Promise.all` fan-out cannot give that. Each read resolves at its own
+ * moment, so by the time the last one lands the first is already history — and
+ * for thread-close, "history" is a container that has since taken new work and
+ * cleared its proposal. Deciding from that set kills a working agent. Called in
+ * a loop with nothing awaited between the calls and the decision, this gives
+ * the one instant the decision needs.
+ *
+ * Same existence rule, same typed ops, same fault behavior as the async form —
+ * it IS the async form's body, so the two cannot drift.
+ */
+export function withExistingNanoclawOutboundSync<T>(
+  agentGroupId: string,
+  sessionId: string,
+  action: (outbound: NanoclawOutboundSession) => T,
+): T | undefined {
   const outboundPath = sessionMailboxPath({ agentGroupId, sessionId }, 'outbound');
   if (sessionDbPathIsGone(outboundPath)) return undefined;
   let readable: Database.Database | undefined;

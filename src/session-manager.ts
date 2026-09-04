@@ -904,12 +904,61 @@ export async function sessionMessageExists(
   );
 }
 
+/**
+ * A caller's precondition, handed to the WRITER so the writer can prove it.
+ *
+ * `true` proceeds; `false` or `{ ok: false, reason }` refuses and nothing is
+ * written. Must be synchronous — that is the entire point. The writer calls it
+ * inside the mailbox action, after every await it performs, with no await
+ * between the call and the insert. An async guard would reintroduce exactly the
+ * window it exists to close.
+ */
+export type WriteGuardResult = boolean | { ok: false; reason: string };
+export type WriteGuard = () => WriteGuardResult;
+
+export interface WriteSessionMessageOptions {
+  /**
+   * Re-proved by the writer immediately before the insert.
+   *
+   * Callers used to prove their preconditions themselves and then call this
+   * function, which awaits — `acquireStorageActivityLease`, the reclaim-journal
+   * import, both mailbox funnels — before the row lands. Every one of those is
+   * a window in which the proof goes stale, and no amount of care at the call
+   * site can close a window inside the callee. So the proof moves to where the
+   * write is.
+   */
+  guard?: WriteGuard;
+}
+
+/** Thrown when a write's guard refuses at the last instant. No row is written. */
+export class SessionWriteRefusedError extends Error {
+  constructor(readonly reason: string) {
+    super(`session write refused: ${reason}`);
+    this.name = 'SessionWriteRefusedError';
+  }
+}
+
+/**
+ * Evaluate a guard and normalize its answer.
+ *
+ * Called ONLY from inside the mailbox action, with nothing awaited between here
+ * and the insert.
+ */
+function refusalFrom(guard: WriteGuard | undefined): string | null {
+  if (!guard) return null;
+  const verdict = guard();
+  if (verdict === true) return null;
+  if (verdict === false) return 'guard refused';
+  return verdict.reason;
+}
+
 export async function writeSessionMessage(
   agentGroupId: string,
   sessionId: string,
   message: SessionMessageInput,
+  options: WriteSessionMessageOptions = {},
 ): Promise<void> {
-  await writeSessionMessageInternal(agentGroupId, sessionId, message, false);
+  await writeSessionMessageInternal(agentGroupId, sessionId, message, false, options.guard);
 }
 
 /** Idempotent channel-ingress variant; false means this platform id was already routed. */
@@ -917,8 +966,9 @@ export async function writeSessionMessageIfNew(
   agentGroupId: string,
   sessionId: string,
   message: SessionMessageInput,
+  options: WriteSessionMessageOptions = {},
 ): Promise<boolean> {
-  return writeSessionMessageInternal(agentGroupId, sessionId, message, true);
+  return writeSessionMessageInternal(agentGroupId, sessionId, message, true, options.guard);
 }
 
 async function writeSessionMessageInternal(
@@ -926,6 +976,7 @@ async function writeSessionMessageInternal(
   sessionId: string,
   message: SessionMessageInput,
   ignoreDuplicateId: boolean,
+  guard?: WriteGuard,
 ): Promise<boolean> {
   // A session mid-archival is about to lose its directory. Re-provisioning it
   // below would resurrect the dir seconds before the reclaim removes it, and
@@ -953,7 +1004,7 @@ async function writeSessionMessageInternal(
   // see its claim and wait for it to finish.
   const lease = await acquireStorageActivityLease(sessionDir(agentGroupId, sessionId), `inbound-${sessionId}`);
   try {
-    return await writeSessionMessageLocked(agentGroupId, sessionId, message, ignoreDuplicateId);
+    return await writeSessionMessageLocked(agentGroupId, sessionId, message, ignoreDuplicateId, guard);
   } finally {
     await lease.release();
   }
@@ -964,6 +1015,7 @@ async function writeSessionMessageLocked(
   sessionId: string,
   message: SessionMessageInput,
   ignoreDuplicateId: boolean,
+  guard?: WriteGuard,
 ): Promise<boolean> {
   // Waiting for the claim above can mean waiting out a reclaim that archived
   // and deleted this session while we queued. Re-provisioning it here would
@@ -1077,7 +1129,19 @@ async function writeSessionMessageLocked(
   // same-key nesting. Every host caller was audited for this in the ingress
   // batch; delivery action handlers in particular run with no session open
   // (plan §4.5b, invariant I-9).
+  // THE GUARD POINT. Inside the mailbox action, after every await this function
+  // performs — the storage-activity lease, the reclaim-journal import, the
+  // funnel's own open — and with nothing awaited between it and the insert
+  // below. A caller's precondition proved out here is proved at the instant the
+  // row lands, which is the only instant that matters.
+  //
+  // The refusal is carried out rather than thrown from inside the action: the
+  // mailbox session should close normally, and the caller's error is raised
+  // once, after it does.
+  let refusedReason: string | null = null;
   const insert = (mailbox: NanoclawMailboxSession): boolean => {
+    refusedReason = refusalFrom(guard);
+    if (refusedReason !== null) return false;
     const recallRow = isScheduledTask ? null : buildRecallRow(agentGroupId, sessionId, message, content, mailbox);
     if (ignoreDuplicateId) return mailbox.insertMessageWithContextIfNew(row, recallRow);
     mailbox.insertMessageWithContext(row, recallRow);
@@ -1086,6 +1150,20 @@ async function writeSessionMessageLocked(
   const inserted =
     (await withExistingMailboxSession(agentGroupId, sessionId, insert)) ??
     (await withMailboxSession(agentGroupId, sessionId, insert));
+
+  // A refusal is loud. `void` has no room for a result, and a silent return
+  // would let a caller that forgets to check believe it wrote — the dangerous
+  // default. Every existing caller already treats a failed write as an
+  // exception, so this composes with what they do today.
+  if (refusedReason !== null) {
+    log.warn('Session write refused by its guard at the insert', {
+      agentGroupId,
+      sessionId,
+      messageId: message.id,
+      reason: refusedReason,
+    });
+    throw new SessionWriteRefusedError(refusedReason);
+  }
 
   if (!inserted) {
     log.debug('Duplicate inbound message ignored', { agentGroupId, sessionId, messageId: message.id });

@@ -59,6 +59,7 @@ import {
   writeOutboundDirect,
   writeSessionMessage,
   writeSessionMessageIfNew,
+  SessionWriteRefusedError,
   isAdmissiblePreTurnTrigger,
   reconcilePendingUpgradeContexts,
 } from './session-manager.js';
@@ -1995,6 +1996,109 @@ describe('the shared-transcript migration is gone', () => {
  * These assert the two halves of the lease contract that closes it. Both fail
  * against the pre-fix writer, which took no lease and re-checked nothing.
  */
+/**
+ * The writer's own guard.
+ *
+ * Callers used to prove their preconditions and then call `writeSessionMessage`,
+ * which awaits — a storage-activity lease, a reclaim-journal import, the mailbox
+ * funnel — before the row lands. Every one of those is a window where the proof
+ * goes stale, and nothing a caller does can close a window inside the callee.
+ * So the proof is handed to the writer, which evaluates it inside the mailbox
+ * action with nothing awaited between the answer and the insert.
+ */
+describe('writeSessionMessage evaluates its caller guard at the insert', () => {
+  const GUARD_SESS = 'sess-guard';
+
+  beforeEach(() => {
+    fs.rmSync(sessionDir(AG, GUARD_SESS), { recursive: true, force: true });
+    const db = initTestDb();
+    runMigrations(db);
+    createAgentGroup({
+      id: AG,
+      name: 'Guard',
+      folder: 'guard',
+      agent_provider: null,
+      created_at: new Date().toISOString(),
+    });
+    createSession({
+      id: GUARD_SESS,
+      agent_group_id: AG,
+      messaging_group_id: null,
+      thread_id: null,
+      agent_provider: null,
+      status: 'active',
+      container_status: 'stopped',
+      last_active: null,
+      created_at: new Date().toISOString(),
+    });
+    initSessionFolder(AG, GUARD_SESS);
+  });
+
+  afterEach(() => {
+    fs.rmSync(sessionDir(AG, GUARD_SESS), { recursive: true, force: true });
+    closeDb();
+  });
+
+  function rowIds(): string[] {
+    const db = new Database(inboundDbPath(AG, GUARD_SESS), { readonly: true });
+    try {
+      return (db.prepare('SELECT id FROM messages_in').all() as Array<{ id: string }>).map((r) => r.id);
+    } finally {
+      db.close();
+    }
+  }
+
+  const message = (id: string) => ({
+    id,
+    kind: 'chat',
+    timestamp: new Date().toISOString(),
+    platformId: 'slack:C1',
+    channelType: 'slack',
+    threadId: null,
+    content: JSON.stringify({ text: 'hello' }),
+  });
+
+  it('writes when the guard still holds', async () => {
+    await writeSessionMessage(AG, GUARD_SESS, message('guard-ok'), { guard: () => true });
+    expect(rowIds()).toContain('guard-ok');
+  });
+
+  /**
+   * The interleave the caller could not see: the precondition holds when
+   * `writeSessionMessage` is CALLED and fails by the time the row would land.
+   * The guard is only ever asked once, inside the action, so flipping it after
+   * the call proves the writer asks it late rather than early.
+   */
+  it('writes nothing when the guard fails during its own awaits', async () => {
+    const state = { authorized: true };
+    const write = writeSessionMessage(AG, GUARD_SESS, message('guard-revoked'), {
+      guard: () => (state.authorized ? true : { ok: false, reason: 'destination revoked' }),
+    });
+    // Revoked while the writer is between its entry and its insert. Everything
+    // it awaits happens after this line and before the guard runs.
+    state.authorized = false;
+
+    await expect(write).rejects.toThrow(SessionWriteRefusedError);
+    expect(rowIds()).not.toContain('guard-revoked');
+  });
+
+  it('treats a bare false as a refusal, and writes nothing', async () => {
+    await expect(writeSessionMessage(AG, GUARD_SESS, message('guard-false'), { guard: () => false })).rejects.toThrow(
+      SessionWriteRefusedError,
+    );
+    expect(rowIds()).not.toContain('guard-false');
+  });
+
+  it('refuses the idempotent variant the same way', async () => {
+    await expect(
+      writeSessionMessageIfNew(AG, GUARD_SESS, message('guard-ifnew'), {
+        guard: () => ({ ok: false, reason: 'no longer wired' }),
+      }),
+    ).rejects.toThrow(/no longer wired/);
+    expect(rowIds()).not.toContain('guard-ifnew');
+  });
+});
+
 describe('writeSessionMessage does not race an in-flight session archival', () => {
   // `CLEANUP_CLAIM` in storage-activity.ts. Written directly because the
   // reaper's own helper holds it only for a synchronous callback, and this

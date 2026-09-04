@@ -1631,7 +1631,9 @@ describe('wakeContainer re-reads the session after every admission await', () =>
     await expect(wakeContainer(callerSnapshot('sess-queued'))).resolves.toBe(false);
     // Queued holding no reservation, on the row as it looked when it queued.
     expect(memoryStub.queuedPayloads).toHaveLength(1);
-    expect((memoryStub.queuedPayloads[0] as Session).status).toBe('active');
+    // The queue carries the session AND the caller's guard, so a wake that
+    // waits an arbitrarily long time resumes with its precondition intact.
+    expect((memoryStub.queuedPayloads[0] as { session: Session }).session.status).toBe('active');
 
     // The wait in the queue is unbounded; the reclaim lands inside it.
     archive('sess-queued');
@@ -1779,6 +1781,72 @@ describe('killContainer against a session that is still spawning', () => {
         .mock.calls.filter((call) => String(call[0]).startsWith('Container kill deferred'))
         .map((call) => call[1] as { sessionId: string; reason: string }),
     ).toEqual([{ sessionId: 'sess-deferred', reason: 'thread close' }]);
+  });
+
+  /**
+   * The wake path's own guard.
+   *
+   * A caller proving its precondition and THEN calling `wakeContainer` proves it
+   * before storage admission, before an unbounded wait in the memory queue, and
+   * before all of `spawnContainer`'s preparation. The guard is asked where the
+   * process is created instead, and again at the dequeue, so a wake that queues
+   * for minutes cannot resume on a precondition nobody has re-asked.
+   */
+  it('refuses the spawn when the caller guard fails, without leaving a container', async () => {
+    seedSession('sess-guarded');
+
+    const asked: number[] = [];
+    await expect(
+      wakeContainer(callerSnapshot('sess-guarded'), 'interactive', {
+        guard: () => {
+          asked.push(1);
+          return { ok: false, reason: 'thread was closed while this wake queued' };
+        },
+      }),
+    ).resolves.toBe(false);
+
+    // Asked at least once, and no container survived the refusal.
+    expect(asked.length).toBeGreaterThan(0);
+    expect(isContainerRunning('sess-guarded')).toBe(false);
+    expect(
+      vi
+        .mocked(log.warn)
+        .mock.calls.filter((call) => String(call[0]).startsWith('wakeContainer failed'))
+        .map((call) => String((call[1] as { err?: unknown }).err)),
+    ).toEqual(['Error: Container spawn refused by its guard: thread was closed while this wake queued']);
+  });
+
+  it('carries the guard through the memory queue and asks it again at the dequeue', async () => {
+    seedSession('sess-queued-guard');
+    seedSession('sess-releaser');
+
+    const state = { wanted: true };
+    memoryStub.queueNext.add('sess-queued-guard');
+    await expect(
+      wakeContainer(callerSnapshot('sess-queued-guard'), 'interactive', {
+        guard: () => (state.wanted ? true : { ok: false, reason: 'no longer wanted' }),
+      }),
+    ).resolves.toBe(false);
+    expect(memoryStub.queuedPayloads).toHaveLength(1);
+
+    // The wait in the queue is unbounded; the caller's reason to wake expires
+    // inside it. Nothing re-reads the session row here — it is still active —
+    // so only the caller's own guard can see this.
+    state.wanted = false;
+    vi.mocked(log.warn).mockClear();
+
+    // Any release drains the queue and resumes the queued wake.
+    await expect(wakeContainer(callerSnapshot('sess-releaser'))).resolves.toBe(false);
+    await Promise.resolve();
+
+    expect(
+      vi
+        .mocked(log.warn)
+        .mock.calls.filter((call) => String(call[0]).startsWith('Queued container wake refused'))
+        .map((call) => call[1] as { sessionId: string; reason: string }),
+    ).toEqual([{ sessionId: 'sess-queued-guard', reason: 'no longer wanted' }]);
+    // And the reservation it was admitted into is handed back, not leaked.
+    expect(memoryStub.releasedIds).toContain('sess-queued-guard');
   });
 
   it('still does nothing for a session that is neither running nor spawning', async () => {
