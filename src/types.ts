@@ -49,6 +49,16 @@ export interface MessagingGroup {
    */
   instance?: string;
   name: string | null;
+  /**
+   * Provenance of `name`, as `"<platform>:<source>"` (e.g. `slack:classified`).
+   * Decides whether a later metadata refresh is allowed to overwrite the name
+   * — see `resolveChannelMetadataUpdates` (main.ts) and migration 069.
+   *
+   * Optional on the TS type per the `denied_at` / `instance` convention so
+   * fixtures that build MessagingGroup objects don't need updating; NULL means
+   * "unknown", which is read as an adapter-sourced name.
+   */
+  name_source?: string | null;
   is_group: number; // 0 | 1
   unknown_sender_policy: UnknownSenderPolicy;
   /**

@@ -6,74 +6,156 @@ import { describe, expect, it, vi } from 'vitest';
 
 import { isDirectExecution, resolveChannelMetadataUpdates, runWorkgroupMemoryStartupGate } from './main.js';
 
-// Codex review (PR #251): reportChannelMetadata's one-shot legacy channel-
-// metadata lookup (chat-sdk-bridge.ts) races the unwired-channel approval
-// flow's own, richer name classification (channel-approval.ts) on the same
-// first inbound event, with no ordering guarantee between the two writers.
-// This callback fires at most once per channel per process, so "never
-// overwrite an existing name" loses that race safely — but only while the
-// channel is unwired, which is the only state requestChannelApproval (the
-// gate that runs channel-approval.ts's classifier) ever fires for. Once
-// wired, that second writer is gone, so a rename must still propagate on
-// each host restart's one-shot re-fetch — round 5 finding on this file.
+// PR #251, rounds 5-7 all landed on this seam. The settled rule is a single
+// invariant, and it is about PROVENANCE, not about what any name looks like:
 //
-// Round 6: the wired-refresh path reopened a second issue. For a Slack MPIM,
-// reportChannelMetadata's generic fetch always returns Slack's own internal
-// `mpdm-alice--bob--carol-1` slug, never the participant-roster name
-// channel-approval.ts classified once at wiring time — so refreshing on any
-// differing name clobbered that human-readable name back to noise on every
-// host restart. SLACK_MPIM_SLUG_RE excludes that shape from both branches.
+//   a persisted channel name is only overwritten by a refresh from the same
+//   platform whose name source is at least as well informed as the source that
+//   produced the stored value — or when the name slot is empty.
+//
+// Two sources exist. `adapter` is the raw per-channel fetch
+// (reportChannelMetadata, chat-sdk-bridge.ts), which reports whatever string
+// the platform hangs on the conversation. `classified` is the classification
+// seam (resolveConversation / resolveChannelName), which can enrich that — a
+// Slack MPDM's platform name is an internal `mpdm-a--b--c-1` slug, and the
+// classifier replaces it with the participant roster. `onMetadata` is always
+// an `adapter` refresh, so it can never take a classified name back. No slug
+// pattern, no per-platform exception, and no wiring test: provenance settles
+// the writer race in the same direction whichever round trip returns first.
+const ADAPTER = { platform: 'slack', source: 'adapter' } as const;
+const CLASSIFIED = { platform: 'slack', source: 'classified' } as const;
+
 describe('resolveChannelMetadataUpdates', () => {
-  it('sets the name only when the messaging group has none yet (unwired)', () => {
-    expect(resolveChannelMetadataUpdates({ name: null, is_group: 0 }, 'General', undefined, false)).toEqual({
-      name: 'General',
-    });
-  });
-
-  it('never overwrites an already-set name while unwired, even a differing one', () => {
+  it('accepts any source into an empty name slot', () => {
     expect(
       resolveChannelMetadataUpdates(
-        { name: 'Group DM: Alice and Bob', is_group: 1 },
-        'renamed-elsewhere',
+        { name: null, name_source: null, channel_type: 'slack', is_group: 0 },
+        'General',
         undefined,
-        false,
+        ADAPTER,
       ),
-    ).toEqual({});
+    ).toEqual({ name: 'General', name_source: 'slack:adapter' });
   });
 
-  it('refreshes a differing name once the channel is wired — no race left to protect', () => {
-    expect(
-      resolveChannelMetadataUpdates({ name: 'old-channel-name', is_group: 0 }, 'renamed-channel', undefined, true),
-    ).toEqual({ name: 'renamed-channel' });
-  });
-
-  it('leaves a matching wired name alone', () => {
-    expect(resolveChannelMetadataUpdates({ name: 'Existing', is_group: 0 }, 'Existing', undefined, true)).toEqual({});
-  });
-
-  it('never treats a Slack MPIM slug as a real name, wired or not', () => {
+  it('ignores an adapter refresh over a classified name', () => {
     expect(
       resolveChannelMetadataUpdates(
-        { name: 'Group DM: Alice and Bob', is_group: 1 },
+        { name: 'Group DM: Alice and Bob', name_source: 'slack:classified', channel_type: 'slack', is_group: 1 },
         'mpdm-alice--bob-1',
         undefined,
-        true,
+        ADAPTER,
       ),
     ).toEqual({});
-    expect(resolveChannelMetadataUpdates({ name: null, is_group: 1 }, 'mpdm-alice--bob-1', undefined, false)).toEqual(
-      {},
-    );
+  });
+
+  it('lets a classified refresh replace an adapter name', () => {
+    expect(
+      resolveChannelMetadataUpdates(
+        { name: 'mpdm-alice--bob-1', name_source: 'slack:adapter', channel_type: 'slack', is_group: 1 },
+        'Group DM: Alice and Bob',
+        undefined,
+        CLASSIFIED,
+      ),
+    ).toEqual({ name: 'Group DM: Alice and Bob', name_source: 'slack:classified' });
+  });
+
+  it('refreshes an adapter name from the same adapter source — renames still propagate', () => {
+    expect(
+      resolveChannelMetadataUpdates(
+        { name: 'old-channel-name', name_source: 'slack:adapter', channel_type: 'slack', is_group: 0 },
+        'renamed-channel',
+        undefined,
+        ADAPTER,
+      ),
+    ).toEqual({ name: 'renamed-channel', name_source: 'slack:adapter' });
+  });
+
+  it('refreshes a name whose stored slug matches the pattern the old exception used to catch', () => {
+    // The deleted SLACK_MPIM_SLUG_RE keyed off the name's SHAPE, so any
+    // platform whose names happen to look like `mpdm-…-1` lost its refresh.
+    // Provenance never looks at the string.
+    expect(
+      resolveChannelMetadataUpdates(
+        { name: 'mpdm-legacy-1', name_source: 'discord:adapter', channel_type: 'discord', is_group: 1 },
+        'mpdm-legacy-2',
+        undefined,
+        { platform: 'discord', source: 'adapter' },
+      ),
+    ).toEqual({ name: 'mpdm-legacy-2', name_source: 'discord:adapter' });
+  });
+
+  it('refuses a refresh whose platform differs from the stored name provenance', () => {
+    expect(
+      resolveChannelMetadataUpdates(
+        { name: '#general', name_source: 'slack:adapter', channel_type: 'slack', is_group: 0 },
+        'general',
+        undefined,
+        { platform: 'discord', source: 'classified' },
+      ),
+    ).toEqual({});
+  });
+
+  it('reads a pre-migration-069 row (no provenance) as an adapter name', () => {
+    // Behavior-preserving for rows written before the column existed: the raw
+    // fetch overwrote them then, and still does.
+    expect(
+      resolveChannelMetadataUpdates(
+        { name: 'legacy', name_source: null, channel_type: 'slack', is_group: 0 },
+        'legacy-renamed',
+        undefined,
+        ADAPTER,
+      ),
+    ).toEqual({ name: 'legacy-renamed', name_source: 'slack:adapter' });
+    // …and a classified write still outranks it.
+    expect(
+      resolveChannelMetadataUpdates(
+        { name: 'legacy', channel_type: 'slack', is_group: 0 },
+        'Group DM: Alice and Bob',
+        undefined,
+        CLASSIFIED,
+      ),
+    ).toEqual({ name: 'Group DM: Alice and Bob', name_source: 'slack:classified' });
+  });
+
+  it('leaves a matching name alone whatever the provenance', () => {
+    expect(
+      resolveChannelMetadataUpdates(
+        { name: 'Existing', name_source: 'slack:adapter', channel_type: 'slack', is_group: 0 },
+        'Existing',
+        undefined,
+        ADAPTER,
+      ),
+    ).toEqual({});
   });
 
   it('still updates is_group independently of the name decision', () => {
-    expect(resolveChannelMetadataUpdates({ name: 'Existing', is_group: 0 }, 'Existing', true, true)).toEqual({
-      is_group: 1,
-    });
+    expect(
+      resolveChannelMetadataUpdates(
+        { name: 'Group DM: Alice and Bob', name_source: 'slack:classified', channel_type: 'slack', is_group: 0 },
+        'mpdm-alice--bob-1',
+        true,
+        ADAPTER,
+      ),
+    ).toEqual({ is_group: 1 });
   });
 
   it('returns an empty object when nothing changed', () => {
-    expect(resolveChannelMetadataUpdates({ name: 'Existing', is_group: 1 }, 'Existing', true, true)).toEqual({});
-    expect(resolveChannelMetadataUpdates({ name: 'Existing', is_group: 1 }, undefined, undefined, true)).toEqual({});
+    expect(
+      resolveChannelMetadataUpdates(
+        { name: 'Existing', name_source: 'slack:adapter', channel_type: 'slack', is_group: 1 },
+        'Existing',
+        true,
+        ADAPTER,
+      ),
+    ).toEqual({});
+    expect(
+      resolveChannelMetadataUpdates(
+        { name: 'Existing', name_source: 'slack:adapter', channel_type: 'slack', is_group: 1 },
+        undefined,
+        undefined,
+        ADAPTER,
+      ),
+    ).toEqual({});
   });
 });
 

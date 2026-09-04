@@ -18,7 +18,13 @@ import { migrateGroupsToClaudeLocal } from './claude-md-compose.js';
 import { initDb } from './db/connection.js';
 import { runMigrations } from './db/migrations/index.js';
 import { registerSecretsFromEnv } from './secret-scrubber.js';
-import { getMessagingGroupAgents, getMessagingGroupByPlatform, updateMessagingGroup } from './db/messaging-groups.js';
+import {
+  channelNameProvenance,
+  channelNameProvenanceAccepts,
+  getMessagingGroupByPlatform,
+  updateMessagingGroup,
+} from './db/messaging-groups.js';
+import type { ChannelNameSource, MessagingGroupUpdates } from './db/messaging-groups.js';
 import { ensureContainerRuntimeRunning, cleanupOrphansStrict } from './container-runtime.js';
 import { warnActiveContainersOfShutdown, warnMarkedRunningSessionsOfStartup } from './host-restart-warn.js';
 import { resetPhantomContainerStatus } from './db/sessions.js';
@@ -158,54 +164,47 @@ export function runWorkgroupMemoryStartupGate(
 
 /**
  * Which fields `onMetadata`'s one-shot channel-metadata discovery should
- * persist for a freshly-seen channel. `name` is set-once ONLY while the
- * channel is still unwired: `reportChannelMetadata` (chat-sdk-bridge.ts)
- * fires this at most once per channel per process and races the
- * unwired-channel approval flow (`requestChannelApproval`,
- * channel-approval.ts), which does its own (richer, e.g. group-DM
- * participant) name classification on the same first inbound event. Both
- * write to `messaging_groups.name` with no ordering guarantee between them —
- * this generic discovery losing that race to an already-set name is always
- * correct there, since the approval flow's answer is strictly more informed.
+ * persist for a channel it just saw.
  *
- * That race only exists while the channel is unwired: `requestChannelApproval`
- * only runs from the channel-request gate (router.ts), which only fires for
- * an mg with no agent groups wired. Once a channel is wired, channel-approval.ts
- * never classifies it again, so there's no second writer left to lose a race
- * to — `reportChannelMetadata`'s one-shot-per-process fetch is the only thing
- * touching `name`, and each host restart resets its per-process dedup set,
- * giving exactly one chance per restart to pick up a platform-side rename. A
- * set-once rule that ignores wiring status would silently freeze the name on
- * every established channel forever the moment it's approved. So: unwired →
- * set-once (protect the race); wired → refresh on change (no race to protect).
+ * `is_group` is a plain refresh — one boolean, one writer, nothing to lose.
  *
- * Wired refresh has one more trap: for a Slack MPIM, `reportChannelMetadata`'s
- * generic per-channel fetch (chat-sdk-bridge.ts) always returns Slack's own
- * internal slug (`mpdm-alice--bob--carol-1`, see the comment on
- * `resolveSlackConversation` in slack.ts) as `name` — it never has the
- * participant-roster lookup that produces a human-readable "Group DM: Alice
- * and Bob". That richer lookup runs once, at wiring time, in
- * channel-approval.ts, and never again. So treating the slug as a genuine
- * rename on the wired-refresh path would clobber the human name back to
- * noise on every host restart. `SLACK_MPIM_SLUG_RE` recognizes that shape and
- * is excluded from both branches — it was never a name worth persisting in
- * the unwired case either, just previously masked there by `!mg.name`.
+ * `name` is the interesting one, because two writers produce it and they are
+ * not equally informed. `reportChannelMetadata` (chat-sdk-bridge.ts) does a
+ * generic per-channel fetch and reports whatever raw string the platform hangs
+ * on the conversation. The classification seam (`resolveConversation` /
+ * `resolveChannelName`, run by the approval flow in channel-approval.ts and by
+ * the router's auto-wire) can enrich that: a Slack MPDM's platform-side name is
+ * an internal `mpdm-alice--bob--carol-1` slug, and the classifier replaces it
+ * with the participant roster a human would recognize. The raw fetch has no way
+ * to produce that answer and no way to know it is undoing one — which is why,
+ * before provenance, every host restart quietly overwrote the roster name with
+ * the slug again.
+ *
+ * So the decision is not made by looking at the name. It is made by comparing
+ * where the incoming value came from with where the stored value came from,
+ * via `channelNameProvenanceAccepts` (db/messaging-groups.ts), which owns the
+ * invariant and the ordering. `onMetadata` is always an `adapter`-sourced
+ * refresh on its own adapter's platform.
+ *
+ * Wiring status deliberately plays no part any more. The old rule ("unwired →
+ * set-once, wired → refresh") existed only to settle the race between these two
+ * writers on a channel's first inbound event; provenance settles it directly
+ * and in the same direction regardless of who wins the network round trip, so
+ * the wiring test is gone along with the `isWired` argument.
  */
-const SLACK_MPIM_SLUG_RE = /^mpdm-.+-\d+$/;
-
 export function resolveChannelMetadataUpdates(
-  mg: { name: string | null; is_group: number },
+  mg: { name: string | null; name_source?: string | null; channel_type: string; is_group: number },
   name: string | undefined,
   isGroup: boolean | undefined,
-  isWired: boolean,
-): Partial<{ name: string; is_group: number }> {
-  const updates: Partial<{ name: string; is_group: number }> = {};
-  if (name && !SLACK_MPIM_SLUG_RE.test(name)) {
-    if (isWired ? name !== mg.name : !mg.name) updates.name = name;
-  }
+  incoming: { platform: string; source: ChannelNameSource },
+): MessagingGroupUpdates {
+  const updates: { is_group?: number } = {};
   if (isGroup !== undefined) {
     const isGroupFlag = isGroup ? 1 : 0;
     if (mg.is_group !== isGroupFlag) updates.is_group = isGroupFlag;
+  }
+  if (name && name !== mg.name && channelNameProvenanceAccepts(mg, incoming)) {
+    return { ...updates, name, name_source: channelNameProvenance(incoming.platform, incoming.source) };
   }
   return updates;
 }
@@ -472,8 +471,10 @@ export async function main(): Promise<void> {
       onMetadata(platformId, name, isGroup) {
         const mg = getMessagingGroupByPlatform(adapter.channelType, platformId);
         if (!mg) return; // router hasn't auto-created it yet — next inbound will
-        const isWired = getMessagingGroupAgents(mg.id).length > 0;
-        const updates = resolveChannelMetadataUpdates(mg, name, isGroup, isWired);
+        const updates = resolveChannelMetadataUpdates(mg, name, isGroup, {
+          platform: adapter.channelType,
+          source: 'adapter',
+        });
         if (Object.keys(updates).length === 0) return;
         updateMessagingGroup(mg.id, updates);
         log.info('Channel metadata persisted', {

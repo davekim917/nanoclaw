@@ -26,6 +26,7 @@ import { getAgentGroup } from './db/agent-groups.js';
 import { getDeliveryAdapter } from './delivery.js';
 import { recordDroppedMessage } from './db/dropped-messages.js';
 import {
+  channelNameProvenance,
   createMessagingGroup,
   createMessagingGroupAgent,
   getMessagingGroupAgents,
@@ -659,7 +660,15 @@ async function routeInboundClaimed(event: InboundEvent, markReplayPending: () =>
         try {
           if (adapter?.resolveChannelName) {
             const name = await adapter.resolveChannelName(mg.platform_id);
-            if (name) updateMessagingGroup(mg.id, { name });
+            // `classified`, not `adapter`: this is the classification seam's
+            // answer, and it must outrank the generic metadata fetch that will
+            // report this same channel's raw platform name later.
+            if (name) {
+              updateMessagingGroup(mg.id, {
+                name,
+                name_source: channelNameProvenance(mg.channel_type, 'classified'),
+              });
+            }
           }
         } catch {
           /* non-critical — the wiring stands either way */

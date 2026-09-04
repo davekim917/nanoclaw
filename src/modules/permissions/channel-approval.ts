@@ -49,7 +49,7 @@ import { normalizeOptions, type NormalizedOption, type RawOption } from '../../c
 import { resolveWiringDefaults } from '../../channels/channel-defaults.js';
 import { createAgentGroup, getAgentGroup, getAgentGroupByFolder, getAllAgentGroups } from '../../db/agent-groups.js';
 import { getChannelAdapter } from '../../channels/channel-registry.js';
-import { getMessagingGroup, updateMessagingGroup } from '../../db/messaging-groups.js';
+import { channelNameProvenance, getMessagingGroup, updateMessagingGroup } from '../../db/messaging-groups.js';
 import { getDeliveryAdapter } from '../../delivery.js';
 import { initGroupFilesystem } from '../../group-init.js';
 import { log } from '../../log.js';
@@ -271,26 +271,39 @@ export async function requestChannelApproval(input: RequestChannelApprovalInput)
       // Written unconditionally (not gated on `!originMg.name`): this is the
       // first inbound event for a fresh, unwired mg, and `reportChannelMetadata`
       // (chat-sdk-bridge.ts, one-shot per channel per process) races this same
-      // event with its own, cruder name lookup — main.ts's `onMetadata` never
-      // overwrites a name once set, so whichever of the two writers runs
-      // second here always wins with the richer answer, instead of the
-      // outcome depending on which network round trip happened to finish
-      // first.
+      // event with its own, cruder name lookup. The `classified` stamp is what
+      // settles that race in one direction: it outranks the raw fetch's
+      // `adapter` stamp, so this answer wins whether it lands first or second,
+      // and the raw fetch cannot take it back on a later restart either.
+      //
+      // Rewritten when the NAME is new or when its PROVENANCE is: a name the
+      // raw fetch happened to get right still carries an `adapter` stamp, and
+      // leaving it there would let a later raw fetch overwrite an answer the
+      // classifier has since confirmed.
       const name = conversationDisplayName(conversation);
-      if (name && name !== originMg.name) {
-        updateMessagingGroup(originMg.id, { name });
+      const nameSource = channelNameProvenance(originMg.channel_type, 'classified');
+      if (name && (name !== originMg.name || originMg.name_source !== nameSource)) {
+        updateMessagingGroup(originMg.id, { name, name_source: nameSource });
         originMg.name = name;
+        originMg.name_source = nameSource;
       }
     } else if (!originMg.name && channelAdapter?.resolveChannelName) {
       // No rich classification available (adapter lacks the seam, or the
       // lookup failed) — fall back to the plain resolver. Set-once: an
       // adapter without the seam can't tell a stale legacy name from a good
       // one, so an already-set name is left alone here as before.
+      //
+      // Still stamped `classified`: `resolveChannelName` is the classification
+      // seam's other face (on Slack it is a projection of the same
+      // `resolveConversation`), so its answer must outrank the raw fetch for
+      // the same reason the branch above does.
       try {
         const name = await channelAdapter.resolveChannelName(originMg.platform_id);
         if (name) {
-          updateMessagingGroup(originMg.id, { name });
+          const nameSource = channelNameProvenance(originMg.channel_type, 'classified');
+          updateMessagingGroup(originMg.id, { name, name_source: nameSource });
           originMg.name = name;
+          originMg.name_source = nameSource;
         }
       } catch {
         /* non-critical */

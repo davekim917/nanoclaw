@@ -444,6 +444,23 @@ describe('resolveSlackConversation', () => {
     await expect(resolveSlackConversation(c, 'slack:G1')).resolves.toEqual({ type: 'group_dm', name: null });
   });
 
+  it('degrades a throwing roster lookup to a nameless group DM, not to an unclassified conversation', async () => {
+    // conversations.members THROWING (rate limit, transport error) used to
+    // escape to resolveSlackConversation's catch and return null for the whole
+    // conversation — discarding the one fact conversations.info already
+    // established, that this IS a group DM, and dropping the approval card to
+    // generic rendering. Same degradation as a members() call that returns
+    // ok:false.
+    const c = {
+      conversations: {
+        info: vi.fn().mockResolvedValue({ ok: true, channel: { is_mpim: true, name: 'mpdm-alice--bob-1' } }),
+        members: vi.fn().mockRejectedValue(new Error('ratelimited')),
+      },
+      users: { info: vi.fn() },
+    } as never;
+    await expect(resolveSlackConversation(c, 'slack:G1')).resolves.toEqual({ type: 'group_dm', name: null });
+  });
+
   it('returns null when the API cannot classify the conversation', async () => {
     await expect(resolveSlackConversation(client(undefined), 'slack:C1')).resolves.toBeNull();
     const throwing = {

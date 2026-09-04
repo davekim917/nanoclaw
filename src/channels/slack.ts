@@ -437,7 +437,14 @@ export async function resolveSlackConversation(
  *  Bots (including our own) and deactivated accounts are excluded. */
 async function resolveMpdmParticipants(client: SlackConversationClient, channelId: string): Promise<string[] | null> {
   if (!client.conversations.members || !client.users) return null;
-  const { ok, members } = await client.conversations.members({ channel: channelId, limit: 100 });
+  // Same `.catch()` the per-member `users.info` calls carry below: a transient
+  // roster failure must degrade to "group DM, no names", not escape to
+  // `resolveSlackConversation`'s catch — that returns null for the whole
+  // conversation, which loses the one fact we already know for certain (this
+  // IS a group DM) and drops the card back to generic rendering.
+  const { ok, members } = await client.conversations
+    .members({ channel: channelId, limit: 100 })
+    .catch(() => ({ ok: false }) as { ok?: boolean; members?: string[] });
   if (ok === false || !members || members.length === 0) return null;
   const users = await Promise.all(
     members.map((userId) => client.users!.info({ user: userId }).catch(() => ({ ok: false }) as { ok?: boolean })),
