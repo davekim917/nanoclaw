@@ -9,8 +9,10 @@ import {
   extractMigrationName,
   extractMigrationOrdinal,
   parseBreakingChangelogLines,
+  parseGitGrepNameLines,
   parseMergeTreeConflicts,
   parseNewMigrationFiles,
+  type ForkOrdinalMigrationFile,
   type NewMigration,
 } from './upstream-dry-run-report.js';
 
@@ -195,18 +197,43 @@ describe('parseNewMigrationFiles', () => {
   });
 });
 
+describe('parseGitGrepNameLines', () => {
+  it('parses tree-ish git grep output (ref:path:content) into a path -> name map', () => {
+    const output = [
+      "origin/main:src/db/migrations/001-initial.ts:  name: 'initial-v2-schema',",
+      "origin/main:src/db/migrations/012-channel-registration.ts:  name: 'channel-registration',",
+      // A non-name-field match on the same file (a type declaration) — must not overwrite the real name.
+      'origin/main:src/db/migrations/012-channel-registration.ts:    const cols = db.prepare("...") as Array<{ name: string }>;',
+      // Runtime reference, not a declaration — no quotes after `name:`, must be dropped.
+      "origin/main:src/db/migrations/index.ts:    log.info('Migration applied', { name: m.name });",
+      '',
+    ].join('\n');
+
+    const result = parseGitGrepNameLines(output, 'origin/main');
+    expect(result.get('src/db/migrations/001-initial.ts')).toBe('initial-v2-schema');
+    expect(result.get('src/db/migrations/012-channel-registration.ts')).toBe('channel-registration');
+    expect(result.has('src/db/migrations/index.ts')).toBe(false);
+  });
+
+  it('returns an empty map for empty input', () => {
+    expect(parseGitGrepNameLines('', 'origin/main').size).toBe(0);
+  });
+});
+
 describe('detectMigrationCollisions', () => {
-  const forkExistingFiles = [
-    'src/db/migrations/067-cli-request-executions.ts',
-    'src/db/migrations/068-sessions-sweep-quiet-until.ts',
-    'src/db/migrations/069-messaging-group-name-source.ts',
+  const forkOrdinalFiles: ForkOrdinalMigrationFile[] = [
+    { file: 'src/db/migrations/067-cli-request-executions.ts', ordinal: 67 },
+    { file: 'src/db/migrations/068-sessions-sweep-quiet-until.ts', ordinal: 68 },
+    { file: 'src/db/migrations/069-messaging-group-name-source.ts', ordinal: 69 },
   ];
+  const noForkNames = new Map<string, string>();
 
   it('flags an upstream ordinal that exactly matches an existing fork file', () => {
     const newMigrations: NewMigration[] = [
       { file: 'src/db/migrations/068-upstream-thing.ts', ordinal: 68, name: 'upstream-thing' },
     ];
-    const collisions = detectMigrationCollisions(newMigrations, forkExistingFiles, 70);
+    const { collisions, alreadyPorted } = detectMigrationCollisions(newMigrations, forkOrdinalFiles, noForkNames, 70);
+    expect(alreadyPorted).toEqual([]);
     expect(collisions).toHaveLength(1);
     expect(collisions[0]).toMatchObject({
       file: 'src/db/migrations/068-upstream-thing.ts',
@@ -219,14 +246,55 @@ describe('detectMigrationCollisions', () => {
     const newMigrations: NewMigration[] = [
       { file: 'src/db/migrations/070-upstream-thing.ts', ordinal: 70, name: 'upstream-thing' },
     ];
-    expect(detectMigrationCollisions(newMigrations, forkExistingFiles, 70)).toEqual([]);
+    expect(detectMigrationCollisions(newMigrations, forkOrdinalFiles, noForkNames, 70)).toEqual({
+      collisions: [],
+      alreadyPorted: [],
+    });
   });
 
   it('flags a below-next-free ordinal even with no exact fork file match', () => {
     const newMigrations: NewMigration[] = [{ file: 'src/db/migrations/050-gap.ts', ordinal: 50, name: 'gap' }];
-    const collisions = detectMigrationCollisions(newMigrations, forkExistingFiles, 70);
+    const { collisions } = detectMigrationCollisions(newMigrations, forkOrdinalFiles, noForkNames, 70);
     expect(collisions).toHaveLength(1);
     expect(collisions[0].collidesWithForkFile).toBe('(none — below next-free ordinal)');
+  });
+
+  it('recognizes a migration already ported under a different ordinal by name, not as a collision', () => {
+    // Real fork shape: upstream ships "021-pending-approvals-title-options.ts"
+    // but the fork already carries that exact migration name under a
+    // module-*.ts fixup file with no ordinal at all (sync-upstream skill's
+    // documented "upstream 021 == fork 045" case, generalized to a
+    // non-numbered fork file).
+    const forkNames = new Map([
+      ['pending-approvals-title-options', 'src/db/migrations/module-approvals-title-options.ts'],
+    ]);
+    const newMigrations: NewMigration[] = [
+      {
+        file: 'src/db/migrations/021-pending-approvals-title-options.ts',
+        ordinal: 21,
+        name: 'pending-approvals-title-options',
+      },
+    ];
+    const { collisions, alreadyPorted } = detectMigrationCollisions(newMigrations, forkOrdinalFiles, forkNames, 70);
+    expect(collisions).toEqual([]);
+    expect(alreadyPorted).toEqual([
+      {
+        file: 'src/db/migrations/021-pending-approvals-title-options.ts',
+        ordinal: 21,
+        name: 'pending-approvals-title-options',
+        forkFile: 'src/db/migrations/module-approvals-title-options.ts',
+      },
+    ]);
+  });
+
+  it('checks name before ordinal, so a same-name port at a colliding ordinal is reported as ported, not as a collision', () => {
+    const forkNames = new Map([['sessions-sweep-quiet-until', 'src/db/migrations/068-sessions-sweep-quiet-until.ts']]);
+    const newMigrations: NewMigration[] = [
+      { file: 'src/db/migrations/068-sessions-sweep-quiet-until.ts', ordinal: 68, name: 'sessions-sweep-quiet-until' },
+    ];
+    const { collisions, alreadyPorted } = detectMigrationCollisions(newMigrations, forkOrdinalFiles, forkNames, 70);
+    expect(collisions).toEqual([]);
+    expect(alreadyPorted).toHaveLength(1);
   });
 });
 
@@ -272,6 +340,7 @@ describe('buildReportMarkdown', () => {
           collidesWithForkFile: 'src/db/migrations/068-sessions-sweep-quiet-until.ts',
         },
       ],
+      alreadyPorted: [],
       forkNextFreeOrdinal: 70,
       breakingLines: ['- [BREAKING] Something changed'],
       ratchetSummary: null,
@@ -303,6 +372,7 @@ describe('buildReportMarkdown', () => {
       conflicts: parseMergeTreeConflicts(CLEAN_MERGE_TREE_FIXTURE),
       newMigrations: [],
       migrationCollisions: [],
+      alreadyPorted: [],
       forkNextFreeOrdinal: 70,
       breakingLines: [],
       ratchetSummary: 'ratchet: 3 offenders (down from 5)',
@@ -314,5 +384,38 @@ describe('buildReportMarkdown', () => {
     expect(md).toContain('ratchet: 3 offenders (down from 5)');
     expect(md).toContain('Merge-tree conflicts (0 total)');
     expect(md).toContain('None.');
+  });
+
+  it('marks an already-ported migration distinctly from a collision', () => {
+    const md = buildReportMarkdown({
+      base: 'abc123',
+      commitsBehind: 1,
+      commitsAhead: 1,
+      conflicts: parseMergeTreeConflicts(CLEAN_MERGE_TREE_FIXTURE),
+      newMigrations: [
+        {
+          file: 'src/db/migrations/021-pending-approvals-title-options.ts',
+          ordinal: 21,
+          name: 'pending-approvals-title-options',
+        },
+      ],
+      migrationCollisions: [],
+      alreadyPorted: [
+        {
+          file: 'src/db/migrations/021-pending-approvals-title-options.ts',
+          ordinal: 21,
+          name: 'pending-approvals-title-options',
+          forkFile: 'src/db/migrations/module-approvals-title-options.ts',
+        },
+      ],
+      forkNextFreeOrdinal: 70,
+      breakingLines: [],
+      ratchetSummary: null,
+      generatedAt: '2026-09-08T09:00:00.000Z',
+      timezone: 'UTC',
+    });
+
+    expect(md).toContain('already ported as `src/db/migrations/module-approvals-title-options.ts`');
+    expect(md).not.toContain('COLLISION');
   });
 });

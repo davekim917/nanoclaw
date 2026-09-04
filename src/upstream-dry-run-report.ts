@@ -47,6 +47,31 @@ export interface MigrationCollision {
   collidesWithForkFile: string;
 }
 
+/** A fork migration file that is ordinal-numbered: `{ordinal}-{slug}.ts`. */
+export interface ForkOrdinalMigrationFile {
+  file: string;
+  ordinal: number;
+}
+
+/**
+ * An upstream new migration whose `name:` already matches a fork migration
+ * (any fork migration file, ordinal-numbered or not — the migration runner
+ * dedupes by `name`, not file number, and this fork has same-name ports
+ * registered under a different ordinal, e.g. `module-*.ts` files). Not a
+ * collision: the migration is already present, nothing to renumber.
+ */
+export interface AlreadyPortedMigration {
+  file: string;
+  ordinal: number | null;
+  name: string;
+  forkFile: string;
+}
+
+export interface MigrationTriage {
+  collisions: MigrationCollision[];
+  alreadyPorted: AlreadyPortedMigration[];
+}
+
 /**
  * Classify a repo-relative path into one of the report's fixed buckets.
  * Order matters: agent-runner/src is checked before the generic src/
@@ -136,14 +161,16 @@ export function extractMigrationName(fileContent: string): string | null {
 }
 
 /**
- * Filter a `git diff --name-only --diff-filter=A <base>..upstream/main --
- * src/db/migrations/` listing down to migration source files (drop
- * .test.ts and non-.ts entries like index.ts helpers are left in — callers
- * pass file contents to extractMigrationName and get null for non-migration
- * files, which is filtered out below).
+ * Filter a newline-separated path listing down to ordinal-numbered
+ * migration source files — works on either `git diff --name-only
+ * --diff-filter=A <base>..<ref> -- src/db/migrations/` output (new files
+ * introduced by <ref>) or `git ls-tree -r --name-only <ref> --
+ * src/db/migrations/` output (every file present at <ref>): both are one
+ * path per line, and the filtering criteria (ordinal-numbered .ts, not
+ * .test.ts, not index.ts/module-*.ts) don't depend on which.
  */
-export function parseNewMigrationFiles(diffNameOnlyOutput: string): string[] {
-  return diffNameOnlyOutput
+export function parseNewMigrationFiles(pathListing: string): string[] {
+  return pathListing
     .split('\n')
     .map((line) => line.trim())
     .filter((line) => line.length > 0)
@@ -152,24 +179,69 @@ export function parseNewMigrationFiles(diffNameOnlyOutput: string): string[] {
 }
 
 /**
- * Cross-reference new upstream migration ordinals against the fork's next
- * free ordinal and its already-registered ordinals. A collision is an
- * upstream new-file ordinal that is < the fork's next-free ordinal (i.e.
- * it would overwrite/shadow an already-taken fork file number).
+ * Parse `git grep -e 'name:' <ref> -- 'src/db/migrations/*.ts'
+ * ':!src/db/migrations/*.test.ts'` output into a path -> registered
+ * migration name map. Tree-ish `git grep` output is `<ref>:<path>:<rest>`
+ * (vs. `<path>:<rest>` for a working-tree grep) — the `refPrefix` the
+ * caller passed as `<ref>` is stripped before splitting path from content.
+ * Lines whose content isn't a quoted `name:` field (a type declaration, a
+ * runtime `name: m.name` reference) yield no match via
+ * `extractMigrationName` and are silently dropped, including every line
+ * from non-migration files like index.ts that this deliberately
+ * unfiltered-by-ordinal pathspec still matches.
+ */
+export function parseGitGrepNameLines(grepOutput: string, refPrefix: string): Map<string, string> {
+  const namesByFile = new Map<string, string>();
+  const prefix = `${refPrefix}:`;
+  for (const rawLine of grepOutput.split('\n')) {
+    if (rawLine.length === 0) continue;
+    const line = rawLine.startsWith(prefix) ? rawLine.slice(prefix.length) : rawLine;
+    const separatorIndex = line.indexOf(':');
+    if (separatorIndex === -1) continue;
+    const filePath = line.slice(0, separatorIndex);
+    const rest = line.slice(separatorIndex + 1);
+    const name = extractMigrationName(rest);
+    if (name && !namesByFile.has(filePath)) namesByFile.set(filePath, name);
+  }
+  return namesByFile;
+}
+
+/**
+ * Cross-reference new upstream migrations against the fork's migrations,
+ * by name first and ordinal second — the migration runner dedupes by
+ * `name` (src/db/migrations/index.ts), not file number, so an ordinal-only
+ * check misclassifies a migration the fork already ported under a
+ * different number as a collision instead of recognizing it needs no
+ * action. Only once a migration's name doesn't match any fork migration
+ * is it checked against the fork's next free ordinal and already-taken
+ * ordinals — a collision there is an upstream new-file ordinal that is
+ * < the fork's next-free ordinal (it would overwrite/shadow an
+ * already-taken fork file number).
  */
 export function detectMigrationCollisions(
   newMigrations: NewMigration[],
-  forkExistingFiles: string[],
+  forkOrdinalFiles: ForkOrdinalMigrationFile[],
+  forkNamesByName: Map<string, string>,
   forkNextFreeOrdinal: number,
-): MigrationCollision[] {
+): MigrationTriage {
   const forkByOrdinal = new Map<number, string>();
-  for (const file of forkExistingFiles) {
-    const ordinal = extractMigrationOrdinal(file);
-    if (ordinal !== null) forkByOrdinal.set(ordinal, file);
-  }
+  for (const { file, ordinal } of forkOrdinalFiles) forkByOrdinal.set(ordinal, file);
 
   const collisions: MigrationCollision[] = [];
+  const alreadyPorted: AlreadyPortedMigration[] = [];
+
   for (const migration of newMigrations) {
+    const forkFile = migration.name !== null ? forkNamesByName.get(migration.name) : undefined;
+    if (forkFile) {
+      alreadyPorted.push({
+        file: migration.file,
+        ordinal: migration.ordinal,
+        name: migration.name as string,
+        forkFile,
+      });
+      continue;
+    }
+
     if (migration.ordinal === null) continue;
     const existing = forkByOrdinal.get(migration.ordinal);
     if (existing) {
@@ -191,7 +263,7 @@ export function detectMigrationCollisions(
       });
     }
   }
-  return collisions;
+  return { collisions, alreadyPorted };
 }
 
 /**
@@ -213,6 +285,7 @@ export interface DryRunReportData {
   conflicts: ConflictCounts;
   newMigrations: NewMigration[];
   migrationCollisions: MigrationCollision[];
+  alreadyPorted: AlreadyPortedMigration[];
   forkNextFreeOrdinal: number;
   breakingLines: string[];
   ratchetSummary: string | null;
@@ -268,10 +341,13 @@ export function buildReportMarkdown(data: DryRunReportData): string {
     lines.push('None.');
   } else {
     for (const migration of data.newMigrations) {
+      const ported = data.alreadyPorted.find((p) => p.file === migration.file);
       const collision = data.migrationCollisions.find((c) => c.file === migration.file);
-      const suffix = collision
-        ? ` — **COLLISION** with ${collision.collidesWithForkFile} (fork next free ordinal: ${data.forkNextFreeOrdinal})`
-        : '';
+      const suffix = ported
+        ? ` — already ported as \`${ported.forkFile}\` (same name; no ordinal action needed)`
+        : collision
+          ? ` — **COLLISION** with ${collision.collidesWithForkFile} (fork next free ordinal: ${data.forkNextFreeOrdinal})`
+          : '';
       lines.push(`- \`${migration.file}\` name: \`${migration.name ?? '(unparsed)'}\`${suffix}`);
     }
   }
@@ -311,17 +387,55 @@ function gitMergeTree(args: string[], cwd: string): string {
   }
 }
 
-/** Read the fork's next-free migration ordinal by walking src/db/migrations/. */
-function readForkMigrationFiles(repoRoot: string): string[] {
-  const dir = path.join(repoRoot, 'src', 'db', 'migrations');
-  return fs
-    .readdirSync(dir)
-    .filter((f) => /^\d+-.*\.ts$/.test(f) && !f.endsWith('.test.ts'))
-    .map((f) => `src/db/migrations/${f}`);
+/**
+ * `git grep` exits 1 (not an error — see `git help grep`) when nothing
+ * matches, e.g. src/db/migrations/ has no files at all at `ref`.
+ */
+function gitGrepAllowNoMatch(args: string[], cwd: string): string {
+  try {
+    return execFileSync('git', args, { cwd, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
+  } catch (err) {
+    const asExecErr = err as { status?: number; stdout?: string };
+    if (asExecErr.status === 1 && typeof asExecErr.stdout === 'string') return asExecErr.stdout;
+    throw err;
+  }
 }
 
-function forkNextFreeOrdinal(forkFiles: string[]): number {
-  const max = forkFiles.reduce((acc, f) => Math.max(acc, extractMigrationOrdinal(f) ?? -1), -1);
+/**
+ * The fork's ordinal-numbered migration files at `ref`, read from git
+ * (not the working tree) so the result matches whatever `ref` the report
+ * is actually comparing — a worktree checked out to a different branch
+ * must not leak checkout-only migrations into the ordinal/collision math.
+ * `git ls-tree` exits 0 with empty output for a path absent at `ref`, so
+ * no exit-code tolerance is needed here the way `git grep` needs one.
+ */
+function readForkOrdinalMigrationFiles(repoRoot: string, ref: string): ForkOrdinalMigrationFile[] {
+  const lsTreeOutput = git(['ls-tree', '-r', '--name-only', ref, '--', 'src/db/migrations/'], repoRoot);
+  return parseNewMigrationFiles(lsTreeOutput).map((file) => ({
+    file,
+    ordinal: extractMigrationOrdinal(file) as number,
+  }));
+}
+
+/**
+ * Every fork migration's registered name at `ref`, keyed by name — both
+ * ordinal-numbered files AND `module-*.ts` fixups, since a same-name port
+ * can land under either shape (sync-upstream skill: "upstream 021 == fork
+ * 045").
+ */
+function readForkMigrationNames(repoRoot: string, ref: string): Map<string, string> {
+  const grepOutput = gitGrepAllowNoMatch(
+    ['grep', '-e', 'name:', ref, '--', 'src/db/migrations/*.ts', ':!src/db/migrations/*.test.ts'],
+    repoRoot,
+  );
+  const nameByFile = parseGitGrepNameLines(grepOutput, ref);
+  const forkNamesByName = new Map<string, string>();
+  for (const [file, name] of nameByFile) forkNamesByName.set(name, file);
+  return forkNamesByName;
+}
+
+function forkNextFreeOrdinal(forkOrdinalFiles: ForkOrdinalMigrationFile[]): number {
+  const max = forkOrdinalFiles.reduce((acc, f) => Math.max(acc, f.ordinal), -1);
   return max + 1;
 }
 
@@ -340,6 +454,9 @@ export interface GenerateOptions {
  * `ours` defaults to `origin/main`, not `HEAD`: this script is documented
  * as safe to run from any worktree, and a feature-branch HEAD would report
  * that branch's ahead/behind and conflicts instead of the fork trunk's.
+ * `origin` is fetched alongside `upstream` for the same reason: a
+ * scheduled run against a live checkout that hasn't been `git pull`ed
+ * since the last deploy would otherwise silently report a stale trunk.
  */
 export function generateDryRunReport(opts: GenerateOptions): string {
   const { repoRoot } = opts;
@@ -347,6 +464,7 @@ export function generateDryRunReport(opts: GenerateOptions): string {
   const theirs = opts.theirs ?? 'upstream/main';
 
   git(['fetch', 'upstream', '--prune'], repoRoot);
+  git(['fetch', 'origin', '--prune'], repoRoot);
 
   const base = git(['merge-base', ours, theirs], repoRoot).trim();
   const commitsBehind = Number.parseInt(git(['rev-list', '--count', `${base}..${theirs}`], repoRoot).trim(), 10);
@@ -371,9 +489,15 @@ export function generateDryRunReport(opts: GenerateOptions): string {
     return { file, ordinal: extractMigrationOrdinal(file), name: extractMigrationName(content) };
   });
 
-  const forkFiles = readForkMigrationFiles(repoRoot);
-  const nextFree = forkNextFreeOrdinal(forkFiles);
-  const migrationCollisions = detectMigrationCollisions(newMigrations, forkFiles, nextFree);
+  const forkOrdinalFiles = readForkOrdinalMigrationFiles(repoRoot, ours);
+  const forkNamesByName = readForkMigrationNames(repoRoot, ours);
+  const nextFree = forkNextFreeOrdinal(forkOrdinalFiles);
+  const { collisions: migrationCollisions, alreadyPorted } = detectMigrationCollisions(
+    newMigrations,
+    forkOrdinalFiles,
+    forkNamesByName,
+    nextFree,
+  );
 
   const changelogDiff = git(['diff', `${base}..${theirs}`, '--', 'CHANGELOG.md'], repoRoot);
   const breakingLines = parseBreakingChangelogLines(changelogDiff);
@@ -383,16 +507,27 @@ export function generateDryRunReport(opts: GenerateOptions): string {
   try {
     const packageJson = JSON.parse(fs.readFileSync(packageJsonPath, 'utf8')) as { scripts?: Record<string, string> };
     if (packageJson.scripts && 'ratchet:report' in packageJson.scripts) {
-      const output = execFileSync('pnpm', ['run', 'ratchet:report'], {
-        cwd: repoRoot,
-        encoding: 'utf8',
-        maxBuffer: 16 * 1024 * 1024,
-      });
+      // Exit 1 means GROWTH or NEW findings (docs/upstream-ratchet.md) — the
+      // most informative case for a weekly report, not a failure to swallow.
+      // Exit 2 ("cannot measure" — pinned commit not fetched) and any other
+      // failure fall through to the catch below and skip the section.
+      let output: string;
+      try {
+        output = execFileSync('pnpm', ['run', 'ratchet:report'], {
+          cwd: repoRoot,
+          encoding: 'utf8',
+          maxBuffer: 16 * 1024 * 1024,
+        });
+      } catch (err) {
+        const asExecErr = err as { status?: number; stdout?: string };
+        if (asExecErr.status === 1 && typeof asExecErr.stdout === 'string') output = asExecErr.stdout;
+        else throw err;
+      }
       const nonEmptyLines = output.split('\n').filter((l) => l.trim().length > 0);
       ratchetSummary =
         nonEmptyLines.length > 0 ? nonEmptyLines[nonEmptyLines.length - 1] : '(ratchet:report produced no output)';
     }
-    // eslint-disable-next-line no-catch-all/no-catch-all -- package.json unreadable, or ratchet:report not present / itself failed: skip the section, per brief ("skip otherwise").
+    // eslint-disable-next-line no-catch-all/no-catch-all -- package.json unreadable, ratchet:report not present, or itself failed for a reason other than reporting GROWTH/NEW findings: skip the section, per brief ("skip otherwise").
   } catch {
     ratchetSummary = null;
   }
@@ -404,6 +539,7 @@ export function generateDryRunReport(opts: GenerateOptions): string {
     conflicts,
     newMigrations,
     migrationCollisions,
+    alreadyPorted,
     forkNextFreeOrdinal: nextFree,
     breakingLines,
     ratchetSummary,
