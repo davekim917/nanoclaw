@@ -328,9 +328,29 @@ function assertComplete(entries: readonly OpEntry[]): void {
         'before deciding, so a map with a hole reports a clean tree for the wrong reason.',
     );
   }
+  assertNoDuplicateKeys(entries);
+}
+
+/**
+ * No op may be contributed twice.
+ *
+ * A duplicate is not a parse failure — both entries are read correctly — but it
+ * makes the map ambiguous in a way the runtime resolves silently: the LAST
+ * property in the literal wins, so a spread and a later re-declaration of the
+ * same name produce one op with two definitions in the source. If they ever
+ * differ, this module's classification describes the one that does not run.
+ *
+ * That is not hypothetical. The re-declaration of `writeOutboundDirect` after
+ * `composeOutboundOps` was already spread was found by exactly this check, on
+ * its first run.
+ *
+ * Separate from `assertComplete`'s parity check so the grammar fixtures can
+ * drive it without a real composed session to compare against.
+ */
+function assertNoDuplicateKeys(entries: readonly OpEntry[]): void {
   const duplicates = entries.map((e) => e.key).filter((k, i, all) => all.indexOf(k) !== i);
   if (duplicates.length > 0) {
-    fail(`forkOps contributes [${[...new Set(duplicates)].join(', ')}] more than once — which spread wins?`);
+    fail(`the composition contributes [${[...new Set(duplicates)].join(', ')}] more than once — which spread wins?`);
   }
 }
 
@@ -442,6 +462,7 @@ export function outboundWriteOps(): Set<string> {
 export function _classifyCompositionForTesting(source: string, fnName: string): OpSides {
   const sf = ts.createSourceFile('fixture.ts', source, ts.ScriptTarget.Latest, true);
   const entries = literalEntries(sf, returnedLiteral(sf, fnName), [fnName]);
+  assertNoDuplicateKeys(entries);
   const inbound = new Set<string>();
   const outbound = new Set<string>();
   for (const { key, expr } of entries) {

@@ -467,6 +467,41 @@ describe('host outbound writes go through the stopped-container guard', () => {
       expect(() => _classifyCompositionForTesting(src, 'comp')).toThrow(/cannot resolve/);
     });
 
+    it('a DUPLICATE key THROWS — the runtime would silently keep the last one', () => {
+      // Both entries parse; the ambiguity is the problem. JavaScript keeps the
+      // LAST property, so a spread plus a later re-declaration of the same name
+      // gives one live op with two definitions in the source, and this module
+      // would describe whichever it happened to read. That is not hypothetical:
+      // this check found `forkOps` re-declaring `writeOutboundDirect` after
+      // already spreading `composeOutboundOps`.
+      const src = `
+        function inner(writableOutbound: never) {
+          return { sameName: () => writableOutbound() };
+        }
+        function comp(inbound: never, writableOutbound: never) {
+          return {
+            ...inner(writableOutbound),
+            sameName: () => inbound,
+          };
+        }`;
+      expect(() => _classifyCompositionForTesting(src, 'comp')).toThrow(/more than once/);
+    });
+
+    it('a GETTER throws — an accessor is not a classifiable op', () => {
+      // An accessor has no call expression to read handles from, and it would
+      // otherwise fall through the member switch and contribute nothing, which
+      // is the silent-omission shape this whole module exists to refuse.
+      const src = `
+        function comp(readableOutbound: never) {
+          return {
+            get sneaky() {
+              return readableOutbound();
+            },
+          };
+        }`;
+      expect(() => _classifyCompositionForTesting(src, 'comp')).toThrow(/unsupported member/);
+    });
+
     it('a spread cycle THROWS instead of recursing forever', () => {
       const src = `
         function a(inbound: never) {
