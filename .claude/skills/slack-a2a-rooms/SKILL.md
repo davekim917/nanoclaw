@@ -115,10 +115,23 @@ group. Each participating agent needs a wiring on **its own instance's** row:
 one room, one `messaging_groups` row per bot, because each bot sees the
 conversation under its own channelType.
 
-1. @-mention one of the bots in the room once. The host auto-creates that
-   bot's `messaging_groups` row and, on an install with auto-wire on, the
-   wiring too.
-2. Confirm what exists and fill in the rest:
+1. Create each bot's row for the channel the opener printed. This is
+   idempotent on `(channel_type, platform_id, instance)`, so a re-run returns
+   the existing row:
+
+   ```bash
+   ncl messaging-groups create --channel-type slack-<suffix> \
+     --platform-id <channel id> --is-group 1
+   ```
+
+   Do this per instance rather than relying on a mention to bootstrap it. The
+   host creates a row only for the instance an inbound event addresses, which
+   leaves out the bot that opened the room, and in a room with no human in it
+   leaves out every bot nobody mentions. Slack mints a new conversation when
+   an MPIM's membership changes, so a room opened without a human cannot have
+   one added later to fix it.
+
+2. Confirm what exists and wire each agent to its own row:
 
    ```bash
    ncl messaging-groups list --channel-type slack-<suffix> --json
@@ -162,7 +175,12 @@ needs its own mention, which makes bot-to-bot conversation mention-driven by
 design: agent A's reply reaches agent B when it @-mentions B, and the chain
 continues as long as each reply mentions the next speaker.
 
-To keep an agent engaged in a thread after the first mention, set sticky
+**Keep `mention` for a room with more than one agent.** It is the declared
+default, and it is what makes an exchange end: an agent stops being woken as
+soon as the previous speaker stops mentioning it, so the conversation converges
+on its own.
+
+To keep one agent engaged in a thread after the first mention, set sticky
 engagement on that wiring. Slack declares `threads: true` for groups, so
 `validateEngageAgainstChannel` keeps the mode rather than coercing it back:
 
@@ -170,9 +188,20 @@ engagement on that wiring. Slack declares `threads: true` for groups, so
 ncl wirings update --id <wiring id> --engage-mode mention-sticky
 ```
 
-The container skill's turn-taking rule follows whichever mode is set — it tells
-agents to answer the turn that woke them, so sticky rooms behave as configured
-without an instruction change.
+Sticky suits a room where one agent works a thread with a human. Applying it to
+two or more agents in the same room removes the thing that stops them. Once
+each has engaged once, `engaged_at` is set and `evaluateEngage` wakes every one
+of them on every later message in that thread, mention or not, so dropping the
+mentions no longer disengages anyone. What remains is the hop governor, and it
+is a backstop rather than a stopping rule: after `SLACK_MAX_BOT_HOPS`
+consecutive agent-to-agent turns with no human message (24 by default,
+`DEFAULT_MAX_BOT_HOPS` in `src/channels/slack-hop-limit.ts`) sibling traffic in
+that thread is dropped until a human speaks — by which point the thread holds
+two dozen turns nobody asked for and needs a human to restart it.
+
+The container skill carries the turn-taking rule for both modes: answer when
+addressed or when there is substantive new work, and otherwise take the wake
+silently.
 
 Slack does not emit `app_mention` for bot-authored messages, but mention
 detection still works on the message text. Note the direction of translation:
@@ -225,9 +254,12 @@ section covers it.
 - **Rooms never grow in place.** Slack mints a _new_ conversation when an MPIM's
   membership changes, so adding an agent later means opening a new room and
   wiring it. Open rooms complete where you can.
-- **Cross-host rooms.** The opener only handles tokens that live in this
-  host's `.env`. For sibling bots on a different NanoClaw host, run it where
-  the first bot's token lives and wire the room on the other host by hand.
+- **One host per room.** `resolveAuth` reads every instance's token from the
+  `.env` of the host it runs on and exits on the first one missing, so the
+  opener can only build a room out of bots configured on that host. There is no
+  supported path for a room spanning two NanoClaw hosts: it would need the
+  remote bots' user ids and their tokens, which is exactly what the opener
+  refuses to reach for.
 - **Edited bot messages.** Slack sends an edit as `message_changed`, which the
   adapter treats as an update rather than new inbound — an agent sees the
   original text, so ask a sibling to post a correction rather than edit.

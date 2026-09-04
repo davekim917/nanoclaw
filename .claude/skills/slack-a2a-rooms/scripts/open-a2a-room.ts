@@ -244,8 +244,17 @@ async function main(): Promise<void> {
   console.log('No .env change is needed — this fork admits sibling-bot messages everywhere.');
   console.log('');
   console.log('Next steps (once per room, per participating agent):');
-  console.log('  1. @-mention one bot in the room so the host auto-creates the messaging group.');
-  console.log('  2. Confirm the row and wire the other agents to it:');
+  console.log("  1. Create each instance's row for this channel. Idempotent — a re-run returns");
+  console.log('     the existing row. Every bot needs its OWN row; the host only auto-creates one');
+  console.log('     for an instance that is addressed, which never happens for the opener itself');
+  console.log('     and never happens at all in a room with no human in it:');
+  for (const auth of auths) {
+    console.log(
+      `       ncl messaging-groups create --channel-type ${channelTypeForInstance(auth.name)} \\\n` +
+        `         --platform-id ${channelId} --is-group 1`,
+    );
+  }
+  console.log('  2. Wire each agent to its own row:');
   for (const auth of auths) {
     console.log(`       ncl messaging-groups list --channel-type ${channelTypeForInstance(auth.name)} --json`);
   }

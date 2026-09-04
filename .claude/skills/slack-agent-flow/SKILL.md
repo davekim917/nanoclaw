@@ -133,21 +133,34 @@ the exact failure this step exists to prevent, usually noticed a day later. The
 select back is what catches it: the team should be listed, one row per agent.
 
 An agent that has already spawned is sitting in its own workgroup of one, and
-rehoming it is a data migration rather than a column edit. Its memory canon is
-a real directory at `data/workgroups/<its own folder>/memory`, reached through
-a `groups/<folder>/memory` symlink that points at the container path and so
-looks identical before and after the move. Changing the column and restarting
-re-points that symlink at the shared canon and leaves the old directory behind:
-`prepareWorkgroupMemoryMember` treats the unchanged link plus an existing
-target as already correct, and it never merges the two trees. The agent comes
-back healthy with none of what it wrote.
+**do not just set the column.** Everything the agent shares with siblings lives
+in one directory, `data/workgroups/<its own folder>/`, mounted into the
+container at `/workspace/workgroup`. That is the memory canon under `memory/`
+and every other shared file beside it. Moving the column re-points the mount at
+`data/workgroups/${WG}/` and moves none of it.
 
-No tool moves a canon between workgroups. `scripts/migrate-workgroup-memory.ts`
-consolidates the sources _inside_ one workgroup onto that workgroup's own
-canon: `inventory --workgroup <id>` collects the canon plus the group-local
-trees of the members already assigned to `<id>`, so pointing it at either side
-of this move leaves the other side untouched. Merging the two canons is a
-manual step, done with the host down so nothing writes underneath it.
+Nothing warns, because nothing looks broken. The agent reaches memory through a
+`groups/<folder>/memory` symlink whose target is the container path, so the
+link is byte-identical before and after; `prepareWorkgroupMemoryMember` sees
+that link plus an existing destination canon and returns unchanged. Its
+`migration-required` throw is guarded on the destination canon being _absent_,
+which is never the case when joining a team that already has one. The agent
+comes back healthy with none of what it wrote.
+
+No tool moves a workgroup's data to another workgroup.
+`scripts/migrate-workgroup-memory.ts` consolidates the sources _inside_ one
+workgroup onto that workgroup's own canon — `inventory --workgroup <id>` takes
+its members from the rows already assigned to `<id>` and its canonical path
+from the same argument — so pointing it at either side of this move leaves the
+other side untouched. It is not the migration path for a rehome.
+
+So there are two supported courses, and the first is the default:
+
+**Rehome a group that has never spawned.** Set the column before its first
+spawn, as the block above does, and there is nothing to move.
+
+**Rehome a group that has already spawned.** Move its shared directory by hand,
+with the host down so nothing writes underneath the copy:
 
 ```bash
 # 1. stop the service — a live host can respawn a container mid-copy
@@ -156,18 +169,25 @@ systemctl --user stop "$(. setup/lib/install-slug.sh; systemd_unit)" \
   || sudo systemctl stop "$(. setup/lib/install-slug.sh; systemd_unit)"
 #    macOS: launchctl bootout "gui/$(id -u)/$(. setup/lib/install-slug.sh; launchd_label)"
 
-# 2. look at both trees, then merge the old one into the destination by hand
-ls -R data/workgroups/<its own folder>/memory
-ls -R data/workgroups/${WG}/memory
+# 2. inventory both sides — everything under the old id, not only memory/
+find data/workgroups/<its own folder> -type f | sort
+find data/workgroups/${WG} -type f | sort
 
-# 3. set the column, then start the service again
+# 3. merge the old tree into the destination by hand, then set the column
+#    and start the service again
 ```
 
-Review the two trees before copying anything: they are plain Markdown, both
-sides may hold a file of the same name, and a blind `cp -r` silently picks a
-winner. Merge conflicting files by editing them, not by overwriting. Once the
-column is set and the host is back up, the group's next spawn mounts the shared
-canon.
+Read both inventories before copying. The trees are plain files, both sides can
+hold the same name, and a blind `cp -r` silently picks a winner — merge a
+conflicting file by editing it, not by overwriting. Leave the old directory in
+place until the group has spawned once and confirmed what it can see; it is the
+only copy.
+
+Two things do not travel with the files. Workgroup-level OneCLI secrets are
+declared on the destination workgroup and merge as a union with the group's
+own, so a secret the old workgroup supplied has to be declared again. Archive
+recall is projected per spawn from the central archive, so it follows the new
+workgroup on its own and needs nothing.
 
 ### 3. Install one Slack app per agent
 
