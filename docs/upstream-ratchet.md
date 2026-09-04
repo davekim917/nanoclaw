@@ -236,6 +236,22 @@ entry that `--check` never writes. The untracked-shadow check has no meaning eit
 bytes sitting at a path the fork's index does not track, which cannot happen inside a single commit's own
 tree.
 
+### Checkout filters (CRLF, ident, smudge)
+
+A ref's raw git blob bytes are not always what a real checkout produces: `.gitattributes` can declare
+`text`/`eol` (CRLF conversion), `ident`, or a `filter` (clean/smudge), and `hashFile` — what the default
+report and the local currency test hash — always reads the CHECKED-OUT (post-filter) bytes. `--check`
+hashes to match: for every upstream-owned regular file, it asks `git check-attr` (scoped to `<ref>`'s own
+`.gitattributes` via `--source=<ref>`, never the running checkout's) which paths have one of those
+attributes set, and for exactly that set re-hashes via `git cat-file --filters` — one path at a time,
+because `--batch --filters` reports the object's PRE-filter size in its header even though it writes the
+POST-filter bytes, which desyncs the batch framing this tool otherwise relies on. Every other upstream
+path — the overwhelming majority — is still hashed from the single batched raw `cat-file --batch` call. A
+symlink (`120000`) is never a candidate: git does not run checkout filters on a symlink's target string.
+Neither this fork's tree nor the pinned upstream commit declares any `.gitattributes` rule today, so on a
+real `--check` run this is one `check-attr` call that flags nothing, at effectively no extra cost — the
+mechanism exists for the day either tree adds one.
+
 ## From a linked worktree
 
 Run the boundary check as

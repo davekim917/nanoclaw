@@ -59,12 +59,16 @@ import { fileURLToPath } from 'node:url';
 import {
   buildManifest,
   classify,
+  decideCheckOutcome,
   findUntrackedShadows,
+  hashBlobContent,
   hashCatFileBatch,
+  parseCheckAttrRecords,
   parseLsFiles,
   parseLsTree,
   parseLsTreeEntries,
   parseNumstat,
+  pathsWithCheckoutFilters,
   RatchetError,
   writeGate,
   type Row,
@@ -329,9 +333,73 @@ function catFileBatch(root: string, ids: readonly string[]): Buffer {
   if (ids.length === 0) return Buffer.alloc(0);
   return execFileSync('git', ['-C', root, 'cat-file', '--batch'], {
     input: ids.join('\n') + '\n',
+    // Bounded by construction: `computeFromRef` only ever requests blob ids for
+    // upstream-owned paths, never the fork's own added content — a large
+    // fork-only asset (the default report never reads it either) cannot blow
+    // this or abort --check on a ref that never touches an upstream file.
     maxBuffer: 512 * 1024 * 1024,
     stdio: ['pipe', 'pipe', 'inherit'],
   }) as Buffer;
+}
+
+/** Attributes that can make a real checkout's bytes differ from a blob's raw stored content. */
+const CHECKOUT_FILTER_ATTRS = ['text', 'eol', 'ident', 'filter'] as const;
+
+/**
+ * Upstream-owned regular-file paths (from `candidates`) where `<ref>`'s OWN
+ * gitattributes — not the running checkout's — set one of `CHECKOUT_FILTER_ATTRS`.
+ *
+ * `--source=<ref>` is what makes this ref-correct rather than
+ * worktree-correct: `git check-attr` (like `git cat-file --filters`, see
+ * `hashFilteredBlob`) otherwise resolves attributes from the CURRENT working
+ * tree regardless of which commit's blob is being asked about — confirmed by
+ * hand: querying an attribute-bearing older commit while HEAD carries no
+ * `.gitattributes` at all returns "unspecified" without `--source`.
+ */
+function checkoutFilteredPaths(root: string, ref: string, candidates: readonly string[]): Set<string> {
+  if (candidates.length === 0) return new Set();
+  const stdout = execFileSync(
+    'git',
+    ['-C', root, 'check-attr', `--source=${ref}`, ...CHECKOUT_FILTER_ATTRS, '--stdin', '-z'],
+    {
+      input: candidates.map((p) => `${p}\0`).join(''),
+      maxBuffer: 512 * 1024 * 1024,
+      encoding: 'utf8',
+      stdio: ['pipe', 'pipe', 'inherit'],
+    },
+  );
+  return pathsWithCheckoutFilters(parseCheckAttrRecords(stdout));
+}
+
+/**
+ * The sha256 a real checkout of `<ref>:<relPath>` would hash to, per
+ * `hashFile` — git's blob content AFTER the filters `<ref>`'s own
+ * gitattributes declare (CRLF/eol conversion, ident, clean/smudge).
+ *
+ * One subprocess per path, deliberately never batched: `git cat-file --batch
+ * --filters` reports the PRE-filter blob size in its header even though it
+ * writes the POST-filter (different-length) bytes — verified by hand, not a
+ * hypothetical: a 6-byte LF blob with `eol=crlf` set writes 9 CRLF bytes to
+ * stdout while the header still says `blob 6`. That desyncs
+ * `parseCatFileBatch`'s size-driven framing for every record after the first
+ * mismatch, so a single-object, non-batch `--filters` call is used instead:
+ * its ENTIRE stdout, to EOF, IS the filtered content, with no header and
+ * nothing to misparse. `--attr-source=<ref>` (the global flag; `cat-file` has
+ * no per-invocation `--source`) pins attributes to `<ref>`'s own
+ * `.gitattributes`, exactly like `checkoutFilteredPaths` above.
+ *
+ * A 120000 (symlink) entry never reaches this function: `--filters` returns a
+ * symlink's raw target string byte-for-byte unchanged — verified by hand — so
+ * the batched raw hash already agrees with `hashFile`'s symlink handling and
+ * `checkoutFilteredPaths` is never asked about a symlink path.
+ */
+function hashFilteredBlob(root: string, ref: string, relPath: string): string {
+  const content = execFileSync(
+    'git',
+    ['-C', root, `--attr-source=${ref}`, 'cat-file', '--filters', `${ref}:${relPath}`],
+    { maxBuffer: 512 * 1024 * 1024, stdio: ['ignore', 'pipe', 'inherit'] },
+  ) as Buffer;
+  return hashBlobContent(content);
 }
 
 /**
@@ -340,15 +408,19 @@ function catFileBatch(root: string, ids: readonly string[]): Buffer {
  * therefore `classify`/`writeGate`/rendering) as the one arbitration path so
  * there is no second implementation of GROWTH/NEW/SHRINK/STALE.
  *
- * Three things differ from the working-tree measurement, all because there is
+ * Differs from the working-tree measurement in four ways, all because there is
  * no working tree and no index for a bare ref:
  *
- *  - `forkIndex`/`modeOf`/`hashOf` all come from `git ls-tree -r -z <ref>` and
- *    ONE `git cat-file --batch` over its blob ids, not from `ls-files`/`lstat`/
- *    reading the disk. A symlink's blob content IS its target string (what git
- *    stores for a 120000 entry), so hashing the blob bytes directly agrees with
- *    `hashFile`'s symlink handling without special-casing the mode — proven in
- *    src/upstream-ratchet-core.test.ts.
+ *  - `forkIndex`/`modeOf` come from `git ls-tree -r -z <ref>` (the FULL tree,
+ *    kept in `refEntries` for gitlink-ancestor detection), not `ls-files`.
+ *  - `hashOf` for a REGULAR file (100644/100755) is the RAW blob hash from ONE
+ *    `git cat-file --batch`, UNLESS `checkoutFilteredPaths` flags the path —
+ *    then it is `hashFilteredBlob`'s checkout-equivalent hash instead. Only
+ *    UPSTREAM-OWNED paths' blobs are ever requested (never the fork's own
+ *    added content, however large) — see `catFileBatch`'s comment. A 120000
+ *    (symlink) entry always uses the raw batch hash: git never filters a
+ *    symlink's target-string content on checkout, so raw already agrees with
+ *    `hashFile` — proven in src/upstream-ratchet-core.test.ts.
  *  - `ignored` is always empty: `git check-ignore` needs a live index and
  *    working tree, neither of which a bare commit has. An upstream path the
  *    fork deleted AND gitignored is simply absent from `ls-tree`, so it is
@@ -362,7 +434,7 @@ function catFileBatch(root: string, ids: readonly string[]): Buffer {
  *
  * Returns the `TreeReader` alongside the manifest so the caller can also run
  * `checkTree` (the STALE-MANIFEST currency check) against the very same
- * `ls-tree`/blob-hash data, with no second git round-trip.
+ * `modeOf`/`hashOf`, with no second git round-trip.
  */
 function computeFromRef(
   root: string,
@@ -372,16 +444,39 @@ function computeFromRef(
   const upstreamModes = parseLsTree(git(root, ['ls-tree', '-r', '-z', sha]));
   const refEntries = parseLsTreeEntries(git(root, ['ls-tree', '-r', '-z', ref]));
 
-  const blobIds = [...new Set([...refEntries.values()].filter((e) => e.mode !== GITLINK_MODE).map((e) => e.blob))];
-  const blobHashes = hashCatFileBatch(catFileBatch(root, blobIds), blobIds);
+  // Only upstream-owned, non-gitlink paths ever need their bytes read — never
+  // the fork's own added content, however large.
+  const upstreamBlobIds = [
+    ...new Set(
+      [...refEntries.entries()]
+        .filter(([relPath, entry]) => upstreamModes.has(relPath) && entry.mode !== GITLINK_MODE)
+        .map(([, entry]) => entry.blob),
+    ),
+  ];
+  const rawHashes = hashCatFileBatch(catFileBatch(root, upstreamBlobIds), upstreamBlobIds);
+
+  // Only REGULAR files (100644/100755) can be attribute-filtered on checkout —
+  // a symlink's content is always its raw target string, never candidate for
+  // this. In a ref with no relevant .gitattributes rule at all (true of both
+  // trees today), checkoutFilteredPaths returns empty and this costs exactly
+  // one check-attr call with zero one-object-at-a-time hashing after it.
+  const filterCandidates = [...upstreamModes.keys()].filter((relPath) => {
+    const entry = refEntries.get(relPath);
+    return entry !== undefined && (entry.mode === '100644' || entry.mode === '100755');
+  });
+  const filteredPaths = checkoutFilteredPaths(root, ref, filterCandidates);
+  const filteredHashes = new Map<string, string>();
+  for (const relPath of filteredPaths) filteredHashes.set(relPath, hashFilteredBlob(root, ref, relPath));
 
   const modeOf = (relPath: string): GitMode | null => {
     const mode = refEntries.get(relPath)?.mode;
     return mode !== undefined && isGitMode(mode) ? mode : null;
   };
   const hashOf = (relPath: string): string | null => {
+    const filtered = filteredHashes.get(relPath);
+    if (filtered !== undefined) return filtered;
     const entry = refEntries.get(relPath);
-    return entry === undefined ? null : (blobHashes.get(entry.blob) ?? null);
+    return entry === undefined ? null : (rawHashes.get(entry.blob) ?? null);
   };
   const forkIndex = new Map([...refEntries].map(([p, e]) => [p, e.mode]));
   const numstat = parseNumstat(git(root, ['diff', '--numstat', '--no-renames', '-z', sha, ref]));
@@ -518,7 +613,14 @@ function runCheck(options: Options): never {
   const elapsedMs = Date.now() - started;
 
   const rows = classify(committed, current);
-  const { blocking } = writeGate(rows, new Set(), false);
+  // The exit decision is one pure function (src/upstream-ratchet-core.ts,
+  // unit-tested there) — `runCheck` has no ad hoc `failing` computation of its
+  // own to drop `currencyFindings` from by accident. Shadows the raw
+  // `checkTree` result with the (identical) copy `decideCheckOutcome` returns,
+  // so every render below reads from the one decision.
+  const outcome = decideCheckOutcome(rows, currencyFindings);
+  const { failing, blocking } = outcome;
+  currencyFindings = outcome.currencyFindings;
 
   const before = counts(committed);
   const after = counts(current);
@@ -526,7 +628,6 @@ function runCheck(options: Options): never {
   const summary =
     `${n(after.divergent)} divergent files, ${n(after.lines)} diff lines vs ${sha.slice(0, 8)} ` +
     `(Δ ${deltaLines >= 0 ? '' : '-'}${n(Math.abs(deltaLines))})`;
-  const failing = blocking.length > 0 || currencyFindings.length > 0;
 
   if (options.json) {
     console.log(

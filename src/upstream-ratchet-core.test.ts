@@ -23,22 +23,27 @@ import { enforceHermeticity, hermeticityAttempts } from './test-hermeticity.js';
 import {
   buildManifest,
   classify,
+  decideCheckOutcome,
   findUntrackedShadows,
   hashCatFileBatch,
   isBlocking,
   parseCatFileBatch,
+  parseCheckAttrRecords,
   parseLsFiles,
   parseLsTree,
   parseLsTreeEntries,
   parseNumstat,
+  pathsWithCheckoutFilters,
   RatchetError,
   writeGate,
+  type CheckAttrRecord,
   type NumstatRecord,
   type Row,
 } from './upstream-ratchet-core.js';
 import {
   hashFile,
   sealManifest,
+  type Finding,
   type GitMode,
   type UpstreamRatchetEntry,
   type UpstreamRatchetManifest,
@@ -214,12 +219,49 @@ describe('commit-source parsing (--check <ref>)', () => {
     expect(() => parseCatFileBatch(Buffer.from(`${id} missing\n`, 'utf8'), [id])).toThrow(/is missing from this clone/);
     // Header present, content shorter than the declared size.
     expect(() => parseCatFileBatch(Buffer.from(`${id} blob 10\nabc\n`, 'utf8'), [id])).toThrow(
-      /truncated while reading the content/,
+      /truncated or missing its trailing newline while reading the content/,
     );
     // No trailing LF at all — the header itself never terminates.
     expect(() => parseCatFileBatch(Buffer.from(`${id} blob 3`, 'utf8'), [id])).toThrow(
       /truncated while reading the header/,
     );
+    // The declared size is exactly right (3 bytes, "abc"), but git's MANDATORY
+    // trailing LF after the content is simply absent — a different boundary
+    // than "header never terminates" (no header LF at all, above) and than
+    // "content shorter than declared size" (below): here the size field lied
+    // about the record being fully framed, not about the content's length.
+    expect(() => parseCatFileBatch(Buffer.from(`${id} blob 3\nabc`, 'utf8'), [id])).toThrow(
+      /truncated or missing its trailing newline/,
+    );
+  });
+
+  it('refuses a record whose returned object id or type does not match the request', () => {
+    const requested = 'd'.repeat(40);
+    const returned = 'e'.repeat(40);
+    // A different id than the one requested — the response is out of sync
+    // with the request (a caller bug, or a desynced stream from an earlier
+    // misparsed record) and must not be attributed to `requested`'s path.
+    expect(() => parseCatFileBatch(batchRecord(returned, Buffer.from('x', 'utf8')), [requested])).toThrow(
+      /out of sync with the request/,
+    );
+    // A non-blob type (this parser is only ever used for blob content).
+    const nonBlob = Buffer.concat([
+      Buffer.from(`${requested} tree 1\n`, 'utf8'),
+      Buffer.from('x', 'utf8'),
+      Buffer.from('\n', 'utf8'),
+    ]);
+    expect(() => parseCatFileBatch(nonBlob, [requested])).toThrow(/expected blob/);
+  });
+
+  it('refuses trailing bytes left over after every requested record is read', () => {
+    const id = 'f'.repeat(40);
+    const clean = batchRecord(id, Buffer.from('ok\n', 'utf8'));
+    // Well-formed record, PLUS bytes that don't belong to any requested id —
+    // a stream that promised exactly `ids.length` records but delivered more.
+    const withGarbage = Buffer.concat([clean, Buffer.from('unexpected trailing junk', 'utf8')]);
+    expect(() => parseCatFileBatch(withGarbage, [id])).toThrow(/unexpected trailing byte/);
+    // The clean version alone must NOT throw — the garbage is what triggers it.
+    expect(() => parseCatFileBatch(clean, [id])).not.toThrow();
   });
 
   it('hashes batch content to sha256, matching a direct hash of the same bytes', () => {
@@ -253,6 +295,108 @@ describe('commit-source parsing (--check <ref>)', () => {
     const linkId = 'f'.repeat(40);
     const linkBatch = batchRecord(linkId, linkTarget);
     expect(hashCatFileBatch(linkBatch, [linkId]).get(linkId)).toBe(hashFile(path.join(root, 'link')));
+  });
+
+  it('parses check-attr -z records and finds paths with a content-transforming attribute set', () => {
+    // Exactly `git check-attr text eol ident filter --stdin -z`'s framing:
+    // <path>\0<attr>\0<value>\0, repeated per (path, attr) pair, in request
+    // order — real output captured by hand for a CRLF-tagged file, an
+    // untouched symlink, and .gitattributes itself.
+    const field = (s: string): string => s + '\0';
+    const stdout =
+      field('crlftest.txt') +
+      field('text') +
+      field('set') +
+      field('crlftest.txt') +
+      field('eol') +
+      field('crlf') +
+      field('crlftest.txt') +
+      field('ident') +
+      field('unspecified') +
+      field('crlftest.txt') +
+      field('filter') +
+      field('unspecified') +
+      field('mylink') +
+      field('text') +
+      field('unspecified') +
+      field('mylink') +
+      field('eol') +
+      field('unspecified') +
+      field('mylink') +
+      field('ident') +
+      field('unspecified') +
+      field('mylink') +
+      field('filter') +
+      field('unspecified');
+
+    const records = parseCheckAttrRecords(stdout);
+    expect(records).toHaveLength(8);
+    expect(records[0]).toEqual({ path: 'crlftest.txt', attr: 'text', value: 'set' });
+    expect(records[1]).toEqual({ path: 'crlftest.txt', attr: 'eol', value: 'crlf' });
+
+    // crlftest.txt has `text`/`eol` SET (a real checkout could produce
+    // different bytes); mylink has every queried attribute "unspecified" —
+    // git's own literal string for "no rule applies" — so it is untouched.
+    expect(pathsWithCheckoutFilters(records)).toEqual(new Set(['crlftest.txt']));
+  });
+
+  it('finds no filtered paths when every attribute is unspecified — the common case today', () => {
+    // Neither tree carries a .gitattributes today (verified by hand against
+    // both nanoclaw-v2 and the upstream pin), so this is the actual shape
+    // `checkoutFilteredPaths` sees on every real `--check` run right now: one
+    // check-attr call, zero one-object-at-a-time `--filters` hashing after it.
+    const records: CheckAttrRecord[] = [
+      { path: 'src/router.ts', attr: 'text', value: 'unspecified' },
+      { path: 'src/router.ts', attr: 'eol', value: 'unspecified' },
+      { path: 'src/router.ts', attr: 'ident', value: 'unspecified' },
+      { path: 'src/router.ts', attr: 'filter', value: 'unspecified' },
+    ];
+    expect(pathsWithCheckoutFilters(records)).toEqual(new Set());
+  });
+
+  it('refuses a NUL-field count that is not a multiple of 3', () => {
+    expect(() => parseCheckAttrRecords('a\0text\0')).toThrow(/not a multiple of 3/);
+  });
+});
+
+describe('--check exit decision (decideCheckOutcome)', () => {
+  const finding = (path: string): Finding => ({ kind: 'changed', path, detail: 'x', hint: 'y' });
+  const present = (diff: number): UpstreamRatchetEntry => ({ diff, mode: '100644', sha256: 'a'.repeat(64) });
+
+  it('growth-only fails, with no currency findings', () => {
+    const rows = classify(manifestOf({ f: present(10) }), manifestOf({ f: present(11) }));
+    const outcome = decideCheckOutcome(rows, []);
+    expect(outcome.failing).toBe(true);
+    expect(outcome.blocking.map((r) => r.path)).toEqual(['f']);
+    expect(outcome.currencyFindings).toEqual([]);
+  });
+
+  it('stale-manifest-only fails, even when classify() sees nothing blocking', () => {
+    // This is the case the extraction exists to guarantee: classify() only
+    // ever looks at `diff`/mode/binary/deleted-state, never at whether the
+    // manifest's recorded sha256 is still accurate — an UNCHANGED verdict here
+    // (identical diff on both sides) must not silently swallow a currency
+    // finding, or `runCheck` computing `failing` from `blocking` alone would
+    // pass a manifest whose recorded sha256 disagrees with the ref's real tree.
+    const rows = classify(manifestOf({ f: present(10) }), manifestOf({ f: present(10) }));
+    expect(rows.every((r) => !isBlocking(r.verdict))).toBe(true);
+    const outcome = decideCheckOutcome(rows, [finding('f')]);
+    expect(outcome.failing).toBe(true);
+    expect(outcome.currencyFindings).toEqual([finding('f')]);
+  });
+
+  it('a clean tree — no growth, no currency findings — passes', () => {
+    const rows = classify(manifestOf({ f: present(10) }), manifestOf({ f: present(10) }));
+    const outcome = decideCheckOutcome(rows, []);
+    expect(outcome.failing).toBe(false);
+  });
+
+  it('both failing at once still reports exactly one row of STALE-MANIFEST evidence', () => {
+    const rows = classify(manifestOf({ f: present(10) }), manifestOf({ f: present(11) }));
+    const outcome = decideCheckOutcome(rows, [finding('f')]);
+    expect(outcome.failing).toBe(true);
+    expect(outcome.blocking).toHaveLength(1);
+    expect(outcome.currencyFindings).toHaveLength(1);
   });
 });
 

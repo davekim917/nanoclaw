@@ -29,6 +29,7 @@ import {
   GITLINK_MODE,
   isGitMode,
   validateRelPath,
+  type Finding,
   type GitMode,
   type UpstreamRatchetEntry,
   type UpstreamRatchetManifest,
@@ -114,7 +115,20 @@ export function parseLsTreeEntries(stdout: string): Map<string, LsTreeEntry> {
  * `ids` must be the exact list sent to `cat-file --batch`, in the same order —
  * the framing has no separators of its own between records other than the
  * fixed header/size/LF shape, so there is no way to recover record boundaries
- * without knowing how many records to expect.
+ * without knowing how many records to expect. This is ONLY safe for the RAW
+ * (unfiltered) batch mode: `--filters` reports the PRE-filter size in this
+ * same header even though it writes POST-filter (larger or smaller) bytes,
+ * which desyncs this exact framing — see `hashFilteredBlob` in
+ * scripts/upstream-ratchet-report.ts for why filtered content is read one
+ * object at a time instead, with no size field to trust.
+ *
+ * Strict by construction, so a desync fails loudly instead of silently
+ * misreading a later record: the returned object id and type must match the
+ * request (a git response is never reordered, but a caller that reorders
+ * `ids` relative to what was actually sent would otherwise attribute one
+ * blob's bytes to a different path), the mandatory trailing LF after the
+ * declared `size` bytes must actually be present, and no bytes may remain
+ * once every requested id has been read.
  */
 export function parseCatFileBatch(stdout: Buffer, ids: readonly string[]): Map<string, Buffer> {
   const out = new Map<string, Buffer>();
@@ -125,16 +139,42 @@ export function parseCatFileBatch(stdout: Buffer, ids: readonly string[]): Map<s
     const header = stdout.subarray(offset, headerEnd).toString('utf8');
     const parts = header.split(' ');
     if (parts[1] === 'missing') fail(`git object ${parts[0] ?? id} is missing from this clone`);
-    if (parts.length < 3) fail(`could not parse cat-file --batch header: ${JSON.stringify(header)}`);
-    const size = Number(parts[2]);
+    if (parts.length !== 3) fail(`could not parse cat-file --batch header: ${JSON.stringify(header)}`);
+    const [oid, type, sizeStr] = parts;
+    if (oid !== id) {
+      fail(
+        `cat-file --batch returned object ${JSON.stringify(oid)} where ${JSON.stringify(id)} was requested — the ` +
+          `response is out of sync with the request`,
+      );
+    }
+    if (type !== 'blob') fail(`cat-file --batch returned type ${JSON.stringify(type)} for ${id}, expected blob`);
+    const size = Number(sizeStr);
     if (!Number.isInteger(size) || size < 0) fail(`could not parse cat-file --batch header: ${JSON.stringify(header)}`);
     const contentStart = headerEnd + 1;
     const contentEnd = contentStart + size;
-    if (contentEnd > stdout.length) fail(`cat-file --batch output truncated while reading the content for ${id}`);
+    // `contentEnd` must be a valid index INTO the buffer (room for the
+    // mandatory trailing LF byte git appends after the content), and that
+    // byte must actually be LF — catches a record whose content is present
+    // but whose trailing LF was silently dropped, not just one that ran out
+    // of bytes mid-content.
+    if (contentEnd >= stdout.length || stdout[contentEnd] !== 0x0a) {
+      fail(`cat-file --batch output truncated or missing its trailing newline while reading the content for ${id}`);
+    }
     out.set(id, stdout.subarray(contentStart, contentEnd));
-    offset = contentEnd + 1; // the trailing LF git appends after the content
+    offset = contentEnd + 1;
+  }
+  if (offset !== stdout.length) {
+    fail(
+      `cat-file --batch output has ${stdout.length - offset} unexpected trailing byte(s) after the ${ids.length} ` +
+        `requested record(s)`,
+    );
   }
   return out;
+}
+
+/** sha256 hex of raw content bytes — the fingerprint every hashing path in this module converges on. */
+export function hashBlobContent(content: Buffer): string {
+  return createHash('sha256').update(content).digest('hex');
 }
 
 /**
@@ -145,13 +185,58 @@ export function parseCatFileBatch(stdout: Buffer, ids: readonly string[]): Map<s
  * exactly what `hashFile` hashes for a symlink (`fs.readlinkSync`, not the
  * pointee) — so a manifest written from a worktree's working tree and one
  * measured here from the same commit's blobs must hash identically. Proven in
- * src/upstream-ratchet-core.test.ts by hashing one fixture both ways.
+ * src/upstream-ratchet-core.test.ts by hashing one fixture both ways. Only
+ * true for RAW (unfiltered) content — see `hashFilteredBlob` in the report
+ * script for the regular-file paths a ref's own gitattributes could transform
+ * on checkout.
  */
 export function hashCatFileBatch(stdout: Buffer, ids: readonly string[]): Map<string, string> {
   const out = new Map<string, string>();
-  for (const [id, content] of parseCatFileBatch(stdout, ids)) {
-    out.set(id, createHash('sha256').update(content).digest('hex'));
+  for (const [id, content] of parseCatFileBatch(stdout, ids)) out.set(id, hashBlobContent(content));
+  return out;
+}
+
+/** One `git check-attr <attrs...> --stdin -z` record: one attribute's value for one path. */
+export interface CheckAttrRecord {
+  path: string;
+  attr: string;
+  value: string;
+}
+
+/**
+ * `git check-attr <attrs...> --stdin -z` output → one record per (path, attr)
+ * pair, in request order. `-z` NUL-delimits every field (path, attr, value) so
+ * a path containing a space or a non-ASCII byte round-trips exactly, the same
+ * reason every other parser in this module takes `-z`/`-Z` output.
+ */
+export function parseCheckAttrRecords(stdout: string): CheckAttrRecord[] {
+  const fields = stdout.split('\0');
+  if (fields[fields.length - 1] === '') fields.pop(); // the trailing NUL after the last record
+  if (fields.length % 3 !== 0) {
+    fail(`could not parse check-attr -z output: ${fields.length} NUL-delimited fields is not a multiple of 3`);
   }
+  const out: CheckAttrRecord[] = [];
+  for (let i = 0; i < fields.length; i += 3) {
+    out.push({ path: fields[i] ?? '', attr: fields[i + 1] ?? '', value: fields[i + 2] ?? '' });
+  }
+  return out;
+}
+
+/**
+ * Paths where at least one CONTENT-TRANSFORMING attribute (`text`, `eol`,
+ * `ident`, `filter`) is set to something other than git's literal
+ * `"unspecified"` — i.e. paths where a real checkout of the queried ref could
+ * produce different bytes than the blob's raw stored content. Every other
+ * attribute (`diff`, `merge`, `export-ignore`, `linguist-*`, …) does not
+ * transform checkout bytes and is deliberately never queried for this.
+ *
+ * `"unspecified"` is git's own literal string for "no rule applies" — a real
+ * attribute value can never equal it, so the exact-match check has no false
+ * negative.
+ */
+export function pathsWithCheckoutFilters(records: readonly CheckAttrRecord[]): Set<string> {
+  const out = new Set<string>();
+  for (const record of records) if (record.value !== 'unspecified') out.add(record.path);
   return out;
 }
 
@@ -525,4 +610,38 @@ export interface WriteGate {
 export function writeGate(rows: readonly Row[], accept: ReadonlySet<string>, acceptAll: boolean): WriteGate {
   const blocking = rows.filter((row) => isBlocking(row.verdict));
   return { blocking, unaccepted: acceptAll ? [] : blocking.filter((row) => !accept.has(row.path)) };
+}
+
+// ── the --check exit decision ────────────────────────────────────────────────
+
+export interface CheckOutcome {
+  /** Whether `--check` exits 1. Two independent things can set this — see below. */
+  failing: boolean;
+  /** Every GROWTH/NEW row from `classify()` — `--accept` never applies to `--check`. */
+  blocking: Row[];
+  /** Every currency finding from `checkTree` run against the ref's own tree. */
+  currencyFindings: Finding[];
+}
+
+/**
+ * `--check <ref>`'s exit decision, as one pure function — extracted so
+ * `scripts/upstream-ratchet-report.ts` cannot drop `currencyFindings` from the
+ * exit code (or from the STALE-MANIFEST section) by computing `failing`
+ * ad hoc; `runCheck` has nothing left to get wrong here but call this once and
+ * render exactly what it returns.
+ *
+ * Two independent things can fail `--check`, and NEITHER alone is the whole
+ * story: `classify()`'s GROWTH/NEW rows (the same line-count arbitration the
+ * default report runs, just pointed at a ref) miss a manifest whose recorded
+ * sha256/mode/deleted state disagrees with the ref's real tree in a way that
+ * does not move the `diff` total — a same-size text edit is the case
+ * `classify()` deliberately lets through. `checkTree`'s currency findings miss
+ * a case where the manifest's bookkeeping IS internally consistent but the
+ * fork's own arbitration was never updated to reflect legitimate growth (a
+ * `--write`-and-commit that under-counted). `--check` fails if either does.
+ */
+export function decideCheckOutcome(rows: readonly Row[], currencyFindings: readonly Finding[]): CheckOutcome {
+  const { blocking } = writeGate(rows, new Set(), false);
+  const findings = [...currencyFindings];
+  return { failing: blocking.length > 0 || findings.length > 0, blocking, currencyFindings: findings };
 }
