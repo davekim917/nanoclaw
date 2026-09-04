@@ -13,6 +13,7 @@ import fs from 'fs';
 import path from 'path';
 
 import { writeMessageOut } from '../db/messages-out.js';
+import { evaluateReviewChurnGate } from '../review-churn-gate.js';
 import { registerTools } from './server.js';
 import type { McpToolDefinition } from './types.js';
 
@@ -71,6 +72,45 @@ function runGitAt(cwd: string, args: string[], timeoutMs = 120_000): string {
     stdio: ['ignore', 'pipe', 'pipe'],
     timeout: timeoutMs,
   }).trim();
+}
+
+/**
+ * The branch and the commit it points at, read in ONE git invocation.
+ *
+ * Two commands can straddle a sibling checking out another branch — they share
+ * this worktree — leaving a branch name from before the switch beside a commit
+ * from after it. Everything downstream is then pinned to an identity that never
+ * existed: the gate judges one PR's history while the refspec pushes the other
+ * branch's commit. `status --porcelain=v2 --branch` reports both from a single
+ * snapshot, so there is no window to lose rather than a smaller one.
+ */
+async function capturedIdentity(
+  context: RepositoryContext,
+): Promise<{ branch: string; head: string; lease: string } | null> {
+  // The whole capture is one critical section, and the lock is taken HERE
+  // rather than by each caller: an identity read outside it is the defect, so
+  // the primitive that produces identities is the place it cannot happen. The
+  // branch, the commit and the remote value are three reads of shared state
+  // that must describe one instant — a sibling topic's `create_worktree` runs
+  // its `fetch --prune` under this same lock, so a capture that straddled it
+  // would pair this checkout's commit with a remote value the fetch had just
+  // advanced, and the lease below would then name a commit this caller never
+  // integrated.
+  return await withRepositoryLock(context, () => {
+    const worktree = context.worktree;
+    const out = runGitAt(worktree, ['status', '--porcelain=v2', '--branch', '--untracked-files=no']);
+    const oid = /^# branch\.oid (\S+)$/m.exec(out)?.[1];
+    const head = /^# branch\.head (.+)$/m.exec(out)?.[1];
+    if (!oid || !head || head === '(detached)' || oid === '(initial)') return null;
+    // The remote value this caller actually integrated, read now rather than
+    // left to `--force-with-lease` to infer at push time: a bare lease expects
+    // whatever `refs/remotes/origin/<branch>` says when the push runs, so a
+    // commit that landed while the gate was on the network would be adopted as
+    // the expectation and then overwritten. An empty lease means the branch
+    // must not exist on the remote yet.
+    const lease = tryGitAt(worktree, ['rev-parse', `refs/remotes/origin/${head}`]) ?? '';
+    return { branch: head, head: oid, lease };
+  });
 }
 
 function tryGitAt(cwd: string, args: string[], timeoutMs = 120_000): string | null {
@@ -564,7 +604,11 @@ export const gitCommitTool: McpToolDefinition = {
 export const gitPushTool: McpToolDefinition = {
   tool: {
     name: 'git_push',
-    description: 'Push this topic worktree branch through the container-scoped origin identity.',
+    description:
+      'Push this topic worktree branch through the container-scoped origin identity. Sends the branch and commit ' +
+      'as they stood when the call started, so work a sibling adds meanwhile is not carried along — push again to ' +
+      'send it. Refused while the pr-review-loop churn gate is holding: three review rounds on one finding class ' +
+      'means the fix belongs in the primitive every flagged site calls, not at one more site.',
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -578,17 +622,57 @@ export const gitPushTool: McpToolDefinition = {
     const repo = typeof args.repo === 'string' ? args.repo : '';
     const resolved = worktreeForTool(repo);
     if ('error' in resolved) return resolved.error;
+    const worktree = resolved.context.worktree;
     try {
+      // A container agent's push path is this tool, not the skill's
+      // `codex-review.sh push`, so the gate has to sit here or it does not
+      // exist for container review loops. It fails open — only an explicit
+      // refusal stops the push.
+      //
+      // The identity is captured under the repository lock (see
+      // `capturedIdentity`); the gate then runs OUTSIDE it, deliberately,
+      // because it makes its own `gh` calls and holding the lock across them
+      // would stall every sibling topic on this repo. Same-topic siblings
+      // share this worktree,
+      // so the checkout can change underneath the verdict — a commit, a
+      // rewrite, a checkout of another branch at the same commit. Rather than
+      // detect each of those, the branch and commit are captured once, up
+      // front, and everything downstream NAMES them: the gate is asked about
+      // that branch and that commit, and the push sends them as an explicit
+      // refspec. Nothing downstream reads the checkout again, so what reaches
+      // the remote is what the gate looked at, or nothing. Work a sibling adds
+      // in the window is simply not pushed here; it gets its own verdict on
+      // its own push.
+      const identity = await capturedIdentity(resolved.context);
+      if (!identity) return err('Cannot push a detached HEAD; create or switch to a branch explicitly');
+      const { branch, head } = identity;
+
+      const gate = evaluateReviewChurnGate({
+        worktree,
+        branch,
+        head,
+        force: args.force === true,
+        lease: identity.lease,
+      });
+      if (gate.status === 'refused') return err(gate.message);
+
       return await withRepositoryLock(resolved.context, async () => {
-        const branch = runGitAt(resolved.context.worktree, ['branch', '--show-current']);
-        if (!branch) return err('Cannot push a detached HEAD; create or switch to a branch explicitly');
-        const push =
-          args.force === true
-            ? ['push', '--force-with-lease', '-u', 'origin', branch]
-            : ['push', '-u', 'origin', branch];
-        runGitAt(resolved.context.worktree, push, 300_000);
+        const push = [
+          'push',
+          ...(args.force === true ? [`--force-with-lease=refs/heads/${branch}:${identity.lease}`] : []),
+          'origin',
+          `${head}:refs/heads/${branch}`,
+        ];
+        runGitAt(worktree, push, 300_000);
+        // `-u` does not apply to a refspec whose source is a commit, so the
+        // tracking config the old form set is restored explicitly. Best effort:
+        // it is a convenience, and the push has already landed.
+        tryGitAt(worktree, ['branch', `--set-upstream-to=origin/${branch}`, branch]);
         await emitRefresh(resolved.context);
-        return ok(`Pushed ${branch} to origin${args.force === true ? ' (force-with-lease)' : ''}`);
+        return ok(
+          `Pushed ${branch} at ${head.slice(0, 8)} to origin${args.force === true ? ' (force-with-lease)' : ''}. ` +
+            `Pass branch=${branch} to open_pr so the PR is opened for this push, not for the checkout.`,
+        );
       });
     } catch (error) {
       return err(`git push failed: ${error instanceof Error ? error.message : String(error)}`);
@@ -608,6 +692,12 @@ export const openPrTool: McpToolDefinition = {
         repo: { type: 'string', description: 'Repository name.' },
         title: { type: 'string', description: 'Pull request title.' },
         body: { type: 'string', description: 'Optional pull request body.' },
+        branch: {
+          type: 'string',
+          description:
+            'Branch to open the PR for. Pass the branch git_push reported; without it the current checkout is used, ' +
+            'which a same-topic sibling can have switched since the push.',
+        },
       },
       required: ['repo', 'title'],
     },
@@ -620,7 +710,24 @@ export const openPrTool: McpToolDefinition = {
     const resolved = worktreeForTool(repo);
     if ('error' in resolved) return resolved.error;
     try {
-      const url = execFileSync('gh', ['pr', 'create', '--title', title, '--body', body], {
+      // Bound to a named branch, never to whatever is checked out when `gh`
+      // runs: same-topic siblings share the worktree, and `gh pr create`
+      // defaults `--head` to the current branch, so a switch mid-call would
+      // open the PR for the sibling's branch — or push theirs to open it.
+      //
+      // `branch` is what closes the window between a push and this call, which
+      // no locking here can reach: git_push names the branch it pushed, and
+      // passing that name back makes this call describe that push rather than
+      // the checkout as it now stands. Absent it, the branch is captured under
+      // the lock, which is correct whenever the checkout has not moved.
+      const named = typeof args.branch === 'string' ? args.branch.trim() : '';
+      let head = named;
+      if (!head) {
+        const identity = await capturedIdentity(resolved.context);
+        if (!identity) return err('Cannot open a PR from a detached HEAD; create or switch to a branch explicitly');
+        head = identity.branch;
+      }
+      const url = execFileSync('gh', ['pr', 'create', '--head', head, '--title', title, '--body', body], {
         cwd: resolved.context.worktree,
         encoding: 'utf8',
         stdio: ['ignore', 'pipe', 'pipe'],

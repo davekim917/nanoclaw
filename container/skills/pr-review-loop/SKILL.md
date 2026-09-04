@@ -144,7 +144,9 @@ merged too coarsely, or the sites genuinely need splitting.
 `REVIEW_LOOP_ALLOW_SITE_PATCH=1` overrides the refusal. It prints the override
 banner, and `codex-review.sh push` writes a line into the PR body naming the
 class that is still unfixed once the push succeeds, so whoever merges sees the
-call that was made. (`codex-review.sh gate` on its own writes nothing — it is
+call that was made. In a container, take the override through that same command
+in Bash rather than retrying `git_push` — `git_push` has no override input on
+purpose, because an override nobody can see on the PR is just a bypass. (`codex-review.sh gate` on its own writes nothing — it is
 a read-only check you can run as often as you like.) Use the override when the
 reframe honestly belongs to a different PR — then open that PR.
 
@@ -157,7 +159,7 @@ codex-review.sh open                      # unresolved Codex threads, TSV: threa
 codex-review.sh body <comment_id>         # the full finding
 codex-review.sh churn                     # findings by file AND by class across rounds — the churn detector
 codex-review.sh classes                   # the class table alone: invariant signature @ seam, sites, primitives
-codex-review.sh gate                      # the reframe gate — exit 3 when a class has run 3 rounds unfixed
+codex-review.sh gate [--committed-only]   # the reframe gate — exit 3 when a class has run 3 rounds unfixed
 codex-review.sh push [git push args…]     # gate, then push — the loop's only push path
 codex-review.sh reply <comment_id> <text> # reply on that thread
 codex-review.sh resolve <thread_id>       # mark it resolved
@@ -207,10 +209,37 @@ Commit once, then push through the gate:
 codex-review.sh push          # runs the reframe gate, then git push
 ```
 
-`codex-review.sh push` is the push path for this loop — not `git push`, and not
-`git_push` if you have the MCP tools. Both skip the gate, and a site patch that
-reaches the remote has already generated the next round. An exit of 3 is the
-gate refusing: read it, and make the next commit the reframe it names.
+`codex-review.sh push` is the push path for this loop — not a bare `git push`,
+which skips the gate, and a site patch that reaches the remote has already
+generated the next round. An exit of 3 is the gate refusing: read it, and make
+the next commit the reframe it names.
+
+One verdict describes one destination, so `push` accepts only the shapes it
+can name: no refspec, which gates the checkout, or a single
+`<sha>:refs/heads/<branch>` after the remote, with a literal commit and no
+wildcard, which pins both the verdict and the audit line to the commit being
+sent. Both the options and the refspec are validated by what IS accepted
+rather than by a list of what is not. A denylist would miss `--branches`,
+which is `--all` under another spelling, and it would miss
+`refs/heads/*:refs/heads/*`, which is one argument that pushes every branch.
+
+The gate in front of a push judges **committed history only**
+(`--committed-only`): a push sends commits, so an edit to the primitive still
+sitting in your working tree is not a reframe the PR will see. A bare
+`codex-review.sh gate` does count the working tree, which is what makes it
+useful before you commit.
+
+**In an agent container** the tool is `git_push`, and it runs this same gate
+before it pushes — the refusal comes back as the tool's error with the class,
+the sites and the primitive in it. Nothing to remember, but two things to know:
+
+- The helper is mounted read-only at
+  `/home/node/.claude/skills/pr-review-loop/scripts/codex-review.sh` (every
+  provider also reaches it at `/app/skills/…`). Run it from inside the topic
+  worktree, or set `REPO` / `PR`.
+- The gate fails **open**. No PR for the branch yet, `gh` unauthenticated,
+  GitHub slow — the push goes through. Only an explicit refusal stops it, so a
+  push that succeeds is not evidence the gate looked.
 
 One commit per round, not per comment. If a finding needs a design decision from the user, leave it out of the batch and say so — keep that thread open rather than stalling the other fixes on it. `codex-review.sh status` reports it in `open=`, so it can't be forgotten at merge time.
 

@@ -1,6 +1,17 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import { execFileSync } from 'child_process';
-import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'fs';
+import {
+  chmodSync,
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  writeFileSync,
+} from 'fs';
+import { fileURLToPath } from 'url';
 import { tmpdir } from 'os';
 import { join } from 'path';
 
@@ -20,6 +31,7 @@ describe('topic-linked worktree topology', () => {
     'NANOCLAW_WORK_UNIT_KEY',
     'NANOCLAW_REPOSITORY_ALLOW_LOCAL_ORIGIN',
     'NANOCLAW_REPOSITORY_ACTION_TRANSPORT',
+    'NANOCLAW_REVIEW_CHURN_GATE_SCRIPT',
   ] as const;
   let savedEnv: Record<string, string | undefined>;
 
@@ -248,6 +260,186 @@ describe('topic-linked worktree topology', () => {
     expect((await gitPushTool.handler({ repo: 'proj' })).isError).toBeFalsy();
     const branch = git(worktree, ['branch', '--show-current']);
     expect(git(remote, ['show-ref', '--verify', `refs/heads/${branch}`])).toContain(branch);
+  });
+
+  test('push-is-refused-while-the-review-churn-gate-holds', async () => {
+    // A container agent's push path is this tool, not `codex-review.sh push`,
+    // so the gate has to hold here or container review loops never see it.
+    expect((await createWorktreeTool.handler({ repo: 'proj' })).isError).toBeFalsy();
+    const worktree = join(firstTopic, 'proj');
+    writeFileSync(join(worktree, 'site.txt'), 'one more call site\n');
+    expect((await gitCommitTool.handler({ repo: 'proj', message: 'patch another site' })).isError).toBeFalsy();
+    const branch = git(worktree, ['branch', '--show-current']);
+
+    const gateScript = join(root, 'refusing-gate.sh');
+    // Exits 3 only when it is handed the pinned identity: --committed-only
+    // (a push sends commits, not the working tree), --head <sha> and BRANCH.
+    // So this also proves the gate is asked about what the push will send.
+    writeFileSync(
+      gateScript,
+      '#!/usr/bin/env bash\n' +
+        'case "$*" in *--committed-only*) ;; *) exit 0 ;; esac\n' +
+        `case "$*" in *--head\\ ${'$'}(git rev-parse HEAD)*) ;; *) exit 0 ;; esac\n` +
+        'test -n "$BRANCH" || exit 0\n' +
+        'echo "REFRAME REQUIRED: inv:race @ src/mailbox/write.ts" >&2\nexit 3\n',
+    );
+    chmodSync(gateScript, 0o755);
+    process.env.NANOCLAW_REVIEW_CHURN_GATE_SCRIPT = gateScript;
+
+    const refused = await gitPushTool.handler({ repo: 'proj' });
+    expect(refused.isError).toBe(true);
+    expect(refused.content[0].text).toContain('REFRAME REQUIRED');
+    expect(refused.content[0].text).toContain('not patch another call site');
+    expect(() => git(remote, ['show-ref', '--verify', `refs/heads/${branch}`])).toThrow();
+
+    // The commit is untouched: the gate refuses the push, it does not rewrite
+    // the agent's work.
+    expect(git(worktree, ['log', '-1', '--format=%s'])).toBe('patch another site');
+
+    // And the same push goes through once the gate stops holding.
+    const cleanGate = join(root, 'clean-gate.sh');
+    writeFileSync(cleanGate, '#!/usr/bin/env bash\nexit 0\n');
+    chmodSync(cleanGate, 0o755);
+    process.env.NANOCLAW_REVIEW_CHURN_GATE_SCRIPT = cleanGate;
+    expect((await gitPushTool.handler({ repo: 'proj' })).isError).toBeFalsy();
+    expect(git(remote, ['show-ref', '--verify', `refs/heads/${branch}`])).toContain(branch);
+  });
+
+  test('captures the branch and its commit in one git invocation', async () => {
+    // Two commands can straddle a sibling's checkout switch, leaving a branch
+    // name from before it beside a commit from after — an identity that never
+    // existed, which the gate would then judge and the refspec would push.
+    const source = readFileSync(fileURLToPath(new URL('./git-worktrees.ts', import.meta.url)), 'utf8');
+    const handler = source.slice(source.indexOf("name: 'git_push'"), source.indexOf("name: 'open_pr'"));
+    expect(handler).toContain('capturedIdentity(resolved.context)');
+    expect(handler).not.toContain("'branch', '--show-current'");
+    expect(handler).not.toContain("'rev-parse', 'HEAD'");
+    expect(source).toContain("['status', '--porcelain=v2', '--branch', '--untracked-files=no']");
+  });
+
+  test('captures the whole identity inside the repository lock', async () => {
+    // The status read and the remote read describe one instant or they describe
+    // nothing: a sibling's create_worktree runs its `fetch --prune` under this
+    // same lock, so a capture straddling it would pair this checkout's commit
+    // with a tracking ref the fetch had just advanced, and the lease would name
+    // a commit this caller never integrated. The lock is taken by the capture
+    // itself rather than by its callers, so there is no way to spell an
+    // unlocked identity read.
+    const source = readFileSync(fileURLToPath(new URL('./git-worktrees.ts', import.meta.url)), 'utf8');
+    const captured = source.slice(
+      source.indexOf('async function capturedIdentity('),
+      source.indexOf('export const createWorktreeTool'),
+    );
+    expect(captured).toContain('withRepositoryLock(context, () => {');
+    // Both reads, inside the closure the lock wraps.
+    const locked = captured.slice(captured.indexOf('withRepositoryLock'));
+    expect(locked).toContain("'status', '--porcelain=v2'");
+    expect(locked).toContain('refs/remotes/origin/${head}');
+  });
+
+  test('a force push carries the lease it captured, not one inferred at push time', async () => {
+    // A bare --force-with-lease expects whatever refs/remotes/origin/<branch>
+    // says when the push runs, and any sibling topic's create_worktree
+    // refreshes that ref with a shared fetch — so a commit that landed while
+    // the gate was on the network would be adopted as the expectation and then
+    // overwritten.
+    const source = readFileSync(fileURLToPath(new URL('./git-worktrees.ts', import.meta.url)), 'utf8');
+    expect(source).toContain('`--force-with-lease=refs/heads/${branch}:${identity.lease}`');
+    expect(source).not.toContain("'--force-with-lease'");
+    expect(source).toContain("tryGitAt(worktree, ['rev-parse', `refs/remotes/origin/${head}`])");
+
+    // And it still pushes: force from a worktree whose branch is on the remote.
+    expect((await createWorktreeTool.handler({ repo: 'proj' })).isError).toBeFalsy();
+    const worktree = join(firstTopic, 'proj');
+    writeFileSync(join(worktree, 'work.txt'), 'one\n');
+    expect((await gitCommitTool.handler({ repo: 'proj', message: 'one' })).isError).toBeFalsy();
+    expect((await gitPushTool.handler({ repo: 'proj' })).isError).toBeFalsy();
+    git(worktree, ['commit', '-q', '--amend', '-m', 'one amended']);
+    expect((await gitPushTool.handler({ repo: 'proj', force: true })).isError).toBeFalsy();
+    const branch = git(worktree, ['branch', '--show-current']);
+    expect(git(remote, ['rev-parse', branch])).toBe(git(worktree, ['rev-parse', 'HEAD']));
+  });
+
+  test('opens the PR for the branch it captured, not the current checkout', async () => {
+    // `gh pr create` defaults --head to whatever is checked out, so a sibling
+    // switching branches mid-call would open the PR for their branch.
+    const source = readFileSync(fileURLToPath(new URL('./git-worktrees.ts', import.meta.url)), 'utf8');
+    const openPr = source.slice(source.indexOf("name: 'open_pr'"));
+    expect(openPr).toContain('capturedIdentity(resolved.context)');
+    expect(openPr).toContain("'--head', head");
+    // Never the raw checkout: --head comes from a named branch or from a
+    // capture, and there is no path that lets `gh` pick it.
+    expect(openPr).not.toContain("'--head', identity.branch");
+  });
+
+  test('opens the PR for a named branch when one is given', async () => {
+    // The window between git_push returning and open_pr being called is
+    // between two tool calls, so no locking inside either one reaches it. The
+    // branch git_push reported is passed back, and this call describes that
+    // push rather than the checkout as it now stands.
+    const source = readFileSync(fileURLToPath(new URL('./git-worktrees.ts', import.meta.url)), 'utf8');
+    const openPr = source.slice(source.indexOf("name: 'open_pr'"));
+    expect(openPr).toContain("typeof args.branch === 'string'");
+    // And git_push tells the caller what to pass.
+    const push = source.slice(source.indexOf("name: 'git_push'"), source.indexOf("name: 'open_pr'"));
+    expect(push).toContain('Pass branch=');
+  });
+
+  test('still refuses a detached HEAD', async () => {
+    expect((await createWorktreeTool.handler({ repo: 'proj' })).isError).toBeFalsy();
+    const worktree = join(firstTopic, 'proj');
+    git(worktree, ['checkout', '-q', '--detach']);
+    const response = await gitPushTool.handler({ repo: 'proj' });
+    expect(response.isError).toBe(true);
+    expect(response.content[0].text).toContain('detached HEAD');
+  });
+
+  test('a sibling committing under the gate cannot smuggle that commit into the push', async () => {
+    // The gate runs outside the repository lock, and same-topic siblings share
+    // this worktree, so the checkout can move after the verdict. The push names
+    // the commit that was judged, so a sibling's commit simply is not pushed —
+    // it gets its own verdict on its own push.
+    expect((await createWorktreeTool.handler({ repo: 'proj' })).isError).toBeFalsy();
+    const worktree = join(firstTopic, 'proj');
+    writeFileSync(join(worktree, 'work.txt'), 'work\n');
+    expect((await gitCommitTool.handler({ repo: 'proj', message: 'work' })).isError).toBeFalsy();
+    const judged = git(worktree, ['rev-parse', 'HEAD']);
+    const branch = git(worktree, ['branch', '--show-current']);
+
+    // The gate script plays the sibling: it runs with the worktree as its cwd.
+    const gateScript = join(root, 'committing-gate.sh');
+    writeFileSync(
+      gateScript,
+      '#!/usr/bin/env bash\ngit -c user.email=s@s -c user.name=s commit -q --allow-empty -m "sibling commit"\nexit 0\n',
+    );
+    chmodSync(gateScript, 0o755);
+    process.env.NANOCLAW_REVIEW_CHURN_GATE_SCRIPT = gateScript;
+
+    expect((await gitPushTool.handler({ repo: 'proj' })).isError).toBeFalsy();
+    expect(git(remote, ['rev-parse', branch])).toBe(judged);
+    expect(git(worktree, ['rev-parse', 'HEAD'])).not.toBe(judged);
+  });
+
+  test('a sibling switching branches under the gate cannot redirect the push', async () => {
+    // The sibling checks out a different branch at the SAME commit, so nothing
+    // about HEAD changes. The push still goes to the branch that was judged,
+    // because that is the branch it names.
+    expect((await createWorktreeTool.handler({ repo: 'proj' })).isError).toBeFalsy();
+    const worktree = join(firstTopic, 'proj');
+    writeFileSync(join(worktree, 'work.txt'), 'work\n');
+    expect((await gitCommitTool.handler({ repo: 'proj', message: 'work' })).isError).toBeFalsy();
+    const judged = git(worktree, ['rev-parse', 'HEAD']);
+    const branch = git(worktree, ['branch', '--show-current']);
+
+    const gateScript = join(root, 'switching-gate.sh');
+    writeFileSync(gateScript, '#!/usr/bin/env bash\ngit checkout -q -b smuggled\nexit 0\n');
+    chmodSync(gateScript, 0o755);
+    process.env.NANOCLAW_REVIEW_CHURN_GATE_SCRIPT = gateScript;
+
+    expect((await gitPushTool.handler({ repo: 'proj' })).isError).toBeFalsy();
+    expect(git(worktree, ['branch', '--show-current'])).toBe('smuggled');
+    expect(git(remote, ['rev-parse', branch])).toBe(judged);
+    expect(() => git(remote, ['show-ref', '--verify', 'refs/heads/smuggled'])).toThrow();
   });
 
   test('origin-pin-drift-and-corrupt-destination-fail-closed-without-loss', async () => {

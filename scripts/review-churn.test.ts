@@ -453,6 +453,22 @@ describe('review-churn gate', () => {
     expect(gate(payload).status).toBe(0);
   });
 
+  it('ignores uncommitted work under --committed-only, because a push sends commits', () => {
+    // The same evidence that lifts a pre-commit check must not lift a gate run
+    // in front of a push: an edit in the working tree never reaches the PR.
+    const payload = fixture('toctou-class');
+    payload.worktree = ['src/mailbox/write.ts'];
+    const out = spawn(['gate', '--json', '--committed-only'], payload);
+    expect(out.status).toBe(3);
+    expect((JSON.parse(out.stdout) as Decision).status).toBe('refuse');
+
+    // A commit at the primitive still lifts it.
+    payload.commits = [
+      { sha: 'jjj0000', date: AFTER, message: 'fix(mailbox): guard the write', files: ['src/mailbox/write.ts'] },
+    ];
+    expect(spawn(['gate', '--json', '--committed-only'], payload).status).toBe(0);
+  });
+
   it('does not accept a seam commit that predates the finding as the reframe', () => {
     const payload = fixture('toctou-class');
     payload.commits = [
@@ -841,6 +857,125 @@ describe('review-churn gate', () => {
     expect(gate(vague).decision.unlifted).toHaveLength(2);
   });
 
+  it('reads seam sources from the pinned commit, not from the checkout', () => {
+    // Same-topic siblings share a worktree, so the checkout can change while
+    // the gate runs. With a commit pinned, the classifier must derive its seams
+    // from that commit's files — otherwise a sibling switching branches
+    // mid-verdict decides what the push is judged against.
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'review-churn-src-'));
+    const git = (...args: string[]) => {
+      const res = spawnSync('git', args, {
+        cwd: root,
+        encoding: 'utf8',
+        env: {
+          ...process.env,
+          GIT_AUTHOR_DATE: '2026-09-01T16:00:00Z',
+          GIT_COMMITTER_DATE: '2026-09-01T16:00:00Z',
+          GIT_AUTHOR_NAME: 'test',
+          GIT_AUTHOR_EMAIL: 'test@example.com',
+          GIT_COMMITTER_NAME: 'test',
+          GIT_COMMITTER_EMAIL: 'test@example.com',
+        },
+      });
+      if (res.status !== 0) throw new Error(`git ${args.join(' ')}: ${res.stderr}`);
+      return res.stdout.trim();
+    };
+    const write = (file: string, body: string) => {
+      fs.mkdirSync(path.dirname(path.join(root, file)), { recursive: true });
+      fs.writeFileSync(path.join(root, file), body);
+    };
+    try {
+      git('init', '-q', '-b', 'main');
+      write('src/mailbox/write.ts', 'export function writeSessionMessage() {}\nexport function wakeContainer() {}\n');
+      for (const site of ['src/router.ts', 'src/delivery.ts', 'src/tasks.ts', 'src/dashboard/close.ts']) {
+        write(site, "import { writeSessionMessage, wakeContainer } from '../mailbox/write.js';\n");
+      }
+      // The sites' real imports, as the pinned commit has them.
+      write('src/router.ts', "import { writeSessionMessage, wakeContainer } from './mailbox/write.js';\n");
+      write('src/delivery.ts', "import { writeSessionMessage } from './mailbox/write.js';\n");
+      write('src/tasks.ts', "import { wakeContainer } from './mailbox/write.js';\n");
+      write('src/dashboard/close.ts', "import { writeSessionMessage } from '../mailbox/write.js';\n");
+      git('add', '-A');
+      git('commit', '-qm', 'the sites as the push will send them');
+      const pinned = git('rev-parse', 'HEAD');
+
+      // A sibling now empties every site in the CHECKOUT, which would leave the
+      // classifier with no imports to find and no seam to gate on.
+      for (const site of ['src/router.ts', 'src/delivery.ts', 'src/tasks.ts', 'src/dashboard/close.ts']) {
+        write(site, '// a sibling switched branches\n');
+      }
+
+      const payload = fixture('toctou-class');
+      delete payload.sources;
+      payload.repoRoot = root;
+      payload.commits = [];
+      payload.worktree = [];
+
+      // Unpinned, the checkout decides and the class has no seam to gate on.
+      const unpinned = JSON.parse(spawn(['classify', '--json'], payload).stdout) as Report;
+      expect(unpinned.classes.find((c) => c.rounds >= 3)!.seam).toBeNull();
+
+      // Pinned to the commit being pushed, the seam is the one that commit has.
+      const pinnedReport = JSON.parse(spawn(['classify', '--json', '--head', pinned], payload).stdout) as Report;
+      expect(pinnedReport.classes.find((c) => c.rounds >= 3)!.seam).toBe('src/mailbox/write.ts');
+      expect(spawn(['gate', '--json', '--committed-only', '--head', pinned], payload).status).toBe(3);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('reads the history of the commit it is given, not of whatever HEAD points at', () => {
+    // A caller that has pinned which commit it is about to push passes --head.
+    // Without it the verdict is about the checkout, which a sibling can move:
+    // their newer commit at the primitive would lift a gate for a push that
+    // leaves it behind.
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'review-churn-head-'));
+    const git = (...args: string[]) => {
+      const res = spawnSync('git', args, {
+        cwd: root,
+        encoding: 'utf8',
+        env: {
+          ...process.env,
+          GIT_AUTHOR_DATE: '2026-09-01T16:00:00Z',
+          GIT_COMMITTER_DATE: '2026-09-01T16:00:00Z',
+          GIT_AUTHOR_NAME: 'test',
+          GIT_AUTHOR_EMAIL: 'test@example.com',
+          GIT_COMMITTER_NAME: 'test',
+          GIT_COMMITTER_EMAIL: 'test@example.com',
+        },
+      });
+      if (res.status !== 0) throw new Error(`git ${args.join(' ')}: ${res.stderr}`);
+      return res.stdout.trim();
+    };
+    try {
+      git('init', '-q', '-b', 'main');
+      fs.writeFileSync(path.join(root, 'unrelated.txt'), 'base\n');
+      git('add', '-A');
+      git('commit', '-qm', 'base');
+      const pinned = git('rev-parse', 'HEAD');
+
+      // The reframe lands only on a side branch — reachable from that commit,
+      // not from the one the caller pinned.
+      git('checkout', '-q', '-b', 'sibling');
+      fs.mkdirSync(path.join(root, 'src/mailbox'), { recursive: true });
+      fs.writeFileSync(path.join(root, 'src/mailbox/write.ts'), 'export function writeSessionMessage() {}\n');
+      git('add', '-A');
+      git('commit', '-qm', 'fix(mailbox): guard the write');
+      const sibling = git('rev-parse', 'HEAD');
+
+      const payload = fixture('toctou-class');
+      payload.repoRoot = root;
+      // HEAD is the sibling's branch, so an unpinned gate lifts on their work.
+      expect(spawn(['gate', '--json', '--committed-only'], payload).status).toBe(0);
+      // Pinned to what the push would send, the reframe is not there.
+      expect(spawn(['gate', '--json', '--committed-only', '--head', pinned], payload).status).toBe(3);
+      // Pinned to the commit that does carry it, it lifts.
+      expect(spawn(['gate', '--json', '--committed-only', '--head', sibling], payload).status).toBe(0);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it('reads the file either side of a real commit to judge a reframe trailer', () => {
     // The payload can supply both images, so the tests above are hermetic; this
     // one exercises the `git show` path they stand in for, including the rename
@@ -980,9 +1115,72 @@ describe('skill wiring', () => {
     const helper = fs.readFileSync(path.resolve('container/skills/pr-review-loop/scripts/codex-review.sh'), 'utf8');
     // gate → push → record, in that order. Recording is a claim that a site
     // patch was pushed, so a refused push must not leave it in the PR body.
-    expect(helper).toMatch(
-      /push\)\n[\s\S]*?run_gate\n\s+shift\n\s+git push "\$@"\n\s+if \[ -n "\$GATE_OVERRIDE_LINE" \]; then\n\s+record_site_patch_override/,
+    const push = helper.slice(helper.indexOf('  push)'));
+    const order = ['run_gate --committed-only', 'git push "$@"', 'record_site_patch_override'].map((m) =>
+      push.indexOf(m),
     );
+    expect(order.every((i) => i >= 0)).toBe(true);
+    expect(order).toEqual([...order].sort((a, b) => a - b));
+    // A named BRANCH resolves the PR, never the mutable checkout.
+    expect(helper).toMatch(/BRANCH:-\}" \]; then\n[\s\S]*?PR_LIST=\$\(resolve_pr_list "\$BRANCH"/);
+    // The verdict is about the branch the push UPDATES. The checkout's branch
+    // and BRANCH can both name something else whose PRs are clean, so the
+    // refspec's destination re-resolves before the gate runs.
+    expect(push).toContain('PUSH_DEST="${BASH_REMATCH[2]}"');
+    expect(push).toMatch(/PUSH_DEST" != "\$\{BRANCH:-\}"/);
+    expect(push).toContain('PR_LIST=$(resolve_pr_list "$PUSH_DEST"');
+    // The PR lives in the base repository, which a fork clone does not point
+    // at, and the listing is bounded — a full page fails closed rather than
+    // gating a subset.
+    expect(helper).toContain('base_repo()');
+    expect(helper).toContain('--limit "$PR_LIST_LIMIT"');
+    expect(helper).toContain('the listing may be truncated');
+    // Never a bare push: `push.default=matching` and a configured
+    // `remote.<name>.push` both let one update several branches, so the
+    // refspec is built from the checkout when the caller gave none and git is
+    // never left to decide what a push means.
+    expect(push).toContain('push_refspecs" -eq 0');
+    expect(push).toContain('set -- "$@" "$push_oid:refs/heads/$push_branch"');
+    // A dry run updates no remote, so it must not write a claim that a site
+    // patch was pushed into any PR body.
+    expect(push).toContain('PUSH_DRY_RUN=1');
+    // PR resolution describes one repository, so a second remote is refused
+    // rather than resolved for: a push to `other` would otherwise be judged by
+    // the checkout repository's PRs.
+    expect(push).toContain('is not origin; the churn gate resolves PRs for one repository');
+    expect(push).toMatch(/PUSH_DRY_RUN" -eq 1 \]; then\n[\s\S]*?was NOT recorded/);
+    // And every PR the branch resolves to, not the first: one branch can have
+    // open PRs into two bases, a push updates both, and a verdict from one
+    // would let a held class on the other ride along. The loop is inside
+    // run_gate, which is the seam `gate` and `push` share.
+    const runGate = helper.slice(helper.indexOf('run_gate() {'), helper.indexOf('case "${1'));
+    expect(runGate).toContain('for pr in $PR_LIST');
+    expect(helper).not.toMatch(/\)\]\[0\]\.number/);
+    // `--head` filters by branch name only, so a fork PR with the same branch
+    // name is in the result set; the source repository is what separates them.
+    expect(helper).toContain('headRepositoryOwner.login ==');
+    expect(helper).toContain('headRepository.name ==');
+    // One verdict describes one destination, so the push shapes that send more
+    // than the judged ref are refused rather than gated on the wrong one. The
+    // mechanism is an allowlist, not a denylist: `--branches` is `--all` under
+    // another spelling, and a denylist misses the next alias git adds. Options
+    // are also required to be self-contained, since a separate value argument
+    // would be counted as the remote or a refspec.
+    for (const shape of ['--all', '--branches', '--mirror', '--tags', '--follow-tags', '--prune'])
+      expect(push).toContain(shape);
+    expect(push).toContain('is not known to the churn gate to leave the ref set alone');
+    expect(push).toContain('--push-option=*');
+    // `--repo=<remote>` supplies the repository itself, which makes the first
+    // bare word the refspec — a different positional grammar, so it is refused
+    // rather than special-cased.
+    expect(push).not.toContain('--repo=*');
+    expect(push).toContain('is not <sha>:refs/heads/<branch>');
+    expect(push).toMatch(/push_refspecs" -gt 1/);
+    // The refspec is validated by a positive grammar for the same reason the
+    // options are: counting arguments does not prove there is one destination,
+    // since `refs/heads/*:refs/heads/*` is one argument that pushes every
+    // branch, and a ref source can move between the verdict and the push.
+    expect(push).toMatch(/\[\[ "\$arg" =~ \^\(\[0-9a-f\]\{7,40\}\):refs\/heads\//);
     // Evaluating the gate writes nothing at all.
     const gateBranch = helper.slice(helper.indexOf('  gate)'), helper.indexOf('  push)'));
     expect(gateBranch).not.toContain('record_site_patch_override');
