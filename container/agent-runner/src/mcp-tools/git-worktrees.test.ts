@@ -1,6 +1,16 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import { execFileSync } from 'child_process';
-import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'fs';
+import {
+  chmodSync,
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  writeFileSync,
+} from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 
@@ -288,6 +298,60 @@ describe('topic-linked worktree topology', () => {
     process.env.NANOCLAW_REVIEW_CHURN_GATE_SCRIPT = cleanGate;
     expect((await gitPushTool.handler({ repo: 'proj' })).isError).toBeFalsy();
     expect(git(remote, ['show-ref', '--verify', `refs/heads/${branch}`])).toContain(branch);
+  });
+
+  test('a sibling moving HEAD under the gate re-takes the decision before pushing', async () => {
+    // The gate runs outside the repository lock (it makes its own gh calls),
+    // so a same-topic sibling sharing this worktree can move the branch after
+    // the verdict. Here the gate script itself plays that sibling: it commits
+    // on its first run only, so the push must be re-evaluated against the new
+    // head rather than sending a head nobody judged.
+    expect((await createWorktreeTool.handler({ repo: 'proj' })).isError).toBeFalsy();
+    const worktree = join(firstTopic, 'proj');
+    writeFileSync(join(worktree, 'work.txt'), 'work\n');
+    expect((await gitCommitTool.handler({ repo: 'proj', message: 'work' })).isError).toBeFalsy();
+
+    const marker = join(root, 'moved-once');
+    const runLog = join(root, 'gate-runs');
+    const gateScript = join(root, 'racing-gate.sh');
+    writeFileSync(
+      gateScript,
+      '#!/usr/bin/env bash\n' +
+        `echo run >> ${runLog}\n` +
+        `if [ ! -f ${marker} ]; then : > ${marker}; ` +
+        'git -c user.email=s@s -c user.name=s commit -q --allow-empty -m "sibling commit"; fi\nexit 0\n',
+    );
+    chmodSync(gateScript, 0o755);
+    process.env.NANOCLAW_REVIEW_CHURN_GATE_SCRIPT = gateScript;
+
+    expect((await gitPushTool.handler({ repo: 'proj' })).isError).toBeFalsy();
+    const branch = git(worktree, ['branch', '--show-current']);
+    // What landed is the head the second evaluation actually saw.
+    expect(git(remote, ['rev-parse', branch])).toBe(git(worktree, ['rev-parse', 'HEAD']));
+    expect(git(worktree, ['log', '-1', '--format=%s'])).toBe('sibling commit');
+    // Two evaluations: the first verdict was discarded when the head moved.
+    expect(readFileSync(runLog, 'utf8').trim().split('\n')).toHaveLength(2);
+  });
+
+  test('a HEAD that keeps moving under the gate pushes nothing', async () => {
+    expect((await createWorktreeTool.handler({ repo: 'proj' })).isError).toBeFalsy();
+    const worktree = join(firstTopic, 'proj');
+    writeFileSync(join(worktree, 'work.txt'), 'work\n');
+    expect((await gitCommitTool.handler({ repo: 'proj', message: 'work' })).isError).toBeFalsy();
+    const branch = git(worktree, ['branch', '--show-current']);
+
+    const gateScript = join(root, 'always-racing-gate.sh');
+    writeFileSync(
+      gateScript,
+      '#!/usr/bin/env bash\ngit -c user.email=s@s -c user.name=s commit -q --allow-empty -m "sibling commit"\nexit 0\n',
+    );
+    chmodSync(gateScript, 0o755);
+    process.env.NANOCLAW_REVIEW_CHURN_GATE_SCRIPT = gateScript;
+
+    const response = await gitPushTool.handler({ repo: 'proj' });
+    expect(response.isError).toBe(true);
+    expect(response.content[0].text).toContain('HEAD moved while the review-loop churn gate');
+    expect(() => git(remote, ['show-ref', '--verify', `refs/heads/${branch}`])).toThrow();
   });
 
   test('origin-pin-drift-and-corrupt-destination-fail-closed-without-loss', async () => {

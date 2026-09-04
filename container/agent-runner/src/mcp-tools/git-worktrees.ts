@@ -20,6 +20,12 @@ import type { McpToolDefinition } from './types.js';
 const LOCK_EX_NB = 2 | 4;
 const LOCK_UN = 8;
 const LOCK_WAIT_MS = 120_000;
+/**
+ * How many times a push re-takes the churn-gate decision when a same-topic
+ * sibling moves the branch underneath it. Two: one race is ordinary, a head
+ * that moves under two consecutive evaluations is a caller racing itself.
+ */
+const GATE_HEAD_ATTEMPTS = 2;
 const SAFE_SEGMENT = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 
 const libc = dlopen('libc.so.6', {
@@ -582,26 +588,50 @@ export const gitPushTool: McpToolDefinition = {
     const repo = typeof args.repo === 'string' ? args.repo : '';
     const resolved = worktreeForTool(repo);
     if ('error' in resolved) return resolved.error;
-    // A container agent's push path is this tool, not the skill's
-    // `codex-review.sh push`, so the gate has to sit here or it does not exist
-    // for container review loops. Outside the repository lock deliberately:
-    // the gate makes its own `gh` calls, and holding the lock across them would
-    // stall every sibling topic on this repo. It fails open — only an explicit
-    // refusal stops the push.
-    const gate = evaluateReviewChurnGate({ worktree: resolved.context.worktree });
-    if (gate.status === 'refused') return err(gate.message);
+    const worktree = resolved.context.worktree;
     try {
-      return await withRepositoryLock(resolved.context, async () => {
-        const branch = runGitAt(resolved.context.worktree, ['branch', '--show-current']);
-        if (!branch) return err('Cannot push a detached HEAD; create or switch to a branch explicitly');
-        const push =
-          args.force === true
-            ? ['push', '--force-with-lease', '-u', 'origin', branch]
-            : ['push', '-u', 'origin', branch];
-        runGitAt(resolved.context.worktree, push, 300_000);
-        await emitRefresh(resolved.context);
-        return ok(`Pushed ${branch} to origin${args.force === true ? ' (force-with-lease)' : ''}`);
-      });
+      // A container agent's push path is this tool, not the skill's
+      // `codex-review.sh push`, so the gate has to sit here or it does not
+      // exist for container review loops. It fails open — only an explicit
+      // refusal stops the push.
+      //
+      // The gate judges committed history, so its verdict belongs to ONE head.
+      // It runs outside the repository lock deliberately: it makes its own
+      // `gh` calls, and holding the lock across them would stall every sibling
+      // topic on this repo. Same-topic siblings share this worktree, though, so
+      // the branch can move between the verdict and the push — a rewrite could
+      // drop the very commit that lifted the gate. The head is therefore
+      // revalidated under the lock and the decision re-taken if it moved.
+      for (let attempt = 0; attempt < GATE_HEAD_ATTEMPTS; attempt += 1) {
+        const evaluatedHead = tryGitAt(worktree, ['rev-parse', 'HEAD']);
+        const gate = evaluateReviewChurnGate({ worktree });
+        if (gate.status === 'refused') return err(gate.message);
+        const outcome = await withRepositoryLock(resolved.context, async () => {
+          if (tryGitAt(worktree, ['rev-parse', 'HEAD']) !== evaluatedHead) return { moved: true } as const;
+          const branch = runGitAt(worktree, ['branch', '--show-current']);
+          if (!branch) {
+            return {
+              moved: false,
+              result: err('Cannot push a detached HEAD; create or switch to a branch explicitly'),
+            } as const;
+          }
+          const push =
+            args.force === true
+              ? ['push', '--force-with-lease', '-u', 'origin', branch]
+              : ['push', '-u', 'origin', branch];
+          runGitAt(worktree, push, 300_000);
+          await emitRefresh(resolved.context);
+          return {
+            moved: false,
+            result: ok(`Pushed ${branch} to origin${args.force === true ? ' (force-with-lease)' : ''}`),
+          } as const;
+        });
+        if (!outcome.moved) return outcome.result;
+      }
+      return err(
+        'HEAD moved while the review-loop churn gate was evaluating it, twice in a row, so the verdict ' +
+          'would not describe what this push sends. Nothing was pushed — let the sibling settle and run git_push again.',
+      );
     } catch (error) {
       return err(`git push failed: ${error instanceof Error ? error.message : String(error)}`);
     }
