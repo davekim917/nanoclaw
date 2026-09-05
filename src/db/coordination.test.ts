@@ -9,11 +9,17 @@
  * future upstream re-pin that changes any of them fails here rather than in
  * production.
  *
- * Real in-memory driver, no mocks: the assertions are about SQL behavior.
+ * Real in-memory driver, no mocks: the assertions are about SQL behavior. The
+ * schema comes from migration 071 itself rather than a restated CREATE TABLE,
+ * so the fixture cannot drift from the live one, and the raw handle is
+ * deliberately not used — this file is new and `src/db/raw-db-ratchet.test.ts`
+ * only ever shrinks.
  */
+import type Database from 'better-sqlite3';
 import { describe, expect, it, beforeEach, afterEach } from 'vitest';
 
-import { initTestDb, closeDb, runMigrations, getRawDb, getDb } from './index.js';
+import { initTestDb, closeDb, getDb } from './index.js';
+import { migration071 } from './migrations/071-host-coordination.js';
 import {
   clearDeliveryAttempt,
   getDeliveryAttempt,
@@ -29,6 +35,13 @@ import {
   writeWakeSignal,
 } from './coordination.js';
 
+/** Migration 071's `up` only ever calls `exec`, so a recorder captures its exact DDL. */
+function migration071Ddl(): string {
+  const statements: string[] = [];
+  migration071.up({ exec: (sql: string) => statements.push(sql) } as unknown as Database.Database);
+  return statements.join('\n');
+}
+
 const INSTANCE = 'host-a';
 const OTHER = 'host-b';
 const NOW = '2026-09-05T12:00:00.000Z';
@@ -39,7 +52,7 @@ const ISO_UTC = /^\d{4}-\d{2}-\d{2}T[\d:.]+Z$/;
 describe('coordination accessors', () => {
   beforeEach(async () => {
     await initTestDb();
-    runMigrations(getRawDb());
+    await getDb().exec(migration071Ddl());
   });
   afterEach(() => closeDb());
 

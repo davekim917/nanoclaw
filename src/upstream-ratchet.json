@@ -702,7 +702,7 @@
 "src/db/connection.ts":{"diff":101,"mode":"100644","sha256":"c1ed56fb5d7590a6f4fbf34ef96bf9a5d6dea3133b6df4252e17bc1524d50996"},
 "src/db/container-configs.test.ts":{"diff":7,"mode":"100644","sha256":"435d78b01fa85498e206c8dacd8037291675dd7b4cdcc6f8835366784ae4d4d0"},
 "src/db/container-configs.ts":{"diff":52,"mode":"100644","sha256":"530d240fffed8327f0bcec1231f8fa201370e68c6009b00b33468b3eb58d48b9"},
-"src/db/coordination.test.ts":{"diff":257,"mode":"100644","sha256":"50b147411df7f2e7e9ea422535d17ac5795d46bcae563f968fd8fd07fe50c8a2"},
+"src/db/coordination.test.ts":{"diff":266,"mode":"100644","sha256":"4c7f2e5ffd400be504f65d1abf509d94e99d2326e7e21855b5369a607486cfbb"},
 "src/db/coordination.ts":{"diff":0,"mode":"100644","sha256":"fb7263a5a35c9a5b793c945565c9f07379bb9442058a6c63cdbc02d700b0c752"},
 "src/db/db-v2.test.ts":{"diff":492,"mode":"100644","sha256":"33300791967eb461fc05b9e7680163d92ada5c2fc055f82c467023570e861f6e"},
 "src/db/driver-registry.test.ts":{"diff":0,"mode":"100644","sha256":"455692c62d37316925b2ecb6ec35e9ef8fe75264af70c44f9a10d977df452d17"},
