@@ -52,7 +52,7 @@
 import fs from 'fs';
 
 import { DATA_DIR } from '../../config.js';
-import { getRawDb } from '../../db/connection.js';
+import { getDb } from '../../db/connection.js';
 import { readSessionInbound, readSessionOutbound, type MessageTailRow } from '../../modules/mailbox/index.js';
 import { heartbeatPath } from '../../session-manager.js';
 import { log } from '../../log.js';
@@ -278,9 +278,7 @@ export const sessionsHandler: AuthHandler = async (req, _params, ctx) => {
 
   let rows: SessionJoinRow[];
   try {
-    rows = getRawDb()
-      .prepare(sql)
-      .all(...(values as Parameters<ReturnType<ReturnType<typeof getRawDb>['prepare']>['all']>)) as SessionJoinRow[];
+    rows = await getDb().all<SessionJoinRow>(sql, ...values);
   } catch (err) {
     log.warn('sessionsHandler: DB error', { err });
     return new Response(JSON.stringify({ error: 'internal_error' }), {
@@ -502,25 +500,24 @@ export const sessionsDetailHandler: AuthHandler = async (_req, params, ctx) => {
   // Re-use the same SELECT shape from the list handler so the detail row
   // carries every field the inbox card already shows — saves the SPA from
   // round-tripping through the list endpoint just to render the header.
-  const row = getRawDb()
-    .prepare(
-      `SELECT s.id, s.agent_group_id, s.messaging_group_id, s.thread_id,
-              s.last_active, s.last_outbound_at, s.last_outbound_kind,
-              s.title, s.archived_at, s.created_at,
-              t.task_id          AS attached_task_id,
-              t.status           AS attached_task_status,
-              t.needs_input      AS attached_task_needs_input
-         FROM sessions s
-    LEFT JOIN (
-                  SELECT task_id, child_session_id, status, needs_input, admitted_at,
-                         ROW_NUMBER() OVER (PARTITION BY child_session_id ORDER BY admitted_at DESC) AS rn
-                    FROM tasks
-                   WHERE child_session_id IS NOT NULL
-                     AND status IN ('pending', 'running')
-                ) t ON t.child_session_id = s.id AND t.rn = 1
-        WHERE s.id = ?`,
-    )
-    .get(sessionId) as SessionJoinRow | undefined;
+  const row = await getDb().get<SessionJoinRow>(
+    `SELECT s.id, s.agent_group_id, s.messaging_group_id, s.thread_id,
+            s.last_active, s.last_outbound_at, s.last_outbound_kind,
+            s.title, s.archived_at, s.created_at,
+            t.task_id          AS attached_task_id,
+            t.status           AS attached_task_status,
+            t.needs_input      AS attached_task_needs_input
+       FROM sessions s
+  LEFT JOIN (
+                SELECT task_id, child_session_id, status, needs_input, admitted_at,
+                       ROW_NUMBER() OVER (PARTITION BY child_session_id ORDER BY admitted_at DESC) AS rn
+                  FROM tasks
+                 WHERE child_session_id IS NOT NULL
+                   AND status IN ('pending', 'running')
+              ) t ON t.child_session_id = s.id AND t.rn = 1
+      WHERE s.id = ?`,
+    sessionId,
+  );
 
   // §2a: nonexistent and out-of-scope both 404 with the same body. Same
   // collapse the steer + archive handlers use.
