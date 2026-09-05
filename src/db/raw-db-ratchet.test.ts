@@ -83,6 +83,19 @@ const NOT_CALLERS: readonly string[] = [DEFINER, SELF];
  * `hasDestination` / `getDestinations`, and `agent-route.ts`'s
  * `targetWiredToMessagingGroup`). None of them has an async twin; they convert
  * in PR 6 with their closure or inside `withCentralSync`.
+ *
+ * PR 5b adds NOTHING. It was expected to add one entry —
+ * `src/modules/permissions/guard.ts`, joining the other guard implementations
+ * above under PR 4's SQL-constant shape — and does not, because the two leaf
+ * exports that guard reads (`hasAdminPrivilege`, `getPendingChannelApproval`)
+ * simply stayed synchronous. That is the cheaper half of the same §4.5 rule:
+ * the SQL-constant shape would have re-derived one composite predicate
+ * (`equivalentSlackUserIds` × three role probes) into THREE separate guard
+ * files, since `dashboard/thread-close-guard.ts` and
+ * `dashboard/observatory-assign-guard.ts` call `hasAdminPrivilege` from their
+ * `decide` bodies too. One synchronous export beats three hand-copied
+ * authorization predicates, and §4.2 is satisfied either way: there is exactly
+ * one form of each function, never two.
  */
 export const RAW_DB_IMPORTERS: readonly string[] = [
   'scripts/bust-slack-profile-cache.ts',
