@@ -106,6 +106,15 @@ const NOT_CALLERS: readonly string[] = [DEFINER, SELF];
  * is left here is direct raw SQL in files outside PR 6's scope (dashboard
  * helpers, storage-manager, the boot reconcilers in `main.ts`, scripts/setup)
  * plus the test fixtures; it keeps shrinking under the same rule.
+ *
+ * PR 6 also carried the three "5c deferral" families 5b left raw (180 → 176):
+ * `writeAudit`/`purgeIntentBody` (scheduled-shared.ts, with every caller in
+ * cli/resources/tasks.ts, scheduled-move.ts, scheduled-mutations.ts and the
+ * sweep-scheduled-move helpers), `recoverMoveIntents`/`pruneAuditBodies`, and
+ * `syncDoneProposalMirror` with its sweep-continuation caller. The remaining
+ * 5c rows — `pruneCliRequestExecutions` (cli/request-ledger.ts + sweep-central)
+ * and `hasUnresolvedMoveIntent` (scheduled-shared.ts + sweep-scheduling) — are
+ * 5c's, in parallel.
  */
 export const RAW_DB_IMPORTERS: readonly string[] = [
   'scripts/bust-slack-profile-cache.ts',
@@ -259,7 +268,6 @@ export const RAW_DB_IMPORTERS: readonly string[] = [
   'src/modules/sweep-continuation/continuation.test.ts',
   'src/modules/sweep-idle-reap/idle-reap.test.ts',
   'src/modules/sweep-orchestrator/orchestrator.test.ts',
-  'src/modules/sweep-scheduled-move/index.ts',
   'src/modules/sweep-scheduled-move/scheduled-move.test.ts',
   'src/modules/sweep-scheduling/index.ts',
   'src/modules/sweep-scheduling/scheduling.test.ts',

@@ -12,12 +12,11 @@
  * `scheduled-move-recovery: sweep hook failed` warn string on both, so a log
  * search for that string still finds every failure it used to.
  */
-import type Database from 'better-sqlite3';
 import fs from 'fs';
 import path from 'path';
 
 import { log } from '../../log.js';
-import { getRawDb } from '../../db/connection.js';
+import { getDb } from '../../db/connection.js';
 import { withCentralSync } from '../../db/central-lease.js';
 import { withQuietInvalidationSync } from '../../db/sessions.js';
 import { sessionsBaseDir } from '../../session-manager.js';
@@ -58,21 +57,25 @@ type MoveIntentSnapshot = TaskRowSnapshot;
  * minimal test DB, or no session exists yet because the move crashed before the
  * target insert). A null target session contributes 0 to the scoped count.
  */
-function resolveTargetSessionId(
-  centralDb: Database.Database,
+async function resolveTargetSessionId(
   targetAgentGroupId: string,
   targetMessagingGroupId: string,
-): string | null {
+): Promise<string | null> {
   try {
-    const row = centralDb
-      .prepare(
-        "SELECT id FROM sessions WHERE agent_group_id = ? AND messaging_group_id = ? AND thread_id IS NULL AND status = 'active' LIMIT 1",
-      )
-      .get(targetAgentGroupId, targetMessagingGroupId) as { id: string } | undefined;
+    const row = await getDb().get<{ id: string }>(
+      "SELECT id FROM sessions WHERE agent_group_id = ? AND messaging_group_id = ? AND thread_id IS NULL AND status = 'active' LIMIT 1",
+      targetAgentGroupId,
+      targetMessagingGroupId,
+    );
     return row?.id ?? null;
   } catch {
     return null;
   }
+}
+
+/** SQLite's "no such table" — the feature is not installed, not a failure. */
+function isMissingTable(err: unknown): boolean {
+  return err instanceof Error && /no such table/i.test(err.message);
 }
 
 interface ParsedIntentDetail {
@@ -121,7 +124,7 @@ function parseIntentDetail(detailJson: string | null): ParsedIntentDetail {
  *
  * Autonomous, not just observable. Additive — no firing-path change (C1).
  */
-export async function recoverMoveIntents(centralDb: Database.Database, options: MoveRecoveryOptions): Promise<void> {
+export async function recoverMoveIntents(options: MoveRecoveryOptions): Promise<void> {
   const nowMs = options.nowMs ?? Date.now();
   // ONE sessions root, always the real one. `dataDir` used to be injectable and
   // no production caller ever injected it — the sweep's only call site passes
@@ -142,16 +145,17 @@ export async function recoverMoveIntents(centralDb: Database.Database, options: 
     ts: string;
   }>;
   try {
-    intents = centralDb
-      .prepare(
-        `SELECT session_id, agent_group_id, series_id, detail_json, correlation_id, ts
+    intents = await getDb().all<(typeof intents)[number]>(
+      `SELECT session_id, agent_group_id, series_id, detail_json, correlation_id, ts
            FROM scheduled_audit
           WHERE action = 'move_intent' AND resolved_at IS NULL`,
-      )
-      .all() as typeof intents;
-  } catch {
-    // Table absent (feature not installed) — nothing to recover.
-    return;
+    );
+  } catch (err) {
+    // Table absent (feature not installed) — nothing to recover. Anything
+    // else (a driver that is not initialized, a locked file) is a real
+    // failure and surfaces through the duty's own catch.
+    if (isMissingTable(err)) return;
+    throw err;
   }
 
   for (const intent of intents) {
@@ -165,7 +169,7 @@ export async function recoverMoveIntents(centralDb: Database.Database, options: 
     const source = { agentGroupId: intent.agent_group_id, sessionId: intent.session_id };
     const targetSessionId =
       detail.targetAgentGroupId && detail.targetMessagingGroupId
-        ? resolveTargetSessionId(centralDb, detail.targetAgentGroupId, detail.targetMessagingGroupId)
+        ? await resolveTargetSessionId(detail.targetAgentGroupId, detail.targetMessagingGroupId)
         : null;
     const target =
       detail.targetAgentGroupId && targetSessionId
@@ -199,7 +203,7 @@ export async function recoverMoveIntents(centralDb: Database.Database, options: 
           { seriesId: intent.series_id, correlationId: intent.correlation_id, liveCount: live.count },
         );
       }
-      purgeIntentBody(centralDb, intent.correlation_id);
+      await purgeIntentBody(intent.correlation_id);
       continue;
     }
 
@@ -211,7 +215,7 @@ export async function recoverMoveIntents(centralDb: Database.Database, options: 
         seriesId: intent.series_id,
         correlationId: intent.correlation_id,
       });
-      purgeIntentBody(centralDb, intent.correlation_id);
+      await purgeIntentBody(intent.correlation_id);
       continue;
     }
 
@@ -223,7 +227,7 @@ export async function recoverMoveIntents(centralDb: Database.Database, options: 
         seriesId: intent.series_id,
         correlationId: intent.correlation_id,
       });
-      purgeIntentBody(centralDb, intent.correlation_id);
+      await purgeIntentBody(intent.correlation_id);
       continue;
     }
     const snapshot = detail.snapshot;
@@ -312,7 +316,7 @@ export async function recoverMoveIntents(centralDb: Database.Database, options: 
     }
     // Stamp + purge AFTER the restore (so a crash before this makes the next
     // pass re-evaluate; now a live row exists → it stamps without re-restoring).
-    purgeIntentBody(centralDb, intent.correlation_id);
+    await purgeIntentBody(intent.correlation_id);
   }
 }
 
@@ -326,20 +330,20 @@ const AUDIT_BODY_RETENTION_MS = 90 * 24 * 60 * 60 * 1000;
  * cancel-vs-completed distinguishability (the `action='cancel'` join, §4.3)
  * indefinitely. Design §4.4 retention.
  */
-export function pruneAuditBodies(centralDb: Database.Database, options: { nowMs?: number }): void {
+export async function pruneAuditBodies(options: { nowMs?: number }): Promise<void> {
   const nowMs = options.nowMs ?? Date.now();
   const cutoff = new Date(nowMs - AUDIT_BODY_RETENTION_MS).toISOString();
   try {
-    centralDb
-      .prepare(
-        `UPDATE scheduled_audit
-            SET before_preview = NULL, after_preview = NULL, detail_json = NULL
-          WHERE ts < ?
-            AND (before_preview IS NOT NULL OR after_preview IS NOT NULL OR detail_json IS NOT NULL)`,
-      )
-      .run(cutoff);
-  } catch {
-    // Table absent — nothing to prune.
+    await getDb().run(
+      `UPDATE scheduled_audit
+          SET before_preview = NULL, after_preview = NULL, detail_json = NULL
+        WHERE ts < ?
+          AND (before_preview IS NOT NULL OR after_preview IS NOT NULL OR detail_json IS NOT NULL)`,
+      cutoff,
+    );
+  } catch (err) {
+    // Table absent — nothing to prune. Anything else surfaces.
+    if (!isMissingTable(err)) throw err;
   }
 }
 
@@ -362,7 +366,7 @@ export function registerScheduledMoveSweepDuties(): void {
     // firing-path change (C1).
     run: async () => {
       try {
-        await recoverMoveIntents(getRawDb(), {});
+        await recoverMoveIntents({});
       } catch (err) {
         log.warn('scheduled-move-recovery: sweep hook failed', { err });
       }
@@ -374,9 +378,9 @@ export function registerScheduledMoveSweepDuties(): void {
     phase: 'tick:housekeeping',
     order: 60,
     // 90d audit-body prune, the companion of the move recovery above.
-    run: () => {
+    run: async () => {
       try {
-        pruneAuditBodies(getRawDb(), {});
+        await pruneAuditBodies({});
       } catch (err) {
         log.warn('scheduled-move-recovery: sweep hook failed', { err });
       }
