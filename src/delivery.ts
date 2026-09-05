@@ -17,6 +17,7 @@ import {
 } from './db/sessions.js';
 import { getAgentGroup } from './db/agent-groups.js';
 import { getRawDb, hasTableRaw } from './db/connection.js';
+import { clearDeliveryAttempt, recordDeliveryAttempt } from './db/coordination.js';
 import {
   getTaskThreadAnchor,
   setTaskThreadAnchor,
@@ -67,8 +68,45 @@ const ACTIVE_POLL_MS = 1000;
 const SWEEP_POLL_MS = 60_000;
 const MAX_DELIVERY_ATTEMPTS = 3;
 
-/** Track delivery attempt counts. Resets on process restart (gives failed messages a fresh chance). */
-const deliveryAttempts = new Map<string, number>();
+/**
+ * Attempt counts live in the `delivery_attempts` table, so they survive a
+ * host restart: a poison message gets MAX_DELIVERY_ATTEMPTS total, not
+ * MAX_DELIVERY_ATTEMPTS per process lifetime (the old in-memory counter
+ * reset on every restart, so a crash-looping host retried it forever).
+ * Bookkeeping failures must never break delivery: a failed record skips the
+ * give-up decision for this tick (the message just retries next poll), and a
+ * failed clear leaves a stale row the next lifecycle of the same id clears.
+ */
+async function recordAttemptRow(messageId: string, sessionId: string, err: unknown): Promise<number | null> {
+  /* eslint-disable no-catch-all/no-catch-all -- attempt bookkeeping must never break delivery */
+  try {
+    return await recordDeliveryAttempt({
+      messageId,
+      sessionId,
+      now: new Date().toISOString(),
+      nextAttemptAt: null,
+      error: err instanceof Error ? err.message : String(err),
+    });
+  } catch (recordErr) {
+    log.error('Failed to record delivery attempt — retrying next poll without a count', {
+      messageId,
+      sessionId,
+      err: recordErr,
+    });
+    return null;
+  }
+  /* eslint-enable no-catch-all/no-catch-all */
+}
+
+async function clearAttemptRow(messageId: string): Promise<void> {
+  /* eslint-disable no-catch-all/no-catch-all -- attempt bookkeeping must never break delivery */
+  try {
+    await clearDeliveryAttempt(messageId);
+  } catch (err) {
+    log.warn('Failed to clear delivery attempt row', { messageId, err });
+  }
+  /* eslint-enable no-catch-all/no-catch-all */
+}
 
 // ── Sweep change-gate (docs/specs/bounded-periodic-work/plan.md) ──
 //
@@ -83,8 +121,12 @@ const deliveryAttempts = new Map<string, number>();
 //
 //   1. Arm only after a drain proves the session has NOTHING outstanding —
 //      not even a future `deliver_after` row, and not after a delivery error.
-//      Retry state lives only in `deliveryAttempts` (in memory), so a failed
-//      delivery never moves the file and would otherwise be skipped forever.
+//      Retry state now lives in the central DB's `delivery_attempts` rows
+//      rather than in process memory, but THE RULE IS UNCHANGED and must not
+//      be relaxed on that basis: the retry itself is still driven by polling
+//      the session's own outbound.db, and a failed delivery writes nothing
+//      there, so its mtime does not move. Arming on a drain that ended in an
+//      error would skip that session until the backoff in rule 2 expires.
 //   2. Expire the skip on time as well as on the change signal, so a bug in
 //      the signal costs bounded delay instead of permanent silence.
 export const QUIET_DELIVERY_BACKOFF_MS = 10 * 60_000;
@@ -631,7 +673,7 @@ async function drainSession(session: Session): Promise<DrainOutcome> {
           });
         }
       }
-      deliveryAttempts.delete(msg.id);
+      await clearAttemptRow(msg.id);
 
       // Pause the typing indicator after a real user-facing message
       // lands on the user's screen, so the client has time to visually
@@ -644,9 +686,8 @@ async function drainSession(session: Session): Promise<DrainOutcome> {
       }
     } catch (err) {
       sawError = true;
-      const attempts = (deliveryAttempts.get(msg.id) ?? 0) + 1;
-      deliveryAttempts.set(msg.id, attempts);
-      if (attempts >= MAX_DELIVERY_ATTEMPTS) {
+      const attempts = await recordAttemptRow(msg.id, session.id, err);
+      if (attempts !== null && attempts >= MAX_DELIVERY_ATTEMPTS) {
         log.error('Message delivery failed permanently, giving up', {
           messageId: msg.id,
           sessionId: session.id,
@@ -655,7 +696,7 @@ async function drainSession(session: Session): Promise<DrainOutcome> {
         });
         const errMsg = err instanceof Error ? err.message : String(err);
         await ackDelivery(agentGroup.id, session.id, (mailbox) => mailbox.markDeliveryFailed(msg.id, errMsg));
-        deliveryAttempts.delete(msg.id);
+        await clearAttemptRow(msg.id);
         // Incident 2026-09-01: the row dropped here was a repository
         // publication that had already fenced ~1400 session inbound DBs in
         // its workgroup. Its strict release fails fast on the first bad
@@ -679,6 +720,7 @@ async function drainSession(session: Session): Promise<DrainOutcome> {
         log.warn('Message delivery failed, will retry', {
           messageId: msg.id,
           sessionId: session.id,
+          // null: the bookkeeping write itself failed; count unknown this tick.
           attempt: attempts,
           maxAttempts: MAX_DELIVERY_ATTEMPTS,
           err,
