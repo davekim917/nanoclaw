@@ -47,6 +47,13 @@ function tsxArgs(args: string[]): string[] {
   return TSX_BIN.endsWith('npx') ? ['tsx', ...args] : args;
 }
 
+/**
+ * These integration cases create and mutate actual Git repositories, including
+ * migration and recovery state. #420 measured 5 s timeouts under host
+ * contention, so only these cases have a 30 s budget.
+ */
+const GIT_HEAVY_TEST_TIMEOUT_MS = 30_000;
+
 function git(cwd: string, args: string[]): string {
   return execFileSync('git', ['-c', 'user.name=Test', '-c', 'user.email=test@example.com', ...args], {
     cwd,
@@ -519,7 +526,7 @@ describe('lossless server-wide repository migration', () => {
     expect(after.indexBytesBase64).toBe(before.indexBytesBase64);
     expect(after.indexEntriesZBase64).toBe(before.indexEntriesZBase64);
     expect(after.statusZBase64).toBe(before.statusZBase64);
-  });
+  }, GIT_HEAVY_TEST_TIMEOUT_MS);
 
   it('neutralizes included dotted-name filter drivers before legacy Git status runs', () => {
     const f = fixture({ repo: 'filtered' });
@@ -850,7 +857,7 @@ describe('lossless server-wide repository migration', () => {
     );
     expect(fs.readFileSync(path.join(recovered.renamedOldPath!, '.git'), 'utf8')).toBe(pointer);
     expect(fs.lstatSync(path.join(recovered.renamedOldPath!, '.git')).mode & 0o7777).toBe(0o640);
-  });
+  }, GIT_HEAVY_TEST_TIMEOUT_MS);
 
   it('selects one exact surviving Git admin and raw index when collided metadata is ambiguous', async () => {
     const f = fixture({ repo: 'reviewed-ambiguous-admin' });
@@ -892,7 +899,7 @@ describe('lossless server-wide repository migration', () => {
     expect(fs.readFileSync(path.join(captured.destinationPath!, 'exact-admin.txt'), 'utf8')).toBe(
       'ongoing exact index state\n',
     );
-  });
+  }, GIT_HEAVY_TEST_TIMEOUT_MS);
 
   it('recovers a missing original admin from one exact hash-bound external Git-admin seed', async () => {
     const f = fixture({ repo: 'external-exact-admin' });
@@ -1273,7 +1280,7 @@ describe('lossless server-wide repository migration', () => {
     const migrated = manifest.captures.find((capture) => capture.workUnit.key.includes('thread-unborn'))!;
     expect(migrated.head).toBeNull();
     expect(fs.readFileSync(path.join(migrated.destinationPath!, 'untracked-only.txt'), 'utf8')).toBe('must survive\n');
-  });
+  }, GIT_HEAVY_TEST_TIMEOUT_MS);
 
   it('imports mirror-only refs and retires the bare mirror without deleting it', async () => {
     const f = fixture();
