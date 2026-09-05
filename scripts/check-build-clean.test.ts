@@ -11,6 +11,7 @@ import {
   isIgnorableDirtPath,
   partitionDirt,
   pathsForLines,
+  runCheckBuildClean,
 } from './check-build-clean.js';
 import { checkBuildDidNotMove } from './write-build-info.js';
 
@@ -286,11 +287,11 @@ describe('checkBuildDidNotMove', () => {
 });
 
 /**
- * Integration coverage: run the actual scripts against a throwaway git repo
- * so the exit code / stderr contract and the BUILD_INFO dirty stamp are
- * checked end to end, not just the pure partition helper.
+ * The guard's expensive compiler and lint steps are injected here. The Git
+ * fixture still exercises its real dirt and postbuild contracts, while a
+ * single smoke below runs the executable with every production default.
  */
-describe('scripts/check-build-clean.ts and scripts/write-build-info.ts (integration)', () => {
+describe('scripts/check-build-clean.ts and scripts/write-build-info.ts', () => {
   const repoRoot = path.resolve(__dirname, '..');
   const checkScript = path.join(repoRoot, 'scripts', 'check-build-clean.ts');
   const writeInfoScript = path.join(repoRoot, 'scripts', 'write-build-info.ts');
@@ -340,9 +341,33 @@ describe('scripts/check-build-clean.ts and scripts/write-build-info.ts (integrat
     return execFileSync('git', ['rev-parse', 'HEAD'], { cwd: dir, encoding: 'utf8' }).trim();
   }
 
+  function inFixture<T>(fn: () => T): T {
+    const originalCwd = process.cwd();
+    process.chdir(dir);
+    try {
+      return fn();
+    } finally {
+      process.chdir(originalCwd);
+    }
+  }
+
   function runCheck(env: NodeJS.ProcessEnv = {}): { status: number; stdout: string; stderr: string } {
-    const result = spawnSync(tsx, [checkScript], { cwd: dir, encoding: 'utf8', env: { ...process.env, ...env } });
-    return { status: result.status ?? -1, stdout: result.stdout, stderr: result.stderr };
+    const stdout: string[] = [];
+    const stderr: string[] = [];
+    const status = inFixture(() =>
+      runCheckBuildClean({
+        env,
+        log: {
+          warn: (...messages: unknown[]) => stderr.push(messages.map(String).join(' ')),
+          error: (...messages: unknown[]) => stderr.push(messages.map(String).join(' ')),
+        },
+        steps: {
+          typecheck: () => ({ ok: true }),
+          lint: () => ({ ok: true }),
+        },
+      }),
+    );
+    return { status, stdout: stdout.join('\n'), stderr: stderr.join('\n') };
   }
 
   function runWriteInfo(env: NodeJS.ProcessEnv = {}): void {
@@ -353,6 +378,115 @@ describe('scripts/check-build-clean.ts and scripts/write-build-info.ts (integrat
   function readBuildInfo(): { dirty: boolean } {
     return JSON.parse(fs.readFileSync(path.join(dir, 'dist', 'BUILD_INFO.json'), 'utf8'));
   }
+
+  it.each([
+    ['typecheck', ['typecheck']],
+    ['lint', ['typecheck', 'lint']],
+  ] as const)('returns an injected %s failure without running later steps', (failedStep, expectedCalls) => {
+    const calls: string[] = [];
+    const errors: string[] = [];
+    const status = runCheckBuildClean({
+      log: { warn: () => undefined, error: (...messages: unknown[]) => errors.push(messages.map(String).join(' ')) },
+      steps: {
+        typecheck: () => {
+          calls.push('typecheck');
+          return failedStep === 'typecheck'
+            ? { ok: false, message: 'BUILD REFUSED: synthetic typecheck failure.' }
+            : { ok: true };
+        },
+        lint: () => {
+          calls.push('lint');
+          return failedStep === 'lint'
+            ? { ok: false, message: 'BUILD REFUSED: synthetic lint failure.' }
+            : { ok: true };
+        },
+        status: () => {
+          calls.push('status');
+          return [];
+        },
+        freshness: () => {
+          calls.push('freshness');
+          return { head: 'a'.repeat(40), originMain: 'a'.repeat(40) };
+        },
+        fingerprint: () => '',
+        recordBuildStart: () => calls.push('record'),
+      },
+    });
+
+    expect(status).toBe(1);
+    expect(calls).toEqual(expectedCalls);
+    expect(errors).toEqual([`BUILD REFUSED: synthetic ${failedStep} failure.`]);
+  });
+
+  it('reports an injected status error before freshness can run', () => {
+    const calls: string[] = [];
+    const errors: string[] = [];
+    const status = runCheckBuildClean({
+      log: { warn: () => undefined, error: (...messages: unknown[]) => errors.push(messages.map(String).join(' ')) },
+      steps: {
+        typecheck: () => {
+          calls.push('typecheck');
+          return { ok: true };
+        },
+        lint: () => {
+          calls.push('lint');
+          return { ok: true };
+        },
+        status: () => {
+          calls.push('status');
+          throw new Error('synthetic status error');
+        },
+        freshness: () => {
+          calls.push('freshness');
+          return { head: 'a'.repeat(40), originMain: 'a'.repeat(40) };
+        },
+      },
+    });
+
+    expect(status).toBe(1);
+    expect(calls).toEqual(['typecheck', 'lint', 'status']);
+    expect(errors).toEqual(['BUILD REFUSED: could not read working tree status.', 'synthetic status error']);
+  });
+
+  it('uses injected status, freshness, and record steps without spawning build gates', () => {
+    const calls: string[] = [];
+    const recorded: Array<{ head: string; fingerprint: string }> = [];
+    const sha = 'a'.repeat(40);
+    const status = runCheckBuildClean({
+      log: { warn: () => undefined, error: () => undefined },
+      steps: {
+        typecheck: () => {
+          calls.push('typecheck');
+          return { ok: true };
+        },
+        lint: () => {
+          calls.push('lint');
+          return { ok: true };
+        },
+        status: () => {
+          calls.push('status');
+          return [];
+        },
+        freshness: () => {
+          calls.push('freshness');
+          return { head: sha, originMain: sha };
+        },
+        fingerprint: (lines) => {
+          calls.push('fingerprint');
+          expect(lines).toEqual([]);
+          return 'synthetic-fingerprint';
+        },
+        recordBuildStart: (head, fingerprint) => {
+          calls.push('record');
+          recorded.push({ head, fingerprint });
+        },
+      },
+    });
+
+    expect(status).toBe(0);
+    expect(calls).toEqual(['typecheck', 'lint', 'status', 'freshness', 'fingerprint', 'record']);
+    expect(recorded).toEqual([{ head: sha, fingerprint: 'synthetic-fingerprint' }]);
+  });
 
   it('allows a build when only docs/** and root markdown are dirty', () => {
     fs.writeFileSync(path.join(dir, 'docs', 'plan.md'), 'plan\n');
@@ -524,4 +658,41 @@ describe('scripts/check-build-clean.ts and scripts/write-build-info.ts (integrat
       expect(fs.existsSync(path.join(dir, 'dist', 'BUILD_INFO.json'))).toBe(false);
     });
   });
+
+  // This is the only real tsc + eslint smoke; under host contention it can
+  // exceed Vitest's five-second default even though the fixture is minimal.
+  it('runs the actual guard once in a self-contained fixture', () => {
+    fs.mkdirSync(path.join(dir, 'scripts'), { recursive: true });
+    fs.copyFileSync(checkScript, path.join(dir, 'scripts', 'check-build-clean.ts'));
+    fs.copyFileSync(path.join(repoRoot, 'eslint.config.js'), path.join(dir, 'eslint.config.js'));
+    fs.writeFileSync(
+      path.join(dir, 'package.json'),
+      JSON.stringify({ type: 'module', scripts: { typecheck: 'tsc --noEmit' } }),
+    );
+    fs.writeFileSync(
+      path.join(dir, 'tsconfig.json'),
+      JSON.stringify({
+        compilerOptions: {
+          target: 'ES2022',
+          module: 'NodeNext',
+          moduleResolution: 'NodeNext',
+          strict: true,
+          noEmit: true,
+          types: ['node'],
+        },
+        include: ['src/**/*.ts', 'scripts/**/*.ts'],
+      }),
+    );
+    fs.symlinkSync(path.join(repoRoot, 'node_modules'), path.join(dir, 'node_modules'));
+    commit('add guard smoke fixture');
+    execFileSync('git', ['push', '-q', 'origin', 'main'], { cwd: dir });
+
+    const result = spawnSync(tsx, [path.join(dir, 'scripts', 'check-build-clean.ts')], {
+      cwd: dir,
+      encoding: 'utf8',
+    });
+
+    expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
+    expect(fs.readFileSync(path.join(dir, 'dist', '.build-start-sha'), 'utf8').trim()).toBe(headSha());
+  }, 60_000);
 });
