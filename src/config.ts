@@ -139,6 +139,25 @@ export const CONTAINER_IMAGE = process.env.CONTAINER_IMAGE || getDefaultContaine
 // cleanupOrphans only reaps containers from this install, not peers.
 export const INSTALL_SLUG = getInstallSlug(PROJECT_ROOT);
 export const CONTAINER_INSTALL_LABEL = `nanoclaw-install=${INSTALL_SLUG}`;
+// Container name prefix. Load-bearing, and deliberately NOT upstream's `ncl-…`
+// grammar: the snapshot pruner selects live containers by
+// `name=nanoclaw-v2-` (src/agent-runner-source.ts) and a successful listing
+// that matches nothing returns an empty set, so renaming would make the
+// pruner delete snapshots a running container still has bind-mounted. Every
+// container already running on an install carries this prefix too. A later
+// upstream port will propose the rename again; the answer stays no until the
+// pruner selects by label instead. One constant, two importers
+// (src/container-runner.ts, src/agent-runner-source.ts) so the two cannot
+// drift — pinned by src/container-labels.test.ts.
+export const CONTAINER_NAME_PREFIX = 'nanoclaw-v2-';
+// Scope labels stamped onto every spawned container beside the install label.
+// Metadata only until the boot-quiescence door reads them to compute its
+// scoped stop set from the container runtime rather than from the in-process
+// registry, which is empty at boot.
+export const CONTAINER_GROUP_LABEL_KEY = 'nanoclaw-group';
+export const CONTAINER_SESSION_LABEL_KEY = 'nanoclaw-session';
+export const CONTAINER_WORKGROUP_LABEL_KEY = 'nanoclaw-workgroup';
+export const CONTAINER_ROLE_LABEL_KEY = 'nanoclaw-role';
 export const CONTAINER_TIMEOUT = parseInt(process.env.CONTAINER_TIMEOUT || '1800000', 10);
 export const CONTAINER_MAX_OUTPUT_SIZE = parseInt(process.env.CONTAINER_MAX_OUTPUT_SIZE || '10485760', 10); // 10MB default
 export const CONTAINER_MEMORY_LIMIT = process.env.CONTAINER_MEMORY_LIMIT || envConfig.CONTAINER_MEMORY_LIMIT || '3g';

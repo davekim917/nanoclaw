@@ -23,7 +23,7 @@ import { execFileSync } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 
-import { DATA_DIR, REPO_ROOT } from './config.js';
+import { CONTAINER_NAME_PREFIX, DATA_DIR, REPO_ROOT } from './config.js';
 import { log } from './log.js';
 
 const DEFAULT_SOURCE_DIR = path.join(REPO_ROOT, 'container', 'agent-runner', 'src');
@@ -97,14 +97,20 @@ export function agentRunnerSourcePath(): string {
 
 /**
  * Default `referencedPaths` for pruneAgentRunnerSnapshots: the host mount
- * source of every mount on every running `nanoclaw-v2-*` container, read via
- * `docker inspect`. Returns null (never an empty set) when docker itself
+ * source of every mount on every running container whose name carries
+ * `CONTAINER_NAME_PREFIX`, read via `docker inspect`. That prefix is the same
+ * constant the spawn path names the container with (src/config.ts), because a
+ * successful listing that matches nothing returns an EMPTY set here and would
+ * prune a snapshot a live container still has mounted.
+ * Returns null (never an empty set) when docker itself
  * cannot be queried, so a Docker hiccup fails toward "prune nothing" rather
  * than toward deleting a snapshot a live container still has mounted.
  */
 function defaultReferencedPaths(): Set<string> | null {
   try {
-    const psOut = execFileSync('docker', ['ps', '-q', '--filter', 'name=nanoclaw-v2-'], { encoding: 'utf-8' });
+    const psOut = execFileSync('docker', ['ps', '-q', '--filter', `name=${CONTAINER_NAME_PREFIX}`], {
+      encoding: 'utf-8',
+    });
     const ids = psOut
       .split('\n')
       .map((s) => s.trim())
