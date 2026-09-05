@@ -73,6 +73,40 @@ describe('mcpServersToOpenCodeConfig', () => {
     });
   });
 
+  it('wraps a cwd-bearing stdio server through /bin/sh (OpenCode has no native cwd field)', () => {
+    const mcp = mcpServersToOpenCodeConfig({
+      plugged: {
+        command: 'node',
+        args: ['server.js', '--flag'],
+        cwd: '/workspace/agent/plugins/sales-sdr',
+      },
+    });
+    expect(mcp.plugged).toEqual({
+      type: 'local',
+      command: [
+        '/bin/sh',
+        '-c',
+        'cd "$0" && exec "$@"',
+        '/workspace/agent/plugins/sales-sdr',
+        'node',
+        'server.js',
+        '--flag',
+      ],
+      enabled: true,
+    });
+  });
+
+  it('leaves a cwd-less stdio server as a plain argv array', () => {
+    const mcp = mcpServersToOpenCodeConfig({
+      plain: { command: 'node', args: ['server.js'] },
+    });
+    expect(mcp.plain).toEqual({
+      type: 'local',
+      command: ['node', 'server.js'],
+      enabled: true,
+    });
+  });
+
   it('rejects deprecated SSE MCP entries', () => {
     expect(() =>
       mcpServersToOpenCodeConfig({
