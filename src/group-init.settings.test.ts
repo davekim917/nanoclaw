@@ -24,9 +24,9 @@ import { closeDb, createAgentGroup, initTestDb, runMigrations, getRawDb } from '
 import { initGroupFilesystem } from './group-init.js';
 import type { AgentGroup } from './types.js';
 
-function makeGroup(id: string): AgentGroup {
+async function makeGroup(id: string): Promise<AgentGroup> {
   const ag = { id, name: id, folder: id, agent_provider: null, created_at: new Date().toISOString() } as AgentGroup;
-  createAgentGroup(ag);
+  await createAgentGroup(ag);
   return ag;
 }
 
@@ -43,8 +43,8 @@ afterEach(async () => {
 });
 
 describe('default settings.json for new groups', () => {
-  it('keeps the customized agent-teams and memory-boundary settings', () => {
-    const ag = makeGroup('ag-lean');
+  it('keeps the customized agent-teams and memory-boundary settings', async () => {
+    const ag = await makeGroup('ag-lean');
     initGroupFilesystem(ag, {});
 
     const file = path.join(TEST_ROOT, 'data', 'v2-sessions', ag.id, '.claude-shared', 'settings.json');
@@ -58,8 +58,8 @@ describe('default settings.json for new groups', () => {
     expect(settings.hooks.PreToolUse).toBeUndefined();
   });
 
-  it('never rewrites an existing settings.json — a hand-edited re-enable sticks', () => {
-    const ag = makeGroup('ag-reenable');
+  it('never rewrites an existing settings.json — a hand-edited re-enable sticks', async () => {
+    const ag = await makeGroup('ag-reenable');
     initGroupFilesystem(ag, {});
     const file = path.join(TEST_ROOT, 'data', 'v2-sessions', ag.id, '.claude-shared', 'settings.json');
 

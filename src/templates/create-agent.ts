@@ -70,13 +70,13 @@ export async function createAgentFromTemplate(ref: string, opts?: CreateAgentOpt
   if (fs.existsSync(resolveGroupFolderPath(folder))) folder = `${folder}-${randomUUID().slice(0, 8)}`;
 
   const group: AgentGroup = { id, name, folder, agent_provider: null, created_at: new Date().toISOString() };
-  createAgentGroup(group);
-  ensureContainerConfig(id);
+  await createAgentGroup(group);
+  await ensureContainerConfig(id);
   // Dual-write, same as `groups config update`: the DB row is the read-side
   // projection (`config get`, scheduling), container.json is what the spawn
   // path hands the container as its TZ.
   if (timezone) {
-    updateContainerConfigScalars(id, { timezone });
+    await updateContainerConfigScalars(id, { timezone });
     updateContainerConfig(folder, (config) => {
       config.timezone = timezone;
     });
@@ -109,7 +109,7 @@ export async function createAgentFromTemplate(ref: string, opts?: CreateAgentOpt
   updateContainerConfig(folder, (config) => {
     config.mcpServers = { ...(config.mcpServers ?? {}), ...tpl.mcpServers };
   });
-  updateContainerConfigJson(id, 'mcp_servers', tpl.mcpServers);
+  await updateContainerConfigJson(id, 'mcp_servers', tpl.mcpServers);
 
   // Per-group skills overlay — keyed by group id, never shared. cpSync creates
   // intermediate dirs, so .claude-shared/skills need not exist yet.

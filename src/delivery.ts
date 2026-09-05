@@ -442,7 +442,7 @@ async function pollActive(): Promise<void> {
   const startedAtMs = Date.now();
   let polled = 0;
   try {
-    const sessions = getRunningSessions();
+    const sessions = await getRunningSessions();
     for (const session of sessions) {
       await deliverSessionMessages(session);
       polled++;
@@ -526,7 +526,7 @@ export async function deliverSessionMessages(session: Session): Promise<DrainOut
 }
 
 async function drainSession(session: Session): Promise<DrainOutcome> {
-  const agentGroup = getAgentGroup(session.agent_group_id);
+  const agentGroup = await getAgentGroup(session.agent_group_id);
   if (!agentGroup) return 'pending';
 
   // The whole queue snapshot in ONE mailbox session, closed before anything
@@ -614,7 +614,7 @@ async function drainSession(session: Session): Promise<DrainOutcome> {
         if (msg.kind !== 'system' && msg.channel_type !== 'agent') {
           const tag = outboundKindTag(msg);
           try {
-            bumpLastOutbound(session.id, tag);
+            await bumpLastOutbound(session.id, tag);
           } catch (err) {
             log.warn('bumpLastOutbound failed', {
               sessionId: session.id,
@@ -771,7 +771,7 @@ export async function runSweepDeliveryCycle(nowMs: number = Date.now()): Promise
   let skipped = 0;
   const seen = new Set<string>();
   try {
-    const sessions = getSessionsActiveSince(new Date(nowMs - SWEEP_POLL_ACTIVITY_HORIZON_MS).toISOString());
+    const sessions = await getSessionsActiveSince(new Date(nowMs - SWEEP_POLL_ACTIVITY_HORIZON_MS).toISOString());
     for (const session of sessions) {
       seen.add(session.id);
       // One unreadable session must not abort the cycle for every session
@@ -903,7 +903,7 @@ async function deliverMessage(
     if (session.messaging_group_id === null && isTaskThread(session.thread_id) && session.thread_id) {
       const series = session.thread_id.slice(`${TASKS_SYSTEM_THREAD_ID}:`.length);
       try {
-        appendRunLog(session.agent_group_id, series, typeof content.text === 'string' ? content.text : '');
+        await appendRunLog(session.agent_group_id, series, typeof content.text === 'string' ? content.text : '');
       } catch (err) {
         log.warn('Failed to append task run log', { id: msg.id, sessionId: session.id, err });
       }
@@ -953,7 +953,7 @@ async function deliverMessage(
     const mg =
       originMg && originMg.channel_type === msg.channel_type && originMg.platform_id === msg.platform_id
         ? originMg
-        : getMessagingGroupByPlatform(msg.channel_type, msg.platform_id);
+        : await getMessagingGroupByPlatform(msg.channel_type, msg.platform_id);
     if (!mg) {
       throw new Error(`unknown messaging group for ${msg.channel_type}/${msg.platform_id} (message ${msg.id})`);
     }
@@ -1151,7 +1151,7 @@ async function deliverMessage(
         questionId: content.questionId,
       });
     } else {
-      const inserted = createPendingQuestion({
+      const inserted = await createPendingQuestion({
         question_id: content.questionId,
         session_id: session.id,
         message_out_id: msg.id,
@@ -1361,7 +1361,7 @@ async function deliverMessage(
       const text =
         typeof parsed.text === 'string' ? parsed.text : typeof parsed.content === 'string' ? parsed.content : '';
       if (text && msg.channel_type && msg.platform_id) {
-        const mg = getMessagingGroupByPlatform(msg.channel_type, msg.platform_id);
+        const mg = await getMessagingGroupByPlatform(msg.channel_type, msg.platform_id);
         archiveMessage({
           id: msg.id,
           agentGroupId: session.agent_group_id,

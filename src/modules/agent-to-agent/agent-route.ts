@@ -306,7 +306,7 @@ async function resolveTargetSession(
   // what an identical request arriving a moment later would get.
   const fallback = freshFallback();
   if (originSessionId) {
-    const candidate = getSession(originSessionId);
+    const candidate = await getSession(originSessionId);
     if (candidate && candidate.agent_group_id === targetAgentGroupId && candidate.status === 'active') {
       // Return-path candidate is authenticated by the source_session_id
       // chain — the host stamps it at write time when an a2a outbound
@@ -350,7 +350,7 @@ async function resolveTargetSession(
       }
     }
   }
-  return { ...resolveSession(targetAgentGroupId, fallback.mgId, fallback.threadId, fallback.mode), fallback };
+  return { ...(await resolveSession(targetAgentGroupId, fallback.mgId, fallback.threadId, fallback.mode)), fallback };
 }
 
 /**
@@ -427,8 +427,8 @@ export async function routeAgentMessage(
   // consumes the outbound row; `applyA2aMessageGate` re-enters here with the
   // grant on approve.
   if (decision.effect === 'hold') {
-    const sourceName = getAgentGroup(sourceAgentGroupId)?.name ?? sourceAgentGroupId;
-    const targetName = getAgentGroup(targetAgentGroupId)?.name ?? targetAgentGroupId;
+    const sourceName = (await getAgentGroup(sourceAgentGroupId))?.name ?? sourceAgentGroupId;
+    const targetName = (await getAgentGroup(targetAgentGroupId))?.name ?? targetAgentGroupId;
     await requestApproval({
       session,
       agentName: sourceName,
@@ -684,10 +684,10 @@ async function performAgentRoute(
   // Archived only once the row is durable, and from `scrubbed` rather than
   // `contentForWrite` — the archive holds the message the peer actually sent,
   // not the thread transcript we wrapped around it.
-  archiveRoutedMessage(scrubbed, a2aMsgId, session.agent_group_id, targetAgentGroupId, targetSession);
+  await archiveRoutedMessage(scrubbed, a2aMsgId, session.agent_group_id, targetAgentGroupId, targetSession);
   // An a2a message is one of the three engagement events, so the target
   // session is engaged from here — the row is durable and the wake follows.
-  markSessionEngaged(targetSession.id);
+  await markSessionEngaged(targetSession.id);
   log.info('Agent message routed', {
     from: session.agent_group_id,
     to: targetAgentGroupId,
@@ -717,16 +717,16 @@ async function performAgentRoute(
  * Attributed to the receiving agent group with the sender named, mirroring
  * how an inbound user message is archived.
  */
-function archiveRoutedMessage(
+async function archiveRoutedMessage(
   content: string,
   a2aMsgId: string,
   sourceAgentGroupId: string,
   targetAgentGroupId: string,
   targetSession: Session,
-): void {
+): Promise<void> {
   const { text } = parseMessageContent(content);
   if (!text) return;
-  const sourceName = getAgentGroup(sourceAgentGroupId)?.name ?? sourceAgentGroupId;
+  const sourceName = (await getAgentGroup(sourceAgentGroupId))?.name ?? sourceAgentGroupId;
   upsertArchiveMessage({
     id: a2aMsgId,
     agentGroupId: targetAgentGroupId,

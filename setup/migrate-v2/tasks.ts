@@ -132,7 +132,7 @@ async function main(): Promise<void> {
 
   for (const t of activeTasks) {
     try {
-      const ag = getAgentGroupByFolder(t.group_folder);
+      const ag = await getAgentGroupByFolder(t.group_folder);
       if (!ag) {
         skipped++;
         continue;
@@ -155,7 +155,7 @@ async function main(): Promise<void> {
       } else {
         platformId = v2PlatformId(parsed.channel_type, t.chat_jid);
       }
-      const mg = getMessagingGroupByPlatform(parsed.channel_type, platformId);
+      const mg = await getMessagingGroupByPlatform(parsed.channel_type, platformId);
       if (!mg) {
         skipped++;
         continue;
@@ -167,7 +167,7 @@ async function main(): Promise<void> {
         continue;
       }
 
-      const { session } = resolveSession(ag.id, mg.id, null, 'shared');
+      const { session } = await resolveSession(ag.id, mg.id, null, 'shared');
       const inboxDb = openInboundDb(inboundDbPath(ag.id, session.id));
       try {
         // What the removed session-manager wrapper did on every open.

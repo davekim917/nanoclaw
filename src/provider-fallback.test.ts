@@ -22,7 +22,13 @@ describe('spawn-time provider fallback', () => {
     await initTestDb();
     const db = getRawDb();
     runMigrations(db);
-    createAgentGroup({ id: GID, name: 'f', folder: 'f', agent_provider: null, created_at: new Date().toISOString() });
+    await createAgentGroup({
+      id: GID,
+      name: 'f',
+      folder: 'f',
+      agent_provider: null,
+      created_at: new Date().toISOString(),
+    });
   });
   afterEach(() => closeDb());
 

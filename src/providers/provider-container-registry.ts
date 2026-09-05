@@ -78,7 +78,9 @@ export interface ProviderHostCapabilities {
   readonly providesAgentSurfaces?: boolean;
 }
 
-export type ProviderContainerConfigFn = (ctx: ProviderContainerContext) => ProviderContainerContribution;
+export type ProviderContainerConfigFn = (
+  ctx: ProviderContainerContext,
+) => ProviderContainerContribution | Promise<ProviderContainerContribution>;
 
 interface RegistryEntry {
   fn: ProviderContainerConfigFn;

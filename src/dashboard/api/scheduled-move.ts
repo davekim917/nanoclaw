@@ -103,8 +103,8 @@ function groupSecretsFromFolder(folder: string, groupsDir: string): string[] {
  * host-side (§4.2 step 3 — enumeration bounded to source∪target effective sets,
  * never a vault listing).
  */
-function effectiveSecrets(agentGroupId: string, folder: string, groupsDir: string): string[] {
-  const workgroup = getWorkgroupOnecliSecrets(agentGroupId);
+async function effectiveSecrets(agentGroupId: string, folder: string, groupsDir: string): Promise<string[]> {
+  const workgroup = await getWorkgroupOnecliSecrets(agentGroupId);
   const group = groupSecretsFromFolder(folder, groupsDir);
   return mergeWorkgroupAndGroupSecrets(workgroup, group);
 }
@@ -124,16 +124,16 @@ export interface SecretDelta {
  * gains/losses — execute recomputes from the BODY's target and 409s on mismatch
  * (TOCTOU, SEC-2 + target-rebind, E-4).
  */
-function computeSecretDelta(
+async function computeSecretDelta(
   sourceAg: string,
   sourceFolder: string,
   targetAg: string,
   targetFolder: string,
   targetMessagingGroupId: string,
   groupsDir: string,
-): SecretDelta {
-  const src = new Set(effectiveSecrets(sourceAg, sourceFolder, groupsDir));
-  const tgt = new Set(effectiveSecrets(targetAg, targetFolder, groupsDir));
+): Promise<SecretDelta> {
+  const src = new Set(await effectiveSecrets(sourceAg, sourceFolder, groupsDir));
+  const tgt = new Set(await effectiveSecrets(targetAg, targetFolder, groupsDir));
   const gains = [...tgt].filter((s) => !src.has(s)).sort();
   const losses = [...src].filter((s) => !tgt.has(s)).sort();
   // Canonical, key-ordered payload — the target identity is part of the hashed
@@ -233,11 +233,11 @@ interface ResolvedMove {
  * check, and a missing source/target group all collapse to 404 (§4.2 "404
  * otherwise" + C7). Returns a Response on any reject, or the resolved ends.
  */
-function resolveAndGate(
+async function resolveAndGate(
   key: string,
   body: MoveBody,
   ctx: AuthedRequestContext,
-): { error: Response } | { ok: ResolvedMove } {
+): Promise<{ error: Response } | { ok: ResolvedMove }> {
   const decoded = decodeKey(key);
   if (!decoded) return { error: json({ error: 'not_found' }, 404) };
 
@@ -250,14 +250,14 @@ function resolveAndGate(
     return { error: json({ error: 'not_found' }, 404) };
   }
 
-  const sourceAg = getAgentGroup(decoded.agentGroupId);
+  const sourceAg = await getAgentGroup(decoded.agentGroupId);
   if (!sourceAg) return { error: json({ error: 'not_found' }, 404) };
 
   const targetAgId = body.targetAgentGroupId;
   const targetMgId = body.targetMessagingGroupId;
   if (!targetAgId || !targetMgId) return { error: json({ error: 'invalid_request' }, 400) };
 
-  const targetAg = getAgentGroup(targetAgId);
+  const targetAg = await getAgentGroup(targetAgId);
   if (!targetAg) return { error: json({ error: 'not_found' }, 404) };
   const targetMg = getMessagingGroup(targetMgId);
   if (!targetMg) return { error: json({ error: 'not_found' }, 404) };
@@ -275,9 +275,9 @@ function resolveAndGate(
   };
 }
 
-export function isCrossWorkgroup(sourceAgId: string, targetAgId: string): boolean {
-  const s = getAgentGroup(sourceAgId);
-  const t = getAgentGroup(targetAgId);
+export async function isCrossWorkgroup(sourceAgId: string, targetAgId: string): Promise<boolean> {
+  const s = await getAgentGroup(sourceAgId);
+  const t = await getAgentGroup(targetAgId);
   if (s?.workgroup_id == null || t?.workgroup_id == null) return true;
   return s.workgroup_id !== t.workgroup_id;
 }
@@ -293,7 +293,7 @@ export const movePreviewHandler: AuthHandler = async (req, params, ctx) => {
     return json({ error: 'invalid_request' }, 400);
   }
 
-  const resolved = resolveAndGate(params['key'] ?? '', body, ctx);
+  const resolved = await resolveAndGate(params['key'] ?? '', body, ctx);
   if ('error' in resolved) return resolved.error;
   const { source, target } = resolved.ok;
 
@@ -319,12 +319,12 @@ export const movePreviewHandler: AuthHandler = async (req, params, ctx) => {
 
   return json({
     wiringOk,
-    gains: delta.gains,
-    losses: delta.losses,
-    crossWorkgroup: isCrossWorkgroup(source.agentGroupId, target.agentGroupId),
+    gains: (await delta).gains,
+    losses: (await delta).losses,
+    crossWorkgroup: await isCrossWorkgroup(source.agentGroupId, target.agentGroupId),
     scriptPresent,
     environmentDeltaChecked: false,
-    deltaHash: delta.deltaHash,
+    deltaHash: (await delta).deltaHash,
   });
 };
 
@@ -397,8 +397,8 @@ function scopedLiveCount(
 }
 
 /** Resolve the target per-series system session id (after scheduleTask created it). */
-function targetSessionIdFor(targetAgentGroupId: string, seriesId: string): string | null {
-  return findSystemSession(targetAgentGroupId, taskThreadId(seriesId))?.id ?? null;
+async function targetSessionIdFor(targetAgentGroupId: string, seriesId: string): Promise<string | null> {
+  return (await findSystemSession(targetAgentGroupId, taskThreadId(seriesId)))?.id ?? null;
 }
 
 export const moveExecuteHandler: AuthHandler = async (req, params, ctx) => {
@@ -410,7 +410,7 @@ export const moveExecuteHandler: AuthHandler = async (req, params, ctx) => {
     return json({ error: 'invalid_request' }, 400);
   }
 
-  const resolved = resolveAndGate(params['key'] ?? '', body, ctx);
+  const resolved = await resolveAndGate(params['key'] ?? '', body, ctx);
   if ('error' in resolved) return resolved.error;
   const { source, target } = resolved.ok;
 
@@ -438,7 +438,7 @@ export const moveExecuteHandler: AuthHandler = async (req, params, ctx) => {
     target.messagingGroupId,
     groupsDir,
   );
-  if (body.confirmedDeltaHash !== delta.deltaHash) {
+  if (body.confirmedDeltaHash !== (await delta).deltaHash) {
     return json({ error: 'delta_changed', reason: 'delta_changed' }, 409);
   }
 
@@ -605,7 +605,7 @@ export const moveExecuteHandler: AuthHandler = async (req, params, ctx) => {
       await scheduledTasks.scheduleTask(
         taskDefFromSnapshot(snapshot, source.seriesId, target.agentGroupId, targetMg, stagedProcessAfter),
       );
-      const tgtSessId = targetSessionIdFor(target.agentGroupId, source.seriesId);
+      const tgtSessId = await targetSessionIdFor(target.agentGroupId, source.seriesId);
       if (tgtSessId) {
         // A DIFFERENT key from the source session above, and that session is
         // closed by now — the two opens are sequential, never nested, which is
@@ -646,7 +646,7 @@ export const moveExecuteHandler: AuthHandler = async (req, params, ctx) => {
     });
     let restored = false;
     try {
-      const tgtSessId = targetSessionIdFor(target.agentGroupId, source.seriesId);
+      const tgtSessId = await targetSessionIdFor(target.agentGroupId, source.seriesId);
       const live = scopedLiveCount(
         dataDir,
         { agentGroupId: source.agentGroupId, sessionId: source.sessionId },
@@ -712,7 +712,7 @@ export const moveExecuteHandler: AuthHandler = async (req, params, ctx) => {
   // LEAVE the move_intent unresolved so the recovery sweep repairs it. An
   // UNREADABLE post-state is equally not-success (never claim a move succeeded
   // on a state we couldn't observe).
-  const tgtSessId = targetSessionIdFor(target.agentGroupId, source.seriesId);
+  const tgtSessId = await targetSessionIdFor(target.agentGroupId, source.seriesId);
   const post = scopedLiveCount(
     dataDir,
     { agentGroupId: source.agentGroupId, sessionId: source.sessionId },
@@ -739,7 +739,7 @@ export const moveExecuteHandler: AuthHandler = async (req, params, ctx) => {
   // (one row per side, shared correlation_id) + invalidate cache. Same-agent
   // reroutes intentionally write both directions against the same group.
   purgeIntentBody(central, correlationId);
-  const secretDetail = { secretGainsCount: delta.gains.length, secretLossesCount: delta.losses.length };
+  const secretDetail = { secretGainsCount: (await delta).gains.length, secretLossesCount: (await delta).losses.length };
   writeAudit(central, {
     actor: ctx.user.id,
     action: 'move',

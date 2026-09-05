@@ -39,7 +39,7 @@ const testGroupDir = path.join(groupsDir, 'test-agent-e2e');
 fs.mkdirSync(testGroupDir, { recursive: true });
 fs.writeFileSync(path.join(testGroupDir, 'CLAUDE.md'), '# Test Agent\nYou are a test agent. Be brief.\n');
 
-createAgentGroup({
+await createAgentGroup({
   id: 'ag-e2e',
   name: 'E2E Test Agent',
   folder: 'test-agent-e2e',
@@ -47,7 +47,7 @@ createAgentGroup({
   created_at: new Date().toISOString(),
 });
 
-createMessagingGroup({
+await createMessagingGroup({
   id: 'mg-e2e',
   channel_type: 'test',
   platform_id: 'e2e-channel',
@@ -101,7 +101,7 @@ await routeInbound({
   },
 });
 
-const session = findSession('mg-e2e', null);
+const session = await findSession('mg-e2e', null);
 if (!session) {
   console.log('✗ No session created!');
   process.exit(1);

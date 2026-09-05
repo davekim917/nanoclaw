@@ -107,7 +107,7 @@ let skippedBadStatus = 0;
 let junk = 0;
 let duplicates = 0;
 
-for (const session of getActiveSessions()) {
+for (const session of await getActiveSessions()) {
   if (isTaskThread(session.thread_id)) continue; // already on the new model
   const srcPath = sessionMailboxPath({ agentGroupId: session.agent_group_id, sessionId: session.id }, 'inbound');
   // Read-only seam: a survey pass must never provision or migrate a session it
@@ -134,7 +134,7 @@ for (const session of getActiveSessions()) {
     if (seriesFilter && seriesId !== seriesFilter) continue;
     const label = `${seriesId} (${session.agent_group_id} / ${session.id})`;
 
-    const ag = getAgentGroup(session.agent_group_id);
+    const ag = await getAgentGroup(session.agent_group_id);
     if (!ag) {
       junk++;
       console.log(`JUNK      ${label} — agent group not in central DB${DELETE_JUNK ? '' : ' (use --delete-junk)'}`);
@@ -178,7 +178,7 @@ for (const session of getActiveSessions()) {
       continue;
     }
 
-    const { session: target } = resolveTaskSession(session.agent_group_id, seriesId);
+    const { session: target } = await resolveTaskSession(session.agent_group_id, seriesId);
     const targetPath = sessionMailboxPath({ agentGroupId: session.agent_group_id, sessionId: target.id }, 'inbound');
     const targetDb = openRw(targetPath);
     try {

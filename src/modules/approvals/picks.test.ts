@@ -69,8 +69,8 @@ async function mountMockAdapter(
   return { delivered, openDMCalls };
 }
 
-function seedAgentGroup(id: string): void {
-  createAgentGroup({
+async function seedAgentGroup(id: string): Promise<void> {
+  await createAgentGroup({
     id,
     name: id.toUpperCase(),
     folder: id,
@@ -84,9 +84,9 @@ function seedUser(id: string, kind: string): void {
 }
 
 describe('pickApprover', () => {
-  beforeEach(() => {
-    seedAgentGroup('ag-1');
-    seedAgentGroup('ag-2');
+  beforeEach(async () => {
+    await seedAgentGroup('ag-1');
+    await seedAgentGroup('ag-2');
   });
 
   it('prefers scoped admins, then globals, then owners — deduplicated', () => {
@@ -108,8 +108,8 @@ describe('pickApprover', () => {
 });
 
 describe('pickApprovalDelivery', () => {
-  beforeEach(() => {
-    seedAgentGroup('ag-1');
+  beforeEach(async () => {
+    await seedAgentGroup('ag-1');
   });
 
   it('returns the first reachable approver', async () => {

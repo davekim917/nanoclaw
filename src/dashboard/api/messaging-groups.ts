@@ -15,7 +15,7 @@ import type { AuthHandler } from '../router.js';
 export const messagingGroupsListHandler: AuthHandler = async (_req, _params, _ctx) => {
   let rows: { id: string; name: string }[];
   try {
-    rows = getAllMessagingGroups().map((mg) => ({
+    rows = (await getAllMessagingGroups()).map((mg) => ({
       id: mg.id,
       name: mg.name ?? `${mg.channel_type}:${mg.platform_id}`,
     }));

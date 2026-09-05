@@ -63,29 +63,29 @@ describe('migration 016 — fresh DB', () => {
     expect(instance!.notnull).toBe(1);
   });
 
-  it('createMessagingGroup without instance stamps instance = channel_type', () => {
-    createMessagingGroup(mg({ id: 'mg-default' }));
+  it('createMessagingGroup without instance stamps instance = channel_type', async () => {
+    await createMessagingGroup(mg({ id: 'mg-default' }));
     const row = getRawDb().prepare("SELECT instance FROM messaging_groups WHERE id = 'mg-default'").get() as {
       instance: string;
     };
     expect(row.instance).toBe('slack');
   });
 
-  it('allows sibling instances on the same (channel_type, platform_id)', () => {
-    createMessagingGroup(mg({ id: 'mg-default' }));
-    createMessagingGroup(mg({ id: 'mg-tester', instance: 'slack-tester' }));
+  it('allows sibling instances on the same (channel_type, platform_id)', async () => {
+    await createMessagingGroup(mg({ id: 'mg-default' }));
+    await createMessagingGroup(mg({ id: 'mg-tester', instance: 'slack-tester' }));
     const count = getRawDb().prepare('SELECT COUNT(*) AS c FROM messaging_groups').get() as { c: number };
     expect(count.c).toBe(2);
   });
 
-  it('rejects a duplicate (channel_type, platform_id, instance) triple', () => {
-    createMessagingGroup(mg({ id: 'mg-a', instance: 'slack-tester' }));
-    expect(() => createMessagingGroup(mg({ id: 'mg-b', instance: 'slack-tester' }))).toThrow();
+  it('rejects a duplicate (channel_type, platform_id, instance) triple', async () => {
+    await createMessagingGroup(mg({ id: 'mg-a', instance: 'slack-tester' }));
+    await expect(createMessagingGroup(mg({ id: 'mg-b', instance: 'slack-tester' }))).rejects.toThrow();
   });
 
-  it('rejects a duplicate default pair (single-bot uniqueness preserved)', () => {
-    createMessagingGroup(mg({ id: 'mg-a' }));
-    expect(() => createMessagingGroup(mg({ id: 'mg-b' }))).toThrow();
+  it('rejects a duplicate default pair (single-bot uniqueness preserved)', async () => {
+    await createMessagingGroup(mg({ id: 'mg-a' }));
+    await expect(createMessagingGroup(mg({ id: 'mg-b' }))).rejects.toThrow();
   });
 });
 
@@ -199,7 +199,7 @@ describe('migration 016 — wired legacy DB upgrade (the FK recreate arm)', () =
     await initTestDb();
     const db = getRawDb();
     runMigrations(db);
-    createMessagingGroup(mg({ id: 'mg-keep', instance: 'slack-tester' }));
+    await createMessagingGroup(mg({ id: 'mg-keep', instance: 'slack-tester' }));
     expect(() => runMigrations(db)).not.toThrow();
     const row = db.prepare("SELECT instance FROM messaging_groups WHERE id = 'mg-keep'").get() as {
       instance: string;
@@ -219,42 +219,42 @@ describe('lookup asymmetry — inbound exact-only vs outbound default-first', ()
     // A query missing the `(instance = channel_type) DESC` ORDER BY would
     // return it; only the deterministic default-first ordering picks
     // mg-default.
-    createMessagingGroup(mg({ id: 'mg-tester', instance: 'alpha-tester' }));
-    createMessagingGroup(mg({ id: 'mg-default' }));
+    await createMessagingGroup(mg({ id: 'mg-tester', instance: 'alpha-tester' }));
+    await createMessagingGroup(mg({ id: 'mg-default' }));
   });
 
-  it('getMessagingGroupWithAgentCount without instance resolves the default-instance row', () => {
-    const found = getMessagingGroupWithAgentCount('slack', 'slack:C1');
+  it('getMessagingGroupWithAgentCount without instance resolves the default-instance row', async () => {
+    const found = await getMessagingGroupWithAgentCount('slack', 'slack:C1');
     expect(found).not.toBeNull();
     expect(found!.mg.id).toBe('mg-default');
   });
 
-  it('getMessagingGroupWithAgentCount with a named instance resolves exactly that row', () => {
-    const found = getMessagingGroupWithAgentCount('slack', 'slack:C1', 'alpha-tester');
+  it('getMessagingGroupWithAgentCount with a named instance resolves exactly that row', async () => {
+    const found = await getMessagingGroupWithAgentCount('slack', 'slack:C1', 'alpha-tester');
     expect(found).not.toBeNull();
     expect(found!.mg.id).toBe('mg-tester');
   });
 
-  it('getMessagingGroupWithAgentCount with an unknown instance returns null (no-hijack rule)', () => {
-    expect(getMessagingGroupWithAgentCount('slack', 'slack:C1', 'slack-unknown')).toBeNull();
+  it('getMessagingGroupWithAgentCount with an unknown instance returns null (no-hijack rule)', async () => {
+    expect(await getMessagingGroupWithAgentCount('slack', 'slack:C1', 'slack-unknown')).toBeNull();
   });
 
-  it('getMessagingGroupByPlatform without instance prefers the default-instance row', () => {
-    const found = getMessagingGroupByPlatform('slack', 'slack:C1');
+  it('getMessagingGroupByPlatform without instance prefers the default-instance row', async () => {
+    const found = await getMessagingGroupByPlatform('slack', 'slack:C1');
     expect(found).toBeDefined();
     expect(found!.id).toBe('mg-default');
   });
 
-  it('getMessagingGroupByPlatform with explicit instance is exact', () => {
-    expect(getMessagingGroupByPlatform('slack', 'slack:C1', 'alpha-tester')!.id).toBe('mg-tester');
-    expect(getMessagingGroupByPlatform('slack', 'slack:C1', 'slack-unknown')).toBeUndefined();
+  it('getMessagingGroupByPlatform with explicit instance is exact', async () => {
+    expect((await getMessagingGroupByPlatform('slack', 'slack:C1', 'alpha-tester'))!.id).toBe('mg-tester');
+    expect(await getMessagingGroupByPlatform('slack', 'slack:C1', 'slack-unknown')).toBeUndefined();
   });
 
-  it('getMessagingGroupByPlatform falls back deterministically when only named instances exist', () => {
+  it('getMessagingGroupByPlatform falls back deterministically when only named instances exist', async () => {
     const db = getRawDb();
     db.prepare("DELETE FROM messaging_groups WHERE id = 'mg-default'").run();
-    createMessagingGroup(mg({ id: 'mg-zeta', instance: 'zeta' }));
-    const found = getMessagingGroupByPlatform('slack', 'slack:C1');
+    await createMessagingGroup(mg({ id: 'mg-zeta', instance: 'zeta' }));
+    const found = await getMessagingGroupByPlatform('slack', 'slack:C1');
     // Lexically-first named instance: 'alpha-tester' < 'zeta'.
     expect(found!.id).toBe('mg-tester');
   });

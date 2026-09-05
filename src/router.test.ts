@@ -197,10 +197,12 @@ import {
   registerMessageInterceptor,
   isSlackChannelType,
   isDiscordChannelType,
+  autoCreateMessagingGroup,
 } from './router.js';
 import {
   getMessagingGroupWithAgentCount,
   getMessagingGroupAgents,
+  createMessagingGroup,
   createMessagingGroupAgent,
 } from './db/messaging-groups.js';
 import { getRawDb } from './db/connection.js';
@@ -312,8 +314,8 @@ describe('C2: pre-fanout intercept dispatch', () => {
 
   it('test_routeInbound_intercept_skips_fanout', async () => {
     const mg = makeMg();
-    vi.mocked(getMessagingGroupWithAgentCount).mockReturnValue({ mg, agentCount: 1 });
-    vi.mocked(getMessagingGroupAgents).mockReturnValue([makeAgent()]);
+    vi.mocked(getMessagingGroupWithAgentCount).mockResolvedValue({ mg, agentCount: 1 });
+    vi.mocked(getMessagingGroupAgents).mockResolvedValue([makeAgent()]);
 
     const handlerSpy = vi.fn().mockResolvedValue(undefined);
     registerInterceptHandler('dashboard_token_issue', handlerSpy);
@@ -334,8 +336,8 @@ describe('C2: pre-fanout intercept dispatch', () => {
 
   it('test_routeInbound_intercept_fanout_with_multiple_agents', async () => {
     const mg = makeMg();
-    vi.mocked(getMessagingGroupWithAgentCount).mockReturnValue({ mg, agentCount: 2 });
-    vi.mocked(getMessagingGroupAgents).mockReturnValue([
+    vi.mocked(getMessagingGroupWithAgentCount).mockResolvedValue({ mg, agentCount: 2 });
+    vi.mocked(getMessagingGroupAgents).mockResolvedValue([
       makeAgent({ id: 'mga-1', agent_group_id: 'ag-1' }),
       makeAgent({ id: 'mga-2', agent_group_id: 'ag-2' }),
     ]);
@@ -355,8 +357,8 @@ describe('C2: pre-fanout intercept dispatch', () => {
     vi.useFakeTimers();
 
     const mg = makeMg();
-    vi.mocked(getMessagingGroupWithAgentCount).mockReturnValue({ mg, agentCount: 1 });
-    vi.mocked(getMessagingGroupAgents).mockReturnValue([makeAgent()]);
+    vi.mocked(getMessagingGroupWithAgentCount).mockResolvedValue({ mg, agentCount: 1 });
+    vi.mocked(getMessagingGroupAgents).mockResolvedValue([makeAgent()]);
 
     const neverResolves = new Promise<void>(() => {});
     registerInterceptHandler('dashboard_token_issue', () => neverResolves);
@@ -378,9 +380,9 @@ describe('C2: pre-fanout intercept dispatch', () => {
     const { getAgentGroup } = await import('./db/agent-groups.js');
     const mg = makeMg();
     const agent = makeAgent();
-    vi.mocked(getMessagingGroupWithAgentCount).mockReturnValue({ mg, agentCount: 1 });
-    vi.mocked(getMessagingGroupAgents).mockReturnValue([agent]);
-    vi.mocked(getAgentGroup).mockReturnValue({
+    vi.mocked(getMessagingGroupWithAgentCount).mockResolvedValue({ mg, agentCount: 1 });
+    vi.mocked(getMessagingGroupAgents).mockResolvedValue([agent]);
+    vi.mocked(getAgentGroup).mockResolvedValue({
       id: 'ag-1',
       name: 'Test Agent',
       folder: 'test',
@@ -398,8 +400,8 @@ describe('C2: pre-fanout intercept dispatch', () => {
       last_active: null,
       created_at: new Date().toISOString(),
     };
-    vi.mocked(resolveSession).mockReturnValue({ session, created: true });
-    vi.mocked(getSession).mockReturnValue(session);
+    vi.mocked(resolveSession).mockResolvedValue({ session, created: true });
+    vi.mocked(getSession).mockResolvedValue(session);
     vi.mocked(wakeContainer).mockResolvedValue(false);
 
     const event = makeChatEvent('hello world');
@@ -415,8 +417,8 @@ describe('C2: pre-fanout intercept dispatch', () => {
 
   it('test_routeInbound_intercept_filter_drops', async () => {
     const mg = makeMg();
-    vi.mocked(getMessagingGroupWithAgentCount).mockReturnValue({ mg, agentCount: 1 });
-    vi.mocked(getMessagingGroupAgents).mockReturnValue([makeAgent()]);
+    vi.mocked(getMessagingGroupWithAgentCount).mockResolvedValue({ mg, agentCount: 1 });
+    vi.mocked(getMessagingGroupAgents).mockResolvedValue([makeAgent()]);
 
     const event = makeChatEvent('/help');
     await routeInbound(event);
@@ -448,16 +450,16 @@ describe('flag dispatcher wake gate', () => {
       engage_mode: 'mention',
       ignored_message_policy: 'accumulate',
     });
-    vi.mocked(getMessagingGroupWithAgentCount).mockReturnValue({ mg, agentCount: 1 });
-    vi.mocked(getMessagingGroupAgents).mockReturnValue([accumulateAgent]);
-    vi.mocked(getAgentGroup).mockReturnValue({
+    vi.mocked(getMessagingGroupWithAgentCount).mockResolvedValue({ mg, agentCount: 1 });
+    vi.mocked(getMessagingGroupAgents).mockResolvedValue([accumulateAgent]);
+    vi.mocked(getAgentGroup).mockResolvedValue({
       id: 'ag-example-assistant-codex',
       name: 'Example Assistant Codex',
       folder: 'example-retail-codex',
       agent_provider: null,
       created_at: new Date().toISOString(),
     });
-    vi.mocked(resolveSession).mockReturnValue({
+    vi.mocked(resolveSession).mockResolvedValue({
       session: {
         id: 's-example-assistant-codex',
         agent_group_id: 'ag-example-assistant-codex',
@@ -494,16 +496,16 @@ describe('flag dispatcher wake gate', () => {
     const { getAgentGroup } = await import('./db/agent-groups.js');
     const mg = makeMg();
     const agent = makeAgent();
-    vi.mocked(getMessagingGroupWithAgentCount).mockReturnValue({ mg, agentCount: 1 });
-    vi.mocked(getMessagingGroupAgents).mockReturnValue([agent]);
-    vi.mocked(getAgentGroup).mockReturnValue({
+    vi.mocked(getMessagingGroupWithAgentCount).mockResolvedValue({ mg, agentCount: 1 });
+    vi.mocked(getMessagingGroupAgents).mockResolvedValue([agent]);
+    vi.mocked(getAgentGroup).mockResolvedValue({
       id: 'ag-1',
       name: 'Example Assistant',
       folder: 'example-retail',
       agent_provider: null,
       created_at: new Date().toISOString(),
     });
-    vi.mocked(resolveSession).mockReturnValue({
+    vi.mocked(resolveSession).mockResolvedValue({
       session: {
         id: 's-1',
         agent_group_id: 'ag-1',
@@ -536,16 +538,16 @@ describe('flag dispatcher wake gate', () => {
     const { getAgentGroup } = await import('./db/agent-groups.js');
     const mg = makeMg();
     const agent = makeAgent({ id: 'mga-newcodex', agent_group_id: 'ag-newcodex' });
-    vi.mocked(getMessagingGroupWithAgentCount).mockReturnValue({ mg, agentCount: 1 });
-    vi.mocked(getMessagingGroupAgents).mockReturnValue([agent]);
-    vi.mocked(getAgentGroup).mockReturnValue({
+    vi.mocked(getMessagingGroupWithAgentCount).mockResolvedValue({ mg, agentCount: 1 });
+    vi.mocked(getMessagingGroupAgents).mockResolvedValue([agent]);
+    vi.mocked(getAgentGroup).mockResolvedValue({
       id: 'ag-newcodex',
       name: 'fresh-codex-sibling',
       folder: 'fresh-codex-sibling',
       agent_provider: 'codex',
       created_at: new Date().toISOString(),
     });
-    vi.mocked(resolveSession).mockReturnValue({
+    vi.mocked(resolveSession).mockResolvedValue({
       session: {
         id: 's-newcodex',
         agent_group_id: 'ag-newcodex',
@@ -606,7 +608,7 @@ describe('thread context fetch', () => {
       fetchThreadHistory,
     };
     vi.mocked(getChannelAdapter).mockReturnValue(adapter);
-    vi.mocked(getMessagingGroupWithAgentCount).mockReturnValue({
+    vi.mocked(getMessagingGroupWithAgentCount).mockResolvedValue({
       mg: makeMg({
         id: 'mg-discord-example',
         channel_type: 'discord',
@@ -615,15 +617,15 @@ describe('thread context fetch', () => {
       }),
       agentCount: 1,
     });
-    vi.mocked(getMessagingGroupAgents).mockReturnValue([makeAgent({ agent_group_id: 'ag-number' })]);
-    vi.mocked(getAgentGroup).mockReturnValue({
+    vi.mocked(getMessagingGroupAgents).mockResolvedValue([makeAgent({ agent_group_id: 'ag-number' })]);
+    vi.mocked(getAgentGroup).mockResolvedValue({
       id: 'ag-number',
       name: 'example-beverage',
       folder: 'example-beverage',
       agent_provider: null,
       created_at: new Date().toISOString(),
     });
-    vi.mocked(resolveSession).mockReturnValue({
+    vi.mocked(resolveSession).mockResolvedValue({
       session: {
         id: 'sess-thread',
         agent_group_id: 'ag-number',
@@ -708,9 +710,9 @@ describe('workspace-trust auto-wire inherits voice and engagement defaults', () 
     // Auto-wire re-enters routing once the row exists; the second lookup must
     // report the channel as wired or routeInbound recurses forever.
     vi.mocked(getMessagingGroupWithAgentCount)
-      .mockReturnValueOnce({ mg, agentCount: 0 })
-      .mockReturnValue({ mg, agentCount: 1 });
-    vi.mocked(getMessagingGroupAgents).mockReturnValue([makeAgent({ messaging_group_id: 'mg-new' })]);
+      .mockResolvedValueOnce({ mg, agentCount: 0 })
+      .mockResolvedValue({ mg, agentCount: 1 });
+    vi.mocked(getMessagingGroupAgents).mockResolvedValue([makeAgent({ messaging_group_id: 'mg-new' })]);
     vi.mocked(getRawDb).mockReturnValue({
       prepare: (sql: string) => ({
         // inheritedAgentGroupFor picks the incumbent; unanimousToneFor asks
@@ -796,8 +798,8 @@ describe('workspace-trust auto-wire inherits voice and engagement defaults', () 
 describe('34: pre-fanout intercept fan-out dedup + denial reply', () => {
   it('always intercepts in a DM even without a platform-confirmed mention', async () => {
     const mg = makeMg({ id: 'mg-1', is_group: 0 });
-    vi.mocked(getMessagingGroupWithAgentCount).mockReturnValue({ mg, agentCount: 1 });
-    vi.mocked(getMessagingGroupAgents).mockReturnValue([makeAgent()]);
+    vi.mocked(getMessagingGroupWithAgentCount).mockResolvedValue({ mg, agentCount: 1 });
+    vi.mocked(getMessagingGroupAgents).mockResolvedValue([makeAgent()]);
     const handlerSpy = vi.fn().mockResolvedValue(undefined);
     registerInterceptHandler('dashboard_token_issue', handlerSpy);
 
@@ -810,8 +812,8 @@ describe('34: pre-fanout intercept fan-out dedup + denial reply', () => {
 
   it('skips interception when the raw text names a different bot (not addressed to me)', async () => {
     const mg = makeMg({ id: 'mg-1', is_group: 1 });
-    vi.mocked(getMessagingGroupWithAgentCount).mockReturnValue({ mg, agentCount: 1 });
-    vi.mocked(getMessagingGroupAgents).mockReturnValue([makeAgent()]);
+    vi.mocked(getMessagingGroupWithAgentCount).mockResolvedValue({ mg, agentCount: 1 });
+    vi.mocked(getMessagingGroupAgents).mockResolvedValue([makeAgent()]);
     const handlerSpy = vi.fn().mockResolvedValue(undefined);
     registerInterceptHandler('dashboard_token_issue', handlerSpy);
 
@@ -827,8 +829,8 @@ describe('34: pre-fanout intercept fan-out dedup + denial reply', () => {
 
   it('a bare unmentioned command in a group picks itself when it wins the deterministic tiebreak', async () => {
     const mg = makeMg({ id: 'mg-1', is_group: 1 });
-    vi.mocked(getMessagingGroupWithAgentCount).mockReturnValue({ mg, agentCount: 1 });
-    vi.mocked(getMessagingGroupAgents).mockReturnValue([makeAgent()]);
+    vi.mocked(getMessagingGroupWithAgentCount).mockResolvedValue({ mg, agentCount: 1 });
+    vi.mocked(getMessagingGroupAgents).mockResolvedValue([makeAgent()]);
     mockInterceptTiebreakWinner('mg-1');
     const handlerSpy = vi.fn().mockResolvedValue(undefined);
     registerInterceptHandler('dashboard_token_issue', handlerSpy);
@@ -842,8 +844,8 @@ describe('34: pre-fanout intercept fan-out dedup + denial reply', () => {
 
   it('a bare unmentioned command stays silent when a sibling wiring wins the tiebreak', async () => {
     const mg = makeMg({ id: 'mg-1', is_group: 1 });
-    vi.mocked(getMessagingGroupWithAgentCount).mockReturnValue({ mg, agentCount: 1 });
-    vi.mocked(getMessagingGroupAgents).mockReturnValue([makeAgent()]);
+    vi.mocked(getMessagingGroupWithAgentCount).mockResolvedValue({ mg, agentCount: 1 });
+    vi.mocked(getMessagingGroupAgents).mockResolvedValue([makeAgent()]);
     mockInterceptTiebreakWinner('mg-sibling-wins');
     const handlerSpy = vi.fn().mockResolvedValue(undefined);
     registerInterceptHandler('dashboard_token_issue', handlerSpy);
@@ -857,8 +859,8 @@ describe('34: pre-fanout intercept fan-out dedup + denial reply', () => {
 
   it('fails open (still answers) when the tiebreak query finds no sibling candidates', async () => {
     const mg = makeMg({ id: 'mg-1', is_group: 1 });
-    vi.mocked(getMessagingGroupWithAgentCount).mockReturnValue({ mg, agentCount: 1 });
-    vi.mocked(getMessagingGroupAgents).mockReturnValue([makeAgent()]);
+    vi.mocked(getMessagingGroupWithAgentCount).mockResolvedValue({ mg, agentCount: 1 });
+    vi.mocked(getMessagingGroupAgents).mockResolvedValue([makeAgent()]);
     mockInterceptTiebreakWinner(undefined);
     const handlerSpy = vi.fn().mockResolvedValue(undefined);
     registerInterceptHandler('dashboard_token_issue', handlerSpy);
@@ -873,8 +875,8 @@ describe('34: pre-fanout intercept fan-out dedup + denial reply', () => {
   it('replies with a safe, non-leaky denial exactly once when the addressed agent denies', async () => {
     vi.mocked(isAnyAdmin).mockReturnValue(false);
     const mg = makeMg({ id: 'mg-1', channel_type: 'slack-test', platform_id: 'platform-1', is_group: 0 });
-    vi.mocked(getMessagingGroupWithAgentCount).mockReturnValue({ mg, agentCount: 1 });
-    vi.mocked(getMessagingGroupAgents).mockReturnValue([makeAgent()]);
+    vi.mocked(getMessagingGroupWithAgentCount).mockResolvedValue({ mg, agentCount: 1 });
+    vi.mocked(getMessagingGroupAgents).mockResolvedValue([makeAgent()]);
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const deliverSpy = vi.fn().mockResolvedValue(undefined) as any;
     vi.mocked(getDeliveryAdapter).mockReturnValue({ deliver: deliverSpy });
@@ -899,8 +901,8 @@ describe('34: pre-fanout intercept fan-out dedup + denial reply', () => {
   it('does not send a duplicate denial from a non-responding sibling', async () => {
     vi.mocked(isAnyAdmin).mockReturnValue(false);
     const mg = makeMg({ id: 'mg-1', is_group: 1 });
-    vi.mocked(getMessagingGroupWithAgentCount).mockReturnValue({ mg, agentCount: 1 });
-    vi.mocked(getMessagingGroupAgents).mockReturnValue([makeAgent()]);
+    vi.mocked(getMessagingGroupWithAgentCount).mockResolvedValue({ mg, agentCount: 1 });
+    vi.mocked(getMessagingGroupAgents).mockResolvedValue([makeAgent()]);
     mockInterceptTiebreakWinner('mg-sibling-wins');
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const deliverSpy = vi.fn().mockResolvedValue(undefined) as any;
@@ -919,9 +921,9 @@ describe('34: pre-fanout intercept fan-out dedup + denial reply', () => {
     // pattern engage_mode with isMention:false — proves the new sole-responder
     // gate (intercept/deny only) never touches ordinary engage evaluation.
     const agent = makeAgent({ engage_mode: 'pattern', engage_pattern: '.' });
-    vi.mocked(getMessagingGroupWithAgentCount).mockReturnValue({ mg, agentCount: 1 });
-    vi.mocked(getMessagingGroupAgents).mockReturnValue([agent]);
-    vi.mocked(getAgentGroup).mockReturnValue({
+    vi.mocked(getMessagingGroupWithAgentCount).mockResolvedValue({ mg, agentCount: 1 });
+    vi.mocked(getMessagingGroupAgents).mockResolvedValue([agent]);
+    vi.mocked(getAgentGroup).mockResolvedValue({
       id: 'ag-1',
       name: 'Test Agent',
       folder: 'test',
@@ -939,8 +941,8 @@ describe('34: pre-fanout intercept fan-out dedup + denial reply', () => {
       last_active: null,
       created_at: new Date().toISOString(),
     };
-    vi.mocked(resolveSession).mockReturnValue({ session, created: true });
-    vi.mocked(getSession).mockReturnValue(session);
+    vi.mocked(resolveSession).mockResolvedValue({ session, created: true });
+    vi.mocked(getSession).mockResolvedValue(session);
     vi.mocked(wakeContainer).mockResolvedValue(false);
 
     // No mention, group chat, plain text — the sole-responder gate must never
@@ -963,9 +965,9 @@ describe('archive-before-session-write ordering', () => {
     const { getAgentGroup } = await import('./db/agent-groups.js');
     const mg = makeMg();
     const agent = makeAgent();
-    vi.mocked(getMessagingGroupWithAgentCount).mockReturnValue({ mg, agentCount: 1 });
-    vi.mocked(getMessagingGroupAgents).mockReturnValue([agent]);
-    vi.mocked(getAgentGroup).mockReturnValue({
+    vi.mocked(getMessagingGroupWithAgentCount).mockResolvedValue({ mg, agentCount: 1 });
+    vi.mocked(getMessagingGroupAgents).mockResolvedValue([agent]);
+    vi.mocked(getAgentGroup).mockResolvedValue({
       id: 'ag-1',
       name: 'Test Agent',
       folder: 'test',
@@ -983,8 +985,8 @@ describe('archive-before-session-write ordering', () => {
       last_active: null,
       created_at: new Date().toISOString(),
     };
-    vi.mocked(resolveSession).mockReturnValue({ session, created: true });
-    vi.mocked(getSession).mockReturnValue(session);
+    vi.mocked(resolveSession).mockResolvedValue({ session, created: true });
+    vi.mocked(getSession).mockResolvedValue(session);
     vi.mocked(wakeContainer).mockResolvedValue(false);
 
     const event = makeChatEvent('hello world');
@@ -1028,17 +1030,17 @@ describe('router notices survive a session whose inbound.db is gone', () => {
   async function routeAs(text: string, isMention = true): Promise<void> {
     const { getAgentGroup } = await import('./db/agent-groups.js');
     const mg = makeMg({ id: 'mg-1', channel_type: 'slack-test', platform_id: 'platform-1', is_group: 0 });
-    vi.mocked(getMessagingGroupWithAgentCount).mockReturnValue({ mg, agentCount: 1 });
-    vi.mocked(getMessagingGroupAgents).mockReturnValue([makeAgent()]);
-    vi.mocked(getAgentGroup).mockReturnValue({
+    vi.mocked(getMessagingGroupWithAgentCount).mockResolvedValue({ mg, agentCount: 1 });
+    vi.mocked(getMessagingGroupAgents).mockResolvedValue([makeAgent()]);
+    vi.mocked(getAgentGroup).mockResolvedValue({
       id: 'ag-1',
       name: 'Test Agent',
       folder: 'test',
       agent_provider: null,
       created_at: new Date().toISOString(),
     });
-    vi.mocked(resolveSession).mockReturnValue({ session, created: false });
-    vi.mocked(getSession).mockReturnValue(session);
+    vi.mocked(resolveSession).mockResolvedValue({ session, created: false });
+    vi.mocked(getSession).mockResolvedValue(session);
     vi.mocked(wakeContainer).mockResolvedValue(false);
     const event = makeChatEvent(text, {
       message: { ...makeChatEvent(text).message, isMention },
@@ -1090,5 +1092,41 @@ describe('router notices survive a session whose inbound.db is gone', () => {
     await routeAs('/clear');
 
     expect(outboundSessionWrite).not.toHaveBeenCalled();
+  });
+});
+
+describe('autoCreateMessagingGroup (seam 3: the lookup yields before the insert)', () => {
+  const candidate: MessagingGroup = {
+    id: 'mg-loser',
+    channel_type: 'slack',
+    platform_id: 'slack:C-RACE',
+    instance: 'slack',
+    name: null,
+    is_group: 1,
+    unknown_sender_policy: 'public',
+    denied_at: null,
+    created_at: new Date().toISOString(),
+  } as MessagingGroup;
+
+  it('adopts the row a concurrent route won with instead of aborting on the unique key', async () => {
+    const winner = { ...candidate, id: 'mg-winner' };
+    vi.mocked(createMessagingGroup).mockRejectedValueOnce(
+      Object.assign(
+        new Error('UNIQUE constraint failed: messaging_groups.channel_type, messaging_groups.platform_id'),
+        {
+          code: 'SQLITE_CONSTRAINT_UNIQUE',
+        },
+      ),
+    );
+    vi.mocked(getMessagingGroupWithAgentCount).mockResolvedValueOnce({ mg: winner, agentCount: 2 });
+
+    await expect(autoCreateMessagingGroup(candidate, 'slack')).resolves.toEqual({ mg: winner, agentCount: 2 });
+  });
+
+  it('rethrows anything that is not the unique-key loss', async () => {
+    vi.mocked(createMessagingGroup).mockRejectedValueOnce(
+      Object.assign(new Error('disk I/O'), { code: 'SQLITE_IOERR' }),
+    );
+    await expect(autoCreateMessagingGroup(candidate, 'slack')).rejects.toThrow('disk I/O');
   });
 });

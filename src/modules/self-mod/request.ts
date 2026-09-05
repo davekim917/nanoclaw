@@ -33,7 +33,7 @@ import type { Session } from '../../types.js';
 import { notifyAgent, requestApproval } from '../approvals/index.js';
 
 export async function validateInstallPackages(content: Record<string, unknown>, session: Session): Promise<boolean> {
-  const agentGroup = getAgentGroup(session.agent_group_id);
+  const agentGroup = await getAgentGroup(session.agent_group_id);
   if (!agentGroup) {
     await notifyAgent(session, 'install_packages failed: agent group not found.');
     return false;
@@ -69,7 +69,7 @@ export async function validateInstallPackages(content: Record<string, unknown>, 
 }
 
 export async function requestInstallPackagesHold(content: Record<string, unknown>, session: Session): Promise<void> {
-  const agentGroup = getAgentGroup(session.agent_group_id);
+  const agentGroup = await getAgentGroup(session.agent_group_id);
   if (!agentGroup) return;
   const apt = (content.apt as string[]) || [];
   const npm = (content.npm as string[]) || [];
@@ -129,7 +129,7 @@ export function escapeInvisibles(s: string): string {
 }
 
 export async function validateAddMcpServer(content: Record<string, unknown>, session: Session): Promise<boolean> {
-  const agentGroup = getAgentGroup(session.agent_group_id);
+  const agentGroup = await getAgentGroup(session.agent_group_id);
   if (!agentGroup) {
     await notifyAgent(session, 'add_mcp_server failed: agent group not found.');
     return false;
@@ -173,7 +173,7 @@ export async function validateAddMcpServer(content: Record<string, unknown>, ses
 }
 
 export async function requestAddMcpServerHold(content: Record<string, unknown>, session: Session): Promise<void> {
-  const agentGroup = getAgentGroup(session.agent_group_id);
+  const agentGroup = await getAgentGroup(session.agent_group_id);
   if (!agentGroup) return; // precheck already answered the requester
   const serverName = content.name as string;
   const serverConfig = parseMcpServerConfig(content);

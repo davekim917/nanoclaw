@@ -19,7 +19,7 @@ export interface ChannelSetup {
   onInboundEvent(event: InboundEvent): void | Promise<void>;
 
   /** Called when the adapter discovers metadata about a conversation. */
-  onMetadata(platformId: string, name?: string, isGroup?: boolean): void;
+  onMetadata(platformId: string, name?: string, isGroup?: boolean): void | Promise<void>;
 
   /** Called when a user clicks a button/action in a card (e.g., ask_user_question response). */
   onAction(questionId: string, selectedOption: string, userId: string): void;

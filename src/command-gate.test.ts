@@ -37,8 +37,8 @@ function insertRole(userId: string, role: 'owner' | 'admin', agentGroupId: strin
   }
 }
 
-function seedAgentGroup(id: string): void {
-  createAgentGroup({ id, name: id.toUpperCase(), folder: id, agent_provider: null, created_at: now() });
+async function seedAgentGroup(id: string): Promise<void> {
+  await createAgentGroup({ id, name: id.toUpperCase(), folder: id, agent_provider: null, created_at: now() });
 }
 
 function seedUser(id: string): void {
@@ -49,8 +49,8 @@ beforeEach(async () => {
   await initTestDb();
   const db = getRawDb();
   runMigrations(db);
-  seedAgentGroup('ag-1');
-  seedAgentGroup('ag-2');
+  await seedAgentGroup('ag-1');
+  await seedAgentGroup('ag-2');
 });
 
 afterEach(async () => {

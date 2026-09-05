@@ -128,8 +128,8 @@ function makeCallerSession(overrides: Partial<Session> = {}): Session {
   };
 }
 
-function seedAgentGroup(id: string): void {
-  createAgentGroup({ id, name: id, folder: id, agent_provider: null, created_at: now() });
+async function seedAgentGroup(id: string): Promise<void> {
+  await createAgentGroup({ id, name: id, folder: id, agent_provider: null, created_at: now() });
 }
 
 function seedSession(sessId: string, agId: string, mgId: string | null = null): void {
@@ -138,8 +138,8 @@ function seedSession(sessId: string, agId: string, mgId: string | null = null): 
     .run(sessId, agId, mgId, now());
 }
 
-function seedMessagingGroup(mgId: string): void {
-  createMessagingGroup({
+async function seedMessagingGroup(mgId: string): Promise<void> {
+  await createMessagingGroup({
     id: mgId,
     channel_type: 'slack',
     platform_id: 'C-platform',
@@ -227,7 +227,7 @@ afterEach(async () => {
 describe('applySpawnTask', () => {
   it('test_admit_missing_capability_rejects: rejects when caller has no orchestrator capability', async () => {
     await setupDb();
-    seedAgentGroup('ag-caller');
+    await seedAgentGroup('ag-caller');
     seedSession('sess-caller', 'ag-caller');
 
     const caller = makeCallerSession();
@@ -246,7 +246,7 @@ describe('applySpawnTask', () => {
 
   it('test_admit_happy_path: inserts task with correct fields (headless mode)', async () => {
     await setupDb();
-    seedAgentGroup('ag-caller');
+    await seedAgentGroup('ag-caller');
     seedSession('sess-caller', 'ag-caller');
     grantOrchestrator('ag-caller');
 
@@ -265,7 +265,7 @@ describe('applySpawnTask', () => {
 
   it('test_idempotency_replay_succeeds_at_cap: replay succeeds even when at concurrency cap', async () => {
     await setupDb();
-    seedAgentGroup('ag-caller');
+    await seedAgentGroup('ag-caller');
     seedSession('sess-caller', 'ag-caller');
     grantOrchestratorCap1('ag-caller');
 
@@ -317,7 +317,7 @@ describe('applySpawnTask', () => {
 
   it('test_idempotency_replay_with_different_payload: rejects with key_reused', async () => {
     await setupDb();
-    seedAgentGroup('ag-caller');
+    await seedAgentGroup('ag-caller');
     seedSession('sess-caller', 'ag-caller');
     grantOrchestrator('ag-caller');
 
@@ -367,7 +367,7 @@ describe('applySpawnTask', () => {
 
   it('test_cap_rejects_new_admission: rejects when at concurrency cap', async () => {
     await setupDb();
-    seedAgentGroup('ag-caller');
+    await seedAgentGroup('ag-caller');
     seedSession('sess-caller', 'ag-caller');
     grantOrchestratorCap1('ag-caller');
 
@@ -389,8 +389,8 @@ describe('applySpawnTask', () => {
 
   it('test_headless_path_when_no_create_thread: surface_mode=headless when adapter lacks createThread', async () => {
     await setupDb();
-    seedAgentGroup('ag-caller');
-    seedMessagingGroup('mg-1');
+    await seedAgentGroup('ag-caller');
+    await seedMessagingGroup('mg-1');
     seedSession('sess-caller', 'ag-caller', 'mg-1');
     grantOrchestrator('ag-caller');
 
@@ -408,8 +408,8 @@ describe('applySpawnTask', () => {
 
   it('ASSERT: surface_mode=native_thread when adapter has createThread and mgId is non-null', async () => {
     await setupDb();
-    seedAgentGroup('ag-caller');
-    seedMessagingGroup('mg-1');
+    await seedAgentGroup('ag-caller');
+    await seedMessagingGroup('mg-1');
     seedSession('sess-caller', 'ag-caller', 'mg-1');
     grantOrchestrator('ag-caller');
 
@@ -426,7 +426,7 @@ describe('applySpawnTask', () => {
 
   it('ASSERT: post-INSERT setImmediate(completeSpawnSideEffects, task_id, childAgentGroupId) called', async () => {
     await setupDb();
-    seedAgentGroup('ag-caller');
+    await seedAgentGroup('ag-caller');
     seedSession('sess-caller', 'ag-caller');
     grantOrchestrator('ag-caller');
 
@@ -441,7 +441,7 @@ describe('applySpawnTask', () => {
 
   it('ASSERT: notify-caller wrapped in try/catch — writeSessionMessage failure does not throw', async () => {
     await setupDb();
-    seedAgentGroup('ag-caller');
+    await seedAgentGroup('ag-caller');
     seedSession('sess-caller', 'ag-caller');
     grantOrchestrator('ag-caller');
 
@@ -459,7 +459,7 @@ describe('applySpawnTask', () => {
 describe('completeSpawnSideEffects', () => {
   it('test_lease_skip_when_held: skips silently when lease is already held', async () => {
     await setupDb();
-    seedAgentGroup('ag-caller');
+    await seedAgentGroup('ag-caller');
     seedSession('sess-caller', 'ag-caller');
 
     // Insert task with lease already held (set to now, not expired)
@@ -483,7 +483,7 @@ describe('completeSpawnSideEffects', () => {
 
   it('test_concurrent_setImmediate_dedupe: second call returns same promise (in-process guard)', async () => {
     await setupDb();
-    seedAgentGroup('ag-caller');
+    await seedAgentGroup('ag-caller');
     seedSession('sess-caller', 'ag-caller');
 
     const taskId = 'task-dedup';
@@ -510,8 +510,8 @@ describe('completeSpawnSideEffects', () => {
 
   it('test_adapter_unavailable_marks_failed_immediately: adapter_unavailable does not consume retry budget', async () => {
     await setupDb();
-    seedAgentGroup('ag-caller');
-    seedMessagingGroup('mg-1');
+    await seedAgentGroup('ag-caller');
+    await seedMessagingGroup('mg-1');
     seedSession('sess-caller', 'ag-caller', 'mg-1');
 
     const taskId = 'task-no-adapter';
@@ -539,7 +539,7 @@ describe('completeSpawnSideEffects', () => {
 
   it('test_completion_exhausted_after_5_failures: marks failed after 5 throws', async () => {
     await setupDb();
-    seedAgentGroup('ag-caller');
+    await seedAgentGroup('ag-caller');
     seedSession('sess-caller', 'ag-caller');
 
     const taskId = 'task-exhaust';
@@ -569,7 +569,7 @@ describe('completeSpawnSideEffects', () => {
 
   it('test_status_cas_aborts_on_cancel_mid_flight: aborts when status no longer pending', async () => {
     await setupDb();
-    seedAgentGroup('ag-caller');
+    await seedAgentGroup('ag-caller');
     seedSession('sess-caller', 'ag-caller');
 
     const taskId = 'task-cancelled-mid';
@@ -592,8 +592,8 @@ describe('completeSpawnSideEffects', () => {
 
   it('test_slack_thread_id_is_parent_message_id: persists threadId not messageId', async () => {
     await setupDb();
-    seedAgentGroup('ag-caller');
-    seedMessagingGroup('mg-1');
+    await seedAgentGroup('ag-caller');
+    await seedMessagingGroup('mg-1');
     seedSession('sess-caller', 'ag-caller', 'mg-1');
 
     const taskId = 'task-slack-thread';
@@ -622,7 +622,7 @@ describe('completeSpawnSideEffects', () => {
 
   it('test_open_session_write_order: tasks UPDATE before writeSessionMessage before wakeContainer', async () => {
     await setupDb();
-    seedAgentGroup('ag-caller');
+    await seedAgentGroup('ag-caller');
     seedSession('sess-caller', 'ag-caller');
 
     const taskId = 'task-write-order';
@@ -675,7 +675,7 @@ describe('completeSpawnSideEffects', () => {
   // that survives the suite no longer touching disk at all.
   it('stamps spawn_task_id through the provisioning mailbox seam, never the existing-only one', async () => {
     await setupDb();
-    seedAgentGroup('ag-caller');
+    await seedAgentGroup('ag-caller');
     seedSession('sess-caller', 'ag-caller');
     // The child row the mocked `resolveSession` claims to have created. Without
     // it the tasks UPDATE fails its child_session_id foreign key and the whole
@@ -725,7 +725,7 @@ vi.mock('../../dashboard/api/events.js', async (importOriginal) => ({
 describe('D6: emitDashboardEvent emits after apply functions commit', () => {
   it('test_applySpawnTask_emits_task_event_admit', async () => {
     await setupDb();
-    seedAgentGroup('ag-caller');
+    await seedAgentGroup('ag-caller');
     seedSession('sess-caller', 'ag-caller');
     grantOrchestrator('ag-caller');
 
@@ -749,7 +749,7 @@ describe('D6: emitDashboardEvent emits after apply functions commit', () => {
 
   it('test_emit_fires_after_commit: emit NOT called if admission is rejected (cap reached)', async () => {
     await setupDb();
-    seedAgentGroup('ag-caller');
+    await seedAgentGroup('ag-caller');
     seedSession('sess-caller', 'ag-caller');
     grantOrchestratorCap1('ag-caller');
 

@@ -162,7 +162,7 @@ beforeEach(async () => {
   runMigrations(db);
 
   // Insert the parent agent group
-  createAgentGroup({
+  await createAgentGroup({
     id: 'ag-parent',
     name: 'Parent Agent',
     folder: 'parent-agent',
@@ -192,7 +192,7 @@ describe('legacy call — no provider, no provider_config', () => {
     const session = makeSession();
     await runCreateAgent({ requestId: 'r1', name: 'Legacy', instructions: 'be helpful' }, session);
 
-    const row = getAgentGroupByFolder('legacy');
+    const row = await getAgentGroupByFolder('legacy');
     expect(row).toBeDefined();
     expect(row!.agent_provider).toBeNull();
 
@@ -226,7 +226,7 @@ describe('create with claude provider', () => {
       session,
     );
 
-    const row = getAgentGroupByFolder('coder');
+    const row = await getAgentGroupByFolder('coder');
     expect(row).toBeDefined();
     expect(row!.agent_provider).toBe('claude');
 
@@ -251,7 +251,7 @@ describe('create with codex provider', () => {
       session,
     );
 
-    const row = getAgentGroupByFolder('codexcoder');
+    const row = await getAgentGroupByFolder('codexcoder');
     expect(row).toBeDefined();
     expect(row!.agent_provider).toBe('codex');
 
@@ -339,7 +339,7 @@ describe('DB failure rollback', () => {
     ).resolves.toBeUndefined(); // must not throw
 
     expect(fs.existsSync(path.join(TEST_GROUPS_DIR, 'dbfail'))).toBe(false);
-    expect(getAgentGroupByFolder('dbfail')).toBeUndefined();
+    expect(await getAgentGroupByFolder('dbfail')).toBeUndefined();
 
     const calls = (writeSessionMessage as ReturnType<typeof vi.fn>).mock.calls;
     const notifyCall = calls.find((c) => {
@@ -457,7 +457,7 @@ describe('envelope guard — non-string provider', () => {
     });
     expect(notifyCall).toBeDefined();
 
-    expect(getAgentGroupByFolder('x')).toBeUndefined();
+    expect(await getAgentGroupByFolder('x')).toBeUndefined();
     expect(fs.existsSync(path.join(TEST_GROUPS_DIR, 'x'))).toBe(false);
   });
 });
@@ -485,7 +485,7 @@ describe('envelope guard — array provider_config', () => {
     });
     expect(notifyCall).toBeDefined();
 
-    expect(getAgentGroupByFolder('x')).toBeUndefined();
+    expect(await getAgentGroupByFolder('x')).toBeUndefined();
     expect(fs.existsSync(path.join(TEST_GROUPS_DIR, 'x'))).toBe(false);
   });
 });
@@ -508,7 +508,7 @@ describe('envelope guard — null provider_config', () => {
     });
     expect(notifyCall).toBeDefined();
 
-    expect(getAgentGroupByFolder('x')).toBeUndefined();
+    expect(await getAgentGroupByFolder('x')).toBeUndefined();
     expect(fs.existsSync(path.join(TEST_GROUPS_DIR, 'x'))).toBe(false);
   });
 });
@@ -518,8 +518,139 @@ describe('envelope guard — undefined provider_config is OK', () => {
     const session = makeSession();
     await runCreateAgent({ requestId: 'r7', name: 'ValidProviderOnly', provider: 'claude' }, session);
 
-    const row = getAgentGroupByFolder('validprovideronly');
+    const row = await getAgentGroupByFolder('validprovideronly');
     expect(row).toBeDefined();
     expect(row!.agent_provider).toBe('claude');
+  });
+});
+
+describe('concurrent approvals (seam 3: every lookup yields)', () => {
+  it('two approved requests for the same name are serialized: one agent, the other refused, the winner untouched', async () => {
+    // Two PARENTS: a same-parent repeat is refused earlier by the creator's
+    // destination-name check, so it never reaches folder allocation. The
+    // helper's capture array is shared, so the approved handler is driven
+    // directly here.
+    await createAgentGroup({
+      id: 'ag-parent-2',
+      name: 'Second Parent',
+      folder: 'second-parent',
+      agent_provider: null,
+      created_at: now(),
+    });
+    const apply = (parent: string, requestId: string) => {
+      const session = makeSession(parent);
+      const payload = {
+        name: 'Twin',
+        localPreview: 'twin',
+        instructions: null,
+        provider: null,
+        providerConfig: null,
+        requestId,
+      };
+      return applyCreateAgent({
+        session,
+        payload,
+        approval: {
+          approval_id: `approval-${requestId}`,
+          session_id: session.id,
+          request_id: requestId,
+          action: 'create_agent',
+          payload: JSON.stringify(payload),
+          created_at: now(),
+          agent_group_id: parent,
+          channel_type: null,
+          platform_id: null,
+          instance: null,
+          thread_id: null,
+          platform_message_id: null,
+          expires_at: null,
+          status: 'pending',
+          title: 'Create agent',
+          question: 'Create this agent?',
+          options_json: '[]',
+          approver_user_id: 'test-admin',
+        } satisfies PendingApproval,
+        userId: 'test-admin',
+        notify: async () => {},
+      });
+    };
+    await Promise.all([apply('ag-parent', 'twin-1'), apply('ag-parent-2', 'twin-2')]);
+
+    // Serialized: the second attempt sees the first's row, derives `twin-2`,
+    // and the scoped-env prefix rule refuses it (TWIN_2 starts with TWIN_).
+    // Unserialized, both derive `twin`, the loser's insert fails on the
+    // unique folder, and its rollback deletes the WINNER's directory.
+    const winner = await getAgentGroupByFolder('twin');
+    expect(winner).toBeDefined();
+    expect(await getAgentGroupByFolder('twin-2')).toBeUndefined();
+    const cfg = JSON.parse(fs.readFileSync(path.join(TEST_GROUPS_DIR, 'twin', 'container.json'), 'utf8')) as {
+      agentGroupId?: string;
+    };
+    expect(cfg.agentGroupId).toBe(winner!.id);
+    expect(fs.existsSync(path.join(TEST_GROUPS_DIR, 'twin-2'))).toBe(false);
+  });
+
+  it('two approved requests from ONE parent for the same name: one agent, the other refused by the destination-name check', async () => {
+    const apply = (requestId: string) => {
+      const session = makeSession('ag-parent');
+      const payload = {
+        name: 'Solo',
+        localPreview: 'solo',
+        instructions: null,
+        provider: null,
+        providerConfig: null,
+        requestId,
+      };
+      return applyCreateAgent({
+        session,
+        payload,
+        approval: {
+          approval_id: `approval-${requestId}`,
+          session_id: session.id,
+          request_id: requestId,
+          action: 'create_agent',
+          payload: JSON.stringify(payload),
+          created_at: now(),
+          agent_group_id: 'ag-parent',
+          channel_type: null,
+          platform_id: null,
+          instance: null,
+          thread_id: null,
+          platform_message_id: null,
+          expires_at: null,
+          status: 'pending',
+          title: 'Create agent',
+          question: 'Create this agent?',
+          options_json: '[]',
+          approver_user_id: 'test-admin',
+        } satisfies PendingApproval,
+        userId: 'test-admin',
+        notify: async () => {},
+      });
+    };
+    // Unserialized, both pass the parent's destination-name check, the second
+    // creates `solo-2` and then its grant hits the parent's primary key —
+    // an orphaned agent group. Under the lock the second is refused up front.
+    await Promise.all([apply('solo-1'), apply('solo-2')]);
+    const rows = getRawDb()
+      .prepare(`SELECT folder FROM agent_groups WHERE folder LIKE 'solo%' ORDER BY folder`)
+      .all() as Array<{ folder: string }>;
+    expect(rows.map((r) => r.folder)).toEqual(['solo']);
+    expect(fs.existsSync(path.join(TEST_GROUPS_DIR, 'solo-2'))).toBe(false);
+  });
+
+  it('the lock is acquired BEFORE the parent invariants (destination name, child cap)', () => {
+    // The interleaving Codex described — the first insert landing between the
+    // second request's parent checks and its folder dedupe — cannot be forced
+    // from outside the handler, so the ordering is pinned on the source: the
+    // lock must precede both parent checks in applyCreateAgent.
+    const source = fs.readFileSync(path.join(__dirname, 'create-agent.ts'), 'utf8');
+    const handler = source.slice(source.indexOf('export const applyCreateAgent'));
+    const lock = handler.indexOf('await acquireFolderAllocationLock()');
+    const nameCheck = handler.indexOf('getDestinationByName(sourceGroup.id, localName)');
+    const childCap = handler.indexOf('CHILDREN_PER_PARENT_CAP');
+    expect(lock).toBeGreaterThan(-1);
+    expect(nameCheck).toBeGreaterThan(lock);
+    expect(childCap).toBeGreaterThan(lock);
   });
 });

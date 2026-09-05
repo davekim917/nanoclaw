@@ -41,7 +41,7 @@ const GROUP = 'ag-mr';
 const DM_PLATFORM = 'discord:1:dm';
 const CHANNEL_PLATFORM = 'discord:1:chan';
 
-function makeSession(id: string, threadId: string | null, mgId: string | null = null): Session {
+async function makeSession(id: string, threadId: string | null, mgId: string | null = null): Promise<Session> {
   const session: Session = {
     id,
     agent_group_id: GROUP,
@@ -53,7 +53,7 @@ function makeSession(id: string, threadId: string | null, mgId: string | null = 
     last_active: null,
     created_at: NOW,
   };
-  createSession(session);
+  await createSession(session);
   initSessionFolder(GROUP, id);
   return session;
 }
@@ -76,8 +76,8 @@ beforeEach(async () => {
   fs.mkdirSync(TEST_DIR, { recursive: true });
   await initTestDb();
   runMigrations(getRawDb());
-  createAgentGroup({ id: GROUP, name: GROUP, folder: GROUP, agent_provider: null, created_at: NOW });
-  createMessagingGroup({
+  await createAgentGroup({ id: GROUP, name: GROUP, folder: GROUP, agent_provider: null, created_at: NOW });
+  await createMessagingGroup({
     id: 'mg-dm',
     channel_type: 'discord',
     platform_id: DM_PLATFORM,
@@ -86,7 +86,7 @@ beforeEach(async () => {
     unknown_sender_policy: 'strict',
     created_at: NOW,
   } as never);
-  createMessagingGroup({
+  await createMessagingGroup({
     id: 'mg-chan',
     channel_type: 'discord',
     platform_id: CHANNEL_PLATFORM,
@@ -103,17 +103,17 @@ afterEach(async () => {
 });
 
 describe('resolveSlackSafetyMessagingGroupId', () => {
-  it('passes a chat session through unchanged', () => {
-    const s = makeSession('sess-chat', 'discord:1:chan:99', 'mg-chan');
-    expect(resolveSlackSafetyMessagingGroupId(s)).toBe('mg-chan');
+  it('passes a chat session through unchanged', async () => {
+    const s = await makeSession('sess-chat', 'discord:1:chan:99', 'mg-chan');
+    expect(await resolveSlackSafetyMessagingGroupId(s)).toBe('mg-chan');
   });
 
-  it('resolves a task session to the destination it posts to', () => {
+  it('resolves a task session to the destination it posts to', async () => {
     // The regression: this used to return null, so the gate fail-closed and
     // every scheduled fire spawned under the `-noslack` identity.
-    const s = makeSession('sess-task', taskThreadId('career-journal-daily-c1fe'));
+    const s = await makeSession('sess-task', taskThreadId('career-journal-daily-c1fe'));
     addTaskRow('sess-task', 'discord', DM_PLATFORM);
-    expect(resolveSlackSafetyMessagingGroupId(s)).toBe('mg-dm');
+    expect(await resolveSlackSafetyMessagingGroupId(s)).toBe('mg-dm');
   });
 
   // The read funnel defaults to the console fan-out's 1s busy_timeout and no
@@ -123,51 +123,51 @@ describe('resolveSlackSafetyMessagingGroupId', () => {
   // replaced: a contended session, or one whose host write was interrupted,
   // would fail to resolve its route and fall through to the fail-closed null —
   // which is what spawns every scheduled fire under the `-noslack` identity.
-  it("threads the replaced open's 5s timeout and journal recovery, not the fan-out defaults", () => {
-    const s = makeSession('sess-task-opts', taskThreadId('career-journal-daily-c1fe'));
+  it("threads the replaced open's 5s timeout and journal recovery, not the fan-out defaults", async () => {
+    const s = await makeSession('sess-task-opts', taskThreadId('career-journal-daily-c1fe'));
     addTaskRow('sess-task-opts', 'discord', DM_PLATFORM);
     readOptions.last = undefined;
 
-    resolveSlackSafetyMessagingGroupId(s);
+    await resolveSlackSafetyMessagingGroupId(s);
 
     expect(readOptions.last).toEqual({ busyTimeoutMs: 5000, recoverJournal: true });
   });
 
-  it('resolves a task pointed at a shared channel to that channel, not to null', () => {
+  it('resolves a task pointed at a shared channel to that channel, not to null', async () => {
     // Still non-owner-safe once the gate judges it — but the gate must get a
     // real subject so the decision is about the destination, not about the
     // absence of one.
-    const s = makeSession('sess-task-chan', taskThreadId('smoke-abcd'));
+    const s = await makeSession('sess-task-chan', taskThreadId('smoke-abcd'));
     addTaskRow('sess-task-chan', 'discord', CHANNEL_PLATFORM);
-    expect(resolveSlackSafetyMessagingGroupId(s)).toBe('mg-chan');
+    expect(await resolveSlackSafetyMessagingGroupId(s)).toBe('mg-chan');
   });
 
-  it('follows the newest row when the destination was retargeted', () => {
-    const s = makeSession('sess-task-moved', taskThreadId('moved-1234'));
+  it('follows the newest row when the destination was retargeted', async () => {
+    const s = await makeSession('sess-task-moved', taskThreadId('moved-1234'));
     addTaskRow('sess-task-moved', 'discord', CHANNEL_PLATFORM, 2);
     addTaskRow('sess-task-moved', 'discord', DM_PLATFORM, 4);
-    expect(resolveSlackSafetyMessagingGroupId(s)).toBe('mg-dm');
+    expect(await resolveSlackSafetyMessagingGroupId(s)).toBe('mg-dm');
   });
 
-  it('fail-closes on the legacy shared task session (many series, no single subject)', () => {
-    const s = makeSession('sess-legacy', TASKS_SYSTEM_THREAD_ID);
+  it('fail-closes on the legacy shared task session (many series, no single subject)', async () => {
+    const s = await makeSession('sess-legacy', TASKS_SYSTEM_THREAD_ID);
     addTaskRow('sess-legacy', 'discord', DM_PLATFORM);
-    expect(resolveSlackSafetyMessagingGroupId(s)).toBeNull();
+    expect(await resolveSlackSafetyMessagingGroupId(s)).toBeNull();
   });
 
-  it('fail-closes when the task has no destination recorded', () => {
-    const s = makeSession('sess-nodest', taskThreadId('nodest-1'));
-    expect(resolveSlackSafetyMessagingGroupId(s)).toBeNull();
+  it('fail-closes when the task has no destination recorded', async () => {
+    const s = await makeSession('sess-nodest', taskThreadId('nodest-1'));
+    expect(await resolveSlackSafetyMessagingGroupId(s)).toBeNull();
   });
 
-  it('fail-closes when the destination resolves to no messaging group', () => {
-    const s = makeSession('sess-unknown', taskThreadId('unknown-1'));
+  it('fail-closes when the destination resolves to no messaging group', async () => {
+    const s = await makeSession('sess-unknown', taskThreadId('unknown-1'));
     addTaskRow('sess-unknown', 'discord', 'discord:1:vanished');
-    expect(resolveSlackSafetyMessagingGroupId(s)).toBeNull();
+    expect(await resolveSlackSafetyMessagingGroupId(s)).toBeNull();
   });
 
-  it('fail-closes on a non-task session with no messaging group (admin shell)', () => {
-    const s = makeSession('sess-admin', null);
-    expect(resolveSlackSafetyMessagingGroupId(s)).toBeNull();
+  it('fail-closes on a non-task session with no messaging group (admin shell)', async () => {
+    const s = await makeSession('sess-admin', null);
+    expect(await resolveSlackSafetyMessagingGroupId(s)).toBeNull();
   });
 });

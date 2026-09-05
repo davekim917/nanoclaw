@@ -566,8 +566,8 @@ function assertStagingPathOwnedBySession(session: Session, stagingPath: string):
   }
 }
 
-function workgroupForSession(session: Session): string {
-  const group = getAgentGroup(session.agent_group_id);
+async function workgroupForSession(session: Session): Promise<string> {
+  const group = await getAgentGroup(session.agent_group_id);
   if (!group) throw new Error(`agent group not found: ${session.agent_group_id}`);
   return group.workgroup_id ?? group.folder;
 }
@@ -594,7 +594,7 @@ export async function applyRepositoryPublishAction(content: Record<string, unkno
   const repositoryId = typeof content.repositoryId === 'string' ? content.repositoryId : '';
   if (!requestId || !repo || !origin || !repositoryId) throw new Error('repository_publish payload is invalid');
   assertRepositoryRequestId(requestId);
-  const workgroupId = workgroupForSession(session);
+  const workgroupId = await workgroupForSession(session);
   const stagingRoot = path.join(sessionDir(session.agent_group_id, session.id), 'repository-staging', requestId);
   const stagingPath = path.join(stagingRoot, repo);
   if (path.dirname(stagingPath) !== stagingRoot) throw new Error('repository staging path escapes the request root');
@@ -606,10 +606,10 @@ export async function applyRepositoryPublishAction(content: Record<string, unkno
   let quiescence: RepositoryMountQuiescence | null = null;
   try {
     await withWorkgroupRepositoryMountClaim(workgroupId, async () => {
-      const groupIds = getAllAgentGroups()
+      const groupIds = (await getAllAgentGroups())
         .filter((candidate) => (candidate.workgroup_id ?? candidate.folder) === workgroupId)
         .map((candidate) => candidate.id);
-      mountSessions = groupIds.flatMap((id) => getSessionsByAgentGroup(id));
+      mountSessions = (await Promise.all(groupIds.map((id) => getSessionsByAgentGroup(id)))).flat();
 
       // The mount claim closes new spawn admission. Wait for every already
       // admitted turn/tool to finish and stop all existing containers before
@@ -694,7 +694,7 @@ export async function applyRepositoryRefreshAction(content: Record<string, unkno
   const repo = typeof content.repo === 'string' ? content.repo : '';
   if (!requestId || !repo) throw new Error('repository_refresh payload is invalid');
   assertRepositoryRequestId(requestId);
-  const workgroupId = workgroupForSession(session);
+  const workgroupId = await workgroupForSession(session);
   try {
     await refreshCanonicalFromLocalRefs({ workgroupId, repo });
   } catch (error) {
@@ -905,7 +905,7 @@ export async function applyRepositoryTransferAction(content: Record<string, unkn
     // already durably queued the request and returned control to the agent; a
     // lookup rejection must therefore produce the same explicit failure wake
     // as a later Git/quiescence rejection instead of becoming a log-only job.
-    const workgroupId = workgroupForSession(session);
+    const workgroupId = await workgroupForSession(session);
     const destination = workUnitForSession(session, workgroupId);
     if (destination.key !== destinationWorkUnitKey) throw new Error('destination repository work-unit changed');
     const sourceRows = getRawDb()

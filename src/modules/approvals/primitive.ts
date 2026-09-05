@@ -228,7 +228,7 @@ export async function notifyAgent(session: Session, text: string): Promise<void>
     threadId: null,
     content: JSON.stringify({ text, sender: 'system', senderId: 'system' }),
   });
-  const fresh = getSession(session.id);
+  const fresh = await getSession(session.id);
   if (fresh) {
     wakeContainer(fresh).catch((err) => log.error('Failed to wake container after notification', { err }));
   }
@@ -346,7 +346,7 @@ export async function requestApproval(opts: RequestApprovalOptions): Promise<boo
 
   const approvalId = `appr-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
   const normalizedOptions = normalizeOptions(APPROVAL_OPTIONS);
-  createPendingApproval({
+  await createPendingApproval({
     approval_id: approvalId,
     session_id: session.id,
     agent_group_id: session.agent_group_id,
@@ -369,7 +369,7 @@ export async function requestApproval(opts: RequestApprovalOptions): Promise<boo
 
   const adapter = getDeliveryAdapter();
   if (!adapter) {
-    deletePendingApproval(approvalId);
+    await deletePendingApproval(approvalId);
     log.error('Failed to deliver approval card', {
       action,
       approvalId,
@@ -395,10 +395,10 @@ export async function requestApproval(opts: RequestApprovalOptions): Promise<boo
       }),
     );
     if (platformMsgId) {
-      updatePendingApprovalMessageId(approvalId, platformMsgId);
+      await updatePendingApprovalMessageId(approvalId, platformMsgId);
     }
   } catch (err) {
-    deletePendingApproval(approvalId);
+    await deletePendingApproval(approvalId);
     log.error('Failed to deliver approval card', { action, approvalId, target: destination.label, err });
     await notifyAgent(session, `${action} failed: could not deliver approval request to ${destination.label}.`);
     return false;

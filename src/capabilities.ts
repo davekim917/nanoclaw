@@ -25,6 +25,7 @@ import { getRegisteredChannelNames } from './channels/channel-registry.js';
 import { readContainerConfig } from './container-config.js';
 import { getRawDb } from './db/connection.js';
 import { getAllAgentGroups, getAgentGroup, getWorkgroupOnecliSecrets } from './db/agent-groups.js';
+import type { AgentGroup } from './types.js';
 import { mergeWorkgroupAndGroupSecrets, slackUserTokenSecrets } from './onecli-secrets.js';
 import { GITHUB_APP_SENTINEL, peekGitHubAppTokenExpiry } from './github-app-token.js';
 import { GH_TOKEN_CONTAINER_PATH, githubTokenDeliveredAsEnv } from './github-token-file.js';
@@ -260,11 +261,44 @@ function yamlTopLevelKeys(absPath: string): string[] {
   }
 }
 
-export function buildSessionServicesSnapshot(
+/**
+ * The central-DB facts a services snapshot is built from. Resolved by the
+ * caller BEFORE any synchronous block that needs the snapshot: the recall row
+ * is built between a write guard and its insert, where nothing may be awaited
+ * (seam-3 plan §4.5), so the snapshot's two central reads happen here and the
+ * build itself (`buildSessionServicesSnapshotFrom`) touches only the
+ * filesystem.
+ */
+export interface SessionServicesCentral {
+  agentGroup: AgentGroup | undefined;
+  workgroupSecrets: string[];
+}
+
+export async function resolveSessionServicesCentral(agentGroupId: string): Promise<SessionServicesCentral> {
+  return {
+    agentGroup: await getAgentGroup(agentGroupId),
+    workgroupSecrets: await getWorkgroupOnecliSecrets(agentGroupId),
+  };
+}
+
+export async function buildSessionServicesSnapshot(
   agentGroupId: string,
   sessionMessagingGroupId?: string | null,
+): Promise<SessionServicesSnapshot> {
+  return buildSessionServicesSnapshotFrom(
+    agentGroupId,
+    await resolveSessionServicesCentral(agentGroupId),
+    sessionMessagingGroupId,
+  );
+}
+
+/** Synchronous: filesystem and config only; every central read arrives in `central`. */
+export function buildSessionServicesSnapshotFrom(
+  agentGroupId: string,
+  central: SessionServicesCentral,
+  sessionMessagingGroupId?: string | null,
 ): SessionServicesSnapshot {
-  const ag = getAgentGroup(agentGroupId);
+  const ag = central.agentGroup;
   const cfg = ag ? readContainerConfig(ag.folder) : undefined;
   // Env-scoped services (Looker, dbt-mcp, dbt Cloud, GitHub, Render) resolve
   // their host creds by FOLDER via resolveScopedEnvVar. Sibling groups (e.g.
@@ -695,7 +729,7 @@ export function buildSessionServicesSnapshot(
   //     must never conclude "no Slack access" just because the MCP isn't
   //     loaded.
   // `resolve_thread_link` (archive) works in any session regardless.
-  const mergedSecrets = mergeWorkgroupAndGroupSecrets(getWorkgroupOnecliSecrets(agentGroupId), cfg?.onecliSecrets);
+  const mergedSecrets = mergeWorkgroupAndGroupSecrets(central.workgroupSecrets, cfg?.onecliSecrets);
   const hasSlackSecret = slackUserTokenSecrets(mergedSecrets, cfg?.slack_user_token?.onecli_secret_names).length > 0;
   const slackMcpEnabled = !!cfg?.slack_user_token?.enabled;
   if (hasSlackSecret || slackMcpEnabled) {
@@ -850,20 +884,20 @@ export function buildSessionServicesSnapshot(
   return { agentGroupId, services };
 }
 
-export function getHostCapabilities(
+export async function getHostCapabilities(
   forAgentGroupId?: string,
   sessionMessagingGroupId?: string | null,
-): HostCapabilities {
+): Promise<HostCapabilities> {
   const registered = getRegisteredChannelNames();
 
-  const messagingGroups = getAllMessagingGroups();
+  const messagingGroups = await getAllMessagingGroups();
   const byChannel: Record<string, number> = {};
   for (const mg of messagingGroups) {
     byChannel[mg.channel_type] = (byChannel[mg.channel_type] ?? 0) + 1;
   }
   const active = Object.keys(byChannel).sort();
 
-  const agentGroups = getAllAgentGroups().map((ag) => {
+  const agentGroups = (await getAllAgentGroups()).map((ag) => {
     const cfg = readContainerConfig(ag.folder);
     return {
       id: ag.id,
@@ -904,6 +938,6 @@ export function getHostCapabilities(
     agentGroups,
     messagingGroupsByChannel: byChannel,
     credentialEnvSet,
-    session: forAgentGroupId ? buildSessionServicesSnapshot(forAgentGroupId, sessionMessagingGroupId) : undefined,
+    session: forAgentGroupId ? await buildSessionServicesSnapshot(forAgentGroupId, sessionMessagingGroupId) : undefined,
   };
 }

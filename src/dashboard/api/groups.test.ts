@@ -36,21 +36,27 @@ async function setupDb(): Promise<void> {
 describe('groupsListHandler', () => {
   beforeEach(async () => {
     await setupDb();
-    createAgentGroup({
+    await createAgentGroup({
       id: 'ag-1',
       name: 'example-labs',
       folder: 'example-labs',
       agent_provider: null,
       created_at: now(),
     });
-    createAgentGroup({
+    await createAgentGroup({
       id: 'ag-2',
       name: 'example-dev',
       folder: 'example-dev',
       agent_provider: null,
       created_at: now(),
     });
-    createAgentGroup({ id: 'ag-3', name: 'personal', folder: 'personal', agent_provider: null, created_at: now() });
+    await createAgentGroup({
+      id: 'ag-3',
+      name: 'personal',
+      folder: 'personal',
+      agent_provider: null,
+      created_at: now(),
+    });
   });
   afterEach(async () => {
     await closeDb();

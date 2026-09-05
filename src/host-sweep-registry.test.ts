@@ -311,12 +311,17 @@ vi.mock('./db/provider-health.js', async (importOriginal) => {
   const real = await importOriginal<typeof import('./db/provider-health.js')>();
   return { ...real, markProviderUnavailable: () => undefined };
 });
-vi.mock('./db/connection.js', async (importOriginal) => ({
-  ...(await importOriginal<typeof import('./db/connection.js')>()),
-  getRawDb: () => ({
-    prepare: () => ({ run: () => undefined, get: () => undefined, all: () => [] }),
-  }),
-}));
+// The guard-path re-reads (seam-3 §4.5 I-1: `sessionStillActive`, the heal's
+// "still live" check) execute the sessions leaf's SQL on the raw handle, so the
+// shared fake answers a `FROM sessions` lookup from the harness's session list
+// and nothing else. Imported inside the factory: `vi.mock` is hoisted above
+// this file's import bindings.
+vi.mock('./db/connection.js', async (importOriginal) => {
+  const { rawDbConnectionMock } = await import('./test-fixtures/raw-db-fake.js');
+  return rawDbConnectionMock(await importOriginal<typeof import('./db/connection.js')>(), {
+    sessions: (id) => h.sessions.find((s) => s.id === id),
+  });
+});
 
 // Family modules self-register their duties at import via
 // `registerSweepDutySource` (plan.md §4.7 step 1) — the underlying bodies

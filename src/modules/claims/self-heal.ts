@@ -716,7 +716,7 @@ async function defaultResolveOwner(workgroupId: string, claim: BoardClaim): Prom
         deliverThreadId: row.deliverThreadId,
       };
     }
-    const group = getAgentGroup(row.agentGroupId);
+    const group = await getAgentGroup(row.agentGroupId);
     if (!group) continue;
     let display: string;
     try {

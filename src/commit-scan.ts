@@ -71,7 +71,7 @@ onHostShutdown(function commitScanHostShutdown() {
 });
 
 async function runScan(): Promise<void> {
-  const groups = getAllAgentGroups();
+  const groups = await getAllAgentGroups();
   let totalRepos = 0;
   let totalCommits = 0;
   for (const group of groups) {

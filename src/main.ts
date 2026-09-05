@@ -398,7 +398,7 @@ export async function main(): Promise<void> {
 
   // 1c. Backfill container_configs from legacy container.json files.
   // Idempotent — skips groups that already have a config row.
-  backfillContainerConfigs();
+  await backfillContainerConfigs();
 
   // 1d. One-time filesystem cutover — idempotent, no-op after first run.
   migrateGroupsToClaudeLocal();
@@ -439,7 +439,7 @@ export async function main(): Promise<void> {
   // row in sessions is stale by definition at this point. Without this, the
   // sweep wastes ticks enforcing SLA against containers that no longer exist
   // (see kill-ceiling / kill-claim warnings against 3-week-old sessions).
-  const resetCount = resetPhantomContainerStatus();
+  const resetCount = await resetPhantomContainerStatus();
   if (resetCount > 0) {
     log.info('Reset phantom container_status rows on startup', { count: resetCount });
   }
@@ -490,15 +490,15 @@ export async function main(): Promise<void> {
       onConnectionRestored(info) {
         return channelRecoveryReady.then(() => recoverChannelAdapter(adapter, info));
       },
-      onMetadata(platformId, name, isGroup) {
-        const mg = getMessagingGroupByPlatform(adapter.channelType, platformId);
+      async onMetadata(platformId, name, isGroup) {
+        const mg = await getMessagingGroupByPlatform(adapter.channelType, platformId);
         if (!mg) return; // router hasn't auto-created it yet — next inbound will
         const updates = resolveChannelMetadataUpdates(mg, name, isGroup, {
           platform: adapter.channelType,
           source: 'adapter',
         });
         if (Object.keys(updates).length === 0) return;
-        updateMessagingGroup(mg.id, updates);
+        await updateMessagingGroup(mg.id, updates);
         log.info('Channel metadata persisted', {
           channelType: adapter.channelType,
           platformId,

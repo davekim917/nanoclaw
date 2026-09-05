@@ -137,7 +137,7 @@ async function migrateOnce(dryRun: boolean): Promise<MigrationResult> {
     let channelSessionId: string;
     let channelSessionPreexisting: boolean;
     if (dryRun) {
-      const existing = findSessionByAgentGroupAndMessagingGroup(sess.agent_group_id, sess.messaging_group_id);
+      const existing = await findSessionByAgentGroupAndMessagingGroup(sess.agent_group_id, sess.messaging_group_id);
       channelSessionPreexisting = !!existing;
       channelSessionId = existing ? existing.id : `(would-create-new)`;
     } else {

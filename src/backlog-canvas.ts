@@ -227,7 +227,7 @@ onHostShutdown(function backlogCanvasHostShutdown() {
 
 /** Exposed for tests and for `scripts/refresh-backlog-canvas.ts`. */
 export async function runTick(): Promise<void> {
-  for (const group of getAllAgentGroups()) {
+  for (const group of await getAllAgentGroups()) {
     const config = readContainerConfig(group.folder).backlogCanvas;
     if (!config?.messagingGroupId) continue; // not opted in
     try {

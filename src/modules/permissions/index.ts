@@ -17,7 +17,13 @@
  */
 import { recordDroppedMessage } from '../../db/dropped-messages.js';
 import { getAgentGroup, getAllAgentGroups } from '../../db/agent-groups.js';
-import { createMessagingGroupAgent, getMessagingGroup, setMessagingGroupDeniedAt } from '../../db/messaging-groups.js';
+import {
+  createMessagingGroupAgent,
+  getMessagingGroup,
+  setMessagingGroupDeniedAt,
+  getMessagingGroupAgents,
+} from '../../db/messaging-groups.js';
+import { insertOrAdopt } from '../../db/insert-or-adopt.js';
 import { resolveWiringDefaults } from '../../channels/channel-defaults.js';
 import {
   completeDeferredInbound,
@@ -34,7 +40,7 @@ import { registerResponseHandler, type ResponsePayload } from '../../response-re
 import { getDeliveryAdapter } from '../../delivery.js';
 import { guard } from '../../guard/index.js';
 import { log } from '../../log.js';
-import type { MessagingGroup, MessagingGroupAgent } from '../../types.js';
+import type { AgentGroup, MessagingGroup, MessagingGroupAgent } from '../../types.js';
 import { canAccessAgentGroup, isSiblingBotSender } from './access.js';
 import {
   AGENT_ACCESS_SCOPE_WARNING,
@@ -453,7 +459,7 @@ async function wireApprovedChannel(
 
   const mg = getMessagingGroup(row.messaging_group_id);
   const isGroup = event.message.isGroup ?? mg?.is_group === 1;
-  const agentGroupName = getAgentGroup(agentGroupId)?.name ?? '';
+  const agentGroupName = (await getAgentGroup(agentGroupId))?.name ?? '';
 
   let engage: { engage_mode: MessagingGroupAgent['engage_mode']; engage_pattern: string | null };
   try {
@@ -476,7 +482,7 @@ async function wireApprovedChannel(
   }
 
   const mgaId = `mga-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-  createMessagingGroupAgent({
+  const wiring: MessagingGroupAgent = {
     id: mgaId,
     messaging_group_id: row.messaging_group_id,
     agent_group_id: agentGroupId,
@@ -496,7 +502,16 @@ async function wireApprovedChannel(
     default_tone: null,
     instructions_profile: null,
     created_at: new Date().toISOString(),
-  });
+  };
+  // Lookup-then-insert on the async driver: a concurrent route can win the
+  // same wiring; adopt it instead of failing this message (seam 3 primitive).
+  await insertOrAdopt(
+    wiring,
+    async (candidate) => {
+      createMessagingGroupAgent(candidate);
+    },
+    async () => (await getMessagingGroupAgents(row.messaging_group_id)).find((w) => w.agent_group_id === agentGroupId),
+  );
   log.info('Channel registration approved — wiring created', {
     messagingGroupId: row.messaging_group_id,
     agentGroupId,
@@ -570,7 +585,7 @@ async function handleChannelApprovalResponse(payload: ResponsePayload): Promise<
 
   // ── Reject / Cancel ──
   if (payload.value === REJECT_VALUE) {
-    setMessagingGroupDeniedAt(row.messaging_group_id, new Date().toISOString());
+    await setMessagingGroupDeniedAt(row.messaging_group_id, new Date().toISOString());
     deletePendingChannelApproval(row.messaging_group_id);
     completeStoredDeferredInbound(row.original_message);
     log.info('Channel registration denied', {
@@ -594,7 +609,7 @@ async function handleChannelApprovalResponse(payload: ResponsePayload): Promise<
     const adapter = getDeliveryAdapter();
     if (!adapter) return true;
 
-    const agentGroups = getAllAgentGroups();
+    const agentGroups = await getAllAgentGroups();
     const options = buildAgentSelectionOptions(agentGroups, approverId);
     const title = '📋 Choose an agent';
     const question = `Which agent should handle this channel? ${AGENT_ACCESS_SCOPE_WARNING}`;
@@ -671,7 +686,7 @@ async function handleChannelApprovalResponse(payload: ResponsePayload): Promise<
 
   if (payload.value.startsWith(CONNECT_PREFIX)) {
     targetAgentGroupId = payload.value.slice(CONNECT_PREFIX.length);
-    const ag = getAgentGroup(targetAgentGroupId);
+    const ag = await getAgentGroup(targetAgentGroupId);
     if (!ag) {
       log.error('Channel registration: target agent group no longer exists', {
         messagingGroupId: row.messaging_group_id,
@@ -734,7 +749,23 @@ registerMessageInterceptor(async (event: InboundEvent): Promise<boolean> => {
   const row = getPendingChannelApproval(pending.channelMgId);
   if (!row) return true;
 
-  const ag = createNewAgentGroup(text);
+  // `awaitingNameInput` is already deleted by here, so a throw out of this
+  // interceptor would strand the approver with no card, no agent, and no
+  // message. Creation can now legitimately fail (folder allocation gives up
+  // after N concurrent losses), so report it instead of propagating.
+  let ag: AgentGroup;
+  try {
+    ag = await createNewAgentGroup(text);
+  } catch (err) {
+    log.error('Channel registration: agent group creation failed', {
+      messagingGroupId: row.messaging_group_id,
+      agentName: text,
+      err,
+    });
+    await notifyApprover(row.approver_user_id, `⚠️ Couldn't create agent "${text}" — check the host logs.`);
+    return true;
+  }
+
   log.info('Channel registration: new agent group created', {
     messagingGroupId: row.messaging_group_id,
     agentGroupId: ag.id,
@@ -744,24 +775,20 @@ registerMessageInterceptor(async (event: InboundEvent): Promise<boolean> => {
 
   const wired = await wireApprovedChannel(row, ag.id, userId);
 
-  const adapter = getDeliveryAdapter();
-  if (adapter) {
-    const dm = await ensureUserDm(row.approver_user_id);
-    if (dm) {
-      adapter
-        .deliver(
-          dm.channel_type,
-          dm.platform_id,
-          null,
-          'chat-sdk',
-          JSON.stringify({
-            text: wired
-              ? `✅ Agent "${ag.name}" created and connected.`
-              : `⚠️ Agent "${ag.name}" was created but the channel couldn't be connected — check the host logs.`,
-          }),
-        )
-        .catch(() => {});
-    }
-  }
+  await notifyApprover(
+    row.approver_user_id,
+    wired
+      ? `✅ Agent "${ag.name}" created and connected.`
+      : `⚠️ Agent "${ag.name}" was created but the channel couldn't be connected — check the host logs.`,
+  );
   return true;
 });
+
+/** Best-effort DM to the approver; delivery failures are never fatal here. */
+async function notifyApprover(approverUserId: string, text: string): Promise<void> {
+  const adapter = getDeliveryAdapter();
+  if (!adapter) return;
+  const dm = await ensureUserDm(approverUserId);
+  if (!dm) return;
+  adapter.deliver(dm.channel_type, dm.platform_id, null, 'chat-sdk', JSON.stringify({ text })).catch(() => {});
+}

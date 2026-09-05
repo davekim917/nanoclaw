@@ -115,7 +115,7 @@ async function boot(seed?: boolean): Promise<Boot> {
     const agentGroups = await import('../../db/agent-groups.js');
     const users = await import('../permissions/db/users.js');
     const roles = await import('../permissions/db/user-roles.js');
-    agentGroups.createAgentGroup({
+    await agentGroups.createAgentGroup({
       id: 'ag-1',
       name: 'Acme',
       folder: 'acme',
@@ -189,7 +189,7 @@ describe('OneCLI approvals survive a host restart', () => {
     // bare channel type — dispatch is exact-key.
     expect(adapter1.deliver.mock.calls[0][6]).toBe('slack-acme');
 
-    const rows = first.sessions.getPendingApprovalsByAction('onecli_credential');
+    const rows = await first.sessions.getPendingApprovalsByAction('onecli_credential');
     expect(rows).toHaveLength(1);
     const approvalId = rows[0].approval_id;
     expect(rows[0].request_id).toBe('req-uuid-1');
@@ -205,7 +205,7 @@ describe('OneCLI approvals survive a host restart', () => {
     await settle();
 
     // Re-attach must not expire a still-open row.
-    expect(second.sessions.getPendingApproval(approvalId)?.status).toBe('pending');
+    expect((await second.sessions.getPendingApproval(approvalId))?.status).toBe('pending');
 
     const redelivered = sdk.callbacks[1](request);
     await settle();
@@ -220,7 +220,7 @@ describe('OneCLI approvals survive a host restart', () => {
     // The guarded action replays: the held credentialed request is decided by
     // the post-restart callback, which is what the SDK submits to the gateway.
     await expect(redelivered).resolves.toBe('approve');
-    expect(second.sessions.getPendingApproval(approvalId)).toBeUndefined();
+    expect(await second.sessions.getPendingApproval(approvalId)).toBeUndefined();
   });
 
   it('keeps the cross-tenant approver check after the restart, with the in-memory set gone', async () => {
@@ -233,7 +233,7 @@ describe('OneCLI approvals survive a host restart', () => {
     await settle();
     sdk.callbacks[0](request).catch(() => {});
     await settle();
-    const approvalId = first.sessions.getPendingApprovalsByAction('onecli_credential')[0].approval_id;
+    const approvalId = (await first.sessions.getPendingApprovalsByAction('onecli_credential'))[0].approval_id;
     first.approvals.stopOneCLIApprovalHandler();
 
     const second = await boot();
@@ -244,20 +244,20 @@ describe('OneCLI approvals survive a host restart', () => {
     const claimed = await second.approvals.resolveOneCLIApproval(approvalId, 'approve', OUTSIDER);
     expect(claimed).toBe(true);
     // Refused, not decided: the row is untouched and still clickable.
-    expect(second.sessions.getPendingApproval(approvalId)?.status).toBe('pending');
+    expect((await second.sessions.getPendingApproval(approvalId))?.status).toBe('pending');
 
     // The real approver still gets through. Nothing is armed in memory here, so
     // the decision is held on the row for the gateway's redelivery rather than
     // discarded — see the redelivery tests below.
     expect(await second.approvals.resolveOneCLIApproval(approvalId, 'approve', ADMIN)).toBe(true);
-    expect(second.sessions.getPendingApproval(approvalId)?.status).toBe('approved');
+    expect((await second.sessions.getPendingApproval(approvalId))?.status).toBe('approved');
   });
 });
 
 describe('expired OneCLI approval cards', () => {
   /** A pending row whose gateway TTL has already passed, as left by a crash. */
   async function seedOverdueRow(boot0: Boot, approvalId: string): Promise<void> {
-    boot0.sessions.createPendingApproval({
+    await boot0.sessions.createPendingApproval({
       approval_id: approvalId,
       session_id: null,
       request_id: 'req-uuid-dead',
@@ -297,7 +297,7 @@ describe('expired OneCLI approval cards', () => {
     // Edits dispatch exact-key too.
     expect(adapter.deliver.mock.calls[0][6]).toBe('slack-acme');
 
-    expect(second.sessions.getPendingApproval('oa-dead1')).toBeUndefined();
+    expect(await second.sessions.getPendingApproval('oa-dead1')).toBeUndefined();
   });
 
   it('expires overdue rows on the row-driven sweep, not just on a timer that died with its process', async () => {
@@ -318,7 +318,7 @@ describe('expired OneCLI approval cards', () => {
     const edits = cardCalls(adapter).filter((c) => c.operation === 'edit');
     expect(edits).toHaveLength(1);
     expect(edits[0].text).toContain('⏱️ Timed out — no response');
-    expect(second.sessions.getPendingApproval('oa-dead3')).toBeUndefined();
+    expect(await second.sessions.getPendingApproval('oa-dead3')).toBeUndefined();
   });
 
   it('refuses a click on a card the sweep already expired, rather than deciding it twice', async () => {
@@ -333,7 +333,7 @@ describe('expired OneCLI approval cards', () => {
 
     // Re-attach expired and deleted the row; the card in the DM still shows
     // live buttons until the edit lands, so a click can still arrive.
-    expect(second.sessions.getPendingApproval('oa-dead4')).toBeUndefined();
+    expect(await second.sessions.getPendingApproval('oa-dead4')).toBeUndefined();
     const claimed = await second.approvals.resolveOneCLIApproval('oa-dead4', 'approve', ADMIN);
     expect(claimed).toBe(false);
     expect(adapter.deliver).not.toHaveBeenCalled();
@@ -347,7 +347,7 @@ describe('expired OneCLI approval cards', () => {
 
     // Seeded after boot on purpose: this is the sweep-vs-click race inside one
     // process, where the sweep has claimed the row but not yet deleted it.
-    first.sessions.createPendingApproval({
+    await first.sessions.createPendingApproval({
       approval_id: 'oa-claimed',
       session_id: null,
       request_id: 'req-uuid-claimed',
@@ -371,15 +371,20 @@ describe('expired OneCLI approval cards', () => {
     const claimed = await first.approvals.resolveOneCLIApproval('oa-claimed', 'reject', ADMIN);
     expect(claimed).toBe(true);
     // Status untouched, no edit delivered — the compare-and-swap refused it.
-    expect(first.sessions.getPendingApproval('oa-claimed')?.status).toBe('approved');
+    expect((await first.sessions.getPendingApproval('oa-claimed'))?.status).toBe('approved');
     expect(adapter.deliver).not.toHaveBeenCalled();
   });
 });
 
 describe('decisions made before the gateway redelivers', () => {
   /** A card that survived the restart, with the gateway still holding it. */
-  function seedSurvivingRow(boot0: Boot, approvalId: string, expiresAt: string, status = 'pending'): void {
-    boot0.sessions.createPendingApproval({
+  async function seedSurvivingRow(
+    boot0: Boot,
+    approvalId: string,
+    expiresAt: string,
+    status = 'pending',
+  ): Promise<void> {
+    await boot0.sessions.createPendingApproval({
       approval_id: approvalId,
       session_id: null,
       request_id: 'req-uuid-held',
@@ -402,7 +407,7 @@ describe('decisions made before the gateway redelivers', () => {
   it('holds a click that lands before the first redelivery and applies it when the request comes back', async () => {
     const inFuture = new Date(Date.now() + 300_000).toISOString();
     const first = await boot(true);
-    seedSurvivingRow(first, 'oa-held', inFuture);
+    await seedSurvivingRow(first, 'oa-held', inFuture);
 
     const second = await boot();
     const adapter = makeAdapter();
@@ -416,7 +421,7 @@ describe('decisions made before the gateway redelivers', () => {
 
     // The decision is held on the row, not thrown away, and the card is not
     // yet corrected — we do not know the request is dead.
-    expect(second.sessions.getPendingApproval('oa-held')?.status).toBe('approved');
+    expect((await second.sessions.getPendingApproval('oa-held'))?.status).toBe('approved');
     expect(adapter.deliver).not.toHaveBeenCalled();
 
     // The gateway redelivers. The held decision is applied to the real
@@ -424,20 +429,20 @@ describe('decisions made before the gateway redelivers', () => {
     const redelivered = sdk.callbacks[0](gatewayRequest('req-uuid-held', inFuture));
     await expect(redelivered).resolves.toBe('approve');
     expect(cardCalls(adapter).filter((c) => c.type === 'ask_question')).toHaveLength(0);
-    expect(second.sessions.getPendingApproval('oa-held')).toBeUndefined();
+    expect(await second.sessions.getPendingApproval('oa-held')).toBeUndefined();
   });
 
   it('carries a held rejection through to the redelivered request', async () => {
     const inFuture = new Date(Date.now() + 300_000).toISOString();
     const first = await boot(true);
-    seedSurvivingRow(first, 'oa-held-rej', inFuture);
+    await seedSurvivingRow(first, 'oa-held-rej', inFuture);
 
     const second = await boot();
     second.approvals.startOneCLIApprovalHandler(makeAdapter());
     await settle();
 
     expect(await second.approvals.resolveOneCLIApproval('oa-held-rej', 'reject', ADMIN)).toBe(true);
-    expect(second.sessions.getPendingApproval('oa-held-rej')?.status).toBe('rejected');
+    expect((await second.sessions.getPendingApproval('oa-held-rej'))?.status).toBe('rejected');
 
     await expect(sdk.callbacks[0](gatewayRequest('req-uuid-held', inFuture))).resolves.toBe('deny');
   });
@@ -445,7 +450,7 @@ describe('decisions made before the gateway redelivers', () => {
   it('tells the human the truth once the held decision outlives the request', async () => {
     const first = await boot(true);
     // Decision recorded, TTL already passed: the gateway never came back.
-    seedSurvivingRow(first, 'oa-stale', new Date(Date.now() - 60_000).toISOString(), 'approved');
+    await seedSurvivingRow(first, 'oa-stale', new Date(Date.now() - 60_000).toISOString(), 'approved');
 
     const second = await boot();
     const adapter = makeAdapter();
@@ -455,12 +460,12 @@ describe('decisions made before the gateway redelivers', () => {
     const edits = cardCalls(adapter).filter((c) => c.operation === 'edit');
     expect(edits).toHaveLength(1);
     expect(edits[0].text).toContain('the original request ended when the host restarted');
-    expect(second.sessions.getPendingApproval('oa-stale')).toBeUndefined();
+    expect(await second.sessions.getPendingApproval('oa-stale')).toBeUndefined();
   });
 
   it('drops an unconsumed rejection without correcting the card', async () => {
     const first = await boot(true);
-    seedSurvivingRow(first, 'oa-stale-rej', new Date(Date.now() - 60_000).toISOString(), 'rejected');
+    await seedSurvivingRow(first, 'oa-stale-rej', new Date(Date.now() - 60_000).toISOString(), 'rejected');
 
     const second = await boot();
     const adapter = makeAdapter();
@@ -469,7 +474,7 @@ describe('decisions made before the gateway redelivers', () => {
 
     // "❌ Rejected" is already accurate — the request was denied either way.
     expect(cardCalls(adapter).filter((c) => c.operation === 'edit')).toHaveLength(0);
-    expect(second.sessions.getPendingApproval('oa-stale-rej')).toBeUndefined();
+    expect(await second.sessions.getPendingApproval('oa-stale-rej')).toBeUndefined();
   });
 });
 
@@ -482,7 +487,7 @@ describe('approver-set authorization', () => {
     await settle();
     sdk.callbacks[0](gatewayRequest('req-uuid-revoke', inFuture)).catch(() => {});
     await settle();
-    const approvalId = first.sessions.getPendingApprovalsByAction('onecli_credential')[0].approval_id;
+    const approvalId = (await first.sessions.getPendingApprovalsByAction('onecli_credential'))[0].approval_id;
 
     // Every admin/owner role goes away while the card sits in the DM.
     first.approvals.stopOneCLIApprovalHandler();
@@ -503,7 +508,7 @@ describe('approver-set authorization', () => {
     // explicit empty-set guard an unidentified callback decides a credentialed
     // request that nobody is authorized to decide.
     expect(await second.approvals.resolveOneCLIApproval(approvalId, 'approve', '')).toBe(true);
-    expect(second.sessions.getPendingApproval(approvalId)?.status).toBe('pending');
+    expect((await second.sessions.getPendingApproval(approvalId))?.status).toBe('pending');
     expect(adapter2.deliver).not.toHaveBeenCalled();
   });
 
@@ -515,7 +520,7 @@ describe('approver-set authorization', () => {
     await settle();
     const held = sdk.callbacks[0](gatewayRequest('req-uuid-legacy', inFuture));
     await settle();
-    const approvalId = first.sessions.getPendingApprovalsByAction('onecli_credential')[0].approval_id;
+    const approvalId = (await first.sessions.getPendingApprovalsByAction('onecli_credential'))[0].approval_id;
 
     // Adapters predating userId propagation send an empty id. With a real
     // approver set that still resolves, with a warning — fork behavior kept.

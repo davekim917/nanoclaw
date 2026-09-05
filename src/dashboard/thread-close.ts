@@ -761,7 +761,7 @@ async function finalizeSession(session: CloseSession, threadId: string, deps: Th
   const clearThenSettle = async (): Promise<SettleOutcome> => {
     if (!(await clear(session, threadId))) return 'not-cleared';
     if (owns(session.id)) return 'still-owned';
-    archive(session.id); // (e)
+    await archive(session.id); // (e)
     return 'settled';
   };
 

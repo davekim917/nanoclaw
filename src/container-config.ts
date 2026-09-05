@@ -904,8 +904,8 @@ export function effectiveTimezone(override: string | null | undefined, fallback:
  * through `effectiveTimezone`, which the spawn path calls directly because it
  * holds the file value rather than a group id.
  */
-export function resolveGroupTimezone(agentGroupId: string, fallback: string = TIMEZONE): string {
-  return effectiveTimezone(getContainerConfig(agentGroupId)?.timezone, fallback);
+export async function resolveGroupTimezone(agentGroupId: string, fallback: string = TIMEZONE): Promise<string> {
+  return effectiveTimezone((await getContainerConfig(agentGroupId))?.timezone, fallback);
 }
 
 /** Build a `ContainerConfig` from a DB row + agent group identity. */

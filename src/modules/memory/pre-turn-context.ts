@@ -2,7 +2,11 @@ import fs from 'fs';
 import path from 'path';
 import { createHash } from 'crypto';
 
-import { buildSessionServicesSnapshot, type SessionServicesSnapshot } from '../../capabilities.js';
+import {
+  buildSessionServicesSnapshotFrom,
+  type SessionServicesCentral,
+  type SessionServicesSnapshot,
+} from '../../capabilities.js';
 import { getRawDb } from '../../db/connection.js';
 import { log } from '../../log.js';
 import {
@@ -121,6 +125,12 @@ export interface PreTurnContextInput {
   includeBootstrap?: boolean;
   /** Evidence already delivered in this provider context epoch. */
   seenEvidenceFingerprints?: readonly string[];
+  /**
+   * Central-DB facts for the capabilities snapshot, resolved by the caller
+   * (`resolveSessionServicesCentral`) before its synchronous block. The build
+   * itself never awaits: it runs between a write guard and its insert.
+   */
+  servicesCentral: SessionServicesCentral;
 }
 
 export interface ContextNotice {
@@ -1913,7 +1923,7 @@ export function buildPreTurnContext(input: PreTurnContextInput): PreTurnContext 
   if (includeBootstrap) {
     try {
       trustedCapabilities = boundedCapabilities(
-        buildSessionServicesSnapshot(input.agentGroupId, currentMessagingGroupId),
+        buildSessionServicesSnapshotFrom(input.agentGroupId, input.servicesCentral, currentMessagingGroupId),
         notices,
       );
     } catch (error) {

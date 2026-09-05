@@ -66,9 +66,9 @@ function withWorkgroup(ag: AgentGroup): void {
 
 async function spawnAppSrcMount(id: string): Promise<{ hostPath: string; containerPath: string; readonly?: boolean }> {
   const ag = group(`ag-runner-src-${id}`, `runner-src-group-${id}`);
-  createAgentGroup(ag);
+  await createAgentGroup(ag);
   withWorkgroup(ag);
-  ensureContainerConfig(ag.id);
+  await ensureContainerConfig(ag.id);
   initGroupFilesystem(ag, {});
   const mounts = await buildMounts(ag, session(`s-runner-src-${id}`, ag.id), containerConfig(), 'claude', {});
   const mount = mounts.find((m) => m.containerPath === '/app/src');

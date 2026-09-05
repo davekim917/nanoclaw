@@ -42,16 +42,27 @@ const SELF = 'src/db/raw-db-ratchet.test.ts';
 const NOT_CALLERS: readonly string[] = [DEFINER, SELF];
 
 /**
- * Every file referencing `getRawDb` or `hasTableRaw` as of seam 3 PR 1, plus
- * the ONE sanctioned addition: `src/db/central-lease.ts` (PR 6a).
+ * Every file referencing `getRawDb` or `hasTableRaw` as of seam 3 PR 1.
+ * A PR may delete entries. Adding one fails this test.
  *
- * That file is the module that will REPLACE every other importer. Its
- * `withRawDb()` is the only way an allowlisted synchronous block reaches the
- * raw handle from PR 6 on — it takes the fork lease first and refuses outside a
- * `withCentralSync` block — so the raw seam moving into it is the shrink this
- * list exists to track, arriving one commit ahead of the removals.
+ * Four entries were ADDED by PR 4 (the big-four leaf flip) and are the plan's
+ * own allowlist, not growth of the transitional seam (§4.5, I-1): the guard
+ * decision seam (`src/guard/guard.ts`, `src/cli/guard.ts`,
+ * `src/modules/agent-to-agent/guard.ts`) is evaluated inside callers'
+ * guard-adjacent synchronous blocks, so it never awaits and reads the central
+ * DB through the leaves' exported SQL; `write-destinations.ts` resolves its
+ * three central reads inside the mailbox action immediately before a
+ * REPLACE-shaped write. PR 6 wraps each of them in `withRawDb` inside
+ * `withCentralSync` and pins the terminal set. Two TEST files joined with
+ * them: `guard/guard.test.ts` stubs the raw handle the sync guard now reads,
+ * and `db/sessions.test.ts` drops module tables through it to pin the
+ * `hasTable` early return.
  *
- * Otherwise: a PR may delete entries. Adding one fails this test.
+ * `src/test-fixtures/raw-db-fake.ts` is the one further entry, and it exists to
+ * KEEP this list small: every test whose subject reaches the sync guard path
+ * without opening a central DB needs a stub handle, and routing them all
+ * through one shared fake means the identifier is named once instead of once
+ * per test file. Migrating an existing test entry onto it removes that entry.
  */
 export const RAW_DB_IMPORTERS: readonly string[] = [
   'scripts/bust-slack-profile-cache.ts',
@@ -85,10 +96,12 @@ export const RAW_DB_IMPORTERS: readonly string[] = [
   'src/cli/crud.test.ts',
   'src/cli/crud.ts',
   'src/cli/delivery-action.test.ts',
+  'src/cli/guard.ts',
   'src/cli/request-ledger.test.ts',
   'src/cli/request-ledger.ts',
   'src/cli/resources/destinations.test.ts',
   'src/cli/resources/destinations.ts',
+  'src/cli/resources/groups-create-adopt.test.ts',
   'src/cli/resources/groups.test.ts',
   'src/cli/resources/groups.ts',
   'src/cli/resources/members.ts',
@@ -151,14 +164,12 @@ export const RAW_DB_IMPORTERS: readonly string[] = [
   'src/dashboard/thread-snooze.test.ts',
   'src/dashboard/thread-snooze.ts',
   'src/db/agent-groups.test.ts',
-  'src/db/agent-groups.ts',
   'src/db/backlog.ts',
   'src/db/boot-order.test.ts',
   'src/db/central-lease.ts',
   'src/db/channel-ingress-receipts.test.ts',
   'src/db/channel-ingress-receipts.ts',
   'src/db/container-configs.test.ts',
-  'src/db/container-configs.ts',
   'src/db/db-v2.test.ts',
   'src/db/denied-models.ts',
   'src/db/index.ts',
@@ -169,6 +180,7 @@ export const RAW_DB_IMPORTERS: readonly string[] = [
   'src/db/provider-health.ts',
   'src/db/scheduled-tasks.test.ts',
   'src/db/scheduled-tasks.ts',
+  'src/db/sessions.test.ts',
   'src/db/sessions.ts',
   'src/db/support-threads.ts',
   'src/db/task-thread-anchors.ts',
@@ -178,9 +190,10 @@ export const RAW_DB_IMPORTERS: readonly string[] = [
   'src/delivery.test.ts',
   'src/delivery.ts',
   'src/group-init.settings.test.ts',
+  'src/guard/guard.test.ts',
+  'src/guard/guard.ts',
   'src/host-core.test.ts',
   'src/host-lifecycle-timers.test.ts',
-  'src/host-sweep-registry.test.ts',
   'src/host-sweep.test.ts',
   'src/mailbox-seam-unreachable-scripts.test.ts',
   'src/main.ts',
@@ -191,8 +204,10 @@ export const RAW_DB_IMPORTERS: readonly string[] = [
   'src/modules/agent-to-agent/create-agent.ts',
   'src/modules/agent-to-agent/db/agent-destinations.ts',
   'src/modules/agent-to-agent/db/agent-message-policies.ts',
+  'src/modules/agent-to-agent/guard.ts',
   'src/modules/agent-to-agent/message-gate.test.ts',
   'src/modules/agent-to-agent/write-destinations.test.ts',
+  'src/modules/agent-to-agent/write-destinations.ts',
   'src/modules/approvals/approval-resolved.test.ts',
   'src/modules/approvals/onecli-approvals.test.ts',
   'src/modules/approvals/picks.test.ts',
@@ -219,6 +234,7 @@ export const RAW_DB_IMPORTERS: readonly string[] = [
   'src/modules/orchestrator-dispatch/progress.test.ts',
   'src/modules/orchestrator-dispatch/progress.ts',
   'src/modules/orchestrator-dispatch/reconciler.test.ts',
+  'src/modules/permissions/channel-approval-folder-race.test.ts',
   'src/modules/permissions/channel-approval.test.ts',
   'src/modules/permissions/db/agent-group-members.ts',
   'src/modules/permissions/db/pending-channel-approvals.ts',
@@ -232,6 +248,7 @@ export const RAW_DB_IMPORTERS: readonly string[] = [
   'src/modules/permissions/sender-approval.test.ts',
   'src/modules/permissions/sender-decline-notify.test.ts',
   'src/modules/permissions/task-slack-subject.test.ts',
+  'src/modules/permissions/user-dm-adopt.test.ts',
   'src/modules/provider-fallback/handler.test.ts',
   'src/modules/repository-workspaces/index.test.ts',
   'src/modules/repository-workspaces/index.ts',
@@ -269,6 +286,7 @@ export const RAW_DB_IMPORTERS: readonly string[] = [
   'src/storage-pressure-alert.test.ts',
   'src/storage-pressure-alert.ts',
   'src/templates/create-agent.test.ts',
+  'src/test-fixtures/raw-db-fake.ts',
   'src/topic-title.test.ts',
   'src/workgroup-memory.integration.test.ts',
   'src/worktree-cleanup.test.ts',

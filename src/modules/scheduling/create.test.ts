@@ -31,8 +31,8 @@ import { createScheduledTask, prepareScheduledTask } from './create.js';
 
 const AG = 'ag-create-test';
 
-function taskSession(): { id: string } {
-  const sessions = getSessionsByAgentGroup(AG).filter((s) => s.thread_id?.startsWith('system:tasks'));
+async function taskSession(): Promise<{ id: string }> {
+  const sessions = (await getSessionsByAgentGroup(AG)).filter((s) => s.thread_id?.startsWith('system:tasks'));
   expect(sessions, 'no task session was provisioned').toHaveLength(1);
   return sessions[0]!;
 }
@@ -59,7 +59,7 @@ beforeEach(async () => {
   await initTestDb();
   const db = getRawDb();
   runMigrations(db);
-  createAgentGroup({ id: AG, name: AG, folder: AG, agent_provider: null, created_at: new Date().toISOString() });
+  (await createAgentGroup({ id: AG, name: AG, folder: AG, agent_provider: null, created_at: new Date().toISOString() }));
 });
 
 afterEach(async () => {
@@ -100,6 +100,6 @@ describe('createScheduledTask', () => {
 
     // The session was resolved (and its inbound.db provisioned) before the
     // bracket, so an empty mailbox is the abort, not a missing session.
-    expect(taskRowCount(taskSession().id)).toBe(0);
+    expect(taskRowCount((await taskSession()).id)).toBe(0);
   });
 });

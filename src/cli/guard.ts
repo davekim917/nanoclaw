@@ -15,7 +15,8 @@
  * Arg auto-fill, the sessions-get existence oracle, and post-handler row
  * filtering stay in dispatch.ts — mechanics, not policy.
  */
-import { getContainerConfig } from '../db/container-configs.js';
+import { getRawDb } from '../db/connection.js';
+import { CONTAINER_CONFIG_BY_GROUP_SQL } from '../db/container-configs.js';
 import { ALLOW, DENY, HOLD, type GuardedActionSpec, type GuardInput } from '../guard/index.js';
 import { GROUP_SCOPE_RESOURCES, type CommandDef } from './registry.js';
 
@@ -42,6 +43,11 @@ export function commandGuardSpec(cmd: CommandDef): GuardedActionSpec {
   };
 }
 
+// Synchronous by design (seam-3 plan §4.5, I-1): this decision runs inside
+// callers' guard-adjacent blocks — `guard(a2aSend)` inside the agent-route
+// WriteGuard, `guard(threadsClose)` inside thread-close's one synchronous
+// decision — so it never awaits. Its central reads use the leaf's exported SQL
+// on the raw handle; PR 6 wraps them in `withRawDb` inside `withCentralSync`.
 function commandDecide(cmd: CommandDef, input: GuardInput) {
   const { actor } = input;
   if (actor.kind === 'host') return ALLOW('host caller (trusted socket)');
@@ -56,7 +62,7 @@ function commandDecide(cmd: CommandDef, input: GuardInput) {
   }
 
   const args = input.payload;
-  const cliScope = getContainerConfig(actor.agentGroupId)?.cli_scope ?? 'group';
+  const cliScope = cliScopeOf(actor.agentGroupId);
 
   if (cliScope === 'disabled') {
     return DENY('CLI access is disabled for this agent group.');
@@ -91,4 +97,12 @@ function commandDecide(cmd: CommandDef, input: GuardInput) {
   }
 
   return ALLOW('open command');
+}
+
+/** Raw, synchronous: see the note on `commandDecide`. */
+function cliScopeOf(agentGroupId: string): string {
+  const row = getRawDb().prepare(CONTAINER_CONFIG_BY_GROUP_SQL).get(agentGroupId) as
+    | { cli_scope: string | null }
+    | undefined;
+  return row?.cli_scope ?? 'group';
 }

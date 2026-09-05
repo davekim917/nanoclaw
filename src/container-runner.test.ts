@@ -147,12 +147,14 @@ import {
   sessionStillActive,
   isContainerRunning,
   isContainerSpawning,
+  renderCapabilitiesSnapshot,
 } from './container-runner.js';
 import { formatMemoryMb, resolveContainerResources } from './container-resources.js';
 import { mergeWorkgroupAndGroupSecrets } from './onecli-secrets.js';
 import { getProviderContainerConfig } from './providers/provider-container-registry.js';
 import { log } from './log.js';
 import { closeDb, getRawDb, initTestDb } from './db/connection.js';
+import { runMigrations } from './db/index.js';
 import { allowSubprocess } from './test-hermeticity.js';
 import type { MemoryAdmissionResult } from './memory-admission.js';
 import type { Session } from './types.js';
@@ -864,7 +866,7 @@ describe('codex provider host auth', () => {
     return JSON.parse(fs.readFileSync(path.join(sessionDir, 'codex', 'auth.json'), 'utf-8'));
   }
 
-  it('copies scoped Codex auth for the agent group folder without DB lookup', () => {
+  it('copies scoped Codex auth for the agent group folder without DB lookup', async () => {
     const home = makeHome();
     const sessionDir = makeSessionDir();
     writeAuth(path.join(home, '.codex'), 'global');
@@ -872,7 +874,7 @@ describe('codex provider host auth', () => {
 
     const fn = getProviderContainerConfig('codex');
     expect(fn).toBeDefined();
-    const contribution = fn!({
+    const contribution = await fn!({
       sessionDir,
       agentGroupId: 'ag-does-not-match-folder',
       agentGroupFolder: 'example-retail-codex',
@@ -889,14 +891,14 @@ describe('codex provider host auth', () => {
     });
   });
 
-  it('falls back to global Codex auth when no scoped auth exists', () => {
+  it('falls back to global Codex auth when no scoped auth exists', async () => {
     const home = makeHome();
     const sessionDir = makeSessionDir();
     writeAuth(path.join(home, '.codex'), 'global');
 
     const fn = getProviderContainerConfig('codex');
     expect(fn).toBeDefined();
-    fn!({
+    await fn!({
       sessionDir,
       agentGroupId: 'example-retail-codex',
       agentGroupFolder: 'example-retail-codex',
@@ -2260,5 +2262,21 @@ describe('NANOCLAW_INSTRUCTIONS_PROFILE reaches the container', () => {
     // second group-level slot here would only be a way for the two to
     // disagree.
     expect(source).toMatch(/const instructionsProfile = channelDefaults\?\.channelInstructionsProfile \?\? null;/);
+  });
+});
+
+describe('renderCapabilitiesSnapshot (seam 3: getHostCapabilities is async)', () => {
+  it('renders the AWAITED capabilities, never a Promise serialized as {}', async () => {
+    // A Promise reaching JSON.stringify is `{}` and no lint rule sees it, so
+    // the proof is behavioural: the snapshot carries the capabilities shape.
+    await initTestDb();
+    try {
+      runMigrations(getRawDb());
+      const parsed = JSON.parse(await renderCapabilitiesSnapshot('ag-none', null)) as Record<string, unknown>;
+      expect(typeof parsed.version).toBe('string');
+      expect(parsed).toHaveProperty('channels');
+    } finally {
+      await closeDb();
+    }
   });
 });

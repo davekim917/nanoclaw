@@ -21,11 +21,18 @@
  *
  * The guard itself fails closed: a throwing decide denies.
  */
-import { getPendingApproval } from '../db/sessions.js';
+import { getRawDb } from '../db/connection.js';
+import { PENDING_APPROVAL_BY_ID_SQL } from '../db/sessions.js';
+import type { PendingApproval } from '../types.js';
 import { log } from '../log.js';
 import { isGuardedAction, type GuardedAction } from './guard-actions.js';
 import { ALLOW, DENY, type GuardDecision, type GuardInput } from './types.js';
 
+// Synchronous by design (seam-3 plan §4.5, I-1): this decision runs inside
+// callers' guard-adjacent blocks — `guard(a2aSend)` inside the agent-route
+// WriteGuard, `guard(threadsClose)` inside thread-close's one synchronous
+// decision — so it never awaits. Its central reads use the leaf's exported SQL
+// on the raw handle; PR 6 wraps them in `withRawDb` inside `withCentralSync`.
 export function guard(action: GuardedAction, input: GuardInput): GuardDecision {
   if (!isGuardedAction(action)) {
     // JS-level backstop — the branded type already forbids this. A
@@ -65,7 +72,7 @@ function grantSatisfies(action: GuardedAction, input: GuardInput): boolean {
   if (grant.action !== action.grantActionName) return false;
   // The row must still be live — resolution deletes it, so a grant can only
   // execute once and a fabricated row object doesn't pass.
-  const live = getPendingApproval(grant.approval_id);
+  const live = getRawDb().prepare(PENDING_APPROVAL_BY_ID_SQL).get(grant.approval_id) as PendingApproval | undefined;
   if (!live || live.action !== action.grantActionName) return false;
   if (action.grantCoversRequest && !action.grantCoversRequest(grant, input)) return false;
   return true;

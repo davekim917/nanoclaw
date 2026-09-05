@@ -27,8 +27,8 @@ vi.mock('../../container-runner.js', async (importOriginal) => {
     killContainer: vi.fn(),
     // The real definition: the route builds this guard and the wake path is
     // what evaluates it, next to `spawn()`.
-    sessionStillActive: (sessionId: string) => () => {
-      const fresh = getSession(sessionId);
+    sessionStillActive: (sessionId: string) => async () => {
+      const fresh = await getSession(sessionId);
       if (!fresh) return { ok: false, reason: 'session no longer exists' };
       if (fresh.status !== 'active') return { ok: false, reason: `session is ${fresh.status}` };
       if (fresh.archived_at != null) return { ok: false, reason: 'session is archived' };
@@ -81,14 +81,14 @@ async function route(content: string, sourceSessionId: string) {
   const { getSession } = await import('../../db/sessions.js');
   await routeAgentMessage(
     { id: `out-${Math.random().toString(36).slice(2, 8)}`, platform_id: B, content, in_reply_to: null },
-    getSession(sourceSessionId)!,
+    (await getSession(sourceSessionId))!,
   );
 }
 
 async function targetInbound(): Promise<Array<{ content: string; channel_type: string | null }>> {
   const { getSessionsByAgentGroup } = await import('../../db/sessions.js');
   const { inboundDbPath } = await import('../../mailbox/sqlite/paths.js');
-  const sessions = getSessionsByAgentGroup(B);
+  const sessions = await getSessionsByAgentGroup(B);
   expect(sessions.length).toBeGreaterThanOrEqual(1);
   const db = new Database(inboundDbPath(B, sessions[0].id), { readonly: true });
   const rows = db
@@ -125,9 +125,21 @@ describe('a2a parity with a normally-engaged session', () => {
     const db = getRawDb();
     runMigrations(db);
 
-    createAgentGroup({ id: A, name: 'Source Agent', folder: 'src-agent', agent_provider: null, created_at: now() });
-    createAgentGroup({ id: B, name: 'Target Agent', folder: 'dst-agent', agent_provider: null, created_at: now() });
-    createMessagingGroup({
+    await createAgentGroup({
+      id: A,
+      name: 'Source Agent',
+      folder: 'src-agent',
+      agent_provider: null,
+      created_at: now(),
+    });
+    await createAgentGroup({
+      id: B,
+      name: 'Target Agent',
+      folder: 'dst-agent',
+      agent_provider: null,
+      created_at: now(),
+    });
+    await createMessagingGroup({
       id: MG,
       channel_type: 'slack',
       platform_id: 'C-GENERAL',
@@ -152,7 +164,7 @@ describe('a2a parity with a normally-engaged session', () => {
       )
       .run(A, B, now());
 
-    sourceSessionId = resolveSession(A, MG, THREAD, 'per-thread').session.id;
+    sourceSessionId = (await resolveSession(A, MG, THREAD, 'per-thread')).session.id;
   });
 
   afterEach(async () => {
@@ -218,7 +230,7 @@ describe('a2a parity with a normally-engaged session', () => {
 
     // Agent-shared, exactly as if the revocation had landed one moment earlier.
     const { getSessionsByAgentGroup } = await import('../../db/sessions.js');
-    const targets = getSessionsByAgentGroup(B);
+    const targets = await getSessionsByAgentGroup(B);
     expect(targets).toHaveLength(1);
     expect(targets[0].messaging_group_id).toBeNull();
     // No chat surface, so no history to backfill from one.
@@ -273,7 +285,7 @@ describe('a2a parity with a normally-engaged session', () => {
     await route(JSON.stringify({ text: '/files' }), sourceSessionId);
 
     const { getSessionsByAgentGroup } = await import('../../db/sessions.js');
-    expect(getSessionsByAgentGroup(B)).toHaveLength(0);
+    expect(await getSessionsByAgentGroup(B)).toHaveLength(0);
   });
 
   it('lets an unrecognised slash command through, like the channel gate', async () => {

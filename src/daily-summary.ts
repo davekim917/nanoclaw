@@ -176,7 +176,7 @@ async function fireDigests(): Promise<void> {
   }
 
   const since = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
-  const workgroups = groupByWorkgroup(getAllAgentGroups());
+  const workgroups = groupByWorkgroup(await getAllAgentGroups());
   let sentCount = 0;
 
   for (const [workgroupId, members] of workgroups) {

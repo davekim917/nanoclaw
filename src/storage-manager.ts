@@ -23,7 +23,8 @@ import { CONTAINER_IMAGE, CONTAINER_IMAGE_BASE, CONTAINER_INSTALL_LABEL, DATA_DI
 import { runningContainerMounts as inspectRunningContainerMounts } from './container-mounts.js';
 import { CONTAINER_RUNTIME_BIN } from './container-runtime.js';
 import { getRawDb } from './db/connection.js';
-import { getAllContainerConfigs } from './db/container-configs.js';
+import { CONTAINER_CONFIGS_ALL_SQL } from './db/container-configs.js';
+import type { ContainerConfigRow } from './types.js';
 import { log } from './log.js';
 import { resolveRepositoryWorkUnit } from './repository-workspaces.js';
 import { tryRunWithStorageCleanupClaim } from './storage-activity.js';
@@ -2511,7 +2512,11 @@ function configuredImageProtection(): { images: Set<string>; readable: boolean }
   try {
     return {
       images: new Set(
-        getAllContainerConfigs()
+        // Raw and synchronous on purpose: this pass runs inside the storage
+        // maintenance worker thread and the synchronous reclaim executors,
+        // and the image-removal action re-reads it immediately before `rmi`.
+        // Seam-3 plan §4.5 allowlists it; PR 6 wraps it in `withRawDb`.
+        (getRawDb().prepare(CONTAINER_CONFIGS_ALL_SQL).all() as ContainerConfigRow[])
           .map((config) => config.image_tag?.trim())
           .filter((tag): tag is string => Boolean(tag)),
       ),

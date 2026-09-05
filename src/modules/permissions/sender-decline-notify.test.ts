@@ -108,10 +108,10 @@ beforeEach(async () => {
   // place so it picks up the mocked delivery + user-dm helpers.
   await import('./index.js');
 
-  createAgentGroup({ id: 'ag-1', name: 'Agent', folder: 'agent', agent_provider: null, created_at: now() });
+  await createAgentGroup({ id: 'ag-1', name: 'Agent', folder: 'agent', agent_provider: null, created_at: now() });
 
   // A wired 1:1 DM messaging group on decline_notify.
-  createMessagingGroup({
+  await createMessagingGroup({
     id: 'mg-dm-stranger',
     channel_type: 'telegram',
     platform_id: 'dm-stranger',
@@ -148,7 +148,7 @@ beforeEach(async () => {
   });
   // Named instance, not the bare channel_type: on such an install nothing is
   // registered under 'telegram', so an omitted instance resolves no adapter.
-  createMessagingGroup({
+  await createMessagingGroup({
     id: 'mg-dm-owner',
     channel_type: 'telegram',
     instance: 'telegram-owner-bot',
@@ -351,7 +351,7 @@ describe('unknown-sender decline_notify flow', () => {
   });
 
   it('flip request_approval→decline_notify with a card pending: the card row converts to a stamp', async () => {
-    updateMessagingGroup('mg-dm-stranger', { unknown_sender_policy: 'request_approval' });
+    await updateMessagingGroup('mg-dm-stranger', { unknown_sender_policy: 'request_approval' });
     const { routeInbound } = await import('../../router.js');
     await routeInbound(strangerDm('hello'));
     await waitForDeliveries(1); // the approval card
@@ -361,7 +361,7 @@ describe('unknown-sender decline_notify flow', () => {
     expect(rows[0].id).toMatch(/^nsa-/);
 
     // Operator flips the policy while the card is still pending.
-    updateMessagingGroup('mg-dm-stranger', { unknown_sender_policy: 'decline_notify' });
+    await updateMessagingGroup('mg-dm-stranger', { unknown_sender_policy: 'decline_notify' });
     deliverMock.mockClear();
 
     await routeInbound(strangerDm('are you there?'));
@@ -383,7 +383,7 @@ describe('unknown-sender decline_notify flow', () => {
     // click itself has to honor the new policy — otherwise decline_notify
     // ("no approval path, grants stay explicit") is bypassable by clicking a
     // stale card.
-    updateMessagingGroup('mg-dm-stranger', { unknown_sender_policy: 'request_approval' });
+    await updateMessagingGroup('mg-dm-stranger', { unknown_sender_policy: 'request_approval' });
     const { routeInbound } = await import('../../router.js');
     await routeInbound(strangerDm('let me in'));
     await waitForDeliveries(1);
@@ -392,7 +392,7 @@ describe('unknown-sender decline_notify flow', () => {
       id: string;
     };
 
-    updateMessagingGroup('mg-dm-stranger', { unknown_sender_policy: 'decline_notify' });
+    await updateMessagingGroup('mg-dm-stranger', { unknown_sender_policy: 'decline_notify' });
 
     // The owner clicks Allow on the card they were sent before the flip.
     const { getResponseHandlers } = await import('../../response-registry.js');
@@ -422,7 +422,7 @@ describe('unknown-sender decline_notify flow', () => {
     await routeInbound(strangerDm('hello'));
     await waitForDeliveries(2);
 
-    updateMessagingGroup('mg-dm-stranger', { unknown_sender_policy: 'request_approval' });
+    await updateMessagingGroup('mg-dm-stranger', { unknown_sender_policy: 'request_approval' });
     deliverMock.mockClear();
 
     await routeInbound(strangerDm('let me in'));
@@ -438,7 +438,7 @@ describe('unknown-sender decline_notify flow', () => {
   });
 
   it('decline_notify on a group messaging group: silent drop — no public decline, no FYI', async () => {
-    createMessagingGroup({
+    await createMessagingGroup({
       id: 'mg-team',
       channel_type: 'telegram',
       platform_id: 'group-team',
@@ -514,7 +514,7 @@ describe('unknown-sender decline_notify flow', () => {
       granted_by: 'telegram:owner',
       granted_at: now(),
     });
-    createMessagingGroup({
+    await createMessagingGroup({
       id: 'mg-dm-second',
       channel_type: 'telegram',
       instance: 'telegram-owner-bot',
@@ -554,7 +554,7 @@ describe('unknown-sender decline_notify flow', () => {
     // row rather than mutated onto the shared fixture: `instance` is fixed at
     // creation, and inbound lookup is exact-on-instance, so the row and the
     // event have to agree or the router auto-creates a separate default row.
-    createMessagingGroup({
+    await createMessagingGroup({
       id: 'mg-dm-named',
       channel_type: 'telegram',
       instance: 'telegram-owner-bot',
@@ -601,7 +601,7 @@ describe('unknown-sender decline_notify flow', () => {
       granted_by: 'telegram:owner',
       granted_at: now(),
     });
-    createMessagingGroup({
+    await createMessagingGroup({
       id: 'mg-dm-nameless',
       channel_type: 'telegram',
       instance: 'telegram-owner-bot',
@@ -642,7 +642,7 @@ describe('unknown-sender decline_notify flow', () => {
       granted_by: 'telegram:owner',
       granted_at: now(),
     });
-    createMessagingGroup({
+    await createMessagingGroup({
       id: 'mg-dm-admin',
       channel_type: 'telegram',
       instance: 'telegram-owner-bot',
@@ -702,7 +702,7 @@ describe('unknown-sender decline_notify flow', () => {
   });
 
   it('converting a pending card row into a stamp drops the retained message body', async () => {
-    updateMessagingGroup('mg-dm-stranger', { unknown_sender_policy: 'request_approval' });
+    await updateMessagingGroup('mg-dm-stranger', { unknown_sender_policy: 'request_approval' });
     const { routeInbound } = await import('../../router.js');
     const carded = strangerDm('let me in, my token is abc123');
     await routeInbound(carded);
@@ -713,7 +713,7 @@ describe('unknown-sender decline_notify flow', () => {
       .get() as { original_message: string };
     expect(card.original_message).toContain('abc123'); // the card legitimately retains it for replay
 
-    updateMessagingGroup('mg-dm-stranger', { unknown_sender_policy: 'decline_notify' });
+    await updateMessagingGroup('mg-dm-stranger', { unknown_sender_policy: 'decline_notify' });
     await routeInbound(strangerDm('hello?'));
     await waitForDeliveries(3);
 

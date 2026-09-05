@@ -6,7 +6,6 @@ import Database from 'better-sqlite3';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const mockExecFileSync = vi.fn();
-const mockGetAllContainerConfigs = vi.fn();
 vi.mock('child_process', () => ({
   execFileSync: (...args: unknown[]) => mockExecFileSync(...args),
 }));
@@ -22,11 +21,6 @@ vi.mock('./db/connection.js', async (importOriginal) => ({
     if (!centralDbMock.current) throw new Error('central db unavailable in storage-manager unit test');
     return centralDbMock.current.db;
   },
-}));
-
-vi.mock('./db/container-configs.js', async (importOriginal) => ({
-  ...(await importOriginal<typeof import('./db/container-configs.js')>()),
-  getAllContainerConfigs: () => mockGetAllContainerConfigs(),
 }));
 
 // NOT spread: log.ts installs process-wide uncaughtException/unhandledRejection
@@ -1422,7 +1416,12 @@ describe('storage-manager Docker cleanup', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     _resetStorageManagerThrottleForTesting();
-    mockGetAllContainerConfigs.mockReturnValue([]);
+    // Configured image references are read raw from the central DB (seam-3
+    // plan §4.5: the storage pass is a synchronous block). An empty table is
+    // "nothing configured" — what the mocked leaf used to return.
+    const db = new Database(':memory:');
+    db.exec('CREATE TABLE container_configs (agent_group_id TEXT PRIMARY KEY, image_tag TEXT)');
+    centralDbMock.current = { db };
     usagePct = 91;
     images = [
       {
@@ -1697,9 +1696,8 @@ describe('storage-manager Docker cleanup', () => {
   });
 
   it('disables managed image deletion when configured image references are unreadable', () => {
-    mockGetAllContainerConfigs.mockImplementation(() => {
-      throw new Error('database unavailable');
-    });
+    // No central DB at all: the raw read throws and the pass fails closed.
+    closeCentralDb();
 
     const report = getStorageReport({
       mode: 'dry-run',

@@ -48,6 +48,7 @@
 import { normalizeOptions, type NormalizedOption, type RawOption } from '../../channels/ask-question.js';
 import { resolveWiringDefaults } from '../../channels/channel-defaults.js';
 import { createAgentGroup, getAgentGroup, getAgentGroupByFolder, getAllAgentGroups } from '../../db/agent-groups.js';
+import { insertOrAdopt } from '../../db/insert-or-adopt.js';
 import { getChannelAdapter } from '../../channels/channel-registry.js';
 import { channelNameProvenance, getMessagingGroup, updateMessagingGroup } from '../../db/messaging-groups.js';
 import { getDeliveryAdapter } from '../../delivery.js';
@@ -227,7 +228,7 @@ export async function requestChannelApproval(input: RequestChannelApprovalInput)
     return existing ? isSameInboundEvent(existing.original_message, event) : false;
   }
 
-  const agentGroups = getAllAgentGroups();
+  const agentGroups = await getAllAgentGroups();
   if (agentGroups.length === 0) {
     log.warn('Channel registration skipped — no agent groups configured. Run /init-first-agent.', {
       messagingGroupId,
@@ -283,7 +284,7 @@ export async function requestChannelApproval(input: RequestChannelApprovalInput)
       const name = conversationDisplayName(conversation);
       const nameSource = channelNameProvenance(originMg.channel_type, 'classified');
       if (name && (name !== originMg.name || originMg.name_source !== nameSource)) {
-        updateMessagingGroup(originMg.id, { name, name_source: nameSource });
+        await updateMessagingGroup(originMg.id, { name, name_source: nameSource });
         originMg.name = name;
         originMg.name_source = nameSource;
       }
@@ -301,7 +302,7 @@ export async function requestChannelApproval(input: RequestChannelApprovalInput)
         const name = await channelAdapter.resolveChannelName(originMg.platform_id);
         if (name) {
           const nameSource = channelNameProvenance(originMg.channel_type, 'classified');
-          updateMessagingGroup(originMg.id, { name, name_source: nameSource });
+          await updateMessagingGroup(originMg.id, { name, name_source: nameSource });
           originMg.name = name;
           originMg.name_source = nameSource;
         }
@@ -422,28 +423,69 @@ export function buildAgentSelectionOptions(
 }
 
 /**
+ * How many times folder allocation may lose the unique-key race before giving
+ * up. Each loss advances the numeric suffix past the folder the winner took,
+ * so exhausting this needs five approvers naming the same agent at the same
+ * instant. Bounded rather than unbounded because a stuck loop here would hang
+ * a router interceptor.
+ */
+const FOLDER_ALLOCATION_ATTEMPTS = 5;
+
+/**
  * Create a new agent group and initialize its filesystem. Handles
  * folder-name collisions with numeric suffixes.
+ *
+ * Concurrency: the `getAgentGroupByFolder` scan yields (async driver), so two
+ * approvers naming agents that normalize to the same folder can both settle on
+ * it and both INSERT; `agent_groups.folder` is UNIQUE, so one loses. Losing is
+ * NOT adoptable here — the winner's row is a DIFFERENT operator's agent, with
+ * its own name and its own channel to wire — so the loser re-runs allocation,
+ * which now sees the taken folder and moves to the next suffix. `insertOrAdopt`
+ * supplies the "did I lose?" signal; the retry policy is this function's.
  */
-export function createNewAgentGroup(name: string): AgentGroup {
-  let folder = toFolder(name);
-  const baseFolder = folder;
+export async function createNewAgentGroup(name: string): Promise<AgentGroup> {
+  const baseFolder = toFolder(name);
+  let folder = baseFolder;
   let suffix = 2;
-  while (getAgentGroupByFolder(folder)) {
-    folder = `${baseFolder}-${suffix}`;
-    suffix++;
+  let agId = '';
+
+  let allocated = false;
+  for (let attempt = 1; attempt <= FOLDER_ALLOCATION_ATTEMPTS && !allocated; attempt++) {
+    while (await getAgentGroupByFolder(folder)) {
+      folder = `${baseFolder}-${suffix}`;
+      suffix++;
+    }
+
+    agId = `ag-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const currentFolder = folder;
+    const { created } = await insertOrAdopt<AgentGroup>(
+      {
+        id: agId,
+        name,
+        folder: currentFolder,
+        agent_provider: null,
+        created_at: new Date().toISOString(),
+      },
+      createAgentGroup,
+      () => getAgentGroupByFolder(currentFolder),
+    );
+    if (created) {
+      allocated = true;
+    } else {
+      log.warn('Channel registration: agent folder taken by a concurrent create, retrying', {
+        folder: currentFolder,
+        attempt,
+      });
+    }
   }
 
-  const agId = `ag-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-  createAgentGroup({
-    id: agId,
-    name,
-    folder,
-    agent_provider: null,
-    created_at: new Date().toISOString(),
-  });
+  if (!allocated) {
+    throw new Error(
+      `Could not allocate a folder for agent "${name}" after ${FOLDER_ALLOCATION_ATTEMPTS} attempts (concurrent creates)`,
+    );
+  }
 
-  const ag = getAgentGroup(agId)!;
+  const ag = (await getAgentGroup(agId))!;
   // Channel-approved groups are created on the instance default provider
   // (DEFAULT_AGENT_PROVIDER, or claude when unset) — initGroupFilesystem stamps
   // it onto the fresh config row. The operator flips a group afterward with

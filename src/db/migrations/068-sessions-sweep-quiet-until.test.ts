@@ -126,25 +126,25 @@ describe('the persisted quiet mark (S2-PR15)', () => {
     await closeDb();
   });
 
-  it('writes a whole tick of marks in one batch', () => {
-    createSession(session('s-1', ACTIVE));
-    createSession(session('s-2', ACTIVE));
-    createSession(session('s-3', ACTIVE));
+  it('writes a whole tick of marks in one batch', async () => {
+    await createSession(session('s-1', ACTIVE));
+    await createSession(session('s-2', ACTIVE));
+    await createSession(session('s-3', ACTIVE));
 
     const marks: QuietSessionMark[] = [
       { sessionId: 's-1', quietUntil: '2026-09-03T12:20:00.000Z', lastActive: ACTIVE },
       { sessionId: 's-3', quietUntil: '2026-09-03T12:25:00.000Z', lastActive: ACTIVE },
     ];
-    persistQuietSessionMarks(marks);
+    await persistQuietSessionMarks(marks);
 
     expect(markOf('s-1')).toBe('2026-09-03T12:20:00.000Z');
     expect(markOf('s-2')).toBeNull();
     expect(markOf('s-3')).toBe('2026-09-03T12:25:00.000Z');
   });
 
-  it('an empty batch writes nothing', () => {
-    createSession(session('s-1', null));
-    persistQuietSessionMarks([]);
+  it('an empty batch writes nothing', async () => {
+    await createSession(session('s-1', null));
+    await persistQuietSessionMarks([]);
     expect(markOf('s-1')).toBeNull();
   });
 
@@ -154,15 +154,15 @@ describe('the persisted quiet mark (S2-PR15)', () => {
   // last_active and clears the column; an unconditional write would put the now
   // stale expiry straight back, and a restart before the next tick would warm it
   // and skip a genuinely due session without ever opening its inbound.db.
-  it('does not write back a mark whose last_active moved between the sweep and the flush', () => {
-    createSession(session('s-stable', ACTIVE));
-    createSession(session('s-moved', ACTIVE));
-    createSession(session('s-null', null));
+  it('does not write back a mark whose last_active moved between the sweep and the flush', async () => {
+    await createSession(session('s-stable', ACTIVE));
+    await createSession(session('s-moved', ACTIVE));
+    await createSession(session('s-null', null));
 
     // The ingress that lands mid-fan-out, through the real writer.
-    updateSession('s-moved', { last_active: '2026-09-03T12:00:00.000Z' });
+    await updateSession('s-moved', { last_active: '2026-09-03T12:00:00.000Z' });
 
-    persistQuietSessionMarks([
+    await persistQuietSessionMarks([
       { sessionId: 's-stable', quietUntil: FUTURE, lastActive: ACTIVE },
       { sessionId: 's-moved', quietUntil: FUTURE, lastActive: ACTIVE },
       // A never-active session: the guard must compare NULL to NULL null-safely
@@ -178,12 +178,12 @@ describe('the persisted quiet mark (S2-PR15)', () => {
   // The invalidation contract the whole warm path rests on. Without this the
   // first tick after a restart could honour a mark taken before a newly due
   // row was written, holding that row for the rest of the backoff.
-  it('updateSession clears the mark in the same statement that moves last_active', () => {
-    createSession(session('s-1', ACTIVE));
-    persistQuietSessionMarks([{ sessionId: 's-1', quietUntil: FUTURE, lastActive: ACTIVE }]);
+  it('updateSession clears the mark in the same statement that moves last_active', async () => {
+    await createSession(session('s-1', ACTIVE));
+    await persistQuietSessionMarks([{ sessionId: 's-1', quietUntil: FUTURE, lastActive: ACTIVE }]);
     expect(markOf('s-1')).toBe(FUTURE);
 
-    updateSession('s-1', { last_active: '2026-09-03T12:00:00.000Z' });
+    await updateSession('s-1', { last_active: '2026-09-03T12:00:00.000Z' });
 
     expect(markOf('s-1')).toBeNull();
   });
@@ -195,9 +195,9 @@ describe('the persisted quiet mark (S2-PR15)', () => {
   // SQLite mutation it protects. These cases are its whole contract, on real
   // SQLite, so the call-site suites can mock the seam and still be testing
   // something real.
-  it('clears the mark and moves last_active, then runs the write', () => {
-    createSession(session('s-1', ACTIVE));
-    persistQuietSessionMarks([{ sessionId: 's-1', quietUntil: FUTURE, lastActive: ACTIVE }]);
+  it('clears the mark and moves last_active, then runs the write', async () => {
+    await createSession(session('s-1', ACTIVE));
+    await persistQuietSessionMarks([{ sessionId: 's-1', quietUntil: FUTURE, lastActive: ACTIVE }]);
     let ran = false;
 
     const out = withQuietInvalidationSync('s-1', () => {
@@ -215,8 +215,8 @@ describe('the persisted quiet mark (S2-PR15)', () => {
   // is millisecond resolution, so two invalidations inside one millisecond would
   // otherwise publish the same basis twice and leave a flush computed on it
   // satisfied — re-marking a session that has just become due.
-  it('always advances last_active, even inside one millisecond', () => {
-    createSession(session('s-1', null));
+  it('always advances last_active, even inside one millisecond', async () => {
+    await createSession(session('s-1', null));
     const seen: string[] = [];
     for (let i = 0; i < 50; i++) {
       withQuietInvalidationSync('s-1', () => undefined);
@@ -231,20 +231,20 @@ describe('the persisted quiet mark (S2-PR15)', () => {
   // it — or after the write it protects was already committed, which is a
   // correct mark rather than a stale one. There is no third ordering: `write`
   // is synchronous better-sqlite3 code with no await before it.
-  it('rejects a flush whose basis predates the invalidation', () => {
-    createSession(session('s-1', ACTIVE));
+  it('rejects a flush whose basis predates the invalidation', async () => {
+    await createSession(session('s-1', ACTIVE));
     // The sweep read `last_active` at the start of the tick: ACTIVE.
     const basis = lastActiveOf('s-1');
 
     withQuietInvalidationSync('s-1', () => undefined);
     // The flush lands afterwards, still carrying the basis it computed on.
-    persistQuietSessionMarks([{ sessionId: 's-1', quietUntil: FUTURE, lastActive: basis }]);
+    await persistQuietSessionMarks([{ sessionId: 's-1', quietUntil: FUTURE, lastActive: basis }]);
 
     expect(markOf('s-1'), 'a mark computed before the invalidation was written anyway').toBeNull();
   });
 
-  it('throws and runs no write when the central DB refuses the invalidation', () => {
-    createSession(session('s-1', ACTIVE));
+  it('throws and runs no write when the central DB refuses the invalidation', async () => {
+    await createSession(session('s-1', ACTIVE));
     getRawDb().exec('DROP TABLE sessions');
     let ran = false;
 
@@ -260,10 +260,10 @@ describe('the persisted quiet mark (S2-PR15)', () => {
   // session row deleted (or closed) between the caller's discovery and this
   // callback looked like a successful invalidation and the due row landed in a
   // mailbox the sweep never enumerates.
-  it('throws and runs no write when no ACTIVE session row matched', () => {
-    createSession(session('s-gone', ACTIVE));
-    createSession(session('s-closed', ACTIVE));
-    updateSession('s-closed', { status: 'closed' });
+  it('throws and runs no write when no ACTIVE session row matched', async () => {
+    await createSession(session('s-gone', ACTIVE));
+    await createSession(session('s-closed', ACTIVE));
+    await updateSession('s-closed', { status: 'closed' });
     getRawDb().prepare('DELETE FROM sessions WHERE id = ?').run('s-gone');
     const ran: string[] = [];
 
@@ -277,8 +277,8 @@ describe('the persisted quiet mark (S2-PR15)', () => {
   // so a write that threw still recorded activity. There is no second write
   // now: the failure propagates with `last_active` exactly where the
   // invalidation left it.
-  it('leaves last_active at the invalidated value when the write throws', () => {
-    createSession(session('s-1', ACTIVE));
+  it('leaves last_active at the invalidated value when the write throws', async () => {
+    await createSession(session('s-1', ACTIVE));
 
     // Captured INSIDE the write, so it is the value the invalidation itself
     // published. Reading it after the throw and comparing it to itself would
@@ -302,13 +302,13 @@ describe('the persisted quiet mark (S2-PR15)', () => {
   // B then matched again and reinstalled a mark over work that had just become
   // due. `updateSession` never steps `last_active` DOWN now, so B is not
   // reachable a second time.
-  it('an ordinary activity write in the same millisecond cannot restore the pre-invalidation basis', () => {
+  it('an ordinary activity write in the same millisecond cannot restore the pre-invalidation basis', async () => {
     // B is in the FUTURE relative to the wall clock, which is how this test
     // reaches the same-millisecond path without fake timers: the helper's
     // `last_active < @now` arm cannot fire, so it must take the strict
     // `+0.001 seconds` arm — exactly what a same-millisecond invalidation does.
     const B = new Date(Date.now() + 3600_000).toISOString();
-    createSession(session('s-1', B));
+    await createSession(session('s-1', B));
     const basis = lastActiveOf('s-1');
     expect(basis).toBe(B);
 
@@ -320,39 +320,39 @@ describe('the persisted quiet mark (S2-PR15)', () => {
     // The activity write that used to land verbatim, carrying the
     // pre-invalidation value — what a same-millisecond
     // `new Date().toISOString()` from session-manager produces.
-    updateSession('s-1', { last_active: B });
+    await updateSession('s-1', { last_active: B });
     expect(lastActiveOf('s-1'), 'an activity write stepped last_active backwards').toBe(invalidated);
 
     // The sweep's flush, queued on B, now lands.
-    persistQuietSessionMarks([{ sessionId: 's-1', quietUntil: FUTURE, lastActive: basis }]);
+    await persistQuietSessionMarks([{ sessionId: 's-1', quietUntil: FUTURE, lastActive: basis }]);
     expect(markOf('s-1'), 'a stale mark was reinstalled over a newly due row').toBeNull();
   });
 
-  it('an update that does not touch last_active leaves the mark alone', () => {
+  it('an update that does not touch last_active leaves the mark alone', async () => {
     // The mark is about when work is next DUE. A container going idle does not
     // change that, and clearing here would throw away the cache on every
     // container state transition.
-    createSession(session('s-1', ACTIVE));
-    persistQuietSessionMarks([{ sessionId: 's-1', quietUntil: FUTURE, lastActive: ACTIVE }]);
+    await createSession(session('s-1', ACTIVE));
+    await persistQuietSessionMarks([{ sessionId: 's-1', quietUntil: FUTURE, lastActive: ACTIVE }]);
 
-    updateSession('s-1', { container_status: 'idle' });
+    await updateSession('s-1', { container_status: 'idle' });
 
     expect(markOf('s-1')).toBe(FUTURE);
   });
 
-  it('the warm read returns only active sessions whose mark is still in the future', () => {
-    createSession(session('s-future', ACTIVE));
-    createSession(session('s-expired', ACTIVE));
-    createSession(session('s-unmarked', ACTIVE));
-    createSession(session('s-closed', ACTIVE));
-    persistQuietSessionMarks([
+  it('the warm read returns only active sessions whose mark is still in the future', async () => {
+    await createSession(session('s-future', ACTIVE));
+    await createSession(session('s-expired', ACTIVE));
+    await createSession(session('s-unmarked', ACTIVE));
+    await createSession(session('s-closed', ACTIVE));
+    await persistQuietSessionMarks([
       { sessionId: 's-future', quietUntil: FUTURE, lastActive: ACTIVE },
       { sessionId: 's-expired', quietUntil: PAST, lastActive: ACTIVE },
       { sessionId: 's-closed', quietUntil: FUTURE, lastActive: ACTIVE },
     ]);
-    updateSession('s-closed', { status: 'closed' });
+    await updateSession('s-closed', { status: 'closed' });
 
-    const warm = getWarmQuietSessionMarks('2026-09-03T12:00:00.000Z');
+    const warm = await getWarmQuietSessionMarks('2026-09-03T12:00:00.000Z');
 
     expect(warm).toEqual([{ id: 's-future', sweep_quiet_until: FUTURE, last_active: ACTIVE }]);
   });

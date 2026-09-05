@@ -34,8 +34,8 @@ function insertWorkgroup(id: string, onecliSecrets: string[]): void {
     .run(id, id, JSON.stringify(onecliSecrets), `ag-${id}`);
 }
 
-function createGroupInWorkgroup(agentGroup: AgentGroup, workgroupId: string): void {
-  createAgentGroup(agentGroup);
+async function createGroupInWorkgroup(agentGroup: AgentGroup, workgroupId: string): Promise<void> {
+  await createAgentGroup(agentGroup);
   getRawDb().prepare('UPDATE agent_groups SET workgroup_id = ? WHERE id = ?').run(workgroupId, agentGroup.id);
   writeContainerConfig(agentGroup.folder, {
     mcpServers: {},
@@ -65,7 +65,7 @@ afterEach(async () => {
 });
 
 describe('buildSessionServicesSnapshot', () => {
-  it('resolves Atlassian and SELECT configuration per folder without cross-folder leakage', () => {
+  it('resolves Atlassian and SELECT configuration per folder without cross-folder leakage', async () => {
     const envNames = [
       'ATLASSIAN_BASE_URL',
       'ATLASSIAN_BASE_URL_TENANT_ALPHA',
@@ -82,7 +82,7 @@ describe('buildSessionServicesSnapshot', () => {
     try {
       insertWorkgroup('tenant-alpha', ['Select-Example']);
       const alpha = group('ag-tenant-alpha', 'tenant-alpha');
-      createGroupInWorkgroup(alpha, 'tenant-alpha');
+      await createGroupInWorkgroup(alpha, 'tenant-alpha');
       writeContainerConfig(alpha.folder, {
         mcpServers: {},
         packages: { apt: [], npm: [] },
@@ -93,7 +93,7 @@ describe('buildSessionServicesSnapshot', () => {
 
       insertWorkgroup('tenant-beta', ['Select-Example']);
       const beta = group('ag-tenant-beta', 'tenant-beta');
-      createGroupInWorkgroup(beta, 'tenant-beta');
+      await createGroupInWorkgroup(beta, 'tenant-beta');
       writeContainerConfig(beta.folder, {
         mcpServers: {},
         packages: { apt: [], npm: [] },
@@ -103,14 +103,14 @@ describe('buildSessionServicesSnapshot', () => {
       });
 
       const alphaSnapshot = buildSessionServicesSnapshot(alpha.id);
-      const alphaAtlassian = alphaSnapshot.services.find((service) => service.name.startsWith('Atlassian'));
-      const alphaSelect = alphaSnapshot.services.find((service) => service.name.startsWith('SELECT'));
+      const alphaAtlassian = (await alphaSnapshot).services.find((service) => service.name.startsWith('Atlassian'));
+      const alphaSelect = (await alphaSnapshot).services.find((service) => service.name.startsWith('SELECT'));
       expect(alphaAtlassian?.useFor).toContain('https://example.atlassian.net');
       expect(alphaSelect?.useFor).toContain('/api/example-organization/');
 
       const betaSnapshot = buildSessionServicesSnapshot(beta.id);
-      const betaAtlassian = betaSnapshot.services.find((service) => service.name.startsWith('Atlassian'));
-      const betaSelect = betaSnapshot.services.find((service) => service.name.startsWith('SELECT'));
+      const betaAtlassian = (await betaSnapshot).services.find((service) => service.name.startsWith('Atlassian'));
+      const betaSelect = (await betaSnapshot).services.find((service) => service.name.startsWith('SELECT'));
       expect(betaAtlassian?.useFor).toContain('ATLASSIAN_BASE_URL is not configured');
       expect(betaAtlassian?.useFor).not.toContain('https://example.atlassian.net');
       expect(betaSelect?.useFor).toContain('/api/<organization_id>/');
@@ -124,10 +124,10 @@ describe('buildSessionServicesSnapshot', () => {
     }
   });
 
-  it('surfaces Cloudflare when the workgroup secret and MCP server are both wired', () => {
+  it('surfaces Cloudflare when the workgroup secret and MCP server are both wired', async () => {
     insertWorkgroup('example-beverage', ['Cloudflare-ExampleBeverage']);
     const ag = group('ag-example-beverage', 'example-beverage');
-    createGroupInWorkgroup(ag, 'example-beverage');
+    await createGroupInWorkgroup(ag, 'example-beverage');
     writeContainerConfig(ag.folder, {
       mcpServers: {
         'cloudflare-api': {
@@ -147,7 +147,7 @@ describe('buildSessionServicesSnapshot', () => {
 
     const snapshot = buildSessionServicesSnapshot(ag.id);
 
-    const service = snapshot.services.find((s) => s.name === 'Cloudflare');
+    const service = (await snapshot).services.find((s) => s.name === 'Cloudflare');
     expect(service).toBeDefined();
     expect(service?.mcpNamespace).toBe('mcp__cloudflare-api__*');
     expect(service?.scopes).toEqual(['example-beverage']);
@@ -156,12 +156,12 @@ describe('buildSessionServicesSnapshot', () => {
     expect(service?.useFor).toContain('mcp__cloudflare-api__execute');
     expect(service?.useFor).toContain('S3-compatible access-key/secret pair is not exposed');
 
-    const rendered = renderSessionCapabilities(snapshot);
+    const rendered = renderSessionCapabilities(await snapshot);
     expect(rendered).toContain('**Cloudflare**');
     expect(rendered).toContain('MCP `mcp__cloudflare-api__*`');
   });
 
-  it('keeps every authored capability detail inside the pre-turn truncation bound', () => {
+  it('keeps every authored capability detail inside the pre-turn truncation bound', async () => {
     // boundedCapabilities clips `useFor`/`activation` at
     // PRE_TURN_BOUNDS.capabilityDetailChars, and it clips from the END. These
     // strings exist to stop the agent denying an ability it has, and the
@@ -181,7 +181,7 @@ describe('buildSessionServicesSnapshot', () => {
       'Wix-ExampleRetail',
     ]);
     const ag = group('ag-wide', 'example-retail-wide');
-    createGroupInWorkgroup(ag, 'example-retail');
+    await createGroupInWorkgroup(ag, 'example-retail');
     const OWNER_SAFE_MG = 'mg-owner-dm';
     writeContainerConfig(ag.folder, {
       mcpServers: {},
@@ -194,31 +194,31 @@ describe('buildSessionServicesSnapshot', () => {
     vi.stubEnv('GITHUB_TOKEN', 'dummy');
 
     const snapshot = buildSessionServicesSnapshot(ag.id, OWNER_SAFE_MG);
-    expect(snapshot.services.length).toBeGreaterThan(0);
+    expect((await snapshot).services.length).toBeGreaterThan(0);
 
     // Guard the guard: prove we actually took the owner-safe branch, so this
     // test can never silently regress into measuring the short string again.
-    const slack = snapshot.services.find((s) => s.name === 'Slack (read)');
+    const slack = (await snapshot).services.find((s) => s.name === 'Slack (read)');
     expect(slack?.useFor).toContain('FILE ATTACHMENTS');
 
-    const oversized = snapshot.services.flatMap((s) =>
+    const oversized = (await snapshot).services.flatMap((s) =>
       (['useFor', 'activation'] as const)
         .filter((f) => (s[f]?.length ?? 0) > PRE_TURN_BOUNDS.capabilityDetailChars)
         .map((f) => `${s.name}.${f}=${s[f]?.length}`),
     );
     expect(oversized).toEqual([]);
-    expect(snapshot.services.length).toBeLessThanOrEqual(PRE_TURN_BOUNDS.capabilityServices);
+    expect((await snapshot).services.length).toBeLessThanOrEqual(PRE_TURN_BOUNDS.capabilityServices);
   });
 
-  it('does not surface Cloudflare unless both its secret and MCP server are wired', () => {
+  it('does not surface Cloudflare unless both its secret and MCP server are wired', async () => {
     insertWorkgroup('example-beverage', ['Cloudflare-ExampleBeverage']);
     const secretOnly = group('ag-secret-only', 'example-beverage-secret-only');
-    createGroupInWorkgroup(secretOnly, 'example-beverage');
+    await createGroupInWorkgroup(secretOnly, 'example-beverage');
 
     const noSecretWorkgroup = 'example-beverage-no-secret';
     insertWorkgroup(noSecretWorkgroup, []);
     const mcpOnly = group('ag-mcp-only', 'example-beverage-mcp-only');
-    createGroupInWorkgroup(mcpOnly, noSecretWorkgroup);
+    await createGroupInWorkgroup(mcpOnly, noSecretWorkgroup);
     writeContainerConfig(mcpOnly.folder, {
       mcpServers: {
         'cloudflare-api': {
@@ -232,18 +232,20 @@ describe('buildSessionServicesSnapshot', () => {
       tools: [],
     });
 
-    expect(buildSessionServicesSnapshot(secretOnly.id).services.some((s) => s.name === 'Cloudflare')).toBe(false);
-    expect(buildSessionServicesSnapshot(mcpOnly.id).services.some((s) => s.name === 'Cloudflare')).toBe(false);
+    expect((await buildSessionServicesSnapshot(secretOnly.id)).services.some((s) => s.name === 'Cloudflare')).toBe(
+      false,
+    );
+    expect((await buildSessionServicesSnapshot(mcpOnly.id)).services.some((s) => s.name === 'Cloudflare')).toBe(false);
   });
 
-  it('surfaces Profound when the workgroup declares the Profound OneCLI secret', () => {
+  it('surfaces Profound when the workgroup declares the Profound OneCLI secret', async () => {
     insertWorkgroup('example-retail', ['Profound']);
     const ag = group('ag-retail', 'example-retail');
-    createGroupInWorkgroup(ag, 'example-retail');
+    await createGroupInWorkgroup(ag, 'example-retail');
 
     const snapshot = buildSessionServicesSnapshot(ag.id);
 
-    const service = snapshot.services.find((s) => s.name === 'Profound');
+    const service = (await snapshot).services.find((s) => s.name === 'Profound');
     expect(service).toBeDefined();
     expect(service?.cli).toBe('curl');
     expect(service?.scopes).toEqual(['example-retail']);
@@ -251,25 +253,25 @@ describe('buildSessionServicesSnapshot', () => {
     expect(service?.useFor).toContain('X-API-Key');
     expect(service?.useFor).not.toContain('/app/skills/profound/SKILL.md');
 
-    const rendered = renderSessionCapabilities(snapshot);
+    const rendered = renderSessionCapabilities(await snapshot);
     expect(rendered).toContain('**Profound**');
     expect(rendered).toContain('Profound REST/reporting API');
   });
 
-  it('does not surface Profound without the Profound OneCLI secret', () => {
+  it('does not surface Profound without the Profound OneCLI secret', async () => {
     insertWorkgroup('example-labs', []);
     const ag = group('ag-example-labs', 'example-labs');
-    createGroupInWorkgroup(ag, 'example-labs');
+    await createGroupInWorkgroup(ag, 'example-labs');
 
     const snapshot = buildSessionServicesSnapshot(ag.id);
 
-    expect(snapshot.services.some((s) => s.name === 'Profound')).toBe(false);
+    expect((await snapshot).services.some((s) => s.name === 'Profound')).toBe(false);
   });
 
-  it('does not advertise universal MCPs excluded from the effective container config', () => {
+  it('does not advertise universal MCPs excluded from the effective container config', async () => {
     insertWorkgroup('restricted', []);
     const ag = group('ag-restricted', 'restricted');
-    createGroupInWorkgroup(ag, 'restricted');
+    await createGroupInWorkgroup(ag, 'restricted');
     writeContainerConfig(ag.folder, {
       mcpServers: {},
       packages: { apt: [], npm: [] },
@@ -279,7 +281,7 @@ describe('buildSessionServicesSnapshot', () => {
       excludeMcpServers: ['exa', 'deepwiki', 'context7', 'pocket', 'granola'],
     });
 
-    const names = buildSessionServicesSnapshot(ag.id).services.map((service) => service.name);
+    const names = (await buildSessionServicesSnapshot(ag.id)).services.map((service) => service.name);
 
     expect(names).not.toContain('Exa');
     expect(names).not.toContain('DeepWiki');
@@ -288,13 +290,13 @@ describe('buildSessionServicesSnapshot', () => {
     expect(names).not.toContain('Granola');
   });
 
-  it('test_capability_and_parity_output_omit_legacy_gitnexus_field', () => {
+  it('test_capability_and_parity_output_omit_legacy_gitnexus_field', async () => {
     fs.mkdirSync(`${dirs.TEST_ROOT}/container/nanoclaw-plugin`, { recursive: true });
     fs.mkdirSync(`${dirs.TEST_ROOT}/plugins/gitnexus`, { recursive: true });
     fs.mkdirSync(`${dirs.TEST_ROOT}/plugins/ordinary-plugin`, { recursive: true });
     insertWorkgroup('legacy', []);
     const ag = group('ag-legacy', 'legacy');
-    createGroupInWorkgroup(ag, 'legacy');
+    await createGroupInWorkgroup(ag, 'legacy');
     writeContainerConfig(ag.folder, {
       mcpServers: {},
       packages: { apt: [], npm: [] },
@@ -308,12 +310,12 @@ describe('buildSessionServicesSnapshot', () => {
     process.env.HOME = dirs.TEST_ROOT;
     try {
       const capabilities = getHostCapabilities();
-      const capabilityGroup = capabilities.agentGroups.find((candidate) => candidate.id === ag.id);
+      const capabilityGroup = (await capabilities).agentGroups.find((candidate) => candidate.id === ag.id);
       expect(capabilityGroup).toBeDefined();
       expect(capabilityGroup).not.toHaveProperty('gitnexusInjectAgentsMd');
-      expect(capabilities.plugins.builtin).not.toContain('nanoclaw-hooks');
-      expect(capabilities.plugins.installed).not.toContain('gitnexus');
-      expect(capabilities.plugins.installed).toContain('ordinary-plugin');
+      expect((await capabilities).plugins.builtin).not.toContain('nanoclaw-hooks');
+      expect((await capabilities).plugins.installed).not.toContain('gitnexus');
+      expect((await capabilities).plugins.installed).toContain('ordinary-plugin');
       expect(SIBLING_BOUND_FIELDS.has('gitnexusInjectAgentsMd')).toBe(false);
     } finally {
       if (previousHome === undefined) delete process.env.HOME;
@@ -359,7 +361,7 @@ describe('GitHub App sentinel scoping', () => {
   it('a PAT group never receives App-cache expiry or App-shape guidance', async () => {
     insertWorkgroup('example-pat', []);
     const ag = group('ag-pat-group', 'example-pat');
-    createGroupInWorkgroup(ag, 'example-pat');
+    await createGroupInWorkgroup(ag, 'example-pat');
     // Host happens to hold App config + warm cache from ANOTHER group's use.
     process.env.GITHUB_APP_ID = '1';
     process.env.GITHUB_APP_INSTALLATION_ID = '42';
@@ -367,7 +369,7 @@ describe('GitHub App sentinel scoping', () => {
 
     vi.stubEnv('GITHUB_TOKEN', 'ghp_static_pat');
     const snapshot = buildSessionServicesSnapshot(ag.id);
-    const gh = snapshot.services.find((s) => s.name === 'GitHub');
+    const gh = (await snapshot).services.find((s) => s.name === 'GitHub');
     expect(gh).toBeDefined();
     expect(gh?.expiresAt).toBeUndefined();
     expect(gh?.activation ?? '').not.toContain('HEALTHY App installation token');
@@ -378,14 +380,14 @@ describe('GitHub App sentinel scoping', () => {
   it('a sentinel group gets expiresAt matching the cache plus the App-shape guidance', async () => {
     insertWorkgroup('example-app', []);
     const ag = group('ag-app-group', 'example-app');
-    createGroupInWorkgroup(ag, 'example-app');
+    await createGroupInWorkgroup(ag, 'example-app');
     process.env.GITHUB_APP_ID = '1';
     process.env.GITHUB_APP_INSTALLATION_ID = '42';
     await warmAppCache(process.env);
 
     vi.stubEnv('GITHUB_TOKEN', 'app:github');
     const snapshot = buildSessionServicesSnapshot(ag.id);
-    const gh = snapshot.services.find((s) => s.name === 'GitHub');
+    const gh = (await snapshot).services.find((s) => s.name === 'GitHub');
     expect(gh?.expiresAt).toBeDefined();
     expect(Number.isFinite(Date.parse(gh!.expiresAt!))).toBe(true);
     expect(gh?.activation ?? '').toContain('HEALTHY App installation token');

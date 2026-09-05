@@ -33,8 +33,8 @@ registerResource({
         if (!to) throw new Error('--to is required');
         if (!approver) throw new Error('--approver is required');
         if (from === to) throw new Error('--from and --to must differ (self-messages are never gated)');
-        if (!getAgentGroup(from)) throw new Error(`source agent group not found: ${from}`);
-        if (!getAgentGroup(to)) throw new Error(`target agent group not found: ${to}`);
+        if (!(await getAgentGroup(from))) throw new Error(`source agent group not found: ${from}`);
+        if (!(await getAgentGroup(to))) throw new Error(`target agent group not found: ${to}`);
 
         setMessagePolicy(from, to, approver, new Date().toISOString());
         return { from_agent_group_id: from, to_agent_group_id: to, approver };

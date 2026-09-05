@@ -1,32 +1,48 @@
 import type { PendingApproval, PendingQuestion, Session } from '../types.js';
-import { getRawDb, hasTableRaw } from './connection.js';
+import { getDb, getRawDb, hasTable } from './connection.js';
 
 // ── Sessions ──
 
 export const TASKS_SYSTEM_THREAD_ID = 'system:tasks';
 
-export function createSession(session: Session): void {
-  getRawDb()
-    .prepare(
-      `INSERT INTO sessions (id, agent_group_id, messaging_group_id, thread_id, agent_provider, status, container_status, last_active, created_at)
+/**
+ * The `getSession` read, as a constant, so a synchronous guard-path caller can
+ * execute the SAME statement through the raw handle.
+ *
+ * One constant, two executors — NOT a `*Sync` twin of the export
+ * (docs/specs/upstream-async-central-db-seam/plan.md §4.5 I-1). The only such
+ * caller is `sessionStillActive` in `container-runner.ts`: a `WakeGuard` is
+ * `() => WakeGuardResult` and is evaluated with nothing awaited between it and
+ * the spawn/insert it protects.
+ */
+export const SESSION_BY_ID_SQL = 'SELECT * FROM sessions WHERE id = ?';
+
+export async function createSession(session: Session): Promise<void> {
+  await getDb().run(
+    `INSERT INTO sessions (id, agent_group_id, messaging_group_id, thread_id, agent_provider, status, container_status, last_active, created_at)
        VALUES (@id, @agent_group_id, @messaging_group_id, @thread_id, @agent_provider, @status, @container_status, @last_active, @created_at)`,
-    )
-    .run(session);
+    session,
+  );
 }
 
-export function getSession(id: string): Session | undefined {
-  return getRawDb().prepare('SELECT * FROM sessions WHERE id = ?').get(id) as Session | undefined;
+export async function getSession(id: string): Promise<Session | undefined> {
+  return getDb().get<Session>(SESSION_BY_ID_SQL, id);
 }
 
-export function findSession(messagingGroupId: string, threadId: string | null): Session | undefined {
+export async function findSession(messagingGroupId: string, threadId: string | null): Promise<Session | undefined> {
   if (threadId) {
-    return getRawDb()
-      .prepare('SELECT * FROM sessions WHERE messaging_group_id = ? AND thread_id = ? AND status = ?')
-      .get(messagingGroupId, threadId, 'active') as Session | undefined;
+    return getDb().get<Session>(
+      'SELECT * FROM sessions WHERE messaging_group_id = ? AND thread_id = ? AND status = ?',
+      messagingGroupId,
+      threadId,
+      'active',
+    );
   }
-  return getRawDb()
-    .prepare('SELECT * FROM sessions WHERE messaging_group_id = ? AND thread_id IS NULL AND status = ?')
-    .get(messagingGroupId, 'active') as Session | undefined;
+  return getDb().get<Session>(
+    'SELECT * FROM sessions WHERE messaging_group_id = ? AND thread_id IS NULL AND status = ?',
+    messagingGroupId,
+    'active',
+  );
 }
 
 /**
@@ -35,23 +51,24 @@ export function findSession(messagingGroupId: string, threadId: string | null): 
  * plain `findSession` would return whichever agent's session happened to
  * be first and route to the wrong container.
  */
-export function findSessionForAgent(
+export async function findSessionForAgent(
   agentGroupId: string,
   messagingGroupId: string,
   threadId: string | null,
-): Session | undefined {
+): Promise<Session | undefined> {
   if (threadId) {
-    return getRawDb()
-      .prepare(
-        "SELECT * FROM sessions WHERE agent_group_id = ? AND messaging_group_id = ? AND thread_id = ? AND status = 'active'",
-      )
-      .get(agentGroupId, messagingGroupId, threadId) as Session | undefined;
+    return getDb().get<Session>(
+      "SELECT * FROM sessions WHERE agent_group_id = ? AND messaging_group_id = ? AND thread_id = ? AND status = 'active'",
+      agentGroupId,
+      messagingGroupId,
+      threadId,
+    );
   }
-  return getRawDb()
-    .prepare(
-      "SELECT * FROM sessions WHERE agent_group_id = ? AND messaging_group_id = ? AND thread_id IS NULL AND status = 'active'",
-    )
-    .get(agentGroupId, messagingGroupId) as Session | undefined;
+  return getDb().get<Session>(
+    "SELECT * FROM sessions WHERE agent_group_id = ? AND messaging_group_id = ? AND thread_id IS NULL AND status = 'active'",
+    agentGroupId,
+    messagingGroupId,
+  );
 }
 
 /**
@@ -61,18 +78,17 @@ export function findSessionForAgent(
  * mirrors that so agent-shared callers don't silently land in an mg-bound
  * session of the same agent group.
  */
-export function findSessionByAgentGroup(agentGroupId: string): Session | undefined {
-  return getRawDb()
-    .prepare(
-      `SELECT * FROM sessions
+export async function findSessionByAgentGroup(agentGroupId: string): Promise<Session | undefined> {
+  return getDb().get<Session>(
+    `SELECT * FROM sessions
        WHERE agent_group_id = ?
          AND messaging_group_id IS NULL
          AND (thread_id IS NULL OR thread_id NOT LIKE 'system:%')
          AND status = 'active'
        ORDER BY created_at DESC
        LIMIT 1`,
-    )
-    .get(agentGroupId) as Session | undefined;
+    agentGroupId,
+  );
 }
 
 /**
@@ -87,33 +103,33 @@ export function findSessionByAgentGroup(agentGroupId: string): Session | undefin
  * channel-root session because it's likely newer, and the task gets inserted
  * into the wrong inbound.db.
  */
-export function findSessionByAgentGroupAndMessagingGroup(
+export async function findSessionByAgentGroupAndMessagingGroup(
   agentGroupId: string,
   messagingGroupId: string,
-): Session | undefined {
-  return getRawDb()
-    .prepare(
-      "SELECT * FROM sessions WHERE agent_group_id = ? AND messaging_group_id = ? AND thread_id IS NULL AND status = 'active' ORDER BY created_at DESC LIMIT 1",
-    )
-    .get(agentGroupId, messagingGroupId) as Session | undefined;
+): Promise<Session | undefined> {
+  return getDb().get<Session>(
+    "SELECT * FROM sessions WHERE agent_group_id = ? AND messaging_group_id = ? AND thread_id IS NULL AND status = 'active' ORDER BY created_at DESC LIMIT 1",
+    agentGroupId,
+    messagingGroupId,
+  );
 }
 
-export function getSessionsByAgentGroup(agentGroupId: string): Session[] {
-  return getRawDb().prepare('SELECT * FROM sessions WHERE agent_group_id = ?').all(agentGroupId) as Session[];
+export async function getSessionsByAgentGroup(agentGroupId: string): Promise<Session[]> {
+  return getDb().all<Session>('SELECT * FROM sessions WHERE agent_group_id = ?', agentGroupId);
 }
 
-export function findSystemSession(agentGroupId: string, threadId: string): Session | undefined {
-  return getRawDb()
-    .prepare(
-      `SELECT * FROM sessions
+export async function findSystemSession(agentGroupId: string, threadId: string): Promise<Session | undefined> {
+  return getDb().get<Session>(
+    `SELECT * FROM sessions
        WHERE agent_group_id = ?
          AND messaging_group_id IS NULL
          AND thread_id = ?
          AND status = 'active'
        ORDER BY created_at DESC
        LIMIT 1`,
-    )
-    .get(agentGroupId, threadId) as Session | undefined;
+    agentGroupId,
+    threadId,
+  );
 }
 
 /** Per-task session thread id for a scheduled task series. */
@@ -127,21 +143,22 @@ export function isTaskThread(threadId: string | null): boolean {
 }
 
 /** All active task sessions for a group — one per live series, plus any legacy shared one. */
-export function findTaskSessions(agentGroupId: string): Session[] {
-  return getRawDb()
-    .prepare(
-      `SELECT * FROM sessions
+export async function findTaskSessions(agentGroupId: string): Promise<Session[]> {
+  return getDb().all<Session>(
+    `SELECT * FROM sessions
        WHERE agent_group_id = ?
          AND messaging_group_id IS NULL
          AND status = 'active'
          AND (thread_id = ? OR thread_id LIKE ?)
        ORDER BY created_at DESC`,
-    )
-    .all(agentGroupId, TASKS_SYSTEM_THREAD_ID, `${TASKS_SYSTEM_THREAD_ID}:%`) as Session[];
+    agentGroupId,
+    TASKS_SYSTEM_THREAD_ID,
+    `${TASKS_SYSTEM_THREAD_ID}:%`,
+  );
 }
 
-export function getActiveSessions(): Session[] {
-  return getRawDb().prepare("SELECT * FROM sessions WHERE status = 'active'").all() as Session[];
+export async function getActiveSessions(): Promise<Session[]> {
+  return getDb().all<Session>("SELECT * FROM sessions WHERE status = 'active'");
 }
 
 /**
@@ -151,25 +168,24 @@ export function getActiveSessions(): Session[] {
  * cycle. A session idle past the horizon has no deliverable outbound and no
  * ack traffic; anything scheduled in it is the host sweep's quiet-cache job.
  */
-export function getSessionsActiveSince(sinceIso: string): Session[] {
-  return getRawDb()
-    .prepare(
-      `SELECT * FROM sessions
+export async function getSessionsActiveSince(sinceIso: string): Promise<Session[]> {
+  return getDb().all<Session>(
+    `SELECT * FROM sessions
        WHERE status = 'active'
          AND (container_status IN ('running', 'idle')
               OR datetime(COALESCE(last_active, created_at)) >= datetime(?))`,
-    )
-    .all(sinceIso) as Session[];
+    sinceIso,
+  );
 }
 
-export function getRunningSessions(): Session[] {
-  return getRawDb().prepare("SELECT * FROM sessions WHERE container_status IN ('running', 'idle')").all() as Session[];
+export async function getRunningSessions(): Promise<Session[]> {
+  return getDb().all<Session>("SELECT * FROM sessions WHERE container_status IN ('running', 'idle')");
 }
 
-export function updateSession(
+export async function updateSession(
   id: string,
   updates: Partial<Pick<Session, 'status' | 'container_status' | 'last_active' | 'agent_provider'>>,
-): void {
+): Promise<void> {
   const fields: string[] = [];
   const values: Record<string, unknown> = { id };
 
@@ -210,9 +226,7 @@ export function updateSession(
   if (updates.last_active !== undefined) fields.push('sweep_quiet_until = NULL');
   if (fields.length === 0) return;
 
-  getRawDb()
-    .prepare(`UPDATE sessions SET ${fields.join(', ')} WHERE id = @id`)
-    .run(values);
+  await getDb().run(`UPDATE sessions SET ${fields.join(', ')} WHERE id = @id`, values);
 }
 
 /** A central-DB quiet-mark invalidation that did not land. Thrown, never swallowed. */
@@ -336,19 +350,18 @@ export interface QuietSessionMark {
  * in-memory mark needs no equivalent: the next tick re-reads `last_active` and
  * invalidates it there.
  */
-export function persistQuietSessionMarks(marks: readonly QuietSessionMark[]): void {
+export async function persistQuietSessionMarks(marks: readonly QuietSessionMark[]): Promise<void> {
   if (marks.length === 0) return;
   const byId: Record<string, { until: string; basis: string | null }> = {};
   for (const mark of marks) byId[mark.sessionId] = { until: mark.quietUntil, basis: mark.lastActive };
-  getRawDb()
-    .prepare(
-      `UPDATE sessions
+  await getDb().run(
+    `UPDATE sessions
           SET sweep_quiet_until = json_extract(j.value, '$.until')
          FROM json_each(@marks) AS j
         WHERE sessions.id = j.key
           AND sessions.last_active IS json_extract(j.value, '$.basis')`,
-    )
-    .run({ marks: JSON.stringify(byId) });
+    { marks: JSON.stringify(byId) },
+  );
 }
 
 /** A persisted quiet mark, with the `last_active` the warm path re-bases it on. */
@@ -367,16 +380,15 @@ export interface WarmQuietSessionMark {
  * its row is unreachable rather than stale, and the reclaim deletes the row.
  * An expired mark is filtered here rather than cleared, so this is a pure read.
  */
-export function getWarmQuietSessionMarks(nowIso: string): WarmQuietSessionMark[] {
-  return getRawDb()
-    .prepare(
-      `SELECT id, sweep_quiet_until, last_active
+export async function getWarmQuietSessionMarks(nowIso: string): Promise<WarmQuietSessionMark[]> {
+  return getDb().all<WarmQuietSessionMark>(
+    `SELECT id, sweep_quiet_until, last_active
          FROM sessions
         WHERE status = 'active'
           AND sweep_quiet_until IS NOT NULL
           AND datetime(sweep_quiet_until) > datetime(@now)`,
-    )
-    .all({ now: nowIso }) as WarmQuietSessionMark[];
+    { now: nowIso },
+  );
 }
 
 /**
@@ -387,6 +399,10 @@ export function getWarmQuietSessionMarks(nowIso: string): WarmQuietSessionMark[]
  * age at which it expires — without this it would outlive the session forever.
  * A session with no row has no container and no delivery loop, so nothing is
  * left that could replay or re-execute the request the claim guarded.
+ *
+ * Seam 3: stays SYNCHRONOUS — it IS one of the eleven pinned central raw
+ * `db.transaction(...)` sites (plan §4.4), and the two DELETEs are atomic by
+ * construction. Converts in PR 6.
  */
 export function deleteSession(id: string): void {
   const db = getRawDb();
@@ -408,10 +424,10 @@ export function deleteSession(id: string): void {
  * orphaned session takes the cold-spawn path immediately rather than the
  * "thinks it's alive, try to kill, no-op" path. Returns the row count.
  */
-export function resetPhantomContainerStatus(): number {
-  const result = getRawDb()
-    .prepare("UPDATE sessions SET container_status = 'stopped' WHERE container_status IN ('running', 'idle')")
-    .run();
+export async function resetPhantomContainerStatus(): Promise<number> {
+  const result = await getDb().run(
+    "UPDATE sessions SET container_status = 'stopped' WHERE container_status IN ('running', 'idle')",
+  );
   return result.changes;
 }
 
@@ -422,15 +438,17 @@ export function resetPhantomContainerStatus(): number {
  * second read). Archived sessions still process inbound traffic and run
  * their containers; archiving is purely an operator-side display flag.
  */
-export function archiveSessionById(id: string, archivedAt: string = new Date().toISOString()): boolean {
-  const result = getRawDb()
-    .prepare(`UPDATE sessions SET archived_at = ? WHERE id = ? AND archived_at IS NULL`)
-    .run(archivedAt, id);
+export async function archiveSessionById(id: string, archivedAt: string = new Date().toISOString()): Promise<boolean> {
+  const result = await getDb().run(
+    `UPDATE sessions SET archived_at = ? WHERE id = ? AND archived_at IS NULL`,
+    archivedAt,
+    id,
+  );
   return result.changes > 0;
 }
 
-export function unarchiveSessionById(id: string): void {
-  getRawDb().prepare(`UPDATE sessions SET archived_at = NULL WHERE id = ?`).run(id);
+export async function unarchiveSessionById(id: string): Promise<void> {
+  await getDb().run(`UPDATE sessions SET archived_at = NULL WHERE id = ?`, id);
 }
 
 /**
@@ -442,20 +460,21 @@ export function unarchiveSessionById(id: string): void {
  * `chat-sdk:<content.type>` (e.g., `chat-sdk:ask_question`) so the inbox
  * can distinguish question-prompts from ordinary chat without re-parsing.
  */
-export function bumpLastOutbound(id: string, kind: string): void {
+export async function bumpLastOutbound(id: string, kind: string): Promise<void> {
   // Bound ISO, NOT `datetime('now')`: that yields the naive
   // `YYYY-MM-DD HH:MM:SS` shape, and SQLite compares it against ISO values as
   // TEXT — at index 10 'T' (0x54) beats ' ' (0x20), so a naive 11pm row sorts
   // BELOW an ISO 7am one from the same day and `MAX(last_outbound_at)` (the
   // observatory's most-recent-activity read) picks the wrong session.
-  getRawDb()
-    .prepare(
-      `UPDATE sessions
+  await getDb().run(
+    `UPDATE sessions
           SET last_outbound_at = ?,
               last_outbound_kind = ?
         WHERE id = ?`,
-    )
-    .run(new Date().toISOString(), kind, id);
+    new Date().toISOString(),
+    kind,
+    id,
+  );
 }
 
 /**
@@ -474,10 +493,12 @@ export function bumpLastOutbound(id: string, kind: string): void {
  * the backfill's whole question is what the session looked like before this
  * engagement.
  */
-export function markSessionEngaged(id: string): void {
-  getRawDb()
-    .prepare(`UPDATE sessions SET engaged_at = ? WHERE id = ? AND engaged_at IS NULL`)
-    .run(new Date().toISOString(), id);
+export async function markSessionEngaged(id: string): Promise<void> {
+  await getDb().run(
+    `UPDATE sessions SET engaged_at = ? WHERE id = ? AND engaged_at IS NULL`,
+    new Date().toISOString(),
+    id,
+  );
 }
 
 /**
@@ -496,8 +517,8 @@ export function markSessionEngaged(id: string): void {
  * force every `Session` literal in the codebase to carry a field only task
  * sessions ever use.
  */
-export function setTaskRoutingPlatformId(id: string, platformId: string): void {
-  getRawDb().prepare('UPDATE sessions SET task_routing_platform_id = ? WHERE id = ?').run(platformId, id);
+export async function setTaskRoutingPlatformId(id: string, platformId: string): Promise<void> {
+  await getDb().run('UPDATE sessions SET task_routing_platform_id = ? WHERE id = ?', platformId, id);
 }
 
 // ── Pending Questions ──
@@ -508,13 +529,11 @@ export function setTaskRoutingPlatformId(id: string, platformId: string): void {
  * IGNORE` that would throw UNIQUE and prevent the retry from reaching the
  * actual send step. Returns true if a new row was inserted.
  */
-export function createPendingQuestion(pq: PendingQuestion): boolean {
-  const result = getRawDb()
-    .prepare(
-      `INSERT OR IGNORE INTO pending_questions (question_id, session_id, message_out_id, platform_id, channel_type, thread_id, title, question, options_json, created_at)
+export async function createPendingQuestion(pq: PendingQuestion): Promise<boolean> {
+  const result = await getDb().run(
+    `INSERT OR IGNORE INTO pending_questions (question_id, session_id, message_out_id, platform_id, channel_type, thread_id, title, question, options_json, created_at)
        VALUES (@question_id, @session_id, @message_out_id, @platform_id, @channel_type, @thread_id, @title, @question, @options_json, @created_at)`,
-    )
-    .run({
+    {
       question_id: pq.question_id,
       session_id: pq.session_id,
       message_out_id: pq.message_out_id,
@@ -525,21 +544,23 @@ export function createPendingQuestion(pq: PendingQuestion): boolean {
       question: pq.question,
       options_json: JSON.stringify(pq.options),
       created_at: pq.created_at,
-    });
+    },
+  );
   return result.changes > 0;
 }
 
-export function getPendingQuestion(questionId: string): PendingQuestion | undefined {
-  const row = getRawDb().prepare('SELECT * FROM pending_questions WHERE question_id = ?').get(questionId) as
-    | (Omit<PendingQuestion, 'options'> & { options_json: string })
-    | undefined;
+export async function getPendingQuestion(questionId: string): Promise<PendingQuestion | undefined> {
+  const row = await getDb().get<Omit<PendingQuestion, 'options'> & { options_json: string }>(
+    'SELECT * FROM pending_questions WHERE question_id = ?',
+    questionId,
+  );
   if (!row) return undefined;
   const { options_json, ...rest } = row;
   return { ...rest, options: JSON.parse(options_json) };
 }
 
-export function deletePendingQuestion(questionId: string): void {
-  getRawDb().prepare('DELETE FROM pending_questions WHERE question_id = ?').run(questionId);
+export async function deletePendingQuestion(questionId: string): Promise<void> {
+  await getDb().run('DELETE FROM pending_questions WHERE question_id = ?', questionId);
 }
 
 // ── Pending Approvals ──
@@ -549,16 +570,15 @@ export function deletePendingQuestion(questionId: string): void {
  * createPendingQuestion: delivery retries with the same approval_id must not
  * fail on UNIQUE before the send step gets a chance to succeed.
  */
-export function createPendingApproval(
+export async function createPendingApproval(
   pa: Partial<PendingApproval> &
     Pick<
       PendingApproval,
       'approval_id' | 'request_id' | 'action' | 'payload' | 'created_at' | 'title' | 'options_json'
     >,
-): boolean {
-  const result = getRawDb()
-    .prepare(
-      `INSERT OR IGNORE INTO pending_approvals
+): Promise<boolean> {
+  const result = await getDb().run(
+    `INSERT OR IGNORE INTO pending_approvals
          (approval_id, session_id, request_id, action, payload, created_at,
           agent_group_id, channel_type, platform_id, instance, thread_id, platform_message_id, expires_at, status,
           title, question, options_json, approver_user_id)
@@ -566,8 +586,7 @@ export function createPendingApproval(
          (@approval_id, @session_id, @request_id, @action, @payload, @created_at,
           @agent_group_id, @channel_type, @platform_id, @instance, @thread_id, @platform_message_id, @expires_at, @status,
           @title, @question, @options_json, @approver_user_id)`,
-    )
-    .run({
+    {
       session_id: null,
       agent_group_id: null,
       channel_type: null,
@@ -580,36 +599,50 @@ export function createPendingApproval(
       question: '',
       approver_user_id: null,
       ...pa,
-    });
+    },
+  );
   return result.changes > 0;
 }
 
-export function getPendingApprovalsBySession(sessionId: string): PendingApproval[] {
-  return getRawDb()
-    .prepare('SELECT * FROM pending_approvals WHERE session_id = ? AND status = ?')
-    .all(sessionId, 'pending') as PendingApproval[];
+export async function getPendingApprovalsBySession(sessionId: string): Promise<PendingApproval[]> {
+  return getDb().all<PendingApproval>(
+    'SELECT * FROM pending_approvals WHERE session_id = ? AND status = ?',
+    sessionId,
+    'pending',
+  );
 }
 
-export function getPendingApprovalByRequestId(requestId: string): PendingApproval | undefined {
-  return getRawDb()
-    .prepare('SELECT * FROM pending_approvals WHERE request_id = ? AND status = ?')
-    .get(requestId, 'pending') as PendingApproval | undefined;
+export async function getPendingApprovalByRequestId(requestId: string): Promise<PendingApproval | undefined> {
+  return getDb().get<PendingApproval>(
+    'SELECT * FROM pending_approvals WHERE request_id = ? AND status = ?',
+    requestId,
+    'pending',
+  );
 }
 
-export function updatePendingApprovalMessageId(approvalId: string, platformMessageId: string | null): void {
-  getRawDb()
-    .prepare('UPDATE pending_approvals SET platform_message_id = ? WHERE approval_id = ?')
-    .run(platformMessageId, approvalId);
+export async function updatePendingApprovalMessageId(
+  approvalId: string,
+  platformMessageId: string | null,
+): Promise<void> {
+  await getDb().run(
+    'UPDATE pending_approvals SET platform_message_id = ? WHERE approval_id = ?',
+    platformMessageId,
+    approvalId,
+  );
 }
 
-export function getPendingApproval(approvalId: string): PendingApproval | undefined {
-  return getRawDb().prepare('SELECT * FROM pending_approvals WHERE approval_id = ?').get(approvalId) as
-    | PendingApproval
-    | undefined;
+/** Exported for the guard seam's synchronous grant check (plan §4.5, I-1). */
+export const PENDING_APPROVAL_BY_ID_SQL = 'SELECT * FROM pending_approvals WHERE approval_id = ?';
+
+export async function getPendingApproval(approvalId: string): Promise<PendingApproval | undefined> {
+  return getDb().get<PendingApproval>(PENDING_APPROVAL_BY_ID_SQL, approvalId);
 }
 
-export function updatePendingApprovalStatus(approvalId: string, status: PendingApproval['status']): void {
-  getRawDb().prepare('UPDATE pending_approvals SET status = ? WHERE approval_id = ?').run(status, approvalId);
+export async function updatePendingApprovalStatus(
+  approvalId: string,
+  status: PendingApproval['status'],
+): Promise<void> {
+  await getDb().run('UPDATE pending_approvals SET status = ? WHERE approval_id = ?', status, approvalId);
 }
 
 /**
@@ -623,14 +656,17 @@ export function updatePendingApprovalStatus(approvalId: string, status: PendingA
  * decided twice. Single-statement UPDATE ... WHERE status = ? is atomic in
  * SQLite, so the loser sees changes === 0 and backs off.
  */
-export function transitionPendingApprovalStatus(
+export async function transitionPendingApprovalStatus(
   approvalId: string,
   from: PendingApproval['status'],
   to: PendingApproval['status'],
-): boolean {
-  const result = getRawDb()
-    .prepare('UPDATE pending_approvals SET status = ? WHERE approval_id = ? AND status = ?')
-    .run(to, approvalId, from);
+): Promise<boolean> {
+  const result = await getDb().run(
+    'UPDATE pending_approvals SET status = ? WHERE approval_id = ? AND status = ?',
+    to,
+    approvalId,
+    from,
+  );
   return result.changes > 0;
 }
 
@@ -641,27 +677,28 @@ export function transitionPendingApprovalStatus(
  * ghosted hold never strands the requesting agent). Reuses the otherwise-unused
  * `expires_at` column on module-initiated rows.
  */
-export function markApprovalAwaitingReason(approvalId: string, expiresAt: string): void {
-  getRawDb()
-    .prepare("UPDATE pending_approvals SET status = 'awaiting_reason', expires_at = ? WHERE approval_id = ?")
-    .run(expiresAt, approvalId);
+export async function markApprovalAwaitingReason(approvalId: string, expiresAt: string): Promise<void> {
+  await getDb().run(
+    "UPDATE pending_approvals SET status = 'awaiting_reason', expires_at = ? WHERE approval_id = ?",
+    expiresAt,
+    approvalId,
+  );
 }
 
 /** Awaiting-reason approvals whose reply window has elapsed — the sweep's ghost set. */
-export function getExpiredAwaitingReasonApprovals(nowIso: string): PendingApproval[] {
-  return getRawDb()
-    .prepare(
-      "SELECT * FROM pending_approvals WHERE status = 'awaiting_reason' AND expires_at IS NOT NULL AND expires_at <= ?",
-    )
-    .all(nowIso) as PendingApproval[];
+export async function getExpiredAwaitingReasonApprovals(nowIso: string): Promise<PendingApproval[]> {
+  return getDb().all<PendingApproval>(
+    "SELECT * FROM pending_approvals WHERE status = 'awaiting_reason' AND expires_at IS NOT NULL AND expires_at <= ?",
+    nowIso,
+  );
 }
 
-export function deletePendingApproval(approvalId: string): void {
-  getRawDb().prepare('DELETE FROM pending_approvals WHERE approval_id = ?').run(approvalId);
+export async function deletePendingApproval(approvalId: string): Promise<void> {
+  await getDb().run('DELETE FROM pending_approvals WHERE approval_id = ?', approvalId);
 }
 
-export function getPendingApprovalsByAction(action: string): PendingApproval[] {
-  return getRawDb().prepare('SELECT * FROM pending_approvals WHERE action = ?').all(action) as PendingApproval[];
+export async function getPendingApprovalsByAction(action: string): Promise<PendingApproval[]> {
+  return getDb().all<PendingApproval>('SELECT * FROM pending_approvals WHERE action = ?', action);
 }
 
 /**
@@ -669,10 +706,13 @@ export function getPendingApprovalsByAction(action: string): PendingApproval[] {
  * card, regardless of whether it was persisted as a pending_question (generic
  * ask_user_question) or a pending_approval (self-mod / OneCLI credential).
  */
-export function getAskQuestionRender(
+export async function getAskQuestionRender(
   id: string,
-): { title: string; question?: string; options: import('../channels/ask-question.js').NormalizedOption[] } | undefined {
-  const q = getPendingQuestion(id);
+): Promise<
+  { title: string; question?: string; options: import('../channels/ask-question.js').NormalizedOption[] } | undefined
+> {
+  const db = getDb();
+  const q = await getPendingQuestion(id);
   if (q) return { title: q.title, question: q.question, options: q.options };
 
   const parseRender = (
@@ -698,26 +738,29 @@ export function getAskQuestionRender(
     }
   };
 
-  const a = getRawDb()
-    .prepare('SELECT title, question, options_json FROM pending_approvals WHERE approval_id = ?')
-    .get(id) as { title: string; question: string; options_json: string } | undefined;
+  const a = await db.get<{ title: string; question: string; options_json: string }>(
+    'SELECT title, question, options_json FROM pending_approvals WHERE approval_id = ?',
+    id,
+  );
   const approvalRender = parseRender(a);
   if (approvalRender) return approvalRender;
 
   // Channel-registration + unknown-sender approvals persist title/options_json
   // the same way pending_approvals does — just SELECT and return.
-  if (hasTableRaw(getRawDb(), 'pending_channel_approvals')) {
-    const c = getRawDb()
-      .prepare('SELECT title, question, options_json FROM pending_channel_approvals WHERE messaging_group_id = ?')
-      .get(id) as { title: string; question: string; options_json: string } | undefined;
+  if (await hasTable(db, 'pending_channel_approvals')) {
+    const c = await db.get<{ title: string; question: string; options_json: string }>(
+      'SELECT title, question, options_json FROM pending_channel_approvals WHERE messaging_group_id = ?',
+      id,
+    );
     const channelRender = parseRender(c);
     if (channelRender) return channelRender;
   }
 
-  if (hasTableRaw(getRawDb(), 'pending_sender_approvals')) {
-    const s = getRawDb()
-      .prepare('SELECT title, question, options_json FROM pending_sender_approvals WHERE id = ?')
-      .get(id) as { title: string; question: string; options_json: string } | undefined;
+  if (await hasTable(db, 'pending_sender_approvals')) {
+    const s = await db.get<{ title: string; question: string; options_json: string }>(
+      'SELECT title, question, options_json FROM pending_sender_approvals WHERE id = ?',
+      id,
+    );
     const senderRender = parseRender(s);
     if (senderRender) return senderRender;
   }

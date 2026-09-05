@@ -18,15 +18,21 @@ async function setupDb(): Promise<void> {
   runMigrations(db);
 }
 
-function seedGroups(): void {
-  createAgentGroup({
+async function seedGroups(): Promise<void> {
+  await createAgentGroup({
     id: 'ag-parent',
     name: 'ag-parent',
     folder: 'ag-parent',
     agent_provider: null,
     created_at: now(),
   });
-  createAgentGroup({ id: 'ag-child', name: 'ag-child', folder: 'ag-child', agent_provider: null, created_at: now() });
+  await createAgentGroup({
+    id: 'ag-child',
+    name: 'ag-child',
+    folder: 'ag-child',
+    agent_provider: null,
+    created_at: now(),
+  });
   getRawDb()
     .prepare(`INSERT INTO sessions (id, agent_group_id, created_at) VALUES (?, ?, ?)`)
     .run('sess-parent', 'ag-parent', now());
@@ -101,7 +107,7 @@ afterEach(async () => {
 describe('applySpawnProgress', () => {
   it('test_progress_resets_timer: updates last_progress_at and last_progress_message', async () => {
     await setupDb();
-    seedGroups();
+    await seedGroups();
     makeRunningTask();
 
     const before = Date.now();
@@ -118,7 +124,7 @@ describe('applySpawnProgress', () => {
 
   it('test_progress_truncates_500: truncates message to 500 chars', async () => {
     await setupDb();
-    seedGroups();
+    await seedGroups();
     makeRunningTask();
 
     await applySpawnProgress({ task_id: 'task-1', message: 'X'.repeat(1000) }, makeChildSession());
@@ -129,7 +135,7 @@ describe('applySpawnProgress', () => {
 
   it('test_progress_wrong_session_silent: does not throw on auth mismatch', async () => {
     await setupDb();
-    seedGroups();
+    await seedGroups();
     makeRunningTask();
 
     await expect(
@@ -143,7 +149,7 @@ describe('applySpawnProgress', () => {
 
   it('ASSERT: no status guard — progress can be reported on any status', async () => {
     await setupDb();
-    seedGroups();
+    await seedGroups();
     // Insert task with status=pending (unusual but should still work)
     insertTaskAtomic({
       task_id: 'task-pend',

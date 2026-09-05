@@ -115,7 +115,7 @@ beforeEach(async () => {
   await import('./index.js'); // register hooks
 
   // Base fixtures: one agent group + owner with a DM on 'telegram'.
-  createAgentGroup({ id: 'ag-1', name: 'Andy', folder: 'andy', agent_provider: null, created_at: now() });
+  await createAgentGroup({ id: 'ag-1', name: 'Andy', folder: 'andy', agent_provider: null, created_at: now() });
 
   upsertUser({ id: 'telegram:owner', kind: 'telegram', display_name: 'Owner', created_at: now() });
   grantRole({
@@ -127,7 +127,7 @@ beforeEach(async () => {
   });
 
   // Pre-seed owner's DM messaging group + user_dms mapping.
-  createMessagingGroup({
+  await createMessagingGroup({
     id: 'mg-dm-owner',
     channel_type: 'telegram',
     platform_id: 'dm-owner',
@@ -155,7 +155,7 @@ beforeEach(async () => {
     granted_by: null,
     granted_at: now(),
   });
-  createMessagingGroup({
+  await createMessagingGroup({
     id: 'mg-dm-owner-wamock',
     channel_type: 'wamock',
     platform_id: 'dm-owner-wamock',
@@ -520,7 +520,7 @@ describe('unknown-channel registration flow', () => {
     }
 
     // denied_at set, pending row cleared, no wiring.
-    const mg = getMessagingGroupByPlatform('telegram', 'chat-deny');
+    const mg = await getMessagingGroupByPlatform('telegram', 'chat-deny');
     expect(mg?.denied_at).not.toBeNull();
     expect(mg?.denied_at).toBeTruthy();
     const mgaCount = (
@@ -582,7 +582,7 @@ describe('unknown-channel registration flow', () => {
     const { getResponseHandlers } = await import('../../response-registry.js');
     const { getRawDb } = await import('../../db/connection.js');
 
-    createAgentGroup({ id: 'ag-2', name: 'Betty', folder: 'betty', agent_provider: null, created_at: now() });
+    await createAgentGroup({ id: 'ag-2', name: 'Betty', folder: 'betty', agent_provider: null, created_at: now() });
     upsertUser({ id: 'telegram:scoped-admin', kind: 'telegram', display_name: 'Scoped Admin', created_at: now() });
     grantRole({
       user_id: 'telegram:scoped-admin',
@@ -591,7 +591,7 @@ describe('unknown-channel registration flow', () => {
       granted_by: 'telegram:owner',
       granted_at: now(),
     });
-    createMessagingGroup({
+    await createMessagingGroup({
       id: 'mg-dm-scoped-admin',
       channel_type: 'telegram',
       platform_id: 'dm-scoped-admin',
@@ -938,7 +938,7 @@ describe('the conversation is classified once, not twice', () => {
   // slug landed in messaging_groups.name before this classification ran —
   // and confirm the richer classified name still wins.
   it('overwrites a name a racing legacy metadata lookup already set', async () => {
-    createMessagingGroup({
+    await createMessagingGroup({
       id: 'mg-mpdm-raced',
       channel_type: 'telegram',
       platform_id: 'mpdm-raced',
@@ -960,7 +960,7 @@ describe('the conversation is classified once, not twice', () => {
   });
 
   it('leaves an existing name alone when the classified name is unavailable', async () => {
-    createMessagingGroup({
+    await createMessagingGroup({
       id: 'mg-mpdm-noroster',
       channel_type: 'telegram',
       platform_id: 'mpdm-noroster',

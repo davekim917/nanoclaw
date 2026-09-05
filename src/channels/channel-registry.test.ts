@@ -6,7 +6,6 @@ import Database from 'better-sqlite3';
 import fs from 'fs';
 
 import type { ChannelAdapter, ChannelSetup, InboundMessage, OutboundMessage } from './adapter.js';
-import { getRawDb } from '../db/connection.js';
 
 // Mock container runner. Spread the real module so exports the router path
 // touches but this suite doesn't assert on — `sessionStillActive` is built
@@ -282,20 +281,26 @@ describe('channel + router integration', () => {
     if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
     fs.mkdirSync(TEST_DIR, { recursive: true });
 
-    const { initTestDb, runMigrations, createAgentGroup, createMessagingGroup, createMessagingGroupAgent } =
-      await import('../db/index.js');
+    const {
+      initTestDb,
+      runMigrations,
+      createAgentGroup,
+      createMessagingGroup,
+      createMessagingGroupAgent,
+      getRawDb: getRawDbFresh,
+    } = await import('../db/index.js');
     await initTestDb();
-    const db = getRawDb();
+    const db = getRawDbFresh();
     runMigrations(db);
 
-    createAgentGroup({
+    await createAgentGroup({
       id: 'ag-1',
       name: 'Test Agent',
       folder: 'test-agent',
       agent_provider: null,
       created_at: now(),
     });
-    createMessagingGroup({
+    await createMessagingGroup({
       id: 'mg-1',
       channel_type: 'mock',
       platform_id: 'chan-100',
@@ -349,7 +354,7 @@ describe('channel + router integration', () => {
     });
 
     // Verify session was created and message written
-    const session = findSession('mg-1', null);
+    const session = await findSession('mg-1', null);
     expect(session).toBeDefined();
 
     const dbPath = inboundDbPath('ag-1', session!.id);

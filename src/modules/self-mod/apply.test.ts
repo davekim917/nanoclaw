@@ -57,8 +57,8 @@ beforeEach(async () => {
   await initTestDb();
   runMigrations(getRawDb());
 
-  createAgentGroup({ id: 'ag-1', name: 'Agent', folder: 'agent', agent_provider: null, created_at: now() });
-  ensureContainerConfig('ag-1');
+  await createAgentGroup({ id: 'ag-1', name: 'Agent', folder: 'agent', agent_provider: null, created_at: now() });
+  await ensureContainerConfig('ag-1');
   session = {
     id: 'sess-1',
     agent_group_id: 'ag-1',
@@ -70,7 +70,7 @@ beforeEach(async () => {
     last_active: now(),
     created_at: now(),
   } as Session;
-  createSession(session);
+  await createSession(session);
 
   writeContainerConfig('agent', {
     mcpServers: { existing: { command: 'mcp-existing', args: [], env: {} } },
@@ -107,7 +107,7 @@ describe('applyAddMcpServer', () => {
     // Servers already in the file, and unrelated operator-owned fields, survive.
     expect(file.mcpServers.existing).toBeDefined();
     expect(file.onecliSecrets).toEqual(['Keep-Me']);
-    expect(JSON.parse(getContainerConfig('ag-1')!.mcp_servers)).toEqual(file.mcpServers);
+    expect(JSON.parse((await getContainerConfig('ag-1'))!.mcp_servers)).toEqual(file.mcpServers);
   });
 
   it('tells the agent how a 401 gets fixed when the server authenticates', async () => {
@@ -156,7 +156,7 @@ describe('applyAddMcpServer', () => {
   it('refuses an approved payload that no longer validates, leaving both stores untouched', async () => {
     await applyAddMcpServer({ name: 'leaky', url: 'https://example.com/mcp?api_key=abc' }, session);
     expect(readContainerConfig('agent').mcpServers.leaky).toBeUndefined();
-    expect(JSON.parse(getContainerConfig('ag-1')!.mcp_servers).leaky).toBeUndefined();
+    expect(JSON.parse((await getContainerConfig('ag-1'))!.mcp_servers).leaky).toBeUndefined();
   });
 
   it.each([
@@ -172,10 +172,16 @@ describe('applyAddMcpServer', () => {
       settled = true;
     });
 
-    await Promise.resolve();
+    // Seam 3: the two reads before the report (`getAgentGroup`,
+    // `getContainerConfig`) are async on the driver, so the report is no
+    // longer reached within a fixed number of microtask ticks. Wait for it to
+    // be issued, then prove the call has NOT returned while it is in flight —
+    // which is the invariant this case exists for.
+    await vi.waitFor(() => expect(releaseNotification).toBeDefined());
     expect(settled).toBe(false);
     releaseNotification!();
     await applying;
+    expect(settled).toBe(true);
   });
 
   it.each([

@@ -36,24 +36,24 @@ describe('getWorkgroupOnecliSecrets', () => {
 
   afterEach(() => closeDb());
 
-  it('returns the workgroup secret declarations for a member group', () => {
-    expect(getWorkgroupOnecliSecrets('ag-retail')).toEqual(['Slack-User-Token-example-retail', 'Anthropic']);
+  it('returns the workgroup secret declarations for a member group', async () => {
+    expect(await getWorkgroupOnecliSecrets('ag-retail')).toEqual(['Slack-User-Token-example-retail', 'Anthropic']);
   });
 
-  it('returns [] when the workgroup declares none', () => {
-    expect(getWorkgroupOnecliSecrets('ag-empty')).toEqual([]);
+  it('returns [] when the workgroup declares none', async () => {
+    expect(await getWorkgroupOnecliSecrets('ag-empty')).toEqual([]);
   });
 
-  it('returns [] when the group has no workgroup', () => {
-    expect(getWorkgroupOnecliSecrets('ag-no-wg')).toEqual([]);
+  it('returns [] when the group has no workgroup', async () => {
+    expect(await getWorkgroupOnecliSecrets('ag-no-wg')).toEqual([]);
   });
 
-  it('returns [] for an unknown group id', () => {
-    expect(getWorkgroupOnecliSecrets('does-not-exist')).toEqual([]);
+  it('returns [] for an unknown group id', async () => {
+    expect(await getWorkgroupOnecliSecrets('does-not-exist')).toEqual([]);
   });
 
-  it('returns [] (not a throw) when onecli_secrets holds malformed JSON', () => {
+  it('returns [] (not a throw) when onecli_secrets holds malformed JSON', async () => {
     getRawDb().prepare(`UPDATE workgroups SET onecli_secrets = ? WHERE id = ?`).run('{not json', 'wg-retail');
-    expect(getWorkgroupOnecliSecrets('ag-retail')).toEqual([]);
+    expect(await getWorkgroupOnecliSecrets('ag-retail')).toEqual([]);
   });
 });
