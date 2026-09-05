@@ -8,7 +8,7 @@
  * a retry / second message from the same unknown sender while a card is
  * still pending is silently dropped instead of spamming the admin.
  */
-import { getRawDb } from '../../../db/connection.js';
+import { getDb } from '../../../db/connection.js';
 
 export interface PendingSenderApproval {
   id: string;
@@ -26,10 +26,9 @@ export interface PendingSenderApproval {
   options_json: string;
 }
 
-export function createPendingSenderApproval(row: PendingSenderApproval): boolean {
-  const result = getRawDb()
-    .prepare(
-      `INSERT OR IGNORE INTO pending_sender_approvals (
+export async function createPendingSenderApproval(row: PendingSenderApproval): Promise<boolean> {
+  const result = await getDb().run(
+    `INSERT OR IGNORE INTO pending_sender_approvals (
          id, messaging_group_id, agent_group_id, sender_identity,
          sender_name, original_message, approver_user_id, created_at,
          title, question, options_json
@@ -39,32 +38,32 @@ export function createPendingSenderApproval(row: PendingSenderApproval): boolean
          @sender_name, @original_message, @approver_user_id, @created_at,
          @title, @question, @options_json
        )`,
-    )
-    .run(row);
+    row,
+  );
   return result.changes > 0;
 }
 
-export function getPendingSenderApproval(id: string): PendingSenderApproval | undefined {
-  return getRawDb().prepare('SELECT * FROM pending_sender_approvals WHERE id = ?').get(id) as
-    | PendingSenderApproval
-    | undefined;
+export async function getPendingSenderApproval(id: string): Promise<PendingSenderApproval | undefined> {
+  return getDb().get<PendingSenderApproval>('SELECT * FROM pending_sender_approvals WHERE id = ?', id);
 }
 
-export function hasInFlightSenderApproval(messagingGroupId: string, senderIdentity: string): boolean {
-  return getInFlightSenderApproval(messagingGroupId, senderIdentity) !== undefined;
+export async function hasInFlightSenderApproval(messagingGroupId: string, senderIdentity: string): Promise<boolean> {
+  return (await getInFlightSenderApproval(messagingGroupId, senderIdentity)) !== undefined;
 }
 
-export function getInFlightSenderApproval(
+export async function getInFlightSenderApproval(
   messagingGroupId: string,
   senderIdentity: string,
-): PendingSenderApproval | undefined {
-  return getRawDb()
-    .prepare('SELECT * FROM pending_sender_approvals WHERE messaging_group_id = ? AND sender_identity = ?')
-    .get(messagingGroupId, senderIdentity) as PendingSenderApproval | undefined;
+): Promise<PendingSenderApproval | undefined> {
+  return getDb().get<PendingSenderApproval>(
+    'SELECT * FROM pending_sender_approvals WHERE messaging_group_id = ? AND sender_identity = ?',
+    messagingGroupId,
+    senderIdentity,
+  );
 }
 
-export function deletePendingSenderApproval(id: string): void {
-  getRawDb().prepare('DELETE FROM pending_sender_approvals WHERE id = ?').run(id);
+export async function deletePendingSenderApproval(id: string): Promise<void> {
+  await getDb().run('DELETE FROM pending_sender_approvals WHERE id = ?', id);
 }
 
 // ── Decline stamps (decline_notify dedupe) ──
@@ -107,13 +106,13 @@ export function isDeclineStampId(id: string): boolean {
   return id.startsWith(DECLINE_STAMP_ID_PREFIX);
 }
 
-export function getDeclineStampAt(messagingGroupId: string, senderIdentity: string): string | undefined {
-  const row = getRawDb()
-    .prepare(
-      `SELECT created_at FROM pending_sender_approvals
+export async function getDeclineStampAt(messagingGroupId: string, senderIdentity: string): Promise<string | undefined> {
+  const row = await getDb().get<{ created_at: string }>(
+    `SELECT created_at FROM pending_sender_approvals
         WHERE messaging_group_id = ? AND sender_identity = ? AND id LIKE '${DECLINE_STAMP_ID_PREFIX}%'`,
-    )
-    .get(messagingGroupId, senderIdentity) as { created_at: string } | undefined;
+    messagingGroupId,
+    senderIdentity,
+  );
   return row?.created_at;
 }
 
@@ -124,14 +123,13 @@ export function getDeclineStampAt(messagingGroupId: string, senderIdentity: stri
  * a stamp; `sender_name` and `original_message` are deliberately not taken
  * from the caller — the dedupe key and the timestamp are the whole record.
  */
-export function upsertDeclineStamp(stamp: {
+export async function upsertDeclineStamp(stamp: {
   messaging_group_id: string;
   agent_group_id: string;
   sender_identity: string;
-}): void {
-  getRawDb()
-    .prepare(
-      `INSERT INTO pending_sender_approvals (
+}): Promise<void> {
+  await getDb().run(
+    `INSERT INTO pending_sender_approvals (
          id, messaging_group_id, agent_group_id, sender_identity,
          sender_name, original_message, approver_user_id, created_at
        )
@@ -148,23 +146,23 @@ export function upsertDeclineStamp(stamp: {
          title = excluded.title,
          question = excluded.question,
          options_json = excluded.options_json`,
-    )
-    .run({
+    {
       id: `${DECLINE_STAMP_ID_PREFIX}${stamp.messaging_group_id}:${stamp.sender_identity}`,
       ...stamp,
       // Overwrites a converted card row's retained body too, so flipping a
       // messaging group to decline_notify drops the pending card's content.
       original_message: DECLINE_STAMP_BODY,
       created_at: new Date().toISOString(),
-    });
+    },
+  );
 }
 
 /** Remove any decline stamp for this pair — real card rows are untouched. */
-export function clearDeclineStamp(messagingGroupId: string, senderIdentity: string): void {
-  getRawDb()
-    .prepare(
-      `DELETE FROM pending_sender_approvals
+export async function clearDeclineStamp(messagingGroupId: string, senderIdentity: string): Promise<void> {
+  await getDb().run(
+    `DELETE FROM pending_sender_approvals
         WHERE messaging_group_id = ? AND sender_identity = ? AND id LIKE '${DECLINE_STAMP_ID_PREFIX}%'`,
-    )
-    .run(messagingGroupId, senderIdentity);
+    messagingGroupId,
+    senderIdentity,
+  );
 }
