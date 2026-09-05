@@ -40,6 +40,7 @@ vi.mock('../log.js', () => ({
 }));
 
 import { closeDb, deleteSession, getRawDb, initTestDb, runMigrations } from '../db/index.js';
+import { getDeliveryAttempt, recordDeliveryAttempt } from '../db/coordination.js';
 import { getDeliveryAction, type DeliveryActionHandler } from '../delivery.js';
 import { inboundDbPath } from '../mailbox/sqlite/paths.js';
 import { initSessionFolder } from '../session-manager.js';
@@ -346,6 +347,31 @@ describe('ledger mechanics', () => {
     deleteSession(SESSION_ID);
 
     expect(requestIds()).toEqual(['req-8']);
+  });
+
+  it('deleting the session takes its delivery attempt counts with it', async () => {
+    // Same shape as the claim above: `delivery_attempts` has no cascading
+    // foreign key, and the only thing that clears a row is a delivery loop the
+    // deleted session no longer has.
+    await recordDeliveryAttempt({
+      messageId: 'out-doomed',
+      sessionId: SESSION_ID,
+      now: new Date().toISOString(),
+      nextAttemptAt: null,
+      error: 'boom',
+    });
+    await recordDeliveryAttempt({
+      messageId: 'out-survivor',
+      sessionId: 'survivor-session',
+      now: new Date().toISOString(),
+      nextAttemptAt: null,
+      error: 'boom',
+    });
+
+    deleteSession(SESSION_ID);
+
+    expect(await getDeliveryAttempt('out-doomed')).toBeUndefined();
+    expect((await getDeliveryAttempt('out-survivor'))?.session_id).toBe('survivor-session');
   });
 
   it('a week-old unsuperseded claim keeps the fact it ran and loses only its payload', () => {

@@ -263,6 +263,7 @@ registerResource({
           const counts = {
             sessions: 0,
             cli_request_executions: 0,
+            delivery_attempts: 0,
             pending_questions: 0,
             pending_approvals: 0,
             agent_destinations_owned: 0,
@@ -296,6 +297,16 @@ registerResource({
           counts.cli_request_executions = db
             .prepare(
               'DELETE FROM cli_request_executions WHERE session_id IN (SELECT id FROM sessions WHERE agent_group_id = ?)',
+            )
+            .run(groupId).changes;
+          // Delivery retry counts (migration 071) are keyed to the session and
+          // have no cascading foreign key. Nothing clears an orphan afterwards:
+          // the row is only ever cleared by a delivery loop for a session that
+          // no longer exists. Must run before the sessions delete below — it
+          // resolves them by subquery.
+          counts.delivery_attempts = db
+            .prepare(
+              'DELETE FROM delivery_attempts WHERE session_id IN (SELECT id FROM sessions WHERE agent_group_id = ?)',
             )
             .run(groupId).changes;
           if (hasPendingApprovals) {
