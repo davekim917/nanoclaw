@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import {
   configFromDb,
+  mcpServerPluginOwner,
   opaqueUrlParts,
   parseMcpServerConfig,
   validateMcpServerName,
@@ -14,6 +15,7 @@ import {
   effectiveTimezone,
   honouredTimezoneOverride,
   resolveGroupTimezone,
+  updateContainerConfig,
   writeContainerConfig,
 } from './container-config.js';
 import { TIMEZONE } from './config.js';
@@ -21,6 +23,7 @@ import { createAgentGroup } from './db/agent-groups.js';
 import { closeDb, initTestDb, getRawDb } from './db/connection.js';
 import { ensureContainerConfig, getContainerConfig, updateContainerConfigScalars } from './db/container-configs.js';
 import { runMigrations } from './db/migrations/index.js';
+import { log } from './log.js';
 import type { AgentGroup } from './types.js';
 import knownSecretShapes from '../tests/fixtures/mcp-known-secret-shapes.json' with { type: 'json' };
 
@@ -211,6 +214,66 @@ describe('MCP server transport validation', () => {
         skills: 'all',
       }),
     ).toThrow(/deprecated SSE transport/);
+  });
+});
+
+describe('MCP server cwd (Agent Plugins fixed forms)', () => {
+  it('a stdio server declaring cwd survives the round trip through container.json', () => {
+    updateContainerConfig('test-mcp-cwd-roundtrip', (config) => {
+      config.mcpServers = {
+        plugged: {
+          command: 'node',
+          args: ['server.js'],
+          env: {},
+          cwd: '${PLUGIN_ROOT}/scripts',
+          pluginRoot: '/workspace/agent/plugins/sales-sdr',
+        },
+      };
+    });
+
+    const result = readContainerConfig('test-mcp-cwd-roundtrip');
+
+    expect(result.mcpServers.plugged).toMatchObject({ cwd: '${PLUGIN_ROOT}/scripts' });
+  });
+
+  it('a cwd with no plugin provenance is stripped and logged', () => {
+    const warnSpy = vi.spyOn(log, 'warn').mockImplementation(() => {});
+    writeGroupConfig('test-mcp-cwd-no-provenance', {
+      mcpServers: {
+        naked: { command: 'node', args: [], env: {}, cwd: './scripts' },
+      },
+      packages: { apt: [], npm: [] },
+      additionalMounts: [],
+      skills: 'all',
+    });
+
+    const result = readContainerConfig('test-mcp-cwd-no-provenance');
+
+    expect(result.mcpServers.naked).not.toHaveProperty('cwd');
+    expect(warnSpy).toHaveBeenCalledWith(
+      'Stripping cwd from stored MCP server without plugin provenance',
+      expect.objectContaining({ server: 'naked' }),
+    );
+    warnSpy.mockRestore();
+  });
+
+  it('parseMcpServerConfig accepts the three fixed cwd forms and rejects an escape', () => {
+    const stdio = parseMcpServerConfig({ command: 'node', cwd: './scripts' }) as { command: string };
+    expect(stdio.command).toBe('node');
+    expect((parseMcpServerConfig({ command: 'node', cwd: '${PLUGIN_ROOT}/x' }) as { cwd?: string }).cwd).toBe(
+      '${PLUGIN_ROOT}/x',
+    );
+    expect((parseMcpServerConfig({ command: 'node', cwd: '${PLUGIN_DATA}' }) as { cwd?: string }).cwd).toBe(
+      '${PLUGIN_DATA}',
+    );
+    expect(() => parseMcpServerConfig({ command: 'node', cwd: '../escape' })).toThrow(/cwd must be/);
+    expect(() => parseMcpServerConfig({ command: 'node', cwd: './a/../b' })).toThrow(/cwd escapes/);
+  });
+
+  it('cwd is rejected on a url (http) server', () => {
+    expect(() => parseMcpServerConfig({ url: 'https://example.com/mcp', cwd: './x' })).toThrow(
+      /only valid with command/,
+    );
   });
 });
 
@@ -570,6 +633,19 @@ describe('parseMcpServerConfig', () => {
     // assignment. A static entry named "nanoclaw" would silently replace
     // the built-in.
     expect(() => validateMcpServerName('nanoclaw')).toThrow(/reserved/);
+  });
+});
+
+describe('mcpServerPluginOwner', () => {
+  it('returns undefined for a non-object, a missing plugin, and an empty-string plugin', () => {
+    expect(mcpServerPluginOwner(null)).toBeUndefined();
+    expect(mcpServerPluginOwner('not-an-object')).toBeUndefined();
+    expect(mcpServerPluginOwner({ command: 'npx' })).toBeUndefined();
+    expect(mcpServerPluginOwner({ command: 'npx', plugin: '' })).toBeUndefined();
+  });
+
+  it('returns the plugin name when present and non-empty', () => {
+    expect(mcpServerPluginOwner({ command: 'npx', plugin: 'sales-sdr' })).toBe('sales-sdr');
   });
 });
 

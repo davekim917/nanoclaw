@@ -1,3 +1,4 @@
+import { cwdWrappedArgv } from './cwd-shim.js';
 import type { McpServerConfig } from './types.js';
 
 /** OpenCode `mcp` entry shape (local stdio server). */
@@ -42,7 +43,13 @@ export function mcpServersToOpenCodeConfig(
       };
       continue;
     }
-    const command = [cfg.command, ...(cfg.args ?? [])];
+    // OpenCode's local MCP entry is a bare argv array with no cwd field, so a
+    // plugin server that declares one is wrapped through /bin/sh the same way
+    // cwd-shim.ts does for Claude — never launched silently in the wrong
+    // directory.
+    const command = cfg.cwd
+      ? cwdWrappedArgv(cfg.cwd, cfg.command, cfg.args ?? [])
+      : [cfg.command, ...(cfg.args ?? [])];
     const env = cfg.env;
     out[name] = {
       type: 'local',

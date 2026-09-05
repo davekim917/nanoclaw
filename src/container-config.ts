@@ -22,6 +22,7 @@ import path from 'path';
 import { GROUPS_DIR, TIMEZONE } from './config.js';
 import { validateContainerResources, type ContainerResources } from './container-resources.js';
 import { getContainerConfig } from './db/container-configs.js';
+import { log } from './log.js';
 import { TOKEN_SHAPE_PATTERNS } from './secret-scrubber.js';
 import { isIanaTimezone } from './timezone.js';
 import type { AgentGroup, ContainerConfigRow } from './types.js';
@@ -46,6 +47,24 @@ export interface StdioMcpServerConfig {
   command: string;
   args?: string[];
   env?: Record<string, string>;
+  /**
+   * Working directory in the Agent Plugins fixed forms (./p, ${PLUGIN_ROOT}[/p],
+   * ${PLUGIN_DATA}[/p]). For plugin servers the agent-runner (plugin-mcp.ts)
+   * resolves it to an absolute container path; providers consume it natively
+   * (codex) or via a launch shim (cwd-shim.ts). Without a pluginRoot there is
+   * nothing to resolve against, so `validateMcpServers` strips it — the only
+   * layer that does; the runtime passes provenance-less servers through
+   * untouched. No CLI flag or self-mod tool param exposes it; raw payloads
+   * carrying one are rejected at intake (`parseMcpServerConfig`).
+   */
+  cwd?: string;
+  /**
+   * Container-side plugin root (e.g. /workspace/agent/plugins/<name>), set at
+   * stamp time for servers that arrived in a plugin. Internal — never part of
+   * CLI input. The agent-runner expands ${PLUGIN_ROOT}/${PLUGIN_DATA} against
+   * it and injects both env vars when building the provider's server map.
+   */
+  pluginRoot?: string;
   instructions?: string;
 }
 
@@ -121,6 +140,16 @@ const MCP_SERVER_NAME_RE = /^[A-Za-z0-9_-]{1,64}$/;
  */
 const RESERVED_MCP_SERVER_NAMES = new Set(['__proto__', 'constructor', 'prototype', 'nanoclaw']);
 const ENV_KEY_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
+// The Agent Plugins fixed cwd shapes: ./p, ${PLUGIN_ROOT}[/p], ${PLUGIN_DATA}[/p].
+const CWD_FORM_RE = /^(?:\.\/|\$\{PLUGIN_ROOT\}(?:\/|$)|\$\{PLUGIN_DATA\}(?:\/|$))/;
+
+/** The owning plugin's name when a stored MCP server entry was stamped from a plugin. */
+export function mcpServerPluginOwner(entry: unknown): string | undefined {
+  if (typeof entry !== 'object' || entry === null) return undefined;
+  const plugin = (entry as Record<string, unknown>).plugin;
+  return typeof plugin === 'string' && plugin !== '' ? plugin : undefined;
+}
+
 /** RFC 7230 token charset — what a header field-name may contain. */
 const HEADER_NAME_RE = /^[A-Za-z0-9!#$%&'*+.^_`|~-]{1,64}$/;
 /**
@@ -337,8 +366,8 @@ export function parseMcpServerConfig(input: Record<string, unknown>): ParsedMcpS
     // to silently rewrite — the whole point of parsing strictly is that a
     // pasted vendor snippet fails loudly.
     if (declaredType === 'stdio') throw new Error('type "stdio" cannot be used with url; use "http"');
-    if (input.args !== undefined || input.env !== undefined) {
-      throw new Error('args and env are only valid with command');
+    if (input.args !== undefined || input.env !== undefined || input.cwd !== undefined) {
+      throw new Error('args, env, and cwd are only valid with command');
     }
     let parsed: URL;
     try {
@@ -412,6 +441,7 @@ export function parseMcpServerConfig(input: Record<string, unknown>): ParsedMcpS
     }
     env[key] = value;
   }
+  const cwd = parseCwd(input.cwd);
   // No explicit `type` on the stdio branch: it is the union's default and the
   // pre-existing writers omit it, so emitting one would churn every
   // container.json without changing behavior.
@@ -419,8 +449,28 @@ export function parseMcpServerConfig(input: Record<string, unknown>): ParsedMcpS
     command,
     args,
     env,
+    ...(cwd === undefined ? {} : { cwd }),
     ...(instructions === undefined ? {} : { instructions }),
   };
+}
+
+/** Accept only the spec's fixed cwd shapes, lexically contained (no ".." segments). */
+function parseCwd(value: unknown): string | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== 'string' || !CWD_FORM_RE.test(value)) {
+    throw new Error('cwd must be ./path, ${PLUGIN_ROOT}[/path], or ${PLUGIN_DATA}[/path]');
+  }
+  // rest === '' is the bare form (`${PLUGIN_DATA}`, `./`); empty segments in a
+  // non-empty rest are rejected for symmetry with the command validator.
+  const rest = value.startsWith('./') ? value.slice(2) : value.replace(CWD_FORM_RE, '');
+  if (
+    rest.includes('${') ||
+    rest.includes('\\') ||
+    (rest !== '' && rest.split('/').some((s) => s === '..' || s === ''))
+  ) {
+    throw new Error('cwd escapes the plugin root');
+  }
+  return value;
 }
 
 export function validateMcpServers(servers: Record<string, McpServerConfig>): Record<string, McpServerConfig> {
@@ -429,6 +479,14 @@ export function validateMcpServers(servers: Record<string, McpServerConfig>): Re
       throw new Error(
         `MCP server "${name}" uses deprecated SSE transport. Use Streamable HTTP (type: "http") instead.`,
       );
+    }
+    // cwd resolves against a plugin root; without provenance nothing can
+    // resolve it. This strip is the ONLY layer (the runtime passes
+    // provenance-less servers through untouched, per plugin-mcp.ts), and it
+    // runs on both the read and write paths since both flow through here.
+    if (server && server.type !== 'http' && server.cwd && !server.pluginRoot) {
+      delete server.cwd;
+      log.warn('Stripping cwd from stored MCP server without plugin provenance', { server: name });
     }
   }
   return servers;
