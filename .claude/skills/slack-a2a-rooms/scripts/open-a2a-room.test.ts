@@ -191,3 +191,14 @@ it('stops duplicate resolved identities before opening a room', async () => {
     log.mockRestore();
   }
 });
+
+describe('open-a2a-room respects the MPIM invitee limit', () => {
+  it.each([false, true])('accepts eight invitees with human=%s and rejects nine', (withHuman) => {
+    const instances = Array.from({ length: withHuman ? 8 : 9 }, (_, i) => `synthetic-${i}`);
+    const userArgs = withHuman ? ['--user', 'U0HUMAN'] : [];
+    expect(() => parseArgs(['--instances', instances.join(','), ...userArgs])).not.toThrow();
+    expect(() => parseArgs(['--instances', [...instances, 'synthetic-extra'].join(','), ...userArgs])).toThrow(
+      'room has 9 invitees; Slack permits at most 8, excluding the caller',
+    );
+  });
+});
