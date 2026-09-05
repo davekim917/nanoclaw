@@ -22,6 +22,13 @@ import {
 } from '../src/repository-migration.js';
 import { canonicalRepoDir, resolveRepositoryWorkUnit } from '../src/repository-workspaces.js';
 
+/**
+ * This integration case clones repositories, retries an interrupted migration,
+ * and rolls both back. #420 measured a 5 s timeout under host contention, so
+ * this case has a 30 s budget.
+ */
+const GIT_HEAVY_TEST_TIMEOUT_MS = 30_000;
+
 let root: string;
 let dataDir: string;
 
@@ -213,5 +220,5 @@ describe('nested repository migration topology', () => {
     expect(git(childCheckout, ['rev-parse', 'HEAD'])).toBe(childHead);
     expect(git(parentCheckout, ['status', '--porcelain=v1', '--untracked-files=all'])).toContain('parent-change.txt');
     expect(git(childCheckout, ['status', '--porcelain=v1', '--untracked-files=all'])).toContain('child-change.txt');
-  });
+  }, GIT_HEAVY_TEST_TIMEOUT_MS);
 });
