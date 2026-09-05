@@ -324,10 +324,11 @@ export async function main(): Promise<void> {
   // out and leave exactly the interrupted sessions unwarned. The skip set is
   // therefore a prediction of which containers survive, not an observation.
   //
-  // D1/E integration: survivable session ids from the boot-scope partition
-  // (seam4/d1, #440). Until that lands the boot stops every container, so the
-  // set is empty and every session marked running is treated as interrupted,
-  // exactly as before.
+  // D1 integration: `new Set(scope.survivableSessionIds)`, where `scope` is the
+  // partition `runBootMountQuiescence` passes through — `survivableSessionIds`
+  // plus its complement `mustStopSessionIds` (seam4/d1, #440). Until that lands
+  // the boot stops every container, so the set is empty and every session
+  // marked running is treated as interrupted, exactly as before.
   try {
     await warnMarkedRunningSessionsOfStartup('host startup after an unclean stop', new Set<string>());
   } catch (err) {
