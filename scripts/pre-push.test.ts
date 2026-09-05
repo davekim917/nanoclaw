@@ -114,6 +114,17 @@ printf 'lint|%s|%s|%s\\n' "$PWD" "$(cat src/gate.ts)" "$consumed" >> "$HOOK_LOG"
 [ "\${HOOK_FAIL:-}" != "lint:$(cat src/gate.ts)" ] || exit 1
 `,
   );
+  writeExecutable(
+    path.join(modules, 'tsc'),
+    `#!/bin/sh
+# The hook runs this twice per snapshot (--noEmit, then -p tsconfig.scripts.json);
+# only the first call is logged, so the count matches the other single-shot gates.
+[ "$1" = "--noEmit" ] || exit 0
+IFS= read -r consumed || true
+printf 'typecheck|%s|%s|%s\\n' "$PWD" "$(cat src/gate.ts)" "$consumed" >> "$HOOK_LOG"
+[ "\${HOOK_FAIL:-}" != "typecheck:$(cat src/gate.ts)" ] || exit 1
+`,
+  );
   const hooks = path.join(root, 'hooks');
   fs.mkdirSync(hooks);
   writeExecutable(path.join(hooks, 'post-checkout'), '#!/bin/sh\ntouch "$HOOK_POST_CHECKOUT"\n');
@@ -209,11 +220,11 @@ describe('.husky/pre-push', () => {
     );
 
     expect(result.status).toBe(0);
-    expect(records(f.log)).toHaveLength(6);
+    expect(records(f.log)).toHaveLength(8);
     expect(records(f.log).join('\n')).toContain('first-pushed');
     expect(records(f.log).join('\n')).toContain('second-pushed');
     expect(records(f.log).join('\n')).not.toContain('dirty-worktree');
-    const snapshotRecords = records(f.log).filter((record) => /^(boundary|lint)\|/.test(record));
+    const snapshotRecords = records(f.log).filter((record) => /^(boundary|lint|typecheck)\|/.test(record));
     expect(snapshotRecords.every((record) => record.endsWith('|'))).toBe(true);
     for (const record of snapshotRecords) {
       const snapshot = record.split('|')[1];
@@ -223,7 +234,7 @@ describe('.husky/pre-push', () => {
     expect(fs.existsSync(path.join(f.root, 'post-checkout-ran'))).toBe(false);
   });
 
-  it.each(['boundary', 'lint'] as const)('rejects a non-HEAD snapshot when %s finds a violation', (gate) => {
+  it.each(['boundary', 'lint', 'typecheck'] as const)('rejects a non-HEAD snapshot when %s finds a violation', (gate) => {
     const f = fixture();
     const rejected = commit(f.root, 'rejected-push');
     runGit(f.root, ['branch', 'rejected-push', rejected]);
@@ -237,7 +248,7 @@ describe('.husky/pre-push', () => {
     expect(records(f.log).join('\n')).toContain('rejected-push');
     expect(records(f.log).join('\n')).not.toContain('clean-head');
     expect(records(f.log).join('\n')).not.toContain('dirty-clean');
-    expect(records(f.log)).toHaveLength(gate === 'boundary' ? 2 : 3);
+    expect(records(f.log)).toHaveLength(gate === 'boundary' ? 2 : gate === 'lint' ? 3 : 4);
     const snapshot = records(f.log)
       .find((record) => record.startsWith('boundary|'))
       ?.split('|')[1];
@@ -279,7 +290,7 @@ describe('.husky/pre-push', () => {
     );
 
     expect(result.status).toBe(0);
-    expect(records(f.log).filter((record) => record.includes('shared-push'))).toHaveLength(2);
+    expect(records(f.log).filter((record) => record.includes('shared-push'))).toHaveLength(3);
   });
 
   it('gates local-only history on a new ref against live advertised tips', () => {
