@@ -391,7 +391,7 @@
 "docs/build-and-runtime.md":{"diff":93,"mode":"100644","sha256":"25348ba0d2df36781ddc91b1fd7e48e3038ee2574d2cf15a606f9d8373607f48"},
 "docs/central-db-async-migration.md":{"diff":115,"mode":"100644","sha256":null,"deleted":true},
 "docs/customizing.md":{"diff":5,"mode":"100644","sha256":"083ca14d07136bd2c8a5c3a630fc123ffb33e86ef9e554065bd4cfa2f433bed7"},
-"docs/db-central.md":{"diff":125,"mode":"100644","sha256":"136c1350cb300bd752e0a4cab024175fcd576cebe965cfe49e0f14b77fce2201"},
+"docs/db-central.md":{"diff":125,"mode":"100644","sha256":"996b5cf48a1ee4af2d4b743ad08c4cdcd2c0500ad822488e320ae2fb0b238340"},
 "docs/db-session.md":{"diff":84,"mode":"100644","sha256":"5931edf9846bbb889f6d7471881f14634168507475ac662c20f8e6bc8d14e4c7"},
 "docs/db.md":{"diff":19,"mode":"100644","sha256":"20b5546dae2c92b3e6f6726f46ecd41ecbb4f9b9296b7727c39c04837a6250d1"},
 "docs/hardened-image.md":{"diff":231,"mode":"100644","sha256":null,"deleted":true},
