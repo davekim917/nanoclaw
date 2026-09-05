@@ -122,7 +122,13 @@ export async function requestSenderApproval(input: RequestSenderApprovalInput): 
   // back cross-workspace to a different surface where the same owner
   // happens to be registered. If nobody on this channel_type can be
   // notified, no row is created and a future message can try again.
-  const target = await pickApprovalDelivery(approvers, originChannelType, { sameChannelTypeOnly: true });
+  //
+  // `instance` so a cold DM row created for this delivery is stamped with
+  // the origin's adapter instance — see the comment on the deliver call below.
+  const target = await pickApprovalDelivery(approvers, originChannelType, {
+    sameChannelTypeOnly: true,
+    instance: originMg?.instance ?? event.instance,
+  });
   if (!target) {
     log.warn('Unknown-sender approval skipped — no in-workspace approver reachable on origin channel_type', {
       messagingGroupId,
@@ -171,6 +177,9 @@ export async function requestSenderApproval(input: RequestSenderApprovalInput): 
   }
 
   try {
+    // Instance-addressed: `target.messagingGroup.instance` is the exact
+    // adapter instance `pickApprovalDelivery` resolved this DM on — see the
+    // comment above.
     await adapter.deliver(
       target.messagingGroup.channel_type,
       target.messagingGroup.platform_id,
@@ -183,6 +192,8 @@ export async function requestSenderApproval(input: RequestSenderApprovalInput): 
         question,
         options,
       }),
+      undefined,
+      target.messagingGroup.instance,
     );
     log.info('Unknown-sender approval card delivered', {
       approvalId,

@@ -318,7 +318,14 @@ export async function requestChannelApproval(input: RequestChannelApprovalInput)
   // there. The dropped_messages row written by the router (reason
   // 'no_agent_wired') already preserves operator visibility; the owner
   // can review pending registrations via the dashboard.
-  const delivery = await pickApprovalDelivery(approvers, originChannelType, { sameChannelTypeOnly: true });
+  //
+  // `instance` so a cold DM row created for this delivery is stamped with
+  // the origin's adapter instance, not the bare channel_type — see the
+  // comment on the `adapter.deliver` call below.
+  const delivery = await pickApprovalDelivery(approvers, originChannelType, {
+    sameChannelTypeOnly: true,
+    instance: originMg?.instance ?? event.instance,
+  });
   if (!delivery) {
     log.warn('Channel registration skipped — no in-workspace approver reachable on origin channel_type', {
       messagingGroupId,
@@ -375,6 +382,10 @@ export async function requestChannelApproval(input: RequestChannelApprovalInput)
   }
 
   try {
+    // Instance-addressed: `delivery.messagingGroup.instance` is the exact
+    // adapter instance `pickApprovalDelivery` resolved this DM on. Without
+    // it, an install whose bots are all named instances resolves no adapter
+    // under the bare channel_type, or the wrong sibling bot answers.
     await adapter.deliver(
       delivery.messagingGroup.channel_type,
       delivery.messagingGroup.platform_id,
@@ -387,6 +398,8 @@ export async function requestChannelApproval(input: RequestChannelApprovalInput)
         question,
         options,
       }),
+      undefined,
+      delivery.messagingGroup.instance,
     );
     log.info('Channel registration card delivered', {
       messagingGroupId,
