@@ -56,7 +56,11 @@ async function readBounded(stream: StdinJsonStream): Promise<string> {
     chunks.push(buffer);
   }
 
-  return Buffer.concat(chunks, byteLength).toString('utf8');
+  try {
+    return new TextDecoder('utf-8', { fatal: true }).decode(Buffer.concat(chunks, byteLength));
+  } catch (err) {
+    throw new StdinJsonInputError('--stdin-json input is not valid UTF-8', { cause: err });
+  }
 }
 
 /** Parse the input, requiring exactly one JSON object — not an array, scalar, or null. */

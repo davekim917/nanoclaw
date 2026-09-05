@@ -32,7 +32,7 @@ function childEnv(): NodeJS.ProcessEnv {
   return env;
 }
 
-function runClient(input: string) {
+function runClient(input: string | Uint8Array) {
   return spawnSync(
     process.execPath,
     ['--import', 'tsx', 'src/cli/client.ts', 'groups', 'list', '--stdin-json'],
@@ -68,5 +68,13 @@ describe('host CLI --stdin-json entry point', () => {
     expect(result.status).toBe(2);
     expect(result.stdout).toBe('');
     expect(result.stderr).toBe(`ncl: ${expectedError}\n`);
+  });
+
+  it('exits 2 for invalid UTF-8 instead of replacing malformed bytes', () => {
+    const result = runClient(Buffer.concat([Buffer.from('{"value":"'), Buffer.from([0xc3]), Buffer.from('"}')]));
+
+    expect(result.status).toBe(2);
+    expect(result.stdout).toBe('');
+    expect(result.stderr).toBe('ncl: --stdin-json input is not valid UTF-8\n');
   });
 });
