@@ -473,6 +473,17 @@ export async function main(): Promise<void> {
     log.info('Host instance lease started', { instanceId: hostInstanceId, ttlMs: HOST_LEASE_TTL_MS });
   }
 
+  // 1-b. Start the `ncl` CLI socket server (data/ncl.sock) before anything
+  // below can spawn or stop a container. startCliServer() refuses to steal
+  // a socket a live host is already serving on (src/cli/socket-server.ts),
+  // and that refusal is only useful this early: cleanupOrphansStrict() a few
+  // steps down (inside runWorkgroupMemoryStartupGate) stops every
+  // install-scoped container on the assumption that this is the sole live
+  // host, and channel adapters + delivery polls start later still. A second
+  // host process must be caught and exited before any of that runs, not
+  // after (PR review finding on the theme-T2 socket single-bind port).
+  await startCliServer();
+
   // 1-0. Materialize the archive schema before ANY service that can spawn.
   //
   // `archive_row_marks` and its triggers are created by the archive's lazy
@@ -805,9 +816,6 @@ export async function main(): Promise<void> {
   startDiscordSlashCommands().catch((err) => {
     log.error('Discord slash commands failed to start', { err });
   });
-
-  // 13. Start the `ncl` CLI socket server (data/ncl.sock).
-  await startCliServer();
 
   // Startup completed — the deploy that produced this build is good; disarm
   // the crash-loop rollback guard.

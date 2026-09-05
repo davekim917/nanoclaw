@@ -19,6 +19,14 @@ let server: net.Server | null = null;
 
 const PROBE_TIMEOUT_MS = 1000;
 
+// Bounded retries for the bind race below (PR #453 review): a concurrent
+// second host process can win the gap between our probe and our bind, so we
+// must be able to re-probe and retry a few times rather than assume our own
+// stale verdict is still true by the time we act on it. Five is generous for
+// a race that, if it recurs every attempt, means something is persistently
+// recreating the path — not worth retrying forever.
+const MAX_BIND_ATTEMPTS = 5;
+
 /**
  * Is a live server accepting on this socket path? Used before stale-socket
  * cleanup so a second host started in the same checkout refuses to take over
@@ -39,32 +47,14 @@ function probeLiveServer(socketPath: string): Promise<boolean> {
   });
 }
 
-export async function startCliServer(socketPath: string = DEFAULT_SOCKET_PATH): Promise<void> {
-  // Stale-socket cleanup — a previous run that crashed may have left the
-  // file behind, and net.createServer refuses to bind to an existing path.
-  // Only a socket nobody answers is stale: a live listener means another
-  // host instance owns this path, and startup must fail rather than steal it.
-  if (fs.existsSync(socketPath)) {
-    if (await probeLiveServer(socketPath)) {
-      throw new Error(
-        `another host instance is already serving ncl at ${socketPath} — ` +
-          `refusing to take over its socket. Stop the other instance ` +
-          `(or remove the file if you are certain none is running) and restart.`,
-      );
-    }
-    try {
-      fs.unlinkSync(socketPath);
-    } catch (err) {
-      const e = err as NodeJS.ErrnoException;
-      if (e.code !== 'ENOENT') {
-        log.warn('Failed to unlink stale ncl socket (will try to bind anyway)', { socketPath, err });
-      }
-    }
-  }
-
-  const s = net.createServer((conn) => handleConnection(conn));
-  server = s;
-  await new Promise<void>((resolve, reject) => {
+/**
+ * Bind and listen, once. Rejects with the raw `EADDRINUSE` error when the
+ * path is occupied — by a live listener or a stale leftover file, either
+ * way `bind(2)` cannot tell the difference and neither can we without a
+ * separate probe.
+ */
+function bindOnce(s: net.Server, socketPath: string): Promise<void> {
+  return new Promise((resolve, reject) => {
     s.once('error', reject);
     s.listen(socketPath, () => {
       try {
@@ -76,6 +66,56 @@ export async function startCliServer(socketPath: string = DEFAULT_SOCKET_PATH): 
       resolve();
     });
   });
+}
+
+export async function startCliServer(socketPath: string = DEFAULT_SOCKET_PATH): Promise<void> {
+  for (let attempt = 1; ; attempt++) {
+    const s = net.createServer((conn) => handleConnection(conn));
+    try {
+      await bindOnce(s, socketPath);
+      server = s;
+      return;
+    } catch (err) {
+      s.close();
+      const e = err as NodeJS.ErrnoException;
+      if (e.code !== 'EADDRINUSE') throw err;
+
+      // The path is occupied. Re-probe fresh on THIS attempt rather than
+      // trusting an earlier verdict — the check-then-act gap between a
+      // probe and an unlink is exactly where a concurrent second host
+      // process can win the race (PR #453 review, reproduced with two
+      // Node processes racing this same sequence): treating the bind's own
+      // EADDRINUSE as the trigger to re-probe, instead of unlinking once
+      // up front and never looking again, is what closes that window. A
+      // live listener still means refuse, unconditionally.
+      if (await probeLiveServer(socketPath)) {
+        throw new Error(
+          `another host instance is already serving ncl at ${socketPath} — ` +
+            `refusing to take over its socket. Stop the other instance ` +
+            `(or remove the file if you are certain none is running) and restart.`,
+          { cause: err },
+        );
+      }
+      if (attempt >= MAX_BIND_ATTEMPTS) {
+        throw new Error(
+          `could not bind ${socketPath} after ${MAX_BIND_ATTEMPTS} attempts — ` +
+            `the path keeps coming back stale-but-occupied, which points at ` +
+            `something other than an ordinary crash leftover.`,
+          { cause: err },
+        );
+      }
+      try {
+        fs.unlinkSync(socketPath);
+      } catch (unlinkErr) {
+        const ue = unlinkErr as NodeJS.ErrnoException;
+        if (ue.code !== 'ENOENT') {
+          log.warn('Failed to unlink stale ncl socket (will try to bind anyway)', { socketPath, err: unlinkErr });
+        }
+      }
+      // Loop and retry the bind — the next iteration re-probes before
+      // acting again, so a competitor that won this round is caught then.
+    }
+  }
 }
 
 export async function stopCliServer(): Promise<void> {
