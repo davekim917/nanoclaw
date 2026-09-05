@@ -91,11 +91,17 @@ function container(name: string, workgroupId: string | null): InstallContainerSc
  *
  * `stubborn` models a container that does not go away. `arrivesLate` models one
  * that appears BETWEEN the two listings — another host, or a spawn racing the
- * boot. `failStopOf` models a stop that throws.
+ * boot. `failStopOf` models a stop that throws. `failListCall` models a docker
+ * that goes away part way through the pass.
  */
 function fakeRuntime(
   initial: InstallContainerScope[],
-  opts: { stubborn?: string[]; arrivesLate?: InstallContainerScope; failStopOf?: string } = {},
+  opts: {
+    stubborn?: string[];
+    arrivesLate?: InstallContainerScope;
+    failStopOf?: string;
+    failListCall?: number;
+  } = {},
 ) {
   let running = [...initial];
   const stops: string[] = [];
@@ -106,6 +112,9 @@ function fakeRuntime(
     listings,
     list: (): InstallContainerScope[] => {
       calls += 1;
+      if (opts.failListCall === calls) {
+        throw new Error('Cannot prove install-scoped container absence: runtime listing failed');
+      }
       if (calls > 1 && opts.arrivesLate && !running.some((e) => e.name === opts.arrivesLate!.name)) {
         running = [...running, opts.arrivesLate];
       }
@@ -242,6 +251,41 @@ describe('quiesceWorkgroupsForBootMountChange', () => {
     // Nothing was interrupted, so the caller must NOT write an accountability
     // note — a false "your container was stopped" is its own bug.
     expect(error).not.toBeInstanceOf(BootQuiescencePartialStopError);
+    expect(spawns).toEqual([]);
+  });
+
+  it('a post-stop listing failure carries the names it already stopped', async () => {
+    // Docker going away AFTER the stops is still a failure with real
+    // casualties: those sessions lost their container, and the caller has to
+    // announce it. A plain Error here would look identical to "nothing was
+    // touched" and the accountability note would be skipped.
+    const runtime = fakeRuntime([container('nanoclaw-v2-a-1', 'wg-a'), container('nanoclaw-v2-b-1', 'wg-b')], {
+      failListCall: 2,
+    });
+
+    const error: unknown = await quiesceWorkgroupsForBootMountChange(['wg-a', 'wg-b'], runtime).then(
+      () => null,
+      (err: unknown) => err,
+    );
+
+    expect(error).toBeInstanceOf(BootQuiescencePartialStopError);
+    const partial = error as BootQuiescencePartialStopError;
+    expect(partial.message).toMatch(/prove install-scoped container absence: post-stop runtime listing failed/);
+    expect(partial.stoppedNames).toEqual(['nanoclaw-v2-a-1', 'nanoclaw-v2-b-1']);
+    expect(log.info).not.toHaveBeenCalledWith('Boot quiescence scope', expect.anything());
+    expect(spawns).toEqual([]);
+  });
+
+  it('a proof failure carries the names it already stopped', async () => {
+    const runtime = fakeRuntime([container('nanoclaw-v2-a-1', 'wg-a')], { stubborn: ['nanoclaw-v2-a-1'] });
+
+    const error: unknown = await quiesceWorkgroupsForBootMountChange(['wg-a'], runtime).then(
+      () => null,
+      (err: unknown) => err,
+    );
+
+    expect(error).toBeInstanceOf(BootQuiescencePartialStopError);
+    expect((error as BootQuiescencePartialStopError).stoppedNames).toEqual(['nanoclaw-v2-a-1']);
     expect(spawns).toEqual([]);
   });
 

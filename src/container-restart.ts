@@ -583,7 +583,22 @@ export async function quiesceWorkgroupsForBootMountChange(
   // second inventory shows as still in scope, recomputed from THEIR OWN labels
   // (null workgroup, or a workgroup in `changed`) — never from the first
   // listing's names, for the same reason.
-  const remaining = list();
+  //
+  // Every failure from here down carries `stopped`: once a container is gone
+  // its session lost its turn, and the caller must write the accountability
+  // note whether the pass failed on the stop, on this listing, or on the proof
+  // itself. A listing that throws is not "none running" — that is the whole
+  // fail-closed contract — but it is also not "nothing was interrupted".
+  let remaining: InstallContainerScope[];
+  try {
+    remaining = list();
+  } catch (err) {
+    throw new BootQuiescencePartialStopError(
+      'Cannot prove install-scoped container absence: post-stop runtime listing failed',
+      stopped,
+      { cause: err },
+    );
+  }
   if (remaining.length > 0) {
     throw new BootQuiescencePartialStopError(
       `Install-scoped containers still running after boot quiescence: ${remaining.map((e) => e.name).join(', ')}`,

@@ -122,12 +122,19 @@ function hashTree(rootDir: string): string {
   return lines.join('\n');
 }
 
-function fakeRuntime(initial: InstallContainerScope[], failStopOf?: string) {
+function fakeRuntime(initial: InstallContainerScope[], failStopOf?: string, failListCall?: number) {
   let running = [...initial];
   const stops: string[] = [];
+  let calls = 0;
   return {
     stops,
-    list: (): InstallContainerScope[] => [...running],
+    list: (): InstallContainerScope[] => {
+      calls += 1;
+      if (failListCall === calls) {
+        throw new Error('Cannot prove install-scoped container absence: runtime listing failed');
+      }
+      return [...running];
+    },
     stop: (name: string): void => {
       if (failStopOf === name) throw new Error(`docker stop ${name}: no such container`);
       stops.push(name);
@@ -337,6 +344,49 @@ describe('boot mount-change ordering', () => {
     ).rejects.toBeInstanceOf(BootQuiescencePartialStopError);
 
     expect(runtime.stops).toEqual(['nanoclaw-v2-a-1']);
+    expect(calls).toEqual(['warn']);
+    db.close();
+  });
+
+  it('a post-stop listing failure still writes the host-restart note before rethrowing', async () => {
+    // The stops all took; docker went away before the proof. The containers
+    // are gone either way, so the sessions get their note and the failure
+    // still stops startup ahead of every reconcile.
+    const db = makeDb();
+    const calls: string[] = [];
+    const runtime = fakeRuntime(
+      [
+        { name: 'nanoclaw-v2-a-1', workgroupId: 'wgx', sessionId: 's1', groupId: 'g1' },
+        { name: 'nanoclaw-v2-b-1', workgroupId: 'wg-other', sessionId: 's2', groupId: 'g2' },
+      ],
+      undefined,
+      2,
+    );
+
+    await expect(
+      runBootMountQuiescence(db, {
+        workgroupIds: () => ['wgx'],
+        memoryWouldChange: () => true,
+        sharedWouldChange: () => false,
+        sharedFsEnabled: true,
+        quiesce: (changed) => quiesceWorkgroupsForBootMountChange(changed, runtime),
+        warnStartup: async () => {
+          calls.push('warn');
+        },
+        reconcileShared: () => {
+          calls.push('reconcileWorkgroupSharedDirs');
+        },
+        memoryGate: () => {
+          calls.push('reconcileWorkgroupMemory');
+          return [];
+        },
+        prune: () => {
+          calls.push('pruneAgentRunnerSnapshots');
+        },
+      }),
+    ).rejects.toBeInstanceOf(BootQuiescencePartialStopError);
+
+    expect(runtime.stops).toEqual(['nanoclaw-v2-a-1', 'nanoclaw-v2-b-1']);
     expect(calls).toEqual(['warn']);
     db.close();
   });
