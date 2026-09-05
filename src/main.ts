@@ -476,8 +476,8 @@ export async function main(): Promise<void> {
   // 1-b. Start the `ncl` CLI socket server (data/ncl.sock) before anything
   // below can spawn or stop a container. startCliServer() refuses to steal
   // a socket a live host is already serving on (src/cli/socket-server.ts),
-  // and that refusal is only useful this early: cleanupOrphansStrict() a few
-  // steps down (inside runWorkgroupMemoryStartupGate) stops every
+  // and that refusal is only useful this early: runBootMountQuiescence()
+  // below calls quiesceWorkgroupsForBootMountChange(), which stops every
   // install-scoped container on the assumption that this is the sole live
   // host, and channel adapters + delivery polls start later still. A second
   // host process must be caught and exited before any of that runs, not
