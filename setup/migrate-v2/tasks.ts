@@ -167,7 +167,7 @@ async function main(): Promise<void> {
         continue;
       }
 
-      const { session } = resolveSession(ag.id, mg.id, null, 'shared');
+      const { session } = await resolveSession(ag.id, mg.id, null, 'shared');
       const inboxDb = openInboundDb(inboundDbPath(ag.id, session.id));
       try {
         // What the removed session-manager wrapper did on every open.

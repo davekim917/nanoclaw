@@ -197,10 +197,12 @@ import {
   registerMessageInterceptor,
   isSlackChannelType,
   isDiscordChannelType,
+  autoCreateMessagingGroup,
 } from './router.js';
 import {
   getMessagingGroupWithAgentCount,
   getMessagingGroupAgents,
+  createMessagingGroup,
   createMessagingGroupAgent,
 } from './db/messaging-groups.js';
 import { getRawDb } from './db/connection.js';
@@ -1090,5 +1092,41 @@ describe('router notices survive a session whose inbound.db is gone', () => {
     await routeAs('/clear');
 
     expect(outboundSessionWrite).not.toHaveBeenCalled();
+  });
+});
+
+describe('autoCreateMessagingGroup (seam 3: the lookup yields before the insert)', () => {
+  const candidate: MessagingGroup = {
+    id: 'mg-loser',
+    channel_type: 'slack',
+    platform_id: 'slack:C-RACE',
+    instance: 'slack',
+    name: null,
+    is_group: 1,
+    unknown_sender_policy: 'public',
+    denied_at: null,
+    created_at: new Date().toISOString(),
+  } as MessagingGroup;
+
+  it('adopts the row a concurrent route won with instead of aborting on the unique key', async () => {
+    const winner = { ...candidate, id: 'mg-winner' };
+    vi.mocked(createMessagingGroup).mockRejectedValueOnce(
+      Object.assign(
+        new Error('UNIQUE constraint failed: messaging_groups.channel_type, messaging_groups.platform_id'),
+        {
+          code: 'SQLITE_CONSTRAINT_UNIQUE',
+        },
+      ),
+    );
+    vi.mocked(getMessagingGroupWithAgentCount).mockResolvedValueOnce({ mg: winner, agentCount: 2 });
+
+    await expect(autoCreateMessagingGroup(candidate, 'slack')).resolves.toEqual({ mg: winner, agentCount: 2 });
+  });
+
+  it('rethrows anything that is not the unique-key loss', async () => {
+    vi.mocked(createMessagingGroup).mockRejectedValueOnce(
+      Object.assign(new Error('disk I/O'), { code: 'SQLITE_IOERR' }),
+    );
+    await expect(autoCreateMessagingGroup(candidate, 'slack')).rejects.toThrow('disk I/O');
   });
 });

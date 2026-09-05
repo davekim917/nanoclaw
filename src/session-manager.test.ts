@@ -2541,3 +2541,45 @@ describe('mailbox seam: ingress writes', () => {
     fs.rmSync(sessionDir(AG_ING, 'sess-ingress-other'), { recursive: true, force: true });
   });
 });
+
+describe('resolveSession under two concurrent first messages (seam 3: the lookup yields)', () => {
+  const AG_RACE = 'ag-race';
+  const MG_RACE = 'mg-race';
+
+  beforeEach(async () => {
+    await initTestDb();
+    runMigrations(getRawDb());
+    await createAgentGroup({
+      id: AG_RACE,
+      name: 'Race',
+      folder: 'race',
+      agent_provider: null,
+      created_at: new Date().toISOString(),
+    });
+    getRawDb()
+      .prepare(
+        `INSERT INTO messaging_groups (id, channel_type, platform_id, instance, name, is_group, unknown_sender_policy, denied_at, created_at)
+         VALUES (?, 'slack', 'slack:C-RACE', 'slack', NULL, 1, 'public', NULL, ?)`,
+      )
+      .run(MG_RACE, new Date().toISOString());
+  });
+  afterEach(async () => {
+    await closeDb();
+  });
+
+  it('both callers end up on the ONE session the unique index let win', async () => {
+    const { resolveSession } = await import('./session-manager.js');
+    const [a, b] = await Promise.all([
+      resolveSession(AG_RACE, MG_RACE, null, 'shared'),
+      resolveSession(AG_RACE, MG_RACE, null, 'shared'),
+    ]);
+    expect(a.session.id).toBe(b.session.id);
+    expect([a.created, b.created].filter(Boolean)).toHaveLength(1);
+    const rows = getRawDb()
+      .prepare(
+        `SELECT COUNT(*) AS n FROM sessions WHERE agent_group_id = ? AND messaging_group_id = ? AND status = 'active'`,
+      )
+      .get(AG_RACE, MG_RACE) as { n: number };
+    expect(rows.n).toBe(1);
+  });
+});

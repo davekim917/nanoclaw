@@ -119,7 +119,7 @@ async function main(): Promise<void> {
     // Create a session for each messaging group (v1 had one session per
     // folder, v2 has one per agent_group + messaging_group pair)
     for (const mg of messagingGroups) {
-      const { session, created } = resolveSession(ag.id, mg.id, null, 'shared');
+      const { session, created } = await resolveSession(ag.id, mg.id, null, 'shared');
 
       if (created) {
         // Write routing so the container knows where to reply. AWAITED:
@@ -171,7 +171,7 @@ async function main(): Promise<void> {
           // Write into each v2 session's outbound.db for this agent group
           const sessions = await getMessagingGroupsByAgentGroup(ag.id);
           for (const mg of sessions) {
-            const { session } = resolveSession(ag.id, mg.id, null, 'shared');
+            const { session } = await resolveSession(ag.id, mg.id, null, 'shared');
             const obPath = outboundDbPath(ag.id, session.id);
             if (fs.existsSync(obPath)) {
               const ob = new Database(obPath);

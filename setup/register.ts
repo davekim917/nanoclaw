@@ -297,7 +297,7 @@ export async function run(args: string[]): Promise<void> {
 
   // 4. Send onboarding message — only on first wiring, not re-registration
   if (newlyWired) {
-    const { session } = resolveSession(
+    const { session } = await resolveSession(
       agentGroup.id,
       messagingGroup.id,
       null,

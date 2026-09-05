@@ -473,10 +473,16 @@ async function getTask(args: Record<string, unknown>, ctx: CallerContext) {
         origin_session_id: content.originSessionId,
         completed_runs: stats.runs,
         failed_runs: stats.failed_runs,
-        recent_log: tailRunLog(session.agent_group_id, seriesKey),
+        seriesKey,
       };
     });
-    if (found) return found;
+    if (found) {
+      // Read after the mailbox action: the log lives on disk and its lookup
+      // goes through the async agent-groups leaf, so it cannot sit inside
+      // the synchronous callback.
+      const { seriesKey, ...output } = found;
+      return { ...output, recent_log: await tailRunLog(session.agent_group_id, seriesKey) };
+    }
   }
   throw new Error(`task not found: ${id}`);
 }

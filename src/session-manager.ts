@@ -377,7 +377,23 @@ export async function resolveSession(
     created_at: new Date().toISOString(),
   };
 
-  await createSession(session);
+  try {
+    await createSession(session);
+  } catch (err) {
+    // The lookup above yields (async driver), so two concurrent first messages
+    // for the same target can both see no session and both insert; the unique
+    // active-session index lets exactly one win. Re-resolve to the winner —
+    // the same shape as `resolveActiveSession` in db/scheduled-tasks.ts.
+    if ((err as { code?: string }).code !== 'SQLITE_CONSTRAINT_UNIQUE') throw err;
+    const winner =
+      sessionMode === 'agent-shared'
+        ? await findSessionByAgentGroup(agentGroupId)
+        : messagingGroupId
+          ? await findSessionForAgent(agentGroupId, messagingGroupId, sessionMode === 'shared' ? null : threadId)
+          : undefined;
+    if (winner) return { session: winner, created: false };
+    throw err;
+  }
   initSessionFolder(agentGroupId, id);
   log.info('Session created', {
     id,

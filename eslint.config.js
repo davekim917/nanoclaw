@@ -1,7 +1,7 @@
-import globals from 'globals'
-import pluginJs from '@eslint/js'
-import tseslint from 'typescript-eslint'
-import noCatchAll from 'eslint-plugin-no-catch-all'
+import globals from 'globals';
+import pluginJs from '@eslint/js';
+import tseslint from 'typescript-eslint';
+import noCatchAll from 'eslint-plugin-no-catch-all';
 
 export default [
   { ignores: ['node_modules/', 'dist/', 'container/', 'groups/'] },
@@ -43,8 +43,13 @@ export default [
     },
     rules: {
       '@typescript-eslint/no-floating-promises': 'error',
-      '@typescript-eslint/no-misused-promises': 'error',
+      // checksSpreads: `{ ...buildX() }` of a now-async builder spreads nothing;
+      // the seam-3 conversion hit exactly that in the recall row.
+      '@typescript-eslint/no-misused-promises': [
+        'error',
+        { checksConditionals: true, checksVoidReturn: true, checksSpreads: true },
+      ],
       '@typescript-eslint/await-thenable': 'error',
     },
   },
-]
+];

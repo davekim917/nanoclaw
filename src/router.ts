@@ -296,6 +296,30 @@ export function setAccessGate(fn: AccessGateFn): void {
  * so subsequent messages resolve via the normal path; returning an empty
  * array falls through to the standard "no agent wired" drop.
  */
+/**
+ * Insert the auto-created messaging group, or adopt the row a concurrent route
+ * won with. The lookup above yields (async driver), so two addressed messages
+ * for a never-seen channel can both see no row and both insert on the same
+ * `(channel_type, platform_id, instance)` unique key; the loser re-reads the
+ * winner instead of aborting its route — the same shape as
+ * `resolveActiveSession` in db/scheduled-tasks.ts. Exported for its test.
+ */
+export async function autoCreateMessagingGroup(
+  mg: MessagingGroup,
+  instance: string,
+): Promise<{ mg: MessagingGroup; agentCount: number }> {
+  try {
+    await createMessagingGroup(mg);
+  } catch (err) {
+    if ((err as { code?: string }).code !== 'SQLITE_CONSTRAINT_UNIQUE') throw err;
+    const winner = await getMessagingGroupWithAgentCount(mg.channel_type, mg.platform_id, instance);
+    if (winner) return winner;
+    throw err;
+  }
+  log.info('Auto-created messaging group', { id: mg.id, channelType: mg.channel_type, platformId: mg.platform_id });
+  return { mg, agentCount: 0 };
+}
+
 export type UnwiredChannelResolverFn = (
   event: InboundEvent,
   mg: MessagingGroup,
@@ -565,13 +589,9 @@ async function routeInboundClaimed(event: InboundEvent, markReplayPending: () =>
       denied_at: null,
       created_at: new Date().toISOString(),
     };
-    await createMessagingGroup(mg);
-    log.info('Auto-created messaging group', {
-      id: mgId,
-      channelType: event.channelType,
-      platformId: event.platformId,
-    });
-    agentCount = 0;
+    const created = await autoCreateMessagingGroup(mg, event.instance ?? event.channelType);
+    mg = created.mg;
+    agentCount = created.agentCount;
   } else {
     mg = found.mg;
     agentCount = found.agentCount;

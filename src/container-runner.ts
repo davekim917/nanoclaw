@@ -1292,7 +1292,7 @@ async function spawnContainer(
   // (which has none by construction) this resolves the series' delivery
   // destination so the gate judges WHERE THE TASK POSTS instead of
   // fail-closing on null. See resolveSlackSafetyMessagingGroupId.
-  writeCapabilitiesSnapshot(agentGroup.id, session.id, slackSafetyMessagingGroupId);
+  await writeCapabilitiesSnapshot(agentGroup.id, session.id, slackSafetyMessagingGroupId);
 
   log.info('Spawning container', { sessionId: session.id, agentGroup: agentGroup.name, containerName });
 
@@ -2027,15 +2027,28 @@ function resolveGcpServiceAccountKey(credentialFolder: string): string | null {
  * every container spawn. Container's get_capabilities MCP tool reads
  * this JSON directly — no round-trip, always fresh per spawn.
  */
-function writeCapabilitiesSnapshot(
+/**
+ * The snapshot's bytes, rendered from the AWAITED capabilities. Split out so a
+ * test can prove the await: `JSON.stringify` of a Promise is `{}` and no lint
+ * rule sees it (seam-3 async-hazard class), so the proof is behavioural.
+ */
+export async function renderCapabilitiesSnapshot(
+  agentGroupId: string,
+  sessionMessagingGroupId: string | null,
+): Promise<string> {
+  const caps = await getHostCapabilities(agentGroupId, sessionMessagingGroupId);
+  return JSON.stringify(caps, null, 2) + '\n';
+}
+
+async function writeCapabilitiesSnapshot(
   agentGroupId: string,
   sessionId: string,
   sessionMessagingGroupId: string | null,
-): void {
+): Promise<void> {
   try {
-    const caps = getHostCapabilities(agentGroupId, sessionMessagingGroupId);
+    const rendered = await renderCapabilitiesSnapshot(agentGroupId, sessionMessagingGroupId);
     const outPath = path.join(sessionDir(agentGroupId, sessionId), 'capabilities.json');
-    fs.writeFileSync(outPath, JSON.stringify(caps, null, 2) + '\n');
+    fs.writeFileSync(outPath, rendered);
   } catch (err) {
     log.warn('Failed to write capabilities snapshot', { err });
   }
