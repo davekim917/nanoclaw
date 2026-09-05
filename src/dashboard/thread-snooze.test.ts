@@ -93,7 +93,7 @@ describe('the endpoints', () => {
     expect(res!.status).toBe(200);
     expect(((await res!.json()) as { snoozed_at_activity: string | null }).snoozed_at_activity).toBe(iso(60_000));
 
-    const map = readThreadSnoozes('u1', ['slack:CTESTCHAN01:1700000000.11']);
+    const map = await readThreadSnoozes('u1', ['slack:CTESTCHAN01:1700000000.11']);
     expect(isSnoozed(map.get('slack:CTESTCHAN01:1700000000.11'), iso(60_000))).toBe(true);
     // …and once the thread moves, the same row stops hiding it.
     expect(isSnoozed(map.get('slack:CTESTCHAN01:1700000000.11'), iso(0))).toBe(false);
@@ -136,7 +136,7 @@ describe('the endpoints', () => {
   it('is per user — one operator’s snooze is invisible to another', async () => {
     seedSession('s-1', 'ag-1', 'slack:CTESTCHAN01:1700000000.11', iso(60_000));
     await threadSnoozeHandler(post(), { id: 'slack:CTESTCHAN01:1700000000.11' }, ctx({ userId: 'u1' }));
-    expect(readThreadSnoozes('u2', ['slack:CTESTCHAN01:1700000000.11']).size).toBe(0);
+    expect((await readThreadSnoozes('u2', ['slack:CTESTCHAN01:1700000000.11'])).size).toBe(0);
   });
 
   it('un-snoozes', async () => {
@@ -144,7 +144,7 @@ describe('the endpoints', () => {
     await threadSnoozeHandler(post(), { id: 'slack:CTESTCHAN01:1700000000.11' }, ctx());
     const res = await threadUnsnoozeHandler(post(), { id: 'slack:CTESTCHAN01:1700000000.11' }, ctx());
     expect(res!.status).toBe(200);
-    expect(readThreadSnoozes('u1', ['slack:CTESTCHAN01:1700000000.11']).size).toBe(0);
+    expect((await readThreadSnoozes('u1', ['slack:CTESTCHAN01:1700000000.11'])).size).toBe(0);
   });
 
   it('addresses a session with no platform thread by its synthetic key', async () => {
@@ -157,7 +157,7 @@ describe('the endpoints', () => {
     seedSession('s-1', 'ag-1', 'slack:CTESTCHAN01:1700000000.11', iso(60_000));
     const res = await threadSnoozeHandler(post(), { id: encodeURIComponent('slack:CTESTCHAN01:1700000000.11') }, ctx());
     expect(res!.status).toBe(200);
-    expect(readThreadSnoozes('u1', ['slack:CTESTCHAN01:1700000000.11']).size).toBe(1);
+    expect((await readThreadSnoozes('u1', ['slack:CTESTCHAN01:1700000000.11'])).size).toBe(1);
   });
 
   it('404s a caller who can see the thread but holds no admin privilege', async () => {
@@ -205,7 +205,7 @@ describe('the endpoints', () => {
 });
 
 describe('readThreadSnoozes', () => {
-  it('asks for nothing when the page is empty', () => {
-    expect(readThreadSnoozes('u1', []).size).toBe(0);
+  it('asks for nothing when the page is empty', async () => {
+    expect((await readThreadSnoozes('u1', [])).size).toBe(0);
   });
 });

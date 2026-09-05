@@ -1577,7 +1577,7 @@ export async function buildThreadList(
   // parameter the query could never match. Attention rows report `snoozed:
   // false` below for the same reason, and the console does not offer the verb
   // on them (`isOwnerlessItem` in the triage panel and the detail actions).
-  const snoozes = readThreadSnoozes(
+  const snoozes = await readThreadSnoozes(
     ctx.user.id,
     grouped.map((t) => t.threadId),
   );
