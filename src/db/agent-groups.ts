@@ -12,11 +12,29 @@ import { getDb } from './connection.js';
  */
 export const AGENT_GROUP_BY_ID_SQL = 'SELECT * FROM agent_groups WHERE id = ?';
 
+/**
+ * Insert an agent group.
+ *
+ * `workgroup_id` is bound explicitly and defaults to NULL, which is what the
+ * column did implicitly before it was named here (migration 036 added it
+ * nullable). Every caller that does not set it therefore writes exactly the
+ * row it wrote before; the one caller that does is `applyCreateAgent`, which
+ * has a parent workgroup to inherit. The parameter object is built field by
+ * field rather than passing `group` through, because an `AgentGroup` read back
+ * with `SELECT *` carries keys this statement does not name.
+ */
 export async function createAgentGroup(group: AgentGroup): Promise<void> {
   await getDb().run(
-    `INSERT INTO agent_groups (id, name, folder, agent_provider, created_at)
-       VALUES (@id, @name, @folder, @agent_provider, @created_at)`,
-    group,
+    `INSERT INTO agent_groups (id, name, folder, agent_provider, created_at, workgroup_id)
+       VALUES (@id, @name, @folder, @agent_provider, @created_at, @workgroup_id)`,
+    {
+      id: group.id,
+      name: group.name,
+      folder: group.folder,
+      agent_provider: group.agent_provider,
+      created_at: group.created_at,
+      workgroup_id: group.workgroup_id ?? null,
+    },
   );
 }
 

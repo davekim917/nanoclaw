@@ -14,7 +14,7 @@
  * workspace-scoped, so that would let a matching raw id in another workspace
  * inherit a role.
  */
-import { getKnownSlackBots, type SlackBotIdentity } from './channels/slack-mentions.js';
+import { getKnownSlackBots, getKnownSlackHumans, type SlackBotIdentity } from './channels/slack-mentions.js';
 
 /**
  * Return the exact persisted id plus same-workspace Slack sibling forms.
@@ -42,4 +42,78 @@ export function equivalentSlackUserIds(
     }
   }
   return [...equivalents];
+}
+
+/**
+ * The Slack identity to treat as "the operator" for a privileged Slack-side
+ * action taken in one workspace — provisioning a new bot, opening the
+ * operator's DM with it, addressing an approval card.
+ *
+ * Upstream has one Slack workspace per install, so its equivalent
+ * (`resolveOperatorSlackUserId` in the slack-agent-flow module) is just "the
+ * first approver whose id starts with `slack:`". The fork runs several Slack
+ * workspaces on one host, and the same human is a separate persisted
+ * principal in each (`slack-a:U123`, `slack-b:U123`). Picking the first
+ * `slack*`-prefixed approver would therefore DM an owner in workspace B about
+ * a bot created in workspace A, and — worse — hand a workspace-A install URL
+ * to whoever holds that raw user id in workspace B.
+ *
+ * Two filters, in order:
+ *
+ *  1. **Workspace equivalence.** A candidate qualifies only if one of its
+ *     `equivalentSlackUserIds` forms is namespaced to `originChannelType`.
+ *     That relation is `teamId`-scoped by construction, so a same-handle
+ *     owner in another workspace never qualifies. An origin channel type
+ *     with no registered bot identity yields null (fail closed) rather than
+ *     falling back to a prefix match.
+ *  2. **Workspace membership, when it is knowable.** `users.list` is synced
+ *     into the workspace-humans registry at adapter init. When the origin
+ *     team has a non-empty roster, the candidate's raw Slack id must appear
+ *     in it. When the roster is empty — the bot lacks `users:read`, or the
+ *     sync has not run yet — this filter is skipped rather than refusing
+ *     everything, because filter 1 is already the workspace boundary and
+ *     filter 2 only catches a hand-written `user_roles` row naming an id
+ *     that is not a member of the workspace at all.
+ *
+ * Takes the approver list rather than an agent-group id: `pickApprover` is
+ * the caller's business (and is moving to the async DB driver under seam 3),
+ * while which workspace an approver belongs to is a pure question about
+ * registered Slack identities. `bots` and `humans` are injectable for
+ * deterministic unit tests, matching `equivalentSlackUserIds`.
+ *
+ * Returns the persisted principal (`userId`, e.g. `slack-a:U123`) alongside
+ * the bare Slack id (`slackUserId`, e.g. `U123`) that Slack Web API calls
+ * take. Null when no approver belongs to the origin workspace.
+ */
+export function resolveOperatorSlackUserId(
+  approvers: readonly string[],
+  originChannelType: string,
+  deps: {
+    bots?: ReadonlyMap<string, SlackBotIdentity>;
+    humans?: ReadonlyMap<string, SlackBotIdentity[]>;
+  } = {},
+): { userId: string; slackUserId: string } | null {
+  const bots = deps.bots ?? getKnownSlackBots();
+  const humans = deps.humans ?? getKnownSlackHumans();
+
+  const originBot = bots.get(originChannelType);
+  if (!originBot) return null;
+
+  const roster = humans.get(originBot.teamId) ?? [];
+  const rosterIds = new Set(roster.map((h) => h.userId));
+
+  for (const approver of approvers) {
+    const inWorkspace = equivalentSlackUserIds(approver, bots).find(
+      (id) => id.slice(0, id.indexOf(':')) === originChannelType,
+    );
+    if (!inWorkspace) continue;
+
+    const slackUserId = inWorkspace.slice(inWorkspace.indexOf(':') + 1);
+    if (!/^[UW][A-Z0-9]+$/i.test(slackUserId)) continue;
+    if (rosterIds.size > 0 && !rosterIds.has(slackUserId)) continue;
+
+    return { userId: approver, slackUserId };
+  }
+
+  return null;
 }

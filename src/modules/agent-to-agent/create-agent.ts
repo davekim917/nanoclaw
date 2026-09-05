@@ -237,12 +237,29 @@ export const applyCreateAgent: ApprovalHandler = async ({ session, payload, noti
     const agentGroupId = `ag-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     const now = new Date().toISOString();
 
+    // The child joins the PARENT's workgroup, not a workgroup of its own.
+    //
+    // Before this, `createAgentGroup` left `workgroup_id` NULL and nothing
+    // ever filled it in, so a chat-created child sat outside every workgroup:
+    // no shared chat archive, no shared files, and — the one that bites —
+    // none of the workgroup's OneCLI secret union, which surfaces as a 401
+    // from an API whose credential is demonstrably in the vault. Inheriting
+    // is also what makes the child a sibling of its parent rather than a
+    // stranger that happens to have a destination grant.
+    //
+    // A parent with no workgroup (a pre-036 row that never got backfilled)
+    // still yields NULL — the same value as before — rather than inventing a
+    // workgroup id, because `workgroup_id` is a foreign key into `workgroups`
+    // and a fabricated id would fail the insert.
+    const workgroupId = sourceGroup.workgroup_id ?? null;
+
     const newGroup: AgentGroup = {
       id: agentGroupId,
       name,
       folder,
       agent_provider: provider ?? null,
       created_at: now,
+      workgroup_id: workgroupId,
     };
 
     // STEP 1: Create folder + baseline container.json + CLAUDE.local.md + skills
@@ -261,6 +278,11 @@ export const applyCreateAgent: ApprovalHandler = async ({ session, payload, noti
     try {
       updateContainerConfig(folder, (c) => {
         c.agentGroupId = agentGroupId;
+        // Written HERE, before the DB insert and therefore before any spawn:
+        // the spawn path reads container.json, not the DB row, so a child
+        // whose workgroup only ever reached the database would boot its first
+        // container outside the workgroup's data pool and secret union.
+        if (workgroupId !== null) c.workgroup_id = workgroupId;
         if (provider !== undefined) c.provider = provider;
         if (providerConfig !== undefined) c.providerConfig = providerConfig;
       });
