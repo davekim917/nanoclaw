@@ -16,6 +16,7 @@ import os from 'os';
 import path from 'path';
 import { fileURLToPath } from 'node:url';
 
+import ts from 'typescript';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { AgentMailbox, MailboxSessionKey } from './mailbox/types.js';
@@ -1514,8 +1515,7 @@ describe('sweep duty registry (S2-PR2)', () => {
   // handle every `.transaction(` call holds. What that file cannot say is
   // whether a call sits inside one, which is the property this case pins. The
   // scan is AST, not text, so a closure spanning many lines is still seen.
-  it('no central db.transaction wraps runIn or killContainer', async () => {
-    const ts = await import('typescript');
+  it('no central db.transaction wraps runIn or killContainer', () => {
     const FILES = ['src/host-sweep.ts', 'src/modules/sweep-container-health/index.ts'] as const;
     const GUARDED = ['runIn', 'killContainer'] as const;
 
@@ -1527,19 +1527,19 @@ describe('sweep duty registry (S2-PR2)', () => {
       const sf = ts.createSourceFile(rel, text, ts.ScriptTarget.Latest, true);
 
       /** `x.transaction(...)` — the shape both a raw handle and the driver use. */
-      const isTransactionCall = (node: import('typescript').Node): boolean =>
+      const isTransactionCall = (node: ts.Node): boolean =>
         ts.isCallExpression(node) &&
         ts.isPropertyAccessExpression(node.expression) &&
         node.expression.name.text === 'transaction';
 
       /** The callee name of a call, whether bare or a property access. */
-      const calleeName = (node: import('typescript').CallExpression): string | null => {
+      const calleeName = (node: ts.CallExpression): string | null => {
         if (ts.isIdentifier(node.expression)) return node.expression.text;
         if (ts.isPropertyAccessExpression(node.expression)) return node.expression.name.text;
         return null;
       };
 
-      const walk = (node: import('typescript').Node, insideTransaction: boolean): void => {
+      const walk = (node: ts.Node, insideTransaction: boolean): void => {
         const nowInside = insideTransaction || isTransactionCall(node);
         if (ts.isCallExpression(node)) {
           const name = calleeName(node);
