@@ -1,67 +1,204 @@
-# Run the boundary gate from the MAIN checkout, not $PWD.
-#
-# Agent worktrees deliberately carry no node_modules (a `pnpm install` there
-# leaves better-sqlite3's native binding unbuilt and yields hundreds of phantom
-# failures), so a bare `pnpm run` here dies with `tsx: not found` and blocks the
-# push. Same defect the pre-commit hook had, fixed the same way:
-# `--git-common-dir` resolves the main checkout from any linked worktree.
-#
-# `--root` is separate and mandatory: the script's default root is
-# process.cwd(), which the `cd` above has just made the main checkout, so
-# without it a push from a linked worktree scanned MAIN's index instead of the
-# committing worktree's — and printed "passed". The registry still resolves
-# through the main checkout via findMainCheckoutRoot's fallback.
-#
-# Known gap, pre-existing: `--index` scans the INDEX, not the refs being
-# pushed. A leaky commit already in history passes as long as the index is
-# clean. commit-msg and pre-commit gate content at commit time, which is where
-# this install actually catches leaks; closing the gap here means diffing
-# each pushed ref against its remote counterpart. Do not describe this hook
-# as scanning "the content being pushed" until it does.
-#
-# set -e: below is now two gates, not one — without this, a failing boundary
-# check would be masked by a passing lint step (the script's exit code is the
-# LAST command's, not the first failure's). pre-commit already does this for
-# the same reason.
+# Read the refs Git will push and gate their committed trees, not any later
+# worktree edits. Linked worktrees use the main checkout's installed tooling.
 set -e
 repo_root=$(dirname "$(cd "$(git rev-parse --git-common-dir)" && pwd)")
 worktree_root=$(git rev-parse --show-toplevel)
-(cd "$repo_root" && pnpm run check:public-boundary -- --root "$worktree_root" --index)
+# Reviewed exceptions are current policy, even when inspecting older content.
+allowlist_path="$worktree_root/.public-boundary-allowlist.json"
+git_local_env=$(git rev-parse --local-env-vars)
+# Git hooks export the invoking checkout's repository selection variables.
+# Keep command-scoped `git -c` configuration so remote access still inherits it.
+for git_env in $git_local_env; do
+  case "$git_env" in
+    GIT_CONFIG*) ;;
+    *) unset "$git_env" ;;
+  esac
+done
+# Pack transfer sends original objects, even when local replacement refs exist.
+export GIT_NO_REPLACE_OBJECTS=1
+remote_name=$1
+remote_url=$2
+case "$(git -C "$worktree_root" rev-parse --show-object-format)" in
+  sha1) zero_sha=$(printf '%040d' 0) ;;
+  sha256) zero_sha=$(printf '%064d' 0) ;;
+  *) echo "pre-push: unsupported repository object format" >&2; exit 1 ;;
+esac
+refs_file=''
+seen_objects=''
+advertised_refs=''
+known_remote_tips=''
+object_list=''
+commit_message=''
+worktree_node_modules_link=''
+snapshot_parent=''
+snapshot_root=''
+snapshot_node_modules_link=''
 
-# Seam 3 lint gate — for no-floating-promises / no-misused-promises /
-# projectService and friends to actually gate anything, `pnpm run lint` itself
-# must be green and enforced (see docs/specs for the seam plan).
-#
-# Known gap, pre-existing pattern (same class as the boundary check's own
-# comment above): this lints the WORKTREE's on-disk files, not the object
-# content of the commit(s) actually being pushed — a commit with a lint error
-# that the working tree has since fixed only in unstaged content would pass.
-# Closing it means linting the pushed SHA's tree (e.g. a `git archive`/export
-# to a throwaway directory per ref on stdin), which the boundary check would
-# need too for the same reason; out of scope for this PR (Codex review, #380).
-#
-# Unlike prettier's compiled binary, eslint.config.js is a plain ES module:
-# its own `import globals from 'globals'` (and typescript-eslint, the
-# no-catch-all plugin, ...) is resolved by Node relative to the CONFIG FILE's
-# own location, not cwd — so `--resolve-plugins-relative-to`/PATH tricks that
-# work for prettier do nothing here, and pointing `--config` at the main
-# checkout's copy while linting the worktree's files fails too (flat config
-# treats paths outside the config's own directory as "outside the base path"
-# and ignores them). The worktree has to lint against ITS OWN
-# eslint.config.js — which is correct anyway, since that's the version of the
-# rules the pushed branch should be gated by — but needs node_modules
-# reachable from inside it, and agent worktrees deliberately have none (see
-# banner comment above). Link the main checkout's in, once, if not already
-# present; never overwrite an existing entry (could be a real install, not
-# this hook's symlink).
-if [ ! -e "$worktree_root/node_modules" ]; then
-  ln -s "$repo_root/node_modules" "$worktree_root/node_modules"
-fi
-(cd "$worktree_root" && node_modules/.bin/eslint --quiet src/ scripts/)
+remove_file() {
+  if [ -n "$1" ] && [ -e "$1" ] && ! rm -f "$1"; then
+    echo "pre-push: failed to remove temporary file" >&2
+  fi
+}
 
-# Include setup and scripts in the same typecheck command used by CI/builds.
-if command -v ionice >/dev/null 2>&1; then
-  (cd "$worktree_root" && ionice -c3 nice -n 10 pnpm run typecheck)
-else
-  (cd "$worktree_root" && nice -n 10 pnpm run typecheck)
+cleanup() {
+  status=$?
+  trap - EXIT HUP INT TERM
+  if [ -n "$snapshot_root" ] && [ -d "$snapshot_root" ]; then
+    if [ "$snapshot_node_modules_link" = 1 ] && [ -L "$snapshot_root/node_modules" ] && ! rm "$snapshot_root/node_modules"; then
+      echo "pre-push: failed to remove temporary node_modules link" >&2
+    fi
+    if ! git -C "$worktree_root" worktree remove "$snapshot_root"; then
+      echo "pre-push: failed to remove temporary snapshot" >&2
+    fi
+  fi
+  remove_file "$commit_message"
+  if [ -n "$snapshot_parent" ] && [ -d "$snapshot_parent" ] && ! rmdir "$snapshot_parent"; then
+    echo "pre-push: failed to remove temporary snapshot directory" >&2
+  fi
+  remove_file "$object_list"
+  if [ "$worktree_node_modules_link" = 1 ] && [ -L "$worktree_root/node_modules" ] && ! rm "$worktree_root/node_modules"; then
+    echo "pre-push: failed to remove worktree node_modules link" >&2
+  fi
+  remove_file "$advertised_refs"
+  remove_file "$known_remote_tips"
+  remove_file "$seen_objects"
+  remove_file "$refs_file"
+  exit "$status"
+}
+trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+refs_file=$(mktemp "${TMPDIR:-/tmp}/nanoclaw-pre-push-refs.XXXXXX")
+seen_objects=$(mktemp "${TMPDIR:-/tmp}/nanoclaw-pre-push-seen.XXXXXX")
+cat > "$refs_file"
+
+needs_remote_tips=''
+while read -r local_ref local_sha remote_ref remote_sha; do
+  [ "$local_sha" = "$zero_sha" ] && continue
+  if [ "$remote_sha" = "$zero_sha" ] || ! git -C "$worktree_root" cat-file -e "$remote_sha^{commit}" 2>/dev/null; then
+    needs_remote_tips=1
+    break
+  fi
+done < "$refs_file"
+
+if [ -n "$needs_remote_tips" ]; then
+  advertised_refs=$(mktemp "${TMPDIR:-/tmp}/nanoclaw-pre-push-remote.XXXXXX")
+  known_remote_tips=$(mktemp "${TMPDIR:-/tmp}/nanoclaw-pre-push-known.XXXXXX")
+  if [ -z "$remote_url" ] || ! git -C "$worktree_root" ls-remote "$remote_url" > "$advertised_refs"; then
+    echo "pre-push: failed to list advertised refs for $remote_name" >&2
+    exit 1
+  fi
+  while read -r remote_tip remote_ref; do
+    if git -C "$worktree_root" cat-file -e "$remote_tip^{commit}" 2>/dev/null; then
+      printf '%s\n' "$remote_tip" >> "$known_remote_tips"
+    fi
+  done < "$advertised_refs"
+  remove_file "$advertised_refs"
+  advertised_refs=''
 fi
+
+scan_message() {
+  if [ ! -e "$worktree_root/node_modules" ] && [ ! -L "$worktree_root/node_modules" ]; then
+    ln -s "$repo_root/node_modules" "$worktree_root/node_modules"
+    worktree_node_modules_link=1
+  fi
+  "$worktree_root/node_modules/.bin/tsx" "$worktree_root/scripts/check-public-boundary.ts" --root "$1" --message "$2" --message-raw --allowlist "$allowlist_path" </dev/null
+}
+
+scan_tag() {
+  snapshot_parent=$(mktemp -d "${TMPDIR:-/tmp}/nanoclaw-pre-push.XXXXXX")
+  commit_message="$snapshot_parent/TAG_EDITMSG"
+  git -C "$worktree_root" cat-file tag "$1" > "$commit_message"
+  scan_message "$worktree_root" "$commit_message"
+  remove_file "$commit_message"
+  commit_message=''
+  rmdir "$snapshot_parent"
+  snapshot_parent=''
+}
+
+snapshot_commit() {
+  snapshot_parent=$(mktemp -d "${TMPDIR:-/tmp}/nanoclaw-pre-push.XXXXXX")
+  snapshot_root="$snapshot_parent/tree"
+  git -C "$worktree_root" -c core.hooksPath=/dev/null worktree add --detach --quiet "$snapshot_root" "$1" </dev/null
+  if [ -e "$snapshot_root/node_modules" ] || [ -L "$snapshot_root/node_modules" ]; then
+    echo "pre-push: snapshot unexpectedly contains node_modules" >&2
+    exit 1
+  fi
+  ln -s "$repo_root/node_modules" "$snapshot_root/node_modules"
+  snapshot_node_modules_link=1
+
+  commit_message="$snapshot_parent/COMMIT_EDITMSG"
+  git -C "$worktree_root" show --no-patch --format=%B "$1" > "$commit_message"
+  scan_message "$snapshot_root" "$commit_message"
+  remove_file "$commit_message"
+  commit_message=''
+  (cd "$repo_root" && pnpm run check:public-boundary -- --root "$snapshot_root" --index --allowlist "$allowlist_path") </dev/null
+  if command -v ionice >/dev/null 2>&1; then
+    (cd "$snapshot_root" && ionice -c3 nice -n 10 node_modules/.bin/eslint --quiet src/ scripts/) </dev/null
+  else
+    (cd "$snapshot_root" && nice -n 10 node_modules/.bin/eslint --quiet src/ scripts/) </dev/null
+  fi
+
+  # Include setup and scripts in the same typecheck command used by CI/builds
+  # (pnpm run typecheck), gated against this pushed commit's own snapshot
+  # rather than the live worktree, same as the boundary and lint checks above.
+  if command -v ionice >/dev/null 2>&1; then
+    (cd "$snapshot_root" && ionice -c3 nice -n 10 node_modules/.bin/tsc --noEmit && ionice -c3 nice -n 10 node_modules/.bin/tsc -p tsconfig.scripts.json) </dev/null
+  else
+    (cd "$snapshot_root" && nice -n 10 node_modules/.bin/tsc --noEmit && nice -n 10 node_modules/.bin/tsc -p tsconfig.scripts.json) </dev/null
+  fi
+
+  rm "$snapshot_root/node_modules"
+  snapshot_node_modules_link=''
+  git -C "$worktree_root" worktree remove "$snapshot_root"
+  rmdir "$snapshot_parent"
+  snapshot_parent=''
+  snapshot_root=''
+}
+
+objects_for_ref() {
+  local_sha=$1
+  remote_sha=$2
+  object_list=$(mktemp "${TMPDIR:-/tmp}/nanoclaw-pre-push-commits.XXXXXX")
+  if [ "$remote_sha" != "$zero_sha" ] && git -C "$worktree_root" cat-file -e "$remote_sha^{commit}" 2>/dev/null; then
+    git -C "$worktree_root" rev-list --objects --no-object-names --filter=tree:0 "$remote_sha..$local_sha" > "$object_list"
+  else
+    set --
+    if [ -n "$known_remote_tips" ]; then
+      while read -r remote_tip; do
+        set -- "$@" "$remote_tip"
+      done < "$known_remote_tips"
+    fi
+    if [ "$#" -eq 0 ]; then
+      git -C "$worktree_root" rev-list --objects --no-object-names --filter=tree:0 "$local_sha" > "$object_list"
+    else
+      git -C "$worktree_root" rev-list --objects --no-object-names --filter=tree:0 "$local_sha" --not "$@" > "$object_list"
+    fi
+  fi
+  # Keep annotated tag objects (including nested tags), not just peeled commits.
+  # Commit snapshots cover their trees, so omit tree/blob traversal here.
+  while read -r object_sha; do
+    if grep -Fqx "$object_sha" "$seen_objects"; then
+      continue
+    fi
+    printf '%s\n' "$object_sha" >> "$seen_objects"
+    case "$(git -C "$worktree_root" cat-file -t "$object_sha")" in
+      commit) snapshot_commit "$object_sha" ;;
+      tag) scan_tag "$object_sha" ;;
+      *) echo "pre-push: unsupported pushed object type" >&2; exit 1 ;;
+    esac
+  done < "$object_list"
+  remove_file "$object_list"
+  object_list=''
+}
+
+while read -r local_ref local_sha remote_ref remote_sha; do
+  [ "$local_sha" = "$zero_sha" ] && continue
+  if ! git -C "$worktree_root" cat-file -e "$local_sha^{commit}" 2>/dev/null; then
+    echo "pre-push: unsupported ref target; expected a commit or tag pointing to a commit" >&2
+    exit 1
+  fi
+  objects_for_ref "$local_sha" "$remote_sha"
+done < "$refs_file"

@@ -1,0 +1,600 @@
+import { execFileSync, spawnSync } from 'node:child_process';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+import Database from 'better-sqlite3';
+import { afterEach, describe, expect, it } from 'vitest';
+
+const roots: string[] = [];
+const linkedWorktrees: Array<{ main: string; root: string }> = [];
+const zeroSha = '0000000000000000000000000000000000000000';
+const realGit = execFileSync('sh', ['-c', 'command -v git'], { encoding: 'utf8' }).trim();
+const realTsx = path.resolve('node_modules/.bin/tsx');
+
+function tempRoot(): string {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'pre-push-'));
+  roots.push(root);
+  return root;
+}
+
+function runGit(root: string, args: string[]): string {
+  return execFileSync('git', args, { cwd: root, encoding: 'utf8' }).trim();
+}
+
+function writeExecutable(file: string, source: string): void {
+  fs.writeFileSync(file, source);
+  fs.chmodSync(file, 0o755);
+}
+
+function linkSystemCommand(bin: string, command: string): void {
+  const executable = execFileSync('sh', ['-c', `command -v ${command}`], { encoding: 'utf8' }).trim();
+  fs.symlinkSync(executable, path.join(bin, command));
+}
+
+function commit(root: string, value: string, message = value): string {
+  fs.mkdirSync(path.join(root, 'src'), { recursive: true });
+  fs.mkdirSync(path.join(root, 'scripts'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'eslint.config.js'), 'export default [];\n');
+  fs.writeFileSync(path.join(root, 'src', 'gate.ts'), `${value}\n`);
+  fs.writeFileSync(path.join(root, 'scripts', 'gate.ts'), `${value}\n`);
+  runGit(root, ['add', 'eslint.config.js', '.public-boundary-allowlist.json', 'src/gate.ts', 'scripts/gate.ts']);
+  runGit(root, ['commit', '-m', message, '--quiet']);
+  return runGit(root, ['rev-parse', 'HEAD']);
+}
+
+function fixture(objectFormat?: 'sha256'): { root: string; hook: string; log: string; bin: string } {
+  const root = tempRoot();
+  runGit(root, objectFormat ? ['init', `--object-format=${objectFormat}`, '--quiet'] : ['init', '--quiet']);
+  runGit(root, ['config', 'user.email', 'test@example.invalid']);
+  runGit(root, ['config', 'user.name', 'Hook Test']);
+  fs.mkdirSync(path.join(root, '.nanoclaw'), { recursive: true });
+  // Install inventory stays untracked; snapshots resolve it from their common checkout.
+  fs.writeFileSync(path.join(root, '.nanoclaw', 'public-boundary-identifiers'), 'Private Customer\n');
+  fs.writeFileSync(path.join(root, '.public-boundary-allowlist.json'), '{"entries": []}\n');
+  fs.mkdirSync(path.join(root, 'scripts'), { recursive: true });
+  fs.symlinkSync(
+    new URL('../scripts/check-public-boundary.ts', import.meta.url),
+    path.join(root, 'scripts', 'check-public-boundary.ts'),
+  );
+  const hook = path.join(root, '.husky', 'pre-push');
+  fs.mkdirSync(path.dirname(hook), { recursive: true });
+  fs.copyFileSync(new URL('../.husky/pre-push', import.meta.url), hook);
+
+  const bin = path.join(root, 'bin');
+  const modules = path.join(root, 'node_modules', '.bin');
+  fs.mkdirSync(bin, { recursive: true });
+  fs.mkdirSync(modules, { recursive: true });
+  writeExecutable(
+    path.join(bin, 'pnpm'),
+    `#!/bin/sh
+while [ "$1" != "--root" ]; do shift; done
+root=$2
+IFS= read -r consumed || true
+value=$(git -C "$root" show :src/gate.ts) || exit 1
+printf 'boundary|%s|%s|%s\\n' "$root" "$value" "$consumed" >> "$HOOK_LOG"
+[ "\${HOOK_FAIL:-}" != "boundary:$value" ] || exit 1
+if [ "\${HOOK_CHECK_TREE:-}" = 1 ]; then
+  exec "$HOOK_REAL_TSX" "$HOOK_REAL_CHECKER" "$@"
+fi
+`,
+  );
+  writeExecutable(
+    path.join(modules, 'tsx'),
+    `#!/bin/sh
+printf 'message|%s|\\n' "$*" >> "$HOOK_LOG"
+script=$(node -e 'process.stdout.write(require("node:fs").realpathSync(process.argv[1]))' "$1")
+shift
+exec "$HOOK_REAL_TSX" "$script" "$@"
+`,
+  );
+  writeExecutable(
+    path.join(bin, 'git'),
+    `#!/bin/sh
+if [ "$1" = -C ] && [ "$3" = ls-remote ]; then shift 2; fi
+if [ "$1" = ls-remote ]; then
+  [ "\${HOOK_LS_REMOTE_FAIL:-}" != 1 ] || exit 1
+  case "\${HOOK_REQUIRE_CONFIG:-}" in
+    count) [ "\${GIT_CONFIG_COUNT:-}" = 1 ] || exit 1 ;;
+    parameters) [ "$("$HOOK_REAL_GIT" config --get hook.prepushprobe)" = parameters ] || exit 1 ;;
+  esac
+  printf '%s' "\${HOOK_REMOTE_REFS:-}"
+  exit 0
+fi
+exec "$HOOK_REAL_GIT" "$@"
+`,
+  );
+  writeExecutable(
+    path.join(modules, 'eslint'),
+    `#!/bin/sh
+test -f eslint.config.js || exit 1
+IFS= read -r consumed || true
+printf 'lint|%s|%s|%s\\n' "$PWD" "$(cat src/gate.ts)" "$consumed" >> "$HOOK_LOG"
+[ "\${HOOK_FAIL:-}" != "lint:$(cat src/gate.ts)" ] || exit 1
+`,
+  );
+  writeExecutable(
+    path.join(modules, 'tsc'),
+    `#!/bin/sh
+# The hook runs this twice per snapshot (--noEmit, then -p tsconfig.scripts.json);
+# only the first call is logged, so the count matches the other single-shot gates.
+[ "$1" = "--noEmit" ] || exit 0
+IFS= read -r consumed || true
+printf 'typecheck|%s|%s|%s\\n' "$PWD" "$(cat src/gate.ts)" "$consumed" >> "$HOOK_LOG"
+[ "\${HOOK_FAIL:-}" != "typecheck:$(cat src/gate.ts)" ] || exit 1
+`,
+  );
+  const hooks = path.join(root, 'hooks');
+  fs.mkdirSync(hooks);
+  writeExecutable(path.join(hooks, 'post-checkout'), '#!/bin/sh\ntouch "$HOOK_POST_CHECKOUT"\n');
+  runGit(root, ['config', 'core.hooksPath', hooks]);
+  return { root, hook, log: path.join(root, 'hook.log'), bin };
+}
+
+function push(
+  f: ReturnType<typeof fixture>,
+  refs: string,
+  options: {
+    fail?: string;
+    remoteRefs?: string;
+    remoteFailure?: boolean;
+    sourceGitEnv?: boolean;
+    commandScopedConfig?: 'count' | 'parameters';
+    withoutIonice?: boolean;
+    realTreeCheck?: boolean;
+  } = {},
+) {
+  if (options.withoutIonice) {
+    for (const command of ['dirname', 'mktemp', 'rm', 'rmdir', 'ln', 'grep', 'cat', 'node', 'sed', 'uname']) {
+      linkSystemCommand(f.bin, command);
+    }
+    writeExecutable(
+      path.join(f.bin, 'nice'),
+      `#!/bin/sh
+printf 'nice\\n' >> "$HOOK_LOG"
+[ "$1" = -n ] && shift 2
+exec "$@"
+`,
+    );
+  }
+  return spawnSync('/bin/sh', [f.hook, 'origin', 'test://origin'], {
+    cwd: f.root,
+    encoding: 'utf8',
+    input: refs,
+    env: {
+      ...process.env,
+      PATH: options.withoutIonice ? f.bin : `${f.bin}:${process.env.PATH}`,
+      HOOK_LOG: f.log,
+      HOOK_POST_CHECKOUT: path.join(f.root, 'post-checkout-ran'),
+      TMPDIR: f.root,
+      HOOK_FAIL: options.fail ?? '',
+      HOOK_REMOTE_REFS: options.remoteRefs ?? '',
+      HOOK_LS_REMOTE_FAIL: options.remoteFailure ? '1' : '',
+      HOOK_REQUIRE_CONFIG: options.commandScopedConfig ?? '',
+      HOOK_REAL_GIT: realGit,
+      HOOK_REAL_TSX: realTsx,
+      HOOK_REAL_CHECKER: fileURLToPath(new URL('./check-public-boundary.ts', import.meta.url)),
+      HOOK_CHECK_TREE: options.realTreeCheck ? '1' : '',
+      ...(options.sourceGitEnv ? { GIT_DIR: path.join(f.root, '.git'), GIT_WORK_TREE: f.root } : {}),
+      ...(options.commandScopedConfig === 'count'
+        ? { GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'user.name', GIT_CONFIG_VALUE_0: 'Hook Test' }
+        : {}),
+      ...(options.commandScopedConfig === 'parameters'
+        ? { GIT_CONFIG_PARAMETERS: "'hook.prepushprobe=parameters'" }
+        : {}),
+    },
+  });
+}
+
+function records(log: string): string[] {
+  return fs.readFileSync(log, 'utf8').trim().split('\n');
+}
+
+afterEach(() => {
+  for (const worktree of linkedWorktrees.splice(0)) {
+    fs.rmSync(path.join(worktree.root, '.husky'), { recursive: true, force: true });
+    fs.rmSync(path.join(worktree.root, 'hook.log'), { force: true });
+    fs.rmSync(path.join(worktree.root, 'scripts', 'check-public-boundary.ts'), { force: true });
+    runGit(worktree.root, ['clean', '-fd']);
+    runGit(worktree.main, ['worktree', 'remove', worktree.root]);
+  }
+  for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
+});
+
+describe('.husky/pre-push', () => {
+  it('gates every pushed SHA, not dirty files, and skips deletions', () => {
+    const f = fixture();
+    const first = commit(f.root, 'first-pushed');
+    runGit(f.root, ['branch', 'first-pushed', first]);
+    const second = commit(f.root, 'second-pushed');
+    fs.writeFileSync(path.join(f.root, 'src', 'gate.ts'), 'dirty-worktree\n');
+
+    const result = push(
+      f,
+      [
+        `refs/heads/first-pushed ${first} refs/heads/first-pushed ${zeroSha}`,
+        `refs/heads/deleted ${zeroSha} refs/heads/deleted ${first}`,
+        `refs/heads/current ${second} refs/heads/current ${zeroSha}`,
+      ].join('\n') + '\n',
+    );
+
+    expect(result.status).toBe(0);
+    expect(records(f.log)).toHaveLength(8);
+    expect(records(f.log).join('\n')).toContain('first-pushed');
+    expect(records(f.log).join('\n')).toContain('second-pushed');
+    expect(records(f.log).join('\n')).not.toContain('dirty-worktree');
+    const snapshotRecords = records(f.log).filter((record) => /^(boundary|lint|typecheck)\|/.test(record));
+    expect(snapshotRecords.every((record) => record.endsWith('|'))).toBe(true);
+    for (const record of snapshotRecords) {
+      const snapshot = record.split('|')[1];
+      expect(fs.existsSync(snapshot)).toBe(false);
+      expect(fs.existsSync(path.dirname(snapshot))).toBe(false);
+    }
+    expect(fs.existsSync(path.join(f.root, 'post-checkout-ran'))).toBe(false);
+  });
+
+  it.each(['boundary', 'lint', 'typecheck'] as const)('rejects a non-HEAD snapshot when %s finds a violation', (gate) => {
+    const f = fixture();
+    const rejected = commit(f.root, 'rejected-push');
+    runGit(f.root, ['branch', 'rejected-push', rejected]);
+    commit(f.root, 'clean-head');
+    fs.writeFileSync(path.join(f.root, 'src', 'gate.ts'), 'dirty-clean\n');
+    const result = push(f, `refs/heads/rejected-push ${rejected} refs/heads/rejected-push ${zeroSha}\n`, {
+      fail: `${gate}:rejected-push`,
+    });
+
+    expect(result.status).toBe(1);
+    expect(records(f.log).join('\n')).toContain('rejected-push');
+    expect(records(f.log).join('\n')).not.toContain('clean-head');
+    expect(records(f.log).join('\n')).not.toContain('dirty-clean');
+    expect(records(f.log)).toHaveLength(gate === 'boundary' ? 2 : gate === 'lint' ? 3 : 4);
+    const snapshot = records(f.log)
+      .find((record) => record.startsWith('boundary|'))
+      ?.split('|')[1];
+    expect(snapshot).toBeDefined();
+    if (!snapshot) throw new Error('boundary gate did not record a snapshot');
+    expect(fs.existsSync(snapshot)).toBe(false);
+    expect(fs.existsSync(path.dirname(snapshot))).toBe(false);
+    expect(runGit(f.root, ['worktree', 'list', '--porcelain'])).not.toContain(snapshot);
+  });
+
+  it('rejects an intermediate commit in an existing ref update', () => {
+    const f = fixture();
+    const base = commit(f.root, 'remote-base');
+    commit(f.root, 'intermediate-violation');
+    const cleanTip = commit(f.root, 'clean-tip');
+    const result = push(f, `refs/heads/current ${cleanTip} refs/heads/current ${base}\n`, {
+      fail: 'boundary:intermediate-violation',
+    });
+
+    expect(result.status).toBe(1);
+    expect(records(f.log).join('\n')).toContain('clean-tip');
+    expect(records(f.log).join('\n')).toContain('intermediate-violation');
+  });
+
+  it('deduplicates overlapping and force-pushed ref ranges', () => {
+    const f = fixture();
+    const base = commit(f.root, 'base');
+    const pushed = commit(f.root, 'shared-push');
+    runGit(f.root, ['-c', 'core.hooksPath=/dev/null', 'checkout', '--detach', base, '--quiet']);
+    const remoteOld = commit(f.root, 'remote-old');
+    runGit(f.root, ['-c', 'core.hooksPath=/dev/null', 'checkout', '--detach', pushed, '--quiet']);
+    const result = push(
+      f,
+      [
+        `refs/heads/first ${pushed} refs/heads/first ${base}`,
+        `refs/heads/force ${pushed} refs/heads/force ${remoteOld}`,
+        `refs/heads/deleted ${zeroSha} refs/heads/deleted ${base}`,
+      ].join('\n') + '\n',
+    );
+
+    expect(result.status).toBe(0);
+    expect(records(f.log).filter((record) => record.includes('shared-push'))).toHaveLength(3);
+  });
+
+  it('gates local-only history on a new ref against live advertised tips', () => {
+    const f = fixture();
+    const base = commit(f.root, 'remote-base');
+    const localOnly = commit(f.root, 'local-only');
+    runGit(f.root, ['branch', 'local-only', localOnly]);
+    const pushed = commit(f.root, 'new-ref-tip');
+    const result = push(f, `refs/heads/new ${pushed} refs/heads/new ${zeroSha}\n`, {
+      fail: 'boundary:local-only',
+      remoteRefs: `${base}\trefs/heads/main\n`,
+    });
+
+    expect(result.status).toBe(1);
+    expect(records(f.log).join('\n')).toContain('new-ref-tip');
+    expect(records(f.log).join('\n')).toContain('local-only');
+    expect(records(f.log).join('\n')).not.toContain('remote-base');
+  });
+
+  it('uses locally known advertised tips when the remote baseline is missing', () => {
+    const f = fixture();
+    const base = commit(f.root, 'remote-base');
+    const pushed = commit(f.root, 'missing-baseline-push');
+    const missingRemote = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+    const result = push(f, `refs/heads/current ${pushed} refs/heads/current ${missingRemote}\n`, {
+      fail: 'boundary:missing-baseline-push',
+      remoteRefs: `${base}\trefs/heads/main\n`,
+    });
+
+    expect(result.status).toBe(1);
+    expect(records(f.log).join('\n')).toContain('missing-baseline-push');
+    expect(records(f.log).join('\n')).not.toContain('remote-base');
+  });
+
+  it('fails closed when live advertised refs cannot be listed', () => {
+    const f = fixture();
+    const pushed = commit(f.root, 'new-ref');
+    const result = push(f, `refs/heads/new ${pushed} refs/heads/new ${zeroSha}\n`, { remoteFailure: true });
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('failed to list advertised refs');
+    expect(fs.existsSync(f.log)).toBe(false);
+  });
+
+  it.each(['count', 'parameters'] as const)(
+    'preserves GIT_CONFIG_%s while listing live refs',
+    (commandScopedConfig) => {
+      const f = fixture();
+      const base = commit(f.root, 'remote-base');
+      const pushed = commit(f.root, 'configured-new-ref');
+      const result = push(f, `refs/heads/new ${pushed} refs/heads/new ${zeroSha}\n`, {
+        remoteRefs: `${base}\trefs/heads/main\n`,
+        commandScopedConfig,
+      });
+
+      expect(result.status).toBe(0);
+      expect(records(f.log).join('\n')).toContain('configured-new-ref');
+    },
+  );
+
+  it.each([
+    ['tree', 'Private Customer', 'clean message', 'boundary:Private Customer'],
+    ['message', 'clean-original', 'fix: Private Customer', undefined],
+  ] as const)('gates the original replaced commit %s', (_surface, originalValue, originalMessage, fail) => {
+    const f = fixture();
+    const base = commit(f.root, 'base');
+    const original = commit(f.root, originalValue, originalMessage);
+    runGit(f.root, ['-c', 'core.hooksPath=/dev/null', 'checkout', '--detach', base, '--quiet']);
+    const replacement = commit(f.root, 'clean-replacement', 'clean replacement');
+    runGit(f.root, ['replace', original, replacement]);
+
+    const result = push(f, `refs/heads/current ${original} refs/heads/current ${zeroSha}\n`, { fail });
+
+    expect(result.status).toBe(1);
+    if (fail) {
+      expect(records(f.log).join('\n')).toContain('Private Customer');
+      expect(records(f.log).join('\n')).not.toContain('clean-replacement');
+    } else {
+      expect(result.stderr).toContain('private-identifier');
+    }
+  });
+
+  it.each([false, true])(
+    'rejects a private annotated tag even when its commit is already remote (nested=%s)',
+    (nested) => {
+      const f = fixture();
+      const base = commit(f.root, 'remote-base');
+      runGit(f.root, ['tag', '-a', 'synthetic-inner', '-m', 'Private Customer annotation', base]);
+      if (nested)
+        runGit(f.root, [
+          '-c',
+          'advice.nestedTag=false',
+          'tag',
+          '-a',
+          'synthetic-outer',
+          '-m',
+          'clean annotation',
+          'synthetic-inner',
+        ]);
+      const tag = runGit(f.root, ['rev-parse', nested ? 'synthetic-outer' : 'synthetic-inner']);
+      const result = push(f, `refs/tags/release ${tag} refs/tags/release ${zeroSha}\n`, {
+        remoteRefs: `${base}\trefs/heads/main\n`,
+      });
+
+      expect(result.status, result.stderr).toBe(1);
+      expect(result.stderr).toContain('TAG_EDITMSG:');
+      expect(result.stderr).toContain('private-identifier');
+      expect(fs.readdirSync(f.root).some((name) => name.startsWith('nanoclaw-pre-push.'))).toBe(false);
+    },
+  );
+
+  it('accepts clean annotated and lightweight tags and scans shared tag objects once', () => {
+    const f = fixture();
+    const base = commit(f.root, 'remote-base');
+    runGit(f.root, ['tag', '-a', 'synthetic-release', '-m', 'clean annotation', base]);
+    const tag = runGit(f.root, ['rev-parse', 'synthetic-release']);
+    const result = push(
+      f,
+      [
+        `refs/tags/release ${tag} refs/tags/release ${zeroSha}`,
+        `refs/tags/alias ${tag} refs/tags/alias ${zeroSha}`,
+        `refs/tags/lightweight ${base} refs/tags/lightweight ${zeroSha}`,
+      ].join('\n') + '\n',
+      { remoteRefs: `${base}\trefs/heads/main\n` },
+    );
+
+    expect(result.status, result.stderr).toBe(0);
+    expect(records(f.log)).toHaveLength(1);
+    expect(records(f.log)[0]).toContain('/TAG_EDITMSG --message-raw');
+    expect(fs.readdirSync(f.root).some((name) => name.startsWith('nanoclaw-pre-push.'))).toBe(false);
+  });
+
+  it.each(['tree', 'blob'] as const)('fails closed for a tag pointing to an unsupported %s target', (kind) => {
+    const f = fixture();
+    const base = commit(f.root, 'remote-base');
+    const target = runGit(f.root, ['rev-parse', kind === 'tree' ? `${base}^{tree}` : `${base}:src/gate.ts`]);
+    runGit(f.root, ['tag', '-a', 'synthetic-object', '-m', 'clean annotation', target]);
+    const tag = runGit(f.root, ['rev-parse', 'synthetic-object']);
+    const result = push(f, `refs/tags/object ${tag} refs/tags/object ${zeroSha}\n`, {
+      remoteRefs: `${base}\trefs/heads/main\n`,
+    });
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('unsupported ref target');
+  });
+
+  it('skips SHA-256 ref deletions', () => {
+    const f = fixture('sha256');
+    const pushed = commit(f.root, 'sha256-pushed');
+    const zeroSha256 = '0'.repeat(64);
+    const result = push(f, `refs/heads/deleted ${zeroSha256} refs/heads/deleted ${pushed}\n`);
+
+    expect(result.status).toBe(0);
+    expect(fs.existsSync(f.log)).toBe(false);
+  });
+
+  it.each([
+    [
+      'exact scissors',
+      'fix: imported\n# ------------------------ >8 ------------------------\nPrivate Customer after scissors',
+    ],
+    ['trailing comment block', 'fix: imported\n\n# Private Customer in history\n#'],
+  ])('rejects a committed %s message verbatim', (_shape, message) => {
+    const f = fixture();
+    const base = commit(f.root, 'remote-base');
+    const pushed = commit(f.root, 'clean-tree', message);
+    const result = push(f, `refs/heads/current ${pushed} refs/heads/current ${base}\n`);
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('private-identifier');
+    expect(records(f.log).join('\n')).toContain('--message-raw');
+    const snapshot = records(f.log)[0].match(/--root ([^ ]+)/)?.[1];
+    expect(snapshot).toBeDefined();
+    expect(fs.existsSync(snapshot!)).toBe(false);
+    expect(fs.existsSync(path.dirname(snapshot!))).toBe(false);
+    expect(runGit(f.root, ['worktree', 'list', '--porcelain'])).not.toContain(snapshot!);
+  });
+
+  it('matches reviewed commit-message exceptions with a stable filename and cleans up each scan', () => {
+    const f = fixture();
+    const base = commit(f.root, 'remote-base');
+    fs.writeFileSync(
+      path.join(f.root, '.public-boundary-allowlist.json'),
+      JSON.stringify({ entries: [{ path: 'COMMIT_EDITMSG', value: 'Private Customer', reason: 'synthetic fixture' }] }),
+    );
+    const pushed = commit(f.root, 'clean-tree', 'fix: Private Customer');
+
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const result = push(f, `refs/heads/current ${pushed} refs/heads/current ${base}\n`);
+      expect(result.status).toBe(0);
+      expect(fs.readdirSync(f.root).some((name) => name.startsWith('nanoclaw-pre-push.'))).toBe(false);
+    }
+    const messages = records(f.log).filter((record) => record.startsWith('message|'));
+    expect(messages).toHaveLength(2);
+    expect(messages.every((record) => record.includes('/COMMIT_EDITMSG --message-raw'))).toBe(true);
+  });
+
+  it.each(['tree', 'message'] as const)(
+    'honors a later approved exception for an intermediate commit %s',
+    (surface) => {
+      const f = fixture();
+      fs.mkdirSync(path.join(f.root, 'data'));
+      const db = new Database(path.join(f.root, 'data', 'v2.db'));
+      db.exec(
+        "CREATE TABLE workgroups (id TEXT, display_name TEXT); INSERT INTO workgroups VALUES ('fixture-workgroup', 'Private Customer');",
+      );
+      db.close();
+      const base = commit(f.root, 'remote-base');
+      const flagged = commit(
+        f.root,
+        surface === 'tree' ? 'Private Customer' : 'clean-tree',
+        surface === 'message' ? 'fix: Private Customer' : 'imported commit',
+      );
+      const rejected = push(f, `refs/heads/current ${flagged} refs/heads/current ${base}\n`, { realTreeCheck: true });
+      expect(rejected.status).toBe(1);
+      expect(rejected.stderr).toContain('private-identifier');
+
+      const paths = surface === 'tree' ? ['src/gate.ts', 'scripts/gate.ts'] : ['COMMIT_EDITMSG'];
+      fs.writeFileSync(
+        path.join(f.root, '.public-boundary-allowlist.json'),
+        JSON.stringify({
+          entries: paths.map((file) => ({
+            path: file,
+            value: 'Private Customer',
+            reason: 'reviewed synthetic fixture',
+          })),
+        }),
+      );
+      const approved = commit(f.root, 'clean-tip', 'record approved exception');
+      const accepted = push(f, `refs/heads/current ${approved} refs/heads/current ${base}\n`, { realTreeCheck: true });
+      expect(accepted.status, accepted.stderr).toBe(0);
+      expect(fs.readdirSync(f.root).some((name) => name.startsWith('nanoclaw-pre-push.'))).toBe(false);
+    },
+  );
+
+  it('clears the source Git environment before the boundary gate reads a snapshot index', () => {
+    const f = fixture();
+    const snapshot = commit(f.root, 'snapshot-index');
+    runGit(f.root, ['branch', 'snapshot-index', snapshot]);
+    commit(f.root, 'source-index');
+    const result = push(f, `refs/heads/snapshot ${snapshot} refs/heads/snapshot ${zeroSha}\n`, { sourceGitEnv: true });
+
+    expect(result.status).toBe(0);
+    const boundaryRecord = records(f.log).find((record) => record.startsWith('boundary|'))!;
+    expect(boundaryRecord).toContain('snapshot-index');
+    expect(boundaryRecord).not.toContain('source-index');
+  });
+
+  it('uses and removes a caller worktree node_modules link for raw message scanning', () => {
+    const main = fixture();
+    const base = commit(main.root, 'base');
+    const linkedRoot = tempRoot();
+    runGit(main.root, ['-c', 'core.hooksPath=/dev/null', 'worktree', 'add', '--detach', '--quiet', linkedRoot, base]);
+    linkedWorktrees.push({ main: main.root, root: linkedRoot });
+    const hook = path.join(linkedRoot, '.husky', 'pre-push');
+    fs.mkdirSync(path.dirname(hook), { recursive: true });
+    fs.copyFileSync(new URL('../.husky/pre-push', import.meta.url), hook);
+    fs.symlinkSync(
+      new URL('../scripts/check-public-boundary.ts', import.meta.url),
+      path.join(linkedRoot, 'scripts', 'check-public-boundary.ts'),
+    );
+
+    const result = push(
+      { ...main, root: linkedRoot, hook, log: path.join(linkedRoot, 'hook.log') },
+      `refs/heads/current ${base} refs/heads/current ${zeroSha}\n`,
+    );
+
+    expect(result.status).toBe(0);
+    expect(records(path.join(linkedRoot, 'hook.log')).join('\n')).toContain('--message-raw');
+    expect(fs.existsSync(path.join(linkedRoot, 'node_modules'))).toBe(false);
+  });
+
+  it('runs eslint through nice when ionice is unavailable', () => {
+    const f = fixture();
+    const pushed = commit(f.root, 'no-ionice');
+    const result = push(f, `refs/heads/new ${pushed} refs/heads/new ${zeroSha}\n`, { withoutIonice: true });
+
+    expect(result.status).toBe(0);
+    expect(records(f.log)).toContain('nice');
+    expect(records(f.log).join('\n')).toContain('lint');
+  });
+
+  it('cleans up a snapshot that already tracks node_modules without unlinking it', () => {
+    const main = fixture();
+    const base = commit(main.root, 'base');
+    const linkedRoot = tempRoot();
+    runGit(main.root, ['-c', 'core.hooksPath=/dev/null', 'worktree', 'add', '--detach', '--quiet', linkedRoot, base]);
+    linkedWorktrees.push({ main: main.root, root: linkedRoot });
+    fs.symlinkSync('tracked-dependency', path.join(linkedRoot, 'node_modules'));
+    runGit(linkedRoot, ['add', 'node_modules']);
+    runGit(linkedRoot, ['commit', '-m', 'track node modules', '--quiet']);
+    const sha = runGit(linkedRoot, ['rev-parse', 'HEAD']);
+    const hook = path.join(linkedRoot, '.husky', 'pre-push');
+    fs.mkdirSync(path.dirname(hook), { recursive: true });
+    fs.copyFileSync(new URL('../.husky/pre-push', import.meta.url), hook);
+
+    const result = push(
+      { ...main, root: linkedRoot, hook, log: path.join(linkedRoot, 'hook.log') },
+      `refs/heads/current ${sha} refs/heads/current ${zeroSha}\n`,
+    );
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('snapshot unexpectedly contains node_modules');
+    expect(fs.lstatSync(path.join(linkedRoot, 'node_modules')).isSymbolicLink()).toBe(true);
+    expect(runGit(main.root, ['worktree', 'list', '--porcelain'])).not.toContain('nanoclaw-pre-push');
+    expect(fs.readdirSync(linkedRoot).some((name) => name.startsWith('nanoclaw-pre-push.'))).toBe(false);
+  });
+});

@@ -456,7 +456,7 @@ describe('commit message scanning (--message)', () => {
   // History travels with the branch, so a message naming an install identifier
   // publishes upstream exactly like source does. pre-commit scans staged files
   // and pre-push scans the index; neither ever saw the message.
-  function fixture(messageBody: string): { options: ReturnType<typeof resolveOptions>; msgPath: string } {
+  function fixture(messageBody: string, raw = false): { options: ReturnType<typeof resolveOptions>; msgPath: string } {
     const root = initRepo();
     const privateValue = 'Private Customer';
     fs.mkdirSync(path.join(root, '.nanoclaw'), { recursive: true });
@@ -487,6 +487,7 @@ describe('commit message scanning (--message)', () => {
         '.nanoclaw/public-boundary-identifiers',
         '--message',
         'COMMIT_EDITMSG',
+        ...(raw ? ['--message-raw'] : []),
       ],
       root,
     );
@@ -587,6 +588,19 @@ describe('commit message scanning (--message)', () => {
     expect(run(options)).toEqual([]);
   });
 
+  it('scans a committed message below exact scissors in raw mode', () => {
+    const { options } = fixture(
+      'fix: imported\n# ------------------------ >8 ------------------------\nPrivate Customer after scissors\n',
+      true,
+    );
+    expect(run(options)).toEqual([{ file: 'COMMIT_EDITMSG', line: 3, category: 'private-identifier' }]);
+  });
+
+  it('scans a committed trailing comment block in raw mode', () => {
+    const { options } = fixture('fix: imported\n\n# Private Customer in history\n#\n', true);
+    expect(run(options)).toEqual([{ file: 'COMMIT_EDITMSG', line: 3, category: 'private-identifier' }]);
+  });
+
   it('scans ONLY the message, not the tracked tree', () => {
     const { options } = fixture('fix: clean message\n');
     // A tracked file carrying the identifier must not be reported here — this
@@ -598,6 +612,10 @@ describe('commit message scanning (--message)', () => {
 
   it('rejects --message with no path rather than silently scanning everything', () => {
     expect(() => resolveOptions(['--message'])).toThrow(/--message requires a path/);
+  });
+
+  it('rejects --message-raw without a message path', () => {
+    expect(() => resolveOptions(['--message-raw'])).toThrow(/--message-raw requires --message/);
   });
 });
 
@@ -623,11 +641,17 @@ describe('git hooks scan the committing tree, not the main checkout', () => {
     ]);
   });
 
-  // Asserted against the hook text because nothing in this suite executes
-  // husky hooks; the behavioural half is the test above.
-  it.each(['pre-commit', 'pre-push'])('.husky/%s passes --root for the committing worktree', (hook) => {
-    const script = fs.readFileSync(new URL(`../.husky/${hook}`, import.meta.url), 'utf8');
+  // Asserted against the hook text because this suite does not execute Husky.
+  it('.husky/pre-commit passes --root for the committing worktree', () => {
+    const script = fs.readFileSync(new URL('../.husky/pre-commit', import.meta.url), 'utf8');
     expect(script).toMatch(/rev-parse --show-toplevel/);
     expect(script).toMatch(/check:public-boundary\s+--\s+--root\s+"\$worktree_root"/);
+  });
+
+  it('.husky/pre-push passes --root for each pushed snapshot', () => {
+    const script = fs.readFileSync(new URL('../.husky/pre-push', import.meta.url), 'utf8');
+    expect(script).toMatch(/while read -r local_ref local_sha remote_ref remote_sha/);
+    expect(script).toMatch(/worktree add --detach --quiet "\$snapshot_root" "\$1"/);
+    expect(script).toMatch(/check:public-boundary\s+--\s+--root\s+"\$snapshot_root" --index/);
   });
 });

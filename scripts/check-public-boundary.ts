@@ -62,6 +62,9 @@ export interface ScanOptions {
   // slot arrangement committed clean while the gate rejected the same
   // identifier in the diff.
   messagePath?: string;
+  // A committed message is serialized history, not an editor buffer. Unlike
+  // the commit-msg input, its scissors and comment text must be scanned.
+  messageRaw: boolean;
 }
 
 const DEFAULT_DB_RELATIVE = path.join('data', 'v2.db');
@@ -401,6 +404,7 @@ export function resolveOptions(argv: string[], cwd = process.cwd()): ScanOptions
     index: false,
     portable: false,
     allowStructural: false,
+    messageRaw: false,
     allowlistPath: '.public-boundary-allowlist.json',
   };
   for (let i = 0; i < argv.length; i += 1) {
@@ -414,10 +418,12 @@ export function resolveOptions(argv: string[], cwd = process.cwd()): ScanOptions
     else if (arg === '--identifiers') options.identifiersPath = argv[++i] ?? '';
     else if (arg === '--allowlist') options.allowlistPath = argv[++i] ?? '';
     else if (arg === '--message') options.messagePath = argv[++i] ?? '';
+    else if (arg === '--message-raw') options.messageRaw = true;
     else throw new Error(`unknown argument: ${arg}`);
   }
   if (!options.root) throw new Error('--root requires a path');
   if (options.messagePath === '') throw new Error('--message requires a path');
+  if (options.messageRaw && !options.messagePath) throw new Error('--message-raw requires --message');
   options.root = path.resolve(options.root);
   if (options.messagePath) options.messagePath = path.resolve(options.root, options.messagePath);
   if (options.identifiersPath !== undefined)
@@ -543,8 +549,9 @@ export interface RunReport {
 const GIT_SCISSORS = /^# -{24} >8 -{24}$/m;
 const GIT_BARE_COMMENT = /^#[ \t]*$/;
 
-function commitMessageInput(messagePath: string): ScanInput {
+function commitMessageInput(messagePath: string, rawMode: boolean): ScanInput {
   const raw = fs.readFileSync(messagePath, 'utf8');
+  if (rawMode) return { file: path.basename(messagePath), content: Buffer.from(raw, 'utf8') };
   // `commit -v` appends the staged diff below the scissors rule, un-prefixed.
   // Git discards everything from that line down, so it never ships — and
   // pre-commit already gates that same content under its real filenames.
@@ -608,7 +615,9 @@ export function runReport(options: ScanOptions): RunReport {
       : 'install-aware';
 
   const findings = scanInputs(
-    options.messagePath ? [commitMessageInput(options.messagePath)] : trackedInputs(options.root, options.index),
+    options.messagePath
+      ? [commitMessageInput(options.messagePath, options.messageRaw)]
+      : trackedInputs(options.root, options.index),
     privateIdentifiers,
     loadAllowlist(options.allowlistPath),
   );
