@@ -2,7 +2,9 @@ import { execFileSync, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
+import Database from 'better-sqlite3';
 import { afterEach, describe, expect, it } from 'vitest';
 
 const roots: string[] = [];
@@ -37,14 +39,7 @@ function commit(root: string, value: string, message = value): string {
   fs.writeFileSync(path.join(root, 'eslint.config.js'), 'export default [];\n');
   fs.writeFileSync(path.join(root, 'src', 'gate.ts'), `${value}\n`);
   fs.writeFileSync(path.join(root, 'scripts', 'gate.ts'), `${value}\n`);
-  runGit(root, [
-    'add',
-    'eslint.config.js',
-    '.nanoclaw/public-boundary-identifiers',
-    '.public-boundary-allowlist.json',
-    'src/gate.ts',
-    'scripts/gate.ts',
-  ]);
+  runGit(root, ['add', 'eslint.config.js', '.public-boundary-allowlist.json', 'src/gate.ts', 'scripts/gate.ts']);
   runGit(root, ['commit', '-m', message, '--quiet']);
   return runGit(root, ['rev-parse', 'HEAD']);
 }
@@ -55,6 +50,7 @@ function fixture(objectFormat?: 'sha256'): { root: string; hook: string; log: st
   runGit(root, ['config', 'user.email', 'test@example.invalid']);
   runGit(root, ['config', 'user.name', 'Hook Test']);
   fs.mkdirSync(path.join(root, '.nanoclaw'), { recursive: true });
+  // Install inventory stays untracked; snapshots resolve it from their common checkout.
   fs.writeFileSync(path.join(root, '.nanoclaw', 'public-boundary-identifiers'), 'Private Customer\n');
   fs.writeFileSync(path.join(root, '.public-boundary-allowlist.json'), '{"entries": []}\n');
   fs.mkdirSync(path.join(root, 'scripts'), { recursive: true });
@@ -79,6 +75,9 @@ IFS= read -r consumed || true
 value=$(git -C "$root" show :src/gate.ts) || exit 1
 printf 'boundary|%s|%s|%s\\n' "$root" "$value" "$consumed" >> "$HOOK_LOG"
 [ "\${HOOK_FAIL:-}" != "boundary:$value" ] || exit 1
+if [ "\${HOOK_CHECK_TREE:-}" = 1 ]; then
+  exec "$HOOK_REAL_TSX" "$HOOK_REAL_CHECKER" "$@"
+fi
 `,
   );
   writeExecutable(
@@ -132,6 +131,7 @@ function push(
     sourceGitEnv?: boolean;
     commandScopedConfig?: 'count' | 'parameters';
     withoutIonice?: boolean;
+    realTreeCheck?: boolean;
   } = {},
 ) {
   if (options.withoutIonice) {
@@ -163,6 +163,8 @@ exec "$@"
       HOOK_REQUIRE_CONFIG: options.commandScopedConfig ?? '',
       HOOK_REAL_GIT: realGit,
       HOOK_REAL_TSX: realTsx,
+      HOOK_REAL_CHECKER: fileURLToPath(new URL('./check-public-boundary.ts', import.meta.url)),
+      HOOK_CHECK_TREE: options.realTreeCheck ? '1' : '',
       ...(options.sourceGitEnv ? { GIT_DIR: path.join(f.root, '.git'), GIT_WORK_TREE: f.root } : {}),
       ...(options.commandScopedConfig === 'count'
         ? { GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'user.name', GIT_CONFIG_VALUE_0: 'Hook Test' }
@@ -410,6 +412,44 @@ describe('.husky/pre-push', () => {
     expect(messages).toHaveLength(2);
     expect(messages.every((record) => record.includes('/COMMIT_EDITMSG --message-raw'))).toBe(true);
   });
+
+  it.each(['tree', 'message'] as const)(
+    'honors a later approved exception for an intermediate commit %s',
+    (surface) => {
+      const f = fixture();
+      fs.mkdirSync(path.join(f.root, 'data'));
+      const db = new Database(path.join(f.root, 'data', 'v2.db'));
+      db.exec(
+        "CREATE TABLE workgroups (id TEXT, display_name TEXT); INSERT INTO workgroups VALUES ('fixture-workgroup', 'Private Customer');",
+      );
+      db.close();
+      const base = commit(f.root, 'remote-base');
+      const flagged = commit(
+        f.root,
+        surface === 'tree' ? 'Private Customer' : 'clean-tree',
+        surface === 'message' ? 'fix: Private Customer' : 'imported commit',
+      );
+      const rejected = push(f, `refs/heads/current ${flagged} refs/heads/current ${base}\n`, { realTreeCheck: true });
+      expect(rejected.status).toBe(1);
+      expect(rejected.stderr).toContain('private-identifier');
+
+      const paths = surface === 'tree' ? ['src/gate.ts', 'scripts/gate.ts'] : ['COMMIT_EDITMSG'];
+      fs.writeFileSync(
+        path.join(f.root, '.public-boundary-allowlist.json'),
+        JSON.stringify({
+          entries: paths.map((file) => ({
+            path: file,
+            value: 'Private Customer',
+            reason: 'reviewed synthetic fixture',
+          })),
+        }),
+      );
+      const approved = commit(f.root, 'clean-tip', 'record approved exception');
+      const accepted = push(f, `refs/heads/current ${approved} refs/heads/current ${base}\n`, { realTreeCheck: true });
+      expect(accepted.status, accepted.stderr).toBe(0);
+      expect(fs.readdirSync(f.root).some((name) => name.startsWith('nanoclaw-pre-push.'))).toBe(false);
+    },
+  );
 
   it('clears the source Git environment before the boundary gate reads a snapshot index', () => {
     const f = fixture();

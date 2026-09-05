@@ -3,6 +3,8 @@
 set -e
 repo_root=$(dirname "$(cd "$(git rev-parse --git-common-dir)" && pwd)")
 worktree_root=$(git rev-parse --show-toplevel)
+# Reviewed exceptions are current policy, even when inspecting older content.
+allowlist_path="$worktree_root/.public-boundary-allowlist.json"
 git_local_env=$(git rev-parse --local-env-vars)
 # Git hooks export the invoking checkout's repository selection variables.
 # Keep command-scoped `git -c` configuration so remote access still inherits it.
@@ -114,10 +116,10 @@ snapshot_commit() {
     ln -s "$repo_root/node_modules" "$worktree_root/node_modules"
     worktree_node_modules_link=1
   fi
-  "$worktree_root/node_modules/.bin/tsx" "$worktree_root/scripts/check-public-boundary.ts" --root "$snapshot_root" --message "$commit_message" --message-raw </dev/null
+  "$worktree_root/node_modules/.bin/tsx" "$worktree_root/scripts/check-public-boundary.ts" --root "$snapshot_root" --message "$commit_message" --message-raw --allowlist "$allowlist_path" </dev/null
   remove_file "$commit_message"
   commit_message=''
-  (cd "$repo_root" && pnpm run check:public-boundary -- --root "$snapshot_root" --index) </dev/null
+  (cd "$repo_root" && pnpm run check:public-boundary -- --root "$snapshot_root" --index --allowlist "$allowlist_path") </dev/null
   if command -v ionice >/dev/null 2>&1; then
     (cd "$snapshot_root" && ionice -c3 nice -n 10 node_modules/.bin/eslint --quiet src/ scripts/) </dev/null
   else
