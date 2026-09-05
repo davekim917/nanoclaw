@@ -35,6 +35,7 @@ import {
   taskThreadId,
   updateSession,
 } from './db/sessions.js';
+import { insertOrAdopt } from './db/insert-or-adopt.js';
 import { getAgentMailbox } from './mailbox/index.js';
 import type { MailboxSession, MailboxSessionKey } from './mailbox/types.js';
 // The host's registered implementation is NanoclawAgentMailbox, so every
@@ -377,23 +378,18 @@ export async function resolveSession(
     created_at: new Date().toISOString(),
   };
 
-  try {
-    await createSession(session);
-  } catch (err) {
-    // The lookup above yields (async driver), so two concurrent first messages
-    // for the same target can both see no session and both insert; the unique
-    // active-session index lets exactly one win. Re-resolve to the winner —
-    // the same shape as `resolveActiveSession` in db/scheduled-tasks.ts.
-    if ((err as { code?: string }).code !== 'SQLITE_CONSTRAINT_UNIQUE') throw err;
-    const winner =
-      sessionMode === 'agent-shared'
-        ? await findSessionByAgentGroup(agentGroupId)
-        : messagingGroupId
-          ? await findSessionForAgent(agentGroupId, messagingGroupId, sessionMode === 'shared' ? null : threadId)
-          : undefined;
-    if (winner) return { session: winner, created: false };
-    throw err;
-  }
+  // The lookup above yields (async driver), so two concurrent first messages
+  // for the same target can both see no session and both insert; the unique
+  // active-session index lets exactly one win and the loser adopts it. `reload`
+  // repeats the exact lookup this function opened with.
+  const { row: resolved, created } = await insertOrAdopt(session, createSession, () =>
+    sessionMode === 'agent-shared'
+      ? findSessionByAgentGroup(agentGroupId)
+      : messagingGroupId
+        ? findSessionForAgent(agentGroupId, messagingGroupId, sessionMode === 'shared' ? null : threadId)
+        : Promise.resolve(undefined),
+  );
+  if (!created) return { session: resolved, created: false };
   initSessionFolder(agentGroupId, id);
   log.info('Session created', {
     id,
@@ -458,20 +454,20 @@ export async function resolveTaskSession(
     created_at: new Date().toISOString(),
   };
 
-  try {
-    await createSession(session);
-  } catch (err) {
-    // Same race as `resolveSession`: two scheduling operations on one series
-    // can both yield at the lookup; the unique active-session index lets one
-    // insert win, and the loser adopts it (mirrors `resolveActiveSession`).
-    if ((err as { code?: string }).code !== 'SQLITE_CONSTRAINT_UNIQUE') throw err;
-    const winner = await findSystemSession(agentGroupId, threadId);
-    if (!winner) throw err;
-    if (routingPlatformId != null && winner.task_routing_platform_id !== routingPlatformId) {
-      await setTaskRoutingPlatformId(winner.id, routingPlatformId);
-      winner.task_routing_platform_id = routingPlatformId;
+  // Same race as `resolveSession`: two scheduling operations on one series can
+  // both yield at the lookup; the unique active-session index lets one insert
+  // win, and the loser adopts it.
+  const { row: resolved, created } = await insertOrAdopt(session, createSession, () =>
+    findSystemSession(agentGroupId, threadId),
+  );
+  if (!created) {
+    // Re-stamp the adopted winner exactly as the cache-hit branch above does —
+    // the column answers "where is this series routed NOW".
+    if (routingPlatformId != null && resolved.task_routing_platform_id !== routingPlatformId) {
+      await setTaskRoutingPlatformId(resolved.id, routingPlatformId);
+      resolved.task_routing_platform_id = routingPlatformId;
     }
-    return { session: winner, created: false };
+    return { session: resolved, created: false };
   }
   if (routingPlatformId != null) {
     await setTaskRoutingPlatformId(id, routingPlatformId);

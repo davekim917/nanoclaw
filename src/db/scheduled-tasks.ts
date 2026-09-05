@@ -23,6 +23,8 @@ import { log } from '../log.js';
 import { getAgentMailbox } from '../mailbox/index.js';
 import { resolveTaskSession, withExistingMailboxSession, withMailboxSession } from '../session-manager.js';
 import type { NanoclawMailboxSession } from '../modules/mailbox/index.js';
+import type { Session } from '../types.js';
+import { insertOrAdopt } from './insert-or-adopt.js';
 import {
   createSession,
   findSessionByAgentGroupAndMessagingGroup,
@@ -137,32 +139,33 @@ function initStubSessionFolder(agentGroupId: string, sessionId: string): void {
  * Concurrency: the lookup-then-insert is racy without protection — two
  * simultaneous callers can both miss the existing row and both try to
  * INSERT. The `sessions_channel_root_unique` partial index (migration 024)
- * makes the second INSERT throw `SQLITE_CONSTRAINT_UNIQUE`, which we catch
- * and resolve by re-lookup.
+ * makes the second INSERT throw `SQLITE_CONSTRAINT_UNIQUE`; `insertOrAdopt`
+ * (`db/insert-or-adopt.ts`) catches it and resolves by re-lookup. This was the
+ * precedent every other site copied by hand; it now shares their primitive.
  */
 export async function resolveActiveSession(agentGroupId: string, messagingGroupId: string): Promise<{ id: string }> {
   const existing = await findSessionByAgentGroupAndMessagingGroup(agentGroupId, messagingGroupId);
   if (existing) return { id: existing.id };
 
   const sessionId = generateSessionId();
-  try {
-    await createSession({
-      id: sessionId,
-      agent_group_id: agentGroupId,
-      messaging_group_id: messagingGroupId,
-      thread_id: null,
-      agent_provider: null,
-      status: 'active',
-      container_status: 'stopped',
-      last_active: null,
-      created_at: new Date().toISOString(),
-    });
-  } catch (err) {
-    if ((err as { code?: string }).code !== 'SQLITE_CONSTRAINT_UNIQUE') throw err;
-    const winner = await findSessionByAgentGroupAndMessagingGroup(agentGroupId, messagingGroupId);
-    if (winner) return { id: winner.id };
-    throw err;
-  }
+  const candidate: Session = {
+    id: sessionId,
+    agent_group_id: agentGroupId,
+    messaging_group_id: messagingGroupId,
+    thread_id: null,
+    agent_provider: null,
+    status: 'active',
+    container_status: 'stopped',
+    last_active: null,
+    created_at: new Date().toISOString(),
+  };
+  const { row, created } = await insertOrAdopt(candidate, createSession, () =>
+    findSessionByAgentGroupAndMessagingGroup(agentGroupId, messagingGroupId),
+  );
+  // Adopted the concurrent winner: the folder belongs to the winner's own
+  // call, which runs `initStubSessionFolder` for it — same as the cache-hit
+  // return above, which has never initialized a folder either.
+  if (!created) return { id: row.id };
   initStubSessionFolder(agentGroupId, sessionId);
   return { id: sessionId };
 }

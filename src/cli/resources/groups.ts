@@ -17,6 +17,7 @@ import { buildAgentGroupImage, killContainer, wakeContainer } from '../../contai
 import { restartAgentGroupContainers } from '../../container-restart.js';
 import { createAgentGroup, getAgentGroup, getAgentGroupByFolder } from '../../db/agent-groups.js';
 import { getRawDb, hasTableRaw } from '../../db/connection.js';
+import { insertOrAdopt } from '../../db/insert-or-adopt.js';
 import { getSession } from '../../db/sessions.js';
 import { writeSessionMessage } from '../../session-manager.js';
 import {
@@ -162,7 +163,18 @@ registerResource({
         }
         const id = `ag-${randomUUID()}`;
         const group: AgentGroup = { id, name, folder, agent_provider: null, created_at: new Date().toISOString() };
-        await createAgentGroup(group);
+        // `getAgentGroupByFolder` yields (async driver), so two concurrent
+        // `groups create` calls for one folder can both miss and both insert
+        // on the UNIQUE folder key. This operation is documented idempotent on
+        // --folder, so the loser adopts the winner and provisions it exactly as
+        // the existing-row branch above does — both callers return ok, one row.
+        const { row: adopted, created } = await insertOrAdopt(group, createAgentGroup, () =>
+          getAgentGroupByFolder(folder),
+        );
+        if (!created) {
+          initGroupFilesystem(adopted);
+          return adopted;
+        }
         // Provision the workspace folder and the `container_configs` row that
         // `getContainerConfig` and the spawn path require. Without this, a
         // group created via `ncl groups create` would throw "Container config

@@ -34,6 +34,7 @@ import {
   updateMessagingGroup,
 } from './db/messaging-groups.js';
 import { getRawDb } from './db/connection.js';
+import { insertOrAdopt } from './db/insert-or-adopt.js';
 import {
   claimChannelIngress,
   claimDeferredChannelIngress,
@@ -308,16 +309,20 @@ export async function autoCreateMessagingGroup(
   mg: MessagingGroup,
   instance: string,
 ): Promise<{ mg: MessagingGroup; agentCount: number }> {
-  try {
-    await createMessagingGroup(mg);
-  } catch (err) {
-    if ((err as { code?: string }).code !== 'SQLITE_CONSTRAINT_UNIQUE') throw err;
+  // `getMessagingGroupWithAgentCount` returns the row AND its wiring count,
+  // but the primitive's `reload` is row-shaped — carry the count out sideways
+  // so the adopted row keeps the wirings the winner may already have, instead
+  // of the 0 a freshly-inserted row has.
+  let adoptedAgentCount = 0;
+  const { row, created } = await insertOrAdopt(mg, createMessagingGroup, async () => {
     const winner = await getMessagingGroupWithAgentCount(mg.channel_type, mg.platform_id, instance);
-    if (winner) return winner;
-    throw err;
-  }
+    if (!winner) return undefined;
+    adoptedAgentCount = winner.agentCount;
+    return winner.mg;
+  });
+  if (!created) return { mg: row, agentCount: adoptedAgentCount };
   log.info('Auto-created messaging group', { id: mg.id, channelType: mg.channel_type, platformId: mg.platform_id });
-  return { mg, agentCount: 0 };
+  return { mg: row, agentCount: 0 };
 }
 
 export type UnwiredChannelResolverFn = (
