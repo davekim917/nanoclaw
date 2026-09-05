@@ -16,7 +16,7 @@ import { resolveContainerResources, type ContainerResources } from '../../contai
 import { buildAgentGroupImage, killContainer, wakeContainer } from '../../container-runner.js';
 import { restartAgentGroupContainers } from '../../container-restart.js';
 import { createAgentGroup, getAgentGroup, getAgentGroupByFolder } from '../../db/agent-groups.js';
-import { getRawDb, hasTableRaw } from '../../db/connection.js';
+import { getDb, getRawDb, hasTable } from '../../db/connection.js';
 import { insertOrAdopt } from '../../db/insert-or-adopt.js';
 import { getSession } from '../../db/sessions.js';
 import { writeSessionMessage } from '../../session-manager.js';
@@ -211,16 +211,22 @@ registerResource({
       handler: async (args) => {
         const id = args.id as string;
         if (!id) throw new Error('--id is required');
-        const db = getRawDb();
 
         // Verify the group exists before doing anything — preserves the
         // genericDelete behaviour of throwing "not found" for unknown IDs.
-        const exists = db.prepare('SELECT 1 FROM agent_groups WHERE id = ? LIMIT 1').get(id);
+        const exists = await getDb().get('SELECT 1 FROM agent_groups WHERE id = ? LIMIT 1', id);
         if (!exists) throw new Error(`group not found: ${id}`);
 
-        const hasAgentDestinations = hasTableRaw(db, 'agent_destinations');
-        const hasPendingApprovals = hasTableRaw(db, 'pending_approvals');
-        const hasWorkgroups = hasTableRaw(db, 'workgroups');
+        const hasAgentDestinations = await hasTable(getDb(), 'agent_destinations');
+        const hasPendingApprovals = await hasTable(getDb(), 'pending_approvals');
+        const hasWorkgroups = await hasTable(getDb(), 'workgroups');
+
+        // The transaction below stays on the RAW synchronous handle
+        // deliberately (seam 3 §4.2 — a fork transaction converts to the
+        // driver only in PR 6, all ten sites at once); only fetched now,
+        // right before it, since everything above this line already moved
+        // to the async driver.
+        const db = getRawDb();
 
         // FK-ordered cascade. Single sync IMMEDIATE transaction — better-sqlite3
         // rolls back the whole thing if any statement throws (e.g. an FK
