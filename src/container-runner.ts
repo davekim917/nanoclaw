@@ -2350,9 +2350,27 @@ function stopUnadoptable(containerName: string, why: string, sessionId: string |
  * is a writer without a reader.
  */
 export async function adoptRunningSessions(
-  deps: { list?: () => InstallContainerScope[] } = {},
+  deps: {
+    list?: () => InstallContainerScope[];
+    /**
+     * D1's boot-scope partition (`quiesceWorkgroupsForBootMountChange(...)
+     * .survivableSessionIds`): the sessions whose containers the door chose to
+     * leave running, computed before anything was stopped. When given it is
+     * THE candidate set — the same partition series G's startup warn skips —
+     * and a listed container outside it is stopped here, fail-closed, because
+     * the door meant to stop it. Absent, every listed container is a candidate
+     * (the pre-D1 tree, and tests that drive the listing directly).
+     */
+    survivableSessionIds?: ReadonlySet<string> | readonly string[];
+  } = {},
 ): Promise<StartupReconciliation> {
   if (deps.list) adoptionListing = deps.list;
+  const survivable =
+    deps.survivableSessionIds === undefined
+      ? null
+      : deps.survivableSessionIds instanceof Set
+        ? (deps.survivableSessionIds as ReadonlySet<string>)
+        : new Set(deps.survivableSessionIds as readonly string[]);
   const counts: StartupReconciliation = { adopted: 0, stopped: 0, pendingClaim: 0, fencedInbound: 0 };
   let containers: InstallContainerScope[];
   try {
@@ -2363,7 +2381,16 @@ export async function adoptRunningSessions(
   }
   for (const container of containers) {
     if (!container.sessionId) {
+      // Unreachable for a survivor under D1: a container with no session label
+      // is one adoption could never claim, so the door fails it closed into
+      // its stop set. Kept as a defensive stop for a listing the door did not
+      // partition.
       stopUnadoptable(container.name, 'no session label', null);
+      counts.stopped += 1;
+      continue;
+    }
+    if (survivable && !survivable.has(container.sessionId)) {
+      stopUnadoptable(container.name, 'outside the boot-scope survivable partition', container.sessionId);
       counts.stopped += 1;
       continue;
     }

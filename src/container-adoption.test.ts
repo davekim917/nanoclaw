@@ -341,6 +341,25 @@ describe('adoptRunningSessions', () => {
     expect(await getSessionClaim('sess-archived')).toBeUndefined();
   });
 
+  it('a listed container outside the survivable partition is stopped, not adopted', async () => {
+    await seedSession(TEST_DATA_DIR, 'sess-survivable');
+    await seedSession(TEST_DATA_DIR, 'sess-must-stop');
+    fakes.listing = [survivor('sess-survivable'), survivor('sess-must-stop')];
+
+    // D1's partition is the candidate set; a container the door meant to stop
+    // but the listing still shows is stopped here, fail-closed.
+    const reconciled = await adoptRunningSessions({
+      list: fakes.list,
+      survivableSessionIds: ['sess-survivable'],
+    });
+
+    expect(reconciled).toEqual({ adopted: 1, stopped: 1, pendingClaim: 0, fencedInbound: 0 });
+    expect(fakes.stopped).toEqual(['nanoclaw-v2-sess-must-stop']);
+    expect(isAdoptedContainer('sess-survivable')).toBe(true);
+    expect(isContainerRunning('sess-must-stop')).toBe(false);
+    expect(await getSessionClaim('sess-must-stop')).toBeUndefined();
+  });
+
   it('a container with no session label is stopped', async () => {
     fakes.listing = [{ name: 'nanoclaw-v2-unlabeled', workgroupId: WORKGROUP_ID, sessionId: null, groupId: null }];
 
