@@ -59,6 +59,7 @@ import {
   hostGatewayArgs,
   killContainerHard,
   readonlyMountArgs,
+  runtimeShowsRunning,
   stopContainer,
 } from './container-runtime.js';
 import { checkAgentRunnerDepsDrift } from './agent-runner-image-check.js';
@@ -85,6 +86,7 @@ import {
   getWorkgroupOnecliSecretsById,
 } from './db/agent-groups.js';
 import { getRawDb, hasTableRaw } from './db/connection.js';
+import { centralTransaction } from './db/central-lease.js';
 import {
   getLiveHostInstance,
   getSessionClaim,
@@ -460,16 +462,36 @@ async function selfLeaseIsLive(instanceId: string): Promise<boolean> {
  * peer can answer, and a process whose OWN lease has lapsed is refused too
  * (`selfLeaseIsLive`): a claim every peer reads as dead is not a claim.
  *
- * Both of those reads, and the peer read below, happen inside this function
- * and therefore inside the single `await` the spawn path makes for the claim.
- * The ordering argument is unchanged: the claim is still the last `await`
- * before `spawn()`, and the guard point stays adjacent to it.
+ * Both of those reads, the peer read and the container read below all happen
+ * inside this function and therefore inside the single `await` the spawn path
+ * makes for the claim. The ordering argument is unchanged: the claim is still
+ * the last `await` before `spawn()`, and the guard point stays adjacent to it.
  *
- * The container half of the fence — refusing a claim whose container is still
- * running untracked — lands with adoption, the series that creates that state
- * (plan §4.3.4, P2).
+ * Two fences, in order (plan §4.3.4):
+ *
+ * P2 — the container half. An UNTRACKED container is still running for this
+ * session: a survivor of the previous host that this one has not adopted.
+ * Fence on the container, not the incarnation — a crashed host's claim is
+ * deliberately takeover-able, so the incarnation cannot tell "nobody runs this
+ * session" from "a survivor runs it". Steady state never pays: a clean exit
+ * nulls `container_ref`, and a session this host tracks short-circuits on the
+ * registry long before here. Fails CLOSED — "cannot prove absence" never reads
+ * as "absent". The adopter holds the survivor by definition and skips it. A
+ * runtime call, so it sits OUTSIDE the transaction below.
+ *
+ * P1 — the peer half, and the incarnation CAS, as ONE atomic step (#439, item
+ * 1). The holder's liveness verdict and the conditional UPDATE were two
+ * statements, and a peer whose lease had expired but renewed in between was
+ * overwritten while its container kept running. `centralTransaction` opens
+ * `BEGIN IMMEDIATE` under the fork's central lease, so the peer's renewal
+ * waits behind the read → verdict → CAS instead of landing inside it. The
+ * closure is DB calls only, sequential, with no other effect (plan §4.4).
  */
-async function claimSessionRun(sessionId: string, containerRef: string): Promise<number | null> {
+async function claimSessionRun(
+  sessionId: string,
+  containerRef: string,
+  opts: { adopting?: boolean } = {},
+): Promise<number | null> {
   const self = await resolveClaimantId();
   if (!self) {
     log.warn('Refusing session claim: no durable host instance id — lease not started', { sessionId });
@@ -479,25 +501,50 @@ async function claimSessionRun(sessionId: string, containerRef: string): Promise
     log.warn("Refusing session claim: this host's lease is not live", { sessionId, instanceId: self });
     return null;
   }
-  const current = await getSessionClaim(sessionId);
-  if (current?.claimed_by && current.claimed_by !== self) {
-    const holder = await getLiveHostInstance(current.claimed_by, new Date().toISOString());
-    if (holder) {
-      log.warn('Refusing session claim held by a live peer host', {
-        sessionId,
-        holder: current.claimed_by,
-        claimant: self,
-      });
-      return null;
+  if (!opts.adopting && !activeContainers.has(sessionId)) {
+    const previous = await getSessionClaim(sessionId);
+    if (previous?.container_ref) {
+      let running: boolean;
+      try {
+        running = runtimeShowsRunning(previous.container_ref);
+      } catch (err) {
+        log.warn('Refusing session claim — cannot prove the previous container is gone', {
+          sessionId,
+          containerRef: previous.container_ref,
+          err,
+        });
+        return null;
+      }
+      if (running) {
+        log.warn('Refusing session claim — a container is still running for this session', {
+          sessionId,
+          containerRef: previous.container_ref,
+        });
+        return null;
+      }
     }
   }
-  return tryClaimSession({
-    sessionId,
-    instanceId: self,
-    expectedIncarnation: current?.incarnation ?? 0,
-    containerRef,
-    now: new Date().toISOString(),
-  });
+  return centralTransaction(async () => {
+    const current = await getSessionClaim(sessionId);
+    if (current?.claimed_by && current.claimed_by !== self) {
+      const holder = await getLiveHostInstance(current.claimed_by, new Date().toISOString());
+      if (holder) {
+        log.warn('Refusing session claim held by a live peer host', {
+          sessionId,
+          holder: current.claimed_by,
+          claimant: self,
+        });
+        return null;
+      }
+    }
+    return tryClaimSession({
+      sessionId,
+      instanceId: self,
+      expectedIncarnation: current?.incarnation ?? 0,
+      containerRef,
+      now: new Date().toISOString(),
+    });
+  }, 'session-claim');
 }
 
 /** Release our claim at this incarnation. Never throws — a failed release is

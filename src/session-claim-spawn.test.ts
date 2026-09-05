@@ -57,6 +57,14 @@ const ABSENT_CONTAINER_RUNTIME_BIN = vi.hoisted(() => 'nanoclaw-absent-container
 vi.mock('./container-runtime.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('./container-runtime.js')>()),
   CONTAINER_RUNTIME_BIN: ABSENT_CONTAINER_RUNTIME_BIN,
+  // The P2 probe (`docker ps`), answered from the test's own fake runtime so
+  // no listing ever leaves the process. Every call is counted: the steady-state
+  // proof is that a claim with no `container_ref` makes none.
+  runtimeShowsRunning: (name: string) => {
+    hooks.runtimeCalls += 1;
+    if (hooks.runtimeListingFails) throw new Error('Cannot connect to the Docker daemon');
+    return hooks.runtimeRunning.has(name);
+  },
 }));
 
 /**
@@ -88,8 +96,17 @@ const hooks = vi.hoisted(() => ({
   releaseGates: new Map<number, Promise<void>>(),
   /** Parks the wake at its first await (background storage admission). */
   storageGate: null as Promise<void> | null,
+  /** Container names the fake runtime reports as running (P2). */
+  runtimeRunning: new Set<string>(),
+  /** `runtimeShowsRunning` throws — the runtime cannot be asked. */
+  runtimeListingFails: false,
+  /** How many times the claim asked the runtime. */
+  runtimeCalls: 0,
   reset(): void {
     this.events.length = 0;
+    this.runtimeRunning.clear();
+    this.runtimeListingFails = false;
+    this.runtimeCalls = 0;
     this.staleRead = false;
     this.claimWriteFails = false;
     this.leaseStartFails = false;
@@ -771,6 +788,75 @@ describe('claim-first spawn', () => {
     } finally {
       letTheReleaseLand();
     }
+  });
+
+  // ── P2, the container half of the fence (seam 4 series E, plan §4.3.4) ──
+
+  it('a spawn is refused while an untracked container is still running for the session', async () => {
+    await seedSession('sess-survivor');
+    // The previous host crashed: its claim is takeover-able (no live lease),
+    // but the container it started is still running. Divergence 3 — the
+    // incarnation alone would let this spawn through.
+    await seedForeignClaim('sess-survivor', 'dead-host', 3);
+    hooks.runtimeRunning.add('nanoclaw-v2-dead-host');
+
+    await expect(wakeContainer(callerSnapshot('sess-survivor'))).resolves.toBe(false);
+
+    expect(hasContainerEverRun('sess-survivor'), 'a second container was started beside the survivor').toBe(false);
+    expect(hooks.events.filter((event) => event.startsWith('claim:sess-survivor:'))).toEqual([]);
+    expect(
+      vi
+        .mocked(log.warn)
+        .mock.calls.filter(
+          (call) => call[0] === 'Refusing session claim — a container is still running for this session',
+        ),
+    ).toHaveLength(1);
+    // The survivor's row is untouched: a refused claim writes nothing.
+    const claim = await getSessionClaim('sess-survivor');
+    expect([claim?.incarnation, claim?.claimed_by, claim?.container_ref]).toEqual([
+      3,
+      'dead-host',
+      'nanoclaw-v2-dead-host',
+    ]);
+  });
+
+  it('a claim with a null container_ref never queries the runtime', async () => {
+    await seedSession('sess-steady');
+
+    // First spawn ever: no row at all.
+    await wakeContainer(callerSnapshot('sess-steady'));
+    await waitForFinalize('sess-steady');
+    expect(hooks.runtimeCalls).toBe(0);
+
+    // A respawn after a clean exit: the release nulled `container_ref`, so the
+    // steady-state cost of P2 is one row read and no runtime call.
+    const released = await getSessionClaim('sess-steady');
+    expect(released?.container_ref).toBeNull();
+    await wakeContainer(callerSnapshot('sess-steady'));
+    await waitForFinalize('sess-steady');
+    expect(hooks.runtimeCalls).toBe(0);
+    expect(hooks.events).toContain('claim:sess-steady:2');
+  });
+
+  it('a runtime listing failure refuses the spawn', async () => {
+    await seedSession('sess-unprovable');
+    await seedForeignClaim('sess-unprovable', 'dead-host', 3);
+    hooks.runtimeListingFails = true;
+
+    await expect(wakeContainer(callerSnapshot('sess-unprovable'))).resolves.toBe(false);
+
+    // Fails CLOSED: "cannot prove absence" never reads as "absent".
+    expect(hasContainerEverRun('sess-unprovable')).toBe(false);
+    expect(hooks.runtimeCalls).toBe(1);
+    expect(
+      vi
+        .mocked(log.warn)
+        .mock.calls.filter(
+          (call) => call[0] === 'Refusing session claim — cannot prove the previous container is gone',
+        ),
+    ).toHaveLength(1);
+    const claim = await getSessionClaim('sess-unprovable');
+    expect([claim?.incarnation, claim?.claimed_by]).toEqual([3, 'dead-host']);
   });
 
   // LAST runtime case in the file, deliberately: `stopAllContainers()` latches
