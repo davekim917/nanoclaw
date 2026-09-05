@@ -15,7 +15,7 @@
  * it cannot prove that nothing happened — `dispatch()` posts approval cards
  * before it can fail, so an exception is "outcome unknown", not "nothing ran".
  */
-import { getRawDb } from '../db/connection.js';
+import { getDb, getRawDb } from '../db/connection.js';
 import { log } from '../log.js';
 import type { ResponseFrame } from './frame.js';
 
@@ -36,35 +36,41 @@ export type CliRequestClaim =
  * Claim the request for execution, or report what a previous attempt did with
  * it. Atomic: the INSERT either wins the row or conflicts, in one statement.
  */
-export function claimCliRequest(sessionId: string, requestId: string, command: string): CliRequestClaim {
-  const db = getRawDb();
-
-  const claimed = db
-    .prepare(
-      `INSERT INTO cli_request_executions (session_id, request_id, command, status, claimed_at)
-       VALUES (@session_id, @request_id, @command, 'executing', @claimed_at)
-       ON CONFLICT(session_id, request_id) DO NOTHING
-       RETURNING request_id`,
-    )
-    .get({
+export async function claimCliRequest(
+  sessionId: string,
+  requestId: string,
+  command: string,
+): Promise<CliRequestClaim> {
+  const claimed = await getDb().get<{ request_id: string }>(
+    `INSERT INTO cli_request_executions (session_id, request_id, command, status, claimed_at)
+     VALUES (@session_id, @request_id, @command, 'executing', @claimed_at)
+     ON CONFLICT(session_id, request_id) DO NOTHING
+     RETURNING request_id`,
+    {
       session_id: sessionId,
       request_id: requestId,
       command,
       // ISO, never datetime('now') — the naive shape is misparsed as local
       // time by `new Date()`. See the CLAUDE.md timestamp rule.
       claimed_at: new Date().toISOString(),
-    }) as { request_id: string } | undefined;
+    },
+  );
 
   if (claimed) return { state: 'fresh' };
 
-  const row = db
-    .prepare(`SELECT status, response FROM cli_request_executions WHERE session_id = ? AND request_id = ?`)
-    .get(sessionId, requestId) as { status: string; response: string | null } | undefined;
+  const row = await getDb().get<{ status: string; response: string | null }>(
+    `SELECT status, response FROM cli_request_executions WHERE session_id = ? AND request_id = ?`,
+    sessionId,
+    requestId,
+  );
 
-  // The INSERT conflicted, so the row existed a statement ago. better-sqlite3
-  // is synchronous and the host is single-threaded, so nothing can have
-  // deleted it in between — but if it somehow has, fail closed: an unknown
-  // outcome must never become a second execution.
+  // The INSERT conflicted, so the row existed a statement ago. Seam 3: this
+  // read is now a separate awaited driver call, not one synchronous run with
+  // the INSERT above, so in principle something could delete the row in
+  // between — but only `pruneCliRequestExecutions` ever deletes a row here,
+  // and it only touches ones with `completed_at IS NOT NULL`, which a just-
+  // claimed ('executing') row never has. If it somehow has vanished anyway,
+  // fail closed: an unknown outcome must never become a second execution.
   if (!row) return { state: 'executing' };
 
   if (row.status === 'done' && row.response) {
@@ -90,19 +96,18 @@ export function claimCliRequest(sessionId: string, requestId: string, command: s
 }
 
 /** Record the outcome. A retry after this replays `response` verbatim. */
-export function completeCliRequest(sessionId: string, requestId: string, response: ResponseFrame): void {
-  getRawDb()
-    .prepare(
-      `UPDATE cli_request_executions
-          SET status = 'done', response = @response, completed_at = @completed_at
-        WHERE session_id = @session_id AND request_id = @request_id AND status != 'done'`,
-    )
-    .run({
+export async function completeCliRequest(sessionId: string, requestId: string, response: ResponseFrame): Promise<void> {
+  await getDb().run(
+    `UPDATE cli_request_executions
+        SET status = 'done', response = @response, completed_at = @completed_at
+      WHERE session_id = @session_id AND request_id = @request_id AND status != 'done'`,
+    {
       session_id: sessionId,
       request_id: requestId,
       response: JSON.stringify(response),
       completed_at: new Date().toISOString(),
-    });
+    },
+  );
 }
 
 /**
