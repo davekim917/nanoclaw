@@ -3,12 +3,15 @@
  * are stopped by a host shutdown/restart, so the interruption is announced
  * and self-accounted instead of silent.
  *
- * Every host start stops all install-labeled containers — graceful shutdown
- * via `stopAllContainers`, startup via `cleanupOrphansStrict` (quiescence is
- * a hard precondition for workgroup FS reconciliation). Without this, a
- * mid-work session loses its turn and its background workers with no
- * explanation, and only comes back when a human pings — the exact
- * "said it was working, then silence" failure family.
+ * A note is for a session whose container THIS restart actually interrupts —
+ * one the host is stopping on the way down, or one whose container this boot
+ * will stop on the way up — and never for one that survives. Both call sites
+ * are handed the set they apply to, because "every container this host tracks"
+ * and "every container this restart interrupts" stopped being the same set
+ * once containers began surviving a restart. Without the note, an interrupted
+ * session loses its turn and its background workers with no explanation, and
+ * only comes back when a human pings — the exact "said it was working, then
+ * silence" failure family.
  *
  * The note and an inert recall marker are written atomically with on_wake=1.
  * The sweep replaces the marker with fresh recall, flips the note to
@@ -31,12 +34,13 @@
  * the startup backstop cannot trust `provider_executing` (it is whatever the
  * dead container last wrote), so a session interrupted mid-turn with more than
  * RESTART_WARN_HEARTBEAT_FRESH_MS of provider silence — a long quiet Codex tool
- * call, say — still gets no note on that path.
+ * call, say — still gets no note on that path. A session whose container
+ * survives the restart also gets no note, which is correct: nothing
+ * interrupted it, and there is no lost turn to account for.
  */
 import { createHash } from 'crypto';
 import fs from 'node:fs';
 
-import { getActiveContainerSessionIds } from './container-runner.js';
 import { getRunningSessions, getSession } from './db/sessions.js';
 import {
   ABSOLUTE_CEILING_MS,
@@ -322,12 +326,22 @@ async function warnSessions(session: Session, reason: string, containerLive = fa
 }
 
 /**
- * Graceful-shutdown path: warn sessions the live registry says have running
- * containers. Runs before stopAllContainers so the note is in place before
- * the container dies.
+ * Graceful-shutdown path: warn exactly the sessions this shutdown is stopping.
+ * Runs before those containers are stopped so the note is in place before the
+ * container dies.
+ *
+ * `stoppingSessionIds` is REQUIRED and computed by the caller. An optional
+ * parameter would silently restore the fleet-wide behaviour whenever a caller
+ * forgot it, and the whole point of the set is that "every tracked container"
+ * and "every container being stopped" are no longer the same thing. Passing a
+ * set rather than a registry accessor is also what keeps this module free of
+ * any dependency on the container registry.
  */
-export async function warnActiveContainersOfShutdown(reason: string): Promise<void> {
-  for (const sessionId of getActiveContainerSessionIds()) {
+export async function warnActiveContainersOfShutdown(
+  reason: string,
+  stoppingSessionIds: ReadonlySet<string>,
+): Promise<void> {
+  for (const sessionId of stoppingSessionIds) {
     const session = await getSession(sessionId);
     // These ids come from the live container registry and nothing has been
     // stopped yet, so `provider_executing` is current state, not residue.
@@ -337,12 +351,29 @@ export async function warnActiveContainersOfShutdown(reason: string): Promise<vo
 
 /**
  * Startup backstop (crash and first-rollout paths): inspect only sessions the
- * central DB still marks running/idle. Within that interrupted-container set,
- * durable continuation is authoritative while tool and processing signals
- * are freshness-bound.
+ * central DB still marks running/idle, minus the ones whose containers will
+ * survive this boot. Within that genuinely-interrupted set, durable
+ * continuation is authoritative while tool and processing signals are
+ * freshness-bound.
+ *
+ * `skipSessionIds` is REQUIRED and computed by the caller: the sessions whose
+ * container this boot will NOT stop. `running`/`idle` in the central DB is a
+ * mark left by the previous host, not proof that a container is gone, so the
+ * partition has to come from the boot scope rather than from this module. A
+ * session that keeps its container was not interrupted and must get no note.
+ *
+ * This runs BEFORE the boot stop pass, not after it. The stop pass is
+ * sequential and can exceed RESTART_WARN_HEARTBEAT_FRESH_MS end to end, which
+ * would age heartbeat-only evidence out of the window and leave the sessions
+ * stopped first with no note at all. Predicting the partition and warning
+ * early is what keeps that evidence readable.
  */
-export async function warnMarkedRunningSessionsOfStartup(reason: string): Promise<void> {
+export async function warnMarkedRunningSessionsOfStartup(
+  reason: string,
+  skipSessionIds: ReadonlySet<string>,
+): Promise<void> {
   for (const session of await getRunningSessions()) {
+    if (skipSessionIds.has(session.id)) continue;
     await warnSessions(session, reason);
   }
 }

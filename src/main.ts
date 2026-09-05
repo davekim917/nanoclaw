@@ -30,7 +30,7 @@ import { ensureContainerRuntimeRunning, cleanupOrphansStrict } from './container
 import { warnActiveContainersOfShutdown, warnMarkedRunningSessionsOfStartup } from './host-restart-warn.js';
 import { resetPhantomContainerStatus } from './db/sessions.js';
 import { resetProcessingChannelIngress } from './db/channel-ingress-receipts.js';
-import { stopAllContainers } from './container-runner.js';
+import { getActiveContainerSessionIds, stopAllContainers } from './container-runner.js';
 import { writeUpstreamPolicySnapshot } from './container-updates.js';
 import { setDeliveryAdapter, startActiveDeliveryPoll, startSweepDeliveryPoll, stopDeliveryPolls } from './delivery.js';
 import { getHostInstanceId, startHostInstanceLease, stopHostInstanceLease } from './host-instance.js';
@@ -314,11 +314,23 @@ export async function main(): Promise<void> {
   // container absence has been proved. A failed runtime listing is not
   // equivalent to "none running": cleanupOrphansStrict throws and startup
   // stops before any filesystem cutover. FIRST warn sessions still marked
-  // 'running' (unclean previous host) that their containers are about to be
-  // stopped — the on_wake note makes the next spawn account publicly instead
-  // of the session going dark until a human pings.
+  // 'running' (unclean previous host) whose containers this boot will stop —
+  // the on_wake note makes the next spawn account publicly instead of the
+  // session going dark until a human pings.
+  //
+  // BEFORE the stop pass, deliberately. That pass is sequential and can run
+  // longer than the heartbeat freshness window end to end, so warning after it
+  // would find the earliest-stopped sessions' heartbeat evidence already aged
+  // out and leave exactly the interrupted sessions unwarned. The skip set is
+  // therefore a prediction of which containers survive, not an observation.
+  //
+  // D1 integration: `new Set(scope.survivableSessionIds)`, where `scope` is the
+  // partition `runBootMountQuiescence` passes through — `survivableSessionIds`
+  // plus its complement `mustStopSessionIds` (seam4/d1, #440). Until that lands
+  // the boot stops every container, so the set is empty and every session
+  // marked running is treated as interrupted, exactly as before.
   try {
-    await warnMarkedRunningSessionsOfStartup('host startup after an unclean stop');
+    await warnMarkedRunningSessionsOfStartup('host startup after an unclean stop', new Set<string>());
   } catch (err) {
     log.error('host-restart startup warn failed', { err });
   }
@@ -662,7 +674,10 @@ async function shutdown(signal: string): Promise<void> {
     // on_wake note (due immediately) makes the post-restart spawn account
     // for the interruption publicly instead of the session going dark.
     try {
-      await warnActiveContainersOfShutdown('graceful host shutdown');
+      // E integration: the narrowed stopping set from beginContainerShutdown()
+      // (seam4/e-adoption). Today it is every tracked container, because that
+      // is exactly what stopAllContainers() below stops.
+      await warnActiveContainersOfShutdown('graceful host shutdown', new Set(getActiveContainerSessionIds()));
     } catch (err) {
       log.error('host-restart shutdown warn failed', { err });
     }
