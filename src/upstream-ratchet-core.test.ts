@@ -29,6 +29,7 @@ import {
   hashBlobContent,
   hashCatFileBatch,
   isBlocking,
+  manifestSymlinkFinding,
   parseCatFileBatch,
   parseLsFiles,
   parseLsTree,
@@ -42,6 +43,7 @@ import {
 import {
   checkTree,
   hashFile,
+  MANIFEST_REL,
   sealManifest,
   validateManifestShape,
   type Finding,
@@ -198,6 +200,39 @@ describe('commit-source parsing (--check <ref>)', () => {
 
   it('refuses a malformed ls-tree record rather than guessing', () => {
     expect(() => parseLsTreeEntries(`100644 blob aaaa src/router.ts${NUL}`)).toThrow(/could not parse ls-tree record/);
+  });
+
+  // `cat-file --filters <ref>:<path>` on a 120000 entry returns the RAW
+  // TARGET STRING, unfiltered, while a real checkout's `fs.readFileSync`
+  // FOLLOWS the link — the two would silently measure two different files if
+  // the manifest were ever committed as a symlink. `manifestSymlinkFinding`
+  // is the pure decision over an already-parsed `ls-tree` fixture; the
+  // working-tree counterpart (`isManifestSymlink`) is tested against a real
+  // `fs.symlinkSync` fixture in `src/upstream-ratchet.test.ts`.
+  describe('manifestSymlinkFinding', () => {
+    it('flags the manifest path when its ls-tree mode is 120000', () => {
+      const entries = parseLsTreeEntries(
+        `100644 blob aaaa1111\tsrc/router.ts${NUL}` + `120000 blob bbbb2222\t${MANIFEST_REL}${NUL}`,
+      );
+      const finding = manifestSymlinkFinding(entries);
+      expect(finding).toMatchObject({
+        kind: 'malformed',
+        path: MANIFEST_REL,
+        detail: 'manifest must be a regular file, not a symlink',
+      });
+    });
+
+    it('returns null when the manifest is a regular file', () => {
+      const entries = parseLsTreeEntries(`100644 blob aaaa1111\t${MANIFEST_REL}${NUL}`);
+      expect(manifestSymlinkFinding(entries)).toBeNull();
+    });
+
+    it('returns null when the manifest path is absent from the tree entirely', () => {
+      // A genuinely missing manifest is a different failure (the caller's
+      // `cat-file`/`show` attempt reports it), not this check's job.
+      const entries = parseLsTreeEntries(`100644 blob aaaa1111\tsrc/router.ts${NUL}`);
+      expect(manifestSymlinkFinding(entries)).toBeNull();
+    });
   });
 
   /** One `cat-file --batch` record: `<id> SP blob SP <size> LF <content> LF`. */
@@ -370,6 +405,28 @@ describe('--check exit decision (decideCheckOutcome)', () => {
     expect(outcome.currencyFindings).toHaveLength(1);
   });
 
+  // Before this fix, `runCheck`'s `JSON.parse` failure went through a plain
+  // `fail()` (stderr text, exit 1, no `--json` output at all) instead of this
+  // decision — a `--json` caller got nothing parseable. The rendering itself
+  // (`reportUnusableCheckedManifest` in scripts/upstream-ratchet-report.ts) is
+  // script-level and proven by the real-git plumbing proof in the build
+  // report; this pins the DECISION half: a "not valid JSON" finding, run
+  // through the exact same `decideCheckOutcome([], findings)` every other
+  // unusable-manifest case uses, fails with no rows to compute (there is
+  // nothing to classify — the manifest never even parsed).
+  it('a "manifest is not valid JSON" finding fails via decideCheckOutcome, with no rows to classify', () => {
+    const parseFailureFinding: Finding = {
+      kind: 'malformed',
+      path: 'src/upstream-ratchet.json',
+      detail: 'manifest is not valid JSON: Unexpected token } in JSON at position 12',
+      hint: 'regenerate: pnpm run ratchet:report -- --write',
+    };
+    const outcome = decideCheckOutcome([], [parseFailureFinding]);
+    expect(outcome.failing).toBe(true);
+    expect(outcome.currencyFindings).toEqual([parseFailureFinding]);
+    expect(outcome.blocking).toEqual([]);
+  });
+
   describe('a malformed manifest read from an arbitrary ref (`--check` cannot trust `git show`)', () => {
     // `--check <ref>` reads `committed` from `git show <ref>:...json` — an
     // ARBITRARY ref's content, never guaranteed well-formed the way the
@@ -450,8 +507,34 @@ describe('--check exit decision (decideCheckOutcome)', () => {
       rejects({ upstream: 'a'.repeat(40), paths: '', files: [] }, /"files" is missing or is not an object/);
     });
 
+    // This used to be `checkTree`'s own inline `COMMIT_RE` check, run AFTER
+    // this function — an invalid-but-string pin reached `resolveCommit`'s
+    // `git rev-parse` (an object lookup) uncaught, either misreporting the
+    // failure as "not in this clone, run: git fetch" (exit 2, wrong diagnosis)
+    // or — for a short sha that happens to resolve locally — silently
+    // accepting a pin this tool never writes in that form. Moved here so it
+    // fires before any object lookup, through the shared validator both
+    // `runCheck` and `main()` call.
+    it('rejects a string "upstream" that is not a 40-character commit sha, without throwing', () => {
+      rejects({ upstream: 'not-a-sha', paths: '', files: {} }, /"upstream" is not a 40-character commit sha/);
+      // A short sha `git rev-parse` could resolve locally without complaint —
+      // exactly the case a regex-only check on the OUTPUT of rev-parse would
+      // never catch, since rev-parse always normalizes to full length on
+      // success.
+      rejects({ upstream: 'abc1234', paths: '', files: {} }, /"upstream" is not a 40-character commit sha/);
+    });
+
+    it('rejects a string "paths" that is not a 64-character sha256 hex digest, without throwing', () => {
+      rejects({ upstream: 'a'.repeat(40), paths: 'not-a-hash', files: {} }, /"paths" is not a 64-character/);
+      rejects({ upstream: 'a'.repeat(40), paths: 'abc1234', files: {} }, /"paths" is not a 64-character/);
+    });
+
     it('accepts a well-shaped manifest (empty findings) — a real one, and the first-run empty fallback', () => {
       expect(validateManifestShape(manifestOf({}))).toEqual([]);
+      // The not-yet-pinned baseline `main()` synthesizes on a first run: an
+      // empty "upstream"/"paths" is exempt from the sha-shape checks above —
+      // this is the ONE place either field is allowed to be a non-matching
+      // string, and only because it is exactly empty.
       expect(validateManifestShape({ upstream: '', paths: '', files: {} })).toEqual([]);
     });
 
@@ -466,6 +549,17 @@ describe('--check exit decision (decideCheckOutcome)', () => {
         uniqueTmpRoot('validate-shape-checktree-2'),
       );
       expect(findings).toEqual(validateManifestShape(null));
+    });
+
+    it('an invalid pin ("not-a-sha", a 7-character short sha) is rejected through checkTree too, before any per-entry work', () => {
+      for (const upstream of ['not-a-sha', 'abc1234']) {
+        const manifest = sealManifest({ upstream, paths: '', files: {} });
+        const findings = checkTree(manifest, uniqueTmpRoot(`validate-shape-checktree-pin-${upstream}`));
+        expect(findings).toEqual(validateManifestShape(manifest));
+        expect(findings).toEqual([
+          expect.objectContaining({ kind: 'malformed', detail: expect.stringContaining('40-character commit sha') }),
+        ]);
+      }
     });
   });
 });

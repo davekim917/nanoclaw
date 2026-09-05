@@ -28,6 +28,8 @@ import { createHash } from 'node:crypto';
 import {
   GITLINK_MODE,
   isGitMode,
+  MANIFEST_REL,
+  REGENERATE_HINT,
   validateRelPath,
   type Finding,
   type GitMode,
@@ -101,6 +103,32 @@ export function parseLsTreeEntries(stdout: string): Map<string, LsTreeEntry> {
     out.set(relPath, { mode, blob });
   }
   return out;
+}
+
+/**
+ * The MALFORMED finding for a manifest committed as a symlink (mode 120000)
+ * in `<ref>`'s tree, or `null` when the manifest is a regular file there, or
+ * absent entirely (a genuinely missing manifest is the caller's `cat-file`/
+ * `show` attempt to report, not this check's).
+ *
+ * `src/upstream-ratchet.json` is a generated artifact this tool itself always
+ * writes as a regular file: `cat-file --filters <ref>:<path>` on a 120000
+ * entry returns the RAW TARGET STRING (filters never apply to a symlink's
+ * content on checkout), while a real checkout's `fs.readFileSync` FOLLOWS the
+ * link to whatever it points at — the two would silently measure two
+ * different files. Refused outright here rather than reconciled; see
+ * `isManifestSymlink` (`src/upstream-ratchet.ts`) for the working-tree
+ * counterpart.
+ */
+export function manifestSymlinkFinding(entries: ReadonlyMap<string, LsTreeEntry>): Finding | null {
+  const entry = entries.get(MANIFEST_REL);
+  if (entry === undefined || entry.mode !== '120000') return null;
+  return {
+    kind: 'malformed',
+    path: MANIFEST_REL,
+    detail: 'manifest must be a regular file, not a symlink',
+    hint: `regenerate: ${REGENERATE_HINT}`,
+  };
 }
 
 /**

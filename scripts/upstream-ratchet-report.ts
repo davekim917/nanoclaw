@@ -64,6 +64,7 @@ import {
   findUntrackedShadows,
   hashBlobContent,
   hashCatFileBatch,
+  manifestSymlinkFinding,
   parseLsFiles,
   parseLsTree,
   parseLsTreeEntries,
@@ -80,6 +81,7 @@ import {
   fileModeOf,
   hashFile,
   isGitMode,
+  isManifestSymlink,
   manifestPath,
   MANIFEST_REL,
   pathExists,
@@ -621,6 +623,65 @@ function renderCurrencyFinding(f: Finding): string {
 }
 
 /**
+ * `--check <ref>`'s manifest cannot be trusted at all — a symlink where a
+ * regular file belongs, invalid JSON, or a shape that would crash the very
+ * next property access. Nothing else about `<ref>` can be measured, but the
+ * failure is still rendered through the SAME machine-readable shape every
+ * other `--check` failure uses (`--json`'s `staleManifest`/`exitCode`), never
+ * a plain-text-only `fail()` that `--json` callers cannot parse.
+ */
+function reportUnusableCheckedManifest(ref: string, resolvedRef: string, findings: Finding[], json: boolean): never {
+  if (json) {
+    console.log(
+      JSON.stringify(
+        {
+          mode: 'check',
+          ref,
+          resolvedRef,
+          staleManifest: findings.map((f) => ({ path: f.path, kind: f.kind, detail: f.detail })),
+          exitCode: 1,
+        },
+        null,
+        2,
+      ),
+    );
+  } else {
+    console.log(
+      `Checking ${ref} (${resolvedRef.slice(0, 8)}) — its own manifest at ${MANIFEST_REL} is not usable, so ` +
+        `nothing else about it can be measured:\n`,
+    );
+    console.log(`STALE-MANIFEST (${n(findings.length)})`);
+    for (const f of findings) console.log(renderCurrencyFinding(f));
+    console.error(
+      `\nupstream-ratchet: --check failing — the manifest committed at ${ref} is not usable; regenerate on ` +
+        `that branch: ${REGENERATE_HINT}`,
+    );
+  }
+  process.exit(1);
+}
+
+/** The working-tree counterpart to `reportUnusableCheckedManifest`, for `main()`'s local manifest. */
+function reportUnusableLocalManifest(committedPath: string, findings: Finding[], json: boolean): never {
+  if (json) {
+    console.log(
+      JSON.stringify(
+        { staleManifest: findings.map((f) => ({ path: f.path, kind: f.kind, detail: f.detail })), exitCode: 1 },
+        null,
+        2,
+      ),
+    );
+  } else {
+    console.log(`${committedPath} is not usable, so nothing else about it can be measured:\n`);
+    console.log(`STALE-MANIFEST (${n(findings.length)})`);
+    for (const f of findings) console.log(renderCurrencyFinding(f));
+    console.error(
+      `\nupstream-ratchet: refusing to measure — ${committedPath} is not usable; regenerate: ${REGENERATE_HINT}`,
+    );
+  }
+  process.exit(1);
+}
+
+/**
  * `--check <ref>`: evaluate `<ref>`'s tree exactly as the default report
  * evaluates the working tree, with no writes and no working-tree dependence.
  * See `computeFromRef` for what "commit-sourced measurement" means concretely.
@@ -656,6 +717,15 @@ function runCheck(options: Options): never {
     process.exit(2);
   }
 
+  // A symlinked manifest would diverge between modes — see
+  // `manifestSymlinkFinding`'s docstring — so refused outright here, in both
+  // modes; `main()` runs the identical check (`isManifestSymlink`) on the
+  // working tree below.
+  const symlinkFinding = manifestSymlinkFinding(
+    parseLsTreeEntries(git(root, ['ls-tree', '-r', '-z', resolvedRef, '--', MANIFEST_REL], true)),
+  );
+  if (symlinkFinding !== null) reportUnusableCheckedManifest(ref, resolvedRef, [symlinkFinding], options.json);
+
   // Read through the SAME filtered path every other regular file in <ref>
   // goes through (`hashFilteredBlob`/`catFileFiltered`), not `git show`: `git
   // show <ref>:<path>` returns the raw, UNfiltered blob, so a ref that assigns
@@ -678,47 +748,34 @@ function runCheck(options: Options): never {
     committed = JSON.parse(manifestText) as UpstreamRatchetManifest;
     // eslint-disable-next-line no-catch-all/no-catch-all
   } catch (error) {
-    fail(
-      `could not parse the manifest at ${ref}:${MANIFEST_REL}: ${error instanceof Error ? error.message : String(error)}`,
+    // Routed through the same JSON-aware path every other unusable-manifest
+    // finding uses (not the plain-text-only `fail()`), so a `--json` caller
+    // gets valid, complete JSON here too instead of a bare stderr line.
+    reportUnusableCheckedManifest(
+      ref,
+      resolvedRef,
+      [
+        {
+          kind: 'malformed',
+          path: MANIFEST_REL,
+          detail: `manifest is not valid JSON: ${error instanceof Error ? error.message : String(error)}`,
+          hint: `regenerate: ${REGENERATE_HINT}`,
+        },
+      ],
+      options.json,
     );
   }
 
   // `validateManifestShape` is what stands between here and a crash: a
   // top-level `null`/array/primitive, or a non-string `upstream`, would throw
-  // on the very next line (`committed.upstream`) otherwise. `--check` reads
+  // on the very next line (`committed.upstream`) otherwise. It also validates
+  // `upstream`/`paths`' own regex shape, so an invalid pin is caught here too,
+  // before `resolveCommit`'s `git rev-parse` object lookup. `--check` reads
   // `committed` from an ARBITRARY ref's content, so this cannot be skipped the
   // way a trusted local file arguably could be — and `main()`'s working-tree
   // path runs the identical check for the identical reason.
   const shapeFindings = validateManifestShape(committed);
-  if (shapeFindings.length > 0) {
-    if (options.json) {
-      console.log(
-        JSON.stringify(
-          {
-            mode: 'check',
-            ref,
-            resolvedRef,
-            staleManifest: shapeFindings.map((f) => ({ path: f.path, kind: f.kind, detail: f.detail })),
-            exitCode: 1,
-          },
-          null,
-          2,
-        ),
-      );
-    } else {
-      console.log(
-        `Checking ${ref} (${resolvedRef.slice(0, 8)}) — its own manifest at ${MANIFEST_REL} is not shaped like ` +
-          `a manifest, so nothing else about it can be measured:\n`,
-      );
-      console.log(`STALE-MANIFEST (${n(shapeFindings.length)})`);
-      for (const f of shapeFindings) console.log(renderCurrencyFinding(f));
-      console.error(
-        `\nupstream-ratchet: --check failing — the manifest committed at ${ref} is not usable; regenerate on ` +
-          `that branch: ${REGENERATE_HINT}`,
-      );
-    }
-    process.exit(1);
-  }
+  if (shapeFindings.length > 0) reportUnusableCheckedManifest(ref, resolvedRef, shapeFindings, options.json);
 
   const sha = resolveCommit(root, committed.upstream);
 
@@ -840,11 +897,48 @@ function main(): void {
   if (options.check !== null) runCheck(options);
   const root = options.root;
   const committedPath = manifestPath(root);
+
+  // Same divergence `runCheck` refuses on the ref side (`manifestSymlinkFinding`'s
+  // docstring), refused here too, before `readManifest`'s `fs.readFileSync`
+  // (which FOLLOWS a symlink) ever reads through one.
+  if (isManifestSymlink(root)) {
+    reportUnusableLocalManifest(
+      committedPath,
+      [
+        {
+          kind: 'malformed',
+          path: MANIFEST_REL,
+          detail: 'manifest must be a regular file, not a symlink',
+          hint: `regenerate: ${REGENERATE_HINT}`,
+        },
+      ],
+      options.json,
+    );
+  }
+
   let committed: UpstreamRatchetManifest;
   try {
     committed = readManifest(root);
     // eslint-disable-next-line no-catch-all/no-catch-all
   } catch (error) {
+    // Invalid JSON means the file EXISTS but cannot be trusted at all — routed
+    // through the same JSON-aware "unusable manifest" path `--check` uses,
+    // rather than treated as the "no manifest yet" first-run case below (that
+    // case is a genuinely MISSING file, not a corrupted one).
+    if (error instanceof SyntaxError) {
+      reportUnusableLocalManifest(
+        committedPath,
+        [
+          {
+            kind: 'malformed',
+            path: MANIFEST_REL,
+            detail: `manifest is not valid JSON: ${error.message}`,
+            hint: `regenerate: ${REGENERATE_HINT}`,
+          },
+        ],
+        options.json,
+      );
+    }
     // Creating the manifest for the first time is a re-pin against an empty
     // baseline: everything upstream owns reads as NEW, which is exactly what an
     // unaudited starting point is. Any other mode needs the file to exist.
@@ -856,32 +950,13 @@ function main(): void {
 
   // Same guard as `runCheck`'s, for the same reason: `resolveCommit` on the
   // very next line dereferences `committed.upstream`, which throws instead of
-  // reporting on a top-level `null`/array or a non-string `upstream`. The
-  // local file is not exempt just because this tool is the only thing that
-  // usually writes it — a hand-edited or corrupted one hits the same crash.
+  // reporting on a top-level `null`/array or a non-string `upstream`. It also
+  // validates `upstream`/`paths`' own regex shape now, catching an invalid pin
+  // here too. The local file is not exempt just because this tool is the only
+  // thing that usually writes it — a hand-edited or corrupted one hits the
+  // same crash.
   const shapeFindings = validateManifestShape(committed);
-  if (shapeFindings.length > 0) {
-    if (options.json) {
-      console.log(
-        JSON.stringify(
-          {
-            staleManifest: shapeFindings.map((f) => ({ path: f.path, kind: f.kind, detail: f.detail })),
-            exitCode: 1,
-          },
-          null,
-          2,
-        ),
-      );
-    } else {
-      console.log(`${committedPath} is not shaped like a manifest, so nothing else about it can be measured:\n`);
-      console.log(`STALE-MANIFEST (${n(shapeFindings.length)})`);
-      for (const f of shapeFindings) console.log(renderCurrencyFinding(f));
-      console.error(
-        `\nupstream-ratchet: refusing to measure — ${committedPath} is not usable; regenerate: ${REGENERATE_HINT}`,
-      );
-    }
-    process.exit(1);
-  }
+  if (shapeFindings.length > 0) reportUnusableLocalManifest(committedPath, shapeFindings, options.json);
 
   const sha = resolveCommit(root, options.upstream ?? committed.upstream);
   const repinned = sha !== committed.upstream;

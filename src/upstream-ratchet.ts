@@ -190,6 +190,31 @@ export function readManifest(repoRoot: string = REPO_ROOT): UpstreamRatchetManif
   return JSON.parse(fs.readFileSync(manifestPath(repoRoot), 'utf8')) as UpstreamRatchetManifest;
 }
 
+/**
+ * Whether the LOCAL manifest is committed as a symlink rather than a regular
+ * file — checked with `lstat` (which does not follow the link), before
+ * `readManifest`'s `fs.readFileSync` (which does) ever reads through it.
+ * `false` for a genuinely missing manifest too: that is `readManifest`'s job
+ * to report, not this check's.
+ *
+ * `src/upstream-ratchet.json` is a generated artifact this tool itself always
+ * writes as a regular file. A symlinked one is refused outright rather than
+ * reconciled, in both the working-tree report and `--check <ref>` (see
+ * `manifestSymlinkFinding` in `src/upstream-ratchet-core.ts` for the ref-tree
+ * counterpart and the reason: `cat-file --filters` on a 120000 entry returns
+ * the raw target string, unfiltered, while a real checkout's
+ * `fs.readFileSync` follows the link — the two would silently measure two
+ * different files.
+ */
+export function isManifestSymlink(repoRoot: string = REPO_ROOT): boolean {
+  try {
+    return fs.lstatSync(manifestPath(repoRoot)).isSymbolicLink();
+    // eslint-disable-next-line no-catch-all/no-catch-all
+  } catch {
+    return false;
+  }
+}
+
 export function writeManifest(manifest: UpstreamRatchetManifest, repoRoot: string = REPO_ROOT): void {
   const target = manifestPath(repoRoot);
   fs.mkdirSync(path.dirname(target), { recursive: true });
@@ -482,13 +507,26 @@ export function fsTreeReader(repoRoot: string): TreeReader {
  * `main()`, so both paths get the same guard rather than treating the local
  * file as trusted by convention.
  *
- * Deliberately coarser than `checkTree`'s own field checks: a `upstream` of
- * `"not-a-sha"` passes here (it IS a string) and is caught by `checkTree`'s
- * `COMMIT_RE` check instead — this function's only job is making every later
- * property access SAFE, not validating content. Per-entry validation
- * (`diff`/`mode`/`sha256`/`deleted`/`ignored`/`binary` shapes) stays in
- * `checkEntry`, which already never crashes anything downstream because every
- * field read there is either optional-chained or already defended.
+ * ALSO validates the SHAPE of `upstream` (a 40-character commit sha, or the
+ * empty string — the not-yet-pinned baseline `main()` synthesizes on a first
+ * run) and `paths` (a 64-character sha256 hex digest, or empty, for the same
+ * reason) rather than just their type. This used to be `checkTree`'s own
+ * `COMMIT_RE` check, run AFTER this function, on the next line — which meant
+ * an invalid-but-string pin like `"not-a-sha"` or a 7-character short sha
+ * passed here and reached `resolveCommit`'s `git rev-parse` UNCAUGHT: that
+ * call is itself an object lookup, so it either misreports the failure as
+ * "not in this clone, run: git fetch" (exit 2, wrong diagnosis) or — for a
+ * short sha that happens to resolve locally — silently accepts a pin this
+ * tool never writes in that form. Moved here so both call sites (`runCheck`
+ * and `main()`) catch it before any object lookup, with one JSON-safe
+ * MALFORMED finding, exit 1. The seal-equality check (`paths` against the
+ * ACTUAL computed seal of `files`' keys) still lives in `checkTree`, since it
+ * needs the file list this function deliberately does not require.
+ *
+ * Per-entry validation (`diff`/`mode`/`sha256`/`deleted`/`ignored`/`binary`
+ * shapes) stays in `checkEntry`, which already never crashes anything
+ * downstream because every field read there is either optional-chained or
+ * already defended.
  */
 export function validateManifestShape(value: unknown): Finding[] {
   if (value === null || typeof value !== 'object' || Array.isArray(value)) {
@@ -510,12 +548,26 @@ export function validateManifestShape(value: unknown): Finding[] {
       detail: `"upstream" is not a string: ${JSON.stringify(manifest.upstream)}`,
       hint: `regenerate: ${REGENERATE_HINT}`,
     });
+  } else if (manifest.upstream !== '' && !COMMIT_RE.test(manifest.upstream)) {
+    findings.push({
+      kind: 'malformed',
+      path: MANIFEST_REL,
+      detail: `"upstream" is not a 40-character commit sha: ${JSON.stringify(manifest.upstream)}`,
+      hint: 're-pin deliberately: pnpm run ratchet:report -- --upstream <rev>',
+    });
   }
   if (typeof manifest.paths !== 'string') {
     findings.push({
       kind: 'malformed',
       path: MANIFEST_REL,
       detail: `"paths" is not a string: ${JSON.stringify(manifest.paths)}`,
+      hint: `regenerate: ${REGENERATE_HINT}`,
+    });
+  } else if (manifest.paths !== '' && !SHA256_RE.test(manifest.paths)) {
+    findings.push({
+      kind: 'malformed',
+      path: MANIFEST_REL,
+      detail: `"paths" is not a 64-character sha256 hex digest: ${JSON.stringify(manifest.paths)}`,
       hint: `regenerate: ${REGENERATE_HINT}`,
     });
   }
@@ -550,22 +602,15 @@ export function checkTree(
   // `validateManifestShape` is what stands between this function and a crash
   // on a top-level `null`/array/primitive — everything below assumes `manifest`
   // is at least a plain object, which is exactly (and only) what that check
-  // guarantees. Any shape finding at all stops here: with `upstream`, `paths`
-  // or `files` not even the right TYPE, neither the seal check nor a per-entry
-  // walk means anything.
+  // guarantees. It ALSO now covers the `upstream`/`paths` regex-shape checks
+  // that used to live inline here (see its docstring), so any shape finding
+  // at all — including an invalid pin — stops here: with `upstream` not even
+  // a usable commit sha, neither the seal check nor a per-entry walk means
+  // anything.
   const shapeFindings = validateManifestShape(manifest);
   if (shapeFindings.length > 0) return shapeFindings;
 
   const findings: Finding[] = [];
-
-  if (!COMMIT_RE.test(manifest.upstream)) {
-    findings.push({
-      kind: 'malformed',
-      path: MANIFEST_REL,
-      detail: `"upstream" is not a 40-character commit sha: ${JSON.stringify(manifest.upstream)}`,
-      hint: 're-pin deliberately: pnpm run ratchet:report -- --upstream <rev>',
-    });
-  }
 
   // The coverage seal. This is the only check that can tell a complete manifest
   // from one an entry was deleted out of — every other check here is per-entry,
