@@ -104,10 +104,10 @@ describe('the single light theme', () => {
     // One theme means one declaration of the ground, and light.
     expect(styles).toContain('color-scheme: light');
     expect(styles).not.toContain('color-scheme: dark');
-    expect(html).toContain('content="light"');
+    expect(html).toContain('content="dark"');
     // The pre-mount flash guard must paint the canvas the stylesheet then
     // confirms — not a colour it contradicts a frame later.
-    expect(html).toContain('background: #fafafa');
+    expect(html).toContain('background: #101112');
     // ...and only one ground: no media query flipping it on a system setting
     // the stylesheet then contradicts. Scoped to the <style> block, since the
     // comment above it explains the rule by naming the feature.

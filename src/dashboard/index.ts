@@ -35,6 +35,13 @@ import {
   workgroupClaimsHandler,
 } from './api/workgroups.js';
 import { observatoryHandler } from './api/observatory.js';
+import {
+  signalOverviewHandler,
+  signalDecisionHandler,
+  signalReviewHandler,
+  signalDispatchHandler,
+  signalProjectHandler,
+} from './observatory-v2/api.js';
 import { observatoryAssignHandler } from './assign.js';
 import { observatoryIssueBriefHandler } from './issue-brief.js';
 import { observatoryNudgeHandler } from './nudge.js';
@@ -97,6 +104,11 @@ export function startDashboard(): void {
   register('GET', '/dashboard/api/workgroup/:id/usage', requireAuth(workgroupUsageHandler));
   register('GET', '/dashboard/api/workgroup/:id/claims', requireAuth(workgroupClaimsHandler));
   register('GET', '/dashboard/api/observatory', requireAuth(observatoryHandler));
+  register('GET', '/dashboard/api/observatory/v2', requireAuth(signalOverviewHandler));
+  register('GET', '/dashboard/api/observatory/v2/decisions/:id', requireAuth(signalDecisionHandler));
+  register('POST', '/dashboard/api/observatory/v2/decisions/:id/review', requireAuth(signalReviewHandler));
+  register('POST', '/dashboard/api/observatory/v2/decisions/:id/dispatch', requireAuth(signalDispatchHandler));
+  register('PUT', '/dashboard/api/observatory/v2/projects/:id', requireAuth(signalProjectHandler));
   register('POST', '/dashboard/api/observatory/assign', requireAuth(observatoryAssignHandler));
   register('POST', '/dashboard/api/observatory/nudge', requireAuth(observatoryNudgeHandler));
   register('POST', '/dashboard/api/observatory/steer', requireAuth(observatorySteerHandler));

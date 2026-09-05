@@ -1,4 +1,4 @@
-export type EventKind = 'task_event' | 'inbound_message' | 'session_event';
+export type EventKind = 'task_event' | 'inbound_message' | 'session_event' | 'connection';
 type Handler<T = unknown> = (payload: T) => void;
 
 const subscribers = new Map<EventKind, Set<Handler>>();
@@ -6,12 +6,17 @@ let es: EventSource | null = null;
 let retryDelay = 1000;
 let retryTimer: ReturnType<typeof setTimeout> | null = null;
 let stopped = false;
+let connected: boolean | null = null;
 
 function dispatchEvent(kind: EventKind, payload: unknown): void {
   const handlers = subscribers.get(kind);
   if (!handlers) return;
   for (const h of handlers) {
-    try { h(payload); } catch { /* handler errors must not kill SSE */ }
+    try {
+      h(payload);
+    } catch {
+      /* handler errors must not kill SSE */
+    }
   }
 }
 
@@ -21,22 +26,40 @@ function connect(): void {
 
   es.addEventListener('task_event', (e: MessageEvent) => {
     retryDelay = 1000;
-    try { dispatchEvent('task_event', JSON.parse(e.data as string)); } catch { /* ignore */ }
+    try {
+      dispatchEvent('task_event', JSON.parse(e.data as string));
+    } catch {
+      /* ignore */
+    }
   });
 
   es.addEventListener('inbound_message', (e: MessageEvent) => {
     retryDelay = 1000;
-    try { dispatchEvent('inbound_message', JSON.parse(e.data as string)); } catch { /* ignore */ }
+    try {
+      dispatchEvent('inbound_message', JSON.parse(e.data as string));
+    } catch {
+      /* ignore */
+    }
   });
 
   es.addEventListener('session_event', (e: MessageEvent) => {
     retryDelay = 1000;
-    try { dispatchEvent('session_event', JSON.parse(e.data as string)); } catch { /* ignore */ }
+    try {
+      dispatchEvent('session_event', JSON.parse(e.data as string));
+    } catch {
+      /* ignore */
+    }
   });
 
-  es.addEventListener('open', () => { retryDelay = 1000; });
+  es.addEventListener('open', () => {
+    retryDelay = 1000;
+    connected = true;
+    dispatchEvent('connection', { connected: true });
+  });
 
   es.addEventListener('error', () => {
+    connected = false;
+    dispatchEvent('connection', { connected: false });
     es?.close();
     es = null;
     if (!stopped) {
@@ -56,6 +79,7 @@ export function startSSE(): void {
 
 export function stopSSE(): void {
   stopped = true;
+  connected = false;
   if (retryTimer !== null) {
     clearTimeout(retryTimer);
     retryTimer = null;
@@ -69,5 +93,8 @@ export function subscribe<T = unknown>(kind: EventKind, handler: Handler<T>): ()
   if (!subscribers.has(kind)) subscribers.set(kind, new Set());
   const set = subscribers.get(kind)!;
   set.add(handler as Handler);
-  return () => { set.delete(handler as Handler); };
+  if (kind === 'connection' && connected !== null) (handler as Handler)({ connected });
+  return () => {
+    set.delete(handler as Handler);
+  };
 }

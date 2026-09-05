@@ -54,7 +54,19 @@ type ThemeChoice = 'system' | 'light' | 'dark';
 const THEME_KEY = 'ncc-theme';
 const THEME_CYCLE: ThemeChoice[] = ['system', 'dark', 'light'];
 
-export function ThreadConsole({ authMe }: { authMe: AuthMe }) {
+export function ThreadConsole({
+  authMe,
+  externalWorkgroup,
+  externalQuery,
+  deepLinkId,
+  onWorkgroupChange,
+}: {
+  authMe: AuthMe;
+  externalWorkgroup?: string;
+  externalQuery?: string;
+  deepLinkId?: string | null;
+  onWorkgroupChange?: (value: string) => void;
+}) {
   /**
    * The primary axis is the WORKGROUP (`example-labs`, `example-dev`, …), not the
    * agent group. Siblings share a workgroup and most threads are multi-agent,
@@ -69,11 +81,21 @@ export function ThreadConsole({ authMe }: { authMe: AuthMe }) {
   const { data: workgroupsData } = useSWR('/dashboard/api/workgroups', () => listWorkgroups(), { refreshInterval: 0 });
   const workgroups: WorkgroupSummary[] = useMemo(() => workgroupsData?.workgroups ?? [], [workgroupsData]);
   const workgroupIds = useMemo(() => workgroups.map((w) => w.id), [workgroups]);
-  const [workgroupFilter, setWorkgroupFilter] = useWorkgroupFilter(authMe.user_id, workgroupIds);
+  const [storedWorkgroupFilter, setWorkgroupFilter] = useWorkgroupFilter(authMe.user_id, workgroupIds);
+  const workgroupFilter = externalWorkgroup ?? storedWorkgroupFilter;
   const [lane, setLane] = useState<Lane>('all');
   const [rawChannel, setChannel] = useState<string | null>(null);
-  const [query, setQuery] = useState('');
-  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [localQuery, setQuery] = useState('');
+  const query = externalQuery || localQuery;
+  const [selectedId, setSelectedId] = useState<string | null>(deepLinkId ?? null);
+  useEffect(() => {
+    if (deepLinkId !== undefined) setSelectedId(deepLinkId);
+  }, [deepLinkId]);
+  const { data: linkedDetail, error: linkedError } = useSWR(
+    deepLinkId ? ['signal-thread-link', deepLinkId] : null,
+    () => getThreadDetail(deepLinkId!),
+    { revalidateOnFocus: true },
+  );
   const [focusComposer, setFocusComposer] = useState(0);
   const [triage, setTriage] = useState<ThreadSummary[] | null>(null);
   const [notice, setNotice] = useState('');
@@ -121,8 +143,9 @@ export function ThreadConsole({ authMe }: { authMe: AuthMe }) {
     (next: string) => {
       if (lens === 'schedule') goToQueue();
       setWorkgroupFilter(next);
+      onWorkgroupChange?.(next);
     },
-    [lens, goToQueue, setWorkgroupFilter],
+    [lens, goToQueue, setWorkgroupFilter, onWorkgroupChange],
   );
 
   const { data, mutate } = useSWR(
@@ -264,7 +287,9 @@ export function ThreadConsole({ authMe }: { authMe: AuthMe }) {
   }, []);
 
   const laneLabel = lane === 'all' ? 'All threads' : lane === 'snoozed' ? 'Snoozed' : STATE_PRESENTATION[lane].label;
-  const selected = visible.find((t) => t.thread_id === selectedId) ?? null;
+  const selected =
+    visible.find((t) => t.thread_id === selectedId) ??
+    (linkedDetail?.thread.thread_id === selectedId ? linkedDetail.thread : null);
 
   /**
    * The row's ONE verb, and it is one verb for every state now: open the
@@ -286,6 +311,7 @@ export function ThreadConsole({ authMe }: { authMe: AuthMe }) {
    */
   const onVerb = useCallback((t: ThreadSummary) => {
     setSelectedId(t.thread_id);
+    if (deepLinkId !== undefined) location.hash = `#/threads/${encodeURIComponent(t.thread_id)}`;
     setFocusComposer((n) => n + 1);
   }, []);
 
@@ -333,6 +359,9 @@ export function ThreadConsole({ authMe }: { authMe: AuthMe }) {
   return (
     <div className="ncc" data-pane={pane} data-nav={navOpen ? 'open' : 'closed'}>
       <header className="ncc-top">
+        {linkedError && (
+          <span role="alert">Could not open the linked thread. It may be unavailable or outside your scope.</span>
+        )}
         {/* Mobile only (console.css) — opens the SAME nav as the sheet the
             bottom bar's Filters tab used to raise. There is no second,
             mobile-only control set: this button and the desktop sidebar share
@@ -512,6 +541,7 @@ export function ThreadConsole({ authMe }: { authMe: AuthMe }) {
                     selected={t.thread_id === selectedId}
                     onSelect={(x) => {
                       setSelectedId(x.thread_id);
+                      if (deepLinkId !== undefined) location.hash = `#/threads/${encodeURIComponent(x.thread_id)}`;
                       // Opening a thread must not steal the cursor; only a verb
                       // asks for the composer. See ReplyComposer's focus effect.
                       setFocusComposer(0);
@@ -766,7 +796,7 @@ export function lastMessagePreview(transcript: ThreadTranscriptEntry[] | undefin
  * thread queue rather than rendering nothing.
  */
 export function lensForHash(hash: string): 'threads' | 'schedule' {
-  return hash.replace(/^#/, '') === '/scheduled' ? 'schedule' : 'threads';
+  return ['/scheduled', '/schedule'].includes(hash.replace(/^#/, '')) ? 'schedule' : 'threads';
 }
 
 /**

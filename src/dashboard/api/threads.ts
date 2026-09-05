@@ -615,7 +615,7 @@ async function selectScopedSessions(
     workgroupId?: string | null;
     groupId: string | null;
     includeArchived: boolean;
-    sinceHours: number;
+    sinceHours: number | null;
     threadId?: string | null;
   },
   now: number,
@@ -656,7 +656,7 @@ async function selectScopedSessions(
     // `session:<id>` addresses that row directly.
     conditions.push(`COALESCE(s.thread_id, 'session:' || s.id) = ?`);
     values.push(opts.threadId);
-  } else {
+  } else if (opts.sinceHours !== null) {
     conditions.push(`datetime(COALESCE(s.last_outbound_at, s.last_active, s.created_at)) >= datetime(?)`);
     values.push(new Date(now - opts.sinceHours * 3_600_000).toISOString());
   }
@@ -1201,7 +1201,7 @@ function threadRoutingChannel(rows: ThreadSessionRow[]): string | null {
  */
 export function selectScopedAttentionItems(
   ctx: AuthedRequestContext,
-  opts: { workgroupId?: string | null; groupId: string | null; sinceHours: number; threadId?: string | null },
+  opts: { workgroupId?: string | null; groupId: string | null; sinceHours: number | null; threadId?: string | null },
   now: number,
   env: AttentionSourceEnv,
 ): AttentionItem[] {
@@ -1461,7 +1461,7 @@ export async function buildThreadList(
     workgroupId?: string | null;
     groupId: string | null;
     includeArchived: boolean;
-    sinceHours: number;
+    sinceHours: number | null;
     limit: number;
     threadId?: string | null;
   },
@@ -1484,7 +1484,7 @@ export async function buildThreadList(
   const { known, names, byId, dmDedupeKey } = await readChannelDirectory();
   const grouped = groupByThread(rows)
     .map((t) => ({ ...t, activity: Math.max(...t.rows.map(activityMs)) }))
-    .sort((a, b) => b.activity - a.activity)
+    .sort((a, b) => b.activity - a.activity || a.threadId.localeCompare(b.threadId))
     .slice(0, opts.limit);
 
   const pagedRows = grouped.flatMap((t) => t.rows);
