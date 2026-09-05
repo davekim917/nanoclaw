@@ -12,7 +12,7 @@ import { fileURLToPath } from 'url';
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { closeDb, getDb, getRawDb, initTestDb } from './connection.js';
+import { closeDb, getDb, initTestDb } from './connection.js';
 import { insertOrAdopt, isUniqueViolation } from './insert-or-adopt.js';
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
@@ -63,7 +63,10 @@ describe('insertOrAdopt', () => {
     // shape, which is the fact the fix depends on.
     beforeEach(async () => {
       await initTestDb();
-      getRawDb().exec('CREATE TABLE pk_race (id TEXT PRIMARY KEY, val TEXT NOT NULL)');
+      // Async driver, not the raw sync handle — src/db/raw-db-ratchet.test.ts
+      // pins the exact set of files allowed to import getRawDb and may only
+      // shrink, never grow; this file has no business on that list.
+      await getDb().exec('CREATE TABLE pk_race (id TEXT PRIMARY KEY, val TEXT NOT NULL)');
     });
 
     afterEach(async () => {
