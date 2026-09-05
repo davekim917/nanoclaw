@@ -241,7 +241,7 @@ import {
   _resetEverSeenRunningForTest,
 } from './container-runner.js';
 import { resolveContainerResources } from './container-resources.js';
-import { closeDb } from './db/connection.js';
+import { closeDb, getDb } from './db/connection.js';
 import { getSessionClaim } from './db/coordination.js';
 import { getHostInstanceId, stopHostInstanceLease } from './host-instance.js';
 import { log } from './log.js';
@@ -665,6 +665,59 @@ describe('adoptRunningSessions', () => {
     expect(hasPendingAdoption('sess-released')).toBe(false);
     await until(() => !isContainerRunning('sess-released'), 'the spawned container never finalized');
     expect(containerOwnsOutbound('sess-released')).toBe(false);
+  });
+
+  it.each([
+    ['an archived session', { archivedAt: '2026-09-04T00:00:00.000Z' }, undefined],
+    ['a session outside the survivable partition', {}, ['some-other-session']],
+  ] as const)(
+    'a failed stop of a container adoption will not take keeps ownership — %s',
+    async (_label, seedOptions, survivableSessionIds) => {
+      await seedSession(TEST_DATA_DIR, 'sess-unstoppable-branch', seedOptions);
+      fakes.listing = [survivor('sess-unstoppable-branch')];
+      fakes.running.add('nanoclaw-v2-sess-unstoppable-branch');
+      fakes.stopFails = true;
+      const requestMb = resolveContainerResources(undefined).memory.requestMb;
+
+      const reconciled = await adoptRunningSessions({ list: fakes.list, survivableSessionIds });
+
+      // The stop result is not discarded: a container still running is a
+      // writer, and it is held exactly like a survivor whose claim was lost.
+      expect(reconciled).toEqual({ adopted: 0, stopped: 0, pendingClaim: 1, fencedInbound: 0 });
+      expect(hasPendingAdoption('sess-unstoppable-branch')).toBe(true);
+      expect(containerOwnsOutbound('sess-unstoppable-branch')).toBe(true);
+      expect(memoryStub.reservedMb()).toBe(requestMb);
+      expect(warnings('An unadoptable container could not be stopped — holding it pending')).toHaveLength(1);
+      expect(fakes.stopped).toEqual([]);
+    },
+  );
+
+  it('a pending survivor holds a memory reservation, released on proven absence', async () => {
+    await seedSession(TEST_DATA_DIR, 'sess-pending-memory');
+    fakes.listing = [survivor('sess-pending-memory')];
+    hooks.claimWriteFails = true;
+    const requestMb = resolveContainerResources(undefined).memory.requestMb;
+
+    await adoptRunningSessions({ list: fakes.list });
+
+    expect(hasPendingAdoption('sess-pending-memory')).toBe(true);
+    expect(memoryStub.reservedMb()).toBe(requestMb);
+
+    // Proven absence: the re-list shows nothing. Everything held goes back.
+    // (The session is archived first so the ordinary path spawns nothing.)
+    await getDb().run(
+      'UPDATE sessions SET archived_at = ? WHERE id = ?',
+      '2026-09-05T01:00:00.000Z',
+      'sess-pending-memory',
+    );
+    fakes.listing = [];
+    hooks.claimWriteFails = false;
+    await expect(wakeContainer(callerSnapshot('sess-pending-memory'))).resolves.toBe(false);
+
+    expect(hasPendingAdoption('sess-pending-memory')).toBe(false);
+    expect(containerOwnsOutbound('sess-pending-memory')).toBe(false);
+    expect(memoryStub.reservedMb()).toBe(0);
+    expect(infos('Spawning container')).toEqual([]);
   });
 
   it("an adopted session's ceiling uses the adoption instant", async () => {
