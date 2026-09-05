@@ -67,9 +67,8 @@ function callsWithin(source: string, name: string): Array<{ callee: string; args
 }
 
 const ADOPT = 'await adoptRunningSessions';
-/** D1's scoped boot door; until it lands, the fleet-wide stop inside the memory gate is the door. */
-const QUIESCE = 'await quiesceWorkgroupsForBootMountChange';
-const MEMORY_GATE = 'runWorkgroupMemoryStartupGate';
+/** The boot mount-change block: D1's scoped quiescence door, both reconciles, the snapshot prune. */
+const DOOR = 'await runBootMountQuiescence';
 const FENCE_RECOVERY = 'await releaseOrphanedRepoIngressFencesAtStartup';
 /** Everything that can issue a wake once started. */
 const WAKE_SOURCES = [
@@ -103,12 +102,14 @@ describe('adoption order (P3)', () => {
 
   it('adoption runs after the boot quiescence door and before the orphaned-fence recovery', () => {
     const adopt = indexOfCall(calls, ADOPT);
-    // The door: D1's scoped quiescence once it is in the tree, and until then
-    // the memory startup gate whose fleet-wide stop it replaces. Adoption sits
-    // after whichever is present so it only ever sees containers the door
-    // chose to leave running.
-    const door = calls.includes(QUIESCE) ? indexOfCall(calls, QUIESCE) : indexOfCall(calls, MEMORY_GATE);
+    // The door: `runBootMountQuiescence` wraps D1's scoped quiescence and the
+    // reconciles it gates. Adoption sits after its return so it only ever sees
+    // containers the door chose to leave running — and its candidate set is
+    // the partition the door returns.
+    const door = indexOfCall(calls, DOOR);
     expect(adopt).toBeGreaterThan(door);
+    // Nothing that can issue a wake sits between the door and adoption either.
+    for (const source of WAKE_SOURCES) expect(indexOfCall(calls, source)).toBeGreaterThan(door);
     // §4.3.6: the recovery's premise — "a fresh process holds no mount claims,
     // so every active fence is orphaned" — must still be true when it runs, so
     // adoption (which registers containers but takes no claims) goes first,

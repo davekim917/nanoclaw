@@ -287,7 +287,8 @@ it('keeps the memory gate a runtime check plus the cutover, with nothing stopped
 
 it('admits pending upgrade contexts after memory cutover and before any runtime can wake', () => {
   const source = fs.readFileSync(path.resolve('src/main.ts'), 'utf8');
-  const memoryCutover = source.indexOf('const { memoryReports } = await runBootMountQuiescence(db);');
+  // Destructuring-agnostic: series E reads `scope` off the same return.
+  const memoryCutover = source.indexOf('= await runBootMountQuiescence(db);');
   const pendingUpgrade = source.indexOf('const pendingUpgrade = await reconcilePendingUpgradeContexts(');
   const dashboard = source.indexOf('startDashboard();');
   const channels = source.indexOf('await initChannelAdapters(');
