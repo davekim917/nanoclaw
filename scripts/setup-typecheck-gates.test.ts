@@ -60,21 +60,47 @@ function fixture(valid: boolean): string {
   return root;
 }
 
+// Each fixture launches two throttled compiler processes on the shared host.
 describe('setup typecheck enforcement', () => {
-  it.each(['build', 'push'] as const)('rejects setup type errors at the %s gate', (gate) => {
-    const root = fixture(false);
-    const result = runGate(root, gate);
-    expect(result.status, result.stderr).toBeGreaterThan(0);
-    expect(result.stdout).toContain('setup/index.ts');
-    expect(result.stdout).toContain('TS2322');
-    expect(fs.existsSync(path.join(root, 'dist/.build-start-sha'))).toBe(false);
-  });
-
-  it.each(['build', 'push'] as const)('accepts valid setup code at the %s gate', (gate) => {
+  it('typechecks authentication steps without optional channel packages installed', () => {
     const root = fixture(true);
-    const result = runGate(root, gate);
+    const config = JSON.parse(fs.readFileSync(path.join(root, 'tsconfig.json'), 'utf8'));
+    config.compilerOptions.types = ['node'];
+    fs.writeFileSync(path.join(root, 'tsconfig.json'), JSON.stringify(config));
+    fs.mkdirSync(path.join(root, 'node_modules/@types'), { recursive: true });
+    fs.symlinkSync(path.join(repoRoot, 'node_modules/@types/node'), path.join(root, 'node_modules/@types/node'));
+    for (const file of ['whatsapp-auth.ts', 'signal-auth.ts', 'status.ts']) {
+      fs.copyFileSync(path.join(repoRoot, 'setup', file), path.join(root, 'setup', file));
+    }
+    for (const dependency of ['@whiskeysockets/baileys', 'pino', 'qrcode']) {
+      expect(fs.existsSync(path.join(root, 'node_modules', dependency))).toBe(false);
+    }
+    const result = runGate(root, 'build');
     expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
-  });
+  }, 60_000);
+
+  it.each(['build', 'push'] as const)(
+    'rejects setup type errors at the %s gate',
+    (gate) => {
+      const root = fixture(false);
+      const result = runGate(root, gate);
+      expect(result.status, result.stderr).toBeGreaterThan(0);
+      expect(result.stdout).toContain('setup/index.ts');
+      expect(result.stdout).toContain('TS2322');
+      expect(fs.existsSync(path.join(root, 'dist/.build-start-sha'))).toBe(false);
+    },
+    60_000,
+  );
+
+  it.each(['build', 'push'] as const)(
+    'accepts valid setup code at the %s gate',
+    (gate) => {
+      const root = fixture(true);
+      const result = runGate(root, gate);
+      expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
+    },
+    60_000,
+  );
 });
 
 function runGate(root: string, gate: 'build' | 'push') {

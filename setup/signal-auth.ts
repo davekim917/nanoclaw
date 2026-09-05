@@ -40,6 +40,19 @@ import { emitStatus } from './status.js';
 
 const LINK_TIMEOUT_MS = 180_000;
 const DEFAULT_DEVICE_NAME = 'NanoClaw';
+const QRCODE_PACKAGE = 'qrcode';
+
+type QrCodeModule = {
+  toString: (text: string, options: { type: 'terminal'; small: boolean }) => Promise<string>;
+};
+
+async function loadOptionalModule<T>(modulePath: string): Promise<T> {
+  return import(modulePath);
+}
+
+async function loadQrCode(): Promise<QrCodeModule> {
+  return loadOptionalModule<QrCodeModule>(QRCODE_PACKAGE);
+}
 
 interface SignalAccount {
   number?: string;
@@ -86,7 +99,7 @@ async function renderQr(url: string): Promise<string[]> {
     'Signal → Settings → Linked Devices → Link New Device → scan this code.';
   const urlHint = 'Or open this link on the phone running Signal:';
   try {
-    const QRCode = await import('qrcode');
+    const QRCode = await loadQrCode();
     const qrText = await QRCode.toString(url, { type: 'terminal', small: true });
     return ['', ...qrText.trimEnd().split('\n'), '', scanHint, '', urlHint, url, ''];
   } catch {
