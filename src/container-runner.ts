@@ -232,13 +232,27 @@ const activeContainers = new Map<
  * start is attempted from the spawn path — the DB may well be healthy again by
  * then — and it is also `shadowWrite`-wrapped, because a failed retry must
  * refuse this one spawn, not throw out of the wake path.
+ *
+ * That "one" is a real once, not one per caller: `lateLeaseStart` holds the
+ * single in-flight attempt so two sessions waking in the same tick share it.
+ * Without it both would see a null id, both would enter the starter, and the
+ * host would end up with two registered instance ids and two renewal timers
+ * while `host-instance.ts` keeps only the last — the earlier row then expires
+ * unrenewed, and any claim taken under it reads as dead to every peer. The
+ * slot is cleared when the attempt settles, so a failure is retried by the
+ * next wake rather than latched for the life of the process.
  */
+let lateLeaseStart: Promise<void> | null = null;
+
 async function resolveClaimantId(): Promise<string | null> {
   const existing = getHostInstanceId();
   if (existing) return existing;
-  await shadowWrite('host instance lease (late start from the spawn path)', () =>
+  lateLeaseStart ??= shadowWrite('host instance lease (late start from the spawn path)', () =>
     startHostInstanceLease({ leaseTtlMs: HOST_LEASE_TTL_MS }),
-  );
+  ).finally(() => {
+    lateLeaseStart = null;
+  });
+  await lateLeaseStart;
   return getHostInstanceId();
 }
 

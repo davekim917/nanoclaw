@@ -74,6 +74,12 @@ const hooks = vi.hoisted(() => ({
   claimWriteFails: false,
   /** `startHostInstanceLease` rejects — the host has no durable id at all. */
   leaseStartFails: false,
+  /** How many times the spawn path entered the lease starter. */
+  leaseStartCalls: 0,
+  /** Parks inside `startHostInstanceLease`, so a second wake can pile onto it. */
+  leaseStartGate: null as Promise<void> | null,
+  /** Every `getHostInstanceId()` read, so a test can see callers arrive. */
+  idReads: 0,
   /** `renewHostInstanceLease` rejects — a lapsed self lease cannot be re-armed. */
   leaseRenewalFails: false,
   /** Parks inside `getSessionClaim`, i.e. immediately before the claim. */
@@ -88,6 +94,9 @@ const hooks = vi.hoisted(() => ({
     this.claimWriteFails = false;
     this.leaseStartFails = false;
     this.leaseRenewalFails = false;
+    this.leaseStartCalls = 0;
+    this.leaseStartGate = null;
+    this.idReads = 0;
     this.preClaimGate = null;
     this.releaseGates.clear();
     this.storageGate = null;
@@ -137,7 +146,13 @@ vi.mock('./host-instance.js', async (importOriginal) => {
   const real = await importOriginal<typeof import('./host-instance.js')>();
   return {
     ...real,
+    getHostInstanceId: () => {
+      hooks.idReads += 1;
+      return real.getHostInstanceId();
+    },
     startHostInstanceLease: async (options?: Parameters<typeof real.startHostInstanceLease>[0]) => {
+      hooks.leaseStartCalls += 1;
+      if (hooks.leaseStartGate) await hooks.leaseStartGate;
       if (hooks.leaseStartFails) throw new Error('host_instances INSERT failed');
       return real.startHostInstanceLease(options);
     },
@@ -269,6 +284,12 @@ const AGENT_GROUP_ID = 'ag-session-claim';
 // disk fixture — the same lever src/container-runner.test.ts pulls.
 const AGENT_GROUP_FOLDER = '__session-claim-test__';
 
+/**
+ * `thread_id` is the session id, never null. `idx_sessions_active_triple` is
+ * unique over (agent_group_id, messaging_group_id, thread_id), so two active
+ * sessions of one group with null thread ids collide — which is exactly what a
+ * case seeding two sessions needs to avoid.
+ */
 async function seedSession(id: string): Promise<void> {
   // A real inbound/outbound mailbox under the temp DATA_DIR: the spawn path
   // refuses a session it cannot prove a mailbox for, and that refusal sits
@@ -278,9 +299,11 @@ async function seedSession(id: string): Promise<void> {
   await getDb().run(
     `INSERT INTO sessions (id, agent_group_id, messaging_group_id, thread_id, agent_provider, status,
                            container_status, last_active, created_at)
-     VALUES (?, ?, NULL, NULL, NULL, 'active', 'stopped', NULL, '2026-09-05T00:00:00.000Z')`,
+     VALUES (?, ?, NULL, ?, NULL, 'active', 'stopped', NULL, ?)`,
     id,
     AGENT_GROUP_ID,
+    id,
+    STAMP,
   );
 }
 
@@ -289,7 +312,7 @@ function callerSnapshot(id: string): Session {
     id,
     agent_group_id: AGENT_GROUP_ID,
     messaging_group_id: null,
-    thread_id: null,
+    thread_id: id,
     agent_provider: null,
     status: 'active',
     container_status: 'stopped',
@@ -348,18 +371,32 @@ function wakeFailures(): string[] {
 }
 
 /** Wait until the spawn path announces the event, or give up loudly. */
-async function untilEvent(event: string): Promise<void> {
-  for (let attempt = 0; attempt < 200 && !hooks.events.includes(event); attempt++) {
+/**
+ * Budget for every wait below. Deliberately generous and expressed as a
+ * DEADLINE rather than a poll count: these are real timers over a real spawn
+ * prelude (mailbox provisioning, group init, argument construction), and under
+ * a loaded full-suite run that prelude takes seconds, not milliseconds. A
+ * fixed count of short sleeps made the waits a function of host load — the
+ * shutdown case below failed once at 22.9 s in a full run while passing alone.
+ * A genuine hang still fails, just later and with the same message.
+ */
+const WAIT_BUDGET_MS = 30_000;
+
+async function until(done: () => boolean, describeFailure: string): Promise<void> {
+  const deadline = Date.now() + WAIT_BUDGET_MS;
+  while (!done() && Date.now() < deadline) {
     await new Promise((resolve) => setTimeout(resolve, 5));
   }
-  expect(hooks.events, `the spawn path never reached ${event}`).toContain(event);
+  expect(done(), describeFailure).toBe(true);
+}
+
+async function untilEvent(event: string): Promise<void> {
+  await until(() => hooks.events.includes(event), `the spawn path never reached ${event}`);
 }
 
 /** Wait for the ENOENT child's close/error to drive finalizeContainer. */
 async function waitForFinalize(sessionId: string): Promise<void> {
-  for (let attempt = 0; attempt < 200 && isContainerRunning(sessionId); attempt++) {
-    await new Promise((resolve) => setTimeout(resolve, 10));
-  }
+  await until(() => !isContainerRunning(sessionId), `the container for ${sessionId} never finalized`);
   // The claim release is a detached tail on the exit handler; let it settle.
   await new Promise((resolve) => setTimeout(resolve, 20));
 }
@@ -555,6 +592,32 @@ describe('claim-first spawn', () => {
     expect([claim?.incarnation, claim?.claimed_by]).toEqual([1, instanceId]);
     expect(hasContainerEverRun('sess-relapsed')).toBe(true);
     await waitForFinalize('sess-relapsed');
+  });
+
+  it('concurrent wakes without a lease share one late start', async () => {
+    await seedSession('sess-race-a');
+    await seedSession('sess-race-b');
+    let letTheLeaseStart!: () => void;
+    hooks.leaseStartGate = new Promise<void>((resolve) => {
+      letTheLeaseStart = resolve;
+    });
+
+    const wakes = [wakeContainer(callerSnapshot('sess-race-a')), wakeContainer(callerSnapshot('sess-race-b'))];
+    // Both wakes have read the (still null) instance id: the first is parked
+    // inside the starter, the second is waiting on that same attempt.
+    await until(() => hooks.idReads >= 2, 'the second wake never reached the claimant resolution');
+    letTheLeaseStart();
+    await Promise.all(wakes);
+
+    // One registration, therefore one renewal timer and one row — not two, of
+    // which the module would remember only the last.
+    expect(hooks.leaseStartCalls).toBe(1);
+    const instanceId = getHostInstanceId();
+    expect(instanceId).not.toBeNull();
+    const claims = await Promise.all([getSessionClaim('sess-race-a'), getSessionClaim('sess-race-b')]);
+    expect(claims.map((claim) => claim?.claimed_by)).toEqual([instanceId, instanceId]);
+    await waitForFinalize('sess-race-a');
+    await waitForFinalize('sess-race-b');
   });
 
   it('a claim write failure starts no container', async () => {
