@@ -28,7 +28,7 @@ import { runSkill, type RunSkillOptions } from '../lib/skill-driver.js';
 
 const DEFAULT_AGENT_NAME = 'Nano';
 
-interface WireArgs {
+export interface WireArgs {
   channel: string;
   userId: string;
   platformId: string;

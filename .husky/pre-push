@@ -58,3 +58,10 @@ if [ ! -e "$worktree_root/node_modules" ]; then
   ln -s "$repo_root/node_modules" "$worktree_root/node_modules"
 fi
 (cd "$worktree_root" && node_modules/.bin/eslint --quiet src/ scripts/)
+
+# Include setup and scripts in the same typecheck command used by CI/builds.
+if command -v ionice >/dev/null 2>&1; then
+  (cd "$worktree_root" && ionice -c3 nice -n 10 pnpm run typecheck)
+else
+  (cd "$worktree_root" && nice -n 10 pnpm run typecheck)
+fi

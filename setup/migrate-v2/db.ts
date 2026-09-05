@@ -186,6 +186,10 @@ async function main(): Promise<void> {
           ignored_message_policy: 'drop',
           session_mode: 'shared',
           priority: 0,
+          default_model: null,
+          default_effort: null,
+          default_tone: null,
+          instructions_profile: null,
           created_at: createdAt,
         });
         created++;

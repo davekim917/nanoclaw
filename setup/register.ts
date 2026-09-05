@@ -286,6 +286,7 @@ export async function run(args: string[]): Promise<void> {
       default_model: null,
       default_effort: null,
       default_tone: null,
+      instructions_profile: null,
       created_at: new Date().toISOString(),
     });
     log.info('Wired agent to messaging group', {

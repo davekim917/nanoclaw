@@ -5,9 +5,18 @@
 import { log } from '../src/log.js';
 import { emitStatus } from './status.js';
 
+type SetupStep = { run: (args: string[]) => Promise<void> };
+
+// Some setup steps are installed by a channel skill. Keeping their module path
+// dynamic lets a fresh core checkout typecheck while retaining the same runtime
+// loader once that optional payload has been copied in.
+function optionalStep(modulePath: string): () => Promise<SetupStep> {
+  return () => import(modulePath);
+}
+
 const STEPS: Record<
   string,
-  () => Promise<{ run: (args: string[]) => Promise<void> }>
+  () => Promise<SetupStep>
 > = {
   timezone: () => import('./timezone.js'),
   'set-env': () => import('./set-env.js'),
@@ -15,7 +24,7 @@ const STEPS: Record<
   container: () => import('./container.js'),
   register: () => import('./register.js'),
   'pair-telegram': () => import('./pair-telegram.js'),
-  groups: () => import('./groups.js'),
+  groups: optionalStep('./groups.js'),
   'whatsapp-auth': () => import('./whatsapp-auth.js'),
   'signal-auth': () => import('./signal-auth.js'),
   mounts: () => import('./mounts.js'),

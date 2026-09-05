@@ -28,45 +28,127 @@
 import fs from 'fs';
 import path from 'path';
 import { createRequire } from 'module';
-// Named import (not default) — pino's d.ts under NodeNext resolves the
-// default export to `typeof pino` (namespace), which isn't callable. The
-// named `pino` export resolves to the callable function.
-import { pino } from 'pino';
-
-import {
-  makeWASocket,
-  Browsers,
-  DisconnectReason,
-  fetchLatestWaWebVersion,
-  makeCacheableSignalKeyStore,
-  useMultiFileAuthState,
-} from '@whiskeysockets/baileys';
 import { emitStatus } from './status.js';
 
 const AUTH_DIR = path.join(process.cwd(), 'store', 'auth');
 const PAIRING_CODE_FILE = path.join(process.cwd(), 'store', 'pairing-code.txt');
-const baileysLogger = pino({ level: 'silent' });
+const BAILEYS_PACKAGE = '@whiskeysockets/baileys';
+const PINO_PACKAGE = 'pino';
+const QRCODE_PACKAGE = 'qrcode';
+
+type WaVersion = [number, number, number];
+type BrowserDescription = [string, string, string];
+
+type BaileysLogger = {
+  level: string;
+  child: (bindings: Record<string, unknown>) => BaileysLogger;
+  trace: (value: unknown, message?: string) => unknown;
+  debug: (value: unknown, message?: string) => unknown;
+  info: (value: unknown, message?: string) => unknown;
+  warn: (value: unknown, message?: string) => unknown;
+  error: (value: unknown, message?: string) => unknown;
+};
+
+type WhatsAppAuthState = {
+  creds: { registered: boolean; me?: { id?: string } };
+  keys: Record<string, unknown>;
+};
+
+type ConnectionUpdate = {
+  connection?: string;
+  lastDisconnect?: { error?: { output?: { statusCode?: number } } };
+  qr?: string;
+};
+
+type WhatsAppSocket = {
+  user?: { id?: string };
+  end: (error: Error | undefined) => void;
+  requestPairingCode: (phone: string) => Promise<string>;
+  ev: {
+    on: {
+      (event: 'connection.update', listener: (update: ConnectionUpdate) => void): void;
+      (event: 'creds.update', listener: () => void | Promise<void>): void;
+    };
+  };
+};
+
+type BaileysModule = {
+  makeWASocket: (config: {
+    version?: WaVersion;
+    auth: {
+      creds: WhatsAppAuthState['creds'];
+      keys: WhatsAppAuthState['keys'];
+    };
+    printQRInTerminal: boolean;
+    logger: BaileysLogger;
+    browser: BrowserDescription;
+  }) => WhatsAppSocket;
+  Browsers: { macOS: (browser: string) => BrowserDescription };
+  DisconnectReason: { loggedOut: number; timedOut: number };
+  fetchLatestWaWebVersion: (options: Record<string, never>) => Promise<{ version: WaVersion }>;
+  makeCacheableSignalKeyStore: (
+    keys: Record<string, unknown>,
+    logger: BaileysLogger,
+  ) => Record<string, unknown>;
+  useMultiFileAuthState: (folder: string) => Promise<{
+    state: WhatsAppAuthState;
+    saveCreds: () => Promise<void>;
+  }>;
+};
+
+type PinoModule = {
+  pino: (options: { level: 'silent' }) => BaileysLogger;
+};
+
+type QrCodeModule = {
+  toString: (text: string, options: { type: 'terminal'; small: boolean }) => Promise<string>;
+};
+
+type LegacyBaileysModule = {
+  proto: {
+    DeviceProps: {
+      PlatformType: Record<string, string | number | undefined>;
+    };
+  };
+};
+
+type LegacyBaileysGenerics = {
+  getPlatformId: (browser: string) => string;
+};
+
+async function loadOptionalModule<T>(modulePath: string): Promise<T> {
+  return import(modulePath);
+}
+
+async function loadQrCode(): Promise<QrCodeModule> {
+  return loadOptionalModule<QrCodeModule>(QRCODE_PACKAGE);
+}
 
 // Baileys v6 bug: getPlatformId sends charCode (49) instead of enum value (1).
 // Fixed in Baileys 7.x but not backported. Without this patch pairing codes
 // fail with "couldn't link device" because WhatsApp receives an invalid
-// platform id. createRequire because proto is not a named ESM export.
-const _require = createRequire(import.meta.url);
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-const { proto } = _require('@whiskeysockets/baileys') as { proto: any };
-try {
-  const _generics = _require(
-    '@whiskeysockets/baileys/lib/Utils/generics',
-  ) as Record<string, unknown>;
-  _generics.getPlatformId = (browser: string): string => {
-    const platformType =
-      proto.DeviceProps.PlatformType[
-        browser.toUpperCase() as keyof typeof proto.DeviceProps.PlatformType
-      ];
-    return platformType ? platformType.toString() : '1';
-  };
-} catch {
-  // If CJS require fails, QR auth still works; only pairing code may be affected.
+// platform id. createRequire is needed because proto is not a named ESM export.
+function patchLegacyBaileysPlatformId(): void {
+  try {
+    const require = createRequire(import.meta.url);
+    const baileys: LegacyBaileysModule = require(BAILEYS_PACKAGE);
+    const generics: LegacyBaileysGenerics = require(`${BAILEYS_PACKAGE}/lib/Utils/generics`);
+    generics.getPlatformId = (browser: string): string => {
+      const platformType = baileys.proto.DeviceProps.PlatformType[browser.toUpperCase()];
+      return platformType ? platformType.toString() : '1';
+    };
+  } catch {
+    // If CJS require fails, QR auth still works; only pairing code may be affected.
+  }
+}
+
+async function loadWhatsAppDependencies(): Promise<BaileysModule & { logger: BaileysLogger }> {
+  const [baileysModule, pinoModule] = await Promise.all([
+    loadOptionalModule<BaileysModule>(BAILEYS_PACKAGE),
+    loadOptionalModule<PinoModule>(PINO_PACKAGE),
+  ]);
+  patchLegacyBaileysPlatformId();
+  return { ...baileysModule, logger: pinoModule.pino({ level: 'silent' }) };
 }
 
 type AuthMethod = 'qr' | 'pairing-code';
@@ -96,7 +178,7 @@ function readAuthedPhoneFromFile(): string {
  */
 async function renderQrLines(qr: string): Promise<string[]> {
   try {
-    const QRCode = await import('qrcode');
+    const QRCode = await loadQrCode();
     const art = await QRCode.toString(qr, { type: 'terminal', small: true });
     return [
       ...art.trimEnd().split('\n'),
@@ -167,6 +249,8 @@ export async function run(args: string[]): Promise<void> {
     return;
   }
 
+  const dependencies = await loadWhatsAppDependencies();
+
   fs.mkdirSync(AUTH_DIR, { recursive: true });
 
   return new Promise<void>((resolve) => {
@@ -198,20 +282,20 @@ export async function run(args: string[]): Promise<void> {
     }
 
     async function connectSocket(isReconnect = false): Promise<void> {
-      const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
-      const { version } = await fetchLatestWaWebVersion({}).catch(() => ({
+      const { state, saveCreds } = await dependencies.useMultiFileAuthState(AUTH_DIR);
+      const { version } = await dependencies.fetchLatestWaWebVersion({}).catch(() => ({
         version: undefined,
       }));
 
-      const sock = makeWASocket({
+      const sock = dependencies.makeWASocket({
         version,
         auth: {
           creds: state.creds,
-          keys: makeCacheableSignalKeyStore(state.keys, baileysLogger),
+          keys: dependencies.makeCacheableSignalKeyStore(state.keys, dependencies.logger),
         },
         printQRInTerminal: false,
-        logger: baileysLogger,
-        browser: Browsers.macOS('Chrome'),
+        logger: dependencies.logger,
+        browser: dependencies.Browsers.macOS('Chrome'),
       });
 
       // Request pairing code only on first connect (not reconnect after 515).
@@ -256,17 +340,15 @@ export async function run(args: string[]): Promise<void> {
         }
 
         if (connection === 'close') {
-          const reason = (
-            lastDisconnect?.error as { output?: { statusCode?: number } }
-          )?.output?.statusCode;
-          if (reason === DisconnectReason.loggedOut) {
+          const reason = lastDisconnect?.error?.output?.statusCode;
+          if (reason === dependencies.DisconnectReason.loggedOut) {
             clearTimeout(timeout);
             emitStatus('WHATSAPP_AUTH', {
               STATUS: 'failed',
               ERROR: 'logged_out',
             });
             process.exit(1);
-          } else if (reason === DisconnectReason.timedOut) {
+          } else if (reason === dependencies.DisconnectReason.timedOut) {
             clearTimeout(timeout);
             emitStatus('WHATSAPP_AUTH', {
               STATUS: 'failed',

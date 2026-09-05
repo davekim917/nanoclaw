@@ -235,7 +235,27 @@ function runLintGate(): void {
   process.exit(1);
 }
 
+/** Typecheck host, scripts, and setup before accepting a build. */
+function runTypecheckGate(): void {
+  try {
+    try {
+      execFileSync('ionice', ['-c3', 'nice', '-n', '10', 'pnpm', 'run', 'typecheck'], {
+        cwd: REPO_ROOT,
+        stdio: 'inherit',
+      });
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
+      execFileSync('nice', ['-n', '10', 'pnpm', 'run', 'typecheck'], { cwd: REPO_ROOT, stdio: 'inherit' });
+    }
+  } catch (err) {
+    console.error('BUILD REFUSED: typecheck gate failed.');
+    console.error(err instanceof Error ? err.message : String(err));
+    process.exit(1);
+  }
+}
+
 function main(): void {
+  runTypecheckGate();
   runLintGate();
 
   // NOTE: don't .trim() the raw output before splitting — porcelain status
