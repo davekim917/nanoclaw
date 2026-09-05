@@ -75,6 +75,19 @@ describe('isUniqueViolation', () => {
 // ── Tripwire ──
 
 /** The three central-DB inserts whose tables carry a racy unique key. */
+/**
+ * Derived from the migrated schema (sqlite_master, 2026-09-05), not from
+ * memory: the inserts whose leaf is async-converted (or whose callers now yield
+ * before it) AND whose table carries a unique key beyond a fresh primary key —
+ *   sessions:               idx_sessions_active_triple, sessions_channel_root_unique
+ *   messaging_groups:       UNIQUE(channel_type, platform_id, instance)
+ *   messaging_group_agents: UNIQUE(messaging_group_id, agent_group_id)
+ *   agent_groups:           folder UNIQUE
+ * Not guarded, and why: pending_approvals / pending_questions / container_configs
+ * key only on a fresh id (createPendingQuestion is INSERT OR IGNORE); the
+ * permissions leaves (pending_sender_approvals, user_dms, users) are still
+ * synchronous end to end, so no yield sits between their lookup and insert.
+ */
 const GUARDED_CALLS = ['createSession(', 'createMessagingGroup(', 'createAgentGroup(', 'createMessagingGroupAgent('];
 
 /** Roots scanned for bare callers. Relative to the repo root. */
