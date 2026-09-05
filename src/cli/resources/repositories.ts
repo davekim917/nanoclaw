@@ -70,13 +70,13 @@ function describe(checkout: LegacyCheckout): string {
  * rather than once per repository.
  */
 async function withWorkgroupQuiescence<T>(workgroupId: string, body: () => Promise<T>): Promise<T> {
-  const groupIds = getAllAgentGroups()
+  const groupIds = (await getAllAgentGroups())
     .filter((group) => (group.workgroup_id ?? group.folder) === workgroupId)
     .map((group) => group.id);
   if (groupIds.length === 0) throw new Error(`no agent groups belong to workgroup ${workgroupId}`);
 
   return withWorkgroupRepositoryMountClaim(workgroupId, async () => {
-    const sessions = groupIds.flatMap((id) => getSessionsByAgentGroup(id));
+    const sessions = (await Promise.all(groupIds.map((id) => getSessionsByAgentGroup(id)))).flat();
     const quiescence = await quiesceSessionsForRepositoryMounts(
       sessions,
       `repository-activation:${workgroupId}:${Date.now()}`,

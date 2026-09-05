@@ -63,8 +63,8 @@ describe('destinations CLI custom ops project to inbound.db (#2465)', () => {
     const db = getRawDb();
     runMigrations(db);
 
-    createAgentGroup({ id: SOURCE, name: 'source', folder: 'source', agent_provider: null, created_at: now() });
-    createAgentGroup({ id: TARGET, name: 'target', folder: 'target', agent_provider: null, created_at: now() });
+    await createAgentGroup({ id: SOURCE, name: 'source', folder: 'source', agent_provider: null, created_at: now() });
+    await createAgentGroup({ id: TARGET, name: 'target', folder: 'target', agent_provider: null, created_at: now() });
 
     // Two active sessions for the source agent — both must receive the
     // projected destination row. Fixing only the "newest" session is a
@@ -72,7 +72,7 @@ describe('destinations CLI custom ops project to inbound.db (#2465)', () => {
     // Distinct threads per session: migration 049 folds NULLs, so two
     // active NULL/NULL rows on one agent group would be rejected at insert.
     for (const sid of [SESSION_A, SESSION_B]) {
-      createSession({
+      await createSession({
         id: sid,
         agent_group_id: SOURCE,
         messaging_group_id: null,

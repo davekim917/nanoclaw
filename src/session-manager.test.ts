@@ -26,8 +26,10 @@ vi.mock('./capabilities.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('./capabilities.js')>();
   return {
     ...actual,
-    buildSessionServicesSnapshot: (...args: Parameters<typeof actual.buildSessionServicesSnapshot>) => {
-      const snapshot = actual.buildSessionServicesSnapshot(...args);
+    // The recall build calls the synchronous half (its central facts arrive
+    // pre-resolved), so that is the seam the test capability rides on.
+    buildSessionServicesSnapshotFrom: (...args: Parameters<typeof actual.buildSessionServicesSnapshotFrom>) => {
+      const snapshot = actual.buildSessionServicesSnapshotFrom(...args);
       return {
         ...snapshot,
         services: [
@@ -267,7 +269,7 @@ describe('writeSessionMessage re-provisions a deleted session folder', () => {
     await initTestDb();
     const db = getRawDb();
     runMigrations(db);
-    createAgentGroup({
+    await createAgentGroup({
       id: AG,
       name: 'Reset',
       folder: 'reset',
@@ -289,7 +291,7 @@ describe('writeSessionMessage re-provisions a deleted session folder', () => {
       last_active: null,
       created_at: new Date().toISOString(),
     };
-    createSession(sess);
+    await createSession(sess);
   });
 
   afterEach(async () => {
@@ -852,7 +854,7 @@ describe('writeSessionMessage re-provisions a deleted session folder', () => {
 
   it('upgrades a legacy inbound schema before startup reconciliation admits fresh context', async () => {
     const legacySessionId = 'sess-legacy-memory-upgrade';
-    createSession({
+    await createSession({
       id: legacySessionId,
       agent_group_id: AG,
       messaging_group_id: null,
@@ -1400,7 +1402,7 @@ describe('session migration pass preserves the idle clock', () => {
     await initTestDb();
     const db = getRawDb();
     runMigrations(db);
-    createAgentGroup({
+    await createAgentGroup({
       id: MIGRATION_AG,
       name: 'Mtime',
       folder: 'mtime',
@@ -1417,8 +1419,8 @@ describe('session migration pass preserves the idle clock', () => {
     await closeDb();
   });
 
-  function seedSession(sessionId: string): void {
-    createSession({
+  async function seedSession(sessionId: string): Promise<void> {
+    await createSession({
       id: sessionId,
       agent_group_id: MIGRATION_AG,
       messaging_group_id: null,
@@ -1439,7 +1441,7 @@ describe('session migration pass preserves the idle clock', () => {
 
   it('leaves a schema-current inbound.db untouched', async () => {
     const sessionId = 'sess-current-schema';
-    seedSession(sessionId);
+    await seedSession(sessionId);
     initSessionFolder(MIGRATION_AG, sessionId);
     const before = ageInbound(sessionId);
 
@@ -1452,7 +1454,7 @@ describe('session migration pass preserves the idle clock', () => {
 
   it('restores the pre-pass mtime after real DDL runs', async () => {
     const sessionId = 'sess-legacy-schema';
-    seedSession(sessionId);
+    await seedSession(sessionId);
     const legacyPath = inboundDbPath(MIGRATION_AG, sessionId);
     fs.mkdirSync(path.dirname(legacyPath), { recursive: true });
     const legacy = new Database(legacyPath);
@@ -1492,7 +1494,7 @@ describe('session migration pass preserves the idle clock', () => {
 
   it('deletes the intent manifest when the pass completes', async () => {
     const sessionId = 'sess-manifest-clean';
-    seedSession(sessionId);
+    await seedSession(sessionId);
     initSessionFolder(MIGRATION_AG, sessionId);
 
     await reconcilePendingUpgradeContexts(getRawDb(), ['mtime']);
@@ -1502,7 +1504,7 @@ describe('session migration pass preserves the idle clock', () => {
 
   it('replays an interrupted pass from the fsynced manifest at startup', async () => {
     const sessionId = 'sess-crashed-pass';
-    seedSession(sessionId);
+    await seedSession(sessionId);
     initSessionFolder(MIGRATION_AG, sessionId);
     const target = inboundDbPath(MIGRATION_AG, sessionId);
     const stat = fs.statSync(target);
@@ -1538,7 +1540,7 @@ describe('session migration pass preserves the idle clock', () => {
     // sibling tests flaked roughly one CI run in three. Without the floor in
     // sawRealActivityAfter this fails every time; with it, never.
     const sessionId = 'sess-subms-phantom';
-    seedSession(sessionId);
+    await seedSession(sessionId);
     initSessionFolder(MIGRATION_AG, sessionId);
     const target = inboundDbPath(MIGRATION_AG, sessionId);
     const writtenAtMs = Date.now();
@@ -1572,7 +1574,7 @@ describe('session migration pass preserves the idle clock', () => {
 
   it('leaves a session that saw real traffic after the crashed pass alone', async () => {
     const sessionId = 'sess-real-traffic';
-    seedSession(sessionId);
+    await seedSession(sessionId);
     initSessionFolder(MIGRATION_AG, sessionId);
     const target = inboundDbPath(MIGRATION_AG, sessionId);
     const writtenAtMs = Date.now() - 60 * 60 * 1000;
@@ -1600,7 +1602,7 @@ describe('session migration pass preserves the idle clock', () => {
     const healthy = 'sess-isolation-healthy';
     const stub = 'sess-isolation-stub';
     const schemaless = 'sess-isolation-schemaless';
-    for (const sessionId of [healthy, stub, schemaless]) seedSession(sessionId);
+    for (const sessionId of [healthy, stub, schemaless]) await seedSession(sessionId);
 
     initSessionFolder(MIGRATION_AG, healthy);
 
@@ -1658,7 +1660,7 @@ describe('session migration pass preserves the idle clock', () => {
     // as idle to the reclaim. A clock left bumped only delays this session's
     // reclaim; a clock rewound over real rows can get it archived.
     const sessionId = 'sess-throws-after-ddl';
-    seedSession(sessionId);
+    await seedSession(sessionId);
     const legacyPath = inboundDbPath(MIGRATION_AG, sessionId);
     fs.mkdirSync(path.dirname(legacyPath), { recursive: true });
     const legacy = new Database(legacyPath);
@@ -1719,7 +1721,7 @@ describe('session migration pass preserves the idle clock', () => {
     // restore keyed on that zero would rewind the clock of a session holding
     // freshly admitted work, which is what feeds the reclaim's idle decision.
     const sessionId = 'sess-partial-admit';
-    seedSession(sessionId);
+    await seedSession(sessionId);
     const legacyPath = inboundDbPath(MIGRATION_AG, sessionId);
     fs.mkdirSync(path.dirname(legacyPath), { recursive: true });
     const legacy = new Database(legacyPath);
@@ -1784,7 +1786,7 @@ describe('session migration pass preserves the idle clock', () => {
 
   it('leaves a session alone when untouched evidence shows work inside the replay window', async () => {
     const sessionId = 'sess-traffic-in-window';
-    seedSession(sessionId);
+    await seedSession(sessionId);
     initSessionFolder(MIGRATION_AG, sessionId);
     const target = inboundDbPath(MIGRATION_AG, sessionId);
     const writtenAtMs = Date.now();
@@ -1812,7 +1814,7 @@ describe('session migration pass preserves the idle clock', () => {
 
   it('tolerates filesystem rounding on the low edge of the replay window', async () => {
     const sessionId = 'sess-rounding-edge';
-    seedSession(sessionId);
+    await seedSession(sessionId);
     initSessionFolder(MIGRATION_AG, sessionId);
     const target = inboundDbPath(MIGRATION_AG, sessionId);
     const writtenAtMs = Date.now();
@@ -1845,7 +1847,7 @@ describe('session migration pass preserves the idle clock', () => {
 
   it('keeps the new mtime for a session whose pass admitted real work', async () => {
     const sessionId = 'sess-admits-work';
-    seedSession(sessionId);
+    await seedSession(sessionId);
     const legacyPath = inboundDbPath(MIGRATION_AG, sessionId);
     fs.mkdirSync(path.dirname(legacyPath), { recursive: true });
     const legacy = new Database(legacyPath);
@@ -2044,14 +2046,14 @@ describe('writeSessionMessage evaluates its caller guard at the insert', () => {
     await initTestDb();
     const db = getRawDb();
     runMigrations(db);
-    createAgentGroup({
+    await createAgentGroup({
       id: AG,
       name: 'Guard',
       folder: 'guard',
       agent_provider: null,
       created_at: new Date().toISOString(),
     });
-    createSession({
+    await createSession({
       id: GUARD_SESS,
       agent_group_id: AG,
       messaging_group_id: null,
@@ -2253,7 +2255,7 @@ describe('writeSessionMessage does not race an in-flight session archival', () =
     await initTestDb();
     const db = getRawDb();
     runMigrations(db);
-    createAgentGroup({
+    await createAgentGroup({
       id: AG,
       name: 'Race',
       folder: 'race',
@@ -2264,7 +2266,7 @@ describe('writeSessionMessage does not race an in-flight session archival', () =
       .prepare(`INSERT INTO workgroups (id, display_name, created_at) VALUES ('race','Race',?)`)
       .run(new Date().toISOString());
     getRawDb().prepare(`UPDATE agent_groups SET workgroup_id = 'race' WHERE id = ?`).run(AG);
-    createSession({
+    await createSession({
       id: SESS,
       agent_group_id: AG,
       messaging_group_id: null,
@@ -2468,7 +2470,7 @@ describe('mailbox seam: ingress writes', () => {
     await initTestDb();
     const db = getRawDb();
     runMigrations(db);
-    createAgentGroup({
+    await createAgentGroup({
       id: AG_ING,
       name: 'Ingress',
       folder: 'ingress',
@@ -2476,7 +2478,7 @@ describe('mailbox seam: ingress writes', () => {
       created_at: new Date().toISOString(),
     });
     for (const id of [SESS_ING, 'sess-ingress-other']) {
-      createSession({
+      await createSession({
         id,
         agent_group_id: AG_ING,
         messaging_group_id: null,

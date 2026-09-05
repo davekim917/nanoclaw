@@ -61,7 +61,15 @@ vi.mock('../../session-manager.js', async (importOriginal) => {
   const real = await importOriginal<typeof import('../../session-manager.js')>();
   return {
     ...real,
-    admitDueTaskContexts: (...args: unknown[]) => mockAdmitDueTaskContexts(...args),
+    // The run-now handler calls the synchronous half (its mutation action must
+    // not yield).
+    admitDueTaskContextsFor: (...args: unknown[]) => mockAdmitDueTaskContexts(...args),
+    // Admission is mocked above, so the central facts it would consume are
+    // stubbed too: this file's schema has no workgroups table to read.
+    resolveRecallCentral: async () => ({
+      provider: 'claude',
+      services: { agentGroup: undefined, workgroupSecrets: [] },
+    }),
     withExistingMailboxSession: async (agentGroupId: string, sessionId: string, action: never) => {
       const hook = duringMailboxAcquire.run;
       duringMailboxAcquire.run = null;
@@ -374,7 +382,7 @@ describe('scheduled mutations invalidate the quiet mark (S2-PR15 / F2)', () => {
 
     // The sweep's flush lands after the edit, carrying the basis it read before.
     const sessionsModule = await import('../../db/sessions.js');
-    sessionsModule.persistQuietSessionMarks([
+    await sessionsModule.persistQuietSessionMarks([
       { sessionId: SESS, quietUntil: '2099-01-01T00:00:00.000Z', lastActive: basis },
     ]);
     expect(sessionRow().sweep_quiet_until, 'a mark computed before the edit hid it').toBeNull();
@@ -721,7 +729,7 @@ describe('runNowHandler', () => {
     expect(res.status).toBe(200);
     expect((await readJson(res)).fired).toBe(true);
     // Fresh due admission completes before the direct wake.
-    expect(mockAdmitDueTaskContexts).toHaveBeenCalledWith(expect.anything(), AG, SESS);
+    expect(mockAdmitDueTaskContexts).toHaveBeenCalledWith(expect.anything(), AG, SESS, expect.anything());
     expect(mockWakeContainer).toHaveBeenCalledTimes(1);
     expect(mockAdmitDueTaskContexts.mock.invocationCallOrder[0]).toBeLessThan(
       mockWakeContainer.mock.invocationCallOrder[0]!,

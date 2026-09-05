@@ -124,9 +124,7 @@ function parseArgs(args: string[]): RegisterArgs {
       case '--unknown-sender-policy': {
         const raw = (args[++i] || '').toLowerCase() as RegisterArgs['unknownSenderPolicy'];
         if (!raw || !SENDER_POLICIES.includes(raw)) {
-          throw new Error(
-            `--unknown-sender-policy must be one of ${SENDER_POLICIES.join('|')}, got "${raw}"`,
-          );
+          throw new Error(`--unknown-sender-policy must be one of ${SENDER_POLICIES.join('|')}, got "${raw}"`);
         }
         result.unknownSenderPolicy = raw;
         break;
@@ -196,23 +194,23 @@ export async function run(args: string[]): Promise<void> {
   // channel group is created on the operator's chosen provider (per-group
   // `ncl groups config update --provider` still overrides). A reused group
   // keeps its existing provider (INSERT OR IGNORE).
-  let agentGroup = getAgentGroupByFolder(parsed.folder);
+  let agentGroup = await getAgentGroupByFolder(parsed.folder);
   if (!agentGroup) {
     const agId = generateId('ag');
-    createAgentGroup({
+    await createAgentGroup({
       id: agId,
       name: parsed.assistantName,
       folder: parsed.folder,
       agent_provider: null,
       created_at: new Date().toISOString(),
     });
-    agentGroup = getAgentGroupByFolder(parsed.folder)!;
+    agentGroup = (await getAgentGroupByFolder(parsed.folder))!;
     log.info('Created agent group', { id: agId, folder: parsed.folder });
   }
-  ensureContainerConfig(agentGroup.id);
+  await ensureContainerConfig(agentGroup.id);
 
   // 2. Create or find messaging group
-  let messagingGroup = getMessagingGroupByPlatform(parsed.channel, parsed.platformId);
+  let messagingGroup = await getMessagingGroupByPlatform(parsed.channel, parsed.platformId);
   if (!messagingGroup) {
     const mgId = generateId('mg');
     // Policy: explicit flag → channel declaration → legacy 'strict' (stale
@@ -222,7 +220,7 @@ export async function run(args: string[]): Promise<void> {
       (hasDeclaredChannelDefaults(parsed.channel)
         ? resolveUnknownSenderPolicy(parsed.channel, parsed.isGroup)
         : 'strict');
-    createMessagingGroup({
+    await createMessagingGroup({
       id: mgId,
       channel_type: parsed.channel,
       platform_id: parsed.platformId,
@@ -231,14 +229,14 @@ export async function run(args: string[]): Promise<void> {
       unknown_sender_policy: unknownSenderPolicy,
       created_at: new Date().toISOString(),
     });
-    messagingGroup = getMessagingGroupByPlatform(parsed.channel, parsed.platformId)!;
+    messagingGroup = (await getMessagingGroupByPlatform(parsed.channel, parsed.platformId))!;
     log.info('Created messaging group', { id: mgId, channel: parsed.channel, platformId: parsed.platformId });
   }
 
   // 3. Wire agent to messaging group — createMessagingGroupAgent auto-creates
   // the companion agent_destinations row so delivery's ACL admits this target.
   let newlyWired = false;
-  const existing = getMessagingGroupAgentByPair(messagingGroup.id, agentGroup.id);
+  const existing = await getMessagingGroupAgentByPair(messagingGroup.id, agentGroup.id);
   if (!existing) {
     newlyWired = true;
     const mgaId = generateId('mga');

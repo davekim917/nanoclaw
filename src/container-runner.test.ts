@@ -864,7 +864,7 @@ describe('codex provider host auth', () => {
     return JSON.parse(fs.readFileSync(path.join(sessionDir, 'codex', 'auth.json'), 'utf-8'));
   }
 
-  it('copies scoped Codex auth for the agent group folder without DB lookup', () => {
+  it('copies scoped Codex auth for the agent group folder without DB lookup', async () => {
     const home = makeHome();
     const sessionDir = makeSessionDir();
     writeAuth(path.join(home, '.codex'), 'global');
@@ -872,7 +872,7 @@ describe('codex provider host auth', () => {
 
     const fn = getProviderContainerConfig('codex');
     expect(fn).toBeDefined();
-    const contribution = fn!({
+    const contribution = await fn!({
       sessionDir,
       agentGroupId: 'ag-does-not-match-folder',
       agentGroupFolder: 'example-retail-codex',
@@ -889,14 +889,14 @@ describe('codex provider host auth', () => {
     });
   });
 
-  it('falls back to global Codex auth when no scoped auth exists', () => {
+  it('falls back to global Codex auth when no scoped auth exists', async () => {
     const home = makeHome();
     const sessionDir = makeSessionDir();
     writeAuth(path.join(home, '.codex'), 'global');
 
     const fn = getProviderContainerConfig('codex');
     expect(fn).toBeDefined();
-    fn!({
+    await fn!({
       sessionDir,
       agentGroupId: 'example-retail-codex',
       agentGroupFolder: 'example-retail-codex',

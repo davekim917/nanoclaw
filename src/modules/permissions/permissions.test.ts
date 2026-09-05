@@ -92,8 +92,8 @@ async function mountMockAdapter(
   return { delivered, openDMCalls };
 }
 
-function seedAgentGroup(id: string): void {
-  createAgentGroup({
+async function seedAgentGroup(id: string): Promise<void> {
+  await createAgentGroup({
     id,
     name: id.toUpperCase(),
     folder: id,
@@ -107,9 +107,9 @@ function seedUser(id: string, kind: string): void {
 }
 
 describe('canAccessAgentGroup', () => {
-  beforeEach(() => {
-    seedAgentGroup('ag-1');
-    seedAgentGroup('ag-2');
+  beforeEach(async () => {
+    await seedAgentGroup('ag-1');
+    await seedAgentGroup('ag-2');
   });
 
   it('denies unknown users', () => {
@@ -323,7 +323,7 @@ describe('ensureUserDm', () => {
     await mountMockAdapter('telegram', undefined, 'telegram-bot-a');
     seedUser('telegram:U-owner', 'telegram');
 
-    createMessagingGroup({
+    await createMessagingGroup({
       id: 'mg-sibling',
       channel_type: 'telegram',
       instance: 'telegram-bot-b',
@@ -365,7 +365,7 @@ describe('ensureUserDm', () => {
       unknown_sender_policy: 'strict' as const,
       created_at: now(),
     };
-    createMessagingGroup(existing);
+    await createMessagingGroup(existing);
 
     const mg = await ensureUserDm('telegram:555');
     expect(mg?.id).toBe('mg-preexisting');

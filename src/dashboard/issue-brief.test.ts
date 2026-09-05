@@ -48,13 +48,13 @@ describe('observatoryIssueBriefHandler', () => {
     getRawDb()
       .prepare(`INSERT INTO workgroups (id, display_name, created_at) VALUES ('wg-1', 'Example', ?)`)
       .run(new Date().toISOString());
-    createAgentGroup({
+    (await createAgentGroup({
       id: 'ag-1',
       name: 'example',
       folder: 'example-co',
       agent_provider: null,
       created_at: new Date().toISOString(),
-    });
+    }));
     getRawDb().prepare(`UPDATE agent_groups SET workgroup_id = 'wg-1' WHERE id = 'ag-1'`).run();
     vi.stubEnv('GITHUB_TOKEN_EXAMPLE_CO', 'tok-scoped');
     _resetIssueBriefCacheForTesting();

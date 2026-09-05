@@ -107,7 +107,7 @@ export async function ensureUserDm(userId: string, instance?: string): Promise<M
   // table is UNIQUE(channel_type, platform_id, instance), so a per-instance
   // row is the intended shape; exact-only here means a miss creates one.
   const now = new Date().toISOString();
-  let mg = getMessagingGroupByPlatform(channelType, dmPlatformId, instance);
+  let mg = await getMessagingGroupByPlatform(channelType, dmPlatformId, instance);
   if (!mg) {
     const mgId = `mg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     mg = {
@@ -127,7 +127,7 @@ export async function ensureUserDm(userId: string, instance?: string): Promise<M
       unknown_sender_policy: 'strict',
       created_at: now,
     };
-    createMessagingGroup(mg);
+    await createMessagingGroup(mg);
     log.info('ensureUserDm: created DM messaging_group', {
       userId,
       channelType,

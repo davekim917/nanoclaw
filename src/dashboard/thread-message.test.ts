@@ -77,11 +77,11 @@ function ctx(over: { userId?: string; no_filter?: boolean; allowed?: string[] } 
 
 let claimsRoot: string;
 
-function seedAgent(id: string, folder = id): void {
+async function seedAgent(id: string, folder = id): Promise<void> {
   getRawDb()
     .prepare(`INSERT OR IGNORE INTO workgroups (id, display_name, created_at) VALUES ('wg-1', 'wg-1', ?)`)
     .run(iso());
-  createAgentGroup({ id, name: id, folder, agent_provider: null, created_at: iso() });
+  await createAgentGroup({ id, name: id, folder, agent_provider: null, created_at: iso() });
   // `createAgentGroup` does not carry workgroup_id, and claims are per-workgroup
   // files — so a claim is unfindable without this.
   getRawDb().prepare(`UPDATE agent_groups SET workgroup_id = 'wg-1' WHERE id = ?`).run(id);
@@ -159,7 +159,7 @@ const send = (body: Record<string, unknown>, c = ctx()) => sendThreadMessage(THR
 
 describe('a chosen agent already on the thread is an ordinary send', () => {
   it('routes into that agent’s existing session and creates nothing', async () => {
-    seedAgent('ag-alpha');
+    await seedAgent('ag-alpha');
     wire('ag-alpha');
     seedSession('s-alpha', 'ag-alpha');
 
@@ -184,8 +184,8 @@ describe('a chosen agent already on the thread is an ordinary send', () => {
 
 describe('assigning an agent with no session on the thread', () => {
   it('creates the session on the thread’s wired channel and delivers into it', async () => {
-    seedAgent('ag-alpha');
-    seedAgent('ag-bravo');
+    await seedAgent('ag-alpha');
+    await seedAgent('ag-bravo');
     wire('ag-alpha');
     wire('ag-bravo');
     seedSession('s-alpha', 'ag-alpha');
@@ -205,8 +205,8 @@ describe('assigning an agent with no session on the thread', () => {
   });
 
   it('refuses an agent that is not wired to the thread’s channel, and creates nothing', async () => {
-    seedAgent('ag-alpha');
-    seedAgent('ag-elsewhere');
+    await seedAgent('ag-alpha');
+    await seedAgent('ag-elsewhere');
     wire('ag-alpha');
     seedSession('s-alpha', 'ag-alpha');
     // ag-elsewhere is a real, in-scope agent — it simply does not belong in this
@@ -220,8 +220,8 @@ describe('assigning an agent with no session on the thread', () => {
   });
 
   it('does not mint a session for a caller who may not steer that agent', async () => {
-    seedAgent('ag-alpha');
-    seedAgent('ag-bravo');
+    await seedAgent('ag-alpha');
+    await seedAgent('ag-bravo');
     wire('ag-alpha');
     wire('ag-bravo');
     seedSession('s-alpha', 'ag-alpha');
@@ -245,9 +245,9 @@ describe('assigning an agent with no session on the thread', () => {
 // ── Hand-over ────────────────────────────────────────────────────────────────
 
 describe('hand-over notifies both sides', () => {
-  beforeEach(() => {
-    seedAgent('ag-alpha');
-    seedAgent('ag-bravo');
+  beforeEach(async () => {
+    await seedAgent('ag-alpha');
+    await seedAgent('ag-bravo');
     wire('ag-alpha');
     wire('ag-bravo');
     seedSession('s-alpha', 'ag-alpha');
@@ -335,7 +335,7 @@ describe('hand-over notifies both sides', () => {
 
 describe('input', () => {
   it('rejects an empty message and one longer than the cap', async () => {
-    seedAgent('ag-alpha');
+    await seedAgent('ag-alpha');
     wire('ag-alpha');
     seedSession('s-alpha', 'ag-alpha');
     expect((await send({ agent_group_id: 'ag-alpha', idempotency_key: 'k1', text: '   ' })).status).toBe(400);

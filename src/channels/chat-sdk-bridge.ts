@@ -1030,7 +1030,7 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
           .call(adapter, channelId)
           .then((info: { name?: string; isDM?: boolean }) => {
             if (!info) return;
-            setupConfig.onMetadata(channelId, info.name, info.isDM === undefined ? undefined : !info.isDM);
+            return setupConfig.onMetadata(channelId, info.name, info.isDM === undefined ? undefined : !info.isDM);
           })
           .catch((err: unknown) => {
             reportedChannels.delete(channelId);
@@ -1145,7 +1145,7 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
         const userId = event.user?.userId || '';
 
         // Resolve render metadata BEFORE dispatching onAction (which deletes the row).
-        const render = getAskQuestionRender(questionId);
+        const render = await getAskQuestionRender(questionId);
         // New format: button id/value is an integer index into options (kept
         // short to fit Telegram's 64-byte callback_data cap). Old format:
         // the full value is embedded in actionId/value directly.
@@ -1244,36 +1244,38 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
             24 * 60 * 60 * 1000,
             gatewayAbort!.signal,
             webhookUrl,
-          ).then(() => {
-            // startGatewayListener resolves immediately with a Response;
-            // the actual work is in the listenerPromise passed to waitUntil
-            if (!listenerPromise) return;
-            const reschedule = (err?: unknown) => {
-              if (gatewayAbort?.signal.aborted) return;
-              const ranForMs = Date.now() - startedAt;
-              if (ranForMs > 5 * 60 * 1000) consecutiveFailures = 0;
-              else consecutiveFailures++;
-              const delayMs = Math.min(60 * 60 * 1000, 2 ** consecutiveFailures * 1000);
-              if (err) {
-                log.error('Gateway listener error, retrying', {
-                  adapter: adapter.name,
-                  err,
-                  consecutiveFailures,
-                  delayMs,
-                });
-              } else {
-                log.info('Gateway listener expired, restarting', {
-                  adapter: adapter.name,
-                  consecutiveFailures,
-                  delayMs,
-                });
-              }
-              setTimeout(startGateway, delayMs);
-            };
-            listenerPromise.then(() => reschedule()).catch(reschedule);
-          }).catch((err) => {
-            log.error('Gateway listener failed to start', { adapter: adapter.name, err });
-          });
+          )
+            .then(() => {
+              // startGatewayListener resolves immediately with a Response;
+              // the actual work is in the listenerPromise passed to waitUntil
+              if (!listenerPromise) return;
+              const reschedule = (err?: unknown) => {
+                if (gatewayAbort?.signal.aborted) return;
+                const ranForMs = Date.now() - startedAt;
+                if (ranForMs > 5 * 60 * 1000) consecutiveFailures = 0;
+                else consecutiveFailures++;
+                const delayMs = Math.min(60 * 60 * 1000, 2 ** consecutiveFailures * 1000);
+                if (err) {
+                  log.error('Gateway listener error, retrying', {
+                    adapter: adapter.name,
+                    err,
+                    consecutiveFailures,
+                    delayMs,
+                  });
+                } else {
+                  log.info('Gateway listener expired, restarting', {
+                    adapter: adapter.name,
+                    consecutiveFailures,
+                    delayMs,
+                  });
+                }
+                setTimeout(startGateway, delayMs);
+              };
+              listenerPromise.then(() => reschedule()).catch(reschedule);
+            })
+            .catch((err) => {
+              log.error('Gateway listener failed to start', { adapter: adapter.name, err });
+            });
         };
         startGateway();
         log.info('Gateway listener started', { adapter: adapter.name });
@@ -2018,7 +2020,7 @@ export async function handleForwardedEvent(
         const originalContent = (
           ((interaction.message as Record<string, unknown>)?.content as string | undefined) || ''
         ).trim();
-        const render = questionId ? getAskQuestionRender(questionId) : undefined;
+        const render = questionId ? await getAskQuestionRender(questionId) : undefined;
         // Discord custom_id mirrors the new index-based encoding (see Button
         // construction). Decode back to the real option value for downstream.
         const selectedOption = resolveSelectedOption(render, decoded.value, tail);

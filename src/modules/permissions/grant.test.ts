@@ -137,9 +137,9 @@ beforeEach(async () => {
   notifyCalls.length = 0;
   initSessionFolder('ag-helper', 'sess-test');
 
-  createMessagingGroup(makeMg('mg-test', 'slack-example-labs', 'slack:C1'));
-  createAgentGroup(makeAg('ag-helper', 'example-labs-v2', 'helper'));
-  createAgentGroup(makeAg('ag-other', 'other', 'other'));
+  await createMessagingGroup(makeMg('mg-test', 'slack-example-labs', 'slack:C1'));
+  await createAgentGroup(makeAg('ag-helper', 'example-labs-v2', 'helper'));
+  await createAgentGroup(makeAg('ag-other', 'other', 'other'));
 
   createUser({ id: 'slack-example-labs:OWNER', kind: 'slack-example-labs', display_name: 'Owner', created_at: now() });
   createUser({

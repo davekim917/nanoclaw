@@ -70,15 +70,15 @@ function now(): string {
   return new Date().toISOString();
 }
 
-function seed(): void {
-  createAgentGroup({
+async function seed(): Promise<void> {
+  await createAgentGroup({
     id: 'ag-1',
     name: 'Support Agent',
     folder: 'support-agent',
     agent_provider: null,
     created_at: now(),
   });
-  createMessagingGroup({
+  await createMessagingGroup({
     id: 'mg-1',
     channel_type: 'slack',
     platform_id: 'slack:C1',
@@ -141,8 +141,8 @@ afterEach(async () => {
 
 describe('handleDispatchSupportIssue — new issue (purest: no ticket from poller)', () => {
   it('opens announcement + thread + session, seeds the ticket-creation protocol, records the row', async () => {
-    seed();
-    const { session: poller } = resolveSession('ag-1', 'mg-1', null, 'shared');
+    await seed();
+    const { session: poller } = await resolveSession('ag-1', 'mg-1', null, 'shared');
 
     await handleDispatchSupportIssue(dispatchContent('gthread-A', 'depletions are off'), poller);
 
@@ -175,9 +175,9 @@ describe('handleDispatchSupportIssue — new issue (purest: no ticket from polle
   });
 
   it('inherits isolated poller routing and turn flags as sticky support-session defaults', async () => {
-    seed();
+    await seed();
     const seriesId = 'task-support-poller';
-    const { session: poller } = resolveTaskSession('ag-1', seriesId);
+    const { session: poller } = await resolveTaskSession('ag-1', seriesId);
     const pollerDb = openInboundDb('ag-1', poller.id);
     insertTaskRow(pollerDb, {
       id: 'task-fire-1',
@@ -208,8 +208,8 @@ describe('handleDispatchSupportIssue — new issue (purest: no ticket from polle
   });
 
   it('with a known ticket (legacy dispatcher), seeds the comment-not-duplicate protocol', async () => {
-    seed();
-    const { session: poller } = resolveSession('ag-1', 'mg-1', null, 'shared');
+    await seed();
+    const { session: poller } = await resolveSession('ag-1', 'mg-1', null, 'shared');
 
     await handleDispatchSupportIssue(
       dispatchContent('gthread-B', 'first email', { issue: 'EXAMPLE-123', team: 'EXAMPLE' }),
@@ -230,8 +230,8 @@ describe('handleDispatchSupportIssue — new issue (purest: no ticket from polle
 
 describe('handleDispatchSupportIssue — follow-up + reopen', () => {
   it('routes a follow-up into the existing session — no second thread', async () => {
-    seed();
-    const { session: poller } = resolveSession('ag-1', 'mg-1', null, 'shared');
+    await seed();
+    const { session: poller } = await resolveSession('ag-1', 'mg-1', null, 'shared');
 
     await handleDispatchSupportIssue(dispatchContent('gthread-A', 'first email'), poller);
     const sessionId = getSupportThread('gthread-A')!.session_id!;
@@ -252,8 +252,8 @@ describe('handleDispatchSupportIssue — follow-up + reopen', () => {
   });
 
   it('seeded legacy row (ticket known, no session) reopens AND records the new session', async () => {
-    seed();
-    const { session: poller } = resolveSession('ag-1', 'mg-1', null, 'shared');
+    await seed();
+    const { session: poller } = await resolveSession('ag-1', 'mg-1', null, 'shared');
     // Simulate the host-side seeding of the legacy ticket map.
     getRawDb()
       .prepare(
@@ -285,8 +285,8 @@ describe('handleDispatchSupportIssue — follow-up + reopen', () => {
 // T6 (SR6) — a support thread outlives the session bound to it.
 describe('handleDispatchSupportIssue — archived session binding', () => {
   it('never writes to or wakes a closed session, and replaces ONLY session_id', async () => {
-    seed();
-    const { session: poller } = resolveSession('ag-1', 'mg-1', null, 'shared');
+    await seed();
+    const { session: poller } = await resolveSession('ag-1', 'mg-1', null, 'shared');
     await handleDispatchSupportIssue(dispatchContent('gthread-A', 'first email'), poller);
     const before = getSupportThread('gthread-A')!;
     const archivedId = before.session_id!;
@@ -300,7 +300,7 @@ describe('handleDispatchSupportIssue — archived session binding', () => {
 
     const after = getSupportThread('gthread-A')!;
     expect(after.session_id).not.toBe(archivedId);
-    expect(getSession(after.session_id!)!.status).toBe('active');
+    expect((await getSession(after.session_id!))!.status).toBe('active');
     // session_id is the ONLY column the rebinding owns. Everything else on the
     // row is either untouched or moved by touchSupportThread, as before.
     const { session_id: _newSession, last_activity_at: _newActivity, ...afterRest } = after;
@@ -319,8 +319,8 @@ describe('handleDispatchSupportIssue — archived session binding', () => {
   });
 
   it('gives two concurrent follow-ups exactly one new session, and delivers both', async () => {
-    seed();
-    const { session: poller } = resolveSession('ag-1', 'mg-1', null, 'shared');
+    await seed();
+    const { session: poller } = await resolveSession('ag-1', 'mg-1', null, 'shared');
     await handleDispatchSupportIssue(dispatchContent('gthread-A', 'first email'), poller);
     const archivedId = getSupportThread('gthread-A')!.session_id!;
     getRawDb().prepare("UPDATE sessions SET status = 'closed' WHERE id = ?").run(archivedId);
@@ -349,8 +349,8 @@ describe('handleDispatchSupportIssue — archived session binding', () => {
   });
 
   it('opens exactly one thread when two emails for a NEW issue arrive together', async () => {
-    seed();
-    const { session: poller } = resolveSession('ag-1', 'mg-1', null, 'shared');
+    await seed();
+    const { session: poller } = await resolveSession('ag-1', 'mg-1', null, 'shared');
 
     // The new-issue branch awaits postParent BEFORE recording the row, so
     // without per-thread serialization the second dispatch reads "no such
@@ -370,8 +370,8 @@ describe('handleDispatchSupportIssue — archived session binding', () => {
   });
 
   it('leaves an active binding on its original session', async () => {
-    seed();
-    const { session: poller } = resolveSession('ag-1', 'mg-1', null, 'shared');
+    await seed();
+    const { session: poller } = await resolveSession('ag-1', 'mg-1', null, 'shared');
     await handleDispatchSupportIssue(dispatchContent('gthread-A', 'first email'), poller);
     const sessionId = getSupportThread('gthread-A')!.session_id!;
 
@@ -384,11 +384,11 @@ describe('handleDispatchSupportIssue — archived session binding', () => {
 
 describe('handleUpdateSupportTicket', () => {
   it('records the ticket by calling-session and edits the announcement', async () => {
-    seed();
-    const { session: poller } = resolveSession('ag-1', 'mg-1', null, 'shared');
+    await seed();
+    const { session: poller } = await resolveSession('ag-1', 'mg-1', null, 'shared');
     await handleDispatchSupportIssue(dispatchContent('gthread-A', 'first email'), poller);
     const row = getSupportThread('gthread-A')!;
-    const issueSession = getSession(row.session_id!)!;
+    const issueSession = (await getSession(row.session_id!))!;
 
     await handleUpdateSupportTicket(
       { action: 'update_support_ticket', linearIssue: 'EXAMPLE-200', linearTeam: 'EXAMPLE' },
@@ -412,8 +412,8 @@ describe('handleUpdateSupportTicket', () => {
   });
 
   it('ignores a call from a non-support session', async () => {
-    seed();
-    const { session: poller } = resolveSession('ag-1', 'mg-1', null, 'shared');
+    await seed();
+    const { session: poller } = await resolveSession('ag-1', 'mg-1', null, 'shared');
 
     await handleUpdateSupportTicket({ action: 'update_support_ticket', linearIssue: 'EXAMPLE-999' }, poller);
 

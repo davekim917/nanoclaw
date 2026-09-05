@@ -67,9 +67,9 @@ function hasLoneSurrogate(value: string): boolean {
   return false;
 }
 
-function seedSession(): void {
-  createAgentGroup({ id: 'ag-1', name: 'Agent', folder: 'agent', agent_provider: null, created_at: now() });
-  createMessagingGroup({
+async function seedSession(): Promise<void> {
+  await createAgentGroup({ id: 'ag-1', name: 'Agent', folder: 'agent', agent_provider: null, created_at: now() });
+  await createMessagingGroup({
     id: 'mg-1',
     channel_type: 'slack-example-labs',
     platform_id: 'slack:C123',
@@ -79,7 +79,7 @@ function seedSession(): void {
     unknown_sender_policy: 'public',
     created_at: now(),
   });
-  createSession({
+  await createSession({
     id: 'sess-1',
     agent_group_id: 'ag-1',
     messaging_group_id: 'mg-1',
@@ -95,7 +95,7 @@ function seedSession(): void {
 
 async function runDestructiveGate(label: string, requestId: string, command?: string): Promise<void> {
   const handler = getDeliveryAction('request_destructive_gate');
-  const session = getSession('sess-1');
+  const session = await getSession('sess-1');
   expect(handler).toBeDefined();
   expect(session).toBeDefined();
   // Two arguments: the handler opens its own mailbox session now, and the
@@ -119,7 +119,7 @@ beforeEach(async () => {
   await initTestDb();
   const db = getRawDb();
   runMigrations(db);
-  seedSession();
+  await seedSession();
   mocks.deliver.mockReset();
   mocks.wakeContainer.mockReset();
   mocks.wakeContainer.mockResolvedValue(undefined);

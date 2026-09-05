@@ -473,8 +473,8 @@ describe('Chat SDK bridge Discord approval actions', () => {
     });
   }
 
-  function seedApproval(id: string): void {
-    createPendingApproval({
+  async function seedApproval(id: string): Promise<void> {
+    await createPendingApproval({
       approval_id: id,
       request_id: id,
       action: 'test',
@@ -491,7 +491,7 @@ describe('Chat SDK bridge Discord approval actions', () => {
   afterEach(() => vi.unstubAllGlobals());
 
   it('maps Discord index zero to approve rather than rejecting it', async () => {
-    seedApproval('appr-discord');
+    await seedApproval('appr-discord');
     const fetchMock = vi.fn(async (_input: unknown, _init?: RequestInit) => new Response(null, { status: 204 }));
     vi.stubGlobal('fetch', fetchMock);
     const onAction = vi.fn();
@@ -518,7 +518,7 @@ describe('Chat SDK bridge Discord approval actions', () => {
   });
 
   it("decodes Discord's newline-delimited custom_id before resolving the option", async () => {
-    seedApproval('appr-discord-wire');
+    await seedApproval('appr-discord-wire');
     const fetchMock = vi.fn(async (_input: unknown, _init?: RequestInit) => new Response(null, { status: 204 }));
     vi.stubGlobal('fetch', fetchMock);
     const onAction = vi.fn();

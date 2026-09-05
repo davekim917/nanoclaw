@@ -60,8 +60,8 @@ beforeEach(async () => {
   const db = getRawDb();
   db.pragma('foreign_keys = ON');
   runMigrations(db);
-  createAgentGroup({ id: 'ag-1', name: 'ag-1', folder: 'ag-1', agent_provider: null, created_at: iso(0) });
-  createAgentGroup({ id: 'ag-2', name: 'ag-2', folder: 'ag-2', agent_provider: null, created_at: iso(0) });
+  await createAgentGroup({ id: 'ag-1', name: 'ag-1', folder: 'ag-1', agent_provider: null, created_at: iso(0) });
+  await createAgentGroup({ id: 'ag-2', name: 'ag-2', folder: 'ag-2', agent_provider: null, created_at: iso(0) });
   vi.mocked(userRoles.hasAdminPrivilege).mockReturnValue(true);
 });
 

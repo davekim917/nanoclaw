@@ -25,7 +25,7 @@ function deps(overrides: Partial<PreflightDeps> = {}): PreflightDeps & { exitCod
   const exitCodes: number[] = [];
   return {
     getContainerConfig: async () => ({ env: {}, caCertificate: '', caCertificateContainerPath: '/ca.pem' }),
-    probeAgent: () => 'ag-probe',
+    probeAgent: async () => 'ag-probe',
     onecliConfigured: () => true,
     now: () => 0,
     sleep: async () => {},
@@ -109,7 +109,7 @@ describe('probeOnecliControlApi', () => {
     const calls: Array<{ agent?: string }> = [];
     const result = await probeOnecliControlApi(
       deps({
-        probeAgent: () => null,
+        probeAgent: async () => null,
         getContainerConfig: async (options) => {
           calls.push(options);
           return {};

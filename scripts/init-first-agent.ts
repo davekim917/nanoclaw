@@ -155,8 +155,14 @@ function generateId(prefix: string): string {
   return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
-function wireIfMissing(mg: MessagingGroup, ag: AgentGroup, now: string, label: string, engagePattern?: string): void {
-  const existing = getMessagingGroupAgentByPair(mg.id, ag.id);
+async function wireIfMissing(
+  mg: MessagingGroup,
+  ag: AgentGroup,
+  now: string,
+  label: string,
+  engagePattern?: string,
+): Promise<void> {
+  const existing = await getMessagingGroupAgentByPair(mg.id, ag.id);
   if (existing) {
     console.log(`Wiring already exists: ${existing.id} (${label})`);
     return;
@@ -223,17 +229,17 @@ async function main(): Promise<void> {
   // 2. Agent group + filesystem.
   const folder = `dm-with-${normalizeName(args.displayName)}`;
   const pickedProvider = process.env.NANOCLAW_PICKED_PROVIDER?.trim().toLowerCase();
-  let ag: AgentGroup | undefined = getAgentGroupByFolder(folder);
+  let ag: AgentGroup | undefined = await getAgentGroupByFolder(folder);
   if (!ag) {
     const agId = generateId('ag');
-    createAgentGroup({
+    await createAgentGroup({
       id: agId,
       name: args.agentName,
       folder,
       agent_provider: null,
       created_at: now,
     });
-    ag = getAgentGroupByFolder(folder)!;
+    ag = (await getAgentGroupByFolder(folder))!;
     console.log(`Created agent group: ${ag.id} (${folder})`);
   } else {
     console.log(`Reusing agent group: ${ag.id} (${folder})`);
@@ -271,7 +277,7 @@ async function main(): Promise<void> {
       });
     }
     // Owner's agent group gets global CLI access
-    updateContainerConfigScalars(ag.id, { cli_scope: 'global' });
+    await updateContainerConfigScalars(ag.id, { cli_scope: 'global' });
   } else if (args.role === 'admin') {
     const alreadyAdmin = existingRoles.some((r) => r.role === 'admin' && r.agent_group_id === ag.id);
     if (!alreadyAdmin) {
@@ -298,7 +304,7 @@ async function main(): Promise<void> {
 
   // 3. DM messaging group.
   const platformId = namespacedPlatformId(args.channel, args.platformId);
-  let dmMg = getMessagingGroupByPlatform(args.channel, platformId);
+  let dmMg = await getMessagingGroupByPlatform(args.channel, platformId);
   if (!dmMg) {
     const mgId = generateId('mg');
     // Policy from the channel declaration (DM context); legacy 'strict' for
@@ -306,7 +312,7 @@ async function main(): Promise<void> {
     const unknownSenderPolicy = hasDeclaredChannelDefaults(args.channel)
       ? resolveUnknownSenderPolicy(args.channel, false)
       : 'strict';
-    createMessagingGroup({
+    await createMessagingGroup({
       id: mgId,
       channel_type: args.channel,
       platform_id: platformId,
@@ -315,14 +321,14 @@ async function main(): Promise<void> {
       unknown_sender_policy: unknownSenderPolicy,
       created_at: now,
     });
-    dmMg = getMessagingGroupByPlatform(args.channel, platformId)!;
+    dmMg = (await getMessagingGroupByPlatform(args.channel, platformId))!;
     console.log(`Created messaging group: ${dmMg.id} (${platformId})`);
   } else {
     console.log(`Reusing messaging group: ${dmMg.id} (${platformId})`);
   }
 
   // 4. Wire DM messaging group to the agent.
-  wireIfMissing(dmMg, ag, now, 'dm', args.engagePattern);
+  await wireIfMissing(dmMg, ag, now, 'dm', args.engagePattern);
 
   // 5. Welcome delivery over the CLI socket. Router picks up the line,
   // writes the message into the DM session's inbound.db, and wakes the

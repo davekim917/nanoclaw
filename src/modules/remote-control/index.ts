@@ -21,7 +21,7 @@ import type { Session } from '../../types.js';
 import { notifyAgent, registerApprovalHandler, requestApproval, type ApprovalHandler } from '../approvals/index.js';
 
 async function handleStartRemoteControl(content: Record<string, unknown>, session: Session): Promise<void> {
-  const agentGroup = getAgentGroup(session.agent_group_id);
+  const agentGroup = await getAgentGroup(session.agent_group_id);
   if (!agentGroup) {
     await notifyAgent(session, 'start_remote_control failed: agent group not found.');
     return;
@@ -46,7 +46,7 @@ async function handleStartRemoteControl(content: Record<string, unknown>, sessio
 }
 
 async function handleStopRemoteControl(_content: Record<string, unknown>, session: Session): Promise<void> {
-  const agentGroup = getAgentGroup(session.agent_group_id);
+  const agentGroup = await getAgentGroup(session.agent_group_id);
   if (!agentGroup) {
     await notifyAgent(session, 'stop_remote_control failed: agent group not found.');
     return;

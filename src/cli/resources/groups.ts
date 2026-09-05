@@ -155,14 +155,14 @@ registerResource({
         const folder = args.folder as string;
         if (!folder) throw new Error('--folder is required');
         const name = (args.name as string) ?? folder;
-        const existing = getAgentGroupByFolder(folder);
+        const existing = await getAgentGroupByFolder(folder);
         if (existing) {
           initGroupFilesystem(existing); // ensure a reused group is fully configured too (idempotent; also repairs a missing workspace folder)
           return existing;
         }
         const id = `ag-${randomUUID()}`;
         const group: AgentGroup = { id, name, folder, agent_provider: null, created_at: new Date().toISOString() };
-        createAgentGroup(group);
+        await createAgentGroup(group);
         // Provision the workspace folder and the `container_configs` row that
         // `getContainerConfig` and the spawn path require. Without this, a
         // group created via `ncl groups create` would throw "Container config
@@ -180,14 +180,14 @@ registerResource({
         // the scalar write below silently updates zero rows and the group's
         // scheduling keeps following the install timezone until the next host
         // startup backfill.
-        ensureContainerConfig(id);
+        await ensureContainerConfig(id);
         if (timezone) {
-          updateContainerConfigScalars(id, { timezone });
+          await updateContainerConfigScalars(id, { timezone });
           updateContainerConfig(folder, (config) => {
             config.timezone = timezone;
           });
         }
-        return getAgentGroupByFolder(folder);
+        return await getAgentGroupByFolder(folder);
       },
     },
     delete: {
@@ -362,8 +362,8 @@ registerResource({
             ctx.sessionId,
             'restarted via ncl',
             message
-              ? () => {
-                  const s = getSession(ctx.sessionId);
+              ? async () => {
+                  const s = await getSession(ctx.sessionId);
                   if (s) {
                     void wakeContainer(s).catch((err) =>
                       log.error('Failed to wake container after ncl restart', { err, sessionId: ctx.sessionId }),
@@ -386,9 +386,9 @@ registerResource({
       handler: async (args) => {
         const id = args.id as string;
         if (!id) throw new Error('--id is required');
-        const row = getContainerConfig(id);
+        const row = await getContainerConfig(id);
         if (!row) throw new Error(`No container config for group: ${id}`);
-        const group = getAgentGroup(id);
+        const group = await getAgentGroup(id);
         if (!group) throw new Error(`No agent group: ${id}`);
         return presentConfig(row, group.folder);
       },
@@ -403,9 +403,9 @@ registerResource({
       handler: async (args) => {
         const id = args.id as string;
         if (!id) throw new Error('--id is required');
-        const row = getContainerConfig(id);
+        const row = await getContainerConfig(id);
         if (!row) throw new Error(`No container config for group: ${id}`);
-        const group = getAgentGroup(id);
+        const group = await getAgentGroup(id);
         if (!group) throw new Error(`No agent group: ${id}`);
 
         const updates: Partial<
@@ -478,7 +478,7 @@ registerResource({
           }
         }
 
-        if (Object.keys(updates).length > 0) updateContainerConfigScalars(id, updates);
+        if (Object.keys(updates).length > 0) await updateContainerConfigScalars(id, updates);
 
         // Mirror the runtime-selecting scalars into container.json. The DB row
         // is a read-side projection (flag vocabulary, task-flag validation);
@@ -526,7 +526,7 @@ registerResource({
           });
         }
 
-        const updated = getContainerConfig(id)!;
+        const updated = (await getContainerConfig(id))!;
         return presentConfig(updated, group.folder);
       },
     },
@@ -545,9 +545,9 @@ registerResource({
         if (!name) throw new Error('--name is required');
         validateMcpServerName(name);
 
-        const group = getAgentGroup(id);
+        const group = await getAgentGroup(id);
         if (!group) throw new Error(`No agent group: ${id}`);
-        const row = getContainerConfig(id);
+        const row = await getContainerConfig(id);
         if (!row) throw new Error(`No container config for group: ${id}`);
 
         const newEntry: McpServerConfig = parseMcpServerConfig({
@@ -568,7 +568,7 @@ registerResource({
           if (!cfg.mcpServers) cfg.mcpServers = {};
           cfg.mcpServers[name] = newEntry;
         });
-        updateContainerConfigJson(id, 'mcp_servers', fileConfig.mcpServers ?? {});
+        await updateContainerConfigJson(id, 'mcp_servers', fileConfig.mcpServers ?? {});
 
         return { added: name, servers: fileConfig.mcpServers ?? {} };
       },
@@ -583,9 +583,9 @@ registerResource({
         const name = args.name as string;
         if (!name) throw new Error('--name is required');
 
-        const group = getAgentGroup(id);
+        const group = await getAgentGroup(id);
         if (!group) throw new Error(`No agent group: ${id}`);
-        const row = getContainerConfig(id);
+        const row = await getContainerConfig(id);
         if (!row) throw new Error(`No container config for group: ${id}`);
 
         // Validate against the canonical file (DB cache may be stale post-
@@ -596,7 +596,7 @@ registerResource({
           }
           delete cfg.mcpServers[name];
         });
-        updateContainerConfigJson(id, 'mcp_servers', fileConfig.mcpServers ?? {});
+        await updateContainerConfigJson(id, 'mcp_servers', fileConfig.mcpServers ?? {});
 
         return { removed: name };
       },
@@ -609,9 +609,9 @@ registerResource({
         const id = args.id as string;
         if (!id) throw new Error('--id is required');
 
-        const group = getAgentGroup(id);
+        const group = await getAgentGroup(id);
         if (!group) throw new Error(`No agent group: ${id}`);
-        const row = getContainerConfig(id);
+        const row = await getContainerConfig(id);
         if (!row) throw new Error(`No container config for group: ${id}`);
 
         const apt = args.apt as string | undefined;
@@ -628,8 +628,8 @@ registerResource({
           if (apt && !cfg.packages.apt.includes(apt)) cfg.packages.apt.push(apt);
           if (npm && !cfg.packages.npm.includes(npm)) cfg.packages.npm.push(npm);
         });
-        if (apt) updateContainerConfigJson(id, 'packages_apt', fileConfig.packages.apt);
-        if (npm) updateContainerConfigJson(id, 'packages_npm', fileConfig.packages.npm);
+        if (apt) await updateContainerConfigJson(id, 'packages_apt', fileConfig.packages.apt);
+        if (npm) await updateContainerConfigJson(id, 'packages_npm', fileConfig.packages.npm);
 
         return {
           added: { apt: apt || null, npm: npm || null },
@@ -645,9 +645,9 @@ registerResource({
         const id = args.id as string;
         if (!id) throw new Error('--id is required');
 
-        const group = getAgentGroup(id);
+        const group = await getAgentGroup(id);
         if (!group) throw new Error(`No agent group: ${id}`);
-        const row = getContainerConfig(id);
+        const row = await getContainerConfig(id);
         if (!row) throw new Error(`No container config for group: ${id}`);
 
         const apt = args.apt as string | undefined;
@@ -659,8 +659,8 @@ registerResource({
           if (apt) cfg.packages.apt = cfg.packages.apt.filter((p) => p !== apt);
           if (npm) cfg.packages.npm = cfg.packages.npm.filter((p) => p !== npm);
         });
-        if (apt) updateContainerConfigJson(id, 'packages_apt', fileConfig.packages.apt);
-        if (npm) updateContainerConfigJson(id, 'packages_npm', fileConfig.packages.npm);
+        if (apt) await updateContainerConfigJson(id, 'packages_apt', fileConfig.packages.apt);
+        if (npm) await updateContainerConfigJson(id, 'packages_npm', fileConfig.packages.npm);
 
         return {
           removed: { apt: apt || null, npm: npm || null },
@@ -682,9 +682,9 @@ registerResource({
         const containerPath = (args.container ?? args['container-path']) as string | undefined;
         if (!hostPath || !containerPath) throw new Error('Provide --host <host-path> and --container <container-path>');
 
-        const group = getAgentGroup(id);
+        const group = await getAgentGroup(id);
         if (!group) throw new Error(`No agent group: ${id}`);
-        const row = getContainerConfig(id);
+        const row = await getContainerConfig(id);
         if (!row) throw new Error(`No container config for group: ${id}`);
 
         const mount: AdditionalMountConfig = {
@@ -698,7 +698,7 @@ registerResource({
             cfg.additionalMounts.push(mount);
           }
         });
-        updateContainerConfigJson(id, 'additional_mounts', fileConfig.additionalMounts ?? []);
+        await updateContainerConfigJson(id, 'additional_mounts', fileConfig.additionalMounts ?? []);
 
         return { added: mount, note: `Run \`ncl groups restart --id ${id}\` for the mount to take effect.` };
       },
@@ -716,9 +716,9 @@ registerResource({
         const containerPath = (args.container ?? args['container-path']) as string | undefined;
         if (!hostPath || !containerPath) throw new Error('Provide --host <host-path> and --container <container-path>');
 
-        const group = getAgentGroup(id);
+        const group = await getAgentGroup(id);
         if (!group) throw new Error(`No agent group: ${id}`);
-        const row = getContainerConfig(id);
+        const row = await getContainerConfig(id);
         if (!row) throw new Error(`No container config for group: ${id}`);
 
         const fileConfig = updateContainerConfig(group.folder, (cfg) => {
@@ -726,7 +726,7 @@ registerResource({
             (m) => !(m.hostPath === hostPath && m.containerPath === containerPath),
           );
         });
-        updateContainerConfigJson(id, 'additional_mounts', fileConfig.additionalMounts ?? []);
+        await updateContainerConfigJson(id, 'additional_mounts', fileConfig.additionalMounts ?? []);
 
         return { removed: { hostPath, containerPath }, note: `Run \`ncl groups restart --id ${id}\` to apply.` };
       },
@@ -752,8 +752,8 @@ registerResource({
         // applied to generic ops). Both folders must resolve to the caller's
         // agent_group_id; otherwise we'd leak another group's container.json.
         if (ctx.caller === 'agent') {
-          const srcGroup = getAgentGroupByFolder(sourceFolder);
-          const sibGroup = getAgentGroupByFolder(siblingFolder);
+          const srcGroup = await getAgentGroupByFolder(sourceFolder);
+          const sibGroup = await getAgentGroupByFolder(siblingFolder);
           const callerId = ctx.agentGroupId;
           if (!srcGroup || srcGroup.id !== callerId || !sibGroup || sibGroup.id !== callerId) {
             throw new Error(

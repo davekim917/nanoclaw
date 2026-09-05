@@ -1,28 +1,41 @@
 import type { AgentGroup } from '../types.js';
-import { getRawDb } from './connection.js';
+import { getDb } from './connection.js';
 
-export function createAgentGroup(group: AgentGroup): void {
-  getRawDb()
-    .prepare(
-      `INSERT INTO agent_groups (id, name, folder, agent_provider, created_at)
+/**
+ * The `getAgentGroup` read, as a constant, so a synchronous guard-path caller
+ * can execute the SAME statement through the raw handle.
+ *
+ * One constant, two executors — NOT a `*Sync` twin of the export
+ * (docs/specs/upstream-async-central-db-seam/plan.md §4.5 I-1). The only such
+ * caller is `modules/agent-to-agent/write-destinations.ts`, whose `resolve()`
+ * must not yield between the read and the REPLACE-shaped projection it feeds.
+ */
+export const AGENT_GROUP_BY_ID_SQL = 'SELECT * FROM agent_groups WHERE id = ?';
+
+export async function createAgentGroup(group: AgentGroup): Promise<void> {
+  await getDb().run(
+    `INSERT INTO agent_groups (id, name, folder, agent_provider, created_at)
        VALUES (@id, @name, @folder, @agent_provider, @created_at)`,
-    )
-    .run(group);
+    group,
+  );
 }
 
-export function getAgentGroup(id: string): AgentGroup | undefined {
-  return getRawDb().prepare('SELECT * FROM agent_groups WHERE id = ?').get(id) as AgentGroup | undefined;
+export async function getAgentGroup(id: string): Promise<AgentGroup | undefined> {
+  return getDb().get<AgentGroup>(AGENT_GROUP_BY_ID_SQL, id);
 }
 
-export function getAgentGroupByFolder(folder: string): AgentGroup | undefined {
-  return getRawDb().prepare('SELECT * FROM agent_groups WHERE folder = ?').get(folder) as AgentGroup | undefined;
+export async function getAgentGroupByFolder(folder: string): Promise<AgentGroup | undefined> {
+  return getDb().get<AgentGroup>('SELECT * FROM agent_groups WHERE folder = ?', folder);
 }
 
-export function getAllAgentGroups(): AgentGroup[] {
-  return getRawDb().prepare('SELECT * FROM agent_groups ORDER BY name').all() as AgentGroup[];
+export async function getAllAgentGroups(): Promise<AgentGroup[]> {
+  return getDb().all<AgentGroup>('SELECT * FROM agent_groups ORDER BY name');
 }
 
-export function updateAgentGroup(id: string, updates: Partial<Pick<AgentGroup, 'name' | 'agent_provider'>>): void {
+export async function updateAgentGroup(
+  id: string,
+  updates: Partial<Pick<AgentGroup, 'name' | 'agent_provider'>>,
+): Promise<void> {
   const fields: string[] = [];
   const values: Record<string, unknown> = { id };
 
@@ -34,13 +47,11 @@ export function updateAgentGroup(id: string, updates: Partial<Pick<AgentGroup, '
   }
   if (fields.length === 0) return;
 
-  getRawDb()
-    .prepare(`UPDATE agent_groups SET ${fields.join(', ')} WHERE id = @id`)
-    .run(values);
+  await getDb().run(`UPDATE agent_groups SET ${fields.join(', ')} WHERE id = @id`, values);
 }
 
-export function deleteAgentGroup(id: string): void {
-  getRawDb().prepare('DELETE FROM agent_groups WHERE id = ?').run(id);
+export async function deleteAgentGroup(id: string): Promise<void> {
+  await getDb().run('DELETE FROM agent_groups WHERE id = ?', id);
 }
 
 /**
@@ -50,21 +61,14 @@ export function deleteAgentGroup(id: string): void {
  * before calling `applyOnecliSecrets`. Returns [] if the group has no
  * workgroup or the workgroup declares none. See `mergeWorkgroupAndGroupSecrets`.
  */
-export function getWorkgroupOnecliSecrets(agentGroupId: string): string[] {
-  const row = getRawDb()
-    .prepare(
-      `SELECT w.onecli_secrets AS secrets FROM workgroups w
+export async function getWorkgroupOnecliSecrets(agentGroupId: string): Promise<string[]> {
+  const row = await getDb().get<{ secrets: string }>(
+    `SELECT w.onecli_secrets AS secrets FROM workgroups w
        JOIN agent_groups a ON a.workgroup_id = w.id
        WHERE a.id = ?`,
-    )
-    .get(agentGroupId) as { secrets: string } | undefined;
-  if (!row) return [];
-  try {
-    const parsed = JSON.parse(row.secrets) as unknown;
-    return Array.isArray(parsed) ? (parsed as string[]) : [];
-  } catch {
-    return [];
-  }
+    agentGroupId,
+  );
+  return parseSecrets(row);
 }
 
 /**
@@ -73,10 +77,15 @@ export function getWorkgroupOnecliSecrets(agentGroupId: string): string[] {
  * variant takes the already-resolved workgroup id and queries the workgroups
  * row directly. Returns [] if no such workgroup exists.
  */
-export function getWorkgroupOnecliSecretsById(workgroupId: string): string[] {
-  const row = getRawDb().prepare(`SELECT onecli_secrets AS secrets FROM workgroups WHERE id = ?`).get(workgroupId) as
-    | { secrets: string }
-    | undefined;
+export async function getWorkgroupOnecliSecretsById(workgroupId: string): Promise<string[]> {
+  const row = await getDb().get<{ secrets: string }>(
+    `SELECT onecli_secrets AS secrets FROM workgroups WHERE id = ?`,
+    workgroupId,
+  );
+  return parseSecrets(row);
+}
+
+function parseSecrets(row: { secrets: string } | undefined): string[] {
   if (!row) return [];
   try {
     const parsed = JSON.parse(row.secrets) as unknown;

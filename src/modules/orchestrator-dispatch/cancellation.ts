@@ -59,7 +59,7 @@ export async function applySpawnCancel(content: Record<string, unknown>, callerS
 
     if (task.status === 'running' && task.child_session_id) {
       // Write _spawn_cancel envelope to child's inbound (cycle-3 S26)
-      const childSession = getSession(task.child_session_id);
+      const childSession = await getSession(task.child_session_id);
       if (childSession) {
         try {
           await writeSessionMessage(childSession.agent_group_id, task.child_session_id, {
@@ -82,7 +82,7 @@ export async function applySpawnCancel(content: Record<string, unknown>, callerS
     }
 
     // Notify parent of successful cancellation
-    const parentSession = getSession(task.parent_session_id);
+    const parentSession = await getSession(task.parent_session_id);
     if (parentSession) {
       try {
         await writeSessionMessage(task.parent_agent_group_id, task.parent_session_id, {

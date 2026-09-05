@@ -997,7 +997,7 @@ async function resolveIdentities(
       // `sessions.agent_provider` → `container_configs.provider` → 'claude',
       // via the one function that owns that precedence. NOT
       // `agent_groups.agent_provider`, which is @deprecated in types.ts.
-      let provider = resolveProviderName(pair.sessionProvider, getContainerConfig(group.id)?.provider);
+      let provider = resolveProviderName(pair.sessionProvider, (await getContainerConfig(group.id))?.provider);
       try {
         const config = readContainerConfig(group.folder);
         // container.json is authoritative for the runtime (see CLAUDE.md

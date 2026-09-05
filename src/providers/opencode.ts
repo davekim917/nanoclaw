@@ -149,7 +149,7 @@ function resolveOpenCodeSourcePaths(
   };
 }
 
-registerProviderContainerConfig('opencode', (ctx) => {
+registerProviderContainerConfig('opencode', async (ctx) => {
   const opencodeDir = path.join(ctx.sessionDir, 'opencode-xdg');
   const opencodeSubdir = path.join(opencodeDir, 'opencode');
   // Both directories were writable by the prior container. Do not let
@@ -211,7 +211,7 @@ registerProviderContainerConfig('opencode', (ctx) => {
   // anomaly (claude uses DEFAULT_OPUS_MODEL etc., never `.env`). Removing them
   // keeps one config pattern across all harnesses. The DB is authoritative; the
   // container reads OPENCODE_MODEL at startup, so an unread value would no-op.
-  const dbConfig = getContainerConfig(ctx.agentGroupId);
+  const dbConfig = await getContainerConfig(ctx.agentGroupId);
   const model = dbConfig?.model ?? DEFAULT_OPENCODE_MODEL;
   const slash = model.indexOf('/');
   const modelProvider = slash > 0 ? model.slice(0, slash) : DEFAULT_OPENCODE_PROVIDER;

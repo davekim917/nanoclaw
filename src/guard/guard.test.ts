@@ -6,6 +6,10 @@
  *
  * Uses synthetic actions defined per test — the catalog is per-worker module
  * state with no reset, so action names are unique.
+ *
+ * guard() is synchronous by design (seam-3 plan §4.5, I-1) — its central
+ * reads run on the raw handle, never awaited — so these tests call it
+ * directly with no await.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -13,10 +17,10 @@ import { guard } from './guard.js';
 import { defineGuardedAction, type GuardedAction } from './guard-actions.js';
 import { ALLOW, DENY, HOLD, type GuardInput } from './types.js';
 
-const mockGetPendingApproval = vi.fn();
-vi.mock('../db/sessions.js', async (importOriginal) => ({
-  ...(await importOriginal<typeof import('../db/sessions.js')>()),
-  getPendingApproval: (...args: unknown[]) => mockGetPendingApproval(...args),
+const mockGetRawDb = vi.fn();
+vi.mock('../db/connection.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../db/connection.js')>()),
+  getRawDb: (...args: unknown[]) => mockGetRawDb(...args),
 }));
 // NOT spread: log.ts installs process-wide uncaughtException/unhandledRejection
 // handlers (including process.exit(1)) at module scope — importOriginal() would
@@ -34,8 +38,17 @@ function input(extra: Partial<GuardInput> = {}): GuardInput {
   return { actor: AGENT, payload: {}, ...extra };
 }
 
+/** Stubs the raw handle so `getRawDb().prepare(sql).get(id)` returns `row`. */
+function stubPendingApprovalRow(row: unknown): void {
+  mockGetRawDb.mockReturnValue({
+    prepare: () => ({
+      get: () => row,
+    }),
+  });
+}
+
 beforeEach(() => {
-  mockGetPendingApproval.mockReset();
+  mockGetRawDb.mockReset();
 });
 
 afterEach(() => {
@@ -91,7 +104,7 @@ describe('grants', () => {
       decide: () => HOLD('b'),
     });
     const grant = grantRow('g1_approved');
-    mockGetPendingApproval.mockReturnValue(grant);
+    stubPendingApprovalRow({ approval_id: 'appr-1', action: 'g1_approved' });
     expect(guard(action, input({ grant })).effect).toBe('allow');
   });
 
@@ -102,7 +115,7 @@ describe('grants', () => {
       decide: () => DENY('revoked since'),
     });
     const grant = grantRow('g2_approved');
-    mockGetPendingApproval.mockReturnValue(grant);
+    stubPendingApprovalRow({ approval_id: 'appr-1', action: 'g2_approved' });
     const d = guard(action, input({ grant }));
     expect(d.effect).toBe('deny');
     if (d.effect === 'deny') expect(d.reason).toBe('revoked since');
@@ -114,7 +127,7 @@ describe('grants', () => {
       grantActionName: 'g3_approved',
       decide: () => HOLD('b'),
     });
-    mockGetPendingApproval.mockReturnValue(undefined);
+    stubPendingApprovalRow(undefined);
     const d = guard(action, input({ grant: grantRow('g3_approved') }));
     expect(d.effect).toBe('deny');
   });
@@ -126,7 +139,7 @@ describe('grants', () => {
       decide: () => HOLD('b'),
     });
     const grant = grantRow('other_action');
-    mockGetPendingApproval.mockReturnValue(grant);
+    stubPendingApprovalRow({ approval_id: 'appr-1', action: 'other_action' });
     expect(guard(action, input({ grant })).effect).toBe('deny');
   });
 
@@ -138,7 +151,7 @@ describe('grants', () => {
       decide: () => HOLD('b'),
     });
     const grant = grantRow('g5_approved');
-    mockGetPendingApproval.mockReturnValue(grant);
+    stubPendingApprovalRow({ approval_id: 'appr-1', action: 'g5_approved' });
     expect(guard(action, input({ grant })).effect).toBe('deny');
   });
 
@@ -149,7 +162,7 @@ describe('grants', () => {
       decide: () => ALLOW('ok'),
     });
     const grant = grantRow('g6_approved');
-    mockGetPendingApproval.mockReturnValue(grant);
+    stubPendingApprovalRow({ approval_id: 'appr-1', action: 'g6_approved' });
     expect(guard(action, input({ grant })).effect).toBe('allow');
   });
 });

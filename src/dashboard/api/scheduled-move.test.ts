@@ -390,16 +390,18 @@ describe('movePreviewHandler', () => {
 });
 
 // ── D2: execute ────────────────────────────────────────────────────────────────
-function deltaHashFor(targetMessagingGroupId = 'tgt-mg'): string {
+async function deltaHashFor(targetMessagingGroupId = 'tgt-mg'): Promise<string> {
   // effective(src) = {Anthropic, Linear}; effective(tgt) = {Anthropic, Linear, Datafold-Prod}.
   // The hash now binds the move target identity (E-4) — pass the MG id used at execute.
-  return computeSecretDelta(
-    'src-ag',
-    'src-folder',
-    'tgt-ag',
-    'tgt-folder',
-    targetMessagingGroupId,
-    path.join(TEST_DIR, 'groups'),
+  return (
+    await computeSecretDelta(
+      'src-ag',
+      'src-folder',
+      'tgt-ag',
+      'tgt-folder',
+      targetMessagingGroupId,
+      path.join(TEST_DIR, 'groups'),
+    )
   ).deltaHash;
 }
 
@@ -442,11 +444,11 @@ function targetSessionId(): string | null {
   return row?.id ?? null;
 }
 
-function moveBody(over?: Record<string, unknown>): Record<string, unknown> {
+async function moveBody(over?: Record<string, unknown>): Promise<Record<string, unknown>> {
   return {
     targetAgentGroupId: 'tgt-ag',
     targetMessagingGroupId: 'tgt-mg',
-    confirmedDeltaHash: deltaHashFor(),
+    confirmedDeltaHash: await deltaHashFor(),
     ...over,
   };
 }
@@ -454,7 +456,7 @@ function moveBody(over?: Record<string, unknown>): Record<string, unknown> {
 describe('moveExecuteHandler', () => {
   it('test_move_one_live_row_invariant', async () => {
     const { key } = seedMoveFixture({ sourceProcessAfter: isoIn(10 * 3600_000) }); // far future, unclaimed → move allowed
-    const res = (await moveExecuteHandler(req(moveBody()), { key }, ctxFor('owner', OWNER_SCOPES)))!;
+    const res = (await moveExecuteHandler(req(await moveBody()), { key }, ctxFor('owner', OWNER_SCOPES)))!;
     expect(res.status).toBe(200);
     expect((await readJson(res)).moved).toBe(true);
 
@@ -491,7 +493,7 @@ describe('moveExecuteHandler', () => {
       });
     };
 
-    const res = (await moveExecuteHandler(req(moveBody()), { key }, ctxFor('owner', OWNER_SCOPES)))!;
+    const res = (await moveExecuteHandler(req(await moveBody()), { key }, ctxFor('owner', OWNER_SCOPES)))!;
     expect(res.status).toBe(409);
     expect((await readJson(res)).reason).toBe('stale_key');
 
@@ -523,7 +525,7 @@ describe('moveExecuteHandler', () => {
       db.close();
     };
 
-    const res = (await moveExecuteHandler(req(moveBody()), { key }, ctxFor('owner', OWNER_SCOPES)))!;
+    const res = (await moveExecuteHandler(req(await moveBody()), { key }, ctxFor('owner', OWNER_SCOPES)))!;
     expect(res.status).toBe(409);
     expect((await readJson(res)).reason).toBe('stale_key');
 
@@ -551,7 +553,7 @@ describe('moveExecuteHandler', () => {
       db.close();
     };
 
-    const res = (await moveExecuteHandler(req(moveBody()), { key }, ctxFor('owner', OWNER_SCOPES)))!;
+    const res = (await moveExecuteHandler(req(await moveBody()), { key }, ctxFor('owner', OWNER_SCOPES)))!;
     expect(res.status).toBe(409);
     expect(liveRowsForSeries('src-ag', 'src-sess', 'ser-1')).toHaveLength(1);
   });
@@ -567,7 +569,7 @@ describe('moveExecuteHandler', () => {
       sourceScheduledFor: slot,
     });
 
-    const res = (await moveExecuteHandler(req(moveBody()), { key }, ctxFor('owner', OWNER_SCOPES)))!;
+    const res = (await moveExecuteHandler(req(await moveBody()), { key }, ctxFor('owner', OWNER_SCOPES)))!;
     expect(res.status).toBe(200);
 
     const tgtLive = liveRowsForSeries('tgt-ag', targetSessionId()!, 'ser-1');
@@ -587,7 +589,7 @@ describe('moveExecuteHandler', () => {
       sourceScheduledFor: '2026-01-05 09:00:00',
     });
 
-    const res = (await moveExecuteHandler(req(moveBody()), { key }, ctxFor('owner', OWNER_SCOPES)))!;
+    const res = (await moveExecuteHandler(req(await moveBody()), { key }, ctxFor('owner', OWNER_SCOPES)))!;
     expect(res.status).toBe(200);
 
     const tgtLive = liveRowsForSeries('tgt-ag', targetSessionId()!, 'ser-1');
@@ -606,7 +608,7 @@ describe('moveExecuteHandler', () => {
       sourceScheduledFor: slot,
     });
 
-    const res = (await moveExecuteHandler(req(moveBody()), { key }, ctxFor('owner', OWNER_SCOPES)))!;
+    const res = (await moveExecuteHandler(req(await moveBody()), { key }, ctxFor('owner', OWNER_SCOPES)))!;
     expect(res.status).toBe(200);
 
     const tgtLive = liveRowsForSeries('tgt-ag', targetSessionId()!, 'ser-1');
@@ -619,13 +621,8 @@ describe('moveExecuteHandler', () => {
   it('same-agent paused move reuses one system session without double-counting or breaking staged restore', async () => {
     const { key } = seedMoveFixture({ sourceStatus: 'paused', sourceProcessAfter: isoIn(-48 * 3600_000) });
     wire('tgt-mg', 'src-ag');
-    const confirmedDeltaHash = computeSecretDelta(
-      'src-ag',
-      'src-folder',
-      'src-ag',
-      'src-folder',
-      'tgt-mg',
-      path.join(TEST_DIR, 'groups'),
+    const confirmedDeltaHash = (
+      await computeSecretDelta('src-ag', 'src-folder', 'src-ag', 'src-folder', 'tgt-mg', path.join(TEST_DIR, 'groups'))
     ).deltaHash;
 
     const res = (await moveExecuteHandler(
@@ -650,7 +647,7 @@ describe('moveExecuteHandler', () => {
   it('test_move_paused_stages_insert_never_due_pending', async () => {
     // Paused source with a PAST-due process_after (paused >1 cycle).
     const { key } = seedMoveFixture({ sourceStatus: 'paused', sourceProcessAfter: isoIn(-48 * 3600_000) });
-    const res = (await moveExecuteHandler(req(moveBody()), { key }, ctxFor('owner', OWNER_SCOPES)))!;
+    const res = (await moveExecuteHandler(req(await moveBody()), { key }, ctxFor('owner', OWNER_SCOPES)))!;
     expect(res.status).toBe(200);
 
     const tgtSess = targetSessionId()!;
@@ -665,7 +662,7 @@ describe('moveExecuteHandler', () => {
 
   it('test_move_writes_intent_before_cancel', async () => {
     const { key } = seedMoveFixture({ sourceProcessAfter: isoIn(10 * 3600_000) });
-    await moveExecuteHandler(req(moveBody()), { key }, ctxFor('owner', OWNER_SCOPES));
+    await moveExecuteHandler(req(await moveBody()), { key }, ctxFor('owner', OWNER_SCOPES));
     // A move_intent audit row was written, then resolved (resolved_at set, body purged).
     const intent = getRawDb()
       .prepare("SELECT detail_json, resolved_at FROM scheduled_audit WHERE action = 'move_intent'")
@@ -677,7 +674,7 @@ describe('moveExecuteHandler', () => {
 
   it('writes TWO-sided move audit sharing a correlation_id', async () => {
     const { key } = seedMoveFixture({ sourceProcessAfter: isoIn(10 * 3600_000) });
-    await moveExecuteHandler(req(moveBody()), { key }, ctxFor('owner', OWNER_SCOPES));
+    await moveExecuteHandler(req(await moveBody()), { key }, ctxFor('owner', OWNER_SCOPES));
     const moveRows = getRawDb()
       .prepare("SELECT agent_group_id, correlation_id FROM scheduled_audit WHERE action = 'move'")
       .all() as Array<{ agent_group_id: string; correlation_id: string }>;
@@ -693,7 +690,7 @@ describe('moveExecuteHandler', () => {
   it('test_move_delta_changed_409', async () => {
     const { key } = seedMoveFixture({ sourceProcessAfter: isoIn(10 * 3600_000) });
     const res = (await moveExecuteHandler(
-      req(moveBody({ confirmedDeltaHash: 'stale-hash' })),
+      req(await moveBody({ confirmedDeltaHash: 'stale-hash' })),
       { key },
       ctxFor('owner', OWNER_SCOPES),
     ))!;
@@ -706,7 +703,7 @@ describe('moveExecuteHandler', () => {
   it('test_move_due_source_409_source_busy', async () => {
     // Pending source, process_after in the past → due → move blocked.
     const { key } = seedMoveFixture({ sourceProcessAfter: isoIn(-1000) });
-    const res = (await moveExecuteHandler(req(moveBody()), { key }, ctxFor('owner', OWNER_SCOPES)))!;
+    const res = (await moveExecuteHandler(req(await moveBody()), { key }, ctxFor('owner', OWNER_SCOPES)))!;
     expect(res.status).toBe(409);
     expect((await readJson(res)).reason).toBe('source_busy');
     // No cancel performed.
@@ -723,7 +720,7 @@ describe('moveExecuteHandler', () => {
     // so vi.spyOn can't replace scheduleTask anyway.
     getRawDb().prepare("DELETE FROM messaging_group_agents WHERE agent_group_id = 'tgt-ag'").run();
 
-    const res = (await moveExecuteHandler(req(moveBody()), { key }, ctxFor('owner', OWNER_SCOPES)))!;
+    const res = (await moveExecuteHandler(req(await moveBody()), { key }, ctxFor('owner', OWNER_SCOPES)))!;
 
     // Move failed; source restored live (compensation via restoreTaskRow).
     expect(res.status).toBeGreaterThanOrEqual(500);
@@ -743,7 +740,7 @@ describe('moveExecuteHandler', () => {
       db.prepare("UPDATE messages_in SET status = 'completed' WHERE series_id = 'ser-1'").run();
       db.close();
     }
-    const res = (await moveExecuteHandler(req(moveBody()), { key }, ctxFor('owner', OWNER_SCOPES)))!;
+    const res = (await moveExecuteHandler(req(await moveBody()), { key }, ctxFor('owner', OWNER_SCOPES)))!;
     expect(res.status).toBe(409);
     expect((await readJson(res)).reason).toBe('stale_key');
   });
@@ -751,7 +748,7 @@ describe('moveExecuteHandler', () => {
   it('non-manage caller → 404 (gate)', async () => {
     const { key } = seedMoveFixture({ sourceProcessAfter: isoIn(10 * 3600_000) });
     const scopes = { role: 'admin_of_group' as const, allowed_group_ids: ['src-ag'], no_filter: false };
-    const res = (await moveExecuteHandler(req(moveBody()), { key }, ctxFor('sadmin', scopes)))!;
+    const res = (await moveExecuteHandler(req(await moveBody()), { key }, ctxFor('sadmin', scopes)))!;
     expect(res.status).toBe(404);
   });
 
@@ -766,7 +763,7 @@ describe('moveExecuteHandler', () => {
     // branch specifically, not an earlier gate.
     fs.rmSync(path.join(TEST_DIR, 'v2-sessions', 'src-ag', 'src-sess', 'inbound.db'));
 
-    const res = (await moveExecuteHandler(req(moveBody()), { key }, ctxFor('owner', OWNER_SCOPES)))!;
+    const res = (await moveExecuteHandler(req(await moveBody()), { key }, ctxFor('owner', OWNER_SCOPES)))!;
     expect(res.status).toBe(503);
     expect((await readJson(res)).error).toBe('session_unreadable');
 
@@ -794,7 +791,7 @@ describe('moveExecuteHandler', () => {
     insertRow(tgtInbound, { id: 'stray-a', series_id: 'ser-1', status: 'pending' });
     insertRow(tgtInbound, { id: 'stray-b', series_id: 'ser-1', status: 'pending' });
 
-    const res = (await moveExecuteHandler(req(moveBody()), { key }, ctxFor('owner', OWNER_SCOPES)))!;
+    const res = (await moveExecuteHandler(req(await moveBody()), { key }, ctxFor('owner', OWNER_SCOPES)))!;
     // Invariant violated (2 live rows post-move) → 500, intent left unresolved.
     expect(res.status).toBe(500);
     const intent = getRawDb()
@@ -816,7 +813,7 @@ describe('moveExecuteHandler', () => {
     insertRow(tgtInbound, { id: 'stray-a', series_id: 'ser-1', status: 'pending' });
     insertRow(tgtInbound, { id: 'stray-b', series_id: 'ser-1', status: 'pending' });
 
-    const res = (await moveExecuteHandler(req(moveBody()), { key }, ctxFor('owner', OWNER_SCOPES)))!;
+    const res = (await moveExecuteHandler(req(await moveBody()), { key }, ctxFor('owner', OWNER_SCOPES)))!;
     expect(res.status).toBe(500);
     expect((await readJson(res)).error).toBe('move_failed');
     // Intent left unresolved so the recovery sweep can repair it.
@@ -846,7 +843,7 @@ describe('moveExecuteHandler', () => {
       .prepare("UPDATE sessions SET last_active = ?, sweep_quiet_until = '2099-01-01T00:00:00.000Z' WHERE id = ?")
       .run(stale, 'src-sess');
 
-    const res = (await moveExecuteHandler(req(moveBody()), { key }, ctxFor('owner', OWNER_SCOPES)))!;
+    const res = (await moveExecuteHandler(req(await moveBody()), { key }, ctxFor('owner', OWNER_SCOPES)))!;
     expect(res.status).toBeGreaterThanOrEqual(500);
     // The restore must actually have happened, or the assertion below is vacuous.
     expect(liveRowsForSeries('src-ag', 'src-sess', 'ser-1')).toHaveLength(1);
@@ -879,7 +876,7 @@ describe('moveExecuteHandler', () => {
     fs.mkdirSync(tgtDir, { recursive: true });
     fs.writeFileSync(path.join(tgtDir, 'inbound.db'), 'this is not sqlite');
 
-    const res = (await moveExecuteHandler(req(moveBody()), { key }, ctxFor('owner', OWNER_SCOPES)))!;
+    const res = (await moveExecuteHandler(req(await moveBody()), { key }, ctxFor('owner', OWNER_SCOPES)))!;
     expect(res.status).toBe(500);
     // Unreadable count → NO restore → source stays terminal (cancelled), and the
     // move_restore_failed audit is written (recoverable, not silently healed).
@@ -898,7 +895,7 @@ describe('moveExecuteHandler', () => {
     addMg('tgt-mg2', 'discord', 'tgt:2', 'tgt-chan-2');
     wire('tgt-mg2', 'tgt-ag');
     // Hash computed for tgt-mg, replayed on an execute targeting tgt-mg2.
-    const hashForMg1 = deltaHashFor('tgt-mg');
+    const hashForMg1 = await deltaHashFor('tgt-mg');
     const res = (await moveExecuteHandler(
       req({ targetAgentGroupId: 'tgt-ag', targetMessagingGroupId: 'tgt-mg2', confirmedDeltaHash: hashForMg1 }),
       { key },
@@ -917,7 +914,7 @@ describe('moveExecuteHandler', () => {
     // isn't valid sqlite). Distinguished from an empty result (→ 409 stale_key).
     const srcPath = path.join(TEST_DIR, 'v2-sessions', 'src-ag', 'src-sess', 'inbound.db');
     fs.writeFileSync(srcPath, 'this is not sqlite');
-    const res = (await moveExecuteHandler(req(moveBody()), { key }, ctxFor('owner', OWNER_SCOPES)))!;
+    const res = (await moveExecuteHandler(req(await moveBody()), { key }, ctxFor('owner', OWNER_SCOPES)))!;
     expect(res.status).toBe(503);
     expect((await readJson(res)).reason).toBe('session_unreadable');
   });
@@ -931,28 +928,28 @@ describe('isCrossWorkgroup', () => {
     addWorkgroup('wg-beta', []);
   });
 
-  it('returns false for two agents sharing the same workgroup_id', () => {
+  it('returns false for two agents sharing the same workgroup_id', async () => {
     addGroup('a1', 'folder-a1', 'wg-alpha');
     addGroup('a2', 'folder-a2', 'wg-alpha');
-    expect(isCrossWorkgroup('a1', 'a2')).toBe(false);
+    expect(await isCrossWorkgroup('a1', 'a2')).toBe(false);
   });
 
-  it('returns true for two agents in different workgroups', () => {
+  it('returns true for two agents in different workgroups', async () => {
     addGroup('a1', 'folder-a1', 'wg-alpha');
     addGroup('b1', 'folder-b1', 'wg-beta');
-    expect(isCrossWorkgroup('a1', 'b1')).toBe(true);
+    expect(await isCrossWorkgroup('a1', 'b1')).toBe(true);
   });
 
-  it('returns true when both agents are orphans (workgroup_id === null)', () => {
+  it('returns true when both agents are orphans (workgroup_id === null)', async () => {
     addGroup('orphan-1', 'folder-orphan-1', null);
     addGroup('orphan-2', 'folder-orphan-2', null);
-    expect(isCrossWorkgroup('orphan-1', 'orphan-2')).toBe(true);
+    expect(await isCrossWorkgroup('orphan-1', 'orphan-2')).toBe(true);
   });
 
-  it('returns true when only one side is orphaned', () => {
+  it('returns true when only one side is orphaned', async () => {
     addGroup('orphan', 'folder-orphan', null);
     addGroup('paired', 'folder-paired', 'wg-alpha');
-    expect(isCrossWorkgroup('orphan', 'paired')).toBe(true);
-    expect(isCrossWorkgroup('paired', 'orphan')).toBe(true);
+    expect(await isCrossWorkgroup('orphan', 'paired')).toBe(true);
+    expect(await isCrossWorkgroup('paired', 'orphan')).toBe(true);
   });
 });

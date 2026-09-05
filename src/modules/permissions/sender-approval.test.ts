@@ -87,9 +87,9 @@ beforeEach(async () => {
 
   // Fixtures: agent group, messaging group with request_approval, wiring,
   // owner + DM messaging group for approver delivery.
-  createAgentGroup({ id: 'ag-1', name: 'Agent', folder: 'agent', agent_provider: null, created_at: now() });
+  await createAgentGroup({ id: 'ag-1', name: 'Agent', folder: 'agent', agent_provider: null, created_at: now() });
 
-  createMessagingGroup({
+  await createMessagingGroup({
     id: 'mg-chat',
     channel_type: 'telegram',
     platform_id: 'chat-123',
@@ -124,7 +124,7 @@ beforeEach(async () => {
     granted_by: null,
     granted_at: now(),
   });
-  createMessagingGroup({
+  await createMessagingGroup({
     id: 'mg-dm-owner',
     channel_type: 'telegram',
     platform_id: 'dm-owner',

@@ -141,12 +141,12 @@ function initStubSessionFolder(agentGroupId: string, sessionId: string): void {
  * and resolve by re-lookup.
  */
 export async function resolveActiveSession(agentGroupId: string, messagingGroupId: string): Promise<{ id: string }> {
-  const existing = findSessionByAgentGroupAndMessagingGroup(agentGroupId, messagingGroupId);
+  const existing = await findSessionByAgentGroupAndMessagingGroup(agentGroupId, messagingGroupId);
   if (existing) return { id: existing.id };
 
   const sessionId = generateSessionId();
   try {
-    createSession({
+    await createSession({
       id: sessionId,
       agent_group_id: agentGroupId,
       messaging_group_id: messagingGroupId,
@@ -159,7 +159,7 @@ export async function resolveActiveSession(agentGroupId: string, messagingGroupI
     });
   } catch (err) {
     if ((err as { code?: string }).code !== 'SQLITE_CONSTRAINT_UNIQUE') throw err;
-    const winner = findSessionByAgentGroupAndMessagingGroup(agentGroupId, messagingGroupId);
+    const winner = await findSessionByAgentGroupAndMessagingGroup(agentGroupId, messagingGroupId);
     if (winner) return { id: winner.id };
     throw err;
   }
@@ -266,7 +266,7 @@ export async function scheduleTask(def: TaskDef): Promise<void> {
   // and re-stamps the series' new home (migration 056).
   // No routing id: the stamp is deferred to `stamp`, which applies it only
   // after re-validating the destination. See the note there.
-  const { session } = resolveTaskSession(def.agentGroupId, def.seriesId);
+  const { session } = await resolveTaskSession(def.agentGroupId, def.seriesId);
 
   const content = JSON.stringify({
     prompt: def.prompt,
@@ -292,7 +292,7 @@ export async function scheduleTask(def: TaskDef): Promise<void> {
   // needs is skipped by not provisioning.
   const stamp =
     (sessionId: string) =>
-    (mailbox: NanoclawMailboxSession): StampOutcome => {
+    async (mailbox: NanoclawMailboxSession): Promise<StampOutcome> => {
       // Re-read the session's status INSIDE the session, immediately before the
       // write, with no await in between — that ordering is the whole point.
       //
@@ -308,7 +308,7 @@ export async function scheduleTask(def: TaskDef): Promise<void> {
       // Same shape as `withStoppedContainerSession` one layer down: restore the
       // check-then-write adjacency the seam's await broke, at the seam rather
       // than at each call site.
-      if (getSession(sessionId)?.status !== 'active') return 'session-closed';
+      if ((await getSession(sessionId))?.status !== 'active') return 'session-closed';
       // AUTHORIZATION, re-validated here too, for the same reason and in the
       // same place: `resolveAndValidateDestination` ran before the funnel's
       // await, and the wiring it proved can be revoked in that window — a
@@ -376,7 +376,7 @@ export async function scheduleTask(def: TaskDef): Promise<void> {
         }),
       );
       try {
-        setTaskRoutingPlatformId(sessionId, def.destination.platformId);
+        await setTaskRoutingPlatformId(sessionId, def.destination.platformId);
       } catch (err) {
         try {
           mailbox.restoreTaskSeries(upserted.touchedId, upserted.prior, upserted.priorRecall);
@@ -410,7 +410,7 @@ export async function scheduleTask(def: TaskDef): Promise<void> {
     // outbound.db it must never have (invariants I-4/I-10). This narrows that
     // window rather than closing it: one await still follows. The action's own
     // check remains the authoritative one.
-    if (getSession(sessionId)?.status !== 'active') return 'session-closed';
+    if ((await getSession(sessionId))?.status !== 'active') return 'session-closed';
     return await withMailboxSession(def.agentGroupId, sessionId, action);
   };
 
@@ -436,7 +436,7 @@ export async function scheduleTask(def: TaskDef): Promise<void> {
   // Lost the race. Re-resolve and try once more. This terminates: the lookups
   // behind `resolveTaskSession` filter `status = 'active'`, so the closed row
   // can never come back — a fresh active task session is minted instead.
-  const retry = resolveTaskSession(def.agentGroupId, def.seriesId);
+  const retry = await resolveTaskSession(def.agentGroupId, def.seriesId);
   if ((await write(retry.session.id)) === 'written') {
     return;
   }

@@ -108,8 +108,8 @@ async function setupDb(): Promise<void> {
   runMigrations(db);
 }
 
-function seedAgentGroup(id: string): void {
-  createAgentGroup({ id, name: id, folder: id, agent_provider: null, created_at: now() });
+async function seedAgentGroup(id: string): Promise<void> {
+  await createAgentGroup({ id, name: id, folder: id, agent_provider: null, created_at: now() });
 }
 
 function seedUser(id: string): void {
@@ -187,8 +187,8 @@ describe('applySessionSteer — C5', () => {
     mockGetMessagingGroup.mockReturnValue(undefined);
     mockEmitDashboardEvent.mockReset();
     await setupDb();
-    seedAgentGroup('ag-1');
-    seedAgentGroup('ag-2');
+    await seedAgentGroup('ag-1');
+    await seedAgentGroup('ag-2');
     seedSession('sess-direct', 'ag-1'); // direct conversation session, no MG
     seedUser('owner-s');
     grantOwner('owner-s');

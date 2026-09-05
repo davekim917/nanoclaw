@@ -54,10 +54,10 @@ export async function handleApprovalsResponse(payload: ResponsePayload): Promise
   }
 
   // DB-backed pending_approvals.
-  const approval = getPendingApproval(payload.questionId);
+  const approval = await getPendingApproval(payload.questionId);
   if (!approval) return false;
 
-  if (!isAuthorizedApprovalClick(approval, payload)) {
+  if (!(await isAuthorizedApprovalClick(approval, payload))) {
     log.warn('Ignoring unauthorized approval response', {
       approvalId: approval.approval_id,
       action: approval.action,
@@ -98,7 +98,7 @@ export async function resolveApprovalFromHost(
   decision: 'approve' | 'reject',
   userId: string,
 ): Promise<{ resolved: boolean; error?: string }> {
-  const approval = getPendingApproval(approvalId);
+  const approval = await getPendingApproval(approvalId);
   if (!approval) return { resolved: false, error: `No pending approval ${approvalId}` };
   if (approval.action === ONECLI_ACTION) {
     return {
@@ -116,12 +116,12 @@ async function handleRegisteredApproval(
   userId: string,
 ): Promise<void> {
   if (!approval.session_id) {
-    deletePendingApproval(approval.approval_id);
+    await deletePendingApproval(approval.approval_id);
     return;
   }
-  const session = getSession(approval.session_id);
+  const session = await getSession(approval.session_id);
   if (!session) {
-    deletePendingApproval(approval.approval_id);
+    await deletePendingApproval(approval.approval_id);
     return;
   }
 
@@ -171,7 +171,7 @@ async function handleRegisteredApproval(
       action: approval.action,
     });
     await notify(`Your ${approval.action} was approved, but no handler is installed to apply it.`);
-    deletePendingApproval(approval.approval_id);
+    await deletePendingApproval(approval.approval_id);
     await notifyApprovalResolved({ approval, session, outcome: 'approve', userId });
     await wakeContainer(session);
     return;
@@ -188,7 +188,7 @@ async function handleRegisteredApproval(
     );
   }
 
-  deletePendingApproval(approval.approval_id);
+  await deletePendingApproval(approval.approval_id);
   await notifyApprovalResolved({ approval, session, outcome: 'approve', userId });
   await wakeContainer(session);
 }
@@ -198,7 +198,7 @@ function namespacedUserId(payload: ResponsePayload): string | null {
   return payload.userId.includes(':') ? payload.userId : `${payload.channelType}:${payload.userId}`;
 }
 
-function isAuthorizedApprovalClick(approval: PendingApproval, payload: ResponsePayload): boolean {
+async function isAuthorizedApprovalClick(approval: PendingApproval, payload: ResponsePayload): Promise<boolean> {
   const userId = namespacedUserId(payload);
   if (!userId) return false;
 
@@ -211,12 +211,12 @@ function isAuthorizedApprovalClick(approval: PendingApproval, payload: ResponseP
   // post into the originating conversation, where thread access IS the
   // approval authority — any thread member may resolve. See primitive.ts.
   if (approval.session_id) {
-    const session = getSession(approval.session_id);
+    const session = await getSession(approval.session_id);
     if (session && isThreadDelivery(approval, session)) return true;
   }
 
   const agentGroupId =
-    approval.agent_group_id ?? (approval.session_id ? getSession(approval.session_id)?.agent_group_id : null);
+    approval.agent_group_id ?? (approval.session_id ? (await getSession(approval.session_id))?.agent_group_id : null);
 
   if (!agentGroupId) {
     return isOwner(userId) || isGlobalAdmin(userId);

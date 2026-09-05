@@ -41,7 +41,7 @@ describe('agent-group-capabilities CRUD', () => {
   it('test_grant_then_has_capability', async () => {
     await setupDb();
     createUser('user-system');
-    createAgentGroup({ id: 'ag-x', name: 'X', folder: 'x', agent_provider: null, created_at: now() });
+    await createAgentGroup({ id: 'ag-x', name: 'X', folder: 'x', agent_provider: null, created_at: now() });
 
     grantCapability('ag-x', 'orchestrator', defaultConfig, 'user-system');
     expect(hasOrchestratorCapability('ag-x')).toBe(true);
@@ -49,7 +49,7 @@ describe('agent-group-capabilities CRUD', () => {
 
   it('test_has_capability_false_when_absent', async () => {
     await setupDb();
-    createAgentGroup({ id: 'ag-y', name: 'Y', folder: 'y', agent_provider: null, created_at: now() });
+    await createAgentGroup({ id: 'ag-y', name: 'Y', folder: 'y', agent_provider: null, created_at: now() });
 
     expect(hasOrchestratorCapability('ag-y')).toBe(false);
   });
@@ -57,7 +57,7 @@ describe('agent-group-capabilities CRUD', () => {
   it('test_revoke_blocks_when_tasks_in_flight', async () => {
     await setupDb();
     createUser('user-system');
-    createAgentGroup({ id: 'ag-x', name: 'X', folder: 'x', agent_provider: null, created_at: now() });
+    await createAgentGroup({ id: 'ag-x', name: 'X', folder: 'x', agent_provider: null, created_at: now() });
     grantCapability('ag-x', 'orchestrator', defaultConfig, 'user-system');
 
     const db = getRawDb();
@@ -77,7 +77,7 @@ describe('agent-group-capabilities CRUD', () => {
   it('test_revoke_succeeds_when_no_tasks_in_flight', async () => {
     await setupDb();
     createUser('user-system');
-    createAgentGroup({ id: 'ag-x', name: 'X', folder: 'x', agent_provider: null, created_at: now() });
+    await createAgentGroup({ id: 'ag-x', name: 'X', folder: 'x', agent_provider: null, created_at: now() });
     grantCapability('ag-x', 'orchestrator', defaultConfig, 'user-system');
 
     const result = revokeCapability('ag-x', 'orchestrator');
@@ -88,7 +88,7 @@ describe('agent-group-capabilities CRUD', () => {
   it('test_get_config_returns_parsed', async () => {
     await setupDb();
     createUser('user-system');
-    createAgentGroup({ id: 'ag-x', name: 'X', folder: 'x', agent_provider: null, created_at: now() });
+    await createAgentGroup({ id: 'ag-x', name: 'X', folder: 'x', agent_provider: null, created_at: now() });
 
     const cfg: CapabilityConfig = {
       concurrencyCap: 7,
@@ -107,7 +107,7 @@ describe('agent-group-capabilities CRUD', () => {
   it('test_grant_is_idempotent', async () => {
     await setupDb();
     createUser('user-system');
-    createAgentGroup({ id: 'ag-x', name: 'X', folder: 'x', agent_provider: null, created_at: now() });
+    await createAgentGroup({ id: 'ag-x', name: 'X', folder: 'x', agent_provider: null, created_at: now() });
 
     grantCapability('ag-x', 'orchestrator', defaultConfig, 'user-system');
     const cfg2: CapabilityConfig = {

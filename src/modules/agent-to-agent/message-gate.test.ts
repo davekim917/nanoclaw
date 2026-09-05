@@ -100,8 +100,8 @@ function makeSession(id: string, agentGroupId: string): Session {
 }
 
 /** Seed a live a2a hold row (what requestApproval writes) and return it as the grant. */
-function seedA2aHold(approvalId: string, payload: Record<string, unknown>): PendingApproval {
-  createPendingApproval({
+async function seedA2aHold(approvalId: string, payload: Record<string, unknown>): Promise<PendingApproval> {
+  await createPendingApproval({
     approval_id: approvalId,
     session_id: 'sess-A',
     request_id: approvalId,
@@ -113,7 +113,7 @@ function seedA2aHold(approvalId: string, payload: Record<string, unknown>): Pend
     options_json: '[]',
     approver_user_id: 'telegram:dana',
   });
-  return getPendingApproval(approvalId)!;
+  return (await getPendingApproval(approvalId))!;
 }
 
 describe('agent message policies', () => {
@@ -128,12 +128,12 @@ describe('agent message policies', () => {
     runMigrations(db);
     vi.mocked(requestApproval).mockClear();
 
-    createAgentGroup({ id: A, name: 'A', folder: 'a', agent_provider: null, created_at: now() });
-    createAgentGroup({ id: B, name: 'B', folder: 'b', agent_provider: null, created_at: now() });
+    await createAgentGroup({ id: A, name: 'A', folder: 'a', agent_provider: null, created_at: now() });
+    await createAgentGroup({ id: B, name: 'B', folder: 'b', agent_provider: null, created_at: now() });
     SA = makeSession('sess-A', A);
     SB = makeSession('sess-B', B);
-    createSession(SA);
-    createSession(SB);
+    await createSession(SA);
+    await createSession(SB);
     initSessionFolder(A, SA.id);
     initSessionFolder(B, SB.id);
     // A→B connection wired.
@@ -224,7 +224,7 @@ describe('agent message policies', () => {
   it('applyA2aMessageGate delivers the held message to the target (valid grant)', async () => {
     setMessagePolicy(A, B, 'telegram:dana', now());
     const payload = { id: 'held-1', platform_id: B, content: JSON.stringify({ text: 'approved!' }), in_reply_to: null };
-    const approval = seedA2aHold('appr-a2a-1', payload);
+    const approval = await seedA2aHold('appr-a2a-1', payload);
 
     const notify = vi.fn();
     await applyA2aMessageGate({ session: SA, userId: 'telegram:dana', notify, payload, approval });
@@ -240,7 +240,7 @@ describe('agent message policies', () => {
   it('destination revoked between hold and approve → refused cleanly, requester told, nothing delivered', async () => {
     setMessagePolicy(A, B, 'telegram:dana', now());
     const payload = { id: 'held-2', platform_id: B, content: JSON.stringify({ text: 'stale' }), in_reply_to: null };
-    const approval = seedA2aHold('appr-a2a-2', payload);
+    const approval = await seedA2aHold('appr-a2a-2', payload);
 
     deleteDestination(A, 'b'); // revoke A→B while the card is pending
 
@@ -256,7 +256,7 @@ describe('agent message policies', () => {
   it('mismatched grant (held for another target) refuses the replay cleanly', async () => {
     setMessagePolicy(A, B, 'telegram:dana', now());
     // Grant was approved for a message to A (different target than the replay).
-    const approval = seedA2aHold('appr-a2a-3', { id: 'other', platform_id: A, content: '{}', in_reply_to: null });
+    const approval = await seedA2aHold('appr-a2a-3', { id: 'other', platform_id: A, content: '{}', in_reply_to: null });
     const payload = { id: 'held-3', platform_id: B, content: JSON.stringify({ text: 'swap' }), in_reply_to: null };
 
     const notify = vi.fn();
@@ -269,9 +269,9 @@ describe('agent message policies', () => {
   it('a grant only works while its row is live (executes once)', async () => {
     setMessagePolicy(A, B, 'telegram:dana', now());
     const payload = { id: 'held-4', platform_id: B, content: JSON.stringify({ text: 'once' }), in_reply_to: null };
-    const approval = seedA2aHold('appr-a2a-4', payload);
+    const approval = await seedA2aHold('appr-a2a-4', payload);
 
-    deletePendingApproval(approval.approval_id); // resolution already consumed the row
+    await deletePendingApproval(approval.approval_id); // resolution already consumed the row
 
     const notify = vi.fn();
     await applyA2aMessageGate({ session: SA, userId: 'telegram:dana', notify, payload, approval });

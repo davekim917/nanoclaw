@@ -162,7 +162,7 @@ beforeEach(async () => {
   runMigrations(db);
 
   // Insert the parent agent group
-  createAgentGroup({
+  await createAgentGroup({
     id: 'ag-parent',
     name: 'Parent Agent',
     folder: 'parent-agent',
@@ -192,7 +192,7 @@ describe('legacy call — no provider, no provider_config', () => {
     const session = makeSession();
     await runCreateAgent({ requestId: 'r1', name: 'Legacy', instructions: 'be helpful' }, session);
 
-    const row = getAgentGroupByFolder('legacy');
+    const row = await getAgentGroupByFolder('legacy');
     expect(row).toBeDefined();
     expect(row!.agent_provider).toBeNull();
 
@@ -226,7 +226,7 @@ describe('create with claude provider', () => {
       session,
     );
 
-    const row = getAgentGroupByFolder('coder');
+    const row = await getAgentGroupByFolder('coder');
     expect(row).toBeDefined();
     expect(row!.agent_provider).toBe('claude');
 
@@ -251,7 +251,7 @@ describe('create with codex provider', () => {
       session,
     );
 
-    const row = getAgentGroupByFolder('codexcoder');
+    const row = await getAgentGroupByFolder('codexcoder');
     expect(row).toBeDefined();
     expect(row!.agent_provider).toBe('codex');
 
@@ -339,7 +339,7 @@ describe('DB failure rollback', () => {
     ).resolves.toBeUndefined(); // must not throw
 
     expect(fs.existsSync(path.join(TEST_GROUPS_DIR, 'dbfail'))).toBe(false);
-    expect(getAgentGroupByFolder('dbfail')).toBeUndefined();
+    expect(await getAgentGroupByFolder('dbfail')).toBeUndefined();
 
     const calls = (writeSessionMessage as ReturnType<typeof vi.fn>).mock.calls;
     const notifyCall = calls.find((c) => {
@@ -457,7 +457,7 @@ describe('envelope guard — non-string provider', () => {
     });
     expect(notifyCall).toBeDefined();
 
-    expect(getAgentGroupByFolder('x')).toBeUndefined();
+    expect(await getAgentGroupByFolder('x')).toBeUndefined();
     expect(fs.existsSync(path.join(TEST_GROUPS_DIR, 'x'))).toBe(false);
   });
 });
@@ -485,7 +485,7 @@ describe('envelope guard — array provider_config', () => {
     });
     expect(notifyCall).toBeDefined();
 
-    expect(getAgentGroupByFolder('x')).toBeUndefined();
+    expect(await getAgentGroupByFolder('x')).toBeUndefined();
     expect(fs.existsSync(path.join(TEST_GROUPS_DIR, 'x'))).toBe(false);
   });
 });
@@ -508,7 +508,7 @@ describe('envelope guard — null provider_config', () => {
     });
     expect(notifyCall).toBeDefined();
 
-    expect(getAgentGroupByFolder('x')).toBeUndefined();
+    expect(await getAgentGroupByFolder('x')).toBeUndefined();
     expect(fs.existsSync(path.join(TEST_GROUPS_DIR, 'x'))).toBe(false);
   });
 });
@@ -518,7 +518,7 @@ describe('envelope guard — undefined provider_config is OK', () => {
     const session = makeSession();
     await runCreateAgent({ requestId: 'r7', name: 'ValidProviderOnly', provider: 'claude' }, session);
 
-    const row = getAgentGroupByFolder('validprovideronly');
+    const row = await getAgentGroupByFolder('validprovideronly');
     expect(row).toBeDefined();
     expect(row!.agent_provider).toBe('claude');
   });

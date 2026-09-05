@@ -90,190 +90,190 @@ afterEach(async () => {
 });
 
 describe('channel-auto-wire resolver', () => {
-  it('returns [] when no default is configured for the channel_type', () => {
+  it('returns [] when no default is configured for the channel_type', async () => {
     const mg = makeMg('mg-1', 'slack-example-labs', 'slack:C1');
-    createMessagingGroup(mg);
-    const result = resolver(makeEvent('slack-example-labs', 'slack:C1'), mg);
+    await createMessagingGroup(mg);
+    const result = await resolver(makeEvent('slack-example-labs', 'slack:C1'), mg);
     expect(result).toEqual([]);
-    expect(getMessagingGroupAgents('mg-1')).toEqual([]);
+    expect(await getMessagingGroupAgents('mg-1')).toEqual([]);
   });
 
-  it('returns [] and writes no row when the configured folder is unknown', () => {
+  it('returns [] and writes no row when the configured folder is unknown', async () => {
     process.env[ENV_FOLDER_KEY] = 'does-not-exist';
     const mg = makeMg('mg-2', 'slack-example-labs', 'slack:C2');
-    createMessagingGroup(mg);
-    const result = resolver(makeEvent('slack-example-labs', 'slack:C2'), mg);
+    await createMessagingGroup(mg);
+    const result = await resolver(makeEvent('slack-example-labs', 'slack:C2'), mg);
     expect(result).toEqual([]);
-    expect(getMessagingGroupAgents('mg-2')).toEqual([]);
+    expect(await getMessagingGroupAgents('mg-2')).toEqual([]);
   });
 
-  it('wires and returns the agent when the folder resolves; defaults to per-thread', () => {
+  it('wires and returns the agent when the folder resolves; defaults to per-thread', async () => {
     const ag = makeAgentGroup('ag-auto', 'example-labs-v2', 'helper');
-    createAgentGroup(ag);
+    await createAgentGroup(ag);
     process.env[ENV_FOLDER_KEY] = 'example-labs-v2';
 
     const mg = makeMg('mg-3', 'slack-example-labs', 'slack:C3');
-    createMessagingGroup(mg);
-    const result = resolver(makeEvent('slack-example-labs', 'slack:C3'), mg);
+    await createMessagingGroup(mg);
+    const result = await resolver(makeEvent('slack-example-labs', 'slack:C3'), mg);
 
     expect(result).toHaveLength(1);
     expect(result[0].agent_group_id).toBe('ag-auto');
     expect(result[0].session_mode).toBe('per-thread');
     expect(result[0].messaging_group_id).toBe('mg-3');
 
-    const persisted = getMessagingGroupAgents('mg-3');
+    const persisted = await getMessagingGroupAgents('mg-3');
     expect(persisted).toHaveLength(1);
     expect(persisted[0].agent_group_id).toBe('ag-auto');
     expect(persisted[0].session_mode).toBe('per-thread');
   });
 
-  it('uses always-on engagement for a threaded DM', () => {
+  it('uses always-on engagement for a threaded DM', async () => {
     const ag = makeAgentGroup('ag-auto', 'example-labs-v2', 'helper');
-    createAgentGroup(ag);
+    await createAgentGroup(ag);
     process.env[ENV_FOLDER_KEY] = 'example-labs-v2';
 
     const mg = makeMg('mg-dm', 'slack-example-labs', 'slack:DM');
-    createMessagingGroup(mg);
+    await createMessagingGroup(mg);
     const event = makeEvent('slack-example-labs', 'slack:DM');
     event.threadId = 'slack:DM:thread-1';
     event.isDM = true;
     event.message.isGroup = false;
 
-    const result = resolver(event, mg);
+    const result = await resolver(event, mg);
 
     expect(result[0].engage_mode).toBe('pattern');
     expect(result[0].engage_pattern).toBe('.');
     expect(result[0].ignored_message_policy).toBe('accumulate');
   });
 
-  it('uses mention engagement for a non-threaded group', () => {
+  it('uses mention engagement for a non-threaded group', async () => {
     const ag = makeAgentGroup('ag-auto', 'example-labs-v2', 'helper');
-    createAgentGroup(ag);
+    await createAgentGroup(ag);
     process.env[ENV_FOLDER_KEY] = 'example-labs-v2';
 
     const mg = makeMg('mg-group', 'slack-example-labs', 'slack:GROUP');
     mg.is_group = 1;
-    createMessagingGroup(mg);
+    await createMessagingGroup(mg);
     const event = makeEvent('slack-example-labs', 'slack:GROUP');
     event.isDM = false;
     event.message.isGroup = true;
 
-    const result = resolver(event, mg);
+    const result = await resolver(event, mg);
 
     expect(result[0].engage_mode).toBe('mention');
     expect(result[0].engage_pattern).toBeNull();
     expect(result[0].ignored_message_policy).toBe('accumulate');
   });
 
-  it('honors an explicit session_mode override', () => {
+  it('honors an explicit session_mode override', async () => {
     const ag = makeAgentGroup('ag-auto', 'example-labs-v2', 'helper');
-    createAgentGroup(ag);
+    await createAgentGroup(ag);
     process.env[ENV_FOLDER_KEY] = 'example-labs-v2';
     process.env[ENV_MODE_KEY] = 'shared';
 
     const mg = makeMg('mg-4', 'slack-example-labs', 'slack:C4');
-    createMessagingGroup(mg);
-    const result = resolver(makeEvent('slack-example-labs', 'slack:C4'), mg);
+    await createMessagingGroup(mg);
+    const result = await resolver(makeEvent('slack-example-labs', 'slack:C4'), mg);
 
     expect(result[0].session_mode).toBe('shared');
   });
 
-  it('defaults ignored_message_policy to accumulate when not configured', () => {
+  it('defaults ignored_message_policy to accumulate when not configured', async () => {
     const ag = makeAgentGroup('ag-auto', 'example-labs-v2', 'helper');
-    createAgentGroup(ag);
+    await createAgentGroup(ag);
     process.env[ENV_FOLDER_KEY] = 'example-labs-v2';
 
     const mg = makeMg('mg-ignored-1', 'slack-example-labs', 'slack:CI1');
-    createMessagingGroup(mg);
-    const result = resolver(makeEvent('slack-example-labs', 'slack:CI1'), mg);
+    await createMessagingGroup(mg);
+    const result = await resolver(makeEvent('slack-example-labs', 'slack:CI1'), mg);
 
     expect(result[0].ignored_message_policy).toBe('accumulate');
-    const persisted = getMessagingGroupAgents('mg-ignored-1');
+    const persisted = await getMessagingGroupAgents('mg-ignored-1');
     expect(persisted[0].ignored_message_policy).toBe('accumulate');
   });
 
-  it('honors an explicit ignored_message_policy override', () => {
+  it('honors an explicit ignored_message_policy override', async () => {
     const ag = makeAgentGroup('ag-auto', 'example-labs-v2', 'helper');
-    createAgentGroup(ag);
+    await createAgentGroup(ag);
     process.env[ENV_FOLDER_KEY] = 'example-labs-v2';
     process.env[ENV_IGNORED_KEY] = 'drop';
 
     const mg = makeMg('mg-ignored-2', 'slack-example-labs', 'slack:CI2');
-    createMessagingGroup(mg);
-    const result = resolver(makeEvent('slack-example-labs', 'slack:CI2'), mg);
+    await createMessagingGroup(mg);
+    const result = await resolver(makeEvent('slack-example-labs', 'slack:CI2'), mg);
 
     expect(result[0].ignored_message_policy).toBe('drop');
-    const persisted = getMessagingGroupAgents('mg-ignored-2');
+    const persisted = await getMessagingGroupAgents('mg-ignored-2');
     expect(persisted[0].ignored_message_policy).toBe('drop');
   });
 
-  it('falls back to per-thread when session_mode is invalid', () => {
+  it('falls back to per-thread when session_mode is invalid', async () => {
     const ag = makeAgentGroup('ag-auto', 'example-labs-v2', 'helper');
-    createAgentGroup(ag);
+    await createAgentGroup(ag);
     process.env[ENV_FOLDER_KEY] = 'example-labs-v2';
     process.env[ENV_MODE_KEY] = 'bogus';
 
     const mg = makeMg('mg-5', 'slack-example-labs', 'slack:C5');
-    createMessagingGroup(mg);
-    const result = resolver(makeEvent('slack-example-labs', 'slack:C5'), mg);
+    await createMessagingGroup(mg);
+    const result = await resolver(makeEvent('slack-example-labs', 'slack:C5'), mg);
 
     expect(result[0].session_mode).toBe('per-thread');
   });
 
-  it('leaves unknown_sender_policy at strict when not configured', () => {
+  it('leaves unknown_sender_policy at strict when not configured', async () => {
     const ag = makeAgentGroup('ag-auto', 'example-labs-v2', 'helper');
-    createAgentGroup(ag);
+    await createAgentGroup(ag);
     process.env[ENV_FOLDER_KEY] = 'example-labs-v2';
 
     const mg = makeMg('mg-policy-1', 'slack-example-labs', 'slack:CP1');
-    createMessagingGroup(mg);
-    resolver(makeEvent('slack-example-labs', 'slack:CP1'), mg);
+    await createMessagingGroup(mg);
+    await resolver(makeEvent('slack-example-labs', 'slack:CP1'), mg);
 
-    const persisted = getMessagingGroupByPlatform('slack-example-labs', 'slack:CP1');
+    const persisted = await getMessagingGroupByPlatform('slack-example-labs', 'slack:CP1');
     expect(persisted?.unknown_sender_policy).toBe('strict');
     expect(mg.unknown_sender_policy).toBe('strict');
   });
 
-  it('relaxes unknown_sender_policy when configured (public) — persists + mutates in-place', () => {
+  it('relaxes unknown_sender_policy when configured (public) — persists + mutates in-place', async () => {
     const ag = makeAgentGroup('ag-auto', 'example-labs-v2', 'helper');
-    createAgentGroup(ag);
+    await createAgentGroup(ag);
     process.env[ENV_FOLDER_KEY] = 'example-labs-v2';
     process.env[ENV_POLICY_KEY] = 'public';
 
     const mg = makeMg('mg-policy-2', 'slack-example-labs', 'slack:CP2');
-    createMessagingGroup(mg);
-    resolver(makeEvent('slack-example-labs', 'slack:CP2'), mg);
+    await createMessagingGroup(mg);
+    await resolver(makeEvent('slack-example-labs', 'slack:CP2'), mg);
 
     // Mutated in-place so router's current-message access gate sees it.
     expect(mg.unknown_sender_policy).toBe('public');
     // Persisted so subsequent messages skip the mutation path entirely.
-    const persisted = getMessagingGroupByPlatform('slack-example-labs', 'slack:CP2');
+    const persisted = await getMessagingGroupByPlatform('slack-example-labs', 'slack:CP2');
     expect(persisted?.unknown_sender_policy).toBe('public');
   });
 
-  it('ignores invalid sender_policy values (stays strict, logs warning)', () => {
+  it('ignores invalid sender_policy values (stays strict, logs warning)', async () => {
     const ag = makeAgentGroup('ag-auto', 'example-labs-v2', 'helper');
-    createAgentGroup(ag);
+    await createAgentGroup(ag);
     process.env[ENV_FOLDER_KEY] = 'example-labs-v2';
     process.env[ENV_POLICY_KEY] = 'yolo';
 
     const mg = makeMg('mg-policy-3', 'slack-example-labs', 'slack:CP3');
-    createMessagingGroup(mg);
-    resolver(makeEvent('slack-example-labs', 'slack:CP3'), mg);
+    await createMessagingGroup(mg);
+    await resolver(makeEvent('slack-example-labs', 'slack:CP3'), mg);
 
     expect(mg.unknown_sender_policy).toBe('strict');
-    const persisted = getMessagingGroupByPlatform('slack-example-labs', 'slack:CP3');
+    const persisted = await getMessagingGroupByPlatform('slack-example-labs', 'slack:CP3');
     expect(persisted?.unknown_sender_policy).toBe('strict');
   });
 
-  it('is scoped per channel_type — `discord` config does not wire `slack-example-labs`', () => {
+  it('is scoped per channel_type — `discord` config does not wire `slack-example-labs`', async () => {
     const ag = makeAgentGroup('ag-main', 'main', 'main');
-    createAgentGroup(ag);
+    await createAgentGroup(ag);
     process.env[ENV_DISCORD_KEY] = 'main';
 
     const mg = makeMg('mg-6', 'slack-example-labs', 'slack:C6');
-    createMessagingGroup(mg);
-    const result = resolver(makeEvent('slack-example-labs', 'slack:C6'), mg);
+    await createMessagingGroup(mg);
+    const result = await resolver(makeEvent('slack-example-labs', 'slack:C6'), mg);
 
     expect(result).toEqual([]);
   });

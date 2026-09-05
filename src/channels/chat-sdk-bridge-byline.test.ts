@@ -87,8 +87,8 @@ async function fireAction(
   return { edits, actions };
 }
 
-function seedApproval(id: string, title = '⚠️ Test approval', question = ''): void {
-  createPendingApproval({
+async function seedApproval(id: string, title = '⚠️ Test approval', question = ''): Promise<void> {
+  await createPendingApproval({
     approval_id: id,
     request_id: id,
     action: 'test',
@@ -103,16 +103,16 @@ function seedApproval(id: string, title = '⚠️ Test approval', question = '')
   });
 }
 
-function seedInteractiveQuestion(id: string, title: string, question: string): void {
+async function seedInteractiveQuestion(id: string, title: string, question: string): Promise<void> {
   const createdAt = new Date().toISOString();
-  createAgentGroup({
+  await createAgentGroup({
     id: 'ag-1',
     name: 'Agent',
     folder: 'agent',
     agent_provider: null,
     created_at: createdAt,
   });
-  createSession({
+  await createSession({
     id: 'sess-1',
     agent_group_id: 'ag-1',
     messaging_group_id: null,
@@ -123,7 +123,7 @@ function seedInteractiveQuestion(id: string, title: string, question: string): v
     last_active: null,
     created_at: createdAt,
   });
-  createPendingQuestion({
+  await createPendingQuestion({
     question_id: id,
     session_id: 'sess-1',
     message_out_id: `out-${id}`,
@@ -175,7 +175,7 @@ describe('chat-sdk-bridge approval-card byline', () => {
   });
 
   it('resolves an indexed Approve button to approve before dispatching it', async () => {
-    seedApproval('q-1');
+    await seedApproval('q-1');
 
     const { edits, actions } = await fireAction(
       { userId: 'U1', userName: 'gavriel' },
@@ -188,7 +188,7 @@ describe('chat-sdk-bridge approval-card byline', () => {
   });
 
   it('keeps the decision context visible after an approval resolves', async () => {
-    seedApproval('q-1', 'Install Packages Request', 'Agent "example-group" wants to install WebKit libraries.');
+    await seedApproval('q-1', 'Install Packages Request', 'Agent "example-group" wants to install WebKit libraries.');
 
     const { edits, actions } = await fireAction(
       { userId: 'U1', userName: 'gavriel' },
@@ -203,7 +203,7 @@ describe('chat-sdk-bridge approval-card byline', () => {
   });
 
   it('keeps interactive-question context visible when pending_questions is the render source', async () => {
-    seedInteractiveQuestion('interactive-1', 'Choose a path', 'Which deployment path should I use?');
+    await seedInteractiveQuestion('interactive-1', 'Choose a path', 'Which deployment path should I use?');
 
     const { edits, actions } = await fireAction(
       { userId: 'U1', userName: 'gavriel' },

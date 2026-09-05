@@ -371,7 +371,7 @@ async function _runThreadedPath(task: Task, childAgentGroupId: string): Promise<
       // mg.platform_id already contains the scheme+channel prefix.
       const bareThreadId = current.child_platform_thread_id!;
       const encodedThreadId = bareThreadId.includes(':') ? bareThreadId : `${mg.platform_id}:${bareThreadId}`;
-      const { session: childSession } = resolveSession(
+      const { session: childSession } = await resolveSession(
         childAgentGroupId,
         task.parent_messaging_group_id,
         encodedThreadId,
@@ -419,11 +419,11 @@ async function _runThreadedPath(task: Task, childAgentGroupId: string): Promise<
       );
 
       // Notify parent with thread URL
-      const parentSession = _resolveParentSession(task);
+      const parentSession = await _resolveParentSession(task);
       if (parentSession) {
         const threadUrl = `Thread started: ${current.child_platform_thread_id}`;
         await _notifyParent(task, threadUrl);
-        void wakeContainer(parentSession).catch((err) =>
+        void wakeContainer(parentSession).catch((err: unknown) =>
           log.warn('wakeContainer(parent) failed after threaded completion', { taskId, err }),
         );
       }
@@ -438,7 +438,7 @@ async function _runHeadlessPath(task: Task, childAgentGroupId: string): Promise<
   if (!current || current.status !== 'pending') return;
 
   if (current.child_session_id === null) {
-    const { session: childSession } = resolveSession(
+    const { session: childSession } = await resolveSession(
       childAgentGroupId,
       null,
       taskId, // synthetic thread_id = task_id (C4 safe: mgId=null → no adapter.deliver)
@@ -473,9 +473,9 @@ async function _runHeadlessPath(task: Task, childAgentGroupId: string): Promise<
 
     // Notify parent (no platform URL in headless mode)
     await _notifyParent(task, `Headless task running: ${taskId}`);
-    const parentSession = _resolveParentSession(task);
+    const parentSession = await _resolveParentSession(task);
     if (parentSession) {
-      void wakeContainer(parentSession).catch((err) =>
+      void wakeContainer(parentSession).catch((err: unknown) =>
         log.warn('wakeContainer(parent) failed after headless completion', { taskId, err }),
       );
     }
@@ -494,8 +494,8 @@ async function _writeSpawnTaskIdToRouting(agentGroupId: string, sessionId: strin
   await withMailboxSession(agentGroupId, sessionId, (mailbox) => mailbox.setSessionRoutingSpawnTaskId(taskId));
 }
 
-function _resolveParentSession(task: Task): Session | null {
-  const session = getSession(task.parent_session_id);
+async function _resolveParentSession(task: Task): Promise<Session | null> {
+  const session = await getSession(task.parent_session_id);
   return session ?? null;
 }
 
@@ -514,7 +514,7 @@ async function _notifyCaller(session: Session, message: string): Promise<void> {
 
 async function _notifyParent(task: Task, message: string): Promise<void> {
   try {
-    const parentSession = getSession(task.parent_session_id);
+    const parentSession = await getSession(task.parent_session_id);
     if (!parentSession) return;
     await writeSessionMessage(task.parent_agent_group_id, task.parent_session_id, {
       id: randomUUID(),

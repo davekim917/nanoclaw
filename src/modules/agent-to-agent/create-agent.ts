@@ -36,7 +36,7 @@ async function notifyAgent(session: Session, text: string): Promise<void> {
     threadId: null,
     content: JSON.stringify({ text, sender: 'system', senderId: 'system' }),
   });
-  const fresh = getSession(session.id);
+  const fresh = await getSession(session.id);
   if (fresh) {
     wakeContainer(fresh).catch((err) => log.error('Failed to wake container after notification', { err }));
   }
@@ -92,7 +92,7 @@ export async function handleCreateAgent(content: Record<string, unknown>, sessio
     return;
   }
 
-  const sourceGroup = getAgentGroup(session.agent_group_id);
+  const sourceGroup = await getAgentGroup(session.agent_group_id);
   if (!sourceGroup) {
     await notifyAgent(session, `create_agent failed: source agent group not found.`);
     log.warn('create_agent failed: missing source group', { sessionAgentGroup: session.agent_group_id, name });
@@ -131,7 +131,7 @@ export const applyCreateAgent: ApprovalHandler = async ({ session, payload, noti
   const provider = (payload.provider as string | null) ?? undefined;
   const providerConfig = (payload.providerConfig as Record<string, unknown> | null) ?? undefined;
 
-  const sourceGroup = getAgentGroup(session.agent_group_id);
+  const sourceGroup = await getAgentGroup(session.agent_group_id);
   if (!sourceGroup) {
     await notify('create_agent approved but source agent group not found.');
     return;
@@ -171,7 +171,7 @@ export const applyCreateAgent: ApprovalHandler = async ({ session, payload, noti
   // (e.g. PARENT_FOLDER__CHILD's tokens overlap with PARENT_FOLDER_*).
   let folder = localName;
   let suffix = 2;
-  while (getAgentGroupByFolder(folder)) {
+  while (await getAgentGroupByFolder(folder)) {
     folder = `${localName}-${suffix}`;
     suffix++;
   }
@@ -182,7 +182,7 @@ export const applyCreateAgent: ApprovalHandler = async ({ session, payload, noti
   // refuse if any existing folder's token is a prefix of this one or vice
   // versa.
   const newTok = folder.toUpperCase().replace(/-/g, '_');
-  for (const existing of getAllAgentGroups()) {
+  for (const existing of await getAllAgentGroups()) {
     if (existing.folder === folder) continue;
     const existTok = existing.folder.toUpperCase().replace(/-/g, '_');
     if (newTok === existTok || newTok.startsWith(existTok + '_') || existTok.startsWith(newTok + '_')) {
@@ -247,7 +247,7 @@ export const applyCreateAgent: ApprovalHandler = async ({ session, payload, noti
   // STEP 3: DB INSERT. On failure, rollback the folder from step 1
   //         (including the agentGroupId / provider config written in step 2).
   try {
-    createAgentGroup(newGroup);
+    await createAgentGroup(newGroup);
   } catch (err) {
     log.error('create_agent: createAgentGroup failed, rolling back folder', { err, folder });
     const cleaned = safeRemoveFolder(folder);

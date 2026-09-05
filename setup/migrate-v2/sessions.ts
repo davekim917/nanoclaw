@@ -88,7 +88,7 @@ async function main(): Promise<void> {
   const v2Db = getRawDb();
   runMigrations(v2Db);
 
-  const agentGroups = getAllAgentGroups();
+  const agentGroups = await getAllAgentGroups();
   const folderToAg = new Map<string, { id: string; folder: string }>();
   for (const ag of agentGroups) {
     folderToAg.set(ag.folder, ag);
@@ -110,7 +110,7 @@ async function main(): Promise<void> {
     }
 
     // Find the messaging groups wired to this agent group
-    const messagingGroups = getMessagingGroupsByAgentGroup(ag.id);
+    const messagingGroups = await getMessagingGroupsByAgentGroup(ag.id);
     if (messagingGroups.length === 0) {
       sessionsSkipped++;
       continue;
@@ -169,7 +169,7 @@ async function main(): Promise<void> {
             .sort((a, b) => b.mtime - a.mtime)[0].name;
 
           // Write into each v2 session's outbound.db for this agent group
-          const sessions = getMessagingGroupsByAgentGroup(ag.id);
+          const sessions = await getMessagingGroupsByAgentGroup(ag.id);
           for (const mg of sessions) {
             const { session } = resolveSession(ag.id, mg.id, null, 'shared');
             const obPath = outboundDbPath(ag.id, session.id);

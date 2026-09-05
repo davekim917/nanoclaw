@@ -160,15 +160,15 @@ afterEach(async () => {
 });
 
 describe('session manager', () => {
-  beforeEach(() => {
-    createAgentGroup({
+  beforeEach(async () => {
+    await createAgentGroup({
       id: 'ag-1',
       name: 'Test Agent',
       folder: 'test-agent',
       agent_provider: null,
       created_at: now(),
     });
-    createMessagingGroup({
+    await createMessagingGroup({
       id: 'mg-1',
       channel_type: 'discord',
       platform_id: 'chan-123',
@@ -260,7 +260,7 @@ describe('session manager', () => {
 
   it('should reject inbound attachment writes through a pre-placed symlinked inbox dir', async () => {
     initSessionFolder('ag-1', 'sess-test');
-    const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
+    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
 
     // The container has /workspace write access, so it can pre create
     // inbox/<msgId> as a symlink to escape.
@@ -285,7 +285,7 @@ describe('session manager', () => {
 
   it('should refuse to follow a pre-existing symlink at the inbound attachment path', async () => {
     initSessionFolder('ag-1', 'sess-test');
-    const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
+    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
 
     // The container pre creates inbox/<msgId>/photo.png as a symlink to a
     // host file. Without the wx flag, writeFileSync would follow it.
@@ -310,7 +310,7 @@ describe('session manager', () => {
 
   it('should reject inbound attachments when messageId is unsafe', async () => {
     initSessionFolder('ag-1', 'sess-test');
-    const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
+    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
 
     await writeSessionMessage('ag-1', session.id, {
       id: '../../escape',
@@ -330,7 +330,7 @@ describe('session manager', () => {
 
   it('should still save inbound attachments with safe basenames', async () => {
     initSessionFolder('ag-1', 'sess-test');
-    const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
+    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
 
     await writeSessionMessage('ag-1', session.id, {
       id: 'msg-ok',
@@ -348,29 +348,29 @@ describe('session manager', () => {
   });
 
   it('should resolve to existing session (shared mode)', async () => {
-    const { session: s1, created: c1 } = resolveSession('ag-1', 'mg-1', null, 'shared');
+    const { session: s1, created: c1 } = await resolveSession('ag-1', 'mg-1', null, 'shared');
     expect(c1).toBe(true);
 
-    const { session: s2, created: c2 } = resolveSession('ag-1', 'mg-1', null, 'shared');
+    const { session: s2, created: c2 } = await resolveSession('ag-1', 'mg-1', null, 'shared');
     expect(c2).toBe(false);
     expect(s2.id).toBe(s1.id);
   });
 
   it('should create separate sessions per thread (per-thread mode)', async () => {
-    const { session: s1 } = resolveSession('ag-1', 'mg-1', 'thread-1', 'per-thread');
-    const { session: s2 } = resolveSession('ag-1', 'mg-1', 'thread-2', 'per-thread');
+    const { session: s1 } = await resolveSession('ag-1', 'mg-1', 'thread-1', 'per-thread');
+    const { session: s2 } = await resolveSession('ag-1', 'mg-1', 'thread-2', 'per-thread');
     expect(s1.id).not.toBe(s2.id);
   });
 
   it('should reuse session for same thread', async () => {
-    const { session: s1 } = resolveSession('ag-1', 'mg-1', 'thread-1', 'per-thread');
-    const { session: s2, created } = resolveSession('ag-1', 'mg-1', 'thread-1', 'per-thread');
+    const { session: s1 } = await resolveSession('ag-1', 'mg-1', 'thread-1', 'per-thread');
+    const { session: s2, created } = await resolveSession('ag-1', 'mg-1', 'thread-1', 'per-thread');
     expect(created).toBe(false);
     expect(s2.id).toBe(s1.id);
   });
 
   it('should write message to inbound DB', async () => {
-    const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
+    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
 
     await writeSessionMessage('ag-1', session.id, {
       id: 'msg-1',
@@ -395,8 +395,8 @@ describe('session manager', () => {
   });
 
   it('should update last_active on message write', async () => {
-    const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
-    expect(getSession(session.id)!.last_active).toBeNull();
+    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
+    expect((await getSession(session.id))!.last_active).toBeNull();
 
     await writeSessionMessage('ag-1', session.id, {
       id: 'msg-1',
@@ -405,7 +405,7 @@ describe('session manager', () => {
       content: JSON.stringify({ text: 'hi' }),
     });
 
-    expect(getSession(session.id)!.last_active).not.toBeNull();
+    expect((await getSession(session.id))!.last_active).not.toBeNull();
   });
 
   it('should refuse path-traversal in attachment filenames', async () => {
@@ -413,7 +413,7 @@ describe('session manager', () => {
     // chat platforms can't sanitize it server-side). Without the guard, a
     // `../../../tmp/pwned` filename escapes the inbox dir and writes anywhere
     // the host process can reach.
-    const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
+    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
     const inboxBase = path.join(sessionDir('ag-1', session.id), 'inbox');
     // Per-process canary: the traversal target is outside DATA_DIR by
     // construction, so a fixed name would be shared with any concurrent run.
@@ -450,8 +450,8 @@ describe('session manager', () => {
 });
 
 describe('router', () => {
-  beforeEach(() => {
-    createAgentGroup({
+  beforeEach(async () => {
+    await createAgentGroup({
       id: 'ag-1',
       name: 'Test Agent',
       folder: 'test-agent',
@@ -460,7 +460,7 @@ describe('router', () => {
     });
     // Use 'public' policy so the router tests exercise routing, not the
     // access gate. Dedicated access-gate tests live with the access module.
-    createMessagingGroup({
+    await createMessagingGroup({
       id: 'mg-1',
       channel_type: 'discord',
       platform_id: 'chan-123',
@@ -506,7 +506,7 @@ describe('router', () => {
     await routeInbound(event);
 
     // Verify session was created
-    const session = findSession('mg-1', null);
+    const session = await findSession('mg-1', null);
     expect(session).toBeDefined();
 
     // Verify message was written to inbound DB
@@ -542,7 +542,7 @@ describe('router', () => {
         timestamp: now(),
       },
     });
-    expect(getMessagingGroupByPlatform('slack', 'C-PLAIN')).toBeUndefined();
+    expect(await getMessagingGroupByPlatform('slack', 'C-PLAIN')).toBeUndefined();
 
     // Mention on unknown channel — SHOULD auto-create (next step: channel-registration flow).
     await routeInbound({
@@ -557,7 +557,7 @@ describe('router', () => {
         isMention: true,
       },
     });
-    expect(getMessagingGroupByPlatform('slack', 'C-MENTIONED')).toBeDefined();
+    expect(await getMessagingGroupByPlatform('slack', 'C-MENTIONED')).toBeDefined();
   });
 
   it('should route multiple messages to the same session', async () => {
@@ -583,7 +583,7 @@ describe('router', () => {
     });
 
     // Both should be in the same session
-    const session = findSession('mg-1', null);
+    const session = await findSession('mg-1', null);
     const dbPath = inboundDbPath('ag-1', session!.id);
     const db = new Database(dbPath);
     const rows = readPairedInboundTriggers(db);
@@ -598,7 +598,7 @@ describe('router', () => {
     (wakeContainer as unknown as ReturnType<typeof vi.fn>).mockClear();
 
     // Wire a second agent to the same messaging group.
-    createAgentGroup({
+    await createAgentGroup({
       id: 'ag-2',
       name: 'Secondary Agent',
       folder: 'secondary-agent',
@@ -635,8 +635,8 @@ describe('router', () => {
     expect(wakeContainer).toHaveBeenCalledTimes(2);
 
     const { getSessionsByAgentGroup } = await import('./db/sessions.js');
-    expect(getSessionsByAgentGroup('ag-1')).toHaveLength(1);
-    expect(getSessionsByAgentGroup('ag-2')).toHaveLength(1);
+    expect(await getSessionsByAgentGroup('ag-1')).toHaveLength(1);
+    expect(await getSessionsByAgentGroup('ag-2')).toHaveLength(1);
   });
 
   it('accumulates without waking when engage fails + ignored_message_policy=accumulate', async () => {
@@ -647,7 +647,7 @@ describe('router', () => {
     // Replace the seed row with a mention-only wiring whose accumulate
     // policy should store context even when the message doesn't mention us.
     const { updateMessagingGroupAgent } = await import('./db/messaging-groups.js');
-    updateMessagingGroupAgent('mga-1', {
+    await updateMessagingGroupAgent('mga-1', {
       engage_mode: 'mention',
       ignored_message_policy: 'accumulate',
     });
@@ -666,7 +666,7 @@ describe('router', () => {
 
     expect(wakeContainer).not.toHaveBeenCalled();
 
-    const session = findSession('mg-1', null);
+    const session = await findSession('mg-1', null);
     expect(session).toBeDefined();
     const db = new Database(inboundDbPath('ag-1', session!.id));
     const rows = db.prepare('SELECT id, kind, trigger FROM messages_in ORDER BY seq').all() as Array<{
@@ -687,7 +687,7 @@ describe('router', () => {
     (wakeContainer as unknown as ReturnType<typeof vi.fn>).mockClear();
 
     const { updateMessagingGroupAgent } = await import('./db/messaging-groups.js');
-    updateMessagingGroupAgent('mga-1', { engage_mode: 'mention' }); // drop is the default
+    await updateMessagingGroupAgent('mga-1', { engage_mode: 'mention' }); // drop is the default
 
     await routeInbound({
       channelType: 'discord',
@@ -698,20 +698,20 @@ describe('router', () => {
 
     expect(wakeContainer).not.toHaveBeenCalled();
     // No session should have been created for this agent.
-    expect(findSession('mg-1', null)).toBeUndefined();
+    expect(await findSession('mg-1', null)).toBeUndefined();
   });
 });
 
 describe('router — channel instances', () => {
-  beforeEach(() => {
-    createAgentGroup({
+  beforeEach(async () => {
+    await createAgentGroup({
       id: 'ag-1',
       name: 'Default Bot',
       folder: 'default-bot',
       agent_provider: null,
       created_at: now(),
     });
-    createAgentGroup({
+    await createAgentGroup({
       id: 'ag-2',
       name: 'Tester Bot',
       folder: 'tester-bot',
@@ -720,7 +720,7 @@ describe('router — channel instances', () => {
     });
     // Two messaging groups on the SAME (channel_type, platform_id), owned
     // by different adapter instances and wired to different agents.
-    createMessagingGroup({
+    await createMessagingGroup({
       id: 'mg-default',
       channel_type: 'slack',
       platform_id: 'slack:C1',
@@ -729,7 +729,7 @@ describe('router — channel instances', () => {
       unknown_sender_policy: 'public',
       created_at: now(),
     });
-    createMessagingGroup({
+    await createMessagingGroup({
       id: 'mg-tester',
       channel_type: 'slack',
       platform_id: 'slack:C1',
@@ -809,10 +809,10 @@ describe('router — channel instances', () => {
         },
       });
 
-      const testerSessions = getSessionsByAgentGroup('ag-2');
+      const testerSessions = await getSessionsByAgentGroup('ag-2');
       expect(testerSessions).toHaveLength(1);
       expect(testerSessions[0].messaging_group_id).toBe('mg-tester');
-      expect(getSessionsByAgentGroup('ag-1')).toHaveLength(0);
+      expect(await getSessionsByAgentGroup('ag-1')).toHaveLength(0);
 
       const tDb = new Database(inboundDbPath('ag-2', testerSessions[0].id));
       const [tRow] = readPairedInboundTriggers(tDb);
@@ -835,7 +835,7 @@ describe('router — channel instances', () => {
         },
       });
 
-      const defaultSessions = getSessionsByAgentGroup('ag-1');
+      const defaultSessions = await getSessionsByAgentGroup('ag-1');
       expect(defaultSessions).toHaveLength(1);
       expect(defaultSessions[0].messaging_group_id).toBe('mg-default');
       const dDb = new Database(inboundDbPath('ag-1', defaultSessions[0].id));
@@ -853,7 +853,7 @@ describe('router — channel instances', () => {
 
     // No row exists for this address on ANY instance yet; create an
     // unwired default row to prove the named event doesn't reuse it.
-    createMessagingGroup({
+    await createMessagingGroup({
       id: 'mg-plain',
       channel_type: 'slack',
       platform_id: 'slack:C-NEW',
@@ -877,12 +877,12 @@ describe('router — channel instances', () => {
       },
     });
 
-    const created = getMessagingGroupByPlatform('slack', 'slack:C-NEW', 'slack-tester');
+    const created = await getMessagingGroupByPlatform('slack', 'slack:C-NEW', 'slack-tester');
     expect(created).toBeDefined();
     expect(created!.instance).toBe('slack-tester');
     expect(created!.id).not.toBe('mg-plain');
     // The default row is untouched.
-    expect(getMessagingGroupByPlatform('slack', 'slack:C-NEW', 'slack')!.id).toBe('mg-plain');
+    expect((await getMessagingGroupByPlatform('slack', 'slack:C-NEW', 'slack'))!.id).toBe('mg-plain');
   });
 });
 
@@ -901,15 +901,15 @@ describe('router — per-wiring thread policy', () => {
     },
   });
 
-  beforeEach(() => {
-    createAgentGroup({
+  beforeEach(async () => {
+    await createAgentGroup({
       id: 'ag-tp',
       name: 'Thread Agent',
       folder: 'thread-agent',
       agent_provider: null,
       created_at: now(),
     });
-    createMessagingGroup({
+    await createMessagingGroup({
       id: 'mg-tp',
       channel_type: 'tp-slack',
       platform_id: 'tp:C1',
@@ -976,7 +976,7 @@ describe('router — per-wiring thread policy', () => {
       // threads=NULL inherits the (fallback) declaration → supportsThreads →
       // per-thread session with the platform thread id, message addressed
       // in-thread. Identical to pre-declaration routing.
-      const sessions = getSessionsByAgentGroup('ag-tp');
+      const sessions = await getSessionsByAgentGroup('ag-tp');
       expect(sessions).toHaveLength(1);
       expect(sessions[0].thread_id).toBe('thread-42');
 
@@ -998,7 +998,7 @@ describe('router — per-wiring thread policy', () => {
 
       // Session collapses (no per-thread force, thread id stripped) and the
       // reply address is top-level.
-      const sessions = getSessionsByAgentGroup('ag-tp');
+      const sessions = await getSessionsByAgentGroup('ag-tp');
       expect(sessions).toHaveLength(1);
       expect(sessions[0].thread_id).toBeNull();
 
@@ -1021,7 +1021,7 @@ describe('router — per-wiring thread policy', () => {
         replyTo: { channelType: 'cli', platformId: 'cli:operator', threadId: 'term-1' },
       });
 
-      const sessions = getSessionsByAgentGroup('ag-tp');
+      const sessions = await getSessionsByAgentGroup('ag-tp');
       expect(sessions).toHaveLength(1);
       const db = new Database(inboundDbPath('ag-tp', sessions[0].id));
       const [row] = readPairedInboundTriggers(db);
@@ -1064,16 +1064,16 @@ describe('router — per-wiring thread policy', () => {
 
     // Declared adapter: group context reads the group declaration...
     await routeInbound(mention('tp-declared', 'tp:G1', true));
-    expect(getMessagingGroupByPlatform('tp-declared', 'tp:G1')!.unknown_sender_policy).toBe('public');
+    expect((await getMessagingGroupByPlatform('tp-declared', 'tp:G1'))!.unknown_sender_policy).toBe('public');
 
     // ...and DM context reads the dm declaration.
     await routeInbound(mention('tp-declared', 'tp:D1', false));
-    expect(getMessagingGroupByPlatform('tp-declared', 'tp:D1')!.unknown_sender_policy).toBe('strict');
+    expect((await getMessagingGroupByPlatform('tp-declared', 'tp:D1'))!.unknown_sender_policy).toBe('strict');
 
     // Undeclared channel — fork policy: public-by-default (sibling gate +
     // auto-wire flow, 2026-05-13), NOT upstream's 'request_approval' fallback.
     await routeInbound(mention('tp-undeclared', 'tp:U1', true));
-    expect(getMessagingGroupByPlatform('tp-undeclared', 'tp:U1')!.unknown_sender_policy).toBe('public');
+    expect((await getMessagingGroupByPlatform('tp-undeclared', 'tp:U1'))!.unknown_sender_policy).toBe('public');
   });
 
   it('workspace-trust auto-wire resolves and persists the channel name', async () => {
@@ -1085,7 +1085,7 @@ describe('router — per-wiring thread policy', () => {
     // An existing wiring in the same workspace is what lets a new channel
     // inherit without an approval card — that is the path that used to skip
     // the name lookup the approval path always did.
-    createMessagingGroup({
+    await createMessagingGroup({
       id: 'mg-ws-seed',
       channel_type: 'slack-testws',
       platform_id: 'slack:C-SEED',
@@ -1150,7 +1150,7 @@ describe('router — per-wiring thread policy', () => {
       // Before the fix this stayed null forever: the row was invisible to any
       // name-keyed roster query, and the agent's own pre-turn context could
       // not name the room it had just been wired into.
-      expect(getMessagingGroupByPlatform('slack-testws', 'slack:C-NEW')!.name).toBe('#dispatch');
+      expect((await getMessagingGroupByPlatform('slack-testws', 'slack:C-NEW'))!.name).toBe('#dispatch');
     } finally {
       await teardownChannelAdapters();
     }
@@ -1159,14 +1159,14 @@ describe('router — per-wiring thread policy', () => {
 
 describe('routing metadata preservation', () => {
   beforeEach(async () => {
-    createAgentGroup({
+    await createAgentGroup({
       id: 'ag-1',
       name: 'Test Agent',
       folder: 'test-agent',
       agent_provider: null,
       created_at: now(),
     });
-    createMessagingGroup({
+    await createMessagingGroup({
       id: 'mg-1',
       channel_type: 'discord',
       platform_id: 'chan-123',
@@ -1232,7 +1232,7 @@ describe('routing metadata preservation', () => {
     });
 
     // Threaded adapter in a group chat forces a per-thread session.
-    const session = findSession('mg-1', 'thread-42');
+    const session = await findSession('mg-1', 'thread-42');
     const db = new Database(inboundDbPath('ag-1', session!.id));
     const row = readPairedInboundTriggers(db).find((candidate) => candidate.id.startsWith('msg-r1'));
     db.close();
@@ -1245,7 +1245,7 @@ describe('routing metadata preservation', () => {
   it('fan-out gives each agent its own routing, not leaked from sibling', async () => {
     const { routeInbound } = await import('./router.js');
 
-    createAgentGroup({
+    await createAgentGroup({
       id: 'ag-2',
       name: 'Agent Two',
       folder: 'agent-two',
@@ -1281,7 +1281,7 @@ describe('routing metadata preservation', () => {
     // Both agents should have the message with correct routing
     const { getSessionsByAgentGroup } = await import('./db/sessions.js');
     for (const agId of ['ag-1', 'ag-2']) {
-      const sessions = getSessionsByAgentGroup(agId);
+      const sessions = await getSessionsByAgentGroup(agId);
       expect(sessions).toHaveLength(1);
       const db = new Database(inboundDbPath(agId, sessions[0].id));
       const [row] = readPairedInboundTriggers(db);
@@ -1295,14 +1295,14 @@ describe('routing metadata preservation', () => {
 
 describe('writeSessionRouting', () => {
   it('populates session_routing from the messaging group', async () => {
-    createAgentGroup({
+    await createAgentGroup({
       id: 'ag-1',
       name: 'Agent',
       folder: 'agent',
       agent_provider: null,
       created_at: now(),
     });
-    createMessagingGroup({
+    await createMessagingGroup({
       id: 'mg-1',
       channel_type: 'telegram',
       platform_id: 'tg:12345',
@@ -1312,7 +1312,7 @@ describe('writeSessionRouting', () => {
       created_at: now(),
     });
 
-    const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
+    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
     await writeSessionRouting('ag-1', session.id);
 
     const db = new Database(inboundDbPath('ag-1', session.id));
@@ -1332,7 +1332,7 @@ describe('writeSessionRouting', () => {
   });
 
   it('writes null routing for agent-shared session (no messaging group)', async () => {
-    createAgentGroup({
+    await createAgentGroup({
       id: 'ag-1',
       name: 'Agent',
       folder: 'agent',
@@ -1340,7 +1340,7 @@ describe('writeSessionRouting', () => {
       created_at: now(),
     });
 
-    const { session } = resolveSession('ag-1', null, null, 'agent-shared');
+    const { session } = await resolveSession('ag-1', null, null, 'agent-shared');
     await writeSessionRouting('ag-1', session.id);
 
     const db = new Database(inboundDbPath('ag-1', session.id));
@@ -1360,14 +1360,14 @@ describe('writeSessionRouting', () => {
   });
 
   it('includes thread_id from per-thread session', async () => {
-    createAgentGroup({
+    await createAgentGroup({
       id: 'ag-1',
       name: 'Agent',
       folder: 'agent',
       agent_provider: null,
       created_at: now(),
     });
-    createMessagingGroup({
+    await createMessagingGroup({
       id: 'mg-1',
       channel_type: 'discord',
       platform_id: 'chan-123',
@@ -1377,7 +1377,7 @@ describe('writeSessionRouting', () => {
       created_at: now(),
     });
 
-    const { session } = resolveSession('ag-1', 'mg-1', 'thread-77', 'per-thread');
+    const { session } = await resolveSession('ag-1', 'mg-1', 'thread-77', 'per-thread');
     await writeSessionRouting('ag-1', session.id);
 
     const db = new Database(inboundDbPath('ag-1', session.id));
@@ -1397,14 +1397,14 @@ describe('writeSessionRouting', () => {
   });
 
   it('test_writeSessionRouting_writes_session_id', async () => {
-    createAgentGroup({
+    await createAgentGroup({
       id: 'ag-1',
       name: 'Agent',
       folder: 'agent',
       agent_provider: null,
       created_at: now(),
     });
-    createMessagingGroup({
+    await createMessagingGroup({
       id: 'mg-1',
       channel_type: 'telegram',
       platform_id: 'tg:99',
@@ -1414,7 +1414,7 @@ describe('writeSessionRouting', () => {
       created_at: now(),
     });
 
-    const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
+    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
     await writeSessionRouting('ag-1', session.id);
 
     const db = new Database(inboundDbPath('ag-1', session.id));
@@ -1437,14 +1437,14 @@ describe('writeSessionRouting', () => {
    * fix resolves inside the callback, where nothing yields before the upsert.
    */
   it('stamps the route the session has at the write, not the one read on entry', async () => {
-    createAgentGroup({
+    await createAgentGroup({
       id: 'ag-1',
       name: 'Agent',
       folder: 'agent',
       agent_provider: null,
       created_at: now(),
     });
-    createMessagingGroup({
+    await createMessagingGroup({
       id: 'mg-before',
       channel_type: 'telegram',
       platform_id: 'tg:before',
@@ -1453,7 +1453,7 @@ describe('writeSessionRouting', () => {
       unknown_sender_policy: 'public',
       created_at: now(),
     });
-    createMessagingGroup({
+    await createMessagingGroup({
       id: 'mg-after',
       channel_type: 'discord',
       platform_id: 'chan-after',
@@ -1463,7 +1463,7 @@ describe('writeSessionRouting', () => {
       created_at: now(),
     });
 
-    const { session } = resolveSession('ag-1', 'mg-before', null, 'shared');
+    const { session } = await resolveSession('ag-1', 'mg-before', null, 'shared');
 
     // The rewire lands inside the funnel's await, after the route has been
     // read once and before the row is written.
@@ -1489,7 +1489,7 @@ describe('writeSessionRouting', () => {
 
 describe('agent-shared session resolution', () => {
   it('resolves to the same session on repeated calls', async () => {
-    createAgentGroup({
+    await createAgentGroup({
       id: 'ag-1',
       name: 'Agent',
       folder: 'agent',
@@ -1497,8 +1497,8 @@ describe('agent-shared session resolution', () => {
       created_at: now(),
     });
 
-    const { session: s1, created: c1 } = resolveSession('ag-1', null, null, 'agent-shared');
-    const { session: s2, created: c2 } = resolveSession('ag-1', null, null, 'agent-shared');
+    const { session: s1, created: c1 } = await resolveSession('ag-1', null, null, 'agent-shared');
+    const { session: s2, created: c2 } = await resolveSession('ag-1', null, null, 'agent-shared');
 
     expect(c1).toBe(true);
     expect(c2).toBe(false);
@@ -1506,7 +1506,7 @@ describe('agent-shared session resolution', () => {
   });
 
   it('agent-shared session has null messaging_group_id', async () => {
-    createAgentGroup({
+    await createAgentGroup({
       id: 'ag-1',
       name: 'Agent',
       folder: 'agent',
@@ -1514,7 +1514,7 @@ describe('agent-shared session resolution', () => {
       created_at: now(),
     });
 
-    const { session } = resolveSession('ag-1', null, null, 'agent-shared');
+    const { session } = await resolveSession('ag-1', null, null, 'agent-shared');
     expect(session.messaging_group_id).toBeNull();
   });
 
@@ -1525,8 +1525,8 @@ describe('agent-shared session resolution', () => {
     // can't re-find it on subsequent calls AND the session ends up bound
     // to whichever chat happened to create it first, breaking the
     // "one session shared across all messaging groups" semantic.
-    createAgentGroup({ id: 'ag-1', name: 'Agent', folder: 'agent', agent_provider: null, created_at: now() });
-    createMessagingGroup({
+    await createAgentGroup({ id: 'ag-1', name: 'Agent', folder: 'agent', agent_provider: null, created_at: now() });
+    await createMessagingGroup({
       id: 'mg-x',
       channel_type: 'discord',
       platform_id: 'chan-x',
@@ -1536,13 +1536,13 @@ describe('agent-shared session resolution', () => {
       created_at: now(),
     });
 
-    const { session, created } = resolveSession('ag-1', 'mg-x', null, 'agent-shared');
+    const { session, created } = await resolveSession('ag-1', 'mg-x', null, 'agent-shared');
     expect(created).toBe(true);
     expect(session.messaging_group_id).toBeNull();
 
     // Subsequent calls from a *different* mg should hit the same session,
     // not a fresh one — that's the whole point of agent-shared.
-    createMessagingGroup({
+    await createMessagingGroup({
       id: 'mg-y',
       channel_type: 'discord',
       platform_id: 'chan-y',
@@ -1551,7 +1551,7 @@ describe('agent-shared session resolution', () => {
       unknown_sender_policy: 'public',
       created_at: now(),
     });
-    const { session: second, created: created2 } = resolveSession('ag-1', 'mg-y', null, 'agent-shared');
+    const { session: second, created: created2 } = await resolveSession('ag-1', 'mg-y', null, 'agent-shared');
     expect(created2).toBe(false);
     expect(second.id).toBe(session.id);
   });
@@ -1561,8 +1561,8 @@ describe('agent-shared session resolution', () => {
     // regardless of mg, so an existing mg-bound session would be reused
     // as the "agent-shared" session — leaking a foreign-mg context to a
     // caller that explicitly asked for agent-shared. Fix: filter mg=null.
-    createAgentGroup({ id: 'ag-1', name: 'Agent', folder: 'agent', agent_provider: null, created_at: now() });
-    createMessagingGroup({
+    await createAgentGroup({ id: 'ag-1', name: 'Agent', folder: 'agent', agent_provider: null, created_at: now() });
+    await createMessagingGroup({
       id: 'mg-bound',
       channel_type: 'discord',
       platform_id: 'chan-b',
@@ -1573,12 +1573,12 @@ describe('agent-shared session resolution', () => {
     });
 
     // Create a per-thread (mg-bound) session FIRST.
-    const { session: bound } = resolveSession('ag-1', 'mg-bound', null, 'shared');
+    const { session: bound } = await resolveSession('ag-1', 'mg-bound', null, 'shared');
     expect(bound.messaging_group_id).toBe('mg-bound');
 
     // Now an agent-shared call should NOT return the mg-bound session —
     // it should create a fresh mg=null session.
-    const { session: shared, created } = resolveSession('ag-1', null, null, 'agent-shared');
+    const { session: shared, created } = await resolveSession('ag-1', null, null, 'agent-shared');
     expect(created).toBe(true);
     expect(shared.id).not.toBe(bound.id);
     expect(shared.messaging_group_id).toBeNull();
@@ -1586,15 +1586,15 @@ describe('agent-shared session resolution', () => {
 });
 
 describe('agent-to-agent routing', () => {
-  beforeEach(() => {
-    createAgentGroup({
+  beforeEach(async () => {
+    await createAgentGroup({
       id: 'ag-pa',
       name: 'PA',
       folder: 'pa-agent',
       agent_provider: null,
       created_at: now(),
     });
-    createMessagingGroup({
+    await createMessagingGroup({
       id: 'mg-slack',
       channel_type: 'slack',
       platform_id: 'C-GENERAL',
@@ -1603,7 +1603,7 @@ describe('agent-to-agent routing', () => {
       unknown_sender_policy: 'public',
       created_at: now(),
     });
-    createAgentGroup({
+    await createAgentGroup({
       id: 'ag-researcher',
       name: 'Researcher',
       folder: 'researcher-agent',
@@ -1626,7 +1626,7 @@ describe('agent-to-agent routing', () => {
   it('A2A outbound lands in a session for the target agent', async () => {
     const { routeAgentMessage } = await import('./modules/agent-to-agent/agent-route.js');
 
-    const { session: paSlackSession } = resolveSession('ag-pa', 'mg-slack', null, 'shared');
+    const { session: paSlackSession } = await resolveSession('ag-pa', 'mg-slack', null, 'shared');
 
     await routeAgentMessage(
       {
@@ -1639,7 +1639,7 @@ describe('agent-to-agent routing', () => {
     );
 
     const { getSessionsByAgentGroup } = await import('./db/sessions.js');
-    const researcherSessions = getSessionsByAgentGroup('ag-researcher');
+    const researcherSessions = await getSessionsByAgentGroup('ag-researcher');
     expect(researcherSessions.length).toBeGreaterThanOrEqual(1);
 
     const rDb = new Database(inboundDbPath('ag-researcher', researcherSessions[0].id));
@@ -1681,9 +1681,9 @@ describe('agent-to-agent routing', () => {
       instructions_profile: null,
       created_at: now(),
     });
-    const { session: paSlackSession } = resolveSession('ag-pa', 'mg-slack', null, 'shared');
+    const { session: paSlackSession } = await resolveSession('ag-pa', 'mg-slack', null, 'shared');
 
-    createMessagingGroup({
+    await createMessagingGroup({
       id: 'mg-discord',
       channel_type: 'discord',
       platform_id: 'chan-discord',
@@ -1708,7 +1708,7 @@ describe('agent-to-agent routing', () => {
       instructions_profile: null,
       created_at: now(),
     });
-    const { session: paDiscordSession } = resolveSession('ag-pa', 'mg-discord', null, 'shared');
+    const { session: paDiscordSession } = await resolveSession('ag-pa', 'mg-discord', null, 'shared');
 
     // PA sends from Slack
     await routeAgentMessage(
@@ -1718,7 +1718,7 @@ describe('agent-to-agent routing', () => {
 
     // Researcher responds back to PA
     const { getSessionsByAgentGroup } = await import('./db/sessions.js');
-    const researcherSession = getSessionsByAgentGroup('ag-researcher')[0];
+    const researcherSession = (await getSessionsByAgentGroup('ag-researcher'))[0];
 
     await routeAgentMessage(
       { id: 'out-reply', platform_id: 'ag-pa', content: JSON.stringify({ text: 'found it' }), in_reply_to: null },
@@ -1743,14 +1743,14 @@ describe('agent-to-agent routing', () => {
     // writeSessionRouting writes nulls because messaging_group_id is null.
     const { routeAgentMessage } = await import('./modules/agent-to-agent/agent-route.js');
 
-    const { session: paSession } = resolveSession('ag-pa', 'mg-slack', null, 'shared');
+    const { session: paSession } = await resolveSession('ag-pa', 'mg-slack', null, 'shared');
     await routeAgentMessage(
       { id: 'out-1', platform_id: 'ag-researcher', content: JSON.stringify({ text: 'go' }), in_reply_to: null },
       paSession,
     );
 
     const { getSessionsByAgentGroup } = await import('./db/sessions.js');
-    const researcherSessions = getSessionsByAgentGroup('ag-researcher');
+    const researcherSessions = await getSessionsByAgentGroup('ag-researcher');
     expect(researcherSessions).toHaveLength(1);
 
     await writeSessionRouting('ag-researcher', researcherSessions[0].id);
@@ -1773,14 +1773,14 @@ describe('agent-to-agent routing', () => {
 
 describe('delivery', () => {
   it('should detect undelivered messages in outbound DB', async () => {
-    createAgentGroup({
+    await createAgentGroup({
       id: 'ag-1',
       name: 'Agent',
       folder: 'agent',
       agent_provider: null,
       created_at: now(),
     });
-    createMessagingGroup({
+    await createMessagingGroup({
       id: 'mg-test',
       channel_type: 'discord',
       platform_id: 'chan-test',
@@ -1790,7 +1790,7 @@ describe('delivery', () => {
       created_at: now(),
     });
 
-    const { session } = resolveSession('ag-1', 'mg-test', null, 'shared');
+    const { session } = await resolveSession('ag-1', 'mg-test', null, 'shared');
 
     // Write a response to the outbound DB (simulating what the agent-runner does)
     const dbPath = outboundDbPath('ag-1', session.id);

@@ -37,15 +37,21 @@ async function setupDb(): Promise<void> {
   runMigrations(db);
 }
 
-function seedGroups(): void {
-  createAgentGroup({
+async function seedGroups(): Promise<void> {
+  await createAgentGroup({
     id: 'ag-parent',
     name: 'ag-parent',
     folder: 'ag-parent',
     agent_provider: null,
     created_at: now(),
   });
-  createAgentGroup({ id: 'ag-child', name: 'ag-child', folder: 'ag-child', agent_provider: null, created_at: now() });
+  await createAgentGroup({
+    id: 'ag-child',
+    name: 'ag-child',
+    folder: 'ag-child',
+    agent_provider: null,
+    created_at: now(),
+  });
   getRawDb()
     .prepare(`INSERT INTO sessions (id, agent_group_id, created_at) VALUES (?, ?, ?)`)
     .run('sess-parent', 'ag-parent', now());
@@ -165,7 +171,7 @@ afterEach(async () => {
 describe('applySpawnCancel', () => {
   it('test_cancel_parent_session_id_required: other orchestrator cannot cancel', async () => {
     await setupDb();
-    seedGroups();
+    await seedGroups();
     makeRunningTask();
 
     await applySpawnCancel({ task_id: 'task-1' }, makeOtherOrchestratorSession());
@@ -179,11 +185,11 @@ describe('applySpawnCancel', () => {
 
   it('cancel pending task transitions to cancelled, no child envelope', async () => {
     await setupDb();
-    seedGroups();
+    await seedGroups();
     makePendingTask();
 
     const { getSession } = await import('../../db/sessions.js');
-    vi.mocked(getSession).mockImplementation((id: string) => {
+    vi.mocked(getSession).mockImplementation(async (id: string) => {
       if (id === 'sess-parent') return makeParentSession();
       return undefined;
     });
@@ -205,13 +211,13 @@ describe('applySpawnCancel', () => {
 
   it('test_cancel_running_writes_envelope_and_arms_kill: running task gets cancel envelope + 2-min timer', async () => {
     await setupDb();
-    seedGroups();
+    await seedGroups();
     makeRunningTask();
 
     vi.useFakeTimers();
 
     const { getSession } = await import('../../db/sessions.js');
-    vi.mocked(getSession).mockImplementation((id: string) => {
+    vi.mocked(getSession).mockImplementation(async (id: string) => {
       if (id === 'sess-child') return makeChildSession();
       if (id === 'sess-parent') return makeParentSession();
       return undefined;
@@ -243,13 +249,13 @@ describe('applySpawnCancel', () => {
 
   it('test_cancel_envelope_format: envelope has correct JSON structure', async () => {
     await setupDb();
-    seedGroups();
+    await seedGroups();
     makeRunningTask();
 
     vi.useFakeTimers();
 
     const { getSession } = await import('../../db/sessions.js');
-    vi.mocked(getSession).mockImplementation((id: string) => {
+    vi.mocked(getSession).mockImplementation(async (id: string) => {
       if (id === 'sess-child') return makeChildSession();
       if (id === 'sess-parent') return makeParentSession();
       return undefined;
@@ -271,13 +277,13 @@ describe('applySpawnCancel', () => {
 
   it('ASSERT: 2-min timer calls killContainer regardless of agent acknowledgement', async () => {
     await setupDb();
-    seedGroups();
+    await seedGroups();
     makeRunningTask();
 
     vi.useFakeTimers();
 
     const { getSession } = await import('../../db/sessions.js');
-    vi.mocked(getSession).mockImplementation((id: string) => {
+    vi.mocked(getSession).mockImplementation(async (id: string) => {
       if (id === 'sess-child') return makeChildSession();
       if (id === 'sess-parent') return makeParentSession();
       return undefined;

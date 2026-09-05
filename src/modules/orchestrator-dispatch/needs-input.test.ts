@@ -33,15 +33,21 @@ async function setupDb(): Promise<void> {
   runMigrations(db);
 }
 
-function seedGroups(): void {
-  createAgentGroup({
+async function seedGroups(): Promise<void> {
+  await createAgentGroup({
     id: 'ag-parent',
     name: 'ag-parent',
     folder: 'ag-parent',
     agent_provider: null,
     created_at: now(),
   });
-  createAgentGroup({ id: 'ag-child', name: 'ag-child', folder: 'ag-child', agent_provider: null, created_at: now() });
+  await createAgentGroup({
+    id: 'ag-child',
+    name: 'ag-child',
+    folder: 'ag-child',
+    agent_provider: null,
+    created_at: now(),
+  });
   getRawDb()
     .prepare(
       `INSERT INTO messaging_groups (id, channel_type, platform_id, instance, name, is_group, unknown_sender_policy, created_at)
@@ -141,7 +147,7 @@ afterEach(async () => {
 describe('applySpawnNeedsInput', () => {
   it('flips needs_input and stores question on a running task', async () => {
     await setupDb();
-    seedGroups();
+    await seedGroups();
     makeTask();
 
     await applySpawnNeedsInput({ task_id: 'task-1', question: 'Repo path A or B?' }, makeChildSession());
@@ -153,7 +159,7 @@ describe('applySpawnNeedsInput', () => {
 
   it('truncates question to 500 chars', async () => {
     await setupDb();
-    seedGroups();
+    await seedGroups();
     makeTask();
 
     await applySpawnNeedsInput({ task_id: 'task-1', question: 'X'.repeat(1000) }, makeChildSession());
@@ -164,7 +170,7 @@ describe('applySpawnNeedsInput', () => {
 
   it('accepts no question and leaves steer_question null', async () => {
     await setupDb();
-    seedGroups();
+    await seedGroups();
     makeTask();
 
     await applySpawnNeedsInput({ task_id: 'task-1' }, makeChildSession());
@@ -176,7 +182,7 @@ describe('applySpawnNeedsInput', () => {
 
   it('does not flip on a terminal task (completed)', async () => {
     await setupDb();
-    seedGroups();
+    await seedGroups();
     makeTask();
     getRawDb().prepare(`UPDATE tasks SET status = 'completed' WHERE task_id = 'task-1'`).run();
 
@@ -189,7 +195,7 @@ describe('applySpawnNeedsInput', () => {
 
   it('silently skips on auth mismatch (wrong child_session)', async () => {
     await setupDb();
-    seedGroups();
+    await seedGroups();
     makeTask();
 
     await expect(
@@ -202,13 +208,13 @@ describe('applySpawnNeedsInput', () => {
 
   it('silently skips when task_id missing', async () => {
     await setupDb();
-    seedGroups();
+    await seedGroups();
     await expect(applySpawnNeedsInput({ question: 'x' }, makeChildSession())).resolves.not.toThrow();
   });
 
   it('posts into the task thread via the channel adapter when the flag flips', async () => {
     await setupDb();
-    seedGroups();
+    await seedGroups();
     makeTask();
     await stubChildMgPresent();
 
@@ -224,7 +230,7 @@ describe('applySpawnNeedsInput', () => {
 
   it('does not double-notify when worker re-asks with the same question', async () => {
     await setupDb();
-    seedGroups();
+    await seedGroups();
     makeTask();
     await stubChildMgPresent();
 
@@ -236,7 +242,7 @@ describe('applySpawnNeedsInput', () => {
 
   it('re-notifies when the question text changes', async () => {
     await setupDb();
-    seedGroups();
+    await seedGroups();
     makeTask();
     await stubChildMgPresent();
 
@@ -248,7 +254,7 @@ describe('applySpawnNeedsInput', () => {
 
   it('skips the adapter post for headless tasks but still flips the row', async () => {
     await setupDb();
-    seedGroups();
+    await seedGroups();
     makeTask({ surface_mode: 'headless', child_platform_thread_id: null, child_messaging_group_id: null });
     await stubChildMgPresent();
 
@@ -261,7 +267,7 @@ describe('applySpawnNeedsInput', () => {
 
   it('skips the adapter post when the messaging group is gone', async () => {
     await setupDb();
-    seedGroups();
+    await seedGroups();
     makeTask();
     const { getMessagingGroup } = await import('../../db/messaging-groups.js');
     vi.mocked(getMessagingGroup).mockReturnValue(undefined);

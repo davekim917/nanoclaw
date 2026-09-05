@@ -82,7 +82,7 @@ beforeEach(async () => {
   const db = getRawDb();
   runMigrations(db);
 
-  createAgentGroup({
+  await createAgentGroup({
     id: AGENT_GROUP_ID,
     name: 'Dest Agent',
     folder: 'dest-agent',
@@ -93,7 +93,7 @@ beforeEach(async () => {
     ['mg-keep', 'slack:C-KEEP', 'Keep'],
     ['mg-revoked', 'slack:C-REVOKED', 'Revoked'],
   ] as const) {
-    createMessagingGroup({
+    await createMessagingGroup({
       id,
       channel_type: 'slack',
       platform_id: platformId,

@@ -26,7 +26,7 @@ export async function handleProviderUnavailable(content: Record<string, unknown>
     log.warn('provider_unavailable: rejected — missing provider', { sessionId: session.id });
     return;
   }
-  const agentGroup = getAgentGroup(session.agent_group_id);
+  const agentGroup = await getAgentGroup(session.agent_group_id);
   if (!agentGroup) return;
 
   // Only act when the group actually declares a fallback. Without one there
@@ -83,8 +83,8 @@ export async function handleProviderUnavailable(content: Record<string, unknown>
   // failed, so the fresh container answers it on the fallback provider —
   // session-scoped on purpose: one exhausted account must not bounce every
   // live container in the group.
-  killContainer(session.id, 'provider quota exhausted — respawning on fallback', () => {
-    const fresh = getSession(session.id);
+  killContainer(session.id, 'provider quota exhausted — respawning on fallback', async () => {
+    const fresh = await getSession(session.id);
     if (fresh) void wakeContainer(fresh);
   });
 }

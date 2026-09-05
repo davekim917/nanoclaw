@@ -567,7 +567,7 @@ describe('scheduleTask invalidates the quiet mark in the same turn as the task-r
 
     const sessionId = taskSessionIdFor('s-interleave');
     expect(basis, 'the invalidation never ran, so the flush below proves nothing').toHaveLength(1);
-    sessionsModule.persistQuietSessionMarks([
+    await sessionsModule.persistQuietSessionMarks([
       { sessionId, quietUntil: '2099-01-01T00:00:00.000Z', lastActive: basis[0]! },
     ]);
 

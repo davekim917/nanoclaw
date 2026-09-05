@@ -88,7 +88,7 @@ function personaSymlinkRoots(group: AgentGroup, groupDir: string): string[] {
   }
 }
 
-export function composeGroupClaudeMd(group: AgentGroup, provider: string): void {
+export async function composeGroupClaudeMd(group: AgentGroup, provider: string): Promise<void> {
   const groupDir = path.resolve(GROUPS_DIR, group.folder);
   if (!fs.existsSync(groupDir)) {
     fs.mkdirSync(groupDir, { recursive: true });
@@ -104,7 +104,7 @@ export function composeGroupClaudeMd(group: AgentGroup, provider: string): void 
   // Desired fragment set — name -> already-resolved content, ready to be
   // pushed straight into the composed doc. Nothing here is written to disk;
   // it exists only in memory for the duration of this call.
-  const configRow = getContainerConfig(group.id);
+  const configRow = await getContainerConfig(group.id);
   const mcpServers: Record<string, McpServerConfig> = configRow
     ? validateMcpServers(JSON.parse(configRow.mcp_servers) as Record<string, McpServerConfig>)
     : {};

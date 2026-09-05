@@ -453,7 +453,7 @@ async function wireApprovedChannel(
 
   const mg = getMessagingGroup(row.messaging_group_id);
   const isGroup = event.message.isGroup ?? mg?.is_group === 1;
-  const agentGroupName = getAgentGroup(agentGroupId)?.name ?? '';
+  const agentGroupName = (await getAgentGroup(agentGroupId))?.name ?? '';
 
   let engage: { engage_mode: MessagingGroupAgent['engage_mode']; engage_pattern: string | null };
   try {
@@ -570,7 +570,7 @@ async function handleChannelApprovalResponse(payload: ResponsePayload): Promise<
 
   // ── Reject / Cancel ──
   if (payload.value === REJECT_VALUE) {
-    setMessagingGroupDeniedAt(row.messaging_group_id, new Date().toISOString());
+    await setMessagingGroupDeniedAt(row.messaging_group_id, new Date().toISOString());
     deletePendingChannelApproval(row.messaging_group_id);
     completeStoredDeferredInbound(row.original_message);
     log.info('Channel registration denied', {
@@ -594,7 +594,7 @@ async function handleChannelApprovalResponse(payload: ResponsePayload): Promise<
     const adapter = getDeliveryAdapter();
     if (!adapter) return true;
 
-    const agentGroups = getAllAgentGroups();
+    const agentGroups = await getAllAgentGroups();
     const options = buildAgentSelectionOptions(agentGroups, approverId);
     const title = '📋 Choose an agent';
     const question = `Which agent should handle this channel? ${AGENT_ACCESS_SCOPE_WARNING}`;
@@ -671,7 +671,7 @@ async function handleChannelApprovalResponse(payload: ResponsePayload): Promise<
 
   if (payload.value.startsWith(CONNECT_PREFIX)) {
     targetAgentGroupId = payload.value.slice(CONNECT_PREFIX.length);
-    const ag = getAgentGroup(targetAgentGroupId);
+    const ag = await getAgentGroup(targetAgentGroupId);
     if (!ag) {
       log.error('Channel registration: target agent group no longer exists', {
         messagingGroupId: row.messaging_group_id,
@@ -737,12 +737,12 @@ registerMessageInterceptor(async (event: InboundEvent): Promise<boolean> => {
   const ag = createNewAgentGroup(text);
   log.info('Channel registration: new agent group created', {
     messagingGroupId: row.messaging_group_id,
-    agentGroupId: ag.id,
-    agentName: ag.name,
-    folder: ag.folder,
+    agentGroupId: (await ag).id,
+    agentName: (await ag).name,
+    folder: (await ag).folder,
   });
 
-  const wired = await wireApprovedChannel(row, ag.id, userId);
+  const wired = await wireApprovedChannel(row, (await ag).id, userId);
 
   const adapter = getDeliveryAdapter();
   if (adapter) {
@@ -756,8 +756,8 @@ registerMessageInterceptor(async (event: InboundEvent): Promise<boolean> => {
           'chat-sdk',
           JSON.stringify({
             text: wired
-              ? `✅ Agent "${ag.name}" created and connected.`
-              : `⚠️ Agent "${ag.name}" was created but the channel couldn't be connected — check the host logs.`,
+              ? `✅ Agent "${(await ag).name}" created and connected.`
+              : `⚠️ Agent "${(await ag).name}" was created but the channel couldn't be connected — check the host logs.`,
           }),
         )
         .catch(() => {});

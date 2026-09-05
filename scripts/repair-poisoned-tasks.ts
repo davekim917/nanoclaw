@@ -63,7 +63,7 @@ for (const group of fs.readdirSync(sessionsRoot)) {
   const groupDir = path.join(sessionsRoot, group);
   if (!fs.statSync(groupDir).isDirectory()) continue;
   // The directory name IS the agent group id (storage-activity.ts:319).
-  const tz = resolveGroupTimezone(group);
+  const tz = await resolveGroupTimezone(group);
   for (const sess of fs.readdirSync(groupDir)) {
     const inboundPath = path.join(groupDir, sess, 'inbound.db');
     const outboundPath = path.join(groupDir, sess, 'outbound.db');
@@ -114,5 +114,7 @@ for (const group of fs.readdirSync(sessionsRoot)) {
   }
 }
 
-console.log(`\n${APPLY ? 'Repaired' : 'Would repair'} ${poisoned} poisoned row(s); ${skipped} overdue-but-unpoisoned left alone.`);
+console.log(
+  `\n${APPLY ? 'Repaired' : 'Would repair'} ${poisoned} poisoned row(s); ${skipped} overdue-but-unpoisoned left alone.`,
+);
 if (!APPLY) console.log('Dry run — re-run with --apply to write.');

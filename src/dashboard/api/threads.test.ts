@@ -110,8 +110,8 @@ async function setupDb(): Promise<void> {
   runMigrations(db);
 }
 
-function seedAgentGroup(id: string, workgroupId?: string): void {
-  createAgentGroup({ id, name: id, folder: id, agent_provider: null, created_at: iso(0) });
+async function seedAgentGroup(id: string, workgroupId?: string): Promise<void> {
+  await createAgentGroup({ id, name: id, folder: id, agent_provider: null, created_at: iso(0) });
   // `createAgentGroup` does not carry workgroup_id; the reconcile path sets it.
   if (workgroupId) getRawDb().prepare('UPDATE agent_groups SET workgroup_id = ? WHERE id = ?').run(workgroupId, id);
 }
@@ -468,7 +468,7 @@ describe('buildThreadList — grouping', () => {
   it('collapses a six-agent thread to ONE row carrying six participants', async () => {
     const thread = 'slack:CFIXTURECH3:1700000000.666666';
     for (let i = 1; i <= 6; i++) {
-      seedAgentGroup(`ag-${i}`);
+      await seedAgentGroup(`ag-${i}`);
       insertSession({
         id: `s-${i}`,
         agentGroupId: `ag-${i}`,
@@ -493,7 +493,7 @@ describe('buildThreadList — grouping', () => {
   });
 
   it('keeps distinct threads in one channel as distinct rows', async () => {
-    seedAgentGroup('ag-1');
+    await seedAgentGroup('ag-1');
     insertSession({ id: 's-a', agentGroupId: 'ag-1', threadId: 'slack:CTESTCHAN01:1.1' });
     insertSession({ id: 's-b', agentGroupId: 'ag-1', threadId: 'slack:CTESTCHAN01:2.2' });
 
@@ -503,7 +503,7 @@ describe('buildThreadList — grouping', () => {
   });
 
   it('does not drop sessions with a NULL thread_id — they get a synthetic key', async () => {
-    seedAgentGroup('ag-1');
+    await seedAgentGroup('ag-1');
     insertSession({ id: 's-null', agentGroupId: 'ag-1', threadId: null });
 
     const { threads } = await buildThreadList(makeCtx(), LIST_OPTS, deps());
@@ -516,8 +516,8 @@ describe('buildThreadList — grouping', () => {
 
   it('takes the title from whichever session generated one most recently', async () => {
     const thread = 'slack:CTESTCHAN01:9.9';
-    seedAgentGroup('ag-1');
-    seedAgentGroup('ag-2');
+    await seedAgentGroup('ag-1');
+    await seedAgentGroup('ag-2');
     insertSession({
       id: 's-1',
       agentGroupId: 'ag-1',
@@ -538,7 +538,7 @@ describe('buildThreadList — grouping', () => {
   });
 
   it('resolves the channel key to a friendly name from messaging_groups', async () => {
-    seedAgentGroup('ag-1');
+    await seedAgentGroup('ag-1');
     getRawDb()
       .prepare(
         `INSERT INTO messaging_groups (id, channel_type, instance, platform_id, name, created_at)
@@ -559,8 +559,8 @@ describe('buildThreadList — grouping', () => {
 
   it('recomputes liveness per §3.4 and surfaces provider_status for live containers only', async () => {
     const thread = 'slack:CTESTCHAN01:5.5';
-    seedAgentGroup('ag-1');
-    seedAgentGroup('ag-2');
+    await seedAgentGroup('ag-1');
+    await seedAgentGroup('ag-2');
     insertSession({ id: 's-live', agentGroupId: 'ag-1', threadId: thread });
     insertSession({ id: 's-dead', agentGroupId: 'ag-2', threadId: thread });
 
@@ -594,8 +594,8 @@ describe('buildThreadList — grouping', () => {
 
   it('resolves participant provider through resolveProviderName, not the deprecated agent_groups column', async () => {
     const thread = 'slack:CTESTCHAN01:7.7';
-    seedAgentGroup('ag-codex');
-    seedAgentGroup('ag-default');
+    await seedAgentGroup('ag-codex');
+    await seedAgentGroup('ag-default');
     insertSession({ id: 's-codex', agentGroupId: 'ag-codex', threadId: thread, agentProvider: 'CODEX' });
     // No session provider and no container_configs row → the documented
     // 'claude' floor, never an empty string.
@@ -608,7 +608,7 @@ describe('buildThreadList — grouping', () => {
   });
 
   it('normalizes the naive last_outbound_at column to ISO-8601 UTC on the wire', async () => {
-    seedAgentGroup('ag-1');
+    await seedAgentGroup('ag-1');
     insertSession({
       id: 's-1',
       agentGroupId: 'ag-1',
@@ -623,8 +623,8 @@ describe('buildThreadList — grouping', () => {
   });
 
   it('honours scope — an out-of-scope group yields no rows rather than a 403', async () => {
-    seedAgentGroup('ag-1');
-    seedAgentGroup('ag-2');
+    await seedAgentGroup('ag-1');
+    await seedAgentGroup('ag-2');
     insertSession({ id: 's-1', agentGroupId: 'ag-1', threadId: 'slack:CTESTCHAN01:1.1' });
     insertSession({ id: 's-2', agentGroupId: 'ag-2', threadId: 'slack:CTESTCHAN01:2.2' });
 
@@ -665,7 +665,7 @@ describe('buildThreadList — synthetic session channel recovery (§3.2 gap, DEF
   });
 
   it('a synthetic (NULL thread_id) session lands in its messaging group channel, not unknown', async () => {
-    seedAgentGroup('ag-1');
+    await seedAgentGroup('ag-1');
     insertMessagingGroup({ id: 'mg-1', platformId: 'discord:1111:2222', name: 'general' });
     insertSession({ id: 's-null', agentGroupId: 'ag-1', threadId: null, messagingGroupId: 'mg-1' });
 
@@ -690,7 +690,7 @@ describe('buildThreadList — synthetic session channel recovery (§3.2 gap, DEF
   });
 
   it('an unanchored system:tasks:<series> thread flags scheduled_task and falls back to the honest "Unrouted tasks" label', async () => {
-    seedAgentGroup('ag-1');
+    await seedAgentGroup('ag-1');
     // Verified against the live central DB (2026-08-20): a `ncl tasks`
     // execution's own isolated session never carries a messaging_group_id
     // (`resolveTaskSession` in session-manager.ts). A task that has never
@@ -708,7 +708,7 @@ describe('buildThreadList — synthetic session channel recovery (§3.2 gap, DEF
   });
 
   it('an ordinary channel thread is never flagged scheduled_task', async () => {
-    seedAgentGroup('ag-1');
+    await seedAgentGroup('ag-1');
     insertSession({ id: 's-1', agentGroupId: 'ag-1', threadId: 'slack:CTESTCHAN01:1.1' });
 
     const { threads } = await buildThreadList(makeCtx(), LIST_OPTS, deps());
@@ -739,7 +739,7 @@ describe('buildThreadList — scheduled tasks resolve to where they actually pos
   });
 
   it('an anchored task thread resolves to its real channel and friendly name, not the tasks bucket', async () => {
-    seedAgentGroup('ag-1');
+    await seedAgentGroup('ag-1');
     insertMessagingGroup({ id: 'mg-1', platformId: 'slack:CTESTDISPATCH1', name: '#example-dispatch' });
     insertSession({ id: 's-task', agentGroupId: 'ag-1', threadId: 'system:tasks:example-task-0001' });
     insertTaskAnchor({ sessionId: 's-task', platformId: 'slack:CTESTDISPATCH1', createdAt: iso(60_000) });
@@ -757,7 +757,7 @@ describe('buildThreadList — scheduled tasks resolve to where they actually pos
   });
 
   it('tie-break: a session re-pointed to a different channel resolves to the MOST RECENT anchor', async () => {
-    seedAgentGroup('ag-1');
+    await seedAgentGroup('ag-1');
     insertMessagingGroup({ id: 'mg-old', platformId: 'slack:CTESTOLDROOM1', name: '#example-old-room' });
     insertMessagingGroup({ id: 'mg-new', platformId: 'slack:CTESTNEWROOM2', name: '#example-new-room' });
     insertSession({ id: 's-task', agentGroupId: 'ag-1', threadId: 'system:tasks:example-task-0002' });
@@ -779,8 +779,8 @@ describe('buildThreadList — scheduled tasks resolve to where they actually pos
     // though today's live data never does. The rule has to be "most recent
     // anchor across the whole thread", not "the first session's anchor" —
     // this is the test that pins it against silently reading row order.
-    seedAgentGroup('ag-a');
-    seedAgentGroup('ag-b');
+    await seedAgentGroup('ag-a');
+    await seedAgentGroup('ag-b');
     insertMessagingGroup({ id: 'mg-a', platformId: 'slack:CTESTROOMA1', name: '#example-room-a' });
     insertMessagingGroup({ id: 'mg-b', platformId: 'slack:CTESTROOMB2', name: '#example-room-b' });
     const thread = 'system:tasks:shared-series-0003';
@@ -796,8 +796,8 @@ describe('buildThreadList — scheduled tasks resolve to where they actually pos
   });
 
   it('an anchor for a DIFFERENT session never leaks onto an unrelated task thread', async () => {
-    seedAgentGroup('ag-1');
-    seedAgentGroup('ag-2');
+    await seedAgentGroup('ag-1');
+    await seedAgentGroup('ag-2');
     insertMessagingGroup({ id: 'mg-1', platformId: 'slack:CTESTROOMX1', name: '#example-room-x' });
     insertSession({ id: 's-anchored', agentGroupId: 'ag-1', threadId: 'system:tasks:series-anchored' });
     insertSession({ id: 's-bare', agentGroupId: 'ag-2', threadId: 'system:tasks:series-bare' });
@@ -824,7 +824,7 @@ describe('buildThreadList — scheduled tasks fall back to their routing stamp (
     // routed to a real channel but has not posted there yet (or posts through a
     // path that leaves no anchor). Its destination IS knowable at definition
     // time, so "Unrouted tasks" was a lie, not an absence.
-    seedAgentGroup('ag-1');
+    await seedAgentGroup('ag-1');
     insertMessagingGroup({ id: 'mg-1', platformId: 'slack:CTESTSWEEP001', name: '#example-sweep' });
     insertSession({
       id: 's-task',
@@ -848,7 +848,7 @@ describe('buildThreadList — scheduled tasks fall back to their routing stamp (
     // the agent chooses its destination at fire time. A series re-pointed
     // between runs still carries its original stamp while its anchors have
     // already moved — the console must show where it is actually posting.
-    seedAgentGroup('ag-1');
+    await seedAgentGroup('ag-1');
     insertMessagingGroup({ id: 'mg-x', platformId: 'slack:CTESTACTUAL01', name: '#example-actual' });
     insertMessagingGroup({ id: 'mg-y', platformId: 'slack:CTESTSTAMPED2', name: '#example-stamped' });
     insertSession({
@@ -867,7 +867,7 @@ describe('buildThreadList — scheduled tasks fall back to their routing stamp (
   it('a task session with NEITHER an anchor nor a stamp still lands in the labeled fallback', async () => {
     // No channel is invented. An `--isolated` series, or one scheduled by a
     // host caller with no --messaging-group, genuinely has no destination.
-    seedAgentGroup('ag-1');
+    await seedAgentGroup('ag-1');
     insertMessagingGroup({ id: 'mg-1', platformId: 'slack:CTESTCHAN01', name: '#example-chan' });
     insertSession({ id: 's-task', agentGroupId: 'ag-1', threadId: 'system:tasks:example-task-0012' });
 
@@ -878,8 +878,8 @@ describe('buildThreadList — scheduled tasks fall back to their routing stamp (
   });
 
   it("a stamp never leaks onto another task thread, and doesn't touch ordinary channel threads", async () => {
-    seedAgentGroup('ag-1');
-    seedAgentGroup('ag-2');
+    await seedAgentGroup('ag-1');
+    await seedAgentGroup('ag-2');
     insertMessagingGroup({ id: 'mg-1', platformId: 'slack:CTESTSTAMP001', name: '#example-stamp' });
     insertSession({
       id: 's-stamped',
@@ -903,8 +903,8 @@ describe('buildThreadList — scheduled tasks fall back to their routing stamp (
     // wins" rule as the anchors, keyed on session created_at because the stamp
     // itself carries no timestamp — pinned so it never silently becomes
     // "whichever row the query returned first".
-    seedAgentGroup('ag-a');
-    seedAgentGroup('ag-b');
+    await seedAgentGroup('ag-a');
+    await seedAgentGroup('ag-b');
     insertMessagingGroup({ id: 'mg-a', platformId: 'slack:CTESTOLDSTMP1', name: '#example-old-stamp' });
     insertMessagingGroup({ id: 'mg-b', platformId: 'slack:CTESTNEWSTMP2', name: '#example-new-stamp' });
     const thread = 'system:tasks:shared-series-0013';
@@ -957,8 +957,8 @@ describe('buildThreadList — DM dedupe by stable platform user id (DEFECT 2)', 
   }
 
   it('collapses two sibling-bot DM rooms for the same human into one channel_key, with both threads addressable through it', async () => {
-    seedAgentGroup('ag-bot-a');
-    seedAgentGroup('ag-bot-b');
+    await seedAgentGroup('ag-bot-a');
+    await seedAgentGroup('ag-bot-b');
     // Real shape (verified live): `platform_id` carries the bare platform
     // family ('slack', 'discord') — each bot instance gets its OWN DM
     // conversation id from the platform, so the id differs per sibling even
@@ -1028,8 +1028,8 @@ describe('buildThreadList — DM dedupe by stable platform user id (DEFECT 2)', 
   });
 
   it('does NOT dedupe two real, unrelated channels that happen to share a display name', async () => {
-    seedAgentGroup('ag-1');
-    seedAgentGroup('ag-2');
+    await seedAgentGroup('ag-1');
+    await seedAgentGroup('ag-2');
     // Two ordinary group channels, same name, no user_dms row for either —
     // there is nothing DM-shaped here at all.
     insertMessagingGroup({ id: 'mg-a', platformId: 'slack:CTESTROOMA1', name: '#general' });
@@ -1044,7 +1044,7 @@ describe('buildThreadList — DM dedupe by stable platform user id (DEFECT 2)', 
   });
 
   it('leaves a DM room untouched when it has no user_dms row (documented gap, not a silent merge)', async () => {
-    seedAgentGroup('ag-1');
+    await seedAgentGroup('ag-1');
     insertMessagingGroup({ id: 'mg-lonely', platformId: 'slack:D9999', name: 'Some Human', channelType: 'slack-bota' });
     insertSession({
       id: 's-lonely',
@@ -1078,13 +1078,13 @@ describe('buildThreadList — workgroup axis', () => {
     await setupDb();
     seedWorkgroup('example-labs');
     seedWorkgroup('example-dev');
-    seedAgentGroup('ag-lab-1', 'example-labs');
-    seedAgentGroup('ag-lab-2', 'example-labs');
-    seedAgentGroup('ag-lab-3', 'example-labs');
-    seedAgentGroup('ag-dev-1', 'example-dev');
+    await seedAgentGroup('ag-lab-1', 'example-labs');
+    await seedAgentGroup('ag-lab-2', 'example-labs');
+    await seedAgentGroup('ag-lab-3', 'example-labs');
+    await seedAgentGroup('ag-dev-1', 'example-dev');
     // An unassigned group — `workgroup_id` is nullable and a NULL must never
     // match a named workgroup.
-    seedAgentGroup('ag-orphan');
+    await seedAgentGroup('ag-orphan');
   });
 
   it('resolves a workgroup to EVERY sibling in it', async () => {
@@ -1221,8 +1221,8 @@ describe('buildThreadList — reply target and snooze', () => {
   });
 
   it('gives every participant the session a reply to THEM lands in', async () => {
-    seedAgentGroup('ag-1');
-    seedAgentGroup('ag-2');
+    await seedAgentGroup('ag-1');
+    await seedAgentGroup('ag-2');
     const thread = 'slack:CTESTCHAN01:1700000000.11';
     insertSession({
       id: 's-1',
@@ -1249,8 +1249,8 @@ describe('buildThreadList — reply target and snooze', () => {
   });
 
   it('aims at the session that asked, even when another agent spoke more recently', async () => {
-    seedAgentGroup('ag-1');
-    seedAgentGroup('ag-2');
+    await seedAgentGroup('ag-1');
+    await seedAgentGroup('ag-2');
     const thread = 'slack:CTESTCHAN01:1700000000.11';
     insertSession({
       id: 's-asked',
@@ -1277,8 +1277,8 @@ describe('buildThreadList — reply target and snooze', () => {
   });
 
   it('aims at the session whose container_state it is rendering when the row is stalled', async () => {
-    seedAgentGroup('ag-1');
-    seedAgentGroup('ag-2');
+    await seedAgentGroup('ag-1');
+    await seedAgentGroup('ag-2');
     const thread = 'slack:CTESTCHAN01:1700000000.11';
     // Both sessions last spoke BEFORE the tool started — that is what makes the
     // 30-minute stall rule fire (§5): a newer output would mean it un-wedged.
@@ -1313,14 +1313,14 @@ describe('buildThreadList — reply target and snooze', () => {
   });
 
   it('reports no snooze by default', async () => {
-    seedAgentGroup('ag-1');
+    await seedAgentGroup('ag-1');
     insertSession({ id: 's-1', agentGroupId: 'ag-1', threadId: 'slack:CTESTCHAN01:1700000000.11' });
     const { threads } = await buildThreadList(makeCtx(), LIST_OPTS, deps());
     expect(threads[0]!.snoozed).toBe(false);
   });
 
   it('reports the caller’s own snooze, and drops it once the thread moves', async () => {
-    seedAgentGroup('ag-1');
+    await seedAgentGroup('ag-1');
     const thread = 'slack:CTESTCHAN01:1700000000.11';
     insertSession({ id: 's-1', agentGroupId: 'ag-1', threadId: thread, lastOutboundAt: iso(60_000) });
     getRawDb()
@@ -1455,7 +1455,7 @@ describe('assignable_agents', () => {
 
   beforeEach(async () => {
     await setupDb();
-    for (const id of ['ag-here', 'ag-wired', 'ag-otherroom']) seedAgentGroup(id);
+    for (const id of ['ag-here', 'ag-wired', 'ag-otherroom']) await seedAgentGroup(id);
     wire('mg-1', 'slack:CTESTCHAN01', 'ag-here');
     wire('mg-1', 'slack:CTESTCHAN01', 'ag-wired');
     wire('mg-2', 'slack:COTHERCHAN2', 'ag-otherroom');
@@ -1535,7 +1535,7 @@ describe('needs_you_reason on the wire (operator report 2026-08-21)', () => {
   });
 
   it('is absent for a thread that is not needs_you', async () => {
-    seedAgentGroup('ag-plain');
+    await seedAgentGroup('ag-plain');
     insertSession({ id: 's-plain', agentGroupId: 'ag-plain', threadId: 'slack:CTESTCHAN01:1.1' });
     const { threads } = await buildThreadList(makeCtx(), LIST_OPTS, deps());
     expect(threads[0]!.state).not.toBe('needs_you');
@@ -1543,7 +1543,7 @@ describe('needs_you_reason on the wire (operator report 2026-08-21)', () => {
   });
 
   it('an ask_question thread carries the ask_question cause on the wire', async () => {
-    seedAgentGroup('ag-ask');
+    await seedAgentGroup('ag-ask');
     const thread = 'slack:CTESTCHAN01:1.2';
     insertSession({
       id: 's-asked',
@@ -1567,7 +1567,7 @@ describe('needs_you_reason on the wire (operator report 2026-08-21)', () => {
   });
 
   it('a task-needs-input thread carries its own steer_question on the wire', async () => {
-    seedAgentGroup('ag-task');
+    await seedAgentGroup('ag-task');
     const thread = 'slack:CTESTCHAN01:1.3';
     insertSession({ id: 's-task', agentGroupId: 'ag-task', threadId: thread });
     getRawDb()
@@ -1588,7 +1588,7 @@ describe('needs_you_reason on the wire (operator report 2026-08-21)', () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'threads-claims-'));
     try {
       seedWorkgroup('wg-1');
-      seedAgentGroup('ag-parked', 'wg-1');
+      await seedAgentGroup('ag-parked', 'wg-1');
       const thread = 'slack:CTESTCHAN01:1787277743.529519';
       insertSession({ id: 's-parked', agentGroupId: 'ag-parked', threadId: thread });
       const claimsDir = path.join(dir, 'wg-1', 'claims');
@@ -1614,7 +1614,7 @@ describe('needs_you_reason on the wire (operator report 2026-08-21)', () => {
 describe('close state on the thread payload', () => {
   beforeEach(async () => {
     await setupDb();
-    seedAgentGroup('ag-close');
+    await seedAgentGroup('ag-close');
   });
 
   const listOne = async () => (await buildThreadList(makeCtx(), LIST_OPTS, deps())).threads[0]!;
@@ -1718,7 +1718,7 @@ describe('attention-source rows in the thread list', () => {
   beforeEach(async () => {
     await setupDb();
     seedWorkgroup(WG);
-    seedAgentGroup('ag-example', WG);
+    await seedAgentGroup('ag-example', WG);
   });
 
   afterEach(() => {
@@ -1939,7 +1939,7 @@ describe('attention-source rows in the thread list', () => {
     declare(JSON.stringify([{ kind: 'release-board', root: 'releases', channel_key: CHANNEL_KEY }]));
     const groupsRoot = boardRoot([readyPr()]);
     const env = { groupsRoot, claimsRoot: tmp('threads-attn-claims-') };
-    seedAgentGroup('ag-elsewhere');
+    await seedAgentGroup('ag-elsewhere');
     expect(
       (
         await buildThreadList(
@@ -1976,7 +1976,7 @@ describe('attention-source rows in the thread list', () => {
     // loud it was chosen.
     declare(JSON.stringify([{ kind: 'release-board', root: 'releases', channel_key: CHANNEL_KEY }]));
     const env = { groupsRoot: boardRoot([readyPr()]), claimsRoot: tmp('threads-attn-claims-') };
-    seedAgentGroup('ag-sibling', WG); // a SECOND agent group in the SAME workgroup
+    await seedAgentGroup('ag-sibling', WG); // a SECOND agent group in the SAME workgroup
 
     const { threads } = await buildThreadList(
       makeCtx({ no_filter: false, allowed_group_ids: ['ag-sibling'] }),
@@ -2093,7 +2093,7 @@ describe('attention-source rows in the thread list', () => {
         groupsRoot: boardRoot([readyPr({ since: iso(THIRTY_DAYS) })]),
         claimsRoot: tmp('threads-attn-claims-'),
       };
-      seedAgentGroup('ag-elsewhere');
+      await seedAgentGroup('ag-elsewhere');
       expect(
         (
           await buildThreadList(
@@ -2407,7 +2407,7 @@ describe('mailbox seam', () => {
 
     // End to end: the list surfaces that state for a live container, using the
     // real probe (no `containerState` dep override).
-    seedAgentGroup(seamGroup);
+    await seedAgentGroup(seamGroup);
     insertSession({ id: seamSession, agentGroupId: seamGroup, threadId: 'slack:CSEAM:1' });
     const { threads } = await buildThreadList(makeCtx(), LIST_OPTS, {
       ...deps({ activeContainerSessionIds: () => [seamSession] }),

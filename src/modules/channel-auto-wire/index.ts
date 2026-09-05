@@ -133,11 +133,11 @@ function newId(): string {
   return `mga-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
-export const resolver: UnwiredChannelResolverFn = (event, mg) => {
+export const resolver: UnwiredChannelResolverFn = async (event, mg) => {
   const folder = resolveDefaultAgentFolder(event.channelType);
   if (!folder) return [];
 
-  const agentGroup = getAgentGroupByFolder(folder);
+  const agentGroup = await getAgentGroupByFolder(folder);
   if (!agentGroup) {
     log.warn('channel-auto-wire: default agent folder not found, skipping', {
       channelType: event.channelType,
@@ -165,7 +165,7 @@ export const resolver: UnwiredChannelResolverFn = (event, mg) => {
   // update is what persists the change for subsequent messages.
   const senderPolicy = resolveDefaultSenderPolicy(event.channelType);
   if (senderPolicy && senderPolicy !== mg.unknown_sender_policy) {
-    updateMessagingGroup(mg.id, { unknown_sender_policy: senderPolicy });
+    await updateMessagingGroup(mg.id, { unknown_sender_policy: senderPolicy });
     mg.unknown_sender_policy = senderPolicy;
     log.info('channel-auto-wire: relaxed unknown_sender_policy', {
       messagingGroupId: mg.id,

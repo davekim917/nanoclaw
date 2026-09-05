@@ -62,34 +62,38 @@ interface TaskRow {
 
 const central = new Database(path.join(DATA_DIR, 'v2.db'), { readonly: true });
 const agentGroups = new Map(
-  (central.prepare('SELECT id, name, folder, agent_provider FROM agent_groups').all() as Array<{
-    id: string;
-    name: string;
-    folder: string;
-    agent_provider: string | null;
-  }>).map((g) => [g.id, g]),
+  (
+    central.prepare('SELECT id, name, folder, agent_provider FROM agent_groups').all() as Array<{
+      id: string;
+      name: string;
+      folder: string;
+      agent_provider: string | null;
+    }>
+  ).map((g) => [g.id, g]),
 );
 const messagingGroups = new Map(
-  (central.prepare('SELECT id, name, channel_type, platform_id FROM messaging_groups').all() as Array<{
-    id: string;
-    name: string | null;
-    channel_type: string;
-    platform_id: string;
-  }>).map((m) => [m.id, m]),
+  (
+    central.prepare('SELECT id, name, channel_type, platform_id FROM messaging_groups').all() as Array<{
+      id: string;
+      name: string | null;
+      channel_type: string;
+      platform_id: string;
+    }>
+  ).map((m) => [m.id, m]),
 );
 const sessions = new Map(
-  (central.prepare('SELECT id, agent_group_id, messaging_group_id, thread_id FROM sessions').all() as Array<{
-    id: string;
-    agent_group_id: string;
-    messaging_group_id: string;
-    thread_id: string | null;
-  }>).map((s) => [s.id, s]),
+  (
+    central.prepare('SELECT id, agent_group_id, messaging_group_id, thread_id FROM sessions').all() as Array<{
+      id: string;
+      agent_group_id: string;
+      messaging_group_id: string;
+      thread_id: string | null;
+    }>
+  ).map((s) => [s.id, s]),
 );
 // Channel destination → messaging group name, for rows whose output target
 // differs from the session's own messaging group.
-const mgByDestination = new Map(
-  [...messagingGroups.values()].map((m) => [`${m.channel_type}\0${m.platform_id}`, m]),
-);
+const mgByDestination = new Map([...messagingGroups.values()].map((m) => [`${m.channel_type}\0${m.platform_id}`, m]));
 central.close();
 // Reopened through the shared connection so this report resolves a group's
 // timezone the same way the firing path does, instead of re-reading
@@ -117,7 +121,7 @@ for (const groupDir of fs.readdirSync(sessionsRoot).sort()) {
   // group with a timezone override runs its whole series on that grid, so both
   // the cron interpretation and the rendered fire time report it — every line
   // already names the zone it is in, so nothing here reads ambiguously.
-  const groupTz = resolveGroupTimezone(groupDir, TIMEZONE);
+  const groupTz = await resolveGroupTimezone(groupDir, TIMEZONE);
   for (const sessDir of fs.readdirSync(groupPath).sort()) {
     const inboundPath = path.join(groupPath, sessDir, 'inbound.db');
     if (!fs.existsSync(inboundPath)) continue;
@@ -162,9 +166,15 @@ for (const groupDir of fs.readdirSync(sessionsRoot).sort()) {
       const script = typeof content.script === 'string' ? (content.script as string) : null;
 
       count++;
-      console.log(`\n━━━ ${row.series_id ?? row.id} ${row.status !== 'pending' ? `[${row.status.toUpperCase()}]` : ''}`);
-      console.log(`  agent group : ${ag ? `${ag.name} (${ag.folder}${ag.agent_provider ? `, ${ag.agent_provider}` : ''})` : groupDir}`);
-      console.log(`  channel     : ${destMg?.name ?? sessionMg?.name ?? '?'} [${row.channel_type ?? sessionMg?.channel_type ?? '?'}] ${row.thread_id ? `thread ${row.thread_id}` : 'channel root'}`);
+      console.log(
+        `\n━━━ ${row.series_id ?? row.id} ${row.status !== 'pending' ? `[${row.status.toUpperCase()}]` : ''}`,
+      );
+      console.log(
+        `  agent group : ${ag ? `${ag.name} (${ag.folder}${ag.agent_provider ? `, ${ag.agent_provider}` : ''})` : groupDir}`,
+      );
+      console.log(
+        `  channel     : ${destMg?.name ?? sessionMg?.name ?? '?'} [${row.channel_type ?? sessionMg?.channel_type ?? '?'}] ${row.thread_id ? `thread ${row.thread_id}` : 'channel root'}`,
+      );
       console.log(`  session     : ${groupDir}/${sessDir}`);
       console.log(`  cron        : ${row.recurrence}  (interpreted in ${groupTz})`);
       console.log(`  next fire   : ${fmtWhen(row.process_after, groupTz)}`);
@@ -176,4 +186,6 @@ for (const groupDir of fs.readdirSync(sessionsRoot).sort()) {
   }
 }
 
-console.log(`\n${count} ${SHOW_ALL ? 'series' : 'active series'} total. (--all includes non-pending, --full prints whole prompts/scripts)`);
+console.log(
+  `\n${count} ${SHOW_ALL ? 'series' : 'active series'} total. (--all includes non-pending, --full prints whole prompts/scripts)`,
+);

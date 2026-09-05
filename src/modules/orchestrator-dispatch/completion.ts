@@ -39,7 +39,7 @@ export async function applySpawnComplete(content: Record<string, unknown>, calle
     });
 
   // Notify parent
-  const parentSession = getSession(task.parent_session_id);
+  const parentSession = await getSession(task.parent_session_id);
   if (!parentSession) return;
 
   try {
@@ -92,7 +92,7 @@ export async function applySpawnFailed(content: Record<string, unknown>, callerS
       /* dashboard module may not be initialized in tests */
     });
 
-  const parentSession = getSession(task.parent_session_id);
+  const parentSession = await getSession(task.parent_session_id);
   if (!parentSession) return;
 
   try {

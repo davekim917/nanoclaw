@@ -139,12 +139,12 @@ export function _resetQuietSessionCacheForTesting(): void {
  *
  * Advisory: a failed warm degrades to today's behavior — a cold first tick.
  */
-function warmQuietSessionCache(): void {
+async function warmQuietSessionCache(): Promise<void> {
   try {
     const nowMs = Date.now();
     const live = new Set(getActiveContainerSessionIds());
     let warmed = 0;
-    for (const row of getWarmQuietSessionMarks(new Date(nowMs).toISOString())) {
+    for (const row of await getWarmQuietSessionMarks(new Date(nowMs).toISOString())) {
       if (live.has(row.id)) continue;
       const skipUntilMs = Date.parse(row.sweep_quiet_until);
       if (!Number.isFinite(skipUntilMs) || skipUntilMs <= nowMs) continue;
@@ -890,12 +890,11 @@ let running = false;
 export function startHostSweep(): void {
   if (running) return;
   running = true;
-  // Before the first tick, never inside it: a warm that ran per tick would be
-  // a second source of truth racing the map the tick is writing.
-  warmQuietSessionCache();
   // sweep() wraps its own body in try/catch and always reschedules itself
   // (see the comment above sweep()), so its returned promise never rejects —
-  // void is safe here.
+  // void is safe here. The quiet-cache warm runs once per start, at the head
+  // of the first tick, before anything writes the map (see sweep()).
+  quietCacheWarmed = false;
   void sweep();
 }
 
@@ -913,8 +912,18 @@ export function stopHostSweep(): void {
  * zero slow ticks. Live: 2026-08-06 ~22:20 ET. Rescheduling is unconditional
  * for the same reason it always was: nothing else re-arms this.
  */
+let quietCacheWarmed = false;
+
 async function sweep(): Promise<void> {
   try {
+    // Once, before the first tick's body, never per tick: a warm that ran
+    // every tick would be a second source of truth racing the map the tick is
+    // writing. It is awaited here (the warm reads the central DB through the
+    // async driver) so the first tick starts from the warmed map.
+    if (!quietCacheWarmed) {
+      quietCacheWarmed = true;
+      await warmQuietSessionCache();
+    }
     await sweepOnce();
   } catch (err) {
     log.error('Host sweep tick threw — rescheduling anyway', { err });
@@ -991,7 +1000,7 @@ async function sweepOnce(): Promise<void> {
   await runTickPhase(tick, 'tick:pre-session');
 
   try {
-    sessions = getActiveSessions();
+    sessions = await getActiveSessions();
   } catch (err) {
     log.error('Host sweep: failed to load active sessions', { err });
     sessions = [];
@@ -1076,7 +1085,7 @@ async function sweepOnce(): Promise<void> {
   const durableQuietMarks = newQuietMarks.filter((mark) => !unreadableIds.has(mark.sessionId));
   if (durableQuietMarks.length > 0) {
     try {
-      persistQuietSessionMarks(durableQuietMarks);
+      await persistQuietSessionMarks(durableQuietMarks);
     } catch (err) {
       // Advisory, and it degrades DOWNWARD on purpose: the in-memory marks go
       // with the failed write, so the next tick sweeps these sessions instead
@@ -1172,7 +1181,7 @@ function skipUnreadable(sessionId: string, reason: string): number {
  * fully quiet and safe to skip until then, or null when it must stay hot.
  */
 async function sweepSession(session: Session, tick: SweepTickContext): Promise<number | null> {
-  const agentGroup = getAgentGroup(session.agent_group_id);
+  const agentGroup = await getAgentGroup(session.agent_group_id);
   if (!agentGroup) return skipUnreadable(session.id, 'agent group missing');
 
   // Every duty below runs inside one of these — a short session, opened and
@@ -1375,13 +1384,18 @@ async function sweepSession(session: Session, tick: SweepTickContext): Promise<n
 }
 
 /** Test-only entry point for one session's sweep tick, over a one-session tick context. */
-export function _sweepSessionForTesting(session: Session): Promise<number | null> {
-  let sessions: Session[] | undefined;
+export async function _sweepSessionForTesting(session: Session): Promise<number | null> {
+  // Seam 3: `SweepTickContext.sessions` is a SYNCHRONOUS getter that duties
+  // read inside a window, so the list cannot be fetched lazily behind an
+  // `await` any more. Resolved up front instead — which is what the real
+  // `sweepOnce` already does (`sessions = await getActiveSessions()` before it
+  // builds the tick), so this helper now matches production ordering.
+  const sessions: Session[] = await getActiveSessions();
   let activeContainerSessionIds: ReadonlySet<string> | undefined;
   const tick: SweepTickContext = {
     now: Date.now(),
     get sessions(): readonly Session[] {
-      return (sessions ??= getActiveSessions());
+      return sessions;
     },
     get activeContainerSessionIds(): ReadonlySet<string> {
       return (activeContainerSessionIds ??= new Set(getActiveContainerSessionIds()));

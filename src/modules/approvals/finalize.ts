@@ -53,7 +53,7 @@ export async function finalizeReject(
     withReason: reason !== undefined,
   });
 
-  deletePendingApproval(approval.approval_id);
+  await deletePendingApproval(approval.approval_id);
   await notifyApprovalResolved({ approval, session, outcome: 'reject', userId });
   await wakeContainer(session);
 }

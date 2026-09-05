@@ -23,6 +23,7 @@ import { assertChannelRoutingConsistency } from './delivery.js';
 import { ensureContainedInboxDir, isPathInside } from './inbox-safety.js';
 import { acquireStorageActivityLease } from './storage-activity.js';
 import { getMessagingGroup } from './db/messaging-groups.js';
+import { resolveSessionServicesCentral, type SessionServicesCentral } from './capabilities.js';
 import { getContainerConfig, resolveProviderName } from './db/container-configs.js';
 import {
   createSession,
@@ -334,15 +335,15 @@ function generateId(): string {
  * - 'agent-shared': one session per agent group — all messaging groups
  *   wired with this mode share a single session (e.g. GitHub + Slack)
  */
-export function resolveSession(
+export async function resolveSession(
   agentGroupId: string,
   messagingGroupId: string | null,
   threadId: string | null,
   sessionMode: SessionMode,
-): { session: Session; created: boolean } {
+): Promise<{ session: Session; created: boolean }> {
   // agent-shared: single session per agent group, regardless of messaging group
   if (sessionMode === 'agent-shared') {
-    const existing = findSessionByAgentGroup(agentGroupId);
+    const existing = await findSessionByAgentGroup(agentGroupId);
     if (existing) {
       return { session: existing, created: false };
     }
@@ -350,7 +351,7 @@ export function resolveSession(
     const lookupThreadId = sessionMode === 'shared' ? null : threadId;
     // Scope lookup by agent_group_id so fan-out to multiple agents in the
     // same chat doesn't accidentally deliver to the wrong agent's session.
-    const existing = findSessionForAgent(agentGroupId, messagingGroupId, lookupThreadId);
+    const existing = await findSessionForAgent(agentGroupId, messagingGroupId, lookupThreadId);
     if (existing) {
       return { session: existing, created: false };
     }
@@ -376,7 +377,7 @@ export function resolveSession(
     created_at: new Date().toISOString(),
   };
 
-  createSession(session);
+  await createSession(session);
   initSessionFolder(agentGroupId, id);
   log.info('Session created', {
     id,
@@ -410,19 +411,19 @@ export function resolveSession(
  * appends, `isTaskSessionPost`); the routing stamp is a separate column
  * precisely so this one is never tempted into carrying it. See migration 056.
  */
-export function resolveTaskSession(
+export async function resolveTaskSession(
   agentGroupId: string,
   seriesId: string,
   routingPlatformId?: string | null,
-): { session: Session; created: boolean } {
+): Promise<{ session: Session; created: boolean }> {
   const threadId = taskThreadId(seriesId);
-  const existing = findSystemSession(agentGroupId, threadId);
+  const existing = await findSystemSession(agentGroupId, threadId);
   if (existing) {
     // Re-scheduling an existing series (including `scheduled-move`, which
     // re-`scheduleTask`s into the target) re-stamps: the column answers "where
     // is this series routed NOW", not "where was it first routed".
     if (routingPlatformId != null && existing.task_routing_platform_id !== routingPlatformId) {
-      setTaskRoutingPlatformId(existing.id, routingPlatformId);
+      await setTaskRoutingPlatformId(existing.id, routingPlatformId);
       existing.task_routing_platform_id = routingPlatformId;
     }
     return { session: existing, created: false };
@@ -441,9 +442,9 @@ export function resolveTaskSession(
     created_at: new Date().toISOString(),
   };
 
-  createSession(session);
+  await createSession(session);
   if (routingPlatformId != null) {
-    setTaskRoutingPlatformId(id, routingPlatformId);
+    await setTaskRoutingPlatformId(id, routingPlatformId);
     session.task_routing_platform_id = routingPlatformId;
   }
   initSessionFolder(agentGroupId, id);
@@ -565,12 +566,14 @@ export async function writeSessionRouting(agentGroupId: string, sessionId: strin
   // Resolved INSIDE the session. The route is read from the central DB and the
   // funnel below yields before the upsert, so a session rewired or closed in
   // that window would otherwise be stamped with the route it had on entry.
-  // Every lookup here is synchronous, so nothing yields between the resolution
-  // and the write.
-  const resolveRoute = ():
-    | { channelType: string | null; platformId: string | null; threadId: string | null }
-    | undefined => {
-    const session = getSession(sessionId);
+  // The session read is a driver call and yields once; the upsert follows it
+  // with no further yield. Routing has no write guard — a stale stamp is
+  // refreshed on the next wake — so that yield is tolerable here where it is
+  // not in `writeSessionMessage`.
+  const resolveRoute = async (): Promise<
+    { channelType: string | null; platformId: string | null; threadId: string | null } | undefined
+  > => {
+    const session = await getSession(sessionId);
     if (!session) return undefined;
 
     let channelType: string | null = null;
@@ -589,14 +592,14 @@ export async function writeSessionRouting(agentGroupId: string, sessionId: strin
 
   // Cheap short-circuit: a session that is already gone needs no mailbox
   // opened. The authoritative read is the one inside the callback.
-  if (!resolveRoute()) return;
+  if (!(await resolveRoute())) return;
 
   // Existing-only. Routing is refreshed on every wake, and a session whose
   // mailbox is gone has nothing to route to; provisioning one here would
   // resurrect a reclaimed directory (invariant I-10). The old code expressed
   // the same rule as an existsSync on inbound.db.
-  const written = await withExistingMailboxSession(agentGroupId, sessionId, (mailbox) => {
-    const route = resolveRoute();
+  const written = await withExistingMailboxSession(agentGroupId, sessionId, async (mailbox) => {
+    const route = await resolveRoute();
     if (!route) return undefined;
     mailbox.upsertSessionRouting({
       channel_type: route.channelType,
@@ -704,15 +707,38 @@ interface RecallSource {
   hasMatchingBootstrapRecall(excludeRecallId: string | null, provider: string, contextEpoch: number): boolean;
 }
 
+/**
+ * The one central-DB fact a recall row needs: which provider's bootstrap and
+ * epoch the pair is built for. Resolved by the caller BEFORE it opens the
+ * mailbox session, so the recall build and the paired insert stay one
+ * synchronous block — the write guard is proved immediately before the row
+ * lands, with nothing awaited in between (seam-3 plan §4.5). A provider read a
+ * few milliseconds earlier is the same value the block used to read inline:
+ * provider changes take effect at the group's next restart, not mid-write.
+ */
+export interface RecallCentral {
+  provider: string;
+  services: SessionServicesCentral;
+}
+
+export async function resolveRecallCentral(agentGroupId: string, sessionId: string): Promise<RecallCentral> {
+  const session = await getSession(sessionId);
+  return {
+    provider: resolveProviderName(session?.agent_provider, (await getContainerConfig(agentGroupId))?.provider),
+    services: await resolveSessionServicesCentral(agentGroupId),
+  };
+}
+
 function buildRecallRow(
   agentGroupId: string,
   sessionId: string,
   message: SessionMessageInput,
   normalizedContent: string,
   mailbox: RecallSource,
+  central: RecallCentral,
 ): MessageInsert | null {
   if (!isAdmissiblePreTurnTrigger({ ...message, content: normalizedContent })) return null;
-  const lifecycle = resolveRecallLifecycle(mailbox, agentGroupId, sessionId, `recall-${message.id}`);
+  const lifecycle = resolveRecallLifecycle(mailbox, agentGroupId, sessionId, central.provider, `recall-${message.id}`);
   return {
     id: `recall-${message.id}`,
     kind: 'system',
@@ -734,6 +760,7 @@ function buildRecallRow(
         contextEpoch: lifecycle.contextEpoch,
         includeBootstrap: lifecycle.includeBootstrap,
         seenEvidenceFingerprints: lifecycle.seenEvidenceFingerprints,
+        servicesCentral: central.services,
       }),
     }),
     processAfter: message.processAfter ?? null,
@@ -792,10 +819,9 @@ function resolveRecallLifecycle(
   mailbox: RecallSource,
   agentGroupId: string,
   sessionId: string,
+  provider: string,
   excludeRecallId?: string,
 ): RecallLifecycle {
-  const session = getSession(sessionId);
-  const provider = resolveProviderName(session?.agent_provider, getContainerConfig(agentGroupId)?.provider);
   let contextEpoch = 0;
   let hasContinuation = false;
   try {
@@ -950,7 +976,7 @@ async function writeSessionMessageInternal(
   // the message would vanish with it. Ordinary routing never gets here —
   // findSessionForAgent filters status='active' — so this only fires on a
   // raw-session-id path, and it must be loud rather than silent.
-  const statusBefore = getSession(sessionId)?.status;
+  const statusBefore = (await getSession(sessionId))?.status;
   if (statusBefore === 'archiving') {
     throw new Error(`session ${sessionId} is being archived; route this message to a fresh session`);
   }
@@ -1118,11 +1144,19 @@ async function writeSessionMessageLocked(
   // same-key nesting. Every host caller was audited for this in the ingress
   // batch; delivery action handlers in particular run with no session open
   // (plan §4.5b, invariant I-9).
+  // The recall's one central read happens here, with the other awaits, so the
+  // action below never yields: the provider is data the pair is built for, not
+  // a precondition the guard proves.
+  const recallCentral = isScheduledTask ? null : await resolveRecallCentral(agentGroupId, sessionId);
+
   // THE GUARD POINT. Inside the mailbox action, after every await this function
   // performs — the storage-activity lease, the reclaim-journal import, the
-  // funnel's own open — and with nothing awaited between it and the insert
-  // below. A caller's precondition proved out here is proved at the instant the
-  // row lands, which is the only instant that matters.
+  // provider read, the funnel's own open — and with nothing awaited between it
+  // and the insert below. A caller's precondition proved out here is proved at
+  // the instant the row lands, which is the only instant that matters. The
+  // action is deliberately NOT async: the funnel admits promises, and a yield
+  // between the guard and the insert would reopen exactly the window this
+  // closes.
   //
   // The refusal is carried out rather than thrown from inside the action: the
   // mailbox session should close normally, and the caller's error is raised
@@ -1131,7 +1165,8 @@ async function writeSessionMessageLocked(
   const insert = (mailbox: NanoclawMailboxSession): boolean => {
     refusedReason = refusalFrom(guard);
     if (refusedReason !== null) return false;
-    const recallRow = isScheduledTask ? null : buildRecallRow(agentGroupId, sessionId, message, content, mailbox);
+    const recallRow =
+      recallCentral === null ? null : buildRecallRow(agentGroupId, sessionId, message, content, mailbox, recallCentral);
     if (ignoreDuplicateId) return mailbox.insertMessageWithContextIfNew(row, recallRow);
     mailbox.insertMessageWithContext(row, recallRow);
     return true;
@@ -1163,7 +1198,7 @@ async function writeSessionMessageLocked(
     return false;
   }
 
-  updateSession(sessionId, { last_active: new Date().toISOString() });
+  await updateSession(sessionId, { last_active: new Date().toISOString() });
 
   // Push an inbox-board SSE notification — the session's last_inbound_at and
   // attention_state just changed. Lazy-imported because the dashboard module
@@ -1190,11 +1225,14 @@ async function writeSessionMessageLocked(
  * can safely return to pending. Scheduled tasks stay untouched: their existing
  * due-time seam admits context immediately before execution.
  */
-export function admitPendingUpgradeContexts(
+export async function admitPendingUpgradeContexts(
   mailbox: NanoclawMailboxSession,
   agentGroupId: string,
   sessionId: string,
-): number {
+): Promise<number> {
+  // The one central read, before the first inbound read: the loop below is one
+  // synchronous pass over a single snapshot of the unpaired rows.
+  const central = await resolveRecallCentral(agentGroupId, sessionId);
   let admitted = 0;
   for (const message of mailbox.listUnpairedPendingUpgradeRows()) {
     const recall = buildRecallRow(
@@ -1215,6 +1253,7 @@ export function admitPendingUpgradeContexts(
       },
       message.content,
       mailbox,
+      central,
     );
     if (!recall) continue;
     if (mailbox.admitPendingUpgradeRow(recall, message.id)) admitted++;
@@ -1434,9 +1473,9 @@ export async function reconcilePendingUpgradeContexts(
       // re-provision on the startup path (invariant I-10). The legacy
       // migrations the raw open used to run by hand are what session() runs on
       // its first touch of a path.
-      await withExistingMailboxSession(target.agentGroupId, target.id, (mailbox) => {
+      await withExistingMailboxSession(target.agentGroupId, target.id, async (mailbox) => {
         sessions++;
-        admittedHere = admitPendingUpgradeContexts(mailbox, target.agentGroupId, target.id);
+        admittedHere = await admitPendingUpgradeContexts(mailbox, target.agentGroupId, target.id);
         admitted += admittedHere;
       });
     } catch (err) {
@@ -1514,7 +1553,30 @@ export function deferMessageForFreshContextRetry(
  * What stays here is the POLICY — which rows get a recall and what it says.
  * Every statement it commits lives in the mailbox module's admission ops.
  */
-export function admitDueTaskContexts(mailbox: NanoclawMailboxSession, agentGroupId: string, sessionId: string): number {
+export async function admitDueTaskContexts(
+  mailbox: NanoclawMailboxSession,
+  agentGroupId: string,
+  sessionId: string,
+): Promise<number> {
+  // The one central read a recall needs, taken BEFORE the first inbound read so
+  // the admission itself is one synchronous pass: fence check, legacy
+  // demotion, due-row select and each paired admission see a single snapshot.
+  const central = await resolveRecallCentral(agentGroupId, sessionId);
+  return admitDueTaskContextsFor(mailbox, agentGroupId, sessionId, central);
+}
+
+/**
+ * The synchronous half of `admitDueTaskContexts`, for a caller whose mailbox
+ * action must not yield (the dashboard's run-now mutation proves its verdict
+ * and mutates in one block). Such a caller resolves the central facts with
+ * `resolveRecallCentral` before opening its session.
+ */
+export function admitDueTaskContextsFor(
+  mailbox: NanoclawMailboxSession,
+  agentGroupId: string,
+  sessionId: string,
+  central: RecallCentral,
+): number {
   // An active repository ingress fence means this session must admit nothing:
   // the whole point is that no new turn starts while its mounts change. The
   // admission below sets trigger = 1, which a fenced row may never carry, so
@@ -1552,6 +1614,7 @@ export function admitDueTaskContexts(mailbox: NanoclawMailboxSession, agentGroup
         // The open session IS the recall source: it exposes the same four
         // reads the adapter used to wrap, on the handle already in hand.
         mailbox,
+        central,
       )!;
     } catch (error) {
       if (!(error instanceof Error)) throw error;
@@ -1845,8 +1908,11 @@ export function clearOutbox(agentGroupId: string, sessionId: string, messageId: 
  * helpers are called from places that don't all carry that context.
  * Best-effort: lookup miss or unavailable dashboard module → no emit.
  */
-function _emitContainerStateEvent(sessionId: string, containerStatus: 'running' | 'idle' | 'stopped'): void {
-  const sess = getSession(sessionId);
+async function _emitContainerStateEvent(
+  sessionId: string,
+  containerStatus: 'running' | 'idle' | 'stopped',
+): Promise<void> {
+  const sess = await getSession(sessionId);
   if (!sess) return;
   void import('./dashboard/api/events.js')
     .then((mod) =>
@@ -1863,19 +1929,19 @@ function _emitContainerStateEvent(sessionId: string, containerStatus: 'running' 
 }
 
 /** Mark a container as running for a session. */
-export function markContainerRunning(sessionId: string): void {
-  updateSession(sessionId, { container_status: 'running', last_active: new Date().toISOString() });
-  _emitContainerStateEvent(sessionId, 'running');
+export async function markContainerRunning(sessionId: string): Promise<void> {
+  await updateSession(sessionId, { container_status: 'running', last_active: new Date().toISOString() });
+  await _emitContainerStateEvent(sessionId, 'running');
 }
 
 /** Mark a container as idle for a session. */
-export function markContainerIdle(sessionId: string): void {
-  updateSession(sessionId, { container_status: 'idle' });
-  _emitContainerStateEvent(sessionId, 'idle');
+export async function markContainerIdle(sessionId: string): Promise<void> {
+  await updateSession(sessionId, { container_status: 'idle' });
+  await _emitContainerStateEvent(sessionId, 'idle');
 }
 
 /** Mark a container as stopped for a session. */
-export function markContainerStopped(sessionId: string): void {
-  updateSession(sessionId, { container_status: 'stopped' });
-  _emitContainerStateEvent(sessionId, 'stopped');
+export async function markContainerStopped(sessionId: string): Promise<void> {
+  await updateSession(sessionId, { container_status: 'stopped' });
+  await _emitContainerStateEvent(sessionId, 'stopped');
 }

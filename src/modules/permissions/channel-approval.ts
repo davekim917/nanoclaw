@@ -227,7 +227,7 @@ export async function requestChannelApproval(input: RequestChannelApprovalInput)
     return existing ? isSameInboundEvent(existing.original_message, event) : false;
   }
 
-  const agentGroups = getAllAgentGroups();
+  const agentGroups = await getAllAgentGroups();
   if (agentGroups.length === 0) {
     log.warn('Channel registration skipped — no agent groups configured. Run /init-first-agent.', {
       messagingGroupId,
@@ -283,7 +283,7 @@ export async function requestChannelApproval(input: RequestChannelApprovalInput)
       const name = conversationDisplayName(conversation);
       const nameSource = channelNameProvenance(originMg.channel_type, 'classified');
       if (name && (name !== originMg.name || originMg.name_source !== nameSource)) {
-        updateMessagingGroup(originMg.id, { name, name_source: nameSource });
+        await updateMessagingGroup(originMg.id, { name, name_source: nameSource });
         originMg.name = name;
         originMg.name_source = nameSource;
       }
@@ -301,7 +301,7 @@ export async function requestChannelApproval(input: RequestChannelApprovalInput)
         const name = await channelAdapter.resolveChannelName(originMg.platform_id);
         if (name) {
           const nameSource = channelNameProvenance(originMg.channel_type, 'classified');
-          updateMessagingGroup(originMg.id, { name, name_source: nameSource });
+          await updateMessagingGroup(originMg.id, { name, name_source: nameSource });
           originMg.name = name;
           originMg.name_source = nameSource;
         }
@@ -425,17 +425,17 @@ export function buildAgentSelectionOptions(
  * Create a new agent group and initialize its filesystem. Handles
  * folder-name collisions with numeric suffixes.
  */
-export function createNewAgentGroup(name: string): AgentGroup {
+export async function createNewAgentGroup(name: string): Promise<AgentGroup> {
   let folder = toFolder(name);
   const baseFolder = folder;
   let suffix = 2;
-  while (getAgentGroupByFolder(folder)) {
+  while (await getAgentGroupByFolder(folder)) {
     folder = `${baseFolder}-${suffix}`;
     suffix++;
   }
 
   const agId = `ag-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-  createAgentGroup({
+  await createAgentGroup({
     id: agId,
     name,
     folder,
@@ -443,7 +443,7 @@ export function createNewAgentGroup(name: string): AgentGroup {
     created_at: new Date().toISOString(),
   });
 
-  const ag = getAgentGroup(agId)!;
+  const ag = (await getAgentGroup(agId))!;
   // Channel-approved groups are created on the instance default provider
   // (DEFAULT_AGENT_PROVIDER, or claude when unset) — initGroupFilesystem stamps
   // it onto the fresh config row. The operator flips a group afterward with

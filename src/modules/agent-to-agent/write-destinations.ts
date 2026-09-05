@@ -7,8 +7,10 @@
  * `hasTableRaw('agent_destinations')` check — without the agent-to-agent module
  * installed, the central table doesn't exist and the projection is skipped.
  */
-import { getAgentGroup } from '../../db/agent-groups.js';
+import { AGENT_GROUP_BY_ID_SQL } from '../../db/agent-groups.js';
+import { getRawDb } from '../../db/connection.js';
 import { getMessagingGroup } from '../../db/messaging-groups.js';
+import type { AgentGroup } from '../../types.js';
 import { log } from '../../log.js';
 import type { DestinationRow } from '../mailbox/index.js';
 import { withExistingMailboxSession } from '../../session-manager.js';
@@ -24,6 +26,14 @@ export async function writeDestinations(agentGroupId: string, sessionId: string)
   // container resolves names against this table to decide where it may send.
   // All three lookups are synchronous, so there is no yield left between the
   // resolution and the write.
+  //
+  // Seam 3 §4.5 I-1: that is why the agent-group read below executes the
+  // agent-groups leaf's exported `AGENT_GROUP_BY_ID_SQL` through the raw handle
+  // rather than calling the now-async `getAgentGroup` — one constant, two
+  // executors, not a `*Sync` twin (plan
+  // docs/specs/upstream-async-central-db-seam/plan.md §4.5). `getMessagingGroup`
+  // is still synchronous for its own reason (§4.2). PR 6 wraps this block in
+  // `withCentralSync`.
   const resolve = (): DestinationRow[] => {
     const rows = getDestinations(agentGroupId);
     const resolved: DestinationRow[] = [];
@@ -41,7 +51,7 @@ export async function writeDestinations(agentGroupId: string, sessionId: string)
           agent_group_id: null,
         });
       } else if (row.target_type === 'agent') {
-        const ag = getAgentGroup(row.target_id);
+        const ag = getRawDb().prepare(AGENT_GROUP_BY_ID_SQL).get(row.target_id) as AgentGroup | undefined;
         if (!ag) continue;
         resolved.push({
           name: row.local_name,

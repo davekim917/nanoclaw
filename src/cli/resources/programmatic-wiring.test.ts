@@ -43,7 +43,9 @@ vi.mock('../../group-init.js', async (importOriginal) => {
   return {
     ...(await importOriginal<typeof import('../../group-init.js')>()),
     initGroupFilesystem: vi.fn((group: { id: string }) => {
-      ensureContainerConfig(group.id);
+      // Synchronous stand-in: the driver runs this INSERT immediately (no
+      // transaction is open), so the promise is only the signature's wrapper.
+      void ensureContainerConfig(group.id);
     }),
   };
 });
@@ -86,7 +88,7 @@ describe('programmatic wiring verbs', () => {
     fs.mkdirSync(TEST_DIR, { recursive: true });
     await initTestDb();
     runMigrations(getRawDb());
-    createAgentGroup({ id: 'ag-1', name: 'Nano', folder: 'nano', agent_provider: null, created_at: now() });
+    await createAgentGroup({ id: 'ag-1', name: 'Nano', folder: 'nano', agent_provider: null, created_at: now() });
   });
   afterEach(async () => {
     await closeDb();

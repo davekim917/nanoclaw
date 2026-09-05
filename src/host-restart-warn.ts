@@ -328,7 +328,7 @@ async function warnSessions(session: Session, reason: string, containerLive = fa
  */
 export async function warnActiveContainersOfShutdown(reason: string): Promise<void> {
   for (const sessionId of getActiveContainerSessionIds()) {
-    const session = getSession(sessionId);
+    const session = await getSession(sessionId);
     // These ids come from the live container registry and nothing has been
     // stopped yet, so `provider_executing` is current state, not residue.
     if (session) await warnSessions(session, reason, true);
@@ -342,7 +342,7 @@ export async function warnActiveContainersOfShutdown(reason: string): Promise<vo
  * are freshness-bound.
  */
 export async function warnMarkedRunningSessionsOfStartup(reason: string): Promise<void> {
-  for (const session of getRunningSessions()) {
+  for (const session of await getRunningSessions()) {
     await warnSessions(session, reason);
   }
 }

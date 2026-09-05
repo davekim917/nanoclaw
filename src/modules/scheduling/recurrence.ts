@@ -88,9 +88,9 @@ export function scriptBackoffMinutes(fails: number): number {
  *  appendRunLog helper (one writer format); appendRunLog throws on a bad
  *  series charset or a missing agent group, and the sweep must not crash
  *  over a log line, so failures are logged and swallowed. */
-function appendHostTaskNote(agentGroupId: string, seriesId: string, note: string): void {
+async function appendHostTaskNote(agentGroupId: string, seriesId: string, note: string): Promise<void> {
   try {
-    appendRunLog(agentGroupId, seriesId, note);
+    await appendRunLog(agentGroupId, seriesId, note);
   } catch (err) {
     log.warn('Could not append host task note to run log', { agentGroupId, seriesId, err });
   }
@@ -113,7 +113,7 @@ export async function handleRecurrence(mailbox: NanoclawMailboxSession, session:
   // instant — changing the override deliberately does not reach into live
   // session DBs to rewrite `process_after`, so one more fire can land at the
   // old local time before the series settles onto the new grid.
-  const tz = resolveGroupTimezone(session.agent_group_id);
+  const tz = await resolveGroupTimezone(session.agent_group_id);
 
   for (const msg of recurring) {
     try {
@@ -135,7 +135,7 @@ export async function handleRecurrence(mailbox: NanoclawMailboxSession, session:
         withQuietInvalidationSync(session.id, () =>
           mailbox.armNextRecurrence(msg.id, msg, newId, cronNext.toISOString(), 'paused'),
         );
-        appendHostTaskNote(
+        await appendHostTaskNote(
           session.agent_group_id,
           msg.series_id,
           `auto-paused after ${scriptFails} consecutive script failures (host); fix the script, then \`ncl tasks resume ${msg.series_id}\``,

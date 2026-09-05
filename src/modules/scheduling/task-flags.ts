@@ -25,17 +25,17 @@ export type TaskFlagIntent = Pick<FlagIntent, 'turnModel' | 'turnEffort'>;
  * such session in hand and resolves purely off the agent group's container
  * config.
  */
-export function resolveTaskFlagIntent(
+export async function resolveTaskFlagIntent(
   content: Record<string, unknown>,
   target: { agent_group_id: string; agent_provider?: string | null },
-): { flagIntent?: TaskFlagIntent; error?: string } {
+): Promise<{ flagIntent?: TaskFlagIntent; error?: string }> {
   const model = typeof content.model === 'string' ? content.model.trim() : '';
   const effort = typeof content.effort === 'string' ? content.effort.trim() : '';
   if (!model && !effort) return {};
 
   const provider = resolveProviderName(
     target.agent_provider ?? null,
-    getContainerConfig(target.agent_group_id)?.provider,
+    (await getContainerConfig(target.agent_group_id))?.provider,
   );
   const flagStr = [model ? `-m1 ${model}` : '', effort ? `-e1 ${effort}` : ''].filter(Boolean).join(' ');
   const parsed = parseMessageFlags(flagStr, provider);

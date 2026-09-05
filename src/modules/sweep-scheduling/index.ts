@@ -63,7 +63,7 @@ async function prepareDueWake(
   // timezone for its local-time gate: a session parameter identifies the
   // mailbox, not the group whose zone override applies.
   await runHostGatedTaskScripts(mailbox, agentGroupId, sessionId);
-  const admittedTasks = admitDueTaskContexts(mailbox, agentGroupId, sessionId);
+  const admittedTasks = await admitDueTaskContexts(mailbox, agentGroupId, sessionId);
   const dueCount = mailbox.countDueMessages();
   return {
     admittedTasks,
@@ -135,7 +135,7 @@ export function registerSchedulingSweepDuties(): void {
     // recurrence so a just-fired recurring series has already re-armed its next
     // pending row and is never collected. The per-task log file in the workspace
     // is the durable history and survives the close.
-    run: (ctx) => {
+    run: async (ctx) => {
       const { session, mailbox } = asSessionContext(ctx);
       if (isTaskThread(session.thread_id)) {
         const liveTasks = mailbox!.countLiveTasks();
@@ -159,7 +159,7 @@ export function registerSchedulingSweepDuties(): void {
           });
           return;
         }
-        updateSession(session.id, { status: 'closed' });
+        await updateSession(session.id, { status: 'closed' });
         log.info('Closed spent task session', { sessionId: session.id, threadId: session.thread_id });
       }
     },

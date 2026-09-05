@@ -35,7 +35,7 @@ import type { Session } from '../../types.js';
  * destination, or an unreadable inbound DB all return null, which the gate
  * treats as not-owner-safe.
  */
-export function resolveSlackSafetyMessagingGroupId(session: Session): string | null {
+export async function resolveSlackSafetyMessagingGroupId(session: Session): Promise<string | null> {
   if (session.messaging_group_id) return session.messaging_group_id;
 
   // Per-series task sessions only (`system:tasks:<seriesId>`). The legacy
@@ -63,7 +63,7 @@ export function resolveSlackSafetyMessagingGroupId(session: Session): string | n
     );
 
     if (!row?.channel_type) return null;
-    return getMessagingGroupByPlatform(row.channel_type, row.platform_id)?.id ?? null;
+    return (await getMessagingGroupByPlatform(row.channel_type, row.platform_id))?.id ?? null;
   } catch (err) {
     log.warn('Slack safety subject lookup failed for task session', { sessionId: session.id, err });
     return null;

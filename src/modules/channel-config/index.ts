@@ -78,7 +78,7 @@ async function resolveChannelMessagingGroupId(
   // destinations lives in the session's inbound.db (host writes it at
   // wake). messaging_groups lives in central v2.db — cross-DB join by
   // (channel_type, platform_id).
-  const mg = getMessagingGroupByPlatform(row.channel_type, row.platform_id);
+  const mg = await getMessagingGroupByPlatform(row.channel_type, row.platform_id);
   return mg?.id ?? null;
 }
 
@@ -135,7 +135,7 @@ async function handleSetChannelModel(content: Record<string, unknown>, session: 
     await notifyAgent(session, 'set_channel_model failed: could not identify the user who sent this message.');
     return;
   }
-  const agent = getAgentGroup(session.agent_group_id);
+  const agent = await getAgentGroup(session.agent_group_id);
   if (!agent) {
     await notifyAgent(session, 'set_channel_model failed: agent group not found.');
     return;
@@ -151,7 +151,7 @@ async function handleSetChannelModel(content: Record<string, unknown>, session: 
     return;
   }
 
-  const wiring = getMessagingGroupAgentByPair(mgId, agent.id);
+  const wiring = await getMessagingGroupAgentByPair(mgId, agent.id);
   if (!wiring) {
     await notifyAgent(session, `set_channel_model failed: channel ${channelName ?? mgId} is not wired to this agent.`);
     return;
@@ -159,7 +159,7 @@ async function handleSetChannelModel(content: Record<string, unknown>, session: 
 
   const provider = resolveProviderName(
     session.agent_provider,
-    getContainerConfig(agent.id)?.provider ?? agent.agent_provider,
+    (await getContainerConfig(agent.id))?.provider ?? agent.agent_provider,
   );
   const parsedModel: ParsedChannelValue = model === null ? { value: null } : parseChannelModel(model.trim(), provider);
   if (parsedModel.error || (model !== null && !parsedModel.value)) {
@@ -168,7 +168,7 @@ async function handleSetChannelModel(content: Record<string, unknown>, session: 
   }
   const normalizedModel = parsedModel.value ?? null;
 
-  updateMessagingGroupAgent(wiring.id, { default_model: normalizedModel });
+  await updateMessagingGroupAgent(wiring.id, { default_model: normalizedModel });
   log.info('Channel default_model updated', {
     wiringId: wiring.id,
     agentGroupId: agent.id,
@@ -209,7 +209,7 @@ async function handleSetChannelEffort(content: Record<string, unknown>, session:
     await notifyAgent(session, 'set_channel_effort failed: could not identify the user who sent this message.');
     return;
   }
-  const agent = getAgentGroup(session.agent_group_id);
+  const agent = await getAgentGroup(session.agent_group_id);
   if (!agent) {
     await notifyAgent(session, 'set_channel_effort failed: agent group not found.');
     return;
@@ -225,7 +225,7 @@ async function handleSetChannelEffort(content: Record<string, unknown>, session:
     return;
   }
 
-  const wiring = getMessagingGroupAgentByPair(mgId, agent.id);
+  const wiring = await getMessagingGroupAgentByPair(mgId, agent.id);
   if (!wiring) {
     await notifyAgent(session, `set_channel_effort failed: channel ${channelName ?? mgId} is not wired to this agent.`);
     return;
@@ -233,7 +233,7 @@ async function handleSetChannelEffort(content: Record<string, unknown>, session:
 
   const provider = resolveProviderName(
     session.agent_provider,
-    getContainerConfig(agent.id)?.provider ?? agent.agent_provider,
+    (await getContainerConfig(agent.id))?.provider ?? agent.agent_provider,
   );
   const parsedEffort: ParsedChannelValue = effort === null ? { value: null } : parseChannelEffort(effort, provider);
   if (parsedEffort.error || (effort !== null && !parsedEffort.value)) {
@@ -242,7 +242,7 @@ async function handleSetChannelEffort(content: Record<string, unknown>, session:
   }
   const normalizedEffort = parsedEffort.value ?? null;
 
-  updateMessagingGroupAgent(wiring.id, { default_effort: normalizedEffort });
+  await updateMessagingGroupAgent(wiring.id, { default_effort: normalizedEffort });
   log.info('Channel default_effort updated', {
     wiringId: wiring.id,
     agentGroupId: agent.id,

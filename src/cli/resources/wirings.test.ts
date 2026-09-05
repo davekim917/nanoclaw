@@ -24,11 +24,26 @@ vi.mock('../../modules/agent-to-agent/write-destinations.js', async (importOrigi
   writeDestinations: vi.fn(),
 }));
 
+// The rollback test below makes this one export throw for a single call
+// (mockImplementationOnce) while every other db/messaging-groups export
+// (getMessagingGroup, getMessagingGroupAgentByPair, assertSameWorkgroupWiring,
+// ...) stays real, and the default implementation here delegates to the real
+// function so every OTHER test in this file (which all go through `create`)
+// is unaffected.
+vi.mock('../../db/messaging-groups.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../db/messaging-groups.js')>();
+  return { ...actual, ensureAgentDestinationForWiring: vi.fn(actual.ensureAgentDestinationForWiring) };
+});
+
 import type { ChannelDefaults } from '../../channels/adapter.js';
 import { registerChannelAdapter } from '../../channels/channel-registry.js';
 import { initTestDb, closeDb, runMigrations, createAgentGroup, createMessagingGroup } from '../../db/index.js';
 import { getRawDb } from '../../db/connection.js';
-import { createMessagingGroupAgent, getMessagingGroupAgent } from '../../db/messaging-groups.js';
+import {
+  createMessagingGroupAgent,
+  ensureAgentDestinationForWiring,
+  getMessagingGroupAgent,
+} from '../../db/messaging-groups.js';
 import { lookup } from '../registry.js';
 // Side-effect import: registers wirings-create / wirings-update.
 import './wirings.js';
@@ -52,8 +67,8 @@ const neverDeclared: ChannelDefaults = {
 };
 registerChannelAdapter('neverchan', { factory: () => null, defaults: neverDeclared });
 
-function mg(id: string, channelType: string, isGroup: number) {
-  createMessagingGroup({
+async function mg(id: string, channelType: string, isGroup: number): Promise<void> {
+  await createMessagingGroup({
     id,
     channel_type: channelType,
     platform_id: `pid-${id}`,
@@ -75,17 +90,17 @@ async function update(args: Record<string, unknown>) {
 beforeEach(async () => {
   await initTestDb();
   runMigrations(getRawDb());
-  createAgentGroup({
+  await createAgentGroup({
     id: 'ag-1',
     name: 'Helper Bot',
     folder: 'helper-bot',
     agent_provider: null,
     created_at: now(),
   });
-  mg('mg-dm', 'declchan', 0);
-  mg('mg-group', 'declchan', 1);
-  mg('mg-never', 'neverchan', 1);
-  mg('mg-stale', 'stalechan', 1); // no declaration anywhere
+  await mg('mg-dm', 'declchan', 0);
+  await mg('mg-group', 'declchan', 1);
+  await mg('mg-never', 'neverchan', 1);
+  await mg('mg-stale', 'stalechan', 1); // no declaration anywhere
 });
 
 afterEach(async () => {
@@ -102,7 +117,7 @@ describe('wirings-create — declaration-derived defaults', () => {
   it('fills group defaults from the declaration', async () => {
     const row = await create({ messaging_group_id: 'mg-group', agent_group_id: 'ag-1' });
     expect(row.engage_mode).toBe('mention-sticky');
-    const persisted = getMessagingGroupAgent(row.id as string);
+    const persisted = await getMessagingGroupAgent(row.id as string);
     expect(persisted!.engage_pattern).toBeNull();
   });
 
@@ -156,14 +171,14 @@ describe('wirings-create — validation', () => {
 describe('wirings — threads and priority columns', () => {
   it('omitted --threads stores NULL (inherit declaration)', async () => {
     const row = await create({ messaging_group_id: 'mg-group', agent_group_id: 'ag-1' });
-    expect(getMessagingGroupAgent(row.id as string)!.threads).toBeNull();
+    expect((await getMessagingGroupAgent(row.id as string))!.threads).toBeNull();
   });
 
   it('--threads true/false stores 1/0', async () => {
     const on = await create({ messaging_group_id: 'mg-group', agent_group_id: 'ag-1', threads: 'true' });
-    expect(getMessagingGroupAgent(on.id as string)!.threads).toBe(1);
+    expect((await getMessagingGroupAgent(on.id as string))!.threads).toBe(1);
     const off = await create({ messaging_group_id: 'mg-dm', agent_group_id: 'ag-1', threads: 'false' });
-    expect(getMessagingGroupAgent(off.id as string)!.threads).toBe(0);
+    expect((await getMessagingGroupAgent(off.id as string))!.threads).toBe(0);
   });
 
   it('rejects a non-boolean --threads value', async () => {
@@ -236,7 +251,7 @@ describe('wirings-update — same validation as create', () => {
     const updated = (await update({ id: 'mga-legacy', priority: '5' })) as { priority: number };
     expect(updated.priority).toBe(5);
     // The pattern fields stay untouched — no silent backfill.
-    expect(getMessagingGroupAgent('mga-legacy')!.engage_pattern).toBeNull();
+    expect((await getMessagingGroupAgent('mga-legacy'))!.engage_pattern).toBeNull();
 
     // But actually changing the pattern fields to an invalid combination
     // still rejects.
@@ -250,13 +265,13 @@ describe('wirings — per-channel tone/model/effort overrides', () => {
   // was invisible here, and a channel silently missing its tone looked
   // identical to one that never had it. Assertions read the persisted row,
   // since create() returns the assembled values, not a DB read.
-  const stored = (id: unknown) => getMessagingGroupAgent(id as string)!;
+  const stored = async (id: unknown) => (await getMessagingGroupAgent(id as string))!;
 
   it('omitted overrides stay NULL so the group default is inherited', async () => {
     const row = await create({ messaging_group_id: 'mg-group', agent_group_id: 'ag-1' });
-    expect(stored(row.id).default_tone).toBeNull();
-    expect(stored(row.id).default_model).toBeNull();
-    expect(stored(row.id).default_effort).toBeNull();
+    expect((await stored(row.id)).default_tone).toBeNull();
+    expect((await stored(row.id)).default_model).toBeNull();
+    expect((await stored(row.id)).default_effort).toBeNull();
   });
 
   it('create accepts all three', async () => {
@@ -268,15 +283,15 @@ describe('wirings — per-channel tone/model/effort overrides', () => {
       default_model: 'sonnet',
       default_effort: 'xhigh',
     });
-    expect(stored(row.id).default_tone).toBe('gilfoyle');
-    expect(stored(row.id).default_model).toBe('sonnet');
-    expect(stored(row.id).default_effort).toBe('xhigh');
+    expect((await stored(row.id)).default_tone).toBe('gilfoyle');
+    expect((await stored(row.id)).default_model).toBe('sonnet');
+    expect((await stored(row.id)).default_effort).toBe('xhigh');
   });
 
   it('update sets an override on an existing wiring', async () => {
     const row = await create({ messaging_group_id: 'mg-group', agent_group_id: 'ag-1' });
     await update({ id: row.id, default_tone: 'engineering' });
-    expect(stored(row.id).default_tone).toBe('engineering');
+    expect((await stored(row.id)).default_tone).toBe('engineering');
   });
 
   it('--default-tone "" clears back to NULL, not to empty string', async () => {
@@ -290,7 +305,7 @@ describe('wirings — per-channel tone/model/effort overrides', () => {
       instructions_profile: null,
     });
     await update({ id: row.id, default_tone: '' });
-    expect(stored(row.id).default_tone).toBeNull();
+    expect((await stored(row.id)).default_tone).toBeNull();
   });
 
   it('clears model and effort the same way', async () => {
@@ -301,8 +316,8 @@ describe('wirings — per-channel tone/model/effort overrides', () => {
       default_effort: 'xhigh',
     });
     await update({ id: row.id, default_model: '', default_effort: '' });
-    expect(stored(row.id).default_model).toBeNull();
-    expect(stored(row.id).default_effort).toBeNull();
+    expect((await stored(row.id)).default_model).toBeNull();
+    expect((await stored(row.id)).default_effort).toBeNull();
   });
 });
 
@@ -312,11 +327,11 @@ describe('wirings — per-channel instructions profile', () => {
   // settable, so every assertion here also pins that they don't clobber each
   // other. Assertions read the persisted row, since create() returns the
   // assembled values rather than a DB read.
-  const stored = (id: unknown) => getMessagingGroupAgent(id as string)!;
+  const stored = async (id: unknown) => (await getMessagingGroupAgent(id as string))!;
 
   it('omitted stays NULL — no channel gains instructions by default', async () => {
     const row = await create({ messaging_group_id: 'mg-group', agent_group_id: 'ag-1' });
-    expect(stored(row.id).instructions_profile).toBeNull();
+    expect((await stored(row.id)).instructions_profile).toBeNull();
   });
 
   it('create accepts a profile name', async () => {
@@ -325,7 +340,7 @@ describe('wirings — per-channel instructions profile', () => {
       agent_group_id: 'ag-1',
       instructions_profile: 'lab',
     });
-    expect(stored(row.id).instructions_profile).toBe('lab');
+    expect((await stored(row.id)).instructions_profile).toBe('lab');
   });
 
   it('create sets tone and instructions independently', async () => {
@@ -335,14 +350,14 @@ describe('wirings — per-channel instructions profile', () => {
       default_tone: 'gilfoyle',
       instructions_profile: 'lab',
     });
-    expect(stored(row.id).default_tone).toBe('gilfoyle');
-    expect(stored(row.id).instructions_profile).toBe('lab');
+    expect((await stored(row.id)).default_tone).toBe('gilfoyle');
+    expect((await stored(row.id)).instructions_profile).toBe('lab');
   });
 
   it('update sets it on an existing wiring', async () => {
     const row = await create({ messaging_group_id: 'mg-group', agent_group_id: 'ag-1' });
     await update({ id: row.id, instructions_profile: 'lab' });
-    expect(stored(row.id).instructions_profile).toBe('lab');
+    expect((await stored(row.id)).instructions_profile).toBe('lab');
   });
 
   it('--instructions-profile "" clears back to NULL, not to empty string', async () => {
@@ -355,7 +370,7 @@ describe('wirings — per-channel instructions profile', () => {
       instructions_profile: 'lab',
     });
     await update({ id: row.id, instructions_profile: '' });
-    expect(stored(row.id).instructions_profile).toBeNull();
+    expect((await stored(row.id)).instructions_profile).toBeNull();
   });
 
   it('clearing instructions leaves tone untouched', async () => {
@@ -366,8 +381,8 @@ describe('wirings — per-channel instructions profile', () => {
       instructions_profile: 'lab',
     });
     await update({ id: row.id, instructions_profile: '' });
-    expect(stored(row.id).instructions_profile).toBeNull();
-    expect(stored(row.id).default_tone).toBe('gilfoyle');
+    expect((await stored(row.id)).instructions_profile).toBeNull();
+    expect((await stored(row.id)).default_tone).toBe('gilfoyle');
   });
 
   it.each([
@@ -388,7 +403,7 @@ describe('wirings — per-channel instructions profile', () => {
     await expect(update({ id: row.id, instructions_profile: '../../etc/shadow' })).rejects.toThrow(
       /--instructions-profile must match/,
     );
-    expect(stored(row.id).instructions_profile).toBeNull();
+    expect((await stored(row.id)).instructions_profile).toBeNull();
   });
 
   it('a rejected create writes no row at all', async () => {
@@ -401,5 +416,33 @@ describe('wirings — per-channel instructions profile', () => {
       .prepare(`SELECT id FROM messaging_group_agents WHERE messaging_group_id = 'mg-dm'`)
       .all() as Array<{ id: string }>;
     expect(rows).toHaveLength(0);
+  });
+});
+
+describe('wirings-create — transactional rollback', () => {
+  // Pins the seam-3 invariant (plan §8.4): the INSERT into
+  // messaging_group_agents and the ensureAgentDestinationForWiring call live
+  // inside ONE raw better-sqlite3 transaction (wirings.ts), which stays
+  // synchronous until PR 6. If the companion destination write fails, the
+  // wiring row must not survive either — a half-written wiring (row present,
+  // no destination) is worse than none, since delivery would silently drop
+  // every reply to that chat as "unknown destination" (see the postCreate
+  // comment in wirings.ts referencing issue #2389).
+  it('a failing companion destination rolls back the wiring row', async () => {
+    vi.mocked(ensureAgentDestinationForWiring).mockImplementationOnce(() => {
+      throw new Error('boom: companion destination failed');
+    });
+
+    const countRows = (table: string) =>
+      (getRawDb().prepare(`SELECT COUNT(*) AS n FROM ${table}`).get() as { n: number }).n;
+
+    const before = { mga: countRows('messaging_group_agents'), dest: countRows('agent_destinations') };
+
+    await expect(create({ messaging_group_id: 'mg-group', agent_group_id: 'ag-1' })).rejects.toThrow(
+      /boom: companion destination failed/,
+    );
+
+    expect(countRows('messaging_group_agents')).toBe(before.mga);
+    expect(countRows('agent_destinations')).toBe(before.dest);
   });
 });

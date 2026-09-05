@@ -313,8 +313,16 @@ vi.mock('./db/provider-health.js', async (importOriginal) => {
 });
 vi.mock('./db/connection.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('./db/connection.js')>()),
+  // The guard-path re-reads (seam-3 §4.5 I-1: `sessionStillActive`, the heal's
+  // "still live" check) execute the sessions leaf's SQL on the raw handle, so
+  // the fake answers a `FROM sessions` lookup from the harness's session list
+  // and nothing else.
   getRawDb: () => ({
-    prepare: () => ({ run: () => undefined, get: () => undefined, all: () => [] }),
+    prepare: (sql: string) => ({
+      run: () => undefined,
+      get: (...args: unknown[]) => (/FROM sessions\b/.test(sql) ? h.sessions.find((s) => s.id === args[0]) : undefined),
+      all: () => [],
+    }),
   }),
 }));
 

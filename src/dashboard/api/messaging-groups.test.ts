@@ -32,7 +32,7 @@ async function setupDb(): Promise<void> {
 describe('messagingGroupsListHandler', () => {
   beforeEach(async () => {
     await setupDb();
-    createMessagingGroup({
+    await createMessagingGroup({
       id: 'mg-1',
       channel_type: 'discord',
       platform_id: 'chan-1',
@@ -41,7 +41,7 @@ describe('messagingGroupsListHandler', () => {
       unknown_sender_policy: 'public',
       created_at: now(),
     });
-    createMessagingGroup({
+    await createMessagingGroup({
       id: 'mg-2',
       channel_type: 'slack',
       platform_id: 'C123',

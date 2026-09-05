@@ -112,7 +112,7 @@ describe('channel recovery coordinator', () => {
     expect(slackRecover.mock.calls[0][0]).toMatchObject({ reason: 'event-loop-stall' });
   });
 
-  it('bounds stall-pass thread expansion to recently-active sessions, fail-open on missing timestamps', () => {
+  it('bounds stall-pass thread expansion to recently-active sessions, fail-open on missing timestamps', async () => {
     const now = Date.now();
     const fresh = new Date(now - 60_000).toISOString();
     const stale = new Date(now - STALL_TARGET_ACTIVITY_HORIZON_MS - 60_000).toISOString();
@@ -128,11 +128,11 @@ describe('channel recovery coordinator', () => {
     const bounded = getChannelRecoveryTargets(adapter('discord'), {
       activeSinceMs: now - STALL_TARGET_ACTIVITY_HORIZON_MS,
     });
-    expect(bounded.map((t) => t.threadId)).toEqual([null, 'discord:g:c:fresh', 'discord:g:c:untimed']);
+    expect((await bounded).map((t) => t.threadId)).toEqual([null, 'discord:g:c:fresh', 'discord:g:c:untimed']);
 
     // Unbounded (transport/startup) passes keep the stale thread.
     const full = getChannelRecoveryTargets(adapter('discord'));
-    expect(full.map((t) => t.threadId)).toContain('discord:g:c:stale');
+    expect((await full).map((t) => t.threadId)).toContain('discord:g:c:stale');
   });
 
   it('coalesces stalls inside the cooldown into one deferred pass with the earliest since', async () => {

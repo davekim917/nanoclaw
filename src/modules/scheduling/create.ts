@@ -157,7 +157,7 @@ export async function createScheduledTask(
   options?: { status?: 'pending' | 'paused'; originSessionId?: string | null },
 ): Promise<{ session: { id: string; agent_group_id: string }; row: ScheduledTaskRow }> {
   const id = makeTaskId(task.name);
-  const { session } = resolveTaskSession(agentGroupId, id);
+  const { session } = await resolveTaskSession(agentGroupId, id);
 
   // The insert changes when this session next has work due, and due-ness lives
   // only in the session DB where the host sweep's quiet cache cannot see it.

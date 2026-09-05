@@ -12,7 +12,10 @@ vi.mock('../group-init.js', async (importOriginal) => {
     ...(await importOriginal<typeof import('../group-init.js')>()),
     initGroupFilesystem: vi.fn((group: { id: string }) => {
       ensureContainerConfigSpy(group.id);
-      ensureContainerConfig(group.id);
+      // The mock stands in for a synchronous caller; the driver runs this
+      // INSERT immediately (no transaction is open), so the promise is only
+      // the async signature's wrapper.
+      void ensureContainerConfig(group.id);
     }),
   };
 });
@@ -102,21 +105,21 @@ describe('genericCreate postCreate hook', () => {
     // Visible side effect: container_configs row exists for the new group.
     // Without postCreate, this was empty and the first spawn threw
     // "Container config not found" — issue #2415.
-    const config = getContainerConfig(result.id);
+    const config = await getContainerConfig(result.id);
     expect(config).toBeDefined();
     expect(config!.agent_group_id).toBe(result.id);
   });
 
   it('wirings-create writes the companion agent_destinations row', async () => {
     // Seed the FKs that the wiring references.
-    createAgentGroup({
+    await createAgentGroup({
       id: 'ag-1',
       name: 'Agent One',
       folder: 'agent-one',
       agent_provider: null,
       created_at: new Date().toISOString(),
     });
-    createMessagingGroup({
+    await createMessagingGroup({
       id: 'mg-1',
       channel_type: 'discord',
       platform_id: 'channel-123',
@@ -144,14 +147,14 @@ describe('genericCreate postCreate hook', () => {
 
 describe('genericCreate postCommit hook', () => {
   it('wirings-create projects the new destination into live sessions', async () => {
-    createAgentGroup({
+    await createAgentGroup({
       id: 'ag-1',
       name: 'Agent One',
       folder: 'agent-one',
       agent_provider: null,
       created_at: new Date().toISOString(),
     });
-    createMessagingGroup({
+    await createMessagingGroup({
       id: 'mg-1',
       channel_type: 'discord',
       platform_id: 'channel-123',
@@ -162,7 +165,7 @@ describe('genericCreate postCommit hook', () => {
     });
     // A container is already running for this agent — its session inbound.db
     // holds a stale destination projection.
-    createSession({
+    await createSession({
       id: 'sess-1',
       agent_group_id: 'ag-1',
       messaging_group_id: null,
@@ -184,14 +187,14 @@ describe('genericCreate postCommit hook', () => {
   });
 
   it('wirings-create projection is a no-op when no sessions are running', async () => {
-    createAgentGroup({
+    await createAgentGroup({
       id: 'ag-2',
       name: 'Agent Two',
       folder: 'agent-two',
       agent_provider: null,
       created_at: new Date().toISOString(),
     });
-    createMessagingGroup({
+    await createMessagingGroup({
       id: 'mg-2',
       channel_type: 'discord',
       platform_id: 'channel-456',

@@ -377,6 +377,7 @@ function rawToRow(
   outbound: OutboundView,
   nowMs: number,
   forceUnhealthy: boolean,
+  timezone: string,
 ): ScheduledRow {
   const seriesId = raw.series_id ?? raw.id;
   const parsed = parseContent(raw.content);
@@ -394,7 +395,7 @@ function rawToRow(
     outboundReadable: outbound.readable,
     nowMs,
     isOneOff,
-    timezone: resolveGroupTimezone(desc.agentGroupId),
+    timezone,
   });
   // Duplicate-successor rows are always flagged (the MAX(seq) read would hide
   // the second fireable row — §4.1). Surface them as stalled.
@@ -432,13 +433,16 @@ function rawToRow(
   };
 }
 
-function readSession(
+async function readSession(
   desc: SessionDescriptor,
   dataDir: string,
   mgByDest: Map<string, string>,
   nowMs: number,
-): SessionReadResult {
+): Promise<SessionReadResult> {
   const location = locate(dataDir, desc.agentGroupId, desc.sessionId);
+  // The one central read a row needs, resolved once per session and before the
+  // read-only funnel opens, so the session read itself stays synchronous.
+  const timezone = await resolveGroupTimezone(desc.agentGroupId);
   try {
     // Read-only seam, deliberately not `withExistingMailboxSession`: this runs
     // across EVERY session in the fleet on a console poll, and a board read
@@ -468,7 +472,7 @@ function readSession(
     const rows: ScheduledRow[] = [];
     const searchByKey: Record<string, string> = {};
     const emit = (raw: RawRow, forceUnhealthy: boolean): void => {
-      const row = rawToRow(raw, desc, mgByDest, outbound, nowMs, forceUnhealthy);
+      const row = rawToRow(raw, desc, mgByDest, outbound, nowMs, forceUnhealthy, timezone);
       rows.push(row);
       searchByKey[row.key] = searchTextFor(raw, row);
     };
@@ -515,14 +519,15 @@ function readSession(
  * Returns null when no row exists for the series (→ the handler maps to 404).
  * Health honors the strand verdict for a terminal-with-recurrence latest row.
  */
-export function buildDetailRow(
+export async function buildDetailRow(
   agentGroupId: string,
   sessionId: string,
   seriesId: string,
   dataDir: string,
   nowMs: number,
-): ScheduledRow | null {
+): Promise<ScheduledRow | null> {
   const location = locate(dataDir, agentGroupId, sessionId);
+  const timezone = await resolveGroupTimezone(agentGroupId);
   const central = getRawDb();
   const ag = central.prepare('SELECT name, agent_provider FROM agent_groups WHERE id = ?').get(agentGroupId) as
     | { name: string; agent_provider: string | null }
@@ -565,7 +570,7 @@ export function buildDetailRow(
     const isLive = raw.status === 'pending' || raw.status === 'paused';
     const isStrand = !isLive && raw.recurrence !== null;
     const outbound = readOutbound(location);
-    const row = rawToRow(raw, desc, mgByDest, outbound, nowMs, false);
+    const row = rawToRow(raw, desc, mgByDest, outbound, nowMs, false, timezone);
     // A terminal-with-recurrence latest row is a residual strand; the §4.1
     // ladder in rawToRow only sees live rows, so force the verdict here.
     if (isStrand) {
@@ -702,7 +707,7 @@ async function doAssemble(scopes: AuthScopes, options: ScheduledAssemblyOptions)
       provider: ag?.agent_provider ?? null,
       sessionId: s.id,
     };
-    const res = readSession(desc, dataDir, mgByDest, nowMs);
+    const res = await readSession(desc, dataDir, mgByDest, nowMs);
     for (const r of res.rows) {
       rows.push(r);
       countRow(counts, r);

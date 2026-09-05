@@ -364,7 +364,7 @@ export async function quiesceAgentGroupsForRepositoryMounts(
   agentGroupIds: string[],
   epoch: string = `repository-mount-${randomUUID()}`,
 ): Promise<RepositoryMountQuiescence> {
-  const sessions = agentGroupIds.flatMap((id) => getSessionsByAgentGroup(id));
+  const sessions = (await Promise.all(agentGroupIds.map((id) => getSessionsByAgentGroup(id)))).flat();
   return quiesceSessionsForRepositoryMounts(sessions, epoch);
 }
 
@@ -500,7 +500,7 @@ export async function restartAgentGroupContainers(
   wakeMessage?: string,
   options: { respawnAll?: boolean } = {},
 ): Promise<number> {
-  const sessions = getSessionsByAgentGroup(agentGroupId).filter(
+  const sessions = (await getSessionsByAgentGroup(agentGroupId)).filter(
     (s) => s.status === 'active' && isContainerRunning(s.id),
   );
 
