@@ -40,6 +40,9 @@ import { fileURLToPath } from 'url';
 import { readEnvFile } from '../src/env.js';
 
 const SLACK_API = 'https://slack.com/api';
+// conversations.open accepts at most eight invitees, excluding the caller.
+// https://docs.slack.dev/reference/methods/conversations.open/
+const MAX_MPIM_INVITEES = 8;
 
 const USAGE = 'Usage: pnpm exec tsx scripts/open-a2a-room.ts --instances <name,name…> [--user <slack user id>]';
 
@@ -146,6 +149,12 @@ export function parseArgs(argv: string[]): { instances: string[]; user?: string 
   // Before the count checks, so a roster of aliases cannot satisfy a minimum
   // it does not actually meet.
   assertDistinctInstances(instances);
+  const inviteeCount = instances.length - 1 + (user ? 1 : 0);
+  if (inviteeCount > MAX_MPIM_INVITEES) {
+    throw new Error(
+      `room has ${inviteeCount} invitees; Slack permits at most ${MAX_MPIM_INVITEES}, excluding the caller`,
+    );
+  }
   if (instances.length < 2) fail('--instances needs at least two comma-separated instance names');
   if (!user && instances.length < 3) {
     fail(
