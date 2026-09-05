@@ -114,7 +114,7 @@ describe('dashboardTokenIssue', () => {
     const deliverMock = vi.fn().mockResolvedValue('msg-id');
     vi.mocked(getDeliveryAdapter).mockReturnValue({ deliver: deliverMock } as never);
     vi.mocked(getMessagingGroup).mockReturnValue(makeSlackMg());
-    vi.mocked(issueDashboardToken).mockReturnValue({
+    vi.mocked(issueDashboardToken).mockResolvedValue({
       id: 1,
       user_id: 'u1',
       token_hmac: 'hmac',
@@ -155,7 +155,7 @@ describe('dashboardTokenIssue', () => {
     const deliverMock = vi.fn().mockResolvedValue('msg-id');
     vi.mocked(getDeliveryAdapter).mockReturnValue({ deliver: deliverMock } as never);
     vi.mocked(getMessagingGroup).mockReturnValue(makeSlackMg());
-    vi.mocked(issueDashboardToken).mockReturnValue({
+    vi.mocked(issueDashboardToken).mockResolvedValue({
       id: 1,
       user_id: 'u1',
       token_hmac: 'hmac',
@@ -178,7 +178,7 @@ describe('dashboardTokenIssue', () => {
     const deliverMock = vi.fn().mockResolvedValue('msg-id');
     vi.mocked(getDeliveryAdapter).mockReturnValue({ deliver: deliverMock } as never);
     vi.mocked(getMessagingGroup).mockReturnValue(makeSlackMg());
-    vi.mocked(issueDashboardToken).mockReturnValue({
+    vi.mocked(issueDashboardToken).mockResolvedValue({
       id: 1,
       user_id: 'u1',
       token_hmac: 'hmac',
@@ -217,7 +217,7 @@ describe('dashboardTokenIssue', () => {
     vi.mocked(getDeliveryAdapter).mockReturnValue({ deliver: deliverMock } as never);
     vi.mocked(getMessagingGroup).mockReturnValue(makeSlackChannelMg());
     vi.mocked(ensureUserDm).mockResolvedValue(makeSlackDmMg());
-    vi.mocked(issueDashboardToken).mockReturnValue({
+    vi.mocked(issueDashboardToken).mockResolvedValue({
       id: 1,
       user_id: 'u1',
       token_hmac: 'hmac',
@@ -278,7 +278,7 @@ describe('dashboardTokenIssue', () => {
     const deliverMock = vi.fn().mockResolvedValue('msg-id');
     vi.mocked(getDeliveryAdapter).mockReturnValue({ deliver: deliverMock } as never);
     vi.mocked(getMessagingGroup).mockReturnValue(makeSlackMg());
-    vi.mocked(issueDashboardToken).mockReturnValue({
+    vi.mocked(issueDashboardToken).mockResolvedValue({
       id: 1,
       user_id: 'u1',
       token_hmac: 'hmac',

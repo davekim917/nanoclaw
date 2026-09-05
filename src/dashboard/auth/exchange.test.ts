@@ -48,10 +48,10 @@ function hmacToken(rawToken: string): string {
   return crypto.createHmac('sha256', key).update(rawToken).digest('hex');
 }
 
-function issueRawToken(userId: string): string {
+async function issueRawToken(userId: string): Promise<string> {
   const rawToken = crypto.randomBytes(32).toString('hex');
   const tokenHmac = hmacToken(rawToken);
-  issueDashboardToken(userId, tokenHmac, 24);
+  await issueDashboardToken(userId, tokenHmac, 24);
   return rawToken;
 }
 
@@ -75,7 +75,7 @@ afterEach(async () => {
 describe('exchangeHandler', () => {
   it('test_exchange_valid_token_sets_cookie', async () => {
     insertUser('u1');
-    const rawToken = issueRawToken('u1');
+    const rawToken = await issueRawToken('u1');
 
     const req = makeReq({ token: rawToken });
     const res = await exchangeHandler(req, {}, makeNodeCtx());
@@ -106,11 +106,11 @@ describe('exchangeHandler', () => {
 
   it('test_exchange_used_token_returns_400', async () => {
     insertUser('u1');
-    const rawToken = issueRawToken('u1');
+    const rawToken = await issueRawToken('u1');
     const hmac = hmacToken(rawToken);
 
     // Consume it once
-    consumeDashboardToken(hmac);
+    await consumeDashboardToken(hmac);
 
     // Try again with same token
     const req = makeReq({ token: rawToken });
@@ -156,7 +156,7 @@ describe('exchangeHandler', () => {
 
   it('test_exchange_no_csrf_origin_check', async () => {
     insertUser('u1');
-    const rawToken = issueRawToken('u1');
+    const rawToken = await issueRawToken('u1');
 
     const req = makeReq({ token: rawToken }, { origin: 'https://evil.com', host: 'localhost:3000' });
     const res = await exchangeHandler(req, {}, makeNodeCtx());

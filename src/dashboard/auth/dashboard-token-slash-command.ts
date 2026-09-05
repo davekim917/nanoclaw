@@ -91,7 +91,7 @@ export async function dashboardTokenSlashCommand(event: SlashCommandEvent): Prom
     created_at: new Date().toISOString(),
   });
 
-  const { url, ttlHours } = mintDashboardTokenUrl(userId);
+  const { url, ttlHours } = await mintDashboardTokenUrl(userId);
   await postEphemeralViaResponseUrl(
     responseUrl,
     `Open your dashboard (valid ${formatTtl(ttlHours)}, works once):\n${url}`,

@@ -70,7 +70,7 @@ describe('dashboardTokenSlashCommand', () => {
   it('test_authorized_admin_mints_and_replies_ephemerally', async () => {
     vi.mocked(isAnyAdmin).mockReturnValue(true);
     vi.mocked(hasAnyMembership).mockReturnValue(false);
-    vi.mocked(mintDashboardTokenUrl).mockReturnValue({
+    vi.mocked(mintDashboardTokenUrl).mockResolvedValue({
       url: 'http://localhost:3000/observatory/#token=abc123',
       ttlHours: 720,
     });
@@ -96,7 +96,7 @@ describe('dashboardTokenSlashCommand', () => {
   it('test_authorized_member_without_admin_role_mints', async () => {
     vi.mocked(isAnyAdmin).mockReturnValue(false);
     vi.mocked(hasAnyMembership).mockReturnValue(true);
-    vi.mocked(mintDashboardTokenUrl).mockReturnValue({ url: 'http://x/#token=y', ttlHours: 24 });
+    vi.mocked(mintDashboardTokenUrl).mockResolvedValue({ url: 'http://x/#token=y', ttlHours: 24 });
 
     await dashboardTokenSlashCommand(makeEvent());
 
@@ -134,7 +134,7 @@ describe('dashboardTokenSlashCommand', () => {
     // Regression guard: the handler must never fall back to posting via a
     // channel/messaging-group path (which would require bot membership).
     vi.mocked(isAnyAdmin).mockReturnValue(true);
-    vi.mocked(mintDashboardTokenUrl).mockReturnValue({ url: 'http://x/#token=z', ttlHours: 1 });
+    vi.mocked(mintDashboardTokenUrl).mockResolvedValue({ url: 'http://x/#token=z', ttlHours: 1 });
 
     await dashboardTokenSlashCommand(makeEvent({ raw: { response_url: 'https://hooks.slack.com/commands/T1/2/def' } }));
 
