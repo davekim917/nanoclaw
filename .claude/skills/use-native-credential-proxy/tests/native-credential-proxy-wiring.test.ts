@@ -12,13 +12,29 @@
  */
 import fs from 'fs';
 import path from 'path';
+import { fileURLToPath } from 'url';
 
 import { describe, it, expect } from 'vitest';
 import ts from 'typescript';
 
+const TEST_DIR = path.dirname(fileURLToPath(import.meta.url));
+
 function sourceFile(): ts.SourceFile {
-  const p = path.resolve(process.cwd(), 'src/container-runner.ts');
-  return ts.createSourceFile(p, fs.readFileSync(p, 'utf8'), ts.ScriptTarget.Latest, true);
+  const installed = path.join(TEST_DIR, 'container-runner.ts');
+  if (fs.existsSync(installed)) {
+    return ts.createSourceFile(installed, fs.readFileSync(installed, 'utf8'), ts.ScriptTarget.Latest, true);
+  }
+  const skill = fs.readFileSync(path.join(TEST_DIR, '..', 'SKILL.md'), 'utf8');
+  const snippet = [...skill.matchAll(/```ts\n([\s\S]*?)```/g)].find(
+    (match) => match[1].includes('args.push(...nativeCredentialEnvArgs())'),
+  )?.[1];
+  if (!snippet) throw new Error('nativeCredentialEnvArgs wiring snippet not found in SKILL.md');
+  return ts.createSourceFile(
+    'SKILL.md',
+    `function buildContainerArgs() { ${snippet} }`,
+    ts.ScriptTarget.Latest,
+    true,
+  );
 }
 
 function findFunction(sf: ts.SourceFile, name: string): ts.FunctionDeclaration | undefined {

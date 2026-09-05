@@ -1,6 +1,6 @@
 # Remove slack-a2a-rooms
 
-Apply copies two files. Delete them, and the removal is done:
+Apply copies the opener. Delete it and any test copied by earlier versions:
 
 ```bash
 rm -f scripts/open-a2a-room.ts scripts/open-a2a-room.test.ts

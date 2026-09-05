@@ -48,10 +48,10 @@ files go into both, alongside the integration points they cover.
 S=.claude/skills/add-atomic-chat-tool
 # Container (Bun) tree — the MCP server and the registration wiring test
 cp $S/atomic-chat-mcp-stdio.ts        container/agent-runner/src/atomic-chat-mcp-stdio.ts
-cp $S/atomic-chat-registration.test.ts container/agent-runner/src/atomic-chat-registration.test.ts
+cp $S/tests/atomic-chat-registration.test.ts container/agent-runner/src/atomic-chat-registration.test.ts
 # Host (Node) tree — the env-forwarding helper and the wiring test
 cp $S/atomic-chat-env.ts              src/atomic-chat-env.ts
-cp $S/atomic-chat-wiring.test.ts      src/atomic-chat-wiring.test.ts
+cp $S/tests/atomic-chat-wiring.test.ts      src/atomic-chat-wiring.test.ts
 ```
 
 ### Register the MCP server in the agent-runner

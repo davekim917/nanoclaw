@@ -107,8 +107,8 @@ Both integration points this skill relies on live in the container (Bun) tree â€
 
 ```bash
 S=.claude/skills/add-gmail-tool
-cp $S/gmail-dockerfile.test.ts    container/agent-runner/src/providers/gmail-dockerfile.test.ts
-cp $S/gmail-allow-pattern.test.ts container/agent-runner/src/providers/gmail-allow-pattern.test.ts
+cp $S/tests/gmail-dockerfile.test.ts    container/agent-runner/src/providers/gmail-dockerfile.test.ts
+cp $S/tests/gmail-allow-pattern.test.ts container/agent-runner/src/providers/gmail-allow-pattern.test.ts
 ```
 
 - `gmail-dockerfile.test.ts` asserts the `GMAIL_MCP_VERSION` ARG and the pinned `pnpm install -g` line are present â€” the `gmail-mcp` binary is a Dockerfile-installed CLI, not importable or typed, so this structural guard is what goes red if the install is dropped.

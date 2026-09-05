@@ -60,20 +60,19 @@ held at the access gate and a room would look open but stay silent.
 test -f src/channels/slack.ts && grep -q 'export function parseSlackWorkspaces' src/channels/slack.ts && grep -q 'export function isSiblingBotSender' src/modules/permissions/access.ts
 ```
 
-### 2. Copy the room opener and its test
+### 2. Copy the room opener
 
-This skill ships two files alongside this document; copy them into the tree at
-the same relative paths (overwrite; the skill's copies are canonical):
+Copy the opener into the tree (overwrite; the skill copy is canonical).
+The test stays under this skill's `tests/` directory and runs in place:
 
 ```nc:copy
 scripts/open-a2a-room.ts
-scripts/open-a2a-room.test.ts
 ```
 
 - `open-a2a-room.ts` — resolves each named instance's bot token and bot user
   id, opens the MPIM as the first-listed instance, posts an intro, and prints
   the channel id plus the `ncl` commands to wire it.
-- `open-a2a-room.test.ts` — pins the opener's `SLACK_BOT_TOKEN_<SUFFIX>`
+- `tests/open-a2a-room.test.ts` — pins the opener's `SLACK_BOT_TOKEN_<SUFFIX>`
   derivation against the adapter's real `parseSlackWorkspaces`, so a change to
   either side of that convention goes red here instead of at 2am against a
   live workspace.
@@ -88,7 +87,7 @@ pnpm run typecheck
 ```
 
 ```nc:run effect:test
-pnpm exec vitest run scripts/open-a2a-room.test.ts
+pnpm exec vitest run --config vitest.skills.config.ts .claude/skills/slack-a2a-rooms/tests/open-a2a-room.test.ts
 ```
 
 ## Opening a room

@@ -35,9 +35,7 @@
  * Token values are never printed.
  */
 import path from 'path';
-import { fileURLToPath } from 'url';
-
-import { readEnvFile } from '../src/env.js';
+import { fileURLToPath, pathToFileURL } from 'url';
 
 const SLACK_API = 'https://slack.com/api';
 // conversations.open accepts at most eight invitees, excluding the caller.
@@ -236,6 +234,9 @@ async function slackCall(
 
 async function resolveAuth(name: string): Promise<SlackAuth> {
   const envKey = tokenEnvKey(name);
+  // Like the env reader itself, resolve from the install root (the CLI cwd).
+  // This also lets the canonical skill script run before it has been copied.
+  const { readEnvFile } = await import(pathToFileURL(path.resolve('src/env.ts')).href);
   const env = readEnvFile([envKey]);
   const token = env[envKey];
   if (!token) fail(`missing ${envKey} in .env (the adapter's suffix-token convention)`);

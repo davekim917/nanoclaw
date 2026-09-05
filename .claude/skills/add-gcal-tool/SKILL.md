@@ -127,7 +127,7 @@ RUN --mount=type=cache,target=/root/.cache/pnpm \
 `@cocal/google-calendar-mcp` is a stdio CLI installed in the image, not an imported module, so `tsc` and the runtime tests never reference it — only the Dockerfile edit above proves it is present. Copy the guard test into the host test tree (vitest) so the Dockerfile `ARG` + install line stay covered:
 
 ```bash
-cp .claude/skills/add-gcal-tool/gcal-dockerfile.test.ts src/gcal-dockerfile.test.ts
+cp .claude/skills/add-gcal-tool/tests/gcal-dockerfile.test.ts src/gcal-dockerfile.test.ts
 pnpm exec vitest run src/gcal-dockerfile.test.ts
 ```
 
