@@ -59,7 +59,11 @@ import {
   updatePendingChannelApprovalCard,
   type PendingChannelApproval,
 } from './db/pending-channel-approvals.js';
-import { deletePendingSenderApproval, getPendingSenderApproval } from './db/pending-sender-approvals.js';
+import {
+  createPendingSenderApproval,
+  deletePendingSenderApproval,
+  getPendingSenderApproval,
+} from './db/pending-sender-approvals.js';
 import { hasAdminPrivilege } from './db/user-roles.js';
 import { getUser, upsertUser } from './db/users.js';
 import './grant.js';
@@ -419,12 +423,35 @@ async function handleSenderApprovalResponse(payload: ResponsePayload): Promise<b
   const approved = payload.value === 'approve';
 
   if (approved) {
-    await addMember({
-      user_id: row.sender_identity,
-      agent_group_id: row.agent_group_id,
-      added_by: approverId,
-      added_at: new Date().toISOString(),
-    });
+    // The claim above already removed the row, and that row held the ONLY copy
+    // of the retained inbound (`original_message`). If the member write fails
+    // here, a plain rethrow would leave the sender approved-but-not-admitted
+    // with nothing left to replay and no card to click again (issue #443,
+    // Codex round 2).
+    //
+    // So the claim is made recoverable by putting the row back, rather than by
+    // adding a `claimed_at` column — a column means a migration, and the row
+    // object is already in hand, complete with its body and render metadata.
+    // `createPendingSenderApproval` is INSERT OR IGNORE, so a concurrent flow
+    // that re-created the card in the meantime wins and this is a no-op.
+    try {
+      await addMember({
+        user_id: row.sender_identity,
+        agent_group_id: row.agent_group_id,
+        added_by: approverId,
+        added_at: new Date().toISOString(),
+      });
+    } catch (err) {
+      const restored = await createPendingSenderApproval(row);
+      log.error('Unknown sender approval failed to add the member — card restored for retry', {
+        approvalId: row.id,
+        senderIdentity: row.sender_identity,
+        agentGroupId: row.agent_group_id,
+        restored,
+        err,
+      });
+      return true;
+    }
     log.info('Unknown sender approved — member added', {
       approvalId: row.id,
       senderIdentity: row.sender_identity,

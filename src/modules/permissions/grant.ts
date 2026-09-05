@@ -248,9 +248,32 @@ export async function handleRevokeAccess(content: Record<string, unknown>, sessi
     await removeMember(targetUserId, targetAgentGroupId);
     revoked = true;
   }
-  if (isAdminOfAgentGroup(targetUserId, targetAgentGroupId)) {
+  // `callerIsGlobal` is the load-bearing half of this condition, not a
+  // shortcut for the check above (issue #443, Codex round 2).
+  //
+  // `removeMember` yields. If an owner grants the target an admin role in that
+  // window, `isAdminOfAgentGroup` — evaluated HERE, after the yield — flips to
+  // true, while the "only a global admin can revoke another admin" refusal was
+  // decided BEFORE it and let this caller through. A scoped admin would then
+  // revoke an admin role, which is exactly the escalation that refusal exists
+  // to prevent.
+  //
+  // Re-testing the predicate is not enough on its own: the predicates are
+  // synchronous on the raw handle by §4.5, but `revokeRole` is not, so any
+  // re-test would still sit on the far side of an await from its write.
+  // Gating on `callerIsGlobal` closes it without a lock, and changes nothing
+  // for a legitimate flow: a scoped caller that reaches this line was already
+  // proven not to be facing an admin target, so this branch was a no-op for
+  // them in every non-racing case.
+  if (callerIsGlobal && isAdminOfAgentGroup(targetUserId, targetAgentGroupId)) {
     await revokeRole(targetUserId, 'admin', targetAgentGroupId);
     revoked = true;
+  } else if (!callerIsGlobal && isAdminOfAgentGroup(targetUserId, targetAgentGroupId)) {
+    log.warn('revoke_access: target gained an admin role mid-revoke — role left in place', {
+      callerId,
+      targetUserId,
+      targetAgentGroupId,
+    });
   }
 
   if (!revoked) {

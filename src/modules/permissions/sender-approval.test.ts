@@ -49,13 +49,17 @@ vi.mock('../../delivery.js', async (importOriginal) => ({
 // under test is the shipped one.
 // Counts calls to the members leaf without changing its behavior, so the
 // duplicate-callback case below can assert that only ONE callback acted.
-const addMemberCalls = vi.hoisted(() => ({ n: 0 }));
+const addMemberCalls = vi.hoisted(() => ({ n: 0, failNext: false }));
 vi.mock('./db/agent-group-members.js', async (importOriginal) => {
   const real = await importOriginal<typeof import('./db/agent-group-members.js')>();
   return {
     ...real,
     addMember: async (row: Parameters<typeof real.addMember>[0]) => {
       addMemberCalls.n++;
+      if (addMemberCalls.failNext) {
+        addMemberCalls.failNext = false;
+        throw new Error('simulated member-write failure');
+      }
       return real.addMember(row);
     },
   };
@@ -335,6 +339,81 @@ describe('unknown-sender request_approval flow', () => {
       c: number;
     };
     expect(stillPending.c).toBe(0);
+  });
+
+  // Issue #443, Codex round 2 — a claim that cannot be recovered is a lost card.
+  //
+  // The claim removes the approval row, and that row holds the ONLY copy of the
+  // retained inbound. If the member write then fails, the sender is left
+  // approved-but-not-admitted with nothing to replay and no card to click
+  // again. The handler now restores the row on failure, so the card stays
+  // actionable and a retry completes normally.
+  it('a failed member write restores the card, and a retry admits the sender once', async () => {
+    const { routeInbound } = await import('../../router.js');
+    const { getResponseHandlers } = await import('../../response-registry.js');
+    const { wakeContainer } = await import('../../container-runner.js');
+    const { getRawDb } = await import('../../db/connection.js');
+
+    await routeInbound(stranger('please let me in'));
+    await new Promise((r) => setTimeout(r, 10));
+
+    const before = getRawDb().prepare('SELECT id, original_message FROM pending_sender_approvals').get() as {
+      id: string;
+      original_message: string;
+    };
+    expect(before).toBeDefined();
+
+    const click = async (): Promise<void> => {
+      for (const handler of getResponseHandlers()) {
+        if (
+          await handler({
+            questionId: before.id,
+            value: 'approve',
+            userId: 'owner',
+            channelType: 'telegram',
+            platformId: 'dm-owner',
+            threadId: null,
+          })
+        ) {
+          break;
+        }
+      }
+    };
+
+    // First click: the member write fails.
+    (wakeContainer as unknown as ReturnType<typeof vi.fn>).mockClear();
+    addMemberCalls.failNext = true;
+    await click();
+
+    // The card survived, with its retained body intact — this is the assertion
+    // the bug breaks: without the restore the row is gone forever.
+    const after = getRawDb().prepare('SELECT id, original_message FROM pending_sender_approvals').get() as
+      | { id: string; original_message: string }
+      | undefined;
+    expect(after).toBeDefined();
+    expect(after!.id).toBe(before.id);
+    expect(after!.original_message).toBe(before.original_message);
+    // Nothing was replayed on the failed attempt.
+    expect(wakeContainer).not.toHaveBeenCalled();
+    // And no member was admitted.
+    const midMembers = getRawDb()
+      .prepare('SELECT COUNT(*) AS c FROM agent_group_members WHERE user_id = ? AND agent_group_id = ?')
+      .get('tg:stranger', 'ag-1') as { c: number };
+    expect(midMembers.c).toBe(0);
+
+    // Second click: the retry succeeds, exactly once.
+    await click();
+    await new Promise((r) => setTimeout(r, 10));
+
+    const members = getRawDb()
+      .prepare('SELECT COUNT(*) AS c FROM agent_group_members WHERE user_id = ? AND agent_group_id = ?')
+      .get('tg:stranger', 'ag-1') as { c: number };
+    expect(members.c).toBe(1);
+    const stillPending = getRawDb().prepare('SELECT COUNT(*) AS c FROM pending_sender_approvals').get() as {
+      c: number;
+    };
+    expect(stillPending.c).toBe(0);
+    expect(wakeContainer).toHaveBeenCalledTimes(1);
   });
 
   it('deny → deletes the pending row without adding a member', async () => {
